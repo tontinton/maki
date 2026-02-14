@@ -1,8 +1,10 @@
 pub mod agent;
+pub(crate) mod anthropic;
 pub mod auth;
-pub mod client;
 pub mod model;
+pub mod provider;
 pub mod tool;
+pub(crate) mod zai;
 
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -173,6 +175,17 @@ pub enum AgentError {
     Json(#[from] serde_json::Error),
     #[error("channel send failed")]
     Channel,
+}
+
+impl AgentError {
+    pub fn from_response(response: ureq::http::Response<ureq::Body>) -> Self {
+        let status = response.status().as_u16();
+        let message = response
+            .into_body()
+            .read_to_string()
+            .unwrap_or_else(|_| "unable to read error body".into());
+        Self::Api { status, message }
+    }
 }
 
 impl From<mpsc::SendError<AgentEvent>> for AgentError {

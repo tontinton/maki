@@ -6,8 +6,8 @@ use std::sync::mpsc::Sender;
 
 use tracing::info;
 
-use crate::client;
 use crate::model::Model;
+use crate::provider::Provider;
 use crate::{
     AgentError, AgentEvent, AgentInput, AgentMode, Message, PendingToolCall, TokenUsage,
     ToolDoneEvent,
@@ -90,6 +90,7 @@ fn execute_tools(
 }
 
 pub fn run(
+    provider: &dyn Provider,
     model: &Model,
     input: AgentInput,
     history: &mut Vec<Message>,
@@ -102,7 +103,7 @@ pub fn run(
     let mut num_turns: u32 = 0;
 
     loop {
-        let response = client::stream_message(model, history, system, &tools, event_tx)?;
+        let response = provider.stream_message(model, history, system, &tools, event_tx)?;
         num_turns += 1;
 
         info!(

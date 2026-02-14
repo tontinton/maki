@@ -141,8 +141,25 @@ pub fn run(
 
     let model_clone = model.clone();
     thread::spawn(move || {
+        let provider = match maki_agent::provider::from_model(&model_clone) {
+            Ok(p) => p,
+            Err(e) => {
+                error!(error = %e, "provider error");
+                let _ = event_tx.send(AgentEvent::Error {
+                    message: e.to_string(),
+                });
+                return;
+            }
+        };
         let mut history = Vec::new();
-        if let Err(e) = agent::run(&model_clone, input, &mut history, &system, &event_tx) {
+        if let Err(e) = agent::run(
+            &*provider,
+            &model_clone,
+            input,
+            &mut history,
+            &system,
+            &event_tx,
+        ) {
             error!(error = %e, "agent error");
             let _ = event_tx.send(AgentEvent::Error {
                 message: e.to_string(),

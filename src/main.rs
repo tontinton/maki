@@ -55,9 +55,11 @@ fn main() -> Result<()> {
             AuthAction::Logout => maki_agent::auth::logout()?,
         },
         Some(Command::Models) => {
-            for id in maki_agent::client::list_models()? {
-                println!("anthropic/{id}");
-            }
+            maki_agent::provider::fetch_all_models(|models| {
+                for model in models {
+                    println!("{model}");
+                }
+            });
         }
         None => {
             let model = Model::from_spec(&cli.model)?;

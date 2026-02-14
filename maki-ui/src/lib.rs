@@ -73,10 +73,21 @@ fn spawn_agent_thread(
     model: Model,
 ) {
     thread::spawn(move || {
+        let provider = match maki_agent::provider::from_model(&model) {
+            Ok(p) => p,
+            Err(e) => {
+                error!(error = %e, "provider error");
+                let _ = event_tx.send(AgentEvent::Error {
+                    message: e.to_string(),
+                });
+                return;
+            }
+        };
         let mut history = Vec::new();
         while let Ok(input) = input_rx.recv() {
             let system = agent::build_system_prompt(&cwd, &input.mode);
-            if let Err(e) = agent::run(&model, input, &mut history, &system, &event_tx) {
+            if let Err(e) = agent::run(&*provider, &model, input, &mut history, &system, &event_tx)
+            {
                 error!(error = %e, "agent error");
                 let _ = event_tx.send(AgentEvent::Error {
                     message: e.to_string(),

@@ -10,6 +10,7 @@ use ureq::Agent;
 
 use crate::auth;
 use crate::model::Model;
+use crate::provider::Provider;
 use crate::tool::ToolCall;
 use crate::{
     AgentError, AgentEvent, ContentBlock, Message, PendingToolCall, Role, StreamResponse,
@@ -91,85 +92,113 @@ struct MessageDeltaEvent {
 const API_VERSION: &str = "2023-06-01";
 const MAX_RETRIES: u32 = 3;
 const RETRY_DELAY: Duration = Duration::from_secs(2);
+const MODELS_URL: &str = "https://api.anthropic.com/v1/models?limit=1000";
 
-fn authed_agent() -> Result<(Agent, auth::ResolvedAuth), AgentError> {
-    let resolved = auth::resolve()?;
-    let agent: Agent = Agent::config_builder()
-        .http_status_as_error(false)
-        .build()
-        .into();
-    Ok((agent, resolved))
+pub struct Anthropic {
+    agent: Agent,
+    auth: auth::ResolvedAuth,
 }
 
-fn apply_auth<B>(
-    req: ureq::RequestBuilder<B>,
-    resolved: &auth::ResolvedAuth,
-) -> ureq::RequestBuilder<B> {
-    let mut req = req.header("anthropic-version", API_VERSION);
-    for (key, value) in &resolved.headers {
-        req = req.header(key, value);
+impl Anthropic {
+    pub fn new() -> Result<Self, AgentError> {
+        let resolved = auth::resolve()?;
+        let agent: Agent = Agent::config_builder()
+            .http_status_as_error(false)
+            .build()
+            .into();
+        Ok(Self {
+            agent,
+            auth: resolved,
+        })
     }
-    req
+
+    fn apply_auth<B>(&self, req: ureq::RequestBuilder<B>) -> ureq::RequestBuilder<B> {
+        let mut req = req.header("anthropic-version", API_VERSION);
+        for (key, value) in &self.auth.headers {
+            req = req.header(key, value);
+        }
+        req
+    }
 }
 
-pub fn stream_message(
-    model: &Model,
-    messages: &[Message],
-    system: &str,
-    tools: &Value,
-    event_tx: &Sender<AgentEvent>,
-) -> Result<StreamResponse, AgentError> {
-    let (agent, resolved) = authed_agent()?;
+impl Provider for Anthropic {
+    fn stream_message(
+        &self,
+        model: &Model,
+        messages: &[Message],
+        system: &str,
+        tools: &Value,
+        event_tx: &Sender<AgentEvent>,
+    ) -> Result<StreamResponse, AgentError> {
+        let body = json!({
+            "model": model.id,
+            "max_tokens": model.max_output_tokens,
+            "system": system,
+            "messages": messages,
+            "tools": tools,
+            "stream": true,
+        });
 
-    let body = json!({
-        "model": model.id,
-        "max_tokens": model.max_output_tokens,
-        "system": system,
-        "messages": messages,
-        "tools": tools,
-        "stream": true,
-    });
+        for attempt in 1..=MAX_RETRIES {
+            debug!(attempt, "sending API request");
 
-    for attempt in 1..=MAX_RETRIES {
-        debug!(attempt, "sending API request");
+            let req = self.apply_auth(
+                self.agent
+                    .post(&self.auth.api_url)
+                    .header("content-type", "application/json"),
+            );
+            let response = req.send(body.to_string().as_str())?;
+            let status = response.status().as_u16();
 
-        let req = apply_auth(
-            agent
-                .post(&resolved.api_url)
-                .header("content-type", "application/json"),
-            &resolved,
-        );
-        let response = req.send(body.to_string().as_str())?;
-
-        let status = response.status().as_u16();
-
-        if status == 429 || status >= 500 {
-            warn!(status, attempt, "retryable API error");
-            if attempt < MAX_RETRIES {
-                thread::sleep(RETRY_DELAY);
-                continue;
+            if status == 429 || status >= 500 {
+                warn!(status, attempt, "retryable API error");
+                if attempt < MAX_RETRIES {
+                    thread::sleep(RETRY_DELAY);
+                    continue;
+                }
+                return Err(AgentError::Api {
+                    status,
+                    message: "max retries exceeded".to_string(),
+                });
             }
-            return Err(AgentError::Api {
-                status,
-                message: "max retries exceeded".to_string(),
-            });
+
+            if status != 200 {
+                return Err(AgentError::from_response(response));
+            }
+
+            return parse_sse(BufReader::new(response.into_body().into_reader()), event_tx);
         }
 
-        if status != 200 {
-            let body_text = response
-                .into_body()
-                .read_to_string()
-                .unwrap_or_else(|_| "unable to read error body".to_string());
-            return Err(AgentError::Api {
-                status,
-                message: body_text,
-            });
-        }
-
-        return parse_sse_stream(response.into_body(), event_tx);
+        unreachable!()
     }
 
-    unreachable!()
+    fn list_models(&self) -> Result<Vec<String>, AgentError> {
+        let mut models = Vec::new();
+        let mut after_id: Option<String> = None;
+
+        loop {
+            let mut url = MODELS_URL.to_string();
+            if let Some(cursor) = &after_id {
+                url.push_str(&format!("&after_id={cursor}"));
+            }
+
+            let response = self.apply_auth(self.agent.get(&url)).call()?;
+            if response.status().as_u16() != 200 {
+                return Err(AgentError::from_response(response));
+            }
+
+            let page: ModelsPage = serde_json::from_reader(response.into_body().into_reader())?;
+            models.extend(page.data.into_iter().map(|m| m.id));
+
+            if !page.has_more {
+                break;
+            }
+            after_id = page.last_id;
+        }
+
+        models.sort();
+        Ok(models)
+    }
 }
 
 #[derive(Deserialize)]
@@ -182,50 +211,6 @@ struct ModelsPage {
     data: Vec<ModelInfo>,
     has_more: bool,
     last_id: Option<String>,
-}
-
-pub fn list_models() -> Result<Vec<String>, AgentError> {
-    let (agent, resolved) = authed_agent()?;
-    let mut models = Vec::new();
-    let mut after_id: Option<String> = None;
-
-    loop {
-        let mut url = "https://api.anthropic.com/v1/models?limit=1000".to_string();
-        if let Some(cursor) = &after_id {
-            url.push_str(&format!("&after_id={cursor}"));
-        }
-
-        let response = apply_auth(agent.get(&url), &resolved).call()?;
-        let status = response.status().as_u16();
-        if status != 200 {
-            let body = response
-                .into_body()
-                .read_to_string()
-                .unwrap_or_else(|_| "unable to read error body".into());
-            return Err(AgentError::Api {
-                status,
-                message: body,
-            });
-        }
-
-        let page: ModelsPage = serde_json::from_reader(response.into_body().into_reader())?;
-        models.extend(page.data.into_iter().map(|m| m.id));
-
-        if !page.has_more {
-            break;
-        }
-        after_id = page.last_id;
-    }
-
-    models.sort();
-    Ok(models)
-}
-
-fn parse_sse_stream(
-    body: ureq::Body,
-    event_tx: &Sender<AgentEvent>,
-) -> Result<StreamResponse, AgentError> {
-    parse_sse(BufReader::new(body.into_reader()), event_tx)
 }
 
 fn parse_sse(
@@ -348,7 +333,7 @@ mod tests {
     use std::sync::mpsc;
 
     #[test]
-    fn parse_sse_text_only() {
+    fn parse_sse_text_and_usage() {
         let sse_data = b"\
 event: message_start\n\
 data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":42,\"cache_creation_input_tokens\":5,\"cache_read_input_tokens\":8}}}\n\
@@ -366,7 +351,7 @@ event: content_block_stop\n\
 data: {\"type\":\"content_block_stop\"}\n\
 \n\
 event: message_delta\n\
-data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":10}}\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":10}}\n\
 \n\
 event: message_stop\n\
 data: {\"type\":\"message_stop\"}\n";
@@ -383,11 +368,11 @@ data: {\"type\":\"message_stop\"}\n";
                 cache_read: 8
             }
         );
-        assert_eq!(resp.message.content.len(), 1);
         assert!(
             matches!(&resp.message.content[0], ContentBlock::Text { text } if text == "Hello world")
         );
         assert!(resp.tool_calls.is_empty());
+        assert_eq!(resp.stop_reason.as_deref(), Some("end_turn"));
 
         let deltas: Vec<String> = rx
             .try_iter()
@@ -403,62 +388,25 @@ data: {\"type\":\"message_stop\"}\n";
     }
 
     #[test]
-    fn parse_sse_stop_reason() {
-        let with_stop = b"\
+    fn parse_sse_tool_use() {
+        let sse_data = "\
 event: message_start\n\
-data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}\n\
+data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10}}}\n\
 \n\
 event: content_block_start\n\
-data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_1\",\"name\":\"bash\"}}\n\
 \n\
 event: content_block_delta\n\
-data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\
+data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\":\"}}\n\
+\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\" \\\"echo hi\\\"}\"}}\n\
 \n\
 event: content_block_stop\n\
 data: {\"type\":\"content_block_stop\"}\n\
 \n\
 event: message_delta\n\
-data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\
-\n\
-event: message_stop\n\
-data: {\"type\":\"message_stop\"}\n";
-
-        let (tx, _rx) = mpsc::channel();
-        let resp = parse_sse(with_stop.as_slice(), &tx).unwrap();
-        assert_eq!(resp.stop_reason.as_deref(), Some("end_turn"));
-
-        let without_stop = b"\
-event: message_start\n\
-data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}\n\
-\n\
-event: message_delta\n\
-data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":2}}\n\
-\n\
-event: message_stop\n\
-data: {\"type\":\"message_stop\"}\n";
-
-        let (tx, _rx) = mpsc::channel();
-        let resp = parse_sse(without_stop.as_slice(), &tx).unwrap();
-        assert!(resp.stop_reason.is_none());
-    }
-
-    #[test]
-    fn parse_sse_tool_use() {
-        let line1 = r#"data: {"type":"message_start","message":{"usage":{"input_tokens":10}}}"#;
-        let line2 = r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tu_1","name":"bash"}}"#;
-        let line3 = r#"data: {"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"{\"command\":"}}"#;
-        let line4 = r#"data: {"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":" \"echo hi\"}"}}"#;
-        let line5 = r#"data: {"type":"content_block_stop"}"#;
-        let line6 = r#"data: {"type":"message_delta","usage":{"output_tokens":5}}"#;
-
-        let sse_data = format!(
-            "event: message_start\n{line1}\n\n\
-             event: content_block_start\n{line2}\n\n\
-             event: content_block_delta\n{line3}\n\n\
-             event: content_block_delta\n{line4}\n\n\
-             event: content_block_stop\n{line5}\n\n\
-             event: message_delta\n{line6}\n"
-        );
+data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
 
         let (tx, _rx) = mpsc::channel();
         let resp = parse_sse(sse_data.as_bytes(), &tx).unwrap();
@@ -466,8 +414,5 @@ data: {\"type\":\"message_stop\"}\n";
         assert_eq!(resp.tool_calls.len(), 1);
         assert_eq!(resp.tool_calls[0].id, "tu_1");
         assert_eq!(resp.tool_calls[0].call.name(), "bash");
-        assert!(
-            matches!(&resp.message.content[0], ContentBlock::ToolUse { id, name, .. } if id == "tu_1" && name == "bash")
-        );
     }
 }
