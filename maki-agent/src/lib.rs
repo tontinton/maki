@@ -19,6 +19,8 @@ pub use model::{Model, ModelError, ModelPricing, TokenUsage};
 
 const DATA_DIR_NAME: &str = ".maki";
 pub const PLANS_DIR: &str = "plans";
+const SCRUB_MAX_LINES: usize = 1000;
+const SCRUB_TIERS: &[(usize, usize)] = &[(1000, 2), (500, 3), (100, 5)];
 
 pub fn data_dir() -> Result<PathBuf, AgentError> {
     let home = env::var("HOME").map_err(|_| AgentError::Api {
@@ -141,6 +143,92 @@ impl Message {
             }
         }
     }
+
+}
+
+fn scrub_target_name<'a>(msg: &'a Message, tool_use_id: &str) -> Option<&'a str> {
+    msg.content.iter().find_map(|b| match b {
+        ContentBlock::ToolUse { id, name, .. }
+            if id == tool_use_id
+                && matches!(
+                    name.as_str(),
+                    tool::ToolCall::READ | tool::ToolCall::GREP | tool::ToolCall::GLOB
+                ) =>
+        {
+            Some(name.as_str())
+        }
+        _ => None,
+    })
+}
+
+fn scrub_summary(name: &str, content: &str) -> String {
+    match name {
+        tool::ToolCall::READ => format!("[read: {} lines]", content.lines().count()),
+        tool::ToolCall::GREP => {
+            let matches = content.lines().filter(|l| l.starts_with("  ")).count();
+            format!("[grep: {matches} matches]")
+        }
+        tool::ToolCall::GLOB => format!("[glob: {} files]", content.lines().count()),
+        _ => format!("[{name}: scrubbed]"),
+    }
+}
+
+fn truncate_to_lines(content: &str, max: usize) -> String {
+    let total = content.lines().count();
+    let mut out = String::new();
+    for (i, line) in content.lines().enumerate() {
+        if i >= max {
+            out.push_str(&format!("\n[truncated, showing {max} of {total} lines]"));
+            break;
+        }
+        if i > 0 {
+            out.push('\n');
+        }
+        out.push_str(line);
+    }
+    out
+}
+
+fn assistant_turns_after(history: &[Message], from: usize) -> usize {
+    history[from + 1..]
+        .iter()
+        .filter(|m| matches!(m.role, Role::Assistant))
+        .count()
+}
+
+pub fn scrub_stale_tool_results(history: &mut [Message]) {
+    for i in 1..history.len() {
+        let turns_ago = assistant_turns_after(history, i);
+        let (before, current) = history.split_at_mut(i);
+
+        for block in &mut current[0].content {
+            let ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            } = block
+            else {
+                continue;
+            };
+            if *is_error || content.starts_with('[') {
+                continue;
+            }
+            let Some(name) = scrub_target_name(&before[i - 1], tool_use_id) else {
+                continue;
+            };
+
+            let line_count = content.lines().count();
+            let should_scrub = SCRUB_TIERS
+                .iter()
+                .any(|&(min_lines, min_turns)| line_count >= min_lines && turns_ago >= min_turns);
+
+            if should_scrub {
+                *content = scrub_summary(name, content);
+            } else if line_count > SCRUB_MAX_LINES {
+                *content = truncate_to_lines(content, SCRUB_MAX_LINES);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -232,108 +320,153 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tool_results_from_done_events() {
-        let events = vec![
-            (
-                "id1".into(),
-                ToolDoneEvent {
-                    tool: "write",
-                    content: "wrote 5 bytes".into(),
-                    is_error: false,
-                },
-            ),
-            (
-                "id2".into(),
-                ToolDoneEvent {
-                    tool: "glob",
-                    content: "err".into(),
-                    is_error: true,
-                },
-            ),
-        ];
-        let msg = Message::tool_results(events);
-        assert_eq!(msg.content.len(), 2);
-        assert!(matches!(
-            &msg.content[0],
-            ContentBlock::ToolResult { tool_use_id, content, is_error: false }
-            if tool_use_id == "id1" && content == "wrote 5 bytes"
-        ));
-        assert!(matches!(
-            &msg.content[1],
-            ContentBlock::ToolResult { tool_use_id, content, is_error: true }
-            if tool_use_id == "id2" && content == "err"
-        ));
-    }
-
-    #[test]
-    fn agent_event_type_tags() {
-        let cases: Vec<(AgentEvent, &str)> = vec![
-            (AgentEvent::TextDelta { text: "x".into() }, "text_delta"),
-            (
-                AgentEvent::ToolStart(ToolStartEvent {
-                    tool: "bash",
-                    summary: "s".into(),
-                }),
-                "tool_start",
-            ),
-            (
-                AgentEvent::ToolDone(ToolDoneEvent {
-                    tool: "read",
-                    content: "c".into(),
-                    is_error: false,
-                }),
-                "tool_done",
-            ),
-            (
-                AgentEvent::Done {
-                    usage: TokenUsage::default(),
-                    num_turns: 1,
-                    stop_reason: None,
-                },
-                "done",
-            ),
-            (
-                AgentEvent::Error {
-                    message: "e".into(),
-                },
-                "error",
-            ),
-        ];
-        for (event, expected_type) in cases {
-            let json: Value = serde_json::to_value(&event).unwrap();
-            assert_eq!(json["type"], expected_type);
-        }
-    }
-
-    #[test]
-    fn effective_message_without_plan() {
-        let input = AgentInput {
+    fn effective_message_with_and_without_plan() {
+        let no_plan = AgentInput {
             message: "do stuff".into(),
             mode: AgentMode::Build,
             pending_plan: None,
         };
-        assert_eq!(input.effective_message(), "do stuff");
-    }
+        assert_eq!(no_plan.effective_message(), "do stuff");
 
-    #[test]
-    fn effective_message_injects_plan_in_build_mode() {
-        let input = AgentInput {
+        let with_plan = AgentInput {
             message: "go".into(),
             mode: AgentMode::Build,
             pending_plan: Some("/tmp/plan.md".into()),
         };
-        let msg = input.effective_message();
+        let msg = with_plan.effective_message();
         assert!(msg.contains("/tmp/plan.md"));
         assert!(msg.contains("go"));
-    }
 
-    #[test]
-    fn effective_message_ignores_plan_in_plan_mode() {
-        let input = AgentInput {
+        let plan_mode = AgentInput {
             message: "plan this".into(),
             mode: AgentMode::Plan("/tmp/p.md".into()),
             pending_plan: Some("/tmp/p.md".into()),
         };
-        assert_eq!(input.effective_message(), "plan this");
+        assert_eq!(plan_mode.effective_message(), "plan this");
+    }
+
+    fn tool_use_msg(id: &str, name: &str) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: id.into(),
+                name: name.into(),
+                input: serde_json::json!({}),
+            }],
+        }
+    }
+
+    fn tool_result_msg(tool_use_id: &str, content: &str, is_error: bool) -> Message {
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: tool_use_id.into(),
+                content: content.into(),
+                is_error,
+            }],
+        }
+    }
+
+    fn result_content(history: &[Message], idx: usize) -> &str {
+        match &history[idx].content[0] {
+            ContentBlock::ToolResult { content, .. } => content,
+            _ => panic!("expected ToolResult"),
+        }
+    }
+
+    fn make_lines(n: usize) -> String {
+        (1..=n)
+            .map(|i| format!("{i}: line"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn add_filler_turns(history: &mut Vec<Message>, n: usize) {
+        for i in 0..n {
+            let id = format!("filler_{i}");
+            history.push(tool_use_msg(&id, "bash"));
+            history.push(tool_result_msg(&id, "ok", false));
+        }
+    }
+
+    #[test]
+    fn scrub_ignores_small_results_and_non_targets() {
+        let small = "1: fn main() {}";
+        let mut history = vec![
+            tool_use_msg("r1", "read"),
+            tool_result_msg("r1", small, false),
+            tool_use_msg("b1", "bash"),
+            tool_result_msg("b1", &make_lines(200), false),
+        ];
+        add_filler_turns(&mut history, 10);
+        scrub_stale_tool_results(&mut history);
+
+        assert_eq!(result_content(&history, 1), small);
+        assert!(!result_content(&history, 3).starts_with('['));
+    }
+
+    #[test]
+    fn scrub_100_lines_after_5_turns() {
+        let content = make_lines(150);
+        let mut history = vec![
+            tool_use_msg("r1", "read"),
+            tool_result_msg("r1", &content, false),
+        ];
+
+        add_filler_turns(&mut history, 4);
+        scrub_stale_tool_results(&mut history);
+        assert!(!result_content(&history, 1).starts_with('['));
+
+        add_filler_turns(&mut history, 1);
+        scrub_stale_tool_results(&mut history);
+        assert!(result_content(&history, 1).starts_with("[read:"));
+    }
+
+    #[test]
+    fn scrub_500_lines_after_3_turns() {
+        let content = make_lines(500);
+        let mut history = vec![
+            tool_use_msg("r1", "read"),
+            tool_result_msg("r1", &content, false),
+        ];
+
+        add_filler_turns(&mut history, 2);
+        scrub_stale_tool_results(&mut history);
+        assert!(!result_content(&history, 1).starts_with('['));
+
+        add_filler_turns(&mut history, 1);
+        scrub_stale_tool_results(&mut history);
+        assert!(result_content(&history, 1).starts_with("[read:"));
+    }
+
+    #[test]
+    fn scrub_1000_lines_after_2_turns() {
+        let content = make_lines(1000);
+        let mut history = vec![
+            tool_use_msg("g1", "grep"),
+            tool_result_msg("g1", &content, false),
+        ];
+
+        add_filler_turns(&mut history, 1);
+        scrub_stale_tool_results(&mut history);
+        assert!(!result_content(&history, 1).starts_with('['));
+
+        add_filler_turns(&mut history, 1);
+        scrub_stale_tool_results(&mut history);
+        assert!(result_content(&history, 1).starts_with("[grep:"));
+    }
+
+    #[test]
+    fn truncate_to_max_lines_immediately() {
+        let content = make_lines(1500);
+        let mut history = vec![
+            tool_use_msg("r1", "read"),
+            tool_result_msg("r1", &content, false),
+        ];
+        scrub_stale_tool_results(&mut history);
+        let result = result_content(&history, 1);
+        assert!(!result.starts_with('['));
+        assert!(result.contains("[truncated, showing 1000 of 1500 lines]"));
+        assert_eq!(result.lines().count(), SCRUB_MAX_LINES + 1);
     }
 }

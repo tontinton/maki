@@ -11,7 +11,7 @@ use crate::prompt;
 use crate::provider::Provider;
 use crate::{
     AgentError, AgentEvent, AgentInput, AgentMode, Message, PendingToolCall, TokenUsage,
-    ToolDoneEvent,
+    ToolDoneEvent, scrub_stale_tool_results,
 };
 
 const AGENTS_MD: &str = "AGENTS.md";
@@ -114,6 +114,7 @@ pub fn run(
 
         total_usage += response.usage;
         history.push(response.message);
+        scrub_stale_tool_results(history);
 
         if response.tool_calls.is_empty() {
             event_tx.send(AgentEvent::Done {
