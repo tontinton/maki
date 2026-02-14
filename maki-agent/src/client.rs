@@ -10,7 +10,10 @@ use ureq::Agent;
 
 use crate::auth;
 use crate::tool::ToolCall;
-use crate::{AgentError, AgentEvent, ContentBlock, Message, PendingToolCall, Role, StreamResponse};
+use crate::{
+    AgentError, AgentEvent, ContentBlock, Message, PendingToolCall, Role, StreamResponse,
+    TokenUsage,
+};
 
 #[derive(Deserialize)]
 struct Usage {
@@ -18,6 +21,21 @@ struct Usage {
     input_tokens: u32,
     #[serde(default)]
     output_tokens: u32,
+    #[serde(default)]
+    cache_creation_input_tokens: u32,
+    #[serde(default)]
+    cache_read_input_tokens: u32,
+}
+
+impl From<Usage> for TokenUsage {
+    fn from(u: Usage) -> Self {
+        Self {
+            input: u.input_tokens,
+            output: u.output_tokens,
+            cache_creation: u.cache_creation_input_tokens,
+            cache_read: u.cache_read_input_tokens,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -147,8 +165,7 @@ fn parse_sse(
     let mut tool_calls: Vec<PendingToolCall> = Vec::new();
     let mut current_tool_json = String::new();
     let mut current_event = String::new();
-    let mut input_tokens: u32 = 0;
-    let mut output_tokens: u32 = 0;
+    let mut usage = TokenUsage::default();
 
     for line in reader.lines() {
         let line = line?;
@@ -166,9 +183,9 @@ fn parse_sse(
         match current_event.as_str() {
             "message_start" => {
                 if let Ok(ev) = serde_json::from_str::<MessageStartEvent>(data)
-                    && let Some(usage) = ev.message.usage
+                    && let Some(u) = ev.message.usage
                 {
-                    input_tokens = usage.input_tokens;
+                    usage = TokenUsage::from(u);
                 }
             }
             "content_block_start" => {
@@ -230,9 +247,9 @@ fn parse_sse(
             }
             "message_delta" => {
                 if let Ok(ev) = serde_json::from_str::<MessageDeltaEvent>(data)
-                    && let Some(usage) = ev.usage
+                    && let Some(u) = ev.usage
                 {
-                    output_tokens = usage.output_tokens;
+                    usage.output = u.output_tokens;
                 }
             }
             _ => {}
@@ -245,8 +262,7 @@ fn parse_sse(
             content: content_blocks,
         },
         tool_calls,
-        input_tokens,
-        output_tokens,
+        usage,
     })
 }
 
@@ -259,7 +275,7 @@ mod tests {
     fn parse_sse_text_only() {
         let sse_data = b"\
 event: message_start\n\
-data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":42}}}\n\
+data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":42,\"cache_creation_input_tokens\":5,\"cache_read_input_tokens\":8}}}\n\
 \n\
 event: content_block_start\n\
 data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\
@@ -282,8 +298,15 @@ data: {\"type\":\"message_stop\"}\n";
         let (tx, rx) = mpsc::channel();
         let resp = parse_sse(sse_data.as_slice(), &tx).unwrap();
 
-        assert_eq!(resp.input_tokens, 42);
-        assert_eq!(resp.output_tokens, 10);
+        assert_eq!(
+            resp.usage,
+            TokenUsage {
+                input: 42,
+                output: 10,
+                cache_creation: 5,
+                cache_read: 8
+            }
+        );
         assert_eq!(resp.message.content.len(), 1);
         assert!(
             matches!(&resp.message.content[0], ContentBlock::Text { text } if text == "Hello world")

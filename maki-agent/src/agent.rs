@@ -7,7 +7,9 @@ use std::sync::mpsc::Sender;
 use tracing::info;
 
 use crate::client;
-use crate::{AgentError, AgentEvent, AgentInput, AgentMode, Message, PendingToolCall, ToolOutput};
+use crate::{
+    AgentError, AgentEvent, AgentInput, AgentMode, Message, PendingToolCall, TokenUsage, ToolOutput,
+};
 
 const AGENTS_MD: &str = "AGENTS.md";
 const PLAN_MODE_LABEL: &str = "PLAN mode";
@@ -94,24 +96,25 @@ pub fn run(
 ) -> Result<(), AgentError> {
     history.push(Message::user(input.effective_message()));
     let tools = crate::tool::ToolCall::definitions();
+    let mut total_usage = TokenUsage::default();
 
     loop {
         let response = client::stream_message(history, system, &tools, event_tx)?;
 
         info!(
-            input_tokens = response.input_tokens,
-            output_tokens = response.output_tokens,
+            input_tokens = response.usage.input,
+            output_tokens = response.usage.output,
+            cache_creation = response.usage.cache_creation,
+            cache_read = response.usage.cache_read,
             tool_count = response.tool_calls.len(),
             "API response received"
         );
 
+        total_usage += response.usage;
         history.push(response.message);
 
         if response.tool_calls.is_empty() {
-            event_tx.send(AgentEvent::Done {
-                input_tokens: response.input_tokens,
-                output_tokens: response.output_tokens,
-            })?;
+            event_tx.send(AgentEvent::Done { usage: total_usage })?;
             break;
         }
 

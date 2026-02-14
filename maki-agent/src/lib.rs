@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod auth;
 pub mod client;
+pub mod pricing;
 pub mod tool;
 
 use std::path::PathBuf;
@@ -10,6 +11,8 @@ use std::{env, fs};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+pub use pricing::{ModelPricing, TokenUsage};
 
 const DATA_DIR_NAME: &str = ".maki";
 pub const PLANS_DIR: &str = "plans";
@@ -142,18 +145,9 @@ impl ToolOutput {
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
     TextDelta(String),
-    ToolStart {
-        name: String,
-        input: String,
-    },
-    ToolDone {
-        name: String,
-        output: String,
-    },
-    Done {
-        input_tokens: u32,
-        output_tokens: u32,
-    },
+    ToolStart { name: String, input: String },
+    ToolDone { name: String, output: String },
+    Done { usage: TokenUsage },
     Error(String),
 }
 
@@ -187,6 +181,5 @@ pub struct PendingToolCall {
 pub struct StreamResponse {
     pub message: Message,
     pub tool_calls: Vec<PendingToolCall>,
-    pub input_tokens: u32,
-    pub output_tokens: u32,
+    pub usage: TokenUsage,
 }

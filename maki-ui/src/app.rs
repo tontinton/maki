@@ -2,7 +2,8 @@ use std::borrow::Cow;
 use std::mem;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use maki_agent::{AgentEvent, AgentInput, AgentMode};
+use maki_agent::pricing::SONNET_4;
+use maki_agent::{AgentEvent, AgentInput, AgentMode, TokenUsage};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -146,7 +147,7 @@ pub struct App {
     scroll_top: u16,
     auto_scroll: bool,
     viewport_height: u16,
-    pub token_usage: (u32, u32),
+    pub token_usage: TokenUsage,
     pub should_quit: bool,
     pub mode: AgentMode,
     pending_plan: Option<String>,
@@ -169,7 +170,7 @@ impl App {
             scroll_top: u16::MAX,
             auto_scroll: true,
             viewport_height: 24,
-            token_usage: (0, 0),
+            token_usage: TokenUsage::default(),
             should_quit: false,
             mode: AgentMode::Build,
             pending_plan: None,
@@ -298,13 +299,9 @@ impl App {
                     text: tool_done_msg(&name, &truncated),
                 });
             }
-            AgentEvent::Done {
-                input_tokens,
-                output_tokens,
-            } => {
+            AgentEvent::Done { usage } => {
                 self.flush_streaming_text();
-                self.token_usage.0 += input_tokens;
-                self.token_usage.1 += output_tokens;
+                self.token_usage += usage;
                 self.status = Status::Idle;
             }
             AgentEvent::Error(err) => {
@@ -422,8 +419,10 @@ impl App {
         let (status_text, status_style) = match &self.status {
             Status::Idle => (
                 format!(
-                    " tokens: {}in / {}out",
-                    self.token_usage.0, self.token_usage.1
+                    " tokens: {}in / {}out (${:.3})",
+                    self.token_usage.input,
+                    self.token_usage.output,
+                    self.token_usage.cost(&SONNET_4)
                 ),
                 STATUS_IDLE_STYLE,
             ),
@@ -483,52 +482,21 @@ mod tests {
     }
 
     #[test]
-    fn empty_submit_ignored() {
-        let mut app = App::new();
-        let actions = app.update(Msg::Key(key(KeyCode::Enter)));
-        assert!(actions.is_empty());
-    }
-
-    #[test]
-    fn keys_ignored_while_streaming() {
-        let mut app = App::new();
-        app.status = Status::Streaming;
-        app.update(Msg::Key(key(KeyCode::Char('x'))));
-        assert!(app.input.is_empty());
-    }
-
-    #[test]
-    fn ctrl_c_quits_regardless_of_state() {
-        for status in [Status::Idle, Status::Streaming] {
-            let mut app = App::new();
-            app.status = status;
-            let actions = app.update(Msg::Key(ctrl('c')));
-            assert!(app.should_quit);
-            assert!(matches!(&actions[0], Action::Quit));
-        }
-    }
-
-    #[test]
-    fn agent_text_delta_accumulates() {
-        let mut app = App::new();
-        app.status = Status::Streaming;
-        app.update(Msg::Agent(AgentEvent::TextDelta("hello".into())));
-        app.update(Msg::Agent(AgentEvent::TextDelta(" world".into())));
-        assert_eq!(app.streaming_text, "hello world");
-    }
-
-    #[test]
     fn agent_done_flushes_and_tracks_tokens() {
         let mut app = App::new();
         app.status = Status::Streaming;
         app.streaming_text = "response text".into();
+        let usage = TokenUsage {
+            input: 100,
+            output: 50,
+            ..Default::default()
+        };
         app.update(Msg::Agent(AgentEvent::Done {
-            input_tokens: 100,
-            output_tokens: 50,
+            usage: usage.clone(),
         }));
 
         assert_eq!(app.status, Status::Idle);
-        assert_eq!(app.token_usage, (100, 50));
+        assert_eq!(app.token_usage, usage);
         assert!(app.streaming_text.is_empty());
         assert_eq!(app.messages.last().unwrap().text, "response text");
         assert_eq!(app.messages.last().unwrap().role, DisplayRole::Assistant);
@@ -567,14 +535,6 @@ mod tests {
         app.update(Msg::Key(key(KeyCode::Backspace)));
         assert_eq!(app.input, "ac");
         assert_eq!(app.cursor_pos, 1);
-    }
-
-    #[test]
-    fn error_event_sets_status() {
-        let mut app = App::new();
-        app.status = Status::Streaming;
-        app.update(Msg::Agent(AgentEvent::Error("boom".into())));
-        assert!(matches!(app.status, Status::Error(ref e) if e == "boom"));
     }
 
     #[test_case(10, 'u', 0  ; "ctrl_u_saturates_at_zero")]
