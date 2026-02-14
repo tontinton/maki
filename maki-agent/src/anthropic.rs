@@ -146,14 +146,15 @@ impl Provider for Anthropic {
             cache_control: EPHEMERAL,
         };
 
-        let body = json!({
+        let body_str = json!({
             "model": model.id,
             "max_tokens": model.max_output_tokens,
             "system": [system_block],
             "messages": wire_messages,
             "tools": wire_tools,
             "stream": true,
-        });
+        })
+        .to_string();
 
         for attempt in 1..=MAX_RETRIES {
             debug!(attempt, "sending API request");
@@ -163,7 +164,7 @@ impl Provider for Anthropic {
                     .post(&self.auth.api_url)
                     .header("content-type", "application/json"),
             );
-            let response = req.send(body.to_string().as_str())?;
+            let response = req.send(body_str.as_str())?;
             let status = response.status().as_u16();
 
             if status == 429 || status >= 500 {

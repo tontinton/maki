@@ -171,6 +171,7 @@ impl Provider for Zai {
         if wire_tools.as_array().is_some_and(|a| !a.is_empty()) {
             body["tools"] = wire_tools;
         }
+        let body_str = body.to_string();
 
         for attempt in 1..=MAX_RETRIES {
             debug!(attempt, "sending Z.AI API request");
@@ -180,7 +181,7 @@ impl Provider for Zai {
                 .post(COMPLETIONS_URL)
                 .header("content-type", "application/json")
                 .header("authorization", &format!("Bearer {}", self.api_key));
-            let response = req.send(body.to_string().as_str())?;
+            let response = req.send(body_str.as_str())?;
             let status = response.status().as_u16();
 
             if status == 429 || status >= 500 {

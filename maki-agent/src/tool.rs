@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 
 use crate::{AgentError, AgentMode, ToolDoneEvent, ToolStartEvent};
 
-const MAX_OUTPUT_BYTES: usize = 50_000;
+const MAX_OUTPUT_BYTES: usize = 30_000;
 const MAX_OUTPUT_LINES: usize = 2000;
 const DEFAULT_BASH_TIMEOUT_SECS: u64 = 120;
 const PROCESS_POLL_INTERVAL_MS: u64 = 10;
@@ -526,6 +526,8 @@ fn execute_grep(
     let output = cmd.output().map_err(|e| format!("failed to run rg: {e}"))?;
     let stdout = String::from_utf8_lossy(&output.stdout);
 
+    let prefix = search_path.strip_suffix('/').unwrap_or(&search_path);
+
     let mut files: Vec<(String, Vec<String>)> = Vec::new();
     for line in stdout.lines() {
         let Some((file, rest)) = line.split_once('|') else {
@@ -539,10 +541,14 @@ fn execute_grep(
             text.truncate(MAX_GREP_LINE_LENGTH);
             text.push_str("...");
         }
-        let formatted = format!("  Line {line_num}: {text}");
-        match files.last_mut().filter(|(f, _)| f == file) {
+        let rel = file
+            .strip_prefix(prefix)
+            .and_then(|p| p.strip_prefix('/'))
+            .unwrap_or(file);
+        let formatted = format!("  {line_num}: {text}");
+        match files.last_mut().filter(|(f, _)| f == rel) {
             Some((_, lines)) => lines.push(formatted),
-            None => files.push((file.to_string(), vec![formatted])),
+            None => files.push((rel.to_string(), vec![formatted])),
         }
     }
 
@@ -550,7 +556,11 @@ fn execute_grep(
         return Ok(NO_FILES_FOUND.to_string());
     }
 
-    files.sort_by(|a, b| mtime(Path::new(&b.0)).cmp(&mtime(Path::new(&a.0))));
+    files.sort_by(|a, b| {
+        let a_abs = Path::new(prefix).join(&a.0);
+        let b_abs = Path::new(prefix).join(&b.0);
+        mtime(&b_abs).cmp(&mtime(&a_abs))
+    });
 
     let mut result = String::new();
     let mut total = 0;

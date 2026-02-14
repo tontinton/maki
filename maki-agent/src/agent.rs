@@ -129,6 +129,16 @@ pub fn run(
         }
 
         let tool_results = execute_tools(&response.tool_calls, event_tx, &input.mode);
+
+        let successful_ids: Vec<&str> = tool_results
+            .iter()
+            .filter(|(_, ev)| !ev.is_error)
+            .map(|(id, _)| id.as_str())
+            .collect();
+        if let Some(last_msg) = history.last_mut() {
+            last_msg.scrub_tool_use_inputs(&successful_ids);
+        }
+
         let tool_msg = Message::tool_results(tool_results);
         event_tx.send(AgentEvent::ToolResultsSubmitted {
             message: tool_msg.clone(),
