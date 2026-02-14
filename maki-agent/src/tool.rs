@@ -130,16 +130,23 @@ fn parse_input<T: serde::de::DeserializeOwned>(input: &Value, tool: &str) -> Res
 }
 
 impl ToolCall {
+    pub const BASH: &str = "bash";
+    pub const READ: &str = "read";
+    pub const WRITE: &str = "write";
+    pub const GLOB: &str = "glob";
+    pub const GREP: &str = "grep";
+    pub const TODOWRITE: &str = "todowrite";
+
     pub fn from_api(name: &str, input: &Value) -> Result<Self, AgentError> {
         match name {
-            "bash" => {
+            Self::BASH => {
                 let i: BashInput = parse_input(input, name)?;
                 Ok(Self::Bash {
                     command: i.command,
                     timeout: i.timeout,
                 })
             }
-            "read" => {
+            Self::READ => {
                 let i: ReadInput = parse_input(input, name)?;
                 Ok(Self::Read {
                     path: i.path,
@@ -147,21 +154,21 @@ impl ToolCall {
                     limit: i.limit,
                 })
             }
-            "write" => {
+            Self::WRITE => {
                 let i: WriteInput = parse_input(input, name)?;
                 Ok(Self::Write {
                     path: i.path,
                     content: i.content,
                 })
             }
-            "glob" => {
+            Self::GLOB => {
                 let i: GlobInput = parse_input(input, name)?;
                 Ok(Self::Glob {
                     pattern: i.pattern,
                     path: i.path,
                 })
             }
-            "grep" => {
+            Self::GREP => {
                 let i: GrepInput = parse_input(input, name)?;
                 Ok(Self::Grep {
                     pattern: i.pattern,
@@ -169,7 +176,7 @@ impl ToolCall {
                     include: i.include,
                 })
             }
-            "todowrite" => {
+            Self::TODOWRITE => {
                 #[derive(Deserialize)]
                 struct Input {
                     todos: Vec<TodoItem>,
@@ -243,7 +250,7 @@ impl ToolCall {
     pub fn definitions() -> Value {
         json!([
             {
-                "name": "bash",
+                "name": Self::BASH,
                 "description": include_str!("tools/bash.md"),
                 "input_schema": {
                     "type": "object",
@@ -255,7 +262,7 @@ impl ToolCall {
                 }
             },
             {
-                "name": "read",
+                "name": Self::READ,
                 "description": include_str!("tools/read.md"),
                 "input_schema": {
                     "type": "object",
@@ -268,7 +275,7 @@ impl ToolCall {
                 }
             },
             {
-                "name": "write",
+                "name": Self::WRITE,
                 "description": include_str!("tools/write.md"),
                 "input_schema": {
                     "type": "object",
@@ -280,7 +287,7 @@ impl ToolCall {
                 }
             },
             {
-                "name": "glob",
+                "name": Self::GLOB,
                 "description": include_str!("tools/glob.md"),
                 "input_schema": {
                     "type": "object",
@@ -292,7 +299,7 @@ impl ToolCall {
                 }
             },
             {
-                "name": "grep",
+                "name": Self::GREP,
                 "description": include_str!("tools/grep.md"),
                 "input_schema": {
                     "type": "object",
@@ -305,7 +312,7 @@ impl ToolCall {
                 }
             },
             {
-                "name": "todowrite",
+                "name": Self::TODOWRITE,
                 "description": include_str!("tools/todowrite.md"),
                 "input_schema": {
                     "type": "object",

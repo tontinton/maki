@@ -131,7 +131,7 @@ impl Message {
     pub fn scrub_tool_use_inputs(&mut self, successful_ids: &[&str]) {
         for block in &mut self.content {
             if let ContentBlock::ToolUse { id, name, input } = block
-                && name == "write"
+                && name == tool::ToolCall::WRITE
                 && successful_ids.contains(&id.as_str())
                 && let Some(content) = input.get("content").and_then(|v| v.as_str())
             {
