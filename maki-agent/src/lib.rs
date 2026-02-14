@@ -124,26 +124,37 @@ impl Message {
         }
     }
 
-    /// Replace the full file content inside successful `write` tool calls with
-    /// a short summary. The model's `ToolUse` block stores the entire written
-    /// file in `input.content`, and because we resend the full conversation
-    /// history on every API call, a single 500-line write permanently adds
-    /// ~5-10k tokens to every subsequent request. The tool result already
-    /// confirms success, so the model doesn't need the content again.
+    /// Replace the stale tool contents with a short summary.
+    /// The model's `ToolUse` block stores the entire written file in `input.content`,
+    /// and because we resend the full conversation history on every API call,
+    /// a single 500-line `write`, for example, permanently adds ~5-10k tokens to every request.
+    /// The tool result already confirms success, so the model doesn't need the content again.
     pub fn scrub_tool_use_inputs(&mut self, successful_ids: &[&str]) {
         for block in &mut self.content {
             if let ContentBlock::ToolUse { id, name, input } = block
-                && name == tool::ToolCall::WRITE
                 && successful_ids.contains(&id.as_str())
-                && let Some(content) = input.get("content").and_then(|v| v.as_str())
             {
-                let lines = content.lines().count();
-                let bytes = content.len();
-                input["content"] = Value::String(format!("[{lines} lines, {bytes} bytes]"));
+                match name.as_str() {
+                    tool::ToolCall::WRITE => {
+                        if let Some(content) = input.get("content").and_then(|v| v.as_str()) {
+                            let lines = content.lines().count();
+                            let bytes = content.len();
+                            input["content"] =
+                                Value::String(format!("[{lines} lines, {bytes} bytes]"));
+                        }
+                    }
+                    tool::ToolCall::EDIT => {
+                        for key in &["old_string", "new_string"] {
+                            if let Some(v) = input.get(*key).and_then(|v| v.as_str()) {
+                                input[*key] = Value::String(format!("[{} bytes]", v.len()));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
             }
         }
     }
-
 }
 
 fn scrub_target_name<'a>(msg: &'a Message, tool_use_id: &str) -> Option<&'a str> {

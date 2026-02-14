@@ -55,6 +55,14 @@ struct WriteInput {
 }
 
 #[derive(Deserialize)]
+struct EditInput {
+    path: String,
+    old_string: String,
+    new_string: String,
+    replace_all: Option<bool>,
+}
+
+#[derive(Deserialize)]
 struct GlobInput {
     pattern: String,
     path: Option<String>,
@@ -108,6 +116,12 @@ pub enum ToolCall {
         path: String,
         content: String,
     },
+    Edit {
+        path: String,
+        old_string: String,
+        new_string: String,
+        replace_all: bool,
+    },
     Glob {
         pattern: String,
         path: Option<String>,
@@ -133,6 +147,7 @@ impl ToolCall {
     pub const BASH: &str = "bash";
     pub const READ: &str = "read";
     pub const WRITE: &str = "write";
+    pub const EDIT: &str = "edit";
     pub const GLOB: &str = "glob";
     pub const GREP: &str = "grep";
     pub const TODOWRITE: &str = "todowrite";
@@ -159,6 +174,15 @@ impl ToolCall {
                 Ok(Self::Write {
                     path: i.path,
                     content: i.content,
+                })
+            }
+            Self::EDIT => {
+                let i: EditInput = parse_input(input, name)?;
+                Ok(Self::Edit {
+                    path: i.path,
+                    old_string: i.old_string,
+                    new_string: i.new_string,
+                    replace_all: i.replace_all.unwrap_or(false),
                 })
             }
             Self::GLOB => {
@@ -198,7 +222,9 @@ impl ToolCall {
     pub fn start_event(&self) -> ToolStartEvent {
         let summary = match self {
             Self::Bash { command, .. } => command.clone(),
-            Self::Read { path, .. } | Self::Write { path, .. } => path.clone(),
+            Self::Read { path, .. } | Self::Write { path, .. } | Self::Edit { path, .. } => {
+                path.clone()
+            }
             Self::Glob { pattern, .. } | Self::Grep { pattern, .. } => pattern.clone(),
             Self::TodoWrite { todos } => format!("{} todos", todos.len()),
         };
@@ -208,8 +234,15 @@ impl ToolCall {
         }
     }
 
+    fn mutable_path(&self) -> Option<&str> {
+        match self {
+            Self::Write { path, .. } | Self::Edit { path, .. } => Some(path),
+            _ => None,
+        }
+    }
+
     pub fn execute(&self, mode: &AgentMode) -> ToolDoneEvent {
-        if let Self::Write { path, .. } = self
+        if let Some(path) = self.mutable_path()
             && let AgentMode::Plan(plan_path) = mode
             && path != plan_path
         {
@@ -228,6 +261,12 @@ impl ToolCall {
                 limit,
             } => execute_read(path, *offset, *limit),
             Self::Write { path, content } => execute_write(path, content),
+            Self::Edit {
+                path,
+                old_string,
+                new_string,
+                replace_all,
+            } => execute_edit(path, old_string, new_string, *replace_all),
             Self::Glob { pattern, path } => execute_glob(pattern, path.as_deref()),
             Self::Grep {
                 pattern,
@@ -284,6 +323,20 @@ impl ToolCall {
                         "content": { "type": "string", "description": "The complete file content to write" }
                     },
                     "required": ["path", "content"]
+                }
+            },
+            {
+                "name": Self::EDIT,
+                "description": include_str!("tools/edit.md"),
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Absolute path to the file" },
+                        "old_string": { "type": "string", "description": "Exact string to find (must match uniquely unless replace_all is true)" },
+                        "new_string": { "type": "string", "description": "Replacement string" },
+                        "replace_all": { "type": "boolean", "description": "Replace all occurrences (default false)" }
+                    },
+                    "required": ["path", "old_string", "new_string"]
                 }
             },
             {
@@ -443,6 +496,32 @@ fn execute_read(path: &str, offset: Option<usize>, limit: Option<usize>) -> Resu
         .join("\n");
 
     Ok(truncate_output(numbered))
+}
+
+const EDIT_NO_MATCH: &str = "old_string not found in file";
+const EDIT_MULTIPLE_MATCHES: &str =
+    "old_string matches multiple locations; add surrounding context to make it unique";
+
+fn execute_edit(
+    path: &str,
+    old_string: &str,
+    new_string: &str,
+    replace_all: bool,
+) -> Result<String, String> {
+    let content = fs::read_to_string(path).map_err(|e| format!("read error: {e}"))?;
+    let count = content.matches(old_string).count();
+    if count == 0 {
+        return Err(EDIT_NO_MATCH.into());
+    }
+    if !replace_all && count > 1 {
+        return Err(EDIT_MULTIPLE_MATCHES.into());
+    }
+    let updated = content.replace(old_string, new_string);
+    fs::write(path, &updated).map_err(|e| format!("write error: {e}"))?;
+    Ok(format!(
+        "edited {path} ({count} occurrence{s})",
+        s = if count == 1 { "" } else { "s" }
+    ))
 }
 
 fn execute_write(path: &str, content: &str) -> Result<String, String> {
@@ -752,27 +831,79 @@ mod tests {
     }
 
     #[test]
-    fn plan_mode_write_restrictions() {
+    fn edit_unique_and_replace_all() {
+        let dir = temp_dir("maki_test_edit");
+        let path = dir.join("file.rs").to_string_lossy().to_string();
+
+        // unique match
+        fs::write(&path, "fn old() {}\nfn keep() {}").unwrap();
+        execute_edit(&path, "fn old() {}", "fn new() {}", false).unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "fn new() {}\nfn keep() {}"
+        );
+
+        // replace_all
+        fs::write(&path, "let x = 1;\nlet x = 1;\nlet y = 2;").unwrap();
+        let msg = execute_edit(&path, "let x = 1;", "let x = 9;", true).unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "let x = 9;\nlet x = 9;\nlet y = 2;"
+        );
+        assert!(msg.contains("2 occurrence"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_rejects_no_match_and_ambiguous() {
+        let dir = temp_dir("maki_test_edit_err");
+        let path = dir.join("file.rs").to_string_lossy().to_string();
+
+        fs::write(&path, "let x = 1;\nlet x = 1;").unwrap();
+        assert_eq!(
+            execute_edit(&path, "NOPE", "b", false).unwrap_err(),
+            EDIT_NO_MATCH
+        );
+        assert_eq!(
+            execute_edit(&path, "let x = 1;", "let x = 2;", false).unwrap_err(),
+            EDIT_MULTIPLE_MATCHES
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn plan_mode_restricts_mutations() {
         let plan_path = env::temp_dir()
             .join("maki_test_plan.md")
             .to_string_lossy()
             .to_string();
         let mode = AgentMode::Plan(plan_path.clone());
 
-        let blocked = ToolCall::Write {
-            path: "/tmp/other.rs".into(),
-            content: "fn main(){}".into(),
-        };
-        let result = blocked.execute(&mode);
-        assert!(result.is_error);
-        assert_eq!(result.content, PLAN_WRITE_RESTRICTED);
+        let cases: Vec<ToolCall> = vec![
+            ToolCall::Write {
+                path: "/tmp/other.rs".into(),
+                content: "x".into(),
+            },
+            ToolCall::Edit {
+                path: "/tmp/other.rs".into(),
+                old_string: "a".into(),
+                new_string: "b".into(),
+                replace_all: false,
+            },
+        ];
+        for tool in &cases {
+            let result = tool.execute(&mode);
+            assert!(result.is_error);
+            assert_eq!(result.content, PLAN_WRITE_RESTRICTED);
+        }
 
         let allowed = ToolCall::Write {
             path: plan_path.clone(),
             content: "plan content".into(),
         };
-        let result = allowed.execute(&mode);
-        assert!(!result.is_error);
+        assert!(!allowed.execute(&mode).is_error);
 
         let _ = fs::remove_file(&plan_path);
     }
