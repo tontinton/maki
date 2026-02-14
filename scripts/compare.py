@@ -61,6 +61,8 @@ def parse_args():
 def resolve_model(agent, model):
     if agent == "opencode" and model.startswith("zai/"):
         return model.replace("zai/", "zai-coding-plan/", 1)
+    if agent == "claude-code" and model.startswith("anthropic/"):
+        return model.removeprefix("anthropic/")
     return model
 
 
