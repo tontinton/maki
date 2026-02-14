@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Coding agent analytics collector - runs Claude Code or OpenCode headless, appends to CSV."""
+"""Coding agent analytics collector - runs Maki, Claude Code, or OpenCode headless, appends to CSV."""
 
 import argparse
 import csv
@@ -10,13 +10,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-AGENTS = ("claude-code", "opencode")
+AGENTS = ("maki", "claude-code", "opencode")
 
 
 def parse_args():
     p = argparse.ArgumentParser(description="Run coding agent with analytics collection")
     p.add_argument("prompt", help="Prompt to send")
-    p.add_argument("--agent", choices=AGENTS, default="claude-code")
+    p.add_argument("--agent", choices=AGENTS, default="maki")
     p.add_argument("--model", default=None)
     p.add_argument("--max-turns", type=int, default=None)
     p.add_argument("--max-budget-usd", type=float, default=None)
@@ -24,6 +24,18 @@ def parse_args():
     p.add_argument("--output", default="runs.csv", help="CSV output path")
     p.add_argument("--tag", default=None)
     return p.parse_args()
+
+
+def build_cmd_maki(args):
+    cmd = [
+        "maki", "-p", "--verbose", "--output-format", "stream-json",
+        args.prompt,
+    ]
+    if args.model:
+        cmd += ["-m", args.model]
+    if args.max_turns is not None:
+        cmd += ["--max-turns", str(args.max_turns)]
+    return cmd
 
 
 def build_cmd_claude(args):
@@ -272,6 +284,7 @@ def process_claude_stream(proc, meta):
 
 
 STREAM_PROCESSORS = {
+    "maki": (build_cmd_maki, process_claude_stream),
     "claude-code": (build_cmd_claude, process_claude_stream),
     "opencode": (build_cmd_opencode, process_opencode_stream),
 }
