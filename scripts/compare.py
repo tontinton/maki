@@ -14,7 +14,7 @@ from pathlib import Path
 def _ts():
     return datetime.now().strftime("%H:%M:%S")
 
-DEFAULT_AGENTS = ["maki", "opencode"]
+DEFAULT_AGENTS = ["claude-code", "maki", "opencode"]
 DEFAULT_MODEL = "anthropic/claude-haiku-4-5"
 COLLECT_SCRIPT = Path(__file__).parent / "collect.py"
 ANALYZE_SCRIPT = Path(__file__).parent / "analyze.py"
