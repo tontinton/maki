@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Claude Code analytics collector - parses stream-json output, appends to CSV."""
+"""Coding agent analytics collector - runs Claude Code or OpenCode headless, appends to CSV."""
 
 import argparse
 import csv
@@ -10,9 +10,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
+AGENTS = ("claude-code", "opencode")
+
+
 def parse_args():
-    p = argparse.ArgumentParser(description="Wrap claude -p with analytics collection")
-    p.add_argument("prompt", help="Prompt to send to claude")
+    p = argparse.ArgumentParser(description="Run coding agent with analytics collection")
+    p.add_argument("prompt", help="Prompt to send")
+    p.add_argument("--agent", choices=AGENTS, default="claude-code")
     p.add_argument("--model", default=None)
     p.add_argument("--max-turns", type=int, default=None)
     p.add_argument("--max-budget-usd", type=float, default=None)
@@ -22,7 +26,7 @@ def parse_args():
     return p.parse_args()
 
 
-def build_cmd(args):
+def build_cmd_claude(args):
     cmd = [
         "claude", "-p", "--verbose", "--output-format", "stream-json",
         "--dangerously-skip-permissions", args.prompt,
@@ -33,6 +37,13 @@ def build_cmd(args):
         cmd += ["--max-turns", str(args.max_turns)]
     if args.max_budget_usd is not None:
         cmd += ["--max-budget-usd", str(args.max_budget_usd)]
+    return cmd
+
+
+def build_cmd_opencode(args):
+    cmd = ["opencode", "run", "--format", "json", "--dir", args.cwd, args.prompt]
+    if args.model:
+        cmd += ["--model", args.model]
     return cmd
 
 
@@ -97,8 +108,86 @@ def process_result(msg, meta):
     }
 
 
+def opencode_usage(tokens):
+    return {
+        "input_tokens": tokens.get("input", 0),
+        "output_tokens": tokens.get("output", 0),
+        "cache_read_input_tokens": tokens.get("cache", {}).get("read", 0),
+        "cache_creation_input_tokens": tokens.get("cache", {}).get("write", 0),
+    }
+
+
+def process_opencode_stream(proc, meta):
+    turn_usage = {}
+    all_tool_calls = []
+    turn_index = -1
+    result_text = ""
+    total_cost = 0
+    total_tokens = {"input_tokens": 0, "output_tokens": 0,
+                    "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}
+    first_ts = None
+    last_ts = None
+
+    for raw_line in proc.stdout:
+        line = raw_line.decode("utf-8", errors="replace").strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+        msg_type = msg.get("type")
+        part = msg.get("part", {})
+        ts = msg.get("timestamp")
+        if ts and first_ts is None:
+            first_ts = ts
+
+        if not meta.get("session_id"):
+            meta["session_id"] = msg.get("sessionID")
+
+        if msg_type == "step_start":
+            turn_index += 1
+            print(f"[turn {turn_index + 1}] start", file=sys.stderr)
+
+        elif msg_type == "tool_use":
+            state = part.get("state", {})
+            inp = state.get("input", {})
+            all_tool_calls.append({
+                "turn": turn_index,
+                "name": part.get("tool", ""),
+                "input": inp,
+            })
+            print(f"[turn {turn_index + 1}] tool_use {part.get('tool', '?')}", file=sys.stderr)
+
+        elif msg_type == "text":
+            result_text = part.get("text", "")
+
+        elif msg_type == "step_finish":
+            last_ts = ts
+            cost = part.get("cost", 0)
+            total_cost += cost
+            tokens = opencode_usage(part.get("tokens", {}))
+            turn_usage[turn_index] = tokens
+            for k in total_tokens:
+                total_tokens[k] += tokens.get(k, 0)
+            print(f"[turn {turn_index + 1}] finish reason={part.get('reason', '?')}", file=sys.stderr)
+
+    duration_ms = (last_ts - first_ts) if (first_ts and last_ts) else 0
+    num_turns = max(turn_index + 1, 0)
+    print(f"[done] {num_turns} turns, ${total_cost:.3f}, {duration_ms / 1000:.1f}s", file=sys.stderr)
+
+    summary = {
+        "total_cost_usd": total_cost,
+        "duration_ms": duration_ms,
+        "num_turns": num_turns,
+        "usage": total_tokens,
+    }
+    return summary, turn_usage, all_tool_calls, result_text
+
+
 CSV_FIELDS = [
-    "timestamp", "session_id", "tag", "model", "prompt",
+    "timestamp", "agent", "session_id", "tag", "model", "prompt",
     "run_cost_usd", "run_duration_ms", "run_num_turns",
     "run_input_tokens", "run_output_tokens", "run_cache_read", "run_cache_write",
     "turn", "tool_name", "tool_input",
@@ -118,6 +207,7 @@ def usage_fields(usage, prefix):
 def append_csv(csv_path, meta, summary, turn_usage, tool_calls):
     run_base = {
         "timestamp": meta.get("timestamp", ""),
+        "agent": meta.get("agent", ""),
         "session_id": meta.get("session_id", ""),
         "tag": meta.get("tag", ""),
         "model": meta.get("model", ""),
@@ -152,23 +242,12 @@ def append_csv(csv_path, meta, summary, turn_usage, tool_calls):
         w.writerows(rows)
 
 
-def run(args):
-    meta = {
-        "prompt": args.prompt,
-        "model": args.model,
-        "tag": args.tag,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "session_id": None,
-    }
+def process_claude_stream(proc, meta):
     turn_usage = {}
     all_tool_calls = []
     turn_index = 0
     summary = {}
     result_text = ""
-
-    cmd = build_cmd(args)
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, cwd=args.cwd)
-    assert proc.stdout is not None
 
     for raw_line in proc.stdout:
         line = raw_line.decode("utf-8", errors="replace").strip()
@@ -189,6 +268,31 @@ def run(args):
             result_text = msg.get("result", "")
             summary = process_result(msg, meta)
 
+    return summary, turn_usage, all_tool_calls, result_text
+
+
+STREAM_PROCESSORS = {
+    "claude-code": (build_cmd_claude, process_claude_stream),
+    "opencode": (build_cmd_opencode, process_opencode_stream),
+}
+
+
+def run(args):
+    meta = {
+        "prompt": args.prompt,
+        "agent": args.agent,
+        "model": args.model,
+        "tag": args.tag,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "session_id": None,
+    }
+
+    build_cmd, process_stream = STREAM_PROCESSORS[args.agent]
+    cmd = build_cmd(args)
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, cwd=args.cwd)
+    assert proc.stdout is not None
+
+    summary, turn_usage, all_tool_calls, result_text = process_stream(proc, meta)
     proc.wait()
 
     csv_path = Path(args.output)
