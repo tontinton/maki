@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -8,6 +9,7 @@ use tracing::warn;
 
 const GLOBAL_CONFIG_FILE: &str = "config.toml";
 pub const PROJECT_CONFIG_FILE: &str = "maki.toml";
+const PERMISSIONS_FILE: &str = ".config/maki/permissions.toml";
 
 const DEFAULT_MAX_OUTPUT_BYTES: usize = 50 * 1024;
 pub const DEFAULT_MAX_OUTPUT_LINES: usize = 2000;
@@ -151,13 +153,75 @@ struct IndexFileConfig {
     max_file_size_mb: Option<u64>,
 }
 
+#[derive(Default)]
+struct PermissionsFileConfig {
+    allow_all: Option<bool>,
+    tools: HashMap<String, ToolPermissions>,
+}
+
+impl<'de> Deserialize<'de> for PermissionsFileConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let table = toml::Table::deserialize(deserializer)?;
+        let allow_all = table.get("allow_all").and_then(|v| v.as_bool());
+        let mut tools = HashMap::new();
+        for (k, v) in &table {
+            if k == "allow_all" {
+                continue;
+            }
+            if let Ok(tp) = v.clone().try_into::<ToolPermissions>() {
+                tools.insert(k.clone(), tp);
+            }
+        }
+        Ok(Self { allow_all, tools })
+    }
+}
+
+#[derive(Deserialize)]
+struct ToolPermissions {
+    allow: Option<ScopeSet>,
+    deny: Option<ScopeSet>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ScopeSet {
+    All(bool),
+    Scopes(Vec<String>),
+}
+
 // --- Runtime structs ---
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Effect {
+    Allow,
+    Deny,
+}
+
+#[derive(Debug, Clone)]
+pub enum PermissionTarget {
+    Global,
+    Project(PathBuf),
+}
+
+#[derive(Debug, Clone)]
+pub struct PermissionRule {
+    pub tool: String,
+    pub scope: Option<String>,
+    pub effect: Effect,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PermissionsConfig {
+    pub allow_all: bool,
+    pub rules: Vec<PermissionRule>,
+}
 
 pub struct Config {
     pub ui: UiConfig,
     pub agent: AgentConfig,
     pub provider: ProviderConfig,
     pub storage: StorageConfig,
+    pub permissions: PermissionsConfig,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -530,6 +594,52 @@ impl Config {
     }
 }
 
+fn push_rules(
+    rules: &mut Vec<PermissionRule>,
+    tools: &HashMap<String, ToolPermissions>,
+    effect: Effect,
+) {
+    for (tool, perms) in tools {
+        let scope_set = match effect {
+            Effect::Deny => &perms.deny,
+            Effect::Allow => &perms.allow,
+        };
+        let Some(scope_set) = scope_set else {
+            continue;
+        };
+        match scope_set {
+            ScopeSet::All(true) => rules.push(PermissionRule {
+                tool: tool.clone(),
+                scope: None,
+                effect,
+            }),
+            ScopeSet::Scopes(scopes) => {
+                for s in scopes {
+                    rules.push(PermissionRule {
+                        tool: tool.clone(),
+                        scope: Some(s.clone()),
+                        effect,
+                    });
+                }
+            }
+            ScopeSet::All(false) => {}
+        }
+    }
+}
+
+fn build_permissions(
+    global: PermissionsFileConfig,
+    project: PermissionsFileConfig,
+) -> PermissionsConfig {
+    let allow_all = global.allow_all.unwrap_or(false);
+    let mut rules = Vec::new();
+    for tools in [&global.tools, &project.tools] {
+        push_rules(&mut rules, tools, Effect::Deny);
+        push_rules(&mut rules, tools, Effect::Allow);
+    }
+    PermissionsConfig { allow_all, rules }
+}
+
 pub fn load_config(cwd: &Path, no_rtk: bool) -> Config {
     let mut base = toml::Table::new();
     if let Some(t) = global_config_path().and_then(|p| read_table(&p)) {
@@ -545,11 +655,39 @@ pub fn load_config(cwd: &Path, no_rtk: bool) -> Config {
             RawConfig::default()
         }
     };
+
+    let permissions = load_permissions(cwd);
+
     Config {
         ui: UiConfig::from_file(raw.ui),
         agent: AgentConfig::from_file(raw.agent, no_rtk, &raw.index),
         provider: ProviderConfig::from_file(raw.provider),
         storage: StorageConfig::from_file(raw.storage),
+        permissions,
+    }
+}
+
+fn load_permissions(cwd: &Path) -> PermissionsConfig {
+    let global_perms = home_dir()
+        .and_then(|h| read_permissions_file(&h.join(PERMISSIONS_FILE)))
+        .unwrap_or_default();
+
+    let project_perms = read_table(&cwd.join(PROJECT_CONFIG_FILE))
+        .and_then(|t| t.get("permissions").cloned())
+        .and_then(|v| v.try_into::<PermissionsFileConfig>().ok())
+        .unwrap_or_default();
+
+    build_permissions(global_perms, project_perms)
+}
+
+fn read_permissions_file(path: &Path) -> Option<PermissionsFileConfig> {
+    let content = fs::read_to_string(path).ok()?;
+    match toml::from_str(&content) {
+        Ok(p) => Some(p),
+        Err(e) => {
+            warn!(path = %path.display(), error = %e, "failed to parse permissions");
+            None
+        }
     }
 }
 
@@ -584,6 +722,145 @@ pub fn global_config_path() -> Option<PathBuf> {
     {
         dirs::config_dir().map(|c| c.join("maki").join(GLOBAL_CONFIG_FILE))
     }
+}
+
+pub fn append_permission_rule(
+    tool: &str,
+    scope: Option<&str>,
+    effect: Effect,
+    target: &PermissionTarget,
+) -> Result<(), String> {
+    match target {
+        PermissionTarget::Global => append_global_permission(tool, scope, effect),
+        PermissionTarget::Project(cwd) => append_project_permission(tool, scope, effect, cwd),
+    }
+}
+
+fn append_global_permission(tool: &str, scope: Option<&str>, effect: Effect) -> Result<(), String> {
+    let path = home_dir()
+        .ok_or_else(|| "cannot determine home directory".to_string())?
+        .join(PERMISSIONS_FILE);
+    let content = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut doc: toml_edit::DocumentMut = content
+        .parse()
+        .map_err(|e| format!("failed to parse permissions: {e}"))?;
+
+    insert_permission_entry(&mut doc, tool, scope, effect)?;
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("cannot create config dir: {e}"))?;
+    }
+    std::fs::write(&path, doc.to_string()).map_err(|e| format!("cannot write permissions: {e}"))?;
+    Ok(())
+}
+
+fn append_project_permission(
+    tool: &str,
+    scope: Option<&str>,
+    effect: Effect,
+    cwd: &Path,
+) -> Result<(), String> {
+    let path = cwd.join(PROJECT_CONFIG_FILE);
+    let content = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut doc: toml_edit::DocumentMut = content
+        .parse()
+        .map_err(|e| format!("failed to parse {PROJECT_CONFIG_FILE}: {e}"))?;
+
+    let perms = doc
+        .entry("permissions")
+        .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
+    let perms = perms
+        .as_table_like_mut()
+        .ok_or_else(|| "[permissions] is not a table".to_string())?;
+
+    let tool_item = perms
+        .entry(tool)
+        .or_insert(toml_edit::Item::Table(toml_edit::Table::new()));
+    let tool_table = tool_item
+        .as_table_like_mut()
+        .ok_or_else(|| format!("[permissions.{tool}] is not a table"))?;
+
+    let key = match effect {
+        Effect::Allow => "allow",
+        Effect::Deny => "deny",
+    };
+
+    match scope {
+        Some(s) => {
+            let arr =
+                tool_table
+                    .entry(key)
+                    .or_insert(toml_edit::Item::Value(toml_edit::Value::Array(
+                        toml_edit::Array::new(),
+                    )));
+            let arr = arr
+                .as_array_mut()
+                .ok_or_else(|| format!("[permissions.{tool}].{key} is not an array"))?;
+            let already_exists = arr
+                .iter()
+                .any(|v| v.as_str().is_some_and(|existing| existing == s));
+            if !already_exists {
+                arr.push(s);
+                arr.set_trailing("\n");
+                arr.set_trailing_comma(true);
+                for item in arr.iter_mut() {
+                    item.decor_mut().set_prefix("\n    ");
+                }
+            }
+        }
+        None => {
+            tool_table.insert(key, toml_edit::Item::Value(toml_edit::Value::from(true)));
+        }
+    }
+
+    std::fs::write(&path, doc.to_string())
+        .map_err(|e| format!("cannot write {PROJECT_CONFIG_FILE}: {e}"))?;
+    Ok(())
+}
+
+fn insert_permission_entry(
+    doc: &mut toml_edit::DocumentMut,
+    tool: &str,
+    scope: Option<&str>,
+    effect: Effect,
+) -> Result<(), String> {
+    let key = match effect {
+        Effect::Allow => "allow",
+        Effect::Deny => "deny",
+    };
+
+    let tool_table = doc
+        .entry(tool)
+        .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
+    let tool_table = tool_table
+        .as_table_mut()
+        .ok_or_else(|| format!("[{tool}] is not a table"))?;
+
+    match scope {
+        Some(s) => {
+            let arr = tool_table.entry(key).or_insert_with(|| {
+                toml_edit::Item::Value(toml_edit::Value::Array(toml_edit::Array::new()))
+            });
+            let arr = arr
+                .as_array_mut()
+                .ok_or_else(|| format!("[{tool}].{key} is not an array"))?;
+            let already_exists = arr
+                .iter()
+                .any(|v| v.as_str().is_some_and(|existing| existing == s));
+            if !already_exists {
+                arr.push(s);
+                arr.set_trailing("\n");
+                arr.set_trailing_comma(true);
+                for item in arr.iter_mut() {
+                    item.decor_mut().set_prefix("\n    ");
+                }
+            }
+        }
+        None => {
+            tool_table.insert(key, toml_edit::value(true));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -767,6 +1044,7 @@ mod tests {
             agent: AgentConfig::default(),
             provider: ProviderConfig::default(),
             storage: StorageConfig::default(),
+            permissions: PermissionsConfig::default(),
         };
         match (section, field) {
             ("provider", "connect_timeout_secs") => {
@@ -781,5 +1059,183 @@ mod tests {
         let err = config.validate().unwrap_err();
         assert_eq!(err.section, section);
         assert_eq!(err.field, field);
+    }
+
+    struct HomeGuard {
+        dir: TempDir,
+        saved: Option<std::ffi::OsString>,
+    }
+
+    impl HomeGuard {
+        fn new() -> Self {
+            let dir = TempDir::new().unwrap();
+            let saved = env::var_os("HOME");
+            unsafe { env::set_var("HOME", dir.path()) };
+            Self { dir, saved }
+        }
+
+        fn write_permissions(&self, content: &str) {
+            let perms_dir = self.dir.path().join(".config/maki");
+            fs::create_dir_all(&perms_dir).unwrap();
+            fs::write(perms_dir.join("permissions.toml"), content).unwrap();
+        }
+
+        fn path(&self) -> &Path {
+            self.dir.path()
+        }
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            match &self.saved {
+                Some(v) => unsafe { env::set_var("HOME", v) },
+                None => unsafe { env::remove_var("HOME") },
+            }
+        }
+    }
+
+    #[test]
+    fn permissions_loaded_from_permissions_file() {
+        let guard = HomeGuard::new();
+        guard.write_permissions(
+            "allow_all = true\n\n\
+             [bash]\nallow = [\n    \"cargo *\",\n]\ndeny = [\n    \"rm -rf *\",\n]\n",
+        );
+
+        let perms = load_permissions(guard.path());
+        assert!(perms.allow_all);
+        assert_eq!(perms.rules.len(), 2);
+        assert_eq!(perms.rules[0].effect, Effect::Deny);
+        assert_eq!(perms.rules[0].tool, "bash");
+        assert_eq!(perms.rules[0].scope.as_deref(), Some("rm -rf *"));
+        assert_eq!(perms.rules[1].effect, Effect::Allow);
+        assert_eq!(perms.rules[1].tool, "bash");
+        assert_eq!(perms.rules[1].scope.as_deref(), Some("cargo *"));
+    }
+
+    #[test]
+    fn permissions_merge_global_and_project() {
+        let guard = HomeGuard::new();
+        guard.write_permissions("[bash]\nallow = [\"git *\"]\ndeny = [\"rm -rf *\"]\n");
+        fs::write(
+            guard.path().join("maki.toml"),
+            "[permissions.read]\nallow = true\n\
+             [permissions.write]\ndeny = [\"/etc/*\"]\n",
+        )
+        .unwrap();
+
+        let perms = load_permissions(guard.path());
+        assert!(!perms.allow_all);
+        assert_eq!(perms.rules.len(), 4);
+
+        let deny_rules: Vec<_> = perms
+            .rules
+            .iter()
+            .filter(|r| r.effect == Effect::Deny)
+            .collect();
+        let allow_rules: Vec<_> = perms
+            .rules
+            .iter()
+            .filter(|r| r.effect == Effect::Allow)
+            .collect();
+
+        assert_eq!(deny_rules.len(), 2);
+        assert_eq!(deny_rules[0].tool, "bash");
+        assert_eq!(deny_rules[1].tool, "write");
+
+        assert_eq!(allow_rules.len(), 2);
+        assert_eq!(allow_rules[0].tool, "bash");
+        assert_eq!(allow_rules[1].tool, "read");
+    }
+
+    #[test]
+    fn project_allow_all_ignored() {
+        let guard = HomeGuard::new();
+        fs::write(
+            guard.path().join("maki.toml"),
+            "[permissions]\nallow_all = true\n",
+        )
+        .unwrap();
+
+        let perms = load_permissions(guard.path());
+        assert!(!perms.allow_all);
+    }
+
+    #[test]
+    fn append_permission_rule_writes_to_permissions_file() {
+        let guard = HomeGuard::new();
+        let perms_dir = guard.path().join(".config/maki");
+        fs::create_dir_all(&perms_dir).unwrap();
+
+        append_permission_rule(
+            "bash",
+            Some("cargo *"),
+            Effect::Allow,
+            &PermissionTarget::Global,
+        )
+        .unwrap();
+        append_permission_rule(
+            "bash",
+            Some("rm -rf *"),
+            Effect::Deny,
+            &PermissionTarget::Global,
+        )
+        .unwrap();
+
+        let content = fs::read_to_string(perms_dir.join("permissions.toml")).unwrap();
+        assert!(content.contains("[bash]"));
+        assert!(content.contains("cargo *"));
+        assert!(content.contains("rm -rf *"));
+        assert!(!content.contains("[permissions]"));
+    }
+
+    #[test]
+    fn no_permissions_file_returns_defaults() {
+        let guard = HomeGuard::new();
+        let perms = load_permissions(guard.path());
+        assert!(!perms.allow_all);
+        assert!(perms.rules.is_empty());
+    }
+
+    #[test]
+    fn deny_rules_before_allow_rules() {
+        let guard = HomeGuard::new();
+        guard.write_permissions("[bash]\nallow = [\"git *\"]\ndeny = [\"rm *\"]\n");
+
+        let perms = load_permissions(guard.path());
+        assert_eq!(perms.rules[0].effect, Effect::Deny);
+        assert_eq!(perms.rules[1].effect, Effect::Allow);
+    }
+
+    #[test]
+    fn append_permission_rule_deduplicates() {
+        let guard = HomeGuard::new();
+        let perms_dir = guard.path().join(".config/maki");
+        fs::create_dir_all(&perms_dir).unwrap();
+
+        append_permission_rule(
+            "bash",
+            Some("cargo *"),
+            Effect::Allow,
+            &PermissionTarget::Global,
+        )
+        .unwrap();
+        append_permission_rule(
+            "bash",
+            Some("cargo *"),
+            Effect::Allow,
+            &PermissionTarget::Global,
+        )
+        .unwrap();
+        append_permission_rule(
+            "bash",
+            Some("cargo *"),
+            Effect::Allow,
+            &PermissionTarget::Global,
+        )
+        .unwrap();
+
+        let content = fs::read_to_string(perms_dir.join("permissions.toml")).unwrap();
+        assert_eq!(content.matches("cargo *").count(), 1);
     }
 }
