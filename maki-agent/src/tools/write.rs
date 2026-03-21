@@ -59,4 +59,8 @@ impl super::ToolDefaults for Write {
     fn mutable_path(&self) -> Option<&str> {
         Some(&self.path)
     }
+
+    fn permission(&self) -> Option<String> {
+        Some(crate::permissions::canonicalize_scope_path(&self.path))
+    }
 }

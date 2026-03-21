@@ -105,7 +105,11 @@ impl WebSearch {
     }
 }
 
-impl super::ToolDefaults for WebSearch {}
+impl super::ToolDefaults for WebSearch {
+    fn permission(&self) -> Option<String> {
+        Some(self.query.clone())
+    }
+}
 
 fn parse_sse_response(body: &str) -> Result<String, String> {
     for line in body.lines() {

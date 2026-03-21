@@ -12,7 +12,10 @@ use maki_interpreter::{AsyncResolver, PendingCall};
 use maki_tool_macro::Tool;
 use serde_json::Value;
 
+use std::sync::Arc;
+
 use crate::cancel::CancelToken;
+use crate::permissions::PermissionManager;
 use crate::task_set::TaskSet;
 use crate::{AgentConfig, AgentEvent, AgentMode, EventSender, ToolInput, ToolOutput};
 
@@ -56,6 +59,7 @@ impl CodeInterpreter {
         let mode = ctx.mode.clone();
         let cancel = ctx.cancel.clone();
         let config = ctx.config;
+        let permissions = ctx.permissions.clone();
         let deadline = Deadline::after(timeout);
         let limits = runner::limits(timeout, config.interpreter_max_memory_mb * 1024 * 1024);
 
@@ -64,8 +68,10 @@ impl CodeInterpreter {
         // There is no safe way to kill a blocking thread.
         ctx.cancel
             .race(smol::unblock(move || {
-                let tools = build_tool_fns(&event_tx, &mode, &cancel, deadline, config);
-                let resolver = build_async_resolver(&event_tx, &mode, &cancel, deadline, config);
+                let tools =
+                    build_tool_fns(&event_tx, &mode, &cancel, deadline, config, &permissions);
+                let resolver =
+                    build_async_resolver(&event_tx, &mode, &cancel, deadline, config, &permissions);
                 let code = format!("{PREAMBLE}{code}");
 
                 let result = if let Some(ref id) = tool_use_id {
@@ -132,6 +138,10 @@ impl super::ToolDefaults for CodeInterpreter {
     fn augment_description(description: &mut String, _ctx: &super::DescriptionContext) {
         description.push_str(&super::build_interpreter_tools_description());
     }
+
+    fn permission(&self) -> Option<String> {
+        Some("code_execution".into())
+    }
 }
 
 fn build_tool_fns(
@@ -140,6 +150,7 @@ fn build_tool_fns(
     cancel: &CancelToken,
     deadline: Deadline,
     config: AgentConfig,
+    permissions: &Arc<PermissionManager>,
 ) -> HashMap<String, ToolFn> {
     let mut tools: HashMap<String, ToolFn> = HashMap::new();
 
@@ -148,6 +159,7 @@ fn build_tool_fns(
         let tx = event_tx.clone();
         let mode = mode.clone();
         let cancel = cancel.clone();
+        let permissions = Arc::clone(permissions);
 
         tools.insert(
             name.clone(),
@@ -159,7 +171,12 @@ fn build_tool_fns(
                     let call = super::ToolCall::from_api(fn_name, &input)
                         .map_err(|e| format!("tool parse error: {e}"))?;
 
-                    let mut inner_ctx = super::interpreter_ctx(&mode, &tx, cancel.clone());
+                    let mut inner_ctx = super::interpreter_ctx(
+                        &mode,
+                        &tx,
+                        cancel.clone(),
+                        Arc::clone(&permissions),
+                    );
                     inner_ctx.deadline = deadline;
                     inner_ctx.config = config;
                     let done = block_on(call.execute(&inner_ctx, String::new()));
@@ -182,10 +199,12 @@ fn build_async_resolver(
     cancel: &CancelToken,
     deadline: Deadline,
     config: AgentConfig,
+    permissions: &Arc<PermissionManager>,
 ) -> AsyncResolver {
     let tx = event_tx.clone();
     let mode = mode.clone();
     let cancel = cancel.clone();
+    let permissions = Arc::clone(permissions);
 
     Box::new(move |pending_calls: Vec<PendingCall>| {
         smol::future::block_on(async {
@@ -195,6 +214,7 @@ fn build_async_resolver(
                 let tx = tx.clone();
                 let mode = mode.clone();
                 let cancel = cancel.clone();
+                let permissions = Arc::clone(&permissions);
 
                 set.spawn(async move {
                     if let Err(e) = deadline.check() {
@@ -210,7 +230,8 @@ fn build_async_resolver(
                         Err(e) => return (pc.call_id, Err(format!("tool parse error: {e}"))),
                     };
 
-                    let mut inner_ctx = super::interpreter_ctx(&mode, &tx, cancel);
+                    let mut inner_ctx =
+                        super::interpreter_ctx(&mode, &tx, cancel, Arc::clone(&permissions));
                     inner_ctx.deadline = deadline;
                     inner_ctx.config = config;
                     let done = call.execute(&inner_ctx, String::new()).await;

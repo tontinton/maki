@@ -89,11 +89,14 @@ impl Task {
         let (sub_tx, sub_rx) = flume::unbounded::<crate::Envelope>();
         let sub_event_tx = EventSender::new(sub_tx, ctx.event_tx.run_id());
         let parent_tx = ctx.event_tx.clone();
+        let (answer_tx, answer_rx) = flume::unbounded::<String>();
+        let answer_rx = Arc::new(async_lock::Mutex::new(answer_rx));
         let subagent_info = ctx.tool_use_id.as_ref().map(|id| SubagentInfo {
             parent_tool_use_id: id.to_owned(),
             name: self.description.clone(),
             prompt: Some(self.prompt.clone()),
             model: Some(model.spec()),
+            answer_tx: Some(answer_tx),
         });
         smol::spawn(async move {
             while let Ok(mut envelope) = sub_rx.recv_async().await {
@@ -125,6 +128,7 @@ impl Task {
                 model,
                 skills: Arc::clone(&ctx.skills),
                 config: ctx.config,
+                permissions: Arc::clone(&ctx.permissions),
             },
             AgentRunParams {
                 history: crate::History::new(Vec::new()),
@@ -133,6 +137,7 @@ impl Task {
                 tools,
             },
         )
+        .with_user_response_rx(answer_rx)
         .with_cancel(child_cancel);
         let start = Instant::now();
         let outcome = agent.run(input).await;
@@ -165,7 +170,11 @@ impl Task {
     }
 }
 
-impl super::ToolDefaults for Task {}
+impl super::ToolDefaults for Task {
+    fn permission(&self) -> Option<String> {
+        Some(format!("task:{}", self.description))
+    }
+}
 
 #[cfg(test)]
 mod tests {

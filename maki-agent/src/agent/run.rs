@@ -13,6 +13,7 @@ use super::streaming::stream_with_retry;
 use super::tool_dispatch::{self, RecentCalls};
 use crate::cancel::CancelToken;
 use crate::mcp::McpManager;
+use crate::permissions::PermissionManager;
 use crate::skill::Skill;
 use crate::tools::{Deadline, ToolContext};
 use crate::{
@@ -38,6 +39,7 @@ pub struct AgentParams {
     pub model: Model,
     pub skills: Arc<[Skill]>,
     pub config: AgentConfig,
+    pub permissions: Arc<PermissionManager>,
 }
 
 pub struct AgentRunParams {
@@ -68,6 +70,7 @@ pub struct Agent {
     mcp: Option<Arc<McpManager>>,
     config: AgentConfig,
     reauth_attempts: u32,
+    permissions: Arc<PermissionManager>,
 }
 
 impl Agent {
@@ -77,6 +80,7 @@ impl Agent {
             model: Arc::new(params.model),
             skills: params.skills,
             config: params.config,
+            permissions: params.permissions,
             history: run.history,
             system: run.system,
             event_tx: run.event_tx,
@@ -318,6 +322,7 @@ impl Agent {
             mcp: self.mcp.clone(),
             deadline: Deadline::None,
             config: self.config,
+            permissions: Arc::clone(&self.permissions),
         }
     }
 
@@ -392,6 +397,7 @@ mod tests {
 
     use super::*;
     use crate::Envelope;
+    use crate::permissions::PermissionManager;
     use crate::skill::Skill;
 
     struct MockProvider {
@@ -453,6 +459,13 @@ mod tests {
                 model: default_model(),
                 skills: Arc::from([]) as Arc<[Skill]>,
                 config: AgentConfig::default(),
+                permissions: Arc::new(PermissionManager::new(
+                    maki_config::PermissionsConfig {
+                        allow_all: true,
+                        rules: vec![],
+                    },
+                    std::path::PathBuf::from("/tmp"),
+                )),
             },
             AgentRunParams {
                 history,
@@ -700,6 +713,13 @@ mod tests {
                     model: default_model(),
                     skills: Arc::from([]) as Arc<[Skill]>,
                     config: AgentConfig::default(),
+                    permissions: Arc::new(PermissionManager::new(
+                        maki_config::PermissionsConfig {
+                            allow_all: true,
+                            rules: vec![],
+                        },
+                        std::path::PathBuf::from("/tmp"),
+                    )),
                 },
                 AgentRunParams {
                     history: History::new(Vec::new()),

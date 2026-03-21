@@ -120,6 +120,10 @@ impl super::ToolDefaults for MultiEdit {
     fn mutable_path(&self) -> Option<&str> {
         Some(&self.path)
     }
+
+    fn permission(&self) -> Option<String> {
+        Some(crate::permissions::canonicalize_scope_path(&self.path))
+    }
 }
 pub(super) fn build_hunk(start_line: usize, old: &str, new: &str) -> DiffHunk {
     let diff = similar::TextDiff::from_lines(old, new);

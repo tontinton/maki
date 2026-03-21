@@ -38,8 +38,10 @@ use serde_json::{Value, json};
 use std::future::Future;
 use tracing::{error, info, warn};
 
+use crate::agent::LoadedInstructions;
 use crate::cancel::CancelToken;
 use crate::mcp::McpManager;
+use crate::permissions::PermissionManager;
 use crate::skill::Skill;
 use crate::template::Vars;
 use crate::{
@@ -168,11 +170,12 @@ pub struct ToolContext {
     pub tool_use_id: Option<String>,
     pub user_response_rx: Option<Arc<async_lock::Mutex<flume::Receiver<String>>>>,
     pub skills: Arc<[Skill]>,
-    pub loaded_instructions: crate::agent::LoadedInstructions,
+    pub loaded_instructions: LoadedInstructions,
     pub cancel: CancelToken,
     pub mcp: Option<Arc<McpManager>>,
     pub deadline: Deadline,
     pub config: AgentConfig,
+    pub permissions: Arc<PermissionManager>,
 }
 
 pub(crate) fn resolve_search_path(path: Option<&str>) -> Result<String, String> {
@@ -320,6 +323,9 @@ pub(crate) trait ToolDefaults {
         None
     }
     fn mutable_path(&self) -> Option<&str> {
+        None
+    }
+    fn permission(&self) -> Option<String> {
         None
     }
     fn augment_description(_description: &mut String, _ctx: &DescriptionContext) {}
@@ -602,6 +608,7 @@ pub(crate) fn interpreter_ctx(
     mode: &AgentMode,
     event_tx: &EventSender,
     cancel: CancelToken,
+    permissions: Arc<PermissionManager>,
 ) -> ToolContext {
     static PROVIDER: LazyLock<Arc<dyn Provider>> = LazyLock::new(|| Arc::new(NullProvider));
     static MODEL: LazyLock<Arc<Model>> =
@@ -615,11 +622,12 @@ pub(crate) fn interpreter_ctx(
         tool_use_id: None,
         user_response_rx: None,
         skills: Arc::clone(&SKILLS),
-        loaded_instructions: crate::agent::LoadedInstructions::new(),
+        loaded_instructions: LoadedInstructions::new(),
         cancel,
         mcp: None,
         deadline: Deadline::None,
         config: AgentConfig::default(),
+        permissions,
     }
 }
 
@@ -628,6 +636,16 @@ pub(crate) mod test_support {
     use crate::{Envelope, EventSender};
 
     use super::*;
+
+    static TEST_PERMISSIONS: LazyLock<Arc<PermissionManager>> = LazyLock::new(|| {
+        Arc::new(PermissionManager::new(
+            maki_config::PermissionsConfig {
+                allow_all: true,
+                rules: vec![],
+            },
+            std::path::PathBuf::from("/tmp"),
+        ))
+    });
 
     pub(crate) fn stub_ctx_with(
         mode: &AgentMode,
@@ -642,7 +660,12 @@ pub(crate) mod test_support {
                 &fallback_tx
             }
         };
-        let mut ctx = interpreter_ctx(mode, event_tx, CancelToken::none());
+        let mut ctx = interpreter_ctx(
+            mode,
+            event_tx,
+            CancelToken::none(),
+            Arc::clone(&TEST_PERMISSIONS),
+        );
         ctx.tool_use_id = tool_use_id.map(String::from);
         ctx
     }

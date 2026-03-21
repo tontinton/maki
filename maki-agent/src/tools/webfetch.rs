@@ -156,7 +156,11 @@ impl WebFetch {
     }
 }
 
-impl super::ToolDefaults for WebFetch {}
+impl super::ToolDefaults for WebFetch {
+    fn permission(&self) -> Option<String> {
+        Some(self.url.clone())
+    }
+}
 
 impl WebFetch {
     fn validated_format(&self) -> Result<&'static str, String> {

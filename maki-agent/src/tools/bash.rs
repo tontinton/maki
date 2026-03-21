@@ -251,6 +251,11 @@ impl super::ToolDefaults for Bash {
     fn start_annotation(&self) -> Option<String> {
         Some(super::timeout_annotation(self.timeout.unwrap_or(120)))
     }
+
+    fn permission(&self) -> Option<String> {
+        let (command, _) = self.resolved();
+        Some(command.to_string())
+    }
 }
 
 struct ChildGuard(Option<Child>);
@@ -400,6 +405,22 @@ mod tests {
             description: desc.map(Into::into),
         };
         assert_eq!(b.start_summary(), expected);
+    }
+
+    #[test_case("cargo test",        None,          "cargo test"   ; "simple_command")]
+    #[test_case("cd /tmp && ls",     None,          "ls"           ; "strips_cd_prefix")]
+    #[test_case("cd /tmp && a && b", None,          "a && b"       ; "strips_cd_keeps_rest")]
+    #[test_case("ls",                Some("/tmp"), "ls"           ; "explicit_workdir")]
+    #[test_case("cd /tmp",           None,          "cd /tmp"      ; "bare_cd_unchanged")]
+    fn permission_cases(cmd: &str, workdir: Option<&str>, expected: &str) {
+        use crate::tools::ToolDefaults;
+        let b = Bash {
+            command: cmd.into(),
+            timeout: None,
+            workdir: workdir.map(Into::into),
+            description: None,
+        };
+        assert_eq!(b.permission().unwrap(), expected);
     }
 
     #[test]
