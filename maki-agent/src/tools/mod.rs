@@ -451,6 +451,24 @@ macro_rules! register_tools {
                         };
                     }
 
+                    if let Some(scope) = dispatch!(self, |t| t.permission()) {
+                        if let Err(e) = ctx.permissions.enforce(
+                            self.name(),
+                            &scope,
+                            &ctx.event_tx,
+                            ctx.user_response_rx.as_deref(),
+                            &id,
+                            &ctx.cancel,
+                        ).await {
+                            return ToolDoneEvent {
+                                id,
+                                tool: self.name(),
+                                output: ToolOutput::Plain(e.to_string()),
+                                is_error: true,
+                            };
+                        }
+                    }
+
                     let start = Instant::now();
                     let result = match self {
                         $(ToolCall::$Variant(inner) => inner.execute(ctx).await),+

@@ -34,6 +34,8 @@ toml_edit = { workspace = true }
 isahc = { workspace = true }
 libc = { workspace = true }
 dirs = { workspace = true }
+tree-sitter = { workspace = true }
+tree-sitter-bash = { workspace = true }
 
 
 [dev-dependencies]

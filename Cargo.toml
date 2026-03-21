@@ -87,6 +87,8 @@ libc = "0.2"
 nucleo-matcher = "0.3"
 criterion = { version = "0.5", features = ["html_reports"] }
 dirs = "6"
+tree-sitter = "0.26"
+tree-sitter-bash = "0.25"
 
 wait-timeout = "0.2"
 

@@ -462,6 +462,11 @@ pub enum AgentEvent {
     Error {
         message: String,
     },
+    PermissionRequest {
+        id: String,
+        tool: String,
+        scope: String,
+    },
     AuthRequired,
 }
 
@@ -491,6 +496,8 @@ pub struct SubagentInfo {
     pub prompt: Option<String>,
     #[serde(rename = "parent_model", skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    #[serde(skip)]
+    pub answer_tx: Option<flume::Sender<String>>,
 }
 
 #[derive(Debug, Clone)]

@@ -2032,6 +2032,8 @@ dependencies = [
  "toml",
  "toml_edit",
  "tracing",
+ "tree-sitter",
+ "tree-sitter-bash",
 ]
 
 [[package]]

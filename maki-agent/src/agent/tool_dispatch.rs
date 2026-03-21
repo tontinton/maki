@@ -187,6 +187,31 @@ pub(crate) async fn execute_mcp_tool(
         return done(MCP_BLOCKED_IN_PLAN.into(), true);
     }
 
+    let perm_tool = format!("mcp:{tool_name}");
+    let perm_scope = {
+        let json = input.to_string();
+        if json.len() > 200 {
+            format!("{}\u{2026}", &json[..200])
+        } else {
+            json
+        }
+    };
+
+    if let Err(e) = ctx
+        .permissions
+        .enforce(
+            &perm_tool,
+            &perm_scope,
+            &ctx.event_tx,
+            ctx.user_response_rx.as_deref(),
+            id,
+            &ctx.cancel,
+        )
+        .await
+    {
+        return done(e.to_string(), true);
+    }
+
     let Some(mcp) = &ctx.mcp else {
         return done(format!("MCP manager not available for {tool_name}"), true);
     };
