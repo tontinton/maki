@@ -2,7 +2,7 @@ mod print;
 
 use std::env;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use clap::{Parser, Subcommand};
 use color_eyre::Result;
@@ -61,6 +61,10 @@ struct Cli {
     /// Disable rtk command rewriting
     #[arg(long)]
     no_rtk: bool,
+
+    /// Skip all permission prompts (allow everything)
+    #[arg(long)]
+    yolo: bool,
 
     /// Initial prompt (reads stdin if omitted in --print mode)
     prompt: Option<String>,
@@ -164,7 +168,10 @@ fn run() -> Result<()> {
         None => {
             let storage = DataDir::resolve().context("resolve data directory")?;
             let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
-            let config = load_config(&cwd, cli.no_rtk);
+            let mut config = load_config(&cwd, cli.no_rtk);
+            if cli.yolo {
+                config.permissions.allow_all = true;
+            }
             config.validate()?;
             let model = resolve_model(cli.model.as_deref(), &config.provider, &storage)?;
             init_logging(&storage, &config.storage);
@@ -178,6 +185,7 @@ fn run() -> Result<()> {
                     cli.verbose,
                     skills,
                     config.agent,
+                    config.permissions,
                 )
                 .context("run print mode")?;
             } else {
@@ -197,6 +205,10 @@ fn run() -> Result<()> {
                     config: config.agent,
                     ui_config: config.ui,
                     input_history_size: config.storage.input_history_size,
+                    permissions: Arc::new(maki_agent::permissions::PermissionManager::new(
+                        config.permissions,
+                        cwd.clone(),
+                    )),
                     #[cfg(feature = "demo")]
                     demo: cli.demo,
                 })

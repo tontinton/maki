@@ -28,7 +28,7 @@ use maki_agent::skill::Skill;
 use maki_agent::tools::{QUESTION_TOOL_NAME, ToolCall};
 use maki_agent::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, Envelope,
-    EventSender, History, agent, template,
+    EventSender, History, PermissionsConfig, agent, template,
 };
 use maki_providers::StopReason;
 use maki_providers::TokenUsage;
@@ -128,6 +128,7 @@ pub fn run(
     verbose: bool,
     skills: Vec<Skill>,
     config: AgentConfig,
+    permissions_config: PermissionsConfig,
 ) -> Result<()> {
     let prompt = match prompt_arg {
         Some(p) => p,
@@ -198,6 +199,10 @@ pub fn run(
                 model: model_clone,
                 skills,
                 config,
+                permissions: Arc::new(maki_agent::permissions::PermissionManager::new(
+                    permissions_config,
+                    cwd_path.clone(),
+                )),
             },
             AgentRunParams {
                 history: History::new(Vec::new()),
@@ -276,6 +281,7 @@ pub fn run(
             | AgentEvent::QueueItemConsumed
             | AgentEvent::AutoCompacting
             | AgentEvent::AuthRequired
+            | AgentEvent::PermissionRequest { .. }
             | AgentEvent::QuestionPrompt { .. }
             | AgentEvent::Retry { .. } => {
                 if is_stream_json {
