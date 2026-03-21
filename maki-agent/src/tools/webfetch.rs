@@ -1,3 +1,4 @@
+use std::net::{IpAddr, ToSocketAddrs};
 use std::time::Duration;
 
 use isahc::config::Configurable;
@@ -44,6 +45,7 @@ impl WebFetch {
         config: maki_config::AgentConfig,
     ) -> Result<ToolOutput, String> {
         let url = validate_and_upgrade_url(&self.url)?;
+        check_ssrf(&url)?;
         let format = self.validated_format()?;
         let base_timeout = self
             .timeout
@@ -169,6 +171,72 @@ impl WebFetch {
             Some("text") => Ok("text"),
             Some("html") => Ok("html"),
             Some(other) => Err(format!("unknown format: {other}")),
+        }
+    }
+}
+
+fn extract_host(url: &str) -> Option<&str> {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    let host_port = rest.split('/').next()?;
+    if let Some(bracketed) = host_port.strip_prefix('[') {
+        bracketed.split(']').next()
+    } else {
+        host_port.split(':').next()
+    }
+}
+
+fn check_ssrf(url: &str) -> Result<(), String> {
+    let host = extract_host(url).ok_or("cannot extract host from URL")?;
+
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if is_private_ip(&ip) {
+            return Err(format!("blocked: {ip} is a private/metadata address"));
+        }
+        return Ok(());
+    }
+
+    let addr = format!("{host}:443");
+    if let Ok(addrs) = addr.to_socket_addrs() {
+        for sa in addrs {
+            if is_private_ip(&sa.ip()) {
+                return Err(format!(
+                    "blocked: {host} resolves to private address {}",
+                    sa.ip()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn is_private_ip(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
+        }
+        IpAddr::V6(v6) => {
+            if v6.is_loopback() || v6.is_unspecified() {
+                return true;
+            }
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_private_ip(&IpAddr::V4(v4));
+            }
+            // IPv4-compatible (deprecated): ::x.x.x.x — to_ipv4() catches these
+            if let Some(v4) = v6.to_ipv4() {
+                return is_private_ip(&IpAddr::V4(v4));
+            }
+            let bytes = v6.octets();
+            // fe80::/10 link-local
+            if bytes[0] == 0xfe && (bytes[1] & 0xc0) == 0x80 {
+                return true;
+            }
+            // fc00::/7 unique-local (ULA)
+            if bytes[0] & 0xfe == 0xfc {
+                return true;
+            }
+            false
         }
     }
 }
@@ -302,6 +370,31 @@ mod tests {
     #[test_case("image/svg+xml", false ; "svg_allowed")]
     fn is_image_content_cases(ct: &str, expected: bool) {
         assert_eq!(is_image_content(ct), expected);
+    }
+
+    #[test_case("https://8.8.8.8", Ok(()) ; "public_ip_allowed")]
+    #[test_case("https://127.0.0.1", Err(()) ; "loopback_blocked")]
+    #[test_case("https://192.168.1.1", Err(()) ; "private_blocked")]
+    #[test_case("https://10.0.0.1", Err(()) ; "rfc1918_blocked")]
+    #[test_case("https://169.254.169.254", Err(()) ; "link_local_blocked")]
+    #[test_case("https://[::1]", Err(()) ; "ipv6_loopback_blocked")]
+    #[test_case("https://[::ffff:127.0.0.1]", Err(()) ; "ipv4_mapped_loopback_blocked")]
+    #[test_case("https://0.0.0.0", Err(()) ; "unspecified_blocked")]
+    fn check_ssrf_cases(url: &str, expected: Result<(), ()>) {
+        match expected {
+            Ok(()) => assert!(check_ssrf(url).is_ok(), "{url} should be allowed"),
+            Err(()) => assert!(check_ssrf(url).is_err(), "{url} should be blocked"),
+        }
+    }
+
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    #[test_case(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), true ; "v4_unspecified")]
+    #[test_case(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x0a00, 0x0001)), true ; "ipv4_mapped_private")]
+    #[test_case(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x0808, 0x0808)), false ; "ipv4_mapped_public")]
+    #[test_case(IpAddr::V6(Ipv6Addr::UNSPECIFIED), true ; "v6_unspecified")]
+    fn is_private_ip_cases(ip: IpAddr, expected: bool) {
+        assert_eq!(is_private_ip(&ip), expected);
     }
 
     #[test_case(None,                "https://x.com"        ; "default_format")]
