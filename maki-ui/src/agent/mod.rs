@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use maki_agent::mcp::config::McpServerInfo;
+use maki_agent::permissions::PermissionManager;
 use maki_agent::skill::Skill;
 use maki_agent::{AgentConfig, AgentInput, CancelTrigger, Envelope, ExtractedCommand, ToolOutput};
 use maki_providers::provider::Provider;
@@ -55,6 +56,7 @@ impl AgentHandles {
         let _ = self.cmd_tx.try_send(AgentCommand::Cancel);
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn respawn(
         &mut self,
         history: Vec<Message>,
@@ -62,12 +64,13 @@ impl AgentHandles {
         model: &Model,
         skills: &Arc<[Skill]>,
         config: AgentConfig,
+        permissions: &Arc<PermissionManager>,
         app: &mut App,
     ) {
         let mcp = self.mcp.clone();
         let old = mem::replace(
             self,
-            spawn_agent(provider, model, history, skills, config, mcp),
+            spawn_agent(provider, model, history, skills, config, permissions, mcp),
         );
         old.cancel();
         self.apply_to_app(app);
@@ -111,6 +114,7 @@ pub(crate) fn spawn_agent(
     initial_history: Vec<Message>,
     skills: &Arc<[Skill]>,
     config: AgentConfig,
+    permissions: &Arc<PermissionManager>,
     mcp_state: McpState,
 ) -> AgentHandles {
     let (agent_tx, agent_rx) = flume::unbounded::<Envelope>();
@@ -136,6 +140,7 @@ pub(crate) fn spawn_agent(
         Arc::clone(&mcp_state.infos),
         Arc::clone(&mcp_state.pids),
         mcp_state.disabled.clone(),
+        Arc::clone(permissions),
         agent_tx,
         answer_rx,
         ecmd_rx,

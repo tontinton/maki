@@ -75,6 +75,11 @@ const COMMANDS: &[Command] = &[
         max_args: 0,
     },
     Command {
+        name: "/yolo",
+        description: "Toggle YOLO mode (skip all permission prompts)",
+        max_args: 0,
+    },
+    Command {
         name: "/exit",
         description: "Exit the application",
         max_args: 0,

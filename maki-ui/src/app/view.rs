@@ -1,3 +1,4 @@
+use crate::components::Overlay;
 #[cfg(test)]
 use crate::components::keybindings::KeybindContext;
 use crate::components::plan_form::PlanForm;
@@ -24,7 +25,9 @@ impl App {
     pub fn view(&mut self, frame: &mut Frame) {
         self.status_bar.clear_expired_hint();
 
-        let form_visible = self.question_form.is_visible() || self.plan_form.is_visible();
+        let form_visible = self.permission_prompt.is_open()
+            || self.question_form.is_visible()
+            || self.plan_form.is_visible();
         let layout = self.compute_layout(frame, form_visible);
         let render_chat = self.resolve_render_chat();
 
@@ -42,7 +45,9 @@ impl App {
         let area = frame.area();
         let bottom_height = if form_visible {
             let max = area.height.saturating_sub(3);
-            if self.plan_form.is_visible() {
+            if self.permission_prompt.is_open() {
+                self.permission_prompt.height(area.width).min(max)
+            } else if self.plan_form.is_visible() {
                 PlanForm::height().min(max)
             } else {
                 self.question_form.height(area.width).min(max)
@@ -110,7 +115,9 @@ impl App {
     }
 
     fn render_bottom_panel(&mut self, frame: &mut Frame, layout: &ViewLayout) {
-        if self.question_form.is_visible() {
+        if self.permission_prompt.is_open() {
+            self.permission_prompt.view(frame, layout.bottom_area);
+        } else if self.question_form.is_visible() {
             self.question_form.view(frame, layout.bottom_area);
         } else if self.plan_form.is_visible() {
             self.plan_form.view(frame, layout.bottom_area);

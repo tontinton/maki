@@ -32,7 +32,14 @@ pub enum ChatEventResult {
     Done,
     QueueItemConsumed,
     Error(String),
-    QuestionPrompt { questions: Vec<QuestionInfo> },
+    QuestionPrompt {
+        questions: Vec<QuestionInfo>,
+    },
+    PermissionRequest {
+        id: String,
+        tool: String,
+        scope: String,
+    },
     AuthRequired,
 }
 
@@ -115,6 +122,9 @@ impl Chat {
             AgentEvent::Error { message } => {
                 self.messages_panel.flush();
                 return ChatEventResult::Error(message);
+            }
+            AgentEvent::PermissionRequest { id, tool, scope } => {
+                return ChatEventResult::PermissionRequest { id, tool, scope };
             }
             AgentEvent::AuthRequired => {
                 return ChatEventResult::AuthRequired;

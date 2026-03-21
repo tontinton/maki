@@ -30,6 +30,7 @@ use crate::components::list_picker::{ListPicker, PickerAction};
 use crate::components::mcp_picker::{McpPicker, McpPickerAction};
 use crate::components::memory_modal::{MemoryEntry, MemoryModal, MemoryModalAction};
 use crate::components::model_picker::{ModelPicker, ModelPickerAction};
+use crate::components::permission_prompt::{PermissionAction, PermissionPrompt};
 use crate::components::plan_form::{PlanForm, PlanFormAction};
 use crate::components::question_form::{QuestionForm, QuestionFormAction};
 use crate::components::rewind_picker::{RewindPicker, RewindPickerAction};
@@ -47,6 +48,7 @@ use arc_swap::{ArcSwap, ArcSwapOption};
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 #[cfg(feature = "demo")]
 use maki_agent::QuestionInfo;
+use maki_agent::permissions::{PermissionDecision, PermissionManager};
 use maki_agent::{AgentEvent, Envelope, ImageSource, McpServerInfo, SubagentInfo, ToolOutput};
 use maki_config::UiConfig;
 use maki_providers::{Message, Model, ModelPricing, TokenUsage};
@@ -104,6 +106,7 @@ pub struct App {
     pub(super) memory_modal: MemoryModal,
     pub(super) search_modal: SearchModal,
     pub(super) todo_panel: TodoPanel,
+    pub(super) permission_prompt: PermissionPrompt,
     pub(super) question_form: QuestionForm,
     pub(super) plan_form: PlanForm,
     pub(super) status_bar: StatusBar,
@@ -135,6 +138,8 @@ pub struct App {
     storage_writer: Arc<StorageWriter>,
     pub(crate) shell: shell::ShellState,
     pub(crate) ui_config: UiConfig,
+    pub(crate) permissions: Arc<PermissionManager>,
+    subagent_answers: HashMap<String, flume::Sender<String>>,
 }
 
 impl App {
@@ -150,6 +155,7 @@ impl App {
         storage_writer: Arc<StorageWriter>,
         ui_config: UiConfig,
         input_history_size: usize,
+        permissions: Arc<PermissionManager>,
     ) -> Self {
         Self {
             chats: vec![Chat::new("Main".into(), ui_config)],
@@ -169,6 +175,7 @@ impl App {
             memory_modal: MemoryModal::new(),
             search_modal: SearchModal::new(),
             todo_panel: TodoPanel::new(),
+            permission_prompt: PermissionPrompt::new(),
             question_form: QuestionForm::new(),
             plan_form: PlanForm::new(),
             status_bar: StatusBar::new(ui_config.flash_duration()),
@@ -200,6 +207,8 @@ impl App {
             storage_writer,
             shell: shell::ShellState::default(),
             ui_config,
+            permissions,
+            subagent_answers: HashMap::new(),
         }
     }
 
@@ -374,6 +383,29 @@ impl App {
     fn handle_key(&mut self, key: KeyEvent) -> Vec<Action> {
         if let Some(actions) = self.handle_global_ctrl(key) {
             return actions;
+        }
+
+        if self.permission_prompt.is_open() {
+            if let Some(action) = self.permission_prompt.handle_key(key) {
+                let subagent_id = self.permission_prompt.subagent_id().map(str::to_owned);
+                let decision = match action {
+                    PermissionAction::AllowOnce => PermissionDecision::AllowOnce,
+                    PermissionAction::AllowSession => PermissionDecision::AllowSession,
+                    PermissionAction::AllowAlwaysLocal => PermissionDecision::AllowAlwaysLocal,
+                    PermissionAction::AllowAlwaysGlobal => PermissionDecision::AllowAlwaysGlobal,
+                    PermissionAction::Deny => PermissionDecision::DenyOnce,
+                    PermissionAction::DenyAlwaysLocal => PermissionDecision::DenyAlwaysLocal,
+                    PermissionAction::DenyAlwaysGlobal => PermissionDecision::DenyAlwaysGlobal,
+                };
+                let answer = decision.to_answer_str().to_string();
+                self.permission_prompt.close();
+                if let Some(tx) = subagent_id.and_then(|id| self.subagent_answers.get(&id)) {
+                    let _ = tx.try_send(answer);
+                } else {
+                    self.send_answer(answer);
+                }
+            }
+            return vec![];
         }
 
         if self.question_form.is_visible() {
@@ -690,6 +722,7 @@ impl App {
         self.close_all_overlays();
         self.pending_input = PendingInput::None;
         self.finish_subagents(DisplayRole::Error, CANCELLED_TEXT);
+        self.subagent_answers.clear();
         self.shell.cancel_all();
         for chat in &mut self.chats {
             chat.flush();
@@ -714,6 +747,11 @@ impl App {
             }
             return vec![];
         }
+
+        let subagent_id = envelope
+            .subagent
+            .as_ref()
+            .map(|s| s.parent_tool_use_id.clone());
 
         let chat_idx = match envelope.subagent {
             Some(ref subagent) => self.resolve_or_create_chat(subagent),
@@ -784,6 +822,11 @@ impl App {
             return vec![];
         }
 
+        if let ChatEventResult::PermissionRequest { id, tool, scope } = result {
+            self.permission_prompt.open(id, tool, scope, subagent_id);
+            return vec![];
+        }
+
         if chat_idx == 0 {
             match result {
                 ChatEventResult::Done => {
@@ -791,6 +834,7 @@ impl App {
                     self.status_bar.clear_flash();
                     self.save_session();
                     self.chat_index.clear();
+                    self.subagent_answers.clear();
                     if let Some(actions) = self.on_agent_done() {
                         return actions;
                     }
@@ -804,6 +848,7 @@ impl App {
                     self.status_bar.clear_flash();
                     self.save_session();
                     self.queue.clear();
+                    self.subagent_answers.clear();
                     self.finish_subagents(DisplayRole::Error, ERROR_TEXT);
                     for chat in &mut self.chats {
                         chat.fail_in_progress();
@@ -826,6 +871,7 @@ impl App {
                     ));
                     self.pending_input = PendingInput::AuthRetry;
                 }
+                ChatEventResult::PermissionRequest { .. } => unreachable!(),
                 ChatEventResult::Continue | ChatEventResult::QueueItemConsumed => {}
             }
         }
@@ -839,6 +885,9 @@ impl App {
         }
         let idx = self.chats.len();
         self.chat_index.insert(id.clone(), idx);
+        if let Some(ref tx) = subagent.answer_tx {
+            self.subagent_answers.insert(id.clone(), tx.clone());
+        }
         self.chats[0].update_tool_summary(id, &subagent.name);
         if let Some(ref model) = subagent.model {
             self.chats[0].update_tool_model(id, model);
@@ -903,6 +952,16 @@ impl App {
             }
             "/cd" => self.cmd_cd(&cmd.args),
             "/memory" => self.cmd_memory(),
+            "/yolo" => {
+                let enabled = self.permissions.toggle_yolo();
+                let msg = if enabled {
+                    "YOLO mode enabled"
+                } else {
+                    "YOLO mode disabled"
+                };
+                self.flash(msg.into());
+                vec![]
+            }
             "/exit" => self.quit(),
             _ => vec![],
         }
@@ -947,7 +1006,7 @@ impl App {
         vec![]
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 12] {
+    fn overlays(&self) -> [&dyn Overlay; 13] {
         [
             &self.help_modal,
             &self.btw_modal,
@@ -959,12 +1018,13 @@ impl App {
             &self.theme_picker,
             &self.model_picker,
             &self.mcp_picker,
+            &self.permission_prompt,
             &self.question_form,
             &self.plan_form,
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 12] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 13] {
         [
             &mut self.help_modal,
             &mut self.btw_modal,
@@ -976,6 +1036,7 @@ impl App {
             &mut self.theme_picker,
             &mut self.model_picker,
             &mut self.mcp_picker,
+            &mut self.permission_prompt,
             &mut self.question_form,
             &mut self.plan_form,
         ]

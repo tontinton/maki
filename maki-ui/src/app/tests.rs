@@ -6,11 +6,12 @@ use crate::components::{TEST_CONTEXT_WINDOW, key, test_pricing};
 use crate::selection::{EdgeScroll, SelectableZone, SelectionZone};
 use arc_swap::ArcSwap;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
+use maki_agent::permissions::PermissionManager;
 use maki_agent::{
     AgentMode, QuestionInfo, QuestionOption, ToolDoneEvent, ToolOutput, ToolStartEvent,
     TurnCompleteEvent,
 };
-use maki_config::UiConfig;
+use maki_config::{PermissionsConfig, UiConfig};
 use ratatui::layout::Rect;
 use std::env;
 use std::path::{Path, PathBuf};
@@ -28,6 +29,13 @@ fn set_zone(app: &mut App, zone: SelectionZone, area: Rect) {
 fn test_app() -> App {
     let writer = Arc::new(StorageWriter::new(DataDir::from_path(env::temp_dir())));
     let mcp_infos = Arc::new(ArcSwap::from_pointee(Vec::new()));
+    let permissions = Arc::new(PermissionManager::new(
+        PermissionsConfig {
+            allow_all: false,
+            rules: vec![],
+        },
+        PathBuf::from("/tmp"),
+    ));
     App::new(
         "test-model".into(),
         test_pricing(),
@@ -39,6 +47,7 @@ fn test_app() -> App {
         writer,
         UiConfig::default(),
         100,
+        permissions,
     )
 }
 
@@ -69,6 +78,7 @@ fn subagent_info(parent_id: &str, name: &str) -> SubagentInfo {
         name: name.into(),
         prompt: None,
         model: None,
+        answer_tx: None,
     }
 }
 
@@ -553,6 +563,13 @@ fn load_session_clears_plan() {
         writer,
         UiConfig::default(),
         100,
+        Arc::new(PermissionManager::new(
+            PermissionsConfig {
+                allow_all: false,
+                rules: vec![],
+            },
+            PathBuf::from("/tmp"),
+        )),
     );
     app.session.messages.push(Message::user("test".into()));
     app.session.save(&app.storage).unwrap();
@@ -1579,6 +1596,20 @@ fn slash_exit_command_quits() {
     let actions = app.execute_command(cmd("/exit"));
     assert!(app.should_quit);
     assert!(matches!(&actions[0], Action::Quit));
+}
+
+#[test]
+fn yolo_toggle() {
+    let mut app = test_app();
+    assert!(!app.permissions.is_yolo());
+    app.execute_command(cmd("/yolo"));
+    assert!(app.permissions.is_yolo());
+    let flash = app.status_bar.flash_text().unwrap();
+    assert!(flash.contains("enabled"), "flash={flash:?}");
+    app.execute_command(cmd("/yolo"));
+    assert!(!app.permissions.is_yolo());
+    let flash = app.status_bar.flash_text().unwrap();
+    assert!(flash.contains("disabled"), "flash={flash:?}");
 }
 
 #[test_case("/tmp",                     "cd /tmp" ; "absolute_path")]

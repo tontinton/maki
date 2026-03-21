@@ -6,6 +6,7 @@ use arc_swap::ArcSwap;
 use maki_agent::agent;
 use maki_agent::mcp::McpManager;
 use maki_agent::mcp::config::{McpServerInfo, persist_enabled};
+use maki_agent::permissions::PermissionManager;
 use maki_agent::skill::Skill;
 use maki_agent::template;
 use maki_agent::template::Vars;
@@ -37,6 +38,7 @@ pub(super) struct AgentLoop {
     history: History,
     shared_history: Arc<ArcSwap<Vec<Message>>>,
     cancel_trigger: Arc<Mutex<Option<CancelTrigger>>>,
+    permissions: Arc<PermissionManager>,
     min_run_id: u64,
     agent_tx: flume::Sender<Envelope>,
     answer_rx: Arc<async_lock::Mutex<flume::Receiver<String>>>,
@@ -61,6 +63,7 @@ impl AgentLoop {
         mcp_infos: Arc<ArcSwap<Vec<McpServerInfo>>>,
         mcp_pids: Arc<Mutex<Vec<u32>>>,
         initial_disabled: Vec<String>,
+        permissions: Arc<PermissionManager>,
         agent_tx: flume::Sender<Envelope>,
         answer_rx: flume::Receiver<String>,
         ecmd_rx: flume::Receiver<ExtractedCommand>,
@@ -83,6 +86,7 @@ impl AgentLoop {
             history: History::new(initial_history),
             shared_history,
             cancel_trigger,
+            permissions,
             min_run_id: 0,
             agent_tx,
             answer_rx: Arc::new(async_lock::Mutex::new(answer_rx)),
@@ -211,6 +215,8 @@ impl AgentLoop {
         let (trigger, cancel) = CancelToken::new();
         self.set_cancel_trigger(Some(trigger));
 
+        while self.answer_rx.lock().await.try_recv().is_ok() {}
+
         let ecmd_rx = self.ecmd_rx.take().expect("ecmd_rx available before run");
         let agent = Agent::new(
             AgentParams {
@@ -218,6 +224,7 @@ impl AgentLoop {
                 model: self.model.clone(),
                 skills: Arc::clone(&self.skills),
                 config: self.config,
+                permissions: Arc::clone(&self.permissions),
             },
             AgentRunParams {
                 history: mem::replace(&mut self.history, History::new(Vec::new())),

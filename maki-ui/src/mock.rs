@@ -51,6 +51,7 @@ fn sub_evt_with(
             name: name.into(),
             prompt: prompt.map(String::from),
             model: model.map(String::from),
+            answer_tx: None,
         }),
         run_id: 1,
     }))

@@ -5,6 +5,7 @@ use arc_swap::ArcSwapOption;
 use color_eyre::Result;
 use color_eyre::eyre::Context;
 use crossterm::event::{self, Event, MouseButton, MouseEvent as CtMouseEvent, MouseEventKind};
+use maki_agent::permissions::PermissionManager;
 use maki_agent::skill::Skill;
 use maki_agent::{AgentConfig, CancelToken};
 use maki_config::UiConfig;
@@ -38,6 +39,7 @@ pub struct EventLoopParams {
     pub config: AgentConfig,
     pub ui_config: UiConfig,
     pub input_history_size: usize,
+    pub permissions: Arc<PermissionManager>,
     #[cfg(feature = "demo")]
     pub demo: bool,
 }
@@ -50,6 +52,7 @@ pub(crate) struct EventLoop<'t> {
     model: Model,
     skills: Arc<[Skill]>,
     config: AgentConfig,
+    permissions: Arc<PermissionManager>,
     shell_tx: flume::Sender<ShellEvent>,
     shell_rx: flume::Receiver<ShellEvent>,
     warn_rx: flume::Receiver<String>,
@@ -143,6 +146,7 @@ impl<'t> EventLoop<'t> {
             config,
             ui_config,
             input_history_size,
+            permissions,
             #[cfg(feature = "demo")]
             demo,
         } = params;
@@ -168,6 +172,7 @@ impl<'t> EventLoop<'t> {
             Arc::clone(&storage_writer),
             ui_config,
             input_history_size,
+            Arc::clone(&permissions),
         );
 
         #[cfg(feature = "demo")]
@@ -183,6 +188,7 @@ impl<'t> EventLoop<'t> {
             initial_history,
             &skills,
             config,
+            &permissions,
             mcp_state,
         );
         handles.apply_to_app(&mut app);
@@ -199,6 +205,7 @@ impl<'t> EventLoop<'t> {
             model,
             skills,
             config,
+            permissions,
             shell_tx,
             shell_rx,
             warn_rx: bg.warn_rx,
@@ -323,6 +330,7 @@ impl<'t> EventLoop<'t> {
                         &self.model,
                         &self.skills,
                         self.config,
+                        &self.permissions,
                         &mut self.app,
                     );
                 }
@@ -337,6 +345,7 @@ impl<'t> EventLoop<'t> {
                     &self.model,
                     &self.skills,
                     self.config,
+                    &self.permissions,
                     &mut self.app,
                 );
             }
@@ -348,6 +357,7 @@ impl<'t> EventLoop<'t> {
                     &self.model,
                     &self.skills,
                     self.config,
+                    &self.permissions,
                     &mut self.app,
                 );
                 *self
@@ -413,6 +423,7 @@ impl<'t> EventLoop<'t> {
                         &self.model,
                         &self.skills,
                         self.config,
+                        &self.permissions,
                         &mut self.app,
                     );
                 }
