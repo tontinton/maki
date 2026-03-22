@@ -1,4 +1,3 @@
-use std::env;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -28,12 +27,13 @@ pub(crate) fn try_parse_image_path(text: &str) -> Option<(PathBuf, ImageMediaTyp
     if path_str.contains("://") {
         return None;
     }
-    if !was_file_uri && !path_str.starts_with('/') && !path_str.starts_with("~/") {
+    let is_absolute =
+        path_str.starts_with('/') || (cfg!(windows) && path_str.get(1..3) == Some(":\\"));
+    if !was_file_uri && !is_absolute && !path_str.starts_with("~/") {
         return None;
     }
     let path = if let Some(rest) = path_str.strip_prefix("~/") {
-        let home = env::var("HOME").ok()?;
-        PathBuf::from(home).join(rest)
+        dirs::home_dir()?.join(rest)
     } else {
         PathBuf::from(&path_str)
     };
@@ -111,8 +111,8 @@ mod tests {
     #[test]
     fn try_parse_image_path_tilde() {
         let (path, media) = try_parse_image_path("~/Pictures/photo.jpg").expect("should parse");
-        let home = env::var("HOME").unwrap();
-        assert_eq!(path, PathBuf::from(home).join("Pictures/photo.jpg"));
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(path, home.join("Pictures/photo.jpg"));
         assert_eq!(media, ImageMediaType::Jpeg);
     }
 

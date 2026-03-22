@@ -27,7 +27,7 @@ pub struct Skill {
 }
 
 pub fn discover_skills(cwd: &Path) -> Vec<Skill> {
-    let home = std::env::var("HOME").ok().map(PathBuf::from);
+    let home = dirs::home_dir();
     discover_skills_inner(cwd, home.as_deref())
 }
 

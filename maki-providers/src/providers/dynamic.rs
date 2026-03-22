@@ -68,8 +68,7 @@ fn builtin_slugs() -> Vec<String> {
 }
 
 fn providers_dir() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    Some(PathBuf::from(home).join(".maki").join(PROVIDERS_DIR))
+    dirs::home_dir().map(|h| h.join(".maki").join(PROVIDERS_DIR))
 }
 
 fn run_script(path: &Path, subcommand: &str, timeout: Duration) -> Result<String, AgentError> {
@@ -178,6 +177,20 @@ fn discover_in(dir: &Path) -> Vec<DynamicProviderMeta> {
                 && meta.permissions().mode() & 0o111 == 0
             {
                 debug!(path = %path.display(), "skipping non-executable file");
+                continue;
+            }
+        }
+
+        #[cfg(windows)]
+        {
+            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                let ext = ext.to_ascii_lowercase();
+                if !matches!(ext.as_str(), "exe" | "bat" | "cmd" | "ps1") {
+                    debug!(path = %path.display(), "skipping non-executable file");
+                    continue;
+                }
+            } else {
+                debug!(path = %path.display(), "skipping file without extension");
                 continue;
             }
         }
@@ -371,8 +384,11 @@ impl Provider for DynamicProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::fs;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
     use tempfile::TempDir;
     use test_case::test_case;
 
@@ -420,6 +436,7 @@ mod tests {
         assert_eq!(info.system_prefix.as_deref(), Some("You are X."));
     }
 
+    #[cfg(unix)]
     fn write_script(dir: &Path, name: &str, info_json: &str) -> PathBuf {
         let path = dir.join(name);
         let script = format!(
@@ -430,6 +447,7 @@ mod tests {
         path
     }
 
+    #[cfg(unix)]
     #[test]
     fn discover_finds_valid_script() {
         let tmp = TempDir::new().unwrap();
@@ -446,6 +464,7 @@ mod tests {
         assert!(providers[0].has_auth);
     }
 
+    #[cfg(unix)]
     #[test]
     fn discover_skips_builtin_collision() {
         let tmp = TempDir::new().unwrap();
@@ -458,6 +477,7 @@ mod tests {
         assert!(providers.is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn discover_skips_invalid_slug() {
         let tmp = TempDir::new().unwrap();
@@ -470,6 +490,7 @@ mod tests {
         assert!(providers.is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn discover_skips_unknown_base() {
         let tmp = TempDir::new().unwrap();
@@ -482,6 +503,7 @@ mod tests {
         assert!(providers.is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn run_script_captures_output() {
         let tmp = TempDir::new().unwrap();
@@ -494,6 +516,7 @@ mod tests {
         assert!(stdout.contains("Bearer test"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn run_script_error_on_bad_subcommand() {
         let tmp = TempDir::new().unwrap();

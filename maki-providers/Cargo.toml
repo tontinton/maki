@@ -9,6 +9,7 @@ serde_json = { workspace = true }
 maki-storage = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+dirs = { workspace = true }
 strum = { workspace = true }
 smol = { workspace = true }
 flume = { workspace = true }

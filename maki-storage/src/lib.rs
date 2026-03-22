@@ -9,9 +9,9 @@ pub mod plans;
 pub mod sessions;
 pub mod theme;
 
-use std::env;
 use std::fs;
 use std::io::Write;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -23,8 +23,9 @@ pub struct DataDir(PathBuf);
 
 impl DataDir {
     pub fn resolve() -> Result<Self, StorageError> {
-        let home = env::var("HOME").map_err(|_| StorageError::HomeNotSet)?;
-        let dir = PathBuf::from(home).join(DATA_DIR_NAME);
+        let dir = dirs::home_dir()
+            .ok_or(StorageError::HomeNotSet)?
+            .join(DATA_DIR_NAME);
         fs::create_dir_all(&dir)?;
         Ok(Self(dir))
     }
@@ -46,7 +47,7 @@ impl DataDir {
 
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
-    #[error("HOME environment variable not set")]
+    #[error("home directory not found")]
     HomeNotSet,
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -75,7 +76,10 @@ pub(crate) fn atomic_write_permissions(
     let tmp = path.with_extension("tmp");
     let mut f = fs::File::create(&tmp)?;
     f.write_all(data)?;
+    #[cfg(unix)]
     fs::set_permissions(&tmp, fs::Permissions::from_mode(mode))?;
+    #[cfg(not(unix))]
+    let _ = mode;
     f.sync_all()?;
     fs::rename(&tmp, path)?;
     Ok(())

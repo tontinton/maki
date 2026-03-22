@@ -211,8 +211,8 @@ pub fn resolve_memories_dir() -> Result<PathBuf, String> {
     let cwd = std::env::current_dir().map_err(|e| format!("cannot get cwd: {e}"))?;
     let root = find_git_root(&cwd);
     let project_id = project_id(&root);
-    let home = std::env::var("HOME").map_err(|_| "HOME not set")?;
-    Ok(PathBuf::from(home)
+    let home = dirs::home_dir().ok_or("home directory not found")?;
+    Ok(home
         .join(".maki")
         .join("projects")
         .join(project_id)

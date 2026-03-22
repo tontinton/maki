@@ -910,11 +910,11 @@ impl App {
 
     fn cmd_cd(&mut self, args: &str) -> Vec<Action> {
         let path = if args.is_empty() {
-            std::env::var("HOME").map(PathBuf::from).unwrap_or_default()
+            dirs::home_dir().unwrap_or_default()
         } else {
             match args.strip_prefix('~') {
                 Some(rest) => {
-                    let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_default();
+                    let home = dirs::home_dir().unwrap_or_default();
                     if rest.is_empty() {
                         home
                     } else {

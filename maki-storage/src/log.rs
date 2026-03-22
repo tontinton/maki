@@ -1,5 +1,6 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
@@ -18,12 +19,18 @@ fn file_path(dir: &Path, index: u32) -> PathBuf {
     }
 }
 
+#[cfg(unix)]
 fn flock_exclusive(file: &File) -> io::Result<()> {
     use std::os::unix::io::AsRawFd;
     let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
     if rc != 0 {
         return Err(io::Error::last_os_error());
     }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn flock_exclusive(_file: &File) -> io::Result<()> {
     Ok(())
 }
 
@@ -65,11 +72,16 @@ impl RotatingFileWriter {
         flock_exclusive(&_lock)?;
 
         let primary = file_path(&self.dir, 0);
-        let our_inode = self.file.metadata()?.ino();
-        let needs_rotate = match fs::metadata(&primary) {
-            Ok(m) => m.ino() == our_inode,
-            Err(_) => true,
+        #[cfg(unix)]
+        let needs_rotate = {
+            let our_inode = self.file.metadata()?.ino();
+            match fs::metadata(&primary) {
+                Ok(m) => m.ino() == our_inode,
+                Err(_) => true,
+            }
         };
+        #[cfg(not(unix))]
+        let needs_rotate = true;
 
         if needs_rotate {
             let last = self.max_files - 1;

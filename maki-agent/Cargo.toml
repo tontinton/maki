@@ -33,6 +33,7 @@ toml = { workspace = true }
 toml_edit = { workspace = true }
 isahc = { workspace = true }
 libc = { workspace = true }
+dirs = { workspace = true }
 
 
 [dev-dependencies]

@@ -73,6 +73,7 @@ pub fn delete_tokens(dir: &DataDir, provider: &str) -> Result<bool, StorageError
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
     use test_case::test_case;
@@ -106,8 +107,11 @@ mod tests {
         assert_eq!(loaded.refresh, "refresh_tok");
         assert_eq!(loaded.expires, 9999999999);
 
-        let metadata = fs::metadata(provider_path(&dir, "anthropic")).unwrap();
-        assert_eq!(metadata.permissions().mode() & 0o777, AUTH_FILE_MODE);
+        #[cfg(unix)]
+        {
+            let metadata = fs::metadata(provider_path(&dir, "anthropic")).unwrap();
+            assert_eq!(metadata.permissions().mode() & 0o777, AUTH_FILE_MODE);
+        }
 
         assert!(delete_tokens(&dir, "anthropic").unwrap());
         assert!(load_tokens(&dir, "anthropic").is_none());

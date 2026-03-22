@@ -31,6 +31,7 @@ base64 = { workspace = true }
 nucleo-matcher = { workspace = true }
 async-process = { workspace = true }
 libc = { workspace = true }
+dirs = { workspace = true }
 
 [features]
 demo = []

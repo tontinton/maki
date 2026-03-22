@@ -13,7 +13,7 @@ use crate::tools::{
     GREP_TOOL_NAME, MULTIEDIT_TOOL_NAME, QUESTION_TOOL_NAME, READ_TOOL_NAME, SKILL_TOOL_NAME,
     TASK_TOOL_NAME, TODOWRITE_TOOL_NAME, WEBFETCH_TOOL_NAME, WEBSEARCH_TOOL_NAME, WRITE_TOOL_NAME,
 };
-use maki_config::{GLOBAL_CONFIG_PATH, PROJECT_CONFIG_FILE, home_dir};
+use maki_config::{PROJECT_CONFIG_FILE, global_config_path};
 
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 const MAX_TIMEOUT_MS: u64 = 300_000;
@@ -215,14 +215,13 @@ pub fn transport_kind(raw: &RawTransport) -> &'static str {
 pub fn load_config(cwd: &Path) -> McpConfig {
     let mut merged = McpConfig::default();
 
-    if let Some(home) = home_dir() {
-        let global_path = home.join(GLOBAL_CONFIG_PATH);
-        if let Some(cfg) = read_config(&global_path) {
-            for name in cfg.mcp.keys() {
-                merged.origins.insert(name.clone(), global_path.clone());
-            }
-            merged.mcp.extend(cfg.mcp);
+    if let Some(global_path) = global_config_path()
+        && let Some(cfg) = read_config(&global_path)
+    {
+        for name in cfg.mcp.keys() {
+            merged.origins.insert(name.clone(), global_path.clone());
         }
+        merged.mcp.extend(cfg.mcp);
     }
 
     let project_path = cwd.join(PROJECT_CONFIG_FILE);

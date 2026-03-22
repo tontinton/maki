@@ -350,14 +350,13 @@ impl McpTransport for StdioTransport {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
     fn spawn_sleep() -> Child {
         let mut std_cmd = std::process::Command::new("sleep");
         std_cmd.arg("60");
-        #[cfg(unix)]
         unsafe {
             std_cmd.pre_exec(|| {
                 libc::setsid();

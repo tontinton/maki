@@ -103,12 +103,21 @@ impl Bash {
 
         info!(command, workdir, timeout_secs, "bash executing");
 
-        let mut std_cmd = StdCommand::new("bash");
-        std_cmd
-            .arg("-c")
-            .arg(command)
-            // prevent git from prompting for credentials
-            .env("GIT_TERMINAL_PROMPT", "0");
+        #[cfg(unix)]
+        let mut std_cmd = {
+            let mut cmd = StdCommand::new("bash");
+            cmd.arg("-c").arg(command);
+            cmd
+        };
+        #[cfg(windows)]
+        let mut std_cmd = {
+            let mut cmd = StdCommand::new("cmd.exe");
+            cmd.arg("/C").arg(command);
+            cmd
+        };
+
+        // prevent git from prompting for credentials
+        std_cmd.env("GIT_TERMINAL_PROMPT", "0");
 
         // detach from tty so commands that try to read /dev/tty fail instead of hanging
         #[cfg(unix)]

@@ -1,4 +1,3 @@
-use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -7,7 +6,7 @@ use serde::Deserialize;
 use thiserror::Error;
 use tracing::warn;
 
-pub const GLOBAL_CONFIG_PATH: &str = ".config/maki/config.toml";
+const GLOBAL_CONFIG_FILE: &str = "config.toml";
 pub const PROJECT_CONFIG_FILE: &str = "maki.toml";
 
 const DEFAULT_MAX_OUTPUT_BYTES: usize = 50 * 1024;
@@ -533,7 +532,7 @@ impl Config {
 
 pub fn load_config(cwd: &Path, no_rtk: bool) -> Config {
     let mut base = toml::Table::new();
-    if let Some(t) = home_dir().and_then(|h| read_table(&h.join(GLOBAL_CONFIG_PATH))) {
+    if let Some(t) = global_config_path().and_then(|p| read_table(&p)) {
         merge_tables(&mut base, t);
     }
     if let Some(t) = read_table(&cwd.join(PROJECT_CONFIG_FILE)) {
@@ -576,14 +575,21 @@ fn read_table(path: &Path) -> Option<toml::Table> {
     }
 }
 
-pub fn home_dir() -> Option<PathBuf> {
-    env::var_os("HOME").map(PathBuf::from)
+pub fn global_config_path() -> Option<PathBuf> {
+    #[cfg(unix)]
+    {
+        dirs::home_dir().map(|h| h.join(".config/maki").join(GLOBAL_CONFIG_FILE))
+    }
+    #[cfg(not(unix))]
+    {
+        dirs::config_dir().map(|c| c.join("maki").join(GLOBAL_CONFIG_FILE))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
+    use std::{env, fs};
     use tempfile::TempDir;
     use test_case::test_case;
 
