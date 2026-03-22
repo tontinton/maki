@@ -2,7 +2,7 @@ An AI coding agent optimized for cost and token efficiency.
 
 ## MCP Servers
 
-Configure MCP servers in `~/.config/maki/config.toml` (global) or `maki.toml` (project, takes precedence).
+Configure MCP servers in `~/.config/maki/config.toml` (global) or `.maki/config.toml` (project, takes precedence).
 
 ### Local (stdio)
 

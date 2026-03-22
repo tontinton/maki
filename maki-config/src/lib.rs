@@ -3,13 +3,16 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use dirs::home_dir;
+
 use serde::Deserialize;
 use thiserror::Error;
 use tracing::warn;
 
-const GLOBAL_CONFIG_FILE: &str = "config.toml";
-pub const PROJECT_CONFIG_FILE: &str = "maki.toml";
+pub const GLOBAL_CONFIG_PATH: &str = ".config/maki/config.toml";
+pub const PROJECT_CONFIG_FILE: &str = ".maki/config.toml";
 const PERMISSIONS_FILE: &str = ".config/maki/permissions.toml";
+const PROJECT_PERMISSIONS_FILE: &str = ".maki/permissions.toml";
 
 const DEFAULT_MAX_OUTPUT_BYTES: usize = 50 * 1024;
 pub const DEFAULT_MAX_OUTPUT_LINES: usize = 2000;
@@ -669,13 +672,11 @@ pub fn load_config(cwd: &Path, no_rtk: bool) -> Config {
 
 fn load_permissions(cwd: &Path) -> PermissionsConfig {
     let global_perms = home_dir()
-        .and_then(|h| read_permissions_file(&h.join(PERMISSIONS_FILE)))
+        .and_then(|h: PathBuf| read_permissions_file(&h.join(PERMISSIONS_FILE)))
         .unwrap_or_default();
 
-    let project_perms = read_table(&cwd.join(PROJECT_CONFIG_FILE))
-        .and_then(|t| t.get("permissions").cloned())
-        .and_then(|v| v.try_into::<PermissionsFileConfig>().ok())
-        .unwrap_or_default();
+    let project_perms =
+        read_permissions_file(&cwd.join(PROJECT_PERMISSIONS_FILE)).unwrap_or_default();
 
     build_permissions(global_perms, project_perms)
 }
@@ -716,11 +717,11 @@ fn read_table(path: &Path) -> Option<toml::Table> {
 pub fn global_config_path() -> Option<PathBuf> {
     #[cfg(unix)]
     {
-        dirs::home_dir().map(|h| h.join(".config/maki").join(GLOBAL_CONFIG_FILE))
+        home_dir().map(|h| h.join(GLOBAL_CONFIG_PATH))
     }
     #[cfg(not(unix))]
     {
-        dirs::config_dir().map(|c| c.join("maki").join(GLOBAL_CONFIG_FILE))
+        dirs::config_dir().map(|c| c.join(GLOBAL_CONFIG_PATH))
     }
 }
 
@@ -760,61 +761,19 @@ fn append_project_permission(
     effect: Effect,
     cwd: &Path,
 ) -> Result<(), String> {
-    let path = cwd.join(PROJECT_CONFIG_FILE);
+    let path = cwd.join(PROJECT_PERMISSIONS_FILE);
     let content = std::fs::read_to_string(&path).unwrap_or_default();
     let mut doc: toml_edit::DocumentMut = content
         .parse()
-        .map_err(|e| format!("failed to parse {PROJECT_CONFIG_FILE}: {e}"))?;
+        .map_err(|e| format!("failed to parse {PROJECT_PERMISSIONS_FILE}: {e}"))?;
 
-    let perms = doc
-        .entry("permissions")
-        .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
-    let perms = perms
-        .as_table_like_mut()
-        .ok_or_else(|| "[permissions] is not a table".to_string())?;
+    insert_permission_entry(&mut doc, tool, scope, effect)?;
 
-    let tool_item = perms
-        .entry(tool)
-        .or_insert(toml_edit::Item::Table(toml_edit::Table::new()));
-    let tool_table = tool_item
-        .as_table_like_mut()
-        .ok_or_else(|| format!("[permissions.{tool}] is not a table"))?;
-
-    let key = match effect {
-        Effect::Allow => "allow",
-        Effect::Deny => "deny",
-    };
-
-    match scope {
-        Some(s) => {
-            let arr =
-                tool_table
-                    .entry(key)
-                    .or_insert(toml_edit::Item::Value(toml_edit::Value::Array(
-                        toml_edit::Array::new(),
-                    )));
-            let arr = arr
-                .as_array_mut()
-                .ok_or_else(|| format!("[permissions.{tool}].{key} is not an array"))?;
-            let already_exists = arr
-                .iter()
-                .any(|v| v.as_str().is_some_and(|existing| existing == s));
-            if !already_exists {
-                arr.push(s);
-                arr.set_trailing("\n");
-                arr.set_trailing_comma(true);
-                for item in arr.iter_mut() {
-                    item.decor_mut().set_prefix("\n    ");
-                }
-            }
-        }
-        None => {
-            tool_table.insert(key, toml_edit::Item::Value(toml_edit::Value::from(true)));
-        }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("cannot create .maki dir: {e}"))?;
     }
-
     std::fs::write(&path, doc.to_string())
-        .map_err(|e| format!("cannot write {PROJECT_CONFIG_FILE}: {e}"))?;
+        .map_err(|e| format!("cannot write {PROJECT_PERMISSIONS_FILE}: {e}"))?;
     Ok(())
 }
 
@@ -897,8 +856,10 @@ mod tests {
     #[test]
     fn partial_agent_config_preserves_unset_fields() {
         let dir = TempDir::new().unwrap();
+        let maki_dir = dir.path().join(".maki");
+        fs::create_dir_all(&maki_dir).unwrap();
         fs::write(
-            dir.path().join("maki.toml"),
+            maki_dir.join("config.toml"),
             "[agent]\nmax_output_lines = 5000\nbash_timeout_secs = 60\n",
         )
         .unwrap();
@@ -919,8 +880,10 @@ mod tests {
              [agent]\nmax_output_lines = 3000\nmax_line_bytes = 800\n",
         )
         .unwrap();
+        let maki_dir = dir.path().join(".maki");
+        fs::create_dir_all(&maki_dir).unwrap();
         fs::write(
-            dir.path().join("maki.toml"),
+            maki_dir.join("config.toml"),
             "[agent]\nmax_output_lines = 5000\n",
         )
         .unwrap();
@@ -942,7 +905,9 @@ mod tests {
     #[test]
     fn invalid_toml_returns_defaults() {
         let dir = TempDir::new().unwrap();
-        fs::write(dir.path().join("maki.toml"), "not valid {{{{ toml").unwrap();
+        let maki_dir = dir.path().join(".maki");
+        fs::create_dir_all(&maki_dir).unwrap();
+        fs::write(maki_dir.join("config.toml"), "not valid {{{{ toml").unwrap();
         let config = load_config(dir.path(), false);
         assert!(config.ui.splash_animation);
         assert_eq!(config.agent.max_output_bytes, DEFAULT_MAX_OUTPUT_BYTES);
@@ -962,8 +927,10 @@ mod tests {
     #[test]
     fn agent_config_from_file_uses_provided_values() {
         let dir = TempDir::new().unwrap();
+        let maki_dir = dir.path().join(".maki");
+        fs::create_dir_all(&maki_dir).unwrap();
         fs::write(
-            dir.path().join("maki.toml"),
+            maki_dir.join("config.toml"),
             "[agent]\nmax_output_bytes = 100\nmax_output_lines = 200\nmax_response_bytes = 300\nmax_line_bytes = 400\n",
         )
         .unwrap();
@@ -997,8 +964,10 @@ mod tests {
     #[test]
     fn tool_output_lines_per_tool_override() {
         let dir = TempDir::new().unwrap();
+        let maki_dir = dir.path().join(".maki");
+        fs::create_dir_all(&maki_dir).unwrap();
         fs::write(
-            dir.path().join("maki.toml"),
+            maki_dir.join("config.toml"),
             "[ui.tool_output_lines]\nbash = 20\nread = 20\n",
         )
         .unwrap();
@@ -1014,8 +983,10 @@ mod tests {
     #[test]
     fn all_sections_load_together() {
         let dir = TempDir::new().unwrap();
+        let maki_dir = dir.path().join(".maki");
+        fs::create_dir_all(&maki_dir).unwrap();
         fs::write(
-            dir.path().join("maki.toml"),
+            maki_dir.join("config.toml"),
             "[provider]\ndefault_model = \"anthropic/claude-opus-4-6\"\nconnect_timeout_secs = 15\n\
              [storage]\nmax_log_files = 5\n\
              [index]\nmax_file_size_mb = 4\n\
@@ -1117,10 +1088,12 @@ mod tests {
     fn permissions_merge_global_and_project() {
         let guard = HomeGuard::new();
         guard.write_permissions("[bash]\nallow = [\"git *\"]\ndeny = [\"rm -rf *\"]\n");
+        let maki_dir = guard.path().join(".maki");
+        fs::create_dir_all(&maki_dir).unwrap();
         fs::write(
-            guard.path().join("maki.toml"),
-            "[permissions.read]\nallow = true\n\
-             [permissions.write]\ndeny = [\"/etc/*\"]\n",
+            maki_dir.join("permissions.toml"),
+            "[read]\nallow = true\n\
+             [write]\ndeny = [\"/etc/*\"]\n",
         )
         .unwrap();
 
@@ -1151,11 +1124,9 @@ mod tests {
     #[test]
     fn project_allow_all_ignored() {
         let guard = HomeGuard::new();
-        fs::write(
-            guard.path().join("maki.toml"),
-            "[permissions]\nallow_all = true\n",
-        )
-        .unwrap();
+        let maki_dir = guard.path().join(".maki");
+        fs::create_dir_all(&maki_dir).unwrap();
+        fs::write(maki_dir.join("permissions.toml"), "allow_all = true\n").unwrap();
 
         let perms = load_permissions(guard.path());
         assert!(!perms.allow_all);

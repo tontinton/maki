@@ -139,7 +139,7 @@ mod tests {
                 transport_kind: "stdio",
                 tool_count: 3,
                 status: McpServerStatus::Disabled,
-                config_path: PathBuf::from("/project/maki.toml"),
+                config_path: PathBuf::from("/project/.maki/config.toml"),
             },
         ]))
     }

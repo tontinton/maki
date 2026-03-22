@@ -414,15 +414,17 @@ timeout = 5000
 
         let project_dir = dir.path().join("project");
         fs::create_dir_all(&project_dir).unwrap();
+        let project_maki_dir = project_dir.join(".maki");
+        fs::create_dir_all(&project_maki_dir).unwrap();
         fs::write(
-            project_dir.join("maki.toml"),
+            project_maki_dir.join("config.toml"),
             r#"[mcp.srv]
 command = ["project"]
 "#,
         )
         .unwrap();
 
-        let project_cfg = read_config(&project_dir.join("maki.toml")).unwrap();
+        let project_cfg = read_config(&project_maki_dir.join("config.toml")).unwrap();
         let global_cfg = read_config(&global_dir.join("config.toml")).unwrap();
 
         let mut merged = McpConfig::default();
