@@ -1,0 +1,1150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>maki</title>
+  <meta name="description" content="AI coding agent. Native Rust TUI. Immediate startup, 60 FPS, low memory. Indexes files instead of reading them, chains tools in a sandbox, auto-compacts context. Anthropic, OpenAI, Z.AI, Synthetic, or any compatible API.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Nunito:wght@400;600;700;800;900&family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,600;0,9..144,700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="asciinema-player.css">
+  <style>
+    *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+
+    :root {
+      --lavender: oklch(85% 0.06 280);
+      --periwinkle: oklch(78% 0.08 275);
+      --soft-pink: oklch(82% 0.06 350);
+      --salmon: oklch(75% 0.12 40);
+      --cream: oklch(96% 0.02 90);
+      --deep-navy: oklch(25% 0.04 270);
+      --navy-light: oklch(35% 0.04 270);
+      --text-secondary: oklch(50% 0.03 270);
+      --muted: oklch(65% 0.03 270);
+      --surface-glow: oklch(90% 0.05 280);
+      --sky-start: oklch(92% 0.04 275);
+      --sky-end: oklch(88% 0.06 280);
+    }
+
+    html {
+      scroll-behavior: smooth;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+    }
+
+    body {
+      font-family: 'Nunito', sans-serif;
+      color: var(--deep-navy);
+      background: var(--cream);
+      line-height: 1.6;
+      overflow-x: hidden;
+    }
+
+    /* ── NAV ── */
+    nav {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      z-index: 100;
+      padding: 0.35rem 1rem;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      background: oklch(96% 0.02 90 / 0.85);
+      backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
+      border-bottom: 1px solid oklch(85% 0.04 280 / 0.3);
+      transition: box-shadow 0.3s ease;
+    }
+    nav.scrolled { box-shadow: 0 4px 30px oklch(70% 0.06 280 / 0.1); }
+    .nav-logo {
+      font-weight: 900;
+      font-size: 1.4rem;
+      color: var(--deep-navy);
+      text-decoration: none;
+      letter-spacing: -0.02em;
+    }
+    .nav-right { display: flex; gap: 1.5rem; align-items: center; }
+    .nav-right a {
+      font-size: 0.92rem;
+      font-weight: 600;
+      color: var(--text-secondary);
+      text-decoration: none;
+      transition: color 0.2s;
+    }
+    .nav-right a:hover { color: var(--deep-navy); }
+    .nav-cta {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+      background: var(--deep-navy) !important;
+      color: var(--cream) !important;
+      padding: 0.45rem 1.1rem;
+      border-radius: 8px;
+      transition: opacity 0.2s !important;
+    }
+    .nav-cta:hover { opacity: 0.85; }
+
+    /* ── STAR BADGE ── */
+    .star-badge {
+      display: none;
+      align-items: center;
+      gap: 0.25rem;
+      font-size: 0.78rem;
+      font-weight: 700;
+      font-family: 'JetBrains Mono', monospace;
+      letter-spacing: 0.01em;
+      opacity: 0;
+      transform: scale(0.8) translateY(2px);
+      transition: opacity 0.5s cubic-bezier(0.16, 1, 0.3, 1), transform 0.5s cubic-bezier(0.16, 1, 0.3, 1);
+      pointer-events: none;
+    }
+    .star-badge.loaded {
+      display: inline-flex;
+      opacity: 1;
+      transform: scale(1) translateY(0);
+    }
+    .star-badge svg {
+      flex-shrink: 0;
+    }
+    .nav-cta .star-badge.loaded,
+    .btn-primary .star-badge.loaded {
+      margin-left: 0.15rem;
+      padding-left: 0.5rem;
+      border-left: 1px solid oklch(80% 0.02 90 / 0.25);
+    }
+    .nav-cta .star-badge svg,
+    .btn-primary .star-badge svg { fill: oklch(80% 0.10 85); }
+
+    /* ── HERO ── */
+    .hero {
+      min-height: 100vh;
+      display: grid;
+      grid-template-columns: 30% 1fr;
+      grid-template-rows: 1fr;
+      align-items: center;
+      padding: 6rem clamp(2rem, 4vw, 4rem) 3rem;
+      position: relative;
+      background: linear-gradient(180deg, var(--sky-start) 0%, var(--sky-end) 40%, var(--lavender) 70%, var(--soft-pink) 100%);
+      overflow: hidden;
+      gap: 2.5rem;
+    }
+    .hero-intro {
+      position: relative;
+      z-index: 2;
+    }
+
+    .hero-clouds {
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+    }
+
+    .cloud-svg {
+      position: absolute;
+      pointer-events: none;
+    }
+
+    .cloud-bank {
+      position: absolute;
+      pointer-events: none;
+      will-change: transform;
+    }
+    .cloud-bank-1 { bottom: -2%; left: -8%; animation: drift-slow 18s ease-in-out infinite; }
+    .cloud-bank-2 { bottom: 6%; right: -6%; animation: drift-slow 14s ease-in-out infinite reverse; }
+    .cloud-bank-5 { bottom: 18%; left: 30%; animation: drift-slow 16s ease-in-out infinite; transform: scale(0.45); opacity: 0.5; }
+    .cloud-bank-7 { bottom: -4%; left: 20%; animation: drift-slow 21s ease-in-out infinite; transform: scale(0.9); }
+    .cloud-bank-8 { bottom: -6%; right: 15%; animation: drift-slow 18s ease-in-out infinite reverse; transform: scale(0.75); opacity: 0.85; }
+
+    .cloud-floor {
+      position: absolute;
+      bottom: -30px;
+      left: -5%;
+      right: -5%;
+      height: 120px;
+      background: linear-gradient(180deg, transparent 0%, oklch(95% 0.02 280 / 0.4) 40%, oklch(96% 0.02 90 / 0.8) 100%);
+    }
+
+    @keyframes drift-slow {
+      0%, 100% { transform: translateX(0); }
+      50% { transform: translateX(30px); }
+    }
+    @keyframes drift-med {
+      0%, 100% { transform: translateX(0) translateY(0); }
+      33% { transform: translateX(20px) translateY(-5px); }
+      66% { transform: translateX(-10px) translateY(3px); }
+    }
+
+    .stars { position: absolute; inset: 0; pointer-events: none; }
+    .star {
+      position: absolute;
+      background: oklch(98% 0.02 90);
+      clip-path: polygon(50% 0%, 61% 35%, 98% 35%, 68% 57%, 79% 91%, 50% 70%, 21% 91%, 32% 57%, 2% 35%, 39% 35%);
+      animation: twinkle 3s ease-in-out infinite;
+      will-change: opacity, transform;
+    }
+    .star-diamond {
+      position: absolute;
+      background: oklch(98% 0.03 85);
+      clip-path: polygon(50% 0%, 62% 38%, 100% 50%, 62% 62%, 50% 100%, 38% 62%, 0% 50%, 38% 38%);
+      animation: twinkle-bright 4s ease-in-out infinite;
+      will-change: opacity, transform;
+    }
+    .star:nth-child(1) { top: 15%; left: 20%; width: 8px; height: 8px; }
+    .star:nth-child(2) { top: 25%; right: 25%; width: 6px; height: 6px; animation-delay: 1s; }
+    .star:nth-child(3) { top: 10%; right: 35%; width: 5px; height: 5px; animation-delay: 0.5s; }
+    .star:nth-child(4) { top: 30%; left: 35%; width: 4px; height: 4px; animation-delay: 2s; }
+    .star:nth-child(5) { top: 18%; left: 55%; width: 7px; height: 7px; animation-delay: 1.5s; }
+    .star:nth-child(6) { top: 8%; right: 15%; width: 5px; height: 5px; animation-delay: 0.8s; }
+    .star:nth-child(7) { top: 6%; left: 40%; width: 4px; height: 4px; animation-delay: 2.3s; }
+    .star:nth-child(8) { top: 22%; left: 70%; width: 5px; height: 5px; animation-delay: 0.3s; }
+    .star:nth-child(9) { top: 12%; left: 82%; width: 3px; height: 3px; animation-delay: 1.8s; }
+    .star:nth-child(10) { top: 35%; right: 40%; width: 4px; height: 4px; animation-delay: 2.6s; }
+    .star-diamond:nth-child(11) { top: 12%; left: 30%; width: 14px; height: 14px; animation-delay: 0.7s; }
+    .star-diamond:nth-child(12) { top: 20%; right: 18%; width: 11px; height: 11px; animation-delay: 1.4s; }
+    .star-diamond:nth-child(13) { top: 7%; left: 60%; width: 10px; height: 10px; animation-delay: 2.1s; }
+    .star-diamond:nth-child(14) { top: 32%; left: 48%; width: 8px; height: 8px; animation-delay: 0.2s; }
+    .star-diamond:nth-child(15) { top: 16%; right: 38%; width: 9px; height: 9px; animation-delay: 1.9s; }
+
+    @keyframes twinkle {
+      0%, 100% { opacity: 0.3; transform: scale(1); }
+      50% { opacity: 1; transform: scale(1.3); }
+    }
+    @keyframes twinkle-bright {
+      0%, 100% { opacity: 0.15; transform: scale(0.8) rotate(0deg); }
+      50% { opacity: 0.9; transform: scale(1.2) rotate(15deg); }
+    }
+
+    .moon-group {
+      position: absolute;
+      top: 10%;
+      right: 10%;
+      pointer-events: none;
+    }
+    .moon {
+      position: relative;
+      width: 42px;
+      height: 42px;
+      border-radius: 50%;
+      background: oklch(95% 0.03 85);
+      box-shadow:
+        0 0 20px oklch(92% 0.04 85 / 0.5),
+        0 0 60px oklch(92% 0.04 85 / 0.2),
+        0 0 100px oklch(92% 0.04 85 / 0.1);
+    }
+    .moon::after {
+      content: '';
+      position: absolute;
+      width: 34px;
+      height: 34px;
+      border-radius: 50%;
+      background: linear-gradient(135deg, var(--sky-start), var(--sky-end));
+      top: -4px;
+      left: 7px;
+    }
+    .moon-2 {
+      position: absolute;
+      width: 28px;
+      height: 28px;
+      border-radius: 50%;
+      background: oklch(94% 0.03 85);
+      box-shadow:
+        0 0 16px oklch(92% 0.04 85 / 0.4),
+        0 0 50px oklch(92% 0.04 85 / 0.15);
+      top: -60px;
+      left: -200px;
+    }
+    .moon-2::after {
+      content: '';
+      position: absolute;
+      width: 22px;
+      height: 22px;
+      border-radius: 50%;
+      background: linear-gradient(135deg, var(--sky-start), var(--sky-end));
+      top: -3px;
+      left: 5px;
+    }
+
+
+    .hero h1 {
+      font-weight: 900;
+      font-size: clamp(2.5rem, 5vw, 3.5rem);
+      letter-spacing: -0.03em;
+      line-height: 1.05;
+      margin-bottom: 0.3rem;
+    }
+    .hero-tagline {
+      font-size: clamp(1.05rem, 2.2vw, 1.3rem);
+      font-weight: 600;
+      color: var(--navy-light);
+      margin-bottom: 1.25rem;
+    }
+    .hero-sub {
+      font-size: 1rem;
+      color: var(--text-secondary);
+      max-width: 42ch;
+      margin-bottom: 1.5rem;
+    }
+    .hero-actions {
+      display: flex;
+      gap: 0.75rem;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    .hero-preview {
+      position: relative;
+      z-index: 2;
+      align-self: center;
+      min-width: 0;
+    }
+
+    /* ── DIVIDER ── */
+    .divider {
+      height: 1px;
+      background: linear-gradient(90deg, transparent, oklch(80% 0.06 280 / 0.4), transparent);
+      margin-bottom: clamp(3rem, 6vw, 5rem);
+    }
+    .divider.visible { transform: scaleX(1); }
+    .btn-primary {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      padding: 0.75rem 1.75rem;
+      background: var(--deep-navy);
+      color: var(--cream);
+      font-family: 'Nunito', sans-serif;
+      font-weight: 700;
+      font-size: 1rem;
+      border: none;
+      border-radius: 10px;
+      cursor: pointer;
+      text-decoration: none;
+      transition: transform 0.2s ease, box-shadow 0.2s ease;
+    }
+    .btn-primary:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 8px 24px oklch(25% 0.04 270 / 0.3);
+    }
+    .btn-ghost {
+      padding: 0.75rem 1.75rem;
+      background: none;
+      color: var(--deep-navy);
+      font-family: 'Nunito', sans-serif;
+      font-weight: 700;
+      font-size: 1rem;
+      border: 2px solid oklch(30% 0.04 270 / 0.25);
+      border-radius: 10px;
+      cursor: pointer;
+      text-decoration: none;
+      transition: transform 0.2s ease, border-color 0.2s;
+    }
+    .btn-ghost:hover { transform: translateY(-2px); border-color: oklch(30% 0.04 270 / 0.5); }
+
+    .install-line code {
+      display: inline-block;
+      padding: 0.5rem 1.25rem;
+      background: oklch(20% 0.03 270 / 0.85);
+      color: oklch(88% 0.04 85);
+      font-family: 'JetBrains Mono', 'Fira Code', monospace;
+      font-size: 0.92rem;
+      border-radius: 8px;
+      letter-spacing: 0.02em;
+      user-select: none;
+    }
+
+    /* ── MAIN CONTENT ── */
+    .content {
+      max-width: 1060px;
+      margin: 0 auto;
+      padding: clamp(4rem, 8vw, 6rem) clamp(1.5rem, 5vw, 3rem) 0rem;
+    }
+
+    .pitch {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 3rem;
+      margin-bottom: clamp(3rem, 6vw, 5rem);
+    }
+    .pitch-col h2 {
+      font-weight: 800;
+      font-size: clamp(1.35rem, 2.5vw, 1.7rem);
+      letter-spacing: -0.02em;
+      line-height: 1.2;
+      margin-bottom: 1.25rem;
+    }
+    .pitch-col h2 span {
+      display: block;
+      font-size: 0.78rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.14em;
+      color: var(--muted);
+      margin-bottom: 0.4rem;
+    }
+
+    .pitch-item:last-child { margin-bottom: 0; }
+
+    .pip {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      margin-top: 0.55rem;
+      justify-self: center;
+    }
+    .pip-lavender { background: var(--periwinkle); }
+    .pip-salmon { background: var(--salmon); }
+    .pip-pink { background: var(--soft-pink); }
+    .pip-gold { background: oklch(78% 0.12 85); }
+
+    .pitch-item strong {
+      font-weight: 800;
+      font-size: 1rem;
+    }
+    .pitch-item p {
+      font-size: 0.92rem;
+      color: var(--text-secondary);
+      line-height: 1.55;
+      margin-top: 0.2rem;
+    }
+    .pitch-item code {
+      font-size: 0.88rem;
+      background: oklch(90% 0.03 270 / 0.5);
+      padding: 0.1rem 0.35rem;
+      border-radius: 4px;
+    }
+    .pitch-badge {
+      display: inline-block;
+      font-size: 0.78rem;
+      font-weight: 700;
+      color: oklch(50% 0.1 280);
+      background: oklch(92% 0.06 280 / 0.5);
+      padding: 0.2rem 0.6rem;
+      border-radius: 20px;
+      margin-left: 0.4rem;
+      vertical-align: middle;
+    }
+
+    /* ── DIVIDER ── */
+    .divider {
+      height: 1px;
+      background: linear-gradient(90deg, transparent, oklch(80% 0.06 280 / 0.4), transparent);
+      margin-bottom: clamp(3rem, 6vw, 5rem);
+    }
+
+    /* faithful TUI recreation */
+    .tui {
+      border-radius: 10px;
+      overflow: hidden;
+      box-shadow: 0 24px 80px oklch(20% 0.04 270 / 0.3), 0 0 0 1px oklch(30% 0.02 270 / 0.3);
+      font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+      font-size: 0.72rem;
+      line-height: 1.5;
+      background: #282a36;
+      color: oklch(78% 0.02 270);
+      display: inline-block;
+      transform-origin: top left;
+    }
+    .tui-titlebar {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      padding: 8px 16px;
+      background: oklch(16% 0.015 270);
+    }
+    .tui-dot { width: 11px; height: 11px; border-radius: 50%; }
+    .tui-dot-r { background: oklch(62% 0.2 25); }
+    .tui-dot-y { background: oklch(78% 0.15 85); }
+    .tui-dot-g { background: oklch(68% 0.15 150); }
+    .tui-titlebar-text {
+      margin-left: 0.5rem;
+      font-size: 0.72rem;
+      color: oklch(55% 0.02 270);
+    }
+
+    .tui-body {
+      display: flex;
+      flex-direction: column;
+      background: #282a36;
+      position: relative;
+      min-height: 330px;
+      min-width: 774px;
+    }
+    .tui-loader {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: #282a36;
+      z-index: 5;
+      transition: opacity 0.3s ease;
+    }
+    .tui-loader.hidden {
+      opacity: 0;
+      pointer-events: none;
+    }
+    .tui-spinner {
+      width: 24px;
+      height: 24px;
+      border: 2px solid oklch(50% 0.02 270);
+      border-top-color: oklch(80% 0.06 280);
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+    }
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+
+    /* asciinema player overrides */
+    .tui-body .ap-wrapper {
+      background: #282a36 !important;
+      border-radius: 0 !important;
+      box-shadow: none !important;
+      padding: 0 !important;
+      margin: 0 !important;
+      justify-content: start !important;
+    }
+    .tui-body .ap-player {
+      background: #282a36 !important;
+      padding: 0 !important;
+      border-radius: 0 !important;
+      margin: 0 !important;
+    }
+    .tui-body pre.ap-terminal {
+      padding: 0 !important;
+      margin: 0 !important;
+      border-width: 0 !important;
+      box-sizing: border-box !important;
+    }
+    .tui-body .ap-control-bar {
+      display: none !important;
+    }
+    .tui-body .ap-overlay-start {
+      display: none !important;
+    }
+    #demo-player {
+    }
+
+
+    /* ── PROVIDERS ── */
+    .providers-section {
+      text-align: center;
+      margin-bottom: 0;
+      position: relative;
+      z-index: 2;
+      max-width: 1060px;
+      margin: 0 auto;
+    }
+    .providers-section h2 {
+      font-weight: 800;
+      font-size: clamp(1.65rem, 3.2vw, 2.2rem);
+      letter-spacing: -0.02em;
+      margin-bottom: 0.5rem;
+    }
+    .providers-section > p {
+      font-size: 1rem;
+      color: var(--text-secondary);
+      max-width: 50ch;
+      margin: 0 auto 2rem;
+    }
+    .provider-grid {
+      display: flex;
+      justify-content: center;
+      gap: 1.25rem;
+      flex-wrap: wrap;
+      margin-bottom: 1.25rem;
+    }
+    .provider-chip {
+      display: inline-block;
+      padding: 0.8rem 1.6rem;
+      background: linear-gradient(135deg, oklch(96% 0.02 280 / 0.6), oklch(94% 0.03 280 / 0.3));
+      border: 1px solid oklch(88% 0.04 280 / 0.4);
+      border-radius: 12px;
+      font-weight: 700;
+      font-size: 1.05rem;
+      color: var(--deep-navy);
+      text-decoration: none;
+    }
+    .provider-chip:hover {
+      transform: translateY(-3px) scale(1.04);
+      box-shadow: 0 8px 24px oklch(70% 0.06 280 / 0.15);
+      background: linear-gradient(135deg, oklch(94% 0.04 280 / 0.7), oklch(90% 0.06 280 / 0.4));
+      border-color: oklch(78% 0.08 280 / 0.5);
+    }
+    .provider-plus {
+      font-size: 0.92rem;
+      color: var(--text-secondary);
+    }
+    .provider-plus a {
+      color: oklch(48% 0.1 280);
+      text-decoration: underline;
+      text-underline-offset: 3px;
+    }
+
+
+    /* ── BOTTOM SKY ── */
+    .bottom-sky {
+      position: relative;
+      overflow: hidden;
+      margin-top: -1px;
+    }
+    .bottom-sky-bg {
+      min-height: clamp(18rem, 28vw, 28rem);
+      background: linear-gradient(180deg, var(--cream) 0%, var(--sky-start) 15%, var(--sky-end) 35%, var(--lavender) 60%, var(--soft-pink) 100%);
+      position: relative;
+      padding: clamp(3rem, 6vw, 5rem) clamp(1.5rem, 5vw, 3rem) clamp(10rem, 14vw, 16rem);
+    }
+    .bottom-stars {
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+    }
+    .bottom-star {
+      position: absolute;
+      background: oklch(98% 0.02 90);
+      clip-path: polygon(50% 0%, 61% 35%, 98% 35%, 68% 57%, 79% 91%, 50% 70%, 21% 91%, 32% 57%, 2% 35%, 39% 35%);
+      animation: twinkle 3s ease-in-out infinite;
+    }
+    .bottom-star:nth-child(1) { bottom: 45%; left: 12%; width: 5px; height: 5px; animation-delay: 0.5s; }
+    .bottom-star:nth-child(2) { bottom: 55%; left: 30%; width: 4px; height: 4px; animation-delay: 1.2s; }
+    .bottom-star:nth-child(3) { bottom: 60%; right: 22%; width: 5px; height: 5px; animation-delay: 0.8s; }
+    .bottom-star:nth-child(4) { bottom: 50%; right: 38%; width: 3px; height: 3px; animation-delay: 2s; }
+    .bottom-star:nth-child(5) { bottom: 65%; left: 52%; width: 4px; height: 4px; animation-delay: 1.5s; }
+    .bottom-star:nth-child(6) { bottom: 48%; right: 10%; width: 4px; height: 4px; animation-delay: 0.3s; }
+    .bottom-star-diamond {
+      position: absolute;
+      background: oklch(98% 0.03 85);
+      clip-path: polygon(50% 0%, 62% 38%, 100% 50%, 62% 62%, 50% 100%, 38% 62%, 0% 50%, 38% 38%);
+      animation: twinkle-bright 4s ease-in-out infinite;
+    }
+    .bottom-star-diamond:nth-child(7) { bottom: 52%; left: 22%; width: 10px; height: 10px; animation-delay: 1.8s; }
+    .bottom-star-diamond:nth-child(8) { bottom: 58%; right: 28%; width: 8px; height: 8px; animation-delay: 0.6s; }
+
+    .bottom-cloud-layer {
+      position: absolute;
+      bottom: 0;
+      left: -5%;
+      right: -5%;
+      pointer-events: none;
+    }
+    .bottom-cloud-row {
+      position: absolute;
+      left: 0;
+      right: 0;
+    }
+    .bottom-cloud-row .cloud-svg {
+    }
+    .bottom-cloud-back {
+      bottom: 60px;
+      height: 90px;
+    }
+    .bottom-cloud-back .cloud-svg { fill: oklch(90% 0.05 300 / 0.5); }
+    .bottom-cloud-mid {
+      bottom: 25px;
+      height: 80px;
+    }
+    .bottom-cloud-mid .cloud-svg { fill: oklch(88% 0.04 290 / 0.6); }
+    .bottom-cloud-front {
+      bottom: -8px;
+      height: 70px;
+    }
+    .bottom-cloud-front .cloud-svg { fill: oklch(92% 0.03 280 / 0.8); }
+
+    .bottom-moon {
+      position: absolute;
+      top: 18%;
+      right: 10%;
+      width: 28px;
+      height: 28px;
+      border-radius: 50%;
+      background: oklch(95% 0.03 85);
+      box-shadow:
+        0 0 16px oklch(92% 0.04 85 / 0.4),
+        0 0 50px oklch(92% 0.04 85 / 0.15);
+    }
+    .bottom-moon::after {
+      content: '';
+      position: absolute;
+      width: 22px;
+      height: 22px;
+      border-radius: 50%;
+      background: linear-gradient(135deg, oklch(90% 0.05 280), oklch(85% 0.06 290));
+      top: -3px;
+      left: 5px;
+    }
+
+    /* ── ANIMATIONS ── */
+    .reveal {
+      opacity: 0;
+      transform: translateY(20px);
+      transition: opacity 0.6s cubic-bezier(0.16, 1, 0.3, 1), transform 0.6s cubic-bezier(0.16, 1, 0.3, 1);
+    }
+    .reveal.visible { opacity: 1; transform: translateY(0); }
+    .reveal-d1 { transition-delay: 0.1s; }
+    .reveal-d2 { transition-delay: 0.2s; }
+    .reveal-d3 { transition-delay: 0.3s; }
+    .reveal-d4 { transition-delay: 0.4s; }
+    .reveal-d5 { transition-delay: 0.5s; }
+    .reveal-d6 { transition-delay: 0.6s; }
+    .reveal-d7 { transition-delay: 0.7s; }
+
+    /* hero entrance choreography — .hero-anim added by JS */
+    .hero-anim .hero-intro > * {
+      opacity: 0;
+      transform: translateY(18px);
+      transition: opacity 0.4s cubic-bezier(0.16, 1, 0.3, 1), transform 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+    }
+    .hero-anim .hero-intro.entered > * { opacity: 1; transform: translateY(0); }
+    .hero-anim .hero-intro > :nth-child(1) { transition-delay: 0.05s; }
+    .hero-anim .hero-intro > :nth-child(2) { transition-delay: 0.12s; }
+    .hero-anim .hero-intro > :nth-child(3) { transition-delay: 0.19s; }
+    .hero-anim .hero-intro > :nth-child(4) { transition-delay: 0.26s; }
+    .hero-anim .hero-intro > :nth-child(5) { transition-delay: 0.33s; }
+    .hero-anim .hero-intro > :nth-child(6) { transition-delay: 0.40s; }
+
+    /* hero preview (TUI) entrance */
+    .hero-anim .hero-preview {
+      opacity: 0;
+      transform: translateX(40px);
+      transition: opacity 0.5s cubic-bezier(0.16, 1, 0.3, 1) 0.15s, transform 0.5s cubic-bezier(0.16, 1, 0.3, 1) 0.15s;
+    }
+    .hero-anim .hero-preview.entered {
+      opacity: 1;
+      transform: translateX(0);
+    }
+
+    /* pitch item stagger — each item animates individually */
+    .pitch-item {
+      display: grid;
+      grid-template-columns: 24px 1fr;
+      gap: 0.75rem;
+      align-items: baseline;
+      margin-bottom: 1.1rem;
+      opacity: 0;
+      transform: translateY(16px);
+      transition: opacity 0.5s cubic-bezier(0.16, 1, 0.3, 1), transform 0.5s cubic-bezier(0.16, 1, 0.3, 1);
+    }
+    .pitch-item.visible { opacity: 1; transform: translateY(0); }
+
+    /* provider chip stagger */
+    .provider-chip {
+      opacity: 0;
+      transform: translateY(14px);
+      transition: transform 0.2s cubic-bezier(0.16, 1, 0.3, 1), box-shadow 0.2s ease, opacity 0.5s cubic-bezier(0.16, 1, 0.3, 1), background 0.25s ease, border-color 0.25s ease;
+    }
+    .provider-chip.visible {
+      opacity: 1;
+      transform: translateY(0);
+    }
+
+    /* install line copy feedback */
+    .install-line {
+      margin-top: 1.25rem;
+      position: relative;
+      display: inline-flex;
+      align-items: center;
+    }
+    .install-line code {
+      cursor: pointer;
+      transition: background 0.2s ease, transform 0.15s ease;
+    }
+    .install-line code:hover {
+      background: oklch(22% 0.04 270 / 0.9);
+    }
+    .install-line code:active {
+      transform: scale(0.97);
+    }
+    .copy-toast {
+      position: absolute;
+      top: 50%;
+      left: calc(100% + 0.6rem);
+      transform: translateY(-50%) translateX(-4px);
+      font-size: 0.78rem;
+      font-weight: 700;
+      color: oklch(50% 0.12 145);
+      opacity: 0;
+      transition: opacity 0.25s ease, transform 0.25s ease;
+      pointer-events: none;
+      white-space: nowrap;
+    }
+    .copy-toast.show {
+      opacity: 1;
+      transform: translateY(-50%) translateX(0);
+    }
+
+    /* nav logo hover */
+    .nav-logo {
+      transition: transform 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+    }
+    .nav-logo:hover {
+      transform: scale(1.05);
+    }
+
+    /* button press feedback */
+    .btn-primary:active {
+      transform: translateY(0) scale(0.97);
+      transition-duration: 0.08s;
+    }
+    .btn-ghost:active {
+      transform: translateY(0) scale(0.97);
+      transition-duration: 0.08s;
+    }
+
+    /* provider chip active */
+    .provider-chip:active {
+      transform: translateY(0) scale(0.97) !important;
+    }
+
+    /* ── REDUCED MOTION ── */
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+        scroll-behavior: auto !important;
+      }
+      .hero-anim .hero-intro > * { opacity: 1; transform: none; }
+      .hero-anim .hero-preview { opacity: 1; transform: none; }
+      .reveal { opacity: 1; transform: none; }
+      .pitch-item { opacity: 1; transform: none; }
+      .provider-chip { opacity: 1; transform: none; }
+      .star-badge { opacity: 1; transform: none; }
+    }
+
+    /* ── RESPONSIVE ── */
+    @media (max-width: 768px) {
+      .nav-right a:not(.nav-cta) { display: none; }
+      .hero { grid-template-columns: 1fr; text-align: center; padding-inline: 1rem; }
+      .hero-intro { display: flex; flex-direction: column; align-items: center; }
+      .hero-actions { justify-content: center; }
+      .hero-preview { width: 100%; }
+      .hero-preview .tui { transform-origin: top center; }
+      .pitch { grid-template-columns: 1fr; }
+
+      .provider-grid { gap: 0.75rem; }
+      .provider-chip { padding: 0.65rem 1.25rem; font-size: 0.88rem; }
+      .moon-2 { display: none; }
+    }
+    @media (max-width: 480px) {
+      .hero-actions { flex-direction: column; align-items: center; }
+    }
+  </style>
+</head>
+<body>
+
+<nav id="nav">
+  <a href="#" class="nav-logo">maki</a>
+  <div class="nav-right">
+    <a href="#features">Features</a>
+    <a href="https://github.com/tontinton/maki" target="_blank" rel="noopener" class="nav-cta"><svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/></svg>GitHub<span class="star-badge" data-stars><svg width="10" height="10" viewBox="0 0 24 24"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/></svg><span data-star-count></span></span></a>
+  </div>
+</nav>
+
+<section class="hero">
+  <div class="hero-clouds">
+    <div class="cloud-bank cloud-bank-1">
+      <svg class="cloud-svg" style="width:380px;bottom:0;left:0" viewBox="0 0 380 120" fill="oklch(96% 0.02 280 / 0.6)"><path d="M10 120 Q10 95 35 90 Q20 60 55 50 Q60 20 100 18 Q130 0 165 15 Q195 5 220 20 Q250 8 275 25 Q310 10 340 30 Q365 20 370 50 Q390 65 370 85 Q380 110 360 120Z"/></svg>
+    </div>
+    <div class="cloud-bank cloud-bank-2">
+      <svg class="cloud-svg" style="width:300px;bottom:0;right:0" viewBox="0 0 300 110" fill="oklch(96% 0.02 280 / 0.55)"><path d="M5 110 Q0 85 25 75 Q15 50 50 40 Q55 15 90 12 Q120 -5 155 10 Q180 0 210 15 Q240 5 260 25 Q285 15 290 45 Q310 60 290 80 Q300 105 280 110Z"/></svg>
+    </div>
+    <div class="cloud-bank cloud-bank-5">
+      <svg class="cloud-svg" style="width:160px;bottom:0;left:0" viewBox="0 0 160 65" fill="oklch(96% 0.02 280 / 0.4)"><path d="M5 65 Q0 48 16 42 Q8 26 30 20 Q38 4 58 6 Q75 -4 95 8 Q112 0 128 15 Q148 8 152 30 Q166 40 150 52 Q158 63 142 65Z"/></svg>
+    </div>
+    <div class="cloud-bank cloud-bank-7">
+      <svg class="cloud-svg" style="width:400px;bottom:0;left:0" viewBox="0 0 400 130" fill="oklch(97% 0.02 280 / 0.65)"><path d="M8 130 Q5 100 30 92 Q15 60 55 48 Q62 18 105 15 Q140 -5 175 12 Q205 0 235 18 Q265 5 295 22 Q325 8 355 30 Q380 18 385 55 Q405 72 385 92 Q395 125 375 130Z"/></svg>
+    </div>
+    <div class="cloud-bank cloud-bank-8">
+      <svg class="cloud-svg" style="width:320px;bottom:0;left:0" viewBox="0 0 320 115" fill="oklch(97% 0.02 280 / 0.6)"><path d="M8 115 Q3 88 28 80 Q15 55 48 42 Q55 15 92 12 Q122 -4 155 10 Q182 0 208 16 Q235 5 258 22 Q282 12 300 35 Q318 22 312 55 Q330 68 312 85 Q320 110 302 115Z"/></svg>
+    </div>
+    <div class="cloud-floor"></div>
+  </div>
+  <div class="stars">
+    <div class="star"></div><div class="star"></div><div class="star"></div><div class="star"></div><div class="star"></div>
+    <div class="star"></div><div class="star"></div><div class="star"></div><div class="star"></div><div class="star"></div>
+    <div class="star-diamond"></div><div class="star-diamond"></div><div class="star-diamond"></div><div class="star-diamond"></div><div class="star-diamond"></div>
+  </div>
+  <div class="moon-group">
+    <div class="moon"></div>
+    <div class="moon-2"></div>
+  </div>
+
+  <div class="hero-intro">
+    <h1>maki</h1>
+    <p class="hero-tagline">the efficient coder</p>
+    <p class="hero-sub">Native rust binary. No javascript runtime. Immediate startup, 60 FPS, barely taking memory. Indexes files instead of reading them whole. Chains tools through a sandboxed interpreter so intermediate results stay out of your context.</p>
+    <div class="hero-actions">
+      <a href="https://github.com/tontinton/maki" target="_blank" rel="noopener" class="btn-primary">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/></svg>
+        GitHub<span class="star-badge" data-stars><svg width="11" height="11" viewBox="0 0 24 24"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/></svg><span data-star-count></span></span>
+      </a>
+      <a href="#features" class="btn-ghost">Features</a>
+    </div>
+    <div class="install-line">
+      <code onclick="navigator.clipboard.writeText('cargo install --locked maki');showCopyToast(this)">cargo install --locked maki</code>
+      <span class="copy-toast">copied!</span>
+    </div>
+  </div>
+
+  <div class="hero-preview">
+    <div class="tui">
+      <div class="tui-titlebar">
+        <div class="tui-dot tui-dot-r"></div>
+        <div class="tui-dot tui-dot-y"></div>
+        <div class="tui-dot tui-dot-g"></div>
+      </div>
+
+      <div class="tui-body">
+        <div class="tui-loader" id="demo-loader"><div class="tui-spinner"></div></div>
+        <div id="demo-player"></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<div class="content" id="features">
+
+  <div class="pitch reveal">
+    <div class="pitch-col">
+      <h2><span>Context efficiency</span>Where tokens go</h2>
+
+      <div class="pitch-item">
+        <div class="pip pip-lavender"></div>
+        <div>
+          <strong>index</strong>
+          <p>Parses 17 languages into skeletons: imports, type defs, function signatures with their line ranges. Adds 59 tok/turn but saves 224 tok/turn on reads, netting 165 tok/turn saved.</p>
+        </div>
+      </div>
+      <div class="pitch-item">
+        <div class="pip pip-salmon"></div>
+        <div>
+          <strong>code_execution</strong>
+          <p>A sandboxed Python interpreter with memory and time limits. All tools are exposed as <code>async</code> functions, so the model can <code>asyncio.gather()</code> a bunch of reads, grep the results, and only return what matters. Intermediate data never touches your context.</p>
+        </div>
+      </div>
+      <div class="pitch-item">
+        <div class="pip pip-pink"></div>
+        <div>
+          <strong>task</strong>
+          <p>The model picks weak, medium, or strong for each subagent. Haiku-tier for grep-heavy research, opus-tier for architecture. Subagents can be read-only or have full tool access.</p>
+        </div>
+      </div>
+      <div class="pitch-item">
+        <div class="pip pip-gold"></div>
+        <div>
+          <strong>Lean system prompt</strong>
+          <p>The system prompt, tool descriptions, and examples are short. When context gets too long, maki compacts history automatically: strips images, thinking blocks, and summarizes older turns.</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="pitch-col">
+      <h2><span>User experience</span>What you get</h2>
+
+      <div class="pitch-item">
+        <div class="pip pip-salmon"></div>
+        <div>
+          <strong>Rust TUI, 60 FPS</strong>
+          <p>Native binary. No javascript runtime, no react. Even the splash screen animation uses SIMD. Syntax highlighting runs on a background thread pool so it never blocks your input. Fits well on small laptop screens.</p>
+        </div>
+      </div>
+      <div class="pitch-item">
+        <div class="pip pip-lavender"></div>
+        <div>
+          <strong>Full visibility</strong>
+          <p>Philosophy: don't hide anything. Token count, cost, and model are always in the status bar. Each subagent gets its own chat window you can flip through with Ctrl-N/P. Ctrl-F for fuzzy search. <code>/btw</code> runs a side query without touching the current session. <code>!</code> runs shell commands, <code>!!</code> runs them silently.</p>
+        </div>
+      </div>
+      <div class="pitch-item">
+        <div class="pip pip-gold"></div>
+        <div>
+          <strong>Sensible permissions</strong>
+          <p>Bash commands are parsed with tree-sitter so maki knows what's actually being run. <code>git diff && rm -rf /</code> correctly flags both <code>git</code> and <code>rm</code>. Most agents only see <code>git</code>. Handles subshells, command substitution, pipes. Per-tool allow/deny rules, or <code>--yolo</code> to skip it all. SSRF protection on webfetch.</p>
+        </div>
+      </div>
+      <div class="pitch-item">
+        <div class="pip pip-pink"></div>
+        <div>
+          <strong>Sessions, memory, MCP</strong>
+          <p>Long-term memory that persists across sessions. Tell maki to remember something, somtimes it picks things up on its own. Double-Escape to rewind. Plan mode restricts the agent to read-only. MCP servers over stdio or HTTP. Skills. 26 themes. Paste images. <code>--print</code> for headless (output is Claude Code-compatible).</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="divider reveal"></div>
+
+</div>
+
+<div class="bottom-sky">
+  <div class="bottom-sky-bg">
+    <div class="bottom-stars">
+      <div class="bottom-star"></div><div class="bottom-star"></div><div class="bottom-star"></div>
+      <div class="bottom-star"></div><div class="bottom-star"></div><div class="bottom-star"></div>
+      <div class="bottom-star-diamond"></div><div class="bottom-star-diamond"></div>
+    </div>
+    <div class="bottom-moon"></div>
+
+    <div class="providers-section">
+      <h2 class="reveal">Providers</h2>
+      <p class="reveal reveal-d1">Set an API key env var, or use <code>maki auth login openai</code> for OAuth.</p>
+      <div class="provider-grid">
+        <a href="https://docs.anthropic.com" target="_blank" rel="noopener" class="provider-chip">Anthropic</a>
+        <a href="https://platform.openai.com/docs" target="_blank" rel="noopener" class="provider-chip">OpenAI</a>
+        <a href="https://docs.z.ai/guides/overview/quick-start" target="_blank" rel="noopener" class="provider-chip">Z.AI</a>
+        <a href="https://dev.synthetic.new/docs/api/overview" target="_blank" rel="noopener" class="provider-chip">Synthetic</a>
+      </div>
+      <p class="provider-plus reveal reveal-d3">Anything that speaks the OpenAI or Anthropic API works too. Write a short <a href="https://github.com/tontinton/maki/tree/main/scripts/providers" target="_blank" rel="noopener">provider script</a>. Ollama examples included.</p>
+    </div>
+
+    <div class="bottom-cloud-layer">
+      <div class="bottom-cloud-row bottom-cloud-back">
+        <svg class="cloud-svg" style="width:360px;bottom:0;left:2%" viewBox="0 0 360 100"><path d="M8 100 Q5 78 28 70 Q15 48 48 38 Q55 12 92 10 Q125 -5 158 10 Q185 0 212 15 Q238 5 262 22 Q288 12 310 32 Q335 20 340 52 Q358 65 340 82 Q350 98 330 100Z"/></svg>
+        <svg class="cloud-svg" style="width:300px;bottom:0;left:30%" viewBox="0 0 300 90"><path d="M5 90 Q0 70 22 62 Q12 42 42 34 Q48 10 80 8 Q108 -4 135 8 Q158 0 180 14 Q205 4 225 20 Q248 10 262 30 Q282 18 285 48 Q302 58 285 72 Q295 88 278 90Z"/></svg>
+        <svg class="cloud-svg" style="width:340px;bottom:0;right:2%" viewBox="0 0 340 95"><path d="M8 95 Q2 75 25 66 Q14 45 45 36 Q52 10 88 8 Q118 -4 150 8 Q178 -2 205 14 Q232 4 255 22 Q280 10 300 30 Q322 18 325 50 Q342 62 325 78 Q335 93 315 95Z"/></svg>
+      </div>
+      <div class="bottom-cloud-row bottom-cloud-mid">
+        <svg class="cloud-svg" style="width:400px;bottom:0;left:-1%" viewBox="0 0 400 95"><path d="M5 95 Q0 72 28 64 Q14 42 50 32 Q58 8 98 6 Q132 -6 168 8 Q198 -2 228 14 Q258 2 288 20 Q318 8 345 28 Q372 16 378 50 Q398 62 378 78 Q390 93 368 95Z"/></svg>
+        <svg class="cloud-svg" style="width:380px;bottom:0;left:25%" viewBox="0 0 380 90"><path d="M5 90 Q0 68 25 60 Q12 40 45 30 Q52 6 90 5 Q122 -5 155 8 Q182 -2 210 12 Q238 2 265 18 Q292 6 318 25 Q345 14 352 46 Q370 58 352 72 Q362 88 342 90Z"/></svg>
+        <svg class="cloud-svg" style="width:360px;bottom:0;right:-1%" viewBox="0 0 360 92"><path d="M5 92 Q0 70 24 62 Q12 42 44 32 Q50 8 85 6 Q115 -4 148 8 Q175 -2 202 14 Q230 2 255 20 Q282 8 305 28 Q330 16 335 48 Q355 60 335 76 Q345 90 325 92Z"/></svg>
+      </div>
+      <div class="bottom-cloud-row bottom-cloud-front">
+        <svg class="cloud-svg" style="width:440px;bottom:0;left:-2%" viewBox="0 0 440 100"><path d="M5 100 Q0 76 30 68 Q15 45 55 35 Q62 8 105 5 Q142 -8 180 8 Q212 -4 245 14 Q278 2 312 20 Q345 6 378 28 Q408 14 415 50 Q435 65 415 82 Q428 98 405 100Z"/></svg>
+        <svg class="cloud-svg" style="width:420px;bottom:0;left:22%" viewBox="0 0 420 95"><path d="M5 95 Q0 72 28 64 Q14 42 52 32 Q58 6 98 4 Q135 -6 170 8 Q200 -2 232 14 Q262 2 295 18 Q325 6 355 26 Q385 14 392 48 Q412 60 392 76 Q405 93 385 95Z"/></svg>
+        <svg class="cloud-svg" style="width:400px;bottom:0;right:-2%" viewBox="0 0 400 98"><path d="M5 98 Q0 75 26 66 Q14 44 48 34 Q55 8 92 5 Q128 -6 162 8 Q192 -2 222 14 Q252 2 282 20 Q312 8 342 28 Q370 16 375 50 Q395 62 375 78 Q388 96 365 98Z"/></svg>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+  const nav = document.getElementById('nav');
+  window.addEventListener('scroll', () => {
+    nav.classList.toggle('scrolled', window.scrollY > 40);
+  }, { passive: true });
+
+  // hero entrance — add hidden state via JS, then animate in
+  // this prevents flicker on Firefox refresh (content visible by default in CSS)
+  const hero = document.querySelector('.hero');
+  hero.classList.add('hero-anim');
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => {
+      document.querySelector('.hero-intro').classList.add('entered');
+      document.querySelector('.hero-preview').classList.add('entered');
+    });
+  });
+
+  // scroll reveal for .reveal elements
+  const revealObs = new IntersectionObserver((entries) => {
+    entries.forEach(entry => {
+      if (entry.isIntersecting) {
+        entry.target.classList.add('visible');
+        revealObs.unobserve(entry.target);
+      }
+    });
+  }, { threshold: 0.12, rootMargin: '0px 0px -40px 0px' });
+  document.querySelectorAll('.reveal').forEach(el => revealObs.observe(el));
+
+  // pitch items stagger on scroll
+  const pitchObs = new IntersectionObserver((entries) => {
+    entries.forEach(entry => {
+      if (entry.isIntersecting) {
+        const col = entry.target;
+        col.querySelectorAll('.pitch-item').forEach((item, i) => {
+          setTimeout(() => item.classList.add('visible'), i * 120);
+        });
+        pitchObs.unobserve(col);
+      }
+    });
+  }, { threshold: 0.15, rootMargin: '0px 0px -60px 0px' });
+  document.querySelectorAll('.pitch-col').forEach(col => pitchObs.observe(col));
+
+  // provider chips stagger
+  const chipObs = new IntersectionObserver((entries) => {
+    entries.forEach(entry => {
+      if (entry.isIntersecting) {
+        entry.target.querySelectorAll('.provider-chip').forEach((chip, i) => {
+          setTimeout(() => chip.classList.add('visible'), i * 100);
+        });
+        chipObs.unobserve(entry.target);
+      }
+    });
+  }, { threshold: 0.2 });
+  document.querySelectorAll('.provider-grid').forEach(g => chipObs.observe(g));
+
+  // copy toast
+  function showCopyToast(el) {
+    const toast = el.parentElement.querySelector('.copy-toast');
+    toast.classList.add('show');
+    setTimeout(() => toast.classList.remove('show'), 1200);
+  }
+
+  // fetch github stars
+  fetch('https://api.github.com/repos/tontinton/maki', { headers: { Accept: 'application/vnd.github.v3+json' } })
+    .then(r => r.json())
+    .then(data => {
+      if (!data.stargazers_count) return;
+      const count = data.stargazers_count >= 1000
+        ? (data.stargazers_count / 1000).toFixed(1).replace(/\.0$/, '') + 'k'
+        : String(data.stargazers_count);
+      document.querySelectorAll('[data-star-count]').forEach(el => el.textContent = count);
+      const badges = document.querySelectorAll('[data-stars]');
+      badges.forEach(el => el.style.display = 'inline-flex');
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          badges.forEach(el => el.classList.add('loaded'));
+        });
+      });
+    })
+    .catch(() => {});
+</script>
+<script src="asciinema-player.min.js"></script>
+<script>
+  const player = AsciinemaPlayer.create('demo.cast', document.getElementById('demo-player'), {
+    autoPlay: true,
+    preload: true,
+    loop: true,
+    speed: 1.3,
+    idleTimeLimit: 2,
+    fit: false,
+    terminalFontSize: 'medium',
+    controls: false,
+    terminalFontFamily: "'JetBrains Mono', 'Fira Code', monospace",
+    theme: 'dracula',
+  });
+  function scaleTui() {
+    const tui = document.querySelector('.hero-preview .tui');
+    if (!tui) return;
+    tui.style.transform = 'none';
+    tui.style.position = 'absolute';
+    tui.style.visibility = 'hidden';
+    tui.style.width = 'auto';
+    const natural = tui.offsetWidth;
+    tui.style.position = '';
+    tui.style.visibility = '';
+    tui.style.width = '';
+    const container = tui.parentElement;
+    const available = container.clientWidth;
+    if (natural > available && natural > 0) {
+      const s = available / natural;
+      tui.style.transform = `scale(${s})`;
+      container.style.height = (tui.offsetHeight * s) + 'px';
+    } else {
+      container.style.height = '';
+    }
+  }
+  window.addEventListener('resize', scaleTui);
+  new ResizeObserver(scaleTui).observe(document.querySelector('.hero-preview'));
+
+  player.addEventListener('play', () => {
+    const loader = document.getElementById('demo-loader');
+    loader.classList.add('hidden');
+    setTimeout(() => loader.remove(), 300);
+    scaleTui();
+  });
+</script>
+
+</body>
+</html>
