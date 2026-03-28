@@ -1,3 +1,5 @@
+<img src="./banner.png">
+
 An AI coding agent optimized for minimal use of context tokens, while providing a great user experience.
 
 Context efficiency:
