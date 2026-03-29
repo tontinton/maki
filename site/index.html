@@ -5,13 +5,15 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>maki</title>
   <meta name="description" content="An efficient AI coding agent. Native Rust TUI. Immediate startup, 60 FPS, low memory. Indexes files instead of reading them, chains tools in a sandbox interpreter. Anthropic, OpenAI, Z.AI, Synthetic, or any OpenAI / Anthropic compatible API.">
+  <meta name="theme-color" content="#f0ede2">
+  <link rel="dns-prefetch" href="https://api.github.com">
   <link rel="preload" href="demo.cast" as="fetch" crossorigin>
   <link rel="preload" href="asciinema-player.min.js" as="script">
-  <link rel="preload" href="asciinema-player.css" as="style">
+  <link rel="preload" href="asciinema-player.css" as="style" onload="this.onload=null;this.rel='stylesheet'">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Nunito:wght@400;600;700;800;900&family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,600;0,9..144,700&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="asciinema-player.css">
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Nunito:wght@400;700;800&display=swap" rel="stylesheet">
+  <noscript><link rel="stylesheet" href="asciinema-player.css"></noscript>
   <style>
     *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 
@@ -63,7 +65,7 @@
     }
     nav.scrolled { box-shadow: 0 4px 30px oklch(70% 0.06 280 / 0.1); }
     .nav-logo {
-      font-weight: 900;
+      font-weight: 800;
       font-size: 1.4rem;
       color: var(--deep-navy);
       text-decoration: none;
@@ -72,7 +74,7 @@
     .nav-right { display: flex; gap: 1.5rem; align-items: center; }
     .nav-right a {
       font-size: 0.92rem;
-      font-weight: 600;
+      font-weight: 700;
       color: var(--text-secondary);
       text-decoration: none;
       transition: color 0.2s;
@@ -272,7 +274,7 @@
 
 
     .hero h1 {
-      font-weight: 900;
+      font-weight: 800;
       font-size: clamp(2.5rem, 5vw, 3.5rem);
       letter-spacing: -0.03em;
       line-height: 1.05;
@@ -280,7 +282,7 @@
     }
     .hero-tagline {
       font-size: clamp(1.05rem, 2.2vw, 1.3rem);
-      font-weight: 600;
+      font-weight: 700;
       color: var(--navy-light);
       margin-bottom: 1.25rem;
     }
@@ -363,6 +365,8 @@
       max-width: 1060px;
       margin: 0 auto;
       padding: clamp(4rem, 8vw, 6rem) clamp(1.5rem, 5vw, 3rem) 0rem;
+      content-visibility: auto;
+      contain-intrinsic-size: auto 800px;
     }
 
     .pitch {
@@ -593,6 +597,8 @@
       position: relative;
       overflow: hidden;
       margin-top: -1px;
+      content-visibility: auto;
+      contain-intrinsic-size: auto 500px;
     }
     .bottom-sky-bg {
       min-height: clamp(18rem, 28vw, 28rem);
