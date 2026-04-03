@@ -18,9 +18,7 @@ pub(crate) fn truncated_msg(total: usize) -> String {
     format!("[{omitted} more truncated]")
 }
 
-pub(crate) fn node_text<'a>(node: Node<'a>, source: &'a [u8]) -> &'a str {
-    node.utf8_text(source).unwrap_or("")
-}
+pub(crate) use crate::helpers::{find_child, node_text};
 
 pub(crate) fn compact_ws(s: &str) -> Cow<'_, str> {
     let needs_compact = s
@@ -163,11 +161,6 @@ pub(crate) fn prefixed(vis: &str, rest: std::fmt::Arguments<'_>) -> String {
     } else {
         format!("{vis} {rest}")
     }
-}
-
-pub(crate) fn find_child<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
-    let mut cursor = node.walk();
-    node.children(&mut cursor).find(|c| c.kind() == kind)
 }
 
 #[cfg(feature = "lang-rust")]

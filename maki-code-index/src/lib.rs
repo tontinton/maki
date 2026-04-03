@@ -6,6 +6,8 @@
 
 use index::common::LanguageExtractor;
 
+pub mod find_symbol;
+pub(crate) mod helpers;
 pub mod index;
 
 pub use index::{IndexError, index_file, index_source};
@@ -89,7 +91,7 @@ impl Language {
         }
     }
 
-    fn ts_language(&self) -> tree_sitter::Language {
+    pub fn ts_language(&self) -> tree_sitter::Language {
         match self {
             #[cfg(feature = "lang-rust")]
             Self::Rust => tree_sitter_rust::LANGUAGE.into(),

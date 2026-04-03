@@ -10,6 +10,7 @@ mod bash;
 mod batch;
 mod code_execution;
 mod edit;
+mod find_symbol;
 mod fuzzy_replace;
 mod glob;
 mod grep;
@@ -76,6 +77,7 @@ impl ToolFilter {
 pub const BASH_TOOL_NAME: &str = bash::Bash::NAME;
 pub const BATCH_TOOL_NAME: &str = batch::Batch::NAME;
 pub const EDIT_TOOL_NAME: &str = edit::Edit::NAME;
+pub const FIND_SYMBOL_TOOL_NAME: &str = find_symbol::FindSymbol::NAME;
 pub const GLOB_TOOL_NAME: &str = glob::Glob::NAME;
 pub const GREP_TOOL_NAME: &str = grep::Grep::NAME;
 pub const INDEX_TOOL_NAME: &str = index::Index::NAME;
@@ -101,6 +103,7 @@ pub(crate) const INTERPRETER_TOOLS: &[&str] = &[
     "bash",
     "webfetch",
     "websearch",
+    "find_symbol",
 ];
 
 pub(crate) const RESEARCH_SUBAGENT_TOOLS: &[&str] = &[
@@ -112,6 +115,7 @@ pub(crate) const RESEARCH_SUBAGENT_TOOLS: &[&str] = &[
     "webfetch",
     "batch",
     "code_execution",
+    "find_symbol",
 ];
 
 pub(crate) const GENERAL_SUBAGENT_TOOLS: &[&str] = &[
@@ -127,6 +131,7 @@ pub(crate) const GENERAL_SUBAGENT_TOOLS: &[&str] = &[
     "batch",
     "code_execution",
     "memory",
+    "find_symbol",
 ];
 
 const PLAN_WRITE_RESTRICTED: &str = "write restricted to plan file in plan mode";
@@ -698,6 +703,7 @@ register_tools! {
     Glob(glob::Glob),
     Grep(grep::Grep),
     Index(index::Index),
+    FindSymbol(find_symbol::FindSymbol),
     Question(question::Question),
     TodoWrite(todowrite::TodoWrite),
     WebFetch(webfetch::WebFetch),

@@ -89,6 +89,7 @@ getrandom = "0.3"
 fastrand = "2"
 test-case = "3"
 ignore = "0.4"
+memchr = "2"
 strum = { version = "0.27", features = ["derive"] }
 htmd = "0.5"
 tempfile = "3"

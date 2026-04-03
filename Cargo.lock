@@ -2191,6 +2191,8 @@ dependencies = [
 name = "maki-code-index"
 version = "0.1.7"
 dependencies = [
+ "ignore",
+ "memchr",
  "test-case",
  "thiserror 2.0.18",
  "tree-sitter",
@@ -4496,9 +4498,9 @@ dependencies = [
 
 [[package]]
 name = "tree-sitter-rust"
-version = "0.23.3"
+version = "0.24.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ca8ccb3e3a3495c8a943f6c3fd24c3804c471fd7f4f16087623c7fa4c0068e8a"
+checksum = "439e577dbe07423ec2582ac62c7531120dbfccfa6e5f92406f93dd271a120e45"
 dependencies = [
  "cc",
  "tree-sitter-language",
