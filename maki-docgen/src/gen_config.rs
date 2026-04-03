@@ -2,8 +2,9 @@ use std::fmt::Write;
 
 use maki_config::{
     AgentConfig, ConfigField, DEFAULT_BASH_TIMEOUT_SECS, DEFAULT_MAX_FILE_SIZE_MB,
-    DEFAULT_MAX_LOG_FILES, DEFAULT_MAX_OUTPUT_LINES, DEFAULT_MOUSE_SCROLL_LINES, INDEX_FIELDS,
-    MIN_TOOL_OUTPUT_LINES, ProviderConfig, StorageConfig, TOP_LEVEL_FIELDS, ToolOutputLines,
+    DEFAULT_MAX_LOG_FILES, DEFAULT_MAX_OUTPUT_LINES, DEFAULT_MOUSE_SCROLL_LINES,
+    DEFAULT_OPENAI_PLAN_CODEX_CLI_VERSION, INDEX_FIELDS, MIN_TOOL_OUTPUT_LINES,
+    OpenAiProviderConfig, ProviderConfig, StorageConfig, TOP_LEVEL_FIELDS, ToolOutputLines,
     UiConfig,
 };
 
@@ -108,6 +109,9 @@ max_output_lines = {max_output_lines}
 [provider]
 default_model = \"anthropic/claude-sonnet-4-6\"
 
+[provider.openai]
+codex_cli_version = \"{codex_cli_version}\"
+
 [storage]
 max_log_files = {max_log_files}
 
@@ -124,6 +128,7 @@ max_file_size_mb = {max_file_size}
         max_output_lines = DEFAULT_MAX_OUTPUT_LINES + 1000,
         max_log_files = DEFAULT_MAX_LOG_FILES / 2,
         max_file_size = DEFAULT_MAX_FILE_SIZE_MB + 2,
+        codex_cli_version = DEFAULT_OPENAI_PLAN_CODEX_CLI_VERSION,
     ).unwrap();
 
     writeln!(out, "### Top-level\n").unwrap();
@@ -134,6 +139,7 @@ max_file_size_mb = {max_file_size}
     write_tool_output_section(&mut out);
     write_section(&mut out, "[agent]", AgentConfig::FIELDS);
     write_section(&mut out, "[provider]", ProviderConfig::FIELDS);
+    write_section(&mut out, "[provider.openai]", OpenAiProviderConfig::FIELDS);
     write_section(&mut out, "[storage]", StorageConfig::FIELDS);
     write_section(&mut out, "[index]", INDEX_FIELDS);
 

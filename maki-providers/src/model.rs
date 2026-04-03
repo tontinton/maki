@@ -75,6 +75,7 @@ impl FromStr for ModelTier {
     }
 }
 
+#[derive(Clone)]
 pub struct ModelEntry {
     pub prefixes: &'static [&'static str],
     pub tier: ModelTier,
@@ -83,6 +84,12 @@ pub struct ModelEntry {
     pub pricing: ModelPricing,
     pub max_output_tokens: u32,
     pub context_window: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelSet {
+    Visible,
+    All,
 }
 
 fn lookup_entry<'a>(
@@ -95,14 +102,19 @@ fn lookup_entry<'a>(
         .ok_or_else(|| ModelError::UnknownModel(model_id.to_string()))
 }
 
-pub fn models_for_provider(provider: ProviderKind) -> &'static [ModelEntry] {
-    match provider {
-        ProviderKind::Anthropic => anthropic::models(),
-        ProviderKind::OpenAi => openai::api::models(),
-        ProviderKind::OpenAiCodingPlan => openai::plan::models(),
-        ProviderKind::Zai | ProviderKind::ZaiCodingPlan => zai::models(),
-        ProviderKind::Synthetic => synthetic::models(),
+pub fn models_for_provider(provider: ProviderKind, set: ModelSet) -> &'static [ModelEntry] {
+    match (provider, set) {
+        (ProviderKind::Anthropic, _) => anthropic::models(),
+        (ProviderKind::OpenAi, _) => openai::api::models(),
+        (ProviderKind::OpenAiCodingPlan, set) => openai::plan_models::models(set),
+        (ProviderKind::Zai | ProviderKind::ZaiCodingPlan, _) => zai::models(),
+        (ProviderKind::Synthetic, _) => synthetic::models(),
     }
+}
+
+fn resolve_provider_entry(provider: ProviderKind, model_id: &str) -> Option<&'static ModelEntry> {
+    let entries = models_for_provider(provider, ModelSet::All);
+    lookup_entry(entries, model_id).ok()
 }
 
 impl ModelFamily {
@@ -136,7 +148,7 @@ impl Model {
     }
 
     pub fn from_tier(provider: ProviderKind, tier: ModelTier) -> Result<Self, ModelError> {
-        let entries = models_for_provider(provider);
+        let entries = models_for_provider(provider, ModelSet::All);
         let entry = entries
             .iter()
             .find(|e| e.default && e.tier == tier)
@@ -149,8 +161,22 @@ impl Model {
         let (provider_str, model_id) = spec.split_once('/').ok_or(ModelError::InvalidFormat)?;
 
         if let Ok(provider) = ProviderKind::from_str(provider_str) {
-            let entries = models_for_provider(provider);
-            let entry = lookup_entry(entries, model_id)?;
+            if provider == ProviderKind::OpenAiCodingPlan {
+                let entry = openai::plan_models::catalog_model_metadata(model_id)
+                    .ok_or_else(|| ModelError::UnknownModel(model_id.to_string()))?;
+                return Ok(Self {
+                    id: model_id.to_string(),
+                    provider,
+                    dynamic_slug: None,
+                    tier: entry.tier,
+                    family: entry.family,
+                    pricing: entry.pricing,
+                    max_output_tokens: entry.max_output_tokens,
+                    context_window: entry.context_window,
+                });
+            }
+            let entry = resolve_provider_entry(provider, model_id)
+                .ok_or_else(|| ModelError::UnknownModel(model_id.to_string()))?;
             return Ok(Self {
                 id: model_id.to_string(),
                 provider,
@@ -232,10 +258,13 @@ impl AddAssign for TokenUsage {
 mod tests {
     use super::*;
     use crate::provider::ProviderKind;
+    use crate::providers::openai::{plan_models, reset_plan_codex_cli_version};
+    use crate::set_openai_plan_codex_cli_version;
     use strum::IntoEnumIterator;
     use test_case::test_case;
 
     const TIERS: [ModelTier; 3] = [ModelTier::Weak, ModelTier::Medium, ModelTier::Strong];
+    const TEST_CODEX_CLI_VERSION: &str = "0.118.0";
 
     #[test_case("no-slash-here", ModelError::InvalidFormat ; "invalid_format")]
     #[test_case("foobar/gpt-4", ModelError::UnsupportedProvider("foobar".into()) ; "unsupported_provider")]
@@ -262,6 +291,36 @@ mod tests {
             cache_read: 150_000,
         };
         assert_eq!(usage.total_input(), 165_000);
+    }
+
+    #[test]
+    fn openai_coding_plan_accepts_upstream_snapshot_model() {
+        reset_plan_codex_cli_version();
+        set_openai_plan_codex_cli_version(TEST_CODEX_CLI_VERSION);
+        plan_models::reset_plan_models_for_tests();
+        plan_models::cache_default_models_for_tests(
+            r#"{
+                "models": [
+                    {"slug": "gpt-5.3-codex", "priority": 2, "context_window": 272000, "visibility": "list"}
+                ]
+            }"#,
+        );
+        let model = Model::from_spec("openai-coding-plan/gpt-5.3-codex").unwrap();
+
+        assert_eq!(model.provider, ProviderKind::OpenAiCodingPlan);
+        assert_eq!(model.id, "gpt-5.3-codex");
+        assert_eq!(model.family, ModelFamily::Gpt);
+    }
+
+    #[test]
+    fn openai_coding_plan_tier_defaults_match_codex() {
+        let weak = Model::from_tier(ProviderKind::OpenAiCodingPlan, ModelTier::Weak).unwrap();
+        let medium = Model::from_tier(ProviderKind::OpenAiCodingPlan, ModelTier::Medium).unwrap();
+        let strong = Model::from_tier(ProviderKind::OpenAiCodingPlan, ModelTier::Strong).unwrap();
+
+        assert_eq!(weak.id, "gpt-5.4-mini");
+        assert_eq!(medium.id, "gpt-5.2");
+        assert_eq!(strong.id, "gpt-5.4");
     }
 
     #[test]
@@ -321,7 +380,7 @@ mod tests {
     #[test]
     fn exactly_one_default_per_provider_tier() {
         for provider in ProviderKind::iter() {
-            let entries = models_for_provider(provider);
+            let entries = models_for_provider(provider, ModelSet::All);
             for &tier in &TIERS {
                 let count = entries
                     .iter()

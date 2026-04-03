@@ -11,7 +11,9 @@ use serde_json::Value;
 use strum::IntoEnumIterator;
 use tracing::{debug, warn};
 
-use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier, models_for_provider};
+use crate::model::{
+    Model, ModelEntry, ModelFamily, ModelPricing, ModelSet, ModelTier, models_for_provider,
+};
 use crate::provider::{BoxFuture, Provider, ProviderKind};
 use crate::{AgentError, Message, ProviderEvent, StreamResponse, ThinkingConfig};
 
@@ -37,6 +39,26 @@ struct DynamicProviderMeta {
 struct DynamicModelInfo {
     id: String,
     tier: Option<ModelTier>,
+}
+
+fn requires_explicit_models(base: ProviderKind) -> bool {
+    matches!(base, ProviderKind::OpenAiCodingPlan)
+}
+
+fn explicit_models_required_error(meta: &DynamicProviderMeta) -> AgentError {
+    AgentError::Config {
+        message: format!(
+            "dynamic provider '{}' with base '{}' must declare an explicit models list",
+            meta.slug, meta.base
+        ),
+    }
+}
+
+fn validate_models_config(meta: &DynamicProviderMeta) -> Result<(), AgentError> {
+    if requires_explicit_models(meta.base) && meta.models.is_none() {
+        return Err(explicit_models_required_error(meta));
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -328,6 +350,7 @@ pub fn create(slug: &str) -> Result<Box<dyn Provider>, AgentError> {
     let meta = find_meta(slug).ok_or_else(|| AgentError::Config {
         message: format!("unknown dynamic provider '{slug}'"),
     })?;
+    validate_models_config(meta)?;
     let resolved = resolve_auth(meta)?;
     let auth = Arc::new(Mutex::new(resolved));
 
@@ -380,6 +403,9 @@ pub fn resolves_model(slug: &str, model_id: &str) -> bool {
     let Some(meta) = find_meta(slug) else {
         return false;
     };
+    if validate_models_config(meta).is_err() {
+        return false;
+    }
     meta.models
         .as_ref()
         .is_none_or(|models| models.iter().any(|model| model.id == model_id))
@@ -387,10 +413,15 @@ pub fn resolves_model(slug: &str, model_id: &str) -> bool {
 
 pub fn fallback_model_entry(slug: &str) -> Option<&'static crate::model::ModelEntry> {
     let meta = find_meta(slug)?;
+    validate_models_config(meta).ok()?;
     default_fallback_entry(meta.base)
 }
 
 fn model_specs_for_meta(meta: &DynamicProviderMeta) -> Vec<String> {
+    if validate_models_config(meta).is_err() {
+        return Vec::new();
+    }
+
     if let Some(models) = &meta.models {
         return models
             .iter()
@@ -398,7 +429,7 @@ fn model_specs_for_meta(meta: &DynamicProviderMeta) -> Vec<String> {
             .collect();
     }
 
-    models_for_provider(meta.base)
+    models_for_provider(meta.base, ModelSet::Visible)
         .iter()
         .flat_map(|entry| entry.prefixes.iter())
         .map(|prefix| format!("{}/{}", meta.slug, prefix))
@@ -406,11 +437,11 @@ fn model_specs_for_meta(meta: &DynamicProviderMeta) -> Vec<String> {
 }
 
 fn default_fallback_entry(base: ProviderKind) -> Option<&'static crate::model::ModelEntry> {
-    models_for_provider(base)
+    models_for_provider(base, ModelSet::Visible)
         .iter()
         .filter(|entry| entry.default)
         .max_by_key(|entry| entry.tier)
-        .or_else(|| models_for_provider(base).first())
+        .or_else(|| models_for_provider(base, ModelSet::Visible).first())
 }
 
 #[derive(Clone)]
@@ -436,10 +467,23 @@ impl DynamicModelMetadata {
 
 pub fn dynamic_model_metadata(slug: &str, model_id: &str) -> Option<DynamicModelMetadata> {
     let meta = find_meta(slug)?;
-    models_for_provider(meta.base)
+    validate_models_config(meta).ok()?;
+    models_for_provider(meta.base, ModelSet::All)
         .iter()
         .find(|entry| entry.prefixes.contains(&model_id))
         .map(DynamicModelMetadata::from_entry)
+        .or_else(|| {
+            (meta.base == ProviderKind::OpenAiCodingPlan)
+                .then(|| super::openai::plan_models::dynamic_model_metadata(model_id))
+                .flatten()
+                .map(|model| DynamicModelMetadata {
+                    tier: model.tier,
+                    family: model.family,
+                    pricing: model.pricing,
+                    max_output_tokens: model.max_output_tokens,
+                    context_window: model.context_window,
+                })
+        })
         .or_else(|| synthesize_model_metadata(meta, model_id))
 }
 
@@ -447,11 +491,11 @@ fn synthesize_model_metadata(
     meta: &DynamicProviderMeta,
     model_id: &str,
 ) -> Option<DynamicModelMetadata> {
-    let fallback = models_for_provider(meta.base)
+    let fallback = models_for_provider(meta.base, ModelSet::Visible)
         .iter()
         .filter(|entry| entry.default)
         .max_by_key(|entry| entry.tier)
-        .or_else(|| models_for_provider(meta.base).first())?;
+        .or_else(|| models_for_provider(meta.base, ModelSet::Visible).first())?;
     let tier = meta
         .models
         .as_ref()
@@ -723,5 +767,59 @@ mod tests {
         );
         let err = run_script(&path, "nonexistent", SCRIPT_TIMEOUT).unwrap_err();
         assert!(matches!(err, AgentError::Config { .. }));
+    }
+
+    #[test]
+    fn openai_coding_plan_meta_without_models_yields_no_specs() {
+        let meta = DynamicProviderMeta {
+            slug: "plan-proxy".into(),
+            display_name: "Plan Proxy".into(),
+            base: ProviderKind::OpenAiCodingPlan,
+            models: None,
+            system_prefix: None,
+            has_auth: true,
+            script_path: PathBuf::from("/tmp/plan-proxy"),
+        };
+
+        let specs = model_specs_for_meta(&meta);
+        assert!(specs.is_empty());
+    }
+
+    #[test]
+    fn openai_coding_plan_without_models_requires_explicit_list() {
+        let meta = DynamicProviderMeta {
+            slug: "plan-proxy".into(),
+            display_name: "Plan Proxy".into(),
+            base: ProviderKind::OpenAiCodingPlan,
+            models: None,
+            system_prefix: None,
+            has_auth: true,
+            script_path: PathBuf::from("/tmp/plan-proxy"),
+        };
+
+        let error = validate_models_config(&meta).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "dynamic provider 'plan-proxy' with base 'openai-coding-plan' must declare an explicit models list"
+        );
+    }
+
+    #[test]
+    fn openai_coding_plan_with_models_accepts_explicit_list() {
+        let meta = DynamicProviderMeta {
+            slug: "plan-proxy".into(),
+            display_name: "Plan Proxy".into(),
+            base: ProviderKind::OpenAiCodingPlan,
+            models: Some(vec![DynamicModelInfo {
+                id: "gpt-5.4".into(),
+                tier: None,
+            }]),
+            system_prefix: None,
+            has_auth: true,
+            script_path: PathBuf::from("/tmp/plan-proxy"),
+        };
+
+        validate_models_config(&meta).unwrap();
+        assert_eq!(model_specs_for_meta(&meta), vec!["plan-proxy/gpt-5.4"]);
     }
 }

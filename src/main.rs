@@ -18,6 +18,7 @@ use tracing_subscriber::EnvFilter;
 
 use maki_providers::model::{Model, ModelTier};
 use maki_providers::provider::{ProviderKind, fetch_all_models};
+use maki_providers::set_openai_plan_codex_cli_version;
 use maki_providers::{dynamic, openai_auth};
 use maki_storage::log::RotatingFileWriter;
 use maki_storage::model::{persist_model, read_model};
@@ -215,6 +216,9 @@ fn run() -> Result<()> {
             print!("{output}");
         }
         Some(Command::Models) => {
+            let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
+            let config = load_config(&cwd, false);
+            set_openai_plan_codex_cli_version(&config.provider.openai.codex_cli_version);
             smol::block_on(fetch_all_models(|batch| {
                 for model in batch.models {
                     println!("{model}");
@@ -261,6 +265,7 @@ fn run() -> Result<()> {
             let storage = DataDir::resolve().context("resolve data directory")?;
             let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
             let mut config = load_config(&cwd, cli.no_rtk);
+            set_openai_plan_codex_cli_version(&config.provider.openai.codex_cli_version);
             if cli.yolo || config.always_yolo {
                 config.permissions.allow_all = true;
             }

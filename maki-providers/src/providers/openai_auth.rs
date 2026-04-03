@@ -328,6 +328,7 @@ pub fn logout(dir: &DataDir) -> Result<(), AgentError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use maki_storage::auth::save_tokens;
     use tempfile::TempDir;
 
     #[test]
@@ -349,6 +350,32 @@ mod tests {
     fn extract_account_id_missing() {
         assert_eq!(extract_account_id("not.a.jwt"), None);
         assert_eq!(extract_account_id("invalid"), None);
+    }
+
+    #[test]
+    fn resolve_oauth_uses_saved_tokens() {
+        let tmp = TempDir::new().unwrap();
+        let dir = DataDir::from_path(tmp.path().to_path_buf());
+        save_tokens(
+            &dir,
+            PROVIDER,
+            &OAuthTokens {
+                access: "access".into(),
+                refresh: "refresh".into(),
+                expires: now_millis() + 120_000,
+                account_id: Some("acct_123".into()),
+            },
+        )
+        .unwrap();
+
+        let resolved = resolve_oauth(&dir).unwrap();
+        assert_eq!(
+            resolved.headers,
+            vec![
+                ("authorization".into(), "Bearer access".into()),
+                ("chatgpt-account-id".into(), "acct_123".into()),
+            ]
+        );
     }
 
     #[test]

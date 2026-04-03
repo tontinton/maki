@@ -3,24 +3,25 @@ use std::time::Instant;
 
 use flume::Sender;
 use futures_lite::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
-use isahc::{HttpClient, Request};
+use isahc::{AsyncReadResponseExt, HttpClient, Request};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::{debug, warn};
 use uuid::Uuid;
 
-use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier, TokenUsage};
-use crate::provider::{BoxFuture, Provider};
+use crate::model::Model;
+use crate::provider::{BoxFuture, Provider, ProviderKind};
 use crate::providers::{ResolvedAuth, SSE_TIMEOUT, http_client, next_sse_line};
 use crate::{
     AgentError, ContentBlock, Message, ProviderEvent, Role, StopReason, StreamResponse,
-    ThinkingConfig,
+    ThinkingConfig, TokenUsage,
 };
 
 use super::auth_state::OpenAiAuthState;
-use super::effective_system;
+use super::plan_models;
+use super::{effective_system, plan_codex_cli_version};
 
-const BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
+const MODELS_PATH: &str = "/models";
 const RESPONSES_PATH: &str = "/responses";
 const HEADER_ORIGINATOR: &str = "originator";
 const HEADER_SESSION_ID: &str = "session_id";
@@ -33,109 +34,6 @@ const ACCOUNT_ID_ERROR: &str = concat!(
     "OpenAI Coding Plan requires a stored ChatGPT account id. ",
     "Please log in again."
 );
-
-pub(crate) fn models() -> &'static [ModelEntry] {
-    &[
-        ModelEntry {
-            prefixes: &["gpt-5.4-mini"],
-            tier: ModelTier::Weak,
-            family: ModelFamily::Gpt,
-            default: true,
-            pricing: ModelPricing {
-                input: 0.00,
-                output: 0.00,
-                cache_write: 0.00,
-                cache_read: 0.00,
-            },
-            max_output_tokens: 128_000,
-            context_window: 272_000,
-        },
-        ModelEntry {
-            prefixes: &["gpt-5.1-codex-mini"],
-            tier: ModelTier::Weak,
-            family: ModelFamily::Gpt,
-            default: false,
-            pricing: ModelPricing {
-                input: 0.00,
-                output: 0.00,
-                cache_write: 0.00,
-                cache_read: 0.00,
-            },
-            max_output_tokens: 128_000,
-            context_window: 272_000,
-        },
-        ModelEntry {
-            prefixes: &["gpt-5.2"],
-            tier: ModelTier::Medium,
-            family: ModelFamily::Gpt,
-            default: true,
-            pricing: ModelPricing {
-                input: 0.00,
-                output: 0.00,
-                cache_write: 0.00,
-                cache_read: 0.00,
-            },
-            max_output_tokens: 128_000,
-            context_window: 272_000,
-        },
-        ModelEntry {
-            prefixes: &["gpt-5.4"],
-            tier: ModelTier::Strong,
-            family: ModelFamily::Gpt,
-            default: true,
-            pricing: ModelPricing {
-                input: 0.00,
-                output: 0.00,
-                cache_write: 0.00,
-                cache_read: 0.00,
-            },
-            max_output_tokens: 128_000,
-            context_window: 272_000,
-        },
-        ModelEntry {
-            prefixes: &["gpt-5.3-codex"],
-            tier: ModelTier::Strong,
-            family: ModelFamily::Gpt,
-            default: false,
-            pricing: ModelPricing {
-                input: 0.00,
-                output: 0.00,
-                cache_write: 0.00,
-                cache_read: 0.00,
-            },
-            max_output_tokens: 128_000,
-            context_window: 272_000,
-        },
-        ModelEntry {
-            prefixes: &["gpt-5.2-codex"],
-            tier: ModelTier::Strong,
-            family: ModelFamily::Gpt,
-            default: false,
-            pricing: ModelPricing {
-                input: 0.00,
-                output: 0.00,
-                cache_write: 0.00,
-                cache_read: 0.00,
-            },
-            max_output_tokens: 128_000,
-            context_window: 272_000,
-        },
-        ModelEntry {
-            prefixes: &["gpt-5.1-codex-max"],
-            tier: ModelTier::Strong,
-            family: ModelFamily::Gpt,
-            default: false,
-            pricing: ModelPricing {
-                input: 0.00,
-                output: 0.00,
-                cache_write: 0.00,
-                cache_read: 0.00,
-            },
-            max_output_tokens: 128_000,
-            context_window: 272_000,
-        },
-    ]
-}
 
 // This transport follows the ChatGPT Coding Plan path used by public Codex
 // implementations rather than the OpenAI Platform API. The shape here was
@@ -213,11 +111,12 @@ impl Provider for OpenAiCodingPlan {
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<String>, AgentError>> {
         Box::pin(async {
-            Ok(models()
-                .iter()
-                .flat_map(|entry| entry.prefixes.iter().copied())
-                .map(str::to_string)
-                .collect())
+            self.auth_state
+                .with_oauth_retry("OpenAI Coding Plan", validate_auth, || async {
+                    let auth = self.current_auth();
+                    do_list_models(&self.client, &auth).await
+                })
+                .await
         })
     }
 
@@ -399,7 +298,7 @@ async fn do_stream(
     request_id: &str,
 ) -> Result<StreamResponse, AgentError> {
     let json_body = serde_json::to_vec(body)?;
-    let request = build_request(auth, session_id, request_id)?.body(json_body)?;
+    let request = build_request(body, auth, session_id, request_id)?.body(json_body)?;
 
     debug!(model = %model.id, "sending OpenAI Coding Plan request");
 
@@ -411,12 +310,34 @@ async fn do_stream(
     parse_sse(BufReader::new(response.into_body()), event_tx).await
 }
 
+async fn do_list_models(
+    client: &HttpClient,
+    auth: &ResolvedAuth,
+) -> Result<Vec<String>, AgentError> {
+    let base_url = auth
+        .base_url
+        .as_deref()
+        .unwrap_or(ProviderKind::OpenAiCodingPlan.base_url());
+    let request = build_models_request(auth)?.body(())?;
+    let mut response = client.send_async(request).await?;
+    if response.status().as_u16() != 200 {
+        return Err(AgentError::from_response(response).await);
+    }
+
+    let body = response.text().await?;
+    plan_models::list_remote_models(base_url, &body)
+}
+
 fn build_request(
+    _body: &Value,
     auth: &ResolvedAuth,
     session_id: &str,
     request_id: &str,
 ) -> Result<isahc::http::request::Builder, AgentError> {
-    let base_url = auth.base_url.as_deref().unwrap_or(BASE_URL);
+    let base_url = auth
+        .base_url
+        .as_deref()
+        .unwrap_or(ProviderKind::OpenAiCodingPlan.base_url());
     let mut builder = Request::builder()
         .method("POST")
         .uri(format!("{base_url}{RESPONSES_PATH}"))
@@ -428,6 +349,23 @@ fn build_request(
         .header(HEADER_ORIGINATOR, ORIGINATOR)
         .header(HEADER_SESSION_ID, session_id)
         .header(HEADER_CLIENT_REQUEST_ID, request_id);
+
+    for (key, value) in &auth.headers {
+        builder = builder.header(key.as_str(), value.as_str());
+    }
+
+    Ok(builder)
+}
+
+fn build_models_request(auth: &ResolvedAuth) -> Result<isahc::http::request::Builder, AgentError> {
+    let base_url = auth
+        .base_url
+        .as_deref()
+        .unwrap_or(ProviderKind::OpenAiCodingPlan.base_url());
+    let codex_cli_version = plan_codex_cli_version()?;
+    let mut builder = Request::builder().method("GET").uri(format!(
+        "{base_url}{MODELS_PATH}?client_version={codex_cli_version}"
+    ));
 
     for (key, value) in &auth.headers {
         builder = builder.header(key.as_str(), value.as_str());
@@ -641,12 +579,27 @@ async fn parse_output_item(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{ModelFamily, ModelPricing, ModelTier};
+    use crate::providers::openai::{
+        PLAN_CONFIG_NOT_INITIALIZED_ERROR, plan_test_lock, reset_plan_codex_cli_version,
+    };
+    use crate::set_openai_plan_codex_cli_version;
     use futures_lite::io::Cursor;
     use serde_json::{Value, json};
+    use std::sync::MutexGuard;
     use test_case::test_case;
 
     const AUTHORIZATION: &str = "Bearer token";
     const ACCOUNT_ID: &str = "acc_123";
+    const TEST_CODEX_CLI_VERSION: &str = "0.0.0";
+
+    fn config_lock() -> MutexGuard<'static, ()> {
+        plan_test_lock()
+    }
+
+    fn init_plan_config() {
+        set_openai_plan_codex_cli_version(TEST_CODEX_CLI_VERSION);
+    }
 
     fn sse(events: &[Value]) -> Vec<u8> {
         let mut payload = String::new();
@@ -669,9 +622,10 @@ mod tests {
         }
     }
 
-    fn test_model() -> Model {
-        Model {
-            id: "gpt-5.3-codex".into(),
+    #[test]
+    fn build_body_uses_responses_shape() {
+        let model = Model {
+            id: "gpt-5.2-codex".into(),
             provider: crate::provider::ProviderKind::OpenAiCodingPlan,
             dynamic_slug: None,
             tier: ModelTier::Strong,
@@ -684,41 +638,16 @@ mod tests {
             },
             max_output_tokens: 128_000,
             context_window: 272_000,
-        }
-    }
-
-    #[test]
-    fn models_match_static_visible_plan_set() {
-        let ids: Vec<&str> = models()
-            .iter()
-            .flat_map(|entry| entry.prefixes.iter().copied())
-            .collect();
-
-        assert_eq!(
-            ids,
-            vec![
-                "gpt-5.4-mini",
-                "gpt-5.1-codex-mini",
-                "gpt-5.2",
-                "gpt-5.4",
-                "gpt-5.3-codex",
-                "gpt-5.2-codex",
-                "gpt-5.1-codex-max",
-            ]
-        );
-    }
-
-    #[test]
-    fn build_body_uses_responses_shape() {
+        };
         let body = build_body(
-            &test_model(),
+            &model,
             &[Message::user("hello".into())],
             "system",
             &json!([]),
             ThinkingConfig::Adaptive,
         );
 
-        assert_eq!(body["model"], "gpt-5.3-codex");
+        assert_eq!(body["model"], "gpt-5.2-codex");
         assert_eq!(body["instructions"], "system");
         assert_eq!(body["store"], false);
         assert_eq!(body["stream"], true);
@@ -729,20 +658,55 @@ mod tests {
 
     #[test]
     fn build_request_targets_codex_responses_with_required_headers() {
-        let request = build_request(&test_auth(), "session-1", "request-1")
+        let request = build_request(&json!({}), &test_auth(), "session-1", "request-1")
             .unwrap()
             .body(Vec::<u8>::new())
             .unwrap();
 
         assert_eq!(
             request.uri().to_string(),
-            "https://chatgpt.com/backend-api/codex/responses"
+            format!(
+                "{}{RESPONSES_PATH}",
+                ProviderKind::OpenAiCodingPlan.base_url()
+            )
         );
         assert_eq!(request.headers()["authorization"], AUTHORIZATION);
         assert_eq!(request.headers()["chatgpt-account-id"], ACCOUNT_ID);
         assert_eq!(request.headers()[HEADER_ORIGINATOR], ORIGINATOR);
         assert_eq!(request.headers()[HEADER_SESSION_ID], "session-1");
         assert_eq!(request.headers()[HEADER_CLIENT_REQUEST_ID], "request-1");
+    }
+
+    #[test]
+    fn build_models_request_targets_codex_models() {
+        let _lock = config_lock();
+        init_plan_config();
+        let request = build_models_request(&test_auth())
+            .unwrap()
+            .body(())
+            .unwrap();
+
+        assert_eq!(
+            request.uri().to_string(),
+            format!(
+                "{}{MODELS_PATH}?client_version={}",
+                ProviderKind::OpenAiCodingPlan.base_url(),
+                plan_codex_cli_version().unwrap()
+            )
+        );
+        assert_eq!(request.headers()["authorization"], AUTHORIZATION);
+        assert_eq!(request.headers()["chatgpt-account-id"], ACCOUNT_ID);
+    }
+
+    #[test]
+    fn build_models_request_requires_initialized_config() {
+        let _lock = config_lock();
+        reset_plan_codex_cli_version();
+
+        let error = build_models_request(&test_auth()).unwrap_err();
+
+        assert!(matches!(error, AgentError::Config { .. }));
+        assert_eq!(error.to_string(), PLAN_CONFIG_NOT_INITIALIZED_ERROR);
     }
 
     #[test]

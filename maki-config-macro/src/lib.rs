@@ -178,7 +178,10 @@ fn config_value_expr(ty_name: &str, default: &Option<Expr>) -> TokenStream2 {
             let val = default.as_ref().expect("usize field requires default");
             quote! { ConfigValue::Usize(#val) }
         }
-        "String" => quote! { ConfigValue::OptionalString },
+        "String" => match default {
+            Some(val) => quote! { ConfigValue::String(#val) },
+            None => quote! { ConfigValue::OptionalString },
+        },
         other => panic!("unsupported config type: {other}"),
     }
 }

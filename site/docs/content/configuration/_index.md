@@ -32,6 +32,9 @@ max_output_lines = 3000
 [provider]
 default_model = "anthropic/claude-sonnet-4-6"
 
+[provider.openai]
+codex_cli_version = "0.118.0"
+
 [storage]
 max_log_files = 5
 
@@ -94,6 +97,12 @@ How many lines of output to show per tool in the UI. All values are `usize` with
 | `default_model` | String | `none` | - | Default model identifier (e.g. `anthropic/claude-sonnet-4-6`) |
 | `connect_timeout_secs` | u64 | `10` | 1 | HTTP connect timeout (seconds) |
 | `stream_timeout_secs` | u64 | `300` | 10 | Streaming response timeout (seconds) |
+
+### `[provider.openai]`
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `codex_cli_version` | String | `0.118.0` | Codex CLI version sent to ChatGPT Coding Plan during model discovery |
 
 ### `[storage]`
 

@@ -113,7 +113,7 @@ To add a custom provider or proxy, drop an executable script into `~/.maki/provi
 
 The `base` field specifies which built-in provider to inherit defaults from. Valid values: `anthropic`, `openai`, `openai-coding-plan`, `zai`, `zai-coding-plan`, `synthetic`. For example, a proxy in front of Anthropic sets `base` to `anthropic`, so Claude model ids and defaults stay available while requests route through your auth and base URL.
 
-If `models` is omitted, the dynamic provider inherits the base provider's model catalog.
+If `models` is omitted, the dynamic provider inherits the base provider's model catalog. `openai-coding-plan` is the exception and must declare an explicit models list.
 
 Dynamic provider models are namespaced as `{slug}/{model_id}` (e.g. `myproxy/claude-sonnet-4-6`).
 

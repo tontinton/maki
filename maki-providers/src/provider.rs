@@ -6,7 +6,7 @@ use serde_json::Value;
 use strum::{Display, EnumIter, EnumString, IntoEnumIterator};
 use tracing::{debug, warn};
 
-use crate::model::{Model, models_for_provider};
+use crate::model::{Model, ModelSet, models_for_provider};
 use crate::providers::anthropic::Anthropic;
 use crate::providers::dynamic;
 use crate::providers::openai::{OpenAi, OpenAiCodingPlan};
@@ -28,6 +28,17 @@ pub enum ProviderKind {
 }
 
 impl ProviderKind {
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::Anthropic => "anthropic",
+            Self::OpenAi => "openai",
+            Self::OpenAiCodingPlan => "openai-coding-plan",
+            Self::Zai => "zai",
+            Self::ZaiCodingPlan => "zai-coding-plan",
+            Self::Synthetic => "synthetic",
+        }
+    }
+
     pub const fn display_name(self) -> &'static str {
         match self {
             Self::Anthropic => "Anthropic",
@@ -165,11 +176,18 @@ pub async fn fetch_all_models(mut on_ready: impl FnMut(ModelBatch)) {
                 },
                 Err(e) => {
                     warn!(provider = %kind, error = %e, "failed to list models, using static fallback");
-                    let fallback: Vec<String> = models_for_provider(kind)
-                        .iter()
-                        .flat_map(|entry| entry.prefixes.iter())
-                        .map(|p| format!("{kind}/{p}"))
-                        .collect();
+                    let fallback: Vec<String> = if kind == ProviderKind::OpenAiCodingPlan {
+                        crate::providers::openai::plan_models::fallback_model_ids()
+                            .into_iter()
+                            .map(|id| format!("{kind}/{id}"))
+                            .collect()
+                    } else {
+                        models_for_provider(kind, ModelSet::Visible)
+                            .iter()
+                            .flat_map(|entry| entry.prefixes.iter())
+                            .map(|p| format!("{kind}/{p}"))
+                            .collect()
+                    };
                     ModelBatch {
                         models: fallback,
                         warnings: vec![format!(

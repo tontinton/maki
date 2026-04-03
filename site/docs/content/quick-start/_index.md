@@ -45,7 +45,7 @@ Export a key for at least one provider:
 | Z.AI | `ZHIPU_API_KEY` |
 | Synthetic | `SYNTHETIC_API_KEY` |
 
-OpenAI API key usage is billed through the OpenAI Platform account at normal API rates. For ChatGPT subscription access with plan credits and limits, run `maki auth login openai` and follow the device-flow login steps.
+NOTE: OpenAI bills API key usage through the OpenAI Platform account at standard API rates. See the [OpenAI API pricing page](https://openai.com/api/pricing/). For ChatGPT subscription access with plan credits and limits use OAuth login: run `maki auth login openai` and follow the instructions. Also, features that rely on ChatGPT credits, such as fast mode, are available only when you sign in with ChatGPT OAuth.
 
 ## Run
 

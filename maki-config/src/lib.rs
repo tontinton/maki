@@ -32,6 +32,7 @@ pub const DEFAULT_INTERPRETER_MAX_MEMORY_MB: usize = 50;
 
 pub const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
 pub const DEFAULT_STREAM_TIMEOUT_SECS: u64 = 300;
+pub const DEFAULT_OPENAI_PLAN_CODEX_CLI_VERSION: &str = "0.118.0";
 
 pub const DEFAULT_MAX_LOG_BYTES_MB: u64 = 200;
 pub const DEFAULT_MAX_LOG_FILES: u32 = 10;
@@ -64,6 +65,7 @@ pub enum ConfigValue {
     U32(u32),
     U64(u64),
     Usize(usize),
+    String(&'static str),
     OptionalString,
 }
 
@@ -74,6 +76,7 @@ impl ConfigValue {
             Self::U32(v) => v.to_string(),
             Self::U64(v) => v.to_string(),
             Self::Usize(v) => v.to_string(),
+            Self::String(v) => v.to_string(),
             Self::OptionalString => "none".to_string(),
         }
     }
@@ -188,6 +191,13 @@ struct ProviderFileConfig {
     default_model: Option<String>,
     connect_timeout_secs: Option<u64>,
     stream_timeout_secs: Option<u64>,
+    openai: OpenAiProviderFileConfig,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct OpenAiProviderFileConfig {
+    codex_cli_version: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -512,6 +522,9 @@ pub struct ProviderConfig {
              min = MIN_STREAM_TIMEOUT_SECS, val = "self.stream_timeout.as_secs()",
              desc = "Streaming response timeout (seconds)")]
     pub stream_timeout: Duration,
+
+    #[config(skip, default = "OpenAiProviderConfig::default()")]
+    pub openai: OpenAiProviderConfig,
 }
 
 impl Default for ProviderConfig {
@@ -520,6 +533,7 @@ impl Default for ProviderConfig {
             default_model: None,
             connect_timeout: Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS),
             stream_timeout: Duration::from_secs(DEFAULT_STREAM_TIMEOUT_SECS),
+            openai: OpenAiProviderConfig::default(),
         }
     }
 }
@@ -535,7 +549,38 @@ impl ProviderConfig {
             stream_timeout: Duration::from_secs(
                 f.stream_timeout_secs.unwrap_or(DEFAULT_STREAM_TIMEOUT_SECS),
             ),
+            openai: OpenAiProviderConfig::from_file(f.openai),
         }
+    }
+}
+
+#[derive(Debug, Clone, ConfigSection)]
+#[config(section = "provider.openai", fields_only)]
+pub struct OpenAiProviderConfig {
+    #[config(
+        ty = "String",
+        default = DEFAULT_OPENAI_PLAN_CODEX_CLI_VERSION,
+        desc = "Codex CLI version sent to ChatGPT Coding Plan during model discovery"
+    )]
+    pub codex_cli_version: String,
+}
+
+impl Default for OpenAiProviderConfig {
+    fn default() -> Self {
+        Self {
+            codex_cli_version: DEFAULT_OPENAI_PLAN_CODEX_CLI_VERSION.to_string(),
+        }
+    }
+}
+
+impl OpenAiProviderConfig {
+    fn from_file(f: OpenAiProviderFileConfig) -> Self {
+        let codex_cli_version = f
+            .codex_cli_version
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| DEFAULT_OPENAI_PLAN_CODEX_CLI_VERSION.to_string());
+        Self { codex_cli_version }
     }
 }
 
@@ -834,6 +879,10 @@ mod tests {
             Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS)
         );
         assert_eq!(
+            config.provider.openai.codex_cli_version,
+            DEFAULT_OPENAI_PLAN_CODEX_CLI_VERSION
+        );
+        assert_eq!(
             config.storage.max_log_bytes,
             DEFAULT_MAX_LOG_BYTES_MB * 1024 * 1024
         );
@@ -978,6 +1027,7 @@ mod tests {
         fs::write(
             maki_dir.join("config.toml"),
             "[provider]\ndefault_model = \"anthropic/claude-opus-4-6\"\nconnect_timeout_secs = 15\n\
+             [provider.openai]\ncodex_cli_version = \"9.9.9\"\n\
              [storage]\nmax_log_files = 5\n\
              [index]\nmax_file_size_mb = 4\n\
              [agent]\nbash_timeout_secs = 60\n",
@@ -989,9 +1039,29 @@ mod tests {
             Some("anthropic/claude-opus-4-6")
         );
         assert_eq!(config.provider.connect_timeout, Duration::from_secs(15));
+        assert_eq!(config.provider.openai.codex_cli_version, "9.9.9");
         assert_eq!(config.storage.max_log_files, 5);
         assert_eq!(config.agent.index_max_file_size, 4 * 1024 * 1024);
         assert_eq!(config.agent.bash_timeout_secs, 60);
+    }
+
+    #[test]
+    fn empty_openai_codex_cli_version_uses_default() {
+        let dir = TempDir::new().unwrap();
+        let maki_dir = dir.path().join(".maki");
+        fs::create_dir_all(&maki_dir).unwrap();
+        fs::write(
+            maki_dir.join("config.toml"),
+            "[provider.openai]\ncodex_cli_version = \"  \"\n",
+        )
+        .unwrap();
+
+        let config = load_config(dir.path(), false);
+
+        assert_eq!(
+            config.provider.openai.codex_cli_version,
+            DEFAULT_OPENAI_PLAN_CODEX_CLI_VERSION
+        );
     }
 
     #[test_case("provider", "connect_timeout_secs", 0 ; "provider_zero_connect_timeout")]
