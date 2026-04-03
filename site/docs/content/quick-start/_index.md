@@ -32,6 +32,12 @@ Living on the edge (main branch):
 cargo install --locked --git https://github.com/tontinton/maki.git maki
 ```
 
+With Nix:
+
+```sh
+nix run github:tontinton/maki
+```
+
 Or download a pre-built binary from [GitHub Releases](https://github.com/tontinton/maki/releases/latest).
 
 ## API Keys
