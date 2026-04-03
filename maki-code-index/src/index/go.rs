@@ -1,6 +1,6 @@
 use tree_sitter::Node;
 
-use crate::common::{
+use super::common::{
     LanguageExtractor, Section, SkeletonEntry, compact_ws, extract_fields_truncated, find_child,
     line_range, node_text, truncate,
 };

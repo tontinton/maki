@@ -4,61 +4,11 @@
 //! the original file while preserving the structural information an LLM needs.
 //! Language support is feature-gated so unused grammars are not compiled in.
 
-use std::path::Path;
+use index::common::LanguageExtractor;
 
-use tree_sitter::Parser;
+pub mod index;
 
-#[cfg(feature = "lang-bash")]
-mod bash;
-#[cfg(feature = "lang-c")]
-mod c;
-mod common;
-#[cfg(feature = "lang-cpp")]
-mod cpp;
-#[cfg(feature = "lang-c-sharp")]
-mod csharp;
-#[cfg(feature = "lang-go")]
-mod go;
-#[cfg(feature = "lang-java")]
-mod java;
-#[cfg(feature = "lang-kotlin")]
-mod kotlin;
-#[cfg(feature = "lang-lua")]
-mod lua;
-#[cfg(feature = "lang-php")]
-mod php;
-#[cfg(feature = "lang-python")]
-mod python;
-#[cfg(feature = "lang-ruby")]
-mod ruby;
-#[cfg(feature = "lang-rust")]
-mod rust;
-#[cfg(feature = "lang-scala")]
-mod scala;
-#[cfg(feature = "lang-swift")]
-mod swift;
-#[cfg(feature = "lang-typescript")]
-mod typescript;
-
-#[cfg(test)]
-mod tests;
-
-use common::{LanguageExtractor, detect_module_doc, doc_comment_start_line, format_skeleton};
-
-#[cfg(test)]
-const MAX_FILE_SIZE: u64 = 2 * 1024 * 1024;
-
-#[derive(Debug, thiserror::Error)]
-pub enum IndexError {
-    #[error("unsupported file type: {0}")]
-    UnsupportedLanguage(String),
-    #[error("file too large ({size} bytes, max {max})")]
-    FileTooLarge { size: u64, max: u64 },
-    #[error("read error: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("parse error: tree-sitter failed to parse file")]
-    ParseFailed,
-}
+pub use index::{IndexError, index_file, index_source};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Language {
@@ -179,100 +129,37 @@ impl Language {
     fn extractor(&self) -> &dyn LanguageExtractor {
         match self {
             #[cfg(feature = "lang-rust")]
-            Self::Rust => &rust::RustExtractor,
+            Self::Rust => &index::rust::RustExtractor,
             #[cfg(feature = "lang-python")]
-            Self::Python => &python::PythonExtractor,
+            Self::Python => &index::python::PythonExtractor,
             #[cfg(feature = "lang-typescript")]
-            Self::TypeScript => &typescript::TsJsExtractor,
+            Self::TypeScript => &index::typescript::TsJsExtractor,
             #[cfg(feature = "lang-typescript")]
-            Self::JavaScript => &typescript::TsJsExtractor,
+            Self::JavaScript => &index::typescript::TsJsExtractor,
             #[cfg(feature = "lang-go")]
-            Self::Go => &go::GoExtractor,
+            Self::Go => &index::go::GoExtractor,
             #[cfg(feature = "lang-java")]
-            Self::Java => &java::JavaExtractor,
+            Self::Java => &index::java::JavaExtractor,
             #[cfg(feature = "lang-c")]
-            Self::C => &c::CExtractor,
+            Self::C => &index::c::CExtractor,
             #[cfg(feature = "lang-cpp")]
-            Self::Cpp => &cpp::CppExtractor,
+            Self::Cpp => &index::cpp::CppExtractor,
             #[cfg(feature = "lang-c-sharp")]
-            Self::CSharp => &csharp::CSharpExtractor,
+            Self::CSharp => &index::csharp::CSharpExtractor,
             #[cfg(feature = "lang-ruby")]
-            Self::Ruby => &ruby::RubyExtractor,
+            Self::Ruby => &index::ruby::RubyExtractor,
             #[cfg(feature = "lang-php")]
-            Self::Php => &php::PhpExtractor,
+            Self::Php => &index::php::PhpExtractor,
             #[cfg(feature = "lang-swift")]
-            Self::Swift => &swift::SwiftExtractor,
+            Self::Swift => &index::swift::SwiftExtractor,
             #[cfg(feature = "lang-kotlin")]
-            Self::Kotlin => &kotlin::KotlinExtractor,
+            Self::Kotlin => &index::kotlin::KotlinExtractor,
             #[cfg(feature = "lang-scala")]
-            Self::Scala => &scala::ScalaExtractor,
+            Self::Scala => &index::scala::ScalaExtractor,
             #[cfg(feature = "lang-bash")]
-            Self::Bash => &bash::BashExtractor,
+            Self::Bash => &index::bash::BashExtractor,
             #[cfg(feature = "lang-lua")]
-            Self::Lua => &lua::LuaExtractor,
+            Self::Lua => &index::lua::LuaExtractor,
         }
     }
-}
-
-pub fn index_file(path: &Path, max_file_size: u64) -> Result<String, IndexError> {
-    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-    let lang = Language::from_extension(ext)
-        .ok_or_else(|| IndexError::UnsupportedLanguage(format!(".{ext}")))?;
-
-    let meta = std::fs::metadata(path)?;
-    if meta.len() > max_file_size {
-        return Err(IndexError::FileTooLarge {
-            size: meta.len(),
-            max: max_file_size,
-        });
-    }
-
-    let source = std::fs::read(path)?;
-    index_source(&source, lang)
-}
-
-pub fn index_source(source: &[u8], lang: Language) -> Result<String, IndexError> {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&lang.ts_language())
-        .map_err(|_| IndexError::ParseFailed)?;
-
-    let tree = parser.parse(source, None).ok_or(IndexError::ParseFailed)?;
-    let root = tree.root_node();
-    let extractor = lang.extractor();
-
-    let module_doc = detect_module_doc(root, source, extractor);
-    let mut entries = Vec::new();
-    let mut test_lines: Vec<usize> = Vec::new();
-
-    let mut cursor = root.walk();
-    for child in root.children(&mut cursor) {
-        if extractor.is_attr(child) || extractor.is_doc_comment(child, source) {
-            continue;
-        }
-        let attrs = extractor.collect_preceding_attrs(child);
-        if extractor.is_test_node(child, source, &attrs) {
-            test_lines.push(child.start_position().row + 1);
-            continue;
-        }
-        for (i, mut entry) in extractor
-            .extract_nodes(child, source, &attrs)
-            .into_iter()
-            .enumerate()
-        {
-            if i == 0
-                && let Some(doc_start) = doc_comment_start_line(child, source, extractor)
-            {
-                entry.line_start = entry.line_start.min(doc_start);
-            }
-            entries.push(entry);
-        }
-    }
-
-    Ok(format_skeleton(
-        &entries,
-        &test_lines,
-        module_doc,
-        extractor.import_separator(),
-    ))
 }

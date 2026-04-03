@@ -1,6 +1,6 @@
 use tree_sitter::Node;
 
-use crate::common::{
+use super::common::{
     BodyMemberHandler, BodyMemberRule, ChildKind, LanguageExtractor, Section, SkeletonEntry,
     compact_ws, extract_body_members, find_child, node_text, prefixed, truncate,
 };
@@ -38,7 +38,7 @@ impl ScalaExtractor {
     fn extract_import(&self, node: Node, source: &[u8]) -> Option<SkeletonEntry> {
         let text = node_text(node, source);
         let cleaned = text.strip_prefix("import ").unwrap_or(text).trim();
-        let paths = crate::common::expand_import(cleaned, self.import_separator());
+        let paths = super::common::expand_import(cleaned, self.import_separator());
         Some(SkeletonEntry::new_import(node, paths))
     }
 

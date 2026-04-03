@@ -1,6 +1,6 @@
 use tree_sitter::Node;
 
-use crate::common::{
+use super::common::{
     ChildKind, FIELD_TRUNCATE_THRESHOLD, LanguageExtractor, Section, SkeletonEntry, expand_import,
     find_child, fn_signature, has_test_attr, line_range, node_text, prefixed, relevant_attr_texts,
     truncated_msg, vis_prefix,

@@ -2,7 +2,10 @@ use std::path::Path;
 
 use test_case::test_case;
 
-use crate::{IndexError, Language, MAX_FILE_SIZE, index_file, index_source};
+use crate::{
+    Language,
+    index::{IndexError, MAX_FILE_SIZE, index_file, index_source},
+};
 
 fn idx(source: &str, lang: Language) -> String {
     index_source(source.as_bytes(), lang).unwrap()

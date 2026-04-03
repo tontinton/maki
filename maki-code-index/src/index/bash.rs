@@ -1,6 +1,6 @@
 use tree_sitter::Node;
 
-use crate::common::{LanguageExtractor, Section, SkeletonEntry, node_text, truncate};
+use super::common::{LanguageExtractor, Section, SkeletonEntry, node_text, truncate};
 
 pub(crate) struct BashExtractor;
 
