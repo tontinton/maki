@@ -59,7 +59,7 @@ impl Batch {
         r#"[{"tool_calls": [
   {"tool": "glob", "parameters": {"pattern": "src/**/*.ts"}},
   {"tool": "grep", "parameters": {"pattern": "import", "include": "*.ts"}},
-  {"tool": "index", "parameters": {"path": "index.ts"}}
+  {"tool": "index", "parameters": {"path": "/project/index.ts"}}
 ]}]"#,
     );
 

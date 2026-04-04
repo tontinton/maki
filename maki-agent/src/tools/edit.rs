@@ -24,8 +24,8 @@ impl Edit {
     pub const DESCRIPTION: &str = include_str!("edit.md");
     pub const EXAMPLES: Option<&str> = Some(
         r#"[
-  {"path": "src/main.rs", "old_string": "fn old_name(", "new_string": "fn new_name("},
-  {"path": "src/lib.rs", "old_string": "use std::collections::HashMap;\nuse std::sync::Arc;", "new_string": "use std::collections::HashMap;\nuse std::io::Read;\nuse std::sync::Arc;"}
+  {"path": "/project/src/main.rs", "old_string": "fn old_name(", "new_string": "fn new_name("},
+  {"path": "/project/src/lib.rs", "old_string": "use std::collections::HashMap;\nuse std::sync::Arc;", "new_string": "use std::collections::HashMap;\nuse std::io::Read;\nuse std::sync::Arc;"}
 ]"#,
     );
 

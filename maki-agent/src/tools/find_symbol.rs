@@ -26,7 +26,7 @@ impl FindSymbol {
     pub const NAME: &str = "find_symbol";
     pub const DESCRIPTION: &str = include_str!("find_symbol.md");
     pub const EXAMPLES: Option<&str> =
-        Some(r#"[{"symbol": "spawn", "file": "/home/user/project/src/main.rs", "line": 42}]"#);
+        Some(r#"[{"symbol": "spawn", "file": "/project/src/main.rs", "line": 42}]"#);
 
     pub async fn execute(&self, _ctx: &super::ToolContext) -> Result<ToolOutput, String> {
         let file = super::resolve_path(&self.file)?;

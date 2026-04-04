@@ -34,7 +34,7 @@ impl Read {
     pub const NAME: &str = "read";
     pub const DESCRIPTION: &str = include_str!("read.md");
     pub const EXAMPLES: Option<&str> =
-        Some(r#"[{"path": "src/main.rs", "offset": 10, "limit": 20}]"#);
+        Some(r#"[{"path": "/project/src/main.rs", "offset": 10, "limit": 20}]"#);
 
     pub async fn execute(&self, ctx: &super::ToolContext) -> Result<ToolOutput, String> {
         let path = super::resolve_path(&self.path)?;

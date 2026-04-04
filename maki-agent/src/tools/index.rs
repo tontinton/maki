@@ -15,7 +15,7 @@ pub struct Index {
 impl Index {
     pub const NAME: &str = "index";
     pub const DESCRIPTION: &str = include_str!("index.md");
-    pub const EXAMPLES: Option<&str> = Some(r#"[{"path": "src/lib.rs"}]"#);
+    pub const EXAMPLES: Option<&str> = Some(r#"[{"path": "/project/src/lib.rs"}]"#);
 
     pub async fn execute(&self, ctx: &super::ToolContext) -> Result<ToolOutput, String> {
         let path = super::resolve_path(&self.path)?;
