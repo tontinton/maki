@@ -100,6 +100,55 @@ impl CallToolResult {
     }
 }
 
+#[derive(Deserialize, Clone)]
+pub struct PromptArgument {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub required: bool,
+}
+
+#[derive(Deserialize)]
+pub struct PromptInfo {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub arguments: Vec<PromptArgument>,
+}
+
+#[derive(Deserialize)]
+pub struct PromptsListResult {
+    pub prompts: Vec<PromptInfo>,
+}
+
+#[derive(Deserialize)]
+pub struct PromptMessageContent {
+    #[serde(default)]
+    pub text: Option<String>,
+}
+
+#[derive(Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum PromptRole {
+    #[default]
+    User,
+    Assistant,
+}
+
+#[derive(Deserialize)]
+pub struct PromptMessage {
+    #[serde(default)]
+    pub role: PromptRole,
+    pub content: PromptMessageContent,
+}
+
+#[derive(Deserialize)]
+pub struct GetPromptResult {
+    pub messages: Vec<PromptMessage>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -129,5 +178,55 @@ mod tests {
         let result: CallToolResult = serde_json::from_value(raw).unwrap();
         assert!(result.is_error);
         assert_eq!(result.joined_text(), "hello");
+    }
+
+    #[test]
+    fn prompts_list_result_deserializes() {
+        let raw = json!({
+            "prompts": [{
+                "name": "code-review",
+                "description": "Review code changes",
+                "arguments": [
+                    {"name": "diff", "description": "The diff to review", "required": true},
+                    {"name": "style", "required": false}
+                ]
+            }]
+        });
+        let result: PromptsListResult = serde_json::from_value(raw).unwrap();
+        assert_eq!(result.prompts.len(), 1);
+        assert_eq!(result.prompts[0].name, "code-review");
+        assert_eq!(
+            result.prompts[0].description.as_deref(),
+            Some("Review code changes")
+        );
+        assert_eq!(result.prompts[0].arguments.len(), 2);
+        assert!(result.prompts[0].arguments[0].required);
+        assert!(!result.prompts[0].arguments[1].required);
+    }
+
+    #[test]
+    fn prompts_list_result_defaults() {
+        let raw = json!({"prompts": [{"name": "simple"}]});
+        let result: PromptsListResult = serde_json::from_value(raw).unwrap();
+        assert!(result.prompts[0].description.is_none());
+        assert!(result.prompts[0].arguments.is_empty());
+    }
+
+    #[test]
+    fn get_prompt_result_deserializes() {
+        let raw = json!({
+            "messages": [
+                {"role": "user", "content": {"text": "Review this code"}},
+                {"role": "assistant", "content": {"text": "I'll review it"}}
+            ]
+        });
+        let result: GetPromptResult = serde_json::from_value(raw).unwrap();
+        assert_eq!(result.messages.len(), 2);
+        assert_eq!(result.messages[0].role, PromptRole::User);
+        assert_eq!(
+            result.messages[0].content.text.as_deref(),
+            Some("Review this code")
+        );
+        assert_eq!(result.messages[1].role, PromptRole::Assistant);
     }
 }

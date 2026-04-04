@@ -50,7 +50,9 @@ use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 #[cfg(feature = "demo")]
 use maki_agent::QuestionInfo;
 use maki_agent::permissions::{PermissionDecision, PermissionManager};
-use maki_agent::{AgentEvent, Envelope, ImageSource, McpServerInfo, SubagentInfo, ToolOutput};
+use maki_agent::{
+    AgentEvent, Envelope, ImageSource, McpPromptInfo, McpServerInfo, SubagentInfo, ToolOutput,
+};
 use maki_config::UiConfig;
 use maki_providers::{Message, Model, ThinkingConfig};
 use maki_storage::DataDir;
@@ -148,6 +150,7 @@ impl App {
         storage: DataDir,
         available_models: Arc<ArcSwapOption<Vec<String>>>,
         mcp_infos: Arc<ArcSwap<Vec<McpServerInfo>>>,
+        mcp_prompts: Arc<ArcSwap<Vec<McpPromptInfo>>>,
         storage_writer: Arc<StorageWriter>,
         ui_config: UiConfig,
         input_history_size: usize,
@@ -160,7 +163,7 @@ impl App {
             active_chat: 0,
             chat_index: HashMap::new(),
             input_box: InputBox::new(InputHistory::load(&storage, input_history_size)),
-            command_palette: CommandPalette::new(custom_commands),
+            command_palette: CommandPalette::new(custom_commands, mcp_prompts),
             task_picker: ListPicker::new(),
             task_picker_original: None,
             theme_picker: ThemePicker::new(),
@@ -1027,8 +1030,75 @@ impl App {
             name if name.starts_with("/project:") || name.starts_with("/user:") => {
                 self.execute_custom_command(name, &cmd.args)
             }
+            name if self.command_palette.find_mcp_prompt(name).is_some() => {
+                self.execute_mcp_prompt(name, &cmd.args)
+            }
             _ => vec![],
         }
+    }
+
+    fn execute_mcp_prompt(&mut self, name: &str, args: &str) -> Vec<Action> {
+        let prompt = self.command_palette.find_mcp_prompt(name).unwrap().clone();
+
+        let arguments = Self::parse_prompt_args(&prompt, args);
+        let missing: Vec<_> = prompt
+            .arguments
+            .iter()
+            .filter(|a| a.required && !arguments.contains_key(&a.name))
+            .map(|a| format!("<{}>", a.name))
+            .collect();
+        if !missing.is_empty() {
+            self.flash(format!("Usage: {} {}", name, missing.join(" ")));
+            return vec![];
+        }
+
+        let prompt_ref = maki_agent::McpPromptRef {
+            qualified_name: prompt.qualified_name.clone(),
+            arguments,
+        };
+        let display_text = if args.trim().is_empty() {
+            name.to_string()
+        } else {
+            format!("{name} {args}")
+        };
+        let mut input = self.build_agent_input(&QueuedMessage {
+            text: display_text,
+            images: Vec::new(),
+        });
+        input.prompt = Some(Box::new(prompt_ref));
+
+        if self.status == Status::Streaming {
+            self.flash("Agent is busy, try again later".into());
+            vec![]
+        } else {
+            self.run_id += 1;
+            self.status = Status::Streaming;
+            vec![Action::SendMessage(Box::new(input))]
+        }
+    }
+
+    fn parse_prompt_args(prompt: &McpPromptInfo, args: &str) -> HashMap<String, String> {
+        let mut result = HashMap::new();
+        let mut remaining = args.trim();
+        if remaining.is_empty() || prompt.arguments.is_empty() {
+            return result;
+        }
+        let last_idx = prompt.arguments.len() - 1;
+        for (i, arg) in prompt.arguments.iter().enumerate() {
+            if remaining.is_empty() {
+                break;
+            }
+            if i == last_idx {
+                result.insert(arg.name.clone(), remaining.to_string());
+            } else if let Some((word, rest)) = remaining.split_once(char::is_whitespace) {
+                result.insert(arg.name.clone(), word.to_string());
+                remaining = rest.trim_start();
+            } else {
+                result.insert(arg.name.clone(), remaining.to_string());
+                break;
+            }
+        }
+        result
     }
 
     fn execute_custom_command(&mut self, name: &str, args: &str) -> Vec<Action> {

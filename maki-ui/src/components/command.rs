@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use crossterm::event::{KeyCode, KeyEvent};
+use maki_agent::McpPromptInfo;
 use maki_agent::command::CustomCommand;
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -110,20 +112,29 @@ pub enum CommandAction {
 enum FilteredItem {
     Builtin(usize),
     Custom(usize),
+    McpPrompt(usize),
 }
 
 pub struct CommandPalette {
     selected: usize,
     filtered: Vec<FilteredItem>,
     custom: Arc<[CustomCommand]>,
+    mcp_prompts_source: Arc<ArcSwap<Vec<McpPromptInfo>>>,
+    mcp_prompts: Arc<Vec<McpPromptInfo>>,
 }
 
 impl CommandPalette {
-    pub fn new(custom_commands: Arc<[CustomCommand]>) -> Self {
+    pub fn new(
+        custom_commands: Arc<[CustomCommand]>,
+        mcp_prompts: Arc<ArcSwap<Vec<McpPromptInfo>>>,
+    ) -> Self {
+        let snapshot = mcp_prompts.load_full();
         Self {
             selected: 0,
             filtered: Vec::new(),
             custom: custom_commands,
+            mcp_prompts_source: mcp_prompts,
+            mcp_prompts: snapshot,
         }
     }
 
@@ -164,6 +175,7 @@ impl CommandPalette {
     }
 
     pub fn sync(&mut self, input: &str) {
+        self.mcp_prompts = self.mcp_prompts_source.load_full();
         let Some(stripped) = input.strip_prefix('/') else {
             self.filtered.clear();
             return;
@@ -194,6 +206,22 @@ impl CommandPalette {
             let max_args = if cmd.has_args() { usize::MAX } else { 0 };
             if entry_name.to_ascii_lowercase().starts_with(&cmd_lower) && arg_count <= max_args {
                 self.filtered.push(FilteredItem::Custom(i));
+            }
+        }
+
+        for (i, prompt) in self.mcp_prompts.iter().enumerate() {
+            let max_args = if prompt.arguments.is_empty() {
+                0
+            } else {
+                usize::MAX
+            };
+            if prompt
+                .display_name
+                .to_ascii_lowercase()
+                .starts_with(&cmd_lower)
+                && arg_count <= max_args
+            {
+                self.filtered.push(FilteredItem::McpPrompt(i));
             }
         }
 
@@ -230,6 +258,7 @@ impl CommandPalette {
         match item {
             FilteredItem::Builtin(i) => BUILTIN_COMMANDS[*i].name.to_string(),
             FilteredItem::Custom(i) => self.custom[*i].display_name(),
+            FilteredItem::McpPrompt(i) => format!("/{}", self.mcp_prompts[*i].display_name),
         }
     }
 
@@ -237,6 +266,7 @@ impl CommandPalette {
         match item {
             FilteredItem::Builtin(i) => BUILTIN_COMMANDS[*i].description,
             FilteredItem::Custom(i) => &self.custom[*i].description,
+            FilteredItem::McpPrompt(i) => &self.mcp_prompts[*i].description,
         }
     }
 
@@ -258,6 +288,11 @@ impl CommandPalette {
         self.custom
             .iter()
             .find(|c| c.display_name() == display_name)
+    }
+
+    pub fn find_mcp_prompt(&self, slash_name: &str) -> Option<&McpPromptInfo> {
+        let name = slash_name.strip_prefix('/')?;
+        self.mcp_prompts.iter().find(|p| p.display_name == name)
     }
 
     pub fn view(&self, frame: &mut Frame, input_area: Rect) -> Option<Rect> {
@@ -336,16 +371,21 @@ impl CommandPalette {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use maki_agent::McpPromptArg;
     use test_case::test_case;
 
+    fn empty_prompts() -> Arc<ArcSwap<Vec<McpPromptInfo>>> {
+        Arc::new(ArcSwap::from_pointee(Vec::new()))
+    }
+
     fn synced(input: &str) -> CommandPalette {
-        let mut p = CommandPalette::new(Arc::from([]));
+        let mut p = CommandPalette::new(Arc::from([]), empty_prompts());
         p.sync(input);
         p
     }
 
     fn synced_with_custom(input: &str, custom: Arc<[CustomCommand]>) -> CommandPalette {
-        let mut p = CommandPalette::new(custom);
+        let mut p = CommandPalette::new(custom, empty_prompts());
         p.sync(input);
         p
     }
@@ -370,17 +410,15 @@ mod tests {
     }
 
     #[test]
-    fn slash_shows_all_commands() {
-        let p = synced("/");
-        assert!(p.is_active());
-        assert_eq!(p.filtered.len(), BUILTIN_COMMANDS.len());
-    }
+    fn slash_shows_builtins_plus_extras() {
+        let builtin_count = synced("/").filtered.len();
+        assert!(builtin_count > 0);
 
-    #[test]
-    fn slash_shows_all_including_custom() {
-        let p = synced_with_custom("/", sample_custom());
-        assert!(p.is_active());
-        assert_eq!(p.filtered.len(), BUILTIN_COMMANDS.len() + 2);
+        let with_custom = synced_with_custom("/", sample_custom());
+        assert_eq!(with_custom.filtered.len(), builtin_count + 2);
+
+        let with_prompts = synced_with_prompts("/");
+        assert_eq!(with_prompts.filtered.len(), builtin_count + 2);
     }
 
     #[test]
@@ -418,7 +456,7 @@ mod tests {
 
     #[test]
     fn confirm_when_inactive_returns_none() {
-        let p = CommandPalette::new(Arc::from([]));
+        let p = CommandPalette::new(Arc::from([]), empty_prompts());
         assert!(p.confirm("").is_none());
     }
 
@@ -469,7 +507,7 @@ mod tests {
     #[test_case("/compact", "/compact", ""    ; "other_command")]
     #[test_case("/btw hello world", "/btw", "hello world" ; "btw_multi_word")]
     fn confirm_parses_args(input: &str, expected_name: &str, expected_args: &str) {
-        let mut p = CommandPalette::new(Arc::from([]));
+        let mut p = CommandPalette::new(Arc::from([]), empty_prompts());
         p.sync(input);
         let cmd = p.confirm(input).unwrap();
         assert_eq!(cmd.name, expected_name);
@@ -479,7 +517,7 @@ mod tests {
     #[test]
     fn confirm_custom_command() {
         let custom = sample_custom();
-        let mut p = CommandPalette::new(custom);
+        let mut p = CommandPalette::new(custom, empty_prompts());
         p.sync("/project:review");
         assert!(p.is_active());
         let cmd = p.confirm("/project:review some-file.rs").unwrap();
@@ -490,10 +528,84 @@ mod tests {
     #[test]
     fn find_custom_command_lookup() {
         let custom = sample_custom();
-        let p = CommandPalette::new(custom);
+        let p = CommandPalette::new(custom, empty_prompts());
         let found = p.find_custom_command("/project:review");
         assert!(found.is_some());
         assert_eq!(found.unwrap().content, "Review $ARGUMENTS");
         assert!(p.find_custom_command("/nonexistent").is_none());
+    }
+
+    fn sample_prompts() -> Arc<ArcSwap<Vec<McpPromptInfo>>> {
+        Arc::new(ArcSwap::from_pointee(vec![
+            McpPromptInfo {
+                display_name: "myserver:code-review".into(),
+                qualified_name: "myserver/code-review".into(),
+                description: "Review code changes".into(),
+                arguments: vec![McpPromptArg {
+                    name: "diff".into(),
+                    description: "The diff".into(),
+                    required: true,
+                }],
+            },
+            McpPromptInfo {
+                display_name: "myserver:summarize".into(),
+                qualified_name: "myserver/summarize".into(),
+                description: "Summarize text".into(),
+                arguments: vec![],
+            },
+        ]))
+    }
+
+    fn synced_with_prompts(input: &str) -> CommandPalette {
+        let mut p = CommandPalette::new(Arc::from([]), sample_prompts());
+        p.sync(input);
+        p
+    }
+
+    #[test]
+    fn filter_mcp_prompt_by_prefix() {
+        let p = synced_with_prompts("/myserver:c");
+        assert!(p.is_active());
+        assert_eq!(p.filtered.len(), 1);
+        assert!(matches!(p.filtered[0], FilteredItem::McpPrompt(0)));
+    }
+
+    #[test]
+    fn mcp_prompt_with_args_stays_active() {
+        let p = synced_with_prompts("/myserver:code-review some diff");
+        assert!(p.is_active());
+    }
+
+    #[test]
+    fn mcp_prompt_without_args_hides_on_space() {
+        let p = synced_with_prompts("/myserver:summarize ");
+        assert!(
+            !p.filtered
+                .iter()
+                .any(|f| matches!(f, FilteredItem::McpPrompt(1)))
+        );
+    }
+
+    #[test]
+    fn find_mcp_prompt_lookup() {
+        let p = synced_with_prompts("/");
+        let found = p.find_mcp_prompt("/myserver:code-review");
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().qualified_name, "myserver/code-review");
+        assert!(p.find_mcp_prompt("/nonexistent").is_none());
+    }
+
+    #[test]
+    fn confirm_mcp_prompt_parses_args() {
+        let input = "/myserver:code-review my-diff-content";
+        let mut p = synced_with_prompts(input);
+        p.selected = p
+            .filtered
+            .iter()
+            .position(|f| matches!(f, FilteredItem::McpPrompt(0)))
+            .unwrap();
+        let cmd = p.confirm(input).unwrap();
+        assert_eq!(cmd.name, "/myserver:code-review");
+        assert_eq!(cmd.args, "my-diff-content");
     }
 }

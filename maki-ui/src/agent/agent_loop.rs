@@ -13,7 +13,7 @@ use maki_agent::template::Vars;
 use maki_agent::tools::{DescriptionContext, ToolCall, ToolFilter};
 use maki_agent::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentParams, AgentRunParams, CancelToken,
-    CancelTrigger, Envelope, EventSender, History, LoadedInstructions,
+    CancelTrigger, Envelope, EventSender, History, LoadedInstructions, McpPromptInfo, PromptRole,
 };
 use maki_providers::{AgentError, Message, Model, TokenUsage};
 use serde_json::Value;
@@ -35,6 +35,7 @@ pub(super) struct AgentLoop {
     disabled: Vec<String>,
     mcp_manager: Option<Arc<McpManager>>,
     mcp_infos: Arc<ArcSwap<Vec<McpServerInfo>>>,
+    mcp_prompts: Arc<ArcSwap<Vec<McpPromptInfo>>>,
     mcp_pids: Arc<Mutex<Vec<u32>>>,
     history: History,
     shared_history: Arc<ArcSwap<Vec<Message>>>,
@@ -63,6 +64,7 @@ impl AgentLoop {
         initial_history: Vec<Message>,
         shared_history: Arc<ArcSwap<Vec<Message>>>,
         mcp_infos: Arc<ArcSwap<Vec<McpServerInfo>>>,
+        mcp_prompts: Arc<ArcSwap<Vec<McpPromptInfo>>>,
         mcp_pids: Arc<Mutex<Vec<u32>>>,
         initial_disabled: Vec<String>,
         permissions: Arc<PermissionManager>,
@@ -85,6 +87,7 @@ impl AgentLoop {
             disabled: initial_disabled,
             mcp_manager: None,
             mcp_infos,
+            mcp_prompts,
             mcp_pids,
             history: History::new(initial_history),
             shared_history,
@@ -196,6 +199,8 @@ impl AgentLoop {
             let infos = mgr.server_infos(&self.disabled);
             spawn_oauth_for_needs_auth(&infos, mgr, &self.mcp_infos, &self.disabled);
             self.mcp_infos.store(Arc::new(infos));
+            self.mcp_prompts
+                .store(Arc::new(mgr.prompt_infos(&self.disabled)));
             *self.mcp_pids.lock().unwrap_or_else(|e| e.into_inner()) = mgr.child_pids();
         }
 
@@ -228,6 +233,31 @@ impl AgentLoop {
         for msg in mem::take(&mut input.preamble) {
             self.history.push(msg);
         }
+
+        if let Some(ref prompt_ref) = input.prompt
+            && let Some(ref mgr) = self.mcp_manager
+        {
+            let messages = mgr
+                .get_prompt(&prompt_ref.qualified_name, &prompt_ref.arguments)
+                .await
+                .map_err(|e| AgentError::Tool {
+                    tool: "mcp_prompt".into(),
+                    message: e.to_string(),
+                })?;
+            for pm in messages {
+                let text = pm.content.text.unwrap_or_default();
+                let msg = match pm.role {
+                    PromptRole::Assistant => Message {
+                        role: maki_providers::Role::Assistant,
+                        content: vec![maki_providers::ContentBlock::Text { text }],
+                        ..Default::default()
+                    },
+                    PromptRole::User => Message::user(text),
+                };
+                self.history.push(msg);
+            }
+        }
+
         self.sync_shared_history_with_pending(&input);
 
         let system = agent::build_system_prompt(&self.vars, &input.mode, &self.instructions);
@@ -279,6 +309,8 @@ impl AgentLoop {
             let infos = mcp.server_infos(&self.disabled);
             self.persist_mcp_toggle(&infos, &server_name, enabled);
             self.mcp_infos.store(Arc::new(infos));
+            self.mcp_prompts
+                .store(Arc::new(mcp.prompt_infos(&self.disabled)));
         }
     }
 

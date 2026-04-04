@@ -175,6 +175,7 @@ impl<'t> EventLoop<'t> {
             storage,
             bg.available,
             Arc::clone(&mcp_state.infos),
+            Arc::clone(&mcp_state.prompts),
             Arc::clone(&storage_writer),
             ui_config,
             input_history_size,

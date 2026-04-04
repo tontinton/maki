@@ -24,6 +24,9 @@ pub enum McpError {
     #[error("unknown MCP tool: {name}")]
     UnknownTool { name: String },
 
+    #[error("unknown MCP prompt: {name}")]
+    UnknownPrompt { name: String },
+
     #[error("config error: {0}")]
     Config(String),
 

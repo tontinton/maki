@@ -64,6 +64,7 @@ pub struct McpServerInfo {
     pub name: String,
     pub transport_kind: &'static str,
     pub tool_count: usize,
+    pub prompt_count: usize,
     pub status: McpServerStatus,
     pub config_path: PathBuf,
     pub url: Option<String>,
@@ -152,6 +153,7 @@ impl McpConfig {
                     name: name.clone(),
                     transport_kind: transport_kind(&raw.transport),
                     tool_count: 0,
+                    prompt_count: 0,
                     status,
                     config_path: self.origins.get(name).cloned().unwrap_or_default(),
                     url: match &raw.transport {

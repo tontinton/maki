@@ -11,6 +11,8 @@ pub use child_guard::ChildGuard;
 pub mod mcp;
 pub use mcp::config::McpServerInfo;
 pub use mcp::config::McpServerStatus;
+pub use mcp::protocol::PromptRole;
+pub use mcp::{McpPromptArg, McpPromptInfo};
 pub(crate) mod task_set;
 pub use agent::{Agent, AgentParams, AgentRunParams, History, LoadedInstructions, RunOutcome};
 pub use cancel::{CancelToken, CancelTrigger};
@@ -24,6 +26,7 @@ pub mod tools;
 pub use tools::{ToolCall, ToolFilter};
 pub mod types;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 pub use maki_providers::AgentError;
@@ -53,6 +56,12 @@ pub trait InterruptSource: Send + Sync {
     fn poll(&self) -> Option<ExtractedCommand>;
 }
 
+#[derive(Clone)]
+pub struct McpPromptRef {
+    pub qualified_name: String,
+    pub arguments: HashMap<String, String>,
+}
+
 #[derive(Default)]
 pub struct AgentInput {
     pub message: String,
@@ -61,6 +70,7 @@ pub struct AgentInput {
     pub images: Vec<ImageSource>,
     pub preamble: Vec<Message>,
     pub thinking: ThinkingConfig,
+    pub prompt: Option<Box<McpPromptRef>>,
 }
 
 impl AgentInput {

@@ -39,6 +39,48 @@ struct McpToolDef {
     input_schema: Value,
 }
 
+struct McpPromptDef {
+    qualified_name: String,
+    server_name: Arc<str>,
+    raw_name: String,
+    description: String,
+    arguments: Vec<protocol::PromptArgument>,
+}
+
+impl McpPromptDef {
+    fn from_info(server_name: &Arc<str>, info: protocol::PromptInfo) -> Self {
+        let qualified_name = format!("{server_name}{SEPARATOR}{}", info.name);
+        Self {
+            qualified_name,
+            server_name: Arc::clone(server_name),
+            raw_name: info.name,
+            description: info.description.unwrap_or_default(),
+            arguments: info.arguments,
+        }
+    }
+
+    fn display_name(&self) -> String {
+        format!("{}:{}", self.server_name, self.raw_name)
+    }
+
+    fn to_info(&self) -> McpPromptInfo {
+        McpPromptInfo {
+            display_name: self.display_name(),
+            qualified_name: self.qualified_name.clone(),
+            description: self.description.clone(),
+            arguments: self
+                .arguments
+                .iter()
+                .map(|a| McpPromptArg {
+                    name: a.name.clone(),
+                    description: a.description.clone().unwrap_or_default(),
+                    required: a.required,
+                })
+                .collect(),
+        }
+    }
+}
+
 struct ServerEntry {
     name: String,
     transport_kind: &'static str,
@@ -52,11 +94,27 @@ struct McpManagerInner {
     transports: HashMap<Arc<str>, Box<dyn McpTransport>>,
     tools: Vec<McpToolDef>,
     tool_index: HashMap<&'static str, usize>,
+    prompts: Vec<McpPromptDef>,
     entries: Vec<ServerEntry>,
 }
 
 pub struct McpManager {
     inner: RwLock<McpManagerInner>,
+}
+
+#[derive(Clone)]
+pub struct McpPromptInfo {
+    pub display_name: String,
+    pub qualified_name: String,
+    pub description: String,
+    pub arguments: Vec<McpPromptArg>,
+}
+
+#[derive(Clone)]
+pub struct McpPromptArg {
+    pub name: String,
+    pub description: String,
+    pub required: bool,
 }
 
 fn transport_url(transport: &Transport) -> Option<String> {
@@ -82,6 +140,7 @@ impl McpManager {
         let mut transports: HashMap<Arc<str>, Box<dyn McpTransport>> = HashMap::new();
         let mut tools = Vec::new();
         let mut tool_index = HashMap::new();
+        let mut prompts = Vec::new();
         let mut entries = Vec::new();
 
         struct Pending {
@@ -143,7 +202,7 @@ impl McpManager {
             let url = transport_url(&p.config.transport);
             let timeout = p.config.timeout;
             match result {
-                Ok((t, server_tools)) => {
+                Ok((t, server_tools, server_prompts)) => {
                     let server_name: Arc<str> = Arc::from(p.config.name.as_str());
                     for tool_info in server_tools {
                         let qualified = format!("{}{SEPARATOR}{}", p.config.name, tool_info.name);
@@ -157,6 +216,9 @@ impl McpManager {
                             input_schema: tool_info.input_schema,
                         });
                         tool_index.insert(interned, idx);
+                    }
+                    for info in server_prompts {
+                        prompts.push(McpPromptDef::from_info(&server_name, info));
                     }
                     transports.insert(Arc::clone(&server_name), t);
                     entries.push(ServerEntry {
@@ -197,6 +259,7 @@ impl McpManager {
         info!(
             running = transports.len(),
             tools = tools.len(),
+            prompts = prompts.len(),
             total = entries.len(),
             "MCP servers initialized"
         );
@@ -206,6 +269,7 @@ impl McpManager {
                 transports,
                 tools,
                 tool_index,
+                prompts,
                 entries,
             }),
         }))
@@ -213,7 +277,14 @@ impl McpManager {
 
     async fn start_server(
         config: &ServerConfig,
-    ) -> Result<(Box<dyn McpTransport>, Vec<protocol::ToolInfo>), McpError> {
+    ) -> Result<
+        (
+            Box<dyn McpTransport>,
+            Vec<protocol::ToolInfo>,
+            Vec<protocol::PromptInfo>,
+        ),
+        McpError,
+    > {
         let t: Box<dyn McpTransport> = match &config.transport {
             Transport::Stdio {
                 program,
@@ -235,12 +306,14 @@ impl McpManager {
         };
         transport::initialize(t.as_ref()).await?;
         let tools = transport::list_tools(t.as_ref()).await?;
+        let prompts = transport::list_prompts(t.as_ref()).await?;
         info!(
             server = config.name,
             tool_count = tools.len(),
+            prompt_count = prompts.len(),
             "MCP server initialized"
         );
-        Ok((t, tools))
+        Ok((t, tools, prompts))
     }
 
     pub fn has_tool(&self, name: &str) -> bool {
@@ -293,9 +366,12 @@ impl McpManager {
 
     pub fn server_infos(&self, disabled: &[String]) -> Vec<McpServerInfo> {
         let inner = self.inner.read_blocking();
-        let mut counts: HashMap<&str, usize> = HashMap::new();
+        let mut counts: HashMap<&str, (usize, usize)> = HashMap::new();
         for tool in &inner.tools {
-            *counts.entry(&tool.server_name).or_default() += 1;
+            counts.entry(&tool.server_name).or_default().0 += 1;
+        }
+        for prompt in &inner.prompts {
+            counts.entry(&prompt.server_name).or_default().1 += 1;
         }
         inner
             .entries
@@ -306,21 +382,54 @@ impl McpManager {
                 } else {
                     entry.status.clone()
                 };
+                let (tool_count, prompt_count) = if matches!(status, McpServerStatus::Running) {
+                    counts.get(entry.name.as_str()).copied().unwrap_or((0, 0))
+                } else {
+                    (0, 0)
+                };
                 McpServerInfo {
                     name: entry.name.clone(),
                     transport_kind: entry.transport_kind,
-                    tool_count: match &status {
-                        McpServerStatus::Running => {
-                            counts.get(entry.name.as_str()).copied().unwrap_or(0)
-                        }
-                        _ => 0,
-                    },
+                    tool_count,
+                    prompt_count,
                     status,
                     config_path: entry.origin.clone(),
                     url: entry.url.clone(),
                 }
             })
             .collect()
+    }
+
+    pub fn prompt_infos(&self, disabled: &[String]) -> Vec<McpPromptInfo> {
+        let inner = self.inner.read_blocking();
+        inner
+            .prompts
+            .iter()
+            .filter(|p| !disabled.iter().any(|d| **d == *p.server_name))
+            .map(|p| p.to_info())
+            .collect()
+    }
+
+    pub async fn get_prompt(
+        &self,
+        qualified_name: &str,
+        arguments: &HashMap<String, String>,
+    ) -> Result<Vec<protocol::PromptMessage>, McpError> {
+        let inner = self.inner.read().await;
+        let def = inner
+            .prompts
+            .iter()
+            .find(|p| p.qualified_name == qualified_name)
+            .ok_or_else(|| McpError::UnknownPrompt {
+                name: qualified_name.into(),
+            })?;
+        let t = inner
+            .transports
+            .get(&def.server_name)
+            .ok_or_else(|| McpError::ServerDied {
+                server: (*def.server_name).into(),
+            })?;
+        transport::get_prompt(t.as_ref(), &def.raw_name, arguments).await
     }
 
     pub async fn shutdown(self) {
@@ -377,11 +486,13 @@ impl McpManager {
         )?);
         transport::initialize(transport.as_ref()).await?;
         let new_tools = transport::list_tools(transport.as_ref()).await?;
+        let new_prompts = transport::list_prompts(transport.as_ref()).await?;
 
         let mut inner = self.inner.write().await;
         let server_key: Arc<str> = Arc::from(server_name);
 
         inner.tools.retain(|t| *t.server_name != *server_name);
+        inner.prompts.retain(|p| *p.server_name != *server_name);
         inner.tool_index.clear();
         let rebind: Vec<_> = inner
             .tools
@@ -405,6 +516,12 @@ impl McpManager {
                 input_schema: tool_info.input_schema,
             });
             inner.tool_index.insert(interned, idx);
+        }
+
+        for info in new_prompts {
+            inner
+                .prompts
+                .push(McpPromptDef::from_info(&server_key, info));
         }
 
         inner.transports.insert(Arc::clone(&server_key), transport);

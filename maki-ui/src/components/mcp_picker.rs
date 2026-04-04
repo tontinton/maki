@@ -59,7 +59,17 @@ impl McpPicker {
                         format!("{} \u{00b7} connecting\u{2026}", info.transport_kind)
                     }
                     McpServerStatus::Running => {
-                        format!("{} \u{00b7} {} tools", info.transport_kind, info.tool_count)
+                        let mut parts = vec![info.transport_kind.to_string()];
+                        if info.tool_count > 0 {
+                            parts.push(format!("{} tools", info.tool_count));
+                        }
+                        if info.prompt_count > 0 {
+                            parts.push(format!("{} prompts", info.prompt_count));
+                        }
+                        if info.tool_count == 0 && info.prompt_count == 0 {
+                            parts.push("no capabilities".into());
+                        }
+                        parts.join(" \u{00b7} ")
                     }
                     McpServerStatus::Disabled => {
                         format!("{} \u{00b7} disabled", info.transport_kind)
@@ -134,6 +144,7 @@ mod tests {
                 name: "fs".into(),
                 transport_kind: "stdio",
                 tool_count: 5,
+                prompt_count: 0,
                 status: McpServerStatus::Running,
                 config_path: PathBuf::from("/home/.config/maki/config.toml"),
                 url: None,
@@ -142,6 +153,7 @@ mod tests {
                 name: "github".into(),
                 transport_kind: "stdio",
                 tool_count: 3,
+                prompt_count: 0,
                 status: McpServerStatus::Disabled,
                 config_path: PathBuf::from("/project/.maki/config.toml"),
                 url: None,

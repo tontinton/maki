@@ -16,7 +16,7 @@ Add servers under `[mcp.*]` in your config:
 - **Global**: `~/.config/maki/config.toml`
 - **Project**: `.maki/config.toml` (project config wins when both set a value)
 
-### Stdio Transport
+### Stdio
 
 ```toml
 [mcp.filesystem]
@@ -29,7 +29,7 @@ timeout = 10000
 enabled = false
 ```
 
-### HTTP Transport
+### HTTP
 
 ```toml
 [mcp.analytics]
@@ -37,76 +37,56 @@ url = "https://mcp.example.com/mcp"
 headers = { Authorization = "Bearer tok123" }
 ```
 
-## Server Options
+### All options
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `command` | array | — | Stdio: program and arguments |
-| `url` | string | — | HTTP: server URL (http/https) |
-| `environment` | map | — | Stdio: environment variables |
-| `headers` | map | — | HTTP: request headers |
-| `timeout` | u64 | 30000 | Request timeout in milliseconds (1-300000) |
-| `enabled` | bool | true | Whether the server is active |
+| Field | Type | Default | Notes |
+|-------|------|---------|-------|
+| `command` | array | | Stdio: program + args |
+| `url` | string | | HTTP: server URL |
+| `environment` | map | | Stdio only |
+| `headers` | map | | HTTP only |
+| `timeout` | u64 | 30000 | Milliseconds (1-300000) |
+| `enabled` | bool | true | |
 
-Pick one: `command` makes it a stdio server, `url` makes it HTTP.
+Set `command` for stdio, `url` for HTTP. Pick one.
 
-## Server Names
+## Naming and namespacing
 
-Names must be ASCII alphanumeric (hyphens allowed). Double underscores (`__`) are reserved - they separate server and tool names internally. Names cannot collide with built-in tools.
+Server names are ASCII alphanumeric, hyphens ok. Tools get prefixed with their server name: a `read` tool on the `filesystem` server becomes `filesystem__read`. Because of this, `__` is reserved and names can't collide with built-in tools.
 
-## Tool Namespacing
+## Runtime toggling
 
-Tools are prefixed with their server name: `{server}__{tool}`. A `read` tool on the `filesystem` server becomes `filesystem__read`, avoiding conflicts with other servers and built-in tools.
+Turn servers on/off from the MCP picker in the UI. Changes save back to your config.
 
-## Runtime Toggling
-
-Servers can be toggled on or off at runtime via the MCP picker in the UI. The state is saved back to your config file.
-
-## Server Status
+## Status
 
 | Status | Meaning |
 |--------|---------|
-| Connecting | Config looks good, waiting for the server to start |
-| Running | Up and running, tools are available |
-| Disabled | Disabled in config or toggled off at runtime |
-| Failed | Startup failed; the error is shown in the UI |
+| Connecting | Waiting for the server to come up |
+| Running | Tools available |
+| Disabled | Off in config or toggled off in UI |
+| Failed | Error shown in UI |
+| NeedsAuth | Waiting for OAuth (see below) |
 
-If one server fails, the rest still start normally.
+If one server fails, the rest still work.
 
-## Startup Flow
+## OAuth
 
-1. Load and merge global + project config
-2. Validate server names and settings
-3. Start all enabled servers in parallel
-4. Collect tool lists from each running server
-5. Namespace the tools and register them with the agent
-
-## Shutdown
-
-All transports shut down in parallel. For HTTP, Maki sends a DELETE request with the session ID to clean up.
-
-## OAuth for HTTP Servers
-
-Some MCP servers require authentication. Maki handles this automatically using OAuth.
-
-When a server needs auth, Maki opens your browser to log in. After you authenticate, the server connects and you're good to go. Other servers keep working while you authenticate.
-
-Tokens refresh automatically. If you change the server URL in your config, you'll need to log in again.
-
-### CLI Commands
+Some HTTP servers need auth. When that happens, Maki opens your browser to log in. Other servers keep working while you authenticate. Tokens refresh on their own. If you change the server URL, you log in again.
 
 ```bash
-# Manually trigger auth for a server
-maki mcp auth <server-name>
-
-# Log out (remove stored tokens)
-maki mcp logout <server-name>
+maki mcp auth <server-name>     # manually trigger auth
+maki mcp logout <server-name>   # remove stored tokens
 ```
 
-### Server Status
+## Prompts
 
-When OAuth is involved, you'll see one extra status:
+MCP servers can expose prompts (reusable message templates). Maki shows them as slash commands in the command palette: `/server:prompt-name`. Type `/` to filter.
 
-| Status | Meaning |
-|--------|---------|
-| NeedsAuth | Server requires authentication; check your browser |
+```
+/github:create-pr           # no arguments
+/analytics:report monthly   # one argument
+/review:code src tests      # multiple, positional
+```
+
+Skip a required argument and Maki shows a usage hint. Prompts are fetched at startup and on reconnect, so new ones need a restart. Only text content is supported.

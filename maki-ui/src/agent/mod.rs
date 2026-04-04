@@ -12,7 +12,7 @@ use arc_swap::ArcSwap;
 use maki_agent::mcp::config::McpServerInfo;
 use maki_agent::permissions::PermissionManager;
 use maki_agent::skill::Skill;
-use maki_agent::{AgentConfig, CancelToken, Envelope, ToolOutput};
+use maki_agent::{AgentConfig, CancelToken, Envelope, McpPromptInfo, ToolOutput};
 
 use self::cancel_map::CancelMap;
 use maki_providers::provider::Provider;
@@ -40,6 +40,7 @@ pub(crate) enum AgentCommand {
 pub(crate) struct McpState {
     pub(crate) disabled: Vec<String>,
     pub(crate) infos: Arc<ArcSwap<Vec<McpServerInfo>>>,
+    pub(crate) prompts: Arc<ArcSwap<Vec<McpPromptInfo>>>,
     pub(crate) pids: Arc<Mutex<Vec<u32>>>,
 }
 
@@ -151,6 +152,7 @@ pub(crate) fn spawn_agent(
         initial_history,
         Arc::clone(&shared_history),
         Arc::clone(&mcp_state.infos),
+        Arc::clone(&mcp_state.prompts),
         Arc::clone(&mcp_state.pids),
         mcp_state.disabled.clone(),
         Arc::clone(permissions),
