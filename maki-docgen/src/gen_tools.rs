@@ -16,6 +16,7 @@ const SECTIONS: &[(&str, &[&str])] = &[
             "glob",
             "grep",
             "index",
+            "find_symbol",
         ],
     ),
     (
@@ -201,6 +202,14 @@ pub fn generate() -> String {
             writeln!(out, "### `{name}`").unwrap();
             writeln!(out).unwrap();
             writeln!(out, "{summary}").unwrap();
+            if *name == "find_symbol" {
+                writeln!(out).unwrap();
+                writeln!(
+                    out,
+                    "> **Experimental.** Opt in with `experimental_find_symbol = true` in your config."
+                )
+                .unwrap();
+            }
             writeln!(out).unwrap();
             write_param_table(&mut out, &params);
         }

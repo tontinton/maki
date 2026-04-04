@@ -93,6 +93,20 @@ Return a compact skeleton of a source file: imports, type definitions, function 
 |-----------|------|----------|-------------|
 | `path` | string | yes | Absolute path to the file |
 
+### `find_symbol`
+
+Find all references to a symbol across a project. Scope-aware: locals search enclosing function, private items search the file.
+
+> **Experimental.** Opt in with `experimental_find_symbol = true` in your config.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `file` | string | yes |  | Absolute path to file containing the symbol |
+| `line` | integer | yes |  | Line number (1-indexed) |
+| `max_results` | integer | no | 50 | Max results |
+| `occurrence` | integer | no | 1 | Nth occurrence on line |
+| `symbol` | string | yes |  | Symbol name |
+
 ## Execution & Control
 
 ### `batch`
