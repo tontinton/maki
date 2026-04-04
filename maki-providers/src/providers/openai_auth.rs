@@ -245,17 +245,17 @@ pub(crate) fn refresh_tokens(tokens: &OAuthTokens) -> Result<OAuthTokens, AgentE
 }
 
 pub(crate) fn build_oauth_resolved(tokens: &OAuthTokens) -> ResolvedAuth {
+    let mut headers = vec![("authorization".into(), format!("Bearer {}", tokens.access))];
+    if let Some(account_id) = &tokens.account_id {
+        headers.push(("chatgpt-account-id".into(), account_id.clone()));
+    }
     ResolvedAuth {
         base_url: None,
-        headers: vec![("authorization".into(), format!("Bearer {}", tokens.access))],
+        headers,
     }
 }
 
-pub(crate) fn is_oauth(dir: &DataDir) -> bool {
-    load_tokens(dir, PROVIDER).is_some()
-}
-
-pub fn resolve(dir: &DataDir) -> Result<ResolvedAuth, AgentError> {
+pub fn resolve_oauth(dir: &DataDir) -> Result<ResolvedAuth, AgentError> {
     if let Some(tokens) = load_tokens(dir, PROVIDER) {
         if !tokens.is_expired() {
             debug!("using OpenAI OAuth authentication");
@@ -274,6 +274,12 @@ pub fn resolve(dir: &DataDir) -> Result<ResolvedAuth, AgentError> {
         }
     }
 
+    Err(AgentError::Config {
+        message: "not authenticated, run `maki auth login openai`".into(),
+    })
+}
+
+pub fn resolve_api(_: &DataDir) -> Result<ResolvedAuth, AgentError> {
     if let Ok(key) = env::var("OPENAI_API_KEY") {
         debug!("using OpenAI API key authentication");
         return Ok(ResolvedAuth {
@@ -283,7 +289,7 @@ pub fn resolve(dir: &DataDir) -> Result<ResolvedAuth, AgentError> {
     }
 
     Err(AgentError::Config {
-        message: "not authenticated, run `maki auth login openai` or set OPENAI_API_KEY".into(),
+        message: "set OPENAI_API_KEY environment variable".into(),
     })
 }
 
@@ -322,6 +328,7 @@ pub fn logout(dir: &DataDir) -> Result<(), AgentError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     #[test]
     fn extract_account_id_from_jwt() {
@@ -342,5 +349,20 @@ mod tests {
     fn extract_account_id_missing() {
         assert_eq!(extract_account_id("not.a.jwt"), None);
         assert_eq!(extract_account_id("invalid"), None);
+    }
+
+    #[test]
+    fn resolve_api_uses_env_var() {
+        unsafe {
+            env::set_var("OPENAI_API_KEY", "test-key");
+        }
+        let tmp = TempDir::new().unwrap();
+        let dir = DataDir::from_path(tmp.path().to_path_buf());
+        let resolved = resolve_api(&dir).unwrap();
+        assert_eq!(resolved.headers[0].0, "authorization");
+        assert_eq!(resolved.headers[0].1, "Bearer test-key");
+        unsafe {
+            env::remove_var("OPENAI_API_KEY");
+        }
     }
 }

@@ -31,7 +31,7 @@ Defaults: claude-haiku-4-5 (weak), claude-sonnet-4-6 (medium), claude-opus-4-6 (
 
 ### OpenAI
 
-- **Env var**: `OPENAI_API_KEY` (also supports OAuth device flow)
+- **Env var**: `OPENAI_API_KEY`
 - **API**: `https://api.openai.com/v1`
 
 | Tier | Models | Pricing (in/out per 1M tokens) | Context |
@@ -41,6 +41,20 @@ Defaults: claude-haiku-4-5 (weak), claude-sonnet-4-6 (medium), claude-opus-4-6 (
 | Strong | **gpt-5.4** (default), o3 | $2.50 / $15.00 | 1050K ctx / 128K out |
 
 Defaults: gpt-5.4-nano (weak), gpt-4.1 (medium), gpt-5.4 (strong)
+
+### OpenAI Coding Plan
+
+- **Auth**: OAuth device flow via `maki auth login openai`
+- **Transport**: `https://chatgpt.com/backend-api/codex/responses`
+- **Notes**: Uses ChatGPT subscription plans, not the OpenAI Platform API.
+
+| Tier | Models | Pricing (in/out per 1M tokens) | Context |
+|------|--------|-------------------------------|---------|
+| Weak | **gpt-5.4-mini** (default), gpt-5.1-codex-mini | $0.00 / $0.00 | 272K ctx / 128K out |
+| Medium | **gpt-5.2** (default) | $0.00 / $0.00 | 272K ctx / 128K out |
+| Strong | **gpt-5.4** (default), gpt-5.3-codex, gpt-5.2-codex, gpt-5.1-codex-max | $0.00 / $0.00 | 272K ctx / 128K out |
+
+Defaults: gpt-5.4-mini (weak), gpt-5.2 (medium), gpt-5.4 (strong)
 
 ### Z.AI
 
@@ -97,7 +111,7 @@ To add a custom provider or proxy, drop an executable script into `~/.maki/provi
 
 `resolve` is called each time a new agent spawns, so scripts should read tokens from disk instead of caching them in memory. That way auth changes from other processes get picked up.
 
-The `base` field specifies which built-in provider to inherit defaults from. Valid values: `anthropic`, `openai`, `zai`, `zai-coding-plan`, `synthetic`. For example, a proxy in front of Anthropic sets `base` to `anthropic`, so Claude model ids and defaults stay available while requests route through your auth and base URL.
+The `base` field specifies which built-in provider to inherit defaults from. Valid values: `anthropic`, `openai`, `openai-coding-plan`, `zai`, `zai-coding-plan`, `synthetic`. For example, a proxy in front of Anthropic sets `base` to `anthropic`, so Claude model ids and defaults stay available while requests route through your auth and base URL.
 
 If `models` is omitted, the dynamic provider inherits the base provider's model catalog.
 

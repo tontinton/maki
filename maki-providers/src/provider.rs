@@ -9,7 +9,7 @@ use tracing::{debug, warn};
 use crate::model::{Model, models_for_provider};
 use crate::providers::anthropic::Anthropic;
 use crate::providers::dynamic;
-use crate::providers::openai::OpenAi;
+use crate::providers::openai::{OpenAi, OpenAiCodingPlan};
 use crate::providers::synthetic::Synthetic;
 use crate::providers::zai::{Zai, ZaiPlan};
 use crate::{AgentError, Message, ProviderEvent, StreamResponse, ThinkingConfig};
@@ -20,6 +20,8 @@ pub enum ProviderKind {
     Anthropic,
     #[strum(serialize = "openai")]
     OpenAi,
+    #[strum(serialize = "openai-coding-plan")]
+    OpenAiCodingPlan,
     Zai,
     ZaiCodingPlan,
     Synthetic,
@@ -30,18 +32,20 @@ impl ProviderKind {
         match self {
             Self::Anthropic => "Anthropic",
             Self::OpenAi => "OpenAI",
+            Self::OpenAiCodingPlan => "OpenAI Coding Plan",
             Self::Zai => "Z.AI",
             Self::ZaiCodingPlan => "Z.AI Coding",
             Self::Synthetic => "Synthetic",
         }
     }
 
-    pub const fn api_key_env(self) -> &'static str {
+    pub const fn api_key_env(self) -> Option<&'static str> {
         match self {
-            Self::Anthropic => "ANTHROPIC_API_KEY",
-            Self::OpenAi => "OPENAI_API_KEY",
-            Self::Zai | Self::ZaiCodingPlan => "ZHIPU_API_KEY",
-            Self::Synthetic => "SYNTHETIC_API_KEY",
+            Self::Anthropic => Some("ANTHROPIC_API_KEY"),
+            Self::OpenAi => Some("OPENAI_API_KEY"),
+            Self::OpenAiCodingPlan => None,
+            Self::Zai | Self::ZaiCodingPlan => Some("ZHIPU_API_KEY"),
+            Self::Synthetic => Some("SYNTHETIC_API_KEY"),
         }
     }
 
@@ -49,6 +53,7 @@ impl ProviderKind {
         match self {
             Self::Anthropic => "https://api.anthropic.com/v1/messages",
             Self::OpenAi => "https://api.openai.com/v1",
+            Self::OpenAiCodingPlan => "https://chatgpt.com/backend-api/codex",
             Self::Zai => "https://api.z.ai/api/paas/v4",
             Self::ZaiCodingPlan => "https://api.z.ai/api/coding/paas/v4",
             Self::Synthetic => "https://api.synthetic.new/openai/v1",
@@ -75,6 +80,7 @@ impl ProviderKind {
         match self {
             Self::Anthropic => Ok(Box::new(Anthropic::new()?)),
             Self::OpenAi => Ok(Box::new(OpenAi::new()?)),
+            Self::OpenAiCodingPlan => Ok(Box::new(OpenAiCodingPlan::new()?)),
             Self::Zai => Ok(Box::new(Zai::new(ZaiPlan::Standard)?)),
             Self::ZaiCodingPlan => Ok(Box::new(Zai::new(ZaiPlan::Coding)?)),
             Self::Synthetic => Ok(Box::new(Synthetic::new()?)),

@@ -18,6 +18,7 @@ isahc = { workspace = true }
 base64 = { workspace = true }
 wait-timeout = { workspace = true }
 fastrand = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 test-case = { workspace = true }

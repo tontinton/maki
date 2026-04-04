@@ -98,7 +98,8 @@ fn lookup_entry<'a>(
 pub fn models_for_provider(provider: ProviderKind) -> &'static [ModelEntry] {
     match provider {
         ProviderKind::Anthropic => anthropic::models(),
-        ProviderKind::OpenAi => openai::models(),
+        ProviderKind::OpenAi => openai::api::models(),
+        ProviderKind::OpenAiCodingPlan => openai::plan::models(),
         ProviderKind::Zai | ProviderKind::ZaiCodingPlan => zai::models(),
         ProviderKind::Synthetic => synthetic::models(),
     }
@@ -242,6 +243,7 @@ mod tests {
     #[test_case("zai/glm-99", ModelError::UnknownModel("glm-99".into()) ; "unknown_zai_model")]
     #[test_case("openai/gpt-99", ModelError::UnknownModel("gpt-99".into()) ; "unknown_openai_model")]
     #[test_case("synthetic/hf:nonexistent", ModelError::UnknownModel("hf:nonexistent".into()) ; "unknown_synthetic_model")]
+    #[test_case("openai-coding-plan/gpt-99", ModelError::UnknownModel("gpt-99".into()) ; "unknown_openai_coding_plan_model")]
 
     fn from_spec_errors(spec: &str, expected: ModelError) {
         let err = Model::from_spec(spec).unwrap_err();

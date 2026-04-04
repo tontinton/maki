@@ -17,7 +17,7 @@ use crate::{AgentError, Message, ProviderEvent, StreamResponse, ThinkingConfig};
 
 use super::ResolvedAuth;
 use super::anthropic::Anthropic;
-use super::openai::OpenAi;
+use super::openai::{OpenAi, OpenAiCodingPlan};
 
 const INFO_TIMEOUT: Duration = Duration::from_secs(5);
 const SCRIPT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -338,6 +338,10 @@ pub fn create(slug: &str) -> Result<Box<dyn Provider>, AgentError> {
         ProviderKind::OpenAi => {
             Box::new(OpenAi::with_auth(auth.clone()).with_system_prefix(meta.system_prefix.clone()))
         }
+        ProviderKind::OpenAiCodingPlan => Box::new(
+            OpenAiCodingPlan::with_auth(auth.clone())?
+                .with_system_prefix(meta.system_prefix.clone()),
+        ),
         other => {
             return Err(AgentError::Config {
                 message: format!(
@@ -363,19 +367,7 @@ pub fn display_name(slug: &str) -> Option<&'static str> {
 pub fn dynamic_model_specs() -> Vec<String> {
     let mut specs = Vec::new();
     for meta in discover() {
-        if let Some(models) = &meta.models {
-            specs.extend(
-                models
-                    .iter()
-                    .map(|model| format!("{}/{}", meta.slug, model.id)),
-            );
-            continue;
-        }
-        for entry in models_for_provider(meta.base) {
-            for prefix in entry.prefixes {
-                specs.push(format!("{}/{prefix}", meta.slug));
-            }
-        }
+        specs.extend(model_specs_for_meta(meta));
     }
     specs
 }
@@ -395,11 +387,30 @@ pub fn resolves_model(slug: &str, model_id: &str) -> bool {
 
 pub fn fallback_model_entry(slug: &str) -> Option<&'static crate::model::ModelEntry> {
     let meta = find_meta(slug)?;
+    default_fallback_entry(meta.base)
+}
+
+fn model_specs_for_meta(meta: &DynamicProviderMeta) -> Vec<String> {
+    if let Some(models) = &meta.models {
+        return models
+            .iter()
+            .map(|model| format!("{}/{}", meta.slug, model.id))
+            .collect();
+    }
+
     models_for_provider(meta.base)
+        .iter()
+        .flat_map(|entry| entry.prefixes.iter())
+        .map(|prefix| format!("{}/{}", meta.slug, prefix))
+        .collect()
+}
+
+fn default_fallback_entry(base: ProviderKind) -> Option<&'static crate::model::ModelEntry> {
+    models_for_provider(base)
         .iter()
         .filter(|entry| entry.default)
         .max_by_key(|entry| entry.tier)
-        .or_else(|| models_for_provider(meta.base).first())
+        .or_else(|| models_for_provider(base).first())
 }
 
 #[derive(Clone)]

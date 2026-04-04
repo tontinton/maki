@@ -80,10 +80,28 @@ fn format_context(entry: &ModelEntry) -> String {
 
 struct ProviderSection {
     name: &'static str,
-    env_var: String,
-    urls: Vec<&'static str>,
+    auth: AuthDoc,
+    endpoint: EndpointDoc,
     features: Option<&'static str>,
+    notes: Option<Vec<&'static str>>,
     entries: &'static [ModelEntry],
+}
+
+enum AuthDoc {
+    ApiKey {
+        env_var: &'static str,
+        note: Option<&'static str>,
+    },
+    OAuthDevice {
+        command: &'static str,
+        note: Option<&'static str>,
+    },
+}
+
+enum EndpointDoc {
+    Api(&'static str),
+    ApiList(Vec<&'static str>),
+    Transport(String),
 }
 
 fn build_sections() -> Vec<ProviderSection> {
@@ -99,15 +117,16 @@ fn build_sections() -> Vec<ProviderSection> {
                 zai_done = true;
                 sections.push(ProviderSection {
                     name: "Z.AI",
-                    env_var: format!(
-                        "`{}` (shared across both endpoints)",
-                        ProviderKind::Zai.api_key_env()
-                    ),
-                    urls: vec![
+                    auth: AuthDoc::ApiKey {
+                        env_var: ProviderKind::Zai.api_key_env().unwrap(),
+                        note: Some("shared across both endpoints"),
+                    },
+                    endpoint: EndpointDoc::ApiList(vec![
                         ProviderKind::Zai.base_url(),
                         ProviderKind::ZaiCodingPlan.base_url(),
-                    ],
+                    ]),
                     features: ProviderKind::Zai.features(),
+                    notes: None,
                     entries: models_for_provider(ProviderKind::Zai),
                 });
             }
@@ -117,18 +136,41 @@ fn build_sections() -> Vec<ProviderSection> {
             ProviderKind::OpenAi => {
                 sections.push(ProviderSection {
                     name: kind.display_name(),
-                    env_var: format!("`{}` (also supports OAuth device flow)", kind.api_key_env()),
-                    urls: vec![kind.base_url()],
+                    auth: AuthDoc::ApiKey {
+                        env_var: kind.api_key_env().unwrap(),
+                        note: None,
+                    },
+                    endpoint: EndpointDoc::Api(kind.base_url()),
                     features: kind.features(),
+                    notes: None,
+                    entries: models_for_provider(kind),
+                });
+            }
+            ProviderKind::OpenAiCodingPlan => {
+                sections.push(ProviderSection {
+                    name: kind.display_name(),
+                    auth: AuthDoc::OAuthDevice {
+                        command: "maki auth login openai",
+                        note: None,
+                    },
+                    endpoint: EndpointDoc::Transport(format!("{}/responses", kind.base_url())),
+                    features: kind.features(),
+                    notes: Some(vec![
+                        "Uses ChatGPT subscription plans, not the OpenAI Platform API.",
+                    ]),
                     entries: models_for_provider(kind),
                 });
             }
             _ => {
                 sections.push(ProviderSection {
                     name: kind.display_name(),
-                    env_var: format!("`{}`", kind.api_key_env()),
-                    urls: vec![kind.base_url()],
+                    auth: AuthDoc::ApiKey {
+                        env_var: kind.api_key_env().unwrap(),
+                        note: None,
+                    },
+                    endpoint: EndpointDoc::Api(kind.base_url()),
                     features: kind.features(),
+                    notes: None,
                     entries: models_for_provider(kind),
                 });
             }
@@ -205,19 +247,48 @@ fn write_model_table(out: &mut String, entries: &[ModelEntry]) {
 
 fn write_section(out: &mut String, section: &ProviderSection) {
     let _ = writeln!(out, "### {}\n", section.name);
-    let _ = writeln!(out, "- **Env var**: {}", section.env_var);
+    match &section.auth {
+        AuthDoc::ApiKey { env_var, note } => {
+            if let Some(note) = note {
+                let _ = writeln!(out, "- **Env var**: `{env_var}` ({note})");
+            } else {
+                let _ = writeln!(out, "- **Env var**: `{env_var}`");
+            }
+        }
+        AuthDoc::OAuthDevice { command, note } => {
+            if let Some(note) = note {
+                let _ = writeln!(
+                    out,
+                    "- **Auth**: OAuth device flow via `{command}` ({note})"
+                );
+            } else {
+                let _ = writeln!(out, "- **Auth**: OAuth device flow via `{command}`");
+            }
+        }
+    }
 
-    if section.urls.len() == 1 {
-        let _ = writeln!(out, "- **API**: `{}`", section.urls[0]);
-    } else {
-        let _ = writeln!(out, "- **API endpoints**:");
-        for url in &section.urls {
-            let _ = writeln!(out, "  - `{url}`");
+    match &section.endpoint {
+        EndpointDoc::Api(url) => {
+            let _ = writeln!(out, "- **API**: `{url}`");
+        }
+        EndpointDoc::Transport(url) => {
+            let _ = writeln!(out, "- **Transport**: `{url}`");
+        }
+        EndpointDoc::ApiList(urls) => {
+            let _ = writeln!(out, "- **API endpoints**:");
+            for url in urls {
+                let _ = writeln!(out, "  - `{url}`");
+            }
         }
     }
 
     if let Some(features) = section.features {
         let _ = writeln!(out, "- **Features**: {features}");
+    }
+    if let Some(notes) = &section.notes {
+        for note in notes {
+            let _ = writeln!(out, "- **Notes**: {note}");
+        }
     }
 
     let _ = writeln!(out);

@@ -45,7 +45,7 @@ Export a key for at least one provider:
 | Z.AI | `ZHIPU_API_KEY` |
 | Synthetic | `SYNTHETIC_API_KEY` |
 
-OpenAI also supports OAuth via device flow. Run `maki auth login openai` and it will walk you through setting it up.
+OpenAI API key usage is billed through the OpenAI Platform account at normal API rates. For ChatGPT subscription access with plan credits and limits, run `maki auth login openai` and follow the device-flow login steps.
 
 ## Run
 

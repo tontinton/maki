@@ -378,6 +378,7 @@ fn resolve_model(
 
 const PROVIDER_PRIORITY: &[ProviderKind] = &[
     ProviderKind::Anthropic,
+    ProviderKind::OpenAiCodingPlan,
     ProviderKind::OpenAi,
     ProviderKind::Zai,
     ProviderKind::ZaiCodingPlan,
