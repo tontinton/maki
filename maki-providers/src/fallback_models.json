@@ -1,0 +1,981 @@
+{
+  "anthropic": {
+    "models": {
+      "claude-3-5-haiku-20241022": {
+        "id": "claude-3-5-haiku-20241022",
+        "family": "claude-haiku",
+        "reasoning": false,
+        "tool_call": true,
+        "cost": {
+          "input": 0.8,
+          "output": 4,
+          "cache_read": 0.08,
+          "cache_write": 1
+        },
+        "limit": {
+          "context": 200000,
+          "output": 8192
+        }
+      },
+      "claude-3-5-haiku-latest": {
+        "id": "claude-3-5-haiku-latest",
+        "family": "claude-haiku",
+        "reasoning": false,
+        "tool_call": true,
+        "cost": {
+          "input": 0.8,
+          "output": 4,
+          "cache_read": 0.08,
+          "cache_write": 1
+        },
+        "limit": {
+          "context": 200000,
+          "output": 8192
+        }
+      },
+      "claude-3-5-sonnet-20240620": {
+        "id": "claude-3-5-sonnet-20240620",
+        "family": "claude-sonnet",
+        "reasoning": false,
+        "tool_call": true,
+        "cost": {
+          "input": 3,
+          "output": 15,
+          "cache_read": 0.3,
+          "cache_write": 3.75
+        },
+        "limit": {
+          "context": 200000,
+          "output": 8192
+        }
+      },
+      "claude-3-5-sonnet-20241022": {
+        "id": "claude-3-5-sonnet-20241022",
+        "family": "claude-sonnet",
+        "reasoning": false,
+        "tool_call": true,
+        "cost": {
+          "input": 3,
+          "output": 15,
+          "cache_read": 0.3,
+          "cache_write": 3.75
+        },
+        "limit": {
+          "context": 200000,
+          "output": 8192
+        }
+      },
+      "claude-3-7-sonnet-20250219": {
+        "id": "claude-3-7-sonnet-20250219",
+        "family": "claude-sonnet",
+        "reasoning": true,
+        "tool_call": true,
+        "cost": {
+          "input": 3,
+          "output": 15,
+          "cache_read": 0.3,
+          "cache_write": 3.75
+        },
+        "limit": {
+          "context": 200000,
+          "output": 64000
+        }
+      },
+      "claude-3-haiku-20240307": {
+        "id": "claude-3-haiku-20240307",
+        "family": "claude-haiku",
+        "reasoning": false,
+        "tool_call": true,
+        "cost": {
+          "input": 0.25,
+          "output": 1.25,
+          "cache_read": 0.03,
+          "cache_write": 0.3
+        },
+        "limit": {
+          "context": 200000,
+          "output": 4096
+        }
+      },
+      "claude-3-opus-20240229": {
+        "id": "claude-3-opus-20240229",
+        "family": "claude-opus",
+        "reasoning": false,
+        "tool_call": true,
+        "cost": {
+          "input": 15,
+          "output": 75,
+          "cache_read": 1.5,
+          "cache_write": 18.75
+        },
+        "limit": {
+          "context": 200000,
+          "output": 4096
+        }
+      },
+      "claude-3-sonnet-20240229": {
+        "id": "claude-3-sonnet-20240229",
+        "family": "claude-sonnet",
+        "reasoning": false,
+        "tool_call": true,
+        "cost": {
+          "input": 3,
+          "output": 15,
+          "cache_read": 0.3,
+          "cache_write": 0.3
+        },
+        "limit": {
+          "context": 200000,
+          "output": 4096
+        }
+      },
+      "claude-haiku-4-5": {
+        "id": "claude-haiku-4-5",
+        "family": "claude-haiku",
+        "reasoning": true,
+        "tool_call": true,
+        "cost": {
+          "input": 1,
+          "output": 5,
+          "cache_read": 0.1,
+          "cache_write": 1.25
+        },
+        "limit": {
+          "context": 200000,
+          "output": 64000
+        }
+      },
+      "claude-haiku-4-5-20251001": {
+        "id": "claude-haiku-4-5-20251001",
+        "family": "claude-haiku",
+        "reasoning": true,
+        "tool_call": true,
+        "cost": {
+          "input": 1,
+          "output": 5,
+          "cache_read": 0.1,
+          "cache_write": 1.25
+        },
+        "limit": {
+          "context": 200000,
+          "output": 64000
+        }
+      },
+      "claude-opus-4-0": {
+        "id": "claude-opus-4-0",
+        "family": "claude-opus",
+        "reasoning": true,
+        "tool_call": true,
+        "cost": {
+          "input": 15,
+          "output": 75,
+          "cache_read": 1.5,
+          "cache_write": 18.75
+        },
+        "limit": {
+          "context": 200000,
+          "output": 32000
+        }
+      },
+      "claude-opus-4-1": {
+        "id": "claude-opus-4-1",
+        "family": "claude-opus",
+        "reasoning": true,
+        "tool_call": true,
+        "cost": {
+          "input": 15,
+          "output": 75,
+          "cache_read": 1.5,
+          "cache_write": 18.75
+        },
+        "limit": {
+          "context": 200000,
+          "output": 32000
+        }
+      },
+      "claude-opus-4-1-20250805": {
+        "id": "claude-opus-4-1-20250805",
+        "family": "claude-opus",
+        "reasoning": true,
+        "tool_call": true,
+        "cost": {
+          "input": 15,
+          "output": 75,
+          "cache_read": 1.5,
+          "cache_write": 18.75
+        },
+        "limit": {
+          "context": 200000,
+          "output": 32000
+        }
+      },
+      "claude-opus-4-20250514": {
+        "id": "claude-opus-4-20250514",
+        "family": "claude-opus",
+        "reasoning": true,
+        "tool_call": true,
+        "cost": {
+          "input": 15,
+          "output": 75,
+          "cache_read": 1.5,
+          "cache_write": 18.75
+        },
+        "limit": {
+          "context": 200000,
+          "output": 32000
+        }
+      },
+      "claude-opus-4-5": {
+        "id": "claude-opus-4-5",
+        "family": "claude-opus",
+        "reasoning": true,
+        "tool_call": true,
+        "cost": {
+          "input": 5,
+          "output": 25,
+          "cache_read": 0.5,
+          "cache_write": 6.25
+        },
+        "limit": {
+          "context": 200000,
+          "output": 64000
+        }
+      },
+      "claude-opus-4-5-20251101": {
+        "id": "claude-opus-4-5-20251101",
+        "family": "claude-opus",
+        "reasoning": true,
+        "tool_call": true,
+        "cost": {
+          "input": 5,
+          "output": 25,
+          "cache_read": 0.5,
+          "cache_write": 6.25
+        },
+        "limit": {
+          "context": 200000,
+          "output": 64000
+        }
+      },
+      "claude-opus-4-6": {
+        "id": "claude-opus-4-6",
+        "family": "claude-opus",
+        "reasoning": true,
+        "tool_call": true,
+        "cost": {
+          "input": 5,
+          "output": 25,
+          "cache_read": 0.5,
+          "cache_write": 6.25
+        },
+        "limit": {
+          "context": 1000000,
+          "output": 128000
+        }
+      },
+      "claude-sonnet-4-0": {
+        "id": "claude-sonnet-4-0",
+        "family": "claude-sonnet",
+        "reasoning": true,
+        "tool_call": true,
+        "cost": {
+          "input": 3,
+          "output": 15,
+          "cache_read": 0.3,
+          "cache_write": 3.75
+        },
+        "limit": {
+          "context": 200000,
+          "output": 64000
+        }
+      },
+      "claude-sonnet-4-20250514": {
+        "id": "claude-sonnet-4-20250514",
+        "family": "claude-sonnet",
+        "reasoning": true,
+        "tool_call": true,
+        "cost": {
+          "input": 3,
+          "output": 15,
+          "cache_read": 0.3,
+          "cache_write": 3.75
+        },
+        "limit": {
+          "context": 200000,
+          "output": 64000
+        }
+      },
+      "claude-sonnet-4-5": {
+        "id": "claude-sonnet-4-5",
+        "family": "claude-sonnet",
+        "reasoning": true,
+        "tool_call": true,
+        "cost": {
+          "input": 3,
+          "output": 15,
+          "cache_read": 0.3,
+          "cache_write": 3.75
+        },
+        "limit": {
+          "context": 200000,
+          "output": 64000
+        }
+      },
+      "claude-sonnet-4-5-20250929": {
+        "id": "claude-sonnet-4-5-20250929",
+        "family": "claude-sonnet",
+        "reasoning": true,
+        "tool_call": true,
+        "cost": {
+          "input": 3,
+          "output": 15,
+          "cache_read": 0.3,
+          "cache_write": 3.75
+        },
+        "limit": {
+          "context": 200000,
+          "output": 64000
+        }
+      },
+      "claude-sonnet-4-6": {
+        "id": "claude-sonnet-4-6",
+        "family": "claude-sonnet",
+        "reasoning": true,
+        "tool_call": true,
+        "cost": {
+          "input": 3,
+          "output": 15,
+          "cache_read": 0.3,
+          "cache_write": 3.75
+        },
+        "limit": {
+          "context": 1000000,
+          "output": 64000
+        }
+      }
+    }
+  },
+  "openai": {
+    "models": {
+      "codex-mini-latest": {
+        "id": "codex-mini-latest",
+        "family": "gpt-codex-mini",
+        "reasoning": true,
+        "tool_call": true,
+        "cost": {
+          "input": 1.5,
+          "output": 6,
+          "cache_read": 0.375
+        },
+        "limit": {
+          "context": 200000,
+          "output": 100000
+        }
+      },
+      "gpt-4": {
+        "id": "gpt-4",
+        "family": "gpt",
+        "reasoning": false,
+        "tool_call": true,
+        "cost": {
+          "input": 30,
+          "output": 60
+        },
+        "limit": {
+          "context": 8192,
+          "output": 8192
+        }
+      },
+      "gpt-4-turbo": {
+        "id": "gpt-4-turbo",
+        "family": "gpt",
+        "reasoning": false,
+        "tool_call": true,
+        "cost": {
+          "input": 10,
+          "output": 30
+        },
+        "limit": {
+          "context": 128000,
+          "output": 4096
+        }
+      },
+      "gpt-4.1": {
+        "id": "gpt-4.1",
+        "family": "gpt",
+        "reasoning": false,
+        "tool_call": true,
+        "cost": {
+          "input": 2,
+          "output": 8,
+          "cache_read": 0.5
+        },
+        "limit": {
+          "context": 1047576,
+          "output": 32768
+        }
+      },
+      "gpt-4.1-mini": {
+        "id": "gpt-4.1-mini",
+        "family": "gpt-mini",
+        "reasoning": false,
+        "tool_call": true,
+        "cost": {
+          "input": 0.4,
+          "output": 1.6,
+          "cache_read": 0.1
+        },
+        "limit": {
+          "context": 1047576,
+          "output": 32768
+        }
+      },
+      "gpt-4.1-nano": {
+        "id": "gpt-4.1-nano",
+        "family": "gpt-nano",
+        "reasoning": false,
+        "tool_call": true,
+        "cost": {
+          "input": 0.1,
+          "output": 0.4,
+          "cache_read": 0.03
+        },
+        "limit": {
+          "context": 1047576,
+          "output": 32768
+        }
+      },
+      "gpt-4o": {
+        "id": "gpt-4o",
+        "family": "gpt",
+        "reasoning": false,
+        "tool_call": true,
+        "cost": {
+          "input": 2.5,
+          "output": 10,
+          "cache_read": 1.25
+        },
+        "limit": {
+          "context": 128000,
+          "output": 16384
+        }
+      },
+      "gpt-4o-2024-05-13": {
+        "id": "gpt-4o-2024-05-13",
+        "family": "gpt",
+        "reasoning": false,
+        "tool_call": true,
+        "cost": {
+          "input": 5,
+          "output": 15
+        },
+        "limit": {
+          "context": 128000,
+          "output": 4096
+        }
+      },
+      "gpt-4o-2024-08-06": {
+        "id": "gpt-4o-2024-08-06",
+        "family": "gpt",
+        "reasoning": false,
+        "tool_call": true,
+        "cost": {
+          "input": 2.5,
+          "output": 10,
+          "cache_read": 1.25
+        },
+        "limit": {
+          "context": 128000,
+          "output": 16384
+        }
+      },
+      "gpt-4o-2024-11-20": {
+        "id": "gpt-4o-2024-11-20",
+        "family": "gpt",
+        "reasoning": false,
+        "tool_call": true,
+        "cost": {
+          "input": 2.5,
+          "output": 10,
+          "cache_read": 1.25
+        },
+        "limit": {
+          "context": 128000,
+          "output": 16384
+        }
+      },
+      "gpt-4o-mini": {
+        "id": "gpt-4o-mini",
+        "family": "gpt-mini",
+        "reasoning": false,
+        "tool_call": true,
+        "cost": {
+          "input": 0.15,
+          "output": 0.6,
+          "cache_read": 0.08
+        },
+        "limit": {
+          "context": 128000,
+          "output": 16384
+        }
+      },
+      "gpt-5": {
+        "id": "gpt-5",
+        "family": "gpt",
+        "reasoning": true,
+        "tool_call": true,
+        "cost": {
+          "input": 1.25,
+          "output": 10,
+          "cache_read": 0.125
+        },
+        "limit": {
+          "context": 400000,
+          "input": 272000,
+          "output": 128000
+        }
+      },
+      "gpt-5-codex": {
+        "id": "gpt-5-codex",
+        "family": "gpt-codex",
+        "reasoning": true,
+        "tool_call": true,
+        "cost": {
+          "input": 1.25,
+          "output": 10,
+          "cache_read": 0.125
+        },
+        "limit": {
+          "context": 400000,
+          "input": 272000,
+          "output": 128000
+        }
+      },
+      "gpt-5-mini": {
+        "id": "gpt-5-mini",
+        "family": "gpt-mini",
+        "reasoning": true,
+        "tool_call": true,
+        "cost": {
+          "input": 0.25,
+          "output": 2,
+          "cache_read": 0.025
+        },
+        "limit": {
+          "context": 400000,
+          "input": 272000,
+          "output": 128000
+        }
+      },
+      "gpt-5-nano": {
+        "id": "gpt-5-nano",
+        "family": "gpt-nano",
+        "reasoning": true,
+        "tool_call": true,
+        "cost": {
+          "input": 0.05,
+          "output": 0.4,
+          "cache_read": 0.005
+        },
+        "limit": {
+          "context": 400000,
+          "input": 272000,
+          "output": 128000
+        }
+      },
+      "gpt-5-pro": {
+        "id": "gpt-5-pro",
+        "family": "gpt-pro",
+        "reasoning": true,
+        "tool_call": true,
+        "cost": {
+          "input": 15,
+          "output": 120
+        },
+        "limit": {
+          "context": 400000,
+          "input": 272000,
+          "output": 272000
+        }
+      },
+      "gpt-5.1": {
+        "id": "gpt-5.1",
+        "family": "gpt",
+        "reasoning": true,
+        "tool_call": true,
+        "cost": {
+          "input": 1.25,
+          "output": 10,
+          "cache_read": 0.13
+        },
+        "limit": {
+          "context": 400000,
+          "input": 272000,
+          "output": 128000
+        }
+      },
+      "gpt-5.1-chat-latest": {
+        "id": "gpt-5.1-chat-latest",
+        "family": "gpt-codex",
+        "reasoning": true,
+        "tool_call": true,
+        "cost": {
+          "input": 1.25,
+          "output": 10,
+          "cache_read": 0.125
+        },
+        "limit": {
+          "context": 128000,
+          "output": 16384
+        }
+      },
+      "gpt-5.1-codex": {
+        "id": "gpt-5.1-codex",
+        "family": "gpt-codex",
+        "reasoning": true,
+        "tool_call": true,
+        "cost": {
+          "input": 1.25,
+          "output": 10,
+          "cache_read": 0.125
+        },
+        "limit": {
+          "context": 400000,
+          "input": 272000,
+          "output": 128000
+        }
+      },
+      "gpt-5.1-codex-max": {
+        "id": "gpt-5.1-codex-max",
+        "family": "gpt-codex",
+        "reasoning": true,
+        "tool_call": true,
+        "cost": {
+          "input": 1.25,
+          "output": 10,
+          "cache_read": 0.125
+        },
+        "limit": {
+          "context": 400000,
+          "input": 272000,
+          "output": 128000
+        }
+      },
+      "gpt-5.1-codex-mini": {
+        "id": "gpt-5.1-codex-mini",
+        "family": "gpt-codex",
+        "reasoning": true,
+        "tool_call": true,
+        "cost": {
+          "input": 0.25,
+          "output": 2,
+          "cache_read": 0.025
+        },
+        "limit": {
+          "context": 400000,
+          "input": 272000,
+          "output": 128000
+        }
+      },
+      "gpt-5.2": {
+        "id": "gpt-5.2",
+        "family": "gpt",
+        "reasoning": true,
+        "tool_call": true,
+        "cost": {
+          "input": 1.75,
+          "output": 14,
+          "cache_read": 0.175
+        },
+        "limit": {
+          "context": 400000,
+          "input": 272000,
+          "output": 128000
+        }
+      },
+      "gpt-5.2-chat-latest": {
+        "id": "gpt-5.2-chat-latest",
+        "family": "gpt-codex",
+        "reasoning": true,
+        "tool_call": true,
+        "cost": {
+          "input": 1.75,
+          "output": 14,
+          "cache_read": 0.175
+        },
+        "limit": {
+          "context": 128000,
+          "output": 16384
+        }
+      },
+      "gpt-5.2-codex": {
+        "id": "gpt-5.2-codex",
+        "family": "gpt-codex",
+        "reasoning": true,
+        "tool_call": true,
+        "cost": {
+          "input": 1.75,
+          "output": 14,
+          "cache_read": 0.175
+        },
+        "limit": {
+          "context": 400000,
+          "input": 272000,
+          "output": 128000
+        }
+      },
+      "gpt-5.2-pro": {
+        "id": "gpt-5.2-pro",
+        "family": "gpt-pro",
+        "reasoning": true,
+        "tool_call": true,
+        "cost": {
+          "input": 21,
+          "output": 168
+        },
+        "limit": {
+          "context": 400000,
+          "input": 272000,
+          "output": 128000
+        }
+      },
+      "gpt-5.3-chat-latest": {
+        "id": "gpt-5.3-chat-latest",
+        "family": "gpt",
+        "reasoning": false,
+        "tool_call": true,
+        "cost": {
+          "input": 1.75,
+          "output": 14,
+          "cache_read": 0.175
+        },
+        "limit": {
+          "context": 128000,
+          "output": 16384
+        }
+      },
+      "gpt-5.3-codex": {
+        "id": "gpt-5.3-codex",
+        "family": "gpt-codex",
+        "reasoning": true,
+        "tool_call": true,
+        "cost": {
+          "input": 1.75,
+          "output": 14,
+          "cache_read": 0.175
+        },
+        "limit": {
+          "context": 400000,
+          "input": 272000,
+          "output": 128000
+        }
+      },
+      "gpt-5.3-codex-spark": {
+        "id": "gpt-5.3-codex-spark",
+        "family": "gpt-codex-spark",
+        "reasoning": true,
+        "tool_call": true,
+        "cost": {
+          "input": 1.75,
+          "output": 14,
+          "cache_read": 0.175
+        },
+        "limit": {
+          "context": 128000,
+          "input": 100000,
+          "output": 32000
+        }
+      },
+      "gpt-5.4": {
+        "id": "gpt-5.4",
+        "family": "gpt",
+        "reasoning": true,
+        "tool_call": true,
+        "cost": {
+          "input": 2.5,
+          "output": 15,
+          "cache_read": 0.25,
+          "context_over_200k": {
+            "input": 5,
+            "output": 22.5,
+            "cache_read": 0.5
+          }
+        },
+        "limit": {
+          "context": 1050000,
+          "input": 922000,
+          "output": 128000
+        }
+      },
+      "gpt-5.4-mini": {
+        "id": "gpt-5.4-mini",
+        "family": "gpt-mini",
+        "reasoning": true,
+        "tool_call": true,
+        "cost": {
+          "input": 0.75,
+          "output": 4.5,
+          "cache_read": 0.075
+        },
+        "limit": {
+          "context": 400000,
+          "input": 272000,
+          "output": 128000
+        }
+      },
+      "gpt-5.4-nano": {
+        "id": "gpt-5.4-nano",
+        "family": "gpt-nano",
+        "reasoning": true,
+        "tool_call": true,
+        "cost": {
+          "input": 0.2,
+          "output": 1.25,
+          "cache_read": 0.02
+        },
+        "limit": {
+          "context": 400000,
+          "input": 272000,
+          "output": 128000
+        }
+      },
+      "gpt-5.4-pro": {
+        "id": "gpt-5.4-pro",
+        "family": "gpt-pro",
+        "reasoning": true,
+        "tool_call": true,
+        "cost": {
+          "input": 30,
+          "output": 180,
+          "context_over_200k": {
+            "input": 60,
+            "output": 270
+          }
+        },
+        "limit": {
+          "context": 1050000,
+          "input": 922000,
+          "output": 128000
+        }
+      },
+      "o1": {
+        "id": "o1",
+        "family": "o",
+        "reasoning": true,
+        "tool_call": true,
+        "cost": {
+          "input": 15,
+          "output": 60,
+          "cache_read": 7.5
+        },
+        "limit": {
+          "context": 200000,
+          "output": 100000
+        }
+      },
+      "o1-pro": {
+        "id": "o1-pro",
+        "family": "o-pro",
+        "reasoning": true,
+        "tool_call": true,
+        "cost": {
+          "input": 150,
+          "output": 600
+        },
+        "limit": {
+          "context": 200000,
+          "output": 100000
+        }
+      },
+      "o3": {
+        "id": "o3",
+        "family": "o",
+        "reasoning": true,
+        "tool_call": true,
+        "cost": {
+          "input": 2,
+          "output": 8,
+          "cache_read": 0.5
+        },
+        "limit": {
+          "context": 200000,
+          "output": 100000
+        }
+      },
+      "o3-deep-research": {
+        "id": "o3-deep-research",
+        "family": "o",
+        "reasoning": true,
+        "tool_call": true,
+        "cost": {
+          "input": 10,
+          "output": 40,
+          "cache_read": 2.5
+        },
+        "limit": {
+          "context": 200000,
+          "output": 100000
+        }
+      },
+      "o3-mini": {
+        "id": "o3-mini",
+        "family": "o-mini",
+        "reasoning": true,
+        "tool_call": true,
+        "cost": {
+          "input": 1.1,
+          "output": 4.4,
+          "cache_read": 0.55
+        },
+        "limit": {
+          "context": 200000,
+          "output": 100000
+        }
+      },
+      "o3-pro": {
+        "id": "o3-pro",
+        "family": "o-pro",
+        "reasoning": true,
+        "tool_call": true,
+        "cost": {
+          "input": 20,
+          "output": 80
+        },
+        "limit": {
+          "context": 200000,
+          "output": 100000
+        }
+      },
+      "o4-mini": {
+        "id": "o4-mini",
+        "family": "o-mini",
+        "reasoning": true,
+        "tool_call": true,
+        "cost": {
+          "input": 1.1,
+          "output": 4.4,
+          "cache_read": 0.28
+        },
+        "limit": {
+          "context": 200000,
+          "output": 100000
+        }
+      },
+      "o4-mini-deep-research": {
+        "id": "o4-mini-deep-research",
+        "family": "o-mini",
+        "reasoning": true,
+        "tool_call": true,
+        "cost": {
+          "input": 2,
+          "output": 8,
+          "cache_read": 0.5
+        },
+        "limit": {
+          "context": 200000,
+          "output": 100000
+        }
+      }
+    }
+  }
+}

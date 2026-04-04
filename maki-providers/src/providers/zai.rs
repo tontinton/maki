@@ -1,9 +1,10 @@
+use std::sync::Arc;
+
 use flume::Sender;
 use serde_json::Value;
 use tracing::warn;
 
-use crate::model::Model;
-use crate::model::{ModelEntry, ModelFamily, ModelPricing, ModelTier};
+use crate::model::{Model, ModelEntry, ModelPricing, ModelTier};
 use crate::provider::{BoxFuture, Provider};
 use crate::{AgentError, Message, ProviderEvent, StreamResponse, ThinkingConfig};
 
@@ -26,107 +27,98 @@ static CONFIG_CODING: OpenAiCompatConfig = OpenAiCompatConfig {
     provider_name: "Z.AI Coding",
 };
 
-pub(crate) fn models() -> &'static [ModelEntry] {
-    &[
-        ModelEntry {
-            prefixes: &["glm-5-code"],
-            tier: ModelTier::Strong,
-            family: ModelFamily::Glm,
-            default: true,
-            pricing: ModelPricing {
-                input: 1.20,
-                output: 5.00,
-                cache_write: 0.00,
-                cache_read: 0.30,
-            },
-            max_output_tokens: 131072,
-            context_window: 200_000,
+fn glm(
+    id: &str,
+    tier: ModelTier,
+    default: bool,
+    pricing: (f64, f64, f64),
+    limits: (u32, u32),
+) -> ModelEntry {
+    ModelEntry {
+        id: id.into(),
+        tier,
+        default,
+        pricing: ModelPricing {
+            input: pricing.0,
+            output: pricing.1,
+            cache_write: 0.00,
+            cache_read: pricing.2,
         },
-        ModelEntry {
-            prefixes: &["glm-5"],
-            tier: ModelTier::Strong,
-            family: ModelFamily::Glm,
-            default: false,
-            pricing: ModelPricing {
-                input: 1.00,
-                output: 3.20,
-                cache_write: 0.00,
-                cache_read: 0.20,
-            },
-            max_output_tokens: 131072,
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["glm-4.7-flash"],
-            tier: ModelTier::Weak,
-            family: ModelFamily::Glm,
-            default: true,
-            pricing: ModelPricing {
-                input: 0.00,
-                output: 0.00,
-                cache_write: 0.00,
-                cache_read: 0.00,
-            },
-            max_output_tokens: 131072,
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["glm-4.7", "glm-4.6"],
-            tier: ModelTier::Medium,
-            family: ModelFamily::Glm,
-            default: true,
-            pricing: ModelPricing {
-                input: 0.60,
-                output: 2.20,
-                cache_write: 0.00,
-                cache_read: 0.11,
-            },
-            max_output_tokens: 131072,
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["glm-4.5-flash"],
-            tier: ModelTier::Weak,
-            family: ModelFamily::Glm,
-            default: false,
-            pricing: ModelPricing {
-                input: 0.00,
-                output: 0.00,
-                cache_write: 0.00,
-                cache_read: 0.00,
-            },
-            max_output_tokens: 98304,
-            context_window: 131_072,
-        },
-        ModelEntry {
-            prefixes: &["glm-4.5-air"],
-            tier: ModelTier::Weak,
-            family: ModelFamily::Glm,
-            default: false,
-            pricing: ModelPricing {
-                input: 0.20,
-                output: 1.10,
-                cache_write: 0.00,
-                cache_read: 0.03,
-            },
-            max_output_tokens: 98304,
-            context_window: 131_072,
-        },
-        ModelEntry {
-            prefixes: &["glm-4.5"],
-            tier: ModelTier::Medium,
-            family: ModelFamily::Glm,
-            default: false,
-            pricing: ModelPricing {
-                input: 0.60,
-                output: 2.20,
-                cache_write: 0.00,
-                cache_read: 0.11,
-            },
-            max_output_tokens: 98304,
-            context_window: 131_072,
-        },
-    ]
+        max_output_tokens: limits.0,
+        context_window: limits.1,
+        supports_thinking: false,
+        supports_tool_examples: false,
+        uses_responses_api: false,
+    }
+}
+
+const GLM_LIMITS: (u32, u32) = (131072, 200_000);
+const GLM_LIMITS_LEGACY: (u32, u32) = (98304, 131_072);
+
+pub(crate) fn models() -> Arc<Vec<ModelEntry>> {
+    static BUILT: std::sync::OnceLock<Arc<Vec<ModelEntry>>> = std::sync::OnceLock::new();
+    BUILT
+        .get_or_init(|| {
+            Arc::new(vec![
+                glm(
+                    "glm-5-code",
+                    ModelTier::Strong,
+                    true,
+                    (1.20, 5.00, 0.30),
+                    GLM_LIMITS,
+                ),
+                glm(
+                    "glm-5",
+                    ModelTier::Strong,
+                    false,
+                    (1.00, 3.20, 0.20),
+                    GLM_LIMITS,
+                ),
+                glm(
+                    "glm-4.7-flash",
+                    ModelTier::Weak,
+                    true,
+                    (0.00, 0.00, 0.00),
+                    GLM_LIMITS,
+                ),
+                glm(
+                    "glm-4.7",
+                    ModelTier::Medium,
+                    true,
+                    (0.60, 2.20, 0.11),
+                    GLM_LIMITS,
+                ),
+                glm(
+                    "glm-4.6",
+                    ModelTier::Medium,
+                    false,
+                    (0.60, 2.20, 0.11),
+                    GLM_LIMITS,
+                ),
+                glm(
+                    "glm-4.5-flash",
+                    ModelTier::Weak,
+                    false,
+                    (0.00, 0.00, 0.00),
+                    GLM_LIMITS_LEGACY,
+                ),
+                glm(
+                    "glm-4.5-air",
+                    ModelTier::Weak,
+                    false,
+                    (0.20, 1.10, 0.03),
+                    GLM_LIMITS_LEGACY,
+                ),
+                glm(
+                    "glm-4.5",
+                    ModelTier::Medium,
+                    false,
+                    (0.60, 2.20, 0.11),
+                    GLM_LIMITS_LEGACY,
+                ),
+            ])
+        })
+        .clone()
 }
 
 #[derive(Debug, Clone, Copy)]

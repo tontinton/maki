@@ -2266,6 +2266,7 @@ dependencies = [
 name = "maki-providers"
 version = "0.1.8"
 dependencies = [
+ "arc-swap",
  "base64",
  "dirs",
  "fastrand",

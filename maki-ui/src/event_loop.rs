@@ -159,6 +159,7 @@ impl<'t> EventLoop<'t> {
 
         std::thread::spawn(crate::highlight::warmup);
         crate::update::spawn_check();
+        smol::spawn(maki_providers::refresh_registry()).detach();
 
         let bg = spawn_model_fetch();
         let storage_writer = Arc::new(StorageWriter::new(storage.clone()));

@@ -303,6 +303,7 @@ fn run() -> Result<()> {
                     .collect::<Result<Vec<_>>>()?;
             }
             config.validate()?;
+            maki_providers::registry::init();
             let model = resolve_model(cli.model.as_deref(), &config.provider, &storage)?;
             init_logging(&storage, &config.storage);
             install_panic_log_hook();

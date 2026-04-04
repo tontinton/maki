@@ -1013,7 +1013,7 @@ impl App {
                 vec![]
             }
             "/thinking" => {
-                if !self.state.model.provider.supports_thinking() {
+                if !self.state.model.supports_thinking {
                     self.flash("Thinking requires Anthropic provider".into());
                     return vec![];
                 }

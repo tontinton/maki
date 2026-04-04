@@ -21,13 +21,6 @@ static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
     provider_name: "OpenAI",
 };
 
-// NOTE: OpenAI also offers these models for subscription usage via the Coding Plan
-const PLAN_MODELS: &[&str] = &["gpt-5.4", "gpt-5.4-mini", "gpt-5.2"];
-
-fn is_codex_model(model_id: &str) -> bool {
-    model_id.contains("-codex") || PLAN_MODELS.contains(&model_id)
-}
-
 pub struct OpenAi {
     compat: OpenAiCompatProvider,
     auth: Arc<Mutex<ResolvedAuth>>,
@@ -147,7 +140,7 @@ impl Provider for OpenAi {
                 system
             };
 
-            if is_codex_model(&model.id) {
+            if model.uses_responses_api {
                 let body = super::responses::build_body(model, messages, system, tools);
                 return self
                     .with_oauth_retry(|| async {
@@ -176,11 +169,12 @@ impl Provider for OpenAi {
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<String>, AgentError>> {
         Box::pin(async {
             if self.is_oauth() {
-                let models = super::models()
+                let models =
+                    crate::model::models_for_provider(crate::provider::ProviderKind::OpenAi);
+                let models = models
                     .iter()
-                    .flat_map(|e| e.prefixes.iter())
-                    .filter(|id| is_codex_model(id))
-                    .map(|&s| s.to_string())
+                    .filter(|e| e.uses_responses_api)
+                    .map(|e| e.id.clone())
                     .collect();
                 return Ok(models);
             }

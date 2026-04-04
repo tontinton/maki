@@ -329,11 +329,13 @@ pub(crate) fn test_model() -> maki_providers::Model {
         provider: maki_providers::provider::ProviderKind::Anthropic,
         dynamic_slug: None,
         tier: maki_providers::ModelTier::Medium,
-        family: maki_providers::ModelFamily::Claude,
         supports_tool_examples_override: None,
         pricing: test_pricing(),
         max_output_tokens: 8192,
         context_window: TEST_CONTEXT_WINDOW,
+        supports_thinking: true,
+        supports_tool_examples: true,
+        uses_responses_api: false,
     }
 }
 

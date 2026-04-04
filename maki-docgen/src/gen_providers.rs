@@ -1,6 +1,8 @@
+use std::fmt::Write;
+use std::sync::Arc;
+
 use maki_providers::model::{ModelEntry, ModelTier, models_for_provider};
 use maki_providers::provider::ProviderKind;
-use std::fmt::Write;
 use strum::IntoEnumIterator;
 
 const FRONT_MATTER: &str = r#"+++
@@ -90,7 +92,7 @@ struct ProviderSection {
     env_var: String,
     urls: Vec<&'static str>,
     features: Option<&'static str>,
-    entries: &'static [ModelEntry],
+    entries: Arc<Vec<ModelEntry>>,
 }
 
 fn build_sections() -> Vec<ProviderSection> {
@@ -164,11 +166,10 @@ fn write_model_table(out: &mut String, entries: &[ModelEntry]) {
         let models: Vec<String> = tier_entries
             .iter()
             .map(|e| {
-                let names = e.prefixes.join(", ");
                 if e.default {
-                    format!("**{names}** (default)")
+                    format!("**{}** (default)", e.id)
                 } else {
-                    names
+                    e.id.clone()
                 }
             })
             .collect();
@@ -192,16 +193,15 @@ fn write_model_table(out: &mut String, entries: &[ModelEntry]) {
         );
     }
 
-    let defaults: Vec<String> = entries
+    let mut defaults: Vec<_> = entries.iter().filter(|e| e.default).collect();
+    defaults.sort_by_key(|e| match e.tier {
+        ModelTier::Strong => 0,
+        ModelTier::Medium => 1,
+        ModelTier::Weak => 2,
+    });
+    let defaults: Vec<String> = defaults
         .iter()
-        .filter(|e| e.default)
-        .map(|e| {
-            format!(
-                "{} ({})",
-                e.prefixes.first().unwrap_or(&"?"),
-                tier_label(e.tier).to_lowercase(),
-            )
-        })
+        .map(|e| format!("{} ({})", e.id, tier_label(e.tier).to_lowercase()))
         .collect();
 
     if !defaults.is_empty() {
@@ -228,7 +228,7 @@ fn write_section(out: &mut String, section: &ProviderSection) {
     }
 
     let _ = writeln!(out);
-    write_model_table(out, section.entries);
+    write_model_table(out, &section.entries);
 }
 
 pub fn generate() -> String {

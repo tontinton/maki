@@ -1,7 +1,9 @@
+use std::sync::Arc;
+
 use flume::Sender;
 use serde_json::{Value, json};
 
-use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier};
+use crate::model::{Model, ModelEntry, ModelPricing, ModelTier};
 use crate::provider::{BoxFuture, Provider};
 use crate::{AgentError, Message, ProviderEvent, StreamResponse, ThinkingConfig};
 
@@ -16,51 +18,62 @@ static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
     provider_name: "Synthetic",
 };
 
-pub(crate) fn models() -> &'static [ModelEntry] {
-    &[
-        ModelEntry {
-            prefixes: &["hf:moonshotai/Kimi-K2.5"],
-            tier: ModelTier::Strong,
-            family: ModelFamily::Synthetic,
-            default: true,
-            pricing: ModelPricing {
-                input: 0.45,
-                output: 3.40,
-                cache_write: 0.00,
-                cache_read: 0.00,
-            },
-            max_output_tokens: 131072,
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["hf:deepseek-ai/DeepSeek-V3.2"],
-            tier: ModelTier::Medium,
-            family: ModelFamily::Synthetic,
-            default: true,
-            pricing: ModelPricing {
-                input: 0.56,
-                output: 1.68,
-                cache_write: 0.00,
-                cache_read: 0.00,
-            },
-            max_output_tokens: 131072,
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["hf:zai-org/GLM-4.7-Flash"],
-            tier: ModelTier::Weak,
-            family: ModelFamily::Synthetic,
-            default: true,
-            pricing: ModelPricing {
-                input: 0.10,
-                output: 0.50,
-                cache_write: 0.00,
-                cache_read: 0.00,
-            },
-            max_output_tokens: 131072,
-            context_window: 200_000,
-        },
-    ]
+pub(crate) fn models() -> Arc<Vec<ModelEntry>> {
+    static BUILT: std::sync::OnceLock<Arc<Vec<ModelEntry>>> = std::sync::OnceLock::new();
+    BUILT
+        .get_or_init(|| {
+            Arc::new(vec![
+                ModelEntry {
+                    id: "hf:moonshotai/Kimi-K2.5".into(),
+                    tier: ModelTier::Strong,
+                    default: true,
+                    pricing: ModelPricing {
+                        input: 0.45,
+                        output: 3.40,
+                        cache_write: 0.00,
+                        cache_read: 0.00,
+                    },
+                    max_output_tokens: 131072,
+                    context_window: 200_000,
+                    supports_thinking: true,
+                    supports_tool_examples: true,
+                    uses_responses_api: false,
+                },
+                ModelEntry {
+                    id: "hf:deepseek-ai/DeepSeek-V3.2".into(),
+                    tier: ModelTier::Medium,
+                    default: true,
+                    pricing: ModelPricing {
+                        input: 0.56,
+                        output: 1.68,
+                        cache_write: 0.00,
+                        cache_read: 0.00,
+                    },
+                    max_output_tokens: 131072,
+                    context_window: 200_000,
+                    supports_thinking: true,
+                    supports_tool_examples: true,
+                    uses_responses_api: false,
+                },
+                ModelEntry {
+                    id: "hf:zai-org/GLM-4.7-Flash".into(),
+                    tier: ModelTier::Weak,
+                    default: true,
+                    pricing: ModelPricing {
+                        input: 0.10,
+                        output: 0.50,
+                        cache_write: 0.00,
+                        cache_read: 0.00,
+                    },
+                    max_output_tokens: 131072,
+                    context_window: 200_000,
+                    supports_thinking: true,
+                    supports_tool_examples: true,
+                    uses_responses_api: false,
+                },
+            ])
+        })
+        .clone()
 }
 
 pub struct Synthetic {

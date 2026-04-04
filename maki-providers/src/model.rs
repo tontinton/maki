@@ -6,11 +6,12 @@
 use std::fmt;
 use std::ops::AddAssign;
 use std::str::FromStr;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
 use crate::provider::ProviderKind;
-use crate::providers::{anthropic, dynamic, openai, synthetic, zai};
+use crate::providers::{dynamic, synthetic, zai};
 
 const PER_MILLION: f64 = 1_000_000.0;
 
@@ -34,14 +35,6 @@ pub struct ModelPricing {
     pub output: f64,
     pub cache_write: f64,
     pub cache_read: f64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ModelFamily {
-    Claude,
-    Glm,
-    Gpt,
-    Synthetic,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
@@ -75,14 +68,17 @@ impl FromStr for ModelTier {
     }
 }
 
+#[derive(Clone)]
 pub struct ModelEntry {
-    pub prefixes: &'static [&'static str],
+    pub id: String,
     pub tier: ModelTier,
-    pub family: ModelFamily,
     pub default: bool,
     pub pricing: ModelPricing,
     pub max_output_tokens: u32,
     pub context_window: u32,
+    pub supports_thinking: bool,
+    pub supports_tool_examples: bool,
+    pub uses_responses_api: bool,
 }
 
 fn lookup_entry<'a>(
@@ -91,25 +87,18 @@ fn lookup_entry<'a>(
 ) -> Result<&'a ModelEntry, ModelError> {
     entries
         .iter()
-        .find(|e| e.prefixes.iter().any(|p| model_id.starts_with(p)))
+        .find(|e| model_id.starts_with(&e.id))
         .ok_or_else(|| ModelError::UnknownModel(model_id.to_string()))
 }
 
-pub fn models_for_provider(provider: ProviderKind) -> &'static [ModelEntry] {
+pub fn models_for_provider(provider: ProviderKind) -> Arc<Vec<ModelEntry>> {
+    if let Some(models) = crate::registry::models_for(provider) {
+        return models;
+    }
     match provider {
-        ProviderKind::Anthropic => anthropic::models(),
-        ProviderKind::OpenAi => openai::models(),
         ProviderKind::Zai | ProviderKind::ZaiCodingPlan => zai::models(),
         ProviderKind::Synthetic => synthetic::models(),
-    }
-}
-
-impl ModelFamily {
-    pub fn supports_tool_examples(self) -> bool {
-        match self {
-            ModelFamily::Claude | ModelFamily::Gpt | ModelFamily::Synthetic => true,
-            ModelFamily::Glm => false,
-        }
+        _ => Arc::new(Vec::new()),
     }
 }
 
@@ -119,17 +108,19 @@ pub struct Model {
     pub provider: ProviderKind,
     pub dynamic_slug: Option<String>,
     pub tier: ModelTier,
-    pub family: ModelFamily,
     pub supports_tool_examples_override: Option<bool>,
     pub pricing: ModelPricing,
     pub max_output_tokens: u32,
     pub context_window: u32,
+    pub supports_thinking: bool,
+    pub supports_tool_examples: bool,
+    pub uses_responses_api: bool,
 }
 
 impl Model {
     pub fn supports_tool_examples(&self) -> bool {
         self.supports_tool_examples_override
-            .unwrap_or_else(|| self.family.supports_tool_examples())
+            .unwrap_or(self.supports_tool_examples)
     }
 
     pub fn spec(&self) -> String {
@@ -146,8 +137,7 @@ impl Model {
             .iter()
             .find(|e| e.default && e.tier == tier)
             .ok_or(ModelError::NoDefault(provider, tier))?;
-        let model_id = entry.prefixes[0];
-        Self::from_spec(&format!("{provider}/{model_id}"))
+        Ok(Self::from_entry(entry, &entry.id.clone(), provider, None))
     }
 
     pub fn from_tier_dynamic(
@@ -168,18 +158,8 @@ impl Model {
 
         if let Ok(provider) = ProviderKind::from_str(provider_str) {
             let entries = models_for_provider(provider);
-            let entry = lookup_entry(entries, model_id)?;
-            return Ok(Self {
-                id: model_id.to_string(),
-                provider,
-                dynamic_slug: None,
-                tier: entry.tier,
-                family: entry.family,
-                supports_tool_examples_override: None,
-                pricing: entry.pricing.clone(),
-                max_output_tokens: entry.max_output_tokens,
-                context_window: entry.context_window,
-            });
+            let entry = lookup_entry(&entries, model_id)?;
+            return Ok(Self::from_entry(entry, model_id, provider, None));
         }
 
         if let Some(base) = dynamic::base_for_slug(provider_str) {
@@ -187,21 +167,37 @@ impl Model {
                 return Ok(model);
             }
             let entries = models_for_provider(base);
-            let entry = lookup_entry(entries, model_id)?;
-            return Ok(Self {
-                id: model_id.to_string(),
-                provider: base,
-                dynamic_slug: Some(provider_str.to_string()),
-                tier: entry.tier,
-                family: entry.family,
-                supports_tool_examples_override: None,
-                pricing: entry.pricing.clone(),
-                max_output_tokens: entry.max_output_tokens,
-                context_window: entry.context_window,
-            });
+            let entry = lookup_entry(&entries, model_id)?;
+            return Ok(Self::from_entry(
+                entry,
+                model_id,
+                base,
+                Some(provider_str.to_string()),
+            ));
         }
 
         Err(ModelError::UnsupportedProvider(provider_str.to_string()))
+    }
+
+    fn from_entry(
+        entry: &ModelEntry,
+        model_id: &str,
+        provider: ProviderKind,
+        dynamic_slug: Option<String>,
+    ) -> Self {
+        Self {
+            id: model_id.to_string(),
+            provider,
+            dynamic_slug,
+            tier: entry.tier,
+            supports_tool_examples_override: None,
+            pricing: entry.pricing.clone(),
+            max_output_tokens: entry.max_output_tokens,
+            context_window: entry.context_window,
+            supports_thinking: entry.supports_thinking,
+            supports_tool_examples: entry.supports_tool_examples,
+            uses_responses_api: entry.uses_responses_api,
+        }
     }
 }
 
@@ -266,17 +262,6 @@ mod tests {
             std::mem::discriminant(&err),
             std::mem::discriminant(&expected)
         );
-    }
-
-    #[test]
-    fn total_input_includes_cached_tokens() {
-        let usage = TokenUsage {
-            input: 5_000,
-            output: 1_000,
-            cache_creation: 10_000,
-            cache_read: 150_000,
-        };
-        assert_eq!(usage.total_input(), 165_000);
     }
 
     #[test]

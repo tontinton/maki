@@ -2004,6 +2004,7 @@ fn thinking_explicit_args() {
 fn thinking_non_anthropic_flashes_error() {
     let mut app = test_app();
     app.state.model.provider = maki_providers::provider::ProviderKind::OpenAi;
+    app.state.model.supports_thinking = false;
 
     app.execute_command(cmd("/thinking"));
     assert_eq!(app.state.thinking, ThinkingConfig::Off);

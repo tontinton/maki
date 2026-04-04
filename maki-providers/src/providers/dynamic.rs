@@ -365,10 +365,8 @@ pub fn dynamic_model_specs() -> Vec<String> {
     let mut specs = Vec::new();
     for meta in discover() {
         if meta.models.is_empty() {
-            for entry in models_for_provider(meta.base) {
-                for prefix in entry.prefixes {
-                    specs.push(format!("{}/{prefix}", meta.slug));
-                }
+            for entry in models_for_provider(meta.base).iter() {
+                specs.push(format!("{}/{}", meta.slug, entry.id));
             }
         } else {
             for m in &meta.models {
@@ -386,32 +384,38 @@ pub fn base_for_slug(slug: &str) -> Option<ProviderKind> {
 pub fn lookup_model(slug: &str, model_id: &str) -> Option<Model> {
     let meta = find_meta(slug)?;
     let script_model = meta.models.iter().find(|m| model_id.starts_with(&m.id))?;
+    let (thinking, tool_examples) = crate::registry::provider_capabilities(meta.base);
     Some(Model {
         id: model_id.to_string(),
         provider: meta.base,
         dynamic_slug: Some(slug.to_string()),
         tier: script_model.tier,
-        family: meta.base.family(),
-        supports_tool_examples_override: script_model.supports_tool_examples,
         pricing: script_model.pricing.clone().unwrap_or_default(),
         max_output_tokens: script_model.max_output_tokens,
         context_window: script_model.context_window,
+        supports_thinking: thinking,
+        supports_tool_examples: tool_examples,
+        supports_tool_examples_override: script_model.supports_tool_examples,
+        uses_responses_api: false,
     })
 }
 
 pub fn find_model_for_tier(slug: &str, tier: ModelTier) -> Option<Model> {
     let meta = find_meta(slug)?;
     let script_model = meta.models.iter().find(|m| m.tier == tier)?;
+    let (thinking, tool_examples) = crate::registry::provider_capabilities(meta.base);
     Some(Model {
         id: script_model.id.clone(),
         provider: meta.base,
         dynamic_slug: Some(slug.to_string()),
         tier,
-        family: meta.base.family(),
         supports_tool_examples_override: script_model.supports_tool_examples,
         pricing: script_model.pricing.clone().unwrap_or_default(),
         max_output_tokens: script_model.max_output_tokens,
         context_window: script_model.context_window,
+        supports_thinking: thinking,
+        supports_tool_examples: tool_examples,
+        uses_responses_api: false,
     })
 }
 
