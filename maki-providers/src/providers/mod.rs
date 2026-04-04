@@ -20,6 +20,7 @@ pub(crate) const SSE_TIMEOUT: Duration = Duration::from_secs(120);
 const LOW_SPEED_BYTES_PER_SEC: u32 = 1;
 const LOW_SPEED_TIMEOUT: Duration = Duration::from_secs(30);
 
+#[derive(Debug, Clone)]
 pub struct ResolvedAuth {
     pub base_url: Option<String>,
     pub headers: Vec<(String, String)>,

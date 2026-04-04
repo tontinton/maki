@@ -7,6 +7,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::{debug, warn};
 
+use super::ResolvedAuth;
 use crate::{
     AgentError, ContentBlock, Message, ProviderEvent, Role, StopReason, StreamResponse, TokenUsage,
 };
@@ -113,6 +114,39 @@ impl OpenAiCompatProvider {
         }
     }
 
+    pub async fn do_stream_with_auth(
+        &self,
+        model: &crate::model::Model,
+        body: &Value,
+        event_tx: &Sender<ProviderEvent>,
+        auth: &ResolvedAuth,
+    ) -> Result<StreamResponse, AgentError> {
+        let json_body = serde_json::to_vec(body)?;
+        let request = request_builder(
+            "POST",
+            auth.base_url.as_deref().unwrap_or(self.config.base_url),
+            "/chat/completions",
+            Some(("content-type", "application/json")),
+            &auth.headers,
+        )?
+        .body(json_body)?;
+
+        debug!(
+            model = %model.id,
+            provider = self.config.provider_name,
+            "sending API request"
+        );
+
+        let response = self.client.send_async(request).await?;
+        let status = response.status().as_u16();
+
+        if status == 200 {
+            parse_sse(BufReader::new(response.into_body()), event_tx).await
+        } else {
+            Err(AgentError::from_response(response).await)
+        }
+    }
+
     pub async fn do_list_models(&self) -> Result<Vec<String>, AgentError> {
         self.do_list_models_with_header(&self.auth_header).await
     }
@@ -143,6 +177,55 @@ impl OpenAiCompatProvider {
         models.sort();
         Ok(models)
     }
+
+    pub async fn do_list_models_with_auth(
+        &self,
+        auth: &ResolvedAuth,
+    ) -> Result<Vec<String>, AgentError> {
+        let request = request_builder(
+            "GET",
+            auth.base_url.as_deref().unwrap_or(self.config.base_url),
+            "/models",
+            None,
+            &auth.headers,
+        )?
+        .body(())?;
+        let mut response = self.client.send_async(request).await?;
+        if response.status().as_u16() != 200 {
+            return Err(AgentError::from_response(response).await);
+        }
+
+        let body: Value = serde_json::from_str(&response.text().await?)?;
+        let mut models: Vec<String> = body["data"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|m| m["id"].as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        models.sort();
+        Ok(models)
+    }
+}
+
+fn request_builder(
+    method: &str,
+    base_url: &str,
+    path: &str,
+    extra_header: Option<(&str, &str)>,
+    headers: &[(String, String)],
+) -> Result<isahc::http::request::Builder, AgentError> {
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(format!("{base_url}{path}"));
+    if let Some((key, value)) = extra_header {
+        builder = builder.header(key, value);
+    }
+    for (key, value) in headers {
+        builder = builder.header(key.as_str(), value.as_str());
+    }
+    Ok(builder)
 }
 
 pub fn convert_messages(messages: &[Message], system: &str) -> Vec<Value> {
@@ -477,6 +560,31 @@ pub async fn parse_sse(
 mod tests {
     use super::*;
     use futures_lite::io::Cursor;
+
+    #[test]
+    fn request_builder_uses_override_base_url_and_headers() {
+        let request = request_builder(
+            "GET",
+            "https://chatgpt.com/backend-api/codex",
+            "/responses",
+            Some(("content-type", "application/json")),
+            &[
+                ("authorization".into(), "Bearer token".into()),
+                ("chatgpt-account-id".into(), "acc_123".into()),
+            ],
+        )
+        .unwrap()
+        .body(())
+        .unwrap();
+
+        assert_eq!(
+            request.uri().to_string(),
+            "https://chatgpt.com/backend-api/codex/responses"
+        );
+        assert_eq!(request.headers()["authorization"], "Bearer token");
+        assert_eq!(request.headers()["chatgpt-account-id"], "acc_123");
+        assert_eq!(request.headers()["content-type"], "application/json");
+    }
 
     #[test]
     fn parse_sse_text_and_usage() {

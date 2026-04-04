@@ -89,7 +89,7 @@ To add a custom provider or proxy, drop an executable script into `~/.maki/provi
 
 | Subcommand | Timeout | What it does |
 |------------|---------|--------|
-| `info` | 5s | Return JSON with `display_name`, `base` provider, `has_auth` |
+| `info` | 5s | Return JSON with `display_name`, `base` provider, optional `models`, and `has_auth` |
 | `resolve` | 30s | Return auth JSON (`base_url`, `headers`) |
 | `login` | interactive | OAuth or credential flow |
 | `logout` | interactive | Clear credentials |
@@ -97,7 +97,9 @@ To add a custom provider or proxy, drop an executable script into `~/.maki/provi
 
 `resolve` is called each time a new agent spawns, so scripts should read tokens from disk instead of caching them in memory. That way auth changes from other processes get picked up.
 
-The `base` field specifies which built-in provider to inherit the model catalog from. Valid values: `anthropic`, `openai`, `zai`, `zai-coding-plan`, `synthetic`. For example, a proxy in front of Anthropic sets `base` to `anthropic` and all Claude models are available, routed through your auth.
+The `base` field specifies which built-in provider to inherit defaults from. Valid values: `anthropic`, `openai`, `zai`, `zai-coding-plan`, `synthetic`. For example, a proxy in front of Anthropic sets `base` to `anthropic`, so Claude model ids and defaults stay available while requests route through your auth and base URL.
+
+If `models` is omitted, the dynamic provider inherits the base provider's model catalog.
 
 Dynamic provider models are namespaced as `{slug}/{model_id}` (e.g. `myproxy/claude-sonnet-4-6`).
 

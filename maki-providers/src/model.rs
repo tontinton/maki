@@ -44,7 +44,8 @@ pub enum ModelFamily {
     Synthetic,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ModelTier {
     Weak,
     Medium,
@@ -162,15 +163,22 @@ impl Model {
         }
 
         if let Some(base) = dynamic::base_for_slug(provider_str) {
-            let entries = models_for_provider(base);
-            let entry = lookup_entry(entries, model_id)?;
+            if !dynamic::resolves_model(provider_str, model_id) {
+                return Err(ModelError::UnknownModel(model_id.to_string()));
+            }
+            let entry = dynamic::dynamic_model_metadata(provider_str, model_id)
+                .or_else(|| {
+                    dynamic::fallback_model_entry(provider_str)
+                        .map(dynamic::DynamicModelMetadata::from_entry)
+                })
+                .ok_or_else(|| ModelError::UnknownModel(model_id.to_string()))?;
             return Ok(Self {
                 id: model_id.to_string(),
                 provider: base,
                 dynamic_slug: Some(provider_str.to_string()),
                 tier: entry.tier,
                 family: entry.family,
-                pricing: entry.pricing.clone(),
+                pricing: entry.pricing,
                 max_output_tokens: entry.max_output_tokens,
                 context_window: entry.context_window,
             });

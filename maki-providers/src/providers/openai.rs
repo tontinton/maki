@@ -138,15 +138,6 @@ pub(crate) fn models() -> &'static [ModelEntry] {
     ]
 }
 
-fn auth_header(resolved: &ResolvedAuth) -> &str {
-    resolved
-        .headers
-        .iter()
-        .find(|(k, _)| k == "authorization")
-        .map(|(_, v)| v.as_str())
-        .unwrap_or_default()
-}
-
 pub struct OpenAi {
     compat: OpenAiCompatProvider,
     auth: Arc<Mutex<ResolvedAuth>>,
@@ -181,8 +172,8 @@ impl OpenAi {
         self
     }
 
-    fn current_auth_header(&self) -> String {
-        auth_header(&self.auth.lock().unwrap()).to_owned()
+    fn current_auth(&self) -> ResolvedAuth {
+        self.auth.lock().unwrap().clone()
     }
 
     fn is_oauth(&self) -> bool {
@@ -253,9 +244,9 @@ impl Provider for OpenAi {
             };
             let body = self.compat.build_body(model, messages, system, tools);
             self.with_oauth_retry(|| async {
-                let header = self.current_auth_header();
+                let auth = self.current_auth();
                 self.compat
-                    .do_stream_with_header(model, &body, event_tx, &header)
+                    .do_stream_with_auth(model, &body, event_tx, &auth)
                     .await
             })
             .await
@@ -265,8 +256,8 @@ impl Provider for OpenAi {
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<String>, AgentError>> {
         Box::pin(async {
             self.with_oauth_retry(|| async {
-                let header = self.current_auth_header();
-                self.compat.do_list_models_with_header(&header).await
+                let auth = self.current_auth();
+                self.compat.do_list_models_with_auth(&auth).await
             })
             .await
         })

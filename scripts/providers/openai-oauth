@@ -105,6 +105,7 @@ def cmd_info():
     print(json.dumps({
         "display_name": "OpenAI OAuth",
         "base": "openai",
+        "models": ["gpt-5.4", "gpt-5.4-mini", "gpt-4.1"],
         "has_auth": True,
     }))
 

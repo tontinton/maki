@@ -11,7 +11,7 @@ use serde_json::Value;
 use strum::IntoEnumIterator;
 use tracing::{debug, warn};
 
-use crate::model::{Model, models_for_provider};
+use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier, models_for_provider};
 use crate::provider::{BoxFuture, Provider, ProviderKind};
 use crate::{AgentError, Message, ProviderEvent, StreamResponse, ThinkingConfig};
 
@@ -27,9 +27,16 @@ struct DynamicProviderMeta {
     slug: String,
     display_name: String,
     base: ProviderKind,
+    models: Option<Vec<DynamicModelInfo>>,
     system_prefix: Option<String>,
     has_auth: bool,
     script_path: PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DynamicModelInfo {
+    id: String,
+    tier: Option<ModelTier>,
 }
 
 #[derive(Deserialize)]
@@ -37,8 +44,30 @@ struct ScriptInfo {
     display_name: String,
     base: String,
     #[serde(default)]
+    models: Vec<ScriptModel>,
+    #[serde(default)]
     system_prefix: Option<String>,
     has_auth: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ScriptModel {
+    Id(String),
+    Detailed {
+        id: String,
+        #[serde(default)]
+        tier: Option<ModelTier>,
+    },
+}
+
+impl ScriptModel {
+    fn into_info(self) -> DynamicModelInfo {
+        match self {
+            Self::Id(id) => DynamicModelInfo { id, tier: None },
+            Self::Detailed { id, tier } => DynamicModelInfo { id, tier },
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -238,6 +267,12 @@ fn discover_in(dir: &Path) -> Vec<DynamicProviderMeta> {
             slug,
             display_name: info.display_name,
             base,
+            models: (!info.models.is_empty()).then(|| {
+                info.models
+                    .into_iter()
+                    .map(ScriptModel::into_info)
+                    .collect()
+            }),
             system_prefix: info.system_prefix.filter(|s| !s.is_empty()),
             has_auth: info.has_auth,
             script_path: path,
@@ -317,6 +352,7 @@ pub fn create(slug: &str) -> Result<Box<dyn Provider>, AgentError> {
         script_path: &meta.script_path,
         inner,
         auth,
+        models: meta.models.clone(),
     }))
 }
 
@@ -327,6 +363,14 @@ pub fn display_name(slug: &str) -> Option<&'static str> {
 pub fn dynamic_model_specs() -> Vec<String> {
     let mut specs = Vec::new();
     for meta in discover() {
+        if let Some(models) = &meta.models {
+            specs.extend(
+                models
+                    .iter()
+                    .map(|model| format!("{}/{}", meta.slug, model.id)),
+            );
+            continue;
+        }
         for entry in models_for_provider(meta.base) {
             for prefix in entry.prefixes {
                 specs.push(format!("{}/{prefix}", meta.slug));
@@ -340,10 +384,83 @@ pub fn base_for_slug(slug: &str) -> Option<ProviderKind> {
     find_meta(slug).map(|m| m.base)
 }
 
+pub fn resolves_model(slug: &str, model_id: &str) -> bool {
+    let Some(meta) = find_meta(slug) else {
+        return false;
+    };
+    meta.models
+        .as_ref()
+        .is_none_or(|models| models.iter().any(|model| model.id == model_id))
+}
+
+pub fn fallback_model_entry(slug: &str) -> Option<&'static crate::model::ModelEntry> {
+    let meta = find_meta(slug)?;
+    models_for_provider(meta.base)
+        .iter()
+        .filter(|entry| entry.default)
+        .max_by_key(|entry| entry.tier)
+        .or_else(|| models_for_provider(meta.base).first())
+}
+
+#[derive(Clone)]
+pub struct DynamicModelMetadata {
+    pub tier: ModelTier,
+    pub family: ModelFamily,
+    pub pricing: ModelPricing,
+    pub max_output_tokens: u32,
+    pub context_window: u32,
+}
+
+impl DynamicModelMetadata {
+    pub fn from_entry(entry: &ModelEntry) -> Self {
+        Self {
+            tier: entry.tier,
+            family: entry.family,
+            pricing: entry.pricing.clone(),
+            max_output_tokens: entry.max_output_tokens,
+            context_window: entry.context_window,
+        }
+    }
+}
+
+pub fn dynamic_model_metadata(slug: &str, model_id: &str) -> Option<DynamicModelMetadata> {
+    let meta = find_meta(slug)?;
+    models_for_provider(meta.base)
+        .iter()
+        .find(|entry| entry.prefixes.contains(&model_id))
+        .map(DynamicModelMetadata::from_entry)
+        .or_else(|| synthesize_model_metadata(meta, model_id))
+}
+
+fn synthesize_model_metadata(
+    meta: &DynamicProviderMeta,
+    model_id: &str,
+) -> Option<DynamicModelMetadata> {
+    let fallback = models_for_provider(meta.base)
+        .iter()
+        .filter(|entry| entry.default)
+        .max_by_key(|entry| entry.tier)
+        .or_else(|| models_for_provider(meta.base).first())?;
+    let tier = meta
+        .models
+        .as_ref()
+        .and_then(|models| models.iter().find(|model| model.id == model_id))
+        .and_then(|model| model.tier)
+        .unwrap_or(fallback.tier);
+    Some(DynamicModelMetadata {
+        tier,
+        family: fallback.family,
+        pricing: fallback.pricing.clone(),
+        max_output_tokens: fallback.max_output_tokens,
+        context_window: fallback.context_window,
+    })
+}
+
 struct DynamicProvider {
     script_path: &'static Path,
     inner: Box<dyn Provider>,
     auth: Arc<Mutex<ResolvedAuth>>,
+    models: Option<Vec<DynamicModelInfo>>,
 }
 
 impl DynamicProvider {
@@ -383,7 +500,12 @@ impl Provider for DynamicProvider {
     }
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<String>, AgentError>> {
-        self.inner.list_models()
+        Box::pin(async {
+            if let Some(models) = &self.models {
+                return Ok(models.iter().map(|model| model.id.clone()).collect());
+            }
+            self.inner.list_models().await
+        })
     }
 
     fn refresh_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
@@ -442,12 +564,61 @@ mod tests {
         let info: ScriptInfo = serde_json::from_str(minimal).unwrap();
         assert_eq!(info.display_name, "Test");
         assert_eq!(info.base, "anthropic");
+        assert!(info.models.is_empty());
         assert!(info.has_auth);
         assert!(info.system_prefix.is_none());
 
-        let with_prefix = r#"{"display_name": "T", "base": "openai", "has_auth": false, "system_prefix": "You are X."}"#;
+        let with_prefix = r#"{"display_name": "T", "base": "openai", "models": [{"id": "gpt-5-codex", "tier": "weak"}], "has_auth": false, "system_prefix": "You are X."}"#;
         let info: ScriptInfo = serde_json::from_str(with_prefix).unwrap();
+        assert_eq!(info.models.len(), 1);
+        assert_eq!(
+            info.models.into_iter().next().unwrap().into_info(),
+            DynamicModelInfo {
+                id: "gpt-5-codex".into(),
+                tier: Some(ModelTier::Weak),
+            }
+        );
         assert_eq!(info.system_prefix.as_deref(), Some("You are X."));
+    }
+
+    #[test]
+    fn synthesize_model_metadata_uses_explicit_script_tier() {
+        let meta = DynamicProviderMeta {
+            slug: "proxy".into(),
+            display_name: "Proxy".into(),
+            base: ProviderKind::OpenAi,
+            models: Some(vec![DynamicModelInfo {
+                id: "gpt-5-codex-latest".into(),
+                tier: Some(ModelTier::Weak),
+            }]),
+            system_prefix: None,
+            has_auth: false,
+            script_path: PathBuf::from("/tmp/proxy"),
+        };
+
+        let entry = synthesize_model_metadata(&meta, "gpt-5-codex-latest").unwrap();
+        assert_eq!(entry.tier, ModelTier::Weak);
+        assert_eq!(entry.family, ModelFamily::Gpt);
+    }
+
+    #[test]
+    fn synthesize_model_metadata_falls_back_to_default_tier() {
+        let meta = DynamicProviderMeta {
+            slug: "proxy".into(),
+            display_name: "Proxy".into(),
+            base: ProviderKind::Anthropic,
+            models: Some(vec![DynamicModelInfo {
+                id: "claude-haiku-custom".into(),
+                tier: None,
+            }]),
+            system_prefix: None,
+            has_auth: false,
+            script_path: PathBuf::from("/tmp/proxy"),
+        };
+
+        let entry = synthesize_model_metadata(&meta, "claude-haiku-custom").unwrap();
+        assert_eq!(entry.tier, ModelTier::Strong);
+        assert_eq!(entry.family, ModelFamily::Claude);
     }
 
     #[cfg(unix)]
