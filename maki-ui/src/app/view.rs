@@ -162,6 +162,15 @@ impl App {
             overlay_rect = self.task_picker.view(frame, full);
         }
 
+        if self.file_picker.is_open() {
+            self.file_picker.tick();
+            overlay_rect = self.file_picker.view(frame, full);
+        }
+
+        if let Some(flash) = self.file_picker.take_flash() {
+            self.status_bar.flash(flash);
+        }
+
         if self.session_picker.is_open() {
             self.session_picker.tick();
             overlay_rect = self.session_picker.view(frame, full);
@@ -319,6 +328,8 @@ impl App {
             contexts.push(KeybindContext::CommandPalette);
         } else if self.search_modal.is_open() {
             contexts.push(KeybindContext::Search);
+        } else if self.file_picker.is_open() {
+            contexts.push(KeybindContext::FilePicker);
         } else {
             if self.status == Status::Streaming {
                 contexts.push(KeybindContext::Streaming);

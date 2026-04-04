@@ -116,6 +116,7 @@ event-listener = "5"
 futures-lite = "2"
 isahc = { version = "1.7", default-features = false, features = ["text-decoding", "static-curl", "static-ssl"] }
 libc = "0.2"
+nucleo = "0.5"
 nucleo-matcher = "0.3"
 open = "5"
 criterion = { version = "0.5", features = ["html_reports"] }

@@ -29,7 +29,9 @@ getrandom = { workspace = true }
 futures-lite = { workspace = true }
 image = { workspace = true }
 base64 = { workspace = true }
+nucleo = { workspace = true }
 nucleo-matcher = { workspace = true }
+ignore = { workspace = true }
 async-process = { workspace = true }
 libc = { workspace = true }
 dirs = { workspace = true }
