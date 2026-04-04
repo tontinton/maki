@@ -42,6 +42,12 @@ main() {
 
     chmod +x "${INSTALL_DIR}/${BINARY}"
     echo "${BINARY} ${tag} installed to ${INSTALL_DIR}/${BINARY}"
+
+    cache_dir="${XDG_DATA_HOME:-${HOME}/.maki}"
+    mkdir -p "${cache_dir}" 2>/dev/null || true
+    body=$(curl -fsSL "https://models.dev/api.json" 2>/dev/null) && \
+        printf '{"etag":null,"data":%s}' "${body}" > "${cache_dir}/models-cache.json" && \
+        echo "model registry cached" || true
 }
 
 need_cmd() {
