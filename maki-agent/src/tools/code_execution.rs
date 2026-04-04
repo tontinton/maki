@@ -147,8 +147,8 @@ impl super::ToolDefaults for CodeExecution {
         Some(super::timeout_annotation(self.timeout.unwrap_or(30)))
     }
 
-    fn augment_description(description: &mut String, _ctx: &super::DescriptionContext) {
-        description.push_str(&super::build_interpreter_tools_description());
+    fn augment_description(description: &mut String, ctx: &super::DescriptionContext) {
+        description.push_str(&super::build_interpreter_tools_description(ctx.filter));
     }
 
     fn permission(&self) -> Option<String> {
@@ -167,6 +167,9 @@ fn build_tool_fns(
     let mut tools: HashMap<String, ToolFn> = HashMap::new();
 
     for &tool_name in INTERPRETER_TOOLS {
+        if !super::is_tool_enabled(&config, tool_name) {
+            continue;
+        }
         let name = tool_name.to_string();
         let tx = event_tx.clone();
         let mode = mode.clone();

@@ -14,7 +14,9 @@ use maki_providers::{ContentBlock, Model, ModelError, Role};
 use maki_tool_macro::Tool;
 use tracing::info;
 
-use super::{GENERAL_SUBAGENT_TOOLS, RESEARCH_SUBAGENT_TOOLS, ToolContext, ToolFilter};
+use super::{
+    DescriptionContext, GENERAL_SUBAGENT_TOOLS, RESEARCH_SUBAGENT_TOOLS, ToolContext, ToolFilter,
+};
 use crate::agent;
 use crate::template;
 use crate::tools::ToolCall;
@@ -84,13 +86,18 @@ impl Task {
         let (instructions, _) =
             smol::unblock(move || agent::load_instruction_files(&cwd_owned)).await;
         system.push_str(&instructions);
-        let filter = ToolFilter::Only(tool_names.to_vec());
-        let mut tools = ToolCall::definitions_with_filter(
-            &vars,
-            &[],
-            &filter,
-            model.family.supports_tool_examples(),
-        );
+        let tool_names: Vec<&str> = tool_names
+            .iter()
+            .copied()
+            .filter(|&name| super::is_tool_enabled(&ctx.config, name))
+            .collect();
+        let filter = ToolFilter::Only(tool_names);
+        let ctx_desc = DescriptionContext {
+            skills: &[],
+            filter: &filter,
+        };
+        let mut tools =
+            ToolCall::definitions(&vars, &ctx_desc, model.family.supports_tool_examples());
         if let Some(ref mcp) = ctx.mcp {
             mcp.extend_tools(&mut tools, &[]);
         }
@@ -205,7 +212,11 @@ mod tests {
     fn subagent_tools_all_registered(tools: &'static [&'static str]) {
         let vars = template::Vars::new();
         let filter = ToolFilter::Only(tools.to_vec());
-        let filtered = ToolCall::definitions_with_filter(&vars, &[], &filter, true);
+        let ctx = DescriptionContext {
+            skills: &[],
+            filter: &filter,
+        };
+        let filtered = ToolCall::definitions(&vars, &ctx, true);
         assert_eq!(filtered.as_array().unwrap().len(), tools.len());
     }
 }

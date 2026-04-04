@@ -1,5 +1,5 @@
 use maki_agent::template::Vars;
-use maki_agent::tools::ToolCall;
+use maki_agent::tools::{DescriptionContext, ToolCall, ToolFilter};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -145,7 +145,14 @@ pub fn generate() -> String {
         .set("{cwd}", "<cwd>")
         .set("{platform}", "linux")
         .set("{date}", "YYYY-MM-DD");
-    let defs = ToolCall::definitions(&vars, &[], false);
+    let defs = ToolCall::definitions(
+        &vars,
+        &DescriptionContext {
+            skills: &[],
+            filter: &ToolFilter::All,
+        },
+        false,
+    );
     let tools: Vec<&Value> = defs
         .as_array()
         .expect("definitions should be an array")

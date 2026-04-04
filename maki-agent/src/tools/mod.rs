@@ -54,6 +54,7 @@ use maki_providers::provider::Provider;
 
 pub struct DescriptionContext<'a> {
     pub skills: &'a [Skill],
+    pub filter: &'a ToolFilter,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -65,13 +66,62 @@ pub enum ToolFilter {
 }
 
 impl ToolFilter {
-    fn matches(&self, name: &str) -> bool {
+    pub fn matches(&self, name: &str) -> bool {
         match self {
             Self::All => true,
             Self::Only(allowed) => allowed.contains(&name),
             Self::AllExcept(blocked) => !blocked.contains(&name),
         }
     }
+
+    pub fn excluding(self, names: &[&'static str]) -> Self {
+        if names.is_empty() {
+            return self;
+        }
+        match self {
+            Self::All => Self::AllExcept(names.to_vec()),
+            Self::Only(allowed) => {
+                Self::Only(allowed.into_iter().filter(|n| !names.contains(n)).collect())
+            }
+            Self::AllExcept(mut blocked) => {
+                for &n in names {
+                    if !blocked.contains(&n) {
+                        blocked.push(n);
+                    }
+                }
+                Self::AllExcept(blocked)
+            }
+        }
+    }
+
+    pub fn excluding_disabled(self, config: &AgentConfig) -> Self {
+        if !config.find_symbol_enabled {
+            self.excluding(&[FIND_SYMBOL_TOOL_NAME])
+        } else {
+            self
+        }
+    }
+
+    pub fn from_config(config: &AgentConfig, extra_exclude: &[&'static str]) -> Self {
+        let base = if config.allowed_tools.is_empty() {
+            Self::All
+        } else {
+            let refs: Vec<&'static str> = config
+                .allowed_tools
+                .iter()
+                .filter_map(|s| ToolCall::static_name(s))
+                .collect();
+            Self::Only(refs)
+        };
+        base.excluding(extra_exclude).excluding_disabled(config)
+    }
+}
+
+pub fn is_tool_enabled(config: &AgentConfig, name: &str) -> bool {
+    if name == FIND_SYMBOL_TOOL_NAME && !config.find_symbol_enabled {
+        return false;
+    }
+    true
 }
 
 pub const BASH_TOOL_NAME: &str = bash::Bash::NAME;
@@ -358,10 +408,13 @@ fn format_tool_signature(name: &str, schema: &Value) -> String {
     format!("- {name}({}) -> str", params.join(", "))
 }
 
-pub(crate) fn build_interpreter_tools_description() -> String {
+pub(crate) fn build_interpreter_tools_description(filter: &ToolFilter) -> String {
     let mut desc =
         String::from("\n\nAvailable tools (called as Python functions with keyword arguments):\n");
     for name in INTERPRETER_TOOLS {
+        if !filter.matches(name) {
+            continue;
+        }
         if let Some(schema) = ToolCall::schema_for(name) {
             desc.push_str(&format_tool_signature(name, &schema));
             desc.push('\n');
@@ -642,12 +695,11 @@ macro_rules! register_tools {
                 }
             }
 
-            fn all_defs(vars: &Vars, skills: &[Skill], supports_examples: bool) -> Vec<(&'static str, Value)> {
-                let ctx = DescriptionContext { skills };
+            fn all_defs(vars: &Vars, ctx: &DescriptionContext, supports_examples: bool) -> Vec<(&'static str, Value)> {
                 vec![
                     $((<$inner>::NAME, {
                         let mut description = vars.apply(<$inner>::DESCRIPTION).into_owned();
-                        <$inner>::augment_description(&mut description, &ctx);
+                        <$inner>::augment_description(&mut description, ctx);
                         let mut def = json!({
                             "name": <$inner>::NAME,
                             "description": &description,
@@ -678,17 +730,13 @@ macro_rules! register_tools {
                 &[$(<$inner>::NAME),+]
             }
 
-            pub fn definitions_with_filter(vars: &Vars, skills: &[Skill], filter: &ToolFilter, supports_examples: bool) -> Value {
+            pub fn definitions(vars: &Vars, ctx: &DescriptionContext, supports_examples: bool) -> Value {
                 Value::Array(
-                    Self::all_defs(vars, skills, supports_examples).into_iter()
-                        .filter(|(name, _)| filter.matches(name))
+                    Self::all_defs(vars, ctx, supports_examples).into_iter()
+                        .filter(|(name, _)| ctx.filter.matches(name))
                         .map(|(_, def)| def)
                         .collect()
                 )
-            }
-
-            pub fn definitions(vars: &Vars, skills: &[Skill], supports_examples: bool) -> Value {
-                Self::definitions_with_filter(vars, skills, &ToolFilter::All, supports_examples)
             }
         }
     };
@@ -1041,7 +1089,14 @@ mod tests {
         }
 
         let vars = Vars::new().set("{cwd}", "/tmp");
-        let all = ToolCall::definitions(&vars, &[], true);
+        let all = ToolCall::definitions(
+            &vars,
+            &DescriptionContext {
+                skills: &[],
+                filter: &ToolFilter::All,
+            },
+            true,
+        );
         for def in all.as_array().unwrap() {
             let name = def["name"].as_str().unwrap();
             check_object_schemas(&def["input_schema"], name);
@@ -1052,7 +1107,11 @@ mod tests {
     fn definitions_filtered_returns_only_requested() {
         let vars = Vars::new().set("{cwd}", "/tmp");
         let filter = ToolFilter::Only(vec!["bash", "read"]);
-        let filtered = ToolCall::definitions_with_filter(&vars, &[], &filter, true);
+        let ctx = DescriptionContext {
+            skills: &[],
+            filter: &filter,
+        };
+        let filtered = ToolCall::definitions(&vars, &ctx, true);
         let names: Vec<&str> = filtered
             .as_array()
             .unwrap()

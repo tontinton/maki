@@ -10,7 +10,7 @@ use maki_agent::permissions::PermissionManager;
 use maki_agent::skill::Skill;
 use maki_agent::template;
 use maki_agent::template::Vars;
-use maki_agent::tools::{ToolCall, ToolFilter};
+use maki_agent::tools::{DescriptionContext, ToolCall, ToolFilter};
 use maki_agent::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentParams, AgentRunParams, CancelToken,
     CancelTrigger, Envelope, EventSender, History, LoadedInstructions,
@@ -292,18 +292,12 @@ impl AgentLoop {
 
     fn build_tools(&self, model: &Model) -> Value {
         let examples = model.family.supports_tool_examples();
-        let filter = if self.config.allowed_tools.is_empty() {
-            ToolFilter::All
-        } else {
-            let refs: Vec<&'static str> = self
-                .config
-                .allowed_tools
-                .iter()
-                .filter_map(|s| ToolCall::static_name(s))
-                .collect();
-            ToolFilter::Only(refs)
+        let filter = ToolFilter::from_config(&self.config, &[]);
+        let ctx = DescriptionContext {
+            skills: &self.skills,
+            filter: &filter,
         };
-        ToolCall::definitions_with_filter(&self.vars, &self.skills, &filter, examples)
+        ToolCall::definitions(&self.vars, &ctx, examples)
     }
 
     async fn reload_instructions(&mut self) {

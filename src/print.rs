@@ -25,7 +25,7 @@ use color_eyre::Result;
 use color_eyre::eyre::Context;
 use maki_agent::mcp::McpManager;
 use maki_agent::skill::Skill;
-use maki_agent::tools::{QUESTION_TOOL_NAME, ToolCall, ToolFilter};
+use maki_agent::tools::{DescriptionContext, QUESTION_TOOL_NAME, ToolCall, ToolFilter};
 use maki_agent::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, Envelope,
     EventSender, History, PermissionsConfig, agent, template,
@@ -146,23 +146,12 @@ pub fn run(
     let vars = template::env_vars();
     let mode = AgentMode::Build;
     let (instructions, loaded_instructions) = agent::load_instruction_files(&vars.apply("{cwd}"));
-    let filter = if config.allowed_tools.is_empty() {
-        ToolFilter::AllExcept(vec![QUESTION_TOOL_NAME])
-    } else {
-        let refs: Vec<&'static str> = config
-            .allowed_tools
-            .iter()
-            .filter_map(|s| ToolCall::static_name(s))
-            .filter(|&name| name != QUESTION_TOOL_NAME)
-            .collect();
-        ToolFilter::Only(refs)
+    let filter = ToolFilter::from_config(&config, &[QUESTION_TOOL_NAME]);
+    let ctx = DescriptionContext {
+        skills: &skills,
+        filter: &filter,
     };
-    let mut tools = ToolCall::definitions_with_filter(
-        &vars,
-        &skills,
-        &filter,
-        model.family.supports_tool_examples(),
-    );
+    let mut tools = ToolCall::definitions(&vars, &ctx, model.family.supports_tool_examples());
 
     let mcp_manager = smol::block_on(McpManager::start(&cwd_path));
 
