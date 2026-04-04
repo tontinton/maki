@@ -83,9 +83,8 @@ impl Task {
 
         let mut system = vars.apply(prompt).into_owned();
         let cwd_owned = vars.apply("{cwd}").into_owned();
-        let (instructions, _) =
-            smol::unblock(move || agent::load_instruction_files(&cwd_owned)).await;
-        system.push_str(&instructions);
+        let text = smol::unblock(move || agent::load_instruction_text(&cwd_owned)).await;
+        system.push_str(&text);
         let tool_names: Vec<&str> = tool_names
             .iter()
             .copied()

@@ -146,5 +146,19 @@ max_file_size_mb = {max_file_size}
     )
     .unwrap();
 
+    writeln!(
+        out,
+        "
+## Personal Instructions
+
+Beyond the shared `AGENTS.md`, Maki supports two files for your own instructions:
+
+- `AGENTS.local.md` at project root for per-project preferences (gitignored)
+- `~/.maki/SYSTEM.md` for preferences that apply to all projects
+
+Both load into the system prompt every session, right after `AGENTS.md`."
+    )
+    .unwrap();
+
     out
 }

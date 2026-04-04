@@ -113,3 +113,12 @@ How many lines of output to show per tool in the UI. All values are `usize` with
 ## Validation
 
 Numeric fields are validated against their minimums on load. A value below the minimum raises a `ConfigError` with the section, field, value, and minimum. Invalid TOML logs a warning and falls back to defaults.
+
+## Personal Instructions
+
+Beyond the shared `AGENTS.md`, Maki supports two files for your own instructions:
+
+- `AGENTS.local.md` at project root for per-project preferences (gitignored)
+- `~/.maki/SYSTEM.md` for preferences that apply to all projects
+
+Both load into the system prompt every session, right after `AGENTS.md`.

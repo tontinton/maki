@@ -92,6 +92,7 @@ Add a `.maki/` directory to your project root for per-project settings:
 ├── config.toml        # Overrides global config
 └── permissions.toml   # Permission rules
 AGENTS.md              # Loaded into agent context automatically
+AGENTS.local.md        # Personal per-project instructions (gitignored)
 ```
 
 `AGENTS.md` is loaded at the start of every session. Put coding conventions, repo quirks & gotchas, or off-limits directories in here. Maki will automatically load `AGENTS.md` files inside subdirs when doing a `read` in the subdir.

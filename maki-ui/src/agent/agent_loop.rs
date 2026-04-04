@@ -13,7 +13,7 @@ use maki_agent::template::Vars;
 use maki_agent::tools::{DescriptionContext, ToolCall, ToolFilter};
 use maki_agent::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentParams, AgentRunParams, CancelToken,
-    CancelTrigger, Envelope, EventSender, History, LoadedInstructions, McpPromptInfo, PromptRole,
+    CancelTrigger, Envelope, EventSender, History, Instructions, McpPromptInfo, PromptRole,
 };
 use maki_providers::{AgentError, Message, Model, TokenUsage};
 use serde_json::Value;
@@ -29,8 +29,7 @@ pub(super) struct AgentLoop {
     skills: Arc<[Skill]>,
     config: AgentConfig,
     vars: Vars,
-    instructions: String,
-    loaded_instructions: LoadedInstructions,
+    instructions: Instructions,
     tools: Value,
     disabled: Vec<String>,
     mcp_manager: Option<Arc<McpManager>>,
@@ -81,8 +80,7 @@ impl AgentLoop {
             skills,
             config,
             vars: Vars::default(),
-            instructions: String::new(),
-            loaded_instructions: LoadedInstructions::default(),
+            instructions: Instructions::default(),
             tools: Value::Null,
             disabled: initial_disabled,
             mcp_manager: None,
@@ -260,7 +258,7 @@ impl AgentLoop {
 
         self.sync_shared_history_with_pending(&input);
 
-        let system = agent::build_system_prompt(&self.vars, &input.mode, &self.instructions);
+        let system = agent::build_system_prompt(&self.vars, &input.mode, &self.instructions.text);
         let (trigger, cancel) = CancelToken::new();
         self.set_cancel_trigger(run_id, trigger);
 
@@ -281,7 +279,7 @@ impl AgentLoop {
                 tools: self.tools.clone(),
             },
         )
-        .with_loaded_instructions(self.loaded_instructions.clone())
+        .with_loaded_instructions(self.instructions.loaded.clone())
         .with_user_response_rx(Arc::clone(&self.answer_rx))
         .with_interrupt_source(Arc::clone(&self.queue) as Arc<dyn maki_agent::InterruptSource>)
         .with_cancel(cancel)
@@ -334,10 +332,7 @@ impl AgentLoop {
 
     async fn reload_instructions(&mut self) {
         let cwd = self.vars.apply("{cwd}").into_owned();
-        let (instructions, loaded) =
-            smol::unblock(move || agent::load_instruction_files(&cwd)).await;
-        self.instructions = instructions;
-        self.loaded_instructions = loaded;
+        self.instructions = smol::unblock(move || agent::load_instructions(&cwd)).await;
     }
 
     fn persist_mcp_toggle(&self, infos: &[McpServerInfo], server_name: &str, enabled: bool) {

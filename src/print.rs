@@ -145,7 +145,7 @@ pub fn run(
     let cwd = cwd_path.to_string_lossy().into_owned();
     let vars = template::env_vars();
     let mode = AgentMode::Build;
-    let (instructions, loaded_instructions) = agent::load_instruction_files(&vars.apply("{cwd}"));
+    let instructions = agent::load_instructions(&vars.apply("{cwd}"));
     let filter = ToolFilter::from_config(&config, &[QUESTION_TOOL_NAME]);
     let ctx = DescriptionContext {
         skills: &skills,
@@ -159,7 +159,7 @@ pub fn run(
         mcp.extend_tools(&mut tools, &[]);
     }
 
-    let system = agent::build_system_prompt(&vars, &mode, &instructions);
+    let system = agent::build_system_prompt(&vars, &mode, &instructions.text);
 
     let (raw_tx, event_rx) = flume::unbounded::<Envelope>();
     let input = AgentInput {
@@ -213,7 +213,7 @@ pub fn run(
                 tools,
             },
         )
-        .with_loaded_instructions(loaded_instructions)
+        .with_loaded_instructions(instructions.loaded)
         .with_mcp(mcp_manager);
         let outcome = agent.run(input).await;
         if let Err(e) = outcome.result {
