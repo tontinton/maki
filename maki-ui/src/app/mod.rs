@@ -24,6 +24,7 @@ use crate::chat::Chat;
 use crate::chat::{CANCELLED_TEXT, ChatEventResult, DONE_TEXT, ERROR_TEXT};
 use crate::components::btw_modal::BtwModal;
 use crate::components::command::{CommandAction, CommandPalette, ParsedCommand};
+use crate::components::file_picker::{FilePickerModal, FilePickerModalAction};
 use crate::components::help_modal::HelpModal;
 use crate::components::input::{InputAction, InputBox, Submission};
 use crate::components::keybindings::key;
@@ -112,6 +113,7 @@ pub struct App {
     pub(super) btw_modal: BtwModal,
     pub(super) memory_modal: MemoryModal,
     pub(super) search_modal: SearchModal,
+    pub(super) file_picker: FilePickerModal,
     pub(super) todo_panel: TodoPanel,
     pub(super) permission_prompt: PermissionPrompt,
     pub(super) question_form: QuestionForm,
@@ -177,6 +179,7 @@ impl App {
             btw_modal: BtwModal::new(ui_config.typewriter_ms_per_char),
             memory_modal: MemoryModal::new(),
             search_modal: SearchModal::new(),
+            file_picker: FilePickerModal::new(),
             todo_panel: TodoPanel::new(),
             permission_prompt: PermissionPrompt::new(),
             question_form: QuestionForm::new(),
@@ -314,6 +317,7 @@ impl App {
         try_picker!(self.rewind_picker);
         try_picker!(self.task_picker);
         try_picker!(self.model_picker);
+        try_picker!(self.file_picker);
         if let Some(zone) = self.zone_at(row, column) {
             self.scroll_zone(zone.zone, delta);
         }
@@ -498,6 +502,25 @@ impl App {
             return vec![];
         }
 
+        if self.file_picker.is_open() {
+            return match self.file_picker.handle_key(key) {
+                FilePickerModalAction::Consumed => vec![],
+                FilePickerModalAction::Select(path) => {
+                    self.file_picker.close();
+                    if let InputAction::PaletteSync(val) =
+                        self.input_box.handle_paste_with_spaces(&path)
+                    {
+                        self.command_palette.sync(&val);
+                    }
+                    vec![]
+                }
+                FilePickerModalAction::Close => {
+                    self.file_picker.close();
+                    vec![]
+                }
+            };
+        }
+
         if self.queue.focus().is_some() {
             match key.code {
                 KeyCode::Up => {
@@ -629,6 +652,8 @@ impl App {
                 let top = self.chats[self.active_chat].scroll_top();
                 let auto = self.chats[self.active_chat].auto_scroll();
                 self.search_modal.open(top, auto);
+            } else if key::FILE_PICKER.matches(key) {
+                self.file_picker.open(&self.state.session.cwd);
             } else if key.code == KeyCode::Char('v') && self.image_paste_rx.is_none() {
                 self.start_image_paste();
             } else if let InputAction::PaletteSync(val) = self.input_box.handle_key(key) {
@@ -1166,12 +1191,13 @@ impl App {
         vec![]
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 13] {
+    fn overlays(&self) -> [&dyn Overlay; 14] {
         [
             &self.help_modal,
             &self.btw_modal,
             &self.memory_modal,
             &self.search_modal,
+            &self.file_picker,
             &self.task_picker,
             &self.session_picker,
             &self.rewind_picker,
@@ -1184,12 +1210,13 @@ impl App {
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 13] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 14] {
         [
             &mut self.help_modal,
             &mut self.btw_modal,
             &mut self.memory_modal,
             &mut self.search_modal,
+            &mut self.file_picker,
             &mut self.task_picker,
             &mut self.session_picker,
             &mut self.rewind_picker,
@@ -1218,6 +1245,7 @@ impl App {
         self.image_paste_rx.is_some()
             || self.btw_modal.is_animating()
             || self.session_picker.is_loading()
+            || self.file_picker.is_loading()
             || self
                 .selection_state
                 .as_ref()
@@ -1284,6 +1312,7 @@ impl App {
             };
         }
         try_picker!(self.memory_modal);
+        try_picker!(self.file_picker);
         try_picker!(self.task_picker);
         try_picker!(self.session_picker);
         try_picker!(self.rewind_picker);

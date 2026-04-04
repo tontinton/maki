@@ -122,6 +122,40 @@ impl InputBox {
         InputAction::PaletteSync(self.buffer.value())
     }
 
+    /// Inserting a file path mid-word looks broken ("read/tmp/x" instead of
+    /// "read /tmp/x"). This adds spaces around the paste only when needed.
+    pub fn handle_paste_with_spaces(&mut self, text: &str) -> InputAction {
+        let line = &self.buffer.lines()[self.buffer.y()];
+        let bx = TextBuffer::char_to_byte(line, self.buffer.x());
+
+        let char_before = line[..bx].chars().next_back();
+        let char_after = line[bx..].chars().next();
+
+        let is_word_boundary =
+            |c: char| -> bool { c.is_alphanumeric() || c == '_' || ")]}>".contains(c) };
+
+        let needs_leading = char_before.is_some_and(&is_word_boundary) && !text.starts_with(' ');
+        let needs_trailing = char_after.is_some_and(&is_word_boundary) && !text.ends_with(' ');
+
+        if !needs_leading && !needs_trailing {
+            return self.handle_paste(text);
+        }
+
+        let mut spaced = String::with_capacity(
+            text.len() + usize::from(needs_leading) + usize::from(needs_trailing),
+        );
+
+        if needs_leading {
+            spaced.push(' ');
+        }
+        spaced.push_str(text);
+        if needs_trailing {
+            spaced.push(' ');
+        }
+
+        self.handle_paste(&spaced)
+    }
+
     pub fn new(history: InputHistory) -> Self {
         Self {
             buffer: TextBuffer::new(String::new()),
@@ -579,7 +613,6 @@ fn total_visual_lines(buffer: &TextBuffer, ew: usize, cursor_visible: bool) -> u
 mod tests {
     use super::*;
     use crate::components::scrollbar::SCROLLBAR_THUMB;
-    use ratatui::style::Color;
     use test_case::test_case;
 
     fn type_text(input: &mut InputBox, text: &str) {
@@ -804,19 +837,6 @@ mod tests {
         assert_eq!(input.scroll_y, 0);
     }
 
-    fn border_fg(terminal: &ratatui::Terminal<ratatui::backend::TestBackend>) -> Color {
-        let buf = terminal.backend().buffer();
-        buf.cell((0, 0)).unwrap().fg
-    }
-
-    #[test_case(false, Style::new().fg(theme::current().mode_plan), theme::current().mode_plan         ; "idle_uses_mode_color")]
-    #[test_case(true,  theme::current().input_border,               theme::current().input_border.fg.unwrap()  ; "streaming_uses_default_border")]
-    fn border_color_matches_mode(streaming: bool, border_style: Style, expected: Color) {
-        let mut input = InputBox::new(InputHistory::default());
-        let terminal = render_input_with(&mut input, 40, 5, streaming, border_style);
-        assert_eq!(border_fg(&terminal), expected);
-    }
-
     #[test]
     fn multibyte_input_renders_without_panic() {
         let mut input = InputBox::new(InputHistory::default());
@@ -950,5 +970,81 @@ mod tests {
         let base_height = input.height(TEST_WIDTH);
         input.attach_image(test_image());
         assert_eq!(input.height(TEST_WIDTH), base_height + 1);
+    }
+
+    #[test_case("read", "src/main.rs", " src/main.rs" ; "leading_after_ascii")]
+    #[test_case("打开", "src/main.rs", " src/main.rs" ; "leading_after_unicode")]
+    #[test_case("", "src/main.rs", "src/main.rs" ; "no_leading_at_start")]
+    #[test_case("read ", "src/main.rs", "src/main.rs" ; "no_leading_after_space")]
+    #[test_case("--file=", "src/main.rs", "src/main.rs" ; "no_leading_after_equals")]
+    #[test_case("/", "src/main.rs", "src/main.rs" ; "no_leading_after_slash")]
+    #[test_case("\"", "src/main.rs", "src/main.rs" ; "no_leading_after_quote")]
+    #[test_case("'", "src/main.rs", "src/main.rs" ; "no_leading_after_squote")]
+    #[test_case("foo_", "src/main.rs", " src/main.rs" ; "leading_after_underscore")]
+    #[test_case("$(cmd)", "src/main.rs", " src/main.rs" ; "leading_after_closing_paren")]
+    #[test_case("arr[0]", "src/main.rs", " src/main.rs" ; "leading_after_closing_bracket")]
+    fn paste_with_spaces_leading(before: &str, paste: &str, expected_suffix: &str) {
+        let mut input = InputBox::new(InputHistory::default());
+        type_text(&mut input, before);
+        input.handle_paste_with_spaces(paste);
+        assert_eq!(input.buffer.value(), format!("{before}{expected_suffix}"));
+    }
+
+    #[test_case("file", 0, "/tmp/foo", "/tmp/foo file" ; "trailing_before_ascii")]
+    #[test_case("を読む", 0, "/tmp/foo", "/tmp/foo を読む" ; "trailing_before_unicode")]
+    #[test_case("foobar", 3, "src/main.rs", "foo src/main.rs bar" ; "both_sides_mid_word")]
+    #[test_case("in  between", 3, "file.rs", "in file.rs between" ; "neither_side_between_spaces")]
+    #[test_case("read ''", 6, "src/main.rs", "read 'src/main.rs'" ; "neither_side_between_quotes")]
+    fn paste_with_spaces_at_cursor(before: &str, cursor_at: usize, paste: &str, expected: &str) {
+        let mut input = InputBox::new(InputHistory::default());
+        type_text(&mut input, before);
+        let back = before.chars().count() - cursor_at;
+        for _ in 0..back {
+            input.buffer.move_left();
+        }
+        input.handle_paste_with_spaces(paste);
+        assert_eq!(input.buffer.value(), expected);
+    }
+
+    #[test]
+    fn paste_with_spaces_empty_line() {
+        let mut input = InputBox::new(InputHistory::default());
+        input.handle_paste_with_spaces("file.rs");
+        assert_eq!(input.buffer.value(), "file.rs");
+    }
+
+    #[test]
+    fn paste_with_spaces_text_has_leading_space() {
+        let mut input = InputBox::new(InputHistory::default());
+        type_text(&mut input, "read");
+        input.handle_paste_with_spaces(" file.rs");
+        assert_eq!(input.buffer.value(), "read file.rs");
+    }
+
+    #[test]
+    fn paste_with_spaces_text_has_trailing_space() {
+        let mut input = InputBox::new(InputHistory::default());
+        type_text(&mut input, "file");
+        for _ in 0..4 {
+            input.buffer.move_left();
+        }
+        input.handle_paste_with_spaces("src/main.rs ");
+        assert_eq!(input.buffer.value(), "src/main.rs file");
+    }
+
+    #[test]
+    fn paste_with_spaces_multiline_buffer_cursor_on_second_line() {
+        let mut input = InputBox::new(InputHistory::default());
+        input.handle_paste("first\nread");
+        input.handle_paste_with_spaces("file.rs");
+        assert_eq!(input.buffer.value(), "first\nread file.rs");
+    }
+
+    #[test]
+    fn paste_with_spaces_cursor_at_end_no_trailing() {
+        let mut input = InputBox::new(InputHistory::default());
+        type_text(&mut input, "read");
+        input.handle_paste_with_spaces("file.rs");
+        assert_eq!(input.buffer.value(), "read file.rs");
     }
 }

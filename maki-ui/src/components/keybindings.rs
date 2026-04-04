@@ -143,6 +143,7 @@ pub mod key {
     pub const POP_QUEUE: Bind = ctrl_bind!('q');
     pub const DELETE_WORD: Bind = ctrl_bind!('w');
     pub const SEARCH: Bind = ctrl_bind!('f');
+    pub const FILE_PICKER: Bind = ctrl_bind!('s');
     pub const OPEN_EDITOR: Bind = ctrl_bind!('o');
     pub const TODO_PANEL: Bind = ctrl_bind!('t');
     pub const TASKS: Bind = ctrl_bind!('x');
@@ -171,6 +172,7 @@ pub enum KeybindContext {
     QueueFocus,
     CommandPalette,
     Search,
+    FilePicker,
 }
 
 impl KeybindContext {
@@ -189,6 +191,7 @@ impl KeybindContext {
             Self::QueueFocus => "Queue",
             Self::CommandPalette => "Commands",
             Self::Search => "Search",
+            Self::FilePicker => "File Picker",
         }
     }
 
@@ -201,7 +204,8 @@ impl KeybindContext {
             | Self::ModelPicker
             | Self::QueueFocus
             | Self::CommandPalette
-            | Self::Search => Some(Self::Picker),
+            | Self::Search
+            | Self::FilePicker => Some(Self::Picker),
             _ => None,
         }
     }
@@ -321,6 +325,12 @@ pub const KEYBINDS: &[Keybind] = &[
     Keybind {
         label: KeyLabel::Single(key::SEARCH.label),
         description: "Search messages",
+        context: KeybindContext::General,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(key::FILE_PICKER.label),
+        description: "File picker",
         context: KeybindContext::General,
         platform: Platform::All,
     },

@@ -17,6 +17,7 @@ On macOS, `Ctrl` maps to `Cmd` where it makes sense (run `/help` for exact keybi
 | `Ctrl+H` | Show keybindings |
 | `Ctrl+N` / `Ctrl+P` | Next / previous task chat |
 | `Ctrl+F` | Search messages |
+| `Ctrl+S` | File picker |
 | `Ctrl+O` | Open plan in editor |
 | `Ctrl+T` | Toggle todo panel |
 | `Ctrl+X` | Open tasks |
@@ -86,4 +87,4 @@ Some pickers add extra bindings on top of the defaults:
 
 Child contexts inherit their parent's bindings and add their own.
 
-- **Pickers** is the base for: Task Picker, Session Picker, Rewind Picker, Theme Picker, Model Picker, Queue, Commands, Search
+- **Pickers** is the base for: Task Picker, Session Picker, Rewind Picker, Theme Picker, Model Picker, Queue, Commands, Search, File Picker
