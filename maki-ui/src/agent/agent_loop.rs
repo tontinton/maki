@@ -15,18 +15,17 @@ use maki_agent::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentParams, AgentRunParams, CancelToken,
     CancelTrigger, Envelope, EventSender, History, LoadedInstructions,
 };
-use maki_providers::provider::Provider;
 use maki_providers::{AgentError, Message, Model, TokenUsage};
 use serde_json::Value;
 use tracing::error;
 
+use super::ModelSlot;
 use super::cancel_map::CancelMap;
 use super::shared_queue::{QueueItem, SharedQueue};
 use super::toggle_disabled;
 
 pub(super) struct AgentLoop {
-    provider: Arc<dyn Provider>,
-    model: Model,
+    model_slot: Arc<ArcSwap<ModelSlot>>,
     skills: Arc<[Skill]>,
     config: AgentConfig,
     vars: Vars,
@@ -58,8 +57,7 @@ enum LoopEvent {
 impl AgentLoop {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
-        provider: Arc<dyn Provider>,
-        model: Model,
+        model_slot: Arc<ArcSwap<ModelSlot>>,
         skills: Arc<[Skill]>,
         config: AgentConfig,
         initial_history: Vec<Message>,
@@ -77,8 +75,7 @@ impl AgentLoop {
         cancel: CancelToken,
     ) -> Self {
         Self {
-            provider,
-            model,
+            model_slot,
             skills,
             config,
             vars: Vars::default(),
@@ -170,7 +167,8 @@ impl AgentLoop {
             return false;
         }
 
-        self.tools = self.build_tools();
+        let slot = self.model_slot.load();
+        self.tools = self.build_tools(&slot.model);
 
         let cwd = PathBuf::from(self.vars.apply("{cwd}").into_owned());
         self.init_mcp(&cwd).await;
@@ -205,8 +203,9 @@ impl AgentLoop {
     }
 
     async fn do_compact(&mut self, event_tx: &EventSender) -> Result<(), AgentError> {
+        let slot = self.model_slot.load();
         let result =
-            agent::compact(&*self.provider, &self.model, &mut self.history, event_tx).await;
+            agent::compact(&*slot.provider, &slot.model, &mut self.history, event_tx).await;
         self.sync_shared_history();
         result
     }
@@ -217,12 +216,14 @@ impl AgentLoop {
         event_tx: EventSender,
         run_id: u64,
     ) -> Result<(), AgentError> {
+        let slot = self.model_slot.load();
+
         let old_cwd = self.vars.apply("{cwd}").into_owned();
         self.vars = template::env_vars();
         if *self.vars.apply("{cwd}") != old_cwd {
             self.reload_instructions().await;
-            self.rebuild_tools();
         }
+        self.rebuild_tools(&slot.model);
 
         for msg in mem::take(&mut input.preamble) {
             self.history.push(msg);
@@ -237,8 +238,8 @@ impl AgentLoop {
 
         let agent = Agent::new(
             AgentParams {
-                provider: Arc::clone(&self.provider),
-                model: self.model.clone(),
+                provider: Arc::clone(&slot.provider),
+                model: slot.model.clone(),
                 skills: Arc::clone(&self.skills),
                 config: self.config.clone(),
                 permissions: Arc::clone(&self.permissions),
@@ -271,7 +272,8 @@ impl AgentLoop {
 
     fn handle_mcp_toggle(&mut self, server_name: String, enabled: bool) {
         toggle_disabled(&mut self.disabled, &server_name, enabled);
-        self.rebuild_tools();
+        let slot = self.model_slot.load();
+        self.rebuild_tools(&slot.model);
 
         if let Some(ref mcp) = self.mcp_manager {
             let infos = mcp.server_infos(&self.disabled);
@@ -280,16 +282,16 @@ impl AgentLoop {
         }
     }
 
-    fn rebuild_tools(&mut self) {
-        let mut tools = self.build_tools();
+    fn rebuild_tools(&mut self, model: &Model) {
+        let mut tools = self.build_tools(model);
         if let Some(ref mcp) = self.mcp_manager {
             mcp.extend_tools(&mut tools, &self.disabled);
         }
         self.tools = tools;
     }
 
-    fn build_tools(&self) -> Value {
-        let examples = self.model.family.supports_tool_examples();
+    fn build_tools(&self, model: &Model) -> Value {
+        let examples = model.family.supports_tool_examples();
         let filter = if self.config.allowed_tools.is_empty() {
             ToolFilter::All
         } else {

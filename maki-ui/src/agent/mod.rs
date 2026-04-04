@@ -25,6 +25,11 @@ use self::agent_loop::AgentLoop;
 use self::command_router::spawn_command_router;
 pub(crate) use self::shared_queue::{QueuedMessage, SharedQueue};
 
+pub(crate) struct ModelSlot {
+    pub(crate) model: Model,
+    pub(crate) provider: Arc<dyn Provider>,
+}
+
 pub(crate) enum AgentCommand {
     Cancel { run_id: u64 },
     CancelAll,
@@ -66,20 +71,20 @@ impl AgentHandles {
     pub(crate) fn respawn(
         &mut self,
         history: Vec<Message>,
-        provider: &Arc<dyn Provider>,
-        model: &Model,
+        model_slot: &Arc<ArcSwap<ModelSlot>>,
         skills: &Arc<[Skill]>,
         config: AgentConfig,
         permissions: &Arc<PermissionManager>,
         app: &mut App,
     ) {
-        if let Err(e) = smol::block_on(provider.reload_auth()) {
+        let slot = model_slot.load();
+        if let Err(e) = smol::block_on(slot.provider.reload_auth()) {
             warn!(error = %e, "failed to reload auth, continuing with existing credentials");
         }
         let mcp = self.mcp.clone();
         let old = mem::replace(
             self,
-            spawn_agent(provider, model, history, skills, config, permissions, mcp),
+            spawn_agent(model_slot, history, skills, config, permissions, mcp),
         );
         old.cancel();
         self.apply_to_app(app);
@@ -118,8 +123,7 @@ pub(crate) fn toggle_disabled(disabled: &mut Vec<String>, name: &str, enabled: b
 }
 
 pub(crate) fn spawn_agent(
-    provider: &Arc<dyn Provider>,
-    model: &Model,
+    model_slot: &Arc<ArcSwap<ModelSlot>>,
     initial_history: Vec<Message>,
     skills: &Arc<[Skill]>,
     config: AgentConfig,
@@ -141,8 +145,7 @@ pub(crate) fn spawn_agent(
     spawn_command_router(cmd_rx, toggle_tx, Arc::clone(&cancel_map));
 
     let agent_loop = AgentLoop::new(
-        Arc::clone(provider),
-        model.clone(),
+        Arc::clone(model_slot),
         Arc::clone(skills),
         config,
         initial_history,

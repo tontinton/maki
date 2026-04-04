@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use arc_swap::ArcSwapOption;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use color_eyre::Result;
 use color_eyre::eyre::Context;
 use crossterm::event::{
@@ -19,7 +19,8 @@ use tracing::warn;
 
 use crate::AppSession;
 use crate::agent::{
-    AgentCommand, AgentHandles, McpState, shared_queue::QueueItem, spawn_agent, toggle_disabled,
+    AgentCommand, AgentHandles, McpState, ModelSlot, shared_queue::QueueItem, spawn_agent,
+    toggle_disabled,
 };
 use crate::app::shell::{ShellEvent, spawn_shell};
 use crate::app::{App, Msg};
@@ -53,8 +54,7 @@ pub(crate) struct EventLoop<'t> {
     terminal: &'t mut ratatui::DefaultTerminal,
     app: App,
     handles: AgentHandles,
-    provider: Arc<dyn Provider>,
-    model: Model,
+    model_slot: Arc<ArcSwap<ModelSlot>>,
     skills: Arc<[Skill]>,
     config: AgentConfig,
     permissions: Arc<PermissionManager>,
@@ -189,9 +189,9 @@ impl<'t> EventLoop<'t> {
 
         let provider: Arc<dyn Provider> = Arc::from(from_model(&model).context("create provider")?);
         let skills: Arc<[Skill]> = Arc::from(skills);
+        let model_slot = Arc::new(ArcSwap::from_pointee(ModelSlot { model, provider }));
         let handles = spawn_agent(
-            &provider,
-            &model,
+            &model_slot,
             initial_history,
             &skills,
             config.clone(),
@@ -208,8 +208,7 @@ impl<'t> EventLoop<'t> {
             terminal,
             app,
             handles,
-            provider,
-            model,
+            model_slot,
             skills,
             config,
             permissions,
@@ -338,8 +337,7 @@ impl<'t> EventLoop<'t> {
     fn respawn_agent(&mut self, history: Vec<Message>) {
         self.handles.respawn(
             history,
-            &self.provider,
-            &self.model,
+            &self.model_slot,
             &self.skills,
             self.config.clone(),
             &self.permissions,
@@ -371,12 +369,14 @@ impl<'t> EventLoop<'t> {
             }
             Action::LoadSession(loaded) => {
                 let loaded = *loaded;
-                if loaded.model_spec != self.model.spec()
+                if loaded.model_spec != self.model_slot.load().model.spec()
                     && let Ok(new_model) = Model::from_spec(&loaded.model_spec)
                     && let Ok(new_provider) = from_model(&new_model)
                 {
-                    self.model = new_model;
-                    self.provider = Arc::from(new_provider);
+                    self.model_slot.store(Arc::new(ModelSlot {
+                        model: new_model,
+                        provider: Arc::from(new_provider),
+                    }));
                 }
                 self.respawn_agent(loaded.messages);
                 *self
@@ -422,8 +422,9 @@ impl<'t> EventLoop<'t> {
                 }
             }
             Action::Btw(question) => {
+                let slot = self.model_slot.load();
                 self.app
-                    .start_btw(question, Arc::clone(&self.provider), self.model.clone());
+                    .start_btw(question, Arc::clone(&slot.provider), slot.model.clone());
             }
             Action::Quit => {}
         }
@@ -434,10 +435,10 @@ impl<'t> EventLoop<'t> {
             Ok(new_model) => match from_model(&new_model) {
                 Ok(new_provider) => {
                     self.app.update_model(&new_model);
-                    let history = Vec::clone(&self.handles.history.load());
-                    self.provider = Arc::from(new_provider);
-                    self.model = new_model;
-                    self.respawn_agent(history);
+                    self.model_slot.store(Arc::new(ModelSlot {
+                        model: new_model,
+                        provider: Arc::from(new_provider),
+                    }));
                 }
                 Err(e) => self.app.flash(format!("Failed to create provider: {e}")),
             },

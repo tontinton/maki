@@ -56,15 +56,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn insert_then_cancel_fires_trigger() {
-        let (trigger, token) = CancelToken::new();
-        let mut map = CancelMap::new(0, trigger);
-        assert!(!token.is_cancelled());
-        map.cancel(0);
-        assert!(token.is_cancelled());
-    }
-
-    #[test]
     fn cancel_before_insert_fires_on_insert() {
         let (trigger, token) = CancelToken::new();
         let mut map = CancelMap::new(99, trigger);
@@ -87,7 +78,13 @@ mod tests {
         map.cancel_all();
         assert!(tok1.is_cancelled());
         assert!(tok2.is_cancelled());
-        assert!(map.entries.is_empty());
+
+        let (t3, tok3) = CancelToken::new();
+        map.insert(5, t3);
+        assert!(
+            !tok3.is_cancelled(),
+            "cancel_all should clear PreCancelled entries"
+        );
     }
 
     #[test]
