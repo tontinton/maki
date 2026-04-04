@@ -27,7 +27,7 @@ pub(crate) fn build_body(
         "instructions": system,
         "input": input,
         "stream": true,
-        "max_output_tokens": model.max_output_tokens,
+        "store": false,
     });
     if wire_tools.as_array().is_some_and(|a| !a.is_empty()) {
         body["tools"] = wire_tools;
