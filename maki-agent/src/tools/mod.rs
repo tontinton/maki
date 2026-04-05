@@ -520,22 +520,15 @@ pub(crate) fn deserialize_with_coercion<T: serde::de::DeserializeOwned>(
     field: &str,
     json_type: &str,
 ) -> Result<T, String> {
-    serde_json::from_value::<T>(raw.clone()).or_else(|_| {
+    serde_json::from_value::<T>(raw.clone()).or_else(|serde_err| {
         coerce_value(raw, field, json_type)
             .and_then(|c| serde_json::from_value(c).ok())
             .ok_or_else(|| {
-                let got_type = match raw {
-                    Value::String(_) => "string",
-                    Value::Number(_) => "number",
-                    Value::Bool(_) => "boolean",
-                    Value::Array(_) => "array",
-                    Value::Object(_) => "object",
-                    Value::Null => "null",
-                };
-                format!(
-                    "The parameter '{}' type is expected as '{}' but provided as '{}'",
-                    field, json_type, got_type
-                )
+                let msg = format!(
+                    "Invalid value for parameter '{}' (expected {}): {}",
+                    field, json_type, serde_err
+                );
+                msg
             })
     })
 }
@@ -1251,6 +1244,27 @@ mod tests {
         assert_eq!(
             resolve_path("src/main.rs").unwrap(),
             cwd.join("src/main.rs").to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn deserialize_error_includes_serde_message() {
+        // array with correct top-level type but bad items
+        let bad_array = json!([{"not_a_valid_field": 1}]);
+        let err =
+            deserialize_with_coercion::<Vec<batch::BatchEntry>>(&bad_array, "tool_calls", "array")
+                .unwrap_err();
+        assert!(
+            err.contains("missing field"),
+            "expected serde detail, got: {err}"
+        );
+
+        // wrong type entirely (string instead of integer)
+        let bad_type = json!("not_a_number");
+        let err = deserialize_with_coercion::<i64>(&bad_type, "count", "integer").unwrap_err();
+        assert!(
+            err.contains("invalid type"),
+            "expected serde detail, got: {err}"
         );
     }
 }
