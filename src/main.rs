@@ -350,7 +350,9 @@ fn run() -> Result<()> {
                     demo: cli.demo,
                 })
                 .context("run UI")?;
-                eprintln!("session: {session_id}");
+                if let Some(session_id) = session_id {
+                    eprintln!("session: {session_id}");
+                }
             }
         }
     }

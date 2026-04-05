@@ -2052,3 +2052,21 @@ fn ctrl_c_denies_permission_prompt() {
     assert!(!app.permission_prompt.is_open());
     assert!(actions.is_empty());
 }
+
+#[test_case(false, false => false ; "neither")]
+#[test_case(true,  false => true  ; "messages only")]
+#[test_case(false, true  => true  ; "ephemeral only")]
+#[test_case(true,  true  => true  ; "both")]
+fn has_content(messages: bool, ephemeral: bool) -> bool {
+    let mut app = test_app();
+    if messages {
+        app.state
+            .session
+            .messages
+            .push(maki_providers::Message::user("hello".into()));
+    }
+    if ephemeral {
+        app.state.session.meta.todo_dismissed = true;
+    }
+    app.has_content()
+}

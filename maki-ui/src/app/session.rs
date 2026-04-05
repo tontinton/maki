@@ -12,6 +12,21 @@ use super::{App, Mode, PendingInput, PlanState};
 use crate::agent::QueuedMessage;
 
 impl App {
+    pub(crate) fn has_messages(&self) -> bool {
+        !self.state.session.messages.is_empty()
+    }
+
+    pub(crate) fn has_ephemeral(&self) -> bool {
+        self.state.session.meta.input_draft.is_some()
+            || self.state.session.meta.todo_dismissed
+            || !self.state.session.meta.queued_messages.is_empty()
+            || self.state.session.meta.mode != Some(maki_storage::sessions::StoredMode::Build)
+    }
+
+    pub(crate) fn has_content(&self) -> bool {
+        self.has_messages() || self.has_ephemeral()
+    }
+
     pub(crate) fn save_session(&mut self) {
         self.state.sync_session(
             &self.shared_history,
@@ -19,12 +34,7 @@ impl App {
             &self.permissions,
         );
         self.sync_ephemeral_state();
-        let has_messages = !self.state.session.messages.is_empty();
-        let has_ephemeral = self.state.session.meta.input_draft.is_some()
-            || self.state.session.meta.todo_dismissed
-            || !self.state.session.meta.queued_messages.is_empty()
-            || self.state.session.meta.mode != Some(maki_storage::sessions::StoredMode::Build);
-        if !has_messages && !has_ephemeral {
+        if !self.has_content() {
             return;
         }
         self.enqueue_save();

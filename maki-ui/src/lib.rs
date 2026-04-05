@@ -36,7 +36,7 @@ pub type AppSession = maki_storage::sessions::Session<Message, TokenUsage, ToolO
 pub(crate) use agent::AgentCommand;
 pub use event_loop::EventLoopParams;
 
-pub fn run(params: EventLoopParams) -> Result<String> {
+pub fn run(params: EventLoopParams) -> Result<Option<String>> {
     let (_guard, mut terminal) = terminal::TerminalGuard::init()?;
     let el = event_loop::EventLoop::new(&mut terminal, params)?;
     el.run()

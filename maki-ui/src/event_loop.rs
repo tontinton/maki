@@ -221,7 +221,7 @@ impl<'t> EventLoop<'t> {
         })
     }
 
-    pub(crate) fn run(mut self) -> Result<String> {
+    pub(crate) fn run(mut self) -> Result<Option<String>> {
         loop {
             self.tick();
             self.terminal.draw(|f| self.app.view(f))?;
@@ -447,8 +447,11 @@ impl<'t> EventLoop<'t> {
         }
     }
 
-    fn shutdown(mut self) -> String {
-        let session_id = self.app.state.session.id.clone();
+    fn shutdown(mut self) -> Option<String> {
+        let session_id = self
+            .app
+            .has_content()
+            .then(|| self.app.state.session.id.clone());
         maki_agent::mcp::kill_process_groups(
             &self
                 .handles
