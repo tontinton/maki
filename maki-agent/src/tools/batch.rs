@@ -7,7 +7,8 @@ use std::fmt::Write;
 
 use crate::agent::{ResolvedCall, resolve_tool};
 use crate::{AgentEvent, BatchProgressEvent, BatchToolEntry, BatchToolStatus, ToolOutput};
-use serde::Deserialize;
+use serde::de::{self, MapAccess, Visitor};
+use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 
 use crate::task_set::TaskSet;
@@ -20,12 +21,82 @@ use super::{ToolCall, ToolContext};
 
 const MAX_BATCH_SIZE: usize = 25;
 
-#[derive(Args, Debug, Clone, Deserialize)]
+#[derive(Args, Debug, Clone)]
 pub(super) struct BatchEntry {
     #[param(description = "The name of the tool to execute")]
     tool: String,
     #[param(description = "Parameters for the tool")]
     parameters: Value,
+}
+
+/// Models sometimes send batch entries with flat fields:
+///   `{"tool": "glob", "path": "/tmp", "pattern": "*.rs"}`
+/// instead of the expected nested format:
+///   `{"tool": "glob", "parameters": {"path": "/tmp", "pattern": "*.rs"}}`
+///
+/// This custom deserializer accepts both. When `parameters` is missing,
+/// every field that isn't `tool` is collected into a `parameters` object.
+/// When both `parameters` and flat fields are present, they are merged
+/// (duplicate keys are rejected).
+impl<'de> Deserialize<'de> for BatchEntry {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct BatchEntryVisitor;
+
+        impl<'de> Visitor<'de> for BatchEntryVisitor {
+            type Value = BatchEntry;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a batch entry with 'tool' and either 'parameters' or flat tool params")
+            }
+
+            fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<BatchEntry, M::Error> {
+                let mut tool: Option<String> = None;
+                let mut parameters: Option<Value> = None;
+                let mut rest = serde_json::Map::new();
+
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "tool" => {
+                            tool = Some(map.next_value()?);
+                        }
+                        "parameters" => {
+                            parameters = Some(map.next_value()?);
+                        }
+                        _ => {
+                            rest.insert(key, map.next_value()?);
+                        }
+                    }
+                }
+
+                let tool = tool.ok_or_else(|| de::Error::missing_field("tool"))?;
+                let parameters = match parameters {
+                    Some(p) if rest.is_empty() => p,
+                    Some(Value::Object(mut obj)) => {
+                        for (k, v) in rest {
+                            if obj.contains_key(&k) {
+                                return Err(de::Error::custom(format_args!(
+                                    "duplicate parameter '{k}' in both 'parameters' and flat fields"
+                                )));
+                            }
+                            obj.insert(k, v);
+                        }
+                        Value::Object(obj)
+                    }
+                    Some(_) => {
+                        return Err(de::Error::custom(
+                            "'parameters' must be an object when flat fields are also present",
+                        ));
+                    }
+                    None if !rest.is_empty() => Value::Object(rest),
+                    None => return Err(de::Error::missing_field("parameters")),
+                };
+
+                Ok(BatchEntry { tool, parameters })
+            }
+        }
+
+        deserializer.deserialize_map(BatchEntryVisitor)
+    }
 }
 
 impl BatchEntry {
@@ -348,6 +419,89 @@ mod tests {
                     .any(|env| matches!(&env.event, AgentEvent::ToolDone(done) if !done.is_error)),
                 "batch inner tool must emit ToolDone"
             );
+        });
+    }
+
+    #[test]
+    fn flat_batch_entry_deserialized_as_nested() {
+        let flat = json!({
+            "tool_calls": [
+                {"tool": "glob", "path": "/tmp", "pattern": "*.rs"},
+                {"tool": "read", "path": "/tmp/foo.txt"}
+            ]
+        });
+        let batch = Batch::parse_input(&flat).unwrap();
+        assert_eq!(batch.tool_calls.len(), 2);
+        assert_eq!(batch.tool_calls[0].tool, "glob");
+        assert_eq!(batch.tool_calls[0].parameters["path"], "/tmp");
+        assert_eq!(batch.tool_calls[0].parameters["pattern"], "*.rs");
+        assert_eq!(batch.tool_calls[1].tool, "read");
+        assert_eq!(batch.tool_calls[1].parameters["path"], "/tmp/foo.txt");
+    }
+
+    #[test]
+    fn nested_batch_entry_still_works() {
+        let nested = json!({
+            "tool_calls": [
+                {"tool": "glob", "parameters": {"path": "/tmp", "pattern": "*.rs"}}
+            ]
+        });
+        let batch = Batch::parse_input(&nested).unwrap();
+        assert_eq!(batch.tool_calls[0].tool, "glob");
+        assert_eq!(batch.tool_calls[0].parameters["path"], "/tmp");
+    }
+
+    #[test]
+    fn mixed_nested_and_flat_fields_merged() {
+        let mixed = json!({
+            "tool_calls": [
+                {"tool": "glob", "parameters": {"path": "/tmp"}, "pattern": "*.rs"}
+            ]
+        });
+        let batch = Batch::parse_input(&mixed).unwrap();
+        assert_eq!(batch.tool_calls[0].tool, "glob");
+        assert_eq!(batch.tool_calls[0].parameters["path"], "/tmp");
+        assert_eq!(batch.tool_calls[0].parameters["pattern"], "*.rs");
+    }
+
+    #[test]
+    fn mixed_with_duplicate_key_is_error() {
+        let dup = json!({
+            "tool_calls": [
+                {"tool": "glob", "parameters": {"pattern": "*.rs"}, "pattern": "*.txt"}
+            ]
+        });
+        assert!(Batch::parse_input(&dup).is_err());
+    }
+
+    #[test]
+    fn batch_entry_missing_tool_is_error() {
+        let no_tool = json!({"tool_calls": [{"parameters": {"path": "/tmp"}}]});
+        assert!(Batch::parse_input(&no_tool).is_err());
+    }
+
+    #[test]
+    fn batch_entry_missing_tool_and_params_is_error() {
+        let empty = json!({"tool_calls": [{}]});
+        assert!(Batch::parse_input(&empty).is_err());
+    }
+
+    #[test]
+    fn flat_batch_entries_actually_execute() {
+        smol::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            std::fs::write(dir.path().join("a.txt"), "hello").unwrap();
+            let dir_str = dir.path().to_string_lossy().to_string();
+
+            let (entries, text) = run_batch(json!({
+                "tool_calls": [
+                    {"tool": "glob", "path": dir_str, "pattern": "*.txt"}
+                ]
+            }))
+            .await;
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].status, BatchToolStatus::Success);
+            assert!(text.contains("a.txt"));
         });
     }
 }
