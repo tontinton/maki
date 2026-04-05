@@ -1,18 +1,17 @@
 use std::io;
 use std::path::Path;
 
+use crate::{GrepFileEntry, GrepLine, GrepMatchGroup, ToolOutput};
 use grep_regex::RegexMatcher;
 use grep_searcher::Searcher;
 use grep_searcher::SearcherBuilder;
 use grep_searcher::{Sink, SinkContext, SinkFinish, SinkMatch};
-use ignore::WalkBuilder;
-use ignore::overrides::OverrideBuilder;
-
-use crate::{GrepFileEntry, GrepLine, GrepMatchGroup, ToolOutput};
 use maki_tool_macro::Tool;
 use tracing::debug;
 
-use super::{NO_FILES_FOUND, mtime, relative_path, resolve_search_path, truncate_bytes};
+use super::{
+    NO_FILES_FOUND, mtime, relative_path, resolve_search_path, truncate_bytes, walk_builder,
+};
 
 pub(super) const INVALID_REGEX: &str = "invalid regex pattern";
 const MAX_PER_CALL_LIMIT: usize = 1000;
@@ -79,20 +78,8 @@ impl Grep {
                     .map_err(|e| format!("{INVALID_REGEX}: {e}"))?
             };
 
-            let mut walker = WalkBuilder::new(&search_path);
-            walker.hidden(false);
-
-            if let Some(glob) = &include {
-                let mut overrides = OverrideBuilder::new(&search_path);
-                overrides
-                    .add(glob)
-                    .map_err(|e| format!("invalid glob pattern: {e}"))?;
-                walker.overrides(
-                    overrides
-                        .build()
-                        .map_err(|e| format!("invalid glob pattern: {e}"))?,
-                );
-            }
+            let patterns: Vec<&str> = include.as_deref().into_iter().collect();
+            let walker = walk_builder(&search_path, &patterns)?;
 
             let mut builder = SearcherBuilder::new();
             builder

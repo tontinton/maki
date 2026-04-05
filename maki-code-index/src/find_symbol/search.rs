@@ -269,6 +269,7 @@ fn search_project(
     walker.max_filesize(Some(MAX_FILE_SIZE));
 
     let mut overrides = OverrideBuilder::new(dir);
+    let _ = overrides.add("!.git");
     for ext in lang.extensions() {
         let _ = overrides.add(&format!("*.{ext}"));
     }

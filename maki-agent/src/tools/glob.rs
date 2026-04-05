@@ -1,10 +1,8 @@
 use crate::ToolOutput;
-use ignore::WalkBuilder;
-use ignore::overrides::OverrideBuilder;
 use maki_tool_macro::Tool;
 use tracing::debug;
 
-use super::{mtime, relative_path, resolve_search_path};
+use super::{mtime, relative_path, resolve_search_path, walk_builder};
 
 #[derive(Tool, Debug, Clone)]
 pub struct Glob {
@@ -33,17 +31,7 @@ impl Glob {
                 "glob executing"
             );
 
-            let mut overrides = OverrideBuilder::new(&search_path);
-            overrides
-                .add(&pattern)
-                .map_err(|e| format!("invalid glob pattern: {e}"))?;
-            let overrides = overrides
-                .build()
-                .map_err(|e| format!("glob build error: {e}"))?;
-
-            let mut entries: Vec<_> = WalkBuilder::new(&search_path)
-                .hidden(false)
-                .overrides(overrides)
+            let mut entries: Vec<_> = walk_builder(&search_path, &[&pattern])?
                 .build()
                 .flatten()
                 .filter(|e| e.file_type().is_some_and(|ft| ft.is_file()))

@@ -35,6 +35,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use humantime::format_duration;
+use ignore::WalkBuilder;
 use serde_json::{Value, json};
 use std::future::Future;
 use tracing::{error, info, warn};
@@ -308,6 +309,33 @@ fn format_rel(prefix: &str, fallback: &str, rel: &Path) -> String {
     } else {
         format!("{prefix}{s}")
     }
+}
+
+/// Returns a `WalkBuilder` with `.hidden(false)` and `!.git` exclusion enforced.
+///
+/// Every tool that walks the file tree should use this instead of constructing
+/// a `WalkBuilder` directly. Extra override patterns (user globs, file-type
+/// filters) can be passed in.
+pub(crate) fn walk_builder(root: &str, patterns: &[&str]) -> Result<WalkBuilder, String> {
+    let mut ob = ignore::overrides::OverrideBuilder::new(root);
+    ob.add("!.git").expect("!.git is a valid glob");
+
+    for p in patterns {
+        ob.add(p)
+            .map_err(|e| format!("invalid glob pattern: {e}"))?;
+    }
+
+    let overrides = ob
+        .build()
+        .map_err(|e| format!("invalid glob pattern: {e}"))?;
+
+    // NOTE: .hidden(false) makes all dotfiles visible, including the .git/ dir.
+    // The .gitignore file never lists .git/ (git handles that implicitly), so
+    // git_ignore(true) does not help. The override is the same mechanism
+    // ripgrep uses for -g '!.git/'
+    let mut wb = WalkBuilder::new(root);
+    wb.hidden(false).overrides(overrides);
+    Ok(wb)
 }
 
 pub(crate) fn mtime(path: &Path) -> SystemTime {
@@ -1213,6 +1241,90 @@ mod tests {
     #[test_case(Value::String("".into()),                         "integer", None               ; "empty_string")]
     fn coerce_value_cases(val: Value, json_type: &str, expected: Option<Value>) {
         assert_eq!(coerce_value(&val, "test_field", json_type), expected);
+    }
+
+    #[test]
+    fn walk_builder_excludes_dot_git_but_shows_dotfiles() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        // create a fake .git dir with an object inside
+        fs::create_dir_all(root.join(".git/objects")).unwrap();
+        fs::write(root.join(".git/config"), "repositoryformatversion = 0").unwrap();
+        fs::write(root.join(".git/objects/abc123"), "blob").unwrap();
+
+        // create a regular dotfile and a normal file
+        fs::write(root.join(".env"), "SECRET=42").unwrap();
+        fs::write(root.join("main.rs"), "fn main() {}").unwrap();
+
+        let root_str = root.to_string_lossy();
+        let paths: Vec<String> = walk_builder(&root_str, &[])
+            .unwrap()
+            .build()
+            .flatten()
+            .filter(|e| e.file_type().is_some_and(|ft| ft.is_file()))
+            .map(|e| {
+                e.path()
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+
+        assert!(
+            paths.contains(&"main.rs".to_string()),
+            "normal files should appear"
+        );
+        assert!(
+            paths.contains(&".env".to_string()),
+            "dotfiles should appear"
+        );
+        assert!(
+            !paths.iter().any(|p| p.starts_with(".git")),
+            ".git/ contents should be excluded, got: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn walk_builder_excludes_dot_git_with_extra_patterns() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::write(root.join(".git/config"), "stuff").unwrap();
+        fs::write(root.join("lib.rs"), "pub fn foo() {}").unwrap();
+        fs::write(root.join("main.py"), "print('hi')").unwrap();
+        fs::write(root.join(".hidden.rs"), "// hidden").unwrap();
+
+        let root_str = root.to_string_lossy();
+        let paths: Vec<String> = walk_builder(&root_str, &["*.rs"])
+            .unwrap()
+            .build()
+            .flatten()
+            .filter(|e| e.file_type().is_some_and(|ft| ft.is_file()))
+            .map(|e| {
+                e.path()
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+
+        assert!(paths.contains(&"lib.rs".to_string()), "*.rs should match");
+        assert!(
+            paths.contains(&".hidden.rs".to_string()),
+            "hidden *.rs should match"
+        );
+        assert!(
+            !paths.contains(&"main.py".to_string()),
+            "*.py should be filtered"
+        );
+        assert!(
+            !paths.iter().any(|p| p.starts_with(".git")),
+            ".git/ should still be excluded, got: {paths:?}"
+        );
     }
 
     #[test]
