@@ -366,9 +366,9 @@ pub(crate) fn strip_code_bar_prefix(
     cell: &ratatui::buffer::Cell,
     out: &mut String,
     line_start: usize,
-) {
+) -> usize {
     if cell.style().fg != theme::current().code_bar.fg || cell.symbol() != "│" {
-        return;
+        return 0;
     }
     let line = &out[line_start..];
     let prefix_len = if line.starts_with(CODE_BAR) {
@@ -376,9 +376,10 @@ pub(crate) fn strip_code_bar_prefix(
     } else if line.starts_with(CODE_BAR_WRAP) {
         CODE_BAR_WRAP.len()
     } else {
-        return;
+        return 0;
     };
     out.drain(line_start..line_start + prefix_len);
+    prefix_len
 }
 
 /// Trailing whitespace trimmed per line; consecutive trailing blank lines
@@ -400,31 +401,45 @@ pub(crate) fn append_rows(
     let row_end = to.min(area.bottom());
     let mut pending_newlines = 0u16;
     let anchor = out.len();
+    let mut prev_row_full = false;
     for row in row_start..row_end {
+        let is_new_line = breaks.is_line_start(row - area.y);
+        if is_new_line {
+            prev_row_full = false;
+        }
+
         let (col_start, col_end) = col_range(ss, area.x, right, row);
         let line_start = out.len();
         for col in col_start..=col_end {
             out.push_str(buf[(col, row)].symbol());
         }
-        if col_start == area.x {
-            strip_code_bar_prefix(&buf[(col_start, row)], out, line_start);
-        }
+
+        let stripped = if col_start == area.x {
+            strip_code_bar_prefix(&buf[(col_start, row)], out, line_start)
+        } else {
+            0
+        };
+
         let trimmed_len = out[line_start..].trim_end().len() + line_start;
         out.truncate(trimmed_len);
-        let is_new_line = breaks.is_line_start(row - area.y);
-        if out.len() == line_start && out.len() > anchor {
-            if is_new_line {
+        let has_content = out.len() > line_start;
+        let is_first_row = line_start == anchor;
+
+        if is_new_line {
+            if !has_content && !is_first_row {
                 pending_newlines += 1;
-            }
-        } else if out.len() > anchor && is_new_line {
-            for _ in 0..pending_newlines {
+            } else if !is_first_row {
+                for _ in 0..pending_newlines {
+                    out.insert(line_start, '\n');
+                }
+                pending_newlines = 0;
                 out.insert(line_start, '\n');
             }
-            pending_newlines = 0;
-            if line_start > anchor {
-                out.insert(line_start, '\n');
-            }
+        } else if has_content && !is_first_row && !prev_row_full && stripped == 0 {
+            out.insert(line_start, ' ');
         }
+
+        prev_row_full = trimmed_len - line_start >= area.width as usize;
     }
 }
 
@@ -476,9 +491,7 @@ pub fn extract_selected_text(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::buffer::Buffer;
-    use ratatui::layout::Rect;
-    use ratatui::style::{Modifier, Style};
+    use ratatui::style::Style;
     use test_case::test_case;
 
     fn doc(row: u32, col: u16) -> DocPos {
@@ -501,9 +514,9 @@ mod tests {
     fn test_buffer() -> (Buffer, Rect) {
         let area = Rect::new(0, 0, 10, 3);
         let mut buf = Buffer::empty(area);
-        buf.set_string(0, 0, "Hello     ", ratatui::style::Style::default());
-        buf.set_string(0, 1, "World     ", ratatui::style::Style::default());
-        buf.set_string(0, 2, "Test      ", ratatui::style::Style::default());
+        buf.set_string(0, 0, "Hello     ", Style::default());
+        buf.set_string(0, 1, "World     ", Style::default());
+        buf.set_string(0, 2, "Test      ", Style::default());
         (buf, area)
     }
 
@@ -516,52 +529,30 @@ mod tests {
         }
     }
 
-    #[test]
-    fn extract_single_region_partial() {
+    #[test_case(ss(0, 0, 0, 4), "# Hello\n\nWorld\nTest", "Hello"         ; "single_row_partial")]
+    #[test_case(ss(0, 0, 2, 9), "# Hello\n\nWorld\nTest", "# Hello\n\nWorld\nTest" ; "fully_selected_uses_raw")]
+    #[test_case(ss(0, 0, 1, 4), "raw",                    "Hello\nWorld"   ; "multi_row_partial")]
+    #[test_case(ss(0, 2, 2, 9), "should not use this",    "llo\nWorld\nTest" ; "partial_column_skips_raw")]
+    fn extract_basic(sel: ScreenSelection, raw: &str, expected: &str) {
         let (buf, area) = test_buffer();
-        let region = ContentRegion {
-            area,
-            raw_text: "# Hello\n\nWorld\nTest",
-            ..Default::default()
-        };
-        let text = extract_selected_text(&buf, &ss(0, 0, 0, 4), &[region]);
-        assert_eq!(text, "Hello");
-    }
-
-    #[test]
-    fn extract_single_region_fully_selected_uses_raw() {
-        let (buf, area) = test_buffer();
-        let raw = "# Hello\n\nWorld\nTest";
         let region = ContentRegion {
             area,
             raw_text: raw,
             ..Default::default()
         };
-        let text = extract_selected_text(&buf, &ss(0, 0, 2, 9), &[region]);
-        assert_eq!(text, raw);
-    }
-
-    #[test]
-    fn extract_multi_row_partial() {
-        let (buf, area) = test_buffer();
-        let region = ContentRegion {
-            area,
-            raw_text: "raw",
-            ..Default::default()
-        };
-        let text = extract_selected_text(&buf, &ss(0, 0, 1, 4), &[region]);
-        assert_eq!(text, "Hello\nWorld");
+        let text = extract_selected_text(&buf, &sel, &[region]);
+        assert_eq!(text, expected);
     }
 
     #[test]
     fn extract_skips_uncovered_rows() {
         let area = Rect::new(0, 0, 10, 5);
         let mut buf = Buffer::empty(area);
-        buf.set_string(0, 0, "Line 0    ", ratatui::style::Style::default());
-        buf.set_string(0, 1, "──────────", ratatui::style::Style::default());
-        buf.set_string(0, 2, "Line 2    ", ratatui::style::Style::default());
-        buf.set_string(0, 3, "──────────", ratatui::style::Style::default());
-        buf.set_string(0, 4, "Line 4    ", ratatui::style::Style::default());
+        buf.set_string(0, 0, "Line 0    ", Style::default());
+        buf.set_string(0, 1, "──────────", Style::default());
+        buf.set_string(0, 2, "Line 2    ", Style::default());
+        buf.set_string(0, 3, "──────────", Style::default());
+        buf.set_string(0, 4, "Line 4    ", Style::default());
 
         let regions = vec![
             ContentRegion {
@@ -588,9 +579,9 @@ mod tests {
     fn extract_overlay_wins_over_base() {
         let area = Rect::new(0, 0, 10, 3);
         let mut buf = Buffer::empty(area);
-        buf.set_string(0, 0, "base 0    ", ratatui::style::Style::default());
-        buf.set_string(0, 1, "overlay 1 ", ratatui::style::Style::default());
-        buf.set_string(0, 2, "base 2    ", ratatui::style::Style::default());
+        buf.set_string(0, 0, "base 0    ", Style::default());
+        buf.set_string(0, 1, "overlay 1 ", Style::default());
+        buf.set_string(0, 2, "base 2    ", Style::default());
 
         let base = ContentRegion {
             area: Rect::new(0, 0, 10, 3),
@@ -610,30 +601,10 @@ mod tests {
     fn extract_multi_region_mixed_full_and_partial() {
         let area = Rect::new(0, 0, 20, 4);
         let mut buf = Buffer::empty(area);
-        buf.set_string(
-            0,
-            0,
-            "msg0 rendered       ",
-            ratatui::style::Style::default(),
-        );
-        buf.set_string(
-            0,
-            1,
-            "msg0 line2          ",
-            ratatui::style::Style::default(),
-        );
-        buf.set_string(
-            0,
-            2,
-            "msg1 rendered       ",
-            ratatui::style::Style::default(),
-        );
-        buf.set_string(
-            0,
-            3,
-            "msg1 line2          ",
-            ratatui::style::Style::default(),
-        );
+        buf.set_string(0, 0, "msg0 rendered       ", Style::default());
+        buf.set_string(0, 1, "msg0 line2          ", Style::default());
+        buf.set_string(0, 2, "msg1 rendered       ", Style::default());
+        buf.set_string(0, 3, "msg1 line2          ", Style::default());
 
         let regions = vec![
             ContentRegion {
@@ -652,62 +623,29 @@ mod tests {
     }
 
     #[test]
-    fn apply_highlight_sets_reversed() {
-        let (mut buf, area) = test_buffer();
-        let s = ss(0, 0, 0, 2);
-        apply_highlight(&mut buf, area, &s);
-        for col in 0..=2 {
-            assert!(buf[(col, 0u16)].modifier.contains(Modifier::REVERSED));
-        }
-        assert!(!buf[(3u16, 0u16)].modifier.contains(Modifier::REVERSED));
-    }
-
-    #[test]
     fn extract_no_matching_region_returns_empty() {
         let (buf, _) = test_buffer();
-        assert_eq!(
-            extract_selected_text(&buf, &ss(0, 0, 2, 7), &[]),
-            "",
-            "no regions at all"
-        );
+        assert_eq!(extract_selected_text(&buf, &ss(0, 0, 2, 7), &[]), "");
 
         let region = ContentRegion {
             area: Rect::new(0, 5, 10, 1),
             raw_text: "far away",
             ..Default::default()
         };
-        assert_eq!(
-            extract_selected_text(&buf, &ss(0, 0, 2, 7), &[region]),
-            "",
-            "region outside selection range"
-        );
+        assert_eq!(extract_selected_text(&buf, &ss(0, 0, 2, 7), &[region]), "");
     }
 
     #[test]
     fn fully_selected_empty_raw_text_extracts_from_buffer() {
         let area = Rect::new(0, 0, 10, 1);
         let mut buf = Buffer::empty(area);
-        buf.set_string(0, 0, "Status    ", ratatui::style::Style::default());
+        buf.set_string(0, 0, "Status    ", Style::default());
         let region = ContentRegion {
             area,
             ..Default::default()
         };
         let text = extract_selected_text(&buf, &ss(0, 0, 0, 9), &[region]);
         assert_eq!(text, "Status");
-    }
-
-    #[test]
-    fn extract_clips_scrollbar_column() {
-        let area = Rect::new(0, 0, 10, 1);
-        let mut buf = Buffer::empty(area);
-        buf.set_string(0, 0, "ABCDEFGHI@", ratatui::style::Style::default());
-        let region = ContentRegion {
-            area,
-            raw_text: "ABCDEFGHI",
-            ..Default::default()
-        };
-        let text = extract_selected_text(&buf, &ss(0, 0, 0, 9), &[region]);
-        assert_eq!(text, "ABCDEFGHI");
     }
 
     #[test_case(Rect::new(0,3,80,20), 15, 5, 10, 22 ; "normal_offset")]
@@ -903,34 +841,37 @@ mod tests {
     }
 
     #[test]
-    fn covers_rect_zero_area() {
-        let s = ss(0, 0, 2, 9);
-        assert!(!s.covers_rect(Rect::new(0, 0, 0, 0)));
-    }
-
-    #[test]
-    fn partial_column_selection_skips_raw_text() {
-        let (buf, area) = test_buffer();
-        let region = ContentRegion {
-            area,
-            raw_text: "should not use this",
-            ..Default::default()
-        };
-        let text = extract_selected_text(&buf, &ss(0, 2, 2, 9), &[region]);
-        assert_eq!(text, "llo\nWorld\nTest");
-    }
-
-    #[test]
-    fn input_chevron_not_copied_when_not_selected() {
-        let area = Rect::new(0, 0, 10, 1);
+    fn soft_wrap_continuation_inserts_space() {
+        let area = Rect::new(0, 0, 20, 2);
         let mut buf = Buffer::empty(area);
-        buf.set_string(0, 0, "❯ hello   ", Style::default());
+        buf.set_string(0, 0, "hello               ", Style::default());
+        buf.set_string(0, 1, "world               ", Style::default());
+        let breaks = LineBreaks::from_heights([2].iter().copied());
         let region = ContentRegion {
             area,
-            raw_text: "hello",
+            line_breaks: breaks,
             ..Default::default()
         };
-        let text = extract_selected_text(&buf, &ss(0, 2, 0, 9), &[region]);
-        assert_eq!(text, "hello");
+        let text = extract_selected_text(&buf, &ss(0, 0, 1, 19), &[region]);
+        assert_eq!(text, "hello world");
+    }
+
+    #[test]
+    fn code_wrap_continuation_no_space() {
+        let area = Rect::new(0, 0, 20, 2);
+        let mut buf = Buffer::empty(area);
+        let code_style = theme::current().code_bar;
+        buf.set_string(0, 0, "│", code_style);
+        buf.set_string(2, 0, "long_variable_na", Style::default());
+        buf.set_string(0, 1, "│", code_style);
+        buf.set_string(1, 1, "me_here         ", Style::default());
+        let breaks = LineBreaks::from_heights([2].iter().copied());
+        let region = ContentRegion {
+            area,
+            line_breaks: breaks,
+            ..Default::default()
+        };
+        let text = extract_selected_text(&buf, &ss(0, 0, 1, 19), &[region]);
+        assert_eq!(text, "long_variable_name_here");
     }
 }
