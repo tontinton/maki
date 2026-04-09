@@ -60,13 +60,7 @@
                                  '#![doc = "Monty Python bridge."]'
               done
             '';
-            buildInputs =
-              with pkgs;
-              [ openssl ]
-              ++ lib.optionals stdenv.isDarwin [
-                darwin.apple_sdk.frameworks.AppKit
-                darwin.apple_sdk.frameworks.ApplicationServices
-              ];
+            buildInputs = with pkgs; [ openssl ];
             doCheck = false;
           };
         in
