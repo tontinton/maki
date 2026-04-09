@@ -1,7 +1,7 @@
 use flume::Sender;
 use serde_json::Value;
 
-use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier};
+use crate::model::{Model, ModelEntry};
 use crate::provider::{BoxFuture, Provider};
 use crate::{AgentError, Message, ProviderEvent, StreamResponse, ThinkingConfig};
 
@@ -20,35 +20,7 @@ static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
 };
 
 pub(crate) fn models() -> &'static [ModelEntry] {
-    &[
-        ModelEntry {
-            prefixes: &["qwen3:1.7b"],
-            tier: ModelTier::Weak,
-            family: ModelFamily::Generic,
-            default: true,
-            pricing: ModelPricing::ZERO,
-            max_output_tokens: DEFAULT_MAX_OUTPUT,
-            context_window: DEFAULT_CONTEXT,
-        },
-        ModelEntry {
-            prefixes: &["qwen3:8b"],
-            tier: ModelTier::Medium,
-            family: ModelFamily::Generic,
-            default: true,
-            pricing: ModelPricing::ZERO,
-            max_output_tokens: DEFAULT_MAX_OUTPUT,
-            context_window: DEFAULT_CONTEXT,
-        },
-        ModelEntry {
-            prefixes: &["qwen3"],
-            tier: ModelTier::Strong,
-            family: ModelFamily::Generic,
-            default: true,
-            pricing: ModelPricing::ZERO,
-            max_output_tokens: DEFAULT_MAX_OUTPUT,
-            context_window: DEFAULT_CONTEXT,
-        },
-    ]
+    &[]
 }
 
 pub struct Ollama {

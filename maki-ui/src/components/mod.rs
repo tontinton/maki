@@ -44,7 +44,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use maki_agent::AgentInput;
 use maki_agent::{ToolInput, ToolOutput};
-use maki_providers::Message;
+use maki_providers::{Message, ModelTier};
 use ratatui::text::{Line, Span};
 
 pub(crate) fn hint_line(pairs: &[(&str, &str)]) -> Line<'static> {
@@ -181,6 +181,7 @@ pub enum Action {
     NewSession,
     LoadSession(Box<LoadedSession>),
     ChangeModel(String),
+    AssignTier(String, ModelTier),
     Compact,
     ToggleMcp(String, bool),
     OpenEditor(PathBuf),

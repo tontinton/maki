@@ -1,21 +1,50 @@
 use std::sync::Arc;
 
 use arc_swap::ArcSwapOption;
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
+use ratatui::text::{Line, Span};
 
+use maki_providers::ModelTier;
 use maki_providers::dynamic;
 use maki_providers::provider::ProviderKind;
 
 use crate::components::Overlay;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
+use crate::theme;
 
 const TITLE: &str = " Models ";
+
+fn footer_line() -> Line<'static> {
+    let t = theme::current();
+    Line::from(vec![
+        Span::styled("  Enter", t.keybind_key),
+        Span::styled(" select", t.form_hint),
+        Span::styled("  1 ", t.keybind_key),
+        Span::styled("(set strong)", t.form_hint),
+        Span::styled(" / ", t.form_hint),
+        Span::styled("2 ", t.keybind_key),
+        Span::styled("(set medium)", t.form_hint),
+        Span::styled(" / ", t.form_hint),
+        Span::styled("3 ", t.keybind_key),
+        Span::styled("(set weak)", t.form_hint),
+    ])
+}
+
+fn tier_for_shortcut(code: KeyCode) -> Option<ModelTier> {
+    match code {
+        KeyCode::Char('1') => Some(ModelTier::Strong),
+        KeyCode::Char('2') => Some(ModelTier::Medium),
+        KeyCode::Char('3') => Some(ModelTier::Weak),
+        _ => None,
+    }
+}
 
 pub enum ModelPickerAction {
     Consumed,
     Select(String),
+    AssignTier(String, ModelTier),
     Close,
 }
 
@@ -49,7 +78,7 @@ pub struct ModelPicker {
 impl ModelPicker {
     pub fn new(models: Arc<ArcSwapOption<Vec<String>>>) -> Self {
         Self {
-            picker: ListPicker::new(),
+            picker: ListPicker::new().with_footer_builder(footer_line),
             models,
             last_spec_count: 0,
         }
@@ -110,6 +139,15 @@ impl ModelPicker {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> ModelPickerAction {
+        if let Some(tier) = tier_for_shortcut(key.code)
+            && let Some(entry) = self.picker.selected_item()
+        {
+            let spec = entry.spec.clone();
+            let id = entry.id.clone();
+            self.picker
+                .with_item_mut(&id, |e| e.tier = tier.to_string());
+            return ModelPickerAction::AssignTier(spec, tier);
+        }
         match self.picker.handle_key(key) {
             PickerAction::Consumed => ModelPickerAction::Consumed,
             PickerAction::Select(_, entry) => ModelPickerAction::Select(entry.spec),
@@ -262,5 +300,21 @@ mod tests {
     #[test]
     fn parse_model_entry_no_slash() {
         assert!(parse_model_entry("no-slash").is_none());
+    }
+
+    // Regression: 1/2/3 must work on every provider, not just Ollama.
+    #[test_case(KeyCode::Char('1'), ModelTier::Strong ; "1_strong")]
+    #[test_case(KeyCode::Char('2'), ModelTier::Medium ; "2_medium")]
+    #[test_case(KeyCode::Char('3'), ModelTier::Weak   ; "3_weak")]
+    fn tier_shortcut_assigns_and_keeps_picker_open(code: KeyCode, want: ModelTier) {
+        let mut p = ModelPicker::new(test_models());
+        p.open("");
+        let action = p.handle_key(key(code));
+        assert!(
+            matches!(&action, ModelPickerAction::AssignTier(s, t)
+                if s == "anthropic/claude-sonnet-4-20250514" && *t == want),
+            "expected AssignTier(claude-sonnet, {want:?}), got something else",
+        );
+        assert!(p.is_open());
     }
 }

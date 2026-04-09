@@ -54,7 +54,7 @@ pub enum ModelFamily {
     Synthetic,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ModelTier {
     Weak,
@@ -152,6 +152,13 @@ impl Model {
     }
 
     pub fn from_tier(provider: ProviderKind, tier: ModelTier) -> Result<Self, ModelError> {
+        if let Some(spec) = crate::tier_map::tier_map()
+            .read()
+            .unwrap()
+            .spec_for_tier(provider, tier)
+        {
+            return Self::from_spec(&spec);
+        }
         let entries = models_for_provider(provider);
         let entry = entries
             .iter()
@@ -181,38 +188,38 @@ impl Model {
         let (provider_str, model_id) = spec.split_once('/').ok_or(ModelError::InvalidFormat)?;
 
         if let Ok(provider) = ProviderKind::from_str(provider_str) {
-            let entries = models_for_provider(provider);
-            match lookup_entry(entries, model_id) {
-                Ok(entry) => {
-                    return Ok(Self {
-                        id: model_id.to_string(),
-                        provider,
-                        dynamic_slug: None,
-                        tier: entry.tier,
-                        family: entry.family,
-                        supports_tool_examples_override: None,
-                        pricing: entry.pricing.clone(),
-                        max_output_tokens: entry.max_output_tokens,
-                        context_window: entry.context_window,
-                    });
-                }
-                Err(e) => {
-                    if provider.accepts_arbitrary_models() {
-                        return Ok(Self {
-                            id: model_id.to_string(),
-                            provider,
-                            dynamic_slug: None,
-                            tier: ModelTier::Medium,
-                            family: provider.family(),
-                            supports_tool_examples_override: None,
-                            pricing: ModelPricing::ZERO,
-                            max_output_tokens: ollama::DEFAULT_MAX_OUTPUT,
-                            context_window: ollama::DEFAULT_CONTEXT,
-                        });
-                    }
-                    return Err(e);
-                }
-            }
+            let static_entry = lookup_entry(models_for_provider(provider), model_id).ok();
+            let tier = crate::tier_map::tier_map().read().unwrap().tier_for(
+                spec,
+                provider,
+                static_entry.map(|e| e.tier),
+            );
+            let (family, pricing, max_output_tokens, context_window) = match static_entry {
+                Some(e) => (
+                    e.family,
+                    e.pricing.clone(),
+                    e.max_output_tokens,
+                    e.context_window,
+                ),
+                None if provider.accepts_arbitrary_models() => (
+                    provider.family(),
+                    ModelPricing::ZERO,
+                    ollama::DEFAULT_MAX_OUTPUT,
+                    ollama::DEFAULT_CONTEXT,
+                ),
+                None => return Err(ModelError::UnknownModel(model_id.to_string())),
+            };
+            return Ok(Self {
+                id: model_id.to_string(),
+                provider,
+                dynamic_slug: None,
+                tier,
+                family,
+                supports_tool_examples_override: None,
+                pricing,
+                max_output_tokens,
+                context_window,
+            });
         }
 
         if let Some(base) = dynamic::base_for_slug(provider_str) {
@@ -334,6 +341,9 @@ mod tests {
     #[test]
     fn spec_roundtrip() {
         for provider in ProviderKind::iter() {
+            if provider.accepts_arbitrary_models() {
+                continue;
+            }
             let model = Model::from_tier(provider, ModelTier::Medium).unwrap();
             let round = Model::from_spec(&model.spec()).unwrap();
             assert_eq!(round.id, model.id);
@@ -344,6 +354,9 @@ mod tests {
     #[test]
     fn from_tier_covers_all_providers() {
         for provider in ProviderKind::iter() {
+            if provider.accepts_arbitrary_models() {
+                continue;
+            }
             for &tier in &TIERS {
                 let model = Model::from_tier(provider, tier).unwrap();
                 assert_eq!(model.provider, provider);
@@ -369,6 +382,9 @@ mod tests {
     #[test]
     fn exactly_one_default_per_provider_tier() {
         for provider in ProviderKind::iter() {
+            if provider.accepts_arbitrary_models() {
+                continue;
+            }
             let entries = models_for_provider(provider);
             for &tier in &TIERS {
                 let count = entries

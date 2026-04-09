@@ -77,7 +77,21 @@ pub struct ListPicker<T> {
     title: &'static str,
     max_visible: Option<u16>,
     generation: u64,
-    footer_hints: Option<&'static [(&'static str, &'static str)]>,
+    footer: Option<FooterSpec>,
+}
+
+enum FooterSpec {
+    Pairs(&'static [(&'static str, &'static str)]),
+    Builder(fn() -> Line<'static>),
+}
+
+impl FooterSpec {
+    fn build(&self) -> Line<'static> {
+        match self {
+            Self::Pairs(hints) => hint_line(hints),
+            Self::Builder(b) => b(),
+        }
+    }
 }
 
 struct State<T> {
@@ -207,7 +221,7 @@ impl<T: PickerItem> ListPicker<T> {
             title: "",
             max_visible: None,
             generation: 0,
-            footer_hints: None,
+            footer: None,
         }
     }
 
@@ -217,7 +231,12 @@ impl<T: PickerItem> ListPicker<T> {
     }
 
     pub fn with_footer(mut self, hints: &'static [(&'static str, &'static str)]) -> Self {
-        self.footer_hints = Some(hints);
+        self.footer = Some(FooterSpec::Pairs(hints));
+        self
+    }
+
+    pub fn with_footer_builder(mut self, builder: fn() -> Line<'static>) -> Self {
+        self.footer = Some(FooterSpec::Builder(builder));
         self
     }
 
@@ -475,7 +494,7 @@ impl<T: PickerItem> ListPicker<T> {
     }
 
     pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
-        let footer = self.footer_hints;
+        let footer = self.footer.as_ref();
         let footer_rows = if footer.is_some() { 1u16 } else { 0 };
         match self.state.as_mut() {
             None => Rect::default(),
@@ -505,8 +524,8 @@ impl<T: PickerItem> ListPicker<T> {
                 ));
                 frame.render_widget(Paragraph::new(vec![line]), list_area);
                 render_search(frame, search_area, &TextBuffer::new(String::new()));
-                if let Some(hints) = footer {
-                    render_footer(frame, areas[2], hints);
+                if let Some(spec) = footer {
+                    render_footer(frame, areas[2], spec);
                 }
                 popup
             }
@@ -533,9 +552,9 @@ fn render_ready<T: PickerItem>(
     s: &mut State<T>,
     title: &'static str,
     max_visible: Option<u16>,
-    footer_hints: Option<&[(&str, &str)]>,
+    footer: Option<&FooterSpec>,
 ) -> Rect {
-    let footer_rows = if footer_hints.is_some() { 1u16 } else { 0 };
+    let footer_rows = if footer.is_some() { 1u16 } else { 0 };
     let content_rows = if s.filtered.is_empty() {
         1
     } else {
@@ -555,7 +574,7 @@ fn render_ready<T: PickerItem>(
     s.viewport_height = viewport_h as usize;
     s.ensure_visible();
 
-    let constraints: Vec<Constraint> = if footer_hints.is_some() {
+    let constraints: Vec<Constraint> = if footer.is_some() {
         vec![
             Constraint::Min(1),
             Constraint::Length(1),
@@ -580,8 +599,8 @@ fn render_ready<T: PickerItem>(
     );
     render_search(frame, search_area, &s.search);
 
-    if let Some(hints) = footer_hints {
-        render_footer(frame, areas[2], hints);
+    if let Some(spec) = footer {
+        render_footer(frame, areas[2], spec);
     }
 
     let total_visual = visual_rows_in_range(&s.filtered, &s.items, 0, s.filtered.len());
@@ -797,8 +816,8 @@ fn render_search(frame: &mut Frame, area: Rect, search: &TextBuffer) {
     frame.render_widget(Paragraph::new(vec![line]), area);
 }
 
-fn render_footer(frame: &mut Frame, area: Rect, hints: &[(&str, &str)]) {
-    frame.render_widget(Paragraph::new(vec![hint_line(hints)]), area);
+fn render_footer(frame: &mut Frame, area: Rect, spec: &FooterSpec) {
+    frame.render_widget(Paragraph::new(vec![spec.build()]), area);
 }
 
 #[cfg(test)]

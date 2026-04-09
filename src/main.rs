@@ -290,6 +290,7 @@ fn run() -> Result<()> {
         }
         None => {
             let storage = DataDir::resolve().context("resolve data directory")?;
+            maki_providers::tier_map::load_from_storage(&storage);
             let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
             let mut config = load_config(&cwd, cli.no_rtk);
             if cli.yolo || config.always_yolo {

@@ -15,7 +15,7 @@ use crate::providers::synthetic::Synthetic;
 use crate::providers::zai::{Zai, ZaiPlan};
 use crate::{AgentError, Message, ProviderEvent, StreamResponse, ThinkingConfig};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Display, EnumString, EnumIter)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Display, EnumString, EnumIter)]
 #[strum(serialize_all = "kebab-case")]
 pub enum ProviderKind {
     Anthropic,
@@ -174,10 +174,18 @@ pub async fn fetch_all_models(mut on_ready: impl FnMut(ModelBatch)) {
         let tx = tx.clone();
         smol::spawn(async move {
             let batch = match provider.list_models().await {
-                Ok(ids) => ModelBatch {
-                    models: ids.into_iter().map(|id| format!("{kind}/{id}")).collect(),
-                    warnings: Vec::new(),
-                },
+                Ok(ids) => {
+                    if kind.accepts_arbitrary_models() {
+                        crate::tier_map::tier_map()
+                            .write()
+                            .unwrap()
+                            .set_known_models(kind, ids.clone());
+                    }
+                    ModelBatch {
+                        models: ids.into_iter().map(|id| format!("{kind}/{id}")).collect(),
+                        warnings: Vec::new(),
+                    }
+                }
                 Err(e) => {
                     warn!(provider = %kind, error = %e, "failed to list models, using static fallback");
                     let fallback: Vec<String> = models_for_provider(kind)

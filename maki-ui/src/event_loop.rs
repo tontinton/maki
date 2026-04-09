@@ -387,6 +387,9 @@ impl<'t> EventLoop<'t> {
                     .unwrap_or_else(|e| e.into_inner()) = loaded.tool_outputs;
             }
             Action::ChangeModel(spec) => self.change_model(spec),
+            Action::AssignTier(spec, tier) => {
+                maki_providers::tier_map::set_and_persist(spec, tier, &self.app.storage);
+            }
             Action::Compact => {
                 self.handles.queue.push(QueueItem::Compact {
                     run_id: self.app.run_id,

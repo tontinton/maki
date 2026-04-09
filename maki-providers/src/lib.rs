@@ -3,6 +3,7 @@ pub mod model;
 pub mod provider;
 pub(crate) mod providers;
 pub mod retry;
+pub mod tier_map;
 pub(crate) mod types;
 
 pub use error::AgentError;

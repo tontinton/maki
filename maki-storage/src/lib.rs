@@ -59,7 +59,7 @@ pub enum StorageError {
     SlugCollision,
 }
 
-pub(crate) fn atomic_write(path: &Path, data: &[u8]) -> Result<(), StorageError> {
+pub fn atomic_write(path: &Path, data: &[u8]) -> Result<(), StorageError> {
     let tmp = path.with_extension("tmp");
     let mut f = fs::File::create(&tmp)?;
     f.write_all(data)?;
