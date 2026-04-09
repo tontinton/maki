@@ -116,15 +116,18 @@ impl OpenAi {
     }
 
     fn codex_auth(&self) -> Result<ResolvedAuth, AgentError> {
-        let storage = self.storage.as_ref().ok_or_else(|| AgentError::Config {
-            message: "Codex models require OAuth authentication".into(),
-        })?;
-        let tokens = maki_storage::auth::load_tokens(storage, auth::PROVIDER).ok_or_else(|| {
-            AgentError::Config {
-                message: "Codex models require OAuth, run `maki auth login openai`".into(),
+        // Prefer OAuth tokens for the ChatGPT Coding Plan backend.
+        if let Some(storage) = self.storage.as_ref() {
+            if let Some(tokens) = maki_storage::auth::load_tokens(storage, auth::PROVIDER) {
+                return Ok(auth::build_coding_plan_resolved(&tokens));
             }
-        })?;
-        Ok(auth::build_coding_plan_resolved(&tokens))
+        }
+        // Fall back to standard API key via the Responses API.
+        let mut auth = self.current_auth();
+        if auth.base_url.is_none() {
+            auth.base_url = Some(CONFIG.base_url.into());
+        }
+        Ok(auth)
     }
 }
 
