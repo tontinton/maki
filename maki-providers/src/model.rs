@@ -10,7 +10,7 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 
 use crate::provider::ProviderKind;
-use crate::providers::{anthropic, dynamic, openai, synthetic, zai};
+use crate::providers::{anthropic, dynamic, ollama, openai, synthetic, zai};
 
 const PER_MILLION: f64 = 1_000_000.0;
 
@@ -36,9 +36,19 @@ pub struct ModelPricing {
     pub cache_read: f64,
 }
 
+impl ModelPricing {
+    pub const ZERO: Self = Self {
+        input: 0.0,
+        output: 0.0,
+        cache_write: 0.0,
+        cache_read: 0.0,
+    };
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelFamily {
     Claude,
+    Generic,
     Glm,
     Gpt,
     Synthetic,
@@ -99,6 +109,7 @@ pub fn models_for_provider(provider: ProviderKind) -> &'static [ModelEntry] {
     match provider {
         ProviderKind::Anthropic => anthropic::models(),
         ProviderKind::OpenAi => openai::models(),
+        ProviderKind::Ollama => ollama::models(),
         ProviderKind::Zai | ProviderKind::ZaiCodingPlan => zai::models(),
         ProviderKind::Synthetic => synthetic::models(),
     }
@@ -108,7 +119,7 @@ impl ModelFamily {
     pub fn supports_tool_examples(self) -> bool {
         match self {
             ModelFamily::Claude | ModelFamily::Gpt | ModelFamily::Synthetic => true,
-            ModelFamily::Glm => false,
+            ModelFamily::Generic | ModelFamily::Glm => false,
         }
     }
 }
@@ -171,18 +182,37 @@ impl Model {
 
         if let Ok(provider) = ProviderKind::from_str(provider_str) {
             let entries = models_for_provider(provider);
-            let entry = lookup_entry(entries, model_id)?;
-            return Ok(Self {
-                id: model_id.to_string(),
-                provider,
-                dynamic_slug: None,
-                tier: entry.tier,
-                family: entry.family,
-                supports_tool_examples_override: None,
-                pricing: entry.pricing.clone(),
-                max_output_tokens: entry.max_output_tokens,
-                context_window: entry.context_window,
-            });
+            match lookup_entry(entries, model_id) {
+                Ok(entry) => {
+                    return Ok(Self {
+                        id: model_id.to_string(),
+                        provider,
+                        dynamic_slug: None,
+                        tier: entry.tier,
+                        family: entry.family,
+                        supports_tool_examples_override: None,
+                        pricing: entry.pricing.clone(),
+                        max_output_tokens: entry.max_output_tokens,
+                        context_window: entry.context_window,
+                    });
+                }
+                Err(e) => {
+                    if provider.accepts_arbitrary_models() {
+                        return Ok(Self {
+                            id: model_id.to_string(),
+                            provider,
+                            dynamic_slug: None,
+                            tier: ModelTier::Medium,
+                            family: provider.family(),
+                            supports_tool_examples_override: None,
+                            pricing: ModelPricing::ZERO,
+                            max_output_tokens: ollama::DEFAULT_MAX_OUTPUT,
+                            context_window: ollama::DEFAULT_CONTEXT,
+                        });
+                    }
+                    return Err(e);
+                }
+            }
         }
 
         if let Some(base) = dynamic::base_for_slug(provider_str) {
@@ -351,5 +381,14 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn ollama_arbitrary_model_accepted() {
+        let model = Model::from_spec("ollama/my-custom-model").unwrap();
+        assert_eq!(model.provider, ProviderKind::Ollama);
+        assert_eq!(model.id, "my-custom-model");
+        assert_eq!(model.tier, ModelTier::Medium);
+        assert_eq!(model.family, ModelFamily::Generic);
     }
 }

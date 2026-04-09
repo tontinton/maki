@@ -9,6 +9,7 @@ use tracing::{debug, warn};
 use crate::model::{Model, ModelFamily, models_for_provider};
 use crate::providers::anthropic::Anthropic;
 use crate::providers::dynamic;
+use crate::providers::ollama::Ollama;
 use crate::providers::openai::OpenAi;
 use crate::providers::synthetic::Synthetic;
 use crate::providers::zai::{Zai, ZaiPlan};
@@ -20,6 +21,7 @@ pub enum ProviderKind {
     Anthropic,
     #[strum(serialize = "openai")]
     OpenAi,
+    Ollama,
     Zai,
     ZaiCodingPlan,
     Synthetic,
@@ -30,6 +32,7 @@ impl ProviderKind {
         match self {
             Self::Anthropic => "Anthropic",
             Self::OpenAi => "OpenAI",
+            Self::Ollama => "Ollama",
             Self::Zai => "Z.AI",
             Self::ZaiCodingPlan => "Z.AI Coding",
             Self::Synthetic => "Synthetic",
@@ -40,6 +43,7 @@ impl ProviderKind {
         match self {
             Self::Anthropic => "ANTHROPIC_API_KEY",
             Self::OpenAi => "OPENAI_API_KEY",
+            Self::Ollama => "",
             Self::Zai | Self::ZaiCodingPlan => "ZHIPU_API_KEY",
             Self::Synthetic => "SYNTHETIC_API_KEY",
         }
@@ -49,6 +53,7 @@ impl ProviderKind {
         match self {
             Self::Anthropic => "https://api.anthropic.com/v1/messages",
             Self::OpenAi => "https://api.openai.com/v1",
+            Self::Ollama => "http://localhost:11434/v1",
             Self::Zai => "https://api.z.ai/api/paas/v4",
             Self::ZaiCodingPlan => "https://api.z.ai/api/coding/paas/v4",
             Self::Synthetic => "https://api.synthetic.new/openai/v1",
@@ -64,6 +69,7 @@ impl ProviderKind {
             Self::Anthropic => {
                 Some("Prompt caching, thinking mode (adaptive/budgeted), advanced tool use")
             }
+            Self::Ollama => Some("Local inference, no API key required, any model via ollama pull"),
             Self::Synthetic => {
                 Some("Reasoning effort support (low/medium/high), open-weight models")
             }
@@ -75,15 +81,21 @@ impl ProviderKind {
         match self {
             Self::Anthropic => ModelFamily::Claude,
             Self::OpenAi => ModelFamily::Gpt,
+            Self::Ollama => ModelFamily::Generic,
             Self::Zai | Self::ZaiCodingPlan => ModelFamily::Glm,
             Self::Synthetic => ModelFamily::Synthetic,
         }
+    }
+
+    pub const fn accepts_arbitrary_models(self) -> bool {
+        matches!(self, Self::Ollama)
     }
 
     pub fn create(self) -> Result<Box<dyn Provider>, AgentError> {
         match self {
             Self::Anthropic => Ok(Box::new(Anthropic::new()?)),
             Self::OpenAi => Ok(Box::new(OpenAi::new()?)),
+            Self::Ollama => Ok(Box::new(Ollama::new())),
             Self::Zai => Ok(Box::new(Zai::new(ZaiPlan::Standard)?)),
             Self::ZaiCodingPlan => Ok(Box::new(Zai::new(ZaiPlan::Coding)?)),
             Self::Synthetic => Ok(Box::new(Synthetic::new()?)),

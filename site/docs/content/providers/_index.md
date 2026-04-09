@@ -42,6 +42,20 @@ Defaults: claude-haiku-4-5 (weak), claude-sonnet-4-6 (medium), claude-opus-4-6 (
 
 Defaults: gpt-5.4-nano (weak), gpt-4.1 (medium), gpt-5.4 (strong)
 
+### Ollama
+
+- **Env var**: `OLLAMA_HOST` (optional, defaults to `http://localhost:11434`)
+- **API**: `http://localhost:11434/v1`
+- **Features**: Local inference, no API key required, any model via ollama pull
+
+| Tier | Models | Pricing (in/out per 1M tokens) | Context |
+|------|--------|-------------------------------|---------|
+| Weak | **qwen3:1.7b** (default) | $0.00 / $0.00 | 128K ctx / 16K out |
+| Medium | **qwen3:8b** (default) | $0.00 / $0.00 | 128K ctx / 16K out |
+| Strong | **qwen3** (default) | $0.00 / $0.00 | 128K ctx / 16K out |
+
+Defaults: qwen3:1.7b (weak), qwen3:8b (medium), qwen3 (strong)
+
 ### Z.AI
 
 - **Env var**: `ZHIPU_API_KEY` (shared across both endpoints)
@@ -98,7 +112,7 @@ To add a custom provider or proxy, drop an executable script into `~/.maki/provi
 
 `resolve` is called each time a new agent spawns, so scripts should read tokens from disk instead of caching them in memory. That way auth changes from other processes get picked up.
 
-The `base` field specifies which built-in provider to inherit the model catalog from. Valid values: `anthropic`, `openai`, `zai`, `zai-coding-plan`, `synthetic`.
+The `base` field specifies which built-in provider to inherit the model catalog from. Valid values: `anthropic`, `openai`, `ollama`, `zai`, `zai-coding-plan`, `synthetic`.
 
 If your provider serves models not in the base catalog, add a `models` subcommand returning:
 

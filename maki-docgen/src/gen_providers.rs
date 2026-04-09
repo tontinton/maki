@@ -87,10 +87,19 @@ fn format_context(entry: &ModelEntry) -> String {
 
 struct ProviderSection {
     name: &'static str,
-    env_var: String,
+    auth_line: String,
     urls: Vec<&'static str>,
     features: Option<&'static str>,
     entries: &'static [ModelEntry],
+}
+
+fn format_auth(kind: ProviderKind) -> String {
+    let env = kind.api_key_env();
+    if env.is_empty() {
+        "`OLLAMA_HOST` (optional, defaults to `http://localhost:11434`)".to_string()
+    } else {
+        format!("`{env}`")
+    }
 }
 
 fn build_sections() -> Vec<ProviderSection> {
@@ -106,9 +115,9 @@ fn build_sections() -> Vec<ProviderSection> {
                 zai_done = true;
                 sections.push(ProviderSection {
                     name: "Z.AI",
-                    env_var: format!(
-                        "`{}` (shared across both endpoints)",
-                        ProviderKind::Zai.api_key_env()
+                    auth_line: format!(
+                        "{} (shared across both endpoints)",
+                        format_auth(ProviderKind::Zai)
                     ),
                     urls: vec![
                         ProviderKind::Zai.base_url(),
@@ -124,7 +133,7 @@ fn build_sections() -> Vec<ProviderSection> {
             ProviderKind::OpenAi => {
                 sections.push(ProviderSection {
                     name: kind.display_name(),
-                    env_var: format!("`{}` (also supports OAuth device flow)", kind.api_key_env()),
+                    auth_line: format!("{} (also supports OAuth device flow)", format_auth(kind)),
                     urls: vec![kind.base_url()],
                     features: kind.features(),
                     entries: models_for_provider(kind),
@@ -133,7 +142,7 @@ fn build_sections() -> Vec<ProviderSection> {
             _ => {
                 sections.push(ProviderSection {
                     name: kind.display_name(),
-                    env_var: format!("`{}`", kind.api_key_env()),
+                    auth_line: format_auth(kind),
                     urls: vec![kind.base_url()],
                     features: kind.features(),
                     entries: models_for_provider(kind),
@@ -212,7 +221,7 @@ fn write_model_table(out: &mut String, entries: &[ModelEntry]) {
 
 fn write_section(out: &mut String, section: &ProviderSection) {
     let _ = writeln!(out, "### {}\n", section.name);
-    let _ = writeln!(out, "- **Env var**: {}", section.env_var);
+    let _ = writeln!(out, "- **Env var**: {}", section.auth_line);
 
     if section.urls.len() == 1 {
         let _ = writeln!(out, "- **API**: `{}`", section.urls[0]);

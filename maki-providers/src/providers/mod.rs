@@ -9,6 +9,7 @@ use crate::AgentError;
 
 pub(crate) mod anthropic;
 pub mod dynamic;
+pub(crate) mod ollama;
 pub(crate) mod openai;
 pub(crate) mod openai_compat;
 pub(crate) mod synthetic;
