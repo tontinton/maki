@@ -8,34 +8,6 @@ use serde::{Deserialize, Serialize};
 
 pub const NO_FILES_FOUND: &str = "No files found";
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct DiffSpan {
-    pub text: String,
-    pub emphasized: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum DiffLine {
-    Unchanged(String),
-    Added(Vec<DiffSpan>),
-    Removed(Vec<DiffSpan>),
-}
-
-impl DiffSpan {
-    pub fn plain(text: String) -> Self {
-        Self {
-            text,
-            emphasized: false,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DiffHunk {
-    pub start_line: usize,
-    pub lines: Vec<DiffLine>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GrepFileEntry {
     pub path: String,
@@ -216,7 +188,8 @@ pub enum ToolOutput {
     },
     Diff {
         path: String,
-        hunks: Vec<DiffHunk>,
+        before: String,
+        after: String,
         summary: String,
     },
     TodoList(Vec<TodoItem>),
@@ -347,35 +320,15 @@ impl ToolOutput {
             }
             Self::Diff {
                 path,
-                hunks,
+                before,
+                after,
                 summary,
-            } => {
-                let display = crate::tools::relative_path(path);
-                let mut out = format!("{summary}\n--- {display}\n+++ {display}");
-                for hunk in hunks {
-                    out.push('\n');
-                    for dl in &hunk.lines {
-                        match dl {
-                            DiffLine::Unchanged(t) => {
-                                let _ = write!(out, "\n  {t}");
-                            }
-                            DiffLine::Removed(spans) | DiffLine::Added(spans) => {
-                                let prefix = if matches!(dl, DiffLine::Removed(_)) {
-                                    "- "
-                                } else {
-                                    "+ "
-                                };
-
-                                let _ = write!(out, "\n{prefix}");
-                                for s in spans {
-                                    out.push_str(&s.text);
-                                }
-                            }
-                        }
-                    }
-                }
-                out
-            }
+            } => crate::diff::unified_text(
+                before,
+                after,
+                summary,
+                &crate::tools::relative_path(path),
+            ),
             Self::TodoList(items) => {
                 if items.is_empty() {
                     return "No todos.".into();
@@ -638,26 +591,11 @@ mod tests {
     use test_case::test_case;
 
     #[test]
-    fn as_display_text_diff_covers_all_line_types_and_multiple_hunks() {
+    fn as_display_text_diff_renders_unified_text() {
         let output = ToolOutput::Diff {
             path: "src/main.rs".into(),
-            hunks: vec![
-                DiffHunk {
-                    start_line: 1,
-                    lines: vec![
-                        DiffLine::Unchanged("keep".into()),
-                        DiffLine::Removed(vec![DiffSpan::plain("old".into())]),
-                        DiffLine::Added(vec![DiffSpan::plain("new".into())]),
-                    ],
-                },
-                DiffHunk {
-                    start_line: 10,
-                    lines: vec![
-                        DiffLine::Removed(vec![DiffSpan::plain("c".into())]),
-                        DiffLine::Added(vec![DiffSpan::plain("d".into())]),
-                    ],
-                },
-            ],
+            before: "keep\nold\n".into(),
+            after: "keep\nnew\n".into(),
             summary: "Updated value".into(),
         };
         let display = output.as_display_text();
@@ -667,8 +605,6 @@ mod tests {
         assert!(display.contains("  keep"));
         assert!(display.contains("- old"));
         assert!(display.contains("+ new"));
-        assert!(display.contains("- c"));
-        assert!(display.contains("+ d"));
         assert_eq!(output.as_text(), "Updated value");
     }
 
@@ -762,7 +698,7 @@ mod tests {
     }
 
     #[test_case(ToolOutput::WriteCode { path: "src/lib.rs".into(), byte_count: 10, lines: vec![] }, Some("src/lib.rs") ; "write_code")]
-    #[test_case(ToolOutput::Diff { path: "src/lib.rs".into(), hunks: vec![], summary: String::new() }, Some("src/lib.rs") ; "diff")]
+    #[test_case(ToolOutput::Diff { path: "src/lib.rs".into(), before: String::new(), after: String::new(), summary: String::new() }, Some("src/lib.rs") ; "diff")]
     #[test_case(ToolOutput::Plain("ok".into()), None ; "non_write_variant")]
     fn output_written_path(output: ToolOutput, expected: Option<&str>) {
         assert_eq!(output.written_path(), expected);

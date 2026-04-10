@@ -4,8 +4,7 @@ use crate::ToolOutput;
 use maki_tool_macro::Tool;
 
 use super::fuzzy_replace;
-use super::multiedit::build_hunk;
-use super::{line_at_offset, relative_path};
+use super::relative_path;
 
 #[derive(Tool, Debug, Clone)]
 pub struct Edit {
@@ -29,35 +28,21 @@ impl Edit {
 ]"#,
     );
 
-    fn diff_output(&self, resolved_path: &str, lines: &[usize]) -> ToolOutput {
-        let rel = relative_path(resolved_path);
-        let hunks = lines
-            .iter()
-            .map(|&line| build_hunk(line, &self.old_string, &self.new_string))
-            .collect();
-        ToolOutput::Diff {
-            hunks,
-            summary: format!("edited {rel}"),
-            path: resolved_path.to_owned(),
-        }
-    }
-
     pub async fn execute(&self, _ctx: &super::ToolContext) -> Result<ToolOutput, String> {
         let path = super::resolve_path(&self.path)?;
         let old_string = self.old_string.clone();
         let new_string = self.new_string.clone();
         let replace_all = self.replace_all.unwrap_or(false);
-        let diff_self = self.clone();
         smol::unblock(move || {
-            let content = fs::read_to_string(&path).map_err(|e| format!("read error: {e}"))?;
-            let result = fuzzy_replace::replace(&content, &old_string, &new_string, replace_all)?;
-            fs::write(&path, &result.content).map_err(|e| format!("write error: {e}"))?;
-            let lines: Vec<usize> = result
-                .match_offsets
-                .iter()
-                .map(|&off| line_at_offset(&content, off))
-                .collect();
-            Ok(diff_self.diff_output(&path, &lines))
+            let before = fs::read_to_string(&path).map_err(|e| format!("read error: {e}"))?;
+            let after = fuzzy_replace::replace(&before, &old_string, &new_string, replace_all)?;
+            fs::write(&path, &after).map_err(|e| format!("write error: {e}"))?;
+            Ok(ToolOutput::Diff {
+                summary: format!("edited {}", relative_path(&path)),
+                path,
+                before,
+                after,
+            })
         })
         .await
     }
@@ -68,11 +53,6 @@ impl Edit {
 }
 
 impl super::ToolDefaults for Edit {
-    fn start_output(&self) -> Option<ToolOutput> {
-        let path = super::resolve_path(&self.path).ok()?;
-        Some(self.diff_output(&path, &[1]))
-    }
-
     fn mutable_path(&self) -> Option<&str> {
         Some(&self.path)
     }
@@ -84,6 +64,8 @@ impl super::ToolDefaults for Edit {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use tempfile::TempDir;
 
     use crate::AgentMode;
@@ -132,6 +114,37 @@ mod tests {
                 fs::read_to_string(&path).unwrap(),
                 "let x = 9;\nlet x = 9;\nlet y = 2;"
             );
+        });
+    }
+
+    /// Regression: when `old_string` contains a literal `\n` it is unescaped
+    /// before writing, so the Diff snapshots must be the post-unescape file
+    /// content, not the raw single-line input. This is the structural
+    /// guarantee that prevents the old "diff full of `\n` escapes" bug.
+    #[test]
+    fn diff_snapshots_are_real_file_content_not_raw_input() {
+        smol::block_on(async {
+            let dir = TempDir::new().unwrap();
+            let ctx = stub_ctx(&AgentMode::Build);
+            let original = "const A: u8 = 1;\nconst B: u8 = 2;\n";
+            let updated = "const A: u8 = 9;\nconst B: u8 = 2;\n";
+            let path = temp_file(&dir, "f.rs", original);
+            let output = Edit {
+                path: path.clone(),
+                old_string: "const A: u8 = 1;\\nconst B: u8 = 2;".into(),
+                new_string: "const A: u8 = 9;\\nconst B: u8 = 2;".into(),
+                replace_all: None,
+            }
+            .execute(&ctx)
+            .await
+            .unwrap();
+
+            let ToolOutput::Diff { before, after, .. } = output else {
+                panic!("expected Diff output");
+            };
+            assert_eq!(before, original);
+            assert_eq!(after, updated);
+            assert_eq!(fs::read_to_string(&path).unwrap(), updated);
         });
     }
 }

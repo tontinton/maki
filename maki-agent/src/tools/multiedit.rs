@@ -1,13 +1,12 @@
 use std::fs;
 
-use crate::{DiffHunk, DiffLine, DiffSpan, ToolOutput};
+use crate::ToolOutput;
 use serde::Deserialize;
-use similar::ChangeTag;
 
 use maki_tool_macro::{Args, Tool};
 
 use super::fuzzy_replace;
-use super::{line_at_offset, relative_path};
+use super::relative_path;
 
 #[derive(Args, Debug, Clone, Deserialize)]
 struct EditEntry {
@@ -43,39 +42,39 @@ impl MultiEdit {
         format!("{n} edit{s}")
     }
 
+    fn apply_edits(&self, before: &str) -> Result<String, String> {
+        if self.edits.is_empty() {
+            return Err("provide at least one edit".into());
+        }
+        let mut content = before.to_owned();
+        for (i, edit) in self.edits.iter().enumerate() {
+            content = fuzzy_replace::replace(
+                &content,
+                &edit.old_string,
+                &edit.new_string,
+                edit.replace_all.unwrap_or(false),
+            )
+            .map_err(|e| format!("edit {i}: {e}"))?;
+        }
+        Ok(content)
+    }
+
     pub async fn execute(&self, _ctx: &super::ToolContext) -> Result<ToolOutput, String> {
         let path = super::resolve_path(&self.path)?;
-        let edits = self.edits.clone();
-        let edit_count_label = self.edit_count_label();
+        let this = self.clone();
         smol::unblock(move || {
-            if edits.is_empty() {
-                return Err("provide at least one edit".into());
-            }
-            let mut content = fs::read_to_string(&path).map_err(|e| format!("read error: {e}"))?;
-
-            let mut hunks = Vec::with_capacity(edits.len());
-            for (i, edit) in edits.iter().enumerate() {
-                let replace_all = edit.replace_all.unwrap_or(false);
-                let result = fuzzy_replace::replace(
-                    &content,
-                    &edit.old_string,
-                    &edit.new_string,
-                    replace_all,
-                )
-                .map_err(|e| format!("edit {i}: {e}"))?;
-                for &off in &result.match_offsets {
-                    let line = line_at_offset(&content, off);
-                    hunks.push(build_hunk(line, &edit.old_string, &edit.new_string));
-                }
-                content = result.content;
-            }
-
-            fs::write(&path, &content).map_err(|e| format!("write error: {e}"))?;
-            let rel = relative_path(&path);
+            let before = fs::read_to_string(&path).map_err(|e| format!("read error: {e}"))?;
+            let after = this.apply_edits(&before)?;
+            fs::write(&path, &after).map_err(|e| format!("write error: {e}"))?;
             Ok(ToolOutput::Diff {
-                hunks,
-                summary: format!("applied {edit_count_label} to {rel}"),
+                summary: format!(
+                    "applied {} to {}",
+                    this.edit_count_label(),
+                    relative_path(&path)
+                ),
                 path,
+                before,
+                after,
             })
         })
         .await
@@ -87,21 +86,6 @@ impl MultiEdit {
 }
 
 impl super::ToolDefaults for MultiEdit {
-    fn start_output(&self) -> Option<ToolOutput> {
-        let hunks: Vec<DiffHunk> = self
-            .edits
-            .iter()
-            .map(|e| build_hunk(1, &e.old_string, &e.new_string))
-            .collect();
-        let path = super::resolve_path(&self.path).ok()?;
-        let rel = relative_path(&path);
-        Some(ToolOutput::Diff {
-            hunks,
-            summary: format!("applied {} to {rel}", self.edit_count_label()),
-            path,
-        })
-    }
-
     fn start_annotation(&self) -> Option<String> {
         Some(self.edit_count_label())
     }
@@ -113,38 +97,6 @@ impl super::ToolDefaults for MultiEdit {
     fn permission(&self) -> Option<String> {
         Some(crate::permissions::canonicalize_scope_path(&self.path))
     }
-}
-pub(super) fn build_hunk(start_line: usize, old: &str, new: &str) -> DiffHunk {
-    let diff = similar::TextDiff::from_lines(old, new);
-    let mut lines = Vec::new();
-    for op in diff.ops() {
-        for change in diff.iter_inline_changes(op) {
-            match change.tag() {
-                ChangeTag::Equal => {
-                    let text: String = change
-                        .iter_strings_lossy()
-                        .map(|(_, t)| t.trim_end_matches('\n').to_owned())
-                        .collect();
-                    lines.push(DiffLine::Unchanged(text));
-                }
-                tag => {
-                    let spans: Vec<DiffSpan> = change
-                        .iter_strings_lossy()
-                        .map(|(emphasized, text)| DiffSpan {
-                            text: text.trim_end_matches('\n').to_owned(),
-                            emphasized,
-                        })
-                        .collect();
-                    if tag == ChangeTag::Delete {
-                        lines.push(DiffLine::Removed(spans));
-                    } else {
-                        lines.push(DiffLine::Added(spans));
-                    }
-                }
-            }
-        }
-    }
-    DiffHunk { start_line, lines }
 }
 
 #[cfg(test)]
@@ -223,25 +175,6 @@ mod tests {
             let tool = MultiEdit::parse_input(&json!({ "path": path, "edits": [] })).unwrap();
             assert_eq!(tool.execute(&ctx).await.unwrap_err(), EMPTY_ERR);
         });
-    }
-
-    fn tags(hunk: &DiffHunk) -> Vec<char> {
-        hunk.lines
-            .iter()
-            .map(|l| match l {
-                DiffLine::Unchanged(_) => '=',
-                DiffLine::Removed(_) => '-',
-                DiffLine::Added(_) => '+',
-            })
-            .collect()
-    }
-
-    #[test_case(1, "keep\n",  "keep\nadded", &['=', '+']           ; "append")]
-    #[test_case(5, "a\nb\nc", "a\nB\nc",     &['=', '-', '+', '='] ; "middle_change")]
-    fn build_hunk_tags(line: usize, old: &str, new: &str, expected: &[char]) {
-        let hunk = build_hunk(line, old, new);
-        assert_eq!(hunk.start_line, line);
-        assert_eq!(tags(&hunk), expected);
     }
 
     #[test]

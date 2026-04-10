@@ -4,10 +4,9 @@ use maki_agent::tools::{
     TASK_TOOL_NAME, TODOWRITE_TOOL_NAME, WEBFETCH_TOOL_NAME, WRITE_TOOL_NAME,
 };
 use maki_agent::{
-    AgentEvent, BatchToolEntry, BatchToolStatus, DiffHunk, DiffLine, DiffSpan, Envelope,
-    GrepFileEntry, GrepMatchGroup, QuestionInfo, QuestionOption, SubagentInfo, TodoItem,
-    TodoPriority, TodoStatus, ToolDoneEvent, ToolInput, ToolOutput, ToolStartEvent,
-    TurnCompleteEvent,
+    AgentEvent, BatchToolEntry, BatchToolStatus, Envelope, GrepFileEntry, GrepMatchGroup,
+    QuestionInfo, QuestionOption, SubagentInfo, TodoItem, TodoPriority, TodoStatus, ToolDoneEvent,
+    ToolInput, ToolOutput, ToolStartEvent, TurnCompleteEvent,
 };
 use maki_providers::{Message, TokenUsage};
 
@@ -264,15 +263,8 @@ pub fn mock_events() -> Vec<MockEvent> {
         EDIT_TOOL_NAME,
         ToolOutput::Diff {
             path: "src/config/mod.rs".into(),
-            hunks: vec![DiffHunk {
-                start_line: 3,
-                lines: vec![
-                    DiffLine::Removed(vec![DiffSpan::plain("pub struct Config {".into())]),
-                    DiffLine::Added(vec![DiffSpan::plain("pub struct ConfigBuilder {".into())]),
-                    DiffLine::Unchanged("    pub port: u16,".into()),
-                    DiffLine::Added(vec![DiffSpan::plain("    pub host: String,".into())]),
-                ],
-            }],
+            before: "use std::net::IpAddr;\n\npub struct Config {\n    pub port: u16,\n}\n".into(),
+            after: "use std::net::IpAddr;\n\npub struct ConfigBuilder {\n    pub port: u16,\n    pub host: String,\n}\n".into(),
             summary: "Renamed Config to ConfigBuilder, added host field".into(),
         },
         false,
@@ -578,13 +570,8 @@ print(f'Total lines across config: {total}')"
         MULTIEDIT_TOOL_NAME,
         ToolOutput::Diff {
             path: "src/main.rs".into(),
-            hunks: vec![DiffHunk {
-                start_line: 1,
-                lines: vec![
-                    DiffLine::Removed(vec![DiffSpan::plain("use config::Config;".into())]),
-                    DiffLine::Added(vec![DiffSpan::plain("use config::ConfigBuilder;".into())]),
-                ],
-            }],
+            before: "use config::Config;\n\nfn main() {}\n".into(),
+            after: "use config::ConfigBuilder;\n\nfn main() {}\n".into(),
             summary: "Updated import to use ConfigBuilder".into(),
         },
         false,

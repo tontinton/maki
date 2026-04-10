@@ -5,11 +5,11 @@ use crate::highlight::{
 use crate::markdown::{should_truncate, truncation_notice};
 use crate::theme;
 
-use maki_agent::{
-    DiffHunk, DiffLine, DiffSpan, GrepFileEntry, InstructionBlock, ToolInput, ToolOutput,
-};
+use maki_agent::diff::{DiffLine, DiffSpan, compute_hunks};
+use maki_agent::{GrepFileEntry, InstructionBlock, ToolInput, ToolOutput};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
+use std::str::Lines;
 use syntect::easy::HighlightLines;
 
 const MAX_CODE_EXECUTION_LINES: usize = 100;
@@ -99,28 +99,70 @@ fn render_code(
     (lines, has_truncation)
 }
 
-fn render_diff(path: Option<&str>, hunks: &[DiffHunk]) -> Vec<Line<'static>> {
-    let max_line_nr = hunks
+/// Walks one file with a syntect highlighter so the parser state at each line
+/// reflects everything seen since the start. Two walkers (one over BEFORE, one
+/// over AFTER) let removed lines be styled in the old file's parser state and
+/// added lines in the new file's.
+struct FileWalker<'a> {
+    lines: Lines<'a>,
+    pos: usize,
+    hl: Option<HighlightLines<'static>>,
+    buf: String,
+}
+
+impl<'a> FileWalker<'a> {
+    fn new(content: &'a str, hl: Option<HighlightLines<'static>>) -> Self {
+        Self {
+            lines: content.lines(),
+            pos: 1,
+            hl,
+            buf: String::new(),
+        }
+    }
+
+    fn skip_to(&mut self, target: usize) {
+        while self.pos < target {
+            let _ = self.step();
+        }
+    }
+
+    fn step(&mut self) -> Option<Vec<(Style, String)>> {
+        let line = self.lines.next().unwrap_or("");
+        let result = self.hl.as_mut().map(|hl| {
+            self.buf.clear();
+            self.buf.push_str(line);
+            self.buf.push('\n');
+            highlight_line(hl, &self.buf)
+        });
+        self.pos += 1;
+        result
+    }
+}
+
+fn render_diff(path: Option<&str>, before: &str, after: &str) -> Vec<Line<'static>> {
+    let hunks = compute_hunks(before, after);
+    let Some(last) = hunks.last() else {
+        return Vec::new();
+    };
+    let numbered = last
+        .lines
         .iter()
-        .map(|h| {
-            let numbered = h
-                .lines
-                .iter()
-                .filter(|l| !matches!(l, DiffLine::Added(_)))
-                .count();
-            h.start_line + numbered.saturating_sub(1)
-        })
-        .max()
-        .unwrap_or(1);
-    let w = nr_width(max_line_nr);
+        .filter(|l| !matches!(l, DiffLine::Added(_)))
+        .count();
+    let w = nr_width(last.before_start + numbered.saturating_sub(1));
+
+    let mut before_walker = FileWalker::new(before, path.map(highlighter_for_path));
+    let mut after_walker = FileWalker::new(after, path.map(highlighter_for_path));
 
     let mut lines = Vec::new();
     for (i, hunk) in hunks.iter().enumerate() {
         if i > 0 {
             lines.push(gap_ellipsis());
         }
-        let mut hl = path.map(highlighter_for_path);
-        let mut line_nr = hunk.start_line;
+        before_walker.skip_to(hunk.before_start);
+        after_walker.skip_to(hunk.after_start);
+
+        let mut line_nr = hunk.before_start;
         for dl in &hunk.lines {
             let show_nr = !matches!(dl, DiffLine::Added(_));
             let nr_str = if show_nr {
@@ -133,45 +175,63 @@ fn render_diff(path: Option<&str>, hunks: &[DiffHunk]) -> Vec<Line<'static>> {
             let mut spans = vec![gutter(&nr_str)];
             match dl {
                 DiffLine::Unchanged(t) => {
+                    let _ = before_walker.step();
                     spans.push(Span::raw("  ".to_owned()));
-                    spans.extend(code_spans(&mut hl, t));
+                    spans.extend(syntax_to_spans(after_walker.step(), t));
                 }
-                DiffLine::Removed(ds) | DiffLine::Added(ds) => {
-                    let is_add = matches!(dl, DiffLine::Added(_));
-                    let (prefix, base, emph) = if is_add {
-                        (
-                            "+ ",
-                            theme::current().diff_new,
-                            theme::current().diff_new_emphasis,
-                        )
-                    } else {
-                        (
-                            "- ",
-                            theme::current().diff_old,
-                            theme::current().diff_old_emphasis,
-                        )
-                    };
-                    spans.push(Span::styled(
-                        prefix,
-                        base.patch(theme::current().code_fallback),
-                    ));
-                    let full: String = ds.iter().map(|s| s.text.as_str()).collect();
-                    if let Some(ref mut h) = hl {
-                        let with_nl = format!("{full}\n");
-                        let syn = highlight_line(h, &with_nl);
-                        spans.extend(merge_syntax_with_diff(&syn, ds, base, emph));
-                    } else {
-                        spans.push(Span::styled(
-                            crate::highlight::normalize_text(&full),
-                            base.patch(theme::current().code_fallback),
-                        ));
-                    }
-                }
+                DiffLine::Removed(ds) => spans.extend(diff_change_spans(
+                    "- ",
+                    ds,
+                    before_walker.step(),
+                    theme::current().diff_old,
+                    theme::current().diff_old_emphasis,
+                )),
+                DiffLine::Added(ds) => spans.extend(diff_change_spans(
+                    "+ ",
+                    ds,
+                    after_walker.step(),
+                    theme::current().diff_new,
+                    theme::current().diff_new_emphasis,
+                )),
             }
             lines.push(Line::from(spans));
         }
     }
     lines
+}
+
+fn syntax_to_spans(syntax: Option<Vec<(Style, String)>>, text: &str) -> Vec<Span<'static>> {
+    match syntax {
+        Some(s) => s
+            .into_iter()
+            .map(|(style, chunk)| Span::styled(chunk, style))
+            .collect(),
+        None => vec![fallback_span(text)],
+    }
+}
+
+fn diff_change_spans(
+    prefix: &'static str,
+    ds: &[DiffSpan],
+    syntax: Option<Vec<(Style, String)>>,
+    base: Style,
+    emph: Style,
+) -> Vec<Span<'static>> {
+    let mut spans = vec![Span::styled(
+        prefix,
+        base.patch(theme::current().code_fallback),
+    )];
+    match syntax {
+        Some(syn) => spans.extend(merge_syntax_with_diff(&syn, ds, base, emph)),
+        None => {
+            let full: String = ds.iter().map(|s| s.text.as_str()).collect();
+            spans.push(Span::styled(
+                crate::highlight::normalize_text(&full),
+                base.patch(theme::current().code_fallback),
+            ));
+        }
+    }
+    spans
 }
 
 fn render_grep_results(
@@ -375,8 +435,13 @@ pub fn render_tool_content(
             code_lines.len(),
             max_lines,
         ),
-        Some(ToolOutput::Diff { path, hunks, .. }) => (
-            render_diff(highlight.then_some(path.as_str()), hunks),
+        Some(ToolOutput::Diff {
+            path,
+            before,
+            after,
+            ..
+        }) => (
+            render_diff(highlight.then_some(path.as_str()), before, after),
             false,
         ),
         Some(ToolOutput::GrepResult { entries }) => {
@@ -462,8 +527,15 @@ fn merge_syntax_with_diff(
 mod tests {
     use super::*;
     use crate::markdown::TRUNCATION_PREFIX;
-    use maki_agent::{DiffSpan, GrepLine, GrepMatchGroup};
+    use maki_agent::{GrepLine, GrepMatchGroup};
     use test_case::test_case;
+
+    fn plain(text: &str) -> DiffSpan {
+        DiffSpan {
+            text: text.into(),
+            emphasized: false,
+        }
+    }
 
     use ratatui::style::Color;
 
@@ -485,13 +557,70 @@ mod tests {
         assert_eq!(result.len(), expected);
     }
 
+    fn diff_fg(lines: &[Line<'static>], substr: &str) -> ratatui::style::Color {
+        lines
+            .iter()
+            .find_map(|l| {
+                l.spans
+                    .iter()
+                    .find(|s| s.content.contains(substr))
+                    .and_then(|s| s.style.fg)
+            })
+            .unwrap_or_else(|| panic!("no fg-styled span containing {substr:?}"))
+    }
+
+    /// Reference color: highlight `text` as part of `prefix` and return the fg
+    /// for the substring `find`. This is the "ground truth" — what the
+    /// highlighter produces when it walks the file from the start.
+    fn fg_in_context(path: &str, prefix: &str, text: &str, find: &str) -> ratatui::style::Color {
+        let mut hl = highlighter_for_path(path);
+        for line in prefix.lines() {
+            let with_nl = format!("{line}\n");
+            let _ = highlight_line(&mut hl, &with_nl);
+        }
+        let with_nl = format!("{text}\n");
+        highlight_line(&mut hl, &with_nl)
+            .into_iter()
+            .find_map(|(s, t)| if t.contains(find) { s.fg } else { None })
+            .unwrap_or_else(|| panic!("ref fg for {find:?} missing"))
+    }
+
+    /// Regression: an unchanged context line inside a multi-line block comment
+    /// must be highlighted with the parser state from walking the full file —
+    /// not from a fresh state at the hunk's start_line. We assert this by
+    /// comparing against an independent reference highlighter.
+    #[test]
+    fn diff_context_line_inside_block_comment_matches_full_file_state() {
+        let before = "/*\nalpha\nbravo\ncharlie\ndelta\necho\nfoxtrot\nOLD\ngolf\n*/\n";
+        let after = "/*\nalpha\nbravo\ncharlie\ndelta\necho\nfoxtrot\nNEW\ngolf\n*/\n";
+
+        let lines = render_diff(Some("test.rs"), before, after);
+
+        let expected = fg_in_context("test.rs", "/*\nalpha\nbravo\ncharlie\n", "delta", "delta");
+        assert_eq!(diff_fg(&lines, "delta"), expected);
+    }
+
+    /// Regression: when an edit removes a closing `*/`, lines that were code
+    /// in BEFORE are now comment in AFTER. Unchanged context lines must be
+    /// highlighted using the AFTER state (their post-edit truth).
+    #[test]
+    fn diff_unchanged_line_uses_after_state_when_close_tag_removed() {
+        let before = "/*\ndoc\n*/\nfn x() {}\n";
+        let after = "/*\ndoc\nfn x() {}\n";
+
+        let lines = render_diff(Some("test.rs"), before, after);
+
+        let expected = fg_in_context("test.rs", "/*\ndoc\n", "fn x() {}", "fn");
+        assert_eq!(diff_fg(&lines, "fn x() {}"), expected);
+    }
+
     #[test]
     fn merge_syntax_with_diff_emphasis_split() {
         let base = Style::new().bg(Color::Red);
         let emph = Style::new().bg(Color::Green);
         let syn = vec![(Style::new().fg(Color::White), "abcde".to_owned())];
         let diff = vec![
-            DiffSpan::plain("abc".into()),
+            plain("abc"),
             DiffSpan {
                 text: "de".into(),
                 emphasized: true,
@@ -513,7 +642,7 @@ mod tests {
             (Style::new().fg(Color::Blue), "ab".to_owned()),
             (Style::new().fg(Color::Cyan), "cd".to_owned()),
         ];
-        let diff = vec![DiffSpan::plain("ab".into())];
+        let diff = vec![plain("ab")];
         let result = merge_syntax_with_diff(&syn, &diff, base, Style::default());
         let text: String = result.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, "abcd");
@@ -576,7 +705,7 @@ mod tests {
             (Style::new().fg(Color::Blue), "cd".to_owned()),
         ];
         let diff = vec![
-            DiffSpan::plain("a".into()),
+            plain("a"),
             DiffSpan {
                 text: "bcd".into(),
                 emphasized: true,

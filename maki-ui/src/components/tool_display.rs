@@ -1185,7 +1185,7 @@ mod tests {
     #[test_case("grep",  ToolOutput::GrepResult { entries: vec![GrepFileEntry { path: "a.rs".into(), groups: vec![GrepMatchGroup::single(1, "hit")] }] }, Some("1 matches in 1 file") ; "grep_file_count")]
     #[test_case("glob",  ToolOutput::GlobResult { files: vec!["a".into(), "b".into()] }, Some("2 files") ; "glob_file_count")]
     #[test_case("glob",  ToolOutput::GlobResult { files: vec![] },            None                ; "glob_empty_no_annotation")]
-    #[test_case("edit",  ToolOutput::Diff { path: "a.rs".into(), hunks: vec![], summary: "ok".into() }, None ; "diff_no_annotation")]
+    #[test_case("edit",  ToolOutput::Diff { path: "a.rs".into(), before: String::new(), after: String::new(), summary: "ok".into() }, None ; "diff_no_annotation")]
     fn annotation_cases(tool: &str, output: ToolOutput, expected: Option<&str>) {
         assert_eq!(
             tool_output_annotation(&output, ToolKind::from_name(tool)).as_deref(),

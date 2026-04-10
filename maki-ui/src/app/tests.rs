@@ -219,7 +219,7 @@ fn toggle_mode_state_machine() {
 }
 
 #[test_case(ToolOutput::WriteCode { path: "/tmp/plans/test.md".into(), byte_count: 100, lines: vec![] }, true  ; "write_matching")]
-#[test_case(ToolOutput::Diff { path: "/tmp/plans/test.md".into(), hunks: vec![], summary: String::new() }, true  ; "edit_matching")]
+#[test_case(ToolOutput::Diff { path: "/tmp/plans/test.md".into(), before: String::new(), after: String::new(), summary: String::new() }, true  ; "edit_matching")]
 #[test_case(ToolOutput::WriteCode { path: "/tmp/other.rs".into(), byte_count: 100, lines: vec![] }, false ; "write_non_matching")]
 fn tool_done_sets_plan_written_flag(output: ToolOutput, expect_written: bool) {
     let mut app = test_app();

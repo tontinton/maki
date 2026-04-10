@@ -19,6 +19,7 @@ pub use agent::{
 pub use cancel::{CancelToken, CancelTrigger};
 pub use maki_config::{AgentConfig, PermissionsConfig, UiConfig};
 pub mod command;
+pub mod diff;
 pub mod permissions;
 pub(crate) mod prompt;
 pub mod skill;
@@ -34,11 +35,10 @@ pub use maki_providers::AgentError;
 use maki_providers::Message;
 pub use maki_providers::{ImageMediaType, ImageSource, ThinkingConfig};
 pub use types::{
-    AgentEvent, BatchProgressEvent, BatchToolEntry, BatchToolStatus, DiffHunk, DiffLine, DiffSpan,
-    Envelope, EventSender, GrepFileEntry, GrepLine, GrepMatchGroup, InstructionBlock,
-    NO_FILES_FOUND, QuestionAnswer, QuestionInfo, QuestionOption, SubagentInfo, TodoItem,
-    TodoPriority, TodoStatus, ToolDoneEvent, ToolInput, ToolOutput, ToolStartEvent,
-    TurnCompleteEvent,
+    AgentEvent, BatchProgressEvent, BatchToolEntry, BatchToolStatus, Envelope, EventSender,
+    GrepFileEntry, GrepLine, GrepMatchGroup, InstructionBlock, NO_FILES_FOUND, QuestionAnswer,
+    QuestionInfo, QuestionOption, SubagentInfo, TodoItem, TodoPriority, TodoStatus, ToolDoneEvent,
+    ToolInput, ToolOutput, ToolStartEvent, TurnCompleteEvent,
 };
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]

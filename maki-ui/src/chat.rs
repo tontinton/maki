@@ -472,8 +472,8 @@ fn build_tool_results_map(messages: &[Message]) -> HashMap<&str, (bool, &str)> {
 mod tests {
     use super::*;
     use maki_agent::{
-        AgentEvent, BatchToolEntry, BatchToolStatus, DiffHunk, DiffLine, DiffSpan, ToolDoneEvent,
-        ToolInput, ToolOutput, ToolStartEvent,
+        AgentEvent, BatchToolEntry, BatchToolStatus, ToolDoneEvent, ToolInput, ToolOutput,
+        ToolStartEvent,
     };
     use maki_config::UiConfig;
     use test_case::test_case;
@@ -509,7 +509,8 @@ mod tests {
     fn edit_output(path: &str) -> ToolOutput {
         ToolOutput::Diff {
             path: path.into(),
-            hunks: vec![],
+            before: String::new(),
+            after: String::new(),
             summary: String::new(),
         }
     }
@@ -688,13 +689,8 @@ mod tests {
                 serde_json::json!({"path": "a", "old_string": "x", "new_string": "y"}),
                 ToolOutput::Diff {
                     path: "a".into(),
-                    hunks: vec![DiffHunk {
-                        start_line: 1,
-                        lines: vec![
-                            DiffLine::Removed(vec![DiffSpan::plain("x".into())]),
-                            DiffLine::Added(vec![DiffSpan::plain("y".into())]),
-                        ],
-                    }],
+                    before: "x\n".into(),
+                    after: "y\n".into(),
                     summary: "edited a".into(),
                 },
             ),

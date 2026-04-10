@@ -280,10 +280,6 @@ pub(crate) fn resolve_search_path(path: Option<&str>) -> Result<String, String> 
     }
 }
 
-pub(crate) fn line_at_offset(content: &str, offset: usize) -> usize {
-    content[..offset].matches('\n').count() + 1
-}
-
 static CWD: LazyLock<Option<PathBuf>> = LazyLock::new(|| env::current_dir().ok());
 static HOME: LazyLock<Option<PathBuf>> = LazyLock::new(dirs::home_dir);
 

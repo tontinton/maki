@@ -11,18 +11,12 @@ const CONTEXT_AWARE_MATCH_RATIO: f64 = 0.5;
 
 type Replacer = fn(&str, &str) -> Vec<String>;
 
-#[derive(Debug)]
-pub(super) struct ReplaceResult {
-    pub content: String,
-    pub match_offsets: Vec<usize>,
-}
-
 pub(super) fn replace(
     content: &str,
     old_string: &str,
     new_string: &str,
     replace_all: bool,
-) -> Result<ReplaceResult, String> {
+) -> Result<String, String> {
     const REPLACERS: &[Replacer] = &[
         exact,
         line_trimmed,
@@ -34,7 +28,7 @@ pub(super) fn replace(
 
     let mut any_found = false;
 
-    let mut try_match = |candidates: Vec<String>, replacement: &str| -> Option<ReplaceResult> {
+    let mut try_match = |candidates: Vec<String>, replacement: &str| -> Option<String> {
         for matched in candidates {
             let Some(first) = content.find(&*matched) else {
                 continue;
@@ -42,11 +36,7 @@ pub(super) fn replace(
             any_found = true;
 
             if replace_all {
-                let offsets = all_offsets(content, &matched);
-                return Some(ReplaceResult {
-                    content: content.replace(&*matched, replacement),
-                    match_offsets: offsets,
-                });
+                return Some(content.replace(&*matched, replacement));
             }
 
             if content[first + matched.len()..].contains(&*matched) {
@@ -57,10 +47,7 @@ pub(super) fn replace(
             result.push_str(&content[..first]);
             result.push_str(replacement);
             result.push_str(&content[first + matched.len()..]);
-            return Some(ReplaceResult {
-                content: result,
-                match_offsets: vec![first],
-            });
+            return Some(result);
         }
         None
     };
@@ -424,16 +411,6 @@ fn substring_whitespace_match(line: &str, normalized_find: &str) -> Option<Strin
     re.find(line).map(|m| m.as_str().to_string())
 }
 
-fn all_offsets(content: &str, needle: &str) -> Vec<usize> {
-    let mut offsets = Vec::new();
-    let mut start = 0;
-    while let Some(pos) = content[start..].find(needle) {
-        offsets.push(start + pos);
-        start += pos + needle.len();
-    }
-    offsets
-}
-
 fn unescape(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
     let mut chars = s.chars();
@@ -483,7 +460,6 @@ mod tests {
         assert!(
             replace(content, search, replacement, false)
                 .unwrap()
-                .content
                 .contains(R)
         );
     }
@@ -501,15 +477,15 @@ mod tests {
     fn block_anchor_picks_best_among_multiple() {
         let content = "fn a() {\n    unrelated();\n}\nfn a() {\n    target();\n}";
         let result = replace(content, "fn a() {\n    target();\n}", R, false).unwrap();
-        assert!(result.content.contains(R));
-        assert!(result.content.contains("unrelated()"));
+        assert!(result.contains(R));
+        assert!(result.contains("unrelated()"));
     }
 
     #[test]
     fn leading_whitespace_disambiguates() {
         let result = replace("fn foo() {}\n  fn foo() {}", "  fn foo() {}", R, false).unwrap();
-        assert!(result.content.starts_with("fn foo() {}"));
-        assert!(result.content.ends_with(R));
+        assert!(result.starts_with("fn foo() {}"));
+        assert!(result.ends_with(R));
     }
 
     #[test]
@@ -546,7 +522,7 @@ mod tests {
         let old = r#"print(\"hello\")"#;
         let new = r#"print(\"world\")"#;
         let result = replace(content, old, new, false).unwrap();
-        assert_eq!(result.content, r#"print("world")"#);
+        assert_eq!(result, r#"print("world")"#);
     }
 
     #[test]
@@ -555,16 +531,12 @@ mod tests {
         let old = r#"say(\"a\")"#;
         let new = r#"say(\"x\")"#;
         let result = replace(content, old, new, true).unwrap();
-        assert_eq!(result.content, "say(\"x\")\nsay(\"b\")");
+        assert_eq!(result, "say(\"x\")\nsay(\"b\")");
     }
 
     #[test]
-    fn replace_returns_match_offsets() {
-        let exact = replace("let x = 1;", "let x = 1;", "let x = 2;", false).unwrap();
-        assert_eq!(exact.match_offsets, vec![0]);
-
+    fn replace_all_replaces_every_occurrence() {
         let all = replace("aXbXc", "X", "Y", true).unwrap();
-        assert_eq!(all.content, "aYbYc");
-        assert_eq!(all.match_offsets, vec![1, 3]);
+        assert_eq!(all, "aYbYc");
     }
 }

@@ -6,8 +6,7 @@ use maki_agent::tools::{
     BASH_TOOL_NAME, GLOB_TOOL_NAME, GREP_TOOL_NAME, QUESTION_TOOL_NAME, WRITE_TOOL_NAME,
 };
 use maki_agent::{
-    BatchToolEntry, DiffHunk, DiffLine, DiffSpan, GrepFileEntry, GrepMatchGroup, QuestionAnswer,
-    ToolInput, ToolOutput,
+    BatchToolEntry, GrepFileEntry, GrepMatchGroup, QuestionAnswer, ToolInput, ToolOutput,
 };
 use ratatui::backend::TestBackend;
 use test_case::test_case;
@@ -519,13 +518,8 @@ fn search_text_diff_output_includes_hunks() {
         tool: "edit",
         output: ToolOutput::Diff {
             path: "src/main.rs".into(),
-            hunks: vec![DiffHunk {
-                start_line: 1,
-                lines: vec![
-                    DiffLine::Removed(vec![DiffSpan::plain("old".into())]),
-                    DiffLine::Added(vec![DiffSpan::plain("new".into())]),
-                ],
-            }],
+            before: "old\n".into(),
+            after: "new\n".into(),
             summary: "1 edit".into(),
         },
         is_error: false,
