@@ -10,6 +10,8 @@ weight = 5
 group = "Reference"
 +++"#;
 
+const TIER_PICKER_NOTE: &str = r#"Open the model picker with `/model` and press `1`, `2`, or `3` on any row to reassign it to strong, medium, or weak. Your overrides are saved to `~/.maki/model-tiers` and apply across sessions."#;
+
 const AUTH_RELOADING: &str = r#"## Auth Reloading
 
 Maki re-reads auth from storage and environment variables each time a new agent spawns (`/new`, retry, session load). If you run `maki auth login` in another terminal or change an env var, the next session picks it up without a restart."#;
@@ -237,7 +239,15 @@ fn write_section(out: &mut String, section: &ProviderSection) {
     }
 
     let _ = writeln!(out);
-    write_model_table(out, section.entries);
+
+    if section.entries.is_empty() {
+        let _ = writeln!(
+            out,
+            "Maki asks your local Ollama for the list of installed models, so there's no built-in catalog. Tiers are guessed from list order: the first model becomes strong, the second medium, and the rest weak. If that guess is wrong, open `/model` and press `1`, `2`, or `3` on any row to reassign it. Your choices are saved to `~/.maki/model-tiers`."
+        );
+    } else {
+        write_model_table(out, section.entries);
+    }
 }
 
 pub fn generate() -> String {
@@ -251,6 +261,7 @@ pub fn generate() -> String {
          Models are split into three tiers: **weak** (cheap and fast), \
          **medium** (balanced), and **strong** (highest capability, highest cost).\n"
     );
+    let _ = writeln!(out, "{TIER_PICKER_NOTE}\n");
     let _ = writeln!(out, "{AUTH_RELOADING}\n");
     let _ = writeln!(out, "## Built-in Providers\n");
 

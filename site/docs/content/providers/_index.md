@@ -9,6 +9,8 @@ group = "Reference"
 
 Maki talks to LLM providers over their HTTP APIs. Models are split into three tiers: **weak** (cheap and fast), **medium** (balanced), and **strong** (highest capability, highest cost).
 
+Open the model picker with `/model` and press `1`, `2`, or `3` on any row to reassign it to strong, medium, or weak. Your overrides are saved to `~/.maki/model-tiers` and apply across sessions.
+
 ## Auth Reloading
 
 Maki re-reads auth from storage and environment variables each time a new agent spawns (`/new`, retry, session load). If you run `maki auth login` in another terminal or change an env var, the next session picks it up without a restart.
@@ -48,13 +50,7 @@ Defaults: gpt-5.4-nano (weak), gpt-4.1 (medium), gpt-5.4 (strong)
 - **API**: `http://localhost:11434/v1`
 - **Features**: Local inference, no API key required, any model via ollama pull
 
-| Tier | Models | Pricing (in/out per 1M tokens) | Context |
-|------|--------|-------------------------------|---------|
-| Weak | **qwen3:1.7b** (default) | $0.00 / $0.00 | 128K ctx / 16K out |
-| Medium | **qwen3:8b** (default) | $0.00 / $0.00 | 128K ctx / 16K out |
-| Strong | **qwen3** (default) | $0.00 / $0.00 | 128K ctx / 16K out |
-
-Defaults: qwen3:1.7b (weak), qwen3:8b (medium), qwen3 (strong)
+Maki asks your local Ollama for the list of installed models, so there's no built-in catalog. Tiers are guessed from list order: the first model becomes strong, the second medium, and the rest weak. If that guess is wrong, open `/model` and press `1`, `2`, or `3` on any row to reassign it. Your choices are saved to `~/.maki/model-tiers`.
 
 ### Z.AI
 
