@@ -429,7 +429,7 @@ pub async fn parse_sse(
         content_blocks.push(ContentBlock::Text { text });
     }
 
-    for acc in tool_accumulators {
+    for (idx, acc) in tool_accumulators.into_iter().enumerate() {
         let input: Value = match serde_json::from_str(&acc.arguments) {
             Ok(v) => {
                 debug!(tool = %acc.name, json = %acc.arguments, "tool input JSON");
@@ -440,11 +440,19 @@ pub async fn parse_sse(
                 Value::Object(Default::default())
             }
         };
-        content_blocks.push(ContentBlock::ToolUse {
-            id: acc.id,
-            name: acc.name,
-            input,
-        });
+        let id = if acc.id.is_empty() {
+            warn!(raw_name = %acc.name, raw_args = %acc.arguments, "provider sent empty tool_use id; substituting placeholder");
+            format!("maki_unnamed_{idx}")
+        } else {
+            acc.id
+        };
+        let name = if acc.name.is_empty() {
+            warn!(%id, raw_args = %acc.arguments, "provider sent empty tool_use name; substituting placeholder");
+            "maki_unknown_tool".to_owned()
+        } else {
+            acc.name
+        };
+        content_blocks.push(ContentBlock::ToolUse { id, name, input });
     }
 
     Ok(StreamResponse {
@@ -661,6 +669,26 @@ data: {\"error\":{\"message\":\"Server overloaded\",\"type\":\"overloaded_error\
                 }
                 other => panic!("expected Api error, got: {other:?}"),
             }
+        })
+    }
+
+    #[test]
+    fn parse_sse_empty_tool_id_and_name_get_placeholders() {
+        smol::block_on(async {
+            let sse = "\
+data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"tool_calls\\\":[{\\\"tool\\\":\\\"read\\\"}]}\"}}]}}]}\n\
+\n\
+data: {\"choices\":[{\"finish_reason\":\"tool_calls\",\"delta\":{}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\
+\n\
+data: [DONE]\n";
+
+            let (tx, _rx) = flume::unbounded();
+            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx).await.unwrap();
+
+            let tools: Vec<_> = resp.message.tool_uses().collect();
+            assert_eq!(tools.len(), 1);
+            assert!(!tools[0].0.is_empty(), "id must be non-empty for Bedrock");
+            assert!(!tools[0].1.is_empty(), "name must be non-empty for Bedrock");
         })
     }
 
