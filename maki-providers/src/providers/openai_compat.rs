@@ -260,9 +260,28 @@ struct FunctionDelta {
 
 #[derive(Deserialize)]
 struct ChunkDelta {
-    content: Option<String>,
+    content: Option<ContentDelta>,
     reasoning_content: Option<String>,
     tool_calls: Option<Vec<ToolCallDelta>>,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(untagged)]
+enum ContentDelta {
+    Array(Vec<ContentDeltaPart>),
+    String(String),
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(tag = "type", rename_all = "lowercase")]
+enum ContentDeltaPart {
+    Thinking { thinking: Vec<ThinkingDeltaBlock> },
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(tag = "type", rename_all = "lowercase")]
+enum ThinkingDeltaBlock {
+    Text { text: String },
 }
 
 #[derive(Deserialize)]
@@ -372,21 +391,39 @@ pub async fn parse_sse(
                 .await?;
         }
 
-        if let Some(content) = delta.content
-            && !content.is_empty()
-        {
-            let content = if is_first_content {
-                is_first_content = false;
-                content.trim_start().to_string()
-            } else {
-                content
-            };
-            if !content.is_empty() {
-                text.push_str(&content);
-                event_tx
-                    .send_async(ProviderEvent::TextDelta { text: content })
-                    .await?;
+        match delta.content {
+            Some(ContentDelta::String(content_str)) if !content_str.is_empty() => {
+                let content = if is_first_content {
+                    is_first_content = false;
+                    content_str.trim_start().to_string()
+                } else {
+                    content_str
+                };
+
+                if !content.is_empty() {
+                    text.push_str(&content);
+                    event_tx
+                        .send_async(ProviderEvent::TextDelta { text: content })
+                        .await?;
+                }
             }
+            Some(ContentDelta::Array(content_array)) => {
+                for part in content_array {
+                    let ContentDeltaPart::Thinking { thinking } = part;
+                    for thinking_block in thinking {
+                        let ThinkingDeltaBlock::Text { text } = thinking_block;
+                        if text.is_empty() {
+                            continue;
+                        }
+
+                        reasoning_text.push_str(&text);
+                        event_tx
+                            .send_async(ProviderEvent::ThinkingDelta { text })
+                            .await?;
+                    }
+                }
+            }
+            _ => {}
         }
 
         if let Some(tc_deltas) = delta.tool_calls {
@@ -758,6 +795,46 @@ data: [DONE]\n";
             assert!(resp.message.content.is_empty());
             assert_eq!(resp.usage, TokenUsage::default());
             assert_eq!(resp.stop_reason, None);
+        })
+    }
+
+    #[test]
+    fn parse_sse_content_as_array_with_thinking() {
+        smol::block_on(async {
+            // Test parsing content as an array with thinking blocks
+            let sse = "\
+data: {\"choices\":[{\"delta\":{\"content\":[{\"type\":\"thinking\",\"thinking\":[{\"type\":\"text\",\"text\":\"Let me think\"}]}]}}]}\n\
+\n\
+data: {\"choices\":[{\"delta\":{\"content\":[{\"type\":\"thinking\",\"thinking\":[{\"type\":\"text\",\"text\":\"...\"}]}]}}]}\n\
+\n\
+data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\
+\n\
+data: [DONE]\n";
+
+            let (tx, rx) = flume::unbounded();
+            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx).await.unwrap();
+
+            assert!(
+                matches!(&resp.message.content[0], ContentBlock::Thinking { thinking, .. } if thinking == "Let me think..."),
+                "{:?}",
+                resp.message.content[0],
+            );
+            assert!(
+                matches!(&resp.message.content[1], ContentBlock::Text { text } if text == "Hello")
+            );
+
+            let mut thinking_deltas = Vec::new();
+            let mut text_deltas = Vec::new();
+            while let Ok(e) = rx.try_recv() {
+                match e {
+                    ProviderEvent::ThinkingDelta { text } => thinking_deltas.push(text),
+                    ProviderEvent::TextDelta { text } => text_deltas.push(text),
+                    _ => {}
+                }
+            }
+
+            assert_eq!(text_deltas, vec!["Hello"]);
+            assert_eq!(thinking_deltas, vec!["Let me think", "..."]);
         })
     }
 }
