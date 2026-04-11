@@ -34,6 +34,7 @@ Supported providers:
 * Anthropic - `ANTHROPIC_API_KEY` only (using OAuth is against TOS).
 * Z.AI - `ZHIPU_API_KEY`.
 * Synthetic - `SYNTHETIC_API_KEY`.
+* Mistral - `MISTRAL_API_KEY`.
 
 **Dynamic providers** - if there's a provider maki doesn't support currently, and it uses openai / anthropic API, you can ask maki (using a different temp provider) to write you a small script to access it anyway. Example for [anthropic](https://github.com/tontinton/maki/blob/main/scripts/providers/ollama-anthropic), example for [openai](https://github.com/tontinton/maki/blob/main/scripts/providers/ollama-openai).
 
