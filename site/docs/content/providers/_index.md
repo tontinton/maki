@@ -52,6 +52,19 @@ Defaults: gpt-5.4-nano (weak), gpt-4.1 (medium), gpt-5.4 (strong)
 
 Maki asks your local Ollama for the list of installed models, so there's no built-in catalog. Tiers are guessed from list order: the first model becomes strong, the second medium, and the rest weak. If that guess is wrong, open `/model` and press `1`, `2`, or `3` on any row to reassign it. Your choices are saved to `~/.maki/model-tiers`.
 
+### Mistral
+
+- **Env var**: `MISTRAL_API_KEY`
+- **API**: `https://api.mistral.ai/v1`
+
+| Tier | Models | Pricing (in/out per 1M tokens) | Context |
+|------|--------|-------------------------------|---------|
+| Weak | **mistral-small-latest, mistral-small-2603** (default) | $0.15 / $0.60 | 262K ctx / 262K out |
+| Medium | **mistral-large-latest, mistral-large-2512** (default) | $0.50 / $1.50 | 262K ctx / 262K out |
+| Strong | **devstral-latest, devstral-medium-latest, devstral-2512** (default) | $0.40 / $2.00 | 262K ctx / 262K out |
+
+Defaults: devstral-latest (strong), mistral-large-latest (medium), mistral-small-latest (weak)
+
 ### Z.AI
 
 - **Env var**: `ZHIPU_API_KEY` (shared across both endpoints)
@@ -108,7 +121,7 @@ To add a custom provider or proxy, drop an executable script into `~/.maki/provi
 
 `resolve` is called each time a new agent spawns, so scripts should read tokens from disk instead of caching them in memory. That way auth changes from other processes get picked up.
 
-The `base` field specifies which built-in provider to inherit the model catalog from. Valid values: `anthropic`, `openai`, `ollama`, `zai`, `zai-coding-plan`, `synthetic`.
+The `base` field specifies which built-in provider to inherit the model catalog from. Valid values: `anthropic`, `openai`, `ollama`, `mistral`, `zai`, `zai-coding-plan`, `synthetic`.
 
 If your provider serves models not in the base catalog, add a `models` subcommand returning:
 
