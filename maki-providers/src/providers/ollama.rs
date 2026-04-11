@@ -15,7 +15,7 @@ static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
     api_key_env: "",
     base_url: "http://localhost:11434/v1",
     max_tokens_field: "max_tokens",
-    include_stream_usage: false,
+    include_stream_usage: true,
     provider_name: "Ollama",
 };
 
