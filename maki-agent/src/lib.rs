@@ -11,7 +11,7 @@ pub mod mcp;
 pub use mcp::config::McpServerInfo;
 pub use mcp::config::McpServerStatus;
 pub use mcp::protocol::PromptRole;
-pub use mcp::{McpPromptArg, McpPromptInfo};
+pub use mcp::{McpCommand, McpHandle, McpPromptArg, McpPromptInfo, McpSnapshot, McpSnapshotReader};
 pub(crate) mod task_set;
 pub use agent::{
     Agent, AgentParams, AgentRunParams, History, Instructions, LoadedInstructions, RunOutcome,

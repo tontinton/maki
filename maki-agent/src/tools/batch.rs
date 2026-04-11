@@ -144,7 +144,7 @@ impl Batch {
         let active = &self.tool_calls[..self.tool_calls.len().min(MAX_BATCH_SIZE)];
         let discarded = &self.tool_calls[active.len()..];
 
-        let mcp = ctx.mcp.as_deref();
+        let mcp = ctx.mcp.as_ref();
 
         let parsed: Vec<Result<ResolvedCall, String>> = active
             .iter()

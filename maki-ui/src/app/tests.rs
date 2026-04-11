@@ -9,10 +9,12 @@ use arc_swap::ArcSwap;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use maki_agent::permissions::PermissionManager;
 use maki_agent::{
-    QuestionInfo, QuestionOption, ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent,
+    ImageMediaType, McpServerInfo, McpServerStatus, McpSnapshot, McpSnapshotReader, QuestionInfo,
+    QuestionOption, ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent,
 };
 use maki_config::{PermissionsConfig, UiConfig};
-use maki_providers::TokenUsage;
+use maki_providers::{ContentBlock, Role, TokenUsage};
+use maki_storage::sessions::StoredThinking;
 use ratatui::layout::Rect;
 use std::env;
 use std::path::{Path, PathBuf};
@@ -29,7 +31,6 @@ fn set_zone(app: &mut App, zone: SelectionZone, area: Rect) {
 
 fn test_app() -> App {
     let writer = Arc::new(StorageWriter::new(DataDir::from_path(env::temp_dir())));
-    let mcp_infos = Arc::new(ArcSwap::from_pointee(Vec::new()));
     let permissions = Arc::new(PermissionManager::new(
         PermissionsConfig {
             allow_all: false,
@@ -43,8 +44,7 @@ fn test_app() -> App {
         AppSession::new("test-model", "/tmp/test"),
         DataDir::from_path(env::temp_dir()),
         Arc::new(ArcSwapOption::empty()),
-        mcp_infos,
-        Arc::new(ArcSwap::from_pointee(Vec::new())),
+        McpSnapshotReader::empty(),
         writer,
         UiConfig::default(),
         100,
@@ -147,7 +147,6 @@ fn with_text(app: &mut App) {
 }
 
 fn with_image(app: &mut App) {
-    use maki_agent::ImageMediaType;
     let img = ImageSource::new(ImageMediaType::Png, Arc::from("dGVzdA=="));
     app.input_box.attach_image(img);
 }
@@ -443,15 +442,13 @@ fn load_session_clears_plan() {
     let writer = Arc::new(StorageWriter::new(DataDir::from_path(
         tmp.path().to_path_buf(),
     )));
-    let mcp_infos = Arc::new(ArcSwap::from_pointee(Vec::new()));
     let model = test_model();
     let mut app = App::new(
         &model,
         AppSession::new("test-model", "/tmp/test"),
         dir,
         Arc::new(ArcSwapOption::empty()),
-        mcp_infos,
-        Arc::new(ArcSwap::from_pointee(Vec::new())),
+        McpSnapshotReader::empty(),
         writer,
         UiConfig::default(),
         100,
@@ -1448,7 +1445,6 @@ fn slash_noncommand_sends_as_prompt() {
 
 fn build_rewind_app() -> App {
     let mut app = test_app();
-    use maki_providers::{ContentBlock, Message, Role};
 
     app.state.session.messages = vec![
         Message::user("first prompt".into()),
@@ -1645,19 +1641,21 @@ fn mcp_command_opens_picker() {
 
 #[test]
 fn mcp_toggle_dispatches_action() {
-    use maki_agent::{McpServerInfo, McpServerStatus};
-    use std::path::PathBuf;
-
     let mut app = test_app();
-    app.mcp_picker = McpPicker::new(Arc::new(ArcSwap::from_pointee(vec![McpServerInfo {
-        name: "test-srv".into(),
-        transport_kind: "stdio",
-        tool_count: 2,
-        prompt_count: 0,
-        status: McpServerStatus::Running,
-        config_path: PathBuf::from("/tmp/config.toml"),
-        url: None,
-    }])));
+    app.mcp_picker = McpPicker::new(McpSnapshotReader::from_snapshot(McpSnapshot {
+        infos: vec![McpServerInfo {
+            name: "test-srv".into(),
+            transport_kind: "stdio",
+            tool_count: 2,
+            prompt_count: 0,
+            status: McpServerStatus::Running,
+            config_path: PathBuf::from("/tmp/config.toml"),
+            url: None,
+        }],
+        prompts: vec![],
+        pids: vec![],
+        generation: 0,
+    }));
     app.execute_command(cmd("/mcp"));
 
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
@@ -1772,7 +1770,6 @@ fn overlay_zone_click_gating() {
 }
 
 fn streaming_app_with_history() -> App {
-    use maki_providers::{ContentBlock, Message, Role};
     let mut app = test_app();
     app.status = Status::Streaming;
     app.run_id = 1;
@@ -2000,8 +1997,6 @@ fn thinking_non_anthropic_flashes_error() {
 
 #[test]
 fn thinking_restored_from_session_meta() {
-    use maki_storage::sessions::StoredThinking;
-
     let tmp = TempDir::new().unwrap();
     let storage = DataDir::from_path(tmp.path().to_path_buf());
     let mut session = AppSession::new("test-model", "/tmp/test");

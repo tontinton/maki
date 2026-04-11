@@ -5,14 +5,17 @@ pub(crate) mod shared_queue;
 
 use std::collections::HashMap;
 use std::mem;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
-use maki_agent::mcp::config::McpServerInfo;
+use maki_agent::mcp;
 use maki_agent::permissions::PermissionManager;
 use maki_agent::skill::Skill;
-use maki_agent::{AgentConfig, CancelToken, Envelope, McpPromptInfo, ToolOutput};
+use maki_agent::{
+    AgentConfig, CancelToken, Envelope, McpCommand, McpHandle, McpSnapshotReader, ToolOutput,
+};
 
 use self::cancel_map::CancelMap;
 use maki_providers::provider::Provider;
@@ -25,6 +28,8 @@ use self::agent_loop::AgentLoop;
 use self::command_router::spawn_command_router;
 pub(crate) use self::shared_queue::{QueuedMessage, SharedQueue};
 
+const MCP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+
 pub(crate) struct ModelSlot {
     pub(crate) model: Model,
     pub(crate) provider: Arc<dyn Provider>,
@@ -33,15 +38,6 @@ pub(crate) struct ModelSlot {
 pub(crate) enum AgentCommand {
     Cancel { run_id: u64 },
     CancelAll,
-    ToggleMcp(String, bool),
-}
-
-#[derive(Clone, Default)]
-pub(crate) struct McpState {
-    pub(crate) disabled: Vec<String>,
-    pub(crate) infos: Arc<ArcSwap<Vec<McpServerInfo>>>,
-    pub(crate) prompts: Arc<ArcSwap<Vec<McpPromptInfo>>>,
-    pub(crate) pids: Arc<Mutex<Vec<u32>>>,
 }
 
 pub(crate) struct AgentHandles {
@@ -50,12 +46,40 @@ pub(crate) struct AgentHandles {
     pub(crate) answer_tx: flume::Sender<String>,
     pub(crate) history: Arc<ArcSwap<Vec<Message>>>,
     pub(crate) tool_outputs: Arc<Mutex<HashMap<String, ToolOutput>>>,
-    pub(crate) mcp: McpState,
+    pub(crate) mcp_handle: Option<McpHandle>,
     pub(crate) queue: Arc<SharedQueue>,
     task: smol::Task<()>,
 }
 
 impl AgentHandles {
+    /// MCP is started once up front. The handle lives across agent respawns, only the agent
+    /// loop task gets replaced.
+    pub(crate) fn spawn(
+        model_slot: &Arc<ArcSwap<ModelSlot>>,
+        initial_history: Vec<Message>,
+        skills: &Arc<[Skill]>,
+        config: AgentConfig,
+        permissions: &Arc<PermissionManager>,
+        cwd: PathBuf,
+    ) -> Self {
+        let mcp_handle = smol::block_on(mcp::start(&cwd));
+        spawn_agent_internal(
+            model_slot,
+            initial_history,
+            skills,
+            config,
+            permissions,
+            mcp_handle,
+        )
+    }
+
+    pub(crate) fn mcp_reader(&self) -> McpSnapshotReader {
+        self.mcp_handle
+            .as_ref()
+            .map(McpHandle::reader)
+            .unwrap_or_else(McpSnapshotReader::empty)
+    }
+
     pub(crate) fn apply_to_app(&self, app: &mut App) {
         app.answer_tx = Some(self.answer_tx.clone());
         app.cmd_tx = Some(self.cmd_tx.clone());
@@ -68,7 +92,12 @@ impl AgentHandles {
         let _ = self.cmd_tx.try_send(AgentCommand::CancelAll);
     }
 
-    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn send_mcp(&self, cmd: McpCommand) {
+        if let Some(ref h) = self.mcp_handle {
+            h.send(cmd);
+        }
+    }
+
     pub(crate) fn respawn(
         &mut self,
         history: Vec<Message>,
@@ -82,17 +111,22 @@ impl AgentHandles {
         if let Err(e) = smol::block_on(slot.provider.reload_auth()) {
             warn!(error = %e, "failed to reload auth, continuing with existing credentials");
         }
-        let mcp = self.mcp.clone();
-        let old = mem::replace(
-            self,
-            spawn_agent(model_slot, history, skills, config, permissions, mcp),
+        let new = spawn_agent_internal(
+            model_slot,
+            history,
+            skills,
+            config,
+            permissions,
+            self.mcp_handle.clone(),
         );
+        let old = mem::replace(self, new);
         old.cancel();
         self.apply_to_app(app);
     }
 
     pub(crate) fn shutdown(self, timeout: Duration) {
         let _ = self.cmd_tx.try_send(AgentCommand::CancelAll);
+        let mcp_handle = self.mcp_handle;
         let task = self.task;
         drop((self.cmd_tx, self.agent_rx, self.answer_tx));
         info!("waiting for agent to finish (timeout {timeout:?})");
@@ -111,30 +145,44 @@ impl AgentHandles {
             if !finished {
                 warn!("agent did not finish within {timeout:?}, forcing shutdown");
             }
+
+            if let Some(handle) = mcp_handle {
+                shutdown_mcp(&handle).await;
+            }
         });
     }
 }
 
-pub(crate) fn toggle_disabled(disabled: &mut Vec<String>, name: &str, enabled: bool) {
-    if enabled {
-        disabled.retain(|s| s != name);
-    } else if !disabled.contains(&name.to_owned()) {
-        disabled.push(name.to_owned());
+async fn shutdown_mcp(handle: &McpHandle) {
+    let (ack_tx, ack_rx) = flume::bounded(1);
+    handle.send(McpCommand::Shutdown { ack: ack_tx });
+    let finished = futures_lite::future::or(
+        async {
+            let _ = ack_rx.recv_async().await;
+            true
+        },
+        async {
+            smol::Timer::after(MCP_SHUTDOWN_TIMEOUT).await;
+            false
+        },
+    )
+    .await;
+    if !finished {
+        warn!("MCP shutdown timed out after {MCP_SHUTDOWN_TIMEOUT:?}");
     }
 }
 
-pub(crate) fn spawn_agent(
+fn spawn_agent_internal(
     model_slot: &Arc<ArcSwap<ModelSlot>>,
     initial_history: Vec<Message>,
     skills: &Arc<[Skill]>,
     config: AgentConfig,
     permissions: &Arc<PermissionManager>,
-    mcp_state: McpState,
+    mcp_handle: Option<McpHandle>,
 ) -> AgentHandles {
     let (agent_tx, agent_rx) = flume::unbounded::<Envelope>();
     let (cmd_tx, cmd_rx) = flume::unbounded::<AgentCommand>();
     let (answer_tx, answer_rx) = flume::unbounded::<String>();
-    let (toggle_tx, toggle_rx) = flume::unbounded::<(String, bool)>();
     let (queue, notify_rx) = SharedQueue::new();
     let shared_history: Arc<ArcSwap<Vec<Message>>> =
         Arc::new(ArcSwap::from_pointee(initial_history.clone()));
@@ -143,7 +191,7 @@ pub(crate) fn spawn_agent(
     let (init_trigger, init_cancel) = CancelToken::new();
     let cancel_map = Arc::new(Mutex::new(CancelMap::new(0, init_trigger)));
 
-    spawn_command_router(cmd_rx, toggle_tx, Arc::clone(&cancel_map));
+    spawn_command_router(cmd_rx, Arc::clone(&cancel_map));
 
     let agent_loop = AgentLoop::new(
         Arc::clone(model_slot),
@@ -151,16 +199,12 @@ pub(crate) fn spawn_agent(
         config,
         initial_history,
         Arc::clone(&shared_history),
-        Arc::clone(&mcp_state.infos),
-        Arc::clone(&mcp_state.prompts),
-        Arc::clone(&mcp_state.pids),
-        mcp_state.disabled.clone(),
+        mcp_handle.clone(),
         Arc::clone(permissions),
         agent_tx,
         answer_rx,
         notify_rx,
         Arc::clone(&queue),
-        toggle_rx,
         cancel_map,
         init_cancel,
     );
@@ -173,7 +217,7 @@ pub(crate) fn spawn_agent(
         answer_tx,
         history: shared_history,
         tool_outputs: shared_tool_outputs,
-        mcp: mcp_state,
+        mcp_handle,
         queue,
         task,
     }

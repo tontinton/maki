@@ -312,7 +312,7 @@ impl McpTransport for StdioTransport {
         })
     }
 
-    fn shutdown(self: Box<Self>) -> BoxFuture<'static, ()> {
+    fn shutdown<'a>(&'a self) -> BoxFuture<'a, ()> {
         Box::pin(async move {
             self.alive.store(false, Ordering::Release);
             #[cfg(unix)]
@@ -320,7 +320,8 @@ impl McpTransport for StdioTransport {
                 libc::killpg(self._child.id() as i32, libc::SIGTERM);
             }
             smol::Timer::after(Duration::from_millis(200)).await;
-            // Drop of self._child (ChildGuard) sends SIGKILL to process group
+            // SIGTERM above gives the child a brief window to exit on its own. When the last
+            // Arc drops, `ChildGuard::drop` follows up with SIGKILL on the process group.
         })
     }
 

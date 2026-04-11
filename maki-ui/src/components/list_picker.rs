@@ -288,6 +288,14 @@ impl<T: PickerItem> ListPicker<T> {
         }
     }
 
+    pub fn replace_toggleable(&mut self, items: Vec<T>, enabled: Vec<bool>) {
+        if let Some(s) = self.state.as_mut().and_then(PickerState::ready_mut) {
+            self.generation += 1;
+            s.enabled = Some(enabled);
+            s.replace_items(items);
+        }
+    }
+
     pub fn retain(&mut self, f: impl Fn(&T) -> bool) {
         let Some(s) = self.state.as_mut().and_then(PickerState::ready_mut) else {
             return;

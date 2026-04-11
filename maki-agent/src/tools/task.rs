@@ -100,7 +100,7 @@ impl Task {
         };
         let mut tools = ToolCall::definitions(&vars, &ctx_desc, model.supports_tool_examples());
         if let Some(ref mcp) = ctx.mcp {
-            mcp.extend_tools(&mut tools, &[]);
+            mcp.extend_tools(&mut tools);
         }
 
         let (sub_tx, sub_rx) = flume::unbounded::<crate::Envelope>();

@@ -12,7 +12,7 @@ use super::instructions::LoadedInstructions;
 use super::streaming::stream_with_retry;
 use super::tool_dispatch::{self, RecentCalls};
 use crate::cancel::CancelToken;
-use crate::mcp::McpManager;
+use crate::mcp::McpHandle;
 use crate::permissions::PermissionManager;
 use crate::skill::Skill;
 use crate::tools::{Deadline, ToolContext};
@@ -66,7 +66,7 @@ pub struct Agent {
     auto_compact: bool,
     loaded_instructions: LoadedInstructions,
     rollback_len: usize,
-    mcp: Option<Arc<McpManager>>,
+    mcp: Option<McpHandle>,
     config: AgentConfig,
     reauth_attempts: u32,
     permissions: Arc<PermissionManager>,
@@ -101,7 +101,7 @@ impl Agent {
         }
     }
 
-    pub fn with_mcp(mut self, mcp: Option<Arc<McpManager>>) -> Self {
+    pub fn with_mcp(mut self, mcp: Option<McpHandle>) -> Self {
         self.mcp = mcp;
         self
     }

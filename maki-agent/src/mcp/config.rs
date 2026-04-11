@@ -109,14 +109,14 @@ pub struct RawHttpFields {
     pub headers: HashMap<String, String>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct ServerConfig {
     pub name: String,
     pub timeout: Duration,
     pub transport: Transport,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum Transport {
     Stdio {
         program: String,

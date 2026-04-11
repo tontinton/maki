@@ -1,12 +1,11 @@
 use std::collections::VecDeque;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::sync::Arc;
 
 use serde_json::Value;
 use tracing::{debug, error, warn};
 
-use crate::mcp::McpManager;
+use crate::mcp::{McpHandle, UNKNOWN_MCP};
 use crate::task_set::TaskSet;
 use crate::tools::{ToolCall, ToolContext};
 use crate::{AgentError, AgentEvent, AgentMode, ToolDoneEvent, ToolOutput, ToolStartEvent};
@@ -22,13 +21,13 @@ pub(crate) enum ResolvedCall {
 }
 
 impl ResolvedCall {
-    pub(crate) fn start_event(&self, id: String, mcp: Option<&McpManager>) -> ToolStartEvent {
+    pub(crate) fn start_event(&self, id: String, mcp: Option<&McpHandle>) -> ToolStartEvent {
         match self {
             Self::Native(call) => call.start_event(id),
             Self::Mcp { tool_name, .. } => {
                 let interned = mcp
                     .map(|m| m.interned_name(tool_name))
-                    .unwrap_or("unknown_mcp");
+                    .unwrap_or(UNKNOWN_MCP);
                 ToolStartEvent {
                     id,
                     tool: interned,
@@ -52,7 +51,7 @@ impl ResolvedCall {
 pub(crate) fn resolve_tool(
     name: &str,
     input: &Value,
-    mcp: Option<&McpManager>,
+    mcp: Option<&McpHandle>,
 ) -> Result<ResolvedCall, AgentError> {
     match ToolCall::from_api(name, input) {
         Ok(call) => Ok(ResolvedCall::Native(call)),
@@ -104,7 +103,7 @@ impl RecentCalls {
 fn parse_tool_calls<'a>(
     tool_uses: impl Iterator<Item = (&'a str, &'a str, &'a Value)>,
     recent: &mut RecentCalls,
-    mcp: Option<&McpManager>,
+    mcp: Option<&McpHandle>,
 ) -> (Vec<ParsedToolCall>, Vec<ToolDoneEvent>) {
     let mut parsed = Vec::new();
     let mut errors = Vec::new();
@@ -177,7 +176,7 @@ pub(crate) async fn execute_mcp_tool(
         .mcp
         .as_ref()
         .map(|m| m.interned_name(tool_name))
-        .unwrap_or("unknown_mcp");
+        .unwrap_or(UNKNOWN_MCP);
 
     let done = |output: String, is_error: bool| ToolDoneEvent {
         id: id.to_owned(),
@@ -228,22 +227,18 @@ pub(crate) async fn execute_mcp_tool(
 pub(super) async fn process_tool_calls(
     response: maki_providers::StreamResponse,
     recent_calls: &mut RecentCalls,
-    mcp: Option<&Arc<McpManager>>,
+    mcp: Option<&McpHandle>,
     history: &mut super::history::History,
     event_tx: &crate::EventSender,
     ctx: &ToolContext,
 ) -> Result<(), AgentError> {
-    let (parsed, errors) = parse_tool_calls(
-        response.message.tool_uses(),
-        recent_calls,
-        mcp.map(|m| m.as_ref()),
-    );
+    let (parsed, errors) = parse_tool_calls(response.message.tool_uses(), recent_calls, mcp);
 
     history.push(response.message);
 
     for p in &parsed {
         event_tx.send(AgentEvent::ToolStart(Box::new(
-            p.call.start_event(p.id.clone(), mcp.map(|m| m.as_ref())),
+            p.call.start_event(p.id.clone(), mcp),
         )))?;
     }
 

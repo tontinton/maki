@@ -2146,6 +2146,7 @@ dependencies = [
 name = "maki-agent"
 version = "0.1.12"
 dependencies = [
+ "arc-swap",
  "async-io",
  "async-lock",
  "async-process",

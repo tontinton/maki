@@ -51,7 +51,7 @@ use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use maki_agent::QuestionInfo;
 use maki_agent::permissions::{PermissionDecision, PermissionManager};
 use maki_agent::{
-    AgentEvent, Envelope, ImageSource, McpPromptInfo, McpServerInfo, SubagentInfo, ToolOutput,
+    AgentEvent, Envelope, ImageSource, McpPromptInfo, McpSnapshotReader, SubagentInfo, ToolOutput,
 };
 use maki_config::UiConfig;
 use maki_providers::{Message, Model, ThinkingConfig};
@@ -149,8 +149,7 @@ impl App {
         session: AppSession,
         storage: DataDir,
         available_models: Arc<ArcSwapOption<Vec<String>>>,
-        mcp_infos: Arc<ArcSwap<Vec<McpServerInfo>>>,
-        mcp_prompts: Arc<ArcSwap<Vec<McpPromptInfo>>>,
+        mcp_reader: McpSnapshotReader,
         storage_writer: Arc<StorageWriter>,
         ui_config: UiConfig,
         input_history_size: usize,
@@ -163,12 +162,12 @@ impl App {
             active_chat: 0,
             chat_index: HashMap::new(),
             input_box: InputBox::new(InputHistory::load(&storage, input_history_size)),
-            command_palette: CommandPalette::new(custom_commands, mcp_prompts),
+            command_palette: CommandPalette::new(custom_commands, mcp_reader.clone()),
             task_picker: ListPicker::new(),
             task_picker_original: None,
             theme_picker: ThemePicker::new(),
             model_picker: ModelPicker::new(available_models),
-            mcp_picker: McpPicker::new(mcp_infos),
+            mcp_picker: McpPicker::new(mcp_reader),
             session_picker: SessionPicker::new(),
             rewind_picker: RewindPicker::new(),
             help_modal: HelpModal::new(),

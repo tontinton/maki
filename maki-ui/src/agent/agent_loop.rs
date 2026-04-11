@@ -1,11 +1,10 @@
 use std::mem;
-use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
 use maki_agent::agent;
-use maki_agent::mcp::McpManager;
-use maki_agent::mcp::config::{McpServerInfo, persist_enabled};
+use maki_agent::mcp::McpHandle;
+use maki_agent::mcp::config::McpServerStatus;
 use maki_agent::permissions::PermissionManager;
 use maki_agent::skill::Skill;
 use maki_agent::template;
@@ -13,7 +12,7 @@ use maki_agent::template::Vars;
 use maki_agent::tools::{DescriptionContext, ToolCall, ToolFilter};
 use maki_agent::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentParams, AgentRunParams, CancelToken,
-    CancelTrigger, Envelope, EventSender, History, Instructions, McpPromptInfo, PromptRole,
+    CancelTrigger, Envelope, EventSender, History, Instructions, McpCommand, PromptRole,
 };
 use maki_providers::{AgentError, Message, Model, TokenUsage};
 use serde_json::Value;
@@ -22,7 +21,6 @@ use tracing::error;
 use super::ModelSlot;
 use super::cancel_map::CancelMap;
 use super::shared_queue::{QueueItem, SharedQueue};
-use super::toggle_disabled;
 
 pub(super) struct AgentLoop {
     model_slot: Arc<ArcSwap<ModelSlot>>,
@@ -31,11 +29,7 @@ pub(super) struct AgentLoop {
     vars: Vars,
     instructions: Instructions,
     tools: Value,
-    disabled: Vec<String>,
-    mcp_manager: Option<Arc<McpManager>>,
-    mcp_infos: Arc<ArcSwap<Vec<McpServerInfo>>>,
-    mcp_prompts: Arc<ArcSwap<Vec<McpPromptInfo>>>,
-    mcp_pids: Arc<Mutex<Vec<u32>>>,
+    mcp_handle: Option<McpHandle>,
     history: History,
     shared_history: Arc<ArcSwap<Vec<Message>>>,
     cancel_map: Arc<Mutex<CancelMap>>,
@@ -46,12 +40,6 @@ pub(super) struct AgentLoop {
     answer_rx: Arc<async_lock::Mutex<flume::Receiver<String>>>,
     notify_rx: flume::Receiver<()>,
     queue: Arc<SharedQueue>,
-    toggle_rx: flume::Receiver<(String, bool)>,
-}
-
-enum LoopEvent {
-    Queue,
-    Toggle(String, bool),
 }
 
 impl AgentLoop {
@@ -62,16 +50,12 @@ impl AgentLoop {
         config: AgentConfig,
         initial_history: Vec<Message>,
         shared_history: Arc<ArcSwap<Vec<Message>>>,
-        mcp_infos: Arc<ArcSwap<Vec<McpServerInfo>>>,
-        mcp_prompts: Arc<ArcSwap<Vec<McpPromptInfo>>>,
-        mcp_pids: Arc<Mutex<Vec<u32>>>,
-        initial_disabled: Vec<String>,
+        mcp_handle: Option<McpHandle>,
         permissions: Arc<PermissionManager>,
         agent_tx: flume::Sender<Envelope>,
         answer_rx: flume::Receiver<String>,
         notify_rx: flume::Receiver<()>,
         queue: Arc<SharedQueue>,
-        toggle_rx: flume::Receiver<(String, bool)>,
         cancel_map: Arc<Mutex<CancelMap>>,
         cancel: CancelToken,
     ) -> Self {
@@ -82,11 +66,7 @@ impl AgentLoop {
             vars: Vars::default(),
             instructions: Instructions::default(),
             tools: Value::Null,
-            disabled: initial_disabled,
-            mcp_manager: None,
-            mcp_infos,
-            mcp_prompts,
-            mcp_pids,
+            mcp_handle,
             history: History::new(initial_history),
             shared_history,
             cancel_map,
@@ -97,7 +77,6 @@ impl AgentLoop {
             answer_rx: Arc::new(async_lock::Mutex::new(answer_rx)),
             notify_rx,
             queue,
-            toggle_rx,
         }
     }
 
@@ -106,35 +85,12 @@ impl AgentLoop {
             return;
         }
 
-        loop {
-            let event = {
-                let notify_rx = &self.notify_rx;
-                let toggle_rx = &self.toggle_rx;
-                futures_lite::future::race(
-                    async { notify_rx.recv_async().await.ok().map(|_| LoopEvent::Queue) },
-                    async {
-                        toggle_rx
-                            .recv_async()
-                            .await
-                            .ok()
-                            .map(|(s, e)| LoopEvent::Toggle(s, e))
-                    },
-                )
-                .await
-            };
-
-            let Some(event) = event else { break };
-
-            match event {
-                LoopEvent::Toggle(name, enabled) => self.handle_mcp_toggle(name, enabled),
-                LoopEvent::Queue => {
-                    while let Some(entry) = self.queue.pop() {
-                        if entry.run_id() < self.min_run_id {
-                            continue;
-                        }
-                        self.process_entry(entry).await;
-                    }
+        while let Ok(()) = self.notify_rx.recv_async().await {
+            while let Some(entry) = self.queue.pop() {
+                if entry.run_id() < self.min_run_id {
+                    continue;
                 }
+                self.process_entry(entry).await;
             }
         }
     }
@@ -170,39 +126,11 @@ impl AgentLoop {
 
         let slot = self.model_slot.load();
         self.tools = self.build_tools(&slot.model);
-
-        let cwd = PathBuf::from(self.vars.apply("{cwd}").into_owned());
-        self.init_mcp(&cwd).await;
+        if let Some(ref mcp) = self.mcp_handle {
+            mcp.extend_tools(&mut self.tools);
+            spawn_oauth_for_needs_auth(mcp);
+        }
         !self.cancel.is_cancelled()
-    }
-
-    async fn init_mcp(&mut self, cwd: &Path) {
-        let mcp_config = maki_agent::mcp::config::load_config(cwd);
-        self.disabled.sort_unstable();
-        self.disabled.dedup();
-
-        if !mcp_config.is_empty() {
-            self.mcp_infos
-                .store(Arc::new(mcp_config.preliminary_infos(&self.disabled)));
-        }
-
-        let mcp_manager = self
-            .cancel
-            .race(McpManager::start_with_config(mcp_config))
-            .await
-            .unwrap_or(None);
-
-        if let Some(ref mgr) = mcp_manager {
-            mgr.extend_tools(&mut self.tools, &self.disabled);
-            let infos = mgr.server_infos(&self.disabled);
-            spawn_oauth_for_needs_auth(&infos, mgr, &self.mcp_infos, &self.disabled);
-            self.mcp_infos.store(Arc::new(infos));
-            self.mcp_prompts
-                .store(Arc::new(mgr.prompt_infos(&self.disabled)));
-            *self.mcp_pids.lock().unwrap_or_else(|e| e.into_inner()) = mgr.child_pids();
-        }
-
-        self.mcp_manager = mcp_manager;
     }
 
     async fn do_compact(&mut self, event_tx: &EventSender) -> Result<(), AgentError> {
@@ -232,10 +160,14 @@ impl AgentLoop {
             self.history.push(msg);
         }
 
-        if let Some(ref prompt_ref) = input.prompt
-            && let Some(ref mgr) = self.mcp_manager
-        {
-            let messages = mgr
+        if let Some(ref prompt_ref) = input.prompt {
+            let Some(ref mcp) = self.mcp_handle else {
+                return Err(AgentError::Tool {
+                    tool: "mcp_prompt".into(),
+                    message: "MCP not available".into(),
+                });
+            };
+            let messages = mcp
                 .get_prompt(&prompt_ref.qualified_name, &prompt_ref.arguments)
                 .await
                 .map_err(|e| AgentError::Tool {
@@ -283,7 +215,7 @@ impl AgentLoop {
         .with_user_response_rx(Arc::clone(&self.answer_rx))
         .with_interrupt_source(Arc::clone(&self.queue) as Arc<dyn maki_agent::InterruptSource>)
         .with_cancel(cancel)
-        .with_mcp(self.mcp_manager.clone());
+        .with_mcp(self.mcp_handle.clone());
 
         let outcome = agent.run(input).await;
 
@@ -298,24 +230,10 @@ impl AgentLoop {
         outcome.result
     }
 
-    fn handle_mcp_toggle(&mut self, server_name: String, enabled: bool) {
-        toggle_disabled(&mut self.disabled, &server_name, enabled);
-        let slot = self.model_slot.load();
-        self.rebuild_tools(&slot.model);
-
-        if let Some(ref mcp) = self.mcp_manager {
-            let infos = mcp.server_infos(&self.disabled);
-            self.persist_mcp_toggle(&infos, &server_name, enabled);
-            self.mcp_infos.store(Arc::new(infos));
-            self.mcp_prompts
-                .store(Arc::new(mcp.prompt_infos(&self.disabled)));
-        }
-    }
-
     fn rebuild_tools(&mut self, model: &Model) {
         let mut tools = self.build_tools(model);
-        if let Some(ref mcp) = self.mcp_manager {
-            mcp.extend_tools(&mut tools, &self.disabled);
+        if let Some(ref mcp) = self.mcp_handle {
+            mcp.extend_tools(&mut tools);
         }
         self.tools = tools;
     }
@@ -333,22 +251,6 @@ impl AgentLoop {
     async fn reload_instructions(&mut self) {
         let cwd = self.vars.apply("{cwd}").into_owned();
         self.instructions = smol::unblock(move || agent::load_instructions(&cwd)).await;
-    }
-
-    fn persist_mcp_toggle(&self, infos: &[McpServerInfo], server_name: &str, enabled: bool) {
-        if let Some(info) = infos.iter().find(|i| i.name == server_name) {
-            let path = info.config_path.clone();
-            let name = server_name.to_owned();
-            let server_for_log = server_name.to_owned();
-            smol::spawn(async move {
-                if let Err(e) =
-                    smol::unblock(move || persist_enabled(&path, &name, enabled)).await
-                {
-                    tracing::warn!(error = %e, server = %server_for_log, "failed to persist MCP toggle");
-                }
-            })
-            .detach();
-        }
     }
 
     fn sync_shared_history(&self) {
@@ -396,27 +298,19 @@ impl AgentLoop {
     }
 }
 
-fn spawn_oauth_for_needs_auth(
-    infos: &[McpServerInfo],
-    mgr: &Arc<McpManager>,
-    mcp_infos: &Arc<ArcSwap<Vec<McpServerInfo>>>,
-    disabled: &[String],
-) {
-    use maki_agent::mcp::config::McpServerStatus;
-
-    for info in infos {
+fn spawn_oauth_for_needs_auth(handle: &McpHandle) {
+    let snapshot = handle.reader().load().clone();
+    for info in snapshot.infos.iter() {
         let McpServerStatus::NeedsAuth { ref url } = info.status else {
             continue;
         };
         let Some(ref server_url) = info.url else {
             continue;
         };
-        let mgr = Arc::clone(mgr);
+        let handle = handle.clone();
         let server_name = info.name.clone();
         let server_url = server_url.clone();
         let www_auth = url.clone();
-        let mcp_infos = Arc::clone(mcp_infos);
-        let disabled = disabled.to_vec();
         smol::spawn(async move {
             let storage = match maki_storage::DataDir::resolve() {
                 Ok(s) => s,
@@ -442,14 +336,11 @@ fn spawn_oauth_for_needs_auth(
             let Some(ref tokens) = auth_data.tokens else {
                 return;
             };
-            if let Err(e) = mgr
-                .reconnect_server(&server_name, &server_url, &tokens.access)
-                .await
-            {
-                tracing::warn!(server = %server_name, error = %e, "OAuth reconnect failed");
-                return;
-            }
-            mcp_infos.store(Arc::new(mgr.server_infos(&disabled)));
+            handle.send(McpCommand::Reconnect {
+                server: server_name.clone(),
+                url: server_url,
+                token: tokens.access.clone(),
+            });
             tracing::info!(server = %server_name, "MCP server authenticated via OAuth");
         })
         .detach();

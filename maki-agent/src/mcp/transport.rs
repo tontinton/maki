@@ -27,7 +27,7 @@ pub trait McpTransport: Send + Sync {
         method: &'a str,
         params: Option<Value>,
     ) -> BoxFuture<'a, Result<(), McpError>>;
-    fn shutdown(self: Box<Self>) -> BoxFuture<'static, ()>;
+    fn shutdown<'a>(&'a self) -> BoxFuture<'a, ()>;
     fn server_name(&self) -> &Arc<str>;
     fn transport_kind(&self) -> &'static str;
     fn child_pids(&self) -> Vec<u32> {

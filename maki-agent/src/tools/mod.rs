@@ -42,7 +42,7 @@ use tracing::{error, info, warn};
 
 use crate::agent::LoadedInstructions;
 use crate::cancel::CancelToken;
-use crate::mcp::McpManager;
+use crate::mcp::McpHandle;
 use crate::permissions::PermissionManager;
 use crate::skill::Skill;
 use crate::template::Vars;
@@ -246,7 +246,7 @@ pub struct ToolContext {
     pub skills: Arc<[Skill]>,
     pub loaded_instructions: LoadedInstructions,
     pub cancel: CancelToken,
-    pub mcp: Option<Arc<McpManager>>,
+    pub mcp: Option<McpHandle>,
     pub deadline: Deadline,
     pub config: AgentConfig,
     pub permissions: Arc<PermissionManager>,

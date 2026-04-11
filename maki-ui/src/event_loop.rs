@@ -10,7 +10,7 @@ use crossterm::event::{
 use maki_agent::command::CustomCommand;
 use maki_agent::permissions::PermissionManager;
 use maki_agent::skill::Skill;
-use maki_agent::{AgentConfig, CancelToken};
+use maki_agent::{AgentConfig, CancelToken, McpCommand};
 use maki_config::UiConfig;
 use maki_providers::provider::{Provider, fetch_all_models, from_model};
 use maki_providers::{Message, Model};
@@ -18,10 +18,7 @@ use maki_storage::DataDir;
 use tracing::warn;
 
 use crate::AppSession;
-use crate::agent::{
-    AgentCommand, AgentHandles, McpState, ModelSlot, shared_queue::QueueItem, spawn_agent,
-    toggle_disabled,
-};
+use crate::agent::{AgentCommand, AgentHandles, ModelSlot, shared_queue::QueueItem};
 use crate::app::shell::{ShellEvent, spawn_shell};
 use crate::app::{App, Msg};
 #[cfg(feature = "demo")]
@@ -162,11 +159,26 @@ impl<'t> EventLoop<'t> {
 
         let bg = spawn_model_fetch();
         let storage_writer = Arc::new(StorageWriter::new(storage.clone()));
-        let mcp_state = McpState::default();
         let (shell_tx, shell_rx) = flume::unbounded::<ShellEvent>();
 
         let resumed = !session.messages.is_empty();
         let initial_history = session.messages.clone();
+        let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+
+        let provider: Arc<dyn Provider> = Arc::from(from_model(&model).context("create provider")?);
+        let skills: Arc<[Skill]> = Arc::from(skills);
+        let model_slot = Arc::new(ArcSwap::from_pointee(ModelSlot {
+            model: model.clone(),
+            provider,
+        }));
+        let handles = AgentHandles::spawn(
+            &model_slot,
+            initial_history,
+            &skills,
+            config.clone(),
+            &permissions,
+            cwd,
+        );
 
         let custom_commands: Arc<[CustomCommand]> = Arc::from(commands);
         let mut app = App::new(
@@ -174,8 +186,7 @@ impl<'t> EventLoop<'t> {
             session,
             storage,
             bg.available,
-            Arc::clone(&mcp_state.infos),
-            Arc::clone(&mcp_state.prompts),
+            handles.mcp_reader(),
             Arc::clone(&storage_writer),
             ui_config,
             input_history_size,
@@ -188,17 +199,6 @@ impl<'t> EventLoop<'t> {
             apply_demo(&mut app);
         }
 
-        let provider: Arc<dyn Provider> = Arc::from(from_model(&model).context("create provider")?);
-        let skills: Arc<[Skill]> = Arc::from(skills);
-        let model_slot = Arc::new(ArcSwap::from_pointee(ModelSlot { model, provider }));
-        let handles = spawn_agent(
-            &model_slot,
-            initial_history,
-            &skills,
-            config.clone(),
-            &permissions,
-            mcp_state,
-        );
         handles.apply_to_app(&mut app);
 
         if resumed {
@@ -241,6 +241,7 @@ impl<'t> EventLoop<'t> {
         self.app.poll_image_paste();
         self.app.btw_modal.poll();
         self.app.status_bar.poll_branch_update();
+        self.app.mcp_picker.refresh();
     }
 
     fn drain_channels(&mut self) -> bool {
@@ -396,11 +397,10 @@ impl<'t> EventLoop<'t> {
                 });
             }
             Action::ToggleMcp(server_name, enabled) => {
-                toggle_disabled(&mut self.handles.mcp.disabled, &server_name, enabled);
-                let _ = self
-                    .handles
-                    .cmd_tx
-                    .try_send(AgentCommand::ToggleMcp(server_name, enabled));
+                self.handles.send_mcp(McpCommand::Toggle {
+                    server: server_name,
+                    enabled,
+                });
             }
             Action::ShellCommand {
                 id,
@@ -455,14 +455,7 @@ impl<'t> EventLoop<'t> {
             .app
             .has_content()
             .then(|| self.app.state.session.id.clone());
-        maki_agent::mcp::kill_process_groups(
-            &self
-                .handles
-                .mcp
-                .pids
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()),
-        );
+        maki_agent::mcp::kill_process_groups(&self.handles.mcp_reader().load().pids);
         self.app.cmd_tx = None;
         self.app.answer_tx = None;
         drop(self.app);

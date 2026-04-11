@@ -235,7 +235,7 @@ impl McpTransport for HttpTransport {
         })
     }
 
-    fn shutdown(self: Box<Self>) -> BoxFuture<'static, ()> {
+    fn shutdown<'a>(&'a self) -> BoxFuture<'a, ()> {
         Box::pin(async move {
             let session_id = self.session_id.lock().await.clone();
             let Some(sid) = session_id else { return };
