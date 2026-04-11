@@ -72,6 +72,10 @@ pub fn highlighter_for_syntax(syntax: &'static SyntaxReference) -> HighlightLine
     HighlightLines::new(syntax, syntax_theme())
 }
 
+/// Syntect expects each slice to end in `\n` so its parser can close the
+/// line cleanly; forgetting the newline leaves the parser mid-line and
+/// corrupts every later highlight. The easiest way to get this right is
+/// to feed it yields from [`syntect::util::LinesWithEndings`].
 pub fn highlight_line(hl: &mut HighlightLines<'_>, text: &str) -> Vec<(Style, String)> {
     match hl.highlight_line(text, syntax_set()) {
         Ok(ranges) => ranges
@@ -80,6 +84,14 @@ pub fn highlight_line(hl: &mut HighlightLines<'_>, text: &str) -> Vec<(Style, St
             .collect(),
         Err(_) => vec![(theme::current().code_fallback, normalize_text(text))],
     }
+}
+
+/// Same input contract as [`highlight_line`], but we drop the styled
+/// output. Handy when walking past lines we won't draw (the unchanged
+/// side of a diff, or skipping ahead to the next hunk) while still
+/// keeping the parser's state in sync with the file.
+pub fn advance_highlighter(hl: &mut HighlightLines<'_>, text: &str) {
+    let _ = hl.highlight_line(text, syntax_set());
 }
 
 pub fn highlighter_for_token(lang: &str) -> HighlightLines<'static> {

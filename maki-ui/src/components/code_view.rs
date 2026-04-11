@@ -1,5 +1,5 @@
 use crate::highlight::{
-    fallback_span, highlight_code_plain, highlight_line, highlighter_for_path,
+    advance_highlighter, fallback_span, highlight_code_plain, highlight_line, highlighter_for_path,
     highlighter_for_syntax, highlighter_for_token, syntax_for_path,
 };
 use crate::markdown::{should_truncate, truncation_notice};
@@ -9,8 +9,9 @@ use maki_agent::diff::{DiffLine, DiffSpan, compute_hunks};
 use maki_agent::{GrepFileEntry, InstructionBlock, ToolInput, ToolOutput};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use std::str::Lines;
 use syntect::easy::HighlightLines;
+use syntect::parsing::SyntaxReference;
+use syntect::util::LinesWithEndings;
 
 const MAX_CODE_EXECUTION_LINES: usize = 100;
 pub(crate) const MAX_INSTRUCTION_LINES: usize = 15;
@@ -43,16 +44,6 @@ fn truncation_line(truncated: usize) -> Line<'static> {
         truncation_notice(truncated),
         theme::current().tool_dim,
     ))
-}
-
-fn code_spans(
-    hl: &mut Option<syntect::easy::HighlightLines<'_>>,
-    text: &str,
-) -> Vec<Span<'static>> {
-    match hl {
-        Some(h) => highlight_spans(h, text),
-        None => vec![fallback_span(text)],
-    }
 }
 
 fn highlight_spans(hl: &mut HighlightLines<'_>, text: &str) -> Vec<Span<'static>> {
@@ -88,7 +79,10 @@ fn render_code(
         .map(|(i, text)| {
             let nr = start_line + i;
             let mut spans = vec![gutter(&format!("{nr:>w$}"))];
-            spans.extend(code_spans(&mut hl, text));
+            match &mut hl {
+                Some(h) => spans.extend(highlight_spans(h, text)),
+                None => spans.push(fallback_span(text)),
+            }
             Line::from(spans)
         })
         .collect();
@@ -99,47 +93,77 @@ fn render_code(
     (lines, has_truncation)
 }
 
-/// Walks one file with a syntect highlighter so the parser state at each line
-/// reflects everything seen since the start. Two walkers (one over BEFORE, one
-/// over AFTER) let removed lines be styled in the old file's parser state and
-/// added lines in the new file's.
+/// Syntect is stateful: to color line N correctly it needs to have seen
+/// lines 1..N in order, so an open string or block comment on an earlier
+/// line still tints everything after it. A diff shows two files at once,
+/// and removed and added lines only make sense in their own file's state,
+/// so we keep one walker per side and step them in lockstep with the hunks.
 struct FileWalker<'a> {
-    lines: Lines<'a>,
+    lines: LinesWithEndings<'a>,
     pos: usize,
-    hl: Option<HighlightLines<'static>>,
-    buf: String,
+    hl: HighlightLines<'static>,
 }
 
 impl<'a> FileWalker<'a> {
-    fn new(content: &'a str, hl: Option<HighlightLines<'static>>) -> Self {
+    fn new(content: &'a str, syntax: &'static SyntaxReference) -> Self {
         Self {
-            lines: content.lines(),
+            lines: LinesWithEndings::from(content),
             pos: 1,
-            hl,
-            buf: String::new(),
+            hl: highlighter_for_syntax(syntax),
         }
+    }
+
+    /// Feeds the next line to syntect but throws the styled output away,
+    /// saving an allocation for lines we won't render (like the unchanged
+    /// side of a diff line that we only show from the other file). Running
+    /// off the end means our line math drifted, so we yell about it in
+    /// debug and stay quiet in release.
+    fn skip(&mut self) -> bool {
+        let Some(line) = self.lines.next() else {
+            debug_assert!(
+                false,
+                "FileWalker::skip called past EOF at pos {}",
+                self.pos
+            );
+            return false;
+        };
+        advance_highlighter(&mut self.hl, line);
+        self.pos += 1;
+        true
+    }
+
+    fn highlight_next(&mut self) -> Option<Vec<(Style, String)>> {
+        let Some(line) = self.lines.next() else {
+            debug_assert!(
+                false,
+                "FileWalker::highlight_next called past EOF at pos {}",
+                self.pos
+            );
+            return None;
+        };
+        let spans = highlight_line(&mut self.hl, line);
+        self.pos += 1;
+        Some(spans)
     }
 
     fn skip_to(&mut self, target: usize) {
         while self.pos < target {
-            let _ = self.step();
+            if !self.skip() {
+                return;
+            }
         }
-    }
-
-    fn step(&mut self) -> Option<Vec<(Style, String)>> {
-        let line = self.lines.next().unwrap_or("");
-        let result = self.hl.as_mut().map(|hl| {
-            self.buf.clear();
-            self.buf.push_str(line);
-            self.buf.push('\n');
-            highlight_line(hl, &self.buf)
-        });
-        self.pos += 1;
-        result
+        debug_assert_eq!(
+            self.pos, target,
+            "FileWalker overshot or failed to reach target",
+        );
     }
 }
 
-fn render_diff(path: Option<&str>, before: &str, after: &str) -> Vec<Line<'static>> {
+fn render_diff(
+    syntax: Option<&'static SyntaxReference>,
+    before: &str,
+    after: &str,
+) -> Vec<Line<'static>> {
     let hunks = compute_hunks(before, after);
     let Some(last) = hunks.last() else {
         return Vec::new();
@@ -151,53 +175,80 @@ fn render_diff(path: Option<&str>, before: &str, after: &str) -> Vec<Line<'stati
         .count();
     let w = nr_width(last.before_start + numbered.saturating_sub(1));
 
-    let mut before_walker = FileWalker::new(before, path.map(highlighter_for_path));
-    let mut after_walker = FileWalker::new(after, path.map(highlighter_for_path));
+    let mut walkers = syntax.map(|s| (FileWalker::new(before, s), FileWalker::new(after, s)));
 
     let mut lines = Vec::new();
     for (i, hunk) in hunks.iter().enumerate() {
         if i > 0 {
             lines.push(gap_ellipsis());
         }
-        before_walker.skip_to(hunk.before_start);
-        after_walker.skip_to(hunk.after_start);
+        if let Some((before, after)) = walkers.as_mut() {
+            before.skip_to(hunk.before_start);
+            after.skip_to(hunk.after_start);
+        }
 
         let mut line_nr = hunk.before_start;
         for dl in &hunk.lines {
-            let show_nr = !matches!(dl, DiffLine::Added(_));
-            let nr_str = if show_nr {
-                let s = format!("{line_nr:>w$}");
-                line_nr += 1;
-                s
-            } else {
-                " ".repeat(w)
-            };
-            let mut spans = vec![gutter(&nr_str)];
-            match dl {
-                DiffLine::Unchanged(t) => {
-                    let _ = before_walker.step();
-                    spans.push(Span::raw("  ".to_owned()));
-                    spans.extend(syntax_to_spans(after_walker.step(), t));
-                }
-                DiffLine::Removed(ds) => spans.extend(diff_change_spans(
-                    "- ",
-                    ds,
-                    before_walker.step(),
-                    theme::current().diff_old,
-                    theme::current().diff_old_emphasis,
-                )),
-                DiffLine::Added(ds) => spans.extend(diff_change_spans(
-                    "+ ",
-                    ds,
-                    after_walker.step(),
-                    theme::current().diff_new,
-                    theme::current().diff_new_emphasis,
-                )),
-            }
-            lines.push(Line::from(spans));
+            lines.push(render_hunk_line(dl, walkers.as_mut(), &mut line_nr, w));
         }
     }
+
     lines
+}
+
+fn numbered_gutter(line_nr: &mut usize, w: usize) -> Span<'static> {
+    let span = gutter(&format!("{line_nr:>w$}"));
+    *line_nr += 1;
+    span
+}
+
+/// Each diff line variant has its own little dance: an unchanged line
+/// needs both walkers stepped but only one set of spans, a removed line
+/// pulls from the before walker, an added line from the after one. Doing
+/// it all in one match means adding a new variant forces the compiler to
+/// drag us back here instead of letting a bug slip through.
+fn render_hunk_line(
+    dl: &DiffLine,
+    walkers: Option<&mut (FileWalker<'_>, FileWalker<'_>)>,
+    line_nr: &mut usize,
+    w: usize,
+) -> Line<'static> {
+    let theme = theme::current();
+    match dl {
+        DiffLine::Unchanged(t) => {
+            let after_spans = walkers.and_then(|(before, after)| {
+                before.skip();
+                after.highlight_next()
+            });
+            let mut spans = vec![numbered_gutter(line_nr, w), Span::raw("  ")];
+            spans.extend(syntax_to_spans(after_spans, t));
+            Line::from(spans)
+        }
+        DiffLine::Removed(ds) => {
+            let before_spans = walkers.and_then(|(before, _)| before.highlight_next());
+            let mut spans = vec![numbered_gutter(line_nr, w)];
+            spans.extend(diff_change_spans(
+                "- ",
+                ds,
+                before_spans,
+                theme.diff_old,
+                theme.diff_old_emphasis,
+            ));
+            Line::from(spans)
+        }
+        DiffLine::Added(ds) => {
+            let after_spans = walkers.and_then(|(_, after)| after.highlight_next());
+            let mut spans = vec![gutter(&" ".repeat(w))];
+            spans.extend(diff_change_spans(
+                "+ ",
+                ds,
+                after_spans,
+                theme.diff_new,
+                theme.diff_new_emphasis,
+            ));
+            Line::from(spans)
+        }
+    }
 }
 
 fn syntax_to_spans(syntax: Option<Vec<(Style, String)>>, text: &str) -> Vec<Span<'static>> {
@@ -441,7 +492,7 @@ pub fn render_tool_content(
             after,
             ..
         }) => (
-            render_diff(highlight.then_some(path.as_str()), before, after),
+            render_diff(highlight.then(|| syntax_for_path(path)), before, after),
             false,
         ),
         Some(ToolOutput::GrepResult { entries }) => {
@@ -594,7 +645,7 @@ mod tests {
         let before = "/*\nalpha\nbravo\ncharlie\ndelta\necho\nfoxtrot\nOLD\ngolf\n*/\n";
         let after = "/*\nalpha\nbravo\ncharlie\ndelta\necho\nfoxtrot\nNEW\ngolf\n*/\n";
 
-        let lines = render_diff(Some("test.rs"), before, after);
+        let lines = render_diff(Some(syntax_for_path("test.rs")), before, after);
 
         let expected = fg_in_context("test.rs", "/*\nalpha\nbravo\ncharlie\n", "delta", "delta");
         assert_eq!(diff_fg(&lines, "delta"), expected);
@@ -608,7 +659,7 @@ mod tests {
         let before = "/*\ndoc\n*/\nfn x() {}\n";
         let after = "/*\ndoc\nfn x() {}\n";
 
-        let lines = render_diff(Some("test.rs"), before, after);
+        let lines = render_diff(Some(syntax_for_path("test.rs")), before, after);
 
         let expected = fg_in_context("test.rs", "/*\ndoc\n", "fn x() {}", "fn");
         assert_eq!(diff_fg(&lines, "fn x() {}"), expected);
