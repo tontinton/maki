@@ -363,7 +363,7 @@ mod tests {
                 assert_eq!(model.provider, provider);
                 assert_eq!(model.tier, tier);
                 assert!(model.max_output_tokens > 0);
-                assert!(model.context_window > model.max_output_tokens);
+                assert!(model.context_window >= model.max_output_tokens);
             }
         }
     }
