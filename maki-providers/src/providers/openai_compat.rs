@@ -201,14 +201,16 @@ pub fn convert_messages(messages: &[Message], system: &str) -> Vec<Value> {
                     }
                 }
 
-                let mut msg_obj = json!({"role": "assistant"});
-                if !text.is_empty() {
-                    msg_obj["content"] = Value::String(text);
+                if !text.is_empty() || !tool_calls.is_empty() {
+                    let mut msg_obj = json!({"role": "assistant"});
+                    if !text.is_empty() {
+                        msg_obj["content"] = Value::String(text);
+                    }
+                    if !tool_calls.is_empty() {
+                        msg_obj["tool_calls"] = Value::Array(tool_calls);
+                    }
+                    out.push(msg_obj);
                 }
-                if !tool_calls.is_empty() {
-                    msg_obj["tool_calls"] = Value::Array(tool_calls);
-                }
-                out.push(msg_obj);
             }
         }
     }
