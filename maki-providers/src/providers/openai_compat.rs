@@ -419,14 +419,31 @@ pub async fn parse_sse(
     let mut content_blocks: Vec<ContentBlock> = Vec::new();
 
     if !reasoning_text.is_empty() {
-        content_blocks.push(ContentBlock::Thinking {
-            thinking: reasoning_text,
-            signature: None,
-        });
+        // Some models like Qwen3.5 are putting the reasoning content into
+        // <think>...</think>, sometimes omitting the closing </think>
+        if let Some(stripped) = reasoning_text.strip_prefix("<think>") {
+            reasoning_text = stripped
+                .strip_suffix("</think>")
+                .unwrap_or(stripped)
+                .trim()
+                .to_owned();
+        } else {
+            reasoning_text = reasoning_text.trim().to_owned();
+        }
+
+        if !reasoning_text.is_empty() {
+            content_blocks.push(ContentBlock::Thinking {
+                thinking: reasoning_text,
+                signature: None,
+            });
+        }
     }
 
     if !text.is_empty() {
-        content_blocks.push(ContentBlock::Text { text });
+        text = text.trim().to_owned();
+        if !text.is_empty() {
+            content_blocks.push(ContentBlock::Text { text });
+        }
     }
 
     for (idx, acc) in tool_accumulators.into_iter().enumerate() {

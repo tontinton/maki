@@ -496,10 +496,11 @@ impl MessagesPanel {
     pub fn flush(&mut self) {
         self.flush_thinking();
         if !self.streaming_text.is_empty() {
-            self.messages.push(DisplayMessage::new(
-                DisplayRole::Assistant,
-                self.streaming_text.take_all(),
-            ));
+            let text = self.streaming_text.take_all().trim().to_owned();
+            if !text.is_empty() {
+                self.messages
+                    .push(DisplayMessage::new(DisplayRole::Assistant, text));
+            }
         }
     }
 
@@ -773,10 +774,24 @@ impl MessagesPanel {
 
     fn flush_thinking(&mut self) {
         if !self.streaming_thinking.is_empty() {
-            self.messages.push(DisplayMessage::new(
-                DisplayRole::Thinking,
-                self.streaming_thinking.take_all(),
-            ));
+            let mut text = self.streaming_thinking.take_all();
+
+            // Some models like Qwen3.5 are putting the reasoning content into
+            // <think>...</think>, sometimes omitting the closing </think>
+            if let Some(stripped) = text.strip_prefix("<think>") {
+                text = stripped
+                    .strip_suffix("</think>")
+                    .unwrap_or(stripped)
+                    .trim()
+                    .to_owned();
+            } else {
+                text = text.trim().to_owned();
+            }
+
+            if !text.trim().is_empty() {
+                self.messages
+                    .push(DisplayMessage::new(DisplayRole::Thinking, text));
+            }
         }
     }
 
