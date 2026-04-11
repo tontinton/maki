@@ -40,7 +40,13 @@ fn rtk_rewrite(command: &str, no_rtk: bool) -> Option<String> {
         .arg(command)
         .output()
         .ok()?;
-    if !output.status.success() {
+    // rtk exits with code 0 or 3 if rewriting was successful
+    if !output.status.success()
+        && output
+            .status
+            .code()
+            .is_none_or(|code| code != 0 && code != 3)
+    {
         return None;
     }
     let rewritten = String::from_utf8(output.stdout).ok()?;
