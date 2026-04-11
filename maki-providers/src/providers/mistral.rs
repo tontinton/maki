@@ -1,5 +1,5 @@
 use flume::Sender;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier};
 use crate::provider::{BoxFuture, Provider};
@@ -88,11 +88,16 @@ impl Provider for Mistral {
         system: &'a str,
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
-        _thinking: ThinkingConfig,
+        thinking: ThinkingConfig,
         session_id: Option<&'a str>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
-            let body = self.compat.build_body(model, messages, system, tools);
+            let mut body = self.compat.build_body(model, messages, system, tools);
+
+            if !matches!(thinking, ThinkingConfig::Off) {
+                body["reasoning_effort"] = json!("high");
+            }
+
             let mut extra_headers = vec![];
             if let Some(session_id) = session_id {
                 extra_headers.push(("x-affinity".to_string(), session_id.to_string()));

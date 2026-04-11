@@ -66,7 +66,7 @@ impl ProviderKind {
     }
 
     pub const fn supports_thinking(self) -> bool {
-        matches!(self, Self::Anthropic | Self::Synthetic)
+        matches!(self, Self::Anthropic | Self::Mistral | Self::Synthetic)
     }
 
     pub const fn features(self) -> Option<&'static str> {
