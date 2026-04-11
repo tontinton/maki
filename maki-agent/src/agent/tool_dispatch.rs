@@ -109,7 +109,12 @@ fn parse_tool_calls<'a>(
     let mut errors = Vec::new();
 
     for (id, name, input) in tool_uses {
-        debug!(tool = %name, id = %id, raw_input = %input, "parsing tool call");
+        debug!(
+            tool = %name,
+            id = %id,
+            input_preview = %crate::tools::schema::preview(&input.to_string()),
+            "parsing tool call"
+        );
         if recent.is_doom_loop(name, input) {
             warn!(tool = %name, "doom loop detected, skipping execution");
             errors.push(ToolDoneEvent::error(id.to_owned(), DOOM_LOOP_MESSAGE));
@@ -120,11 +125,21 @@ fn parse_tool_calls<'a>(
                     call,
                 }),
                 Err(AgentError::Tool { message, .. }) => {
-                    warn!(tool = %name, input = %input, error = %message, "failed to parse tool call");
+                    warn!(
+                        tool = %name,
+                        input_preview = %crate::tools::schema::preview(&input.to_string()),
+                        error = %message,
+                        "failed to parse tool call"
+                    );
                     errors.push(ToolDoneEvent::error(id.to_owned(), message));
                 }
                 Err(e) => {
-                    warn!(tool = %name, input = %input, error = %e, "failed to parse tool call");
+                    warn!(
+                        tool = %name,
+                        input_preview = %crate::tools::schema::preview(&input.to_string()),
+                        error = %e,
+                        "failed to parse tool call"
+                    );
                     errors.push(ToolDoneEvent::error(id.to_owned(), e.to_string()));
                 }
             }

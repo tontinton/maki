@@ -5,12 +5,13 @@ use std::path::{Path, PathBuf};
 use crate::ToolOutput;
 use futures_lite::StreamExt;
 use maki_tool_macro::Tool;
+use serde::Deserialize;
 
 const MAX_LINES_PER_FILE: usize = 200;
 const MAX_DIR_BYTES: u64 = 50 * 1024;
 const VALID_COMMANDS: &[&str] = &["view", "write", "delete"];
 
-#[derive(Tool, Debug, Clone)]
+#[derive(Tool, Debug, Clone, Deserialize)]
 pub struct Memory {
     #[param(description = "Command: view, write, delete")]
     command: String,

@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use maki_interpreter::runner::{self, ToolFn};
 use maki_interpreter::{AsyncResolver, PendingCall};
 use maki_tool_macro::Tool;
+use serde::Deserialize;
 use serde_json::Value;
 
 use std::sync::Arc;
@@ -27,7 +28,7 @@ use super::{Deadline, INTERPRETER_TOOLS};
 const STREAM_FLUSH_INTERVAL: Duration = Duration::from_millis(100);
 const PREAMBLE: &str = "import re\nimport asyncio\nimport sys\nimport os\nimport json\n";
 
-#[derive(Tool, Debug, Clone)]
+#[derive(Tool, Debug, Clone, Deserialize)]
 pub struct CodeExecution {
     #[param(
         description = "Python code to execute. Tools are async functions that return strings (not objects). You MUST await every call: `result = await read(path='/file')`. Use `await asyncio.gather(...)` for concurrency."

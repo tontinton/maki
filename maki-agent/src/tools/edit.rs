@@ -2,11 +2,12 @@ use std::fs;
 
 use crate::ToolOutput;
 use maki_tool_macro::Tool;
+use serde::Deserialize;
 
 use super::fuzzy_replace;
 use super::relative_path;
 
-#[derive(Tool, Debug, Clone)]
+#[derive(Tool, Debug, Clone, Deserialize)]
 pub struct Edit {
     #[param(description = "Absolute path to the file")]
     path: String,

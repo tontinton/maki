@@ -9,6 +9,7 @@ use async_process::Command;
 use futures_lite::StreamExt;
 use futures_lite::io::{AsyncBufReadExt, BufReader};
 use maki_tool_macro::Tool;
+use serde::Deserialize;
 
 use crate::{AgentEvent, EventSender, ToolInput, ToolOutput};
 
@@ -103,7 +104,7 @@ fn timeout_or_cancel_msg(
     msg
 }
 
-#[derive(Tool, Debug, Clone)]
+#[derive(Tool, Debug, Clone, Deserialize)]
 pub struct Bash {
     #[param(description = "The bash command to execute")]
     command: String,

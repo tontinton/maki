@@ -19,6 +19,7 @@ pub mod memory;
 mod multiedit;
 mod question;
 mod read;
+pub(crate) mod schema;
 mod skill;
 mod task;
 mod todowrite;
@@ -486,10 +487,10 @@ pub(crate) fn sanitize_tool_input(input: &Value) -> Value {
     let mut out = serde_json::Map::new();
     for (key, val) in obj {
         let norm_key = to_snake_case(key);
-        let new_val = val
-            .as_str()
-            .map(|s| strip_stray_quotes(key, s))
-            .unwrap_or_else(|| val.clone());
+        let new_val = match val.as_str() {
+            Some(s) => Value::String(strip_stray_quotes(key, s)),
+            None => val.clone(),
+        };
         if norm_key != *key {
             warn!(original = %key, normalized = %norm_key, "normalized camelCase key to snake_case");
         }
@@ -498,15 +499,15 @@ pub(crate) fn sanitize_tool_input(input: &Value) -> Value {
     Value::Object(out)
 }
 
-fn strip_stray_quotes(field: &str, s: &str) -> Value {
+fn strip_stray_quotes(field: &str, s: &str) -> String {
     let t = s.trim();
     if let Some(inner) = t.strip_prefix('"').and_then(|s| s.strip_suffix('"'))
         && !inner.contains('"')
     {
         warn!(field = %field, original = %s, fixed = %inner, "stripped stray quotes from tool param");
-        return Value::String(inner.to_string());
+        return inner.to_string();
     }
-    Value::String(s.to_string())
+    s.to_string()
 }
 
 fn to_snake_case(s: &str) -> String {
@@ -522,43 +523,6 @@ fn to_snake_case(s: &str) -> String {
         }
     }
     result
-}
-
-fn coerce_value(val: &Value, field: &str, json_type: &str) -> Option<Value> {
-    let coerced = match (val, json_type) {
-        (Value::String(s), "integer") => parse_number::<i64>(s).map(Value::from),
-        (Value::String(s), "number") => parse_number::<f64>(s).map(Value::from),
-        (Value::String(s), "boolean") => match s.trim() {
-            "true" => Some(Value::Bool(true)),
-            "false" => Some(Value::Bool(false)),
-            _ => None,
-        },
-        _ => None,
-    }?;
-    warn!(field = %field, original = %val, fixed = %coerced, "coerced tool param type");
-    Some(coerced)
-}
-
-pub(crate) fn deserialize_with_coercion<T: serde::de::DeserializeOwned>(
-    raw: &Value,
-    field: &str,
-    json_type: &str,
-) -> Result<T, String> {
-    serde_json::from_value::<T>(raw.clone()).or_else(|serde_err| {
-        coerce_value(raw, field, json_type)
-            .and_then(|c| serde_json::from_value(c).ok())
-            .ok_or_else(|| {
-                let msg = format!(
-                    "Invalid value for parameter '{}' (expected {}): {}",
-                    field, json_type, serde_err
-                );
-                msg
-            })
-    })
-}
-
-fn parse_number<T: std::str::FromStr>(s: &str) -> Option<T> {
-    s.trim().parse().ok()
 }
 
 macro_rules! register_tools {
@@ -605,7 +569,7 @@ macro_rules! register_tools {
                     $(<$inner>::NAME => {
                         <$inner>::parse_input(input)
                             .map(|v| ToolCall::$Variant(Box::new(v)))
-                            .map_err(|msg| AgentError::Tool { tool: name.to_string(), message: msg })
+                            .map_err(|e| AgentError::Tool { tool: name.to_string(), message: e.to_string() })
                     })+
                     _ => Err(AgentError::Tool {
                         tool: name.to_string(),
@@ -1084,6 +1048,37 @@ mod tests {
         assert_eq!(tool, "nonexistent_tool");
     }
 
+    /// Every registered tool, poked with four shapes of garbage, should come
+    /// back with a plain validator error the LLM can read (Missing,
+    /// TypeMismatch, NotInEnum). If any of them trips the `InternalBug`
+    /// path, the schema no longer matches the Rust type and serde exploded
+    /// after validation said it was fine. That's ours to fix, not the
+    /// model's, so this test fails loudly when it happens.
+    #[test]
+    fn every_tool_rejects_bogus_input_without_internal_bug() {
+        const BOGUS_INPUTS: &[&str] = &[
+            "{}",
+            "\"raw string\"",
+            "{\"unknown_field\": 42}",
+            "{\"path\": 123, \"pattern\": []}",
+        ];
+        for name in ToolCall::all_names() {
+            for raw in BOGUS_INPUTS {
+                let input: Value = serde_json::from_str(raw).unwrap();
+                match ToolCall::from_api(name, &input) {
+                    Ok(_) => {}
+                    Err(AgentError::Tool { message, .. }) => {
+                        assert!(
+                            !message.contains("internal validator bug"),
+                            "tool `{name}` with input `{raw}` produced InternalBug: {message}",
+                        );
+                    }
+                    Err(e) => panic!("unexpected error kind for `{name}`: {e:?}"),
+                }
+            }
+        }
+    }
+
     #[test]
     fn tool_definitions_schema_requires_additional_properties_false() {
         fn check_object_schemas(schema: &Value, path: &str) {
@@ -1218,21 +1213,6 @@ mod tests {
         assert_eq!(sanitize_tool_input(&input), expected);
     }
 
-    #[test_case(Value::String("30".into()),                       "integer", Some(json!(30))    ; "string_to_integer")]
-    #[test_case(Value::String("-5".into()),                       "integer", Some(json!(-5))    ; "negative_string_to_integer")]
-    #[test_case(Value::String(" 42".into()),                      "integer", Some(json!(42))    ; "leading_whitespace")]
-    #[test_case(Value::String("30, \"offset\": 2075".into()),     "integer", None               ; "embedded_trailing_fields_rejected")]
-    #[test_case(Value::String("-3-5".into()),                     "integer", None               ; "malformed_number_rejected")]
-    #[test_case(Value::String("true".into()),                     "boolean", Some(json!(true))  ; "string_true_to_bool")]
-    #[test_case(Value::String("false".into()),                    "boolean", Some(json!(false)) ; "string_false_to_bool")]
-    #[test_case(Value::String("1.25".into()),                      "number",  Some(json!(1.25))  ; "string_to_float")]
-    #[test_case(Value::String("hello".into()),                    "integer", None               ; "non_numeric_string")]
-    #[test_case(json!(30),                                        "integer", None               ; "already_correct_type")]
-    #[test_case(Value::String("".into()),                         "integer", None               ; "empty_string")]
-    fn coerce_value_cases(val: Value, json_type: &str, expected: Option<Value>) {
-        assert_eq!(coerce_value(&val, "test_field", json_type), expected);
-    }
-
     #[test]
     fn walk_builder_excludes_dot_git_but_shows_dotfiles() {
         let tmp = TempDir::new().unwrap();
@@ -1357,23 +1337,31 @@ mod tests {
     }
 
     #[test]
-    fn deserialize_error_includes_serde_message() {
-        // array with correct top-level type but bad items
-        let bad_array = json!([{"not_a_valid_field": 1}]);
-        let err =
-            deserialize_with_coercion::<Vec<batch::BatchEntry>>(&bad_array, "tool_calls", "array")
-                .unwrap_err();
-        assert!(
-            err.contains("missing field"),
-            "expected serde detail, got: {err}"
-        );
+    fn multiedit_reports_inner_shape_with_path() {
+        let input = json!({
+            "path": "/x",
+            "edits": [{"old_string": "a"}]
+        });
+        let err = ToolCall::from_api("multiedit", &input).unwrap_err();
+        let AgentError::Tool { message, .. } = err else {
+            panic!("expected Tool error");
+        };
+        assert!(message.contains("edits[0].new_string"), "got: {message}");
+        assert!(message.contains("missing"), "got: {message}");
+    }
 
-        // wrong type entirely (string instead of integer)
-        let bad_type = json!("not_a_number");
-        let err = deserialize_with_coercion::<i64>(&bad_type, "count", "integer").unwrap_err();
+    #[test]
+    fn multiedit_huge_string_error_is_bounded() {
+        let huge: String = "x".repeat(50 * 1024);
+        let input = json!({"path": "/x", "edits": huge});
+        let err = ToolCall::from_api("multiedit", &input).unwrap_err();
+        let AgentError::Tool { message, .. } = err else {
+            panic!("expected Tool error");
+        };
         assert!(
-            err.contains("invalid type"),
-            "expected serde detail, got: {err}"
+            message.len() < schema::BOUNDED_ERR_MAX,
+            "error message too long: {} bytes",
+            message.len()
         );
     }
 }

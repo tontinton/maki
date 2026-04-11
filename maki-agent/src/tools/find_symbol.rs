@@ -2,13 +2,14 @@ use std::path::Path;
 
 use maki_code_index::find_symbol::{FindSymbolError, find_symbol as do_find_symbol};
 use maki_tool_macro::Tool;
+use serde::Deserialize;
 
 use super::relative_path;
 use crate::ToolOutput;
 
 const DEFAULT_MAX_RESULTS: usize = 50;
 
-#[derive(Tool, Debug, Clone)]
+#[derive(Tool, Debug, Clone, Deserialize)]
 pub struct FindSymbol {
     #[param(description = "Symbol name")]
     symbol: String,

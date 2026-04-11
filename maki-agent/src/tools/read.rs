@@ -5,10 +5,11 @@ use std::path::Path;
 use crate::agent::{self, LoadedInstructions};
 use crate::{InstructionBlock, ToolOutput};
 use maki_tool_macro::Tool;
+use serde::Deserialize;
 
 use super::{relative_path, truncate_bytes};
 
-#[derive(Tool, Debug, Clone)]
+#[derive(Tool, Debug, Clone, Deserialize)]
 pub struct Read {
     #[param(description = "Absolute path to the file or directory")]
     path: String,
@@ -204,21 +205,13 @@ mod tests {
         }
     }
 
+    const EXPECTED_INTEGER: &str = "expected integer";
+
     #[test]
     fn parse_input_bad_coercion_returns_error() {
         let err = Read::parse_input(&json!({"path": "x", "limit": "not_a_number"})).unwrap_err();
-        assert!(
-            err.contains("limit"),
-            "error should mention field name: {err}"
-        );
-    }
-
-    #[test]
-    fn parse_input_error_includes_schema_hint() {
-        let err = Read::parse_input(&json!({})).unwrap_err();
-        assert!(
-            err.contains("path") && err.contains("Expected:"),
-            "error should mention missing field and schema: {err}"
-        );
+        let msg = err.to_string();
+        assert!(msg.contains("limit"), "should mention field: {msg}");
+        assert!(msg.contains(EXPECTED_INTEGER), "should mention type: {msg}");
     }
 }

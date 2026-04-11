@@ -3,6 +3,7 @@ use std::time::Duration;
 use isahc::config::Configurable;
 use isahc::{AsyncReadResponseExt, HttpClient, Request};
 use maki_tool_macro::Tool;
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::ToolOutput;
@@ -15,7 +16,7 @@ const REQUEST_TIMEOUT_SECS: u64 = 25;
 const DEFAULT_NUM_RESULTS: u64 = 8;
 const NO_RESULTS_MSG: &str = "No search results found";
 
-#[derive(Tool, Debug, Clone)]
+#[derive(Tool, Debug, Clone, Deserialize)]
 pub struct WebSearch {
     #[param(description = "Search query")]
     query: String,

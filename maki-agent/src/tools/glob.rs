@@ -1,10 +1,11 @@
 use crate::ToolOutput;
 use maki_tool_macro::Tool;
+use serde::Deserialize;
 use tracing::debug;
 
 use super::{mtime, relative_path, resolve_search_path, walk_builder};
 
-#[derive(Tool, Debug, Clone)]
+#[derive(Tool, Debug, Clone, Deserialize)]
 pub struct Glob {
     #[param(description = "Glob pattern (e.g. **/*.rs, src/**/*.ts)")]
     pattern: String,

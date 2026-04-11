@@ -1,7 +1,8 @@
 use crate::{TodoItem, ToolOutput};
 use maki_tool_macro::Tool;
+use serde::Deserialize;
 
-#[derive(Tool, Debug, Clone)]
+#[derive(Tool, Debug, Clone, Deserialize)]
 pub struct TodoWrite {
     #[param(description = "The updated todo list")]
     todos: Vec<TodoItem>,

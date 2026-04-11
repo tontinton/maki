@@ -7,6 +7,7 @@ use grep_searcher::Searcher;
 use grep_searcher::SearcherBuilder;
 use grep_searcher::{Sink, SinkContext, SinkFinish, SinkMatch};
 use maki_tool_macro::Tool;
+use serde::Deserialize;
 use tracing::debug;
 
 use super::{
@@ -21,7 +22,7 @@ fn needs_multiline(pattern: &str) -> bool {
     pattern.contains("\\n") || pattern.contains("(?s)") || pattern.contains("(?m)")
 }
 
-#[derive(Tool, Debug, Clone, Default)]
+#[derive(Tool, Debug, Clone, Default, Deserialize)]
 pub struct Grep {
     #[param(description = "Regex pattern")]
     pattern: String,

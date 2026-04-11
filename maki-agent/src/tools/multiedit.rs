@@ -18,7 +18,7 @@ struct EditEntry {
     replace_all: Option<bool>,
 }
 
-#[derive(Tool, Debug, Clone)]
+#[derive(Tool, Debug, Clone, Deserialize)]
 pub struct MultiEdit {
     #[param(description = "Absolute path to the file")]
     path: String,

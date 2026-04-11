@@ -12,6 +12,7 @@ use maki_providers::model::ModelTier;
 use maki_providers::provider;
 use maki_providers::{ContentBlock, Model, ModelError, Role};
 use maki_tool_macro::Tool;
+use serde::Deserialize;
 use tracing::info;
 use uuid::Uuid;
 
@@ -23,7 +24,7 @@ use crate::template;
 use crate::tools::ToolCall;
 use crate::{Agent, AgentInput, AgentMode, AgentParams, AgentRunParams};
 
-#[derive(Tool, Debug, Clone)]
+#[derive(Tool, Debug, Clone, Deserialize)]
 pub struct Task {
     #[param(description = "Short (3-5 words) description of the task")]
     description: String,

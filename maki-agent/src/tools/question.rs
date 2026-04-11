@@ -1,10 +1,11 @@
 use crate::{AgentEvent, QuestionAnswer, QuestionInfo, ToolOutput};
 use maki_tool_macro::Tool;
+use serde::Deserialize;
 
 const EMPTY_QUESTIONS: &str = "at least one question is required";
 const CHANNEL_CLOSED: &str = "question cancelled: response channel closed";
 
-#[derive(Tool, Debug, Clone)]
+#[derive(Tool, Debug, Clone, Deserialize)]
 pub struct Question {
     #[param(description = "List of questions to ask the user")]
     questions: Vec<QuestionInfo>,

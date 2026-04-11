@@ -1,15 +1,22 @@
 //! Derive macros for tool schemas.
 //!
-//! - `Tool`: generates `schema()`, `parse_input()`, `schema_hint()` for top-level tool structs.
-//! - `Args`: generates `item_schema()` for structs used as `Vec<T>` items in tool schemas.
-//! - `ArgEnum`: generates `item_schema()` for `#[serde(rename_all = "snake_case")]` enums.
+//! - `Tool`: generates `SCHEMA`, `schema()`, and `parse_input()` for top-level tool structs.
+//! - `Args`: generates `ITEM_SCHEMA` for structs used as nested objects.
+//! - `ArgEnum`: generates `ITEM_SCHEMA` for `#[serde(rename_all = "snake_case")]` enums.
+//!
+//! The actual shape of every parameter lives in one `ParamSchema` value
+//! over in `maki_agent::tools::schema`. We require `Deserialize` on the
+//! tool struct because once validation has cleaned the JSON up, we hand
+//! the result to `serde_json::from_value` and let serde do the last mile.
+//! That way defaults, renames, and tagged enums stay with serde instead
+//! of a hand-rolled field loop in here that would drift out of sync.
 
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
 use syn::{
-    Attribute, Data, DeriveInput, Expr, Fields, GenericArgument, Ident, Lit, Meta, PathArguments,
-    Type, parse_macro_input,
+    Attribute, Data, DeriveInput, Expr, Fields, GenericArgument, Lit, Meta, PathArguments, Type,
+    parse_macro_input,
 };
 
 fn param_description(attrs: &[Attribute]) -> Option<String> {
@@ -49,36 +56,6 @@ fn unwrapped_type(ty: &Type) -> &Type {
     inner_type(ty, "Option").unwrap_or(ty)
 }
 
-fn json_type_str(ty: &Type) -> &'static str {
-    let ty = unwrapped_type(ty);
-    if let Type::Path(tp) = ty
-        && let Some(seg) = tp.path.segments.last()
-    {
-        return match seg.ident.to_string().as_str() {
-            "String" | "str" => "string",
-            "bool" => "boolean",
-            "u8" | "u16" | "u32" | "u64" | "u128" | "usize" | "i8" | "i16" | "i32" | "i64"
-            | "i128" | "isize" => "integer",
-            "f32" | "f64" => "number",
-            "Vec" => "array",
-            _ => "object",
-        };
-    }
-    "object"
-}
-
-fn vec_item_schema(ty: &Type) -> TokenStream2 {
-    let inner = unwrapped_type(ty);
-    if let Some(item_ty) = inner_type(inner, "Vec") {
-        let item_json_type = json_type_str(item_ty);
-        if item_json_type == "object" {
-            return quote! { #item_ty::item_schema() };
-        }
-        return quote! { serde_json::json!({ "type": #item_json_type }) };
-    }
-    quote! { serde_json::json!({}) }
-}
-
 fn has_serde_default(attrs: &[Attribute]) -> bool {
     attrs.iter().any(|attr| {
         if !attr.path().is_ident("serde") {
@@ -106,7 +83,31 @@ fn to_snake_case(s: &str) -> String {
     out
 }
 
-fn is_plain_object(ty: &Type) -> bool {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Primitive {
+    String,
+    Bool,
+    Integer,
+    Number,
+}
+
+fn primitive_of(ty: &Type) -> Option<Primitive> {
+    if let Type::Path(tp) = ty
+        && let Some(seg) = tp.path.segments.last()
+    {
+        return match seg.ident.to_string().as_str() {
+            "String" | "str" => Some(Primitive::String),
+            "bool" => Some(Primitive::Bool),
+            "u8" | "u16" | "u32" | "u64" | "u128" | "usize" | "i8" | "i16" | "i32" | "i64"
+            | "i128" | "isize" => Some(Primitive::Integer),
+            "f32" | "f64" => Some(Primitive::Number),
+            _ => None,
+        };
+    }
+    None
+}
+
+fn is_value_type(ty: &Type) -> bool {
     if let Type::Path(tp) = ty
         && let Some(seg) = tp.path.segments.last()
     {
@@ -115,22 +116,73 @@ fn is_plain_object(ty: &Type) -> bool {
     false
 }
 
-fn field_schema_token(field_ty: &Type) -> TokenStream2 {
-    let json_type = json_type_str(field_ty);
-    let unwrapped = unwrapped_type(field_ty);
-    if json_type == "array" {
-        let item_schema = vec_item_schema(unwrapped);
-        quote! {
-            serde_json::json!({
-                "type": "array",
-                "items": #item_schema
-            })
-        }
-    } else if json_type == "object" && !is_plain_object(unwrapped) {
-        quote! { #unwrapped::item_schema() }
+/// `Option<T>` only gets peeled at the top level of a field. Inside a
+/// `Vec`, we keep whatever the user wrote so optional items still round
+/// trip through serde.
+fn schema_ref(ty: &Type, description: &str, unwrap_option: bool) -> TokenStream2 {
+    let inner = if unwrap_option {
+        unwrapped_type(ty)
     } else {
-        quote! { serde_json::json!({ "type": #json_type }) }
+        ty
+    };
+
+    if is_value_type(inner) {
+        return quote! {
+            &crate::tools::schema::ParamSchema::Any { description: #description }
+        };
     }
+
+    if let Some(prim) = primitive_of(inner) {
+        let kind = primitive_kind_token(prim);
+        return quote! {
+            &crate::tools::schema::ParamSchema::Primitive {
+                kind: #kind,
+                description: #description,
+            }
+        };
+    }
+
+    if let Some(item_ty) = inner_type(inner, "Vec") {
+        let item_schema = schema_ref(item_ty, "", false);
+        return quote! {
+            &crate::tools::schema::ParamSchema::Array {
+                items: #item_schema,
+                description: #description,
+            }
+        };
+    }
+
+    quote! { #inner::ITEM_SCHEMA }
+}
+
+fn primitive_kind_token(prim: Primitive) -> TokenStream2 {
+    match prim {
+        Primitive::String => quote! { crate::tools::schema::ParamKind::String },
+        Primitive::Bool => quote! { crate::tools::schema::ParamKind::Bool },
+        Primitive::Integer => quote! { crate::tools::schema::ParamKind::Integer },
+        Primitive::Number => quote! { crate::tools::schema::ParamKind::Number },
+    }
+}
+
+fn object_property_tokens(fields: &syn::FieldsNamed) -> Vec<TokenStream2> {
+    fields
+        .named
+        .iter()
+        .map(|field| {
+            let field_name = field.ident.as_ref().unwrap();
+            let field_str = field_name.to_string();
+            let desc = param_description(&field.attrs).unwrap_or_default();
+            let schema = schema_ref(&field.ty, &desc, true);
+            let required = !(is_option(&field.ty) || has_serde_default(&field.attrs));
+            quote! {
+                (
+                    #field_str,
+                    #schema,
+                    #required,
+                )
+            }
+        })
+        .collect()
 }
 
 #[proc_macro_derive(ArgEnum)]
@@ -152,12 +204,11 @@ pub fn derive_arg_enum(input: TokenStream) -> TokenStream {
 
     let expanded = quote! {
         impl #name {
-            pub fn item_schema() -> serde_json::Value {
-                serde_json::json!({
-                    "type": "string",
-                    "enum": [#(#variants),*]
-                })
-            }
+            pub(crate) const ITEM_SCHEMA: &'static crate::tools::schema::ParamSchema =
+                &crate::tools::schema::ParamSchema::Enum {
+                    variants: &[#(#variants),*],
+                    description: "",
+                };
         }
     };
     expanded.into()
@@ -179,46 +230,15 @@ pub fn derive_args(input: TokenStream) -> TokenStream {
             .into();
     };
 
-    let mut prop_entries = Vec::new();
-    let mut required_entries = Vec::new();
-
-    for field in &fields.named {
-        let field_name = field.ident.as_ref().unwrap();
-        let field_ty = &field.ty;
-        let field_str = field_name.to_string();
-        let desc = param_description(&field.attrs).unwrap_or_default();
-        let optional = is_option(field_ty) || has_serde_default(&field.attrs);
-        let base = field_schema_token(field_ty);
-
-        prop_entries.push(quote! {
-            let mut entry = #base;
-            if let serde_json::Value::Object(ref mut m) = entry {
-                if !#desc.is_empty() {
-                    m.insert("description".to_string(), serde_json::Value::String(#desc.to_string()));
-                }
-            }
-            props.insert(#field_str.to_string(), entry);
-        });
-
-        if !optional {
-            required_entries.push(quote! { required.push(#field_str.to_string()); });
-        }
-    }
+    let props = object_property_tokens(fields);
 
     let expanded = quote! {
         impl #name {
-            pub fn item_schema() -> serde_json::Value {
-                let mut props = serde_json::Map::new();
-                #(#prop_entries)*
-                let mut required = Vec::<String>::new();
-                #(#required_entries)*
-                serde_json::json!({
-                    "type": "object",
-                    "required": required,
-                    "properties": serde_json::Value::Object(props),
-                    "additionalProperties": false
-                })
-            }
+            pub(crate) const ITEM_SCHEMA: &'static crate::tools::schema::ParamSchema =
+                &crate::tools::schema::ParamSchema::Object {
+                    properties: &[#(#props),*],
+                    description: "",
+                };
         }
     };
     expanded.into()
@@ -240,101 +260,25 @@ pub fn derive_tool(input: TokenStream) -> TokenStream {
             .into();
     };
 
-    let mut prop_entries = Vec::new();
-    let mut required_entries = Vec::new();
-    let mut field_extractions = Vec::new();
-    let mut schema_hint_parts = Vec::new();
-
-    for field in &fields.named {
-        let field_name = field.ident.as_ref().unwrap();
-        let field_ty = &field.ty;
-        let field_str = field_name.to_string();
-        let desc = param_description(&field.attrs).unwrap_or_default();
-        let json_type = json_type_str(field_ty);
-        let optional = is_option(field_ty) || has_serde_default(&field.attrs);
-
-        if json_type == "array" {
-            let item_schema = vec_item_schema(field_ty);
-            prop_entries.push(quote! {
-                props.insert(#field_str.to_string(), serde_json::json!({
-                    "type": "array",
-                    "description": #desc,
-                    "items": #item_schema
-                }));
-            });
-        } else {
-            prop_entries.push(quote! {
-                props.insert(#field_str.to_string(), serde_json::json!({
-                    "type": #json_type,
-                    "description": #desc
-                }));
-            });
-        }
-
-        if !optional {
-            required_entries.push(quote! { required.push(#field_str.to_string()); });
-        }
-
-        let hint_suffix = if optional { "?" } else { "" };
-        let type_hint = match json_type {
-            "string" => "str",
-            "integer" => "int",
-            "boolean" => "bool",
-            "number" => "num",
-            "array" => "[...]",
-            _ => "obj",
-        };
-        schema_hint_parts.push(format!("{}{}: {}", field_str, hint_suffix, type_hint));
-
-        if optional {
-            field_extractions.push(quote! {
-                let #field_name: #field_ty = input
-                    .get(#field_str)
-                    .filter(|v| !v.is_null())
-                    .map(|v| crate::tools::deserialize_with_coercion(v, #field_str, #json_type))
-                    .transpose()?;
-            });
-        } else {
-            field_extractions.push(quote! {
-                let #field_name: #field_ty = {
-                    let raw = input.get(#field_str).filter(|v| !v.is_null()).ok_or_else(|| format!("The required parameter '{}' is missing. Expected: {}", #field_str, Self::schema_hint()))?;
-                    crate::tools::deserialize_with_coercion(raw, #field_str, #json_type)?
-                };
-            });
-        }
-    }
-
-    let field_names: Vec<&Ident> = fields
-        .named
-        .iter()
-        .map(|f| f.ident.as_ref().unwrap())
-        .collect();
-
-    let schema_hint_str = format!("{{ {} }}", schema_hint_parts.join(", "));
+    let props = object_property_tokens(fields);
 
     let expanded = quote! {
         impl #name {
+            pub(crate) const SCHEMA: &'static crate::tools::schema::ParamSchema =
+                &crate::tools::schema::ParamSchema::Object {
+                    properties: &[#(#props),*],
+                    description: "",
+                };
+
             pub(crate) fn schema() -> serde_json::Value {
-                let mut props = serde_json::Map::new();
-                #(#prop_entries)*
-                let mut required = Vec::<String>::new();
-                #(#required_entries)*
-                serde_json::json!({
-                    "type": "object",
-                    "required": required,
-                    "properties": serde_json::Value::Object(props),
-                    "additionalProperties": false
-                })
+                crate::tools::schema::to_json_schema(Self::SCHEMA)
             }
 
-            pub(crate) fn schema_hint() -> &'static str {
-                #schema_hint_str
-            }
-
-            pub(crate) fn parse_input(input: &serde_json::Value) -> Result<Self, String> {
-                let input = &crate::tools::sanitize_tool_input(input);
-                #(#field_extractions)*
-                Ok(Self { #(#field_names),* })
+            pub(crate) fn parse_input(
+                input: &serde_json::Value,
+            ) -> Result<Self, crate::tools::schema::ToolInputError> {
+                let sanitized = crate::tools::sanitize_tool_input(input);
+                crate::tools::schema::validate_and_deserialize(Self::SCHEMA, sanitized)
             }
         }
     };

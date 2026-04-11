@@ -12,7 +12,7 @@ use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 
 use crate::task_set::TaskSet;
-use maki_tool_macro::{Args, Tool};
+use maki_tool_macro::Tool;
 use tracing::{error, info};
 
 use std::time::Instant;
@@ -21,12 +21,17 @@ use super::{ToolCall, ToolContext};
 
 const MAX_BATCH_SIZE: usize = 25;
 
-#[derive(Args, Debug, Clone)]
+#[derive(Debug, Clone)]
 pub(super) struct BatchEntry {
-    #[param(description = "The name of the tool to execute")]
     tool: String,
-    #[param(description = "Parameters for the tool")]
     parameters: Value,
+}
+
+impl BatchEntry {
+    pub(crate) const ITEM_SCHEMA: &'static crate::tools::schema::ParamSchema =
+        &crate::tools::schema::ParamSchema::Any {
+            description: "Tool invocation: { tool: string, parameters: object } or flat { tool: string, ...params }",
+        };
 }
 
 /// Models sometimes send batch entries with flat fields:
@@ -117,7 +122,7 @@ impl BatchEntry {
     }
 }
 
-#[derive(Tool, Debug, Clone)]
+#[derive(Tool, Debug, Clone, Deserialize)]
 pub struct Batch {
     #[param(description = "Array of tool calls to execute in parallel")]
     tool_calls: Vec<BatchEntry>,

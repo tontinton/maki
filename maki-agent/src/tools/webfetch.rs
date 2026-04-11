@@ -5,6 +5,7 @@ use isahc::config::Configurable;
 use isahc::{AsyncReadResponseExt, HttpClient, Request};
 
 use maki_tool_macro::Tool;
+use serde::Deserialize;
 
 use crate::ToolOutput;
 
@@ -18,7 +19,7 @@ const CF_MITIGATED: &str = "cf-mitigated";
 const CF_CHALLENGE: &str = "challenge";
 const FALLBACK_USER_AGENT: &str = "maki";
 
-#[derive(Tool, Debug, Clone)]
+#[derive(Tool, Debug, Clone, Deserialize)]
 pub struct WebFetch {
     #[param(description = "URL to fetch (http:// or https://)")]
     url: String,
