@@ -106,6 +106,9 @@ struct ServerEntry {
 impl ServerEntry {
     async fn clear_connection(&mut self) {
         if let Some(old) = self.transport.take() {
+            // A live tool call can still be holding an `Arc` to this transport via the
+            // `ToolIndex`, so we cannot rely on `Drop` to reap the child in time.
+            kill_process_groups(&old.child_pids());
             old.shutdown().await;
         }
         self.tools.clear();

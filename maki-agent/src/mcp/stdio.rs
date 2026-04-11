@@ -314,14 +314,11 @@ impl McpTransport for StdioTransport {
 
     fn shutdown<'a>(&'a self) -> BoxFuture<'a, ()> {
         Box::pin(async move {
+            // Flip `alive` so any in-flight reader or writer gives up with a clean error.
+            // We deliberately do not signal the child here: the transport lives behind an
+            // Arc, and once the last clone goes away `ChildGuard::drop` takes care of
+            // killing the whole process group. Doing it twice just raced with itself.
             self.alive.store(false, Ordering::Release);
-            #[cfg(unix)]
-            unsafe {
-                libc::killpg(self._child.id() as i32, libc::SIGTERM);
-            }
-            smol::Timer::after(Duration::from_millis(200)).await;
-            // SIGTERM above gives the child a brief window to exit on its own. When the last
-            // Arc drops, `ChildGuard::drop` follows up with SIGKILL on the process group.
         })
     }
 

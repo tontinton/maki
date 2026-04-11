@@ -20,7 +20,7 @@ use tracing::error;
 
 use super::ModelSlot;
 use super::cancel_map::CancelMap;
-use super::shared_queue::{QueueItem, SharedQueue};
+use super::shared_queue::{QueueItem, QueueReceiver};
 
 pub(super) struct AgentLoop {
     model_slot: Arc<ArcSwap<ModelSlot>>,
@@ -33,13 +33,12 @@ pub(super) struct AgentLoop {
     history: History,
     shared_history: Arc<ArcSwap<Vec<Message>>>,
     cancel_map: Arc<Mutex<CancelMap>>,
-    cancel: CancelToken,
+    init_cancel: CancelToken,
     permissions: Arc<PermissionManager>,
     min_run_id: u64,
     agent_tx: flume::Sender<Envelope>,
     answer_rx: Arc<async_lock::Mutex<flume::Receiver<String>>>,
-    notify_rx: flume::Receiver<()>,
-    queue: Arc<SharedQueue>,
+    queue: Arc<QueueReceiver>,
     session_id: Option<String>,
 }
 
@@ -55,10 +54,9 @@ impl AgentLoop {
         permissions: Arc<PermissionManager>,
         agent_tx: flume::Sender<Envelope>,
         answer_rx: flume::Receiver<String>,
-        notify_rx: flume::Receiver<()>,
-        queue: Arc<SharedQueue>,
+        queue: Arc<QueueReceiver>,
         cancel_map: Arc<Mutex<CancelMap>>,
-        cancel: CancelToken,
+        init_cancel: CancelToken,
         session_id: Option<String>,
     ) -> Self {
         Self {
@@ -72,12 +70,11 @@ impl AgentLoop {
             history: History::new(initial_history),
             shared_history,
             cancel_map,
-            cancel,
+            init_cancel,
             permissions,
             min_run_id: 0,
             agent_tx,
             answer_rx: Arc::new(async_lock::Mutex::new(answer_rx)),
-            notify_rx,
             queue,
             session_id,
         }
@@ -88,7 +85,7 @@ impl AgentLoop {
             return;
         }
 
-        while let Ok(()) = self.notify_rx.recv_async().await {
+        while let Ok(()) = self.queue.recv_notify().await {
             while let Some(entry) = self.queue.pop() {
                 if entry.run_id() < self.min_run_id {
                     continue;
@@ -123,7 +120,7 @@ impl AgentLoop {
     async fn initialize(&mut self) -> bool {
         self.vars = template::env_vars();
         self.reload_instructions().await;
-        if self.cancel.is_cancelled() {
+        if self.init_cancel.is_cancelled() {
             return false;
         }
 
@@ -133,7 +130,7 @@ impl AgentLoop {
             mcp.extend_tools(&mut self.tools);
             spawn_oauth_for_needs_auth(mcp);
         }
-        !self.cancel.is_cancelled()
+        !self.init_cancel.is_cancelled()
     }
 
     async fn do_compact(&mut self, event_tx: &EventSender) -> Result<(), AgentError> {

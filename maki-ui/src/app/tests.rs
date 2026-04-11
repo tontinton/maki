@@ -1,5 +1,5 @@
 use super::*;
-use crate::agent::shared_queue::SharedQueue;
+use crate::agent::shared_queue;
 use crate::chat::{CANCELLED_TEXT, DONE_TEXT, ERROR_TEXT};
 use crate::components::command::ParsedCommand;
 use crate::components::keybindings::{KeybindContext, key as kb};
@@ -51,7 +51,7 @@ fn test_app() -> App {
         permissions,
         Arc::from([]),
     );
-    let (shared_queue, _rx) = SharedQueue::new();
+    let (shared_queue, _rx) = shared_queue::queue();
     app.queue.set_shared(shared_queue);
     app
 }

@@ -26,7 +26,7 @@ use crate::app::App;
 
 use self::agent_loop::AgentLoop;
 use self::command_router::spawn_command_router;
-pub(crate) use self::shared_queue::{QueuedMessage, SharedQueue};
+pub(crate) use self::shared_queue::{QueueSender, QueuedMessage};
 
 const MCP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -47,7 +47,7 @@ pub(crate) struct AgentHandles {
     pub(crate) history: Arc<ArcSwap<Vec<Message>>>,
     pub(crate) tool_outputs: Arc<Mutex<HashMap<String, ToolOutput>>>,
     pub(crate) mcp_handle: Option<McpHandle>,
-    pub(crate) queue: Arc<SharedQueue>,
+    pub(crate) queue: QueueSender,
     task: smol::Task<()>,
 }
 
@@ -87,7 +87,7 @@ impl AgentHandles {
         app.cmd_tx = Some(self.cmd_tx.clone());
         app.shared_history = Some(Arc::clone(&self.history));
         app.shared_tool_outputs = Some(Arc::clone(&self.tool_outputs));
-        app.queue.set_shared(Arc::clone(&self.queue));
+        app.queue.set_shared(self.queue.clone());
     }
 
     pub(crate) fn cancel(self) {
@@ -123,15 +123,17 @@ impl AgentHandles {
             Some(app.state.session.id.clone()),
         );
         let old = mem::replace(self, new);
-        old.cancel();
+        // Repoint the app at the new queue before dropping `old`, otherwise the app keeps
+        // the last old `QueueSender` alive and the old loop parks in `recv_notify` forever.
         self.apply_to_app(app);
+        old.cancel();
     }
 
     pub(crate) fn shutdown(self, timeout: Duration) {
         let _ = self.cmd_tx.try_send(AgentCommand::CancelAll);
         let mcp_handle = self.mcp_handle;
         let task = self.task;
-        drop((self.cmd_tx, self.agent_rx, self.answer_tx));
+        drop((self.cmd_tx, self.agent_rx, self.answer_tx, self.queue));
         info!("waiting for agent to finish (timeout {timeout:?})");
         smol::block_on(async {
             let finished = futures_lite::future::or(
@@ -187,7 +189,8 @@ fn spawn_agent_internal(
     let (agent_tx, agent_rx) = flume::unbounded::<Envelope>();
     let (cmd_tx, cmd_rx) = flume::unbounded::<AgentCommand>();
     let (answer_tx, answer_rx) = flume::unbounded::<String>();
-    let (queue, notify_rx) = SharedQueue::new();
+    let (queue_tx, queue_rx) = shared_queue::queue();
+    let queue_rx = Arc::new(queue_rx);
     let shared_history: Arc<ArcSwap<Vec<Message>>> =
         Arc::new(ArcSwap::from_pointee(initial_history.clone()));
     let shared_tool_outputs: Arc<Mutex<HashMap<String, ToolOutput>>> =
@@ -207,8 +210,7 @@ fn spawn_agent_internal(
         Arc::clone(permissions),
         agent_tx,
         answer_rx,
-        notify_rx,
-        Arc::clone(&queue),
+        queue_rx,
         cancel_map,
         init_cancel,
         session_id,
@@ -223,7 +225,7 @@ fn spawn_agent_internal(
         history: shared_history,
         tool_outputs: shared_tool_outputs,
         mcp_handle,
-        queue,
+        queue: queue_tx,
         task,
     }
 }

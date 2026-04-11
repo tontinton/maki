@@ -1,3 +1,11 @@
+//! Queue of work handed from the UI to the agent loop.
+//!
+//! Shutdown rides on `Drop`: when the last [`QueueSender`] goes away, flume
+//! closes the notify channel, so the receiver's `recv_notify` wakes with an
+//! `Err` and the agent loop falls out of its main loop on its own. That way
+//! nobody needs a separate "please stop" flag, and callers can't forget to
+//! set it.
+
 use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -9,6 +17,8 @@ use crate::components::queue_panel::QueueEntry;
 use crate::theme;
 
 const COMPACT_LABEL: &str = "/compact";
+
+type Items = Arc<Mutex<VecDeque<QueueItem>>>;
 
 pub(crate) struct QueuedMessage {
     pub(crate) text: String,
@@ -67,47 +77,46 @@ impl QueueItem {
     }
 }
 
-pub(crate) struct SharedQueue {
-    inner: Mutex<VecDeque<QueueItem>>,
-    notify_tx: flume::Sender<()>,
-}
-
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-impl SharedQueue {
-    pub(crate) fn new() -> (Arc<Self>, flume::Receiver<()>) {
-        let (tx, rx) = flume::bounded(1);
-        (
-            Arc::new(Self {
-                inner: Mutex::new(VecDeque::new()),
-                notify_tx: tx,
-            }),
-            rx,
-        )
-    }
+#[derive(Clone)]
+pub(crate) struct QueueSender {
+    items: Items,
+    notify_tx: flume::Sender<()>,
+}
 
+pub(crate) struct QueueReceiver {
+    items: Items,
+    notify_rx: flume::Receiver<()>,
+}
+
+pub(crate) fn queue() -> (QueueSender, QueueReceiver) {
+    let (notify_tx, notify_rx) = flume::bounded(1);
+    let items: Items = Arc::new(Mutex::new(VecDeque::new()));
+    (
+        QueueSender {
+            items: Arc::clone(&items),
+            notify_tx,
+        },
+        QueueReceiver { items, notify_rx },
+    )
+}
+
+impl QueueSender {
     pub(crate) fn push(&self, entry: QueueItem) {
-        lock(&self.inner).push_back(entry);
+        lock(&self.items).push_back(entry);
         let _ = self.notify_tx.try_send(());
     }
 
-    pub(crate) fn pop(&self) -> Option<QueueItem> {
-        lock(&self.inner).pop_front()
-    }
-
     pub(crate) fn remove(&self, index: usize) -> Option<QueueItem> {
-        let mut inner = lock(&self.inner);
-        if index < inner.len() {
-            inner.remove(index)
-        } else {
-            None
-        }
+        let mut items = lock(&self.items);
+        (index < items.len()).then(|| items.remove(index)).flatten()
     }
 
     pub(crate) fn len(&self) -> usize {
-        lock(&self.inner).len()
+        lock(&self.items).len()
     }
 
     #[cfg(test)]
@@ -116,11 +125,11 @@ impl SharedQueue {
     }
 
     pub(crate) fn clear(&self) {
-        lock(&self.inner).clear();
+        lock(&self.items).clear();
     }
 
     pub(crate) fn text_messages(&self) -> Vec<String> {
-        lock(&self.inner)
+        lock(&self.items)
             .iter()
             .filter_map(|item| match item {
                 QueueItem::Message { text, .. } => Some(text.clone()),
@@ -130,15 +139,45 @@ impl SharedQueue {
     }
 
     pub(crate) fn entries(&self) -> Vec<QueueEntry<'static>> {
-        lock(&self.inner)
+        lock(&self.items)
             .iter()
             .map(QueueItem::as_queue_entry)
             .collect()
     }
 }
 
-impl InterruptSource for SharedQueue {
+impl QueueReceiver {
+    pub(crate) fn pop(&self) -> Option<QueueItem> {
+        lock(&self.items).pop_front()
+    }
+
+    pub(crate) async fn recv_notify(&self) -> Result<(), flume::RecvError> {
+        self.notify_rx.recv_async().await
+    }
+}
+
+impl InterruptSource for QueueReceiver {
     fn poll(&self) -> Option<ExtractedCommand> {
         self.pop().map(QueueItem::into_extracted_command)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn last_sender_drop_closes_notify_channel() {
+        let (tx, rx) = queue();
+        let tx2 = tx.clone();
+
+        drop(tx);
+        assert_eq!(rx.notify_rx.try_recv(), Err(flume::TryRecvError::Empty));
+
+        drop(tx2);
+        assert_eq!(
+            rx.notify_rx.try_recv(),
+            Err(flume::TryRecvError::Disconnected)
+        );
     }
 }

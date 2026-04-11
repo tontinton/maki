@@ -1,24 +1,20 @@
 //! Queue for messages typed while the agent is busy.
 //!
-//! MessageQueue wraps SharedQueue and manages UI-only state (focus).
-
-use std::sync::Arc;
-
 use super::{App, format_with_images};
 
-use crate::agent::shared_queue::{QueueItem, SharedQueue};
+use crate::agent::shared_queue::{QueueItem, QueueSender};
 use crate::components::queue_panel::QueueEntry;
 
 pub(crate) use crate::agent::shared_queue::QueuedMessage;
 
 #[derive(Default)]
 pub(crate) struct MessageQueue {
-    shared: Option<Arc<SharedQueue>>,
+    shared: Option<QueueSender>,
     focus: Option<usize>,
 }
 
 impl MessageQueue {
-    pub(crate) fn set_shared(&mut self, shared: Arc<SharedQueue>) {
+    pub(crate) fn set_shared(&mut self, shared: QueueSender) {
         self.shared = Some(shared);
     }
 
