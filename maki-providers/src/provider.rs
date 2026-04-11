@@ -9,6 +9,7 @@ use tracing::{debug, warn};
 use crate::model::{Model, ModelFamily, models_for_provider};
 use crate::providers::anthropic::Anthropic;
 use crate::providers::dynamic;
+use crate::providers::mistral::Mistral;
 use crate::providers::ollama::Ollama;
 use crate::providers::openai::OpenAi;
 use crate::providers::synthetic::Synthetic;
@@ -22,6 +23,7 @@ pub enum ProviderKind {
     #[strum(serialize = "openai")]
     OpenAi,
     Ollama,
+    Mistral,
     Zai,
     ZaiCodingPlan,
     Synthetic,
@@ -33,6 +35,7 @@ impl ProviderKind {
             Self::Anthropic => "Anthropic",
             Self::OpenAi => "OpenAI",
             Self::Ollama => "Ollama",
+            Self::Mistral => "Mistral",
             Self::Zai => "Z.AI",
             Self::ZaiCodingPlan => "Z.AI Coding",
             Self::Synthetic => "Synthetic",
@@ -44,6 +47,7 @@ impl ProviderKind {
             Self::Anthropic => "ANTHROPIC_API_KEY",
             Self::OpenAi => "OPENAI_API_KEY",
             Self::Ollama => "",
+            Self::Mistral => "MISTRAL_API_KEY",
             Self::Zai | Self::ZaiCodingPlan => "ZHIPU_API_KEY",
             Self::Synthetic => "SYNTHETIC_API_KEY",
         }
@@ -54,6 +58,7 @@ impl ProviderKind {
             Self::Anthropic => "https://api.anthropic.com/v1/messages",
             Self::OpenAi => "https://api.openai.com/v1",
             Self::Ollama => "http://localhost:11434/v1",
+            Self::Mistral => "https://api.mistral.ai/v1",
             Self::Zai => "https://api.z.ai/api/paas/v4",
             Self::ZaiCodingPlan => "https://api.z.ai/api/coding/paas/v4",
             Self::Synthetic => "https://api.synthetic.new/openai/v1",
@@ -82,6 +87,7 @@ impl ProviderKind {
             Self::Anthropic => ModelFamily::Claude,
             Self::OpenAi => ModelFamily::Gpt,
             Self::Ollama => ModelFamily::Generic,
+            Self::Mistral => ModelFamily::Generic,
             Self::Zai | Self::ZaiCodingPlan => ModelFamily::Glm,
             Self::Synthetic => ModelFamily::Synthetic,
         }
@@ -96,6 +102,7 @@ impl ProviderKind {
             Self::Anthropic => Ok(Box::new(Anthropic::new()?)),
             Self::OpenAi => Ok(Box::new(OpenAi::new()?)),
             Self::Ollama => Ok(Box::new(Ollama::new())),
+            Self::Mistral => Ok(Box::new(Mistral::new()?)),
             Self::Zai => Ok(Box::new(Zai::new(ZaiPlan::Standard)?)),
             Self::ZaiCodingPlan => Ok(Box::new(Zai::new(ZaiPlan::Coding)?)),
             Self::Synthetic => Ok(Box::new(Synthetic::new()?)),

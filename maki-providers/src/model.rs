@@ -10,7 +10,7 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 
 use crate::provider::ProviderKind;
-use crate::providers::{anthropic, dynamic, ollama, openai, synthetic, zai};
+use crate::providers::{anthropic, dynamic, mistral, ollama, openai, synthetic, zai};
 
 const PER_MILLION: f64 = 1_000_000.0;
 
@@ -110,6 +110,7 @@ pub fn models_for_provider(provider: ProviderKind) -> &'static [ModelEntry] {
         ProviderKind::Anthropic => anthropic::models(),
         ProviderKind::OpenAi => openai::models(),
         ProviderKind::Ollama => ollama::models(),
+        ProviderKind::Mistral => mistral::models(),
         ProviderKind::Zai | ProviderKind::ZaiCodingPlan => zai::models(),
         ProviderKind::Synthetic => synthetic::models(),
     }
