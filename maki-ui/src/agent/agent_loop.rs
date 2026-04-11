@@ -40,6 +40,7 @@ pub(super) struct AgentLoop {
     answer_rx: Arc<async_lock::Mutex<flume::Receiver<String>>>,
     notify_rx: flume::Receiver<()>,
     queue: Arc<SharedQueue>,
+    session_id: Option<String>,
 }
 
 impl AgentLoop {
@@ -58,6 +59,7 @@ impl AgentLoop {
         queue: Arc<SharedQueue>,
         cancel_map: Arc<Mutex<CancelMap>>,
         cancel: CancelToken,
+        session_id: Option<String>,
     ) -> Self {
         Self {
             model_slot,
@@ -77,6 +79,7 @@ impl AgentLoop {
             answer_rx: Arc::new(async_lock::Mutex::new(answer_rx)),
             notify_rx,
             queue,
+            session_id,
         }
     }
 
@@ -203,6 +206,7 @@ impl AgentLoop {
                 skills: Arc::clone(&self.skills),
                 config: self.config.clone(),
                 permissions: Arc::clone(&self.permissions),
+                session_id: self.session_id.clone(),
             },
             AgentRunParams {
                 history: mem::replace(&mut self.history, History::new(Vec::new())),

@@ -29,7 +29,8 @@ impl App {
         self.btw_modal.open(&question, rx);
         messages.push(Message::user(question));
 
-        smol::spawn(run_btw(provider, model, messages, tx)).detach();
+        let session_id = self.state.session.id.clone();
+        smol::spawn(run_btw(provider, model, messages, tx, Some(session_id))).detach();
     }
 }
 
@@ -38,6 +39,7 @@ async fn run_btw(
     model: Model,
     messages: Vec<Message>,
     btw_tx: Sender<BtwEvent>,
+    session_id: Option<String>,
 ) {
     let (event_tx, event_rx) = flume::unbounded();
     let tools = Value::Array(vec![]);
@@ -49,6 +51,7 @@ async fn run_btw(
         &tools,
         &event_tx,
         ThinkingConfig::Off,
+        session_id.as_deref(),
     );
 
     let forward_fut = async {

@@ -117,6 +117,7 @@ impl ProviderKind {
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 pub trait Provider: Send + Sync {
+    #[allow(clippy::too_many_arguments)]
     fn stream_message<'a>(
         &'a self,
         model: &'a Model,
@@ -125,6 +126,7 @@ pub trait Provider: Send + Sync {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         thinking: ThinkingConfig,
+        session_id: Option<&'a str>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>>;
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<String>, AgentError>>;

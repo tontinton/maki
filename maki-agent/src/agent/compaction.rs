@@ -34,6 +34,7 @@ pub(super) async fn compact_history(
         event_tx,
         cancel,
         ThinkingConfig::Off,
+        None,
     )
     .await?;
 
@@ -147,6 +148,7 @@ mod tests {
             _: &'a Value,
             _: &'a flume::Sender<ProviderEvent>,
             _: ThinkingConfig,
+            _: Option<&str>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async {
                 let mut responses = self.responses.lock().unwrap();

@@ -89,6 +89,7 @@ impl Provider for Synthetic {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         thinking: ThinkingConfig,
+        _session_id: Option<&str>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let mut body = self.compat.build_body(model, messages, system, tools);
@@ -109,7 +110,7 @@ impl Provider for Synthetic {
                 }
             };
             self.compat
-                .do_stream(model, &body, event_tx, &self.auth)
+                .do_stream(model, &[], &body, event_tx, &self.auth)
                 .await
         })
     }

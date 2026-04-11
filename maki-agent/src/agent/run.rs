@@ -39,6 +39,7 @@ pub struct AgentParams {
     pub skills: Arc<[Skill]>,
     pub config: AgentConfig,
     pub permissions: Arc<PermissionManager>,
+    pub session_id: Option<String>,
 }
 
 pub struct AgentRunParams {
@@ -71,6 +72,7 @@ pub struct Agent {
     reauth_attempts: u32,
     permissions: Arc<PermissionManager>,
     thinking: ThinkingConfig,
+    session_id: Option<String>,
 }
 
 impl Agent {
@@ -98,6 +100,7 @@ impl Agent {
             mcp: None,
             reauth_attempts: 0,
             thinking: ThinkingConfig::Off,
+            session_id: params.session_id,
         }
     }
 
@@ -180,6 +183,7 @@ impl Agent {
             &self.event_tx,
             &self.cancel,
             self.thinking,
+            self.session_id.as_deref(),
         )
         .await
         {
@@ -439,6 +443,7 @@ mod tests {
             _: &'a Value,
             _: &'a flume::Sender<ProviderEvent>,
             _: ThinkingConfig,
+            _: Option<&str>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async {
                 let mut responses = self.responses.lock().unwrap();
@@ -485,6 +490,7 @@ mod tests {
                     },
                     std::path::PathBuf::from("/tmp"),
                 )),
+                session_id: None,
             },
             AgentRunParams {
                 history,
@@ -707,6 +713,7 @@ mod tests {
                     _: &'a Value,
                     _: &'a flume::Sender<ProviderEvent>,
                     _: ThinkingConfig,
+                    _: Option<&'a str>,
                 ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
                     Box::pin(async {
                         futures_lite::future::pending::<()>().await;
@@ -735,6 +742,7 @@ mod tests {
                         },
                         std::path::PathBuf::from("/tmp"),
                     )),
+                    session_id: None,
                 },
                 AgentRunParams {
                     history: History::new(Vec::new()),

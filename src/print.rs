@@ -181,6 +181,7 @@ pub fn run(
         .unwrap_or_default();
 
     let model_clone = model.clone();
+    let session_id_clone = session_id.clone();
     let agent_task = smol::spawn(async move {
         let event_tx = EventSender::new(raw_tx, 0);
         let provider: Arc<dyn Provider> = match provider::from_model_async(&model_clone).await {
@@ -205,6 +206,7 @@ pub fn run(
                     permissions_config,
                     cwd_path.clone(),
                 )),
+                session_id: Some(session_id_clone),
             },
             AgentRunParams {
                 history: History::new(Vec::new()),

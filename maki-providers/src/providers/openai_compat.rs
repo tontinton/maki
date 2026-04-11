@@ -83,15 +83,20 @@ impl OpenAiCompatProvider {
     pub async fn do_stream(
         &self,
         model: &crate::model::Model,
+        extra_headers: &[(String, String)],
         body: &Value,
         event_tx: &Sender<ProviderEvent>,
         auth: &ResolvedAuth,
     ) -> Result<StreamResponse, AgentError> {
         let json_body = serde_json::to_vec(body)?;
-        let request = self
+        let mut request = self
             .build_request("POST", "/chat/completions", auth)
-            .header("content-type", "application/json")
-            .body(json_body)?;
+            .header("content-type", "application/json");
+        for (key, value) in extra_headers {
+            request = request.header(key.as_str(), value.as_str());
+        }
+
+        let request = request.body(json_body)?;
 
         debug!(
             model = %model.id,

@@ -13,6 +13,7 @@ use maki_providers::provider;
 use maki_providers::{ContentBlock, Model, ModelError, Role};
 use maki_tool_macro::Tool;
 use tracing::info;
+use uuid::Uuid;
 
 use super::{
     DescriptionContext, GENERAL_SUBAGENT_TOOLS, RESEARCH_SUBAGENT_TOOLS, ToolContext, ToolFilter,
@@ -103,6 +104,7 @@ impl Task {
             mcp.extend_tools(&mut tools);
         }
 
+        let session_id = Uuid::new_v4().to_string();
         let (sub_tx, sub_rx) = flume::unbounded::<crate::Envelope>();
         let sub_event_tx = EventSender::new(sub_tx, ctx.event_tx.run_id());
         let parent_tx = ctx.event_tx.clone();
@@ -147,6 +149,7 @@ impl Task {
                 skills: Arc::clone(&ctx.skills),
                 config: ctx.config.clone(),
                 permissions: Arc::clone(&ctx.permissions),
+                session_id: Some(session_id),
             },
             AgentRunParams {
                 history: crate::History::new(Vec::new()),

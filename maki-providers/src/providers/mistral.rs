@@ -89,11 +89,16 @@ impl Provider for Mistral {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         _thinking: ThinkingConfig,
+        session_id: Option<&'a str>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let body = self.compat.build_body(model, messages, system, tools);
+            let mut extra_headers = vec![];
+            if let Some(session_id) = session_id {
+                extra_headers.push(("x-affinity".to_string(), session_id.to_string()));
+            }
             self.compat
-                .do_stream(model, &body, event_tx, &self.auth)
+                .do_stream(model, &extra_headers, &body, event_tx, &self.auth)
                 .await
         })
     }

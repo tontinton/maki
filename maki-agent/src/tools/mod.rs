@@ -794,6 +794,7 @@ impl Provider for NullProvider {
         _: &'a Value,
         _: &'a flume::Sender<ProviderEvent>,
         _: ThinkingConfig,
+        _: Option<&str>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async { unimplemented!() })
     }

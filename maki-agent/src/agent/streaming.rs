@@ -30,6 +30,7 @@ pub(crate) async fn stream_with_retry(
     event_tx: &EventSender,
     cancel: &CancelToken,
     thinking: ThinkingConfig,
+    session_id: Option<&str>,
 ) -> Result<StreamResponse, AgentError> {
     let mut retry = RetryState::new();
     loop {
@@ -39,7 +40,7 @@ pub(crate) async fn stream_with_retry(
             async move { forward_provider_events(prx, &event_tx).await }
         });
         let result = futures_lite::future::race(
-            provider.stream_message(model, messages, system, tools, &ptx, thinking),
+            provider.stream_message(model, messages, system, tools, &ptx, thinking, session_id),
             async {
                 cancel.cancelled().await;
                 Err(AgentError::Cancelled)

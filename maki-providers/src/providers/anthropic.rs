@@ -402,6 +402,7 @@ impl Provider for Anthropic {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         thinking: ThinkingConfig,
+        _session_id: Option<&str>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let wire_messages = build_wire_messages(messages);

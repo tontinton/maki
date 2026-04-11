@@ -452,9 +452,11 @@ impl Provider for DynamicProvider {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         thinking: ThinkingConfig,
+        session_id: Option<&'a str>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
-        self.inner
-            .stream_message(model, messages, system, tools, event_tx, thinking)
+        self.inner.stream_message(
+            model, messages, system, tools, event_tx, thinking, session_id,
+        )
     }
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<String>, AgentError>> {

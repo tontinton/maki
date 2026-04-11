@@ -178,6 +178,7 @@ impl<'t> EventLoop<'t> {
             config.clone(),
             &permissions,
             cwd,
+            Some(session.id.clone()),
         );
 
         let custom_commands: Arc<[CustomCommand]> = Arc::from(commands);

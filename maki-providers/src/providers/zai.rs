@@ -165,12 +165,13 @@ impl Provider for Zai {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         _thinking: ThinkingConfig,
+        _session_id: Option<&str>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let body = self.compat.build_body(model, messages, system, tools);
             match self
                 .compat
-                .do_stream(model, &body, event_tx, &self.auth)
+                .do_stream(model, &[], &body, event_tx, &self.auth)
                 .await
             {
                 Err(AgentError::Api { status, message })

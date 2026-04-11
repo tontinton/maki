@@ -61,6 +61,7 @@ impl AgentHandles {
         config: AgentConfig,
         permissions: &Arc<PermissionManager>,
         cwd: PathBuf,
+        session_id: Option<String>,
     ) -> Self {
         let mcp_handle = smol::block_on(mcp::start(&cwd));
         spawn_agent_internal(
@@ -70,6 +71,7 @@ impl AgentHandles {
             config,
             permissions,
             mcp_handle,
+            session_id,
         )
     }
 
@@ -118,6 +120,7 @@ impl AgentHandles {
             config,
             permissions,
             self.mcp_handle.clone(),
+            Some(app.state.session.id.clone()),
         );
         let old = mem::replace(self, new);
         old.cancel();
@@ -179,6 +182,7 @@ fn spawn_agent_internal(
     config: AgentConfig,
     permissions: &Arc<PermissionManager>,
     mcp_handle: Option<McpHandle>,
+    session_id: Option<String>,
 ) -> AgentHandles {
     let (agent_tx, agent_rx) = flume::unbounded::<Envelope>();
     let (cmd_tx, cmd_rx) = flume::unbounded::<AgentCommand>();
@@ -207,6 +211,7 @@ fn spawn_agent_internal(
         Arc::clone(&queue),
         cancel_map,
         init_cancel,
+        session_id,
     );
 
     let task = smol::spawn(agent_loop.run());
