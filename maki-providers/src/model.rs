@@ -10,7 +10,7 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 
 use crate::provider::ProviderKind;
-use crate::providers::{anthropic, dynamic, ollama, openai, synthetic, zai};
+use crate::providers::{anthropic, custom, dynamic, ollama, openai, synthetic, zai};
 
 const PER_MILLION: f64 = 1_000_000.0;
 
@@ -112,6 +112,7 @@ pub fn models_for_provider(provider: ProviderKind) -> &'static [ModelEntry] {
         ProviderKind::Ollama => ollama::models(),
         ProviderKind::Zai | ProviderKind::ZaiCodingPlan => zai::models(),
         ProviderKind::Synthetic => synthetic::models(),
+        ProviderKind::Custom => custom::models(),
     }
 }
 
@@ -201,12 +202,20 @@ impl Model {
                     e.max_output_tokens,
                     e.context_window,
                 ),
-                None if provider.accepts_arbitrary_models() => (
-                    provider.family(),
-                    ModelPricing::ZERO,
-                    ollama::DEFAULT_MAX_OUTPUT,
-                    ollama::DEFAULT_CONTEXT,
-                ),
+                None if provider.accepts_arbitrary_models() => {
+                    if provider == ProviderKind::Custom {
+                        let (custom_cw, custom_mot) = custom::get_defaults();
+                        (provider.family(), ModelPricing::ZERO, custom_mot, custom_cw)
+                    } else {
+                        // Ollama
+                        (
+                            provider.family(),
+                            ModelPricing::ZERO,
+                            ollama::DEFAULT_MAX_OUTPUT,
+                            ollama::DEFAULT_CONTEXT,
+                        )
+                    }
+                }
                 None => return Err(ModelError::UnknownModel(model_id.to_string())),
             };
             return Ok(Self {

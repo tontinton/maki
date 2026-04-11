@@ -81,6 +81,28 @@ Defaults: glm-5-code (strong), glm-4.7-flash (weak), glm-4.7 (medium)
 
 Defaults: hf:moonshotai/Kimi-K2.5 (strong), hf:deepseek-ai/DeepSeek-V3.2 (medium), hf:zai-org/GLM-4.7-Flash (weak)
 
+### Custom
+
+- **Config**: `custom_openai_base_url` and `custom_openai_api_key` in `[provider]` section
+- **Features**: User-defined OpenAI-compatible endpoint, accepts arbitrary models
+
+Add to your `~/.config/maki/config.toml` or `.maki/config.toml`:
+
+```toml
+[provider]
+custom_openai_base_url = "http://192.168.0.100/v1"
+custom_openai_api_key = "your-api-key"
+```
+
+Then use any model from your endpoint:
+
+```
+custom/llama-3.3-70b
+custom/qwen-2.5-72b
+```
+
+The custom provider uses the OpenAI-compatible chat completions API. Set `default_model` to use it by default.
+
 ## Model Identifiers
 
 Models are referenced as `provider/model_id`:

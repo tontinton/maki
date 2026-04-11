@@ -32,6 +32,8 @@ pub const DEFAULT_INTERPRETER_MAX_MEMORY_MB: usize = 50;
 
 pub const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
 pub const DEFAULT_STREAM_TIMEOUT_SECS: u64 = 300;
+pub const DEFAULT_CUSTOM_CONTEXT_WINDOW: u32 = 128_000;
+pub const DEFAULT_CUSTOM_MAX_OUTPUT_TOKENS: u32 = 16_384;
 
 pub const DEFAULT_MAX_LOG_BYTES_MB: u64 = 200;
 pub const DEFAULT_MAX_LOG_FILES: u32 = 10;
@@ -199,6 +201,10 @@ struct ProviderFileConfig {
     default_model: Option<String>,
     connect_timeout_secs: Option<u64>,
     stream_timeout_secs: Option<u64>,
+    custom_openai_base_url: Option<String>,
+    custom_openai_api_key: Option<String>,
+    context_window: Option<u32>,
+    max_output_tokens: Option<u32>,
 }
 
 #[derive(Deserialize, Default)]
@@ -532,6 +538,20 @@ pub struct ProviderConfig {
              min = MIN_STREAM_TIMEOUT_SECS, val = "self.stream_timeout.as_secs()",
              desc = "Streaming response timeout (seconds)")]
     pub stream_timeout: Duration,
+
+    #[config(ty = "String", desc = "Custom OpenAI-compatible base URL")]
+    pub custom_openai_base_url: Option<String>,
+
+    #[config(ty = "String", desc = "Custom OpenAI-compatible API key")]
+    pub custom_openai_api_key: Option<String>,
+
+    #[config(default = DEFAULT_CUSTOM_CONTEXT_WINDOW,
+             desc = "Context window for custom OpenAI-compatible provider")]
+    pub context_window: u32,
+
+    #[config(default = DEFAULT_CUSTOM_MAX_OUTPUT_TOKENS,
+             desc = "Maximum output tokens for custom OpenAI-compatible provider")]
+    pub max_output_tokens: u32,
 }
 
 impl Default for ProviderConfig {
@@ -540,6 +560,10 @@ impl Default for ProviderConfig {
             default_model: None,
             connect_timeout: Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS),
             stream_timeout: Duration::from_secs(DEFAULT_STREAM_TIMEOUT_SECS),
+            custom_openai_base_url: None,
+            custom_openai_api_key: None,
+            context_window: DEFAULT_CUSTOM_CONTEXT_WINDOW,
+            max_output_tokens: DEFAULT_CUSTOM_MAX_OUTPUT_TOKENS,
         }
     }
 }
@@ -555,6 +579,12 @@ impl ProviderConfig {
             stream_timeout: Duration::from_secs(
                 f.stream_timeout_secs.unwrap_or(DEFAULT_STREAM_TIMEOUT_SECS),
             ),
+            custom_openai_base_url: f.custom_openai_base_url,
+            custom_openai_api_key: f.custom_openai_api_key,
+            context_window: f.context_window.unwrap_or(DEFAULT_CUSTOM_CONTEXT_WINDOW),
+            max_output_tokens: f
+                .max_output_tokens
+                .unwrap_or(DEFAULT_CUSTOM_MAX_OUTPUT_TOKENS),
         }
     }
 }

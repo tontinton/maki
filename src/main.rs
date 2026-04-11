@@ -293,6 +293,17 @@ fn run() -> Result<()> {
             maki_providers::tier_map::load_from_storage(&storage);
             let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
             let mut config = load_config(&cwd, cli.no_rtk);
+            if let (Some(base_url), Some(api_key)) = (
+                config.provider.custom_openai_base_url.as_ref(),
+                config.provider.custom_openai_api_key.as_ref(),
+            ) {
+                maki_providers::set_custom_config(maki_providers::CustomConfig {
+                    base_url: base_url.clone(),
+                    api_key: api_key.clone(),
+                    context_window: config.provider.context_window,
+                    max_output_tokens: config.provider.max_output_tokens,
+                });
+            }
             if cli.yolo || config.always_yolo {
                 config.permissions.allow_all = true;
             }
@@ -352,7 +363,7 @@ fn run() -> Result<()> {
                 })
                 .context("run UI")?;
                 if let Some(session_id) = session_id {
-                    eprintln!("session: {session_id}");
+                    eprintln!("continue:  maki -s {session_id}");
                 }
             }
         }

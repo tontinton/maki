@@ -8,6 +8,7 @@ use serde::Deserialize;
 use crate::AgentError;
 
 pub(crate) mod anthropic;
+pub mod custom;
 pub mod dynamic;
 pub(crate) mod ollama;
 pub(crate) mod openai;

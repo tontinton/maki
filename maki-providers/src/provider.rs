@@ -8,6 +8,7 @@ use tracing::{debug, warn};
 
 use crate::model::{Model, ModelFamily, models_for_provider};
 use crate::providers::anthropic::Anthropic;
+use crate::providers::custom::Custom;
 use crate::providers::dynamic;
 use crate::providers::ollama::Ollama;
 use crate::providers::openai::OpenAi;
@@ -25,6 +26,7 @@ pub enum ProviderKind {
     Zai,
     ZaiCodingPlan,
     Synthetic,
+    Custom,
 }
 
 impl ProviderKind {
@@ -36,6 +38,7 @@ impl ProviderKind {
             Self::Zai => "Z.AI",
             Self::ZaiCodingPlan => "Z.AI Coding",
             Self::Synthetic => "Synthetic",
+            Self::Custom => "Custom",
         }
     }
 
@@ -46,6 +49,7 @@ impl ProviderKind {
             Self::Ollama => "",
             Self::Zai | Self::ZaiCodingPlan => "ZHIPU_API_KEY",
             Self::Synthetic => "SYNTHETIC_API_KEY",
+            Self::Custom => "",
         }
     }
 
@@ -57,11 +61,12 @@ impl ProviderKind {
             Self::Zai => "https://api.z.ai/api/paas/v4",
             Self::ZaiCodingPlan => "https://api.z.ai/api/coding/paas/v4",
             Self::Synthetic => "https://api.synthetic.new/openai/v1",
+            Self::Custom => "",
         }
     }
 
     pub const fn supports_thinking(self) -> bool {
-        matches!(self, Self::Anthropic | Self::Synthetic)
+        matches!(self, Self::Anthropic | Self::Synthetic | Self::Custom)
     }
 
     pub const fn features(self) -> Option<&'static str> {
@@ -73,6 +78,7 @@ impl ProviderKind {
             Self::Synthetic => {
                 Some("Reasoning effort support (low/medium/high), open-weight models")
             }
+            Self::Custom => Some("User-defined OpenAI-compatible endpoint"),
             _ => None,
         }
     }
@@ -84,11 +90,12 @@ impl ProviderKind {
             Self::Ollama => ModelFamily::Generic,
             Self::Zai | Self::ZaiCodingPlan => ModelFamily::Glm,
             Self::Synthetic => ModelFamily::Synthetic,
+            Self::Custom => ModelFamily::Gpt,
         }
     }
 
     pub const fn accepts_arbitrary_models(self) -> bool {
-        matches!(self, Self::Ollama)
+        matches!(self, Self::Ollama | Self::Custom)
     }
 
     pub fn create(self) -> Result<Box<dyn Provider>, AgentError> {
@@ -99,6 +106,7 @@ impl ProviderKind {
             Self::Zai => Ok(Box::new(Zai::new(ZaiPlan::Standard)?)),
             Self::ZaiCodingPlan => Ok(Box::new(Zai::new(ZaiPlan::Coding)?)),
             Self::Synthetic => Ok(Box::new(Synthetic::new()?)),
+            Self::Custom => Ok(Box::new(Custom::new()?)),
         }
     }
 
