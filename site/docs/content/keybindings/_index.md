@@ -36,6 +36,7 @@ On macOS, `Ctrl` maps to `Cmd` where it makes sense (run `/help` for exact keybi
 | `Ctrl+B` | Scroll to bottom |
 | `Ctrl+Q` | Pop queue |
 | `Esc Esc` | Rewind |
+| `Alt+O` | Edit input in external editor |
 
 ### macOS-specific
 

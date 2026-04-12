@@ -433,6 +433,13 @@ impl<'t> EventLoop<'t> {
                     self.app.refresh_memory_entry(&path);
                 }
             }
+            Action::EditInputInEditor => {
+                let current_text = self.app.input_box.buffer.value();
+                match terminal::edit_temp_content(&current_text, self.terminal) {
+                    Ok(edited) => self.app.input_box.set_input(edited),
+                    Err(e) => self.app.flash(e),
+                }
+            }
             Action::Btw(question) => {
                 let slot = self.model_slot.load();
                 self.app

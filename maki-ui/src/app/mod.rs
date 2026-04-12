@@ -614,6 +614,9 @@ impl App {
     }
 
     fn handle_main_chat_key(&mut self, key: KeyEvent) -> Vec<Action> {
+        if key::EDIT_INPUT.matches(key) {
+            return vec![Action::EditInputInEditor];
+        }
         if is_ctrl(&key) {
             if key::POP_QUEUE.matches(key) {
                 self.queue.remove(0);

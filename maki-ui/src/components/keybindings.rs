@@ -112,7 +112,7 @@ pub struct Bind {
 
 impl Bind {
     pub fn matches(&self, key: KeyEvent) -> bool {
-        key.code == self.code && key.modifiers.contains(self.modifiers)
+        key.code == self.code && key.modifiers == self.modifiers
     }
 
     #[cfg(test)]
@@ -149,6 +149,11 @@ pub mod key {
     pub const DELETE: Bind = ctrl_bind!('d');
     pub const KILL_LINE: Bind = ctrl_bind!('k');
     pub const LINE_START: Bind = ctrl_bind!('a');
+    pub const EDIT_INPUT: Bind = Bind {
+        code: KeyCode::Char('o'),
+        modifiers: KeyModifiers::ALT,
+        label: "Alt+O",
+    };
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, EnumIter)]
@@ -434,6 +439,12 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
+        label: KeyLabel::Single(key::EDIT_INPUT.label),
+        description: "Edit input in external editor",
+        context: KeybindContext::Editing,
+        platform: Platform::All,
+    },
+    Keybind {
         label: KeyLabel::Alt("↑", "↓"),
         description: "Navigate input history",
         context: KeybindContext::Streaming,
@@ -515,6 +526,22 @@ pub fn all_contexts() -> impl Iterator<Item = KeybindContext> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::KeyEvent;
+
+    #[test]
+    fn bind_requires_exact_modifiers() {
+        let bind = key::OPEN_EDITOR; // Ctrl+O
+        let exact = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL);
+        let extra = KeyEvent::new(
+            KeyCode::Char('o'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        let wrong = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::ALT);
+
+        assert!(bind.matches(exact));
+        assert!(!bind.matches(extra), "extra modifiers should not match");
+        assert!(!bind.matches(wrong), "wrong modifier should not match");
+    }
 
     #[test]
     fn every_context_has_at_least_one_keybind() {

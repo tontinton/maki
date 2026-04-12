@@ -1719,6 +1719,14 @@ fn open_editor(plan: PlanState, expect_flash: bool) {
 }
 
 #[test]
+fn alt_o_opens_editor_for_input() {
+    let mut app = test_app();
+    app.input_box.buffer.insert_text("hello");
+    let actions = app.update(Msg::Key(kb::EDIT_INPUT.to_key_event()));
+    assert!(matches!(&actions[..], [Action::EditInputInEditor]));
+}
+
+#[test]
 fn btw_empty_flashes_error() {
     let mut app = test_app();
     let actions = app.execute_command(ParsedCommand {

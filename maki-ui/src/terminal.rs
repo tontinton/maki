@@ -57,6 +57,23 @@ fn push_keyboard_enhancement() {
     }
 }
 
+pub(crate) fn edit_temp_content(
+    content: &str,
+    terminal: &mut ratatui::DefaultTerminal,
+) -> Result<String, String> {
+    let tmp = tempfile::Builder::new()
+        .prefix("maki-input-")
+        .suffix(".md")
+        .tempfile()
+        .map_err(|e| format!("Failed to create temp file: {e}"))?;
+
+    std::fs::write(tmp.path(), content).map_err(|e| format!("Failed to write temp file: {e}"))?;
+
+    open_in_editor(tmp.path(), terminal)?;
+
+    std::fs::read_to_string(tmp.path()).map_err(|e| format!("Failed to read edited content: {e}"))
+}
+
 pub(crate) fn open_in_editor(
     path: &Path,
     terminal: &mut ratatui::DefaultTerminal,

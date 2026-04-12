@@ -35,6 +35,7 @@ libc = { workspace = true }
 dirs = { workspace = true }
 strum = { workspace = true }
 notify = { workspace = true }
+tempfile = { workspace = true }
 
 [features]
 demo = []

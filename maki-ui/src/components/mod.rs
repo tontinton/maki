@@ -185,6 +185,7 @@ pub enum Action {
     Compact,
     ToggleMcp(String, bool),
     OpenEditor(PathBuf),
+    EditInputInEditor,
     Btw(String),
     Quit,
 }
