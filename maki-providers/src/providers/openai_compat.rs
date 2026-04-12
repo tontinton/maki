@@ -275,7 +275,15 @@ enum ContentDelta {
 #[derive(Deserialize, Debug)]
 #[serde(tag = "type", rename_all = "lowercase")]
 enum ContentDeltaPart {
-    Thinking { thinking: Vec<ThinkingDeltaBlock> },
+    Text { text: String },
+    Thinking { thinking: Vec<ThinkingDelta> },
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(untagged)]
+enum ThinkingDelta {
+    Block(ThinkingDeltaBlock),
+    String(String),
 }
 
 #[derive(Deserialize, Debug)]
@@ -410,17 +418,41 @@ pub async fn parse_sse(
             }
             Some(ContentDelta::Array(content_array)) => {
                 for part in content_array {
-                    let ContentDeltaPart::Thinking { thinking } = part;
-                    for thinking_block in thinking {
-                        let ThinkingDeltaBlock::Text { text } = thinking_block;
-                        if text.is_empty() {
-                            continue;
-                        }
+                    match part {
+                        ContentDeltaPart::Thinking { thinking } => {
+                            for thinking_block in thinking {
+                                let content = match thinking_block {
+                                    ThinkingDelta::Block(ThinkingDeltaBlock::Text {
+                                        text: content_str,
+                                    }) => content_str,
+                                    ThinkingDelta::String(content_str) => content_str,
+                                };
 
-                        reasoning_text.push_str(&text);
-                        event_tx
-                            .send_async(ProviderEvent::ThinkingDelta { text })
-                            .await?;
+                                if content.is_empty() {
+                                    continue;
+                                }
+
+                                reasoning_text.push_str(&content);
+                                event_tx
+                                    .send_async(ProviderEvent::ThinkingDelta { text: content })
+                                    .await?;
+                            }
+                        }
+                        ContentDeltaPart::Text { text: content_str } => {
+                            let content = if is_first_content {
+                                is_first_content = false;
+                                content_str.trim_start().to_string()
+                            } else {
+                                content_str
+                            };
+
+                            if !content.is_empty() {
+                                text.push_str(&content);
+                                event_tx
+                                    .send_async(ProviderEvent::TextDelta { text: content })
+                                    .await?;
+                            }
+                        }
                     }
                 }
             }
