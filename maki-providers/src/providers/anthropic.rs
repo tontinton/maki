@@ -4,7 +4,7 @@
 
 use std::env;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use flume::Sender;
 use futures_lite::io::{AsyncBufReadExt, BufReader};
@@ -304,23 +304,29 @@ pub struct Anthropic {
     client: HttpClient,
     auth: Arc<Mutex<super::ResolvedAuth>>,
     system_prefix: Option<String>,
+    stream_timeout: Duration,
 }
 
 impl Anthropic {
-    pub fn new() -> Result<Self, AgentError> {
+    pub fn new(timeouts: super::Timeouts) -> Result<Self, AgentError> {
         let resolved = resolve_auth()?;
         Ok(Self {
-            client: super::http_client(),
+            client: super::http_client(timeouts.connect),
             auth: Arc::new(Mutex::new(resolved)),
             system_prefix: None,
+            stream_timeout: timeouts.stream,
         })
     }
 
-    pub(crate) fn with_auth(auth: Arc<Mutex<super::ResolvedAuth>>) -> Self {
+    pub(crate) fn with_auth(
+        auth: Arc<Mutex<super::ResolvedAuth>>,
+        timeouts: super::Timeouts,
+    ) -> Self {
         Self {
-            client: super::http_client(),
+            client: super::http_client(timeouts.connect),
             auth,
             system_prefix: None,
+            stream_timeout: timeouts.stream,
         }
     }
 
@@ -356,7 +362,7 @@ impl Anthropic {
         let status = response.status().as_u16();
 
         if status == 200 {
-            parse_sse(response, event_tx).await
+            parse_sse(response, event_tx, self.stream_timeout).await
         } else {
             Err(AgentError::from_response(response).await)
         }
@@ -531,6 +537,7 @@ fn build_wire_tools(tools: &Value) -> Value {
 async fn parse_sse(
     response: isahc::Response<isahc::AsyncBody>,
     event_tx: &Sender<ProviderEvent>,
+    stream_timeout: Duration,
 ) -> Result<StreamResponse, AgentError> {
     let reader = BufReader::new(response.into_body());
     let mut lines = reader.lines();
@@ -541,9 +548,9 @@ async fn parse_sse(
     let mut current_block_idx: usize = 0;
     let mut usage = TokenUsage::default();
     let mut stop_reason: Option<StopReason> = None;
-    let mut deadline = Instant::now() + super::SSE_TIMEOUT;
+    let mut deadline = Instant::now() + stream_timeout;
 
-    while let Some(line) = super::next_sse_line(&mut lines, &mut deadline).await? {
+    while let Some(line) = super::next_sse_line(&mut lines, &mut deadline, stream_timeout).await? {
         if let Some(event_type) = line.strip_prefix("event: ") {
             current_event = event_type.to_string();
             continue;
@@ -696,6 +703,8 @@ async fn parse_sse(
 mod tests {
     use super::*;
 
+    const TEST_STREAM_TIMEOUT: Duration = Duration::from_secs(300);
+
     fn mock_response(data: &'static [u8]) -> isahc::Response<isahc::AsyncBody> {
         let body = isahc::AsyncBody::from_bytes_static(data);
         isahc::Response::builder().status(200).body(body).unwrap()
@@ -727,7 +736,9 @@ event: message_stop\n\
 data: {\"type\":\"message_stop\"}\n";
 
             let (tx, rx) = flume::unbounded();
-            let resp = parse_sse(mock_response(sse_data), &tx).await.unwrap();
+            let resp = parse_sse(mock_response(sse_data), &tx, TEST_STREAM_TIMEOUT)
+                .await
+                .unwrap();
 
             assert_eq!(
                 resp.usage,
@@ -776,7 +787,7 @@ event: message_delta\n\
 data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
 
             let (tx, rx) = flume::unbounded();
-            let resp = parse_sse(mock_response(sse_data.as_bytes()), &tx)
+            let resp = parse_sse(mock_response(sse_data.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
                 .await
                 .unwrap();
 
@@ -850,7 +861,9 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
         smol::block_on(async {
             let input = b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n";
             let (tx, _rx) = flume::unbounded();
-            let err = parse_sse(mock_response(input), &tx).await.unwrap_err();
+            let err = parse_sse(mock_response(input), &tx, TEST_STREAM_TIMEOUT)
+                .await
+                .unwrap_err();
             match err {
                 AgentError::Api { status, message } => {
                     assert_eq!(status, 529);
@@ -866,7 +879,9 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
         smol::block_on(async {
             let input = b"event: error\ndata: not-json\n";
             let (tx, _rx) = flume::unbounded();
-            let err = parse_sse(mock_response(input), &tx).await.unwrap_err();
+            let err = parse_sse(mock_response(input), &tx, TEST_STREAM_TIMEOUT)
+                .await
+                .unwrap_err();
             match err {
                 AgentError::Api { status, message } => {
                     assert_eq!(status, 400);
@@ -897,7 +912,7 @@ event: message_delta\n\
 data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":1}}\n";
 
             let (tx, _rx) = flume::unbounded();
-            let resp = parse_sse(mock_response(sse_data.as_bytes()), &tx)
+            let resp = parse_sse(mock_response(sse_data.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
                 .await
                 .unwrap();
 
@@ -943,7 +958,9 @@ event: message_delta\n\
 data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n";
 
             let (tx, rx) = flume::unbounded();
-            let resp = parse_sse(mock_response(sse_data), &tx).await.unwrap();
+            let resp = parse_sse(mock_response(sse_data), &tx, TEST_STREAM_TIMEOUT)
+                .await
+                .unwrap();
 
             assert!(
                 matches!(&resp.message.content[0], ContentBlock::Thinking { thinking, signature }
@@ -990,7 +1007,9 @@ event: message_delta\n\
 data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n";
 
             let (tx, _rx) = flume::unbounded();
-            let resp = parse_sse(mock_response(sse_data), &tx).await.unwrap();
+            let resp = parse_sse(mock_response(sse_data), &tx, TEST_STREAM_TIMEOUT)
+                .await
+                .unwrap();
 
             assert!(
                 matches!(&resp.message.content[0], ContentBlock::RedactedThinking { data } if data == "opaque_data")

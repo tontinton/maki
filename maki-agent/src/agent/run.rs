@@ -40,6 +40,7 @@ pub struct AgentParams {
     pub config: AgentConfig,
     pub permissions: Arc<PermissionManager>,
     pub session_id: Option<String>,
+    pub timeouts: maki_providers::Timeouts,
 }
 
 pub struct AgentRunParams {
@@ -73,6 +74,7 @@ pub struct Agent {
     permissions: Arc<PermissionManager>,
     thinking: ThinkingConfig,
     session_id: Option<String>,
+    timeouts: maki_providers::Timeouts,
 }
 
 impl Agent {
@@ -83,6 +85,7 @@ impl Agent {
             skills: params.skills,
             config: params.config,
             permissions: params.permissions,
+            timeouts: params.timeouts,
             history: run.history,
             system: run.system,
             event_tx: run.event_tx,
@@ -325,6 +328,7 @@ impl Agent {
             deadline: Deadline::None,
             config: self.config.clone(),
             permissions: Arc::clone(&self.permissions),
+            timeouts: self.timeouts,
         }
     }
 
@@ -491,6 +495,7 @@ mod tests {
                     std::path::PathBuf::from("/tmp"),
                 )),
                 session_id: None,
+                timeouts: maki_providers::Timeouts::default(),
             },
             AgentRunParams {
                 history,
@@ -743,6 +748,7 @@ mod tests {
                         std::path::PathBuf::from("/tmp"),
                     )),
                     session_id: None,
+                    timeouts: maki_providers::Timeouts::default(),
                 },
                 AgentRunParams {
                     history: History::new(Vec::new()),

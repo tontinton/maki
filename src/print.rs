@@ -123,6 +123,7 @@ impl VerboseOutput {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     model: &Model,
     prompt_arg: Option<String>,
@@ -131,6 +132,7 @@ pub fn run(
     skills: Vec<Skill>,
     config: AgentConfig,
     permissions_config: PermissionsConfig,
+    timeouts: maki_providers::Timeouts,
 ) -> Result<()> {
     let prompt = match prompt_arg {
         Some(p) => p,
@@ -184,16 +186,17 @@ pub fn run(
     let session_id_clone = session_id.clone();
     let agent_task = smol::spawn(async move {
         let event_tx = EventSender::new(raw_tx, 0);
-        let provider: Arc<dyn Provider> = match provider::from_model_async(&model_clone).await {
-            Ok(p) => Arc::from(p),
-            Err(e) => {
-                error!(error = %e, "provider error");
-                let _ = event_tx.send(AgentEvent::Error {
-                    message: e.user_message(),
-                });
-                return;
-            }
-        };
+        let provider: Arc<dyn Provider> =
+            match provider::from_model_async(&model_clone, timeouts).await {
+                Ok(p) => Arc::from(p),
+                Err(e) => {
+                    error!(error = %e, "provider error");
+                    let _ = event_tx.send(AgentEvent::Error {
+                        message: e.user_message(),
+                    });
+                    return;
+                }
+            };
         let skills: Arc<[Skill]> = Arc::from(skills);
         let error_tx = event_tx.clone();
         let agent = Agent::new(
@@ -207,6 +210,7 @@ pub fn run(
                     cwd_path.clone(),
                 )),
                 session_id: Some(session_id_clone),
+                timeouts,
             },
             AgentRunParams {
                 history: History::new(Vec::new()),

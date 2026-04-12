@@ -326,7 +326,7 @@ pub fn auth_providers() -> Vec<(&'static str, &'static str)> {
         .collect()
 }
 
-pub fn create(slug: &str) -> Result<Box<dyn Provider>, AgentError> {
+pub fn create(slug: &str, timeouts: super::Timeouts) -> Result<Box<dyn Provider>, AgentError> {
     let meta = find_meta(slug).ok_or_else(|| AgentError::Config {
         message: format!("unknown dynamic provider '{slug}'"),
     })?;
@@ -335,11 +335,13 @@ pub fn create(slug: &str) -> Result<Box<dyn Provider>, AgentError> {
 
     let inner: Box<dyn Provider> = match meta.base {
         ProviderKind::Anthropic => Box::new(
-            Anthropic::with_auth(auth.clone()).with_system_prefix(meta.system_prefix.clone()),
+            Anthropic::with_auth(auth.clone(), timeouts)
+                .with_system_prefix(meta.system_prefix.clone()),
         ),
-        ProviderKind::OpenAi => {
-            Box::new(OpenAi::with_auth(auth.clone()).with_system_prefix(meta.system_prefix.clone()))
-        }
+        ProviderKind::OpenAi => Box::new(
+            OpenAi::with_auth(auth.clone(), timeouts)
+                .with_system_prefix(meta.system_prefix.clone()),
+        ),
         other => {
             return Err(AgentError::Config {
                 message: format!(

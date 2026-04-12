@@ -141,7 +141,7 @@ pub struct Zai {
 }
 
 impl Zai {
-    pub fn new(plan: ZaiPlan) -> Result<Self, AgentError> {
+    pub fn new(plan: ZaiPlan, timeouts: super::Timeouts) -> Result<Self, AgentError> {
         let config = match plan {
             ZaiPlan::Standard => &CONFIG_STANDARD,
             ZaiPlan::Coding => &CONFIG_CODING,
@@ -150,7 +150,7 @@ impl Zai {
             message: format!("{} not set", config.api_key_env),
         })?;
         Ok(Self {
-            compat: OpenAiCompatProvider::new(config),
+            compat: OpenAiCompatProvider::new(config, timeouts),
             auth: ResolvedAuth::bearer(&api_key),
         })
     }

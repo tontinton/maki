@@ -293,6 +293,10 @@ fn run() -> Result<()> {
             maki_providers::tier_map::load_from_storage(&storage);
             let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
             let mut config = load_config(&cwd, cli.no_rtk);
+            let timeouts = maki_providers::Timeouts {
+                connect: config.provider.connect_timeout,
+                stream: config.provider.stream_timeout,
+            };
             if cli.yolo || config.always_yolo {
                 config.permissions.allow_all = true;
             }
@@ -318,6 +322,7 @@ fn run() -> Result<()> {
                     skills,
                     config.agent,
                     config.permissions,
+                    timeouts,
                 )
                 .context("run print mode")?;
             } else {
@@ -347,6 +352,7 @@ fn run() -> Result<()> {
                         config.permissions,
                         cwd.clone(),
                     )),
+                    timeouts,
                     #[cfg(feature = "demo")]
                     demo: cli.demo,
                 })

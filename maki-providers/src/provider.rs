@@ -7,6 +7,7 @@ use strum::{Display, EnumIter, EnumString, IntoEnumIterator};
 use tracing::{debug, warn};
 
 use crate::model::{Model, ModelFamily, models_for_provider};
+use crate::providers::Timeouts;
 use crate::providers::anthropic::Anthropic;
 use crate::providers::dynamic;
 use crate::providers::mistral::Mistral;
@@ -97,20 +98,20 @@ impl ProviderKind {
         matches!(self, Self::Ollama)
     }
 
-    pub fn create(self) -> Result<Box<dyn Provider>, AgentError> {
+    pub fn create(self, timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
         match self {
-            Self::Anthropic => Ok(Box::new(Anthropic::new()?)),
-            Self::OpenAi => Ok(Box::new(OpenAi::new()?)),
-            Self::Ollama => Ok(Box::new(Ollama::new()?)),
-            Self::Mistral => Ok(Box::new(Mistral::new()?)),
-            Self::Zai => Ok(Box::new(Zai::new(ZaiPlan::Standard)?)),
-            Self::ZaiCodingPlan => Ok(Box::new(Zai::new(ZaiPlan::Coding)?)),
-            Self::Synthetic => Ok(Box::new(Synthetic::new()?)),
+            Self::Anthropic => Ok(Box::new(Anthropic::new(timeouts)?)),
+            Self::OpenAi => Ok(Box::new(OpenAi::new(timeouts)?)),
+            Self::Ollama => Ok(Box::new(Ollama::new(timeouts)?)),
+            Self::Mistral => Ok(Box::new(Mistral::new(timeouts)?)),
+            Self::Zai => Ok(Box::new(Zai::new(ZaiPlan::Standard, timeouts)?)),
+            Self::ZaiCodingPlan => Ok(Box::new(Zai::new(ZaiPlan::Coding, timeouts)?)),
+            Self::Synthetic => Ok(Box::new(Synthetic::new(timeouts)?)),
         }
     }
 
     pub fn is_available(self) -> bool {
-        self.create().is_ok()
+        self.create(Timeouts::default()).is_ok()
     }
 }
 
@@ -140,26 +141,29 @@ pub trait Provider: Send + Sync {
     }
 }
 
-pub fn from_model(model: &Model) -> Result<Box<dyn Provider>, AgentError> {
+pub fn from_model(model: &Model, timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
     if let Some(slug) = &model.dynamic_slug {
-        let provider = dynamic::create(slug)?;
+        let provider = dynamic::create(slug, timeouts)?;
         debug!(slug, model = %model.id, "dynamic provider created");
         return Ok(provider);
     }
-    let provider = model.provider.create()?;
+    let provider = model.provider.create(timeouts)?;
     debug!(provider = %model.provider, model = %model.id, "provider created");
     Ok(provider)
 }
 
-pub async fn from_model_async(model: &Model) -> Result<Box<dyn Provider>, AgentError> {
+pub async fn from_model_async(
+    model: &Model,
+    timeouts: Timeouts,
+) -> Result<Box<dyn Provider>, AgentError> {
     let slug = model.dynamic_slug.clone();
     let kind = model.provider;
     let id = model.id.clone();
     let provider = smol::unblock(move || {
         if let Some(slug) = &slug {
-            dynamic::create(slug)
+            dynamic::create(slug, timeouts)
         } else {
-            kind.create()
+            kind.create(timeouts)
         }
     })
     .await?;
@@ -174,9 +178,10 @@ pub struct ModelBatch {
 
 pub async fn fetch_all_models(mut on_ready: impl FnMut(ModelBatch)) {
     let (tx, rx) = flume::unbounded();
+    let timeouts = Timeouts::default();
 
     for kind in ProviderKind::iter() {
-        let Ok(provider) = smol::unblock(move || kind.create()).await else {
+        let Ok(provider) = smol::unblock(move || kind.create(timeouts)).await else {
             warn!(provider = %kind, "failed to create provider, skipping");
             continue;
         };

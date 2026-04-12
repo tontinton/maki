@@ -251,6 +251,7 @@ pub struct ToolContext {
     pub deadline: Deadline,
     pub config: AgentConfig,
     pub permissions: Arc<PermissionManager>,
+    pub timeouts: maki_providers::Timeouts,
 }
 
 pub(crate) fn resolve_path(path: &str) -> Result<String, String> {
@@ -792,6 +793,7 @@ pub(crate) fn interpreter_ctx(
         deadline: Deadline::None,
         config: AgentConfig::default(),
         permissions,
+        timeouts: maki_providers::Timeouts::default(),
     }
 }
 

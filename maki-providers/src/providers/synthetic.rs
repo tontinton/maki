@@ -69,12 +69,12 @@ pub struct Synthetic {
 }
 
 impl Synthetic {
-    pub fn new() -> Result<Self, AgentError> {
+    pub fn new(timeouts: super::Timeouts) -> Result<Self, AgentError> {
         let api_key = std::env::var(CONFIG.api_key_env).map_err(|_| AgentError::Config {
             message: format!("{} not set", CONFIG.api_key_env),
         })?;
         Ok(Self {
-            compat: OpenAiCompatProvider::new(&CONFIG),
+            compat: OpenAiCompatProvider::new(&CONFIG, timeouts),
             auth: ResolvedAuth::bearer(&api_key),
         })
     }

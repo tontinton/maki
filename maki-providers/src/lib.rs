@@ -11,6 +11,7 @@ pub use model::{
     Model, ModelEntry, ModelError, ModelFamily, ModelPricing, ModelTier, TokenUsage,
     models_for_provider,
 };
+pub use providers::Timeouts;
 pub use providers::dynamic;
 pub use providers::openai::auth as openai_auth;
 pub use types::{

@@ -16,10 +16,23 @@ pub(crate) mod openai_compat;
 pub(crate) mod synthetic;
 pub(crate) mod zai;
 
-pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-pub(crate) const SSE_TIMEOUT: Duration = Duration::from_secs(120);
 const LOW_SPEED_BYTES_PER_SEC: u32 = 1;
 const LOW_SPEED_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Clone, Copy)]
+pub struct Timeouts {
+    pub connect: Duration,
+    pub stream: Duration,
+}
+
+impl Default for Timeouts {
+    fn default() -> Self {
+        Self {
+            connect: Duration::from_secs(10),
+            stream: Duration::from_secs(300),
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct ResolvedAuth {
@@ -84,12 +97,10 @@ impl SseErrorPayload {
     }
 }
 
-/// Read the next SSE line, resetting the deadline on every received line.
-/// Any received line (including pings, blank separators) proves the connection
-/// is alive. Dead connections are caught by the HTTP-layer LOW_SPEED_TIMEOUT.
 pub(crate) async fn next_sse_line<R: AsyncBufRead + Unpin>(
     lines: &mut futures_lite::io::Lines<R>,
     deadline: &mut Instant,
+    stream_timeout: Duration,
 ) -> Result<Option<String>, AgentError> {
     let remaining = deadline.saturating_duration_since(Instant::now());
     let result = futures_lite::future::or(
@@ -97,20 +108,20 @@ pub(crate) async fn next_sse_line<R: AsyncBufRead + Unpin>(
         async {
             smol::Timer::after(remaining).await;
             Err(AgentError::Timeout {
-                secs: SSE_TIMEOUT.as_secs(),
+                secs: stream_timeout.as_secs(),
             })
         },
     )
     .await;
     if let Ok(Some(_)) = &result {
-        *deadline = Instant::now() + SSE_TIMEOUT;
+        *deadline = Instant::now() + stream_timeout;
     }
     result
 }
 
-pub(crate) fn http_client() -> isahc::HttpClient {
+pub(crate) fn http_client(connect_timeout: Duration) -> isahc::HttpClient {
     isahc::HttpClient::builder()
-        .connect_timeout(CONNECT_TIMEOUT)
+        .connect_timeout(connect_timeout)
         .low_speed_timeout(LOW_SPEED_BYTES_PER_SEC, LOW_SPEED_TIMEOUT)
         .build()
         .expect("failed to build HTTP client")
@@ -157,7 +168,10 @@ mod tests {
         smol::block_on(async {
             let mut lines = NeverReader.lines();
             let mut past = Instant::now() - Duration::from_secs(1);
-            let err = next_sse_line(&mut lines, &mut past).await.unwrap_err();
+            let stream_timeout = Duration::from_secs(300);
+            let err = next_sse_line(&mut lines, &mut past, stream_timeout)
+                .await
+                .unwrap_err();
             assert!(matches!(err, AgentError::Timeout { .. }));
         })
     }

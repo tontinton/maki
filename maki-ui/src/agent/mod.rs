@@ -48,12 +48,14 @@ pub(crate) struct AgentHandles {
     pub(crate) tool_outputs: Arc<Mutex<HashMap<String, ToolOutput>>>,
     pub(crate) mcp_handle: Option<McpHandle>,
     pub(crate) queue: QueueSender,
+    pub(crate) timeouts: maki_providers::Timeouts,
     task: smol::Task<()>,
 }
 
 impl AgentHandles {
     /// MCP is started once up front. The handle lives across agent respawns, only the agent
     /// loop task gets replaced.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn spawn(
         model_slot: &Arc<ArcSwap<ModelSlot>>,
         initial_history: Vec<Message>,
@@ -62,6 +64,7 @@ impl AgentHandles {
         permissions: &Arc<PermissionManager>,
         cwd: PathBuf,
         session_id: Option<String>,
+        timeouts: maki_providers::Timeouts,
     ) -> Self {
         let mcp_handle = smol::block_on(mcp::start(&cwd));
         spawn_agent_internal(
@@ -72,6 +75,7 @@ impl AgentHandles {
             permissions,
             mcp_handle,
             session_id,
+            timeouts,
         )
     }
 
@@ -121,6 +125,7 @@ impl AgentHandles {
             permissions,
             self.mcp_handle.clone(),
             Some(app.state.session.id.clone()),
+            self.timeouts,
         );
         let old = mem::replace(self, new);
         // Repoint the app at the new queue before dropping `old`, otherwise the app keeps
@@ -177,6 +182,7 @@ async fn shutdown_mcp(handle: &McpHandle) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_agent_internal(
     model_slot: &Arc<ArcSwap<ModelSlot>>,
     initial_history: Vec<Message>,
@@ -185,6 +191,7 @@ fn spawn_agent_internal(
     permissions: &Arc<PermissionManager>,
     mcp_handle: Option<McpHandle>,
     session_id: Option<String>,
+    timeouts: maki_providers::Timeouts,
 ) -> AgentHandles {
     let (agent_tx, agent_rx) = flume::unbounded::<Envelope>();
     let (cmd_tx, cmd_rx) = flume::unbounded::<AgentCommand>();
@@ -214,6 +221,7 @@ fn spawn_agent_internal(
         cancel_map,
         init_cancel,
         session_id,
+        timeouts,
     );
 
     let task = smol::spawn(agent_loop.run());
@@ -226,6 +234,7 @@ fn spawn_agent_internal(
         tool_outputs: shared_tool_outputs,
         mcp_handle,
         queue: queue_tx,
+        timeouts,
         task,
     }
 }

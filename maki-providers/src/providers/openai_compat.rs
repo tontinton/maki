@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use flume::Sender;
 use futures_lite::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
@@ -25,18 +25,24 @@ pub(crate) struct OpenAiCompatConfig {
 pub(crate) struct OpenAiCompatProvider {
     client: HttpClient,
     config: &'static OpenAiCompatConfig,
+    stream_timeout: Duration,
 }
 
 impl OpenAiCompatProvider {
-    pub fn new(config: &'static OpenAiCompatConfig) -> Self {
+    pub fn new(config: &'static OpenAiCompatConfig, timeouts: super::Timeouts) -> Self {
         Self {
-            client: super::http_client(),
+            client: super::http_client(timeouts.connect),
             config,
+            stream_timeout: timeouts.stream,
         }
     }
 
     pub(crate) fn client(&self) -> &HttpClient {
         &self.client
+    }
+
+    pub(crate) fn stream_timeout(&self) -> Duration {
+        self.stream_timeout
     }
 
     pub fn build_body(
@@ -108,7 +114,12 @@ impl OpenAiCompatProvider {
         let status = response.status().as_u16();
 
         if status == 200 {
-            parse_sse(BufReader::new(response.into_body()), event_tx).await
+            parse_sse(
+                BufReader::new(response.into_body()),
+                event_tx,
+                self.stream_timeout,
+            )
+            .await
         } else {
             Err(AgentError::from_response(response).await)
         }
@@ -321,6 +332,7 @@ struct ToolAccumulator {
 pub async fn parse_sse(
     reader: impl AsyncBufRead + Unpin,
     event_tx: &Sender<ProviderEvent>,
+    stream_timeout: Duration,
 ) -> Result<StreamResponse, AgentError> {
     let mut lines = reader.lines();
 
@@ -330,9 +342,9 @@ pub async fn parse_sse(
     let mut usage = TokenUsage::default();
     let mut stop_reason: Option<StopReason> = None;
     let mut is_first_content = true;
-    let mut deadline = Instant::now() + super::SSE_TIMEOUT;
+    let mut deadline = Instant::now() + stream_timeout;
 
-    while let Some(line) = super::next_sse_line(&mut lines, &mut deadline).await? {
+    while let Some(line) = super::next_sse_line(&mut lines, &mut deadline, stream_timeout).await? {
         let data = match line.strip_prefix("data: ") {
             Some(d) => d.trim(),
             None => continue,
@@ -515,6 +527,8 @@ mod tests {
     use super::*;
     use futures_lite::io::Cursor;
 
+    const TEST_STREAM_TIMEOUT: Duration = Duration::from_secs(300);
+
     #[test]
     fn parse_sse_text_and_usage() {
         smol::block_on(async {
@@ -528,7 +542,9 @@ data: {\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}],\"usage\":{\"prom
 data: [DONE]\n";
 
             let (tx, rx) = flume::unbounded();
-            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx).await.unwrap();
+            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+                .await
+                .unwrap();
 
             assert_eq!(resp.usage.input, 60);
             assert_eq!(resp.usage.output, 10);
@@ -564,7 +580,9 @@ data: {\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}],\"usage\":{\"prom
 data: [DONE]\n";
 
             let (tx, rx) = flume::unbounded();
-            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx).await.unwrap();
+            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+                .await
+                .unwrap();
 
             assert!(
                 matches!(&resp.message.content[0], ContentBlock::Thinking { thinking, .. } if thinking == "Let me think...")
@@ -669,7 +687,9 @@ data: {\"choices\":[{\"finish_reason\":\"tool_calls\",\"delta\":{}}],\"usage\":{
 data: [DONE]\n";
 
             let (tx, rx) = flume::unbounded();
-            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx).await.unwrap();
+            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+                .await
+                .unwrap();
 
             let tools: Vec<_> = resp.message.tool_uses().collect();
             assert_eq!(tools.len(), 2);
@@ -702,7 +722,7 @@ data: [DONE]\n";
 data: {\"error\":{\"message\":\"Server overloaded\",\"type\":\"overloaded_error\"}}\n";
 
             let (tx, _rx) = flume::unbounded();
-            let err = parse_sse(Cursor::new(sse.as_bytes()), &tx)
+            let err = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
                 .await
                 .unwrap_err();
 
@@ -727,7 +747,9 @@ data: {\"choices\":[{\"finish_reason\":\"tool_calls\",\"delta\":{}}],\"usage\":{
 data: [DONE]\n";
 
             let (tx, _rx) = flume::unbounded();
-            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx).await.unwrap();
+            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+                .await
+                .unwrap();
 
             let tools: Vec<_> = resp.message.tool_uses().collect();
             assert_eq!(tools.len(), 1);
@@ -749,7 +771,9 @@ data: {\"choices\":[{\"finish_reason\":\"tool_calls\",\"delta\":{}}],\"usage\":{
 data: [DONE]\n";
 
             let (tx, _rx) = flume::unbounded();
-            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx).await.unwrap();
+            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+                .await
+                .unwrap();
 
             let tools: Vec<_> = resp.message.tool_uses().collect();
             assert_eq!(tools.len(), 1);
@@ -791,7 +815,9 @@ data: [DONE]\n";
         smol::block_on(async {
             let sse = "data: [DONE]\n";
             let (tx, _rx) = flume::unbounded();
-            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx).await.unwrap();
+            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+                .await
+                .unwrap();
             assert!(resp.message.content.is_empty());
             assert_eq!(resp.usage, TokenUsage::default());
             assert_eq!(resp.stop_reason, None);
@@ -812,7 +838,9 @@ data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\
 data: [DONE]\n";
 
             let (tx, rx) = flume::unbounded();
-            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx).await.unwrap();
+            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+                .await
+                .unwrap();
 
             assert!(
                 matches!(&resp.message.content[0], ContentBlock::Thinking { thinking, .. } if thinking == "Let me think..."),

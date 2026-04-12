@@ -70,7 +70,7 @@ impl Task {
                     ctx.model.dynamic_slug.as_deref(),
                 )
                 .map_err(|e| e.to_string())?;
-                let resolved_provider = provider::from_model_async(&resolved_model)
+                let resolved_provider = provider::from_model_async(&resolved_model, ctx.timeouts)
                     .await
                     .map_err(|e| e.to_string())?;
                 (resolved_model, Arc::from(resolved_provider))
@@ -151,6 +151,7 @@ impl Task {
                 config: ctx.config.clone(),
                 permissions: Arc::clone(&ctx.permissions),
                 session_id: Some(session_id),
+                timeouts: ctx.timeouts,
             },
             AgentRunParams {
                 history: crate::History::new(Vec::new()),

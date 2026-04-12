@@ -36,10 +36,10 @@ pub struct OpenAi {
 }
 
 impl OpenAi {
-    pub fn new() -> Result<Self, AgentError> {
+    pub fn new(timeouts: crate::providers::Timeouts) -> Result<Self, AgentError> {
         let storage = DataDir::resolve()?;
         let resolved = auth::resolve(&storage)?;
-        let compat = OpenAiCompatProvider::new(&CONFIG);
+        let compat = OpenAiCompatProvider::new(&CONFIG, timeouts);
         Ok(Self {
             compat,
             auth: Arc::new(Mutex::new(resolved)),
@@ -48,9 +48,12 @@ impl OpenAi {
         })
     }
 
-    pub(crate) fn with_auth(auth: Arc<Mutex<ResolvedAuth>>) -> Self {
+    pub(crate) fn with_auth(
+        auth: Arc<Mutex<ResolvedAuth>>,
+        timeouts: crate::providers::Timeouts,
+    ) -> Self {
         Self {
-            compat: OpenAiCompatProvider::new(&CONFIG),
+            compat: OpenAiCompatProvider::new(&CONFIG, timeouts),
             auth,
             storage: None,
             system_prefix: None,
@@ -153,6 +156,7 @@ impl Provider for OpenAi {
 
             if is_codex_model(&model.id) {
                 let body = super::responses::build_body(model, messages, system, tools);
+                let stream_timeout = self.compat.stream_timeout();
                 return self
                     .with_oauth_retry(|| async {
                         let codex_auth = self.codex_auth()?;
@@ -162,6 +166,7 @@ impl Provider for OpenAi {
                             &body,
                             event_tx,
                             &codex_auth,
+                            stream_timeout,
                         )
                         .await
                     })

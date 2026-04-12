@@ -12,6 +12,7 @@ use maki_agent::permissions::PermissionManager;
 use maki_agent::skill::Skill;
 use maki_agent::{AgentConfig, CancelToken, McpCommand};
 use maki_config::UiConfig;
+use maki_providers::Timeouts;
 use maki_providers::provider::{Provider, fetch_all_models, from_model};
 use maki_providers::{Message, Model};
 use maki_storage::DataDir;
@@ -43,6 +44,7 @@ pub struct EventLoopParams {
     pub ui_config: UiConfig,
     pub input_history_size: usize,
     pub permissions: Arc<PermissionManager>,
+    pub timeouts: Timeouts,
     #[cfg(feature = "demo")]
     pub demo: bool,
 }
@@ -59,6 +61,7 @@ pub(crate) struct EventLoop<'t> {
     shell_rx: flume::Receiver<ShellEvent>,
     warn_rx: flume::Receiver<String>,
     storage_writer: Arc<StorageWriter>,
+    timeouts: Timeouts,
     _model_fetch_task: smol::Task<()>,
 }
 
@@ -150,6 +153,7 @@ impl<'t> EventLoop<'t> {
             ui_config,
             input_history_size,
             permissions,
+            timeouts,
             #[cfg(feature = "demo")]
             demo,
         } = params;
@@ -165,7 +169,8 @@ impl<'t> EventLoop<'t> {
         let initial_history = session.messages.clone();
         let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
 
-        let provider: Arc<dyn Provider> = Arc::from(from_model(&model).context("create provider")?);
+        let provider: Arc<dyn Provider> =
+            Arc::from(from_model(&model, timeouts).context("create provider")?);
         let skills: Arc<[Skill]> = Arc::from(skills);
         let model_slot = Arc::new(ArcSwap::from_pointee(ModelSlot {
             model: model.clone(),
@@ -179,6 +184,7 @@ impl<'t> EventLoop<'t> {
             &permissions,
             cwd,
             Some(session.id.clone()),
+            timeouts,
         );
 
         let custom_commands: Arc<[CustomCommand]> = Arc::from(commands);
@@ -218,6 +224,7 @@ impl<'t> EventLoop<'t> {
             shell_rx,
             warn_rx: bg.warn_rx,
             storage_writer,
+            timeouts,
             _model_fetch_task: bg.task,
         })
     }
@@ -374,7 +381,7 @@ impl<'t> EventLoop<'t> {
                 let loaded = *loaded;
                 if loaded.model_spec != self.model_slot.load().model.spec()
                     && let Ok(new_model) = Model::from_spec(&loaded.model_spec)
-                    && let Ok(new_provider) = from_model(&new_model)
+                    && let Ok(new_provider) = from_model(&new_model, self.timeouts)
                 {
                     self.model_slot.store(Arc::new(ModelSlot {
                         model: new_model,
@@ -437,7 +444,7 @@ impl<'t> EventLoop<'t> {
 
     fn change_model(&mut self, spec: String) {
         match Model::from_spec(&spec) {
-            Ok(new_model) => match from_model(&new_model) {
+            Ok(new_model) => match from_model(&new_model, self.timeouts) {
                 Ok(new_provider) => {
                     self.app.update_model(&new_model);
                     self.model_slot.store(Arc::new(ModelSlot {

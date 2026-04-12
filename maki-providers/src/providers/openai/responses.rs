@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use flume::Sender;
 use futures_lite::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
@@ -142,6 +142,7 @@ pub(crate) async fn do_stream(
     body: &Value,
     event_tx: &Sender<ProviderEvent>,
     auth: &ResolvedAuth,
+    stream_timeout: Duration,
 ) -> Result<StreamResponse, AgentError> {
     let base = auth.base_url.as_deref().ok_or_else(|| AgentError::Config {
         message: "Responses API requires a base_url in auth".into(),
@@ -167,7 +168,12 @@ pub(crate) async fn do_stream(
     let status = response.status().as_u16();
 
     if status == 200 {
-        parse_sse(BufReader::new(response.into_body()), event_tx).await
+        parse_sse(
+            BufReader::new(response.into_body()),
+            event_tx,
+            stream_timeout,
+        )
+        .await
     } else {
         Err(AgentError::from_response(response).await)
     }
@@ -183,6 +189,7 @@ struct ToolAccumulator {
 pub(crate) async fn parse_sse(
     reader: impl AsyncBufRead + Unpin,
     event_tx: &Sender<ProviderEvent>,
+    stream_timeout: Duration,
 ) -> Result<StreamResponse, AgentError> {
     let mut lines = reader.lines();
 
@@ -191,10 +198,12 @@ pub(crate) async fn parse_sse(
     let mut usage = TokenUsage::default();
     let mut stop_reason: Option<StopReason> = None;
     let mut is_first_content = true;
-    let mut deadline = Instant::now() + crate::providers::SSE_TIMEOUT;
+    let mut deadline = Instant::now() + stream_timeout;
     let mut current_event = String::new();
 
-    while let Some(line) = crate::providers::next_sse_line(&mut lines, &mut deadline).await? {
+    while let Some(line) =
+        crate::providers::next_sse_line(&mut lines, &mut deadline, stream_timeout).await?
+    {
         if let Some(event_type) = line.strip_prefix("event: ") {
             current_event = event_type.trim().to_string();
             continue;
@@ -406,9 +415,11 @@ mod tests {
     use futures_lite::io::Cursor;
     use serde_json::json;
 
+    const TEST_STREAM_TIMEOUT: Duration = Duration::from_secs(300);
+
     async fn run_sse(sse: &str) -> (Result<StreamResponse, AgentError>, Vec<ProviderEvent>) {
         let (tx, rx) = flume::unbounded();
-        let result = parse_sse(Cursor::new(sse.as_bytes()), &tx).await;
+        let result = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT).await;
         (result, rx.drain().collect())
     }
 
