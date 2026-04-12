@@ -286,6 +286,7 @@ enum ThinkingDeltaBlock {
 
 #[derive(Deserialize)]
 struct ChunkChoice {
+    #[serde(alias = "message")]
     delta: Option<ChunkDelta>,
     finish_reason: Option<String>,
 }
