@@ -1,5 +1,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
 use crate::app::shell::parse_shell_prefix;
 use crate::highlight;
 use crate::text_buffer::{EditResult, TextBuffer, is_newline_key};
@@ -152,7 +154,7 @@ impl InputBox {
             self.buffer
                 .lines()
                 .iter()
-                .map(|line| visual_line_count(line.chars().count(), ew) as u16),
+                .map(|line| visual_line_count(line.width(), ew) as u16),
         )
     }
 
@@ -258,13 +260,19 @@ impl InputBox {
             .lines()
             .iter()
             .take(self.buffer.y())
-            .map(|line| visual_line_count(line.chars().count(), ew) as u16)
+            .map(|line| visual_line_count(line.width(), ew) as u16)
             .sum();
 
         let wrap_row = if ew == 0 {
             0
         } else {
-            (self.buffer.x() / ew) as u16
+            let line = &self.buffer.lines()[self.buffer.y()];
+            let cursor_col: usize = line
+                .chars()
+                .take(self.buffer.x())
+                .map(|c| c.width().unwrap_or(1))
+                .sum();
+            (cursor_col / ew) as u16
         };
 
         lines_above + wrap_row
@@ -423,18 +431,31 @@ fn wrap_line(
     shell_spans: Option<&[Span<'static>]>,
 ) -> Vec<Line<'static>> {
     let chars: Vec<char> = line.chars().collect();
-    let chunk_size = ew.max(1);
-    let total_chars = if is_cursor_line {
-        chars.len() + 1
-    } else {
-        chars.len().max(1)
-    };
-    let num_rows = total_chars.div_ceil(chunk_size).max(1);
+    let widths: Vec<usize> = chars.iter().map(|c| c.width().unwrap_or(1)).collect();
+    let row_width = ew.max(1);
 
-    (0..num_rows)
-        .map(|row| {
-            let start = row * chunk_size;
-            let end = (start + chunk_size).min(chars.len());
+    let mut row_ranges: Vec<(usize, usize)> = Vec::new();
+    let mut row_start = 0;
+    let mut row_col = 0;
+    for (i, &w) in widths.iter().enumerate() {
+        if row_col + w > row_width && row_col > 0 {
+            row_ranges.push((row_start, i));
+            row_start = i;
+            row_col = 0;
+        }
+        row_col += w;
+    }
+    if row_start < chars.len() || row_ranges.is_empty() {
+        row_ranges.push((row_start, chars.len()));
+    }
+    if is_cursor_line && row_col + 1 > row_width {
+        row_ranges.push((chars.len(), chars.len()));
+    }
+
+    row_ranges
+        .into_iter()
+        .enumerate()
+        .map(|(row, (start, end))| {
             let prefix = if row == 0 && is_first_line {
                 CHEVRON
             } else if row == 0 {
@@ -445,13 +466,13 @@ fn wrap_line(
             let mut spans = vec![Span::styled(prefix.to_owned(), prefix_style)];
 
             let chunk_spans = if let Some(styled) = &shell_spans {
-                slice_styled_spans(styled, start, end.min(chars.len()))
+                slice_styled_spans(styled, start, end)
             } else {
                 let chunk_text: String = chars[start..end].iter().collect();
                 vec![Span::raw(chunk_text)]
             };
 
-            if is_cursor_line && cursor_x >= start && cursor_x < start + chunk_size {
+            if is_cursor_line && cursor_x >= start && cursor_x <= end {
                 let local_cursor = cursor_x.saturating_sub(start);
                 spans.extend(overlay_cursor(chunk_spans, local_cursor));
             } else {
@@ -545,7 +566,7 @@ fn total_visual_lines(buffer: &TextBuffer, ew: usize, cursor_visible: bool) -> u
         .iter()
         .enumerate()
         .map(|(i, line)| {
-            let mut text_len = line.chars().count();
+            let mut text_len = line.width();
             if cursor_visible && i == cursor_y {
                 text_len += 1;
             }
