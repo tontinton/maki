@@ -49,9 +49,16 @@ use ratatui::text::{Line, Span};
 
 pub(crate) fn hint_line(pairs: &[(&str, &str)]) -> Line<'static> {
     let t = crate::theme::current();
-    let mut spans = Vec::with_capacity(pairs.len() * 2);
+    let mut spans = Vec::with_capacity(pairs.len() * 3);
     for (key, desc) in pairs {
-        spans.push(Span::styled(format!("  {key}"), t.keybind_key));
+        spans.push(Span::raw("  "));
+        let parts: Vec<&str> = key.split('/').collect();
+        for (i, part) in parts.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::raw("/"));
+            }
+            spans.push(Span::styled((*part).to_string(), t.keybind_key));
+        }
         spans.push(Span::styled(format!(" {desc}"), t.form_hint));
     }
     Line::from(spans)

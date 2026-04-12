@@ -31,7 +31,7 @@ use crate::components::list_picker::{ListPicker, PickerAction};
 use crate::components::mcp_picker::{McpPicker, McpPickerAction};
 use crate::components::memory_modal::{MemoryEntry, MemoryModal, MemoryModalAction};
 use crate::components::model_picker::{ModelPicker, ModelPickerAction};
-use crate::components::permission_prompt::{PermissionAction, PermissionPrompt};
+use crate::components::permission_prompt::PermissionPrompt;
 use crate::components::plan_form::{PlanForm, PlanFormAction};
 use crate::components::question_form::{QuestionForm, QuestionFormAction};
 use crate::components::rewind_picker::{RewindPicker, RewindPickerAction};
@@ -49,7 +49,7 @@ use arc_swap::{ArcSwap, ArcSwapOption};
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 #[cfg(feature = "demo")]
 use maki_agent::QuestionInfo;
-use maki_agent::permissions::{PermissionDecision, PermissionManager};
+use maki_agent::permissions::PermissionManager;
 use maki_agent::{
     AgentEvent, Envelope, ImageSource, McpPromptInfo, McpSnapshotReader, SubagentInfo, ToolOutput,
 };
@@ -400,23 +400,14 @@ impl App {
         }
 
         if self.permission_prompt.is_open() {
-            if let Some(action) = self.permission_prompt.handle_key(key) {
+            if let Some(answer) = self.permission_prompt.handle_key(key) {
                 let subagent_id = self.permission_prompt.subagent_id().map(str::to_owned);
-                let decision = match action {
-                    PermissionAction::AllowOnce => PermissionDecision::AllowOnce,
-                    PermissionAction::AllowSession => PermissionDecision::AllowSession,
-                    PermissionAction::AllowAlwaysLocal => PermissionDecision::AllowAlwaysLocal,
-                    PermissionAction::AllowAlwaysGlobal => PermissionDecision::AllowAlwaysGlobal,
-                    PermissionAction::Deny => PermissionDecision::DenyOnce,
-                    PermissionAction::DenyAlwaysLocal => PermissionDecision::DenyAlwaysLocal,
-                    PermissionAction::DenyAlwaysGlobal => PermissionDecision::DenyAlwaysGlobal,
-                };
-                let answer = decision.to_answer_str().to_string();
+                let encoded = answer.encode();
                 self.permission_prompt.close();
                 if let Some(tx) = subagent_id.and_then(|id| self.subagent_answers.get(&id)) {
-                    let _ = tx.try_send(answer);
+                    let _ = tx.try_send(encoded);
                 } else {
-                    self.send_answer(answer);
+                    self.send_answer(encoded);
                 }
             }
             return vec![];
@@ -1259,6 +1250,9 @@ impl App {
 
     fn route_text_paste(&mut self, text: &str) {
         if self.plan_form.is_visible() {
+            return;
+        }
+        if self.permission_prompt.handle_paste(text) {
             return;
         }
         if self.question_form.handle_paste(text) {

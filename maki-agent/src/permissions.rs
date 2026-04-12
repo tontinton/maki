@@ -54,12 +54,21 @@ pub enum PermissionCheck {
 }
 
 #[derive(Debug, Error)]
-#[error(
-    "Permission denied for `{tool}` ({scope}). Do not retry. Try a different approach or ask the user for guidance."
-)]
 pub struct PermissionError {
     tool: String,
     scope: String,
+    guidance: Option<String>,
+}
+
+impl std::fmt::Display for PermissionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Permission denied for `{}` ({}).", self.tool, self.scope)?;
+        if let Some(g) = &self.guidance {
+            write!(f, " User guidance: {}", g)
+        } else {
+            write!(f, " {}", DEFAULT_DENY_GUIDANCE)
+        }
+    }
 }
 
 impl PermissionError {
@@ -67,50 +76,79 @@ impl PermissionError {
         Self {
             tool: tool.to_string(),
             scope: scope.to_string(),
+            guidance: None,
+        }
+    }
+
+    fn with_guidance(tool: &str, scope: &str, guidance: String) -> Self {
+        Self {
+            tool: tool.to_string(),
+            scope: scope.to_string(),
+            guidance: Some(guidance),
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PermissionDecision {
+pub const DEFAULT_DENY_GUIDANCE: &str =
+    "Do not retry. Try a different approach or ask the user for guidance.";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PermissionAnswer {
     AllowOnce,
     AllowSession,
     AllowAlwaysLocal,
     AllowAlwaysGlobal,
-    DenyOnce,
+    Deny,
+    DenyWithGuidance(String),
     DenyAlwaysLocal,
     DenyAlwaysGlobal,
 }
 
-impl PermissionDecision {
-    pub fn is_allow(self) -> bool {
+impl PermissionAnswer {
+    pub fn is_allow(&self) -> bool {
         matches!(
             self,
             Self::AllowOnce | Self::AllowSession | Self::AllowAlwaysLocal | Self::AllowAlwaysGlobal
         )
     }
 
-    pub fn to_answer_str(self) -> &'static str {
+    pub fn encode(&self) -> String {
         match self {
-            Self::AllowOnce => "allow",
-            Self::AllowSession => "allow_session",
-            Self::AllowAlwaysLocal => "allow_always_local",
-            Self::AllowAlwaysGlobal => "allow_always_global",
-            Self::DenyOnce => "deny",
-            Self::DenyAlwaysLocal => "deny_always_local",
-            Self::DenyAlwaysGlobal => "deny_always_global",
+            Self::AllowOnce => "allow".to_string(),
+            Self::AllowSession => "allow_session".to_string(),
+            Self::AllowAlwaysLocal => "allow_always_local".to_string(),
+            Self::AllowAlwaysGlobal => "allow_always_global".to_string(),
+            Self::Deny => "deny".to_string(),
+            Self::DenyWithGuidance(g) => format!("deny:{g}"),
+            Self::DenyAlwaysLocal => "deny_always_local".to_string(),
+            Self::DenyAlwaysGlobal => "deny_always_global".to_string(),
         }
     }
 
-    pub fn from_answer_str(s: &str) -> Option<Self> {
+    pub fn decode(s: &str) -> Option<Self> {
         match s {
             "allow" => Some(Self::AllowOnce),
             "allow_session" => Some(Self::AllowSession),
             "allow_always_local" => Some(Self::AllowAlwaysLocal),
             "allow_always_global" => Some(Self::AllowAlwaysGlobal),
-            "deny" => Some(Self::DenyOnce),
+            "deny" => Some(Self::Deny),
             "deny_always_local" => Some(Self::DenyAlwaysLocal),
             "deny_always_global" => Some(Self::DenyAlwaysGlobal),
+            _ if s.starts_with("deny:") => {
+                let guidance = s.strip_prefix("deny:").unwrap();
+                if guidance.is_empty() {
+                    Some(Self::Deny)
+                } else {
+                    Some(Self::DenyWithGuidance(guidance.to_string()))
+                }
+            }
+            _ => None,
+        }
+    }
+
+    pub fn guidance(&self) -> Option<&str> {
+        match self {
+            Self::DenyWithGuidance(g) => Some(g),
             _ => None,
         }
     }
@@ -233,16 +271,18 @@ impl PermissionManager {
         *self.session_rules() = rules;
     }
 
-    pub fn apply_decision(&self, tool: &str, scopes: &[String], decision: PermissionDecision) {
-        let resolved = if decision.is_allow() {
+    pub fn apply_decision(&self, tool: &str, scopes: &[String], answer: &PermissionAnswer) {
+        let resolved = if answer.is_allow() {
             generalized_scopes(tool, scopes)
         } else {
             scopes.to_vec()
         };
 
-        match decision {
-            PermissionDecision::AllowOnce | PermissionDecision::DenyOnce => {}
-            PermissionDecision::AllowSession => {
+        match answer {
+            PermissionAnswer::AllowOnce
+            | PermissionAnswer::Deny
+            | PermissionAnswer::DenyWithGuidance(_) => {}
+            PermissionAnswer::AllowSession => {
                 for s in &resolved {
                     self.add_session_rule(PermissionRule {
                         tool: tool.to_string(),
@@ -251,17 +291,17 @@ impl PermissionManager {
                     });
                 }
             }
-            PermissionDecision::AllowAlwaysLocal
-            | PermissionDecision::AllowAlwaysGlobal
-            | PermissionDecision::DenyAlwaysLocal
-            | PermissionDecision::DenyAlwaysGlobal => {
-                let effect = if decision.is_allow() {
+            PermissionAnswer::AllowAlwaysLocal
+            | PermissionAnswer::AllowAlwaysGlobal
+            | PermissionAnswer::DenyAlwaysLocal
+            | PermissionAnswer::DenyAlwaysGlobal => {
+                let effect = if answer.is_allow() {
                     Effect::Allow
                 } else {
                     Effect::Deny
                 };
-                let target = match decision {
-                    PermissionDecision::AllowAlwaysLocal | PermissionDecision::DenyAlwaysLocal => {
+                let target = match answer {
+                    PermissionAnswer::AllowAlwaysLocal | PermissionAnswer::DenyAlwaysLocal => {
                         PermissionTarget::Project(self.cwd.clone())
                     }
                     _ => PermissionTarget::Global,
@@ -332,11 +372,17 @@ impl PermissionManager {
                             }
                             Err(_) => return Err(PermissionError::new(tool, scope)),
                         };
-                        match PermissionDecision::from_answer_str(&answer) {
-                            Some(d) => {
-                                self.apply_decision(&t2, &s2, d);
-                                if d.is_allow() {
+                        match PermissionAnswer::decode(&answer) {
+                            Some(a) => {
+                                self.apply_decision(&t2, &s2, &a);
+                                if a.is_allow() {
                                     Ok(())
+                                } else if let Some(guidance) = a.guidance() {
+                                    Err(PermissionError::with_guidance(
+                                        tool,
+                                        scope,
+                                        guidance.to_string(),
+                                    ))
                                 } else {
                                     Err(PermissionError::new(tool, scope))
                                 }
@@ -747,7 +793,7 @@ mod tests {
         mgr.apply_decision(
             "bash",
             &["cd /tmp".into(), "cargo test --all".into()],
-            PermissionDecision::AllowAlwaysLocal,
+            &PermissionAnswer::AllowAlwaysLocal,
         );
         assert!(matches!(
             mgr.check("bash", "cd /other && cargo build"),
@@ -761,7 +807,7 @@ mod tests {
         mgr.apply_decision(
             "bash",
             &["cd /tmp".into(), "cargo test".into()],
-            PermissionDecision::DenyAlwaysLocal,
+            &PermissionAnswer::DenyAlwaysLocal,
         );
         assert!(matches!(
             mgr.check("bash", "cd /tmp"),
@@ -898,15 +944,15 @@ mod tests {
 
     #[test]
     fn allow_decisions_use_generalized_scope() {
-        for decision in [
-            PermissionDecision::AllowSession,
-            PermissionDecision::AllowAlwaysLocal,
+        for answer in [
+            PermissionAnswer::AllowSession,
+            PermissionAnswer::AllowAlwaysLocal,
         ] {
             let mgr = PermissionManager::new(PermissionsConfig::default(), PathBuf::from("/tmp"));
-            mgr.apply_decision("bash", &["cargo test --all".into()], decision);
+            mgr.apply_decision("bash", &["cargo test --all".into()], &answer);
             assert!(
                 matches!(mgr.check("bash", "cargo build"), PermissionCheck::Allowed),
-                "{decision:?} should generalize scope"
+                "{answer:?} should generalize scope"
             );
         }
     }
@@ -932,28 +978,28 @@ mod tests {
     }
 
     #[test]
-    fn permission_decision_roundtrip() {
-        let decisions = [
-            PermissionDecision::AllowOnce,
-            PermissionDecision::AllowSession,
-            PermissionDecision::AllowAlwaysLocal,
-            PermissionDecision::AllowAlwaysGlobal,
-            PermissionDecision::DenyOnce,
-            PermissionDecision::DenyAlwaysLocal,
-            PermissionDecision::DenyAlwaysGlobal,
+    fn permission_answer_roundtrip() {
+        let answers = [
+            PermissionAnswer::AllowOnce,
+            PermissionAnswer::AllowSession,
+            PermissionAnswer::AllowAlwaysLocal,
+            PermissionAnswer::AllowAlwaysGlobal,
+            PermissionAnswer::Deny,
+            PermissionAnswer::DenyAlwaysLocal,
+            PermissionAnswer::DenyAlwaysGlobal,
         ];
-        for d in decisions {
-            let s = d.to_answer_str();
-            let parsed = PermissionDecision::from_answer_str(s).unwrap();
-            assert_eq!(parsed, d);
+        for a in answers {
+            let s = a.encode();
+            let parsed = PermissionAnswer::decode(&s).unwrap();
+            assert_eq!(parsed, a);
         }
     }
 
     #[test]
     fn once_decisions_do_not_add_rules() {
         let mgr = PermissionManager::new(PermissionsConfig::default(), PathBuf::from("/tmp"));
-        for decision in [PermissionDecision::AllowOnce, PermissionDecision::DenyOnce] {
-            mgr.apply_decision("bash", &["cargo test".into()], decision);
+        for answer in [PermissionAnswer::AllowOnce, PermissionAnswer::Deny] {
+            mgr.apply_decision("bash", &["cargo test".into()], &answer);
             assert!(matches!(
                 mgr.check("bash", "cargo test"),
                 PermissionCheck::NeedsPrompt { .. }
@@ -969,5 +1015,36 @@ mod tests {
         assert!(pm.is_yolo());
         assert!(!pm.toggle_yolo());
         assert!(!pm.is_yolo());
+    }
+
+    #[test]
+    fn permission_error_without_guidance() {
+        let err = PermissionError::new("bash", "rm -rf /");
+        let msg = err.to_string();
+        assert!(msg.contains(DEFAULT_DENY_GUIDANCE));
+        assert!(!msg.contains("User guidance"));
+    }
+
+    #[test]
+    fn permission_error_with_guidance() {
+        let guidance = "Use cat instead";
+        let err = PermissionError::with_guidance("bash", "rm -rf /", guidance.into());
+        let msg = err.to_string();
+        assert!(msg.contains(&format!("User guidance: {}", guidance)));
+        assert!(!msg.contains(DEFAULT_DENY_GUIDANCE));
+    }
+
+    #[test_case("deny" => Some(PermissionAnswer::Deny) ; "plain_deny")]
+    #[test_case("deny:" => Some(PermissionAnswer::Deny) ; "deny_colon_empty")]
+    #[test_case("deny:Use cat" => Some(PermissionAnswer::DenyWithGuidance("Use cat".into())) ; "deny_with_guidance")]
+    fn decode_deny_variants(input: &str) -> Option<PermissionAnswer> {
+        PermissionAnswer::decode(input)
+    }
+
+    #[test]
+    fn deny_with_guidance_roundtrip() {
+        let answer = PermissionAnswer::DenyWithGuidance("Use cat".into());
+        let encoded = answer.encode();
+        assert_eq!(PermissionAnswer::decode(&encoded), Some(answer));
     }
 }
