@@ -299,13 +299,29 @@ pub async fn start_with_config(config: McpConfig) -> Option<McpHandle> {
         return None;
     }
 
-    // Publish placeholder entries first so the UI shows every server as Connecting, Disabled
-    // or Failed while transports are still being brought up in the background.
-    let mut inner = parse_entries(config);
+    let inner = parse_entries(config);
     let snapshot = Arc::new(ArcSwap::from_pointee(McpSnapshot::default()));
     let index: Arc<ArcSwap<ToolIndex>> = Arc::new(ArcSwap::from_pointee(ToolIndex::default()));
+
     publish(&inner, &index, &snapshot);
 
+    let (cmd_tx, cmd_rx) = flume::unbounded();
+    let handle = McpHandle {
+        cmd_tx,
+        index: Arc::clone(&index),
+        snapshot: Arc::clone(&snapshot),
+    };
+
+    smol::spawn(run_with_init(inner, index, snapshot, cmd_rx)).detach();
+    Some(handle)
+}
+
+async fn run_with_init(
+    mut inner: McpManagerInner,
+    index: Arc<ArcSwap<ToolIndex>>,
+    snapshot: Arc<ArcSwap<McpSnapshot>>,
+    cmd_rx: flume::Receiver<McpCommand>,
+) {
     start_enabled(&mut inner).await;
     inner.generation += 1;
     publish(&inner, &index, &snapshot);
@@ -320,14 +336,7 @@ pub async fn start_with_config(config: McpConfig) -> Option<McpHandle> {
         "MCP servers initialized"
     );
 
-    let (cmd_tx, cmd_rx) = flume::unbounded();
-    let handle = McpHandle {
-        cmd_tx,
-        index: Arc::clone(&index),
-        snapshot: Arc::clone(&snapshot),
-    };
-    smol::spawn(run(inner, index, snapshot, cmd_rx)).detach();
-    Some(handle)
+    run(inner, index, snapshot, cmd_rx).await;
 }
 
 async fn run(
@@ -861,12 +870,14 @@ mod tests {
                 ("bad-srv", stdio_raw(&[])),
             ]);
             let handle = start_with_config(config).await.unwrap();
-            let mut infos = handle.reader().load().infos.clone();
-            infos.sort_by(|a, b| a.name.cmp(&b.name));
+            let infos = handle.reader().load().infos.clone();
 
-            assert!(matches!(infos[0].status, McpServerStatus::Failed(_)));
-            assert_eq!(infos[0].tool_count, 0);
-            assert_eq!(infos[1].status, McpServerStatus::Disabled);
+            let bad = infos.iter().find(|i| i.name == "bad-srv").unwrap();
+            assert!(matches!(bad.status, McpServerStatus::Failed(_)));
+            assert_eq!(bad.tool_count, 0);
+
+            let disabled = infos.iter().find(|i| i.name == "disabled-srv").unwrap();
+            assert_eq!(disabled.status, McpServerStatus::Disabled);
         });
     }
 
