@@ -36,6 +36,7 @@ dirs = { workspace = true }
 strum = { workspace = true }
 notify = { workspace = true }
 tempfile = { workspace = true }
+shell-words = { workspace = true }
 
 [features]
 demo = []

@@ -1,3 +1,4 @@
+use shell_words::split;
 use std::io::stdout;
 use std::path::Path;
 
@@ -82,9 +83,16 @@ pub(crate) fn open_in_editor(
         .or_else(|_| std::env::var("EDITOR"))
         .map_err(|_| "Set $VISUAL or $EDITOR to open files".to_string())?;
 
+    let args = split(&editor).map_err(|e| format!("Failed to parse $VISUAL or $EDITOR: {e}"))?;
+
+    if args.is_empty() {
+        return Err("Empty $VISUAL or $EDITOR".to_string());
+    }
+
     suspend();
 
-    let result = std::process::Command::new(&editor)
+    let result = std::process::Command::new(&args[0])
+        .args(&args[1..])
         .arg(path)
         .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::inherit())
