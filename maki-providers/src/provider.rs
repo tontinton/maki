@@ -46,7 +46,7 @@ impl ProviderKind {
         match self {
             Self::Anthropic => "ANTHROPIC_API_KEY",
             Self::OpenAi => "OPENAI_API_KEY",
-            Self::Ollama => "",
+            Self::Ollama => "OLLAMA_API_KEY",
             Self::Mistral => "MISTRAL_API_KEY",
             Self::Zai | Self::ZaiCodingPlan => "ZHIPU_API_KEY",
             Self::Synthetic => "SYNTHETIC_API_KEY",
@@ -74,7 +74,7 @@ impl ProviderKind {
             Self::Anthropic => {
                 Some("Prompt caching, thinking mode (adaptive/budgeted), advanced tool use")
             }
-            Self::Ollama => Some("Local inference, no API key required, any model via ollama pull"),
+            Self::Ollama => Some("Local inference via OLLAMA_HOST, or cloud via OLLAMA_API_KEY"),
             Self::Synthetic => {
                 Some("Reasoning effort support (low/medium/high), open-weight models")
             }

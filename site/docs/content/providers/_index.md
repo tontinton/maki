@@ -46,9 +46,9 @@ Defaults: gpt-5.4-nano (weak), gpt-4.1 (medium), gpt-5.4 (strong)
 
 ### Ollama
 
-- **Env var**: `OLLAMA_HOST` (required, e.g. `http://localhost:11434`)
+- **Env var**: `OLLAMA_API_KEY` for cloud, or `OLLAMA_HOST` for local (e.g. `http://localhost:11434`)
 - **API**: `http://localhost:11434/v1`
-- **Features**: Local inference, no API key required, any model via ollama pull
+- **Features**: Local inference via OLLAMA_HOST, or cloud via OLLAMA_API_KEY
 
 Maki asks your local Ollama for the list of installed models, so there's no built-in catalog. Tiers are guessed from list order: the first model becomes strong, the second medium, and the rest weak. If that guess is wrong, open `/model` and press `1`, `2`, or `3` on any row to reassign it. Your choices are saved to `~/.maki/model-tiers`.
 
