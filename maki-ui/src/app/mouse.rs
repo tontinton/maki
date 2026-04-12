@@ -1,6 +1,8 @@
 use std::time::{Duration, Instant};
 
 use crate::selection::{self, ContentRegion, EdgeScroll, SelectableZone, Selection, SelectionZone};
+#[cfg(target_os = "linux")]
+use arboard::{LinuxClipboardKind, SetExtLinux};
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
@@ -166,10 +168,24 @@ impl App {
 
         if !text.is_empty() {
             match &mut self.clipboard {
-                Some(cb) => match cb.set_text(&text) {
-                    Ok(()) => self.status_bar.flash("Copied selection".into()),
-                    Err(e) => self.status_bar.flash(format!("Copy failed: {e}")),
-                },
+                Some(cb) => {
+                    #[cfg(target_os = "linux")]
+                    let result = cb
+                        .set()
+                        .clipboard(LinuxClipboardKind::Primary)
+                        .text(&text)
+                        .and_then(|()| {
+                            cb.set().clipboard(LinuxClipboardKind::Clipboard).text(text)
+                        });
+
+                    #[cfg(not(target_os = "linux"))]
+                    let result = cb.set_text(&text);
+
+                    match result {
+                        Ok(()) => self.status_bar.flash("Copied selection".into()),
+                        Err(e) => self.status_bar.flash(format!("Copy failed: {e}")),
+                    }
+                }
                 None => self.status_bar.flash("Copy failed: no clipboard".into()),
             }
         }
