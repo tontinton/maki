@@ -10,7 +10,7 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 
 use crate::provider::ProviderKind;
-use crate::providers::{anthropic, dynamic, mistral, ollama, openai, synthetic, zai};
+use crate::providers::{anthropic, dynamic, google, mistral, ollama, openai, synthetic, zai};
 
 const PER_MILLION: f64 = 1_000_000.0;
 
@@ -49,6 +49,7 @@ impl ModelPricing {
 pub enum ModelFamily {
     Claude,
     Generic,
+    Gemini,
     Glm,
     Gpt,
     Synthetic,
@@ -111,6 +112,7 @@ pub fn models_for_provider(provider: ProviderKind) -> &'static [ModelEntry] {
         ProviderKind::OpenAi => openai::models(),
         ProviderKind::Ollama => ollama::models(),
         ProviderKind::Mistral => mistral::models(),
+        ProviderKind::Google => google::models(),
         ProviderKind::Zai | ProviderKind::ZaiCodingPlan => zai::models(),
         ProviderKind::Synthetic => synthetic::models(),
     }
@@ -120,7 +122,7 @@ impl ModelFamily {
     pub fn supports_tool_examples(self) -> bool {
         match self {
             ModelFamily::Claude | ModelFamily::Gpt | ModelFamily::Synthetic => true,
-            ModelFamily::Generic | ModelFamily::Glm => false,
+            ModelFamily::Generic | ModelFamily::Gemini | ModelFamily::Glm => false,
         }
     }
 }

@@ -17,6 +17,7 @@ use crate::{AgentError, Message, ProviderEvent, StreamResponse, ThinkingConfig};
 
 use super::ResolvedAuth;
 use super::anthropic::Anthropic;
+use super::google::Google;
 use super::openai::OpenAi;
 
 const INFO_TIMEOUT: Duration = Duration::from_secs(5);
@@ -342,6 +343,7 @@ pub fn create(slug: &str, timeouts: super::Timeouts) -> Result<Box<dyn Provider>
             OpenAi::with_auth(auth.clone(), timeouts)
                 .with_system_prefix(meta.system_prefix.clone()),
         ),
+        ProviderKind::Google => Box::new(Google::with_auth(auth.clone(), timeouts)),
         other => {
             return Err(AgentError::Config {
                 message: format!(

@@ -7,6 +7,7 @@ use strum::{Display, EnumIter, EnumString, IntoEnumIterator};
 use tracing::{debug, warn};
 
 use crate::model::{Model, ModelFamily, models_for_provider};
+use crate::providers::google::Google;
 use crate::providers::Timeouts;
 use crate::providers::anthropic::Anthropic;
 use crate::providers::dynamic;
@@ -23,6 +24,7 @@ pub enum ProviderKind {
     Anthropic,
     #[strum(serialize = "openai")]
     OpenAi,
+    Google,
     Ollama,
     Mistral,
     Zai,
@@ -35,6 +37,7 @@ impl ProviderKind {
         match self {
             Self::Anthropic => "Anthropic",
             Self::OpenAi => "OpenAI",
+            Self::Google => "Google",
             Self::Ollama => "Ollama",
             Self::Mistral => "Mistral",
             Self::Zai => "Z.AI",
@@ -47,6 +50,7 @@ impl ProviderKind {
         match self {
             Self::Anthropic => "ANTHROPIC_API_KEY",
             Self::OpenAi => "OPENAI_API_KEY",
+            Self::Google => "GEMINI_API_KEY",
             Self::Ollama => "OLLAMA_API_KEY",
             Self::Mistral => "MISTRAL_API_KEY",
             Self::Zai | Self::ZaiCodingPlan => "ZHIPU_API_KEY",
@@ -58,6 +62,7 @@ impl ProviderKind {
         match self {
             Self::Anthropic => "https://api.anthropic.com/v1/messages",
             Self::OpenAi => "https://api.openai.com/v1",
+            Self::Google => "https://generativelanguage.googleapis.com/v1beta",
             Self::Ollama => "http://localhost:11434/v1",
             Self::Mistral => "https://api.mistral.ai/v1",
             Self::Zai => "https://api.z.ai/api/paas/v4",
@@ -67,7 +72,7 @@ impl ProviderKind {
     }
 
     pub const fn supports_thinking(self) -> bool {
-        matches!(self, Self::Anthropic | Self::Mistral | Self::Synthetic)
+        matches!(self, Self::Anthropic | Self::Google | Self::Mistral | Self::Synthetic)
     }
 
     pub const fn features(self) -> Option<&'static str> {
@@ -75,6 +80,7 @@ impl ProviderKind {
             Self::Anthropic => {
                 Some("Prompt caching, thinking mode (adaptive/budgeted), advanced tool use")
             }
+            Self::Google => Some("Native Gemini API with thinking support"),
             Self::Ollama => Some("Local inference via OLLAMA_HOST, or cloud via OLLAMA_API_KEY"),
             Self::Synthetic => {
                 Some("Reasoning effort support (low/medium/high), open-weight models")
@@ -87,6 +93,7 @@ impl ProviderKind {
         match self {
             Self::Anthropic => ModelFamily::Claude,
             Self::OpenAi => ModelFamily::Gpt,
+            Self::Google => ModelFamily::Gemini,
             Self::Ollama => ModelFamily::Generic,
             Self::Mistral => ModelFamily::Generic,
             Self::Zai | Self::ZaiCodingPlan => ModelFamily::Glm,
@@ -95,13 +102,14 @@ impl ProviderKind {
     }
 
     pub const fn accepts_arbitrary_models(self) -> bool {
-        matches!(self, Self::Ollama)
+        matches!(self, Self::Ollama | Self::Google)
     }
 
     pub fn create(self, timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
         match self {
             Self::Anthropic => Ok(Box::new(Anthropic::new(timeouts)?)),
             Self::OpenAi => Ok(Box::new(OpenAi::new(timeouts)?)),
+            Self::Google => Ok(Box::new(Google::new(timeouts)?)),
             Self::Ollama => Ok(Box::new(Ollama::new(timeouts)?)),
             Self::Mistral => Ok(Box::new(Mistral::new(timeouts)?)),
             Self::Zai => Ok(Box::new(Zai::new(ZaiPlan::Standard, timeouts)?)),

@@ -10,6 +10,7 @@ use maki_storage::sessions::{StoredThinking, TitleSource};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use strum::{Display, IntoStaticStr};
+use tracing::warn;
 
 use crate::TokenUsage;
 
@@ -219,6 +220,18 @@ impl StopReason {
             "stop" => Self::EndTurn,
             "tool_calls" => Self::ToolUse,
             "length" => Self::MaxTokens,
+            _ => Self::EndTurn,
+        }
+    }
+
+    pub fn from_google(s: &str) -> Self {
+        match s {
+            "STOP" => Self::EndTurn,
+            "MAX_TOKENS" => Self::MaxTokens,
+            "SAFETY" | "RECITATION" => {
+                warn!("Gemini stop reason: {s}, treating as end_turn");
+                Self::EndTurn
+            }
             _ => Self::EndTurn,
         }
     }
