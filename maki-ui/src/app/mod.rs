@@ -41,7 +41,9 @@ use crate::components::status_bar::StatusBar;
 use crate::components::theme_picker::{ThemePicker, ThemePickerAction};
 use crate::components::todo_panel::TodoPanel;
 use crate::components::tool_display::format_turn_usage;
-use crate::components::{Action, DisplayMessage, DisplayRole, Overlay, RetryInfo, Status, is_ctrl};
+use crate::components::{
+    Action, DisplayMessage, DisplayRole, ExitRequest, Overlay, RetryInfo, Status, is_ctrl,
+};
 use crate::image;
 use crate::selection::{SelectionState, SelectionZone, ZoneRegistry};
 use arboard::Clipboard;
@@ -117,7 +119,8 @@ pub struct App {
     pub(super) status_bar: StatusBar,
     pub status: Status,
     pub(crate) state: session_state::SessionState,
-    pub should_quit: bool,
+    pub exit_request: ExitRequest,
+    pub(crate) exit_on_done: bool,
     pub(crate) queue: MessageQueue,
     pub answer_tx: Option<flume::Sender<String>>,
     pub(crate) cmd_tx: Option<flume::Sender<super::AgentCommand>>,
@@ -181,7 +184,8 @@ impl App {
             status_bar: StatusBar::new(ui_config.flash_duration()),
             status: Status::Idle,
             state,
-            should_quit: false,
+            exit_request: ExitRequest::None,
+            exit_on_done: false,
             queue: MessageQueue::default(),
             answer_tx: None,
             cmd_tx: None,
@@ -696,11 +700,11 @@ impl App {
     fn quit(&mut self) -> Vec<Action> {
         self.save_session();
         self.save_input_history();
-        self.should_quit = true;
+        self.exit_request = ExitRequest::Success;
         vec![Action::Quit]
     }
 
-    fn handle_submit(&mut self, sub: Submission) -> Vec<Action> {
+    pub(crate) fn handle_submit(&mut self, sub: Submission) -> Vec<Action> {
         if self.pending_input == PendingInput::AuthRetry {
             self.pending_input = PendingInput::None;
             self.send_answer(String::new());
@@ -891,6 +895,9 @@ impl App {
                     if self.state.mode == Mode::Plan && self.state.plan.is_written() {
                         self.plan_form.open();
                     }
+                    if self.exit_on_done {
+                        self.exit_request = ExitRequest::Success;
+                    }
                 }
                 ChatEventResult::Error(message) => {
                     self.status = Status::error(message.clone());
@@ -901,6 +908,9 @@ impl App {
                     self.finish_subagents(DisplayRole::Error, ERROR_TEXT);
                     for chat in &mut self.chats {
                         chat.fail_in_progress_with_message(message.clone());
+                    }
+                    if self.exit_on_done {
+                        self.exit_request = ExitRequest::Error;
                     }
                 }
                 ChatEventResult::QuestionPrompt { questions } => {

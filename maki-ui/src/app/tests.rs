@@ -3,7 +3,7 @@ use crate::agent::shared_queue;
 use crate::chat::{CANCELLED_TEXT, DONE_TEXT, ERROR_TEXT};
 use crate::components::command::ParsedCommand;
 use crate::components::keybindings::{KeybindContext, key as kb};
-use crate::components::{key, test_model};
+use crate::components::{ExitRequest, key, test_model};
 use crate::selection::{EdgeScroll, SelectableZone, SelectionZone};
 use arc_swap::ArcSwap;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
@@ -158,7 +158,7 @@ fn ctrl_c_clears_nonempty_input(setup: fn(&mut App)) {
     setup(&mut app);
     let actions = app.update(Msg::Key(kb::QUIT.to_key_event()));
     assert!(actions.is_empty());
-    assert!(!app.should_quit);
+    assert_eq!(app.exit_request, ExitRequest::None);
     assert!(app.input_box.is_empty());
 }
 
@@ -168,19 +168,19 @@ fn ctrl_c_quits_when_input_empty(status: Status) {
     let mut app = test_app();
     app.status = status;
     let actions = app.update(Msg::Key(kb::QUIT.to_key_event()));
-    assert!(app.should_quit);
+    assert_eq!(app.exit_request, ExitRequest::Success);
     assert!(matches!(&actions[0], Action::Quit));
 }
 
-#[test]
-fn error_event_sets_status() {
+#[test_case(AgentEvent::Done { usage: TokenUsage::default(), num_turns: 1, stop_reason: None }, ExitRequest::Success ; "done_exits_success")]
+#[test_case(AgentEvent::Error { message: "boom".into() }, ExitRequest::Error ; "error_exits_error")]
+fn exit_on_done_flag_triggers_exit(event: AgentEvent, expected: ExitRequest) {
     let mut app = test_app();
+    app.exit_on_done = true;
     app.status = Status::Streaming;
     app.run_id = 1;
-    app.update(agent_msg(AgentEvent::Error {
-        message: "boom".into(),
-    }));
-    assert!(matches!(app.status, Status::Error { ref message, .. } if message == "boom"));
+    app.update(agent_msg(event));
+    assert_eq!(app.exit_request, expected);
 }
 
 #[test]
@@ -1391,7 +1391,7 @@ fn submit_exit_quits(input: &str) {
         text: input.into(),
         images: vec![],
     });
-    assert!(app.should_quit);
+    assert_eq!(app.exit_request, ExitRequest::Success);
     assert!(matches!(&actions[0], Action::Quit));
 }
 
@@ -1956,7 +1956,7 @@ fn ctrl_c_closes_overlay_instead_of_quitting() {
     assert!(app.help_modal.is_open());
 
     let actions = app.update(Msg::Key(kb::QUIT.to_key_event()));
-    assert!(!app.should_quit);
+    assert_eq!(app.exit_request, ExitRequest::None);
     assert!(!app.help_modal.is_open());
     assert!(actions.is_empty());
 }
@@ -2060,7 +2060,7 @@ fn ctrl_c_denies_permission_prompt() {
     assert!(app.permission_prompt.is_open());
 
     let actions = app.update(Msg::Key(kb::QUIT.to_key_event()));
-    assert!(!app.should_quit);
+    assert_eq!(app.exit_request, ExitRequest::None);
     assert!(!app.permission_prompt.is_open());
     assert!(actions.is_empty());
 }

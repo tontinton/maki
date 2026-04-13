@@ -24,7 +24,8 @@ use crate::app::shell::{ShellEvent, spawn_shell};
 use crate::app::{App, Msg};
 #[cfg(feature = "demo")]
 use crate::components;
-use crate::components::{Action, Status};
+use crate::components::input::Submission;
+use crate::components::{Action, ExitRequest, Status};
 
 #[cfg(feature = "demo")]
 use crate::mock;
@@ -45,6 +46,7 @@ pub struct EventLoopParams {
     pub input_history_size: usize,
     pub permissions: Arc<PermissionManager>,
     pub timeouts: Timeouts,
+    pub exit_on_done: bool,
     #[cfg(feature = "demo")]
     pub demo: bool,
 }
@@ -154,6 +156,7 @@ impl<'t> EventLoop<'t> {
             input_history_size,
             permissions,
             timeouts,
+            exit_on_done,
             #[cfg(feature = "demo")]
             demo,
         } = params;
@@ -200,6 +203,7 @@ impl<'t> EventLoop<'t> {
             Arc::clone(&permissions),
             custom_commands,
         );
+        app.exit_on_done = exit_on_done;
 
         #[cfg(feature = "demo")]
         if demo {
@@ -229,13 +233,21 @@ impl<'t> EventLoop<'t> {
         })
     }
 
-    pub(crate) fn run(mut self) -> Result<Option<String>> {
+    pub(crate) fn run(mut self, initial_prompt: Option<String>) -> Result<(Option<String>, i32)> {
+        if let Some(prompt) = initial_prompt {
+            let sub = Submission {
+                text: prompt,
+                images: Vec::new(),
+            };
+            let actions = self.app.handle_submit(sub);
+            self.dispatch(actions);
+        }
         loop {
             self.tick();
             self.terminal.draw(|f| self.app.view(f))?;
             let had_agent_msg = self.drain_channels();
 
-            if self.app.should_quit {
+            if self.app.exit_request != ExitRequest::None {
                 return Ok(self.shutdown());
             }
 
@@ -465,7 +477,8 @@ impl<'t> EventLoop<'t> {
         }
     }
 
-    fn shutdown(mut self) -> Option<String> {
+    fn shutdown(mut self) -> (Option<String>, i32) {
+        let exit_code = self.app.exit_request.code();
         let session_id = self
             .app
             .has_content()
@@ -481,7 +494,7 @@ impl<'t> EventLoop<'t> {
                 warn!("storage writer has outstanding references, skipping graceful shutdown")
             }
         }
-        session_id
+        (session_id, exit_code)
     }
 }
 

@@ -1,6 +1,7 @@
 mod print;
 
 use std::env;
+use std::io::{self, IsTerminal, Read};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -73,11 +74,15 @@ struct Cli {
     #[arg(long)]
     yolo: bool,
 
+    /// Exit after the agent completes (for automation workflows)
+    #[arg(long)]
+    exit_on_done: bool,
+
     /// Pre-approve tools (comma-separated). Accepts PascalCase (Claude Code) or snake_case.
     #[arg(long, value_delimiter = ',')]
     allowed_tools: Vec<String>,
 
-    /// Initial prompt (reads stdin if omitted in --print mode)
+    /// Initial prompt (reads stdin if piped)
     prompt: Option<String>,
 }
 
@@ -339,26 +344,42 @@ fn run() -> Result<()> {
                 } else {
                     Model::from_spec(&session.model).unwrap_or(model)
                 };
-                let session_id = maki_ui::run(maki_ui::EventLoopParams {
-                    model,
-                    skills,
-                    commands,
-                    session,
-                    storage,
-                    config: config.agent,
-                    ui_config: config.ui,
-                    input_history_size: config.storage.input_history_size,
-                    permissions: Arc::new(maki_agent::permissions::PermissionManager::new(
-                        config.permissions,
-                        cwd.clone(),
-                    )),
-                    timeouts,
-                    #[cfg(feature = "demo")]
-                    demo: cli.demo,
-                })
+                let initial_prompt = match cli.prompt {
+                    Some(p) => Some(p),
+                    None if !io::stdin().is_terminal() => {
+                        let mut buf = String::new();
+                        io::stdin().read_to_string(&mut buf).context("read stdin")?;
+                        Some(buf)
+                    }
+                    None => None,
+                };
+                let (session_id, exit_code) = maki_ui::run(
+                    maki_ui::EventLoopParams {
+                        model,
+                        skills,
+                        commands,
+                        session,
+                        storage,
+                        config: config.agent,
+                        ui_config: config.ui,
+                        input_history_size: config.storage.input_history_size,
+                        permissions: Arc::new(maki_agent::permissions::PermissionManager::new(
+                            config.permissions,
+                            cwd.clone(),
+                        )),
+                        timeouts,
+                        exit_on_done: cli.exit_on_done,
+                        #[cfg(feature = "demo")]
+                        demo: cli.demo,
+                    },
+                    initial_prompt,
+                )
                 .context("run UI")?;
                 if let Some(session_id) = session_id {
                     eprintln!("session: {session_id}");
+                }
+                if exit_code != 0 {
+                    std::process::exit(exit_code);
                 }
             }
         }

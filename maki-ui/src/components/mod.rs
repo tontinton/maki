@@ -199,6 +199,23 @@ pub enum Action {
 
 const ERROR_DISPLAY: Duration = Duration::from_secs(5);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExitRequest {
+    #[default]
+    None,
+    Success,
+    Error,
+}
+
+impl ExitRequest {
+    pub fn code(&self) -> i32 {
+        match self {
+            Self::None | Self::Success => 0,
+            Self::Error => 1,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Status {
     Idle,
