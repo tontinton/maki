@@ -338,6 +338,7 @@ pub(crate) enum ChildKind {
 #[derive(Debug, Clone)]
 pub(crate) enum EntryData {
     Import {
+        keyword: Option<String>,
         paths: Vec<Vec<String>>,
     },
     Item {
@@ -371,11 +372,19 @@ impl SkeletonEntry {
     }
 
     pub(crate) fn new_import(node: Node, paths: Vec<Vec<String>>) -> Self {
+        Self::new_import_with_keyword(node, None, paths)
+    }
+
+    pub(crate) fn new_import_with_keyword(
+        node: Node,
+        keyword: Option<String>,
+        paths: Vec<Vec<String>>,
+    ) -> Self {
         Self {
             section: Section::Import,
             line_start: node.start_position().row + 1,
             line_end: node.end_position().row + 1,
-            data: EntryData::Import { paths },
+            data: EntryData::Import { keyword, paths },
         }
     }
 
@@ -564,17 +573,29 @@ fn format_imports(out: &mut String, entries: &[&SkeletonEntry], import_sep: &str
     let prefix = if out.is_empty() { "" } else { "\n" };
     let _ = writeln!(out, "{prefix}imports: {}", line_range(min_line, max_line));
 
-    let mut trie = ImportTrie::default();
+    let mut keyword_tries: BTreeMap<&str, ImportTrie> = BTreeMap::new();
     for entry in entries {
-        if let EntryData::Import { paths } = &entry.data {
+        if let EntryData::Import { keyword, paths } = &entry.data {
+            let trie = keyword_tries
+                .entry(keyword.as_deref().unwrap_or("import"))
+                .or_default();
             for path in paths {
                 trie.insert(path);
             }
         }
     }
-    let lines = trie.render(import_sep);
-    for line in lines {
-        let _ = writeln!(out, "  {line}");
+
+    for (keyword, trie) in keyword_tries {
+        let lines = trie.render(import_sep);
+        if keyword == "import" {
+            for line in lines {
+                let _ = writeln!(out, "  {line}");
+            }
+        } else {
+            for line in lines {
+                let _ = writeln!(out, "  {keyword}: {line}");
+            }
+        }
     }
 }
 

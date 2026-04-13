@@ -17,6 +17,8 @@ pub(crate) mod common;
 pub(crate) mod cpp;
 #[cfg(feature = "lang-c-sharp")]
 pub(crate) mod csharp;
+#[cfg(feature = "lang-elixir")]
+pub(crate) mod elixir;
 #[cfg(feature = "lang-go")]
 pub(crate) mod go;
 #[cfg(feature = "lang-java")]

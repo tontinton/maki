@@ -46,6 +46,8 @@ pub enum Language {
     Bash,
     #[cfg(feature = "lang-lua")]
     Lua,
+    #[cfg(feature = "lang-elixir")]
+    Elixir,
 }
 
 impl Language {
@@ -87,6 +89,8 @@ impl Language {
             "sh" | "bash" | "zsh" => Some(Self::Bash),
             #[cfg(feature = "lang-lua")]
             "lua" => Some(Self::Lua),
+            #[cfg(feature = "lang-elixir")]
+            "ex" | "exs" => Some(Self::Elixir),
             _ => None,
         }
     }
@@ -125,6 +129,8 @@ impl Language {
             Self::Bash => tree_sitter_bash::LANGUAGE.into(),
             #[cfg(feature = "lang-lua")]
             Self::Lua => tree_sitter_lua::LANGUAGE.into(),
+            #[cfg(feature = "lang-elixir")]
+            Self::Elixir => tree_sitter_elixir::LANGUAGE.into(),
         }
     }
 
@@ -162,6 +168,8 @@ impl Language {
             Self::Bash => &index::bash::BashExtractor,
             #[cfg(feature = "lang-lua")]
             Self::Lua => &index::lua::LuaExtractor,
+            #[cfg(feature = "lang-elixir")]
+            Self::Elixir => &index::elixir::ElixirExtractor,
         }
     }
 }
