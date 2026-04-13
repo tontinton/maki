@@ -33,7 +33,7 @@
               # NOTE: these are cargo git dependencies; set hash to "" and
               # rebuild to get the correct value.
               outputHashes = {
-                "monty-0.0.9" = "sha256-lIuPWXuovY4TB5M7JUCDAIN97bo1X8B6MhL3UjFTnqA=";
+                "monty-0.0.11" = "sha256-PRP8XcgeNVnc+2dWHxpizjvAtSjfqtkEXckXjPCRoJI=";
                 "ruff_python_ast-0.0.0" = "sha256-nVQC4ZaLWiZBUEReLqzpXKxXVxCdUW6b+mda9J8JSA0=";
                 "ruff_python_parser-0.0.0" = "sha256-nVQC4ZaLWiZBUEReLqzpXKxXVxCdUW6b+mda9J8JSA0=";
                 "ruff_python_trivia-0.0.0" = "sha256-nVQC4ZaLWiZBUEReLqzpXKxXVxCdUW6b+mda9J8JSA0=";
