@@ -34,7 +34,19 @@ pub struct Ollama {
 
 impl Ollama {
     pub fn new(timeouts: super::Timeouts) -> Result<Self, AgentError> {
-        if let Ok(api_key) = std::env::var(API_KEY_ENV) {
+        Self::from_env(
+            timeouts,
+            std::env::var(API_KEY_ENV).ok(),
+            std::env::var(HOST_ENV).ok(),
+        )
+    }
+
+    fn from_env(
+        timeouts: super::Timeouts,
+        api_key: Option<String>,
+        host: Option<String>,
+    ) -> Result<Self, AgentError> {
+        if let Some(api_key) = api_key {
             return Ok(Self {
                 compat: OpenAiCompatProvider::new(&CONFIG, timeouts),
                 auth: ResolvedAuth {
@@ -44,7 +56,7 @@ impl Ollama {
             });
         }
 
-        let host = std::env::var(HOST_ENV).map_err(|_| AgentError::Config {
+        let host = host.ok_or(AgentError::Config {
             message: HOST_NOT_SET.into(),
         })?;
         Ok(Self {
@@ -84,9 +96,6 @@ impl Provider for Ollama {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     const TEST_TIMEOUTS: super::super::Timeouts = super::super::Timeouts {
         connect: std::time::Duration::from_secs(10),
@@ -94,67 +103,39 @@ mod tests {
     };
 
     #[test]
-    fn new_without_host_or_api_key_errors() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        // SAFETY: single-threaded test section guarded by ENV_LOCK.
-        unsafe {
-            std::env::remove_var(HOST_ENV);
-            std::env::remove_var(API_KEY_ENV);
-        }
-        match Ollama::new(TEST_TIMEOUTS) {
+    fn from_env_without_host_or_api_key_errors() {
+        match Ollama::from_env(TEST_TIMEOUTS, None, None) {
             Err(AgentError::Config { message }) => assert_eq!(message, HOST_NOT_SET),
             Err(other) => panic!("expected Config error, got {other:?}"),
-            Ok(_) => panic!("expected error when {HOST_ENV} and {API_KEY_ENV} are unset"),
+            Ok(_) => panic!("expected error when host and api_key are None"),
         }
     }
 
     #[test]
-    fn new_with_host_builds_auth() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        // SAFETY: single-threaded test section guarded by ENV_LOCK.
-        unsafe {
-            std::env::remove_var(API_KEY_ENV);
-            std::env::set_var(HOST_ENV, "http://x:1234");
-        }
-        let ollama = Ollama::new(TEST_TIMEOUTS).expect("should build when host set");
+    fn from_env_with_host_builds_auth() {
+        let ollama = Ollama::from_env(TEST_TIMEOUTS, None, Some("http://x:1234".into())).unwrap();
         assert_eq!(ollama.auth.base_url.as_deref(), Some("http://x:1234/v1"));
         assert!(ollama.auth.headers.is_empty());
-        // SAFETY: single-threaded test section guarded by ENV_LOCK.
-        unsafe { std::env::remove_var(HOST_ENV) };
     }
 
     #[test]
-    fn new_with_api_key_uses_cloud() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        // SAFETY: single-threaded test section guarded by ENV_LOCK.
-        unsafe {
-            std::env::remove_var(HOST_ENV);
-            std::env::set_var(API_KEY_ENV, "test-key");
-        }
-        let ollama = Ollama::new(TEST_TIMEOUTS).expect("should build with API key");
+    fn from_env_with_api_key_uses_cloud() {
+        let ollama = Ollama::from_env(TEST_TIMEOUTS, Some("test-key".into()), None).unwrap();
         assert_eq!(ollama.auth.base_url.as_deref(), Some(CLOUD_BASE_URL));
         assert_eq!(ollama.auth.headers.len(), 1);
         assert_eq!(ollama.auth.headers[0].0, "authorization");
         assert_eq!(ollama.auth.headers[0].1, "Bearer test-key");
-        // SAFETY: single-threaded test section guarded by ENV_LOCK.
-        unsafe { std::env::remove_var(API_KEY_ENV) };
     }
 
     #[test]
-    fn new_api_key_takes_precedence_over_host() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        // SAFETY: single-threaded test section guarded by ENV_LOCK.
-        unsafe {
-            std::env::set_var(HOST_ENV, "http://local:1234");
-            std::env::set_var(API_KEY_ENV, "test-key");
-        }
-        let ollama = Ollama::new(TEST_TIMEOUTS).expect("should build");
+    fn from_env_api_key_takes_precedence_over_host() {
+        let ollama = Ollama::from_env(
+            TEST_TIMEOUTS,
+            Some("test-key".into()),
+            Some("http://local:1234".into()),
+        )
+        .unwrap();
         assert_eq!(ollama.auth.base_url.as_deref(), Some(CLOUD_BASE_URL));
         assert_eq!(ollama.auth.headers[0].1, "Bearer test-key");
-        // SAFETY: single-threaded test section guarded by ENV_LOCK.
-        unsafe {
-            std::env::remove_var(HOST_ENV);
-            std::env::remove_var(API_KEY_ENV);
-        }
     }
 }
