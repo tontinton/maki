@@ -1,4 +1,5 @@
 use std::fs;
+use std::path::Path;
 
 use crate::ToolOutput;
 use maki_tool_macro::Tool;
@@ -29,15 +30,22 @@ impl Edit {
 ]"#,
     );
 
-    pub async fn execute(&self, _ctx: &super::ToolContext) -> Result<ToolOutput, String> {
+    pub async fn execute(&self, ctx: &super::ToolContext) -> Result<ToolOutput, String> {
         let path = super::resolve_path(&self.path)?;
         let old_string = self.old_string.clone();
         let new_string = self.new_string.clone();
         let replace_all = self.replace_all.unwrap_or(false);
+        let file_tracker = ctx.file_tracker.clone();
         smol::unblock(move || {
-            let before = fs::read_to_string(&path).map_err(|e| format!("read error: {e}"))?;
+            let p = Path::new(&path);
+            file_tracker.check_before_edit(p)?;
+
+            let before = fs::read_to_string(p).map_err(|e| format!("read error: {e}"))?;
             let after = fuzzy_replace::replace(&before, &old_string, &new_string, replace_all)?;
-            fs::write(&path, &after).map_err(|e| format!("write error: {e}"))?;
+            fs::write(p, &after).map_err(|e| format!("write error: {e}"))?;
+
+            file_tracker.record_read(p);
+
             Ok(ToolOutput::Diff {
                 summary: format!("edited {}", relative_path(&path)),
                 path,
@@ -66,6 +74,7 @@ impl super::ToolDefaults for Edit {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::path::Path;
 
     use tempfile::TempDir;
 
@@ -80,6 +89,10 @@ mod tests {
         path.to_string_lossy().to_string()
     }
 
+    fn pre_read(ctx: &super::super::ToolContext, path: &str) {
+        ctx.file_tracker.record_read(Path::new(path));
+    }
+
     #[test]
     fn edit_reads_replaces_writes() {
         smol::block_on(async {
@@ -87,6 +100,7 @@ mod tests {
             let ctx = stub_ctx(&AgentMode::Build);
 
             let path = temp_file(&dir, "f.rs", "fn old() {}\nfn keep() {}");
+            pre_read(&ctx, &path);
             Edit {
                 path: path.clone(),
                 old_string: "fn old() {}".into(),
@@ -102,6 +116,7 @@ mod tests {
             );
 
             let path = temp_file(&dir, "g.rs", "let x = 1;\nlet x = 1;\nlet y = 2;");
+            pre_read(&ctx, &path);
             Edit {
                 path: path.clone(),
                 old_string: "let x = 1;".into(),
@@ -130,6 +145,7 @@ mod tests {
             let original = "const A: u8 = 1;\nconst B: u8 = 2;\n";
             let updated = "const A: u8 = 9;\nconst B: u8 = 2;\n";
             let path = temp_file(&dir, "f.rs", original);
+            pre_read(&ctx, &path);
             let output = Edit {
                 path: path.clone(),
                 old_string: "const A: u8 = 1;\\nconst B: u8 = 2;".into(),

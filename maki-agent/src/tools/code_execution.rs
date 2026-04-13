@@ -23,7 +23,7 @@ use crate::{AgentConfig, AgentEvent, AgentMode, EventSender, ToolInput, ToolOutp
 use smol::future::block_on;
 
 use super::truncate_output;
-use super::{Deadline, INTERPRETER_TOOLS};
+use super::{Deadline, FileReadTracker, INTERPRETER_TOOLS};
 
 const STREAM_FLUSH_INTERVAL: Duration = Duration::from_millis(100);
 const PREAMBLE: &str = "import re\nimport asyncio\nimport sys\nimport os\nimport json\n";
@@ -61,6 +61,7 @@ impl CodeExecution {
         let cancel = ctx.cancel.clone();
         let config = ctx.config.clone();
         let permissions = ctx.permissions.clone();
+        let file_tracker = ctx.file_tracker.clone();
         let deadline = Deadline::after(timeout);
         let limits = runner::limits(timeout, config.interpreter_max_memory_mb * 1024 * 1024);
 
@@ -76,6 +77,7 @@ impl CodeExecution {
                     deadline,
                     config.clone(),
                     &permissions,
+                    &file_tracker,
                 );
                 let resolver = build_async_resolver(
                     &event_tx,
@@ -84,6 +86,7 @@ impl CodeExecution {
                     deadline,
                     config.clone(),
                     &permissions,
+                    &file_tracker,
                 );
                 let code = format!("{PREAMBLE}{code}");
 
@@ -164,6 +167,7 @@ fn build_tool_fns(
     deadline: Deadline,
     config: AgentConfig,
     permissions: &Arc<PermissionManager>,
+    file_tracker: &Arc<FileReadTracker>,
 ) -> HashMap<String, ToolFn> {
     let mut tools: HashMap<String, ToolFn> = HashMap::new();
 
@@ -177,6 +181,7 @@ fn build_tool_fns(
         let cancel = cancel.clone();
         let permissions = Arc::clone(permissions);
         let config = config.clone();
+        let file_tracker = Arc::clone(file_tracker);
 
         tools.insert(
             name.clone(),
@@ -193,6 +198,7 @@ fn build_tool_fns(
                         &tx,
                         cancel.clone(),
                         Arc::clone(&permissions),
+                        Arc::clone(&file_tracker),
                     );
                     inner_ctx.deadline = deadline;
                     inner_ctx.config = config.clone();
@@ -217,14 +223,17 @@ fn build_async_resolver(
     deadline: Deadline,
     config: AgentConfig,
     permissions: &Arc<PermissionManager>,
+    file_tracker: &Arc<FileReadTracker>,
 ) -> AsyncResolver {
     let tx = event_tx.clone();
     let mode = mode.clone();
     let cancel = cancel.clone();
     let permissions = Arc::clone(permissions);
+    let file_tracker = Arc::clone(file_tracker);
 
     Box::new(move |pending_calls: Vec<PendingCall>| {
         let config = config.clone();
+        let file_tracker = Arc::clone(&file_tracker);
         smol::future::block_on(async {
             let call_ids: Vec<u32> = pending_calls.iter().map(|pc| pc.call_id).collect();
             let mut set = TaskSet::new();
@@ -234,6 +243,7 @@ fn build_async_resolver(
                 let cancel = cancel.clone();
                 let permissions = Arc::clone(&permissions);
                 let config = config.clone();
+                let file_tracker = Arc::clone(&file_tracker);
 
                 set.spawn(async move {
                     if let Err(e) = deadline.check() {
@@ -249,8 +259,13 @@ fn build_async_resolver(
                         Err(e) => return (pc.call_id, Err(format!("tool parse error: {e}"))),
                     };
 
-                    let mut inner_ctx =
-                        super::interpreter_ctx(&mode, &tx, cancel, Arc::clone(&permissions));
+                    let mut inner_ctx = super::interpreter_ctx(
+                        &mode,
+                        &tx,
+                        cancel,
+                        Arc::clone(&permissions),
+                        file_tracker,
+                    );
                     inner_ctx.deadline = deadline;
                     inner_ctx.config = config;
                     let done = call.execute(&inner_ctx, String::new()).await;

@@ -15,7 +15,7 @@ use crate::cancel::CancelToken;
 use crate::mcp::McpHandle;
 use crate::permissions::PermissionManager;
 use crate::skill::Skill;
-use crate::tools::{Deadline, ToolContext};
+use crate::tools::{Deadline, FileReadTracker, ToolContext};
 use crate::{
     AgentConfig, AgentError, AgentEvent, AgentInput, AgentMode, EventSender, ExtractedCommand,
     InterruptSource, TurnCompleteEvent,
@@ -75,6 +75,7 @@ pub struct Agent {
     thinking: ThinkingConfig,
     session_id: Option<String>,
     timeouts: maki_providers::Timeouts,
+    file_tracker: Arc<FileReadTracker>,
 }
 
 impl Agent {
@@ -104,6 +105,7 @@ impl Agent {
             reauth_attempts: 0,
             thinking: ThinkingConfig::Off,
             session_id: params.session_id,
+            file_tracker: Arc::new(FileReadTracker::new()),
         }
     }
 
@@ -329,6 +331,7 @@ impl Agent {
             config: self.config.clone(),
             permissions: Arc::clone(&self.permissions),
             timeouts: self.timeouts,
+            file_tracker: Arc::clone(&self.file_tracker),
         }
     }
 

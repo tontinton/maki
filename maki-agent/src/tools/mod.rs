@@ -10,6 +10,7 @@ mod bash;
 mod batch;
 mod code_execution;
 mod edit;
+mod file_tracker;
 mod find_symbol;
 mod fuzzy_replace;
 mod glob;
@@ -26,6 +27,8 @@ mod todowrite;
 mod webfetch;
 mod websearch;
 mod write;
+
+pub(crate) use file_tracker::FileReadTracker;
 
 use std::collections::HashSet;
 use std::env;
@@ -252,6 +255,7 @@ pub struct ToolContext {
     pub config: AgentConfig,
     pub permissions: Arc<PermissionManager>,
     pub timeouts: maki_providers::Timeouts,
+    pub file_tracker: Arc<FileReadTracker>,
 }
 
 pub(crate) fn resolve_path(path: &str) -> Result<String, String> {
@@ -774,6 +778,7 @@ pub(crate) fn interpreter_ctx(
     event_tx: &EventSender,
     cancel: CancelToken,
     permissions: Arc<PermissionManager>,
+    file_tracker: Arc<FileReadTracker>,
 ) -> ToolContext {
     static PROVIDER: LazyLock<Arc<dyn Provider>> = LazyLock::new(|| Arc::new(NullProvider));
     static MODEL: LazyLock<Arc<Model>> =
@@ -794,6 +799,7 @@ pub(crate) fn interpreter_ctx(
         config: AgentConfig::default(),
         permissions,
         timeouts: maki_providers::Timeouts::default(),
+        file_tracker,
     }
 }
 
@@ -831,6 +837,7 @@ pub(crate) mod test_support {
             event_tx,
             CancelToken::none(),
             Arc::clone(&TEST_PERMISSIONS),
+            Arc::new(FileReadTracker::new()),
         );
         ctx.tool_use_id = tool_use_id.map(String::from);
         ctx
@@ -844,6 +851,7 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::path::Path;
 
     use serde_json::json;
     use tempfile::TempDir;
@@ -1155,6 +1163,10 @@ mod tests {
 
             let plan_str = plan_path.to_str().unwrap();
             let other_str = other.to_str().unwrap();
+
+            // Pre-read both files for edit/multiedit tests
+            ctx.file_tracker.record_read(Path::new(plan_str));
+            ctx.file_tracker.record_read(Path::new(other_str));
 
             let blocked = ToolCall::from_api(tool, &other_input(plan_str, other_str)).unwrap();
             let result = blocked.execute(&ctx, "t1".into()).await;

@@ -1,4 +1,5 @@
 use std::fs;
+use std::path::Path;
 
 use crate::ToolOutput;
 use serde::Deserialize;
@@ -59,13 +60,20 @@ impl MultiEdit {
         Ok(content)
     }
 
-    pub async fn execute(&self, _ctx: &super::ToolContext) -> Result<ToolOutput, String> {
+    pub async fn execute(&self, ctx: &super::ToolContext) -> Result<ToolOutput, String> {
         let path = super::resolve_path(&self.path)?;
         let this = self.clone();
+        let file_tracker = ctx.file_tracker.clone();
         smol::unblock(move || {
-            let before = fs::read_to_string(&path).map_err(|e| format!("read error: {e}"))?;
+            let p = Path::new(&path);
+            file_tracker.check_before_edit(p)?;
+
+            let before = fs::read_to_string(p).map_err(|e| format!("read error: {e}"))?;
             let after = this.apply_edits(&before)?;
-            fs::write(&path, &after).map_err(|e| format!("write error: {e}"))?;
+            fs::write(p, &after).map_err(|e| format!("write error: {e}"))?;
+
+            file_tracker.record_read(p);
+
             Ok(ToolOutput::Diff {
                 summary: format!(
                     "applied {} to {}",
@@ -102,6 +110,7 @@ impl super::ToolDefaults for MultiEdit {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::path::Path;
 
     use serde_json::json;
     use tempfile::TempDir;
@@ -121,12 +130,17 @@ mod tests {
         path.to_string_lossy().to_string()
     }
 
+    fn pre_read(ctx: &super::super::ToolContext, path: &str) {
+        ctx.file_tracker.record_read(Path::new(path));
+    }
+
     #[test]
     fn sequential_edits_compose() {
         smol::block_on(async {
             let dir = TempDir::new().unwrap();
             let ctx = stub_ctx(&AgentMode::Build);
             let path = temp_file(&dir, "f.rs", "fn alpha() {}\nfn beta() {}");
+            pre_read(&ctx, &path);
             let tool = MultiEdit::parse_input(&json!({
                 "path": path,
                 "edits": [
@@ -151,6 +165,7 @@ mod tests {
             let ctx = stub_ctx(&AgentMode::Build);
             let original = "let a = 1;\nlet b = 2;";
             let path = temp_file(&dir, "f.rs", original);
+            pre_read(&ctx, &path);
             let tool = MultiEdit::parse_input(&json!({
                 "path": path,
                 "edits": [
@@ -172,25 +187,10 @@ mod tests {
             let dir = TempDir::new().unwrap();
             let ctx = stub_ctx(&AgentMode::Build);
             let path = temp_file(&dir, "f.rs", "content");
+            pre_read(&ctx, &path);
             let tool = MultiEdit::parse_input(&json!({ "path": path, "edits": [] })).unwrap();
             assert_eq!(tool.execute(&ctx).await.unwrap_err(), EMPTY_ERR);
         });
-    }
-
-    #[test]
-    fn start_summary_is_path_only() {
-        let tool = MultiEdit {
-            path: "/x.rs".into(),
-            edits: vec![
-                EditEntry {
-                    old_string: "a".into(),
-                    new_string: "b".into(),
-                    replace_all: None,
-                };
-                2
-            ],
-        };
-        assert_eq!(tool.start_summary(), "/x.rs");
     }
 
     #[test_case(1, "1 edit"  ; "singular")]

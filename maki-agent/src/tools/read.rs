@@ -44,13 +44,15 @@ impl Read {
         let loaded = ctx.loaded_instructions.clone();
         let max_output_lines = ctx.config.max_output_lines;
         let max_line_bytes = ctx.config.max_line_bytes;
+        let file_tracker = ctx.file_tracker.clone();
         smol::unblock(move || {
             let cwd = std::env::current_dir().ok();
-            if Path::new(&path).is_dir() {
+            let p = Path::new(&path);
+            if p.is_dir() {
                 return Self::list_dir(&path, cwd.as_deref(), &loaded);
             }
 
-            let raw = fs::read_to_string(&path).map_err(|e| format!("read error: {e}"))?;
+            let raw = fs::read_to_string(p).map_err(|e| format!("read error: {e}"))?;
             let total_lines = raw.lines().count();
 
             let start = offset.unwrap_or(1).saturating_sub(1);
@@ -64,7 +66,6 @@ impl Read {
                 .collect();
 
             let instructions = cwd.as_deref().and_then(|cwd| {
-                let p = Path::new(&path);
                 if agent::is_instruction_file(p.file_name()?.to_str()?) {
                     return None;
                 }
@@ -74,6 +75,8 @@ impl Read {
                     &loaded,
                 ))
             });
+
+            file_tracker.record_read(p);
 
             Ok(ToolOutput::ReadCode {
                 path,

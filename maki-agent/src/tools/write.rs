@@ -38,11 +38,17 @@ impl Write {
         let path = super::resolve_path(&self.path)?;
         let content = self.content.clone();
         let output = self.write_output(&path, ctx.config.max_output_lines);
+        let file_tracker = ctx.file_tracker.clone();
         smol::unblock(move || {
-            if let Some(parent) = Path::new(&path).parent() {
+            let p = Path::new(&path);
+            if p.exists() {
+                file_tracker.check_before_edit(p)?;
+            }
+            if let Some(parent) = p.parent() {
                 fs::create_dir_all(parent).map_err(|e| format!("mkdir error: {e}"))?;
             }
             fs::write(&path, &content).map_err(|e| format!("write error: {e}"))?;
+            file_tracker.record_read(p);
             Ok(output)
         })
         .await
