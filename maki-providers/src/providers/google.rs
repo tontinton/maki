@@ -127,10 +127,7 @@ impl Google {
     fn stream_url(&self, model_id: &str) -> String {
         let base = {
             let auth = self.auth.lock().unwrap();
-            auth.base_url
-                .as_deref()
-                .unwrap_or(BASE_URL)
-                .to_string()
+            auth.base_url.as_deref().unwrap_or(BASE_URL).to_string()
         };
         let encoded = super::urlenc(model_id);
         format!("{base}/models/{encoded}:streamGenerateContent?alt=sse")
@@ -139,10 +136,7 @@ impl Google {
     fn models_url(&self) -> String {
         let base = {
             let auth = self.auth.lock().unwrap();
-            auth.base_url
-                .as_deref()
-                .unwrap_or(BASE_URL)
-                .to_string()
+            auth.base_url.as_deref().unwrap_or(BASE_URL).to_string()
         };
         let key = self.api_key();
         format!("{base}/models?key={key}&pageSize=1000")
@@ -293,7 +287,10 @@ fn convert_messages(messages: &[Message]) -> Vec<Value> {
                 ContentBlock::Text { text } => {
                     parts.push(json!({"text": text}));
                 }
-                ContentBlock::Thinking { thinking, signature } => {
+                ContentBlock::Thinking {
+                    thinking,
+                    signature,
+                } => {
                     let mut part = json!({"text": thinking, "thought": true});
                     if let Some(sig) = signature {
                         part["thoughtSignature"] = json!(sig);
@@ -314,9 +311,8 @@ fn convert_messages(messages: &[Message]) -> Vec<Value> {
                     content,
                     is_error,
                 } => {
-                    let mut response_val = serde_json::from_str(content).unwrap_or_else(|_| {
-                        json!({"result": content})
-                    });
+                    let mut response_val = serde_json::from_str(content)
+                        .unwrap_or_else(|_| json!({"result": content}));
                     if *is_error {
                         response_val = json!({"error": response_val});
                     }
@@ -597,7 +593,13 @@ mod tests {
             context_window: 1_048_576,
         };
         let messages = vec![Message::user("hello".into())];
-        let body = google.build_body(&model, &messages, "be helpful", &json!([]), ThinkingConfig::Off);
+        let body = google.build_body(
+            &model,
+            &messages,
+            "be helpful",
+            &json!([]),
+            ThinkingConfig::Off,
+        );
 
         assert_eq!(body["contents"][0]["role"], "user");
         assert_eq!(body["systemInstruction"]["parts"][0]["text"], "be helpful");
@@ -620,15 +622,12 @@ mod tests {
             context_window: 1_048_576,
         };
         let messages = vec![Message::user("think about this".into())];
-        let body = google.build_body(
-            &model,
-            &messages,
-            "",
-            &json!([]),
-            ThinkingConfig::Adaptive,
-        );
+        let body = google.build_body(&model, &messages, "", &json!([]), ThinkingConfig::Adaptive);
 
-        assert_eq!(body["generationConfig"]["thinkingConfig"]["includeThoughts"], true);
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"]["includeThoughts"],
+            true
+        );
     }
 
     #[test]
@@ -654,7 +653,10 @@ mod tests {
             ThinkingConfig::Budget(8192),
         );
 
-        assert_eq!(body["generationConfig"]["thinkingConfig"]["thinkingBudget"], 8192);
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            8192
+        );
     }
 
     #[test_case("STOP", StopReason::EndTurn ; "stop")]
@@ -726,7 +728,10 @@ mod tests {
         ];
         let result = convert_messages(&messages);
         assert_eq!(result[0]["parts"][0]["functionCall"]["name"], "read_file");
-        assert_eq!(result[1]["parts"][0]["functionResponse"]["name"], "read_file");
+        assert_eq!(
+            result[1]["parts"][0]["functionResponse"]["name"],
+            "read_file"
+        );
     }
 
     #[test]
@@ -752,9 +757,21 @@ mod tests {
         assert_eq!(result[0]["name"], "bash");
         assert_eq!(result[0]["description"], "run a command");
         assert!(result[0]["parameters"]["properties"]["cmd"].is_object());
-        assert!(result[0]["parameters"].get("additionalProperties").is_none());
-        assert!(result[0]["parameters"]["properties"]["cmd"].get("additionalProperties").is_none());
-        assert!(result[0]["parameters"]["properties"]["opts"].get("additionalProperties").is_none());
+        assert!(
+            result[0]["parameters"]
+                .get("additionalProperties")
+                .is_none()
+        );
+        assert!(
+            result[0]["parameters"]["properties"]["cmd"]
+                .get("additionalProperties")
+                .is_none()
+        );
+        assert!(
+            result[0]["parameters"]["properties"]["opts"]
+                .get("additionalProperties")
+                .is_none()
+        );
     }
 
     #[test]
@@ -776,9 +793,21 @@ mod tests {
         });
         let cleaned = strip_additional_properties(schema);
         assert!(cleaned.get("additionalProperties").is_none());
-        assert!(cleaned["properties"]["inner"].get("additionalProperties").is_none());
-        assert!(cleaned["properties"]["inner"]["properties"]["x"].get("additionalProperties").is_none());
-        assert!(cleaned["properties"]["list"]["items"].get("additionalProperties").is_none());
+        assert!(
+            cleaned["properties"]["inner"]
+                .get("additionalProperties")
+                .is_none()
+        );
+        assert!(
+            cleaned["properties"]["inner"]["properties"]["x"]
+                .get("additionalProperties")
+                .is_none()
+        );
+        assert!(
+            cleaned["properties"]["list"]["items"]
+                .get("additionalProperties")
+                .is_none()
+        );
     }
 
     #[test]

@@ -7,10 +7,10 @@ use strum::{Display, EnumIter, EnumString, IntoEnumIterator};
 use tracing::{debug, warn};
 
 use crate::model::{Model, ModelFamily, models_for_provider};
-use crate::providers::google::Google;
 use crate::providers::Timeouts;
 use crate::providers::anthropic::Anthropic;
 use crate::providers::dynamic;
+use crate::providers::google::Google;
 use crate::providers::mistral::Mistral;
 use crate::providers::ollama::Ollama;
 use crate::providers::openai::OpenAi;
@@ -72,7 +72,10 @@ impl ProviderKind {
     }
 
     pub const fn supports_thinking(self) -> bool {
-        matches!(self, Self::Anthropic | Self::Google | Self::Mistral | Self::Synthetic)
+        matches!(
+            self,
+            Self::Anthropic | Self::Google | Self::Mistral | Self::Synthetic
+        )
     }
 
     pub const fn features(self) -> Option<&'static str> {

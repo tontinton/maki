@@ -44,6 +44,20 @@ Defaults: claude-haiku-4-5 (weak), claude-sonnet-4-6 (medium), claude-opus-4-6 (
 
 Defaults: gpt-5.4-nano (weak), gpt-4.1 (medium), gpt-5.4 (strong)
 
+### Google
+
+- **Env var**: `GEMINI_API_KEY`
+- **API**: `https://generativelanguage.googleapis.com/v1beta`
+- **Features**: Native Gemini API with thinking support
+
+| Tier | Models | Pricing (in/out per 1M tokens) | Context |
+|------|--------|-------------------------------|---------|
+| Weak | **gemini-2.0-flash-lite** (default) | $0.07 / $0.30 | 1048K ctx / 65K out |
+| Medium | **gemini-2.5-flash** (default) | $0.15 / $0.60 | 1048K ctx / 65K out |
+| Strong | **gemini-2.5-pro** (default) | $1.25 / $5.00 | 1048K ctx / 65K out |
+
+Defaults: gemini-2.5-pro (strong), gemini-2.5-flash (medium), gemini-2.0-flash-lite (weak)
+
 ### Ollama
 
 - **Env var**: `OLLAMA_API_KEY` for cloud, or `OLLAMA_HOST` for local (e.g. `http://localhost:11434`)
@@ -121,7 +135,7 @@ To add a custom provider or proxy, drop an executable script into `~/.maki/provi
 
 `resolve` is called each time a new agent spawns, so scripts should read tokens from disk instead of caching them in memory. That way auth changes from other processes get picked up.
 
-The `base` field specifies which built-in provider to inherit the model catalog from. Valid values: `anthropic`, `openai`, `ollama`, `mistral`, `zai`, `zai-coding-plan`, `synthetic`.
+The `base` field specifies which built-in provider to inherit the model catalog from. Valid values: `anthropic`, `openai`, `google`, `ollama`, `mistral`, `zai`, `zai-coding-plan`, `synthetic`.
 
 If your provider serves models not in the base catalog, add a `models` subcommand returning:
 
