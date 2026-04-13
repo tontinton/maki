@@ -11,6 +11,7 @@ toml = { workspace = true }
 toml_edit = { workspace = true }
 tracing = { workspace = true }
 dirs = { workspace = true }
+dotenvy = { workspace = true }
 
 [dev-dependencies]
 test-case = { workspace = true }

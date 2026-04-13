@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+#[cfg(unix)]
 use dirs::home_dir;
 
 use maki_config_macro::ConfigSection;
@@ -10,10 +11,12 @@ use serde::Deserialize;
 use thiserror::Error;
 use tracing::warn;
 
-pub const GLOBAL_CONFIG_PATH: &str = ".config/maki/config.toml";
+#[cfg(unix)]
+const GLOBAL_CONFIG_DIR: &str = ".config/maki";
+const PROJECT_DIR: &str = ".maki";
 pub const PROJECT_CONFIG_FILE: &str = ".maki/config.toml";
-const PERMISSIONS_FILE: &str = ".config/maki/permissions.toml";
-const PROJECT_PERMISSIONS_FILE: &str = ".maki/permissions.toml";
+const CONFIG_FILE: &str = "config.toml";
+const PERMISSIONS_FILE: &str = "permissions.toml";
 
 pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 50 * 1024;
 pub const DEFAULT_MAX_OUTPUT_LINES: usize = 2000;
@@ -652,12 +655,49 @@ fn build_permissions(
     PermissionsConfig { allow_all, rules }
 }
 
+fn global_dir() -> Option<PathBuf> {
+    #[cfg(unix)]
+    {
+        home_dir().map(|h| h.join(GLOBAL_CONFIG_DIR))
+    }
+    #[cfg(not(unix))]
+    {
+        dirs::config_dir().map(|c| c.join("maki"))
+    }
+}
+
+fn load_env_files(cwd: &Path) {
+    let mut vars = HashMap::new();
+    if let Some(path) = global_dir() {
+        collect_env_vars(&path.join(".env"), &mut vars);
+    }
+    collect_env_vars(&cwd.join(PROJECT_DIR).join(".env"), &mut vars);
+
+    for (key, value) in vars {
+        if std::env::var_os(&key).is_none() {
+            // SAFETY: single-threaded at startup, before any async runtime
+            unsafe { std::env::set_var(&key, &value) };
+        }
+    }
+}
+
+fn collect_env_vars(path: &Path, vars: &mut HashMap<String, String>) {
+    let Ok(iter) = dotenvy::from_path_iter(path) else {
+        return;
+    };
+    for item in iter.flatten() {
+        vars.insert(item.0, item.1);
+    }
+}
+
 pub fn load_config(cwd: &Path, no_rtk: bool) -> Config {
+    load_env_files(cwd);
+
     let mut base = toml::Table::new();
-    if let Some(t) = global_config_path().and_then(|p| read_table(&p)) {
+    if let Some(t) = global_dir().and_then(|d| read_table(&d.join(CONFIG_FILE))) {
         merge_tables(&mut base, t);
     }
-    if let Some(t) = read_table(&cwd.join(PROJECT_CONFIG_FILE)) {
+    if let Some(t) = read_table(&cwd.join(PROJECT_DIR).join(CONFIG_FILE)) {
         merge_tables(&mut base, t);
     }
     let raw: RawConfig = match toml::Value::Table(base).try_into() {
@@ -667,8 +707,6 @@ pub fn load_config(cwd: &Path, no_rtk: bool) -> Config {
             RawConfig::default()
         }
     };
-
-    let permissions = load_permissions(cwd);
 
     Config {
         always_yolo: raw.always_yolo.unwrap_or(false),
@@ -681,17 +719,17 @@ pub fn load_config(cwd: &Path, no_rtk: bool) -> Config {
         ),
         provider: ProviderConfig::from_file(raw.provider),
         storage: StorageConfig::from_file(raw.storage),
-        permissions,
+        permissions: load_permissions(cwd),
     }
 }
 
 fn load_permissions(cwd: &Path) -> PermissionsConfig {
-    let global_perms = home_dir()
-        .and_then(|h: PathBuf| read_permissions_file(&h.join(PERMISSIONS_FILE)))
+    let global_perms = global_dir()
+        .and_then(|d| read_permissions_file(&d.join(PERMISSIONS_FILE)))
         .unwrap_or_default();
 
     let project_perms =
-        read_permissions_file(&cwd.join(PROJECT_PERMISSIONS_FILE)).unwrap_or_default();
+        read_permissions_file(&cwd.join(PROJECT_DIR).join(PERMISSIONS_FILE)).unwrap_or_default();
 
     build_permissions(global_perms, project_perms)
 }
@@ -730,14 +768,7 @@ fn read_table(path: &Path) -> Option<toml::Table> {
 }
 
 pub fn global_config_path() -> Option<PathBuf> {
-    #[cfg(unix)]
-    {
-        home_dir().map(|h| h.join(GLOBAL_CONFIG_PATH))
-    }
-    #[cfg(not(unix))]
-    {
-        dirs::config_dir().map(|c| c.join(GLOBAL_CONFIG_PATH))
-    }
+    global_dir().map(|d| d.join(CONFIG_FILE))
 }
 
 pub fn append_permission_rule(
@@ -753,7 +784,7 @@ pub fn append_permission_rule(
 }
 
 fn append_global_permission(tool: &str, scope: Option<&str>, effect: Effect) -> Result<(), String> {
-    let path = home_dir()
+    let path = global_dir()
         .ok_or_else(|| "cannot determine home directory".to_string())?
         .join(PERMISSIONS_FILE);
     let content = std::fs::read_to_string(&path).unwrap_or_default();
@@ -776,11 +807,11 @@ fn append_project_permission(
     effect: Effect,
     cwd: &Path,
 ) -> Result<(), String> {
-    let path = cwd.join(PROJECT_PERMISSIONS_FILE);
+    let path = cwd.join(PROJECT_DIR).join(PERMISSIONS_FILE);
     let content = std::fs::read_to_string(&path).unwrap_or_default();
     let mut doc: toml_edit::DocumentMut = content
         .parse()
-        .map_err(|e| format!("failed to parse {PROJECT_PERMISSIONS_FILE}: {e}"))?;
+        .map_err(|e| format!("failed to parse .maki/{PERMISSIONS_FILE}: {e}"))?;
 
     insert_permission_entry(&mut doc, tool, scope, effect)?;
 
@@ -788,7 +819,7 @@ fn append_project_permission(
         std::fs::create_dir_all(parent).map_err(|e| format!("cannot create .maki dir: {e}"))?;
     }
     std::fs::write(&path, doc.to_string())
-        .map_err(|e| format!("cannot write {PROJECT_PERMISSIONS_FILE}: {e}"))?;
+        .map_err(|e| format!("cannot write .maki/{PERMISSIONS_FILE}: {e}"))?;
     Ok(())
 }
 
@@ -840,9 +871,12 @@ fn insert_permission_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard};
     use std::{env, fs};
     use tempfile::TempDir;
     use test_case::test_case;
+
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     #[test]
     fn empty_config_returns_defaults() {
@@ -886,8 +920,8 @@ mod tests {
 
     #[test]
     fn project_overrides_global_field_by_field() {
-        let dir = TempDir::new().unwrap();
-        let global_dir = dir.path().join(".config/maki");
+        let guard = HomeGuard::new();
+        let global_dir = guard.path().join(".config/maki");
         fs::create_dir_all(&global_dir).unwrap();
         fs::write(
             global_dir.join("config.toml"),
@@ -895,7 +929,7 @@ mod tests {
              [agent]\nmax_output_lines = 3000\nmax_line_bytes = 800\n",
         )
         .unwrap();
-        let maki_dir = dir.path().join(".maki");
+        let maki_dir = guard.path().join(".maki");
         fs::create_dir_all(&maki_dir).unwrap();
         fs::write(
             maki_dir.join("config.toml"),
@@ -903,13 +937,7 @@ mod tests {
         )
         .unwrap();
 
-        let saved_home = env::var_os("HOME");
-        unsafe { env::set_var("HOME", dir.path()) };
-        let config = load_config(dir.path(), false);
-        match saved_home {
-            Some(v) => unsafe { env::set_var("HOME", v) },
-            None => unsafe { env::remove_var("HOME") },
-        }
+        let config = load_config(guard.path(), false);
 
         assert!(!config.ui.splash_animation);
         assert_eq!(config.ui.flash_duration_ms, 2000);
@@ -1051,14 +1079,20 @@ mod tests {
     struct HomeGuard {
         dir: TempDir,
         saved: Option<std::ffi::OsString>,
+        _lock: MutexGuard<'static, ()>,
     }
 
     impl HomeGuard {
         fn new() -> Self {
+            let lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
             let dir = TempDir::new().unwrap();
             let saved = env::var_os("HOME");
             unsafe { env::set_var("HOME", dir.path()) };
-            Self { dir, saved }
+            Self {
+                dir,
+                saved,
+                _lock: lock,
+            }
         }
 
         fn write_permissions(&self, content: &str) {
@@ -1224,5 +1258,43 @@ mod tests {
 
         let content = fs::read_to_string(perms_dir.join("permissions.toml")).unwrap();
         assert_eq!(content.matches("cargo *").count(), 1);
+    }
+
+    #[test]
+    fn env_file_precedence() {
+        const GLOBAL_ONLY: &str = "TEST_MAKI_GLOBAL_ONLY";
+        const PROJECT_SHADOWS: &str = "TEST_MAKI_PROJECT_SHADOWS";
+        const PROCESS_WINS: &str = "TEST_MAKI_PROCESS_WINS";
+
+        let guard = HomeGuard::new();
+        let global_dir = guard.path().join(".config/maki");
+        fs::create_dir_all(&global_dir).unwrap();
+        fs::write(
+            global_dir.join(".env"),
+            format!("{GLOBAL_ONLY}=global\n{PROJECT_SHADOWS}=global\n{PROCESS_WINS}=global"),
+        )
+        .unwrap();
+
+        let maki_dir = guard.path().join(".maki");
+        fs::create_dir_all(&maki_dir).unwrap();
+        fs::write(
+            maki_dir.join(".env"),
+            format!("{PROJECT_SHADOWS}=project\n{PROCESS_WINS}=project"),
+        )
+        .unwrap();
+
+        unsafe {
+            std::env::remove_var(GLOBAL_ONLY);
+            std::env::remove_var(PROJECT_SHADOWS);
+            std::env::set_var(PROCESS_WINS, "process");
+        }
+
+        let _config = load_config(guard.path(), false);
+
+        assert_eq!(std::env::var(GLOBAL_ONLY).unwrap(), "global");
+        assert_eq!(std::env::var(PROJECT_SHADOWS).unwrap(), "project");
+        assert_eq!(std::env::var(PROCESS_WINS).unwrap(), "process");
+
+        unsafe { std::env::remove_var(PROCESS_WINS) };
     }
 }

@@ -120,6 +120,7 @@ nucleo-matcher = "0.3"
 open = "5"
 criterion = { version = "0.5", features = ["html_reports"] }
 dirs = "6"
+dotenvy = "0.15"
 tree-sitter = "0.26"
 tree-sitter-bash = "0.25"
 monty = { git = "https://github.com/pydantic/monty.git", rev = "2e9df4b", package = "monty" }
