@@ -99,6 +99,7 @@ mod tests {
 
     const TEST_TIMEOUTS: super::super::Timeouts = super::super::Timeouts {
         connect: std::time::Duration::from_secs(10),
+        low_speed: std::time::Duration::from_secs(30),
         stream: std::time::Duration::from_secs(300),
     };
 

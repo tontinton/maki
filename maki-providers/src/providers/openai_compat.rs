@@ -31,7 +31,7 @@ pub(crate) struct OpenAiCompatProvider {
 impl OpenAiCompatProvider {
     pub fn new(config: &'static OpenAiCompatConfig, timeouts: super::Timeouts) -> Self {
         Self {
-            client: super::http_client(timeouts.connect),
+            client: super::http_client(timeouts),
             config,
             stream_timeout: timeouts.stream,
         }

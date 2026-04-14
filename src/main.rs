@@ -300,6 +300,7 @@ fn run() -> Result<()> {
             let mut config = load_config(&cwd, cli.no_rtk);
             let timeouts = maki_providers::Timeouts {
                 connect: config.provider.connect_timeout,
+                low_speed: config.provider.low_speed_timeout,
                 stream: config.provider.stream_timeout,
             };
             if cli.yolo || config.always_yolo {

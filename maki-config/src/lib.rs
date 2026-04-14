@@ -34,6 +34,7 @@ pub const DEFAULT_SEARCH_RESULT_LIMIT: usize = 100;
 pub const DEFAULT_INTERPRETER_MAX_MEMORY_MB: usize = 50;
 
 pub const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
+pub const DEFAULT_LOW_SPEED_TIMEOUT_SECS: u64 = 30;
 pub const DEFAULT_STREAM_TIMEOUT_SECS: u64 = 300;
 
 pub const DEFAULT_MAX_LOG_BYTES_MB: u64 = 200;
@@ -59,6 +60,7 @@ pub const MIN_MAX_LOG_FILES: u32 = 1;
 pub const MIN_INPUT_HISTORY_SIZE: usize = 10;
 pub const MIN_MAX_FILE_SIZE_MB: u64 = 1;
 pub const MIN_CONNECT_TIMEOUT_SECS: u64 = 1;
+pub const MIN_LOW_SPEED_TIMEOUT_SECS: u64 = 1;
 pub const MIN_STREAM_TIMEOUT_SECS: u64 = 10;
 
 #[derive(Debug, Clone, Copy)]
@@ -201,6 +203,7 @@ struct AgentFileConfig {
 struct ProviderFileConfig {
     default_model: Option<String>,
     connect_timeout_secs: Option<u64>,
+    low_speed_timeout_secs: Option<u64>,
     stream_timeout_secs: Option<u64>,
 }
 
@@ -531,6 +534,11 @@ pub struct ProviderConfig {
              desc = "HTTP connect timeout (seconds)")]
     pub connect_timeout: Duration,
 
+    #[config(key = "low_speed_timeout_secs", ty = "u64", default = DEFAULT_LOW_SPEED_TIMEOUT_SECS,
+             min = MIN_LOW_SPEED_TIMEOUT_SECS, val = "self.low_speed_timeout.as_secs()",
+             desc = "Low speed timeout (seconds with less than 1 byte received)")]
+    pub low_speed_timeout: Duration,
+
     #[config(key = "stream_timeout_secs", ty = "u64", default = DEFAULT_STREAM_TIMEOUT_SECS,
              min = MIN_STREAM_TIMEOUT_SECS, val = "self.stream_timeout.as_secs()",
              desc = "Streaming response timeout (seconds)")]
@@ -542,6 +550,7 @@ impl Default for ProviderConfig {
         Self {
             default_model: None,
             connect_timeout: Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS),
+            low_speed_timeout: Duration::from_secs(DEFAULT_LOW_SPEED_TIMEOUT_SECS),
             stream_timeout: Duration::from_secs(DEFAULT_STREAM_TIMEOUT_SECS),
         }
     }
@@ -554,6 +563,10 @@ impl ProviderConfig {
             connect_timeout: Duration::from_secs(
                 f.connect_timeout_secs
                     .unwrap_or(DEFAULT_CONNECT_TIMEOUT_SECS),
+            ),
+            low_speed_timeout: Duration::from_secs(
+                f.low_speed_timeout_secs
+                    .unwrap_or(DEFAULT_LOW_SPEED_TIMEOUT_SECS),
             ),
             stream_timeout: Duration::from_secs(
                 f.stream_timeout_secs.unwrap_or(DEFAULT_STREAM_TIMEOUT_SECS),

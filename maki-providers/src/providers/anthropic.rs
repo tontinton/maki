@@ -311,7 +311,7 @@ impl Anthropic {
     pub fn new(timeouts: super::Timeouts) -> Result<Self, AgentError> {
         let resolved = resolve_auth()?;
         Ok(Self {
-            client: super::http_client(timeouts.connect),
+            client: super::http_client(timeouts),
             auth: Arc::new(Mutex::new(resolved)),
             system_prefix: None,
             stream_timeout: timeouts.stream,
@@ -323,7 +323,7 @@ impl Anthropic {
         timeouts: super::Timeouts,
     ) -> Self {
         Self {
-            client: super::http_client(timeouts.connect),
+            client: super::http_client(timeouts),
             auth,
             system_prefix: None,
             stream_timeout: timeouts.stream,

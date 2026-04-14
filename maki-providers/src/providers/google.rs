@@ -89,7 +89,7 @@ impl Google {
     pub fn new(timeouts: super::Timeouts) -> Result<Self, AgentError> {
         let resolved = resolve_auth()?;
         Ok(Self {
-            client: http_client(timeouts.connect),
+            client: http_client(timeouts),
             auth: Arc::new(Mutex::new(resolved)),
             stream_timeout: timeouts.stream,
         })
@@ -100,7 +100,7 @@ impl Google {
         timeouts: super::Timeouts,
     ) -> Self {
         Self {
-            client: http_client(timeouts.connect),
+            client: http_client(timeouts),
             auth,
             stream_timeout: timeouts.stream,
         }
@@ -574,6 +574,7 @@ mod tests {
     fn test_timeouts() -> super::super::Timeouts {
         super::super::Timeouts {
             connect: Duration::from_secs(5),
+            low_speed: Duration::from_secs(30),
             stream: Duration::from_secs(300),
         }
     }

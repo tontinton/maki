@@ -94,6 +94,7 @@ How many lines of output to show per tool in the UI. All values are `usize` with
 |-------|------|---------|-----|-------------|
 | `default_model` | String | `none` | - | Default model identifier (e.g. `anthropic/claude-sonnet-4-6`) |
 | `connect_timeout_secs` | u64 | `10` | 1 | HTTP connect timeout (seconds) |
+| `low_speed_timeout_secs` | u64 | `30` | 1 | Low speed timeout (seconds with less than 1 byte received) |
 | `stream_timeout_secs` | u64 | `300` | 10 | Streaming response timeout (seconds) |
 
 ### `[storage]`

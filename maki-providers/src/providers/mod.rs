@@ -18,12 +18,12 @@ pub(crate) mod synthetic;
 pub(crate) mod zai;
 
 const LOW_SPEED_BYTES_PER_SEC: u32 = 1;
-const LOW_SPEED_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy)]
 pub struct Timeouts {
     pub connect: Duration,
     pub stream: Duration,
+    pub low_speed: Duration,
 }
 
 impl Default for Timeouts {
@@ -31,6 +31,7 @@ impl Default for Timeouts {
         Self {
             connect: Duration::from_secs(10),
             stream: Duration::from_secs(300),
+            low_speed: Duration::from_secs(30),
         }
     }
 }
@@ -120,10 +121,10 @@ pub(crate) async fn next_sse_line<R: AsyncBufRead + Unpin>(
     result
 }
 
-pub(crate) fn http_client(connect_timeout: Duration) -> isahc::HttpClient {
+pub(crate) fn http_client(timeouts: Timeouts) -> isahc::HttpClient {
     isahc::HttpClient::builder()
-        .connect_timeout(connect_timeout)
-        .low_speed_timeout(LOW_SPEED_BYTES_PER_SEC, LOW_SPEED_TIMEOUT)
+        .connect_timeout(timeouts.connect)
+        .low_speed_timeout(LOW_SPEED_BYTES_PER_SEC, timeouts.low_speed)
         .build()
         .expect("failed to build HTTP client")
 }
