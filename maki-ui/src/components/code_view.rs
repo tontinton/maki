@@ -1,5 +1,5 @@
 use crate::highlight::{
-    advance_highlighter, fallback_span, highlight_code_plain, highlight_line, highlighter_for_path,
+    advance_highlighter, fallback_span, highlight_line, highlighter_for_path,
     highlighter_for_syntax, highlighter_for_token, syntax_for_path,
 };
 use crate::markdown::{should_truncate, truncation_notice};
@@ -13,7 +13,7 @@ use syntect::easy::HighlightLines;
 use syntect::parsing::SyntaxReference;
 use syntect::util::LinesWithEndings;
 
-const MAX_CODE_EXECUTION_LINES: usize = 100;
+pub(crate) const MAX_CODE_EXECUTION_LINES: usize = 100;
 pub(crate) const MAX_INSTRUCTION_LINES: usize = 15;
 
 pub(crate) fn instruction_limit(expanded: bool) -> usize {
@@ -412,45 +412,74 @@ pub(crate) fn render_instructions(
     truncated
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SectionFlags {
+    pub script: bool,
+    pub output: bool,
+}
+
+impl SectionFlags {
+    pub fn any(self) -> bool {
+        self.script || self.output
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct RenderLimits {
+    pub script: usize,
+    pub output: usize,
+}
+
+impl RenderLimits {
+    pub fn new(expanded: SectionFlags, output_limit: usize) -> Self {
+        Self {
+            script: if expanded.script {
+                usize::MAX
+            } else {
+                MAX_CODE_EXECUTION_LINES
+            },
+            output: if expanded.output {
+                usize::MAX
+            } else {
+                output_limit
+            },
+        }
+    }
+
+    pub fn is_output_expanded(self) -> bool {
+        self.output == usize::MAX
+    }
+}
+
 pub struct ToolContent {
     pub lines: Vec<Line<'static>>,
-    pub has_truncation: bool,
+    pub truncation: SectionFlags,
+    pub separator_line: Option<usize>,
 }
 
 pub fn render_tool_content(
     input: Option<&ToolInput>,
     output: Option<&ToolOutput>,
     highlight: bool,
-    max_lines: usize,
+    limits: RenderLimits,
 ) -> ToolContent {
     let mut lines = Vec::new();
-    let mut has_truncation = false;
-    match input {
-        Some(ToolInput::Script { language, code }) => {
-            let code_lines: Vec<String> = code
-                .trim_end_matches('\n')
-                .lines()
-                .map(String::from)
-                .collect();
-            let total = code_lines.len();
-            let hl = highlight.then(|| highlighter_for_token(language));
-            let (code_result, trunc) =
-                render_code(hl, 1, &code_lines, total, MAX_CODE_EXECUTION_LINES);
-            has_truncation |= trunc;
-            lines.extend(code_result);
+    let mut truncation = SectionFlags::default();
+    if let Some((language, code)) = input.map(|i| match i {
+        ToolInput::Script { language, code } | ToolInput::Code { language, code } => {
+            (language, code)
         }
-        Some(ToolInput::Code { language, code }) => {
-            if highlight {
-                for line in highlight_code_plain(language, code) {
-                    lines.push(line);
-                }
-            } else {
-                for text in code.trim_end_matches('\n').lines() {
-                    lines.push(Line::from(fallback_span(text)));
-                }
-            }
-        }
-        None => {}
+    }) {
+        let code_lines: Vec<String> = code
+            .trim_end_matches('\n')
+            .lines()
+            .map(String::from)
+            .collect();
+        let total = code_lines.len();
+        let hl = highlight.then(|| highlighter_for_token(language));
+        let (code_result, trunc) = render_code(hl, 1, &code_lines, total, limits.script);
+        truncation.script = trunc;
+        lines.extend(code_result);
     }
     let (output_lines, output_trunc) = match output {
         Some(ToolOutput::ReadCode {
@@ -463,7 +492,7 @@ pub fn render_tool_content(
             *start_line,
             code_lines,
             code_lines.len(),
-            max_lines,
+            limits.output,
         ),
         Some(
             ToolOutput::WriteCode {
@@ -484,7 +513,7 @@ pub fn render_tool_content(
             1,
             code_lines,
             code_lines.len(),
-            max_lines,
+            limits.output,
         ),
         Some(ToolOutput::Diff {
             path,
@@ -496,24 +525,30 @@ pub fn render_tool_content(
             false,
         ),
         Some(ToolOutput::GrepResult { entries }) => {
-            render_grep_results(entries, max_lines, highlight)
+            render_grep_results(entries, limits.output, highlight)
         }
         Some(ToolOutput::Instructions { blocks }) => {
             let mut instruction_lines = Vec::new();
-            let trunc = render_instructions(blocks, &mut instruction_lines, max_lines, highlight);
+            let trunc =
+                render_instructions(blocks, &mut instruction_lines, limits.output, highlight);
             (instruction_lines, trunc)
         }
         Some(ToolOutput::ReadDir { .. }) => (Vec::new(), false),
         _ => (Vec::new(), false),
     };
-    has_truncation |= output_trunc;
-    if !lines.is_empty() && !output_lines.is_empty() {
+    truncation.output = output_trunc;
+    let separator_line = if !lines.is_empty() && !output_lines.is_empty() {
+        let sep = lines.len();
         lines.push(Line::default());
-    }
+        Some(sep)
+    } else {
+        None
+    };
     lines.extend(output_lines);
     ToolContent {
         lines,
-        has_truncation,
+        truncation,
+        separator_line,
     }
 }
 

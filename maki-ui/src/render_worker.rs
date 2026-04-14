@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use tracing::error;
 
-use crate::components::code_view;
+use crate::components::code_view::{self, RenderLimits};
 use maki_agent::{ToolInput, ToolOutput};
 use ratatui::text::Line;
 
@@ -20,7 +20,7 @@ struct RenderJob {
     id: u64,
     tool_input: Option<Arc<ToolInput>>,
     tool_output: Option<Arc<ToolOutput>>,
-    max_lines: usize,
+    limits: RenderLimits,
 }
 
 pub struct RenderResult {
@@ -67,14 +67,14 @@ impl RenderWorker {
         &self,
         tool_input: Option<Arc<ToolInput>>,
         tool_output: Option<Arc<ToolOutput>>,
-        max_lines: usize,
+        limits: RenderLimits,
     ) -> u64 {
         let id = NEXT_JOB_ID.fetch_add(1, Ordering::Relaxed);
         let _ = self.job_tx.send(RenderJob {
             id,
             tool_input,
             tool_output,
-            max_lines,
+            limits,
         });
         self.maybe_spawn_thread();
         id
@@ -115,7 +115,7 @@ fn worker_loop(inner: &PoolInner) {
             job.tool_input.as_deref(),
             job.tool_output.as_deref(),
             true,
-            job.max_lines,
+            job.limits,
         );
         if inner
             .result_tx

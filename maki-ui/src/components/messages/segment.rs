@@ -1,5 +1,6 @@
 use crate::render_worker::RenderWorker;
 
+use super::super::code_view::SectionFlags;
 use super::super::tool_display::{HighlightRequest, ToolLines};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
@@ -48,7 +49,8 @@ pub(super) struct Segment {
     pub search_text: String,
     pub tool_id: Option<String>,
     pub msg_index: Option<usize>,
-    pub has_truncation: bool,
+    pub truncation: SectionFlags,
+    pub separator_line: Option<usize>,
     cached_height: Cell<Option<CachedHeight>>,
     pending_highlight: Option<u64>,
     highlight_range: Option<(usize, usize)>,
@@ -145,7 +147,8 @@ impl Segment {
         self.highlight_key = HighlightKey::from_request(tl.highlight.as_ref());
         self.spinner_lines = tl.spinner_lines;
         self.content_indent = tl.content_indent;
-        self.has_truncation = tl.has_truncation;
+        self.truncation = tl.truncation;
+        self.separator_line = tl.separator_line;
         self.set_lines(tl.lines);
     }
 
@@ -158,7 +161,8 @@ impl Segment {
             tl.lines.splice(s..req.range.1, hl_lines);
             Some((s, new_end))
         });
-        self.has_truncation = tl.has_truncation;
+        self.truncation = tl.truncation;
+        self.separator_line = tl.separator_line;
         if let Some((s, e)) = reused {
             self.set_lines(tl.lines);
             self.highlight_range = Some((s, e));
@@ -237,12 +241,13 @@ impl SegmentCache {
         self.segments.iter().map(|s| s.height(width) as u32).sum()
     }
 
-    pub fn segment_at_row(&self, doc_row: u32, width: u16) -> Option<(usize, &Segment)> {
+    pub fn segment_at_row(&self, doc_row: u32, width: u16) -> Option<(usize, &Segment, u32)> {
         let mut cumulative: u32 = 0;
         for (i, seg) in self.segments.iter().enumerate() {
+            let seg_start = cumulative;
             cumulative += seg.height(width) as u32;
             if doc_row < cumulative {
-                return Some((i, seg));
+                return Some((i, seg, seg_start));
             }
         }
         None

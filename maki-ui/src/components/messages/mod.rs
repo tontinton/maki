@@ -8,13 +8,14 @@ use self::render::RenderCursor;
 use self::segment::{Segment, SegmentCache, wrapped_line_count};
 use self::selection::parse_batch_inner_id;
 
-use super::streaming_content::StreamingContent;
 use super::tool_display::{
-    ToolLines, append_annotation, append_right_info, assistant_style, build_batch_entry_lines,
-    build_instructions_lines, build_tool_lines, done_style, error_style, format_timestamp_now,
-    thinking_style, tool_output_annotation, truncate_to_header, user_style,
+    ToolKind, ToolLines, append_annotation, append_right_info, assistant_style,
+    build_batch_entry_lines, build_instructions_lines, build_tool_lines, done_style, error_style,
+    format_timestamp_now, thinking_style, tool_output_annotation, truncate_to_header, user_style,
 };
-use super::{DisplayMessage, DisplayRole, ToolRole, ToolStatus, apply_scroll_delta};
+use super::{
+    DisplayMessage, DisplayRole, ToolRole, ToolStatus, apply_scroll_delta, code_view::SectionFlags,
+};
 use crate::animation::spinner_str;
 use crate::components::keybindings::key;
 use crate::markdown::{hr_line, plain_lines, text_to_lines, truncate_output};
@@ -24,12 +25,12 @@ use crate::splash::{ColorTransition, Splash};
 use crate::theme;
 use maki_config::{ToolOutputLines, UiConfig};
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
 use super::scrollbar::render_vertical_scrollbar;
-use super::tool_display::ToolKind;
+use super::streaming_content::StreamingContent;
 use maki_agent::tools::{ToolCall, WEBFETCH_TOOL_NAME};
 use maki_agent::{
     BatchToolEntry, BatchToolStatus, InstructionBlock, NO_FILES_FOUND, ToolDoneEvent, ToolOutput,
@@ -55,7 +56,7 @@ pub struct MessagesPanel {
     highlight_segment: Option<usize>,
     idle_splash: Splash,
     accent: ColorTransition,
-    expanded_tools: HashSet<String>,
+    expanded_tools: HashMap<String, SectionFlags>,
     tool_output_lines: ToolOutputLines,
 }
 
@@ -90,7 +91,7 @@ impl MessagesPanel {
             highlight_segment: None,
             idle_splash: Splash::new(ui_config.splash_animation),
             accent: ColorTransition::new(theme::current().mode_build),
-            expanded_tools: HashSet::new(),
+            expanded_tools: HashMap::new(),
             tool_output_lines: ui_config.tool_output_lines,
         }
     }
@@ -332,8 +333,12 @@ impl MessagesPanel {
         }
         let inst_id = segment::instruction_id(parent_id);
         let batch_index = parse_batch_inner_id(parent_id).map(|(_, idx)| idx + 1);
-        let expanded = self.expanded_tools.contains(&inst_id);
-        let tl = build_instructions_lines(blocks, self.viewport_width, expanded, batch_index);
+        let exp = self
+            .expanded_tools
+            .get(&inst_id)
+            .copied()
+            .unwrap_or_default();
+        let tl = build_instructions_lines(blocks, self.viewport_width, exp.output, batch_index);
 
         if let Some(seg_idx) = self.cache.find_by_tool_id(&inst_id) {
             let seg = self.cache.get_mut(seg_idx).unwrap();
@@ -461,14 +466,18 @@ impl MessagesPanel {
         else {
             return false;
         };
-        let is_expanded = self.expanded_tools.contains(tool_id);
-        if !seg.has_truncation && !is_expanded {
+        let exp = self
+            .expanded_tools
+            .get(tool_id)
+            .copied()
+            .unwrap_or_default();
+        if !seg.truncation.any() && !exp.any() {
             return false;
         }
         let tool_id = tool_id.to_owned();
-        if !self.expanded_tools.remove(&tool_id) {
-            self.expanded_tools.insert(tool_id.clone());
-        }
+        let entry = self.expanded_tools.entry(tool_id.clone()).or_default();
+        entry.script = !entry.script;
+        entry.output = !entry.output;
         self.rebuild_expanded_tool(&tool_id);
         true
     }
@@ -558,19 +567,37 @@ impl MessagesPanel {
         }
         let doc_row = (row.saturating_sub(area.y)) as u32 + self.scroll_top as u32;
         let width = self.viewport_width;
-        let Some((_, seg)) = self.cache.segment_at_row(doc_row, width) else {
+        let Some((_, seg, seg_start)) = self.cache.segment_at_row(doc_row, width) else {
             return false;
         };
         let Some(tool_id) = seg.tool_id.as_deref() else {
             return false;
         };
-        let is_expanded = self.expanded_tools.contains(tool_id);
-        if !seg.has_truncation && !is_expanded {
+        let exp = self
+            .expanded_tools
+            .get(tool_id)
+            .copied()
+            .unwrap_or_default();
+        if !seg.truncation.any() && !exp.any() {
             return false;
         }
+        let click_line = (doc_row - seg_start) as usize;
         let tool_id = tool_id.to_owned();
-        if !self.expanded_tools.remove(&tool_id) {
-            self.expanded_tools.insert(tool_id.clone());
+        let truncation = seg.truncation;
+        let separator_line = seg.separator_line;
+
+        let entry = self.expanded_tools.entry(tool_id.clone()).or_default();
+        match separator_line {
+            Some(sep) if click_line < sep => {
+                if truncation.script || entry.script {
+                    entry.script = !entry.script;
+                }
+            }
+            _ => {
+                if truncation.output || entry.output {
+                    entry.output = !entry.output;
+                }
+            }
         }
         self.rebuild_expanded_tool(&tool_id);
         true
@@ -759,10 +786,10 @@ impl MessagesPanel {
         status: ToolStatus,
         started_at: Instant,
         width: u16,
-        expanded: bool,
+        exp: SectionFlags,
         tool_output_lines: &ToolOutputLines,
     ) -> ToolLines {
-        let mut tl = build_tool_lines(msg, status, started_at, width, expanded, tool_output_lines);
+        let mut tl = build_tool_lines(msg, status, started_at, width, exp, tool_output_lines);
         if let Some(ts) = &msg.timestamp
             && !tl.lines.is_empty()
         {
@@ -826,13 +853,17 @@ impl MessagesPanel {
             return;
         };
 
-        let expanded = self.expanded_tools.contains(tool_id);
+        let exp = self
+            .expanded_tools
+            .get(tool_id)
+            .copied()
+            .unwrap_or_default();
         let tl = Self::build_tool_segment_lines(
             msg,
             status,
             self.started_at,
             self.viewport_width,
-            expanded,
+            exp,
             &self.tool_output_lines,
         );
 
@@ -868,13 +899,17 @@ impl MessagesPanel {
             .enumerate()
             .map(|(j, entry)| {
                 let child_id = format!("{tool_id}__{j}");
-                let child_expanded = self.expanded_tools.contains(&child_id);
+                let child_exp = self
+                    .expanded_tools
+                    .get(&child_id)
+                    .copied()
+                    .unwrap_or_default();
                 let tl = build_batch_entry_lines(
                     entry,
                     j,
                     self.started_at,
                     self.viewport_width,
-                    child_expanded,
+                    child_exp,
                     &self.tool_output_lines,
                 );
                 let search = tl.search_text.clone();
@@ -921,14 +956,14 @@ impl MessagesPanel {
             let msg = &self.messages[i];
 
             if let DisplayRole::Tool(t) = &msg.role {
-                let expanded = self.expanded_tools.contains(&t.id);
+                let exp = self.expanded_tools.get(&t.id).copied().unwrap_or_default();
                 let status = t.status;
                 let tl = Self::build_tool_segment_lines(
                     msg,
                     status,
                     self.started_at,
                     self.viewport_width,
-                    expanded,
+                    exp,
                     &self.tool_output_lines,
                 );
                 let id = t.id.clone();
@@ -945,13 +980,17 @@ impl MessagesPanel {
                         .enumerate()
                         .map(|(j, entry)| {
                             let child_id = format!("{id}__{j}");
-                            let child_expanded = self.expanded_tools.contains(&child_id);
+                            let child_exp = self
+                                .expanded_tools
+                                .get(&child_id)
+                                .copied()
+                                .unwrap_or_default();
                             let tl = build_batch_entry_lines(
                                 entry,
                                 j,
                                 self.started_at,
                                 self.viewport_width,
-                                child_expanded,
+                                child_exp,
                                 &self.tool_output_lines,
                             );
                             let blocks = entry.output.as_ref().and_then(|o| o.owned_instructions());
