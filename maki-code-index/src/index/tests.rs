@@ -1036,3 +1036,135 @@ end
     );
     lacks(&out, &[":ok", "true", "{:ok, state}"]);
 }
+
+#[test]
+#[cfg(feature = "lang-markdown")]
+fn markdown_atx_headings() {
+    let src = r#"# Main Title
+
+## Section 1
+
+Some text here.
+
+### Subsection 1.1
+
+More content.
+
+## Section 2
+
+### Another Subsection 2.1
+
+#### Deep Heading 2.1.3
+
+# Footer Title
+
+And some more content
+"#;
+    let out = idx(src, Language::Markdown);
+    has(
+        &out,
+        &[
+            "headings:",
+            "# Main Title [1-16]",
+            "## Section 1 [3-10]",
+            "### Subsection 1.1 [7-10]",
+            "## Section 2 [11-16]",
+            "### Another Subsection 2.1 [13-16]",
+            "#### Deep Heading 2.1.3 [15-16]",
+            "# Footer Title [17-20]",
+        ],
+    );
+    lacks(
+        &out,
+        &["Some text here", "More content", "And some more content"],
+    );
+}
+
+#[test]
+#[cfg(feature = "lang-markdown")]
+fn markdown_atx_headings_no_newline() {
+    let src = r#"# Main Title
+Some text here
+# Footer Title"#;
+    let out = idx(src, Language::Markdown);
+    has(
+        &out,
+        &["headings:", "# Main Title [1-2]", "# Footer Title [3-3]"],
+    );
+    lacks(&out, &["Some text here"]);
+}
+
+#[test]
+#[cfg(feature = "lang-markdown")]
+fn markdown_setext_headings() {
+    let src = r#"Heading 1
+=========
+
+Some text here
+
+Heading 1.1
+---------
+
+More content
+
+Heading 2
+=========
+
+And some more content
+"#;
+    let out = idx(src, Language::Markdown);
+    has(
+        &out,
+        &[
+            "headings:",
+            "# Heading 1 [1-10]",
+            "## Heading 1.1 [6-10]",
+            "# Heading 2 [11-15]",
+        ],
+    );
+    lacks(
+        &out,
+        &["Some text here", "More content", "And some more content"],
+    );
+}
+
+#[test]
+#[cfg(feature = "lang-markdown")]
+fn markdown_mixed_atx_setext_headings() {
+    let src = r#"Heading 1
+=========
+
+Some text here
+
+## Heading 1.1
+
+More content
+
+Heading 2
+=========
+
+And some more content
+"#;
+    let out = idx(src, Language::Markdown);
+    has(
+        &out,
+        &[
+            "headings:",
+            "# Heading 1 [1-9]",
+            "## Heading 1.1 [6-9]",
+            "# Heading 2 [10-14]",
+        ],
+    );
+    lacks(
+        &out,
+        &["Some text here", "More content", "And some more content"],
+    );
+}
+
+#[test]
+#[cfg(feature = "lang-markdown")]
+fn markdown_empty() {
+    let src = r#""#;
+    let out = idx(src, Language::Markdown);
+    assert!(out.is_empty());
+}

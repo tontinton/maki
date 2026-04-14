@@ -83,10 +83,10 @@ pub(crate) fn has_test_attr(attrs: &[Node], source: &[u8]) -> bool {
     })
 }
 
-pub(crate) fn doc_comment_start_line(
+pub(crate) fn doc_comment_start_line<E: LanguageExtractor + ?Sized>(
     node: Node,
     source: &[u8],
-    extractor: &dyn LanguageExtractor,
+    extractor: &E,
 ) -> Option<usize> {
     let mut earliest: Option<usize> = None;
     let mut prev = node.prev_sibling();
@@ -309,6 +309,7 @@ pub(crate) enum Section {
     Class,
     Macro,
     Test,
+    Heading,
 }
 
 impl Section {
@@ -324,6 +325,7 @@ impl Section {
             Self::Class => "classes:",
             Self::Macro => "macros:",
             Self::Test => "tests:",
+            Self::Heading => "headings:",
         }
     }
 }
@@ -421,8 +423,48 @@ impl SkeletonEntry {
 }
 
 pub(crate) trait LanguageExtractor {
-    fn extract_nodes(&self, node: Node, source: &[u8], attrs: &[Node]) -> Vec<SkeletonEntry>;
-    fn is_doc_comment(&self, node: Node, source: &[u8]) -> bool;
+    fn extract_nodes_from_root(
+        &self,
+        root: Node,
+        source: &[u8],
+    ) -> (Vec<SkeletonEntry>, Vec<usize>) {
+        let mut entries = Vec::new();
+        let mut test_lines: Vec<usize> = Vec::new();
+
+        let mut cursor = root.walk();
+        for child in root.children(&mut cursor) {
+            if self.is_attr(child) || self.is_doc_comment(child, source) {
+                continue;
+            }
+            let attrs = self.collect_preceding_attrs(child);
+            if self.is_test_node(child, source, &attrs) {
+                test_lines.push(child.start_position().row + 1);
+                continue;
+            }
+            for (i, mut entry) in self
+                .extract_nodes(child, source, &attrs)
+                .into_iter()
+                .enumerate()
+            {
+                if i == 0
+                    && let Some(doc_start) = doc_comment_start_line(child, source, self)
+                {
+                    entry.line_start = entry.line_start.min(doc_start);
+                }
+                entries.push(entry);
+            }
+        }
+
+        (entries, test_lines)
+    }
+
+    fn extract_nodes(&self, _node: Node, _source: &[u8], _attrs: &[Node]) -> Vec<SkeletonEntry> {
+        vec![]
+    }
+
+    fn is_doc_comment(&self, _node: Node, _source: &[u8]) -> bool {
+        false
+    }
 
     fn is_test_node(&self, _node: Node, _source: &[u8], _attrs: &[Node]) -> bool {
         false
@@ -476,6 +518,7 @@ pub(crate) fn format_skeleton(
         match section {
             Section::Import => format_imports(&mut out, items, import_sep),
             Section::Module => format_leaf_section(&mut out, section.header(), items),
+            Section::Heading => format_heading(&mut out, section.header(), items),
             _ => format_section(&mut out, section.header(), items),
         }
     }
@@ -537,6 +580,17 @@ fn format_leaf_section(out: &mut String, header: &str, items: &[&SkeletonEntry])
     let indent = "  ";
     for line in wrap_csv(&names, indent) {
         let _ = writeln!(out, "{line}");
+    }
+}
+
+fn format_heading(out: &mut String, header: &str, items: &[&SkeletonEntry]) {
+    let sep = if out.is_empty() { "" } else { "\n" };
+    let _ = writeln!(out, "{sep}{header}");
+    for entry in items {
+        let EntryData::Item { text, .. } = &entry.data else {
+            continue;
+        };
+        let _ = writeln!(out, "  {} [{}-{}]", text, entry.line_start, entry.line_end);
     }
 }
 

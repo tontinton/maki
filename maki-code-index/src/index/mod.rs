@@ -3,7 +3,7 @@ use std::path::Path;
 use tree_sitter::Parser;
 
 use crate::Language;
-use common::{detect_module_doc, doc_comment_start_line, format_skeleton};
+use common::{detect_module_doc, format_skeleton};
 
 #[cfg(test)]
 pub(crate) const MAX_FILE_SIZE: u64 = 2 * 1024 * 1024;
@@ -27,6 +27,8 @@ pub(crate) mod java;
 pub(crate) mod kotlin;
 #[cfg(feature = "lang-lua")]
 pub(crate) mod lua;
+#[cfg(feature = "lang-markdown")]
+pub(crate) mod markdown;
 #[cfg(feature = "lang-php")]
 pub(crate) mod php;
 #[cfg(feature = "lang-python")]
@@ -85,32 +87,7 @@ pub fn index_source(source: &[u8], lang: Language) -> Result<String, IndexError>
     let extractor = lang.extractor();
 
     let module_doc = detect_module_doc(root, source, extractor);
-    let mut entries = Vec::new();
-    let mut test_lines: Vec<usize> = Vec::new();
-
-    let mut cursor = root.walk();
-    for child in root.children(&mut cursor) {
-        if extractor.is_attr(child) || extractor.is_doc_comment(child, source) {
-            continue;
-        }
-        let attrs = extractor.collect_preceding_attrs(child);
-        if extractor.is_test_node(child, source, &attrs) {
-            test_lines.push(child.start_position().row + 1);
-            continue;
-        }
-        for (i, mut entry) in extractor
-            .extract_nodes(child, source, &attrs)
-            .into_iter()
-            .enumerate()
-        {
-            if i == 0
-                && let Some(doc_start) = doc_comment_start_line(child, source, extractor)
-            {
-                entry.line_start = entry.line_start.min(doc_start);
-            }
-            entries.push(entry);
-        }
-    }
+    let (entries, test_lines) = extractor.extract_nodes_from_root(root, source);
 
     Ok(format_skeleton(
         &entries,

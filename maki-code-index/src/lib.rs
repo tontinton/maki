@@ -48,6 +48,8 @@ pub enum Language {
     Lua,
     #[cfg(feature = "lang-elixir")]
     Elixir,
+    #[cfg(feature = "lang-markdown")]
+    Markdown,
 }
 
 impl Language {
@@ -91,6 +93,8 @@ impl Language {
             "lua" => Some(Self::Lua),
             #[cfg(feature = "lang-elixir")]
             "ex" | "exs" => Some(Self::Elixir),
+            #[cfg(feature = "lang-markdown")]
+            "md" | "markdown" => Some(Self::Markdown),
             _ => None,
         }
     }
@@ -131,6 +135,8 @@ impl Language {
             Self::Lua => tree_sitter_lua::LANGUAGE.into(),
             #[cfg(feature = "lang-elixir")]
             Self::Elixir => tree_sitter_elixir::LANGUAGE.into(),
+            #[cfg(feature = "lang-markdown")]
+            Self::Markdown => tree_sitter_md::LANGUAGE.into(),
         }
     }
 
@@ -170,6 +176,8 @@ impl Language {
             Self::Lua => &index::lua::LuaExtractor,
             #[cfg(feature = "lang-elixir")]
             Self::Elixir => &index::elixir::ElixirExtractor,
+            #[cfg(feature = "lang-markdown")]
+            Self::Markdown => &index::markdown::MarkdownExtractor,
         }
     }
 }
