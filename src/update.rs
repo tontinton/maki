@@ -1,3 +1,5 @@
+#[cfg(unix)]
+use std::ffi::CString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -90,16 +92,44 @@ fn execute_script(script: &str) -> Result<(), UpdateError> {
     Ok(())
 }
 
+#[cfg(unix)]
+fn needs_sudo(path: &Path) -> bool {
+    let Some(dir) = path.parent() else {
+        return false;
+    };
+    let Ok(cpath) = CString::new(dir.as_os_str().as_encoded_bytes()) else {
+        return false;
+    };
+    unsafe { libc::access(cpath.as_ptr(), libc::W_OK) != 0 }
+}
+
+#[cfg(not(unix))]
+fn needs_sudo(_path: &Path) -> bool {
+    false
+}
+
 fn restore_backup(backup_path: &Path, exe_path: &Path) -> Result<(), UpdateError> {
-    let tmp = exe_path.with_extension("maki_tmp");
-    std::fs::copy(backup_path, &tmp).map_err(|e| UpdateError::Restore {
+    let err = |e| UpdateError::Restore {
         path: backup_path.to_path_buf(),
         source: e,
-    })?;
-    std::fs::rename(&tmp, exe_path).map_err(|e| UpdateError::Restore {
-        path: backup_path.to_path_buf(),
-        source: e,
-    })?;
+    };
+
+    if needs_sudo(exe_path) {
+        println!("Restoring to {} (requires sudo)...", exe_path.display());
+        let status = std::process::Command::new("sudo")
+            .args(["cp", "--"])
+            .arg(backup_path)
+            .arg(exe_path)
+            .status()
+            .map_err(err)?;
+        if !status.success() {
+            return Err(err(std::io::Error::other("sudo cp failed")));
+        }
+    } else {
+        let tmp = exe_path.with_extension("maki_tmp");
+        std::fs::copy(backup_path, &tmp).map_err(err)?;
+        std::fs::rename(&tmp, exe_path).map_err(err)?;
+    }
     Ok(())
 }
 

@@ -2134,6 +2134,7 @@ dependencies = [
  "flume 0.11.1",
  "futures-lite",
  "isahc",
+ "libc",
  "maki-agent",
  "maki-code-index",
  "maki-config",
