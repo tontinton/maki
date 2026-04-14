@@ -261,6 +261,7 @@ impl Bash {
         match status {
             Ok(status) => {
                 flush_output(ctx, &output, &mut last_len);
+                let exit_code = status.code().unwrap_or(-1);
                 let content = truncate_output(
                     output,
                     ctx.config.max_output_lines,
@@ -268,10 +269,16 @@ impl Bash {
                 );
                 if !status.success() {
                     if content.is_empty() {
-                        return Err(format!("exited with code {}", status.code().unwrap_or(-1)));
+                        return Err(format!("Exit code: {exit_code}"));
                     }
-                    return Err(content);
+                    return Err(format!("{content}\nExit code: {exit_code}"));
                 }
+                // Return exit code only when there's no other output
+                let content = if content.is_empty() {
+                    format!("Exit code: {exit_code}")
+                } else {
+                    content
+                };
                 Ok(ToolOutput::Plain(content))
             }
             Err(reason) => {
@@ -423,6 +430,33 @@ mod tests {
             b.workdir = Some(dir.path().to_string_lossy().into());
             let out = b.execute(&ctx).await.unwrap().as_text();
             assert_eq!(out.trim(), "ok");
+        });
+    }
+
+    #[test]
+    fn execute_empty_output_includes_exit_code() {
+        smol::block_on(async {
+            let ctx = stub_ctx(&AgentMode::Build);
+            let out = bash("true").execute(&ctx).await.unwrap().as_text();
+            assert_eq!(out, "Exit code: 0");
+        });
+    }
+
+    #[test]
+    fn execute_success_with_output() {
+        smol::block_on(async {
+            let ctx = stub_ctx(&AgentMode::Build);
+            let out = bash("echo hello").execute(&ctx).await.unwrap().as_text();
+            assert_eq!(out.trim(), "hello");
+        });
+    }
+
+    #[test]
+    fn execute_false_exit_code() {
+        smol::block_on(async {
+            let ctx = stub_ctx(&AgentMode::Build);
+            let err = bash("false").execute(&ctx).await.unwrap_err();
+            assert_eq!(err, "Exit code: 1");
         });
     }
 
