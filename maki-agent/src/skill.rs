@@ -15,10 +15,15 @@ const PROJECT_SKILL_DIRS: &[&str] = &[
     ".maki/skills",
     ".claude/skills",
     ".opencode/skills",
-    ".opencode/skill",
+    ".agents/skills",
 ];
 
-const GLOBAL_SKILL_DIRS: &[&str] = &[".maki/skills", ".claude/skills", ".opencode/skills"];
+const GLOBAL_SKILL_DIRS: &[&str] = &[
+    ".maki/skills",
+    ".claude/skills",
+    ".config/opencode/skills",
+    ".agents/skills",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Skill {
@@ -270,7 +275,7 @@ mod tests {
             (".maki/skills/a-skill", "a-skill"),
             (".claude/skills/b-skill", "b-skill"),
             (".opencode/skills/c-skill", "c-skill"),
-            (".opencode/skill/d-skill", "d-skill"),
+            (".agents/skills/d-skill", "d-skill"),
         ] {
             let path = dir.path().join(skill_dir);
             fs::create_dir_all(&path).unwrap();
