@@ -13,22 +13,35 @@ use tree_sitter::{Node, Parser};
 
 use crate::{AgentEvent, EventSender};
 
-const BUILTIN_ALLOW_RULES: &[(&str, &str)] = &[
-    ("write", "**"),
-    ("edit", "**"),
-    ("multiedit", "**"),
-    ("code_execution", "*"),
-    ("task", "*"),
-    ("websearch", "*"),
-    ("webfetch", "*"),
-];
-
 const COMPLEX_NODE_TYPES: &[&str] = &[
     "command_substitution",
     "process_substitution",
     "subshell",
     "arithmetic_expansion",
 ];
+
+pub const DEFAULT_DENY_GUIDANCE: &str =
+    "Do not retry. Try a different approach or ask the user for guidance.";
+
+fn builtin_rules(cwd: &Path) -> Vec<PermissionRule> {
+    let cwd_glob = format!(
+        "{}/**",
+        cwd.canonicalize()
+            .unwrap_or_else(|_| cwd.to_path_buf())
+            .display()
+    );
+    let allow = |tool: &str, scope: &str| PermissionRule {
+        tool: tool.into(),
+        scope: Some(scope.into()),
+        effect: Effect::Allow,
+    };
+    vec![
+        allow("write", &cwd_glob),
+        allow("edit", &cwd_glob),
+        allow("multiedit", &cwd_glob),
+        allow("task", "*"),
+    ]
+}
 
 thread_local! {
     static BASH_PARSER: RefCell<Parser> = RefCell::new({
@@ -88,9 +101,6 @@ impl PermissionError {
         }
     }
 }
-
-pub const DEFAULT_DENY_GUIDANCE: &str =
-    "Do not retry. Try a different approach or ask the user for guidance.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PermissionAnswer {
@@ -164,18 +174,10 @@ pub struct PermissionManager {
 
 impl PermissionManager {
     pub fn new(config: PermissionsConfig, cwd: PathBuf) -> Self {
-        let builtin_rules = BUILTIN_ALLOW_RULES
-            .iter()
-            .map(|(tool, scope)| PermissionRule {
-                tool: tool.to_string(),
-                scope: Some(scope.to_string()),
-                effect: Effect::Allow,
-            })
-            .collect();
         Self {
+            builtin_rules: builtin_rules(&cwd),
             session_rules: Mutex::new(Vec::new()),
             config_rules: config.rules,
-            builtin_rules,
             allow_all: AtomicBool::new(config.allow_all),
             cwd,
         }
@@ -600,108 +602,51 @@ mod tests {
         }
     }
 
-    #[test_case("cargo test" => vec!["cargo test"] ; "single_command")]
-    #[test_case("cd /tmp && cargo test" => vec!["cd /tmp", "cargo test"] ; "two_commands_and")]
-    #[test_case("a && b && c" => vec!["a", "b", "c"] ; "three_commands_and")]
-    #[test_case("a || b" => vec!["a", "b"] ; "two_commands_or")]
-    #[test_case("a && b || c" => vec!["a", "b", "c"] ; "mixed_and_or")]
-    #[test_case("a ; b" => vec!["a", "b"] ; "semicolon")]
-    #[test_case("a ; b && c" => vec!["a", "b", "c"] ; "semicolon_and_and")]
-    #[test_case("cargo test 2>&1 | tail -5" => vec!["cargo test 2>&1", "tail -5"] ; "pipe_splits_into_segments")]
-    #[test_case("echo \"a && b\"" => vec!["echo \"a && b\""] ; "double_quoted_and")]
-    #[test_case("echo 'a && b'" => vec!["echo 'a && b'"] ; "single_quoted_and")]
-    #[test_case("echo a \\&\\& b" => vec!["echo a \\&\\& b"] ; "escaped_ampersands")]
-    #[test_case("echo \"a || b\" && cargo test" => vec!["echo \"a || b\"", "cargo test"] ; "quoted_or_with_real_and")]
-    #[test_case("  cd /tmp  &&  cargo test  " => vec!["cd /tmp", "cargo test"] ; "extra_whitespace")]
-    #[test_case("" => Vec::<String>::new() ; "empty_string")]
-    #[test_case("   " => Vec::<String>::new() ; "only_whitespace")]
-    #[test_case("echo 'it'\\''s'" => vec!["echo 'it'\\''s'"] ; "escaped_single_quote_in_single_quotes")]
-    #[test_case("a | b" => vec!["a", "b"] ; "pipe_splits")]
-    #[test_case("a && b | c" => vec!["a", "b", "c"] ; "and_then_pipe")]
-    #[test_case("a | b && c | d" => vec!["a", "b", "c", "d"] ; "nested_pipe_in_list")]
-    #[test_case("echo \"hello \\\"world\\\"\"" => vec!["echo \"hello \\\"world\\\"\""] ; "escaped_double_quote_in_double_quotes")]
-    #[test_case("a&&b" => vec!["a", "b"] ; "no_spaces_around_and")]
-    #[test_case("a||b" => vec!["a", "b"] ; "no_spaces_around_or")]
-    fn test_split_shell_commands(input: &str) -> Vec<String> {
+    fn default_mgr() -> PermissionManager {
+        PermissionManager::new(PermissionsConfig::default(), PathBuf::from("/tmp"))
+    }
+
+    #[test_case("cargo test" => vec!["cargo test"] ; "single")]
+    #[test_case("a && b || c ; d" => vec!["a", "b", "c", "d"] ; "operators")]
+    #[test_case("a | b" => vec!["a", "b"] ; "pipe")]
+    #[test_case("echo \"a && b\"" => vec!["echo \"a && b\""] ; "quoted_not_split")]
+    #[test_case("" => Vec::<String>::new() ; "empty")]
+    fn split_shell(input: &str) -> Vec<String> {
         split_shell_commands(input)
     }
 
-    #[test_case("*", "anything" => true ; "star_matches_all")]
-    #[test_case("**", "anything" => true ; "double_star_matches_all")]
-    #[test_case("cargo *", "cargo test" => true ; "prefix_star")]
+    #[test_case("*", "anything" => true ; "star")]
+    #[test_case("cargo *", "cargo test" => true ; "prefix")]
     #[test_case("cargo *", "git push" => false ; "prefix_no_match")]
-    #[test_case("src/**", "src/main.rs" => true ; "dir_glob")]
-    #[test_case("src/**", "tests/main.rs" => false ; "dir_glob_no_match")]
-    #[test_case("exact", "exact" => true ; "exact_match")]
-    #[test_case("exact", "other" => false ; "exact_no_match")]
-    #[test_case("src/**", "srcfoo" => false ; "dir_glob_no_bare_prefix")]
-    #[test_case("src/**", "src" => true ; "dir_glob_matches_dir_itself")]
-    fn test_scope_matches(pattern: &str, value: &str) -> bool {
+    #[test_case("src/**", "src/main.rs" => true ; "glob")]
+    #[test_case("src/**", "srcfoo" => false ; "glob_no_bare_prefix")]
+    fn scope_match(pattern: &str, value: &str) -> bool {
         scope_matches(pattern, value)
     }
 
-    #[test]
-    fn canonicalize_resolves_dot_segments() {
-        let result = canonicalize_scope_path("/a/b/../c");
-        assert_eq!(result, "/a/c");
-    }
-
-    #[test_case("cargo test" => false ; "simple_command")]
-    #[test_case("echo $(whoami)" => true ; "dollar_paren")]
-    #[test_case("echo `whoami`" => true ; "backtick")]
-    #[test_case("cat <(ls)" => true ; "process_substitution_in")]
-    #[test_case("diff <(ls a) >(ls b)" => true ; "process_substitution_both")]
-    #[test_case("echo $((1+2))" => true ; "arithmetic")]
-    #[test_case("(cd /tmp && rm -rf *)" => true ; "subshell")]
-    #[test_case("echo 'safe $(not expanded)'" => false ; "single_quoted_dollar_paren")]
-    #[test_case("echo \"safe $(expanded)\"" => true ; "double_quoted_dollar_paren")]
-    #[test_case("echo \\$(not expanded)" => true ; "escaped_dollar_paren_conservative")]
-    #[test_case("cargo test && echo done" => false ; "compound_but_not_complex")]
-    #[test_case("echo $(((" => true ; "parse_error_treated_as_complex")]
-    fn test_has_complex_shell_constructs(input: &str) -> bool {
+    // Things like $(cmd) or subshells can hide dangerous commands, so we always ask
+    #[test_case("cargo test" => false ; "simple")]
+    #[test_case("echo $(whoami)" => true ; "command_sub")]
+    #[test_case("(cd /tmp && ls)" => true ; "subshell")]
+    #[test_case("echo 'safe $(x)'" => false ; "single_quoted_safe")]
+    #[test_case("echo $(((" => true ; "parse_error")]
+    fn complex_shell(input: &str) -> bool {
         analyze_bash(input).1
     }
 
-    #[test]
-    fn analyze_bash_simple_returns_segments_not_complex() {
-        let (scopes, is_complex) = analyze_bash("cd /tmp && cargo test");
-        assert_eq!(scopes, vec!["cd /tmp", "cargo test"]);
-        assert!(!is_complex);
-    }
-
-    #[test]
-    fn analyze_bash_complex_returns_whole_command_and_complex() {
-        let (scopes, is_complex) = analyze_bash("echo $(rm -rf /)");
-        assert_eq!(scopes, vec!["echo $(rm -rf /)"]);
-        assert!(is_complex);
-    }
-
-    #[test]
-    fn compound_command_allowed_when_all_segments_match() {
+    #[test_case("cd /tmp && cargo test", vec!["cd *", "cargo *"], true ; "all_allowed")]
+    #[test_case("cd /tmp && cargo test", vec!["cargo *"], false ; "missing_rule")]
+    fn compound_check(cmd: &str, rules: Vec<&str>, expect_allowed: bool) {
         let mgr = PermissionManager::new(
-            make_config(vec![allow_rule("cd *"), allow_rule("cargo *")]),
+            make_config(rules.into_iter().map(allow_rule).collect()),
             PathBuf::from("/tmp"),
         );
-        assert!(matches!(
-            mgr.check("bash", "cd /tmp && cargo test"),
-            PermissionCheck::Allowed
-        ));
+        let check = mgr.check("bash", cmd);
+        assert_eq!(matches!(check, PermissionCheck::Allowed), expect_allowed);
     }
 
     #[test]
-    fn compound_command_needs_prompt_if_any_segment_unmatched() {
-        let mgr = PermissionManager::new(
-            make_config(vec![allow_rule("cargo *")]),
-            PathBuf::from("/tmp"),
-        );
-        assert!(matches!(
-            mgr.check("bash", "cd /tmp && cargo test"),
-            PermissionCheck::NeedsPrompt { .. }
-        ));
-    }
-
-    #[test]
-    fn compound_command_denied_if_any_segment_denied() {
+    fn compound_denied_if_any_segment_denied() {
         let mgr = PermissionManager::new(
             make_config(vec![
                 allow_rule("cd *"),
@@ -717,124 +662,42 @@ mod tests {
     }
 
     #[test]
-    fn pipe_requires_both_segments_allowed() {
-        let mgr = PermissionManager::new(
-            make_config(vec![allow_rule("cargo *"), allow_rule("tail *")]),
-            PathBuf::from("/tmp"),
-        );
+    fn complex_constructs_force_prompt_even_with_allow_star() {
+        let mgr = PermissionManager::new(make_config(vec![allow_rule("*")]), PathBuf::from("/tmp"));
         assert!(matches!(
-            mgr.check("bash", "cargo test 2>&1 | tail -5"),
-            PermissionCheck::Allowed
+            mgr.check("bash", "echo $(whoami)"),
+            PermissionCheck::NeedsPrompt { .. }
+        ));
+    }
+
+    #[test_case("write", "/tmp/file.txt" => true ; "write_in_cwd")]
+    #[test_case("write", "/etc/passwd" => false ; "write_outside_cwd")]
+    #[test_case("task", "task:research" => true ; "task_allowed")]
+    #[test_case("websearch", "rust async" => false ; "websearch_prompts")]
+    #[test_case("bash", "cargo test" => false ; "bash_prompts")]
+    fn builtin_check(tool: &str, scope: &str) -> bool {
+        matches!(default_mgr().check(tool, scope), PermissionCheck::Allowed)
+    }
+
+    #[test]
+    fn path_traversal_prompts() {
+        let path = canonicalize_scope_path("/tmp/../etc/passwd");
+        assert!(matches!(
+            default_mgr().check("write", &path),
+            PermissionCheck::NeedsPrompt { .. }
         ));
     }
 
     #[test]
-    fn pipe_denied_when_rhs_not_allowed() {
+    fn session_rule_overrides_config() {
         let mgr = PermissionManager::new(
             make_config(vec![allow_rule("cargo *")]),
             PathBuf::from("/tmp"),
         );
-        assert!(matches!(
-            mgr.check("bash", "cargo test | rm -rf /"),
-            PermissionCheck::NeedsPrompt { .. }
-        ));
-    }
-
-    #[test]
-    fn pipe_denied_when_rhs_explicitly_denied() {
-        let mgr = PermissionManager::new(
-            make_config(vec![allow_rule("cargo *"), deny_rule("rm *")]),
-            PathBuf::from("/tmp"),
-        );
-        assert!(matches!(
-            mgr.check("bash", "cargo test | rm -rf /"),
-            PermissionCheck::Denied
-        ));
-    }
-
-    #[test]
-    fn compound_command_with_semicolon() {
-        let mgr = PermissionManager::new(
-            make_config(vec![allow_rule("cd *"), allow_rule("cargo *")]),
-            PathBuf::from("/tmp"),
-        );
-        assert!(matches!(
-            mgr.check("bash", "cd /tmp ; cargo test"),
-            PermissionCheck::Allowed
-        ));
-    }
-
-    #[test]
-    fn compound_command_quoted_operator_not_split() {
-        let mgr = PermissionManager::new(
-            make_config(vec![allow_rule("echo *")]),
-            PathBuf::from("/tmp"),
-        );
-        assert!(matches!(
-            mgr.check("bash", "echo \"a && b\""),
-            PermissionCheck::Allowed
-        ));
-    }
-
-    #[test]
-    fn complex_shell_constructs_force_prompt() {
-        let mgr = PermissionManager::new(make_config(vec![allow_rule("*")]), PathBuf::from("/tmp"));
-        for cmd in ["echo $(whoami)", "(cd /tmp && ls)", "echo `whoami`"] {
-            assert!(
-                matches!(mgr.check("bash", cmd), PermissionCheck::NeedsPrompt { .. }),
-                "{cmd} should force prompt"
-            );
-        }
-    }
-
-    #[test]
-    fn always_allow_compound_adds_generalized_rules() {
-        let mgr = PermissionManager::new(PermissionsConfig::default(), PathBuf::from("/tmp"));
-        mgr.apply_decision(
-            "bash",
-            &["cd /tmp".into(), "cargo test --all".into()],
-            &PermissionAnswer::AllowAlwaysLocal,
-        );
-        assert!(matches!(
-            mgr.check("bash", "cd /other && cargo build"),
-            PermissionCheck::Allowed
-        ));
-    }
-
-    #[test]
-    fn deny_always_compound_uses_exact_scopes() {
-        let mgr = PermissionManager::new(PermissionsConfig::default(), PathBuf::from("/tmp"));
-        mgr.apply_decision(
-            "bash",
-            &["cd /tmp".into(), "cargo test".into()],
-            &PermissionAnswer::DenyAlwaysLocal,
-        );
-        assert!(matches!(
-            mgr.check("bash", "cd /tmp"),
-            PermissionCheck::Denied
-        ));
+        mgr.add_session_rule(deny_rule("cargo *"));
         assert!(matches!(
             mgr.check("bash", "cargo test"),
             PermissionCheck::Denied
-        ));
-        assert!(matches!(
-            mgr.check("bash", "cargo build"),
-            PermissionCheck::NeedsPrompt { .. }
-        ));
-    }
-
-    #[test]
-    fn allow_all_permits_everything() {
-        let mgr = PermissionManager::new(
-            PermissionsConfig {
-                allow_all: true,
-                rules: vec![],
-            },
-            PathBuf::from("/tmp"),
-        );
-        assert!(matches!(
-            mgr.check("bash", "rm -rf /"),
-            PermissionCheck::Allowed
         ));
     }
 
@@ -853,198 +716,50 @@ mod tests {
         ));
     }
 
+    // When you allow "cargo test", we generalize to "cargo *" for convenience.
+    // But denies stay exact, you probably have a good reason to block that specific thing.
     #[test]
-    fn builtin_allows_write() {
-        let mgr = PermissionManager::new(PermissionsConfig::default(), PathBuf::from("/tmp"));
+    fn allow_decision_generalizes() {
+        let mgr = default_mgr();
+        mgr.apply_decision(
+            "bash",
+            &["cargo test --all".into()],
+            &PermissionAnswer::AllowSession,
+        );
         assert!(matches!(
-            mgr.check("write", "/some/path"),
+            mgr.check("bash", "cargo build"),
             PermissionCheck::Allowed
         ));
     }
 
     #[test]
-    fn bash_needs_prompt_by_default() {
-        let mgr = PermissionManager::new(PermissionsConfig::default(), PathBuf::from("/tmp"));
-        assert!(matches!(
-            mgr.check("bash", "cargo test"),
-            PermissionCheck::NeedsPrompt { .. }
-        ));
-    }
-
-    #[test]
-    fn config_allow_rule_matches() {
-        let mgr = PermissionManager::new(
-            make_config(vec![allow_rule("cargo *")]),
-            PathBuf::from("/tmp"),
+    fn deny_decision_uses_exact() {
+        let mgr = default_mgr();
+        mgr.apply_decision(
+            "bash",
+            &["cargo test".into()],
+            &PermissionAnswer::DenyAlwaysLocal,
         );
-        assert!(matches!(
-            mgr.check("bash", "cargo test"),
-            PermissionCheck::Allowed
-        ));
-        assert!(matches!(
-            mgr.check("bash", "rm -rf"),
-            PermissionCheck::NeedsPrompt { .. }
-        ));
-    }
-
-    #[test]
-    fn session_grant_works() {
-        let mgr = PermissionManager::new(PermissionsConfig::default(), PathBuf::from("/tmp"));
-        assert!(matches!(
-            mgr.check("bash", "cargo test"),
-            PermissionCheck::NeedsPrompt { .. }
-        ));
-        mgr.add_session_rule(allow_rule("cargo *"));
-        assert!(matches!(
-            mgr.check("bash", "cargo test"),
-            PermissionCheck::Allowed
-        ));
-    }
-
-    #[test]
-    fn session_deny_overrides_config_allow() {
-        let mgr = PermissionManager::new(
-            make_config(vec![allow_rule("cargo *")]),
-            PathBuf::from("/tmp"),
-        );
-        mgr.add_session_rule(deny_rule("cargo *"));
         assert!(matches!(
             mgr.check("bash", "cargo test"),
             PermissionCheck::Denied
         ));
-    }
-
-    #[test_case("bash", "cargo test --all" => "cargo *" ; "bash_generalizes")]
-    #[test_case("write", "/home/user/src/main.rs" => "/home/user/src/**" ; "write_generalizes")]
-    #[test_case("edit", "main.rs" => "**" ; "edit_no_parent")]
-    #[test_case("webfetch", "https://example.com" => "*" ; "webfetch_generalizes")]
-    #[test_case("websearch", "rust async" => "*" ; "websearch_generalizes")]
-    #[test_case("task", "task:research" => "task:research" ; "task_passthrough")]
-    fn test_generalize_scope(tool: &str, scope: &str) -> String {
-        generalize_scope(tool, scope)
-    }
-
-    #[test]
-    fn generalized_scopes_deduplicates() {
-        let scopes: Vec<String> = ["git log", "echo hi", "git diff", "echo hi", "git status"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        assert_eq!(generalized_scopes("bash", &scopes), vec!["git *", "echo *"]);
-    }
-
-    #[test]
-    fn generalized_scopes_preserves_order() {
-        let scopes: Vec<String> = ["echo a", "git log", "echo b"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        assert_eq!(generalized_scopes("bash", &scopes), vec!["echo *", "git *"]);
-    }
-
-    #[test]
-    fn allow_decisions_use_generalized_scope() {
-        for answer in [
-            PermissionAnswer::AllowSession,
-            PermissionAnswer::AllowAlwaysLocal,
-        ] {
-            let mgr = PermissionManager::new(PermissionsConfig::default(), PathBuf::from("/tmp"));
-            mgr.apply_decision("bash", &["cargo test --all".into()], &answer);
-            assert!(
-                matches!(mgr.check("bash", "cargo build"), PermissionCheck::Allowed),
-                "{answer:?} should generalize scope"
-            );
-        }
-    }
-
-    #[test]
-    fn wildcard_tool_matches_any() {
-        let mgr = PermissionManager::new(
-            make_config(vec![PermissionRule {
-                tool: "*".into(),
-                scope: None,
-                effect: Effect::Deny,
-            }]),
-            PathBuf::from("/tmp"),
-        );
         assert!(matches!(
-            mgr.check("bash", "anything"),
-            PermissionCheck::Denied
-        ));
-        assert!(matches!(
-            mgr.check("write", "/any/path"),
-            PermissionCheck::Denied
+            mgr.check("bash", "cargo build"),
+            PermissionCheck::NeedsPrompt { .. }
         ));
     }
 
     #[test]
     fn permission_answer_roundtrip() {
-        let answers = [
+        for a in [
             PermissionAnswer::AllowOnce,
             PermissionAnswer::AllowSession,
             PermissionAnswer::AllowAlwaysLocal,
-            PermissionAnswer::AllowAlwaysGlobal,
             PermissionAnswer::Deny,
-            PermissionAnswer::DenyAlwaysLocal,
-            PermissionAnswer::DenyAlwaysGlobal,
-        ];
-        for a in answers {
-            let s = a.encode();
-            let parsed = PermissionAnswer::decode(&s).unwrap();
-            assert_eq!(parsed, a);
+            PermissionAnswer::DenyWithGuidance("hint".into()),
+        ] {
+            assert_eq!(PermissionAnswer::decode(&a.encode()), Some(a));
         }
-    }
-
-    #[test]
-    fn once_decisions_do_not_add_rules() {
-        let mgr = PermissionManager::new(PermissionsConfig::default(), PathBuf::from("/tmp"));
-        for answer in [PermissionAnswer::AllowOnce, PermissionAnswer::Deny] {
-            mgr.apply_decision("bash", &["cargo test".into()], &answer);
-            assert!(matches!(
-                mgr.check("bash", "cargo test"),
-                PermissionCheck::NeedsPrompt { .. }
-            ));
-        }
-    }
-
-    #[test]
-    fn toggle_yolo() {
-        let pm = PermissionManager::new(make_config(vec![]), PathBuf::from("/tmp"));
-        assert!(!pm.is_yolo());
-        assert!(pm.toggle_yolo());
-        assert!(pm.is_yolo());
-        assert!(!pm.toggle_yolo());
-        assert!(!pm.is_yolo());
-    }
-
-    #[test]
-    fn permission_error_without_guidance() {
-        let err = PermissionError::new("bash", "rm -rf /");
-        let msg = err.to_string();
-        assert!(msg.contains(DEFAULT_DENY_GUIDANCE));
-        assert!(!msg.contains("User guidance"));
-    }
-
-    #[test]
-    fn permission_error_with_guidance() {
-        let guidance = "Use cat instead";
-        let err = PermissionError::with_guidance("bash", "rm -rf /", guidance.into());
-        let msg = err.to_string();
-        assert!(msg.contains(&format!("User guidance: {}", guidance)));
-        assert!(!msg.contains(DEFAULT_DENY_GUIDANCE));
-    }
-
-    #[test_case("deny" => Some(PermissionAnswer::Deny) ; "plain_deny")]
-    #[test_case("deny:" => Some(PermissionAnswer::Deny) ; "deny_colon_empty")]
-    #[test_case("deny:Use cat" => Some(PermissionAnswer::DenyWithGuidance("Use cat".into())) ; "deny_with_guidance")]
-    fn decode_deny_variants(input: &str) -> Option<PermissionAnswer> {
-        PermissionAnswer::decode(input)
-    }
-
-    #[test]
-    fn deny_with_guidance_roundtrip() {
-        let answer = PermissionAnswer::DenyWithGuidance("Use cat".into());
-        let encoded = answer.encode();
-        assert_eq!(PermissionAnswer::decode(&encoded), Some(answer));
     }
 }

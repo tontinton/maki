@@ -1,7 +1,8 @@
-//! Executes Python in the monty sandbox and bridges tool calls back into the agent.
+//! Python execution bridge for the agent.
 //!
-//! Sync tool calls use `block_on`; async tool calls go through `AsyncResolver` to batch concurrent awaits.
-//! Stdout is flushed to the UI on STREAM_FLUSH_INTERVAL so output appears incrementally.
+//! We run Python in the monty sandbox, and bridge tool calls back to the agent.
+//! Async awaits get batched via AsyncResolver so concurrent tool calls actually run in parallel.
+//! Stdout streams to the UI every STREAM_FLUSH_INTERVAL so you see output as it happens.
 
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -19,6 +20,7 @@ use crate::cancel::CancelToken;
 use crate::permissions::PermissionManager;
 use crate::task_set::TaskSet;
 use crate::{AgentConfig, AgentEvent, AgentMode, EventSender, ToolInput, ToolOutput};
+use async_lock::Mutex;
 
 use smol::future::block_on;
 
@@ -27,6 +29,17 @@ use super::{Deadline, FileReadTracker, INTERPRETER_TOOLS};
 
 const STREAM_FLUSH_INTERVAL: Duration = Duration::from_millis(100);
 const PREAMBLE: &str = "import re\nimport asyncio\nimport sys\nimport os\nimport json\n";
+
+struct InterpreterEnv {
+    event_tx: EventSender,
+    mode: AgentMode,
+    cancel: CancelToken,
+    deadline: Deadline,
+    config: AgentConfig,
+    permissions: Arc<PermissionManager>,
+    file_tracker: Arc<FileReadTracker>,
+    user_response_rx: Option<Arc<Mutex<flume::Receiver<String>>>>,
+}
 
 #[derive(Tool, Debug, Clone, Deserialize)]
 pub struct CodeExecution {
@@ -56,38 +69,26 @@ impl CodeExecution {
         );
         let code = self.code.clone();
         let tool_use_id = ctx.tool_use_id.clone();
-        let event_tx = ctx.event_tx.clone();
-        let mode = ctx.mode.clone();
-        let cancel = ctx.cancel.clone();
         let config = ctx.config.clone();
-        let permissions = ctx.permissions.clone();
-        let file_tracker = ctx.file_tracker.clone();
         let deadline = Deadline::after(timeout);
         let limits = runner::limits(timeout, config.interpreter_max_memory_mb * 1024 * 1024);
+        let env = InterpreterEnv {
+            event_tx: ctx.event_tx.clone(),
+            mode: ctx.mode.clone(),
+            cancel: ctx.cancel.clone(),
+            deadline,
+            config,
+            permissions: ctx.permissions.clone(),
+            file_tracker: ctx.file_tracker.clone(),
+            user_response_rx: ctx.user_response_rx.clone(),
+        };
 
-        // NOTE: cancel races the smol::unblock future. When cancel wins, the
-        // blocking thread pool task keeps running until the Python code finishes.
-        // There is no safe way to kill a blocking thread.
+        // We race cancel against the blocking thread. If cancel wins, the Python thread
+        // keeps running till it finishes. Threads can not be killed safely.
         ctx.cancel
             .race(smol::unblock(move || {
-                let tools = build_tool_fns(
-                    &event_tx,
-                    &mode,
-                    &cancel,
-                    deadline,
-                    config.clone(),
-                    &permissions,
-                    &file_tracker,
-                );
-                let resolver = build_async_resolver(
-                    &event_tx,
-                    &mode,
-                    &cancel,
-                    deadline,
-                    config.clone(),
-                    &permissions,
-                    &file_tracker,
-                );
+                let tools = build_tool_fns(&env);
+                let resolver = build_async_resolver(&env);
                 let code = format!("{PREAMBLE}{code}");
 
                 let result = if let Some(ref id) = tool_use_id {
@@ -96,7 +97,7 @@ impl CodeExecution {
                     runner::run_streaming(&code, &tools, Some(&resolver), limits, &mut |line| {
                         pending.push_str(line);
                         if last_flush.elapsed() >= STREAM_FLUSH_INTERVAL && !pending.is_empty() {
-                            event_tx.try_send(AgentEvent::ToolOutput {
+                            env.event_tx.try_send(AgentEvent::ToolOutput {
                                 id: id.to_string(),
                                 content: pending.clone(),
                             });
@@ -126,8 +127,8 @@ impl CodeExecution {
 
                 Ok(ToolOutput::Plain(truncate_output(
                     output,
-                    config.max_output_lines,
-                    config.max_output_bytes,
+                    env.config.max_output_lines,
+                    env.config.max_output_bytes,
                 )))
             }))
             .await?
@@ -156,32 +157,26 @@ impl super::ToolDefaults for CodeExecution {
     }
 
     fn permission(&self) -> Option<String> {
-        Some("code_execution".into())
+        None
     }
 }
 
-fn build_tool_fns(
-    event_tx: &EventSender,
-    mode: &AgentMode,
-    cancel: &CancelToken,
-    deadline: Deadline,
-    config: AgentConfig,
-    permissions: &Arc<PermissionManager>,
-    file_tracker: &Arc<FileReadTracker>,
-) -> HashMap<String, ToolFn> {
+fn build_tool_fns(env: &InterpreterEnv) -> HashMap<String, ToolFn> {
     let mut tools: HashMap<String, ToolFn> = HashMap::new();
 
     for &tool_name in INTERPRETER_TOOLS {
-        if !super::is_tool_enabled(&config, tool_name) {
+        if !super::is_tool_enabled(&env.config, tool_name) {
             continue;
         }
         let name = tool_name.to_string();
-        let tx = event_tx.clone();
-        let mode = mode.clone();
-        let cancel = cancel.clone();
-        let permissions = Arc::clone(permissions);
-        let config = config.clone();
-        let file_tracker = Arc::clone(file_tracker);
+        let tx = env.event_tx.clone();
+        let mode = env.mode.clone();
+        let cancel = env.cancel.clone();
+        let deadline = env.deadline;
+        let permissions = Arc::clone(&env.permissions);
+        let config = env.config.clone();
+        let file_tracker = Arc::clone(&env.file_tracker);
+        let user_response_rx = env.user_response_rx.clone();
 
         tools.insert(
             name.clone(),
@@ -199,6 +194,7 @@ fn build_tool_fns(
                         cancel.clone(),
                         Arc::clone(&permissions),
                         Arc::clone(&file_tracker),
+                        user_response_rx.clone(),
                     );
                     inner_ctx.deadline = deadline;
                     inner_ctx.config = config.clone();
@@ -216,24 +212,20 @@ fn build_tool_fns(
     tools
 }
 
-fn build_async_resolver(
-    event_tx: &EventSender,
-    mode: &AgentMode,
-    cancel: &CancelToken,
-    deadline: Deadline,
-    config: AgentConfig,
-    permissions: &Arc<PermissionManager>,
-    file_tracker: &Arc<FileReadTracker>,
-) -> AsyncResolver {
-    let tx = event_tx.clone();
-    let mode = mode.clone();
-    let cancel = cancel.clone();
-    let permissions = Arc::clone(permissions);
-    let file_tracker = Arc::clone(file_tracker);
+fn build_async_resolver(env: &InterpreterEnv) -> AsyncResolver {
+    let tx = env.event_tx.clone();
+    let mode = env.mode.clone();
+    let cancel = env.cancel.clone();
+    let deadline = env.deadline;
+    let config = env.config.clone();
+    let permissions = Arc::clone(&env.permissions);
+    let file_tracker = Arc::clone(&env.file_tracker);
+    let user_response_rx = env.user_response_rx.clone();
 
     Box::new(move |pending_calls: Vec<PendingCall>| {
         let config = config.clone();
         let file_tracker = Arc::clone(&file_tracker);
+        let user_response_rx = user_response_rx.clone();
         smol::future::block_on(async {
             let call_ids: Vec<u32> = pending_calls.iter().map(|pc| pc.call_id).collect();
             let mut set = TaskSet::new();
@@ -244,6 +236,7 @@ fn build_async_resolver(
                 let permissions = Arc::clone(&permissions);
                 let config = config.clone();
                 let file_tracker = Arc::clone(&file_tracker);
+                let user_response_rx = user_response_rx.clone();
 
                 set.spawn(async move {
                     if let Err(e) = deadline.check() {
@@ -265,6 +258,7 @@ fn build_async_resolver(
                         cancel,
                         Arc::clone(&permissions),
                         file_tracker,
+                        user_response_rx,
                     );
                     inner_ctx.deadline = deadline;
                     inner_ctx.config = config;

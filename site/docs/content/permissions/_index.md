@@ -28,19 +28,20 @@ For every tool call, Maki resolves permission like this:
 
 ## Builtin Defaults
 
-These tools work out of the box, no prompting needed:
+| Tool | Scope | Notes |
+|------|-------|-------|
+| `write` | Project directory | Files outside require permission |
+| `edit` | Project directory | Files outside require permission |
+| `multiedit` | Project directory | Files outside require permission |
+| `task` | `*` (all) | Subagent spawning always allowed |
 
-| Tool | Scope |
-|------|-------|
-| `write` | `**` (all paths) |
-| `edit` | `**` (all paths) |
-| `multiedit` | `**` (all paths) |
-| `code_execution` | `*` (all) |
-| `task` | `*` (all) |
-| `websearch` | `*` (all) |
-| `webfetch` | `*` (all) |
+These tools require explicit permission:
 
-Everything else (most notably `bash`) needs explicit permission.
+- `bash` - Shell commands
+- `websearch` - Web search queries
+- `webfetch` - URL fetching
+
+Container tools like `batch` and `code_execution` prompt for each inner tool individually.
 
 ## TOML Configuration
 

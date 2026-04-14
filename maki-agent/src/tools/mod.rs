@@ -779,6 +779,7 @@ pub(crate) fn interpreter_ctx(
     cancel: CancelToken,
     permissions: Arc<PermissionManager>,
     file_tracker: Arc<FileReadTracker>,
+    user_response_rx: Option<Arc<async_lock::Mutex<flume::Receiver<String>>>>,
 ) -> ToolContext {
     static PROVIDER: LazyLock<Arc<dyn Provider>> = LazyLock::new(|| Arc::new(NullProvider));
     static MODEL: LazyLock<Arc<Model>> =
@@ -790,7 +791,7 @@ pub(crate) fn interpreter_ctx(
         event_tx: event_tx.clone(),
         mode: mode.clone(),
         tool_use_id: None,
-        user_response_rx: None,
+        user_response_rx,
         skills: Arc::clone(&SKILLS),
         loaded_instructions: LoadedInstructions::new(),
         cancel,
@@ -838,6 +839,7 @@ pub(crate) mod test_support {
             CancelToken::none(),
             Arc::clone(&TEST_PERMISSIONS),
             Arc::new(FileReadTracker::new()),
+            None,
         );
         ctx.tool_use_id = tool_use_id.map(String::from);
         ctx
