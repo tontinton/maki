@@ -16,6 +16,18 @@ const HELP_SEGMENTS: &[(&str, bool)] = &[
     (" in chat", false),
 ];
 
+const TIPS: &[(&str, &str)] = &[
+    (
+        key::FILE_PICKER.label,
+        "to grab file paths with fuzzy search",
+    ),
+    (key::TASKS.label, "to see what your subagents are up to"),
+    (key::SEARCH.label, "to find things in the conversation"),
+    ("/btw", "to ask something without interrupting the session"),
+    ("/memory", "to view, edit, and delete persistent notes"),
+    ("/cd", "to switch to a different directory"),
+];
+
 const COLOR_TRANSITION_SECS: f32 = 0.4;
 
 /// Seconds for the initial fade-in animation (ease-out cubic).
@@ -106,6 +118,7 @@ pub struct Splash {
     start: Instant,
     field_offset: f32,
     animate: bool,
+    tip_idx: usize,
 }
 
 impl Default for Splash {
@@ -118,10 +131,12 @@ impl Splash {
     pub fn new(animate: bool) -> Self {
         let mut rng = [0u8; 8];
         getrandom::fill(&mut rng).ok();
+        let tip_idx = u32::from_le_bytes([rng[4], rng[5], rng[6], rng[7]]) as usize % TIPS.len();
         Self {
             start: Instant::now(),
             field_offset: (u64::from_le_bytes(rng) % 10_000) as f32,
             animate,
+            tip_idx,
         }
     }
 
@@ -138,10 +153,11 @@ impl Splash {
         };
 
         let new_version = update::latest_version();
-        let block_height = 6;
+        let block_height = 8;
         let top_y = area.y + area.height.saturating_sub(block_height) / 2;
         let tag_y = top_y + 1;
         let help_y = tag_y + 2;
+        let tip_y = help_y + 2;
 
         if self.animate {
             self.render_field(area, buf, t + self.field_offset, fade, accent);
@@ -149,6 +165,7 @@ impl Splash {
         self.render_logo(area, buf, t, fade, top_y, accent);
         render_centered_faded(area, buf, fade, 0.75, tag_y, TAGLINE);
         self.render_help(area, buf, fade, help_y, accent);
+        self.render_tip(area, buf, fade, tip_y, accent);
         let version_text = match new_version {
             Some(v) => format!("v{} - v{} available", update::CURRENT, v),
             None => format!("v{}", update::CURRENT),
@@ -334,45 +351,54 @@ impl Splash {
 
         let theme = theme::current();
         let bg = theme.background;
-        let (ac_r, ac_g, ac_b) = extract_rgb(accent, (100, 140, 255));
-        let (fg_r, fg_g, fg_b) = extract_rgb(theme.foreground, (200, 200, 200));
-        let (bg_r, bg_g, bg_b) = extract_rgb(bg, (15, 15, 25));
+        let ac = extract_rgb(accent, (100, 140, 255));
+        let fg = extract_rgb(theme.foreground, (200, 200, 200));
+        let bg_rgb = extract_rgb(bg, (15, 15, 25));
 
-        let help_x = area.x
-            + (area
-                .width
-                .saturating_sub(HELP_SEGMENTS.iter().map(|(s, _)| s.len() as u16).sum()))
-                / 2;
+        let total_width: u16 = HELP_SEGMENTS.iter().map(|(s, _)| s.len() as u16).sum();
+        let x_start = area.x + area.width.saturating_sub(total_width) / 2;
 
-        let mut col = 0usize;
-        for &(segment, highlighted) in HELP_SEGMENTS {
-            let ((tr, tg, tb), base_alpha) = if highlighted {
-                ((ac_r, ac_g, ac_b), 0.75)
-            } else {
-                ((fg_r, fg_g, fg_b), 0.5)
-            };
-            let alpha = base_alpha * fade;
-            let style = Style::new()
-                .fg(Color::Rgb(
-                    lerp_u8(bg_r, tr, alpha),
-                    lerp_u8(bg_g, tg, alpha),
-                    lerp_u8(bg_b, tb, alpha),
-                ))
-                .bg(bg);
+        let segments: Vec<_> = HELP_SEGMENTS
+            .iter()
+            .map(|&(text, highlighted)| {
+                let (target, alpha) = if highlighted { (ac, 0.75) } else { (fg, 0.5) };
+                (text, faded_style(bg_rgb, target, alpha * fade, bg))
+            })
+            .collect();
 
-            for ch in segment.chars() {
-                let x = help_x + col as u16;
-                if x >= area.x + area.width {
-                    break;
-                }
+        render_segments(area, buf, help_y, x_start, &segments);
+    }
 
-                if let Some(cell) = buf.cell_mut((x, help_y)) {
-                    cell.set_char(ch).set_style(style);
-                }
-
-                col += 1;
-            }
+    fn render_tip(&self, area: Rect, buf: &mut Buffer, fade: f32, tip_y: u16, accent: Color) {
+        if tip_y >= area.y + area.height {
+            return;
         }
+
+        let theme = theme::current();
+        let bg = theme.background;
+        let tip_rgb = extract_rgb(
+            theme.todo_in_progress.fg.unwrap_or(Color::Yellow),
+            (249, 226, 175),
+        );
+        let ac = extract_rgb(accent, (100, 140, 255));
+        let fg = extract_rgb(theme.foreground, (200, 200, 200));
+        let bg_rgb = extract_rgb(bg, (15, 15, 25));
+
+        let (label, desc) = TIPS[self.tip_idx];
+        let total_width = (5 + label.len() + 1 + desc.len()) as u16;
+        let x_start = area.x + area.width.saturating_sub(total_width) / 2;
+
+        let segments: &[(&str, Style)] = &[
+            (
+                "tip: ",
+                faded_style(bg_rgb, tip_rgb, 0.75 * fade, bg).add_modifier(Modifier::BOLD),
+            ),
+            (label, faded_style(bg_rgb, ac, 0.75 * fade, bg)),
+            (" ", Style::default()),
+            (desc, faded_style(bg_rgb, fg, 0.5 * fade, bg)),
+        ];
+
+        render_segments(area, buf, tip_y, x_start, segments);
     }
 }
 
@@ -380,32 +406,16 @@ fn render_right_faded(area: Rect, buf: &mut Buffer, fade: f32, intensity: f32, y
     if y >= area.y + area.height {
         return;
     }
-
     let theme = theme::current();
     let bg = theme.background;
-    let (fg_r, fg_g, fg_b) = extract_rgb(theme.foreground, (200, 200, 200));
-    let (bg_r, bg_g, bg_b) = extract_rgb(bg, (15, 15, 25));
-
-    let alpha = intensity * fade;
-    let style = Style::new()
-        .fg(Color::Rgb(
-            lerp_u8(bg_r, fg_r, alpha),
-            lerp_u8(bg_g, fg_g, alpha),
-            lerp_u8(bg_b, fg_b, alpha),
-        ))
-        .bg(bg);
-
-    let char_count = text.chars().count() as u16;
-    let x_start = area.x + area.width.saturating_sub(char_count + 1);
-    for (i, ch) in text.chars().enumerate() {
-        let x = x_start + i as u16;
-        if x >= area.x + area.width {
-            break;
-        }
-        if let Some(cell) = buf.cell_mut((x, y)) {
-            cell.set_char(ch).set_style(style);
-        }
-    }
+    let style = faded_style(
+        extract_rgb(bg, (15, 15, 25)),
+        extract_rgb(theme.foreground, (200, 200, 200)),
+        intensity * fade,
+        bg,
+    );
+    let x_start = area.x + area.width.saturating_sub(text.chars().count() as u16 + 1);
+    render_segments(area, buf, y, x_start, &[(text, style)]);
 }
 
 fn render_centered_faded(
@@ -419,38 +429,48 @@ fn render_centered_faded(
     if y >= area.y + area.height {
         return;
     }
-
     let theme = theme::current();
     let bg = theme.background;
-    let (fg_r, fg_g, fg_b) = extract_rgb(theme.foreground, (200, 200, 200));
-    let (bg_r, bg_g, bg_b) = extract_rgb(bg, (15, 15, 25));
-
-    let alpha = intensity * fade;
-    let style = Style::new()
-        .fg(Color::Rgb(
-            lerp_u8(bg_r, fg_r, alpha),
-            lerp_u8(bg_g, fg_g, alpha),
-            lerp_u8(bg_b, fg_b, alpha),
-        ))
-        .bg(bg);
-
-    let char_count = text.chars().count() as u16;
-    let x_start = area.x + area.width.saturating_sub(char_count) / 2;
-    for (i, ch) in text.chars().enumerate() {
-        let x = x_start + i as u16;
-        if x >= area.x + area.width {
-            break;
-        }
-        if let Some(cell) = buf.cell_mut((x, y)) {
-            cell.set_char(ch).set_style(style);
-        }
-    }
+    let style = faded_style(
+        extract_rgb(bg, (15, 15, 25)),
+        extract_rgb(theme.foreground, (200, 200, 200)),
+        intensity * fade,
+        bg,
+    );
+    let x_start = area.x + area.width.saturating_sub(text.chars().count() as u16) / 2;
+    render_segments(area, buf, y, x_start, &[(text, style)]);
 }
 
 fn extract_rgb(color: Color, fallback: (u8, u8, u8)) -> (u8, u8, u8) {
     match color {
         Color::Rgb(r, g, b) => (r, g, b),
         _ => fallback,
+    }
+}
+
+fn faded_style(bg: (u8, u8, u8), fg: (u8, u8, u8), alpha: f32, bg_color: Color) -> Style {
+    Style::new()
+        .fg(Color::Rgb(
+            lerp_u8(bg.0, fg.0, alpha),
+            lerp_u8(bg.1, fg.1, alpha),
+            lerp_u8(bg.2, fg.2, alpha),
+        ))
+        .bg(bg_color)
+}
+
+fn render_segments(area: Rect, buf: &mut Buffer, y: u16, x_start: u16, segments: &[(&str, Style)]) {
+    let x_end = area.x + area.width;
+    let mut x = x_start;
+    for &(text, style) in segments {
+        for ch in text.chars() {
+            if x >= x_end {
+                return;
+            }
+            if let Some(cell) = buf.cell_mut((x, y)) {
+                cell.set_char(ch).set_style(style);
+            }
+            x += 1;
+        }
     }
 }
 
