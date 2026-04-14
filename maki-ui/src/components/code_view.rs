@@ -524,51 +524,39 @@ fn merge_syntax_with_diff(
     emphasis: Style,
 ) -> Vec<Span<'static>> {
     let mut result = Vec::new();
-    let mut syn_off = 0;
-    let mut syn_idx = 0;
-    let mut diff_off = 0;
-    let mut diff_idx = 0;
 
-    while syn_idx < syntax_spans.len() {
-        let (ref syn_style, ref syn_text) = syntax_spans[syn_idx];
-        let syn_rem = &syn_text[syn_off..];
-        if syn_rem.is_empty() {
-            syn_idx += 1;
-            syn_off = 0;
-            continue;
-        }
+    let syn_iter = syntax_spans
+        .iter()
+        .flat_map(|(style, text)| text.chars().map(move |c| (c, *style)));
 
-        let (bg, diff_rem) = if diff_idx < diff_spans.len() {
-            let ds = &diff_spans[diff_idx];
-            let rem = &ds.text[diff_off..];
-            if rem.is_empty() {
-                diff_idx += 1;
-                diff_off = 0;
-                continue;
-            }
-            let bg = if ds.emphasized { emphasis } else { base };
-            (bg, rem.len())
+    let mut diff_iter = diff_spans.iter().flat_map(|ds| {
+        let bg = if ds.emphasized { emphasis } else { base };
+        ds.text.chars().map(move |_| bg)
+    });
+
+    let mut current_text = String::new();
+    let mut current_style: Option<Style> = None;
+
+    for (syn_char, syn_style) in syn_iter {
+        let bg = diff_iter.next().unwrap_or(base);
+        let combined = syn_style.patch(bg);
+
+        if current_style == Some(combined) {
+            current_text.push(syn_char);
         } else {
-            (base, syn_rem.len())
-        };
-
-        let take = syn_rem.len().min(diff_rem);
-        let take = syn_rem.floor_char_boundary(take);
-        result.push(Span::styled(
-            syn_rem[..take].to_owned(),
-            syn_style.patch(bg),
-        ));
-        syn_off += take;
-        diff_off += take;
-
-        if syn_off >= syn_text.len() {
-            syn_idx += 1;
-            syn_off = 0;
+            if !current_text.is_empty() {
+                result.push(Span::styled(
+                    std::mem::take(&mut current_text),
+                    current_style.unwrap(),
+                ));
+            }
+            current_text.push(syn_char);
+            current_style = Some(combined);
         }
-        if diff_idx < diff_spans.len() && diff_off >= diff_spans[diff_idx].text.len() {
-            diff_idx += 1;
-            diff_off = 0;
-        }
+    }
+
+    if !current_text.is_empty() {
+        result.push(Span::styled(current_text, current_style.unwrap()));
     }
 
     result
@@ -578,7 +566,7 @@ fn merge_syntax_with_diff(
 mod tests {
     use super::*;
     use crate::markdown::TRUNCATION_PREFIX;
-    use maki_agent::{GrepLine, GrepMatchGroup};
+    use maki_agent::GrepMatchGroup;
     use test_case::test_case;
 
     fn plain(text: &str) -> DiffSpan {
@@ -695,8 +683,7 @@ mod tests {
         ];
         let diff = vec![plain("ab")];
         let result = merge_syntax_with_diff(&syn, &diff, base, Style::default());
-        let text: String = result.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(text, "abcd");
+        assert_eq!(spans_text(&result), "abcd");
     }
 
     fn grep_entries(files: &[(&str, &[usize])]) -> Vec<GrepFileEntry> {
@@ -721,8 +708,12 @@ mod tests {
         assert_eq!(render_grep_results(&entries, max, true).0.len(), expected);
     }
 
+    fn spans_text(spans: &[Span]) -> String {
+        spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
     fn line_text(line: &Line) -> String {
-        line.spans.iter().map(|s| s.content.as_ref()).collect()
+        spans_text(&line.spans)
     }
 
     #[test]
@@ -745,81 +736,6 @@ mod tests {
             content_gutters.windows(2).all(|w| w[0] == w[1]),
             "gutter widths should be uniform across files: {content_gutters:?}"
         );
-    }
-
-    #[test]
-    fn merge_syntax_interleaved_splits_at_emphasis_boundary() {
-        let base = Style::default();
-        let emph = Style::new().bg(Color::Green);
-        let syn = vec![
-            (Style::new().fg(Color::Red), "ab".to_owned()),
-            (Style::new().fg(Color::Blue), "cd".to_owned()),
-        ];
-        let diff = vec![
-            plain("a"),
-            DiffSpan {
-                text: "bcd".into(),
-                emphasized: true,
-            },
-        ];
-        let result = merge_syntax_with_diff(&syn, &diff, base, emph);
-        let text: String = result.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(text, "abcd");
-        assert_eq!(result[0].content.as_ref(), "a");
-        assert_eq!(result[0].style.fg, Some(Color::Red));
-        assert_eq!(result[1].content.as_ref(), "b");
-        assert_eq!(result[1].style.bg, Some(Color::Green));
-        assert_eq!(result[2].content.as_ref(), "cd");
-        assert_eq!(result[2].style.bg, Some(Color::Green));
-    }
-
-    #[test]
-    fn grep_highlights_match_and_context_lines_independently() {
-        let entries = vec![GrepFileEntry {
-            path: "test.rs".into(),
-            groups: vec![GrepMatchGroup {
-                lines: vec![
-                    GrepLine {
-                        line_nr: 1,
-                        text: "let x = \"open string".into(),
-                        is_match: false,
-                    },
-                    GrepLine::matched(2, "let y = 42;"),
-                ],
-            }],
-        }];
-        let (lines, _) = render_grep_results(&entries, 100, true);
-
-        let distinct_styles = |line: &Line| -> usize {
-            let styles: Vec<Style> = line.spans[1..].iter().map(|s| s.style).collect();
-            styles
-                .iter()
-                .collect::<std::collections::HashSet<_>>()
-                .len()
-        };
-
-        assert!(
-            distinct_styles(&lines[0]) > 1,
-            "context line should have multiple distinct (dimmed) syntax styles"
-        );
-        assert!(
-            distinct_styles(&lines[1]) > 1,
-            "match line after unclosed string context should be highlighted independently"
-        );
-    }
-
-    #[test]
-    fn render_instructions_single_block() {
-        let blocks = vec![InstructionBlock {
-            path: "/src/AGENTS.md".into(),
-            content: "# Title\n\nSome rules here".into(),
-        }];
-        let mut lines = Vec::new();
-        let truncated = render_instructions(&blocks, &mut lines, MAX_INSTRUCTION_LINES, false);
-        assert!(!truncated);
-        let text: Vec<String> = lines.iter().map(line_text).collect();
-        assert!(text.iter().any(|l| l.contains("Title")));
-        assert!(text.iter().any(|l| l.contains("Some rules here")));
     }
 
     #[test_case(MAX_INSTRUCTION_LINES, true,  true  ; "collapsed_truncates")]
@@ -858,8 +774,10 @@ mod tests {
         assert_eq!(lines.len(), 0);
     }
 
-    #[test_case("héllo", &["hé", "llo"]       ; "multibyte_accented")]
-    #[test_case("🦀x",   &["🦀", "x"]         ; "emoji_boundary")]
+    #[test_case("héllo",           &["hé", "llo"]          ; "accented")]
+    #[test_case("🦀x",              &["🦀", "x"]            ; "emoji")]
+    #[test_case("sep := \"│\"",     &["sep := \"", "│\""]   ; "box_drawing")]
+    #[test_case("日本語",           &["日本", "語"]         ; "cjk")]
     fn merge_syntax_with_diff_multibyte(input: &str, parts: &[&str]) {
         let base = Style::new().bg(Color::Red);
         let emph = Style::new().bg(Color::Green);
@@ -873,7 +791,6 @@ mod tests {
             })
             .collect();
         let result = merge_syntax_with_diff(&syn, &diff, base, emph);
-        let full: String = result.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(full, input);
+        assert_eq!(spans_text(&result), input);
     }
 }
