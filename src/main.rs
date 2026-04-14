@@ -1,4 +1,5 @@
 mod print;
+mod update;
 
 use std::env;
 use std::io::{self, IsTerminal, Read};
@@ -149,6 +150,17 @@ enum Command {
         #[command(subcommand)]
         action: McpAction,
     },
+    /// Update maki to the latest version
+    Update {
+        /// Skip confirmation prompt
+        #[arg(short = 'y', long)]
+        yes: bool,
+        /// Disable syntax highlighting
+        #[arg(long)]
+        no_color: bool,
+    },
+    /// Rollback to the previous version
+    Rollback,
 }
 
 #[derive(Subcommand)]
@@ -292,6 +304,12 @@ fn run() -> Result<()> {
                     }
                 }
             }
+        }
+        Some(Command::Update { yes, no_color }) => {
+            update::update(yes, no_color).map_err(|e| color_eyre::eyre::eyre!("{e}"))?;
+        }
+        Some(Command::Rollback) => {
+            update::rollback().map_err(|e| color_eyre::eyre::eyre!("{e}"))?;
         }
         None => {
             let storage = DataDir::resolve().context("resolve data directory")?;

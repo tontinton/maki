@@ -1,3 +1,4 @@
+use std::fmt::Write;
 use std::sync::{LazyLock, Mutex, OnceLock};
 
 use crate::theme;
@@ -217,6 +218,46 @@ pub fn fallback_span(text: &str) -> Span<'static> {
     Span::styled(normalize_text(text), theme::current().code_fallback)
 }
 
+pub fn highlight_ansi(lang: &str, code: &str) -> String {
+    let theme = theme::current();
+    let (bg_r, bg_g, bg_b) = match theme.background {
+        Color::Rgb(r, g, b) => (r, g, b),
+        _ => (0, 0, 0),
+    };
+    let bg_code = format!("\x1b[48;2;{bg_r};{bg_g};{bg_b}m");
+
+    let syntax = syntax_for_token(lang);
+    let mut hl = HighlightLines::new(syntax, syntax_theme());
+
+    let mut out = String::new();
+    for line in LinesWithEndings::from(code) {
+        out.push_str(&bg_code);
+        match hl.highlight_line(line, syntax_set()) {
+            Ok(ranges) => {
+                for (style, text) in ranges {
+                    let fg = style.foreground;
+                    let bold = if style.font_style.contains(FontStyle::BOLD) {
+                        "1;"
+                    } else {
+                        ""
+                    };
+                    let _ = write!(
+                        out,
+                        "\x1b[{bold}38;2;{};{};{}m{}",
+                        fg.r,
+                        fg.g,
+                        fg.b,
+                        text.trim_end_matches('\n')
+                    );
+                }
+            }
+            Err(_) => out.push_str(line.trim_end_matches('\n')),
+        }
+        out.push_str("\x1b[K\x1b[0m\n");
+    }
+    out
+}
+
 fn convert_style(s: syntect::highlighting::Style) -> Style {
     let f = s.foreground;
     let mut style = Style::new().fg(Color::Rgb(f.r, f.g, f.b));
@@ -294,5 +335,13 @@ mod tests {
         assert!(text.starts_with(TAB_SPACES), "tab not expanded: {text:?}");
         assert!(!text.contains('\t'));
         assert!(!text.ends_with('\n'));
+    }
+
+    #[test]
+    fn highlight_ansi_includes_background() {
+        let out = highlight_ansi("bash", "echo hi\n");
+        assert!(out.contains("\x1b[48;2;"), "expected background ANSI");
+        assert!(out.contains("\x1b[38;2;"), "expected foreground ANSI");
+        assert!(out.contains("echo"));
     }
 }

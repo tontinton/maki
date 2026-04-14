@@ -10,6 +10,7 @@ mod components;
 pub use components::command::{BUILTIN_COMMANDS, BuiltinCommand};
 pub use components::keybindings;
 mod highlight;
+pub use highlight::highlight_ansi;
 mod image;
 mod markdown;
 #[cfg(feature = "demo")]
@@ -20,7 +21,7 @@ pub mod splash;
 mod storage_writer;
 mod text_buffer;
 mod theme;
-mod update;
+pub mod update;
 
 mod agent;
 mod event_loop;

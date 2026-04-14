@@ -24,7 +24,6 @@ async-lock = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
 arc-swap = { workspace = true }
-isahc = { workspace = true }
 getrandom = { workspace = true }
 futures-lite = { workspace = true }
 image = { workspace = true }

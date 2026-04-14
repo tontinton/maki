@@ -166,11 +166,7 @@ impl Splash {
         render_centered_faded(area, buf, fade, 0.75, tag_y, TAGLINE);
         self.render_help(area, buf, fade, help_y, accent);
         self.render_tip(area, buf, fade, tip_y, accent);
-        let version_text = match new_version {
-            Some(v) => format!("v{} - v{} available", update::CURRENT, v),
-            None => format!("v{}", update::CURRENT),
-        };
-        render_right_faded(area, buf, fade, 0.4, area.y, &version_text);
+        render_version(area, buf, fade, area.y, new_version);
     }
 
     fn render_field(&self, area: Rect, buf: &mut Buffer, t: f32, fade: f32, accent: Color) {
@@ -402,20 +398,24 @@ impl Splash {
     }
 }
 
-fn render_right_faded(area: Rect, buf: &mut Buffer, fade: f32, intensity: f32, y: u16, text: &str) {
+fn render_version(area: Rect, buf: &mut Buffer, fade: f32, y: u16, new_version: Option<&str>) {
     if y >= area.y + area.height {
         return;
     }
     let theme = theme::current();
     let bg = theme.background;
+    let text = match new_version {
+        Some(v) => format!("v{} run maki update to get v{}", update::CURRENT, v),
+        None => format!("v{}", update::CURRENT),
+    };
     let style = faded_style(
         extract_rgb(bg, (15, 15, 25)),
         extract_rgb(theme.foreground, (200, 200, 200)),
-        intensity * fade,
+        0.4 * fade,
         bg,
     );
     let x_start = area.x + area.width.saturating_sub(text.chars().count() as u16 + 1);
-    render_segments(area, buf, y, x_start, &[(text, style)]);
+    render_segments(area, buf, y, x_start, &[(&text, style)]);
 }
 
 fn render_centered_faded(

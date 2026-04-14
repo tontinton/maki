@@ -8,6 +8,7 @@ pub mod model;
 pub mod plans;
 pub mod sessions;
 pub mod theme;
+pub mod version;
 
 use std::fs;
 use std::io::Write;
