@@ -526,6 +526,12 @@ pub const KEYBINDS: &[Keybind] = &[
         context: KeybindContext::CommandPalette,
         platform: Platform::All,
     },
+    Keybind {
+        label: KeyLabel::MacMulti(&["Ctrl+1/2/3"], &["⌘1/2/3"]),
+        description: "Set tier (strong/medium/weak)",
+        context: KeybindContext::ModelPicker,
+        platform: Platform::All,
+    },
 ];
 
 pub fn all_contexts() -> impl Iterator<Item = KeybindContext> {

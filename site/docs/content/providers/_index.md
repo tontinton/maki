@@ -9,7 +9,7 @@ group = "Reference"
 
 Maki talks to LLM providers over their HTTP APIs. Models are split into three tiers: **weak** (cheap and fast), **medium** (balanced), and **strong** (highest capability, highest cost).
 
-Open the model picker with `/model` and press `1`, `2`, or `3` on any row to reassign it to strong, medium, or weak. Your overrides are saved to `~/.maki/model-tiers` and apply across sessions.
+Open the model picker with `/model` and press `Ctrl+1`, `Ctrl+2`, or `Ctrl+3` on any row to reassign it to strong, medium, or weak. Your overrides are saved to `~/.maki/model-tiers` and apply across sessions.
 
 ## Auth Reloading
 

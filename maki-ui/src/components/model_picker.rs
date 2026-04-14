@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use arc_swap::ArcSwapOption;
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use ratatui::text::{Line, Span};
@@ -21,19 +21,22 @@ fn footer_line() -> Line<'static> {
     Line::from(vec![
         Span::styled("  Enter", t.keybind_key),
         Span::styled(" select", t.form_hint),
-        Span::styled("  1 ", t.keybind_key),
+        Span::styled("  Ctrl+1 ", t.keybind_key),
         Span::styled("(set strong)", t.form_hint),
         Span::styled(" / ", t.form_hint),
-        Span::styled("2 ", t.keybind_key),
+        Span::styled("Ctrl+2 ", t.keybind_key),
         Span::styled("(set medium)", t.form_hint),
         Span::styled(" / ", t.form_hint),
-        Span::styled("3 ", t.keybind_key),
+        Span::styled("Ctrl+3 ", t.keybind_key),
         Span::styled("(set weak)", t.form_hint),
     ])
 }
 
-fn tier_for_shortcut(code: KeyCode) -> Option<ModelTier> {
-    match code {
+fn tier_for_shortcut(key: KeyEvent) -> Option<ModelTier> {
+    if !key.modifiers.contains(KeyModifiers::CONTROL) {
+        return None;
+    }
+    match key.code {
         KeyCode::Char('1') => Some(ModelTier::Strong),
         KeyCode::Char('2') => Some(ModelTier::Medium),
         KeyCode::Char('3') => Some(ModelTier::Weak),
@@ -139,7 +142,7 @@ impl ModelPicker {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> ModelPickerAction {
-        if let Some(tier) = tier_for_shortcut(key.code)
+        if let Some(tier) = tier_for_shortcut(key)
             && let Some(entry) = self.picker.selected_item()
         {
             let spec = entry.spec.clone();
@@ -198,8 +201,12 @@ mod tests {
     use super::*;
     use crate::components::key;
     use crate::components::keybindings::key as kb;
-    use crossterm::event::{KeyCode, KeyEvent};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use test_case::test_case;
+
+    fn ctrl_key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::CONTROL)
+    }
 
     fn test_models() -> Arc<ArcSwapOption<Vec<String>>> {
         let models = Arc::new(ArcSwapOption::empty());
@@ -302,19 +309,30 @@ mod tests {
         assert!(parse_model_entry("no-slash").is_none());
     }
 
-    // Regression: 1/2/3 must work on every provider, not just Ollama.
-    #[test_case(KeyCode::Char('1'), ModelTier::Strong ; "1_strong")]
-    #[test_case(KeyCode::Char('2'), ModelTier::Medium ; "2_medium")]
-    #[test_case(KeyCode::Char('3'), ModelTier::Weak   ; "3_weak")]
+    // Regression: Ctrl+1/2/3 must work on every provider, not just Ollama.
+    #[test_case(KeyCode::Char('1'), ModelTier::Strong ; "ctrl_1_strong")]
+    #[test_case(KeyCode::Char('2'), ModelTier::Medium ; "ctrl_2_medium")]
+    #[test_case(KeyCode::Char('3'), ModelTier::Weak   ; "ctrl_3_weak")]
     fn tier_shortcut_assigns_and_keeps_picker_open(code: KeyCode, want: ModelTier) {
         let mut p = ModelPicker::new(test_models());
         p.open("");
-        let action = p.handle_key(key(code));
+        let action = p.handle_key(ctrl_key(code));
         assert!(
             matches!(&action, ModelPickerAction::AssignTier(s, t)
                 if s == "anthropic/claude-sonnet-4-20250514" && *t == want),
             "expected AssignTier(claude-sonnet, {want:?}), got something else",
         );
         assert!(p.is_open());
+    }
+
+    #[test]
+    fn plain_number_keys_go_to_filter() {
+        let mut p = ModelPicker::new(test_models());
+        p.open("");
+        let action = p.handle_key(key(KeyCode::Char('1')));
+        assert!(
+            matches!(action, ModelPickerAction::Consumed),
+            "plain '1' should be consumed by filter, not trigger tier assignment"
+        );
     }
 }

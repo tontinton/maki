@@ -23,7 +23,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 const NO_MATCHES: &str = "No matches";
 const LOADING_LABEL: &str = "Loading...";
 const SEARCH_PREFIX: &str = super::CHEVRON;
-const MIN_WIDTH_PERCENT: u16 = 60;
+const MIN_WIDTH_PERCENT: u16 = 65;
 const MAX_HEIGHT_PERCENT: u16 = 80;
 const SEARCH_ROW: u16 = 1;
 const DETAIL_RIGHT_PAD: u16 = 1;

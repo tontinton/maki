@@ -10,7 +10,7 @@ weight = 5
 group = "Reference"
 +++"#;
 
-const TIER_PICKER_NOTE: &str = r#"Open the model picker with `/model` and press `1`, `2`, or `3` on any row to reassign it to strong, medium, or weak. Your overrides are saved to `~/.maki/model-tiers` and apply across sessions."#;
+const TIER_PICKER_NOTE: &str = r#"Open the model picker with `/model` and press `Ctrl+1`, `Ctrl+2`, or `Ctrl+3` on any row to reassign it to strong, medium, or weak. Your overrides are saved to `~/.maki/model-tiers` and apply across sessions."#;
 
 const AUTH_RELOADING: &str = r#"## Auth Reloading
 
