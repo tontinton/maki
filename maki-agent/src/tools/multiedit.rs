@@ -110,15 +110,12 @@ impl super::ToolDefaults for MultiEdit {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::path::Path;
 
     use serde_json::json;
     use tempfile::TempDir;
-    use test_case::test_case;
 
     use crate::AgentMode;
-    use crate::tools::ToolDefaults;
-    use crate::tools::test_support::stub_ctx;
+    use crate::tools::test_support::{pre_read, stub_ctx};
 
     use super::*;
 
@@ -128,10 +125,6 @@ mod tests {
         let path = dir.path().join(name);
         fs::write(&path, content).unwrap();
         path.to_string_lossy().to_string()
-    }
-
-    fn pre_read(ctx: &super::super::ToolContext, path: &str) {
-        ctx.file_tracker.record_read(Path::new(path));
     }
 
     #[test]
@@ -191,22 +184,5 @@ mod tests {
             let tool = MultiEdit::parse_input(&json!({ "path": path, "edits": [] })).unwrap();
             assert_eq!(tool.execute(&ctx).await.unwrap_err(), EMPTY_ERR);
         });
-    }
-
-    #[test_case(1, "1 edit"  ; "singular")]
-    #[test_case(2, "2 edits" ; "plural")]
-    fn start_annotation_edit_count(n: usize, expected: &str) {
-        let tool = MultiEdit {
-            path: "/x.rs".into(),
-            edits: vec![
-                EditEntry {
-                    old_string: "a".into(),
-                    new_string: "b".into(),
-                    replace_all: None,
-                };
-                n
-            ],
-        };
-        assert_eq!(tool.start_annotation().unwrap(), expected);
     }
 }

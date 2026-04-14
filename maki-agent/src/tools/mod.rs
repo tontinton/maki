@@ -28,7 +28,7 @@ mod webfetch;
 mod websearch;
 mod write;
 
-pub(crate) use file_tracker::FileReadTracker;
+pub use file_tracker::FileReadTracker;
 
 use std::collections::HashSet;
 use std::env;
@@ -845,6 +845,10 @@ pub(crate) mod test_support {
 
     pub(crate) fn stub_ctx(mode: &AgentMode) -> ToolContext {
         stub_ctx_with(mode, None, None)
+    }
+
+    pub(crate) fn pre_read(ctx: &ToolContext, path: &str) {
+        ctx.file_tracker.record_read(Path::new(path));
     }
 }
 

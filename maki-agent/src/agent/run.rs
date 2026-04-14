@@ -41,6 +41,7 @@ pub struct AgentParams {
     pub permissions: Arc<PermissionManager>,
     pub session_id: Option<String>,
     pub timeouts: maki_providers::Timeouts,
+    pub file_tracker: Arc<FileReadTracker>,
 }
 
 pub struct AgentRunParams {
@@ -105,7 +106,7 @@ impl Agent {
             reauth_attempts: 0,
             thinking: ThinkingConfig::Off,
             session_id: params.session_id,
-            file_tracker: Arc::new(FileReadTracker::new()),
+            file_tracker: params.file_tracker,
         }
     }
 
@@ -499,6 +500,7 @@ mod tests {
                 )),
                 session_id: None,
                 timeouts: maki_providers::Timeouts::default(),
+                file_tracker: FileReadTracker::fresh(),
             },
             AgentRunParams {
                 history,
@@ -752,6 +754,7 @@ mod tests {
                     )),
                     session_id: None,
                     timeouts: maki_providers::Timeouts::default(),
+                    file_tracker: FileReadTracker::fresh(),
                 },
                 AgentRunParams {
                     history: History::new(Vec::new()),

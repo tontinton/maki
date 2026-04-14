@@ -17,7 +17,8 @@ use tracing::info;
 use uuid::Uuid;
 
 use super::{
-    DescriptionContext, GENERAL_SUBAGENT_TOOLS, RESEARCH_SUBAGENT_TOOLS, ToolContext, ToolFilter,
+    DescriptionContext, FileReadTracker, GENERAL_SUBAGENT_TOOLS, RESEARCH_SUBAGENT_TOOLS,
+    ToolContext, ToolFilter,
 };
 use crate::agent;
 use crate::template;
@@ -152,6 +153,7 @@ impl Task {
                 permissions: Arc::clone(&ctx.permissions),
                 session_id: Some(session_id),
                 timeouts: ctx.timeouts,
+                file_tracker: FileReadTracker::fresh(),
             },
             AgentRunParams {
                 history: crate::History::new(Vec::new()),

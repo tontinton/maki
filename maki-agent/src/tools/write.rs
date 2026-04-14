@@ -73,3 +73,78 @@ impl super::ToolDefaults for Write {
         Some(crate::permissions::canonicalize_scope_path(&self.path))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use tempfile::TempDir;
+
+    use crate::AgentMode;
+    use crate::tools::test_support::{pre_read, stub_ctx};
+
+    use super::*;
+
+    const ERR_NOT_READ: &str = "file must be read before editing";
+
+    #[test]
+    fn write_new_file_succeeds() {
+        smol::block_on(async {
+            let dir = TempDir::new().unwrap();
+            let ctx = stub_ctx(&AgentMode::Build);
+            let path = dir.path().join("new.txt").to_string_lossy().to_string();
+
+            Write {
+                path: path.clone(),
+                content: "hello".into(),
+            }
+            .execute(&ctx)
+            .await
+            .unwrap();
+
+            assert_eq!(fs::read_to_string(&path).unwrap(), "hello");
+        });
+    }
+
+    #[test]
+    fn write_existing_without_read_fails() {
+        smol::block_on(async {
+            let dir = TempDir::new().unwrap();
+            let ctx = stub_ctx(&AgentMode::Build);
+            let path = dir.path().join("existing.txt");
+            fs::write(&path, "original").unwrap();
+
+            let err = Write {
+                path: path.to_string_lossy().to_string(),
+                content: "overwrite".into(),
+            }
+            .execute(&ctx)
+            .await
+            .unwrap_err();
+
+            assert!(err.contains(ERR_NOT_READ));
+            assert_eq!(fs::read_to_string(&path).unwrap(), "original");
+        });
+    }
+
+    #[test]
+    fn write_existing_after_read_succeeds() {
+        smol::block_on(async {
+            let dir = TempDir::new().unwrap();
+            let ctx = stub_ctx(&AgentMode::Build);
+            let path = dir.path().join("existing.txt");
+            fs::write(&path, "original").unwrap();
+            pre_read(&ctx, &path.to_string_lossy());
+
+            Write {
+                path: path.to_string_lossy().to_string(),
+                content: "overwrite".into(),
+            }
+            .execute(&ctx)
+            .await
+            .unwrap();
+
+            assert_eq!(fs::read_to_string(&path).unwrap(), "overwrite");
+        });
+    }
+}

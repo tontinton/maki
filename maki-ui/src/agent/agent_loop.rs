@@ -9,7 +9,7 @@ use maki_agent::permissions::PermissionManager;
 use maki_agent::skill::Skill;
 use maki_agent::template;
 use maki_agent::template::Vars;
-use maki_agent::tools::{DescriptionContext, ToolCall, ToolFilter};
+use maki_agent::tools::{DescriptionContext, FileReadTracker, ToolCall, ToolFilter};
 use maki_agent::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentParams, AgentRunParams, CancelToken,
     CancelTrigger, Envelope, EventSender, History, Instructions, McpCommand, PromptRole,
@@ -35,6 +35,7 @@ pub(super) struct AgentLoop {
     cancel_map: Arc<Mutex<CancelMap>>,
     init_cancel: CancelToken,
     permissions: Arc<PermissionManager>,
+    file_tracker: Arc<FileReadTracker>,
     min_run_id: u64,
     agent_tx: flume::Sender<Envelope>,
     answer_rx: Arc<async_lock::Mutex<flume::Receiver<String>>>,
@@ -74,6 +75,7 @@ impl AgentLoop {
             cancel_map,
             init_cancel,
             permissions,
+            file_tracker: FileReadTracker::fresh(),
             min_run_id: 0,
             agent_tx,
             answer_rx: Arc::new(async_lock::Mutex::new(answer_rx)),
@@ -208,6 +210,7 @@ impl AgentLoop {
                 permissions: Arc::clone(&self.permissions),
                 session_id: self.session_id.clone(),
                 timeouts: self.timeouts,
+                file_tracker: Arc::clone(&self.file_tracker),
             },
             AgentRunParams {
                 history: mem::replace(&mut self.history, History::new(Vec::new())),

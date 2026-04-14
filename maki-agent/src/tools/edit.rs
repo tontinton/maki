@@ -74,12 +74,11 @@ impl super::ToolDefaults for Edit {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::path::Path;
 
     use tempfile::TempDir;
 
     use crate::AgentMode;
-    use crate::tools::test_support::stub_ctx;
+    use crate::tools::test_support::{pre_read, stub_ctx};
 
     use super::*;
 
@@ -87,10 +86,6 @@ mod tests {
         let path = dir.path().join(name);
         fs::write(&path, content).unwrap();
         path.to_string_lossy().to_string()
-    }
-
-    fn pre_read(ctx: &super::super::ToolContext, path: &str) {
-        ctx.file_tracker.record_read(Path::new(path));
     }
 
     #[test]

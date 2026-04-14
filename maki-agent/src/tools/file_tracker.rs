@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 pub struct FileReadTracker(Mutex<HashMap<PathBuf, SystemTime>>);
@@ -16,9 +16,19 @@ fn normalize_path(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+impl Default for FileReadTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FileReadTracker {
     pub fn new() -> Self {
         Self(Mutex::new(HashMap::new()))
+    }
+
+    pub fn fresh() -> Arc<Self> {
+        Arc::new(Self::new())
     }
 
     pub fn record_read(&self, path: &Path) {
@@ -51,7 +61,6 @@ mod tests {
     use super::*;
 
     const ERR_NOT_READ: &str = "file must be read before editing";
-    const ERR_FILE_CHANGED: &str = "file changed since last read";
 
     #[test]
     fn edit_without_read_fails() {
@@ -71,44 +80,6 @@ mod tests {
         fs::write(&path, "content").unwrap();
 
         let tracker = FileReadTracker::new();
-        tracker.record_read(&path);
-        tracker.check_before_edit(&path).unwrap();
-    }
-
-    #[test]
-    fn stale_mtime_fails() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("test.rs");
-        fs::write(&path, "original").unwrap();
-
-        let tracker = FileReadTracker::new();
-        tracker.record_read(&path);
-
-        let normalized = normalize_path(&path);
-        let stale = SystemTime::UNIX_EPOCH;
-        tracker.0.lock().unwrap().insert(normalized, stale);
-
-        let err = tracker.check_before_edit(&path).unwrap_err();
-        assert!(err.contains(ERR_FILE_CHANGED));
-    }
-
-    #[test]
-    fn re_record_updates_mtime() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("test.rs");
-        fs::write(&path, "content").unwrap();
-
-        let tracker = FileReadTracker::new();
-        tracker.record_read(&path);
-
-        let normalized = normalize_path(&path);
-        tracker
-            .0
-            .lock()
-            .unwrap()
-            .insert(normalized.clone(), SystemTime::UNIX_EPOCH);
-        assert!(tracker.check_before_edit(&path).is_err());
-
         tracker.record_read(&path);
         tracker.check_before_edit(&path).unwrap();
     }

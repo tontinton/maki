@@ -25,7 +25,9 @@ use color_eyre::Result;
 use color_eyre::eyre::Context;
 use maki_agent::mcp;
 use maki_agent::skill::Skill;
-use maki_agent::tools::{DescriptionContext, QUESTION_TOOL_NAME, ToolCall, ToolFilter};
+use maki_agent::tools::{
+    DescriptionContext, FileReadTracker, QUESTION_TOOL_NAME, ToolCall, ToolFilter,
+};
 use maki_agent::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, Envelope,
     EventSender, History, PermissionsConfig, agent, template,
@@ -211,6 +213,7 @@ pub fn run(
                 )),
                 session_id: Some(session_id_clone),
                 timeouts,
+                file_tracker: FileReadTracker::fresh(),
             },
             AgentRunParams {
                 history: History::new(Vec::new()),
