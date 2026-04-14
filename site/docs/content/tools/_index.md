@@ -192,7 +192,7 @@ Persistent, project-scoped scratchpad for learnings, patterns, decisions, and go
 
 ### `skill`
 
-Load a skill by name to get detailed instructions.
+Load a skill that provides instructions and workflows for specific tasks.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|

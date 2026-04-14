@@ -16,7 +16,8 @@ pub struct SkillTool {
 
 impl SkillTool {
     pub const NAME: &str = "skill";
-    pub const DESCRIPTION: &str = "Load a skill by name to get detailed instructions.";
+    pub const DESCRIPTION: &str =
+        "Load a skill that provides instructions and workflows for specific tasks.";
     pub const EXAMPLES: Option<&str> = Some(r#"[{"name": "rust-patterns"}]"#);
 
     pub async fn execute(&self, ctx: &ToolContext) -> Result<ToolOutput, String> {
