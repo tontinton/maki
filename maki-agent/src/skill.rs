@@ -77,15 +77,16 @@ impl Skill {
 }
 
 pub fn build_skill_list_description(skills: &[Skill]) -> String {
-    if skills.is_empty() {
-        return String::new();
-    }
-    let mut desc = String::from("\n\n<available_skills>\n");
-    for skill in skills {
-        desc.push_str(&format!("- {}: {}\n", skill.name, skill.description));
-    }
-    desc.push_str("</available_skills>");
-    desc
+    let body = if skills.is_empty() {
+        "No skills available.\n".to_string()
+    } else {
+        skills
+            .iter()
+            .map(|s| format!("- {}: {}\n", s.name, s.description))
+            .collect()
+    };
+
+    format!("\n\n<available_skills>\n{body}</available_skills>")
 }
 
 pub(crate) fn find_project_ancestor_dirs(cwd: &Path) -> Vec<PathBuf> {
@@ -297,7 +298,10 @@ mod tests {
 
     #[test]
     fn build_skill_list_description_empty() {
-        assert_eq!(build_skill_list_description(&[]), "");
+        assert_eq!(
+            build_skill_list_description(&[]),
+            "\n\n<available_skills>\nNo skills available.\n</available_skills>"
+        );
     }
 
     #[test]
