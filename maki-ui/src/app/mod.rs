@@ -28,7 +28,7 @@ use crate::components::file_picker::{FilePickerModal, FilePickerModalAction};
 use crate::components::help_modal::HelpModal;
 use crate::components::input::{InputAction, InputBox, Submission};
 use crate::components::keybindings::key;
-use crate::components::list_picker::{ListPicker, PickerAction};
+use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 use crate::components::mcp_picker::{McpPicker, McpPickerAction};
 use crate::components::memory_modal::{MemoryEntry, MemoryModal, MemoryModalAction};
 use crate::components::model_picker::{ModelPicker, ModelPickerAction};
@@ -80,6 +80,28 @@ const AUTH_EXPIRED_MSG: &str =
 const FLASH_NO_PLAN: &str = "No plan file";
 const IMPLEMENT_MSG_PREFIX: &str = "Implement the plan";
 
+const TASK_DONE_DETAIL: &str = "✓ ";
+
+/// `Option<bool>` lets us distinguish the main chat (None, no status indicator)
+/// from subagents (Some, with spinner or checkmark).
+#[derive(Clone)]
+pub(super) struct TaskEntry {
+    name: String,
+    finished: Option<bool>,
+}
+
+impl PickerItem for TaskEntry {
+    fn label(&self) -> &str {
+        &self.name
+    }
+    fn detail(&self) -> Option<&str> {
+        matches!(self.finished, Some(true)).then_some(TASK_DONE_DETAIL)
+    }
+    fn is_spinning(&self) -> bool {
+        matches!(self.finished, Some(false))
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PendingInput {
     #[default]
@@ -102,7 +124,7 @@ pub struct App {
     pub(super) chat_index: HashMap<String, usize>,
     pub(crate) input_box: InputBox,
     pub(super) command_palette: CommandPalette,
-    pub(super) task_picker: ListPicker<String>,
+    pub(super) task_picker: ListPicker<TaskEntry>,
     pub(super) task_picker_original: Option<usize>,
     pub(super) theme_picker: ThemePicker,
     pub(super) model_picker: ModelPicker,
@@ -324,9 +346,17 @@ impl App {
     }
 
     fn open_tasks(&mut self) {
-        let names: Vec<String> = self.chats.iter().map(|c| c.name.clone()).collect();
+        let entries: Vec<TaskEntry> = self
+            .chats
+            .iter()
+            .enumerate()
+            .map(|(i, c)| TaskEntry {
+                name: c.name.clone(),
+                finished: (i > 0).then_some(c.is_finished()),
+            })
+            .collect();
         self.task_picker_original = Some(self.active_chat);
-        self.task_picker.open(names, " Tasks ");
+        self.task_picker.open(entries, " Tasks ");
         self.task_picker.select(self.active_chat);
     }
 

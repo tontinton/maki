@@ -1,9 +1,10 @@
 //! Modal list picker with search. Supports immediate (`open`) or lazy loading
 //! (`open_loading` → `resolve`) where a spinner is shown until items arrive.
 
+use std::sync::OnceLock;
 use std::time::Instant;
 
-use crate::animation::spinner_frame;
+use crate::animation::{spinner_frame, spinner_str};
 use crate::components::Overlay;
 use crate::components::hint_line;
 use crate::components::is_ctrl;
@@ -28,6 +29,13 @@ const MAX_HEIGHT_PERCENT: u16 = 80;
 const SEARCH_ROW: u16 = 1;
 const DETAIL_RIGHT_PAD: u16 = 1;
 
+/// Spinners need a consistent time reference. Using a static epoch avoids
+/// passing Instant through every render call.
+fn animation_elapsed_ms() -> u128 {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    EPOCH.get_or_init(Instant::now).elapsed().as_millis()
+}
+
 pub trait PickerItem {
     fn label(&self) -> &str;
     fn detail(&self) -> Option<&str> {
@@ -35,6 +43,10 @@ pub trait PickerItem {
     }
     fn section(&self) -> Option<&str> {
         None
+    }
+    /// Shows a spinner in the detail slot when true.
+    fn is_spinning(&self) -> bool {
+        false
     }
 }
 
@@ -52,7 +64,7 @@ pub enum PickerAction<T> {
 }
 
 enum PickerState<T> {
-    Loading(Instant),
+    Loading,
     Ready(State<T>),
 }
 
@@ -60,14 +72,14 @@ impl<T> PickerState<T> {
     fn ready(&self) -> Option<&State<T>> {
         match self {
             Self::Ready(s) => Some(s),
-            Self::Loading(_) => None,
+            Self::Loading => None,
         }
     }
 
     fn ready_mut(&mut self) -> Option<&mut State<T>> {
         match self {
             Self::Ready(s) => Some(s),
-            Self::Loading(_) => None,
+            Self::Loading => None,
         }
     }
 }
@@ -262,7 +274,7 @@ impl<T: PickerItem> ListPicker<T> {
     pub fn open_loading(&mut self, title: &'static str) {
         self.generation += 1;
         self.title = title;
-        self.state = Some(PickerState::Loading(Instant::now()));
+        self.state = Some(PickerState::Loading);
     }
 
     pub fn resolve(&mut self, items: Vec<T>) {
@@ -338,7 +350,7 @@ impl<T: PickerItem> ListPicker<T> {
     }
 
     pub fn is_loading(&self) -> bool {
-        matches!(self.state, Some(PickerState::Loading(_)))
+        matches!(self.state, Some(PickerState::Loading))
     }
 
     pub fn contains(&self, pos: Position) -> bool {
@@ -351,7 +363,7 @@ impl<T: PickerItem> ListPicker<T> {
     pub fn handle_key(&mut self, key: KeyEvent) -> PickerAction<T> {
         match &self.state {
             None => return PickerAction::Close,
-            Some(PickerState::Loading(_)) => {
+            Some(PickerState::Loading) => {
                 if key::QUIT.matches(key) || key.code == KeyCode::Esc {
                     self.generation += 1;
                     self.state = None;
@@ -506,7 +518,7 @@ impl<T: PickerItem> ListPicker<T> {
         let footer_rows = if footer.is_some() { 1u16 } else { 0 };
         match self.state.as_mut() {
             None => Rect::default(),
-            Some(PickerState::Loading(started_at)) => {
+            Some(PickerState::Loading) => {
                 let modal = Modal {
                     title: self.title,
                     width_percent: MIN_WIDTH_PERCENT,
@@ -525,7 +537,7 @@ impl<T: PickerItem> ListPicker<T> {
                 let areas = Layout::vertical(constraints).split(inner);
                 let list_area = areas[0];
                 let search_area = areas[1];
-                let ch = spinner_frame(started_at.elapsed().as_millis());
+                let ch = spinner_frame(animation_elapsed_ms());
                 let line = Line::from(Span::styled(
                     format!("  {ch} {LOADING_LABEL}"),
                     theme::current().cmd_desc,
@@ -772,7 +784,12 @@ fn render_list<T: PickerItem>(
             Span::styled(sym, sty)
         });
         let label = format!("  {}", item.label());
-        let line = match item.detail() {
+        let detail: Option<&str> = if item.is_spinning() {
+            Some(spinner_str(animation_elapsed_ms()))
+        } else {
+            item.detail()
+        };
+        let line = match detail {
             Some(detail) => {
                 let label = truncate_label(&label, max_label_width(detail, area.width));
                 let pad = detail_padding(&label, detail, area.width);

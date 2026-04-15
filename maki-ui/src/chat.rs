@@ -233,6 +233,10 @@ impl Chat {
             .push(DisplayMessage::new(role, text.into()));
     }
 
+    pub fn is_finished(&self) -> bool {
+        self.finished
+    }
+
     pub fn update_tool_summary(&mut self, tool_id: &str, summary: &str) {
         self.messages_panel.update_tool_summary(tool_id, summary);
     }
