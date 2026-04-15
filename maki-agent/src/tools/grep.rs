@@ -57,6 +57,7 @@ impl Grep {
             .limit
             .map(|l| l.min(MAX_PER_CALL_LIMIT))
             .unwrap_or(search_limit);
+        let file_tracker = ctx.file_tracker.clone();
 
         smol::unblock(move || {
             let search_path = resolve_search_path(path.as_deref())?;
@@ -121,6 +122,7 @@ impl Grep {
                 let _ = searcher.search_path(&matcher, &path, &mut sink);
 
                 if !groups.is_empty() {
+                    file_tracker.record_read(&path);
                     let rel = path
                         .strip_prefix(base)
                         .unwrap_or(&path)
