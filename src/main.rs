@@ -35,7 +35,7 @@ struct Cli {
     #[arg(short, long)]
     print: bool,
 
-    /// Model spec (provider/model-id). Defaults to last used model, or claude-opus-4-6
+    /// Model spec (provider/model-id). Defaults to last used model, or claude-opus-4-7
     #[arg(short, long)]
     model: Option<String>,
 

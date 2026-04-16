@@ -171,10 +171,24 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             context_window: 200_000,
         },
         ModelEntry {
-            prefixes: &["claude-opus-4-6"],
+            prefixes: &["claude-opus-4-7"],
             tier: ModelTier::Strong,
             family: ModelFamily::Claude,
             default: true,
+            pricing: ModelPricing {
+                input: 5.00,
+                output: 25.00,
+                cache_write: 6.25,
+                cache_read: 0.50,
+            },
+            max_output_tokens: 128000,
+            context_window: 200_000,
+        },
+        ModelEntry {
+            prefixes: &["claude-opus-4-6"],
+            tier: ModelTier::Strong,
+            family: ModelFamily::Claude,
+            default: false,
             pricing: ModelPricing {
                 input: 5.00,
                 output: 25.00,
