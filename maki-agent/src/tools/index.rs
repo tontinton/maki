@@ -45,4 +45,18 @@ impl Index {
     }
 }
 
-impl super::ToolDefaults for Index {}
+super::impl_tool!(
+    Index,
+    audience = super::ToolAudience::MAIN
+        | super::ToolAudience::RESEARCH_SUB
+        | super::ToolAudience::GENERAL_SUB,
+);
+
+impl super::ToolInvocation for Index {
+    fn start_summary(&self) -> String {
+        Index::start_summary(self)
+    }
+    fn execute<'a>(self: Box<Self>, ctx: &'a super::ToolContext) -> super::ExecFuture<'a> {
+        Box::pin(async move { Index::execute(&self, ctx).await })
+    }
+}

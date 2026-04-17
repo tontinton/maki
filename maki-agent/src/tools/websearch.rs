@@ -106,9 +106,20 @@ impl WebSearch {
     }
 }
 
-impl super::ToolDefaults for WebSearch {
-    fn permission(&self) -> Option<String> {
+super::impl_tool!(
+    WebSearch,
+    audience = super::ToolAudience::MAIN | super::ToolAudience::INTERPRETER,
+);
+
+impl super::ToolInvocation for WebSearch {
+    fn start_summary(&self) -> String {
+        WebSearch::start_summary(self)
+    }
+    fn permission_scope(&self) -> Option<String> {
         Some(self.query.clone())
+    }
+    fn execute<'a>(self: Box<Self>, ctx: &'a super::ToolContext) -> super::ExecFuture<'a> {
+        Box::pin(async move { WebSearch::execute(&self, ctx).await })
     }
 }
 

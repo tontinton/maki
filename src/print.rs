@@ -26,7 +26,7 @@ use color_eyre::eyre::Context;
 use maki_agent::mcp;
 use maki_agent::skill::Skill;
 use maki_agent::tools::{
-    DescriptionContext, FileReadTracker, QUESTION_TOOL_NAME, ToolCall, ToolFilter,
+    DescriptionContext, FileReadTracker, QUESTION_TOOL_NAME, ToolFilter, ToolRegistry,
 };
 use maki_agent::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, Envelope,
@@ -155,7 +155,7 @@ pub fn run(
         skills: &skills,
         filter: &filter,
     };
-    let mut tools = ToolCall::definitions(&vars, &ctx, model.supports_tool_examples());
+    let mut tools = ToolRegistry::native().definitions(&vars, &ctx, model.supports_tool_examples());
 
     let mcp_handle = smol::block_on(mcp::start(&cwd_path));
 

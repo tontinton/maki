@@ -13,4 +13,3 @@ pub use instructions::{
     load_instruction_text, load_instructions,
 };
 pub use run::{Agent, AgentParams, AgentRunParams, RunOutcome};
-pub(crate) use tool_dispatch::{ResolvedCall, resolve_tool};

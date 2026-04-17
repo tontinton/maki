@@ -20,7 +20,7 @@ const JSON_ENCODED_ARRAY_HINT: &str = "Pass a JSON array, not a JSON-encoded str
 const JSON_ENCODED_OBJECT_HINT: &str = "Pass a JSON object, not a JSON-encoded string.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ParamKind {
+pub enum ParamKind {
     Null,
     Bool,
     Integer,
@@ -61,7 +61,7 @@ impl Display for ParamKind {
 pub(crate) type Property = (&'static str, &'static ParamSchema, bool);
 
 #[derive(Debug)]
-pub(crate) enum ParamSchema {
+pub enum ParamSchema {
     Primitive {
         kind: ParamKind,
         description: &'static str,
@@ -143,7 +143,7 @@ enum PathSeg {
 }
 
 #[derive(Debug, Default, Clone)]
-pub(crate) struct JsonPath(Vec<PathSeg>);
+pub struct JsonPath(Vec<PathSeg>);
 
 impl JsonPath {
     pub(crate) fn is_empty(&self) -> bool {
@@ -185,13 +185,13 @@ impl Display for JsonPath {
 }
 
 #[derive(Debug)]
-pub(crate) struct ToolInputError {
+pub struct ToolInputError {
     pub path: JsonPath,
     pub kind: ToolInputErrorKind,
 }
 
 #[derive(Debug)]
-pub(crate) enum ToolInputErrorKind {
+pub enum ToolInputErrorKind {
     Missing,
     TypeMismatch {
         expected: ParamKind,

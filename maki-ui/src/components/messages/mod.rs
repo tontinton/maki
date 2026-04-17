@@ -31,7 +31,7 @@ use std::time::Instant;
 
 use super::scrollbar::render_vertical_scrollbar;
 use super::streaming_content::StreamingContent;
-use maki_agent::tools::{ToolCall, WEBFETCH_TOOL_NAME};
+use maki_agent::tools::{WEBFETCH_TOOL_NAME, native_static_name};
 use maki_agent::{
     BatchToolEntry, BatchToolStatus, InstructionBlock, NO_FILES_FOUND, ToolDoneEvent, ToolOutput,
     ToolStartEvent,
@@ -117,7 +117,7 @@ impl MessagesPanel {
     }
 
     pub fn tool_pending(&mut self, id: String, name: &str) {
-        let Some(name) = ToolCall::name_static(name) else {
+        let Some(name) = native_static_name(name) else {
             return;
         };
         self.flush();

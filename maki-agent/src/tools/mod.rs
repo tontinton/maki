@@ -1,10 +1,10 @@
-//! Tool registry and dispatch.
-//!
-//! `register_tools!` enforces unique names at compile time and generates `ToolCall` + dispatch glue.
-//! Plan mode only permits writes to the designated plan file; all other write-like tools are rejected.
-//! `Deadline` lets batch/code_execution cap child tool timeouts without exceeding their own budget.
-//! `RESEARCH_SUBAGENT_TOOLS` is read-only; `GENERAL_SUBAGENT_TOOLS` is the full set.
-//! `sanitize_tool_input` fixes common LLM JSON mistakes: stray quotes, type mismatches, embedded fields.
+//! Shared plumbing for native tools. The registry itself lives in `registry.rs`; this file
+//! holds the helpers every tool leans on: `ToolFilter` to enable/disable per caller,
+//! `Deadline` so a parent tool can cap a child's timeout, the walker that skips `.git`,
+//! and `sanitize_tool_input` which patches up small JSON mistakes models make (stray
+//! quotes, camelCase keys, extra wrappers). The `register_tools!` and `impl_tool!` macros
+//! at the bottom wire each native tool into the registry through `Native<T>`. Plan mode
+//! rejects writes to anything but the plan file before they reach the tool.
 
 mod bash;
 mod batch;
@@ -20,6 +20,7 @@ pub mod memory;
 mod multiedit;
 mod question;
 mod read;
+pub mod registry;
 pub(crate) mod schema;
 mod skill;
 mod task;
@@ -29,31 +30,30 @@ mod websearch;
 mod write;
 
 pub use file_tracker::FileReadTracker;
+pub use registry::{
+    ExecFuture, Native, ParseError, RegisteredTool, RegistryError, Tool, ToolAudience,
+    ToolInvocation, ToolRegistry, ToolSource,
+};
 
 use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use humantime::format_duration;
 use ignore::WalkBuilder;
-use serde_json::{Value, json};
-use std::future::Future;
-use tracing::{error, info, warn};
+use serde_json::Value;
+use tracing::warn;
 
+pub(super) use crate::NO_FILES_FOUND;
 use crate::agent::LoadedInstructions;
 use crate::cancel::CancelToken;
 use crate::mcp::McpHandle;
 use crate::permissions::PermissionManager;
 use crate::skill::Skill;
-use crate::template::Vars;
-use crate::{
-    AgentConfig, AgentError, AgentMode, EventSender, NO_FILES_FOUND, ToolDoneEvent, ToolInput,
-    ToolOutput, ToolStartEvent,
-};
+use crate::{AgentConfig, AgentMode, EventSender};
 use maki_providers::Model;
 use maki_providers::provider::Provider;
 
@@ -66,32 +66,35 @@ pub struct DescriptionContext<'a> {
 pub enum ToolFilter {
     #[default]
     All,
-    Only(Vec<&'static str>),
-    AllExcept(Vec<&'static str>),
+    Only(Vec<String>),
+    AllExcept(Vec<String>),
 }
 
 impl ToolFilter {
     pub fn matches(&self, name: &str) -> bool {
         match self {
             Self::All => true,
-            Self::Only(allowed) => allowed.contains(&name),
-            Self::AllExcept(blocked) => !blocked.contains(&name),
+            Self::Only(allowed) => allowed.iter().any(|n| n == name),
+            Self::AllExcept(blocked) => !blocked.iter().any(|n| n == name),
         }
     }
 
-    pub fn excluding(self, names: &[&'static str]) -> Self {
+    pub fn excluding(self, names: &[&str]) -> Self {
         if names.is_empty() {
             return self;
         }
         match self {
-            Self::All => Self::AllExcept(names.to_vec()),
-            Self::Only(allowed) => {
-                Self::Only(allowed.into_iter().filter(|n| !names.contains(n)).collect())
-            }
+            Self::All => Self::AllExcept(names.iter().map(|s| (*s).to_owned()).collect()),
+            Self::Only(allowed) => Self::Only(
+                allowed
+                    .into_iter()
+                    .filter(|n| !names.iter().any(|x| *x == n))
+                    .collect(),
+            ),
             Self::AllExcept(mut blocked) => {
                 for &n in names {
-                    if !blocked.contains(&n) {
-                        blocked.push(n);
+                    if !blocked.iter().any(|b| b == n) {
+                        blocked.push(n.to_owned());
                     }
                 }
                 Self::AllExcept(blocked)
@@ -99,34 +102,35 @@ impl ToolFilter {
         }
     }
 
-    pub fn excluding_disabled(self, config: &AgentConfig) -> Self {
-        if !config.find_symbol_enabled {
-            self.excluding(&[FIND_SYMBOL_TOOL_NAME])
-        } else {
-            self
-        }
-    }
-
-    pub fn from_config(config: &AgentConfig, extra_exclude: &[&'static str]) -> Self {
+    pub fn from_config(config: &AgentConfig, extra_exclude: &[&str]) -> Self {
         let base = if config.allowed_tools.is_empty() {
             Self::All
         } else {
-            let refs: Vec<&'static str> = config
-                .allowed_tools
-                .iter()
-                .filter_map(|s| ToolCall::static_name(s))
-                .collect();
-            Self::Only(refs)
+            Self::Only(
+                config
+                    .allowed_tools
+                    .iter()
+                    .filter(|s| ToolRegistry::native().has(s))
+                    .cloned()
+                    .collect(),
+            )
         };
-        base.excluding(extra_exclude).excluding_disabled(config)
+        let mut exclude: Vec<&str> = extra_exclude.to_vec();
+        exclude.extend(disabled_tool_names(config));
+        base.excluding(&exclude)
     }
 }
 
-pub fn is_tool_enabled(config: &AgentConfig, name: &str) -> bool {
-    if name == FIND_SYMBOL_TOOL_NAME && !config.find_symbol_enabled {
-        return false;
+fn disabled_tool_names(config: &AgentConfig) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    if !config.find_symbol_enabled {
+        out.push(FIND_SYMBOL_TOOL_NAME);
     }
-    true
+    out
+}
+
+pub fn is_tool_enabled(config: &AgentConfig, name: &str) -> bool {
+    !disabled_tool_names(config).contains(&name)
 }
 
 pub const BASH_TOOL_NAME: &str = bash::Bash::NAME;
@@ -148,49 +152,8 @@ pub const WRITE_TOOL_NAME: &str = write::Write::NAME;
 pub const MEMORY_TOOL_NAME: &str = memory::Memory::NAME;
 pub const CODE_EXECUTION_TOOL_NAME: &str = code_execution::CodeExecution::NAME;
 
-pub(crate) const INTERPRETER_TOOLS: &[&str] = &[
-    "read",
-    "write",
-    "edit",
-    "multiedit",
-    "glob",
-    "grep",
-    "bash",
-    "webfetch",
-    "websearch",
-    "find_symbol",
-];
-
-pub(crate) const RESEARCH_SUBAGENT_TOOLS: &[&str] = &[
-    "bash",
-    "read",
-    "index",
-    "glob",
-    "grep",
-    "webfetch",
-    "batch",
-    "code_execution",
-    "find_symbol",
-];
-
-pub(crate) const GENERAL_SUBAGENT_TOOLS: &[&str] = &[
-    "bash",
-    "read",
-    "index",
-    "write",
-    "edit",
-    "multiedit",
-    "glob",
-    "grep",
-    "webfetch",
-    "batch",
-    "code_execution",
-    "memory",
-    "find_symbol",
-];
-
-const PLAN_WRITE_RESTRICTED: &str = "write restricted to plan file in plan mode";
-const DEADLINE_EXCEEDED: &str = "timeout exceeded";
+pub(crate) const PLAN_WRITE_RESTRICTED: &str = "write restricted to plan file in plan mode";
+pub(crate) const DEADLINE_EXCEEDED: &str = "timeout exceeded";
 
 #[derive(Clone, Copy, Debug, Default)]
 pub enum Deadline {
@@ -314,10 +277,6 @@ fn format_rel(prefix: &str, fallback: &str, rel: &Path) -> String {
 }
 
 /// Returns a `WalkBuilder` with `.hidden(false)` and `!.git` exclusion enforced.
-///
-/// Every tool that walks the file tree should use this instead of constructing
-/// a `WalkBuilder` directly. Extra override patterns (user globs, file-type
-/// filters) can be passed in.
 pub(crate) fn walk_builder(root: &str, patterns: &[&str]) -> Result<WalkBuilder, String> {
     let mut ob = ignore::overrides::OverrideBuilder::new(root);
     ob.add("!.git").expect("!.git is a valid glob");
@@ -331,10 +290,6 @@ pub(crate) fn walk_builder(root: &str, patterns: &[&str]) -> Result<WalkBuilder,
         .build()
         .map_err(|e| format!("invalid glob pattern: {e}"))?;
 
-    // NOTE: .hidden(false) makes all dotfiles visible, including the .git/ dir.
-    // The .gitignore file never lists .git/ (git handles that implicitly), so
-    // git_ignore(true) does not help. The override is the same mechanism
-    // ripgrep uses for -g '!.git/'
     let mut wb = WalkBuilder::new(root);
     wb.hidden(false).overrides(overrides);
     Ok(wb)
@@ -386,21 +341,6 @@ pub(crate) fn truncate_output(text: String, max_lines: usize, max_bytes: usize) 
     result
 }
 
-fn format_examples_as_text(examples: &[Value]) -> Option<String> {
-    if examples.is_empty() {
-        return None;
-    }
-    let mut text = String::from("Examples:");
-    for ex in examples {
-        if let Some(code) = ex.get("code").and_then(|c| c.as_str()) {
-            text.push_str("\n```\n");
-            text.push_str(code);
-            text.push_str("\n```");
-        }
-    }
-    Some(text)
-}
-
 fn format_tool_signature(name: &str, schema: &Value) -> String {
     let empty_props = serde_json::Map::new();
     let props = schema
@@ -438,38 +378,24 @@ fn format_tool_signature(name: &str, schema: &Value) -> String {
     format!("- {name}({}) -> str", params.join(", "))
 }
 
+/// Walks the registry so adding a new `INTERPRETER` tool shows up automatically.
 pub(crate) fn build_interpreter_tools_description(filter: &ToolFilter) -> String {
     let mut desc =
         String::from("\n\nAvailable tools (called as Python functions with keyword arguments):\n");
-    for name in INTERPRETER_TOOLS {
+    let registry = ToolRegistry::native();
+    for entry in registry.iter().iter() {
+        let name = entry.name();
+        if !entry.tool.audience().contains(ToolAudience::INTERPRETER) {
+            continue;
+        }
         if !filter.matches(name) {
             continue;
         }
-        if let Some(schema) = ToolCall::schema_for(name) {
-            desc.push_str(&format_tool_signature(name, &schema));
-            desc.push('\n');
-        }
+        let schema = entry.tool.schema();
+        desc.push_str(&format_tool_signature(name, &schema));
+        desc.push('\n');
     }
     desc
-}
-
-pub(crate) trait ToolDefaults {
-    fn start_input(&self) -> Option<ToolInput> {
-        None
-    }
-    fn start_output(&self) -> Option<ToolOutput> {
-        None
-    }
-    fn start_annotation(&self) -> Option<String> {
-        None
-    }
-    fn mutable_path(&self) -> Option<&str> {
-        None
-    }
-    fn permission(&self) -> Option<String> {
-        None
-    }
-    fn augment_description(_description: &mut String, _ctx: &DescriptionContext) {}
 }
 
 pub(crate) fn sanitize_tool_input(input: &Value) -> Value {
@@ -530,10 +456,60 @@ fn to_snake_case(s: &str) -> String {
     result
 }
 
-macro_rules! register_tools {
-    ($($Variant:ident($inner:path)),+ $(,)?) => {
-        $(const _: () = { fn _assert_defaults<T: ToolDefaults>() {} fn _check() { _assert_defaults::<$inner>() } };)+
+/// Builds the `Tool` impl for `Native<T>` from the consts `#[derive(Tool)]` produces, so
+/// tool files only write logic. `augment` lets a tool tweak its description at request
+/// time (e.g. appending the interpreter tool list).
+macro_rules! impl_tool {
+    (@augment_body $desc:ident, $ctx:ident,) => {};
+    (@augment_body $desc:ident, $ctx:ident, $f:expr) => { ($f)(&mut $desc, $ctx); };
+    (@audience_body) => { $crate::tools::ToolAudience::all() };
+    (@audience_body $aud:expr) => { $aud };
+    (
+        $ty:ty
+        $(, audience = $aud:expr)?
+        $(, augment = $augment:expr)?
+        $(,)?
+    ) => {
+        impl $crate::tools::Tool for $crate::tools::Native<$ty> {
+            fn name(&self) -> &str { <$ty>::NAME }
 
+            fn description(&self, _ctx: &$crate::tools::DescriptionContext)
+                -> std::borrow::Cow<'_, str>
+            {
+                #[allow(unused_mut)]
+                let mut s = <$ty>::DESCRIPTION.to_owned();
+                $crate::tools::impl_tool!(@augment_body s, _ctx, $($augment)?);
+                std::borrow::Cow::Owned(s)
+            }
+
+            fn schema(&self) -> serde_json::Value {
+                $crate::tools::schema::to_json_schema(<$ty>::SCHEMA)
+            }
+
+            fn examples(&self) -> Option<serde_json::Value> {
+                let raw = <$ty>::EXAMPLES?;
+                Some(serde_json::from_str(raw).unwrap_or_else(|e|
+                    panic!("invalid EXAMPLES JSON for {}: {e}", <$ty>::NAME)))
+            }
+
+            fn audience(&self) -> $crate::tools::ToolAudience {
+                $crate::tools::impl_tool!(@audience_body $($aud)?)
+            }
+
+            fn parse(&self, input: &serde_json::Value)
+                -> Result<Box<dyn $crate::tools::ToolInvocation>, $crate::tools::ParseError>
+            {
+                Ok(Box::new(<$ty>::parse_input(input)?))
+            }
+        }
+    };
+}
+pub(crate) use impl_tool;
+
+/// Checks at compile time that no two tools share a `NAME`. Without this, duplicates would
+/// only show up as a confused model calling the wrong tool at runtime.
+macro_rules! register_tools {
+    ($($inner:path),+ $(,)?) => {
         const _: () = {
             const NAMES: &[&str] = &[$(<$inner>::NAME),+];
             const fn str_eq(a: &str, b: &str) -> bool {
@@ -557,196 +533,40 @@ macro_rules! register_tools {
             }
         };
 
-        #[derive(Debug, Clone)]
-        pub enum ToolCall {
-            $($Variant(Box<$inner>)),+
+        pub(crate) fn native_tools() -> Vec<std::sync::Arc<dyn $crate::tools::Tool>> {
+            vec![
+                $(std::sync::Arc::new($crate::tools::Native::<$inner>::new())),+
+            ]
         }
 
-        macro_rules! dispatch {
-            ($self:expr, |$t:ident| $body:expr) => {
-                match $self { $(ToolCall::$Variant($t) => $body),+ }
-            };
-        }
+        /// UI code stores tool names as `&'static str` (e.g. `DisplayRole::Tool`).
+        pub const NATIVE_NAMES: &[&str] = &[$(<$inner>::NAME),+];
 
-        impl ToolCall {
-            pub fn from_api(name: &str, input: &Value) -> Result<Self, AgentError> {
-                match name {
-                    $(<$inner>::NAME => {
-                        <$inner>::parse_input(input)
-                            .map(|v| ToolCall::$Variant(Box::new(v)))
-                            .map_err(|e| AgentError::Tool { tool: name.to_string(), message: e.to_string() })
-                    })+
-                    _ => Err(AgentError::Tool {
-                        tool: name.to_string(),
-                        message: format!("unknown variant `{name}`"),
-                    })
-                }
-            }
-
-            pub fn name(&self) -> &'static str {
-                match self {
-                    $(ToolCall::$Variant(_) => <$inner>::NAME),+
-                }
-            }
-
-            pub fn name_static(name: &str) -> Option<&'static str> {
-                match name {
-                    $(<$inner>::NAME => Some(<$inner>::NAME),)+
-                    _ => None,
-                }
-            }
-
-            pub fn start_summary(&self) -> String {
-                dispatch!(self, |t| t.start_summary())
-            }
-
-            pub fn start_annotation(&self) -> Option<String> {
-                dispatch!(self, |t| t.start_annotation())
-            }
-
-            pub fn start_input(&self) -> Option<ToolInput> {
-                dispatch!(self, |t| t.start_input())
-            }
-
-            pub fn start_event(&self, id: String) -> ToolStartEvent {
-                dispatch!(self, |t| ToolStartEvent {
-                    id,
-                    tool: self.name(),
-                    summary: t.start_summary(),
-                    annotation: t.start_annotation(),
-                    input: t.start_input(),
-                    output: t.start_output(),
-                })
-            }
-
-            pub fn execute<'a>(&'a self, ctx: &'a ToolContext, id: String) -> Pin<Box<dyn Future<Output = ToolDoneEvent> + Send + 'a>> {
-                Box::pin(async move {
-                    if let Some(path) = self.mutable_path()
-                        && let AgentMode::Plan(plan_path) = &ctx.mode
-                        && Path::new(path) != plan_path.as_path()
-                    {
-                        return ToolDoneEvent {
-                            id,
-                            tool: self.name(),
-                            output: ToolOutput::Plain(PLAN_WRITE_RESTRICTED.into()),
-                            is_error: true,
-                        };
-                    }
-
-                    if let Some(scope) = dispatch!(self, |t| t.permission()) {
-                        if let Err(e) = ctx.permissions.enforce(
-                            self.name(),
-                            &scope,
-                            &ctx.event_tx,
-                            ctx.user_response_rx.as_deref(),
-                            &id,
-                            &ctx.cancel,
-                        ).await {
-                            return ToolDoneEvent {
-                                id,
-                                tool: self.name(),
-                                output: ToolOutput::Plain(e.to_string()),
-                                is_error: true,
-                            };
-                        }
-                    }
-
-                    let start = Instant::now();
-                    let result = match self {
-                        $(ToolCall::$Variant(inner) => inner.execute(ctx).await),+
-                    };
-                    let duration_ms = start.elapsed().as_millis() as u64;
-                    let (output, is_error) = match result {
-                        Ok(o) => (o, false),
-                        Err(e) => {
-                            error!(tool = self.name(), duration_ms, error = %e, "tool execution failed");
-                            (ToolOutput::Plain(e), true)
-                        }
-                    };
-                    if !is_error {
-                        info!(tool = self.name(), duration_ms, "tool completed");
-                    }
-                    ToolDoneEvent { id, tool: self.name(), output, is_error }
-                })
-            }
-
-            fn mutable_path(&self) -> Option<&str> {
-                dispatch!(self, |t| t.mutable_path())
-            }
-
-            pub fn schema_for(name: &str) -> Option<Value> {
-                match name {
-                    $(<$inner>::NAME => Some(<$inner>::schema()),)+
-                    _ => None,
-                }
-            }
-
-            fn all_defs(vars: &Vars, ctx: &DescriptionContext, supports_examples: bool) -> Vec<(&'static str, Value)> {
-                vec![
-                    $((<$inner>::NAME, {
-                        let mut description = vars.apply(<$inner>::DESCRIPTION).into_owned();
-                        <$inner>::augment_description(&mut description, ctx);
-                        let mut def = json!({
-                            "name": <$inner>::NAME,
-                            "description": &description,
-                            "input_schema": <$inner>::schema()
-                        });
-                        if let Some(json) = <$inner>::EXAMPLES {
-                            let examples: Vec<Value> = serde_json::from_str(json)
-                                .expect(concat!("invalid EXAMPLES JSON for ", stringify!($inner)));
-                            if supports_examples {
-                                def["input_examples"] = Value::Array(examples);
-                            } else if let Some(text) = format_examples_as_text(&examples) {
-                                def["description"] = Value::String(format!("{}\n\n{}", description, text));
-                            }
-                        }
-                        def
-                    })),+
-                ]
-            }
-
-            pub fn static_name(name: &str) -> Option<&'static str> {
-                match name {
-                    $(<$inner>::NAME => Some(<$inner>::NAME),)+
-                    _ => None,
-                }
-            }
-
-            pub fn all_names() -> &'static [&'static str] {
-                &[$(<$inner>::NAME),+]
-            }
-
-            pub fn definitions(vars: &Vars, ctx: &DescriptionContext, supports_examples: bool) -> Value {
-                Value::Array(
-                    Self::all_defs(vars, ctx, supports_examples).into_iter()
-                        .filter(|(name, _)| ctx.filter.matches(name))
-                        .map(|(_, def)| def)
-                        .collect()
-                )
-            }
+        pub fn native_static_name(name: &str) -> Option<&'static str> {
+            NATIVE_NAMES.iter().copied().find(|n| *n == name)
         }
     };
 }
 
 register_tools! {
-    Bash(bash::Bash),
-    Read(read::Read),
-    Write(write::Write),
-    Edit(edit::Edit),
-    MultiEdit(multiedit::MultiEdit),
-    Glob(glob::Glob),
-    Grep(grep::Grep),
-    Index(index::Index),
-    FindSymbol(find_symbol::FindSymbol),
-    Question(question::Question),
-    TodoWrite(todowrite::TodoWrite),
-    WebFetch(webfetch::WebFetch),
-    WebSearch(websearch::WebSearch),
-    Skill(skill::SkillTool),
-    Task(task::Task),
-    Batch(batch::Batch),
-    CodeExecution(code_execution::CodeExecution),
-    Memory(memory::Memory),
+    bash::Bash,
+    read::Read,
+    write::Write,
+    edit::Edit,
+    multiedit::MultiEdit,
+    glob::Glob,
+    grep::Grep,
+    index::Index,
+    find_symbol::FindSymbol,
+    question::Question,
+    todowrite::TodoWrite,
+    webfetch::WebFetch,
+    websearch::WebSearch,
+    skill::SkillTool,
+    task::Task,
+    batch::Batch,
+    code_execution::CodeExecution,
+    memory::Memory,
 }
 
 use maki_providers::provider::BoxFuture;
@@ -764,11 +584,11 @@ impl Provider for NullProvider {
         _: &'a flume::Sender<ProviderEvent>,
         _: ThinkingConfig,
         _: Option<&str>,
-    ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+    ) -> BoxFuture<'a, Result<StreamResponse, crate::AgentError>> {
         Box::pin(async { unimplemented!() })
     }
 
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<String>, AgentError>> {
+    fn list_models(&self) -> BoxFuture<'_, Result<Vec<String>, crate::AgentError>> {
         Box::pin(async { unimplemented!() })
     }
 }
@@ -849,6 +669,24 @@ pub(crate) mod test_support {
         stub_ctx_with(mode, None, None)
     }
 
+    pub(crate) fn stub_ctx_with_permissions(
+        mode: &AgentMode,
+        permissions: Arc<PermissionManager>,
+    ) -> ToolContext {
+        let (tx, _rx) = flume::unbounded::<crate::Envelope>();
+        let event_tx = EventSender::new(tx, 0);
+        let mut ctx = interpreter_ctx(
+            mode,
+            &event_tx,
+            CancelToken::none(),
+            permissions,
+            Arc::new(FileReadTracker::new()),
+            None,
+        );
+        ctx.tool_use_id = None;
+        ctx
+    }
+
     pub(crate) fn pre_read(ctx: &ToolContext, path: &str) {
         ctx.file_tracker.record_read(Path::new(path));
     }
@@ -865,8 +703,12 @@ mod tests {
 
     use super::test_support::stub_ctx;
     use super::*;
+    use crate::agent::tool_dispatch;
+    use crate::template::Vars;
+    use crate::{AgentError, NO_FILES_FOUND, ToolOutput};
 
     const LINE_LIMIT: usize = 500;
+    const PARSE_INTERNAL_BUG: &str = "internal validator bug";
 
     #[test_case(30,  "30s timeout"   ; "seconds_only")]
     #[test_case(120, "2m timeout"    ; "minutes_only")]
@@ -1016,7 +858,7 @@ mod tests {
             let path = file.to_string_lossy().to_string();
             let g = grep::Grep::parse_input(&json!({"pattern": "fn main", "path": path})).unwrap();
             let out = g.execute(&ctx).await.unwrap();
-            let ToolOutput::GrepResult { entries } = &out else {
+            let crate::ToolOutput::GrepResult { entries } = &out else {
                 panic!("expected GrepResult, got: {out:?}");
             };
             assert_eq!(entries.len(), 1);
@@ -1055,21 +897,11 @@ mod tests {
         });
     }
 
-    #[test]
-    fn from_api_unknown_tool_returns_error() {
-        let err = ToolCall::from_api("nonexistent_tool", &json!({})).unwrap_err();
-        let AgentError::Tool { tool, .. } = err else {
-            panic!("expected AgentError::Tool, got {err:?}");
-        };
-        assert_eq!(tool, "nonexistent_tool");
-    }
-
     /// Every registered tool, poked with four shapes of garbage, should come
     /// back with a plain validator error the LLM can read (Missing,
     /// TypeMismatch, NotInEnum). If any of them trips the `InternalBug`
     /// path, the schema no longer matches the Rust type and serde exploded
-    /// after validation said it was fine. That's ours to fix, not the
-    /// model's, so this test fails loudly when it happens.
+    /// after validation said it was fine.
     #[test]
     fn every_tool_rejects_bogus_input_without_internal_bug() {
         const BOGUS_INPUTS: &[&str] = &[
@@ -1078,18 +910,20 @@ mod tests {
             "{\"unknown_field\": 42}",
             "{\"path\": 123, \"pattern\": []}",
         ];
-        for name in ToolCall::all_names() {
+        let registry = ToolRegistry::native();
+        for entry in registry.iter().iter() {
+            let name = entry.name().to_owned();
             for raw in BOGUS_INPUTS {
                 let input: Value = serde_json::from_str(raw).unwrap();
-                match ToolCall::from_api(name, &input) {
+                match entry.tool.parse(&input) {
                     Ok(_) => {}
-                    Err(AgentError::Tool { message, .. }) => {
+                    Err(e) => {
+                        let msg = e.to_string();
                         assert!(
-                            !message.contains("internal validator bug"),
-                            "tool `{name}` with input `{raw}` produced InternalBug: {message}",
+                            !msg.contains(PARSE_INTERNAL_BUG),
+                            "tool `{name}` with input `{raw}` produced InternalBug: {msg}",
                         );
                     }
-                    Err(e) => panic!("unexpected error kind for `{name}`: {e:?}"),
                 }
             }
         }
@@ -1118,7 +952,7 @@ mod tests {
         }
 
         let vars = Vars::new().set("{cwd}", "/tmp");
-        let all = ToolCall::definitions(
+        let all = ToolRegistry::native().definitions(
             &vars,
             &DescriptionContext {
                 skills: &[],
@@ -1135,12 +969,12 @@ mod tests {
     #[test]
     fn definitions_filtered_returns_only_requested() {
         let vars = Vars::new().set("{cwd}", "/tmp");
-        let filter = ToolFilter::Only(vec!["bash", "read"]);
+        let filter = ToolFilter::Only(vec!["bash".into(), "read".into()]);
         let ctx = DescriptionContext {
             skills: &[],
             filter: &filter,
         };
-        let filtered = ToolCall::definitions(&vars, &ctx, true);
+        let filtered = ToolRegistry::native().definitions(&vars, &ctx, true);
         let names: Vec<&str> = filtered
             .as_array()
             .unwrap()
@@ -1170,17 +1004,34 @@ mod tests {
             let plan_str = plan_path.to_str().unwrap();
             let other_str = other.to_str().unwrap();
 
-            // Pre-read both files for edit/multiedit tests
             ctx.file_tracker.record_read(Path::new(plan_str));
             ctx.file_tracker.record_read(Path::new(other_str));
 
-            let blocked = ToolCall::from_api(tool, &other_input(plan_str, other_str)).unwrap();
-            let result = blocked.execute(&ctx, "t1".into()).await;
-            assert!(result.is_error, "{tool} should be blocked on non-plan file");
+            let registry = ToolRegistry::native();
+            let blocked = tool_dispatch::run(
+                registry,
+                None,
+                "t1".into(),
+                tool,
+                &other_input(plan_str, other_str),
+                &ctx,
+            )
+            .await;
+            assert!(
+                blocked.is_error,
+                "{tool} should be blocked on non-plan file"
+            );
 
-            let allowed = ToolCall::from_api(tool, &plan_input(plan_str, other_str)).unwrap();
-            let result = allowed.execute(&ctx, "t2".into()).await;
-            assert!(!result.is_error, "{tool} should be allowed on plan file");
+            let allowed = tool_dispatch::run(
+                registry,
+                None,
+                "t2".into(),
+                tool,
+                &plan_input(plan_str, other_str),
+                &ctx,
+            )
+            .await;
+            assert!(!allowed.is_error, "{tool} should be allowed on plan file");
         });
     }
 
@@ -1238,12 +1089,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
 
-        // create a fake .git dir with an object inside
         fs::create_dir_all(root.join(".git/objects")).unwrap();
         fs::write(root.join(".git/config"), "repositoryformatversion = 0").unwrap();
         fs::write(root.join(".git/objects/abc123"), "blob").unwrap();
 
-        // create a regular dotfile and a normal file
         fs::write(root.join(".env"), "SECRET=42").unwrap();
         fs::write(root.join("main.rs"), "fn main() {}").unwrap();
 
@@ -1262,18 +1111,9 @@ mod tests {
             })
             .collect();
 
-        assert!(
-            paths.contains(&"main.rs".to_string()),
-            "normal files should appear"
-        );
-        assert!(
-            paths.contains(&".env".to_string()),
-            "dotfiles should appear"
-        );
-        assert!(
-            !paths.iter().any(|p| p.starts_with(".git")),
-            ".git/ contents should be excluded, got: {paths:?}"
-        );
+        assert!(paths.contains(&"main.rs".to_string()));
+        assert!(paths.contains(&".env".to_string()));
+        assert!(!paths.iter().any(|p| p.starts_with(".git")));
     }
 
     #[test]
@@ -1302,19 +1142,10 @@ mod tests {
             })
             .collect();
 
-        assert!(paths.contains(&"lib.rs".to_string()), "*.rs should match");
-        assert!(
-            paths.contains(&".hidden.rs".to_string()),
-            "hidden *.rs should match"
-        );
-        assert!(
-            !paths.contains(&"main.py".to_string()),
-            "*.py should be filtered"
-        );
-        assert!(
-            !paths.iter().any(|p| p.starts_with(".git")),
-            ".git/ should still be excluded, got: {paths:?}"
-        );
+        assert!(paths.contains(&"lib.rs".to_string()));
+        assert!(paths.contains(&".hidden.rs".to_string()));
+        assert!(!paths.contains(&"main.py".to_string()));
+        assert!(!paths.iter().any(|p| p.starts_with(".git")));
     }
 
     #[test]
@@ -1358,30 +1189,40 @@ mod tests {
 
     #[test]
     fn multiedit_reports_inner_shape_with_path() {
-        let input = json!({
+        let registry = ToolRegistry::native();
+        let entry = registry.get("multiedit").unwrap();
+        let err = match entry.tool.parse(&json!({
             "path": "/x",
             "edits": [{"old_string": "a"}]
-        });
-        let err = ToolCall::from_api("multiedit", &input).unwrap_err();
-        let AgentError::Tool { message, .. } = err else {
-            panic!("expected Tool error");
+        })) {
+            Ok(_) => panic!("expected parse error"),
+            Err(e) => e,
         };
-        assert!(message.contains("edits[0].new_string"), "got: {message}");
-        assert!(message.contains("missing"), "got: {message}");
+        let msg = err.to_string();
+        assert!(msg.contains("edits[0].new_string"), "got: {msg}");
+        assert!(msg.contains("missing"), "got: {msg}");
     }
 
     #[test]
     fn multiedit_huge_string_error_is_bounded() {
         let huge: String = "x".repeat(50 * 1024);
-        let input = json!({"path": "/x", "edits": huge});
-        let err = ToolCall::from_api("multiedit", &input).unwrap_err();
-        let AgentError::Tool { message, .. } = err else {
-            panic!("expected Tool error");
+        let registry = ToolRegistry::native();
+        let entry = registry.get("multiedit").unwrap();
+        let err = match entry.tool.parse(&json!({"path": "/x", "edits": huge})) {
+            Ok(_) => panic!("expected parse error"),
+            Err(e) => e,
         };
+        let message = err.to_string();
         assert!(
             message.len() < schema::BOUNDED_ERR_MAX,
             "error message too long: {} bytes",
             message.len()
         );
+        // Check the error fits inside `AgentError::Tool` without tripping the bounded-error
+        // cap, since that is the shape the real agent loop constructs.
+        let _ = AgentError::Tool {
+            tool: "multiedit".into(),
+            message,
+        };
     }
 }

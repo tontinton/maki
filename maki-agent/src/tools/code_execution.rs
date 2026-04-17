@@ -25,7 +25,8 @@ use async_lock::Mutex;
 use smol::future::block_on;
 
 use super::truncate_output;
-use super::{Deadline, FileReadTracker, INTERPRETER_TOOLS};
+use super::{Deadline, FileReadTracker};
+use crate::tools::{ToolAudience, ToolRegistry};
 
 const STREAM_FLUSH_INTERVAL: Duration = Duration::from_millis(100);
 const PREAMBLE: &str = "import re\nimport asyncio\nimport sys\nimport os\nimport json\n";
@@ -140,31 +141,45 @@ impl CodeExecution {
     }
 }
 
-impl super::ToolDefaults for CodeExecution {
+super::impl_tool!(
+    CodeExecution,
+    audience = super::ToolAudience::MAIN
+        | super::ToolAudience::RESEARCH_SUB
+        | super::ToolAudience::GENERAL_SUB,
+    augment = |desc: &mut String, ctx: &super::DescriptionContext| {
+        desc.push_str(&super::build_interpreter_tools_description(ctx.filter));
+    },
+);
+
+impl super::ToolInvocation for CodeExecution {
+    fn start_summary(&self) -> String {
+        CodeExecution::start_summary(self)
+    }
     fn start_input(&self) -> Option<ToolInput> {
         Some(ToolInput::Script {
             language: "python".into(),
             code: self.code.clone(),
         })
     }
-
     fn start_annotation(&self) -> Option<String> {
         Some(super::timeout_annotation(self.timeout.unwrap_or(30)))
     }
-
-    fn augment_description(description: &mut String, ctx: &super::DescriptionContext) {
-        description.push_str(&super::build_interpreter_tools_description(ctx.filter));
-    }
-
-    fn permission(&self) -> Option<String> {
+    fn permission_scope(&self) -> Option<String> {
         None
+    }
+    fn execute<'a>(self: Box<Self>, ctx: &'a super::ToolContext) -> super::ExecFuture<'a> {
+        Box::pin(async move { CodeExecution::execute(&self, ctx).await })
     }
 }
 
 fn build_tool_fns(env: &InterpreterEnv) -> HashMap<String, ToolFn> {
     let mut tools: HashMap<String, ToolFn> = HashMap::new();
 
-    for &tool_name in INTERPRETER_TOOLS {
+    for entry in ToolRegistry::native().iter().iter() {
+        let tool_name = entry.name();
+        if !entry.tool.audience().contains(ToolAudience::INTERPRETER) {
+            continue;
+        }
         if !super::is_tool_enabled(&env.config, tool_name) {
             continue;
         }
@@ -185,8 +200,6 @@ fn build_tool_fns(env: &InterpreterEnv) -> HashMap<String, ToolFn> {
                     deadline.check()?;
 
                     let input = build_tool_input(&args, &kwargs)?;
-                    let call = super::ToolCall::from_api(fn_name, &input)
-                        .map_err(|e| format!("tool parse error: {e}"))?;
 
                     let mut inner_ctx = super::interpreter_ctx(
                         &mode,
@@ -198,7 +211,14 @@ fn build_tool_fns(env: &InterpreterEnv) -> HashMap<String, ToolFn> {
                     );
                     inner_ctx.deadline = deadline;
                     inner_ctx.config = config.clone();
-                    let done = block_on(call.execute(&inner_ctx, String::new()));
+                    let done = block_on(crate::agent::tool_dispatch::run(
+                        ToolRegistry::native(),
+                        inner_ctx.mcp.as_ref(),
+                        String::new(),
+                        fn_name,
+                        &input,
+                        &inner_ctx,
+                    ));
                     if done.is_error {
                         Err(done.output.as_text())
                     } else {
@@ -247,10 +267,6 @@ fn build_async_resolver(env: &InterpreterEnv) -> AsyncResolver {
                         Ok(v) => v,
                         Err(e) => return (pc.call_id, Err(e)),
                     };
-                    let call = match super::ToolCall::from_api(&pc.name, &input) {
-                        Ok(c) => c,
-                        Err(e) => return (pc.call_id, Err(format!("tool parse error: {e}"))),
-                    };
 
                     let mut inner_ctx = super::interpreter_ctx(
                         &mode,
@@ -262,7 +278,15 @@ fn build_async_resolver(env: &InterpreterEnv) -> AsyncResolver {
                     );
                     inner_ctx.deadline = deadline;
                     inner_ctx.config = config;
-                    let done = call.execute(&inner_ctx, String::new()).await;
+                    let done = crate::agent::tool_dispatch::run(
+                        ToolRegistry::native(),
+                        inner_ctx.mcp.as_ref(),
+                        String::new(),
+                        &pc.name,
+                        &input,
+                        &inner_ctx,
+                    )
+                    .await;
 
                     let result = if done.is_error {
                         Err(done.output.as_text())

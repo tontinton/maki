@@ -51,8 +51,12 @@ impl Glob {
         })
         .await
     }
+}
 
-    pub fn start_summary(&self) -> String {
+super::impl_tool!(Glob);
+
+impl super::ToolInvocation for Glob {
+    fn start_summary(&self) -> String {
         let mut s = self.pattern.clone();
         if let Some(dir) = &self.path {
             s.push_str(" in ");
@@ -60,13 +64,15 @@ impl Glob {
         }
         s
     }
+    fn execute<'a>(self: Box<Self>, ctx: &'a super::ToolContext) -> super::ExecFuture<'a> {
+        Box::pin(async move { Glob::execute(&self, ctx).await })
+    }
 }
-
-impl super::ToolDefaults for Glob {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::ToolInvocation;
     use test_case::test_case;
 
     #[test_case("**/*.rs", None,            "**/*.rs"          ; "pattern_only")]

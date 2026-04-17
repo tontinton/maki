@@ -170,7 +170,16 @@ impl Grep {
     }
 }
 
-impl super::ToolDefaults for Grep {}
+super::impl_tool!(Grep);
+
+impl super::ToolInvocation for Grep {
+    fn start_summary(&self) -> String {
+        Grep::start_summary(self)
+    }
+    fn execute<'a>(self: Box<Self>, ctx: &'a super::ToolContext) -> super::ExecFuture<'a> {
+        Box::pin(async move { Grep::execute(&self, ctx).await })
+    }
+}
 
 struct GrepSink<'a> {
     groups: &'a mut Vec<GrepMatchGroup>,

@@ -9,7 +9,7 @@ use maki_agent::permissions::PermissionManager;
 use maki_agent::skill::Skill;
 use maki_agent::template;
 use maki_agent::template::Vars;
-use maki_agent::tools::{DescriptionContext, FileReadTracker, ToolCall, ToolFilter};
+use maki_agent::tools::{DescriptionContext, FileReadTracker, ToolFilter, ToolRegistry};
 use maki_agent::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentParams, AgentRunParams, CancelToken,
     CancelTrigger, Envelope, EventSender, History, Instructions, McpCommand, PromptRole,
@@ -253,7 +253,7 @@ impl AgentLoop {
             skills: &self.skills,
             filter: &filter,
         };
-        ToolCall::definitions(&self.vars, &ctx, examples)
+        ToolRegistry::native().definitions(&self.vars, &ctx, examples)
     }
 
     async fn reload_instructions(&mut self) {

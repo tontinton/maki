@@ -50,7 +50,16 @@ impl Question {
     }
 }
 
-impl super::ToolDefaults for Question {}
+super::impl_tool!(Question, audience = super::ToolAudience::MAIN);
+
+impl super::ToolInvocation for Question {
+    fn start_summary(&self) -> String {
+        Question::start_summary(self)
+    }
+    fn execute<'a>(self: Box<Self>, ctx: &'a super::ToolContext) -> super::ExecFuture<'a> {
+        Box::pin(async move { Question::execute(&self, ctx).await })
+    }
+}
 
 impl Question {
     fn format_answer(questions: &[QuestionInfo], raw: &str) -> ToolOutput {

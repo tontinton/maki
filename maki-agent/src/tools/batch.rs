@@ -5,7 +5,8 @@
 
 use std::fmt::Write;
 
-use crate::agent::{ResolvedCall, resolve_tool};
+use crate::agent::tool_dispatch;
+use crate::tools::ToolRegistry;
 use crate::{AgentEvent, BatchProgressEvent, BatchToolEntry, BatchToolStatus, ToolOutput};
 use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
@@ -17,7 +18,7 @@ use tracing::{error, info};
 
 use std::time::Instant;
 
-use super::{ToolCall, ToolContext};
+use super::ToolContext;
 
 const MAX_BATCH_SIZE: usize = 25;
 
@@ -110,7 +111,9 @@ impl BatchEntry {
         status: BatchToolStatus,
         output: Option<ToolOutput>,
     ) -> BatchToolEntry {
-        let call = ToolCall::from_api(&self.tool, &self.parameters).ok();
+        let call = ToolRegistry::native()
+            .get(&self.tool)
+            .and_then(|e| e.tool.parse(&self.parameters).ok());
         BatchToolEntry {
             tool: self.tool.clone(),
             summary: call.as_ref().map(|c| c.start_summary()).unwrap_or_default(),
@@ -149,27 +152,16 @@ impl Batch {
         let active = &self.tool_calls[..self.tool_calls.len().min(MAX_BATCH_SIZE)];
         let discarded = &self.tool_calls[active.len()..];
 
-        let mcp = ctx.mcp.as_ref();
-
-        let parsed: Vec<Result<ResolvedCall, String>> = active
-            .iter()
-            .map(|entry| {
-                if entry.tool == Self::NAME {
-                    return Err("cannot nest batch inside batch".into());
-                }
-                resolve_tool(&entry.tool, &entry.parameters, mcp).map_err(|e| e.to_string())
-            })
-            .collect();
-
         let inner_id = |i: usize| format!("{batch_id}__{i}");
 
         let start = Instant::now();
         let mut set = TaskSet::new();
-        for (i, parsed_call) in parsed.iter().enumerate() {
+        for (i, entry) in active.iter().enumerate() {
             let id = inner_id(i);
             let batch_id = batch_id.clone();
             let ctx = ctx.clone();
-            let parsed_call = parsed_call.clone();
+            let name = entry.tool.clone();
+            let params = entry.parameters.clone();
             set.spawn(async move {
                 ctx.event_tx
                     .try_send(AgentEvent::BatchProgress(Box::new(BatchProgressEvent {
@@ -178,21 +170,42 @@ impl Batch {
                         status: BatchToolStatus::InProgress,
                         output: None,
                     })));
-                let (result, output) = match parsed_call {
-                    Ok(call) => {
-                        let inner_ctx = ToolContext {
-                            tool_use_id: Some(id.clone()),
-                            ..ctx.clone()
-                        };
-                        let done = call.execute(&inner_ctx, id).await;
-                        ctx.event_tx
-                            .try_send(AgentEvent::ToolDone(Box::new(done.clone())));
-                        let text = done.output.as_text();
-                        let result = if done.is_error { Err(text) } else { Ok(text) };
-                        (result, Some(done.output))
-                    }
-                    Err(e) => (Err(e.to_string()), None),
+
+                if name == Batch::NAME {
+                    let status = BatchToolStatus::Error;
+                    ctx.event_tx.try_send(AgentEvent::BatchProgress(Box::new(
+                        BatchProgressEvent {
+                            batch_id,
+                            index: i,
+                            status,
+                            output: None,
+                        },
+                    )));
+                    return (i, Err("cannot nest batch inside batch".into()), None);
+                }
+
+                let inner_ctx = ToolContext {
+                    tool_use_id: Some(id.clone()),
+                    ..ctx.clone()
                 };
+                let done = tool_dispatch::run(
+                    ToolRegistry::native(),
+                    inner_ctx.mcp.as_ref(),
+                    id,
+                    &name,
+                    &params,
+                    &inner_ctx,
+                )
+                .await;
+                ctx.event_tx
+                    .try_send(AgentEvent::ToolDone(Box::new(done.clone())));
+                let text = done.output.as_text();
+                let result = if done.is_error {
+                    Err(text.to_string())
+                } else {
+                    Ok(text.to_string())
+                };
+                let output = Some(done.output);
                 let status = if result.is_ok() {
                     BatchToolStatus::Success
                 } else {
@@ -210,7 +223,7 @@ impl Batch {
         }
 
         let mut results: Vec<(Result<String, String>, Option<ToolOutput>)> =
-            vec![(Err("tool task panicked".into()), None); parsed.len()];
+            vec![(Err("tool task panicked".into()), None); active.len()];
         let all = ctx.cancel.race(set.join_all()).await?;
         for (r, i) in all.into_iter().zip(0..) {
             match r {
@@ -287,7 +300,17 @@ impl Batch {
     }
 }
 
-impl super::ToolDefaults for Batch {
+super::impl_tool!(
+    Batch,
+    audience = super::ToolAudience::MAIN
+        | super::ToolAudience::RESEARCH_SUB
+        | super::ToolAudience::GENERAL_SUB,
+);
+
+impl super::ToolInvocation for Batch {
+    fn start_summary(&self) -> String {
+        Batch::start_summary(self)
+    }
     fn start_output(&self) -> Option<ToolOutput> {
         let entries = self
             .tool_calls
@@ -298,6 +321,9 @@ impl super::ToolDefaults for Batch {
             entries,
             text: String::new(),
         })
+    }
+    fn execute<'a>(self: Box<Self>, ctx: &'a super::ToolContext) -> super::ExecFuture<'a> {
+        Box::pin(async move { Batch::execute(&self, ctx).await })
     }
 }
 

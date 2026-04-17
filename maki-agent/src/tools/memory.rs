@@ -47,7 +47,19 @@ impl Memory {
     }
 }
 
-impl super::ToolDefaults for Memory {}
+super::impl_tool!(
+    Memory,
+    audience = super::ToolAudience::MAIN | super::ToolAudience::GENERAL_SUB,
+);
+
+impl super::ToolInvocation for Memory {
+    fn start_summary(&self) -> String {
+        Memory::start_summary(self)
+    }
+    fn execute<'a>(self: Box<Self>, ctx: &'a super::ToolContext) -> super::ExecFuture<'a> {
+        Box::pin(async move { Memory::execute(&self, ctx).await })
+    }
+}
 
 async fn dispatch(
     command: &str,

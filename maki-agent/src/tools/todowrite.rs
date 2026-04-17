@@ -18,10 +18,15 @@ impl TodoWrite {
     pub async fn execute(&self, _ctx: &super::ToolContext) -> Result<ToolOutput, String> {
         Ok(ToolOutput::TodoList(self.todos.clone()))
     }
-
-    pub fn start_summary(&self) -> String {
-        format!("{} todos", self.todos.len())
-    }
 }
 
-impl super::ToolDefaults for TodoWrite {}
+super::impl_tool!(TodoWrite, audience = super::ToolAudience::MAIN);
+
+impl super::ToolInvocation for TodoWrite {
+    fn start_summary(&self) -> String {
+        format!("{} todos", self.todos.len())
+    }
+    fn execute<'a>(self: Box<Self>, ctx: &'a super::ToolContext) -> super::ExecFuture<'a> {
+        Box::pin(async move { TodoWrite::execute(&self, ctx).await })
+    }
+}

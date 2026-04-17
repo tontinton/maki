@@ -23,6 +23,9 @@ const COMPLEX_NODE_TYPES: &[&str] = &[
 pub const DEFAULT_DENY_GUIDANCE: &str =
     "Do not retry. Try a different approach or ask the user for guidance.";
 
+/// Tests assert on this exact prefix; a wording tweak here updates them in one place.
+pub const PERMISSION_DENIED_PREFIX: &str = "Permission denied for";
+
 fn builtin_rules(cwd: &Path) -> Vec<PermissionRule> {
     let cwd_glob = format!(
         "{}/**",
@@ -75,7 +78,11 @@ pub struct PermissionError {
 
 impl std::fmt::Display for PermissionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Permission denied for `{}` ({}).", self.tool, self.scope)?;
+        write!(
+            f,
+            "{} `{}` ({}).",
+            PERMISSION_DENIED_PREFIX, self.tool, self.scope
+        )?;
         if let Some(g) = &self.guidance {
             write!(f, " User guidance: {}", g)
         } else {

@@ -59,18 +59,29 @@ impl Write {
     }
 }
 
-impl super::ToolDefaults for Write {
+super::impl_tool!(
+    Write,
+    audience = super::ToolAudience::MAIN
+        | super::ToolAudience::GENERAL_SUB
+        | super::ToolAudience::INTERPRETER,
+);
+
+impl super::ToolInvocation for Write {
+    fn start_summary(&self) -> String {
+        Write::start_summary(self)
+    }
     fn start_output(&self) -> Option<ToolOutput> {
         let path = super::resolve_path(&self.path).ok()?;
         Some(self.write_output(&path, maki_config::DEFAULT_MAX_OUTPUT_LINES))
     }
-
-    fn mutable_path(&self) -> Option<&str> {
-        Some(&self.path)
+    fn mutable_path(&self) -> Option<&Path> {
+        Some(Path::new(&self.path))
     }
-
-    fn permission(&self) -> Option<String> {
+    fn permission_scope(&self) -> Option<String> {
         Some(crate::permissions::canonicalize_scope_path(&self.path))
+    }
+    fn execute<'a>(self: Box<Self>, ctx: &'a super::ToolContext) -> super::ExecFuture<'a> {
+        Box::pin(async move { Write::execute(&self, ctx).await })
     }
 }
 

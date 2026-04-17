@@ -31,12 +31,23 @@ impl SkillTool {
     }
 }
 
-impl super::ToolDefaults for SkillTool {
-    fn augment_description(description: &mut String, ctx: &super::DescriptionContext) {
-        let desc = build_skill_list_description(ctx.skills);
-        if !desc.is_empty() {
-            description.push_str(&desc);
+super::impl_tool!(
+    SkillTool,
+    audience = super::ToolAudience::MAIN,
+    augment = |desc: &mut String, ctx: &super::DescriptionContext| {
+        let list = build_skill_list_description(ctx.skills);
+        if !list.is_empty() {
+            desc.push_str(&list);
         }
+    },
+);
+
+impl super::ToolInvocation for SkillTool {
+    fn start_summary(&self) -> String {
+        SkillTool::start_summary(self)
+    }
+    fn execute<'a>(self: Box<Self>, ctx: &'a super::ToolContext) -> super::ExecFuture<'a> {
+        Box::pin(async move { SkillTool::execute(&self, ctx).await })
     }
 }
 

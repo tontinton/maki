@@ -141,7 +141,16 @@ impl Read {
     }
 }
 
-impl super::ToolDefaults for Read {}
+super::impl_tool!(Read);
+
+impl super::ToolInvocation for Read {
+    fn start_summary(&self) -> String {
+        Read::start_summary(self)
+    }
+    fn execute<'a>(self: Box<Self>, ctx: &'a super::ToolContext) -> super::ExecFuture<'a> {
+        Box::pin(async move { Read::execute(&self, ctx).await })
+    }
+}
 
 #[cfg(test)]
 mod tests {

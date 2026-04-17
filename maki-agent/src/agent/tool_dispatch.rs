@@ -1,72 +1,21 @@
 use std::collections::VecDeque;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::time::Instant;
 
 use serde_json::Value;
 use tracing::{debug, error, warn};
 
 use crate::mcp::{McpHandle, UNKNOWN_MCP};
 use crate::task_set::TaskSet;
-use crate::tools::{ToolCall, ToolContext};
+use crate::tools::registry::ToolRegistry;
+use crate::tools::{ToolContext, native_static_name};
 use crate::{AgentError, AgentEvent, AgentMode, ToolDoneEvent, ToolOutput, ToolStartEvent};
 
 const DOOM_LOOP_THRESHOLD: usize = 3;
 const DOOM_LOOP_MESSAGE: &str = "You have called this tool with identical input 3 times in a row. You are stuck in a loop. Break out and try a different approach.";
 const MCP_BLOCKED_IN_PLAN: &str = "MCP tools are not available in plan mode";
-
-#[derive(Clone)]
-pub(crate) enum ResolvedCall {
-    Native(ToolCall),
-    Mcp { tool_name: String, input: Value },
-}
-
-impl ResolvedCall {
-    pub(crate) fn start_event(&self, id: String, mcp: Option<&McpHandle>) -> ToolStartEvent {
-        match self {
-            Self::Native(call) => call.start_event(id),
-            Self::Mcp { tool_name, .. } => {
-                let interned = mcp
-                    .map(|m| m.interned_name(tool_name))
-                    .unwrap_or(UNKNOWN_MCP);
-                ToolStartEvent {
-                    id,
-                    tool: interned,
-                    summary: format!("mcp: {tool_name}"),
-                    annotation: None,
-                    input: None,
-                    output: None,
-                }
-            }
-        }
-    }
-
-    pub(crate) async fn execute(&self, ctx: &ToolContext, id: String) -> ToolDoneEvent {
-        match self {
-            Self::Native(call) => call.execute(ctx, id).await,
-            Self::Mcp { tool_name, input } => execute_mcp_tool(ctx, &id, tool_name, input).await,
-        }
-    }
-}
-
-pub(crate) fn resolve_tool(
-    name: &str,
-    input: &Value,
-    mcp: Option<&McpHandle>,
-) -> Result<ResolvedCall, AgentError> {
-    match ToolCall::from_api(name, input) {
-        Ok(call) => Ok(ResolvedCall::Native(call)),
-        Err(_) if mcp.is_some_and(|m| m.has_tool(name)) => Ok(ResolvedCall::Mcp {
-            tool_name: name.to_owned(),
-            input: input.clone(),
-        }),
-        Err(e) => Err(e),
-    }
-}
-
-struct ParsedToolCall {
-    id: String,
-    call: ResolvedCall,
-}
+const UNKNOWN_TOOL_PREFIX: &str = "unknown tool";
 
 pub(super) struct RecentCalls(VecDeque<(String, u64)>);
 
@@ -100,102 +49,147 @@ impl RecentCalls {
     }
 }
 
-fn parse_tool_calls<'a>(
-    tool_uses: impl Iterator<Item = (&'a str, &'a str, &'a Value)>,
-    recent: &mut RecentCalls,
-    mcp: Option<&McpHandle>,
-) -> (Vec<ParsedToolCall>, Vec<ToolDoneEvent>) {
-    let mut parsed = Vec::new();
-    let mut errors = Vec::new();
+/// Events need `&'static str` names, but MCP names only appear at runtime. We intern
+/// them through `McpHandle` and fall back to a shared placeholder for unknowns.
+fn static_tool_name(name: &str, mcp: Option<&McpHandle>) -> &'static str {
+    if let Some(n) = native_static_name(name) {
+        return n;
+    }
+    mcp.map(|m| m.interned_name(name)).unwrap_or(UNKNOWN_MCP)
+}
 
-    for (id, name, input) in tool_uses {
-        debug!(
-            tool = %name,
-            id = %id,
-            input_preview = %crate::tools::schema::preview(&input.to_string()),
-            "parsing tool call"
-        );
-        if recent.is_doom_loop(name, input) {
-            warn!(tool = %name, "doom loop detected, skipping execution");
-            errors.push(ToolDoneEvent::error(id.to_owned(), DOOM_LOOP_MESSAGE));
-        } else {
-            match resolve_tool(name, input, mcp) {
-                Ok(call) => parsed.push(ParsedToolCall {
-                    id: id.to_owned(),
-                    call,
-                }),
-                Err(AgentError::Tool { message, .. }) => {
-                    warn!(
-                        tool = %name,
-                        input_preview = %crate::tools::schema::preview(&input.to_string()),
-                        error = %message,
-                        "failed to parse tool call"
-                    );
-                    errors.push(ToolDoneEvent::error(id.to_owned(), message));
+/// `ToolStart` goes out from here so every source (native, MCP) looks the same to the UI.
+/// On parse error or unknown tool we skip the start event, matching the old code and
+/// keeping the UI from showing a phantom running tool.
+pub(crate) async fn run(
+    registry: &ToolRegistry,
+    mcp: Option<&McpHandle>,
+    id: String,
+    name: &str,
+    input: &Value,
+    ctx: &ToolContext,
+) -> ToolDoneEvent {
+    let tool_static = static_tool_name(name, mcp);
+    let started = Instant::now();
+
+    let done_error = |msg: String| ToolDoneEvent {
+        id: id.clone(),
+        tool: tool_static,
+        output: ToolOutput::Plain(msg),
+        is_error: true,
+    };
+
+    if let Some(entry) = registry.get(name) {
+        let invocation = match entry.tool.parse(input) {
+            Ok(inv) => inv,
+            Err(e) => {
+                warn!(
+                    tool = %name,
+                    source = %entry.source.as_log_field(),
+                    input_preview = %crate::tools::schema::preview(&input.to_string()),
+                    error = %e,
+                    "tool input parse failed"
+                );
+                return done_error(e.to_string());
+            }
+        };
+
+        if let AgentMode::Plan(plan_path) = &ctx.mode
+            && let Some(target) = invocation.mutable_path()
+            && target != plan_path.as_path()
+        {
+            warn!(
+                tool = %name,
+                target = %target.display(),
+                plan = %plan_path.display(),
+                "blocked write in plan mode"
+            );
+            return done_error(crate::tools::PLAN_WRITE_RESTRICTED.into());
+        }
+
+        let start = ToolStartEvent {
+            id: id.clone(),
+            tool: tool_static,
+            summary: invocation.start_summary(),
+            annotation: invocation.start_annotation(),
+            input: invocation.start_input(),
+            output: invocation.start_output(),
+        };
+        let _ = ctx.event_tx.send(AgentEvent::ToolStart(Box::new(start)));
+
+        if let Some(scope) = invocation.permission_scope()
+            && let Err(e) = ctx
+                .permissions
+                .enforce(
+                    name,
+                    &scope,
+                    &ctx.event_tx,
+                    ctx.user_response_rx.as_deref(),
+                    &id,
+                    &ctx.cancel,
+                )
+                .await
+        {
+            return done_error(e.to_string());
+        }
+
+        let result = invocation.execute(ctx).await;
+        let elapsed = started.elapsed();
+        match result {
+            Ok(output) => {
+                debug!(
+                    tool = %name,
+                    source = %entry.source.as_log_field(),
+                    elapsed_ms = elapsed.as_millis() as u64,
+                    "tool ok"
+                );
+                ToolDoneEvent {
+                    id,
+                    tool: tool_static,
+                    output,
+                    is_error: false,
                 }
-                Err(e) => {
-                    warn!(
-                        tool = %name,
-                        input_preview = %crate::tools::schema::preview(&input.to_string()),
-                        error = %e,
-                        "failed to parse tool call"
-                    );
-                    errors.push(ToolDoneEvent::error(id.to_owned(), e.to_string()));
-                }
+            }
+            Err(message) => {
+                warn!(
+                    tool = %name,
+                    source = %entry.source.as_log_field(),
+                    elapsed_ms = elapsed.as_millis() as u64,
+                    error = %message,
+                    "tool failed"
+                );
+                done_error(message)
             }
         }
-        recent.record(name.to_owned(), input);
-    }
-
-    (parsed, errors)
-}
-
-async fn execute_tools(tool_calls: &[ParsedToolCall], ctx: &ToolContext) -> Vec<ToolDoneEvent> {
-    let mut set = TaskSet::new();
-    for parsed in tool_calls {
-        let event_tx = ctx.event_tx.clone();
-        let tool_ctx = ToolContext {
-            tool_use_id: Some(parsed.id.clone()),
-            ..ctx.clone()
+    } else if mcp.is_some_and(|m| m.has_tool(name)) {
+        // MCP tools have no `ToolInvocation`, so we build the start event by hand.
+        let start = ToolStartEvent {
+            id: id.clone(),
+            tool: tool_static,
+            summary: format!("mcp: {name}"),
+            annotation: None,
+            input: None,
+            output: None,
         };
-        let id = parsed.id.clone();
-        let call = parsed.call.clone();
-        set.spawn(async move {
-            let output = call.execute(&tool_ctx, id).await;
-            event_tx.try_send(AgentEvent::ToolDone(Box::new(output.clone())));
-            output
-        });
+        let _ = ctx.event_tx.send(AgentEvent::ToolStart(Box::new(start)));
+        execute_mcp_tool(ctx, &id, tool_static, name, input).await
+    } else {
+        let msg = format!("{UNKNOWN_TOOL_PREFIX}: {name}");
+        warn!(tool = %name, "unknown tool");
+        done_error(msg)
     }
-
-    set.join_all()
-        .await
-        .into_iter()
-        .enumerate()
-        .map(|(i, r)| match r {
-            Ok(output) => output,
-            Err(e) => {
-                error!(error = %e, "tool task panicked");
-                ToolDoneEvent::error(tool_calls[i].id.clone(), "tool task panicked")
-            }
-        })
-        .collect()
 }
 
-pub(crate) async fn execute_mcp_tool(
+async fn execute_mcp_tool(
     ctx: &ToolContext,
     id: &str,
+    tool_static: &'static str,
     tool_name: &str,
     input: &Value,
 ) -> ToolDoneEvent {
-    let interned = ctx
-        .mcp
-        .as_ref()
-        .map(|m| m.interned_name(tool_name))
-        .unwrap_or(UNKNOWN_MCP);
-
     let done = |output: String, is_error: bool| ToolDoneEvent {
         id: id.to_owned(),
-        tool: interned,
+        tool: tool_static,
         output: ToolOutput::Plain(output),
         is_error,
     };
@@ -239,6 +233,8 @@ pub(crate) async fn execute_mcp_tool(
     }
 }
 
+/// Drops doom-loop repeats, then fans the rest out in parallel so one slow tool does not
+/// stall the others.
 pub(super) async fn process_tool_calls(
     response: maki_providers::StreamResponse,
     recent_calls: &mut RecentCalls,
@@ -247,29 +243,98 @@ pub(super) async fn process_tool_calls(
     event_tx: &crate::EventSender,
     ctx: &ToolContext,
 ) -> Result<(), AgentError> {
-    let (parsed, errors) = parse_tool_calls(response.message.tool_uses(), recent_calls, mcp);
+    let tool_uses: Vec<(String, String, Value)> = response
+        .message
+        .tool_uses()
+        .map(|(id, name, input)| (id.to_owned(), name.to_owned(), input.clone()))
+        .collect();
 
     history.push(response.message);
 
-    for p in &parsed {
-        event_tx.send(AgentEvent::ToolStart(Box::new(
-            p.call.start_event(p.id.clone(), mcp),
-        )))?;
+    let mut immediate_errors: Vec<ToolDoneEvent> = Vec::new();
+    let mut runnable: Vec<(String, String, Value)> = Vec::new();
+
+    for (id, name, input) in tool_uses {
+        debug!(
+            tool = %name,
+            id = %id,
+            input_preview = %crate::tools::schema::preview(&input.to_string()),
+            "parsing tool call"
+        );
+        if recent_calls.is_doom_loop(&name, &input) {
+            warn!(tool = %name, "doom loop detected, skipping execution");
+            immediate_errors.push(ToolDoneEvent::error(id.clone(), DOOM_LOOP_MESSAGE));
+        } else {
+            runnable.push((id, name.clone(), input.clone()));
+        }
+        recent_calls.record(name, &input);
     }
 
-    for err in &errors {
+    for err in &immediate_errors {
         event_tx.try_send(AgentEvent::ToolDone(Box::new(err.clone())));
     }
 
-    let mut results = execute_tools(&parsed, ctx).await;
+    let mut set = TaskSet::new();
+    for (id, name, input) in runnable {
+        let event_tx_clone = ctx.event_tx.clone();
+        let tool_ctx = ToolContext {
+            tool_use_id: Some(id.clone()),
+            ..ctx.clone()
+        };
+        let mcp_owned = mcp.cloned();
+        set.spawn(async move {
+            let done = run(
+                ToolRegistry::native(),
+                mcp_owned.as_ref(),
+                id,
+                &name,
+                &input,
+                &tool_ctx,
+            )
+            .await;
+            event_tx_clone.try_send(AgentEvent::ToolDone(Box::new(done.clone())));
+            done
+        });
+    }
 
-    results.extend(errors);
-    let tool_msg = crate::types::tool_results(results);
+    let results: Vec<ToolDoneEvent> = set
+        .join_all()
+        .await
+        .into_iter()
+        .filter_map(|r| match r {
+            Ok(out) => Some(out),
+            Err(e) => {
+                error!(error = %e, "tool task panicked");
+                None
+            }
+        })
+        .collect();
+
+    let mut all_results = results;
+    all_results.extend(immediate_errors);
+    let tool_msg = crate::types::tool_results(all_results);
     event_tx.send(AgentEvent::ToolResultsSubmitted {
         message: Box::new(tool_msg.clone()),
     })?;
     history.push(tool_msg);
     Ok(())
+}
+
+/// Skips the native lookup so plan-mode and missing-manager tests can poke the MCP
+/// branch without registering a fake tool.
+#[cfg(test)]
+async fn dispatch_mcp(
+    ctx: &ToolContext,
+    id: &str,
+    tool_name: &str,
+    input: &Value,
+) -> ToolDoneEvent {
+    let tool_static = ctx
+        .mcp
+        .as_ref()
+        .map(|m| m.interned_name(tool_name))
+        .unwrap_or(UNKNOWN_MCP);
+    execute_mcp_tool(ctx, id, tool_static, tool_name, input).await
 }
 
 #[cfg(test)]
@@ -303,15 +368,30 @@ mod tests {
     }
 
     #[test]
-    fn resolve_tool_returns_error_for_unknown_without_mcp() {
-        let result = resolve_tool("unknown__tool", &serde_json::json!({}), None);
-        assert!(result.is_err());
+    fn unknown_tool_returns_error_event() {
+        smol::block_on(async {
+            let ctx = crate::tools::test_support::stub_ctx(&AgentMode::Build);
+            let done = run(
+                ToolRegistry::native(),
+                None,
+                "t1".into(),
+                "nonexistent__tool",
+                &serde_json::json!({}),
+                &ctx,
+            )
+            .await;
+            assert!(done.is_error);
+            assert_eq!(done.tool, UNKNOWN_MCP);
+            let text = done.output.as_text();
+            assert!(text.starts_with(UNKNOWN_TOOL_PREFIX));
+            assert!(text.contains("nonexistent__tool"));
+        });
     }
 
     #[test]
     fn mcp_tool_blocked_in_plan_mode() {
         smol::block_on(async {
-            let result = execute_mcp_tool(
+            let result = dispatch_mcp(
                 &crate::tools::test_support::stub_ctx(&AgentMode::Plan(PathBuf::from(
                     "/tmp/plan.md",
                 ))),
@@ -328,7 +408,7 @@ mod tests {
     #[test]
     fn mcp_tool_errors_without_mcp_manager() {
         smol::block_on(async {
-            let result = execute_mcp_tool(
+            let result = dispatch_mcp(
                 &crate::tools::test_support::stub_ctx(&AgentMode::Build),
                 "t1",
                 "myserver__mytool",
@@ -337,6 +417,59 @@ mod tests {
             .await;
             assert!(result.is_error);
             assert!(result.output.as_text().contains("not available"));
+        });
+    }
+
+    /// Denies bash and checks the marker file is never created. If a denied tool runs
+    /// anyway, the user said no and we did it anyway.
+    #[test]
+    fn permission_denial_short_circuits_execute() {
+        use std::sync::Arc;
+
+        use maki_config::{Effect, PermissionRule, PermissionsConfig};
+        use tempfile::TempDir;
+
+        use crate::permissions::{PERMISSION_DENIED_PREFIX, PermissionManager};
+
+        smol::block_on(async {
+            let deny_all_bash = PermissionsConfig {
+                allow_all: false,
+                rules: vec![PermissionRule {
+                    tool: crate::tools::BASH_TOOL_NAME.into(),
+                    scope: None,
+                    effect: Effect::Deny,
+                }],
+            };
+            let dir = TempDir::new().unwrap();
+            let permissions = Arc::new(PermissionManager::new(
+                deny_all_bash,
+                dir.path().to_path_buf(),
+            ));
+            let ctx = crate::tools::test_support::stub_ctx_with_permissions(
+                &AgentMode::Build,
+                permissions,
+            );
+
+            let marker = dir.path().join("should_never_exist");
+            let marker_str = marker.to_str().unwrap();
+
+            let done = run(
+                ToolRegistry::native(),
+                None,
+                "t1".into(),
+                crate::tools::BASH_TOOL_NAME,
+                &serde_json::json!({ "command": format!("touch {marker_str}") }),
+                &ctx,
+            )
+            .await;
+
+            assert!(done.is_error, "permission denial must produce error event");
+            assert!(!marker.exists(), "tool executed despite permission denial");
+            assert!(
+                done.output.as_text().starts_with(PERMISSION_DENIED_PREFIX),
+                "error should be the permission-denied message, got: {}",
+                done.output.as_text()
+            );
         });
     }
 }

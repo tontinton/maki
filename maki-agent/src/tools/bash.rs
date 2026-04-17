@@ -308,7 +308,12 @@ impl Bash {
     }
 }
 
-impl super::ToolDefaults for Bash {
+super::impl_tool!(Bash);
+
+impl super::ToolInvocation for Bash {
+    fn start_summary(&self) -> String {
+        Bash::start_summary(self)
+    }
     fn start_input(&self) -> Option<ToolInput> {
         let (command, _) = self.resolved();
         Some(ToolInput::Code {
@@ -316,14 +321,15 @@ impl super::ToolDefaults for Bash {
             code: command.to_string(),
         })
     }
-
     fn start_annotation(&self) -> Option<String> {
         Some(super::timeout_annotation(self.timeout.unwrap_or(120)))
     }
-
-    fn permission(&self) -> Option<String> {
+    fn permission_scope(&self) -> Option<String> {
         let (command, _) = self.resolved();
         Some(command.to_string())
+    }
+    fn execute<'a>(self: Box<Self>, ctx: &'a super::ToolContext) -> super::ExecFuture<'a> {
+        Box::pin(async move { Bash::execute(&self, ctx).await })
     }
 }
 
@@ -481,14 +487,14 @@ mod tests {
     #[test_case("ls",                Some("/tmp"), "ls"           ; "explicit_workdir")]
     #[test_case("cd /tmp",           None,          "cd /tmp"      ; "bare_cd_unchanged")]
     fn permission_cases(cmd: &str, workdir: Option<&str>, expected: &str) {
-        use crate::tools::ToolDefaults;
+        use crate::tools::ToolInvocation;
         let b = Bash {
             command: cmd.into(),
             timeout: None,
             workdir: workdir.map(Into::into),
             description: None,
         };
-        assert_eq!(b.permission().unwrap(), expected);
+        assert_eq!(b.permission_scope().unwrap(), expected);
     }
 
     #[test]

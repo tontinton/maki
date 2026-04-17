@@ -61,13 +61,25 @@ impl Edit {
     }
 }
 
-impl super::ToolDefaults for Edit {
-    fn mutable_path(&self) -> Option<&str> {
-        Some(&self.path)
-    }
+super::impl_tool!(
+    Edit,
+    audience = super::ToolAudience::MAIN
+        | super::ToolAudience::GENERAL_SUB
+        | super::ToolAudience::INTERPRETER,
+);
 
-    fn permission(&self) -> Option<String> {
+impl super::ToolInvocation for Edit {
+    fn start_summary(&self) -> String {
+        Edit::start_summary(self)
+    }
+    fn mutable_path(&self) -> Option<&Path> {
+        Some(Path::new(&self.path))
+    }
+    fn permission_scope(&self) -> Option<String> {
         Some(crate::permissions::canonicalize_scope_path(&self.path))
+    }
+    fn execute<'a>(self: Box<Self>, ctx: &'a super::ToolContext) -> super::ExecFuture<'a> {
+        Box::pin(async move { Edit::execute(&self, ctx).await })
     }
 }
 

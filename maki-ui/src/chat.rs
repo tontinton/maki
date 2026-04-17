@@ -12,7 +12,7 @@ use crate::components::{DisplayMessage, DisplayRole, ToolRole, ToolStatus};
 use crate::markdown::truncate_output;
 
 use crate::selection::Selection;
-use maki_agent::tools::{ToolCall, WEBFETCH_TOOL_NAME};
+use maki_agent::tools::{ToolInvocation, ToolRegistry, WEBFETCH_TOOL_NAME, native_static_name};
 use maki_agent::{
     AgentEvent, BatchToolStatus, NO_FILES_FOUND, QuestionInfo, ToolDoneEvent, ToolOutput,
     ToolStartEvent,
@@ -317,13 +317,15 @@ pub fn history_to_display(
                                 .push(DisplayMessage::new(DisplayRole::Thinking, thinking.clone()));
                         }
                         ContentBlock::ToolUse { id, name, input } => {
-                            let static_name = ToolCall::static_name(name).unwrap_or("unknown");
-                            let tool_call = ToolCall::from_api(name, input).ok();
+                            let static_name = native_static_name(name).unwrap_or("unknown");
+                            let tool_call: Option<Box<dyn ToolInvocation>> = ToolRegistry::native()
+                                .get(name)
+                                .and_then(|entry| entry.try_parse(input));
                             let summary = tool_call
-                                .as_ref()
+                                .as_deref()
                                 .map(|tc| tc.start_summary())
                                 .unwrap_or_else(|| name.clone());
-                            let tool_input = tool_call.as_ref().and_then(|tc| tc.start_input());
+                            let tool_input = tool_call.as_deref().and_then(|tc| tc.start_input());
                             let (status, result_text) = results
                                 .get(id.as_str())
                                 .map(|(err, text)| {
@@ -345,7 +347,7 @@ pub fn history_to_display(
                                     tool_output_lines,
                                 );
                             if let Some(ta) =
-                                tool_call.as_ref().and_then(|tc| tc.start_annotation())
+                                tool_call.as_deref().and_then(|tc| tc.start_annotation())
                             {
                                 append_annotation(&mut annotation, &ta);
                             }

@@ -9,7 +9,6 @@ use std::sync::{Arc, Mutex};
 use clap::{Parser, Subcommand};
 use color_eyre::Result;
 use color_eyre::eyre::{Context, bail};
-use maki_agent::ToolCall;
 use maki_agent::command::{self, CustomCommand};
 use maki_agent::mcp::{config as mcp_config, oauth as mcp_oauth};
 use maki_agent::skill::{self, Skill};
@@ -99,11 +98,11 @@ fn normalize_tool_name(name: &str) -> Result<String> {
             result.push(c);
         }
     }
-    if ToolCall::static_name(&result).is_none() {
+    if maki_agent::tools::native_static_name(&result).is_none() {
         bail!(
             "unknown tool '{}'. Valid tools: {}",
             name,
-            ToolCall::all_names().join(", ")
+            maki_agent::tools::NATIVE_NAMES.join(", ")
         );
     }
     Ok(result)
