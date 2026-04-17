@@ -53,7 +53,7 @@ use crate::cancel::CancelToken;
 use crate::mcp::McpHandle;
 use crate::permissions::PermissionManager;
 use crate::skill::Skill;
-use crate::{AgentConfig, AgentMode, EventSender};
+use crate::{AgentConfig, AgentEvent, AgentMode, EventSender, ToolStartEvent};
 use maki_providers::Model;
 use maki_providers::provider::Provider;
 
@@ -219,6 +219,15 @@ pub struct ToolContext {
     pub permissions: Arc<PermissionManager>,
     pub timeouts: maki_providers::Timeouts,
     pub file_tracker: Arc<FileReadTracker>,
+    pub(crate) batch_child: bool,
+}
+
+impl ToolContext {
+    pub(crate) fn emit_tool_start(&self, start: ToolStartEvent) {
+        if !self.batch_child {
+            let _ = self.event_tx.send(AgentEvent::ToolStart(Box::new(start)));
+        }
+    }
 }
 
 pub(crate) fn resolve_path(path: &str) -> Result<String, String> {
@@ -621,6 +630,7 @@ pub(crate) fn interpreter_ctx(
         permissions,
         timeouts: maki_providers::Timeouts::default(),
         file_tracker,
+        batch_child: false,
     }
 }
 

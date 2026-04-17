@@ -186,6 +186,7 @@ impl Batch {
 
                 let inner_ctx = ToolContext {
                     tool_use_id: Some(id.clone()),
+                    batch_child: true,
                     ..ctx.clone()
                 };
                 let done = tool_dispatch::run(

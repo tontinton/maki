@@ -115,7 +115,7 @@ pub(crate) async fn run(
             input: invocation.start_input(),
             output: invocation.start_output(),
         };
-        let _ = ctx.event_tx.send(AgentEvent::ToolStart(Box::new(start)));
+        ctx.emit_tool_start(start);
 
         if let Some(scope) = invocation.permission_scope()
             && let Err(e) = ctx
@@ -171,7 +171,7 @@ pub(crate) async fn run(
             input: None,
             output: None,
         };
-        let _ = ctx.event_tx.send(AgentEvent::ToolStart(Box::new(start)));
+        ctx.emit_tool_start(start);
         execute_mcp_tool(ctx, &id, tool_static, name, input).await
     } else {
         let msg = format!("{UNKNOWN_TOOL_PREFIX}: {name}");
