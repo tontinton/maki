@@ -12,7 +12,9 @@ use color_eyre::eyre::{Context, bail};
 use maki_agent::command::{self, CustomCommand};
 use maki_agent::mcp::{config as mcp_config, oauth as mcp_oauth};
 use maki_agent::skill::{self, Skill};
+use maki_agent::tools::ToolRegistry;
 use maki_config::load_config;
+use maki_lua::PluginHost;
 use maki_storage::DataDir;
 use maki_ui::AppSession;
 use tracing_subscriber::EnvFilter;
@@ -336,6 +338,9 @@ fn run() -> Result<()> {
             install_panic_log_hook();
             let skills = discover(cli.no_skills);
             let commands = discover_cmds(cli.no_commands);
+            let _plugin_host =
+                PluginHost::new(&config.lua_plugins, Arc::clone(ToolRegistry::native_arc()))
+                    .context("initialize lua plugin host")?;
             if cli.print {
                 print::run(
                     &model,

@@ -7,7 +7,7 @@ use std::time::Duration;
 use dirs::home_dir;
 
 use maki_config_macro::ConfigSection;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::warn;
 
@@ -157,6 +157,7 @@ struct RawConfig {
     provider: ProviderFileConfig,
     storage: StorageFileConfig,
     index: IndexFileConfig,
+    lua_plugins: LuaPluginsFileConfig,
 }
 
 #[derive(Deserialize, Default)]
@@ -291,6 +292,7 @@ pub struct Config {
     pub provider: ProviderConfig,
     pub storage: StorageConfig,
     pub permissions: PermissionsConfig,
+    pub lua_plugins: LuaPluginsConfig,
 }
 
 #[derive(Debug, Clone, Copy, ConfigSection)]
@@ -423,7 +425,7 @@ impl Default for ToolOutputLines {
     }
 }
 
-#[derive(Debug, Clone, ConfigSection)]
+#[derive(Debug, Clone, ConfigSection, Serialize)]
 #[config(section = "agent")]
 pub struct AgentConfig {
     #[config(default = DEFAULT_MAX_OUTPUT_BYTES, min = MIN_OUTPUT_BYTES, desc = "Max tool output size (bytes)")]
@@ -612,6 +614,28 @@ impl StorageConfig {
     }
 }
 
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct LuaPluginsFileConfig {
+    enabled: Option<bool>,
+    user_dirs: Option<Vec<PathBuf>>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct LuaPluginsConfig {
+    pub enabled: bool,
+    pub user_dirs: Vec<PathBuf>,
+}
+
+impl LuaPluginsConfig {
+    fn from_file(f: LuaPluginsFileConfig) -> Self {
+        Self {
+            enabled: f.enabled.unwrap_or(false),
+            user_dirs: f.user_dirs.unwrap_or_default(),
+        }
+    }
+}
+
 impl Config {
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.ui.validate_all()?;
@@ -740,6 +764,7 @@ fn load_config_with_global(cwd: &Path, no_rtk: bool, global: Option<PathBuf>) ->
         provider: ProviderConfig::from_file(raw.provider),
         storage: StorageConfig::from_file(raw.storage),
         permissions: load_permissions_with_global(cwd, global.as_deref()),
+        lua_plugins: LuaPluginsConfig::from_file(raw.lua_plugins),
     }
 }
 
@@ -1102,6 +1127,7 @@ mod tests {
             provider: ProviderConfig::default(),
             storage: StorageConfig::default(),
             permissions: PermissionsConfig::default(),
+            lua_plugins: LuaPluginsConfig::default(),
         };
         match (section, field) {
             ("provider", "connect_timeout_secs") => {
@@ -1320,5 +1346,31 @@ mod tests {
             std::env::remove_var(PROJECT_SHADOWS);
             std::env::remove_var(PROCESS_WINS);
         }
+    }
+
+    #[test]
+    fn lua_plugins_config_parses_fields() {
+        let dir = TempDir::new().unwrap();
+        let maki_dir = dir.path().join(".maki");
+        fs::create_dir_all(&maki_dir).unwrap();
+        fs::write(
+            maki_dir.join("config.toml"),
+            "[lua_plugins]\nenabled = true\nuser_dirs = [\"/tmp/plugins\"]\n",
+        )
+        .unwrap();
+        let config = load_config(dir.path(), false);
+        assert!(config.lua_plugins.enabled);
+        assert_eq!(
+            config.lua_plugins.user_dirs,
+            vec![PathBuf::from("/tmp/plugins")]
+        );
+    }
+
+    #[test]
+    fn lua_plugins_config_empty_returns_defaults() {
+        let dir = TempDir::new().unwrap();
+        let config = load_config(dir.path(), false);
+        assert!(!config.lua_plugins.enabled);
+        assert!(config.lua_plugins.user_dirs.is_empty());
     }
 }

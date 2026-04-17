@@ -124,7 +124,7 @@ impl MessagesPanel {
         let role = DisplayRole::Tool(Box::new(ToolRole {
             id,
             status: ToolStatus::InProgress,
-            name,
+            name: Arc::from(name),
         }));
         let mut msg = DisplayMessage::new(role, String::new());
         msg.timestamp = Some(format_timestamp_now());
@@ -134,7 +134,7 @@ impl MessagesPanel {
     pub fn tool_start(&mut self, event: ToolStartEvent) {
         if let Some(msg) = self.find_tool_msg_mut(&event.id) {
             if let DisplayRole::Tool(t) = &mut msg.role {
-                t.name = event.tool;
+                t.name = Arc::clone(&event.tool);
             }
             msg.text = event.summary;
             msg.tool_input = event.input.map(Arc::new);
@@ -148,7 +148,7 @@ impl MessagesPanel {
             DisplayRole::Tool(Box::new(ToolRole {
                 id: event.id,
                 status: ToolStatus::InProgress,
-                name: event.tool,
+                name: Arc::clone(&event.tool),
             })),
             event.summary,
         );
@@ -195,16 +195,16 @@ impl MessagesPanel {
         }
         truncate_to_header(&mut msg.text);
         let done_annotation =
-            tool_output_annotation(&event.output, ToolKind::from_name(event.tool));
+            tool_output_annotation(&event.output, ToolKind::from_name(&event.tool));
         if let Some(suffix) = &done_annotation {
             append_annotation(&mut msg.annotation, suffix);
         }
 
         match &event.output {
             ToolOutput::Plain(text) | ToolOutput::ReadDir { text, .. } => {
-                if !matches!(event.tool, WEBFETCH_TOOL_NAME) {
+                if event.tool.as_ref() != WEBFETCH_TOOL_NAME {
                     let limits =
-                        ToolKind::from_name(event.tool).output_limits(&self.tool_output_lines);
+                        ToolKind::from_name(&event.tool).output_limits(&self.tool_output_lines);
                     let tr = truncate_output(text, limits.max_lines, limits.keep);
                     msg.truncated_lines = tr.skipped;
                     if !tr.kept.is_empty() {
@@ -222,7 +222,7 @@ impl MessagesPanel {
                 } else {
                     let display = output.as_display_text();
                     let limits =
-                        ToolKind::from_name(event.tool).output_limits(&self.tool_output_lines);
+                        ToolKind::from_name(&event.tool).output_limits(&self.tool_output_lines);
                     let tr = truncate_output(&display, limits.max_lines, limits.keep);
                     msg.truncated_lines = tr.skipped;
                     msg.text = format!("{}\n{}", msg.text, tr.kept);
@@ -392,14 +392,14 @@ impl MessagesPanel {
     }
 
     pub fn fail_in_progress_with_message(&mut self, message: String) {
-        let ids: Vec<(String, &'static str)> = self
+        let ids: Vec<(String, Arc<str>)> = self
             .messages
             .iter()
             .filter_map(|m| {
                 if let DisplayRole::Tool(t) = &m.role
                     && t.status == ToolStatus::InProgress
                 {
-                    Some((t.id.clone(), t.name))
+                    Some((t.id.clone(), Arc::clone(&t.name)))
                 } else {
                     None
                 }

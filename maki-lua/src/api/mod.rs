@@ -1,0 +1,26 @@
+pub(crate) mod ctx;
+pub(crate) mod fs;
+pub(crate) mod log;
+pub(crate) mod tool;
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use mlua::{Lua, Result as LuaResult, Table};
+
+use crate::api::tool::PendingTools;
+
+pub(crate) fn create_maki_global(
+    lua: &Lua,
+    pending: PendingTools,
+    fs_roots: Arc<[PathBuf]>,
+    plugin: Arc<str>,
+) -> LuaResult<Table> {
+    let maki = lua.create_table()?;
+
+    maki.set("api", tool::create_api_table(lua, pending)?)?;
+    maki.set("fs", fs::create_fs_table(lua, fs_roots)?)?;
+    maki.set("log", log::create_log_table(lua, plugin)?)?;
+
+    Ok(maki)
+}

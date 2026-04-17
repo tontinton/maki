@@ -925,7 +925,7 @@ mod tests {
             role: DisplayRole::Tool(Box::new(ToolRole {
                 id: "t1".into(),
                 status,
-                name: BASH_TOOL_NAME,
+                name: BASH_TOOL_NAME.into(),
             })),
             text: text.into(),
             tool_input: input.map(Arc::new),
@@ -1277,7 +1277,7 @@ mod tests {
             role: DisplayRole::Tool(Box::new(ToolRole {
                 id: "t1".into(),
                 status: ToolStatus::Success,
-                name: TASK_TOOL_NAME,
+                name: TASK_TOOL_NAME.into(),
             })),
             text: "Find auth".into(),
             tool_input: None,
@@ -1391,7 +1391,7 @@ mod tests {
             role: DisplayRole::Tool(Box::new(ToolRole {
                 id: "t1".into(),
                 status: ToolStatus::Success,
-                name: INDEX_TOOL_NAME,
+                name: INDEX_TOOL_NAME.into(),
             })),
             text: format!("src/lib.rs\n{body}"),
             tool_input: None,
@@ -1529,7 +1529,7 @@ mod tests {
             role: DisplayRole::Tool(Box::new(ToolRole {
                 id: "t1".into(),
                 status,
-                name: BASH_TOOL_NAME,
+                name: BASH_TOOL_NAME.into(),
             })),
             text,
             tool_input: None,
@@ -1646,7 +1646,7 @@ mod tests {
             role: DisplayRole::Tool(Box::new(ToolRole {
                 id: "t1".into(),
                 status: ToolStatus::Success,
-                name: READ_TOOL_NAME,
+                name: READ_TOOL_NAME.into(),
             })),
             text: "read /src/main.rs".into(),
             tool_input: None,

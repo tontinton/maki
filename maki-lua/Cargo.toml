@@ -1,0 +1,24 @@
+[package]
+name = "maki-lua"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+maki-agent = { workspace = true }
+maki-config = { workspace = true }
+mlua = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+smol = { workspace = true }
+flume = { workspace = true }
+futures-lite = { workspace = true }
+
+[dev-dependencies]
+maki-agent = { workspace = true, features = ["test-support"] }
+tempfile = { workspace = true }
+test-case = { workspace = true }

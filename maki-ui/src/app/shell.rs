@@ -105,7 +105,7 @@ impl App {
             ShellEvent::Start { id, command } => {
                 self.main_chat().shell_tool_start(ToolStartEvent {
                     id,
-                    tool: "bash",
+                    tool: "bash".into(),
                     summary: command.clone(),
                     annotation: None,
                     input: Some(ToolInput::Code {
@@ -135,7 +135,7 @@ impl App {
                 };
                 self.main_chat().shell_tool_done(ToolDoneEvent {
                     id,
-                    tool: "bash",
+                    tool: "bash".into(),
                     output: ToolOutput::Plain(output),
                     is_error,
                 });

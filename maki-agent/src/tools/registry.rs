@@ -1,8 +1,5 @@
-//! The one place that knows about tools. Built-in, MCP, and future plugins all land here,
-//! so there is no second list to forget and no parallel `match name { ... }` table to drift.
-//!
-//! Tool identity is an `Arc<str>` owned by the entry, so MCP tools don't need leaked
-//! strings to look like natives at call sites.
+//! Single source of truth for all tools (native, MCP, Lua). One registry, one lookup
+//! path, no parallel lists that can drift.
 
 use std::borrow::Cow;
 use std::future::Future;
@@ -20,8 +17,6 @@ use crate::{ToolInput as ToolInputEvent, ToolOutput};
 use super::{DescriptionContext, ToolContext};
 
 bitflags! {
-    /// Subagents and `code_execution` filter on this instead of each keeping their own
-    /// allow-list of tool names.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct ToolAudience: u8 {
         const MAIN         = 0b0001;
@@ -37,12 +32,11 @@ impl Default for ToolAudience {
     }
 }
 
-/// Carried on every entry so log lines can say `tool_source=mcp:github` and the "why is
-/// this one behaving differently" question answers itself.
 #[derive(Clone, Debug)]
 pub enum ToolSource {
     Native,
     Mcp { server: Arc<str> },
+    Lua { plugin: Arc<str> },
 }
 
 impl ToolSource {
@@ -50,6 +44,7 @@ impl ToolSource {
         match self {
             Self::Native => Cow::Borrowed("native"),
             Self::Mcp { server } => Cow::Owned(format!("mcp:{server}")),
+            Self::Lua { plugin } => Cow::Owned(format!("lua:{plugin}")),
         }
     }
 }
@@ -138,7 +133,12 @@ impl ToolRegistry {
     }
 
     pub fn native() -> &'static Self {
-        static NATIVE: LazyLock<ToolRegistry> = LazyLock::new(ToolRegistry::build_native);
+        Self::native_arc()
+    }
+
+    pub fn native_arc() -> &'static Arc<Self> {
+        static NATIVE: LazyLock<Arc<ToolRegistry>> =
+            LazyLock::new(|| Arc::new(ToolRegistry::build_native()));
         &NATIVE
     }
 
@@ -175,6 +175,7 @@ impl ToolRegistry {
         let name = tool.name().to_owned();
         let mut conflict = None;
         self.tools.rcu(|current| {
+            conflict = None;
             if let Some(existing) = current.iter().find(|t| t.name() == name) {
                 conflict = Some(existing.source.as_log_field().into_owned());
                 return Vec::clone(current);
@@ -202,6 +203,7 @@ impl ToolRegistry {
         let entries: Vec<_> = entries.into_iter().collect();
         let mut conflict = None;
         self.tools.rcu(|current| {
+            conflict = None;
             let mut next = Vec::clone(current);
             for (tool, source) in &entries {
                 let name = tool.name();
@@ -225,14 +227,62 @@ impl ToolRegistry {
         Ok(())
     }
 
-    /// Called on MCP server disconnect or reconnect so stale entries cannot outlive
-    /// their transport.
     pub fn clear_mcp_server(&self, server: &str) {
         self.tools.rcu(|current| {
             current
                 .iter()
                 .filter(
                     |t| !matches!(&t.source, ToolSource::Mcp { server: s } if s.as_ref() == server),
+                )
+                .cloned()
+                .collect::<Vec<_>>()
+        });
+    }
+
+    /// Swap a plugin's tools atomically. On name conflict with another source, rolls back.
+    pub fn replace_plugin(
+        &self,
+        plugin: &str,
+        new_entries: Vec<(Arc<dyn Tool>, ToolSource)>,
+    ) -> Result<(), RegistryError> {
+        let mut conflict = None;
+        self.tools.rcu(|current| {
+            conflict = None;
+            let mut next: Vec<RegisteredTool> = current
+                .iter()
+                .filter(
+                    |t| !matches!(&t.source, ToolSource::Lua { plugin: p } if p.as_ref() == plugin),
+                )
+                .cloned()
+                .collect();
+            for (tool, source) in &new_entries {
+                let name = tool.name();
+                if let Some(existing) = next.iter().find(|t| t.name() == name) {
+                    conflict = Some(RegistryError::NameConflict {
+                        name: name.to_owned(),
+                        existing: existing.source.as_log_field().into_owned(),
+                    });
+                    return Vec::clone(current);
+                }
+                next.push(RegisteredTool {
+                    tool: Arc::clone(tool),
+                    source: source.clone(),
+                });
+            }
+            next
+        });
+        if let Some(e) = conflict {
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    pub fn clear_plugin(&self, plugin: &str) {
+        self.tools.rcu(|current| {
+            current
+                .iter()
+                .filter(
+                    |t| !matches!(&t.source, ToolSource::Lua { plugin: p } if p.as_ref() == plugin),
                 )
                 .cloned()
                 .collect::<Vec<_>>()
@@ -437,5 +487,32 @@ mod tests {
         assert!(!reg.has("serverA__one"));
         assert!(reg.has("serverB__one"));
         assert!(reg.has("native_tool"));
+    }
+
+    #[test]
+    fn clear_plugin_removes_only_that_plugin() {
+        let reg = ToolRegistry::new();
+        reg.register(
+            mock("pluginA__foo"),
+            ToolSource::Lua {
+                plugin: "pluginA".into(),
+            },
+        )
+        .unwrap();
+        reg.register(
+            mock("pluginB__bar"),
+            ToolSource::Lua {
+                plugin: "pluginB".into(),
+            },
+        )
+        .unwrap();
+        reg.register(mock("native_tool2"), ToolSource::Native)
+            .unwrap();
+
+        reg.clear_plugin("pluginA");
+
+        assert!(!reg.has("pluginA__foo"));
+        assert!(reg.has("pluginB__bar"));
+        assert!(reg.has("native_tool2"));
     }
 }

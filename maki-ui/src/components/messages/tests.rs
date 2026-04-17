@@ -11,10 +11,10 @@ use maki_agent::{
 use ratatui::backend::TestBackend;
 use test_case::test_case;
 
-fn start(id: &str, tool: &'static str) -> ToolStartEvent {
+fn start(id: &str, tool: &str) -> ToolStartEvent {
     ToolStartEvent {
         id: id.into(),
-        tool,
+        tool: tool.into(),
         summary: id.into(),
         annotation: None,
         input: None,
@@ -37,7 +37,7 @@ fn tool_done_updates_start_status(is_error: bool, expected: ToolStatus) {
     panel.tool_start(start("t1", "bash"));
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
-        tool: "bash",
+        tool: "bash".into(),
         output: ToolOutput::Plain("output".into()),
         is_error,
     });
@@ -64,7 +64,7 @@ fn tool_done_sets_annotation(tool: &'static str, output: ToolOutput, expected: O
     panel.tool_start(start("t1", tool));
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
-        tool,
+        tool: tool.into(),
         output,
         is_error: false,
     });
@@ -80,7 +80,7 @@ fn tool_done_annotation_merge(output: &str, expected: Option<&str>) {
     panel.tool_start(event);
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
-        tool: BASH_TOOL_NAME,
+        tool: BASH_TOOL_NAME.into(),
         output: ToolOutput::Plain(output.into()),
         is_error: false,
     });
@@ -113,7 +113,7 @@ fn tool_done_glob_result(output: ToolOutput, has_file_count: bool, has_no_files_
     panel.tool_start(start("t1", GLOB_TOOL_NAME));
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
-        tool: GLOB_TOOL_NAME,
+        tool: GLOB_TOOL_NAME.into(),
         output,
         is_error: false,
     });
@@ -131,7 +131,7 @@ fn tool_done_grep_shows_matches() {
     panel.tool_start(start("t1", GREP_TOOL_NAME));
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
-        tool: GREP_TOOL_NAME,
+        tool: GREP_TOOL_NAME.into(),
         output: grep_output(2),
         is_error: false,
     });
@@ -231,7 +231,7 @@ fn unknown_tool_id_is_noop() {
     panel.tool_output("ghost", "data");
     panel.tool_done(ToolDoneEvent {
         id: "orphan".into(),
-        tool: "bash",
+        tool: "bash".into(),
         output: ToolOutput::Plain("output".into()),
         is_error: false,
     });
@@ -245,7 +245,7 @@ fn in_progress_tracking() {
 
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
-        tool: "bash",
+        tool: "bash".into(),
         output: ToolOutput::Plain("ok".into()),
         is_error: false,
     });
@@ -253,7 +253,7 @@ fn in_progress_tracking() {
 
     panel.tool_done(ToolDoneEvent {
         id: "t2".into(),
-        tool: "read",
+        tool: "read".into(),
         output: ToolOutput::Plain("ok".into()),
         is_error: false,
     });
@@ -318,7 +318,7 @@ fn events_before_cache_built_render_correctly() {
     panel.tool_output("t1", "early output");
     panel.tool_done(ToolDoneEvent {
         id: "t2".into(),
-        tool: "bash",
+        tool: "bash".into(),
         output: ToolOutput::Plain("result".into()),
         is_error: false,
     });
@@ -331,7 +331,7 @@ fn events_before_cache_built_render_correctly() {
 fn bash_code_start(panel: &mut MessagesPanel, id: &str, code: &str) {
     panel.tool_start(ToolStartEvent {
         id: id.into(),
-        tool: BASH_TOOL_NAME,
+        tool: BASH_TOOL_NAME.into(),
         summary: code.into(),
         annotation: None,
         input: Some(ToolInput::Code {
@@ -353,7 +353,7 @@ fn bash_live_output_with_code_input() {
 
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
-        tool: BASH_TOOL_NAME,
+        tool: BASH_TOOL_NAME.into(),
         output: ToolOutput::Plain("done".into()),
         is_error: false,
     });
@@ -368,7 +368,7 @@ fn cancel_in_progress_marks_pending_as_error(cache_built: bool) {
     let mut panel = panel_with_tools(&[("t1", "bash"), ("t2", "read")]);
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
-        tool: "bash",
+        tool: "bash".into(),
         output: ToolOutput::Plain("ok".into()),
         is_error: false,
     });
@@ -405,7 +405,7 @@ fn tool_done_after_cancel_in_progress_does_not_underflow() {
 
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
-        tool: "bash",
+        tool: "bash".into(),
         output: ToolOutput::Plain("late".into()),
         is_error: false,
     });
@@ -413,12 +413,12 @@ fn tool_done_after_cancel_in_progress_does_not_underflow() {
     assert_eq!(msg_status(&panel, "t1"), ToolStatus::Success);
 }
 
-fn tool_msg(id: &str, name: &'static str, status: ToolStatus) -> DisplayMessage {
+fn tool_msg(id: &str, name: &str, status: ToolStatus) -> DisplayMessage {
     DisplayMessage::new(
         DisplayRole::Tool(Box::new(ToolRole {
             id: id.into(),
             status,
-            name,
+            name: name.into(),
         })),
         id.into(),
     )
@@ -447,7 +447,7 @@ fn question_tool_renders_summary() {
     panel.tool_start(start("q1", QUESTION_TOOL_NAME));
     panel.tool_done(ToolDoneEvent {
         id: "q1".into(),
-        tool: QUESTION_TOOL_NAME,
+        tool: QUESTION_TOOL_NAME.into(),
         output: ToolOutput::QuestionAnswers(vec![
             QuestionAnswer {
                 question: "Q1".into(),
@@ -500,7 +500,7 @@ fn search_text_grep_result_includes_structured_output() {
     panel.tool_start(start("t1", "grep"));
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
-        tool: "grep",
+        tool: "grep".into(),
         output: grep_output(2),
         is_error: false,
     });
@@ -515,7 +515,7 @@ fn search_text_diff_output_includes_hunks() {
     panel.tool_start(start("t1", "edit"));
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
-        tool: "edit",
+        tool: "edit".into(),
         output: ToolOutput::Diff {
             path: "src/main.rs".into(),
             before: "old\n".into(),
@@ -535,7 +535,7 @@ fn search_text_bash_with_code_input() {
     bash_code_start(&mut panel, "t1", "echo hello");
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
-        tool: BASH_TOOL_NAME,
+        tool: BASH_TOOL_NAME.into(),
         output: ToolOutput::Plain("hello".into()),
         is_error: false,
     });
@@ -601,7 +601,7 @@ fn batch_entry(tool: &str, summary: &str, status: BatchToolStatus) -> BatchToolE
 fn batch_start(panel: &mut MessagesPanel, entries: Vec<BatchToolEntry>) {
     panel.tool_start(ToolStartEvent {
         id: "b1".into(),
-        tool: "batch",
+        tool: "batch".into(),
         summary: format!("{} tools", entries.len()),
         annotation: None,
         input: None,
@@ -615,7 +615,7 @@ fn batch_start(panel: &mut MessagesPanel, entries: Vec<BatchToolEntry>) {
 fn batch_done(panel: &mut MessagesPanel, entries: Vec<BatchToolEntry>) {
     panel.tool_done(ToolDoneEvent {
         id: "b1".into(),
-        tool: "batch",
+        tool: "batch".into(),
         output: ToolOutput::Batch {
             entries,
             text: String::new(),
@@ -877,7 +877,7 @@ fn panel_with_long_tool(line_count: usize) -> MessagesPanel {
     let mut panel = MessagesPanel::new(UiConfig::default());
     panel.tool_start(ToolStartEvent {
         id: "t1".into(),
-        tool: BASH_TOOL_NAME,
+        tool: BASH_TOOL_NAME.into(),
         summary: "cmd".into(),
         annotation: None,
         input: None,
@@ -885,7 +885,7 @@ fn panel_with_long_tool(line_count: usize) -> MessagesPanel {
     });
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
-        tool: BASH_TOOL_NAME,
+        tool: BASH_TOOL_NAME.into(),
         output: ToolOutput::Plain(body),
         is_error: false,
     });
@@ -938,7 +938,7 @@ fn panel_with_grep_tool(match_count: usize) -> MessagesPanel {
     let mut panel = MessagesPanel::new(UiConfig::default());
     panel.tool_start(ToolStartEvent {
         id: "t1".into(),
-        tool: GREP_TOOL_NAME,
+        tool: GREP_TOOL_NAME.into(),
         summary: "grep pattern".into(),
         annotation: None,
         input: None,
@@ -946,7 +946,7 @@ fn panel_with_grep_tool(match_count: usize) -> MessagesPanel {
     });
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
-        tool: GREP_TOOL_NAME,
+        tool: GREP_TOOL_NAME.into(),
         output: ToolOutput::GrepResult { entries },
         is_error: false,
     });
@@ -1030,7 +1030,7 @@ fn search_text_includes_truncated_bash_output() {
     bash_code_start(&mut panel, "t1", "echo lines");
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
-        tool: BASH_TOOL_NAME,
+        tool: BASH_TOOL_NAME.into(),
         output: ToolOutput::Plain(full_output.clone()),
         is_error: false,
     });
@@ -1066,7 +1066,7 @@ fn instruction_segment_has_spacer_before_it() {
     panel.tool_start(start("t1", "read"));
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
-        tool: "read",
+        tool: "read".into(),
         output: read_code_with_instructions(instruction_blocks()),
         is_error: false,
     });
@@ -1111,7 +1111,7 @@ fn toggle_instruction_segment_expands_and_collapses() {
     panel.tool_start(start("t1", "read"));
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
-        tool: "read",
+        tool: "read".into(),
         output: read_code_with_instructions(blocks),
         is_error: false,
     });

@@ -13,7 +13,7 @@ struct ConfigAttr {
 enum ConfigAttrValue {
     Flag,
     Str(LitStr),
-    Expr(Expr),
+    Expr(Box<Expr>),
 }
 
 impl Parse for ConfigAttr {
@@ -36,7 +36,7 @@ impl Parse for ConfigAttr {
             let expr: Expr = input.parse()?;
             Ok(Self {
                 key,
-                value: ConfigAttrValue::Expr(expr),
+                value: ConfigAttrValue::Expr(Box::new(expr)),
             })
         }
     }
@@ -117,14 +117,14 @@ fn parse_field_attrs(field: &syn::Field) -> syn::Result<FieldAttrs> {
                     ConfigAttrValue::Str(lit) => {
                         attrs.default = Some(parse_str(&lit.value())?);
                     }
-                    ConfigAttrValue::Expr(expr) => attrs.default = Some(expr),
+                    ConfigAttrValue::Expr(expr) => attrs.default = Some(*expr),
                     ConfigAttrValue::Flag => {
                         return Err(syn::Error::new(item.key.span(), "default requires a value"));
                     }
                 },
                 "min" => {
                     if let ConfigAttrValue::Expr(expr) = item.value {
-                        attrs.min = Some(expr);
+                        attrs.min = Some(*expr);
                     }
                 }
                 "desc" => {

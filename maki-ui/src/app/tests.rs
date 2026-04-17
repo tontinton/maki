@@ -229,7 +229,7 @@ fn tool_done_sets_plan_written_flag(output: ToolOutput, expect_written: bool) {
 
     app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
         id: "t1".into(),
-        tool: "write",
+        tool: "write".into(),
         output,
         is_error: false,
     }))));
@@ -612,7 +612,7 @@ fn cancel_resets_all_chats_and_indices() {
     app.update(subagent_msg(
         AgentEvent::ToolStart(Box::new(ToolStartEvent {
             id: "sub_t1".into(),
-            tool: "bash",
+            tool: "bash".into(),
             summary: "running".into(),
             annotation: None,
             input: None,
@@ -631,7 +631,7 @@ fn cancel_resets_all_chats_and_indices() {
 fn finish_subagent(app: &mut App, id: &str, is_error: bool) {
     app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
         id: id.into(),
-        tool: "task",
+        tool: "task".into(),
         output: ToolOutput::Plain("result".into()),
         is_error,
     }))));
@@ -974,7 +974,7 @@ fn double_esc_cancels_flushes_and_fails_tools() {
     }));
     app.update(agent_msg(AgentEvent::ToolStart(Box::new(ToolStartEvent {
         id: "t1".into(),
-        tool: "bash",
+        tool: "bash".into(),
         summary: "running".into(),
         annotation: None,
         input: None,
@@ -1288,7 +1288,7 @@ fn resolve_or_create_chat_sets_model_id_and_annotation() {
     app.run_id = 1;
     app.update(agent_msg(AgentEvent::ToolStart(Box::new(ToolStartEvent {
         id: "task1".into(),
-        tool: "task",
+        tool: "task".into(),
         summary: "research".into(),
         annotation: None,
         input: None,
@@ -2031,7 +2031,7 @@ fn agent_error_creates_synthetic_tool_done_with_message() {
 
     app.update(agent_msg(AgentEvent::ToolStart(Box::new(ToolStartEvent {
         id: "t1".into(),
-        tool: "bash",
+        tool: "bash".into(),
         summary: "echo hello".into(),
         annotation: None,
         input: None,

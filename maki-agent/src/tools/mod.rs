@@ -21,7 +21,7 @@ mod multiedit;
 mod question;
 mod read;
 pub mod registry;
-pub(crate) mod schema;
+pub mod schema;
 mod skill;
 mod task;
 mod todowrite;
@@ -634,8 +634,8 @@ pub(crate) fn interpreter_ctx(
     }
 }
 
-#[cfg(test)]
-pub(crate) mod test_support {
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support {
     use crate::{Envelope, EventSender};
 
     use super::*;
@@ -650,7 +650,7 @@ pub(crate) mod test_support {
         ))
     });
 
-    pub(crate) fn stub_ctx_with(
+    pub fn stub_ctx_with(
         mode: &AgentMode,
         event_tx: Option<&EventSender>,
         tool_use_id: Option<&str>,
@@ -675,10 +675,11 @@ pub(crate) mod test_support {
         ctx
     }
 
-    pub(crate) fn stub_ctx(mode: &AgentMode) -> ToolContext {
+    pub fn stub_ctx(mode: &AgentMode) -> ToolContext {
         stub_ctx_with(mode, None, None)
     }
 
+    #[cfg(test)]
     pub(crate) fn stub_ctx_with_permissions(
         mode: &AgentMode,
         permissions: Arc<PermissionManager>,
@@ -697,6 +698,7 @@ pub(crate) mod test_support {
         ctx
     }
 
+    #[cfg(test)]
     pub(crate) fn pre_read(ctx: &ToolContext, path: &str) {
         ctx.file_tracker.record_read(Path::new(path));
     }

@@ -1,26 +1,15 @@
 //! MCP client: manages transports and routes tool calls to servers.
 //!
-//! Tool names are namespaced as `server__tool` (double underscore) so two servers can both
-//! expose a tool called `search` without stepping on each other. The qualified names are leaked
-//! into `&'static str` so tool descriptors can hold them without dragging a lifetime everywhere.
+//! Tool names are namespaced as `server__tool` so two servers can both expose `search`
+//! without colliding. Names are deduped via `Arc<str>` in a small cache.
 //!
-//! # Architecture
+//! All mutable state lives in the `run` task, which owns `McpManagerInner` exclusively.
+//! Commands come in through a channel (one at a time, no interleaving). Reads go through
+//! two lock-free `ArcSwap`s: a `ToolIndex` for tool calls and an `McpSnapshot` for the UI.
+//! This way a slow tool call never blocks a toggle and vice versa.
 //!
-//! All mutable state lives inside one task, `run`, which owns `McpManagerInner` outright. Nobody
-//! else gets to touch it. Two doors lead in and out:
-//!
-//! * Writes come in as `McpCommand`s over a channel. `run` handles them one at a time, so a
-//!   toggle, a reconnect and a shutdown can never interleave.
-//! * Reads go through two `ArcSwap`s that `run` republishes after every change: a `ToolIndex`
-//!   for the hot tool-call path and an `McpSnapshot` for the UI. Both sides are lock-free, so a
-//!   slow tool call can't stall a toggle and a toggle can't stall an in-flight call.
-//!
-//! `McpSnapshotReader` is a read-only newtype around the snapshot `ArcSwap`. Handing that out
-//! instead of the raw `ArcSwap` means outside code physically cannot publish a snapshot, which
-//! keeps the "only `run` publishes" rule enforced by the type system.
-//!
-//! The snapshot is the single source of truth for every per-server fact, including whether a
-//! server is disabled. There is no second list to keep in sync.
+//! `McpSnapshotReader` is a read-only handle. Outside code physically cannot publish a
+//! snapshot, so the "only `run` publishes" invariant is enforced by the type system.
 
 pub mod config;
 pub mod error;
@@ -30,7 +19,7 @@ pub mod protocol;
 pub mod stdio;
 pub mod transport;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -51,7 +40,7 @@ const SEPARATOR: &str = "__";
 pub const UNKNOWN_MCP: &str = "unknown_mcp";
 
 struct McpToolDef {
-    qualified_name: &'static str,
+    qualified_name: Arc<str>,
     raw_name: String,
     description: String,
     input_schema: Value,
@@ -146,7 +135,7 @@ struct McpManagerInner {
 
 #[derive(Default)]
 struct ToolIndex {
-    tools: HashMap<&'static str, ToolRef>,
+    tools: HashMap<Arc<str>, ToolRef>,
     prompts: HashMap<String, PromptRef>,
     descriptors: Arc<[Value]>,
 }
@@ -242,13 +231,13 @@ impl McpHandle {
         self.index.load().tools.contains_key(name)
     }
 
-    pub fn interned_name(&self, name: &str) -> &'static str {
+    pub fn interned_name(&self, name: &str) -> Arc<str> {
         self.index
             .load()
             .tools
             .get_key_value(name)
-            .map(|(&k, _)| k)
-            .unwrap_or(UNKNOWN_MCP)
+            .map(|(k, _)| Arc::clone(k))
+            .unwrap_or_else(|| Arc::from(UNKNOWN_MCP))
     }
 
     pub async fn call_tool(&self, qualified_name: &str, args: &Value) -> Result<String, McpError> {
@@ -621,14 +610,14 @@ fn publish(inner: &McpManagerInner, index: &ArcSwap<ToolIndex>, snapshot: &ArcSw
         {
             for t in &entry.tools {
                 tools.insert(
-                    t.qualified_name,
+                    Arc::clone(&t.qualified_name),
                     ToolRef {
                         raw_name: t.raw_name.clone(),
                         transport: Arc::clone(transport),
                     },
                 );
                 descriptors.push(json!({
-                    "name": t.qualified_name,
+                    "name": t.qualified_name.as_ref(),
                     "description": t.description,
                     "input_schema": t.input_schema,
                 }));
@@ -698,20 +687,20 @@ pub fn kill_process_groups(pids: &[u32]) {
 #[cfg(not(unix))]
 pub fn kill_process_groups(_pids: &[u32]) {}
 
-/// Leak the name into a `&'static str` so tool descriptors can use it without a lifetime. Names
-/// come from config, so the set is small and fixed per session, and the leak stays bounded.
-fn intern(name: String) -> &'static str {
-    static CACHE: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
-    let mut set = CACHE
-        .get_or_init(|| Mutex::new(HashSet::new()))
+/// Dedup cache for qualified MCP tool names. The set is bounded (finite per session)
+/// and `Arc<str>` means entries get freed when the cache drops, unlike the old `Box::leak`.
+fn intern(name: String) -> Arc<str> {
+    static CACHE: OnceLock<Mutex<HashMap<String, Arc<str>>>> = OnceLock::new();
+    let mut map = CACHE
+        .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    if let Some(&existing) = set.get(name.as_str()) {
-        return existing;
+    if let Some(existing) = map.get(&name) {
+        return Arc::clone(existing);
     }
-    let leaked: &'static str = Box::leak(name.into_boxed_str());
-    set.insert(leaked);
-    leaked
+    let arc: Arc<str> = Arc::from(name.as_str());
+    map.insert(name, Arc::clone(&arc));
+    arc
 }
 
 #[cfg(test)]

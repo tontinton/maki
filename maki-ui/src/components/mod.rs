@@ -311,7 +311,7 @@ impl DisplayMessage {
 pub struct ToolRole {
     pub id: String,
     pub status: ToolStatus,
-    pub name: &'static str,
+    pub name: Arc<str>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -325,9 +325,9 @@ pub enum DisplayRole {
 }
 
 impl DisplayRole {
-    pub fn tool_name(&self) -> Option<&'static str> {
+    pub fn tool_name(&self) -> Option<&str> {
         match self {
-            DisplayRole::Tool(t) => Some(t.name),
+            DisplayRole::Tool(t) => Some(&t.name),
             _ => None,
         }
     }

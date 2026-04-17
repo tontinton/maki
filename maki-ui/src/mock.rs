@@ -57,20 +57,20 @@ fn sub_evt_with(
     }))
 }
 
-fn tool_start(id: &str, tool: &'static str, summary: &str, input: Option<ToolInput>) -> AgentEvent {
+fn tool_start(id: &str, tool: &str, summary: &str, input: Option<ToolInput>) -> AgentEvent {
     tool_start_with(id, tool, summary, input, None)
 }
 
 fn tool_start_with(
     id: &str,
-    tool: &'static str,
+    tool: &str,
     summary: &str,
     input: Option<ToolInput>,
     annotation: Option<&str>,
 ) -> AgentEvent {
     AgentEvent::ToolStart(Box::new(ToolStartEvent {
         id: id.into(),
-        tool,
+        tool: tool.into(),
         summary: summary.into(),
         annotation: annotation.map(Into::into),
         input,
@@ -78,10 +78,10 @@ fn tool_start_with(
     }))
 }
 
-fn tool_done(id: &str, tool: &'static str, output: ToolOutput, is_error: bool) -> AgentEvent {
+fn tool_done(id: &str, tool: &str, output: ToolOutput, is_error: bool) -> AgentEvent {
     AgentEvent::ToolDone(Box::new(ToolDoneEvent {
         id: id.into(),
-        tool,
+        tool: tool.into(),
         output,
         is_error,
     }))

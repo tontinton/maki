@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 use std::time::Instant;
 
 use serde_json::Value;
@@ -8,8 +9,8 @@ use tracing::{debug, error, warn};
 
 use crate::mcp::{McpHandle, UNKNOWN_MCP};
 use crate::task_set::TaskSet;
+use crate::tools::ToolContext;
 use crate::tools::registry::ToolRegistry;
-use crate::tools::{ToolContext, native_static_name};
 use crate::{AgentError, AgentEvent, AgentMode, ToolDoneEvent, ToolOutput, ToolStartEvent};
 
 const DOOM_LOOP_THRESHOLD: usize = 3;
@@ -49,18 +50,9 @@ impl RecentCalls {
     }
 }
 
-/// Events need `&'static str` names, but MCP names only appear at runtime. We intern
-/// them through `McpHandle` and fall back to a shared placeholder for unknowns.
-fn static_tool_name(name: &str, mcp: Option<&McpHandle>) -> &'static str {
-    if let Some(n) = native_static_name(name) {
-        return n;
-    }
-    mcp.map(|m| m.interned_name(name)).unwrap_or(UNKNOWN_MCP)
-}
-
-/// `ToolStart` goes out from here so every source (native, MCP) looks the same to the UI.
-/// On parse error or unknown tool we skip the start event, matching the old code and
-/// keeping the UI from showing a phantom running tool.
+/// Unified dispatch: every tool source (native, MCP, Lua) flows through here.
+/// Parse errors and unknown tools skip the start event so the UI never shows a
+/// phantom running tool.
 pub(crate) async fn run(
     registry: &ToolRegistry,
     mcp: Option<&McpHandle>,
@@ -69,17 +61,22 @@ pub(crate) async fn run(
     input: &Value,
     ctx: &ToolContext,
 ) -> ToolDoneEvent {
-    let tool_static = static_tool_name(name, mcp);
+    let entry = registry.get(name);
+    let tool_id: Arc<str> = entry
+        .as_ref()
+        .map(|e| Arc::from(e.tool.name()))
+        .or_else(|| mcp.map(|m| m.interned_name(name)))
+        .unwrap_or_else(|| Arc::from(UNKNOWN_MCP));
     let started = Instant::now();
 
     let done_error = |msg: String| ToolDoneEvent {
         id: id.clone(),
-        tool: tool_static,
+        tool: Arc::clone(&tool_id),
         output: ToolOutput::Plain(msg),
         is_error: true,
     };
 
-    if let Some(entry) = registry.get(name) {
+    if let Some(entry) = entry {
         let invocation = match entry.tool.parse(input) {
             Ok(inv) => inv,
             Err(e) => {
@@ -109,7 +106,7 @@ pub(crate) async fn run(
 
         let start = ToolStartEvent {
             id: id.clone(),
-            tool: tool_static,
+            tool: Arc::clone(&tool_id),
             summary: invocation.start_summary(),
             annotation: invocation.start_annotation(),
             input: invocation.start_input(),
@@ -145,7 +142,7 @@ pub(crate) async fn run(
                 );
                 ToolDoneEvent {
                     id,
-                    tool: tool_static,
+                    tool: tool_id,
                     output,
                     is_error: false,
                 }
@@ -165,14 +162,14 @@ pub(crate) async fn run(
         // MCP tools have no `ToolInvocation`, so we build the start event by hand.
         let start = ToolStartEvent {
             id: id.clone(),
-            tool: tool_static,
+            tool: Arc::clone(&tool_id),
             summary: format!("mcp: {name}"),
             annotation: None,
             input: None,
             output: None,
         };
         ctx.emit_tool_start(start);
-        execute_mcp_tool(ctx, &id, tool_static, name, input).await
+        execute_mcp_tool(ctx, &id, tool_id, name, input).await
     } else {
         let msg = format!("{UNKNOWN_TOOL_PREFIX}: {name}");
         warn!(tool = %name, "unknown tool");
@@ -183,13 +180,13 @@ pub(crate) async fn run(
 async fn execute_mcp_tool(
     ctx: &ToolContext,
     id: &str,
-    tool_static: &'static str,
+    tool_id: Arc<str>,
     tool_name: &str,
     input: &Value,
 ) -> ToolDoneEvent {
     let done = |output: String, is_error: bool| ToolDoneEvent {
         id: id.to_owned(),
-        tool: tool_static,
+        tool: Arc::clone(&tool_id),
         output: ToolOutput::Plain(output),
         is_error,
     };
@@ -329,12 +326,12 @@ async fn dispatch_mcp(
     tool_name: &str,
     input: &Value,
 ) -> ToolDoneEvent {
-    let tool_static = ctx
+    let tool_id = ctx
         .mcp
         .as_ref()
         .map(|m| m.interned_name(tool_name))
-        .unwrap_or(UNKNOWN_MCP);
-    execute_mcp_tool(ctx, id, tool_static, tool_name, input).await
+        .unwrap_or_else(|| Arc::from(UNKNOWN_MCP));
+    execute_mcp_tool(ctx, id, tool_id, tool_name, input).await
 }
 
 #[cfg(test)]
@@ -381,7 +378,7 @@ mod tests {
             )
             .await;
             assert!(done.is_error);
-            assert_eq!(done.tool, UNKNOWN_MCP);
+            assert_eq!(done.tool.as_ref(), UNKNOWN_MCP);
             let text = done.output.as_text();
             assert!(text.starts_with(UNKNOWN_TOOL_PREFIX));
             assert!(text.contains("nonexistent__tool"));

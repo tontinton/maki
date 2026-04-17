@@ -1,5 +1,6 @@
 use std::fmt::Write;
 use std::path::Path;
+use std::sync::Arc;
 
 use flume::Sender;
 use maki_providers::{AgentError, ContentBlock, Message, Role, StopReason, TokenUsage};
@@ -393,7 +394,7 @@ impl ToolOutput {
 #[derive(Debug, Clone, Serialize)]
 pub struct ToolStartEvent {
     pub id: String,
-    pub tool: &'static str,
+    pub tool: Arc<str>,
     pub summary: String,
     pub annotation: Option<String>,
     pub input: Option<ToolInput>,
@@ -403,16 +404,18 @@ pub struct ToolStartEvent {
 #[derive(Debug, Clone, Serialize)]
 pub struct ToolDoneEvent {
     pub id: String,
-    pub tool: &'static str,
+    pub tool: Arc<str>,
     pub output: ToolOutput,
     pub is_error: bool,
 }
+
+const UNKNOWN_TOOL: &str = "unknown";
 
 impl ToolDoneEvent {
     pub fn error(id: String, message: impl Into<String>) -> Self {
         Self {
             id,
-            tool: "unknown",
+            tool: Arc::from(UNKNOWN_TOOL),
             output: ToolOutput::Plain(message.into()),
             is_error: true,
         }
@@ -708,7 +711,7 @@ mod tests {
     fn event_written_path_none_on_error() {
         let event = ToolDoneEvent {
             id: "id".into(),
-            tool: "write",
+            tool: Arc::from("write"),
             output: ToolOutput::WriteCode {
                 path: "src/lib.rs".into(),
                 byte_count: 10,
@@ -724,13 +727,13 @@ mod tests {
         let msg = tool_results(vec![
             ToolDoneEvent {
                 id: "t1".into(),
-                tool: "bash",
+                tool: Arc::from("bash"),
                 output: ToolOutput::Plain("ok".into()),
                 is_error: false,
             },
             ToolDoneEvent {
                 id: "t2".into(),
-                tool: "read",
+                tool: Arc::from("read"),
                 output: ToolOutput::Plain("fail".into()),
                 is_error: true,
             },
@@ -797,7 +800,7 @@ mod tests {
     fn wrote_to_matches_absolute_path() {
         let event = ToolDoneEvent {
             id: "id".into(),
-            tool: "write",
+            tool: Arc::from("write"),
             output: ToolOutput::WriteCode {
                 path: "/home/user/.maki/plans/slug.md".into(),
                 byte_count: 10,
@@ -813,7 +816,7 @@ mod tests {
     fn wrote_to_false_on_error() {
         let event = ToolDoneEvent {
             id: "id".into(),
-            tool: "write",
+            tool: Arc::from("write"),
             output: ToolOutput::WriteCode {
                 path: "/plans/slug.md".into(),
                 byte_count: 10,

@@ -355,7 +355,7 @@ pub fn history_to_display(
                                 role: DisplayRole::Tool(Box::new(ToolRole {
                                     id: id.clone(),
                                     status,
-                                    name: static_name,
+                                    name: static_name.into(),
                                 })),
                                 text,
                                 tool_input: tool_input.map(Arc::new),
@@ -484,10 +484,10 @@ mod tests {
     use maki_config::UiConfig;
     use test_case::test_case;
 
-    fn tool_start(id: &str, tool: &'static str) -> AgentEvent {
+    fn tool_start(id: &str, tool: &str) -> AgentEvent {
         AgentEvent::ToolStart(Box::new(ToolStartEvent {
             id: id.into(),
-            tool,
+            tool: tool.into(),
             summary: String::new(),
             annotation: None,
             input: None,
@@ -495,10 +495,10 @@ mod tests {
         }))
     }
 
-    fn tool_done(id: &str, tool: &'static str, output: ToolOutput) -> AgentEvent {
+    fn tool_done(id: &str, tool: &str, output: ToolOutput) -> AgentEvent {
         AgentEvent::ToolDone(Box::new(ToolDoneEvent {
             id: id.into(),
-            tool,
+            tool: tool.into(),
             output,
             is_error: false,
         }))

@@ -83,7 +83,7 @@ pub enum ParamSchema {
     Any { description: &'static str },
 }
 
-pub(crate) fn to_json_schema(s: &ParamSchema) -> Value {
+pub fn to_json_schema(s: &ParamSchema) -> Value {
     match s {
         ParamSchema::Primitive { kind, description } => {
             json!({ "type": kind.to_string(), "description": description })
@@ -134,6 +134,91 @@ pub(crate) fn to_json_schema(s: &ParamSchema) -> Value {
             }
         }
     }
+}
+
+/// `Box::leak` everything so the result is `&'static`, matching native tool schemas
+/// which are `const`. Leaks are proportional to schema size, so reloading a plugin
+/// leaks the old schemas. Acceptable because the set is small and fixed per session.
+pub fn try_from_json(v: &Value) -> Result<&'static ParamSchema, String> {
+    let description: &'static str = v
+        .get("description")
+        .and_then(|d| d.as_str())
+        .map(|s| -> &'static str { Box::leak(s.to_owned().into_boxed_str()) })
+        .unwrap_or("");
+
+    let type_str = v.get("type").and_then(|t| t.as_str());
+
+    let schema = match type_str {
+        Some("string") if v.get("enum").is_some() => {
+            let variants: &'static [&'static str] = Box::leak(
+                v["enum"]
+                    .as_array()
+                    .ok_or("enum must be an array")?
+                    .iter()
+                    .map(|e| -> Result<&'static str, String> {
+                        let s = e.as_str().ok_or("enum variant must be a string")?;
+                        Ok(Box::leak(s.to_owned().into_boxed_str()))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_boxed_slice(),
+            );
+            ParamSchema::Enum {
+                variants,
+                description,
+            }
+        }
+        Some("string") => ParamSchema::Primitive {
+            kind: ParamKind::String,
+            description,
+        },
+        Some("integer") => ParamSchema::Primitive {
+            kind: ParamKind::Integer,
+            description,
+        },
+        Some("number") => ParamSchema::Primitive {
+            kind: ParamKind::Number,
+            description,
+        },
+        Some("boolean") => ParamSchema::Primitive {
+            kind: ParamKind::Bool,
+            description,
+        },
+        Some("array") => {
+            let items_val = v.get("items").ok_or("array schema missing items")?;
+            let items: &'static ParamSchema = try_from_json(items_val)?;
+            ParamSchema::Array { items, description }
+        }
+        Some("object") => {
+            let props_map = v
+                .get("properties")
+                .and_then(|p| p.as_object())
+                .ok_or("object schema missing properties")?;
+            let required: Vec<&str> = v
+                .get("required")
+                .and_then(|r| r.as_array())
+                .map(|arr| arr.iter().filter_map(|x| x.as_str()).collect())
+                .unwrap_or_default();
+            let properties: &'static [Property] = Box::leak(
+                props_map
+                    .iter()
+                    .map(|(name, sub)| -> Result<Property, String> {
+                        let static_name: &'static str = Box::leak(name.clone().into_boxed_str());
+                        let static_schema: &'static ParamSchema = try_from_json(sub)?;
+                        let is_required = required.contains(&name.as_str());
+                        Ok((static_name, static_schema, is_required))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_boxed_slice(),
+            );
+            ParamSchema::Object {
+                properties,
+                description,
+            }
+        }
+        _ => ParamSchema::Any { description },
+    };
+
+    Ok(Box::leak(Box::new(schema)))
 }
 
 #[derive(Debug, Clone)]
@@ -289,7 +374,7 @@ pub(crate) fn preview(s: &str) -> String {
     out
 }
 
-pub(crate) fn validate(schema: &ParamSchema, input: Value) -> Result<Value, ToolInputError> {
+pub fn validate(schema: &ParamSchema, input: Value) -> Result<Value, ToolInputError> {
     walk(schema, input, &mut JsonPath::default())
 }
 
@@ -666,5 +751,36 @@ mod tests {
         };
         let out = validate(&SCHEMA, json!({"name": "x", "extra": 42})).unwrap();
         assert!(out.get("extra").is_none());
+    }
+
+    #[test_case(ParamKind::String,  json!("hello"), json!(42)    ; "string_accepts_string_rejects_int")]
+    #[test_case(ParamKind::Integer, json!(7),        json!("no") ; "integer_accepts_int_rejects_string")]
+    #[test_case(ParamKind::Bool,    json!(true),     json!(1)    ; "bool_accepts_bool_rejects_int")]
+    fn roundtrip_primitive(kind: ParamKind, good: Value, bad: Value) {
+        let schema = ParamSchema::Primitive {
+            kind,
+            description: "",
+        };
+        let json_schema = to_json_schema(&schema);
+        let recovered = try_from_json(&json_schema).expect("try_from_json failed");
+        assert!(validate(recovered, good).is_ok());
+        assert!(validate(recovered, bad).is_err());
+    }
+
+    #[test]
+    fn roundtrip_object() {
+        const INT_PRIM: ParamSchema = ParamSchema::Primitive {
+            kind: ParamKind::Integer,
+            description: "",
+        };
+        const SCHEMA: ParamSchema = ParamSchema::Object {
+            properties: &[("name", &STR_PRIM, true), ("count", &INT_PRIM, false)],
+            description: "",
+        };
+        let json_schema = to_json_schema(&SCHEMA);
+        let recovered = try_from_json(&json_schema).expect("try_from_json failed");
+        assert!(validate(recovered, json!({"name": "x", "count": 3})).is_ok());
+        assert!(validate(recovered, json!({"name": "x"})).is_ok());
+        assert!(validate(recovered, json!({"count": 3})).is_err());
     }
 }
