@@ -3,7 +3,7 @@ mod history;
 mod instructions;
 mod run;
 mod streaming;
-pub(crate) mod tool_dispatch;
+pub mod tool_dispatch;
 
 pub use compaction::compact;
 pub use history::History;

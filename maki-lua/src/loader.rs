@@ -14,6 +14,11 @@ use crate::runtime::{self, LuaThread, Request};
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
+const BUNDLED_INDEX: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../plugins/index/init.lua"
+));
+
 pub struct PluginHost {
     inner: Option<LuaThread>,
 }
@@ -53,6 +58,20 @@ impl PluginHost {
         let host = Self { inner: Some(lua) };
 
         let mut seen: HashSet<Arc<str>> = HashSet::new();
+
+        for builtin in &config.builtins {
+            let source = match builtin.as_str() {
+                "index" => BUNDLED_INDEX,
+                other => {
+                    tracing::warn!(builtin = other, "unknown builtin plugin, skipping");
+                    continue;
+                }
+            };
+            let name: Arc<str> = Arc::from(builtin.as_str());
+            seen.insert(Arc::clone(&name));
+            host.load_source_named(name, source.to_owned(), None)?;
+        }
+
         for dir in &config.user_dirs {
             host.load_dir(dir, &mut seen)?;
         }
@@ -161,6 +180,7 @@ mod tests {
     fn enabled_config() -> LuaPluginsConfig {
         LuaPluginsConfig {
             enabled: true,
+            builtins: vec![],
             user_dirs: vec![],
         }
     }
@@ -168,6 +188,7 @@ mod tests {
     fn disabled_config() -> LuaPluginsConfig {
         LuaPluginsConfig {
             enabled: false,
+            builtins: vec![],
             user_dirs: vec![],
         }
     }

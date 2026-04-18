@@ -50,5 +50,3 @@ uuid = { workspace = true }
 test-case = { workspace = true }
 tempfile = { workspace = true }
 
-[features]
-test-support = []

@@ -7,6 +7,7 @@ use maki_lua::PluginHost;
 fn config() -> LuaPluginsConfig {
     LuaPluginsConfig {
         enabled: true,
+        builtins: vec![],
         user_dirs: vec![],
     }
 }

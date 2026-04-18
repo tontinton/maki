@@ -16,6 +16,8 @@ use crate::{ToolInput as ToolInputEvent, ToolOutput};
 
 use super::{DescriptionContext, ToolContext};
 
+pub const DELEGATE_NATIVE: &str = "DELEGATE_NATIVE";
+
 bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct ToolAudience: u8 {
@@ -53,10 +55,9 @@ pub type ParseError = super::schema::ToolInputError;
 
 pub type ExecFuture<'a> = Pin<Box<dyn Future<Output = Result<ToolOutput, String>> + Send + 'a>>;
 
-/// Owns the parsed input so start-event construction and `execute` share one parse.
-///
-/// `permission_scope` and `mutable_path` live here, not on `Tool`, because "am I writing
-/// to the plan file?" is a question only the parsed call can answer.
+/// Holds the parsed input so start-event and `execute` share one parse pass.
+/// `permission_scope` and `mutable_path` belong here because only the parsed
+/// call knows which file it will touch.
 pub trait ToolInvocation: Send + Sync {
     fn start_summary(&self) -> String;
     fn start_annotation(&self) -> Option<String> {
@@ -101,16 +102,17 @@ impl RegisteredTool {
         self.tool.name()
     }
 
-    /// Lets crates outside `maki-agent` parse without naming `ParseError`.
+    /// Parse without naming `ParseError`, handy for crates outside `maki-agent`.
     pub fn try_parse(&self, input: &serde_json::Value) -> Option<Box<dyn ToolInvocation>> {
         self.tool.parse(input).ok()
     }
 }
 
-/// `ArcSwap` keeps the hot path (`get` on every tool call) lock-free, while MCP handshakes
-/// and future plugin loads publish a whole new snapshot in one atomic swap.
+/// Lock-free reads via `ArcSwap`: every tool call just loads a pointer.
+/// Writes (MCP handshake, plugin reload) swap in a whole new snapshot atomically.
 pub struct ToolRegistry {
     tools: ArcSwap<Vec<RegisteredTool>>,
+    native_fallbacks: ArcSwap<Vec<RegisteredTool>>,
 }
 
 impl Default for ToolRegistry {
@@ -129,6 +131,7 @@ impl ToolRegistry {
     pub fn new() -> Self {
         Self {
             tools: ArcSwap::from_pointee(Vec::new()),
+            native_fallbacks: ArcSwap::from_pointee(Vec::new()),
         }
     }
 
@@ -142,8 +145,14 @@ impl ToolRegistry {
         &NATIVE
     }
 
-    /// Duplicate names panic. The `register_tools!` macro catches them at compile time,
-    /// but plugins and MCP skip that check, so this is the runtime safety belt.
+    /// Fresh registry with all native tools, not shared. Useful in tests that
+    /// register plugins without touching the global static.
+    pub fn with_natives() -> Self {
+        Self::build_native()
+    }
+
+    /// `register_tools!` catches dupes at compile time. Plugins and MCP skip
+    /// that macro, so this runtime check is the safety net.
     fn build_native() -> Self {
         let registry = Self::new();
         let natives = super::native_tools();
@@ -194,8 +203,8 @@ impl ToolRegistry {
         Ok(())
     }
 
-    /// All-or-nothing: a name clash rolls back the whole batch so a half-registered MCP
-    /// server never leaves the registry partially populated.
+    /// All-or-nothing: a name clash rolls back the whole batch so an MCP server
+    /// never ends up half-registered.
     pub fn register_many(
         &self,
         entries: impl IntoIterator<Item = (Arc<dyn Tool>, ToolSource)>,
@@ -239,15 +248,20 @@ impl ToolRegistry {
         });
     }
 
-    /// Swap a plugin's tools atomically. On name conflict with another source, rolls back.
+    /// Atomically swap a plugin's tools in. When a bundled plugin provides a tool
+    /// with the same name as a native one, the native gets moved to `native_fallbacks`
+    /// so Lua can return DELEGATE_NATIVE to fall through. Conflicts with other
+    /// non-native sources still roll back.
     pub fn replace_plugin(
         &self,
         plugin: &str,
         new_entries: Vec<(Arc<dyn Tool>, ToolSource)>,
     ) -> Result<(), RegistryError> {
         let mut conflict = None;
+        let mut displaced: Vec<RegisteredTool> = Vec::new();
         self.tools.rcu(|current| {
             conflict = None;
+            displaced = Vec::new();
             let mut next: Vec<RegisteredTool> = current
                 .iter()
                 .filter(
@@ -257,12 +271,17 @@ impl ToolRegistry {
                 .collect();
             for (tool, source) in &new_entries {
                 let name = tool.name();
-                if let Some(existing) = next.iter().find(|t| t.name() == name) {
-                    conflict = Some(RegistryError::NameConflict {
-                        name: name.to_owned(),
-                        existing: existing.source.as_log_field().into_owned(),
-                    });
-                    return Vec::clone(current);
+                if let Some(idx) = next.iter().position(|t| t.name() == name) {
+                    if matches!(next[idx].source, ToolSource::Native) {
+                        displaced.push(next.remove(idx));
+                    } else {
+                        conflict = Some(RegistryError::NameConflict {
+                            name: name.to_owned(),
+                            existing: next[idx].source.as_log_field().into_owned(),
+                        });
+                        displaced = Vec::new();
+                        return Vec::clone(current);
+                    }
                 }
                 next.push(RegisteredTool {
                     tool: Arc::clone(tool),
@@ -274,19 +293,57 @@ impl ToolRegistry {
         if let Some(e) = conflict {
             return Err(e);
         }
+        if !displaced.is_empty() {
+            self.native_fallbacks.rcu(|current| {
+                let mut next = Vec::clone(current);
+                next.extend(displaced.iter().cloned());
+                next
+            });
+        }
         Ok(())
     }
 
     pub fn clear_plugin(&self, plugin: &str) {
+        let fallbacks = self.native_fallbacks.load();
+        let tools_guard = self.tools.load();
+        let plugin_names: Vec<&str> = tools_guard
+            .iter()
+            .filter(|t| matches!(&t.source, ToolSource::Lua { plugin: p } if p.as_ref() == plugin))
+            .map(|t| t.name())
+            .collect();
+        let restore: Vec<RegisteredTool> = fallbacks
+            .iter()
+            .filter(|t| plugin_names.contains(&t.name()))
+            .cloned()
+            .collect();
         self.tools.rcu(|current| {
-            current
+            let mut next: Vec<RegisteredTool> = current
                 .iter()
                 .filter(
                     |t| !matches!(&t.source, ToolSource::Lua { plugin: p } if p.as_ref() == plugin),
                 )
                 .cloned()
-                .collect::<Vec<_>>()
+                .collect();
+            next.extend(restore.iter().cloned());
+            next
         });
+        if !restore.is_empty() {
+            self.native_fallbacks.rcu(|current| {
+                current
+                    .iter()
+                    .filter(|t| !plugin_names.contains(&t.name()))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            });
+        }
+    }
+
+    pub fn get_native_fallback(&self, name: &str) -> Option<RegisteredTool> {
+        self.native_fallbacks
+            .load()
+            .iter()
+            .find(|t| t.name() == name)
+            .cloned()
     }
 
     pub fn names(&self) -> Vec<Arc<str>> {
@@ -297,8 +354,8 @@ impl ToolRegistry {
             .collect()
     }
 
-    /// Built fresh each request so an MCP server registering mid-session shows up on the
-    /// next turn.
+    /// Rebuilt each request so tools registered mid-session (MCP handshake) show
+    /// up on the very next turn.
     pub fn definitions(
         &self,
         vars: &Vars,
@@ -368,8 +425,8 @@ fn format_examples_as_text(examples: &Value) -> Option<String> {
     Some(text)
 }
 
-/// `impl_tool!` hangs the `Tool` impl off this wrapper using the consts from
-/// `#[derive(Tool)]`, so tool files only write their logic.
+/// `impl_tool!` wires up the `Tool` trait on this wrapper using consts from
+/// `#[derive(Tool)]`. Tool files only need to write their actual logic.
 pub struct Native<T: 'static>(std::marker::PhantomData<T>);
 
 impl<T: 'static> Native<T> {
@@ -433,9 +490,8 @@ mod tests {
         assert!(matches!(err, RegistryError::NameConflict { .. }));
     }
 
-    /// MCP tools registered mid-session must appear on the very next `definitions()` call.
-    /// This is the guarantee that lets us build tool schemas per-request instead of at
-    /// startup.
+    /// Tools added mid-session must show up in the next `definitions()` call.
+    /// That is the whole reason we build schemas per-request.
     #[test]
     fn definitions_reflects_mid_session_registration() {
         let reg = ToolRegistry::new();
@@ -514,5 +570,54 @@ mod tests {
         assert!(!reg.has("pluginA__foo"));
         assert!(reg.has("pluginB__bar"));
         assert!(reg.has("native_tool2"));
+    }
+
+    #[test]
+    fn replace_plugin_displaces_native_and_clear_restores_it() {
+        let reg = ToolRegistry::new();
+        reg.register(mock("index"), ToolSource::Native).unwrap();
+
+        reg.replace_plugin(
+            "idx",
+            vec![(
+                mock("index"),
+                ToolSource::Lua {
+                    plugin: "idx".into(),
+                },
+            )],
+        )
+        .unwrap();
+
+        let entry = reg.get("index").unwrap();
+        assert!(matches!(entry.source, ToolSource::Lua { .. }));
+
+        let fallback = reg.get_native_fallback("index");
+        assert!(fallback.is_some());
+        assert!(matches!(fallback.unwrap().source, ToolSource::Native));
+
+        reg.clear_plugin("idx");
+        let restored = reg.get("index").unwrap();
+        assert!(matches!(restored.source, ToolSource::Native));
+        assert!(reg.get_native_fallback("index").is_none());
+    }
+
+    #[test]
+    fn replace_plugin_rejects_conflict_with_non_native() {
+        let reg = ToolRegistry::new();
+        reg.register(mock("shared"), ToolSource::Mcp { server: "s".into() })
+            .unwrap();
+
+        let err = reg
+            .replace_plugin(
+                "myplugin",
+                vec![(
+                    mock("shared"),
+                    ToolSource::Lua {
+                        plugin: "myplugin".into(),
+                    },
+                )],
+            )
+            .unwrap_err();
+        assert!(matches!(err, RegistryError::NameConflict { .. }));
     }
 }

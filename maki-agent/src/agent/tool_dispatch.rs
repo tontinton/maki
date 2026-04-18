@@ -10,7 +10,7 @@ use tracing::{debug, error, warn};
 use crate::mcp::{McpHandle, UNKNOWN_MCP};
 use crate::task_set::TaskSet;
 use crate::tools::ToolContext;
-use crate::tools::registry::ToolRegistry;
+use crate::tools::registry::{DELEGATE_NATIVE, ToolRegistry, ToolSource};
 use crate::{AgentError, AgentEvent, AgentMode, ToolDoneEvent, ToolOutput, ToolStartEvent};
 
 const DOOM_LOOP_THRESHOLD: usize = 3;
@@ -50,10 +50,9 @@ impl RecentCalls {
     }
 }
 
-/// Unified dispatch: every tool source (native, MCP, Lua) flows through here.
-/// Parse errors and unknown tools skip the start event so the UI never shows a
-/// phantom running tool.
-pub(crate) async fn run(
+/// Single entry point for all tool sources (native, MCP, Lua). Parse errors
+/// and unknown tools skip the start event so the UI never shows a phantom spinner.
+pub async fn run(
     registry: &ToolRegistry,
     mcp: Option<&McpHandle>,
     id: String,
@@ -130,7 +129,20 @@ pub(crate) async fn run(
             return done_error(e.to_string());
         }
 
-        let result = invocation.execute(ctx).await;
+        let mut result = invocation.execute(ctx).await;
+
+        if matches!(&result, Ok(ToolOutput::Plain(s)) if s == DELEGATE_NATIVE && matches!(entry.source, ToolSource::Lua { .. }))
+        {
+            debug!(tool = %name, "DELEGATE_NATIVE: falling back to native tool");
+            match registry.get_native_fallback(name) {
+                Some(native) => match native.tool.parse(input) {
+                    Ok(native_inv) => result = native_inv.execute(ctx).await,
+                    Err(e) => result = Err(format!("native fallback parse error: {e}")),
+                },
+                None => result = Err(format!("no native tool '{name}' for DELEGATE_NATIVE")),
+            }
+        }
+
         let elapsed = started.elapsed();
         match result {
             Ok(output) => {
@@ -159,7 +171,7 @@ pub(crate) async fn run(
             }
         }
     } else if mcp.is_some_and(|m| m.has_tool(name)) {
-        // MCP tools have no `ToolInvocation`, so we build the start event by hand.
+        // MCP tools skip parsing, so we assemble the start event manually.
         let start = ToolStartEvent {
             id: id.clone(),
             tool: Arc::clone(&tool_id),
@@ -230,8 +242,7 @@ async fn execute_mcp_tool(
     }
 }
 
-/// Drops doom-loop repeats, then fans the rest out in parallel so one slow tool does not
-/// stall the others.
+/// Deduplicates doom-loop repeats, then runs remaining calls in parallel.
 pub(super) async fn process_tool_calls(
     response: maki_providers::StreamResponse,
     recent_calls: &mut RecentCalls,
@@ -317,8 +328,8 @@ pub(super) async fn process_tool_calls(
     Ok(())
 }
 
-/// Skips the native lookup so plan-mode and missing-manager tests can poke the MCP
-/// branch without registering a fake tool.
+/// Test-only entry that skips native lookup, letting plan-mode and MCP tests
+/// exercise the dispatch path without registering a fake native tool.
 #[cfg(test)]
 async fn dispatch_mcp(
     ctx: &ToolContext,
@@ -417,8 +428,7 @@ mod tests {
         });
     }
 
-    /// Denies bash and checks the marker file is never created. If a denied tool runs
-    /// anyway, the user said no and we did it anyway.
+    /// Denies bash and verifies the marker file is never created.
     #[test]
     fn permission_denial_short_circuits_execute() {
         use std::sync::Arc;

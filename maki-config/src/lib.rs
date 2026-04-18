@@ -618,19 +618,23 @@ impl StorageConfig {
 #[serde(default)]
 struct LuaPluginsFileConfig {
     enabled: Option<bool>,
+    builtins: Option<Vec<String>>,
     user_dirs: Option<Vec<PathBuf>>,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct LuaPluginsConfig {
     pub enabled: bool,
+    pub builtins: Vec<String>,
     pub user_dirs: Vec<PathBuf>,
 }
 
 impl LuaPluginsConfig {
     fn from_file(f: LuaPluginsFileConfig) -> Self {
+        let enabled = f.enabled.unwrap_or(false);
         Self {
-            enabled: f.enabled.unwrap_or(false),
+            enabled,
+            builtins: f.builtins.unwrap_or_else(|| vec!["index".to_string()]),
             user_dirs: f.user_dirs.unwrap_or_default(),
         }
     }

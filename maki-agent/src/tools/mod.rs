@@ -634,7 +634,6 @@ pub(crate) fn interpreter_ctx(
     }
 }
 
-#[cfg(any(test, feature = "test-support"))]
 pub mod test_support {
     use crate::{Envelope, EventSender};
 
