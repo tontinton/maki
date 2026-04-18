@@ -12,6 +12,7 @@ use serde_json::Value;
 
 use crate::api::create_maki_global;
 use crate::api::ctx::LuaCtx;
+use crate::api::fs::check_sandbox;
 use crate::api::tool::{LuaTool, PendingTool, PendingTools, ToolCallResult, coerce_tool_result};
 use crate::error::PluginError;
 
@@ -131,7 +132,6 @@ impl LuaRuntime {
         roots.into()
     }
 
-    /// Log and continue on individual failures since partial removal still helps.
     fn drop_plugin_keys(&mut self, name: &str) {
         if let Some(keys) = self.plugins.remove(name) {
             for (_, key) in keys {
@@ -162,14 +162,88 @@ impl LuaRuntime {
         &self,
         fs_roots: Arc<[PathBuf]>,
         plugin: Arc<str>,
+        require_root: Option<PathBuf>,
     ) -> Result<mlua::Table, mlua::Error> {
         let maki = create_maki_global(&self.lua, Arc::clone(&self.pending), fs_roots, plugin)?;
         let env = self.lua.create_table()?;
         env.set("maki", maki)?;
+
+        if let Some(root) = require_root {
+            let require_fn = self.create_require_fn(&env, root)?;
+            env.set("require", require_fn)?;
+        }
+
         let meta = self.lua.create_table()?;
         meta.set("__index", self.lua.globals())?;
         env.set_metatable(Some(meta))?;
         Ok(env)
+    }
+
+    fn create_require_fn(
+        &self,
+        env: &mlua::Table,
+        require_root: PathBuf,
+    ) -> Result<Function, mlua::Error> {
+        let lua_dir = require_root
+            .canonicalize()
+            .unwrap_or_else(|_| require_root.clone());
+        let loaded = self.lua.create_table()?;
+        let loading = self.lua.create_table()?;
+        let env_clone = env.clone();
+
+        self.lua.create_function(move |lua, modname: String| {
+            if modname.is_empty() {
+                return Err(mlua::Error::runtime(
+                    "require: module name must be non-empty",
+                ));
+            }
+
+            if let Ok(cached) = loaded.get::<LuaValue>(modname.as_str()) {
+                if cached != LuaValue::Nil {
+                    return Ok(cached);
+                }
+            }
+
+            if loading.get::<bool>(modname.as_str()).unwrap_or(false) {
+                return Ok(LuaValue::Boolean(true));
+            }
+
+            loading.set(modname.as_str(), true)?;
+
+            let rel_path = modname.replace('.', "/") + ".lua";
+            let abs_path = lua_dir.join(&rel_path);
+            let abs_str = abs_path.to_string_lossy();
+
+            let resolved = check_sandbox(&abs_str, std::slice::from_ref(&lua_dir))?;
+
+            let source = std::fs::read_to_string(&resolved).map_err(|e| {
+                let _ = loading.set(modname.as_str(), LuaValue::Nil);
+                mlua::Error::runtime(format!("require '{modname}': {e}"))
+            })?;
+
+            let result: LuaValue = match lua
+                .load(&source)
+                .set_name(&modname)
+                .set_environment(env_clone.clone())
+                .eval()
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = loading.set(modname.as_str(), LuaValue::Nil);
+                    return Err(e);
+                }
+            };
+
+            loading.set(modname.as_str(), LuaValue::Nil)?;
+            let stored = if result == LuaValue::Nil {
+                LuaValue::Boolean(true)
+            } else {
+                result.clone()
+            };
+            loaded.set(modname.as_str(), stored)?;
+
+            Ok(result)
+        })
     }
 
     fn load_source(
@@ -186,9 +260,10 @@ impl LuaRuntime {
         self.discard_pending(stale);
 
         let roots = self.fs_roots(plugin_dir.as_deref());
+        let require_root = plugin_dir.as_ref().map(|d| d.join("lua"));
 
         let env = self
-            .build_plugin_env(roots, Arc::clone(&name))
+            .build_plugin_env(roots, Arc::clone(&name), require_root)
             .map_err(|e| PluginError::Lua {
                 plugin: name.to_string(),
                 source: e,

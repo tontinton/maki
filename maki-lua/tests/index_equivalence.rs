@@ -123,7 +123,7 @@ fn index_config() -> LuaPluginsConfig {
     LuaPluginsConfig {
         enabled: true,
         builtins: vec!["index".to_string()],
-        user_dirs: vec![],
+        init_file: None,
     }
 }
 
@@ -139,7 +139,7 @@ fn exec_tool(reg: &ToolRegistry, name: &str, input: serde_json::Value) -> Result
     })
 }
 
-/// Under cwd so it lands inside the Lua sandbox root.
+/// Needs to be under cwd to land inside the Lua sandbox.
 fn sandbox_tmp() -> TempDir {
     TempDir::new_in(".").unwrap()
 }

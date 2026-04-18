@@ -7,11 +7,10 @@ use mlua::{Buffer, Lua, Result as LuaResult, Table};
 
 const SANDBOX_ERR: &str = "path outside sandbox";
 
-/// Resolve `path` for sandbox checking: canonicalize the deepest ancestor that exists
-/// (catching symlink escapes), then re-append remaining components lexically.
-/// This lets plugins write to paths that don't exist yet while still blocking
-/// symlink escapes through any component that does exist.
-fn resolve_for_sandbox(path: &str) -> LuaResult<PathBuf> {
+/// Canonicalize the deepest existing ancestor, then re-append the rest lexically.
+/// This way plugins can write to paths that don't exist yet, but symlink escapes
+/// through existing components are still caught.
+pub(crate) fn resolve_for_sandbox(path: &str) -> LuaResult<PathBuf> {
     let p = Path::new(path);
     let abs = if p.is_absolute() {
         p.to_path_buf()
@@ -56,7 +55,7 @@ fn resolve_for_sandbox(path: &str) -> LuaResult<PathBuf> {
     Ok(result)
 }
 
-fn check_sandbox(path: &str, roots: &[PathBuf]) -> LuaResult<PathBuf> {
+pub(crate) fn check_sandbox(path: &str, roots: &[PathBuf]) -> LuaResult<PathBuf> {
     let resolved = resolve_for_sandbox(path)?;
     if roots.iter().any(|r| resolved.starts_with(r)) {
         Ok(resolved)

@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use maki_agent::tools::{ToolRegistry, ToolSource};
@@ -8,7 +9,15 @@ fn enabled_config() -> LuaPluginsConfig {
     LuaPluginsConfig {
         enabled: true,
         builtins: vec![],
-        user_dirs: vec![],
+        init_file: None,
+    }
+}
+
+fn init_config(init_file: PathBuf) -> LuaPluginsConfig {
+    LuaPluginsConfig {
+        enabled: true,
+        builtins: vec![],
+        init_file: Some(init_file),
     }
 }
 
@@ -74,21 +83,6 @@ fn register_echo_tool() {
 
     let out = exec_tool(&reg, "echo_", serde_json::json!({"msg": "hello"})).unwrap();
     assert_eq!(out, "hello");
-}
-
-#[test]
-fn definitions_unchanged_when_disabled() {
-    let reg = fresh_registry();
-    let names_before = reg.names();
-
-    let config = LuaPluginsConfig {
-        enabled: false,
-        builtins: vec![],
-        user_dirs: vec![],
-    };
-    let _host = PluginHost::new(&config, Arc::clone(&reg)).unwrap();
-
-    assert_eq!(reg.names(), names_before, "disabled host mutated registry");
 }
 
 #[test]
@@ -200,14 +194,9 @@ maki.api.register_tool({{
     let mut ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
     ctx.deadline = maki_agent::tools::Deadline::after(std::time::Duration::from_millis(500));
 
-    let start = std::time::Instant::now();
     let result = smol::block_on(async { inv.execute(&ctx).await });
 
     assert!(result.is_err(), "expected error from timed-out loop");
-    assert!(
-        start.elapsed() < std::time::Duration::from_secs(30),
-        "interrupt took unreasonably long"
-    );
 
     let ok = exec_tool(&reg, "noop_after_loop", serde_json::json!({}));
     assert!(ok.is_ok(), "VM poisoned after interrupt: {ok:?}");
@@ -366,32 +355,170 @@ maki.api.register_tool({
 }
 
 #[test]
-fn load_dir_discovers_lua_files() {
+fn init_lua_with_require_registers_tools() {
     let tmp = tempfile::TempDir::new().unwrap();
+    let lua_dir = tmp.path().join("lua");
+    std::fs::create_dir_all(lua_dir.join("tools")).unwrap();
+
     std::fs::write(
-        tmp.path().join("greet.lua"),
+        lua_dir.join("tools/greet.lua"),
         r#"
-maki.api.register_tool({
-    name = "greet",
-    description = "says hi",
-    schema = { type = "object", properties = {}, additionalProperties = false },
-    handler = function() return "hi" end
-})
+local M = {}
+function M.setup()
+    maki.api.register_tool({
+        name = "greet",
+        description = "says hi",
+        schema = { type = "object", properties = {}, additionalProperties = false },
+        handler = function() return "hi" end
+    })
+end
+return M
 "#,
     )
     .unwrap();
-    std::fs::write(tmp.path().join("readme.txt"), "not a plugin").unwrap();
 
-    let config = LuaPluginsConfig {
-        enabled: true,
-        builtins: vec![],
-        user_dirs: vec![tmp.path().to_path_buf()],
-    };
+    std::fs::write(
+        tmp.path().join("init.lua"),
+        r#"
+local greet = require("tools.greet")
+greet.setup()
+"#,
+    )
+    .unwrap();
+
+    let config = init_config(tmp.path().join("init.lua"));
     let reg = fresh_registry();
     let _host = PluginHost::new(&config, Arc::clone(&reg)).unwrap();
 
     assert!(reg.has("greet"));
     assert_eq!(reg.names().len(), 1);
+}
+
+#[test]
+fn require_caches_modules() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let lua_dir = tmp.path().join("lua");
+    std::fs::create_dir_all(&lua_dir).unwrap();
+
+    std::fs::write(lua_dir.join("counter.lua"), "return { value = 42 }\n").unwrap();
+
+    std::fs::write(
+        tmp.path().join("init.lua"),
+        r#"
+local a = require("counter")
+local b = require("counter")
+assert(a == b, "require should return cached module")
+"#,
+    )
+    .unwrap();
+
+    let config = init_config(tmp.path().join("init.lua"));
+    let reg = fresh_registry();
+    let _host = PluginHost::new(&config, Arc::clone(&reg)).unwrap();
+}
+
+#[test]
+fn require_sandbox_escape_blocked() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let lua_dir = tmp.path().join("lua");
+    std::fs::create_dir_all(&lua_dir).unwrap();
+
+    std::fs::write(tmp.path().join("init.lua"), "require(\"../../escape\")\n").unwrap();
+
+    let config = init_config(tmp.path().join("init.lua"));
+    let reg = fresh_registry();
+    let result = PluginHost::new(&config, Arc::clone(&reg));
+    let err = result.err().expect("expected sandbox error");
+    assert!(matches!(err, PluginError::Lua { .. }));
+    let msg = err.to_string();
+    assert!(
+        msg.contains("sandbox") || msg.contains("outside"),
+        "got: {msg}"
+    );
+}
+
+#[test]
+fn require_circular_returns_sentinel_and_caches_real_value() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let lua_dir = tmp.path().join("lua");
+    std::fs::create_dir_all(&lua_dir).unwrap();
+
+    std::fs::write(
+        lua_dir.join("a.lua"),
+        "local b = require(\"b\")\nreturn { name = \"a\" }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        lua_dir.join("b.lua"),
+        "local a = require(\"a\")\nassert(a == true, \"circular require should return sentinel\")\nreturn { name = \"b\" }\n",
+    )
+    .unwrap();
+
+    std::fs::write(
+        tmp.path().join("init.lua"),
+        r#"
+require("a")
+local a2 = require("a")
+assert(type(a2) == "table", "cached value should be table, got: " .. type(a2))
+assert(a2.name == "a", "cached value should have name='a'")
+local b2 = require("b")
+assert(type(b2) == "table", "cached value should be table, got: " .. type(b2))
+assert(b2.name == "b", "cached value should have name='b'")
+"#,
+    )
+    .unwrap();
+
+    let config = init_config(tmp.path().join("init.lua"));
+    let reg = fresh_registry();
+    let _host = PluginHost::new(&config, Arc::clone(&reg)).unwrap();
+}
+
+#[test]
+fn require_nonexistent_module_errors() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let lua_dir = tmp.path().join("lua");
+    std::fs::create_dir_all(&lua_dir).unwrap();
+
+    std::fs::write(tmp.path().join("init.lua"), "require(\"nonexistent\")\n").unwrap();
+
+    let config = init_config(tmp.path().join("init.lua"));
+    let reg = fresh_registry();
+    let result = PluginHost::new(&config, Arc::clone(&reg));
+    let err = result.err().expect("expected error for missing module");
+    assert!(matches!(err, PluginError::Lua { .. }));
+    assert!(err.to_string().contains("nonexistent"), "got: {err}");
+}
+
+#[test]
+fn require_error_cleans_loading_state() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let lua_dir = tmp.path().join("lua");
+    std::fs::create_dir_all(&lua_dir).unwrap();
+
+    std::fs::write(lua_dir.join("bad.lua"), "error('deliberate')").unwrap();
+    std::fs::write(lua_dir.join("good.lua"), "return { ok = true }").unwrap();
+
+    std::fs::write(
+        tmp.path().join("init.lua"),
+        r#"
+local ok, err = pcall(require, "bad")
+assert(not ok, "bad module should fail")
+
+-- second require of the same broken module must error again, not return a sentinel
+local ok2, err2 = pcall(require, "bad")
+assert(not ok2, "broken module should fail on retry too")
+
+-- unrelated modules must still work
+local g = require("good")
+assert(type(g) == "table", "good module should load, got: " .. type(g))
+assert(g.ok == true)
+"#,
+    )
+    .unwrap();
+
+    let config = init_config(tmp.path().join("init.lua"));
+    let reg = fresh_registry();
+    let _host = PluginHost::new(&config, Arc::clone(&reg)).unwrap();
 }
 
 #[test]

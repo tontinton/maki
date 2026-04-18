@@ -619,23 +619,27 @@ impl StorageConfig {
 struct LuaPluginsFileConfig {
     enabled: Option<bool>,
     builtins: Option<Vec<String>>,
-    user_dirs: Option<Vec<PathBuf>>,
+    init_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct LuaPluginsConfig {
     pub enabled: bool,
     pub builtins: Vec<String>,
-    pub user_dirs: Vec<PathBuf>,
+    pub init_file: Option<PathBuf>,
 }
 
 impl LuaPluginsConfig {
     fn from_file(f: LuaPluginsFileConfig) -> Self {
         let enabled = f.enabled.unwrap_or(false);
+        let init_file = f.init_file.or_else(|| {
+            let path = global_dir()?.join("init.lua");
+            path.is_file().then_some(path)
+        });
         Self {
             enabled,
             builtins: f.builtins.unwrap_or_else(|| vec!["index".to_string()]),
-            user_dirs: f.user_dirs.unwrap_or_default(),
+            init_file,
         }
     }
 }
@@ -1357,24 +1361,18 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let maki_dir = dir.path().join(".maki");
         fs::create_dir_all(&maki_dir).unwrap();
+        let init = maki_dir.join("init.lua");
+        fs::write(&init, "").unwrap();
         fs::write(
             maki_dir.join("config.toml"),
-            "[lua_plugins]\nenabled = true\nuser_dirs = [\"/tmp/plugins\"]\n",
+            format!(
+                "[lua_plugins]\nenabled = true\ninit_file = \"{}\"\n",
+                init.to_str().unwrap().replace('\\', "\\\\")
+            ),
         )
         .unwrap();
         let config = load_config(dir.path(), false);
         assert!(config.lua_plugins.enabled);
-        assert_eq!(
-            config.lua_plugins.user_dirs,
-            vec![PathBuf::from("/tmp/plugins")]
-        );
-    }
-
-    #[test]
-    fn lua_plugins_config_empty_returns_defaults() {
-        let dir = TempDir::new().unwrap();
-        let config = load_config(dir.path(), false);
-        assert!(!config.lua_plugins.enabled);
-        assert!(config.lua_plugins.user_dirs.is_empty());
+        assert_eq!(config.lua_plugins.init_file, Some(init));
     }
 }

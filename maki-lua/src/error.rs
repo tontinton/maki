@@ -11,8 +11,6 @@ pub enum PluginError {
     },
     #[error("plugin {plugin} attempted to shadow existing tool '{tool}'")]
     NameConflict { plugin: String, tool: String },
-    #[error("duplicate plugin name '{plugin}' across dirs")]
-    DuplicatePlugin { plugin: String },
     #[error("io error loading plugin {path}: {source}")]
     Io {
         path: PathBuf,
