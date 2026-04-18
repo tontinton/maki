@@ -53,6 +53,48 @@ pub enum Language {
 }
 
 impl Language {
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            #[cfg(feature = "lang-rust")]
+            "rust" => Some(Self::Rust),
+            #[cfg(feature = "lang-python")]
+            "python" => Some(Self::Python),
+            #[cfg(feature = "lang-typescript")]
+            "typescript" => Some(Self::TypeScript),
+            #[cfg(feature = "lang-typescript")]
+            "javascript" => Some(Self::JavaScript),
+            #[cfg(feature = "lang-go")]
+            "go" => Some(Self::Go),
+            #[cfg(feature = "lang-java")]
+            "java" => Some(Self::Java),
+            #[cfg(feature = "lang-c")]
+            "c" => Some(Self::C),
+            #[cfg(feature = "lang-cpp")]
+            "cpp" => Some(Self::Cpp),
+            #[cfg(feature = "lang-c-sharp")]
+            "c_sharp" => Some(Self::CSharp),
+            #[cfg(feature = "lang-ruby")]
+            "ruby" => Some(Self::Ruby),
+            #[cfg(feature = "lang-php")]
+            "php" => Some(Self::Php),
+            #[cfg(feature = "lang-swift")]
+            "swift" => Some(Self::Swift),
+            #[cfg(feature = "lang-kotlin")]
+            "kotlin" => Some(Self::Kotlin),
+            #[cfg(feature = "lang-scala")]
+            "scala" => Some(Self::Scala),
+            #[cfg(feature = "lang-bash")]
+            "bash" => Some(Self::Bash),
+            #[cfg(feature = "lang-lua")]
+            "lua" => Some(Self::Lua),
+            #[cfg(feature = "lang-elixir")]
+            "elixir" => Some(Self::Elixir),
+            #[cfg(feature = "lang-markdown")]
+            "markdown" => Some(Self::Markdown),
+            _ => None,
+        }
+    }
+
     pub fn from_extension(ext: &str) -> Option<Self> {
         match ext {
             #[cfg(feature = "lang-rust")]

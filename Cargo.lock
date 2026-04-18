@@ -2336,14 +2336,17 @@ dependencies = [
  "flume 0.11.1",
  "futures-lite",
  "maki-agent",
+ "maki-code-index",
  "maki-config",
  "mlua",
+ "regex",
  "serde_json",
  "smol",
  "tempfile",
  "test-case",
  "thiserror 2.0.18",
  "tracing",
+ "tree-sitter",
 ]
 
 [[package]]
