@@ -2,19 +2,19 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use maki_agent::tools::{ToolRegistry, ToolSource};
-use maki_config::LuaPluginsConfig;
+use maki_config::PluginsConfig;
 use maki_lua::{PluginError, PluginHost};
 
-fn enabled_config() -> LuaPluginsConfig {
-    LuaPluginsConfig {
+fn enabled_config() -> PluginsConfig {
+    PluginsConfig {
         enabled: true,
         builtins: vec![],
         init_file: None,
     }
 }
 
-fn init_config(init_file: PathBuf) -> LuaPluginsConfig {
-    LuaPluginsConfig {
+fn init_config(init_file: PathBuf) -> PluginsConfig {
+    PluginsConfig {
         enabled: true,
         builtins: vec![],
         init_file: Some(init_file),

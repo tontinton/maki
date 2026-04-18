@@ -1,12 +1,12 @@
 use std::sync::Arc;
 
 use maki_agent::tools::ToolRegistry;
-use maki_config::LuaPluginsConfig;
+use maki_config::PluginsConfig;
 use maki_lua::PluginHost;
 
 #[test]
 fn index_plugin_spec() {
-    let config = LuaPluginsConfig {
+    let config = PluginsConfig {
         enabled: true,
         builtins: vec![],
         init_file: None,

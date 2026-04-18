@@ -157,7 +157,7 @@ struct RawConfig {
     provider: ProviderFileConfig,
     storage: StorageFileConfig,
     index: IndexFileConfig,
-    lua_plugins: LuaPluginsFileConfig,
+    plugins: PluginsFileConfig,
 }
 
 #[derive(Deserialize, Default)]
@@ -292,7 +292,7 @@ pub struct Config {
     pub provider: ProviderConfig,
     pub storage: StorageConfig,
     pub permissions: PermissionsConfig,
-    pub lua_plugins: LuaPluginsConfig,
+    pub plugins: PluginsConfig,
 }
 
 #[derive(Debug, Clone, Copy, ConfigSection)]
@@ -616,21 +616,21 @@ impl StorageConfig {
 
 #[derive(Deserialize, Default)]
 #[serde(default)]
-struct LuaPluginsFileConfig {
+struct PluginsFileConfig {
     enabled: Option<bool>,
     builtins: Option<Vec<String>>,
     init_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct LuaPluginsConfig {
+pub struct PluginsConfig {
     pub enabled: bool,
     pub builtins: Vec<String>,
     pub init_file: Option<PathBuf>,
 }
 
-impl LuaPluginsConfig {
-    fn from_file(f: LuaPluginsFileConfig) -> Self {
+impl PluginsConfig {
+    fn from_file(f: PluginsFileConfig) -> Self {
         let enabled = f.enabled.unwrap_or(false);
         let init_file = f.init_file.or_else(|| {
             let path = global_dir()?.join("init.lua");
@@ -772,7 +772,7 @@ fn load_config_with_global(cwd: &Path, no_rtk: bool, global: Option<PathBuf>) ->
         provider: ProviderConfig::from_file(raw.provider),
         storage: StorageConfig::from_file(raw.storage),
         permissions: load_permissions_with_global(cwd, global.as_deref()),
-        lua_plugins: LuaPluginsConfig::from_file(raw.lua_plugins),
+        plugins: PluginsConfig::from_file(raw.plugins),
     }
 }
 
@@ -1135,7 +1135,7 @@ mod tests {
             provider: ProviderConfig::default(),
             storage: StorageConfig::default(),
             permissions: PermissionsConfig::default(),
-            lua_plugins: LuaPluginsConfig::default(),
+            plugins: PluginsConfig::default(),
         };
         match (section, field) {
             ("provider", "connect_timeout_secs") => {
@@ -1357,7 +1357,7 @@ mod tests {
     }
 
     #[test]
-    fn lua_plugins_config_parses_fields() {
+    fn plugins_config_parses_fields() {
         let dir = TempDir::new().unwrap();
         let maki_dir = dir.path().join(".maki");
         fs::create_dir_all(&maki_dir).unwrap();
@@ -1366,13 +1366,13 @@ mod tests {
         fs::write(
             maki_dir.join("config.toml"),
             format!(
-                "[lua_plugins]\nenabled = true\ninit_file = \"{}\"\n",
+                "[plugins]\nenabled = true\ninit_file = \"{}\"\n",
                 init.to_str().unwrap().replace('\\', "\\\\")
             ),
         )
         .unwrap();
         let config = load_config(dir.path(), false);
-        assert!(config.lua_plugins.enabled);
-        assert_eq!(config.lua_plugins.init_file, Some(init));
+        assert!(config.plugins.enabled);
+        assert_eq!(config.plugins.init_file, Some(init));
     }
 }

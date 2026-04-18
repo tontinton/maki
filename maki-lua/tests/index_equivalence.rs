@@ -3,7 +3,7 @@ use std::sync::Arc;
 use maki_agent::tools::ToolRegistry;
 use maki_agent::tools::registry::DELEGATE_NATIVE;
 use maki_code_index::{Language, index_source};
-use maki_config::LuaPluginsConfig;
+use maki_config::PluginsConfig;
 use maki_lua::PluginHost;
 use tempfile::TempDir;
 use test_case::test_case;
@@ -119,8 +119,8 @@ function main() {
 }
 "#;
 
-fn index_config() -> LuaPluginsConfig {
-    LuaPluginsConfig {
+fn index_config() -> PluginsConfig {
+    PluginsConfig {
         enabled: true,
         builtins: vec!["index".to_string()],
         init_file: None,

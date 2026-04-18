@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use include_dir::{Dir, include_dir};
 use maki_agent::tools::ToolRegistry;
-use maki_config::LuaPluginsConfig;
+use maki_config::PluginsConfig;
 
 use crate::error::PluginError;
 use crate::runtime::{self, LuaThread, Request};
@@ -43,10 +43,7 @@ impl Drop for PluginHost {
 }
 
 impl PluginHost {
-    pub fn new(
-        config: &LuaPluginsConfig,
-        registry: Arc<ToolRegistry>,
-    ) -> Result<Self, PluginError> {
+    pub fn new(config: &PluginsConfig, registry: Arc<ToolRegistry>) -> Result<Self, PluginError> {
         if !config.enabled {
             return Ok(Self { inner: None });
         }
@@ -131,13 +128,13 @@ impl PluginHost {
 mod tests {
     use super::*;
     use maki_agent::tools::ToolRegistry;
-    use maki_config::LuaPluginsConfig;
+    use maki_config::PluginsConfig;
 
     #[test]
     fn new_with_disabled_config_is_noop() {
         let reg = Arc::new(ToolRegistry::new());
         let names_before = reg.names();
-        let config = LuaPluginsConfig {
+        let config = PluginsConfig {
             enabled: false,
             builtins: vec![],
             init_file: None,

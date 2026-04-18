@@ -339,7 +339,7 @@ fn run() -> Result<()> {
             let skills = discover(cli.no_skills);
             let commands = discover_cmds(cli.no_commands);
             let _plugin_host =
-                PluginHost::new(&config.lua_plugins, Arc::clone(ToolRegistry::native_arc()))
+                PluginHost::new(&config.plugins, Arc::clone(ToolRegistry::native_arc()))
                     .context("initialize lua plugin host")?;
             if cli.print {
                 print::run(
