@@ -318,6 +318,7 @@ impl LuaRuntime {
                     audience: t.audience,
                     tx: self.tx.clone(),
                     plugin: Arc::clone(&name),
+                    summary_key: t.summary_key.clone(),
                 });
                 (
                     tool,

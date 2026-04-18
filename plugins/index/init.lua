@@ -2,6 +2,7 @@ local indexer = require("indexer")
 
 maki.api.register_tool({
   name = "index",
+  summary_key = "path",
   description = "Return a compact overview of a source file: imports, type definitions, function signatures, and structure with their line numbers surrounded by []. ~70-90% more efficient than reading the full file.\n\n- Use this FIRST to understand file structure before using read with offset/limit.\n- Supports source files in different programming languages and markdown.\n- Falls back with an error on unsupported languages. Use read instead.",
   schema = {
     type = "object",
