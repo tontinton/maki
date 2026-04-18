@@ -197,16 +197,16 @@ fn toggle_mode_state_machine() {
 
     tab(&mut app);
     assert_eq!(app.state.mode, Mode::Build);
-    assert!(!app.state.plan.is_written());
+    assert!(!app.state.plan.is_ready());
 
     tab(&mut app);
     assert_eq!(app.state.mode, Mode::Plan);
     assert_eq!(app.state.plan.path().unwrap(), first_path);
 
-    app.state.plan.mark_written();
+    app.state.plan.mark_ready();
     tab(&mut app);
     assert_eq!(app.state.mode, Mode::Build);
-    assert!(app.state.plan.is_written());
+    assert!(app.state.plan.is_ready());
     assert_eq!(app.state.plan.path().unwrap(), first_path);
 
     app.state.mode = Mode::Build;
@@ -220,7 +220,7 @@ fn toggle_mode_state_machine() {
 #[test_case(ToolOutput::WriteCode { path: "/tmp/plans/test.md".into(), byte_count: 100, lines: vec![] }, true  ; "write_matching")]
 #[test_case(ToolOutput::Diff { path: "/tmp/plans/test.md".into(), before: String::new(), after: String::new(), summary: String::new() }, true  ; "edit_matching")]
 #[test_case(ToolOutput::WriteCode { path: "/tmp/other.rs".into(), byte_count: 100, lines: vec![] }, false ; "write_non_matching")]
-fn tool_done_sets_plan_written_flag(output: ToolOutput, expect_written: bool) {
+fn tool_done_transitions_plan_to_ready(output: ToolOutput, expect_ready: bool) {
     let mut app = test_app();
     app.state.mode = Mode::Plan;
     app.state.plan = PlanState::Drafting(PathBuf::from("/tmp/plans/test.md"));
@@ -234,7 +234,7 @@ fn tool_done_sets_plan_written_flag(output: ToolOutput, expect_written: bool) {
         is_error: false,
     }))));
 
-    assert_eq!(app.state.plan.is_written(), expect_written);
+    assert_eq!(app.state.plan.is_ready(), expect_ready);
 }
 
 #[test]
@@ -400,7 +400,7 @@ fn reset_session_clears_plan() {
     app.state.token_usage.input = 500;
     app.chats[0].context_size = 1000;
     app.state.mode = Mode::Build;
-    app.state.plan = PlanState::Written(PathBuf::from("plan.md"));
+    app.state.plan = PlanState::Ready(PathBuf::from("plan.md"));
     app.queue_and_notify(queued_msg("q"));
     app.queue.set_focus_at(0);
     app.update(Msg::Key(kb::HELP.to_key_event()));
@@ -477,7 +477,7 @@ fn load_session_clears_plan() {
     app.state.session.save(&app.storage).unwrap();
     let id = app.state.session.id.clone();
     app.state.mode = Mode::Build;
-    app.state.plan = PlanState::Written(PathBuf::from("old-plan.md"));
+    app.state.plan = PlanState::Ready(PathBuf::from("old-plan.md"));
     app.load_session(id);
     assert_eq!(app.state.mode, Mode::Build);
     assert_eq!(app.state.plan.path(), None);
@@ -1703,7 +1703,7 @@ fn paste_routing(setup: fn(&mut App), expected_input: &str) {
 
 #[test_case(PlanState::None,                                       true  ; "no_plan")]
 #[test_case(PlanState::Drafting(PathBuf::from("/tmp/plan.md")),     false ; "plan_drafting")]
-#[test_case(PlanState::Written(PathBuf::from("/tmp/plan.md")),      false ; "plan_written")]
+#[test_case(PlanState::Ready(PathBuf::from("/tmp/plan.md")),       false ; "plan_ready")]
 fn open_editor(plan: PlanState, expect_flash: bool) {
     let mut app = test_app();
     let plan_path = plan.path().map(Path::to_path_buf);
@@ -1863,21 +1863,97 @@ fn plan_app() -> App {
     app.status = Status::Streaming;
     app.run_id = 1;
     app.state.mode = Mode::Plan;
-    app.state.plan = PlanState::Written(PathBuf::from("test-plan.md"));
+    app.state.plan = PlanState::Drafting(PathBuf::from("test-plan.md"));
+    app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+        id: "t1".into(),
+        tool: "write".into(),
+        output: ToolOutput::WriteCode {
+            path: "test-plan.md".into(),
+            byte_count: 42,
+            lines: vec![],
+        },
+        is_error: false,
+    }))));
     app
 }
 
-#[test_case(Mode::Plan,  PlanState::Written(PathBuf::from("test-plan.md")),  true  ; "plan_mode_written_opens_form")]
-#[test_case(Mode::Plan,  PlanState::Drafting(PathBuf::from("test-plan.md")), false ; "plan_mode_unwritten_no_form")]
-#[test_case(Mode::Build, PlanState::None,                                    false ; "build_mode_no_form")]
-fn done_plan_form_visibility(mode: Mode, plan: PlanState, expect_form: bool) {
+#[test_case(Mode::Plan,  true  ; "plan_mode_tooldone_opens_form")]
+#[test_case(Mode::Build, false ; "build_mode_tooldone_no_form")]
+fn tool_done_write_opens_plan_form(mode: Mode, expect_form: bool) {
     let mut app = test_app();
     app.status = Status::Streaming;
     app.run_id = 1;
     app.state.mode = mode;
-    app.state.plan = plan;
-    app.update(done_event());
+    app.state.plan = PlanState::Drafting(PathBuf::from("/tmp/plans/test.md"));
+    app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+        id: "t1".into(),
+        tool: "write".into(),
+        output: ToolOutput::WriteCode {
+            path: "/tmp/plans/test.md".into(),
+            byte_count: 42,
+            lines: vec![],
+        },
+        is_error: false,
+    }))));
     assert_eq!(app.plan_form.is_visible(), expect_form);
+    if expect_form {
+        assert!(app.state.plan.is_ready());
+    }
+}
+
+#[test]
+fn done_event_does_not_open_plan_form() {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    app.state.mode = Mode::Plan;
+    app.state.plan = PlanState::Ready(PathBuf::from("test-plan.md"));
+    app.update(done_event());
+    assert!(!app.plan_form.is_visible());
+}
+
+#[test]
+fn question_demotes_ready_to_drafting() {
+    let mut app = plan_app();
+    assert!(app.state.plan.is_ready());
+    assert!(app.plan_form.is_visible());
+
+    app.update(agent_msg(AgentEvent::QuestionPrompt {
+        id: "q1".into(),
+        questions: vec![QuestionInfo {
+            question: "Pick one".into(),
+            header: "Choice".into(),
+            options: vec![QuestionOption {
+                label: "A".into(),
+                description: String::new(),
+            }],
+            multiple: false,
+        }],
+    }));
+    assert!(matches!(app.state.plan, PlanState::Drafting(_)));
+    assert!(!app.plan_form.is_visible());
+    assert!(app.question_form.is_visible());
+}
+
+#[test]
+fn re_edit_closes_plan_form() {
+    let mut app = plan_app();
+    assert!(app.state.plan.is_ready());
+    assert!(app.plan_form.is_visible());
+
+    // Agent edits the plan again (second write to same path)
+    app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+        id: "t2".into(),
+        tool: "write".into(),
+        output: ToolOutput::WriteCode {
+            path: "test-plan.md".into(),
+            byte_count: 50,
+            lines: vec![],
+        },
+        is_error: false,
+    }))));
+    assert!(matches!(app.state.plan, PlanState::Drafting(_)));
+    assert!(!app.plan_form.is_visible());
 }
 
 #[test_case(0, Mode::Build, true,  true  ; "clear_and_implement")]
@@ -1890,7 +1966,6 @@ fn plan_form_menu_options(
     has_send_message: bool,
 ) {
     let mut app = plan_app();
-    app.update(done_event());
     assert!(app.plan_form.is_visible());
 
     for _ in 0..downs {
@@ -1912,7 +1987,6 @@ fn plan_form_menu_options(
 #[test]
 fn implement_plan_clear_context_does_not_leak_plan_state() {
     let mut app = plan_app();
-    app.update(done_event());
     assert!(app.plan_form.is_visible());
     app.update(Msg::Key(key(KeyCode::Enter)));
     assert_eq!(app.state.mode, Mode::Build);
@@ -1922,7 +1996,6 @@ fn implement_plan_clear_context_does_not_leak_plan_state() {
 #[test]
 fn plan_form_open_editor() {
     let mut app = plan_app();
-    app.update(done_event());
 
     let actions = app.update(Msg::Key(kb::OPEN_EDITOR.to_key_event()));
     assert!(app.plan_form.is_visible());
@@ -1932,7 +2005,6 @@ fn plan_form_open_editor() {
 #[test]
 fn plan_form_dismiss_on_esc() {
     let mut app = plan_app();
-    app.update(done_event());
 
     let actions = app.update(Msg::Key(key(KeyCode::Esc)));
     assert!(!app.plan_form.is_visible());
@@ -1942,7 +2014,6 @@ fn plan_form_dismiss_on_esc() {
 #[test]
 fn reset_session_closes_plan_form() {
     let mut app = plan_app();
-    app.update(done_event());
     assert!(app.plan_form.is_visible());
 
     app.reset_session();

@@ -48,7 +48,7 @@ impl SessionState {
         let mut plan = match &session.meta.plan_path {
             Some(p) if Path::new(p).exists() => {
                 if session.meta.plan_written {
-                    PlanState::Written(PathBuf::from(p))
+                    PlanState::Ready(PathBuf::from(p))
                 } else {
                     PlanState::Drafting(PathBuf::from(p))
                 }
@@ -95,7 +95,7 @@ impl SessionState {
         self.session.meta.context_size = self.context_size;
         self.session.meta.mode = Some(self.mode.into());
         self.session.meta.plan_path = self.plan.path().map(|p| p.to_string_lossy().into_owned());
-        self.session.meta.plan_written = self.plan.is_written();
+        self.session.meta.plan_written = self.plan.is_ready();
         self.session.meta.session_rules = rules_to_stored(&permissions.session_rules_snapshot());
         self.session.meta.thinking = Some(self.thinking.into());
         self.session.updated_at = maki_storage::now_epoch();

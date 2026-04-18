@@ -31,25 +31,31 @@ pub(crate) enum PlanState {
     #[default]
     None,
     Drafting(PathBuf),
-    Written(PathBuf),
+    Ready(PathBuf),
 }
 
 impl PlanState {
     pub(crate) fn path(&self) -> Option<&Path> {
         match self {
             Self::None => Option::None,
-            Self::Drafting(p) | Self::Written(p) => Some(p),
+            Self::Drafting(p) | Self::Ready(p) => Some(p),
         }
     }
 
-    pub(crate) fn mark_written(&mut self) {
+    pub(crate) fn mark_ready(&mut self) {
         if let Self::Drafting(p) = self {
-            *self = Self::Written(std::mem::take(p));
+            *self = Self::Ready(std::mem::take(p));
         }
     }
 
-    pub(crate) fn is_written(&self) -> bool {
-        matches!(self, Self::Written(_))
+    pub(crate) fn mark_drafting(&mut self) {
+        if let Self::Ready(p) = self {
+            *self = Self::Drafting(std::mem::take(p));
+        }
+    }
+
+    pub(crate) fn is_ready(&self) -> bool {
+        matches!(self, Self::Ready(_))
     }
 
     pub(crate) fn allocate_path(&mut self, storage: &DataDir) {

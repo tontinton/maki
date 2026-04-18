@@ -866,7 +866,13 @@ impl App {
             if self.state.mode == Mode::Plan
                 && self.state.plan.path().is_some_and(|pp| e.wrote_to(pp))
             {
-                self.state.plan.mark_written();
+                if !self.state.plan.is_ready() {
+                    self.state.plan.mark_ready();
+                    self.plan_form.open();
+                } else {
+                    self.state.plan.mark_drafting();
+                    self.plan_form.close();
+                }
             }
             if let Some(ref outputs) = self.shared_tool_outputs {
                 outputs
@@ -947,9 +953,6 @@ impl App {
                     self.chat_index.clear();
                     self.subagent_answers.clear();
                     self.status = Status::Idle;
-                    if self.state.mode == Mode::Plan && self.state.plan.is_written() {
-                        self.plan_form.open();
-                    }
                     if self.exit_on_done {
                         self.exit_request = ExitRequest::Success;
                     }
@@ -969,6 +972,10 @@ impl App {
                     }
                 }
                 ChatEventResult::QuestionPrompt { questions } => {
+                    if self.state.plan.is_ready() {
+                        self.state.plan.mark_drafting();
+                        self.plan_form.close();
+                    }
                     if QuestionForm::is_form_suitable(&questions) {
                         self.question_form.open(questions);
                     } else {
@@ -1407,7 +1414,7 @@ impl App {
 
     fn implement_plan(&mut self, clear_context: bool) -> Vec<Action> {
         let plan_snapshot = match std::mem::take(&mut self.state.plan) {
-            PlanState::Written(p) => Some((
+            PlanState::Ready(p) | PlanState::Drafting(p) => Some((
                 std::fs::read_to_string(&p).unwrap_or_default(),
                 p.display().to_string(),
             )),
