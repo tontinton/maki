@@ -143,6 +143,20 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             context_window: 200_000,
         },
         ModelEntry {
+            prefixes: &["claude-sonnet-4-6-1m"],
+            tier: ModelTier::Medium,
+            family: ModelFamily::Claude,
+            default: false,
+            pricing: ModelPricing {
+                input: 3.00,
+                output: 15.00,
+                cache_write: 3.75,
+                cache_read: 0.30,
+            },
+            max_output_tokens: 64000,
+            context_window: 1_000_000,
+        },
+        ModelEntry {
             prefixes: &["claude-sonnet-4-6"],
             tier: ModelTier::Medium,
             family: ModelFamily::Claude,
@@ -171,6 +185,20 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             context_window: 200_000,
         },
         ModelEntry {
+            prefixes: &["claude-opus-4-7-1m"],
+            tier: ModelTier::Strong,
+            family: ModelFamily::Claude,
+            default: false,
+            pricing: ModelPricing {
+                input: 5.00,
+                output: 25.00,
+                cache_write: 6.25,
+                cache_read: 0.50,
+            },
+            max_output_tokens: 128000,
+            context_window: 1_000_000,
+        },
+        ModelEntry {
             prefixes: &["claude-opus-4-7"],
             tier: ModelTier::Strong,
             family: ModelFamily::Claude,
@@ -183,6 +211,20 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: 128000,
             context_window: 200_000,
+        },
+        ModelEntry {
+            prefixes: &["claude-opus-4-6-1m"],
+            tier: ModelTier::Strong,
+            family: ModelFamily::Claude,
+            default: false,
+            pricing: ModelPricing {
+                input: 5.00,
+                output: 25.00,
+                cache_write: 6.25,
+                cache_read: 0.50,
+            },
+            max_output_tokens: 128000,
+            context_window: 1_000_000,
         },
         ModelEntry {
             prefixes: &["claude-opus-4-6"],
