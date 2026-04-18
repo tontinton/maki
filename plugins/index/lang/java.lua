@@ -15,16 +15,25 @@ return function(U)
 
   local function modifiers_text(node, source)
     local mods = find_child(node, "modifiers")
-    if not mods then return "" end
+    if not mods then
+      return ""
+    end
     local parts = {}
     for _, child in ipairs(mods:children()) do
       local ck = child:type()
       local text = get_text(child, source)
       if ck == "marker_annotation" or ck == "annotation" then
         parts[#parts + 1] = text
-      elseif text:match("^public$") or text:match("^private$") or text:match("^protected$")
-          or text:match("^static$") or text:match("^final$") or text:match("^abstract$")
-          or text:match("^default$") or text:match("^synchronized$") then
+      elseif
+        text:match("^public$")
+        or text:match("^private$")
+        or text:match("^protected$")
+        or text:match("^static$")
+        or text:match("^final$")
+        or text:match("^abstract$")
+        or text:match("^default$")
+        or text:match("^synchronized$")
+      then
         parts[#parts + 1] = text
       end
     end
@@ -39,7 +48,9 @@ return function(U)
   local function method_sig(node, source)
     local mods = modifiers_text(node, source)
     local name_node = node:field("name")[1]
-    if not name_node then return nil end
+    if not name_node then
+      return nil
+    end
     local name = get_text(name_node, source)
     local ret_node = node:field("type")[1]
     local ret = ret_node and (get_text(ret_node, source) .. " ") or ""
@@ -59,33 +70,39 @@ return function(U)
   end
 
   local CLASS_RULES = {
-    { kind = "method_declaration",      handler = "method", fn = method_sig },
+    { kind = "method_declaration", handler = "method", fn = method_sig },
     { kind = "constructor_declaration", handler = "method", fn = method_sig },
-    { kind = "field_declaration",       handler = "field",  fn = field_text, counter = "field" },
+    { kind = "field_declaration", handler = "field", fn = field_text, counter = "field" },
   }
 
   local INTERFACE_RULES = {
-    { kind = "method_declaration",   handler = "method", fn = method_sig },
-    { kind = "constant_declaration", handler = "field",  fn = field_text, counter = "field" },
+    { kind = "method_declaration", handler = "method", fn = method_sig },
+    { kind = "constant_declaration", handler = "field", fn = field_text, counter = "field" },
   }
 
   local function type_list_text(parent, source)
     local tl = find_child(parent, "type_list")
-    if tl then return get_text(tl, source) end
+    if tl then
+      return get_text(tl, source)
+    end
     local raw = get_text(parent, source)
     return raw:gsub("^extends%s*", ""):gsub("^implements%s*", "")
   end
 
   local function implements_clause(node, source)
     local ifaces = node:field("interfaces")[1]
-    if not ifaces then return "" end
+    if not ifaces then
+      return ""
+    end
     return " implements " .. type_list_text(ifaces, source)
   end
 
   local function extract_class(node, source)
     local mods = modifiers_text(node, source)
     local name_node = node:field("name")[1]
-    if not name_node then return nil end
+    if not name_node then
+      return nil
+    end
     local name = get_text(name_node, source)
     local tparams = tparams_text(node, source)
     local super_node = node:field("superclass")[1]
@@ -95,39 +112,52 @@ return function(U)
       super = " extends " .. get_text(type_id or super_node, source)
     end
     local interfaces = implements_clause(node, source)
-    local label = compact_ws(mods ~= "" and (mods .. " class " .. name .. tparams .. super .. interfaces)
-                             or ("class " .. name .. tparams .. super .. interfaces))
+    local label = compact_ws(
+      mods ~= "" and (mods .. " class " .. name .. tparams .. super .. interfaces)
+        or ("class " .. name .. tparams .. super .. interfaces)
+    )
     local entry = new_entry(SECTION.Class, node, label)
     local body = find_child(node, "class_body")
-    if body then entry.children = extract_body_members(body, source, CLASS_RULES) end
+    if body then
+      entry.children = extract_body_members(body, source, CLASS_RULES)
+    end
     return entry
   end
 
   local function extract_interface(node, source)
     local mods = modifiers_text(node, source)
     local name_node = node:field("name")[1]
-    if not name_node then return nil end
+    if not name_node then
+      return nil
+    end
     local name = get_text(name_node, source)
     local tparams = tparams_text(node, source)
     local ext_node = find_child(node, "extends_interfaces")
     local ext_str = ext_node and (" extends " .. type_list_text(ext_node, source)) or ""
-    local label = compact_ws(mods ~= "" and (mods .. " interface " .. name .. tparams .. ext_str)
-                             or ("interface " .. name .. tparams .. ext_str))
+    local label = compact_ws(
+      mods ~= "" and (mods .. " interface " .. name .. tparams .. ext_str)
+        or ("interface " .. name .. tparams .. ext_str)
+    )
     local entry = new_entry(SECTION.Trait, node, label)
     local body = find_child(node, "interface_body")
-    if body then entry.children = extract_body_members(body, source, INTERFACE_RULES) end
+    if body then
+      entry.children = extract_body_members(body, source, INTERFACE_RULES)
+    end
     return entry
   end
 
   local function extract_enum(node, source)
     local mods = modifiers_text(node, source)
     local name_node = node:field("name")[1]
-    if not name_node then return nil end
+    if not name_node then
+      return nil
+    end
     local name = get_text(name_node, source)
     local tparams = tparams_text(node, source)
     local interfaces = implements_clause(node, source)
-    local label = compact_ws(mods ~= "" and (mods .. " enum " .. name .. tparams .. interfaces)
-                             or ("enum " .. name .. tparams .. interfaces))
+    local label = compact_ws(
+      mods ~= "" and (mods .. " enum " .. name .. tparams .. interfaces) or ("enum " .. name .. tparams .. interfaces)
+    )
     local entry = new_entry(SECTION.Type, node, label)
     local body = find_child(node, "enum_body")
     if body then
@@ -140,21 +170,27 @@ return function(U)
   local function extract_record(node, source)
     local mods = modifiers_text(node, source)
     local name_node = node:field("name")[1]
-    if not name_node then return nil end
+    if not name_node then
+      return nil
+    end
     local name = get_text(name_node, source)
     local tparams = tparams_text(node, source)
     local params_node = find_child(node, "formal_parameters")
     local params = params_node and get_text(params_node, source) or ""
     local interfaces = implements_clause(node, source)
-    local label = compact_ws(mods ~= "" and (mods .. " record " .. name .. tparams .. params .. interfaces)
-                             or ("record " .. name .. tparams .. params .. interfaces))
+    local label = compact_ws(
+      mods ~= "" and (mods .. " record " .. name .. tparams .. params .. interfaces)
+        or ("record " .. name .. tparams .. params .. interfaces)
+    )
     return new_entry(SECTION.Class, node, label)
   end
 
   local function extract_annotation_type(node, source)
     local mods = modifiers_text(node, source)
     local name_node = node:field("name")[1]
-    if not name_node then return nil end
+    if not name_node then
+      return nil
+    end
     local name = get_text(name_node, source)
     local label = compact_ws(mods ~= "" and (mods .. " @interface " .. name) or ("@interface " .. name))
     return new_entry(SECTION.Type, node, label)
@@ -170,7 +206,9 @@ return function(U)
     import_separator = ".",
 
     is_doc_comment = function(node, source)
-      if node:type() ~= "block_comment" then return false end
+      if node:type() ~= "block_comment" then
+        return false
+      end
       return get_text(node, source):sub(1, 3) == "/**"
     end,
 

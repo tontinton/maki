@@ -12,12 +12,14 @@ return function(U)
   local SECTION = U.SECTION
 
   local function strip_quotes(s)
-    return s:match('^["\'](.+)["\']$') or s
+    return s:match("^[\"'](.+)[\"']$") or s
   end
 
   local function split_path(s, sep)
     local path = {}
-    for part in s:gmatch("[^" .. sep .. "]+") do path[#path + 1] = part end
+    for part in s:gmatch("[^" .. sep .. "]+") do
+      path[#path + 1] = part
+    end
     return path
   end
 
@@ -50,13 +52,17 @@ return function(U)
         end
       end
     end
-    if #paths == 0 then return nil end
+    if #paths == 0 then
+      return nil
+    end
     return new_import_entry(node, paths)
   end
 
   local function extract_function(node, source)
     local name_node = node:field("name")[1]
-    if not name_node then return nil end
+    if not name_node then
+      return nil
+    end
     local sig = get_text(name_node, source) .. params_result(node, source)
     return new_entry(SECTION.Function, node, sig)
   end
@@ -64,7 +70,9 @@ return function(U)
   local function extract_method(node, source)
     local recv_node = node:field("receiver")[1]
     local name_node = node:field("name")[1]
-    if not name_node then return nil end
+    if not name_node then
+      return nil
+    end
     local recv = recv_node and (get_text(recv_node, source) .. " ") or ""
     local sig = recv .. get_text(name_node, source) .. params_result(node, source)
     return new_entry(SECTION.Impl, node, sig)
@@ -154,7 +162,9 @@ return function(U)
 
   return {
     import_separator = "/",
-    is_doc_comment = function(node, _source) return node:type() == "comment" end,
+    is_doc_comment = function(node, _source)
+      return node:type() == "comment"
+    end,
 
     extract_nodes = function(node, source, _attrs)
       local kind = node:type()
@@ -162,21 +172,16 @@ return function(U)
       if kind == "import_declaration" then
         local e = extract_import(node, source)
         return e and { e } or {}
-
       elseif kind == "function_declaration" then
         local e = extract_function(node, source)
         return e and { e } or {}
-
       elseif kind == "method_declaration" then
         local e = extract_method(node, source)
         return e and { e } or {}
-
       elseif kind == "type_declaration" then
         return extract_type_declaration(node, source)
-
       elseif kind == "const_declaration" then
         return extract_const_var(node, source, false)
-
       elseif kind == "var_declaration" then
         return extract_const_var(node, source, true)
       end

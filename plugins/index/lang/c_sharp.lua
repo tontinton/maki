@@ -15,10 +15,22 @@ return function(U)
   local line_end = U.line_end
 
   local MODIFIER_KEYWORDS = {
-    public = true, private = true, protected = true, internal = true,
-    static = true, abstract = true, sealed = true, override = true,
-    virtual = true, async = true, readonly = true, extern = true,
-    partial = true, new = true, unsafe = true, volatile = true,
+    public = true,
+    private = true,
+    protected = true,
+    internal = true,
+    static = true,
+    abstract = true,
+    sealed = true,
+    override = true,
+    virtual = true,
+    async = true,
+    readonly = true,
+    extern = true,
+    partial = true,
+    new = true,
+    unsafe = true,
+    volatile = true,
   }
 
   local function modifiers_text_free(node, source)
@@ -27,7 +39,9 @@ return function(U)
       local ckind = child:type()
       if ckind == "modifier" then
         local t = get_text(child, source)
-        if MODIFIER_KEYWORDS[t] then parts[#parts + 1] = t end
+        if MODIFIER_KEYWORDS[t] then
+          parts[#parts + 1] = t
+        end
       elseif ckind == "attribute_list" then
         parts[#parts + 1] = get_text(child, source)
       end
@@ -37,7 +51,9 @@ return function(U)
 
   local function base_list_text(node, source)
     local bl = find_child(node, "base_list")
-    if not bl then return "" end
+    if not bl then
+      return ""
+    end
     local t = get_text(bl, source):match("^%s*(.-)%s*$")
     t = t:gsub("^:", ""):match("^%s*(.-)%s*$")
     return " : " .. t
@@ -48,7 +64,9 @@ return function(U)
     local ret = node:field("returns")[1] or node:field("type")[1]
     local ret_str = ret and (get_text(ret, source) .. " ") or ""
     local name_node = node:field("name")[1]
-    if not name_node then return nil end
+    if not name_node then
+      return nil
+    end
     local name = get_text(name_node, source)
     local params_node = find_child(node, "parameter_list")
     local params = params_node and get_text(params_node, source) or "()"
@@ -58,14 +76,18 @@ return function(U)
   local function field_text_free(node, source)
     local mods = modifiers_text_free(node, source)
     local decl = find_child(node, "variable_declaration")
-    if not decl then return compact_ws(prefixed(mods, get_text(node, source))) end
+    if not decl then
+      return compact_ws(prefixed(mods, get_text(node, source)))
+    end
     local type_node = decl:field("type")[1]
     local type_str = type_node and get_text(type_node, source) or "_"
     local names = {}
     for _, child in ipairs(decl:children()) do
       if child:type() == "variable_declarator" then
         local nn = child:field("name")[1]
-        if nn then names[#names + 1] = get_text(nn, source) end
+        if nn then
+          names[#names + 1] = get_text(nn, source)
+        end
       end
     end
     local name_str = #names > 0 and table.concat(names, ", ") or "_"
@@ -82,21 +104,23 @@ return function(U)
   end
 
   local CLASS_RULES = {
-    { kind = "method_declaration",      handler = "method", fn = method_signature_free },
+    { kind = "method_declaration", handler = "method", fn = method_signature_free },
     { kind = "constructor_declaration", handler = "method", fn = method_signature_free },
-    { kind = "field_declaration",       handler = "field",  fn = field_text_free,     counter = "field" },
-    { kind = "property_declaration",    handler = "field",  fn = property_text_free,  counter = "field" },
+    { kind = "field_declaration", handler = "field", fn = field_text_free, counter = "field" },
+    { kind = "property_declaration", handler = "field", fn = property_text_free, counter = "field" },
   }
 
   local INTERFACE_RULES = {
-    { kind = "method_declaration",   handler = "method", fn = method_signature_free },
-    { kind = "property_declaration", handler = "field",  fn = property_text_free,   counter = "field" },
+    { kind = "method_declaration", handler = "method", fn = method_signature_free },
+    { kind = "property_declaration", handler = "field", fn = property_text_free, counter = "field" },
   }
 
   local function extract_class_like(node, source, section, keyword)
     local mods = modifiers_text_free(node, source)
     local name_node = node:field("name")[1]
-    if not name_node then return nil end
+    if not name_node then
+      return nil
+    end
     local name = get_text(name_node, source)
     local bases = base_list_text(node, source)
     local text = compact_ws(prefixed(mods, keyword .. " " .. name .. " " .. bases))
@@ -111,7 +135,9 @@ return function(U)
   local function extract_interface(node, source)
     local mods = modifiers_text_free(node, source)
     local name_node = node:field("name")[1]
-    if not name_node then return nil end
+    if not name_node then
+      return nil
+    end
     local name = get_text(name_node, source)
     local bases = base_list_text(node, source)
     local text = compact_ws(prefixed(mods, "interface " .. name .. bases))
@@ -126,7 +152,9 @@ return function(U)
   local function extract_enum(node, source)
     local mods = modifiers_text_free(node, source)
     local name_node = node:field("name")[1]
-    if not name_node then return nil end
+    if not name_node then
+      return nil
+    end
     local name = get_text(name_node, source)
     local text = compact_ws(prefixed(mods, "enum " .. name))
     local entry = new_entry(SECTION.Type, node, text)
@@ -141,7 +169,9 @@ return function(U)
   local function extract_record(node, source)
     local mods = modifiers_text_free(node, source)
     local name_node = node:field("name")[1]
-    if not name_node then return nil end
+    if not name_node then
+      return nil
+    end
     local name = get_text(name_node, source)
     local params_node = find_child(node, "parameter_list")
     local params = params_node and get_text(params_node, source) or ""
@@ -152,7 +182,9 @@ return function(U)
 
   local function extract_namespace(node, source)
     local name_node = node:field("name")[1]
-    if not name_node then return nil end
+    if not name_node then
+      return nil
+    end
     return new_entry(SECTION.Module, node, get_text(name_node, source))
   end
 
@@ -161,7 +193,9 @@ return function(U)
 
     is_doc_comment = function(node, source)
       local kind = node:type()
-      if kind == "single_line_doc_comment" then return true end
+      if kind == "single_line_doc_comment" then
+        return true
+      end
       if kind == "comment" then
         return get_text(node, source):sub(1, 3) == "///"
       end
@@ -171,7 +205,7 @@ return function(U)
     extract_nodes = function(node, source, _attrs)
       local kind = node:type()
       if kind == "using_directive" then
-        return { simple_import(node, source, {"using%s+"}, ".") }
+        return { simple_import(node, source, { "using%s+" }, ".") }
       elseif kind == "namespace_declaration" or kind == "file_scoped_namespace_declaration" then
         local e = extract_namespace(node, source)
         return e and { e } or {}

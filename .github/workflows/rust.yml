@@ -28,12 +28,22 @@ env:
 
 jobs:
   fmt:
-    name: Format
+    name: Format (Rust)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: extractions/setup-just@v2
-      - run: just fmt-check
+      - run: cargo fmt --all -- --check
+
+  fmt-lua:
+    name: Format (Lua)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: JohnnyMorganz/stylua-action@v4
+        with:
+          token: ${{ github.token }}
+          version: latest
+          args: --check plugins/
 
   lint:
     name: Lint

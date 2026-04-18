@@ -18,9 +18,11 @@ lint-fix:
 
 fmt-check:
     cargo fmt --all -- --check
+    stylua --check plugins/
 
 fmt:
     cargo fmt --all
+    stylua plugins/
 
 pylint:
     ruff check scripts/

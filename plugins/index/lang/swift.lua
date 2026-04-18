@@ -14,15 +14,16 @@ return function(U)
 
   local function modifiers_text(node, source)
     local mods = find_child(node, "modifiers")
-    if not mods then return "" end
+    if not mods then
+      return ""
+    end
     local parts = {}
     for _, child in ipairs(mods:children()) do
       local ckind = child:type()
       if ckind == "visibility_modifier" then
         local t = get_text(child, source)
         parts[#parts + 1] = t:match("^(%S+)") or t
-      elseif ckind == "function_modifier" or ckind == "member_modifier"
-          or ckind == "mutation_modifier" then
+      elseif ckind == "function_modifier" or ckind == "member_modifier" or ckind == "mutation_modifier" then
         parts[#parts + 1] = get_text(child, source)
       end
     end
@@ -51,7 +52,10 @@ return function(U)
     local keyword = "func"
     for _, child in ipairs(node:children()) do
       local t = child:type()
-      if t == "func" or t == "init" then keyword = t; break end
+      if t == "func" or t == "init" then
+        keyword = t
+        break
+      end
     end
     local name_node = node:field("name")[1]
     local name = name_node and get_text(name_node, source) or ""
@@ -70,10 +74,12 @@ return function(U)
     local keyword = "var"
     for _, child in ipairs(node:children()) do
       local t = child:type()
-      if t == "let" or t == "var" then keyword = t; break end
+      if t == "let" or t == "var" then
+        keyword = t
+        break
+      end
     end
-    local name_node = node:field("name")[1]
-      or find_child(node, "bound_identifier")
+    local name_node = node:field("name")[1] or find_child(node, "bound_identifier")
     local name = name_node and get_text(name_node, source) or "_"
     local type_node = find_child(node, "type_annotation")
     local type_str = type_node and (" " .. get_text(type_node, source)) or ""
@@ -82,28 +88,34 @@ return function(U)
 
   local function inheritance_text(node, source)
     local inh = find_child(node, "inheritance_specifier")
-    if not inh then return "" end
+    if not inh then
+      return ""
+    end
     local parts = {}
     for _, child in ipairs(inh:children()) do
       local ckind = child:type()
       if ckind ~= "," and ckind ~= ":" then
         local t = get_text(child, source):match("^%s*(.-)%s*$")
-        if #t > 0 then parts[#parts + 1] = t end
+        if #t > 0 then
+          parts[#parts + 1] = t
+        end
       end
     end
     return #parts > 0 and (": " .. table.concat(parts, ", ")) or ""
   end
 
   local CLASS_RULES = {
-    { kind = "function_declaration",  handler = "method", fn = swift_fn_signature },
-    { kind = "init_declaration",      handler = "method", fn = swift_fn_signature },
-    { kind = "property_declaration",  handler = "field",  fn = property_text_str, counter = "field" },
+    { kind = "function_declaration", handler = "method", fn = swift_fn_signature },
+    { kind = "init_declaration", handler = "method", fn = swift_fn_signature },
+    { kind = "property_declaration", handler = "field", fn = property_text_str, counter = "field" },
   }
 
   local function extract_class_like(node, source, section, keyword)
     local mods = modifiers_text(node, source)
     local name_node = node:field("name")[1]
-    if not name_node then return nil end
+    if not name_node then
+      return nil
+    end
     local name = get_text(name_node, source)
     local inh = inheritance_text(node, source)
     local text = compact_ws(prefixed(mods, keyword .. " " .. name .. inh))
@@ -118,13 +130,17 @@ return function(U)
   local function extract_enum_body(node, source)
     local mods = modifiers_text(node, source)
     local name_node = node:field("name")[1]
-    if not name_node then return nil end
+    if not name_node then
+      return nil
+    end
     local name = get_text(name_node, source)
     local inh = inheritance_text(node, source)
     local text = compact_ws(prefixed(mods, "enum " .. name .. inh))
     local entry = new_entry(SECTION.Type, node, text)
     local body = find_child(node, "enum_class_body")
-    if not body then return entry end
+    if not body then
+      return entry
+    end
     local children = {}
     for _, child in ipairs(body:children()) do
       local ckind = child:type()
@@ -158,7 +174,9 @@ return function(U)
     cleaned = cleaned:match("^%s*(.-)%s*$")
     local last = cleaned:match("%S+$") or cleaned
     local parts = {}
-    for seg in last:gmatch("[^%.]+") do parts[#parts + 1] = seg end
+    for seg in last:gmatch("[^%.]+") do
+      parts[#parts + 1] = seg
+    end
     return new_import_entry(node, { parts })
   end
 
@@ -174,14 +192,18 @@ return function(U)
 
   local function extract_function(node, source)
     local sig = swift_fn_signature(node, source)
-    if not sig then return nil end
+    if not sig then
+      return nil
+    end
     return new_entry(SECTION.Function, node, sig)
   end
 
   local function extract_typealias(node, source)
     local mods = modifiers_text(node, source)
     local name_node = node:field("name")[1]
-    if not name_node then return nil end
+    if not name_node then
+      return nil
+    end
     local name = get_text(name_node, source)
     local val_node = node:field("value")[1]
     local val_str = val_node and (" = " .. get_text(val_node, source)) or ""
@@ -189,20 +211,27 @@ return function(U)
   end
 
   local PROTOCOL_RULES = {
-    { kind = "protocol_function_declaration",  handler = "method", fn = swift_fn_signature },
-    { kind = "protocol_property_declaration",  handler = "field",  fn = function(n, source)
+    { kind = "protocol_function_declaration", handler = "method", fn = swift_fn_signature },
+    {
+      kind = "protocol_property_declaration",
+      handler = "field",
+      fn = function(n, source)
         local nn = find_child(n, "simple_identifier") or n:field("name")[1]
         local name = nn and get_text(nn, source) or "_"
         local type_node = find_child(n, "type_annotation")
         local type_str = type_node and (" " .. get_text(type_node, source)) or ""
         return compact_ws("var " .. name .. type_str)
-      end, counter = "field" },
+      end,
+      counter = "field",
+    },
   }
 
   local function extract_protocol(node, source)
     local mods = modifiers_text(node, source)
     local name_node = node:field("name")[1]
-    if not name_node then return nil end
+    if not name_node then
+      return nil
+    end
     local name = get_text(name_node, source)
     local inh = inheritance_text(node, source)
     local text = compact_ws(prefixed(mods, "protocol " .. name .. inh))
@@ -234,7 +263,9 @@ return function(U)
 
     is_doc_comment = function(node, source)
       local kind = node:type()
-      if kind ~= "comment" and kind ~= "multiline_comment" then return false end
+      if kind ~= "comment" and kind ~= "multiline_comment" then
+        return false
+      end
       local text = get_text(node, source)
       return text:sub(1, 3) == "///" or text:sub(1, 3) == "/**"
     end,

@@ -15,14 +15,18 @@ return function(U)
   local DOC_ATTRS = { doc = true, moduledoc = true, typedoc = true, spec = true }
 
   local function call_target(node, source)
-    if node:type() ~= "call" then return nil end
+    if node:type() ~= "call" then
+      return nil
+    end
     local t = node:field("target")[1]
     return t and get_text(t, source) or nil
   end
 
   local function first_arg(node, source)
     local args = find_child(node, "arguments")
-    if not args then return nil end
+    if not args then
+      return nil
+    end
     for _, child in ipairs(args:children()) do
       local ck = child:type()
       if ck ~= "," and ck ~= "(" and ck ~= ")" then
@@ -42,9 +46,13 @@ return function(U)
 
   local function extract_import(node, source)
     local target = call_target(node, source)
-    if not target or not IMPORT_KEYWORDS[target] then return nil end
+    if not target or not IMPORT_KEYWORDS[target] then
+      return nil
+    end
     local arg = first_arg(node, source)
-    if not arg then return nil end
+    if not arg then
+      return nil
+    end
     local arg_text = get_text(arg, source)
     local paths = { split_dot(arg_text) }
     return new_import_entry(node, paths, target)
@@ -52,9 +60,13 @@ return function(U)
 
   local function def_sig(node, source)
     local args = find_child(node, "arguments")
-    if not args then return nil end
+    if not args then
+      return nil
+    end
     local arg = first_arg(node, source)
-    if not arg then return nil end
+    if not arg then
+      return nil
+    end
     local ck = arg:type()
     if ck == "call" or ck == "identifier" or ck == "binary_operator" then
       return get_text(arg, source)
@@ -68,20 +80,30 @@ return function(U)
   end
 
   local function extract_standalone_fn(node, source)
-    if not is_def_call(node, source) then return nil end
+    if not is_def_call(node, source) then
+      return nil
+    end
     local sig = def_sig(node, source)
-    if not sig then return nil end
+    if not sig then
+      return nil
+    end
     local target = call_target(node, source)
     local prefix = target == DEFP and "defp " or "def "
     return new_entry(SECTION.Function, node, compact_ws(prefix .. sig))
   end
 
   local function attr_name(node, source)
-    if node:type() ~= "unary_operator" then return nil end
+    if node:type() ~= "unary_operator" then
+      return nil
+    end
     local op = node:field("operator")[1]
-    if not op or get_text(op, source) ~= "@" then return nil end
+    if not op or get_text(op, source) ~= "@" then
+      return nil
+    end
     local operand = node:field("operand")[1]
-    if not operand then return nil end
+    if not operand then
+      return nil
+    end
     local ok = operand:type()
     if ok == "identifier" or ok == "alias" then
       return get_text(operand, source)
@@ -93,17 +115,27 @@ return function(U)
 
   local function extract_module_attr(node, source)
     local name = attr_name(node, source)
-    if not name then return nil end
-    if DOC_ATTRS[name] then return nil end
-    if not name:match("^[A-Z]") then return nil end
+    if not name then
+      return nil
+    end
+    if DOC_ATTRS[name] then
+      return nil
+    end
+    if not name:match("^[A-Z]") then
+      return nil
+    end
     return new_entry(SECTION.Constant, node, "@" .. name)
   end
 
   local function extract_module(node, source)
     local target = call_target(node, source)
-    if target ~= "defmodule" then return nil end
+    if target ~= "defmodule" then
+      return nil
+    end
     local arg = first_arg(node, source)
-    if not arg then return nil end
+    if not arg then
+      return nil
+    end
     local name = get_text(arg, source)
 
     local do_block = find_child(node, "do_block")
@@ -142,7 +174,9 @@ return function(U)
 
     is_doc_comment = function(node, source)
       local ck = node:type()
-      if ck == "comment" then return true end
+      if ck == "comment" then
+        return true
+      end
       if ck == "unary_operator" then
         local name = attr_name(node, source)
         return name ~= nil and DOC_ATTRS[name] == true
@@ -154,7 +188,9 @@ return function(U)
       local ck = node:type()
       if ck == "call" then
         local imp = extract_import(node, source)
-        if imp then return { imp } end
+        if imp then
+          return { imp }
+        end
         local mod_entry, mod_imports = extract_module(node, source)
         if mod_entry then
           local result = {}
@@ -167,10 +203,14 @@ return function(U)
           return result
         end
         local fn_entry = extract_standalone_fn(node, source)
-        if fn_entry then return { fn_entry } end
+        if fn_entry then
+          return { fn_entry }
+        end
       elseif ck == "unary_operator" then
         local e = extract_module_attr(node, source)
-        if e then return { e } end
+        if e then
+          return { e }
+        end
       end
       return {}
     end,

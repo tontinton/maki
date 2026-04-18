@@ -14,9 +14,13 @@ return function(U)
     local parts = {}
     for _, child in ipairs(node:children()) do
       local ckind = child:type()
-      if ckind == "visibility_modifier" or ckind == "static_modifier"
-        or ckind == "abstract_modifier" or ckind == "final_modifier"
-        or ckind == "readonly_modifier" then
+      if
+        ckind == "visibility_modifier"
+        or ckind == "static_modifier"
+        or ckind == "abstract_modifier"
+        or ckind == "final_modifier"
+        or ckind == "readonly_modifier"
+      then
         parts[#parts + 1] = get_text(child, source)
       end
     end
@@ -29,7 +33,9 @@ return function(U)
       if ckind == "qualified_name" or ckind == "name" then
         local text = get_text(child, source)
         local parts = {}
-        for seg in text:gmatch("[^\\]+") do parts[#parts + 1] = seg end
+        for seg in text:gmatch("[^\\]+") do
+          parts[#parts + 1] = seg
+        end
         return parts
       end
     end
@@ -43,18 +49,26 @@ return function(U)
       local ckind = child:type()
       if ckind == "namespace_use_clause" then
         local p = use_clause_path(child, source)
-        if p then paths[#paths + 1] = p end
+        if p then
+          paths[#paths + 1] = p
+        end
       elseif ckind == "namespace_name" then
         local text = get_text(child, source)
-        for seg in text:gmatch("[^\\]+") do prefix_parts[#prefix_parts + 1] = seg end
+        for seg in text:gmatch("[^\\]+") do
+          prefix_parts[#prefix_parts + 1] = seg
+        end
       elseif ckind == "namespace_use_group" then
         for _, clause in ipairs(child:children()) do
           if clause:type() == "namespace_use_clause" then
             local p = use_clause_path(clause, source)
             if p then
               local full = {}
-              for _, s in ipairs(prefix_parts) do full[#full + 1] = s end
-              for _, s in ipairs(p) do full[#full + 1] = s end
+              for _, s in ipairs(prefix_parts) do
+                full[#full + 1] = s
+              end
+              for _, s in ipairs(p) do
+                full[#full + 1] = s
+              end
               paths[#paths + 1] = full
             end
           end
@@ -80,7 +94,9 @@ return function(U)
   local function method_sig(node, source)
     local mods = modifiers(node, source)
     local name_node = node:field("name")[1]
-    if not name_node then return nil end
+    if not name_node then
+      return nil
+    end
     local name = get_text(name_node, source)
     local params = params_text(node, source)
     local ret = return_type_text(node, source)
@@ -95,20 +111,24 @@ return function(U)
     local name = "_"
     if el then
       local nn = el:field("name")[1]
-      if nn then name = get_text(nn, source) end
+      if nn then
+        name = get_text(nn, source)
+      end
     end
     return compact_ws(prefixed(mods, type_str .. name))
   end
 
   local CLASS_RULES = {
-    { kind = "method_declaration",   handler = "method", fn = method_sig },
-    { kind = "property_declaration", handler = "field",  fn = property_text, counter = "field" },
+    { kind = "method_declaration", handler = "method", fn = method_sig },
+    { kind = "property_declaration", handler = "field", fn = property_text, counter = "field" },
   }
 
   local function extract_class(node, source)
     local mods = modifiers(node, source)
     local name_node = node:field("name")[1]
-    if not name_node then return nil end
+    if not name_node then
+      return nil
+    end
     local name = get_text(name_node, source)
     local base = find_child(node, "base_clause")
     local base_str = ""
@@ -144,7 +164,9 @@ return function(U)
 
   local function extract_interface(node, source)
     local name_node = node:field("name")[1]
-    if not name_node then return nil end
+    if not name_node then
+      return nil
+    end
     local name = get_text(name_node, source)
     local base = find_child(node, "base_clause")
     local base_str = ""
@@ -166,7 +188,9 @@ return function(U)
 
   local function extract_trait(node, source)
     local name_node = node:field("name")[1]
-    if not name_node then return nil end
+    if not name_node then
+      return nil
+    end
     local name = get_text(name_node, source)
     local entry = new_entry(SECTION.Trait, node, name)
     local body = find_child(node, "declaration_list")
@@ -178,7 +202,9 @@ return function(U)
 
   local function extract_function(node, source)
     local name_node = node:field("name")[1]
-    if not name_node then return nil end
+    if not name_node then
+      return nil
+    end
     local name = get_text(name_node, source)
     local params = params_text(node, source)
     local ret = return_type_text(node, source)
@@ -191,17 +217,23 @@ return function(U)
     for _, child in ipairs(node:children()) do
       if child:type() == "const_element" then
         local nn = find_child(child, "name")
-        if nn then names[#names + 1] = get_text(nn, source) end
+        if nn then
+          names[#names + 1] = get_text(nn, source)
+        end
       end
     end
-    if #names == 0 then return nil end
+    if #names == 0 then
+      return nil
+    end
     local text = compact_ws(prefixed(mods, table.concat(names, ", ")))
     return new_entry(SECTION.Constant, node, text)
   end
 
   local function extract_enum(node, source)
     local name_node = node:field("name")[1]
-    if not name_node then return nil end
+    if not name_node then
+      return nil
+    end
     local name = get_text(name_node, source)
     local backing = find_child(node, "primitive_type")
     local backing_str = backing and (": " .. get_text(backing, source)) or ""
@@ -230,7 +262,9 @@ return function(U)
 
   local function extract_namespace(node, source)
     local name_node = node:field("name")[1]
-    if not name_node then return nil end
+    if not name_node then
+      return nil
+    end
     return new_entry(SECTION.Module, node, get_text(name_node, source))
   end
 
@@ -238,7 +272,9 @@ return function(U)
     import_separator = "\\",
 
     is_doc_comment = function(node, source)
-      if node:type() ~= "comment" then return false end
+      if node:type() ~= "comment" then
+        return false
+      end
       return get_text(node, source):sub(1, 3) == "/**"
     end,
 

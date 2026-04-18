@@ -36,7 +36,9 @@ return function(U)
 
   local function fn_signature(node, source)
     local name_node = node:field("name")[1]
-    if not name_node then return nil end
+    if not name_node then
+      return nil
+    end
     local name = get_text(name_node, source)
     local params_node = find_child(node, "parameters")
     local params = params_node and get_text(params_node, source) or "()"
@@ -54,9 +56,10 @@ return function(U)
   end
 
   local function extract_fields(node, source)
-    local body = find_child(node, "field_declaration_list")
-      or find_child(node, "enum_variant_list")
-    if not body then return {} end
+    local body = find_child(node, "field_declaration_list") or find_child(node, "enum_variant_list")
+    if not body then
+      return {}
+    end
     local fields = {}
     local total = 0
     for _, child in ipairs(body:children()) do
@@ -87,7 +90,9 @@ return function(U)
 
   local function extract_methods(node, source, include_vis)
     local body = find_child(node, "declaration_list")
-    if not body then return {} end
+    if not body then
+      return {}
+    end
     local methods = {}
     for _, child in ipairs(body:children()) do
       local ckind = child:type()
@@ -115,20 +120,26 @@ return function(U)
     end,
 
     is_doc_comment = function(node, source)
-      if node:type() ~= "line_comment" then return false end
+      if node:type() ~= "line_comment" then
+        return false
+      end
       local text = get_text(node, source)
       return text:sub(1, 3) == "///" and text:sub(1, 4) ~= "////"
     end,
 
     is_module_doc = function(node, source)
-      if node:type() ~= "line_comment" then return false end
+      if node:type() ~= "line_comment" then
+        return false
+      end
       local text = get_text(node, source)
       return text:sub(1, 3) == "//!"
     end,
 
     is_test_node = function(node, source, attrs)
       local kind = node:type()
-      if kind ~= "mod_item" and kind ~= "function_item" then return false end
+      if kind ~= "mod_item" and kind ~= "function_item" then
+        return false
+      end
       for _, a in ipairs(attrs) do
         local text = get_text(a, source)
         if text == "#[test]" or text == "#[cfg(test)]" or text:sub(-7) == "::test]" then
@@ -156,11 +167,12 @@ return function(U)
           text = full:match("^use (.-)%;?$") or full:gsub(";$", "")
         end
         return { new_import_entry(node, expand_import(text, "::")) }
-
       elseif kind == "struct_item" or kind == "enum_item" or kind == "union_item" then
         local v = vis_prefix(node, source)
         local name_node = node:field("name")[1]
-        if not name_node then return {} end
+        if not name_node then
+          return {}
+        end
         local name = get_text(name_node, source)
         local generics_node = find_child(node, "type_parameters")
         local generics = generics_node and get_text(generics_node, source) or ""
@@ -170,29 +182,34 @@ return function(U)
         local entry = new_entry(SECTION.Type, node, text)
         entry.children = extract_fields(node, source)
         entry.attrs = relevant_attr_texts(attrs, source)
-        if is_enum then entry.child_kind = CHILD_BRIEF end
+        if is_enum then
+          entry.child_kind = CHILD_BRIEF
+        end
         return { entry }
-
       elseif kind == "function_item" then
         local v = vis_prefix(node, source)
         local sig = fn_signature(node, source)
-        if not sig then return {} end
+        if not sig then
+          return {}
+        end
         return { new_entry(SECTION.Function, node, prefixed(v, sig)) }
-
       elseif kind == "trait_item" then
         local v = vis_prefix(node, source)
         local name_node = node:field("name")[1]
-        if not name_node then return {} end
+        if not name_node then
+          return {}
+        end
         local name = get_text(name_node, source)
         local generics_node = find_child(node, "type_parameters")
         local generics = generics_node and get_text(generics_node, source) or ""
         local entry = new_entry(SECTION.Trait, node, prefixed(v, name .. generics))
         entry.children = extract_methods(node, source, false)
         return { entry }
-
       elseif kind == "impl_item" then
         local type_node = node:field("type")[1] or find_child(node, "type_identifier")
-        if not type_node then return {} end
+        if not type_node then
+          return {}
+        end
         local type_name = get_text(type_node, source)
         local trait_node = node:field("trait")[1]
         local text
@@ -204,32 +221,36 @@ return function(U)
         local entry = new_entry(SECTION.Impl, node, text)
         entry.children = extract_methods(node, source, true)
         return { entry }
-
       elseif kind == "const_item" or kind == "static_item" then
         local name_node = node:field("name")[1]
-        if not name_node then return {} end
+        if not name_node then
+          return {}
+        end
         local name = get_text(name_node, source)
         local type_node = node:field("type")[1]
         local type_str = type_node and (": " .. get_text(type_node, source)) or ""
         local v = vis_prefix(node, source)
         local prefix = kind == "static_item" and "static " or ""
         return { new_entry(SECTION.Constant, node, prefixed(v, prefix .. name .. type_str)) }
-
       elseif kind == "mod_item" then
         local name_node = node:field("name")[1]
-        if not name_node then return {} end
+        if not name_node then
+          return {}
+        end
         local v = vis_prefix(node, source)
         return { new_entry(SECTION.Module, node, prefixed(v, get_text(name_node, source))) }
-
       elseif kind == "macro_definition" then
         local name_node = node:field("name")[1]
-        if not name_node then return {} end
+        if not name_node then
+          return {}
+        end
         return { new_entry(SECTION.Macro, node, get_text(name_node, source) .. "!") }
-
       elseif kind == "type_item" then
         local v = vis_prefix(node, source)
         local name_node = node:field("name")[1]
-        if not name_node then return {} end
+        if not name_node then
+          return {}
+        end
         local name = get_text(name_node, source)
         local val_node = node:field("type")[1]
         local val = val_node and (" = " .. get_text(val_node, source)) or ""

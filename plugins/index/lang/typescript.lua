@@ -1,7 +1,9 @@
 return function(U)
   local function return_type(node, source)
     local r = U.get_text(node, source)
-    if r:sub(1, 1) == ":" then return r end
+    if r:sub(1, 1) == ":" then
+      return r
+    end
     return ": " .. r
   end
 
@@ -21,7 +23,9 @@ return function(U)
   end
 
   local function export_prefix(node)
-    if is_exported(node) then return "export " end
+    if is_exported(node) then
+      return "export "
+    end
     return ""
   end
 
@@ -34,10 +38,14 @@ return function(U)
 
   local function extract_class(node, source)
     local name_node = node:field("name")[1]
-    if not name_node then return nil end
+    if not name_node then
+      return nil
+    end
     local name = U.get_text(name_node, source)
     local body_node = node:field("body")[1]
-    if not body_node then return nil end
+    if not body_node then
+      return nil
+    end
     local methods = {}
     local field_counts = {}
     for _, child in ipairs(body_node:children()) do
@@ -72,7 +80,9 @@ return function(U)
 
   local function extract_function(node, source)
     local name_node = node:field("name")[1]
-    if not name_node then return nil end
+    if not name_node then
+      return nil
+    end
     local name = U.get_text(name_node, source)
     local params_node = node:field("parameters")[1]
     local params = params_node and U.get_text(params_node, source) or "()"
@@ -84,10 +94,14 @@ return function(U)
 
   local function extract_interface(node, source)
     local name_node = node:field("name")[1]
-    if not name_node then return nil end
+    if not name_node then
+      return nil
+    end
     local name = U.get_text(name_node, source)
     local body_node = node:field("body")[1]
-    if not body_node then return nil end
+    if not body_node then
+      return nil
+    end
     local fields = {}
     for _, child in ipairs(body_node:children()) do
       local ckind = child:type()
@@ -104,7 +118,9 @@ return function(U)
 
   local function extract_type_alias(node, source)
     local name_node = node:field("name")[1]
-    if not name_node then return nil end
+    if not name_node then
+      return nil
+    end
     local name = U.get_text(name_node, source)
     local val_node = node:field("value")[1]
     local val_str = val_node and (" = " .. U.truncate(U.get_text(val_node, source), 80)) or ""
@@ -113,16 +129,22 @@ return function(U)
 
   local function extract_enum(node, source)
     local name_node = node:field("name")[1]
-    if not name_node then return nil end
+    if not name_node then
+      return nil
+    end
     local name = U.get_text(name_node, source)
     return U.new_entry(U.SECTION.Type, node, export_prefix(node) .. "enum " .. name)
   end
 
   local function extract_const(node, source)
     local decl = U.find_child(node, "variable_declarator")
-    if not decl then return nil end
+    if not decl then
+      return nil
+    end
     local name_node = decl:field("name")[1]
-    if not name_node then return nil end
+    if not name_node then
+      return nil
+    end
     local name = U.get_text(name_node, source)
     local type_node = decl:field("type")[1]
     local type_str = type_node and return_type(type_node, source) or ""
@@ -133,7 +155,9 @@ return function(U)
 
   local function extract_lexical_declaration(node, source)
     local first = node:child(0)
-    if not first then return nil end
+    if not first then
+      return nil
+    end
     if U.get_text(first, source) == "const" then
       return extract_const(node, source)
     end
@@ -143,12 +167,18 @@ return function(U)
   local function extract_export_statement(node, source)
     for _, child in ipairs(node:children()) do
       local ckind = child:type()
-      if ckind == "class_declaration" then return extract_class(child, source)
-      elseif ckind == "function_declaration" then return extract_function(child, source)
-      elseif ckind == "interface_declaration" then return extract_interface(child, source)
-      elseif ckind == "type_alias_declaration" then return extract_type_alias(child, source)
-      elseif ckind == "lexical_declaration" then return extract_lexical_declaration(child, source)
-      elseif ckind == "enum_declaration" then return extract_enum(child, source)
+      if ckind == "class_declaration" then
+        return extract_class(child, source)
+      elseif ckind == "function_declaration" then
+        return extract_function(child, source)
+      elseif ckind == "interface_declaration" then
+        return extract_interface(child, source)
+      elseif ckind == "type_alias_declaration" then
+        return extract_type_alias(child, source)
+      elseif ckind == "lexical_declaration" then
+        return extract_lexical_declaration(child, source)
+      elseif ckind == "enum_declaration" then
+        return extract_enum(child, source)
       end
     end
     return nil
@@ -184,7 +214,9 @@ return function(U)
   end
 
   return {
-    extract_nodes = function(node, source, _attrs) return extract_node(node, source) end,
+    extract_nodes = function(node, source, _attrs)
+      return extract_node(node, source)
+    end,
     import_separator = "/",
     is_doc_comment = function(node, source)
       return node:type() == "comment" and U.get_text(node, source):sub(1, 3) == "/**"

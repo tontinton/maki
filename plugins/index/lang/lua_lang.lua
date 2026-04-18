@@ -8,9 +8,13 @@ return function(U)
 
   local function require_module(node, source)
     local name_node = node:field("name")[1]
-    if not name_node or get_text(name_node, source) ~= "require" then return nil end
+    if not name_node or get_text(name_node, source) ~= "require" then
+      return nil
+    end
     local args = node:field("arguments")[1]
-    if not args then return nil end
+    if not args then
+      return nil
+    end
     for _, child in ipairs(args:children()) do
       local t = child:type()
       if t == "string" then
@@ -23,9 +27,13 @@ return function(U)
 
   local function import_from_require(node, source)
     local mod = require_module(node, source)
-    if not mod then return nil end
+    if not mod then
+      return nil
+    end
     local path = {}
-    for part in mod:gmatch("[^%.]+") do path[#path + 1] = part end
+    for part in mod:gmatch("[^%.]+") do
+      path[#path + 1] = part
+    end
     return new_import_entry(node, { path })
   end
 
@@ -41,17 +49,22 @@ return function(U)
 
       if kind == "function_declaration" then
         local name_node = node:field("name")[1]
-        if not name_node then return {} end
+        if not name_node then
+          return {}
+        end
         local params_node = node:field("parameters")[1]
         local params = params_node and get_text(params_node, source) or "()"
         return { new_entry(SECTION.Function, node, compact_ws(get_text(name_node, source) .. params)) }
-
       elseif kind == "variable_declaration" then
         local assign = find_child(node, "assignment_statement")
-        if not assign then return {} end
+        if not assign then
+          return {}
+        end
         local var_list = find_child(assign, "variable_list")
         local expr_list = find_child(assign, "expression_list")
-        if not var_list or not expr_list then return {} end
+        if not var_list or not expr_list then
+          return {}
+        end
 
         local results = {}
         local expr_children = {}
@@ -64,15 +77,21 @@ return function(U)
         for i, expr in ipairs(expr_children) do
           if expr:type() == "function_call" then
             local imp = import_from_require(expr, source)
-            if imp then results[#results + 1] = imp end
+            if imp then
+              results[#results + 1] = imp
+            end
           end
         end
 
-        if #results > 0 then return results end
+        if #results > 0 then
+          return results
+        end
 
         local var_children = {}
         for _, child in ipairs(var_list:children()) do
-          if child:type() ~= "," then var_children[#var_children + 1] = child end
+          if child:type() ~= "," then
+            var_children[#var_children + 1] = child
+          end
         end
 
         if #var_children == 1 then
@@ -84,7 +103,6 @@ return function(U)
           end
         end
         return {}
-
       elseif kind == "function_call" then
         local imp = import_from_require(node, source)
         return imp and { imp } or {}

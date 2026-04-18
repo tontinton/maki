@@ -11,9 +11,13 @@ return function(U)
   local SECTION = U.SECTION
 
   local function is_module_doc(node, source)
-    if node:type() ~= "expression_statement" then return false end
+    if node:type() ~= "expression_statement" then
+      return false
+    end
     local first = node:child(0)
-    if not first then return false end
+    if not first then
+      return false
+    end
     return first:type() == "string" and get_text(first, source):sub(1, 3) == '"""'
   end
 
@@ -31,7 +35,9 @@ return function(U)
       end
       for name in names:gmatch("[^,]+") do
         local path = {}
-        for _, p in ipairs(base_parts) do path[#path + 1] = p end
+        for _, p in ipairs(base_parts) do
+          path[#path + 1] = p
+        end
         path[#path + 1] = name:match("^%s*(.-)%s*$")
         paths[#paths + 1] = path
       end
@@ -48,10 +54,14 @@ return function(U)
 
   local function extract_class(node, source)
     local name_node = node:field("name")[1]
-    if not name_node then return nil end
+    if not name_node then
+      return nil
+    end
     local name = get_text(name_node, source)
     local body_node = node:field("body")[1]
-    if not body_node then return nil end
+    if not body_node then
+      return nil
+    end
     local methods = {}
     for _, child in ipairs(body_node:children()) do
       local fn_node = nil
@@ -89,10 +99,14 @@ return function(U)
     local actual = node
     if node:type() == "decorated_definition" then
       actual = find_child(node, "function_definition")
-      if not actual then return nil end
+      if not actual then
+        return nil
+      end
     end
     local name_node = actual:field("name")[1]
-    if not name_node then return nil end
+    if not name_node then
+      return nil
+    end
     local name = get_text(name_node, source)
     local params_node = actual:field("parameters")[1]
     local params = params_node and get_text(params_node, source) or "()"
@@ -103,9 +117,13 @@ return function(U)
 
   local function extract_assignment(node, source)
     local left = node:child(0)
-    if not left then return nil end
+    if not left then
+      return nil
+    end
     local name = get_text(left, source)
-    if not name:match("^[A-Z_]+$") then return nil end
+    if not name:match("^[A-Z_]+$") then
+      return nil
+    end
     local found_eq = false
     local val = nil
     for i = 0, node:child_count() - 1 do
@@ -133,11 +151,12 @@ return function(U)
       local e = extract_function(node, source)
       return e and { e } or {}
     elseif kind == "decorated_definition" then
-      local inner = find_child(node, "class_definition")
-        or find_child(node, "function_definition")
+      local inner = find_child(node, "class_definition") or find_child(node, "function_definition")
       if inner and inner:type() == "class_definition" then
         local e = extract_class(inner, source)
-        if e then e.line_start = line_start(node) end
+        if e then
+          e.line_start = line_start(node)
+        end
         return e and { e } or {}
       elseif inner then
         local e = extract_function(node, source)

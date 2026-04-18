@@ -1,26 +1,45 @@
 local FIELD_TRUNCATE_THRESHOLD = 8
 local LINE_WRAP_THRESHOLD = 120
-local MAX_INT = math.maxinteger or 2^53
+local MAX_INT = math.maxinteger or 2 ^ 53
 
 local EXT_TO_LANG = {
   rs = "rust",
-  py = "python", pyi = "python",
-  ts = "typescript", tsx = "typescript",
-  js = "javascript", jsx = "javascript", mjs = "javascript", cjs = "javascript",
+  py = "python",
+  pyi = "python",
+  ts = "typescript",
+  tsx = "typescript",
+  js = "javascript",
+  jsx = "javascript",
+  mjs = "javascript",
+  cjs = "javascript",
   go = "go",
   java = "java",
-  c = "c", h = "c",
-  cpp = "cpp", cc = "cpp", cxx = "cpp", hpp = "cpp", hxx = "cpp", hh = "cpp",
+  c = "c",
+  h = "c",
+  cpp = "cpp",
+  cc = "cpp",
+  cxx = "cpp",
+  hpp = "cpp",
+  hxx = "cpp",
+  hh = "cpp",
   cs = "c_sharp",
-  rb = "ruby", rake = "ruby", gemspec = "ruby",
+  rb = "ruby",
+  rake = "ruby",
+  gemspec = "ruby",
   php = "php",
   swift = "swift",
-  kt = "kotlin", kts = "kotlin",
-  scala = "scala", sc = "scala",
-  sh = "bash", bash = "bash", zsh = "bash",
+  kt = "kotlin",
+  kts = "kotlin",
+  scala = "scala",
+  sc = "scala",
+  sh = "bash",
+  bash = "bash",
+  zsh = "bash",
   lua = "lua_lang",
-  ex = "elixir", exs = "elixir",
-  md = "markdown", markdown = "markdown",
+  ex = "elixir",
+  exs = "elixir",
+  md = "markdown",
+  markdown = "markdown",
 }
 
 local LANG_TO_PARSER = {
@@ -47,13 +66,17 @@ local function line_end(node)
 end
 
 local function format_range(s, e)
-  if s == e then return "[" .. s .. "]" end
+  if s == e then
+    return "[" .. s .. "]"
+  end
   return "[" .. s .. "-" .. e .. "]"
 end
 
 local function find_child(node, kind)
   for _, child in ipairs(node:children()) do
-    if child:type() == kind then return child end
+    if child:type() == kind then
+      return child
+    end
   end
   return nil
 end
@@ -63,9 +86,13 @@ local function compact_ws(s)
 end
 
 local function truncate(s, max)
-  if #s <= max then return s end
+  if #s <= max then
+    return s
+  end
   local boundary = max - 11
-  if boundary < 0 then boundary = 0 end
+  if boundary < 0 then
+    boundary = 0
+  end
   return s:sub(1, boundary) .. "[truncated]"
 end
 
@@ -173,7 +200,9 @@ local function find_sep(text, sep)
     if c == "{" then
       depth = depth + 1
     elseif c == "}" then
-      if depth > 0 then depth = depth - 1 end
+      if depth > 0 then
+        depth = depth - 1
+      end
     elseif depth == 0 and text:sub(i, i + sep_len - 1) == sep then
       return i
     end
@@ -190,7 +219,9 @@ local function split_top_level(text, delim)
     if c == 123 then
       depth = depth + 1
     elseif c == 125 then
-      if depth > 0 then depth = depth - 1 end
+      if depth > 0 then
+        depth = depth - 1
+      end
     elseif c == delim:byte(1) and depth == 0 then
       local part = text:sub(start, i - 1)
       part = part:match("^%s*(.-)%s*$")
@@ -225,7 +256,9 @@ local function expand_import(text, sep)
       local pos = find_sep(remaining, sep)
       if not pos then
         local path = {}
-        for _, p in ipairs(prefix) do path[#path + 1] = p end
+        for _, p in ipairs(prefix) do
+          path[#path + 1] = p
+        end
         path[#path + 1] = remaining
         results[#results + 1] = path
       else
@@ -233,7 +266,9 @@ local function expand_import(text, sep)
         local rest = remaining:sub(pos + #sep)
 
         local new_prefix = {}
-        for _, p in ipairs(prefix) do new_prefix[#new_prefix + 1] = p end
+        for _, p in ipairs(prefix) do
+          new_prefix[#new_prefix + 1] = p
+        end
         new_prefix[#new_prefix + 1] = segment
 
         local inner = rest:match("^{(.*)}$")
@@ -241,7 +276,9 @@ local function expand_import(text, sep)
           local items = split_top_level(inner, ",")
           for i = #items, 1, -1 do
             local cp = {}
-            for _, p in ipairs(new_prefix) do cp[#cp + 1] = p end
+            for _, p in ipairs(new_prefix) do
+              cp[#cp + 1] = p
+            end
             stack[#stack + 1] = { cp, items[i] }
           end
         else
@@ -255,16 +292,16 @@ local function expand_import(text, sep)
 end
 
 local SECTIONS = {
-  { key = "Import",   header = "imports:"  },
-  { key = "Module",   header = "mod:"      },
-  { key = "Constant", header = "consts:"   },
-  { key = "Type",     header = "types:"    },
-  { key = "Trait",    header = "traits:"   },
-  { key = "Impl",     header = "impls:"    },
-  { key = "Function", header = "fns:"      },
-  { key = "Class",    header = "classes:"  },
-  { key = "Macro",    header = "macros:"   },
-  { key = "Heading",  header = "headings:" },
+  { key = "Import", header = "imports:" },
+  { key = "Module", header = "mod:" },
+  { key = "Constant", header = "consts:" },
+  { key = "Type", header = "types:" },
+  { key = "Trait", header = "traits:" },
+  { key = "Impl", header = "impls:" },
+  { key = "Function", header = "fns:" },
+  { key = "Class", header = "classes:" },
+  { key = "Macro", header = "macros:" },
+  { key = "Heading", header = "headings:" },
 }
 
 local SECTION = {}
@@ -322,7 +359,9 @@ local function simple_import(node, source, prefixes, sep)
 end
 
 local function prefixed(vis, rest)
-  if vis == "" then return rest end
+  if vis == "" then
+    return rest
+  end
   return vis .. " " .. rest
 end
 
@@ -362,7 +401,10 @@ local function extract_body_members(body, source, rules)
     local kind = child:type()
     local rule = nil
     for _, r in ipairs(rules) do
-      if r.kind == kind then rule = r; break end
+      if r.kind == kind then
+        rule = r
+        break
+      end
     end
     if rule then
       if rule.handler == "method" then
@@ -409,7 +451,9 @@ local function doc_comment_start_line(node, source, is_doc_comment_fn, is_attr_f
 end
 
 local function collect_preceding_attrs(node, is_attr_fn)
-  if not is_attr_fn then return {} end
+  if not is_attr_fn then
+    return {}
+  end
   local attrs = {}
   local prev = node:prev_sibling()
   while prev do
@@ -430,21 +474,31 @@ end
 -- Module-level docs (like //! in Rust) sit before any real item.
 -- We collect them as a range and stop at the first non-doc node.
 local function detect_module_doc(root, source, is_module_doc_fn, is_attr_fn)
-  if not is_module_doc_fn then return nil end
+  if not is_module_doc_fn then
+    return nil
+  end
   local start_line, end_line_val
   for _, child in ipairs(root:children()) do
     if is_module_doc_fn(child, source) then
       local l = line_start(child)
-      if not start_line then start_line = l end
+      if not start_line then
+        start_line = l
+      end
       local er, ec = child:end_()
       local el
-      if ec == 0 then el = er else el = er + 1 end
+      if ec == 0 then
+        el = er
+      else
+        el = er + 1
+      end
       end_line_val = el
     elseif not (is_attr_fn and is_attr_fn(child)) and not child:extra() then
       break
     end
   end
-  if start_line then return { start_line, end_line_val } end
+  if start_line then
+    return { start_line, end_line_val }
+  end
   return nil
 end
 
@@ -458,7 +512,9 @@ local function format_skeleton(entries, test_lines, module_doc, import_sep)
   local grouped = {}
   for _, entry in ipairs(entries) do
     local s = entry.section
-    if not grouped[s] then grouped[s] = {} end
+    if not grouped[s] then
+      grouped[s] = {}
+    end
     local g = grouped[s]
     g[#g + 1] = entry
   end
@@ -471,11 +527,17 @@ local function format_skeleton(entries, test_lines, module_doc, import_sep)
       if sec == SECTION.Import then
         local min_line, max_line = MAX_INT, 0
         for _, e in ipairs(items) do
-          if e.line_start < min_line then min_line = e.line_start end
-          if e.line_end > max_line then max_line = e.line_end end
+          if e.line_start < min_line then
+            min_line = e.line_start
+          end
+          if e.line_end > max_line then
+            max_line = e.line_end
+          end
         end
 
-        if #out > 0 then out[#out + 1] = "" end
+        if #out > 0 then
+          out[#out + 1] = ""
+        end
         out[#out + 1] = "imports: " .. format_range(min_line, max_line)
 
         local keyword_order = {}
@@ -507,30 +569,39 @@ local function format_skeleton(entries, test_lines, module_doc, import_sep)
             end
           end
         end
-
       elseif sec == SECTION.Module then
         local min_line, max_line = MAX_INT, 0
         for _, e in ipairs(items) do
-          if e.line_start < min_line then min_line = e.line_start end
-          if e.line_end > max_line then max_line = e.line_end end
+          if e.line_start < min_line then
+            min_line = e.line_start
+          end
+          if e.line_end > max_line then
+            max_line = e.line_end
+          end
         end
-        if #out > 0 then out[#out + 1] = "" end
+        if #out > 0 then
+          out[#out + 1] = ""
+        end
         out[#out + 1] = header .. " " .. format_range(min_line, max_line)
         local names = {}
-        for _, e in ipairs(items) do names[#names + 1] = e.text end
+        for _, e in ipairs(items) do
+          names[#names + 1] = e.text
+        end
         for _, line in ipairs(wrap_csv(names, "  ")) do
           out[#out + 1] = line
         end
-
       elseif sec == SECTION.Heading then
-        if #out > 0 then out[#out + 1] = "" end
+        if #out > 0 then
+          out[#out + 1] = ""
+        end
         out[#out + 1] = header
         for _, entry in ipairs(items) do
           out[#out + 1] = "  " .. entry.text .. " " .. format_range(entry.line_start, entry.line_end)
         end
-
       else
-        if #out > 0 then out[#out + 1] = "" end
+        if #out > 0 then
+          out[#out + 1] = ""
+        end
         out[#out + 1] = header
         for _, entry in ipairs(items) do
           if entry.kind == "item" then
@@ -556,14 +627,22 @@ local function format_skeleton(entries, test_lines, module_doc, import_sep)
   if test_lines and #test_lines > 0 then
     local min_t, max_t = MAX_INT, 0
     for _, l in ipairs(test_lines) do
-      if l < min_t then min_t = l end
-      if l > max_t then max_t = l end
+      if l < min_t then
+        min_t = l
+      end
+      if l > max_t then
+        max_t = l
+      end
     end
-    if #out > 0 then out[#out + 1] = "" end
+    if #out > 0 then
+      out[#out + 1] = ""
+    end
     out[#out + 1] = "tests: " .. format_range(min_t, max_t)
   end
 
-  if #out == 0 then return "" end
+  if #out == 0 then
+    return ""
+  end
   return table.concat(out, "\n") .. "\n"
 end
 
@@ -632,7 +711,7 @@ local function validate_lang(name, lang)
   end
   assert(type(lang.extract_nodes) == "function", name .. ": missing extract_nodes")
   assert(type(lang.import_separator) == "string", name .. ": missing import_separator")
-  for _, opt in ipairs({"is_doc_comment", "is_module_doc", "is_attr", "is_test_node"}) do
+  for _, opt in ipairs({ "is_doc_comment", "is_module_doc", "is_attr", "is_test_node" }) do
     local v = lang[opt]
     assert(v == nil or type(v) == "function", name .. ": " .. opt .. " must be nil or function")
   end
@@ -677,7 +756,9 @@ end
 
 local function index_source(source, lang_name)
   local extractor = EXTRACTORS[lang_name]
-  if not extractor then return nil, "unsupported language: " .. tostring(lang_name) end
+  if not extractor then
+    return nil, "unsupported language: " .. tostring(lang_name)
+  end
   local pname = parser_name(lang_name)
   local parser = maki.treesitter.get_parser(source, pname)
   local root = parser:parse()[1]:root()

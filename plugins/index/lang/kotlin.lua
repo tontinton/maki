@@ -14,7 +14,9 @@ return function(U)
 
   local function modifiers_text(node, source)
     local mods = find_child(node, "modifiers")
-    if not mods then return "" end
+    if not mods then
+      return ""
+    end
     local parts = {}
     for _, child in ipairs(mods:children()) do
       if child:type() ~= "annotation" then
@@ -49,9 +51,14 @@ return function(U)
     end
     local has_star = false
     for _, child in ipairs(node:children()) do
-      if get_text(child, source) == "*" then has_star = true; break end
+      if get_text(child, source) == "*" then
+        has_star = true
+        break
+      end
     end
-    if has_star then parts[#parts + 1] = "*" end
+    if has_star then
+      parts[#parts + 1] = "*"
+    end
     return new_import_entry(node, { parts })
   end
 
@@ -70,16 +77,22 @@ return function(U)
     local mods = modifiers_text(node, source)
     local tparams = tparams_text(node, source)
     local name_node = node:field("simple_identifier")[1] or node:field("name")[1] or find_child(node, "identifier")
-    if not name_node then return nil end
+    if not name_node then
+      return nil
+    end
     local name = get_text(name_node, source)
     local params_node = find_child(node, "function_value_parameters")
     local params = params_node and get_text(params_node, source) or "()"
     local ret_node = node:field("type")[1] or find_child(node, "type")
     local ret = ret_node and (" : " .. get_text(ret_node, source)) or ""
     local parts = {}
-    if mods ~= "" then parts[#parts + 1] = mods end
+    if mods ~= "" then
+      parts[#parts + 1] = mods
+    end
     parts[#parts + 1] = "fun"
-    if tparams ~= "" then parts[#parts + 1] = tparams end
+    if tparams ~= "" then
+      parts[#parts + 1] = tparams
+    end
     parts[#parts + 1] = name .. params .. ret
     return compact_ws(table.concat(parts, " "))
   end
@@ -89,11 +102,18 @@ return function(U)
     local kw = "val"
     for _, child in ipairs(node:children()) do
       local t = get_text(child, source)
-      if t == "var" or t == "val" then kw = t; break end
+      if t == "var" or t == "val" then
+        kw = t
+        break
+      end
     end
     local var_decl = node:field("variable_declaration")[1] or find_child(node, "variable_declaration")
-    if not var_decl then return nil end
-    local id_node = var_decl:field("simple_identifier")[1] or find_child(var_decl, "simple_identifier") or find_child(var_decl, "identifier")
+    if not var_decl then
+      return nil
+    end
+    local id_node = var_decl:field("simple_identifier")[1]
+      or find_child(var_decl, "simple_identifier")
+      or find_child(var_decl, "identifier")
     local id = id_node and get_text(id_node, source) or "_"
     local type_node = var_decl:field("type")[1] or find_child(var_decl, "type")
     local type_str = type_node and (" : " .. get_text(type_node, source)) or ""
@@ -125,11 +145,15 @@ return function(U)
         local sub_body = find_child(child, "class_body")
         if sub_body then
           local sub = class_members(sub_body, source)
-          for _, m in ipairs(sub) do members[#members + 1] = "companion." .. m end
+          for _, m in ipairs(sub) do
+            members[#members + 1] = "companion." .. m
+          end
         end
       elseif ck == "enum_entry" then
         local id = child:field("simple_identifier")[1]
-        if id then members[#members + 1] = get_text(id, source) end
+        if id then
+          members[#members + 1] = get_text(id, source)
+        end
       end
     end
     if prop_count > FIELD_TRUNCATE_THRESHOLD then
@@ -141,16 +165,23 @@ return function(U)
   local function extract_class(node, source)
     local mods = modifiers_text(node, source)
     local name_node = node:field("simple_identifier")[1] or node:field("name")[1] or find_child(node, "identifier")
-    if not name_node then return nil end
+    if not name_node then
+      return nil
+    end
     local name = get_text(name_node, source)
     local tparams = tparams_text(node, source)
 
     local kw = "class"
     for _, child in ipairs(node:children()) do
       local t = get_text(child, source)
-      if t == "interface" then kw = "interface"; break end
+      if t == "interface" then
+        kw = "interface"
+        break
+      end
     end
-    if mods:find("enum") then kw = "enum class" end
+    if mods:find("enum") then
+      kw = "enum class"
+    end
 
     local ctor_node = find_child(node, "primary_constructor")
     local ctor = ctor_node and get_text(find_child(ctor_node, "class_parameters") or ctor_node, source) or ""
@@ -158,9 +189,13 @@ return function(U)
     local supers = delegation_text(node, source)
 
     local parts = {}
-    if mods ~= "" then parts[#parts + 1] = mods end
+    if mods ~= "" then
+      parts[#parts + 1] = mods
+    end
     parts[#parts + 1] = kw
-    if tparams ~= "" then parts[#parts + 1] = tparams end
+    if tparams ~= "" then
+      parts[#parts + 1] = tparams
+    end
     parts[#parts + 1] = name .. ctor .. supers
     local label = compact_ws(table.concat(parts, " "))
 
@@ -168,7 +203,9 @@ return function(U)
     local body = find_child(node, "class_body") or find_child(node, "enum_class_body")
     if body then
       entry.children = class_members(body, source)
-      if kw == "enum class" then entry.child_kind = CHILD_BRIEF end
+      if kw == "enum class" then
+        entry.child_kind = CHILD_BRIEF
+      end
     end
     return entry
   end
@@ -176,13 +213,17 @@ return function(U)
   local function extract_object(node, source)
     local mods = modifiers_text(node, source)
     local name_node = node:field("simple_identifier")[1] or node:field("name")[1] or find_child(node, "identifier")
-    if not name_node then return nil end
+    if not name_node then
+      return nil
+    end
     local name = get_text(name_node, source)
     local supers = delegation_text(node, source)
     local prefix = mods ~= "" and (mods .. " object ") or "object "
     local entry = new_entry(SECTION.Class, node, compact_ws(prefix .. name .. supers))
     local body = find_child(node, "class_body")
-    if body then entry.children = class_members(body, source) end
+    if body then
+      entry.children = class_members(body, source)
+    end
     return entry
   end
 
@@ -190,7 +231,9 @@ return function(U)
     local vis_node = find_child(node, "modifiers")
     local vis = vis_node and get_text(vis_node, source) or ""
     local name_node = node:field("type_alias_name")[1] or node:field("name")[1] or find_child(node, "identifier")
-    if not name_node then return nil end
+    if not name_node then
+      return nil
+    end
     local name = get_text(name_node, source)
     local tparams = tparams_text(node, source)
     local rhs = nil
@@ -209,10 +252,16 @@ return function(U)
   local function extract_property(node, source)
     local mods = modifiers_text(node, source)
     local var_decl = node:field("variable_declaration")[1] or find_child(node, "variable_declaration")
-    if not var_decl then return nil end
-    local id_node = var_decl:field("simple_identifier")[1] or find_child(var_decl, "simple_identifier") or find_child(var_decl, "identifier")
+    if not var_decl then
+      return nil
+    end
+    local id_node = var_decl:field("simple_identifier")[1]
+      or find_child(var_decl, "simple_identifier")
+      or find_child(var_decl, "identifier")
     local id = id_node and get_text(id_node, source) or ""
-    if not (mods:find("const") or id:match("^[A-Z_][A-Z0-9_]*$")) then return nil end
+    if not (mods:find("const") or id:match("^[A-Z_][A-Z0-9_]*$")) then
+      return nil
+    end
     local text = property_text(node, source)
     return text and new_entry(SECTION.Constant, node, text) or nil
   end
@@ -235,15 +284,20 @@ return function(U)
   end
 
   local DECL_KINDS = {
-    class_declaration = true, object_declaration = true,
-    function_declaration = true, property_declaration = true, type_alias = true,
+    class_declaration = true,
+    object_declaration = true,
+    function_declaration = true,
+    property_declaration = true,
+    type_alias = true,
   }
 
   return {
     import_separator = ".",
 
     is_doc_comment = function(node, source)
-      if node:type() ~= "multiline_comment" then return false end
+      if node:type() ~= "multiline_comment" then
+        return false
+      end
       return get_text(node, source):sub(1, 3) == "/**"
     end,
 
@@ -269,7 +323,9 @@ return function(U)
         for _, child in ipairs(node:children()) do
           if DECL_KINDS[child:type()] then
             local e = extract_declaration(child, source)
-            if e then results[#results + 1] = e end
+            if e then
+              results[#results + 1] = e
+            end
           end
         end
         return results

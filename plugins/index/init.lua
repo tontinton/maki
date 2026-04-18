@@ -19,19 +19,29 @@ Return a compact overview of a source file: imports, type definitions, function 
   },
   handler = function(input, _)
     local path = input.path
-    if not path then return "error: path is required" end
+    if not path then
+      return "error: path is required"
+    end
 
     local ext = path:match("%.([^%.]+)$")
-    if not ext then return "DELEGATE_NATIVE" end
+    if not ext then
+      return "DELEGATE_NATIVE"
+    end
 
     local lang = indexer.EXT_TO_LANG[ext]
-    if not lang then return "DELEGATE_NATIVE" end
+    if not lang then
+      return "DELEGATE_NATIVE"
+    end
 
     local ok, source = pcall(maki.fs.read, path)
-    if not ok then return "error: " .. tostring(source) end
+    if not ok then
+      return "error: " .. tostring(source)
+    end
 
     local result, err = indexer.index_source(source, lang)
-    if not result then return "error: " .. tostring(err) end
+    if not result then
+      return "error: " .. tostring(err)
+    end
 
     return result
   end,

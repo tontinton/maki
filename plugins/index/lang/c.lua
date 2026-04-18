@@ -17,18 +17,26 @@ return function(U)
 
   local function extract_include(node, source)
     local path_node = node:field("path")[1]
-    if not path_node then return nil end
+    if not path_node then
+      return nil
+    end
     local raw = get_text(path_node, source)
     local cleaned = raw:gsub("[<>\"']", "")
     local parts = {}
-    for p in cleaned:gmatch("[^/]+") do parts[#parts + 1] = p end
+    for p in cleaned:gmatch("[^/]+") do
+      parts[#parts + 1] = p
+    end
     return new_import_entry(node, { parts })
   end
 
   local function unwrap_to_fn_declarator(node)
-    if not node then return nil end
+    if not node then
+      return nil
+    end
     local ck = node:type()
-    if ck == "function_declarator" then return node end
+    if ck == "function_declarator" then
+      return node
+    end
     if ck == "pointer_declarator" then
       local inner = node:field("declarator")[1]
       return unwrap_to_fn_declarator(inner)
@@ -39,9 +47,13 @@ return function(U)
   local function build_fn_sig(node, source)
     local decl_node = node:field("declarator")[1]
     local fn_decl = unwrap_to_fn_declarator(decl_node)
-    if not fn_decl then return nil end
+    if not fn_decl then
+      return nil
+    end
     local name_node = fn_decl:field("declarator")[1]
-    if not name_node then return nil end
+    if not name_node then
+      return nil
+    end
     local name = get_text(name_node, source)
     local params_node = fn_decl:field("parameters")[1]
     local params = params_node and get_text(params_node, source) or "()"
@@ -84,7 +96,9 @@ return function(U)
 
   local function extract_typedef(node, source)
     local type_node = node:field("type")[1]
-    if not type_node then return nil end
+    if not type_node then
+      return nil
+    end
     local decl = node:field("declarator")[1]
     local alias = decl and get_text(decl, source) or ""
     local ck = type_node:type()
@@ -128,7 +142,9 @@ return function(U)
 
   local function extract_define(node, source)
     local name_node = node:field("name")[1]
-    if not name_node then return nil end
+    if not name_node then
+      return nil
+    end
     local name = get_text(name_node, source)
     local val_node = node:field("value")[1]
     local val_str = val_node and (" " .. truncate(get_text(val_node, source), DEFINE_TRUNCATE)) or ""
@@ -137,11 +153,17 @@ return function(U)
 
   local function extract_declaration(node, source)
     local decl_node = node:field("declarator")[1]
-    if not decl_node then return nil end
+    if not decl_node then
+      return nil
+    end
     local fn_decl = unwrap_to_fn_declarator(decl_node)
-    if not fn_decl then return nil end
+    if not fn_decl then
+      return nil
+    end
     local sig = build_fn_sig(node, source)
-    if not sig then return nil end
+    if not sig then
+      return nil
+    end
     return new_entry(SECTION.Function, node, sig)
   end
 
@@ -150,7 +172,9 @@ return function(U)
 
     is_doc_comment = function(node, source)
       local ck = node:type()
-      if ck ~= "comment" then return false end
+      if ck ~= "comment" then
+        return false
+      end
       local text = get_text(node, source)
       return text:sub(1, 3) == "/**" or text:sub(1, 3) == "///"
     end,
@@ -165,7 +189,9 @@ return function(U)
         return e and { e } or {}
       elseif kind == "preproc_function_def" then
         local name_node = node:field("name")[1]
-        if not name_node then return {} end
+        if not name_node then
+          return {}
+        end
         local name = get_text(name_node, source)
         local params_node = node:field("parameters")[1]
         local params = params_node and get_text(params_node, source) or ""

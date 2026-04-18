@@ -10,7 +10,11 @@ return function(U)
       local text = get_text(node, source)
       local count = 0
       for i = 1, #text do
-        if text:sub(i, i) == "#" then count = count + 1 else break end
+        if text:sub(i, i) == "#" then
+          count = count + 1
+        else
+          break
+        end
       end
       return count
     else

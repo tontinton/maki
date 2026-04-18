@@ -8,15 +8,13 @@ end
 
 local function has(output, needles)
   for _, n in ipairs(needles) do
-    assert(output:find(n, 1, true),
-      "missing '" .. n .. "' in:\n" .. output)
+    assert(output:find(n, 1, true), "missing '" .. n .. "' in:\n" .. output)
   end
 end
 
 local function lacks(output, needles)
   for _, n in ipairs(needles) do
-    assert(not output:find(n, 1, true),
-      "unexpected '" .. n .. "' in:\n" .. output)
+    assert(not output:find(n, 1, true), "unexpected '" .. n .. "' in:\n" .. output)
   end
 end
 
@@ -114,7 +112,8 @@ end
 
 -- rust_test_module_collapsed
 do
-  local src = "fn main() {}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n    #[test]\n    fn it_works() { assert!(true); }\n}\n"
+  local src =
+    "fn main() {}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n    #[test]\n    fn it_works() { assert!(true); }\n}\n"
   local out = idx(src, "rust")
   has(out, { "tests:" })
   lacks(out, { "it_works" })
@@ -123,11 +122,11 @@ end
 -- rust_test_detection
 do
   local cases = {
-    { src = "#[test]\nfn it_works() { assert!(true); }\n",    test = true,  name = "standalone_test" },
-    { src = "#[tokio::test]\nasync fn my_test() {}\n",         test = true,  name = "tokio_test" },
-    { src = "#[attested]\nfn foo() {}\n",                      test = false, name = "attested_not_test" },
-    { src = "#[cfg(not(test))]\nfn real_fn() {}\n",            test = false, name = "cfg_not_test" },
-    { src = "#[my_crate::test_helper]\nfn setup() {}\n",       test = false, name = "test_helper_not_test" },
+    { src = "#[test]\nfn it_works() { assert!(true); }\n", test = true, name = "standalone_test" },
+    { src = "#[tokio::test]\nasync fn my_test() {}\n", test = true, name = "tokio_test" },
+    { src = "#[attested]\nfn foo() {}\n", test = false, name = "attested_not_test" },
+    { src = "#[cfg(not(test))]\nfn real_fn() {}\n", test = false, name = "cfg_not_test" },
+    { src = "#[my_crate::test_helper]\nfn setup() {}\n", test = false, name = "test_helper_not_test" },
   }
   for _, c in ipairs(cases) do
     local out = idx(c.src, "rust")
@@ -144,10 +143,13 @@ end
 -- rust_doc_comment_line_ranges
 do
   local cases = {
-    { src = "/// Documented\n/// More docs\npub fn foo() {}\n",                        expected = "pub foo() [1-3]" },
-    { src = "/// Doc\n#[derive(Debug)]\npub struct Bar {\n    pub x: i32,\n}\n",       expected = "pub struct Bar [1-5]" },
-    { src = "pub fn plain() {}\n",                                                     expected = "pub plain() [1]" },
-    { src = "// regular comment\npub fn foo() {}\n",                                   expected = "pub foo() [2]" },
+    { src = "/// Documented\n/// More docs\npub fn foo() {}\n", expected = "pub foo() [1-3]" },
+    {
+      src = "/// Doc\n#[derive(Debug)]\npub struct Bar {\n    pub x: i32,\n}\n",
+      expected = "pub struct Bar [1-5]",
+    },
+    { src = "pub fn plain() {}\n", expected = "pub plain() [1]" },
+    { src = "// regular comment\npub fn foo() {}\n", expected = "pub foo() [2]" },
   }
   for _, c in ipairs(cases) do
     local out = idx(c.src, "rust")
@@ -937,7 +939,8 @@ end
 
 -- markdown_atx_headings
 do
-  local src = "# Main Title\n\n## Section 1\n\nSome text here.\n\n### Subsection 1.1\n\nMore content.\n\n## Section 2\n\n### Another Subsection 2.1\n\n#### Deep Heading 2.1.3\n\n# Footer Title\n\nAnd some more content\n"
+  local src =
+    "# Main Title\n\n## Section 1\n\nSome text here.\n\n### Subsection 1.1\n\nMore content.\n\n## Section 2\n\n### Another Subsection 2.1\n\n#### Deep Heading 2.1.3\n\n# Footer Title\n\nAnd some more content\n"
   local out = idx(src, "markdown")
   has(out, {
     "headings:",
@@ -962,7 +965,8 @@ end
 
 -- markdown_setext_headings
 do
-  local src = "Heading 1\n=========\n\nSome text here\n\nHeading 1.1\n---------\n\nMore content\n\nHeading 2\n=========\n\nAnd some more content\n"
+  local src =
+    "Heading 1\n=========\n\nSome text here\n\nHeading 1.1\n---------\n\nMore content\n\nHeading 2\n=========\n\nAnd some more content\n"
   local out = idx(src, "markdown")
   has(out, {
     "headings:",
@@ -972,5 +976,3 @@ do
   })
   lacks(out, { "Some text here", "More content", "And some more content" })
 end
-
-
