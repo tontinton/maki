@@ -5,7 +5,9 @@ use std::time::Duration;
 use flume::Sender;
 use maki_agent::ToolOutput;
 use maki_agent::tools::Tool;
-use maki_agent::tools::schema::{ParamKind, ParamSchema, to_json_schema, try_from_json, validate};
+use maki_agent::tools::schema::{
+    ParamSchema, extract_summary_keys, to_json_schema, try_from_json, validate,
+};
 use maki_agent::tools::{
     Deadline, DescriptionContext, ExecFuture, ParseError, ToolAudience, ToolContext, ToolInvocation,
 };
@@ -28,7 +30,7 @@ pub(crate) struct PendingTool {
     pub(crate) schema: &'static ParamSchema,
     pub(crate) audience: ToolAudience,
     pub(crate) handler_key: RegistryKey,
-    pub(crate) summary_key: Option<Arc<str>>,
+    pub(crate) summary_keys: &'static [&'static str],
 }
 
 pub(crate) type PendingTools = Arc<Mutex<Vec<PendingTool>>>;
@@ -40,7 +42,7 @@ pub(crate) struct LuaTool {
     pub(crate) audience: ToolAudience,
     pub(crate) tx: Sender<Request>,
     pub(crate) plugin: Arc<str>,
-    pub(crate) summary_key: Option<Arc<str>>,
+    pub(crate) summary_keys: &'static [&'static str],
 }
 
 impl Tool for LuaTool {
@@ -65,7 +67,7 @@ impl Tool for LuaTool {
         Ok(Box::new(LuaToolInvocation {
             tool: Arc::clone(&self.name),
             plugin: Arc::clone(&self.plugin),
-            summary_key: self.summary_key.clone(),
+            summary_keys: self.summary_keys,
             input: validated,
             tx: self.tx.clone(),
         }))
@@ -75,19 +77,23 @@ impl Tool for LuaTool {
 struct LuaToolInvocation {
     tool: Arc<str>,
     plugin: Arc<str>,
-    summary_key: Option<Arc<str>>,
+    summary_keys: &'static [&'static str],
     input: Value,
     tx: Sender<Request>,
 }
 
 impl ToolInvocation for LuaToolInvocation {
     fn start_summary(&self) -> String {
-        self.summary_key
-            .as_deref()
-            .and_then(|k| self.input.get(k))
-            .and_then(Value::as_str)
-            .map(String::from)
-            .unwrap_or_else(|| self.tool.to_string())
+        let parts: Vec<&str> = self
+            .summary_keys
+            .iter()
+            .filter_map(|k| self.input.get(*k).and_then(Value::as_str))
+            .collect();
+        if parts.is_empty() {
+            self.tool.to_string()
+        } else {
+            parts.join(" ")
+        }
     }
 
     fn execute<'a>(self: Box<Self>, ctx: &'a ToolContext) -> ExecFuture<'a> {
@@ -218,14 +224,8 @@ fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> Lua
 
     let schema_val: Value = lua.from_value(schema_table)?;
     let param_schema = try_from_json(&schema_val).map_err(mlua::Error::runtime)?;
+    let summary_keys = extract_summary_keys(&schema_val);
     let audience = parse_audience(audiences)?;
-    let summary_key: Option<Arc<str>> = spec
-        .get::<String>("summary_key")
-        .ok()
-        .map(|s| Arc::from(s.as_str()));
-    if let Some(ref key) = summary_key {
-        validate_summary_key(key, param_schema)?;
-    }
     let handler_key: RegistryKey = lua.create_registry_value(handler)?;
     let name: Arc<str> = Arc::from(name.as_str());
 
@@ -238,34 +238,10 @@ fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> Lua
             schema: param_schema,
             audience,
             handler_key,
-            summary_key,
+            summary_keys,
         });
 
     Ok(())
-}
-
-fn validate_summary_key(key: &str, schema: &ParamSchema) -> LuaResult<()> {
-    let ParamSchema::Object { properties, .. } = schema else {
-        return Err(mlua::Error::runtime(
-            "register_tool: summary_key requires an object schema",
-        ));
-    };
-    match properties.iter().find(|(name, _, _)| *name == key) {
-        Some((
-            _,
-            ParamSchema::Primitive {
-                kind: ParamKind::String,
-                ..
-            },
-            _,
-        )) => Ok(()),
-        Some(_) => Err(mlua::Error::runtime(format!(
-            "register_tool: summary_key '{key}' must reference a string property"
-        ))),
-        None => Err(mlua::Error::runtime(format!(
-            "register_tool: summary_key '{key}' not found in schema properties"
-        ))),
-    }
 }
 
 pub(crate) type ToolCallResult = Result<String, String>;
@@ -311,66 +287,65 @@ mod tests {
         assert_eq!(is_valid_tool_name(name), expected);
     }
 
-    fn invocation(summary_key: Option<&str>, input: Value) -> LuaToolInvocation {
+    fn invocation(summary_keys: &'static [&'static str], input: Value) -> LuaToolInvocation {
         let (tx, _rx) = flume::unbounded();
         LuaToolInvocation {
-            tool: Arc::from("index"),
-            plugin: Arc::from("index"),
-            summary_key: summary_key.map(Arc::from),
+            tool: Arc::from("test_tool"),
+            plugin: Arc::from("test"),
+            summary_keys,
             input,
             tx,
         }
     }
 
-    #[test_case::test_case(Some("path"), serde_json::json!({"path": "/home/x/foo.rs"}), "/home/x/foo.rs" ; "extracts_declared_key")]
-    #[test_case::test_case(Some("path"), serde_json::json!({"count": 5}), "index" ; "key_missing_falls_back_to_tool_name")]
-    #[test_case::test_case(Some("path"), serde_json::json!({"path": 42}), "index" ; "non_string_value_falls_back_to_tool_name")]
-    #[test_case::test_case(None, serde_json::json!({"path": "/home/x/foo.rs"}), "index" ; "no_key_declared")]
-    fn start_summary_cases(summary_key: Option<&str>, input: Value, expected: &str) {
-        let inv = invocation(summary_key, input);
+    #[test_case::test_case(&["path"], serde_json::json!({"path": "/home/x/foo.rs"}), "/home/x/foo.rs" ; "extracts_declared_key")]
+    #[test_case::test_case(&["path"], serde_json::json!({"count": 5}), "test_tool" ; "key_missing_falls_back_to_tool_name")]
+    #[test_case::test_case(&["path"], serde_json::json!({"path": 42}), "test_tool" ; "non_string_value_falls_back_to_tool_name")]
+    #[test_case::test_case(&[], serde_json::json!({"path": "/home/x/foo.rs"}), "test_tool" ; "no_keys_declared")]
+    #[test_case::test_case(&["pattern", "path"], serde_json::json!({"pattern": "foo", "path": "/src"}), "foo /src" ; "multiple_keys_joined")]
+    #[test_case::test_case(&["pattern", "path"], serde_json::json!({"pattern": "foo"}), "foo" ; "multiple_keys_partial")]
+    fn start_summary_cases(summary_keys: &'static [&'static str], input: Value, expected: &str) {
+        let inv = invocation(summary_keys, input);
         assert_eq!(inv.start_summary(), expected);
     }
 
-    fn object_schema(json: Value) -> &'static ParamSchema {
-        try_from_json(&json).expect("valid schema")
+    #[test]
+    fn summary_extracted_from_schema() {
+        let json = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "summary": true },
+                "count": { "type": "integer" }
+            },
+            "required": ["path"]
+        });
+        assert_eq!(extract_summary_keys(&json), &["path"]);
     }
 
     #[test]
-    fn validate_summary_key_accepts_valid_string_prop() {
-        let schema = object_schema(serde_json::json!({
+    fn summary_multiple_from_schema() {
+        let json = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "pattern": { "type": "string", "summary": true },
+                "path": { "type": "string", "summary": true },
+                "limit": { "type": "integer" }
+            },
+            "required": ["pattern"]
+        });
+        let keys = extract_summary_keys(&json);
+        assert!(keys.contains(&"pattern"));
+        assert!(keys.contains(&"path"));
+        assert_eq!(keys.len(), 2);
+    }
+
+    #[test]
+    fn no_summary_in_schema() {
+        let json = serde_json::json!({
             "type": "object",
             "properties": { "path": { "type": "string" } },
             "required": ["path"]
-        }));
-        assert!(validate_summary_key("path", schema).is_ok());
-    }
-
-    #[test]
-    fn validate_summary_key_rejects_missing_prop() {
-        let schema = object_schema(serde_json::json!({
-            "type": "object",
-            "properties": { "path": { "type": "string" } },
-            "required": ["path"]
-        }));
-        let err = validate_summary_key("missing", schema).unwrap_err();
-        assert!(err.to_string().contains("not found in schema"));
-    }
-
-    #[test]
-    fn validate_summary_key_rejects_non_string_prop() {
-        let schema = object_schema(serde_json::json!({
-            "type": "object",
-            "properties": { "count": { "type": "integer" } },
-            "required": ["count"]
-        }));
-        let err = validate_summary_key("count", schema).unwrap_err();
-        assert!(err.to_string().contains("must reference a string"));
-    }
-
-    #[test]
-    fn validate_summary_key_rejects_non_object_schema() {
-        let schema = object_schema(serde_json::json!({ "type": "string" }));
-        let err = validate_summary_key("anything", schema).unwrap_err();
-        assert!(err.to_string().contains("requires an object schema"));
+        });
+        assert!(extract_summary_keys(&json).is_empty());
     }
 }

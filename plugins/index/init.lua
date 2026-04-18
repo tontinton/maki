@@ -2,7 +2,6 @@ local indexer = require("indexer")
 
 maki.api.register_tool({
   name = "index",
-  summary_key = "path",
   description = [[
 Return a compact overview of a source file: imports, type definitions, function signatures, and structure with their line numbers surrounded by []. ~70-90% more efficient than reading the full file.
 
@@ -13,7 +12,7 @@ Return a compact overview of a source file: imports, type definitions, function 
   schema = {
     type = "object",
     properties = {
-      path = { type = "string", description = "Absolute path to the file" },
+      path = { type = "string", description = "Absolute path to the file", summary = true },
     },
     required = { "path" },
   },

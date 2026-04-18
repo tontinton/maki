@@ -1,15 +1,8 @@
 //! Derive macros for tool schemas.
 //!
-//! - `Tool`: generates `SCHEMA`, `schema()`, and `parse_input()` for top-level tool structs.
-//! - `Args`: generates `ITEM_SCHEMA` for structs used as nested objects.
-//! - `ArgEnum`: generates `ITEM_SCHEMA` for `#[serde(rename_all = "snake_case")]` enums.
-//!
-//! The actual shape of every parameter lives in one `ParamSchema` value
-//! over in `maki_agent::tools::schema`. We require `Deserialize` on the
-//! tool struct because once validation has cleaned the JSON up, we hand
-//! the result to `serde_json::from_value` and let serde do the last mile.
-//! That way defaults, renames, and tagged enums stay with serde instead
-//! of a hand-rolled field loop in here that would drift out of sync.
+//! The parameter shape lives in `ParamSchema` over in `maki_agent::tools::schema`.
+//! We let serde do the last mile (defaults, renames, tagged enums) so this crate
+//! only needs to build the schema, not reimplement serde's field logic.
 
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
@@ -116,9 +109,8 @@ fn is_value_type(ty: &Type) -> bool {
     false
 }
 
-/// `Option<T>` only gets peeled at the top level of a field. Inside a
-/// `Vec`, we keep whatever the user wrote so optional items still round
-/// trip through serde.
+/// `Option<T>` is only peeled at the top level of a field, not inside
+/// containers, so serde can still round-trip optional items.
 fn schema_ref(ty: &Type, description: &str, unwrap_option: bool) -> TokenStream2 {
     let inner = if unwrap_option {
         unwrapped_type(ty)

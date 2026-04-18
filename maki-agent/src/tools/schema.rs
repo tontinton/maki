@@ -1,11 +1,10 @@
-//! One `ParamSchema` per tool, declared at compile time, feeds both the
-//! JSON Schema we send the LLM and the validator that checks what comes
-//! back. Keeping them in one place is the whole point: if the two ever
-//! disagree, the model gets a schema that lies about what we accept.
+//! Each tool has one `ParamSchema` that drives both the JSON Schema sent to the
+//! LLM and the validator that checks its response. If those two ever disagree
+//! the model gets a schema that lies about what we accept, so one source of
+//! truth keeps us honest.
 //!
-//! Validation errors are our own typed values, rendered through a single
-//! `Display` impl, so the model never sees a stray serde or serde_json
-//! message we didn't write ourselves.
+//! Validation errors are our own types with a single `Display` impl so the
+//! model never sees a raw serde message we did not write.
 
 use std::fmt::{self, Display, Formatter, Write};
 
@@ -78,9 +77,9 @@ pub enum ParamSchema {
         properties: &'static [Property],
         description: &'static str,
     },
-    /// Used for `serde_json::Value` fields where we genuinely want to let
-    /// anything through, like batch entry parameters.
-    Any { description: &'static str },
+    Any {
+        description: &'static str,
+    },
 }
 
 pub fn to_json_schema(s: &ParamSchema) -> Value {
@@ -136,9 +135,8 @@ pub fn to_json_schema(s: &ParamSchema) -> Value {
     }
 }
 
-/// `Box::leak` everything so the result is `&'static`, matching native tool schemas
-/// which are `const`. Leaks are proportional to schema size, so reloading a plugin
-/// leaks the old schemas. Acceptable because the set is small and fixed per session.
+/// Leaks everything to get `&'static` lifetimes matching native tool schemas.
+/// The leaked set is small and fixed per session, so this is fine.
 pub fn try_from_json(v: &Value) -> Result<&'static ParamSchema, String> {
     let description: &'static str = v
         .get("description")
@@ -219,6 +217,23 @@ pub fn try_from_json(v: &Value) -> Result<&'static ParamSchema, String> {
     };
 
     Ok(Box::leak(Box::new(schema)))
+}
+
+/// Pulls property names marked `"summary": true` out of a JSON schema.
+/// Leaks like `try_from_json` so the result is `&'static`.
+pub fn extract_summary_keys(v: &Value) -> &'static [&'static str] {
+    let Some(props) = v.get("properties").and_then(|p| p.as_object()) else {
+        return &[];
+    };
+    let keys: Vec<&'static str> = props
+        .iter()
+        .filter(|(_, sub)| sub.get("summary").and_then(|v| v.as_bool()) == Some(true))
+        .map(|(name, _)| -> &'static str { Box::leak(name.clone().into_boxed_str()) })
+        .collect();
+    if keys.is_empty() {
+        return &[];
+    }
+    Box::leak(keys.into_boxed_slice())
 }
 
 #[derive(Debug, Clone)]
@@ -481,10 +496,8 @@ fn validate_object(
     Ok(Value::Object(out))
 }
 
-/// Always returns a `Value` of the requested kind, so callers can safely
-/// destructure with `unreachable!` in the else arm. Models sometimes
-/// stringify the whole array or object, so we try parsing the string
-/// before giving up.
+/// Models sometimes stringify arrays and objects, so we try parsing the
+/// string as JSON before giving up.
 fn coerce_container(
     value: Value,
     expected: ParamKind,
@@ -551,11 +564,10 @@ fn log_coercion(
     );
 }
 
-/// The one path every `Tool` derive takes: validate first so the LLM gets
-/// our nice structured errors, then let serde handle defaults, renames,
-/// and tagged enums. If serde still fails after validation passed, the
-/// schema is out of sync with the Rust type. That's on us, not the model,
-/// hence the `InternalBug` error kind.
+/// Validate first so the LLM gets our structured errors, then hand off to
+/// serde for defaults, renames, and tagged enums. If serde fails after
+/// validation passed, the schema is out of sync with the Rust type, not
+/// the model's fault, so we report `InternalBug`.
 pub(crate) fn validate_and_deserialize<T: DeserializeOwned>(
     schema: &ParamSchema,
     input: Value,
@@ -569,8 +581,6 @@ pub(crate) fn validate_and_deserialize<T: DeserializeOwned>(
     })
 }
 
-/// Ceiling on a rendered validator error, shared so unit and integration
-/// tests agree on the same budget.
 #[cfg(test)]
 pub(crate) const BOUNDED_ERR_MAX: usize = 400;
 
