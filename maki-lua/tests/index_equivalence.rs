@@ -184,7 +184,7 @@ fn lua_matches_native(source: &str, ext: &str, lang: Language) {
     equivalence_support::assert_equivalent(&native, &lua);
 }
 
-#[test_case("test.go",  "package main\nfunc main() {}" ; "unsupported_extension")]
+#[test_case("test.xyz", "some content" ; "unsupported_extension")]
 #[test_case("Makefile", "all:\n\techo hi"                ; "no_extension")]
 fn delegates_to_native(filename: &str, source: &str) {
     let s = setup();

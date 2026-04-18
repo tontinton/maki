@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
+use include_dir::Dir;
 use maki_agent::cancel::CancelToken;
 use maki_agent::tools::{RegistryError, Tool, ToolRegistry, ToolSource};
 use mlua::{Function, Lua, LuaSerdeExt, RegistryKey, Value as LuaValue, VmState};
@@ -63,6 +64,7 @@ struct LuaRuntime {
     cwd: PathBuf,
     call_state: Arc<Mutex<Option<CallState>>>,
     shutdown: Arc<AtomicBool>,
+    bundled_dirs: &'static [&'static Dir<'static>],
 }
 
 impl LuaRuntime {
@@ -70,6 +72,7 @@ impl LuaRuntime {
         registry: Arc<ToolRegistry>,
         tx: flume::Sender<Request>,
         shutdown: Arc<AtomicBool>,
+        bundled_dirs: &'static [&'static Dir<'static>],
     ) -> Result<Self, PluginError> {
         let lua = Lua::new();
         let pending: PendingTools = Arc::new(Mutex::new(Vec::new()));
@@ -117,6 +120,7 @@ impl LuaRuntime {
             cwd,
             call_state,
             shutdown,
+            bundled_dirs,
         })
     }
 
@@ -168,8 +172,8 @@ impl LuaRuntime {
         let env = self.lua.create_table()?;
         env.set("maki", maki)?;
 
-        if let Some(root) = require_root {
-            let require_fn = self.create_require_fn(&env, root)?;
+        if require_root.is_some() || !self.bundled_dirs.is_empty() {
+            let require_fn = self.create_require_fn(&env, require_root)?;
             env.set("require", require_fn)?;
         }
 
@@ -182,14 +186,13 @@ impl LuaRuntime {
     fn create_require_fn(
         &self,
         env: &mlua::Table,
-        require_root: PathBuf,
+        require_root: Option<PathBuf>,
     ) -> Result<Function, mlua::Error> {
-        let lua_dir = require_root
-            .canonicalize()
-            .unwrap_or_else(|_| require_root.clone());
+        let lua_dir = require_root.map(|r| r.canonicalize().unwrap_or(r));
         let loaded = self.lua.create_table()?;
         let loading = self.lua.create_table()?;
         let env_clone = env.clone();
+        let bundled_dirs = self.bundled_dirs;
 
         self.lua.create_function(move |lua, modname: String| {
             if modname.is_empty() {
@@ -211,15 +214,33 @@ impl LuaRuntime {
             loading.set(modname.as_str(), true)?;
 
             let rel_path = modname.replace('.', "/") + ".lua";
-            let abs_path = lua_dir.join(&rel_path);
-            let abs_str = abs_path.to_string_lossy();
 
-            let resolved = check_sandbox(&abs_str, std::slice::from_ref(&lua_dir))?;
+            let source_str: Result<Option<String>, mlua::Error> = (|| {
+                for dir in bundled_dirs {
+                    if let Some(file) = dir.get_file(&rel_path) {
+                        if let Some(contents) = file.contents_utf8() {
+                            return Ok(Some(contents.to_owned()));
+                        }
+                    }
+                }
+                let Some(dir) = lua_dir.as_ref() else {
+                    return Ok(None);
+                };
+                let abs_path = dir.join(&rel_path);
+                let abs_str = abs_path.to_string_lossy();
+                let resolved = check_sandbox(&abs_str, std::slice::from_ref(dir))
+                    .map_err(|e| mlua::Error::runtime(e.to_string()))?;
+                Ok(std::fs::read_to_string(&resolved).ok())
+            })();
 
-            let source = std::fs::read_to_string(&resolved).map_err(|e| {
+            let source_str = source_str?;
+
+            let Some(source) = source_str else {
                 let _ = loading.set(modname.as_str(), LuaValue::Nil);
-                mlua::Error::runtime(format!("require '{modname}': {e}"))
-            })?;
+                return Err(mlua::Error::runtime(format!(
+                    "require '{modname}': module not found"
+                )));
+            };
 
             let result: LuaValue = match lua
                 .load(&source)
@@ -387,7 +408,10 @@ pub(crate) struct LuaThread {
     pub shutdown: Arc<AtomicBool>,
 }
 
-pub fn spawn(registry: Arc<ToolRegistry>) -> Result<LuaThread, PluginError> {
+pub fn spawn(
+    registry: Arc<ToolRegistry>,
+    bundled_dirs: &'static [&'static Dir<'static>],
+) -> Result<LuaThread, PluginError> {
     let (tx, rx) = flume::unbounded::<Request>();
     let tx_clone = tx.clone();
     let shutdown: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
@@ -397,7 +421,7 @@ pub fn spawn(registry: Arc<ToolRegistry>) -> Result<LuaThread, PluginError> {
     let handle = thread::Builder::new()
         .name("maki-lua".to_owned())
         .spawn(move || {
-            let mut rt = match LuaRuntime::new(registry, tx_clone, shutdown_thread) {
+            let mut rt = match LuaRuntime::new(registry, tx_clone, shutdown_thread, bundled_dirs) {
                 Ok(r) => {
                     let _ = init_tx.send(Ok(()));
                     r

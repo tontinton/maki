@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use include_dir::{Dir, include_dir};
 use maki_agent::tools::ToolRegistry;
 use maki_config::LuaPluginsConfig;
 
@@ -12,10 +13,8 @@ use crate::runtime::{self, LuaThread, Request};
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
-const BUNDLED_INDEX: &str = include_str!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../plugins/index/init.lua"
-));
+static BUNDLED_INDEX_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/../plugins/index");
+static BUNDLED_DIRS: &[&Dir] = &[&BUNDLED_INDEX_DIR];
 
 pub struct PluginHost {
     inner: Option<LuaThread>,
@@ -52,19 +51,26 @@ impl PluginHost {
             return Ok(Self { inner: None });
         }
 
-        let lua = runtime::spawn(registry)?;
+        let lua = runtime::spawn(registry, BUNDLED_DIRS)?;
         let host = Self { inner: Some(lua) };
 
         for builtin in &config.builtins {
-            let source = match builtin.as_str() {
-                "index" => BUNDLED_INDEX,
+            let dir = match builtin.as_str() {
+                "index" => &BUNDLED_INDEX_DIR,
                 other => {
                     tracing::warn!(builtin = other, "unknown builtin plugin, skipping");
                     continue;
                 }
             };
+            let init = dir
+                .get_file("init.lua")
+                .and_then(|f| f.contents_utf8())
+                .ok_or_else(|| PluginError::Lua {
+                    plugin: builtin.clone(),
+                    source: mlua::Error::runtime("bundled plugin missing init.lua"),
+                })?;
             let name: Arc<str> = Arc::from(builtin.as_str());
-            host.load_source_named(name, source.to_owned(), None)?;
+            host.load_source_named(name, init.to_owned(), None)?;
         }
 
         if let Some(ref init_path) = config.init_file {

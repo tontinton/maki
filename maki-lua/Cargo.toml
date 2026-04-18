@@ -20,6 +20,7 @@ futures-lite = { workspace = true }
 tree-sitter = { workspace = true }
 regex = { workspace = true }
 maki-code-index = { workspace = true }
+include_dir = { workspace = true }
 
 [dev-dependencies]
 maki-agent = { workspace = true }

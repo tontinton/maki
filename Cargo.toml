@@ -131,6 +131,7 @@ criterion = { version = "0.5", features = ["html_reports"] }
 dirs = "6"
 dotenvy = "0.15"
 tree-sitter = "0.26"
+include_dir = "0.7"
 mlua = { version = "0.11", features = ["luau", "async", "send", "serde", "macros"] }
 tree-sitter-bash = "0.25"
 tree-sitter-elixir = "0.3"
