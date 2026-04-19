@@ -634,6 +634,27 @@ pub(crate) fn interpreter_ctx(
     }
 }
 
+/// Minimal ToolContext for CLI one-shot tool execution (e.g. `maki index`).
+/// Allows everything, sends events to a dummy channel, uses no model.
+pub fn cli_tool_ctx() -> ToolContext {
+    let (tx, _rx) = flume::unbounded::<crate::Envelope>();
+    let event_tx = crate::EventSender::new(tx, 0);
+    interpreter_ctx(
+        &AgentMode::Build,
+        &event_tx,
+        CancelToken::none(),
+        Arc::new(PermissionManager::new(
+            maki_config::PermissionsConfig {
+                allow_all: true,
+                rules: vec![],
+            },
+            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+        )),
+        Arc::new(FileReadTracker::new()),
+        None,
+    )
+}
+
 pub mod test_support {
     use crate::{Envelope, EventSender};
 

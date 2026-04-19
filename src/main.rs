@@ -236,10 +236,40 @@ fn run() -> Result<()> {
         Some(Command::Index { path }) => {
             let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
             let config = load_config(&cwd, false);
-            let output =
-                maki_code_index::index_file(Path::new(&path), config.agent.index_max_file_size)
-                    .context("index file")?;
-            print!("{output}");
+            let abs_path = Path::new(&path)
+                .canonicalize()
+                .unwrap_or_else(|_| Path::new(&path).to_path_buf());
+            let _plugin_host =
+                PluginHost::new(&config.plugins, Arc::clone(ToolRegistry::native_arc()))
+                    .context("initialize lua plugin host")?;
+            let input = serde_json::json!({"path": abs_path.to_str().unwrap_or(&path)});
+            let reg = ToolRegistry::native_arc();
+            let entry = reg
+                .get("index")
+                .ok_or_else(|| color_eyre::eyre::eyre!("index tool not registered"))?;
+            let inv = entry
+                .tool
+                .parse(&input)
+                .map_err(|e| color_eyre::eyre::eyre!("parse index input: {e}"))?;
+            let ctx = maki_agent::tools::cli_tool_ctx();
+            let result: Result<maki_agent::ToolOutput, String> =
+                smol::block_on(async { inv.execute(&ctx).await });
+            match result {
+                Ok(output) => {
+                    let text = output.as_text();
+                    if text == "DELEGATE_NATIVE" {
+                        let output = maki_code_index::index_file(
+                            &abs_path,
+                            config.agent.index_max_file_size,
+                        )
+                        .context("index file")?;
+                        print!("{output}");
+                    } else {
+                        print!("{text}");
+                    }
+                }
+                Err(e) => bail!("index failed: {e}"),
+            }
         }
         Some(Command::FindSymbol { symbol, file, line }) => {
             let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
