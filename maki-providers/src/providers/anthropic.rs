@@ -275,15 +275,15 @@ fn resolve_auth() -> Result<super::ResolvedAuth, AgentError> {
 }
 
 #[derive(Deserialize)]
-struct Usage {
+pub(crate) struct Usage {
     #[serde(default)]
-    input_tokens: u32,
+    pub(crate) input_tokens: u32,
     #[serde(default)]
-    output_tokens: u32,
+    pub(crate) output_tokens: u32,
     #[serde(default)]
-    cache_creation_input_tokens: u32,
+    pub(crate) cache_creation_input_tokens: u32,
     #[serde(default)]
-    cache_read_input_tokens: u32,
+    pub(crate) cache_read_input_tokens: u32,
 }
 
 impl From<Usage> for TokenUsage {
@@ -298,19 +298,19 @@ impl From<Usage> for TokenUsage {
 }
 
 #[derive(Deserialize)]
-struct MessagePayload {
+pub(crate) struct MessagePayload {
     #[serde(default)]
-    usage: Option<Usage>,
+    pub(crate) usage: Option<Usage>,
 }
 
 #[derive(Deserialize)]
-struct MessageStartEvent {
-    message: MessagePayload,
+pub(crate) struct MessageStartEvent {
+    pub(crate) message: MessagePayload,
 }
 
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-enum SseContentBlock {
+pub(crate) enum SseContentBlock {
     Text,
     Thinking,
     RedactedThinking { data: String },
@@ -318,14 +318,14 @@ enum SseContentBlock {
 }
 
 #[derive(Deserialize)]
-struct ContentBlockStartEvent {
-    index: usize,
-    content_block: SseContentBlock,
+pub(crate) struct ContentBlockStartEvent {
+    pub(crate) index: usize,
+    pub(crate) content_block: SseContentBlock,
 }
 
 #[derive(Deserialize)]
 #[serde(tag = "type")]
-enum Delta {
+pub(crate) enum Delta {
     #[serde(rename = "text_delta")]
     Text { text: String },
     #[serde(rename = "thinking_delta")]
@@ -337,23 +337,23 @@ enum Delta {
 }
 
 #[derive(Deserialize)]
-struct ContentBlockDeltaEvent {
-    index: usize,
-    delta: Delta,
+pub(crate) struct ContentBlockDeltaEvent {
+    pub(crate) index: usize,
+    pub(crate) delta: Delta,
 }
 
 #[derive(Deserialize)]
-struct MessageDeltaPayload {
+pub(crate) struct MessageDeltaPayload {
     #[serde(default)]
-    stop_reason: Option<String>,
+    pub(crate) stop_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
-struct MessageDeltaEvent {
+pub(crate) struct MessageDeltaEvent {
     #[serde(default)]
-    delta: Option<MessageDeltaPayload>,
+    pub(crate) delta: Option<MessageDeltaPayload>,
     #[serde(default)]
-    usage: Option<Usage>,
+    pub(crate) usage: Option<Usage>,
 }
 
 pub struct Anthropic {
@@ -590,7 +590,7 @@ fn build_wire_tools(tools: &Value) -> Value {
     Value::Array(out)
 }
 
-async fn parse_sse(
+pub(crate) async fn parse_sse(
     response: isahc::Response<isahc::AsyncBody>,
     event_tx: &Sender<ProviderEvent>,
     stream_timeout: Duration,
