@@ -69,8 +69,8 @@ super::impl_tool!(
 );
 
 impl super::ToolInvocation for Edit {
-    fn start_summary(&self) -> String {
-        Edit::start_summary(self)
+    fn start_summary(&self) -> super::SummaryFuture {
+        super::SummaryFuture::Ready(Edit::start_summary(self))
     }
     fn mutable_path(&self) -> Option<&Path> {
         Some(Path::new(&self.path))

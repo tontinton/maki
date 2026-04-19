@@ -101,8 +101,8 @@ super::impl_tool!(
 );
 
 impl super::ToolInvocation for MultiEdit {
-    fn start_summary(&self) -> String {
-        MultiEdit::start_summary(self)
+    fn start_summary(&self) -> super::SummaryFuture {
+        super::SummaryFuture::Ready(MultiEdit::start_summary(self))
     }
     fn start_annotation(&self) -> Option<String> {
         Some(self.edit_count_label())

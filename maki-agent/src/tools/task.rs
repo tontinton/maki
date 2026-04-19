@@ -209,8 +209,8 @@ impl Task {
 super::impl_tool!(Task, audience = super::ToolAudience::MAIN);
 
 impl super::ToolInvocation for Task {
-    fn start_summary(&self) -> String {
-        Task::start_summary(self)
+    fn start_summary(&self) -> super::SummaryFuture {
+        super::SummaryFuture::Ready(Task::start_summary(self))
     }
     fn permission_scope(&self) -> Option<String> {
         Some(format!("task:{}", self.description))

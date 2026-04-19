@@ -162,8 +162,8 @@ impl WebFetch {
 super::impl_tool!(WebFetch);
 
 impl super::ToolInvocation for WebFetch {
-    fn start_summary(&self) -> String {
-        WebFetch::start_summary(self)
+    fn start_summary(&self) -> super::SummaryFuture {
+        super::SummaryFuture::Ready(WebFetch::start_summary(self))
     }
     fn permission_scope(&self) -> Option<String> {
         Some(self.url.clone())

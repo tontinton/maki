@@ -31,8 +31,8 @@ mod write;
 
 pub use file_tracker::FileReadTracker;
 pub use registry::{
-    ExecFuture, Native, ParseError, RegisteredTool, RegistryError, Tool, ToolAudience,
-    ToolInvocation, ToolRegistry, ToolSource,
+    ExecFuture, Native, ParseError, RegisteredTool, RegistryError, SummaryFuture, Tool,
+    ToolAudience, ToolInvocation, ToolRegistry, ToolSource,
 };
 
 use std::collections::HashSet;

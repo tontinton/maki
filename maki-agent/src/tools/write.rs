@@ -67,8 +67,8 @@ super::impl_tool!(
 );
 
 impl super::ToolInvocation for Write {
-    fn start_summary(&self) -> String {
-        Write::start_summary(self)
+    fn start_summary(&self) -> super::SummaryFuture {
+        super::SummaryFuture::Ready(Write::start_summary(self))
     }
     fn start_output(&self) -> Option<ToolOutput> {
         let path = super::resolve_path(&self.path).ok()?;

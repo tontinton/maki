@@ -106,7 +106,7 @@ pub async fn run(
         let start = ToolStartEvent {
             id: id.clone(),
             tool: Arc::clone(&tool_id),
-            summary: invocation.start_summary(),
+            summary: invocation.start_summary().await,
             annotation: invocation.start_annotation(),
             input: invocation.start_input(),
             output: invocation.start_output(),

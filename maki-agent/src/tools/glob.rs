@@ -58,13 +58,13 @@ impl Glob {
 super::impl_tool!(Glob);
 
 impl super::ToolInvocation for Glob {
-    fn start_summary(&self) -> String {
+    fn start_summary(&self) -> super::SummaryFuture {
         let mut s = self.pattern.clone();
         if let Some(dir) = &self.path {
             s.push_str(" in ");
             s.push_str(&relative_path(dir));
         }
-        s
+        super::SummaryFuture::Ready(s)
     }
     fn execute<'a>(self: Box<Self>, ctx: &'a super::ToolContext) -> super::ExecFuture<'a> {
         Box::pin(async move { Glob::execute(&self, ctx).await })
@@ -84,6 +84,6 @@ mod tests {
             pattern: pattern.into(),
             path: path.map(Into::into),
         };
-        assert_eq!(g.start_summary(), expected);
+        assert_eq!(g.start_summary().into_ready(), expected);
     }
 }

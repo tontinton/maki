@@ -323,7 +323,7 @@ pub fn history_to_display(
                                 .and_then(|entry| entry.try_parse(input));
                             let summary = tool_call
                                 .as_deref()
-                                .map(|tc| tc.start_summary())
+                                .map(|tc| tc.start_summary().into_ready())
                                 .unwrap_or_else(|| name.clone());
                             let tool_input = tool_call.as_deref().and_then(|tc| tc.start_input());
                             let (status, result_text) = results

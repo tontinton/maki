@@ -3,6 +3,7 @@ pub(crate) mod fs;
 pub(crate) mod log;
 pub(crate) mod tool;
 pub(crate) mod treesitter;
+pub(crate) mod uv;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -23,6 +24,7 @@ pub(crate) fn create_maki_global(
     maki.set("fs", fs::create_fs_table(lua, fs_roots)?)?;
     maki.set("log", log::create_log_table(lua, plugin)?)?;
     maki.set("treesitter", treesitter::create_treesitter_table(lua)?)?;
+    maki.set("uv", uv::create_uv_table(lua)?)?;
 
     Ok(maki)
 }

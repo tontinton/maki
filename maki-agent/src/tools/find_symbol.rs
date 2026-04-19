@@ -91,8 +91,8 @@ impl FindSymbol {
 super::impl_tool!(FindSymbol);
 
 impl super::ToolInvocation for FindSymbol {
-    fn start_summary(&self) -> String {
-        FindSymbol::start_summary(self)
+    fn start_summary(&self) -> super::SummaryFuture {
+        super::SummaryFuture::Ready(FindSymbol::start_summary(self))
     }
     fn execute<'a>(self: Box<Self>, ctx: &'a super::ToolContext) -> super::ExecFuture<'a> {
         Box::pin(async move { FindSymbol::execute(&self, ctx).await })

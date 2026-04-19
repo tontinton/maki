@@ -152,8 +152,8 @@ super::impl_tool!(
 );
 
 impl super::ToolInvocation for CodeExecution {
-    fn start_summary(&self) -> String {
-        CodeExecution::start_summary(self)
+    fn start_summary(&self) -> super::SummaryFuture {
+        super::SummaryFuture::Ready(CodeExecution::start_summary(self))
     }
     fn start_input(&self) -> Option<ToolInput> {
         Some(ToolInput::Script {

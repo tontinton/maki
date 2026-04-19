@@ -1,5 +1,19 @@
 local indexer = require("indexer")
 
+local function normalize(p)
+  local cwd = maki.uv.cwd()
+  if cwd and p:sub(1, #cwd + 1) == cwd .. "/" then
+    local rel = p:sub(#cwd + 2)
+    return rel == "" and "." or rel
+  end
+  local home = maki.uv.os_homedir()
+  if home and p:sub(1, #home + 1) == home .. "/" then
+    local rel = p:sub(#home + 2)
+    return rel == "" and "~" or "~/" .. rel
+  end
+  return p
+end
+
 maki.api.register_tool({
   name = "index",
   description = [[
@@ -12,10 +26,13 @@ Return a compact overview of a source file: imports, type definitions, function 
   schema = {
     type = "object",
     properties = {
-      path = { type = "string", description = "Absolute path to the file", summary = true },
+      path = { type = "string", description = "Absolute path to the file" },
     },
     required = { "path" },
   },
+  summary = function(input)
+    return normalize(input.path)
+  end,
   handler = function(input, _)
     local path = input.path
     if not path then

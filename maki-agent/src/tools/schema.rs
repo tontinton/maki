@@ -219,23 +219,6 @@ pub fn try_from_json(v: &Value) -> Result<&'static ParamSchema, String> {
     Ok(Box::leak(Box::new(schema)))
 }
 
-/// Pulls property names marked `"summary": true` out of a JSON schema.
-/// Leaks like `try_from_json` so the result is `&'static`.
-pub fn extract_summary_keys(v: &Value) -> &'static [&'static str] {
-    let Some(props) = v.get("properties").and_then(|p| p.as_object()) else {
-        return &[];
-    };
-    let keys: Vec<&'static str> = props
-        .iter()
-        .filter(|(_, sub)| sub.get("summary").and_then(|v| v.as_bool()) == Some(true))
-        .map(|(name, _)| -> &'static str { Box::leak(name.clone().into_boxed_str()) })
-        .collect();
-    if keys.is_empty() {
-        return &[];
-    }
-    Box::leak(keys.into_boxed_slice())
-}
-
 #[derive(Debug, Clone)]
 enum PathSeg {
     Field(&'static str),

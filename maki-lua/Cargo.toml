@@ -21,6 +21,7 @@ tree-sitter = { workspace = true }
 regex = { workspace = true }
 maki-code-index = { workspace = true }
 include_dir = { workspace = true }
+dirs = { workspace = true }
 
 [dev-dependencies]
 maki-agent = { workspace = true }

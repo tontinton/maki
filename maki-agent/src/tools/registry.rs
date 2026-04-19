@@ -6,6 +6,7 @@ use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
+use std::task::{Context, Poll};
 
 use arc_swap::ArcSwap;
 use bitflags::bitflags;
@@ -55,11 +56,39 @@ pub type ParseError = super::schema::ToolInputError;
 
 pub type ExecFuture<'a> = Pin<Box<dyn Future<Output = Result<ToolOutput, String>> + Send + 'a>>;
 
+pub enum SummaryFuture {
+    Ready(String),
+    Pending(Pin<Box<dyn Future<Output = String> + Send>>),
+}
+
+impl SummaryFuture {
+    pub fn into_ready(self) -> String {
+        match self {
+            Self::Ready(s) => s,
+            Self::Pending(_) => {
+                debug_assert!(false, "into_ready() on Pending SummaryFuture");
+                String::new()
+            }
+        }
+    }
+}
+
+impl Future for SummaryFuture {
+    type Output = String;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<String> {
+        match self.get_mut() {
+            Self::Ready(s) => Poll::Ready(std::mem::take(s)),
+            Self::Pending(fut) => fut.as_mut().poll(cx),
+        }
+    }
+}
+
 /// Holds the parsed input so start-event and `execute` share one parse pass.
 /// `permission_scope` and `mutable_path` belong here because only the parsed
 /// call knows which file it will touch.
 pub trait ToolInvocation: Send + Sync {
-    fn start_summary(&self) -> String;
+    fn start_summary(&self) -> SummaryFuture;
     fn start_annotation(&self) -> Option<String> {
         None
     }
@@ -453,8 +482,8 @@ mod tests {
     struct MockInvocation;
 
     impl ToolInvocation for MockInvocation {
-        fn start_summary(&self) -> String {
-            "mock".into()
+        fn start_summary(&self) -> SummaryFuture {
+            SummaryFuture::Ready("mock".into())
         }
         fn execute<'a>(self: Box<Self>, _ctx: &'a super::ToolContext) -> ExecFuture<'a> {
             Box::pin(async { Ok(ToolOutput::Plain(String::new())) })

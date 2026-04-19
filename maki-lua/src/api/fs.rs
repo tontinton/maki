@@ -6,6 +6,37 @@ use std::sync::Arc;
 use mlua::{Buffer, Lua, Result as LuaResult, Table};
 
 const SANDBOX_ERR: &str = "path outside sandbox";
+const NON_UTF8: &str = "non-utf8 path";
+
+fn expand_tilde(path: &str) -> PathBuf {
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    } else if path == "~" {
+        if let Some(home) = dirs::home_dir() {
+            return home;
+        }
+    }
+    PathBuf::from(path)
+}
+
+fn make_absolute(path: &str) -> LuaResult<PathBuf> {
+    let p = expand_tilde(path);
+    if p.is_absolute() {
+        Ok(p)
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(&p))
+            .map_err(|e| mlua::Error::runtime(format!("cannot resolve cwd: {e}")))
+    }
+}
+
+fn path_to_string(p: &Path) -> LuaResult<String> {
+    p.to_str()
+        .map(|s| s.to_owned())
+        .ok_or_else(|| mlua::Error::runtime(NON_UTF8))
+}
 
 /// Canonicalize the deepest existing ancestor, then re-append the rest lexically.
 /// This way plugins can write to paths that don't exist yet, but symlink escapes
@@ -108,6 +139,155 @@ pub(crate) fn create_fs_table(lua: &Lua, roots: Arc<[PathBuf]>) -> LuaResult<Tab
         })?,
     )?;
 
+    // vim.fs-compatible path utilities
+
+    t.set(
+        "dirname",
+        lua.create_function(|_, file: String| {
+            Ok(Path::new(&file)
+                .parent()
+                .and_then(|p| p.to_str())
+                .map(|s| s.to_owned()))
+        })?,
+    )?;
+
+    t.set(
+        "basename",
+        lua.create_function(|_, file: String| {
+            Ok(Path::new(&file)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|s| s.to_owned()))
+        })?,
+    )?;
+
+    t.set(
+        "joinpath",
+        lua.create_function(|_, parts: mlua::Variadic<String>| {
+            let mut buf = PathBuf::new();
+            for part in parts.iter() {
+                buf.push(part);
+            }
+            path_to_string(&buf)
+        })?,
+    )?;
+
+    t.set(
+        "normalize",
+        lua.create_function(|_, path: String| {
+            let abs = make_absolute(&path)?;
+            let mut components = Vec::new();
+            for comp in abs.components() {
+                match comp {
+                    Component::ParentDir => {
+                        components.pop();
+                    }
+                    Component::CurDir => {}
+                    _ => components.push(comp),
+                }
+            }
+            let result: PathBuf = components.iter().collect();
+            path_to_string(&result)
+        })?,
+    )?;
+
+    t.set(
+        "abspath",
+        lua.create_function(|_, path: String| path_to_string(&make_absolute(&path)?))?,
+    )?;
+
+    t.set(
+        "parents",
+        lua.create_function(|lua, start: String| {
+            let p = Path::new(&start);
+            let tbl = lua.create_table()?;
+            let mut i = 1;
+            let mut current = p.parent();
+            while let Some(parent) = current {
+                if let Some(s) = parent.to_str() {
+                    tbl.set(i, s)?;
+                    i += 1;
+                }
+                current = parent.parent();
+            }
+            Ok(tbl)
+        })?,
+    )?;
+
+    t.set(
+        "root",
+        lua.create_function(|_, (source, marker): (String, mlua::Value)| {
+            let markers: Vec<String> = match marker {
+                mlua::Value::String(s) => vec![s.to_str()?.to_owned()],
+                mlua::Value::Table(t) => {
+                    let mut v = Vec::new();
+                    for pair in t.sequence_values::<String>() {
+                        v.push(pair?);
+                    }
+                    v
+                }
+                _ => {
+                    return Err(mlua::Error::runtime(
+                        "fs.root: marker must be a string or list of strings",
+                    ));
+                }
+            };
+
+            let start = Path::new(&source);
+            let start = if start.is_file() || !start.exists() {
+                start.parent().unwrap_or(start)
+            } else {
+                start
+            };
+
+            let mut dir = make_absolute(start.to_str().unwrap_or_default())?;
+
+            loop {
+                for m in &markers {
+                    if dir.join(m).exists() {
+                        return Ok(Some(path_to_string(&dir)?));
+                    }
+                }
+                if !dir.pop() {
+                    return Ok(None);
+                }
+            }
+        })?,
+    )?;
+
+    t.set(
+        "relpath",
+        lua.create_function(|_, (base, target): (String, String)| {
+            let base_comps: Vec<_> = Path::new(&base).components().collect();
+            let target_comps: Vec<_> = Path::new(&target).components().collect();
+
+            let common = base_comps
+                .iter()
+                .zip(target_comps.iter())
+                .take_while(|(a, b)| a == b)
+                .count();
+
+            let mut result = PathBuf::new();
+            for _ in common..base_comps.len() {
+                result.push("..");
+            }
+            for comp in &target_comps[common..] {
+                result.push(comp);
+            }
+            path_to_string(&result)
+        })?,
+    )?;
+
+    t.set(
+        "ext",
+        lua.create_function(|_, file: String| {
+            Ok(Path::new(&file)
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|s| s.to_owned()))
+        })?,
+    )?;
+
     Ok(t)
 }
 
@@ -116,6 +296,7 @@ mod tests {
     use super::*;
     use mlua::Lua;
     use tempfile::TempDir;
+    use test_case::test_case;
 
     fn roots(dirs: &[&Path]) -> Arc<[PathBuf]> {
         dirs.iter()
@@ -125,48 +306,45 @@ mod tests {
     }
 
     #[test]
-    fn fs_read_within_cwd_ok() {
+    fn read_within_sandbox_ok() {
         let tmp = TempDir::new().unwrap();
         let file = tmp.path().join("hello.txt");
         std::fs::write(&file, "world").unwrap();
 
         let lua = Lua::new();
-        let allowed = roots(&[tmp.path()]);
-        let tbl = create_fs_table(&lua, allowed).unwrap();
+        let tbl = create_fs_table(&lua, roots(&[tmp.path()])).unwrap();
         let read: mlua::Function = tbl.get("read").unwrap();
         let result: String = read.call(file.to_str().unwrap()).unwrap();
         assert_eq!(result, "world");
     }
 
-    #[test]
-    fn fs_read_outside_cwd_denied() {
+    #[test_case("read"     ; "read")]
+    #[test_case("read_bytes" ; "read_bytes")]
+    #[test_case("metadata" ; "metadata")]
+    fn sandbox_denies_outside_path(fn_name: &str) {
         let tmp = TempDir::new().unwrap();
-
         let lua = Lua::new();
-        let allowed = roots(&[tmp.path()]);
-        let tbl = create_fs_table(&lua, allowed).unwrap();
-        let read: mlua::Function = tbl.get("read").unwrap();
-        let err = read
-            .call::<String>("/etc/hostname")
+        let tbl = create_fs_table(&lua, roots(&[tmp.path()])).unwrap();
+        let f: mlua::Function = tbl.get(fn_name).unwrap();
+        let err = f
+            .call::<mlua::Value>("/etc/hostname")
             .unwrap_err()
             .to_string();
         assert!(
             err.contains(SANDBOX_ERR),
-            "expected sandbox error, got: {err}"
+            "{fn_name}: expected sandbox error, got: {err}"
         );
     }
 
     #[cfg(unix)]
     #[test]
-    fn fs_read_symlink_escape_denied() {
+    fn symlink_escape_denied() {
         let tmp = TempDir::new().unwrap();
         let link = tmp.path().join("escape");
         std::os::unix::fs::symlink("/etc/hostname", &link).unwrap();
 
         let lua = Lua::new();
-        let allowed = roots(&[tmp.path()]);
-        let tbl = create_fs_table(&lua, allowed).unwrap();
-
+        let tbl = create_fs_table(&lua, roots(&[tmp.path()])).unwrap();
         let read: mlua::Function = tbl.get("read").unwrap();
         let err = read
             .call::<String>(link.to_str().unwrap())
@@ -175,42 +353,6 @@ mod tests {
         assert!(
             err.contains(SANDBOX_ERR),
             "expected sandbox error for symlink escape, got: {err}"
-        );
-    }
-
-    #[test]
-    fn fs_read_bytes_sandbox_check() {
-        let tmp = TempDir::new().unwrap();
-
-        let lua = Lua::new();
-        let allowed = roots(&[tmp.path()]);
-        let tbl = create_fs_table(&lua, allowed).unwrap();
-        let read_bytes: mlua::Function = tbl.get("read_bytes").unwrap();
-        let err = read_bytes
-            .call::<Buffer>("/etc/hostname")
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains(SANDBOX_ERR),
-            "expected sandbox error, got: {err}"
-        );
-    }
-
-    #[test]
-    fn fs_metadata_sandbox_check() {
-        let tmp = TempDir::new().unwrap();
-
-        let lua = Lua::new();
-        let allowed = roots(&[tmp.path()]);
-        let tbl = create_fs_table(&lua, allowed).unwrap();
-        let metadata: mlua::Function = tbl.get("metadata").unwrap();
-        let err = metadata
-            .call::<Table>("/etc/hostname")
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains(SANDBOX_ERR),
-            "expected sandbox error, got: {err}"
         );
     }
 }

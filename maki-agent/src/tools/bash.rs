@@ -311,8 +311,8 @@ impl Bash {
 super::impl_tool!(Bash);
 
 impl super::ToolInvocation for Bash {
-    fn start_summary(&self) -> String {
-        Bash::start_summary(self)
+    fn start_summary(&self) -> super::SummaryFuture {
+        super::SummaryFuture::Ready(Bash::start_summary(self))
     }
     fn start_input(&self) -> Option<ToolInput> {
         let (command, _) = self.resolved();

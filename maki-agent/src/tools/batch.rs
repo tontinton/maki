@@ -116,7 +116,10 @@ impl BatchEntry {
             .and_then(|e| e.tool.parse(&self.parameters).ok());
         BatchToolEntry {
             tool: self.tool.clone(),
-            summary: call.as_ref().map(|c| c.start_summary()).unwrap_or_default(),
+            summary: call
+                .as_ref()
+                .map(|c| c.start_summary().into_ready())
+                .unwrap_or_default(),
             status,
             input: call.and_then(|c| c.start_input()),
             output,
@@ -309,8 +312,8 @@ super::impl_tool!(
 );
 
 impl super::ToolInvocation for Batch {
-    fn start_summary(&self) -> String {
-        Batch::start_summary(self)
+    fn start_summary(&self) -> super::SummaryFuture {
+        super::SummaryFuture::Ready(Batch::start_summary(self))
     }
     fn start_output(&self) -> Option<ToolOutput> {
         let entries = self

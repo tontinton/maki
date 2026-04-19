@@ -34,6 +34,12 @@ pub enum Request {
         deadline: Option<Instant>,
         reply: flume::Sender<ToolCallResult>,
     },
+    ComputeSummary {
+        plugin: Arc<str>,
+        tool: Arc<str>,
+        input: Value,
+        reply: flume::Sender<String>,
+    },
     ClearPlugin {
         plugin: Arc<str>,
         reply: flume::Sender<()>,
@@ -55,10 +61,15 @@ impl Drop for CallStateGuard<'_> {
     }
 }
 
+struct ToolKeys {
+    handler: RegistryKey,
+    summary: Option<RegistryKey>,
+}
+
 struct LuaRuntime {
     lua: Lua,
     pending: PendingTools,
-    plugins: HashMap<Arc<str>, HashMap<Arc<str>, RegistryKey>>,
+    plugins: HashMap<Arc<str>, HashMap<Arc<str>, ToolKeys>>,
     registry: Arc<ToolRegistry>,
     tx: flume::Sender<Request>,
     cwd: PathBuf,
@@ -138,9 +149,14 @@ impl LuaRuntime {
 
     fn drop_plugin_keys(&mut self, name: &str) {
         if let Some(keys) = self.plugins.remove(name) {
-            for (_, key) in keys {
-                if let Err(e) = self.lua.remove_registry_value(key) {
+            for (_, tk) in keys {
+                if let Err(e) = self.lua.remove_registry_value(tk.handler) {
                     tracing::warn!(plugin = name, error = %e, "failed to drop lua handler key");
+                }
+                if let Some(sk) = tk.summary {
+                    if let Err(e) = self.lua.remove_registry_value(sk) {
+                        tracing::warn!(plugin = name, error = %e, "failed to drop lua summary key");
+                    }
                 }
             }
         }
@@ -158,6 +174,11 @@ impl LuaRuntime {
         for t in tools {
             if let Err(e) = self.lua.remove_registry_value(t.handler_key) {
                 tracing::warn!(error = %e, "failed to drop lua handler key on rollback");
+            }
+            if let Some(sk) = t.summary_key {
+                if let Err(e) = self.lua.remove_registry_value(sk) {
+                    tracing::warn!(error = %e, "failed to drop lua summary key on rollback");
+                }
             }
         }
     }
@@ -318,7 +339,7 @@ impl LuaRuntime {
                     audience: t.audience,
                     tx: self.tx.clone(),
                     plugin: Arc::clone(&name),
-                    summary_keys: t.summary_keys,
+                    has_summary_fn: t.summary_key.is_some(),
                 });
                 (
                     tool,
@@ -341,9 +362,17 @@ impl LuaRuntime {
 
         self.drop_plugin_keys(&name);
 
-        let keys: HashMap<Arc<str>, RegistryKey> = pending
+        let keys: HashMap<Arc<str>, ToolKeys> = pending
             .into_iter()
-            .map(|t| (t.name, t.handler_key))
+            .map(|t| {
+                (
+                    t.name,
+                    ToolKeys {
+                        handler: t.handler_key,
+                        summary: t.summary_key,
+                    },
+                )
+            })
             .collect();
         self.plugins.insert(name, keys);
 
@@ -368,13 +397,13 @@ impl LuaRuntime {
             .get(plugin)
             .ok_or_else(|| format!("plugin not loaded: {plugin}"))?;
 
-        let handler_key = keys
+        let tool_keys = keys
             .get(tool)
             .ok_or_else(|| format!("tool not found: {tool}"))?;
 
         let handler: Function = self
             .lua
-            .registry_value(handler_key)
+            .registry_value(&tool_keys.handler)
             .map_err(|e| e.to_string())?;
 
         if self.shutdown.load(Ordering::Acquire) {
@@ -400,6 +429,20 @@ impl LuaRuntime {
             Ok(val) => coerce_tool_result(&val),
             Err(e) => Err(e.to_string()),
         }
+    }
+
+    fn compute_summary(&self, plugin: &str, tool: &str, input: Value) -> String {
+        let result = (|| {
+            let tk = self.plugins.get(plugin)?.get(tool)?;
+            let key = tk.summary.as_ref()?;
+            let func = self.lua.registry_value::<Function>(key).ok()?;
+            let input_lua = self.lua.to_value(&input).ok()?;
+            match func.call::<LuaValue>(input_lua).ok()? {
+                LuaValue::String(s) => s.to_str().ok().map(|s| s.to_owned()),
+                _ => None,
+            }
+        })();
+        result.unwrap_or_else(|| tool.to_string())
     }
 }
 
@@ -463,6 +506,15 @@ pub fn spawn(
                     Request::ClearPlugin { plugin, reply } => {
                         rt.clear_plugin(&plugin);
                         let _ = reply.send(());
+                    }
+                    Request::ComputeSummary {
+                        plugin,
+                        tool,
+                        input,
+                        reply,
+                    } => {
+                        let res = rt.compute_summary(&plugin, &tool, input);
+                        let _ = reply.send(res);
                     }
                 }
             }

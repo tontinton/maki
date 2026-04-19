@@ -43,8 +43,8 @@ super::impl_tool!(
 );
 
 impl super::ToolInvocation for SkillTool {
-    fn start_summary(&self) -> String {
-        SkillTool::start_summary(self)
+    fn start_summary(&self) -> super::SummaryFuture {
+        super::SummaryFuture::Ready(SkillTool::start_summary(self))
     }
     fn execute<'a>(self: Box<Self>, ctx: &'a super::ToolContext) -> super::ExecFuture<'a> {
         Box::pin(async move { SkillTool::execute(&self, ctx).await })

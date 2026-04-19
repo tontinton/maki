@@ -2353,6 +2353,7 @@ dependencies = [
 name = "maki-lua"
 version = "0.2.5"
 dependencies = [
+ "dirs",
  "flume 0.11.1",
  "futures-lite",
  "include_dir",
