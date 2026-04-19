@@ -251,6 +251,15 @@ mod tests {
             (super::super::TODOWRITE_TOOL_NAME, MAIN),
             (super::super::SKILL_TOOL_NAME, MAIN),
             (super::super::TASK_TOOL_NAME, MAIN),
+            (super::super::LSP_GOTO_DEFINITION_TOOL_NAME, all),
+            (super::super::LSP_REFERENCES_TOOL_NAME, all),
+            (super::super::LSP_HOVER_TOOL_NAME, all),
+            (super::super::LSP_DIAGNOSTICS_TOOL_NAME, all),
+            (super::super::LSP_IMPLEMENTATION_TOOL_NAME, all),
+            (super::super::LSP_DOCUMENT_SYMBOL_TOOL_NAME, all),
+            (super::super::LSP_WORKSPACE_SYMBOL_TOOL_NAME, all),
+            (super::super::LSP_INCOMING_CALLS_TOOL_NAME, all),
+            (super::super::LSP_OUTGOING_CALLS_TOOL_NAME, all),
         ]);
 
         let snapshot = ToolRegistry::native().iter();

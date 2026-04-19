@@ -1,0 +1,21 @@
+[package]
+name = "maki-lsp"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+smol = { workspace = true }
+async-process = { workspace = true }
+async-lock = { workspace = true }
+async-io = { workspace = true }
+futures-lite = { workspace = true }
+flume = { workspace = true }
+libc = { workspace = true }
+
+[dev-dependencies]
+test-case = { workspace = true }
+toml = { workspace = true }

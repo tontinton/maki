@@ -51,6 +51,7 @@ members = [
   "maki-docgen",
   "maki-highlight",
   "maki-interpreter",
+  "maki-lsp",
   "maki-lua",
   "maki-providers",
   "maki-storage",
@@ -71,6 +72,7 @@ rust-version = "1.85"
 [workspace.dependencies]
 maki-agent = { path = "maki-agent" }
 maki-config = { path = "maki-config" }
+maki-lsp = { path = "maki-lsp" }
 maki-interpreter = { path = "maki-interpreter" }
 maki-providers = { path = "maki-providers" }
 maki-storage = { path = "maki-storage" }

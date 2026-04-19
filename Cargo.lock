@@ -134,7 +134,6 @@ dependencies = [
  "parking_lot",
  "percent-encoding",
  "windows-sys 0.60.2",
- "wl-clipboard-rs",
  "x11rb",
 ]
 
@@ -779,7 +778,6 @@ version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d8b9f2e4c67f833b660cdb0a3523065869fb35570177239812ed4c905aeff87b"
 dependencies = [
- "base64",
  "bitflags 2.11.0",
  "crossterm_winapi",
  "derive_more",
@@ -1008,12 +1006,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
 
 [[package]]
-name = "downcast-rs"
-version = "1.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "75b325c5dbd37f80359721ad39aca5a29fb04c89279657cffdda8736d0c0b9d2"
-
-[[package]]
 name = "either"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1220,12 +1212,6 @@ name = "fixedbitset"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ce7134b9999ecaf8bcd65542e436736ef32ddca1b3e06094cb6ec5755203b80"
-
-[[package]]
-name = "fixedbitset"
-version = "0.5.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1d674e81391d1e1ab681a28d99df07927c6d4aa5b027d7da16ba32d1d21ecd99"
 
 [[package]]
 name = "flate2"
@@ -2210,7 +2196,7 @@ dependencies = [
 
 [[package]]
 name = "maki"
-version = "0.2.8"
+version = "0.2.5"
 dependencies = [
  "clap",
  "color-eyre",
@@ -2219,6 +2205,7 @@ dependencies = [
  "isahc",
  "libc",
  "maki-agent",
+ "maki-code-index",
  "maki-config",
  "maki-lua",
  "maki-providers",
@@ -2237,7 +2224,7 @@ dependencies = [
 
 [[package]]
 name = "maki-agent"
-version = "0.2.8"
+version = "0.2.5"
 dependencies = [
  "arc-swap",
  "async-io",
@@ -2252,13 +2239,16 @@ dependencies = [
  "getrandom 0.3.4",
  "grep-regex",
  "grep-searcher",
+ "htmd",
  "humantime",
  "ignore",
  "isahc",
  "jiff",
  "libc",
+ "maki-code-index",
  "maki-config",
  "maki-interpreter",
+ "maki-lsp",
  "maki-providers",
  "maki-storage",
  "maki-tool-macro",
@@ -2266,7 +2256,6 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
- "serde_yaml",
  "sha2",
  "similar",
  "smol",
@@ -2283,85 +2272,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "maki-config"
-version = "0.2.8"
+name = "maki-code-index"
+version = "0.2.5"
 dependencies = [
- "dirs",
- "dotenvy",
- "maki-config-macro",
- "serde",
- "tempfile",
+ "ignore",
+ "memchr",
  "test-case",
  "thiserror 2.0.18",
- "toml",
- "toml_edit",
- "tracing",
-]
-
-[[package]]
-name = "maki-config-macro"
-version = "0.2.8"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.117",
-]
-
-[[package]]
-name = "maki-docgen"
-version = "0.2.8"
-dependencies = [
- "maki-agent",
- "maki-config",
- "maki-providers",
- "maki-ui",
- "serde_json",
- "smol",
- "strum",
-]
-
-[[package]]
-name = "maki-highlight"
-version = "0.2.8"
-dependencies = [
- "syntect",
- "test-case",
- "two-face",
-]
-
-[[package]]
-name = "maki-interpreter"
-version = "0.2.8"
-dependencies = [
- "monty",
- "serde_json",
- "test-case",
- "thiserror 2.0.18",
- "tracing",
-]
-
-[[package]]
-name = "maki-lua"
-version = "0.2.8"
-dependencies = [
- "dirs",
- "flume 0.11.1",
- "futures-lite",
- "htmd",
- "include_dir",
- "isahc",
- "libc",
- "maki-agent",
- "maki-config",
- "maki-highlight",
- "mlua",
- "regex",
- "serde_json",
- "smol",
- "tempfile",
- "test-case",
- "thiserror 2.0.18",
- "tracing",
  "tree-sitter",
  "tree-sitter-bash",
  "tree-sitter-c",
@@ -2384,8 +2301,97 @@ dependencies = [
 ]
 
 [[package]]
+name = "maki-config"
+version = "0.2.5"
+dependencies = [
+ "dirs",
+ "dotenvy",
+ "maki-config-macro",
+ "serde",
+ "tempfile",
+ "test-case",
+ "thiserror 2.0.18",
+ "toml",
+ "toml_edit",
+ "tracing",
+]
+
+[[package]]
+name = "maki-config-macro"
+version = "0.2.5"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
+name = "maki-docgen"
+version = "0.2.5"
+dependencies = [
+ "maki-agent",
+ "maki-config",
+ "maki-providers",
+ "maki-ui",
+ "serde_json",
+ "smol",
+ "strum",
+]
+
+[[package]]
+name = "maki-interpreter"
+version = "0.2.5"
+dependencies = [
+ "monty",
+ "serde_json",
+ "test-case",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
+name = "maki-lsp"
+version = "0.2.5"
+dependencies = [
+ "async-io",
+ "async-lock",
+ "async-process",
+ "flume 0.11.1",
+ "futures-lite",
+ "libc",
+ "serde",
+ "serde_json",
+ "smol",
+ "test-case",
+ "thiserror 2.0.18",
+ "toml",
+ "tracing",
+]
+
+[[package]]
+name = "maki-lua"
+version = "0.2.5"
+dependencies = [
+ "flume 0.11.1",
+ "futures-lite",
+ "include_dir",
+ "maki-agent",
+ "maki-code-index",
+ "maki-config",
+ "mlua",
+ "regex",
+ "serde_json",
+ "smol",
+ "tempfile",
+ "test-case",
+ "thiserror 2.0.18",
+ "tracing",
+ "tree-sitter",
+]
+
+[[package]]
 name = "maki-providers"
-version = "0.2.8"
+version = "0.2.5"
 dependencies = [
  "base64",
  "dirs",
@@ -2408,7 +2414,7 @@ dependencies = [
 
 [[package]]
 name = "maki-storage"
-version = "0.2.8"
+version = "0.2.5"
 dependencies = [
  "dirs",
  "getrandom 0.3.4",
@@ -2425,7 +2431,7 @@ dependencies = [
 
 [[package]]
 name = "maki-tool-macro"
-version = "0.2.8"
+version = "0.2.5"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2434,7 +2440,7 @@ dependencies = [
 
 [[package]]
 name = "maki-ui"
-version = "0.2.8"
+version = "0.2.5"
 dependencies = [
  "arboard",
  "arc-swap",
@@ -2454,7 +2460,6 @@ dependencies = [
  "libc",
  "maki-agent",
  "maki-config",
- "maki-highlight",
  "maki-providers",
  "maki-storage",
  "notify",
@@ -2471,6 +2476,7 @@ dependencies = [
  "test-case",
  "toml",
  "tracing",
+ "two-face",
  "unicode-width",
 ]
 
@@ -2707,15 +2713,6 @@ checksum = "d273983c5a657a70a3e8f2a01329822f3b8c8172b73826411a55751e404a0a4a"
 dependencies = [
  "memchr",
  "minimal-lexical",
-]
-
-[[package]]
-name = "nom"
-version = "8.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df9761775871bdef83bee530e60050f7e54b1105350d6884eb0fb4f46c2f9405"
-dependencies = [
- "memchr",
 ]
 
 [[package]]
@@ -3007,16 +3004,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "os_pipe"
-version = "1.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d8fae84b431384b68627d0f9b3b1245fcf9f46f6c0e3dc902e9dce64edd1967"
-dependencies = [
- "libc",
- "windows-sys 0.59.0",
-]
-
-[[package]]
 name = "owo-colors"
 version = "4.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3104,17 +3091,6 @@ checksum = "89815c69d36021a140146f26659a81d6c2afa33d216d736dd4be5381a7362220"
 dependencies = [
  "pest",
  "sha2",
-]
-
-[[package]]
-name = "petgraph"
-version = "0.8.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8701b58ea97060d5e5b155d383a69952a60943f0e6dfe30b04c287beb0b27455"
-dependencies = [
- "fixedbitset 0.5.7",
- "hashbrown 0.15.5",
- "indexmap",
 ]
 
 [[package]]
@@ -3273,7 +3249,7 @@ checksum = "740ebea15c5d1428f910cd1a5f52cebf8d25006245ed8ade92702f4943d91e07"
 dependencies = [
  "base64",
  "indexmap",
- "quick-xml 0.38.4",
+ "quick-xml",
  "serde",
  "time",
 ]
@@ -3520,15 +3496,6 @@ name = "quick-xml"
 version = "0.38.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b66c2058c55a409d601666cffe35f04333cf1013010882cec174a7467cd4e21c"
-dependencies = [
- "memchr",
-]
-
-[[package]]
-name = "quick-xml"
-version = "0.39.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "958f21e8e7ceb5a1aa7fa87fab28e7c75976e0bfe7e23ff069e0a260f894067d"
 dependencies = [
  "memchr",
 ]
@@ -3972,19 +3939,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "serde_yaml"
-version = "0.9.34+deprecated"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a8b1a1a2ebf674015cc02edccce75287f1a0130d394307b36743c2f5d504b47"
-dependencies = [
- "indexmap",
- "itoa",
- "ryu",
- "serde",
- "unsafe-libyaml",
-]
-
-[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4308,7 +4262,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d4ea810f0692f9f51b382fff5893887bb4580f5fa246fde546e0b13e7fcee662"
 dependencies = [
  "fnv",
- "nom 7.1.3",
+ "nom",
  "phf 0.11.3",
  "phf_codegen 0.11.3",
 ]
@@ -4334,7 +4288,7 @@ dependencies = [
  "fancy-regex 0.11.0",
  "filedescriptor",
  "finl_unicode",
- "fixedbitset 0.4.2",
+ "fixedbitset",
  "hex",
  "lazy_static",
  "libc",
@@ -4841,17 +4795,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tree_magic_mini"
-version = "3.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b8765b90061cba6c22b5831f675da109ae5561588290f9fa2317adab2714d5a6"
-dependencies = [
- "memchr",
- "nom 8.0.0",
- "petgraph",
-]
-
-[[package]]
 name = "two-face"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4945,12 +4888,6 @@ dependencies = [
  "phf_codegen 0.11.3",
  "rand",
 ]
-
-[[package]]
-name = "unsafe-libyaml"
-version = "0.2.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861"
 
 [[package]]
 name = "url"
@@ -5147,76 +5084,6 @@ dependencies = [
  "hashbrown 0.15.5",
  "indexmap",
  "semver",
-]
-
-[[package]]
-name = "wayland-backend"
-version = "0.3.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2857dd20b54e916ec7253b3d6b4d5c4d7d4ca2c33c2e11c6c76a99bd8744755d"
-dependencies = [
- "cc",
- "downcast-rs",
- "rustix",
- "smallvec",
- "wayland-sys",
-]
-
-[[package]]
-name = "wayland-client"
-version = "0.31.14"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "645c7c96bb74690c3189b5c9cb4ca1627062bb23693a4fad9d8c3de958260144"
-dependencies = [
- "bitflags 2.11.0",
- "rustix",
- "wayland-backend",
- "wayland-scanner",
-]
-
-[[package]]
-name = "wayland-protocols"
-version = "0.32.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "563a85523cade2429938e790815fd7319062103b9f4a2dc806e9b53b95982d8f"
-dependencies = [
- "bitflags 2.11.0",
- "wayland-backend",
- "wayland-client",
- "wayland-scanner",
-]
-
-[[package]]
-name = "wayland-protocols-wlr"
-version = "0.3.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eb04e52f7836d7c7976c78ca0250d61e33873c34156a2a1fc9474828ec268234"
-dependencies = [
- "bitflags 2.11.0",
- "wayland-backend",
- "wayland-client",
- "wayland-protocols",
- "wayland-scanner",
-]
-
-[[package]]
-name = "wayland-scanner"
-version = "0.31.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9c324a910fd86ebdc364a3e61ec1f11737d3b1d6c273c0239ee8ff4bc0d24b4a"
-dependencies = [
- "proc-macro2",
- "quick-xml 0.39.2",
- "quote",
-]
-
-[[package]]
-name = "wayland-sys"
-version = "0.31.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d8eab23fefc9e41f8e841df4a9c707e8a8c4ed26e944ef69297184de2785e3be"
-dependencies = [
- "pkg-config",
 ]
 
 [[package]]
@@ -5666,24 +5533,6 @@ dependencies = [
  "serde_json",
  "unicode-xid",
  "wasmparser",
-]
-
-[[package]]
-name = "wl-clipboard-rs"
-version = "0.9.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e9651471a32e87d96ef3a127715382b2d11cc7c8bb9822ded8a7cc94072eb0a3"
-dependencies = [
- "libc",
- "log",
- "os_pipe",
- "rustix",
- "thiserror 2.0.18",
- "tree_magic_mini",
- "wayland-backend",
- "wayland-client",
- "wayland-protocols",
- "wayland-protocols-wlr",
 ]
 
 [[package]]
