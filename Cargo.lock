@@ -2248,6 +2248,7 @@ dependencies = [
  "maki-code-index",
  "maki-config",
  "maki-interpreter",
+ "maki-lsp",
  "maki-providers",
  "maki-storage",
  "maki-tool-macro",
@@ -2345,6 +2346,25 @@ dependencies = [
  "serde_json",
  "test-case",
  "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
+name = "maki-lsp"
+version = "0.2.5"
+dependencies = [
+ "async-io",
+ "async-lock",
+ "async-process",
+ "flume 0.11.1",
+ "futures-lite",
+ "libc",
+ "serde",
+ "serde_json",
+ "smol",
+ "test-case",
+ "thiserror 2.0.18",
+ "toml",
  "tracing",
 ]
 

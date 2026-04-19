@@ -16,6 +16,15 @@ mod fuzzy_replace;
 mod glob;
 mod grep;
 mod index;
+mod lsp_diagnostics;
+mod lsp_document_symbol;
+mod lsp_goto;
+mod lsp_hover;
+mod lsp_implementation;
+mod lsp_incoming_calls;
+mod lsp_outgoing_calls;
+mod lsp_references;
+mod lsp_workspace_symbol;
 pub mod memory;
 mod multiedit;
 mod question;
@@ -151,6 +160,15 @@ pub const WEBSEARCH_TOOL_NAME: &str = websearch::WebSearch::NAME;
 pub const WRITE_TOOL_NAME: &str = write::Write::NAME;
 pub const MEMORY_TOOL_NAME: &str = memory::Memory::NAME;
 pub const CODE_EXECUTION_TOOL_NAME: &str = code_execution::CodeExecution::NAME;
+pub const LSP_GOTO_DEFINITION_TOOL_NAME: &str = lsp_goto::LspGotoDefinition::NAME;
+pub const LSP_REFERENCES_TOOL_NAME: &str = lsp_references::LspReferences::NAME;
+pub const LSP_HOVER_TOOL_NAME: &str = lsp_hover::LspHover::NAME;
+pub const LSP_DIAGNOSTICS_TOOL_NAME: &str = lsp_diagnostics::LspDiagnostics::NAME;
+pub const LSP_IMPLEMENTATION_TOOL_NAME: &str = lsp_implementation::LspImplementation::NAME;
+pub const LSP_DOCUMENT_SYMBOL_TOOL_NAME: &str = lsp_document_symbol::LspDocumentSymbol::NAME;
+pub const LSP_WORKSPACE_SYMBOL_TOOL_NAME: &str = lsp_workspace_symbol::LspWorkspaceSymbol::NAME;
+pub const LSP_INCOMING_CALLS_TOOL_NAME: &str = lsp_incoming_calls::LspIncomingCalls::NAME;
+pub const LSP_OUTGOING_CALLS_TOOL_NAME: &str = lsp_outgoing_calls::LspOutgoingCalls::NAME;
 
 pub(crate) const PLAN_WRITE_RESTRICTED: &str = "write restricted to plan file in plan mode";
 pub(crate) const DEADLINE_EXCEEDED: &str = "timeout exceeded";
@@ -219,6 +237,7 @@ pub struct ToolContext {
     pub permissions: Arc<PermissionManager>,
     pub timeouts: maki_providers::Timeouts,
     pub file_tracker: Arc<FileReadTracker>,
+    pub lsp_handle: Option<maki_lsp::LspHandle>,
     pub(crate) batch_child: bool,
 }
 
@@ -576,6 +595,15 @@ register_tools! {
     batch::Batch,
     code_execution::CodeExecution,
     memory::Memory,
+    lsp_goto::LspGotoDefinition,
+    lsp_references::LspReferences,
+    lsp_hover::LspHover,
+    lsp_diagnostics::LspDiagnostics,
+    lsp_implementation::LspImplementation,
+    lsp_document_symbol::LspDocumentSymbol,
+    lsp_workspace_symbol::LspWorkspaceSymbol,
+    lsp_incoming_calls::LspIncomingCalls,
+    lsp_outgoing_calls::LspOutgoingCalls,
 }
 
 use maki_providers::provider::BoxFuture;
@@ -630,6 +658,7 @@ pub(crate) fn interpreter_ctx(
         permissions,
         timeouts: maki_providers::Timeouts::default(),
         file_tracker,
+        lsp_handle: None,
         batch_child: false,
     }
 }

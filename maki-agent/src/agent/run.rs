@@ -77,6 +77,7 @@ pub struct Agent {
     session_id: Option<String>,
     timeouts: maki_providers::Timeouts,
     file_tracker: Arc<FileReadTracker>,
+    lsp_handle: Option<maki_lsp::LspHandle>,
 }
 
 impl Agent {
@@ -107,11 +108,17 @@ impl Agent {
             thinking: ThinkingConfig::Off,
             session_id: params.session_id,
             file_tracker: params.file_tracker,
+            lsp_handle: None,
         }
     }
 
     pub fn with_mcp(mut self, mcp: Option<McpHandle>) -> Self {
         self.mcp = mcp;
+        self
+    }
+
+    pub fn with_lsp(mut self, lsp: Option<maki_lsp::LspHandle>) -> Self {
+        self.lsp_handle = lsp;
         self
     }
 
@@ -333,6 +340,7 @@ impl Agent {
             permissions: Arc::clone(&self.permissions),
             timeouts: self.timeouts,
             file_tracker: Arc::clone(&self.file_tracker),
+            lsp_handle: self.lsp_handle.clone(),
             batch_child: false,
         }
     }
