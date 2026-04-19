@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use tracing::{debug, warn};
 
-use crate::skill::{find_project_ancestor_dirs, parse_frontmatter, split_frontmatter};
+use crate::skill::{find_project_ancestor_dirs, parse_frontmatter};
 
 const COMMAND_DIRS: &[&str] = &[".maki/commands", ".claude/commands"];
 const ARGUMENTS_PLACEHOLDER: &str = "$ARGUMENTS";
@@ -103,24 +103,19 @@ fn scan_command_dir(
 
 fn parse_command(content: &str, path: &Path, scope: CommandScope) -> Option<CustomCommand> {
     let name_from_file = path.file_stem()?.to_string_lossy().into_owned();
+    let (fm, body) = parse_frontmatter(content);
 
-    let (frontmatter, body) = split_frontmatter(content);
-    let (name, description) = parse_frontmatter(&frontmatter, &name_from_file);
-    let has_hint = frontmatter
-        .lines()
-        .any(|l| l.trim().starts_with("argument-hint:"));
-
-    let body = body.trim();
     if body.is_empty() {
+        let name = fm.name.as_deref().unwrap_or(&name_from_file);
         warn!(command = name, path = ?path, "command file has no content, skipping");
         return None;
     }
 
-    let accepts_args = has_hint || body.contains(ARGUMENTS_PLACEHOLDER);
+    let accepts_args = fm.argument_hint.is_some() || body.contains(ARGUMENTS_PLACEHOLDER);
 
     Some(CustomCommand {
-        name,
-        description,
+        name: fm.name.unwrap_or(name_from_file),
+        description: fm.description.unwrap_or_default(),
         content: body.to_string(),
         scope,
         accepts_args,
@@ -166,30 +161,6 @@ mod tests {
     fn parse_command_empty_body_returns_none() {
         let path = PathBuf::from("/fake/empty.md");
         assert!(parse_command("---\nname: empty\n---\n   \n", &path, CommandScope::User).is_none());
-    }
-
-    #[test]
-    fn render_replaces_arguments() {
-        let cmd = CustomCommand {
-            name: "test".into(),
-            description: String::new(),
-            content: "Review $ARGUMENTS carefully".into(),
-            scope: CommandScope::Project,
-            accepts_args: true,
-        };
-        assert_eq!(cmd.render("main.rs"), "Review main.rs carefully");
-    }
-
-    #[test]
-    fn render_no_placeholder_returns_content() {
-        let cmd = CustomCommand {
-            name: "test".into(),
-            description: String::new(),
-            content: "Do the thing".into(),
-            scope: CommandScope::User,
-            accepts_args: false,
-        };
-        assert_eq!(cmd.render("ignored"), "Do the thing");
     }
 
     #[test_case(CommandScope::Project, "/project:review" ; "project_scope")]

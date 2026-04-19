@@ -138,6 +138,7 @@ tree-sitter-elixir = "0.3"
 tree-sitter-md = "0.5"
 monty = { git = "https://github.com/pydantic/monty.git", rev = "2e9df4b", package = "monty" }
 notify = { version = "9.0.0-rc.2", default-features = false, features = ["flume", "macos_fsevent"] }
+serde_yaml = "0.9"
 shell-words = "1"
 
 wait-timeout = "0.2"

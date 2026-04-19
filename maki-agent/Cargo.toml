@@ -41,6 +41,7 @@ dirs = { workspace = true }
 tree-sitter = { workspace = true }
 tree-sitter-bash = { workspace = true }
 sha2 = { workspace = true }
+serde_yaml = { workspace = true }
 base64 = { workspace = true }
 getrandom = { workspace = true }
 uuid = { workspace = true }

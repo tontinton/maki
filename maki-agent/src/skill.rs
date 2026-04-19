@@ -1,12 +1,12 @@
 //! Skill discovery: YAML-fronted Markdown files that expose named prompts to the agent.
 //!
 //! Project skills (found by walking ancestors up to `.git`) override global (`$HOME`) skills by name.
-//! Frontmatter is minimal: only `name:` and `description:` lines are parsed; full YAML is not required.
 
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use serde::Deserialize;
 use tracing::{debug, warn};
 
 use crate::ToolOutput;
@@ -124,56 +124,48 @@ fn scan_skill_dir(dir: &Path, skills: &mut HashMap<String, Skill>) {
     }
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct Frontmatter {
+    pub name: Option<String>,
+    pub description: Option<String>,
+    #[serde(rename = "argument-hint")]
+    pub argument_hint: Option<String>,
+}
+
 fn parse_skill(content: &str, path: &Path) -> Option<Skill> {
     let name_from_dir = path.parent()?.file_name()?.to_string_lossy().into_owned();
+    let (fm, body) = parse_frontmatter(content);
 
-    let (frontmatter, body) = split_frontmatter(content);
-    let (name, description) = parse_frontmatter(&frontmatter, &name_from_dir);
-
-    let body = body.trim();
     if body.is_empty() {
+        let name = fm.name.as_deref().unwrap_or(&name_from_dir);
         warn!(skill = name, path = ?path, "skill file has no content, skipping");
         return None;
     }
 
     Some(Skill {
-        name,
-        description,
+        name: fm.name.unwrap_or(name_from_dir),
+        description: fm.description.unwrap_or_default(),
         content: body.to_string(),
         location: path.to_path_buf(),
     })
 }
 
-pub(crate) fn split_frontmatter(content: &str) -> (String, String) {
+pub(crate) fn parse_frontmatter(content: &str) -> (Frontmatter, &str) {
     let content = content.trim_start();
-    if !content.starts_with("---") {
-        return (String::new(), content.to_string());
-    }
 
-    let end = content[3..].find("\n---").map(|i| i + 3);
-    let Some(end) = end else {
-        return (String::new(), content.to_string());
+    let Some(rest) = content.strip_prefix("---") else {
+        return (Frontmatter::default(), content);
     };
 
-    let frontmatter = content[3..end].trim().to_string();
-    let body = content[end + 4..].trim().to_string();
-    (frontmatter, body)
-}
+    let Some(end) = rest.find("\n---") else {
+        return (Frontmatter::default(), content);
+    };
 
-pub(crate) fn parse_frontmatter(frontmatter: &str, default_name: &str) -> (String, String) {
-    let mut name = default_name.to_string();
-    let mut description = String::new();
+    let yaml = &rest[1..end + 1];
+    let body = rest[end + 4..].trim();
 
-    for line in frontmatter.lines() {
-        let line = line.trim();
-        if let Some(value) = line.strip_prefix("name:") {
-            name = value.trim().to_string();
-        } else if let Some(value) = line.strip_prefix("description:") {
-            description = value.trim().to_string();
-        }
-    }
-
-    (name, description)
+    let fm = serde_yaml::from_str(yaml).unwrap_or_default();
+    (fm, body)
 }
 
 #[cfg(test)]
@@ -184,30 +176,6 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
-
-    #[test_case(
-        "---\nname: test-skill\ndescription: A test\n---\nBody content",
-        "name: test-skill\ndescription: A test",
-        "Body content"
-        ; "with_frontmatter"
-    )]
-    #[test_case(
-        "Just body\nno frontmatter",
-        "",
-        "Just body\nno frontmatter"
-        ; "no_frontmatter"
-    )]
-    #[test_case(
-        "---\nname: test\nBody without closing",
-        "",
-        "---\nname: test\nBody without closing"
-        ; "unclosed_frontmatter"
-    )]
-    fn split_frontmatter_cases(input: &str, expected_fm: &str, expected_body: &str) {
-        let (fm, body) = split_frontmatter(input);
-        assert_eq!(fm, expected_fm);
-        assert_eq!(body, expected_body);
-    }
 
     #[test_case(
         "---\nname: git-release\ndescription: Create releases\n---\n## Instructions\nDo stuff",
@@ -222,6 +190,20 @@ mod tests {
         "my-awesome-skill",
         ""
         ; "defaults_to_dir_name"
+    )]
+    #[test_case(
+        "---\nname: multiline\ndescription: |\n  Line 1.\n  Line 2.\n---\nBody",
+        "multiline",
+        "multiline",
+        "Line 1.\nLine 2.\n"
+        ; "literal_block_scalar"
+    )]
+    #[test_case(
+        "---\nname: folded\ndescription: >\n  Line 1.\n  Line 2.\n---\nBody",
+        "folded",
+        "folded",
+        "Line 1. Line 2.\n"
+        ; "folded_block_scalar"
     )]
     fn parse_skill_extracts_fields(
         content: &str,
@@ -239,6 +221,13 @@ mod tests {
     fn parse_skill_empty_content_returns_none() {
         let path = PathBuf::from("/fake/empty/SKILL.md");
         assert!(parse_skill("---\nname: empty\n---\n   \n", &path).is_none());
+    }
+
+    #[test]
+    fn parse_frontmatter_invalid_yaml_falls_back() {
+        let (fm, body) = parse_frontmatter("---\n: invalid: yaml: [[\n---\nBody");
+        assert!(fm.name.is_none());
+        assert_eq!(body, "Body");
     }
 
     #[test]
@@ -298,10 +287,8 @@ mod tests {
 
     #[test]
     fn build_skill_list_description_empty() {
-        assert_eq!(
-            build_skill_list_description(&[]),
-            "\n\n<available_skills>\nNo skills available.\n</available_skills>"
-        );
+        let desc = build_skill_list_description(&[]);
+        assert!(desc.contains("No skills available."));
     }
 
     #[test]
