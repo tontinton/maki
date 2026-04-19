@@ -90,6 +90,7 @@
               ruff
               rustc
               rustfmt
+              stylua
               ty
             ];
 
