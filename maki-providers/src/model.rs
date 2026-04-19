@@ -10,7 +10,9 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 
 use crate::provider::ProviderKind;
-use crate::providers::{anthropic, dynamic, google, mistral, ollama, openai, synthetic, zai};
+use crate::providers::{
+    anthropic, bedrock, dynamic, google, mistral, ollama, openai, synthetic, zai,
+};
 
 const PER_MILLION: f64 = 1_000_000.0;
 
@@ -109,6 +111,7 @@ fn lookup_entry<'a>(
 pub fn models_for_provider(provider: ProviderKind) -> &'static [ModelEntry] {
     match provider {
         ProviderKind::Anthropic => anthropic::models(),
+        ProviderKind::Bedrock => bedrock::models(),
         ProviderKind::OpenAi => openai::models(),
         ProviderKind::Ollama => ollama::models(),
         ProviderKind::Mistral => mistral::models(),
@@ -211,13 +214,20 @@ impl Model {
                     provider.fallback_context_window(),
                 ),
             };
+            // Bedrock uses the Anthropic Messages API but does not support
+            // the `input_examples` extension in tool definitions.
+            let examples_override = if provider == ProviderKind::Bedrock {
+                Some(false)
+            } else {
+                None
+            };
             return Ok(Self {
                 id: model_id.to_string(),
                 provider,
                 dynamic_slug: None,
                 tier,
                 family,
-                supports_tool_examples_override: None,
+                supports_tool_examples_override: examples_override,
                 pricing,
                 max_output_tokens,
                 context_window,

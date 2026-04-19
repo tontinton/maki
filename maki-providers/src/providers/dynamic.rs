@@ -17,6 +17,7 @@ use crate::{AgentError, Message, ProviderEvent, StreamResponse, ThinkingConfig};
 
 use super::ResolvedAuth;
 use super::anthropic::Anthropic;
+use super::bedrock::Bedrock;
 use super::google::Google;
 use super::mistral::Mistral;
 use super::ollama::Ollama;
@@ -364,6 +365,7 @@ pub fn create(slug: &str, timeouts: super::Timeouts) -> Result<Box<dyn Provider>
             Zai::with_auth(ZaiPlan::Coding, auth.clone(), timeouts)
                 .with_system_prefix(meta.system_prefix.clone()),
         ),
+        ProviderKind::Bedrock => Box::new(Bedrock::new(timeouts)?),
         ProviderKind::Synthetic => Box::new(
             Synthetic::with_auth(auth.clone(), timeouts)
                 .with_system_prefix(meta.system_prefix.clone()),

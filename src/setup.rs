@@ -12,6 +12,7 @@ use tracing_subscriber::EnvFilter;
 
 const PROVIDER_PRIORITY: &[ProviderKind] = &[
     ProviderKind::Anthropic,
+    ProviderKind::Bedrock,
     ProviderKind::OpenAi,
     ProviderKind::Zai,
     ProviderKind::ZaiCodingPlan,
