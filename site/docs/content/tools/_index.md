@@ -7,7 +7,7 @@ group = "Reference"
 
 # Tools
 
-Maki ships with 17 built-in tools. This is the full reference.
+Maki ships with 26 built-in tools. This is the full reference.
 
 ## File Operations
 
@@ -183,3 +183,90 @@ Search the web for real-time information using Exa AI.
 |-----------|------|----------|---------|-------------|
 | `num_results` | integer | no | 8 | Number of results to return |
 | `query` | string | yes |  | Search query |
+
+## LSP
+
+### `lsp_goto_definition`
+
+Jump to the definition of a symbol at a given file position using the Language Server Protocol.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `column` | integer | yes | Column number (1-indexed) |
+| `line` | integer | yes | Line number (1-indexed) |
+| `path` | string | yes | Absolute path to the file |
+
+### `lsp_references`
+
+Find all references to a symbol at a given file position using the Language Server Protocol.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `column` | integer | yes | Column number (1-indexed) |
+| `line` | integer | yes | Line number (1-indexed) |
+| `path` | string | yes | Absolute path to the file |
+
+### `lsp_hover`
+
+Get type information and documentation for a symbol at a given file position using the Language Server Protocol.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `column` | integer | yes | Column number (1-indexed) |
+| `line` | integer | yes | Line number (1-indexed) |
+| `path` | string | yes | Absolute path to the file |
+
+### `lsp_diagnostics`
+
+Get compile errors, warnings, and other diagnostics for a file from the Language Server Protocol.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `path` | string | yes | Absolute path to the file |
+
+### `lsp_goto_implementation`
+
+Find implementations of an interface, trait, or abstract method at a given file position using the Language Server Protocol.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `column` | integer | yes | Column number (1-indexed) |
+| `line` | integer | yes | Line number (1-indexed) |
+| `path` | string | yes | Absolute path to the file |
+
+### `lsp_document_symbol`
+
+Get all symbols (functions, classes, structs, variables) in a document using the Language Server Protocol.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `path` | string | yes | Absolute path to the file |
+
+### `lsp_workspace_symbol`
+
+Search for symbols across the entire workspace by name using the Language Server Protocol.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `path` | string | yes | Absolute path to any file in the project (used to pick the LSP server) |
+| `query` | string | yes | Symbol name or query to search for |
+
+### `lsp_incoming_calls`
+
+Find all functions or methods that call the function at a given position using the Language Server Protocol.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `column` | integer | yes | Column number (1-indexed) |
+| `line` | integer | yes | Line number (1-indexed) |
+| `path` | string | yes | Absolute path to the file |
+
+### `lsp_outgoing_calls`
+
+Find all functions or methods called by the function at a given position using the Language Server Protocol.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `column` | integer | yes | Column number (1-indexed) |
+| `line` | integer | yes | Line number (1-indexed) |
+| `path` | string | yes | Absolute path to the file |
