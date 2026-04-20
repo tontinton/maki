@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 use crate::AppSession;
 use crate::chat::Chat;
 use crate::chat::{CANCELLED_TEXT, ChatEventResult, DONE_TEXT, ERROR_TEXT};
+use crate::clipboard::ClipboardState;
 use crate::components::btw_modal::BtwModal;
 use crate::components::command::{CommandAction, CommandPalette, ParsedCommand};
 use crate::components::file_picker::{FilePickerModal, FilePickerModalAction};
@@ -47,7 +48,6 @@ use crate::components::{
 };
 use crate::image;
 use crate::selection::{SelectionState, SelectionZone, ZoneRegistry};
-use arboard::Clipboard;
 use arc_swap::{ArcSwap, ArcSwapOption};
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 #[cfg(feature = "demo")]
@@ -155,7 +155,7 @@ pub struct App {
     demo_questions: Option<(usize, Vec<QuestionInfo>)>,
     pub(super) zones: ZoneRegistry,
     pub(super) selection_state: Option<SelectionState>,
-    pub(super) clipboard: Option<Clipboard>,
+    pub(super) clipboard: ClipboardState,
     pub(super) last_esc: Option<Instant>,
 
     pub(crate) storage: DataDir,
@@ -221,7 +221,7 @@ impl App {
             demo_questions: None,
             zones: [None; SelectionZone::COUNT],
             selection_state: None,
-            clipboard: Clipboard::new().ok(),
+            clipboard: ClipboardState::new(),
             last_esc: None,
             storage,
             shared_history: None,
