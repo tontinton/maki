@@ -31,6 +31,20 @@ Maki re-reads auth from storage and environment variables each time a new agent 
 
 Defaults: claude-haiku-4-5 (weak), claude-sonnet-4-6 (medium), claude-opus-4-7 (strong)
 
+### Bedrock
+
+- **Env var**: `AWS_BEARER_TOKEN_BEDROCK`
+- **API**: `https://bedrock-runtime.us-east-1.amazonaws.com`
+- **Features**: AWS SigV4 auth, EventStream streaming, supports IAM/SSO/instance credentials
+
+| Tier | Models | Pricing (in/out per 1M tokens) | Context |
+|------|--------|-------------------------------|---------|
+| Weak | **claude-haiku-4-5** (default) | $1.00 / $5.00 | 200K ctx / 64K out |
+| Medium | claude-sonnet-4-5, **claude-sonnet-4-6** (default) | $3.00 / $15.00 | 200K ctx / 64K out |
+| Strong | claude-opus-4-6, **claude-opus-4-7** (default) | $5.00 / $25.00 | 200K ctx / 128K out |
+
+Defaults: claude-haiku-4-5 (weak), claude-sonnet-4-6 (medium), claude-opus-4-7 (strong)
+
 ### OpenAI
 
 - **Env var**: `OPENAI_API_KEY` (also supports OAuth device flow)
@@ -135,7 +149,7 @@ To add a custom provider or proxy, drop an executable script into `~/.maki/provi
 
 `resolve` is called each time a new agent spawns, so scripts should read tokens from disk instead of caching them in memory. That way auth changes from other processes get picked up.
 
-The `base` field specifies which built-in provider to inherit the model catalog from. Valid values: `anthropic`, `openai`, `google`, `ollama`, `mistral`, `zai`, `zai-coding-plan`, `synthetic`.
+The `base` field specifies which built-in provider to inherit the model catalog from. Valid values: `anthropic`, `bedrock`, `openai`, `google`, `ollama`, `mistral`, `zai`, `zai-coding-plan`, `synthetic`.
 
 If your provider serves models not in the base catalog, add a `models` subcommand returning:
 

@@ -31,7 +31,7 @@ The core agent loop. Runs on <a href="https://github.com/smol-rs/smol" target="_
 
 A single interface over multiple LLM HTTP APIs.
 
-Custom provider definitions placed in `~/.maki/providers/` are picked up at runtime. The crate handles streaming, token counting, retries, and prompt caching. Models are grouped into pricing tiers (weak, medium, strong) so the agent can choose appropriately.
+Built-in providers include Anthropic, AWS Bedrock (with native SigV4 signing and EventStream binary streaming), OpenAI, Google, Ollama, Mistral, Z.AI, and Synthetic. Custom provider definitions placed in `~/.maki/providers/` are picked up at runtime. The crate handles streaming, token counting, retries, and prompt caching. Models are grouped into pricing tiers (weak, medium, strong) so the agent can choose appropriately.
 
 ### `maki-config`
 
