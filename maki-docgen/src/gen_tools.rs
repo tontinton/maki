@@ -28,6 +28,20 @@ const SECTIONS: &[(&str, &[&str])] = &[
         "Agent & Knowledge",
         &["task", "todo_write", "memory", "skill"],
     ),
+    (
+        "LSP",
+        &[
+            "lsp_goto_definition",
+            "lsp_references",
+            "lsp_hover",
+            "lsp_diagnostics",
+            "lsp_goto_implementation",
+            "lsp_document_symbol",
+            "lsp_workspace_symbol",
+            "lsp_incoming_calls",
+            "lsp_outgoing_calls",
+        ],
+    ),
 ];
 
 struct Param {

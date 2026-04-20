@@ -21,7 +21,7 @@ Syntax highlighting comes from <a href="https://github.com/trishume/syntect" tar
 
 The core agent loop. Runs on <a href="https://github.com/smol-rs/smol" target="_blank">`smol`</a> for faster compile times than tokio, sends messages to the LLM, reads responses, and executes tools as needed.
 
-- 17 built-in tools, each with typed inputs and outputs
+- 27 built-in tools, each with typed inputs and outputs
 - A three-layer permission system: session rules, config rules, and builtin defaults (checked in that order)
 - MCP client support for external tool servers
 - A skill system that loads task-specific instructions
@@ -56,3 +56,7 @@ Supports 15+ languages, each behind a feature gate so you only compile the gramm
 A Python sandbox for the `code_execution` tool. Runs on <a href="https://github.com/pydantic/monty" target="_blank">monty</a>, pydantic's minimal Python runtime, so user code is isolated from the host.
 
 The sandbox enforces memory limits, and the agent's tools are exposed as async Python functions inside it. Input and output are JSON-serialized.
+
+### `maki-lsp`
+
+A Language Server Protocol client. Connects to user-configured LSP servers (rust-analyzer, pyright, gopls, etc.) and exposes 9 tools for semantic code navigation: go to definition, find references, hover info, diagnostics, go to implementation, document symbols, workspace symbol search, and call hierarchy (incoming and outgoing calls). Servers are spawned lazily on first use and communicate over JSON-RPC 2.0 on stdin/stdout.
