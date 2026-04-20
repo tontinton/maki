@@ -399,6 +399,14 @@ fn validate_primitive(
         log_coercion(path, got, expected, &value, &coerced);
         return Ok(coerced);
     }
+    if got == ParamKind::Number
+        && expected == ParamKind::Integer
+        && let Some(i) = value.as_f64().and_then(f64_as_i64)
+    {
+        let coerced = Value::from(i);
+        log_coercion(path, got, expected, &value, &coerced);
+        return Ok(coerced);
+    }
     Err(ToolInputError::at(
         path,
         ToolInputErrorKind::TypeMismatch {
@@ -511,10 +519,18 @@ fn coerce_container(
     ))
 }
 
+fn f64_as_i64(f: f64) -> Option<i64> {
+    (f.fract() == 0.0 && f >= i64::MIN as f64 && f <= i64::MAX as f64).then_some(f as i64)
+}
+
 fn coerce_primitive(v: &Value, expected: ParamKind) -> Option<Value> {
     let s = v.as_str()?.trim();
     match expected {
-        ParamKind::Integer => s.parse::<i64>().ok().map(Value::from),
+        ParamKind::Integer => s
+            .parse::<i64>()
+            .ok()
+            .or_else(|| f64_as_i64(s.parse::<f64>().ok()?))
+            .map(Value::from),
         ParamKind::Number => s.parse::<f64>().ok().map(Value::from),
         ParamKind::Bool => match s {
             "true" => Some(Value::Bool(true)),
@@ -689,6 +705,10 @@ mod tests {
     #[test_case(json!(""),                       ParamKind::Integer, None              ; "empty_string")]
     #[test_case(json!("30, \"offset\": 2075"),   ParamKind::Integer, None              ; "embedded_trailing_fields_rejected")]
     #[test_case(json!("-3-5"),                   ParamKind::Integer, None              ; "malformed_number_rejected")]
+    #[test_case(json!("20.0"),                    ParamKind::Integer, Some(json!(20))   ; "float_string_to_integer")]
+    #[test_case(json!("20.5"),                    ParamKind::Integer, None              ; "fractional_float_string_rejected")]
+    #[test_case(json!("NaN"),                     ParamKind::Integer, None              ; "nan_string_rejected")]
+    #[test_case(json!("inf"),                     ParamKind::Integer, None              ; "inf_string_rejected")]
     #[test_case(json!("1.25"),                   ParamKind::Number,  Some(json!(1.25)) ; "string_to_float")]
     #[test_case(json!("true"),                   ParamKind::Bool,    Some(json!(true)) ; "string_to_bool")]
     #[test_case(json!(30),                       ParamKind::Integer, None              ; "already_correct_type_no_coercion")]
@@ -734,6 +754,16 @@ mod tests {
         let out = validate(&SCHEMA, json!({"name": "x", "hint": null})).unwrap();
         assert_eq!(out["name"], "x");
         assert!(out.get("hint").is_none());
+    }
+
+    #[test]
+    fn validate_float_number_coerced_to_integer() {
+        const INT_PRIM: ParamSchema = ParamSchema::Primitive {
+            kind: ParamKind::Integer,
+            description: "",
+        };
+        assert_eq!(validate(&INT_PRIM, json!(20.0)).unwrap(), json!(20));
+        assert!(validate(&INT_PRIM, json!(20.5)).is_err());
     }
 
     #[test]
