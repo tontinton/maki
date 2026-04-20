@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
+use crate::agent::QueuedMessage;
 use crate::components::Status;
 use crate::theme;
 use maki_agent::{AgentInput, AgentMode};
@@ -9,12 +10,16 @@ use maki_storage::plans;
 use ratatui::style::{Color, Modifier, Style};
 
 use super::App;
-use crate::agent::QueuedMessage;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Mode {
     Build,
     Plan,
+}
+
+pub(crate) enum PlanTrigger {
+    WriteDone,
+    QuestionAsked,
 }
 
 impl Mode {
@@ -68,6 +73,27 @@ impl PlanState {
 }
 
 impl App {
+    pub(super) fn transition_plan(&mut self, trigger: PlanTrigger) {
+        if self.state.mode != Mode::Plan {
+            return;
+        }
+        match trigger {
+            PlanTrigger::WriteDone => {
+                if self.state.plan.is_ready() {
+                    return;
+                }
+                self.state.plan.mark_ready();
+                self.plan_form.open();
+            }
+            PlanTrigger::QuestionAsked => {
+                if self.state.plan.is_ready() {
+                    self.state.plan.mark_drafting();
+                    self.plan_form.close();
+                }
+            }
+        }
+    }
+
     pub(super) fn enter_plan(&mut self) {
         self.state.plan.allocate_path(&self.storage);
         self.state.mode = Mode::Plan;

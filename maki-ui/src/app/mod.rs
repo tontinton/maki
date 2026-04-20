@@ -66,7 +66,7 @@ use crate::storage_writer::StorageWriter;
 use ratatui::layout::Position;
 
 pub(crate) use crate::agent::QueuedMessage;
-pub(crate) use mode::{Mode, PlanState};
+pub(crate) use mode::{Mode, PlanState, PlanTrigger};
 #[cfg(test)]
 use mouse::EDGE_SCROLL_LINES;
 pub(crate) use queue::MessageQueue;
@@ -866,13 +866,7 @@ impl App {
             if self.state.mode == Mode::Plan
                 && self.state.plan.path().is_some_and(|pp| e.wrote_to(pp))
             {
-                if !self.state.plan.is_ready() {
-                    self.state.plan.mark_ready();
-                    self.plan_form.open();
-                } else {
-                    self.state.plan.mark_drafting();
-                    self.plan_form.close();
-                }
+                self.transition_plan(PlanTrigger::WriteDone);
             }
             if let Some(ref outputs) = self.shared_tool_outputs {
                 outputs
@@ -972,10 +966,7 @@ impl App {
                     }
                 }
                 ChatEventResult::QuestionPrompt { questions } => {
-                    if self.state.plan.is_ready() {
-                        self.state.plan.mark_drafting();
-                        self.plan_form.close();
-                    }
+                    self.transition_plan(PlanTrigger::QuestionAsked);
                     if QuestionForm::is_form_suitable(&questions) {
                         self.question_form.open(questions);
                     } else {
@@ -1414,7 +1405,7 @@ impl App {
 
     fn implement_plan(&mut self, clear_context: bool) -> Vec<Action> {
         let plan_snapshot = match std::mem::take(&mut self.state.plan) {
-            PlanState::Ready(p) | PlanState::Drafting(p) => Some((
+            PlanState::Ready(p) => Some((
                 std::fs::read_to_string(&p).unwrap_or_default(),
                 p.display().to_string(),
             )),

@@ -13,6 +13,6 @@ Your responsibility is to think, read, search, and construct a well-formed plan 
 
 Use the Question tool freely to ask clarifying questions or get the user's opinion when weighing tradeoffs. Don't make large assumptions about user intent. The goal is to present a well-researched plan and tie up loose ends before implementation begins.
 
-Write your plan to: {plan_path} only when you have no more open questions and the plan is finalized. This signals to the system that the plan is ready for implementation.
+Write your plan to: {plan_path} only after all questions are resolved and the plan is finalized.
 When complete, tell the user.
 </system-reminder>
