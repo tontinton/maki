@@ -195,11 +195,13 @@ pub fn convert_messages(messages: &[Message], system: &str) -> Vec<Value> {
             }
             Role::Assistant => {
                 let mut text = String::new();
+                let mut reasoning = String::new();
                 let mut tool_calls = Vec::new();
 
                 for block in &msg.content {
                     match block {
                         ContentBlock::Text { text: t } => text.push_str(t),
+                        ContentBlock::Thinking { thinking, .. } => reasoning.push_str(thinking),
                         ContentBlock::ToolUse { id, name, input } => {
                             tool_calls.push(json!({
                                 "id": id,
@@ -212,13 +214,15 @@ pub fn convert_messages(messages: &[Message], system: &str) -> Vec<Value> {
                         }
                         ContentBlock::ToolResult { .. }
                         | ContentBlock::Image { .. }
-                        | ContentBlock::Thinking { .. }
                         | ContentBlock::RedactedThinking { .. } => {}
                     }
                 }
 
-                if !text.is_empty() || !tool_calls.is_empty() {
+                if !text.is_empty() || !tool_calls.is_empty() || !reasoning.is_empty() {
                     let mut msg_obj = json!({"role": "assistant"});
+                    if !reasoning.is_empty() {
+                        msg_obj["reasoning_content"] = Value::String(reasoning);
+                    }
                     if !text.is_empty() {
                         msg_obj["content"] = Value::String(text);
                     }
@@ -681,6 +685,69 @@ data: [DONE]\n";
         assert_eq!(wire[3]["role"], "tool");
         assert_eq!(wire[3]["tool_call_id"], "tc_1");
         assert_eq!(wire[3]["content"], "file.txt");
+    }
+
+    #[test]
+    fn convert_messages_assistant_with_reasoning_and_tool_calls() {
+        let messages = vec![Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Thinking {
+                    thinking: "Let me reason...".to_string(),
+                    signature: None,
+                },
+                ContentBlock::ToolUse {
+                    id: "tc_1".to_string(),
+                    name: "bash".to_string(),
+                    input: json!({"command": "ls"}),
+                },
+            ],
+            ..Default::default()
+        }];
+
+        let wire = convert_messages(&messages, "system");
+
+        let assistant = &wire[1];
+        assert_eq!(assistant["role"], "assistant");
+        assert_eq!(assistant["reasoning_content"], "Let me reason...");
+        assert_eq!(assistant["tool_calls"][0]["id"], "tc_1");
+    }
+
+    #[test]
+    fn convert_messages_assistant_thinking_only() {
+        let messages = vec![Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Thinking {
+                thinking: "just thinking".to_string(),
+                signature: None,
+            }],
+            ..Default::default()
+        }];
+
+        let wire = convert_messages(&messages, "system");
+
+        let assistant = &wire[1];
+        assert_eq!(assistant["role"], "assistant");
+        assert_eq!(assistant["reasoning_content"], "just thinking");
+        assert!(assistant.get("content").is_none());
+        assert!(assistant.get("tool_calls").is_none());
+    }
+
+    #[test]
+    fn convert_messages_assistant_no_thinking_no_reasoning_key() {
+        let messages = vec![Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text {
+                text: "hello".to_string(),
+            }],
+            ..Default::default()
+        }];
+
+        let wire = convert_messages(&messages, "system");
+
+        let assistant = &wire[1];
+        assert_eq!(assistant["role"], "assistant");
+        assert!(assistant.get("reasoning_content").is_none());
     }
 
     #[test]
