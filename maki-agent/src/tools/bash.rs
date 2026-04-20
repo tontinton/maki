@@ -126,7 +126,7 @@ impl Bash {
 ]"#,
     );
 
-    fn resolved(&self) -> (&str, Option<&str>) {
+    fn resolved_command(&self) -> (&str, Option<&str>) {
         if self.workdir.is_some() {
             return (&self.command, self.workdir.as_deref());
         }
@@ -141,11 +141,17 @@ impl Bash {
         (&self.command, None)
     }
 
+    fn resolved_workdir(&self) -> Result<Option<String>, String> {
+        let (_, raw) = self.resolved_command();
+        raw.map(super::resolve_path).transpose()
+    }
+
     pub async fn execute(&self, ctx: &super::ToolContext) -> Result<ToolOutput, String> {
         let timeout_secs = ctx
             .deadline
             .cap_timeout(self.timeout.unwrap_or(ctx.config.bash_timeout_secs))?;
-        let (command, workdir) = self.resolved();
+        let (command, _) = self.resolved_command();
+        let workdir = self.resolved_workdir()?;
         let no_rtk = ctx.config.no_rtk;
         let cmd_owned = command.to_owned();
         let rewritten = futures_lite::future::or(
@@ -158,7 +164,12 @@ impl Bash {
         .await;
         let command = rewritten.as_deref().unwrap_or(command);
 
-        info!(command, workdir, timeout_secs, "bash executing");
+        info!(
+            command,
+            workdir = workdir.as_deref(),
+            timeout_secs,
+            "bash executing"
+        );
 
         #[cfg(unix)]
         let mut std_cmd = {
@@ -185,8 +196,8 @@ impl Bash {
             });
         }
 
-        if let Some(dir) = workdir {
-            std_cmd.current_dir(dir);
+        if let Some(ref dir) = workdir {
+            std_cmd.current_dir(dir.as_str());
         }
         let mut cmd: Command = std_cmd.into();
         cmd.stdin(Stdio::null())
@@ -295,7 +306,7 @@ impl Bash {
     }
 
     pub fn start_summary(&self) -> String {
-        let (command, workdir) = self.resolved();
+        let (command, workdir) = self.resolved_command();
         let mut s = self
             .description
             .clone()
@@ -315,7 +326,7 @@ impl super::ToolInvocation for Bash {
         Bash::start_summary(self)
     }
     fn start_input(&self) -> Option<ToolInput> {
-        let (command, _) = self.resolved();
+        let (command, _) = self.resolved_command();
         Some(ToolInput::Code {
             language: "bash".into(),
             code: command.to_string(),
@@ -325,7 +336,7 @@ impl super::ToolInvocation for Bash {
         Some(super::timeout_annotation(self.timeout.unwrap_or(120)))
     }
     fn permission_scope(&self) -> Option<String> {
-        let (command, _) = self.resolved();
+        let (command, _) = self.resolved_command();
         Some(command.to_string())
     }
     fn execute<'a>(self: Box<Self>, ctx: &'a super::ToolContext) -> super::ExecFuture<'a> {
@@ -558,5 +569,19 @@ mod tests {
             assert!(err.contains("cancelled"));
             assert_pid_dead(&pidfile, "grandchild process should be dead").await;
         });
+    }
+
+    #[test_case("ls",              Some("~/projects"), "projects" ; "explicit_workdir_tilde")]
+    #[test_case("cd ~/foo && ls",   None,               "foo"      ; "cd_prefix_tilde")]
+    fn resolved_workdir_expands_tilde(cmd: &str, workdir: Option<&str>, suffix: &str) {
+        let home = dirs::home_dir().unwrap();
+        let b = Bash {
+            command: cmd.into(),
+            timeout: None,
+            workdir: workdir.map(Into::into),
+            description: None,
+        };
+        let expected = format!("{}/{suffix}", home.display());
+        assert_eq!(b.resolved_workdir().unwrap().unwrap(), expected);
     }
 }
