@@ -1941,7 +1941,7 @@ fn re_edit_closes_plan_form() {
     assert!(app.state.plan.is_ready());
     assert!(app.plan_form.is_visible());
 
-    // Agent edits the plan again (second write to same path)
+    // Agent edits the plan again (second write to same path) — idempotent, stays Ready
     app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
         id: "t2".into(),
         tool: "write".into(),
@@ -1952,8 +1952,8 @@ fn re_edit_closes_plan_form() {
         },
         is_error: false,
     }))));
-    assert!(matches!(app.state.plan, PlanState::Drafting(_)));
-    assert!(!app.plan_form.is_visible());
+    assert!(matches!(app.state.plan, PlanState::Ready(_)));
+    assert!(app.plan_form.is_visible());
 }
 
 #[test_case(0, Mode::Build, true,  true  ; "clear_and_implement")]
