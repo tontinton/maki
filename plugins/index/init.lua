@@ -33,7 +33,7 @@ Return a compact overview of a source file: imports, type definitions, function 
   summary = function(input)
     return normalize(input.path)
   end,
-  handler = function(input, _)
+  handler = function(input, ctx)
     local path = input.path
     if not path then
       return "error: path is required"
@@ -47,6 +47,17 @@ Return a compact overview of a source file: imports, type definitions, function 
     local lang = indexer.EXT_TO_LANG[ext]
     if not lang then
       return "DELEGATE_NATIVE"
+    end
+
+    local config = ctx:config()
+    local max_file_size = (config and config.index_max_file_size) or (2 * 1024 * 1024)
+    local ok_meta, meta = pcall(maki.fs.metadata, path)
+    if ok_meta and meta.size > max_file_size then
+      return "error: File too large ("
+        .. meta.size
+        .. " bytes, max "
+        .. max_file_size
+        .. "). Use read with offset/limit instead."
     end
 
     local ok, source = pcall(maki.fs.read, path)

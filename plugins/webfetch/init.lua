@@ -1,6 +1,11 @@
 local VALID_FORMATS = { markdown = true, text = true, html = true }
 local DEFAULT_FORMAT = "markdown"
 local SKIP_TAGS = { script = true, style = true, noscript = true }
+local ACCEPT_HEADERS = {
+  html = "text/html,*/*;q=0.5",
+  text = "text/plain,text/html;q=0.9,*/*;q=0.5",
+  markdown = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.5",
+}
 
 local function strip_html(html)
   local out = {}
@@ -70,6 +75,7 @@ maki.api.register_tool({
     },
     required = { "url" },
   },
+  permission_scope = "url",
 
   summary = function(input)
     local fmt = input.format
@@ -98,6 +104,9 @@ maki.api.register_tool({
     local resp, err = maki.net.request(url, {
       timeout = input.timeout or 30,
       max_bytes = max_response,
+      headers = {
+        ["Accept"] = ACCEPT_HEADERS[fmt],
+      },
     })
     if not resp then
       return "error: " .. tostring(err)

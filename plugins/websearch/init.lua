@@ -23,6 +23,8 @@ maki.api.register_tool({
     },
     required = { "query" },
   },
+  permission_scope = "query",
+  audiences = { "main", "interpreter" },
 
   summary = function(input)
     return input.query

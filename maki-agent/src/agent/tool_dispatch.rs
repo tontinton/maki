@@ -10,7 +10,7 @@ use tracing::{debug, error, warn};
 use crate::mcp::{McpHandle, UNKNOWN_MCP};
 use crate::task_set::TaskSet;
 use crate::tools::ToolContext;
-use crate::tools::registry::{DELEGATE_NATIVE, ToolRegistry, ToolSource};
+use crate::tools::registry::{DELEGATE_NATIVE, ToolInvocation, ToolRegistry, ToolSource};
 use crate::{AgentError, AgentEvent, AgentMode, ToolDoneEvent, ToolOutput, ToolStartEvent};
 
 const DOOM_LOOP_THRESHOLD: usize = 3;
@@ -113,20 +113,8 @@ pub async fn run(
         };
         ctx.emit_tool_start(start);
 
-        if let Some(scope) = invocation.permission_scope()
-            && let Err(e) = ctx
-                .permissions
-                .enforce(
-                    name,
-                    &scope,
-                    &ctx.event_tx,
-                    ctx.user_response_rx.as_deref(),
-                    &id,
-                    &ctx.cancel,
-                )
-                .await
-        {
-            return done_error(e.to_string());
+        if let Err(e) = enforce_permission(invocation.as_ref(), name, ctx, &id).await {
+            return done_error(e);
         }
 
         let mut result = invocation.execute(ctx).await;
@@ -136,7 +124,13 @@ pub async fn run(
             debug!(tool = %name, "DELEGATE_NATIVE: falling back to native tool");
             match registry.get_native_fallback(name) {
                 Some(native) => match native.tool.parse(input) {
-                    Ok(native_inv) => result = native_inv.execute(ctx).await,
+                    Ok(native_inv) => {
+                        result = match enforce_permission(native_inv.as_ref(), name, ctx, &id).await
+                        {
+                            Ok(()) => native_inv.execute(ctx).await,
+                            Err(e) => Err(e),
+                        };
+                    }
                     Err(e) => result = Err(format!("native fallback parse error: {e}")),
                 },
                 None => result = Err(format!("no native tool '{name}' for DELEGATE_NATIVE")),
@@ -187,6 +181,28 @@ pub async fn run(
         warn!(tool = %name, "unknown tool");
         done_error(msg)
     }
+}
+
+async fn enforce_permission(
+    inv: &dyn ToolInvocation,
+    name: &str,
+    ctx: &ToolContext,
+    id: &str,
+) -> Result<(), String> {
+    if let Some(scope) = inv.permission_scope() {
+        ctx.permissions
+            .enforce(
+                name,
+                &scope,
+                &ctx.event_tx,
+                ctx.user_response_rx.as_deref(),
+                id,
+                &ctx.cancel,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 async fn execute_mcp_tool(

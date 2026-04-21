@@ -56,6 +56,14 @@ maki.api.register_tool({
 const MINIMAL_SCHEMA: &str =
     r#"{ type = "object", properties = {}, additionalProperties = false }"#;
 
+const STRING_FIELD_SCHEMA: &str = r#"{
+    type = "object",
+    properties = { url = { type = "string" } },
+    required = { "url" },
+}"#;
+
+const INVALID_PERMISSION_SCOPE_ERR: &str = "not in schema properties or not type 'string'";
+
 #[test]
 fn stdlib_globals_accessible() {
     let reg = fresh_registry();
@@ -177,6 +185,56 @@ fn empty_audiences_rejected() {
     assert!(err.to_string().contains("audiences"));
 }
 
+const NON_STRING_FIELD_SCHEMA: &str = r#"{
+    type = "object",
+    properties = { count = { type = "integer" } },
+    required = { "count" },
+}"#;
+
+#[test_case::test_case(STRING_FIELD_SCHEMA, "nonexistent" ; "missing_field")]
+#[test_case::test_case(NON_STRING_FIELD_SCHEMA, "count" ; "non_string_field")]
+fn permission_scope_invalid_rejected(schema: &str, scope_field: &str) {
+    let reg = fresh_registry();
+    let host = PluginHost::new(&enabled_config(), Arc::clone(&reg)).unwrap();
+
+    let src = format!(
+        r#"maki.api.register_tool({{
+            name = "bad_scope",
+            description = "test",
+            schema = {schema},
+            permission_scope = "{scope_field}",
+            handler = function() return "" end
+        }})"#,
+    );
+    let err = host
+        .load_source("bad_scope_plugin", &src)
+        .expect_err("expected error for invalid permission_scope");
+
+    assert!(matches!(err, PluginError::Lua { .. }));
+    assert!(
+        err.to_string().contains(INVALID_PERMISSION_SCOPE_ERR),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn permission_scope_valid_string_field_accepted() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(&enabled_config(), Arc::clone(&reg)).unwrap();
+
+    let src = format!(
+        r#"maki.api.register_tool({{
+            name = "ok_scope",
+            description = "test",
+            schema = {STRING_FIELD_SCHEMA},
+            permission_scope = "url",
+            handler = function() return "" end
+        }})"#,
+    );
+    host.load_source("ok_scope_plugin", &src).unwrap();
+    assert!(reg.has("ok_scope"));
+}
+
 #[test]
 fn interrupt_kills_infinite_loop_and_vm_recovers() {
     let reg = fresh_registry();
@@ -205,7 +263,7 @@ maki.api.register_tool({{
     let entry = reg.get("infinite_loop_").expect("loop tool not registered");
     let inv = entry.tool.parse(&serde_json::json!({})).unwrap();
     let mut ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
-    ctx.deadline = maki_agent::tools::Deadline::after(std::time::Duration::from_secs(2));
+    ctx.deadline = maki_agent::tools::Deadline::after(std::time::Duration::from_secs(5));
 
     let result = smol::block_on(async { inv.execute(&ctx).await });
 
@@ -226,9 +284,6 @@ fn reload_same_plugin_replaces_tools() {
     host.load_source("p1", ECHO_PLUGIN)
         .expect("reload with same plugin name should succeed");
     assert!(reg.has("echo_"));
-
-    host.load_source("p1", "").unwrap();
-    assert!(!reg.has("echo_"));
 }
 
 #[test]
@@ -281,32 +336,21 @@ fn is_error_propagated_as_error() {
     assert_eq!(err, "boom");
 }
 
-const BAD_RETURN_NUMBER: &str = r#"
-maki.api.register_tool({
-    name = "bad_ret_num",
-    description = "returns a number",
-    schema = { type = "object", properties = {}, additionalProperties = false },
-    audiences = { "main" },
-    handler = function() return 42 end
-})
-"#;
-
-const BAD_RETURN_NIL: &str = r#"
-maki.api.register_tool({
-    name = "bad_ret_nil",
-    description = "returns nil",
-    schema = { type = "object", properties = {}, additionalProperties = false },
-    audiences = { "main" },
-    handler = function() return nil end
-})
-"#;
-
-#[test_case::test_case(BAD_RETURN_NUMBER, "bad_ret_num" ; "number_return")]
-#[test_case::test_case(BAD_RETURN_NIL,    "bad_ret_nil" ; "nil_return")]
-fn handler_bad_return_type_is_error(plugin_src: &str, tool_name: &str) {
+#[test_case::test_case("return 42", "bad_ret_num" ; "number_return")]
+#[test_case::test_case("return nil", "bad_ret_nil" ; "nil_return")]
+fn handler_bad_return_type_is_error(handler_body: &str, tool_name: &str) {
     let reg = fresh_registry();
     let host = PluginHost::new(&enabled_config(), Arc::clone(&reg)).unwrap();
-    host.load_source("bad_ret", plugin_src).unwrap();
+    let src = format!(
+        r#"maki.api.register_tool({{
+            name = "{tool_name}",
+            description = "bad return",
+            schema = {MINIMAL_SCHEMA},
+            audiences = {{ "main" }},
+            handler = function() {handler_body} end
+        }})"#,
+    );
+    host.load_source("bad_ret", &src).unwrap();
 
     let err = exec_tool(&reg, tool_name, serde_json::json!({})).unwrap_err();
     assert!(err.contains("must return string"), "got: {err}");

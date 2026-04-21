@@ -30,6 +30,7 @@ pub(crate) struct PendingTool {
     pub(crate) audience: ToolAudience,
     pub(crate) handler_key: RegistryKey,
     pub(crate) summary_key: Option<RegistryKey>,
+    pub(crate) permission_scope_field: Option<Arc<str>>,
 }
 
 pub(crate) type PendingTools = Arc<Mutex<Vec<PendingTool>>>;
@@ -42,6 +43,7 @@ pub(crate) struct LuaTool {
     pub(crate) tx: Sender<Request>,
     pub(crate) plugin: Arc<str>,
     pub(crate) has_summary_fn: bool,
+    pub(crate) permission_scope_field: Option<Arc<str>>,
 }
 
 impl Tool for LuaTool {
@@ -63,12 +65,19 @@ impl Tool for LuaTool {
 
     fn parse(&self, input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
         let validated = validate(self.schema, input.clone())?;
+        let permission_scope = self.permission_scope_field.as_deref().and_then(|field| {
+            validated
+                .get(field)
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_owned())
+        });
         Ok(Box::new(LuaToolInvocation {
             tool: Arc::clone(&self.name),
             plugin: Arc::clone(&self.plugin),
             has_summary_fn: self.has_summary_fn,
             input: validated,
             tx: self.tx.clone(),
+            permission_scope,
         }))
     }
 }
@@ -79,6 +88,7 @@ struct LuaToolInvocation {
     has_summary_fn: bool,
     input: Value,
     tx: Sender<Request>,
+    permission_scope: Option<String>,
 }
 
 impl ToolInvocation for LuaToolInvocation {
@@ -109,6 +119,10 @@ impl ToolInvocation for LuaToolInvocation {
                 reply_rx.recv_async().await.unwrap_or(fallback)
             }),
         }
+    }
+
+    fn permission_scope(&self) -> Option<String> {
+        self.permission_scope.clone()
     }
 
     fn execute<'a>(self: Box<Self>, ctx: &'a ToolContext) -> ExecFuture<'a> {
@@ -239,6 +253,25 @@ fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> Lua
 
     let schema_val: Value = lua.from_value(schema_table)?;
     let param_schema = try_from_json(&schema_val).map_err(mlua::Error::runtime)?;
+
+    let permission_scope_field: Option<Arc<str>> = spec
+        .get::<String>("permission_scope")
+        .ok()
+        .map(|s| Arc::from(s.as_str()));
+    if let Some(ref field) = permission_scope_field {
+        let is_string = schema_val
+            .get("properties")
+            .and_then(|p| p.get(field.as_ref()))
+            .and_then(|s| s.get("type"))
+            .and_then(|t| t.as_str())
+            .is_some_and(|t| t == "string");
+        if !is_string {
+            return Err(mlua::Error::runtime(format!(
+                "register_tool: permission_scope field '{field}' not in schema properties or not type 'string'"
+            )));
+        }
+    }
+
     let summary_fn: Option<Function> = spec.get("summary").ok();
     let audience = parse_audience(audiences)?;
     let handler_key: RegistryKey = lua.create_registry_value(handler)?;
@@ -257,6 +290,7 @@ fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> Lua
             audience,
             handler_key,
             summary_key,
+            permission_scope_field,
         });
 
     Ok(())
@@ -313,6 +347,7 @@ mod tests {
             has_summary_fn: false,
             input,
             tx,
+            permission_scope: None,
         }
     }
 
@@ -320,5 +355,50 @@ mod tests {
     fn no_summary_fn_returns_tool_name() {
         let inv = invocation(serde_json::json!({"path": "/home/x/foo.rs"}));
         assert_eq!(inv.start_summary().into_ready(), "test_tool");
+    }
+
+    fn make_lua_tool(permission_scope_field: Option<&str>) -> LuaTool {
+        let schema = try_from_json(&serde_json::json!({
+            "type": "object",
+            "properties": {
+                "url": { "type": "string" },
+                "format": { "type": "string" },
+            },
+            "required": ["url"],
+        }))
+        .unwrap();
+        let (tx, _rx) = flume::unbounded();
+        LuaTool {
+            name: Arc::from("test_tool"),
+            description: "test".into(),
+            schema,
+            audience: ToolAudience::default(),
+            tx,
+            plugin: Arc::from("test"),
+            has_summary_fn: false,
+            permission_scope_field: permission_scope_field.map(Arc::from),
+        }
+    }
+
+    #[test]
+    fn permission_scope_extracted_at_parse_time() {
+        let tool = make_lua_tool(Some("url"));
+        let inv = tool
+            .parse(&serde_json::json!({"url": "https://example.com"}))
+            .unwrap();
+        assert_eq!(
+            inv.permission_scope(),
+            Some("https://example.com".to_string())
+        );
+    }
+
+    #[test_case::test_case(Some("format"), None ; "optional_field_absent_in_input")]
+    #[test_case::test_case(None, None ; "no_field_configured")]
+    fn permission_scope_none(field: Option<&str>, expected: Option<&str>) {
+        let tool = make_lua_tool(field);
+        let inv = tool
+            .parse(&serde_json::json!({"url": "https://example.com"}))
+            .unwrap();
+        assert_eq!(inv.permission_scope(), expected.map(String::from));
     }
 }

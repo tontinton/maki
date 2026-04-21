@@ -340,6 +340,7 @@ impl LuaRuntime {
                     tx: self.tx.clone(),
                     plugin: Arc::clone(&name),
                     has_summary_fn: t.summary_key.is_some(),
+                    permission_scope_field: t.permission_scope_field.clone(),
                 });
                 (
                     tool,
