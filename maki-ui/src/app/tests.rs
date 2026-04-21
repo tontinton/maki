@@ -1345,7 +1345,7 @@ fn help_modal_consumes_keys_and_esc_closes() {
     ; "streaming"
 )]
 #[test_case(
-    |app: &mut App| { app.plan_form.open(); },
+    |app: &mut App| { app.state.mode = Mode::Plan; app.plan_form.on_plan_ready(); },
     &[KeybindContext::FormInput],
     &[KeybindContext::Editing]
     ; "plan_form"
@@ -1675,7 +1675,7 @@ fn mcp_toggle_dispatches_action() {
 }
 
 #[test_case(
-    |app: &mut App| { app.plan_form.open(); },
+    |app: &mut App| { app.state.mode = Mode::Plan; app.plan_form.on_plan_ready(); },
     ""
     ; "consumed_by_plan_form"
 )]
@@ -1716,7 +1716,7 @@ fn open_editor(plan: PlanState, expect_flash: bool) {
     } else {
         let expected = plan_path.unwrap();
         assert!(matches!(&actions[..], [Action::OpenEditor(p)] if p == &expected));
-        assert!(app.plan_form.is_visible());
+        assert!(!app.plan_form.is_visible());
     }
 }
 
@@ -1938,7 +1938,7 @@ fn question_demotes_ready_to_drafting() {
 }
 
 #[test]
-fn re_edit_closes_plan_form() {
+fn re_edit_keeps_plan_form_visible() {
     let mut app = plan_app();
     assert!(app.state.plan.is_ready());
     assert!(app.plan_form.is_visible());
@@ -1960,7 +1960,6 @@ fn re_edit_closes_plan_form() {
 
 #[test_case(0, Mode::Build, true,  true  ; "clear_and_implement")]
 #[test_case(1, Mode::Build, false, true  ; "implement_keeps_context")]
-#[test_case(2, Mode::Plan,  false, false ; "continue_planning")]
 fn plan_form_menu_options(
     downs: usize,
     expected_mode: Mode,
@@ -1976,11 +1975,7 @@ fn plan_form_menu_options(
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
     assert!(!app.plan_form.is_visible());
     assert_eq!(app.state.mode, expected_mode);
-    if expected_mode == Mode::Plan {
-        assert!(matches!(app.state.plan, PlanState::Drafting(_)));
-    } else {
-        assert_eq!(app.state.plan, PlanState::None);
-    }
+    assert_eq!(app.state.plan, PlanState::None);
     assert_eq!(
         actions.iter().any(|a| matches!(a, Action::NewSession)),
         has_new_session
@@ -2000,16 +1995,6 @@ fn plan_form_open_editor() {
     assert!(matches!(&actions[..], [Action::OpenEditor(p)] if p == Path::new("test-plan.md")));
 }
 
-#[test]
-fn plan_form_dismiss_on_esc() {
-    let mut app = plan_app();
-
-    let actions = app.update(Msg::Key(key(KeyCode::Esc)));
-    assert!(!app.plan_form.is_visible());
-    assert!(matches!(app.state.plan, PlanState::Drafting(_)));
-    assert!(actions.is_empty());
-}
-
 fn rewrite_plan(app: &mut App) {
     app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
         id: "t2".into(),
@@ -2023,30 +2008,71 @@ fn rewrite_plan(app: &mut App) {
     }))));
 }
 
-fn select_plan_continue(app: &mut App) {
-    for _ in 0..2 {
-        app.update(Msg::Key(key(KeyCode::Down)));
-    }
-    app.update(Msg::Key(key(KeyCode::Enter)));
-}
-
 fn dismiss_plan_esc(app: &mut App) {
     app.update(Msg::Key(key(KeyCode::Esc)));
 }
 
-#[test_case(select_plan_continue as fn(&mut App) ; "after_continue")]
-#[test_case(dismiss_plan_esc     as fn(&mut App) ; "after_dismiss")]
-fn rewrite_reopens_form(close: fn(&mut App)) {
+#[test]
+fn rewrite_does_not_reopen_after_dismiss() {
     let mut app = plan_app();
     assert!(app.plan_form.is_visible());
 
-    close(&mut app);
+    dismiss_plan_esc(&mut app);
     assert!(!app.plan_form.is_visible());
-    assert!(matches!(app.state.plan, PlanState::Drafting(_)));
+    assert!(app.state.plan.is_ready());
+
+    rewrite_plan(&mut app);
+    assert!(!app.plan_form.is_visible());
+    assert!(app.state.plan.is_ready());
+}
+
+#[test]
+fn ctrl_t_toggles_plan_form_in_plan_mode() {
+    let mut app = plan_app();
+    assert!(app.plan_form.is_visible());
+
+    app.update(Msg::Key(kb::TODO_PANEL.to_key_event()));
+    assert!(!app.plan_form.is_visible());
+
+    app.update(Msg::Key(kb::TODO_PANEL.to_key_event()));
+    assert!(app.plan_form.is_visible());
+}
+
+#[test]
+fn ctrl_t_toggles_todo_panel_in_build_mode() {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    app.state.mode = Mode::Build;
+
+    app.update(Msg::Key(kb::TODO_PANEL.to_key_event()));
+    assert!(app.todo_panel.hint_line().is_none());
+}
+
+#[test]
+fn question_resets_dismiss_then_rewrite_shows() {
+    let mut app = plan_app();
+    dismiss_plan_esc(&mut app);
+    assert!(!app.plan_form.is_visible());
+
+    app.update(agent_msg(AgentEvent::QuestionPrompt {
+        id: "q1".into(),
+        questions: vec![QuestionInfo {
+            question: "Pick one".into(),
+            header: "Choice".into(),
+            options: vec![QuestionOption {
+                label: "A".into(),
+                description: String::new(),
+            }],
+            multiple: false,
+        }],
+    }));
+    assert!(!app.plan_form.is_visible());
+
+    app.update(Msg::Key(key(KeyCode::Enter)));
 
     rewrite_plan(&mut app);
     assert!(app.plan_form.is_visible());
-    assert!(app.state.plan.is_ready());
 }
 
 #[test]

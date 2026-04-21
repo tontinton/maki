@@ -1,7 +1,6 @@
 use crate::components::Overlay;
 #[cfg(test)]
 use crate::components::keybindings::KeybindContext;
-use crate::components::plan_form::PlanForm;
 use crate::components::queue_panel;
 use crate::components::status_bar::{StatusBarContext, UsageStats};
 use crate::selection::{self, SelectableZone, SelectionZone};
@@ -10,7 +9,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::widgets::{Block, Borders, Widget};
 
-use super::{App, Status};
+use super::{App, Mode, Status};
 
 struct ViewLayout {
     msg_area: Rect,
@@ -25,9 +24,10 @@ impl App {
     pub fn view(&mut self, frame: &mut Frame) {
         self.status_bar.clear_expired_hint();
 
+        let in_plan = self.state.mode == Mode::Plan;
         let form_visible = self.permission_prompt.is_open()
             || self.question_form.is_visible()
-            || self.plan_form.is_visible();
+            || (in_plan && self.plan_form.is_visible());
         let layout = self.compute_layout(frame, form_visible);
         let render_chat = self.resolve_render_chat();
 
@@ -48,7 +48,7 @@ impl App {
             if self.permission_prompt.is_open() {
                 self.permission_prompt.height(area.width).min(max)
             } else if self.plan_form.is_visible() {
-                PlanForm::height().min(max)
+                self.plan_form.height().min(max)
             } else {
                 self.question_form.height(area.width).min(max)
             }
@@ -115,17 +115,18 @@ impl App {
     }
 
     fn render_bottom_panel(&mut self, frame: &mut Frame, layout: &ViewLayout) {
+        let in_plan = self.state.mode == Mode::Plan;
         if self.permission_prompt.is_open() {
             self.permission_prompt.view(frame, layout.bottom_area);
         } else if self.question_form.is_visible() {
             self.question_form.view(frame, layout.bottom_area);
-        } else if self.plan_form.is_visible() {
-            self.plan_form.view(frame, layout.bottom_area);
         } else if !self.is_main_chat() {
             let sep = Block::default()
                 .borders(Borders::TOP)
                 .border_style(self.separator_style());
             frame.render_widget(sep, layout.bottom_area);
+        } else if in_plan && self.plan_form.is_visible() {
+            self.plan_form.view(frame, layout.bottom_area);
         } else if layout.bottom_area.height > 0 {
             let queue_entries = self.queue.entries();
             queue_panel::view(frame, layout.queue_area, &queue_entries, self.queue.focus());
@@ -133,18 +134,17 @@ impl App {
                 self.todo_panel.view(frame, layout.todo_area);
             }
             let streaming = self.status == Status::Streaming;
-            let todo_hint = if streaming {
-                self.todo_panel.hint_line()
-            } else {
-                None
-            };
+            let panel_hint = in_plan
+                .then(|| self.plan_form.hint_line())
+                .flatten()
+                .or_else(|| streaming.then(|| self.todo_panel.hint_line()).flatten());
             self.input_box.view(
                 frame,
                 layout.input_area,
                 streaming,
                 self.separator_style(),
                 !self.any_overlay_open(),
-                todo_hint,
+                panel_hint,
             );
             self.command_palette.view(frame, layout.input_area);
         }
@@ -308,7 +308,9 @@ impl App {
     #[cfg(test)]
     pub(super) fn active_keybind_contexts(&self) -> Vec<KeybindContext> {
         let mut contexts = vec![KeybindContext::General];
-        if self.question_form.is_visible() || self.plan_form.is_visible() {
+        if self.question_form.is_visible()
+            || (self.state.mode == Mode::Plan && self.plan_form.is_visible())
+        {
             contexts.push(KeybindContext::FormInput);
         } else if self.queue.focus().is_some() {
             contexts.push(KeybindContext::QueueFocus);

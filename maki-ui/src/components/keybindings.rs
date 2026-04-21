@@ -342,7 +342,7 @@ pub const KEYBINDS: &[Keybind] = &[
     },
     Keybind {
         label: KeyLabel::Single(key::TODO_PANEL.label),
-        description: "Toggle todo panel",
+        description: "Toggle todo / plan panel",
         context: KeybindContext::General,
         platform: Platform::All,
     },

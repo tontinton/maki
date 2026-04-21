@@ -90,6 +90,7 @@ impl App {
         self.task_picker_original = None;
         self.last_esc = None;
         self.todo_panel.reset();
+        self.plan_form.reset();
     }
 
     pub(crate) fn restore_display(&mut self) {

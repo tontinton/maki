@@ -56,7 +56,7 @@ pub(crate) fn hint_line(pairs: &[(&str, &str)]) -> Line<'static> {
         let parts: Vec<&str> = key.split('/').collect();
         for (i, part) in parts.iter().enumerate() {
             if i > 0 {
-                spans.push(Span::raw("/"));
+                spans.push(Span::styled("/", t.form_hint));
             }
             spans.push(Span::styled((*part).to_string(), t.keybind_key));
         }

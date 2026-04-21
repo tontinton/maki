@@ -467,9 +467,11 @@ impl App {
             return vec![];
         }
 
-        if self.plan_form.is_visible() {
+        if self.state.mode == Mode::Plan && self.plan_form.is_visible() {
             let action = self.plan_form.handle_key(key);
-            return self.handle_plan_form_action(action);
+            if action != PlanFormAction::Passthrough {
+                return self.handle_plan_form_action(action);
+            }
         }
 
         self.selection_state = None;
@@ -670,17 +672,17 @@ impl App {
                 self.queue.remove(0);
             } else if key::OPEN_EDITOR.matches(key) {
                 return match self.state.plan.path() {
-                    Some(p) => {
-                        self.plan_form.open();
-                        vec![Action::OpenEditor(p.to_path_buf())]
-                    }
+                    Some(p) => vec![Action::OpenEditor(p.to_path_buf())],
                     None => {
                         self.flash(FLASH_NO_PLAN.into());
                         vec![]
                     }
                 };
             } else if key::TODO_PANEL.matches(key) {
-                self.todo_panel.toggle();
+                match self.state.mode {
+                    Mode::Plan => self.plan_form.toggle(),
+                    Mode::Build => self.todo_panel.toggle(),
+                }
             } else if key::SEARCH.matches(key) {
                 let top = self.chats[self.active_chat].scroll_top();
                 let auto = self.chats[self.active_chat].auto_scroll();
@@ -1222,7 +1224,7 @@ impl App {
         vec![]
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 14] {
+    fn overlays(&self) -> [&dyn Overlay; 13] {
         [
             &self.help_modal,
             &self.btw_modal,
@@ -1237,11 +1239,10 @@ impl App {
             &self.mcp_picker,
             &self.permission_prompt,
             &self.question_form,
-            &self.plan_form,
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 14] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 13] {
         [
             &mut self.help_modal,
             &mut self.btw_modal,
@@ -1256,7 +1257,6 @@ impl App {
             &mut self.mcp_picker,
             &mut self.permission_prompt,
             &mut self.question_form,
-            &mut self.plan_form,
         ]
     }
 
@@ -1318,7 +1318,7 @@ impl App {
     }
 
     fn route_text_paste(&mut self, text: &str) {
-        if self.plan_form.is_visible() {
+        if self.state.mode == Mode::Plan && self.plan_form.is_visible() {
             return;
         }
         if self.permission_prompt.handle_paste(text) {
@@ -1359,20 +1359,14 @@ impl App {
     }
 
     fn handle_plan_form_action(&mut self, action: PlanFormAction) -> Vec<Action> {
-        if !matches!(action, PlanFormAction::Consumed) {
-            self.plan_form.close();
-        }
         match action {
-            PlanFormAction::Consumed => vec![],
-            PlanFormAction::Dismiss | PlanFormAction::Continue => {
-                self.state.plan.mark_drafting();
+            PlanFormAction::Consumed | PlanFormAction::Passthrough => vec![],
+            PlanFormAction::Hide => {
+                self.plan_form.hide();
                 vec![]
             }
             PlanFormAction::OpenEditor => match self.state.plan.path() {
-                Some(p) => {
-                    self.plan_form.open();
-                    vec![Action::OpenEditor(p.to_path_buf())]
-                }
+                Some(p) => vec![Action::OpenEditor(p.to_path_buf())],
                 None => {
                     self.flash(FLASH_NO_PLAN.into());
                     vec![]
@@ -1409,6 +1403,7 @@ impl App {
     }
 
     fn implement_plan(&mut self, clear_context: bool) -> Vec<Action> {
+        self.plan_form.reset();
         let plan_snapshot = match std::mem::take(&mut self.state.plan) {
             PlanState::Ready(p) => Some((
                 std::fs::read_to_string(&p).unwrap_or_default(),

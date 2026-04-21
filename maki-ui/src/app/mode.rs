@@ -83,12 +83,12 @@ impl App {
                     return;
                 }
                 self.state.plan.mark_ready();
-                self.plan_form.open();
+                self.plan_form.on_plan_ready();
             }
             PlanTrigger::QuestionAsked => {
                 if self.state.plan.is_ready() {
                     self.state.plan.mark_drafting();
-                    self.plan_form.close();
+                    self.plan_form.on_plan_drafting();
                 }
             }
         }
