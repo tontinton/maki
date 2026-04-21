@@ -9,11 +9,15 @@ use mlua::{Lua, Result as LuaResult, Table, Value};
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 const MAX_TIMEOUT_SECS: u64 = 120;
 const DEFAULT_MAX_BYTES: usize = 5 * 1024 * 1024;
+const MAX_RETRIES: u32 = 3;
 const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 const CF_MITIGATED: &str = "cf-mitigated";
 const CF_CHALLENGE: &str = "challenge";
 const FALLBACK_USER_AGENT: &str = "maki";
 
+// Supports both Neovim's current vim.net.request(url, opts, on_response) signature
+// and the proposed multi-method API: vim.net.request(url, opts) with opts.method.
+// See: https://github.com/neovim/neovim/issues/38946
 pub(crate) fn create_net_table(lua: &Lua) -> LuaResult<Table> {
     let net = lua.create_table()?;
 
@@ -72,6 +76,10 @@ fn do_request(lua: &Lua, url: &str, opts: Option<&Table>) -> Result<Table, Strin
             .min(MAX_TIMEOUT_SECS),
     );
 
+    let retries = opts
+        .and_then(|o| o.get::<u32>("retry").ok())
+        .unwrap_or(MAX_RETRIES);
+
     let client = HttpClient::builder()
         .timeout(timeout)
         .build()
@@ -81,25 +89,38 @@ fn do_request(lua: &Lua, url: &str, opts: Option<&Table>) -> Result<Table, Strin
         .and_then(|o| o.get::<String>("method").ok())
         .unwrap_or_else(|| "GET".to_string());
 
-    let response = client
-        .send(build_request(&url, USER_AGENT, &method, opts)?)
-        .map_err(|e| format!("request failed: {e}"))?;
-
     let is_get = method.eq_ignore_ascii_case("GET");
+    let mut last_err = String::new();
 
-    let is_cf_challenge = response.status().as_u16() == 403
-        && response
-            .headers()
-            .get(CF_MITIGATED)
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| v.contains(CF_CHALLENGE));
+    let mut response = 'retry: {
+        for attempt in 0..=retries {
+            match client.send(build_request(&url, USER_AGENT, &method, opts)?) {
+                Ok(resp) => {
+                    let status = resp.status().as_u16();
+                    let is_cf_challenge = status == 403
+                        && resp
+                            .headers()
+                            .get(CF_MITIGATED)
+                            .and_then(|v| v.to_str().ok())
+                            .is_some_and(|v| v.contains(CF_CHALLENGE));
 
-    let mut response = if is_cf_challenge && is_get {
-        client
-            .send(build_request(&url, FALLBACK_USER_AGENT, &method, opts)?)
-            .map_err(|e| format!("request failed: {e}"))?
-    } else {
-        response
+                    if is_cf_challenge && is_get {
+                        match client.send(build_request(&url, FALLBACK_USER_AGENT, &method, opts)?)
+                        {
+                            Ok(resp) => break 'retry resp,
+                            Err(e) => last_err = format!("request failed: {e}"),
+                        }
+                    } else if status >= 500 && attempt < retries {
+                        last_err = format!("HTTP {status}");
+                        continue;
+                    } else {
+                        break 'retry resp;
+                    }
+                }
+                Err(e) => last_err = format!("request failed: {e}"),
+            }
+        }
+        return Err(last_err);
     };
 
     let status = response.status().as_u16();
@@ -277,41 +298,41 @@ mod tests {
         assert_eq!(extract_host(url), expected);
     }
 
-    fn lua_table_from(lua: &Lua, pairs: &[(&str, &str)]) -> Table {
-        let tbl = lua.create_table().unwrap();
-        for (k, v) in pairs {
-            tbl.set(*k, lua.create_string(*v).unwrap()).unwrap();
-        }
-        tbl
-    }
-
     #[test]
-    fn build_request_post_includes_body() {
-        let lua = Lua::new();
-        let opts = lua_table_from(&lua, &[("body", "hello world")]);
-        let req = build_request("https://example.com", "agent", "POST", Some(&opts)).unwrap();
-        assert_eq!(req.method(), "POST");
-        assert_eq!(req.body(), b"hello world");
-    }
-
-    #[test]
-    fn build_request_get_has_empty_body() {
+    fn build_request_get_no_opts() {
         let req = build_request("https://example.com", "agent", "GET", None).unwrap();
         assert_eq!(req.method(), "GET");
         assert!(req.body().is_empty());
+        assert_eq!(req.headers()["User-Agent"], "agent");
     }
 
     #[test]
-    fn build_request_custom_headers() {
+    fn build_request_post_with_body_and_headers() {
         let lua = Lua::new();
         let headers = lua.create_table().unwrap();
         headers.set("Content-Type", "application/json").unwrap();
         let opts = lua.create_table().unwrap();
         opts.set("headers", headers).unwrap();
+        opts.set("body", "hello world").unwrap();
         let req = build_request("https://example.com", "agent", "POST", Some(&opts)).unwrap();
-        assert_eq!(
-            req.headers().get("Content-Type").unwrap().to_str().unwrap(),
-            "application/json"
-        );
+        assert_eq!(req.method(), "POST");
+        assert_eq!(req.body(), b"hello world");
+        assert_eq!(req.headers()["Content-Type"], "application/json");
+    }
+
+    #[test_case(r#"net.request("https://127.0.0.1")"# ; "ssrf_blocked")]
+    #[test_case(r#"net.request("ftp://x")"# ; "invalid_url")]
+    fn lua_request_error_returns_nil_and_message(expr: &str) {
+        let lua = Lua::new();
+        let net = create_net_table(&lua).unwrap();
+        lua.globals().set("net", net).unwrap();
+        let (is_nil, has_err): (bool, bool) = lua
+            .load(format!(
+                "local r, err = {expr}; return r == nil, err ~= nil"
+            ))
+            .eval()
+            .unwrap();
+        assert!(is_nil);
+        assert!(has_err);
     }
 }
