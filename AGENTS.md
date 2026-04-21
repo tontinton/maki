@@ -47,7 +47,7 @@ Rust workspace, key crates in root dir:
 - **maki-code-index**: index tool implementation using tree-sitter (returns a compact skeleton of a source file)
 - **maki-storage**: Persistent state across runs (e.g. sessions, auth)
 - **maki-config**: User config
-- **maki-lua**: WIP lua plugin system inspired by neovim
+- **maki-lua**: WIP lua plugin system (API mirrored from neovim for plugin compatibility), built-in plugins in plugins dir
 
 ## Docs
 
