@@ -670,7 +670,10 @@ impl App {
                 self.queue.remove(0);
             } else if key::OPEN_EDITOR.matches(key) {
                 return match self.state.plan.path() {
-                    Some(p) => vec![Action::OpenEditor(p.to_path_buf())],
+                    Some(p) => {
+                        self.plan_form.open();
+                        vec![Action::OpenEditor(p.to_path_buf())]
+                    }
                     None => {
                         self.flash(FLASH_NO_PLAN.into());
                         vec![]

@@ -1712,9 +1712,11 @@ fn open_editor(plan: PlanState, expect_flash: bool) {
     if expect_flash {
         assert!(actions.is_empty());
         assert_eq!(app.status_bar.flash_text().unwrap(), FLASH_NO_PLAN);
+        assert!(!app.plan_form.is_visible());
     } else {
         let expected = plan_path.unwrap();
         assert!(matches!(&actions[..], [Action::OpenEditor(p)] if p == &expected));
+        assert!(app.plan_form.is_visible());
     }
 }
 
