@@ -1974,6 +1974,11 @@ fn plan_form_menu_options(
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
     assert!(!app.plan_form.is_visible());
     assert_eq!(app.state.mode, expected_mode);
+    if expected_mode == Mode::Plan {
+        assert!(matches!(app.state.plan, PlanState::Drafting(_)));
+    } else {
+        assert_eq!(app.state.plan, PlanState::None);
+    }
     assert_eq!(
         actions.iter().any(|a| matches!(a, Action::NewSession)),
         has_new_session
@@ -1982,15 +1987,6 @@ fn plan_form_menu_options(
         actions.iter().any(|a| matches!(a, Action::SendMessage(i) if i.message == "Implement the plan at `test-plan.md`.")),
         has_send_message
     );
-}
-
-#[test]
-fn implement_plan_clear_context_does_not_leak_plan_state() {
-    let mut app = plan_app();
-    assert!(app.plan_form.is_visible());
-    app.update(Msg::Key(key(KeyCode::Enter)));
-    assert_eq!(app.state.mode, Mode::Build);
-    assert_eq!(app.state.plan, PlanState::None);
 }
 
 #[test]
@@ -2008,7 +2004,47 @@ fn plan_form_dismiss_on_esc() {
 
     let actions = app.update(Msg::Key(key(KeyCode::Esc)));
     assert!(!app.plan_form.is_visible());
+    assert!(matches!(app.state.plan, PlanState::Drafting(_)));
     assert!(actions.is_empty());
+}
+
+fn rewrite_plan(app: &mut App) {
+    app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+        id: "t2".into(),
+        tool: "write".into(),
+        output: ToolOutput::WriteCode {
+            path: "test-plan.md".into(),
+            byte_count: 99,
+            lines: vec![],
+        },
+        is_error: false,
+    }))));
+}
+
+fn select_plan_continue(app: &mut App) {
+    for _ in 0..2 {
+        app.update(Msg::Key(key(KeyCode::Down)));
+    }
+    app.update(Msg::Key(key(KeyCode::Enter)));
+}
+
+fn dismiss_plan_esc(app: &mut App) {
+    app.update(Msg::Key(key(KeyCode::Esc)));
+}
+
+#[test_case(select_plan_continue as fn(&mut App) ; "after_continue")]
+#[test_case(dismiss_plan_esc     as fn(&mut App) ; "after_dismiss")]
+fn rewrite_reopens_form(close: fn(&mut App)) {
+    let mut app = plan_app();
+    assert!(app.plan_form.is_visible());
+
+    close(&mut app);
+    assert!(!app.plan_form.is_visible());
+    assert!(matches!(app.state.plan, PlanState::Drafting(_)));
+
+    rewrite_plan(&mut app);
+    assert!(app.plan_form.is_visible());
+    assert!(app.state.plan.is_ready());
 }
 
 #[test]

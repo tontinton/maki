@@ -1360,7 +1360,9 @@ impl App {
             self.plan_form.close();
         }
         match action {
-            PlanFormAction::Consumed | PlanFormAction::Dismiss | PlanFormAction::Continue => {
+            PlanFormAction::Consumed => vec![],
+            PlanFormAction::Dismiss | PlanFormAction::Continue => {
+                self.state.plan.mark_drafting();
                 vec![]
             }
             PlanFormAction::OpenEditor => match self.state.plan.path() {
