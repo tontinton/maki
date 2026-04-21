@@ -14,7 +14,8 @@ use crate::runtime::{self, LuaThread, Request};
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 static BUNDLED_INDEX_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/../plugins/index");
-static BUNDLED_DIRS: &[&Dir] = &[&BUNDLED_INDEX_DIR];
+static BUNDLED_WEBFETCH_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/../plugins/webfetch");
+static BUNDLED_DIRS: &[&Dir] = &[&BUNDLED_INDEX_DIR, &BUNDLED_WEBFETCH_DIR];
 
 pub struct PluginHost {
     inner: Option<LuaThread>,
@@ -54,6 +55,7 @@ impl PluginHost {
         for builtin in &config.builtins {
             let dir = match builtin.as_str() {
                 "index" => &BUNDLED_INDEX_DIR,
+                "webfetch" => &BUNDLED_WEBFETCH_DIR,
                 other => {
                     tracing::warn!(builtin = other, "unknown builtin plugin, skipping");
                     continue;

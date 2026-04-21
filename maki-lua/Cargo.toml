@@ -22,6 +22,8 @@ regex = { workspace = true }
 maki-code-index = { workspace = true }
 include_dir = { workspace = true }
 dirs = { workspace = true }
+isahc = { workspace = true }
+htmd = { workspace = true }
 
 [dev-dependencies]
 maki-agent = { workspace = true }

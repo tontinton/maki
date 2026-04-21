@@ -1,6 +1,8 @@
 pub(crate) mod ctx;
 pub(crate) mod fs;
 pub(crate) mod log;
+pub(crate) mod net;
+pub(crate) mod text;
 pub(crate) mod tool;
 pub(crate) mod treesitter;
 pub(crate) mod uv;
@@ -25,6 +27,8 @@ pub(crate) fn create_maki_global(
     maki.set("log", log::create_log_table(lua, plugin)?)?;
     maki.set("treesitter", treesitter::create_treesitter_table(lua)?)?;
     maki.set("uv", uv::create_uv_table(lua)?)?;
+    maki.set("net", net::create_net_table(lua)?)?;
+    maki.set("text", text::create_text_table(lua)?)?;
 
     Ok(maki)
 }

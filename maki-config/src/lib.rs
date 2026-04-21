@@ -638,7 +638,9 @@ impl PluginsConfig {
         });
         Self {
             enabled,
-            builtins: f.builtins.unwrap_or_else(|| vec!["index".to_string()]),
+            builtins: f
+                .builtins
+                .unwrap_or_else(|| vec!["index".to_string(), "webfetch".to_string()]),
             init_file,
         }
     }
