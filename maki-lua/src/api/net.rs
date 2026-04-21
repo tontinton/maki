@@ -2,7 +2,7 @@ use std::io::Read;
 use std::net::{IpAddr, ToSocketAddrs};
 use std::time::Duration;
 
-use isahc::config::Configurable;
+use isahc::config::{Configurable, RedirectPolicy};
 use isahc::{HttpClient, Request};
 use mlua::{Lua, Result as LuaResult, Table, Value};
 
@@ -82,6 +82,7 @@ fn do_request(lua: &Lua, url: &str, opts: Option<&Table>) -> Result<Table, Strin
 
     let client = HttpClient::builder()
         .timeout(timeout)
+        .redirect_policy(RedirectPolicy::Follow)
         .build()
         .map_err(|e| format!("client error: {e}"))?;
 
