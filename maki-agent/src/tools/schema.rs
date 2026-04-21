@@ -201,8 +201,12 @@ pub fn try_from_json(v: &Value) -> Result<&'static ParamSchema, String> {
                     .iter()
                     .map(|(name, sub)| -> Result<Property, String> {
                         let static_name: &'static str = Box::leak(name.clone().into_boxed_str());
+                        let inline_required = sub
+                            .get("required")
+                            .and_then(|r| r.as_bool())
+                            .unwrap_or(false);
                         let static_schema: &'static ParamSchema = try_from_json(sub)?;
-                        let is_required = required.contains(&name.as_str());
+                        let is_required = inline_required || required.contains(&name.as_str());
                         Ok((static_name, static_schema, is_required))
                     })
                     .collect::<Result<Vec<_>, _>>()?
@@ -805,5 +809,19 @@ mod tests {
         assert!(validate(recovered, json!({"name": "x", "count": 3})).is_ok());
         assert!(validate(recovered, json!({"name": "x"})).is_ok());
         assert!(validate(recovered, json!({"count": 3})).is_err());
+    }
+
+    #[test]
+    fn try_from_json_inline_required() {
+        let schema_json = json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "required": true },
+                "hint": { "type": "string" },
+            }
+        });
+        let schema = try_from_json(&schema_json).unwrap();
+        assert!(validate(schema, json!({"path": "/x"})).is_ok());
+        assert!(validate(schema, json!({"hint": "y"})).is_err());
     }
 }

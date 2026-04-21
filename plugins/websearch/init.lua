@@ -18,10 +18,9 @@ maki.api.register_tool({
   schema = {
     type = "object",
     properties = {
-      query = { type = "string", description = "Search query" },
+      query = { type = "string", description = "Search query", required = true },
       num_results = { type = "integer", description = "Number of results to return (default 8)" },
     },
-    required = { "query" },
   },
   permission_scope = "query",
   audiences = { "main", "interpreter" },

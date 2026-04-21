@@ -69,11 +69,10 @@ maki.api.register_tool({
   schema = {
     type = "object",
     properties = {
-      url = { type = "string", description = "URL to fetch (http:// or https://)" },
+      url = { type = "string", description = "URL to fetch (http:// or https://)", required = true },
       format = { type = "string", description = "Output format: markdown (default), text, or html" },
       timeout = { type = "integer", description = "Timeout in seconds (default 30, max 120)" },
     },
-    required = { "url" },
   },
   permission_scope = "url",
 

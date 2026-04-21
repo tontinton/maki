@@ -26,9 +26,8 @@ Return a compact overview of a source file: imports, type definitions, function 
   schema = {
     type = "object",
     properties = {
-      path = { type = "string", description = "Absolute path to the file" },
+      path = { type = "string", description = "Absolute path to the file", required = true },
     },
-    required = { "path" },
   },
   summary = function(input)
     return normalize(input.path)
