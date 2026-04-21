@@ -638,9 +638,13 @@ impl PluginsConfig {
         });
         Self {
             enabled,
-            builtins: f
-                .builtins
-                .unwrap_or_else(|| vec!["index".to_string(), "webfetch".to_string()]),
+            builtins: f.builtins.unwrap_or_else(|| {
+                vec![
+                    "index".to_string(),
+                    "webfetch".to_string(),
+                    "websearch".to_string(),
+                ]
+            }),
             init_file,
         }
     }
@@ -1376,5 +1380,17 @@ mod tests {
         let config = load_config(dir.path(), false);
         assert!(config.plugins.enabled);
         assert_eq!(config.plugins.init_file, Some(init));
+    }
+
+    #[test]
+    fn plugins_default_builtins_include_websearch() {
+        let dir = TempDir::new().unwrap();
+        let maki_dir = dir.path().join(".maki");
+        fs::create_dir_all(&maki_dir).unwrap();
+        fs::write(maki_dir.join("config.toml"), "[plugins]\nenabled = true\n").unwrap();
+        let config = load_config(dir.path(), false);
+        assert!(config.plugins.builtins.contains(&"websearch".to_string()));
+        assert!(config.plugins.builtins.contains(&"index".to_string()));
+        assert!(config.plugins.builtins.contains(&"webfetch".to_string()));
     }
 }

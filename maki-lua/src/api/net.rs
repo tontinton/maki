@@ -30,9 +30,14 @@ pub(crate) fn create_net_table(lua: &Lua) -> LuaResult<Table> {
     Ok(net)
 }
 
-fn build_request(url: &str, user_agent: &str, opts: Option<&Table>) -> Result<Request<()>, String> {
+fn build_request(
+    url: &str,
+    user_agent: &str,
+    method: &str,
+    opts: Option<&Table>,
+) -> Result<Request<Vec<u8>>, String> {
     let mut builder = Request::builder()
-        .method("GET")
+        .method(method)
         .uri(url)
         .header("User-Agent", user_agent);
 
@@ -43,8 +48,13 @@ fn build_request(url: &str, user_agent: &str, opts: Option<&Table>) -> Result<Re
         }
     }
 
+    let body = opts
+        .and_then(|o| o.get::<String>("body").ok())
+        .map(|s| s.into_bytes())
+        .unwrap_or_default();
+
     builder
-        .body(())
+        .body(body)
         .map_err(|e| format!("request build error: {e}"))
 }
 
@@ -67,9 +77,15 @@ fn do_request(lua: &Lua, url: &str, opts: Option<&Table>) -> Result<Table, Strin
         .build()
         .map_err(|e| format!("client error: {e}"))?;
 
+    let method = opts
+        .and_then(|o| o.get::<String>("method").ok())
+        .unwrap_or_else(|| "GET".to_string());
+
     let response = client
-        .send(build_request(&url, USER_AGENT, opts)?)
+        .send(build_request(&url, USER_AGENT, &method, opts)?)
         .map_err(|e| format!("request failed: {e}"))?;
+
+    let is_get = method.eq_ignore_ascii_case("GET");
 
     let is_cf_challenge = response.status().as_u16() == 403
         && response
@@ -78,9 +94,9 @@ fn do_request(lua: &Lua, url: &str, opts: Option<&Table>) -> Result<Table, Strin
             .and_then(|v| v.to_str().ok())
             .is_some_and(|v| v.contains(CF_CHALLENGE));
 
-    let mut response = if is_cf_challenge {
+    let mut response = if is_cf_challenge && is_get {
         client
-            .send(build_request(&url, FALLBACK_USER_AGENT, opts)?)
+            .send(build_request(&url, FALLBACK_USER_AGENT, &method, opts)?)
             .map_err(|e| format!("request failed: {e}"))?
     } else {
         response
@@ -259,5 +275,43 @@ mod tests {
     #[test_case("not-a-url", None ; "no_scheme")]
     fn extract_host_cases(url: &str, expected: Option<&str>) {
         assert_eq!(extract_host(url), expected);
+    }
+
+    fn lua_table_from(lua: &Lua, pairs: &[(&str, &str)]) -> Table {
+        let tbl = lua.create_table().unwrap();
+        for (k, v) in pairs {
+            tbl.set(*k, lua.create_string(*v).unwrap()).unwrap();
+        }
+        tbl
+    }
+
+    #[test]
+    fn build_request_post_includes_body() {
+        let lua = Lua::new();
+        let opts = lua_table_from(&lua, &[("body", "hello world")]);
+        let req = build_request("https://example.com", "agent", "POST", Some(&opts)).unwrap();
+        assert_eq!(req.method(), "POST");
+        assert_eq!(req.body(), b"hello world");
+    }
+
+    #[test]
+    fn build_request_get_has_empty_body() {
+        let req = build_request("https://example.com", "agent", "GET", None).unwrap();
+        assert_eq!(req.method(), "GET");
+        assert!(req.body().is_empty());
+    }
+
+    #[test]
+    fn build_request_custom_headers() {
+        let lua = Lua::new();
+        let headers = lua.create_table().unwrap();
+        headers.set("Content-Type", "application/json").unwrap();
+        let opts = lua.create_table().unwrap();
+        opts.set("headers", headers).unwrap();
+        let req = build_request("https://example.com", "agent", "POST", Some(&opts)).unwrap();
+        assert_eq!(
+            req.headers().get("Content-Type").unwrap().to_str().unwrap(),
+            "application/json"
+        );
     }
 }

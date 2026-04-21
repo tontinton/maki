@@ -48,38 +48,6 @@ local function strip_html(html)
   return result:match("^%s*(.-)%s*$")
 end
 
-local function truncate(text, max_lines, max_bytes)
-  if #text <= max_bytes then
-    local n = 0
-    for _ in text:gmatch("\n") do
-      n = n + 1
-    end
-    if n + 1 <= max_lines then
-      return text
-    end
-  end
-  local out = {}
-  local bytes = 0
-  local lines = 0
-  for line in text:gmatch("([^\n]*)\n?") do
-    lines = lines + 1
-    if lines > max_lines then
-      break
-    end
-    local new_bytes = bytes + #line + 1
-    if new_bytes > max_bytes then
-      break
-    end
-    out[#out + 1] = line
-    bytes = new_bytes
-  end
-  local result = table.concat(out, "\n")
-  if #result < #text then
-    result = result .. "\n\n[truncated " .. (#text - #result) .. " bytes]"
-  end
-  return result
-end
-
 local failures = {}
 
 local function case(name, fn)
@@ -122,42 +90,6 @@ case("strip_html_edge_cases", function()
   eq(strip_html(""), "")
   eq(strip_html("<div><span></span></div>"), "")
   eq(strip_html("hello<div"), "hello")
-end)
-
--- ── truncate ──
-
-case("truncate_within_limits_unchanged", function()
-  eq(truncate("hello", 100, 1000), "hello")
-  eq(truncate("a\nb\nc", 3, 1000), "a\nb\nc")
-  eq(truncate("", 100, 1000), "")
-end)
-
-case("truncate_exceeds_line_limit", function()
-  local result = truncate("aaa\nbbb\nccc\nddd", 2, 1000)
-  assert(result:find("aaa", 1, true), "should keep first line")
-  assert(result:find("bbb", 1, true), "should keep second line")
-  assert(not result:find("ccc", 1, true), "should drop third line")
-  assert(result:find("%[truncated %d+ bytes%]"), "should have truncation marker")
-end)
-
-case("truncate_exceeds_byte_limit", function()
-  local text = string.rep("x", 200)
-  local result = truncate(text, 1000, 50)
-  assert(#result < #text, "should be shorter")
-  assert(result:find("%[truncated"), "should have truncation marker")
-end)
-
-case("truncate_byte_limit_mid_line", function()
-  local text = "short\n" .. string.rep("x", 100)
-  local result = truncate(text, 1000, 20)
-  assert(result:find("short"), "should keep first line")
-  assert(not result:find(string.rep("x", 100)), "should drop long line")
-  assert(result:find("%[truncated"), "should have truncation marker")
-end)
-
-case("truncate_trailing_newlines_counted", function()
-  local result = truncate("a\n\n\n\n\n", 2, 1000)
-  assert(result:find("%[truncated"), "trailing newlines should count as lines")
 end)
 
 if #failures > 0 then

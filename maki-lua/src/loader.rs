@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use include_dir::{Dir, include_dir};
@@ -13,9 +13,34 @@ use crate::runtime::{self, LuaThread, Request};
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
-static BUNDLED_INDEX_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/../plugins/index");
-static BUNDLED_WEBFETCH_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/../plugins/webfetch");
-static BUNDLED_DIRS: &[&Dir] = &[&BUNDLED_INDEX_DIR, &BUNDLED_WEBFETCH_DIR];
+struct BundledPlugin {
+    name: &'static str,
+    dir: Dir<'static>,
+}
+
+static BUNDLED_PLUGINS: &[BundledPlugin] = &[
+    BundledPlugin {
+        name: "index",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/index"),
+    },
+    BundledPlugin {
+        name: "webfetch",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/webfetch"),
+    },
+    BundledPlugin {
+        name: "websearch",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/websearch"),
+    },
+    BundledPlugin {
+        name: "lib",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/lib"),
+    },
+];
+
+static BUNDLED_DIRS: LazyLock<&'static [&'static Dir<'static>]> = LazyLock::new(|| {
+    let dirs: Vec<&'static Dir<'static>> = BUNDLED_PLUGINS.iter().map(|p| &p.dir).collect();
+    Vec::leak(dirs)
+});
 
 pub struct PluginHost {
     inner: Option<LuaThread>,
@@ -49,15 +74,17 @@ impl PluginHost {
             return Ok(Self { inner: None });
         }
 
-        let lua = runtime::spawn(registry, BUNDLED_DIRS)?;
+        let lua = runtime::spawn(registry, *BUNDLED_DIRS)?;
         let host = Self { inner: Some(lua) };
 
         for builtin in &config.builtins {
-            let dir = match builtin.as_str() {
-                "index" => &BUNDLED_INDEX_DIR,
-                "webfetch" => &BUNDLED_WEBFETCH_DIR,
-                other => {
-                    tracing::warn!(builtin = other, "unknown builtin plugin, skipping");
+            let dir = match BUNDLED_PLUGINS.iter().find(|p| p.name == builtin.as_str()) {
+                Some(p) => &p.dir,
+                None => {
+                    tracing::warn!(
+                        builtin = builtin.as_str(),
+                        "unknown builtin plugin, skipping"
+                    );
                     continue;
                 }
             };

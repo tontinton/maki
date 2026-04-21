@@ -108,9 +108,9 @@ impl LuaRuntime {
         });
 
         let globals = lua.globals();
-        for dangerous in &["os", "io", "debug", "package", "require"] {
+        for name in &["require", "io", "package"] {
             globals
-                .set(*dangerous, LuaValue::Nil)
+                .set(*name, LuaValue::Nil)
                 .map_err(|e| PluginError::Lua {
                     plugin: "<init>".to_owned(),
                     source: e,

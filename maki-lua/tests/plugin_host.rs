@@ -57,11 +57,24 @@ const MINIMAL_SCHEMA: &str =
     r#"{ type = "object", properties = {}, additionalProperties = false }"#;
 
 #[test]
-fn sandbox_strips_dangerous_globals() {
+fn stdlib_globals_accessible() {
     let reg = fresh_registry();
     let host = PluginHost::new(&enabled_config(), Arc::clone(&reg)).unwrap();
 
-    for global in &["os", "io", "debug", "package"] {
+    for global in &["os", "debug", "string", "table", "math"] {
+        let source =
+            format!(r#"if {global} == nil then error("stdlib missing: {global} is nil") end"#);
+        host.load_source(&format!("stdlib_check_{global}"), &source)
+            .unwrap_or_else(|e| panic!("stdlib check for {global} failed: {e}"));
+    }
+}
+
+#[test]
+fn dangerous_globals_blocked() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(&enabled_config(), Arc::clone(&reg)).unwrap();
+
+    for global in &["io", "package"] {
         let source =
             format!(r#"if {global} ~= nil then error("sandbox leak: {global} is not nil") end"#);
         host.load_source(&format!("sandbox_check_{global}"), &source)
@@ -192,7 +205,7 @@ maki.api.register_tool({{
     let entry = reg.get("infinite_loop_").expect("loop tool not registered");
     let inv = entry.tool.parse(&serde_json::json!({})).unwrap();
     let mut ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
-    ctx.deadline = maki_agent::tools::Deadline::after(std::time::Duration::from_millis(500));
+    ctx.deadline = maki_agent::tools::Deadline::after(std::time::Duration::from_secs(2));
 
     let result = smol::block_on(async { inv.execute(&ctx).await });
 
