@@ -184,6 +184,19 @@ fn lua_matches_native(source: &str, ext: &str, lang: Language) {
     equivalence_support::assert_equivalent(&native, &lua);
 }
 
+#[test]
+fn summary_returns_normalized_path() {
+    let s = setup();
+    let input = write_fixture(s.tmp.path(), "test.rs", RUST_FIXTURE);
+    let entry = s.reg.get("index").unwrap();
+    let inv = entry.tool.parse(&input).expect("parse failed");
+    let summary = smol::block_on(inv.start_summary());
+    assert!(
+        summary.contains("test.rs"),
+        "summary '{summary}' should contain normalized path"
+    );
+}
+
 #[test_case("test.xyz", "some content" ; "unsupported_extension")]
 #[test_case("Makefile", "all:\n\techo hi"                ; "no_extension")]
 fn delegates_to_native(filename: &str, source: &str) {

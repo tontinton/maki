@@ -271,6 +271,7 @@ impl MessagesPanel {
         index: usize,
         status: BatchToolStatus,
         output: Option<ToolOutput>,
+        summary: Option<&str>,
     ) {
         let Some(msg) = self.find_tool_msg_mut(batch_id) else {
             return;
@@ -282,6 +283,9 @@ impl MessagesPanel {
             entry.status = status;
             if output.is_some() {
                 entry.output = output;
+            }
+            if let Some(s) = summary {
+                entry.summary = s.to_owned();
             }
         }
         self.rebuild_tool_segment(batch_id);

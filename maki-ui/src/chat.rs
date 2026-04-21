@@ -97,8 +97,13 @@ impl Chat {
                 }
             }
             AgentEvent::BatchProgress(e) => {
-                self.messages_panel
-                    .batch_progress(&e.batch_id, e.index, e.status, e.output);
+                self.messages_panel.batch_progress(
+                    &e.batch_id,
+                    e.index,
+                    e.status,
+                    e.output,
+                    e.summary.as_deref(),
+                );
             }
             AgentEvent::QuestionPrompt { questions, .. } => {
                 return ChatEventResult::QuestionPrompt { questions };
@@ -318,13 +323,10 @@ pub fn history_to_display(
                         }
                         ContentBlock::ToolUse { id, name, input } => {
                             let static_name = native_static_name(name).unwrap_or("unknown");
-                            let tool_call: Option<Box<dyn ToolInvocation>> = ToolRegistry::native()
-                                .get(name)
-                                .and_then(|entry| entry.try_parse(input));
-                            let summary = tool_call
-                                .as_deref()
-                                .map(|tc| tc.start_summary().into_ready())
-                                .unwrap_or_else(|| name.clone());
+                            let reg = ToolRegistry::native();
+                            let tool_call: Option<Box<dyn ToolInvocation>> =
+                                reg.get(name).and_then(|entry| entry.try_parse(input));
+                            let summary = reg.resolve_summary(name, input);
                             let tool_input = tool_call.as_deref().and_then(|tc| tc.start_input());
                             let (status, result_text) = results
                                 .get(id.as_str())

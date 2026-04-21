@@ -375,6 +375,30 @@ impl ToolRegistry {
             .cloned()
     }
 
+    /// Resolve a human-friendly summary for a tool invocation.
+    /// Prefers the native tool's summary (which parses args into a readable
+    /// string like a file path), falling back to the current registered tool,
+    /// then to the raw tool name.
+    pub fn resolve_summary(&self, name: &str, input: &Value) -> String {
+        self.resolve_invocation(name, input)
+            .map(|inv| inv.start_summary().into_ready())
+            .unwrap_or_else(|| name.to_owned())
+    }
+
+    /// Like [`resolve_summary`] but awaits async summaries (e.g. Lua plugins).
+    pub async fn resolve_summary_async(&self, name: &str, input: &Value) -> String {
+        match self.resolve_invocation(name, input) {
+            Some(inv) => inv.start_summary().await,
+            None => name.to_owned(),
+        }
+    }
+
+    fn resolve_invocation(&self, name: &str, input: &Value) -> Option<Box<dyn ToolInvocation>> {
+        self.get_native_fallback(name)
+            .and_then(|e| e.try_parse(input))
+            .or_else(|| self.get(name).and_then(|e| e.try_parse(input)))
+    }
+
     pub fn names(&self) -> Vec<Arc<str>> {
         self.tools
             .load()

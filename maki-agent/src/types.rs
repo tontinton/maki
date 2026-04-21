@@ -525,6 +525,7 @@ pub struct BatchProgressEvent {
     pub index: usize,
     pub status: BatchToolStatus,
     pub output: Option<ToolOutput>,
+    pub summary: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
