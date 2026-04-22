@@ -1,19 +1,5 @@
 local indexer = require("indexer")
 
-local function normalize(p)
-  local cwd = maki.uv.cwd()
-  if cwd and p:sub(1, #cwd + 1) == cwd .. "/" then
-    local rel = p:sub(#cwd + 2)
-    return rel == "" and "." or rel
-  end
-  local home = maki.uv.os_homedir()
-  if home and p:sub(1, #home + 1) == home .. "/" then
-    local rel = p:sub(#home + 2)
-    return rel == "" and "~" or "~/" .. rel
-  end
-  return p
-end
-
 local KEYWORDS = {
   pub = true,
   fn = true,
@@ -120,6 +106,30 @@ local function build_styled_buf(text)
   return buf
 end
 
+local function normalize(p)
+  local cwd = maki.uv.cwd()
+  if cwd and p:sub(1, #cwd + 1) == cwd .. "/" then
+    local rel = p:sub(#cwd + 2)
+    return rel == "" and "." or rel
+  end
+  local home = maki.uv.os_homedir()
+  if home and p:sub(1, #home + 1) == home .. "/" then
+    local rel = p:sub(#home + 2)
+    return rel == "" and "~" or "~/" .. rel
+  end
+  return p
+end
+
+local function build_header(path, line_count)
+  local buf = maki.ui.buf()
+  local spans = { { normalize(path), "path" } }
+  if line_count then
+    spans[#spans + 1] = { " (" .. line_count .. " lines)", "dim" }
+  end
+  buf:line(spans)
+  return buf
+end
+
 maki.api.register_tool({
   name = "index",
   description = [[
@@ -135,12 +145,8 @@ Return a compact overview of a source file: imports, type definitions, function 
       path = { type = "string", description = "Absolute path to the file", required = true },
     },
   },
-  render = {
-    header_style = "path",
-    always_annotate = true,
-  },
-  summary = function(input)
-    return normalize(input.path)
+  header = function(input)
+    return build_header(input.path)
   end,
   handler = function(input, ctx)
     local path = input.path
@@ -181,9 +187,11 @@ Return a compact overview of a source file: imports, type definitions, function 
 
     local buf = build_styled_buf(result)
 
+    local line_count = select(2, result:gsub("\n", "\n")) + 1
     return {
-      output = result,
-      render_buf = buf,
+      llm_output = result,
+      body = buf,
+      header = build_header(path, line_count),
     }
   end,
 })

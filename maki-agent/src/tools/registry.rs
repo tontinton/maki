@@ -13,7 +13,7 @@ use bitflags::bitflags;
 use serde_json::{Value, json};
 
 use crate::template::Vars;
-use crate::{ToolInput as ToolInputEvent, ToolOutput};
+use crate::{BufferSnapshot, ToolInput as ToolInputEvent, ToolOutput};
 
 use super::{DescriptionContext, ToolContext};
 
@@ -56,29 +56,55 @@ pub type ParseError = super::schema::ToolInputError;
 
 pub type ExecFuture<'a> = Pin<Box<dyn Future<Output = Result<ToolOutput, String>> + Send + 'a>>;
 
-pub enum SummaryFuture {
-    Ready(String),
-    Pending {
-        fallback: String,
-        fut: Pin<Box<dyn Future<Output = String> + Send>>,
-    },
+#[derive(Debug, Clone)]
+pub enum HeaderResult {
+    Plain(String),
+    Styled(BufferSnapshot),
 }
 
-impl SummaryFuture {
-    pub fn into_ready(self) -> String {
+impl HeaderResult {
+    pub fn plain(text: String) -> Self {
+        Self::Plain(text)
+    }
+
+    pub fn text(&self) -> String {
         match self {
-            Self::Ready(s) => s,
-            Self::Pending { fallback, .. } => fallback,
+            Self::Plain(t) => t.clone(),
+            Self::Styled(snap) => snap.first_line_text(),
+        }
+    }
+
+    pub fn snapshot(self) -> Option<BufferSnapshot> {
+        match self {
+            Self::Plain(_) => None,
+            Self::Styled(snap) => Some(snap),
         }
     }
 }
 
-impl Future for SummaryFuture {
-    type Output = String;
+pub enum HeaderFuture {
+    Ready(HeaderResult),
+    Pending {
+        fallback: String,
+        fut: Pin<Box<dyn Future<Output = HeaderResult> + Send>>,
+    },
+}
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<String> {
+impl HeaderFuture {
+    pub fn into_ready(self) -> HeaderResult {
+        match self {
+            Self::Ready(r) => r,
+            Self::Pending { fallback, .. } => HeaderResult::plain(fallback),
+        }
+    }
+}
+
+impl Future for HeaderFuture {
+    type Output = HeaderResult;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<HeaderResult> {
         match self.get_mut() {
-            Self::Ready(s) => Poll::Ready(std::mem::take(s)),
+            Self::Ready(r) => Poll::Ready(std::mem::replace(r, HeaderResult::plain(String::new()))),
             Self::Pending { fut, .. } => fut.as_mut().poll(cx),
         }
     }
@@ -88,7 +114,7 @@ impl Future for SummaryFuture {
 /// `permission_scope` and `mutable_path` belong here because only the parsed
 /// call knows which file it will touch.
 pub trait ToolInvocation: Send + Sync {
-    fn start_summary(&self) -> SummaryFuture;
+    fn start_header(&self) -> HeaderFuture;
     fn start_annotation(&self) -> Option<String> {
         None
     }
@@ -379,16 +405,16 @@ impl ToolRegistry {
     /// Prefers the native tool's summary (which parses args into a readable
     /// string like a file path), falling back to the current registered tool,
     /// then to the raw tool name.
-    pub fn resolve_summary(&self, name: &str, input: &Value) -> String {
+    pub fn resolve_header(&self, name: &str, input: &Value) -> String {
         self.resolve_invocation(name, input)
-            .map(|inv| inv.start_summary().into_ready())
+            .map(|inv| inv.start_header().into_ready().text())
             .unwrap_or_else(|| name.to_owned())
     }
 
-    /// Like [`resolve_summary`] but awaits async summaries (e.g. Lua plugins).
-    pub async fn resolve_summary_async(&self, name: &str, input: &Value) -> String {
+    /// Like [`resolve_header`] but awaits async headers (e.g. Lua plugins).
+    pub async fn resolve_header_async(&self, name: &str, input: &Value) -> String {
         match self.resolve_invocation(name, input) {
-            Some(inv) => inv.start_summary().await,
+            Some(inv) => inv.start_header().await.text(),
             None => name.to_owned(),
         }
     }
@@ -506,8 +532,8 @@ mod tests {
     struct MockInvocation;
 
     impl ToolInvocation for MockInvocation {
-        fn start_summary(&self) -> SummaryFuture {
-            SummaryFuture::Ready("mock".into())
+        fn start_header(&self) -> HeaderFuture {
+            HeaderFuture::Ready(HeaderResult::plain("mock".into()))
         }
         fn execute<'a>(self: Box<Self>, _ctx: &'a super::ToolContext) -> ExecFuture<'a> {
             Box::pin(async { Ok(ToolOutput::Plain(String::new())) })

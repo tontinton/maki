@@ -275,6 +275,7 @@ pub struct DisplayMessage {
     pub turn_usage: Option<String>,
     pub truncated_lines: usize,
     pub render_snapshot: Option<BufferSnapshot>,
+    pub render_header: Option<BufferSnapshot>,
 }
 
 impl DisplayMessage {
@@ -291,6 +292,7 @@ impl DisplayMessage {
             turn_usage: None,
             truncated_lines: 0,
             render_snapshot: None,
+            render_header: None,
         }
     }
 
@@ -307,6 +309,7 @@ impl DisplayMessage {
             turn_usage: None,
             truncated_lines: 0,
             render_snapshot: None,
+            render_header: None,
         }
     }
 }

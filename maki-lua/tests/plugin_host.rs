@@ -326,7 +326,7 @@ fn is_error_propagated_as_error() {
             schema = {MINIMAL_SCHEMA},
             audiences = {{ "main" }},
             handler = function(input, ctx)
-                return {{ output = "boom", is_error = true }}
+                return {{ llm_output = "boom", is_error = true }}
             end
         }})"#,
     );

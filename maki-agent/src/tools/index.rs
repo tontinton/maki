@@ -40,7 +40,7 @@ impl Index {
         .await
     }
 
-    pub fn start_summary(&self) -> String {
+    pub fn start_header(&self) -> String {
         relative_path(&self.path)
     }
 }
@@ -53,8 +53,8 @@ super::impl_tool!(
 );
 
 impl super::ToolInvocation for Index {
-    fn start_summary(&self) -> super::SummaryFuture {
-        super::SummaryFuture::Ready(Index::start_summary(self))
+    fn start_header(&self) -> super::HeaderFuture {
+        super::HeaderFuture::Ready(super::HeaderResult::plain(Index::start_header(self)))
     }
     fn execute<'a>(self: Box<Self>, ctx: &'a super::ToolContext) -> super::ExecFuture<'a> {
         Box::pin(async move { Index::execute(&self, ctx).await })

@@ -54,7 +54,7 @@ impl Write {
         .await
     }
 
-    pub fn start_summary(&self) -> String {
+    pub fn start_header(&self) -> String {
         relative_path(&self.path)
     }
 }
@@ -67,8 +67,8 @@ super::impl_tool!(
 );
 
 impl super::ToolInvocation for Write {
-    fn start_summary(&self) -> super::SummaryFuture {
-        super::SummaryFuture::Ready(Write::start_summary(self))
+    fn start_header(&self) -> super::HeaderFuture {
+        super::HeaderFuture::Ready(super::HeaderResult::plain(Write::start_header(self)))
     }
     fn start_output(&self) -> Option<ToolOutput> {
         let path = super::resolve_path(&self.path).ok()?;

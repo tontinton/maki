@@ -88,7 +88,7 @@ impl MultiEdit {
         .await
     }
 
-    pub fn start_summary(&self) -> String {
+    pub fn start_header(&self) -> String {
         relative_path(&self.path)
     }
 }
@@ -101,8 +101,8 @@ super::impl_tool!(
 );
 
 impl super::ToolInvocation for MultiEdit {
-    fn start_summary(&self) -> super::SummaryFuture {
-        super::SummaryFuture::Ready(MultiEdit::start_summary(self))
+    fn start_header(&self) -> super::HeaderFuture {
+        super::HeaderFuture::Ready(super::HeaderResult::plain(MultiEdit::start_header(self)))
     }
     fn start_annotation(&self) -> Option<String> {
         Some(self.edit_count_label())

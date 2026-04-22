@@ -25,7 +25,7 @@ maki.api.register_tool({
   permission_scope = "query",
   audiences = { "main", "interpreter" },
 
-  summary = function(input)
+  header = function(input)
     return input.query
   end,
 

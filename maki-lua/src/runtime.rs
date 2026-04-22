@@ -8,11 +8,11 @@ use std::time::Instant;
 use include_dir::Dir;
 use maki_agent::RawRenderHints;
 use maki_agent::cancel::CancelToken;
-use maki_agent::tools::{RegistryError, Tool, ToolRegistry, ToolSource};
+use maki_agent::tools::{HeaderResult, RegistryError, Tool, ToolRegistry, ToolSource};
 use mlua::{Function, Lua, LuaSerdeExt, RegistryKey, Value as LuaValue, VmState};
 use serde_json::Value;
 
-use crate::api::buf::BufferStore;
+use crate::api::buf::{BufHandle, BufferStore};
 use crate::api::create_maki_global;
 use crate::api::ctx::LuaCtx;
 use crate::api::fs::check_sandbox;
@@ -38,11 +38,11 @@ pub enum Request {
         deadline: Option<Instant>,
         reply: flume::Sender<ToolCallReply>,
     },
-    ComputeSummary {
+    ComputeHeader {
         plugin: Arc<str>,
         tool: Arc<str>,
         input: Value,
-        reply: flume::Sender<String>,
+        reply: flume::Sender<HeaderResult>,
     },
     ClearPlugin {
         plugin: Arc<str>,
@@ -67,7 +67,7 @@ impl Drop for CallStateGuard<'_> {
 
 struct ToolKeys {
     handler: RegistryKey,
-    summary: Option<RegistryKey>,
+    header: Option<RegistryKey>,
 }
 
 struct LuaRuntime {
@@ -159,9 +159,9 @@ impl LuaRuntime {
                 if let Err(e) = self.lua.remove_registry_value(tk.handler) {
                     tracing::warn!(plugin = name, error = %e, "failed to drop lua handler key");
                 }
-                if let Some(sk) = tk.summary {
+                if let Some(sk) = tk.header {
                     if let Err(e) = self.lua.remove_registry_value(sk) {
-                        tracing::warn!(plugin = name, error = %e, "failed to drop lua summary key");
+                        tracing::warn!(plugin = name, error = %e, "failed to drop lua header key");
                     }
                 }
             }
@@ -181,9 +181,9 @@ impl LuaRuntime {
             if let Err(e) = self.lua.remove_registry_value(t.handler_key) {
                 tracing::warn!(error = %e, "failed to drop lua handler key on rollback");
             }
-            if let Some(sk) = t.summary_key {
+            if let Some(sk) = t.header_key {
                 if let Err(e) = self.lua.remove_registry_value(sk) {
-                    tracing::warn!(error = %e, "failed to drop lua summary key on rollback");
+                    tracing::warn!(error = %e, "failed to drop lua header key on rollback");
                 }
             }
         }
@@ -345,7 +345,7 @@ impl LuaRuntime {
                     audience: t.audience,
                     tx: self.tx.clone(),
                     plugin: Arc::clone(&name),
-                    has_summary_fn: t.summary_key.is_some(),
+                    has_header_fn: t.header_key.is_some(),
                     permission_scope_field: t.permission_scope_field.clone(),
                 });
                 (
@@ -381,7 +381,7 @@ impl LuaRuntime {
                     t.name,
                     ToolKeys {
                         handler: t.handler_key,
-                        summary: t.summary_key,
+                        header: t.header_key,
                     },
                 )
             })
@@ -450,18 +450,26 @@ impl LuaRuntime {
         }
     }
 
-    fn compute_summary(&self, plugin: &str, tool: &str, input: Value) -> String {
+    fn compute_header(&self, plugin: &str, tool: &str, input: Value) -> HeaderResult {
         let result = (|| {
             let tk = self.plugins.get(plugin)?.get(tool)?;
-            let key = tk.summary.as_ref()?;
+            let key = tk.header.as_ref()?;
             let func = self.lua.registry_value::<Function>(key).ok()?;
             let input_lua = self.lua.to_value(&input).ok()?;
             match func.call::<LuaValue>(input_lua).ok()? {
-                LuaValue::String(s) => s.to_str().ok().map(|s| s.to_owned()),
+                LuaValue::String(s) => Some(HeaderResult::plain(s.to_str().ok()?.to_owned())),
+                LuaValue::UserData(ud) => {
+                    let h = ud.borrow::<BufHandle>().ok()?;
+                    let snapshot = self.lua.app_data_mut::<BufferStore>()?.take(h.0)?;
+                    Some(HeaderResult::Styled(snapshot))
+                }
                 _ => None,
             }
         })();
-        result.unwrap_or_else(|| tool.to_string())
+        if let Some(mut store) = self.lua.app_data_mut::<BufferStore>() {
+            store.clear();
+        }
+        result.unwrap_or_else(|| HeaderResult::plain(tool.to_string()))
     }
 }
 
@@ -526,13 +534,13 @@ pub fn spawn(
                         rt.clear_plugin(&plugin);
                         let _ = reply.send(());
                     }
-                    Request::ComputeSummary {
+                    Request::ComputeHeader {
                         plugin,
                         tool,
                         input,
                         reply,
                     } => {
-                        let res = rt.compute_summary(&plugin, &tool, input);
+                        let res = rt.compute_header(&plugin, &tool, input);
                         let _ = reply.send(res);
                     }
                 }

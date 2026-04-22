@@ -151,7 +151,7 @@ impl WebFetch {
         )))
     }
 
-    pub fn start_summary(&self) -> String {
+    pub fn start_header(&self) -> String {
         match self.format.as_deref() {
             Some(f) if f != "markdown" => format!("{} [{f}]", self.url),
             _ => self.url.clone(),
@@ -162,8 +162,8 @@ impl WebFetch {
 super::impl_tool!(WebFetch);
 
 impl super::ToolInvocation for WebFetch {
-    fn start_summary(&self) -> super::SummaryFuture {
-        super::SummaryFuture::Ready(WebFetch::start_summary(self))
+    fn start_header(&self) -> super::HeaderFuture {
+        super::HeaderFuture::Ready(super::HeaderResult::plain(WebFetch::start_header(self)))
     }
     fn permission_scope(&self) -> Option<String> {
         Some(self.url.clone())
@@ -409,12 +409,12 @@ mod tests {
     #[test_case(None,                "https://x.com"        ; "default_format")]
     #[test_case(Some("markdown"),     "https://x.com"        ; "markdown_hidden")]
     #[test_case(Some("text"),         "https://x.com [text]" ; "non_default_shown")]
-    fn start_summary_cases(format: Option<&str>, expected: &str) {
+    fn start_header_cases(format: Option<&str>, expected: &str) {
         let wf = WebFetch {
             url: "https://x.com".into(),
             format: format.map(Into::into),
             timeout: None,
         };
-        assert_eq!(wf.start_summary(), expected);
+        assert_eq!(wf.start_header(), expected);
     }
 }

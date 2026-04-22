@@ -483,12 +483,29 @@ impl ToolLineBuilder {
         }
     }
 
-    fn push_header(&mut self, tool_name: &str, header: &str, annotation: Option<&str>) {
+    fn push_header(
+        &mut self,
+        tool_name: &str,
+        header: &str,
+        annotation: Option<&str>,
+        render_header: Option<&BufferSnapshot>,
+    ) {
         let mut spans = vec![Span::styled(
             format!("{tool_name}> "),
             theme::current().tool_prefix,
         )];
-        spans.extend(style_tool_header(&self.header_style, header));
+        if let Some(snapshot) = render_header {
+            if let Some(first_line) = snapshot.lines.first() {
+                for span in &first_line.spans {
+                    spans.push(Span::styled(
+                        span.text.clone(),
+                        resolve_span_style(&span.style),
+                    ));
+                }
+            }
+        } else {
+            spans.extend(style_tool_header(&self.header_style, header));
+        }
         let mut copy = format!("{tool_name}> {header}");
         if let Some(ann) = annotation {
             spans.push(Span::styled(
@@ -790,7 +807,12 @@ pub fn build_tool_lines(
     };
 
     let mut b = ToolLineBuilder::new(width, "", expanded, limits, hints);
-    b.push_header(tool_name, header, msg.annotation.as_deref());
+    b.push_header(
+        tool_name,
+        header,
+        msg.annotation.as_deref(),
+        msg.render_header.as_ref(),
+    );
     b.prepend_indicator(status.into(), started_at);
     b.push_code_content(msg.tool_input.as_deref(), msg.tool_output.as_deref());
     if let Some(ref snapshot) = msg.render_snapshot {
@@ -848,7 +870,7 @@ pub fn build_batch_entry_lines(
     }
 
     let mut b = ToolLineBuilder::new(width, BATCH_INDENT, expanded, limits, hints);
-    b.push_header(&entry.tool, &entry.summary, annotation.as_deref());
+    b.push_header(&entry.tool, &entry.summary, annotation.as_deref(), None);
     b.prepend_indicator(entry.status.into(), started_at);
     b.push_code_content(entry.input.as_ref(), entry.output.as_ref());
     let is_done = matches!(
@@ -907,7 +929,7 @@ pub fn build_instructions_lines(
         limits,
         &ToolRenderHints::default(),
     );
-    b.push_header("load", header, annotation.as_deref());
+    b.push_header("load", header, annotation.as_deref(), None);
     b.prepend_indicator(Indicator::Success, Instant::now());
 
     let start = b.lines.len();
@@ -1006,6 +1028,7 @@ mod tests {
             timestamp: None,
             turn_usage: None,
             render_snapshot: None,
+            render_header: None,
         }
     }
 
@@ -1423,6 +1446,7 @@ mod tests {
             turn_usage: None,
             truncated_lines: 0,
             render_snapshot: None,
+            render_header: None,
         }
     }
 
@@ -1541,6 +1565,7 @@ mod tests {
             turn_usage: None,
             truncated_lines: 0,
             render_snapshot: None,
+            render_header: None,
         }
     }
 
@@ -1600,6 +1625,7 @@ mod tests {
             turn_usage: None,
             truncated_lines: 0,
             render_snapshot: Some(snapshot),
+            render_header: None,
         }
     }
 
@@ -1797,6 +1823,7 @@ mod tests {
             timestamp: None,
             turn_usage: None,
             render_snapshot: None,
+            render_header: None,
         }
     }
 
@@ -1925,6 +1952,7 @@ mod tests {
             timestamp: None,
             turn_usage: None,
             render_snapshot: None,
+            render_header: None,
         }
     }
 
@@ -2044,6 +2072,7 @@ mod tests {
             turn_usage: None,
             truncated_lines: 0,
             render_snapshot: Some(snapshot),
+            render_header: None,
         };
         let tl = build_tool_lines(
             &msg,
@@ -2135,6 +2164,7 @@ mod tests {
             turn_usage: None,
             truncated_lines: 0,
             render_snapshot: Some(snapshot),
+            render_header: None,
         };
         let tl = build_tool_lines(
             &msg,
@@ -2173,6 +2203,7 @@ mod tests {
             turn_usage: None,
             truncated_lines: 0,
             render_snapshot: Some(snapshot),
+            render_header: None,
         };
         let tl = build_tool_lines(
             &msg,

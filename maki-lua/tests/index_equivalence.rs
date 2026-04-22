@@ -185,15 +185,17 @@ fn lua_matches_native(source: &str, ext: &str, lang: Language) {
 }
 
 #[test]
-fn summary_returns_normalized_path() {
+fn header_returns_normalized_path() {
     let s = setup();
     let input = write_fixture(s.tmp.path(), "test.rs", RUST_FIXTURE);
     let entry = s.reg.get("index").unwrap();
     let inv = entry.tool.parse(&input).expect("parse failed");
-    let summary = smol::block_on(inv.start_summary());
+    let header = smol::block_on(inv.start_header());
+    let header_text = header.text();
     assert!(
-        summary.contains("test.rs"),
-        "summary '{summary}' should contain normalized path"
+        header_text.contains("test.rs"),
+        "header '{}' should contain normalized path",
+        header_text
     );
 }
 

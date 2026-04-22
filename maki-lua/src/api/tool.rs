@@ -6,8 +6,8 @@ use flume::Sender;
 use maki_agent::tools::Tool;
 use maki_agent::tools::schema::{ParamSchema, to_json_schema, try_from_json, validate};
 use maki_agent::tools::{
-    Deadline, DescriptionContext, ExecFuture, ParseError, SummaryFuture, ToolAudience, ToolContext,
-    ToolInvocation,
+    Deadline, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError, ToolAudience,
+    ToolContext, ToolInvocation,
 };
 use maki_agent::{AgentEvent, BufferSnapshot, RawRenderHints, ToolOutput};
 use mlua::{
@@ -30,7 +30,7 @@ pub(crate) struct PendingTool {
     pub(crate) schema: &'static ParamSchema,
     pub(crate) audience: ToolAudience,
     pub(crate) handler_key: RegistryKey,
-    pub(crate) summary_key: Option<RegistryKey>,
+    pub(crate) header_key: Option<RegistryKey>,
     pub(crate) permission_scope_field: Option<Arc<str>>,
     pub(crate) render_hints: Option<RawRenderHints>,
 }
@@ -44,7 +44,7 @@ pub(crate) struct LuaTool {
     pub(crate) audience: ToolAudience,
     pub(crate) tx: Sender<Request>,
     pub(crate) plugin: Arc<str>,
-    pub(crate) has_summary_fn: bool,
+    pub(crate) has_header_fn: bool,
     pub(crate) permission_scope_field: Option<Arc<str>>,
 }
 
@@ -76,7 +76,7 @@ impl Tool for LuaTool {
         Ok(Box::new(LuaToolInvocation {
             tool: Arc::clone(&self.name),
             plugin: Arc::clone(&self.plugin),
-            has_summary_fn: self.has_summary_fn,
+            has_header_fn: self.has_header_fn,
             input: validated,
             tx: self.tx.clone(),
             permission_scope,
@@ -87,28 +87,28 @@ impl Tool for LuaTool {
 struct LuaToolInvocation {
     tool: Arc<str>,
     plugin: Arc<str>,
-    has_summary_fn: bool,
+    has_header_fn: bool,
     input: Value,
     tx: Sender<Request>,
     permission_scope: Option<String>,
 }
 
 impl ToolInvocation for LuaToolInvocation {
-    fn start_summary(&self) -> SummaryFuture {
-        if !self.has_summary_fn {
-            return SummaryFuture::Ready(self.tool.to_string());
+    fn start_header(&self) -> HeaderFuture {
+        if !self.has_header_fn {
+            return HeaderFuture::Ready(HeaderResult::plain(self.tool.to_string()));
         }
-        let (reply_tx, reply_rx) = flume::bounded(1);
+        let (reply_tx, reply_rx) = flume::bounded::<HeaderResult>(1);
         let tool = Arc::clone(&self.tool);
         let plugin = Arc::clone(&self.plugin);
         let input = self.input.clone();
         let tx = self.tx.clone();
         let fallback = tool.to_string();
-        SummaryFuture::Pending {
+        HeaderFuture::Pending {
             fallback: fallback.clone(),
             fut: Box::pin(async move {
                 let sent = tx
-                    .send_async(Request::ComputeSummary {
+                    .send_async(Request::ComputeHeader {
                         plugin: Arc::clone(&plugin),
                         tool: Arc::clone(&tool),
                         input,
@@ -116,9 +116,12 @@ impl ToolInvocation for LuaToolInvocation {
                     })
                     .await;
                 if sent.is_err() {
-                    return fallback;
+                    return HeaderResult::plain(fallback);
                 }
-                reply_rx.recv_async().await.unwrap_or(fallback)
+                reply_rx
+                    .recv_async()
+                    .await
+                    .unwrap_or_else(|_| HeaderResult::plain(fallback))
             }),
         }
     }
@@ -179,10 +182,10 @@ impl ToolInvocation for LuaToolInvocation {
                                 snapshot,
                             });
                         }
-                        if let Some(annotation) = reply.annotation {
-                            let _ = ctx.event_tx.send(AgentEvent::ToolAnnotation {
+                        if let Some(header) = reply.header {
+                            let _ = ctx.event_tx.send(AgentEvent::ToolHeaderSnapshot {
                                 id: id.clone(),
-                                annotation,
+                                snapshot: header,
                             });
                         }
                     }
@@ -249,11 +252,9 @@ fn parse_audience(audiences: Option<mlua::Table>) -> LuaResult<ToolAudience> {
 fn parse_render_hints(spec: &Table) -> Option<RawRenderHints> {
     let render: Table = spec.get("render").ok()?;
     Some(RawRenderHints {
-        header_style: render.get::<String>("header_style").ok(),
         output_lines: render.get::<usize>("output_lines").ok(),
         output_keep: render.get::<String>("output_keep").ok(),
         output_separator: render.get::<String>("output_separator").ok(),
-        always_annotate: render.get::<bool>("always_annotate").ok(),
         skip_done_truncation: render.get::<bool>("skip_done_truncation").ok(),
     })
 }
@@ -302,10 +303,10 @@ fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> Lua
         }
     }
 
-    let summary_fn: Option<Function> = spec.get("summary").ok();
+    let header_fn: Option<Function> = spec.get("header").ok();
     let audience = parse_audience(audiences)?;
     let handler_key: RegistryKey = lua.create_registry_value(handler)?;
-    let summary_key = summary_fn
+    let header_key = header_fn
         .map(|f| lua.create_registry_value(f))
         .transpose()?;
     let name: Arc<str> = Arc::from(name.as_str());
@@ -321,7 +322,7 @@ fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> Lua
             schema: param_schema,
             audience,
             handler_key,
-            summary_key,
+            header_key,
             permission_scope_field,
             render_hints,
         });
@@ -334,7 +335,7 @@ pub(crate) type ToolCallResult = Result<String, String>;
 pub(crate) struct ToolCallReply {
     pub result: ToolCallResult,
     pub snapshot: Option<BufferSnapshot>,
-    pub annotation: Option<String>,
+    pub header: Option<BufferSnapshot>,
 }
 
 impl ToolCallReply {
@@ -342,7 +343,7 @@ impl ToolCallReply {
         Self {
             result: Err(msg.into()),
             snapshot: None,
-            annotation: None,
+            header: None,
         }
     }
 }
@@ -350,19 +351,20 @@ impl ToolCallReply {
 pub(crate) fn extract_tool_return(lua: &Lua, result: &LuaValue) -> ToolCallReply {
     let text_result = coerce_tool_result(result);
 
-    let (snapshot, annotation) = if let LuaValue::Table(t) = result {
-        let snap = t.get::<LuaValue>("render_buf").ok().and_then(|v| {
+    let (snapshot, header) = if let LuaValue::Table(t) = result {
+        let snap = t.get::<LuaValue>("body").ok().and_then(|v| {
             let ud = v.as_userdata()?;
             let h = ud.borrow::<BufHandle>().ok()?;
             lua.app_data_mut::<BufferStore>()?.take(h.0)
         });
 
-        let ann = t
-            .get::<LuaValue>("annotation")
-            .ok()
-            .and_then(|v| v.as_string().map(|s| s.to_string_lossy().to_string()));
+        let hdr = t.get::<LuaValue>("header").ok().and_then(|v| {
+            let ud = v.as_userdata()?;
+            let h = ud.borrow::<BufHandle>().ok()?;
+            lua.app_data_mut::<BufferStore>()?.take(h.0)
+        });
 
-        (snap, ann)
+        (snap, hdr)
     } else {
         (None, None)
     };
@@ -374,7 +376,7 @@ pub(crate) fn extract_tool_return(lua: &Lua, result: &LuaValue) -> ToolCallReply
     ToolCallReply {
         result: text_result,
         snapshot,
-        annotation,
+        header,
     }
 }
 
@@ -382,7 +384,7 @@ pub(crate) fn coerce_tool_result(result: &LuaValue) -> ToolCallResult {
     match result {
         LuaValue::String(s) => s.to_str().map(|s| s.to_owned()).map_err(|e| e.to_string()),
         LuaValue::Table(t) => {
-            let output = t.get::<LuaValue>("output").ok().and_then(|v| {
+            let output = t.get::<LuaValue>("llm_output").ok().and_then(|v| {
                 if let LuaValue::String(s) = v {
                     s.to_str().ok().map(|s| s.to_owned())
                 } else {
@@ -425,7 +427,7 @@ mod tests {
         LuaToolInvocation {
             tool: Arc::from("test_tool"),
             plugin: Arc::from("test"),
-            has_summary_fn: false,
+            has_header_fn: false,
             input,
             tx,
             permission_scope: None,
@@ -433,9 +435,9 @@ mod tests {
     }
 
     #[test]
-    fn no_summary_fn_returns_tool_name() {
+    fn no_header_fn_returns_tool_name() {
         let inv = invocation(serde_json::json!({"path": "/home/x/foo.rs"}));
-        assert_eq!(inv.start_summary().into_ready(), "test_tool");
+        assert_eq!(inv.start_header().into_ready().text(), "test_tool");
     }
 
     fn make_lua_tool(permission_scope_field: Option<&str>) -> LuaTool {
@@ -456,7 +458,7 @@ mod tests {
             audience: ToolAudience::default(),
             tx,
             plugin: Arc::from("test"),
-            has_summary_fn: false,
+            has_header_fn: false,
             permission_scope_field: permission_scope_field.map(Arc::from),
         }
     }
@@ -496,29 +498,45 @@ mod tests {
         let reply = extract_tool_return(&lua, &val);
         assert_eq!(reply.result, Ok("result text".to_string()));
         assert!(reply.snapshot.is_none());
-        assert!(reply.annotation.is_none());
+        assert!(reply.header.is_none());
     }
 
     #[test]
     fn extract_tool_return_table_with_output() {
         let lua = lua_with_buf_store();
         let t = lua.create_table().unwrap();
-        t.set("output", "hello").unwrap();
+        t.set("llm_output", "hello").unwrap();
         let reply = extract_tool_return(&lua, &LuaValue::Table(t));
         assert_eq!(reply.result, Ok("hello".to_string()));
         assert!(reply.snapshot.is_none());
-        assert!(reply.annotation.is_none());
+        assert!(reply.header.is_none());
     }
 
     #[test]
-    fn extract_tool_return_table_with_annotation() {
+    fn extract_tool_return_table_with_header() {
         let lua = lua_with_buf_store();
+        let buf_id = {
+            let mut store = lua.app_data_mut::<BufferStore>().unwrap();
+            let id = store.create();
+            store.append_line(
+                id,
+                maki_agent::SnapshotLine {
+                    spans: vec![maki_agent::SnapshotSpan {
+                        text: "42 lines".into(),
+                        style: maki_agent::SpanStyle::Default,
+                    }],
+                },
+            );
+            id
+        };
+        let handle = lua.create_userdata(BufHandle(buf_id)).unwrap();
         let t = lua.create_table().unwrap();
-        t.set("output", "data").unwrap();
-        t.set("annotation", "42 lines").unwrap();
+        t.set("llm_output", "data").unwrap();
+        t.set("header", handle).unwrap();
         let reply = extract_tool_return(&lua, &LuaValue::Table(t));
         assert_eq!(reply.result, Ok("data".to_string()));
-        assert_eq!(reply.annotation.as_deref(), Some("42 lines"));
+        let hdr = reply.header.expect("header should be present");
+        assert_eq!(hdr.lines[0].spans[0].text, "42 lines");
     }
 
     #[test]
@@ -540,8 +558,8 @@ mod tests {
         };
         let handle = lua.create_userdata(BufHandle(buf_id)).unwrap();
         let t = lua.create_table().unwrap();
-        t.set("output", "plain for llm").unwrap();
-        t.set("render_buf", handle).unwrap();
+        t.set("llm_output", "plain for llm").unwrap();
+        t.set("body", handle).unwrap();
         let reply = extract_tool_return(&lua, &LuaValue::Table(t));
         assert_eq!(reply.result, Ok("plain for llm".to_string()));
         let snap = reply.snapshot.unwrap();
@@ -558,7 +576,7 @@ mod tests {
             store.create();
         }
         let t = lua.create_table().unwrap();
-        t.set("output", "ok").unwrap();
+        t.set("llm_output", "ok").unwrap();
         let _reply = extract_tool_return(&lua, &LuaValue::Table(t));
         let mut store = lua.app_data_mut::<BufferStore>().unwrap();
         assert!(
@@ -571,7 +589,7 @@ mod tests {
     fn extract_tool_return_is_error_flag() {
         let lua = lua_with_buf_store();
         let t = lua.create_table().unwrap();
-        t.set("output", "something broke").unwrap();
+        t.set("llm_output", "something broke").unwrap();
         t.set("is_error", true).unwrap();
         let reply = extract_tool_return(&lua, &LuaValue::Table(t));
         assert_eq!(reply.result, Err("something broke".to_string()));
@@ -580,11 +598,29 @@ mod tests {
     #[test]
     fn extract_tool_return_missing_output_field() {
         let lua = lua_with_buf_store();
+        let buf_id = {
+            let mut store = lua.app_data_mut::<BufferStore>().unwrap();
+            let id = store.create();
+            store.append_line(
+                id,
+                maki_agent::SnapshotLine {
+                    spans: vec![maki_agent::SnapshotSpan {
+                        text: "some header".into(),
+                        style: maki_agent::SpanStyle::Default,
+                    }],
+                },
+            );
+            id
+        };
+        let handle = lua.create_userdata(BufHandle(buf_id)).unwrap();
         let t = lua.create_table().unwrap();
-        t.set("annotation", "some annotation").unwrap();
+        t.set("header", handle).unwrap();
         let reply = extract_tool_return(&lua, &LuaValue::Table(t));
-        assert!(reply.result.is_err(), "missing output should be an error");
-        assert_eq!(reply.annotation.as_deref(), Some("some annotation"));
+        assert!(
+            reply.result.is_err(),
+            "missing llm_output should be an error"
+        );
+        assert!(reply.header.is_some(), "header should still be extracted");
     }
 
     #[test]
@@ -593,6 +629,6 @@ mod tests {
         let reply = extract_tool_return(&lua, &LuaValue::Integer(42));
         assert!(reply.result.is_err());
         assert!(reply.snapshot.is_none());
-        assert!(reply.annotation.is_none());
+        assert!(reply.header.is_none());
     }
 }

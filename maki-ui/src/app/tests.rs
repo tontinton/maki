@@ -617,6 +617,7 @@ fn cancel_resets_all_chats_and_indices() {
             annotation: None,
             input: None,
             output: None,
+            render_header: None,
         })),
         "task1",
         None,
@@ -979,6 +980,7 @@ fn double_esc_cancels_flushes_and_fails_tools() {
         annotation: None,
         input: None,
         output: None,
+        render_header: None,
     }))));
 
     let actions = app.update(Msg::Key(key(KeyCode::Esc)));
@@ -1293,6 +1295,7 @@ fn resolve_or_create_chat_sets_model_id_and_annotation() {
         annotation: None,
         input: None,
         output: None,
+        render_header: None,
     }))));
 
     app.update(subagent_msg_with_model(
@@ -2171,6 +2174,7 @@ fn agent_error_creates_synthetic_tool_done_with_message() {
         annotation: None,
         input: None,
         output: None,
+        render_header: None,
     }))));
     assert_eq!(app.main_chat().in_progress_count(), 1);
 

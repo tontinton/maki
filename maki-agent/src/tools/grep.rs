@@ -157,7 +157,7 @@ impl Grep {
         .await
     }
 
-    pub fn start_summary(&self) -> String {
+    pub fn start_header(&self) -> String {
         let mut s = self.pattern.trim_end_matches('"').to_string();
         if let Some(inc) = &self.include {
             s.push_str(" [");
@@ -175,8 +175,8 @@ impl Grep {
 super::impl_tool!(Grep);
 
 impl super::ToolInvocation for Grep {
-    fn start_summary(&self) -> super::SummaryFuture {
-        super::SummaryFuture::Ready(Grep::start_summary(self))
+    fn start_header(&self) -> super::HeaderFuture {
+        super::HeaderFuture::Ready(super::HeaderResult::plain(Grep::start_header(self)))
     }
     fn execute<'a>(self: Box<Self>, ctx: &'a super::ToolContext) -> super::ExecFuture<'a> {
         Box::pin(async move { Grep::execute(&self, ctx).await })
@@ -256,7 +256,7 @@ mod tests {
     #[test_case("TODO",    Some("*.rs"), None,           "TODO [*.rs]"          ; "with_include")]
     #[test_case("TODO",    None,         Some("src/"),   "TODO in src/"         ; "with_path")]
     #[test_case("TODO",    Some("*.rs"), Some("src/"),   "TODO [*.rs] in src/" ; "with_include_and_path")]
-    fn start_summary_cases(
+    fn start_header_cases(
         pattern: &str,
         include: Option<&str>,
         path: Option<&str>,
@@ -268,7 +268,7 @@ mod tests {
             path: path.map(Into::into),
             ..Default::default()
         };
-        assert_eq!(g.start_summary(), expected);
+        assert_eq!(g.start_header(), expected);
     }
 
     #[test_case("foo",       false ; "simple_pattern")]

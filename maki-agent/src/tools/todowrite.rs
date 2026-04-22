@@ -23,8 +23,11 @@ impl TodoWrite {
 super::impl_tool!(TodoWrite, audience = super::ToolAudience::MAIN);
 
 impl super::ToolInvocation for TodoWrite {
-    fn start_summary(&self) -> super::SummaryFuture {
-        super::SummaryFuture::Ready(format!("{} todos", self.todos.len()))
+    fn start_header(&self) -> super::HeaderFuture {
+        super::HeaderFuture::Ready(super::HeaderResult::plain(format!(
+            "{} todos",
+            self.todos.len()
+        )))
     }
     fn execute<'a>(self: Box<Self>, ctx: &'a super::ToolContext) -> super::ExecFuture<'a> {
         Box::pin(async move { TodoWrite::execute(&self, ctx).await })

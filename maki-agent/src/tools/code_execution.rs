@@ -135,7 +135,7 @@ impl CodeExecution {
             .await?
     }
 
-    pub fn start_summary(&self) -> String {
+    pub fn start_header(&self) -> String {
         let lines = self.code.lines().count();
         format!("{lines} lines")
     }
@@ -152,8 +152,10 @@ super::impl_tool!(
 );
 
 impl super::ToolInvocation for CodeExecution {
-    fn start_summary(&self) -> super::SummaryFuture {
-        super::SummaryFuture::Ready(CodeExecution::start_summary(self))
+    fn start_header(&self) -> super::HeaderFuture {
+        super::HeaderFuture::Ready(super::HeaderResult::plain(CodeExecution::start_header(
+            self,
+        )))
     }
     fn start_input(&self) -> Option<ToolInput> {
         Some(ToolInput::Script {

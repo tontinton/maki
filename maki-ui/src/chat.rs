@@ -145,8 +145,8 @@ impl Chat {
             AgentEvent::ToolSnapshot { id, snapshot } => {
                 self.messages_panel.tool_snapshot(&id, snapshot);
             }
-            AgentEvent::ToolAnnotation { id, annotation } => {
-                self.messages_panel.tool_annotation(&id, &annotation);
+            AgentEvent::ToolHeaderSnapshot { id, snapshot } => {
+                self.messages_panel.tool_header_snapshot(&id, snapshot);
             }
             AgentEvent::SubagentHistory { .. } => {}
         }
@@ -340,7 +340,7 @@ pub fn history_to_display(
                             let reg = ToolRegistry::native();
                             let tool_call: Option<Box<dyn ToolInvocation>> =
                                 reg.get(name).and_then(|entry| entry.try_parse(input));
-                            let summary = reg.resolve_summary(name, input);
+                            let summary = reg.resolve_header(name, input);
                             let tool_input = tool_call.as_deref().and_then(|tc| tc.start_input());
                             let (status, result_text) = results
                                 .get(id.as_str())
@@ -384,6 +384,7 @@ pub fn history_to_display(
                                 turn_usage: None,
                                 truncated_lines,
                                 render_snapshot: None,
+                                render_header: None,
                             });
                         }
                         _ => {}
@@ -510,6 +511,7 @@ mod tests {
             annotation: None,
             input: None,
             output: None,
+            render_header: None,
         }))
     }
 

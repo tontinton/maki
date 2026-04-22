@@ -39,7 +39,7 @@ impl Memory {
         .await
     }
 
-    pub fn start_summary(&self) -> String {
+    pub fn start_header(&self) -> String {
         match self.path.as_deref() {
             Some(p) => format!("{} {p}", self.command),
             None => self.command.clone(),
@@ -53,8 +53,8 @@ super::impl_tool!(
 );
 
 impl super::ToolInvocation for Memory {
-    fn start_summary(&self) -> super::SummaryFuture {
-        super::SummaryFuture::Ready(Memory::start_summary(self))
+    fn start_header(&self) -> super::HeaderFuture {
+        super::HeaderFuture::Ready(super::HeaderResult::plain(Memory::start_header(self)))
     }
     fn execute<'a>(self: Box<Self>, ctx: &'a super::ToolContext) -> super::ExecFuture<'a> {
         Box::pin(async move { Memory::execute(&self, ctx).await })

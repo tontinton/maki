@@ -70,12 +70,7 @@ impl Default for ToolRenderHints {
 impl ToolRenderHints {
     pub fn from_raw(raw: &RawRenderHints, existing: Option<&Self>) -> Self {
         Self {
-            header_style: match raw.header_style.as_deref() {
-                Some("path") => HeaderStyle::Path,
-                Some("command") => HeaderStyle::Command,
-                Some("grep") => HeaderStyle::Grep,
-                _ => HeaderStyle::Plain,
-            },
+            header_style: existing.map_or(HeaderStyle::Plain, |e| e.header_style),
             body_format: existing.map_or(BodyFormat::Plain, |e| e.body_format),
             output_lines: raw.output_lines,
             output_keep: match raw.output_keep.as_deref() {
@@ -87,7 +82,7 @@ impl ToolRenderHints {
                 Some("code_execution") => OutputSeparator::CodeExecution,
                 _ => OutputSeparator::None,
             },
-            always_annotate: raw.always_annotate.unwrap_or(false),
+            always_annotate: existing.is_some_and(|e| e.always_annotate),
             skip_done_truncation: raw.skip_done_truncation.unwrap_or(false),
         }
     }
@@ -249,14 +244,8 @@ mod tests {
     fn register_and_remove_plugin_tool() {
         let mut reg = RenderHintsRegistry::new();
         let name: Arc<str> = Arc::from("my_plugin_tool");
-        reg.register(
-            Arc::clone(&name),
-            &RawRenderHints {
-                always_annotate: Some(true),
-                ..Default::default()
-            },
-        );
-        assert!(reg.get("my_plugin_tool").always_annotate);
+        reg.register(Arc::clone(&name), &RawRenderHints::default());
+        assert!(!reg.get("my_plugin_tool").always_annotate);
         reg.remove_plugin_tools(&[name]);
         assert!(!reg.get("my_plugin_tool").always_annotate);
     }
@@ -272,15 +261,6 @@ mod tests {
         let mut r = RawRenderHints::default();
         f(&mut r);
         ToolRenderHints::from_raw(&r, None)
-    }
-
-    #[test_case("path",    HeaderStyle::Path    ; "path")]
-    #[test_case("command", HeaderStyle::Command ; "command")]
-    #[test_case("grep",    HeaderStyle::Grep    ; "grep")]
-    #[test_case("unknown", HeaderStyle::Plain   ; "unknown_falls_back_to_plain")]
-    fn from_raw_header_style(input: &str, expected: HeaderStyle) {
-        let h = raw(|r| r.header_style = Some(input.into()));
-        assert_eq!(h.header_style, expected);
     }
 
     #[test_case("tail", OutputKeep::Tail ; "tail")]
@@ -301,11 +281,9 @@ mod tests {
     #[test]
     fn from_raw_never_sets_non_plain_body_format() {
         let h = raw(|r| {
-            r.header_style = Some("path".into());
             r.output_lines = Some(100);
             r.output_keep = Some("tail".into());
             r.output_separator = Some("bash".into());
-            r.always_annotate = Some(true);
         });
         assert_eq!(h.body_format, BodyFormat::Plain);
     }
@@ -317,8 +295,7 @@ mod tests {
         reg.register(
             Arc::from(INDEX_TOOL_NAME),
             &RawRenderHints {
-                header_style: Some("path".into()),
-                always_annotate: Some(true),
+                output_lines: Some(100),
                 ..Default::default()
             },
         );
@@ -343,23 +320,19 @@ mod tests {
         reg.register(
             Arc::clone(&name),
             &RawRenderHints {
-                header_style: Some("command".into()),
                 output_lines: Some(50),
                 ..Default::default()
             },
         );
-        assert_eq!(reg.get("custom_tool").header_style, HeaderStyle::Command);
         assert_eq!(reg.get("custom_tool").output_lines, Some(50));
 
         reg.register(
             Arc::clone(&name),
             &RawRenderHints {
-                header_style: Some("path".into()),
                 output_lines: Some(100),
                 ..Default::default()
             },
         );
-        assert_eq!(reg.get("custom_tool").header_style, HeaderStyle::Path);
         assert_eq!(reg.get("custom_tool").output_lines, Some(100));
     }
 

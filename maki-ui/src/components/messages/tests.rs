@@ -19,6 +19,7 @@ fn start(id: &str, tool: &str) -> ToolStartEvent {
         annotation: None,
         input: None,
         output: None,
+        render_header: None,
     }
 }
 
@@ -339,6 +340,7 @@ fn bash_code_start(panel: &mut MessagesPanel, id: &str, code: &str) {
             code: code.into(),
         }),
         output: None,
+        render_header: None,
     });
 }
 
@@ -609,6 +611,7 @@ fn batch_start(panel: &mut MessagesPanel, entries: Vec<BatchToolEntry>) {
             entries,
             text: String::new(),
         }),
+        render_header: None,
     });
 }
 
@@ -882,6 +885,7 @@ fn panel_with_long_tool(line_count: usize) -> MessagesPanel {
         annotation: None,
         input: None,
         output: None,
+        render_header: None,
     });
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
@@ -943,6 +947,7 @@ fn panel_with_grep_tool(match_count: usize) -> MessagesPanel {
         annotation: None,
         input: None,
         output: None,
+        render_header: None,
     });
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),

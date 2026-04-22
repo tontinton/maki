@@ -275,7 +275,7 @@ pub fn run(
             | AgentEvent::QuestionPrompt { .. }
             | AgentEvent::SubagentHistory { .. }
             | AgentEvent::ToolSnapshot { .. }
-            | AgentEvent::ToolAnnotation { .. }
+            | AgentEvent::ToolHeaderSnapshot { .. }
             | AgentEvent::Retry { .. } => {
                 if is_stream_json {
                     println!("{}", serde_json::to_string(&envelope)?);

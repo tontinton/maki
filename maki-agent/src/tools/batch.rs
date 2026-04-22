@@ -124,7 +124,7 @@ impl BatchEntry {
             .and_then(|e| e.tool.parse(&self.parameters).ok());
         BatchToolEntry {
             tool: self.tool.clone(),
-            summary: summary.unwrap_or_else(|| reg.resolve_summary(&self.tool, &self.parameters)),
+            summary: summary.unwrap_or_else(|| reg.resolve_header(&self.tool, &self.parameters)),
             status,
             input: call.and_then(|c| c.start_input()),
             output,
@@ -192,7 +192,7 @@ impl Batch {
                 }
 
                 let summary = ToolRegistry::native()
-                    .resolve_summary_async(&name, &params)
+                    .resolve_header_async(&name, &params)
                     .await;
 
                 ctx.event_tx
@@ -328,7 +328,7 @@ impl Batch {
         })
     }
 
-    pub fn start_summary(&self) -> String {
+    pub fn start_header(&self) -> String {
         format!("{} tools", self.tool_calls.len())
     }
 }
@@ -341,8 +341,8 @@ super::impl_tool!(
 );
 
 impl super::ToolInvocation for Batch {
-    fn start_summary(&self) -> super::SummaryFuture {
-        super::SummaryFuture::Ready(Batch::start_summary(self))
+    fn start_header(&self) -> super::HeaderFuture {
+        super::HeaderFuture::Ready(super::HeaderResult::plain(Batch::start_header(self)))
     }
     fn start_output(&self) -> Option<ToolOutput> {
         let entries = self

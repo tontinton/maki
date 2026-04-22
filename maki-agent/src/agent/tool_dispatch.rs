@@ -103,10 +103,12 @@ pub async fn run(
             return done_error(crate::tools::PLAN_WRITE_RESTRICTED.into());
         }
 
+        let header_result = invocation.start_header().await;
         let start = ToolStartEvent {
             id: id.clone(),
             tool: Arc::clone(&tool_id),
-            summary: invocation.start_summary().await,
+            summary: header_result.text(),
+            render_header: header_result.snapshot(),
             annotation: invocation.start_annotation(),
             input: invocation.start_input(),
             output: invocation.start_output(),
@@ -170,6 +172,7 @@ pub async fn run(
             id: id.clone(),
             tool: Arc::clone(&tool_id),
             summary: format!("mcp: {name}"),
+            render_header: None,
             annotation: None,
             input: None,
             output: None,

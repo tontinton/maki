@@ -26,7 +26,7 @@ impl SkillTool {
             .ok_or_else(|| format!("{NOT_FOUND}{}", self.name))
     }
 
-    pub fn start_summary(&self) -> String {
+    pub fn start_header(&self) -> String {
         self.name.clone()
     }
 }
@@ -43,8 +43,8 @@ super::impl_tool!(
 );
 
 impl super::ToolInvocation for SkillTool {
-    fn start_summary(&self) -> super::SummaryFuture {
-        super::SummaryFuture::Ready(SkillTool::start_summary(self))
+    fn start_header(&self) -> super::HeaderFuture {
+        super::HeaderFuture::Ready(super::HeaderResult::plain(SkillTool::start_header(self)))
     }
     fn execute<'a>(self: Box<Self>, ctx: &'a super::ToolContext) -> super::ExecFuture<'a> {
         Box::pin(async move { SkillTool::execute(&self, ctx).await })

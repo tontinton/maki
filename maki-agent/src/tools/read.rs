@@ -125,7 +125,7 @@ impl Read {
         Ok(ToolOutput::ReadDir { text, instructions })
     }
 
-    pub fn start_summary(&self) -> String {
+    pub fn start_header(&self) -> String {
         let mut s = relative_path(&self.path);
         let start = self.offset.unwrap_or(1);
         match (self.offset.is_some(), self.limit) {
@@ -144,8 +144,8 @@ impl Read {
 super::impl_tool!(Read);
 
 impl super::ToolInvocation for Read {
-    fn start_summary(&self) -> super::SummaryFuture {
-        super::SummaryFuture::Ready(Read::start_summary(self))
+    fn start_header(&self) -> super::HeaderFuture {
+        super::HeaderFuture::Ready(super::HeaderResult::plain(Read::start_header(self)))
     }
     fn execute<'a>(self: Box<Self>, ctx: &'a super::ToolContext) -> super::ExecFuture<'a> {
         Box::pin(async move { Read::execute(&self, ctx).await })
@@ -163,13 +163,13 @@ mod tests {
     #[test_case(Some(10),  None,      "/a/b.rs:10"    ; "offset_only")]
     #[test_case(None,      Some(25),  "/a/b.rs:1-25"  ; "limit_only")]
     #[test_case(Some(50),  Some(51),  "/a/b.rs:50-100" ; "offset_and_limit")]
-    fn start_summary_cases(offset: Option<usize>, limit: Option<usize>, expected: &str) {
+    fn start_header_cases(offset: Option<usize>, limit: Option<usize>, expected: &str) {
         let r = Read {
             path: "/a/b.rs".into(),
             offset,
             limit,
         };
-        assert_eq!(r.start_summary(), expected);
+        assert_eq!(r.start_header(), expected);
     }
 
     #[test]

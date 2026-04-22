@@ -305,7 +305,7 @@ impl Bash {
         }
     }
 
-    pub fn start_summary(&self) -> String {
+    pub fn start_header(&self) -> String {
         let (command, workdir) = self.resolved_command();
         let mut s = self
             .description
@@ -322,8 +322,8 @@ impl Bash {
 super::impl_tool!(Bash);
 
 impl super::ToolInvocation for Bash {
-    fn start_summary(&self) -> super::SummaryFuture {
-        super::SummaryFuture::Ready(Bash::start_summary(self))
+    fn start_header(&self) -> super::HeaderFuture {
+        super::HeaderFuture::Ready(super::HeaderResult::plain(Bash::start_header(self)))
     }
     fn start_input(&self) -> Option<ToolInput> {
         let (command, _) = self.resolved_command();
@@ -482,14 +482,14 @@ mod tests {
     #[test_case(Some("build"), Some("/tmp/proj"), "cargo build", "build in /tmp/proj" ; "appends_workdir")]
     #[test_case(None, None, "cd /tmp && ls", "ls in /tmp" ; "strips_cd_prefix")]
     #[test_case(Some("list"), None, "cd /tmp && ls", "list in /tmp" ; "strips_cd_prefix_with_desc")]
-    fn start_summary_cases(desc: Option<&str>, workdir: Option<&str>, cmd: &str, expected: &str) {
+    fn start_header_cases(desc: Option<&str>, workdir: Option<&str>, cmd: &str, expected: &str) {
         let b = Bash {
             command: cmd.into(),
             timeout: None,
             workdir: workdir.map(Into::into),
             description: desc.map(Into::into),
         };
-        assert_eq!(b.start_summary(), expected);
+        assert_eq!(b.start_header(), expected);
     }
 
     #[test_case("cargo test",        None,          "cargo test"   ; "simple_command")]

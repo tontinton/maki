@@ -113,6 +113,7 @@ impl App {
                         code: command,
                     }),
                     output: None,
+                    render_header: None,
                 });
             }
             ShellEvent::Output { id, content } => {

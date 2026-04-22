@@ -75,6 +75,7 @@ fn tool_start_with(
         annotation: annotation.map(Into::into),
         input,
         output: None,
+        render_header: None,
     }))
 }
 

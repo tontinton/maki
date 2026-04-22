@@ -398,6 +398,7 @@ pub struct ToolStartEvent {
     pub id: String,
     pub tool: Arc<str>,
     pub summary: String,
+    pub render_header: Option<BufferSnapshot>,
     pub annotation: Option<String>,
     pub input: Option<ToolInput>,
     pub output: Option<ToolOutput>,
@@ -511,15 +512,24 @@ pub enum AgentEvent {
         id: String,
         snapshot: BufferSnapshot,
     },
-    ToolAnnotation {
+    ToolHeaderSnapshot {
         id: String,
-        annotation: String,
+        snapshot: BufferSnapshot,
     },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct BufferSnapshot {
     pub lines: Vec<SnapshotLine>,
+}
+
+impl BufferSnapshot {
+    pub fn first_line_text(&self) -> String {
+        self.lines
+            .first()
+            .map(|l| l.spans.iter().map(|s| s.text.as_str()).collect())
+            .unwrap_or_default()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -555,11 +565,9 @@ pub struct InlineStyle {
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct RawRenderHints {
-    pub header_style: Option<String>,
     pub output_lines: Option<usize>,
     pub output_keep: Option<String>,
     pub output_separator: Option<String>,
-    pub always_annotate: Option<bool>,
     pub skip_done_truncation: Option<bool>,
 }
 

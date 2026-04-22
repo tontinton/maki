@@ -44,7 +44,7 @@ impl Question {
         ctx.cancel.race(recv).await?
     }
 
-    pub fn start_summary(&self) -> String {
+    pub fn start_header(&self) -> String {
         let n = self.questions.len();
         format!("{n} question{}", if n == 1 { "" } else { "s" })
     }
@@ -53,8 +53,8 @@ impl Question {
 super::impl_tool!(Question, audience = super::ToolAudience::MAIN);
 
 impl super::ToolInvocation for Question {
-    fn start_summary(&self) -> super::SummaryFuture {
-        super::SummaryFuture::Ready(Question::start_summary(self))
+    fn start_header(&self) -> super::HeaderFuture {
+        super::HeaderFuture::Ready(super::HeaderResult::plain(Question::start_header(self)))
     }
     fn execute<'a>(self: Box<Self>, ctx: &'a super::ToolContext) -> super::ExecFuture<'a> {
         Box::pin(async move { Question::execute(&self, ctx).await })

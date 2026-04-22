@@ -76,7 +76,7 @@ maki.api.register_tool({
   },
   permission_scope = "url",
 
-  summary = function(input)
+  header = function(input)
     local fmt = input.format
     if fmt and fmt ~= DEFAULT_FORMAT then
       return input.url .. " [" .. fmt .. "]"

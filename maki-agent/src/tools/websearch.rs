@@ -101,7 +101,7 @@ impl WebSearch {
         )))
     }
 
-    pub fn start_summary(&self) -> String {
+    pub fn start_header(&self) -> String {
         self.query.clone()
     }
 }
@@ -112,8 +112,8 @@ super::impl_tool!(
 );
 
 impl super::ToolInvocation for WebSearch {
-    fn start_summary(&self) -> super::SummaryFuture {
-        super::SummaryFuture::Ready(WebSearch::start_summary(self))
+    fn start_header(&self) -> super::HeaderFuture {
+        super::HeaderFuture::Ready(super::HeaderResult::plain(WebSearch::start_header(self)))
     }
     fn permission_scope(&self) -> Option<String> {
         Some(self.query.clone())

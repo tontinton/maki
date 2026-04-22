@@ -201,7 +201,7 @@ impl Task {
         Ok(ToolOutput::Plain(text))
     }
 
-    pub fn start_summary(&self) -> String {
+    pub fn start_header(&self) -> String {
         self.description.clone()
     }
 }
@@ -209,8 +209,8 @@ impl Task {
 super::impl_tool!(Task, audience = super::ToolAudience::MAIN);
 
 impl super::ToolInvocation for Task {
-    fn start_summary(&self) -> super::SummaryFuture {
-        super::SummaryFuture::Ready(Task::start_summary(self))
+    fn start_header(&self) -> super::HeaderFuture {
+        super::HeaderFuture::Ready(super::HeaderResult::plain(Task::start_header(self)))
     }
     fn permission_scope(&self) -> Option<String> {
         Some(format!("task:{}", self.description))

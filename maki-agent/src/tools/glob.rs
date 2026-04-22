@@ -58,13 +58,13 @@ impl Glob {
 super::impl_tool!(Glob);
 
 impl super::ToolInvocation for Glob {
-    fn start_summary(&self) -> super::SummaryFuture {
+    fn start_header(&self) -> super::HeaderFuture {
         let mut s = self.pattern.clone();
         if let Some(dir) = &self.path {
             s.push_str(" in ");
             s.push_str(&relative_path(dir));
         }
-        super::SummaryFuture::Ready(s)
+        super::HeaderFuture::Ready(super::HeaderResult::plain(s))
     }
     fn execute<'a>(self: Box<Self>, ctx: &'a super::ToolContext) -> super::ExecFuture<'a> {
         Box::pin(async move { Glob::execute(&self, ctx).await })
@@ -79,11 +79,11 @@ mod tests {
 
     #[test_case("**/*.rs", None,            "**/*.rs"          ; "pattern_only")]
     #[test_case("**/*.rs", Some("src/"),      "**/*.rs in src/"  ; "with_path")]
-    fn start_summary_cases(pattern: &str, path: Option<&str>, expected: &str) {
+    fn start_header_cases(pattern: &str, path: Option<&str>, expected: &str) {
         let g = Glob {
             pattern: pattern.into(),
             path: path.map(Into::into),
         };
-        assert_eq!(g.start_summary().into_ready(), expected);
+        assert_eq!(g.start_header().into_ready().text(), expected);
     }
 }

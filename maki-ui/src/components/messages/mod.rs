@@ -150,6 +150,7 @@ impl MessagesPanel {
             msg.tool_input = event.input.map(Arc::new);
             msg.tool_output = event.output.map(Arc::new);
             msg.annotation = event.annotation;
+            msg.render_header = event.render_header;
             self.rebuild_tool_segment(&event.id);
             return;
         }
@@ -165,6 +166,7 @@ impl MessagesPanel {
         msg.tool_input = event.input.map(Arc::new);
         msg.tool_output = event.output.map(Arc::new);
         msg.annotation = event.annotation;
+        msg.render_header = event.render_header;
         msg.timestamp = Some(format_timestamp_now());
         self.messages.push(msg);
     }
@@ -324,9 +326,10 @@ impl MessagesPanel {
         }
     }
 
-    pub fn tool_annotation(&mut self, tool_id: &str, annotation: &str) {
+    pub fn tool_header_snapshot(&mut self, tool_id: &str, snapshot: BufferSnapshot) {
         if let Some(msg) = self.find_tool_msg_mut(tool_id) {
-            append_annotation(&mut msg.annotation, annotation);
+            msg.text = snapshot.first_line_text();
+            msg.render_header = Some(snapshot);
             self.rebuild_tool_segment(tool_id);
         }
     }

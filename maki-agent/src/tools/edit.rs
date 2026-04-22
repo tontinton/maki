@@ -56,7 +56,7 @@ impl Edit {
         .await
     }
 
-    pub fn start_summary(&self) -> String {
+    pub fn start_header(&self) -> String {
         relative_path(&self.path)
     }
 }
@@ -69,8 +69,8 @@ super::impl_tool!(
 );
 
 impl super::ToolInvocation for Edit {
-    fn start_summary(&self) -> super::SummaryFuture {
-        super::SummaryFuture::Ready(Edit::start_summary(self))
+    fn start_header(&self) -> super::HeaderFuture {
+        super::HeaderFuture::Ready(super::HeaderResult::plain(Edit::start_header(self)))
     }
     fn mutable_path(&self) -> Option<&Path> {
         Some(Path::new(&self.path))

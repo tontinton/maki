@@ -83,7 +83,7 @@ impl FindSymbol {
         .await
     }
 
-    pub fn start_summary(&self) -> String {
+    pub fn start_header(&self) -> String {
         format!("{} in {}", self.symbol, relative_path(&self.file))
     }
 }
@@ -91,8 +91,8 @@ impl FindSymbol {
 super::impl_tool!(FindSymbol);
 
 impl super::ToolInvocation for FindSymbol {
-    fn start_summary(&self) -> super::SummaryFuture {
-        super::SummaryFuture::Ready(FindSymbol::start_summary(self))
+    fn start_header(&self) -> super::HeaderFuture {
+        super::HeaderFuture::Ready(super::HeaderResult::plain(FindSymbol::start_header(self)))
     }
     fn execute<'a>(self: Box<Self>, ctx: &'a super::ToolContext) -> super::ExecFuture<'a> {
         Box::pin(async move { FindSymbol::execute(&self, ctx).await })
