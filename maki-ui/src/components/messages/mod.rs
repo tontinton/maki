@@ -204,14 +204,14 @@ impl MessagesPanel {
         }
         truncate_to_header(&mut msg.text);
         let hints = self.render_hints.get(&event.tool);
-        let done_annotation = tool_output_annotation(&event.output, hints.always_annotate);
+        let done_annotation = tool_output_annotation(&event.output);
         if let Some(suffix) = &done_annotation {
             append_annotation(&mut msg.annotation, suffix);
         }
 
         match &event.output {
             ToolOutput::Plain(text) | ToolOutput::ReadDir { text, .. }
-                if !hints.skip_done_truncation && msg.render_snapshot.is_none() =>
+                if msg.render_snapshot.is_none() =>
             {
                 let limits = output_limits_from_hints(&event.tool, hints, &self.tool_output_lines);
                 let tr = truncate_output(text, limits.max_lines, limits.keep);

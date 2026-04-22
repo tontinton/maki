@@ -565,13 +565,9 @@ pub struct InlineStyle {
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct RawRenderHints {
-    pub output_lines: Option<usize>,
-    pub output_keep: Option<String>,
+    pub truncate_lines: Option<usize>,
+    pub truncate_at: Option<String>,
     pub output_separator: Option<String>,
-    pub skip_done_truncation: Option<bool>,
-    pub header_style: Option<String>,
-    pub body_format: Option<String>,
-    pub always_annotate: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]

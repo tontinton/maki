@@ -408,7 +408,7 @@ fn build_loaded_tool(
     let hints = registry.get(tool);
     match reconstructed {
         Some(ref output @ ToolOutput::GlobResult { .. }) => {
-            let annotation = tool_output_annotation(output, hints.always_annotate);
+            let annotation = tool_output_annotation(output);
             let text = if output.is_empty_result() {
                 format!("{summary}\n{NO_FILES_FOUND}")
             } else {
@@ -420,7 +420,7 @@ fn build_loaded_tool(
             (text, 0, reconstructed.map(Arc::new), annotation)
         }
         Some(ref output @ ToolOutput::GrepResult { .. }) => {
-            let annotation = tool_output_annotation(output, hints.always_annotate);
+            let annotation = tool_output_annotation(output);
             (
                 summary.to_owned(),
                 0,
@@ -442,7 +442,7 @@ fn build_loaded_tool(
             (text, 0, reconstructed.map(Arc::new), None)
         }
         Some(ref output) => {
-            let annotation = tool_output_annotation(output, hints.always_annotate);
+            let annotation = tool_output_annotation(output);
             (
                 summary.to_owned(),
                 0,
@@ -453,11 +453,11 @@ fn build_loaded_tool(
         None => {
             let result = result_text.unwrap_or("");
             let annotation = if !result.is_empty() {
-                tool_output_annotation(&ToolOutput::Plain(result.into()), hints.always_annotate)
+                tool_output_annotation(&ToolOutput::Plain(result.into()))
             } else {
                 None
             };
-            if result.is_empty() || hints.skip_done_truncation {
+            if result.is_empty() {
                 (summary.to_owned(), 0, None, annotation)
             } else {
                 let limits = output_limits_from_hints(tool, hints, tool_output_lines);

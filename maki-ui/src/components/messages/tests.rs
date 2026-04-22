@@ -73,7 +73,7 @@ fn tool_done_sets_annotation(tool: &'static str, output: ToolOutput, expected: O
 }
 
 #[test_case("line\n".repeat(200).as_str(), Some("2m timeout · 200 lines") ; "merges_start_and_output_annotations")]
-#[test_case("ok",                           Some("2m timeout")           ; "keeps_start_when_output_has_none")]
+#[test_case("ok",                           Some("2m timeout · 1 lines") ; "merges_start_and_short_output")]
 fn tool_done_annotation_merge(output: &str, expected: Option<&str>) {
     let mut panel = MessagesPanel::new(UiConfig::default());
     let mut event = start("t1", BASH_TOOL_NAME);

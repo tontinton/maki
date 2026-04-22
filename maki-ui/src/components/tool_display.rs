@@ -4,7 +4,7 @@ use super::render_hints::{
 use super::status_bar::format_tokens;
 use super::{DisplayMessage, ToolStatus};
 
-use super::{code_view, index_highlight};
+use super::code_view;
 use crate::animation::spinner_frame;
 use crate::theme;
 use code_view::RenderLimits;
@@ -45,13 +45,13 @@ pub(crate) fn output_limits_from_hints(
     tol: &ToolOutputLines,
 ) -> OutputLimits {
     let config_value = tol.get(name);
-    let max_lines = match hints.output_lines {
+    let max_lines = match hints.truncate_lines {
         Some(hint) if config_value == tol.other => hint,
         _ => config_value,
     };
     OutputLimits {
         max_lines,
-        keep: hints.output_keep.into(),
+        keep: hints.truncate_at.into(),
     }
 }
 
@@ -64,11 +64,10 @@ const BASH_WAITING_LABEL: &str = "Waiting for output...";
 const BASH_NO_OUTPUT_LABEL: &str = "No output.";
 const BASH_OUTPUT_SEPARATOR: &str = "──────";
 
-const PLAIN_ANNOTATION_THRESHOLD: usize = 10;
 const BATCH_INDENT: &str = "  ";
 const BATCH_CONTENT_INDENT: &str = "    ";
 
-pub(crate) fn tool_output_annotation(output: &ToolOutput, always_annotate: bool) -> Option<String> {
+pub(crate) fn tool_output_annotation(output: &ToolOutput) -> Option<String> {
     match output {
         ToolOutput::ReadCode {
             lines, total_lines, ..
@@ -99,11 +98,7 @@ pub(crate) fn tool_output_annotation(output: &ToolOutput, always_annotate: bool)
         }
         ToolOutput::Plain(text) => {
             let n = text.lines().count();
-            if always_annotate || n > PLAIN_ANNOTATION_THRESHOLD {
-                Some(format!("{n} lines"))
-            } else {
-                None
-            }
+            Some(format!("{n} lines"))
         }
         _ => None,
     }
@@ -585,7 +580,6 @@ impl ToolLineBuilder {
             }
             match self.body_format {
                 BodyFormat::Markdown => self.push_markdown_body(text),
-                BodyFormat::Index => self.push_index_body(text),
                 BodyFormat::Plain => push_text_lines(&mut self.lines, text, TOOL_BODY_INDENT),
             }
             if let Some(full) = &resolved.full_text {
@@ -641,10 +635,6 @@ impl ToolLineBuilder {
             format!("{indent}{label}"),
             theme::current().tool_dim,
         )));
-    }
-
-    fn push_index_body(&mut self, text: &str) {
-        index_highlight::push_index_lines(&mut self.lines, text, TOOL_BODY_INDENT);
     }
 
     fn push_snapshot(&mut self, snapshot: &BufferSnapshot, search_fallback: Option<&str>) {
@@ -861,11 +851,7 @@ pub fn build_batch_entry_lines(
     let hints = registry.get(&entry.tool);
     let limits = output_limits_from_hints(&entry.tool, hints, tool_output_lines);
     let mut annotation = entry.annotation.clone();
-    if let Some(suffix) = entry
-        .output
-        .as_ref()
-        .and_then(|o| tool_output_annotation(o, hints.always_annotate))
-    {
+    if let Some(suffix) = entry.output.as_ref().and_then(tool_output_annotation) {
         append_annotation(&mut annotation, &suffix);
     }
 
@@ -1393,7 +1379,7 @@ mod tests {
         assert!(lines_text(&tl).contains("(anthropic/claude-haiku-4-20250414)"));
     }
 
-    #[test_case("bash",  ToolOutput::Plain("ok".into()),                      None                ; "plain_short_no_annotation")]
+    #[test_case("bash",  ToolOutput::Plain("ok".into()),                      Some("1 lines")     ; "plain_short_annotates")]
     #[test_case("bash",  ToolOutput::Plain((0..20).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n")), Some("20 lines") ; "plain_long_annotates")]
     #[test_case("read",  ToolOutput::ReadCode { path: "a.rs".into(), start_line: 1, lines: vec!["x".into(); 5], total_lines: 5, instructions: None }, Some("5 lines") ; "read_code_full_file")]
     #[test_case("read",  ToolOutput::ReadCode { path: "a.rs".into(), start_line: 10, lines: vec!["x".into(); 5], total_lines: 100, instructions: None }, Some("5 of 100 lines") ; "read_code_partial")]
@@ -1402,12 +1388,8 @@ mod tests {
     #[test_case("glob",  ToolOutput::GlobResult { files: vec!["a".into(), "b".into()] }, Some("2 files") ; "glob_file_count")]
     #[test_case("glob",  ToolOutput::GlobResult { files: vec![] },            None                ; "glob_empty_no_annotation")]
     #[test_case("edit",  ToolOutput::Diff { path: "a.rs".into(), before: String::new(), after: String::new(), summary: "ok".into() }, None ; "diff_no_annotation")]
-    fn annotation_cases(tool: &str, output: ToolOutput, expected: Option<&str>) {
-        let r = reg();
-        assert_eq!(
-            tool_output_annotation(&output, r.get(tool).always_annotate).as_deref(),
-            expected
-        );
+    fn annotation_cases(_tool: &str, output: ToolOutput, expected: Option<&str>) {
+        assert_eq!(tool_output_annotation(&output).as_deref(), expected);
     }
 
     #[test]
@@ -1584,35 +1566,6 @@ mod tests {
         assert!(text.contains("line_0"));
         assert!(!text.contains("line_149"));
         assert!(text.contains(TRUNCATION_PREFIX));
-    }
-
-    #[test]
-    fn index_output_styles_all_elements() {
-        let body = "imports: [1-5]\n  pub fn main() [10-20]\nfns:";
-        let msg = index_msg(body);
-        let mut r = RenderHintsRegistry::new();
-        r.register(
-            Arc::from("index"),
-            &maki_agent::RawRenderHints {
-                body_format: Some("index".into()),
-                always_annotate: Some(true),
-                ..Default::default()
-            },
-        );
-        let tl = build_tool_lines(
-            &msg,
-            ToolStatus::Success,
-            Instant::now(),
-            80,
-            SectionFlags::default(),
-            &TOL,
-            &r,
-        );
-        let t = theme::current();
-        assert!(line_has_styled(&tl, "imports:", t.index_section));
-        assert!(line_has_styled(&tl, "fns:", t.index_section));
-        assert!(line_has_styled(&tl, "[10-20]", t.index_line_nr));
-        assert!(line_has_styled(&tl, "pub", t.index_keyword));
     }
 
     fn snapshot_msg(snapshot: BufferSnapshot) -> DisplayMessage {
@@ -2027,7 +1980,7 @@ mod tests {
     #[test]
     fn output_limits_plugin_hint_wins_over_config_other() {
         let hints = ToolRenderHints {
-            output_lines: Some(50),
+            truncate_lines: Some(50),
             ..Default::default()
         };
         let ol = output_limits_from_hints("my_lua_tool", &hints, &TOL);
@@ -2037,7 +1990,7 @@ mod tests {
     #[test]
     fn output_limits_per_tool_config_wins_over_plugin_hint() {
         let hints = ToolRenderHints {
-            output_lines: Some(50),
+            truncate_lines: Some(50),
             ..Default::default()
         };
         let ol = output_limits_from_hints("bash", &hints, &TOL);
@@ -2050,7 +2003,7 @@ mod tests {
         custom_reg.register(
             Arc::from("my_tail_tool"),
             &maki_agent::RawRenderHints {
-                output_keep: Some("tail".into()),
+                truncate_at: Some("tail".into()),
                 ..Default::default()
             },
         );

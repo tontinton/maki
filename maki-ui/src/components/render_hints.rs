@@ -47,18 +47,15 @@ pub enum BodyFormat {
     #[default]
     Plain,
     Markdown,
-    Index,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ToolRenderHints {
     pub header_style: HeaderStyle,
     pub body_format: BodyFormat,
-    pub output_lines: Option<usize>,
-    pub output_keep: OutputKeep,
+    pub truncate_lines: Option<usize>,
+    pub truncate_at: OutputKeep,
     pub output_separator: OutputSeparator,
-    pub always_annotate: bool,
-    pub skip_done_truncation: bool,
 }
 
 impl Default for ToolRenderHints {
@@ -70,19 +67,10 @@ impl Default for ToolRenderHints {
 impl ToolRenderHints {
     pub fn from_raw(raw: &RawRenderHints, existing: Option<&Self>) -> Self {
         Self {
-            header_style: match raw.header_style.as_deref() {
-                Some("path") => HeaderStyle::Path,
-                Some("command") => HeaderStyle::Command,
-                Some("grep") => HeaderStyle::Grep,
-                _ => existing.map_or(HeaderStyle::Plain, |e| e.header_style),
-            },
-            body_format: match raw.body_format.as_deref() {
-                Some("markdown") => BodyFormat::Markdown,
-                Some("index") => BodyFormat::Index,
-                _ => existing.map_or(BodyFormat::Plain, |e| e.body_format),
-            },
-            output_lines: raw.output_lines,
-            output_keep: match raw.output_keep.as_deref() {
+            header_style: existing.map_or(HeaderStyle::Plain, |e| e.header_style),
+            body_format: existing.map_or(BodyFormat::Plain, |e| e.body_format),
+            truncate_lines: raw.truncate_lines,
+            truncate_at: match raw.truncate_at.as_deref() {
                 Some("tail") => OutputKeep::Tail,
                 _ => OutputKeep::Head,
             },
@@ -91,10 +79,6 @@ impl ToolRenderHints {
                 Some("code_execution") => OutputSeparator::CodeExecution,
                 _ => OutputSeparator::None,
             },
-            always_annotate: raw
-                .always_annotate
-                .unwrap_or_else(|| existing.is_some_and(|e| e.always_annotate)),
-            skip_done_truncation: raw.skip_done_truncation.unwrap_or(false),
         }
     }
 }
@@ -114,22 +98,20 @@ impl ToolRenderHints {
     const DEFAULT: Self = Self {
         header_style: HeaderStyle::Plain,
         body_format: BodyFormat::Plain,
-        output_lines: None,
-        output_keep: OutputKeep::Head,
+        truncate_lines: None,
+        truncate_at: OutputKeep::Head,
         output_separator: OutputSeparator::None,
-        always_annotate: false,
-        skip_done_truncation: false,
     };
 }
 
 const DEFAULT_HINTS: &[(&str, ToolRenderHints)] = &[
     hint!(BASH_TOOL_NAME,
         header_style: HeaderStyle::Command,
-        output_keep: OutputKeep::Tail,
+        truncate_at: OutputKeep::Tail,
         output_separator: OutputSeparator::Bash,
     ),
     hint!(CODE_EXECUTION_TOOL_NAME,
-        output_keep: OutputKeep::Tail,
+        truncate_at: OutputKeep::Tail,
         output_separator: OutputSeparator::CodeExecution,
     ),
     hint!(TASK_TOOL_NAME,
@@ -213,16 +195,10 @@ mod tests {
     #[test_case("bash", true ; "bash_tail_keep")]
     #[test_case("code_execution", true ; "code_execution_tail_keep")]
     #[test_case("read", false ; "read_head_keep")]
-    fn output_keep_direction(tool: &str, expect_tail: bool) {
+    fn truncate_at_direction(tool: &str, expect_tail: bool) {
         let reg = RenderHintsRegistry::new();
         let hints = reg.get(tool);
-        assert_eq!(matches!(hints.output_keep, OutputKeep::Tail), expect_tail);
-    }
-
-    #[test_case("bash", false ; "bash_no_always_annotate")]
-    fn always_annotate(tool: &str, expected: bool) {
-        let reg = RenderHintsRegistry::new();
-        assert_eq!(reg.get(tool).always_annotate, expected);
+        assert_eq!(matches!(hints.truncate_at, OutputKeep::Tail), expect_tail);
     }
 
     #[test]
@@ -230,7 +206,6 @@ mod tests {
         let reg = RenderHintsRegistry::new();
         let hints = reg.get("nonexistent_tool");
         assert!(matches!(hints.header_style, HeaderStyle::Plain));
-        assert!(!hints.always_annotate);
     }
 
     #[test]
@@ -238,15 +213,9 @@ mod tests {
         let mut reg = RenderHintsRegistry::new();
         let name: Arc<str> = Arc::from("my_plugin_tool");
         reg.register(Arc::clone(&name), &RawRenderHints::default());
-        assert!(!reg.get("my_plugin_tool").always_annotate);
+        assert!(reg.hints.contains_key("my_plugin_tool"));
         reg.remove_plugin_tools(&[name]);
-        assert!(!reg.get("my_plugin_tool").always_annotate);
-    }
-
-    #[test_case("bash", false ; "bash_no_skip_done")]
-    fn skip_done_truncation(tool: &str, expected: bool) {
-        let reg = RenderHintsRegistry::new();
-        assert_eq!(reg.get(tool).skip_done_truncation, expected);
+        assert!(!reg.hints.contains_key("my_plugin_tool"));
     }
 
     fn raw(f: impl FnOnce(&mut RawRenderHints)) -> ToolRenderHints {
@@ -257,9 +226,9 @@ mod tests {
 
     #[test_case("tail", OutputKeep::Tail ; "tail")]
     #[test_case("junk", OutputKeep::Head ; "invalid_falls_back_to_head")]
-    fn from_raw_output_keep(input: &str, expected: OutputKeep) {
-        let h = raw(|r| r.output_keep = Some(input.into()));
-        assert_eq!(h.output_keep, expected);
+    fn from_raw_truncate_at(input: &str, expected: OutputKeep) {
+        let h = raw(|r| r.truncate_at = Some(input.into()));
+        assert_eq!(h.truncate_at, expected);
     }
 
     #[test_case("bash",           OutputSeparator::Bash          ; "bash")]
@@ -273,8 +242,8 @@ mod tests {
     #[test]
     fn from_raw_never_sets_non_plain_body_format() {
         let h = raw(|r| {
-            r.output_lines = Some(100);
-            r.output_keep = Some("tail".into());
+            r.truncate_lines = Some(100);
+            r.truncate_at = Some("tail".into());
             r.output_separator = Some("bash".into());
         });
         assert_eq!(h.body_format, BodyFormat::Plain);
@@ -283,25 +252,21 @@ mod tests {
     #[test]
     fn register_preserves_existing_body_format() {
         let mut reg = RenderHintsRegistry::new();
+        reg.register(Arc::from("custom"), &RawRenderHints::default());
+        assert_eq!(reg.get("custom").body_format, BodyFormat::Plain);
+
+        let mut entry = *reg.get("custom");
+        entry.body_format = BodyFormat::Markdown;
+        reg.hints.insert(Arc::from("custom"), entry);
+
         reg.register(
             Arc::from("custom"),
             &RawRenderHints {
-                body_format: Some("index".into()),
-                always_annotate: Some(true),
+                truncate_lines: Some(100),
                 ..Default::default()
             },
         );
-        assert_eq!(reg.get("custom").body_format, BodyFormat::Index);
-        assert!(reg.get("custom").always_annotate);
-        reg.register(
-            Arc::from("custom"),
-            &RawRenderHints {
-                output_lines: Some(100),
-                ..Default::default()
-            },
-        );
-        assert_eq!(reg.get("custom").body_format, BodyFormat::Index);
-        assert!(reg.get("custom").always_annotate);
+        assert_eq!(reg.get("custom").body_format, BodyFormat::Markdown);
     }
 
     #[test]
@@ -321,20 +286,20 @@ mod tests {
         reg.register(
             Arc::clone(&name),
             &RawRenderHints {
-                output_lines: Some(50),
+                truncate_lines: Some(50),
                 ..Default::default()
             },
         );
-        assert_eq!(reg.get("custom_tool").output_lines, Some(50));
+        assert_eq!(reg.get("custom_tool").truncate_lines, Some(50));
 
         reg.register(
             Arc::clone(&name),
             &RawRenderHints {
-                output_lines: Some(100),
+                truncate_lines: Some(100),
                 ..Default::default()
             },
         );
-        assert_eq!(reg.get("custom_tool").output_lines, Some(100));
+        assert_eq!(reg.get("custom_tool").truncate_lines, Some(100));
     }
 
     #[test]
@@ -357,10 +322,8 @@ mod tests {
         let h = ToolRenderHints::from_raw(&RawRenderHints::default(), None);
         assert_eq!(h.header_style, HeaderStyle::Plain);
         assert_eq!(h.body_format, BodyFormat::Plain);
-        assert_eq!(h.output_lines, None);
-        assert_eq!(h.output_keep, OutputKeep::Head);
+        assert_eq!(h.truncate_lines, None);
+        assert_eq!(h.truncate_at, OutputKeep::Head);
         assert_eq!(h.output_separator, OutputSeparator::None);
-        assert!(!h.always_annotate);
-        assert!(!h.skip_done_truncation);
     }
 }

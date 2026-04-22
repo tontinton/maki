@@ -145,11 +145,6 @@ Return a compact overview of a source file: imports, type definitions, function 
       path = { type = "string", description = "Absolute path to the file", required = true },
     },
   },
-  render = {
-    header_style = "path",
-    body_format = "index",
-    always_annotate = true,
-  },
   header = function(input)
     return build_header(input.path)
   end,

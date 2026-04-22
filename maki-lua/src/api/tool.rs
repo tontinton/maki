@@ -252,13 +252,9 @@ fn parse_audience(audiences: Option<mlua::Table>) -> LuaResult<ToolAudience> {
 fn parse_render_hints(spec: &Table) -> Option<RawRenderHints> {
     let render: Table = spec.get("render").ok()?;
     Some(RawRenderHints {
-        output_lines: render.get::<usize>("output_lines").ok(),
-        output_keep: render.get::<String>("output_keep").ok(),
+        truncate_lines: render.get::<usize>("truncate_lines").ok(),
+        truncate_at: render.get::<String>("truncate_at").ok(),
         output_separator: render.get::<String>("output_separator").ok(),
-        skip_done_truncation: render.get::<bool>("skip_done_truncation").ok(),
-        header_style: render.get::<String>("header_style").ok(),
-        body_format: render.get::<String>("body_format").ok(),
-        always_annotate: render.get::<bool>("always_annotate").ok(),
     })
 }
 
