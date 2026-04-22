@@ -1,7 +1,7 @@
 use maki_agent::template::Vars;
 use maki_agent::tools::{DescriptionContext, ToolFilter, ToolRegistry};
-use serde_json::Value;
-use std::collections::HashMap;
+use serde_json::{Map, Value, json};
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
 const SECTIONS: &[(&str, &[&str])] = &[
@@ -16,6 +16,7 @@ const SECTIONS: &[(&str, &[&str])] = &[
             "glob",
             "grep",
             "find_symbol",
+            "index",
         ],
     ),
     (
@@ -26,6 +27,7 @@ const SECTIONS: &[(&str, &[&str])] = &[
         "Agent & Knowledge",
         &["task", "todo_write", "memory", "skill"],
     ),
+    ("Web", &["webfetch", "websearch"]),
 ];
 
 struct Param {
@@ -139,6 +141,140 @@ fn write_param_table(out: &mut String, params: &[Param]) {
     }
 }
 
+fn parse_lua_plugin(source: &str) -> Option<Value> {
+    let name = source
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("name = \"")?.strip_suffix("\","))?;
+
+    let desc = extract_lua_description(source)?;
+
+    let schema_start = source.find("schema = {")?;
+    let schema_block = &source[schema_start..];
+    let schema_end = find_matching_brace(schema_block, schema_block.find('{')?)?;
+    let schema_src = &schema_block[..=schema_end];
+
+    let mut properties = Map::new();
+    let mut required = Vec::new();
+
+    let props_start = schema_src.find("properties = {")?;
+    let props_block = &schema_src[props_start..];
+    let props_end = find_matching_brace(props_block, props_block.find('{')?)?;
+    let props_src = &props_block["properties = {".len()..props_end];
+
+    for line in props_src.lines() {
+        let line = line.trim();
+        let Some((pname, rest)) = line.split_once('=') else {
+            continue;
+        };
+        let pname = pname.trim();
+        if !rest.trim().starts_with('{') {
+            continue;
+        }
+
+        let ptype = extract_lua_field(rest, "type")?;
+        let pdesc = extract_lua_field(rest, "description").unwrap_or_default();
+        let is_required = rest.contains("required = true");
+
+        let prop = json!({ "type": ptype, "description": pdesc });
+        if is_required {
+            required.push(Value::String(pname.to_string()));
+        }
+        properties.insert(pname.to_string(), prop);
+    }
+
+    let schema = json!({
+        "type": "object",
+        "required": required,
+        "properties": properties,
+        "additionalProperties": false,
+    });
+
+    Some(json!({
+        "name": name,
+        "description": desc,
+        "input_schema": schema,
+    }))
+}
+
+fn extract_lua_description(source: &str) -> Option<String> {
+    if let Some(start) = source.find("description = [[") {
+        let after = &source[start + "description = [[".len()..];
+        let end = after.find("]]")?;
+        return Some(after[..end].trim().to_string());
+    }
+    let marker = "description = \"";
+    let start = source.find(marker)?;
+    let desc_block = &source[start..];
+    let mut parts = Vec::new();
+    for line in desc_block.lines() {
+        let trimmed = line.trim();
+        let quoted = trimmed
+            .strip_prefix(".. \"")
+            .or_else(|| trimmed.strip_prefix("description = \""));
+        if let Some(s) = quoted {
+            if let Some(end) = s.rfind('"') {
+                parts.push(unescape_lua_string(&s[..end]));
+            }
+        }
+        if !trimmed.contains("..") && trimmed.ends_with(',') {
+            break;
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(parts.join(""))
+}
+
+fn unescape_lua_string(s: &str) -> String {
+    s.replace("\\n", "\n")
+}
+
+fn find_matching_brace(s: &str, open: usize) -> Option<usize> {
+    let mut depth = 0;
+    for (i, ch) in s[open..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(open + i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn extract_lua_field(s: &str, field: &str) -> Option<String> {
+    let pattern = format!("{field} = \"");
+    let start = s.find(&pattern)?;
+    let after = &s[start + pattern.len()..];
+    let end = after.find('"')?;
+    Some(after[..end].to_string())
+}
+
+fn load_builtin_plugins() -> Vec<Value> {
+    let Ok(entries) = std::fs::read_dir("plugins") else {
+        return Vec::new();
+    };
+    let mut plugins: Vec<Value> = entries
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let path = e.path().join("init.lua");
+            let source = std::fs::read_to_string(&path).ok()?;
+            parse_lua_plugin(&source)
+        })
+        .collect();
+    plugins.sort_by(|a, b| {
+        let na = a.get("name").and_then(|n| n.as_str()).unwrap_or("");
+        let nb = b.get("name").and_then(|n| n.as_str()).unwrap_or("");
+        na.cmp(nb)
+    });
+    plugins
+}
+
 pub fn generate() -> String {
     let vars = Vars::new()
         .set("{cwd}", "<cwd>")
@@ -152,18 +288,24 @@ pub fn generate() -> String {
         },
         false,
     );
-    let tools: Vec<&Value> = defs
+    let plugin_defs = load_builtin_plugins();
+    let plugin_names: HashSet<&str> = plugin_defs
+        .iter()
+        .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
+        .collect();
+    let all_tools: Vec<&Value> = defs
         .as_array()
         .expect("definitions should be an array")
         .iter()
+        .chain(&plugin_defs)
         .collect();
 
-    let tool_map: HashMap<&str, &Value> = tools
+    let tool_map: HashMap<&str, &Value> = all_tools
         .iter()
         .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(|n| (n, *t)))
         .collect();
 
-    let total = tools.len();
+    let total = all_tools.len();
     let mut out = String::new();
     writeln!(out, "+++").unwrap();
     writeln!(out, "title = \"Tools\"").unwrap();
@@ -197,7 +339,11 @@ pub fn generate() -> String {
             let summary = first_paragraph(description);
 
             writeln!(out).unwrap();
-            writeln!(out, "### `{name}`").unwrap();
+            if plugin_names.contains(name) {
+                writeln!(out, "### `{name}` *(lua plugin)*").unwrap();
+            } else {
+                writeln!(out, "### `{name}`").unwrap();
+            }
             writeln!(out).unwrap();
             writeln!(out, "{summary}").unwrap();
             if *name == "find_symbol" {
