@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use flume::Sender;
+use maki_agent::RawRenderHints;
 use maki_agent::ToolOutput;
 use maki_agent::tools::Tool;
 use maki_agent::tools::schema::{ParamSchema, to_json_schema, try_from_json, validate};
@@ -31,6 +32,7 @@ pub(crate) struct PendingTool {
     pub(crate) handler_key: RegistryKey,
     pub(crate) summary_key: Option<RegistryKey>,
     pub(crate) permission_scope_field: Option<Arc<str>>,
+    pub(crate) render_hints: Option<RawRenderHints>,
 }
 
 pub(crate) type PendingTools = Arc<Mutex<Vec<PendingTool>>>;
@@ -228,6 +230,18 @@ fn parse_audience(audiences: Option<mlua::Table>) -> LuaResult<ToolAudience> {
     Ok(flags)
 }
 
+fn parse_render_hints(spec: &Table) -> Option<RawRenderHints> {
+    let render: Table = spec.get("render").ok()?;
+    Some(RawRenderHints {
+        header_style: render.get::<String>("header_style").ok(),
+        output_lines: render.get::<usize>("output_lines").ok(),
+        output_keep: render.get::<String>("output_keep").ok(),
+        output_separator: render.get::<String>("output_separator").ok(),
+        always_annotate: render.get::<bool>("always_annotate").ok(),
+        skip_done_truncation: render.get::<bool>("skip_done_truncation").ok(),
+    })
+}
+
 fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> LuaResult<()> {
     let name: String = spec
         .get("name")
@@ -280,6 +294,8 @@ fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> Lua
         .transpose()?;
     let name: Arc<str> = Arc::from(name.as_str());
 
+    let render_hints = parse_render_hints(spec);
+
     pending
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -291,6 +307,7 @@ fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> Lua
             handler_key,
             summary_key,
             permission_scope_field,
+            render_hints,
         });
 
     Ok(())

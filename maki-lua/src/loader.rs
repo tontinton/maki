@@ -5,6 +5,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use include_dir::{Dir, include_dir};
+use maki_agent::RawRenderHints;
 use maki_agent::tools::ToolRegistry;
 use maki_config::PluginsConfig;
 
@@ -44,6 +45,7 @@ static BUNDLED_DIRS: LazyLock<&'static [&'static Dir<'static>]> = LazyLock::new(
 
 pub struct PluginHost {
     inner: Option<LuaThread>,
+    render_hints: Vec<(Arc<str>, RawRenderHints)>,
 }
 
 impl Drop for PluginHost {
@@ -71,11 +73,17 @@ impl Drop for PluginHost {
 impl PluginHost {
     pub fn new(config: &PluginsConfig, registry: Arc<ToolRegistry>) -> Result<Self, PluginError> {
         if !config.enabled {
-            return Ok(Self { inner: None });
+            return Ok(Self {
+                inner: None,
+                render_hints: Vec::new(),
+            });
         }
 
         let lua = runtime::spawn(registry, *BUNDLED_DIRS)?;
-        let host = Self { inner: Some(lua) };
+        let mut host = Self {
+            inner: Some(lua),
+            render_hints: Vec::new(),
+        };
 
         for builtin in &config.builtins {
             let dir = match BUNDLED_PLUGINS.iter().find(|p| p.name == builtin.as_str()) {
@@ -118,12 +126,12 @@ impl PluginHost {
             .ok_or(PluginError::HostDead)
     }
 
-    fn load_source_named(
+    fn send_load(
         &self,
         name: Arc<str>,
         source: String,
         plugin_dir: Option<PathBuf>,
-    ) -> Result<(), PluginError> {
+    ) -> Result<Vec<(Arc<str>, RawRenderHints)>, PluginError> {
         let tx = self.tx()?;
         let (reply_tx, reply_rx) = flume::bounded(1);
         tx.send(Request::LoadSource {
@@ -134,6 +142,17 @@ impl PluginHost {
         })
         .map_err(|_| PluginError::HostDead)?;
         reply_rx.recv().map_err(|_| PluginError::HostDead)?
+    }
+
+    fn load_source_named(
+        &mut self,
+        name: Arc<str>,
+        source: String,
+        plugin_dir: Option<PathBuf>,
+    ) -> Result<(), PluginError> {
+        let hints = self.send_load(name, source, plugin_dir)?;
+        self.render_hints.extend(hints);
+        Ok(())
     }
 
     pub fn unload(&self, plugin: &str) -> Result<(), PluginError> {
@@ -149,7 +168,12 @@ impl PluginHost {
     }
 
     pub fn load_source(&self, name: &str, source: &str) -> Result<(), PluginError> {
-        self.load_source_named(Arc::from(name), source.to_owned(), None)
+        self.send_load(Arc::from(name), source.to_owned(), None)?;
+        Ok(())
+    }
+
+    pub fn drain_render_hints(&mut self) -> Vec<(Arc<str>, RawRenderHints)> {
+        std::mem::take(&mut self.render_hints)
     }
 }
 

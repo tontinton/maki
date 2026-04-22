@@ -10,7 +10,7 @@ use crossterm::event::{
 use maki_agent::command::CustomCommand;
 use maki_agent::permissions::PermissionManager;
 use maki_agent::skill::Skill;
-use maki_agent::{AgentConfig, CancelToken, McpCommand};
+use maki_agent::{AgentConfig, CancelToken, McpCommand, RawRenderHints};
 use maki_config::UiConfig;
 use maki_providers::Timeouts;
 use maki_providers::provider::{Provider, fetch_all_models, from_model};
@@ -47,6 +47,7 @@ pub struct EventLoopParams {
     pub permissions: Arc<PermissionManager>,
     pub timeouts: Timeouts,
     pub exit_on_done: bool,
+    pub plugin_render_hints: Vec<(Arc<str>, RawRenderHints)>,
     #[cfg(feature = "demo")]
     pub demo: bool,
 }
@@ -157,6 +158,7 @@ impl<'t> EventLoop<'t> {
             permissions,
             timeouts,
             exit_on_done,
+            plugin_render_hints,
             #[cfg(feature = "demo")]
             demo,
         } = params;
@@ -211,6 +213,10 @@ impl<'t> EventLoop<'t> {
         }
 
         handles.apply_to_app(&mut app);
+
+        if !plugin_render_hints.is_empty() {
+            app.main_chat().register_plugin_hints(plugin_render_hints);
+        }
 
         if resumed {
             restore_session(&mut app, &handles);

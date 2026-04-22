@@ -687,13 +687,13 @@ fn scroll_clamps_to_max_scroll() {
     assert_eq!(panel.scroll_top, max);
 }
 
-#[test]
-fn parse_batch_inner_id_cases() {
-    assert_eq!(parse_batch_inner_id("b1__0"), Some(("b1", 0)));
-    assert_eq!(parse_batch_inner_id("b1__2"), Some(("b1", 2)));
-    assert_eq!(parse_batch_inner_id("a__b__1"), Some(("a__b", 1)));
-    assert_eq!(parse_batch_inner_id("no_separator"), None);
-    assert_eq!(parse_batch_inner_id("b1__notnum"), None);
+#[test_case("b1__0",          Some(("b1", 0))   ; "simple")]
+#[test_case("b1__2",          Some(("b1", 2))   ; "higher_index")]
+#[test_case("a__b__1",        Some(("a__b", 1)) ; "nested_separators")]
+#[test_case("no_separator",   None               ; "no_double_underscore")]
+#[test_case("b1__notnum",     None               ; "non_numeric_suffix")]
+fn parse_batch_inner_id_cases(input: &str, expected: Option<(&str, usize)>) {
+    assert_eq!(parse_batch_inner_id(input), expected);
 }
 
 #[test_case("bash", 1, 1 ; "known_tool_creates_message")]

@@ -378,7 +378,7 @@ fn run() -> Result<()> {
             install_panic_log_hook();
             let skills = discover(cli.no_skills);
             let commands = discover_cmds(cli.no_commands);
-            let _plugin_host =
+            let mut _plugin_host =
                 PluginHost::new(&config.plugins, Arc::clone(ToolRegistry::native_arc()))
                     .context("initialize lua plugin host")?;
             if cli.print {
@@ -432,6 +432,7 @@ fn run() -> Result<()> {
                         )),
                         timeouts,
                         exit_on_done: cli.exit_on_done,
+                        plugin_render_hints: _plugin_host.drain_render_hints(),
                         #[cfg(feature = "demo")]
                         demo: cli.demo,
                     },

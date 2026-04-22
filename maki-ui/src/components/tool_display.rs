@@ -1,3 +1,6 @@
+use super::render_hints::{
+    BodyFormat, HeaderStyle, OutputSeparator, RenderHintsRegistry, ToolRenderHints,
+};
 use super::status_bar::format_tokens;
 use super::{DisplayMessage, ToolStatus};
 
@@ -21,11 +24,6 @@ use jiff::Timestamp;
 use jiff::tz::TimeZone;
 
 use crate::markdown::{Keep, should_truncate, text_to_lines, truncate_output, truncation_notice};
-use maki_agent::tools::{
-    BASH_TOOL_NAME, CODE_EXECUTION_TOOL_NAME, EDIT_TOOL_NAME, GLOB_TOOL_NAME, GREP_TOOL_NAME,
-    INDEX_TOOL_NAME, MEMORY_TOOL_NAME, MULTIEDIT_TOOL_NAME, READ_TOOL_NAME, TASK_TOOL_NAME,
-    WEBFETCH_TOOL_NAME, WEBSEARCH_TOOL_NAME, WRITE_TOOL_NAME,
-};
 use maki_agent::{BatchToolEntry, BatchToolStatus, InstructionBlock, ToolInput, ToolOutput};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
@@ -33,65 +31,25 @@ use ratatui::text::{Line, Span};
 use crate::highlight::highlight_regex_inline;
 use crate::render_worker::RenderWorker;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ToolKind {
-    Bash,
-    CodeExecution,
-    Task,
-    Index,
-    Grep,
-    Read,
-    Write,
-    WebFetch,
-    WebSearch,
-    Other,
-}
-
-impl ToolKind {
-    pub fn from_name(name: &str) -> Self {
-        match name {
-            BASH_TOOL_NAME => Self::Bash,
-            CODE_EXECUTION_TOOL_NAME => Self::CodeExecution,
-            TASK_TOOL_NAME => Self::Task,
-            INDEX_TOOL_NAME => Self::Index,
-            GREP_TOOL_NAME => Self::Grep,
-            READ_TOOL_NAME => Self::Read,
-            WRITE_TOOL_NAME | EDIT_TOOL_NAME | MULTIEDIT_TOOL_NAME | MEMORY_TOOL_NAME => {
-                Self::Write
-            }
-            WEBFETCH_TOOL_NAME => Self::WebFetch,
-            WEBSEARCH_TOOL_NAME => Self::WebSearch,
-            _ => Self::Other,
-        }
-    }
-
-    pub fn output_limits(self, tol: &ToolOutputLines) -> OutputLimits {
-        let max_lines = match self {
-            Self::Bash => tol.bash,
-            Self::CodeExecution => tol.code_execution,
-            Self::Task => tol.task,
-            Self::Index => tol.index,
-            Self::Grep => tol.grep,
-            Self::Read => tol.read,
-            Self::Write => tol.write,
-            Self::WebFetch | Self::WebSearch => tol.web,
-            Self::Other => tol.other,
-        };
-        let keep = match self {
-            Self::Bash | Self::CodeExecution => Keep::Tail,
-            _ => Keep::Head,
-        };
-        OutputLimits { max_lines, keep }
-    }
-
-    fn always_annotate(self) -> bool {
-        matches!(self, Self::WebFetch | Self::WebSearch | Self::Index)
-    }
-}
-
 pub(crate) struct OutputLimits {
     pub max_lines: usize,
     pub keep: Keep,
+}
+
+pub(crate) fn output_limits_from_hints(
+    name: &str,
+    hints: &ToolRenderHints,
+    tol: &ToolOutputLines,
+) -> OutputLimits {
+    let config_value = tol.get(name);
+    let max_lines = match hints.output_lines {
+        Some(hint) if config_value == tol.other => hint,
+        _ => config_value,
+    };
+    OutputLimits {
+        max_lines,
+        keep: hints.output_keep.into(),
+    }
 }
 
 pub const TOOL_INDICATOR: &str = "● ";
@@ -107,7 +65,7 @@ const PLAIN_ANNOTATION_THRESHOLD: usize = 10;
 const BATCH_INDENT: &str = "  ";
 const BATCH_CONTENT_INDENT: &str = "    ";
 
-pub(crate) fn tool_output_annotation(output: &ToolOutput, kind: ToolKind) -> Option<String> {
+pub(crate) fn tool_output_annotation(output: &ToolOutput, always_annotate: bool) -> Option<String> {
     match output {
         ToolOutput::ReadCode {
             lines, total_lines, ..
@@ -138,7 +96,7 @@ pub(crate) fn tool_output_annotation(output: &ToolOutput, kind: ToolKind) -> Opt
         }
         ToolOutput::Plain(text) => {
             let n = text.lines().count();
-            if kind.always_annotate() || n > PLAIN_ANNOTATION_THRESHOLD {
+            if always_annotate || n > PLAIN_ANNOTATION_THRESHOLD {
                 Some(format!("{n} lines"))
             } else {
                 None
@@ -193,16 +151,14 @@ fn style_grep_header(header: &str) -> Vec<Span<'static>> {
     spans
 }
 
-fn style_tool_header(tool: &str, header: &str) -> Vec<Span<'static>> {
-    match tool {
-        READ_TOOL_NAME | EDIT_TOOL_NAME | WRITE_TOOL_NAME | MULTIEDIT_TOOL_NAME
-        | INDEX_TOOL_NAME => {
+fn style_tool_header(header_style: &HeaderStyle, header: &str) -> Vec<Span<'static>> {
+    match header_style {
+        HeaderStyle::Path => {
             vec![Span::styled(header.to_owned(), theme::current().tool_path)]
         }
-        BASH_TOOL_NAME | GLOB_TOOL_NAME => style_command_with_path(header),
-        GREP_TOOL_NAME => style_grep_header(header),
-        CODE_EXECUTION_TOOL_NAME => vec![Span::styled(header.to_owned(), theme::current().tool)],
-        _ => vec![Span::styled(header.to_owned(), theme::current().tool)],
+        HeaderStyle::Command => style_command_with_path(header),
+        HeaderStyle::Grep => style_grep_header(header),
+        HeaderStyle::Plain => vec![Span::styled(header.to_owned(), theme::current().tool)],
     }
 }
 
@@ -493,6 +449,9 @@ struct ToolLineBuilder {
     separator_line: Option<usize>,
     limits: RenderLimits,
     keep: Keep,
+    header_style: HeaderStyle,
+    body_format: BodyFormat,
+    output_separator: OutputSeparator,
 }
 
 impl ToolLineBuilder {
@@ -501,6 +460,7 @@ impl ToolLineBuilder {
         outer_indent: &'static str,
         expanded: SectionFlags,
         output_limits: OutputLimits,
+        hints: &ToolRenderHints,
     ) -> Self {
         let limits = RenderLimits::new(expanded, output_limits.max_lines);
         Self {
@@ -514,6 +474,9 @@ impl ToolLineBuilder {
             separator_line: None,
             limits,
             keep: output_limits.keep,
+            header_style: hints.header_style,
+            body_format: hints.body_format,
+            output_separator: hints.output_separator,
         }
     }
 
@@ -522,7 +485,7 @@ impl ToolLineBuilder {
             format!("{tool_name}> "),
             theme::current().tool_prefix,
         )];
-        spans.extend(style_tool_header(tool_name, header));
+        spans.extend(style_tool_header(&self.header_style, header));
         let mut copy = format!("{tool_name}> {header}");
         if let Some(ann) = annotation {
             spans.push(Span::styled(
@@ -578,26 +541,21 @@ impl ToolLineBuilder {
         }
     }
 
-    fn push_resolved_output(
-        &mut self,
-        resolved: &ResolvedOutput<'_>,
-        kind: ToolKind,
-        is_done: bool,
-    ) {
+    fn push_resolved_output(&mut self, resolved: &ResolvedOutput<'_>, is_done: bool) {
         let has_code = self.content_range.1 > self.content_range.0;
 
         if resolved.text.is_none() {
-            if has_code && kind == ToolKind::Bash {
+            if has_code && self.output_separator == OutputSeparator::Bash {
                 self.push_bash_output_label(TOOL_BODY_INDENT, is_done, false);
             }
             return;
         }
 
         if has_code {
-            if kind == ToolKind::Bash {
+            if self.output_separator == OutputSeparator::Bash {
                 self.push_bash_output_label(TOOL_BODY_INDENT, is_done, resolved.text.is_some());
             } else if resolved.text.is_some() {
-                self.push_code_output_separator(kind, TOOL_BODY_INDENT);
+                self.push_code_output_separator(TOOL_BODY_INDENT);
             }
         }
 
@@ -605,10 +563,10 @@ impl ToolLineBuilder {
             if matches!(self.keep, Keep::Tail) {
                 self.push_truncation_count(resolved.skipped);
             }
-            match kind {
-                ToolKind::Task => self.push_markdown_body(text),
-                ToolKind::Index => self.push_index_body(text),
-                _ => push_text_lines(&mut self.lines, text, TOOL_BODY_INDENT),
+            match self.body_format {
+                BodyFormat::Markdown => self.push_markdown_body(text),
+                BodyFormat::Index => self.push_index_body(text),
+                BodyFormat::Plain => push_text_lines(&mut self.lines, text, TOOL_BODY_INDENT),
             }
             if let Some(full) = &resolved.full_text {
                 self.push_search_text(full);
@@ -669,8 +627,8 @@ impl ToolLineBuilder {
         index_highlight::push_index_lines(&mut self.lines, text, TOOL_BODY_INDENT);
     }
 
-    fn push_code_output_separator(&mut self, kind: ToolKind, indent: &str) {
-        if kind == ToolKind::CodeExecution {
+    fn push_code_output_separator(&mut self, indent: &str) {
+        if self.output_separator == OutputSeparator::CodeExecution {
             self.separator_line = Some(self.lines.len());
             self.lines.push(Line::from(Span::styled(
                 format!("{indent}{}", CODE_EXECUTION_OUTPUT_SEPARATOR),
@@ -736,16 +694,17 @@ pub fn build_tool_lines(
     width: u16,
     expanded: SectionFlags,
     tool_output_lines: &ToolOutputLines,
+    registry: &RenderHintsRegistry,
 ) -> ToolLines {
     let tool_name = msg.role.tool_name().unwrap_or("?");
-    let kind = ToolKind::from_name(tool_name);
-    let limits = kind.output_limits(tool_output_lines);
+    let hints = registry.get(tool_name);
+    let limits = output_limits_from_hints(tool_name, hints, tool_output_lines);
     let (header, body) = match msg.text.split_once('\n') {
         Some((h, b)) => (h, Some(b)),
         None => (msg.text.as_str(), None),
     };
 
-    let mut b = ToolLineBuilder::new(width, "", expanded, limits);
+    let mut b = ToolLineBuilder::new(width, "", expanded, limits, hints);
     b.push_header(tool_name, header, msg.annotation.as_deref());
     b.prepend_indicator(status.into(), started_at);
     b.push_code_content(msg.tool_input.as_deref(), msg.tool_output.as_deref());
@@ -758,7 +717,7 @@ pub fn build_tool_lines(
         b.limits,
         b.keep,
     );
-    b.push_resolved_output(&resolved, kind, is_done);
+    b.push_resolved_output(&resolved, is_done);
     b.finish(
         msg.tool_input.clone(),
         msg.tool_output.clone(),
@@ -778,19 +737,20 @@ pub fn build_batch_entry_lines(
     width: u16,
     expanded: SectionFlags,
     tool_output_lines: &ToolOutputLines,
+    registry: &RenderHintsRegistry,
 ) -> ToolLines {
-    let kind = ToolKind::from_name(&entry.tool);
-    let limits = kind.output_limits(tool_output_lines);
+    let hints = registry.get(&entry.tool);
+    let limits = output_limits_from_hints(&entry.tool, hints, tool_output_lines);
     let mut annotation = entry.annotation.clone();
     if let Some(suffix) = entry
         .output
         .as_ref()
-        .and_then(|o| tool_output_annotation(o, kind))
+        .and_then(|o| tool_output_annotation(o, hints.always_annotate))
     {
         append_annotation(&mut annotation, &suffix);
     }
 
-    let mut b = ToolLineBuilder::new(width, BATCH_INDENT, expanded, limits);
+    let mut b = ToolLineBuilder::new(width, BATCH_INDENT, expanded, limits, hints);
     b.push_header(&entry.tool, &entry.summary, annotation.as_deref());
     b.prepend_indicator(entry.status.into(), started_at);
     b.push_code_content(entry.input.as_ref(), entry.output.as_ref());
@@ -799,7 +759,7 @@ pub fn build_batch_entry_lines(
         BatchToolStatus::Success | BatchToolStatus::Error
     );
     let resolved = resolve_output(entry.output.as_ref(), None, None, 0, b.limits, b.keep);
-    b.push_resolved_output(&resolved, kind, is_done);
+    b.push_resolved_output(&resolved, is_done);
     b.prepend_separator(index);
     b.finish(
         entry.input.clone().map(Arc::new),
@@ -843,7 +803,13 @@ pub fn build_instructions_lines(
         script: false,
         output: expanded,
     };
-    let mut b = ToolLineBuilder::new(width, outer_indent, exp, limits);
+    let mut b = ToolLineBuilder::new(
+        width,
+        outer_indent,
+        exp,
+        limits,
+        &ToolRenderHints::default(),
+    );
     b.push_header("load", header, annotation.as_deref());
     b.prepend_indicator(Indicator::Success, Instant::now());
 
@@ -879,13 +845,18 @@ mod tests {
     use super::*;
 
     const TOL: ToolOutputLines = ToolOutputLines::DEFAULT;
+    use crate::components::render_hints::RenderHintsRegistry;
     use crate::components::{DisplayRole, ToolRole};
     use crate::markdown::TRUNCATION_PREFIX;
-    use maki_agent::tools::{BASH_TOOL_NAME, READ_TOOL_NAME, WRITE_TOOL_NAME};
+    use maki_agent::tools::{BASH_TOOL_NAME, INDEX_TOOL_NAME, READ_TOOL_NAME, TASK_TOOL_NAME};
     use maki_agent::{
         BatchToolEntry, BatchToolStatus, GrepFileEntry, GrepMatchGroup, ToolInput, ToolOutput,
     };
     use test_case::test_case;
+
+    fn reg() -> RenderHintsRegistry {
+        RenderHintsRegistry::new()
+    }
 
     fn exp(both: bool) -> SectionFlags {
         SectionFlags {
@@ -956,6 +927,7 @@ mod tests {
             80,
             SectionFlags::default(),
             &TOL,
+            &reg(),
         );
         assert_eq!(tl.highlight.is_some(), expect_highlight);
         if let Some(hl) = &tl.highlight {
@@ -975,13 +947,13 @@ mod tests {
 
     #[test]
     fn style_tool_header_path_first() {
-        let spans = style_tool_header(WRITE_TOOL_NAME, "src/main.rs");
+        let spans = style_tool_header(&HeaderStyle::Path, "src/main.rs");
         assert_eq!(spans_text(&spans), "src/main.rs");
     }
 
     #[test]
     fn style_tool_header_in_path() {
-        let spans = style_tool_header(BASH_TOOL_NAME, "echo hi in /tmp");
+        let spans = style_tool_header(&HeaderStyle::Command, "echo hi in /tmp");
         let text = spans_text(&spans);
         assert!(text.contains("echo hi"));
         assert!(has_styled_span(&spans, "/tmp", theme::current().tool_path));
@@ -990,7 +962,7 @@ mod tests {
     #[test]
     fn style_tool_header_truncates_json_in_path() {
         let spans = style_tool_header(
-            GREP_TOOL_NAME,
+            &HeaderStyle::Grep,
             "STRIKETHROUGH_STYLE in /home/tony/c/maki2\", \"pattern\": \"STRIKETHROUGH_STYLE\"}",
         );
         let text = spans_text(&spans);
@@ -1038,6 +1010,7 @@ mod tests {
             80,
             SectionFlags::default(),
             &TOL,
+            &reg(),
         );
         let text = lines_text(&tl);
         assert!(text.contains("line1"));
@@ -1061,6 +1034,7 @@ mod tests {
             80,
             SectionFlags::default(),
             &TOL,
+            &reg(),
         );
         assert_eq!(
             line_has_styled(&tl, BASH_OUTPUT_SEPARATOR, theme::current().tool_dim),
@@ -1079,6 +1053,7 @@ mod tests {
             80,
             SectionFlags::default(),
             &TOL,
+            &reg(),
         );
         assert!(line_has_styled(&tl, label, theme::current().tool_dim));
     }
@@ -1091,8 +1066,15 @@ mod tests {
             code_input(),
             Some(ToolOutput::Plain("hello".into())),
         );
-        let tl =
-            build_batch_entry_lines(&entry, 0, Instant::now(), 80, SectionFlags::default(), &TOL);
+        let tl = build_batch_entry_lines(
+            &entry,
+            0,
+            Instant::now(),
+            80,
+            SectionFlags::default(),
+            &TOL,
+            &reg(),
+        );
         assert!(line_has_styled(
             &tl,
             BASH_OUTPUT_SEPARATOR,
@@ -1139,6 +1121,7 @@ mod tests {
             80,
             SectionFlags::default(),
             &TOL,
+            &reg(),
         );
         let span_count_before = tl.lines[0].spans.len();
         append_right_info(&mut tl.lines[0], None, Some("12:34:56"), width);
@@ -1166,16 +1149,30 @@ mod tests {
             }),
         );
         entry.summary = "src/main.rs".into();
-        let tl =
-            build_batch_entry_lines(&entry, 0, Instant::now(), 80, SectionFlags::default(), &TOL);
+        let tl = build_batch_entry_lines(
+            &entry,
+            0,
+            Instant::now(),
+            80,
+            SectionFlags::default(),
+            &TOL,
+            &reg(),
+        );
         assert!(lines_text(&tl).contains("(42 lines)"));
     }
 
     #[test]
     fn batch_entry_code_input_rendered() {
         let entry = batch_entry("bash", BatchToolStatus::Success, code_input(), None);
-        let tl =
-            build_batch_entry_lines(&entry, 0, Instant::now(), 80, SectionFlags::default(), &TOL);
+        let tl = build_batch_entry_lines(
+            &entry,
+            0,
+            Instant::now(),
+            80,
+            SectionFlags::default(),
+            &TOL,
+            &reg(),
+        );
         assert!(lines_text(&tl).contains("echo hi"));
     }
 
@@ -1184,18 +1181,39 @@ mod tests {
     #[test_case(BatchToolStatus::Success,    &[]     ; "success_no_spinner")]
     fn batch_entry_spinner(status: BatchToolStatus, expected: &[usize]) {
         let entry = batch_entry("bash", status, None, None);
-        let tl =
-            build_batch_entry_lines(&entry, 0, Instant::now(), 80, SectionFlags::default(), &TOL);
+        let tl = build_batch_entry_lines(
+            &entry,
+            0,
+            Instant::now(),
+            80,
+            SectionFlags::default(),
+            &TOL,
+            &reg(),
+        );
         assert_eq!(tl.spinner_lines, expected);
     }
 
     #[test]
     fn batch_entry_separator_on_nonzero_index() {
         let entry = batch_entry("bash", BatchToolStatus::Success, None, None);
-        let first =
-            build_batch_entry_lines(&entry, 0, Instant::now(), 80, SectionFlags::default(), &TOL);
-        let second =
-            build_batch_entry_lines(&entry, 1, Instant::now(), 80, SectionFlags::default(), &TOL);
+        let first = build_batch_entry_lines(
+            &entry,
+            0,
+            Instant::now(),
+            80,
+            SectionFlags::default(),
+            &TOL,
+            &reg(),
+        );
+        let second = build_batch_entry_lines(
+            &entry,
+            1,
+            Instant::now(),
+            80,
+            SectionFlags::default(),
+            &TOL,
+            &reg(),
+        );
         assert!(second.lines.len() > first.lines.len());
         assert!(spans_text(&second.lines[1].spans).contains(TOOL_SEPARATOR));
     }
@@ -1208,8 +1226,15 @@ mod tests {
             None,
             Some(ToolOutput::Plain("hello world".into())),
         );
-        let tl =
-            build_batch_entry_lines(&entry, 0, Instant::now(), 80, SectionFlags::default(), &TOL);
+        let tl = build_batch_entry_lines(
+            &entry,
+            0,
+            Instant::now(),
+            80,
+            SectionFlags::default(),
+            &TOL,
+            &reg(),
+        );
         assert!(lines_text(&tl).contains("hello world"));
     }
 
@@ -1224,6 +1249,7 @@ mod tests {
             80,
             SectionFlags::default(),
             &TOL,
+            &reg(),
         );
         let text = lines_text(&tl);
         assert!(text.contains("(2m timeout)"));
@@ -1233,8 +1259,15 @@ mod tests {
     fn batch_entry_stored_annotation_rendered() {
         let mut entry = batch_entry("task", BatchToolStatus::Success, None, None);
         entry.annotation = Some("anthropic/claude-haiku-4-20250414".into());
-        let tl =
-            build_batch_entry_lines(&entry, 0, Instant::now(), 80, SectionFlags::default(), &TOL);
+        let tl = build_batch_entry_lines(
+            &entry,
+            0,
+            Instant::now(),
+            80,
+            SectionFlags::default(),
+            &TOL,
+            &reg(),
+        );
         assert!(lines_text(&tl).contains("(anthropic/claude-haiku-4-20250414)"));
     }
 
@@ -1250,8 +1283,9 @@ mod tests {
     #[test_case("glob",  ToolOutput::GlobResult { files: vec![] },            None                ; "glob_empty_no_annotation")]
     #[test_case("edit",  ToolOutput::Diff { path: "a.rs".into(), before: String::new(), after: String::new(), summary: "ok".into() }, None ; "diff_no_annotation")]
     fn annotation_cases(tool: &str, output: ToolOutput, expected: Option<&str>) {
+        let r = reg();
         assert_eq!(
-            tool_output_annotation(&output, ToolKind::from_name(tool)).as_deref(),
+            tool_output_annotation(&output, r.get(tool).always_annotate).as_deref(),
             expected
         );
     }
@@ -1266,6 +1300,7 @@ mod tests {
             80,
             SectionFlags::default(),
             &TOL,
+            &reg(),
         );
         let text = lines_text(&tl);
         assert!(text.contains("bold"));
@@ -1317,6 +1352,7 @@ mod tests {
             80,
             SectionFlags::default(),
             &TOL,
+            &reg(),
         )
     }
 
@@ -1362,6 +1398,7 @@ mod tests {
             width,
             SectionFlags::default(),
             &TOL,
+            &reg(),
         );
         assert_hr_fits(&tl, width);
     }
@@ -1382,6 +1419,7 @@ mod tests {
             width,
             SectionFlags::default(),
             &TOL,
+            &reg(),
         );
         assert_hr_fits(&tl, width);
     }
@@ -1416,6 +1454,7 @@ mod tests {
             80,
             SectionFlags::default(),
             &TOL,
+            &reg(),
         );
         let text = lines_text(&tl);
         assert!(text.contains("line_0"));
@@ -1434,6 +1473,7 @@ mod tests {
             80,
             SectionFlags::default(),
             &TOL,
+            &reg(),
         );
         let t = theme::current();
         assert!(line_has_styled(&tl, "imports:", t.index_section));
@@ -1482,34 +1522,41 @@ mod tests {
         tool: &str,
         expect_text: bool,
     ) {
-        let kind = ToolKind::from_name(tool);
-        let output_limits = kind.output_limits(&TOL);
-        let limits = RenderLimits::new(SectionFlags::default(), output_limits.max_lines);
-        let resolved = resolve_output(output.as_ref(), body, None, 0, limits, output_limits.keep);
+        let r = reg();
+        let hints = r.get(tool);
+        let ol = output_limits_from_hints(tool, hints, &TOL);
+        let limits = RenderLimits::new(SectionFlags::default(), ol.max_lines);
+        let resolved = resolve_output(output.as_ref(), body, None, 0, limits, ol.keep);
         assert_eq!(resolved.text.is_some(), expect_text);
     }
 
     #[test]
     fn resolve_output_pre_truncated_forwarded() {
-        let output_limits = ToolKind::Bash.output_limits(&TOL);
-        let limits = RenderLimits::new(SectionFlags::default(), output_limits.max_lines);
-        let resolved = resolve_output(None, Some("short"), None, 42, limits, output_limits.keep);
+        let r = reg();
+        let hints = r.get("bash");
+        let ol = output_limits_from_hints("bash", hints, &TOL);
+        let limits = RenderLimits::new(SectionFlags::default(), ol.max_lines);
+        let resolved = resolve_output(None, Some("short"), None, 42, limits, ol.keep);
         assert_eq!(resolved.skipped, 42);
     }
 
     #[test]
     fn resolve_output_truncation_overrides_pre_truncated() {
         let long = n_lines(200);
-        let output_limits = ToolKind::Bash.output_limits(&TOL);
-        let limits = RenderLimits::new(SectionFlags::default(), output_limits.max_lines);
-        let resolved = resolve_output(None, Some(&long), None, 5, limits, output_limits.keep);
+        let r = reg();
+        let hints = r.get("bash");
+        let ol = output_limits_from_hints("bash", hints, &TOL);
+        let limits = RenderLimits::new(SectionFlags::default(), ol.max_lines);
+        let resolved = resolve_output(None, Some(&long), None, 5, limits, ol.keep);
         assert!(resolved.skipped > 5);
     }
 
     fn bash_output_msg(line_count: usize, live: bool) -> DisplayMessage {
         let full_body = n_lines(line_count);
-        let limits = ToolKind::Bash.output_limits(&TOL);
-        let tr = truncate_output(&full_body, limits.max_lines, limits.keep);
+        let r = reg();
+        let hints = r.get("bash");
+        let ol = output_limits_from_hints("bash", hints, &TOL);
+        let tr = truncate_output(&full_body, ol.max_lines, ol.keep);
         let text = if tr.kept.is_empty() {
             "header".into()
         } else {
@@ -1553,6 +1600,7 @@ mod tests {
             80,
             exp(false),
             &TOL,
+            &reg(),
         );
         let expanded = build_tool_lines(
             &msg,
@@ -1561,6 +1609,7 @@ mod tests {
             80,
             exp(true),
             &TOL,
+            &reg(),
         );
         let collapsed_text = lines_text(&collapsed);
         let expanded_text = lines_text(&expanded);
@@ -1588,6 +1637,7 @@ mod tests {
             80,
             exp(expanded),
             &TOL,
+            &reg(),
         );
         let text = lines_text(&tl);
         assert_eq!(tl.truncation.any(), expect_truncation);
@@ -1615,6 +1665,7 @@ mod tests {
             80,
             exp(expanded),
             &TOL,
+            &reg(),
         );
         assert_eq!(tl.truncation.any(), expect_truncation);
         let text = lines_text(&tl);
@@ -1688,6 +1739,7 @@ mod tests {
             80,
             SectionFlags::default(),
             &TOL,
+            &reg(),
         );
         let text = lines_text(&tl);
         assert!(
@@ -1724,5 +1776,25 @@ mod tests {
                 .any(|l| l.spans.iter().any(|s| s.content.contains('─'))),
             "batch instruction should have separator"
         );
+    }
+
+    #[test]
+    fn output_limits_plugin_hint_wins_over_config_other() {
+        let hints = ToolRenderHints {
+            output_lines: Some(50),
+            ..Default::default()
+        };
+        let ol = output_limits_from_hints("my_lua_tool", &hints, &TOL);
+        assert_eq!(ol.max_lines, 50);
+    }
+
+    #[test]
+    fn output_limits_per_tool_config_wins_over_plugin_hint() {
+        let hints = ToolRenderHints {
+            output_lines: Some(50),
+            ..Default::default()
+        };
+        let ol = output_limits_from_hints("bash", &hints, &TOL);
+        assert_eq!(ol.max_lines, TOL.bash);
     }
 }

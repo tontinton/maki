@@ -510,6 +510,16 @@ pub enum AgentEvent {
     },
 }
 
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RawRenderHints {
+    pub header_style: Option<String>,
+    pub output_lines: Option<usize>,
+    pub output_keep: Option<String>,
+    pub output_separator: Option<String>,
+    pub always_annotate: Option<bool>,
+    pub skip_done_truncation: Option<bool>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct TurnCompleteEvent {
     pub message: Message,

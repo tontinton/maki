@@ -8,10 +8,12 @@ use self::render::RenderCursor;
 use self::segment::{Segment, SegmentCache, wrapped_line_count};
 use self::selection::parse_batch_inner_id;
 
+use super::render_hints::{RenderHintsRegistry, ToolRenderHints};
 use super::tool_display::{
-    ToolKind, ToolLines, append_annotation, append_right_info, assistant_style,
-    build_batch_entry_lines, build_instructions_lines, build_tool_lines, done_style, error_style,
-    format_timestamp_now, thinking_style, tool_output_annotation, truncate_to_header, user_style,
+    ToolLines, append_annotation, append_right_info, assistant_style, build_batch_entry_lines,
+    build_instructions_lines, build_tool_lines, done_style, error_style, format_timestamp_now,
+    output_limits_from_hints, thinking_style, tool_output_annotation, truncate_to_header,
+    user_style,
 };
 use super::{
     DisplayMessage, DisplayRole, ToolRole, ToolStatus, apply_scroll_delta, code_view::SectionFlags,
@@ -31,10 +33,10 @@ use std::time::Instant;
 
 use super::scrollbar::render_vertical_scrollbar;
 use super::streaming_content::StreamingContent;
-use maki_agent::tools::{WEBFETCH_TOOL_NAME, native_static_name};
+use maki_agent::tools::native_static_name;
 use maki_agent::{
-    BatchToolEntry, BatchToolStatus, InstructionBlock, NO_FILES_FOUND, ToolDoneEvent, ToolOutput,
-    ToolStartEvent,
+    BatchToolEntry, BatchToolStatus, InstructionBlock, NO_FILES_FOUND, RawRenderHints,
+    ToolDoneEvent, ToolOutput, ToolStartEvent,
 };
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -58,6 +60,7 @@ pub struct MessagesPanel {
     accent: ColorTransition,
     expanded_tools: HashMap<String, SectionFlags>,
     tool_output_lines: ToolOutputLines,
+    render_hints: RenderHintsRegistry,
 }
 
 impl MessagesPanel {
@@ -93,6 +96,7 @@ impl MessagesPanel {
             accent: ColorTransition::new(theme::current().mode_build),
             expanded_tools: HashMap::new(),
             tool_output_lines: ui_config.tool_output_lines,
+            render_hints: RenderHintsRegistry::new(),
         }
     }
 
@@ -105,6 +109,13 @@ impl MessagesPanel {
         self.cache.clear();
         self.expanded_tools.clear();
         self.highlight_segment = None;
+    }
+
+    pub fn register_plugin_hints(&mut self, tools: Vec<(Arc<str>, RawRenderHints)>) {
+        for (name, raw) in tools {
+            self.render_hints
+                .register(name, ToolRenderHints::from_raw(&raw));
+        }
     }
 
     pub fn thinking_delta(&mut self, text: &str) {
@@ -168,7 +179,8 @@ impl MessagesPanel {
             return;
         };
         let tool_name = msg.role.tool_name().unwrap_or("");
-        let limits = ToolKind::from_name(tool_name).output_limits(&self.tool_output_lines);
+        let hints = self.render_hints.get(tool_name);
+        let limits = output_limits_from_hints(tool_name, hints, &self.tool_output_lines);
         truncate_to_header(&mut msg.text);
         let truncated = truncate_output(content, limits.max_lines, limits.keep);
         msg.truncated_lines = truncated.skipped;
@@ -194,18 +206,17 @@ impl MessagesPanel {
             };
         }
         truncate_to_header(&mut msg.text);
-        let done_annotation =
-            tool_output_annotation(&event.output, ToolKind::from_name(&event.tool));
+        let hints = self.render_hints.get(&event.tool);
+        let done_annotation = tool_output_annotation(&event.output, hints.always_annotate);
         if let Some(suffix) = &done_annotation {
             append_annotation(&mut msg.annotation, suffix);
         }
 
         match &event.output {
             ToolOutput::Plain(text) | ToolOutput::ReadDir { text, .. }
-                if event.tool.as_ref() != WEBFETCH_TOOL_NAME =>
+                if !hints.skip_done_truncation =>
             {
-                let limits =
-                    ToolKind::from_name(&event.tool).output_limits(&self.tool_output_lines);
+                let limits = output_limits_from_hints(&event.tool, hints, &self.tool_output_lines);
                 let tr = truncate_output(text, limits.max_lines, limits.keep);
                 msg.truncated_lines = tr.skipped;
                 if !tr.kept.is_empty() {
@@ -222,7 +233,7 @@ impl MessagesPanel {
                 } else {
                     let display = output.as_display_text();
                     let limits =
-                        ToolKind::from_name(&event.tool).output_limits(&self.tool_output_lines);
+                        output_limits_from_hints(&event.tool, hints, &self.tool_output_lines);
                     let tr = truncate_output(&display, limits.max_lines, limits.keep);
                     msg.truncated_lines = tr.skipped;
                     msg.text = format!("{}\n{}", msg.text, tr.kept);
@@ -790,8 +801,17 @@ impl MessagesPanel {
         width: u16,
         exp: SectionFlags,
         tool_output_lines: &ToolOutputLines,
+        registry: &RenderHintsRegistry,
     ) -> ToolLines {
-        let mut tl = build_tool_lines(msg, status, started_at, width, exp, tool_output_lines);
+        let mut tl = build_tool_lines(
+            msg,
+            status,
+            started_at,
+            width,
+            exp,
+            tool_output_lines,
+            registry,
+        );
         if let Some(ts) = &msg.timestamp
             && !tl.lines.is_empty()
         {
@@ -867,6 +887,7 @@ impl MessagesPanel {
             self.viewport_width,
             exp,
             &self.tool_output_lines,
+            &self.render_hints,
         );
 
         let instructions = msg
@@ -913,6 +934,7 @@ impl MessagesPanel {
                     self.viewport_width,
                     child_exp,
                     &self.tool_output_lines,
+                    &self.render_hints,
                 );
                 let search = tl.search_text.clone();
                 let instructions = entry.output.as_ref().and_then(|o| o.owned_instructions());
@@ -967,6 +989,7 @@ impl MessagesPanel {
                     self.viewport_width,
                     exp,
                     &self.tool_output_lines,
+                    &self.render_hints,
                 );
                 let id = t.id.clone();
                 let search_text = tl.search_text.clone();
@@ -994,6 +1017,7 @@ impl MessagesPanel {
                                 self.viewport_width,
                                 child_exp,
                                 &self.tool_output_lines,
+                                &self.render_hints,
                             );
                             let blocks = entry.output.as_ref().and_then(|o| o.owned_instructions());
                             (child_id, tl, blocks)

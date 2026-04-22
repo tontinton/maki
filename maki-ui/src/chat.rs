@@ -7,15 +7,18 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::components::messages::MessagesPanel;
-use crate::components::tool_display::{ToolKind, append_annotation, tool_output_annotation};
+use crate::components::render_hints::RenderHintsRegistry;
+use crate::components::tool_display::{
+    append_annotation, output_limits_from_hints, tool_output_annotation,
+};
 use crate::components::{DisplayMessage, DisplayRole, ToolRole, ToolStatus};
 use crate::markdown::truncate_output;
 
 use crate::selection::Selection;
-use maki_agent::tools::{ToolInvocation, ToolRegistry, WEBFETCH_TOOL_NAME, native_static_name};
+use maki_agent::tools::{ToolInvocation, ToolRegistry, native_static_name};
 use maki_agent::{
-    AgentEvent, BatchToolStatus, NO_FILES_FOUND, QuestionInfo, ToolDoneEvent, ToolOutput,
-    ToolStartEvent,
+    AgentEvent, BatchToolStatus, NO_FILES_FOUND, QuestionInfo, RawRenderHints, ToolDoneEvent,
+    ToolOutput, ToolStartEvent,
 };
 use maki_config::{ToolOutputLines, UiConfig};
 use maki_providers::{ContentBlock, Message, Role, TokenUsage};
@@ -254,6 +257,10 @@ impl Chat {
         self.messages_panel.load_messages(msgs);
     }
 
+    pub fn register_plugin_hints(&mut self, tools: Vec<(Arc<str>, RawRenderHints)>) {
+        self.messages_panel.register_plugin_hints(tools);
+    }
+
     pub fn push_user_message(&mut self, text: impl Into<String>) {
         self.messages_panel
             .push(DisplayMessage::new(DisplayRole::User, text.into()));
@@ -302,6 +309,7 @@ pub fn history_to_display(
     tool_outputs: &HashMap<String, ToolOutput>,
     tool_output_lines: &ToolOutputLines,
 ) -> Vec<DisplayMessage> {
+    let registry = RenderHintsRegistry::new();
     let results = build_tool_results_map(messages);
     let mut display = Vec::new();
     for msg in messages {
@@ -347,6 +355,7 @@ pub fn history_to_display(
                                     stored,
                                     result_text,
                                     tool_output_lines,
+                                    &registry,
                                 );
                             if let Some(ta) =
                                 tool_call.as_deref().and_then(|tc| tc.start_annotation())
@@ -387,23 +396,24 @@ fn build_loaded_tool(
     reconstructed: Option<ToolOutput>,
     result_text: Option<&str>,
     tool_output_lines: &ToolOutputLines,
+    registry: &RenderHintsRegistry,
 ) -> (String, usize, Option<Arc<ToolOutput>>, Option<String>) {
-    let kind = ToolKind::from_name(tool);
+    let hints = registry.get(tool);
     match reconstructed {
         Some(ref output @ ToolOutput::GlobResult { .. }) => {
-            let annotation = tool_output_annotation(output, kind);
+            let annotation = tool_output_annotation(output, hints.always_annotate);
             let text = if output.is_empty_result() {
                 format!("{summary}\n{NO_FILES_FOUND}")
             } else {
                 let display = output.as_display_text();
-                let limits = kind.output_limits(tool_output_lines);
+                let limits = output_limits_from_hints(tool, hints, tool_output_lines);
                 let tr = truncate_output(&display, limits.max_lines, limits.keep);
                 format!("{}\n{}", summary, tr.kept)
             };
             (text, 0, reconstructed.map(Arc::new), annotation)
         }
         Some(ref output @ ToolOutput::GrepResult { .. }) => {
-            let annotation = tool_output_annotation(output, kind);
+            let annotation = tool_output_annotation(output, hints.always_annotate);
             (
                 summary.to_owned(),
                 0,
@@ -425,7 +435,7 @@ fn build_loaded_tool(
             (text, 0, reconstructed.map(Arc::new), None)
         }
         Some(ref output) => {
-            let annotation = tool_output_annotation(output, kind);
+            let annotation = tool_output_annotation(output, hints.always_annotate);
             (
                 summary.to_owned(),
                 0,
@@ -436,14 +446,14 @@ fn build_loaded_tool(
         None => {
             let result = result_text.unwrap_or("");
             let annotation = if !result.is_empty() {
-                tool_output_annotation(&ToolOutput::Plain(result.into()), kind)
+                tool_output_annotation(&ToolOutput::Plain(result.into()), hints.always_annotate)
             } else {
                 None
             };
-            if result.is_empty() || matches!(tool, WEBFETCH_TOOL_NAME) {
+            if result.is_empty() || hints.skip_done_truncation {
                 (summary.to_owned(), 0, None, annotation)
             } else {
-                let limits = kind.output_limits(tool_output_lines);
+                let limits = output_limits_from_hints(tool, hints, tool_output_lines);
                 let tr = truncate_output(result, limits.max_lines, limits.keep);
                 (
                     format!("{}\n{}", summary, tr.kept),

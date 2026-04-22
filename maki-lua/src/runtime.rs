@@ -6,6 +6,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
 use include_dir::Dir;
+use maki_agent::RawRenderHints;
 use maki_agent::cancel::CancelToken;
 use maki_agent::tools::{RegistryError, Tool, ToolRegistry, ToolSource};
 use mlua::{Function, Lua, LuaSerdeExt, RegistryKey, Value as LuaValue, VmState};
@@ -19,12 +20,14 @@ use crate::error::PluginError;
 
 const INTERRUPT_MSG: &str = "plugin interrupted: cancelled, deadline exceeded, or shutting down";
 
+pub type LoadResult = Result<Vec<(Arc<str>, RawRenderHints)>, PluginError>;
+
 pub enum Request {
     LoadSource {
         name: Arc<str>,
         source: String,
         plugin_dir: Option<PathBuf>,
-        reply: flume::Sender<Result<(), PluginError>>,
+        reply: flume::Sender<LoadResult>,
     },
     CallTool {
         plugin: Arc<str>,
@@ -293,7 +296,7 @@ impl LuaRuntime {
         name: Arc<str>,
         source: &str,
         plugin_dir: Option<PathBuf>,
-    ) -> Result<(), PluginError> {
+    ) -> LoadResult {
         let stale = self.drain_pending();
         debug_assert!(
             stale.is_empty(),
@@ -363,6 +366,11 @@ impl LuaRuntime {
 
         self.drop_plugin_keys(&name);
 
+        let hints: Vec<(Arc<str>, RawRenderHints)> = pending
+            .iter()
+            .filter_map(|t| t.render_hints.clone().map(|h| (Arc::clone(&t.name), h)))
+            .collect();
+
         let keys: HashMap<Arc<str>, ToolKeys> = pending
             .into_iter()
             .map(|t| {
@@ -377,7 +385,7 @@ impl LuaRuntime {
             .collect();
         self.plugins.insert(name, keys);
 
-        Ok(())
+        Ok(hints)
     }
 
     fn clear_plugin(&mut self, plugin: &str) {

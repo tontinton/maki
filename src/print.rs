@@ -346,7 +346,6 @@ pub fn run(
             }
         }
     }
-
     smol::block_on(async {
         futures_lite::future::or(
             async {
