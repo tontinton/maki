@@ -1,3 +1,4 @@
+pub(crate) mod buf;
 pub(crate) mod ctx;
 pub(crate) mod fs;
 pub(crate) mod json;
@@ -13,6 +14,7 @@ use std::sync::Arc;
 
 use mlua::{Lua, Result as LuaResult, Table};
 
+use crate::api::buf::{BufHandle, BufferStore};
 use crate::api::tool::PendingTools;
 
 pub(crate) fn create_maki_global(
@@ -31,6 +33,22 @@ pub(crate) fn create_maki_global(
     maki.set("json", json::create_json_table(lua)?)?;
     maki.set("net", net::create_net_table(lua)?)?;
     maki.set("text", text::create_text_table(lua)?)?;
+    maki.set("ui", create_ui_table(lua)?)?;
 
     Ok(maki)
+}
+
+fn create_ui_table(lua: &Lua) -> LuaResult<Table> {
+    let t = lua.create_table()?;
+    t.set(
+        "buf",
+        lua.create_function(|lua, ()| {
+            let mut store = lua
+                .app_data_mut::<BufferStore>()
+                .ok_or_else(|| mlua::Error::runtime("buffer store not initialized"))?;
+            let id = store.create();
+            Ok(BufHandle(id))
+        })?,
+    )?;
+    Ok(t)
 }

@@ -1,7 +1,4 @@
 //! Async agent loop with tools.
-//!
-//! `AgentMode::Build` executes tools freely; `Plan(path)` restricts writes to the plan file only.
-//! `ExtractedCommand` injects control signals (interrupt, cancel, compact) into a running agent.
 
 pub mod agent;
 pub mod cancel;
@@ -35,10 +32,11 @@ pub use maki_providers::AgentError;
 use maki_providers::Message;
 pub use maki_providers::{ImageMediaType, ImageSource, ThinkingConfig};
 pub use types::{
-    AgentEvent, BatchProgressEvent, BatchToolEntry, BatchToolStatus, Envelope, EventSender,
-    GrepFileEntry, GrepLine, GrepMatchGroup, InstructionBlock, NO_FILES_FOUND, QuestionAnswer,
-    QuestionInfo, QuestionOption, RawRenderHints, SubagentInfo, TodoItem, TodoPriority, TodoStatus,
-    ToolDoneEvent, ToolInput, ToolOutput, ToolStartEvent, TurnCompleteEvent,
+    AgentEvent, BatchProgressEvent, BatchToolEntry, BatchToolStatus, BufferSnapshot, Envelope,
+    EventSender, GrepFileEntry, GrepLine, GrepMatchGroup, InstructionBlock, NO_FILES_FOUND,
+    QuestionAnswer, QuestionInfo, QuestionOption, RawRenderHints, SnapshotLine, SnapshotSpan,
+    SpanStyle, SubagentInfo, TodoItem, TodoPriority, TodoStatus, ToolDoneEvent, ToolInput,
+    ToolOutput, ToolStartEvent, TurnCompleteEvent,
 };
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]

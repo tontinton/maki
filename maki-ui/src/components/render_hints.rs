@@ -50,7 +50,7 @@ pub enum BodyFormat {
     Index,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ToolRenderHints {
     pub header_style: HeaderStyle,
     pub body_format: BodyFormat,
@@ -68,7 +68,7 @@ impl Default for ToolRenderHints {
 }
 
 impl ToolRenderHints {
-    pub fn from_raw(raw: &RawRenderHints) -> Self {
+    pub fn from_raw(raw: &RawRenderHints, existing: Option<&Self>) -> Self {
         Self {
             header_style: match raw.header_style.as_deref() {
                 Some("path") => HeaderStyle::Path,
@@ -76,7 +76,7 @@ impl ToolRenderHints {
                 Some("grep") => HeaderStyle::Grep,
                 _ => HeaderStyle::Plain,
             },
-            body_format: BodyFormat::Plain,
+            body_format: existing.map_or(BodyFormat::Plain, |e| e.body_format),
             output_lines: raw.output_lines,
             output_keep: match raw.output_keep.as_deref() {
                 Some("tail") => OutputKeep::Tail,
@@ -172,7 +172,9 @@ impl RenderHintsRegistry {
         Self { hints }
     }
 
-    pub fn register(&mut self, name: Arc<str>, hints: ToolRenderHints) {
+    pub fn register(&mut self, name: Arc<str>, raw: &RawRenderHints) {
+        let existing = self.hints.get(name.as_ref());
+        let hints = ToolRenderHints::from_raw(raw, existing);
         self.hints.insert(name, hints);
     }
 
@@ -249,8 +251,8 @@ mod tests {
         let name: Arc<str> = Arc::from("my_plugin_tool");
         reg.register(
             Arc::clone(&name),
-            ToolRenderHints {
-                always_annotate: true,
+            &RawRenderHints {
+                always_annotate: Some(true),
                 ..Default::default()
             },
         );
@@ -269,7 +271,7 @@ mod tests {
     fn raw(f: impl FnOnce(&mut RawRenderHints)) -> ToolRenderHints {
         let mut r = RawRenderHints::default();
         f(&mut r);
-        ToolRenderHints::from_raw(&r)
+        ToolRenderHints::from_raw(&r, None)
     }
 
     #[test_case("path",    HeaderStyle::Path    ; "path")]
@@ -306,5 +308,85 @@ mod tests {
             r.always_annotate = Some(true);
         });
         assert_eq!(h.body_format, BodyFormat::Plain);
+    }
+
+    #[test]
+    fn register_preserves_native_body_format() {
+        let mut reg = RenderHintsRegistry::new();
+        assert_eq!(reg.get(INDEX_TOOL_NAME).body_format, BodyFormat::Index);
+        reg.register(
+            Arc::from(INDEX_TOOL_NAME),
+            &RawRenderHints {
+                header_style: Some("path".into()),
+                always_annotate: Some(true),
+                ..Default::default()
+            },
+        );
+        assert_eq!(reg.get(INDEX_TOOL_NAME).body_format, BodyFormat::Index);
+        assert!(reg.get(INDEX_TOOL_NAME).always_annotate);
+    }
+
+    #[test]
+    fn from_raw_with_existing_markdown_preserves_it() {
+        let existing = ToolRenderHints {
+            body_format: BodyFormat::Markdown,
+            ..Default::default()
+        };
+        let h = ToolRenderHints::from_raw(&RawRenderHints::default(), Some(&existing));
+        assert_eq!(h.body_format, BodyFormat::Markdown);
+    }
+
+    #[test]
+    fn register_new_tool_then_overwrite() {
+        let mut reg = RenderHintsRegistry::new();
+        let name: Arc<str> = Arc::from("custom_tool");
+        reg.register(
+            Arc::clone(&name),
+            &RawRenderHints {
+                header_style: Some("command".into()),
+                output_lines: Some(50),
+                ..Default::default()
+            },
+        );
+        assert_eq!(reg.get("custom_tool").header_style, HeaderStyle::Command);
+        assert_eq!(reg.get("custom_tool").output_lines, Some(50));
+
+        reg.register(
+            Arc::clone(&name),
+            &RawRenderHints {
+                header_style: Some("path".into()),
+                output_lines: Some(100),
+                ..Default::default()
+            },
+        );
+        assert_eq!(reg.get("custom_tool").header_style, HeaderStyle::Path);
+        assert_eq!(reg.get("custom_tool").output_lines, Some(100));
+    }
+
+    #[test]
+    fn remove_plugin_tools_only_removes_specified() {
+        let mut reg = RenderHintsRegistry::new();
+        let a: Arc<str> = Arc::from("plugin_a");
+        let b: Arc<str> = Arc::from("plugin_b");
+        reg.register(Arc::clone(&a), &RawRenderHints::default());
+        reg.register(Arc::clone(&b), &RawRenderHints::default());
+        reg.remove_plugin_tools(&[a]);
+        assert!(
+            !reg.hints.contains_key("plugin_a"),
+            "plugin_a should be removed"
+        );
+        assert!(reg.hints.contains_key("plugin_b"), "plugin_b should remain");
+    }
+
+    #[test]
+    fn from_raw_all_defaults_match_const() {
+        let h = ToolRenderHints::from_raw(&RawRenderHints::default(), None);
+        assert_eq!(h.header_style, HeaderStyle::Plain);
+        assert_eq!(h.body_format, BodyFormat::Plain);
+        assert_eq!(h.output_lines, None);
+        assert_eq!(h.output_keep, OutputKeep::Head);
+        assert_eq!(h.output_separator, OutputSeparator::None);
+        assert!(!h.always_annotate);
+        assert!(!h.skip_done_truncation);
     }
 }

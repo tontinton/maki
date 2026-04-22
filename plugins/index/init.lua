@@ -14,6 +14,112 @@ local function normalize(p)
   return p
 end
 
+local KEYWORDS = {
+  pub = true,
+  fn = true,
+  struct = true,
+  enum = true,
+  trait = true,
+  type = true,
+  impl = true,
+  mod = true,
+  const = true,
+  static = true,
+  async = true,
+  class = true,
+  interface = true,
+  export = true,
+  ["macro_rules!"] = true,
+}
+
+local function split_trailing_range(line)
+  local bracket_start = line:find("%[%d[%d%-%,% ]*%]$")
+  if not bracket_start or bracket_start <= 1 then
+    return nil
+  end
+  return line:sub(1, bracket_start - 1), line:sub(bracket_start)
+end
+
+local function styled_section_line(buf, line)
+  local before, range = split_trailing_range(line)
+  if range then
+    buf:line({ { before, "section" }, { range, "line_nr" } })
+  else
+    buf:line({ { line, "section" } })
+  end
+end
+
+local function styled_content_line(buf, line)
+  local leading, content
+  if line:sub(1, 2) == "  " then
+    leading = "  "
+    content = line:sub(3)
+  else
+    leading = ""
+    content = line
+  end
+
+  local spans = {}
+  if leading ~= "" then
+    spans[#spans + 1] = { leading }
+  end
+
+  local kw_found = nil
+  for kw in pairs(KEYWORDS) do
+    local kw_len = #kw
+    if content:sub(1, kw_len) == kw then
+      local next_char = content:sub(kw_len + 1, kw_len + 1)
+      if next_char == " " or next_char == "(" then
+        kw_found = kw
+        break
+      end
+    end
+  end
+
+  local rest
+  if kw_found then
+    spans[#spans + 1] = { kw_found, "keyword" }
+    rest = content:sub(#kw_found + 1)
+  else
+    rest = content
+  end
+
+  local before, range = split_trailing_range(rest)
+  if range then
+    spans[#spans + 1] = { before, "tool" }
+    spans[#spans + 1] = { range, "line_nr" }
+  else
+    spans[#spans + 1] = { rest, "tool" }
+  end
+
+  buf:line(spans)
+end
+
+local function is_section_header(line)
+  local trimmed = line:match("^(.-)%s*$")
+  if trimmed:sub(-1) == ":" then
+    return true
+  end
+  if trimmed:sub(-1) == "]" and trimmed:find(": %[") then
+    return true
+  end
+  return false
+end
+
+local function build_styled_buf(text)
+  local buf = maki.ui.buf()
+  for line in (text .. "\n"):gmatch("([^\n]*)\n") do
+    if line == "" then
+      buf:line("")
+    elseif is_section_header(line) then
+      styled_section_line(buf, line)
+    else
+      styled_content_line(buf, line)
+    end
+  end
+  return buf
+end
+
 maki.api.register_tool({
   name = "index",
   description = [[
@@ -28,6 +134,10 @@ Return a compact overview of a source file: imports, type definitions, function 
     properties = {
       path = { type = "string", description = "Absolute path to the file", required = true },
     },
+  },
+  render = {
+    header_style = "path",
+    always_annotate = true,
   },
   summary = function(input)
     return normalize(input.path)
@@ -69,6 +179,11 @@ Return a compact overview of a source file: imports, type definitions, function 
       return "error: " .. tostring(err)
     end
 
-    return result
+    local buf = build_styled_buf(result)
+
+    return {
+      output = result,
+      render_buf = buf,
+    }
   end,
 })

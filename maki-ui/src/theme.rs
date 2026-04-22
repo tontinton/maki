@@ -272,6 +272,23 @@ pub fn current_theme_name() -> String {
     read_theme_name().unwrap_or_else(|| DEFAULT_THEME.to_owned())
 }
 
+pub fn style_by_name(name: &str) -> Style {
+    let t = current();
+    match name {
+        "dim" | "tool_dim" => t.tool_dim,
+        "path" | "tool_path" => t.tool_path,
+        "tool" => t.tool,
+        "error" => t.error,
+        "bold" => t.bold,
+        "keyword" | "index_keyword" => t.index_keyword,
+        "section" | "index_section" => t.index_section,
+        "line_nr" | "index_line_nr" => t.index_line_nr,
+        "diff_old" => t.diff_old,
+        "diff_new" => t.diff_new,
+        _ => Style::default(),
+    }
+}
+
 #[derive(Debug)]
 pub struct Theme {
     pub background: Color,
@@ -1079,5 +1096,39 @@ mode_build = "#112233"
 "##;
         let theme = Theme::from_toml(toml).unwrap();
         assert_eq!(theme.mode_build, Color::Rgb(0x11, 0x22, 0x33));
+    }
+
+    #[test]
+    fn style_by_name_aliases_resolve() {
+        set(Theme::from_toml(dracula_toml()).unwrap());
+        let t = current();
+        assert_eq!(style_by_name("dim"), t.tool_dim);
+        assert_eq!(style_by_name("tool_dim"), t.tool_dim);
+        assert_eq!(style_by_name("path"), t.tool_path);
+        assert_eq!(style_by_name("tool_path"), t.tool_path);
+        assert_eq!(style_by_name("keyword"), t.index_keyword);
+        assert_eq!(style_by_name("index_keyword"), t.index_keyword);
+        assert_eq!(style_by_name("section"), t.index_section);
+        assert_eq!(style_by_name("index_section"), t.index_section);
+        assert_eq!(style_by_name("line_nr"), t.index_line_nr);
+        assert_eq!(style_by_name("index_line_nr"), t.index_line_nr);
+    }
+
+    #[test]
+    fn style_by_name_direct_names() {
+        set(Theme::from_toml(dracula_toml()).unwrap());
+        let t = current();
+        assert_eq!(style_by_name("tool"), t.tool);
+        assert_eq!(style_by_name("error"), t.error);
+        assert_eq!(style_by_name("bold"), t.bold);
+        assert_eq!(style_by_name("diff_old"), t.diff_old);
+        assert_eq!(style_by_name("diff_new"), t.diff_new);
+    }
+
+    #[test]
+    fn style_by_name_unknown_returns_default() {
+        assert_eq!(style_by_name("nonexistent_style"), Style::default());
+        assert_eq!(style_by_name(""), Style::default());
+        assert_eq!(style_by_name("typo_keyword"), Style::default());
     }
 }

@@ -3,19 +3,19 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use flume::Sender;
-use maki_agent::RawRenderHints;
-use maki_agent::ToolOutput;
 use maki_agent::tools::Tool;
 use maki_agent::tools::schema::{ParamSchema, to_json_schema, try_from_json, validate};
 use maki_agent::tools::{
     Deadline, DescriptionContext, ExecFuture, ParseError, SummaryFuture, ToolAudience, ToolContext,
     ToolInvocation,
 };
+use maki_agent::{AgentEvent, BufferSnapshot, RawRenderHints, ToolOutput};
 use mlua::{
     Function, Lua, LuaSerdeExt, RegistryKey, Result as LuaResult, Table, Value as LuaValue,
 };
 use serde_json::Value;
 
+use crate::api::buf::{BufHandle, BufferStore};
 use crate::api::ctx::LuaCtx;
 use crate::runtime::Request;
 
@@ -137,7 +137,7 @@ impl ToolInvocation for LuaToolInvocation {
         Box::pin(async move {
             let timeout_secs = deadline.cap_timeout(TOOL_CALL_MAX_TIME.as_secs())?;
 
-            let (reply_tx, reply_rx) = flume::bounded(1);
+            let (reply_tx, reply_rx) = flume::bounded::<ToolCallReply>(1);
             let lua_ctx = LuaCtx {
                 cancel: ctx.cancel.clone(),
                 config: ctx.config.clone(),
@@ -171,7 +171,23 @@ impl ToolInvocation for LuaToolInvocation {
                     plugin, tool
                 )),
                 Some(Err(_)) => Err("lua thread disconnected".to_string()),
-                Some(Ok(result)) => result.map(ToolOutput::Plain),
+                Some(Ok(reply)) => {
+                    if let Some(ref id) = ctx.tool_use_id {
+                        if let Some(snapshot) = reply.snapshot {
+                            let _ = ctx.event_tx.send(AgentEvent::ToolSnapshot {
+                                id: id.clone(),
+                                snapshot,
+                            });
+                        }
+                        if let Some(annotation) = reply.annotation {
+                            let _ = ctx.event_tx.send(AgentEvent::ToolAnnotation {
+                                id: id.clone(),
+                                annotation,
+                            });
+                        }
+                    }
+                    reply.result.map(ToolOutput::Plain)
+                }
             }
         })
     }
@@ -314,6 +330,54 @@ fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> Lua
 }
 
 pub(crate) type ToolCallResult = Result<String, String>;
+
+pub(crate) struct ToolCallReply {
+    pub result: ToolCallResult,
+    pub snapshot: Option<BufferSnapshot>,
+    pub annotation: Option<String>,
+}
+
+impl ToolCallReply {
+    pub fn err(msg: impl Into<String>) -> Self {
+        Self {
+            result: Err(msg.into()),
+            snapshot: None,
+            annotation: None,
+        }
+    }
+}
+
+pub(crate) fn extract_tool_return(lua: &Lua, result: &LuaValue) -> ToolCallReply {
+    let text_result = coerce_tool_result(result);
+
+    let (snapshot, annotation) = if let LuaValue::Table(t) = result {
+        let snap = t.get::<LuaValue>("render_buf").ok().and_then(|v| {
+            let ud = v.as_userdata()?;
+            let h = ud.borrow::<BufHandle>().ok()?;
+            lua.app_data_mut::<BufferStore>()?.take(h.0)
+        });
+
+        let ann = t
+            .get::<LuaValue>("annotation")
+            .ok()
+            .and_then(|v| v.as_string().map(|s| s.to_string_lossy().to_string()));
+
+        (snap, ann)
+    } else {
+        (None, None)
+    };
+
+    if let Some(mut store) = lua.app_data_mut::<BufferStore>() {
+        store.clear();
+    }
+
+    ToolCallReply {
+        result: text_result,
+        snapshot,
+        annotation,
+    }
+}
+
 pub(crate) fn coerce_tool_result(result: &LuaValue) -> ToolCallResult {
     match result {
         LuaValue::String(s) => s.to_str().map(|s| s.to_owned()).map_err(|e| e.to_string()),
@@ -417,5 +481,118 @@ mod tests {
             .parse(&serde_json::json!({"url": "https://example.com"}))
             .unwrap();
         assert_eq!(inv.permission_scope(), expected.map(String::from));
+    }
+
+    fn lua_with_buf_store() -> Lua {
+        let lua = Lua::new();
+        lua.set_app_data(BufferStore::new());
+        lua
+    }
+
+    #[test]
+    fn extract_tool_return_plain_string() {
+        let lua = lua_with_buf_store();
+        let val = LuaValue::String(lua.create_string("result text").unwrap());
+        let reply = extract_tool_return(&lua, &val);
+        assert_eq!(reply.result, Ok("result text".to_string()));
+        assert!(reply.snapshot.is_none());
+        assert!(reply.annotation.is_none());
+    }
+
+    #[test]
+    fn extract_tool_return_table_with_output() {
+        let lua = lua_with_buf_store();
+        let t = lua.create_table().unwrap();
+        t.set("output", "hello").unwrap();
+        let reply = extract_tool_return(&lua, &LuaValue::Table(t));
+        assert_eq!(reply.result, Ok("hello".to_string()));
+        assert!(reply.snapshot.is_none());
+        assert!(reply.annotation.is_none());
+    }
+
+    #[test]
+    fn extract_tool_return_table_with_annotation() {
+        let lua = lua_with_buf_store();
+        let t = lua.create_table().unwrap();
+        t.set("output", "data").unwrap();
+        t.set("annotation", "42 lines").unwrap();
+        let reply = extract_tool_return(&lua, &LuaValue::Table(t));
+        assert_eq!(reply.result, Ok("data".to_string()));
+        assert_eq!(reply.annotation.as_deref(), Some("42 lines"));
+    }
+
+    #[test]
+    fn extract_tool_return_with_render_buf() {
+        let lua = lua_with_buf_store();
+        let buf_id = {
+            let mut store = lua.app_data_mut::<BufferStore>().unwrap();
+            let id = store.create();
+            store.append_line(
+                id,
+                maki_agent::SnapshotLine {
+                    spans: vec![maki_agent::SnapshotSpan {
+                        text: "styled".into(),
+                        style: maki_agent::SpanStyle::Named("keyword".into()),
+                    }],
+                },
+            );
+            id
+        };
+        let handle = lua.create_userdata(BufHandle(buf_id)).unwrap();
+        let t = lua.create_table().unwrap();
+        t.set("output", "plain for llm").unwrap();
+        t.set("render_buf", handle).unwrap();
+        let reply = extract_tool_return(&lua, &LuaValue::Table(t));
+        assert_eq!(reply.result, Ok("plain for llm".to_string()));
+        let snap = reply.snapshot.unwrap();
+        assert_eq!(snap.lines.len(), 1);
+        assert_eq!(snap.lines[0].spans[0].text, "styled");
+    }
+
+    #[test]
+    fn extract_tool_return_clears_orphaned_buffers() {
+        let lua = lua_with_buf_store();
+        {
+            let mut store = lua.app_data_mut::<BufferStore>().unwrap();
+            store.create();
+            store.create();
+        }
+        let t = lua.create_table().unwrap();
+        t.set("output", "ok").unwrap();
+        let _reply = extract_tool_return(&lua, &LuaValue::Table(t));
+        let mut store = lua.app_data_mut::<BufferStore>().unwrap();
+        assert!(
+            store.take(1).is_none(),
+            "orphaned buffers should be cleared after extract"
+        );
+    }
+
+    #[test]
+    fn extract_tool_return_is_error_flag() {
+        let lua = lua_with_buf_store();
+        let t = lua.create_table().unwrap();
+        t.set("output", "something broke").unwrap();
+        t.set("is_error", true).unwrap();
+        let reply = extract_tool_return(&lua, &LuaValue::Table(t));
+        assert_eq!(reply.result, Err("something broke".to_string()));
+    }
+
+    #[test]
+    fn extract_tool_return_missing_output_field() {
+        let lua = lua_with_buf_store();
+        let t = lua.create_table().unwrap();
+        t.set("annotation", "some annotation").unwrap();
+        let reply = extract_tool_return(&lua, &LuaValue::Table(t));
+        assert!(reply.result.is_err(), "missing output should be an error");
+        assert_eq!(reply.annotation.as_deref(), Some("some annotation"));
+    }
+
+    #[test]
+    fn extract_tool_return_non_string_non_table() {
+        let lua = lua_with_buf_store();
+        let reply = extract_tool_return(&lua, &LuaValue::Integer(42));
+        assert!(reply.result.is_err());
+        assert!(reply.snapshot.is_none());
+        assert!(reply.annotation.is_none());
     }
 }

@@ -223,8 +223,7 @@ pub enum ToolOutput {
     },
 }
 
-/// Remaining lines after a 1-indexed window `[start_line .. start_line + shown)`
-/// within a file of `total` lines. Uses saturating ops so no input can overflow.
+/// Saturating arithmetic so callers can't overflow with any combination of inputs.
 fn lines_remaining_after(total: usize, start_line: usize, shown: usize) -> usize {
     let end = start_line.saturating_add(shown).saturating_sub(1);
     total.saturating_sub(end)
@@ -508,6 +507,50 @@ pub enum AgentEvent {
         tool_use_id: String,
         messages: Vec<Message>,
     },
+    ToolSnapshot {
+        id: String,
+        snapshot: BufferSnapshot,
+    },
+    ToolAnnotation {
+        id: String,
+        annotation: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct BufferSnapshot {
+    pub lines: Vec<SnapshotLine>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SnapshotLine {
+    pub spans: Vec<SnapshotSpan>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SnapshotSpan {
+    pub text: String,
+    pub style: SpanStyle,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub enum SpanStyle {
+    #[default]
+    Default,
+    Named(String),
+    Inline(InlineStyle),
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct InlineStyle {
+    pub fg: Option<(u8, u8, u8)>,
+    pub bg: Option<(u8, u8, u8)>,
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub dim: bool,
+    pub strikethrough: bool,
+    pub reversed: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]

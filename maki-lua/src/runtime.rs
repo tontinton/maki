@@ -12,10 +12,11 @@ use maki_agent::tools::{RegistryError, Tool, ToolRegistry, ToolSource};
 use mlua::{Function, Lua, LuaSerdeExt, RegistryKey, Value as LuaValue, VmState};
 use serde_json::Value;
 
+use crate::api::buf::BufferStore;
 use crate::api::create_maki_global;
 use crate::api::ctx::LuaCtx;
 use crate::api::fs::check_sandbox;
-use crate::api::tool::{LuaTool, PendingTool, PendingTools, ToolCallResult, coerce_tool_result};
+use crate::api::tool::{LuaTool, PendingTool, PendingTools, ToolCallReply, extract_tool_return};
 use crate::error::PluginError;
 
 const INTERRUPT_MSG: &str = "plugin interrupted: cancelled, deadline exceeded, or shutting down";
@@ -35,7 +36,7 @@ pub enum Request {
         input: Value,
         ctx: LuaCtx,
         deadline: Option<Instant>,
-        reply: flume::Sender<ToolCallResult>,
+        reply: flume::Sender<ToolCallReply>,
     },
     ComputeSummary {
         plugin: Arc<str>,
@@ -124,6 +125,8 @@ impl LuaRuntime {
             plugin: "<init>".to_owned(),
             source: e,
         })?;
+
+        lua.set_app_data(BufferStore::new());
 
         Ok(Self {
             lua,
@@ -400,23 +403,19 @@ impl LuaRuntime {
         input: Value,
         ctx: LuaCtx,
         deadline: Option<Instant>,
-    ) -> ToolCallResult {
-        let keys = self
-            .plugins
-            .get(plugin)
-            .ok_or_else(|| format!("plugin not loaded: {plugin}"))?;
-
-        let tool_keys = keys
-            .get(tool)
-            .ok_or_else(|| format!("tool not found: {tool}"))?;
-
-        let handler: Function = self
-            .lua
-            .registry_value(&tool_keys.handler)
-            .map_err(|e| e.to_string())?;
-
+    ) -> ToolCallReply {
+        let Some(keys) = self.plugins.get(plugin) else {
+            return ToolCallReply::err(format!("plugin not loaded: {plugin}"));
+        };
+        let Some(tool_keys) = keys.get(tool) else {
+            return ToolCallReply::err(format!("tool not found: {tool}"));
+        };
+        let handler: Function = match self.lua.registry_value(&tool_keys.handler) {
+            Ok(f) => f,
+            Err(e) => return ToolCallReply::err(e.to_string()),
+        };
         if self.shutdown.load(Ordering::Acquire) {
-            return Err("plugin host shutting down".into());
+            return ToolCallReply::err("plugin host shutting down");
         }
 
         {
@@ -429,14 +428,25 @@ impl LuaRuntime {
 
         let _clear_on_drop = CallStateGuard(&self.call_state);
 
-        let input_lua = self.lua.to_value(&input).map_err(|e| e.to_string())?;
-        let ctx_ud = self.lua.create_userdata(ctx).map_err(|e| e.to_string())?;
+        let input_lua = match self.lua.to_value(&input) {
+            Ok(v) => v,
+            Err(e) => return ToolCallReply::err(e.to_string()),
+        };
+        let ctx_ud = match self.lua.create_userdata(ctx) {
+            Ok(u) => u,
+            Err(e) => return ToolCallReply::err(e.to_string()),
+        };
 
         let result = handler.call::<LuaValue>((input_lua, ctx_ud));
 
         match result {
-            Ok(val) => coerce_tool_result(&val),
-            Err(e) => Err(e.to_string()),
+            Ok(val) => extract_tool_return(&self.lua, &val),
+            Err(e) => {
+                if let Some(mut store) = self.lua.app_data_mut::<BufferStore>() {
+                    store.clear();
+                }
+                ToolCallReply::err(e.to_string())
+            }
         }
     }
 

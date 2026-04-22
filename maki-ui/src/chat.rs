@@ -1,6 +1,6 @@
-//! `history_to_display` rebuilds UI messages from raw API history + stored tool outputs.
-//! Stored `ToolOutput` gets syntax highlighting; absent outputs fall back to plain text
-//! from `ToolResult`. Webfetch bodies are hidden to save screen space.
+//! When loading old sessions, stored `ToolOutput` gets syntax highlighting.
+//! Missing outputs fall back to plain text from `ToolResult`.
+//! Webfetch bodies are hidden to save screen space.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -141,6 +141,12 @@ impl Chat {
             }
             AgentEvent::AuthRequired => {
                 return ChatEventResult::AuthRequired;
+            }
+            AgentEvent::ToolSnapshot { id, snapshot } => {
+                self.messages_panel.tool_snapshot(&id, snapshot);
+            }
+            AgentEvent::ToolAnnotation { id, annotation } => {
+                self.messages_panel.tool_annotation(&id, &annotation);
             }
             AgentEvent::SubagentHistory { .. } => {}
         }
@@ -377,6 +383,7 @@ pub fn history_to_display(
                                 timestamp: None,
                                 turn_usage: None,
                                 truncated_lines,
+                                render_snapshot: None,
                             });
                         }
                         _ => {}
@@ -388,8 +395,7 @@ pub fn history_to_display(
     display
 }
 
-/// Replicate the live `tool_done` rendering: set structured output for
-/// syntax highlighting, truncate plain text bodies, compute annotations.
+/// Mirrors the live `tool_done` path so loaded tools look the same as streamed ones.
 fn build_loaded_tool(
     tool: &str,
     summary: &str,

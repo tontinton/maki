@@ -8,7 +8,7 @@ use self::render::RenderCursor;
 use self::segment::{Segment, SegmentCache, wrapped_line_count};
 use self::selection::parse_batch_inner_id;
 
-use super::render_hints::{RenderHintsRegistry, ToolRenderHints};
+use super::render_hints::RenderHintsRegistry;
 use super::tool_display::{
     ToolLines, append_annotation, append_right_info, assistant_style, build_batch_entry_lines,
     build_instructions_lines, build_tool_lines, done_style, error_style, format_timestamp_now,
@@ -35,8 +35,8 @@ use super::scrollbar::render_vertical_scrollbar;
 use super::streaming_content::StreamingContent;
 use maki_agent::tools::native_static_name;
 use maki_agent::{
-    BatchToolEntry, BatchToolStatus, InstructionBlock, NO_FILES_FOUND, RawRenderHints,
-    ToolDoneEvent, ToolOutput, ToolStartEvent,
+    BatchToolEntry, BatchToolStatus, BufferSnapshot, InstructionBlock, NO_FILES_FOUND,
+    RawRenderHints, ToolDoneEvent, ToolOutput, ToolStartEvent,
 };
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -113,8 +113,7 @@ impl MessagesPanel {
 
     pub fn register_plugin_hints(&mut self, tools: Vec<(Arc<str>, RawRenderHints)>) {
         for (name, raw) in tools {
-            self.render_hints
-                .register(name, ToolRenderHints::from_raw(&raw));
+            self.render_hints.register(name, &raw);
         }
     }
 
@@ -214,7 +213,7 @@ impl MessagesPanel {
 
         match &event.output {
             ToolOutput::Plain(text) | ToolOutput::ReadDir { text, .. }
-                if !hints.skip_done_truncation =>
+                if !hints.skip_done_truncation && msg.render_snapshot.is_none() =>
             {
                 let limits = output_limits_from_hints(&event.tool, hints, &self.tool_output_lines);
                 let tr = truncate_output(text, limits.max_lines, limits.keep);
@@ -316,6 +315,20 @@ impl MessagesPanel {
             |msg| append_annotation(&mut msg.annotation, model),
             |entry| append_annotation(&mut entry.annotation, model),
         );
+    }
+
+    pub fn tool_snapshot(&mut self, tool_id: &str, snapshot: BufferSnapshot) {
+        if let Some(msg) = self.find_tool_msg_mut(tool_id) {
+            msg.render_snapshot = Some(snapshot);
+            self.rebuild_tool_segment(tool_id);
+        }
+    }
+
+    pub fn tool_annotation(&mut self, tool_id: &str, annotation: &str) {
+        if let Some(msg) = self.find_tool_msg_mut(tool_id) {
+            append_annotation(&mut msg.annotation, annotation);
+            self.rebuild_tool_segment(tool_id);
+        }
     }
 
     pub fn set_turn_usage_on_last_tool(&mut self, usage: String) {

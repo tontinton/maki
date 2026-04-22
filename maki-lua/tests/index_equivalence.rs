@@ -236,3 +236,36 @@ fn delegate_native_via_dispatch_runs_native_tool() {
     );
     assert_ne!(done.output.as_text(), DELEGATE_NATIVE);
 }
+
+#[test]
+fn lua_index_sends_snapshot_event() {
+    let s = setup();
+    let input = write_fixture(s.tmp.path(), "test.rs", RUST_FIXTURE);
+
+    let (event_tx, event_rx) = flume::unbounded::<maki_agent::Envelope>();
+    let sender = maki_agent::EventSender::new(event_tx, 0);
+    let mut ctx = maki_agent::tools::test_support::stub_ctx_with(
+        &maki_agent::AgentMode::Build,
+        Some(&sender),
+        Some("snap-test-id"),
+    );
+    ctx.tool_use_id = Some("snap-test-id".into());
+
+    let entry = s.reg.get("index").unwrap();
+    let inv = entry.tool.parse(&input).expect("parse failed");
+    let result = smol::block_on(async { inv.execute(&ctx).await });
+    assert!(result.is_ok(), "index should succeed");
+
+    let mut found_snapshot = false;
+    while let Ok(envelope) = event_rx.try_recv() {
+        if let maki_agent::AgentEvent::ToolSnapshot { id, snapshot } = &envelope.event {
+            assert_eq!(id, "snap-test-id");
+            assert!(!snapshot.lines.is_empty(), "snapshot should have lines");
+            found_snapshot = true;
+        }
+    }
+    assert!(
+        found_snapshot,
+        "expected ToolSnapshot event for Lua-handled index"
+    );
+}

@@ -45,7 +45,7 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use maki_agent::AgentInput;
-use maki_agent::{ToolInput, ToolOutput};
+use maki_agent::{BufferSnapshot, ToolInput, ToolOutput};
 use maki_providers::{Message, ModelTier};
 use ratatui::text::{Line, Span};
 
@@ -274,6 +274,7 @@ pub struct DisplayMessage {
     pub timestamp: Option<String>,
     pub turn_usage: Option<String>,
     pub truncated_lines: usize,
+    pub render_snapshot: Option<BufferSnapshot>,
 }
 
 impl DisplayMessage {
@@ -289,6 +290,7 @@ impl DisplayMessage {
             timestamp: None,
             turn_usage: None,
             truncated_lines: 0,
+            render_snapshot: None,
         }
     }
 
@@ -304,6 +306,7 @@ impl DisplayMessage {
             timestamp: None,
             turn_usage: None,
             truncated_lines: 0,
+            render_snapshot: None,
         }
     }
 }

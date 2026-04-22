@@ -24,8 +24,11 @@ use jiff::Timestamp;
 use jiff::tz::TimeZone;
 
 use crate::markdown::{Keep, should_truncate, text_to_lines, truncate_output, truncation_notice};
-use maki_agent::{BatchToolEntry, BatchToolStatus, InstructionBlock, ToolInput, ToolOutput};
-use ratatui::style::Style;
+use maki_agent::{
+    BatchToolEntry, BatchToolStatus, BufferSnapshot, InstructionBlock, SpanStyle, ToolInput,
+    ToolOutput,
+};
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 
 use crate::highlight::highlight_regex_inline;
@@ -627,6 +630,33 @@ impl ToolLineBuilder {
         index_highlight::push_index_lines(&mut self.lines, text, TOOL_BODY_INDENT);
     }
 
+    fn push_snapshot(&mut self, snapshot: &BufferSnapshot, search_fallback: Option<&str>) {
+        let total = snapshot.lines.len();
+        let max = self.limits.output;
+        let start = self.lines.len();
+        let (range, skipped) = if total > max {
+            let skipped = total - max;
+            match self.keep {
+                Keep::Tail => (skipped..total, skipped),
+                Keep::Head => (0..max, skipped),
+            }
+        } else {
+            (0..total, 0)
+        };
+        if matches!(self.keep, Keep::Tail) {
+            self.push_truncation_count(skipped);
+        }
+        self.lines
+            .extend(snapshot_to_lines_range(snapshot, TOOL_BODY_INDENT, range));
+        if matches!(self.keep, Keep::Head) {
+            self.push_truncation_count(skipped);
+        }
+        self.content_range = (start, self.lines.len());
+        if let Some(text) = search_fallback {
+            self.push_search_text(text);
+        }
+    }
+
     fn push_code_output_separator(&mut self, indent: &str) {
         if self.output_separator == OutputSeparator::CodeExecution {
             self.separator_line = Some(self.lines.len());
@@ -687,6 +717,61 @@ fn push_text_lines(lines: &mut Vec<Line<'static>>, text: &str, indent: &str) {
     }
 }
 
+fn snapshot_to_lines_range(
+    snapshot: &BufferSnapshot,
+    indent: &str,
+    range: std::ops::Range<usize>,
+) -> Vec<Line<'static>> {
+    snapshot.lines[range]
+        .iter()
+        .map(|sline| {
+            let mut spans = vec![Span::raw(indent.to_string())];
+            for span in &sline.spans {
+                spans.push(Span::styled(
+                    span.text.clone(),
+                    resolve_span_style(&span.style),
+                ));
+            }
+            Line::from(spans)
+        })
+        .collect()
+}
+
+fn resolve_span_style(style: &SpanStyle) -> Style {
+    match style {
+        SpanStyle::Default => Style::default(),
+        SpanStyle::Named(name) => theme::style_by_name(name),
+        SpanStyle::Inline(inline) => {
+            let mut s = Style::default();
+            if let Some((r, g, b)) = inline.fg {
+                s = s.fg(Color::Rgb(r, g, b));
+            }
+            if let Some((r, g, b)) = inline.bg {
+                s = s.bg(Color::Rgb(r, g, b));
+            }
+            if inline.bold {
+                s = s.bold();
+            }
+            if inline.italic {
+                s = s.italic();
+            }
+            if inline.underline {
+                s = s.underlined();
+            }
+            if inline.dim {
+                s = s.dim();
+            }
+            if inline.strikethrough {
+                s = s.crossed_out();
+            }
+            if inline.reversed {
+                s = s.reversed();
+            }
+            s
+        }
+    }
+}
+
 pub fn build_tool_lines(
     msg: &DisplayMessage,
     status: ToolStatus,
@@ -708,16 +793,28 @@ pub fn build_tool_lines(
     b.push_header(tool_name, header, msg.annotation.as_deref());
     b.prepend_indicator(status.into(), started_at);
     b.push_code_content(msg.tool_input.as_deref(), msg.tool_output.as_deref());
-    let is_done = status != ToolStatus::InProgress;
-    let resolved = resolve_output(
-        msg.tool_output.as_deref(),
-        body,
-        msg.live_output.as_deref(),
-        msg.truncated_lines,
-        b.limits,
-        b.keep,
-    );
-    b.push_resolved_output(&resolved, is_done);
+    if let Some(ref snapshot) = msg.render_snapshot {
+        let search_text = msg
+            .tool_output
+            .as_ref()
+            .and_then(|o| match o.as_ref() {
+                ToolOutput::Plain(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .or(body);
+        b.push_snapshot(snapshot, search_text);
+    } else {
+        let is_done = status != ToolStatus::InProgress;
+        let resolved = resolve_output(
+            msg.tool_output.as_deref(),
+            body,
+            msg.live_output.as_deref(),
+            msg.truncated_lines,
+            b.limits,
+            b.keep,
+        );
+        b.push_resolved_output(&resolved, is_done);
+    }
     b.finish(
         msg.tool_input.clone(),
         msg.tool_output.clone(),
@@ -850,7 +947,8 @@ mod tests {
     use crate::markdown::TRUNCATION_PREFIX;
     use maki_agent::tools::{BASH_TOOL_NAME, INDEX_TOOL_NAME, READ_TOOL_NAME, TASK_TOOL_NAME};
     use maki_agent::{
-        BatchToolEntry, BatchToolStatus, GrepFileEntry, GrepMatchGroup, ToolInput, ToolOutput,
+        BatchToolEntry, BatchToolStatus, GrepFileEntry, GrepMatchGroup, SnapshotLine, SnapshotSpan,
+        ToolInput, ToolOutput,
     };
     use test_case::test_case;
 
@@ -907,6 +1005,7 @@ mod tests {
             truncated_lines: 0,
             timestamp: None,
             turn_usage: None,
+            render_snapshot: None,
         }
     }
 
@@ -1323,6 +1422,7 @@ mod tests {
             timestamp: None,
             turn_usage: None,
             truncated_lines: 0,
+            render_snapshot: None,
         }
     }
 
@@ -1440,6 +1540,7 @@ mod tests {
             timestamp: None,
             turn_usage: None,
             truncated_lines: 0,
+            render_snapshot: None,
         }
     }
 
@@ -1480,6 +1581,114 @@ mod tests {
         assert!(line_has_styled(&tl, "fns:", t.index_section));
         assert!(line_has_styled(&tl, "[10-20]", t.index_line_nr));
         assert!(line_has_styled(&tl, "pub", t.index_keyword));
+    }
+
+    fn snapshot_msg(snapshot: BufferSnapshot) -> DisplayMessage {
+        DisplayMessage {
+            role: DisplayRole::Tool(Box::new(ToolRole {
+                id: "t1".into(),
+                status: ToolStatus::Success,
+                name: INDEX_TOOL_NAME.into(),
+            })),
+            text: "src/lib.rs\nplain fallback".into(),
+            tool_input: None,
+            tool_output: Some(Arc::new(ToolOutput::Plain("plain fallback".into()))),
+            live_output: None,
+            annotation: None,
+            plan_path: None,
+            timestamp: None,
+            turn_usage: None,
+            truncated_lines: 0,
+            render_snapshot: Some(snapshot),
+        }
+    }
+
+    fn make_snapshot(lines: Vec<Vec<SnapshotSpan>>) -> BufferSnapshot {
+        BufferSnapshot {
+            lines: lines
+                .into_iter()
+                .map(|spans| SnapshotLine { spans })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn snapshot_renders_styled_spans() {
+        let snapshot = make_snapshot(vec![vec![
+            SnapshotSpan {
+                text: "pub".into(),
+                style: SpanStyle::Named("keyword".into()),
+            },
+            SnapshotSpan {
+                text: " fn main()".into(),
+                style: SpanStyle::Named("tool".into()),
+            },
+        ]]);
+        let msg = snapshot_msg(snapshot);
+        let tl = build_tool_lines(
+            &msg,
+            ToolStatus::Success,
+            Instant::now(),
+            80,
+            SectionFlags::default(),
+            &TOL,
+            &reg(),
+        );
+        let t = theme::current();
+        assert!(line_has_styled(&tl, "pub", t.index_keyword));
+        assert!(line_has_styled(&tl, " fn main()", t.tool));
+    }
+
+    #[test]
+    fn snapshot_overrides_text_output() {
+        let snapshot = make_snapshot(vec![vec![SnapshotSpan {
+            text: "from_snapshot".into(),
+            style: SpanStyle::Default,
+        }]]);
+        let msg = snapshot_msg(snapshot);
+        let tl = build_tool_lines(
+            &msg,
+            ToolStatus::Success,
+            Instant::now(),
+            80,
+            SectionFlags::default(),
+            &TOL,
+            &reg(),
+        );
+        let text = lines_text(&tl);
+        assert!(text.contains("from_snapshot"));
+        assert!(!text.contains("plain fallback"));
+        assert!(
+            tl.search_text.contains("plain fallback"),
+            "search_text should contain tool output for Ctrl+F"
+        );
+    }
+
+    #[test]
+    fn snapshot_truncation_head() {
+        let lines: Vec<Vec<SnapshotSpan>> = (0..150)
+            .map(|i| {
+                vec![SnapshotSpan {
+                    text: format!("line_{i}"),
+                    style: SpanStyle::Default,
+                }]
+            })
+            .collect();
+        let snapshot = make_snapshot(lines);
+        let msg = snapshot_msg(snapshot);
+        let tl = build_tool_lines(
+            &msg,
+            ToolStatus::Success,
+            Instant::now(),
+            80,
+            SectionFlags::default(),
+            &TOL,
+            &reg(),
+        );
+        let text = lines_text(&tl);
+        assert!(text.contains("line_0"));
+        assert!(!text.contains("line_149"));
+        assert!(text.contains(TRUNCATION_PREFIX));
     }
 
     #[test_case(None,       None,    "bash",  false ; "none_output_none_body")]
@@ -1587,6 +1796,7 @@ mod tests {
             truncated_lines,
             timestamp: None,
             turn_usage: None,
+            render_snapshot: None,
         }
     }
 
@@ -1714,6 +1924,7 @@ mod tests {
             truncated_lines: 0,
             timestamp: None,
             turn_usage: None,
+            render_snapshot: None,
         }
     }
 
@@ -1796,5 +2007,253 @@ mod tests {
         };
         let ol = output_limits_from_hints("bash", &hints, &TOL);
         assert_eq!(ol.max_lines, TOL.bash);
+    }
+
+    #[test]
+    fn snapshot_truncation_tail() {
+        let mut custom_reg = RenderHintsRegistry::new();
+        custom_reg.register(
+            Arc::from("my_tail_tool"),
+            &maki_agent::RawRenderHints {
+                output_keep: Some("tail".into()),
+                ..Default::default()
+            },
+        );
+        let lines: Vec<Vec<SnapshotSpan>> = (0..150)
+            .map(|i| {
+                vec![SnapshotSpan {
+                    text: format!("line_{i}"),
+                    style: SpanStyle::Default,
+                }]
+            })
+            .collect();
+        let snapshot = make_snapshot(lines);
+        let msg = DisplayMessage {
+            role: DisplayRole::Tool(Box::new(ToolRole {
+                id: "t1".into(),
+                status: ToolStatus::Success,
+                name: "my_tail_tool".into(),
+            })),
+            text: "header\nfallback".into(),
+            tool_input: None,
+            tool_output: Some(Arc::new(ToolOutput::Plain("fallback".into()))),
+            live_output: None,
+            annotation: None,
+            plan_path: None,
+            timestamp: None,
+            turn_usage: None,
+            truncated_lines: 0,
+            render_snapshot: Some(snapshot),
+        };
+        let tl = build_tool_lines(
+            &msg,
+            ToolStatus::Success,
+            Instant::now(),
+            80,
+            SectionFlags::default(),
+            &TOL,
+            &custom_reg,
+        );
+        let text = lines_text(&tl);
+        assert!(
+            text.contains("line_149"),
+            "tail truncation should show last lines"
+        );
+        assert!(
+            !text.contains("line_0"),
+            "tail truncation should hide first lines"
+        );
+        assert!(text.contains(TRUNCATION_PREFIX));
+    }
+
+    #[test]
+    fn snapshot_empty_has_no_content_lines() {
+        let snapshot = make_snapshot(vec![]);
+        let msg = snapshot_msg(snapshot);
+        let tl = build_tool_lines(
+            &msg,
+            ToolStatus::Success,
+            Instant::now(),
+            80,
+            SectionFlags::default(),
+            &TOL,
+            &reg(),
+        );
+        assert!(
+            !lines_text(&tl).contains("plain fallback"),
+            "snapshot present means text path should not be used"
+        );
+        assert_eq!(tl.lines.len(), 1, "only the header line");
+    }
+
+    #[test]
+    fn snapshot_within_limit_no_truncation() {
+        let lines: Vec<Vec<SnapshotSpan>> = (0..3)
+            .map(|i| {
+                vec![SnapshotSpan {
+                    text: format!("row_{i}"),
+                    style: SpanStyle::Default,
+                }]
+            })
+            .collect();
+        let snapshot = make_snapshot(lines);
+        let msg = snapshot_msg(snapshot);
+        let tl = build_tool_lines(
+            &msg,
+            ToolStatus::Success,
+            Instant::now(),
+            80,
+            SectionFlags::default(),
+            &TOL,
+            &reg(),
+        );
+        let text = lines_text(&tl);
+        assert!(text.contains("row_0"));
+        assert!(text.contains("row_2"));
+        assert!(!text.contains(TRUNCATION_PREFIX));
+    }
+
+    #[test]
+    fn snapshot_search_text_uses_tool_output_not_body() {
+        let snapshot = make_snapshot(vec![vec![SnapshotSpan {
+            text: "visible".into(),
+            style: SpanStyle::Default,
+        }]]);
+        let msg = DisplayMessage {
+            role: DisplayRole::Tool(Box::new(ToolRole {
+                id: "t1".into(),
+                status: ToolStatus::Success,
+                name: INDEX_TOOL_NAME.into(),
+            })),
+            text: "src/lib.rs\nbody_text_here".into(),
+            tool_input: None,
+            tool_output: Some(Arc::new(ToolOutput::Plain("llm_output_here".into()))),
+            live_output: None,
+            annotation: None,
+            plan_path: None,
+            timestamp: None,
+            turn_usage: None,
+            truncated_lines: 0,
+            render_snapshot: Some(snapshot),
+        };
+        let tl = build_tool_lines(
+            &msg,
+            ToolStatus::Success,
+            Instant::now(),
+            80,
+            SectionFlags::default(),
+            &TOL,
+            &reg(),
+        );
+        assert!(
+            tl.search_text.contains("llm_output_here"),
+            "search_text should come from ToolOutput::Plain, not body text"
+        );
+    }
+
+    #[test]
+    fn snapshot_search_text_falls_back_to_body_when_no_plain_output() {
+        let snapshot = make_snapshot(vec![vec![SnapshotSpan {
+            text: "visible".into(),
+            style: SpanStyle::Default,
+        }]]);
+        let msg = DisplayMessage {
+            role: DisplayRole::Tool(Box::new(ToolRole {
+                id: "t1".into(),
+                status: ToolStatus::Success,
+                name: INDEX_TOOL_NAME.into(),
+            })),
+            text: "header\nbody_fallback".into(),
+            tool_input: None,
+            tool_output: None,
+            live_output: None,
+            annotation: None,
+            plan_path: None,
+            timestamp: None,
+            turn_usage: None,
+            truncated_lines: 0,
+            render_snapshot: Some(snapshot),
+        };
+        let tl = build_tool_lines(
+            &msg,
+            ToolStatus::Success,
+            Instant::now(),
+            80,
+            SectionFlags::default(),
+            &TOL,
+            &reg(),
+        );
+        assert!(
+            tl.search_text.contains("body_fallback"),
+            "search_text should fall back to msg body when no plain output"
+        );
+    }
+
+    #[test]
+    fn resolve_span_style_inline_all_modifiers() {
+        use maki_agent::types::InlineStyle;
+        let style = SpanStyle::Inline(InlineStyle {
+            fg: Some((10, 20, 30)),
+            bg: Some((40, 50, 60)),
+            bold: true,
+            italic: true,
+            underline: true,
+            dim: true,
+            strikethrough: true,
+            reversed: true,
+        });
+        let resolved = resolve_span_style(&style);
+        assert_eq!(resolved.fg, Some(Color::Rgb(10, 20, 30)));
+        assert_eq!(resolved.bg, Some(Color::Rgb(40, 50, 60)));
+        use ratatui::style::Modifier;
+        assert!(resolved.add_modifier.contains(Modifier::BOLD));
+        assert!(resolved.add_modifier.contains(Modifier::ITALIC));
+        assert!(resolved.add_modifier.contains(Modifier::UNDERLINED));
+        assert!(resolved.add_modifier.contains(Modifier::DIM));
+        assert!(resolved.add_modifier.contains(Modifier::CROSSED_OUT));
+        assert!(resolved.add_modifier.contains(Modifier::REVERSED));
+    }
+
+    #[test]
+    fn resolve_span_style_inline_no_modifiers() {
+        use maki_agent::types::InlineStyle;
+        let style = SpanStyle::Inline(InlineStyle::default());
+        let resolved = resolve_span_style(&style);
+        assert_eq!(resolved.fg, None);
+        assert_eq!(resolved.bg, None);
+        assert_eq!(resolved, Style::default());
+    }
+
+    #[test]
+    fn snapshot_to_lines_range_adds_indent_prefix() {
+        let snapshot = make_snapshot(vec![vec![SnapshotSpan {
+            text: "content".into(),
+            style: SpanStyle::Default,
+        }]]);
+        let lines = snapshot_to_lines_range(&snapshot, ">>", 0..1);
+        assert_eq!(lines.len(), 1);
+        let first_span = &lines[0].spans[0];
+        assert_eq!(first_span.content.as_ref(), ">>");
+    }
+
+    #[test]
+    fn snapshot_multi_span_line_preserves_order() {
+        let snapshot = make_snapshot(vec![vec![
+            SnapshotSpan {
+                text: "aaa".into(),
+                style: SpanStyle::Default,
+            },
+            SnapshotSpan {
+                text: "bbb".into(),
+                style: SpanStyle::Named("dim".into()),
+            },
+            SnapshotSpan {
+                text: "ccc".into(),
+                style: SpanStyle::Default,
+            },
+        ]]);
+        let lines = snapshot_to_lines_range(&snapshot, "", 0..1);
+        let texts: Vec<&str> = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(texts, vec!["", "aaa", "bbb", "ccc"]);
     }
 }

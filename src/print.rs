@@ -1,19 +1,11 @@
 //! Non-interactive (headless) mode: `maki "prompt" --print`.
 //!
-//! # Claude Code compatibility
+//! Wire format intentionally matches Claude Code so existing scripts work
+//! unchanged. Keep `PrintResult` fields a strict subset of theirs. `StreamJson`
+//! is JSONL with the same shape, `Text` prints the raw response only.
 //!
-//! `--print` and `--output-format text|json|stream-json` match Claude Code on
-//! purpose. Tools and scripts that consume Claude Code output should work with
-//! ours unchanged.
-//!
-//! Rules:
-//! - JSON fields in `PrintResult` must be a strict subset of Claude Code's.
-//!   Don't add maki-specific fields.
-//! - `StreamJson` is JSONL, one object per line, same shape as Claude Code.
-//! - `Text` prints the raw response, nothing else.
-//!
-//! We can adopt new fields when Claude Code adds them, but we don't invent our
-//! own. Check Claude Code's docs/source before changing anything here.
+//! We adopt new fields when Claude Code adds them but never invent our own.
+//! Check their docs before changing anything here.
 
 use std::env;
 use std::io::{self, Read};
@@ -282,6 +274,8 @@ pub fn run(
             | AgentEvent::PermissionRequest { .. }
             | AgentEvent::QuestionPrompt { .. }
             | AgentEvent::SubagentHistory { .. }
+            | AgentEvent::ToolSnapshot { .. }
+            | AgentEvent::ToolAnnotation { .. }
             | AgentEvent::Retry { .. } => {
                 if is_stream_json {
                     println!("{}", serde_json::to_string(&envelope)?);
