@@ -10,7 +10,7 @@ use tracing::{debug, error, warn};
 use crate::mcp::{McpHandle, UNKNOWN_MCP};
 use crate::task_set::TaskSet;
 use crate::tools::ToolContext;
-use crate::tools::registry::{DELEGATE_NATIVE, ToolInvocation, ToolRegistry, ToolSource};
+use crate::tools::registry::{ToolInvocation, ToolRegistry};
 use crate::{AgentError, AgentEvent, AgentMode, ToolDoneEvent, ToolOutput, ToolStartEvent};
 
 const DOOM_LOOP_THRESHOLD: usize = 3;
@@ -119,25 +119,7 @@ pub async fn run(
             return done_error(e);
         }
 
-        let mut result = invocation.execute(ctx).await;
-
-        if matches!(&result, Ok(ToolOutput::Plain(s)) if s == DELEGATE_NATIVE && matches!(entry.source, ToolSource::Lua { .. }))
-        {
-            debug!(tool = %name, "DELEGATE_NATIVE: falling back to native tool");
-            match registry.get_native_fallback(name) {
-                Some(native) => match native.tool.parse(input) {
-                    Ok(native_inv) => {
-                        result = match enforce_permission(native_inv.as_ref(), name, ctx, &id).await
-                        {
-                            Ok(()) => native_inv.execute(ctx).await,
-                            Err(e) => Err(e),
-                        };
-                    }
-                    Err(e) => result = Err(format!("native fallback parse error: {e}")),
-                },
-                None => result = Err(format!("no native tool '{name}' for DELEGATE_NATIVE")),
-            }
-        }
+        let result = invocation.execute(ctx).await;
 
         let elapsed = started.elapsed();
         match result {

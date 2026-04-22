@@ -576,7 +576,6 @@ fn generalize_scope(tool: &str, scope: &str) -> String {
                 _ => "**".to_string(),
             }
         }
-        "webfetch" | "websearch" => "*".to_string(),
         _ => scope.to_string(),
     }
 }
@@ -680,7 +679,6 @@ mod tests {
     #[test_case("write", "/tmp/file.txt" => true ; "write_in_cwd")]
     #[test_case("write", "/etc/passwd" => false ; "write_outside_cwd")]
     #[test_case("task", "task:research" => true ; "task_allowed")]
-    #[test_case("websearch", "rust async" => false ; "websearch_prompts")]
     #[test_case("bash", "cargo test" => false ; "bash_prompts")]
     fn builtin_check(tool: &str, scope: &str) -> bool {
         matches!(default_mgr().check(tool, scope), PermissionCheck::Allowed)

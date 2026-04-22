@@ -256,6 +256,9 @@ fn parse_render_hints(spec: &Table) -> Option<RawRenderHints> {
         output_keep: render.get::<String>("output_keep").ok(),
         output_separator: render.get::<String>("output_separator").ok(),
         skip_done_truncation: render.get::<bool>("skip_done_truncation").ok(),
+        header_style: render.get::<String>("header_style").ok(),
+        body_format: render.get::<String>("body_format").ok(),
+        always_annotate: render.get::<bool>("always_annotate").ok(),
     })
 }
 

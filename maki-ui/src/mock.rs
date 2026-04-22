@@ -1,7 +1,7 @@
 use maki_agent::tools::{
     BASH_TOOL_NAME, BATCH_TOOL_NAME, CODE_EXECUTION_TOOL_NAME, EDIT_TOOL_NAME, GLOB_TOOL_NAME,
-    GREP_TOOL_NAME, INDEX_TOOL_NAME, MULTIEDIT_TOOL_NAME, QUESTION_TOOL_NAME, READ_TOOL_NAME,
-    TASK_TOOL_NAME, TODOWRITE_TOOL_NAME, WEBFETCH_TOOL_NAME, WRITE_TOOL_NAME,
+    GREP_TOOL_NAME, MULTIEDIT_TOOL_NAME, QUESTION_TOOL_NAME, READ_TOOL_NAME, TASK_TOOL_NAME,
+    TODOWRITE_TOOL_NAME, WRITE_TOOL_NAME,
 };
 use maki_agent::{
     AgentEvent, BatchToolEntry, BatchToolStatus, Envelope, GrepFileEntry, GrepMatchGroup,
@@ -371,13 +371,13 @@ pub fn mock_events() -> Vec<MockEvent> {
     // Index - Success
     events.push(evt(tool_start(
         "t_index",
-        INDEX_TOOL_NAME,
+        "index",
         "src/config/mod.rs",
         None,
     )));
     events.push(evt(tool_done(
         "t_index",
-        INDEX_TOOL_NAME,
+        "index",
         ToolOutput::Plain(
             concat!(
                 "imports: [1-3]\n",
@@ -404,13 +404,13 @@ pub fn mock_events() -> Vec<MockEvent> {
     // WebFetch - Success
     events.push(evt(tool_start(
         "t_web",
-        WEBFETCH_TOOL_NAME,
+        "webfetch",
         "https://docs.rs/config",
         None,
     )));
     events.push(evt(tool_done(
         "t_web",
-        WEBFETCH_TOOL_NAME,
+        "webfetch",
         ToolOutput::Plain("Configuration crate docs content...".into()),
         false,
     )));

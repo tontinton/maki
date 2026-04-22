@@ -145,6 +145,11 @@ Return a compact overview of a source file: imports, type definitions, function 
       path = { type = "string", description = "Absolute path to the file", required = true },
     },
   },
+  render = {
+    header_style = "path",
+    body_format = "index",
+    always_annotate = true,
+  },
   header = function(input)
     return build_header(input.path)
   end,
@@ -156,12 +161,12 @@ Return a compact overview of a source file: imports, type definitions, function 
 
     local ext = path:match("%.([^%.]+)$")
     if not ext then
-      return "DELEGATE_NATIVE"
+      return { llm_output = "Unsupported file type: (no extension). Use the read tool instead.", is_error = true }
     end
 
     local lang = indexer.EXT_TO_LANG[ext]
     if not lang then
-      return "DELEGATE_NATIVE"
+      return { llm_output = "Unsupported file type: ." .. ext .. ". Use the read tool instead.", is_error = true }
     end
 
     local config = ctx:config()

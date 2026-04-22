@@ -15,7 +15,6 @@ const SECTIONS: &[(&str, &[&str])] = &[
             "multiedit",
             "glob",
             "grep",
-            "index",
             "find_symbol",
         ],
     ),
@@ -23,7 +22,6 @@ const SECTIONS: &[(&str, &[&str])] = &[
         "Execution & Control",
         &["batch", "code_execution", "question"],
     ),
-    ("External", &["webfetch", "websearch"]),
     (
         "Agent & Knowledge",
         &["task", "todo_write", "memory", "skill"],

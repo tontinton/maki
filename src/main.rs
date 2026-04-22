@@ -104,11 +104,14 @@ fn normalize_tool_name(name: &str) -> Result<String> {
             result.push(c);
         }
     }
-    if maki_agent::tools::native_static_name(&result).is_none() {
+    if maki_agent::tools::ToolRegistry::native()
+        .get(&result)
+        .is_none()
+    {
         bail!(
             "unknown tool '{}'. Valid tools: {}",
             name,
-            maki_agent::tools::NATIVE_NAMES.join(", ")
+            maki_agent::tools::NATIVE_TOOL_NAMES.join(", ")
         );
     }
     Ok(result)
@@ -262,19 +265,7 @@ fn run() -> Result<()> {
             let result: Result<maki_agent::ToolOutput, String> =
                 smol::block_on(async { inv.execute(&ctx).await });
             match result {
-                Ok(output) => {
-                    let text = output.as_text();
-                    if text == "DELEGATE_NATIVE" {
-                        let output = maki_code_index::index_file(
-                            &abs_path,
-                            config.agent.index_max_file_size,
-                        )
-                        .context("index file")?;
-                        print!("{output}");
-                    } else {
-                        print!("{text}");
-                    }
-                }
+                Ok(output) => print!("{}", output.as_text()),
                 Err(e) => bail!("index failed: {e}"),
             }
         }

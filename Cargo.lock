@@ -2253,7 +2253,6 @@ dependencies = [
  "getrandom 0.3.4",
  "grep-regex",
  "grep-searcher",
- "htmd",
  "humantime",
  "ignore",
  "isahc",

@@ -16,7 +16,6 @@ ignore = { workspace = true }
 strum = { workspace = true }
 maki-tool-macro = { workspace = true }
 maki-storage = { workspace = true }
-htmd = { workspace = true }
 regex = { workspace = true }
 grep-regex = { workspace = true }
 grep-searcher = { workspace = true }

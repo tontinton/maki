@@ -700,7 +700,7 @@ fn parse_batch_inner_id_cases(input: &str, expected: Option<(&str, usize)>) {
 }
 
 #[test_case("bash", 1, 1 ; "known_tool_creates_message")]
-#[test_case("nonexistent_tool", 0, 0 ; "unknown_tool_ignored")]
+#[test_case("nonexistent_tool", 1, 1 ; "unknown_tool_accepted")]
 fn tool_pending(tool: &str, expected_msgs: usize, expected_in_progress: usize) {
     let mut panel = MessagesPanel::new(UiConfig::default());
     panel.tool_pending("t1".into(), tool);

@@ -569,6 +569,9 @@ pub struct RawRenderHints {
     pub output_keep: Option<String>,
     pub output_separator: Option<String>,
     pub skip_done_truncation: Option<bool>,
+    pub header_style: Option<String>,
+    pub body_format: Option<String>,
+    pub always_annotate: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]

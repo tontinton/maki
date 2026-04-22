@@ -22,6 +22,9 @@ maki.api.register_tool({
       num_results = { type = "integer", description = "Number of results to return (default 8)" },
     },
   },
+  render = {
+    always_annotate = true,
+  },
   permission_scope = "query",
   audiences = { "main", "interpreter" },
 

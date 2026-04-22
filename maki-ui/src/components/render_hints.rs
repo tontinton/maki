@@ -2,9 +2,9 @@ use crate::markdown::Keep;
 use maki_agent::RawRenderHints;
 use maki_agent::tools::{
     BASH_TOOL_NAME, BATCH_TOOL_NAME, CODE_EXECUTION_TOOL_NAME, EDIT_TOOL_NAME,
-    FIND_SYMBOL_TOOL_NAME, GLOB_TOOL_NAME, GREP_TOOL_NAME, INDEX_TOOL_NAME, MEMORY_TOOL_NAME,
-    MULTIEDIT_TOOL_NAME, QUESTION_TOOL_NAME, READ_TOOL_NAME, SKILL_TOOL_NAME, TASK_TOOL_NAME,
-    TODOWRITE_TOOL_NAME, WEBFETCH_TOOL_NAME, WEBSEARCH_TOOL_NAME, WRITE_TOOL_NAME,
+    FIND_SYMBOL_TOOL_NAME, GLOB_TOOL_NAME, GREP_TOOL_NAME, MEMORY_TOOL_NAME, MULTIEDIT_TOOL_NAME,
+    QUESTION_TOOL_NAME, READ_TOOL_NAME, SKILL_TOOL_NAME, TASK_TOOL_NAME, TODOWRITE_TOOL_NAME,
+    WRITE_TOOL_NAME,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -70,8 +70,17 @@ impl Default for ToolRenderHints {
 impl ToolRenderHints {
     pub fn from_raw(raw: &RawRenderHints, existing: Option<&Self>) -> Self {
         Self {
-            header_style: existing.map_or(HeaderStyle::Plain, |e| e.header_style),
-            body_format: existing.map_or(BodyFormat::Plain, |e| e.body_format),
+            header_style: match raw.header_style.as_deref() {
+                Some("path") => HeaderStyle::Path,
+                Some("command") => HeaderStyle::Command,
+                Some("grep") => HeaderStyle::Grep,
+                _ => existing.map_or(HeaderStyle::Plain, |e| e.header_style),
+            },
+            body_format: match raw.body_format.as_deref() {
+                Some("markdown") => BodyFormat::Markdown,
+                Some("index") => BodyFormat::Index,
+                _ => existing.map_or(BodyFormat::Plain, |e| e.body_format),
+            },
             output_lines: raw.output_lines,
             output_keep: match raw.output_keep.as_deref() {
                 Some("tail") => OutputKeep::Tail,
@@ -82,7 +91,9 @@ impl ToolRenderHints {
                 Some("code_execution") => OutputSeparator::CodeExecution,
                 _ => OutputSeparator::None,
             },
-            always_annotate: existing.is_some_and(|e| e.always_annotate),
+            always_annotate: raw
+                .always_annotate
+                .unwrap_or_else(|| existing.is_some_and(|e| e.always_annotate)),
             skip_done_truncation: raw.skip_done_truncation.unwrap_or(false),
         }
     }
@@ -111,7 +122,7 @@ impl ToolRenderHints {
     };
 }
 
-const NATIVE_HINTS: &[(&str, ToolRenderHints)] = &[
+const DEFAULT_HINTS: &[(&str, ToolRenderHints)] = &[
     hint!(BASH_TOOL_NAME,
         header_style: HeaderStyle::Command,
         output_keep: OutputKeep::Tail,
@@ -124,11 +135,6 @@ const NATIVE_HINTS: &[(&str, ToolRenderHints)] = &[
     hint!(TASK_TOOL_NAME,
         body_format: BodyFormat::Markdown,
     ),
-    hint!(INDEX_TOOL_NAME,
-        header_style: HeaderStyle::Path,
-        body_format: BodyFormat::Index,
-        always_annotate: true,
-    ),
     hint!(GREP_TOOL_NAME,
         header_style: HeaderStyle::Grep,
     ),
@@ -140,13 +146,6 @@ const NATIVE_HINTS: &[(&str, ToolRenderHints)] = &[
     hint!(EDIT_TOOL_NAME, header_style: HeaderStyle::Path),
     hint!(MULTIEDIT_TOOL_NAME, header_style: HeaderStyle::Path),
     hint!(MEMORY_TOOL_NAME, header_style: HeaderStyle::Path),
-    hint!(WEBFETCH_TOOL_NAME,
-        always_annotate: true,
-        skip_done_truncation: true,
-    ),
-    hint!(WEBSEARCH_TOOL_NAME,
-        always_annotate: true,
-    ),
     hint!(FIND_SYMBOL_TOOL_NAME),
     hint!(TODOWRITE_TOOL_NAME),
     hint!(QUESTION_TOOL_NAME),
@@ -160,7 +159,7 @@ pub struct RenderHintsRegistry {
 
 impl RenderHintsRegistry {
     pub fn new() -> Self {
-        let hints = NATIVE_HINTS
+        let hints = DEFAULT_HINTS
             .iter()
             .map(|(name, h)| (Arc::from(*name), *h))
             .collect();
@@ -189,16 +188,13 @@ impl RenderHintsRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use maki_agent::tools::native_static_name;
     use test_case::test_case;
 
     #[test]
-    fn native_hints_complete() {
-        for (name, _) in NATIVE_HINTS {
-            assert!(
-                native_static_name(name).is_some(),
-                "{name} in NATIVE_HINTS is not a registered native tool"
-            );
+    fn default_hints_are_known_tools() {
+        let known: Vec<&str> = DEFAULT_HINTS.iter().map(|(n, _)| *n).collect();
+        for name in &known {
+            assert!(!name.is_empty(), "empty tool name in DEFAULT_HINTS");
         }
     }
 
@@ -209,7 +205,7 @@ mod tests {
         for name in native_names.names() {
             assert!(
                 reg.hints.contains_key(&*name),
-                "native tool {name} missing from NATIVE_HINTS"
+                "native tool {name} missing from DEFAULT_HINTS"
             );
         }
     }
@@ -223,9 +219,6 @@ mod tests {
         assert_eq!(matches!(hints.output_keep, OutputKeep::Tail), expect_tail);
     }
 
-    #[test_case("webfetch", true ; "webfetch_always_annotate")]
-    #[test_case("websearch", true ; "websearch_always_annotate")]
-    #[test_case("index", true ; "index_always_annotate")]
     #[test_case("bash", false ; "bash_no_always_annotate")]
     fn always_annotate(tool: &str, expected: bool) {
         let reg = RenderHintsRegistry::new();
@@ -250,7 +243,6 @@ mod tests {
         assert!(!reg.get("my_plugin_tool").always_annotate);
     }
 
-    #[test_case("webfetch", true ; "webfetch_skip_done")]
     #[test_case("bash", false ; "bash_no_skip_done")]
     fn skip_done_truncation(tool: &str, expected: bool) {
         let reg = RenderHintsRegistry::new();
@@ -289,18 +281,27 @@ mod tests {
     }
 
     #[test]
-    fn register_preserves_native_body_format() {
+    fn register_preserves_existing_body_format() {
         let mut reg = RenderHintsRegistry::new();
-        assert_eq!(reg.get(INDEX_TOOL_NAME).body_format, BodyFormat::Index);
         reg.register(
-            Arc::from(INDEX_TOOL_NAME),
+            Arc::from("custom"),
+            &RawRenderHints {
+                body_format: Some("index".into()),
+                always_annotate: Some(true),
+                ..Default::default()
+            },
+        );
+        assert_eq!(reg.get("custom").body_format, BodyFormat::Index);
+        assert!(reg.get("custom").always_annotate);
+        reg.register(
+            Arc::from("custom"),
             &RawRenderHints {
                 output_lines: Some(100),
                 ..Default::default()
             },
         );
-        assert_eq!(reg.get(INDEX_TOOL_NAME).body_format, BodyFormat::Index);
-        assert!(reg.get(INDEX_TOOL_NAME).always_annotate);
+        assert_eq!(reg.get("custom").body_format, BodyFormat::Index);
+        assert!(reg.get("custom").always_annotate);
     }
 
     #[test]

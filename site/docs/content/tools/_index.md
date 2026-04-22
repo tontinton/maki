@@ -7,7 +7,7 @@ group = "Reference"
 
 # Tools
 
-Maki ships with 18 built-in tools. This is the full reference.
+Maki ships with 15 built-in tools. This is the full reference.
 
 ## File Operations
 
@@ -85,14 +85,6 @@ Search file contents using regex.
 | `path` | string | no | cwd | Directory to search in |
 | `pattern` | string | yes |  | Regex pattern |
 
-### `index`
-
-Return a compact overview of a source file: imports, type definitions, function signatures, and structure with their line numbers surrounded by []. ~70-90% more efficient than reading the full file.
-
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `path` | string | yes | Absolute path to the file |
-
 ### `find_symbol`
 
 Find all references to a symbol across a project. Scope-aware: locals search enclosing function, private items search the file.
@@ -137,27 +129,6 @@ Use this tool when you need to ask the user questions during execution. This all
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `questions` | array | yes | List of questions to ask the user |
-
-## External
-
-### `webfetch`
-
-Fetch a URL and return its contents.
-
-| Parameter | Type | Required | Default | Description |
-|-----------|------|----------|---------|-------------|
-| `format` | string | no |  | Output format: markdown (default), text, or html |
-| `timeout` | integer | no | 30, max 120 | Timeout in seconds |
-| `url` | string | yes |  | URL to fetch (http:// or https://) |
-
-### `websearch`
-
-Search the web for real-time information using Exa AI.
-
-| Parameter | Type | Required | Default | Description |
-|-----------|------|----------|---------|-------------|
-| `num_results` | integer | no | 8 | Number of results to return |
-| `query` | string | yes |  | Search query |
 
 ## Agent & Knowledge
 

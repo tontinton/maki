@@ -15,7 +15,6 @@ mod find_symbol;
 mod fuzzy_replace;
 mod glob;
 mod grep;
-mod index;
 pub mod memory;
 mod multiedit;
 mod question;
@@ -25,8 +24,6 @@ pub mod schema;
 mod skill;
 mod task;
 mod todowrite;
-mod webfetch;
-mod websearch;
 mod write;
 
 pub use file_tracker::FileReadTracker;
@@ -139,15 +136,12 @@ pub const EDIT_TOOL_NAME: &str = edit::Edit::NAME;
 pub const FIND_SYMBOL_TOOL_NAME: &str = find_symbol::FindSymbol::NAME;
 pub const GLOB_TOOL_NAME: &str = glob::Glob::NAME;
 pub const GREP_TOOL_NAME: &str = grep::Grep::NAME;
-pub const INDEX_TOOL_NAME: &str = index::Index::NAME;
 pub const MULTIEDIT_TOOL_NAME: &str = multiedit::MultiEdit::NAME;
 pub const QUESTION_TOOL_NAME: &str = question::Question::NAME;
 pub const READ_TOOL_NAME: &str = read::Read::NAME;
 pub const SKILL_TOOL_NAME: &str = skill::SkillTool::NAME;
 pub const TASK_TOOL_NAME: &str = task::Task::NAME;
 pub const TODOWRITE_TOOL_NAME: &str = todowrite::TodoWrite::NAME;
-pub const WEBFETCH_TOOL_NAME: &str = webfetch::WebFetch::NAME;
-pub const WEBSEARCH_TOOL_NAME: &str = websearch::WebSearch::NAME;
 pub const WRITE_TOOL_NAME: &str = write::Write::NAME;
 pub const MEMORY_TOOL_NAME: &str = memory::Memory::NAME;
 pub const CODE_EXECUTION_TOOL_NAME: &str = code_execution::CodeExecution::NAME;
@@ -548,12 +542,7 @@ macro_rules! register_tools {
             ]
         }
 
-        /// UI code stores tool names as `&'static str` (e.g. `DisplayRole::Tool`).
-        pub const NATIVE_NAMES: &[&str] = &[$(<$inner>::NAME),+];
-
-        pub fn native_static_name(name: &str) -> Option<&'static str> {
-            NATIVE_NAMES.iter().copied().find(|n| *n == name)
-        }
+        pub const NATIVE_TOOL_NAMES: &[&str] = &[$(<$inner>::NAME),+];
     };
 }
 
@@ -565,12 +554,9 @@ register_tools! {
     multiedit::MultiEdit,
     glob::Glob,
     grep::Grep,
-    index::Index,
     find_symbol::FindSymbol,
     question::Question,
     todowrite::TodoWrite,
-    webfetch::WebFetch,
-    websearch::WebSearch,
     skill::SkillTool,
     task::Task,
     batch::Batch,

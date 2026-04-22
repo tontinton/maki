@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use maki_agent::tools::ToolRegistry;
-use maki_agent::tools::registry::DELEGATE_NATIVE;
 use maki_code_index::{Language, index_source};
 use maki_config::PluginsConfig;
 use maki_lua::PluginHost;
@@ -201,25 +200,25 @@ fn header_returns_normalized_path() {
 
 #[test_case("test.xyz", "some content" ; "unsupported_extension")]
 #[test_case("Makefile", "all:\n\techo hi"                ; "no_extension")]
-fn delegates_to_native(filename: &str, source: &str) {
+fn returns_error_for_unsupported(filename: &str, source: &str) {
     let s = setup();
     let input = write_fixture(s.tmp.path(), filename, source);
-    let result = exec_tool(&s.reg, "index", input).unwrap();
-    assert_eq!(result, DELEGATE_NATIVE);
+    let result = exec_tool(&s.reg, "index", input);
+    assert!(result.is_err(), "expected error for {filename}");
+    let err = result.unwrap_err();
+    assert!(
+        err.contains("Unsupported file type"),
+        "error should mention unsupported file type, got: {err}"
+    );
 }
 
 #[test]
-fn delegate_native_via_dispatch_runs_native_tool() {
+fn unsupported_via_dispatch_returns_error() {
     use maki_agent::agent::tool_dispatch;
 
     let s = setup();
-    assert!(s.reg.get_native_fallback("index").is_some());
 
-    let input = write_fixture(
-        s.tmp.path(),
-        "test.go",
-        "package main\n\nfunc main() {\n}\n",
-    );
+    let input = write_fixture(s.tmp.path(), "test.xyz", "some content");
     let ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
 
     let done = smol::block_on(tool_dispatch::run(
@@ -232,11 +231,10 @@ fn delegate_native_via_dispatch_runs_native_tool() {
     ));
 
     assert!(
-        !done.is_error,
-        "expected success, got: {}",
+        done.is_error,
+        "expected error for unsupported extension, got: {}",
         done.output.as_text()
     );
-    assert_ne!(done.output.as_text(), DELEGATE_NATIVE);
 }
 
 #[test]

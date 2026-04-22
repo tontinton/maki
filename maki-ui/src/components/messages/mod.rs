@@ -33,7 +33,6 @@ use std::time::Instant;
 
 use super::scrollbar::render_vertical_scrollbar;
 use super::streaming_content::StreamingContent;
-use maki_agent::tools::native_static_name;
 use maki_agent::{
     BatchToolEntry, BatchToolStatus, BufferSnapshot, InstructionBlock, NO_FILES_FOUND,
     RawRenderHints, ToolDoneEvent, ToolOutput, ToolStartEvent,
@@ -127,9 +126,6 @@ impl MessagesPanel {
     }
 
     pub fn tool_pending(&mut self, id: String, name: &str) {
-        let Some(name) = native_static_name(name) else {
-            return;
-        };
         self.flush();
         let role = DisplayRole::Tool(Box::new(ToolRole {
             id,

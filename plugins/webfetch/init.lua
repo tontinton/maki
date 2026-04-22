@@ -74,6 +74,10 @@ maki.api.register_tool({
       timeout = { type = "integer", description = "Timeout in seconds (default 30, max 120)" },
     },
   },
+  render = {
+    always_annotate = true,
+    skip_done_truncation = true,
+  },
   permission_scope = "url",
 
   header = function(input)

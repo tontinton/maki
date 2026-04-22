@@ -15,7 +15,7 @@ use crate::components::{DisplayMessage, DisplayRole, ToolRole, ToolStatus};
 use crate::markdown::truncate_output;
 
 use crate::selection::Selection;
-use maki_agent::tools::{ToolInvocation, ToolRegistry, native_static_name};
+use maki_agent::tools::{ToolInvocation, ToolRegistry};
 use maki_agent::{
     AgentEvent, BatchToolStatus, NO_FILES_FOUND, QuestionInfo, RawRenderHints, ToolDoneEvent,
     ToolOutput, ToolStartEvent,
@@ -336,7 +336,7 @@ pub fn history_to_display(
                                 .push(DisplayMessage::new(DisplayRole::Thinking, thinking.clone()));
                         }
                         ContentBlock::ToolUse { id, name, input } => {
-                            let static_name = native_static_name(name).unwrap_or("unknown");
+                            let static_name = name.as_str();
                             let reg = ToolRegistry::native();
                             let tool_call: Option<Box<dyn ToolInvocation>> =
                                 reg.get(name).and_then(|entry| entry.try_parse(input));
@@ -812,22 +812,6 @@ mod tests {
             long_output.len()
         );
     }
-
-    #[test]
-    fn history_webfetch_hides_body() {
-        let msgs = tool_use_pair(
-            "webfetch",
-            serde_json::json!({"url": "https://example.com"}),
-            "fetched content\nmore lines",
-            false,
-        );
-        let display = history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default());
-        assert!(
-            !display[0].text.contains('\n'),
-            "webfetch should hide body text"
-        );
-    }
-
     #[test]
     fn history_stored_batch_with_errors_shows_count() {
         let batch_output = ToolOutput::Batch {

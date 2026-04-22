@@ -17,8 +17,6 @@ use crate::{BufferSnapshot, ToolInput as ToolInputEvent, ToolOutput};
 
 use super::{DescriptionContext, ToolContext};
 
-pub const DELEGATE_NATIVE: &str = "DELEGATE_NATIVE";
-
 bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct ToolAudience: u8 {
@@ -305,7 +303,7 @@ impl ToolRegistry {
 
     /// Atomically swap a plugin's tools in. When a bundled plugin provides a tool
     /// with the same name as a native one, the native gets moved to `native_fallbacks`
-    /// so Lua can return DELEGATE_NATIVE to fall through. Conflicts with other
+    /// so header resolution can still use the native's start_header. Conflicts with other
     /// non-native sources still roll back.
     pub fn replace_plugin(
         &self,
@@ -393,7 +391,7 @@ impl ToolRegistry {
         }
     }
 
-    pub fn get_native_fallback(&self, name: &str) -> Option<RegisteredTool> {
+    fn native_fallback(&self, name: &str) -> Option<RegisteredTool> {
         self.native_fallbacks
             .load()
             .iter()
@@ -420,7 +418,7 @@ impl ToolRegistry {
     }
 
     fn resolve_invocation(&self, name: &str, input: &Value) -> Option<Box<dyn ToolInvocation>> {
-        self.get_native_fallback(name)
+        self.native_fallback(name)
             .and_then(|e| e.try_parse(input))
             .or_else(|| self.get(name).and_then(|e| e.try_parse(input)))
     }
@@ -654,30 +652,30 @@ mod tests {
     #[test]
     fn replace_plugin_displaces_native_and_clear_restores_it() {
         let reg = ToolRegistry::new();
-        reg.register(mock("index"), ToolSource::Native).unwrap();
+        reg.register(mock("mytool"), ToolSource::Native).unwrap();
 
         reg.replace_plugin(
-            "idx",
+            "myplugin",
             vec![(
-                mock("index"),
+                mock("mytool"),
                 ToolSource::Lua {
-                    plugin: "idx".into(),
+                    plugin: "myplugin".into(),
                 },
             )],
         )
         .unwrap();
 
-        let entry = reg.get("index").unwrap();
+        let entry = reg.get("mytool").unwrap();
         assert!(matches!(entry.source, ToolSource::Lua { .. }));
 
-        let fallback = reg.get_native_fallback("index");
+        let fallback = reg.native_fallback("mytool");
         assert!(fallback.is_some());
         assert!(matches!(fallback.unwrap().source, ToolSource::Native));
 
-        reg.clear_plugin("idx");
-        let restored = reg.get("index").unwrap();
+        reg.clear_plugin("myplugin");
+        let restored = reg.get("mytool").unwrap();
         assert!(matches!(restored.source, ToolSource::Native));
-        assert!(reg.get_native_fallback("index").is_none());
+        assert!(reg.native_fallback("mytool").is_none());
     }
 
     #[test]
