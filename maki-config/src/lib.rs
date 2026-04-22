@@ -641,7 +641,7 @@ pub struct PluginsConfig {
 
 impl PluginsConfig {
     fn from_file(f: PluginsFileConfig) -> Self {
-        let enabled = f.enabled.unwrap_or(false);
+        let enabled = f.enabled.unwrap_or(true);
         let init_file = f.init_file.or_else(|| {
             let path = global_dir()?.join("init.lua");
             path.is_file().then_some(path)

@@ -72,9 +72,9 @@ struct Cli {
     #[arg(long)]
     no_rtk: bool,
 
-    /// Enable the Lua plugin system
+    /// Disable the Lua plugin system
     #[arg(long)]
-    plugins: bool,
+    no_plugins: bool,
 
     /// Skip all permission prompts (allow everything)
     #[arg(long)]
@@ -243,8 +243,8 @@ fn run() -> Result<()> {
         Some(Command::Index { path }) => {
             let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
             let mut config = load_config(&cwd, false);
-            if cli.plugins {
-                config.plugins.enabled = true;
+            if cli.no_plugins {
+                config.plugins.enabled = false;
             }
             let abs_path = Path::new(&path)
                 .canonicalize()
@@ -350,8 +350,8 @@ fn run() -> Result<()> {
                 low_speed: config.provider.low_speed_timeout,
                 stream: config.provider.stream_timeout,
             };
-            if cli.plugins {
-                config.plugins.enabled = true;
+            if cli.no_plugins {
+                config.plugins.enabled = false;
             }
             if cli.yolo || config.always_yolo {
                 config.permissions.allow_all = true;
