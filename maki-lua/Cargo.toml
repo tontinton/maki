@@ -19,11 +19,28 @@ flume = { workspace = true }
 futures-lite = { workspace = true }
 tree-sitter = { workspace = true }
 regex = { workspace = true }
-maki-code-index = { workspace = true }
 include_dir = { workspace = true }
 dirs = { workspace = true }
 isahc = { workspace = true }
 htmd = { workspace = true }
+tree-sitter-bash = { workspace = true }
+tree-sitter-c = { workspace = true }
+tree-sitter-c-sharp = { workspace = true }
+tree-sitter-cpp = { workspace = true }
+tree-sitter-elixir = { workspace = true }
+tree-sitter-go = { workspace = true }
+tree-sitter-java = { workspace = true }
+tree-sitter-javascript = { workspace = true }
+tree-sitter-kotlin-ng = { workspace = true }
+tree-sitter-lua = { workspace = true }
+tree-sitter-md = { workspace = true }
+tree-sitter-php = { workspace = true }
+tree-sitter-python = { workspace = true }
+tree-sitter-ruby = { workspace = true }
+tree-sitter-rust = { workspace = true }
+tree-sitter-scala = { workspace = true }
+tree-sitter-swift = { workspace = true }
+tree-sitter-typescript = { workspace = true }
 
 [dev-dependencies]
 maki-agent = { workspace = true }

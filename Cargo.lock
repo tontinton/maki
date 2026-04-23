@@ -2219,7 +2219,6 @@ dependencies = [
  "isahc",
  "libc",
  "maki-agent",
- "maki-code-index",
  "maki-config",
  "maki-lua",
  "maki-providers",
@@ -2258,7 +2257,6 @@ dependencies = [
  "isahc",
  "jiff",
  "libc",
- "maki-code-index",
  "maki-config",
  "maki-interpreter",
  "maki-providers",
@@ -2282,35 +2280,6 @@ dependencies = [
  "tree-sitter",
  "tree-sitter-bash",
  "uuid",
-]
-
-[[package]]
-name = "maki-code-index"
-version = "0.2.7"
-dependencies = [
- "ignore",
- "memchr",
- "test-case",
- "thiserror 2.0.18",
- "tree-sitter",
- "tree-sitter-bash",
- "tree-sitter-c",
- "tree-sitter-c-sharp",
- "tree-sitter-cpp",
- "tree-sitter-elixir",
- "tree-sitter-go",
- "tree-sitter-java",
- "tree-sitter-javascript",
- "tree-sitter-kotlin-ng",
- "tree-sitter-lua",
- "tree-sitter-md",
- "tree-sitter-php",
- "tree-sitter-python",
- "tree-sitter-ruby",
- "tree-sitter-rust",
- "tree-sitter-scala",
- "tree-sitter-swift",
- "tree-sitter-typescript",
 ]
 
 [[package]]
@@ -2373,7 +2342,6 @@ dependencies = [
  "include_dir",
  "isahc",
  "maki-agent",
- "maki-code-index",
  "maki-config",
  "mlua",
  "regex",
@@ -2384,6 +2352,24 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "tree-sitter",
+ "tree-sitter-bash",
+ "tree-sitter-c",
+ "tree-sitter-c-sharp",
+ "tree-sitter-cpp",
+ "tree-sitter-elixir",
+ "tree-sitter-go",
+ "tree-sitter-java",
+ "tree-sitter-javascript",
+ "tree-sitter-kotlin-ng",
+ "tree-sitter-lua",
+ "tree-sitter-md",
+ "tree-sitter-php",
+ "tree-sitter-python",
+ "tree-sitter-ruby",
+ "tree-sitter-rust",
+ "tree-sitter-scala",
+ "tree-sitter-swift",
+ "tree-sitter-typescript",
 ]
 
 [[package]]

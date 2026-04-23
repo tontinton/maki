@@ -1,5 +1,6 @@
 mod api;
 mod error;
+pub mod language;
 mod loader;
 mod runtime;
 

@@ -144,15 +144,6 @@ enum Command {
     Models,
     /// Run the index tool on a file to see how it looks like
     Index { path: String },
-    /// Run the find_symbol tool
-    FindSymbol {
-        /// Symbol name to search for
-        symbol: String,
-        /// Path to the file containing the symbol
-        file: String,
-        /// Line number (1-indexed)
-        line: usize,
-    },
     /// Manage MCP server authentication
     Mcp {
         #[command(subcommand)]
@@ -267,28 +258,6 @@ fn run() -> Result<()> {
             match result {
                 Ok(output) => print!("{}", output.as_text()),
                 Err(e) => bail!("index failed: {e}"),
-            }
-        }
-        Some(Command::FindSymbol { symbol, file, line }) => {
-            let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
-            let result = maki_code_index::find_symbol::find_symbol(
-                &cwd,
-                Path::new(&file),
-                line,
-                &symbol,
-                1,
-                None,
-            )
-            .context("find_symbol")?;
-            println!(
-                "Scope: {}\n{} references ({} files searched, {} parsed)",
-                result.scope,
-                result.references.len(),
-                result.stats.files_grepped,
-                result.stats.files_parsed
-            );
-            for r in &result.references {
-                println!("{}", r.format_relative(&cwd));
             }
         }
         Some(Command::Models) => {

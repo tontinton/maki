@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use maki_code_index::Language;
+use crate::language::Language;
 use mlua::{MultiValue, Table, UserData, UserDataFields, UserDataMethods, Value as LuaValue};
 use regex::Regex;
 use tree_sitter::{Node, Query, QueryCursor, QueryPredicateArg, StreamingIterator, Tree};

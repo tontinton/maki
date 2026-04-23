@@ -7,7 +7,7 @@ group = "Reference"
 
 # Tools
 
-Maki ships with 18 built-in tools. This is the full reference.
+Maki ships with 17 built-in tools. This is the full reference.
 
 ## File Operations
 
@@ -84,20 +84,6 @@ Search file contents using regex.
 | `limit` | integer | no |  | Max match groups to return |
 | `path` | string | no | cwd | Directory to search in |
 | `pattern` | string | yes |  | Regex pattern |
-
-### `find_symbol`
-
-Find all references to a symbol across a project. Scope-aware: locals search enclosing function, private items search the file.
-
-> **Experimental.** Opt in with `experimental_find_symbol = true` in your config.
-
-| Parameter | Type | Required | Default | Description |
-|-----------|------|----------|---------|-------------|
-| `file` | string | yes |  | Absolute path to file containing the symbol |
-| `line` | integer | yes |  | Line number (1-indexed) |
-| `max_results` | integer | no | 50 | Max results |
-| `occurrence` | integer | no | 1 | Nth occurrence on line |
-| `symbol` | string | yes |  | Symbol name |
 
 ### `index` *(lua plugin)*
 

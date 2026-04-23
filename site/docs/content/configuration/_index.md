@@ -46,7 +46,6 @@ max_file_size_mb = 4
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `always_yolo` | bool | `false` | Start every session with YOLO mode (skip permission prompts, deny rules still apply) |
-| `experimental_find_symbol` | bool | `false` | Enable the find_symbol tool (scope-aware symbol reference search) |
 
 ### `[ui]`
 

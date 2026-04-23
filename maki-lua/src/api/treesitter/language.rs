@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use maki_code_index::Language;
+use crate::language::Language;
 use mlua::{Lua, Table, Value as LuaValue};
 
 struct LangRegistry {

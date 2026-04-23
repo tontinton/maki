@@ -45,12 +45,6 @@ Everything persistent lives under `~/.maki`: sessions, auth keys, input history,
 
 All writes are crash-safe: write to a `.tmp` file, then atomically rename it into place. Auth files get `0600` permissions on Unix.
 
-### `maki-code-index`
-
-Parses source files with <a href="https://github.com/tree-sitter/tree-sitter" target="_blank">tree-sitter</a> and produces compact skeletons, typically 70-90% smaller than the original. The output keeps imports, type definitions, and function signatures with their line numbers, giving the agent enough context to navigate a codebase without reading every file in full.
-
-Supports 15+ languages, each behind a feature gate so you only compile the grammars you need. Each language has its own `LanguageExtractor` that knows how to locate docstrings and test nodes.
-
 ### `maki-interpreter`
 
 A Python sandbox for the `code_execution` tool. Runs on <a href="https://github.com/pydantic/monty" target="_blank">monty</a>, pydantic's minimal Python runtime, so user code is isolated from the host.

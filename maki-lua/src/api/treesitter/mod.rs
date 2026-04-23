@@ -6,8 +6,8 @@ pub(crate) mod tree;
 
 use mlua::{AnyUserData, Lua, Result as LuaResult, Table};
 
+use crate::language::Language;
 use language_tree::LuaLanguageTree;
-use maki_code_index::Language;
 use node::LuaNode;
 
 pub(crate) fn create_treesitter_table(lua: &Lua) -> LuaResult<Table> {

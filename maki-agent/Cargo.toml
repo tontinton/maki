@@ -6,7 +6,6 @@ edition.workspace = true
 [dependencies]
 maki-providers = { workspace = true }
 maki-config = { workspace = true }
-maki-code-index = { workspace = true }
 maki-interpreter = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

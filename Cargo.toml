@@ -22,7 +22,6 @@ demo = ["maki-ui/demo"]
 [dependencies]
 maki-ui = { workspace = true }
 maki-agent = { workspace = true }
-maki-code-index = { workspace = true }
 maki-config = { workspace = true }
 maki-providers = { workspace = true }
 maki-storage = { workspace = true }
@@ -48,7 +47,6 @@ test-case = { workspace = true }
 [workspace]
 members = [
   "maki-agent",
-  "maki-code-index",
   "maki-config",
   "maki-docgen",
   "maki-interpreter",
@@ -72,7 +70,6 @@ rust-version = "1.85"
 [workspace.dependencies]
 maki-agent = { path = "maki-agent" }
 maki-config = { path = "maki-config" }
-maki-code-index = { path = "maki-code-index" }
 maki-interpreter = { path = "maki-interpreter" }
 maki-providers = { path = "maki-providers" }
 maki-storage = { path = "maki-storage" }
@@ -134,8 +131,23 @@ tree-sitter = "0.26"
 include_dir = "0.7"
 mlua = { version = "0.11", features = ["luau", "async", "send", "serde", "macros"] }
 tree-sitter-bash = "0.25"
+tree-sitter-c = "0.24"
+tree-sitter-c-sharp = "0.23"
+tree-sitter-cpp = "0.23"
 tree-sitter-elixir = "0.3"
+tree-sitter-go = "0.23"
+tree-sitter-java = "0.23"
+tree-sitter-javascript = "0.23"
+tree-sitter-kotlin-ng = "1.1"
+tree-sitter-lua = "0.5"
 tree-sitter-md = "0.5"
+tree-sitter-php = "0.24"
+tree-sitter-python = "0.23"
+tree-sitter-ruby = "0.23"
+tree-sitter-rust = "0.24"
+tree-sitter-scala = "0.25"
+tree-sitter-swift = "0.7"
+tree-sitter-typescript = "0.23"
 monty = { git = "https://github.com/pydantic/monty.git", rev = "2e9df4b", package = "monty" }
 notify = { version = "9.0.0-rc.2", default-features = false, features = ["flume", "macos_fsevent"] }
 serde_yaml = "0.9"

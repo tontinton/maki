@@ -93,22 +93,13 @@ pub struct ConfigField {
     pub description: &'static str,
 }
 
-pub const TOP_LEVEL_FIELDS: &[ConfigField] = &[
-    ConfigField {
-        name: "always_yolo",
-        ty: "bool",
-        default: ConfigValue::Bool(false),
-        min: None,
-        description: "Start every session with YOLO mode (skip permission prompts, deny rules still apply)",
-    },
-    ConfigField {
-        name: "experimental_find_symbol",
-        ty: "bool",
-        default: ConfigValue::Bool(false),
-        min: None,
-        description: "Enable the find_symbol tool (scope-aware symbol reference search)",
-    },
-];
+pub const TOP_LEVEL_FIELDS: &[ConfigField] = &[ConfigField {
+    name: "always_yolo",
+    ty: "bool",
+    default: ConfigValue::Bool(false),
+    min: None,
+    description: "Start every session with YOLO mode (skip permission prompts, deny rules still apply)",
+}];
 
 pub const INDEX_FIELDS: &[ConfigField] = &[ConfigField {
     name: "max_file_size_mb",
@@ -148,7 +139,6 @@ fn check(
 #[serde(default)]
 struct RawConfig {
     always_yolo: Option<bool>,
-    experimental_find_symbol: Option<bool>,
     #[serde(default)]
     ui: UiFileConfig,
     agent: AgentFileConfig,
@@ -476,18 +466,10 @@ pub struct AgentConfig {
 
     #[config(skip, default = "Vec::new()")]
     pub allowed_tools: Vec<String>,
-
-    #[config(skip, default = false)]
-    pub find_symbol_enabled: bool,
 }
 
 impl AgentConfig {
-    fn from_file(
-        file: AgentFileConfig,
-        no_rtk: bool,
-        index_file_config: &IndexFileConfig,
-        find_symbol_enabled: bool,
-    ) -> Self {
+    fn from_file(file: AgentFileConfig, no_rtk: bool, index_file_config: &IndexFileConfig) -> Self {
         Self {
             no_rtk,
             max_output_bytes: file.max_output_bytes.unwrap_or(DEFAULT_MAX_OUTPUT_BYTES),
@@ -516,7 +498,6 @@ impl AgentConfig {
                 * 1024
                 * 1024,
             allowed_tools: Vec::new(),
-            find_symbol_enabled,
         }
     }
 
@@ -779,12 +760,7 @@ fn load_config_with_global(cwd: &Path, no_rtk: bool, global: Option<PathBuf>) ->
     Config {
         always_yolo: raw.always_yolo.unwrap_or(false),
         ui: UiConfig::from_file(raw.ui),
-        agent: AgentConfig::from_file(
-            raw.agent,
-            no_rtk,
-            &raw.index,
-            raw.experimental_find_symbol.unwrap_or(false),
-        ),
+        agent: AgentConfig::from_file(raw.agent, no_rtk, &raw.index),
         provider: ProviderConfig::from_file(raw.provider),
         storage: StorageConfig::from_file(raw.storage),
         permissions: load_permissions_with_global(cwd, global.as_deref()),

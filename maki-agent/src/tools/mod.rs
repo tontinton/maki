@@ -11,7 +11,6 @@ mod batch;
 mod code_execution;
 mod edit;
 mod file_tracker;
-mod find_symbol;
 mod fuzzy_replace;
 mod glob;
 mod grep;
@@ -118,12 +117,8 @@ impl ToolFilter {
     }
 }
 
-fn disabled_tool_names(config: &AgentConfig) -> Vec<&'static str> {
-    let mut out = Vec::new();
-    if !config.find_symbol_enabled {
-        out.push(FIND_SYMBOL_TOOL_NAME);
-    }
-    out
+fn disabled_tool_names(_config: &AgentConfig) -> Vec<&'static str> {
+    Vec::new()
 }
 
 pub fn is_tool_enabled(config: &AgentConfig, name: &str) -> bool {
@@ -133,7 +128,6 @@ pub fn is_tool_enabled(config: &AgentConfig, name: &str) -> bool {
 pub const BASH_TOOL_NAME: &str = bash::Bash::NAME;
 pub const BATCH_TOOL_NAME: &str = batch::Batch::NAME;
 pub const EDIT_TOOL_NAME: &str = edit::Edit::NAME;
-pub const FIND_SYMBOL_TOOL_NAME: &str = find_symbol::FindSymbol::NAME;
 pub const GLOB_TOOL_NAME: &str = glob::Glob::NAME;
 pub const GREP_TOOL_NAME: &str = grep::Grep::NAME;
 pub const MULTIEDIT_TOOL_NAME: &str = multiedit::MultiEdit::NAME;
@@ -554,7 +548,6 @@ register_tools! {
     multiedit::MultiEdit,
     glob::Glob,
     grep::Grep,
-    find_symbol::FindSymbol,
     question::Question,
     todowrite::TodoWrite,
     skill::SkillTool,

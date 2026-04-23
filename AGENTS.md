@@ -40,14 +40,18 @@ Read `justfile` for more.
 
 Rust workspace, key crates in root dir:
 
-- **maki-ui**: Uses ratatui for an interactive UI (elm like architecture)
-- **maki-providers**: Integration with LLM providers via APIs (e.g. Anthropic, Z.AI)
-- **maki-agent**: An async agent loop that runs on smol + tools descriptions and implementations
-- **maki-interpreter**: code_execution tool implementation using pydantic/monty (a minimal python sandbox)
-- **maki-code-index**: index tool implementation using tree-sitter (returns a compact skeleton of a source file)
-- **maki-storage**: Persistent state across runs (e.g. sessions, auth)
-- **maki-config**: User config
-- **maki-lua**: Lua plugin system (API mirrored from neovim for plugin compatibility), built-in plugins in ./plugins dir
+- maki-ui: Uses ratatui for an interactive UI (elm like architecture)
+- maki-providers: Integration with LLM providers via APIs (e.g. Anthropic, Z.AI)
+- maki-agent: An async agent loop that runs on smol + tools descriptions and implementations
+- maki-interpreter: code_execution tool implementation using pydantic/monty (a minimal python sandbox)
+- maki-storage: Persistent state across runs (e.g. sessions, auth)
+- maki-config: User config
+- maki-lua: Lua plugin system (API mirrored from neovim for plugin compatibility), built-in plugins in ./plugins dir
+
+Built-in lua plugins in ./plugins:
+- index: tool to return a compact skeleton of a source file using tree-sitter
+- webfetch: tool to fetch a url
+- websearch: tool to search exa.ai
 
 ## Docs
 

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use maki_code_index::Language;
+use crate::language::Language;
 use mlua::{Function, UserData, UserDataMethods, Value as LuaValue};
 use tree_sitter::{Parser, Tree};
 
