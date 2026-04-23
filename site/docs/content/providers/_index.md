@@ -40,9 +40,9 @@ Defaults: claude-haiku-4-5 (weak), claude-sonnet-4-6 (medium), claude-opus-4-7 (
 |------|--------|-------------------------------|---------|
 | Weak | **gpt-5.4-nano** (default), gpt-5.4-mini, gpt-4.1-nano | $0.20 / $1.25 | 400K ctx / 128K out |
 | Medium | gpt-4.1-mini, **gpt-4.1** (default), o4-mini, gpt-5.1-codex-mini | $0.40 / $1.60 | 1047K ctx / 32K out |
-| Strong | **gpt-5.4** (default), o3, gpt-5.3-codex, gpt-5.2-codex, gpt-5.1-codex-max, gpt-5.1-codex | $2.50 / $15.00 | 1050K ctx / 128K out |
+| Strong | **gpt-5.5** (default), gpt-5.4, o3, gpt-5.3-codex, gpt-5.2-codex, gpt-5.1-codex-max, gpt-5.1-codex | $5.00 / $30.00 | 1050K ctx / 128K out |
 
-Defaults: gpt-5.4-nano (weak), gpt-4.1 (medium), gpt-5.4 (strong)
+Defaults: gpt-5.4-nano (weak), gpt-4.1 (medium), gpt-5.5 (strong)
 
 ### Google
 
