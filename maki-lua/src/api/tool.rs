@@ -17,7 +17,7 @@ use serde_json::Value;
 
 use crate::api::buf::{BufHandle, BufferStore};
 use crate::api::ctx::LuaCtx;
-use crate::runtime::Request;
+use crate::runtime::{LiveCtx, Request};
 
 const TOOL_NAME_MAX: usize = 64;
 const TOOL_HANDLER_RETURN_ERR: &str =
@@ -144,6 +144,7 @@ impl ToolInvocation for LuaToolInvocation {
             let lua_ctx = LuaCtx {
                 cancel: ctx.cancel.clone(),
                 config: ctx.config.clone(),
+                finish_tx: None,
             };
 
             tx.send_async(Request::CallTool {
@@ -156,6 +157,10 @@ impl ToolInvocation for LuaToolInvocation {
                     Deadline::None => None,
                 },
                 reply: reply_tx,
+                live: ctx.tool_use_id.clone().map(|id| LiveCtx {
+                    event_tx: ctx.event_tx.clone(),
+                    tool_use_id: id,
+                }),
             })
             .await
             .map_err(|_| "lua thread disconnected".to_string())?;
@@ -254,7 +259,6 @@ fn parse_render_hints(spec: &Table) -> Option<RawRenderHints> {
     Some(RawRenderHints {
         truncate_lines: render.get::<usize>("truncate_lines").ok(),
         truncate_at: render.get::<String>("truncate_at").ok(),
-        output_separator: render.get::<String>("output_separator").ok(),
     })
 }
 

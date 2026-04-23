@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use include_dir::Dir;
 use maki_agent::RawRenderHints;
@@ -14,12 +14,16 @@ use serde_json::Value;
 
 use crate::api::buf::{BufHandle, BufferStore};
 use crate::api::create_maki_global;
-use crate::api::ctx::LuaCtx;
+use crate::api::ctx::{FinishPayload, LuaCtx};
+use crate::api::fn_api::{JobEvent, JobStore};
 use crate::api::fs::check_sandbox;
 use crate::api::tool::{LuaTool, PendingTool, PendingTools, ToolCallReply, extract_tool_return};
 use crate::error::PluginError;
 
 const INTERRUPT_MSG: &str = "plugin interrupted: cancelled, deadline exceeded, or shutting down";
+const DISPATCH_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const NIL_WITHOUT_FINISH_MSG: &str =
+    "handler returned nil without calling ctx:finish() or starting jobs";
 
 pub type LoadResult = Result<Vec<(Arc<str>, RawRenderHints)>, PluginError>;
 
@@ -37,6 +41,7 @@ pub enum Request {
         ctx: LuaCtx,
         deadline: Option<Instant>,
         reply: flume::Sender<ToolCallReply>,
+        live: Option<LiveCtx>,
     },
     ComputeHeader {
         plugin: Arc<str>,
@@ -51,6 +56,11 @@ pub enum Request {
     Shutdown,
 }
 
+pub struct LiveCtx {
+    pub event_tx: maki_agent::EventSender,
+    pub tool_use_id: String,
+}
+
 struct CallState {
     cancel: CancelToken,
     deadline: Option<Instant>,
@@ -62,6 +72,14 @@ impl Drop for CallStateGuard<'_> {
     fn drop(&mut self) {
         let mut guard = self.0.lock().unwrap_or_else(|e| e.into_inner());
         *guard = None;
+    }
+}
+
+struct JobCleanupGuard<'a>(&'a LuaRuntime);
+
+impl Drop for JobCleanupGuard<'_> {
+    fn drop(&mut self) {
+        self.0.cleanup_jobs();
     }
 }
 
@@ -401,8 +419,9 @@ impl LuaRuntime {
         plugin: &str,
         tool: &str,
         input: Value,
-        ctx: LuaCtx,
+        mut ctx: LuaCtx,
         deadline: Option<Instant>,
+        live: Option<&LiveCtx>,
     ) -> ToolCallReply {
         let Some(keys) = self.plugins.get(plugin) else {
             return ToolCallReply::err(format!("plugin not loaded: {plugin}"));
@@ -428,6 +447,12 @@ impl LuaRuntime {
 
         let _clear_on_drop = CallStateGuard(&self.call_state);
 
+        let (finish_tx, finish_rx) = flume::bounded::<FinishPayload>(1);
+        ctx.finish_tx = Some(finish_tx);
+
+        self.lua.set_app_data(JobStore::new());
+        let _cleanup = JobCleanupGuard(self);
+
         let input_lua = match self.lua.to_value(&input) {
             Ok(v) => v,
             Err(e) => return ToolCallReply::err(e.to_string()),
@@ -440,13 +465,137 @@ impl LuaRuntime {
         let result = handler.call::<LuaValue>((input_lua, ctx_ud));
 
         match result {
-            Ok(val) => extract_tool_return(&self.lua, &val),
-            Err(e) => {
-                if let Some(mut store) = self.lua.app_data_mut::<BufferStore>() {
-                    store.clear();
+            Ok(LuaValue::Nil) => {
+                if let Some(live) = live {
+                    if let Some(store) = self.lua.app_data_ref::<BufferStore>() {
+                        if let Some(shared) = store.live_buf() {
+                            let _ = live.event_tx.send(maki_agent::AgentEvent::LiveToolBuf {
+                                id: live.tool_use_id.clone(),
+                                body: Arc::clone(shared),
+                            });
+                        }
+                    }
                 }
-                ToolCallReply::err(e.to_string())
+                self.dispatch_loop(finish_rx)
             }
+            Ok(val) => extract_tool_return(&self.lua, &val),
+            Err(e) => ToolCallReply::err(e.to_string()),
+        }
+    }
+
+    fn finish_reply(payload: FinishPayload) -> ToolCallReply {
+        ToolCallReply {
+            result: if payload.is_error {
+                Err(payload.llm_output)
+            } else {
+                Ok(payload.llm_output)
+            },
+            snapshot: payload.body,
+            header: None,
+        }
+    }
+
+    fn dispatch_loop(&self, finish_rx: flume::Receiver<FinishPayload>) -> ToolCallReply {
+        let no_jobs_started = self
+            .lua
+            .app_data_ref::<JobStore>()
+            .is_some_and(|s| s.is_empty());
+
+        if no_jobs_started {
+            self.lua.gc_collect().ok();
+            match finish_rx.recv_timeout(DISPATCH_POLL_INTERVAL) {
+                Ok(payload) => return Self::finish_reply(payload),
+                _ => return ToolCallReply::err(NIL_WITHOUT_FINISH_MSG),
+            }
+        }
+
+        let event_rx = self
+            .lua
+            .app_data_ref::<JobStore>()
+            .map(|s| s.event_rx.clone());
+
+        loop {
+            {
+                let guard = self.call_state.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(state) = guard.as_ref() {
+                    if state.cancel.is_cancelled() {
+                        return ToolCallReply::err("cancelled");
+                    }
+                    if state.deadline.is_some_and(|d| Instant::now() > d) {
+                        return ToolCallReply::err("timeout");
+                    }
+                }
+            }
+
+            match finish_rx.try_recv() {
+                Ok(payload) => return Self::finish_reply(payload),
+                Err(flume::TryRecvError::Disconnected) => {
+                    return ToolCallReply::err(NIL_WITHOUT_FINISH_MSG);
+                }
+                Err(flume::TryRecvError::Empty) => {}
+            }
+
+            let has_alive = self
+                .lua
+                .app_data_ref::<JobStore>()
+                .is_some_and(|s| s.has_alive_jobs());
+
+            if !has_alive {
+                match finish_rx.recv_timeout(DISPATCH_POLL_INTERVAL) {
+                    Ok(payload) => return Self::finish_reply(payload),
+                    Err(flume::RecvTimeoutError::Disconnected) => {
+                        return ToolCallReply::err(NIL_WITHOUT_FINISH_MSG);
+                    }
+                    Err(flume::RecvTimeoutError::Timeout) => {
+                        return ToolCallReply::err(NIL_WITHOUT_FINISH_MSG);
+                    }
+                }
+            }
+
+            let tagged = event_rx
+                .as_ref()
+                .and_then(|rx| rx.recv_timeout(DISPATCH_POLL_INTERVAL).ok());
+
+            let Some(tagged) = tagged else {
+                continue;
+            };
+
+            let callback = self.lua.app_data_ref::<JobStore>().and_then(|s| {
+                let key = s.callback_key(tagged.job_id, &tagged.event)?;
+                self.lua.registry_value::<Function>(key).ok()
+            });
+
+            let is_exit = matches!(tagged.event, JobEvent::Exit(_));
+
+            if let Some(func) = callback {
+                let arg: LuaValue = match &tagged.event {
+                    JobEvent::Stdout(line) | JobEvent::Stderr(line) => self
+                        .lua
+                        .create_string(line)
+                        .map(LuaValue::String)
+                        .unwrap_or(LuaValue::Nil),
+                    JobEvent::Exit(code) => LuaValue::Integer(*code as i64),
+                };
+                if let Err(e) = func.call::<()>((tagged.job_id, arg)) {
+                    return ToolCallReply::err(format!("job callback error: {e}"));
+                }
+            }
+
+            if is_exit {
+                if let Some(mut store) = self.lua.app_data_mut::<JobStore>() {
+                    store.mark_dead(tagged.job_id);
+                }
+            }
+        }
+    }
+
+    fn cleanup_jobs(&self) {
+        if let Some(mut store) = self.lua.app_data_mut::<JobStore>() {
+            store.kill_all();
+            store.clear(&self.lua);
+        }
+        if let Some(mut buf_store) = self.lua.app_data_mut::<BufferStore>() {
+            buf_store.clear();
         }
     }
 
@@ -526,8 +675,9 @@ pub fn spawn(
                         ctx,
                         deadline,
                         reply,
+                        live,
                     } => {
-                        let res = rt.call_tool(&plugin, &tool, input, ctx, deadline);
+                        let res = rt.call_tool(&plugin, &tool, input, ctx, deadline, live.as_ref());
                         let _ = reply.send(res);
                     }
                     Request::ClearPlugin { plugin, reply } => {

@@ -1,5 +1,6 @@
 pub(crate) mod buf;
 pub(crate) mod ctx;
+pub(crate) mod fn_api;
 pub(crate) mod fs;
 pub(crate) mod json;
 pub(crate) mod log;
@@ -34,6 +35,7 @@ pub(crate) fn create_maki_global(
     maki.set("net", net::create_net_table(lua)?)?;
     maki.set("text", text::create_text_table(lua)?)?;
     maki.set("ui", create_ui_table(lua)?)?;
+    maki.set("fn", fn_api::create_fn_table(lua)?)?;
 
     Ok(maki)
 }
@@ -46,7 +48,7 @@ fn create_ui_table(lua: &Lua) -> LuaResult<Table> {
             let mut store = lua
                 .app_data_mut::<BufferStore>()
                 .ok_or_else(|| mlua::Error::runtime("buffer store not initialized"))?;
-            let id = store.create();
+            let (id, _) = store.create_live();
             Ok(BufHandle(id))
         })?,
     )?;

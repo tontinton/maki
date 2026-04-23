@@ -149,6 +149,9 @@ impl Chat {
                 self.messages_panel.tool_header_snapshot(&id, snapshot);
             }
             AgentEvent::SubagentHistory { .. } => {}
+            AgentEvent::LiveToolBuf { id, body } => {
+                self.messages_panel.register_live_buf(id, body);
+            }
         }
         ChatEventResult::Continue
     }

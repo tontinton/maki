@@ -2341,6 +2341,7 @@ dependencies = [
  "htmd",
  "include_dir",
  "isahc",
+ "libc",
  "maki-agent",
  "maki-config",
  "mlua",

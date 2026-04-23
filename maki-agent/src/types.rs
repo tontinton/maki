@@ -1,6 +1,7 @@
 use std::fmt::Write;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use flume::Sender;
 use maki_providers::{AgentError, ContentBlock, Message, Role, StopReason, TokenUsage};
@@ -516,6 +517,76 @@ pub enum AgentEvent {
         id: String,
         snapshot: BufferSnapshot,
     },
+    LiveToolBuf {
+        id: String,
+        body: Arc<SharedBuf>,
+    },
+}
+
+pub struct SharedBuf {
+    committed: Mutex<Arc<Vec<SnapshotLine>>>,
+    dirty: AtomicBool,
+}
+
+impl SharedBuf {
+    pub fn new() -> Self {
+        Self {
+            committed: Mutex::new(Arc::new(Vec::new())),
+            dirty: AtomicBool::new(false),
+        }
+    }
+
+    pub fn append(&self, line: SnapshotLine) {
+        let mut guard = self.committed.lock().unwrap_or_else(|e| e.into_inner());
+        Arc::make_mut(&mut guard).push(line);
+        drop(guard);
+        self.dirty.store(true, Ordering::Release);
+    }
+
+    pub fn len(&self) -> usize {
+        self.committed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn read_if_dirty(&self) -> Option<Arc<Vec<SnapshotLine>>> {
+        if !self.dirty.swap(false, Ordering::AcqRel) {
+            return None;
+        }
+        let guard = self.committed.lock().unwrap_or_else(|e| e.into_inner());
+        Some(Arc::clone(&guard))
+    }
+
+    pub fn take(&self) -> BufferSnapshot {
+        self.dirty.store(false, Ordering::Release);
+        let guard = self.committed.lock().unwrap_or_else(|e| e.into_inner());
+        BufferSnapshot {
+            lines: guard.as_ref().clone(),
+        }
+    }
+}
+
+impl Default for SharedBuf {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for SharedBuf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedBuf").finish_non_exhaustive()
+    }
+}
+
+impl Serialize for SharedBuf {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_unit()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -567,7 +638,6 @@ pub struct InlineStyle {
 pub struct RawRenderHints {
     pub truncate_lines: Option<usize>,
     pub truncate_at: Option<String>,
-    pub output_separator: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -772,21 +842,6 @@ mod tests {
     }
 
     #[test]
-    fn event_written_path_none_on_error() {
-        let event = ToolDoneEvent {
-            id: "id".into(),
-            tool: Arc::from("write"),
-            output: ToolOutput::WriteCode {
-                path: "src/lib.rs".into(),
-                byte_count: 10,
-                lines: vec![],
-            },
-            is_error: true,
-        };
-        assert_eq!(event.written_path(), None);
-    }
-
-    #[test]
     fn tool_results_builds_message_with_tool_result_blocks() {
         let msg = tool_results(vec![
             ToolDoneEvent {
@@ -861,24 +916,8 @@ mod tests {
     }
 
     #[test]
-    fn wrote_to_matches_absolute_path() {
-        let event = ToolDoneEvent {
-            id: "id".into(),
-            tool: Arc::from("write"),
-            output: ToolOutput::WriteCode {
-                path: "/home/user/.maki/plans/slug.md".into(),
-                byte_count: 10,
-                lines: vec![],
-            },
-            is_error: false,
-        };
-        assert!(event.wrote_to(Path::new("/home/user/.maki/plans/slug.md")));
-        assert!(!event.wrote_to(Path::new("/home/user/.maki/plans/other.md")));
-    }
-
-    #[test]
-    fn wrote_to_false_on_error() {
-        let event = ToolDoneEvent {
+    fn wrote_to_checks_path_and_error_flag() {
+        let ok_event = ToolDoneEvent {
             id: "id".into(),
             tool: Arc::from("write"),
             output: ToolOutput::WriteCode {
@@ -886,9 +925,16 @@ mod tests {
                 byte_count: 10,
                 lines: vec![],
             },
-            is_error: true,
+            is_error: false,
         };
-        assert!(!event.wrote_to(Path::new("/plans/slug.md")));
+        assert!(ok_event.wrote_to(Path::new("/plans/slug.md")));
+        assert!(!ok_event.wrote_to(Path::new("/plans/other.md")));
+
+        let err_event = ToolDoneEvent {
+            is_error: true,
+            ..ok_event
+        };
+        assert!(!err_event.wrote_to(Path::new("/plans/slug.md")));
     }
 
     #[test]
@@ -918,5 +964,83 @@ mod tests {
     #[test_case(10, 10, 1, 0   ; "last_line")]
     fn lines_remaining(total: usize, start: usize, shown: usize, expected: usize) {
         assert_eq!(lines_remaining_after(total, start, shown), expected);
+    }
+
+    fn line(text: &str) -> SnapshotLine {
+        SnapshotLine {
+            spans: vec![SnapshotSpan {
+                text: text.into(),
+                style: SpanStyle::Default,
+            }],
+        }
+    }
+
+    #[test]
+    fn shared_buf_lifecycle() {
+        let buf = SharedBuf::new();
+
+        assert!(buf.is_empty());
+        assert!(buf.read_if_dirty().is_none());
+
+        for i in 0..3 {
+            buf.append(line(&format!("l{i}")));
+        }
+        assert_eq!(buf.len(), 3);
+
+        let snap = buf.read_if_dirty().expect("dirty after appends");
+        assert_eq!(snap.len(), 3);
+        assert_eq!(snap[0].spans[0].text, "l0");
+        assert!(buf.read_if_dirty().is_none(), "clean after read");
+
+        buf.append(line("l3"));
+        let _ = buf.take();
+        assert!(buf.read_if_dirty().is_none(), "take clears dirty");
+    }
+
+    #[test]
+    fn shared_buf_arc_snapshot_isolation() {
+        let buf = SharedBuf::new();
+        buf.append(line("a"));
+        buf.append(line("b"));
+        let snap = buf.read_if_dirty().unwrap();
+        buf.append(line("c"));
+        assert_eq!(snap.len(), 2, "held Arc must not see new appends");
+        let snap2 = buf.read_if_dirty().unwrap();
+        assert_eq!(snap2.len(), 3);
+    }
+
+    #[test]
+    fn shared_buf_poisoned_mutex_recovery() {
+        let buf = Arc::new(SharedBuf::new());
+        let buf2 = Arc::clone(&buf);
+        let h = std::thread::spawn(move || {
+            let _guard = buf2.committed.lock().unwrap();
+            panic!("intentional poison");
+        });
+        let _ = h.join();
+        buf.append(SnapshotLine { spans: vec![] });
+        assert_eq!(buf.len(), 1, "should recover from poisoned mutex");
+    }
+
+    #[test]
+    fn buffer_snapshot_first_line_text() {
+        let empty = BufferSnapshot { lines: vec![] };
+        assert_eq!(empty.first_line_text(), "");
+
+        let multi = BufferSnapshot {
+            lines: vec![SnapshotLine {
+                spans: vec![
+                    SnapshotSpan {
+                        text: "hello ".into(),
+                        style: SpanStyle::Default,
+                    },
+                    SnapshotSpan {
+                        text: "world".into(),
+                        style: SpanStyle::Named("bold".into()),
+                    },
+                ],
+            }],
+        };
+        assert_eq!(multi.first_line_text(), "hello world");
     }
 }

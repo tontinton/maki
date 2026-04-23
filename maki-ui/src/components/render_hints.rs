@@ -34,14 +34,6 @@ impl From<OutputKeep> for Keep {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum OutputSeparator {
-    #[default]
-    None,
-    Bash,
-    CodeExecution,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum BodyFormat {
     #[default]
     Plain,
@@ -54,7 +46,6 @@ pub struct ToolRenderHints {
     pub body_format: BodyFormat,
     pub truncate_lines: Option<usize>,
     pub truncate_at: OutputKeep,
-    pub output_separator: OutputSeparator,
 }
 
 impl Default for ToolRenderHints {
@@ -72,11 +63,6 @@ impl ToolRenderHints {
             truncate_at: match raw.truncate_at.as_deref() {
                 Some("tail") => OutputKeep::Tail,
                 _ => OutputKeep::Head,
-            },
-            output_separator: match raw.output_separator.as_deref() {
-                Some("bash") => OutputSeparator::Bash,
-                Some("code_execution") => OutputSeparator::CodeExecution,
-                _ => OutputSeparator::None,
             },
         }
     }
@@ -99,7 +85,6 @@ impl ToolRenderHints {
         body_format: BodyFormat::Plain,
         truncate_lines: None,
         truncate_at: OutputKeep::Head,
-        output_separator: OutputSeparator::None,
     };
 }
 
@@ -107,11 +92,9 @@ const DEFAULT_HINTS: &[(&str, ToolRenderHints)] = &[
     hint!(BASH_TOOL_NAME,
         header_style: HeaderStyle::Command,
         truncate_at: OutputKeep::Tail,
-        output_separator: OutputSeparator::Bash,
     ),
     hint!(CODE_EXECUTION_TOOL_NAME,
         truncate_at: OutputKeep::Tail,
-        output_separator: OutputSeparator::CodeExecution,
     ),
     hint!(TASK_TOOL_NAME,
         body_format: BodyFormat::Markdown,
@@ -229,20 +212,11 @@ mod tests {
         assert_eq!(h.truncate_at, expected);
     }
 
-    #[test_case("bash",           OutputSeparator::Bash          ; "bash")]
-    #[test_case("code_execution", OutputSeparator::CodeExecution ; "code_execution")]
-    #[test_case("invalid",        OutputSeparator::None          ; "invalid_falls_back_to_none")]
-    fn from_raw_output_separator(input: &str, expected: OutputSeparator) {
-        let h = raw(|r| r.output_separator = Some(input.into()));
-        assert_eq!(h.output_separator, expected);
-    }
-
     #[test]
     fn from_raw_never_sets_non_plain_body_format() {
         let h = raw(|r| {
             r.truncate_lines = Some(100);
             r.truncate_at = Some("tail".into());
-            r.output_separator = Some("bash".into());
         });
         assert_eq!(h.body_format, BodyFormat::Plain);
     }
@@ -322,6 +296,5 @@ mod tests {
         assert_eq!(h.body_format, BodyFormat::Plain);
         assert_eq!(h.truncate_lines, None);
         assert_eq!(h.truncate_at, OutputKeep::Head);
-        assert_eq!(h.output_separator, OutputSeparator::None);
     }
 }

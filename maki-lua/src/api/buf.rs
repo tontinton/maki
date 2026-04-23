@@ -1,12 +1,14 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use maki_agent::types::InlineStyle;
-use maki_agent::{BufferSnapshot, SnapshotLine, SnapshotSpan, SpanStyle};
+use maki_agent::{BufferSnapshot, SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle};
 use mlua::{Result as LuaResult, UserData, UserDataMethods, Value as LuaValue};
 
 pub(crate) struct BufferStore {
-    buffers: HashMap<u32, Vec<SnapshotLine>>,
+    buffers: HashMap<u32, Arc<SharedBuf>>,
     next_id: u32,
+    live_buf: Option<(u32, Arc<SharedBuf>)>,
 }
 
 impl BufferStore {
@@ -14,34 +16,47 @@ impl BufferStore {
         Self {
             buffers: HashMap::new(),
             next_id: 1,
+            live_buf: None,
         }
     }
 
     pub fn create(&mut self) -> u32 {
         let id = self.next_id;
         self.next_id += 1;
-        self.buffers.insert(id, Vec::new());
+        self.buffers.insert(id, Arc::new(SharedBuf::new()));
         id
     }
 
+    pub fn create_live(&mut self) -> (u32, Arc<SharedBuf>) {
+        let id = self.create();
+        let shared = Arc::clone(&self.buffers[&id]);
+        if self.live_buf.is_none() {
+            self.live_buf = Some((id, Arc::clone(&shared)));
+        }
+        (id, shared)
+    }
+
     pub fn append_line(&mut self, id: u32, line: SnapshotLine) {
-        if let Some(lines) = self.buffers.get_mut(&id) {
-            lines.push(line);
+        if let Some(buf) = self.buffers.get(&id) {
+            buf.append(line);
         }
     }
 
     pub fn len(&self, id: u32) -> usize {
-        self.buffers.get(&id).map_or(0, |l| l.len())
+        self.buffers.get(&id).map_or(0, |b| b.len())
     }
 
     pub fn take(&mut self, id: u32) -> Option<BufferSnapshot> {
-        self.buffers
-            .remove(&id)
-            .map(|lines| BufferSnapshot { lines })
+        self.buffers.remove(&id).map(|b| b.take())
     }
 
     pub fn clear(&mut self) {
         self.buffers.clear();
+        self.live_buf = None;
+    }
+
+    pub fn live_buf(&self) -> Option<&Arc<SharedBuf>> {
+        self.live_buf.as_ref().map(|(_, buf)| buf)
     }
 }
 
@@ -407,5 +422,139 @@ mod tests {
             }
             other => panic!("expected inline style, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn shared_buf_append_and_len() {
+        let buf = SharedBuf::new();
+        assert_eq!(buf.len(), 0);
+        buf.append(SnapshotLine {
+            spans: vec![SnapshotSpan {
+                text: "hello".into(),
+                style: SpanStyle::Default,
+            }],
+        });
+        assert_eq!(buf.len(), 1);
+    }
+
+    #[test]
+    fn shared_buf_dirty_flag() {
+        let buf = SharedBuf::new();
+        assert!(buf.read_if_dirty().is_none());
+        buf.append(SnapshotLine { spans: vec![] });
+        let snap = buf.read_if_dirty();
+        assert!(snap.is_some());
+        assert_eq!(snap.unwrap().len(), 1);
+        assert!(buf.read_if_dirty().is_none());
+    }
+
+    #[test]
+    fn shared_buf_take_clones_lines() {
+        let buf = Arc::new(SharedBuf::new());
+        buf.append(SnapshotLine {
+            spans: vec![SnapshotSpan {
+                text: "line1".into(),
+                style: SpanStyle::Default,
+            }],
+        });
+        let snap = buf.take();
+        assert_eq!(snap.lines.len(), 1);
+        assert_eq!(snap.lines[0].spans[0].text, "line1");
+        assert_eq!(buf.len(), 1);
+    }
+
+    #[test]
+    fn shared_buf_cow_semantics() {
+        let buf = SharedBuf::new();
+        buf.append(SnapshotLine { spans: vec![] });
+        let ui_ref = buf.read_if_dirty().unwrap();
+        assert_eq!(ui_ref.len(), 1);
+        buf.append(SnapshotLine { spans: vec![] });
+        assert_eq!(ui_ref.len(), 1);
+        let ui_ref2 = buf.read_if_dirty().unwrap();
+        assert_eq!(ui_ref2.len(), 2);
+    }
+
+    #[test]
+    fn create_live_and_dispatch() {
+        let mut store = BufferStore::new();
+        let (id, _shared) = store.create_live();
+        store.append_line(
+            id,
+            SnapshotLine {
+                spans: vec![SnapshotSpan {
+                    text: "test".into(),
+                    style: SpanStyle::Default,
+                }],
+            },
+        );
+        assert_eq!(store.len(id), 1);
+    }
+
+    #[test]
+    fn take_live_buf_from_store() {
+        let mut store = BufferStore::new();
+        let (id, _shared) = store.create_live();
+        store.append_line(id, SnapshotLine { spans: vec![] });
+        let snap = store.take(id);
+        assert!(snap.is_some());
+        assert_eq!(snap.unwrap().lines.len(), 1);
+    }
+
+    #[test]
+    fn create_live_second_call_does_not_overwrite_first() {
+        let mut store = BufferStore::new();
+        let (id1, shared1) = store.create_live();
+        let (id2, _shared2) = store.create_live();
+        assert_ne!(id1, id2);
+        shared1.append(SnapshotLine { spans: vec![] });
+        let live = store.live_buf().expect("live_buf should exist");
+        assert_eq!(
+            live.len(),
+            1,
+            "live_buf should still point to the first buf"
+        );
+    }
+
+    #[test]
+    fn clear_resets_live_buf() {
+        let mut store = BufferStore::new();
+        store.create_live();
+        assert!(store.live_buf().is_some());
+        store.clear();
+        assert!(store.live_buf().is_none());
+    }
+
+    #[test]
+    fn live_buf_returns_none_before_create_live() {
+        let store = BufferStore::new();
+        assert!(store.live_buf().is_none());
+    }
+
+    #[test]
+    fn live_buf_arc_is_same_as_backing_buffer() {
+        let mut store = BufferStore::new();
+        let (id, shared) = store.create_live();
+        shared.append(SnapshotLine {
+            spans: vec![SnapshotSpan {
+                text: "via arc".into(),
+                style: SpanStyle::Default,
+            }],
+        });
+        assert_eq!(store.len(id), 1);
+        let live = store.live_buf().unwrap();
+        assert_eq!(live.len(), 1);
+    }
+
+    #[test]
+    fn create_live_mixed_with_create_regular() {
+        let mut store = BufferStore::new();
+        let regular = store.create();
+        let (live_id, _) = store.create_live();
+        store.append_line(regular, SnapshotLine { spans: vec![] });
+        store.append_line(live_id, SnapshotLine { spans: vec![] });
+        assert_eq!(store.len(regular), 1);
+        assert_eq!(store.len(live_id), 1);
+        assert!(store.live_buf().is_some());
     }
 }

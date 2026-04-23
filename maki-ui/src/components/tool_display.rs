@@ -1,6 +1,4 @@
-use super::render_hints::{
-    BodyFormat, HeaderStyle, OutputSeparator, RenderHintsRegistry, ToolRenderHints,
-};
+use super::render_hints::{BodyFormat, HeaderStyle, RenderHintsRegistry, ToolRenderHints};
 use super::status_bar::format_tokens;
 use super::{DisplayMessage, ToolStatus};
 
@@ -66,6 +64,23 @@ const BASH_OUTPUT_SEPARATOR: &str = "──────";
 
 const BATCH_INDENT: &str = "  ";
 const BATCH_CONTENT_INDENT: &str = "    ";
+
+#[derive(Clone, Copy, PartialEq)]
+enum SeparatorStyle {
+    None,
+    Bash,
+    CodeExecution,
+}
+
+impl SeparatorStyle {
+    fn from_input(input: Option<&ToolInput>) -> Self {
+        match input {
+            Some(ToolInput::Code { .. }) => Self::Bash,
+            Some(ToolInput::Script { .. }) => Self::CodeExecution,
+            None => Self::None,
+        }
+    }
+}
 
 pub(crate) fn tool_output_annotation(output: &ToolOutput) -> Option<String> {
     match output {
@@ -449,7 +464,7 @@ struct ToolLineBuilder {
     keep: Keep,
     header_style: HeaderStyle,
     body_format: BodyFormat,
-    output_separator: OutputSeparator,
+    separator_style: SeparatorStyle,
 }
 
 impl ToolLineBuilder {
@@ -474,7 +489,7 @@ impl ToolLineBuilder {
             keep: output_limits.keep,
             header_style: hints.header_style,
             body_format: hints.body_format,
-            output_separator: hints.output_separator,
+            separator_style: SeparatorStyle::None,
         }
     }
 
@@ -548,6 +563,7 @@ impl ToolLineBuilder {
             self.lines.push(line);
         }
         self.content_range = (start, self.lines.len());
+        self.separator_style = SeparatorStyle::from_input(input);
         if let Some(ToolInput::Code { code, .. }) = input {
             self.push_search_text(code.trim_end());
         }
@@ -560,14 +576,14 @@ impl ToolLineBuilder {
         let has_code = self.content_range.1 > self.content_range.0;
 
         if resolved.text.is_none() {
-            if has_code && self.output_separator == OutputSeparator::Bash {
+            if has_code && self.separator_style == SeparatorStyle::Bash {
                 self.push_bash_output_label(TOOL_BODY_INDENT, is_done, false);
             }
             return;
         }
 
         if has_code {
-            if self.output_separator == OutputSeparator::Bash {
+            if self.separator_style == SeparatorStyle::Bash {
                 self.push_bash_output_label(TOOL_BODY_INDENT, is_done, resolved.text.is_some());
             } else if resolved.text.is_some() {
                 self.push_code_output_separator(TOOL_BODY_INDENT);
@@ -665,7 +681,7 @@ impl ToolLineBuilder {
     }
 
     fn push_code_output_separator(&mut self, indent: &str) {
-        if self.output_separator == OutputSeparator::CodeExecution {
+        if self.separator_style == SeparatorStyle::CodeExecution {
             self.separator_line = Some(self.lines.len());
             self.lines.push(Line::from(Span::styled(
                 format!("{indent}{}", CODE_EXECUTION_OUTPUT_SEPARATOR),
@@ -839,6 +855,7 @@ pub fn truncate_to_header(text: &mut String) {
     text.truncate(end);
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn build_batch_entry_lines(
     entry: &BatchToolEntry,
     index: usize,
@@ -847,6 +864,8 @@ pub fn build_batch_entry_lines(
     expanded: SectionFlags,
     tool_output_lines: &ToolOutputLines,
     registry: &RenderHintsRegistry,
+    snapshot: Option<&BufferSnapshot>,
+    header_snapshot: Option<&BufferSnapshot>,
 ) -> ToolLines {
     let hints = registry.get(&entry.tool);
     let limits = output_limits_from_hints(&entry.tool, hints, tool_output_lines);
@@ -856,15 +875,28 @@ pub fn build_batch_entry_lines(
     }
 
     let mut b = ToolLineBuilder::new(width, BATCH_INDENT, expanded, limits, hints);
-    b.push_header(&entry.tool, &entry.summary, annotation.as_deref(), None);
+    b.push_header(
+        &entry.tool,
+        &entry.summary,
+        annotation.as_deref(),
+        header_snapshot,
+    );
     b.prepend_indicator(entry.status.into(), started_at);
     b.push_code_content(entry.input.as_ref(), entry.output.as_ref());
     let is_done = matches!(
         entry.status,
         BatchToolStatus::Success | BatchToolStatus::Error
     );
-    let resolved = resolve_output(entry.output.as_ref(), None, None, 0, b.limits, b.keep);
-    b.push_resolved_output(&resolved, is_done);
+    if let Some(snap) = snapshot {
+        let search_text = entry.output.as_ref().and_then(|o| match o {
+            ToolOutput::Plain(t) => Some(t.as_str()),
+            _ => None,
+        });
+        b.push_snapshot(snap, search_text);
+    } else {
+        let resolved = resolve_output(entry.output.as_ref(), None, None, 0, b.limits, b.keep);
+        b.push_resolved_output(&resolved, is_done);
+    }
     b.prepend_separator(index);
     b.finish(
         entry.input.clone().map(Arc::new),
@@ -1174,15 +1206,7 @@ mod tests {
             code_input(),
             Some(ToolOutput::Plain("hello".into())),
         );
-        let tl = build_batch_entry_lines(
-            &entry,
-            0,
-            Instant::now(),
-            80,
-            SectionFlags::default(),
-            &TOL,
-            &reg(),
-        );
+        let tl = batch_lines(&entry, 0);
         assert!(line_has_styled(
             &tl,
             BASH_OUTPUT_SEPARATOR,
@@ -1216,6 +1240,20 @@ mod tests {
             output,
             annotation: None,
         }
+    }
+
+    fn batch_lines(entry: &BatchToolEntry, index: usize) -> ToolLines {
+        build_batch_entry_lines(
+            entry,
+            index,
+            Instant::now(),
+            80,
+            SectionFlags::default(),
+            &TOL,
+            &reg(),
+            None,
+            None,
+        )
     }
 
     #[test_case(80, true  ; "shown_when_width_sufficient")]
@@ -1257,30 +1295,14 @@ mod tests {
             }),
         );
         entry.summary = "src/main.rs".into();
-        let tl = build_batch_entry_lines(
-            &entry,
-            0,
-            Instant::now(),
-            80,
-            SectionFlags::default(),
-            &TOL,
-            &reg(),
-        );
+        let tl = batch_lines(&entry, 0);
         assert!(lines_text(&tl).contains("(42 lines)"));
     }
 
     #[test]
     fn batch_entry_code_input_rendered() {
         let entry = batch_entry("bash", BatchToolStatus::Success, code_input(), None);
-        let tl = build_batch_entry_lines(
-            &entry,
-            0,
-            Instant::now(),
-            80,
-            SectionFlags::default(),
-            &TOL,
-            &reg(),
-        );
+        let tl = batch_lines(&entry, 0);
         assert!(lines_text(&tl).contains("echo hi"));
     }
 
@@ -1289,39 +1311,15 @@ mod tests {
     #[test_case(BatchToolStatus::Success,    &[]     ; "success_no_spinner")]
     fn batch_entry_spinner(status: BatchToolStatus, expected: &[usize]) {
         let entry = batch_entry("bash", status, None, None);
-        let tl = build_batch_entry_lines(
-            &entry,
-            0,
-            Instant::now(),
-            80,
-            SectionFlags::default(),
-            &TOL,
-            &reg(),
-        );
+        let tl = batch_lines(&entry, 0);
         assert_eq!(tl.spinner_lines, expected);
     }
 
     #[test]
     fn batch_entry_separator_on_nonzero_index() {
         let entry = batch_entry("bash", BatchToolStatus::Success, None, None);
-        let first = build_batch_entry_lines(
-            &entry,
-            0,
-            Instant::now(),
-            80,
-            SectionFlags::default(),
-            &TOL,
-            &reg(),
-        );
-        let second = build_batch_entry_lines(
-            &entry,
-            1,
-            Instant::now(),
-            80,
-            SectionFlags::default(),
-            &TOL,
-            &reg(),
-        );
+        let first = batch_lines(&entry, 0);
+        let second = batch_lines(&entry, 1);
         assert!(second.lines.len() > first.lines.len());
         assert!(spans_text(&second.lines[1].spans).contains(TOOL_SEPARATOR));
     }
@@ -1334,15 +1332,7 @@ mod tests {
             None,
             Some(ToolOutput::Plain("hello world".into())),
         );
-        let tl = build_batch_entry_lines(
-            &entry,
-            0,
-            Instant::now(),
-            80,
-            SectionFlags::default(),
-            &TOL,
-            &reg(),
-        );
+        let tl = batch_lines(&entry, 0);
         assert!(lines_text(&tl).contains("hello world"));
     }
 
@@ -1367,15 +1357,7 @@ mod tests {
     fn batch_entry_stored_annotation_rendered() {
         let mut entry = batch_entry("task", BatchToolStatus::Success, None, None);
         entry.annotation = Some("anthropic/claude-haiku-4-20250414".into());
-        let tl = build_batch_entry_lines(
-            &entry,
-            0,
-            Instant::now(),
-            80,
-            SectionFlags::default(),
-            &TOL,
-            &reg(),
-        );
+        let tl = batch_lines(&entry, 0);
         assert!(lines_text(&tl).contains("(anthropic/claude-haiku-4-20250414)"));
     }
 
@@ -1524,6 +1506,8 @@ mod tests {
             SectionFlags::default(),
             &TOL,
             &reg(),
+            None,
+            None,
         );
         assert_hr_fits(&tl, width);
     }

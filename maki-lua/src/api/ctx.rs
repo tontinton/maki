@@ -1,10 +1,21 @@
+use maki_agent::BufferSnapshot;
 use maki_agent::cancel::CancelToken;
 use maki_config::AgentConfig;
-use mlua::{LuaSerdeExt, UserData, UserDataMethods};
+use mlua::{LuaSerdeExt, UserData, UserDataMethods, Value as LuaValue};
+
+use crate::api::buf::{BufHandle, BufferStore};
+use crate::api::tool::coerce_tool_result;
+
+pub(crate) struct FinishPayload {
+    pub llm_output: String,
+    pub is_error: bool,
+    pub body: Option<BufferSnapshot>,
+}
 
 pub(crate) struct LuaCtx {
     pub(crate) cancel: CancelToken,
     pub(crate) config: AgentConfig,
+    pub(crate) finish_tx: Option<flume::Sender<FinishPayload>>,
 }
 
 impl UserData for LuaCtx {
@@ -12,5 +23,36 @@ impl UserData for LuaCtx {
         methods.add_method("cancelled", |_, this, ()| Ok(this.cancel.is_cancelled()));
 
         methods.add_method("config", |lua, this, ()| lua.to_value(&this.config));
+
+        methods.add_method_mut("finish", |lua, this, val: LuaValue| {
+            let tx = this
+                .finish_tx
+                .take()
+                .ok_or_else(|| mlua::Error::runtime("ctx:finish() already called"))?;
+
+            let (result, body) = match &val {
+                LuaValue::Table(t) => {
+                    let body_snap = t.get::<LuaValue>("body").ok().and_then(|v| {
+                        let ud = v.as_userdata()?;
+                        let h = ud.borrow::<BufHandle>().ok()?;
+                        lua.app_data_mut::<BufferStore>()?.take(h.0)
+                    });
+                    (coerce_tool_result(&val), body_snap)
+                }
+                _ => (coerce_tool_result(&val), None),
+            };
+
+            let (llm_output, is_error) = match result {
+                Ok(s) => (s, false),
+                Err(s) => (s, true),
+            };
+
+            let _ = tx.send(FinishPayload {
+                llm_output,
+                is_error,
+                body,
+            });
+            Ok(())
+        });
     }
 }

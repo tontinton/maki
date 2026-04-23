@@ -35,7 +35,7 @@ use super::scrollbar::render_vertical_scrollbar;
 use super::streaming_content::StreamingContent;
 use maki_agent::{
     BatchToolEntry, BatchToolStatus, BufferSnapshot, InstructionBlock, NO_FILES_FOUND,
-    RawRenderHints, ToolDoneEvent, ToolOutput, ToolStartEvent,
+    RawRenderHints, SharedBuf, ToolDoneEvent, ToolOutput, ToolStartEvent,
 };
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -58,6 +58,9 @@ pub struct MessagesPanel {
     idle_splash: Splash,
     accent: ColorTransition,
     expanded_tools: HashMap<String, SectionFlags>,
+    live_bufs: HashMap<String, Arc<SharedBuf>>,
+    batch_child_snapshots: HashMap<String, BufferSnapshot>,
+    batch_child_headers: HashMap<String, BufferSnapshot>,
     tool_output_lines: ToolOutputLines,
     render_hints: RenderHintsRegistry,
 }
@@ -94,6 +97,9 @@ impl MessagesPanel {
             idle_splash: Splash::new(ui_config.splash_animation),
             accent: ColorTransition::new(theme::current().mode_build),
             expanded_tools: HashMap::new(),
+            live_bufs: HashMap::new(),
+            batch_child_snapshots: HashMap::new(),
+            batch_child_headers: HashMap::new(),
             tool_output_lines: ui_config.tool_output_lines,
             render_hints: RenderHintsRegistry::new(),
         }
@@ -107,6 +113,8 @@ impl MessagesPanel {
         self.messages = msgs;
         self.cache.clear();
         self.expanded_tools.clear();
+        self.batch_child_snapshots.clear();
+        self.batch_child_headers.clear();
         self.highlight_segment = None;
     }
 
@@ -188,6 +196,7 @@ impl MessagesPanel {
     }
 
     pub fn tool_done(&mut self, event: ToolDoneEvent) {
+        self.live_bufs.remove(&event.id);
         let Some(msg) = self
             .messages
             .iter_mut()
@@ -316,14 +325,22 @@ impl MessagesPanel {
     }
 
     pub fn tool_snapshot(&mut self, tool_id: &str, snapshot: BufferSnapshot) {
-        if let Some(msg) = self.find_tool_msg_mut(tool_id) {
+        if let Some((batch_id, _)) = parse_batch_inner_id(tool_id) {
+            self.batch_child_snapshots
+                .insert(tool_id.to_owned(), snapshot);
+            self.rebuild_tool_segment(batch_id);
+        } else if let Some(msg) = self.find_tool_msg_mut(tool_id) {
             msg.render_snapshot = Some(snapshot);
             self.rebuild_tool_segment(tool_id);
         }
     }
 
     pub fn tool_header_snapshot(&mut self, tool_id: &str, snapshot: BufferSnapshot) {
-        if let Some(msg) = self.find_tool_msg_mut(tool_id) {
+        if let Some((batch_id, _)) = parse_batch_inner_id(tool_id) {
+            self.batch_child_headers
+                .insert(tool_id.to_owned(), snapshot);
+            self.rebuild_tool_segment(batch_id);
+        } else if let Some(msg) = self.find_tool_msg_mut(tool_id) {
             msg.text = snapshot.first_line_text();
             msg.render_header = Some(snapshot);
             self.rebuild_tool_segment(tool_id);
@@ -669,6 +686,7 @@ impl MessagesPanel {
             || self.streaming_text.is_animating()
             || self.show_idle_splash()
             || self.accent.is_animating()
+            || !self.live_bufs.is_empty()
     }
 
     fn show_idle_splash(&self) -> bool {
@@ -706,6 +724,7 @@ impl MessagesPanel {
             );
         }
         self.drain_highlights();
+        self.poll_live_bufs();
         self.rebuild_line_cache();
         if self.in_progress_count() > 0 {
             self.update_spinners();
@@ -804,6 +823,26 @@ impl MessagesPanel {
         self.messages
             .iter_mut()
             .rfind(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == tool_id))
+    }
+
+    pub fn register_live_buf(&mut self, id: String, body: Arc<SharedBuf>) {
+        self.live_bufs.insert(id, body);
+    }
+
+    fn poll_live_bufs(&mut self) {
+        let updates: Vec<_> = self
+            .live_bufs
+            .iter()
+            .filter_map(|(id, buf)| buf.read_if_dirty().map(|lines| (id.clone(), lines)))
+            .collect();
+        for (tool_id, lines) in updates {
+            if let Some(msg) = self.find_tool_msg_mut(&tool_id) {
+                msg.render_snapshot = Some(BufferSnapshot {
+                    lines: Vec::clone(&lines),
+                });
+            }
+            self.rebuild_tool_segment(&tool_id);
+        }
     }
 
     fn build_tool_segment_lines(
@@ -947,6 +986,8 @@ impl MessagesPanel {
                     child_exp,
                     &self.tool_output_lines,
                     &self.render_hints,
+                    self.batch_child_snapshots.get(&child_id),
+                    self.batch_child_headers.get(&child_id),
                 );
                 let search = tl.search_text.clone();
                 let instructions = entry.output.as_ref().and_then(|o| o.owned_instructions());
@@ -1030,6 +1071,8 @@ impl MessagesPanel {
                                 child_exp,
                                 &self.tool_output_lines,
                                 &self.render_hints,
+                                self.batch_child_snapshots.get(&child_id),
+                                self.batch_child_headers.get(&child_id),
                             );
                             let blocks = entry.output.as_ref().and_then(|o| o.owned_instructions());
                             (child_id, tl, blocks)
