@@ -3,7 +3,7 @@ use maki_agent::cancel::CancelToken;
 use maki_config::AgentConfig;
 use mlua::{LuaSerdeExt, UserData, UserDataMethods, Value as LuaValue};
 
-use crate::api::buf::{BufHandle, BufferStore};
+use crate::api::buf::BufHandle;
 use crate::api::tool::coerce_tool_result;
 
 pub(crate) struct FinishPayload {
@@ -24,7 +24,7 @@ impl UserData for LuaCtx {
 
         methods.add_method("config", |lua, this, ()| lua.to_value(&this.config));
 
-        methods.add_method_mut("finish", |lua, this, val: LuaValue| {
+        methods.add_method_mut("finish", |_lua, this, val: LuaValue| {
             let tx = this
                 .finish_tx
                 .take()
@@ -35,7 +35,7 @@ impl UserData for LuaCtx {
                     let body_snap = t.get::<LuaValue>("body").ok().and_then(|v| {
                         let ud = v.as_userdata()?;
                         let h = ud.borrow::<BufHandle>().ok()?;
-                        lua.app_data_mut::<BufferStore>()?.take(h.0)
+                        Some(h.buf.take())
                     });
                     (coerce_tool_result(&val), body_snap)
                 }

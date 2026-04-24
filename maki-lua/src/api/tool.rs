@@ -15,7 +15,6 @@ use mlua::{
 };
 use serde_json::Value;
 
-use crate::api::buf::{BufHandle, BufferStore};
 use crate::api::ctx::LuaCtx;
 use crate::runtime::{LiveCtx, Request};
 
@@ -351,38 +350,6 @@ impl ToolCallReply {
     }
 }
 
-pub(crate) fn extract_tool_return(lua: &Lua, result: &LuaValue) -> ToolCallReply {
-    let text_result = coerce_tool_result(result);
-
-    let (snapshot, header) = if let LuaValue::Table(t) = result {
-        let snap = t.get::<LuaValue>("body").ok().and_then(|v| {
-            let ud = v.as_userdata()?;
-            let h = ud.borrow::<BufHandle>().ok()?;
-            lua.app_data_mut::<BufferStore>()?.take(h.0)
-        });
-
-        let hdr = t.get::<LuaValue>("header").ok().and_then(|v| {
-            let ud = v.as_userdata()?;
-            let h = ud.borrow::<BufHandle>().ok()?;
-            lua.app_data_mut::<BufferStore>()?.take(h.0)
-        });
-
-        (snap, hdr)
-    } else {
-        (None, None)
-    };
-
-    if let Some(mut store) = lua.app_data_mut::<BufferStore>() {
-        store.clear();
-    }
-
-    ToolCallReply {
-        result: text_result,
-        snapshot,
-        header,
-    }
-}
-
 pub(crate) fn coerce_tool_result(result: &LuaValue) -> ToolCallResult {
     match result {
         LuaValue::String(s) => s.to_str().map(|s| s.to_owned()).map_err(|e| e.to_string()),
@@ -488,150 +455,58 @@ mod tests {
         assert_eq!(inv.permission_scope(), expected.map(String::from));
     }
 
-    fn lua_with_buf_store() -> Lua {
+    #[test]
+    fn coerce_string_returns_ok() {
         let lua = Lua::new();
-        lua.set_app_data(BufferStore::new());
-        lua
+        let val = LuaValue::String(lua.create_string("hello").unwrap());
+        assert_eq!(coerce_tool_result(&val), Ok("hello".to_string()));
     }
 
     #[test]
-    fn extract_tool_return_plain_string() {
-        let lua = lua_with_buf_store();
-        let val = LuaValue::String(lua.create_string("result text").unwrap());
-        let reply = extract_tool_return(&lua, &val);
-        assert_eq!(reply.result, Ok("result text".to_string()));
-        assert!(reply.snapshot.is_none());
-        assert!(reply.header.is_none());
-    }
-
-    #[test]
-    fn extract_tool_return_table_with_output() {
-        let lua = lua_with_buf_store();
-        let t = lua.create_table().unwrap();
-        t.set("llm_output", "hello").unwrap();
-        let reply = extract_tool_return(&lua, &LuaValue::Table(t));
-        assert_eq!(reply.result, Ok("hello".to_string()));
-        assert!(reply.snapshot.is_none());
-        assert!(reply.header.is_none());
-    }
-
-    #[test]
-    fn extract_tool_return_table_with_header() {
-        let lua = lua_with_buf_store();
-        let buf_id = {
-            let mut store = lua.app_data_mut::<BufferStore>().unwrap();
-            let id = store.create();
-            store.append_line(
-                id,
-                maki_agent::SnapshotLine {
-                    spans: vec![maki_agent::SnapshotSpan {
-                        text: "42 lines".into(),
-                        style: maki_agent::SpanStyle::Default,
-                    }],
-                },
-            );
-            id
-        };
-        let handle = lua.create_userdata(BufHandle(buf_id)).unwrap();
+    fn coerce_table_with_is_error_false_still_ok() {
+        let lua = Lua::new();
         let t = lua.create_table().unwrap();
         t.set("llm_output", "data").unwrap();
-        t.set("header", handle).unwrap();
-        let reply = extract_tool_return(&lua, &LuaValue::Table(t));
-        assert_eq!(reply.result, Ok("data".to_string()));
-        let hdr = reply.header.expect("header should be present");
-        assert_eq!(hdr.lines[0].spans[0].text, "42 lines");
-    }
-
-    #[test]
-    fn extract_tool_return_with_render_buf() {
-        let lua = lua_with_buf_store();
-        let buf_id = {
-            let mut store = lua.app_data_mut::<BufferStore>().unwrap();
-            let id = store.create();
-            store.append_line(
-                id,
-                maki_agent::SnapshotLine {
-                    spans: vec![maki_agent::SnapshotSpan {
-                        text: "styled".into(),
-                        style: maki_agent::SpanStyle::Named("keyword".into()),
-                    }],
-                },
-            );
-            id
-        };
-        let handle = lua.create_userdata(BufHandle(buf_id)).unwrap();
-        let t = lua.create_table().unwrap();
-        t.set("llm_output", "plain for llm").unwrap();
-        t.set("body", handle).unwrap();
-        let reply = extract_tool_return(&lua, &LuaValue::Table(t));
-        assert_eq!(reply.result, Ok("plain for llm".to_string()));
-        let snap = reply.snapshot.unwrap();
-        assert_eq!(snap.lines.len(), 1);
-        assert_eq!(snap.lines[0].spans[0].text, "styled");
-    }
-
-    #[test]
-    fn extract_tool_return_clears_orphaned_buffers() {
-        let lua = lua_with_buf_store();
-        {
-            let mut store = lua.app_data_mut::<BufferStore>().unwrap();
-            store.create();
-            store.create();
-        }
-        let t = lua.create_table().unwrap();
-        t.set("llm_output", "ok").unwrap();
-        let _reply = extract_tool_return(&lua, &LuaValue::Table(t));
-        let mut store = lua.app_data_mut::<BufferStore>().unwrap();
-        assert!(
-            store.take(1).is_none(),
-            "orphaned buffers should be cleared after extract"
+        t.set("is_error", false).unwrap();
+        assert_eq!(
+            coerce_tool_result(&LuaValue::Table(t)),
+            Ok("data".to_string())
         );
     }
 
     #[test]
-    fn extract_tool_return_is_error_flag() {
-        let lua = lua_with_buf_store();
+    fn coerce_table_with_is_error_true() {
+        let lua = Lua::new();
         let t = lua.create_table().unwrap();
-        t.set("llm_output", "something broke").unwrap();
+        t.set("llm_output", "boom").unwrap();
         t.set("is_error", true).unwrap();
-        let reply = extract_tool_return(&lua, &LuaValue::Table(t));
-        assert_eq!(reply.result, Err("something broke".to_string()));
-    }
-
-    #[test]
-    fn extract_tool_return_missing_output_field() {
-        let lua = lua_with_buf_store();
-        let buf_id = {
-            let mut store = lua.app_data_mut::<BufferStore>().unwrap();
-            let id = store.create();
-            store.append_line(
-                id,
-                maki_agent::SnapshotLine {
-                    spans: vec![maki_agent::SnapshotSpan {
-                        text: "some header".into(),
-                        style: maki_agent::SpanStyle::Default,
-                    }],
-                },
-            );
-            id
-        };
-        let handle = lua.create_userdata(BufHandle(buf_id)).unwrap();
-        let t = lua.create_table().unwrap();
-        t.set("header", handle).unwrap();
-        let reply = extract_tool_return(&lua, &LuaValue::Table(t));
-        assert!(
-            reply.result.is_err(),
-            "missing llm_output should be an error"
+        assert_eq!(
+            coerce_tool_result(&LuaValue::Table(t)),
+            Err("boom".to_string())
         );
-        assert!(reply.header.is_some(), "header should still be extracted");
+    }
+
+    #[test_case::test_case(&LuaValue::Nil ; "nil")]
+    #[test_case::test_case(&LuaValue::Boolean(true) ; "boolean")]
+    fn coerce_invalid_type_is_error(val: &LuaValue) {
+        assert_eq!(
+            coerce_tool_result(val),
+            Err(TOOL_HANDLER_RETURN_ERR.to_string())
+        );
     }
 
     #[test]
-    fn extract_tool_return_non_string_non_table() {
-        let lua = lua_with_buf_store();
-        let reply = extract_tool_return(&lua, &LuaValue::Integer(42));
-        assert!(reply.result.is_err());
-        assert!(reply.snapshot.is_none());
-        assert!(reply.header.is_none());
+    fn coerce_empty_table_is_error() {
+        let lua = Lua::new();
+        let t = lua.create_table().unwrap();
+        assert!(coerce_tool_result(&LuaValue::Table(t)).is_err());
+    }
+
+    #[test]
+    fn coerce_table_non_string_llm_output_is_error() {
+        let lua = Lua::new();
+        let t = lua.create_table().unwrap();
+        t.set("llm_output", 42).unwrap();
+        assert!(coerce_tool_result(&LuaValue::Table(t)).is_err());
     }
 }

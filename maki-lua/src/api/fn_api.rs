@@ -5,6 +5,8 @@ use std::thread;
 
 use mlua::{Function, Lua, RegistryKey, Result as LuaResult, Table};
 
+use crate::runtime::with_task_jobs;
+
 const READER_BUF_SIZE: usize = 8 * 1024;
 
 pub(crate) enum JobEvent {
@@ -252,22 +254,19 @@ pub(crate) fn create_fn_table(lua: &Lua) -> LuaResult<Table> {
                 None => (None, None, None, None, None),
             };
 
-            let mut store = lua
-                .app_data_mut::<JobStore>()
-                .ok_or_else(|| mlua::Error::runtime("job store not initialized"))?;
-            store
-                .start(&cmd, cwd, env, on_stdout, on_stderr, on_exit)
-                .map_err(mlua::Error::runtime)
+            with_task_jobs(lua, |store| {
+                store.start(&cmd, cwd, env, on_stdout, on_stderr, on_exit)
+            })
+            .ok_or_else(|| mlua::Error::runtime("job store not initialized"))?
+            .map_err(mlua::Error::runtime)
         })?,
     )?;
 
     t.set(
         "jobstop",
         lua.create_function(|lua, job_id: u32| {
-            let mut store = lua
-                .app_data_mut::<JobStore>()
+            with_task_jobs(lua, |store| store.kill(job_id))
                 .ok_or_else(|| mlua::Error::runtime("job store not initialized"))?;
-            store.kill(job_id);
             Ok(())
         })?,
     )?;

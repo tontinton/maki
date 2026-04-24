@@ -2,13 +2,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use maki_agent::types::InlineStyle;
-use maki_agent::{BufferSnapshot, SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle};
+use maki_agent::{SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle};
 use mlua::{Result as LuaResult, UserData, UserDataMethods, Value as LuaValue};
 
 pub(crate) struct BufferStore {
     buffers: HashMap<u32, Arc<SharedBuf>>,
     next_id: u32,
-    live_buf: Option<(u32, Arc<SharedBuf>)>,
+    live_buf: Option<Arc<SharedBuf>>,
 }
 
 impl BufferStore {
@@ -20,33 +20,36 @@ impl BufferStore {
         }
     }
 
-    pub fn create(&mut self) -> u32 {
+    pub fn create(&mut self) -> BufHandle {
+        let buf = Arc::new(SharedBuf::new());
         let id = self.next_id;
         self.next_id += 1;
-        self.buffers.insert(id, Arc::new(SharedBuf::new()));
-        id
+        self.buffers.insert(id, Arc::clone(&buf));
+        BufHandle { id, buf }
     }
 
-    pub fn create_live(&mut self) -> (u32, Arc<SharedBuf>) {
-        let id = self.create();
-        let shared = Arc::clone(&self.buffers[&id]);
+    pub fn create_live(&mut self) -> BufHandle {
+        let handle = self.create();
         if self.live_buf.is_none() {
-            self.live_buf = Some((id, Arc::clone(&shared)));
+            self.live_buf = Some(Arc::clone(&handle.buf));
         }
-        (id, shared)
+        handle
     }
 
+    #[cfg(test)]
     pub fn append_line(&mut self, id: u32, line: SnapshotLine) {
         if let Some(buf) = self.buffers.get(&id) {
             buf.append(line);
         }
     }
 
+    #[cfg(test)]
     pub fn len(&self, id: u32) -> usize {
         self.buffers.get(&id).map_or(0, |b| b.len())
     }
 
-    pub fn take(&mut self, id: u32) -> Option<BufferSnapshot> {
+    #[cfg(test)]
+    pub fn take(&mut self, id: u32) -> Option<maki_agent::BufferSnapshot> {
         self.buffers.remove(&id).map(|b| b.take())
     }
 
@@ -56,45 +59,38 @@ impl BufferStore {
     }
 
     pub fn live_buf(&self) -> Option<&Arc<SharedBuf>> {
-        self.live_buf.as_ref().map(|(_, buf)| buf)
+        self.live_buf.as_ref()
     }
 }
 
-#[derive(Clone, Copy)]
-pub(crate) struct BufHandle(pub u32);
+#[derive(Clone)]
+pub(crate) struct BufHandle {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub id: u32,
+    pub buf: Arc<SharedBuf>,
+}
 
 impl UserData for BufHandle {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
-        methods.add_method("line", |lua, this, arg: LuaValue| {
+        methods.add_method("line", |_lua, this, arg: LuaValue| {
             let line = parse_line(&arg)?;
-            let mut store = lua
-                .app_data_mut::<BufferStore>()
-                .ok_or_else(|| mlua::Error::runtime("buffer store not initialized"))?;
-            store.append_line(this.0, line);
+            this.buf.append(line);
             Ok(())
         });
 
-        methods.add_method("lines", |lua, this, tbl: mlua::Table| {
+        methods.add_method("lines", |_lua, this, tbl: mlua::Table| {
             let mut parsed = Vec::with_capacity(tbl.raw_len());
             for i in 1..=tbl.raw_len() {
                 let val: LuaValue = tbl.raw_get(i)?;
                 parsed.push(parse_line(&val)?);
             }
-            let mut store = lua
-                .app_data_mut::<BufferStore>()
-                .ok_or_else(|| mlua::Error::runtime("buffer store not initialized"))?;
             for line in parsed {
-                store.append_line(this.0, line);
+                this.buf.append(line);
             }
             Ok(())
         });
 
-        methods.add_method("len", |lua, this, ()| {
-            let store = lua
-                .app_data_ref::<BufferStore>()
-                .ok_or_else(|| mlua::Error::runtime("buffer store not initialized"))?;
-            Ok(store.len(this.0))
-        });
+        methods.add_method("len", |_lua, this, ()| Ok(this.buf.len()));
     }
 }
 
@@ -186,7 +182,7 @@ mod tests {
     #[test]
     fn take_removes_buffer_from_store() {
         let mut store = BufferStore::new();
-        let id = store.create();
+        let id = store.create().id;
         store.append_line(
             id,
             SnapshotLine {
@@ -199,7 +195,7 @@ mod tests {
         let snap = store.take(id);
         assert!(snap.is_some());
         assert_eq!(snap.unwrap().lines.len(), 1);
-        assert!(store.take(id).is_none(), "second take should return None");
+        assert!(store.take(id).is_none());
     }
 
     #[test]
@@ -209,18 +205,17 @@ mod tests {
     }
 
     #[test]
-    fn nonexistent_id_is_safe() {
+    fn append_to_nonexistent_id_is_noop() {
         let mut store = BufferStore::new();
         store.append_line(42, SnapshotLine { spans: vec![] });
         assert_eq!(store.len(42), 0);
-        assert_eq!(store.len(999), 0);
     }
 
     #[test]
     fn clear_frees_all_buffers() {
         let mut store = BufferStore::new();
-        let a = store.create();
-        let b = store.create();
+        let a = store.create().id;
+        let b = store.create().id;
         store.append_line(a, SnapshotLine { spans: vec![] });
         store.append_line(b, SnapshotLine { spans: vec![] });
         store.clear();
@@ -234,7 +229,7 @@ mod tests {
         store.create();
         store.create();
         store.clear();
-        assert_eq!(store.create(), 3, "id counter should not reset after clear");
+        assert_eq!(store.create().id, 3);
     }
 
     #[test_case("#ff0000", Some((255, 0, 0))   ; "red")]
@@ -269,8 +264,7 @@ mod tests {
 
     #[test]
     fn parse_line_rejects_non_string_non_table() {
-        let result = parse_line(&LuaValue::Integer(42));
-        assert!(result.is_err());
+        assert!(parse_line(&LuaValue::Integer(42)).is_err());
     }
 
     #[test]
@@ -293,9 +287,17 @@ mod tests {
         assert_eq!(line.spans[1].style, SpanStyle::Default);
     }
 
-    #[test_case(LuaValue::Boolean(true) ; "rejects_non_table")]
-    fn parse_span_rejects_invalid(val: LuaValue) {
-        assert!(parse_span(&val).is_err());
+    #[test]
+    fn parse_line_empty_table_produces_empty_spans() {
+        let lua = test_lua();
+        let t = lua.create_table().unwrap();
+        let line = parse_line(&LuaValue::Table(t)).unwrap();
+        assert!(line.spans.is_empty());
+    }
+
+    #[test]
+    fn parse_span_rejects_non_table() {
+        assert!(parse_span(&LuaValue::Boolean(true)).is_err());
     }
 
     #[test]
@@ -340,16 +342,7 @@ mod tests {
 
     #[test]
     fn parse_style_rejects_integer() {
-        let result = parse_style(&LuaValue::Integer(99));
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn parse_line_empty_table_produces_empty_spans() {
-        let lua = test_lua();
-        let t = lua.create_table().unwrap();
-        let line = parse_line(&LuaValue::Table(t)).unwrap();
-        assert!(line.spans.is_empty());
+        assert!(parse_style(&LuaValue::Integer(99)).is_err());
     }
 
     #[test]
@@ -363,12 +356,15 @@ mod tests {
     #[test]
     fn buf_handle_line_and_len_via_lua() {
         let lua = test_lua();
-        let mut store = lua.app_data_mut::<BufferStore>().unwrap();
-        let id = store.create();
-        drop(store);
+        let (handle, id) = {
+            let mut store = lua.app_data_mut::<BufferStore>().unwrap();
+            let handle = store.create();
+            let id = handle.id;
+            (handle, id)
+        };
 
-        let handle = lua.create_userdata(BufHandle(id)).unwrap();
-        lua.globals().set("buf", handle).unwrap();
+        let ud = lua.create_userdata(handle).unwrap();
+        lua.globals().set("buf", ud).unwrap();
 
         lua.load(r#"buf:line("hello")"#).exec().unwrap();
         lua.load(r#"buf:line({ { "styled", "dim" } })"#)
@@ -385,12 +381,13 @@ mod tests {
     #[test]
     fn buf_handle_lines_adds_multiple() {
         let lua = test_lua();
-        let mut store = lua.app_data_mut::<BufferStore>().unwrap();
-        let id = store.create();
-        drop(store);
+        let handle = {
+            let mut store = lua.app_data_mut::<BufferStore>().unwrap();
+            store.create()
+        };
 
-        let handle = lua.create_userdata(BufHandle(id)).unwrap();
-        lua.globals().set("buf", handle).unwrap();
+        let ud = lua.create_userdata(handle).unwrap();
+        lua.globals().set("buf", ud).unwrap();
 
         lua.load(r#"buf:lines({ "a", "b", "c" })"#).exec().unwrap();
         let len: usize = lua.load("return buf:len()").eval().unwrap();
@@ -400,12 +397,15 @@ mod tests {
     #[test]
     fn buf_handle_line_with_inline_style_via_lua() {
         let lua = test_lua();
-        let mut store = lua.app_data_mut::<BufferStore>().unwrap();
-        let id = store.create();
-        drop(store);
+        let (handle, id) = {
+            let mut store = lua.app_data_mut::<BufferStore>().unwrap();
+            let handle = store.create();
+            let id = handle.id;
+            (handle, id)
+        };
 
-        let handle = lua.create_userdata(BufHandle(id)).unwrap();
-        lua.globals().set("buf", handle).unwrap();
+        let ud = lua.create_userdata(handle).unwrap();
+        lua.globals().set("buf", ud).unwrap();
 
         lua.load(r##"buf:line({ { "ERROR", { fg = "#ff0000", bold = true } } })"##)
             .exec()
@@ -425,60 +425,10 @@ mod tests {
     }
 
     #[test]
-    fn shared_buf_append_and_len() {
-        let buf = SharedBuf::new();
-        assert_eq!(buf.len(), 0);
-        buf.append(SnapshotLine {
-            spans: vec![SnapshotSpan {
-                text: "hello".into(),
-                style: SpanStyle::Default,
-            }],
-        });
-        assert_eq!(buf.len(), 1);
-    }
-
-    #[test]
-    fn shared_buf_dirty_flag() {
-        let buf = SharedBuf::new();
-        assert!(buf.read_if_dirty().is_none());
-        buf.append(SnapshotLine { spans: vec![] });
-        let snap = buf.read_if_dirty();
-        assert!(snap.is_some());
-        assert_eq!(snap.unwrap().len(), 1);
-        assert!(buf.read_if_dirty().is_none());
-    }
-
-    #[test]
-    fn shared_buf_take_clones_lines() {
-        let buf = Arc::new(SharedBuf::new());
-        buf.append(SnapshotLine {
-            spans: vec![SnapshotSpan {
-                text: "line1".into(),
-                style: SpanStyle::Default,
-            }],
-        });
-        let snap = buf.take();
-        assert_eq!(snap.lines.len(), 1);
-        assert_eq!(snap.lines[0].spans[0].text, "line1");
-        assert_eq!(buf.len(), 1);
-    }
-
-    #[test]
-    fn shared_buf_cow_semantics() {
-        let buf = SharedBuf::new();
-        buf.append(SnapshotLine { spans: vec![] });
-        let ui_ref = buf.read_if_dirty().unwrap();
-        assert_eq!(ui_ref.len(), 1);
-        buf.append(SnapshotLine { spans: vec![] });
-        assert_eq!(ui_ref.len(), 1);
-        let ui_ref2 = buf.read_if_dirty().unwrap();
-        assert_eq!(ui_ref2.len(), 2);
-    }
-
-    #[test]
-    fn create_live_and_dispatch() {
+    fn create_live_and_take() {
         let mut store = BufferStore::new();
-        let (id, _shared) = store.create_live();
+        let handle = store.create_live();
+        let id = handle.id;
         store.append_line(
             id,
             SnapshotLine {
@@ -489,13 +439,6 @@ mod tests {
             },
         );
         assert_eq!(store.len(id), 1);
-    }
-
-    #[test]
-    fn take_live_buf_from_store() {
-        let mut store = BufferStore::new();
-        let (id, _shared) = store.create_live();
-        store.append_line(id, SnapshotLine { spans: vec![] });
         let snap = store.take(id);
         assert!(snap.is_some());
         assert_eq!(snap.unwrap().lines.len(), 1);
@@ -504,16 +447,12 @@ mod tests {
     #[test]
     fn create_live_second_call_does_not_overwrite_first() {
         let mut store = BufferStore::new();
-        let (id1, shared1) = store.create_live();
-        let (id2, _shared2) = store.create_live();
-        assert_ne!(id1, id2);
-        shared1.append(SnapshotLine { spans: vec![] });
-        let live = store.live_buf().expect("live_buf should exist");
-        assert_eq!(
-            live.len(),
-            1,
-            "live_buf should still point to the first buf"
-        );
+        let handle1 = store.create_live();
+        let handle2 = store.create_live();
+        assert_ne!(handle1.id, handle2.id);
+        handle1.buf.append(SnapshotLine { spans: vec![] });
+        let live = store.live_buf().unwrap();
+        assert_eq!(live.len(), 1);
     }
 
     #[test]
@@ -532,25 +471,24 @@ mod tests {
     }
 
     #[test]
-    fn live_buf_arc_is_same_as_backing_buffer() {
+    fn live_buf_reflects_writes_through_handle() {
         let mut store = BufferStore::new();
-        let (id, shared) = store.create_live();
-        shared.append(SnapshotLine {
+        let handle = store.create_live();
+        handle.buf.append(SnapshotLine {
             spans: vec![SnapshotSpan {
                 text: "via arc".into(),
                 style: SpanStyle::Default,
             }],
         });
-        assert_eq!(store.len(id), 1);
-        let live = store.live_buf().unwrap();
-        assert_eq!(live.len(), 1);
+        assert_eq!(store.len(handle.id), 1);
+        assert_eq!(store.live_buf().unwrap().len(), 1);
     }
 
     #[test]
     fn create_live_mixed_with_create_regular() {
         let mut store = BufferStore::new();
-        let regular = store.create();
-        let (live_id, _) = store.create_live();
+        let regular = store.create().id;
+        let live_id = store.create_live().id;
         store.append_line(regular, SnapshotLine { spans: vec![] });
         store.append_line(live_id, SnapshotLine { spans: vec![] });
         assert_eq!(store.len(regular), 1);

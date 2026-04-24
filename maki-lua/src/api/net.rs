@@ -1,9 +1,9 @@
-use std::io::Read;
 use std::net::{IpAddr, ToSocketAddrs};
 use std::time::Duration;
 
+use futures_lite::io::AsyncReadExt;
 use isahc::config::{Configurable, RedirectPolicy};
-use isahc::{HttpClient, Request};
+use isahc::{AsyncBody, HttpClient, Request};
 use mlua::{Lua, Result as LuaResult, Table, Value};
 
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
@@ -15,17 +15,43 @@ const CF_MITIGATED: &str = "cf-mitigated";
 const CF_CHALLENGE: &str = "challenge";
 const FALLBACK_USER_AGENT: &str = "maki";
 
-// Supports both Neovim's current vim.net.request(url, opts, on_response) signature
-// and the proposed multi-method API: vim.net.request(url, opts) with opts.method.
-// See: https://github.com/neovim/neovim/issues/38946
+struct RequestParams {
+    url: String,
+    method: String,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+    timeout: Duration,
+    max_bytes: usize,
+    retries: u32,
+}
+
+struct ResponseData {
+    body: String,
+    status: u16,
+    content_type: String,
+}
+
 pub(crate) fn create_net_table(lua: &Lua) -> LuaResult<Table> {
     let net = lua.create_table()?;
 
+    // Supports both Neovim's current vim.net.request(url, opts, on_response) signature
+    // and the proposed multi-method API: vim.net.request(url, opts) with opts.method.
+    // See: https://github.com/neovim/neovim/issues/38946
     net.set(
         "request",
-        lua.create_function(|lua, (url, opts): (String, Option<Table>)| {
-            match do_request(lua, &url, opts.as_ref()) {
-                Ok(tbl) => Ok((Value::Table(tbl), Value::Nil)),
+        lua.create_async_function(|lua, (url, opts): (String, Option<Table>)| async move {
+            let params = match extract_request_params(&url, opts.as_ref()) {
+                Ok(p) => p,
+                Err(e) => return Ok((Value::Nil, Value::String(lua.create_string(&e)?))),
+            };
+            match do_request(params).await {
+                Ok(resp) => {
+                    let tbl = lua.create_table()?;
+                    tbl.set("body", resp.body)?;
+                    tbl.set("status", resp.status)?;
+                    tbl.set("content_type", resp.content_type)?;
+                    Ok((Value::Table(tbl), Value::Nil))
+                }
                 Err(e) => Ok((Value::Nil, Value::String(lua.create_string(&e)?))),
             }
         })?,
@@ -34,41 +60,29 @@ pub(crate) fn create_net_table(lua: &Lua) -> LuaResult<Table> {
     Ok(net)
 }
 
-fn build_request(
-    url: &str,
-    user_agent: &str,
-    method: &str,
-    opts: Option<&Table>,
-) -> Result<Request<Vec<u8>>, String> {
-    let mut builder = Request::builder()
-        .method(method)
-        .uri(url)
-        .header("User-Agent", user_agent);
+fn extract_request_params(url: &str, opts: Option<&Table>) -> Result<RequestParams, String> {
+    let url = validate_and_upgrade_url(url)?;
+    check_ssrf(&url)?;
 
-    if let Some(headers) = opts.and_then(|o| o.get::<Table>("headers").ok()) {
-        for pair in headers.pairs::<String, String>() {
+    let method = opts
+        .and_then(|o| o.get::<String>("method").ok())
+        .unwrap_or_else(|| "GET".to_string());
+
+    let headers = if let Some(tbl) = opts.and_then(|o| o.get::<Table>("headers").ok()) {
+        let mut h = Vec::new();
+        for pair in tbl.pairs::<String, String>() {
             let (k, v) = pair.map_err(|e| format!("invalid header: {e}"))?;
-            builder = builder.header(k.as_str(), v.as_str());
+            h.push((k, v));
         }
-    }
+        h
+    } else {
+        Vec::new()
+    };
 
     let body = opts
         .and_then(|o| o.get::<String>("body").ok())
         .map(|s| s.into_bytes())
         .unwrap_or_default();
-
-    builder
-        .body(body)
-        .map_err(|e| format!("request build error: {e}"))
-}
-
-fn do_request(lua: &Lua, url: &str, opts: Option<&Table>) -> Result<Table, String> {
-    let url = validate_and_upgrade_url(url)?;
-    check_ssrf(&url)?;
-
-    let max_bytes = opts
-        .and_then(|o| o.get::<usize>("max_bytes").ok())
-        .unwrap_or(DEFAULT_MAX_BYTES);
 
     let timeout = Duration::from_secs(
         opts.and_then(|o| o.get::<u64>("timeout").ok())
@@ -76,26 +90,66 @@ fn do_request(lua: &Lua, url: &str, opts: Option<&Table>) -> Result<Table, Strin
             .min(MAX_TIMEOUT_SECS),
     );
 
+    let max_bytes = opts
+        .and_then(|o| o.get::<usize>("max_bytes").ok())
+        .unwrap_or(DEFAULT_MAX_BYTES);
+
     let retries = opts
         .and_then(|o| o.get::<u32>("retry").ok())
         .unwrap_or(MAX_RETRIES);
 
+    Ok(RequestParams {
+        url,
+        method,
+        headers,
+        body,
+        timeout,
+        max_bytes,
+        retries,
+    })
+}
+
+fn build_request(
+    url: &str,
+    user_agent: &str,
+    method: &str,
+    headers: &[(String, String)],
+    body: Vec<u8>,
+) -> Result<Request<AsyncBody>, String> {
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(url)
+        .header("User-Agent", user_agent);
+
+    for (k, v) in headers {
+        builder = builder.header(k.as_str(), v.as_str());
+    }
+
+    builder
+        .body(AsyncBody::from(body))
+        .map_err(|e| format!("request build error: {e}"))
+}
+
+async fn do_request(params: RequestParams) -> Result<ResponseData, String> {
     let client = HttpClient::builder()
-        .timeout(timeout)
+        .timeout(params.timeout)
         .redirect_policy(RedirectPolicy::Follow)
         .build()
         .map_err(|e| format!("client error: {e}"))?;
 
-    let method = opts
-        .and_then(|o| o.get::<String>("method").ok())
-        .unwrap_or_else(|| "GET".to_string());
-
-    let is_get = method.eq_ignore_ascii_case("GET");
+    let is_get = params.method.eq_ignore_ascii_case("GET");
     let mut last_err = String::new();
 
     let mut response = 'retry: {
-        for attempt in 0..=retries {
-            match client.send(build_request(&url, USER_AGENT, &method, opts)?) {
+        for attempt in 0..=params.retries {
+            let req = build_request(
+                &params.url,
+                USER_AGENT,
+                &params.method,
+                &params.headers,
+                params.body.clone(),
+            )?;
+            match client.send_async(req).await {
                 Ok(resp) => {
                     let status = resp.status().as_u16();
                     let is_cf_challenge = status == 403
@@ -106,12 +160,18 @@ fn do_request(lua: &Lua, url: &str, opts: Option<&Table>) -> Result<Table, Strin
                             .is_some_and(|v| v.contains(CF_CHALLENGE));
 
                     if is_cf_challenge && is_get {
-                        match client.send(build_request(&url, FALLBACK_USER_AGENT, &method, opts)?)
-                        {
+                        let req = build_request(
+                            &params.url,
+                            FALLBACK_USER_AGENT,
+                            &params.method,
+                            &params.headers,
+                            params.body.clone(),
+                        )?;
+                        match client.send_async(req).await {
                             Ok(resp) => break 'retry resp,
                             Err(e) => last_err = format!("request failed: {e}"),
                         }
-                    } else if status >= 500 && attempt < retries {
+                    } else if status >= 500 && attempt < params.retries {
                         last_err = format!("HTTP {status}");
                         continue;
                     } else {
@@ -138,7 +198,7 @@ fn do_request(lua: &Lua, url: &str, opts: Option<&Table>) -> Result<Table, Strin
         .get("content-length")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<usize>().ok())
-        && len > max_bytes
+        && len > params.max_bytes
     {
         return Err(format!("response too large: {len} bytes"));
     }
@@ -146,22 +206,21 @@ fn do_request(lua: &Lua, url: &str, opts: Option<&Table>) -> Result<Table, Strin
     let mut bytes = Vec::new();
     response
         .body_mut()
-        .take((max_bytes + 1) as u64)
+        .take((params.max_bytes + 1) as u64)
         .read_to_end(&mut bytes)
+        .await
         .map_err(|e| format!("read error: {e}"))?;
 
-    if bytes.len() > max_bytes {
+    if bytes.len() > params.max_bytes {
         return Err(format!("response too large: {} bytes", bytes.len()));
     }
 
     let body = String::from_utf8_lossy(&bytes).into_owned();
-
-    let tbl = lua.create_table().map_err(|e| e.to_string())?;
-    tbl.set("body", body).map_err(|e| e.to_string())?;
-    tbl.set("status", status).map_err(|e| e.to_string())?;
-    tbl.set("content_type", content_type)
-        .map_err(|e| e.to_string())?;
-    Ok(tbl)
+    Ok(ResponseData {
+        body,
+        status,
+        content_type,
+    })
 }
 
 fn extract_host(url: &str) -> Option<&str> {
@@ -301,24 +360,43 @@ mod tests {
 
     #[test]
     fn build_request_get_no_opts() {
-        let req = build_request("https://example.com", "agent", "GET", None).unwrap();
+        let req = build_request("https://example.com", "agent", "GET", &[], vec![]).unwrap();
         assert_eq!(req.method(), "GET");
-        assert!(req.body().is_empty());
+        assert_eq!(req.body().len(), Some(0));
         assert_eq!(req.headers()["User-Agent"], "agent");
     }
 
     #[test]
     fn build_request_post_with_body_and_headers() {
-        let lua = Lua::new();
-        let headers = lua.create_table().unwrap();
-        headers.set("Content-Type", "application/json").unwrap();
-        let opts = lua.create_table().unwrap();
-        opts.set("headers", headers).unwrap();
-        opts.set("body", "hello world").unwrap();
-        let req = build_request("https://example.com", "agent", "POST", Some(&opts)).unwrap();
+        let headers = vec![("Content-Type".to_string(), "application/json".to_string())];
+        let req = build_request(
+            "https://example.com",
+            "agent",
+            "POST",
+            &headers,
+            b"hello world".to_vec(),
+        )
+        .unwrap();
         assert_eq!(req.method(), "POST");
-        assert_eq!(req.body(), b"hello world");
+        assert_eq!(req.body().len(), Some(b"hello world".len() as u64));
         assert_eq!(req.headers()["Content-Type"], "application/json");
+    }
+
+    #[test]
+    fn build_request_multiple_headers() {
+        let headers = vec![
+            ("Accept".to_string(), "text/html".to_string()),
+            ("X-Custom".to_string(), "foo".to_string()),
+        ];
+        let req = build_request("https://example.com", "agent", "GET", &headers, vec![]).unwrap();
+        assert_eq!(req.headers()["Accept"], "text/html");
+        assert_eq!(req.headers()["X-Custom"], "foo");
+    }
+
+    #[test]
+    fn build_request_invalid_uri_errors() {
+        let result = build_request("not a valid uri \x00", "agent", "GET", &[], vec![]);
+        assert!(result.is_err());
     }
 
     #[test_case(r#"net.request("https://127.0.0.1")"# ; "ssrf_blocked")]
@@ -335,5 +413,67 @@ mod tests {
             .unwrap();
         assert!(is_nil);
         assert!(has_err);
+    }
+
+    #[test]
+    fn extract_params_defaults_no_opts() {
+        let params = extract_request_params("https://example.com", None).unwrap();
+        assert_eq!(params.url, "https://example.com");
+        assert_eq!(params.method, "GET");
+        assert!(params.headers.is_empty());
+        assert!(params.body.is_empty());
+        assert_eq!(params.timeout, Duration::from_secs(DEFAULT_TIMEOUT_SECS));
+        assert_eq!(params.max_bytes, DEFAULT_MAX_BYTES);
+        assert_eq!(params.retries, MAX_RETRIES);
+    }
+
+    #[test]
+    fn extract_params_timeout_clamped_to_max() {
+        let lua = Lua::new();
+        let opts = lua.create_table().unwrap();
+        opts.set("timeout", MAX_TIMEOUT_SECS + 100).unwrap();
+        let params = extract_request_params("https://example.com", Some(&opts)).unwrap();
+        assert_eq!(params.timeout, Duration::from_secs(MAX_TIMEOUT_SECS));
+    }
+
+    #[test]
+    fn extract_params_post_with_body() {
+        let lua = Lua::new();
+        let opts = lua.create_table().unwrap();
+        opts.set("method", "POST").unwrap();
+        opts.set("body", r#"{"key":"val"}"#).unwrap();
+        let params = extract_request_params("https://example.com", Some(&opts)).unwrap();
+        assert_eq!(params.method, "POST");
+        assert_eq!(params.body, br#"{"key":"val"}"#);
+    }
+
+    #[test]
+    fn extract_params_http_upgraded_to_https() {
+        let params = extract_request_params("http://example.com", None).unwrap();
+        assert_eq!(params.url, "https://example.com");
+    }
+
+    #[test]
+    fn extract_params_headers_collected() {
+        let lua = Lua::new();
+        let headers = lua.create_table().unwrap();
+        headers.set("Authorization", "Bearer tok").unwrap();
+        headers.set("Accept", "text/html").unwrap();
+        let opts = lua.create_table().unwrap();
+        opts.set("headers", headers).unwrap();
+        let params = extract_request_params("https://example.com", Some(&opts)).unwrap();
+        assert_eq!(params.headers.len(), 2);
+        assert!(
+            params
+                .headers
+                .iter()
+                .any(|(k, v)| k == "Authorization" && v == "Bearer tok")
+        );
+        assert!(
+            params
+                .headers
+                .iter()
+                .any(|(k, v)| k == "Accept" && v == "text/html")
+        );
     }
 }

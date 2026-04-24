@@ -15,8 +15,8 @@ use std::sync::Arc;
 
 use mlua::{Lua, Result as LuaResult, Table};
 
-use crate::api::buf::{BufHandle, BufferStore};
 use crate::api::tool::PendingTools;
+use crate::runtime::with_task_bufs;
 
 pub(crate) fn create_maki_global(
     lua: &Lua,
@@ -45,11 +45,8 @@ fn create_ui_table(lua: &Lua) -> LuaResult<Table> {
     t.set(
         "buf",
         lua.create_function(|lua, ()| {
-            let mut store = lua
-                .app_data_mut::<BufferStore>()
-                .ok_or_else(|| mlua::Error::runtime("buffer store not initialized"))?;
-            let (id, _) = store.create_live();
-            Ok(BufHandle(id))
+            with_task_bufs(lua, |store| store.create_live())
+                .ok_or_else(|| mlua::Error::runtime("buffer store not initialized"))
         })?,
     )?;
     Ok(t)
