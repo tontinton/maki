@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 maki-agent = { workspace = true }
 maki-config = { workspace = true }
+maki-highlight = { workspace = true }
 maki-providers = { workspace = true }
 maki-storage = { workspace = true }
 ratatui = { workspace = true }
@@ -13,7 +14,6 @@ crossterm = { workspace = true }
 color-eyre = { workspace = true }
 tracing = { workspace = true }
 syntect = { workspace = true }
-two-face = { workspace = true }
 unicode-width = { workspace = true }
 serde_json = { workspace = true }
 arboard = { workspace = true }

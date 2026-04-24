@@ -2321,6 +2321,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "maki-highlight"
+version = "0.2.7"
+dependencies = [
+ "syntect",
+ "test-case",
+ "two-face",
+]
+
+[[package]]
 name = "maki-interpreter"
 version = "0.2.7"
 dependencies = [
@@ -2344,6 +2353,7 @@ dependencies = [
  "libc",
  "maki-agent",
  "maki-config",
+ "maki-highlight",
  "mlua",
  "regex",
  "serde_json",
@@ -2443,6 +2453,7 @@ dependencies = [
  "libc",
  "maki-agent",
  "maki-config",
+ "maki-highlight",
  "maki-providers",
  "maki-storage",
  "notify",
@@ -2459,7 +2470,6 @@ dependencies = [
  "test-case",
  "toml",
  "tracing",
- "two-face",
  "unicode-width",
 ]
 

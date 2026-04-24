@@ -1,7 +1,4 @@
-use crate::highlight::{
-    advance_highlighter, fallback_span, highlight_line, highlighter_for_path,
-    highlighter_for_syntax, highlighter_for_token, syntax_for_path,
-};
+use crate::highlight::{fallback_span, highlight_line};
 use crate::markdown::{should_truncate, truncation_notice};
 use crate::theme;
 
@@ -9,7 +6,6 @@ use maki_agent::diff::{DiffLine, DiffSpan, compute_hunks};
 use maki_agent::{GrepFileEntry, InstructionBlock, ToolInput, ToolOutput};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use syntect::easy::HighlightLines;
 use syntect::parsing::SyntaxReference;
 use syntect::util::LinesWithEndings;
 
@@ -46,16 +42,16 @@ fn truncation_line(truncated: usize) -> Line<'static> {
     ))
 }
 
-fn highlight_spans(hl: &mut HighlightLines<'_>, text: &str) -> Vec<Span<'static>> {
+fn highlight_spans(hl: &mut maki_highlight::Highlighter, text: &str) -> Vec<Span<'static>> {
     let with_nl = format!("{text}\n");
     highlight_line(hl, &with_nl)
         .into_iter()
-        .map(|(style, chunk)| Span::styled(chunk, style))
+        .filter(|span| !span.content.is_empty())
         .collect()
 }
 
 fn render_code(
-    mut hl: Option<HighlightLines<'static>>,
+    mut hl: Option<maki_highlight::Highlighter>,
     start_line: usize,
     code_lines: &[String],
     total_count: usize,
@@ -93,15 +89,13 @@ fn render_code(
     (lines, has_truncation)
 }
 
-/// Syntect is stateful: to color line N correctly it needs to have seen
-/// lines 1..N in order, so an open string or block comment on an earlier
-/// line still tints everything after it. A diff shows two files at once,
-/// and removed and added lines only make sense in their own file's state,
-/// so we keep one walker per side and step them in lockstep with the hunks.
+/// Syntect is stateful, so to color line N you need lines 1..N first.
+/// A diff has two files, each with its own parser state. We keep one
+/// walker per side and step them in lockstep with the hunks.
 struct FileWalker<'a> {
     lines: LinesWithEndings<'a>,
     pos: usize,
-    hl: HighlightLines<'static>,
+    hl: maki_highlight::Highlighter,
 }
 
 impl<'a> FileWalker<'a> {
@@ -109,15 +103,12 @@ impl<'a> FileWalker<'a> {
         Self {
             lines: LinesWithEndings::from(content),
             pos: 1,
-            hl: highlighter_for_syntax(syntax),
+            hl: maki_highlight::Highlighter::for_syntax(syntax),
         }
     }
 
-    /// Feeds the next line to syntect but throws the styled output away,
-    /// saving an allocation for lines we won't render (like the unchanged
-    /// side of a diff line that we only show from the other file). Running
-    /// off the end means our line math drifted, so we yell about it in
-    /// debug and stay quiet in release.
+    /// Advances the parser without keeping styled output (for lines we
+    /// skip over in the diff). Debug-asserts if we run past EOF.
     fn skip(&mut self) -> bool {
         let Some(line) = self.lines.next() else {
             debug_assert!(
@@ -127,12 +118,12 @@ impl<'a> FileWalker<'a> {
             );
             return false;
         };
-        advance_highlighter(&mut self.hl, line);
+        self.hl.advance(line);
         self.pos += 1;
         true
     }
 
-    fn highlight_next(&mut self) -> Option<Vec<(Style, String)>> {
+    fn highlight_next(&mut self) -> Option<Vec<Span<'static>>> {
         let Some(line) = self.lines.next() else {
             debug_assert!(
                 false,
@@ -202,11 +193,8 @@ fn numbered_gutter(line_nr: &mut usize, w: usize) -> Span<'static> {
     span
 }
 
-/// Each diff line variant has its own little dance: an unchanged line
-/// needs both walkers stepped but only one set of spans, a removed line
-/// pulls from the before walker, an added line from the after one. Doing
-/// it all in one match means adding a new variant forces the compiler to
-/// drag us back here instead of letting a bug slip through.
+/// Unchanged lines step both walkers but take spans from `after`.
+/// Removed/added lines only step their own side.
 fn render_hunk_line(
     dl: &DiffLine,
     walkers: Option<&mut (FileWalker<'_>, FileWalker<'_>)>,
@@ -251,12 +239,9 @@ fn render_hunk_line(
     }
 }
 
-fn syntax_to_spans(syntax: Option<Vec<(Style, String)>>, text: &str) -> Vec<Span<'static>> {
+fn syntax_to_spans(syntax: Option<Vec<Span<'static>>>, text: &str) -> Vec<Span<'static>> {
     match syntax {
-        Some(s) => s
-            .into_iter()
-            .map(|(style, chunk)| Span::styled(chunk, style))
-            .collect(),
+        Some(s) => s,
         None => vec![fallback_span(text)],
     }
 }
@@ -264,7 +249,7 @@ fn syntax_to_spans(syntax: Option<Vec<(Style, String)>>, text: &str) -> Vec<Span
 fn diff_change_spans(
     prefix: &'static str,
     ds: &[DiffSpan],
-    syntax: Option<Vec<(Style, String)>>,
+    syntax: Option<Vec<Span<'static>>>,
     base: Style,
     emph: Style,
 ) -> Vec<Span<'static>> {
@@ -277,7 +262,7 @@ fn diff_change_spans(
         None => {
             let full: String = ds.iter().map(|s| s.text.as_str()).collect();
             spans.push(Span::styled(
-                crate::highlight::normalize_text(&full),
+                maki_highlight::normalize_text(&full),
                 base.patch(theme::current().code_fallback),
             ));
         }
@@ -320,7 +305,7 @@ fn render_grep_results(
             )));
         }
 
-        let syntax = highlight.then(|| syntax_for_path(&entry.path));
+        let syntax = highlight.then(|| maki_highlight::syntax_for_path(&entry.path));
         let has_context = entry.groups.iter().any(|g| g.lines.len() > 1);
 
         for (gi, group) in entry.groups.iter().enumerate() {
@@ -337,7 +322,10 @@ fn render_grep_results(
                 }
                 let mut spans = vec![gutter(&format!("{:>w$}", line.line_nr))];
                 let text_spans = if let Some(syn) = syntax {
-                    highlight_spans(&mut highlighter_for_syntax(syn), &line.text)
+                    highlight_spans(
+                        &mut maki_highlight::Highlighter::for_syntax(syn),
+                        &line.text,
+                    )
                 } else if line.is_match {
                     vec![fallback_span(&line.text)]
                 } else {
@@ -403,7 +391,7 @@ pub(crate) fn render_instructions(
         let code_lines: Vec<String> = block.content.lines().map(String::from).collect();
         let total = code_lines.len();
         let remaining = max_lines.saturating_sub(used);
-        let hl = highlight.then(|| highlighter_for_path(&block.path));
+        let hl = highlight.then(|| maki_highlight::Highlighter::for_path(&block.path));
         let (rendered, was_truncated) = render_code(hl, 1, &code_lines, total, remaining);
         used += rendered.len();
         truncated |= was_truncated;
@@ -476,7 +464,7 @@ pub fn render_tool_content(
             .map(String::from)
             .collect();
         let total = code_lines.len();
-        let hl = highlight.then(|| highlighter_for_token(language));
+        let hl = highlight.then(|| maki_highlight::Highlighter::for_token(language));
         let (code_result, trunc) = render_code(hl, 1, &code_lines, total, limits.script);
         truncation.script = trunc;
         lines.extend(code_result);
@@ -488,7 +476,7 @@ pub fn render_tool_content(
             lines: code_lines,
             ..
         }) => render_code(
-            highlight.then(|| highlighter_for_path(path)),
+            highlight.then(|| maki_highlight::Highlighter::for_path(path)),
             *start_line,
             code_lines,
             code_lines.len(),
@@ -509,7 +497,7 @@ pub fn render_tool_content(
                 lines: code_lines,
             },
         ) => render_code(
-            highlight.then(|| highlighter_for_path(path)),
+            highlight.then(|| maki_highlight::Highlighter::for_path(path)),
             1,
             code_lines,
             code_lines.len(),
@@ -521,7 +509,11 @@ pub fn render_tool_content(
             after,
             ..
         }) => (
-            render_diff(highlight.then(|| syntax_for_path(path)), before, after),
+            render_diff(
+                highlight.then(|| maki_highlight::syntax_for_path(path)),
+                before,
+                after,
+            ),
             false,
         ),
         Some(ToolOutput::GrepResult { entries }) => {
@@ -553,7 +545,7 @@ pub fn render_tool_content(
 }
 
 fn merge_syntax_with_diff(
-    syntax_spans: &[(Style, String)],
+    syntax_spans: &[Span<'static>],
     diff_spans: &[DiffSpan],
     base: Style,
     emphasis: Style,
@@ -562,7 +554,7 @@ fn merge_syntax_with_diff(
 
     let syn_iter = syntax_spans
         .iter()
-        .flat_map(|(style, text)| text.chars().map(move |c| (c, *style)));
+        .flat_map(|span| span.content.chars().map(move |c| (c, span.style)));
 
     let mut diff_iter = diff_spans.iter().flat_map(|ds| {
         let bg = if ds.emphasized { emphasis } else { base };
@@ -622,7 +614,7 @@ mod tests {
     fn render_code_line_count(input_lines: usize, total: usize, expected: usize) {
         let code_lines: Vec<String> = (0..input_lines).map(|i| format!("line {i}")).collect();
         let (result, _) = render_code(
-            Some(highlighter_for_path("test.rs")),
+            Some(maki_highlight::Highlighter::for_path("test.rs")),
             1,
             &code_lines,
             total,
@@ -643,11 +635,10 @@ mod tests {
             .unwrap_or_else(|| panic!("no fg-styled span containing {substr:?}"))
     }
 
-    /// Reference color: highlight `text` as part of `prefix` and return the fg
-    /// for the substring `find`. This is the "ground truth" - what the
-    /// highlighter produces when it walks the file from the start.
+    /// Walk the file from scratch up to `prefix`, then highlight `text`
+    /// and return the fg for `find`. This is our ground truth.
     fn fg_in_context(path: &str, prefix: &str, text: &str, find: &str) -> ratatui::style::Color {
-        let mut hl = highlighter_for_path(path);
+        let mut hl = maki_highlight::Highlighter::for_path(path);
         for line in prefix.lines() {
             let with_nl = format!("{line}\n");
             let _ = highlight_line(&mut hl, &with_nl);
@@ -655,34 +646,45 @@ mod tests {
         let with_nl = format!("{text}\n");
         highlight_line(&mut hl, &with_nl)
             .into_iter()
-            .find_map(|(s, t)| if t.contains(find) { s.fg } else { None })
+            .find_map(|span| {
+                if span.content.contains(find) {
+                    span.style.fg
+                } else {
+                    None
+                }
+            })
             .unwrap_or_else(|| panic!("ref fg for {find:?} missing"))
     }
 
-    /// Regression: an unchanged context line inside a multi-line block comment
-    /// must be highlighted with the parser state from walking the full file —
-    /// not from a fresh state at the hunk's start_line. We assert this by
-    /// comparing against an independent reference highlighter.
+    /// Context lines inside a block comment must carry the full-file parser
+    /// state, not a fresh one from the hunk start.
     #[test]
     fn diff_context_line_inside_block_comment_matches_full_file_state() {
         let before = "/*\nalpha\nbravo\ncharlie\ndelta\necho\nfoxtrot\nOLD\ngolf\n*/\n";
         let after = "/*\nalpha\nbravo\ncharlie\ndelta\necho\nfoxtrot\nNEW\ngolf\n*/\n";
 
-        let lines = render_diff(Some(syntax_for_path("test.rs")), before, after);
+        let lines = render_diff(
+            Some(maki_highlight::syntax_for_path("test.rs")),
+            before,
+            after,
+        );
 
         let expected = fg_in_context("test.rs", "/*\nalpha\nbravo\ncharlie\n", "delta", "delta");
         assert_eq!(diff_fg(&lines, "delta"), expected);
     }
 
-    /// Regression: when an edit removes a closing `*/`, lines that were code
-    /// in BEFORE are now comment in AFTER. Unchanged context lines must be
-    /// highlighted using the AFTER state (their post-edit truth).
+    /// When an edit removes `*/`, formerly-code lines become comment.
+    /// Unchanged context lines must use the AFTER parser state.
     #[test]
     fn diff_unchanged_line_uses_after_state_when_close_tag_removed() {
         let before = "/*\ndoc\n*/\nfn x() {}\n";
         let after = "/*\ndoc\nfn x() {}\n";
 
-        let lines = render_diff(Some(syntax_for_path("test.rs")), before, after);
+        let lines = render_diff(
+            Some(maki_highlight::syntax_for_path("test.rs")),
+            before,
+            after,
+        );
 
         let expected = fg_in_context("test.rs", "/*\ndoc\n", "fn x() {}", "fn");
         assert_eq!(diff_fg(&lines, "fn x() {}"), expected);
@@ -692,7 +694,7 @@ mod tests {
     fn merge_syntax_with_diff_emphasis_split() {
         let base = Style::new().bg(Color::Red);
         let emph = Style::new().bg(Color::Green);
-        let syn = vec![(Style::new().fg(Color::White), "abcde".to_owned())];
+        let syn = vec![Span::styled("abcde", Style::new().fg(Color::White))];
         let diff = vec![
             plain("abc"),
             DiffSpan {
@@ -713,8 +715,8 @@ mod tests {
     fn merge_syntax_longer_than_diff_preserves_trailing() {
         let base = Style::new().bg(Color::Red);
         let syn = vec![
-            (Style::new().fg(Color::Blue), "ab".to_owned()),
-            (Style::new().fg(Color::Cyan), "cd".to_owned()),
+            Span::styled("ab", Style::new().fg(Color::Blue)),
+            Span::styled("cd", Style::new().fg(Color::Cyan)),
         ];
         let diff = vec![plain("ab")];
         let result = merge_syntax_with_diff(&syn, &diff, base, Style::default());
@@ -816,7 +818,10 @@ mod tests {
     fn merge_syntax_with_diff_multibyte(input: &str, parts: &[&str]) {
         let base = Style::new().bg(Color::Red);
         let emph = Style::new().bg(Color::Green);
-        let syn = vec![(Style::new().fg(Color::White), input.to_owned())];
+        let syn = vec![Span::styled(
+            input.to_owned(),
+            Style::new().fg(Color::White),
+        )];
         let diff: Vec<DiffSpan> = parts
             .iter()
             .enumerate()

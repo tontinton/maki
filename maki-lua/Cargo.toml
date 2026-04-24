@@ -10,6 +10,7 @@ rust-version.workspace = true
 [dependencies]
 maki-agent = { workspace = true }
 maki-config = { workspace = true }
+maki-highlight = { workspace = true }
 mlua = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

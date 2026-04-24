@@ -525,9 +525,9 @@ fn shell_highlight_spans(line: &str) -> Option<Vec<Span<'static>>> {
     let command = &line[parsed.prefix_len..];
     let shell_style = theme::current().shell_prefix;
     let mut spans = vec![Span::styled(prefix.to_owned(), shell_style)];
-    let mut hl = highlight::highlighter_for_token("bash");
-    for (style, text) in highlight::highlight_line(&mut hl, command) {
-        spans.push(Span::styled(text, style));
+    let mut hl = maki_highlight::Highlighter::for_token("bash");
+    for span in highlight::highlight_line(&mut hl, command) {
+        spans.push(span);
     }
     Some(spans)
 }

@@ -623,6 +623,7 @@ async fn dispatch_async(
             .and_then(|m| {
                 let ctx = m.get(&key)?;
                 let is_exit = matches!(tagged.event, JobEvent::Exit(_));
+                ctx.jobs.forward_to_waiter(tagged.job_id, &tagged.event);
                 let cb = ctx
                     .jobs
                     .callback_key(tagged.job_id, &tagged.event)
@@ -956,8 +957,8 @@ mod tests {
         t.set("header", hdr_handle).unwrap();
         let reply = extract_tool_return_from_task(&LuaValue::Table(t));
         assert_eq!(reply.result, Ok("text".to_string()));
-        assert_eq!(reply.snapshot.unwrap().lines[0].spans[0].text, "body line");
-        assert_eq!(reply.header.unwrap().lines[0].spans[0].text, "hdr line");
+        assert_eq!(reply.snapshot.unwrap().first_line_text(), "body line");
+        assert_eq!(reply.header.unwrap().first_line_text(), "hdr line");
     }
 
     #[test]
@@ -1035,7 +1036,7 @@ mod tests {
             is_error: false,
             body: Some(buf.take()),
         });
-        assert_eq!(reply.snapshot.unwrap().lines[0].spans[0].text, "rendered");
+        assert_eq!(reply.snapshot.unwrap().first_line_text(), "rendered");
         assert!(reply.header.is_none());
     }
 

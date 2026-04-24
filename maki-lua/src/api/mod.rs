@@ -8,6 +8,7 @@ pub(crate) mod net;
 pub(crate) mod text;
 pub(crate) mod tool;
 pub(crate) mod treesitter;
+pub(crate) mod ui;
 pub(crate) mod uv;
 
 use std::path::PathBuf;
@@ -16,7 +17,6 @@ use std::sync::Arc;
 use mlua::{Lua, Result as LuaResult, Table};
 
 use crate::api::tool::PendingTools;
-use crate::runtime::with_task_bufs;
 
 pub(crate) fn create_maki_global(
     lua: &Lua,
@@ -34,20 +34,8 @@ pub(crate) fn create_maki_global(
     maki.set("json", json::create_json_table(lua)?)?;
     maki.set("net", net::create_net_table(lua)?)?;
     maki.set("text", text::create_text_table(lua)?)?;
-    maki.set("ui", create_ui_table(lua)?)?;
+    maki.set("ui", ui::create_ui_table(lua)?)?;
     maki.set("fn", fn_api::create_fn_table(lua)?)?;
 
     Ok(maki)
-}
-
-fn create_ui_table(lua: &Lua) -> LuaResult<Table> {
-    let t = lua.create_table()?;
-    t.set(
-        "buf",
-        lua.create_function(|lua, ()| {
-            with_task_bufs(lua, |store| store.create_live())
-                .ok_or_else(|| mlua::Error::runtime("buffer store not initialized"))
-        })?,
-    )?;
-    Ok(t)
 }

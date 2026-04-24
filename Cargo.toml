@@ -49,6 +49,7 @@ members = [
   "maki-agent",
   "maki-config",
   "maki-docgen",
+  "maki-highlight",
   "maki-interpreter",
   "maki-lua",
   "maki-providers",
@@ -77,6 +78,7 @@ maki-ui = { path = "maki-ui" }
 maki-lua = { path = "maki-lua" }
 maki-tool-macro = { path = "maki-tool-macro" }
 maki-config-macro = { path = "maki-config-macro" }
+maki-highlight = { path = "maki-highlight" }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 uuid = { version = "1", default-features = false, features = ["v4"] }

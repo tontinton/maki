@@ -1,0 +1,15 @@
+[package]
+name = "maki-highlight"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+syntect = { workspace = true }
+two-face = { workspace = true }
+
+[dev-dependencies]
+test-case = { workspace = true }
