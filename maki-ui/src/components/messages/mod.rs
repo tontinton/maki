@@ -10,10 +10,10 @@ use self::selection::parse_batch_inner_id;
 
 use super::render_hints::RenderHintsRegistry;
 use super::tool_display::{
-    ToolLines, append_annotation, append_right_info, assistant_style, build_batch_entry_lines,
-    build_instructions_lines, build_tool_lines, done_style, error_style, format_timestamp_now,
-    output_limits_from_hints, thinking_style, tool_output_annotation, truncate_to_header,
-    user_style,
+    BatchChildState, RenderCtx, ToolLines, append_annotation, append_right_info, assistant_style,
+    build_batch_entry_lines, build_instructions_lines, build_tool_lines, done_style, error_style,
+    format_timestamp_now, output_limits_from_hints, thinking_style, tool_output_annotation,
+    truncate_to_header, user_style,
 };
 use super::{
     DisplayMessage, DisplayRole, ToolRole, ToolStatus, apply_scroll_delta, code_view::SectionFlags,
@@ -59,8 +59,7 @@ pub struct MessagesPanel {
     accent: ColorTransition,
     expanded_tools: HashMap<String, SectionFlags>,
     live_bufs: HashMap<String, Arc<SharedBuf>>,
-    batch_child_snapshots: HashMap<String, BufferSnapshot>,
-    batch_child_headers: HashMap<String, BufferSnapshot>,
+    batch_children: HashMap<String, BatchChildState>,
     tool_output_lines: ToolOutputLines,
     render_hints: RenderHintsRegistry,
 }
@@ -98,8 +97,7 @@ impl MessagesPanel {
             accent: ColorTransition::new(theme::current().mode_build),
             expanded_tools: HashMap::new(),
             live_bufs: HashMap::new(),
-            batch_child_snapshots: HashMap::new(),
-            batch_child_headers: HashMap::new(),
+            batch_children: HashMap::new(),
             tool_output_lines: ui_config.tool_output_lines,
             render_hints: RenderHintsRegistry::new(),
         }
@@ -113,8 +111,7 @@ impl MessagesPanel {
         self.messages = msgs;
         self.cache.clear();
         self.expanded_tools.clear();
-        self.batch_child_snapshots.clear();
-        self.batch_child_headers.clear();
+        self.batch_children.clear();
         self.highlight_segment = None;
     }
 
@@ -326,8 +323,10 @@ impl MessagesPanel {
 
     pub fn tool_snapshot(&mut self, tool_id: &str, snapshot: BufferSnapshot) {
         if let Some((batch_id, _)) = parse_batch_inner_id(tool_id) {
-            self.batch_child_snapshots
-                .insert(tool_id.to_owned(), snapshot);
+            self.batch_children
+                .entry(tool_id.to_owned())
+                .or_default()
+                .snapshot = Some(snapshot);
             self.rebuild_tool_segment(batch_id);
         } else if let Some(msg) = self.find_tool_msg_mut(tool_id) {
             msg.render_snapshot = Some(snapshot);
@@ -337,8 +336,10 @@ impl MessagesPanel {
 
     pub fn tool_header_snapshot(&mut self, tool_id: &str, snapshot: BufferSnapshot) {
         if let Some((batch_id, _)) = parse_batch_inner_id(tool_id) {
-            self.batch_child_headers
-                .insert(tool_id.to_owned(), snapshot);
+            self.batch_children
+                .entry(tool_id.to_owned())
+                .or_default()
+                .header = Some(snapshot);
             self.rebuild_tool_segment(batch_id);
         } else if let Some(msg) = self.find_tool_msg_mut(tool_id) {
             msg.text = snapshot.first_line_text();
@@ -825,6 +826,15 @@ impl MessagesPanel {
             .rfind(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == tool_id))
     }
 
+    fn rctx(&self) -> RenderCtx<'_> {
+        RenderCtx {
+            started_at: self.started_at,
+            width: self.viewport_width,
+            tool_output_lines: &self.tool_output_lines,
+            registry: &self.render_hints,
+        }
+    }
+
     pub fn register_live_buf(&mut self, id: String, body: Arc<SharedBuf>) {
         self.live_bufs.insert(id, body);
     }
@@ -837,9 +847,7 @@ impl MessagesPanel {
             .collect();
         for (tool_id, lines) in updates {
             if let Some(msg) = self.find_tool_msg_mut(&tool_id) {
-                msg.render_snapshot = Some(BufferSnapshot {
-                    lines: Vec::clone(&lines),
-                });
+                msg.render_snapshot = Some(BufferSnapshot::from_arc(lines));
             }
             self.rebuild_tool_segment(&tool_id);
         }
@@ -848,25 +856,19 @@ impl MessagesPanel {
     fn build_tool_segment_lines(
         msg: &DisplayMessage,
         status: ToolStatus,
-        started_at: Instant,
-        width: u16,
+        rctx: &RenderCtx,
         exp: SectionFlags,
-        tool_output_lines: &ToolOutputLines,
-        registry: &RenderHintsRegistry,
     ) -> ToolLines {
-        let mut tl = build_tool_lines(
-            msg,
-            status,
-            started_at,
-            width,
-            exp,
-            tool_output_lines,
-            registry,
-        );
+        let mut tl = build_tool_lines(msg, status, rctx, exp);
         if let Some(ts) = &msg.timestamp
             && !tl.lines.is_empty()
         {
-            append_right_info(&mut tl.lines[0], msg.turn_usage.as_deref(), Some(ts), width);
+            append_right_info(
+                &mut tl.lines[0],
+                msg.turn_usage.as_deref(),
+                Some(ts),
+                rctx.width,
+            );
         }
         tl
     }
@@ -931,15 +933,8 @@ impl MessagesPanel {
             .get(tool_id)
             .copied()
             .unwrap_or_default();
-        let tl = Self::build_tool_segment_lines(
-            msg,
-            status,
-            self.started_at,
-            self.viewport_width,
-            exp,
-            &self.tool_output_lines,
-            &self.render_hints,
-        );
+        let rctx = self.rctx();
+        let tl = Self::build_tool_segment_lines(msg, status, &rctx, exp);
 
         let instructions = msg
             .tool_output
@@ -968,6 +963,7 @@ impl MessagesPanel {
         let Some(ToolOutput::Batch { entries, .. }) = msg.tool_output.as_deref() else {
             return;
         };
+        let rctx = self.rctx();
         let children: Vec<_> = entries
             .iter()
             .enumerate()
@@ -981,13 +977,9 @@ impl MessagesPanel {
                 let tl = build_batch_entry_lines(
                     entry,
                     j,
-                    self.started_at,
-                    self.viewport_width,
+                    &rctx,
                     child_exp,
-                    &self.tool_output_lines,
-                    &self.render_hints,
-                    self.batch_child_snapshots.get(&child_id),
-                    self.batch_child_headers.get(&child_id),
+                    self.batch_children.get(&child_id),
                 );
                 let search = tl.search_text.clone();
                 let instructions = entry.output.as_ref().and_then(|o| o.owned_instructions());
@@ -1035,15 +1027,7 @@ impl MessagesPanel {
             if let DisplayRole::Tool(t) = &msg.role {
                 let exp = self.expanded_tools.get(&t.id).copied().unwrap_or_default();
                 let status = t.status;
-                let tl = Self::build_tool_segment_lines(
-                    msg,
-                    status,
-                    self.started_at,
-                    self.viewport_width,
-                    exp,
-                    &self.tool_output_lines,
-                    &self.render_hints,
-                );
+                let tl = Self::build_tool_segment_lines(msg, status, &self.rctx(), exp);
                 let id = t.id.clone();
                 let search_text = tl.search_text.clone();
                 self.cache.push_spacer_if_needed();
@@ -1066,13 +1050,9 @@ impl MessagesPanel {
                             let tl = build_batch_entry_lines(
                                 entry,
                                 j,
-                                self.started_at,
-                                self.viewport_width,
+                                &self.rctx(),
                                 child_exp,
-                                &self.tool_output_lines,
-                                &self.render_hints,
-                                self.batch_child_snapshots.get(&child_id),
-                                self.batch_child_headers.get(&child_id),
+                                self.batch_children.get(&child_id),
                             );
                             let blocks = entry.output.as_ref().and_then(|o| o.owned_instructions());
                             (child_id, tl, blocks)

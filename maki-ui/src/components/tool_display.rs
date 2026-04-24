@@ -37,6 +37,19 @@ pub(crate) struct OutputLimits {
     pub keep: Keep,
 }
 
+pub struct RenderCtx<'a> {
+    pub started_at: Instant,
+    pub width: u16,
+    pub tool_output_lines: &'a ToolOutputLines,
+    pub registry: &'a RenderHintsRegistry,
+}
+
+#[derive(Default)]
+pub struct BatchChildState {
+    pub snapshot: Option<BufferSnapshot>,
+    pub header: Option<BufferSnapshot>,
+}
+
 pub(crate) fn output_limits_from_hints(
     name: &str,
     hints: &ToolRenderHints,
@@ -799,28 +812,25 @@ fn resolve_span_style(style: &SpanStyle) -> Style {
 pub fn build_tool_lines(
     msg: &DisplayMessage,
     status: ToolStatus,
-    started_at: Instant,
-    width: u16,
+    rctx: &RenderCtx,
     expanded: SectionFlags,
-    tool_output_lines: &ToolOutputLines,
-    registry: &RenderHintsRegistry,
 ) -> ToolLines {
     let tool_name = msg.role.tool_name().unwrap_or("?");
-    let hints = registry.get(tool_name);
-    let limits = output_limits_from_hints(tool_name, hints, tool_output_lines);
+    let hints = rctx.registry.get(tool_name);
+    let limits = output_limits_from_hints(tool_name, hints, rctx.tool_output_lines);
     let (header, body) = match msg.text.split_once('\n') {
         Some((h, b)) => (h, Some(b)),
         None => (msg.text.as_str(), None),
     };
 
-    let mut b = ToolLineBuilder::new(width, "", expanded, limits, hints);
+    let mut b = ToolLineBuilder::new(rctx.width, "", expanded, limits, hints);
     b.push_header(
         tool_name,
         header,
         msg.annotation.as_deref(),
         msg.render_header.as_ref(),
     );
-    b.prepend_indicator(status.into(), started_at);
+    b.prepend_indicator(status.into(), rctx.started_at);
     b.push_code_content(msg.tool_input.as_deref(), msg.tool_output.as_deref());
     if let Some(ref snapshot) = msg.render_snapshot {
         let search_text = msg
@@ -856,39 +866,34 @@ pub fn truncate_to_header(text: &mut String) {
     text.truncate(end);
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn build_batch_entry_lines(
     entry: &BatchToolEntry,
     index: usize,
-    started_at: Instant,
-    width: u16,
+    rctx: &RenderCtx,
     expanded: SectionFlags,
-    tool_output_lines: &ToolOutputLines,
-    registry: &RenderHintsRegistry,
-    snapshot: Option<&BufferSnapshot>,
-    header_snapshot: Option<&BufferSnapshot>,
+    child_state: Option<&BatchChildState>,
 ) -> ToolLines {
-    let hints = registry.get(&entry.tool);
-    let limits = output_limits_from_hints(&entry.tool, hints, tool_output_lines);
+    let hints = rctx.registry.get(&entry.tool);
+    let limits = output_limits_from_hints(&entry.tool, hints, rctx.tool_output_lines);
     let mut annotation = entry.annotation.clone();
     if let Some(suffix) = entry.output.as_ref().and_then(tool_output_annotation) {
         append_annotation(&mut annotation, &suffix);
     }
 
-    let mut b = ToolLineBuilder::new(width, BATCH_INDENT, expanded, limits, hints);
+    let mut b = ToolLineBuilder::new(rctx.width, BATCH_INDENT, expanded, limits, hints);
     b.push_header(
         &entry.tool,
         &entry.summary,
         annotation.as_deref(),
-        header_snapshot,
+        child_state.and_then(|s| s.header.as_ref()),
     );
-    b.prepend_indicator(entry.status.into(), started_at);
+    b.prepend_indicator(entry.status.into(), rctx.started_at);
     b.push_code_content(entry.input.as_ref(), entry.output.as_ref());
     let is_done = matches!(
         entry.status,
         BatchToolStatus::Success | BatchToolStatus::Error
     );
-    if let Some(snap) = snapshot {
+    if let Some(snap) = child_state.and_then(|s| s.snapshot.as_ref()) {
         let search_text = entry.output.as_ref().and_then(|o| match o {
             ToolOutput::Plain(t) => Some(t.as_str()),
             _ => None,
@@ -997,6 +1002,15 @@ mod tests {
         RenderHintsRegistry::new()
     }
 
+    fn test_rctx(width: u16, registry: &RenderHintsRegistry) -> RenderCtx<'_> {
+        RenderCtx {
+            started_at: Instant::now(),
+            width,
+            tool_output_lines: &TOL,
+            registry,
+        }
+    }
+
     fn exp(both: bool) -> SectionFlags {
         SectionFlags {
             script: both,
@@ -1064,11 +1078,8 @@ mod tests {
         let tl = build_tool_lines(
             &msg,
             ToolStatus::Success,
-            Instant::now(),
-            80,
+            &test_rctx(80, &reg()),
             SectionFlags::default(),
-            &TOL,
-            &reg(),
         );
         assert_eq!(tl.highlight.is_some(), expect_highlight);
         if let Some(hl) = &tl.highlight {
@@ -1147,11 +1158,8 @@ mod tests {
         let tl = build_tool_lines(
             &msg,
             status,
-            Instant::now(),
-            80,
+            &test_rctx(80, &reg()),
             SectionFlags::default(),
-            &TOL,
-            &reg(),
         );
         let text = lines_text(&tl);
         assert!(text.contains("line1"));
@@ -1171,11 +1179,8 @@ mod tests {
         let tl = build_tool_lines(
             &msg,
             ToolStatus::Success,
-            Instant::now(),
-            80,
+            &test_rctx(80, &reg()),
             SectionFlags::default(),
-            &TOL,
-            &reg(),
         );
         assert_eq!(
             line_has_styled(&tl, BASH_OUTPUT_SEPARATOR, theme::current().tool_dim),
@@ -1190,11 +1195,8 @@ mod tests {
         let tl = build_tool_lines(
             &msg,
             status,
-            Instant::now(),
-            80,
+            &test_rctx(80, &reg()),
             SectionFlags::default(),
-            &TOL,
-            &reg(),
         );
         assert!(line_has_styled(&tl, label, theme::current().tool_dim));
     }
@@ -1247,12 +1249,8 @@ mod tests {
         build_batch_entry_lines(
             entry,
             index,
-            Instant::now(),
-            80,
+            &test_rctx(80, &reg()),
             SectionFlags::default(),
-            &TOL,
-            &reg(),
-            None,
             None,
         )
     }
@@ -1264,11 +1262,8 @@ mod tests {
         let mut tl = build_tool_lines(
             &msg,
             ToolStatus::Success,
-            Instant::now(),
-            80,
+            &test_rctx(80, &reg()),
             SectionFlags::default(),
-            &TOL,
-            &reg(),
         );
         let span_count_before = tl.lines[0].spans.len();
         append_right_info(&mut tl.lines[0], None, Some("12:34:56"), width);
@@ -1344,11 +1339,8 @@ mod tests {
         let tl = build_tool_lines(
             &msg,
             ToolStatus::Success,
-            Instant::now(),
-            80,
+            &test_rctx(80, &reg()),
             SectionFlags::default(),
-            &TOL,
-            &reg(),
         );
         let text = lines_text(&tl);
         assert!(text.contains("(2m timeout)"));
@@ -1381,11 +1373,8 @@ mod tests {
         let tl = build_tool_lines(
             &msg,
             ToolStatus::Success,
-            Instant::now(),
-            80,
+            &test_rctx(80, &reg()),
             SectionFlags::default(),
-            &TOL,
-            &reg(),
         );
         let text = lines_text(&tl);
         assert!(text.contains("bold"));
@@ -1435,11 +1424,8 @@ mod tests {
         build_tool_lines(
             &msg,
             ToolStatus::Success,
-            Instant::now(),
-            80,
+            &test_rctx(80, &reg()),
             SectionFlags::default(),
-            &TOL,
-            &reg(),
         )
     }
 
@@ -1478,14 +1464,12 @@ mod tests {
     fn task_hr_fits_within_indented_width() {
         let width: u16 = 60;
         let msg = task_msg("before\n\n---\n\nafter".into());
+        let r = reg();
         let tl = build_tool_lines(
             &msg,
             ToolStatus::Success,
-            Instant::now(),
-            width,
+            &test_rctx(width, &r),
             SectionFlags::default(),
-            &TOL,
-            &reg(),
         );
         assert_hr_fits(&tl, width);
     }
@@ -1499,15 +1483,12 @@ mod tests {
             None,
             Some(ToolOutput::Plain("before\n\n---\n\nafter".into())),
         );
+        let r = reg();
         let tl = build_batch_entry_lines(
             &entry,
             0,
-            Instant::now(),
-            width,
+            &test_rctx(width, &r),
             SectionFlags::default(),
-            &TOL,
-            &reg(),
-            None,
             None,
         );
         assert_hr_fits(&tl, width);
@@ -1541,11 +1522,8 @@ mod tests {
         let tl = build_tool_lines(
             &msg,
             ToolStatus::Success,
-            Instant::now(),
-            80,
+            &test_rctx(80, &reg()),
             SectionFlags::default(),
-            &TOL,
-            &reg(),
         );
         let text = lines_text(&tl);
         assert!(text.contains("line_0"));
@@ -1576,10 +1554,12 @@ mod tests {
 
     fn make_snapshot(lines: Vec<Vec<SnapshotSpan>>) -> BufferSnapshot {
         BufferSnapshot {
-            lines: lines
-                .into_iter()
-                .map(|spans| SnapshotLine { spans })
-                .collect(),
+            lines: Arc::new(
+                lines
+                    .into_iter()
+                    .map(|spans| SnapshotLine { spans })
+                    .collect(),
+            ),
         }
     }
 
@@ -1599,11 +1579,8 @@ mod tests {
         let tl = build_tool_lines(
             &msg,
             ToolStatus::Success,
-            Instant::now(),
-            80,
+            &test_rctx(80, &reg()),
             SectionFlags::default(),
-            &TOL,
-            &reg(),
         );
         let t = theme::current();
         assert!(line_has_styled(&tl, "pub", t.index_keyword));
@@ -1620,11 +1597,8 @@ mod tests {
         let tl = build_tool_lines(
             &msg,
             ToolStatus::Success,
-            Instant::now(),
-            80,
+            &test_rctx(80, &reg()),
             SectionFlags::default(),
-            &TOL,
-            &reg(),
         );
         let text = lines_text(&tl);
         assert!(text.contains("from_snapshot"));
@@ -1650,11 +1624,8 @@ mod tests {
         let tl = build_tool_lines(
             &msg,
             ToolStatus::Success,
-            Instant::now(),
-            80,
+            &test_rctx(80, &reg()),
             SectionFlags::default(),
-            &TOL,
-            &reg(),
         );
         let text = lines_text(&tl);
         assert!(text.contains("line_0"));
@@ -1775,24 +1746,11 @@ mod tests {
     #[test]
     fn bash_expanded_live_output() {
         let msg = bash_output_msg(200, true);
-        let collapsed = build_tool_lines(
-            &msg,
-            ToolStatus::InProgress,
-            Instant::now(),
-            80,
-            exp(false),
-            &TOL,
-            &reg(),
-        );
-        let expanded = build_tool_lines(
-            &msg,
-            ToolStatus::InProgress,
-            Instant::now(),
-            80,
-            exp(true),
-            &TOL,
-            &reg(),
-        );
+        let r = reg();
+        let collapsed =
+            build_tool_lines(&msg, ToolStatus::InProgress, &test_rctx(80, &r), exp(false));
+        let expanded =
+            build_tool_lines(&msg, ToolStatus::InProgress, &test_rctx(80, &r), exp(true));
         let collapsed_text = lines_text(&collapsed);
         let expanded_text = lines_text(&expanded);
         assert!(collapsed.truncation.any());
@@ -1812,15 +1770,8 @@ mod tests {
         expect_expand_notice: bool,
     ) {
         let msg = bash_output_msg(line_count, false);
-        let tl = build_tool_lines(
-            &msg,
-            ToolStatus::Success,
-            Instant::now(),
-            80,
-            exp(expanded),
-            &TOL,
-            &reg(),
-        );
+        let r = reg();
+        let tl = build_tool_lines(&msg, ToolStatus::Success, &test_rctx(80, &r), exp(expanded));
         let text = lines_text(&tl);
         assert_eq!(tl.truncation.any(), expect_truncation);
         assert_eq!(text.contains("click to expand"), expect_expand_notice);
@@ -1840,15 +1791,8 @@ mod tests {
         expect_expand_notice: bool,
     ) {
         let msg = read_output_msg(line_count);
-        let tl = build_tool_lines(
-            &msg,
-            ToolStatus::Success,
-            Instant::now(),
-            80,
-            exp(expanded),
-            &TOL,
-            &reg(),
-        );
+        let r = reg();
+        let tl = build_tool_lines(&msg, ToolStatus::Success, &test_rctx(80, &r), exp(expanded));
         assert_eq!(tl.truncation.any(), expect_truncation);
         let text = lines_text(&tl);
         assert_eq!(text.contains("click to expand"), expect_expand_notice);
@@ -1919,11 +1863,8 @@ mod tests {
         let tl = build_tool_lines(
             &msg,
             ToolStatus::Success,
-            Instant::now(),
-            80,
+            &test_rctx(80, &reg()),
             SectionFlags::default(),
-            &TOL,
-            &reg(),
         );
         let text = lines_text(&tl);
         assert!(
@@ -2022,11 +1963,8 @@ mod tests {
         let tl = build_tool_lines(
             &msg,
             ToolStatus::Success,
-            Instant::now(),
-            80,
+            &test_rctx(80, &custom_reg),
             SectionFlags::default(),
-            &TOL,
-            &custom_reg,
         );
         let text = lines_text(&tl);
         assert!(
@@ -2047,11 +1985,8 @@ mod tests {
         let tl = build_tool_lines(
             &msg,
             ToolStatus::Success,
-            Instant::now(),
-            80,
+            &test_rctx(80, &reg()),
             SectionFlags::default(),
-            &TOL,
-            &reg(),
         );
         assert!(
             !lines_text(&tl).contains("plain fallback"),
@@ -2075,11 +2010,8 @@ mod tests {
         let tl = build_tool_lines(
             &msg,
             ToolStatus::Success,
-            Instant::now(),
-            80,
+            &test_rctx(80, &reg()),
             SectionFlags::default(),
-            &TOL,
-            &reg(),
         );
         let text = lines_text(&tl);
         assert!(text.contains("row_0"));
@@ -2114,11 +2046,8 @@ mod tests {
         let tl = build_tool_lines(
             &msg,
             ToolStatus::Success,
-            Instant::now(),
-            80,
+            &test_rctx(80, &reg()),
             SectionFlags::default(),
-            &TOL,
-            &reg(),
         );
         assert!(
             tl.search_text.contains("llm_output_here"),
@@ -2153,11 +2082,8 @@ mod tests {
         let tl = build_tool_lines(
             &msg,
             ToolStatus::Success,
-            Instant::now(),
-            80,
+            &test_rctx(80, &reg()),
             SectionFlags::default(),
-            &TOL,
-            &reg(),
         );
         assert!(
             tl.search_text.contains("body_fallback"),

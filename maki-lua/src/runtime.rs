@@ -562,17 +562,17 @@ async fn dispatch_async(
 ) -> ToolCallReply {
     let task_state = lua.app_data_ref::<TaskMap>().and_then(|m| {
         let ctx = m.get(&key)?;
-        Some((ctx.cancel.clone(), ctx.deadline, ctx.jobs.event_rx.clone()))
+        Some((
+            ctx.cancel.clone(),
+            ctx.deadline,
+            ctx.jobs.event_rx.clone(),
+            !ctx.jobs.is_empty(),
+        ))
     });
 
-    let Some((cancel, deadline, event_rx)) = task_state else {
+    let Some((cancel, deadline, event_rx, has_jobs)) = task_state else {
         return ToolCallReply::err(NIL_WITHOUT_FINISH_MSG);
     };
-
-    let has_jobs = lua
-        .app_data_ref::<TaskMap>()
-        .and_then(|m| Some(!m.get(&key)?.jobs.is_empty()))
-        .unwrap_or(false);
 
     if !has_jobs {
         lua.gc_collect().ok();
@@ -598,34 +598,38 @@ async fn dispatch_async(
             Err(flume::TryRecvError::Empty) => {}
         }
 
-        let has_alive = lua
-            .app_data_ref::<TaskMap>()
-            .and_then(|m| Some(m.get(&key)?.jobs.has_alive_jobs()))
-            .unwrap_or(false);
-
-        if !has_alive {
-            smol::Timer::after(DISPATCH_POLL_INTERVAL).await;
-            return match finish_rx.try_recv() {
-                Ok(payload) => finish_reply(payload),
-                _ => ToolCallReply::err(NIL_WITHOUT_FINISH_MSG),
-            };
-        }
-
         let tagged = match event_rx.try_recv() {
             Ok(t) => t,
             Err(_) => {
+                let has_alive = lua
+                    .app_data_ref::<TaskMap>()
+                    .and_then(|m| Some(m.get(&key)?.jobs.has_alive_jobs()))
+                    .unwrap_or(false);
+
+                if !has_alive {
+                    smol::Timer::after(DISPATCH_POLL_INTERVAL).await;
+                    return match finish_rx.try_recv() {
+                        Ok(payload) => finish_reply(payload),
+                        _ => ToolCallReply::err(NIL_WITHOUT_FINISH_MSG),
+                    };
+                }
                 smol::Timer::after(DISPATCH_POLL_INTERVAL).await;
                 continue;
             }
         };
 
-        let callback = lua.app_data_ref::<TaskMap>().and_then(|m| {
-            let ctx = m.get(&key)?;
-            let key = ctx.jobs.callback_key(tagged.job_id, &tagged.event)?;
-            lua.registry_value::<Function>(key).ok()
-        });
-
-        let is_exit = matches!(tagged.event, JobEvent::Exit(_));
+        let (callback, is_exit) = lua
+            .app_data_ref::<TaskMap>()
+            .and_then(|m| {
+                let ctx = m.get(&key)?;
+                let is_exit = matches!(tagged.event, JobEvent::Exit(_));
+                let cb = ctx
+                    .jobs
+                    .callback_key(tagged.job_id, &tagged.event)
+                    .and_then(|k| lua.registry_value::<Function>(k).ok());
+                Some((cb, is_exit))
+            })
+            .unwrap_or((None, matches!(tagged.event, JobEvent::Exit(_))));
 
         if let Some(func) = callback {
             let arg: LuaValue = match &tagged.event {
@@ -738,17 +742,21 @@ async fn run_tool_call(
     let call_future = async {
         match async_thread.await {
             Ok(LuaValue::Nil) => {
-                if let Some(tasks) = lua.app_data_ref::<TaskMap>() {
-                    if let Some(ctx) = tasks.get(&thread_key) {
-                        if let Some(live) = &ctx.live {
-                            if let Some(shared) = ctx.bufs.live_buf() {
-                                let _ = live.event_tx.send(maki_agent::AgentEvent::LiveToolBuf {
-                                    id: live.tool_use_id.clone(),
-                                    body: Arc::clone(shared),
-                                });
-                            }
-                        }
-                    }
+                let live_shared = lua.app_data_ref::<TaskMap>().and_then(|m| {
+                    let ctx = m.get(&thread_key)?;
+                    let live = ctx.live.as_ref()?;
+                    let shared = ctx.bufs.live_buf()?;
+                    Some((
+                        live.event_tx.clone(),
+                        live.tool_use_id.clone(),
+                        Arc::clone(shared),
+                    ))
+                });
+                if let Some((event_tx, tool_use_id, shared)) = live_shared {
+                    let _ = event_tx.send(maki_agent::AgentEvent::LiveToolBuf {
+                        id: tool_use_id,
+                        body: shared,
+                    });
                 }
                 dispatch_async(&lua, thread_key, finish_rx).await
             }

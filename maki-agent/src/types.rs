@@ -567,9 +567,7 @@ impl SharedBuf {
     pub fn take(&self) -> BufferSnapshot {
         self.dirty.store(false, Ordering::Release);
         let guard = self.committed.lock().unwrap_or_else(|e| e.into_inner());
-        BufferSnapshot {
-            lines: guard.as_ref().clone(),
-        }
+        BufferSnapshot::from_arc(Arc::clone(&guard))
     }
 }
 
@@ -593,10 +591,14 @@ impl Serialize for SharedBuf {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct BufferSnapshot {
-    pub lines: Vec<SnapshotLine>,
+    pub lines: Arc<Vec<SnapshotLine>>,
 }
 
 impl BufferSnapshot {
+    pub fn from_arc(lines: Arc<Vec<SnapshotLine>>) -> Self {
+        Self { lines }
+    }
+
     pub fn first_line_text(&self) -> String {
         self.lines
             .first()
@@ -1026,11 +1028,13 @@ mod tests {
 
     #[test]
     fn buffer_snapshot_first_line_text() {
-        let empty = BufferSnapshot { lines: vec![] };
+        let empty = BufferSnapshot {
+            lines: Arc::new(vec![]),
+        };
         assert_eq!(empty.first_line_text(), "");
 
         let multi = BufferSnapshot {
-            lines: vec![SnapshotLine {
+            lines: Arc::new(vec![SnapshotLine {
                 spans: vec![
                     SnapshotSpan {
                         text: "hello ".into(),
@@ -1041,7 +1045,7 @@ mod tests {
                         style: SpanStyle::Named("bold".into()),
                     },
                 ],
-            }],
+            }]),
         };
         assert_eq!(multi.first_line_text(), "hello world");
     }
