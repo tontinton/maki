@@ -19,6 +19,8 @@ struct BundledPlugin {
     dir: Dir<'static>,
 }
 
+/// `lib` is not a default builtin; it only exists so plugins can
+/// `require()` shared modules across plugin boundaries.
 static BUNDLED_PLUGINS: &[BundledPlugin] = &[
     BundledPlugin {
         name: "index",

@@ -65,6 +65,7 @@ const BASH_OUTPUT_SEPARATOR: &str = "──────";
 const BATCH_INDENT: &str = "  ";
 const BATCH_CONTENT_INDENT: &str = "    ";
 
+/// Derived from `ToolInput` variant, not render hints.
 #[derive(Clone, Copy, PartialEq)]
 enum SeparatorStyle {
     None,

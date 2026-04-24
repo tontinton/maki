@@ -28,6 +28,8 @@ struct JobMeta {
     on_exit: Option<RegistryKey>,
 }
 
+/// All jobs in a task share one event channel so the dispatch loop
+/// can poll a single receiver for stdout/stderr/exit from any child.
 pub(crate) struct JobStore {
     jobs: HashMap<u32, JobMeta>,
     pub(crate) event_rx: flume::Receiver<TaggedJobEvent>,

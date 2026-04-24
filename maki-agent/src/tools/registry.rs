@@ -161,8 +161,12 @@ impl RegisteredTool {
     }
 }
 
-/// Lock-free reads via `ArcSwap`: every tool call just loads a pointer.
-/// Writes (MCP handshake, plugin reload) swap in a whole new snapshot atomically.
+/// Lock-free reads via `ArcSwap`, writes swap in a new snapshot atomically.
+///
+/// Bundled Lua plugins can replace a native tool with their own version.
+/// The original native tool is kept in `native_fallbacks` so we can still
+/// look up its header info. User plugins are not allowed to replace tools
+/// that aren't native (that gives a `NameConflict` error).
 pub struct ToolRegistry {
     tools: ArcSwap<Vec<RegisteredTool>>,
     native_fallbacks: ArcSwap<Vec<RegisteredTool>>,
@@ -198,8 +202,6 @@ impl ToolRegistry {
         &NATIVE
     }
 
-    /// Fresh registry with all native tools, not shared. Useful in tests that
-    /// register plugins without touching the global static.
     pub fn with_natives() -> Self {
         Self::build_native()
     }
@@ -301,10 +303,6 @@ impl ToolRegistry {
         });
     }
 
-    /// Atomically swap a plugin's tools in. When a bundled plugin provides a tool
-    /// with the same name as a native one, the native gets moved to `native_fallbacks`
-    /// so header resolution can still use the native's start_header. Conflicts with other
-    /// non-native sources still roll back.
     pub fn replace_plugin(
         &self,
         plugin: &str,

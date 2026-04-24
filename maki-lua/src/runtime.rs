@@ -29,6 +29,8 @@ const NIL_WITHOUT_FINISH_MSG: &str =
 
 pub type LoadResult = Result<Vec<(Arc<str>, RawRenderHints)>, PluginError>;
 
+/// `LoadSource` and `ClearPlugin` drain all in-flight tool calls before
+/// proceeding, so the plugin environment is never mutated mid-call.
 pub enum Request {
     LoadSource {
         name: Arc<str>,
@@ -58,6 +60,8 @@ pub enum Request {
     Shutdown,
 }
 
+/// Bundles `event_tx` + `tool_use_id` so `CallTool` does not need
+/// two separate Option fields that must stay in sync.
 pub struct LiveCtx {
     pub event_tx: maki_agent::EventSender,
     pub tool_use_id: String,
@@ -80,6 +84,7 @@ impl ThreadKey {
     }
 }
 
+/// Keyed by coroutine pointer. All access is on the single Lua OS thread.
 type TaskMap = HashMap<ThreadKey, TaskCtx>;
 
 pub(crate) fn with_task_jobs<R>(lua: &Lua, f: impl FnOnce(&mut JobStore) -> R) -> Option<R> {
@@ -96,6 +101,8 @@ pub(crate) fn with_task_bufs<R>(lua: &Lua, f: impl FnOnce(&mut BufferStore) -> R
     Some(f(&mut ctx.bufs))
 }
 
+/// RAII guard that cleans up a task (kills jobs, clears bufs) even on
+/// panics or early returns.
 struct TaskCleanupGuard {
     lua: Lua,
     key: ThreadKey,
@@ -122,6 +129,8 @@ struct ToolKeys {
 
 type PluginMap = Rc<RefCell<HashMap<Arc<str>, HashMap<Arc<str>, ToolKeys>>>>;
 
+/// Sandbox-first: `require`, `io`, `package` are stripped, `os` and `debug`
+/// are limited by Luau's built-in sandbox.
 struct LuaRuntime {
     lua: Lua,
     pending: PendingTools,
@@ -144,6 +153,8 @@ impl LuaRuntime {
         let pending: PendingTools = Arc::new(Mutex::new(Vec::new()));
         let cwd = std::env::current_dir().unwrap_or_default();
 
+        // Each coroutine gets its own cancel token and deadline, so the
+        // interrupt handler does an O(1) HashMap lookup to check just that task.
         let interrupt_shutdown = Arc::clone(&shutdown);
         let interrupt_lua = lua.clone();
         lua.set_interrupt(move |_| {
@@ -264,6 +275,8 @@ impl LuaRuntime {
         Ok(env)
     }
 
+    /// Bundled dirs are checked before the filesystem, which lets plugins
+    /// `require()` shared modules like `truncate.lua` from the `lib` bundle.
     fn create_require_fn(
         &self,
         env: &mlua::Table,
@@ -450,6 +463,8 @@ impl LuaRuntime {
         self.drop_plugin_keys(plugin);
     }
 
+    /// Temporarily inserts a TaskCtx so `maki.ui.buf()` works during header
+    /// computation. `TaskCleanupGuard` handles teardown.
     fn compute_header(&self, plugin: &str, tool: &str, input: Value) -> HeaderResult {
         let plugins = self.plugins.borrow();
         let Some(tk) = plugins.get(plugin).and_then(|p| p.get(tool)) else {
@@ -538,6 +553,8 @@ fn extract_tool_return_from_task(val: &LuaValue) -> ToolCallReply {
     }
 }
 
+/// After the handler returns nil (async mode), this loop polls job events
+/// and waits for either `ctx:finish()` or all jobs to die.
 async fn dispatch_async(
     lua: &Lua,
     key: ThreadKey,
@@ -645,6 +662,10 @@ fn finish_reply(payload: FinishPayload) -> ToolCallReply {
     }
 }
 
+/// Tool calls run concurrently on a `smol::LocalExecutor`. Coroutines
+/// interleave at yield points (async I/O). Deadlines are enforced three
+/// ways: CPU-bound loops via `set_interrupt`, I/O waits via `smol::Timer`
+/// race, and spawned jobs via the dispatch loop.
 #[allow(clippy::too_many_arguments)]
 async fn run_tool_call(
     lua: Lua,
@@ -754,6 +775,9 @@ pub(crate) struct LuaThread {
     pub shutdown: Arc<AtomicBool>,
 }
 
+/// Runs on a dedicated OS thread so the Lua instance never crosses thread
+/// boundaries (no Mutex needed). `smol::block_on` drives cooperative async.
+/// `LoadSource`/`ClearPlugin` wait for in-flight calls to finish first.
 pub fn spawn(
     registry: Arc<ToolRegistry>,
     bundled_dirs: &'static [&'static Dir<'static>],

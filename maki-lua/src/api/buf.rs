@@ -5,6 +5,8 @@ use maki_agent::types::InlineStyle;
 use maki_agent::{SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle};
 use mlua::{Result as LuaResult, UserData, UserDataMethods, Value as LuaValue};
 
+/// `live_buf` tracks the first buffer a handler creates, which is the one
+/// the runtime streams to the UI during execution.
 pub(crate) struct BufferStore {
     buffers: HashMap<u32, Arc<SharedBuf>>,
     next_id: u32,

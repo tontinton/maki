@@ -50,8 +50,8 @@ impl RecentCalls {
     }
 }
 
-/// Single entry point for all tool sources (native, MCP, Lua). Parse errors
-/// and unknown tools skip the start event so the UI never shows a phantom spinner.
+/// Parse errors and unknown tools skip the start event so the UI never
+/// shows a phantom spinner.
 pub async fn run(
     registry: &ToolRegistry,
     mcp: Option<&McpHandle>,

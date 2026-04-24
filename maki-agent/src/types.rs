@@ -523,6 +523,8 @@ pub enum AgentEvent {
     },
 }
 
+/// Append-only buffer for streaming tool output to the UI. Writers append
+/// under a Mutex, readers get a cheap Arc clone via `read_if_dirty()`.
 pub struct SharedBuf {
     committed: Mutex<Arc<Vec<SnapshotLine>>>,
     dirty: AtomicBool,

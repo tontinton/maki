@@ -12,6 +12,8 @@ pub(crate) struct FinishPayload {
     pub body: Option<BufferSnapshot>,
 }
 
+/// When the handler returns nil, the runtime waits for `ctx:finish()`
+/// to deliver the result through `finish_tx`.
 pub(crate) struct LuaCtx {
     pub(crate) cancel: CancelToken,
     pub(crate) config: AgentConfig,
