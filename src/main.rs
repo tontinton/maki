@@ -466,6 +466,7 @@ const PROVIDER_PRIORITY: &[ProviderKind] = &[
     ProviderKind::OpenAi,
     ProviderKind::Zai,
     ProviderKind::ZaiCodingPlan,
+    ProviderKind::Synthetic,
 ];
 
 fn auto_detect_model() -> Option<Model> {
