@@ -58,6 +58,20 @@ Defaults: gpt-5.4-nano (weak), gpt-4.1 (medium), gpt-5.5 (strong)
 
 Defaults: gemini-2.5-pro (strong), gemini-2.5-flash (medium), gemini-2.0-flash-lite (weak)
 
+### Copilot
+
+- **Env var**: `GH_COPILOT_TOKEN` or `~/.config/github-copilot/{hosts.json,apps.json}`
+- **API**: `https://api.githubcopilot.com (or GraphQL-discovered Copilot API endpoint)`
+- **Features**: Native Copilot Chat HTTP API with model endpoint discovery
+
+| Tier | Models | Pricing (in/out per 1M tokens) | Context |
+|------|--------|-------------------------------|---------|
+| Weak | **gpt-5-mini, gpt-5 mini, claude-haiku-4.5** (default) | $0.00 / $0.00 | 200K ctx / 100K out |
+| Medium | **gpt-5.2, gpt-4.1, claude-sonnet-4.5** (default) | $0.00 / $0.00 | 200K ctx / 100K out |
+| Strong | **gpt-5.4, gpt-5.3-codex, claude-opus-4.6, grok-code-fast-1** (default) | $0.00 / $0.00 | 200K ctx / 100K out |
+
+Defaults: gpt-5-mini (weak), gpt-5.2 (medium), gpt-5.4 (strong)
+
 ### Ollama
 
 - **Env var**: `OLLAMA_HOST` for local/remote (e.g. `http://localhost:11434`), `OLLAMA_API_KEY` for auth
@@ -135,7 +149,7 @@ To add a custom provider or proxy, drop an executable script into `~/.maki/provi
 
 `resolve` is called each time a new agent spawns, so scripts should read tokens from disk instead of caching them in memory. That way auth changes from other processes get picked up.
 
-The `base` field specifies which built-in provider to inherit the model catalog from. Valid values: `anthropic`, `openai`, `google`, `ollama`, `mistral`, `zai`, `zai-coding-plan`, `synthetic`.
+The `base` field specifies which built-in provider to inherit the model catalog from. Valid values: `anthropic`, `openai`, `google`, `copilot`, `ollama`, `mistral`, `zai`, `zai-coding-plan`, `synthetic`.
 
 If your provider serves models not in the base catalog, add a `models` subcommand returning:
 

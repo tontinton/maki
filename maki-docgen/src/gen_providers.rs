@@ -141,6 +141,18 @@ fn build_sections() -> Vec<ProviderSection> {
                     entries: models_for_provider(kind),
                 });
             }
+            ProviderKind::Copilot => {
+                sections.push(ProviderSection {
+                    name: kind.display_name(),
+                    auth_line: format!(
+                        "{} or `~/.config/github-copilot/{{hosts.json,apps.json}}`",
+                        format_auth(kind)
+                    ),
+                    urls: vec![kind.base_url()],
+                    features: kind.features(),
+                    entries: models_for_provider(kind),
+                });
+            }
             _ => {
                 sections.push(ProviderSection {
                     name: kind.display_name(),

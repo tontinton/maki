@@ -590,7 +590,7 @@ fn build_wire_tools(tools: &Value) -> Value {
     Value::Array(out)
 }
 
-async fn parse_sse(
+pub(crate) async fn parse_sse(
     response: isahc::Response<isahc::AsyncBody>,
     event_tx: &Sender<ProviderEvent>,
     stream_timeout: Duration,

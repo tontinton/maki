@@ -10,12 +10,13 @@ use maki_agent::tools::ToolRegistry;
 use maki_config::load_config;
 use maki_lua::PluginHost;
 use maki_providers::provider::fetch_all_models;
-use maki_providers::{dynamic, openai_auth};
+use maki_providers::{copilot_auth, dynamic, openai_auth};
 use maki_storage::DataDir;
 
 pub fn auth_login(provider: &str, storage: &DataDir) -> Result<()> {
     match provider {
         "openai" => openai_auth::login(storage)?,
+        "copilot" => copilot_auth::login()?,
         slug => dynamic::login(slug)?,
     }
     Ok(())
@@ -24,6 +25,7 @@ pub fn auth_login(provider: &str, storage: &DataDir) -> Result<()> {
 pub fn auth_logout(provider: &str, storage: &DataDir) -> Result<()> {
     match provider {
         "openai" => openai_auth::logout(storage)?,
+        "copilot" => copilot_auth::logout()?,
         slug => dynamic::logout(slug)?,
     }
     Ok(())

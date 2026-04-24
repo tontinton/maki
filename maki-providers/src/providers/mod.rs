@@ -8,6 +8,7 @@ use serde::Deserialize;
 use crate::AgentError;
 
 pub(crate) mod anthropic;
+pub(crate) mod copilot;
 pub mod dynamic;
 pub(crate) mod google;
 pub(crate) mod mistral;

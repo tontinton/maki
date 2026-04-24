@@ -32,6 +32,7 @@ User experience:
 Supported providers:
 * Anthropic - `ANTHROPIC_API_KEY` only (using OAuth is against TOS).
 * OpenAI - `OPENAI_API_KEY` and OAuth via `maki auth login openai`.
+* Copilot - `GH_COPILOT_TOKEN` or an existing GitHub Copilot sign-in at `~/.config/github-copilot/`.
 * Ollama - `OLLAMA_HOST` for local (e.g. `http://localhost:11434`), or `OLLAMA_API_KEY` for cloud.
 * Mistral - `MISTRAL_API_KEY`.
 * Z.AI - `ZHIPU_API_KEY`.

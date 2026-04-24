@@ -2396,6 +2396,7 @@ dependencies = [
  "maki-storage",
  "serde",
  "serde_json",
+ "serde_yaml",
  "smol",
  "strum",
  "tempfile",

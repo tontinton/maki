@@ -17,6 +17,7 @@ use crate::{AgentError, Message, ProviderEvent, StreamResponse, ThinkingConfig};
 
 use super::ResolvedAuth;
 use super::anthropic::Anthropic;
+use super::copilot::Copilot;
 use super::google::Google;
 use super::mistral::Mistral;
 use super::ollama::Ollama;
@@ -348,6 +349,10 @@ pub fn create(slug: &str, timeouts: super::Timeouts) -> Result<Box<dyn Provider>
                 .with_system_prefix(meta.system_prefix.clone()),
         ),
         ProviderKind::Google => Box::new(Google::with_auth(auth.clone(), timeouts)),
+        ProviderKind::Copilot => Box::new(
+            Copilot::with_auth(auth.clone(), timeouts)
+                .with_system_prefix(meta.system_prefix.clone()),
+        ),
         ProviderKind::Ollama => Box::new(
             Ollama::with_auth(auth.clone(), timeouts)
                 .with_system_prefix(meta.system_prefix.clone()),

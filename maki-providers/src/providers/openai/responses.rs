@@ -230,7 +230,16 @@ pub(crate) async fn parse_sse(
             });
         }
 
-        match current_event.as_str() {
+        let parsed_event = if current_event.is_empty() {
+            serde_json::from_str::<Value>(data)
+                .ok()
+                .and_then(|value| value["type"].as_str().map(ToOwned::to_owned))
+                .unwrap_or_default()
+        } else {
+            current_event.clone()
+        };
+
+        match parsed_event.as_str() {
             "response.output_text.delta" => {
                 let parsed: Value = match serde_json::from_str(data) {
                     Ok(v) => v,
@@ -293,6 +302,58 @@ pub(crate) async fn parse_sse(
                         .find(|a| a.output_index == output_index)
                     {
                         acc.arguments.push_str(delta);
+                    }
+                }
+            }
+
+            "response.output_item.done" => {
+                let parsed: Value = match serde_json::from_str(data) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let item = &parsed["item"];
+                if item["type"].as_str() == Some("function_call") {
+                    let output_index = parsed["output_index"].as_u64().unwrap_or(0);
+                    let call_id = item["call_id"].as_str().unwrap_or_default().to_string();
+                    let name = item["name"].as_str().unwrap_or_default().to_string();
+                    let arguments = item["arguments"].as_str().unwrap_or_default().to_string();
+                    if let Some(acc) = tool_accumulators
+                        .iter_mut()
+                        .find(|acc| acc.output_index == output_index)
+                    {
+                        let should_emit_start = acc.name.is_empty() && !name.is_empty();
+                        if acc.call_id.is_empty() {
+                            acc.call_id = call_id.clone();
+                        }
+                        if acc.name.is_empty() {
+                            acc.name = name.clone();
+                        }
+                        if !arguments.is_empty() {
+                            acc.arguments = arguments;
+                        }
+                        if should_emit_start {
+                            event_tx
+                                .send_async(ProviderEvent::ToolUseStart {
+                                    id: acc.call_id.clone(),
+                                    name: acc.name.clone(),
+                                })
+                                .await?;
+                        }
+                    } else {
+                        if !name.is_empty() {
+                            event_tx
+                                .send_async(ProviderEvent::ToolUseStart {
+                                    id: call_id.clone(),
+                                    name: name.clone(),
+                                })
+                                .await?;
+                        }
+                        tool_accumulators.push(ToolAccumulator {
+                            output_index,
+                            call_id,
+                            name,
+                            arguments,
+                        });
                     }
                 }
             }

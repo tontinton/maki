@@ -9,6 +9,7 @@ use tracing::{debug, warn};
 use crate::model::{Model, ModelFamily, models_for_provider};
 use crate::providers::Timeouts;
 use crate::providers::anthropic::Anthropic;
+use crate::providers::copilot::Copilot;
 use crate::providers::dynamic;
 use crate::providers::google::Google;
 use crate::providers::mistral::Mistral;
@@ -25,6 +26,7 @@ pub enum ProviderKind {
     #[strum(serialize = "openai")]
     OpenAi,
     Google,
+    Copilot,
     Ollama,
     Mistral,
     Zai,
@@ -38,6 +40,7 @@ impl ProviderKind {
             Self::Anthropic => "Anthropic",
             Self::OpenAi => "OpenAI",
             Self::Google => "Google",
+            Self::Copilot => "Copilot",
             Self::Ollama => "Ollama",
             Self::Mistral => "Mistral",
             Self::Zai => "Z.AI",
@@ -51,6 +54,7 @@ impl ProviderKind {
             Self::Anthropic => "ANTHROPIC_API_KEY",
             Self::OpenAi => "OPENAI_API_KEY",
             Self::Google => "GEMINI_API_KEY",
+            Self::Copilot => "GH_COPILOT_TOKEN",
             Self::Ollama => "OLLAMA_API_KEY",
             Self::Mistral => "MISTRAL_API_KEY",
             Self::Zai | Self::ZaiCodingPlan => "ZHIPU_API_KEY",
@@ -63,6 +67,9 @@ impl ProviderKind {
             Self::Anthropic => "https://api.anthropic.com/v1/messages",
             Self::OpenAi => "https://api.openai.com/v1",
             Self::Google => "https://generativelanguage.googleapis.com/v1beta",
+            Self::Copilot => {
+                "https://api.githubcopilot.com (or GraphQL-discovered Copilot API endpoint)"
+            }
             Self::Ollama => "http://localhost:11434/v1",
             Self::Mistral => "https://api.mistral.ai/v1",
             Self::Zai => "https://api.z.ai/api/paas/v4",
@@ -84,6 +91,7 @@ impl ProviderKind {
                 Some("Prompt caching, thinking mode (adaptive/budgeted), advanced tool use")
             }
             Self::Google => Some("Native Gemini API with thinking support"),
+            Self::Copilot => Some("Native Copilot Chat HTTP API with model endpoint discovery"),
             Self::Ollama => {
                 Some("Local or remote inference via OLLAMA_HOST, cloud fallback via OLLAMA_API_KEY")
             }
@@ -99,6 +107,7 @@ impl ProviderKind {
             Self::Anthropic => ModelFamily::Claude,
             Self::OpenAi => ModelFamily::Gpt,
             Self::Google => ModelFamily::Gemini,
+            Self::Copilot => ModelFamily::Generic,
             Self::Ollama => ModelFamily::Generic,
             Self::Mistral => ModelFamily::Generic,
             Self::Zai | Self::ZaiCodingPlan => ModelFamily::Glm,
@@ -107,7 +116,7 @@ impl ProviderKind {
     }
 
     pub const fn accepts_arbitrary_models(self) -> bool {
-        matches!(self, Self::Ollama | Self::Google)
+        matches!(self, Self::Ollama | Self::Google | Self::Copilot)
     }
 
     pub const fn fallback_max_output(self) -> u32 {
@@ -115,6 +124,7 @@ impl ProviderKind {
             Self::Anthropic => 128_000,
             Self::OpenAi => 100_000,
             Self::Google => 65_536,
+            Self::Copilot => 100_000,
             Self::Ollama => 16_384,
             Self::Mistral => 32_000,
             Self::Zai | Self::ZaiCodingPlan => 16_000,
@@ -127,6 +137,7 @@ impl ProviderKind {
             Self::Anthropic => 200_000,
             Self::OpenAi => 200_000,
             Self::Google => 1_000_000,
+            Self::Copilot => 200_000,
             Self::Ollama => 128_000,
             Self::Mistral => 128_000,
             Self::Zai | Self::ZaiCodingPlan => 128_000,
@@ -139,6 +150,7 @@ impl ProviderKind {
             Self::Anthropic => Ok(Box::new(Anthropic::new(timeouts)?)),
             Self::OpenAi => Ok(Box::new(OpenAi::new(timeouts)?)),
             Self::Google => Ok(Box::new(Google::new(timeouts)?)),
+            Self::Copilot => Ok(Box::new(Copilot::new(timeouts)?)),
             Self::Ollama => Ok(Box::new(Ollama::new(timeouts)?)),
             Self::Mistral => Ok(Box::new(Mistral::new(timeouts)?)),
             Self::Zai => Ok(Box::new(Zai::new(ZaiPlan::Standard, timeouts)?)),
