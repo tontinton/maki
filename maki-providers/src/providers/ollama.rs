@@ -1,3 +1,5 @@
+use std::sync::{Arc, Mutex};
+
 use flume::Sender;
 use serde_json::Value;
 
@@ -27,7 +29,8 @@ pub(crate) fn models() -> &'static [ModelEntry] {
 
 pub struct Ollama {
     compat: OpenAiCompatProvider,
-    auth: ResolvedAuth,
+    auth: Arc<Mutex<ResolvedAuth>>,
+    system_prefix: Option<String>,
 }
 
 impl Ollama {
@@ -37,6 +40,19 @@ impl Ollama {
             std::env::var(API_KEY_ENV).ok(),
             std::env::var(HOST_ENV).ok(),
         )
+    }
+
+    pub(crate) fn with_auth(auth: Arc<Mutex<ResolvedAuth>>, timeouts: super::Timeouts) -> Self {
+        Self {
+            compat: OpenAiCompatProvider::new(&CONFIG, timeouts),
+            auth,
+            system_prefix: None,
+        }
+    }
+
+    pub(crate) fn with_system_prefix(mut self, prefix: Option<String>) -> Self {
+        self.system_prefix = prefix;
+        self
     }
 
     fn from_env(
@@ -59,10 +75,11 @@ impl Ollama {
         };
         Ok(Self {
             compat: OpenAiCompatProvider::new(&CONFIG, timeouts),
-            auth: ResolvedAuth {
+            auth: Arc::new(Mutex::new(ResolvedAuth {
                 base_url: Some(base_url),
                 headers,
-            },
+            })),
+            system_prefix: None,
         })
     }
 }
@@ -79,15 +96,21 @@ impl Provider for Ollama {
         _session_id: Option<&str>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
+            let auth = self.auth.lock().unwrap().clone();
+            let mut buf = String::new();
+            let system = super::with_prefix(&self.system_prefix, system, &mut buf);
             let body = self.compat.build_body(model, messages, system, tools);
             self.compat
-                .do_stream(model, &[], &body, event_tx, &self.auth)
+                .do_stream(model, &[], &body, event_tx, &auth)
                 .await
         })
     }
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<String>, AgentError>> {
-        Box::pin(self.compat.do_list_models(&self.auth))
+        Box::pin(async move {
+            let auth = self.auth.lock().unwrap().clone();
+            self.compat.do_list_models(&auth).await
+        })
     }
 }
 
@@ -113,17 +136,19 @@ mod tests {
     #[test]
     fn from_env_with_host_builds_auth() {
         let ollama = Ollama::from_env(TEST_TIMEOUTS, None, Some("http://x:1234".into())).unwrap();
-        assert_eq!(ollama.auth.base_url.as_deref(), Some("http://x:1234/v1"));
-        assert!(ollama.auth.headers.is_empty());
+        let auth = ollama.auth.lock().unwrap();
+        assert_eq!(auth.base_url.as_deref(), Some("http://x:1234/v1"));
+        assert!(auth.headers.is_empty());
     }
 
     #[test]
     fn from_env_with_api_key_uses_cloud() {
         let ollama = Ollama::from_env(TEST_TIMEOUTS, Some("test-key".into()), None).unwrap();
-        assert_eq!(ollama.auth.base_url.as_deref(), Some(CLOUD_BASE_URL));
-        assert_eq!(ollama.auth.headers.len(), 1);
-        assert_eq!(ollama.auth.headers[0].0, "authorization");
-        assert_eq!(ollama.auth.headers[0].1, "Bearer test-key");
+        let auth = ollama.auth.lock().unwrap();
+        assert_eq!(auth.base_url.as_deref(), Some(CLOUD_BASE_URL));
+        assert_eq!(auth.headers.len(), 1);
+        assert_eq!(auth.headers[0].0, "authorization");
+        assert_eq!(auth.headers[0].1, "Bearer test-key");
     }
 
     #[test]
@@ -134,11 +159,9 @@ mod tests {
             Some("http://local:1234".into()),
         )
         .unwrap();
-        assert_eq!(
-            ollama.auth.base_url.as_deref(),
-            Some("http://local:1234/v1")
-        );
-        assert_eq!(ollama.auth.headers.len(), 1);
-        assert_eq!(ollama.auth.headers[0].1, "Bearer test-key");
+        let auth = ollama.auth.lock().unwrap();
+        assert_eq!(auth.base_url.as_deref(), Some("http://local:1234/v1"));
+        assert_eq!(auth.headers.len(), 1);
+        assert_eq!(auth.headers[0].1, "Bearer test-key");
     }
 }

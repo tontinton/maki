@@ -146,13 +146,8 @@ impl Provider for OpenAi {
         _session_id: Option<&str>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
-            let effective_system;
-            let system = if let Some(prefix) = &self.system_prefix {
-                effective_system = format!("{prefix}\n\n{system}");
-                &effective_system
-            } else {
-                system
-            };
+            let mut buf = String::new();
+            let system = super::super::with_prefix(&self.system_prefix, system, &mut buf);
 
             if is_codex_model(&model.id) {
                 let body = super::responses::build_body(model, messages, system, tools);

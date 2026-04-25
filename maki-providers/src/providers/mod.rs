@@ -51,6 +51,20 @@ impl ResolvedAuth {
     }
 }
 
+pub(crate) fn with_prefix<'a>(
+    prefix: &Option<String>,
+    system: &'a str,
+    buf: &'a mut String,
+) -> &'a str {
+    match prefix {
+        Some(p) => {
+            *buf = format!("{p}\n\n{system}");
+            buf
+        }
+        None => system,
+    }
+}
+
 pub(crate) fn urlenc(s: &str) -> String {
     let mut out = String::with_capacity(s.len() * 2);
     for b in s.bytes() {

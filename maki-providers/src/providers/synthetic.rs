@@ -1,3 +1,5 @@
+use std::sync::{Arc, Mutex};
+
 use flume::Sender;
 use serde_json::{Value, json};
 
@@ -65,7 +67,8 @@ pub(crate) fn models() -> &'static [ModelEntry] {
 
 pub struct Synthetic {
     compat: OpenAiCompatProvider,
-    auth: ResolvedAuth,
+    auth: Arc<Mutex<ResolvedAuth>>,
+    system_prefix: Option<String>,
 }
 
 impl Synthetic {
@@ -75,8 +78,22 @@ impl Synthetic {
         })?;
         Ok(Self {
             compat: OpenAiCompatProvider::new(&CONFIG, timeouts),
-            auth: ResolvedAuth::bearer(&api_key),
+            auth: Arc::new(Mutex::new(ResolvedAuth::bearer(&api_key))),
+            system_prefix: None,
         })
+    }
+
+    pub(crate) fn with_auth(auth: Arc<Mutex<ResolvedAuth>>, timeouts: super::Timeouts) -> Self {
+        Self {
+            compat: OpenAiCompatProvider::new(&CONFIG, timeouts),
+            auth,
+            system_prefix: None,
+        }
+    }
+
+    pub(crate) fn with_system_prefix(mut self, prefix: Option<String>) -> Self {
+        self.system_prefix = prefix;
+        self
     }
 }
 
@@ -92,6 +109,9 @@ impl Provider for Synthetic {
         _session_id: Option<&str>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
+            let auth = self.auth.lock().unwrap().clone();
+            let mut buf = String::new();
+            let system = super::with_prefix(&self.system_prefix, system, &mut buf);
             let mut body = self.compat.build_body(model, messages, system, tools);
             match thinking {
                 ThinkingConfig::Off => {}
@@ -110,12 +130,15 @@ impl Provider for Synthetic {
                 }
             };
             self.compat
-                .do_stream(model, &[], &body, event_tx, &self.auth)
+                .do_stream(model, &[], &body, event_tx, &auth)
                 .await
         })
     }
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<String>, AgentError>> {
-        Box::pin(self.compat.do_list_models(&self.auth))
+        Box::pin(async move {
+            let auth = self.auth.lock().unwrap().clone();
+            self.compat.do_list_models(&auth).await
+        })
     }
 }

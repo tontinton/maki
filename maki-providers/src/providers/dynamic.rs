@@ -18,7 +18,11 @@ use crate::{AgentError, Message, ProviderEvent, StreamResponse, ThinkingConfig};
 use super::ResolvedAuth;
 use super::anthropic::Anthropic;
 use super::google::Google;
+use super::mistral::Mistral;
+use super::ollama::Ollama;
 use super::openai::OpenAi;
+use super::synthetic::Synthetic;
+use super::zai::{Zai, ZaiPlan};
 
 const INFO_TIMEOUT: Duration = Duration::from_secs(5);
 const SCRIPT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -344,14 +348,26 @@ pub fn create(slug: &str, timeouts: super::Timeouts) -> Result<Box<dyn Provider>
                 .with_system_prefix(meta.system_prefix.clone()),
         ),
         ProviderKind::Google => Box::new(Google::with_auth(auth.clone(), timeouts)),
-        other => {
-            return Err(AgentError::Config {
-                message: format!(
-                    "dynamic provider '{}' uses unsupported base '{other}'",
-                    meta.slug
-                ),
-            });
-        }
+        ProviderKind::Ollama => Box::new(
+            Ollama::with_auth(auth.clone(), timeouts)
+                .with_system_prefix(meta.system_prefix.clone()),
+        ),
+        ProviderKind::Mistral => Box::new(
+            Mistral::with_auth(auth.clone(), timeouts)
+                .with_system_prefix(meta.system_prefix.clone()),
+        ),
+        ProviderKind::Zai => Box::new(
+            Zai::with_auth(ZaiPlan::Standard, auth.clone(), timeouts)
+                .with_system_prefix(meta.system_prefix.clone()),
+        ),
+        ProviderKind::ZaiCodingPlan => Box::new(
+            Zai::with_auth(ZaiPlan::Coding, auth.clone(), timeouts)
+                .with_system_prefix(meta.system_prefix.clone()),
+        ),
+        ProviderKind::Synthetic => Box::new(
+            Synthetic::with_auth(auth.clone(), timeouts)
+                .with_system_prefix(meta.system_prefix.clone()),
+        ),
     };
 
     Ok(Box::new(DynamicProvider {
@@ -622,5 +638,20 @@ esac
             run_script(&path, "nonexistent", SCRIPT_TIMEOUT).unwrap_err(),
             AgentError::Config { .. }
         ));
+    }
+
+    #[cfg(unix)]
+    #[test_case("ollama", ProviderKind::Ollama ; "base_ollama")]
+    #[test_case("mistral", ProviderKind::Mistral ; "base_mistral")]
+    #[test_case("zai", ProviderKind::Zai ; "base_zai")]
+    #[test_case("zai-coding-plan", ProviderKind::ZaiCodingPlan ; "base_zai_coding_plan")]
+    #[test_case("synthetic", ProviderKind::Synthetic ; "base_synthetic")]
+    fn discover_accepts_all_bases(base: &str, expected: ProviderKind) {
+        let tmp = TempDir::new().unwrap();
+        let info = format!(r#"{{"display_name": "Test", "base": "{base}", "has_auth": false}}"#);
+        write_script(tmp.path(), "custom-test", &info);
+        let providers = discover_in(tmp.path());
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].base, expected);
     }
 }

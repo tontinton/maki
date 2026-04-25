@@ -1,3 +1,5 @@
+use std::sync::{Arc, Mutex};
+
 use flume::Sender;
 use serde_json::Value;
 use tracing::warn;
@@ -137,7 +139,8 @@ pub enum ZaiPlan {
 
 pub struct Zai {
     compat: OpenAiCompatProvider,
-    auth: ResolvedAuth,
+    auth: Arc<Mutex<ResolvedAuth>>,
+    system_prefix: Option<String>,
 }
 
 impl Zai {
@@ -151,8 +154,30 @@ impl Zai {
         })?;
         Ok(Self {
             compat: OpenAiCompatProvider::new(config, timeouts),
-            auth: ResolvedAuth::bearer(&api_key),
+            auth: Arc::new(Mutex::new(ResolvedAuth::bearer(&api_key))),
+            system_prefix: None,
         })
+    }
+
+    pub(crate) fn with_auth(
+        plan: ZaiPlan,
+        auth: Arc<Mutex<ResolvedAuth>>,
+        timeouts: super::Timeouts,
+    ) -> Self {
+        let config = match plan {
+            ZaiPlan::Standard => &CONFIG_STANDARD,
+            ZaiPlan::Coding => &CONFIG_CODING,
+        };
+        Self {
+            compat: OpenAiCompatProvider::new(config, timeouts),
+            auth,
+            system_prefix: None,
+        }
+    }
+
+    pub(crate) fn with_system_prefix(mut self, prefix: Option<String>) -> Self {
+        self.system_prefix = prefix;
+        self
     }
 }
 
@@ -168,10 +193,13 @@ impl Provider for Zai {
         _session_id: Option<&str>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
+            let auth = self.auth.lock().unwrap().clone();
+            let mut buf = String::new();
+            let system = super::with_prefix(&self.system_prefix, system, &mut buf);
             let body = self.compat.build_body(model, messages, system, tools);
             match self
                 .compat
-                .do_stream(model, &[], &body, event_tx, &self.auth)
+                .do_stream(model, &[], &body, event_tx, &auth)
                 .await
             {
                 Err(AgentError::Api { status, message })
@@ -190,6 +218,9 @@ impl Provider for Zai {
     }
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<String>, AgentError>> {
-        Box::pin(self.compat.do_list_models(&self.auth))
+        Box::pin(async move {
+            let auth = self.auth.lock().unwrap().clone();
+            self.compat.do_list_models(&auth).await
+        })
     }
 }
