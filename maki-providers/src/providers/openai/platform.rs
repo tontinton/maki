@@ -22,7 +22,7 @@ static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
 };
 
 // NOTE: OpenAI also offers these models for subscription usage via the Coding Plan
-const PLAN_MODELS: &[&str] = &["gpt-5.4", "gpt-5.4-mini", "gpt-5.2"];
+const PLAN_MODELS: &[&str] = &["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.2"];
 
 fn is_codex_model(model_id: &str) -> bool {
     model_id.contains("-codex") || PLAN_MODELS.contains(&model_id)

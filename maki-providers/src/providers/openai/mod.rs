@@ -93,10 +93,24 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             context_window: 200_000,
         },
         ModelEntry {
-            prefixes: &["gpt-5.4"],
+            prefixes: &["gpt-5.5"],
             tier: ModelTier::Strong,
             family: ModelFamily::Gpt,
             default: true,
+            pricing: ModelPricing {
+                input: 5.00,
+                output: 30.00,
+                cache_write: 0.00,
+                cache_read: 0.50,
+            },
+            max_output_tokens: 128_000,
+            context_window: 1_000_000,
+        },
+        ModelEntry {
+            prefixes: &["gpt-5.4"],
+            tier: ModelTier::Strong,
+            family: ModelFamily::Gpt,
+            default: false,
             pricing: ModelPricing {
                 input: 2.50,
                 output: 15.00,
