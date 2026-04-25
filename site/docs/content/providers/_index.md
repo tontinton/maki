@@ -60,11 +60,11 @@ Defaults: gemini-2.5-pro (strong), gemini-2.5-flash (medium), gemini-2.0-flash-l
 
 ### Ollama
 
-- **Env var**: `OLLAMA_API_KEY` for cloud, or `OLLAMA_HOST` for local (e.g. `http://localhost:11434`)
+- **Env var**: `OLLAMA_HOST` for local/remote (e.g. `http://localhost:11434`), `OLLAMA_API_KEY` for auth
 - **API**: `http://localhost:11434/v1`
-- **Features**: Local inference via OLLAMA_HOST, or cloud via OLLAMA_API_KEY
+- **Features**: Local or remote inference via OLLAMA_HOST, cloud fallback via OLLAMA_API_KEY
 
-Maki asks your local Ollama for the list of installed models, so there's no built-in catalog. Tiers are guessed from list order: the first model becomes strong, the second medium, and the rest weak. If that guess is wrong, open `/model` and press `Alt+1`, `Alt+2`, or `Alt+3` on any row to reassign it. Your choices are saved to `~/.maki/model-tiers`.
+Maki asks Ollama for the list of installed models, so there's no built-in catalog. Tiers are guessed from list order: the first model becomes strong, the second medium, and the rest weak. If that guess is wrong, open `/model` and press `Alt+1`, `Alt+2`, or `Alt+3` on any row to reassign it. Your choices are saved to `~/.maki/model-tiers`.
 
 ### Mistral
 

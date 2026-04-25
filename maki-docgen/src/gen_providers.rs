@@ -98,7 +98,7 @@ struct ProviderSection {
 fn format_auth(kind: ProviderKind) -> String {
     let env = kind.api_key_env();
     if kind == ProviderKind::Ollama {
-        format!("`{env}` for cloud, or `OLLAMA_HOST` for local (e.g. `http://localhost:11434`)")
+        format!("`OLLAMA_HOST` for local/remote (e.g. `http://localhost:11434`), `{env}` for auth")
     } else {
         format!("`{env}`")
     }
@@ -243,7 +243,7 @@ fn write_section(out: &mut String, section: &ProviderSection) {
     if section.entries.is_empty() {
         let _ = writeln!(
             out,
-            "Maki asks your local Ollama for the list of installed models, so there's no built-in catalog. Tiers are guessed from list order: the first model becomes strong, the second medium, and the rest weak. If that guess is wrong, open `/model` and press `Alt+1`, `Alt+2`, or `Alt+3` on any row to reassign it. Your choices are saved to `~/.maki/model-tiers`."
+            "Maki asks Ollama for the list of installed models, so there's no built-in catalog. Tiers are guessed from list order: the first model becomes strong, the second medium, and the rest weak. If that guess is wrong, open `/model` and press `Alt+1`, `Alt+2`, or `Alt+3` on any row to reassign it. Your choices are saved to `~/.maki/model-tiers`."
         );
     } else {
         write_model_table(out, section.entries);

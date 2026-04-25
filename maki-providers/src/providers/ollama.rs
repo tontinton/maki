@@ -44,24 +44,24 @@ impl Ollama {
         api_key: Option<String>,
         host: Option<String>,
     ) -> Result<Self, AgentError> {
-        if let Some(api_key) = api_key {
-            return Ok(Self {
-                compat: OpenAiCompatProvider::new(&CONFIG, timeouts),
-                auth: ResolvedAuth {
-                    base_url: Some(CLOUD_BASE_URL.into()),
-                    headers: vec![("authorization".into(), format!("Bearer {api_key}"))],
-                },
-            });
-        }
-
-        let host = host.ok_or(AgentError::Config {
-            message: HOST_NOT_SET.into(),
-        })?;
+        let base_url = match host {
+            Some(h) => format!("{h}/v1"),
+            None if api_key.is_some() => CLOUD_BASE_URL.into(),
+            None => {
+                return Err(AgentError::Config {
+                    message: HOST_NOT_SET.into(),
+                });
+            }
+        };
+        let headers = match api_key {
+            Some(key) => vec![("authorization".into(), format!("Bearer {key}"))],
+            None => Vec::new(),
+        };
         Ok(Self {
             compat: OpenAiCompatProvider::new(&CONFIG, timeouts),
             auth: ResolvedAuth {
-                base_url: Some(format!("{host}/v1")),
-                headers: Vec::new(),
+                base_url: Some(base_url),
+                headers,
             },
         })
     }
@@ -127,14 +127,18 @@ mod tests {
     }
 
     #[test]
-    fn from_env_api_key_takes_precedence_over_host() {
+    fn from_env_both_host_and_api_key_uses_host_with_auth() {
         let ollama = Ollama::from_env(
             TEST_TIMEOUTS,
             Some("test-key".into()),
             Some("http://local:1234".into()),
         )
         .unwrap();
-        assert_eq!(ollama.auth.base_url.as_deref(), Some(CLOUD_BASE_URL));
+        assert_eq!(
+            ollama.auth.base_url.as_deref(),
+            Some("http://local:1234/v1")
+        );
+        assert_eq!(ollama.auth.headers.len(), 1);
         assert_eq!(ollama.auth.headers[0].1, "Bearer test-key");
     }
 }

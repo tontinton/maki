@@ -84,7 +84,9 @@ impl ProviderKind {
                 Some("Prompt caching, thinking mode (adaptive/budgeted), advanced tool use")
             }
             Self::Google => Some("Native Gemini API with thinking support"),
-            Self::Ollama => Some("Local inference via OLLAMA_HOST, or cloud via OLLAMA_API_KEY"),
+            Self::Ollama => {
+                Some("Local or remote inference via OLLAMA_HOST, cloud fallback via OLLAMA_API_KEY")
+            }
             Self::Synthetic => {
                 Some("Reasoning effort support (low/medium/high), open-weight models")
             }
