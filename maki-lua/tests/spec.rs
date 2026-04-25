@@ -14,6 +14,7 @@ fn plugin_spec(name: &str, spec: &str) {
         enabled: true,
         builtins: vec![],
         init_file: None,
+        experimental_bash_lua: false,
     };
     let reg = Arc::new(ToolRegistry::new());
     let host = PluginHost::new(&config, Arc::clone(&reg)).unwrap();

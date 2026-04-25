@@ -10,6 +10,7 @@ fn enabled_config() -> PluginsConfig {
         enabled: true,
         builtins: vec![],
         init_file: None,
+        experimental_bash_lua: false,
     }
 }
 
@@ -18,6 +19,7 @@ fn init_config(init_file: PathBuf) -> PluginsConfig {
         enabled: true,
         builtins: vec![],
         init_file: Some(init_file),
+        experimental_bash_lua: false,
     }
 }
 

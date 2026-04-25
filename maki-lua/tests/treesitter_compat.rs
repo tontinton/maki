@@ -9,6 +9,7 @@ fn config() -> PluginsConfig {
         enabled: true,
         builtins: vec![],
         init_file: None,
+        experimental_bash_lua: false,
     }
 }
 

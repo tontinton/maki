@@ -42,7 +42,7 @@ pub enum Request {
         plugin: Arc<str>,
         tool: Arc<str>,
         input: Value,
-        ctx: LuaCtx,
+        ctx: Box<LuaCtx>,
         deadline: Option<Instant>,
         reply: flume::Sender<ToolCallReply>,
         live: Option<LiveCtx>,
@@ -557,15 +557,10 @@ async fn dispatch_async(
 ) -> ToolCallReply {
     let task_state = lua.app_data_ref::<TaskMap>().and_then(|m| {
         let ctx = m.get(&key)?;
-        Some((
-            ctx.cancel.clone(),
-            ctx.deadline,
-            ctx.jobs.event_rx.clone(),
-            !ctx.jobs.is_empty(),
-        ))
+        Some((ctx.cancel.clone(), ctx.deadline, !ctx.jobs.is_empty()))
     });
 
-    let Some((cancel, deadline, event_rx, has_jobs)) = task_state else {
+    let Some((cancel, deadline, has_jobs)) = task_state else {
         return ToolCallReply::err(NIL_WITHOUT_FINISH_MSG);
     };
 
@@ -579,6 +574,7 @@ async fn dispatch_async(
     }
 
     let is_cancelled = || cancel.is_cancelled() || deadline.is_some_and(|d| Instant::now() > d);
+    let mut event_buf = Vec::new();
 
     loop {
         if is_cancelled() {
@@ -593,57 +589,57 @@ async fn dispatch_async(
             Err(flume::TryRecvError::Empty) => {}
         }
 
-        let tagged = match event_rx.try_recv() {
-            Ok(t) => t,
-            Err(_) => {
-                let has_alive = lua
-                    .app_data_ref::<TaskMap>()
-                    .and_then(|m| Some(m.get(&key)?.jobs.has_alive_jobs()))
-                    .unwrap_or(false);
-
-                if !has_alive {
-                    smol::Timer::after(DISPATCH_POLL_INTERVAL).await;
-                    return match finish_rx.try_recv() {
-                        Ok(payload) => finish_reply(payload),
-                        _ => ToolCallReply::err(NIL_WITHOUT_FINISH_MSG),
-                    };
-                }
-                smol::Timer::after(DISPATCH_POLL_INTERVAL).await;
-                continue;
-            }
-        };
-
-        let (callback, is_exit) = lua
-            .app_data_ref::<TaskMap>()
-            .and_then(|m| {
-                let ctx = m.get(&key)?;
-                let is_exit = matches!(tagged.event, JobEvent::Exit(_));
-                ctx.jobs.forward_to_waiter(tagged.job_id, &tagged.event);
-                let cb = ctx
-                    .jobs
-                    .callback_key(tagged.job_id, &tagged.event)
-                    .and_then(|k| lua.registry_value::<Function>(k).ok());
-                Some((cb, is_exit))
-            })
-            .unwrap_or((None, matches!(tagged.event, JobEvent::Exit(_))));
-
-        if let Some(func) = callback {
-            let arg: LuaValue = match &tagged.event {
-                JobEvent::Stdout(line) | JobEvent::Stderr(line) => lua
-                    .create_string(line)
-                    .map(LuaValue::String)
-                    .unwrap_or(LuaValue::Nil),
-                JobEvent::Exit(code) => LuaValue::Integer(*code as i64),
-            };
-            if let Err(e) = func.call::<()>((tagged.job_id, arg)) {
-                return ToolCallReply::err(format!("job callback error: {e}"));
+        if let Some(m) = lua.app_data_ref::<TaskMap>() {
+            if let Some(ctx) = m.get(&key) {
+                ctx.jobs.drain_events(&mut event_buf);
             }
         }
 
-        if is_exit {
-            if let Some(mut tasks) = lua.app_data_mut::<TaskMap>() {
-                if let Some(ctx) = tasks.get_mut(&key) {
-                    ctx.jobs.mark_dead(tagged.job_id);
+        if event_buf.is_empty() {
+            let has_alive = lua
+                .app_data_ref::<TaskMap>()
+                .and_then(|m| Some(m.get(&key)?.jobs.has_alive_jobs()))
+                .unwrap_or(false);
+
+            if !has_alive {
+                smol::Timer::after(DISPATCH_POLL_INTERVAL).await;
+                return match finish_rx.try_recv() {
+                    Ok(payload) => finish_reply(payload),
+                    _ => ToolCallReply::err(NIL_WITHOUT_FINISH_MSG),
+                };
+            }
+            smol::Timer::after(DISPATCH_POLL_INTERVAL).await;
+            continue;
+        }
+
+        for (job_id, event) in event_buf.drain(..) {
+            let is_exit = matches!(event, JobEvent::Exit(_));
+
+            let callback = lua.app_data_ref::<TaskMap>().and_then(|m| {
+                let ctx = m.get(&key)?;
+                ctx.jobs
+                    .callback_key(job_id, &event)
+                    .and_then(|k| lua.registry_value::<Function>(k).ok())
+            });
+
+            if let Some(func) = callback {
+                let arg: LuaValue = match &event {
+                    JobEvent::Stdout(line) | JobEvent::Stderr(line) => lua
+                        .create_string(line)
+                        .map(LuaValue::String)
+                        .unwrap_or(LuaValue::Nil),
+                    JobEvent::Exit(code) => LuaValue::Integer(*code as i64),
+                };
+                if let Err(e) = func.call::<()>((job_id, arg)) {
+                    return ToolCallReply::err(format!("job callback error: {e}"));
+                }
+            }
+
+            if is_exit {
+                if let Some(mut tasks) = lua.app_data_mut::<TaskMap>() {
+                    if let Some(ctx) = tasks.get_mut(&key) {
+                        ctx.jobs.mark_dead(job_id);
+                    }
                 }
             }
         }
@@ -672,7 +668,7 @@ async fn run_tool_call(
     plugin: Arc<str>,
     tool: Arc<str>,
     input: Value,
-    mut ctx: LuaCtx,
+    mut ctx: Box<LuaCtx>,
     deadline: Option<Instant>,
     live: Option<LiveCtx>,
     plugins: PluginMap,
@@ -703,7 +699,7 @@ async fn run_tool_call(
         Ok(v) => v,
         Err(e) => return ToolCallReply::err(e.to_string()),
     };
-    let ctx_ud = match lua.create_userdata(ctx) {
+    let ctx_ud = match lua.create_userdata(*ctx) {
         Ok(u) => u,
         Err(e) => return ToolCallReply::err(e.to_string()),
     };

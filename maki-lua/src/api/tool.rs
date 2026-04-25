@@ -144,13 +144,17 @@ impl ToolInvocation for LuaToolInvocation {
                 cancel: ctx.cancel.clone(),
                 config: ctx.config.clone(),
                 finish_tx: None,
+                live: ctx.tool_use_id.clone().map(|id| LiveCtx {
+                    event_tx: ctx.event_tx.clone(),
+                    tool_use_id: id,
+                }),
             };
 
             tx.send_async(Request::CallTool {
                 plugin: Arc::clone(&plugin),
                 tool: Arc::clone(&tool),
                 input,
-                ctx: lua_ctx,
+                ctx: Box::new(lua_ctx),
                 deadline: match deadline {
                     Deadline::At(t) => Some(t),
                     Deadline::None => None,

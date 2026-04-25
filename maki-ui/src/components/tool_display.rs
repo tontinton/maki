@@ -675,14 +675,41 @@ impl ToolLineBuilder {
         let total = snapshot.lines.len();
         let max = self.limits.output;
         let start = self.lines.len();
-        let (range, skipped) = if total > max {
-            let skipped = total - max;
+
+        let sep_idx = snapshot.lines.iter().position(|line| {
+            line.spans
+                .first()
+                .is_some_and(|s| s.text.starts_with(BASH_OUTPUT_SEPARATOR))
+        });
+
+        let (header_end, output_start) = match sep_idx {
+            Some(idx) => (idx, idx + 1),
+            None => (0, 0),
+        };
+
+        if sep_idx.is_some() {
+            self.lines.extend(snapshot_to_lines_range(
+                snapshot,
+                TOOL_BODY_INDENT,
+                0..header_end,
+            ));
+            self.separator_line = Some(self.lines.len());
+            self.lines.extend(snapshot_to_lines_range(
+                snapshot,
+                TOOL_BODY_INDENT,
+                header_end..output_start,
+            ));
+        }
+
+        let output_total = total - output_start;
+        let (range, skipped) = if output_total > max {
+            let skipped = output_total - max;
             match self.keep {
-                Keep::Tail => (skipped..total, skipped),
-                Keep::Head => (0..max, skipped),
+                Keep::Tail => (output_start + skipped..total, skipped),
+                Keep::Head => (output_start..output_start + max, skipped),
             }
         } else {
-            (0..total, 0)
+            (output_start..total, 0)
         };
         if matches!(self.keep, Keep::Tail) {
             self.push_truncation_count(skipped);

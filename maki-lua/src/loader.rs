@@ -35,6 +35,10 @@ static BUNDLED_PLUGINS: &[BundledPlugin] = &[
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/websearch"),
     },
     BundledPlugin {
+        name: "bash",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/bash"),
+    },
+    BundledPlugin {
         name: "lib",
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/lib"),
     },
@@ -193,6 +197,7 @@ mod tests {
             enabled: false,
             builtins: vec![],
             init_file: None,
+            experimental_bash_lua: false,
         };
         let _host = PluginHost::new(&config, reg.clone()).unwrap();
         assert_eq!(reg.names(), names_before);

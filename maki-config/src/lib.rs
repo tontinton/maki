@@ -601,12 +601,15 @@ impl StorageConfig {
     }
 }
 
+const DEFAULT_BUILTINS: &[&str] = &["index", "webfetch", "websearch"];
+
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct PluginsFileConfig {
     enabled: Option<bool>,
     builtins: Option<Vec<String>>,
     init_file: Option<PathBuf>,
+    experimental_bash_lua: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -614,11 +617,13 @@ pub struct PluginsConfig {
     pub enabled: bool,
     pub builtins: Vec<String>,
     pub init_file: Option<PathBuf>,
+    pub experimental_bash_lua: bool,
 }
 
 impl PluginsConfig {
     fn from_file(f: PluginsFileConfig) -> Self {
         let enabled = f.enabled.unwrap_or(true);
+        let experimental_bash_lua = f.experimental_bash_lua.unwrap_or(false);
         let init_file = f.init_file.or_else(|| {
             for dir in config_search_dirs(global_dir().as_deref()).iter().rev() {
                 let path = dir.join("init.lua");
@@ -628,16 +633,18 @@ impl PluginsConfig {
             }
             None
         });
+        let builtins_explicit = f.builtins.is_some();
+        let mut builtins = f
+            .builtins
+            .unwrap_or_else(|| DEFAULT_BUILTINS.iter().map(|s| (*s).to_string()).collect());
+        if experimental_bash_lua && !builtins_explicit {
+            builtins.push("bash".to_string());
+        }
         Self {
             enabled,
-            builtins: f.builtins.unwrap_or_else(|| {
-                vec![
-                    "index".to_string(),
-                    "webfetch".to_string(),
-                    "websearch".to_string(),
-                ]
-            }),
+            builtins,
             init_file,
+            experimental_bash_lua,
         }
     }
 }
