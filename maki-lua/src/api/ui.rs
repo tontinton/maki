@@ -1,3 +1,6 @@
+use std::time::Duration;
+
+use humantime::format_duration;
 use mlua::{Lua, Result as LuaResult, Table};
 
 use crate::runtime::with_task_bufs;
@@ -17,6 +20,14 @@ pub(crate) fn create_ui_table(lua: &Lua) -> LuaResult<Table> {
             let segments =
                 smol::unblock(move || maki_highlight::highlight_code(&lang, &code)).await;
             segments_to_lua_lines(&lua, &segments)
+        })?,
+    )?;
+    t.set(
+        "humantime",
+        lua.create_function(|_, secs: u64| {
+            Ok(format_duration(Duration::from_secs(secs))
+                .to_string()
+                .replace(' ', ""))
         })?,
     )?;
     Ok(t)

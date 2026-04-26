@@ -153,6 +153,11 @@ maki.api.register_tool({
     if workdir then
       s = s .. " in " .. relative_path(workdir)
     end
+    if input.timeout then
+      local buf = maki.ui.buf()
+      buf:line({ { s }, { " (" .. maki.ui.humantime(input.timeout) .. " timeout)", "dim" } })
+      return buf
+    end
     return s
   end,
 

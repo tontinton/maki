@@ -2326,6 +2326,7 @@ dependencies = [
  "flume 0.11.1",
  "futures-lite",
  "htmd",
+ "humantime",
  "include_dir",
  "isahc",
  "libc",
