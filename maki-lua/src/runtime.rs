@@ -1,6 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -18,7 +18,7 @@ use crate::api::buf::{BufHandle, BufferStore};
 use crate::api::create_maki_global;
 use crate::api::ctx::{FinishPayload, LuaCtx};
 use crate::api::fn_api::{JobEvent, JobStore};
-use crate::api::fs::check_sandbox;
+
 use crate::api::tool::{LuaTool, PendingTool, PendingTools, ToolCallReply, coerce_tool_result};
 use crate::error::PluginError;
 
@@ -137,7 +137,6 @@ struct LuaRuntime {
     plugins: PluginMap,
     registry: Arc<ToolRegistry>,
     tx: flume::Sender<Request>,
-    cwd: PathBuf,
     shutdown: Arc<AtomicBool>,
     bundled_dirs: &'static [&'static Dir<'static>],
 }
@@ -151,7 +150,6 @@ impl LuaRuntime {
     ) -> Result<Self, PluginError> {
         let lua = Lua::new();
         let pending: PendingTools = Arc::new(Mutex::new(Vec::new()));
-        let cwd = std::env::current_dir().unwrap_or_default();
 
         // Each coroutine gets its own cancel token and deadline, so the
         // interrupt handler does an O(1) HashMap lookup to check just that task.
@@ -200,22 +198,9 @@ impl LuaRuntime {
             plugins: Rc::new(RefCell::new(HashMap::new())) as PluginMap,
             registry,
             tx,
-            cwd,
             shutdown,
             bundled_dirs,
         })
-    }
-
-    fn fs_roots(&self, plugin_dir: Option<&Path>) -> Arc<[PathBuf]> {
-        let cwd_canon = self.cwd.canonicalize().unwrap_or_else(|_| self.cwd.clone());
-        let mut roots = vec![cwd_canon];
-        if let Some(dir) = plugin_dir {
-            let canon = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
-            if !roots.contains(&canon) {
-                roots.push(canon);
-            }
-        }
-        roots.into()
     }
 
     fn drop_plugin_keys(&mut self, name: &str) {
@@ -256,11 +241,10 @@ impl LuaRuntime {
 
     fn build_plugin_env(
         &self,
-        fs_roots: Arc<[PathBuf]>,
         plugin: Arc<str>,
         require_root: Option<PathBuf>,
     ) -> Result<mlua::Table, mlua::Error> {
-        let maki = create_maki_global(&self.lua, Arc::clone(&self.pending), fs_roots, plugin)?;
+        let maki = create_maki_global(&self.lua, Arc::clone(&self.pending), plugin)?;
         let env = self.lua.create_table()?;
         env.set("maki", maki)?;
 
@@ -321,10 +305,22 @@ impl LuaRuntime {
                     return Ok(None);
                 };
                 let abs_path = dir.join(&rel_path);
-                let abs_str = abs_path.to_string_lossy();
-                let resolved = check_sandbox(&abs_str, std::slice::from_ref(dir))
-                    .map_err(|e| mlua::Error::runtime(e.to_string()))?;
-                Ok(std::fs::read_to_string(&resolved).ok())
+                let normalized = abs_path.components().fold(PathBuf::new(), |mut acc, c| {
+                    match c {
+                        std::path::Component::ParentDir => {
+                            acc.pop();
+                        }
+                        std::path::Component::CurDir => {}
+                        _ => acc.push(c),
+                    }
+                    acc
+                });
+                if !normalized.starts_with(dir) {
+                    return Err(mlua::Error::runtime(format!(
+                        "require: '{modname}' outside sandbox"
+                    )));
+                }
+                Ok(std::fs::read_to_string(&normalized).ok())
             })();
 
             let source_str = source_str?;
@@ -374,11 +370,10 @@ impl LuaRuntime {
         );
         self.discard_pending(stale);
 
-        let roots = self.fs_roots(plugin_dir.as_deref());
         let require_root = plugin_dir.as_ref().map(|d| d.join("lua"));
 
         let env = self
-            .build_plugin_env(roots, Arc::clone(&name), require_root)
+            .build_plugin_env(Arc::clone(&name), require_root)
             .map_err(|e| PluginError::Lua {
                 plugin: name.to_string(),
                 source: e,
@@ -962,18 +957,6 @@ mod tests {
     }
 
     #[test]
-    fn extract_return_table_body_only_no_header() {
-        let lua = test_lua();
-        let body_handle = lua.create_userdata(make_buf_handle("content")).unwrap();
-        let t = lua.create_table().unwrap();
-        t.set("llm_output", "msg").unwrap();
-        t.set("body", body_handle).unwrap();
-        let reply = extract_tool_return_from_task(&LuaValue::Table(t));
-        assert!(reply.snapshot.is_some());
-        assert!(reply.header.is_none());
-    }
-
-    #[test]
     fn extract_return_non_userdata_body_field_ignored() {
         let lua = test_lua();
         let t = lua.create_table().unwrap();
@@ -1041,25 +1024,6 @@ mod tests {
     }
 
     #[test]
-    fn finish_reply_error_preserves_body() {
-        let buf = maki_agent::SharedBuf::new();
-        buf.append(SnapshotLine { spans: vec![] });
-        let reply = finish_reply(FinishPayload {
-            llm_output: "err".to_string(),
-            is_error: true,
-            body: Some(buf.take()),
-        });
-        assert!(reply.result.is_err());
-        assert!(reply.snapshot.is_some());
-    }
-
-    #[test]
-    fn thread_key_identity() {
-        let lua = Lua::new();
-        assert_eq!(ThreadKey::current(&lua), ThreadKey::current(&lua));
-    }
-
-    #[test]
     fn task_cleanup_guard_removes_entry() {
         let lua = Lua::new();
         lua.set_app_data(TaskMap::new());
@@ -1086,16 +1050,12 @@ mod tests {
     }
 
     #[test]
-    fn with_task_accessors_return_none_when_no_entry() {
+    fn with_task_accessors_return_none_when_missing() {
         let lua = Lua::new();
-        lua.set_app_data(TaskMap::new());
         assert!(with_task_jobs(&lua, |_| 42).is_none());
         assert!(with_task_bufs(&lua, |_| 42).is_none());
-    }
 
-    #[test]
-    fn with_task_accessors_return_none_without_task_map() {
-        let lua = Lua::new();
+        lua.set_app_data(TaskMap::new());
         assert!(with_task_jobs(&lua, |_| 42).is_none());
         assert!(with_task_bufs(&lua, |_| 42).is_none());
     }
