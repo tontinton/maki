@@ -92,29 +92,39 @@ impl JobStore {
             ($stream:expr, $name:expr, $variant:ident) => {
                 if let Some(stream) = $stream {
                     let tx = event_tx.clone();
-                    thread::Builder::new()
-                        .name($name.into())
-                        .spawn(move || {
-                            for line in BufReader::with_capacity(READER_BUF_SIZE, stream)
-                                .lines()
-                                .map_while(Result::ok)
-                            {
-                                if tx.send(JobEvent::$variant(line)).is_err() {
-                                    break;
+                    Some(
+                        thread::Builder::new()
+                            .name($name.into())
+                            .spawn(move || {
+                                for line in BufReader::with_capacity(READER_BUF_SIZE, stream)
+                                    .lines()
+                                    .map_while(Result::ok)
+                                {
+                                    if tx.send(JobEvent::$variant(line)).is_err() {
+                                        break;
+                                    }
                                 }
-                            }
-                        })
-                        .map_err(|e| e.to_string())?;
+                            })
+                            .map_err(|e| e.to_string())?,
+                    )
+                } else {
+                    None
                 }
             };
         }
-        spawn_reader!(stdout, "job-stdout", Stdout);
-        spawn_reader!(stderr, "job-stderr", Stderr);
+        let stdout_handle = spawn_reader!(stdout, "job-stdout", Stdout);
+        let stderr_handle = spawn_reader!(stderr, "job-stderr", Stderr);
 
         thread::Builder::new()
             .name("job-wait".into())
             .spawn(move || {
                 let code = child.wait().map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
+                if let Some(h) = stdout_handle {
+                    let _ = h.join();
+                }
+                if let Some(h) = stderr_handle {
+                    let _ = h.join();
+                }
                 let _ = event_tx.send(JobEvent::Exit(code));
             })
             .map_err(|e| e.to_string())?;
