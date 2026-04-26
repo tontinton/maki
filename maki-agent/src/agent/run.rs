@@ -20,6 +20,7 @@ use crate::{
     AgentConfig, AgentError, AgentEvent, AgentInput, AgentMode, EventSender, ExtractedCommand,
     InterruptSource, TurnCompleteEvent,
 };
+use maki_config::ToolOutputLines;
 
 const MAX_REAUTH_ATTEMPTS: u32 = 2;
 
@@ -38,6 +39,7 @@ pub struct AgentParams {
     pub model: Model,
     pub skills: Arc<[Skill]>,
     pub config: AgentConfig,
+    pub tool_output_lines: ToolOutputLines,
     pub permissions: Arc<PermissionManager>,
     pub session_id: Option<String>,
     pub timeouts: maki_providers::Timeouts,
@@ -71,6 +73,7 @@ pub struct Agent {
     rollback_len: usize,
     mcp: Option<McpHandle>,
     config: AgentConfig,
+    tool_output_lines: ToolOutputLines,
     reauth_attempts: u32,
     permissions: Arc<PermissionManager>,
     thinking: ThinkingConfig,
@@ -86,6 +89,7 @@ impl Agent {
             model: Arc::new(params.model),
             skills: params.skills,
             config: params.config,
+            tool_output_lines: params.tool_output_lines,
             permissions: params.permissions,
             timeouts: params.timeouts,
             history: run.history,
@@ -330,6 +334,7 @@ impl Agent {
             mcp: self.mcp.clone(),
             deadline: Deadline::None,
             config: self.config.clone(),
+            tool_output_lines: self.tool_output_lines,
             permissions: Arc::clone(&self.permissions),
             timeouts: self.timeouts,
             file_tracker: Arc::clone(&self.file_tracker),
@@ -491,6 +496,7 @@ mod tests {
                 model: default_model(),
                 skills: Arc::from([]) as Arc<[Skill]>,
                 config: AgentConfig::default(),
+                tool_output_lines: ToolOutputLines::default(),
                 permissions: Arc::new(PermissionManager::new(
                     maki_config::PermissionsConfig {
                         allow_all: true,
@@ -745,6 +751,7 @@ mod tests {
                     model: default_model(),
                     skills: Arc::from([]) as Arc<[Skill]>,
                     config: AgentConfig::default(),
+                    tool_output_lines: ToolOutputLines::default(),
                     permissions: Arc::new(PermissionManager::new(
                         maki_config::PermissionsConfig {
                             allow_all: true,

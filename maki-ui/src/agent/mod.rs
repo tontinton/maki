@@ -15,6 +15,7 @@ use maki_agent::permissions::PermissionManager;
 use maki_agent::skill::Skill;
 use maki_agent::{
     AgentConfig, CancelToken, Envelope, McpCommand, McpHandle, McpSnapshotReader, ToolOutput,
+    ToolOutputLines,
 };
 
 use self::cancel_map::CancelMap;
@@ -61,6 +62,7 @@ impl AgentHandles {
         initial_history: Vec<Message>,
         skills: &Arc<[Skill]>,
         config: AgentConfig,
+        tool_output_lines: ToolOutputLines,
         permissions: &Arc<PermissionManager>,
         cwd: PathBuf,
         session_id: Option<String>,
@@ -72,6 +74,7 @@ impl AgentHandles {
             initial_history,
             skills,
             config,
+            tool_output_lines,
             permissions,
             mcp_handle,
             session_id,
@@ -104,12 +107,14 @@ impl AgentHandles {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn respawn(
         &mut self,
         history: Vec<Message>,
         model_slot: &Arc<ArcSwap<ModelSlot>>,
         skills: &Arc<[Skill]>,
         config: AgentConfig,
+        tool_output_lines: ToolOutputLines,
         permissions: &Arc<PermissionManager>,
         app: &mut App,
     ) {
@@ -122,6 +127,7 @@ impl AgentHandles {
             history,
             skills,
             config,
+            tool_output_lines,
             permissions,
             self.mcp_handle.clone(),
             Some(app.state.session.id.clone()),
@@ -188,6 +194,7 @@ fn spawn_agent_internal(
     initial_history: Vec<Message>,
     skills: &Arc<[Skill]>,
     config: AgentConfig,
+    tool_output_lines: ToolOutputLines,
     permissions: &Arc<PermissionManager>,
     mcp_handle: Option<McpHandle>,
     session_id: Option<String>,
@@ -211,6 +218,7 @@ fn spawn_agent_internal(
         Arc::clone(model_slot),
         Arc::clone(skills),
         config,
+        tool_output_lines,
         initial_history,
         Arc::clone(&shared_history),
         mcp_handle.clone(),

@@ -442,7 +442,6 @@ impl RenderLimits {
 pub struct ToolContent {
     pub lines: Vec<Line<'static>>,
     pub truncation: SectionFlags,
-    pub separator_line: Option<usize>,
 }
 
 pub fn render_tool_content(
@@ -529,19 +528,11 @@ pub fn render_tool_content(
         _ => (Vec::new(), false),
     };
     truncation.output = output_trunc;
-    let separator_line = if !lines.is_empty() && !output_lines.is_empty() {
-        let sep = lines.len();
+    if !lines.is_empty() && !output_lines.is_empty() {
         lines.push(Line::default());
-        Some(sep)
-    } else {
-        None
-    };
-    lines.extend(output_lines);
-    ToolContent {
-        lines,
-        truncation,
-        separator_line,
     }
+    lines.extend(output_lines);
+    ToolContent { lines, truncation }
 }
 
 fn merge_syntax_with_diff(

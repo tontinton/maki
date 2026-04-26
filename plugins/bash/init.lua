@@ -1,4 +1,5 @@
 local truncate = require("truncate")
+local ToolView = require("tool_view")
 
 local RTK_REWRITE_TIMEOUT_MS = 2000
 local RTK_UNSUPPORTED_FLAGS = {
@@ -171,17 +172,27 @@ maki.api.register_tool({
       command = rewritten
     end
 
+    local tol = ctx:tool_output_lines()
     local buf = maki.ui.buf()
+    local view = ToolView.new(buf, {
+      max_lines = (tol and tol.bash) or 5,
+      keep = "tail",
+    })
 
+    local header = {}
     local highlighted = maki.ui.highlight(command, "bash")
     if highlighted then
-      buf:lines(highlighted)
+      for _, line in ipairs(highlighted) do
+        header[#header + 1] = line
+      end
     else
-      buf:line(command)
+      header[#header + 1] = command
     end
-    buf:line({ { SEPARATOR, "dim" } })
+    header[#header + 1] = { { SEPARATOR, "dim" } }
+    view:set_header(header)
 
     local output_parts = {}
+    local has_output = false
     local finished = false
 
     local function finish(exit_code)
@@ -206,26 +217,38 @@ maki.api.register_tool({
       end
 
       if output == "" then
-        buf:line({ { "No output", "dim" } })
+        view:clear()
+        view:append({ { "No output", "dim" } })
       end
 
       if is_error then
-        buf:line({ { "Exit code: " .. exit_code, "dim" } })
+        view:append({ { "Exit code: " .. exit_code, "dim" } })
       end
+      view:finish()
 
       ctx:finish({ llm_output = llm_output, is_error = is_error, body = buf })
     end
+
+    view:append({ { "Waiting for output...", "dim" } })
 
     local id = maki.fn.jobstart(command, {
       cwd = workdir,
       env = { GIT_TERMINAL_PROMPT = "0" },
       on_stdout = function(_, line)
+        if not has_output then
+          has_output = true
+          view:clear()
+        end
         append_line(output_parts, line)
-        buf:line(line)
+        view:append(line)
       end,
       on_stderr = function(_, line)
+        if not has_output then
+          has_output = true
+          view:clear()
+        end
         append_line(output_parts, line)
-        buf:line(line)
+        view:append(line)
       end,
       on_exit = function(_, code)
         finish(code)
@@ -242,6 +265,8 @@ maki.api.register_tool({
         if output ~= "" then
           msg = msg .. "\n" .. output
         end
+        view:append({ { "Timed out after " .. timeout_secs .. "s", "dim" } })
+        view:finish()
         ctx:finish({
           llm_output = msg,
           is_error = true,

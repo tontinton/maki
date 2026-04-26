@@ -13,6 +13,7 @@ use maki_agent::tools::{DescriptionContext, FileReadTracker, ToolFilter, ToolReg
 use maki_agent::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentParams, AgentRunParams, CancelToken,
     CancelTrigger, Envelope, EventSender, History, Instructions, McpCommand, PromptRole,
+    ToolOutputLines,
 };
 use maki_providers::{AgentError, Message, Model, TokenUsage};
 use serde_json::Value;
@@ -26,6 +27,7 @@ pub(super) struct AgentLoop {
     model_slot: Arc<ArcSwap<ModelSlot>>,
     skills: Arc<[Skill]>,
     config: AgentConfig,
+    tool_output_lines: ToolOutputLines,
     vars: Vars,
     instructions: Instructions,
     tools: Value,
@@ -50,6 +52,7 @@ impl AgentLoop {
         model_slot: Arc<ArcSwap<ModelSlot>>,
         skills: Arc<[Skill]>,
         config: AgentConfig,
+        tool_output_lines: ToolOutputLines,
         initial_history: Vec<Message>,
         shared_history: Arc<ArcSwap<Vec<Message>>>,
         mcp_handle: Option<McpHandle>,
@@ -66,6 +69,7 @@ impl AgentLoop {
             model_slot,
             skills,
             config,
+            tool_output_lines,
             vars: Vars::default(),
             instructions: Instructions::default(),
             tools: Value::Null,
@@ -207,6 +211,7 @@ impl AgentLoop {
                 model: slot.model.clone(),
                 skills: Arc::clone(&self.skills),
                 config: self.config.clone(),
+                tool_output_lines: self.tool_output_lines,
                 permissions: Arc::clone(&self.permissions),
                 session_id: self.session_id.clone(),
                 timeouts: self.timeouts,

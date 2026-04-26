@@ -187,6 +187,7 @@ impl<'t> EventLoop<'t> {
             initial_history,
             &skills,
             config.clone(),
+            ui_config.tool_output_lines,
             &permissions,
             cwd,
             Some(session.id.clone()),
@@ -369,6 +370,7 @@ impl<'t> EventLoop<'t> {
             &self.model_slot,
             &self.skills,
             self.config.clone(),
+            self.app.ui_config.tool_output_lines,
             &self.permissions,
             &mut self.app,
         );

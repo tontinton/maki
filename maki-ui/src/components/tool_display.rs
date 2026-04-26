@@ -70,31 +70,8 @@ pub const TOOL_INDICATOR: &str = "● ";
 pub const TOOL_BODY_INDENT: &str = "  ";
 
 const TOOL_SEPARATOR: &str = "──────────────────";
-const CODE_EXECUTION_OUTPUT_SEPARATOR: &str = "────────────";
-const BASH_WAITING_LABEL: &str = "Waiting for output...";
-const BASH_NO_OUTPUT_LABEL: &str = "No output.";
-const BASH_OUTPUT_SEPARATOR: &str = "──────";
-
 const BATCH_INDENT: &str = "  ";
 const BATCH_CONTENT_INDENT: &str = "    ";
-
-/// Derived from `ToolInput` variant, not render hints.
-#[derive(Clone, Copy, PartialEq)]
-enum SeparatorStyle {
-    None,
-    Bash,
-    CodeExecution,
-}
-
-impl SeparatorStyle {
-    fn from_input(input: Option<&ToolInput>) -> Self {
-        match input {
-            Some(ToolInput::Code { .. }) => Self::Bash,
-            Some(ToolInput::Script { .. }) => Self::CodeExecution,
-            None => Self::None,
-        }
-    }
-}
 
 pub(crate) fn tool_output_annotation(output: &ToolOutput) -> Option<String> {
     match output {
@@ -250,7 +227,6 @@ pub struct ToolLines {
     pub spinner_lines: Vec<usize>,
     pub content_indent: &'static str,
     pub truncation: SectionFlags,
-    pub separator_line: Option<usize>,
 }
 
 pub struct HighlightRequest {
@@ -477,12 +453,10 @@ struct ToolLineBuilder {
     width: u16,
     outer_indent: &'static str,
     truncation: SectionFlags,
-    separator_line: Option<usize>,
     limits: RenderLimits,
     keep: Keep,
     header_style: HeaderStyle,
     body_format: BodyFormat,
-    separator_style: SeparatorStyle,
 }
 
 impl ToolLineBuilder {
@@ -502,12 +476,10 @@ impl ToolLineBuilder {
             width: width.saturating_sub(outer_indent.len() as u16),
             outer_indent,
             truncation: SectionFlags::default(),
-            separator_line: None,
             limits,
             keep: output_limits.keep,
             header_style: hints.header_style,
             body_format: hints.body_format,
-            separator_style: SeparatorStyle::None,
         }
     }
 
@@ -575,13 +547,11 @@ impl ToolLineBuilder {
         self.truncation.script |= content.truncation.script;
         self.truncation.output |= content.truncation.output;
         let start = self.lines.len();
-        self.separator_line = content.separator_line.map(|l| start + l);
         for mut line in content.lines {
             line.spans.insert(0, Span::raw(TOOL_BODY_INDENT));
             self.lines.push(line);
         }
         self.content_range = (start, self.lines.len());
-        self.separator_style = SeparatorStyle::from_input(input);
         if let Some(ToolInput::Code { code, .. }) = input {
             self.push_search_text(code.trim_end());
         }
@@ -590,22 +560,9 @@ impl ToolLineBuilder {
         }
     }
 
-    fn push_resolved_output(&mut self, resolved: &ResolvedOutput<'_>, is_done: bool) {
-        let has_code = self.content_range.1 > self.content_range.0;
-
+    fn push_resolved_output(&mut self, resolved: &ResolvedOutput<'_>) {
         if resolved.text.is_none() {
-            if has_code && self.separator_style == SeparatorStyle::Bash {
-                self.push_bash_output_label(TOOL_BODY_INDENT, is_done, false);
-            }
             return;
-        }
-
-        if has_code {
-            if self.separator_style == SeparatorStyle::Bash {
-                self.push_bash_output_label(TOOL_BODY_INDENT, is_done, resolved.text.is_some());
-            } else if resolved.text.is_some() {
-                self.push_code_output_separator(TOOL_BODY_INDENT);
-            }
         }
 
         if let Some(text) = &resolved.text {
@@ -654,84 +611,17 @@ impl ToolLineBuilder {
         }
     }
 
-    fn push_bash_output_label(&mut self, indent: &str, is_done: bool, has_output: bool) {
-        self.separator_line = Some(self.lines.len());
-        self.lines.push(Line::from(Span::styled(
-            format!("{indent}{BASH_OUTPUT_SEPARATOR}"),
-            theme::current().tool_dim,
-        )));
-        let label = match (has_output, is_done) {
-            (true, _) => return,
-            (false, false) => BASH_WAITING_LABEL,
-            (false, true) => BASH_NO_OUTPUT_LABEL,
-        };
-        self.lines.push(Line::from(Span::styled(
-            format!("{indent}{label}"),
-            theme::current().tool_dim,
-        )));
-    }
-
     fn push_snapshot(&mut self, snapshot: &BufferSnapshot, search_fallback: Option<&str>) {
-        let total = snapshot.lines.len();
-        let max = self.limits.output;
         let start = self.lines.len();
-
-        let sep_idx = snapshot.lines.iter().position(|line| {
-            line.spans
-                .first()
-                .is_some_and(|s| s.text.starts_with(BASH_OUTPUT_SEPARATOR))
-        });
-
-        let (header_end, output_start) = match sep_idx {
-            Some(idx) => (idx, idx + 1),
-            None => (0, 0),
-        };
-
-        if sep_idx.is_some() {
-            self.lines.extend(snapshot_to_lines_range(
-                snapshot,
-                TOOL_BODY_INDENT,
-                0..header_end,
-            ));
-            self.separator_line = Some(self.lines.len());
-            self.lines.extend(snapshot_to_lines_range(
-                snapshot,
-                TOOL_BODY_INDENT,
-                header_end..output_start,
-            ));
-        }
-
-        let output_total = total - output_start;
-        let (range, skipped) = if output_total > max {
-            let skipped = output_total - max;
-            match self.keep {
-                Keep::Tail => (output_start + skipped..total, skipped),
-                Keep::Head => (output_start..output_start + max, skipped),
-            }
-        } else {
-            (output_start..total, 0)
-        };
-        if matches!(self.keep, Keep::Tail) {
-            self.push_truncation_count(skipped);
-        }
-        self.lines
-            .extend(snapshot_to_lines_range(snapshot, TOOL_BODY_INDENT, range));
-        if matches!(self.keep, Keep::Head) {
-            self.push_truncation_count(skipped);
-        }
+        let total = snapshot.lines.len();
+        self.lines.extend(snapshot_to_lines_range(
+            snapshot,
+            TOOL_BODY_INDENT,
+            0..total,
+        ));
         self.content_range = (start, self.lines.len());
         if let Some(text) = search_fallback {
             self.push_search_text(text);
-        }
-    }
-
-    fn push_code_output_separator(&mut self, indent: &str) {
-        if self.separator_style == SeparatorStyle::CodeExecution {
-            self.separator_line = Some(self.lines.len());
-            self.lines.push(Line::from(Span::styled(
-                format!("{indent}{}", CODE_EXECUTION_OUTPUT_SEPARATOR),
-                theme::current().tool_dim,
-            )));
         }
     }
 
@@ -770,7 +660,6 @@ impl ToolLineBuilder {
             spinner_lines: self.spinner_lines,
             content_indent,
             truncation: self.truncation,
-            separator_line: self.separator_line,
         }
     }
 }
@@ -874,7 +763,6 @@ pub fn build_tool_lines(
             .or(body);
         b.push_snapshot(snapshot, search_text);
     } else {
-        let is_done = status != ToolStatus::InProgress;
         let resolved = resolve_output(
             msg.tool_output.as_deref(),
             body,
@@ -883,7 +771,7 @@ pub fn build_tool_lines(
             b.limits,
             b.keep,
         );
-        b.push_resolved_output(&resolved, is_done);
+        b.push_resolved_output(&resolved);
     }
     b.finish(
         msg.tool_input.clone(),
@@ -920,10 +808,6 @@ pub fn build_batch_entry_lines(
     );
     b.prepend_indicator(entry.status.into(), rctx.started_at);
     b.push_code_content(entry.input.as_ref(), entry.output.as_ref());
-    let is_done = matches!(
-        entry.status,
-        BatchToolStatus::Success | BatchToolStatus::Error
-    );
     if let Some(snap) = child_state.and_then(|s| s.snapshot.as_ref()) {
         let search_text = entry.output.as_ref().and_then(|o| match o {
             ToolOutput::Plain(t) => Some(t.as_str()),
@@ -932,7 +816,7 @@ pub fn build_batch_entry_lines(
         b.push_snapshot(snap, search_text);
     } else {
         let resolved = resolve_output(entry.output.as_ref(), None, None, 0, b.limits, b.keep);
-        b.push_resolved_output(&resolved, is_done);
+        b.push_resolved_output(&resolved);
     }
     b.prepend_separator(index);
     b.finish(
@@ -1201,51 +1085,6 @@ mod tests {
         tl.lines
             .iter()
             .any(|l| has_styled_span(&l.spans, text, style))
-    }
-
-    #[test_case(code_input(), true  ; "shown_with_code_input")]
-    #[test_case(None,         false ; "hidden_without_code_input")]
-    fn bash_separator(input: Option<ToolInput>, expected: bool) {
-        let msg = bash_msg("echo hi\nhello", ToolStatus::Success, input, plain_output());
-        let tl = build_tool_lines(
-            &msg,
-            ToolStatus::Success,
-            &test_rctx(80, &reg()),
-            SectionFlags::default(),
-        );
-        assert_eq!(
-            line_has_styled(&tl, BASH_OUTPUT_SEPARATOR, theme::current().tool_dim),
-            expected,
-        );
-    }
-
-    #[test_case(ToolStatus::InProgress, None,                                     BASH_WAITING_LABEL   ; "waiting_when_in_progress")]
-    #[test_case(ToolStatus::Success,    Some(ToolOutput::Plain(String::new())),    BASH_NO_OUTPUT_LABEL ; "no_output_when_done_empty")]
-    fn bash_status_label(status: ToolStatus, output: Option<ToolOutput>, label: &str) {
-        let msg = bash_msg("echo hi", status, code_input(), output);
-        let tl = build_tool_lines(
-            &msg,
-            status,
-            &test_rctx(80, &reg()),
-            SectionFlags::default(),
-        );
-        assert!(line_has_styled(&tl, label, theme::current().tool_dim));
-    }
-
-    #[test]
-    fn batch_bash_separator_between_code_and_output() {
-        let entry = batch_entry(
-            "bash",
-            BatchToolStatus::Success,
-            code_input(),
-            Some(ToolOutput::Plain("hello".into())),
-        );
-        let tl = batch_lines(&entry, 0);
-        assert!(line_has_styled(
-            &tl,
-            BASH_OUTPUT_SEPARATOR,
-            theme::current().tool_dim
-        ));
     }
 
     #[test_case("header\nbody\nmore", "header" ; "multiline")]
@@ -1640,30 +1479,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn snapshot_truncation_head() {
-        let lines: Vec<Vec<SnapshotSpan>> = (0..150)
-            .map(|i| {
-                vec![SnapshotSpan {
-                    text: format!("line_{i}"),
-                    style: SpanStyle::Default,
-                }]
-            })
-            .collect();
-        let snapshot = make_snapshot(lines);
-        let msg = snapshot_msg(snapshot);
-        let tl = build_tool_lines(
-            &msg,
-            ToolStatus::Success,
-            &test_rctx(80, &reg()),
-            SectionFlags::default(),
-        );
-        let text = lines_text(&tl);
-        assert!(text.contains("line_0"));
-        assert!(!text.contains("line_149"));
-        assert!(text.contains(TRUNCATION_PREFIX));
-    }
-
     #[test_case(None,       None,    "bash",  false ; "none_output_none_body")]
     #[test_case(None,       Some("hello"), "bash", true ; "none_output_with_body")]
     #[test_case(
@@ -1786,7 +1601,6 @@ mod tests {
         let expanded_text = lines_text(&expanded);
         assert!(collapsed.truncation.any());
         assert!(!expanded.truncation.any());
-        assert!(!expanded_text.contains(BASH_WAITING_LABEL));
         assert!(expanded_text.contains("line 0"));
         assert!(!collapsed_text.contains("line 0"));
     }
@@ -1952,61 +1766,6 @@ mod tests {
         };
         let ol = output_limits_from_hints("bash", &hints, &TOL);
         assert_eq!(ol.max_lines, TOL.bash);
-    }
-
-    #[test]
-    fn snapshot_truncation_tail() {
-        let mut custom_reg = RenderHintsRegistry::new();
-        custom_reg.register(
-            Arc::from("my_tail_tool"),
-            &maki_agent::RawRenderHints {
-                truncate_at: Some("tail".into()),
-                ..Default::default()
-            },
-        );
-        let lines: Vec<Vec<SnapshotSpan>> = (0..150)
-            .map(|i| {
-                vec![SnapshotSpan {
-                    text: format!("line_{i}"),
-                    style: SpanStyle::Default,
-                }]
-            })
-            .collect();
-        let snapshot = make_snapshot(lines);
-        let msg = DisplayMessage {
-            role: DisplayRole::Tool(Box::new(ToolRole {
-                id: "t1".into(),
-                status: ToolStatus::Success,
-                name: "my_tail_tool".into(),
-            })),
-            text: "header\nfallback".into(),
-            tool_input: None,
-            tool_output: Some(Arc::new(ToolOutput::Plain("fallback".into()))),
-            live_output: None,
-            annotation: None,
-            plan_path: None,
-            timestamp: None,
-            turn_usage: None,
-            truncated_lines: 0,
-            render_snapshot: Some(snapshot),
-            render_header: None,
-        };
-        let tl = build_tool_lines(
-            &msg,
-            ToolStatus::Success,
-            &test_rctx(80, &custom_reg),
-            SectionFlags::default(),
-        );
-        let text = lines_text(&tl);
-        assert!(
-            text.contains("line_149"),
-            "tail truncation should show last lines"
-        );
-        assert!(
-            !text.contains("line_0"),
-            "tail truncation should hide first lines"
-        );
-        assert!(text.contains(TRUNCATION_PREFIX));
     }
 
     #[test]

@@ -14,7 +14,7 @@ pub use agent::{
     Agent, AgentParams, AgentRunParams, History, Instructions, LoadedInstructions, RunOutcome,
 };
 pub use cancel::{CancelToken, CancelTrigger};
-pub use maki_config::{AgentConfig, PermissionsConfig, UiConfig};
+pub use maki_config::{AgentConfig, PermissionsConfig, ToolOutputLines};
 pub mod command;
 pub mod diff;
 pub mod permissions;

@@ -548,6 +548,13 @@ impl SharedBuf {
         self.dirty.store(true, Ordering::Release);
     }
 
+    pub fn set_lines(&self, lines: Vec<SnapshotLine>) {
+        let mut guard = self.committed.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = Arc::new(lines);
+        drop(guard);
+        self.dirty.store(true, Ordering::Release);
+    }
+
     pub fn len(&self) -> usize {
         self.committed
             .lock()

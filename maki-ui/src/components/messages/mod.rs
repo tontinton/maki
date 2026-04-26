@@ -610,7 +610,7 @@ impl MessagesPanel {
         }
         let doc_row = (row.saturating_sub(area.y)) as u32 + self.scroll_top as u32;
         let width = self.viewport_width;
-        let Some((_, seg, seg_start)) = self.cache.segment_at_row(doc_row, width) else {
+        let Some((_, seg, _)) = self.cache.segment_at_row(doc_row, width) else {
             return false;
         };
         let Some(tool_id) = seg.tool_id.as_deref() else {
@@ -624,23 +624,14 @@ impl MessagesPanel {
         if !seg.truncation.any() && !exp.any() {
             return false;
         }
-        let click_line = (doc_row - seg_start) as usize;
         let tool_id = tool_id.to_owned();
         let truncation = seg.truncation;
-        let separator_line = seg.separator_line;
 
         let entry = self.expanded_tools.entry(tool_id.clone()).or_default();
-        match separator_line {
-            Some(sep) if click_line < sep => {
-                if truncation.script || entry.script {
-                    entry.script = !entry.script;
-                }
-            }
-            _ => {
-                if truncation.output || entry.output {
-                    entry.output = !entry.output;
-                }
-            }
+        if truncation.output || entry.output {
+            entry.output = !entry.output;
+        } else if truncation.script || entry.script {
+            entry.script = !entry.script;
         }
         self.rebuild_expanded_tool(&tool_id);
         true

@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::{AgentEvent, EventSender, SubagentInfo, ToolOutput};
+use maki_config::ToolOutputLines;
 use maki_providers::model::ModelTier;
 use maki_providers::provider;
 use maki_providers::{ContentBlock, Model, ModelError, Role};
@@ -152,6 +153,7 @@ impl Task {
                 model,
                 skills: Arc::clone(&ctx.skills),
                 config: ctx.config.clone(),
+                tool_output_lines: ToolOutputLines::default(),
                 permissions: Arc::clone(&ctx.permissions),
                 session_id: Some(session_id),
                 timeouts: ctx.timeouts,

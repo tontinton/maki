@@ -1,7 +1,7 @@
 use maki_agent::AgentEvent;
 use maki_agent::BufferSnapshot;
 use maki_agent::cancel::CancelToken;
-use maki_config::AgentConfig;
+use maki_config::{AgentConfig, ToolOutputLines};
 use mlua::{LuaSerdeExt, UserData, UserDataMethods, Value as LuaValue};
 
 use crate::api::buf::BufHandle;
@@ -17,6 +17,7 @@ pub(crate) struct FinishPayload {
 pub(crate) struct LuaCtx {
     pub(crate) cancel: CancelToken,
     pub(crate) config: AgentConfig,
+    pub(crate) tool_output_lines: ToolOutputLines,
     pub(crate) finish_tx: Option<flume::Sender<FinishPayload>>,
     pub(crate) live: Option<LiveCtx>,
 }
@@ -26,6 +27,10 @@ impl UserData for LuaCtx {
         methods.add_method("cancelled", |_, this, ()| Ok(this.cancel.is_cancelled()));
 
         methods.add_method("config", |lua, this, ()| lua.to_value(&this.config));
+
+        methods.add_method("tool_output_lines", |lua, this, ()| {
+            lua.to_value(&this.tool_output_lines)
+        });
 
         methods.add_method("emit_output", |_, this, content: String| {
             if let Some(live) = &this.live {

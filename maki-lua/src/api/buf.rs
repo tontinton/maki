@@ -92,6 +92,16 @@ impl UserData for BufHandle {
             Ok(())
         });
 
+        methods.add_method("set_lines", |_lua, this, tbl: mlua::Table| {
+            let mut parsed = Vec::with_capacity(tbl.raw_len());
+            for i in 1..=tbl.raw_len() {
+                let val: LuaValue = tbl.raw_get(i)?;
+                parsed.push(parse_line(&val)?);
+            }
+            this.buf.set_lines(parsed);
+            Ok(())
+        });
+
         methods.add_method("len", |_lua, this, ()| Ok(this.buf.len()));
     }
 }
@@ -484,6 +494,27 @@ mod tests {
         });
         assert_eq!(store.len(handle.id), 1);
         assert_eq!(store.live_buf().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn set_lines_replaces_content() {
+        let lua = test_lua();
+        let handle = {
+            let mut store = lua.app_data_mut::<BufferStore>().unwrap();
+            store.create()
+        };
+        let ud = lua.create_userdata(handle).unwrap();
+        lua.globals().set("buf", ud).unwrap();
+
+        lua.load(r#"buf:lines({ "a", "b", "c", "d", "e" })"#)
+            .exec()
+            .unwrap();
+        let len: usize = lua.load("return buf:len()").eval().unwrap();
+        assert_eq!(len, 5);
+
+        lua.load(r#"buf:set_lines({ "x", "y" })"#).exec().unwrap();
+        let len: usize = lua.load("return buf:len()").eval().unwrap();
+        assert_eq!(len, 2, "set_lines should replace, not append");
     }
 
     #[test]

@@ -22,7 +22,7 @@ use maki_agent::tools::{
 };
 use maki_agent::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, Envelope,
-    EventSender, History, PermissionsConfig, agent, template,
+    EventSender, History, PermissionsConfig, ToolOutputLines, agent, template,
 };
 use maki_providers::StopReason;
 use maki_providers::TokenUsage;
@@ -199,6 +199,7 @@ pub fn run(
                 model: model_clone,
                 skills,
                 config,
+                tool_output_lines: ToolOutputLines::default(),
                 permissions: Arc::new(maki_agent::permissions::PermissionManager::new(
                     permissions_config,
                     cwd_path.clone(),

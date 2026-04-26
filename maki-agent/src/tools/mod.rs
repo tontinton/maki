@@ -50,6 +50,7 @@ use crate::mcp::McpHandle;
 use crate::permissions::PermissionManager;
 use crate::skill::Skill;
 use crate::{AgentConfig, AgentMode, EventSender};
+use maki_config::ToolOutputLines;
 use maki_providers::Model;
 use maki_providers::provider::Provider;
 
@@ -204,6 +205,7 @@ pub struct ToolContext {
     pub mcp: Option<McpHandle>,
     pub deadline: Deadline,
     pub config: AgentConfig,
+    pub tool_output_lines: ToolOutputLines,
     pub permissions: Arc<PermissionManager>,
     pub timeouts: maki_providers::Timeouts,
     pub file_tracker: Arc<FileReadTracker>,
@@ -597,6 +599,7 @@ pub(crate) fn interpreter_ctx(
         mcp: None,
         deadline: Deadline::None,
         config: AgentConfig::default(),
+        tool_output_lines: ToolOutputLines::default(),
         permissions,
         timeouts: maki_providers::Timeouts::default(),
         file_tracker,

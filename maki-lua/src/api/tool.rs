@@ -143,6 +143,7 @@ impl ToolInvocation for LuaToolInvocation {
             let lua_ctx = LuaCtx {
                 cancel: ctx.cancel.clone(),
                 config: ctx.config.clone(),
+                tool_output_lines: ctx.tool_output_lines,
                 finish_tx: None,
                 live: ctx.tool_use_id.clone().map(|id| LiveCtx {
                     event_tx: ctx.event_tx.clone(),

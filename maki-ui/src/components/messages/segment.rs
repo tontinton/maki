@@ -50,7 +50,6 @@ pub(super) struct Segment {
     pub tool_id: Option<String>,
     pub msg_index: Option<usize>,
     pub truncation: SectionFlags,
-    pub separator_line: Option<usize>,
     cached_height: Cell<Option<CachedHeight>>,
     pending_highlight: Option<u64>,
     highlight_range: Option<(usize, usize)>,
@@ -148,7 +147,6 @@ impl Segment {
         self.spinner_lines = tl.spinner_lines;
         self.content_indent = tl.content_indent;
         self.truncation = tl.truncation;
-        self.separator_line = tl.separator_line;
         self.set_lines(tl.lines);
     }
 
@@ -162,7 +160,6 @@ impl Segment {
             Some((s, new_end))
         });
         self.truncation = tl.truncation;
-        self.separator_line = tl.separator_line;
         if let Some((s, e)) = reused {
             self.set_lines(tl.lines);
             self.highlight_range = Some((s, e));
