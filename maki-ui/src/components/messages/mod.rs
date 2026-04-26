@@ -193,7 +193,7 @@ impl MessagesPanel {
     }
 
     pub fn tool_done(&mut self, event: ToolDoneEvent) {
-        self.live_bufs.remove(&event.id);
+        let live_buf = self.live_bufs.remove(&event.id);
         let Some(msg) = self
             .messages
             .iter_mut()
@@ -201,6 +201,9 @@ impl MessagesPanel {
         else {
             return;
         };
+        if let Some(buf) = live_buf.filter(|_| msg.render_snapshot.is_some()) {
+            msg.render_snapshot = Some(buf.take());
+        }
         if let DisplayRole::Tool(t) = &mut msg.role {
             t.status = if event.is_error {
                 ToolStatus::Error
