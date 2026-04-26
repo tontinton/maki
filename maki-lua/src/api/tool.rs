@@ -21,7 +21,7 @@ use crate::runtime::{LiveCtx, Request};
 const TOOL_NAME_MAX: usize = 64;
 const TOOL_HANDLER_RETURN_ERR: &str =
     "tool handler must return string or {output=string, is_error?=bool}";
-const TOOL_CALL_MAX_TIME: Duration = Duration::from_secs(30);
+const TOOL_CALL_MAX_TIME: Duration = Duration::from_secs(600);
 
 pub(crate) struct PendingTool {
     pub(crate) name: Arc<str>,
