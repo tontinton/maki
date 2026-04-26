@@ -52,6 +52,7 @@ Built-in lua plugins in ./plugins:
 - index: tool to return a compact skeleton of a source file using tree-sitter
 - webfetch: tool to fetch a url
 - websearch: tool to search exa.ai
+- bash: tool to run bash (experimental)
 
 ## Docs
 
