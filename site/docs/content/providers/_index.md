@@ -110,6 +110,19 @@ Defaults: devstral-latest (strong), mistral-large-latest (medium), mistral-small
 
 Defaults: glm-5-code (strong), glm-4.7-flash (weak), glm-4.7 (medium)
 
+### DeepSeek
+
+- **Env var**: `DEEPSEEK_API_KEY`
+- **API**: `https://api.deepseek.com`
+- **Features**: Thinking mode toggle (on/off), open-weight models
+
+| Tier | Models | Pricing (in/out per 1M tokens) | Context |
+|------|--------|-------------------------------|---------|
+| Medium | **deepseek-v4-flash** (default) | $0.14 / $0.28 | 1000K ctx / 384K out |
+| Strong | **deepseek-v4-pro** (default) | $0.43 / $0.87 | 1000K ctx / 384K out |
+
+Defaults: deepseek-v4-flash (medium), deepseek-v4-pro (strong)
+
 ### Synthetic
 
 - **Env var**: `SYNTHETIC_API_KEY`
@@ -151,7 +164,7 @@ To add a custom provider or proxy, drop an executable script into `~/.maki/provi
 
 `resolve` is called each time a new agent spawns, so scripts should read tokens from disk instead of caching them in memory. That way auth changes from other processes get picked up.
 
-The `base` field specifies which built-in provider to inherit the model catalog from. Valid values: `anthropic`, `openai`, `google`, `copilot`, `ollama`, `mistral`, `zai`, `zai-coding-plan`, `synthetic`.
+The `base` field specifies which built-in provider to inherit the model catalog from. Valid values: `anthropic`, `openai`, `google`, `copilot`, `ollama`, `mistral`, `zai`, `zai-coding-plan`, `deepseek`, `synthetic`.
 
 If your provider serves models not in the base catalog, add a `models` subcommand returning:
 

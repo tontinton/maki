@@ -18,6 +18,7 @@ use crate::{AgentError, Message, ProviderEvent, StreamResponse, ThinkingConfig};
 use super::ResolvedAuth;
 use super::anthropic::Anthropic;
 use super::copilot::Copilot;
+use super::deepseek::DeepSeek;
 use super::google::Google;
 use super::mistral::Mistral;
 use super::ollama::Ollama;
@@ -375,6 +376,10 @@ pub fn create(slug: &str, timeouts: super::Timeouts) -> Result<Box<dyn Provider>
             Synthetic::with_auth(auth.clone(), timeouts)
                 .with_system_prefix(meta.system_prefix.clone()),
         ),
+        ProviderKind::DeepSeek => Box::new(
+            DeepSeek::with_auth(auth.clone(), timeouts)
+                .with_system_prefix(meta.system_prefix.clone()),
+        ),
     };
 
     Ok(Box::new(DynamicProvider {
@@ -653,6 +658,7 @@ esac
     #[test_case("zai", ProviderKind::Zai ; "base_zai")]
     #[test_case("zai-coding-plan", ProviderKind::ZaiCodingPlan ; "base_zai_coding_plan")]
     #[test_case("synthetic", ProviderKind::Synthetic ; "base_synthetic")]
+    #[test_case("deepseek", ProviderKind::DeepSeek ; "base_deepseek")]
     fn discover_accepts_all_bases(base: &str, expected: ProviderKind) {
         let tmp = TempDir::new().unwrap();
         let info = format!(r#"{{"display_name": "Test", "base": "{base}", "has_auth": false}}"#);

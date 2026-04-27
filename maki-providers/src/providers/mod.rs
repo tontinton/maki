@@ -9,6 +9,7 @@ use crate::AgentError;
 
 pub(crate) mod anthropic;
 pub(crate) mod copilot;
+pub(crate) mod deepseek;
 pub mod dynamic;
 pub(crate) mod google;
 pub(crate) mod mistral;

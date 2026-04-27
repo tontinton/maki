@@ -10,6 +10,7 @@ use crate::model::{Model, ModelFamily, models_for_provider};
 use crate::providers::Timeouts;
 use crate::providers::anthropic::Anthropic;
 use crate::providers::copilot::Copilot;
+use crate::providers::deepseek::DeepSeek;
 use crate::providers::dynamic;
 use crate::providers::google::Google;
 use crate::providers::mistral::Mistral;
@@ -31,6 +32,8 @@ pub enum ProviderKind {
     Mistral,
     Zai,
     ZaiCodingPlan,
+    #[strum(serialize = "deepseek")]
+    DeepSeek,
     Synthetic,
 }
 
@@ -45,6 +48,7 @@ impl ProviderKind {
             Self::Mistral => "Mistral",
             Self::Zai => "Z.AI",
             Self::ZaiCodingPlan => "Z.AI Coding",
+            Self::DeepSeek => "DeepSeek",
             Self::Synthetic => "Synthetic",
         }
     }
@@ -58,6 +62,7 @@ impl ProviderKind {
             Self::Ollama => "OLLAMA_API_KEY",
             Self::Mistral => "MISTRAL_API_KEY",
             Self::Zai | Self::ZaiCodingPlan => "ZHIPU_API_KEY",
+            Self::DeepSeek => "DEEPSEEK_API_KEY",
             Self::Synthetic => "SYNTHETIC_API_KEY",
         }
     }
@@ -74,6 +79,7 @@ impl ProviderKind {
             Self::Mistral => "https://api.mistral.ai/v1",
             Self::Zai => "https://api.z.ai/api/paas/v4",
             Self::ZaiCodingPlan => "https://api.z.ai/api/coding/paas/v4",
+            Self::DeepSeek => "https://api.deepseek.com",
             Self::Synthetic => "https://api.synthetic.new/openai/v1",
         }
     }
@@ -81,7 +87,7 @@ impl ProviderKind {
     pub const fn supports_thinking(self) -> bool {
         matches!(
             self,
-            Self::Anthropic | Self::Google | Self::Mistral | Self::Synthetic
+            Self::Anthropic | Self::Google | Self::Mistral | Self::DeepSeek | Self::Synthetic
         )
     }
 
@@ -98,6 +104,7 @@ impl ProviderKind {
             Self::Synthetic => {
                 Some("Reasoning effort support (low/medium/high), open-weight models")
             }
+            Self::DeepSeek => Some("Thinking mode toggle (on/off), open-weight models"),
             _ => None,
         }
     }
@@ -111,6 +118,7 @@ impl ProviderKind {
             Self::Ollama => ModelFamily::Generic,
             Self::Mistral => ModelFamily::Generic,
             Self::Zai | Self::ZaiCodingPlan => ModelFamily::Glm,
+            Self::DeepSeek => ModelFamily::Generic,
             Self::Synthetic => ModelFamily::Synthetic,
         }
     }
@@ -128,6 +136,7 @@ impl ProviderKind {
             Self::Ollama => 16_384,
             Self::Mistral => 32_000,
             Self::Zai | Self::ZaiCodingPlan => 16_000,
+            Self::DeepSeek => 384_000,
             Self::Synthetic => 32_000,
         }
     }
@@ -141,6 +150,7 @@ impl ProviderKind {
             Self::Ollama => 128_000,
             Self::Mistral => 128_000,
             Self::Zai | Self::ZaiCodingPlan => 128_000,
+            Self::DeepSeek => 1_000_000,
             Self::Synthetic => 128_000,
         }
     }
@@ -155,6 +165,7 @@ impl ProviderKind {
             Self::Mistral => Ok(Box::new(Mistral::new(timeouts)?)),
             Self::Zai => Ok(Box::new(Zai::new(ZaiPlan::Standard, timeouts)?)),
             Self::ZaiCodingPlan => Ok(Box::new(Zai::new(ZaiPlan::Coding, timeouts)?)),
+            Self::DeepSeek => Ok(Box::new(DeepSeek::new(timeouts)?)),
             Self::Synthetic => Ok(Box::new(Synthetic::new(timeouts)?)),
         }
     }

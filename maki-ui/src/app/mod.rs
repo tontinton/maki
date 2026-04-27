@@ -1089,7 +1089,10 @@ impl App {
             }
             "/thinking" => {
                 if !self.state.model.provider.supports_thinking() {
-                    self.flash("Thinking requires Anthropic, Mistral or Synthetic provider".into());
+                    self.flash(
+                        "Thinking requires Anthropic, Mistral, DeepSeek or Synthetic provider"
+                            .into(),
+                    );
                     return vec![];
                 }
                 match ThinkingConfig::parse(cmd.args.trim(), self.state.thinking) {

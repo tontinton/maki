@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::provider::ProviderKind;
 use crate::providers::{
-    anthropic, copilot, dynamic, google, mistral, ollama, openai, synthetic, zai,
+    anthropic, copilot, deepseek, dynamic, google, mistral, ollama, openai, synthetic, zai,
 };
 
 const PER_MILLION: f64 = 1_000_000.0;
@@ -118,6 +118,7 @@ pub fn models_for_provider(provider: ProviderKind) -> &'static [ModelEntry] {
         ProviderKind::Google => google::models(),
         ProviderKind::Zai | ProviderKind::ZaiCodingPlan => zai::models(),
         ProviderKind::Synthetic => synthetic::models(),
+        ProviderKind::DeepSeek => deepseek::models(),
     }
 }
 
@@ -358,6 +359,10 @@ mod tests {
                 continue;
             }
             for &tier in &TIERS {
+                // DeepSeek has no Weak tier model
+                if provider == ProviderKind::DeepSeek && tier == ModelTier::Weak {
+                    continue;
+                }
                 let model = Model::from_tier(provider, tier).unwrap();
                 assert_eq!(model.provider, provider);
                 assert_eq!(model.tier, tier);
@@ -387,6 +392,9 @@ mod tests {
             }
             let entries = models_for_provider(provider);
             for &tier in &TIERS {
+                if provider == ProviderKind::DeepSeek && tier == ModelTier::Weak {
+                    continue;
+                }
                 let count = entries
                     .iter()
                     .filter(|e| e.tier == tier && e.default)
@@ -404,6 +412,7 @@ mod tests {
     #[test_case("openai/gpt-99", ProviderKind::OpenAi, "gpt-99" ; "unknown_openai_model_accepted")]
     #[test_case("synthetic/hf:nonexistent", ProviderKind::Synthetic, "hf:nonexistent" ; "unknown_synthetic_model_accepted")]
     #[test_case("ollama/my-custom-model", ProviderKind::Ollama, "my-custom-model" ; "unknown_ollama_model_accepted")]
+    #[test_case("deepseek/my-custom-model", ProviderKind::DeepSeek, "my-custom-model" ; "unknown_deepseek_model_accepted")]
     fn unknown_model_accepted(spec: &str, expected_provider: ProviderKind, expected_id: &str) {
         let model = Model::from_spec(spec).unwrap();
         assert_eq!(model.provider, expected_provider);
