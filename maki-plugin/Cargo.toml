@@ -1,0 +1,19 @@
+[package]
+name = "maki-plugin"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+maki-storage = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+toml = { workspace = true }
+isahc = { workspace = true }
+dirs = { workspace = true }
+smol = { workspace = true }
+
+[dev-dependencies]
+test-case = { workspace = true }
+tempfile = { workspace = true }
