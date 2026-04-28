@@ -195,11 +195,15 @@ pub fn convert_messages(messages: &[Message], system: &str) -> Vec<Value> {
             }
             Role::Assistant => {
                 let mut text = String::new();
+                let mut reasoning_text = String::new();
                 let mut tool_calls = Vec::new();
 
                 for block in &msg.content {
                     match block {
                         ContentBlock::Text { text: t } => text.push_str(t),
+                        ContentBlock::Thinking { thinking, .. } => {
+                            reasoning_text.push_str(thinking);
+                        }
                         ContentBlock::ToolUse { id, name, input } => {
                             tool_calls.push(json!({
                                 "id": id,
@@ -212,15 +216,19 @@ pub fn convert_messages(messages: &[Message], system: &str) -> Vec<Value> {
                         }
                         ContentBlock::ToolResult { .. }
                         | ContentBlock::Image { .. }
-                        | ContentBlock::Thinking { .. }
                         | ContentBlock::RedactedThinking { .. } => {}
                     }
                 }
 
-                if !text.is_empty() || !tool_calls.is_empty() {
+                if !text.is_empty() || !tool_calls.is_empty() || !reasoning_text.is_empty() {
                     let mut msg_obj = json!({"role": "assistant"});
                     if !text.is_empty() {
                         msg_obj["content"] = Value::String(text);
+                    } else if !reasoning_text.is_empty() {
+                        msg_obj["content"] = Value::String(String::new());
+                    }
+                    if !reasoning_text.is_empty() {
+                        msg_obj["reasoning_content"] = Value::String(reasoning_text);
                     }
                     if !tool_calls.is_empty() {
                         msg_obj["tool_calls"] = Value::Array(tool_calls);
@@ -841,6 +849,45 @@ data: [DONE]\n";
         let msgs = vec![Message::user("hello".into())];
         let result = convert_messages(&msgs, "system");
         assert!(result[1]["content"].is_string());
+    }
+
+    #[test]
+    fn convert_messages_assistant_with_reasoning() {
+        let messages = vec![Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Thinking {
+                    thinking: "Let me think...".into(),
+                    signature: None,
+                },
+                ContentBlock::Text {
+                    text: "Hello".into(),
+                },
+            ],
+            ..Default::default()
+        }];
+        let wire = convert_messages(&messages, "");
+        let asst = &wire[1];
+        assert_eq!(asst["role"], "assistant");
+        assert_eq!(asst["content"], "Hello");
+        assert_eq!(asst["reasoning_content"], "Let me think...");
+    }
+
+    #[test]
+    fn convert_messages_assistant_reasoning_only() {
+        let messages = vec![Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Thinking {
+                thinking: "Just thinking...".into(),
+                signature: None,
+            }],
+            ..Default::default()
+        }];
+        let wire = convert_messages(&messages, "");
+        let asst = &wire[1];
+        assert_eq!(asst["role"], "assistant");
+        assert_eq!(asst["reasoning_content"], "Just thinking...");
+        assert_eq!(asst["content"], "");
     }
 
     #[test]
