@@ -48,7 +48,7 @@ impl Write {
                 fs::create_dir_all(parent).map_err(|e| format!("mkdir error: {e}"))?;
             }
             fs::write(&path, &content).map_err(|e| format!("write error: {e}"))?;
-            file_tracker.record_read(p);
+            file_tracker.record_read(p, 1, usize::MAX);
             Ok(output)
         })
         .await

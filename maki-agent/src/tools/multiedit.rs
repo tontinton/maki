@@ -69,10 +69,11 @@ impl MultiEdit {
             file_tracker.check_before_edit(p)?;
 
             let before = fs::read_to_string(p).map_err(|e| format!("read error: {e}"))?;
-            let after = this.apply_edits(&before)?;
+            let after = this.apply_edits(&before).inspect_err(|_| {
+                file_tracker.clear_read(p);
+            })?;
             fs::write(p, &after).map_err(|e| format!("write error: {e}"))?;
-
-            file_tracker.record_read(p);
+            file_tracker.record_read(p, 1, usize::MAX);
 
             Ok(ToolOutput::Diff {
                 summary: format!(

@@ -41,10 +41,13 @@ impl Edit {
             file_tracker.check_before_edit(p)?;
 
             let before = fs::read_to_string(p).map_err(|e| format!("read error: {e}"))?;
-            let after = fuzzy_replace::replace(&before, &old_string, &new_string, replace_all)?;
+            let after = fuzzy_replace::replace(&before, &old_string, &new_string, replace_all)
+                .inspect_err(|_| {
+                    file_tracker.clear_read(p);
+                })?;
             fs::write(p, &after).map_err(|e| format!("write error: {e}"))?;
 
-            file_tracker.record_read(p);
+            file_tracker.record_read(p, 1, usize::MAX);
 
             Ok(ToolOutput::Diff {
                 summary: format!("edited {}", relative_path(&path)),
@@ -90,6 +93,8 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::AgentMode;
+    use crate::ToolOutput;
+    use crate::tools::read::Read;
     use crate::tools::test_support::{pre_read, stub_ctx};
 
     use super::*;
@@ -169,6 +174,70 @@ mod tests {
             assert_eq!(before, original);
             assert_eq!(after, updated);
             assert_eq!(fs::read_to_string(&path).unwrap(), updated);
+        });
+    }
+
+    #[test]
+    fn failed_edit_allows_re_read() {
+        smol::block_on(async {
+            let dir = TempDir::new().unwrap();
+            let ctx = stub_ctx(&AgentMode::Build);
+            let path = temp_file(&dir, "f.rs", "fn alpha() {}\nfn beta() {}");
+            pre_read(&ctx, &path);
+
+            // Failed edit - old_string not found
+            let err = Edit {
+                path: path.clone(),
+                old_string: "MISSING".into(),
+                new_string: "replaced".into(),
+                replace_all: None,
+            }
+            .execute(&ctx)
+            .await
+            .unwrap_err();
+            assert!(err.contains("not found"));
+
+            // Re-reading with same params should now succeed
+            let read = Read::parse_input(&serde_json::json!({ "path": path })).unwrap();
+            let output = read.execute(&ctx).await.unwrap();
+            assert!(matches!(output, ToolOutput::ReadCode { .. }));
+        });
+    }
+
+    #[test]
+    fn sequential_edits_on_same_file_succeed() {
+        smol::block_on(async {
+            let dir = TempDir::new().unwrap();
+            let ctx = stub_ctx(&AgentMode::Build);
+            let path = temp_file(&dir, "f.rs", "fn one() {}\nfn two() {}\nfn three() {}");
+            pre_read(&ctx, &path);
+
+            // First edit
+            Edit {
+                path: path.clone(),
+                old_string: "fn one() {}".into(),
+                new_string: "fn alpha() {}".into(),
+                replace_all: None,
+            }
+            .execute(&ctx)
+            .await
+            .unwrap();
+
+            // Second edit on same file without re-reading
+            Edit {
+                path: path.clone(),
+                old_string: "fn two() {}".into(),
+                new_string: "fn beta() {}".into(),
+                replace_all: None,
+            }
+            .execute(&ctx)
+            .await
+            .unwrap();
+
+            assert_eq!(
+                fs::read_to_string(&path).unwrap(),
+                "fn alpha() {}\nfn beta() {}\nfn three() {}"
+            );
         });
     }
 }

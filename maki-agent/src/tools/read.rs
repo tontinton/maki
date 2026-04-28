@@ -52,11 +52,16 @@ impl Read {
                 return Self::list_dir(&path, cwd.as_deref(), &loaded);
             }
 
+            let offset_val = offset.unwrap_or(1);
+            let limit_val = limit.unwrap_or(max_output_lines);
+
+            file_tracker.check_before_read(p, offset_val, limit_val)?;
+
             let raw = fs::read_to_string(p).map_err(|e| format!("read error: {e}"))?;
             let total_lines = raw.lines().count();
 
-            let start = offset.unwrap_or(1).saturating_sub(1);
-            let limit = limit.unwrap_or(max_output_lines);
+            let start = offset_val.saturating_sub(1);
+            let limit = limit_val;
 
             let lines: Vec<String> = raw
                 .lines()
@@ -76,7 +81,7 @@ impl Read {
                 ))
             });
 
-            file_tracker.record_read(p);
+            file_tracker.record_read(p, offset_val, limit_val);
 
             Ok(ToolOutput::ReadCode {
                 path,

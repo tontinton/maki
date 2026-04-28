@@ -124,7 +124,7 @@ impl Grep {
                 let _ = searcher.search_path(&matcher, &path, &mut sink);
 
                 if !groups.is_empty() {
-                    file_tracker.record_read(&path);
+                    file_tracker.record_read(&path, 1, usize::MAX);
                     let rel = path
                         .strip_prefix(base)
                         .unwrap_or(&path)

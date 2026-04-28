@@ -699,7 +699,7 @@ pub mod test_support {
 
     #[cfg(test)]
     pub(crate) fn pre_read(ctx: &ToolContext, path: &str) {
-        ctx.file_tracker.record_read(Path::new(path));
+        ctx.file_tracker.record_read(Path::new(path), 1, usize::MAX);
     }
 }
 
@@ -1015,8 +1015,10 @@ mod tests {
             let plan_str = plan_path.to_str().unwrap();
             let other_str = other.to_str().unwrap();
 
-            ctx.file_tracker.record_read(Path::new(plan_str));
-            ctx.file_tracker.record_read(Path::new(other_str));
+            ctx.file_tracker
+                .record_read(Path::new(plan_str), 1, usize::MAX);
+            ctx.file_tracker
+                .record_read(Path::new(other_str), 1, usize::MAX);
 
             let registry = ToolRegistry::native();
             let blocked = tool_dispatch::run(
