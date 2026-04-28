@@ -317,7 +317,10 @@ impl ToolOutput {
                 let remaining = lines_remaining_after(*total_lines, *start_line, lines.len());
                 if remaining > 0 {
                     out.push_str(&format!(
-                        "\n\n... truncated {remaining} more lines. Use offset/limit to read further.",
+                        "\n\n...\n\nTruncated lines: {}-{}. Use offset={} to read further.",
+                        start_line + lines.len(),
+                        total_lines,
+                        start_line + lines.len(),
                     ));
                 }
                 out
@@ -875,14 +878,14 @@ mod tests {
         10,
         vec!["fn foo()".into(), "fn bar()".into()],
         Some(vec![InstructionBlock { path: "AGENTS.md".into(), content: "do stuff".into() }]),
-        "10: fn foo()\n11: fn bar()\n\n... truncated 89 more lines. Use offset/limit to read further."
+        "10: fn foo()\n11: fn bar()\n\n...\n\nTruncated lines: 12-100. Use offset=12 to read further."
         ; "with_instructions"
     )]
     #[test_case(
         1,
         vec!["line1".into()],
         None,
-        "1: line1\n\n... truncated 99 more lines. Use offset/limit to read further."
+        "1: line1\n\n...\n\nTruncated lines: 2-100. Use offset=2 to read further."
         ; "without_instructions"
     )]
     fn read_code_display_text(

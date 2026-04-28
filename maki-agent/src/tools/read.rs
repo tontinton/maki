@@ -15,7 +15,9 @@ pub struct Read {
     path: String,
     #[param(description = "Line number to start from (1-indexed)")]
     offset: Option<usize>,
-    #[param(description = "Max number of lines to read")]
+    #[param(
+        description = "Max number of lines to read. Omitting the limit reads up to 2000 lines."
+    )]
     limit: Option<usize>,
 }
 

@@ -29,7 +29,7 @@ Read a file or directory. Returns contents with line numbers (1-indexed).
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `limit` | integer | no | Max number of lines to read |
+| `limit` | integer | no | Max number of lines to read. Omitting the limit reads up to 2000 lines. |
 | `offset` | integer | no | Line number to start from (1-indexed) |
 | `path` | string | yes | Absolute path to the file or directory |
 
