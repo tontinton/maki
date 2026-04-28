@@ -27,7 +27,10 @@ use crate::{
 
 use super::anthropic::{EventAction, EventProcessingState, process_anthropic_event};
 
-const SERVICE: &str = "bedrock-runtime";
+// The SigV4 signing service name is "bedrock", NOT "bedrock-runtime".
+// The endpoint hostname uses bedrock-runtime but the signing credential
+// scope must use "bedrock" to match what AWS expects.
+const SERVICE: &str = "bedrock";
 
 // ---------------------------------------------------------------------------
 // Model registry

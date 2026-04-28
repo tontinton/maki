@@ -471,16 +471,35 @@ impl<'t> EventLoop<'t> {
 
     fn change_model(&mut self, spec: String) {
         match Model::from_spec(&spec) {
-            Ok(new_model) => match from_model(&new_model, self.timeouts) {
-                Ok(new_provider) => {
+            Ok(new_model) => {
+                let current = self.model_slot.load();
+                let same_provider = new_model.provider == current.model.provider
+                    && new_model.dynamic_slug == current.model.dynamic_slug;
+
+                if same_provider {
+                    // Reuse the existing provider — avoids re-resolving credentials
+                    // (which may spawn a subprocess or hit a flaky SSO endpoint).
+                    if let Err(e) = smol::block_on(current.provider.reload_auth()) {
+                        warn!(error = %e, "failed to reload auth on model switch");
+                    }
                     self.app.update_model(&new_model);
                     self.model_slot.store(Arc::new(ModelSlot {
                         model: new_model,
-                        provider: Arc::from(new_provider),
+                        provider: Arc::clone(&current.provider),
                     }));
+                } else {
+                    match from_model(&new_model, self.timeouts) {
+                        Ok(new_provider) => {
+                            self.app.update_model(&new_model);
+                            self.model_slot.store(Arc::new(ModelSlot {
+                                model: new_model,
+                                provider: Arc::from(new_provider),
+                            }));
+                        }
+                        Err(e) => self.app.flash(format!("Failed to create provider: {e}")),
+                    }
                 }
-                Err(e) => self.app.flash(format!("Failed to create provider: {e}")),
-            },
+            }
             Err(e) => self.app.flash(format!("Invalid model: {e}")),
         }
     }
