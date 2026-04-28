@@ -154,6 +154,14 @@ Return a compact overview of a source file: imports, type definitions, function 
       return "error: path is required"
     end
 
+    local ok_meta, meta = pcall(maki.fs.metadata, path)
+    if ok_meta and meta.is_dir then
+      return {
+        llm_output = "Path is a directory. Use index on files or use the read or glob tool to list directories.",
+        is_error = true,
+      }
+    end
+
     local ext = path:match("%.([^%.]+)$")
     if not ext then
       return { llm_output = "Unsupported file type: (no extension). Use the read tool instead.", is_error = true }
@@ -166,7 +174,6 @@ Return a compact overview of a source file: imports, type definitions, function 
 
     local config = ctx:config()
     local max_file_size = (config and config.index_max_file_size) or (2 * 1024 * 1024)
-    local ok_meta, meta = pcall(maki.fs.metadata, path)
     if ok_meta and meta.size > max_file_size then
       return "error: File too large ("
         .. meta.size
