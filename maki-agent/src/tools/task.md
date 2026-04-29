@@ -1,5 +1,8 @@
 Launch an autonomous subagent to perform tasks independently. Best combined with batch.
 
+Always use subagents for individual tasks and **always** use the `research`
+subagent for exploratory tasks.
+
 Subagent types (set via `subagent_type`):
 - `research` (default): Read-only tools. For codebase exploration or gathering context.
 - `general`: Full tool access. For delegating implementation work.
