@@ -5,7 +5,7 @@
 
 use std::fmt::Write;
 
-use crate::agent::tool_dispatch;
+use crate::agent::tool_dispatch::{self, Emit};
 use crate::tools::ToolRegistry;
 use crate::{AgentEvent, BatchProgressEvent, BatchToolEntry, BatchToolStatus, ToolOutput};
 use serde::de::{self, MapAccess, Visitor};
@@ -206,7 +206,6 @@ impl Batch {
 
                 let inner_ctx = ToolContext {
                     tool_use_id: Some(id.clone()),
-                    batch_child: true,
                     ..ctx.clone()
                 };
                 let done = tool_dispatch::run(
@@ -216,6 +215,7 @@ impl Batch {
                     &name,
                     &params,
                     &inner_ctx,
+                    Emit::Silent,
                 )
                 .await;
                 ctx.event_tx

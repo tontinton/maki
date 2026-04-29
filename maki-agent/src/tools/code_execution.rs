@@ -16,6 +16,7 @@ use serde_json::Value;
 
 use std::sync::Arc;
 
+use crate::agent::tool_dispatch::Emit;
 use crate::cancel::CancelToken;
 use crate::permissions::PermissionManager;
 use crate::task_set::TaskSet;
@@ -220,6 +221,7 @@ fn build_tool_fns(env: &InterpreterEnv) -> HashMap<String, ToolFn> {
                         fn_name,
                         &input,
                         &inner_ctx,
+                        Emit::Silent,
                     ));
                     if done.is_error {
                         Err(done.output.as_text())
@@ -287,6 +289,7 @@ fn build_async_resolver(env: &InterpreterEnv) -> AsyncResolver {
                         &pc.name,
                         &input,
                         &inner_ctx,
+                        Emit::Silent,
                     )
                     .await;
 

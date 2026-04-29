@@ -13,6 +13,12 @@ use crate::tools::ToolContext;
 use crate::tools::registry::{ToolInvocation, ToolRegistry};
 use crate::{AgentError, AgentEvent, AgentMode, ToolDoneEvent, ToolOutput, ToolStartEvent};
 
+#[derive(Clone, Copy)]
+pub enum Emit {
+    Notify,
+    Silent,
+}
+
 const DOOM_LOOP_THRESHOLD: usize = 3;
 const DOOM_LOOP_MESSAGE: &str = "You have called this tool with identical input 3 times in a row. You are stuck in a loop. Break out and try a different approach.";
 const MCP_BLOCKED_IN_PLAN: &str = "MCP tools are not available in plan mode";
@@ -59,6 +65,7 @@ pub async fn run(
     name: &str,
     input: &Value,
     ctx: &ToolContext,
+    emit: Emit,
 ) -> ToolDoneEvent {
     let entry = registry.get(name);
     let tool_id: Arc<str> = entry
@@ -113,7 +120,9 @@ pub async fn run(
             input: invocation.start_input(),
             output: invocation.start_output(),
         };
-        ctx.emit_tool_start(start);
+        if matches!(emit, Emit::Notify) {
+            let _ = ctx.event_tx.send(AgentEvent::ToolStart(Box::new(start)));
+        }
 
         if let Err(e) = enforce_permission(invocation.as_ref(), name, ctx, &id).await {
             return done_error(e);
@@ -159,7 +168,9 @@ pub async fn run(
             input: None,
             output: None,
         };
-        ctx.emit_tool_start(start);
+        if matches!(emit, Emit::Notify) {
+            let _ = ctx.event_tx.send(AgentEvent::ToolStart(Box::new(start)));
+        }
         execute_mcp_tool(ctx, &id, tool_id, name, input).await
     } else {
         let msg = format!("{UNKNOWN_TOOL_PREFIX}: {name}");
@@ -299,6 +310,7 @@ pub(super) async fn process_tool_calls(
                 &name,
                 &input,
                 &tool_ctx,
+                Emit::Notify,
             )
             .await;
             event_tx_clone.try_send(AgentEvent::ToolDone(Box::new(done.clone())));
@@ -387,6 +399,7 @@ mod tests {
                 "nonexistent__tool",
                 &serde_json::json!({}),
                 &ctx,
+                Emit::Silent,
             )
             .await;
             assert!(done.is_error);
@@ -468,6 +481,7 @@ mod tests {
                 crate::tools::BASH_TOOL_NAME,
                 &serde_json::json!({ "command": format!("touch {marker_str}") }),
                 &ctx,
+                Emit::Silent,
             )
             .await;
 

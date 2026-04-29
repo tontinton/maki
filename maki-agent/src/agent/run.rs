@@ -333,7 +333,6 @@ impl Agent {
             permissions: Arc::clone(&self.permissions),
             timeouts: self.timeouts,
             file_tracker: Arc::clone(&self.file_tracker),
-            batch_child: false,
         }
     }
 
