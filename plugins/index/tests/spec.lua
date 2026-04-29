@@ -454,30 +454,217 @@ int main(int argc, char **argv) {
     return 0;
 }
 ]==]
-  local out = idx(src, "c")
-  has(out, {
-    "imports:",
-    "stdio.h",
-    "my_lib.h",
-    "consts:",
-    "MAX_SIZE 256",
-    "VERSION",
-    "types:",
-    "typedef struct",
-    "int x",
-    "int y",
-    "typedef enum",
-    "RED",
-    "GREEN",
-    "typedef unsigned int uint32",
-    "struct Node",
-    "enum Direction",
-    "UP",
-    "fns:",
-    "int add(int a, int b)",
-    "void process(const char *input, size_t len)",
-    "int main(int argc, char **argv)",
-  })
+  for _, lang in ipairs({ "c", "cpp" }) do
+    local out = idx(src, lang)
+    has(out, {
+      "imports:",
+      "stdio.h",
+      "my_lib.h",
+      "consts:",
+      "MAX_SIZE 256",
+      "VERSION",
+      "types:",
+      "typedef struct",
+      "int x",
+      "int y",
+      "typedef enum",
+      "RED",
+      "GREEN",
+      "typedef unsigned int uint32",
+      "struct Node",
+      "enum Direction",
+      "UP",
+      "fns:",
+      "int add(int a, int b)",
+      "void process(const char *input, size_t len)",
+      "int main(int argc, char **argv)",
+    })
+  end
+end)
+
+case("c_extern_c_wrapped", function()
+  local src = [==[
+#include <glib.h>
+
+G_BEGIN_DECLS
+
+#define MAX_SIZE 256
+
+typedef enum {
+    RED,
+    GREEN,
+    BLUE,
+} Color;
+
+typedef struct {
+    int x;
+    int y;
+} Point;
+
+int add(int a, int b);
+void process(const char *input, size_t len);
+
+G_END_DECLS
+]==]
+  for _, lang in ipairs({ "c", "cpp" }) do
+    local out = idx(src, lang)
+    has(out, {
+      "imports:",
+      "glib.h",
+      "consts:",
+      "MAX_SIZE 256",
+      "types:",
+      "enum",
+      "RED",
+      "GREEN",
+      "BLUE",
+      "struct",
+      "int x",
+      "int y",
+      "fns:",
+      "int add(int a, int b)",
+      "void process(const char *input, size_t len)",
+    })
+  end
+end)
+
+case("c_extern_c", function()
+  local src = [==[
+#include <stdio.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#define MAX_SIZE 256
+
+typedef enum {
+    RED,
+    GREEN,
+    BLUE,
+} Color;
+
+typedef struct {
+    int x;
+    int y;
+} Point;
+
+int add(int a, int b);
+void process(const char *input, size_t len);
+
+#ifdef __cplusplus
+}
+#endif
+]==]
+  for _, lang in ipairs({ "c", "cpp" }) do
+    local out = idx(src, lang)
+    has(out, {
+      "imports:",
+      "stdio.h",
+      "consts:",
+      "MAX_SIZE 256",
+      "types:",
+      "enum",
+      "RED",
+      "GREEN",
+      "BLUE",
+      "struct",
+      "int x",
+      "int y",
+      "fns:",
+      "int add(int a, int b)",
+      "void process(const char *input, size_t len)",
+    })
+  end
+end)
+
+case("c_single_include_guards", function()
+  local src = [==[
+#ifndef __MY_HEADER_H__
+#define __MY_HEADER_H__
+#include <stdio.h>
+
+#define MAX_SIZE 256
+
+typedef enum {
+    RED,
+    GREEN,
+    BLUE,
+} Color;
+
+typedef struct {
+    int x;
+    int y;
+} Point;
+
+int add(int a, int b);
+void process(const char *input, size_t len);
+
+#endif /* __MY_HEADER_H__ */
+]==]
+  for _, lang in ipairs({ "c", "cpp" }) do
+    local out = idx(src, lang)
+    has(out, {
+      "imports:",
+      "stdio.h",
+      "consts:",
+      "MAX_SIZE 256",
+      "types:",
+      "enum",
+      "RED",
+      "GREEN",
+      "BLUE",
+      "struct",
+      "int x",
+      "int y",
+      "fns:",
+      "int add(int a, int b)",
+      "void process(const char *input, size_t len)",
+    })
+  end
+end)
+
+case("c_single_include_pragma", function()
+  local src = [==[
+#pragma "once"
+#include <stdio.h>
+
+#define MAX_SIZE 256
+
+typedef enum {
+    RED,
+    GREEN,
+    BLUE,
+} Color;
+
+typedef struct {
+    int x;
+    int y;
+} Point;
+
+int add(int a, int b);
+void process(const char *input, size_t len);
+]==]
+  for _, lang in ipairs({ "c", "cpp" }) do
+    local out = idx(src, lang)
+    has(out, {
+      "imports:",
+      "stdio.h",
+      "consts:",
+      "MAX_SIZE 256",
+      "types:",
+      "enum",
+      "RED",
+      "GREEN",
+      "BLUE",
+      "struct",
+      "int x",
+      "int y",
+      "fns:",
+      "int add(int a, int b)",
+      "void process(const char *input, size_t len)",
+    })
+  end
 end)
 
 case("csharp_all_sections", function()

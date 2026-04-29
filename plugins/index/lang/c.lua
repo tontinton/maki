@@ -167,6 +167,66 @@ return function(U)
     return new_entry(SECTION.Function, node, sig)
   end
 
+  local function extract_from_children(node, source)
+    local entries = {}
+    for _, child in ipairs(node:children()) do
+      local extracted = extract_nodes(child, source, nil)
+      if extracted and #extracted > 0 then
+        for _, entry in ipairs(extracted) do
+          entries[#entries + 1] = entry
+        end
+      end
+    end
+    return entries
+  end
+
+  extract_nodes = function(node, source, _attrs)
+    local kind = node:type()
+
+    if kind == "preproc_include" then
+      local e = extract_include(node, source)
+      return e and { e } or {}
+    elseif kind == "preproc_def" then
+      local e = extract_define(node, source)
+      return e and { e } or {}
+    elseif kind == "preproc_function_def" then
+      local name_node = node:field("name")[1]
+      if not name_node then
+        return {}
+      end
+      local name = get_text(name_node, source)
+      local params_node = node:field("parameters")[1]
+      local params = params_node and get_text(params_node, source) or ""
+      return { new_entry(SECTION.Macro, node, name .. params) }
+    elseif kind == "function_definition" then
+      local sig = build_fn_sig(node, source)
+      return sig and { new_entry(SECTION.Function, node, sig) } or {}
+    elseif kind == "struct_specifier" then
+      return { extract_struct(node, source) }
+    elseif kind == "union_specifier" then
+      local e = extract_struct(node, source)
+      e.text = e.text:gsub("^struct", "union")
+      return { e }
+    elseif kind == "enum_specifier" then
+      return { extract_enum(node, source) }
+    elseif kind == "type_definition" then
+      local e = extract_typedef(node, source)
+      return e and { e } or {}
+    elseif kind == "declaration" then
+      local e = extract_declaration(node, source)
+      return e and { e } or {}
+    elseif
+      kind == "preproc_ifdef"
+      or kind == "preproc_if"
+      or kind == "linkage_specification"
+      or kind == "declaration_list"
+      or kind == "translation_unit"
+    then
+      return extract_from_children(node, source)
+    end
+    return {}
+  end
+
   return {
     import_separator = "/",
 
@@ -179,42 +239,6 @@ return function(U)
       return text:sub(1, 3) == "/**" or text:sub(1, 3) == "///"
     end,
 
-    extract_nodes = function(node, source, _attrs)
-      local kind = node:type()
-      if kind == "preproc_include" then
-        local e = extract_include(node, source)
-        return e and { e } or {}
-      elseif kind == "preproc_def" then
-        local e = extract_define(node, source)
-        return e and { e } or {}
-      elseif kind == "preproc_function_def" then
-        local name_node = node:field("name")[1]
-        if not name_node then
-          return {}
-        end
-        local name = get_text(name_node, source)
-        local params_node = node:field("parameters")[1]
-        local params = params_node and get_text(params_node, source) or ""
-        return { new_entry(SECTION.Macro, node, name .. params) }
-      elseif kind == "function_definition" then
-        local sig = build_fn_sig(node, source)
-        return sig and { new_entry(SECTION.Function, node, sig) } or {}
-      elseif kind == "struct_specifier" then
-        return { extract_struct(node, source) }
-      elseif kind == "union_specifier" then
-        local e = extract_struct(node, source)
-        e.text = e.text:gsub("^struct", "union")
-        return { e }
-      elseif kind == "enum_specifier" then
-        return { extract_enum(node, source) }
-      elseif kind == "type_definition" then
-        local e = extract_typedef(node, source)
-        return e and { e } or {}
-      elseif kind == "declaration" then
-        local e = extract_declaration(node, source)
-        return e and { e } or {}
-      end
-      return {}
-    end,
+    extract_nodes = extract_nodes,
   }
 end

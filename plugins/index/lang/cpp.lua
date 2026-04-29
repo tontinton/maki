@@ -159,6 +159,19 @@ return function(U)
     return {}
   end
 
+  local function extract_from_children(node, source)
+    local entries = {}
+    for _, child in ipairs(node:children()) do
+      local extracted = extract_nodes(child, source, nil)
+      if extracted and #extracted > 0 then
+        for _, entry in ipairs(extracted) do
+          entries[#entries + 1] = entry
+        end
+      end
+    end
+    return entries
+  end
+
   extract_nodes = function(node, source, _attrs)
     local kind = node:type()
 
@@ -252,6 +265,14 @@ return function(U)
       local ty_node = node:field("type")[1]
       local ty = ty_node and get_text(ty_node, source) or "_"
       return { new_entry(SECTION.Type, node, compact_ws("using " .. name .. " = " .. ty)) }
+    elseif
+      kind == "linkage_specification"
+      or kind == "preproc_ifdef"
+      or kind == "preproc_if"
+      or kind == "declaration_list"
+      or kind == "translation_unit"
+    then
+      return extract_from_children(node, source)
     end
 
     return {}
