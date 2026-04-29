@@ -7,37 +7,44 @@ group = "Getting Started"
 
 # Configuration
 
-Maki uses TOML config files in two places:
+Maki uses Lua config files in two places:
 
-- **Global**: `~/.config/maki/config.toml`
-- **Project**: `.maki/config.toml` (relative to your working directory)
+- **Global**: `~/.config/maki/init.lua`
+- **Project**: `.maki/init.lua` (relative to your working directory)
 
 Project settings win over global ones, field by field. Neither file needs to exist; everything has a default.
 
+All fields are optional. Unknown fields cause an immediate error with a helpful message.
+
 ## Example
 
-```toml
-[ui]
-splash_animation = true
-mouse_scroll_lines = 5
-
-[ui.tool_output_lines]
-bash = 8
-read = 5
-
-[agent]
-bash_timeout_secs = 180
-max_output_lines = 3000
-
-[provider]
-default_model = "anthropic/claude-sonnet-4-6"
-
-[storage]
-max_log_files = 5
-
-[index]
-max_file_size_mb = 4
+```lua
+maki.setup({
+    ui = {
+        splash_animation = true,
+        mouse_scroll_lines = 5,
+        tool_output_lines = {
+            bash = 8,
+            read = 5,
+        },
+    },
+    agent = {
+        bash_timeout_secs = 180,
+        max_output_lines = 3000,
+    },
+    provider = {
+        default_model = "anthropic/claude-sonnet-4-6",
+    },
+    storage = {
+        max_log_files = 5,
+    },
+    index = {
+        max_file_size_mb = 4,
+    },
+})
 ```
+
+`maki.setup()` can only be called once per init.lua.
 
 ## Full Reference
 
@@ -47,7 +54,7 @@ max_file_size_mb = 4
 |-------|------|---------|-------------|
 | `always_yolo` | bool | `false` | Start every session with YOLO mode (skip permission prompts, deny rules still apply) |
 
-### `[ui]`
+### `ui`
 
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
@@ -56,7 +63,7 @@ max_file_size_mb = 4
 | `typewriter_ms_per_char` | u64 | `4` | - | Typewriter effect speed (ms/char) |
 | `mouse_scroll_lines` | u32 | `3` | 1 | Lines per mouse wheel scroll |
 
-### `[ui.tool_output_lines]`
+### `ui.tool_output_lines`
 
 How many lines of output to show per tool in the UI. All values are `usize` with a minimum of 1.
 
@@ -72,7 +79,7 @@ How many lines of output to show per tool in the UI. All values are `usize` with
 | `web` | 3 |
 | `other` | 3 |
 
-### `[agent]`
+### `agent`
 
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
@@ -87,7 +94,7 @@ How many lines of output to show per tool in the UI. All values are `usize` with
 | `search_result_limit` | usize | `100` | 10 | Max results from grep/glob searches |
 | `interpreter_max_memory_mb` | usize | `50` | 10 | Memory limit for code interpreter (MB) |
 
-### `[provider]`
+### `provider`
 
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
@@ -96,7 +103,7 @@ How many lines of output to show per tool in the UI. All values are `usize` with
 | `low_speed_timeout_secs` | u64 | `30` | 1 | Low speed timeout (seconds with less than 1 byte received) |
 | `stream_timeout_secs` | u64 | `300` | 10 | Streaming response timeout (seconds) |
 
-### `[storage]`
+### `storage`
 
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
@@ -104,15 +111,38 @@ How many lines of output to show per tool in the UI. All values are `usize` with
 | `max_log_files` | u32 | `10` | 1 | Max number of log files to keep |
 | `input_history_size` | usize | `100` | 10 | Number of input history entries to retain |
 
-### `[index]`
+### `index`
 
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
 | `max_file_size_mb` | u64 | `2` | 1 | Max file size for indexing (MB) |
 
+## Tools
+
+The `tools` table controls which tools are loaded. By default, `index`, `webfetch`, and `websearch` are enabled. `bash` is available but disabled by default.
+
+```lua
+maki.setup({
+    tools = {
+        bash = { enabled = true },
+        websearch = { enabled = false },
+    },
+})
+```
+
 ## Validation
 
-Numeric fields are validated against their minimums on load. A value below the minimum raises a `ConfigError` with the section, field, value, and minimum. Invalid TOML logs a warning and falls back to defaults.
+Numeric fields are validated against their minimums on load. A value below the minimum raises a `ConfigError` with the section, field, value, and minimum. Invalid config logs a warning and falls back to defaults.
+
+## Migrating from config.toml
+
+If you are upgrading from a version that used `config.toml`:
+
+1. Rename `~/.config/maki/config.toml` to `~/.config/maki/init.lua`
+2. Rename `.maki/config.toml` to `.maki/init.lua`
+3. Wrap your settings in `maki.setup({ ... })`
+4. Move any `[mcp.*]` sections to `mcp.toml` (see [MCP](/docs/mcp/))
+5. Permissions stay in `permissions.toml`, nothing changes there
 
 ## Personal Instructions
 

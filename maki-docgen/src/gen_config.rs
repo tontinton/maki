@@ -44,8 +44,16 @@ fn has_any_min(fields: &[ConfigField]) -> bool {
     fields.iter().any(|f| f.min.is_some())
 }
 
+fn lua_section_name(heading: &str) -> String {
+    heading
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_string()
+}
+
 fn write_section(out: &mut String, heading: &str, fields: &[ConfigField]) {
-    writeln!(out, "### `{heading}`\n").unwrap();
+    let lua_name = lua_section_name(heading);
+    writeln!(out, "### `{lua_name}`\n").unwrap();
     if has_any_min(fields) {
         write_table_with_min(out, fields);
     } else {
@@ -55,7 +63,7 @@ fn write_section(out: &mut String, heading: &str, fields: &[ConfigField]) {
 }
 
 fn write_tool_output_section(out: &mut String) {
-    writeln!(out, "### `[ui.tool_output_lines]`\n").unwrap();
+    writeln!(out, "### `ui.tool_output_lines`\n").unwrap();
     writeln!(
         out,
         "How many lines of output to show per tool in the UI. \
@@ -83,37 +91,44 @@ group = \"Getting Started\"
 
 # Configuration
 
-Maki uses TOML config files in two places:
+Maki uses Lua config files in two places:
 
-- **Global**: `~/.config/maki/config.toml`
-- **Project**: `.maki/config.toml` (relative to your working directory)
+- **Global**: `~/.config/maki/init.lua`
+- **Project**: `.maki/init.lua` (relative to your working directory)
 
 Project settings win over global ones, field by field. Neither file needs to exist; everything has a default.
 
+All fields are optional. Unknown fields cause an immediate error with a helpful message.
+
 ## Example
 
-```toml
-[ui]
-splash_animation = true
-mouse_scroll_lines = {mouse_scroll}
-
-[ui.tool_output_lines]
-bash = {tol_bash}
-read = {tol_read}
-
-[agent]
-bash_timeout_secs = {bash_timeout}
-max_output_lines = {max_output_lines}
-
-[provider]
-default_model = \"anthropic/claude-sonnet-4-6\"
-
-[storage]
-max_log_files = {max_log_files}
-
-[index]
-max_file_size_mb = {max_file_size}
+```lua
+maki.setup({{
+    ui = {{
+        splash_animation = true,
+        mouse_scroll_lines = {mouse_scroll},
+        tool_output_lines = {{
+            bash = {tol_bash},
+            read = {tol_read},
+        }},
+    }},
+    agent = {{
+        bash_timeout_secs = {bash_timeout},
+        max_output_lines = {max_output_lines},
+    }},
+    provider = {{
+        default_model = \"anthropic/claude-sonnet-4-6\",
+    }},
+    storage = {{
+        max_log_files = {max_log_files},
+    }},
+    index = {{
+        max_file_size_mb = {max_file_size},
+    }},
+}})
 ```
+
+`maki.setup()` can only be called once per init.lua.
 
 ## Full Reference
 ",
@@ -137,18 +152,50 @@ max_file_size_mb = {max_file_size}
     write_section(&mut out, "[storage]", StorageConfig::FIELDS);
     write_section(&mut out, "[index]", INDEX_FIELDS);
 
+    writeln!(out, "## Tools\n").unwrap();
+    writeln!(
+        out,
+        "The `tools` table controls which tools are loaded. \
+         By default, `index`, `webfetch`, and `websearch` are enabled. \
+         `bash` is available but disabled by default.\n"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "\
+```lua
+maki.setup({{
+    tools = {{
+        bash = {{ enabled = true }},
+        websearch = {{ enabled = false }},
+    }},
+}})
+```\n"
+    )
+    .unwrap();
+
     writeln!(out, "## Validation\n").unwrap();
     writeln!(
         out,
         "Numeric fields are validated against their minimums on load. \
          A value below the minimum raises a `ConfigError` with the section, field, value, \
-         and minimum. Invalid TOML logs a warning and falls back to defaults."
+         and minimum. Invalid config logs a warning and falls back to defaults."
     )
     .unwrap();
 
     writeln!(
         out,
         "
+## Migrating from config.toml
+
+If you are upgrading from a version that used `config.toml`:
+
+1. Rename `~/.config/maki/config.toml` to `~/.config/maki/init.lua`
+2. Rename `.maki/config.toml` to `.maki/init.lua`
+3. Wrap your settings in `maki.setup({{ ... }})`
+4. Move any `[mcp.*]` sections to `mcp.toml` (see [MCP](/docs/mcp/))
+5. Permissions stay in `permissions.toml`, nothing changes there
+
 ## Personal Instructions
 
 Beyond the shared `AGENTS.md`, Maki supports two files for your own instructions:

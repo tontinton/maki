@@ -1,27 +1,7 @@
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use maki_agent::tools::{ToolRegistry, ToolSource};
-use maki_config::PluginsConfig;
 use maki_lua::{PluginError, PluginHost};
-
-fn enabled_config() -> PluginsConfig {
-    PluginsConfig {
-        enabled: true,
-        builtins: vec![],
-        init_file: None,
-        experimental_bash_lua: false,
-    }
-}
-
-fn init_config(init_file: PathBuf) -> PluginsConfig {
-    PluginsConfig {
-        enabled: true,
-        builtins: vec![],
-        init_file: Some(init_file),
-        experimental_bash_lua: false,
-    }
-}
 
 fn fresh_registry() -> Arc<ToolRegistry> {
     Arc::new(ToolRegistry::new())
@@ -80,7 +60,7 @@ const FINISH_CALLED_TWICE_ERR: &str = "ctx:finish() already called";
 #[test]
 fn stdlib_globals_accessible() {
     let reg = fresh_registry();
-    let host = PluginHost::new(&enabled_config(), Arc::clone(&reg)).unwrap();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
 
     for global in &["os", "debug", "string", "table", "math"] {
         let source =
@@ -93,7 +73,7 @@ fn stdlib_globals_accessible() {
 #[test]
 fn dangerous_globals_blocked() {
     let reg = fresh_registry();
-    let host = PluginHost::new(&enabled_config(), Arc::clone(&reg)).unwrap();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
 
     for global in &["io", "package"] {
         let source =
@@ -106,7 +86,7 @@ fn dangerous_globals_blocked() {
 #[test]
 fn register_echo_tool() {
     let reg = fresh_registry();
-    let host = PluginHost::new(&enabled_config(), Arc::clone(&reg)).unwrap();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     host.load_source("echo_plugin", ECHO_PLUGIN).unwrap();
 
     let entry = reg.get("echo_").expect("echo_ tool not registered");
@@ -122,7 +102,7 @@ fn register_echo_tool() {
 #[test]
 fn unload_round_trip() {
     let reg = fresh_registry();
-    let host = PluginHost::new(&enabled_config(), Arc::clone(&reg)).unwrap();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
 
     host.load_source("unload_test", ECHO_PLUGIN).unwrap();
     assert!(reg.has("echo_"));
@@ -139,7 +119,7 @@ fn unload_round_trip() {
 #[test_case::test_case(EMPTY_AUD_SRC, "audiences" ; "empty_audiences")]
 fn registration_validation_rejects(fields: &str, expected_err: &str) {
     let reg = fresh_registry();
-    let host = PluginHost::new(&enabled_config(), Arc::clone(&reg)).unwrap();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let src = format!(
         r#"maki.api.register_tool({{
             {fields},
@@ -158,7 +138,7 @@ fn registration_validation_rejects(fields: &str, expected_err: &str) {
 #[test_case::test_case(NON_STRING_FIELD_SCHEMA, "count" ; "non_string_field")]
 fn permission_scope_invalid_rejected(schema: &str, scope_field: &str) {
     let reg = fresh_registry();
-    let host = PluginHost::new(&enabled_config(), Arc::clone(&reg)).unwrap();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
 
     let src = format!(
         r#"maki.api.register_tool({{
@@ -183,7 +163,7 @@ fn permission_scope_invalid_rejected(schema: &str, scope_field: &str) {
 #[test]
 fn permission_scope_valid_string_field_accepted() {
     let reg = fresh_registry();
-    let host = PluginHost::new(&enabled_config(), Arc::clone(&reg)).unwrap();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
 
     let src = format!(
         r#"maki.api.register_tool({{
@@ -201,7 +181,7 @@ fn permission_scope_valid_string_field_accepted() {
 #[test]
 fn interrupt_kills_infinite_loop_and_vm_recovers() {
     let reg = fresh_registry();
-    let host = PluginHost::new(&enabled_config(), Arc::clone(&reg)).unwrap();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
 
     let src = format!(
         r#"
@@ -239,7 +219,7 @@ maki.api.register_tool({{
 #[test]
 fn reload_same_plugin_replaces_tools() {
     let reg = fresh_registry();
-    let host = PluginHost::new(&enabled_config(), Arc::clone(&reg)).unwrap();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
 
     host.load_source("p1", ECHO_PLUGIN).unwrap();
     assert!(reg.has("echo_"));
@@ -252,7 +232,7 @@ fn reload_same_plugin_replaces_tools() {
 #[test]
 fn failed_load_leaves_no_tools() {
     let reg = fresh_registry();
-    let host = PluginHost::new(&enabled_config(), Arc::clone(&reg)).unwrap();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
 
     let src = format!(
         r#"
@@ -280,7 +260,7 @@ error("plugin blew up after register")
 #[test]
 fn is_error_propagated_as_error() {
     let reg = fresh_registry();
-    let host = PluginHost::new(&enabled_config(), Arc::clone(&reg)).unwrap();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
 
     let src = format!(
         r#"maki.api.register_tool({{
@@ -302,7 +282,7 @@ fn is_error_propagated_as_error() {
 #[test]
 fn handler_bad_return_type_is_error() {
     let reg = fresh_registry();
-    let host = PluginHost::new(&enabled_config(), Arc::clone(&reg)).unwrap();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let src = format!(
         r#"maki.api.register_tool({{
             name = "bad_ret_num",
@@ -321,7 +301,7 @@ fn handler_bad_return_type_is_error() {
 #[test]
 fn handler_nil_without_jobs_is_error() {
     let reg = fresh_registry();
-    let host = PluginHost::new(&enabled_config(), Arc::clone(&reg)).unwrap();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let src = r#"maki.api.register_tool({
         name = "nil_no_jobs",
         description = "returns nil without starting jobs",
@@ -337,7 +317,7 @@ fn handler_nil_without_jobs_is_error() {
 #[test]
 fn handler_lua_error_surfaces_as_tool_error() {
     let reg = fresh_registry();
-    let host = PluginHost::new(&enabled_config(), Arc::clone(&reg)).unwrap();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
 
     let src = format!(
         r#"maki.api.register_tool({{
@@ -357,7 +337,7 @@ fn handler_lua_error_surfaces_as_tool_error() {
 #[test]
 fn lua_tool_schema_rejects_bad_input() {
     let reg = fresh_registry();
-    let host = PluginHost::new(&enabled_config(), Arc::clone(&reg)).unwrap();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
 
     let src = r#"
 maki.api.register_tool({
@@ -421,9 +401,10 @@ greet.setup()
     )
     .unwrap();
 
-    let config = init_config(tmp.path().join("init.lua"));
+    let init_path = tmp.path().join("init.lua");
     let reg = fresh_registry();
-    let _host = PluginHost::new(&config, Arc::clone(&reg)).unwrap();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_plugin_file(&init_path).unwrap();
 
     assert!(reg.has("greet"));
     assert_eq!(reg.names().len(), 1);
@@ -447,9 +428,10 @@ assert(a == b, "require should return cached module")
     )
     .unwrap();
 
-    let config = init_config(tmp.path().join("init.lua"));
+    let init_path = tmp.path().join("init.lua");
     let reg = fresh_registry();
-    let _host = PluginHost::new(&config, Arc::clone(&reg)).unwrap();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_plugin_file(&init_path).unwrap();
 }
 
 #[test]
@@ -460,10 +442,12 @@ fn require_sandbox_escape_blocked() {
 
     std::fs::write(tmp.path().join("init.lua"), "require(\"../../escape\")\n").unwrap();
 
-    let config = init_config(tmp.path().join("init.lua"));
+    let init_path = tmp.path().join("init.lua");
     let reg = fresh_registry();
-    let result = PluginHost::new(&config, Arc::clone(&reg));
-    let err = result.err().expect("expected sandbox error");
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let err = host
+        .load_plugin_file(&init_path)
+        .expect_err("expected sandbox error");
     assert!(matches!(err, PluginError::Lua { .. }));
     let msg = err.to_string();
     assert!(
@@ -503,9 +487,10 @@ assert(b2.name == "b", "cached value should have name='b'")
     )
     .unwrap();
 
-    let config = init_config(tmp.path().join("init.lua"));
+    let init_path = tmp.path().join("init.lua");
     let reg = fresh_registry();
-    let _host = PluginHost::new(&config, Arc::clone(&reg)).unwrap();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_plugin_file(&init_path).unwrap();
 }
 
 #[test]
@@ -516,10 +501,12 @@ fn require_nonexistent_module_errors() {
 
     std::fs::write(tmp.path().join("init.lua"), "require(\"nonexistent\")\n").unwrap();
 
-    let config = init_config(tmp.path().join("init.lua"));
+    let init_path = tmp.path().join("init.lua");
     let reg = fresh_registry();
-    let result = PluginHost::new(&config, Arc::clone(&reg));
-    let err = result.err().expect("expected error for missing module");
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let err = host
+        .load_plugin_file(&init_path)
+        .expect_err("expected error for missing module");
     assert!(matches!(err, PluginError::Lua { .. }));
     assert!(err.to_string().contains("nonexistent"), "got: {err}");
 }
@@ -551,15 +538,16 @@ assert(g.ok == true)
     )
     .unwrap();
 
-    let config = init_config(tmp.path().join("init.lua"));
+    let init_path = tmp.path().join("init.lua");
     let reg = fresh_registry();
-    let _host = PluginHost::new(&config, Arc::clone(&reg)).unwrap();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_plugin_file(&init_path).unwrap();
 }
 
 #[test]
 fn multi_tool_plugin_registers_and_unloads_all() {
     let reg = fresh_registry();
-    let host = PluginHost::new(&enabled_config(), Arc::clone(&reg)).unwrap();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
 
     let src = format!(
         r#"
@@ -590,7 +578,7 @@ maki.api.register_tool({{
 #[test]
 fn conflict_from_different_plugin_preserves_original() {
     let reg = fresh_registry();
-    let host = PluginHost::new(&enabled_config(), Arc::clone(&reg)).unwrap();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
 
     let src = format!(
         r#"maki.api.register_tool({{
@@ -615,7 +603,7 @@ fn conflict_from_different_plugin_preserves_original() {
 #[test]
 fn ctx_finish_called_twice_is_error() {
     let reg = fresh_registry();
-    let host = PluginHost::new(&enabled_config(), Arc::clone(&reg)).unwrap();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let src = format!(
         r#"maki.api.register_tool({{
             name = "double_finish",
@@ -636,7 +624,7 @@ fn ctx_finish_called_twice_is_error() {
 #[test]
 fn ctx_finish_with_is_error_propagates() {
     let reg = fresh_registry();
-    let host = PluginHost::new(&enabled_config(), Arc::clone(&reg)).unwrap();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let src = format!(
         r#"maki.api.register_tool({{
             name = "finish_err",
@@ -656,7 +644,7 @@ fn ctx_finish_with_is_error_propagates() {
 #[test]
 fn async_job_on_exit_receives_exit_code() {
     let reg = fresh_registry();
-    let host = PluginHost::new(&enabled_config(), Arc::clone(&reg)).unwrap();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let src = format!(
         r#"maki.api.register_tool({{
             name = "job_exit_code",
@@ -680,7 +668,7 @@ fn async_job_on_exit_receives_exit_code() {
 #[test]
 fn async_job_exits_without_finish_is_error() {
     let reg = fresh_registry();
-    let host = PluginHost::new(&enabled_config(), Arc::clone(&reg)).unwrap();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let src = format!(
         r#"maki.api.register_tool({{
             name = "job_no_finish",
@@ -702,7 +690,7 @@ fn async_job_exits_without_finish_is_error() {
 #[test]
 fn async_job_callback_error_surfaces() {
     let reg = fresh_registry();
-    let host = PluginHost::new(&enabled_config(), Arc::clone(&reg)).unwrap();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let src = format!(
         r#"maki.api.register_tool({{
             name = "job_cb_err",
@@ -726,7 +714,7 @@ fn async_job_callback_error_surfaces() {
 #[test]
 fn jobstop_kills_running_job() {
     let reg = fresh_registry();
-    let host = PluginHost::new(&enabled_config(), Arc::clone(&reg)).unwrap();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let src = format!(
         r#"maki.api.register_tool({{
             name = "job_stop",
@@ -751,7 +739,7 @@ fn jobstop_kills_running_job() {
 #[test]
 fn vm_recovers_after_async_job_tool() {
     let reg = fresh_registry();
-    let host = PluginHost::new(&enabled_config(), Arc::clone(&reg)).unwrap();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let src = format!(
         r#"
 maki.api.register_tool({{
@@ -779,4 +767,147 @@ maki.api.register_tool({{
     assert_eq!(out1, "ok1");
     let out2 = exec_tool(&reg, "sync_after", serde_json::json!({})).unwrap();
     assert_eq!(out2, "ok2");
+}
+
+const ALREADY_CALLED_ERR: &str = "already called";
+const UNKNOWN_FIELD_ERR: &str = "unknown field";
+
+#[test]
+fn setup_happy_path() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let raw = host
+        .send_run_init_lua(
+            "maki.setup({ agent = { bash_timeout_secs = 120 } })".to_owned(),
+            "test_init.lua".to_owned(),
+            None,
+        )
+        .unwrap();
+    let raw = raw.expect("expected Some(RawConfig)");
+    assert_eq!(raw.agent.bash_timeout_secs, Some(120));
+}
+
+#[test_case::test_case(
+    "maki.setup({ ui = { splash_animaton = false } })",
+    UNKNOWN_FIELD_ERR
+    ; "unknown_field"
+)]
+#[test_case::test_case(
+    r#"maki.setup({ agent = { bash_timeout_secs = "not a number" } })"#,
+    ""
+    ; "wrong_type"
+)]
+fn setup_rejects_bad_input(lua_src: &str, expected_substr: &str) {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let err = host
+        .send_run_init_lua(lua_src.to_owned(), "test_init.lua".to_owned(), None)
+        .expect_err("expected error");
+    assert!(matches!(err, PluginError::Lua { .. }), "got: {err}");
+    if !expected_substr.is_empty() {
+        assert!(err.to_string().contains(expected_substr), "got: {err}");
+    }
+}
+
+#[test]
+fn setup_double_call_error() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let err = host
+        .send_run_init_lua(
+            "maki.setup({})\nmaki.setup({})".to_owned(),
+            "test_init.lua".to_owned(),
+            None,
+        )
+        .expect_err("expected error for double setup");
+    assert!(err.to_string().contains(ALREADY_CALLED_ERR), "got: {err}");
+}
+
+#[test]
+fn setup_not_called_returns_none() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let raw = host
+        .send_run_init_lua(
+            "-- no setup call".to_owned(),
+            "test_init.lua".to_owned(),
+            None,
+        )
+        .unwrap();
+    assert!(raw.is_none());
+}
+
+#[test]
+fn setup_tools_section() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let raw = host
+        .send_run_init_lua(
+            "maki.setup({ tools = { websearch = { enabled = false }, bash = { enabled = true } } })"
+                .to_owned(),
+            "test_init.lua".to_owned(),
+            None,
+        )
+        .unwrap()
+        .expect("expected Some(RawConfig)");
+    assert_eq!(raw.tools["websearch"].enabled, Some(false));
+    assert_eq!(raw.tools["bash"].enabled, Some(true));
+}
+
+#[test]
+fn setup_all_sections_at_once() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let raw = host
+        .send_run_init_lua(
+            r#"maki.setup({
+                always_yolo = true,
+                ui = { splash_animation = false, mouse_scroll_lines = 5 },
+                agent = { bash_timeout_secs = 120, max_output_lines = 9000 },
+                provider = { default_model = "anthropic/claude-opus-4-6" },
+                storage = { max_log_files = 3 },
+                index = { max_file_size_mb = 8 },
+                tools = { bash = { enabled = true } },
+            })"#
+            .to_owned(),
+            "test_init.lua".to_owned(),
+            None,
+        )
+        .unwrap()
+        .expect("expected Some(RawConfig)");
+    assert_eq!(raw.always_yolo, Some(true));
+    assert_eq!(raw.ui.splash_animation, Some(false));
+    assert_eq!(raw.ui.mouse_scroll_lines, Some(5));
+    assert_eq!(raw.agent.bash_timeout_secs, Some(120));
+    assert_eq!(raw.agent.max_output_lines, Some(9000));
+    assert_eq!(
+        raw.provider.default_model.as_deref(),
+        Some("anthropic/claude-opus-4-6")
+    );
+    assert_eq!(raw.storage.max_log_files, Some(3));
+    assert_eq!(raw.index.max_file_size_mb, Some(8));
+    assert_eq!(raw.tools["bash"].enabled, Some(true));
+}
+
+#[test]
+fn setup_no_tool_registration_in_init_env() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let err = host
+        .send_run_init_lua(
+            r#"maki.register_tool({
+                name = "sneaky",
+                description = "should fail",
+                audiences = { "main" },
+                handler = function() return "nope" end
+            })"#
+            .to_owned(),
+            "test_init.lua".to_owned(),
+            None,
+        )
+        .expect_err("register_tool should not be available in init.lua env");
+    assert!(
+        matches!(err, PluginError::Lua { .. }),
+        "expected Lua error, got: {err}"
+    );
 }

@@ -8,7 +8,7 @@ use color_eyre::eyre::Context;
 use maki_agent::command::{self, CustomCommand};
 use maki_agent::skill::{self, Skill};
 use maki_agent::tools::ToolRegistry;
-use maki_config::load_config;
+use maki_config::{load_env_files, load_permissions};
 use maki_lua::PluginHost;
 use maki_providers::model::Model;
 use maki_storage::StateDir;
@@ -74,17 +74,24 @@ pub fn run(cli: Cli) -> Result<()> {
     maki_providers::tier_map::load_from_storage(&storage);
 
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
-    let mut config = load_config(&cwd, cli.no_rtk);
 
-    let timeouts = maki_providers::Timeouts {
-        connect: config.provider.connect_timeout,
-        low_speed: config.provider.low_speed_timeout,
-        stream: config.provider.stream_timeout,
+    load_env_files(&cwd);
+    warn_stale_config_toml(&cwd);
+
+    let mut plugin_host = if cli.no_plugins {
+        PluginHost::disabled()
+    } else {
+        PluginHost::new(Arc::clone(ToolRegistry::native_arc()))
+            .context("initialize lua plugin host")?
     };
 
-    if cli.no_plugins {
-        config.plugins.enabled = false;
-    }
+    let raw_config = plugin_host
+        .load_init_files(&cwd)
+        .context("load init.lua files")?;
+
+    let mut config = raw_config.unwrap_or_default().into_config(cli.no_rtk);
+    config.permissions = load_permissions(&cwd);
+
     if cli.yolo || config.always_yolo {
         config.permissions.allow_all = true;
     }
@@ -97,6 +104,16 @@ pub fn run(cli: Cli) -> Result<()> {
     }
     config.validate()?;
 
+    plugin_host
+        .load_builtins(&config.plugins)
+        .context("load builtin plugins")?;
+
+    let timeouts = maki_providers::Timeouts {
+        connect: config.provider.connect_timeout,
+        low_speed: config.provider.low_speed_timeout,
+        stream: config.provider.stream_timeout,
+    };
+
     let model = setup::resolve_model(cli.model.as_deref(), &config.provider, &storage)?;
 
     setup::init_logging(&storage, &config.storage);
@@ -104,9 +121,6 @@ pub fn run(cli: Cli) -> Result<()> {
 
     let skills = discover_skills(cli.no_skills);
     let commands = discover_commands(cli.no_commands);
-
-    let mut _plugin_host = PluginHost::new(&config.plugins, Arc::clone(ToolRegistry::native_arc()))
-        .context("initialize lua plugin host")?;
 
     if cli.print {
         crate::print::run(
@@ -151,7 +165,7 @@ pub fn run(cli: Cli) -> Result<()> {
                 )),
                 timeouts,
                 exit_on_done: cli.exit_on_done,
-                plugin_render_hints: _plugin_host.drain_render_hints(),
+                plugin_render_hints: plugin_host.drain_render_hints(),
                 #[cfg(feature = "demo")]
                 demo: cli.demo,
             },
@@ -166,4 +180,19 @@ pub fn run(cli: Cli) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn warn_stale_config_toml(cwd: &std::path::Path) {
+    let stale_paths = [
+        maki_config::global_config_dir().map(|d| d.join("config.toml")),
+        Some(cwd.join(".maki/config.toml")),
+    ];
+    for path in stale_paths.into_iter().flatten() {
+        if path.is_file() {
+            tracing::warn!(
+                path = %path.display(),
+                "config.toml found but no longer used. Migrate to init.lua. See https://maki.sh/docs/configuration/"
+            );
+        }
+    }
 }

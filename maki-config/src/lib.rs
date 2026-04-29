@@ -10,8 +10,6 @@ use thiserror::Error;
 use tracing::warn;
 
 const PROJECT_DIR: &str = ".maki";
-pub const PROJECT_CONFIG_FILE: &str = ".maki/config.toml";
-const CONFIG_FILE: &str = "config.toml";
 const PERMISSIONS_FILE: &str = "permissions.toml";
 
 pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 50 * 1024;
@@ -58,6 +56,8 @@ pub const MIN_MAX_FILE_SIZE_MB: u64 = 1;
 pub const MIN_CONNECT_TIMEOUT_SECS: u64 = 1;
 pub const MIN_LOW_SPEED_TIMEOUT_SECS: u64 = 1;
 pub const MIN_STREAM_TIMEOUT_SECS: u64 = 10;
+
+pub const DEFAULT_BUILTINS: &[&str] = &["index", "webfetch", "websearch"];
 
 #[derive(Debug, Clone, Copy)]
 pub enum ConfigValue {
@@ -131,79 +131,201 @@ fn check(
     Ok(())
 }
 
-#[derive(Deserialize, Default)]
-#[serde(default)]
-struct RawConfig {
-    always_yolo: Option<bool>,
+macro_rules! merge_option {
+    ($self:ident, $overlay:ident, $($field:ident),+) => {
+        $(if $overlay.$field.is_some() { $self.$field = $overlay.$field; })+
+    };
+}
+
+#[derive(Deserialize, Default, Debug)]
+#[serde(default, deny_unknown_fields)]
+pub struct RawConfig {
+    pub always_yolo: Option<bool>,
     #[serde(default)]
-    ui: UiFileConfig,
-    agent: AgentFileConfig,
-    provider: ProviderFileConfig,
-    storage: StorageFileConfig,
-    index: IndexFileConfig,
-    plugins: PluginsFileConfig,
+    pub ui: UiFileConfig,
+    pub agent: AgentFileConfig,
+    pub provider: ProviderFileConfig,
+    pub storage: StorageFileConfig,
+    pub index: IndexFileConfig,
+    pub tools: HashMap<String, ToolFileConfig>,
 }
 
-#[derive(Deserialize, Default)]
-#[serde(default)]
-struct UiFileConfig {
-    splash_animation: Option<bool>,
-    flash_duration_ms: Option<u64>,
-    typewriter_ms_per_char: Option<u64>,
-    mouse_scroll_lines: Option<u32>,
-    tool_output_lines: Option<ToolOutputLinesFile>,
+impl RawConfig {
+    pub fn merge(&mut self, overlay: RawConfig) {
+        merge_option!(self, overlay, always_yolo);
+        self.ui.merge(overlay.ui);
+        self.agent.merge(overlay.agent);
+        self.provider.merge(overlay.provider);
+        self.storage.merge(overlay.storage);
+        self.index.merge(overlay.index);
+        self.tools.extend(overlay.tools);
+    }
+
+    pub fn into_config(self, no_rtk: bool) -> Config {
+        Config {
+            always_yolo: self.always_yolo.unwrap_or(false),
+            ui: UiConfig::from_file(self.ui),
+            agent: AgentConfig::from_file(self.agent, no_rtk, &self.index),
+            provider: ProviderConfig::from_file(self.provider),
+            storage: StorageConfig::from_file(self.storage),
+            permissions: PermissionsConfig::default(),
+            plugins: PluginsConfig::from_tools(self.tools),
+        }
+    }
 }
 
-#[derive(Deserialize, Default)]
-#[serde(default)]
-struct ToolOutputLinesFile {
-    bash: Option<usize>,
-    code_execution: Option<usize>,
-    task: Option<usize>,
-    index: Option<usize>,
-    grep: Option<usize>,
-    read: Option<usize>,
-    write: Option<usize>,
-    web: Option<usize>,
-    other: Option<usize>,
+#[derive(Deserialize, Default, Debug)]
+#[serde(default, deny_unknown_fields)]
+pub struct ToolFileConfig {
+    pub enabled: Option<bool>,
 }
 
-#[derive(Deserialize, Default)]
-#[serde(default)]
-struct AgentFileConfig {
-    max_output_bytes: Option<usize>,
-    max_output_lines: Option<usize>,
-    max_response_bytes: Option<usize>,
-    max_line_bytes: Option<usize>,
-    bash_timeout_secs: Option<u64>,
-    code_execution_timeout_secs: Option<u64>,
-    max_continuation_turns: Option<u32>,
-    compaction_buffer: Option<u32>,
-    search_result_limit: Option<usize>,
-    interpreter_max_memory_mb: Option<usize>,
+#[derive(Deserialize, Default, Debug)]
+#[serde(default, deny_unknown_fields)]
+pub struct UiFileConfig {
+    pub splash_animation: Option<bool>,
+    pub flash_duration_ms: Option<u64>,
+    pub typewriter_ms_per_char: Option<u64>,
+    pub mouse_scroll_lines: Option<u32>,
+    pub tool_output_lines: Option<ToolOutputLinesFile>,
 }
 
-#[derive(Deserialize, Default)]
-#[serde(default)]
-struct ProviderFileConfig {
-    default_model: Option<String>,
-    connect_timeout_secs: Option<u64>,
-    low_speed_timeout_secs: Option<u64>,
-    stream_timeout_secs: Option<u64>,
+impl UiFileConfig {
+    fn merge(&mut self, overlay: UiFileConfig) {
+        merge_option!(
+            self,
+            overlay,
+            splash_animation,
+            flash_duration_ms,
+            typewriter_ms_per_char,
+            mouse_scroll_lines
+        );
+        match (self.tool_output_lines.as_mut(), overlay.tool_output_lines) {
+            (Some(base), Some(over)) => base.merge(over),
+            (None, Some(over)) => self.tool_output_lines = Some(over),
+            _ => {}
+        }
+    }
 }
 
-#[derive(Deserialize, Default)]
-#[serde(default)]
-struct StorageFileConfig {
-    max_log_bytes_mb: Option<u64>,
-    max_log_files: Option<u32>,
-    input_history_size: Option<usize>,
+#[derive(Deserialize, Default, Debug)]
+#[serde(default, deny_unknown_fields)]
+pub struct ToolOutputLinesFile {
+    pub bash: Option<usize>,
+    pub code_execution: Option<usize>,
+    pub task: Option<usize>,
+    pub index: Option<usize>,
+    pub grep: Option<usize>,
+    pub read: Option<usize>,
+    pub write: Option<usize>,
+    pub web: Option<usize>,
+    pub other: Option<usize>,
 }
 
-#[derive(Deserialize, Default)]
-#[serde(default)]
-struct IndexFileConfig {
-    max_file_size_mb: Option<u64>,
+impl ToolOutputLinesFile {
+    fn merge(&mut self, overlay: ToolOutputLinesFile) {
+        merge_option!(
+            self,
+            overlay,
+            bash,
+            code_execution,
+            task,
+            index,
+            grep,
+            read,
+            write,
+            web,
+            other
+        );
+    }
+}
+
+#[derive(Deserialize, Default, Debug)]
+#[serde(default, deny_unknown_fields)]
+pub struct AgentFileConfig {
+    pub max_output_bytes: Option<usize>,
+    pub max_output_lines: Option<usize>,
+    pub max_response_bytes: Option<usize>,
+    pub max_line_bytes: Option<usize>,
+    pub bash_timeout_secs: Option<u64>,
+    pub code_execution_timeout_secs: Option<u64>,
+    pub max_continuation_turns: Option<u32>,
+    pub compaction_buffer: Option<u32>,
+    pub search_result_limit: Option<usize>,
+    pub interpreter_max_memory_mb: Option<usize>,
+}
+
+impl AgentFileConfig {
+    fn merge(&mut self, overlay: AgentFileConfig) {
+        merge_option!(
+            self,
+            overlay,
+            max_output_bytes,
+            max_output_lines,
+            max_response_bytes,
+            max_line_bytes,
+            bash_timeout_secs,
+            code_execution_timeout_secs,
+            max_continuation_turns,
+            compaction_buffer,
+            search_result_limit,
+            interpreter_max_memory_mb
+        );
+    }
+}
+
+#[derive(Deserialize, Default, Debug)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProviderFileConfig {
+    pub default_model: Option<String>,
+    pub connect_timeout_secs: Option<u64>,
+    pub low_speed_timeout_secs: Option<u64>,
+    pub stream_timeout_secs: Option<u64>,
+}
+
+impl ProviderFileConfig {
+    fn merge(&mut self, overlay: ProviderFileConfig) {
+        merge_option!(
+            self,
+            overlay,
+            default_model,
+            connect_timeout_secs,
+            low_speed_timeout_secs,
+            stream_timeout_secs
+        );
+    }
+}
+
+#[derive(Deserialize, Default, Debug)]
+#[serde(default, deny_unknown_fields)]
+pub struct StorageFileConfig {
+    pub max_log_bytes_mb: Option<u64>,
+    pub max_log_files: Option<u32>,
+    pub input_history_size: Option<usize>,
+}
+
+impl StorageFileConfig {
+    fn merge(&mut self, overlay: StorageFileConfig) {
+        merge_option!(
+            self,
+            overlay,
+            max_log_bytes_mb,
+            max_log_files,
+            input_history_size
+        );
+    }
+}
+
+#[derive(Deserialize, Default, Debug)]
+#[serde(default, deny_unknown_fields)]
+pub struct IndexFileConfig {
+    pub max_file_size_mb: Option<u64>,
+}
+
+impl IndexFileConfig {
+    fn merge(&mut self, overlay: IndexFileConfig) {
+        merge_option!(self, overlay, max_file_size_mb);
+    }
 }
 
 #[derive(Default)]
@@ -601,50 +723,33 @@ impl StorageConfig {
     }
 }
 
-const DEFAULT_BUILTINS: &[&str] = &["index", "webfetch", "websearch"];
-
-#[derive(Deserialize, Default)]
-#[serde(default)]
-struct PluginsFileConfig {
-    enabled: Option<bool>,
-    builtins: Option<Vec<String>>,
-    init_file: Option<PathBuf>,
-    experimental_bash_lua: Option<bool>,
-}
-
 #[derive(Debug, Clone, Default)]
 pub struct PluginsConfig {
     pub enabled: bool,
-    pub builtins: Vec<String>,
-    pub init_file: Option<PathBuf>,
-    pub experimental_bash_lua: bool,
+    pub tools: Vec<String>,
 }
 
 impl PluginsConfig {
-    fn from_file(f: PluginsFileConfig) -> Self {
-        let enabled = f.enabled.unwrap_or(true);
-        let experimental_bash_lua = f.experimental_bash_lua.unwrap_or(false);
-        let init_file = f.init_file.or_else(|| {
-            for dir in config_search_dirs(global_dir().as_deref()).iter().rev() {
-                let path = dir.join("init.lua");
-                if path.is_file() {
-                    return Some(path);
-                }
-            }
-            None
-        });
-        let builtins_explicit = f.builtins.is_some();
-        let mut builtins = f
-            .builtins
-            .unwrap_or_else(|| DEFAULT_BUILTINS.iter().map(|s| (*s).to_string()).collect());
-        if experimental_bash_lua && !builtins_explicit {
-            builtins.push("bash".to_string());
-        }
+    pub fn from_tools(tools: HashMap<String, ToolFileConfig>) -> Self {
+        let mut all: Vec<String> = DEFAULT_BUILTINS
+            .iter()
+            .filter(|name| tools.get(**name).and_then(|t| t.enabled).unwrap_or(true))
+            .map(|s| s.to_string())
+            .collect();
+
+        let mut extra: Vec<&String> = tools
+            .iter()
+            .filter(|(name, cfg)| {
+                !DEFAULT_BUILTINS.contains(&name.as_str()) && cfg.enabled.unwrap_or(false)
+            })
+            .map(|(name, _)| name)
+            .collect();
+        extra.sort();
+        all.extend(extra.into_iter().cloned());
+
         Self {
-            enabled,
-            builtins,
-            init_file,
-            experimental_bash_lua,
+            enabled: true,
+            tools: all,
         }
     }
 }
@@ -746,40 +851,13 @@ fn collect_env_vars(path: &Path, vars: &mut HashMap<String, String>) {
     }
 }
 
-pub fn load_config(cwd: &Path, no_rtk: bool) -> Config {
-    let global_dirs = config_search_dirs(global_dir().as_deref());
-    load_config_inner(cwd, no_rtk, &global_dirs)
+pub fn load_env_files(cwd: &Path) {
+    load_env_files_with_global(cwd, global_dir().as_deref());
 }
 
-fn load_config_inner(cwd: &Path, no_rtk: bool, global_dirs: &[PathBuf]) -> Config {
-    load_env_files_with_global(cwd, global_dirs.first().map(|p| p.as_path()));
-
-    let mut base = toml::Table::new();
-    for dir in global_dirs {
-        if let Some(t) = read_table(&dir.join(CONFIG_FILE)) {
-            merge_tables(&mut base, t);
-        }
-    }
-    if let Some(t) = read_table(&cwd.join(PROJECT_DIR).join(CONFIG_FILE)) {
-        merge_tables(&mut base, t);
-    }
-    let raw: RawConfig = match toml::Value::Table(base).try_into() {
-        Ok(c) => c,
-        Err(e) => {
-            warn!(error = %e, "failed to deserialize config, using defaults");
-            RawConfig::default()
-        }
-    };
-
-    Config {
-        always_yolo: raw.always_yolo.unwrap_or(false),
-        ui: UiConfig::from_file(raw.ui),
-        agent: AgentConfig::from_file(raw.agent, no_rtk, &raw.index),
-        provider: ProviderConfig::from_file(raw.provider),
-        storage: StorageConfig::from_file(raw.storage),
-        permissions: load_permissions_inner(cwd, global_dirs),
-        plugins: PluginsConfig::from_file(raw.plugins),
-    }
+pub fn load_permissions(cwd: &Path) -> PermissionsConfig {
+    let global_dirs = config_search_dirs(global_dir().as_deref());
+    load_permissions_inner(cwd, &global_dirs)
 }
 
 fn load_permissions_inner(cwd: &Path, global_dirs: &[PathBuf]) -> PermissionsConfig {
@@ -807,37 +885,12 @@ fn read_permissions_file(path: &Path) -> Option<PermissionsFileConfig> {
     }
 }
 
-fn merge_tables(base: &mut toml::Table, overlay: toml::Table) {
-    for (k, v) in overlay {
-        match (base.get_mut(&k), v) {
-            (Some(toml::Value::Table(b)), toml::Value::Table(o)) => merge_tables(b, o),
-            (_, v) => {
-                base.insert(k, v);
-            }
-        }
-    }
+pub fn global_config_dir() -> Option<PathBuf> {
+    global_dir()
 }
 
-fn read_table(path: &Path) -> Option<toml::Table> {
-    let content = fs::read_to_string(path).ok()?;
-    match content.parse::<toml::Table>() {
-        Ok(t) => Some(t),
-        Err(e) => {
-            warn!(path = %path.display(), error = %e, "failed to parse config");
-            None
-        }
-    }
-}
-
-pub fn global_config_path() -> Option<PathBuf> {
-    let dirs = config_search_dirs(global_dir().as_deref());
-    for dir in dirs.iter().rev() {
-        let path = dir.join(CONFIG_FILE);
-        if path.is_file() {
-            return Some(path);
-        }
-    }
-    dirs.first().map(|d| d.join(CONFIG_FILE))
+pub fn global_config_dirs() -> Vec<PathBuf> {
+    config_search_dirs(global_dir().as_deref())
 }
 
 pub fn append_permission_rule(
@@ -974,8 +1027,7 @@ mod tests {
 
     #[test]
     fn empty_config_returns_defaults() {
-        let dir = TempDir::new().unwrap();
-        let config = load_config(dir.path(), false);
+        let config = RawConfig::default().into_config(false);
         assert!(config.ui.splash_animation);
         assert_eq!(config.agent.max_output_bytes, DEFAULT_MAX_OUTPUT_BYTES);
         assert_eq!(
@@ -990,85 +1042,51 @@ mod tests {
 
     #[test]
     fn partial_agent_config_preserves_unset_fields() {
-        let dir = TempDir::new().unwrap();
-        let maki_dir = dir.path().join(".maki");
-        fs::create_dir_all(&maki_dir).unwrap();
-        fs::write(
-            maki_dir.join("config.toml"),
-            "[agent]\nmax_output_lines = 5000\nbash_timeout_secs = 60\n",
-        )
-        .unwrap();
-        let config = load_config(dir.path(), false);
+        let raw = RawConfig {
+            agent: AgentFileConfig {
+                max_output_lines: Some(5000),
+                bash_timeout_secs: Some(60),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let config = raw.into_config(false);
         assert_eq!(config.agent.max_output_lines, 5000);
         assert_eq!(config.agent.bash_timeout_secs, 60);
         assert_eq!(config.agent.max_output_bytes, DEFAULT_MAX_OUTPUT_BYTES);
     }
 
     #[test]
-    fn project_overrides_global_field_by_field() {
-        let dir = TempDir::new().unwrap();
-        let global = global_config_dir(dir.path());
-        fs::create_dir_all(&global).unwrap();
-        fs::write(
-            global.join("config.toml"),
-            "[ui]\nsplash_animation = false\nflash_duration_ms = 2000\n\
-             [agent]\nmax_output_lines = 3000\nmax_line_bytes = 800\n",
-        )
-        .unwrap();
-        let maki_dir = dir.path().join(".maki");
-        fs::create_dir_all(&maki_dir).unwrap();
-        fs::write(
-            maki_dir.join("config.toml"),
-            "[agent]\nmax_output_lines = 5000\n",
-        )
-        .unwrap();
+    fn merge_overlay_wins_field_by_field() {
+        let mut base = RawConfig {
+            always_yolo: Some(false),
+            ui: UiFileConfig {
+                splash_animation: Some(false),
+                flash_duration_ms: Some(2000),
+                ..Default::default()
+            },
+            agent: AgentFileConfig {
+                max_output_lines: Some(3000),
+                max_line_bytes: Some(800),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let overlay = RawConfig {
+            always_yolo: Some(true),
+            agent: AgentFileConfig {
+                max_output_lines: Some(5000),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        base.merge(overlay);
 
-        let config = load_config_inner(dir.path(), false, &[global]);
-
-        assert!(!config.ui.splash_animation);
-        assert_eq!(config.ui.flash_duration_ms, 2000);
-        assert_eq!(config.agent.max_output_lines, 5000);
-        assert_eq!(config.agent.max_line_bytes, 800);
-    }
-
-    #[test]
-    fn invalid_toml_returns_defaults() {
-        let dir = TempDir::new().unwrap();
-        let maki_dir = dir.path().join(".maki");
-        fs::create_dir_all(&maki_dir).unwrap();
-        fs::write(maki_dir.join("config.toml"), "not valid {{{{ toml").unwrap();
-        let config = load_config(dir.path(), false);
-        assert!(config.ui.splash_animation);
-        assert_eq!(config.agent.max_output_bytes, DEFAULT_MAX_OUTPUT_BYTES);
-    }
-
-    #[test]
-    fn merge_tables_recursive() {
-        let mut base: toml::Table = toml::from_str("[a]\nx = 1\ny = 2").unwrap();
-        let overlay: toml::Table = toml::from_str("[a]\ny = 99\nz = 3").unwrap();
-        merge_tables(&mut base, overlay);
-        let a = base["a"].as_table().unwrap();
-        assert_eq!(a["x"].as_integer(), Some(1));
-        assert_eq!(a["y"].as_integer(), Some(99));
-        assert_eq!(a["z"].as_integer(), Some(3));
-    }
-
-    #[test]
-    fn agent_config_from_file_uses_provided_values() {
-        let dir = TempDir::new().unwrap();
-        let maki_dir = dir.path().join(".maki");
-        fs::create_dir_all(&maki_dir).unwrap();
-        fs::write(
-            maki_dir.join("config.toml"),
-            "[agent]\nmax_output_bytes = 100\nmax_output_lines = 200\nmax_response_bytes = 300\nmax_line_bytes = 400\n",
-        )
-        .unwrap();
-        let config = load_config(dir.path(), true);
-        assert_eq!(config.agent.max_output_bytes, 100);
-        assert_eq!(config.agent.max_output_lines, 200);
-        assert_eq!(config.agent.max_response_bytes, 300);
-        assert_eq!(config.agent.max_line_bytes, 400);
-        assert!(config.agent.no_rtk);
+        assert_eq!(base.always_yolo, Some(true), "overlay wins");
+        assert_eq!(base.agent.max_output_lines, Some(5000), "overlay wins");
+        assert_eq!(base.agent.max_line_bytes, Some(800), "base preserved");
+        assert_eq!(base.ui.splash_animation, Some(false), "base preserved");
+        assert_eq!(base.ui.flash_duration_ms, Some(2000), "base preserved");
     }
 
     #[test_case("max_output_bytes",  0 ; "zero_output_bytes")]
@@ -1092,45 +1110,24 @@ mod tests {
 
     #[test]
     fn tool_output_lines_per_tool_override() {
-        let dir = TempDir::new().unwrap();
-        let maki_dir = dir.path().join(".maki");
-        fs::create_dir_all(&maki_dir).unwrap();
-        fs::write(
-            maki_dir.join("config.toml"),
-            "[ui.tool_output_lines]\nbash = 20\nread = 20\n",
-        )
-        .unwrap();
-        let config = load_config(dir.path(), false);
+        let raw = RawConfig {
+            ui: UiFileConfig {
+                tool_output_lines: Some(ToolOutputLinesFile {
+                    bash: Some(20),
+                    read: Some(20),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let config = raw.into_config(false);
         assert_eq!(config.ui.tool_output_lines.bash, 20);
         assert_eq!(config.ui.tool_output_lines.read, 20);
         assert_eq!(
             config.ui.tool_output_lines.index,
             ToolOutputLines::DEFAULT.index
         );
-    }
-
-    #[test]
-    fn all_sections_load_together() {
-        let dir = TempDir::new().unwrap();
-        let maki_dir = dir.path().join(".maki");
-        fs::create_dir_all(&maki_dir).unwrap();
-        fs::write(
-            maki_dir.join("config.toml"),
-            "[provider]\ndefault_model = \"anthropic/claude-opus-4-6\"\nconnect_timeout_secs = 15\n\
-             [storage]\nmax_log_files = 5\n\
-             [index]\nmax_file_size_mb = 4\n\
-             [agent]\nbash_timeout_secs = 60\n",
-        )
-        .unwrap();
-        let config = load_config(dir.path(), false);
-        assert_eq!(
-            config.provider.default_model.as_deref(),
-            Some("anthropic/claude-opus-4-6")
-        );
-        assert_eq!(config.provider.connect_timeout, Duration::from_secs(15));
-        assert_eq!(config.storage.max_log_files, 5);
-        assert_eq!(config.agent.index_max_file_size, 4 * 1024 * 1024);
-        assert_eq!(config.agent.bash_timeout_secs, 60);
     }
 
     #[test_case("provider", "connect_timeout_secs", 0 ; "provider_zero_connect_timeout")]
@@ -1354,7 +1351,7 @@ mod tests {
             std::env::set_var(PROCESS_WINS, "process");
         }
 
-        let _config = load_config_inner(dir.path(), false, &[global]);
+        load_env_files_with_global(dir.path(), Some(&global));
 
         assert_eq!(std::env::var(GLOBAL_ONLY).unwrap(), "global");
         assert_eq!(std::env::var(PROJECT_SHADOWS).unwrap(), "project");
@@ -1368,35 +1365,219 @@ mod tests {
     }
 
     #[test]
-    fn plugins_config_parses_fields() {
-        let dir = TempDir::new().unwrap();
-        let maki_dir = dir.path().join(".maki");
-        fs::create_dir_all(&maki_dir).unwrap();
-        let init = maki_dir.join("init.lua");
-        fs::write(&init, "").unwrap();
-        fs::write(
-            maki_dir.join("config.toml"),
-            format!(
-                "[plugins]\nenabled = true\ninit_file = \"{}\"\n",
-                init.to_str().unwrap().replace('\\', "\\\\")
-            ),
-        )
-        .unwrap();
-        let config = load_config(dir.path(), false);
-        assert!(config.plugins.enabled);
-        assert_eq!(config.plugins.init_file, Some(init));
+    fn plugins_default_builtins_populated_when_enabled() {
+        let config = RawConfig::default().into_config(false);
+        assert!(
+            !config.plugins.tools.is_empty(),
+            "enabled plugins should have default builtins"
+        );
     }
 
     #[test]
-    fn plugins_default_builtins_populated_when_enabled() {
-        let dir = TempDir::new().unwrap();
-        let maki_dir = dir.path().join(".maki");
-        fs::create_dir_all(&maki_dir).unwrap();
-        fs::write(maki_dir.join("config.toml"), "[plugins]\nenabled = true\n").unwrap();
-        let config = load_config(dir.path(), false);
-        assert!(
-            !config.plugins.builtins.is_empty(),
-            "enabled plugins should have default builtins"
+    fn merge_tools_overlay_replaces_and_preserves() {
+        let mut base = RawConfig::default();
+        base.tools.insert(
+            "index".to_string(),
+            ToolFileConfig {
+                enabled: Some(true),
+            },
         );
+        base.tools.insert(
+            "websearch".to_string(),
+            ToolFileConfig {
+                enabled: Some(true),
+            },
+        );
+
+        let mut overlay = RawConfig::default();
+        overlay.tools.insert(
+            "websearch".to_string(),
+            ToolFileConfig {
+                enabled: Some(false),
+            },
+        );
+        overlay.tools.insert(
+            "bash".to_string(),
+            ToolFileConfig {
+                enabled: Some(true),
+            },
+        );
+
+        base.merge(overlay);
+        assert_eq!(
+            base.tools["index"].enabled,
+            Some(true),
+            "base-only key preserved"
+        );
+        assert_eq!(
+            base.tools["websearch"].enabled,
+            Some(false),
+            "overlay replaces"
+        );
+        assert_eq!(
+            base.tools["bash"].enabled,
+            Some(true),
+            "overlay-only key added"
+        );
+    }
+
+    #[test_case("[ui]\nsplash_animaton = true\n" ; "top_level_typo")]
+    #[test_case("agent = { bsh_timeout_secs = 60 }\n" ; "nested_section_typo")]
+    #[test_case("[tools.bash]\nenabled = true\ntypo_field = 42\n" ; "tool_config_typo")]
+    fn deny_unknown_fields_rejects(toml_str: &str) {
+        let result: Result<RawConfig, _> = toml::from_str(toml_str);
+        assert!(
+            result.is_err(),
+            "unknown field should be rejected: {toml_str}"
+        );
+    }
+
+    #[test]
+    fn deny_unknown_fields_accepts_valid_tools() {
+        const VALID: &str = "[tools.bash]\nenabled = true\n[tools.websearch]\nenabled = false\n";
+        let result: Result<RawConfig, _> = toml::from_str(VALID);
+        assert!(
+            result.is_ok(),
+            "valid tools section should parse: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn plugins_from_tools_default() {
+        let plugins = PluginsConfig::from_tools(HashMap::new());
+        let expected: Vec<String> = DEFAULT_BUILTINS.iter().map(|s| s.to_string()).collect();
+        assert_eq!(plugins.tools, expected);
+        assert!(plugins.enabled);
+    }
+
+    #[test]
+    fn plugins_from_tools_enable_disable_and_sort() {
+        let mut tools = HashMap::new();
+        tools.insert(
+            "websearch".to_string(),
+            ToolFileConfig {
+                enabled: Some(false),
+            },
+        );
+        tools.insert(
+            "bash".to_string(),
+            ToolFileConfig {
+                enabled: Some(true),
+            },
+        );
+        tools.insert(
+            "zeta".to_string(),
+            ToolFileConfig {
+                enabled: Some(true),
+            },
+        );
+        tools.insert(
+            "alpha".to_string(),
+            ToolFileConfig {
+                enabled: Some(true),
+            },
+        );
+        tools.insert("custom_tool".to_string(), ToolFileConfig { enabled: None });
+
+        let plugins = PluginsConfig::from_tools(tools);
+        assert!(
+            !plugins.tools.contains(&"websearch".to_string()),
+            "disabled builtin removed"
+        );
+        assert!(
+            plugins.tools.contains(&"index".to_string()),
+            "untouched builtin stays"
+        );
+        assert!(plugins.tools.contains(&"bash".to_string()), "extra enabled");
+        assert!(
+            !plugins.tools.contains(&"custom_tool".to_string()),
+            "enabled=None non-default ignored"
+        );
+
+        let extras: Vec<_> = plugins
+            .tools
+            .iter()
+            .filter(|t| !DEFAULT_BUILTINS.contains(&t.as_str()))
+            .cloned()
+            .collect();
+        assert_eq!(
+            extras,
+            vec!["alpha", "bash", "zeta"],
+            "extras sorted alphabetically"
+        );
+    }
+
+    #[test]
+    fn plugins_from_tools_all_builtins_disabled() {
+        let mut tools = HashMap::new();
+        for name in DEFAULT_BUILTINS {
+            tools.insert(
+                name.to_string(),
+                ToolFileConfig {
+                    enabled: Some(false),
+                },
+            );
+        }
+        let plugins = PluginsConfig::from_tools(tools);
+        assert!(plugins.tools.is_empty());
+        assert!(plugins.enabled);
+    }
+
+    #[test]
+    fn merge_tool_output_lines_field_level_overlay() {
+        let mut base = RawConfig {
+            ui: UiFileConfig {
+                tool_output_lines: Some(ToolOutputLinesFile {
+                    bash: Some(50),
+                    read: Some(30),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let overlay = RawConfig {
+            ui: UiFileConfig {
+                tool_output_lines: Some(ToolOutputLinesFile {
+                    bash: Some(100),
+                    grep: Some(15),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        base.merge(overlay);
+        let tol = base.ui.tool_output_lines.as_ref().unwrap();
+        assert_eq!(tol.bash, Some(100), "overlay wins");
+        assert_eq!(tol.read, Some(30), "base preserved");
+        assert_eq!(tol.grep, Some(15), "overlay added");
+    }
+
+    #[test]
+    fn into_config_tools_flow_to_plugins() {
+        let mut tools = HashMap::new();
+        tools.insert(
+            "bash".to_string(),
+            ToolFileConfig {
+                enabled: Some(true),
+            },
+        );
+        tools.insert(
+            "websearch".to_string(),
+            ToolFileConfig {
+                enabled: Some(false),
+            },
+        );
+        let raw = RawConfig {
+            tools,
+            ..Default::default()
+        };
+        let config = raw.into_config(false);
+
+        assert!(config.plugins.tools.contains(&"bash".to_string()));
+        assert!(!config.plugins.tools.contains(&"websearch".to_string()));
+        assert!(config.plugins.tools.contains(&"index".to_string()));
     }
 }

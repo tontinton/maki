@@ -7,14 +7,14 @@ group = "Reference"
 
 # Tools
 
-Maki ships with 17 built-in tools. This is the full reference.
+Maki ships with 18 built-in tools. This is the full reference.
 
 ## File Operations
 
-### `bash`
+### `bash` *(lua plugin)*
 
 Execute a bash command.
-Commands run in <cwd> by default.
+Commands run in
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|

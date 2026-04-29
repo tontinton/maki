@@ -5,6 +5,7 @@ pub(crate) mod fs;
 pub(crate) mod json;
 pub(crate) mod log;
 pub(crate) mod net;
+pub(crate) mod setup;
 pub(crate) mod text;
 pub(crate) mod tool;
 pub(crate) mod treesitter;

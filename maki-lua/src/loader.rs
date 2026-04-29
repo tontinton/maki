@@ -7,7 +7,7 @@ use std::time::Duration;
 use include_dir::{Dir, include_dir};
 use maki_agent::RawRenderHints;
 use maki_agent::tools::ToolRegistry;
-use maki_config::PluginsConfig;
+use maki_config::{PluginsConfig, RawConfig};
 
 use crate::error::PluginError;
 use crate::runtime::{self, LuaThread, Request};
@@ -77,21 +77,60 @@ impl Drop for PluginHost {
 }
 
 impl PluginHost {
-    pub fn new(config: &PluginsConfig, registry: Arc<ToolRegistry>) -> Result<Self, PluginError> {
-        if !config.enabled {
-            return Ok(Self {
-                inner: None,
-                render_hints: Vec::new(),
-            });
-        }
-
+    pub fn new(registry: Arc<ToolRegistry>) -> Result<Self, PluginError> {
         let lua = runtime::spawn(registry, *BUNDLED_DIRS)?;
-        let mut host = Self {
+        Ok(Self {
             inner: Some(lua),
             render_hints: Vec::new(),
-        };
+        })
+    }
 
-        for builtin in &config.builtins {
+    pub fn disabled() -> Self {
+        Self {
+            inner: None,
+            render_hints: Vec::new(),
+        }
+    }
+
+    pub fn load_init_files(&self, cwd: &Path) -> Result<Option<RawConfig>, PluginError> {
+        let mut merged: Option<RawConfig> = None;
+
+        for global_dir in maki_config::global_config_dirs() {
+            self.run_init_file(&global_dir.join("init.lua"), "global/init.lua", &mut merged)?;
+            if merged.is_some() {
+                break;
+            }
+        }
+        self.run_init_file(&cwd.join(".maki/init.lua"), "project/init.lua", &mut merged)?;
+
+        Ok(merged)
+    }
+
+    fn run_init_file(
+        &self,
+        path: &Path,
+        label: &str,
+        merged: &mut Option<RawConfig>,
+    ) -> Result<(), PluginError> {
+        if !path.is_file() {
+            return Ok(());
+        }
+        let source = fs::read_to_string(path).map_err(|e| PluginError::Io {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
+        let plugin_dir = path.parent().map(Path::to_path_buf);
+        if let Some(raw) = self.send_run_init_lua(source, label.to_owned(), plugin_dir)? {
+            match merged {
+                Some(existing) => existing.merge(raw),
+                None => *merged = Some(raw),
+            }
+        }
+        Ok(())
+    }
+
+    pub fn load_builtins(&mut self, config: &PluginsConfig) -> Result<(), PluginError> {
+        for builtin in &config.tools {
             let dir = match BUNDLED_PLUGINS.iter().find(|p| p.name == builtin.as_str()) {
                 Some(p) => &p.dir,
                 None => {
@@ -110,19 +149,9 @@ impl PluginHost {
                     source: mlua::Error::runtime("bundled plugin missing init.lua"),
                 })?;
             let name: Arc<str> = Arc::from(builtin.as_str());
-            host.load_source_named(name, init.to_owned(), None)?;
+            self.load_source_named(name, init.to_owned(), None)?;
         }
-
-        if let Some(ref init_path) = config.init_file {
-            let source = fs::read_to_string(init_path).map_err(|e| PluginError::Io {
-                path: init_path.clone(),
-                source: e,
-            })?;
-            let plugin_dir = init_path.parent().map(Path::to_path_buf);
-            host.load_source_named(Arc::from("user"), source, plugin_dir)?;
-        }
-
-        Ok(host)
+        Ok(())
     }
 
     fn tx(&self) -> Result<&flume::Sender<Request>, PluginError> {
@@ -143,6 +172,24 @@ impl PluginHost {
         tx.send(Request::LoadSource {
             name,
             source,
+            plugin_dir,
+            reply: reply_tx,
+        })
+        .map_err(|_| PluginError::HostDead)?;
+        reply_rx.recv().map_err(|_| PluginError::HostDead)?
+    }
+
+    pub fn send_run_init_lua(
+        &self,
+        source: String,
+        source_name: String,
+        plugin_dir: Option<PathBuf>,
+    ) -> Result<Option<RawConfig>, PluginError> {
+        let tx = self.tx()?;
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        tx.send(Request::RunInitLua {
+            source,
+            source_name,
             plugin_dir,
             reply: reply_tx,
         })
@@ -178,6 +225,16 @@ impl PluginHost {
         Ok(())
     }
 
+    pub fn load_plugin_file(&self, path: &Path) -> Result<(), PluginError> {
+        let source = fs::read_to_string(path).map_err(|e| PluginError::Io {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
+        let plugin_dir = path.parent().map(Path::to_path_buf);
+        self.send_load(Arc::from("user"), source, plugin_dir)?;
+        Ok(())
+    }
+
     pub fn drain_render_hints(&mut self) -> Vec<(Arc<str>, RawRenderHints)> {
         std::mem::take(&mut self.render_hints)
     }
@@ -187,19 +244,12 @@ impl PluginHost {
 mod tests {
     use super::*;
     use maki_agent::tools::ToolRegistry;
-    use maki_config::PluginsConfig;
 
     #[test]
-    fn new_with_disabled_config_is_noop() {
+    fn disabled_is_noop() {
         let reg = Arc::new(ToolRegistry::new());
         let names_before = reg.names();
-        let config = PluginsConfig {
-            enabled: false,
-            builtins: vec![],
-            init_file: None,
-            experimental_bash_lua: false,
-        };
-        let _host = PluginHost::new(&config, reg.clone()).unwrap();
+        let _host = PluginHost::disabled();
         assert_eq!(reg.names(), names_before);
     }
 }

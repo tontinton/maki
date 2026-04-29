@@ -109,9 +109,11 @@ To skip all prompts, toggle YOLO with the `/yolo` command, or run with `--yolo`.
 
 To start in YOLO mode every time:
 
-```toml
-# ~/.config/maki/config.toml
-always_yolo = true
+```lua
+-- ~/.config/maki/init.lua
+maki.setup({
+    always_yolo = true,
+})
 ```
 
 ## Bash Command Parsing

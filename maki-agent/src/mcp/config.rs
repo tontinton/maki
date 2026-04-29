@@ -13,8 +13,9 @@ use crate::tools::{
     GREP_TOOL_NAME, MEMORY_TOOL_NAME, MULTIEDIT_TOOL_NAME, QUESTION_TOOL_NAME, READ_TOOL_NAME,
     SKILL_TOOL_NAME, TASK_TOOL_NAME, TODOWRITE_TOOL_NAME, WRITE_TOOL_NAME,
 };
-use maki_config::{PROJECT_CONFIG_FILE, global_config_path};
+use maki_config::global_config_dir;
 
+const MCP_CONFIG_FILE: &str = "mcp.toml";
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 const MAX_TIMEOUT_MS: u64 = 300_000;
 
@@ -225,16 +226,17 @@ pub fn transport_kind(raw: &RawTransport) -> &'static str {
 pub fn load_config(cwd: &Path) -> McpConfig {
     let mut merged = McpConfig::default();
 
-    if let Some(global_path) = global_config_path()
-        && let Some(cfg) = read_config(&global_path)
-    {
-        for name in cfg.mcp.keys() {
-            merged.origins.insert(name.clone(), global_path.clone());
+    if let Some(global_dir) = global_config_dir() {
+        let global_path = global_dir.join(MCP_CONFIG_FILE);
+        if let Some(cfg) = read_config(&global_path) {
+            for name in cfg.mcp.keys() {
+                merged.origins.insert(name.clone(), global_path.clone());
+            }
+            merged.mcp.extend(cfg.mcp);
         }
-        merged.mcp.extend(cfg.mcp);
     }
 
-    let project_path = cwd.join(PROJECT_CONFIG_FILE);
+    let project_path = cwd.join(".maki").join(MCP_CONFIG_FILE);
     if let Some(cfg) = read_config(&project_path) {
         for name in cfg.mcp.keys() {
             merged.origins.insert(name.clone(), project_path.clone());
@@ -392,7 +394,7 @@ headers = { Authorization = "Bearer tok123" }
         let global_dir = dir.path().join("global");
         fs::create_dir_all(&global_dir).unwrap();
         fs::write(
-            global_dir.join("config.toml"),
+            global_dir.join("mcp.toml"),
             r#"[mcp.srv]
 command = ["global"]
 timeout = 5000
@@ -405,15 +407,15 @@ timeout = 5000
         let project_maki_dir = project_dir.join(".maki");
         fs::create_dir_all(&project_maki_dir).unwrap();
         fs::write(
-            project_maki_dir.join("config.toml"),
+            project_maki_dir.join("mcp.toml"),
             r#"[mcp.srv]
 command = ["project"]
 "#,
         )
         .unwrap();
 
-        let project_cfg = read_config(&project_maki_dir.join("config.toml")).unwrap();
-        let global_cfg = read_config(&global_dir.join("config.toml")).unwrap();
+        let project_cfg = read_config(&project_maki_dir.join("mcp.toml")).unwrap();
+        let global_cfg = read_config(&global_dir.join("mcp.toml")).unwrap();
 
         let mut merged = McpConfig::default();
         merged.mcp.extend(global_cfg.mcp);
@@ -436,7 +438,7 @@ command = ["project"]
     #[test]
     fn persist_enabled_round_trip() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
+        let path = dir.path().join("mcp.toml");
 
         persist_enabled(&path, "srv", false).unwrap();
         let doc: toml_edit::DocumentMut = fs::read_to_string(&path).unwrap().parse().unwrap();

@@ -14,11 +14,13 @@ use maki_agent::tools::{HeaderResult, RegistryError, Tool, ToolRegistry, ToolSou
 use mlua::{Function, Lua, LuaSerdeExt, RegistryKey, Value as LuaValue, VmState};
 use serde_json::Value;
 
+use maki_config::RawConfig;
+
 use crate::api::buf::{BufHandle, BufferStore};
 use crate::api::create_maki_global;
 use crate::api::ctx::{FinishPayload, LuaCtx};
 use crate::api::fn_api::{JobEvent, JobStore};
-
+use crate::api::setup::ConfigStore;
 use crate::api::tool::{LuaTool, PendingTool, PendingTools, ToolCallReply, coerce_tool_result};
 use crate::error::PluginError;
 
@@ -56,6 +58,12 @@ pub enum Request {
     ClearPlugin {
         plugin: Arc<str>,
         reply: flume::Sender<()>,
+    },
+    RunInitLua {
+        source: String,
+        source_name: String,
+        plugin_dir: Option<PathBuf>,
+        reply: flume::Sender<Result<Option<RawConfig>, PluginError>>,
     },
     Shutdown,
 }
@@ -239,12 +247,11 @@ impl LuaRuntime {
         }
     }
 
-    fn build_plugin_env(
+    fn build_env(
         &self,
-        plugin: Arc<str>,
+        maki: mlua::Table,
         require_root: Option<PathBuf>,
     ) -> Result<mlua::Table, mlua::Error> {
-        let maki = create_maki_global(&self.lua, Arc::clone(&self.pending), plugin)?;
         let env = self.lua.create_table()?;
         env.set("maki", maki)?;
 
@@ -371,9 +378,14 @@ impl LuaRuntime {
         self.discard_pending(stale);
 
         let require_root = plugin_dir.as_ref().map(|d| d.join("lua"));
+        let maki = create_maki_global(&self.lua, Arc::clone(&self.pending), Arc::clone(&name))
+            .map_err(|e| PluginError::Lua {
+                plugin: name.to_string(),
+                source: e,
+            })?;
 
         let env = self
-            .build_plugin_env(Arc::clone(&name), require_root)
+            .build_env(maki, require_root)
             .map_err(|e| PluginError::Lua {
                 plugin: name.to_string(),
                 source: e,
@@ -517,6 +529,53 @@ impl LuaRuntime {
                 HeaderResult::plain(tool.to_string())
             }
         }
+    }
+
+    fn run_init_lua(
+        &self,
+        source: &str,
+        source_name: &str,
+        plugin_dir: Option<PathBuf>,
+    ) -> Result<Option<RawConfig>, PluginError> {
+        let map_err = |e: mlua::Error| PluginError::Lua {
+            plugin: source_name.to_owned(),
+            source: e,
+        };
+
+        let config_store: ConfigStore = Arc::new(Mutex::new(None));
+        let require_root = plugin_dir.as_ref().map(|d| d.join("lua"));
+
+        let setup_fn = crate::api::setup::create_setup_fn(&self.lua, Arc::clone(&config_store))
+            .map_err(&map_err)?;
+        let maki = self.lua.create_table().map_err(&map_err)?;
+        maki.set("setup", setup_fn).map_err(&map_err)?;
+        maki.set(
+            "fs",
+            crate::api::fs::create_fs_table(&self.lua).map_err(&map_err)?,
+        )
+        .map_err(&map_err)?;
+        maki.set(
+            "json",
+            crate::api::json::create_json_table(&self.lua).map_err(&map_err)?,
+        )
+        .map_err(&map_err)?;
+        maki.set(
+            "uv",
+            crate::api::uv::create_uv_table(&self.lua).map_err(&map_err)?,
+        )
+        .map_err(&map_err)?;
+
+        let env = self.build_env(maki, require_root).map_err(&map_err)?;
+
+        self.lua
+            .load(source)
+            .set_name(source_name)
+            .set_environment(env)
+            .exec()
+            .map_err(&map_err)?;
+
+        let raw = config_store.lock().unwrap().take();
+        Ok(raw)
     }
 }
 
@@ -872,6 +931,18 @@ pub fn spawn(
                             reply,
                         } => {
                             let res = rt.compute_header(&plugin, &tool, input);
+                            let _ = reply.send(res);
+                        }
+                        Request::RunInitLua {
+                            source,
+                            source_name,
+                            plugin_dir,
+                            reply,
+                        } => {
+                            while inflight.get() > 0 {
+                                smol::future::yield_now().await;
+                            }
+                            let res = rt.run_init_lua(&source, &source_name, plugin_dir);
                             let _ = reply.send(res);
                         }
                     }

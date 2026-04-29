@@ -1,21 +1,11 @@
 use std::sync::Arc;
 
 use maki_agent::tools::ToolRegistry;
-use maki_config::PluginsConfig;
 use maki_lua::PluginHost;
-
-fn config() -> PluginsConfig {
-    PluginsConfig {
-        enabled: true,
-        builtins: vec![],
-        init_file: None,
-        experimental_bash_lua: false,
-    }
-}
 
 fn setup() -> (Arc<ToolRegistry>, PluginHost) {
     let reg = Arc::new(ToolRegistry::new());
-    let host = PluginHost::new(&config(), Arc::clone(&reg)).unwrap();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     (reg, host)
 }
 

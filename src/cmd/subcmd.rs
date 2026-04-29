@@ -7,7 +7,7 @@ use color_eyre::eyre::{Context, bail};
 
 use maki_agent::mcp::{config as mcp_config, oauth as mcp_oauth};
 use maki_agent::tools::ToolRegistry;
-use maki_config::load_config;
+use maki_config::{load_env_files, load_permissions};
 use maki_lua::PluginHost;
 use maki_providers::provider::fetch_all_models;
 use maki_providers::{copilot_auth, dynamic, openai_auth};
@@ -44,15 +44,26 @@ pub fn models() {
 
 pub fn index(path: &str, no_plugins: bool) -> Result<()> {
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
-    let mut config = load_config(&cwd, false);
-    if no_plugins {
-        config.plugins.enabled = false;
-    }
+    load_env_files(&cwd);
+
+    let mut host = if no_plugins {
+        PluginHost::disabled()
+    } else {
+        PluginHost::new(Arc::clone(ToolRegistry::native_arc()))
+            .context("initialize lua plugin host")?
+    };
+
+    let raw_config = host.load_init_files(&cwd).context("load init.lua files")?;
+
+    let mut config = raw_config.unwrap_or_default().into_config(false);
+    config.permissions = load_permissions(&cwd);
+
+    host.load_builtins(&config.plugins)
+        .context("load builtin plugins")?;
+
     let abs_path = Path::new(path)
         .canonicalize()
         .unwrap_or_else(|_| Path::new(path).to_path_buf());
-    let _plugin_host = PluginHost::new(&config.plugins, Arc::clone(ToolRegistry::native_arc()))
-        .context("initialize lua plugin host")?;
     let input = serde_json::json!({"path": abs_path.to_str().unwrap_or(path)});
     let reg = ToolRegistry::native_arc();
     let entry = reg

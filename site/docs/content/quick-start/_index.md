@@ -75,10 +75,13 @@ Type a prompt, press **Enter**, and the agent starts working.
 
 Set a default in your config:
 
-```toml
-# ~/.config/maki/config.toml
-[provider]
-default_model = "anthropic/claude-sonnet-4-6"
+```lua
+-- ~/.config/maki/init.lua
+maki.setup({
+    provider = {
+        default_model = "anthropic/claude-sonnet-4-6",
+    },
+})
 ```
 
 You can also switch models mid-session with the built-in model picker.
@@ -89,8 +92,9 @@ Add a `.maki/` directory to your project root for per-project settings:
 
 ```
 .maki/
-├── config.toml        # Overrides global config
-└── permissions.toml   # Permission rules
+├── init.lua           # Overrides global config
+├── permissions.toml   # Permission rules
+└── mcp.toml           # MCP server config
 AGENTS.md              # Loaded into agent context automatically
 AGENTS.local.md        # Personal per-project instructions (gitignored)
 ```

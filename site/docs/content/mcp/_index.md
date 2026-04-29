@@ -11,10 +11,10 @@ Maki connects to external tool servers over MCP. Both **stdio** and **HTTP** tra
 
 ## Configuration
 
-Add servers under `[mcp.*]` in your config:
+Add servers under `[mcp.*]` in your MCP config:
 
-- **Global**: `~/.config/maki/config.toml`
-- **Project**: `.maki/config.toml` (project config wins when both set a value)
+- **Global**: `~/.config/maki/mcp.toml`
+- **Project**: `.maki/mcp.toml` (project config wins when both set a value)
 
 ### Stdio
 
