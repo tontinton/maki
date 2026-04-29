@@ -16,8 +16,21 @@ const BATCH_SRC: &str = include_str!("../../plugins/batch/init.lua");
 
 /// Only the real ToolView emits this when collapsed.
 const EXPAND_HINT: &str = "click to expand";
-/// Fixed cap so truncation tests don't depend on the product default.
+/// Fixed caps so truncation tests don't depend on the product defaults. The
+/// index and read caps differ so a body rendered through the wrong view is
+/// visibly different.
 const VIEW_CAP: usize = 3;
+const INDEX_VIEW_CAP: usize = 2;
+const READ_VIEW_CAP: usize = 5;
+
+fn view_lines() -> ToolOutputLines {
+    ToolOutputLines {
+        other: VIEW_CAP,
+        index: INDEX_VIEW_CAP,
+        read: READ_VIEW_CAP,
+        ..ToolOutputLines::DEFAULT
+    }
+}
 
 const GREP_OUT: &str =
     "src/a.rs:\n  1: fn main() {}\n  2: fn helper() {}\n\nsrc/b.rs:\n  10: fn other() {}";
@@ -65,10 +78,7 @@ fn restore(
             output: output.to_owned(),
             input,
             is_error: false,
-            tool_output_lines: ToolOutputLines {
-                other: VIEW_CAP,
-                ..ToolOutputLines::DEFAULT
-            },
+            tool_output_lines: view_lines(),
             theme_gen: None,
             clicks,
             state,
@@ -245,5 +255,92 @@ fn multiedit_batch_child_shows_full_numbered_diff() {
     assert!(
         !text.contains("3 + n1"),
         "added lines get a blank gutter: {text}"
+    );
+}
+
+const INDEX_TOOL: &str = "index";
+const LIVE_TOOL_USE_ID: &str = "live_id";
+/// More than the index view cap, exactly the read view cap, so a listing
+/// rendered through the index view is visibly truncated.
+const DIR_ENTRIES: [&str; READ_VIEW_CAP] = ["a.txt", "b.txt", "c.txt", "d.txt", "e.txt"];
+const ENTRIES_SUFFIX: &str = " entries";
+
+struct Live {
+    body: String,
+    output: String,
+    annotation: Option<String>,
+}
+
+fn exec_live(host: &PluginHost, reg: &ToolRegistry, tool: &str, input: Value) -> Live {
+    let (tx, rx) = flume::unbounded();
+    let event_tx = maki_agent::EventSender::new(tx, 0);
+    let mut ctx = maki_agent::tools::test_support::stub_ctx_with(
+        &maki_agent::AgentMode::Build,
+        Some(&event_tx),
+        Some(LIVE_TOOL_USE_ID),
+    );
+    ctx.tool_output_lines = view_lines();
+    let inv = reg
+        .get(tool)
+        .unwrap_or_else(|| panic!("tool {tool} not registered"))
+        .tool
+        .parse(&input)
+        .expect("parse failed");
+    let result = smol::block_on(async { inv.execute(&ctx).await });
+    host.load_source("live_barrier", "").unwrap();
+    let mut body = String::new();
+    for env in rx.drain() {
+        if let AgentEvent::ToolSnapshot { snapshot, .. } = env.event {
+            body = snapshot.text();
+        }
+    }
+    let output = match result.output.expect("tool failed") {
+        maki_agent::ToolOutput::Plain(s) | maki_agent::ToolOutput::Markdown(s) => s.text,
+        other => panic!("unexpected output: {other:?}"),
+    };
+    Live {
+        body,
+        output,
+        annotation: result.annotation,
+    }
+}
+
+/// A directory has no skeleton, so index shows the plain listing. Restore must
+/// rebuild that same listing view instead of the index skeleton view, which
+/// would truncate to the index cap and highlight the entries as code.
+#[test]
+fn index_dir_renders_identically_live_and_restored() {
+    let dir = tempfile::tempdir().unwrap();
+    for name in DIR_ENTRIES {
+        std::fs::write(dir.path().join(name), "").unwrap();
+    }
+    let reg = Arc::new(ToolRegistry::new());
+    let host = PluginHost::with_all_builtins(Arc::clone(&reg)).unwrap();
+    let input = json!({ "path": dir.path().to_str().unwrap() });
+
+    let live = exec_live(&host, &reg, INDEX_TOOL, input.clone());
+    let restored = restore(&host, INDEX_TOOL, input, &live.output, None, Vec::new());
+
+    let expected_annotation = format!("{}{ENTRIES_SUFFIX}", DIR_ENTRIES.len());
+    assert_eq!(
+        live.annotation.as_deref(),
+        Some(expected_annotation.as_str()),
+        "live dir listing is annotated like read's"
+    );
+    for name in DIR_ENTRIES {
+        assert!(
+            live.body.contains(name),
+            "entry {name} missing: {}",
+            live.body
+        );
+    }
+    assert!(
+        !live.body.contains(EXPAND_HINT),
+        "listing fits the read view cap: {}",
+        live.body
+    );
+    assert_eq!(
+        restored.body, live.body,
+        "restored dir listing must match the live one"
     );
 }

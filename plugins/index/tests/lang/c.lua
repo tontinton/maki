@@ -2,8 +2,9 @@
 -- C-header constructs (typedefs, enums, includes, guards) work the same way
 -- under both `c` and `cpp`. C++-specific syntax lives in cpp.lua.
 
+local th = require("maki.test_helpers")
 local helpers = require("tests.helpers")
-local case = helpers.case
+local case = th.case
 local idx = helpers.idx
 local idx_with_meta = helpers.idx_with_meta
 local has = helpers.has

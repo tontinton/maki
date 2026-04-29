@@ -1,22 +1,11 @@
--- Shared helpers for the index plugin spec.
+-- Index-specific test helpers.
 --
--- Per-language spec files in tests/lang/<lang>.lua require this module to get
--- a consistent test vocabulary. `case` wraps each block in pcall so a single
--- failure does not abort the rest of the suite; failures are collected here
--- and surfaced by `report()` from tests/spec.lua at the end.
+-- Per-language spec files in tests/lang/<lang>.lua require this module for
+-- indexer-specific assertions (`idx`, `has`, `lacks`, etc.).
 
 local indexer = require("indexer")
 
 local M = {}
-
-local failures = {}
-
-function M.case(name, fn)
-  local ok, err = pcall(fn)
-  if not ok then
-    table.insert(failures, name .. ": " .. tostring(err))
-  end
-end
 
 function M.idx(source, lang)
   local result, err = indexer.index_source(source, lang)
@@ -97,12 +86,6 @@ function M.assert_fields_no_ranged_meta(text, meta, struct_needle, field_needles
     end
   end
   assert(struct_found, struct_needle .. " not found in output")
-end
-
-function M.report()
-  if #failures > 0 then
-    error(#failures .. " case(s) failed:\n\n" .. table.concat(failures, "\n\n"))
-  end
 end
 
 return M

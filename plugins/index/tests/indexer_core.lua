@@ -1,5 +1,6 @@
+local th = require("maki.test_helpers")
 local helpers = require("tests.helpers")
-local case = helpers.case
+local case = th.case
 local idx_with_meta = helpers.idx_with_meta
 
 local function meta_count(meta)

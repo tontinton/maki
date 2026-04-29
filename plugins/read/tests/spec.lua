@@ -35,55 +35,15 @@ local function split_lines(content)
   return lines
 end
 
-local function sort_dir_entries(entries, is_instruction_file)
-  local sorted = {}
-  for _, entry in ipairs(entries) do
-    local name, typ = entry[1], entry[2]
-    if typ == "directory" then
-      sorted[#sorted + 1] = { name .. "/", true }
-    elseif not is_instruction_file(name) then
-      sorted[#sorted + 1] = { name, false }
-    end
-  end
-  table.sort(sorted, function(a, b)
-    if a[2] ~= b[2] then
-      return a[2]
-    end
-    return a[1] < b[1]
-  end)
-  local names = {}
-  for _, e in ipairs(sorted) do
-    names[#names + 1] = e[1]
-  end
-  return names
-end
+local dir_listing = require("maki.dir_listing")
+local th = require("maki.test_helpers")
 
-local failures = {}
-
-local function case(name, fn)
-  local ok, err = pcall(fn)
-  if not ok then
-    table.insert(failures, name .. ": " .. tostring(err))
-  end
+local case = th.case
+local eq = th.eq
+local mktmpdir = function()
+  return th.mktmpdir("read_spec")
 end
-
-local function eq(actual, expected, msg)
-  if actual ~= expected then
-    error((msg or "") .. "\nexpected: " .. tostring(expected) .. "\n  actual: " .. tostring(actual))
-  end
-end
-
-local _tmpdir_counter = 0
-local function mktmpdir()
-  _tmpdir_counter = _tmpdir_counter + 1
-  local name = "/tmp/maki_read_spec_" .. tostring(os.clock()):gsub("%.", "") .. "_" .. _tmpdir_counter
-  maki.fs.mkdir(name)
-  return name
-end
-
-local function rmtree(dir)
-  maki.fs.rm(dir, { recursive = true })
-end
+local rmtree = th.rmtree
 
 -- line_nr_fmt: table-driven across all boundaries + alignment
 
@@ -161,41 +121,6 @@ case("split_lines", function()
   end
 end)
 
--- sort_dir_entries
-
-local function mock_is_instruction(name)
-  local set = { ["AGENTS.md"] = true, ["CLAUDE.md"] = true, ["COPILOT.md"] = true }
-  return set[name] or false
-end
-
-case("sort_dirs_first_alpha_within_group", function()
-  local entries = {
-    { "z", "directory" },
-    { "a", "directory" },
-    { "m.txt", "file" },
-    { "b.txt", "file" },
-  }
-  local names = sort_dir_entries(entries, mock_is_instruction)
-  eq(names[1], "a/")
-  eq(names[2], "z/")
-  eq(names[3], "b.txt")
-  eq(names[4], "m.txt")
-end)
-
-case("sort_hides_instruction_files_not_dirs", function()
-  local entries = {
-    { "AGENTS.md", "file" },
-    { "CLAUDE.md", "file" },
-    { "COPILOT.md", "file" },
-    { "AGENTS.md", "directory" },
-    { "main.rs", "file" },
-  }
-  local names = sort_dir_entries(entries, mock_is_instruction)
-  eq(#names, 2)
-  eq(names[1], "AGENTS.md/")
-  eq(names[2], "main.rs")
-end)
-
 -- integration: directory listing via real filesystem
 
 case("dir_listing_sort_and_filter", function()
@@ -203,20 +128,32 @@ case("dir_listing_sort_and_filter", function()
   maki.fs.write(maki.fs.joinpath(tmpdir, "c.txt"), "")
   maki.fs.write(maki.fs.joinpath(tmpdir, "a.txt"), "")
   maki.fs.write(maki.fs.joinpath(tmpdir, "AGENTS.md"), "instructions")
+  maki.fs.write(maki.fs.joinpath(tmpdir, "b.txt"), "")
+  maki.fs.write(maki.fs.joinpath(tmpdir, "m.txt"), "")
   maki.fs.mkdir(maki.fs.joinpath(tmpdir, "zdir"))
   maki.fs.mkdir(maki.fs.joinpath(tmpdir, "adir"))
+  maki.fs.mkdir(maki.fs.joinpath(tmpdir, "idir"))
 
-  local entries, err = maki.fs.dir(tmpdir)
+  local ctx = {
+    is_instruction_file = function(self, name)
+      local set = { ["AGENTS.md"] = true, ["CLAUDE.md"] = true, ["COPILOT.md"] = true }
+      return set[name] or false
+    end,
+    find_instructions = function()
+      return {}
+    end,
+  }
+  local listing, err = dir_listing.list(tmpdir, ctx)
   assert(err == nil, "dir listing should succeed: " .. tostring(err))
-  local names = sort_dir_entries(entries, mock_is_instruction)
-  eq(#names, 4)
-  eq(names[1], "adir/")
-  eq(names[2], "zdir/")
-  eq(names[3], "a.txt")
-  eq(names[4], "c.txt")
+  eq(#listing.names, 7)
+  eq(listing.names[1], "adir/")
+  eq(listing.names[2], "idir/")
+  eq(listing.names[3], "zdir/")
+  eq(listing.names[4], "a.txt")
+  eq(listing.names[5], "b.txt")
+  eq(listing.names[6], "c.txt")
+  eq(listing.names[7], "m.txt")
   rmtree(tmpdir)
 end)
 
-if #failures > 0 then
-  error(#failures .. " case(s) failed:\n\n" .. table.concat(failures, "\n\n"))
-end
+th.report()

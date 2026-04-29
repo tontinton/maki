@@ -1,3 +1,4 @@
+local dir_listing = require("maki.dir_listing")
 local ToolView = require("maki.tool_view")
 local shorten_path = require("maki.shorten_path")
 local output_limits = require("maki.output_limits")
@@ -98,17 +99,6 @@ local function build_file_view(lines, start_line, total_lines, path, ctx, prefix
   return buf
 end
 
-local function build_dir_view(text, ctx)
-  local buf = maki.ui.buf()
-  local view = ToolView.new(buf, read_view_opts(ctx))
-  view:append_text(text)
-  view:finish()
-  buf:on("click", function()
-    view:toggle()
-  end)
-  return buf
-end
-
 local function read_file(path, offset, limit, ctx)
   local content, err = maki.fs.read(path)
   if not content then
@@ -183,41 +173,18 @@ local function read_file(path, offset, limit, ctx)
 end
 
 local function list_dir(path, ctx)
-  local entries, err = maki.fs.dir(path)
-  if not entries then
+  local listing, err = dir_listing.list(path, ctx)
+  if not listing then
     return { llm_output = "read error: " .. tostring(err), is_error = true }
   end
 
-  local sorted = {}
-  for _, entry in ipairs(entries) do
-    local name, typ = entry[1], entry[2]
-    if typ == "directory" then
-      sorted[#sorted + 1] = { name .. "/", true }
-    elseif not ctx:is_instruction_file(name) then
-      sorted[#sorted + 1] = { name, false }
-    end
-  end
-  table.sort(sorted, function(a, b)
-    if a[2] ~= b[2] then
-      return a[2]
-    end
-    return a[1] < b[1]
-  end)
-
-  local names = {}
-  for _, e in ipairs(sorted) do
-    names[#names + 1] = e[1]
-  end
-  local text = table.concat(names, "\n")
-
-  local instructions = ctx:find_instructions(path)
   local result = {
-    llm_output = text,
-    body = build_dir_view(text, ctx),
-    annotation = #sorted .. " entries",
+    llm_output = listing.text,
+    body = dir_listing.view(listing.text, ctx),
+    annotation = listing.count .. " entries",
   }
-  if #instructions > 0 then
-    result.instructions = instructions
+  if listing.instructions then
+    result.instructions = listing.instructions
   end
   return result
 end

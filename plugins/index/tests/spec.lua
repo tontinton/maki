@@ -3,8 +3,55 @@
 -- Per-language cases live in tests/lang/<lang>.lua and run as side effects of
 -- require. Add a new language by creating tests/lang/<lang>.lua (use any
 -- existing file as a template) and adding a require line below — keep them
--- alphabetized. Each spec uses the shared `case` helper from tests/helpers.lua,
--- which collects failures so a single broken case does not abort the suite.
+-- alphabetized.
+
+local th = require("maki.test_helpers")
+local case = th.case
+local eq = th.eq
+local mktmpdir = function()
+  return th.mktmpdir("index_spec")
+end
+local rmtree = th.rmtree
+
+local dir_listing = require("maki.dir_listing")
+
+local function mock_ctx(path)
+  return {
+    is_instruction_file = function(self, name)
+      local set = { ["AGENTS.md"] = true, ["CLAUDE.md"] = true, ["COPILOT.md"] = true }
+      return set[name] or false
+    end,
+    find_instructions = function()
+      return {}
+    end,
+  }
+end
+
+-- integration: directory listing via real filesystem
+
+case("dir_listing_sort_and_filter", function()
+  local tmpdir = mktmpdir()
+  maki.fs.write(maki.fs.joinpath(tmpdir, "c.txt"), "")
+  maki.fs.write(maki.fs.joinpath(tmpdir, "a.txt"), "")
+  maki.fs.write(maki.fs.joinpath(tmpdir, "AGENTS.md"), "instructions")
+  maki.fs.write(maki.fs.joinpath(tmpdir, "b.txt"), "")
+  maki.fs.write(maki.fs.joinpath(tmpdir, "m.txt"), "")
+  maki.fs.mkdir(maki.fs.joinpath(tmpdir, "zdir"))
+  maki.fs.mkdir(maki.fs.joinpath(tmpdir, "adir"))
+  maki.fs.mkdir(maki.fs.joinpath(tmpdir, "idir"))
+
+  local listing, err = dir_listing.list(tmpdir, mock_ctx(tmpdir))
+  assert(err == nil, "dir listing should succeed: " .. tostring(err))
+  eq(#listing.names, 7)
+  eq(listing.names[1], "adir/")
+  eq(listing.names[2], "idir/")
+  eq(listing.names[3], "zdir/")
+  eq(listing.names[4], "a.txt")
+  eq(listing.names[5], "b.txt")
+  eq(listing.names[6], "c.txt")
+  eq(listing.names[7], "m.txt")
+  rmtree(tmpdir)
+end)
 require("tests.indexer_core")
 require("tests.lang.bash")
 require("tests.lang.bazel")
@@ -33,4 +80,4 @@ require("tests.lang.typescript")
 require("tests.lang.yaml")
 require("tests.lang.zig")
 
-require("tests.helpers").report()
+th.report()

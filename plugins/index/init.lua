@@ -1,3 +1,4 @@
+local dir_listing = require("maki.dir_listing")
 local indexer = require("indexer")
 local ToolView = require("maki.tool_view")
 local shorten_path = require("maki.shorten_path")
@@ -170,6 +171,10 @@ Return a compact overview of a source file: imports, type definitions, function 
     return render_header(input.path)
   end,
   restore = function(input, output, _is_error, ctx)
+    local meta = input.path and maki.fs.metadata(input.path)
+    if meta and meta.is_dir then
+      return { body = dir_listing.view(output, ctx) }
+    end
     local ext = input.path:match("%.([^%.]+)$") or ""
     local buf, header = render_index(output, input.path, ctx, ext)
     return { body = buf, header = header }
@@ -181,11 +186,23 @@ Return a compact overview of a source file: imports, type definitions, function 
     end
 
     local meta = maki.fs.metadata(path)
-    if meta and meta.is_dir then
-      return {
-        llm_output = "Path is a directory. Use index on files or use the read or glob tool to list directories.",
-        is_error = true,
+    if not meta then
+      return { llm_output = "error: path not found: " .. path, is_error = true }
+    end
+    if meta.is_dir then
+      local listing, err = dir_listing.list(path, ctx)
+      if not listing then
+        return { llm_output = "error: " .. tostring(err), is_error = true }
+      end
+      local output = {
+        llm_output = listing.text,
+        body = dir_listing.view(listing.text, ctx),
+        annotation = listing.count .. " entries",
       }
+      if listing.instructions then
+        output.instructions = listing.instructions
+      end
+      return output
     end
 
     local filename = path:match("([^/]+)$")

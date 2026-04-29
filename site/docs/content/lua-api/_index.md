@@ -4771,6 +4771,16 @@ end
 return M
 ```
 
+### `require("maki.dir_listing")`
+
+```lua
+-- Shared directory listing for index and read plugins.
+-- Lists entries, filters instruction files, sorts dirs before files, and
+-- renders the listing so every caller shows a directory the same way.
+function M.list(path, ctx)
+function M.view(text, ctx)
+```
+
 ### `require("maki.fuzzy_replace")`
 
 ```lua
@@ -4877,6 +4887,21 @@ local function shorten_path(path)
 end
 
 return shorten_path
+```
+
+### `require("maki.test_helpers")`
+
+```lua
+-- Shared test helpers for Lua plugin specs.
+--
+-- Provides a lightweight test harness: `case` wraps each block in pcall so a
+-- single failure does not abort the rest of the suite. Failures are collected
+-- and surfaced by `report()` at the end.
+function M.case(name, fn)
+function M.eq(actual, expected, msg)
+function M.mktmpdir(prefix)
+function M.rmtree(dir)
+function M.report()
 ```
 
 ### `require("maki.text_input")`
