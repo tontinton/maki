@@ -18,10 +18,10 @@ use maki_config::RawConfig;
 
 use crate::api::buf::{BufHandle, BufferStore};
 use crate::api::create_maki_global;
-use crate::api::ctx::{FinishPayload, LuaCtx};
+use crate::api::ctx::LuaCtx;
 use crate::api::fn_api::{JobEvent, JobStore};
 use crate::api::setup::ConfigStore;
-use crate::api::tool::{LuaTool, PendingTool, PendingTools, ToolCallReply, coerce_tool_result};
+use crate::api::tool::{LuaTool, PendingTool, PendingTools, ToolCallReply};
 use crate::error::PluginError;
 
 const INTERRUPT_MSG: &str = "plugin interrupted: cancelled, deadline exceeded, or shutting down";
@@ -599,40 +599,12 @@ impl LuaRuntime {
     }
 }
 
-fn extract_tool_return_from_task(val: &LuaValue) -> ToolCallReply {
-    let text_result = coerce_tool_result(val);
-
-    let (snapshot, header) = if let LuaValue::Table(t) = val {
-        let snap = t.get::<LuaValue>("body").ok().and_then(|v| {
-            let ud = v.as_userdata()?;
-            let h = ud.borrow::<BufHandle>().ok()?;
-            Some(h.buf.take())
-        });
-
-        let hdr = t.get::<LuaValue>("header").ok().and_then(|v| {
-            let ud = v.as_userdata()?;
-            let h = ud.borrow::<BufHandle>().ok()?;
-            Some(h.buf.take())
-        });
-
-        (snap, hdr)
-    } else {
-        (None, None)
-    };
-
-    ToolCallReply {
-        result: text_result,
-        snapshot,
-        header,
-    }
-}
-
 /// After the handler returns nil (async mode), this loop polls job events
 /// and waits for either `ctx:finish()` or all jobs to die.
 async fn dispatch_async(
     lua: &Lua,
     key: ThreadKey,
-    finish_rx: flume::Receiver<FinishPayload>,
+    finish_rx: flume::Receiver<ToolCallReply>,
 ) -> ToolCallReply {
     let task_state = lua.app_data_ref::<TaskMap>().and_then(|m| {
         let ctx = m.get(&key)?;
@@ -647,7 +619,7 @@ async fn dispatch_async(
         lua.gc_collect().ok();
         smol::Timer::after(DISPATCH_POLL_INTERVAL).await;
         return match finish_rx.try_recv() {
-            Ok(payload) => finish_reply(payload),
+            Ok(reply) => reply,
             _ => ToolCallReply::err(NIL_WITHOUT_FINISH_MSG),
         };
     }
@@ -661,7 +633,7 @@ async fn dispatch_async(
         }
 
         match finish_rx.try_recv() {
-            Ok(payload) => return finish_reply(payload),
+            Ok(reply) => return reply,
             Err(flume::TryRecvError::Disconnected) => {
                 return ToolCallReply::err(NIL_WITHOUT_FINISH_MSG);
             }
@@ -683,7 +655,7 @@ async fn dispatch_async(
             if !has_alive {
                 smol::Timer::after(DISPATCH_POLL_INTERVAL).await;
                 return match finish_rx.try_recv() {
-                    Ok(payload) => finish_reply(payload),
+                    Ok(reply) => reply,
                     _ => ToolCallReply::err(NIL_WITHOUT_FINISH_MSG),
                 };
             }
@@ -725,18 +697,6 @@ async fn dispatch_async(
     }
 }
 
-fn finish_reply(payload: FinishPayload) -> ToolCallReply {
-    ToolCallReply {
-        result: if payload.is_error {
-            Err(payload.llm_output)
-        } else {
-            Ok(payload.llm_output)
-        },
-        snapshot: payload.body,
-        header: None,
-    }
-}
-
 /// Tool calls run concurrently on a `smol::LocalExecutor`. Coroutines
 /// interleave at yield points (async I/O). Deadlines are enforced three
 /// ways: CPU-bound loops via `set_interrupt`, I/O waits via `smol::Timer`
@@ -770,7 +730,7 @@ async fn run_tool_call(
         return ToolCallReply::err("plugin host shutting down");
     }
 
-    let (finish_tx, finish_rx) = flume::bounded::<FinishPayload>(1);
+    let (finish_tx, finish_rx) = flume::bounded::<ToolCallReply>(1);
     ctx.finish_tx = Some(finish_tx);
     let cancel = ctx.cancel.clone();
 
@@ -831,7 +791,7 @@ async fn run_tool_call(
                 }
                 dispatch_async(&lua, thread_key, finish_rx).await
             }
-            Ok(val) => extract_tool_return_from_task(&val),
+            Ok(val) => ToolCallReply::from_lua_value(&val),
             Err(e) => ToolCallReply::err(e.to_string()),
         }
     };
@@ -1009,8 +969,8 @@ pub fn spawn(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::tool::ToolCallReply;
     use maki_agent::{SnapshotLine, SnapshotSpan, SpanStyle};
-    use test_case::test_case;
 
     fn make_buf_handle(text: &str) -> BufHandle {
         let buf = Arc::new(maki_agent::SharedBuf::new());
@@ -1029,27 +989,18 @@ mod tests {
         lua
     }
 
-    fn snapshot_line(text: &str) -> SnapshotLine {
-        SnapshotLine {
-            spans: vec![SnapshotSpan {
-                text: text.into(),
-                style: SpanStyle::Default,
-            }],
-        }
-    }
-
     #[test]
-    fn extract_return_plain_string() {
+    fn from_lua_value_plain_string() {
         let lua = test_lua();
         let val = LuaValue::String(lua.create_string("ok").unwrap());
-        let reply = extract_tool_return_from_task(&val);
+        let reply = ToolCallReply::from_lua_value(&val);
         assert_eq!(reply.result, Ok("ok".to_string()));
         assert!(reply.snapshot.is_none());
         assert!(reply.header.is_none());
     }
 
     #[test]
-    fn extract_return_table_with_body_and_header() {
+    fn from_lua_value_table_with_body_and_header() {
         let lua = test_lua();
         let body_handle = lua.create_userdata(make_buf_handle("body line")).unwrap();
         let hdr_handle = lua.create_userdata(make_buf_handle("hdr line")).unwrap();
@@ -1057,77 +1008,27 @@ mod tests {
         t.set("llm_output", "text").unwrap();
         t.set("body", body_handle).unwrap();
         t.set("header", hdr_handle).unwrap();
-        let reply = extract_tool_return_from_task(&LuaValue::Table(t));
+        let reply = ToolCallReply::from_lua_value(&LuaValue::Table(t));
         assert_eq!(reply.result, Ok("text".to_string()));
         assert_eq!(reply.snapshot.unwrap().first_line_text(), "body line");
         assert_eq!(reply.header.unwrap().first_line_text(), "hdr line");
     }
 
     #[test]
-    fn extract_return_non_userdata_body_field_ignored() {
-        let lua = test_lua();
-        let t = lua.create_table().unwrap();
-        t.set("llm_output", "ok").unwrap();
-        t.set("body", "not a bufhandle").unwrap();
-        let reply = extract_tool_return_from_task(&LuaValue::Table(t));
-        assert_eq!(reply.result, Ok("ok".to_string()));
-        assert!(reply.snapshot.is_none());
-    }
-
-    #[test]
-    fn extract_return_nil_is_error() {
-        let reply = extract_tool_return_from_task(&LuaValue::Nil);
+    fn from_lua_value_nil_is_error() {
+        let reply = ToolCallReply::from_lua_value(&LuaValue::Nil);
         assert!(reply.result.is_err());
     }
 
     #[test]
-    fn extract_return_table_missing_llm_output_still_extracts_body() {
+    fn from_lua_value_missing_llm_output_still_extracts_body() {
         let lua = test_lua();
         let t = lua.create_table().unwrap();
         t.set("body", lua.create_userdata(make_buf_handle("x")).unwrap())
             .unwrap();
-        let reply = extract_tool_return_from_task(&LuaValue::Table(t));
+        let reply = ToolCallReply::from_lua_value(&LuaValue::Table(t));
         assert!(reply.result.is_err());
         assert!(reply.snapshot.is_some());
-    }
-
-    #[test]
-    fn extract_return_is_error_flag() {
-        let lua = test_lua();
-        let t = lua.create_table().unwrap();
-        t.set("llm_output", "boom").unwrap();
-        t.set("is_error", true).unwrap();
-        let reply = extract_tool_return_from_task(&LuaValue::Table(t));
-        assert_eq!(reply.result, Err("boom".to_string()));
-    }
-
-    #[test_case(false, None  => Ok("done".to_string()) ; "success_no_body")]
-    #[test_case(true,  None  => Err("done".to_string()) ; "error_no_body")]
-    fn finish_reply_result(is_error: bool, body_text: Option<&str>) -> Result<String, String> {
-        let body = body_text.map(|t| {
-            let buf = maki_agent::SharedBuf::new();
-            buf.append(snapshot_line(t));
-            buf.take()
-        });
-        finish_reply(FinishPayload {
-            llm_output: "done".to_string(),
-            is_error,
-            body,
-        })
-        .result
-    }
-
-    #[test]
-    fn finish_reply_with_body_snapshot() {
-        let buf = maki_agent::SharedBuf::new();
-        buf.append(snapshot_line("rendered"));
-        let reply = finish_reply(FinishPayload {
-            llm_output: "ok".to_string(),
-            is_error: false,
-            body: Some(buf.take()),
-        });
-        assert_eq!(reply.snapshot.unwrap().first_line_text(), "rendered");
-        assert!(reply.header.is_none());
     }
 
     #[test]

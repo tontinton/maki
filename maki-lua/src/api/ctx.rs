@@ -1,24 +1,16 @@
 use maki_agent::AgentEvent;
-use maki_agent::BufferSnapshot;
 use maki_agent::cancel::CancelToken;
 use maki_config::{AgentConfig, ToolOutputLines};
 use mlua::{LuaSerdeExt, UserData, UserDataMethods, Value as LuaValue};
 
-use crate::api::buf::BufHandle;
-use crate::api::tool::coerce_tool_result;
+use crate::api::tool::ToolCallReply;
 use crate::runtime::LiveCtx;
-
-pub(crate) struct FinishPayload {
-    pub llm_output: String,
-    pub is_error: bool,
-    pub body: Option<BufferSnapshot>,
-}
 
 pub(crate) struct LuaCtx {
     pub(crate) cancel: CancelToken,
     pub(crate) config: AgentConfig,
     pub(crate) tool_output_lines: ToolOutputLines,
-    pub(crate) finish_tx: Option<flume::Sender<FinishPayload>>,
+    pub(crate) finish_tx: Option<flume::Sender<ToolCallReply>>,
     pub(crate) live: Option<LiveCtx>,
 }
 
@@ -48,28 +40,7 @@ impl UserData for LuaCtx {
                 .take()
                 .ok_or_else(|| mlua::Error::runtime("ctx:finish() already called"))?;
 
-            let (result, body) = match &val {
-                LuaValue::Table(t) => {
-                    let body_snap = t.get::<LuaValue>("body").ok().and_then(|v| {
-                        let ud = v.as_userdata()?;
-                        let h = ud.borrow::<BufHandle>().ok()?;
-                        Some(h.buf.take())
-                    });
-                    (coerce_tool_result(&val), body_snap)
-                }
-                _ => (coerce_tool_result(&val), None),
-            };
-
-            let (llm_output, is_error) = match result {
-                Ok(s) => (s, false),
-                Err(s) => (s, true),
-            };
-
-            let _ = tx.send(FinishPayload {
-                llm_output,
-                is_error,
-                body,
-            });
+            let _ = tx.send(ToolCallReply::from_lua_value(&val));
             Ok(())
         });
     }

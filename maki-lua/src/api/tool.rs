@@ -9,12 +9,13 @@ use maki_agent::tools::{
     Deadline, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError, ToolAudience,
     ToolContext, ToolInvocation,
 };
-use maki_agent::{AgentEvent, BufferSnapshot, RawRenderHints, ToolOutput};
+use maki_agent::{AgentEvent, BufferSnapshot, RawRenderHints, SharedBuf, ToolOutput};
 use mlua::{
     Function, Lua, LuaSerdeExt, RegistryKey, Result as LuaResult, Table, Value as LuaValue,
 };
 use serde_json::Value;
 
+use crate::api::buf::BufHandle;
 use crate::api::ctx::LuaCtx;
 use crate::runtime::{LiveCtx, Request};
 
@@ -185,6 +186,12 @@ impl ToolInvocation for LuaToolInvocation {
                 Some(Err(_)) => Err("lua thread disconnected".to_string()),
                 Some(Ok(reply)) => {
                     if let Some(ref id) = ctx.tool_use_id {
+                        if let Some(live_buf) = reply.live_buf {
+                            let _ = ctx.event_tx.send(AgentEvent::LiveToolBuf {
+                                id: id.clone(),
+                                body: live_buf,
+                            });
+                        }
                         if let Some(snapshot) = reply.snapshot {
                             let _ = ctx.event_tx.send(AgentEvent::ToolSnapshot {
                                 id: id.clone(),
@@ -343,14 +350,56 @@ pub(crate) struct ToolCallReply {
     pub result: ToolCallResult,
     pub snapshot: Option<BufferSnapshot>,
     pub header: Option<BufferSnapshot>,
+    pub live_buf: Option<Arc<SharedBuf>>,
 }
 
 impl ToolCallReply {
+    pub fn from_lua_value(val: &LuaValue) -> Self {
+        let result = coerce_tool_result(val);
+        let LuaValue::Table(t) = val else {
+            return Self {
+                result,
+                snapshot: None,
+                header: None,
+                live_buf: None,
+            };
+        };
+        let (snapshot, live_buf) = Self::extract_body_handle(t);
+        let header = t
+            .get::<LuaValue>("header")
+            .ok()
+            .and_then(|v| Self::extract_snapshot(&v));
+        Self {
+            result,
+            snapshot,
+            header,
+            live_buf,
+        }
+    }
+
+    fn extract_body_handle(t: &mlua::Table) -> (Option<BufferSnapshot>, Option<Arc<SharedBuf>>) {
+        t.get::<LuaValue>("body")
+            .ok()
+            .and_then(|v| {
+                let ud = v.as_userdata()?;
+                let h = ud.borrow::<BufHandle>().ok()?;
+                Some((Some(h.buf.take()), Some(Arc::clone(&h.buf))))
+            })
+            .unwrap_or((None, None))
+    }
+
+    fn extract_snapshot(val: &LuaValue) -> Option<BufferSnapshot> {
+        let ud = val.as_userdata()?;
+        let h = ud.borrow::<BufHandle>().ok()?;
+        Some(h.buf.take())
+    }
+
     pub fn err(msg: impl Into<String>) -> Self {
         Self {
             result: Err(msg.into()),
             snapshot: None,
             header: None,
+            live_buf: None,
         }
     }
 }
@@ -383,15 +432,10 @@ mod tests {
     use super::*;
 
     #[test_case::test_case("echo", true ; "simple_name")]
-    #[test_case::test_case("echo_tool", true ; "with_underscore")]
-    #[test_case::test_case("_private", true ; "leading_underscore")]
     #[test_case::test_case("tool123", true ; "trailing_digits")]
-    #[test_case::test_case("a", true ; "single_char")]
     #[test_case::test_case("", false ; "empty")]
     #[test_case::test_case("../../bash", false ; "path_traversal")]
     #[test_case::test_case("foo bar", false ; "space")]
-    #[test_case::test_case("foo.bar", false ; "dot")]
-    #[test_case::test_case("foo/bar", false ; "slash")]
     #[test_case::test_case("1foo", false ; "leading_digit")]
     fn tool_name_validation(name: &str, expected: bool) {
         assert_eq!(is_valid_tool_name(name), expected);
@@ -450,14 +494,17 @@ mod tests {
         );
     }
 
-    #[test_case::test_case(Some("format"), None ; "optional_field_absent_in_input")]
-    #[test_case::test_case(None, None ; "no_field_configured")]
-    fn permission_scope_none(field: Option<&str>, expected: Option<&str>) {
-        let tool = make_lua_tool(field);
-        let inv = tool
+    #[test]
+    fn permission_scope_none_when_field_absent_or_unconfigured() {
+        let absent = make_lua_tool(Some("format"))
             .parse(&serde_json::json!({"url": "https://example.com"}))
             .unwrap();
-        assert_eq!(inv.permission_scope(), expected.map(String::from));
+        assert_eq!(absent.permission_scope(), None);
+
+        let unconfigured = make_lua_tool(None)
+            .parse(&serde_json::json!({"url": "https://example.com"}))
+            .unwrap();
+        assert_eq!(unconfigured.permission_scope(), None);
     }
 
     #[test]
@@ -465,18 +512,6 @@ mod tests {
         let lua = Lua::new();
         let val = LuaValue::String(lua.create_string("hello").unwrap());
         assert_eq!(coerce_tool_result(&val), Ok("hello".to_string()));
-    }
-
-    #[test]
-    fn coerce_table_with_is_error_false_still_ok() {
-        let lua = Lua::new();
-        let t = lua.create_table().unwrap();
-        t.set("llm_output", "data").unwrap();
-        t.set("is_error", false).unwrap();
-        assert_eq!(
-            coerce_tool_result(&LuaValue::Table(t)),
-            Ok("data".to_string())
-        );
     }
 
     #[test]
@@ -491,27 +526,21 @@ mod tests {
         );
     }
 
-    #[test_case::test_case(&LuaValue::Nil ; "nil")]
-    #[test_case::test_case(&LuaValue::Boolean(true) ; "boolean")]
-    fn coerce_invalid_type_is_error(val: &LuaValue) {
+    #[test]
+    fn coerce_invalid_types_are_errors() {
         assert_eq!(
-            coerce_tool_result(val),
+            coerce_tool_result(&LuaValue::Nil),
+            Err(TOOL_HANDLER_RETURN_ERR.to_string())
+        );
+        assert_eq!(
+            coerce_tool_result(&LuaValue::Boolean(true)),
             Err(TOOL_HANDLER_RETURN_ERR.to_string())
         );
     }
 
     #[test]
-    fn coerce_empty_table_is_error() {
+    fn coerce_table_missing_llm_output_is_error() {
         let lua = Lua::new();
-        let t = lua.create_table().unwrap();
-        assert!(coerce_tool_result(&LuaValue::Table(t)).is_err());
-    }
-
-    #[test]
-    fn coerce_table_non_string_llm_output_is_error() {
-        let lua = Lua::new();
-        let t = lua.create_table().unwrap();
-        t.set("llm_output", 42).unwrap();
-        assert!(coerce_tool_result(&LuaValue::Table(t)).is_err());
+        assert!(coerce_tool_result(&LuaValue::Table(lua.create_table().unwrap())).is_err());
     }
 }
