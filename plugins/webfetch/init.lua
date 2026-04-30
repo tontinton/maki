@@ -56,6 +56,7 @@ local function strip_html(html)
 end
 
 local truncate = require("truncate")
+local ToolView = require("tool_view")
 
 maki.api.register_tool({
   name = "webfetch",
@@ -130,6 +131,26 @@ maki.api.register_tool({
       body = strip_html(body)
     end
 
-    return truncate(body, max_lines, max_bytes)
+    local llm_output = truncate(body, max_lines, max_bytes)
+
+    local tol = ctx:tool_output_lines()
+    local buf = maki.ui.buf()
+    local view = ToolView.new(buf, {
+      max_lines = (tol and tol.web) or 3,
+      keep = "head",
+    })
+    buf:on("click", function()
+      view:toggle()
+    end)
+
+    for line in (body .. "\n"):gmatch("([^\n]*)\n") do
+      view:append(line)
+    end
+    view:finish()
+
+    return {
+      llm_output = llm_output,
+      body = buf,
+    }
   end,
 })
