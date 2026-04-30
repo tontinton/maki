@@ -1,4 +1,5 @@
 local indexer = require("indexer")
+local ToolView = require("tool_view")
 
 local KEYWORDS = {
   pub = true,
@@ -18,111 +19,86 @@ local KEYWORDS = {
   ["macro_rules!"] = true,
 }
 
-local function split_trailing_range(line)
-  local bracket_start = line:find("%[%d[%d%-%,% ]*%]$")
-  if not bracket_start or bracket_start <= 1 then
+local function extract_line_range(line)
+  local pos = line:find("%[%d[%d%-%,% ]*%]$")
+  if not pos or pos <= 1 then
     return nil
   end
-  return line:sub(1, bracket_start - 1), line:sub(bracket_start)
+  return line:sub(1, pos - 1), line:sub(pos)
 end
 
-local function styled_section_line(buf, line)
-  local before, range = split_trailing_range(line)
+local function append_styled(view, line, style)
+  local text, range = extract_line_range(line)
   if range then
-    buf:line({ { before, "section" }, { range, "line_nr" } })
+    view:append({ { text, style }, { range, "line_nr" } })
   else
-    buf:line({ { line, "section" } })
+    view:append({ { line, style } })
   end
 end
 
-local function styled_content_line(buf, line)
-  local leading, content
-  if line:sub(1, 2) == "  " then
-    leading = "  "
-    content = line:sub(3)
-  else
-    leading = ""
-    content = line
-  end
+local function append_entry(view, line)
+  local indent = line:sub(1, 2) == "  " and "  " or ""
+  local content = line:sub(#indent + 1)
 
   local spans = {}
-  if leading ~= "" then
-    spans[#spans + 1] = { leading }
+  if indent ~= "" then
+    spans[#spans + 1] = { indent }
   end
 
-  local kw_found = nil
   for kw in pairs(KEYWORDS) do
-    local kw_len = #kw
-    if content:sub(1, kw_len) == kw then
-      local next_char = content:sub(kw_len + 1, kw_len + 1)
-      if next_char == " " or next_char == "(" then
-        kw_found = kw
-        break
-      end
+    local next_char = content:sub(#kw + 1, #kw + 1)
+    if content:sub(1, #kw) == kw and (next_char == " " or next_char == "(") then
+      spans[#spans + 1] = { kw, "keyword" }
+      content = content:sub(#kw + 1)
+      break
     end
   end
 
-  local rest
-  if kw_found then
-    spans[#spans + 1] = { kw_found, "keyword" }
-    rest = content:sub(#kw_found + 1)
-  else
-    rest = content
-  end
-
-  local before, range = split_trailing_range(rest)
+  local text, range = extract_line_range(content)
   if range then
-    spans[#spans + 1] = { before, "tool" }
+    spans[#spans + 1] = { text, "tool" }
     spans[#spans + 1] = { range, "line_nr" }
   else
-    spans[#spans + 1] = { rest, "tool" }
+    spans[#spans + 1] = { content, "tool" }
   end
 
-  buf:line(spans)
+  view:append(spans)
 end
 
 local function is_section_header(line)
   local trimmed = line:match("^(.-)%s*$")
-  if trimmed:sub(-1) == ":" then
-    return true
-  end
-  if trimmed:sub(-1) == "]" and trimmed:find(": %[") then
-    return true
-  end
-  return false
+  return trimmed:sub(-1) == ":" or (trimmed:sub(-1) == "]" and trimmed:find(": %[") ~= nil)
 end
 
-local function build_styled_buf(text)
-  local buf = maki.ui.buf()
+local function render_skeleton(view, text)
   for line in (text .. "\n"):gmatch("([^\n]*)\n") do
     if line == "" then
-      buf:line("")
+      view:append("")
     elseif is_section_header(line) then
-      styled_section_line(buf, line)
+      append_styled(view, line, "section")
     else
-      styled_content_line(buf, line)
+      append_entry(view, line)
     end
   end
-  return buf
 end
 
-local function normalize(p)
+local function shorten_path(path)
   local cwd = maki.uv.cwd()
-  if cwd and p:sub(1, #cwd + 1) == cwd .. "/" then
-    local rel = p:sub(#cwd + 2)
+  if cwd and path:sub(1, #cwd + 1) == cwd .. "/" then
+    local rel = path:sub(#cwd + 2)
     return rel == "" and "." or rel
   end
   local home = maki.uv.os_homedir()
-  if home and p:sub(1, #home + 1) == home .. "/" then
-    local rel = p:sub(#home + 2)
+  if home and path:sub(1, #home + 1) == home .. "/" then
+    local rel = path:sub(#home + 2)
     return rel == "" and "~" or "~/" .. rel
   end
-  return p
+  return path
 end
 
-local function build_header(path, line_count)
+local function render_header(path, line_count)
   local buf = maki.ui.buf()
-  local spans = { { normalize(path), "path" } }
+  local spans = { { shorten_path(path), "path" } }
   if line_count then
     spans[#spans + 1] = { " (" .. line_count .. " lines)", "dim" }
   end
@@ -146,7 +122,7 @@ Return a compact overview of a source file: imports, type definitions, function 
     },
   },
   header = function(input)
-    return build_header(input.path)
+    return render_header(input.path)
   end,
   handler = function(input, ctx)
     local path = input.path
@@ -154,8 +130,8 @@ Return a compact overview of a source file: imports, type definitions, function 
       return "error: path is required"
     end
 
-    local ok_meta, meta = pcall(maki.fs.metadata, path)
-    if ok_meta and meta.is_dir then
+    local meta_ok, meta = pcall(maki.fs.metadata, path)
+    if meta_ok and meta.is_dir then
       return {
         llm_output = "Path is a directory. Use index on files or use the read or glob tool to list directories.",
         is_error = true,
@@ -174,7 +150,7 @@ Return a compact overview of a source file: imports, type definitions, function 
 
     local config = ctx:config()
     local max_file_size = (config and config.index_max_file_size) or (2 * 1024 * 1024)
-    if ok_meta and meta.size > max_file_size then
+    if meta_ok and meta.size > max_file_size then
       return "error: File too large ("
         .. meta.size
         .. " bytes, max "
@@ -187,18 +163,29 @@ Return a compact overview of a source file: imports, type definitions, function 
       return "error: " .. tostring(source)
     end
 
-    local result, err = indexer.index_source(source, lang)
-    if not result then
+    local skeleton, err = indexer.index_source(source, lang)
+    if not skeleton then
       return "error: " .. tostring(err)
     end
 
-    local buf = build_styled_buf(result)
+    local tol = ctx:tool_output_lines()
+    local buf = maki.ui.buf()
+    local view = ToolView.new(buf, {
+      max_lines = (tol and tol.index) or 5,
+      keep = "head",
+    })
+    buf:on("click", function()
+      view:toggle()
+    end)
 
-    local line_count = select(2, result:gsub("\n", "\n")) + 1
+    render_skeleton(view, skeleton)
+    view:finish()
+
+    local line_count = select(2, skeleton:gsub("\n", "\n")) + 1
     return {
-      llm_output = result,
+      llm_output = skeleton,
       body = buf,
-      header = build_header(path, line_count),
+      header = render_header(path, line_count),
     }
   end,
 })
