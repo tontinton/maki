@@ -74,23 +74,15 @@ function ToolView:flush()
   end
 
   if self.expanded then
-    if self.keep == "tail" and #self.all_lines > self.max then
-      lines[#lines + 1] = { { "click to collapse", "dim" } }
-    end
-
     for _, line in ipairs(self.all_lines) do
       lines[#lines + 1] = line
     end
     if self.all_skipped > 0 then
       lines[#lines + 1] = { { self.all_skipped .. " lines omitted", "dim" } }
     end
-
-    if self.keep == "head" and #self.all_lines > self.max then
-      lines[#lines + 1] = { { "click to collapse", "dim" } }
-    end
   else
     local hidden = self.skipped
-    local label = hidden > 0 and (hidden .. " lines hidden (click to expand)") or nil
+    local label = hidden > 0 and ("... (" .. hidden .. " lines) (click to expand)") or nil
 
     if self.keep == "tail" and label then
       lines[#lines + 1] = { { label, "dim" } }
