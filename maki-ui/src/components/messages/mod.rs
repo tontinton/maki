@@ -41,6 +41,13 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 
+#[derive(Debug)]
+pub enum ClickResult {
+    Nothing,
+    Toggled,
+    LuaToolClick { tool_id: String, row: u32 },
+}
+
 pub struct MessagesPanel {
     messages: Vec<DisplayMessage>,
     streaming_thinking: StreamingContent,
@@ -193,7 +200,18 @@ impl MessagesPanel {
     }
 
     pub fn tool_done(&mut self, event: ToolDoneEvent) {
-        let live_buf = self.live_bufs.remove(&event.id);
+        let has_snapshot = self
+            .messages
+            .iter()
+            .rfind(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == event.id))
+            .is_some_and(|m| m.render_snapshot.is_some());
+        if has_snapshot {
+            if let Some(buf) = self.live_bufs.get(&event.id) {
+                buf.read_if_dirty();
+            }
+        } else {
+            self.live_bufs.remove(&event.id);
+        }
         let Some(msg) = self
             .messages
             .iter_mut()
@@ -201,9 +219,6 @@ impl MessagesPanel {
         else {
             return;
         };
-        if let Some(buf) = live_buf.filter(|_| msg.render_snapshot.is_some()) {
-            msg.render_snapshot = Some(buf.take());
-        }
         if let DisplayRole::Tool(t) = &mut msg.role {
             t.status = if event.is_error {
                 ToolStatus::Error
@@ -607,25 +622,38 @@ impl MessagesPanel {
         self.accent.set(color);
     }
 
-    pub fn toggle_expansion_at(&mut self, row: u16, area: Rect) -> bool {
+    pub fn handle_click(&mut self, row: u16, area: Rect) -> ClickResult {
         if area.height == 0 {
-            return false;
+            return ClickResult::Nothing;
         }
         let doc_row = (row.saturating_sub(area.y)) as u32 + self.scroll_top as u32;
         let width = self.viewport_width;
-        let Some((_, seg, _)) = self.cache.segment_at_row(doc_row, width) else {
-            return false;
+        let Some((_, seg, seg_start)) = self.cache.segment_at_row(doc_row, width) else {
+            return ClickResult::Nothing;
         };
         let Some(tool_id) = seg.tool_id.as_deref() else {
-            return false;
+            return ClickResult::Nothing;
         };
+
+        let has_snapshot = self
+            .messages
+            .iter()
+            .rfind(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == tool_id))
+            .is_some_and(|m| m.render_snapshot.is_some());
+        if has_snapshot {
+            return ClickResult::LuaToolClick {
+                tool_id: tool_id.to_owned(),
+                row: doc_row - seg_start,
+            };
+        }
+
         let exp = self
             .expanded_tools
             .get(tool_id)
             .copied()
             .unwrap_or_default();
         if !seg.truncation.any() && !exp.any() {
-            return false;
+            return ClickResult::Nothing;
         }
         let tool_id = tool_id.to_owned();
         let truncation = seg.truncation;
@@ -637,7 +665,12 @@ impl MessagesPanel {
             entry.script = !entry.script;
         }
         self.rebuild_expanded_tool(&tool_id);
-        true
+        ClickResult::Toggled
+    }
+
+    #[cfg(test)]
+    pub fn toggle_expansion_at(&mut self, row: u16, area: Rect) -> bool {
+        matches!(self.handle_click(row, area), ClickResult::Toggled)
     }
 
     fn rebuild_expanded_tool(&mut self, tool_id: &str) {

@@ -36,6 +36,8 @@ use crate::terminal;
 const ANIMATION_INTERVAL_MS: u64 = 16;
 const IDLE_POLL_INTERVAL_MS: u64 = 100;
 
+pub type BufClickHandler = Arc<dyn Fn(&str, u32) + Send + Sync>;
+
 pub struct EventLoopParams {
     pub model: Model,
     pub skills: Vec<Skill>,
@@ -49,6 +51,7 @@ pub struct EventLoopParams {
     pub timeouts: Timeouts,
     pub exit_on_done: bool,
     pub plugin_render_hints: Vec<(Arc<str>, RawRenderHints)>,
+    pub buf_click: Option<BufClickHandler>,
     #[cfg(feature = "demo")]
     pub demo: bool,
 }
@@ -160,6 +163,7 @@ impl<'t> EventLoop<'t> {
             timeouts,
             exit_on_done,
             plugin_render_hints,
+            buf_click,
             #[cfg(feature = "demo")]
             demo,
         } = params;
@@ -208,6 +212,7 @@ impl<'t> EventLoop<'t> {
             custom_commands,
         );
         app.exit_on_done = exit_on_done;
+        app.buf_click = buf_click;
 
         #[cfg(feature = "demo")]
         if demo {

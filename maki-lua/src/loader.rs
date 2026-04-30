@@ -238,6 +238,26 @@ impl PluginHost {
     pub fn drain_render_hints(&mut self) -> Vec<(Arc<str>, RawRenderHints)> {
         std::mem::take(&mut self.render_hints)
     }
+
+    pub fn event_handle(&self) -> Option<EventHandle> {
+        self.inner
+            .as_ref()
+            .map(|t| EventHandle { tx: t.tx.clone() })
+    }
+}
+
+#[derive(Clone)]
+pub struct EventHandle {
+    tx: flume::Sender<Request>,
+}
+
+impl EventHandle {
+    pub fn fire_click(&self, tool_id: &str, row: u32) {
+        let _ = self.tx.try_send(Request::FireBufClick {
+            tool_id: tool_id.to_owned(),
+            row,
+        });
+    }
 }
 
 #[cfg(test)]
@@ -251,5 +271,20 @@ mod tests {
         let names_before = reg.names();
         let _host = PluginHost::disabled();
         assert_eq!(reg.names(), names_before);
+    }
+
+    #[test]
+    fn fire_click_sends_request_through_channel() {
+        let (tx, rx) = flume::bounded(8);
+        let handle = EventHandle { tx };
+        handle.fire_click("tool_42", 7);
+        let req = rx.try_recv().unwrap();
+        match req {
+            Request::FireBufClick { tool_id, row } => {
+                assert_eq!(tool_id, "tool_42");
+                assert_eq!(row, 7);
+            }
+            _ => panic!("expected FireBufClick"),
+        }
     }
 }

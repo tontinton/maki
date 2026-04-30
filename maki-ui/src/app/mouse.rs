@@ -1,6 +1,7 @@
 use std::time::{Duration, Instant};
 
 use crate::clipboard::CopyResult;
+use crate::components::messages::ClickResult;
 use crate::selection::{self, ContentRegion, EdgeScroll, SelectableZone, Selection, SelectionZone};
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
@@ -46,7 +47,15 @@ impl App {
                         self.selection_state = None;
                         if zone == SelectionZone::Messages {
                             let area = self.msg_area();
-                            self.chats[self.active_chat].toggle_expansion_at(event.row, area);
+                            let chat = &mut self.chats[self.active_chat];
+                            match chat.handle_click(event.row, area) {
+                                ClickResult::LuaToolClick { tool_id, row } => {
+                                    if let Some(handler) = &self.buf_click {
+                                        handler(&tool_id, row);
+                                    }
+                                }
+                                ClickResult::Toggled | ClickResult::Nothing => {}
+                            }
                         }
                     }
                 }

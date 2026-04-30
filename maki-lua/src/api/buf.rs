@@ -3,7 +3,9 @@ use std::sync::Arc;
 
 use maki_agent::types::InlineStyle;
 use maki_agent::{SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle};
-use mlua::{Result as LuaResult, UserData, UserDataMethods, Value as LuaValue};
+use mlua::{Function, Result as LuaResult, UserData, UserDataMethods, Value as LuaValue};
+
+use crate::runtime::{with_click_handlers, with_live_ctx};
 
 /// `live_buf` tracks the first buffer a handler creates, which is the one
 /// the runtime streams to the UI during execution.
@@ -103,6 +105,21 @@ impl UserData for BufHandle {
         });
 
         methods.add_method("len", |_lua, this, ()| Ok(this.buf.len()));
+
+        methods.add_method("on", |lua, _this, (event, callback): (String, Function)| {
+            if event != "click" {
+                return Err(mlua::Error::runtime(format!("unsupported event: {event}")));
+            }
+            let tool_id = with_live_ctx(lua, |live| live.tool_use_id.clone())
+                .ok_or_else(|| mlua::Error::runtime("buf:on() requires a live tool context"))?;
+            let key = lua.create_registry_value(callback)?;
+            with_click_handlers(lua, |handlers| {
+                if let Some(old) = handlers.insert(tool_id, key) {
+                    let _ = lua.remove_registry_value(old);
+                }
+            });
+            Ok(())
+        });
     }
 }
 
@@ -527,5 +544,38 @@ mod tests {
         assert_eq!(store.len(regular), 1);
         assert_eq!(store.len(live_id), 1);
         assert!(store.live_buf().is_some());
+    }
+
+    #[test]
+    fn buf_on_unsupported_event_errors() {
+        let lua = test_lua();
+        let handle = {
+            let mut store = lua.app_data_mut::<BufferStore>().unwrap();
+            store.create()
+        };
+        let ud = lua.create_userdata(handle).unwrap();
+        lua.globals().set("buf", ud).unwrap();
+
+        let result = lua.load(r#"buf:on("hover", function() end)"#).exec();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("unsupported event"), "got: {err}");
+    }
+
+    #[test]
+    fn buf_on_click_without_live_ctx_errors() {
+        let lua = test_lua();
+        lua.set_app_data(HashMap::<String, mlua::RegistryKey>::new());
+        let handle = {
+            let mut store = lua.app_data_mut::<BufferStore>().unwrap();
+            store.create()
+        };
+        let ud = lua.create_userdata(handle).unwrap();
+        lua.globals().set("buf", ud).unwrap();
+
+        let result = lua.load(r#"buf:on("click", function() end)"#).exec();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("live tool context"), "got: {err}");
     }
 }

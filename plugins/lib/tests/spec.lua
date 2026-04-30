@@ -69,7 +69,7 @@ case("tool_view_tail_keeps_last_n", function()
     view:append("line" .. i)
   end
   eq(#buf.lines, 4) -- 3 ring lines + 1 notice
-  eq(buf.lines[1][1][1], "2 lines hidden")
+  eq(buf.lines[1][1][1], "2 lines hidden (click to expand)")
   eq(buf.lines[2], "line3")
   eq(buf.lines[3], "line4")
   eq(buf.lines[4], "line5")
@@ -86,7 +86,7 @@ case("tool_view_head_keeps_first_n", function()
   eq(buf.lines[1], "line1")
   eq(buf.lines[2], "line2")
   eq(buf.lines[3], "line3")
-  eq(buf.lines[4][1][1], "2 lines hidden")
+  eq(buf.lines[4][1][1], "2 lines hidden (click to expand)")
 end)
 
 case("tool_view_header_appears_first", function()
@@ -106,7 +106,7 @@ case("tool_view_ring_wraparound", function()
     view:append("line" .. i)
   end
   eq(view.skipped, 7)
-  eq(buf.lines[1][1][1], "7 lines hidden")
+  eq(buf.lines[1][1][1], "7 lines hidden (click to expand)")
   eq(buf.lines[2], "line8")
   eq(buf.lines[3], "line9")
   eq(buf.lines[4], "line10")
@@ -121,7 +121,7 @@ case("tool_view_finish_flushes_head_skipped", function()
   local count_before = buf.call_count
   view:finish()
   assert(buf.call_count > count_before, "finish should flush when head has skipped lines")
-  eq(buf.lines[3][1][1], "3 lines hidden")
+  eq(buf.lines[3][1][1], "3 lines hidden (click to expand)")
 end)
 
 case("tool_view_no_truncation_within_limit", function()
@@ -132,6 +132,116 @@ case("tool_view_no_truncation_within_limit", function()
   end
   eq(#buf.lines, 5)
   eq(view.skipped, 0)
+end)
+
+case("tool_view_toggle_expands_all_lines", function()
+  local buf = mock_buf()
+  local view = ToolView.new(buf, { max_lines = 3, keep = "tail" })
+  for i = 1, 10 do
+    view:append("line" .. i)
+  end
+  eq(#buf.lines, 4) -- 3 visible + hidden notice
+  view:toggle()
+  eq(#buf.lines, 11) -- 1 collapse link + 10 data lines
+  eq(buf.lines[1][1][1], "click to collapse")
+  eq(buf.lines[2], "line1")
+  eq(buf.lines[11], "line10")
+end)
+
+case("tool_view_toggle_twice_collapses_back", function()
+  local buf = mock_buf()
+  local view = ToolView.new(buf, { max_lines = 3, keep = "tail" })
+  for i = 1, 10 do
+    view:append("line" .. i)
+  end
+  view:toggle()
+  view:toggle()
+  eq(#buf.lines, 4)
+  eq(buf.lines[1][1][1], "7 lines hidden (click to expand)")
+  eq(buf.lines[2], "line8")
+end)
+
+case("tool_view_toggle_head_mode_expands", function()
+  local buf = mock_buf()
+  local view = ToolView.new(buf, { max_lines = 2, keep = "head" })
+  for i = 1, 5 do
+    view:append("line" .. i)
+  end
+  view:finish()
+  eq(buf.lines[3][1][1], "3 lines hidden (click to expand)")
+  view:toggle()
+  eq(buf.lines[1], "line1")
+  eq(buf.lines[5], "line5")
+  eq(buf.lines[6][1][1], "click to collapse")
+end)
+
+case("tool_view_expand_cap_overflow_shows_omitted", function()
+  local buf = mock_buf()
+  local view = ToolView.new(buf, { max_lines = 2, keep = "tail" })
+  local cap = 2 * 10 -- expand_cap = max * EXPAND_CAP_MULTIPLIER
+  for i = 1, cap + 5 do
+    view:append("line" .. i)
+  end
+  eq(view.all_skipped, 5)
+  view:toggle()
+  eq(buf.lines[1][1][1], "click to collapse")
+  eq(buf.lines[cap + 1], "line" .. cap)
+  eq(buf.lines[cap + 2][1][1], "5 lines omitted")
+end)
+
+case("tool_view_no_collapse_link_when_within_max", function()
+  local buf = mock_buf()
+  local view = ToolView.new(buf, { max_lines = 10, keep = "tail" })
+  for i = 1, 5 do
+    view:append("line" .. i)
+  end
+  view:toggle()
+  for _, line in ipairs(buf.lines) do
+    if type(line) == "table" and line[1] and line[1][1] == "click to collapse" then
+      error("should not show collapse link when lines <= max")
+    end
+  end
+end)
+
+case("tool_view_clear_resets_data_but_keeps_expanded", function()
+  local buf = mock_buf()
+  local view = ToolView.new(buf, { max_lines = 3, keep = "tail" })
+  for i = 1, 10 do
+    view:append("line" .. i)
+  end
+  view:toggle()
+  eq(view.expanded, true)
+  view:clear()
+  eq(#view.all_lines, 0)
+  eq(view.all_skipped, 0)
+  eq(view.ring_count, 0)
+  eq(view.skipped, 0)
+end)
+
+case("tool_view_header_preserved_after_toggle", function()
+  local buf = mock_buf()
+  local view = ToolView.new(buf, { max_lines = 3, keep = "tail" })
+  view:set_header({ "$ echo hello", { { "---", "dim" } } })
+  for i = 1, 10 do
+    view:append("line" .. i)
+  end
+  view:toggle()
+  eq(buf.lines[1], "$ echo hello")
+  eq(buf.lines[2][1][1], "---")
+  eq(buf.lines[3][1][1], "click to collapse")
+  eq(buf.lines[4], "line1")
+  eq(buf.lines[13], "line10")
+end)
+
+case("tool_view_append_after_toggle_still_works", function()
+  local buf = mock_buf()
+  local view = ToolView.new(buf, { max_lines = 3, keep = "tail" })
+  for i = 1, 5 do
+    view:append("line" .. i)
+  end
+  view:toggle()
+  view:append("line6")
+  eq(view.all_lines[6], "line6")
 end)
 
 if #failures > 0 then

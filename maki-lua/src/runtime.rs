@@ -65,6 +65,10 @@ pub enum Request {
         plugin_dir: Option<PathBuf>,
         reply: flume::Sender<Result<Option<RawConfig>, PluginError>>,
     },
+    FireBufClick {
+        tool_id: String,
+        row: u32,
+    },
     Shutdown,
 }
 
@@ -95,6 +99,8 @@ impl ThreadKey {
 /// Keyed by coroutine pointer. All access is on the single Lua OS thread.
 type TaskMap = HashMap<ThreadKey, TaskCtx>;
 
+type ClickHandlerMap = HashMap<String, RegistryKey>;
+
 pub(crate) fn with_task_jobs<R>(lua: &Lua, f: impl FnOnce(&mut JobStore) -> R) -> Option<R> {
     let key = ThreadKey::current(lua);
     let mut tasks = lua.app_data_mut::<TaskMap>()?;
@@ -107,6 +113,19 @@ pub(crate) fn with_task_bufs<R>(lua: &Lua, f: impl FnOnce(&mut BufferStore) -> R
     let mut tasks = lua.app_data_mut::<TaskMap>()?;
     let ctx = tasks.get_mut(&key)?;
     Some(f(&mut ctx.bufs))
+}
+
+pub(crate) fn with_click_handlers<R>(
+    lua: &Lua,
+    f: impl FnOnce(&mut ClickHandlerMap) -> R,
+) -> Option<R> {
+    lua.app_data_mut::<ClickHandlerMap>().map(|mut m| f(&mut m))
+}
+
+pub(crate) fn with_live_ctx<R>(lua: &Lua, f: impl FnOnce(&LiveCtx) -> R) -> Option<R> {
+    let key = ThreadKey::current(lua);
+    lua.app_data_ref::<TaskMap>()
+        .and_then(|tasks| tasks.get(&key)?.live.as_ref().map(f))
 }
 
 /// RAII guard that cleans up a task (kills jobs, clears bufs) even on
@@ -199,6 +218,7 @@ impl LuaRuntime {
         })?;
 
         lua.set_app_data(TaskMap::new());
+        lua.set_app_data(ClickHandlerMap::new());
 
         Ok(Self {
             lua,
@@ -924,6 +944,26 @@ pub fn spawn(
                             rt.clear_plugin(&plugin);
                             let _ = reply.send(());
                         }
+                        Request::FireBufClick { tool_id, row } => {
+                            let handler_fn =
+                                rt.lua.app_data_ref::<ClickHandlerMap>().and_then(|m| {
+                                    let key = m.get(&tool_id)?;
+                                    rt.lua.registry_value::<Function>(key).ok()
+                                });
+                            if let Some(func) = handler_fn {
+                                let lua = rt.lua.clone();
+                                ex.spawn(async move {
+                                    let Ok(data) = lua.create_table() else {
+                                        return;
+                                    };
+                                    let _ = data.set("row", row);
+                                    if let Err(e) = func.call_async::<()>(data).await {
+                                        tracing::warn!(tool_id, error = %e, "click handler failed");
+                                    }
+                                })
+                                .detach();
+                            }
+                        }
                         Request::ComputeHeader {
                             plugin,
                             tool,
@@ -1096,17 +1136,9 @@ mod tests {
         lua.set_app_data(TaskMap::new());
         let key = ThreadKey::current(&lua);
         {
-            let mut tasks = lua.app_data_mut::<TaskMap>().unwrap();
-            tasks.insert(
-                key,
-                TaskCtx {
-                    cancel: CancelToken::none(),
-                    deadline: None,
-                    jobs: JobStore::new(),
-                    bufs: BufferStore::new(),
-                    live: None,
-                },
-            );
+            lua.app_data_mut::<TaskMap>()
+                .unwrap()
+                .insert(key, task_ctx(None));
         }
         drop(TaskCleanupGuard {
             lua: lua.clone(),
@@ -1125,5 +1157,41 @@ mod tests {
         lua.set_app_data(TaskMap::new());
         assert!(with_task_jobs(&lua, |_| 42).is_none());
         assert!(with_task_bufs(&lua, |_| 42).is_none());
+    }
+
+    fn task_ctx(live: Option<LiveCtx>) -> TaskCtx {
+        TaskCtx {
+            cancel: CancelToken::none(),
+            deadline: None,
+            jobs: JobStore::new(),
+            bufs: BufferStore::new(),
+            live,
+        }
+    }
+
+    #[test]
+    fn with_live_ctx_follows_task_live_field() {
+        let lua = Lua::new();
+        lua.set_app_data(TaskMap::new());
+        let key = ThreadKey::current(&lua);
+
+        lua.app_data_mut::<TaskMap>()
+            .unwrap()
+            .insert(key, task_ctx(None));
+        assert!(with_live_ctx(&lua, |_| ()).is_none());
+
+        let (tx, _rx) = flume::unbounded();
+        lua.app_data_mut::<TaskMap>()
+            .unwrap()
+            .get_mut(&key)
+            .unwrap()
+            .live = Some(LiveCtx {
+            event_tx: maki_agent::EventSender::new(tx, 0),
+            tool_use_id: "tool_abc".into(),
+        });
+        assert_eq!(
+            with_live_ctx(&lua, |ctx| ctx.tool_use_id.clone()).unwrap(),
+            "tool_abc"
+        );
     }
 }

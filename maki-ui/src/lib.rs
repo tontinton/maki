@@ -36,7 +36,7 @@ use maki_providers::TokenUsage;
 pub type AppSession = maki_storage::sessions::Session<Message, TokenUsage, ToolOutput>;
 
 pub(crate) use agent::AgentCommand;
-pub use event_loop::EventLoopParams;
+pub use event_loop::{BufClickHandler, EventLoopParams};
 
 pub fn run(
     params: EventLoopParams,

@@ -46,6 +46,7 @@ use crate::components::tool_display::format_turn_usage;
 use crate::components::{
     Action, DisplayMessage, DisplayRole, ExitRequest, Overlay, RetryInfo, Status, is_ctrl,
 };
+use crate::event_loop::BufClickHandler;
 use crate::image;
 use crate::selection::{SelectionState, SelectionZone, ZoneRegistry};
 use arc_swap::{ArcSwap, ArcSwapOption};
@@ -166,6 +167,7 @@ pub struct App {
     pub(crate) shell: shell::ShellState,
     pub(crate) ui_config: UiConfig,
     pub(crate) permissions: Arc<PermissionManager>,
+    pub(super) buf_click: Option<BufClickHandler>,
     subagent_answers: HashMap<String, flume::Sender<String>>,
 }
 
@@ -231,6 +233,7 @@ impl App {
             shell: shell::ShellState::default(),
             ui_config,
             permissions,
+            buf_click: None,
             subagent_answers: HashMap::new(),
         }
     }

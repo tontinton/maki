@@ -415,34 +415,6 @@ fn tool_done_after_cancel_in_progress_does_not_underflow() {
     assert_eq!(msg_status(&panel, "t1"), ToolStatus::Success);
 }
 
-fn tool_msg(id: &str, name: &str, status: ToolStatus) -> DisplayMessage {
-    DisplayMessage::new(
-        DisplayRole::Tool(Box::new(ToolRole {
-            id: id.into(),
-            status,
-            name: name.into(),
-        })),
-        id.into(),
-    )
-}
-
-#[test]
-fn load_messages_counts_in_progress_and_replaces_state() {
-    let mut panel = panel_with_tools(&[("old", "bash")]);
-    assert_eq!(panel.in_progress_count(), 1);
-
-    panel.load_messages(vec![
-        tool_msg("t1", "bash", ToolStatus::InProgress),
-        tool_msg("t2", "read", ToolStatus::Success),
-    ]);
-    assert_eq!(panel.in_progress_count(), 1);
-    assert_eq!(panel.messages.len(), 2);
-
-    panel.load_messages(Vec::new());
-    assert_eq!(panel.in_progress_count(), 0);
-    assert!(panel.messages.is_empty());
-}
-
 #[test]
 fn question_tool_renders_summary() {
     let mut panel = MessagesPanel::new(UiConfig::default());
@@ -1130,4 +1102,104 @@ fn toggle_instruction_segment_expands_and_collapses() {
 
     panel.toggle_expansion(&inst_id);
     assert_eq!(seg_line_count(&panel, &inst_id), collapsed);
+}
+
+#[test]
+fn handle_click_returns_nothing_when_no_segment_at_row() {
+    let mut panel = MessagesPanel::new(UiConfig::default());
+    render(&mut panel, 80, 24);
+    let area = Rect::new(0, 0, 80, 24);
+    assert!(matches!(panel.handle_click(23, area), ClickResult::Nothing));
+}
+
+#[test]
+fn handle_click_returns_lua_tool_click_when_snapshot_exists() {
+    use maki_agent::{SnapshotLine, SnapshotSpan, SpanStyle};
+
+    let mut panel = MessagesPanel::new(UiConfig::default());
+    panel.tool_start(start("t1", BASH_TOOL_NAME));
+    panel.tool_done(ToolDoneEvent {
+        id: "t1".into(),
+        tool: BASH_TOOL_NAME.into(),
+        output: ToolOutput::Plain("output".into()),
+        is_error: false,
+    });
+    panel.tool_snapshot(
+        "t1",
+        BufferSnapshot::from_arc(Arc::new(vec![SnapshotLine {
+            spans: vec![SnapshotSpan {
+                text: "rendered".into(),
+                style: SpanStyle::Default,
+            }],
+        }])),
+    );
+    render(&mut panel, 80, 24);
+    let area = Rect::new(0, 0, 80, 24);
+    match panel.handle_click(area.y, area) {
+        ClickResult::LuaToolClick { tool_id, .. } => {
+            assert_eq!(tool_id, "t1");
+        }
+        other => panic!("expected LuaToolClick, got {other:?}"),
+    }
+}
+
+#[test]
+fn handle_click_returns_toggled_for_truncated_tool_without_snapshot() {
+    let mut panel = panel_with_long_tool(200);
+    let area = Rect::new(0, 0, 80, 24);
+    match panel.handle_click(area.y, area) {
+        ClickResult::Toggled => {}
+        other => panic!("expected Toggled, got {other:?}"),
+    }
+}
+
+#[test]
+fn handle_click_non_tool_segment_returns_nothing() {
+    let mut panel = MessagesPanel::new(UiConfig::default());
+    panel.push(DisplayMessage::new(
+        DisplayRole::User,
+        "user message".into(),
+    ));
+    render(&mut panel, 80, 24);
+    let area = Rect::new(0, 0, 80, 24);
+    assert!(matches!(
+        panel.handle_click(area.y, area),
+        ClickResult::Nothing
+    ));
+}
+
+#[test]
+fn live_buf_updates_after_tool_done_are_picked_up() {
+    use maki_agent::{SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle};
+
+    let buf = Arc::new(SharedBuf::new());
+    let line = |text: &str| SnapshotLine {
+        spans: vec![SnapshotSpan {
+            text: text.into(),
+            style: SpanStyle::Default,
+        }],
+    };
+
+    let mut panel = MessagesPanel::new(UiConfig::default());
+    panel.register_live_buf("t1".into(), Arc::clone(&buf));
+    panel.tool_start(start("t1", BASH_TOOL_NAME));
+
+    buf.set_lines(vec![line("before")]);
+    panel.tool_snapshot(
+        "t1",
+        BufferSnapshot::from_arc(Arc::new(vec![line("before")])),
+    );
+    panel.tool_done(ToolDoneEvent {
+        id: "t1".into(),
+        tool: BASH_TOOL_NAME.into(),
+        output: ToolOutput::Plain("output".into()),
+        is_error: false,
+    });
+
+    buf.set_lines(vec![line("after click")]);
+    render(&mut panel, 80, 24);
+
+    let msg = panel.find_tool_msg_mut("t1").unwrap();
+    let snap = msg.render_snapshot.as_ref().unwrap();
+    assert_eq!(snap.lines[0].spans[0].text, "after click");
 }

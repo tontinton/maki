@@ -184,6 +184,10 @@ maki.api.register_tool({
       keep = "tail",
     })
 
+    buf:on("click", function(ev)
+      view:toggle()
+    end)
+
     local header = {}
     local highlighted = maki.ui.highlight(command, "bash")
     if highlighted then
