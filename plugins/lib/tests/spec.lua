@@ -177,8 +177,8 @@ end)
 
 case("tool_view_expand_cap_overflow_shows_omitted", function()
   local buf = mock_buf()
-  local view = ToolView.new(buf, { max_lines = 2, keep = "tail" })
-  local cap = 2 * 10 -- expand_cap = max * EXPAND_CAP_MULTIPLIER
+  local cap = 20
+  local view = ToolView.new(buf, { max_lines = 2, keep = "tail", max_expand_lines = cap })
   for i = 1, cap + 5 do
     view:append("line" .. i)
   end

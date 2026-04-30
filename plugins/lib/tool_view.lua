@@ -1,14 +1,12 @@
 local ToolView = {}
 ToolView.__index = ToolView
 
-local EXPAND_CAP_MULTIPLIER = 10
-
 function ToolView.new(buf, opts)
   local self = setmetatable({}, ToolView)
   self.buf = buf
   self.max = (opts and opts.max_lines) or 80
   self.keep = (opts and opts.keep) or "tail"
-  self.expand_cap = self.max * EXPAND_CAP_MULTIPLIER
+  self.max_expand_lines = (opts and opts.max_expand_lines) or 2000
   self.header = {}
   self.ring = {}
   self.ring_start = 1
@@ -36,7 +34,7 @@ function ToolView:clear()
 end
 
 function ToolView:append(line)
-  if #self.all_lines < self.expand_cap then
+  if #self.all_lines < self.max_expand_lines then
     self.all_lines[#self.all_lines + 1] = line
   else
     self.all_skipped = self.all_skipped + 1
