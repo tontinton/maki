@@ -71,7 +71,7 @@ local function is_section_header(line)
 end
 
 local function render_skeleton(view, text)
-  for line in (text .. "\n"):gmatch("([^\n]*)\n") do
+  for line in text:gmatch("([^\n]*)\n?") do
     if line == "" then
       view:append("")
     elseif is_section_header(line) then

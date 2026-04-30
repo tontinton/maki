@@ -74,6 +74,7 @@ pub enum Request {
 
 /// Bundles `event_tx` + `tool_use_id` so `CallTool` does not need
 /// two separate Option fields that must stay in sync.
+#[derive(Clone)]
 pub struct LiveCtx {
     pub event_tx: maki_agent::EventSender,
     pub tool_use_id: String,

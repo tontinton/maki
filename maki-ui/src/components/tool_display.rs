@@ -664,11 +664,11 @@ impl ToolLineBuilder {
     }
 }
 
-fn push_text_lines(lines: &mut Vec<Line<'static>>, text: &str, indent: &str) {
+fn push_text_lines(lines: &mut Vec<Line<'static>>, text: &str, indent: &'static str) {
     let style = theme::current().tool;
     for line in text.lines() {
         lines.push(Line::from(vec![
-            Span::styled(indent.to_owned(), style),
+            Span::styled(indent, style),
             Span::styled(line.to_owned(), style),
         ]));
     }

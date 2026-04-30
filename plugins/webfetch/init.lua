@@ -7,25 +7,30 @@ local ACCEPT_HEADERS = {
   markdown = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.5",
 }
 
+local LT, GT, SLASH, SPACE, TAB, CR, LF = 60, 62, 47, 32, 9, 13, 10
+local function is_ws(b)
+  return b == SPACE or b == TAB or b == CR or b == LF
+end
+
 local function strip_html(html)
   local out = {}
   local in_tag = false
-  local tag_buf = {}
+  local tag_start = 0
   local skip_tag = nil
   local last_was_space = true
 
   for i = 1, #html do
-    local ch = html:sub(i, i)
-    if ch == "<" then
+    local b = html:byte(i)
+    if b == LT then
       in_tag = true
-      tag_buf = {}
-    elseif ch == ">" then
+      tag_start = i + 1
+    elseif b == GT then
       in_tag = false
-      local tag_str = table.concat(tag_buf):lower()
+      local tag_str = html:sub(tag_start, i - 1):lower()
       local tag_name = tag_str:match("^%s*(%S+)")
 
       if skip_tag then
-        if tag_name and tag_name:sub(1, 1) == "/" and tag_name:sub(2) == skip_tag then
+        if tag_name and tag_name:byte(1) == SLASH and tag_name:sub(2) == skip_tag then
           skip_tag = nil
         end
       elseif tag_name and SKIP_TAGS[tag_name] then
@@ -37,15 +42,15 @@ local function strip_html(html)
         last_was_space = true
       end
     elseif in_tag then
-      tag_buf[#tag_buf + 1] = ch
+      -- accumulate nothing; we use sub(tag_start, i-1) on close
     elseif not skip_tag then
-      if ch:match("%s") then
+      if is_ws(b) then
         if not last_was_space and #out > 0 then
           out[#out + 1] = " "
           last_was_space = true
         end
       else
-        out[#out + 1] = ch
+        out[#out + 1] = html:sub(i, i)
         last_was_space = false
       end
     end
@@ -143,7 +148,7 @@ maki.api.register_tool({
       view:toggle()
     end)
 
-    for line in (body .. "\n"):gmatch("([^\n]*)\n") do
+    for line in body:gmatch("([^\n]*)\n?") do
       view:append(line)
     end
     view:finish()

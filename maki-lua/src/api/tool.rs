@@ -141,15 +141,16 @@ impl ToolInvocation for LuaToolInvocation {
             let timeout_secs = deadline.cap_timeout(TOOL_CALL_MAX_TIME.as_secs())?;
 
             let (reply_tx, reply_rx) = flume::bounded::<ToolCallReply>(1);
+            let live = ctx.tool_use_id.clone().map(|id| LiveCtx {
+                event_tx: ctx.event_tx.clone(),
+                tool_use_id: id,
+            });
             let lua_ctx = LuaCtx {
                 cancel: ctx.cancel.clone(),
                 config: ctx.config.clone(),
                 tool_output_lines: ctx.tool_output_lines,
                 finish_tx: None,
-                live: ctx.tool_use_id.clone().map(|id| LiveCtx {
-                    event_tx: ctx.event_tx.clone(),
-                    tool_use_id: id,
-                }),
+                live: live.clone(),
             };
 
             tx.send_async(Request::CallTool {
@@ -162,10 +163,7 @@ impl ToolInvocation for LuaToolInvocation {
                     Deadline::None => None,
                 },
                 reply: reply_tx,
-                live: ctx.tool_use_id.clone().map(|id| LiveCtx {
-                    event_tx: ctx.event_tx.clone(),
-                    tool_use_id: id,
-                }),
+                live,
             })
             .await
             .map_err(|_| "lua thread disconnected".to_string())?;

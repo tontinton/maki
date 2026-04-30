@@ -97,7 +97,7 @@ maki.api.register_tool({
       view:toggle()
     end)
 
-    for line in (text .. "\n"):gmatch("([^\n]*)\n") do
+    for line in text:gmatch("([^\n]*)\n?") do
       view:append(line)
     end
     view:finish()
