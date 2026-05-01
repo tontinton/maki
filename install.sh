@@ -42,6 +42,63 @@ main() {
 
     chmod +x "${INSTALL_DIR}/${BINARY}"
     echo "${BINARY} ${tag} installed to ${INSTALL_DIR}/${BINARY}"
+    echo ""
+    print_migration_guide
+}
+
+print_migration_guide() {
+    cat <<'GUIDE'
+=== Migration Guide ===
+
+A few things changed recently. Nothing will break right away, but
+you will want to move your config files over when you get a chance.
+
+--- Config files ---
+
+config.toml is gone. Settings now live in init.lua.
+
+Before (config.toml):
+  [agent]
+  bash_timeout_secs = 180
+
+After (init.lua):
+  maki.setup({
+      agent = { bash_timeout_secs = 180 },
+  })
+
+Rename your files:
+  ~/.config/maki/config.toml  ->  ~/.config/maki/init.lua
+  .maki/config.toml           ->  .maki/init.lua
+
+Wrap the content in maki.setup({ ... }) and switch from TOML to Lua
+table syntax.
+
+--- MCP servers ---
+
+MCP config used to live inside config.toml under [mcp.*] sections.
+It now has its own file:
+
+  ~/.config/maki/mcp.toml   (global)
+  .maki/mcp.toml            (per-project)
+
+Move your [mcp.*] sections there. The format stays the same, just a
+different file. permissions.toml is unchanged.
+
+--- Directory layout ---
+
+If you had a ~/.maki/ directory, it still works. Maki checks it first
+as a fallback. But new installs and new files go to XDG locations:
+
+  Config:  ~/.config/maki/    (init.lua, permissions.toml, mcp.toml)
+  Data:    ~/.local/share/maki/
+  Logs:    ~/.local/logs/maki/
+  State:   ~/.local/state/maki/
+
+You can keep using ~/.maki/ forever, or move your files to the XDG
+paths whenever you feel like it. Maki checks both.
+
+Full docs: https://maki.sh/docs/configuration/
+GUIDE
 }
 
 need_cmd() {
