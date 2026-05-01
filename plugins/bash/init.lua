@@ -146,6 +146,11 @@ maki.api.register_tool({
     },
   },
   permission_scope = "command",
+  render = {
+    truncate_at = "tail",
+    input_code_field = "command",
+    input_code_language = "bash",
+  },
 
   header = function(input)
     local command, workdir = resolve_command(input)

@@ -268,6 +268,8 @@ fn parse_render_hints(spec: &Table) -> Option<RawRenderHints> {
     Some(RawRenderHints {
         truncate_lines: render.get::<usize>("truncate_lines").ok(),
         truncate_at: render.get::<String>("truncate_at").ok(),
+        input_code_field: render.get::<String>("input_code_field").ok(),
+        input_code_language: render.get::<String>("input_code_language").ok(),
     })
 }
 

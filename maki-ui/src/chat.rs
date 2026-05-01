@@ -18,7 +18,7 @@ use crate::selection::Selection;
 use maki_agent::tools::{ToolInvocation, ToolRegistry};
 use maki_agent::{
     AgentEvent, BatchToolStatus, NO_FILES_FOUND, QuestionInfo, RawRenderHints, ToolDoneEvent,
-    ToolOutput, ToolStartEvent,
+    ToolInput, ToolOutput, ToolStartEvent,
 };
 use maki_config::{ToolOutputLines, UiConfig};
 use maki_providers::{ContentBlock, Message, Role, TokenUsage};
@@ -348,7 +348,19 @@ pub fn history_to_display(
                             let tool_call: Option<Box<dyn ToolInvocation>> =
                                 reg.get(name).and_then(|entry| entry.try_parse(input));
                             let summary = reg.resolve_header(name, input);
-                            let tool_input = tool_call.as_deref().and_then(|tc| tc.start_input());
+                            let hints = registry.get(static_name);
+                            let tool_input = tool_call
+                                .as_deref()
+                                .and_then(|tc| tc.start_input())
+                                .or_else(|| {
+                                    let field = hints.input_code_field?;
+                                    let lang = hints.input_code_language.unwrap_or("text");
+                                    let code = input.get(field)?.as_str()?;
+                                    Some(ToolInput::Code {
+                                        language: lang.into(),
+                                        code: format!("{code}\n"),
+                                    })
+                                });
                             let (status, result_text) = results
                                 .get(id.as_str())
                                 .map(|(err, text)| {

@@ -652,6 +652,8 @@ pub struct InlineStyle {
 pub struct RawRenderHints {
     pub truncate_lines: Option<usize>,
     pub truncate_at: Option<String>,
+    pub input_code_field: Option<String>,
+    pub input_code_language: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

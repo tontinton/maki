@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand};
 use color_eyre::Result;
 use color_eyre::eyre::bail;
 
-use maki_agent::tools::ToolRegistry;
+use maki_agent::tools::{all_builtin_tool_names, is_builtin_tool};
 
 use crate::print::OutputFormat;
 
@@ -141,11 +141,11 @@ pub fn normalize_tool_name(name: &str) -> Result<String> {
             result.push(c);
         }
     }
-    if ToolRegistry::native().get(&result).is_none() {
+    if !is_builtin_tool(&result) {
         bail!(
             "unknown tool '{}'. Valid tools: {}",
             name,
-            maki_agent::tools::NATIVE_TOOL_NAMES.join(", ")
+            all_builtin_tool_names().join(", ")
         );
     }
     Ok(result)
@@ -170,6 +170,6 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("unknown tool"));
-        assert!(err.contains("bash"));
+        assert!(err.contains("read"));
     }
 }

@@ -57,7 +57,7 @@ pub const MIN_CONNECT_TIMEOUT_SECS: u64 = 1;
 pub const MIN_LOW_SPEED_TIMEOUT_SECS: u64 = 1;
 pub const MIN_STREAM_TIMEOUT_SECS: u64 = 10;
 
-pub const DEFAULT_BUILTINS: &[&str] = &["index", "webfetch", "websearch"];
+pub const DEFAULT_BUILTINS: &[&str] = &["bash", "index", "webfetch", "websearch"];
 
 #[derive(Debug, Clone, Copy)]
 pub enum ConfigValue {
@@ -1397,7 +1397,7 @@ mod tests {
             },
         );
         overlay.tools.insert(
-            "bash".to_string(),
+            "alpha_tool".to_string(),
             ToolFileConfig {
                 enabled: Some(true),
             },
@@ -1415,7 +1415,7 @@ mod tests {
             "overlay replaces"
         );
         assert_eq!(
-            base.tools["bash"].enabled,
+            base.tools["alpha_tool"].enabled,
             Some(true),
             "overlay-only key added"
         );
@@ -1461,12 +1461,6 @@ mod tests {
             },
         );
         tools.insert(
-            "bash".to_string(),
-            ToolFileConfig {
-                enabled: Some(true),
-            },
-        );
-        tools.insert(
             "zeta".to_string(),
             ToolFileConfig {
                 enabled: Some(true),
@@ -1489,7 +1483,10 @@ mod tests {
             plugins.tools.contains(&"index".to_string()),
             "untouched builtin stays"
         );
-        assert!(plugins.tools.contains(&"bash".to_string()), "extra enabled");
+        assert!(
+            plugins.tools.contains(&"bash".to_string()),
+            "bash is a default builtin"
+        );
         assert!(
             !plugins.tools.contains(&"custom_tool".to_string()),
             "enabled=None non-default ignored"
@@ -1503,7 +1500,7 @@ mod tests {
             .collect();
         assert_eq!(
             extras,
-            vec!["alpha", "bash", "zeta"],
+            vec!["alpha", "zeta"],
             "extras sorted alphabetically"
         );
     }

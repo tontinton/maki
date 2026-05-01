@@ -8,6 +8,10 @@ use maki_agent::tools::{
 use std::collections::HashMap;
 use std::sync::Arc;
 
+fn leak_str(s: &str) -> &'static str {
+    Box::leak(s.to_owned().into_boxed_str())
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum HeaderStyle {
     #[default]
@@ -40,12 +44,14 @@ pub enum BodyFormat {
     Markdown,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ToolRenderHints {
     pub header_style: HeaderStyle,
     pub body_format: BodyFormat,
     pub truncate_lines: Option<usize>,
     pub truncate_at: OutputKeep,
+    pub input_code_field: Option<&'static str>,
+    pub input_code_language: Option<&'static str>,
 }
 
 impl Default for ToolRenderHints {
@@ -62,8 +68,19 @@ impl ToolRenderHints {
             truncate_lines: raw.truncate_lines,
             truncate_at: match raw.truncate_at.as_deref() {
                 Some("tail") => OutputKeep::Tail,
-                _ => OutputKeep::Head,
+                Some(_) => OutputKeep::Head,
+                None => existing.map_or(OutputKeep::Head, |e| e.truncate_at),
             },
+            input_code_field: raw
+                .input_code_field
+                .as_deref()
+                .map(|s| leak_str(s))
+                .or(existing.and_then(|e| e.input_code_field)),
+            input_code_language: raw
+                .input_code_language
+                .as_deref()
+                .map(|s| leak_str(s))
+                .or(existing.and_then(|e| e.input_code_language)),
         }
     }
 }
@@ -85,6 +102,8 @@ impl ToolRenderHints {
         body_format: BodyFormat::Plain,
         truncate_lines: None,
         truncate_at: OutputKeep::Head,
+        input_code_field: None,
+        input_code_language: None,
     };
 }
 
@@ -92,6 +111,8 @@ const DEFAULT_HINTS: &[(&str, ToolRenderHints)] = &[
     hint!(BASH_TOOL_NAME,
         header_style: HeaderStyle::Command,
         truncate_at: OutputKeep::Tail,
+        input_code_field: Some("command"),
+        input_code_language: Some("bash"),
     ),
     hint!(CODE_EXECUTION_TOOL_NAME,
         truncate_at: OutputKeep::Tail,

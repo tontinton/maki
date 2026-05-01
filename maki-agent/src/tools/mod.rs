@@ -6,7 +6,6 @@
 //! at the bottom wire each native tool into the registry through `Native<T>`. Plan mode
 //! rejects writes to anything but the plan file before they reach the tool.
 
-mod bash;
 mod batch;
 mod code_execution;
 mod edit;
@@ -107,7 +106,7 @@ impl ToolFilter {
                 config
                     .allowed_tools
                     .iter()
-                    .filter(|s| ToolRegistry::native().has(s))
+                    .filter(|s| is_builtin_tool(s))
                     .cloned()
                     .collect(),
             )
@@ -126,7 +125,7 @@ pub fn is_tool_enabled(config: &AgentConfig, name: &str) -> bool {
     !disabled_tool_names(config).contains(&name)
 }
 
-pub const BASH_TOOL_NAME: &str = bash::Bash::NAME;
+pub const BASH_TOOL_NAME: &str = "bash";
 pub const BATCH_TOOL_NAME: &str = batch::Batch::NAME;
 pub const EDIT_TOOL_NAME: &str = edit::Edit::NAME;
 pub const GLOB_TOOL_NAME: &str = glob::Glob::NAME;
@@ -534,7 +533,6 @@ macro_rules! register_tools {
 }
 
 register_tools! {
-    bash::Bash,
     read::Read,
     write::Write,
     edit::Edit,
@@ -548,6 +546,18 @@ register_tools! {
     batch::Batch,
     code_execution::CodeExecution,
     memory::Memory,
+}
+
+pub fn is_builtin_tool(name: &str) -> bool {
+    NATIVE_TOOL_NAMES.contains(&name) || maki_config::DEFAULT_BUILTINS.contains(&name)
+}
+
+pub fn all_builtin_tool_names() -> Vec<&'static str> {
+    NATIVE_TOOL_NAMES
+        .iter()
+        .chain(maki_config::DEFAULT_BUILTINS.iter())
+        .copied()
+        .collect()
 }
 
 use maki_providers::provider::BoxFuture;
@@ -973,7 +983,7 @@ mod tests {
     #[test]
     fn definitions_filtered_returns_only_requested() {
         let vars = Vars::new().set("{cwd}", "/tmp");
-        let filter = ToolFilter::Only(vec!["bash".into(), "read".into()]);
+        let filter = ToolFilter::Only(vec!["read".into(), "glob".into()]);
         let ctx = DescriptionContext {
             skills: &[],
             filter: &filter,
@@ -985,7 +995,7 @@ mod tests {
             .iter()
             .map(|d| d["name"].as_str().unwrap())
             .collect();
-        assert_eq!(names, ["bash", "read"]);
+        assert_eq!(names, ["read", "glob"]);
     }
 
     #[test_case("write",     |p: &str, _: &str| json!({"path": p, "content": "plan"})                          , |_: &str, o: &str| json!({"path": o, "content": "x"})                           ; "write")]

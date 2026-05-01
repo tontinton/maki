@@ -8,36 +8,12 @@ use toml_edit::DocumentMut;
 
 use super::SEPARATOR;
 use super::error::McpError;
-use crate::tools::{
-    BASH_TOOL_NAME, BATCH_TOOL_NAME, CODE_EXECUTION_TOOL_NAME, EDIT_TOOL_NAME, GLOB_TOOL_NAME,
-    GREP_TOOL_NAME, MEMORY_TOOL_NAME, MULTIEDIT_TOOL_NAME, QUESTION_TOOL_NAME, READ_TOOL_NAME,
-    SKILL_TOOL_NAME, TASK_TOOL_NAME, TODOWRITE_TOOL_NAME, WRITE_TOOL_NAME,
-};
+use crate::tools::is_builtin_tool;
 use maki_config::global_config_dir;
 
 const MCP_CONFIG_FILE: &str = "mcp.toml";
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 const MAX_TIMEOUT_MS: u64 = 300_000;
-
-const BUILTIN_TOOL_NAMES: &[&str] = &[
-    BASH_TOOL_NAME,
-    READ_TOOL_NAME,
-    WRITE_TOOL_NAME,
-    EDIT_TOOL_NAME,
-    MULTIEDIT_TOOL_NAME,
-    GLOB_TOOL_NAME,
-    GREP_TOOL_NAME,
-    QUESTION_TOOL_NAME,
-    TODOWRITE_TOOL_NAME,
-    MEMORY_TOOL_NAME,
-    "index",
-    "webfetch",
-    "websearch",
-    SKILL_TOOL_NAME,
-    TASK_TOOL_NAME,
-    BATCH_TOOL_NAME,
-    CODE_EXECUTION_TOOL_NAME,
-];
 
 fn default_true() -> bool {
     true
@@ -175,7 +151,7 @@ pub fn parse_server(name: String, server: RawServerConfig) -> Result<ServerConfi
             "server name '{name}' must be ASCII alphanumeric + hyphens"
         )));
     }
-    if BUILTIN_TOOL_NAMES.contains(&name.as_str()) {
+    if is_builtin_tool(&name) {
         return Err(McpError::Config(format!(
             "server name '{name}' conflicts with built-in tool"
         )));

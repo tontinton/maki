@@ -442,7 +442,7 @@ mod tests {
         });
     }
 
-    /// Denies bash and verifies the marker file is never created.
+    /// Denies write and verifies the marker file is never created.
     #[test]
     fn permission_denial_short_circuits_execute() {
         use std::sync::Arc;
@@ -453,17 +453,17 @@ mod tests {
         use crate::permissions::{PERMISSION_DENIED_PREFIX, PermissionManager};
 
         smol::block_on(async {
-            let deny_all_bash = PermissionsConfig {
+            let deny_all_write = PermissionsConfig {
                 allow_all: false,
                 rules: vec![PermissionRule {
-                    tool: crate::tools::BASH_TOOL_NAME.into(),
+                    tool: crate::tools::WRITE_TOOL_NAME.into(),
                     scope: None,
                     effect: Effect::Deny,
                 }],
             };
             let dir = TempDir::new().unwrap();
             let permissions = Arc::new(PermissionManager::new(
-                deny_all_bash,
+                deny_all_write,
                 dir.path().to_path_buf(),
             ));
             let ctx = crate::tools::test_support::stub_ctx_with_permissions(
@@ -478,8 +478,8 @@ mod tests {
                 ToolRegistry::native(),
                 None,
                 "t1".into(),
-                crate::tools::BASH_TOOL_NAME,
-                &serde_json::json!({ "command": format!("touch {marker_str}") }),
+                crate::tools::WRITE_TOOL_NAME,
+                &serde_json::json!({ "path": marker_str, "content": "x" }),
                 &ctx,
                 Emit::Silent,
             )

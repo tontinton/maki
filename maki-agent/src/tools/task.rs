@@ -239,7 +239,6 @@ mod tests {
         let all = MAIN | RES | GEN | INT;
 
         let expected: BTreeMap<&str, ToolAudience> = BTreeMap::from([
-            (super::super::BASH_TOOL_NAME, all),
             (super::super::READ_TOOL_NAME, all),
             (super::super::GLOB_TOOL_NAME, all),
             (super::super::GREP_TOOL_NAME, all),
