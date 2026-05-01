@@ -119,6 +119,7 @@ impl MessagesPanel {
         self.cache.clear();
         self.expanded_tools.clear();
         self.batch_children.clear();
+        self.live_bufs.clear();
         self.highlight_segment = None;
     }
 
