@@ -159,3 +159,23 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release edit "${{ needs.create-release.outputs.tag }}" --repo "$GITHUB_REPOSITORY" --draft=false
+
+  deploy-docs:
+    name: Deploy Docs
+    needs: [publish-release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build site
+        working-directory: site
+        run: bash build.sh
+
+      - name: Deploy to Cloudflare Pages
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy site/_build --project-name=maki
