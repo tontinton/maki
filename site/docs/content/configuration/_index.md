@@ -7,14 +7,14 @@ group = "Getting Started"
 
 # Configuration
 
-Maki uses Lua config files in two places:
+Settings go in `init.lua`, a Lua script that calls `maki.setup()`. Same language as plugins.
+
+Two places, both optional:
 
 - **Global**: `~/.config/maki/init.lua`
 - **Project**: `.maki/init.lua` (relative to your working directory)
 
-Project settings win over global ones, field by field. Neither file needs to exist; everything has a default.
-
-All fields are optional. Unknown fields cause an immediate error with a helpful message.
+When both exist, project settings override global ones. Neither file is required.
 
 ## Example
 
@@ -43,6 +43,8 @@ maki.setup({
     },
 })
 ```
+
+All fields are optional. Typos in field names cause an error right away.
 
 `maki.setup()` can only be called once per init.lua.
 
@@ -119,7 +121,7 @@ How many lines of output to show per tool in the UI. All values are `usize` with
 
 ## Tools
 
-The `tools` table controls which tools are loaded. By default, `index`, `webfetch`, and `websearch` are enabled. `bash` is available but disabled by default.
+The `tools` table lets you turn tools on or off. By default `index`, `webfetch`, and `websearch` are on. `bash` is off by default.
 
 ```lua
 maki.setup({
@@ -132,23 +134,65 @@ maki.setup({
 
 ## Validation
 
-Numeric fields are validated against their minimums on load. A value below the minimum raises a `ConfigError` with the section, field, value, and minimum. Invalid config logs a warning and falls back to defaults.
+If a value is below its minimum, Maki shows a `ConfigError` with the field name, value, and minimum.
 
-## Migrating from config.toml
+## Directory layout
 
-If you are upgrading from a version that used `config.toml`:
+Maki uses XDG directories on Linux and macOS:
 
-1. Rename `~/.config/maki/config.toml` to `~/.config/maki/init.lua`
-2. Rename `.maki/config.toml` to `.maki/init.lua`
-3. Wrap your settings in `maki.setup({ ... })`
-4. Move any `[mcp.*]` sections to `mcp.toml` (see [MCP](/docs/mcp/))
-5. Permissions stay in `permissions.toml`, nothing changes there
+| Purpose | Path |
+|---------|------|
+| Config | `~/.config/maki/` (init.lua, permissions.toml, mcp.toml) |
+| Data | `~/.local/share/maki/` |
+| Logs | `~/.local/logs/maki/` |
+| State | `~/.local/state/maki/` |
+
+`~/.maki/` is checked as a legacy fallback.
 
 ## Personal Instructions
 
-Beyond the shared `AGENTS.md`, Maki supports two files for your own instructions:
+On top of `AGENTS.md`, you can add your own instructions in two places:
 
 - `AGENTS.local.md` at project root for per-project preferences (gitignored)
-- `~/.maki/AGENTS.md` for preferences that apply to all projects
+- `~/.config/maki/AGENTS.md` for preferences that apply to all projects
 
-Both load into the system prompt every session, right after `AGENTS.md`.
+Both are added to the system prompt at the start of every session.
+
+## Migrating from config.toml
+
+Still have a `config.toml`? Here is how to switch over.
+
+**Rename your config files:**
+
+```
+~/.config/maki/config.toml  ->  ~/.config/maki/init.lua
+.maki/config.toml           ->  .maki/init.lua
+```
+
+**Wrap the content in `maki.setup()`:**
+
+Before:
+
+```toml
+[agent]
+bash_timeout_secs = 180
+```
+
+After:
+
+```lua
+maki.setup({
+    agent = { bash_timeout_secs = 180 },
+})
+```
+
+Same field names, just Lua syntax instead of TOML.
+
+**Move MCP sections to `mcp.toml`.**
+
+- `~/.config/maki/mcp.toml` (global)
+- `.maki/mcp.toml` (per-project)
+
+Same format, just a different file. See [MCP](/docs/mcp/).
+
+**Permissions stay in `permissions.toml`.**
