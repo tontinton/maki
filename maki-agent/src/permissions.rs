@@ -1,4 +1,3 @@
-use std::cell::RefCell;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -9,16 +8,8 @@ use maki_config::{
 };
 use thiserror::Error;
 use tracing::{info, warn};
-use tree_sitter::{Node, Parser};
 
 use crate::{AgentEvent, EventSender};
-
-const COMPLEX_NODE_TYPES: &[&str] = &[
-    "command_substitution",
-    "process_substitution",
-    "subshell",
-    "arithmetic_expansion",
-];
 
 pub const DEFAULT_DENY_GUIDANCE: &str =
     "Do not retry. Try a different approach or ask the user for guidance.";
@@ -44,18 +35,6 @@ fn builtin_rules(cwd: &Path) -> Vec<PermissionRule> {
         allow("multiedit", &cwd_glob),
         allow("task", "*"),
     ]
-}
-
-thread_local! {
-    static BASH_PARSER: RefCell<Parser> = RefCell::new({
-        let mut parser = Parser::new();
-        parser.set_language(&tree_sitter_bash::LANGUAGE.into()).expect("failed to load bash grammar");
-        parser
-    });
-}
-
-fn parse_bash(input: &str) -> Option<tree_sitter::Tree> {
-    BASH_PARSER.with(|p| p.borrow_mut().parse(input, None))
 }
 
 #[derive(Debug)]
@@ -240,17 +219,12 @@ impl PermissionManager {
         }
     }
 
-    fn check_bash(&self, command: &str) -> PermissionCheck {
-        let (scopes, is_complex) = analyze_bash(command);
-        let scope_refs: Vec<&str> = scopes.iter().map(|s| s.as_str()).collect();
-        self.check_inner("bash", &scope_refs, is_complex)
+    pub fn check(&self, tool: &str, scope: &str) -> PermissionCheck {
+        self.check_inner(tool, &[scope], false)
     }
 
-    pub fn check(&self, tool: &str, scope: &str) -> PermissionCheck {
-        if tool == "bash" {
-            return self.check_bash(scope);
-        }
-        self.check_inner(tool, &[scope], false)
+    pub fn check_multi(&self, tool: &str, scopes: &[&str], force_prompt: bool) -> PermissionCheck {
+        self.check_inner(tool, scopes, force_prompt)
     }
 
     pub fn add_session_rule(&self, rule: PermissionRule) {
@@ -332,75 +306,70 @@ impl PermissionManager {
     pub async fn enforce(
         &self,
         tool: &str,
-        scope: &str,
+        scopes: &crate::tools::PermissionScopes,
         event_tx: &EventSender,
         user_response_rx: Option<&async_lock::Mutex<flume::Receiver<String>>>,
         request_id: &str,
         cancel: &crate::CancelToken,
     ) -> Result<(), PermissionError> {
-        match self.check(tool, scope) {
-            PermissionCheck::Allowed => Ok(()),
-            PermissionCheck::Denied => Err(PermissionError::new(tool, scope)),
-            PermissionCheck::NeedsPrompt {
-                tool: pt,
-                scopes: ps,
-                force_prompt,
-            } => {
-                let Some(rx) = user_response_rx else {
-                    warn!(tool, scope, "no permission response channel");
-                    return Err(PermissionError::new(tool, scope));
-                };
-                let guard = rx.lock().await;
-                let refs: Vec<&str> = ps.iter().map(|s| s.as_str()).collect();
-                match self.check_inner(&pt, &refs, force_prompt) {
-                    PermissionCheck::Allowed => {
-                        drop(guard);
-                        Ok(())
-                    }
-                    PermissionCheck::Denied => {
-                        drop(guard);
-                        Err(PermissionError::new(tool, scope))
-                    }
-                    PermissionCheck::NeedsPrompt {
-                        tool: t2,
-                        scopes: s2,
-                        ..
-                    } => {
-                        let _ = event_tx.send(AgentEvent::PermissionRequest {
-                            id: request_id.to_owned(),
-                            tool: t2.clone(),
-                            scopes: s2.clone(),
-                        });
-                        let response = cancel.race(guard.recv_async()).await;
-                        drop(guard);
-                        let answer = match response {
-                            Ok(Ok(a)) => a,
-                            Ok(Err(_)) => {
-                                warn!(tool, scope, "permission channel closed");
-                                return Err(PermissionError::new(tool, scope));
-                            }
-                            Err(_) => return Err(PermissionError::new(tool, scope)),
-                        };
-                        match PermissionAnswer::decode(&answer) {
-                            Some(a) => {
-                                self.apply_decision(&t2, &s2, &a);
-                                if a.is_allow() {
-                                    Ok(())
-                                } else if let Some(guidance) = a.guidance() {
-                                    Err(PermissionError::with_guidance(
-                                        tool,
-                                        scope,
-                                        guidance.to_string(),
-                                    ))
-                                } else {
-                                    Err(PermissionError::new(tool, scope))
-                                }
-                            }
-                            None => Err(PermissionError::new(tool, scope)),
-                        }
-                    }
-                }
+        let scope_refs: Vec<&str> = scopes.scopes.iter().map(|s| s.as_str()).collect();
+        let deny = |guidance: Option<String>| {
+            let display = scopes.scopes.join("; ");
+            match guidance {
+                Some(g) => PermissionError::with_guidance(tool, &display, g),
+                None => PermissionError::new(tool, &display),
             }
+        };
+
+        let (pt, ps, force_prompt) = match self.check_inner(tool, &scope_refs, scopes.force_prompt)
+        {
+            PermissionCheck::Allowed => return Ok(()),
+            PermissionCheck::Denied => return Err(deny(None)),
+            PermissionCheck::NeedsPrompt {
+                tool,
+                scopes,
+                force_prompt,
+            } => (tool, scopes, force_prompt),
+        };
+
+        let Some(rx) = user_response_rx else {
+            warn!(tool, scope = %scopes.scopes.join("; "), "no permission response channel");
+            return Err(deny(None));
+        };
+
+        let guard = rx.lock().await;
+        let refs: Vec<&str> = ps.iter().map(|s| s.as_str()).collect();
+        let (t2, s2) = match self.check_inner(&pt, &refs, force_prompt) {
+            PermissionCheck::Allowed => return Ok(()),
+            PermissionCheck::Denied => return Err(deny(None)),
+            PermissionCheck::NeedsPrompt { tool, scopes, .. } => (tool, scopes),
+        };
+
+        let _ = event_tx.send(AgentEvent::PermissionRequest {
+            id: request_id.to_owned(),
+            tool: t2.clone(),
+            scopes: s2.clone(),
+        });
+        let response = cancel.race(guard.recv_async()).await;
+        drop(guard);
+
+        let answer = match response {
+            Ok(Ok(a)) => a,
+            Ok(Err(_)) => {
+                warn!(tool, scope = %scopes.scopes.join("; "), "permission channel closed");
+                return Err(deny(None));
+            }
+            Err(_) => return Err(deny(None)),
+        };
+
+        let Some(answer) = PermissionAnswer::decode(&answer) else {
+            return Err(deny(None));
+        };
+        self.apply_decision(&t2, &s2, &answer);
+        if answer.is_allow() {
+            Ok(())
+        } else {
+            Err(deny(answer.guidance().map(String::from)))
         }
     }
 }
@@ -427,106 +396,6 @@ pub fn scope_matches(pattern: &str, value: &str) -> bool {
         return value.starts_with(prefix);
     }
     pattern == value
-}
-
-pub fn split_shell_commands(input: &str) -> Vec<String> {
-    let trimmed = input.trim();
-    if trimmed.is_empty() {
-        return Vec::new();
-    }
-    let Some(tree) = parse_bash(trimmed) else {
-        return vec![trimmed.to_string()];
-    };
-    let mut segments = Vec::new();
-    collect_commands(tree.root_node(), trimmed, &mut segments);
-    if segments.is_empty() {
-        vec![trimmed.to_string()]
-    } else {
-        segments
-    }
-}
-
-fn collect_commands(node: Node, source: &str, out: &mut Vec<String>) {
-    match node.kind() {
-        "program" | "list" => {
-            let mut cursor = node.walk();
-            for child in node.children(&mut cursor) {
-                collect_commands(child, source, out);
-            }
-        }
-        "pipeline" => {
-            let mut cursor = node.walk();
-            for child in node.children(&mut cursor) {
-                if child.is_named() {
-                    let text = &source[child.start_byte()..child.end_byte()];
-                    let text = text.trim();
-                    if !text.is_empty() {
-                        out.push(text.to_string());
-                    }
-                }
-            }
-        }
-        "command"
-        | "redirected_statement"
-        | "negated_command"
-        | "subshell"
-        | "compound_statement"
-        | "if_statement"
-        | "while_statement"
-        | "for_statement"
-        | "case_statement"
-        | "function_definition"
-        | "c_style_for_statement" => {
-            let text = &source[node.start_byte()..node.end_byte()];
-            let text = text.trim();
-            if !text.is_empty() {
-                out.push(text.to_string());
-            }
-        }
-        kind if node.is_named() => {
-            warn!(
-                node_kind = kind,
-                "unknown bash AST node in permission check"
-            );
-        }
-        _ => {}
-    }
-}
-
-fn analyze_bash(command: &str) -> (Vec<String>, bool) {
-    let Some(tree) = parse_bash(command) else {
-        return (vec![command.to_string()], true);
-    };
-    if is_complex_bash(&tree) {
-        return (vec![command.to_string()], true);
-    }
-    let mut segments = Vec::new();
-    collect_commands(tree.root_node(), command, &mut segments);
-    if segments.is_empty() {
-        (vec![command.to_string()], false)
-    } else {
-        (segments, false)
-    }
-}
-
-fn is_complex_bash(tree: &tree_sitter::Tree) -> bool {
-    has_complex_node(tree.root_node()) || has_error_node(tree.root_node())
-}
-
-fn has_complex_node(node: Node) -> bool {
-    if COMPLEX_NODE_TYPES.contains(&node.kind()) {
-        return true;
-    }
-    let mut cursor = node.walk();
-    node.children(&mut cursor).any(|c| has_complex_node(c))
-}
-
-fn has_error_node(node: Node) -> bool {
-    if node.is_error() || node.is_missing() {
-        return true;
-    }
-    let mut cursor = node.walk();
-    node.children(&mut cursor).any(|c| has_error_node(c))
 }
 
 pub fn canonicalize_scope_path(path: &str) -> String {
@@ -612,42 +481,26 @@ mod tests {
         PermissionManager::new(PermissionsConfig::default(), PathBuf::from("/tmp"))
     }
 
-    #[test_case("cargo test" => vec!["cargo test"] ; "single")]
-    #[test_case("a && b || c ; d" => vec!["a", "b", "c", "d"] ; "operators")]
-    #[test_case("a | b" => vec!["a", "b"] ; "pipe")]
-    #[test_case("echo \"a && b\"" => vec!["echo \"a && b\""] ; "quoted_not_split")]
-    #[test_case("" => Vec::<String>::new() ; "empty")]
-    fn split_shell(input: &str) -> Vec<String> {
-        split_shell_commands(input)
-    }
-
     #[test_case("*", "anything" => true ; "star")]
     #[test_case("cargo *", "cargo test" => true ; "prefix")]
     #[test_case("cargo *", "git push" => false ; "prefix_no_match")]
     #[test_case("src/**", "src/main.rs" => true ; "glob")]
+    #[test_case("src/**", "src/deep/nested/file.rs" => true ; "glob_deep_nested")]
+    #[test_case("src/**", "src" => true ; "glob_exact_prefix")]
     #[test_case("src/**", "srcfoo" => false ; "glob_no_bare_prefix")]
+    #[test_case("src/**", "other/src/main.rs" => false ; "glob_no_inner_match")]
     fn scope_match(pattern: &str, value: &str) -> bool {
         scope_matches(pattern, value)
     }
 
-    // Things like $(cmd) or subshells can hide dangerous commands, so we always ask
-    #[test_case("cargo test" => false ; "simple")]
-    #[test_case("echo $(whoami)" => true ; "command_sub")]
-    #[test_case("(cd /tmp && ls)" => true ; "subshell")]
-    #[test_case("echo 'safe $(x)'" => false ; "single_quoted_safe")]
-    #[test_case("echo $(((" => true ; "parse_error")]
-    fn complex_shell(input: &str) -> bool {
-        analyze_bash(input).1
-    }
-
-    #[test_case("cd /tmp && cargo test", vec!["cd *", "cargo *"], true ; "all_allowed")]
-    #[test_case("cd /tmp && cargo test", vec!["cargo *"], false ; "missing_rule")]
-    fn compound_check(cmd: &str, rules: Vec<&str>, expect_allowed: bool) {
+    #[test_case(vec!["cd /tmp", "cargo test"], vec!["cd *", "cargo *"], true ; "all_allowed")]
+    #[test_case(vec!["cd /tmp", "cargo test"], vec!["cargo *"], false ; "missing_rule")]
+    fn compound_check(scopes: Vec<&str>, rules: Vec<&str>, expect_allowed: bool) {
         let mgr = PermissionManager::new(
             make_config(rules.into_iter().map(allow_rule).collect()),
             PathBuf::from("/tmp"),
         );
-        let check = mgr.check("bash", cmd);
+        let check = mgr.check_multi("bash", &scopes, false);
         assert_eq!(matches!(check, PermissionCheck::Allowed), expect_allowed);
     }
 
@@ -662,7 +515,7 @@ mod tests {
             PathBuf::from("/tmp"),
         );
         assert!(matches!(
-            mgr.check("bash", "cd /tmp && cargo test && rm -rf /"),
+            mgr.check_multi("bash", &["cd /tmp", "cargo test", "rm -rf /"], false),
             PermissionCheck::Denied
         ));
     }
@@ -671,7 +524,7 @@ mod tests {
     fn complex_constructs_force_prompt_even_with_allow_star() {
         let mgr = PermissionManager::new(make_config(vec![allow_rule("*")]), PathBuf::from("/tmp"));
         assert!(matches!(
-            mgr.check("bash", "echo $(whoami)"),
+            mgr.check_multi("bash", &["echo $(whoami)"], true),
             PermissionCheck::NeedsPrompt { .. }
         ));
     }
@@ -766,5 +619,175 @@ mod tests {
         ] {
             assert_eq!(PermissionAnswer::decode(&a.encode()), Some(a));
         }
+    }
+
+    #[test]
+    fn check_multi_force_prompt_skips_allow_rules() {
+        let mgr = PermissionManager::new(
+            make_config(vec![allow_rule("cargo *"), allow_rule("git *")]),
+            PathBuf::from("/tmp"),
+        );
+        assert!(matches!(
+            mgr.check_multi("bash", &["cargo test", "git push"], false),
+            PermissionCheck::Allowed
+        ));
+        match mgr.check_multi("bash", &["cargo test", "git push"], true) {
+            PermissionCheck::NeedsPrompt {
+                scopes,
+                force_prompt,
+                ..
+            } => {
+                assert_eq!(scopes, vec!["cargo test", "git push"]);
+                assert!(force_prompt);
+            }
+            other => panic!("expected NeedsPrompt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_multi_deny_wins_over_force_prompt() {
+        let mgr =
+            PermissionManager::new(make_config(vec![deny_rule("rm *")]), PathBuf::from("/tmp"));
+        assert!(matches!(
+            mgr.check_multi("bash", &["rm -rf /"], true),
+            PermissionCheck::Denied
+        ));
+    }
+
+    #[test]
+    fn check_multi_partial_coverage_prompts_uncovered() {
+        let mgr = PermissionManager::new(
+            make_config(vec![allow_rule("cargo *")]),
+            PathBuf::from("/tmp"),
+        );
+        match mgr.check_multi("bash", &["cargo test", "git push", "ls"], false) {
+            PermissionCheck::NeedsPrompt { scopes, .. } => {
+                assert_eq!(scopes, vec!["git push", "ls"]);
+            }
+            other => panic!("expected NeedsPrompt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_decision_multi_scope_generalizes_all() {
+        let mgr = default_mgr();
+        mgr.apply_decision(
+            "bash",
+            &["cargo test".into(), "git status".into()],
+            &PermissionAnswer::AllowSession,
+        );
+        assert!(matches!(
+            mgr.check("bash", "cargo build"),
+            PermissionCheck::Allowed
+        ));
+        assert!(matches!(
+            mgr.check("bash", "git push"),
+            PermissionCheck::Allowed
+        ));
+    }
+
+    #[test]
+    fn generalized_scopes_deduplicates() {
+        let scopes = vec!["cargo test".into(), "cargo build".into()];
+        let result = generalized_scopes("bash", &scopes);
+        assert_eq!(result, vec!["cargo *"]);
+    }
+
+    #[test]
+    fn generalized_scopes_preserves_distinct() {
+        let scopes = vec!["cargo test".into(), "git status".into()];
+        let result = generalized_scopes("bash", &scopes);
+        assert_eq!(result, vec!["cargo *", "git *"]);
+    }
+
+    #[test_case("edit", "/home/user/project/src/main.rs" => "/home/user/project/src/**" ; "edit_uses_parent_dir")]
+    #[test_case("edit", "/Cargo.toml" => "//**" ; "edit_root_file")]
+    #[test_case("webfetch", "some:scope" => "some:scope" ; "unknown_tool_preserves_exact")]
+    fn generalize_single_scope(tool: &str, scope: &str) -> String {
+        generalized_scopes(tool, &[scope.into()])
+            .into_iter()
+            .next()
+            .unwrap()
+    }
+
+    #[test]
+    fn generalize_edit_scope_root_file() {
+        let scopes = vec!["/Cargo.toml".into()];
+        let result = generalized_scopes("edit", &scopes);
+        assert_eq!(result, vec!["//**"]);
+    }
+
+    #[test]
+    fn generalize_unknown_tool_preserves_exact() {
+        let scopes = vec!["some:scope".into()];
+        let result = generalized_scopes("webfetch", &scopes);
+        assert_eq!(result, vec!["some:scope"]);
+    }
+
+    #[test]
+    fn deny_rule_with_none_scope_blocks_everything() {
+        let mgr = PermissionManager::new(
+            make_config(vec![PermissionRule {
+                tool: "bash".into(),
+                scope: None,
+                effect: Effect::Deny,
+            }]),
+            PathBuf::from("/tmp"),
+        );
+        assert!(matches!(
+            mgr.check("bash", "anything"),
+            PermissionCheck::Denied
+        ));
+    }
+
+    #[test]
+    fn wildcard_tool_rule_applies_cross_tool() {
+        let mgr = PermissionManager::new(
+            make_config(vec![PermissionRule {
+                tool: "*".into(),
+                scope: None,
+                effect: Effect::Deny,
+            }]),
+            PathBuf::from("/tmp"),
+        );
+        assert!(matches!(mgr.check("bash", "ls"), PermissionCheck::Denied));
+        assert!(matches!(
+            mgr.check("write", "/tmp/x"),
+            PermissionCheck::Denied
+        ));
+    }
+
+    #[test]
+    fn yolo_mode_allows_but_deny_still_blocks() {
+        let mgr =
+            PermissionManager::new(make_config(vec![deny_rule("rm *")]), PathBuf::from("/tmp"));
+        mgr.toggle_yolo();
+        assert!(mgr.is_yolo());
+        assert!(matches!(
+            mgr.check("bash", "cargo test"),
+            PermissionCheck::Allowed
+        ));
+        assert!(matches!(
+            mgr.check("bash", "rm -rf /"),
+            PermissionCheck::Denied
+        ));
+    }
+
+    #[test]
+    fn add_session_rule_is_idempotent() {
+        let mgr = default_mgr();
+        let rule = allow_rule("cargo *");
+        mgr.add_session_rule(rule.clone());
+        mgr.add_session_rule(rule.clone());
+        mgr.add_session_rule(rule);
+        assert_eq!(mgr.session_rules_snapshot().len(), 1);
+    }
+
+    #[test_case(PermissionAnswer::AllowOnce ; "allow_once")]
+    #[test_case(PermissionAnswer::Deny ; "deny_once")]
+    fn once_decisions_add_no_session_rules(answer: PermissionAnswer) {
+        let mgr = default_mgr();
+        mgr.apply_decision("bash", &["cargo test".into()], &answer);
+        assert!(mgr.session_rules_snapshot().is_empty());
     }
 }

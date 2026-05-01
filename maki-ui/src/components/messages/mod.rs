@@ -34,8 +34,8 @@ use std::time::Instant;
 use super::scrollbar::render_vertical_scrollbar;
 use super::streaming_content::StreamingContent;
 use maki_agent::{
-    BatchToolEntry, BatchToolStatus, BufferSnapshot, InstructionBlock, NO_FILES_FOUND,
-    RawRenderHints, SharedBuf, ToolDoneEvent, ToolOutput, ToolStartEvent,
+    BatchToolEntry, BatchToolStatus, BufferSnapshot, InstructionBlock, NO_FILES_FOUND, SharedBuf,
+    ToolDoneEvent, ToolOutput, ToolStartEvent,
 };
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -121,12 +121,6 @@ impl MessagesPanel {
         self.batch_children.clear();
         self.live_bufs.clear();
         self.highlight_segment = None;
-    }
-
-    pub fn register_plugin_hints(&mut self, tools: Vec<(Arc<str>, RawRenderHints)>) {
-        for (name, raw) in tools {
-            self.render_hints.register(name, &raw);
-        }
     }
 
     pub fn thinking_delta(&mut self, text: &str) {

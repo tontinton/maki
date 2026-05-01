@@ -75,8 +75,10 @@ impl super::ToolInvocation for Edit {
     fn mutable_path(&self) -> Option<&Path> {
         Some(Path::new(&self.path))
     }
-    fn permission_scope(&self) -> Option<String> {
-        Some(crate::permissions::canonicalize_scope_path(&self.path))
+    fn permission_scopes(&self) -> super::BoxFuture<'_, Option<super::PermissionScopes>> {
+        Box::pin(std::future::ready(Some(super::PermissionScopes::single(
+            crate::permissions::canonicalize_scope_path(&self.path),
+        ))))
     }
     fn execute<'a>(self: Box<Self>, ctx: &'a super::ToolContext) -> super::ExecFuture<'a> {
         Box::pin(async move { Edit::execute(&self, ctx).await })

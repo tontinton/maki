@@ -167,9 +167,6 @@ impl super::ToolInvocation for CodeExecution {
     fn start_annotation(&self) -> Option<String> {
         Some(super::timeout_annotation(self.timeout.unwrap_or(30)))
     }
-    fn permission_scope(&self) -> Option<String> {
-        None
-    }
     fn execute<'a>(self: Box<Self>, ctx: &'a super::ToolContext) -> super::ExecFuture<'a> {
         Box::pin(async move { CodeExecution::execute(&self, ctx).await })
     }

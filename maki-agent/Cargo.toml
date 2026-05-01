@@ -35,8 +35,6 @@ toml_edit = { workspace = true }
 isahc = { workspace = true }
 libc = { workspace = true }
 open = { workspace = true }
-tree-sitter = { workspace = true }
-tree-sitter-bash = { workspace = true }
 sha2 = { workspace = true }
 serde_yaml = { workspace = true }
 base64 = { workspace = true }

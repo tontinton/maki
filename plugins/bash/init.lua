@@ -122,6 +122,68 @@ local function append_line(output, line)
 end
 
 local cwd = maki.uv.cwd() or "."
+
+local COMPLEX_TYPES = {
+  command_substitution = true,
+  process_substitution = true,
+  subshell = true,
+  arithmetic_expansion = true,
+}
+
+local function is_complex(node)
+  if COMPLEX_TYPES[node:type()] then
+    return true
+  end
+  for child in node:iter_children() do
+    if is_complex(child) then
+      return true
+    end
+  end
+  return false
+end
+
+local LEAF_COMMAND_TYPES = {
+  command = true,
+  redirected_statement = true,
+  negated_command = true,
+  subshell = true,
+  compound_statement = true,
+  if_statement = true,
+  while_statement = true,
+  for_statement = true,
+  case_statement = true,
+  function_definition = true,
+  c_style_for_statement = true,
+}
+
+local function collect_commands(node, source)
+  local out = {}
+  local kind = node:type()
+  if kind == "program" or kind == "list" then
+    for child in node:iter_children() do
+      local nested = collect_commands(child, source)
+      for _, cmd in ipairs(nested) do
+        out[#out + 1] = cmd
+      end
+    end
+  elseif kind == "pipeline" then
+    for child in node:iter_children() do
+      if child:named() then
+        local text = maki.treesitter.get_node_text(child, source):match("^%s*(.-)%s*$")
+        if text ~= "" then
+          out[#out + 1] = text
+        end
+      end
+    end
+  elseif LEAF_COMMAND_TYPES[kind] then
+    local text = maki.treesitter.get_node_text(node, source):match("^%s*(.-)%s*$")
+    if text ~= "" then
+      out[#out + 1] = text
+    end
+  end
+  return out
+end
+
 local description = [[Execute a bash command.
 Commands run in ]] .. cwd .. [[ by default.
 
@@ -145,12 +207,28 @@ maki.api.register_tool({
       description = { type = "string", description = "Short description (3-5 words) of what the command does" },
     },
   },
-  permission_scope = "command",
-  render = {
-    truncate_at = "tail",
-    input_code_field = "command",
-    input_code_language = "bash",
-  },
+  permission_scopes = function(input)
+    local command = input.command
+    if not command or command:match("^%s*$") then
+      return nil
+    end
+
+    local ok, parser = pcall(maki.treesitter.get_parser, command, "bash")
+    if not ok then
+      return { scopes = { command }, force_prompt = true }
+    end
+
+    local root = parser:parse()[1]:root()
+    if root:has_error() or is_complex(root) then
+      return { scopes = { command }, force_prompt = true }
+    end
+
+    local segments = collect_commands(root, command)
+    if #segments == 0 then
+      segments = { command }
+    end
+    return { scopes = segments, force_prompt = false }
+  end,
 
   header = function(input)
     local command, workdir = resolve_command(input)

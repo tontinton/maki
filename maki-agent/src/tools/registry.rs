@@ -108,8 +108,32 @@ impl Future for HeaderFuture {
     }
 }
 
+#[derive(Clone)]
+pub struct PermissionScopes {
+    pub scopes: Vec<String>,
+    pub force_prompt: bool,
+}
+
+impl PermissionScopes {
+    pub fn single(scope: String) -> Self {
+        Self {
+            scopes: vec![scope],
+            force_prompt: false,
+        }
+    }
+
+    pub fn force_prompt(scope: String) -> Self {
+        Self {
+            scopes: vec![scope],
+            force_prompt: true,
+        }
+    }
+}
+
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
 /// Holds the parsed input so start-event and `execute` share one parse pass.
-/// `permission_scope` and `mutable_path` belong here because only the parsed
+/// `permission_scopes` and `mutable_path` belong here because only the parsed
 /// call knows which file it will touch.
 pub trait ToolInvocation: Send + Sync {
     fn start_header(&self) -> HeaderFuture;
@@ -125,8 +149,8 @@ pub trait ToolInvocation: Send + Sync {
     fn mutable_path(&self) -> Option<&Path> {
         None
     }
-    fn permission_scope(&self) -> Option<String> {
-        None
+    fn permission_scopes(&self) -> BoxFuture<'_, Option<PermissionScopes>> {
+        Box::pin(std::future::ready(None))
     }
     fn execute<'a>(self: Box<Self>, ctx: &'a ToolContext) -> ExecFuture<'a>;
 }

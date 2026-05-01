@@ -26,8 +26,8 @@ mod write;
 
 pub use file_tracker::FileReadTracker;
 pub use registry::{
-    ExecFuture, HeaderFuture, HeaderResult, Native, ParseError, RegisteredTool, RegistryError,
-    Tool, ToolAudience, ToolInvocation, ToolRegistry, ToolSource,
+    BoxFuture, ExecFuture, HeaderFuture, HeaderResult, Native, ParseError, PermissionScopes,
+    RegisteredTool, RegistryError, Tool, ToolAudience, ToolInvocation, ToolRegistry, ToolSource,
 };
 
 use std::collections::HashSet;
@@ -560,7 +560,6 @@ pub fn all_builtin_tool_names() -> Vec<&'static str> {
         .collect()
 }
 
-use maki_providers::provider::BoxFuture;
 use maki_providers::{Message, ProviderEvent, StreamResponse, ThinkingConfig};
 
 struct NullProvider;

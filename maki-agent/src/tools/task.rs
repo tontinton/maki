@@ -214,8 +214,10 @@ impl super::ToolInvocation for Task {
     fn start_header(&self) -> super::HeaderFuture {
         super::HeaderFuture::Ready(super::HeaderResult::plain(Task::start_header(self)))
     }
-    fn permission_scope(&self) -> Option<String> {
-        Some(format!("task:{}", self.description))
+    fn permission_scopes(&self) -> super::BoxFuture<'_, Option<super::PermissionScopes>> {
+        Box::pin(std::future::ready(Some(super::PermissionScopes::single(
+            format!("task:{}", self.description),
+        ))))
     }
     fn execute<'a>(self: Box<Self>, ctx: &'a super::ToolContext) -> super::ExecFuture<'a> {
         Box::pin(async move { Task::execute(&self, ctx).await })

@@ -185,11 +185,11 @@ async fn enforce_permission(
     ctx: &ToolContext,
     id: &str,
 ) -> Result<(), String> {
-    if let Some(scope) = inv.permission_scope() {
+    if let Some(scopes) = inv.permission_scopes().await {
         ctx.permissions
             .enforce(
                 name,
-                &scope,
+                &scopes,
                 &ctx.event_tx,
                 ctx.user_response_rx.as_deref(),
                 id,
@@ -228,12 +228,13 @@ async fn execute_mcp_tool(
             json
         }
     };
+    let perm_scopes = crate::tools::PermissionScopes::single(perm_scope);
 
     if let Err(e) = ctx
         .permissions
         .enforce(
             &perm_tool,
-            &perm_scope,
+            &perm_scopes,
             &ctx.event_tx,
             ctx.user_response_rx.as_deref(),
             id,

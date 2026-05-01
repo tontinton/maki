@@ -1,5 +1,4 @@
 use crate::markdown::Keep;
-use maki_agent::RawRenderHints;
 use maki_agent::tools::{
     BASH_TOOL_NAME, BATCH_TOOL_NAME, CODE_EXECUTION_TOOL_NAME, EDIT_TOOL_NAME, GLOB_TOOL_NAME,
     GREP_TOOL_NAME, MEMORY_TOOL_NAME, MULTIEDIT_TOOL_NAME, QUESTION_TOOL_NAME, READ_TOOL_NAME,
@@ -7,10 +6,6 @@ use maki_agent::tools::{
 };
 use std::collections::HashMap;
 use std::sync::Arc;
-
-fn leak_str(s: &str) -> &'static str {
-    Box::leak(s.to_owned().into_boxed_str())
-}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum HeaderStyle {
@@ -57,31 +52,6 @@ pub struct ToolRenderHints {
 impl Default for ToolRenderHints {
     fn default() -> Self {
         Self::DEFAULT
-    }
-}
-
-impl ToolRenderHints {
-    pub fn from_raw(raw: &RawRenderHints, existing: Option<&Self>) -> Self {
-        Self {
-            header_style: existing.map_or(HeaderStyle::Plain, |e| e.header_style),
-            body_format: existing.map_or(BodyFormat::Plain, |e| e.body_format),
-            truncate_lines: raw.truncate_lines,
-            truncate_at: match raw.truncate_at.as_deref() {
-                Some("tail") => OutputKeep::Tail,
-                Some(_) => OutputKeep::Head,
-                None => existing.map_or(OutputKeep::Head, |e| e.truncate_at),
-            },
-            input_code_field: raw
-                .input_code_field
-                .as_deref()
-                .map(|s| leak_str(s))
-                .or(existing.and_then(|e| e.input_code_field)),
-            input_code_language: raw
-                .input_code_language
-                .as_deref()
-                .map(|s| leak_str(s))
-                .or(existing.and_then(|e| e.input_code_language)),
-        }
     }
 }
 
@@ -150,22 +120,9 @@ impl RenderHintsRegistry {
         Self { hints }
     }
 
-    pub fn register(&mut self, name: Arc<str>, raw: &RawRenderHints) {
-        let existing = self.hints.get(name.as_ref());
-        let hints = ToolRenderHints::from_raw(raw, existing);
-        self.hints.insert(name, hints);
-    }
-
     pub fn get(&self, name: &str) -> &ToolRenderHints {
         static DEFAULT: ToolRenderHints = ToolRenderHints::DEFAULT;
         self.hints.get(name).unwrap_or(&DEFAULT)
-    }
-
-    #[allow(dead_code)]
-    pub fn remove_plugin_tools(&mut self, tools: &[Arc<str>]) {
-        for name in tools {
-            self.hints.remove(name.as_ref());
-        }
     }
 }
 
@@ -208,114 +165,5 @@ mod tests {
         let reg = RenderHintsRegistry::new();
         let hints = reg.get("nonexistent_tool");
         assert!(matches!(hints.header_style, HeaderStyle::Plain));
-    }
-
-    #[test]
-    fn register_and_remove_plugin_tool() {
-        let mut reg = RenderHintsRegistry::new();
-        let name: Arc<str> = Arc::from("my_plugin_tool");
-        reg.register(Arc::clone(&name), &RawRenderHints::default());
-        assert!(reg.hints.contains_key("my_plugin_tool"));
-        reg.remove_plugin_tools(&[name]);
-        assert!(!reg.hints.contains_key("my_plugin_tool"));
-    }
-
-    fn raw(f: impl FnOnce(&mut RawRenderHints)) -> ToolRenderHints {
-        let mut r = RawRenderHints::default();
-        f(&mut r);
-        ToolRenderHints::from_raw(&r, None)
-    }
-
-    #[test_case("tail", OutputKeep::Tail ; "tail")]
-    #[test_case("junk", OutputKeep::Head ; "invalid_falls_back_to_head")]
-    fn from_raw_truncate_at(input: &str, expected: OutputKeep) {
-        let h = raw(|r| r.truncate_at = Some(input.into()));
-        assert_eq!(h.truncate_at, expected);
-    }
-
-    #[test]
-    fn from_raw_never_sets_non_plain_body_format() {
-        let h = raw(|r| {
-            r.truncate_lines = Some(100);
-            r.truncate_at = Some("tail".into());
-        });
-        assert_eq!(h.body_format, BodyFormat::Plain);
-    }
-
-    #[test]
-    fn register_preserves_existing_body_format() {
-        let mut reg = RenderHintsRegistry::new();
-        reg.register(Arc::from("custom"), &RawRenderHints::default());
-        assert_eq!(reg.get("custom").body_format, BodyFormat::Plain);
-
-        let mut entry = *reg.get("custom");
-        entry.body_format = BodyFormat::Markdown;
-        reg.hints.insert(Arc::from("custom"), entry);
-
-        reg.register(
-            Arc::from("custom"),
-            &RawRenderHints {
-                truncate_lines: Some(100),
-                ..Default::default()
-            },
-        );
-        assert_eq!(reg.get("custom").body_format, BodyFormat::Markdown);
-    }
-
-    #[test]
-    fn from_raw_with_existing_markdown_preserves_it() {
-        let existing = ToolRenderHints {
-            body_format: BodyFormat::Markdown,
-            ..Default::default()
-        };
-        let h = ToolRenderHints::from_raw(&RawRenderHints::default(), Some(&existing));
-        assert_eq!(h.body_format, BodyFormat::Markdown);
-    }
-
-    #[test]
-    fn register_new_tool_then_overwrite() {
-        let mut reg = RenderHintsRegistry::new();
-        let name: Arc<str> = Arc::from("custom_tool");
-        reg.register(
-            Arc::clone(&name),
-            &RawRenderHints {
-                truncate_lines: Some(50),
-                ..Default::default()
-            },
-        );
-        assert_eq!(reg.get("custom_tool").truncate_lines, Some(50));
-
-        reg.register(
-            Arc::clone(&name),
-            &RawRenderHints {
-                truncate_lines: Some(100),
-                ..Default::default()
-            },
-        );
-        assert_eq!(reg.get("custom_tool").truncate_lines, Some(100));
-    }
-
-    #[test]
-    fn remove_plugin_tools_only_removes_specified() {
-        let mut reg = RenderHintsRegistry::new();
-        let a: Arc<str> = Arc::from("plugin_a");
-        let b: Arc<str> = Arc::from("plugin_b");
-        reg.register(Arc::clone(&a), &RawRenderHints::default());
-        reg.register(Arc::clone(&b), &RawRenderHints::default());
-        reg.remove_plugin_tools(&[a]);
-        assert!(
-            !reg.hints.contains_key("plugin_a"),
-            "plugin_a should be removed"
-        );
-        assert!(reg.hints.contains_key("plugin_b"), "plugin_b should remain");
-    }
-
-    #[test]
-    fn from_raw_all_defaults_match_const() {
-        let h = ToolRenderHints::from_raw(&RawRenderHints::default(), None);
-        assert_eq!(h.header_style, HeaderStyle::Plain);
-        assert_eq!(h.body_format, BodyFormat::Plain);
-        assert_eq!(h.truncate_lines, None);
-        assert_eq!(h.truncate_at, OutputKeep::Head);
     }
 }

@@ -6,10 +6,10 @@ use flume::Sender;
 use maki_agent::tools::Tool;
 use maki_agent::tools::schema::{ParamSchema, to_json_schema, try_from_json, validate};
 use maki_agent::tools::{
-    Deadline, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError, ToolAudience,
-    ToolContext, ToolInvocation,
+    BoxFuture, Deadline, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError,
+    PermissionScopes, ToolAudience, ToolContext, ToolInvocation,
 };
-use maki_agent::{AgentEvent, BufferSnapshot, RawRenderHints, SharedBuf, ToolOutput};
+use maki_agent::{AgentEvent, BufferSnapshot, SharedBuf, ToolOutput};
 use mlua::{
     Function, Lua, LuaSerdeExt, RegistryKey, Result as LuaResult, Table, Value as LuaValue,
 };
@@ -24,6 +24,12 @@ const TOOL_HANDLER_RETURN_ERR: &str =
     "tool handler must return string or {output=string, is_error?=bool}";
 const TOOL_CALL_MAX_TIME: Duration = Duration::from_secs(600);
 
+#[derive(Clone)]
+pub(crate) enum PermissionScopeKind {
+    Field(Arc<str>),
+    Callback,
+}
+
 pub(crate) struct PendingTool {
     pub(crate) name: Arc<str>,
     pub(crate) description: String,
@@ -31,8 +37,8 @@ pub(crate) struct PendingTool {
     pub(crate) audience: ToolAudience,
     pub(crate) handler_key: RegistryKey,
     pub(crate) header_key: Option<RegistryKey>,
-    pub(crate) permission_scope_field: Option<Arc<str>>,
-    pub(crate) render_hints: Option<RawRenderHints>,
+    pub(crate) permission_scope_kind: Option<PermissionScopeKind>,
+    pub(crate) permission_scopes_key: Option<RegistryKey>,
 }
 
 pub(crate) type PendingTools = Arc<Mutex<Vec<PendingTool>>>;
@@ -45,7 +51,7 @@ pub(crate) struct LuaTool {
     pub(crate) tx: Sender<Request>,
     pub(crate) plugin: Arc<str>,
     pub(crate) has_header_fn: bool,
-    pub(crate) permission_scope_field: Option<Arc<str>>,
+    pub(crate) permission_scope_kind: Option<PermissionScopeKind>,
 }
 
 impl Tool for LuaTool {
@@ -67,21 +73,31 @@ impl Tool for LuaTool {
 
     fn parse(&self, input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
         let validated = validate(self.schema, input.clone())?;
-        let permission_scope = self.permission_scope_field.as_deref().and_then(|field| {
-            validated
-                .get(field)
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_owned())
-        });
+        let permission_state = match &self.permission_scope_kind {
+            Some(PermissionScopeKind::Field(field)) => {
+                let scope = validated
+                    .get(field.as_ref())
+                    .and_then(|v| v.as_str())
+                    .map(|s| PermissionScopes::single(s.to_owned()));
+                PermissionState::Ready(scope)
+            }
+            Some(PermissionScopeKind::Callback) => PermissionState::NeedsCompute,
+            None => PermissionState::Ready(None),
+        };
         Ok(Box::new(LuaToolInvocation {
             tool: Arc::clone(&self.name),
             plugin: Arc::clone(&self.plugin),
             has_header_fn: self.has_header_fn,
             input: validated,
             tx: self.tx.clone(),
-            permission_scope,
+            permission_state,
         }))
     }
+}
+
+enum PermissionState {
+    Ready(Option<PermissionScopes>),
+    NeedsCompute,
 }
 
 struct LuaToolInvocation {
@@ -90,7 +106,7 @@ struct LuaToolInvocation {
     has_header_fn: bool,
     input: Value,
     tx: Sender<Request>,
-    permission_scope: Option<String>,
+    permission_state: PermissionState,
 }
 
 impl ToolInvocation for LuaToolInvocation {
@@ -126,8 +142,36 @@ impl ToolInvocation for LuaToolInvocation {
         }
     }
 
-    fn permission_scope(&self) -> Option<String> {
-        self.permission_scope.clone()
+    fn permission_scopes(&self) -> BoxFuture<'_, Option<PermissionScopes>> {
+        match &self.permission_state {
+            PermissionState::Ready(v) => Box::pin(std::future::ready(v.clone())),
+            PermissionState::NeedsCompute => {
+                let (reply_tx, reply_rx) = flume::bounded(1);
+                let tx = self.tx.clone();
+                let plugin = Arc::clone(&self.plugin);
+                let tool = Arc::clone(&self.tool);
+                let input = self.input.clone();
+                let fallback = input.to_string();
+                Box::pin(async move {
+                    if tx
+                        .send_async(Request::ComputePermissionScopes {
+                            plugin,
+                            tool,
+                            input,
+                            reply: reply_tx,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        return Some(PermissionScopes::force_prompt(fallback));
+                    }
+                    match reply_rx.recv_async().await {
+                        Ok(Some(scopes)) => Some(scopes),
+                        _ => Some(PermissionScopes::force_prompt(fallback)),
+                    }
+                })
+            }
+        }
     }
 
     fn execute<'a>(self: Box<Self>, ctx: &'a ToolContext) -> ExecFuture<'a> {
@@ -263,16 +307,6 @@ fn parse_audience(audiences: Option<mlua::Table>) -> LuaResult<ToolAudience> {
     Ok(flags)
 }
 
-fn parse_render_hints(spec: &Table) -> Option<RawRenderHints> {
-    let render: Table = spec.get("render").ok()?;
-    Some(RawRenderHints {
-        truncate_lines: render.get::<usize>("truncate_lines").ok(),
-        truncate_at: render.get::<String>("truncate_at").ok(),
-        input_code_field: render.get::<String>("input_code_field").ok(),
-        input_code_language: render.get::<String>("input_code_language").ok(),
-    })
-}
-
 fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> LuaResult<()> {
     let name: String = spec
         .get("name")
@@ -317,6 +351,21 @@ fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> Lua
         }
     }
 
+    let permission_scopes_fn: Option<Function> = spec.get("permission_scopes").ok();
+    if permission_scope_field.is_some() && permission_scopes_fn.is_some() {
+        return Err(mlua::Error::runtime(
+            "register_tool: cannot specify both 'permission_scope' and 'permission_scopes'",
+        ));
+    }
+    let permission_scopes_key = permission_scopes_fn
+        .map(|f| lua.create_registry_value(f))
+        .transpose()?;
+    let permission_scope_kind = if permission_scopes_key.is_some() {
+        Some(PermissionScopeKind::Callback)
+    } else {
+        permission_scope_field.map(PermissionScopeKind::Field)
+    };
+
     let header_fn: Option<Function> = spec.get("header").ok();
     let audience = parse_audience(audiences)?;
     let handler_key: RegistryKey = lua.create_registry_value(handler)?;
@@ -324,8 +373,6 @@ fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> Lua
         .map(|f| lua.create_registry_value(f))
         .transpose()?;
     let name: Arc<str> = Arc::from(name.as_str());
-
-    let render_hints = parse_render_hints(spec);
 
     pending
         .lock()
@@ -337,8 +384,8 @@ fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> Lua
             audience,
             handler_key,
             header_key,
-            permission_scope_field,
-            render_hints,
+            permission_scope_kind,
+            permission_scopes_key,
         });
 
     Ok(())
@@ -449,7 +496,7 @@ mod tests {
             has_header_fn: false,
             input,
             tx,
-            permission_scope: None,
+            permission_state: PermissionState::Ready(None),
         }
     }
 
@@ -459,7 +506,7 @@ mod tests {
         assert_eq!(inv.start_header().into_ready().text(), "test_tool");
     }
 
-    fn make_lua_tool(permission_scope_field: Option<&str>) -> LuaTool {
+    fn make_lua_tool(permission_scope_kind: Option<PermissionScopeKind>) -> LuaTool {
         let schema = try_from_json(&serde_json::json!({
             "type": "object",
             "properties": {
@@ -478,33 +525,34 @@ mod tests {
             tx,
             plugin: Arc::from("test"),
             has_header_fn: false,
-            permission_scope_field: permission_scope_field.map(Arc::from),
+            permission_scope_kind,
         }
     }
 
     #[test]
     fn permission_scope_extracted_at_parse_time() {
-        let tool = make_lua_tool(Some("url"));
+        let tool = make_lua_tool(Some(PermissionScopeKind::Field(Arc::from("url"))));
         let inv = tool
             .parse(&serde_json::json!({"url": "https://example.com"}))
             .unwrap();
+        let scopes = smol::block_on(inv.permission_scopes());
         assert_eq!(
-            inv.permission_scope(),
-            Some("https://example.com".to_string())
+            scopes.unwrap().scopes,
+            vec!["https://example.com".to_string()]
         );
     }
 
     #[test]
     fn permission_scope_none_when_field_absent_or_unconfigured() {
-        let absent = make_lua_tool(Some("format"))
+        let absent = make_lua_tool(Some(PermissionScopeKind::Field(Arc::from("format"))))
             .parse(&serde_json::json!({"url": "https://example.com"}))
             .unwrap();
-        assert_eq!(absent.permission_scope(), None);
+        assert!(smol::block_on(absent.permission_scopes()).is_none());
 
         let unconfigured = make_lua_tool(None)
             .parse(&serde_json::json!({"url": "https://example.com"}))
             .unwrap();
-        assert_eq!(unconfigured.permission_scope(), None);
+        assert!(smol::block_on(unconfigured.permission_scopes()).is_none());
     }
 
     #[test]
@@ -527,7 +575,8 @@ mod tests {
     }
 
     #[test]
-    fn coerce_invalid_types_are_errors() {
+    fn coerce_error_paths() {
+        let lua = Lua::new();
         assert_eq!(
             coerce_tool_result(&LuaValue::Nil),
             Err(TOOL_HANDLER_RETURN_ERR.to_string())
@@ -536,11 +585,92 @@ mod tests {
             coerce_tool_result(&LuaValue::Boolean(true)),
             Err(TOOL_HANDLER_RETURN_ERR.to_string())
         );
+        assert!(coerce_tool_result(&LuaValue::Table(lua.create_table().unwrap())).is_err());
     }
 
     #[test]
-    fn coerce_table_missing_llm_output_is_error() {
-        let lua = Lua::new();
-        assert!(coerce_tool_result(&LuaValue::Table(lua.create_table().unwrap())).is_err());
+    fn needs_compute_fallback_on_failure() {
+        // Closed channel → fallback to force_prompt
+        let (tx, rx) = flume::bounded(0);
+        drop(rx);
+        let inv = LuaToolInvocation {
+            tool: Arc::from("bash"),
+            plugin: Arc::from("test"),
+            has_header_fn: false,
+            input: serde_json::json!({"command": "ls"}),
+            tx,
+            permission_state: PermissionState::NeedsCompute,
+        };
+        let scopes = smol::block_on(inv.permission_scopes()).expect("should fallback");
+        assert!(scopes.force_prompt);
+        assert!(!scopes.scopes.is_empty());
+
+        // Callback returns None → fallback to force_prompt
+        let (tx2, rx2) = flume::bounded(1);
+        let inv2 = LuaToolInvocation {
+            tool: Arc::from("bash"),
+            plugin: Arc::from("test"),
+            has_header_fn: false,
+            input: serde_json::json!({"command": "echo hi"}),
+            tx: tx2,
+            permission_state: PermissionState::NeedsCompute,
+        };
+        std::thread::spawn(move || {
+            if let Ok(Request::ComputePermissionScopes { reply, .. }) = rx2.recv() {
+                let _ = reply.send(None);
+            }
+        });
+        let scopes2 = smol::block_on(inv2.permission_scopes()).expect("should fallback");
+        assert!(scopes2.force_prompt);
+    }
+
+    #[test]
+    fn needs_compute_returns_callback_result() {
+        let (tx, rx) = flume::bounded(1);
+        let inv = LuaToolInvocation {
+            tool: Arc::from("bash"),
+            plugin: Arc::from("test"),
+            has_header_fn: false,
+            input: serde_json::json!({"command": "cargo test"}),
+            tx,
+            permission_state: PermissionState::NeedsCompute,
+        };
+        std::thread::spawn(move || {
+            if let Ok(Request::ComputePermissionScopes { reply, .. }) = rx.recv() {
+                let _ = reply.send(Some(PermissionScopes {
+                    scopes: vec!["cargo".into(), "test".into()],
+                    force_prompt: false,
+                }));
+            }
+        });
+        let result = smol::block_on(inv.permission_scopes());
+        let scopes = result.unwrap();
+        assert_eq!(scopes.scopes, vec!["cargo", "test"]);
+        assert!(!scopes.force_prompt);
+    }
+
+    #[test]
+    fn permission_scope_field_non_string_value_returns_none() {
+        let schema = try_from_json(&serde_json::json!({
+            "type": "object",
+            "properties": {
+                "count": { "type": "integer" },
+            },
+            "required": ["count"],
+        }))
+        .unwrap();
+        let (tx, _rx) = flume::unbounded();
+        let tool = LuaTool {
+            name: Arc::from("test_tool"),
+            description: "test".into(),
+            schema,
+            audience: ToolAudience::default(),
+            tx,
+            plugin: Arc::from("test"),
+            has_header_fn: false,
+            permission_scope_kind: Some(PermissionScopeKind::Field(Arc::from("count"))),
+        };
+        let inv = tool.parse(&serde_json::json!({"count": 42})).unwrap();
+        assert!(smol::block_on(inv.permission_scopes()).is_none());
     }
 }

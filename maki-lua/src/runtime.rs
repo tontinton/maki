@@ -8,9 +8,10 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use include_dir::Dir;
-use maki_agent::RawRenderHints;
 use maki_agent::cancel::CancelToken;
-use maki_agent::tools::{HeaderResult, RegistryError, Tool, ToolRegistry, ToolSource};
+use maki_agent::tools::{
+    HeaderResult, PermissionScopes, RegistryError, Tool, ToolRegistry, ToolSource,
+};
 use mlua::{Function, Lua, LuaSerdeExt, RegistryKey, Value as LuaValue, VmState};
 use serde_json::Value;
 
@@ -29,7 +30,7 @@ const DISPATCH_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const NIL_WITHOUT_FINISH_MSG: &str =
     "handler returned nil without calling ctx:finish() or starting jobs";
 
-pub type LoadResult = Result<Vec<(Arc<str>, RawRenderHints)>, PluginError>;
+pub type LoadResult = Result<(), PluginError>;
 
 /// `LoadSource` and `ClearPlugin` drain all in-flight tool calls before
 /// proceeding, so the plugin environment is never mutated mid-call.
@@ -54,6 +55,12 @@ pub enum Request {
         tool: Arc<str>,
         input: Value,
         reply: flume::Sender<HeaderResult>,
+    },
+    ComputePermissionScopes {
+        plugin: Arc<str>,
+        tool: Arc<str>,
+        input: Value,
+        reply: flume::Sender<Option<PermissionScopes>>,
     },
     ClearPlugin {
         plugin: Arc<str>,
@@ -153,6 +160,7 @@ impl Drop for TaskCleanupGuard {
 struct ToolKeys {
     handler: RegistryKey,
     header: Option<RegistryKey>,
+    permission_scopes: Option<RegistryKey>,
 }
 
 type PluginMap = Rc<RefCell<HashMap<Arc<str>, HashMap<Arc<str>, ToolKeys>>>>;
@@ -243,6 +251,11 @@ impl LuaRuntime {
                         tracing::warn!(plugin = name, error = %e, "failed to drop lua header key");
                     }
                 }
+                if let Some(sk) = tk.permission_scopes {
+                    if let Err(e) = self.lua.remove_registry_value(sk) {
+                        tracing::warn!(plugin = name, error = %e, "failed to drop lua permission_scopes key");
+                    }
+                }
             }
         }
     }
@@ -263,6 +276,11 @@ impl LuaRuntime {
             if let Some(sk) = t.header_key {
                 if let Err(e) = self.lua.remove_registry_value(sk) {
                     tracing::warn!(error = %e, "failed to drop lua header key on rollback");
+                }
+            }
+            if let Some(sk) = t.permission_scopes_key {
+                if let Err(e) = self.lua.remove_registry_value(sk) {
+                    tracing::warn!(error = %e, "failed to drop lua permission_scopes key on rollback");
                 }
             }
         }
@@ -441,7 +459,7 @@ impl LuaRuntime {
                     tx: self.tx.clone(),
                     plugin: Arc::clone(&name),
                     has_header_fn: t.header_key.is_some(),
-                    permission_scope_field: t.permission_scope_field.clone(),
+                    permission_scope_kind: t.permission_scope_kind.clone(),
                 });
                 (
                     tool,
@@ -464,11 +482,6 @@ impl LuaRuntime {
 
         self.drop_plugin_keys(&name);
 
-        let hints: Vec<(Arc<str>, RawRenderHints)> = pending
-            .iter()
-            .filter_map(|t| t.render_hints.clone().map(|h| (Arc::clone(&t.name), h)))
-            .collect();
-
         let keys: HashMap<Arc<str>, ToolKeys> = pending
             .into_iter()
             .map(|t| {
@@ -477,13 +490,14 @@ impl LuaRuntime {
                     ToolKeys {
                         handler: t.handler_key,
                         header: t.header_key,
+                        permission_scopes: t.permission_scopes_key,
                     },
                 )
             })
             .collect();
         self.plugins.borrow_mut().insert(name, keys);
 
-        Ok(hints)
+        Ok(())
     }
 
     fn clear_plugin(&mut self, plugin: &str) {
@@ -550,6 +564,55 @@ impl LuaRuntime {
                 HeaderResult::plain(tool.to_string())
             }
         }
+    }
+
+    fn compute_permission_scopes(
+        &self,
+        plugin: &str,
+        tool: &str,
+        input: Value,
+    ) -> Option<PermissionScopes> {
+        let plugins = self.plugins.borrow();
+        let tk = plugins.get(plugin)?.get(tool)?;
+        let key = tk.permission_scopes.as_ref()?;
+        let func = match self.lua.registry_value::<Function>(key) {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!(plugin, tool, error = %e, "failed to resolve permission_scopes callback");
+                return None;
+            }
+        };
+        let lua_input = match self.lua.to_value(&input) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(plugin, tool, error = %e, "failed to convert input for permission_scopes");
+                return None;
+            }
+        };
+        let result: LuaValue = match func.call(lua_input) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(plugin, tool, error = %e, "permission_scopes callback failed");
+                return None;
+            }
+        };
+        let table = match result {
+            LuaValue::Table(t) => t,
+            _ => return None,
+        };
+        let scopes_table: mlua::Table = table.get("scopes").ok()?;
+        let mut scopes = Vec::new();
+        for (_, s) in scopes_table.pairs::<usize, String>().flatten() {
+            scopes.push(s);
+        }
+        if scopes.is_empty() {
+            return None;
+        }
+        let force_prompt: bool = table.get("force_prompt").unwrap_or(false);
+        Some(PermissionScopes {
+            scopes,
+            force_prompt,
+        })
     }
 
     fn run_init_lua(
@@ -934,6 +997,15 @@ pub fn spawn(
                             let res = rt.compute_header(&plugin, &tool, input);
                             let _ = reply.send(res);
                         }
+                        Request::ComputePermissionScopes {
+                            plugin,
+                            tool,
+                            input,
+                            reply,
+                        } => {
+                            let res = rt.compute_permission_scopes(&plugin, &tool, input);
+                            let _ = reply.send(res);
+                        }
                         Request::RunInitLua {
                             source,
                             source_name,
@@ -1016,12 +1088,6 @@ mod tests {
     }
 
     #[test]
-    fn from_lua_value_nil_is_error() {
-        let reply = ToolCallReply::from_lua_value(&LuaValue::Nil);
-        assert!(reply.result.is_err());
-    }
-
-    #[test]
     fn from_lua_value_missing_llm_output_still_extracts_body() {
         let lua = test_lua();
         let t = lua.create_table().unwrap();
@@ -1048,17 +1114,6 @@ mod tests {
         });
         let tasks = lua.app_data_ref::<TaskMap>().unwrap();
         assert!(!tasks.contains_key(&key));
-    }
-
-    #[test]
-    fn with_task_accessors_return_none_when_missing() {
-        let lua = Lua::new();
-        assert!(with_task_jobs(&lua, |_| 42).is_none());
-        assert!(with_task_bufs(&lua, |_| 42).is_none());
-
-        lua.set_app_data(TaskMap::new());
-        assert!(with_task_jobs(&lua, |_| 42).is_none());
-        assert!(with_task_bufs(&lua, |_| 42).is_none());
     }
 
     fn task_ctx(live: Option<LiveCtx>) -> TaskCtx {

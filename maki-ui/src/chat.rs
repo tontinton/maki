@@ -17,8 +17,8 @@ use crate::markdown::truncate_output;
 use crate::selection::Selection;
 use maki_agent::tools::{ToolInvocation, ToolRegistry};
 use maki_agent::{
-    AgentEvent, BatchToolStatus, NO_FILES_FOUND, QuestionInfo, RawRenderHints, ToolDoneEvent,
-    ToolInput, ToolOutput, ToolStartEvent,
+    AgentEvent, BatchToolStatus, NO_FILES_FOUND, QuestionInfo, ToolDoneEvent, ToolInput,
+    ToolOutput, ToolStartEvent,
 };
 use maki_config::{ToolOutputLines, UiConfig};
 use maki_providers::{ContentBlock, Message, Role, TokenUsage};
@@ -268,10 +268,6 @@ impl Chat {
 
     pub fn load_messages(&mut self, msgs: Vec<DisplayMessage>) {
         self.messages_panel.load_messages(msgs);
-    }
-
-    pub fn register_plugin_hints(&mut self, tools: Vec<(Arc<str>, RawRenderHints)>) {
-        self.messages_panel.register_plugin_hints(tools);
     }
 
     pub fn push_user_message(&mut self, text: impl Into<String>) {
