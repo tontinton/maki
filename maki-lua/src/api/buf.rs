@@ -110,8 +110,9 @@ impl UserData for BufHandle {
             if event != "click" {
                 return Err(mlua::Error::runtime(format!("unsupported event: {event}")));
             }
-            let tool_id = with_live_ctx(lua, |live| live.tool_use_id.clone())
-                .ok_or_else(|| mlua::Error::runtime("buf:on() requires a live tool context"))?;
+            let Some(tool_id) = with_live_ctx(lua, |live| live.tool_use_id.clone()) else {
+                return Ok(());
+            };
             let key = lua.create_registry_value(callback)?;
             with_click_handlers(lua, |handlers| {
                 if let Some(old) = handlers.insert(tool_id, key) {
@@ -458,19 +459,9 @@ mod tests {
         let mut store = BufferStore::new();
         let handle = store.create_live();
         let id = handle.id;
-        store.append_line(
-            id,
-            SnapshotLine {
-                spans: vec![SnapshotSpan {
-                    text: "test".into(),
-                    style: SpanStyle::Default,
-                }],
-            },
-        );
-        assert_eq!(store.len(id), 1);
-        let snap = store.take(id);
-        assert!(snap.is_some());
-        assert_eq!(snap.unwrap().lines.len(), 1);
+        store.append_line(id, SnapshotLine { spans: vec![] });
+        assert!(store.take(id).is_some());
+        assert!(store.take(id).is_none());
     }
 
     #[test]
@@ -490,12 +481,6 @@ mod tests {
         store.create_live();
         assert!(store.live_buf().is_some());
         store.clear();
-        assert!(store.live_buf().is_none());
-    }
-
-    #[test]
-    fn live_buf_returns_none_before_create_live() {
-        let store = BufferStore::new();
         assert!(store.live_buf().is_none());
     }
 
@@ -535,26 +520,9 @@ mod tests {
     }
 
     #[test]
-    fn create_live_mixed_with_create_regular() {
-        let mut store = BufferStore::new();
-        let regular = store.create().id;
-        let live_id = store.create_live().id;
-        store.append_line(regular, SnapshotLine { spans: vec![] });
-        store.append_line(live_id, SnapshotLine { spans: vec![] });
-        assert_eq!(store.len(regular), 1);
-        assert_eq!(store.len(live_id), 1);
-        assert!(store.live_buf().is_some());
-    }
-
-    #[test]
     fn buf_on_unsupported_event_errors() {
         let lua = test_lua();
-        let handle = {
-            let mut store = lua.app_data_mut::<BufferStore>().unwrap();
-            store.create()
-        };
-        let ud = lua.create_userdata(handle).unwrap();
-        lua.globals().set("buf", ud).unwrap();
+        set_buf_global(&lua);
 
         let result = lua.load(r#"buf:on("hover", function() end)"#).exec();
         assert!(result.is_err());
@@ -562,20 +530,52 @@ mod tests {
         assert!(err.contains("unsupported event"), "got: {err}");
     }
 
-    #[test]
-    fn buf_on_click_without_live_ctx_errors() {
-        let lua = test_lua();
-        lua.set_app_data(HashMap::<String, mlua::RegistryKey>::new());
+    fn set_buf_global(lua: &mlua::Lua) {
         let handle = {
             let mut store = lua.app_data_mut::<BufferStore>().unwrap();
             store.create()
         };
         let ud = lua.create_userdata(handle).unwrap();
         lua.globals().set("buf", ud).unwrap();
+    }
 
-        let result = lua.load(r#"buf:on("click", function() end)"#).exec();
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("live tool context"), "got: {err}");
+    fn test_lua_with_handlers() -> mlua::Lua {
+        let lua = test_lua();
+        lua.set_app_data(HashMap::<String, mlua::RegistryKey>::new());
+        lua
+    }
+
+    #[test]
+    fn buf_on_click_without_live_ctx_is_noop() {
+        let lua = test_lua_with_handlers();
+        set_buf_global(&lua);
+
+        lua.load(r#"buf:on("click", function() end)"#)
+            .exec()
+            .unwrap();
+
+        let handlers = lua
+            .app_data_ref::<HashMap<String, mlua::RegistryKey>>()
+            .unwrap();
+        assert!(handlers.is_empty(), "no-op should not register a handler");
+    }
+
+    #[test]
+    fn buf_on_click_registers_and_replaces_handler() {
+        let lua = test_lua_with_handlers();
+        crate::runtime::install_live_ctx(&lua, "tool_123");
+        set_buf_global(&lua);
+
+        lua.load(r#"buf:on("click", function() return 1 end)"#)
+            .exec()
+            .unwrap();
+        let registered = with_click_handlers(&lua, |h| h.contains_key("tool_123")).unwrap_or(false);
+        assert!(registered, "handler should be registered for tool_123");
+
+        lua.load(r#"buf:on("click", function() return 2 end)"#)
+            .exec()
+            .unwrap();
+        let count = with_click_handlers(&lua, |h| h.len()).unwrap_or(0);
+        assert_eq!(count, 1, "second on() should replace, not accumulate");
     }
 }

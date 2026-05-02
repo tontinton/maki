@@ -1040,6 +1040,26 @@ pub fn spawn(
 }
 
 #[cfg(test)]
+pub(crate) fn install_live_ctx(lua: &Lua, tool_use_id: &str) {
+    let key = ThreadKey::current(lua);
+    if lua.app_data_ref::<TaskMap>().is_none() {
+        lua.set_app_data(TaskMap::new());
+    }
+    let (tx, _rx) = flume::unbounded();
+    let ctx = TaskCtx {
+        cancel: CancelToken::none(),
+        deadline: None,
+        jobs: JobStore::new(),
+        bufs: BufferStore::new(),
+        live: Some(LiveCtx {
+            event_tx: maki_agent::EventSender::new(tx, 0),
+            tool_use_id: tool_use_id.to_owned(),
+        }),
+    };
+    lua.app_data_mut::<TaskMap>().unwrap().insert(key, ctx);
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::api::tool::ToolCallReply;
