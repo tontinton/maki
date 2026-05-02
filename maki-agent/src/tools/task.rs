@@ -99,10 +99,7 @@ impl Task {
             .map(|e| e.name().to_owned())
             .collect();
         let filter = ToolFilter::Only(tool_names);
-        let ctx_desc = DescriptionContext {
-            skills: &[],
-            filter: &filter,
-        };
+        let ctx_desc = DescriptionContext { filter: &filter };
         let mut tools =
             ToolRegistry::native().definitions(&vars, &ctx_desc, model.supports_tool_examples());
         if let Some(ref mcp) = ctx.mcp {
@@ -151,7 +148,6 @@ impl Task {
             AgentParams {
                 provider,
                 model,
-                skills: Arc::clone(&ctx.skills),
                 config: ctx.config.clone(),
                 tool_output_lines: ToolOutputLines::default(),
                 permissions: Arc::clone(&ctx.permissions),
@@ -252,7 +248,6 @@ mod tests {
             (super::super::MEMORY_TOOL_NAME, MAIN | GEN),
             (super::super::QUESTION_TOOL_NAME, MAIN),
             (super::super::TODOWRITE_TOOL_NAME, MAIN),
-            (super::super::SKILL_TOOL_NAME, MAIN),
             (super::super::TASK_TOOL_NAME, MAIN),
         ]);
 

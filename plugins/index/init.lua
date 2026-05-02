@@ -1,5 +1,6 @@
 local indexer = require("indexer")
 local ToolView = require("tool_view")
+local shorten_path = require("shorten_path")
 
 local KEYWORDS = {
   pub = true,
@@ -82,20 +83,6 @@ local function render_skeleton(view, text)
   end
 end
 
-local function shorten_path(path)
-  local cwd = maki.uv.cwd()
-  if cwd and path:sub(1, #cwd + 1) == cwd .. "/" then
-    local rel = path:sub(#cwd + 2)
-    return rel == "" and "." or rel
-  end
-  local home = maki.uv.os_homedir()
-  if home and path:sub(1, #home + 1) == home .. "/" then
-    local rel = path:sub(#home + 2)
-    return rel == "" and "~" or "~/" .. rel
-  end
-  return path
-end
-
 local function render_header(path, line_count)
   local buf = maki.ui.buf()
   local spans = { { shorten_path(path), "path" } }
@@ -130,8 +117,8 @@ Return a compact overview of a source file: imports, type definitions, function 
       return "error: path is required"
     end
 
-    local meta_ok, meta = pcall(maki.fs.metadata, path)
-    if meta_ok and meta.is_dir then
+    local meta = maki.fs.metadata(path)
+    if meta and meta.is_dir then
       return {
         llm_output = "Path is a directory. Use index on files or use the read or glob tool to list directories.",
         is_error = true,

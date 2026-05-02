@@ -16,7 +16,6 @@ use clap::ValueEnum;
 use color_eyre::Result;
 use color_eyre::eyre::Context;
 use maki_agent::mcp;
-use maki_agent::skill::Skill;
 use maki_agent::tools::{
     DescriptionContext, FileReadTracker, QUESTION_TOOL_NAME, ToolFilter, ToolRegistry,
 };
@@ -123,7 +122,6 @@ pub fn run(
     prompt_arg: Option<String>,
     format: OutputFormat,
     verbose: bool,
-    skills: Vec<Skill>,
     config: AgentConfig,
     permissions_config: PermissionsConfig,
     timeouts: maki_providers::Timeouts,
@@ -143,10 +141,7 @@ pub fn run(
     let mode = AgentMode::Build;
     let instructions = agent::load_instructions(&vars.apply("{cwd}"));
     let filter = ToolFilter::from_config(&config, &[QUESTION_TOOL_NAME]);
-    let ctx = DescriptionContext {
-        skills: &skills,
-        filter: &filter,
-    };
+    let ctx = DescriptionContext { filter: &filter };
     let mut tools = ToolRegistry::native().definitions(&vars, &ctx, model.supports_tool_examples());
 
     let mcp_handle = smol::block_on(mcp::start(&cwd_path));
@@ -191,13 +186,11 @@ pub fn run(
                     return;
                 }
             };
-        let skills: Arc<[Skill]> = Arc::from(skills);
         let error_tx = event_tx.clone();
         let agent = Agent::new(
             AgentParams {
                 provider,
                 model: model_clone,
-                skills,
                 config,
                 tool_output_lines: ToolOutputLines::default(),
                 permissions: Arc::new(maki_agent::permissions::PermissionManager::new(

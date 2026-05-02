@@ -6,7 +6,6 @@ use maki_agent::agent;
 use maki_agent::mcp::McpHandle;
 use maki_agent::mcp::config::McpServerStatus;
 use maki_agent::permissions::PermissionManager;
-use maki_agent::skill::Skill;
 use maki_agent::template;
 use maki_agent::template::Vars;
 use maki_agent::tools::{DescriptionContext, FileReadTracker, ToolFilter, ToolRegistry};
@@ -25,7 +24,6 @@ use super::shared_queue::{QueueItem, QueueReceiver};
 
 pub(super) struct AgentLoop {
     model_slot: Arc<ArcSwap<ModelSlot>>,
-    skills: Arc<[Skill]>,
     config: AgentConfig,
     tool_output_lines: ToolOutputLines,
     vars: Vars,
@@ -50,7 +48,6 @@ impl AgentLoop {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         model_slot: Arc<ArcSwap<ModelSlot>>,
-        skills: Arc<[Skill]>,
         config: AgentConfig,
         tool_output_lines: ToolOutputLines,
         initial_history: Vec<Message>,
@@ -67,7 +64,6 @@ impl AgentLoop {
     ) -> Self {
         Self {
             model_slot,
-            skills,
             config,
             tool_output_lines,
             vars: Vars::default(),
@@ -209,7 +205,6 @@ impl AgentLoop {
             AgentParams {
                 provider: Arc::clone(&slot.provider),
                 model: slot.model.clone(),
-                skills: Arc::clone(&self.skills),
                 config: self.config.clone(),
                 tool_output_lines: self.tool_output_lines,
                 permissions: Arc::clone(&self.permissions),
@@ -254,10 +249,7 @@ impl AgentLoop {
     fn build_tools(&self, model: &Model) -> Value {
         let examples = model.supports_tool_examples();
         let filter = ToolFilter::from_config(&self.config, &[]);
-        let ctx = DescriptionContext {
-            skills: &self.skills,
-            filter: &filter,
-        };
+        let ctx = DescriptionContext { filter: &filter };
         ToolRegistry::native().definitions(&self.vars, &ctx, examples)
     }
 

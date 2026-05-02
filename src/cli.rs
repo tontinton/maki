@@ -40,10 +40,6 @@ pub struct Cli {
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     pub output_format: OutputFormat,
 
-    /// Skip loading skill files from .maki/skills, .claude/skills, etc.
-    #[arg(long)]
-    pub no_skills: bool,
-
     /// Skip loading custom commands from .maki/commands, .claude/commands, etc.
     #[arg(long)]
     pub no_commands: bool,

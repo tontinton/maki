@@ -403,7 +403,7 @@ impl LuaRuntime {
         })
     }
 
-    fn load_source(
+    async fn load_source(
         &mut self,
         name: Arc<str>,
         source: &str,
@@ -435,7 +435,8 @@ impl LuaRuntime {
             .load(source)
             .set_name(name.as_ref())
             .set_environment(env)
-            .exec();
+            .exec_async()
+            .await;
 
         if let Err(e) = exec_result {
             let stale = self.drain_pending();
@@ -925,7 +926,7 @@ pub fn spawn(
                             while inflight.get() > 0 {
                                 smol::future::yield_now().await;
                             }
-                            let res = rt.load_source(Arc::clone(&name), &source, plugin_dir);
+                            let res = rt.load_source(Arc::clone(&name), &source, plugin_dir).await;
                             let _ = reply.send(res);
                         }
                         Request::CallTool {

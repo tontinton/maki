@@ -155,7 +155,7 @@ Persistent, project-scoped scratchpad for learnings, patterns, decisions, and go
 | `content` | string | no | File content for 'write' |
 | `path` | string | no | Relative path (e.g. 'architecture.md'). Omit to list all. |
 
-### `skill`
+### `skill` *(lua plugin)*
 
 Load a skill that provides instructions and workflows for specific tasks.
 

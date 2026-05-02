@@ -12,7 +12,6 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use maki_agent::mcp;
 use maki_agent::permissions::PermissionManager;
-use maki_agent::skill::Skill;
 use maki_agent::{
     AgentConfig, CancelToken, Envelope, McpCommand, McpHandle, McpSnapshotReader, ToolOutput,
     ToolOutputLines,
@@ -60,7 +59,6 @@ impl AgentHandles {
     pub(crate) fn spawn(
         model_slot: &Arc<ArcSwap<ModelSlot>>,
         initial_history: Vec<Message>,
-        skills: &Arc<[Skill]>,
         config: AgentConfig,
         tool_output_lines: ToolOutputLines,
         permissions: &Arc<PermissionManager>,
@@ -72,7 +70,6 @@ impl AgentHandles {
         spawn_agent_internal(
             model_slot,
             initial_history,
-            skills,
             config,
             tool_output_lines,
             permissions,
@@ -112,7 +109,6 @@ impl AgentHandles {
         &mut self,
         history: Vec<Message>,
         model_slot: &Arc<ArcSwap<ModelSlot>>,
-        skills: &Arc<[Skill]>,
         config: AgentConfig,
         tool_output_lines: ToolOutputLines,
         permissions: &Arc<PermissionManager>,
@@ -125,7 +121,6 @@ impl AgentHandles {
         let new = spawn_agent_internal(
             model_slot,
             history,
-            skills,
             config,
             tool_output_lines,
             permissions,
@@ -192,7 +187,6 @@ async fn shutdown_mcp(handle: &McpHandle) {
 fn spawn_agent_internal(
     model_slot: &Arc<ArcSwap<ModelSlot>>,
     initial_history: Vec<Message>,
-    skills: &Arc<[Skill]>,
     config: AgentConfig,
     tool_output_lines: ToolOutputLines,
     permissions: &Arc<PermissionManager>,
@@ -216,7 +210,6 @@ fn spawn_agent_internal(
 
     let agent_loop = AgentLoop::new(
         Arc::clone(model_slot),
-        Arc::clone(skills),
         config,
         tool_output_lines,
         initial_history,

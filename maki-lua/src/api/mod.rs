@@ -11,10 +11,11 @@ pub(crate) mod tool;
 pub(crate) mod treesitter;
 pub(crate) mod ui;
 pub(crate) mod uv;
+pub(crate) mod yaml;
 
 use std::sync::Arc;
 
-use mlua::{Function, Lua, Result as LuaResult, Table};
+use mlua::{Function, Lua, Result as LuaResult, Table, Value};
 
 use crate::api::tool::PendingTools;
 use crate::runtime::with_task_jobs;
@@ -32,6 +33,7 @@ pub(crate) fn create_maki_global(
     maki.set("treesitter", treesitter::create_treesitter_table(lua)?)?;
     maki.set("uv", uv::create_uv_table(lua)?)?;
     maki.set("json", json::create_json_table(lua)?)?;
+    maki.set("yaml", yaml::create_yaml_table(lua)?)?;
     maki.set("net", net::create_net_table(lua)?)?;
     maki.set("text", text::create_text_table(lua)?)?;
     maki.set("ui", ui::create_ui_table(lua)?)?;
@@ -47,4 +49,8 @@ pub(crate) fn create_maki_global(
     )?;
 
     Ok(maki)
+}
+
+pub(crate) fn err_pair(lua: &Lua, e: impl std::fmt::Display) -> LuaResult<(Value, Value)> {
+    Ok((Value::Nil, Value::String(lua.create_string(e.to_string())?)))
 }

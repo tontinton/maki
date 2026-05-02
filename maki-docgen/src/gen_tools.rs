@@ -282,7 +282,6 @@ pub fn generate() -> String {
     let defs = ToolRegistry::native().definitions(
         &vars,
         &DescriptionContext {
-            skills: &[],
             filter: &ToolFilter::All,
         },
         false,

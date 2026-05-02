@@ -10,7 +10,6 @@ use crossterm::event::{
 };
 use maki_agent::command::CustomCommand;
 use maki_agent::permissions::PermissionManager;
-use maki_agent::skill::Skill;
 use maki_agent::{AgentConfig, CancelToken, McpCommand};
 use maki_config::UiConfig;
 use maki_providers::Timeouts;
@@ -40,7 +39,6 @@ pub type BufClickHandler = Arc<dyn Fn(&str, u32) + Send + Sync>;
 
 pub struct EventLoopParams {
     pub model: Model,
-    pub skills: Vec<Skill>,
     pub commands: Vec<CustomCommand>,
     pub session: AppSession,
     pub storage: StateDir,
@@ -60,7 +58,6 @@ pub(crate) struct EventLoop<'t> {
     app: App,
     handles: AgentHandles,
     model_slot: Arc<ArcSwap<ModelSlot>>,
-    skills: Arc<[Skill]>,
     config: AgentConfig,
     permissions: Arc<PermissionManager>,
     shell_tx: flume::Sender<ShellEvent>,
@@ -151,7 +148,6 @@ impl<'t> EventLoop<'t> {
     ) -> Result<Self> {
         let EventLoopParams {
             model,
-            skills,
             commands,
             session,
             storage,
@@ -179,7 +175,6 @@ impl<'t> EventLoop<'t> {
 
         let provider: Arc<dyn Provider> =
             Arc::from(from_model(&model, timeouts).context("create provider")?);
-        let skills: Arc<[Skill]> = Arc::from(skills);
         let model_slot = Arc::new(ArcSwap::from_pointee(ModelSlot {
             model: model.clone(),
             provider,
@@ -187,7 +182,6 @@ impl<'t> EventLoop<'t> {
         let handles = AgentHandles::spawn(
             &model_slot,
             initial_history,
-            &skills,
             config.clone(),
             ui_config.tool_output_lines,
             &permissions,
@@ -228,7 +222,6 @@ impl<'t> EventLoop<'t> {
             app,
             handles,
             model_slot,
-            skills,
             config,
             permissions,
             shell_tx,
@@ -367,7 +360,6 @@ impl<'t> EventLoop<'t> {
         self.handles.respawn(
             history,
             &self.model_slot,
-            &self.skills,
             self.config.clone(),
             self.app.ui_config.tool_output_lines,
             &self.permissions,

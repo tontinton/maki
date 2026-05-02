@@ -6,7 +6,6 @@ use color_eyre::Result;
 use color_eyre::eyre::Context;
 
 use maki_agent::command::{self, CustomCommand};
-use maki_agent::skill::{self, Skill};
 use maki_agent::tools::ToolRegistry;
 use maki_config::{load_env_files, load_permissions};
 use maki_lua::PluginHost;
@@ -16,14 +15,6 @@ use maki_ui::AppSession;
 
 use crate::cli::{Cli, normalize_tool_name};
 use crate::setup;
-
-fn discover_skills(disable: bool) -> Vec<Skill> {
-    if disable {
-        return Vec::new();
-    }
-    let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
-    skill::discover_skills(&cwd)
-}
 
 fn discover_commands(disable: bool) -> Vec<CustomCommand> {
     if disable {
@@ -119,7 +110,6 @@ pub fn run(cli: Cli) -> Result<()> {
     setup::init_logging(&storage, &config.storage);
     setup::install_panic_log_hook();
 
-    let skills = discover_skills(cli.no_skills);
     let commands = discover_commands(cli.no_commands);
 
     if cli.print {
@@ -128,7 +118,6 @@ pub fn run(cli: Cli) -> Result<()> {
             cli.prompt,
             cli.output_format,
             cli.verbose,
-            skills,
             config.agent,
             config.permissions,
             timeouts,
@@ -152,7 +141,6 @@ pub fn run(cli: Cli) -> Result<()> {
         let (session_id, exit_code) = maki_ui::run(
             maki_ui::EventLoopParams {
                 model,
-                skills,
                 commands,
                 session,
                 storage,

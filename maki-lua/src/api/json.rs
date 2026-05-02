@@ -1,8 +1,6 @@
 use mlua::{Lua, LuaSerdeExt, Result as LuaResult, Table, Value};
 
-fn err_pair(lua: &Lua, e: impl std::fmt::Display) -> LuaResult<(Value, Value)> {
-    Ok((Value::Nil, Value::String(lua.create_string(e.to_string())?)))
-}
+use super::err_pair;
 
 pub(crate) fn create_json_table(lua: &Lua) -> LuaResult<Table> {
     let json = lua.create_table()?;

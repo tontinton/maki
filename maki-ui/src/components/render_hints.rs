@@ -2,7 +2,7 @@ use crate::markdown::Keep;
 use maki_agent::tools::{
     BASH_TOOL_NAME, BATCH_TOOL_NAME, CODE_EXECUTION_TOOL_NAME, EDIT_TOOL_NAME, GLOB_TOOL_NAME,
     GREP_TOOL_NAME, MEMORY_TOOL_NAME, MULTIEDIT_TOOL_NAME, QUESTION_TOOL_NAME, READ_TOOL_NAME,
-    SKILL_TOOL_NAME, TASK_TOOL_NAME, TODOWRITE_TOOL_NAME, WRITE_TOOL_NAME,
+    TASK_TOOL_NAME, TODOWRITE_TOOL_NAME, WRITE_TOOL_NAME,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -104,7 +104,6 @@ const DEFAULT_HINTS: &[(&str, ToolRenderHints)] = &[
     hint!(TODOWRITE_TOOL_NAME),
     hint!(QUESTION_TOOL_NAME),
     hint!(BATCH_TOOL_NAME),
-    hint!(SKILL_TOOL_NAME),
 ];
 
 pub struct RenderHintsRegistry {

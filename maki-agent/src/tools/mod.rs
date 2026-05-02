@@ -19,7 +19,6 @@ mod question;
 mod read;
 pub mod registry;
 pub mod schema;
-mod skill;
 mod task;
 mod todowrite;
 mod write;
@@ -47,14 +46,12 @@ use crate::agent::LoadedInstructions;
 use crate::cancel::CancelToken;
 use crate::mcp::McpHandle;
 use crate::permissions::PermissionManager;
-use crate::skill::Skill;
 use crate::{AgentConfig, AgentMode, EventSender};
 use maki_config::ToolOutputLines;
 use maki_providers::Model;
 use maki_providers::provider::Provider;
 
 pub struct DescriptionContext<'a> {
-    pub skills: &'a [Skill],
     pub filter: &'a ToolFilter,
 }
 
@@ -133,7 +130,6 @@ pub const GREP_TOOL_NAME: &str = grep::Grep::NAME;
 pub const MULTIEDIT_TOOL_NAME: &str = multiedit::MultiEdit::NAME;
 pub const QUESTION_TOOL_NAME: &str = question::Question::NAME;
 pub const READ_TOOL_NAME: &str = read::Read::NAME;
-pub const SKILL_TOOL_NAME: &str = skill::SkillTool::NAME;
 pub const TASK_TOOL_NAME: &str = task::Task::NAME;
 pub const TODOWRITE_TOOL_NAME: &str = todowrite::TodoWrite::NAME;
 pub const WRITE_TOOL_NAME: &str = write::Write::NAME;
@@ -198,7 +194,6 @@ pub struct ToolContext {
     pub mode: AgentMode,
     pub tool_use_id: Option<String>,
     pub user_response_rx: Option<Arc<async_lock::Mutex<flume::Receiver<String>>>>,
-    pub skills: Arc<[Skill]>,
     pub loaded_instructions: LoadedInstructions,
     pub cancel: CancelToken,
     pub mcp: Option<McpHandle>,
@@ -541,7 +536,6 @@ register_tools! {
     grep::Grep,
     question::Question,
     todowrite::TodoWrite,
-    skill::SkillTool,
     task::Task,
     batch::Batch,
     code_execution::CodeExecution,
@@ -594,7 +588,6 @@ pub(crate) fn interpreter_ctx(
     static PROVIDER: LazyLock<Arc<dyn Provider>> = LazyLock::new(|| Arc::new(NullProvider));
     static MODEL: LazyLock<Arc<Model>> =
         LazyLock::new(|| Arc::new(Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap()));
-    static SKILLS: LazyLock<Arc<[Skill]>> = LazyLock::new(|| Arc::from([]));
     ToolContext {
         provider: Arc::clone(&PROVIDER),
         model: Arc::clone(&MODEL),
@@ -602,7 +595,6 @@ pub(crate) fn interpreter_ctx(
         mode: mode.clone(),
         tool_use_id: None,
         user_response_rx,
-        skills: Arc::clone(&SKILLS),
         loaded_instructions: LoadedInstructions::new(),
         cancel,
         mcp: None,
@@ -968,7 +960,6 @@ mod tests {
         let all = ToolRegistry::native().definitions(
             &vars,
             &DescriptionContext {
-                skills: &[],
                 filter: &ToolFilter::All,
             },
             true,
@@ -983,10 +974,7 @@ mod tests {
     fn definitions_filtered_returns_only_requested() {
         let vars = Vars::new().set("{cwd}", "/tmp");
         let filter = ToolFilter::Only(vec!["read".into(), "glob".into()]);
-        let ctx = DescriptionContext {
-            skills: &[],
-            filter: &filter,
-        };
+        let ctx = DescriptionContext { filter: &filter };
         let filtered = ToolRegistry::native().definitions(&vars, &ctx, true);
         let names: Vec<&str> = filtered
             .as_array()

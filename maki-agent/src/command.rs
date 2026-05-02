@@ -1,17 +1,54 @@
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-#[cfg(test)]
-use std::path::PathBuf;
-
+use serde::Deserialize;
 use tracing::{debug, warn};
-
-use crate::skill::{find_project_ancestor_dirs, parse_frontmatter};
 
 const PROJECT_COMMAND_DIRS: &[&str] = &[".maki/commands", ".claude/commands"];
 const GLOBAL_THIRD_PARTY_COMMAND_DIRS: &[&str] = &[".claude/commands"];
 const ARGUMENTS_PLACEHOLDER: &str = "$ARGUMENTS";
+
+#[derive(Debug, Default, Deserialize)]
+struct Frontmatter {
+    name: Option<String>,
+    description: Option<String>,
+    #[serde(rename = "argument-hint")]
+    argument_hint: Option<String>,
+}
+
+fn find_project_ancestor_dirs(cwd: &Path) -> Vec<PathBuf> {
+    let mut dirs = vec![cwd.to_path_buf()];
+    let mut current = cwd;
+
+    while let Some(parent) = current.parent() {
+        dirs.push(parent.to_path_buf());
+        if parent.join(".git").exists() {
+            break;
+        }
+        current = parent;
+    }
+
+    dirs
+}
+
+fn parse_frontmatter(content: &str) -> (Frontmatter, &str) {
+    let content = content.trim_start();
+
+    let Some(rest) = content.strip_prefix("---") else {
+        return (Frontmatter::default(), content);
+    };
+
+    let Some(end) = rest.find("\n---") else {
+        return (Frontmatter::default(), content);
+    };
+
+    let yaml = &rest[1..end + 1];
+    let body = rest[end + 4..].trim();
+
+    let fm = serde_yaml::from_str(yaml).unwrap_or_default();
+    (fm, body)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandScope {
@@ -139,6 +176,11 @@ mod tests {
         ; "full_frontmatter"
     )]
     #[test_case(
+        "Review $ARGUMENTS",
+        "test-cmd", "", true
+        ; "body_placeholder_without_hint"
+    )]
+    #[test_case(
         "Just do things",
         "test-cmd", "", false
         ; "no_frontmatter_uses_filename"
@@ -237,5 +279,48 @@ mod tests {
         let commands = discover_commands_inner(dir.path(), None);
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0].name, "valid");
+    }
+
+    #[test_case(
+        "---\n: invalid: yaml: [[\n---\nBody",
+        None, "Body"
+        ; "invalid_yaml_falls_back"
+    )]
+    #[test_case(
+        "---\nname: oops\nThis never closes",
+        None, "---\nname: oops\nThis never closes"
+        ; "no_closing_delimiter"
+    )]
+    #[test_case(
+        "  \n---\nname: trimmed\n---\nBody",
+        Some("trimmed"), "Body"
+        ; "leading_whitespace"
+    )]
+    fn parse_frontmatter_edge_cases(input: &str, expected_name: Option<&str>, expected_body: &str) {
+        let (fm, body) = parse_frontmatter(input);
+        assert_eq!(fm.name.as_deref(), expected_name);
+        assert_eq!(body, expected_body);
+    }
+
+    #[test]
+    fn find_project_ancestor_dirs_stops_at_git() {
+        let tmp = TempDir::new().unwrap();
+        let deep = tmp.path().join("a/b/c");
+        fs::create_dir_all(&deep).unwrap();
+        fs::create_dir_all(tmp.path().join("a/.git")).unwrap();
+
+        let dirs = find_project_ancestor_dirs(&deep);
+        let dir_strs: Vec<_> = dirs
+            .iter()
+            .map(|d| d.to_string_lossy().into_owned())
+            .collect();
+
+        assert!(dir_strs.contains(&deep.to_string_lossy().into_owned()));
+        assert!(dir_strs.contains(&tmp.path().join("a/b").to_string_lossy().into_owned()));
+        assert!(dir_strs.contains(&tmp.path().join("a").to_string_lossy().into_owned()));
+        assert!(
+            !dir_strs.contains(&tmp.path().to_string_lossy().into_owned()),
+            "should not traverse past .git"
+        );
     }
 }

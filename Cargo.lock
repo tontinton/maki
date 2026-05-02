@@ -2335,6 +2335,7 @@ dependencies = [
  "mlua",
  "regex",
  "serde_json",
+ "serde_yaml",
  "smol",
  "tempfile",
  "test-case",

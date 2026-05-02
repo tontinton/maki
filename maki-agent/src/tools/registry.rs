@@ -603,10 +603,7 @@ mod tests {
         .unwrap();
 
         let filter = crate::tools::ToolFilter::All;
-        let ctx = DescriptionContext {
-            skills: &[],
-            filter: &filter,
-        };
+        let ctx = DescriptionContext { filter: &filter };
         let vars = Vars::new();
         let defs = reg.definitions(&vars, &ctx, false);
         let arr = defs.as_array().expect("definitions returns array");

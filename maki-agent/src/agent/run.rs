@@ -14,7 +14,6 @@ use super::tool_dispatch::{self, RecentCalls};
 use crate::cancel::CancelToken;
 use crate::mcp::McpHandle;
 use crate::permissions::PermissionManager;
-use crate::skill::Skill;
 use crate::tools::{Deadline, FileReadTracker, ToolContext};
 use crate::{
     AgentConfig, AgentError, AgentEvent, AgentInput, AgentMode, EventSender, ExtractedCommand,
@@ -37,7 +36,6 @@ pub struct RunOutcome {
 pub struct AgentParams {
     pub provider: Arc<dyn Provider>,
     pub model: Model,
-    pub skills: Arc<[Skill]>,
     pub config: AgentConfig,
     pub tool_output_lines: ToolOutputLines,
     pub permissions: Arc<PermissionManager>,
@@ -60,7 +58,6 @@ pub struct Agent {
     system: String,
     event_tx: EventSender,
     tools: Value,
-    skills: Arc<[Skill]>,
     mode: AgentMode,
     user_response_rx: Option<Arc<async_lock::Mutex<flume::Receiver<String>>>>,
     interrupt_source: Option<Arc<dyn InterruptSource>>,
@@ -87,7 +84,6 @@ impl Agent {
         Self {
             provider: params.provider,
             model: Arc::new(params.model),
-            skills: params.skills,
             config: params.config,
             tool_output_lines: params.tool_output_lines,
             permissions: params.permissions,
@@ -328,7 +324,6 @@ impl Agent {
             mode: self.mode.clone(),
             tool_use_id: None,
             user_response_rx: self.user_response_rx.clone(),
-            skills: Arc::clone(&self.skills),
             loaded_instructions: self.loaded_instructions.clone(),
             cancel: self.cancel.clone(),
             mcp: self.mcp.clone(),
@@ -415,7 +410,6 @@ mod tests {
     use super::*;
     use crate::Envelope;
     use crate::permissions::PermissionManager;
-    use crate::skill::Skill;
 
     struct MockInterruptSource {
         commands: Mutex<VecDeque<ExtractedCommand>>,
@@ -494,7 +488,6 @@ mod tests {
             AgentParams {
                 provider: Arc::new(provider),
                 model: default_model(),
-                skills: Arc::from([]) as Arc<[Skill]>,
                 config: AgentConfig::default(),
                 tool_output_lines: ToolOutputLines::default(),
                 permissions: Arc::new(PermissionManager::new(
@@ -749,7 +742,6 @@ mod tests {
                 AgentParams {
                     provider: Arc::new(HangingProvider),
                     model: default_model(),
-                    skills: Arc::from([]) as Arc<[Skill]>,
                     config: AgentConfig::default(),
                     tool_output_lines: ToolOutputLines::default(),
                     permissions: Arc::new(PermissionManager::new(

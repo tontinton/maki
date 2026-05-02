@@ -89,4 +89,4 @@ More info at the [official docs](http://maki.sh/docs).
 Currently working on a refactor so maki is a core agent UI loop with features like tools, UI elements, and storage all controlled by lua plugins.
 This will allow you to customize the hell out of maki.
 
-Status: webfetch, websearch, index, bash are plugins (in the `./plugins` dir).
+Status: webfetch, websearch, index, bash, and skill tools are lua plugins (in the `./plugins` dir).
