@@ -195,12 +195,7 @@ impl MessagesPanel {
     }
 
     pub fn tool_done(&mut self, event: ToolDoneEvent) {
-        let has_snapshot = self
-            .messages
-            .iter()
-            .rfind(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == event.id))
-            .is_some_and(|m| m.render_snapshot.is_some());
-        if has_snapshot {
+        if self.has_snapshot(&event.id) {
             if let Some(buf) = self.live_bufs.get(&event.id) {
                 buf.read_if_dirty();
             }
@@ -335,16 +330,7 @@ impl MessagesPanel {
     }
 
     pub fn tool_snapshot(&mut self, tool_id: &str, snapshot: BufferSnapshot) {
-        if let Some((batch_id, _)) = parse_batch_inner_id(tool_id) {
-            self.batch_children
-                .entry(tool_id.to_owned())
-                .or_default()
-                .snapshot = Some(snapshot);
-            self.rebuild_tool_segment(batch_id);
-        } else if let Some(msg) = self.find_tool_msg_mut(tool_id) {
-            msg.render_snapshot = Some(snapshot);
-            self.rebuild_tool_segment(tool_id);
-        }
+        self.store_snapshot(tool_id, snapshot);
     }
 
     pub fn tool_header_snapshot(&mut self, tool_id: &str, snapshot: BufferSnapshot) {
@@ -630,12 +616,7 @@ impl MessagesPanel {
             return ClickResult::Nothing;
         };
 
-        let has_snapshot = self
-            .messages
-            .iter()
-            .rfind(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == tool_id))
-            .is_some_and(|m| m.render_snapshot.is_some());
-        if has_snapshot {
+        if self.has_snapshot(tool_id) {
             return ClickResult::LuaToolClick {
                 tool_id: tool_id.to_owned(),
                 row: doc_row - seg_start,
@@ -842,6 +823,30 @@ impl MessagesPanel {
         selection::extract_selection_text(&self.cache, self.viewport_width, sel, msg_area)
     }
 
+    fn has_snapshot(&self, tool_id: &str) -> bool {
+        self.batch_children
+            .get(tool_id)
+            .is_some_and(|c| c.snapshot.is_some())
+            || self
+                .messages
+                .iter()
+                .rfind(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == tool_id))
+                .is_some_and(|m| m.render_snapshot.is_some())
+    }
+
+    fn store_snapshot(&mut self, tool_id: &str, snapshot: BufferSnapshot) {
+        if let Some((batch_id, _)) = parse_batch_inner_id(tool_id) {
+            self.batch_children
+                .entry(tool_id.to_owned())
+                .or_default()
+                .snapshot = Some(snapshot);
+            self.rebuild_tool_segment(batch_id);
+        } else if let Some(msg) = self.find_tool_msg_mut(tool_id) {
+            msg.render_snapshot = Some(snapshot);
+            self.rebuild_tool_segment(tool_id);
+        }
+    }
+
     fn find_tool_msg_mut(&mut self, tool_id: &str) -> Option<&mut DisplayMessage> {
         self.messages
             .iter_mut()
@@ -868,10 +873,7 @@ impl MessagesPanel {
             .filter_map(|(id, buf)| buf.read_if_dirty().map(|lines| (id.clone(), lines)))
             .collect();
         for (tool_id, lines) in updates {
-            if let Some(msg) = self.find_tool_msg_mut(&tool_id) {
-                msg.render_snapshot = Some(BufferSnapshot::from_arc(lines));
-            }
-            self.rebuild_tool_segment(&tool_id);
+            self.store_snapshot(&tool_id, BufferSnapshot::from_arc(lines));
         }
     }
 

@@ -6,10 +6,20 @@ use maki_agent::tools::{
     BASH_TOOL_NAME, GLOB_TOOL_NAME, GREP_TOOL_NAME, QUESTION_TOOL_NAME, WRITE_TOOL_NAME,
 };
 use maki_agent::{
-    BatchToolEntry, GrepFileEntry, GrepMatchGroup, QuestionAnswer, ToolInput, ToolOutput,
+    BatchToolEntry, GrepFileEntry, GrepMatchGroup, QuestionAnswer, SharedBuf, SnapshotLine,
+    SnapshotSpan, SpanStyle, ToolInput, ToolOutput,
 };
 use ratatui::backend::TestBackend;
 use test_case::test_case;
+
+fn snap_line(text: &str) -> SnapshotLine {
+    SnapshotLine {
+        spans: vec![SnapshotSpan {
+            text: text.into(),
+            style: SpanStyle::Default,
+        }],
+    }
+}
 
 fn start(id: &str, tool: &str) -> ToolStartEvent {
     ToolStartEvent {
@@ -1114,8 +1124,6 @@ fn handle_click_returns_nothing_when_no_segment_at_row() {
 
 #[test]
 fn handle_click_returns_lua_tool_click_when_snapshot_exists() {
-    use maki_agent::{SnapshotLine, SnapshotSpan, SpanStyle};
-
     let mut panel = MessagesPanel::new(UiConfig::default());
     panel.tool_start(start("t1", BASH_TOOL_NAME));
     panel.tool_done(ToolDoneEvent {
@@ -1126,12 +1134,7 @@ fn handle_click_returns_lua_tool_click_when_snapshot_exists() {
     });
     panel.tool_snapshot(
         "t1",
-        BufferSnapshot::from_arc(Arc::new(vec![SnapshotLine {
-            spans: vec![SnapshotSpan {
-                text: "rendered".into(),
-                style: SpanStyle::Default,
-            }],
-        }])),
+        BufferSnapshot::from_arc(Arc::new(vec![snap_line("rendered")])),
     );
     render(&mut panel, 80, 24);
     let area = Rect::new(0, 0, 80, 24);
@@ -1170,24 +1173,16 @@ fn handle_click_non_tool_segment_returns_nothing() {
 
 #[test]
 fn live_buf_updates_after_tool_done_are_picked_up() {
-    use maki_agent::{SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle};
-
     let buf = Arc::new(SharedBuf::new());
-    let line = |text: &str| SnapshotLine {
-        spans: vec![SnapshotSpan {
-            text: text.into(),
-            style: SpanStyle::Default,
-        }],
-    };
 
     let mut panel = MessagesPanel::new(UiConfig::default());
     panel.register_live_buf("t1".into(), Arc::clone(&buf));
     panel.tool_start(start("t1", BASH_TOOL_NAME));
 
-    buf.set_lines(vec![line("before")]);
+    buf.set_lines(vec![snap_line("before")]);
     panel.tool_snapshot(
         "t1",
-        BufferSnapshot::from_arc(Arc::new(vec![line("before")])),
+        BufferSnapshot::from_arc(Arc::new(vec![snap_line("before")])),
     );
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
@@ -1196,10 +1191,35 @@ fn live_buf_updates_after_tool_done_are_picked_up() {
         is_error: false,
     });
 
-    buf.set_lines(vec![line("after click")]);
+    buf.set_lines(vec![snap_line("after click")]);
     render(&mut panel, 80, 24);
 
     let msg = panel.find_tool_msg_mut("t1").unwrap();
     let snap = msg.render_snapshot.as_ref().unwrap();
     assert_eq!(snap.lines[0].spans[0].text, "after click");
+}
+
+#[test]
+fn handle_click_returns_lua_tool_click_for_batch_child() {
+    let mut panel = MessagesPanel::new(UiConfig::default());
+    batch_start(
+        &mut panel,
+        vec![batch_entry("bash", "echo hi", BatchToolStatus::Success)],
+    );
+    let mut done_entries = vec![batch_entry("bash", "echo hi", BatchToolStatus::Success)];
+    done_entries[0].output = Some(ToolOutput::Plain("hi".into()));
+    batch_done(&mut panel, done_entries);
+
+    panel.tool_snapshot(
+        "b1__0",
+        BufferSnapshot::from_arc(Arc::new(vec![snap_line("rendered")])),
+    );
+    render(&mut panel, 80, 24);
+
+    let area = Rect::new(0, 0, 80, 24);
+    let clicked = (0..area.height).find_map(|row| match panel.handle_click(row, area) {
+        ClickResult::LuaToolClick { tool_id, .. } if tool_id == "b1__0" => Some(tool_id),
+        _ => None,
+    });
+    assert_eq!(clicked.as_deref(), Some("b1__0"));
 }
