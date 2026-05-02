@@ -125,14 +125,19 @@ Return a compact overview of a source file: imports, type definitions, function 
       }
     end
 
-    local ext = path:match("%.([^%.]+)$")
-    if not ext then
-      return { llm_output = "Unsupported file type: (no extension). Use the read tool instead.", is_error = true }
-    end
+    local filename = path:match("([^/]+)$")
+    local lang = indexer.FILENAME_TO_LANG[filename]
 
-    local lang = indexer.EXT_TO_LANG[ext]
     if not lang then
-      return { llm_output = "Unsupported file type: ." .. ext .. ". Use the read tool instead.", is_error = true }
+      local ext = path:match("%.([^%.]+)$")
+      if not ext then
+        return { llm_output = "Unsupported file type: (no extension). Use the read tool instead.", is_error = true }
+      end
+
+      lang = indexer.EXT_TO_LANG[ext]
+      if not lang then
+        return { llm_output = "Unsupported file type: ." .. ext .. ". Use the read tool instead.", is_error = true }
+      end
     end
 
     local config = ctx:config()

@@ -40,11 +40,21 @@ local EXT_TO_LANG = {
   exs = "elixir",
   md = "markdown",
   markdown = "markdown",
+  bzl = "bazel_bzl",
+}
+
+local FILENAME_TO_LANG = {
+  ["MODULE.bazel"] = "bazel_module",
+  ["BUILD"] = "bazel_build",
+  ["BUILD.bazel"] = "bazel_build",
 }
 
 local LANG_TO_PARSER = {
   lua_lang = "lua",
   javascript = "typescript",
+  bazel_build = "starlark",
+  bazel_module = "starlark",
+  bazel_bzl = "starlark",
 }
 
 local function parser_name(lang)
@@ -736,16 +746,30 @@ local function unique_langs()
 end
 
 local EXTRACTORS = {}
-for _, name in ipairs(unique_langs()) do
-  local factory = require("lang." .. name)
-  local lang = factory(U)
-  validate_lang(name, lang)
 
-  if lang.extract then
-    EXTRACTORS[name] = lang.extract
-  else
-    EXTRACTORS[name] = function(source, root)
-      return default_extract(lang, source, root)
+-- Bazel file-kind extractors live in lang/bazel/ and are pre-registered
+-- because BUILD.bazel and MODULE.bazel are detected by filename (not by
+-- extension), and all three share the "starlark" tree-sitter parser.
+for _, sub in ipairs({ "build", "module", "bzl" }) do
+  local lang_name = "bazel_" .. sub
+  local factory = require("lang.bazel." .. sub)
+  local lang = factory(U)
+  validate_lang(lang_name, lang)
+  EXTRACTORS[lang_name] = lang.extract
+end
+
+for _, name in ipairs(unique_langs()) do
+  if not EXTRACTORS[name] then
+    local factory = require("lang." .. name)
+    local lang = factory(U)
+    validate_lang(name, lang)
+
+    if lang.extract then
+      EXTRACTORS[name] = lang.extract
+    else
+      EXTRACTORS[name] = function(source, root)
+        return default_extract(lang, source, root)
+      end
     end
   end
 end
@@ -768,4 +792,5 @@ end
 return {
   index_source = index_source,
   EXT_TO_LANG = EXT_TO_LANG,
+  FILENAME_TO_LANG = FILENAME_TO_LANG,
 }

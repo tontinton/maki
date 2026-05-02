@@ -43,6 +43,7 @@ tree-sitter-python = { workspace = true }
 tree-sitter-ruby = { workspace = true }
 tree-sitter-rust = { workspace = true }
 tree-sitter-scala = { workspace = true }
+tree-sitter-starlark = { workspace = true }
 tree-sitter-swift = { workspace = true }
 tree-sitter-typescript = { workspace = true }
 [target.'cfg(unix)'.dependencies]

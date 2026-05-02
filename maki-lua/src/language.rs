@@ -20,6 +20,7 @@ pub enum Language {
     Lua,
     Elixir,
     Markdown,
+    Starlark,
 }
 
 impl Language {
@@ -43,6 +44,7 @@ impl Language {
             "lua" => Some(Self::Lua),
             "elixir" => Some(Self::Elixir),
             "markdown" => Some(Self::Markdown),
+            "starlark" => Some(Self::Starlark),
             _ => None,
         }
     }
@@ -67,6 +69,7 @@ impl Language {
             "lua" => Some(Self::Lua),
             "ex" | "exs" => Some(Self::Elixir),
             "md" | "markdown" => Some(Self::Markdown),
+            "bzl" => Some(Self::Starlark),
             _ => None,
         }
     }
@@ -91,6 +94,7 @@ impl Language {
             Self::Lua => tree_sitter_lua::LANGUAGE.into(),
             Self::Elixir => tree_sitter_elixir::LANGUAGE.into(),
             Self::Markdown => tree_sitter_md::LANGUAGE.into(),
+            Self::Starlark => tree_sitter_starlark::LANGUAGE.into(),
         }
     }
 }

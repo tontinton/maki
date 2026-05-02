@@ -6,6 +6,7 @@
 -- alphabetized. Each spec uses the shared `case` helper from tests/helpers.lua,
 -- which collects failures so a single broken case does not abort the suite.
 require("tests.lang.bash")
+require("tests.lang.bazel")
 require("tests.lang.c")
 require("tests.lang.c_sharp")
 require("tests.lang.cpp")
