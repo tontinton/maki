@@ -7,6 +7,8 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use event_listener::Event;
+
 use include_dir::Dir;
 use maki_agent::cancel::CancelToken;
 use maki_agent::tools::{
@@ -29,6 +31,8 @@ const INTERRUPT_MSG: &str = "plugin interrupted: cancelled, deadline exceeded, o
 const DISPATCH_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const NIL_WITHOUT_FINISH_MSG: &str =
     "handler returned nil without calling ctx:finish() or starting jobs";
+const MAX_INFLIGHT_TOOLS: usize = 64;
+const GC_STEP_INTERVAL: usize = 4;
 
 pub type LoadResult = Result<(), PluginError>;
 
@@ -157,6 +161,59 @@ impl Drop for TaskCleanupGuard {
     }
 }
 
+/// Caps concurrent tool coroutines so we don't blow the Lua stack or starve
+/// the single-threaded executor. Also lets load/clear ops drain gracefully.
+struct InflightGate {
+    lua: Lua,
+    count: Cell<usize>,
+    ops_since_gc: Cell<usize>,
+    event: Event,
+}
+
+impl InflightGate {
+    fn new(lua: Lua) -> Self {
+        Self {
+            lua,
+            count: Cell::new(0),
+            ops_since_gc: Cell::new(0),
+            event: Event::new(),
+        }
+    }
+
+    fn increment(&self) {
+        self.count.set(self.count.get() + 1);
+    }
+
+    fn decrement(&self) {
+        self.count.set(self.count.get().saturating_sub(1));
+        self.event.notify(usize::MAX);
+        let ops = self.ops_since_gc.get() + 1;
+        if ops >= GC_STEP_INTERVAL {
+            self.ops_since_gc.set(0);
+            self.lua.gc_step().ok();
+        } else {
+            self.ops_since_gc.set(ops);
+        }
+    }
+
+    async fn wait_below(&self, limit: usize) {
+        loop {
+            if self.count.get() < limit {
+                return;
+            }
+            let listener = self.event.listen();
+            if self.count.get() < limit {
+                return;
+            }
+            listener.await;
+        }
+    }
+
+    async fn drain(&self) {
+        self.wait_below(1).await;
+    }
+}
+
 struct ToolKeys {
     handler: RegistryKey,
     header: Option<RegistryKey>,
@@ -195,7 +252,15 @@ impl LuaRuntime {
             if interrupt_shutdown.load(Ordering::Acquire) {
                 return Err(mlua::Error::runtime(INTERRUPT_MSG));
             }
-            let key = ThreadKey(interrupt_lua.current_thread().to_pointer() as usize);
+            // current_thread() needs a free stack slot and panics if there isn't one.
+            // Safe to skip: global shutdown check above still fires every tick.
+            let thread = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                interrupt_lua.current_thread()
+            }));
+            let Ok(thread) = thread else {
+                return Ok(VmState::Continue);
+            };
+            let key = ThreadKey(thread.to_pointer() as usize);
             let cancelled = interrupt_lua
                 .app_data_ref::<TaskMap>()
                 .and_then(|m| {
@@ -907,7 +972,7 @@ pub fn spawn(
             };
 
             let ex = smol::LocalExecutor::new();
-            let inflight = Rc::new(Cell::new(0usize));
+            let gate = Rc::new(InflightGate::new(rt.lua.clone()));
 
             smol::block_on(ex.run(async {
                 loop {
@@ -923,9 +988,7 @@ pub fn spawn(
                             plugin_dir,
                             reply,
                         } => {
-                            while inflight.get() > 0 {
-                                smol::future::yield_now().await;
-                            }
+                            gate.drain().await;
                             let res = rt.load_source(Arc::clone(&name), &source, plugin_dir).await;
                             let _ = reply.send(res);
                         }
@@ -938,11 +1001,12 @@ pub fn spawn(
                             reply,
                             live,
                         } => {
+                            gate.wait_below(MAX_INFLIGHT_TOOLS).await;
                             let lua = rt.lua.clone();
                             let plugins = Rc::clone(&rt.plugins);
                             let shutdown_ref = Arc::clone(&rt.shutdown);
-                            let counter = Rc::clone(&inflight);
-                            counter.set(counter.get() + 1);
+                            let g = Rc::clone(&gate);
+                            g.increment();
 
                             ex.spawn(async move {
                                 let res = run_tool_call(
@@ -958,14 +1022,12 @@ pub fn spawn(
                                 )
                                 .await;
                                 let _ = reply.send(res);
-                                counter.set(counter.get() - 1);
+                                g.decrement();
                             })
                             .detach();
                         }
                         Request::ClearPlugin { plugin, reply } => {
-                            while inflight.get() > 0 {
-                                smol::future::yield_now().await;
-                            }
+                            gate.drain().await;
                             rt.clear_plugin(&plugin);
                             let _ = reply.send(());
                         }
@@ -1013,9 +1075,7 @@ pub fn spawn(
                             plugin_dir,
                             reply,
                         } => {
-                            while inflight.get() > 0 {
-                                smol::future::yield_now().await;
-                            }
+                            gate.drain().await;
                             let res = rt.run_init_lua(&source, &source_name, plugin_dir);
                             let _ = reply.send(res);
                         }
@@ -1171,5 +1231,75 @@ mod tests {
             with_live_ctx(&lua, |ctx| ctx.tool_use_id.clone()).unwrap(),
             "tool_abc"
         );
+    }
+
+    fn gate() -> InflightGate {
+        InflightGate::new(Lua::new())
+    }
+
+    #[test]
+    fn inflight_gate_decrement_saturates_at_zero() {
+        let g = gate();
+        g.decrement();
+        g.decrement();
+        assert_eq!(g.count.get(), 0);
+    }
+
+    #[test]
+    fn inflight_gate_drain_requires_all_decrements() {
+        let ex = smol::LocalExecutor::new();
+        smol::block_on(ex.run(async {
+            let g = Rc::new(gate());
+            g.increment();
+            g.increment();
+            let g2 = Rc::clone(&g);
+            let waiter = ex.spawn(async move { g2.drain().await });
+            smol::future::yield_now().await;
+            assert!(!waiter.is_finished());
+            g.decrement();
+            smol::future::yield_now().await;
+            assert!(!waiter.is_finished());
+            g.decrement();
+            waiter.await;
+        }));
+    }
+
+    #[test]
+    fn inflight_gate_multiple_waiters_all_wake() {
+        let ex = smol::LocalExecutor::new();
+        smol::block_on(ex.run(async {
+            let g = Rc::new(gate());
+            g.increment();
+            let mut waiters = Vec::new();
+            for _ in 0..4 {
+                let g2 = Rc::clone(&g);
+                waiters.push(ex.spawn(async move { g2.drain().await }));
+            }
+            smol::future::yield_now().await;
+            for w in &waiters {
+                assert!(!w.is_finished());
+            }
+            g.decrement();
+            for w in waiters {
+                w.await;
+            }
+        }));
+    }
+
+    #[test]
+    fn inflight_gate_blocks_at_max_capacity() {
+        let ex = smol::LocalExecutor::new();
+        smol::block_on(ex.run(async {
+            let g = Rc::new(gate());
+            for _ in 0..MAX_INFLIGHT_TOOLS {
+                g.increment();
+            }
+            let g2 = Rc::clone(&g);
+            let waiter = ex.spawn(async move { g2.wait_below(MAX_INFLIGHT_TOOLS).await });
+            smol::future::yield_now().await;
+            assert!(!waiter.is_finished());
+            g.decrement();
+            waiter.await;
+        }));
     }
 }

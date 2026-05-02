@@ -2321,6 +2321,7 @@ dependencies = [
 name = "maki-lua"
 version = "0.2.9"
 dependencies = [
+ "event-listener",
  "flume 0.11.1",
  "futures-lite",
  "htmd",
