@@ -230,7 +230,7 @@ fn reload_same_plugin_replaces_tools() {
 }
 
 #[test]
-fn failed_load_leaves_no_tools() {
+fn failed_load_leaves_no_tools_or_commands() {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
 
@@ -243,6 +243,10 @@ maki.api.register_tool({{
     audiences = {{ "main" }},
     handler = function() return "" end
 }})
+maki.api.register_command({{
+    name = "/doomed",
+    handler = function() end,
+}})
 error("plugin blew up after register")
 "#,
     );
@@ -251,6 +255,7 @@ error("plugin blew up after register")
         .expect_err("expected lua error");
     assert!(matches!(err, PluginError::Lua { .. }));
     assert!(!reg.has("doomed"));
+    assert_eq!(host.command_reader().load().commands.len(), 0);
 
     host.load_source("broken", ECHO_PLUGIN)
         .expect("retry with good source should succeed");
@@ -910,4 +915,81 @@ fn setup_no_tool_registration_in_init_env() {
         matches!(err, PluginError::Lua { .. }),
         "expected Lua error, got: {err}"
     );
+}
+
+#[test]
+fn register_command_happy_path() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source(
+        "cmd_plugin",
+        r#"
+        maki.api.register_command({
+            name = "/hello",
+            description = "says hello",
+            handler = function(args) end,
+        })
+        "#,
+    )
+    .unwrap();
+
+    let reader = host.command_reader();
+    let snap = reader.load();
+    assert_eq!(snap.commands.len(), 1);
+    assert_eq!(snap.commands[0].name.as_ref(), "/hello");
+    assert_eq!(snap.commands[0].description.as_ref(), "says hello");
+    assert_eq!(snap.commands[0].plugin.as_ref(), "cmd_plugin");
+}
+
+#[test_case::test_case(
+    r#"maki.api.register_command({ name = "", handler = function() end })"#,
+    "non-empty" ; "empty_name"
+)]
+#[test_case::test_case(
+    r#"maki.api.register_command({ name = "/test", description = "no handler" })"#,
+    "handler" ; "missing_handler"
+)]
+fn register_command_validation_rejects(src: &str, expected_err: &str) {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let err = host
+        .load_source("bad_cmd", src)
+        .expect_err("expected validation error");
+    assert!(matches!(err, PluginError::Lua { .. }));
+    assert!(err.to_string().contains(expected_err), "got: {err}");
+}
+
+#[test]
+fn reload_replaces_commands() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source(
+        "reload_cmd",
+        r#"maki.api.register_command({ name = "/v1", handler = function() end })"#,
+    )
+    .unwrap();
+
+    host.load_source(
+        "reload_cmd",
+        r#"maki.api.register_command({ name = "/v2", handler = function() end })"#,
+    )
+    .unwrap();
+    let snap = host.command_reader().load();
+    assert_eq!(snap.commands.len(), 1);
+    assert_eq!(snap.commands[0].name.as_ref(), "/v2");
+}
+
+#[test]
+fn unload_clears_commands() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source(
+        "cmd_only",
+        r#"maki.api.register_command({ name = "/bye", handler = function() end })"#,
+    )
+    .unwrap();
+    assert_eq!(host.command_reader().load().commands.len(), 1);
+
+    host.unload("cmd_only").unwrap();
+    assert_eq!(host.command_reader().load().commands.len(), 0);
 }

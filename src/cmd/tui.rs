@@ -99,6 +99,9 @@ pub fn run(cli: Cli) -> Result<()> {
         .load_builtins(&config.plugins)
         .context("load builtin plugins")?;
 
+    let lua_command_reader = plugin_host.command_reader();
+    let ui_action_rx = plugin_host.ui_action_rx();
+
     let timeouts = maki_providers::Timeouts {
         connect: config.provider.connect_timeout,
         low_speed: config.provider.low_speed_timeout,
@@ -153,6 +156,9 @@ pub fn run(cli: Cli) -> Result<()> {
                 )),
                 timeouts,
                 exit_on_done: cli.exit_on_done,
+                lua_command_reader,
+                ui_action_rx,
+                lua_event_handle: plugin_host.event_handle(),
                 buf_click: plugin_host.event_handle().map(|eh| {
                     Arc::new(move |tool_id: &str, row: u32| {
                         eh.fire_click(tool_id, row);

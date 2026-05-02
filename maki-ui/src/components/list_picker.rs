@@ -86,7 +86,7 @@ impl<T> PickerState<T> {
 
 pub struct ListPicker<T> {
     state: Option<PickerState<T>>,
-    title: &'static str,
+    title: String,
     max_visible: Option<u16>,
     generation: u64,
     footer: Option<FooterSpec>,
@@ -230,7 +230,7 @@ impl<T: PickerItem> ListPicker<T> {
     pub fn new() -> Self {
         Self {
             state: None,
-            title: "",
+            title: String::new(),
             max_visible: None,
             generation: 0,
             footer: None,
@@ -252,28 +252,28 @@ impl<T: PickerItem> ListPicker<T> {
         self
     }
 
-    pub fn open_toggleable(&mut self, items: Vec<T>, enabled: Vec<bool>, title: &'static str) {
+    pub fn open_toggleable(&mut self, items: Vec<T>, enabled: Vec<bool>, title: impl Into<String>) {
         assert_eq!(
             items.len(),
             enabled.len(),
             "items and enabled must have same length"
         );
         self.generation += 1;
-        self.title = title;
+        self.title = title.into();
         let mut state = State::new(items);
         state.enabled = Some(enabled);
         self.state = Some(PickerState::Ready(state));
     }
 
-    pub fn open(&mut self, items: Vec<T>, title: &'static str) {
+    pub fn open(&mut self, items: Vec<T>, title: impl Into<String>) {
         self.generation += 1;
-        self.title = title;
+        self.title = title.into();
         self.state = Some(PickerState::Ready(State::new(items)));
     }
 
-    pub fn open_loading(&mut self, title: &'static str) {
+    pub fn open_loading(&mut self, title: impl Into<String>) {
         self.generation += 1;
-        self.title = title;
+        self.title = title.into();
         self.state = Some(PickerState::Loading);
     }
 
@@ -520,7 +520,7 @@ impl<T: PickerItem> ListPicker<T> {
             None => Rect::default(),
             Some(PickerState::Loading) => {
                 let modal = Modal {
-                    title: self.title,
+                    title: &self.title,
                     width_percent: MIN_WIDTH_PERCENT,
                     max_height_percent: MAX_HEIGHT_PERCENT,
                 };
@@ -550,7 +550,7 @@ impl<T: PickerItem> ListPicker<T> {
                 popup
             }
             Some(PickerState::Ready(s)) => {
-                render_ready(frame, area, s, self.title, self.max_visible, footer)
+                render_ready(frame, area, s, &self.title, self.max_visible, footer)
             }
         }
     }
@@ -570,7 +570,7 @@ fn render_ready<T: PickerItem>(
     frame: &mut Frame,
     area: Rect,
     s: &mut State<T>,
-    title: &'static str,
+    title: &str,
     max_visible: Option<u16>,
     footer: Option<&FooterSpec>,
 ) -> Rect {

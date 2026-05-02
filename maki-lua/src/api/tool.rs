@@ -16,6 +16,9 @@ use mlua::{
 use serde_json::Value;
 
 use crate::api::buf::BufHandle;
+use crate::api::command::{
+    CommandEntry, CommandHandlerMap, LuaCommandWriter, publish_command_snapshot,
+};
 use crate::api::ctx::LuaCtx;
 use crate::runtime::{LiveCtx, Request};
 
@@ -254,13 +257,24 @@ impl ToolInvocation for LuaToolInvocation {
     }
 }
 
-pub(crate) fn create_api_table(lua: &Lua, pending: PendingTools) -> LuaResult<Table> {
+pub(crate) fn create_api_table(
+    lua: &Lua,
+    pending: PendingTools,
+    plugin: Arc<str>,
+) -> LuaResult<Table> {
     let t = lua.create_table()?;
 
     t.set(
         "register_tool",
         lua.create_function(move |lua, spec: Table| {
             register_tool_from_lua(lua, &spec, pending.clone())
+        })?,
+    )?;
+
+    t.set(
+        "register_command",
+        lua.create_function(move |lua, spec: Table| {
+            register_command_from_lua(lua, &spec, Arc::clone(&plugin))
         })?,
     )?;
 
@@ -387,6 +401,48 @@ fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> Lua
             permission_scope_kind,
             permission_scopes_key,
         });
+
+    Ok(())
+}
+
+fn register_command_from_lua(lua: &Lua, spec: &Table, plugin: Arc<str>) -> LuaResult<()> {
+    let name: String = spec
+        .get("name")
+        .map_err(|_| mlua::Error::runtime("register_command: missing 'name'"))?;
+    if name.is_empty() {
+        return Err(mlua::Error::runtime(
+            "register_command: name must be non-empty",
+        ));
+    }
+    let description: String = spec.get("description").unwrap_or_default();
+    let handler: Function = spec
+        .get("handler")
+        .map_err(|_| mlua::Error::runtime("register_command: missing 'handler'"))?;
+
+    let handler_key = lua.create_registry_value(handler)?;
+    let name: Arc<str> = Arc::from(name.as_str());
+    let description: Arc<str> = Arc::from(description.as_str());
+
+    {
+        let mut map = lua
+            .app_data_mut::<CommandHandlerMap>()
+            .ok_or_else(|| mlua::Error::runtime("register_command: not initialized"))?;
+        map.entry(Arc::clone(&plugin)).or_default().insert(
+            Arc::clone(&name),
+            CommandEntry {
+                handler: handler_key,
+                description,
+            },
+        );
+    }
+
+    let map = lua
+        .app_data_ref::<CommandHandlerMap>()
+        .ok_or_else(|| mlua::Error::runtime("register_command: not initialized"))?;
+    let writer = lua
+        .app_data_ref::<LuaCommandWriter>()
+        .ok_or_else(|| mlua::Error::runtime("register_command: not initialized"))?;
+    publish_command_snapshot(&map, &writer);
 
     Ok(())
 }

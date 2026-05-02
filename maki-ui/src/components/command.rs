@@ -4,6 +4,7 @@ use std::sync::Arc;
 use crossterm::event::{KeyCode, KeyEvent};
 use maki_agent::command::CustomCommand;
 use maki_agent::{McpPromptInfo, McpSnapshotReader};
+use maki_lua::{LuaCommandInfo, LuaCommandReader};
 use nucleo::pattern::{CaseMatching, Normalization};
 use nucleo::{Config, Matcher, Nucleo, Utf32String};
 use ratatui::Frame;
@@ -77,11 +78,6 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         max_args: usize::MAX,
     },
     BuiltinCommand {
-        name: "/memory",
-        description: "List memory files for this project",
-        max_args: 0,
-    },
-    BuiltinCommand {
         name: "/yolo",
         description: "Toggle YOLO mode (skip all permission prompts)",
         max_args: 0,
@@ -115,6 +111,7 @@ enum CommandType {
     Builtin(&'static BuiltinCommand),
     Custom(usize),
     McpPrompt(usize),
+    Lua(usize),
 }
 
 struct CommandItem {
@@ -135,19 +132,29 @@ pub struct CommandPalette {
     mcp_reader: McpSnapshotReader,
     mcp_prompts: Vec<McpPromptInfo>,
     mcp_generation: u64,
+    lua_reader: LuaCommandReader,
+    lua_commands: Vec<LuaCommandInfo>,
+    lua_generation: u64,
     nucleo: Nucleo<CommandItem>,
     matcher: Matcher,
     current_arg_count: usize,
 }
 
 impl CommandPalette {
-    pub fn new(custom_commands: Arc<[CustomCommand]>, mcp_reader: McpSnapshotReader) -> Self {
+    pub fn new(
+        custom_commands: Arc<[CustomCommand]>,
+        mcp_reader: McpSnapshotReader,
+        lua_reader: LuaCommandReader,
+    ) -> Self {
         let snap = mcp_reader.load();
         let mcp_generation = snap.generation;
         let prompts = snap.prompts.clone();
-        drop(snap);
 
-        let nucleo = Self::build_nucleo(&custom_commands, &prompts);
+        let lua_snap = lua_reader.load();
+        let lua_generation = lua_snap.generation;
+        let lua_commands = lua_snap.commands.clone();
+
+        let nucleo = Self::build_nucleo(&custom_commands, &prompts, &lua_commands);
         Self {
             selected: 0,
             filtered: Vec::new(),
@@ -155,6 +162,9 @@ impl CommandPalette {
             mcp_reader,
             mcp_prompts: prompts,
             mcp_generation,
+            lua_reader,
+            lua_commands,
+            lua_generation,
             nucleo,
             matcher: Matcher::new(Config::DEFAULT),
             current_arg_count: 0,
@@ -164,6 +174,7 @@ impl CommandPalette {
     fn build_nucleo(
         custom_commands: &[CustomCommand],
         mcp_prompts: &[McpPromptInfo],
+        lua_commands: &[LuaCommandInfo],
     ) -> Nucleo<CommandItem> {
         let nucleo = Nucleo::new(Config::DEFAULT, Arc::new(|| {}), None, 1);
         let injector = nucleo.injector();
@@ -199,6 +210,17 @@ impl CommandPalette {
                     usize::MAX
                 },
                 command_type: CommandType::McpPrompt(i),
+            };
+            injector.push(item, |item, cols| {
+                cols[0] = Utf32String::from(item.name.as_str());
+            });
+        }
+
+        for (i, cmd) in lua_commands.iter().enumerate() {
+            let item = CommandItem {
+                name: cmd.name.to_string(),
+                max_args: 0,
+                command_type: CommandType::Lua(i),
             };
             injector.push(item, |item, cols| {
                 cols[0] = Utf32String::from(item.name.as_str());
@@ -245,13 +267,16 @@ impl CommandPalette {
     }
 
     pub fn sync(&mut self, input: &str) {
-        let snap = self.mcp_reader.load();
-        if snap.generation != self.mcp_generation {
-            self.mcp_generation = snap.generation;
-            self.mcp_prompts = snap.prompts.clone();
-            self.nucleo = Self::build_nucleo(&self.custom, &self.mcp_prompts);
+        let mcp_snap = self.mcp_reader.load();
+        let lua_snap = self.lua_reader.load();
+        if mcp_snap.generation != self.mcp_generation || lua_snap.generation != self.lua_generation
+        {
+            self.mcp_generation = mcp_snap.generation;
+            self.mcp_prompts = mcp_snap.prompts.clone();
+            self.lua_generation = lua_snap.generation;
+            self.lua_commands = lua_snap.commands.clone();
+            self.nucleo = Self::build_nucleo(&self.custom, &self.mcp_prompts, &self.lua_commands);
         }
-        drop(snap);
         let Some(stripped) = input.strip_prefix('/') else {
             self.filtered.clear();
             self.current_arg_count = 0;
@@ -355,6 +380,7 @@ impl CommandPalette {
             CommandType::Builtin(cmd) => cmd.name.to_string(),
             CommandType::Custom(i) => self.custom[*i].display_name(),
             CommandType::McpPrompt(i) => format!("/{}", self.mcp_prompts[*i].display_name),
+            CommandType::Lua(i) => self.lua_commands[*i].name.to_string(),
         }
     }
 
@@ -363,6 +389,7 @@ impl CommandPalette {
             CommandType::Builtin(cmd) => cmd.description,
             CommandType::Custom(i) => &self.custom[*i].description,
             CommandType::McpPrompt(i) => &self.mcp_prompts[*i].description,
+            CommandType::Lua(i) => &self.lua_commands[*i].description,
         }
     }
 
@@ -389,6 +416,10 @@ impl CommandPalette {
     pub fn find_mcp_prompt(&self, slash_name: &str) -> Option<&McpPromptInfo> {
         let name = slash_name.strip_prefix('/')?;
         self.mcp_prompts.iter().find(|p| p.display_name == name)
+    }
+
+    pub fn find_lua_command(&self, name: &str) -> Option<&LuaCommandInfo> {
+        self.lua_commands.iter().find(|c| c.name.as_ref() == name)
     }
 
     pub fn view(&self, frame: &mut Frame, input_area: Rect) -> Option<Rect> {
@@ -509,13 +540,13 @@ mod tests {
     }
 
     fn synced(input: &str) -> CommandPalette {
-        let mut p = CommandPalette::new(Arc::from([]), empty_snapshot());
+        let mut p = CommandPalette::new(Arc::from([]), empty_snapshot(), LuaCommandReader::empty());
         p.sync(input);
         p
     }
 
     fn synced_with_custom(input: &str, custom: Arc<[CustomCommand]>) -> CommandPalette {
-        let mut p = CommandPalette::new(custom, empty_snapshot());
+        let mut p = CommandPalette::new(custom, empty_snapshot(), LuaCommandReader::empty());
         p.sync(input);
         p
     }
@@ -586,7 +617,7 @@ mod tests {
 
     #[test]
     fn confirm_when_inactive_returns_none() {
-        let p = CommandPalette::new(Arc::from([]), empty_snapshot());
+        let p = CommandPalette::new(Arc::from([]), empty_snapshot(), LuaCommandReader::empty());
         assert!(p.confirm("").is_none());
     }
 
@@ -639,7 +670,7 @@ mod tests {
     #[test_case("/pct", "/compact", ""    ; "fuzzy-match-2")]
     #[test_case("/btw hello world", "/btw", "hello world" ; "btw_multi_word")]
     fn confirm_parses_args(input: &str, expected_name: &str, expected_args: &str) {
-        let mut p = CommandPalette::new(Arc::from([]), empty_snapshot());
+        let mut p = CommandPalette::new(Arc::from([]), empty_snapshot(), LuaCommandReader::empty());
         p.sync(input);
         let cmd = p.confirm(input).unwrap();
         assert_eq!(cmd.name, expected_name);
@@ -649,7 +680,7 @@ mod tests {
     #[test]
     fn confirm_custom_command() {
         let custom = sample_custom();
-        let mut p = CommandPalette::new(custom, empty_snapshot());
+        let mut p = CommandPalette::new(custom, empty_snapshot(), LuaCommandReader::empty());
         p.sync("/project:review");
         assert!(p.is_active());
         let cmd = p.confirm("/project:review some-file.rs").unwrap();
@@ -660,7 +691,7 @@ mod tests {
     #[test]
     fn find_custom_command_lookup() {
         let custom = sample_custom();
-        let p = CommandPalette::new(custom, empty_snapshot());
+        let p = CommandPalette::new(custom, empty_snapshot(), LuaCommandReader::empty());
         let found = p.find_custom_command("/project:review");
         assert!(found.is_some());
         assert_eq!(found.unwrap().content, "Review $ARGUMENTS");
@@ -694,7 +725,7 @@ mod tests {
     }
 
     fn synced_with_prompts(input: &str) -> CommandPalette {
-        let mut p = CommandPalette::new(Arc::from([]), sample_prompts());
+        let mut p = CommandPalette::new(Arc::from([]), sample_prompts(), LuaCommandReader::empty());
         p.sync(input);
         p
     }
@@ -752,7 +783,7 @@ mod tests {
     #[test]
     fn mcp_update_clears_old_prompts() {
         let reader = sample_prompts();
-        let mut p = CommandPalette::new(Arc::from([]), reader);
+        let mut p = CommandPalette::new(Arc::from([]), reader, LuaCommandReader::empty());
 
         p.sync("/");
         let initial_count = p
@@ -804,7 +835,6 @@ mod tests {
     #[test_case("/cmp", "/compact" ; "compact_fuzzy")]
     #[test_case("/new", "/new" ; "new_exact")]
     #[test_case("/tsk", "/tasks" ; "tasks_fuzzy")]
-    #[test_case("/mem", "/memory" ; "memory_prefix")]
     #[test_case("/sess", "/sessions" ; "sessions_prefix")]
     fn nucleo_highlights_matching_indices(input: &str, expected_cmd: &str) {
         let p = synced(input);
@@ -820,5 +850,106 @@ mod tests {
             !matched.indices.is_empty(),
             "Match should have highlight indices"
         );
+    }
+
+    fn sample_lua_commands() -> LuaCommandReader {
+        LuaCommandReader::from_commands(vec![
+            LuaCommandInfo {
+                name: Arc::from("/memory"),
+                description: Arc::from("View memory files"),
+                plugin: Arc::from("memory"),
+            },
+            LuaCommandInfo {
+                name: Arc::from("/deploy"),
+                description: Arc::from("Deploy the project"),
+                plugin: Arc::from("deploy_plugin"),
+            },
+        ])
+    }
+
+    fn synced_with_lua(input: &str) -> CommandPalette {
+        let mut p = CommandPalette::new(Arc::from([]), empty_snapshot(), sample_lua_commands());
+        p.sync(input);
+        p
+    }
+
+    #[test]
+    fn lua_commands_appear_in_unfiltered_list() {
+        let p = synced_with_lua("/");
+        let lua_count = p
+            .filtered
+            .iter()
+            .filter(|f| matches!(f.command_type, CommandType::Lua(_)))
+            .count();
+        assert_eq!(lua_count, 2);
+    }
+
+    #[test]
+    fn lua_command_filtered_by_substring() {
+        let p = synced_with_lua("/mem");
+        assert!(p.is_active());
+        let found = p
+            .filtered
+            .iter()
+            .any(|f| matches!(f.command_type, CommandType::Lua(_)) && p.item_name(f) == "/memory");
+        assert!(found);
+    }
+
+    #[test]
+    fn find_lua_command_returns_matching_entry() {
+        let p = synced_with_lua("/");
+        let found = p.find_lua_command("/memory");
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().plugin.as_ref(), "memory");
+        assert!(p.find_lua_command("/nonexistent").is_none());
+    }
+
+    #[test]
+    fn confirm_lua_command_parses_args() {
+        let mut p = CommandPalette::new(Arc::from([]), empty_snapshot(), sample_lua_commands());
+        p.sync("/memory");
+        let cmd = p.confirm("/memory some-arg").unwrap();
+        assert_eq!(cmd.name, "/memory");
+        assert_eq!(cmd.args, "some-arg");
+    }
+
+    #[test]
+    fn lua_commands_update_on_generation_change() {
+        let (writer, reader) = maki_lua::test_support::lua_command_writer_pair();
+        writer.publish(vec![LuaCommandInfo {
+            name: Arc::from("/old"),
+            description: Arc::from("old command"),
+            plugin: Arc::from("p"),
+        }]);
+        let mut p = CommandPalette::new(Arc::from([]), empty_snapshot(), reader);
+        p.sync("/");
+        let initial_lua = p
+            .filtered
+            .iter()
+            .filter(|f| matches!(f.command_type, CommandType::Lua(_)))
+            .count();
+        assert_eq!(initial_lua, 1);
+
+        writer.publish(vec![
+            LuaCommandInfo {
+                name: Arc::from("/new1"),
+                description: Arc::from("new"),
+                plugin: Arc::from("p"),
+            },
+            LuaCommandInfo {
+                name: Arc::from("/new2"),
+                description: Arc::from("new2"),
+                plugin: Arc::from("p"),
+            },
+        ]);
+        p.sync("/");
+        let updated_lua = p
+            .filtered
+            .iter()
+            .filter(|f| matches!(f.command_type, CommandType::Lua(_)))
+            .count();
+        assert_eq!(updated_lua, 2);
+        assert!(p.find_lua_command("/old").is_none());
+        assert!(p.find_lua_command("/new1").is_some());
     }
 }

@@ -2331,6 +2331,7 @@ dependencies = [
 name = "maki-lua"
 version = "0.3.2"
 dependencies = [
+ "arc-swap",
  "event-listener",
  "flume 0.11.1",
  "futures-lite",
@@ -2446,6 +2447,7 @@ dependencies = [
  "maki-agent",
  "maki-config",
  "maki-highlight",
+ "maki-lua",
  "maki-providers",
  "maki-storage",
  "notify",

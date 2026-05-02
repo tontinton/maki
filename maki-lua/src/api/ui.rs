@@ -1,11 +1,16 @@
+use std::path::PathBuf;
 use std::time::Duration;
 
 use humantime::format_duration;
 use mlua::{Lua, Result as LuaResult, Table};
 
+use crate::api::command::{SelectEvent, SelectItem, SelectOpts, UiAction};
 use crate::runtime::with_task_bufs;
 
-pub(crate) fn create_ui_table(lua: &Lua) -> LuaResult<Table> {
+pub(crate) fn create_ui_table(
+    lua: &Lua,
+    ui_action_tx: Option<flume::Sender<UiAction>>,
+) -> LuaResult<Table> {
     let t = lua.create_table()?;
     t.set(
         "buf",
@@ -30,6 +35,99 @@ pub(crate) fn create_ui_table(lua: &Lua) -> LuaResult<Table> {
                 .replace(' ', ""))
         })?,
     )?;
+
+    if let Some(tx) = ui_action_tx {
+        let flash_tx = tx.clone();
+        t.set(
+            "flash",
+            lua.create_function(move |_, msg: String| {
+                let _ = flash_tx.try_send(UiAction::Flash(msg));
+                Ok(())
+            })?,
+        )?;
+
+        let editor_tx = tx.clone();
+        t.set(
+            "open_editor",
+            lua.create_function(move |_, path: String| {
+                let _ = editor_tx.try_send(UiAction::OpenEditor(PathBuf::from(path)));
+                Ok(())
+            })?,
+        )?;
+
+        let select_tx = tx;
+        t.set(
+            "select",
+            lua.create_async_function(move |lua, (items_tbl, opts_tbl): (Table, Table)| {
+                let tx = select_tx.clone();
+                async move {
+                    let format_fn: Option<mlua::Function> = opts_tbl.get("format").ok();
+
+                    let mut items = Vec::new();
+                    for pair in items_tbl.sequence_values::<mlua::Value>() {
+                        let val = pair?;
+                        let (label, detail) = if let Some(ref fmt) = format_fn {
+                            let tbl: Table = fmt.call(val.clone())?;
+                            let label: String = tbl.get("label")?;
+                            let detail: Option<String> = tbl.get("detail").ok();
+                            (label, detail)
+                        } else {
+                            let s = match &val {
+                                mlua::Value::String(s) => s.to_str()?.to_owned(),
+                                _ => {
+                                    return Err(mlua::Error::runtime(
+                                        "select: items must be strings or use opts.format",
+                                    ));
+                                }
+                            };
+                            (s, None)
+                        };
+                        items.push(SelectItem { label, detail });
+                    }
+
+                    let title: String = opts_tbl.get("title").unwrap_or_default();
+                    let has_on_delete: bool = opts_tbl.get("on_delete").unwrap_or(false);
+
+                    let (reply_tx, reply_rx) = flume::bounded::<SelectEvent>(1);
+                    if tx
+                        .try_send(UiAction::Select {
+                            items,
+                            opts: SelectOpts {
+                                title,
+                                has_on_delete,
+                            },
+                            reply_tx,
+                        })
+                        .is_err()
+                    {
+                        return Ok(mlua::Value::Nil);
+                    }
+
+                    let event = match reply_rx.recv_async().await {
+                        Ok(e) => e,
+                        Err(_) => return Ok(mlua::Value::Nil),
+                    };
+
+                    let result = lua.create_table()?;
+                    match event {
+                        SelectEvent::Choice { index } => {
+                            result.set("type", "choice")?;
+                            result.set("index", index + 1)?;
+                        }
+                        SelectEvent::Delete { index } => {
+                            result.set("type", "delete")?;
+                            result.set("index", index + 1)?;
+                        }
+                        SelectEvent::Close => {
+                            result.set("type", "close")?;
+                        }
+                    }
+                    Ok(mlua::Value::Table(result))
+                }
+            })?,
+        )?;
+    }
+
     Ok(t)
 }
 

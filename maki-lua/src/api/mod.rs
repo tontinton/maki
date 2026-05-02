@@ -1,4 +1,5 @@
 pub(crate) mod buf;
+pub(crate) mod command;
 pub(crate) mod ctx;
 pub(crate) mod env;
 pub(crate) mod fn_api;
@@ -18,6 +19,7 @@ use std::sync::Arc;
 
 use mlua::{Function, Lua, Result as LuaResult, Table, Value};
 
+use crate::api::command::UiAction;
 use crate::api::tool::PendingTools;
 use crate::runtime::with_task_jobs;
 
@@ -25,10 +27,14 @@ pub(crate) fn create_maki_global(
     lua: &Lua,
     pending: PendingTools,
     plugin: Arc<str>,
+    ui_action_tx: Option<flume::Sender<UiAction>>,
 ) -> LuaResult<Table> {
     let maki = lua.create_table()?;
 
-    maki.set("api", tool::create_api_table(lua, pending)?)?;
+    maki.set(
+        "api",
+        tool::create_api_table(lua, pending, Arc::clone(&plugin))?,
+    )?;
     maki.set("env", env::create_env_table(lua)?)?;
     maki.set("fs", fs::create_fs_table(lua)?)?;
     maki.set("log", log::create_log_table(lua, plugin)?)?;
@@ -38,7 +44,7 @@ pub(crate) fn create_maki_global(
     maki.set("yaml", yaml::create_yaml_table(lua)?)?;
     maki.set("net", net::create_net_table(lua)?)?;
     maki.set("text", text::create_text_table(lua)?)?;
-    maki.set("ui", ui::create_ui_table(lua)?)?;
+    maki.set("ui", ui::create_ui_table(lua, ui_action_tx)?)?;
     maki.set("fn", fn_api::create_fn_table(lua)?)?;
     maki.set(
         "defer_fn",

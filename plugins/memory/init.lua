@@ -1,40 +1,28 @@
 local ToolView = require("tool_view")
 local helpers = require("memory_helpers")
 
-local MAX_LINES_PER_FILE = helpers.MAX_LINES_PER_FILE
-local MAX_DIR_BYTES = helpers.MAX_DIR_BYTES
-local count_lines = helpers.count_lines
-local safe_resolve = helpers.safe_resolve
-local dir_total_bytes = helpers.dir_total_bytes
-local list_memories = helpers.list_memories
-local project_id = helpers.project_id
-
 local function memories_path_suffix()
   local cwd = maki.uv.cwd()
   local root = maki.fs.root(cwd, ".git") or cwd
-  return "projects/" .. project_id(root) .. "/memories"
+  return "projects/" .. helpers.project_id(root) .. "/memories"
 end
 
-local function resolve_memories_dir()
+local function resolve_dir(check_legacy)
+  if check_legacy then
+    local legacy = maki.env.legacy_dir()
+    if legacy then
+      local dir = maki.fs.joinpath(legacy, memories_path_suffix())
+      local meta = maki.fs.metadata(dir)
+      if meta and meta.is_dir then
+        return dir
+      end
+    end
+  end
   local state = maki.env.state_dir()
   if not state then
     return nil, "cannot resolve state dir"
   end
   return maki.fs.joinpath(state, memories_path_suffix())
-end
-
--- On read, try the old ~/.maki location first so memories written
--- before the XDG migration are still found.
-local function resolve_memories_read_dir()
-  local legacy = maki.env.legacy_dir()
-  if legacy then
-    local dir = maki.fs.joinpath(legacy, memories_path_suffix())
-    local meta = maki.fs.metadata(dir)
-    if meta and meta.is_dir then
-      return dir
-    end
-  end
-  return resolve_memories_dir()
 end
 
 local function render_content(content, path, ctx)
@@ -69,9 +57,9 @@ end
 
 local function cmd_view(path, dir, ctx)
   if not path then
-    return list_memories(dir)
+    return helpers.list_memories(dir)
   end
-  local file_path, err = safe_resolve(dir, path)
+  local file_path, err = helpers.safe_resolve(dir, path)
   if not file_path then
     return nil, err
   end
@@ -86,22 +74,18 @@ local function cmd_view(path, dir, ctx)
 end
 
 local function cmd_write(path, content, dir, ctx)
-  local lc = count_lines(content)
-  if lc > MAX_LINES_PER_FILE then
-    return nil, "content exceeds " .. MAX_LINES_PER_FILE .. " lines (" .. lc .. " lines); reduce content size"
+  local lc = helpers.count_lines(content)
+  if lc > helpers.MAX_LINES_PER_FILE then
+    return nil, "content exceeds " .. helpers.MAX_LINES_PER_FILE .. " lines (" .. lc .. " lines); reduce content size"
   end
-  local file_path, err = safe_resolve(dir, path)
+  local file_path, err = helpers.safe_resolve(dir, path)
   if not file_path then
     return nil, err
   end
-  local existing_size = 0
   local meta = maki.fs.metadata(file_path)
-  if meta then
-    existing_size = meta.size
-  end
-  local new_size = #content
-  if dir_total_bytes(dir) - existing_size + new_size > MAX_DIR_BYTES then
-    return nil, "memory directory would exceed " .. MAX_DIR_BYTES .. " byte limit; delete stale entries first"
+  local existing_size = meta and meta.size or 0
+  if helpers.dir_total_bytes(dir) - existing_size + #content > helpers.MAX_DIR_BYTES then
+    return nil, "memory directory would exceed " .. helpers.MAX_DIR_BYTES .. " byte limit; delete stale entries first"
   end
   maki.fs.mkdir(dir, { parents = true })
   local ok, write_err = maki.fs.write(file_path, content)
@@ -115,12 +99,11 @@ local function cmd_write(path, content, dir, ctx)
 end
 
 local function cmd_delete(path, dir)
-  local file_path, err = safe_resolve(dir, path)
+  local file_path, err = helpers.safe_resolve(dir, path)
   if not file_path then
     return nil, err
   end
-  local meta = maki.fs.metadata(file_path)
-  if not meta then
+  if not maki.fs.metadata(file_path) then
     return nil, "'" .. path .. "' does not exist"
   end
   local ok, rm_err = maki.fs.rm(file_path)
@@ -154,16 +137,7 @@ maki.api.register_tool({
 
   handler = function(input, ctx)
     local cmd = input.command
-    if not cmd then
-      return "error: unknown command '" .. tostring(cmd) .. "'. Valid commands: view, write, delete"
-    end
-
-    local dir, dir_err
-    if cmd == "view" then
-      dir, dir_err = resolve_memories_read_dir()
-    else
-      dir, dir_err = resolve_memories_dir()
-    end
+    local dir, dir_err = resolve_dir(cmd == "view")
     if not dir then
       return "error: " .. dir_err
     end
@@ -191,5 +165,57 @@ maki.api.register_tool({
       return "error: " .. err
     end
     return result
+  end,
+})
+
+maki.api.register_command({
+  name = "/memory",
+  description = "View, edit, and delete memory files",
+  handler = function()
+    local dir = resolve_dir(true)
+    if not dir then
+      maki.ui.flash("Cannot resolve memory directory")
+      return
+    end
+
+    local entries = helpers.collect_file_entries(dir)
+    if #entries == 0 then
+      maki.ui.flash("No memory files yet")
+      return
+    end
+    table.sort(entries, function(a, b)
+      return a[1] < b[1]
+    end)
+
+    while true do
+      local event = maki.ui.select(entries, {
+        title = " Memory Files ",
+        footer = { { "enter", "open" }, { "ctrl+d", "delete" } },
+        format = function(item)
+          return { label = item[1], detail = "(" .. item[2] .. " bytes)" }
+        end,
+        on_delete = true,
+      })
+
+      if not event or event.type == "close" then
+        return
+      elseif event.type == "choice" then
+        local item = entries[event.index]
+        maki.ui.open_editor(maki.fs.joinpath(dir, item[1]))
+        return
+      elseif event.type == "delete" then
+        local item = entries[event.index]
+        local ok, err = maki.fs.rm(maki.fs.joinpath(dir, item[1]))
+        if ok then
+          maki.ui.flash("Deleted " .. item[1])
+          table.remove(entries, event.index)
+          if #entries == 0 then
+            return
+          end
+        else
+          maki.ui.flash("Delete failed: " .. tostring(err))
+        end
+      end
+    end
   end,
 })

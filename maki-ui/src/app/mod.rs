@@ -30,8 +30,8 @@ use crate::components::help_modal::HelpModal;
 use crate::components::input::{InputAction, InputBox, Submission};
 use crate::components::keybindings::key;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
+use crate::components::lua_select::LuaSelectModal;
 use crate::components::mcp_picker::{McpPicker, McpPickerAction};
-use crate::components::memory_modal::{MemoryEntry, MemoryModal, MemoryModalAction};
 use crate::components::model_picker::{ModelPicker, ModelPickerAction};
 use crate::components::permission_prompt::PermissionPrompt;
 use crate::components::plan_form::{PlanForm, PlanFormAction};
@@ -57,6 +57,7 @@ use maki_agent::{
     AgentEvent, Envelope, ImageSource, McpPromptInfo, McpSnapshotReader, SubagentInfo, ToolOutput,
 };
 use maki_config::UiConfig;
+use maki_lua::{EventHandle, LuaCommandReader};
 use maki_providers::{Message, Model, ThinkingConfig};
 use maki_storage::StateDir;
 use maki_storage::input_history::InputHistory;
@@ -134,7 +135,7 @@ pub struct App {
     pub(super) rewind_picker: RewindPicker,
     pub(super) help_modal: HelpModal,
     pub(super) btw_modal: BtwModal,
-    pub(super) memory_modal: MemoryModal,
+    pub(super) lua_select: LuaSelectModal,
     pub(super) search_modal: SearchModal,
     pub(super) file_picker: FilePickerModal,
     pub(super) permission_prompt: PermissionPrompt,
@@ -167,6 +168,7 @@ pub struct App {
     pub(crate) ui_config: UiConfig,
     pub(crate) permissions: Arc<PermissionManager>,
     pub(super) buf_click: Option<BufClickHandler>,
+    pub(crate) lua_event_handle: Option<EventHandle>,
     subagent_answers: HashMap<String, flume::Sender<String>>,
 }
 
@@ -178,6 +180,7 @@ impl App {
         storage: StateDir,
         available_models: Arc<ArcSwapOption<Vec<String>>>,
         mcp_reader: McpSnapshotReader,
+        lua_command_reader: LuaCommandReader,
         storage_writer: Arc<StorageWriter>,
         ui_config: UiConfig,
         input_history_size: usize,
@@ -190,7 +193,11 @@ impl App {
             active_chat: 0,
             chat_index: HashMap::new(),
             input_box: InputBox::new(InputHistory::load(&storage, input_history_size)),
-            command_palette: CommandPalette::new(custom_commands, mcp_reader.clone()),
+            command_palette: CommandPalette::new(
+                custom_commands,
+                mcp_reader.clone(),
+                lua_command_reader,
+            ),
             task_picker: ListPicker::new(),
             task_picker_original: None,
             theme_picker: ThemePicker::new(),
@@ -200,7 +207,7 @@ impl App {
             rewind_picker: RewindPicker::new(),
             help_modal: HelpModal::new(),
             btw_modal: BtwModal::new(ui_config.typewriter_ms_per_char),
-            memory_modal: MemoryModal::new(),
+            lua_select: LuaSelectModal::new(),
             search_modal: SearchModal::new(),
             file_picker: FilePickerModal::new(),
             permission_prompt: PermissionPrompt::new(),
@@ -232,6 +239,7 @@ impl App {
             ui_config,
             permissions,
             buf_click: None,
+            lua_event_handle: None,
             subagent_answers: HashMap::new(),
         }
     }
@@ -251,15 +259,6 @@ impl App {
 
     pub(crate) fn flash(&mut self, msg: String) {
         self.status_bar.flash(msg);
-    }
-
-    pub(crate) fn refresh_memory_entry(&mut self, path: &std::path::Path) {
-        if self.memory_modal.is_open()
-            && let Some(name) = path.file_name().and_then(|n| n.to_str())
-            && let Ok(meta) = std::fs::metadata(path)
-        {
-            self.memory_modal.update_size(name, meta.len());
-        }
     }
 
     pub fn tick_error_expiry(&mut self) {
@@ -328,10 +327,10 @@ impl App {
             self.help_modal.scroll(delta);
             return;
         }
-        if self.memory_modal.is_open() {
+        if self.lua_select.is_open() {
             let pos = Position::new(column, row);
-            if self.memory_modal.contains(pos) {
-                self.memory_modal.scroll(delta);
+            if self.lua_select.contains(pos) {
+                self.lua_select.scroll(delta);
             }
             return;
         }
@@ -500,22 +499,8 @@ impl App {
             return vec![];
         }
 
-        if self.memory_modal.is_open() {
-            match self.memory_modal.handle_key(key) {
-                MemoryModalAction::OpenFile(filename) => {
-                    return self.open_memory_file(&filename);
-                }
-                MemoryModalAction::DeleteFile(filename) => {
-                    return self.delete_memory_file(&filename);
-                }
-                MemoryModalAction::ConfirmDelete => {
-                    self.status_bar.flash(format!(
-                        "Press {} again to confirm delete",
-                        key::DELETE.label
-                    ));
-                }
-                MemoryModalAction::Close | MemoryModalAction::Consumed => {}
-            }
+        if self.lua_select.is_open() {
+            self.lua_select.handle_key(key);
             return vec![];
         }
 
@@ -1088,7 +1073,6 @@ impl App {
                 vec![]
             }
             "/cd" => self.cmd_cd(&cmd.args),
-            "/memory" => self.cmd_memory(),
             "/yolo" => {
                 let enabled = self.permissions.toggle_yolo();
                 let msg = if enabled {
@@ -1123,8 +1107,22 @@ impl App {
             name if self.command_palette.find_mcp_prompt(name).is_some() => {
                 self.execute_mcp_prompt(name, &cmd.args)
             }
+            name if self.command_palette.find_lua_command(name).is_some() => {
+                self.run_lua_command(name, cmd.args);
+                vec![]
+            }
             _ => vec![],
         }
+    }
+
+    fn run_lua_command(&self, name: &str, args: String) {
+        let Some(lua_cmd) = self.command_palette.find_lua_command(name) else {
+            return;
+        };
+        let Some(handle) = &self.lua_event_handle else {
+            return;
+        };
+        handle.run_command(Arc::clone(&lua_cmd.plugin), Arc::clone(&lua_cmd.name), args);
     }
 
     fn execute_mcp_prompt(&mut self, name: &str, args: &str) -> Vec<Action> {
@@ -1239,21 +1237,11 @@ impl App {
         vec![]
     }
 
-    fn cmd_memory(&mut self) -> Vec<Action> {
-        let entries: Vec<MemoryEntry> = maki_agent::tools::memory::list_memory_entries()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(name, size)| MemoryEntry::new(name, size))
-            .collect();
-        self.memory_modal.open(entries);
-        vec![]
-    }
-
     fn overlays(&self) -> [&dyn Overlay; 13] {
         [
             &self.help_modal,
             &self.btw_modal,
-            &self.memory_modal,
+            &self.lua_select,
             &self.search_modal,
             &self.file_picker,
             &self.task_picker,
@@ -1271,7 +1259,7 @@ impl App {
         [
             &mut self.help_modal,
             &mut self.btw_modal,
-            &mut self.memory_modal,
+            &mut self.lua_select,
             &mut self.search_modal,
             &mut self.file_picker,
             &mut self.task_picker,
@@ -1367,7 +1355,7 @@ impl App {
                 }
             };
         }
-        try_picker!(self.memory_modal);
+        try_picker!(self.lua_select);
         try_picker!(self.file_picker);
         try_picker!(self.task_picker);
         try_picker!(self.session_picker);
@@ -1400,31 +1388,6 @@ impl App {
             PlanFormAction::Implement => self.implement_plan(false),
             PlanFormAction::ClearAndImplement => self.implement_plan(true),
         }
-    }
-
-    fn open_memory_file(&mut self, filename: &str) -> Vec<Action> {
-        match maki_agent::tools::memory::resolve_memories_dir() {
-            Ok(dir) => vec![Action::OpenEditor(dir.join(filename))],
-            Err(e) => {
-                self.flash(e);
-                vec![]
-            }
-        }
-    }
-
-    fn delete_memory_file(&mut self, filename: &str) -> Vec<Action> {
-        match maki_agent::tools::memory::resolve_memories_dir() {
-            Ok(dir) => match std::fs::remove_file(dir.join(filename)) {
-                Ok(()) => {
-                    let owned = filename.to_owned();
-                    self.memory_modal.retain(|e| e.name != owned);
-                    self.flash(format!("Deleted memory file: {filename}"));
-                }
-                Err(e) => self.flash(format!("Failed to delete {filename}: {e}")),
-            },
-            Err(e) => self.flash(e),
-        }
-        vec![]
     }
 
     fn implement_plan(&mut self, clear_context: bool) -> Vec<Action> {

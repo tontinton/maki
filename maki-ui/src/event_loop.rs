@@ -12,6 +12,7 @@ use maki_agent::command::CustomCommand;
 use maki_agent::permissions::PermissionManager;
 use maki_agent::{AgentConfig, CancelToken, McpCommand};
 use maki_config::UiConfig;
+use maki_lua::{EventHandle, LuaCommandReader, UiAction};
 use maki_providers::Timeouts;
 use maki_providers::provider::{Provider, fetch_all_models, from_model};
 use maki_providers::{Message, Model};
@@ -48,6 +49,9 @@ pub struct EventLoopParams {
     pub permissions: Arc<PermissionManager>,
     pub timeouts: Timeouts,
     pub exit_on_done: bool,
+    pub lua_command_reader: LuaCommandReader,
+    pub ui_action_rx: Option<flume::Receiver<UiAction>>,
+    pub lua_event_handle: Option<EventHandle>,
     pub buf_click: Option<BufClickHandler>,
     #[cfg(feature = "demo")]
     pub demo: bool,
@@ -65,6 +69,7 @@ pub(crate) struct EventLoop<'t> {
     warn_rx: flume::Receiver<String>,
     storage_writer: Arc<StorageWriter>,
     timeouts: Timeouts,
+    ui_action_rx: Option<flume::Receiver<UiAction>>,
     _model_fetch_task: smol::Task<()>,
 }
 
@@ -157,6 +162,9 @@ impl<'t> EventLoop<'t> {
             permissions,
             timeouts,
             exit_on_done,
+            lua_command_reader,
+            ui_action_rx,
+            lua_event_handle,
             buf_click,
             #[cfg(feature = "demo")]
             demo,
@@ -197,6 +205,7 @@ impl<'t> EventLoop<'t> {
             storage,
             bg.available,
             handles.mcp_reader(),
+            lua_command_reader,
             Arc::clone(&storage_writer),
             ui_config,
             input_history_size,
@@ -205,6 +214,7 @@ impl<'t> EventLoop<'t> {
         );
         app.exit_on_done = exit_on_done;
         app.buf_click = buf_click;
+        app.lua_event_handle = lua_event_handle;
 
         #[cfg(feature = "demo")]
         if demo {
@@ -229,6 +239,7 @@ impl<'t> EventLoop<'t> {
             warn_rx: bg.warn_rx,
             storage_writer,
             timeouts,
+            ui_action_rx,
             _model_fetch_task: bg.task,
         })
     }
@@ -287,6 +298,28 @@ impl<'t> EventLoop<'t> {
 
         while let Ok(warning) = self.warn_rx.try_recv() {
             self.app.flash(warning);
+        }
+
+        if let Some(rx) = &self.ui_action_rx {
+            while let Ok(action) = rx.try_recv() {
+                match action {
+                    UiAction::Select {
+                        items,
+                        opts,
+                        reply_tx,
+                    } => {
+                        self.app.lua_select.open(items, opts, reply_tx);
+                    }
+                    UiAction::Flash(msg) => {
+                        self.app.flash(msg);
+                    }
+                    UiAction::OpenEditor(path) => {
+                        if let Err(e) = crate::terminal::open_in_editor(&path, self.terminal) {
+                            self.app.flash(e);
+                        }
+                    }
+                }
+            }
         }
 
         had_agent_msg
@@ -441,8 +474,6 @@ impl<'t> EventLoop<'t> {
             Action::OpenEditor(path) => {
                 if let Err(e) = terminal::open_in_editor(&path, self.terminal) {
                     self.app.flash(e);
-                } else {
-                    self.app.refresh_memory_entry(&path);
                 }
             }
             Action::EditInputInEditor => {

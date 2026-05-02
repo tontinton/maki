@@ -7,13 +7,13 @@ use ratatui::widgets::{Block, BorderType, Clear};
 
 const CHROME_LINES: u16 = 2;
 
-pub struct Modal {
-    pub title: &'static str,
+pub struct Modal<'a> {
+    pub title: &'a str,
     pub width_percent: u16,
     pub max_height_percent: u16,
 }
 
-impl Modal {
+impl Modal<'_> {
     pub fn render(&self, frame: &mut Frame, area: Rect, content_height: u16) -> (Rect, Rect) {
         let max_h = (area.height as u32 * self.max_height_percent as u32 / 100) as u16;
         let total_h = (content_height + CHROME_LINES)

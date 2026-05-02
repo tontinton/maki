@@ -20,6 +20,8 @@ use serde_json::Value;
 use maki_config::RawConfig;
 
 use crate::api::buf::{BufHandle, BufferStore};
+use crate::api::command::{CommandHandlerMap, publish_command_snapshot};
+use crate::api::command::{LuaCommandReader, LuaCommandWriter, UiAction};
 use crate::api::create_maki_global;
 use crate::api::ctx::LuaCtx;
 use crate::api::fn_api::{JobEvent, JobStore};
@@ -79,6 +81,11 @@ pub enum Request {
     FireBufClick {
         tool_id: String,
         row: u32,
+    },
+    RunCommand {
+        plugin: Arc<str>,
+        command: Arc<str>,
+        args: String,
     },
     Shutdown,
 }
@@ -232,6 +239,7 @@ struct LuaRuntime {
     tx: flume::Sender<Request>,
     shutdown: Arc<AtomicBool>,
     bundled_dirs: &'static [&'static Dir<'static>],
+    ui_action_tx: Option<flume::Sender<UiAction>>,
 }
 
 impl LuaRuntime {
@@ -240,6 +248,8 @@ impl LuaRuntime {
         tx: flume::Sender<Request>,
         shutdown: Arc<AtomicBool>,
         bundled_dirs: &'static [&'static Dir<'static>],
+        ui_action_tx: Option<flume::Sender<UiAction>>,
+        command_writer: LuaCommandWriter,
     ) -> Result<Self, PluginError> {
         let lua = Lua::new();
         let pending: PendingTools = Arc::new(Mutex::new(Vec::new()));
@@ -293,6 +303,8 @@ impl LuaRuntime {
 
         lua.set_app_data(TaskMap::new());
         lua.set_app_data(ClickHandlerMap::new());
+        lua.set_app_data(CommandHandlerMap::new());
+        lua.set_app_data(command_writer);
 
         Ok(Self {
             lua,
@@ -302,6 +314,7 @@ impl LuaRuntime {
             tx,
             shutdown,
             bundled_dirs,
+            ui_action_tx,
         })
     }
 
@@ -320,6 +333,22 @@ impl LuaRuntime {
                     if let Err(e) = self.lua.remove_registry_value(sk) {
                         tracing::warn!(plugin = name, error = %e, "failed to drop lua permission_scopes key");
                     }
+                }
+            }
+        }
+        if let Some(mut cmd_map) = self.lua.app_data_mut::<CommandHandlerMap>() {
+            if let Some(cmds) = cmd_map.remove(name) {
+                for (_, entry) in cmds {
+                    if let Err(e) = self.lua.remove_registry_value(entry.handler) {
+                        tracing::warn!(plugin = name, error = %e, "failed to drop command handler key");
+                    }
+                }
+                drop(cmd_map);
+                if let (Some(map), Some(writer)) = (
+                    self.lua.app_data_ref::<CommandHandlerMap>(),
+                    self.lua.app_data_ref::<LuaCommandWriter>(),
+                ) {
+                    publish_command_snapshot(&map, &writer);
                 }
             }
         }
@@ -482,11 +511,16 @@ impl LuaRuntime {
         self.discard_pending(stale);
 
         let require_root = plugin_dir.as_ref().map(|d| d.join("lua"));
-        let maki = create_maki_global(&self.lua, Arc::clone(&self.pending), Arc::clone(&name))
-            .map_err(|e| PluginError::Lua {
-                plugin: name.to_string(),
-                source: e,
-            })?;
+        let maki = create_maki_global(
+            &self.lua,
+            Arc::clone(&self.pending),
+            Arc::clone(&name),
+            self.ui_action_tx.clone(),
+        )
+        .map_err(|e| PluginError::Lua {
+            plugin: name.to_string(),
+            source: e,
+        })?;
 
         let env = self
             .build_env(maki, require_root)
@@ -494,6 +528,8 @@ impl LuaRuntime {
                 plugin: name.to_string(),
                 source: e,
             })?;
+
+        self.drop_plugin_keys(&name);
 
         let exec_result = self
             .lua
@@ -506,6 +542,7 @@ impl LuaRuntime {
         if let Err(e) = exec_result {
             let stale = self.drain_pending();
             self.discard_pending(stale);
+            self.drop_plugin_keys(&name);
             return Err(PluginError::Lua {
                 plugin: name.to_string(),
                 source: e,
@@ -545,8 +582,6 @@ impl LuaRuntime {
                 },
             });
         }
-
-        self.drop_plugin_keys(&name);
 
         let keys: HashMap<Arc<str>, ToolKeys> = pending
             .into_iter()
@@ -942,6 +977,8 @@ pub(crate) struct LuaThread {
     pub tx: flume::Sender<Request>,
     pub join: Option<JoinHandle<()>>,
     pub shutdown: Arc<AtomicBool>,
+    pub command_reader: LuaCommandReader,
+    pub ui_action_rx: flume::Receiver<UiAction>,
 }
 
 /// Runs on a dedicated OS thread so the Lua instance never crosses thread
@@ -956,11 +993,20 @@ pub fn spawn(
     let shutdown: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
     let shutdown_thread = Arc::clone(&shutdown);
     let (init_tx, init_rx) = flume::bounded::<Result<(), PluginError>>(1);
+    let (ui_action_tx, ui_action_rx) = flume::unbounded::<UiAction>();
+    let (command_writer, command_reader) = LuaCommandWriter::new();
 
     let handle = thread::Builder::new()
         .name("maki-lua".to_owned())
         .spawn(move || {
-            let mut rt = match LuaRuntime::new(registry, tx_clone, shutdown_thread, bundled_dirs) {
+            let mut rt = match LuaRuntime::new(
+                registry,
+                tx_clone,
+                shutdown_thread,
+                bundled_dirs,
+                Some(ui_action_tx),
+                command_writer,
+            ) {
                 Ok(r) => {
                     let _ = init_tx.send(Ok(()));
                     r
@@ -1051,6 +1097,30 @@ pub fn spawn(
                                 .detach();
                             }
                         }
+                        Request::RunCommand {
+                            plugin,
+                            command,
+                            args,
+                        } => {
+                            let handler_fn =
+                                rt.lua.app_data_ref::<CommandHandlerMap>().and_then(|m| {
+                                    let entry = m.get(&plugin)?.get(&command)?;
+                                    rt.lua.registry_value::<Function>(&entry.handler).ok()
+                                });
+                            if let Some(func) = handler_fn {
+                                ex.spawn(async move {
+                                    if let Err(e) = func.call_async::<()>(args).await {
+                                        tracing::warn!(
+                                            plugin = %plugin,
+                                            command = %command,
+                                            error = %e,
+                                            "command handler failed"
+                                        );
+                                    }
+                                })
+                                .detach();
+                            }
+                        }
                         Request::ComputeHeader {
                             plugin,
                             tool,
@@ -1097,6 +1167,8 @@ pub fn spawn(
         tx,
         join: Some(handle),
         shutdown,
+        command_reader,
+        ui_action_rx,
     })
 }
 

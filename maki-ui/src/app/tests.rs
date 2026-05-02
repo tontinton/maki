@@ -14,6 +14,7 @@ use maki_agent::{
     TurnCompleteEvent,
 };
 use maki_config::{PermissionsConfig, UiConfig};
+use maki_lua::LuaCommandReader;
 use maki_providers::{ContentBlock, Role, TokenUsage};
 use maki_storage::sessions::StoredThinking;
 use ratatui::layout::Rect;
@@ -46,6 +47,7 @@ fn test_app() -> App {
         StateDir::from_path(env::temp_dir()),
         Arc::new(ArcSwapOption::empty()),
         McpSnapshotReader::empty(),
+        LuaCommandReader::empty(),
         writer,
         UiConfig::default(),
         100,
@@ -459,6 +461,7 @@ fn load_session_clears_plan() {
         dir,
         Arc::new(ArcSwapOption::empty()),
         McpSnapshotReader::empty(),
+        LuaCommandReader::empty(),
         writer,
         UiConfig::default(),
         100,

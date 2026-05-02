@@ -8,6 +8,7 @@ use include_dir::{Dir, include_dir};
 use maki_agent::tools::ToolRegistry;
 use maki_config::{PluginsConfig, RawConfig};
 
+use crate::api::command::{LuaCommandReader, UiAction};
 use crate::error::PluginError;
 use crate::runtime::{self, LuaThread, Request};
 
@@ -236,6 +237,17 @@ impl PluginHost {
             .as_ref()
             .map(|t| EventHandle { tx: t.tx.clone() })
     }
+
+    pub fn command_reader(&self) -> LuaCommandReader {
+        self.inner
+            .as_ref()
+            .map(|t| t.command_reader.clone())
+            .unwrap_or_else(LuaCommandReader::empty)
+    }
+
+    pub fn ui_action_rx(&self) -> Option<flume::Receiver<UiAction>> {
+        self.inner.as_ref().map(|t| t.ui_action_rx.clone())
+    }
 }
 
 #[derive(Clone)]
@@ -248,6 +260,14 @@ impl EventHandle {
         let _ = self.tx.try_send(Request::FireBufClick {
             tool_id: tool_id.to_owned(),
             row,
+        });
+    }
+
+    pub fn run_command(&self, plugin: Arc<str>, command: Arc<str>, args: String) {
+        let _ = self.tx.try_send(Request::RunCommand {
+            plugin,
+            command,
+            args,
         });
     }
 }
@@ -265,6 +285,43 @@ mod tests {
         assert_eq!(reg.names(), names_before);
     }
 
+    use crate::api::command::{LuaCommandInfo, LuaCommandWriter};
+
+    #[test]
+    fn command_writer_reader_pair_works() {
+        let (writer, reader) = LuaCommandWriter::new();
+        let snap = reader.load();
+        assert_eq!(snap.commands.len(), 0);
+
+        writer.publish(vec![LuaCommandInfo {
+            name: Arc::from("/test"),
+            description: Arc::from("desc"),
+            plugin: Arc::from("p"),
+        }]);
+        let snap = reader.load();
+        assert_eq!(snap.commands.len(), 1);
+        assert!(snap.generation > 0);
+    }
+
+    #[test]
+    fn memory_builtin_registers_command() {
+        let reg = Arc::new(ToolRegistry::new());
+        let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
+        host.load_builtins(&PluginsConfig::from_tools(std::collections::HashMap::new()))
+            .unwrap();
+        let reader = host.command_reader();
+        let snap = reader.load();
+        let found = snap.commands.iter().any(|c| c.name.as_ref() == "/memory");
+        assert!(
+            found,
+            "Expected /memory command, found: {:?}",
+            snap.commands
+                .iter()
+                .map(|c| c.name.as_ref())
+                .collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn fire_click_sends_request_through_channel() {
         let (tx, rx) = flume::bounded(8);
@@ -278,5 +335,82 @@ mod tests {
             }
             _ => panic!("expected FireBufClick"),
         }
+    }
+
+    #[test]
+    fn run_command_sends_correct_request() {
+        let (tx, rx) = flume::bounded(8);
+        let handle = EventHandle { tx };
+        handle.run_command(Arc::from("myplugin"), Arc::from("/greet"), "world".into());
+        let req = rx.try_recv().unwrap();
+        match req {
+            Request::RunCommand {
+                plugin,
+                command,
+                args,
+            } => {
+                assert_eq!(plugin.as_ref(), "myplugin");
+                assert_eq!(command.as_ref(), "/greet");
+                assert_eq!(args, "world");
+            }
+            _ => panic!("expected RunCommand"),
+        }
+    }
+
+    #[test]
+    fn multiple_plugins_register_independent_commands() {
+        let reg = Arc::new(ToolRegistry::new());
+        let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+        host.load_source(
+            "plugin_a",
+            r#"
+            maki.api.register_command({
+                name = "/alpha",
+                description = "from a",
+                handler = function() end,
+            })
+            "#,
+        )
+        .unwrap();
+        host.load_source(
+            "plugin_b",
+            r#"
+            maki.api.register_command({
+                name = "/beta",
+                description = "from b",
+                handler = function() end,
+            })
+            "#,
+        )
+        .unwrap();
+
+        let snap = host.command_reader().load();
+        assert_eq!(snap.commands.len(), 2);
+        let names: Vec<&str> = snap.commands.iter().map(|c| c.name.as_ref()).collect();
+        assert!(names.contains(&"/alpha"));
+        assert!(names.contains(&"/beta"));
+    }
+
+    #[test]
+    fn command_reader_generation_increments_on_publish() {
+        let (writer, reader) = LuaCommandWriter::new();
+        assert_eq!(reader.load().generation, 0);
+        writer.publish(vec![]);
+        assert!(reader.load().generation > 0);
+    }
+
+    #[test]
+    fn disabled_host_returns_empty_command_reader() {
+        let host = PluginHost::disabled();
+        let reader = host.command_reader();
+        let snap = reader.load();
+        assert_eq!(snap.commands.len(), 0);
+        assert_eq!(snap.generation, 0);
+    }
+
+    #[test]
+    fn disabled_host_returns_no_ui_action_rx() {
+        let host = PluginHost::disabled();
+        assert!(host.ui_action_rx().is_none());
     }
 }
