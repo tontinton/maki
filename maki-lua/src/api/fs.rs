@@ -86,6 +86,16 @@ fn collect_dir_entries(
     }
 }
 
+fn io_result(lua: &Lua, result: std::io::Result<()>) -> LuaResult<(mlua::Value, mlua::Value)> {
+    match result {
+        Ok(()) => Ok((mlua::Value::Boolean(true), mlua::Value::Nil)),
+        Err(e) => Ok((
+            mlua::Value::Nil,
+            mlua::Value::String(lua.create_string(e.to_string())?),
+        )),
+    }
+}
+
 pub(crate) fn create_fs_table(lua: &Lua) -> LuaResult<Table> {
     let t = lua.create_table()?;
 
@@ -315,6 +325,41 @@ pub(crate) fn create_fs_table(lua: &Lua) -> LuaResult<Table> {
         })?,
     )?;
 
+    t.set(
+        "write",
+        lua.create_async_function(|lua, (path, content): (String, String)| async move {
+            let abs = make_absolute(&path)?;
+            let result = smol::fs::write(&abs, content).await;
+            io_result(&lua, result)
+        })?,
+    )?;
+
+    t.set(
+        "rm",
+        lua.create_async_function(|lua, path: String| async move {
+            let abs = make_absolute(&path)?;
+            let result = smol::fs::remove_file(&abs).await;
+            io_result(&lua, result)
+        })?,
+    )?;
+
+    t.set(
+        "mkdir",
+        lua.create_async_function(|lua, (path, opts): (String, Option<Table>)| async move {
+            let abs = make_absolute(&path)?;
+            let parents = opts
+                .as_ref()
+                .and_then(|t| t.get::<bool>("parents").ok())
+                .unwrap_or(false);
+            let result = if parents {
+                smol::fs::create_dir_all(&abs).await
+            } else {
+                smol::fs::create_dir(&abs).await
+            };
+            io_result(&lua, result)
+        })?,
+    )?;
+
     Ok(t)
 }
 
@@ -507,6 +552,173 @@ mod tests {
         assert!(
             len < 20,
             "symlink cycle produced {len} entries, expected bounded"
+        );
+    }
+
+    #[test]
+    fn write_creates_file() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("new.txt");
+
+        let lua = Lua::new();
+        let tbl = create_fs_table(&lua).unwrap();
+        let write: mlua::Function = tbl.get("write").unwrap();
+        let (ok, err): (mlua::Value, mlua::Value) =
+            smol::block_on(write.call_async((file.to_str().unwrap(), "hello world"))).unwrap();
+        assert!(
+            matches!(ok, mlua::Value::Boolean(true)),
+            "write should succeed"
+        );
+        assert!(matches!(err, mlua::Value::Nil));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello world");
+    }
+
+    #[test]
+    fn write_overwrites_existing() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("overwrite.txt");
+        std::fs::write(&file, "old").unwrap();
+
+        let lua = Lua::new();
+        let tbl = create_fs_table(&lua).unwrap();
+        let write: mlua::Function = tbl.get("write").unwrap();
+        smol::block_on(
+            write.call_async::<(mlua::Value, mlua::Value)>((file.to_str().unwrap(), "new")),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "new");
+    }
+
+    #[test]
+    fn write_to_nonexistent_parent_returns_error() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("no_parent/deep/file.txt");
+
+        let lua = Lua::new();
+        let tbl = create_fs_table(&lua).unwrap();
+        let write: mlua::Function = tbl.get("write").unwrap();
+        let (ok, err): (mlua::Value, mlua::Value) =
+            smol::block_on(write.call_async((file.to_str().unwrap(), "data"))).unwrap();
+        assert!(matches!(ok, mlua::Value::Nil), "should fail");
+        assert!(
+            matches!(err, mlua::Value::String(_)),
+            "should return error string"
+        );
+    }
+
+    #[test]
+    fn rm_deletes_file() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("doomed.txt");
+        std::fs::write(&file, "bye").unwrap();
+
+        let lua = Lua::new();
+        let tbl = create_fs_table(&lua).unwrap();
+        let rm: mlua::Function = tbl.get("rm").unwrap();
+        let (ok, _): (mlua::Value, mlua::Value) =
+            smol::block_on(rm.call_async(file.to_str().unwrap())).unwrap();
+        assert!(matches!(ok, mlua::Value::Boolean(true)));
+        assert!(!file.exists());
+    }
+
+    #[test]
+    fn rm_nonexistent_returns_error() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("ghost.txt");
+
+        let lua = Lua::new();
+        let tbl = create_fs_table(&lua).unwrap();
+        let rm: mlua::Function = tbl.get("rm").unwrap();
+        let (ok, err): (mlua::Value, mlua::Value) =
+            smol::block_on(rm.call_async(file.to_str().unwrap())).unwrap();
+        assert!(
+            matches!(ok, mlua::Value::Nil),
+            "should fail for nonexistent"
+        );
+        assert!(matches!(err, mlua::Value::String(_)));
+    }
+
+    #[test]
+    fn mkdir_creates_single_dir() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("newdir");
+
+        let lua = Lua::new();
+        let tbl = create_fs_table(&lua).unwrap();
+        let mkdir: mlua::Function = tbl.get("mkdir").unwrap();
+        let (ok, _): (mlua::Value, mlua::Value) =
+            smol::block_on(mkdir.call_async(dir.to_str().unwrap())).unwrap();
+        assert!(matches!(ok, mlua::Value::Boolean(true)));
+        assert!(dir.is_dir());
+    }
+
+    #[test]
+    fn mkdir_without_parents_fails_on_deep_path() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("a/b/c");
+
+        let lua = Lua::new();
+        let tbl = create_fs_table(&lua).unwrap();
+        let mkdir: mlua::Function = tbl.get("mkdir").unwrap();
+        let (ok, err): (mlua::Value, mlua::Value) =
+            smol::block_on(mkdir.call_async(dir.to_str().unwrap())).unwrap();
+        assert!(
+            matches!(ok, mlua::Value::Nil),
+            "should fail without parents option"
+        );
+        assert!(matches!(err, mlua::Value::String(_)));
+    }
+
+    #[test]
+    fn mkdir_with_parents_creates_nested() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("x/y/z");
+
+        let lua = Lua::new();
+        let tbl = create_fs_table(&lua).unwrap();
+        let mkdir: mlua::Function = tbl.get("mkdir").unwrap();
+        let opts = lua.create_table().unwrap();
+        opts.set("parents", true).unwrap();
+        let (ok, _): (mlua::Value, mlua::Value) =
+            smol::block_on(mkdir.call_async((dir.to_str().unwrap(), opts))).unwrap();
+        assert!(matches!(ok, mlua::Value::Boolean(true)));
+        assert!(dir.is_dir());
+    }
+
+    #[test]
+    fn mkdir_already_exists_returns_error() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("exists");
+        std::fs::create_dir(&dir).unwrap();
+
+        let lua = Lua::new();
+        let tbl = create_fs_table(&lua).unwrap();
+        let mkdir: mlua::Function = tbl.get("mkdir").unwrap();
+        let (ok, err): (mlua::Value, mlua::Value) =
+            smol::block_on(mkdir.call_async(dir.to_str().unwrap())).unwrap();
+        assert!(
+            matches!(ok, mlua::Value::Nil),
+            "creating existing dir should fail"
+        );
+        assert!(matches!(err, mlua::Value::String(_)));
+    }
+
+    #[test]
+    fn mkdir_with_parents_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("idem");
+        std::fs::create_dir(&dir).unwrap();
+
+        let lua = Lua::new();
+        let tbl = create_fs_table(&lua).unwrap();
+        let mkdir: mlua::Function = tbl.get("mkdir").unwrap();
+        let opts = lua.create_table().unwrap();
+        opts.set("parents", true).unwrap();
+        let (ok, _): (mlua::Value, mlua::Value) =
+            smol::block_on(mkdir.call_async((dir.to_str().unwrap(), opts))).unwrap();
+        assert!(
+            matches!(ok, mlua::Value::Boolean(true)),
+            "parents=true should be idempotent"
         );
     }
 }

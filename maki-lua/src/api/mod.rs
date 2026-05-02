@@ -1,5 +1,6 @@
 pub(crate) mod buf;
 pub(crate) mod ctx;
+pub(crate) mod env;
 pub(crate) mod fn_api;
 pub(crate) mod fs;
 pub(crate) mod json;
@@ -28,6 +29,7 @@ pub(crate) fn create_maki_global(
     let maki = lua.create_table()?;
 
     maki.set("api", tool::create_api_table(lua, pending)?)?;
+    maki.set("env", env::create_env_table(lua)?)?;
     maki.set("fs", fs::create_fs_table(lua)?)?;
     maki.set("log", log::create_log_table(lua, plugin)?)?;
     maki.set("treesitter", treesitter::create_treesitter_table(lua)?)?;

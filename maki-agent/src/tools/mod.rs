@@ -133,7 +133,7 @@ pub const READ_TOOL_NAME: &str = read::Read::NAME;
 pub const TASK_TOOL_NAME: &str = task::Task::NAME;
 pub const TODOWRITE_TOOL_NAME: &str = todowrite::TodoWrite::NAME;
 pub const WRITE_TOOL_NAME: &str = write::Write::NAME;
-pub const MEMORY_TOOL_NAME: &str = memory::Memory::NAME;
+pub const MEMORY_TOOL_NAME: &str = "memory";
 pub const CODE_EXECUTION_TOOL_NAME: &str = code_execution::CodeExecution::NAME;
 
 pub(crate) const PLAN_WRITE_RESTRICTED: &str = "write restricted to plan file in plan mode";
@@ -539,7 +539,6 @@ register_tools! {
     task::Task,
     batch::Batch,
     code_execution::CodeExecution,
-    memory::Memory,
 }
 
 pub fn is_builtin_tool(name: &str) -> bool {

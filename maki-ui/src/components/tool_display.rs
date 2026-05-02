@@ -86,9 +86,7 @@ pub(crate) fn tool_output_annotation(output: &ToolOutput) -> Option<String> {
             }
         }
         ToolOutput::WriteCode { byte_count, .. } => Some(format!("{byte_count} bytes")),
-        ToolOutput::MemoryWrite { lines, .. } | ToolOutput::MemoryRead { lines, .. } => {
-            Some(format!("{} lines", lines.len()))
-        }
+
         ToolOutput::GrepResult { entries } => {
             let matches: usize = entries.iter().map(|e| e.match_count()).sum();
             let files = entries.len();
@@ -251,8 +249,6 @@ impl HighlightRequest {
             | ToolOutput::WriteCode { .. }
             | ToolOutput::Diff { .. }
             | ToolOutput::GrepResult { .. }
-            | ToolOutput::MemoryWrite { .. }
-            | ToolOutput::MemoryRead { .. }
             | ToolOutput::Instructions { .. } => Some(o),
             ToolOutput::Plain(_)
             | ToolOutput::ReadDir { .. }
