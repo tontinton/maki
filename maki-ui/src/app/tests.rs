@@ -10,7 +10,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventK
 use maki_agent::permissions::PermissionManager;
 use maki_agent::{
     ImageMediaType, McpServerInfo, McpServerStatus, McpSnapshot, McpSnapshotReader, QuestionInfo,
-    QuestionOption, ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent,
+    QuestionOption, TodoItem, TodoPriority, TodoStatus, ToolDoneEvent, ToolOutput, ToolStartEvent,
+    TurnCompleteEvent,
 };
 use maki_config::{PermissionsConfig, UiConfig};
 use maki_providers::{ContentBlock, Role, TokenUsage};
@@ -2045,15 +2046,48 @@ fn ctrl_t_toggles_plan_form_in_plan_mode() {
     assert!(app.plan_form.is_visible());
 }
 
+fn send_subagent_todo(app: &mut App, items: Vec<TodoItem>) {
+    app.update(subagent_msg(
+        AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+            id: "tw1".into(),
+            tool: "todo_write".into(),
+            output: ToolOutput::TodoList(items),
+            is_error: false,
+        })),
+        "task1",
+        Some("research"),
+    ));
+}
+
 #[test]
-fn ctrl_t_toggles_todo_panel_in_build_mode() {
-    let mut app = test_app();
-    app.status = Status::Streaming;
-    app.run_id = 1;
-    app.state.mode = Mode::Build;
+fn ctrl_t_toggles_todo_panel_on_subagent_chat() {
+    let mut app = app_with_subagent();
+    send_subagent_todo(
+        &mut app,
+        vec![TodoItem {
+            content: "task".into(),
+            status: TodoStatus::Pending,
+            priority: TodoPriority::Medium,
+        }],
+    );
+    app.active_chat = 1;
+    assert!(
+        app.chats[1].todo_panel.height() > 0,
+        "panel should be visible after todo_write"
+    );
 
     app.update(Msg::Key(kb::TODO_PANEL.to_key_event()));
-    assert!(app.todo_panel.hint_line().is_none());
+    assert_eq!(
+        app.chats[1].todo_panel.height(),
+        0,
+        "panel should hide after toggle"
+    );
+
+    app.update(Msg::Key(kb::TODO_PANEL.to_key_event()));
+    assert!(
+        app.chats[1].todo_panel.height() > 0,
+        "panel should reappear after second toggle"
+    );
 }
 
 #[test]

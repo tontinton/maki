@@ -41,7 +41,6 @@ use crate::components::search_modal::{SearchAction, SearchModal};
 use crate::components::session_picker::{SessionPicker, SessionPickerAction};
 use crate::components::status_bar::StatusBar;
 use crate::components::theme_picker::{ThemePicker, ThemePickerAction};
-use crate::components::todo_panel::TodoPanel;
 use crate::components::tool_display::format_turn_usage;
 use crate::components::{
     Action, DisplayMessage, DisplayRole, ExitRequest, Overlay, RetryInfo, Status, is_ctrl,
@@ -138,7 +137,6 @@ pub struct App {
     pub(super) memory_modal: MemoryModal,
     pub(super) search_modal: SearchModal,
     pub(super) file_picker: FilePickerModal,
-    pub(super) todo_panel: TodoPanel,
     pub(super) permission_prompt: PermissionPrompt,
     pub(super) question_form: QuestionForm,
     pub(super) plan_form: PlanForm,
@@ -205,7 +203,6 @@ impl App {
             memory_modal: MemoryModal::new(),
             search_modal: SearchModal::new(),
             file_picker: FilePickerModal::new(),
-            todo_panel: TodoPanel::new(),
             permission_prompt: PermissionPrompt::new(),
             question_form: QuestionForm::new(),
             plan_form: PlanForm::new(),
@@ -663,6 +660,10 @@ impl App {
         if !self.is_main_chat() {
             return match key.code {
                 KeyCode::Tab if !self.is_bash_input() => self.toggle_mode(),
+                _ if key::TODO_PANEL.matches(key) => {
+                    self.chats[self.active_chat].todo_panel.toggle();
+                    vec![]
+                }
                 _ => vec![],
             };
         }
@@ -688,7 +689,7 @@ impl App {
             } else if key::TODO_PANEL.matches(key) {
                 match self.state.mode {
                     Mode::Plan => self.plan_form.toggle(),
-                    Mode::Build => self.todo_panel.toggle(),
+                    Mode::Build => self.chats[self.active_chat].todo_panel.toggle(),
                 }
             } else if key::SEARCH.matches(key) {
                 let top = self.chats[self.active_chat].scroll_top();
@@ -891,7 +892,7 @@ impl App {
                     .insert(e.id.clone(), e.output.clone());
             }
             if let ToolOutput::TodoList(ref items) = e.output {
-                self.todo_panel.on_todowrite(items);
+                self.chats[chat_idx].todo_panel.on_todowrite(items);
             }
             if let Some(&sub_idx) = self.chat_index.get(&e.id) {
                 let (role, text) = if e.is_error {
@@ -957,7 +958,7 @@ impl App {
         if chat_idx == 0 {
             match result {
                 ChatEventResult::Done => {
-                    self.todo_panel.on_turn_done();
+                    self.chats[0].todo_panel.on_turn_done();
                     self.status_bar.clear_flash();
                     self.save_session();
                     self.chat_index.clear();

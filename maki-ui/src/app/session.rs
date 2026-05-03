@@ -44,7 +44,7 @@ impl App {
         let draft = self.input_box.buffer.value();
         self.state.session.meta.input_draft = if draft.is_empty() { None } else { Some(draft) };
 
-        self.state.session.meta.todo_dismissed = self.todo_panel.is_user_dismissed();
+        self.state.session.meta.todo_dismissed = self.chats[0].todo_panel.is_user_dismissed();
 
         self.state.session.meta.queued_messages = self.queue.text_messages();
 
@@ -89,7 +89,7 @@ impl App {
         self.status_bar.clear_flash();
         self.task_picker_original = None;
         self.last_esc = None;
-        self.todo_panel.reset();
+        self.chats[0].todo_panel.reset();
         self.plan_form.reset();
     }
 
@@ -102,7 +102,7 @@ impl App {
         self.main_chat().load_messages(display_msgs);
         self.main_chat().token_usage = self.state.token_usage;
         self.main_chat().context_size = self.state.context_size;
-        self.todo_panel.restore(
+        self.chats[0].todo_panel.restore(
             &self.state.session.tool_outputs,
             self.state.session.meta.todo_dismissed,
         );

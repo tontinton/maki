@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use crate::components::messages::MessagesPanel;
 use crate::components::render_hints::RenderHintsRegistry;
+use crate::components::todo_panel::TodoPanel;
 use crate::components::tool_display::{
     append_annotation, output_limits_from_hints, tool_output_annotation,
 };
@@ -54,6 +55,7 @@ pub struct Chat {
     pub token_usage: TokenUsage,
     pub context_size: u32,
     pub model_id: Option<String>,
+    pub(crate) todo_panel: TodoPanel,
     pending_turn_usage: Option<String>,
     messages_panel: MessagesPanel,
     finished: bool,
@@ -66,6 +68,7 @@ impl Chat {
             token_usage: TokenUsage::default(),
             context_size: 0,
             model_id: None,
+            todo_panel: TodoPanel::new(),
             pending_turn_usage: None,
             messages_panel: MessagesPanel::new(ui_config),
             finished: false,

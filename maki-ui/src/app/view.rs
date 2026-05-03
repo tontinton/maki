@@ -54,10 +54,11 @@ impl App {
             }
         } else if self.is_main_chat() {
             queue_panel::height(self.queue.len())
-                + self.todo_panel.height()
+                + self.chats[self.active_chat].todo_panel.height()
                 + self.input_box.height(area.width)
         } else {
-            1
+            let todo_h = self.chats[self.active_chat].todo_panel.height();
+            if todo_h > 0 { todo_h + 1 } else { 1 }
         };
 
         let [msg_area, bottom_area, status_area] = Layout::vertical([
@@ -71,7 +72,7 @@ impl App {
         let todo_h = if form_visible {
             0
         } else {
-            self.todo_panel.height()
+            self.chats[self.active_chat].todo_panel.height()
         };
         let input_height = bottom_area.height.saturating_sub(queue_height + todo_h);
 
@@ -121,23 +122,40 @@ impl App {
         } else if self.question_form.is_visible() {
             self.question_form.view(frame, layout.bottom_area);
         } else if !self.is_main_chat() {
+            let todo_h = self.chats[self.active_chat].todo_panel.height();
+            let (todo_area, sep_area) = if todo_h > 0 {
+                let [t, s] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)])
+                    .areas(layout.bottom_area);
+                (Some(t), s)
+            } else {
+                (None, layout.bottom_area)
+            };
+            if let Some(area) = todo_area {
+                self.chats[self.active_chat].todo_panel.view(frame, area);
+            }
             let sep = Block::default()
                 .borders(Borders::TOP)
                 .border_style(self.separator_style());
-            frame.render_widget(sep, layout.bottom_area);
+            frame.render_widget(sep, sep_area);
         } else if in_plan && self.plan_form.is_visible() {
             self.plan_form.view(frame, layout.bottom_area);
         } else if layout.bottom_area.height > 0 {
             let queue_entries = self.queue.entries();
             queue_panel::view(frame, layout.queue_area, &queue_entries, self.queue.focus());
             if layout.todo_area.height > 0 {
-                self.todo_panel.view(frame, layout.todo_area);
+                self.chats[self.active_chat]
+                    .todo_panel
+                    .view(frame, layout.todo_area);
             }
             let streaming = self.status == Status::Streaming;
             let panel_hint = in_plan
                 .then(|| self.plan_form.hint_line())
                 .flatten()
-                .or_else(|| streaming.then(|| self.todo_panel.hint_line()).flatten());
+                .or_else(|| {
+                    streaming
+                        .then(|| self.chats[self.active_chat].todo_panel.hint_line())
+                        .flatten()
+                });
             self.input_box.view(
                 frame,
                 layout.input_area,
