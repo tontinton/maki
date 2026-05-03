@@ -20,7 +20,12 @@ impl TodoWrite {
     }
 }
 
-super::impl_tool!(TodoWrite, audience = super::ToolAudience::MAIN);
+super::impl_tool!(
+    TodoWrite,
+    audience = super::ToolAudience::MAIN
+        | super::ToolAudience::RESEARCH_SUB
+        | super::ToolAudience::GENERAL_SUB,
+);
 
 impl super::ToolInvocation for TodoWrite {
     fn start_header(&self) -> super::HeaderFuture {

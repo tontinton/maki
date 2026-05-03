@@ -247,7 +247,7 @@ mod tests {
             (super::super::CODE_EXECUTION_TOOL_NAME, MAIN | RES | GEN),
             (super::super::MEMORY_TOOL_NAME, MAIN | GEN),
             (super::super::QUESTION_TOOL_NAME, MAIN),
-            (super::super::TODOWRITE_TOOL_NAME, MAIN),
+            (super::super::TODOWRITE_TOOL_NAME, MAIN | RES | GEN),
             (super::super::TASK_TOOL_NAME, MAIN),
         ]);
 
