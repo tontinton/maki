@@ -230,6 +230,22 @@ case("tool_view_header_preserved_after_toggle", function()
   eq(buf.lines[12], "line10")
 end)
 
+case("tool_view_no_truncate_single_line", function()
+  for _, mode in ipairs({ "tail", "head" }) do
+    local buf = mock_buf()
+    local view = ToolView.new(buf, { max_lines = 3, keep = mode })
+    for i = 1, 4 do
+      view:append("line" .. i)
+    end
+    if mode == "head" then
+      view:finish()
+    end
+    eq(#buf.lines, 4, mode .. ": should inline the single skipped line")
+    eq(buf.lines[1], "line1", mode)
+    eq(buf.lines[4], "line4", mode)
+  end
+end)
+
 case("tool_view_append_after_toggle_still_works", function()
   local buf = mock_buf()
   local view = ToolView.new(buf, { max_lines = 3, keep = "tail" })

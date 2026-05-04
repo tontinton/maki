@@ -82,25 +82,21 @@ function ToolView:flush()
     end
   else
     local hidden = self.skipped
-    local label = hidden > 0 and ("... (" .. hidden .. " lines) (click to expand)") or nil
+    local notice = hidden >= 2 and { { "... (" .. hidden .. " lines) (click to expand)", "dim" } }
+      or hidden == 1 and self.all_lines[self.keep == "tail" and 1 or self.ring_count + 1]
+      or nil
 
-    if self.keep == "tail" and label then
-      lines[#lines + 1] = { { label, "dim" } }
+    if self.keep == "tail" and notice then
+      lines[#lines + 1] = notice
     end
 
-    if self.keep == "tail" and self.ring_count == self.max then
-      for i = 0, self.ring_count - 1 do
-        local idx = ((self.ring_start - 1 + i) % self.max) + 1
-        lines[#lines + 1] = self.ring[idx]
-      end
-    else
-      for i = 1, self.ring_count do
-        lines[#lines + 1] = self.ring[i]
-      end
+    for i = 0, self.ring_count - 1 do
+      local idx = ((self.ring_start - 1 + i) % self.max) + 1
+      lines[#lines + 1] = self.ring[idx]
     end
 
-    if self.keep == "head" and label then
-      lines[#lines + 1] = { { label, "dim" } }
+    if self.keep == "head" and notice then
+      lines[#lines + 1] = notice
     end
   end
 
