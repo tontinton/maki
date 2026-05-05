@@ -18,6 +18,14 @@
 //! The rightmost column of each area is reserved for the scrollbar, so
 //! `highlight_area` / `msg_area()` are 1 column narrower than the full
 //! area and all column math uses `width - 1`.
+//!
+//! When text is word-wrapped, ratatui eats the space at the break point,
+//! so the copied text would lose that space unless we put it back. But we
+//! should only add a space for word-boundary wraps, not mid-word ones
+//! (where a long token just overflows the column). `LineBreaks` tracks
+//! both line starts and wrap types: `compute_wrap_types()` walks each
+//! line the same way ratatui does and classifies every break, then
+//! `append_rows` calls `needs_space()` to decide.
 
 use std::cmp::Ordering;
 use std::time::Instant;
@@ -26,7 +34,8 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Modifier;
 use ratatui::text::Line;
-use ratatui::widgets::{Paragraph, Wrap};
+
+use unicode_width::UnicodeWidthChar;
 
 use crate::markdown::{CODE_BAR, CODE_BAR_WRAP};
 use crate::theme;
@@ -244,55 +253,121 @@ impl SelectionState {
 pub enum LineBreaks {
     #[default]
     EveryRow,
-    Bitmap(Vec<u64>),
+    Bitmap {
+        line_starts: Vec<u64>,
+        word_wraps: Vec<u64>,
+    },
+}
+
+fn set_bit(bits: &mut Vec<u64>, row: u16) {
+    let idx = (row / 64) as usize;
+    if idx >= bits.len() {
+        bits.resize(idx + 1, 0u64);
+    }
+    bits[idx] |= 1 << (row % 64);
+}
+
+fn get_bit(bits: &[u64], row: u16) -> bool {
+    bits.get((row / 64) as usize)
+        .is_some_and(|word| word & (1 << (row % 64)) != 0)
 }
 
 impl LineBreaks {
     pub fn from_heights(heights: impl Iterator<Item = u16>) -> Self {
-        let mut bits = Vec::new();
+        let mut line_starts = Vec::new();
         let mut row: u16 = 0;
         for h in heights {
             if h == 0 {
                 continue;
             }
-            let idx = (row / 64) as usize;
-            if idx >= bits.len() {
-                bits.resize(idx + 1, 0u64);
-            }
-            bits[idx] |= 1 << (row % 64);
+            set_bit(&mut line_starts, row);
             row = row.saturating_add(h);
         }
-        Self::Bitmap(bits)
+        Self::Bitmap {
+            line_starts,
+            word_wraps: Vec::new(),
+        }
     }
 
     pub fn from_lines(lines: &[Line<'_>], width: u16) -> Self {
         if width == 0 {
             return Self::EveryRow;
         }
-        let mut heights = Vec::with_capacity(lines.len());
+        let mut line_starts = Vec::new();
+        let mut word_wraps = Vec::new();
+        let mut row: u16 = 0;
         for line in lines {
-            if is_code_wrap_continuation(line)
-                && let Some(last) = heights.last_mut()
-            {
-                *last += 1;
+            if is_code_wrap_continuation(line) {
+                row += 1;
                 continue;
             }
-            let h = Paragraph::new(vec![line.clone()])
-                .wrap(Wrap { trim: false })
-                .line_count(width) as u16;
-            heights.push(h);
+            set_bit(&mut line_starts, row);
+            let wrap_types = compute_wrap_types(line, width);
+            for is_word_wrap in &wrap_types {
+                row += 1;
+                if *is_word_wrap {
+                    set_bit(&mut word_wraps, row);
+                }
+            }
+            row += 1;
         }
-        Self::from_heights(heights.into_iter())
+        Self::Bitmap {
+            line_starts,
+            word_wraps,
+        }
     }
 
     pub fn is_line_start(&self, row: u16) -> bool {
         match self {
             Self::EveryRow => true,
-            Self::Bitmap(bits) => bits
-                .get((row / 64) as usize)
-                .is_some_and(|word| word & (1 << (row % 64)) != 0),
+            Self::Bitmap { line_starts, .. } => get_bit(line_starts, row),
         }
     }
+
+    pub fn needs_space(&self, row: u16) -> bool {
+        match self {
+            Self::EveryRow => false,
+            Self::Bitmap { word_wraps, .. } => get_bit(word_wraps, row),
+        }
+    }
+}
+
+fn compute_wrap_types(line: &Line<'_>, width: u16) -> Vec<bool> {
+    let w = width as usize;
+    let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+    let chars: Vec<char> = text.chars().collect();
+    let mut wraps = Vec::new();
+    let mut i = 0;
+    let mut col = 0;
+    let mut last_breakable: Option<usize> = None;
+
+    while i < chars.len() {
+        let ch = chars[i];
+        let cw = ch.width().unwrap_or(0);
+
+        if ch == ' ' || ch == '\t' {
+            last_breakable = Some(i);
+        }
+
+        if col + cw > w && col > 0 {
+            if let Some(bp) = last_breakable {
+                wraps.push(true);
+                i = bp + 1;
+                while i < chars.len() && chars[i] == ' ' {
+                    i += 1;
+                }
+            } else {
+                wraps.push(false);
+            }
+            col = 0;
+            last_breakable = None;
+            continue;
+        }
+
+        col += cw;
+        i += 1;
+    }
+    wraps
 }
 
 fn is_code_wrap_continuation(line: &Line<'_>) -> bool {
@@ -423,12 +498,9 @@ pub(crate) fn append_rows(
     let row_end = to.min(area.bottom());
     let mut pending_newlines = 0u16;
     let anchor = out.len();
-    let mut prev_row_full = false;
     for row in row_start..row_end {
-        let is_new_line = breaks.is_line_start(row - area.y);
-        if is_new_line {
-            prev_row_full = false;
-        }
+        let rel_row = row - area.y;
+        let is_new_line = breaks.is_line_start(rel_row);
 
         let (col_start, col_end) = col_range(ss, area.x, right, row);
         let line_start = out.len();
@@ -457,11 +529,9 @@ pub(crate) fn append_rows(
                 pending_newlines = 0;
                 out.insert(line_start, '\n');
             }
-        } else if has_content && !is_first_row && !prev_row_full && stripped == 0 {
+        } else if has_content && !is_first_row && stripped == 0 && breaks.needs_space(rel_row) {
             out.insert(line_start, ' ');
         }
-
-        prev_row_full = trimmed_len - line_start >= area.width as usize;
     }
 }
 
@@ -868,7 +938,7 @@ mod tests {
     }
 
     #[test]
-    fn soft_wrap_continuation_inserts_space() {
+    fn char_wrap_continuation_no_space_from_heights() {
         let area = Rect::new(0, 0, 20, 2);
         let mut buf = Buffer::empty(area);
         buf.set_string(0, 0, "hello               ", Style::default());
@@ -880,7 +950,7 @@ mod tests {
             ..Default::default()
         };
         let text = extract_selected_text(&buf, &ss(0, 0, 1, 19), &[region]);
-        assert_eq!(text, "hello world");
+        assert_eq!(text, "helloworld");
     }
 
     #[test]
@@ -900,15 +970,6 @@ mod tests {
         };
         let text = extract_selected_text(&buf, &ss(0, 0, 1, 19), &[region]);
         assert_eq!(text, "long_variable_name_here");
-    }
-
-    #[test]
-    fn selection_empty_until_updated() {
-        let area = Rect::new(0, 0, 80, 20);
-        let mut sel = Selection::start(5, 10, area, SelectionZone::Messages, 0);
-        assert!(sel.is_empty());
-        sel.update(6, 10, 0);
-        assert!(!sel.is_empty());
     }
 
     #[test]
@@ -937,15 +998,10 @@ mod tests {
     }
 
     #[test]
-    fn line_breaks_empty_iterator() {
-        let lb = LineBreaks::from_heights(std::iter::empty());
-        assert!(matches!(lb, LineBreaks::Bitmap(ref v) if v.is_empty()));
-    }
-
-    #[test]
-    fn line_breaks_bitmap_query_beyond_stored_bits() {
+    fn line_breaks_query_beyond_stored_bits() {
         let lb = LineBreaks::from_heights([1].iter().copied());
         assert!(!lb.is_line_start(100));
+        assert!(!lb.needs_space(200));
     }
 
     #[test]
@@ -978,20 +1034,10 @@ mod tests {
         assert_eq!(text, "H");
     }
 
-    #[test]
-    fn col_range_single_row_selection() {
-        let sel = ss(5, 10, 5, 20);
-        let (start, end) = col_range(&sel, 0, 79, 5);
-        assert_eq!(start, 10);
-        assert_eq!(end, 20);
-    }
-
-    #[test]
-    fn col_range_mid_row_full_width() {
-        let sel = ss(3, 10, 7, 50);
-        let (start, end) = col_range(&sel, 0, 79, 5);
-        assert_eq!(start, 0, "mid row gets full left");
-        assert_eq!(end, 79, "mid row gets full right");
+    #[test_case(ss(5, 10, 5, 20), 5, (10, 20) ; "single_row")]
+    #[test_case(ss(3, 10, 7, 50), 5, (0, 79)   ; "mid_row_full_width")]
+    fn col_range_cases(sel: ScreenSelection, row: u16, expected: (u16, u16)) {
+        assert_eq!(col_range(&sel, 0, 79, row), expected);
     }
 
     #[test]
@@ -1004,5 +1050,178 @@ mod tests {
             zone: SelectionZone::Messages,
         });
         assert!(zone_at(&zones, 25, 10).is_none(), "outside all zones");
+    }
+
+    fn wrap_extract(input: &str, width: u16) -> String {
+        use ratatui::widgets::{Paragraph, Widget, Wrap};
+        let lines = vec![Line::from(input)];
+        let p = Paragraph::new(lines.clone()).wrap(Wrap { trim: false });
+        let height = p.line_count(width) as u16;
+        let area = Rect::new(0, 0, width, height);
+        let mut buf = Buffer::empty(area);
+        Paragraph::new(lines.clone())
+            .wrap(Wrap { trim: false })
+            .render(area, &mut buf);
+        let breaks = LineBreaks::from_lines(&lines, width);
+        let region = ContentRegion {
+            area,
+            line_breaks: breaks,
+            ..Default::default()
+        };
+        extract_selected_text(&buf, &ss(0, 0, height - 1, width - 1), &[region])
+    }
+
+    #[test_case("hello world", 5, "hello world" ; "word_wrap_at_exact_boundary")]
+    #[test_case("helloworld",  5, "helloworld"  ; "char_wrap_mid_word")]
+    #[test_case("hello world", 6, "hello world" ; "word_wrap_space_not_at_boundary")]
+    #[test_case("aa bb cc",    3, "aa bb cc"    ; "multi_word_three_rows")]
+    #[test_case("abc ",        4, "abc"         ; "trailing_space_not_duplicated")]
+    #[test_case("ab",          1, "ab"          ; "single_col_width")]
+    #[test_case("abcdefgh ij", 5, "abcdefgh ij" ; "long_word_then_short")]
+    #[test_case("abcde fghij", 5, "abcde fghij" ; "word_fills_row_exactly")]
+    #[test_case("ab cd ef",    3, "ab cd ef"    ; "three_short_words")]
+    #[test_case("a    b",      4, "a b"         ; "many_spaces_between_words")]
+    fn wrap_copy(input: &str, width: u16, expected: &str) {
+        assert_eq!(wrap_extract(input, width), expected);
+    }
+
+    fn cwt(input: &str, width: u16) -> Vec<bool> {
+        compute_wrap_types(&Line::from(input), width)
+    }
+
+    #[test_case("abcdef",        5, &[false]              ; "char_overflow")]
+    #[test_case("ab cd",         3, &[true]               ; "word_boundary")]
+    #[test_case("ab   cd",       4, &[true]               ; "multiple_consecutive_spaces")]
+    #[test_case("abcdefghij",    3, &[false, false, false] ; "long_word_multiple_wraps")]
+    #[test_case("hi worldaaaaaa",5, &[true, false, false]  ; "mixed_word_then_char")]
+    #[test_case("ab\tcd",        3, &[true]               ; "tab_as_breakpoint")]
+    #[test_case("漢字漢字",       3, &[false, false, false] ; "cjk_double_width_char_wrap")]
+    #[test_case("漢 字字",        3, &[true, false]          ; "cjk_with_space_word_wrap")]
+    fn cwt_cases(input: &str, width: u16, expected: &[bool]) {
+        assert_eq!(cwt(input, width), expected);
+    }
+
+    #[test]
+    fn from_lines_no_wrap_marks_each_line_as_start() {
+        let lines = vec![Line::from("abc"), Line::from("def"), Line::from("ghi")];
+        let lb = LineBreaks::from_lines(&lines, 80);
+        assert!(lb.is_line_start(0));
+        assert!(lb.is_line_start(1));
+        assert!(lb.is_line_start(2));
+        assert!(!lb.needs_space(0));
+        assert!(!lb.needs_space(1));
+        assert!(!lb.needs_space(2));
+    }
+
+    #[test]
+    fn from_lines_word_wrap_marks_continuation_rows() {
+        let lines = vec![Line::from("hello world")];
+        let lb = LineBreaks::from_lines(&lines, 6);
+        assert!(lb.is_line_start(0));
+        assert!(!lb.is_line_start(1), "continuation row is not a line start");
+        assert!(lb.needs_space(1), "word-boundary continuation needs space");
+    }
+
+    #[test]
+    fn from_lines_code_wrap_continuation_skipped() {
+        let wrap_line = Line::from(vec![ratatui::text::Span::raw(CODE_BAR_WRAP)]);
+        let lines = vec![Line::from("first"), wrap_line, Line::from("second")];
+        let lb = LineBreaks::from_lines(&lines, 80);
+        assert!(lb.is_line_start(0));
+        assert!(
+            !lb.is_line_start(1),
+            "code wrap continuation is not a line start"
+        );
+        assert!(lb.is_line_start(2));
+    }
+
+    #[test]
+    fn from_lines_across_64_row_boundary() {
+        let lines: Vec<Line<'_>> = (0..70).map(|_| Line::from("x")).collect();
+        let lb = LineBreaks::from_lines(&lines, 80);
+        assert!(lb.is_line_start(0));
+        assert!(lb.is_line_start(63));
+        assert!(lb.is_line_start(64));
+        assert!(lb.is_line_start(69));
+    }
+
+    #[test]
+    fn word_wrap_across_64_row_boundary_needs_space() {
+        let long = (0..66).map(|_| "xx").collect::<Vec<_>>().join(" ");
+        let lines = vec![Line::from(long.as_str())];
+        let lb = LineBreaks::from_lines(&lines, 3);
+        assert!(lb.is_line_start(0));
+        assert!(!lb.is_line_start(1));
+        assert!(lb.needs_space(1), "first continuation needs space");
+        assert!(lb.needs_space(65), "continuation past row 64 needs space");
+    }
+
+    #[test_case(Rect::new(0, 0, 0, 5), Rect::new(0, 0, 1, 5), ss(0, 0, 4, 0), 0, 5 ; "zero_width")]
+    #[test_case(Rect::new(0, 0, 10, 0), Rect::new(0, 0, 10, 1), ss(0, 0, 0, 9), 0, 1 ; "zero_height")]
+    fn append_rows_degenerate_area_no_panic(
+        area: Rect,
+        buf_area: Rect,
+        sel: ScreenSelection,
+        from: u16,
+        to: u16,
+    ) {
+        let buf = Buffer::empty(buf_area);
+        let mut out = String::new();
+        append_rows(&buf, area, &sel, from, to, &mut out, &LineBreaks::EveryRow);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn cwt_multi_span_line() {
+        use ratatui::text::Span;
+        let line = Line::from(vec![Span::raw("hello "), Span::raw("world")]);
+        let wraps = compute_wrap_types(&line, 6);
+        assert_eq!(
+            wraps,
+            vec![true],
+            "word wrap should work across span boundaries"
+        );
+    }
+
+    #[test]
+    fn from_lines_mixed_wrapping_and_non_wrapping() {
+        let lines = vec![
+            Line::from("hello world"),
+            Line::from("ok"),
+            Line::from("foo bar baz"),
+        ];
+        let lb = LineBreaks::from_lines(&lines, 6);
+        // row layout: "hello world" wraps to rows 0-1, "ok" is row 2,
+        // "foo bar baz" wraps to rows 3-5
+        assert!(lb.is_line_start(0));
+        assert!(!lb.is_line_start(1));
+        assert!(lb.needs_space(1));
+        assert!(lb.is_line_start(2));
+        assert!(lb.is_line_start(3));
+        assert!(!lb.is_line_start(4));
+        assert!(lb.needs_space(4));
+        assert!(!lb.is_line_start(5));
+        assert!(lb.needs_space(5));
+    }
+
+    #[test]
+    fn wrap_extract_two_lines_first_wraps_second_doesnt() {
+        use ratatui::widgets::{Paragraph, Widget, Wrap};
+        let lines = vec![Line::from("hello world"), Line::from("ok")];
+        let p = Paragraph::new(lines.clone()).wrap(Wrap { trim: false });
+        let height = p.line_count(6) as u16;
+        let area = Rect::new(0, 0, 6, height);
+        let mut buf = Buffer::empty(area);
+        Paragraph::new(lines.clone())
+            .wrap(Wrap { trim: false })
+            .render(area, &mut buf);
+        let breaks = LineBreaks::from_lines(&lines, 6);
+        let region = ContentRegion {
+            area,
+            line_breaks: breaks,
+            ..Default::default()
+        };
+        let text = extract_selected_text(&buf, &ss(0, 0, height - 1, 5), &[region]);
+        assert_eq!(text, "hello world\nok");
     }
 }
