@@ -101,6 +101,17 @@ struct UserMessage<'a> {
     content: &'a Value,
 }
 
+#[derive(Serialize)]
+struct RetryEvent<'a> {
+    #[serde(rename = "type")]
+    event_type: &'static str,
+    subtype: &'static str,
+    attempt: u32,
+    retry_delay_ms: u64,
+    error: &'a str,
+    session_id: &'a str,
+}
+
 enum VerboseOutput {
     StreamJson,
     Json(Vec<Value>),
@@ -219,11 +230,11 @@ pub fn run(
         }
     });
 
-    let is_stream_json = matches!(format, OutputFormat::StreamJson);
-    let mut verbose_out = verbose.then(|| match format {
-        OutputFormat::StreamJson => VerboseOutput::StreamJson,
-        _ => VerboseOutput::Json(Vec::new()),
-    });
+    let mut verbose_out = match format {
+        OutputFormat::StreamJson => Some(VerboseOutput::StreamJson),
+        _ if verbose => Some(VerboseOutput::Json(Vec::new())),
+        _ => None,
+    };
 
     if let Some(out) = &mut verbose_out {
         out.emit(&InitEvent {
@@ -270,16 +281,24 @@ pub fn run(
             | AgentEvent::SubagentHistory { .. }
             | AgentEvent::ToolSnapshot { .. }
             | AgentEvent::ToolHeaderSnapshot { .. }
-            | AgentEvent::LiveToolBuf { .. }
-            | AgentEvent::Retry { .. } => {
-                if is_stream_json {
-                    println!("{}", serde_json::to_string(&envelope)?);
+            | AgentEvent::LiveToolBuf { .. } => {}
+            AgentEvent::Retry {
+                attempt,
+                message,
+                delay_ms,
+            } => {
+                if let Some(out) = &mut verbose_out {
+                    out.emit(&RetryEvent {
+                        event_type: "system",
+                        subtype: "api_retry",
+                        attempt: *attempt,
+                        retry_delay_ms: *delay_ms,
+                        error: message,
+                        session_id: &session_id,
+                    })?;
                 }
             }
             AgentEvent::TurnComplete(tc) => {
-                if is_stream_json {
-                    println!("{}", serde_json::to_string(&envelope)?);
-                }
                 if let Some(out) = &mut verbose_out {
                     let content_value = serde_json::to_value(&tc.message.content)?;
                     out.emit(&AssistantEvent {
@@ -296,9 +315,6 @@ pub fn run(
                 }
             }
             AgentEvent::ToolResultsSubmitted { message } => {
-                if is_stream_json {
-                    println!("{}", serde_json::to_string(&envelope)?);
-                }
                 if let Some(out) = &mut verbose_out {
                     let content_value = serde_json::to_value(&message.content)?;
                     out.emit(&UserEvent {
@@ -317,18 +333,12 @@ pub fn run(
                 num_turns: turns,
                 stop_reason: sr,
             } => {
-                if is_stream_json {
-                    println!("{}", serde_json::to_string(&envelope)?);
-                }
                 num_turns = *turns;
                 usage = *u;
                 stop_reason = *sr;
                 break;
             }
             AgentEvent::Error { message } => {
-                if is_stream_json {
-                    println!("{}", serde_json::to_string(&envelope)?);
-                }
                 is_error = true;
                 result_text = message.clone();
                 break;
@@ -372,9 +382,7 @@ pub fn run(
                     events.push(serde_json::to_value(&result)?);
                     println!("{}", serde_json::to_string(&events)?);
                 }
-                Some(VerboseOutput::StreamJson) => println!("{}", serde_json::to_string(&result)?),
-                None if is_stream_json => {}
-                None => println!("{}", serde_json::to_string(&result)?),
+                _ => println!("{}", serde_json::to_string(&result)?),
             }
         }
     }
@@ -399,8 +407,15 @@ mod tests {
         "usage",
         "duration_ms",
     ];
-
     const INIT_EVENT_FIELDS: &[&str] = &["type", "subtype", "cwd", "session_id", "tools", "model"];
+    const RETRY_EVENT_FIELDS: &[&str] = &[
+        "type",
+        "subtype",
+        "attempt",
+        "retry_delay_ms",
+        "error",
+        "session_id",
+    ];
 
     #[test]
     fn wire_format_required_fields() {
@@ -432,6 +447,19 @@ mod tests {
         let json: Value = serde_json::to_value(&init).unwrap();
         for field in INIT_EVENT_FIELDS {
             assert!(json.get(field).is_some(), "InitEvent missing: {field}");
+        }
+
+        let retry = RetryEvent {
+            event_type: "system",
+            subtype: "api_retry",
+            attempt: 2,
+            retry_delay_ms: 3000,
+            error: "rate_limit",
+            session_id: "abc",
+        };
+        let json: Value = serde_json::to_value(&retry).unwrap();
+        for field in RETRY_EVENT_FIELDS {
+            assert!(json.get(field).is_some(), "RetryEvent missing: {field}");
         }
     }
 }
