@@ -236,6 +236,10 @@ struct ChatChunk {
     error: Option<String>,
 }
 
+/// Tool-call markers emitted by templates that don't structure tools into
+/// Ollama's `tool_calls` field (qwen3-coder, llama-3.x, hermes derivatives).
+const TOOL_MARKERS: &[&str] = &["<function=", "<tool_call>"];
+
 async fn parse_ndjson(
     reader: impl AsyncBufRead + Unpin,
     event_tx: &Sender<ProviderEvent>,
@@ -243,6 +247,7 @@ async fn parse_ndjson(
 ) -> Result<StreamResponse, AgentError> {
     let mut lines = reader.lines();
     let mut text = String::new();
+    let mut emitted_len = 0_usize;
     let mut thinking_text = String::new();
     let mut tool_blocks: Vec<ContentBlock> = Vec::new();
     let mut usage = TokenUsage::default();
@@ -293,9 +298,15 @@ async fn parse_ndjson(
                 };
                 if !piece.is_empty() {
                     text.push_str(&piece);
-                    event_tx
-                        .send_async(ProviderEvent::TextDelta { text: piece })
-                        .await?;
+                    let limit =
+                        first_marker_start(&text).unwrap_or_else(|| safe_partial_end(&text));
+                    if limit > emitted_len {
+                        let to_emit = text[emitted_len..limit].to_string();
+                        emitted_len = limit;
+                        event_tx
+                            .send_async(ProviderEvent::TextDelta { text: to_emit })
+                            .await?;
+                    }
                 }
             }
             if let Some(calls) = msg.tool_calls {
@@ -333,6 +344,23 @@ async fn parse_ndjson(
         }
     }
 
+    if tool_blocks.is_empty() && first_marker_start(&text).is_some() {
+        let (clean, calls) = extract_text_tool_calls(&text);
+        text = clean;
+        for (name, input) in calls {
+            let id = format!("ollama_call_{next_tool_idx}");
+            next_tool_idx += 1;
+            debug!(tool = %name, args = %input, %id, "tool call extracted from text");
+            event_tx
+                .send_async(ProviderEvent::ToolUseStart {
+                    id: id.clone(),
+                    name: name.clone(),
+                })
+                .await?;
+            tool_blocks.push(ContentBlock::ToolUse { id, name, input });
+        }
+    }
+
     if !tool_blocks.is_empty() {
         stop_reason = Some(StopReason::ToolUse);
     }
@@ -358,6 +386,136 @@ async fn parse_ndjson(
         usage,
         stop_reason,
     })
+}
+
+fn first_marker_start(text: &str) -> Option<usize> {
+    TOOL_MARKERS.iter().filter_map(|m| text.find(m)).min()
+}
+
+/// Returns the byte length of `text` that's safe to emit as a streaming delta:
+/// the position right before any trailing prefix of a tool-call marker. This
+/// lets us hold back tokens like `<func` until we know whether they're the
+/// start of `<function=` or just stray prose.
+fn safe_partial_end(text: &str) -> usize {
+    let mut safe = text.len();
+    for marker in TOOL_MARKERS {
+        let max = marker.len().saturating_sub(1).min(text.len());
+        for i in (1..=max).rev() {
+            if text.ends_with(&marker[..i]) {
+                safe = safe.min(text.len() - i);
+                break;
+            }
+        }
+    }
+    safe
+}
+
+/// Walks `text`, splits it into prose plus extracted tool calls. Recognizes
+/// two formats produced by templates that don't fill Ollama's `tool_calls`:
+///
+///  * Hermes / Llama-3.x XML:
+///    `<function=NAME>\n<parameter=KEY>VALUE</parameter>...</function>`,
+///    optionally with a stray `</tool_call>` epilogue.
+///  * Qwen JSON:
+///    `<tool_call>\n{"name":"NAME","arguments":{...}}\n</tool_call>`.
+fn extract_text_tool_calls(text: &str) -> (String, Vec<(String, Value)>) {
+    let mut prose = String::new();
+    let mut calls = Vec::new();
+    let mut i = 0;
+
+    while i < text.len() {
+        let function_pos = text[i..].find("<function=").map(|x| i + x);
+        let tool_call_pos = text[i..].find("<tool_call>").map(|x| i + x);
+        let next = match (function_pos, tool_call_pos) {
+            (Some(f), Some(t)) if f <= t => Some((f, true)),
+            (Some(_), Some(t)) => Some((t, false)),
+            (Some(f), None) => Some((f, true)),
+            (None, Some(t)) => Some((t, false)),
+            (None, None) => None,
+        };
+
+        let Some((start, is_function)) = next else {
+            prose.push_str(&text[i..]);
+            break;
+        };
+
+        prose.push_str(&text[i..start]);
+
+        if is_function {
+            let Some(end_rel) = text[start..].find("</function>") else {
+                prose.push_str(&text[start..]);
+                break;
+            };
+            let block_end = start + end_rel + "</function>".len();
+            match parse_hermes_block(&text[start..block_end]) {
+                Some(call) => calls.push(call),
+                None => prose.push_str(&text[start..block_end]),
+            }
+            i = block_end;
+            let after = &text[i..];
+            let trimmed = after.trim_start();
+            let ws_len = after.len() - trimmed.len();
+            if trimmed.starts_with("</tool_call>") {
+                i += ws_len + "</tool_call>".len();
+            }
+        } else {
+            let inner_start = start + "<tool_call>".len();
+            let Some(end_rel) = text[inner_start..].find("</tool_call>") else {
+                prose.push_str(&text[start..]);
+                break;
+            };
+            let inner = text[inner_start..inner_start + end_rel].trim();
+            let block_end = inner_start + end_rel + "</tool_call>".len();
+            let parsed = parse_hermes_block(inner).or_else(|| parse_json_call(inner));
+            match parsed {
+                Some(call) => calls.push(call),
+                None => prose.push_str(&text[start..block_end]),
+            }
+            i = block_end;
+        }
+    }
+
+    (prose.trim().to_string(), calls)
+}
+
+fn parse_hermes_block(block: &str) -> Option<(String, Value)> {
+    let block = block.trim();
+    let after_open = block.strip_prefix("<function=")?;
+    let close = after_open.rfind("</function>")?;
+    let header_end = after_open[..close].find('>')?;
+    let name = after_open[..header_end].trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let body = &after_open[header_end + 1..close];
+
+    let mut args = serde_json::Map::new();
+    let mut rest = body;
+    while let Some(p_start) = rest.find("<parameter=") {
+        let p_after = &rest[p_start + "<parameter=".len()..];
+        let key_end = p_after.find('>')?;
+        let key = p_after[..key_end].trim().to_string();
+        let p_inner = &p_after[key_end + 1..];
+        let p_close = p_inner.find("</parameter>")?;
+        let raw = p_inner[..p_close].trim();
+        let value =
+            serde_json::from_str::<Value>(raw).unwrap_or_else(|_| Value::String(raw.to_string()));
+        args.insert(key, value);
+        rest = &p_inner[p_close + "</parameter>".len()..];
+    }
+
+    Some((name, Value::Object(args)))
+}
+
+fn parse_json_call(s: &str) -> Option<(String, Value)> {
+    let v: Value = serde_json::from_str(s).ok()?;
+    let name = v.get("name")?.as_str()?.to_string();
+    let args = v
+        .get("arguments")
+        .or_else(|| v.get("parameters"))
+        .cloned()
+        .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+    Some((name, args))
 }
 
 impl Provider for Ollama {
@@ -699,6 +857,149 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(resp.stop_reason, Some(StopReason::MaxTokens));
+        });
+    }
+
+    #[test]
+    fn safe_partial_end_holds_back_partial_marker() {
+        assert_eq!(safe_partial_end("hello"), 5);
+        assert_eq!(safe_partial_end("hello <"), 6);
+        assert_eq!(safe_partial_end("hello <func"), 6);
+        assert_eq!(safe_partial_end("hello <function"), 6);
+        // A complete marker isn't held back here — first_marker_start handles it.
+        assert_eq!(safe_partial_end("<function="), 10);
+    }
+
+    #[test]
+    fn parse_hermes_block_basic() {
+        let block = "<function=websearch>\n<parameter=query>\nfoobar\n</parameter>\n</function>";
+        let (name, args) = parse_hermes_block(block).unwrap();
+        assert_eq!(name, "websearch");
+        assert_eq!(args["query"], "foobar");
+    }
+
+    #[test]
+    fn parse_hermes_block_coerces_numeric_value() {
+        let block = "<function=websearch>\n<parameter=num_results>5</parameter>\n<parameter=query>foo</parameter>\n</function>";
+        let (_, args) = parse_hermes_block(block).unwrap();
+        assert_eq!(args["num_results"], 5);
+        assert_eq!(args["query"], "foo");
+    }
+
+    #[test]
+    fn parse_json_call_arguments_field() {
+        let s = r#"{"name":"websearch","arguments":{"query":"foo"}}"#;
+        let (name, args) = parse_json_call(s).unwrap();
+        assert_eq!(name, "websearch");
+        assert_eq!(args["query"], "foo");
+    }
+
+    #[test]
+    fn parse_json_call_parameters_alias() {
+        let s = r#"{"name":"x","parameters":{"k":1}}"#;
+        let (_, args) = parse_json_call(s).unwrap();
+        assert_eq!(args["k"], 1);
+    }
+
+    #[test]
+    fn extract_text_tool_calls_hermes_with_trailing_tool_call_close() {
+        let text = "<function=websearch>\n<parameter=query>\nfoobar\n</parameter>\n</function>\n</tool_call>";
+        let (prose, calls) = extract_text_tool_calls(text);
+        assert!(prose.is_empty(), "prose should be empty, got: {prose:?}");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "websearch");
+        assert_eq!(calls[0].1["query"], "foobar");
+    }
+
+    #[test]
+    fn extract_text_tool_calls_qwen_json_wrapper() {
+        let text = r#"<tool_call>{"name":"websearch","arguments":{"query":"foo"}}</tool_call>"#;
+        let (prose, calls) = extract_text_tool_calls(text);
+        assert!(prose.is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "websearch");
+        assert_eq!(calls[0].1["query"], "foo");
+    }
+
+    #[test]
+    fn extract_text_tool_calls_keeps_surrounding_prose() {
+        let text = "I will search now.\n<function=websearch>\n<parameter=query>foo</parameter>\n</function>\nDone.";
+        let (prose, calls) = extract_text_tool_calls(text);
+        assert_eq!(prose, "I will search now.\n\nDone.");
+        assert_eq!(calls.len(), 1);
+    }
+
+    #[test]
+    fn extract_text_tool_calls_multiple_calls() {
+        let text = "<function=read>\n<parameter=path>/a</parameter>\n</function>\n\
+                    Some prose between.\n\
+                    <tool_call>{\"name\":\"grep\",\"arguments\":{\"pattern\":\"foo\"}}</tool_call>";
+        let (prose, calls) = extract_text_tool_calls(text);
+        assert_eq!(prose, "Some prose between.");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].0, "read");
+        assert_eq!(calls[0].1["path"], "/a");
+        assert_eq!(calls[1].0, "grep");
+        assert_eq!(calls[1].1["pattern"], "foo");
+    }
+
+    #[test]
+    fn extract_text_tool_calls_passes_through_unparseable_block() {
+        let text = "<function=bad>\nno params\n</function>";
+        let (prose, calls) = extract_text_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "bad");
+        assert!(
+            calls[0].1.as_object().unwrap().is_empty(),
+            "args: {:?}",
+            calls[0].1
+        );
+        assert!(prose.is_empty());
+    }
+
+    #[test]
+    fn parse_ndjson_extracts_text_format_tool_call() {
+        smol::block_on(async {
+            let body = "\
+{\"message\":{\"role\":\"assistant\",\"content\":\"<function\"},\"done\":false}
+{\"message\":{\"role\":\"assistant\",\"content\":\"=websearch>\\n<parameter=query>\\nfoobar\\n</parameter>\\n</function>\\n</tool_call>\"},\"done\":false}
+{\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"done\":true,\"done_reason\":\"stop\",\"prompt_eval_count\":3,\"eval_count\":7}
+";
+            let (tx, rx) = flume::unbounded();
+            let resp = parse_ndjson(Cursor::new(body.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+                .await
+                .unwrap();
+
+            assert_eq!(resp.stop_reason, Some(StopReason::ToolUse));
+            let tools: Vec<_> = resp.message.tool_uses().collect();
+            assert_eq!(tools.len(), 1);
+            assert_eq!(tools[0].1, "websearch");
+            assert_eq!(tools[0].2["query"], "foobar");
+            assert!(
+                !resp
+                    .message
+                    .content
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::Text { .. })),
+                "extracted message should have no Text block: {:?}",
+                resp.message.content
+            );
+
+            let events: Vec<_> = rx.drain().collect();
+            for e in &events {
+                if let ProviderEvent::TextDelta { text } = e {
+                    assert!(
+                        !text.contains("<function=") && !text.contains("<tool_call>"),
+                        "marker leaked into TextDelta: {text:?}"
+                    );
+                }
+            }
+            assert!(
+                events.iter().any(
+                    |e| matches!(e, ProviderEvent::ToolUseStart { name, .. } if name == "websearch")
+                ),
+                "missing ToolUseStart for extracted call"
+            );
         });
     }
 
