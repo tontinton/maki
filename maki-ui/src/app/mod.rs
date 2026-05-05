@@ -30,7 +30,7 @@ use crate::components::help_modal::HelpModal;
 use crate::components::input::{InputAction, InputBox, Submission};
 use crate::components::keybindings::key;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
-use crate::components::lua_select::LuaSelectModal;
+use crate::components::lua_select::{LuaSelectAction, LuaSelectModal};
 use crate::components::mcp_picker::{McpPicker, McpPickerAction};
 use crate::components::model_picker::{ModelPicker, ModelPickerAction};
 use crate::components::permission_prompt::PermissionPrompt;
@@ -500,7 +500,9 @@ impl App {
         }
 
         if self.lua_select.is_open() {
-            self.lua_select.handle_key(key);
+            if let LuaSelectAction::Flash(msg) = self.lua_select.handle_key(key) {
+                self.status_bar.flash(msg.to_string());
+            }
             return vec![];
         }
 

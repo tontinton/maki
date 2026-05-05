@@ -190,7 +190,7 @@ maki.api.register_command({
     while true do
       local event = maki.ui.select(entries, {
         title = " Memory Files ",
-        footer = { { "enter", "open" }, { "ctrl+d", "delete" } },
+        footer = { { "enter", "open" }, { "ctrl+o", "edit" }, { "ctrl+d", "delete" } },
         format = function(item)
           return { label = item[1], detail = "(" .. item[2] .. " bytes)" }
         end,
@@ -199,7 +199,7 @@ maki.api.register_command({
 
       if not event or event.type == "close" then
         return
-      elseif event.type == "choice" then
+      elseif event.type == "choice" or event.type == "open_editor" then
         local item = entries[event.index]
         maki.ui.open_editor(maki.fs.joinpath(dir, item[1]))
         return

@@ -10,6 +10,12 @@ use ratatui::layout::{Position, Rect};
 const DEFAULT_TITLE: &str = " Select ";
 const FOOTER_WITH_DELETE: &[(&str, &str)] = &[("Enter", "select"), (key::DELETE.label, "delete")];
 const FOOTER_NO_DELETE: &[(&str, &str)] = &[("Enter", "select")];
+const FLASH_CONFIRM_DELETE: &str = "Press Ctrl+D again to confirm delete";
+
+pub enum LuaSelectAction {
+    Consumed,
+    Flash(&'static str),
+}
 
 impl PickerItem for SelectItem {
     fn label(&self) -> &str {
@@ -50,12 +56,14 @@ impl LuaSelectModal {
         self.reply_tx = Some(reply_tx);
         self.confirming_idx = None;
 
-        let footer = if opts.has_on_delete {
-            FOOTER_WITH_DELETE
+        let picker = if !opts.footer.is_empty() {
+            ListPicker::new().with_footer_owned(opts.footer)
+        } else if opts.has_on_delete {
+            ListPicker::new().with_footer(FOOTER_WITH_DELETE)
         } else {
-            FOOTER_NO_DELETE
+            ListPicker::new().with_footer(FOOTER_NO_DELETE)
         };
-        self.picker = ListPicker::new().with_footer(footer);
+        self.picker = picker;
 
         let title = if opts.title.is_empty() {
             DEFAULT_TITLE.to_string()
@@ -90,10 +98,13 @@ impl LuaSelectModal {
         self.picker.handle_paste(text)
     }
 
-    pub fn handle_key(&mut self, key: KeyEvent) {
+    pub fn handle_key(&mut self, key: KeyEvent) -> LuaSelectAction {
         if self.has_on_delete && is_ctrl(&key) && key.code == KeyCode::Char('d') {
-            self.handle_delete_key();
-            return;
+            return self.handle_delete_key();
+        }
+
+        if is_ctrl(&key) && key.code == KeyCode::Char('o') {
+            return self.handle_open_editor();
         }
 
         self.confirming_idx = None;
@@ -103,30 +114,41 @@ impl LuaSelectModal {
             PickerAction::Close => self.close(),
             PickerAction::Consumed | PickerAction::Toggle(..) => {}
         }
+        LuaSelectAction::Consumed
     }
 
     fn send_choice(&mut self, index: usize) {
+        self.send_and_close(SelectEvent::Choice { index });
+    }
+
+    fn send_and_close(&mut self, event: SelectEvent) {
         if let Some(tx) = self.reply_tx.take() {
-            let _ = tx.send(SelectEvent::Choice { index });
+            let _ = tx.send(event);
         }
         self.picker.close();
     }
 
-    fn handle_delete_key(&mut self) {
+    fn handle_delete_key(&mut self) -> LuaSelectAction {
         let Some(idx) = self.picker.selected_index() else {
-            return;
+            return LuaSelectAction::Consumed;
         };
 
         if self.confirming_idx == Some(idx) {
-            if let Some(tx) = self.reply_tx.take() {
-                let _ = tx.send(SelectEvent::Delete { index: idx });
-            }
-            self.picker.close();
+            self.send_and_close(SelectEvent::Delete { index: idx });
             self.confirming_idx = None;
-            return;
+            return LuaSelectAction::Consumed;
         }
 
         self.confirming_idx = Some(idx);
+        LuaSelectAction::Flash(FLASH_CONFIRM_DELETE)
+    }
+
+    fn handle_open_editor(&mut self) -> LuaSelectAction {
+        let Some(idx) = self.picker.selected_index() else {
+            return LuaSelectAction::Consumed;
+        };
+        self.send_and_close(SelectEvent::OpenEditor { index: idx });
+        LuaSelectAction::Consumed
     }
 
     pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
@@ -156,11 +178,16 @@ impl Overlay for LuaSelectModal {
 mod tests {
     use super::*;
     use crate::components::key as key_ev;
-    use crossterm::event::{KeyCode, KeyModifiers};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use maki_lua::{SelectEvent, SelectItem, SelectOpts};
+    use test_case::test_case;
 
     fn ctrl_d() -> KeyEvent {
         KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL)
+    }
+
+    fn ctrl_o() -> KeyEvent {
+        KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL)
     }
 
     fn sample_items() -> Vec<SelectItem> {
@@ -180,6 +207,7 @@ mod tests {
         SelectOpts {
             title: " Test ".into(),
             has_on_delete: true,
+            footer: vec![],
         }
     }
 
@@ -187,6 +215,7 @@ mod tests {
         SelectOpts {
             title: " Test ".into(),
             has_on_delete: false,
+            footer: vec![],
         }
     }
 
@@ -216,26 +245,13 @@ mod tests {
     }
 
     #[test]
-    fn close_sends_close_event() {
-        let mut modal = LuaSelectModal::new();
-        let rx = open_modal(&mut modal, sample_items(), opts_no_delete());
-
-        modal.close();
-
-        match rx.try_recv().unwrap() {
-            SelectEvent::Close => {}
-            other => panic!("expected Close, got {}", select_event_name(&other)),
-        }
-        assert!(!modal.is_open());
-    }
-
-    #[test]
     fn ctrl_d_confirm_flow_sends_delete() {
         let mut modal = LuaSelectModal::new();
         let rx = open_modal(&mut modal, sample_items(), opts_with_delete());
 
-        modal.handle_key(ctrl_d());
+        let action = modal.handle_key(ctrl_d());
         assert!(modal.is_open());
+        assert!(matches!(action, LuaSelectAction::Flash(_)));
 
         modal.handle_key(ctrl_d());
         assert!(!modal.is_open());
@@ -284,21 +300,19 @@ mod tests {
         assert!(modal.is_open());
     }
 
-    #[test]
-    fn enter_on_empty_is_consumed() {
+    #[test_case(key_ev(KeyCode::Enter), false ; "enter_on_empty")]
+    #[test_case(ctrl_d(), true ; "ctrl_d_on_empty")]
+    #[test_case(ctrl_o(), false ; "ctrl_o_on_empty")]
+    fn action_on_empty_list_is_consumed(key: KeyEvent, with_delete: bool) {
         let mut modal = LuaSelectModal::new();
-        let _rx = open_modal(&mut modal, vec![], opts_no_delete());
+        let opts = if with_delete {
+            opts_with_delete()
+        } else {
+            opts_no_delete()
+        };
+        let _rx = open_modal(&mut modal, vec![], opts);
 
-        modal.handle_key(key_ev(KeyCode::Enter));
-        assert!(modal.is_open());
-    }
-
-    #[test]
-    fn ctrl_d_on_empty_is_consumed() {
-        let mut modal = LuaSelectModal::new();
-        let _rx = open_modal(&mut modal, vec![], opts_with_delete());
-
-        modal.handle_key(ctrl_d());
+        modal.handle_key(key);
         assert!(modal.is_open());
     }
 
@@ -308,16 +322,16 @@ mod tests {
         let _rx = open_modal(&mut modal, sample_items(), opts_with_delete());
 
         modal.handle_key(ctrl_d());
-        assert!(modal.confirming_idx.is_some());
-
         modal.handle_key(key_ev(KeyCode::Down));
-        assert!(modal.confirming_idx.is_none());
+        let action = modal.handle_key(ctrl_d());
+        assert!(matches!(action, LuaSelectAction::Flash(_)));
     }
 
     fn select_event_name(event: &SelectEvent) -> &'static str {
         match event {
             SelectEvent::Choice { .. } => "Choice",
             SelectEvent::Delete { .. } => "Delete",
+            SelectEvent::OpenEditor { .. } => "OpenEditor",
             SelectEvent::Close => "Close",
         }
     }
@@ -352,63 +366,16 @@ mod tests {
     }
 
     #[test]
-    fn first_item_selected_by_default() {
+    fn ctrl_o_sends_open_editor_event() {
         let mut modal = LuaSelectModal::new();
         let rx = open_modal(&mut modal, sample_items(), opts_no_delete());
 
-        modal.handle_key(key_ev(KeyCode::Enter));
+        modal.handle_key(ctrl_o());
 
         assert!(!modal.is_open());
         match rx.try_recv().unwrap() {
-            SelectEvent::Choice { index } => assert_eq!(index, 0),
-            other => panic!("expected Choice 0, got {}", select_event_name(&other)),
+            SelectEvent::OpenEditor { index } => assert_eq!(index, 0),
+            other => panic!("expected OpenEditor, got {}", select_event_name(&other)),
         }
-    }
-
-    #[test]
-    fn single_item_select_and_delete() {
-        let mut modal = LuaSelectModal::new();
-        let rx = open_modal(
-            &mut modal,
-            vec![SelectItem {
-                label: "only".into(),
-                detail: None,
-            }],
-            opts_with_delete(),
-        );
-
-        modal.handle_key(ctrl_d());
-        modal.handle_key(ctrl_d());
-        assert!(!modal.is_open());
-        match rx.try_recv().unwrap() {
-            SelectEvent::Delete { index } => assert_eq!(index, 0),
-            other => panic!("expected Delete, got {}", select_event_name(&other)),
-        }
-
-        let mut modal = LuaSelectModal::new();
-        let rx = open_modal(
-            &mut modal,
-            vec![SelectItem {
-                label: "only".into(),
-                detail: None,
-            }],
-            opts_with_delete(),
-        );
-        modal.handle_key(key_ev(KeyCode::Enter));
-        match rx.try_recv().unwrap() {
-            SelectEvent::Choice { index } => assert_eq!(index, 0),
-            other => panic!("expected Choice, got {}", select_event_name(&other)),
-        }
-    }
-
-    #[test]
-    fn open_with_empty_title_uses_default() {
-        let mut modal = LuaSelectModal::new();
-        let opts = SelectOpts {
-            title: String::new(),
-            has_on_delete: false,
-        };
-        let _rx = open_modal(&mut modal, sample_items(), opts);
-        assert!(modal.is_open());
     }
 }

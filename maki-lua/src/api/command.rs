@@ -96,11 +96,13 @@ pub struct SelectItem {
 pub struct SelectOpts {
     pub title: String,
     pub has_on_delete: bool,
+    pub footer: Vec<(String, String)>,
 }
 
 pub enum SelectEvent {
     Choice { index: usize },
     Delete { index: usize },
+    OpenEditor { index: usize },
     Close,
 }
 

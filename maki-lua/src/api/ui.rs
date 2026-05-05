@@ -88,6 +88,20 @@ pub(crate) fn create_ui_table(
                     let title: String = opts_tbl.get("title").unwrap_or_default();
                     let has_on_delete: bool = opts_tbl.get("on_delete").unwrap_or(false);
 
+                    let footer: Vec<(String, String)> =
+                        if let Ok(footer_tbl) = opts_tbl.get::<Table>("footer") {
+                            let mut pairs = Vec::new();
+                            for entry in footer_tbl.sequence_values::<Table>() {
+                                let entry = entry?;
+                                let key: String = entry.get(1)?;
+                                let desc: String = entry.get(2)?;
+                                pairs.push((key, desc));
+                            }
+                            pairs
+                        } else {
+                            Vec::new()
+                        };
+
                     let (reply_tx, reply_rx) = flume::bounded::<SelectEvent>(1);
                     if tx
                         .try_send(UiAction::Select {
@@ -95,6 +109,7 @@ pub(crate) fn create_ui_table(
                             opts: SelectOpts {
                                 title,
                                 has_on_delete,
+                                footer,
                             },
                             reply_tx,
                         })
@@ -116,6 +131,10 @@ pub(crate) fn create_ui_table(
                         }
                         SelectEvent::Delete { index } => {
                             result.set("type", "delete")?;
+                            result.set("index", index + 1)?;
+                        }
+                        SelectEvent::OpenEditor { index } => {
+                            result.set("type", "open_editor")?;
                             result.set("index", index + 1)?;
                         }
                         SelectEvent::Close => {
