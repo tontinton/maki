@@ -75,7 +75,7 @@ impl ProviderKind {
             Self::Copilot => {
                 "https://api.githubcopilot.com (or GraphQL-discovered Copilot API endpoint)"
             }
-            Self::Ollama => "http://localhost:11434/v1",
+            Self::Ollama => "http://localhost:11434",
             Self::Mistral => "https://api.mistral.ai/v1",
             Self::Zai => "https://api.z.ai/api/paas/v4",
             Self::ZaiCodingPlan => "https://api.z.ai/api/coding/paas/v4",

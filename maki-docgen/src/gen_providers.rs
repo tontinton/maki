@@ -255,7 +255,7 @@ fn write_section(out: &mut String, section: &ProviderSection) {
     if section.entries.is_empty() {
         let _ = writeln!(
             out,
-            "This provider talks the OpenAI-compatible `/v1` API, so it also works with llama.cpp's server, LocalAI, or anything else that speaks the same protocol. Just point `OLLAMA_HOST` to the right address (e.g. `http://localhost:8080` for llama.cpp).\n"
+            "This provider talks Ollama's native `/api/chat` (NDJSON streaming) and `/api/tags` endpoints. Point `OLLAMA_HOST` at any Ollama-compatible server, or set `OLLAMA_API_KEY` (with no host) to use Ollama Cloud.\n"
         );
         let _ = writeln!(
             out,
