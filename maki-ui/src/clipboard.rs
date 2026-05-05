@@ -48,17 +48,18 @@ impl ClipboardState {
 
         #[cfg(target_os = "linux")]
         {
-            clipboard
+            let primary = clipboard
                 .set()
                 .clipboard(LinuxClipboardKind::Primary)
-                .text(text)
-                .and_then(|()| {
-                    clipboard
-                        .set()
-                        .clipboard(LinuxClipboardKind::Clipboard)
-                        .text(text)
-                })
-                .map_err(|e| e.to_string())
+                .text(text);
+            let system = clipboard
+                .set()
+                .clipboard(LinuxClipboardKind::Clipboard)
+                .text(text);
+            match (primary, system) {
+                (_, Ok(())) | (Ok(()), _) => Ok(()),
+                (Err(p), Err(s)) => Err(format!("primary: {p}; clipboard: {s}")),
+            }
         }
 
         #[cfg(not(target_os = "linux"))]
@@ -132,22 +133,20 @@ mod tests {
     }
 
     #[test]
-    fn each_backend_receives_the_input_text_verbatim() {
-        // Force native to fail so osc52 also runs; capture what each got.
-        let native_input = Cell::new(String::new());
-        let osc52_input = Cell::new(String::new());
-        let _ = ClipboardState::copy_text_impl(
-            "the payload",
-            |t| {
-                native_input.set(t.to_string());
-                Err("fail".into())
-            },
-            |t| {
-                osc52_input.set(t.to_string());
+    fn whitespace_only_text_is_not_noop() {
+        let native_called = Cell::new(false);
+        let result = ClipboardState::copy_text_impl(
+            "   \n\t",
+            |_| {
+                native_called.set(true);
                 Ok(())
             },
+            |_| Ok(()),
         );
-        assert_eq!(native_input.take(), "the payload");
-        assert_eq!(osc52_input.take(), "the payload");
+        assert!(matches!(result, Ok(CopyResult::Copied)));
+        assert!(
+            native_called.get(),
+            "whitespace-only text must still be copied"
+        );
     }
 }

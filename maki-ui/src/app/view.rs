@@ -297,7 +297,7 @@ impl App {
             if self
                 .selection_state
                 .as_ref()
-                .is_some_and(|s| s.sel.zone == SelectionZone::Overlay)
+                .is_some_and(|s| s.sel().zone == SelectionZone::Overlay)
             {
                 self.selection_state = None;
             }
@@ -309,16 +309,17 @@ impl App {
             return;
         };
 
-        let zone = state.sel.zone;
+        let sel = state.sel();
+        let zone = sel.zone;
         let scroll = self.scroll_offset(zone);
-        if let Some(screen_sel) = state.sel.to_screen(scroll) {
+        if let Some(screen_sel) = sel.to_screen(scroll) {
             let highlight_area = self.zones[zone.idx()]
                 .map(|z| z.highlight_area)
                 .unwrap_or_default();
             selection::apply_highlight(frame.buffer_mut(), highlight_area, &screen_sel);
         }
-        if state.copy_on_release {
-            let sel = state.sel;
+        if state.is_pending_copy() {
+            let sel = *sel;
             self.copy_selection(frame.buffer_mut(), &sel, render_chat);
         }
     }

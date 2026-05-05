@@ -4,7 +4,7 @@ use crate::chat::{CANCELLED_TEXT, DONE_TEXT, ERROR_TEXT};
 use crate::components::command::ParsedCommand;
 use crate::components::keybindings::{KeybindContext, key as kb};
 use crate::components::{ExitRequest, key, test_model};
-use crate::selection::{EdgeScroll, SelectableZone, SelectionZone};
+use crate::selection::{EdgeScroll, SelectableZone, SelectionState, SelectionZone};
 use arc_swap::ArcSwap;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use maki_agent::permissions::PermissionManager;
@@ -900,7 +900,7 @@ fn mouse_drag_updates_selection() {
     app.update(mouse_event(MouseEventKind::Drag(MouseButton::Left), 20, 10));
 
     let state = app.selection_state.as_ref().unwrap();
-    let (_, end) = state.sel.normalized();
+    let (_, end) = state.sel().normalized();
     assert_eq!(end.row, 10);
     assert_eq!(end.col, 20);
 }
@@ -919,11 +919,11 @@ fn mouse_drag_clamps_to_area() {
     ));
 
     let state = app.selection_state.as_ref().unwrap();
-    let (_, end) = state.sel.normalized();
+    let (_, end) = state.sel().normalized();
     assert_eq!(end.col, 79);
     assert_eq!(end.row, 19, "clamped to area bottom");
     assert!(
-        state.edge_scroll.is_some(),
+        app.selection_state.as_ref().unwrap().is_edge_scrolling(),
         "outside area triggers edge scroll"
     );
 }
@@ -948,7 +948,11 @@ fn edge_scroll_direction(zone: Rect, down: (u16, u16), drag: (u16, u16), expecte
     ));
 
     let state = app.selection_state.as_ref().unwrap();
-    assert_eq!(state.edge_scroll.as_ref().map(|es| es.dir), expected);
+    let edge_dir = match state {
+        SelectionState::Dragging { edge_scroll, .. } => edge_scroll.as_ref().map(|es| es.dir),
+        _ => None,
+    };
+    assert_eq!(edge_dir, expected);
 }
 
 #[test]
@@ -959,11 +963,11 @@ fn mouse_up_clears_edge_scroll() {
 
     app.update(mouse_event(MouseEventKind::Down(MouseButton::Left), 10, 10));
     app.update(mouse_event(MouseEventKind::Drag(MouseButton::Left), 10, 1));
-    assert!(app.selection_state.as_ref().unwrap().edge_scroll.is_some());
+    assert!(app.selection_state.as_ref().unwrap().is_edge_scrolling());
 
     app.update(mouse_event(MouseEventKind::Up(MouseButton::Left), 10, 1));
     let state = app.selection_state.as_ref().unwrap();
-    assert!(state.edge_scroll.is_none());
+    assert!(state.is_pending_copy());
 }
 
 #[test]
@@ -1031,11 +1035,12 @@ fn edge_scroll_makes_app_animating() {
     assert!(!app.is_animating());
     set_zone(&mut app, SelectionZone::Messages, Rect::new(0, 0, 80, 20));
     app.update(mouse_event(MouseEventKind::Down(MouseButton::Left), 5, 5));
-    let state = app.selection_state.as_mut().unwrap();
-    state.edge_scroll = Some(EdgeScroll {
-        dir: 1,
-        last_tick: Instant::now(),
-    });
+    if let Some(SelectionState::Dragging { edge_scroll, .. }) = app.selection_state.as_mut() {
+        *edge_scroll = Some(EdgeScroll {
+            dir: 1,
+            last_tick: Instant::now(),
+        });
+    }
     assert!(app.is_animating());
 }
 
@@ -1048,11 +1053,10 @@ fn mouse_up_behavior() {
     app.update(mouse_event(MouseEventKind::Drag(MouseButton::Left), 10, 10));
     app.update(mouse_event(MouseEventKind::Up(MouseButton::Left), 10, 10));
     assert!(
-        app.selection_state.as_ref().unwrap().copy_on_release,
-        "non-empty selection sets copy flag"
+        app.selection_state.as_ref().unwrap().is_pending_copy(),
+        "non-empty selection transitions to PendingCopy"
     );
 
-    app.selection_state.as_mut().unwrap().copy_on_release = false;
     app.selection_state = None;
     app.update(mouse_event(MouseEventKind::Down(MouseButton::Left), 5, 5));
     app.update(mouse_event(MouseEventKind::Up(MouseButton::Left), 5, 5));
@@ -1075,6 +1079,170 @@ fn key_and_scroll_clear_selection() {
         delta: 3,
     });
     assert!(app.selection_state.is_none(), "scroll clears selection");
+}
+
+#[test]
+fn key_and_scroll_preserve_pending_copy() {
+    let mut app = test_app();
+    set_zone(&mut app, SelectionZone::Messages, Rect::new(0, 0, 80, 20));
+
+    app.update(mouse_event(MouseEventKind::Down(MouseButton::Left), 5, 5));
+    app.update(mouse_event(MouseEventKind::Drag(MouseButton::Left), 10, 10));
+    app.update(mouse_event(MouseEventKind::Up(MouseButton::Left), 10, 10));
+    assert!(app.selection_state.as_ref().unwrap().is_pending_copy());
+
+    app.update(Msg::Key(key(KeyCode::Char('a'))));
+    assert!(
+        app.selection_state.as_ref().unwrap().is_pending_copy(),
+        "key press must not clear pending copy"
+    );
+
+    app.update(Msg::Scroll {
+        column: 10,
+        row: 10,
+        delta: 3,
+    });
+    assert!(
+        app.selection_state.as_ref().unwrap().is_pending_copy(),
+        "scroll must not clear pending copy"
+    );
+}
+
+#[test]
+fn new_mouse_down_replaces_pending_copy_with_dragging() {
+    let mut app = test_app();
+    set_zone(&mut app, SelectionZone::Messages, Rect::new(0, 0, 80, 20));
+
+    app.update(mouse_event(MouseEventKind::Down(MouseButton::Left), 5, 5));
+    app.update(mouse_event(MouseEventKind::Drag(MouseButton::Left), 10, 10));
+    app.update(mouse_event(MouseEventKind::Up(MouseButton::Left), 10, 10));
+    assert!(app.selection_state.as_ref().unwrap().is_pending_copy());
+
+    app.update(mouse_event(MouseEventKind::Down(MouseButton::Left), 15, 15));
+    let state = app.selection_state.as_ref().unwrap();
+    assert!(
+        matches!(state, SelectionState::Dragging { .. }),
+        "new mouse-down must transition PendingCopy back to Dragging"
+    );
+}
+
+#[test]
+fn drag_on_pending_copy_is_noop() {
+    let mut app = test_app();
+    set_zone(&mut app, SelectionZone::Messages, Rect::new(0, 0, 80, 20));
+
+    app.update(mouse_event(MouseEventKind::Down(MouseButton::Left), 5, 5));
+    app.update(mouse_event(MouseEventKind::Drag(MouseButton::Left), 10, 10));
+    app.update(mouse_event(MouseEventKind::Up(MouseButton::Left), 10, 10));
+    assert!(app.selection_state.as_ref().unwrap().is_pending_copy());
+
+    let sel_before = *app.selection_state.as_ref().unwrap().sel();
+    app.update(mouse_event(MouseEventKind::Drag(MouseButton::Left), 50, 50));
+    assert!(
+        app.selection_state.as_ref().unwrap().is_pending_copy(),
+        "drag event must not change PendingCopy state"
+    );
+    let sel_after = *app.selection_state.as_ref().unwrap().sel();
+    assert_eq!(sel_before.normalized(), sel_after.normalized());
+}
+
+#[test]
+fn tick_edge_scroll_noop_on_pending_copy() {
+    let mut app = test_app();
+    set_zone(&mut app, SelectionZone::Messages, Rect::new(0, 0, 80, 20));
+
+    app.update(mouse_event(MouseEventKind::Down(MouseButton::Left), 5, 5));
+    app.update(mouse_event(MouseEventKind::Drag(MouseButton::Left), 10, 10));
+    app.update(mouse_event(MouseEventKind::Up(MouseButton::Left), 10, 10));
+    assert!(app.selection_state.as_ref().unwrap().is_pending_copy());
+
+    app.tick_edge_scroll();
+    assert!(
+        app.selection_state.as_ref().unwrap().is_pending_copy(),
+        "tick_edge_scroll must not alter PendingCopy"
+    );
+}
+
+#[test]
+fn pending_copy_not_animating() {
+    let mut app = test_app();
+    set_zone(&mut app, SelectionZone::Messages, Rect::new(0, 0, 80, 20));
+    app.run_id = 1;
+    app.update(agent_msg(AgentEvent::TextDelta { text: "x".into() }));
+    app.update(agent_msg(AgentEvent::Done {
+        usage: TokenUsage::default(),
+        num_turns: 1,
+        stop_reason: None,
+    }));
+
+    app.update(mouse_event(MouseEventKind::Down(MouseButton::Left), 5, 5));
+    app.update(mouse_event(MouseEventKind::Drag(MouseButton::Left), 10, 10));
+    app.update(mouse_event(MouseEventKind::Up(MouseButton::Left), 10, 10));
+    assert!(app.selection_state.as_ref().unwrap().is_pending_copy());
+    assert!(
+        !app.is_animating(),
+        "PendingCopy should not keep the app animating"
+    );
+}
+
+#[test]
+fn edge_scroll_direction_switches_on_drag_reversal() {
+    let mut app = test_app();
+    let zone = Rect::new(0, 5, 80, 10);
+    set_zone(&mut app, SelectionZone::Messages, zone);
+    app.active_chat().scroll_to_top();
+
+    app.update(mouse_event(MouseEventKind::Down(MouseButton::Left), 10, 8));
+    app.update(mouse_event(MouseEventKind::Drag(MouseButton::Left), 10, 4));
+
+    if let Some(SelectionState::Dragging { edge_scroll, .. }) = &app.selection_state {
+        assert!(
+            edge_scroll.as_ref().unwrap().dir > 0,
+            "scrolling up (positive dir)"
+        );
+    } else {
+        panic!("expected Dragging");
+    }
+
+    app.update(mouse_event(MouseEventKind::Drag(MouseButton::Left), 10, 16));
+    if let Some(SelectionState::Dragging { edge_scroll, .. }) = &app.selection_state {
+        assert!(
+            edge_scroll.as_ref().unwrap().dir < 0,
+            "scrolling down after reversal"
+        );
+    } else {
+        panic!("expected Dragging");
+    }
+}
+
+#[test]
+fn drag_back_into_area_clears_edge_scroll() {
+    let mut app = test_app();
+    let zone = Rect::new(0, 5, 80, 10);
+    set_zone(&mut app, SelectionZone::Messages, zone);
+    app.active_chat().scroll_to_top();
+
+    app.update(mouse_event(MouseEventKind::Down(MouseButton::Left), 10, 8));
+    app.update(mouse_event(MouseEventKind::Drag(MouseButton::Left), 10, 4));
+    assert!(app.selection_state.as_ref().unwrap().is_edge_scrolling());
+
+    app.update(mouse_event(MouseEventKind::Drag(MouseButton::Left), 10, 10));
+    assert!(
+        !app.selection_state.as_ref().unwrap().is_edge_scrolling(),
+        "dragging back into area must stop edge scroll"
+    );
+}
+
+#[test]
+fn mouse_down_outside_all_zones_ignored() {
+    let mut app = test_app();
+    set_zone(&mut app, SelectionZone::Messages, Rect::new(0, 0, 40, 10));
+
+    app.update(mouse_event(MouseEventKind::Down(MouseButton::Left), 50, 15));
+    assert!(
+        app.selection_state.is_none(),
+        "click outside zones must not create selection"
+    );
 }
 
 #[test]
@@ -1280,8 +1448,8 @@ fn mouse_down_in_input_creates_input_zone_selection() {
 
     app.update(mouse_event(MouseEventKind::Down(MouseButton::Left), 10, 16));
     let state = app.selection_state.as_ref().unwrap();
-    assert_eq!(state.sel.zone, SelectionZone::Input);
-    assert_eq!(state.sel.area, input);
+    assert_eq!(state.sel().zone, SelectionZone::Input);
+    assert_eq!(state.sel().area, input);
 }
 
 #[test]
@@ -1789,7 +1957,7 @@ fn overlay_zone_click_gating() {
 
     app.update(mouse_event(MouseEventKind::Down(MouseButton::Left), 20, 5));
     let state = app.selection_state.as_ref().unwrap();
-    assert_eq!(state.sel.zone, SelectionZone::Overlay);
+    assert_eq!(state.sel().zone, SelectionZone::Overlay);
 }
 
 fn streaming_app_with_history() -> App {

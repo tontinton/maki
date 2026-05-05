@@ -1,26 +1,23 @@
 //! Mouse selection + clipboard copy.
 //!
-//! We call `EnableMouseCapture` for scroll events, which kills the terminal's
-//! native text selection. This module reimplements it.
+//! Enabling mouse capture (for scroll) kills the terminal's native text
+//! selection, so we reimplement it here. A few things that are easy to get
+//! wrong:
 //!
-//! Key design decisions:
+//! Positions are stored in doc space (`DocPos`), not screen space, because
+//! screen coords go stale the moment the user scrolls.
 //!
-//! - Selection stores positions in doc space (`DocPos`), not screen space.
-//!   Screen positions go stale on scroll; doc positions don't.
+//! Copy runs inside `view()`, not on mouse-up. The terminal buffer only
+//! holds valid cell data during rendering, so that is the only moment we
+//! can scrape the text. Code bar prefixes (`│ `) are stripped during
+//! scraping so you get clean source.
 //!
-//! - Copy happens inside `view()`, not on mouse-up. The terminal buffer only
-//!   has valid cell data during rendering.
+//! While a selection is active, `has_selection` freezes auto-scroll in the
+//! messages panel so the viewport stays put while the user drags.
 //!
-//! - All selections extract from the rendered buffer via cell scraping.
-//!   Code block `| ` prefixes are stripped. Truncated content stays truncated.
-//!
-//! - `has_selection` freezes auto-scroll in `MessagesPanel::view()` so the
-//!   viewport doesn't jump while the user is dragging.
-//!
-//! - Content is rendered 1 column narrower than the area to reserve space for
-//!   the scrollbar. `highlight_area` and `msg_area()` reflect this content
-//!   width. `apply_highlight` and `append_rows` use `area.width - 1` for the
-//!   rightmost content column index.
+//! The rightmost column of each area is reserved for the scrollbar, so
+//! `highlight_area` / `msg_area()` are 1 column narrower than the full
+//! area and all column math uses `width - 1`.
 
 use std::cmp::Ordering;
 use std::time::Instant;
@@ -208,14 +205,39 @@ pub struct EdgeScroll {
     pub last_tick: Instant,
 }
 
-/// `copy_on_release`: set on mouse-up, consumed in next `view()`. We can't
-/// copy on mouse-up because the terminal buffer is only valid during rendering.
-/// `last_drag_col`: remembered for edge-scroll ticks that lack mouse coords.
-pub struct SelectionState {
-    pub sel: Selection,
-    pub copy_on_release: bool,
-    pub edge_scroll: Option<EdgeScroll>,
-    pub last_drag_col: u16,
+/// Two-phase lifecycle: `Dragging` while the mouse is held, then
+/// `PendingCopy` on release so the next `view()` can scrape the buffer.
+pub enum SelectionState {
+    Dragging {
+        sel: Selection,
+        edge_scroll: Option<EdgeScroll>,
+        last_drag_col: u16,
+    },
+    PendingCopy {
+        sel: Selection,
+    },
+}
+
+impl SelectionState {
+    pub fn sel(&self) -> &Selection {
+        match self {
+            Self::Dragging { sel, .. } | Self::PendingCopy { sel } => sel,
+        }
+    }
+
+    pub fn is_pending_copy(&self) -> bool {
+        matches!(self, Self::PendingCopy { .. })
+    }
+
+    pub fn is_edge_scrolling(&self) -> bool {
+        matches!(
+            self,
+            Self::Dragging {
+                edge_scroll: Some(_),
+                ..
+            }
+        )
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -279,8 +301,8 @@ fn is_code_wrap_continuation(line: &Line<'_>) -> bool {
         .is_some_and(|s| s.content.as_ref() == CODE_BAR_WRAP)
 }
 
-/// Screen region + optional raw source text for copy. If `raw_text` is
-/// non-empty and the region is fully selected, raw text is used as-is.
+/// When `raw_text` is set and the region is fully selected we use the
+/// source text verbatim instead of scraping cells.
 #[derive(Default)]
 pub struct ContentRegion<'a> {
     pub area: Rect,
@@ -342,7 +364,7 @@ pub(crate) fn col_range(ss: &ScreenSelection, left: u16, right: u16, row: u16) -
     (col_start, col_end)
 }
 
-/// Flips `REVERSED` on selected cells. Skips last column (scrollbar).
+/// Last column is the scrollbar, so we skip it.
 pub fn apply_highlight(buf: &mut Buffer, area: Rect, ss: &ScreenSelection) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -382,8 +404,8 @@ pub(crate) fn strip_code_bar_prefix(
     prefix_len
 }
 
-/// Trailing whitespace trimmed per line; consecutive trailing blank lines
-/// collapsed via `pending_newlines`.
+/// Trailing whitespace is trimmed per line. Consecutive blank lines are
+/// collapsed so we don't emit a wall of empty newlines.
 pub(crate) fn append_rows(
     buf: &Buffer,
     area: Rect,
@@ -443,7 +465,7 @@ pub(crate) fn append_rows(
     }
 }
 
-/// Regions searched in reverse (overlays win). Uncovered rows skipped.
+/// Searched in reverse so overlays win over what is behind them.
 pub fn extract_selected_text(
     buf: &Buffer,
     ss: &ScreenSelection,
@@ -675,6 +697,11 @@ mod tests {
     #[test_case(doc(5,3),  doc(12,8),  Rect::new(0,0,80,10),  0, Some(ss(5,3,9,79))     ; "cursor_below_area")]
     #[test_case(doc(12,5), doc(3,2),   Rect::new(0,0,80,10),  0, Some(ss(3,2,9,79))     ; "backward_from_below")]
     #[test_case(doc(58,5), doc(55,3),  Rect::new(0,2,80,20), 50, Some(ss(7,3,10,5))     ; "edge_scroll_reversal")]
+    #[test_case(doc(9,0),  doc(9,5),   Rect::new(0,0,80,10),  0, Some(ss(9,0,9,5))      ; "at_viewport_bottom")]
+    #[test_case(doc(9,0),  doc(9,5),   Rect::new(0,0,80,10), 10, None                   ; "scrolled_past_bottom")]
+    #[test_case(doc(3,10), doc(12,50), Rect::new(0,0,80,10),  5, Some(ss(0,0,7,50))     ; "start_above_viewport")]
+    #[test_case(doc(2,5),  doc(25,70), Rect::new(0,0,80,10),  5, Some(ss(0,0,9,79))     ; "both_ends_outside")]
+    #[test_case(doc(0,8),  doc(5,20),  Rect::new(5,3,40,10),  0, Some(ss(3,8,8,20))     ; "nonzero_area_offset")]
     fn to_screen_cases(
         anchor: DocPos,
         cursor: DocPos,
@@ -873,5 +900,109 @@ mod tests {
         };
         let text = extract_selected_text(&buf, &ss(0, 0, 1, 19), &[region]);
         assert_eq!(text, "long_variable_name_here");
+    }
+
+    #[test]
+    fn selection_empty_until_updated() {
+        let area = Rect::new(0, 0, 80, 20);
+        let mut sel = Selection::start(5, 10, area, SelectionZone::Messages, 0);
+        assert!(sel.is_empty());
+        sel.update(6, 10, 0);
+        assert!(!sel.is_empty());
+    }
+
+    #[test]
+    fn selection_start_col_clamped() {
+        let area = Rect::new(10, 5, 40, 20);
+        let right = Selection::start(8, 200, area, SelectionZone::Messages, 0);
+        assert_eq!(right.normalized().0.col, 49, "clamped to area right edge");
+        let left = Selection::start(8, 0, area, SelectionZone::Messages, 0);
+        assert_eq!(left.normalized().0.col, 10, "clamped to area left edge");
+    }
+
+    #[test]
+    fn covers_rect_empty_area() {
+        let sel = ss(0, 0, 10, 10);
+        assert!(!sel.covers_rect(Rect::new(0, 0, 0, 5)));
+        assert!(!sel.covers_rect(Rect::new(0, 0, 5, 0)));
+        assert!(!sel.covers_rect(Rect::ZERO));
+    }
+
+    #[test]
+    fn line_breaks_bitmap_zero_height_ignored() {
+        let lb = LineBreaks::from_heights([1, 0, 0, 1].iter().copied());
+        assert!(lb.is_line_start(0));
+        assert!(lb.is_line_start(1));
+        assert!(!lb.is_line_start(2));
+    }
+
+    #[test]
+    fn line_breaks_empty_iterator() {
+        let lb = LineBreaks::from_heights(std::iter::empty());
+        assert!(matches!(lb, LineBreaks::Bitmap(ref v) if v.is_empty()));
+    }
+
+    #[test]
+    fn line_breaks_bitmap_query_beyond_stored_bits() {
+        let lb = LineBreaks::from_heights([1].iter().copied());
+        assert!(!lb.is_line_start(100));
+    }
+
+    #[test]
+    fn extract_trailing_blank_lines_collapsed() {
+        let area = Rect::new(0, 0, 10, 4);
+        let mut buf = Buffer::empty(area);
+        buf.set_string(0, 0, "Line A    ", Style::default());
+        buf.set_string(0, 1, "          ", Style::default());
+        buf.set_string(0, 2, "          ", Style::default());
+        buf.set_string(0, 3, "Line D    ", Style::default());
+        let region = ContentRegion {
+            area,
+            ..Default::default()
+        };
+        let text = extract_selected_text(&buf, &ss(0, 0, 3, 9), &[region]);
+        assert_eq!(
+            text, "Line A\n\n\nLine D",
+            "two blank rows produce two pending newlines"
+        );
+    }
+
+    #[test]
+    fn extract_single_cell_selection() {
+        let (buf, area) = test_buffer();
+        let region = ContentRegion {
+            area,
+            ..Default::default()
+        };
+        let text = extract_selected_text(&buf, &ss(0, 0, 0, 0), &[region]);
+        assert_eq!(text, "H");
+    }
+
+    #[test]
+    fn col_range_single_row_selection() {
+        let sel = ss(5, 10, 5, 20);
+        let (start, end) = col_range(&sel, 0, 79, 5);
+        assert_eq!(start, 10);
+        assert_eq!(end, 20);
+    }
+
+    #[test]
+    fn col_range_mid_row_full_width() {
+        let sel = ss(3, 10, 7, 50);
+        let (start, end) = col_range(&sel, 0, 79, 5);
+        assert_eq!(start, 0, "mid row gets full left");
+        assert_eq!(end, 79, "mid row gets full right");
+    }
+
+    #[test]
+    fn zone_at_returns_none_when_outside() {
+        let mut zones: ZoneRegistry = [None; SelectionZone::COUNT];
+        assert!(zone_at(&zones, 10, 10).is_none(), "no zones registered");
+        zones[SelectionZone::Messages.idx()] = Some(SelectableZone {
+            area: Rect::new(0, 0, 80, 20),
+            highlight_area: Rect::new(0, 0, 80, 20),
+            zone: SelectionZone::Messages,
+        });
+        assert!(zone_at(&zones, 25, 10).is_none(), "outside all zones");
     }
 }

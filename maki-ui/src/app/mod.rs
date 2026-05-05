@@ -272,6 +272,16 @@ impl App {
         &mut self.chats[self.active_chat]
     }
 
+    fn clear_selection_unless_pending_copy(&mut self) {
+        if !self
+            .selection_state
+            .as_ref()
+            .is_some_and(|s| s.is_pending_copy())
+        {
+            self.selection_state = None;
+        }
+    }
+
     pub fn update(&mut self, msg: Msg) -> Vec<Action> {
         match msg {
             Msg::Key(key) => self.handle_key(key),
@@ -295,7 +305,7 @@ impl App {
                 vec![]
             }
             Msg::Scroll { column, row, delta } => {
-                self.selection_state = None;
+                self.clear_selection_unless_pending_copy();
                 self.handle_scroll(column, row, delta);
                 vec![]
             }
@@ -478,7 +488,7 @@ impl App {
             }
         }
 
-        self.selection_state = None;
+        self.clear_selection_unless_pending_copy();
 
         if self.help_modal.is_open() {
             self.help_modal.handle_key(key);
@@ -1295,7 +1305,7 @@ impl App {
             || self
                 .selection_state
                 .as_ref()
-                .is_some_and(|s| s.edge_scroll.is_some())
+                .is_some_and(|s| s.is_edge_scrolling())
             || self.chats.iter().any(|c| c.is_animating())
     }
 

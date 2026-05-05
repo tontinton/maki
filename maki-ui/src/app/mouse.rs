@@ -2,7 +2,9 @@ use std::time::{Duration, Instant};
 
 use crate::clipboard::CopyResult;
 use crate::components::messages::ClickResult;
-use crate::selection::{self, ContentRegion, EdgeScroll, SelectableZone, Selection, SelectionZone};
+use crate::selection::{
+    self, ContentRegion, EdgeScroll, SelectableZone, Selection, SelectionState, SelectionZone,
+};
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
@@ -20,7 +22,7 @@ impl App {
                         return;
                     }
                     let scroll = self.scroll_offset(zone.zone);
-                    self.selection_state = Some(crate::selection::SelectionState {
+                    self.selection_state = Some(SelectionState::Dragging {
                         sel: Selection::start(
                             event.row,
                             event.column,
@@ -28,7 +30,6 @@ impl App {
                             zone.zone,
                             scroll,
                         ),
-                        copy_on_release: false,
                         edge_scroll: None,
                         last_drag_col: event.column,
                     });
@@ -38,12 +39,11 @@ impl App {
                 self.handle_drag(event.row, event.column);
             }
             MouseEventKind::Up(MouseButton::Left) => {
-                if let Some(ref mut state) = self.selection_state {
-                    state.edge_scroll = None;
-                    if !state.sel.is_empty() {
-                        state.copy_on_release = true;
+                if let Some(SelectionState::Dragging { sel, .. }) = self.selection_state {
+                    if !sel.is_empty() {
+                        self.selection_state = Some(SelectionState::PendingCopy { sel });
                     } else {
-                        let zone = state.sel.zone;
+                        let zone = sel.zone;
                         self.selection_state = None;
                         if zone == SelectionZone::Messages {
                             let area = self.msg_area();
@@ -65,12 +65,17 @@ impl App {
     }
 
     fn handle_drag(&mut self, row: u16, col: u16) {
-        let Some(ref mut state) = self.selection_state else {
-            return;
+        let (zone, area) = match self.selection_state {
+            Some(SelectionState::Dragging {
+                ref sel,
+                ref mut last_drag_col,
+                ..
+            }) => {
+                *last_drag_col = col;
+                (sel.zone, sel.area)
+            }
+            _ => return,
         };
-        let zone = state.sel.zone;
-        let area = state.sel.area;
-        state.last_drag_col = col;
 
         let at_top = row <= area.y;
         let at_bottom = row + 1 >= area.bottom();
@@ -81,56 +86,78 @@ impl App {
             } else {
                 -EDGE_SCROLL_LINES
             };
-            let first_edge_hit = state.edge_scroll.is_none();
-            if let Some(ref mut es) = state.edge_scroll {
-                es.dir = dir;
+            let first_edge_hit = if let Some(SelectionState::Dragging { edge_scroll, .. }) =
+                &mut self.selection_state
+            {
+                let first = edge_scroll.is_none();
+                match edge_scroll {
+                    Some(es) => es.dir = dir,
+                    None => {
+                        *edge_scroll = Some(EdgeScroll {
+                            dir,
+                            last_tick: Instant::now(),
+                        });
+                    }
+                }
+                first
             } else {
-                state.edge_scroll = Some(EdgeScroll {
-                    dir,
-                    last_tick: Instant::now(),
-                });
-            }
+                false
+            };
             if first_edge_hit {
                 self.scroll_zone(zone, dir);
             }
             self.update_selection_to_edge(zone, col);
         } else {
-            let state = self.selection_state.as_mut().expect("checked above");
-            state.edge_scroll = None;
+            if let Some(SelectionState::Dragging { edge_scroll, .. }) = &mut self.selection_state {
+                *edge_scroll = None;
+            }
             let scroll = self.scroll_offset(zone);
-            let state = self.selection_state.as_mut().expect("checked above");
-            state.sel.update(row, col, scroll);
+            if let Some(SelectionState::Dragging { sel, .. }) = &mut self.selection_state {
+                sel.update(row, col, scroll);
+            }
         }
     }
 
     fn update_selection_to_edge(&mut self, zone: SelectionZone, col: u16) {
         let scroll = self.scroll_offset(zone);
-        let state = self.selection_state.as_mut().expect("caller ensures Some");
-        let edge_row = if state.edge_scroll.as_ref().is_some_and(|es| es.dir > 0) {
-            state.sel.area.y
-        } else {
-            state.sel.area.bottom().saturating_sub(1)
+        let Some(SelectionState::Dragging {
+            ref mut sel,
+            ref edge_scroll,
+            ..
+        }) = self.selection_state
+        else {
+            return;
         };
-        state.sel.update(edge_row, col, scroll);
+        let edge_row = if edge_scroll.as_ref().is_some_and(|es| es.dir > 0) {
+            sel.area.y
+        } else {
+            sel.area.bottom().saturating_sub(1)
+        };
+        sel.update(edge_row, col, scroll);
     }
 
     pub fn tick_edge_scroll(&mut self) {
-        let Some(ref mut state) = self.selection_state else {
-            return;
+        let (dir, zone, col) = match self.selection_state {
+            Some(SelectionState::Dragging {
+                ref sel,
+                ref mut edge_scroll,
+                last_drag_col,
+            }) => {
+                let Some(es) = edge_scroll else {
+                    return;
+                };
+                if es.last_tick.elapsed() < EDGE_SCROLL_INTERVAL {
+                    return;
+                }
+                let dir = es.dir;
+                es.last_tick = Instant::now();
+                (dir, sel.zone, last_drag_col)
+            }
+            _ => return,
         };
-        let Some(ref mut es) = state.edge_scroll else {
-            return;
-        };
-        if es.last_tick.elapsed() < EDGE_SCROLL_INTERVAL {
-            return;
-        }
-        let dir = es.dir;
-        let zone = state.sel.zone;
-        let last_drag_col = state.last_drag_col;
-        es.last_tick = Instant::now();
 
         self.scroll_zone(zone, dir);
-        self.update_selection_to_edge(zone, last_drag_col);
+        self.update_selection_to_edge(zone, col);
     }
 
     pub(super) fn copy_selection(
