@@ -4,10 +4,11 @@ local shorten_path = require("maki.shorten_path")
 local DESCRIPTION = [[Read a file or directory. Returns contents with line numbers (1-indexed).
 
 - Supports absolute, relative, and ~/ paths.
-- Use the index tool first to locate relevant line ranges.
-- **Always include offset and limit**. Defaults: no offset = start at 1; no limit = up to 2000 lines.
+- **Always include offset and limit** if possible. Defaults: no offset = start at 1; no limit = up to 2000 lines.
+- Use the **index** tool or **grep** tool first to find the offset and limit.
+- Only read the sections you actually need.
+- Use `wc -l` to check total number of lines before reading to decide a reasonable limit unless known already.
 - Use truncation hints (e.g. "truncated lines X-Y") to continue with the correct offset.
-- For files >500 lines, always **read** with offset/limit (only what you need).
 - Do not reread the same range (same file and same offset).
 - Prefer grep to locate content instead of scanning full files.
 - Call in parallel when reading multiple files.
@@ -224,6 +225,13 @@ local function list_dir(path, ctx)
   end
   return result
 end
+
+maki.api.register_prompt_hint({
+  slot = "tool_usage",
+  content = [[
+- When using the **read** tool, only read the sections you actually need.
+- Use `wc -l` to check total number of lines before reading to decide a reasonable **read** tool limit unless known already.]],
+})
 
 maki.api.register_tool({
   name = "read",

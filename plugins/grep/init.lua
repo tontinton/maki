@@ -178,6 +178,11 @@ local function parse_llm_output(text)
   return entries
 end
 
+maki.api.register_prompt_hint({
+  slot = "tool_usage",
+  content = "- Use the **grep** tool when searching for specific content across files.",
+})
+
 maki.api.register_tool({
   name = "grep",
   kind = "search",

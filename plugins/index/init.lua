@@ -141,7 +141,7 @@ end
 
 maki.api.register_prompt_hint({
   slot = "tool_usage",
-  content = "- Use **index** before **read**.",
+  content = "- Use the **index** tool first on individual files to get their skeleton, then use the **read** tool with offset/limit for the specific section you need.",
 })
 
 maki.api.register_prompt_hint({
