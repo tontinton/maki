@@ -2,3 +2,6 @@
 __pycache__/
 runs.csv
 /.direnv/
+# pixi environments
+.pixi/*
+!.pixi/config.toml

@@ -1,0 +1,15 @@
+[workspace]
+authors = ["Tobias Hunger <tobias@prefix.dev>"]
+channels = ["conda-forge"]
+name = "maki"
+platforms = ["linux-64"]
+version = "0.1.0"
+
+[tasks]
+
+[dependencies]
+python = ">=3.14.4,<3.15"
+perl = ">=5.32.1,<5.33"
+just = ">=1.50.0,<2"
+ruff = ">=0.15.11,<0.16"
+ty = ">=0.0.34,<0.0.35"
