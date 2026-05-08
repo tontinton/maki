@@ -31,6 +31,21 @@ Maki re-reads auth from storage and environment variables each time a new agent 
 
 Defaults: claude-haiku-4-5 (weak), claude-sonnet-4-6 (medium), claude-opus-4-7 (strong)
 
+#### Amazon Bedrock
+
+If you already use Claude through AWS Bedrock, you can point Maki at it instead of the direct Anthropic API. Set `CLAUDE_CODE_USE_BEDROCK=1` and Maki will route all Anthropic requests through Bedrock. The same models, the same features, just a different door.
+
+You will need `AWS_REGION` and one of the following for auth:
+
+| Method | Env vars |
+|--------|----------|
+| IAM credentials | `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` (and optionally `AWS_SESSION_TOKEN`) |
+| Credentials file | `AWS_PROFILE` (defaults to `default`), reads `~/.aws/credentials` |
+| Bearer token | `AWS_BEARER_TOKEN_BEDROCK` |
+| Gateway proxy | `CLAUDE_CODE_SKIP_BEDROCK_AUTH=1` + `ANTHROPIC_BEDROCK_BASE_URL` (skips signing, useful behind a proxy that handles auth) |
+
+You can override the model with `ANTHROPIC_MODEL` and the endpoint with `ANTHROPIC_BEDROCK_BASE_URL`. These env var names match Claude Code, so if you were already using Bedrock there, the same setup works here.
+
 ### OpenAI
 
 - **Env var**: `OPENAI_API_KEY` (also supports OAuth device flow)

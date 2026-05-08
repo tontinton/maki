@@ -1,0 +1,752 @@
+use std::env;
+use std::ops::ControlFlow;
+use std::sync::{Arc, Mutex};
+
+use base64::Engine;
+use flume::Sender;
+use hmac::{Hmac, Mac};
+use isahc::{HttpClient, Request};
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use tracing::debug;
+
+use crate::model::Model;
+use crate::provider::{BoxFuture, Provider};
+use crate::{AgentError, Message, ProviderEvent, StreamResponse, ThinkingConfig};
+
+use super::shared;
+
+const BEDROCK_API_VERSION: &str = "bedrock-2023-05-31";
+const MIN_EVENTSTREAM_FRAME: usize = 16;
+
+fn io_error(
+    kind: std::io::ErrorKind,
+    e: impl Into<Box<dyn std::error::Error + Send + Sync>>,
+) -> AgentError {
+    AgentError::Io(std::io::Error::new(kind, e))
+}
+
+#[derive(Clone)]
+enum AuthKind {
+    SigV4 {
+        access_key: String,
+        secret_key: String,
+        session_token: Option<String>,
+    },
+    Bearer {
+        token: String,
+    },
+    None,
+}
+
+#[derive(Clone)]
+struct BedrockAuth {
+    kind: AuthKind,
+    region: String,
+}
+
+pub(crate) fn is_enabled() -> bool {
+    env::var("CLAUDE_CODE_USE_BEDROCK").is_ok_and(|v| v == "1")
+}
+
+fn resolve_bedrock_auth() -> Result<BedrockAuth, AgentError> {
+    let region = env::var("AWS_REGION").map_err(|_| AgentError::Config {
+        message: "AWS_REGION must be set when using Bedrock".into(),
+    })?;
+
+    let kind = if let Ok(token) = env::var("AWS_BEARER_TOKEN_BEDROCK") {
+        debug!("using Bedrock bearer token auth");
+        AuthKind::Bearer { token }
+    } else if env::var("CLAUDE_CODE_SKIP_BEDROCK_AUTH").is_ok_and(|v| v == "1") {
+        debug!("skipping Bedrock auth (gateway proxy mode)");
+        AuthKind::None
+    } else if let (Ok(access_key), Ok(secret_key)) = (
+        env::var("AWS_ACCESS_KEY_ID"),
+        env::var("AWS_SECRET_ACCESS_KEY"),
+    ) {
+        let session_token = env::var("AWS_SESSION_TOKEN").ok();
+        debug!("using Bedrock SigV4 auth from env vars");
+        AuthKind::SigV4 {
+            access_key,
+            secret_key,
+            session_token,
+        }
+    } else {
+        let profile = env::var("AWS_PROFILE").unwrap_or_else(|_| "default".into());
+        let creds_path = env::var("HOME")
+            .map(|h| format!("{h}/.aws/credentials"))
+            .unwrap_or_default();
+        if let Ok(content) = std::fs::read_to_string(&creds_path)
+            && let Ok((access_key, secret_key, session_token)) =
+                parse_aws_credentials_file(&content, &profile)
+        {
+            debug!(profile = %profile, "using Bedrock SigV4 auth from credentials file");
+            AuthKind::SigV4 {
+                access_key,
+                secret_key,
+                session_token,
+            }
+        } else {
+            return Err(AgentError::Config {
+                message: "no AWS credentials found: set AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, AWS_PROFILE, or AWS_BEARER_TOKEN_BEDROCK".into(),
+            });
+        }
+    };
+
+    Ok(BedrockAuth { kind, region })
+}
+
+fn parse_aws_credentials_file(
+    content: &str,
+    profile: &str,
+) -> Result<(String, String, Option<String>), AgentError> {
+    let target_section = format!("[{profile}]");
+    let mut in_section = false;
+    let mut access_key = None;
+    let mut secret_key = None;
+    let mut session_token = None;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_section = trimmed == target_section;
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        if let Some((key, value)) = trimmed.split_once('=') {
+            let key = key.trim();
+            let value = value.trim();
+            match key {
+                "aws_access_key_id" => access_key = Some(value.to_string()),
+                "aws_secret_access_key" => secret_key = Some(value.to_string()),
+                "aws_session_token" => session_token = Some(value.to_string()),
+                _ => {}
+            }
+        }
+    }
+
+    match (access_key, secret_key) {
+        (Some(ak), Some(sk)) => Ok((ak, sk, session_token)),
+        _ => Err(AgentError::Config {
+            message: format!("profile '{profile}' not found or missing keys in credentials file"),
+        }),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sign_request_sigv4(
+    method: &str,
+    url: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+    access_key: &str,
+    secret_key: &str,
+    session_token: Option<&str>,
+    region: &str,
+    service: &str,
+    timestamp: &str,
+) -> Vec<(String, String)> {
+    let date = &timestamp[..8];
+
+    let (host, path, query) = parse_url(url);
+
+    let payload_hash = hex_sha256(body);
+
+    let mut canonical_headers: Vec<(&str, String)> =
+        headers.iter().map(|(k, v)| (*k, v.to_string())).collect();
+    canonical_headers.push(("host", host.to_string()));
+    canonical_headers.push(("x-amz-date", timestamp.to_string()));
+    if let Some(tok) = session_token {
+        canonical_headers.push(("x-amz-security-token", tok.to_string()));
+    }
+    canonical_headers.sort_by(|a, b| a.0.cmp(b.0));
+
+    let canonical_headers_str: String = canonical_headers
+        .iter()
+        .map(|(k, v)| format!("{k}:{v}\n"))
+        .collect();
+
+    let signed_headers: String = canonical_headers
+        .iter()
+        .map(|(k, _)| *k)
+        .collect::<Vec<_>>()
+        .join(";");
+
+    let canonical_request = format!(
+        "{method}\n{path}\n{query}\n{canonical_headers_str}\n{signed_headers}\n{payload_hash}"
+    );
+
+    let credential_scope = format!("{date}/{region}/{service}/aws4_request");
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n{timestamp}\n{credential_scope}\n{}",
+        hex_sha256(canonical_request.as_bytes())
+    );
+
+    let signing_key = derive_signing_key(secret_key, date, region, service);
+    let signature = hex_encode(&hmac_sha256(&signing_key, string_to_sign.as_bytes()));
+
+    let authorization = format!(
+        "AWS4-HMAC-SHA256 Credential={access_key}/{credential_scope}, SignedHeaders={signed_headers}, Signature={signature}"
+    );
+
+    let mut result = vec![
+        ("Authorization".into(), authorization),
+        ("x-amz-date".into(), timestamp.into()),
+    ];
+    if let Some(tok) = session_token {
+        result.push(("x-amz-security-token".into(), tok.into()));
+    }
+    result
+}
+
+fn parse_url(url: &str) -> (&str, &str, &str) {
+    let after_scheme = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url);
+    let (host, path_and_query) = after_scheme.split_once('/').unwrap_or((after_scheme, ""));
+    let full_path = if path_and_query.is_empty() {
+        "/"
+    } else {
+        // the leading slash got split off, so we grab it back from the original url
+        let path_start = url.len() - path_and_query.len() - 1;
+        &url[path_start..]
+    };
+    let (path, query) = full_path.split_once('?').unwrap_or((full_path, ""));
+    (host, path, query)
+}
+
+fn hex_sha256(data: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    hex_encode(&hasher.finalize())
+}
+
+fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts any key length");
+    mac.update(data);
+    mac.finalize().into_bytes().to_vec()
+}
+
+fn derive_signing_key(secret_key: &str, date: &str, region: &str, service: &str) -> Vec<u8> {
+    let k_date = hmac_sha256(format!("AWS4{secret_key}").as_bytes(), date.as_bytes());
+    let k_region = hmac_sha256(&k_date, region.as_bytes());
+    let k_service = hmac_sha256(&k_region, service.as_bytes());
+    hmac_sha256(&k_service, b"aws4_request")
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
+fn decode_eventstream_frame(buf: &[u8]) -> Result<(usize, Option<Vec<u8>>), AgentError> {
+    if buf.len() < MIN_EVENTSTREAM_FRAME {
+        return Err(io_error(
+            std::io::ErrorKind::UnexpectedEof,
+            "eventstream frame too short",
+        ));
+    }
+
+    let total_len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+    let headers_len = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
+
+    if buf.len() < total_len {
+        return Err(io_error(
+            std::io::ErrorKind::UnexpectedEof,
+            "incomplete eventstream frame",
+        ));
+    }
+
+    let prelude_size = 12; // total_len(4) + headers_len(4) + prelude_crc(4)
+    let message_crc_size = 4;
+    let headers_end = prelude_size + headers_len;
+    let payload_end = total_len - message_crc_size;
+
+    let headers_bytes = &buf[prelude_size..headers_end];
+    let payload_bytes = &buf[headers_end..payload_end];
+
+    let mut event_type = None;
+    let mut exception_type = None;
+    let mut pos = 0;
+
+    while pos < headers_bytes.len() {
+        let name_len = headers_bytes[pos] as usize;
+        pos += 1;
+        if pos + name_len > headers_bytes.len() {
+            break;
+        }
+        let name = std::str::from_utf8(&headers_bytes[pos..pos + name_len]).unwrap_or("");
+        pos += name_len;
+
+        if pos >= headers_bytes.len() {
+            break;
+        }
+        let header_type = headers_bytes[pos];
+        pos += 1;
+
+        if header_type == 7 {
+            if pos + 2 > headers_bytes.len() {
+                break;
+            }
+            let value_len =
+                u16::from_be_bytes([headers_bytes[pos], headers_bytes[pos + 1]]) as usize;
+            pos += 2;
+            if pos + value_len > headers_bytes.len() {
+                break;
+            }
+            let value = std::str::from_utf8(&headers_bytes[pos..pos + value_len]).unwrap_or("");
+            pos += value_len;
+
+            match name {
+                ":event-type" => event_type = Some(value.to_string()),
+                ":exception-type" => exception_type = Some(value.to_string()),
+                _ => {}
+            }
+        } else {
+            break;
+        }
+    }
+
+    if let Some(exc) = exception_type {
+        let message = std::str::from_utf8(payload_bytes)
+            .unwrap_or("unknown error")
+            .to_string();
+        let status = match exc.as_str() {
+            "ThrottlingException" => 429,
+            "ValidationException" => 400,
+            _ => 500,
+        };
+        return Err(AgentError::Api { status, message });
+    }
+
+    let payload = if event_type.as_deref() == Some("chunk") && !payload_bytes.is_empty() {
+        Some(payload_bytes.to_vec())
+    } else {
+        None
+    };
+
+    Ok((total_len, payload))
+}
+
+pub(crate) struct Bedrock {
+    client: HttpClient,
+    auth: Arc<Mutex<BedrockAuth>>,
+    base_url: Option<String>,
+}
+
+impl Bedrock {
+    pub fn new(timeouts: super::super::Timeouts) -> Result<Self, AgentError> {
+        let auth = resolve_bedrock_auth()?;
+        let base_url = env::var("ANTHROPIC_BEDROCK_BASE_URL").ok();
+        Ok(Self {
+            client: super::super::http_client(timeouts),
+            auth: Arc::new(Mutex::new(auth)),
+            base_url,
+        })
+    }
+}
+
+impl Provider for Bedrock {
+    fn stream_message<'a>(
+        &'a self,
+        model: &'a Model,
+        messages: &'a [Message],
+        system: &'a str,
+        tools: &'a Value,
+        event_tx: &'a Sender<ProviderEvent>,
+        thinking: ThinkingConfig,
+        _session_id: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+        Box::pin(async move {
+            let auth = self.auth.lock().unwrap().clone();
+            let model_id = env::var("ANTHROPIC_MODEL").unwrap_or_else(|_| model.id.clone());
+
+            let mut body = shared::build_request_body_with_system(
+                model,
+                messages,
+                &[shared::SystemBlock {
+                    r#type: "text",
+                    text: system,
+                    cache_control: Some(shared::EPHEMERAL),
+                }],
+                tools,
+                thinking,
+            );
+            body["anthropic_version"] = json!(BEDROCK_API_VERSION);
+            let has_examples = tools
+                .as_array()
+                .is_some_and(|arr| arr.iter().any(|t| t.get("input_examples").is_some()));
+            if has_examples {
+                body["anthropic_beta"] = json!([shared::BETA_TOOL_EXAMPLES_BEDROCK]);
+            }
+
+            let encoded_model = super::super::urlenc(&model_id);
+            let url = match &self.base_url {
+                Some(base) => format!("{base}/model/{encoded_model}/invoke-with-response-stream"),
+                None => format!(
+                    "https://bedrock-runtime.{}.amazonaws.com/model/{encoded_model}/invoke-with-response-stream",
+                    auth.region
+                ),
+            };
+
+            let json_body = serde_json::to_vec(&body)?;
+
+            let (host, _, _) = parse_url(&url);
+            let host = host.to_string();
+            let extra_headers = vec![("content-type", "application/json"), ("host", &host)];
+
+            let timestamp = now_timestamp();
+            let signing_headers = match &auth.kind {
+                AuthKind::SigV4 {
+                    access_key,
+                    secret_key,
+                    session_token,
+                } => Some(sign_request_sigv4(
+                    "POST",
+                    &url,
+                    &extra_headers,
+                    &json_body,
+                    access_key,
+                    secret_key,
+                    session_token.as_deref(),
+                    &auth.region,
+                    "bedrock",
+                    &timestamp,
+                )),
+                AuthKind::Bearer { token } => {
+                    Some(vec![("Authorization".into(), format!("Bearer {token}"))])
+                }
+                AuthKind::None => None,
+            };
+
+            let mut builder = Request::builder().method("POST").uri(&url);
+            for (k, v) in &extra_headers {
+                builder = builder.header(*k, *v);
+            }
+            if let Some(ref sign_hdrs) = signing_headers {
+                for (k, v) in sign_hdrs {
+                    builder = builder.header(k.as_str(), v.as_str());
+                }
+            }
+            let request = builder.body(json_body)?;
+
+            debug!(model = %model_id, region = %auth.region, "sending Bedrock request");
+
+            let mut response = self.client.send_async(request).await?;
+            let status = response.status().as_u16();
+            if status != 200 {
+                return Err(AgentError::from_response(response).await);
+            }
+
+            let mut parser = shared::EventParser::new();
+            let mut frame_buf = Vec::new();
+            let mut read_buf = [0u8; 8192];
+
+            loop {
+                let body = response.body_mut();
+                let n = {
+                    use futures_lite::io::AsyncReadExt;
+                    body.read(&mut read_buf).await?
+                };
+                if n == 0 {
+                    break;
+                }
+                frame_buf.extend_from_slice(&read_buf[..n]);
+
+                while frame_buf.len() >= MIN_EVENTSTREAM_FRAME {
+                    let peek_total = u32::from_be_bytes([
+                        frame_buf[0],
+                        frame_buf[1],
+                        frame_buf[2],
+                        frame_buf[3],
+                    ]) as usize;
+                    if frame_buf.len() < peek_total {
+                        break;
+                    }
+
+                    let (consumed, payload) = decode_eventstream_frame(&frame_buf)?;
+                    frame_buf.drain(..consumed);
+
+                    let Some(payload) = payload else {
+                        continue;
+                    };
+
+                    let (event_type, json) = decode_event_payload(&payload)?;
+
+                    if let ControlFlow::Break(()) =
+                        parser.process(&event_type, &json, event_tx).await?
+                    {
+                        return Ok(parser.finish());
+                    }
+                }
+            }
+
+            Ok(parser.finish())
+        })
+    }
+
+    fn list_models(&self) -> BoxFuture<'_, Result<Vec<String>, AgentError>> {
+        Box::pin(async {
+            let models: Vec<String> = shared::models()
+                .iter()
+                .map(|entry| entry.prefixes[0].to_string())
+                .collect();
+            Ok(models)
+        })
+    }
+
+    fn reload_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
+        Box::pin(async {
+            let new_auth = resolve_bedrock_auth()?;
+            *self.auth.lock().unwrap() = new_auth;
+            debug!("reloaded Bedrock auth from env");
+            Ok(())
+        })
+    }
+}
+
+fn decode_event_payload(payload: &[u8]) -> Result<(String, String), AgentError> {
+    let json_str =
+        std::str::from_utf8(payload).map_err(|e| io_error(std::io::ErrorKind::InvalidData, e))?;
+    let outer: Value = serde_json::from_str(json_str)?;
+
+    let (parsed, json) = if let Some(b64) = outer.get("bytes").and_then(|b| b.as_str()) {
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .map_err(|e| io_error(std::io::ErrorKind::InvalidData, e))?;
+        let json =
+            String::from_utf8(decoded).map_err(|e| io_error(std::io::ErrorKind::InvalidData, e))?;
+        let parsed: Value = serde_json::from_str(&json)?;
+        (parsed, json)
+    } else {
+        (outer, json_str.to_string())
+    };
+
+    let event_type = parsed
+        .get("type")
+        .and_then(|t| t.as_str())
+        .unwrap_or("")
+        .to_string();
+    Ok((event_type, json))
+}
+
+fn now_timestamp() -> String {
+    use std::time::SystemTime;
+    let dur = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap();
+    let secs = dur.as_secs();
+    let days = secs / 86400;
+    let day_secs = secs % 86400;
+    let hours = day_secs / 3600;
+    let minutes = (day_secs % 3600) / 60;
+    let seconds = day_secs % 60;
+
+    let (year, month, day) = days_to_ymd(days);
+    format!("{year:04}{month:02}{day:02}T{hours:02}{minutes:02}{seconds:02}Z")
+}
+
+fn days_to_ymd(days_since_epoch: u64) -> (u64, u64, u64) {
+    // Howard Hinnant's date algorithm: http://howardhinnant.github.io/date_algorithms.html
+    let z = days_since_epoch + 719468;
+    let era = z / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ContentBlock, ProviderEvent};
+    use test_case::test_case;
+
+    #[test_case(None ; "without_session_token")]
+    #[test_case(Some("TOKEN") ; "with_session_token")]
+    fn sigv4_signing(session_token: Option<&str>) {
+        let headers = sign_request_sigv4(
+            "POST",
+            "https://bedrock-runtime.us-east-1.amazonaws.com/model/test/invoke",
+            &[
+                ("content-type", "application/json"),
+                ("host", "bedrock-runtime.us-east-1.amazonaws.com"),
+            ],
+            b"{}",
+            "AKID",
+            "SECRET",
+            session_token,
+            "us-east-1",
+            "bedrock",
+            "20240101T000000Z",
+        );
+        let auth = headers.iter().find(|(k, _)| k == "Authorization").unwrap();
+        assert!(auth.1.starts_with(
+            "AWS4-HMAC-SHA256 Credential=AKID/20240101/us-east-1/bedrock/aws4_request"
+        ));
+        assert!(auth.1.contains("SignedHeaders="));
+        assert!(auth.1.contains("Signature="));
+        assert_eq!(
+            headers.iter().any(|(k, _)| k == "x-amz-security-token"),
+            session_token.is_some(),
+        );
+    }
+
+    fn build_eventstream_frame(header_name: &str, header_value: &str, payload: &[u8]) -> Vec<u8> {
+        let mut header_buf = Vec::new();
+        header_buf.push(header_name.len() as u8);
+        header_buf.extend_from_slice(header_name.as_bytes());
+        header_buf.push(7);
+        header_buf.extend_from_slice(&(header_value.len() as u16).to_be_bytes());
+        header_buf.extend_from_slice(header_value.as_bytes());
+
+        let headers_len = header_buf.len() as u32;
+        let total_len = 12 + headers_len + payload.len() as u32 + 4;
+
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&total_len.to_be_bytes());
+        frame.extend_from_slice(&headers_len.to_be_bytes());
+        frame.extend_from_slice(&0u32.to_be_bytes());
+        frame.extend_from_slice(&header_buf);
+        frame.extend_from_slice(payload);
+        frame.extend_from_slice(&0u32.to_be_bytes());
+        frame
+    }
+
+    #[test]
+    fn decode_eventstream_chunk_returns_payload() {
+        let payload = b"{\"type\":\"content_block_delta\"}";
+        let frame = build_eventstream_frame(":event-type", "chunk", payload);
+        let (consumed, data) = decode_eventstream_frame(&frame).unwrap();
+        assert_eq!(consumed, frame.len());
+        assert_eq!(data.unwrap(), payload);
+    }
+
+    #[test]
+    fn decode_eventstream_metadata_returns_none() {
+        let frame = build_eventstream_frame(":event-type", "initial-response", b"");
+        let (consumed, data) = decode_eventstream_frame(&frame).unwrap();
+        assert_eq!(consumed, frame.len());
+        assert!(data.is_none());
+    }
+
+    #[test_case("ValidationException", 400, "Access denied" ; "validation_exception")]
+    #[test_case("ThrottlingException", 429, "Rate exceeded" ; "throttling_exception")]
+    #[test_case("UnknownException", 500, "oops" ; "unknown_maps_to_500")]
+    fn decode_eventstream_exception(exc_type: &str, expected_status: u16, msg: &str) {
+        let frame = build_eventstream_frame(":exception-type", exc_type, msg.as_bytes());
+        let err = decode_eventstream_frame(&frame).unwrap_err();
+        match err {
+            AgentError::Api { status, message } => {
+                assert_eq!(status, expected_status);
+                assert_eq!(message, msg);
+            }
+            other => panic!("expected Api error, got: {other:?}"),
+        }
+    }
+
+    #[test_case("default", "AKID", "SECRET", None ; "default_profile")]
+    #[test_case("myprofile", "MYKEY", "MYSECRET", Some("MYTOKEN") ; "named_profile_with_token")]
+    fn parse_aws_credentials(
+        profile: &str,
+        expected_key: &str,
+        expected_secret: &str,
+        expected_token: Option<&str>,
+    ) {
+        let content = "\
+[default]\n\
+aws_access_key_id = AKID\n\
+aws_secret_access_key = SECRET\n\
+\n\
+[myprofile]\n\
+aws_access_key_id = MYKEY\n\
+aws_secret_access_key = MYSECRET\n\
+aws_session_token = MYTOKEN\n";
+        let (key, secret, token) = parse_aws_credentials_file(content, profile).unwrap();
+        assert_eq!(key, expected_key);
+        assert_eq!(secret, expected_secret);
+        assert_eq!(token.as_deref(), expected_token);
+    }
+
+    #[test]
+    fn parse_aws_credentials_missing_profile_errors() {
+        let content = "[default]\naws_access_key_id = AKID\naws_secret_access_key = SECRET\n";
+        assert!(parse_aws_credentials_file(content, "nonexistent").is_err());
+    }
+
+    #[test]
+    fn event_parser_text_stream() {
+        smol::block_on(async {
+            let (tx, rx) = flume::unbounded();
+            let mut parser = shared::EventParser::new();
+
+            let steps: &[(&str, &str)] = &[
+                (
+                    "message_start",
+                    r#"{"type":"message_start","message":{"usage":{"input_tokens":10}}}"#,
+                ),
+                (
+                    "content_block_start",
+                    r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+                ),
+                (
+                    "content_block_delta",
+                    r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}"#,
+                ),
+            ];
+            for (event, data) in steps {
+                assert!(
+                    parser
+                        .process(event, data, &tx)
+                        .await
+                        .unwrap()
+                        .is_continue()
+                );
+            }
+            assert!(
+                parser
+                    .process("message_stop", r#"{"type":"message_stop"}"#, &tx)
+                    .await
+                    .unwrap()
+                    .is_break()
+            );
+
+            let resp = parser.finish();
+            assert_eq!(resp.usage.input, 10);
+            assert!(
+                matches!(&resp.message.content[0], ContentBlock::Text { text } if text == "Hello")
+            );
+            assert!(
+                rx.drain()
+                    .any(|e| matches!(e, ProviderEvent::TextDelta { text } if text == "Hello"))
+            );
+        })
+    }
+
+    #[test_case("https://host.com/path?q=1", "host.com", "/path", "q=1" ; "with_query")]
+    #[test_case("https://host.com/path", "host.com", "/path", "" ; "without_query")]
+    fn url_parsing(url: &str, expected_host: &str, expected_path: &str, expected_query: &str) {
+        let (host, path, query) = parse_url(url);
+        assert_eq!(host, expected_host);
+        assert_eq!(path, expected_path);
+        assert_eq!(query, expected_query);
+    }
+
+    #[test_case(0, (1970, 1, 1) ; "epoch")]
+    #[test_case(19723, (2024, 1, 1) ; "known_date")]
+    fn days_to_ymd_conversion(days: u64, expected: (u64, u64, u64)) {
+        assert_eq!(days_to_ymd(days), expected);
+    }
+}

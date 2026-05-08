@@ -9,6 +9,7 @@ use tracing::{debug, warn};
 use crate::model::{Model, ModelFamily, models_for_provider};
 use crate::providers::Timeouts;
 use crate::providers::anthropic::Anthropic;
+use crate::providers::anthropic::bedrock;
 use crate::providers::copilot::Copilot;
 use crate::providers::deepseek::DeepSeek;
 use crate::providers::dynamic;
@@ -157,7 +158,13 @@ impl ProviderKind {
 
     pub fn create(self, timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
         match self {
-            Self::Anthropic => Ok(Box::new(Anthropic::new(timeouts)?)),
+            Self::Anthropic => {
+                if bedrock::is_enabled() {
+                    Ok(Box::new(bedrock::Bedrock::new(timeouts)?))
+                } else {
+                    Ok(Box::new(Anthropic::new(timeouts)?))
+                }
+            }
             Self::OpenAi => Ok(Box::new(OpenAi::new(timeouts)?)),
             Self::Google => Ok(Box::new(Google::new(timeouts)?)),
             Self::Copilot => Ok(Box::new(Copilot::new(timeouts)?)),
