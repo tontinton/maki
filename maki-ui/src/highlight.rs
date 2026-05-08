@@ -96,6 +96,7 @@ pub fn fallback_span(text: &str) -> Span<'static> {
 
 pub fn highlight_ansi(lang: &str, code: &str) -> String {
     let theme = theme::current();
+    maki_highlight::set_theme(theme.syntax.clone());
     let bg = match theme.background {
         Color::Rgb(r, g, b) => (r, g, b),
         _ => (0, 0, 0),
