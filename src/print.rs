@@ -160,6 +160,7 @@ pub fn run(
     if let Some(ref handle) = mcp_handle {
         handle.extend_tools(&mut tools);
     }
+    let mcp_for_agent = mcp_handle.clone();
 
     let system = agent::build_system_prompt(&vars, &mode, &instructions.text);
 
@@ -220,7 +221,7 @@ pub fn run(
             },
         )
         .with_loaded_instructions(instructions.loaded)
-        .with_mcp(mcp_handle);
+        .with_mcp(mcp_for_agent);
         let outcome = agent.run(input).await;
         if let Err(e) = outcome.result {
             error!(error = %e, "agent error");
@@ -346,15 +347,13 @@ pub fn run(
         }
     }
     smol::block_on(async {
-        futures_lite::future::or(
-            async {
-                agent_task.await;
-            },
-            async {
-                smol::Timer::after(AGENT_SHUTDOWN_TIMEOUT).await;
-            },
-        )
+        futures_lite::future::or(agent_task, async {
+            smol::Timer::after(AGENT_SHUTDOWN_TIMEOUT).await;
+        })
         .await;
+        if let Some(ref handle) = mcp_handle {
+            handle.shutdown().await;
+        }
     });
 
     let duration_ms = start.elapsed().as_millis();

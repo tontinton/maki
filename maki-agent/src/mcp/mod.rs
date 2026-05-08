@@ -22,6 +22,7 @@ pub mod transport;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use arc_swap::{ArcSwap, Guard};
 use serde_json::{Value, json};
@@ -38,6 +39,7 @@ use self::transport::McpTransport;
 
 const SEPARATOR: &str = "__";
 pub const UNKNOWN_MCP: &str = "unknown_mcp";
+const MCP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 struct McpToolDef {
     qualified_name: Arc<str>,
@@ -275,6 +277,25 @@ impl McpHandle {
             arr.extend(self.index.load().descriptors.iter().cloned());
         }
     }
+
+    pub async fn shutdown(&self) {
+        let (ack_tx, ack_rx) = flume::bounded(1);
+        self.send(McpCommand::Shutdown { ack: ack_tx });
+        let finished = futures_lite::future::or(
+            async {
+                let _ = ack_rx.recv_async().await;
+                true
+            },
+            async {
+                smol::Timer::after(MCP_SHUTDOWN_TIMEOUT).await;
+                false
+            },
+        )
+        .await;
+        if !finished {
+            warn!("MCP shutdown timed out after {MCP_SHUTDOWN_TIMEOUT:?}");
+        }
+    }
 }
 
 pub async fn start(cwd: &Path) -> Option<McpHandle> {
@@ -288,10 +309,13 @@ pub async fn start_with_config(config: McpConfig) -> Option<McpHandle> {
         return None;
     }
 
-    let inner = parse_entries(config);
+    let mut inner = parse_entries(config);
+
+    start_enabled(&mut inner).await;
+    inner.generation += 1;
+
     let snapshot = Arc::new(ArcSwap::from_pointee(McpSnapshot::default()));
     let index: Arc<ArcSwap<ToolIndex>> = Arc::new(ArcSwap::from_pointee(ToolIndex::default()));
-
     publish(&inner, &index, &snapshot);
 
     let (cmd_tx, cmd_rx) = flume::unbounded();
@@ -300,20 +324,6 @@ pub async fn start_with_config(config: McpConfig) -> Option<McpHandle> {
         index: Arc::clone(&index),
         snapshot: Arc::clone(&snapshot),
     };
-
-    smol::spawn(run_with_init(inner, index, snapshot, cmd_rx)).detach();
-    Some(handle)
-}
-
-async fn run_with_init(
-    mut inner: McpManagerInner,
-    index: Arc<ArcSwap<ToolIndex>>,
-    snapshot: Arc<ArcSwap<McpSnapshot>>,
-    cmd_rx: flume::Receiver<McpCommand>,
-) {
-    start_enabled(&mut inner).await;
-    inner.generation += 1;
-    publish(&inner, &index, &snapshot);
 
     info!(
         running = inner
@@ -325,7 +335,8 @@ async fn run_with_init(
         "MCP servers initialized"
     );
 
-    run(inner, index, snapshot, cmd_rx).await;
+    smol::spawn(run(inner, index, snapshot, cmd_rx)).detach();
+    Some(handle)
 }
 
 async fn run(
@@ -334,6 +345,7 @@ async fn run(
     snapshot: Arc<ArcSwap<McpSnapshot>>,
     cmd_rx: flume::Receiver<McpCommand>,
 ) {
+    let mut ack: Option<flume::Sender<()>> = None;
     while let Ok(cmd) = cmd_rx.recv_async().await {
         match cmd {
             McpCommand::Toggle { server, enabled } => {
@@ -342,16 +354,19 @@ async fn run(
             McpCommand::Reconnect { server, url, token } => {
                 handle_reconnect(&mut inner, &server, &url, &token).await;
             }
-            McpCommand::Shutdown { ack } => {
-                shutdown_all(&mut inner).await;
-                inner.generation += 1;
-                publish(&inner, &index, &snapshot);
-                let _ = ack.try_send(());
-                return;
+            McpCommand::Shutdown { ack: tx } => {
+                ack = Some(tx);
+                break;
             }
         }
         inner.generation += 1;
         publish(&inner, &index, &snapshot);
+    }
+    shutdown_all(&mut inner).await;
+    inner.generation += 1;
+    publish(&inner, &index, &snapshot);
+    if let Some(tx) = ack {
+        let _ = tx.try_send(());
     }
 }
 

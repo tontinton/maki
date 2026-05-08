@@ -28,8 +28,6 @@ use self::agent_loop::AgentLoop;
 use self::command_router::spawn_command_router;
 pub(crate) use self::shared_queue::{QueueSender, QueuedMessage};
 
-const MCP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
-
 pub(crate) struct ModelSlot {
     pub(crate) model: Model,
     pub(crate) provider: Arc<dyn Provider>,
@@ -157,29 +155,10 @@ impl AgentHandles {
                 warn!("agent did not finish within {timeout:?}, forcing shutdown");
             }
 
-            if let Some(handle) = mcp_handle {
-                shutdown_mcp(&handle).await;
+            if let Some(ref handle) = mcp_handle {
+                handle.shutdown().await;
             }
         });
-    }
-}
-
-async fn shutdown_mcp(handle: &McpHandle) {
-    let (ack_tx, ack_rx) = flume::bounded(1);
-    handle.send(McpCommand::Shutdown { ack: ack_tx });
-    let finished = futures_lite::future::or(
-        async {
-            let _ = ack_rx.recv_async().await;
-            true
-        },
-        async {
-            smol::Timer::after(MCP_SHUTDOWN_TIMEOUT).await;
-            false
-        },
-    )
-    .await;
-    if !finished {
-        warn!("MCP shutdown timed out after {MCP_SHUTDOWN_TIMEOUT:?}");
     }
 }
 
