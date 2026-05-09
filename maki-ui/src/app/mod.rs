@@ -383,6 +383,9 @@ impl App {
             return Some(self.suspend());
         }
         if key::QUIT.matches(key) {
+            if self.status == Status::Streaming {
+                return Some(self.handle_cancel());
+            }
             if self.any_overlay_open() || self.queue.focus().is_some() {
                 return None;
             }

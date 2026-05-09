@@ -173,11 +173,10 @@ fn ctrl_c_clears_nonempty_input(setup: fn(&mut App)) {
     assert!(app.input_box.is_empty());
 }
 
-#[test_case(Status::Idle      ; "idle")]
-#[test_case(Status::Streaming ; "streaming")]
-fn ctrl_c_quits_when_input_empty(status: Status) {
+#[test]
+fn ctrl_c_quits_when_input_empty() {
     let mut app = test_app();
-    app.status = status;
+    app.status = Status::Idle;
     let actions = app.update(Msg::Key(kb::QUIT.to_key_event()));
     assert_eq!(app.exit_request, ExitRequest::Success);
     assert!(matches!(&actions[0], Action::Quit));
@@ -1031,6 +1030,18 @@ fn double_esc_idle_no_user_turns_flashes_error() {
     app.last_esc = Some(Instant::now());
     app.update(Msg::Key(key(KeyCode::Esc)));
     assert!(!app.rewind_picker.is_open());
+}
+
+#[test]
+fn ctrl_c_while_streaming_cancels_instead_of_quitting() {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+
+    let actions = app.update(Msg::Key(kb::QUIT.to_key_event()));
+    assert!(matches!(&actions[0], Action::CancelAgent { .. }));
+    assert_eq!(app.status, Status::Idle);
+    assert_ne!(app.exit_request, ExitRequest::Success);
 }
 
 #[test]
