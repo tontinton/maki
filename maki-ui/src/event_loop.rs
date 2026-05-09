@@ -318,6 +318,9 @@ impl<'t> EventLoop<'t> {
                             self.app.flash(e);
                         }
                     }
+                    UiAction::OpenWin { .. } => {
+                        // TODO: Plan 04, LuaFloatWindow component
+                    }
                 }
             }
         }

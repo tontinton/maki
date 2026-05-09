@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use arc_swap::ArcSwap;
+use maki_agent::SharedBuf;
 use mlua::RegistryKey;
 
 #[derive(Clone)]
@@ -106,11 +107,37 @@ pub enum SelectEvent {
     Close,
 }
 
+pub struct WinOpts {
+    pub title: String,
+    pub footer: Vec<(String, String)>,
+    pub cursor_line: bool,
+}
+
+pub enum WinEvent {
+    Key { key: String, cursor: usize },
+    Close,
+}
+
+pub enum WinCommand {
+    SetConfig {
+        title: Option<String>,
+        footer: Option<Vec<(String, String)>>,
+    },
+    SetCursor(usize),
+    Close,
+}
+
 pub enum UiAction {
     Select {
         items: Vec<SelectItem>,
         opts: SelectOpts,
         reply_tx: flume::Sender<SelectEvent>,
+    },
+    OpenWin {
+        buf: Arc<SharedBuf>,
+        opts: WinOpts,
+        event_tx: flume::Sender<WinEvent>,
+        cmd_rx: flume::Receiver<WinCommand>,
     },
     Flash(String),
     OpenEditor(PathBuf),
