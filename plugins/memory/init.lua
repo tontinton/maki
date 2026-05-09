@@ -1,6 +1,7 @@
 local ToolView = require("tool_view")
 local helpers = require("memory_helpers")
 local ListPicker = require("list_picker")
+local highlight_to_view = require("highlight")
 
 local function memories_path_suffix()
   local cwd = maki.uv.cwd()
@@ -38,16 +39,7 @@ local function render_content(content, path, ctx)
   end)
 
   local ext = path:match("%.([^%.]+)$") or "md"
-  local highlighted = maki.ui.highlight(content, ext)
-  if highlighted then
-    for idx, hl_line in ipairs(highlighted) do
-      local spans = { { string.format("%4d ", idx), "line_nr" } }
-      for _, seg in ipairs(hl_line) do
-        spans[#spans + 1] = seg
-      end
-      view:append(spans)
-    end
-  else
+  if not highlight_to_view(view, content, ext) then
     for line in (content .. "\n"):gmatch("([^\n]*)\n") do
       view:append(line)
     end

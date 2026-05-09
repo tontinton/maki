@@ -2,6 +2,7 @@ local SKILL_FILE = "SKILL.md"
 local NOT_FOUND = "skill not found: "
 local shorten_path = require("shorten_path")
 local ToolView = require("tool_view")
+local highlight_to_view = require("highlight")
 local helpers = require("skill_helpers")
 local parse_frontmatter = helpers.parse_frontmatter
 local build_skill_list = helpers.build_skill_list
@@ -126,16 +127,7 @@ maki.api.register_tool({
     end)
 
     local ext = skill.location:match("%.([^%.]+)$") or "md"
-    local highlighted = maki.ui.highlight(skill.content, ext)
-    if highlighted then
-      for idx, hl_line in ipairs(highlighted) do
-        local spans = { { string.format("%4d ", idx), "line_nr" } }
-        for _, seg in ipairs(hl_line) do
-          spans[#spans + 1] = seg
-        end
-        view:append(spans)
-      end
-    else
+    if not highlight_to_view(view, skill.content, ext) then
       for line in formatted:gmatch("([^\n]*)\n?") do
         view:append(line)
       end
