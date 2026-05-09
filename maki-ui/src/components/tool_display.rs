@@ -690,7 +690,7 @@ fn snapshot_to_lines_range(
         .collect()
 }
 
-fn resolve_span_style(style: &SpanStyle) -> Style {
+pub(crate) fn resolve_span_style(style: &SpanStyle) -> Style {
     match style {
         SpanStyle::Default => Style::default(),
         SpanStyle::Named(name) => theme::style_by_name(name),

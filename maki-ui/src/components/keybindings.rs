@@ -1,4 +1,5 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use std::fmt::Write;
 use strum::EnumIter;
 use unicode_width::UnicodeWidthStr;
 
@@ -544,10 +545,64 @@ pub fn all_contexts() -> impl Iterator<Item = KeybindContext> {
     KeybindContext::iter()
 }
 
+pub(crate) fn key_event_to_string(key: &KeyEvent) -> String {
+    let mut s = String::new();
+    let mods = key.modifiers;
+    let is_char = matches!(key.code, KeyCode::Char(_));
+    if mods.contains(KeyModifiers::CONTROL) {
+        s.push_str("ctrl+");
+    }
+    if mods.contains(KeyModifiers::ALT) {
+        s.push_str("alt+");
+    }
+    if mods.contains(KeyModifiers::SHIFT) && !is_char {
+        s.push_str("shift+");
+    }
+    match key.code {
+        KeyCode::Char(' ') => s.push_str("space"),
+        KeyCode::Char(c) => s.push(c),
+        KeyCode::Enter => s.push_str("enter"),
+        KeyCode::Esc => s.push_str("esc"),
+        KeyCode::Tab => s.push_str("tab"),
+        KeyCode::BackTab => {
+            if !s.contains("shift+") {
+                s.insert_str(0, "shift+");
+            }
+            s.push_str("tab");
+        }
+        KeyCode::Backspace => s.push_str("backspace"),
+        KeyCode::Delete => s.push_str("delete"),
+        KeyCode::Up => s.push_str("up"),
+        KeyCode::Down => s.push_str("down"),
+        KeyCode::Left => s.push_str("left"),
+        KeyCode::Right => s.push_str("right"),
+        KeyCode::Home => s.push_str("home"),
+        KeyCode::End => s.push_str("end"),
+        KeyCode::PageUp => s.push_str("pageup"),
+        KeyCode::PageDown => s.push_str("pagedown"),
+        KeyCode::F(n) => write!(s, "f{n}").unwrap(),
+        KeyCode::Insert => s.push_str("insert"),
+        _ => {}
+    }
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crossterm::event::KeyEvent;
+    use test_case::test_case;
+
+    #[test_case(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL), "ctrl+d")]
+    #[test_case(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT), "alt+x")]
+    #[test_case(KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT), "shift+tab")]
+    #[test_case(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT), "shift+tab")]
+    #[test_case(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), "space")]
+    #[test_case(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE), "f5")]
+    #[test_case(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE), "a")]
+    fn key_event_to_string_cases(input: KeyEvent, expected: &str) {
+        assert_eq!(key_event_to_string(&input), expected);
+    }
 
     #[test]
     fn bind_requires_exact_modifiers() {

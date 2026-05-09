@@ -318,8 +318,13 @@ impl<'t> EventLoop<'t> {
                             self.app.flash(e);
                         }
                     }
-                    UiAction::OpenWin { .. } => {
-                        // TODO: Plan 04, LuaFloatWindow component
+                    UiAction::OpenWin {
+                        buf,
+                        opts,
+                        event_tx,
+                        cmd_rx,
+                    } => {
+                        self.app.lua_float.open(buf, opts, event_tx, cmd_rx);
                     }
                 }
             }

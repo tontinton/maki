@@ -30,6 +30,7 @@ use crate::components::help_modal::HelpModal;
 use crate::components::input::{InputAction, InputBox, Submission};
 use crate::components::keybindings::key;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
+use crate::components::lua_float::LuaFloatWindow;
 use crate::components::lua_select::{LuaSelectAction, LuaSelectModal};
 use crate::components::mcp_picker::{McpPicker, McpPickerAction};
 use crate::components::model_picker::{ModelPicker, ModelPickerAction};
@@ -136,6 +137,7 @@ pub struct App {
     pub(super) help_modal: HelpModal,
     pub(super) btw_modal: BtwModal,
     pub(super) lua_select: LuaSelectModal,
+    pub(super) lua_float: LuaFloatWindow,
     pub(super) search_modal: SearchModal,
     pub(super) file_picker: FilePickerModal,
     pub(super) permission_prompt: PermissionPrompt,
@@ -208,6 +210,7 @@ impl App {
             help_modal: HelpModal::new(),
             btw_modal: BtwModal::new(ui_config.typewriter_ms_per_char),
             lua_select: LuaSelectModal::new(),
+            lua_float: LuaFloatWindow::new(),
             search_modal: SearchModal::new(),
             file_picker: FilePickerModal::new(),
             permission_prompt: PermissionPrompt::new(),
@@ -503,6 +506,11 @@ impl App {
             if let LuaSelectAction::Flash(msg) = self.lua_select.handle_key(key) {
                 self.status_bar.flash(msg.to_string());
             }
+            return vec![];
+        }
+
+        if self.lua_float.is_open() {
+            self.lua_float.handle_key(key);
             return vec![];
         }
 
@@ -1239,11 +1247,12 @@ impl App {
         vec![]
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 13] {
+    fn overlays(&self) -> [&dyn Overlay; 14] {
         [
             &self.help_modal,
             &self.btw_modal,
             &self.lua_select,
+            &self.lua_float,
             &self.search_modal,
             &self.file_picker,
             &self.task_picker,
@@ -1257,11 +1266,12 @@ impl App {
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 13] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 14] {
         [
             &mut self.help_modal,
             &mut self.btw_modal,
             &mut self.lua_select,
+            &mut self.lua_float,
             &mut self.search_modal,
             &mut self.file_picker,
             &mut self.task_picker,
