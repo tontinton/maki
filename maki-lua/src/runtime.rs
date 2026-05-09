@@ -406,7 +406,7 @@ impl LuaRuntime {
     }
 
     /// Bundled dirs are checked first, so plugins can `require()` shared
-    /// modules (like `truncate.lua`) without touching the filesystem.
+    /// modules (like `maki.truncate`) without touching the filesystem.
     fn create_require_fn(
         &self,
         env: &mlua::Table,

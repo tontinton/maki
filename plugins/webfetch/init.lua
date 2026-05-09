@@ -60,8 +60,8 @@ local function strip_html(html)
   return result:match("^%s*(.-)%s*$")
 end
 
-local truncate = require("truncate")
-local ToolView = require("tool_view")
+local truncate = require("maki.truncate")
+local ToolView = require("maki.tool_view")
 
 maki.api.register_tool({
   name = "webfetch",

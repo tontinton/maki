@@ -1,7 +1,7 @@
-local ToolView = require("tool_view")
+local ToolView = require("maki.tool_view")
 local helpers = require("memory_helpers")
-local ListPicker = require("list_picker")
-local highlight_to_view = require("highlight")
+local ListPicker = require("maki.list_picker")
+local highlight_to_view = require("maki.highlight")
 
 local function memories_path_suffix()
   local cwd = maki.uv.cwd()

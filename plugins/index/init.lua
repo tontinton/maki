@@ -1,6 +1,6 @@
 local indexer = require("indexer")
-local ToolView = require("tool_view")
-local shorten_path = require("shorten_path")
+local ToolView = require("maki.tool_view")
+local shorten_path = require("maki.shorten_path")
 
 local KEYWORDS = {
   pub = true,

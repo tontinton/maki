@@ -1,8 +1,8 @@
 local SKILL_FILE = "SKILL.md"
 local NOT_FOUND = "skill not found: "
-local shorten_path = require("shorten_path")
-local ToolView = require("tool_view")
-local highlight_to_view = require("highlight")
+local shorten_path = require("maki.shorten_path")
+local ToolView = require("maki.tool_view")
+local highlight_to_view = require("maki.highlight")
 local helpers = require("skill_helpers")
 local parse_frontmatter = helpers.parse_frontmatter
 local build_skill_list = helpers.build_skill_list

@@ -1,5 +1,5 @@
-local truncate = require("truncate")
-local ToolView = require("tool_view")
+local truncate = require("maki.truncate")
+local ToolView = require("maki.tool_view")
 
 local failures = {}
 
@@ -257,7 +257,7 @@ case("tool_view_append_after_toggle_still_works", function()
   eq(view.all_lines[6], "line6")
 end)
 
-local ListPicker = require("list_picker")
+local ListPicker = require("maki.list_picker")
 local render_lines = ListPicker._render_lines
 
 case("render_lines_string_items_basic", function()

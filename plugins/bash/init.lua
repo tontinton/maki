@@ -1,5 +1,5 @@
-local truncate = require("truncate")
-local ToolView = require("tool_view")
+local truncate = require("maki.truncate")
+local ToolView = require("maki.tool_view")
 
 local RTK_REWRITE_TIMEOUT_MS = 2000
 local RTK_UNSUPPORTED_FLAGS = {
