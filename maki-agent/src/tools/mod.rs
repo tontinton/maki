@@ -126,7 +126,6 @@ pub const BATCH_TOOL_NAME: &str = batch::Batch::NAME;
 pub const EDIT_TOOL_NAME: &str = edit::Edit::NAME;
 pub const GLOB_TOOL_NAME: &str = glob::Glob::NAME;
 pub const GREP_TOOL_NAME: &str = grep::Grep::NAME;
-pub const MEMORY_TOOL_NAME: &str = "memory";
 pub const MULTIEDIT_TOOL_NAME: &str = multiedit::MultiEdit::NAME;
 pub const QUESTION_TOOL_NAME: &str = question::Question::NAME;
 pub const READ_TOOL_NAME: &str = read::Read::NAME;

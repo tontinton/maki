@@ -1,8 +1,7 @@
 use crate::markdown::Keep;
 use maki_agent::tools::{
-    BASH_TOOL_NAME, BATCH_TOOL_NAME, CODE_EXECUTION_TOOL_NAME, EDIT_TOOL_NAME, GLOB_TOOL_NAME,
-    GREP_TOOL_NAME, MEMORY_TOOL_NAME, MULTIEDIT_TOOL_NAME, QUESTION_TOOL_NAME, READ_TOOL_NAME,
-    TASK_TOOL_NAME, TODOWRITE_TOOL_NAME, WRITE_TOOL_NAME,
+    CODE_EXECUTION_TOOL_NAME, EDIT_TOOL_NAME, GLOB_TOOL_NAME, GREP_TOOL_NAME, MULTIEDIT_TOOL_NAME,
+    READ_TOOL_NAME, TASK_TOOL_NAME, WRITE_TOOL_NAME,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -45,8 +44,6 @@ pub struct ToolRenderHints {
     pub body_format: BodyFormat,
     pub truncate_lines: Option<usize>,
     pub truncate_at: OutputKeep,
-    pub input_code_field: Option<&'static str>,
-    pub input_code_language: Option<&'static str>,
 }
 
 impl Default for ToolRenderHints {
@@ -67,23 +64,15 @@ macro_rules! hint {
 }
 
 impl ToolRenderHints {
-    const DEFAULT: Self = Self {
+    pub const DEFAULT: Self = Self {
         header_style: HeaderStyle::Plain,
         body_format: BodyFormat::Plain,
         truncate_lines: None,
         truncate_at: OutputKeep::Head,
-        input_code_field: None,
-        input_code_language: None,
     };
 }
 
 const DEFAULT_HINTS: &[(&str, ToolRenderHints)] = &[
-    hint!(BASH_TOOL_NAME,
-        header_style: HeaderStyle::Command,
-        truncate_at: OutputKeep::Tail,
-        input_code_field: Some("command"),
-        input_code_language: Some("bash"),
-    ),
     hint!(CODE_EXECUTION_TOOL_NAME,
         truncate_at: OutputKeep::Tail,
     ),
@@ -100,10 +89,6 @@ const DEFAULT_HINTS: &[(&str, ToolRenderHints)] = &[
     hint!(WRITE_TOOL_NAME, header_style: HeaderStyle::Path),
     hint!(EDIT_TOOL_NAME, header_style: HeaderStyle::Path),
     hint!(MULTIEDIT_TOOL_NAME, header_style: HeaderStyle::Path),
-    hint!(MEMORY_TOOL_NAME, header_style: HeaderStyle::Path),
-    hint!(TODOWRITE_TOOL_NAME),
-    hint!(QUESTION_TOOL_NAME),
-    hint!(BATCH_TOOL_NAME),
 ];
 
 pub struct RenderHintsRegistry {
@@ -139,18 +124,16 @@ mod tests {
     }
 
     #[test]
-    fn all_native_tools_have_hints() {
-        let reg = RenderHintsRegistry::new();
-        let native_names = maki_agent::tools::ToolRegistry::with_natives();
-        for name in native_names.names() {
-            assert!(
-                reg.hints.contains_key(&*name),
-                "native tool {name} missing from DEFAULT_HINTS"
+    fn no_all_default_entries() {
+        for (name, hints) in DEFAULT_HINTS {
+            assert_ne!(
+                *hints,
+                ToolRenderHints::DEFAULT,
+                "{name} has all-default hints and should not be in DEFAULT_HINTS"
             );
         }
     }
 
-    #[test_case("bash", true ; "bash_tail_keep")]
     #[test_case("code_execution", true ; "code_execution_tail_keep")]
     #[test_case("read", false ; "read_head_keep")]
     fn truncate_at_direction(tool: &str, expect_tail: bool) {

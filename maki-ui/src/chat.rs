@@ -18,8 +18,8 @@ use crate::markdown::truncate_output;
 use crate::selection::Selection;
 use maki_agent::tools::{ToolInvocation, ToolRegistry};
 use maki_agent::{
-    AgentEvent, BatchToolStatus, NO_FILES_FOUND, QuestionInfo, ToolDoneEvent, ToolInput,
-    ToolOutput, ToolStartEvent,
+    AgentEvent, BatchToolStatus, NO_FILES_FOUND, QuestionInfo, ToolDoneEvent, ToolOutput,
+    ToolStartEvent,
 };
 use maki_config::{ToolOutputLines, UiConfig};
 use maki_providers::{ContentBlock, Message, Role, TokenUsage};
@@ -347,19 +347,7 @@ pub fn history_to_display(
                             let tool_call: Option<Box<dyn ToolInvocation>> =
                                 reg.get(name).and_then(|entry| entry.try_parse(input));
                             let summary = reg.resolve_header(name, input);
-                            let hints = registry.get(static_name);
-                            let tool_input = tool_call
-                                .as_deref()
-                                .and_then(|tc| tc.start_input())
-                                .or_else(|| {
-                                    let field = hints.input_code_field?;
-                                    let lang = hints.input_code_language.unwrap_or("text");
-                                    let code = input.get(field)?.as_str()?;
-                                    Some(ToolInput::Code {
-                                        language: lang.into(),
-                                        code: format!("{code}\n"),
-                                    })
-                                });
+                            let tool_input = tool_call.as_deref().and_then(|tc| tc.start_input());
                             let (status, result_text) = results
                                 .get(id.as_str())
                                 .map(|(err, text)| {
@@ -515,8 +503,7 @@ fn build_tool_results_map(messages: &[Message]) -> HashMap<&str, (bool, &str)> {
 mod tests {
     use super::*;
     use maki_agent::{
-        AgentEvent, BatchToolEntry, BatchToolStatus, ToolDoneEvent, ToolInput, ToolOutput,
-        ToolStartEvent,
+        AgentEvent, BatchToolEntry, BatchToolStatus, ToolDoneEvent, ToolOutput, ToolStartEvent,
     };
     use maki_config::UiConfig;
     use test_case::test_case;
@@ -789,27 +776,6 @@ mod tests {
         let outputs = HashMap::from([("t1".into(), write_output)]);
         let display = history_to_display(&msgs, &outputs, &ToolOutputLines::default());
         assert!(display[0].annotation.is_some());
-    }
-
-    #[test]
-    fn history_bash_has_code_input() {
-        let msgs = vec![Message {
-            role: Role::Assistant,
-            content: vec![ContentBlock::ToolUse {
-                id: "t1".into(),
-                name: "bash".into(),
-                input: serde_json::json!({"command": "echo hi"}),
-            }],
-            ..Default::default()
-        }];
-        let display = history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default());
-        assert!(
-            matches!(
-                display[0].tool_input.as_deref(),
-                Some(ToolInput::Code { .. })
-            ),
-            "bash tool should produce Code input for syntax highlighting"
-        );
     }
 
     #[test]

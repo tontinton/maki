@@ -1598,7 +1598,9 @@ mod tests {
         assert!(collapsed.truncation.any());
         assert!(!expanded.truncation.any());
         assert!(expanded_text.contains("line 0"));
-        assert!(!collapsed_text.contains("line 0"));
+        assert!(expanded_text.contains("line 199"));
+        assert!(collapsed_text.contains("line 0"));
+        assert!(!collapsed_text.contains("line 199"));
     }
 
     #[test_case(200, true,  false, false ; "expanded_shows_all")]
