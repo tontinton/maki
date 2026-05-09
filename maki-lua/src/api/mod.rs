@@ -13,6 +13,7 @@ pub(crate) mod tool;
 pub(crate) mod treesitter;
 pub(crate) mod ui;
 pub(crate) mod uv;
+pub(crate) mod win;
 pub(crate) mod yaml;
 
 use std::sync::Arc;

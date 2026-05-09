@@ -4,8 +4,25 @@ use std::time::Duration;
 use humantime::format_duration;
 use mlua::{Lua, Result as LuaResult, Table};
 
-use crate::api::command::{SelectEvent, SelectItem, SelectOpts, UiAction};
+use crate::api::command::{
+    SelectEvent, SelectItem, SelectOpts, UiAction, WinCommand, WinEvent, WinOpts,
+};
+use crate::api::win::WinHandle;
 use crate::runtime::with_task_bufs;
+
+pub(crate) fn parse_footer(tbl: &Table) -> LuaResult<Vec<(String, String)>> {
+    let footer_tbl: Table = match tbl.get("footer") {
+        Ok(t) => t,
+        Err(_) => return Ok(Vec::new()),
+    };
+    footer_tbl
+        .sequence_values::<Table>()
+        .map(|entry| {
+            let entry = entry?;
+            Ok((entry.get(1)?, entry.get(2)?))
+        })
+        .collect()
+}
 
 pub(crate) fn create_ui_table(
     lua: &Lua,
@@ -55,7 +72,7 @@ pub(crate) fn create_ui_table(
             })?,
         )?;
 
-        let select_tx = tx;
+        let select_tx = tx.clone();
         t.set(
             "select",
             lua.create_async_function(move |lua, (items_tbl, opts_tbl): (Table, Table)| {
@@ -88,19 +105,7 @@ pub(crate) fn create_ui_table(
                     let title: String = opts_tbl.get("title").unwrap_or_default();
                     let has_on_delete: bool = opts_tbl.get("on_delete").unwrap_or(false);
 
-                    let footer: Vec<(String, String)> =
-                        if let Ok(footer_tbl) = opts_tbl.get::<Table>("footer") {
-                            let mut pairs = Vec::new();
-                            for entry in footer_tbl.sequence_values::<Table>() {
-                                let entry = entry?;
-                                let key: String = entry.get(1)?;
-                                let desc: String = entry.get(2)?;
-                                pairs.push((key, desc));
-                            }
-                            pairs
-                        } else {
-                            Vec::new()
-                        };
+                    let footer = parse_footer(&opts_tbl)?;
 
                     let (reply_tx, reply_rx) = flume::bounded::<SelectEvent>(1);
                     if tx
@@ -144,6 +149,35 @@ pub(crate) fn create_ui_table(
                     Ok(mlua::Value::Table(result))
                 }
             })?,
+        )?;
+
+        let open_win_tx = tx;
+        t.set(
+            "open_win",
+            lua.create_function(
+                move |_lua, (buf_ud, opts_tbl): (mlua::AnyUserData, Table)| {
+                    let buf_handle = buf_ud.borrow::<crate::api::buf::BufHandle>()?;
+                    let title: String = opts_tbl.get("title").unwrap_or_default();
+                    let cursor_line: bool = opts_tbl.get("cursor_line").unwrap_or(true);
+                    let footer = parse_footer(&opts_tbl)?;
+
+                    let (event_tx, event_rx) = flume::bounded::<WinEvent>(8);
+                    let (cmd_tx, cmd_rx) = flume::bounded::<WinCommand>(8);
+
+                    let _ = open_win_tx.try_send(UiAction::OpenWin {
+                        buf: buf_handle.buf.clone(),
+                        opts: WinOpts {
+                            title,
+                            footer,
+                            cursor_line,
+                        },
+                        event_tx,
+                        cmd_rx,
+                    });
+
+                    Ok(WinHandle::new(event_rx, cmd_tx))
+                },
+            )?,
         )?;
     }
 
