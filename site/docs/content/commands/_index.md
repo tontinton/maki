@@ -24,7 +24,6 @@ Type `/` in the input box to open the command palette.
 | `/mcp` | Configure MCP servers |
 | `/cd` | Change working directory |
 | `/btw` | Ask a quick question (no tools, no history pollution) |
-| `/memory` | List memory files for this project |
 | `/yolo` | Toggle YOLO mode (skip all permission prompts) |
 | `/thinking` | Toggle extended thinking (off, adaptive, or budget) |
 | `/exit` | Exit the application |

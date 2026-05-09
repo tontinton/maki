@@ -9,7 +9,7 @@ fn memories_path_suffix() -> Result<String, String> {
     Ok(format!("projects/{id}/memories"))
 }
 
-pub fn resolve_memories_dir() -> Result<PathBuf, String> {
+fn resolve_memories_dir() -> Result<PathBuf, String> {
     let suffix = memories_path_suffix()?;
     let state = maki_storage::paths::state_dir().map_err(|e| format!("state dir: {e}"))?;
     Ok(state.join(suffix))
@@ -65,11 +65,13 @@ pub fn list_memory_files() -> Option<String> {
 
 pub fn list_memory_entries() -> Option<Vec<(String, u64)>> {
     let memories_dir = resolve_memories_read_dir().ok()?;
-    if !memories_dir.exists() {
-        return None;
-    }
-    let entries: Vec<(String, u64)> = fs::read_dir(&memories_dir)
-        .ok()?
+    let entries = collect_file_entries(&memories_dir);
+    if entries.is_empty() { None } else { Some(entries) }
+}
+
+fn collect_file_entries(dir: &Path) -> Vec<(String, u64)> {
+    let Ok(rd) = fs::read_dir(dir) else { return Vec::new() };
+    let mut entries: Vec<(String, u64)> = rd
         .filter_map(|e| e.ok())
         .filter_map(|e| {
             let meta = e.metadata().ok()?;
@@ -80,12 +82,8 @@ pub fn list_memory_entries() -> Option<Vec<(String, u64)>> {
             }
         })
         .collect();
-    if entries.is_empty() {
-        return None;
-    }
-    let mut sorted = entries;
-    sorted.sort_by(|a, b| a.0.cmp(&b.0));
-    Some(sorted)
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    entries
 }
 
 #[cfg(test)]
@@ -158,58 +156,33 @@ mod tests {
     }
 
     #[test]
-    fn list_memory_entries_returns_none_for_missing_dir() {
-        let dir = tempfile::tempdir().unwrap();
-        let memories = dir.path().join("nonexistent");
-        assert!(!memories.exists());
-    }
-
-    #[test]
-    fn list_memory_entries_returns_none_for_empty_dir() {
-        let dir = tempfile::tempdir().unwrap();
-        let memories = dir.path().join("memories");
-        fs::create_dir_all(&memories).unwrap();
-        let entries: Vec<(String, u64)> = fs::read_dir(&memories)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter_map(|e| {
-                let meta = e.metadata().ok()?;
-                if meta.is_file() {
-                    Some((e.file_name().to_string_lossy().into_owned(), meta.len()))
-                } else {
-                    None
-                }
-            })
-            .collect();
-        assert!(entries.is_empty());
-    }
-
-    #[test]
-    fn list_memory_files_format() {
+    fn collect_entries_returns_sorted_files_with_sizes() {
         let dir = tempfile::tempdir().unwrap();
         let memories = dir.path().join("memories");
         fs::create_dir_all(&memories).unwrap();
         fs::write(memories.join("arch.md"), "data").unwrap();
         fs::write(memories.join("notes.md"), "more").unwrap();
 
-        let mut entries: Vec<(String, u64)> = fs::read_dir(&memories)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter_map(|e| {
-                let meta = e.metadata().ok()?;
-                if meta.is_file() {
-                    Some((e.file_name().to_string_lossy().into_owned(), meta.len()))
-                } else {
-                    None
-                }
-            })
-            .collect();
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
-
+        let entries = collect_file_entries(&memories);
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].0, "arch.md");
         assert_eq!(entries[0].1, 4);
         assert_eq!(entries[1].0, "notes.md");
         assert_eq!(entries[1].1, 4);
+    }
+
+    #[test]
+    fn collect_entries_empty_dir_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let memories = dir.path().join("memories");
+        fs::create_dir_all(&memories).unwrap();
+        assert!(collect_file_entries(&memories).is_empty());
+    }
+
+    #[test]
+    fn collect_entries_missing_dir_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let memories = dir.path().join("nonexistent");
+        assert!(collect_file_entries(&memories).is_empty());
     }
 }

@@ -34,13 +34,10 @@ impl TerminalMux {
         }
     }
 
-    // Wrap a control sequence so terminal multiplexers pass it through to the
-    // outer terminal. tmux and screen take a DCS-wrapped payload with every
-    // internal ESC byte doubled. Otherwise the ESC in the OSC52 `ESC \`
-    // terminator ends the DCS early and truncates the payload. Zellij has no
-    // passthrough protocol but intercepts OSC52 itself, so we emit the raw
-    // sequence and let zellij forward or honor it per its `copy_command`
-    // config.
+    // tmux and screen need DCS-passthrough with every internal ESC doubled.
+    // Without doubling, the `ESC \` in an OSC52 ST terminator would close
+    // the DCS wrapper early and truncate the payload.
+    // Zellij intercepts OSC52 natively, so we just emit the raw sequence.
     fn wrap_for_mux(&self, sequence: String) -> String {
         match self {
             Self::Zellij | Self::None => sequence,
@@ -133,7 +130,7 @@ pub(crate) fn edit_temp_content(
 pub(crate) fn open_in_editor(
     path: &Path,
     terminal: &mut ratatui::DefaultTerminal,
-) -> Result<(), String> {
+) -> Result<i32, String> {
     let editor = std::env::var("VISUAL")
         .or_else(|_| std::env::var("EDITOR"))
         .map_err(|_| "Set $VISUAL or $EDITOR to open files".to_string())?;
@@ -157,13 +154,10 @@ pub(crate) fn open_in_editor(
     resume(terminal);
 
     match result {
-        Ok(status) if !status.success() => Err(format!(
-            "{editor} exited with {status} - set $VISUAL or $EDITOR"
-        )),
+        Ok(status) => Ok(status.code().unwrap_or(-1)),
         Err(e) => Err(format!(
             "Failed to open {editor}: {e} - set $VISUAL or $EDITOR"
         )),
-        Ok(_) => Ok(()),
     }
 }
 
@@ -184,10 +178,8 @@ pub(crate) fn copy_to_clipboard(text: &str) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    // Faithfully simulates how a DCS-passthrough mux (tmux/screen) parses the
-    // body between its opener and ST terminator: `ESC ESC` collapses to a
-    // single ESC, `ESC \` ends the DCS, and any other byte is emitted verbatim.
-    // Panics on malformed input so tests fail loudly on unexpected bytes.
+    // Simulates DCS-passthrough parsing: `ESC ESC` becomes one ESC,
+    // `ESC \` ends the DCS. Panics on bad input so tests fail loudly.
     fn parse_dcs_passthrough(wrapped: &str, prefix: &str) -> String {
         let body = wrapped
             .strip_prefix(prefix)
@@ -223,9 +215,8 @@ mod tests {
         }
     }
 
-    // OSC52 payload using ST terminator — matches what crossterm emits, and
-    // exercises the case where the DCS body contains an ESC both at the
-    // start (opening the OSC) and mid-body (opening the ST terminator).
+    // Uses the ST terminator that crossterm emits, which puts ESC bytes
+    // at the start and in the middle of the payload.
     const OSC52_WITH_ST: &str = "\u{1b}]52;c;SGVsbG8=\u{1b}\\";
 
     #[test]
@@ -238,8 +229,7 @@ mod tests {
 
     #[test]
     fn zellij_is_identity_because_it_intercepts_osc52() {
-        // Zellij consumes OSC52 itself rather than forwarding; wrapping in a
-        // DCS it doesn't understand would eat the whole sequence.
+        // Zellij handles OSC52 itself; DCS-wrapping would eat the sequence.
         assert_eq!(
             TerminalMux::Zellij.wrap_for_mux(OSC52_WITH_ST.to_string()),
             OSC52_WITH_ST
@@ -261,9 +251,8 @@ mod tests {
         assert_eq!(parse_dcs_passthrough(&wrapped, "\u{1b}P"), OSC52_WITH_ST);
     }
 
-    // A payload with ESC bytes at multiple positions: if any of them gets left
-    // undoubled, the first undoubled `ESC \` would close the DCS early and
-    // truncate the payload, and this round-trip would fail.
+    // Multiple interior ESC bytes: if any gets left undoubled, the first
+    // bare `ESC \` would close the DCS early and truncate everything after.
     #[test]
     fn tmux_preserves_payload_with_multiple_interior_esc_bytes() {
         let payload = "\u{1b}A\u{1b}B\u{1b}C\u{1b}\\";
@@ -271,8 +260,6 @@ mod tests {
         assert_eq!(parse_dcs_passthrough(&wrapped, "\u{1b}Ptmux;"), payload);
     }
 
-    // End-to-end: feed the actual crossterm OSC52 output through the wrapper,
-    // confirming the full real pipeline isn't lossy.
     #[test]
     fn tmux_wrap_roundtrips_crossterm_osc52_output() {
         let mut sequence = String::new();

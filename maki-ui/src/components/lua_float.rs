@@ -31,6 +31,7 @@ struct OpenState {
     cmd_rx: flume::Receiver<WinCommand>,
     cached_lines: Arc<Vec<SnapshotLine>>,
     viewport_h: u16,
+    content_width: u16,
 }
 
 pub(crate) struct LuaFloatWindow {
@@ -61,6 +62,7 @@ impl LuaFloatWindow {
             cmd_rx,
             cached_lines,
             viewport_h: 1,
+            content_width: 0,
         });
     }
 
@@ -148,6 +150,11 @@ impl LuaFloatWindow {
         };
 
         s.viewport_h = content_area.height;
+        let w = content_area.width;
+        if s.content_width != w {
+            let _ = s.event_tx.try_send(WinEvent::Resize { width: w });
+        }
+        s.content_width = w;
         adjust_scroll(s);
 
         let vh = s.viewport_h as usize;
@@ -211,6 +218,8 @@ fn adjust_scroll(s: &mut OpenState) {
     if vh == 0 {
         return;
     }
+    let max_offset = s.cached_lines.len().saturating_sub(vh);
+    s.scroll_offset = s.scroll_offset.min(max_offset);
     if s.cursor < s.scroll_offset {
         s.scroll_offset = s.cursor;
     } else if s.cursor >= s.scroll_offset + vh {
@@ -238,6 +247,7 @@ impl Overlay for LuaFloatWindow {
 mod tests {
     use super::*;
     use maki_agent::{SnapshotSpan, SpanStyle};
+    use test_case::test_case;
 
     fn make_line(text: &str) -> SnapshotLine {
         SnapshotLine {
@@ -405,6 +415,27 @@ mod tests {
     }
 
     #[test]
+    fn scroll_clamps_when_viewport_expands() {
+        let mut win = LuaFloatWindow::new();
+        let (_event_rx, cmd_tx) = open_with_lines(&mut win, &["a", "b"]);
+        assert_eq!(state(&win).viewport_h, 1);
+        cmd_tx.send(WinCommand::SetCursor(1)).unwrap();
+        win.tick();
+        assert_eq!(
+            state(&win).scroll_offset,
+            1,
+            "scroll_offset pushed by small viewport"
+        );
+        state_mut(&mut win).viewport_h = 5;
+        adjust_scroll(state_mut(&mut win));
+        assert_eq!(
+            state(&win).scroll_offset,
+            0,
+            "scroll_offset clamped after viewport grows"
+        );
+    }
+
+    #[test]
     fn channel_disconnect_closes() {
         let mut win = LuaFloatWindow::new();
         let (event_tx, cmd_rx, _event_rx, cmd_tx) = make_channels();
@@ -414,5 +445,80 @@ mod tests {
         drop(cmd_tx);
         win.tick();
         assert!(!win.is_open());
+    }
+
+    fn make_open_state(
+        cursor: usize,
+        scroll_offset: usize,
+        num_lines: usize,
+        viewport_h: u16,
+    ) -> OpenState {
+        let (event_tx, cmd_rx, _event_rx, _cmd_tx) = make_channels();
+        let buf = Arc::new(SharedBuf::new());
+        let lines: Vec<_> = (0..num_lines).map(|_| make_line("x")).collect();
+        OpenState {
+            buf,
+            title: String::new(),
+            footer: vec![],
+            cursor_line: true,
+            cursor,
+            scroll_offset,
+            event_tx,
+            cmd_rx,
+            cached_lines: Arc::new(lines),
+            viewport_h,
+            content_width: 0,
+        }
+    }
+
+    #[test_case(0, 5, 0, 10 => 0 ; "empty_content")]
+    #[test_case(3, 5, 10, 0 => 5 ; "zero_viewport_is_noop")]
+    #[test_case(2, 5, 20, 5 => 2 ; "cursor_above_viewport")]
+    #[test_case(15, 0, 20, 5 => 11 ; "cursor_below_viewport")]
+    #[test_case(7, 0, 10, 1 => 7 ; "single_line_viewport")]
+    fn adjust_scroll_cases(cursor: usize, scroll: usize, lines: usize, vh: u16) -> usize {
+        let mut s = make_open_state(cursor, scroll, lines, vh);
+        adjust_scroll(&mut s);
+        s.scroll_offset
+    }
+
+    #[test]
+    fn set_cursor_on_empty_content() {
+        let mut win = LuaFloatWindow::new();
+        let (event_tx, cmd_rx, _event_rx, cmd_tx) = make_channels();
+        let buf = Arc::new(SharedBuf::new());
+        win.open(buf, make_opts(), event_tx, cmd_rx);
+        cmd_tx.send(WinCommand::SetCursor(5)).unwrap();
+        win.tick();
+        assert_eq!(state(&win).cursor, 0, "cursor clamps to 0 on empty buf");
+    }
+
+    #[test]
+    fn multiple_commands_in_single_tick() {
+        let mut win = LuaFloatWindow::new();
+        let (_event_rx, cmd_tx) = open_with_lines(&mut win, &["a", "b", "c", "d", "e"]);
+        cmd_tx
+            .send(WinCommand::SetConfig {
+                title: Some("Updated".to_string()),
+                footer: None,
+            })
+            .unwrap();
+        cmd_tx.send(WinCommand::SetCursor(3)).unwrap();
+        win.tick();
+        assert_eq!(state(&win).title, "Updated");
+        assert_eq!(state(&win).cursor, 3);
+    }
+
+    #[test]
+    fn reopen_after_close() {
+        let mut win = LuaFloatWindow::new();
+        let (_event_rx, _cmd_tx) = open_with_lines(&mut win, &["first"]);
+        win.handle_key(key(KeyCode::Esc));
+        assert!(!win.is_open());
+
+        let (_event_rx2, _cmd_tx2) = open_with_lines(&mut win, &["second", "third"]);
+        assert!(win.is_open());
+        assert_eq!(state(&win).cached_lines.len(), 2);
+        assert_eq!(state(&win).cursor, 0, "cursor resets on reopen");
     }
 }

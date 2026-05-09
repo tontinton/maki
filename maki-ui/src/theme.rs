@@ -285,6 +285,9 @@ pub fn style_by_name(name: &str) -> Style {
         "line_nr" | "index_line_nr" => t.index_line_nr,
         "diff_old" => t.diff_old,
         "diff_new" => t.diff_new,
+        "cmd_selected" => t.cmd_selected,
+        "cmd_name" => t.cmd_name,
+        "cmd_desc" => t.cmd_desc,
         _ => Style::default(),
     }
 }
@@ -763,6 +766,7 @@ fn brighten_toward(style: Style, from: Color, to: Color, t: f32) -> Style {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use test_case::test_case;
 
     fn dracula_toml() -> &'static str {
         BUNDLED_THEMES
@@ -772,44 +776,117 @@ mod tests {
             .toml
     }
 
-    #[test]
-    fn bundled_theme_loads() {
-        let theme = Theme::from_toml(dracula_toml()).unwrap();
-        assert_eq!(theme.background, Color::Rgb(0x28, 0x2a, 0x36));
-        assert_eq!(theme.foreground, Color::Rgb(0xf8, 0xf8, 0xf2));
+    fn dracula() -> Theme {
+        Theme::from_toml(dracula_toml()).unwrap()
     }
 
     #[test]
-    fn palette_colors_resolve_to_styles() {
-        let theme = Theme::from_toml(dracula_toml()).unwrap();
-        assert_eq!(theme.user.fg, Some(Color::Rgb(0x8b, 0xe9, 0xfd)));
-        assert_eq!(theme.error.fg, Some(Color::Rgb(0xff, 0x55, 0x55)));
+    fn dracula_theme_fields() {
+        let t = dracula();
+        assert_eq!(t.background, Color::Rgb(0x28, 0x2a, 0x36));
+        assert_eq!(t.foreground, Color::Rgb(0xf8, 0xf8, 0xf2));
+        assert_eq!(t.user.fg, Some(Color::Rgb(0x8b, 0xe9, 0xfd)));
+        assert_eq!(t.error.fg, Some(Color::Rgb(0xff, 0x55, 0x55)));
+        assert!(t.bold.add_modifier.contains(Modifier::BOLD));
+        assert!(t.thinking.add_modifier.contains(Modifier::ITALIC));
+        assert!(t.strikethrough.add_modifier.contains(Modifier::CROSSED_OUT));
+        assert_eq!(t.diff_old.bg, Some(Color::Rgb(0x4D, 0x1F, 0x1F)));
+        assert_eq!(t.diff_new.bg, Some(Color::Rgb(0x1F, 0x3D, 0x1F)));
+        assert_eq!(t.input_border.fg, Some(Color::Rgb(0x62, 0x72, 0xa4)));
     }
 
     #[test]
-    fn modifiers_applied() {
-        let theme = Theme::from_toml(dracula_toml()).unwrap();
-        assert!(theme.bold.add_modifier.contains(Modifier::BOLD));
-        assert!(theme.thinking.add_modifier.contains(Modifier::ITALIC));
-        assert!(
-            theme
-                .strikethrough
-                .add_modifier
-                .contains(Modifier::CROSSED_OUT)
-        );
+    fn dracula_derivations() {
+        let t = dracula();
+        assert_eq!(t.mode_build, Color::Rgb(0x8b, 0xe9, 0xfd));
+        assert_eq!(t.mode_plan, Color::Rgb(0xff, 0x79, 0xc6));
+        assert_eq!(t.heading.fg, Some(Color::Rgb(0x8b, 0xe9, 0xfd)));
+        assert!(t.heading.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(t.inline_code.fg, Some(Color::Rgb(0x50, 0xfa, 0x7b)));
+        assert_eq!(t.code_bar.fg, Some(Color::Rgb(0xff, 0xb8, 0x6c)));
+        assert_eq!(t.list_marker.fg, Some(Color::Rgb(0x8b, 0xe9, 0xfd)));
+        assert_eq!(t.bold.fg, Some(Color::Rgb(0xff, 0xb8, 0x6c)));
     }
 
     #[test]
-    fn inline_hex_colors_resolve() {
-        let theme = Theme::from_toml(dracula_toml()).unwrap();
-        assert_eq!(theme.diff_old.bg, Some(Color::Rgb(0x4D, 0x1F, 0x1F)));
-        assert_eq!(theme.diff_new.bg, Some(Color::Rgb(0x1F, 0x3D, 0x1F)));
+    fn dracula_syntax_scopes() {
+        let t = dracula();
+        assert!(!t.syntax.scopes.is_empty());
+        assert!(t.syntax.settings.foreground.is_some());
+        assert!(t.syntax.settings.background.is_some());
+    }
+
+    const COMMENT_COLOR: SynColor = SynColor {
+        r: 0x62,
+        g: 0x72,
+        b: 0xa4,
+        a: 0xFF,
+    };
+    const STRING_COLOR: SynColor = SynColor {
+        r: 0xf1,
+        g: 0xfa,
+        b: 0x8c,
+        a: 0xFF,
+    };
+    const PINK_COLOR: SynColor = SynColor {
+        r: 0xff,
+        g: 0x79,
+        b: 0xc6,
+        a: 0xFF,
+    };
+    const CYAN_COLOR: SynColor = SynColor {
+        r: 0x8b,
+        g: 0xe9,
+        b: 0xfd,
+        a: 0xFF,
+    };
+
+    fn resolve_color_for_scope(
+        theme: &syntect::highlighting::Theme,
+        scope_str: &str,
+    ) -> Option<SynColor> {
+        use syntect::parsing::ScopeStack;
+
+        let stack: ScopeStack = scope_str.parse().unwrap();
+        let mut best_item: Option<&ThemeItem> = None;
+        let mut best_score: f64 = 0.0;
+        for item in &theme.scopes {
+            if let Some(score) = item.scope.does_match(stack.as_slice())
+                && score.0 > best_score
+            {
+                best_score = score.0;
+                best_item = Some(item);
+            }
+        }
+        best_item.and_then(|item| item.style.foreground)
     }
 
     #[test]
-    fn input_border_resolves_to_style() {
-        let theme = Theme::from_toml(dracula_toml()).unwrap();
-        assert_eq!(theme.input_border.fg, Some(Color::Rgb(0x62, 0x72, 0xa4)));
+    fn scope_resolution_maps_helix_to_textmate() {
+        let t = dracula();
+        let cases: &[(&str, SynColor)] = &[
+            (
+                "source.rust comment.line.double-slash.rust punctuation.definition.comment.rust",
+                COMMENT_COLOR,
+            ),
+            ("source.rust comment.line.double-slash.rust", COMMENT_COLOR),
+            (
+                "source.rust string.quoted.double.rust punctuation.definition.string.begin.rust",
+                STRING_COLOR,
+            ),
+            ("source.rust meta.generic.rust", CYAN_COLOR),
+            (
+                "source.rust meta.path.rust punctuation.accessor.rust",
+                PINK_COLOR,
+            ),
+        ];
+        for (scope, expected) in cases {
+            assert_eq!(
+                resolve_color_for_scope(&t.syntax, scope),
+                Some(*expected),
+                "scope {scope} should resolve correctly"
+            );
+        }
     }
 
     #[test]
@@ -841,47 +918,8 @@ mod tests {
     }
 
     #[test]
-    fn load_by_name_known() {
-        let theme = load_by_name("dracula").unwrap();
-        assert_eq!(theme.background, Color::Rgb(0x28, 0x2a, 0x36));
-    }
-
-    #[test]
     fn load_by_name_unknown() {
         assert!(load_by_name("nonexistent").is_err());
-    }
-
-    #[test]
-    fn syntax_theme_built_from_toml_scopes() {
-        let theme = Theme::from_toml(dracula_toml()).unwrap();
-        assert!(
-            !theme.syntax.scopes.is_empty(),
-            "syntax scopes should be populated from toml"
-        );
-        assert!(theme.syntax.settings.foreground.is_some());
-        assert!(theme.syntax.settings.background.is_some());
-    }
-
-    #[test]
-    fn syntax_theme_keyword_has_correct_color() {
-        let theme = Theme::from_toml(dracula_toml()).unwrap();
-        let keyword_scope: ScopeSelectors = "keyword".parse().unwrap();
-        let keyword_item = theme
-            .syntax
-            .scopes
-            .iter()
-            .find(|item| format!("{:?}", item.scope) == format!("{:?}", keyword_scope));
-        assert!(keyword_item.is_some(), "keyword scope should exist");
-        let style = keyword_item.unwrap().style;
-        assert_eq!(
-            style.foreground,
-            Some(SynColor {
-                r: 0xff,
-                g: 0x79,
-                b: 0xc6,
-                a: 0xFF
-            })
-        );
     }
 
     #[test]
@@ -901,141 +939,6 @@ comment = "#6272a4"
         let theme = Theme::from_toml(toml).unwrap();
         assert!(!theme.syntax.scopes.is_empty());
         assert_eq!(theme.background, Color::Rgb(0x28, 0x2a, 0x36));
-    }
-
-    const COMMENT_COLOR: SynColor = SynColor {
-        r: 0x62,
-        g: 0x72,
-        b: 0xa4,
-        a: 0xFF,
-    };
-    const STRING_COLOR: SynColor = SynColor {
-        r: 0xf1,
-        g: 0xfa,
-        b: 0x8c,
-        a: 0xFF,
-    };
-    const PINK_COLOR: SynColor = SynColor {
-        r: 0xff,
-        g: 0x79,
-        b: 0xc6,
-        a: 0xFF,
-    };
-
-    fn resolve_color_for_scope(
-        theme: &syntect::highlighting::Theme,
-        scope_str: &str,
-    ) -> Option<SynColor> {
-        use syntect::parsing::ScopeStack;
-
-        let stack: ScopeStack = scope_str.parse().unwrap();
-        let mut best_item: Option<&ThemeItem> = None;
-        let mut best_score: f64 = 0.0;
-        for item in &theme.scopes {
-            if let Some(score) = item.scope.does_match(stack.as_slice())
-                && score.0 > best_score
-            {
-                best_score = score.0;
-                best_item = Some(item);
-            }
-        }
-        best_item.and_then(|item| item.style.foreground)
-    }
-
-    #[test]
-    fn comment_delimiter_gets_comment_color() {
-        let theme = Theme::from_toml(dracula_toml()).unwrap();
-        let color = resolve_color_for_scope(
-            &theme.syntax,
-            "source.rust comment.line.double-slash.rust punctuation.definition.comment.rust",
-        );
-        assert_eq!(color, Some(COMMENT_COLOR));
-    }
-
-    #[test]
-    fn comment_body_gets_comment_color() {
-        let theme = Theme::from_toml(dracula_toml()).unwrap();
-        let color =
-            resolve_color_for_scope(&theme.syntax, "source.rust comment.line.double-slash.rust");
-        assert_eq!(color, Some(COMMENT_COLOR));
-    }
-
-    #[test]
-    fn string_quote_gets_string_color() {
-        let theme = Theme::from_toml(dracula_toml()).unwrap();
-        let color = resolve_color_for_scope(
-            &theme.syntax,
-            "source.rust string.quoted.double.rust punctuation.definition.string.begin.rust",
-        );
-        assert_eq!(color, Some(STRING_COLOR));
-    }
-
-    const CYAN_COLOR: SynColor = SynColor {
-        r: 0x8b,
-        g: 0xe9,
-        b: 0xfd,
-        a: 0xFF,
-    };
-
-    #[test]
-    fn non_builtin_type_in_generic_position_gets_type_color() {
-        let theme = Theme::from_toml(dracula_toml()).unwrap();
-        let color = resolve_color_for_scope(&theme.syntax, "source.rust meta.generic.rust");
-        assert_eq!(color, Some(CYAN_COLOR));
-    }
-
-    #[test]
-    fn double_colon_accessor_gets_pink() {
-        let theme = Theme::from_toml(dracula_toml()).unwrap();
-        let color = resolve_color_for_scope(
-            &theme.syntax,
-            "source.rust meta.path.rust punctuation.accessor.rust",
-        );
-        assert_eq!(color, Some(PINK_COLOR));
-    }
-
-    #[test]
-    fn derives_mode_build_from_keyword_storage_type() {
-        let theme = Theme::from_toml(dracula_toml()).unwrap();
-        assert_eq!(theme.mode_build, Color::Rgb(0x8b, 0xe9, 0xfd));
-    }
-
-    #[test]
-    fn derives_mode_plan_from_keyword() {
-        let theme = Theme::from_toml(dracula_toml()).unwrap();
-        assert_eq!(theme.mode_plan, Color::Rgb(0xff, 0x79, 0xc6));
-    }
-
-    #[test]
-    fn derives_heading_from_keyword_storage_type() {
-        let theme = Theme::from_toml(dracula_toml()).unwrap();
-        assert_eq!(theme.heading.fg, Some(Color::Rgb(0x8b, 0xe9, 0xfd)));
-        assert!(theme.heading.add_modifier.contains(Modifier::BOLD));
-    }
-
-    #[test]
-    fn derives_inline_code_from_function_call() {
-        let theme = Theme::from_toml(dracula_toml()).unwrap();
-        assert_eq!(theme.inline_code.fg, Some(Color::Rgb(0x50, 0xfa, 0x7b)));
-    }
-
-    #[test]
-    fn derives_code_bar_from_variable_parameter() {
-        let theme = Theme::from_toml(dracula_toml()).unwrap();
-        assert_eq!(theme.code_bar.fg, Some(Color::Rgb(0xff, 0xb8, 0x6c)));
-    }
-
-    #[test]
-    fn derives_list_marker_from_keyword_storage_type() {
-        let theme = Theme::from_toml(dracula_toml()).unwrap();
-        assert_eq!(theme.list_marker.fg, Some(Color::Rgb(0x8b, 0xe9, 0xfd)));
-    }
-
-    #[test]
-    fn derives_bold_from_markup_bold() {
-        let theme = Theme::from_toml(dracula_toml()).unwrap();
-        assert_eq!(theme.bold.fg, Some(Color::Rgb(0xff, 0xb8, 0x6c)));
-        assert!(theme.bold.add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]
@@ -1099,8 +1002,8 @@ mode_build = "#112233"
     }
 
     #[test]
-    fn style_by_name_aliases_resolve() {
-        set(Theme::from_toml(dracula_toml()).unwrap());
+    fn style_by_name_resolves() {
+        set(dracula());
         let t = current();
         assert_eq!(style_by_name("dim"), t.tool_dim);
         assert_eq!(style_by_name("tool_dim"), t.tool_dim);
@@ -1112,23 +1015,20 @@ mode_build = "#112233"
         assert_eq!(style_by_name("index_section"), t.index_section);
         assert_eq!(style_by_name("line_nr"), t.index_line_nr);
         assert_eq!(style_by_name("index_line_nr"), t.index_line_nr);
-    }
-
-    #[test]
-    fn style_by_name_direct_names() {
-        set(Theme::from_toml(dracula_toml()).unwrap());
-        let t = current();
         assert_eq!(style_by_name("tool"), t.tool);
         assert_eq!(style_by_name("error"), t.error);
         assert_eq!(style_by_name("bold"), t.bold);
         assert_eq!(style_by_name("diff_old"), t.diff_old);
         assert_eq!(style_by_name("diff_new"), t.diff_new);
+        assert_eq!(style_by_name("cmd_selected"), t.cmd_selected);
+        assert_eq!(style_by_name("cmd_name"), t.cmd_name);
+        assert_eq!(style_by_name("cmd_desc"), t.cmd_desc);
     }
 
-    #[test]
-    fn style_by_name_unknown_returns_default() {
-        assert_eq!(style_by_name("nonexistent_style"), Style::default());
-        assert_eq!(style_by_name(""), Style::default());
-        assert_eq!(style_by_name("typo_keyword"), Style::default());
+    #[test_case("nonexistent_style")]
+    #[test_case("")]
+    #[test_case("typo_keyword")]
+    fn style_by_name_unknown_returns_default(name: &str) {
+        assert_eq!(style_by_name(name), Style::default());
     }
 }

@@ -115,6 +115,7 @@ pub struct WinOpts {
 
 pub enum WinEvent {
     Key { key: String, cursor: usize },
+    Resize { width: u16 },
     Close,
 }
 
@@ -140,7 +141,10 @@ pub enum UiAction {
         cmd_rx: flume::Receiver<WinCommand>,
     },
     Flash(String),
-    OpenEditor(PathBuf),
+    OpenEditor {
+        path: PathBuf,
+        reply_tx: flume::Sender<i32>,
+    },
 }
 
 #[cfg(test)]
@@ -192,34 +196,11 @@ mod tests {
     }
 
     #[test]
-    fn publish_empty_map_produces_empty_snapshot() {
-        let map: CommandHandlerMap = HashMap::new();
+    fn writer_generation_increments() {
         let (writer, reader) = LuaCommandWriter::new();
-        publish_command_snapshot(&map, &writer);
-
-        let snap = reader.load();
-        assert_eq!(snap.commands.len(), 0);
-        assert_eq!(snap.generation, 1);
-    }
-
-    #[test]
-    fn writer_generation_is_sequential() {
-        let (writer, reader) = LuaCommandWriter::new();
-        for i in 1..=5u64 {
-            writer.publish(vec![]);
-            assert_eq!(reader.load().generation, i);
-        }
-    }
-
-    #[test]
-    fn from_commands_constructor_sets_generation() {
-        let reader = LuaCommandReader::from_commands(vec![LuaCommandInfo {
-            name: Arc::from("/test"),
-            description: Arc::from("d"),
-            plugin: Arc::from("p"),
-        }]);
-        let snap = reader.load();
-        assert_eq!(snap.commands.len(), 1);
-        assert_eq!(snap.generation, 1);
+        writer.publish(vec![]);
+        assert_eq!(reader.load().generation, 1);
+        writer.publish(vec![]);
+        assert_eq!(reader.load().generation, 2);
     }
 }

@@ -313,10 +313,15 @@ impl<'t> EventLoop<'t> {
                     UiAction::Flash(msg) => {
                         self.app.flash(msg);
                     }
-                    UiAction::OpenEditor(path) => {
-                        if let Err(e) = crate::terminal::open_in_editor(&path, self.terminal) {
-                            self.app.flash(e);
-                        }
+                    UiAction::OpenEditor { path, reply_tx } => {
+                        let code = match crate::terminal::open_in_editor(&path, self.terminal) {
+                            Ok(code) => code,
+                            Err(e) => {
+                                self.app.flash(e);
+                                -1
+                            }
+                        };
+                        let _ = reply_tx.send(code);
                     }
                     UiAction::OpenWin {
                         buf,

@@ -47,6 +47,12 @@ impl UserData for WinHandle {
                     tbl.set("cursor", cursor + 1)?;
                     Ok(mlua::Value::Table(tbl))
                 }
+                Ok(WinEvent::Resize { width }) => {
+                    let tbl = lua.create_table()?;
+                    tbl.set("type", "resize")?;
+                    tbl.set("width", width)?;
+                    Ok(mlua::Value::Table(tbl))
+                }
                 Ok(WinEvent::Close) => {
                     this.closed = true;
                     let tbl = lua.create_table()?;

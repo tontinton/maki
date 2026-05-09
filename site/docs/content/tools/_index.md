@@ -145,7 +145,7 @@ Create or update a structured todo list to track tasks.
 |-----------|------|----------|-------------|
 | `todos` | array | yes | The updated todo list |
 
-### `memory`
+### `memory` *(lua plugin)*
 
 Persistent, project-scoped scratchpad for learnings, patterns, decisions, and gotchas across sessions.
 

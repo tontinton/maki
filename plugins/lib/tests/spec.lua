@@ -257,6 +257,86 @@ case("tool_view_append_after_toggle_still_works", function()
   eq(view.all_lines[6], "line6")
 end)
 
+local ListPicker = require("list_picker")
+local render_lines = ListPicker._render_lines
+
+case("render_lines_string_items_basic", function()
+  local lines = render_lines({ "alpha", "beta" }, 1, 40)
+  eq(#lines, 2)
+  eq(lines[1][1][1], "  alpha")
+  eq(lines[1][1][2], "cmd_selected")
+  eq(lines[2][1][2], "cmd_name")
+end)
+
+case("render_lines_table_items_with_detail", function()
+  local items = {
+    { label = "foo", detail = "(3 bytes)" },
+    { label = "bar", detail = "(10 bytes)" },
+  }
+  local lines = render_lines(items, 2, 60)
+  eq(lines[1][1][2], "cmd_name", "unselected label style")
+  eq(lines[1][3][2], "cmd_desc", "unselected detail style")
+  eq(lines[2][1][2], "cmd_selected", "selected label style")
+  eq(lines[2][3][2], "cmd_selected", "selected detail uses cmd_selected")
+end)
+
+case("render_lines_detail_padding_never_zero", function()
+  local label = string.rep("x", 50)
+  local detail = string.rep("y", 50)
+  local items = { { label = label, detail = detail } }
+  local lines = render_lines(items, 1, 20)
+  local pad_span = lines[1][2][1]
+  assert(#pad_span >= 1, "padding must be at least 1 space even when overflowing")
+end)
+
+case("render_lines_no_detail_fills_trailing", function()
+  local lines = render_lines({ "ab" }, 1, 10)
+  eq(#lines[1], 2, "label + trailing pad")
+  local trail = lines[1][2][1]
+  eq(#trail, 10 - 2 - 2, "trail = width - indent(2) - label_len(2)")
+end)
+
+case("render_lines_selected_index_out_of_range", function()
+  local lines = render_lines({ "a", "b" }, 99, 40)
+  eq(lines[1][1][2], "cmd_name")
+  eq(lines[2][1][2], "cmd_name")
+end)
+
+case("render_lines_empty_items", function()
+  local lines = render_lines({}, 1, 40)
+  eq(#lines, 0)
+end)
+
+case("render_lines_default_width_used", function()
+  local items = { "test" }
+  local lines_default = render_lines(items, 1)
+  local lines_explicit = render_lines(items, 1, 80)
+  eq(#lines_default[1], #lines_explicit[1], "default width should be 80")
+  eq(lines_default[1][2][1], lines_explicit[1][2][1])
+end)
+
+case("render_lines_mixed_string_and_table", function()
+  local items = { "plain", { label = "rich", detail = "info" } }
+  local lines = render_lines(items, 1, 40)
+  eq(lines[1][1][1], "  plain")
+  eq(#lines[1], 2, "string item: label + trailing")
+  eq(lines[2][1][1], "  rich")
+  eq(#lines[2], 4, "table item with detail: label + pad + detail + right_pad")
+end)
+
+case("render_lines_trailing_omitted_when_label_fills_width", function()
+  local label = string.rep("z", 10)
+  local lines = render_lines({ label }, 1, 12)
+  eq(#lines[1], 1, "no trailing span when width - indent - label <= 0")
+end)
+
+case("render_lines_detail_right_pad_always_present", function()
+  local items = { { label = "x", detail = "d" } }
+  local lines = render_lines(items, 1, 50)
+  local right_pad = lines[1][4][1]
+  eq(#right_pad, 2, "DETAIL_RIGHT_PAD = 2")
+end)
+
 if #failures > 0 then
   error(#failures .. " case(s) failed:\n\n" .. table.concat(failures, "\n\n"))
 end

@@ -1,5 +1,6 @@
 local ToolView = require("tool_view")
 local helpers = require("memory_helpers")
+local ListPicker = require("list_picker")
 
 local function memories_path_suffix()
   local cwd = maki.uv.cwd()
@@ -187,22 +188,44 @@ maki.api.register_command({
       return a[1] < b[1]
     end)
 
+    local function build_items()
+      local items = {}
+      for _, e in ipairs(entries) do
+        items[#items + 1] = { label = e[1], detail = "(" .. e[2] .. " bytes)" }
+      end
+      return items
+    end
+
+    local last_cursor = 1
     while true do
-      local event = maki.ui.select(entries, {
+      local event = ListPicker.open(build_items(), {
         title = " Memory Files ",
-        footer = { { "enter", "open" }, { "ctrl+o", "edit" }, { "ctrl+d", "delete" } },
-        format = function(item)
-          return { label = item[1], detail = "(" .. item[2] .. " bytes)" }
-        end,
-        on_delete = true,
+        cursor = last_cursor,
+        submit_keys = { "ctrl+o" },
+        footer = {
+          { "Enter", "open" },
+          { "Ctrl+O", "edit" },
+          { "Ctrl+D", "delete" },
+        },
       })
 
-      if not event or event.type == "close" then
-        return
-      elseif event.type == "choice" or event.type == "open_editor" then
+      if event.type == "close" then
+        break
+      end
+
+      last_cursor = event.index
+      if event.type == "choice" then
         local item = entries[event.index]
-        maki.ui.open_editor(maki.fs.joinpath(dir, item[1]))
-        return
+        if item then
+          local path = maki.fs.joinpath(dir, item[1])
+          local code = maki.ui.open_editor(path)
+          if code == 0 then
+            local meta = maki.fs.metadata(path)
+            if meta then
+              item[2] = meta.size
+            end
+          end
+        end
       elseif event.type == "delete" then
         local item = entries[event.index]
         local ok, err = maki.fs.rm(maki.fs.joinpath(dir, item[1]))
@@ -210,11 +233,16 @@ maki.api.register_command({
           maki.ui.flash("Deleted " .. item[1])
           table.remove(entries, event.index)
           if #entries == 0 then
-            return
+            break
+          end
+          if last_cursor > #entries then
+            last_cursor = #entries
           end
         else
           maki.ui.flash("Delete failed: " .. tostring(err))
         end
+      else
+        break
       end
     end
   end,

@@ -66,9 +66,21 @@ pub(crate) fn create_ui_table(
         let editor_tx = tx.clone();
         t.set(
             "open_editor",
-            lua.create_function(move |_, path: String| {
-                let _ = editor_tx.try_send(UiAction::OpenEditor(PathBuf::from(path)));
-                Ok(())
+            lua.create_async_function(move |_, path: String| {
+                let tx = editor_tx.clone();
+                async move {
+                    let (reply_tx, reply_rx) = flume::bounded::<i32>(1);
+                    if tx
+                        .try_send(UiAction::OpenEditor {
+                            path: PathBuf::from(path),
+                            reply_tx,
+                        })
+                        .is_err()
+                    {
+                        return Ok(-1);
+                    }
+                    Ok(reply_rx.recv_async().await.unwrap_or(-1))
+                }
             })?,
         )?;
 

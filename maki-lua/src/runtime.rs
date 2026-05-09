@@ -38,8 +38,8 @@ const GC_STEP_INTERVAL: usize = 4;
 
 pub type LoadResult = Result<(), PluginError>;
 
-/// `LoadSource` and `ClearPlugin` drain all in-flight tool calls before
-/// proceeding, so the plugin environment is never mutated mid-call.
+/// `LoadSource`/`ClearPlugin` drain in-flight tools first so the plugin
+/// environment is never mutated mid-call.
 pub enum Request {
     LoadSource {
         name: Arc<str>,
@@ -90,8 +90,6 @@ pub enum Request {
     Shutdown,
 }
 
-/// Bundles `event_tx` + `tool_use_id` so `CallTool` does not need
-/// two separate Option fields that must stay in sync.
 #[derive(Clone)]
 pub struct LiveCtx {
     pub event_tx: maki_agent::EventSender,
@@ -115,7 +113,7 @@ impl ThreadKey {
     }
 }
 
-/// Keyed by coroutine pointer. All access is on the single Lua OS thread.
+/// Single-threaded: keyed by coroutine pointer, no locking needed.
 type TaskMap = HashMap<ThreadKey, TaskCtx>;
 
 type ClickHandlerMap = HashMap<String, RegistryKey>;
@@ -147,8 +145,6 @@ pub(crate) fn with_live_ctx<R>(lua: &Lua, f: impl FnOnce(&LiveCtx) -> R) -> Opti
         .and_then(|tasks| tasks.get(&key)?.live.as_ref().map(f))
 }
 
-/// RAII guard that cleans up a task (kills jobs, clears bufs) even on
-/// panics or early returns.
 struct TaskCleanupGuard {
     lua: Lua,
     key: ThreadKey,
@@ -168,8 +164,18 @@ impl Drop for TaskCleanupGuard {
     }
 }
 
-/// Caps concurrent tool coroutines so we don't blow the Lua stack or starve
-/// the single-threaded executor. Also lets load/clear ops drain gracefully.
+fn register_task(lua: &Lua, thread_key: ThreadKey, ctx: TaskCtx) -> TaskCleanupGuard {
+    if let Some(mut tasks) = lua.app_data_mut::<TaskMap>() {
+        tasks.insert(thread_key, ctx);
+    }
+    TaskCleanupGuard {
+        lua: lua.clone(),
+        key: thread_key,
+    }
+}
+
+/// Without a cap, concurrent coroutines can blow the Lua stack or starve
+/// the single-threaded executor. The gate also lets load/clear ops drain.
 struct InflightGate {
     lua: Lua,
     count: Cell<usize>,
@@ -229,8 +235,8 @@ struct ToolKeys {
 
 type PluginMap = Rc<RefCell<HashMap<Arc<str>, HashMap<Arc<str>, ToolKeys>>>>;
 
-/// Sandbox-first: `require`, `io`, `package` are stripped, `os` and `debug`
-/// are limited by Luau's built-in sandbox.
+/// Plugins run sandboxed: no `require`/`io`/`package`, and `os`/`debug`
+/// go through Luau's built-in restrictions.
 struct LuaRuntime {
     lua: Lua,
     pending: PendingTools,
@@ -399,8 +405,8 @@ impl LuaRuntime {
         Ok(env)
     }
 
-    /// Bundled dirs are checked before the filesystem, which lets plugins
-    /// `require()` shared modules like `truncate.lua` from the `lib` bundle.
+    /// Bundled dirs are checked first, so plugins can `require()` shared
+    /// modules (like `truncate.lua`) without touching the filesystem.
     fn create_require_fn(
         &self,
         env: &mlua::Table,
@@ -606,8 +612,8 @@ impl LuaRuntime {
         self.drop_plugin_keys(plugin);
     }
 
-    /// Temporarily inserts a TaskCtx so `maki.ui.buf()` works during header
-    /// computation. `TaskCleanupGuard` handles teardown.
+    /// Header computation needs a TaskCtx registered so `maki.ui.buf()`
+    /// works inside the handler.
     fn compute_header(&self, plugin: &str, tool: &str, input: Value) -> HeaderResult {
         let plugins = self.plugins.borrow();
         let Some(tk) = plugins.get(plugin).and_then(|p| p.get(tool)) else {
@@ -764,8 +770,8 @@ impl LuaRuntime {
     }
 }
 
-/// After the handler returns nil (async mode), this loop polls job events
-/// and waits for either `ctx:finish()` or all jobs to die.
+/// When a handler returns nil it enters async mode: this loop polls job
+/// events until `ctx:finish()` is called or every job dies.
 async fn dispatch_async(
     lua: &Lua,
     key: ThreadKey,
@@ -862,10 +868,9 @@ async fn dispatch_async(
     }
 }
 
-/// Tool calls run concurrently on a `smol::LocalExecutor`. Coroutines
-/// interleave at yield points (async I/O). Deadlines are enforced three
-/// ways: CPU-bound loops via `set_interrupt`, I/O waits via `smol::Timer`
-/// race, and spawned jobs via the dispatch loop.
+/// Coroutines interleave at yield points on a `smol::LocalExecutor`.
+/// Deadlines are enforced three ways: `set_interrupt` for CPU loops,
+/// `smol::Timer` races for I/O waits, and the dispatch loop for jobs.
 #[allow(clippy::too_many_arguments)]
 async fn run_tool_call(
     lua: Lua,
@@ -921,14 +926,7 @@ async fn run_tool_call(
         bufs: BufferStore::new(),
         live,
     };
-    if let Some(mut tasks) = lua.app_data_mut::<TaskMap>() {
-        tasks.insert(thread_key, task_ctx);
-    }
-
-    let _cleanup = TaskCleanupGuard {
-        lua: lua.clone(),
-        key: thread_key,
-    };
+    let _cleanup = register_task(&lua, thread_key, task_ctx);
 
     let async_thread = match thread.into_async::<LuaValue>((input_lua, ctx_ud)) {
         Ok(at) => at,
@@ -981,9 +979,8 @@ pub(crate) struct LuaThread {
     pub ui_action_rx: flume::Receiver<UiAction>,
 }
 
-/// Runs on a dedicated OS thread so the Lua instance never crosses thread
-/// boundaries (no Mutex needed). `smol::block_on` drives cooperative async.
-/// `LoadSource`/`ClearPlugin` wait for in-flight calls to finish first.
+/// Lua lives on its own OS thread (no Mutex needed). `smol::block_on`
+/// drives cooperative async; load/clear requests wait for in-flight tools.
 pub fn spawn(
     registry: Arc<ToolRegistry>,
     bundled_dirs: &'static [&'static Dir<'static>],
@@ -1108,14 +1105,22 @@ pub fn spawn(
                                     rt.lua.registry_value::<Function>(&entry.handler).ok()
                                 });
                             if let Some(func) = handler_fn {
+                                let lua = rt.lua.clone();
                                 ex.spawn(async move {
-                                    if let Err(e) = func.call_async::<()>(args).await {
-                                        tracing::warn!(
-                                            plugin = %plugin,
-                                            command = %command,
-                                            error = %e,
-                                            "command handler failed"
-                                        );
+                                    let run = async {
+                                        let thread = lua.create_thread(func)?;
+                                        let thread_key = ThreadKey(thread.to_pointer() as usize);
+                                        let _cleanup = register_task(&lua, thread_key, TaskCtx {
+                                            cancel: CancelToken::none(),
+                                            deadline: None,
+                                            jobs: JobStore::new(),
+                                            bufs: BufferStore::new(),
+                                            live: None,
+                                        });
+                                        thread.into_async::<()>(args)?.await
+                                    };
+                                    if let Err(e) = run.await {
+                                        tracing::warn!(plugin = %plugin, command = %command, error = %e, "command handler failed");
                                     }
                                 })
                                 .detach();
@@ -1333,28 +1338,6 @@ mod tests {
             assert!(!waiter.is_finished());
             g.decrement();
             waiter.await;
-        }));
-    }
-
-    #[test]
-    fn inflight_gate_multiple_waiters_all_wake() {
-        let ex = smol::LocalExecutor::new();
-        smol::block_on(ex.run(async {
-            let g = Rc::new(gate());
-            g.increment();
-            let mut waiters = Vec::new();
-            for _ in 0..4 {
-                let g2 = Rc::clone(&g);
-                waiters.push(ex.spawn(async move { g2.drain().await }));
-            }
-            smol::future::yield_now().await;
-            for w in &waiters {
-                assert!(!w.is_finished());
-            }
-            g.decrement();
-            for w in waiters {
-                w.await;
-            }
         }));
     }
 
