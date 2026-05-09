@@ -81,12 +81,20 @@ fn agent_msg_with_run_id(event: AgentEvent, run_id: u64) -> Msg {
 }
 
 fn subagent_info(parent_id: &str, name: &str) -> SubagentInfo {
+    subagent_info_with_tx(parent_id, name, None)
+}
+
+fn subagent_info_with_tx(
+    parent_id: &str,
+    name: &str,
+    answer_tx: Option<flume::Sender<String>>,
+) -> SubagentInfo {
     SubagentInfo {
         parent_tool_use_id: parent_id.into(),
         name: name.into(),
         prompt: None,
         model: None,
-        answer_tx: None,
+        answer_tx,
     }
 }
 
@@ -845,7 +853,7 @@ fn pending_question_submit_routes_through_answer_tx() {
 }
 
 #[test_case(PendingInput::Question  ; "question")]
-#[test_case(PendingInput::AuthRetry ; "auth_retry")]
+#[test_case(PendingInput::AuthRetry { subagent_id: None } ; "auth_retry")]
 fn cancel_clears_pending_input(pending: PendingInput) {
     let mut app = test_app();
     app.status = Status::Streaming;
@@ -1766,16 +1774,6 @@ fn retry_clears_subagent_in_progress_tools() {
     assert!(app.retry_info.is_none());
 }
 
-#[test]
-fn auth_required_sets_pending_auth_retry() {
-    let mut app = test_app();
-    app.status = Status::Streaming;
-    app.run_id = 1;
-    app.update(agent_msg(AgentEvent::AuthRequired));
-    assert_eq!(app.pending_input, PendingInput::AuthRetry);
-    assert_eq!(app.chats[0].last_message_text(), AUTH_EXPIRED_MSG,);
-}
-
 fn auth_retry_enter(app: &mut App) -> Vec<Action> {
     app.update(Msg::Key(key(KeyCode::Enter)))
 }
@@ -1794,12 +1792,110 @@ fn auth_retry_sends_empty_answer(submit: fn(&mut App) -> Vec<Action>) {
     app.answer_tx = Some(tx);
 
     app.update(agent_msg(AgentEvent::AuthRequired));
-    assert_eq!(app.pending_input, PendingInput::AuthRetry);
+    assert!(matches!(
+        app.pending_input,
+        PendingInput::AuthRetry { subagent_id: None }
+    ));
 
     let actions = submit(&mut app);
     assert!(actions.is_empty());
     assert_eq!(app.pending_input, PendingInput::None);
     assert_eq!(rx.try_recv().unwrap(), "");
+}
+
+fn app_with_subagent_tx(id: &str) -> (App, flume::Receiver<String>, flume::Receiver<String>) {
+    let (sub_tx, sub_rx) = flume::unbounded();
+    let (main_tx, main_rx) = flume::unbounded();
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    app.answer_tx = Some(main_tx);
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::TextDelta { text: "x".into() },
+        subagent: Some(subagent_info_with_tx(id, "research", Some(sub_tx))),
+        run_id: 1,
+    })));
+    (app, sub_rx, main_rx)
+}
+
+#[test]
+fn auth_required_in_subagent_shows_in_both_chats() {
+    let mut app = app_with_subagent_id("sub1");
+    app.update(subagent_msg(
+        AgentEvent::AuthRequired,
+        "sub1",
+        Some("research"),
+    ));
+
+    assert_eq!(app.chats[1].last_message_text(), AUTH_EXPIRED_MSG);
+    assert_eq!(app.chats[0].last_message_text(), AUTH_EXPIRED_MSG);
+    assert!(matches!(
+        app.pending_input,
+        PendingInput::AuthRetry { subagent_id: Some(ref id) } if id == "sub1"
+    ));
+}
+
+#[test]
+fn auth_retry_in_subagent_routes_to_subagent_channel() {
+    let (mut app, sub_rx, main_rx) = app_with_subagent_tx("sub1");
+    app.update(subagent_msg(
+        AgentEvent::AuthRequired,
+        "sub1",
+        Some("research"),
+    ));
+    let actions = app.update(Msg::Key(key(KeyCode::Enter)));
+
+    assert!(actions.is_empty());
+    assert_eq!(app.pending_input, PendingInput::None);
+    assert_eq!(sub_rx.try_recv().unwrap(), "");
+    assert!(main_rx.try_recv().is_err());
+}
+
+#[test]
+fn cancel_clears_subagent_auth_retry() {
+    let (mut app, sub_rx, _main_rx) = app_with_subagent_tx("sub1");
+    app.update(subagent_msg(
+        AgentEvent::AuthRequired,
+        "sub1",
+        Some("research"),
+    ));
+
+    cancel_app(&mut app);
+
+    assert_eq!(app.pending_input, PendingInput::None);
+    assert!(sub_rx.try_recv().is_err());
+}
+
+#[test]
+fn stale_auth_required_after_cancel_is_dropped() {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 2;
+    let count_before = app.chats[0].message_count();
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::AuthRequired,
+        subagent: None,
+        run_id: 1,
+    })));
+    assert_eq!(app.pending_input, PendingInput::None);
+    assert_eq!(app.chats[0].message_count(), count_before);
+}
+
+#[test]
+fn send_to_agent_unknown_subagent_falls_back_to_main() {
+    let (main_tx, main_rx) = flume::unbounded();
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    app.answer_tx = Some(main_tx);
+
+    app.pending_input = PendingInput::AuthRetry {
+        subagent_id: Some("nonexistent".into()),
+    };
+    app.update(Msg::Key(key(KeyCode::Enter)));
+
+    assert_eq!(main_rx.try_recv().unwrap(), "");
+    assert_eq!(app.pending_input, PendingInput::None);
 }
 
 #[test_case(42, false ; "restores_scroll_position")]

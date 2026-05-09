@@ -104,12 +104,14 @@ impl PickerItem for TaskEntry {
     }
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(super) enum PendingInput {
     #[default]
     None,
     Question,
-    AuthRetry,
+    AuthRetry {
+        subagent_id: Option<String>,
+    },
 }
 
 pub enum Msg {
@@ -318,6 +320,15 @@ impl App {
         }
     }
 
+    fn send_to_agent(&self, subagent_id: Option<&str>, answer: String) {
+        let routed = subagent_id.and_then(|id| self.subagent_answers.get(id));
+        if let Some(tx) = routed {
+            let _ = tx.try_send(answer);
+        } else {
+            self.send_answer(answer);
+        }
+    }
+
     fn handle_scroll(&mut self, column: u16, row: u16, delta: i32) {
         if self.btw_modal.is_open() {
             self.btw_modal.scroll(delta);
@@ -448,11 +459,7 @@ impl App {
                 let subagent_id = self.permission_prompt.subagent_id().map(str::to_owned);
                 let encoded = answer.encode();
                 self.permission_prompt.close();
-                if let Some(tx) = subagent_id.and_then(|id| self.subagent_answers.get(&id)) {
-                    let _ = tx.try_send(encoded);
-                } else {
-                    self.send_answer(encoded);
-                }
+                self.send_to_agent(subagent_id.as_deref(), encoded);
             }
             return vec![];
         }
@@ -765,16 +772,17 @@ impl App {
     }
 
     pub(crate) fn handle_submit(&mut self, sub: Submission) -> Vec<Action> {
-        if self.pending_input == PendingInput::AuthRetry {
-            self.pending_input = PendingInput::None;
-            self.send_answer(String::new());
-            return vec![];
-        }
-        if self.pending_input == PendingInput::Question {
-            self.pending_input = PendingInput::None;
-            self.main_chat().push_user_message(&sub.text);
-            self.send_answer(sub.text);
-            return vec![];
+        match std::mem::take(&mut self.pending_input) {
+            PendingInput::AuthRetry { subagent_id } => {
+                self.send_to_agent(subagent_id.as_deref(), String::new());
+                return vec![];
+            }
+            PendingInput::Question => {
+                self.main_chat().push_user_message(&sub.text);
+                self.send_answer(sub.text);
+                return vec![];
+            }
+            PendingInput::None => {}
         }
         if sub.is_empty() {
             return vec![];
@@ -943,6 +951,21 @@ impl App {
             return vec![];
         }
 
+        if let ChatEventResult::AuthRequired = result {
+            self.chats[chat_idx].push(DisplayMessage::new(
+                DisplayRole::Error,
+                AUTH_EXPIRED_MSG.into(),
+            ));
+            if chat_idx != 0 {
+                self.main_chat().push(DisplayMessage::new(
+                    DisplayRole::Error,
+                    AUTH_EXPIRED_MSG.into(),
+                ));
+            }
+            self.pending_input = PendingInput::AuthRetry { subagent_id };
+            return vec![];
+        }
+
         if chat_idx == 0 {
             match result {
                 ChatEventResult::Done => {
@@ -981,14 +1004,8 @@ impl App {
                         self.pending_input = PendingInput::Question;
                     }
                 }
-                ChatEventResult::AuthRequired => {
-                    self.main_chat().push(DisplayMessage::new(
-                        DisplayRole::Error,
-                        AUTH_EXPIRED_MSG.into(),
-                    ));
-                    self.pending_input = PendingInput::AuthRetry;
-                }
-                ChatEventResult::PermissionRequest { .. }
+                ChatEventResult::AuthRequired
+                | ChatEventResult::PermissionRequest { .. }
                 | ChatEventResult::QueueItemConsumed { .. } => unreachable!(),
                 ChatEventResult::Continue => {}
             }
