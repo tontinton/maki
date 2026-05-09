@@ -3,6 +3,7 @@ mod gen_config;
 mod gen_keybindings;
 mod gen_providers;
 mod gen_tools;
+mod lua_util;
 
 use std::fs;
 use std::path::Path;

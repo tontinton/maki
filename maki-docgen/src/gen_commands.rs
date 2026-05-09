@@ -2,6 +2,8 @@ use std::fmt::Write;
 
 use maki_ui::BUILTIN_COMMANDS;
 
+use crate::lua_util;
+
 pub fn generate() -> String {
     let mut out = String::new();
     writeln!(out, "+++").unwrap();
@@ -25,6 +27,9 @@ pub fn generate() -> String {
     writeln!(out, "| Command | Description |").unwrap();
     writeln!(out, "|---------|-------------|").unwrap();
     for cmd in BUILTIN_COMMANDS {
+        writeln!(out, "| `{}` | {} |", cmd.name, cmd.description).unwrap();
+    }
+    for cmd in &lua_util::load_builtin_plugin_commands() {
         writeln!(out, "| `{}` | {} |", cmd.name, cmd.description).unwrap();
     }
 

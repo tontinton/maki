@@ -27,6 +27,7 @@ Type `/` in the input box to open the command palette.
 | `/yolo` | Toggle YOLO mode (skip all permission prompts) |
 | `/thinking` | Toggle extended thinking (off, adaptive, or budget) |
 | `/exit` | Exit the application |
+| `/memory` | View, edit, and delete memory files |
 
 ## Custom commands
 

@@ -66,11 +66,17 @@ pub fn list_memory_files() -> Option<String> {
 pub fn list_memory_entries() -> Option<Vec<(String, u64)>> {
     let memories_dir = resolve_memories_read_dir().ok()?;
     let entries = collect_file_entries(&memories_dir);
-    if entries.is_empty() { None } else { Some(entries) }
+    if entries.is_empty() {
+        None
+    } else {
+        Some(entries)
+    }
 }
 
 fn collect_file_entries(dir: &Path) -> Vec<(String, u64)> {
-    let Ok(rd) = fs::read_dir(dir) else { return Vec::new() };
+    let Ok(rd) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
     let mut entries: Vec<(String, u64)> = rd
         .filter_map(|e| e.ok())
         .filter_map(|e| {
