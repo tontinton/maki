@@ -106,7 +106,7 @@ impl UserData for BufHandle {
 
         methods.add_method("len", |_lua, this, ()| Ok(this.buf.len()));
 
-        methods.add_method("on", |lua, _this, (event, callback): (String, Function)| {
+        methods.add_method("on", |lua, this, (event, callback): (String, Function)| {
             if event != "click" {
                 return Err(mlua::Error::runtime(format!("unsupported event: {event}")));
             }
@@ -114,9 +114,10 @@ impl UserData for BufHandle {
                 return Ok(());
             };
             let key = lua.create_registry_value(callback)?;
+            let buf = Arc::clone(&this.buf);
             with_click_handlers(lua, |handlers| {
-                if let Some(old) = handlers.insert(tool_id, key) {
-                    let _ = lua.remove_registry_value(old);
+                if let Some((old_key, _)) = handlers.insert(tool_id, (key, buf)) {
+                    let _ = lua.remove_registry_value(old_key);
                 }
             });
             Ok(())
@@ -541,7 +542,7 @@ mod tests {
 
     fn test_lua_with_handlers() -> mlua::Lua {
         let lua = test_lua();
-        lua.set_app_data(HashMap::<String, mlua::RegistryKey>::new());
+        lua.set_app_data(HashMap::<String, (mlua::RegistryKey, Arc<SharedBuf>)>::new());
         lua
     }
 
@@ -555,7 +556,7 @@ mod tests {
             .unwrap();
 
         let handlers = lua
-            .app_data_ref::<HashMap<String, mlua::RegistryKey>>()
+            .app_data_ref::<HashMap<String, (mlua::RegistryKey, Arc<SharedBuf>)>>()
             .unwrap();
         assert!(handlers.is_empty(), "no-op should not register a handler");
     }

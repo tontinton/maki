@@ -93,6 +93,22 @@ local function render_header(path, line_count)
   return buf
 end
 
+local function render_index(skeleton, path, ctx)
+  local tol = ctx:tool_output_lines()
+  local buf = maki.ui.buf()
+  local view = ToolView.new(buf, {
+    max_lines = (tol and tol.index) or 5,
+    keep = "head",
+  })
+  buf:on("click", function()
+    view:toggle()
+  end)
+  render_skeleton(view, skeleton)
+  view:finish()
+  local line_count = select(2, skeleton:gsub("\n", "\n")) + 1
+  return buf, render_header(path, line_count)
+end
+
 maki.api.register_tool({
   name = "index",
   description = [[
@@ -110,6 +126,10 @@ Return a compact overview of a source file: imports, type definitions, function 
   },
   header = function(input)
     return render_header(input.path)
+  end,
+  restore = function(output, input, _is_error, ctx)
+    local buf, header = render_index(output, input.path, ctx)
+    return { body = buf, header = header }
   end,
   handler = function(input, ctx)
     local path = input.path
@@ -160,24 +180,11 @@ Return a compact overview of a source file: imports, type definitions, function 
       return "error: " .. tostring(err)
     end
 
-    local tol = ctx:tool_output_lines()
-    local buf = maki.ui.buf()
-    local view = ToolView.new(buf, {
-      max_lines = (tol and tol.index) or 5,
-      keep = "head",
-    })
-    buf:on("click", function()
-      view:toggle()
-    end)
-
-    render_skeleton(view, skeleton)
-    view:finish()
-
-    local line_count = select(2, skeleton:gsub("\n", "\n")) + 1
+    local buf, header = render_index(skeleton, path, ctx)
     return {
       llm_output = skeleton,
       body = buf,
-      header = render_header(path, line_count),
+      header = header,
     }
   end,
 })

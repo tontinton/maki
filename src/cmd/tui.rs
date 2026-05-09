@@ -161,9 +161,11 @@ pub fn run(cli: Cli) -> Result<()> {
                 ui_action_rx,
                 lua_event_handle: plugin_host.event_handle(),
                 buf_click: plugin_host.event_handle().map(|eh| {
-                    Arc::new(move |tool_id: &str, row: u32| {
-                        eh.fire_click(tool_id, row);
-                    }) as maki_ui::BufClickHandler
+                    Arc::new(
+                        move |tool_id: &str, row: u32| -> Option<maki_agent::BufferSnapshot> {
+                            eh.fire_click(tool_id, row)
+                        },
+                    ) as maki_ui::BufClickHandler
                 }),
                 #[cfg(feature = "demo")]
                 demo: cli.demo,

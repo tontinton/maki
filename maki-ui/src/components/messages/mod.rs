@@ -195,12 +195,10 @@ impl MessagesPanel {
     }
 
     pub fn tool_done(&mut self, event: ToolDoneEvent) {
-        if self.has_snapshot(&event.id) {
-            if let Some(buf) = self.live_bufs.get(&event.id) {
-                buf.read_if_dirty();
-            }
-        } else {
-            self.live_bufs.remove(&event.id);
+        if let Some(buf) = self.live_bufs.remove(&event.id)
+            && let Some(lines) = buf.read_if_dirty()
+        {
+            self.store_snapshot(&event.id, BufferSnapshot::from_arc(lines));
         }
         let Some(msg) = self
             .messages

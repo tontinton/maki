@@ -40,6 +40,7 @@ pub(crate) struct PendingTool {
     pub(crate) audience: ToolAudience,
     pub(crate) handler_key: RegistryKey,
     pub(crate) header_key: Option<RegistryKey>,
+    pub(crate) restore_key: Option<RegistryKey>,
     pub(crate) permission_scope_kind: Option<PermissionScopeKind>,
     pub(crate) permission_scopes_key: Option<RegistryKey>,
 }
@@ -398,9 +399,13 @@ fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> Lua
     };
 
     let header_fn: Option<Function> = spec.get("header").ok();
+    let restore_fn: Option<Function> = spec.get("restore").ok();
     let audience = parse_audience(audiences)?;
     let handler_key: RegistryKey = lua.create_registry_value(handler)?;
     let header_key = header_fn
+        .map(|f| lua.create_registry_value(f))
+        .transpose()?;
+    let restore_key = restore_fn
         .map(|f| lua.create_registry_value(f))
         .transpose()?;
     let name: Arc<str> = Arc::from(name.as_str());
@@ -415,6 +420,7 @@ fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> Lua
             audience,
             handler_key,
             header_key,
+            restore_key,
             permission_scope_kind,
             permission_scopes_key,
         });

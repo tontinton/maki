@@ -47,11 +47,14 @@ impl App {
                         self.selection_state = None;
                         if zone == SelectionZone::Messages {
                             let area = self.msg_area();
-                            let chat = &mut self.chats[self.active_chat];
-                            match chat.handle_click(event.row, area) {
+                            let result = self.chats[self.active_chat].handle_click(event.row, area);
+                            match result {
                                 ClickResult::LuaToolClick { tool_id, row } => {
-                                    if let Some(handler) = &self.buf_click {
-                                        handler(&tool_id, row);
+                                    if let Some(handler) = &self.buf_click
+                                        && let Some(snapshot) = handler(&tool_id, row)
+                                    {
+                                        self.chats[self.active_chat]
+                                            .tool_snapshot(&tool_id, snapshot);
                                     }
                                 }
                                 ClickResult::Toggled | ClickResult::Nothing => {}

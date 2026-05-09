@@ -6,6 +6,18 @@ use mlua::{LuaSerdeExt, UserData, UserDataMethods, Value as LuaValue};
 use crate::api::tool::ToolCallReply;
 use crate::runtime::LiveCtx;
 
+pub(crate) struct RestoreCtx {
+    pub(crate) tool_output_lines: ToolOutputLines,
+}
+
+impl UserData for RestoreCtx {
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method("tool_output_lines", |lua, this, ()| {
+            lua.to_value(&this.tool_output_lines)
+        });
+    }
+}
+
 pub(crate) struct LuaCtx {
     pub(crate) cancel: CancelToken,
     pub(crate) config: AgentConfig,

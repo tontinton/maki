@@ -7,6 +7,7 @@ mod runtime;
 pub use api::command::{LuaCommandInfo, LuaCommandReader, UiAction, WinCommand, WinEvent, WinOpts};
 pub use error::PluginError;
 pub use loader::{EventHandle, PluginHost};
+pub use runtime::RestoreReply;
 
 pub mod test_support {
     use crate::api::command::{LuaCommandInfo, LuaCommandReader, LuaCommandWriter};

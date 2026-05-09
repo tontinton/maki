@@ -147,6 +147,10 @@ maki.api.register_tool({
     return input.command
   end,
 
+  restore = function(output, input, _is_error, ctx)
+    return render_content(output, input.path or "file.md", ctx)
+  end,
+
   handler = function(input, ctx)
     local cmd = input.command
     local dir, dir_err = resolve_dir(cmd == "view")

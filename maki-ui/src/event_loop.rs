@@ -10,7 +10,7 @@ use crossterm::event::{
 };
 use maki_agent::command::CustomCommand;
 use maki_agent::permissions::PermissionManager;
-use maki_agent::{AgentConfig, CancelToken, McpCommand};
+use maki_agent::{AgentConfig, BufferSnapshot, CancelToken, McpCommand};
 use maki_config::UiConfig;
 use maki_lua::{EventHandle, LuaCommandReader, UiAction};
 use maki_providers::Timeouts;
@@ -36,7 +36,7 @@ use crate::terminal;
 const ANIMATION_INTERVAL_MS: u64 = 16;
 const IDLE_POLL_INTERVAL_MS: u64 = 100;
 
-pub type BufClickHandler = Arc<dyn Fn(&str, u32) + Send + Sync>;
+pub type BufClickHandler = Arc<dyn Fn(&str, u32) -> Option<BufferSnapshot> + Send + Sync>;
 
 pub struct EventLoopParams {
     pub model: Model,

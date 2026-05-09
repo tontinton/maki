@@ -98,6 +98,7 @@ impl App {
             &self.state.session.messages,
             &self.state.session.tool_outputs,
             &self.ui_config.tool_output_lines,
+            self.lua_event_handle.as_ref(),
         );
         self.main_chat().load_messages(display_msgs);
         self.main_chat().token_usage = self.state.token_usage;
@@ -130,6 +131,7 @@ impl App {
                     messages,
                     &self.state.session.tool_outputs,
                     &self.ui_config.tool_output_lines,
+                    self.lua_event_handle.as_ref(),
                 );
                 chat.load_messages(display);
                 chat.mark_finished(DisplayRole::Done, DONE_TEXT);

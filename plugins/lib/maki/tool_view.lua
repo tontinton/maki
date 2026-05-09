@@ -109,4 +109,17 @@ function ToolView:finish()
   end
 end
 
+function ToolView.restore(output, opts)
+  local buf = maki.ui.buf()
+  local view = ToolView.new(buf, opts)
+  for line in (output .. "\n"):gmatch("([^\n]*)\n") do
+    view:append(line)
+  end
+  view:finish()
+  buf:on("click", function()
+    view:toggle()
+  end)
+  return buf
+end
+
 return ToolView

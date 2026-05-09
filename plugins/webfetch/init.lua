@@ -63,6 +63,11 @@ end
 local truncate = require("maki.truncate")
 local ToolView = require("maki.tool_view")
 
+local function web_view_opts(ctx)
+  local tol = ctx:tool_output_lines()
+  return { max_lines = (tol and tol.web) or 3, keep = "head" }
+end
+
 maki.api.register_tool({
   name = "webfetch",
   description = [[Fetch a URL and return its contents.
@@ -88,6 +93,10 @@ maki.api.register_tool({
       return input.url .. " [" .. fmt .. "]"
     end
     return input.url
+  end,
+
+  restore = function(output, _input, _is_error, ctx)
+    return ToolView.restore(output, web_view_opts(ctx))
   end,
 
   handler = function(input, ctx)
@@ -138,24 +147,9 @@ maki.api.register_tool({
 
     local llm_output = truncate(body, max_lines, max_bytes)
 
-    local tol = ctx:tool_output_lines()
-    local buf = maki.ui.buf()
-    local view = ToolView.new(buf, {
-      max_lines = (tol and tol.web) or 3,
-      keep = "head",
-    })
-    buf:on("click", function()
-      view:toggle()
-    end)
-
-    for line in body:gmatch("([^\n]*)\n?") do
-      view:append(line)
-    end
-    view:finish()
-
     return {
       llm_output = llm_output,
-      body = buf,
+      body = ToolView.restore(body, web_view_opts(ctx)),
     }
   end,
 })

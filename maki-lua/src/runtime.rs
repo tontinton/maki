@@ -14,6 +14,7 @@ use maki_agent::cancel::CancelToken;
 use maki_agent::tools::{
     HeaderResult, PermissionScopes, RegistryError, Tool, ToolRegistry, ToolSource,
 };
+use maki_agent::{BufferSnapshot, SharedBuf};
 use mlua::{Function, Lua, LuaSerdeExt, RegistryKey, Value as LuaValue, VmState};
 use serde_json::Value;
 
@@ -82,6 +83,7 @@ pub enum Request {
     FireBufClick {
         tool_id: String,
         row: u32,
+        reply: flume::Sender<Option<BufferSnapshot>>,
     },
     RunCommand {
         plugin: Arc<str>,
@@ -92,6 +94,20 @@ pub enum Request {
         reply: flume::Sender<Vec<String>>,
     },
     Shutdown,
+    RestoreTool {
+        tool: Arc<str>,
+        tool_use_id: String,
+        output: String,
+        input: Value,
+        is_error: bool,
+        tool_output_lines: maki_config::ToolOutputLines,
+        reply: flume::Sender<Option<RestoreReply>>,
+    },
+}
+
+pub struct RestoreReply {
+    pub body: Option<BufferSnapshot>,
+    pub header: Option<BufferSnapshot>,
 }
 
 #[derive(Clone)]
@@ -120,7 +136,7 @@ impl ThreadKey {
 /// Single-threaded: keyed by coroutine pointer, no locking needed.
 type TaskMap = HashMap<ThreadKey, TaskCtx>;
 
-type ClickHandlerMap = HashMap<String, RegistryKey>;
+type ClickHandlerMap = HashMap<String, (RegistryKey, Arc<SharedBuf>)>;
 
 pub(crate) fn with_task_jobs<R>(lua: &Lua, f: impl FnOnce(&mut JobStore) -> R) -> Option<R> {
     let key = ThreadKey::current(lua);
@@ -234,6 +250,7 @@ impl InflightGate {
 struct ToolKeys {
     handler: RegistryKey,
     header: Option<RegistryKey>,
+    restore: Option<RegistryKey>,
     permission_scopes: Option<RegistryKey>,
 }
 
@@ -632,6 +649,7 @@ impl LuaRuntime {
                     ToolKeys {
                         handler: t.handler_key,
                         header: t.header_key,
+                        restore: t.restore_key,
                         permission_scopes: t.permission_scopes_key,
                     },
                 )
@@ -706,6 +724,52 @@ impl LuaRuntime {
                 HeaderResult::plain(tool.to_string())
             }
         }
+    }
+
+    async fn restore_tool(
+        &self,
+        tool: &str,
+        tool_use_id: &str,
+        output: &str,
+        input: Value,
+        is_error: bool,
+        tool_output_lines: maki_config::ToolOutputLines,
+    ) -> Option<RestoreReply> {
+        let func = {
+            let plugins = self.plugins.borrow();
+            let tk = plugins.values().find_map(|tools| tools.get(tool))?;
+            let key = tk.restore.as_ref()?;
+            self.lua.registry_value::<Function>(key).ok()?
+        };
+        let input_lua = self.lua.to_value(&input).ok()?;
+        let thread = self.lua.create_thread(func).ok()?;
+        let thread_key = ThreadKey(thread.to_pointer() as usize);
+
+        let (dummy_tx, _) = flume::unbounded();
+        let task_ctx = TaskCtx {
+            cancel: CancelToken::none(),
+            deadline: None,
+            jobs: JobStore::new(),
+            bufs: BufferStore::new(),
+            live: Some(LiveCtx {
+                event_tx: maki_agent::EventSender::new(dummy_tx, 0),
+                tool_use_id: tool_use_id.to_owned(),
+            }),
+        };
+        let _cleanup = register_task(&self.lua, thread_key, task_ctx);
+
+        let ctx_ud = self
+            .lua
+            .create_userdata(crate::api::ctx::RestoreCtx { tool_output_lines })
+            .ok()?;
+        let ret = thread
+            .into_async::<LuaValue>((output, input_lua, is_error, ctx_ud))
+            .ok()?
+            .await
+            .inspect_err(|e| tracing::warn!(tool, error = %e, "restore callback failed"))
+            .ok()?;
+
+        extract_restore_reply(&ret)
     }
 
     fn compute_permission_scopes(
@@ -803,6 +867,30 @@ impl LuaRuntime {
         let raw = config_store.lock().unwrap().take();
         Ok(raw)
     }
+}
+
+fn extract_restore_reply(ret: &LuaValue) -> Option<RestoreReply> {
+    let (body, header) = match ret {
+        LuaValue::UserData(ud) => {
+            let h = ud.borrow::<BufHandle>().ok()?;
+            (Some(h.buf.take()), None)
+        }
+        LuaValue::Table(t) => {
+            let body = t.get::<LuaValue>("body").ok().and_then(|v| {
+                let ud = v.as_userdata()?;
+                let h = ud.borrow::<BufHandle>().ok()?;
+                Some(h.buf.take())
+            });
+            let header = t.get::<LuaValue>("header").ok().and_then(|v| {
+                let ud = v.as_userdata()?;
+                let h = ud.borrow::<BufHandle>().ok()?;
+                Some(h.buf.take())
+            });
+            (body, header)
+        }
+        _ => return None,
+    };
+    Some(RestoreReply { body, header })
 }
 
 /// When a handler returns nil it enters async mode: this loop polls job
@@ -1109,24 +1197,29 @@ pub fn spawn(
                             rt.clear_plugin(&plugin);
                             let _ = reply.send(());
                         }
-                        Request::FireBufClick { tool_id, row } => {
-                            let handler_fn =
+                        Request::FireBufClick { tool_id, row, reply } => {
+                            let entry =
                                 rt.lua.app_data_ref::<ClickHandlerMap>().and_then(|m| {
-                                    let key = m.get(&tool_id)?;
-                                    rt.lua.registry_value::<Function>(key).ok()
+                                    let (key, buf) = m.get(&tool_id)?;
+                                    let func = rt.lua.registry_value::<Function>(key).ok()?;
+                                    Some((func, Arc::clone(buf)))
                                 });
-                            if let Some(func) = handler_fn {
+                            if let Some((func, buf)) = entry {
                                 let lua = rt.lua.clone();
                                 ex.spawn(async move {
                                     let Ok(data) = lua.create_table() else {
+                                        let _ = reply.send(None);
                                         return;
                                     };
                                     let _ = data.set("row", row);
                                     if let Err(e) = func.call_async::<()>(data).await {
                                         tracing::warn!(tool_id, error = %e, "click handler failed");
                                     }
+                                    let _ = reply.send(Some(buf.take()));
                                 })
                                 .detach();
+                            } else {
+                                let _ = reply.send(None);
                             }
                         }
                         Request::RunCommand {
@@ -1193,6 +1286,18 @@ pub fn spawn(
                             let extras = rt.collect_prompt_extras();
                             let _ = reply.send(extras);
                         }
+                    Request::RestoreTool {
+                        tool,
+                        tool_use_id,
+                        output,
+                        input,
+                        is_error,
+                        tool_output_lines,
+                        reply,
+                    } => {
+                        let res = rt.restore_tool(&tool, &tool_use_id, &output, input, is_error, tool_output_lines).await;
+                        let _ = reply.send(res);
+                    }
                     }
                 }
             }));
@@ -1395,5 +1500,90 @@ mod tests {
             g.decrement();
             waiter.await;
         }));
+    }
+
+    #[test]
+    fn extract_restore_reply_non_table_non_userdata_returns_none() {
+        assert!(extract_restore_reply(&LuaValue::Nil).is_none());
+        assert!(extract_restore_reply(&LuaValue::Integer(42)).is_none());
+        assert!(extract_restore_reply(&LuaValue::Boolean(true)).is_none());
+    }
+
+    #[test]
+    fn extract_restore_reply_userdata_returns_body_only() {
+        let lua = test_lua();
+        let handle = make_buf_handle("restored line");
+        let ud = lua.create_userdata(handle).unwrap();
+        let val = LuaValue::UserData(ud);
+        let reply = extract_restore_reply(&val).expect("should extract from userdata");
+        assert_eq!(reply.body.unwrap().first_line_text(), "restored line");
+        assert!(reply.header.is_none());
+    }
+
+    #[test]
+    fn extract_restore_reply_table_with_body_and_header() {
+        let lua = test_lua();
+        let body = lua.create_userdata(make_buf_handle("body")).unwrap();
+        let header = lua.create_userdata(make_buf_handle("header")).unwrap();
+        let t = lua.create_table().unwrap();
+        t.set("body", body).unwrap();
+        t.set("header", header).unwrap();
+        let val = LuaValue::Table(t);
+        let reply = extract_restore_reply(&val).unwrap();
+        assert_eq!(reply.body.unwrap().first_line_text(), "body");
+        assert_eq!(reply.header.unwrap().first_line_text(), "header");
+    }
+
+    #[test]
+    fn extract_restore_reply_table_body_only() {
+        let lua = test_lua();
+        let body = lua.create_userdata(make_buf_handle("only body")).unwrap();
+        let t = lua.create_table().unwrap();
+        t.set("body", body).unwrap();
+        let val = LuaValue::Table(t);
+        let reply = extract_restore_reply(&val).unwrap();
+        assert_eq!(reply.body.unwrap().first_line_text(), "only body");
+        assert!(reply.header.is_none());
+    }
+
+    #[test]
+    fn extract_restore_reply_empty_table_returns_both_none() {
+        let lua = test_lua();
+        let t = lua.create_table().unwrap();
+        let val = LuaValue::Table(t);
+        let reply = extract_restore_reply(&val).unwrap();
+        assert!(reply.body.is_none());
+        assert!(reply.header.is_none());
+    }
+
+    #[test]
+    fn extract_restore_reply_table_with_wrong_type_in_body() {
+        let lua = test_lua();
+        let t = lua.create_table().unwrap();
+        t.set("body", "not_userdata").unwrap();
+        let val = LuaValue::Table(t);
+        let reply = extract_restore_reply(&val).unwrap();
+        assert!(reply.body.is_none());
+    }
+
+    #[test]
+    fn click_handler_map_stores_buf_alongside_key() {
+        let lua = test_lua();
+        lua.set_app_data(ClickHandlerMap::new());
+        let buf = Arc::new(maki_agent::SharedBuf::new());
+        buf.append(SnapshotLine {
+            spans: vec![SnapshotSpan {
+                text: "click content".into(),
+                style: SpanStyle::Default,
+            }],
+        });
+        let func = lua.create_function(|_, _: ()| Ok(())).unwrap();
+        let key = lua.create_registry_value(func).unwrap();
+        with_click_handlers(&lua, |handlers| {
+            handlers.insert("tool_1".into(), (key, Arc::clone(&buf)));
+        });
+        let found = lua.app_data_ref::<ClickHandlerMap>().unwrap();
+        let (_, stored_buf) = found.get("tool_1").unwrap();
+        assert_eq!(stored_buf.take().first_line_text(), "click content");
     }
 }

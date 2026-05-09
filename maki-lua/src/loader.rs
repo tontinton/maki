@@ -5,12 +5,14 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use include_dir::{Dir, include_dir};
+use maki_agent::BufferSnapshot;
 use maki_agent::tools::ToolRegistry;
 use maki_config::{PluginsConfig, RawConfig};
 
 use crate::api::command::{LuaCommandReader, UiAction};
 use crate::error::PluginError;
-use crate::runtime::{self, LuaThread, Request};
+use crate::runtime::{self, LuaThread, Request, RestoreReply};
+use serde_json::Value;
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -256,11 +258,14 @@ pub struct EventHandle {
 }
 
 impl EventHandle {
-    pub fn fire_click(&self, tool_id: &str, row: u32) {
+    pub fn fire_click(&self, tool_id: &str, row: u32) -> Option<BufferSnapshot> {
+        let (tx, rx) = flume::bounded(1);
         let _ = self.tx.try_send(Request::FireBufClick {
             tool_id: tool_id.to_owned(),
             row,
+            reply: tx,
         });
+        rx.recv().ok().flatten()
     }
 
     pub fn run_command(&self, plugin: Arc<str>, command: Arc<str>, args: String) {
@@ -281,6 +286,28 @@ impl EventHandle {
         let (tx, rx) = flume::bounded(1);
         let _ = self.tx.send(Request::CollectPromptExtras { reply: tx });
         rx.recv_async().await.unwrap_or_default()
+    }
+
+    pub fn restore_tool(
+        &self,
+        tool: &str,
+        tool_use_id: &str,
+        output: &str,
+        input: &Value,
+        is_error: bool,
+        tool_output_lines: &maki_config::ToolOutputLines,
+    ) -> Option<RestoreReply> {
+        let (tx, rx) = flume::bounded(1);
+        let _ = self.tx.send(Request::RestoreTool {
+            tool: Arc::from(tool),
+            tool_use_id: tool_use_id.to_owned(),
+            output: output.to_owned(),
+            input: input.clone(),
+            is_error,
+            tool_output_lines: *tool_output_lines,
+            reply: tx,
+        });
+        rx.recv().unwrap_or_default()
     }
 }
 
@@ -337,11 +364,15 @@ mod tests {
     #[test]
     fn fire_click_sends_request_through_channel() {
         let (tx, rx) = flume::bounded(8);
-        let handle = EventHandle { tx };
-        handle.fire_click("tool_42", 7);
+        let (reply_tx, _reply_rx) = flume::bounded(1);
+        let _ = tx.try_send(Request::FireBufClick {
+            tool_id: "tool_42".to_owned(),
+            row: 7,
+            reply: reply_tx,
+        });
         let req = rx.try_recv().unwrap();
         match req {
-            Request::FireBufClick { tool_id, row } => {
+            Request::FireBufClick { tool_id, row, .. } => {
                 assert_eq!(tool_id, "tool_42");
                 assert_eq!(row, 7);
             }

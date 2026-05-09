@@ -6,8 +6,8 @@ use maki_agent::tools::{
     BASH_TOOL_NAME, GLOB_TOOL_NAME, GREP_TOOL_NAME, QUESTION_TOOL_NAME, WRITE_TOOL_NAME,
 };
 use maki_agent::{
-    BatchToolEntry, GrepFileEntry, GrepMatchGroup, QuestionAnswer, SharedBuf, SnapshotLine,
-    SnapshotSpan, SpanStyle, ToolInput, ToolOutput,
+    BatchToolEntry, GrepFileEntry, GrepMatchGroup, QuestionAnswer, SnapshotLine, SnapshotSpan,
+    SpanStyle, ToolInput, ToolOutput,
 };
 use ratatui::backend::TestBackend;
 use test_case::test_case;
@@ -1172,34 +1172,6 @@ fn handle_click_non_tool_segment_returns_nothing() {
 }
 
 #[test]
-fn live_buf_updates_after_tool_done_are_picked_up() {
-    let buf = Arc::new(SharedBuf::new());
-
-    let mut panel = MessagesPanel::new(UiConfig::default());
-    panel.register_live_buf("t1".into(), Arc::clone(&buf));
-    panel.tool_start(start("t1", BASH_TOOL_NAME));
-
-    buf.set_lines(vec![snap_line("before")]);
-    panel.tool_snapshot(
-        "t1",
-        BufferSnapshot::from_arc(Arc::new(vec![snap_line("before")])),
-    );
-    panel.tool_done(ToolDoneEvent {
-        id: "t1".into(),
-        tool: BASH_TOOL_NAME.into(),
-        output: ToolOutput::Plain("output".into()),
-        is_error: false,
-    });
-
-    buf.set_lines(vec![snap_line("after click")]);
-    render(&mut panel, 80, 24);
-
-    let msg = panel.find_tool_msg_mut("t1").unwrap();
-    let snap = msg.render_snapshot.as_ref().unwrap();
-    assert_eq!(snap.lines[0].spans[0].text, "after click");
-}
-
-#[test]
 fn handle_click_returns_lua_tool_click_for_batch_child() {
     let mut panel = MessagesPanel::new(UiConfig::default());
     batch_start(
@@ -1222,4 +1194,69 @@ fn handle_click_returns_lua_tool_click_for_batch_child() {
         _ => None,
     });
     assert_eq!(clicked.as_deref(), Some("b1__0"));
+}
+
+#[test]
+fn tool_done_removes_live_buf_and_snapshots_dirty() {
+    let buf = Arc::new(maki_agent::SharedBuf::new());
+    buf.set_lines(vec![snap_line("dirty content")]);
+
+    let mut panel = MessagesPanel::new(UiConfig::default());
+    panel.register_live_buf("t1".into(), Arc::clone(&buf));
+    panel.tool_start(start("t1", BASH_TOOL_NAME));
+    panel.tool_done(ToolDoneEvent {
+        id: "t1".into(),
+        tool: BASH_TOOL_NAME.into(),
+        output: ToolOutput::Plain("output".into()),
+        is_error: false,
+    });
+
+    let msg = panel.find_tool_msg_mut("t1").unwrap();
+    assert_eq!(
+        msg.render_snapshot.as_ref().unwrap().first_line_text(),
+        "dirty content"
+    );
+}
+
+#[test]
+fn tool_done_without_live_buf_preserves_existing_snapshot() {
+    let mut panel = MessagesPanel::new(UiConfig::default());
+    panel.tool_start(start("t1", BASH_TOOL_NAME));
+    panel.tool_snapshot(
+        "t1",
+        BufferSnapshot::from_arc(Arc::new(vec![snap_line("pre-existing")])),
+    );
+    panel.tool_done(ToolDoneEvent {
+        id: "t1".into(),
+        tool: BASH_TOOL_NAME.into(),
+        output: ToolOutput::Plain("output".into()),
+        is_error: false,
+    });
+
+    let msg = panel.find_tool_msg_mut("t1").unwrap();
+    assert_eq!(
+        msg.render_snapshot.as_ref().unwrap().first_line_text(),
+        "pre-existing"
+    );
+}
+
+#[test]
+fn tool_done_clean_live_buf_does_not_snapshot() {
+    let buf = Arc::new(maki_agent::SharedBuf::new());
+
+    let mut panel = MessagesPanel::new(UiConfig::default());
+    panel.register_live_buf("t1".into(), Arc::clone(&buf));
+    panel.tool_start(start("t1", BASH_TOOL_NAME));
+    panel.tool_done(ToolDoneEvent {
+        id: "t1".into(),
+        tool: BASH_TOOL_NAME.into(),
+        output: ToolOutput::Plain("output".into()),
+        is_error: false,
+    });
+
+    let msg = panel.find_tool_msg_mut("t1").unwrap();
+    assert!(
+        msg.render_snapshot.is_none(),
+        "clean (never-written) live buf should not produce a snapshot"
+    );
 }

@@ -496,9 +496,9 @@ where
                     path = %path.display(),
                     error = %e,
                     line = line_count,
-                    "corrupt/truncated JSONL record; discarding trailing lines",
+                    "skipping unrecognized JSONL record",
                 );
-                break;
+                continue;
             }
         };
         match record {
@@ -967,7 +967,7 @@ mod tests {
     }
 
     #[test]
-    fn crash_recovery_discards_from_corrupt_line() {
+    fn crash_recovery_skips_corrupt_line() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
         let mut session: TestSession = Session::new("m", "/project");
@@ -986,7 +986,7 @@ mod tests {
         file.write_all(b"\n").unwrap();
 
         let loaded = TestSession::load_from(&session.id, dir).unwrap();
-        assert_eq!(loaded.messages.len(), 1);
+        assert_eq!(loaded.messages.len(), 2);
     }
 
     #[test]
@@ -1266,5 +1266,95 @@ mod tests {
             loaded.meta.thinking,
             Some(StoredThinking::Budget { tokens: 8192 })
         );
+    }
+
+    #[test]
+    fn crash_recovery_preserves_tool_outputs_around_corrupt_line() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut session: TestSession = Session::new("m", "/project");
+        session.messages.push(user_message("first"));
+        session
+            .tool_outputs
+            .insert("t1".into(), serde_json::json!({"result": "ok"}));
+        let mut log = SessionLog::create(dir, &session).unwrap();
+        log.append(&session).unwrap();
+
+        let path = dir.join(format!("{}.jsonl", session.id));
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(b"CORRUPT\n").unwrap();
+        file.write_all(
+            serde_json::to_string(&serde_json::json!({"t":"msg","d": user_message("second")}))
+                .unwrap()
+                .as_bytes(),
+        )
+        .unwrap();
+        file.write_all(b"\n").unwrap();
+
+        let loaded = TestSession::load_from(&session.id, dir).unwrap();
+        assert_eq!(loaded.messages.len(), 2);
+        assert!(loaded.tool_outputs.contains_key("t1"));
+    }
+
+    #[test]
+    fn corrupt_header_line_only_returns_not_found() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let id = "fake-session-id";
+        let path = dir.join(format!("{id}.jsonl"));
+        fs::write(&path, "NOT_A_HEADER\n").unwrap();
+
+        let err = TestSession::load_from(id, dir).unwrap_err();
+        assert!(matches!(
+            err,
+            SessionError::Storage(StorageError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn empty_lines_in_jsonl_are_skipped() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut session: TestSession = Session::new("m", "/project");
+        session.messages.push(user_message("msg"));
+        session.save_to(dir).unwrap();
+
+        let path = dir.join(format!("{}.jsonl", session.id));
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(b"\n\n\n").unwrap();
+        file.write_all(
+            serde_json::to_string(&serde_json::json!({"t":"msg","d": user_message("after")}))
+                .unwrap()
+                .as_bytes(),
+        )
+        .unwrap();
+        file.write_all(b"\n").unwrap();
+
+        let loaded = TestSession::load_from(&session.id, dir).unwrap();
+        assert_eq!(loaded.messages.len(), 2);
+    }
+
+    #[test]
+    fn unknown_record_type_is_skipped() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut session: TestSession = Session::new("m", "/project");
+        session.messages.push(user_message("first"));
+        session.save_to(dir).unwrap();
+
+        let path = dir.join(format!("{}.jsonl", session.id));
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(b"{\"t\":\"future_type\",\"d\":{}}\n")
+            .unwrap();
+        file.write_all(
+            serde_json::to_string(&serde_json::json!({"t":"msg","d": user_message("second")}))
+                .unwrap()
+                .as_bytes(),
+        )
+        .unwrap();
+        file.write_all(b"\n").unwrap();
+
+        let loaded = TestSession::load_from(&session.id, dir).unwrap();
+        assert_eq!(loaded.messages.len(), 2);
     }
 }

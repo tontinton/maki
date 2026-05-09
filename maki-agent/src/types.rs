@@ -610,13 +610,13 @@ pub struct SnapshotLine {
     pub spans: Vec<SnapshotSpan>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SnapshotSpan {
     pub text: String,
     pub style: SpanStyle,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub enum SpanStyle {
     #[default]
     Default,
@@ -624,7 +624,7 @@ pub enum SpanStyle {
     Inline(InlineStyle),
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct InlineStyle {
     pub fg: Option<(u8, u8, u8)>,
     pub bg: Option<(u8, u8, u8)>,
@@ -1039,5 +1039,27 @@ mod tests {
             }]),
         };
         assert_eq!(multi.first_line_text(), "hello world");
+    }
+
+    #[test_case(SpanStyle::Default ; "default")]
+    #[test_case(SpanStyle::Named("comment".into()) ; "named")]
+    #[test_case(SpanStyle::Inline(InlineStyle {
+        fg: Some((255, 0, 0)),
+        bg: None,
+        bold: true,
+        italic: false,
+        underline: true,
+        dim: false,
+        strikethrough: false,
+        reversed: true,
+    }) ; "inline")]
+    fn snapshot_span_serde_roundtrip(style: SpanStyle) {
+        let span = SnapshotSpan {
+            text: "test".into(),
+            style,
+        };
+        let json = serde_json::to_string(&span).unwrap();
+        let parsed: SnapshotSpan = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, span);
     }
 }

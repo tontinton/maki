@@ -6,6 +6,11 @@ local parse_sse_response = require("parse_sse")
 local truncate = require("maki.truncate")
 local ToolView = require("maki.tool_view")
 
+local function web_view_opts(ctx)
+  local tol = ctx:tool_output_lines()
+  return { max_lines = (tol and tol.web) or 3, keep = "head" }
+end
+
 maki.api.register_tool({
   name = "websearch",
   description = "Search the web for real-time information using Exa AI.\n\n"
@@ -28,6 +33,10 @@ maki.api.register_tool({
 
   header = function(input)
     return input.query
+  end,
+
+  restore = function(output, _input, _is_error, ctx)
+    return ToolView.restore(output, web_view_opts(ctx))
   end,
 
   handler = function(input, ctx)
@@ -87,24 +96,9 @@ maki.api.register_tool({
 
     local llm_output = truncate(text, max_lines, max_bytes)
 
-    local tol = ctx:tool_output_lines()
-    local buf = maki.ui.buf()
-    local view = ToolView.new(buf, {
-      max_lines = (tol and tol.web) or 3,
-      keep = "head",
-    })
-    buf:on("click", function()
-      view:toggle()
-    end)
-
-    for line in text:gmatch("([^\n]*)\n?") do
-      view:append(line)
-    end
-    view:finish()
-
     return {
       llm_output = llm_output,
-      body = buf,
+      body = ToolView.restore(text, web_view_opts(ctx)),
     }
   end,
 })

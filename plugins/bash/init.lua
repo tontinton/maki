@@ -55,6 +55,20 @@ local function relative_path(p)
   return p
 end
 
+local function build_header_lines(command)
+  local header = {}
+  local highlighted = maki.ui.highlight(command, "bash")
+  if highlighted then
+    for _, line in ipairs(highlighted) do
+      header[#header + 1] = line
+    end
+  else
+    header[#header + 1] = command
+  end
+  header[#header + 1] = { { SEPARATOR, "dim" } }
+  return header
+end
+
 local function rtk_find_unsupported(cmd)
   if not cmd:match("^rtk find ") then
     return false
@@ -119,6 +133,20 @@ local function append_line(output, line)
     output[#output + 1] = "\n"
   end
   output[#output + 1] = line
+end
+
+local function create_bash_view(command, ctx)
+  local tol = ctx:tool_output_lines()
+  local buf = maki.ui.buf()
+  local view = ToolView.new(buf, {
+    max_lines = (tol and tol.bash) or 5,
+    keep = "tail",
+  })
+  view:set_header(build_header_lines(command))
+  buf:on("click", function()
+    view:toggle()
+  end)
+  return buf, view
 end
 
 local cwd = maki.uv.cwd() or "."
@@ -244,6 +272,35 @@ maki.api.register_tool({
     return s
   end,
 
+  restore = function(output, input, is_error, ctx)
+    local command = resolve_command(input)
+    local buf, view = create_bash_view(command, ctx)
+    if is_error then
+      local body, code = output:match("^(.-)\nExit code: (%d+)$")
+      if body then
+        for line in (body .. "\n"):gmatch("([^\n]*)\n") do
+          view:append(line)
+        end
+        view:append({ { "Exit code: " .. code, "dim" } })
+      else
+        for line in (output .. "\n"):gmatch("([^\n]*)\n") do
+          view:append(line)
+        end
+      end
+    else
+      if output == "Exit code: 0" or output == "" then
+        view:clear()
+        view:append({ { "No output", "dim" } })
+      else
+        for line in (output .. "\n"):gmatch("([^\n]*)\n") do
+          view:append(line)
+        end
+      end
+    end
+    view:finish()
+    return buf
+  end,
+
   handler = function(input, ctx)
     if not input.command then
       return { llm_output = "error: command is required", is_error = true }
@@ -260,28 +317,7 @@ maki.api.register_tool({
       command = rewritten
     end
 
-    local tol = ctx:tool_output_lines()
-    local buf = maki.ui.buf()
-    local view = ToolView.new(buf, {
-      max_lines = (tol and tol.bash) or 5,
-      keep = "tail",
-    })
-
-    buf:on("click", function(ev)
-      view:toggle()
-    end)
-
-    local header = {}
-    local highlighted = maki.ui.highlight(command, "bash")
-    if highlighted then
-      for _, line in ipairs(highlighted) do
-        header[#header + 1] = line
-      end
-    else
-      header[#header + 1] = command
-    end
-    header[#header + 1] = { { SEPARATOR, "dim" } }
-    view:set_header(header)
+    local buf, view = create_bash_view(command, ctx)
 
     local output_parts = {}
     local has_output = false
