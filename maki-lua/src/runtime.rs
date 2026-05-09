@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -37,6 +37,7 @@ const MAX_INFLIGHT_TOOLS: usize = 64;
 const GC_STEP_INTERVAL: usize = 4;
 
 pub type LoadResult = Result<(), PluginError>;
+pub(crate) type PromptExtraCallbacks = BTreeMap<Arc<str>, RegistryKey>;
 
 /// `LoadSource`/`ClearPlugin` drain in-flight tools first so the plugin
 /// environment is never mutated mid-call.
@@ -86,6 +87,9 @@ pub enum Request {
         plugin: Arc<str>,
         command: Arc<str>,
         args: String,
+    },
+    CollectPromptExtras {
+        reply: flume::Sender<Vec<String>>,
     },
     Shutdown,
 }
@@ -311,6 +315,7 @@ impl LuaRuntime {
         lua.set_app_data(ClickHandlerMap::new());
         lua.set_app_data(CommandHandlerMap::new());
         lua.set_app_data(command_writer);
+        lua.set_app_data(PromptExtraCallbacks::default());
 
         Ok(Self {
             lua,
@@ -358,6 +363,36 @@ impl LuaRuntime {
                 }
             }
         }
+        if let Some(mut extras) = self.lua.app_data_mut::<PromptExtraCallbacks>() {
+            if let Some(key) = extras.remove(name) {
+                if let Err(e) = self.lua.remove_registry_value(key) {
+                    tracing::warn!(plugin = name, error = %e, "failed to drop prompt extra key");
+                }
+            }
+        }
+    }
+
+    fn collect_prompt_extras(&self) -> Vec<String> {
+        let Some(map) = self.lua.app_data_ref::<PromptExtraCallbacks>() else {
+            return Vec::new();
+        };
+        let mut extras = Vec::new();
+        for (plugin, key) in map.iter() {
+            let Ok(func) = self.lua.registry_value::<Function>(key) else {
+                continue;
+            };
+            match func.call::<LuaValue>(()) {
+                Ok(LuaValue::String(s)) => extras.push(s.to_string_lossy()),
+                Ok(LuaValue::Nil) => {}
+                Ok(_) => {
+                    tracing::warn!(plugin = %plugin, "prompt extra callback returned non-string")
+                }
+                Err(e) => {
+                    tracing::warn!(plugin = %plugin, error = %e, "prompt extra callback failed")
+                }
+            }
+        }
+        extras
     }
 
     fn drain_pending(&self) -> Vec<PendingTool> {
@@ -1153,6 +1188,10 @@ pub fn spawn(
                             gate.drain().await;
                             let res = rt.run_init_lua(&source, &source_name, plugin_dir);
                             let _ = reply.send(res);
+                        }
+                        Request::CollectPromptExtras { reply } => {
+                            let extras = rt.collect_prompt_extras();
+                            let _ = reply.send(extras);
                         }
                     }
                 }

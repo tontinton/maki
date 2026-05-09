@@ -14,6 +14,7 @@ use maki_agent::{
     CancelTrigger, Envelope, EventSender, History, Instructions, McpCommand, PromptRole,
     ToolOutputLines,
 };
+use maki_lua::EventHandle;
 use maki_providers::{AgentError, Message, Model, TokenUsage};
 use serde_json::Value;
 use tracing::error;
@@ -42,6 +43,7 @@ pub(super) struct AgentLoop {
     queue: Arc<QueueReceiver>,
     session_id: Option<String>,
     timeouts: maki_providers::Timeouts,
+    lua_handle: Option<EventHandle>,
 }
 
 impl AgentLoop {
@@ -61,6 +63,7 @@ impl AgentLoop {
         init_cancel: CancelToken,
         session_id: Option<String>,
         timeouts: maki_providers::Timeouts,
+        lua_handle: Option<EventHandle>,
     ) -> Self {
         Self {
             model_slot,
@@ -82,6 +85,7 @@ impl AgentLoop {
             queue,
             session_id,
             timeouts,
+            lua_handle,
         }
     }
 
@@ -195,7 +199,16 @@ impl AgentLoop {
 
         self.sync_shared_history_with_pending(&input);
 
-        let system = agent::build_system_prompt(&self.vars, &input.mode, &self.instructions.text);
+        let prompt_extras = match self.lua_handle.as_ref() {
+            Some(h) => h.collect_prompt_extras_async().await,
+            None => Vec::new(),
+        };
+        let system = agent::build_system_prompt(
+            &self.vars,
+            &input.mode,
+            &self.instructions.text,
+            &prompt_extras,
+        );
         let (trigger, cancel) = CancelToken::new();
         self.set_cancel_trigger(run_id, trigger);
 

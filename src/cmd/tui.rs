@@ -124,6 +124,7 @@ pub fn run(cli: Cli) -> Result<()> {
             config.agent,
             config.permissions,
             timeouts,
+            plugin_host.event_handle(),
         )
         .context("run print mode")?;
     } else {

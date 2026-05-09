@@ -196,6 +196,7 @@ impl<'t> EventLoop<'t> {
             cwd,
             Some(session.id.clone()),
             timeouts,
+            lua_event_handle.clone(),
         );
 
         let custom_commands: Arc<[CustomCommand]> = Arc::from(commands);
@@ -396,6 +397,7 @@ impl<'t> EventLoop<'t> {
     }
 
     fn respawn_agent(&mut self, history: Vec<Message>) {
+        let lua_handle = self.app.lua_event_handle.clone();
         self.handles.respawn(
             history,
             &self.model_slot,
@@ -403,6 +405,7 @@ impl<'t> EventLoop<'t> {
             self.app.ui_config.tool_output_lines,
             &self.permissions,
             &mut self.app,
+            lua_handle,
         );
     }
 

@@ -20,7 +20,7 @@ use crate::api::command::{
     CommandEntry, CommandHandlerMap, LuaCommandWriter, publish_command_snapshot,
 };
 use crate::api::ctx::LuaCtx;
-use crate::runtime::{LiveCtx, Request};
+use crate::runtime::{LiveCtx, PromptExtraCallbacks, Request};
 
 const TOOL_NAME_MAX: usize = 64;
 const TOOL_HANDLER_RETURN_ERR: &str =
@@ -270,6 +270,23 @@ pub(crate) fn create_api_table(
             register_tool_from_lua(lua, &spec, pending.clone())
         })?,
     )?;
+
+    {
+        let plugin = Arc::clone(&plugin);
+        t.set(
+            "register_system_prompt_extra",
+            lua.create_function(move |lua, callback: Function| {
+                let key = lua.create_registry_value(callback)?;
+                let mut map = lua
+                    .app_data_mut::<PromptExtraCallbacks>()
+                    .ok_or_else(|| mlua::Error::runtime("not initialized"))?;
+                if let Some(old) = map.insert(Arc::clone(&plugin), key) {
+                    lua.remove_registry_value(old)?;
+                }
+                Ok(())
+            })?,
+        )?;
+    }
 
     t.set(
         "register_command",

@@ -16,6 +16,7 @@ use maki_agent::{
     AgentConfig, CancelToken, Envelope, McpCommand, McpHandle, McpSnapshotReader, ToolOutput,
     ToolOutputLines,
 };
+use maki_lua::EventHandle;
 
 use self::cancel_map::CancelMap;
 use maki_providers::provider::Provider;
@@ -63,6 +64,7 @@ impl AgentHandles {
         cwd: PathBuf,
         session_id: Option<String>,
         timeouts: maki_providers::Timeouts,
+        lua_handle: Option<EventHandle>,
     ) -> Self {
         let mcp_handle = smol::block_on(mcp::start(&cwd));
         spawn_agent_internal(
@@ -74,6 +76,7 @@ impl AgentHandles {
             mcp_handle,
             session_id,
             timeouts,
+            lua_handle,
         )
     }
 
@@ -111,6 +114,7 @@ impl AgentHandles {
         tool_output_lines: ToolOutputLines,
         permissions: &Arc<PermissionManager>,
         app: &mut App,
+        lua_handle: Option<EventHandle>,
     ) {
         let slot = model_slot.load();
         if let Err(e) = smol::block_on(slot.provider.reload_auth()) {
@@ -125,6 +129,7 @@ impl AgentHandles {
             self.mcp_handle.clone(),
             Some(app.state.session.id.clone()),
             self.timeouts,
+            lua_handle,
         );
         let old = mem::replace(self, new);
         // Repoint the app at the new queue before dropping `old`, otherwise the app keeps
@@ -172,6 +177,7 @@ fn spawn_agent_internal(
     mcp_handle: Option<McpHandle>,
     session_id: Option<String>,
     timeouts: maki_providers::Timeouts,
+    lua_handle: Option<EventHandle>,
 ) -> AgentHandles {
     let (agent_tx, agent_rx) = flume::unbounded::<Envelope>();
     let (cmd_tx, cmd_rx) = flume::unbounded::<AgentCommand>();
@@ -202,6 +208,7 @@ fn spawn_agent_internal(
         init_cancel,
         session_id,
         timeouts,
+        lua_handle,
     );
 
     let task = smol::spawn(agent_loop.run());

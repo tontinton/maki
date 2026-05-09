@@ -270,6 +270,18 @@ impl EventHandle {
             args,
         });
     }
+
+    pub fn collect_prompt_extras(&self) -> Vec<String> {
+        let (tx, rx) = flume::bounded(1);
+        let _ = self.tx.send(Request::CollectPromptExtras { reply: tx });
+        rx.recv().unwrap_or_default()
+    }
+
+    pub async fn collect_prompt_extras_async(&self) -> Vec<String> {
+        let (tx, rx) = flume::bounded(1);
+        let _ = self.tx.send(Request::CollectPromptExtras { reply: tx });
+        rx.recv_async().await.unwrap_or_default()
+    }
 }
 
 #[cfg(test)]
@@ -412,5 +424,129 @@ mod tests {
     fn disabled_host_returns_no_ui_action_rx() {
         let host = PluginHost::disabled();
         assert!(host.ui_action_rx().is_none());
+    }
+
+    #[test]
+    fn prompt_extra_callback_string_is_collected() {
+        let reg = Arc::new(ToolRegistry::new());
+        let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+        host.load_source(
+            "test_extra",
+            r#"
+            maki.api.register_system_prompt_extra(function()
+                return "\n\nfrom test_extra"
+            end)
+            "#,
+        )
+        .unwrap();
+        let handle = host.event_handle().unwrap();
+        let extras = handle.collect_prompt_extras();
+        assert_eq!(extras.len(), 1);
+        assert_eq!(extras[0], "\n\nfrom test_extra");
+    }
+
+    #[test]
+    fn prompt_extra_non_string_returns_are_skipped() {
+        let reg = Arc::new(ToolRegistry::new());
+        let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+        host.load_source(
+            "nil_extra",
+            r#"
+            maki.api.register_system_prompt_extra(function()
+                return nil
+            end)
+            "#,
+        )
+        .unwrap();
+        host.load_source(
+            "num_extra",
+            r#"
+            maki.api.register_system_prompt_extra(function()
+                return 42
+            end)
+            "#,
+        )
+        .unwrap();
+        let handle = host.event_handle().unwrap();
+        assert!(handle.collect_prompt_extras().is_empty());
+    }
+
+    #[test]
+    fn prompt_extra_multiple_plugins_ordered_by_name() {
+        let reg = Arc::new(ToolRegistry::new());
+        let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+        host.load_source(
+            "zzz_plugin",
+            r#"
+            maki.api.register_system_prompt_extra(function()
+                return "from_zzz"
+            end)
+            "#,
+        )
+        .unwrap();
+        host.load_source(
+            "aaa_plugin",
+            r#"
+            maki.api.register_system_prompt_extra(function()
+                return "from_aaa"
+            end)
+            "#,
+        )
+        .unwrap();
+        let handle = host.event_handle().unwrap();
+        let extras = handle.collect_prompt_extras();
+        assert_eq!(extras.len(), 2);
+        assert_eq!(extras[0], "from_aaa", "BTreeMap should sort by plugin name");
+        assert_eq!(extras[1], "from_zzz");
+    }
+
+    #[test]
+    fn prompt_extra_unload_cleans_up_callback() {
+        let reg = Arc::new(ToolRegistry::new());
+        let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+        host.load_source(
+            "temp_plugin",
+            r#"
+            maki.api.register_system_prompt_extra(function()
+                return "temporary"
+            end)
+            "#,
+        )
+        .unwrap();
+        let handle = host.event_handle().unwrap();
+        assert_eq!(handle.collect_prompt_extras().len(), 1);
+
+        host.unload("temp_plugin").unwrap();
+        assert!(handle.collect_prompt_extras().is_empty());
+    }
+
+    #[test]
+    fn prompt_extra_re_register_replaces_old_callback() {
+        let reg = Arc::new(ToolRegistry::new());
+        let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+        host.load_source(
+            "evolving",
+            r#"
+            maki.api.register_system_prompt_extra(function()
+                return "v1"
+            end)
+            "#,
+        )
+        .unwrap();
+        let handle = host.event_handle().unwrap();
+        assert_eq!(handle.collect_prompt_extras(), vec!["v1"]);
+
+        host.load_source(
+            "evolving",
+            r#"
+            maki.api.register_system_prompt_extra(function()
+                return "v2"
+            end)
+            "#,
+        )
+        .unwrap();
+        let extras = handle.collect_prompt_extras();
+        assert_eq!(extras.len(), 1, "should have exactly one, not two");
+        assert_eq!(extras[0], "v2");
     }
 }

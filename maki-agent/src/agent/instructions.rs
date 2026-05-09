@@ -48,7 +48,12 @@ pub(crate) fn is_instruction_file(name: &str) -> bool {
             .any(|f| *f == name || Path::new(f).file_name().is_some_and(|n| n == name))
 }
 
-pub fn build_system_prompt(vars: &Vars, mode: &AgentMode, instructions: &str) -> String {
+pub fn build_system_prompt(
+    vars: &Vars,
+    mode: &AgentMode,
+    instructions: &str,
+    prompt_extras: &[String],
+) -> String {
     let mut out = crate::prompt::SYSTEM_PROMPT.to_string();
 
     out.push_str(&vars.apply(
@@ -57,8 +62,8 @@ pub fn build_system_prompt(vars: &Vars, mode: &AgentMode, instructions: &str) ->
 
     out.push_str(instructions);
 
-    if let Some(listing) = crate::tools::memory::list_memory_files() {
-        out.push_str(&listing);
+    for extra in prompt_extras {
+        out.push_str(extra);
     }
 
     if let AgentMode::Plan(plan_path) = mode {
@@ -181,11 +186,30 @@ mod tests {
     #[test_case(&AgentMode::Plan(PathBuf::from(PLAN_PATH)), true ; "plan_includes_plan")]
     fn plan_section_presence(mode: &AgentMode, expect_plan: bool) {
         let vars = Vars::new().set("{cwd}", "/tmp").set("{platform}", "linux");
-        let prompt = build_system_prompt(&vars, mode, "");
+        let prompt = build_system_prompt(&vars, mode, "", &[]);
         assert_eq!(prompt.contains("Plan Mode"), expect_plan);
         if expect_plan {
             assert!(prompt.contains(PLAN_PATH));
         }
+    }
+
+    #[test]
+    fn prompt_extras_ordered_after_instructions_before_plan() {
+        let vars = Vars::new().set("{cwd}", "/tmp").set("{platform}", "linux");
+        let extras = vec!["EXTRA_A".to_string(), "EXTRA_B".to_string()];
+        let prompt = build_system_prompt(
+            &vars,
+            &AgentMode::Plan(PathBuf::from("plan.md")),
+            "\nProject instructions here",
+            &extras,
+        );
+        let pos_instr = prompt.find("Project instructions here").unwrap();
+        let pos_a = prompt.find("EXTRA_A").expect("EXTRA_A missing");
+        let pos_b = prompt.find("EXTRA_B").expect("EXTRA_B missing");
+        let pos_plan = prompt.find("Plan Mode").unwrap();
+        assert!(pos_instr < pos_a, "extras after instructions");
+        assert!(pos_a < pos_b, "extras preserve insertion order");
+        assert!(pos_b < pos_plan, "extras before plan section");
     }
 
     #[test_case("AGENTS.md",                true  ; "direct_match")]

@@ -23,6 +23,7 @@ use maki_agent::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, Envelope,
     EventSender, History, PermissionsConfig, ToolOutputLines, agent, template,
 };
+use maki_lua::EventHandle;
 use maki_providers::StopReason;
 use maki_providers::TokenUsage;
 use maki_providers::model::Model;
@@ -136,6 +137,7 @@ pub fn run(
     config: AgentConfig,
     permissions_config: PermissionsConfig,
     timeouts: maki_providers::Timeouts,
+    lua_handle: Option<EventHandle>,
 ) -> Result<()> {
     let prompt = match prompt_arg {
         Some(p) => p,
@@ -162,7 +164,11 @@ pub fn run(
     }
     let mcp_for_agent = mcp_handle.clone();
 
-    let system = agent::build_system_prompt(&vars, &mode, &instructions.text);
+    let prompt_extras = lua_handle
+        .as_ref()
+        .map(|h| h.collect_prompt_extras())
+        .unwrap_or_default();
+    let system = agent::build_system_prompt(&vars, &mode, &instructions.text, &prompt_extras);
 
     let (raw_tx, event_rx) = flume::unbounded::<Envelope>();
     let input = AgentInput {
