@@ -94,7 +94,6 @@ pub struct ListPicker<T> {
 
 enum FooterSpec {
     Pairs(&'static [(&'static str, &'static str)]),
-    Owned(Vec<(String, String)>),
     Builder(fn() -> Line<'static>),
 }
 
@@ -102,7 +101,6 @@ impl FooterSpec {
     fn build(&self) -> Line<'static> {
         match self {
             Self::Pairs(hints) => hint_line(hints),
-            Self::Owned(pairs) => hint_line(pairs),
             Self::Builder(b) => b(),
         }
     }
@@ -246,11 +244,6 @@ impl<T: PickerItem> ListPicker<T> {
 
     pub fn with_footer(mut self, hints: &'static [(&'static str, &'static str)]) -> Self {
         self.footer = Some(FooterSpec::Pairs(hints));
-        self
-    }
-
-    pub fn with_footer_owned(mut self, pairs: Vec<(String, String)>) -> Self {
-        self.footer = Some(FooterSpec::Owned(pairs));
         self
     }
 

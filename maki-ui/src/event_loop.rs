@@ -303,13 +303,6 @@ impl<'t> EventLoop<'t> {
         if let Some(rx) = &self.ui_action_rx {
             while let Ok(action) = rx.try_recv() {
                 match action {
-                    UiAction::Select {
-                        items,
-                        opts,
-                        reply_tx,
-                    } => {
-                        self.app.lua_select.open(items, opts, reply_tx);
-                    }
                     UiAction::Flash(msg) => {
                         self.app.flash(msg);
                     }

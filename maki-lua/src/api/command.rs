@@ -89,24 +89,6 @@ pub(crate) fn publish_command_snapshot(map: &CommandHandlerMap, writer: &LuaComm
     writer.publish(commands);
 }
 
-pub struct SelectItem {
-    pub label: String,
-    pub detail: Option<String>,
-}
-
-pub struct SelectOpts {
-    pub title: String,
-    pub has_on_delete: bool,
-    pub footer: Vec<(String, String)>,
-}
-
-pub enum SelectEvent {
-    Choice { index: usize },
-    Delete { index: usize },
-    OpenEditor { index: usize },
-    Close,
-}
-
 pub struct WinOpts {
     pub title: String,
     pub footer: Vec<(String, String)>,
@@ -129,11 +111,6 @@ pub enum WinCommand {
 }
 
 pub enum UiAction {
-    Select {
-        items: Vec<SelectItem>,
-        opts: SelectOpts,
-        reply_tx: flume::Sender<SelectEvent>,
-    },
     OpenWin {
         buf: Arc<SharedBuf>,
         opts: WinOpts,

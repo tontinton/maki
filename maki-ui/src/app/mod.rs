@@ -31,7 +31,6 @@ use crate::components::input::{InputAction, InputBox, Submission};
 use crate::components::keybindings::key;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 use crate::components::lua_float::LuaFloatWindow;
-use crate::components::lua_select::{LuaSelectAction, LuaSelectModal};
 use crate::components::mcp_picker::{McpPicker, McpPickerAction};
 use crate::components::model_picker::{ModelPicker, ModelPickerAction};
 use crate::components::permission_prompt::PermissionPrompt;
@@ -136,7 +135,6 @@ pub struct App {
     pub(super) rewind_picker: RewindPicker,
     pub(super) help_modal: HelpModal,
     pub(super) btw_modal: BtwModal,
-    pub(super) lua_select: LuaSelectModal,
     pub(super) lua_float: LuaFloatWindow,
     pub(super) search_modal: SearchModal,
     pub(super) file_picker: FilePickerModal,
@@ -209,7 +207,6 @@ impl App {
             rewind_picker: RewindPicker::new(),
             help_modal: HelpModal::new(),
             btw_modal: BtwModal::new(ui_config.typewriter_ms_per_char),
-            lua_select: LuaSelectModal::new(),
             lua_float: LuaFloatWindow::new(),
             search_modal: SearchModal::new(),
             file_picker: FilePickerModal::new(),
@@ -328,13 +325,6 @@ impl App {
         }
         if self.help_modal.is_open() {
             self.help_modal.scroll(delta);
-            return;
-        }
-        if self.lua_select.is_open() {
-            let pos = Position::new(column, row);
-            if self.lua_select.contains(pos) {
-                self.lua_select.scroll(delta);
-            }
             return;
         }
         let pos = Position::new(column, row);
@@ -499,13 +489,6 @@ impl App {
 
         if self.btw_modal.is_open() {
             self.btw_modal.handle_key(key);
-            return vec![];
-        }
-
-        if self.lua_select.is_open() {
-            if let LuaSelectAction::Flash(msg) = self.lua_select.handle_key(key) {
-                self.status_bar.flash(msg.to_string());
-            }
             return vec![];
         }
 
@@ -1247,11 +1230,10 @@ impl App {
         vec![]
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 14] {
+    fn overlays(&self) -> [&dyn Overlay; 13] {
         [
             &self.help_modal,
             &self.btw_modal,
-            &self.lua_select,
             &self.lua_float,
             &self.search_modal,
             &self.file_picker,
@@ -1266,11 +1248,10 @@ impl App {
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 14] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 13] {
         [
             &mut self.help_modal,
             &mut self.btw_modal,
-            &mut self.lua_select,
             &mut self.lua_float,
             &mut self.search_modal,
             &mut self.file_picker,
@@ -1367,7 +1348,6 @@ impl App {
                 }
             };
         }
-        try_picker!(self.lua_select);
         try_picker!(self.file_picker);
         try_picker!(self.task_picker);
         try_picker!(self.session_picker);

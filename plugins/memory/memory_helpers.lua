@@ -52,7 +52,7 @@ function M.safe_resolve(memories_dir, relative)
   local resolved = maki.fs.normalize(maki.fs.joinpath(memories_dir, relative))
   local norm_base = maki.fs.normalize(memories_dir)
   local prefix = norm_base .. "/"
-  if resolved ~= norm_base and resolved:sub(1, #prefix) ~= prefix then
+  if resolved:sub(1, #prefix) ~= prefix then
     return nil, "path traversal outside memories directory is not allowed"
   end
   return resolved
