@@ -258,6 +258,26 @@ case("tool_view_append_after_toggle_still_works", function()
 end)
 
 local ListPicker = require("maki.list_picker")
+local highlight_to_view = require("maki.highlight")
+
+case("highlight_to_view_number_width_scales", function()
+  local buf = mock_buf()
+  local view = ToolView.new(buf, { max_lines = 200 })
+  local lines = {}
+  for i = 1, 100 do
+    lines[i] = "x"
+  end
+  local content = table.concat(lines, "\n")
+  local ok = highlight_to_view(view, content, "txt")
+  eq(ok, true)
+  eq(view.ring_count, 100)
+  local first_nr = buf.lines[1][1][1]
+  local last_nr = buf.lines[100][1][1]
+  eq(first_nr, "  1 ", "3-digit width for 100 lines, right-aligned")
+  eq(last_nr, "100 ", "line 100 should fill the width")
+  eq(buf.lines[1][1][2], "line_nr")
+end)
+
 local render_lines = ListPicker._render_lines
 
 case("render_lines_string_items_basic", function()
