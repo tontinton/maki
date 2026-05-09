@@ -18,6 +18,7 @@ const DISMISS_KEYS: &str = if cfg!(target_os = "macos") {
 };
 const HINT_PAIRS: &[(&str, &str)] = &[
     ("↑↓", "select"),
+    ("Space", "toggle parallel"),
     ("Enter", "confirm"),
     (key::OPEN_EDITOR.label, "edit plan"),
     (DISMISS_KEYS, "dismiss"),
@@ -66,6 +67,7 @@ enum Visibility {
 pub struct PlanForm {
     visibility: Visibility,
     selected: usize,
+    parallel: bool,
 }
 
 impl PlanForm {
@@ -73,6 +75,7 @@ impl PlanForm {
         Self {
             visibility: Visibility::Hidden,
             selected: 0,
+            parallel: true,
         }
     }
 
@@ -104,6 +107,10 @@ impl PlanForm {
         if self.is_visible() {
             self.visibility = Visibility::UserDismissed;
         }
+    }
+
+    pub fn parallel(&self) -> bool {
+        self.parallel
     }
 
     pub fn reset(&mut self) {
@@ -146,6 +153,10 @@ impl PlanForm {
                 self.selected = (self.selected + 1).min(MENU.len() - 1);
                 PlanFormAction::Consumed
             }
+            KeyCode::Char(' ') => {
+                self.parallel = !self.parallel;
+                PlanFormAction::Consumed
+            }
             KeyCode::Enter => (MENU[self.selected].action)(),
             KeyCode::Tab => PlanFormAction::Passthrough,
             _ => PlanFormAction::Consumed,
@@ -162,13 +173,16 @@ impl PlanForm {
 
         for (i, item) in MENU.iter().enumerate() {
             let (prefix, style) = selected_prefix(&t, i == self.selected);
-            lines.push(Line::from(vec![
+            let mut spans = vec![
                 Span::styled(prefix, t.form_arrow),
                 Span::styled(item.label, style),
                 Span::styled(item.desc, t.form_description),
-            ]));
+            ];
+            if self.parallel {
+                spans.push(Span::styled(" (parallel)", t.form_description.bold()));
+            }
+            lines.push(Line::from(spans));
         }
-
         lines.push(Line::default());
         lines.push(hint_line(HINT_PAIRS));
 
@@ -269,12 +283,29 @@ mod tests {
     }
 
     #[test_case(0, PlanFormAction::ClearAndImplement ; "enter_at_0")]
-    #[test_case(1, PlanFormAction::Implement         ; "enter_at_1")]
+    #[test_case(1, PlanFormAction::Implement          ; "enter_at_1")]
     fn enter_dispatches(selected: usize, expected: PlanFormAction) {
         let mut form = PlanForm::new();
         form.on_plan_ready();
         form.selected = selected;
         assert_eq!(form.handle_key(key(KeyCode::Enter)), expected);
+    }
+
+    #[test]
+    fn space_toggles_parallel() {
+        let mut form = PlanForm::new();
+        form.on_plan_ready();
+        assert!(form.parallel());
+        assert_eq!(
+            form.handle_key(key(KeyCode::Char(' '))),
+            PlanFormAction::Consumed
+        );
+        assert!(!form.parallel());
+        assert_eq!(
+            form.handle_key(key(KeyCode::Char(' '))),
+            PlanFormAction::Consumed
+        );
+        assert!(form.parallel());
     }
 
     #[test_case(key(KeyCode::Esc)              ; "esc")]

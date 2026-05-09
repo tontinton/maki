@@ -2166,6 +2166,19 @@ fn plan_form_menu_options(
 }
 
 #[test]
+fn plan_form_implement_without_parallel() {
+    let mut app = plan_app();
+    app.update(Msg::Key(key(KeyCode::Char(' '))));
+    let actions = app.update(Msg::Key(key(KeyCode::Enter)));
+    let expected_msg = format!("{IMPLEMENT_MSG_PREFIX} at `test-plan.md`.");
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, Action::SendMessage(i) if i.message == expected_msg))
+    );
+}
+
+#[test]
 fn plan_form_open_editor() {
     let mut app = plan_app();
 

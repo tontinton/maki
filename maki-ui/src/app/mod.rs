@@ -80,7 +80,7 @@ const AUTH_EXPIRED_MSG: &str =
     "Token expired. Run `maki auth login` in another terminal, then press Enter to retry.";
 const FLASH_NO_PLAN: &str = "No plan file";
 const IMPLEMENT_MSG_PREFIX: &str = "Implement the plan";
-const IMPLEMENT_PARALLEL_HINT: &str = "For multi-step (3+) plans: use batch+task to parallelize, assign each subagent a separate module and restrict its tests to that module to avoid interference.";
+const IMPLEMENT_PARALLEL_HINT: &str = "Use batch+task to parallelize, assign each subagent a separate module and restrict its tests to that module to avoid interference.";
 
 const TASK_DONE_DETAIL: &str = "✓ ";
 
@@ -1383,6 +1383,7 @@ impl App {
     }
 
     fn implement_plan(&mut self, clear_context: bool) -> Vec<Action> {
+        let parallel = self.plan_form.parallel();
         self.plan_form.reset();
         let plan_snapshot = match std::mem::take(&mut self.state.plan) {
             PlanState::Ready(p) => Some((
@@ -1401,7 +1402,11 @@ impl App {
         };
 
         let text = if let Some((content, path_str)) = plan_snapshot {
-            let text = format!("{IMPLEMENT_MSG_PREFIX} at `{path_str}`. {IMPLEMENT_PARALLEL_HINT}");
+            let text = if parallel {
+                format!("{IMPLEMENT_MSG_PREFIX} at `{path_str}`. {IMPLEMENT_PARALLEL_HINT}")
+            } else {
+                format!("{IMPLEMENT_MSG_PREFIX} at `{path_str}`.")
+            };
             self.main_chat()
                 .push(DisplayMessage::plan(content, path_str));
             text
