@@ -267,13 +267,13 @@ fn sign_request_sigv4(
 ) -> Vec<(String, String)> {
     let date = &timestamp[..8];
 
-    let (host, path, query) = parse_url(url);
-
+    let (_, path, query) = parse_url(url);
     let payload_hash = hex_sha256(body);
 
+    // 'host' belongs to the HTTP request, so the caller already sets it. If we add
+    // it here too it ends up signed twice and AWS rejects the signature.
     let mut canonical_headers: Vec<(&str, String)> =
         headers.iter().map(|(k, v)| (*k, v.to_string())).collect();
-    canonical_headers.push(("host", host.to_string()));
     canonical_headers.push(("x-amz-date", timestamp.to_string()));
     if let Some(tok) = session_token {
         canonical_headers.push(("x-amz-security-token", tok.to_string()));
@@ -291,8 +291,12 @@ fn sign_request_sigv4(
         .collect::<Vec<_>>()
         .join(";");
 
+    // Bedrock model IDs contain ':', which the URL already spells as '%3A'. SigV4
+    // wants the path percent-encoded again when it goes into the canonical request,
+    // so '%3A' becomes '%253A'. Skip this and the signature will not match.
+    let canonical_path = encode_path(path);
     let canonical_request = format!(
-        "{method}\n{path}\n{query}\n{canonical_headers_str}\n{signed_headers}\n{payload_hash}"
+        "{method}\n{canonical_path}\n{query}\n{canonical_headers_str}\n{signed_headers}\n{payload_hash}"
     );
 
     let credential_scope = format!("{date}/{region}/{service}/aws4_request");
@@ -316,6 +320,24 @@ fn sign_request_sigv4(
         result.push(("x-amz-security-token".into(), tok.into()));
     }
     result
+}
+
+fn encode_path(path: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(path.len());
+    for b in path.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                out.push(b as char);
+            }
+            _ => {
+                out.push('%');
+                out.push(HEX[(b >> 4) as usize] as char);
+                out.push(HEX[(b & 0xF) as usize] as char);
+            }
+        }
+    }
+    out
 }
 
 fn parse_url(url: &str) -> (&str, &str, &str) {
@@ -718,6 +740,40 @@ mod tests {
     use crate::{ContentBlock, ProviderEvent};
     use test_case::test_case;
 
+    #[test]
+    fn sigv4_signing_encodes_path_segments() {
+        // The URL below has '%3A' from a real Bedrock model ID. The pinned signature
+        // was computed against the doubly encoded '%253A' canonical path, so this
+        // test fails the moment someone stops re-encoding the path.
+        let url = "https://bedrock-runtime.us-east-1.amazonaws.com/model/anthropic.claude-3-5-sonnet-20241022-v2%3A0/invoke-with-response-stream";
+        let headers = sign_request_sigv4(
+            "POST",
+            url,
+            &[
+                ("content-type", "application/json"),
+                ("host", "bedrock-runtime.us-east-1.amazonaws.com"),
+            ],
+            b"{}",
+            "AKID",
+            "SECRET",
+            None,
+            "us-east-1",
+            "bedrock",
+            "20240101T000000Z",
+        );
+        let auth = headers
+            .iter()
+            .find(|(k, _)| k == "Authorization")
+            .map(|(_, v)| v.as_str())
+            .unwrap();
+        assert!(
+            auth.contains(
+                "Signature=ff69b69725fa6fa2de10b57605b9fca403f357980e082d138d1772abe10fbea2"
+            ),
+            "unexpected signature: {auth}"
+        );
+    }
+
     #[test_case(None ; "without_session_token")]
     #[test_case(Some("TOKEN") ; "with_session_token")]
     fn sigv4_signing(session_token: Option<&str>) {
@@ -740,7 +796,16 @@ mod tests {
         assert!(auth.1.starts_with(
             "AWS4-HMAC-SHA256 Credential=AKID/20240101/us-east-1/bedrock/aws4_request"
         ));
-        assert!(auth.1.contains("SignedHeaders="));
+        let expected_signed = if session_token.is_some() {
+            "SignedHeaders=content-type;host;x-amz-date;x-amz-security-token"
+        } else {
+            "SignedHeaders=content-type;host;x-amz-date"
+        };
+        assert!(
+            auth.1.contains(expected_signed),
+            "Authorization missing expected SignedHeaders: {}",
+            auth.1
+        );
         assert!(auth.1.contains("Signature="));
         assert_eq!(
             headers.iter().any(|(k, _)| k == "x-amz-security-token"),
