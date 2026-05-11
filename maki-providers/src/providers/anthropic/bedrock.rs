@@ -1,14 +1,16 @@
 use std::env;
 use std::ops::ControlFlow;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use flume::Sender;
 use hmac::{Hmac, Mac};
-use isahc::{HttpClient, Request};
+use isahc::config::Configurable;
+use isahc::{HttpClient, ReadResponseExt, Request};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::model::Model;
 use crate::provider::{BoxFuture, Provider};
@@ -18,6 +20,8 @@ use super::shared;
 
 const BEDROCK_API_VERSION: &str = "bedrock-2023-05-31";
 const MIN_EVENTSTREAM_FRAME: usize = 16;
+const CONTAINER_METADATA_TIMEOUT: Duration = Duration::from_secs(5);
+const REFRESH_MARGIN: Duration = Duration::from_secs(5 * 60);
 
 fn io_error(
     kind: std::io::ErrorKind,
@@ -32,6 +36,8 @@ enum AuthKind {
         access_key: String,
         secret_key: String,
         session_token: Option<String>,
+        // epoch seconds; Some only for temporary creds from the container endpoint.
+        expires_at: Option<u64>,
     },
     Bearer {
         token: String,
@@ -70,6 +76,17 @@ fn resolve_bedrock_auth() -> Result<BedrockAuth, AgentError> {
             access_key,
             secret_key,
             session_token,
+            expires_at: None,
+        }
+    } else if let Ok(url) = env::var("AWS_CONTAINER_CREDENTIALS_FULL_URI") {
+        let (access_key, secret_key, session_token, expires_at) =
+            fetch_container_credentials(&url)?;
+        debug!("using Bedrock SigV4 auth from container credentials endpoint");
+        AuthKind::SigV4 {
+            access_key,
+            secret_key,
+            session_token,
+            expires_at,
         }
     } else {
         let profile = env::var("AWS_PROFILE").unwrap_or_else(|_| "default".into());
@@ -85,10 +102,11 @@ fn resolve_bedrock_auth() -> Result<BedrockAuth, AgentError> {
                 access_key,
                 secret_key,
                 session_token,
+                expires_at: None,
             }
         } else {
             return Err(AgentError::Config {
-                message: "no AWS credentials found: set AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, AWS_PROFILE, or AWS_BEARER_TOKEN_BEDROCK".into(),
+                message: "no AWS credentials found: set AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, AWS_PROFILE, AWS_CONTAINER_CREDENTIALS_FULL_URI, or AWS_BEARER_TOKEN_BEDROCK".into(),
             });
         }
     };
@@ -133,6 +151,105 @@ fn parse_aws_credentials_file(
             message: format!("profile '{profile}' not found or missing keys in credentials file"),
         }),
     }
+}
+
+fn fetch_container_credentials(
+    url: &str,
+) -> Result<(String, String, Option<String>, Option<u64>), AgentError> {
+    // file rotates, so don't cache it.
+    let auth_header = match env::var("AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE") {
+        Ok(path) => Some(
+            std::fs::read_to_string(&path).map_err(|e| AgentError::Config {
+                message: format!("read container auth token file {path}: {e}"),
+            })?,
+        ),
+        Err(_) => env::var("AWS_CONTAINER_AUTHORIZATION_TOKEN").ok(),
+    };
+
+    let client = HttpClient::builder()
+        .connect_timeout(CONTAINER_METADATA_TIMEOUT)
+        .timeout(CONTAINER_METADATA_TIMEOUT)
+        .build()
+        .map_err(|e| AgentError::Config {
+            message: format!("container creds http client: {e}"),
+        })?;
+
+    let mut builder = Request::builder().method("GET").uri(url);
+    if let Some(token) = &auth_header {
+        builder = builder.header("Authorization", token.trim());
+    }
+    let request = builder.body(Vec::<u8>::new())?;
+
+    let mut resp = client.send(request).map_err(|e| AgentError::Config {
+        message: format!("container creds request: {e}"),
+    })?;
+
+    if resp.status().as_u16() != 200 {
+        let body_text = resp.text().unwrap_or_else(|_| "unknown error".into());
+        return Err(AgentError::Config {
+            message: format!(
+                "container creds endpoint returned {}: {body_text}",
+                resp.status().as_u16()
+            ),
+        });
+    }
+
+    let body_text = resp.text()?;
+    parse_container_credentials_response(&body_text)
+}
+
+fn parse_container_credentials_response(
+    body: &str,
+) -> Result<(String, String, Option<String>, Option<u64>), AgentError> {
+    let v: Value = serde_json::from_str(body)?;
+    let access_key = v
+        .get("AccessKeyId")
+        .and_then(|s| s.as_str())
+        .ok_or_else(|| AgentError::Config {
+            message: "container creds response missing AccessKeyId".into(),
+        })?
+        .to_string();
+    let secret_key = v
+        .get("SecretAccessKey")
+        .and_then(|s| s.as_str())
+        .ok_or_else(|| AgentError::Config {
+            message: "container creds response missing SecretAccessKey".into(),
+        })?
+        .to_string();
+    let session_token = v.get("Token").and_then(|s| s.as_str()).map(str::to_string);
+    let expires_at = v
+        .get("Expiration")
+        .and_then(|s| s.as_str())
+        .and_then(parse_iso8601_to_epoch);
+    Ok((access_key, secret_key, session_token, expires_at))
+}
+
+// Hand-rolled to avoid pulling in chrono just for this one field.
+fn parse_iso8601_to_epoch(s: &str) -> Option<u64> {
+    let s = s.strip_suffix('Z')?;
+    let (date, time) = s.split_once('T')?;
+    let mut date_parts = date.split('-');
+    let year: u64 = date_parts.next()?.parse().ok()?;
+    let month: u64 = date_parts.next()?.parse().ok()?;
+    let day: u64 = date_parts.next()?.parse().ok()?;
+    let time = time.split('.').next()?; // drop fractional seconds
+    let mut time_parts = time.split(':');
+    let hour: u64 = time_parts.next()?.parse().ok()?;
+    let minute: u64 = time_parts.next()?.parse().ok()?;
+    let second: u64 = time_parts.next()?.parse().ok()?;
+    Some(ymdhms_to_epoch(year, month, day, hour, minute, second))
+}
+
+// Inverse of days_to_ymd. Howard Hinnant's algorithm; valid for any civil date.
+fn ymdhms_to_epoch(year: u64, month: u64, day: u64, hour: u64, minute: u64, second: u64) -> u64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y / 400;
+    let yoe = y - era * 400;
+    let m = month as i64;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + day as i64 - 1;
+    let doe = yoe as i64 * 365 + (yoe / 4) as i64 - (yoe / 100) as i64 + doy;
+    let days_since_epoch = (era as i64 * 146097 + doe - 719468) as u64;
+    days_since_epoch * 86400 + hour * 3600 + minute * 60 + second
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -343,13 +460,35 @@ pub(crate) struct Bedrock {
 
 impl Bedrock {
     pub fn new(timeouts: super::super::Timeouts) -> Result<Self, AgentError> {
-        let auth = resolve_bedrock_auth()?;
+        // is_available() upstream calls new().is_ok() and discards the error,
+        // so the user sees a generic "no provider available" message. Surface
+        // the real reason here before that happens.
+        let auth = resolve_bedrock_auth().inspect_err(|e| {
+            warn!(error = %e, "Bedrock auth resolution failed");
+        })?;
         let base_url = env::var("ANTHROPIC_BEDROCK_BASE_URL").ok();
         Ok(Self {
             client: super::super::http_client(timeouts),
             auth: Arc::new(Mutex::new(auth)),
             base_url,
         })
+    }
+
+    fn needs_refresh(&self) -> bool {
+        let auth = self.auth.lock().unwrap();
+        match &auth.kind {
+            AuthKind::SigV4 {
+                expires_at: Some(exp),
+                ..
+            } => {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                now + REFRESH_MARGIN.as_secs() >= *exp
+            }
+            _ => false,
+        }
     }
 }
 
@@ -365,6 +504,10 @@ impl Provider for Bedrock {
         _session_id: Option<&'a str>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
+            if self.needs_refresh() {
+                debug!("Bedrock creds near expiry, refreshing before request");
+                self.reload_auth().await?;
+            }
             let auth = self.auth.lock().unwrap().clone();
             let model_id = env::var("ANTHROPIC_MODEL").unwrap_or_else(|_| model.id.clone());
 
@@ -408,6 +551,7 @@ impl Provider for Bedrock {
                     access_key,
                     secret_key,
                     session_token,
+                    expires_at: _,
                 } => Some(sign_request_sigv4(
                     "POST",
                     &url,
@@ -684,6 +828,50 @@ aws_session_token = MYTOKEN\n";
     fn parse_aws_credentials_missing_profile_errors() {
         let content = "[default]\naws_access_key_id = AKID\naws_secret_access_key = SECRET\n";
         assert!(parse_aws_credentials_file(content, "nonexistent").is_err());
+    }
+
+    #[test]
+    fn parse_container_creds_full_response() {
+        let body = r#"{
+            "AccessKeyId": "ASIA123",
+            "SecretAccessKey": "secret456",
+            "Token": "session789",
+            "Expiration": "2026-05-11T18:00:00Z"
+        }"#;
+        let (ak, sk, tok, exp) = parse_container_credentials_response(body).unwrap();
+        assert_eq!(ak, "ASIA123");
+        assert_eq!(sk, "secret456");
+        assert_eq!(tok.as_deref(), Some("session789"));
+        assert_eq!(exp, Some(1778522400));
+    }
+
+    #[test]
+    fn parse_container_creds_missing_token_is_ok() {
+        let body = r#"{"AccessKeyId":"AKIA1","SecretAccessKey":"s1"}"#;
+        let (ak, sk, tok, exp) = parse_container_credentials_response(body).unwrap();
+        assert_eq!(ak, "AKIA1");
+        assert_eq!(sk, "s1");
+        assert!(tok.is_none());
+        assert!(exp.is_none());
+    }
+
+    #[test]
+    fn parse_container_creds_missing_required_field_errors() {
+        let body = r#"{"SecretAccessKey":"s1"}"#;
+        assert!(parse_container_credentials_response(body).is_err());
+    }
+
+    #[test_case("2026-05-11T18:00:00Z",      Some(1778522400) ; "plain_seconds")]
+    #[test_case("2026-05-11T18:00:00.123Z",  Some(1778522400) ; "fractional_dropped")]
+    #[test_case("2024-01-01T00:00:00Z",      Some(1704067200) ; "epoch_2024")]
+    #[test_case("1970-01-01T00:00:00Z",      Some(0)          ; "unix_epoch")]
+    #[test_case("2000-02-29T23:59:59Z",      Some(951868799)  ; "leap_day")]
+    #[test_case("2024-12-31T23:59:59Z",      Some(1735689599) ; "year_end")]
+    #[test_case("2100-03-01T00:00:00Z",      Some(4107542400) ; "century_non_leap")]
+    #[test_case("not a date",                None              ; "garbage")]
+    #[test_case("2026-05-11T18:00:00",       None              ; "missing_z")]
+    fn iso8601_parse(input: &str, expected: Option<u64>) {
+        assert_eq!(parse_iso8601_to_epoch(input), expected);
     }
 
     #[test]
