@@ -12,6 +12,7 @@ pub(crate) mod copilot;
 pub(crate) mod deepseek;
 pub mod dynamic;
 pub(crate) mod google;
+pub(crate) mod llama_cpp;
 pub(crate) mod mistral;
 pub(crate) mod ollama;
 pub(crate) mod openai;

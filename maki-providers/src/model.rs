@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::provider::ProviderKind;
 use crate::providers::{
-    anthropic, copilot, deepseek, dynamic, google, mistral, ollama, openai, synthetic, zai,
+    anthropic, copilot, deepseek, dynamic, google, llama_cpp, mistral, ollama, openai, synthetic,
+    zai,
 };
 
 const PER_MILLION: f64 = 1_000_000.0;
@@ -114,6 +115,7 @@ pub fn models_for_provider(provider: ProviderKind) -> &'static [ModelEntry] {
         ProviderKind::OpenAi => openai::models(),
         ProviderKind::Copilot => copilot::models(),
         ProviderKind::Ollama => ollama::models(),
+        ProviderKind::LlamaCpp => llama_cpp::models(),
         ProviderKind::Mistral => mistral::models(),
         ProviderKind::Google => google::models(),
         ProviderKind::Zai | ProviderKind::ZaiCodingPlan => zai::models(),

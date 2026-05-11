@@ -20,6 +20,7 @@ use super::anthropic::Anthropic;
 use super::copilot::Copilot;
 use super::deepseek::DeepSeek;
 use super::google::Google;
+use super::llama_cpp::LlamaCpp;
 use super::mistral::Mistral;
 use super::ollama::Ollama;
 use super::openai::OpenAi;
@@ -360,6 +361,10 @@ pub fn create(slug: &str, timeouts: super::Timeouts) -> Result<Box<dyn Provider>
             Ollama::with_auth(auth.clone(), timeouts)
                 .with_system_prefix(meta.system_prefix.clone()),
         ),
+        ProviderKind::LlamaCpp => Box::new(
+            LlamaCpp::with_auth(auth.clone(), timeouts)
+                .with_system_prefix(meta.system_prefix.clone()),
+        ),
         ProviderKind::Mistral => Box::new(
             Mistral::with_auth(auth.clone(), timeouts)
                 .with_system_prefix(meta.system_prefix.clone()),
@@ -654,6 +659,7 @@ esac
 
     #[cfg(unix)]
     #[test_case("ollama", ProviderKind::Ollama ; "base_ollama")]
+    #[test_case("llama-cpp", ProviderKind::LlamaCpp ; "base_llama_cpp")]
     #[test_case("mistral", ProviderKind::Mistral ; "base_mistral")]
     #[test_case("zai", ProviderKind::Zai ; "base_zai")]
     #[test_case("zai-coding-plan", ProviderKind::ZaiCodingPlan ; "base_zai_coding_plan")]
