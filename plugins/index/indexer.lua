@@ -12,6 +12,7 @@ local EXT_TO_LANG = {
   jsx = "javascript",
   mjs = "javascript",
   cjs = "javascript",
+  gleam = "gleam",
   go = "go",
   java = "java",
   c = "c",
