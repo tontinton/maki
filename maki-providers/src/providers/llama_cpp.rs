@@ -7,8 +7,8 @@ use crate::model::{Model, ModelEntry};
 use crate::provider::{BoxFuture, Provider};
 use crate::{AgentError, Message, ProviderEvent, StreamResponse, ThinkingConfig};
 
-use super::ResolvedAuth;
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
+use super::{KeyPool, ResolvedAuth};
 
 const HOST_ENV: &str = "LLAMA_CPP_HOST";
 const API_KEY_ENV: &str = "LLAMA_CPP_API_KEY";
@@ -29,22 +29,21 @@ pub(crate) fn models() -> &'static [ModelEntry] {
 pub struct LlamaCpp {
     compat: OpenAiCompatProvider,
     auth: Arc<Mutex<ResolvedAuth>>,
+    key_pool: Option<KeyPool>,
     system_prefix: Option<String>,
 }
 
 impl LlamaCpp {
     pub fn new(timeouts: super::Timeouts) -> Result<Self, AgentError> {
-        Self::from_env(
-            timeouts,
-            std::env::var(API_KEY_ENV).ok(),
-            std::env::var(HOST_ENV).ok(),
-        )
+        let key_pool = KeyPool::from_env(API_KEY_ENV).ok();
+        Self::from_env(timeouts, key_pool, std::env::var(HOST_ENV).ok())
     }
 
     pub(crate) fn with_auth(auth: Arc<Mutex<ResolvedAuth>>, timeouts: super::Timeouts) -> Self {
         Self {
             compat: OpenAiCompatProvider::new(&CONFIG, timeouts),
             auth,
+            key_pool: None,
             system_prefix: None,
         }
     }
@@ -56,7 +55,7 @@ impl LlamaCpp {
 
     fn from_env(
         timeouts: super::Timeouts,
-        api_key: Option<String>,
+        key_pool: Option<KeyPool>,
         host: Option<String>,
     ) -> Result<Self, AgentError> {
         let base_url = match host {
@@ -67,7 +66,7 @@ impl LlamaCpp {
                 });
             }
         };
-        let headers = match api_key {
+        let headers = match key_pool.as_ref().map(|p| p.current().to_string()) {
             Some(key) => vec![("authorization".into(), format!("Bearer {key}"))],
             None => Vec::new(),
         };
@@ -77,6 +76,7 @@ impl LlamaCpp {
                 base_url: Some(base_url),
                 headers,
             })),
+            key_pool,
             system_prefix: None,
         })
     }
@@ -110,6 +110,16 @@ impl Provider for LlamaCpp {
             self.compat.do_list_models(&auth).await
         })
     }
+
+    fn rotate_key(&self) -> BoxFuture<'_, Result<bool, AgentError>> {
+        Box::pin(async {
+            Ok(self.key_pool.as_ref().is_some_and(|p| {
+                p.rotate_headers(&self.auth, |key| {
+                    vec![("authorization".into(), format!("Bearer {key}"))]
+                })
+            }))
+        })
+    }
 }
 
 #[cfg(test)]
@@ -141,12 +151,9 @@ mod tests {
 
     #[test]
     fn from_env_with_api_key_uses_host_with_auth() {
-        let llama = LlamaCpp::from_env(
-            TEST_TIMEOUTS,
-            Some("test-key".into()),
-            Some("http://local:1234".into()),
-        )
-        .unwrap();
+        let pool = KeyPool::from_keys(vec!["test-key".into()]);
+        let llama = LlamaCpp::from_env(TEST_TIMEOUTS, Some(pool), Some("http://local:1234".into()))
+            .unwrap();
         let auth = llama.auth.lock().unwrap();
         assert_eq!(auth.base_url.as_deref(), Some("http://local:1234/v1"));
         assert_eq!(auth.headers.len(), 1);

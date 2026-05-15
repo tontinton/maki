@@ -15,6 +15,8 @@ Open the model picker with `/model` and press `Alt+1`, `Alt+2`, or `Alt+3` on an
 
 Maki re-reads auth from storage and environment variables each time a new agent spawns (`/new`, retry, session load). If you run `maki auth login` in another terminal or change an env var, the next session picks it up without a restart.
 
+You can set multiple API keys in one env var (`ANTHROPIC_API_KEY=sk-1,sk-2,sk-3`) and they rotate automatically on rate-limit or auth errors.
+
 ## Built-in Providers
 
 ### Anthropic

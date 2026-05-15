@@ -221,6 +221,10 @@ pub trait Provider: Send + Sync {
     fn reload_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
         Box::pin(async { Ok(()) })
     }
+
+    fn rotate_key(&self) -> BoxFuture<'_, Result<bool, AgentError>> {
+        Box::pin(async { Ok(false) })
+    }
 }
 
 pub fn from_model(model: &Model, timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {

@@ -9,8 +9,8 @@ use crate::model::{ModelEntry, ModelFamily, ModelPricing, ModelTier};
 use crate::provider::{BoxFuture, Provider};
 use crate::{AgentError, Message, ProviderEvent, StreamResponse, ThinkingConfig};
 
-use super::ResolvedAuth;
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
+use super::{KeyPool, ResolvedAuth};
 
 static CONFIG_STANDARD: OpenAiCompatConfig = OpenAiCompatConfig {
     api_key_env: "ZHIPU_API_KEY",
@@ -140,6 +140,7 @@ pub enum ZaiPlan {
 pub struct Zai {
     compat: OpenAiCompatProvider,
     auth: Arc<Mutex<ResolvedAuth>>,
+    key_pool: Option<KeyPool>,
     system_prefix: Option<String>,
 }
 
@@ -149,12 +150,11 @@ impl Zai {
             ZaiPlan::Standard => &CONFIG_STANDARD,
             ZaiPlan::Coding => &CONFIG_CODING,
         };
-        let api_key = std::env::var(config.api_key_env).map_err(|_| AgentError::Config {
-            message: format!("{} not set", config.api_key_env),
-        })?;
+        let pool = KeyPool::from_env(config.api_key_env)?;
         Ok(Self {
             compat: OpenAiCompatProvider::new(config, timeouts),
-            auth: Arc::new(Mutex::new(ResolvedAuth::bearer(&api_key))),
+            auth: Arc::new(Mutex::new(ResolvedAuth::bearer(pool.current()))),
+            key_pool: Some(pool),
             system_prefix: None,
         })
     }
@@ -171,6 +171,7 @@ impl Zai {
         Self {
             compat: OpenAiCompatProvider::new(config, timeouts),
             auth,
+            key_pool: None,
             system_prefix: None,
         }
     }
@@ -221,6 +222,15 @@ impl Provider for Zai {
         Box::pin(async move {
             let auth = self.auth.lock().unwrap().clone();
             self.compat.do_list_models(&auth).await
+        })
+    }
+
+    fn rotate_key(&self) -> BoxFuture<'_, Result<bool, AgentError>> {
+        Box::pin(async {
+            Ok(self
+                .key_pool
+                .as_ref()
+                .is_some_and(|p| p.rotate_auth(&self.auth, ResolvedAuth::bearer)))
         })
     }
 }

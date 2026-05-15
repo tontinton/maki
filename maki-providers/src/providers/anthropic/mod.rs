@@ -4,7 +4,6 @@
 pub(crate) mod bedrock;
 pub(super) mod shared;
 
-use std::env;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -19,39 +18,40 @@ use crate::model::Model;
 use crate::provider::{BoxFuture, Provider};
 use crate::{AgentError, Message, ProviderEvent, StreamResponse, ThinkingConfig};
 
+use super::KeyPool;
+
 const API_VERSION: &str = "2023-06-01";
 const MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
 const MODELS_URL: &str = "https://api.anthropic.com/v1/models?limit=1000";
 
+const ENV_VAR: &str = "ANTHROPIC_API_KEY";
+
 pub(crate) use shared::models;
 
-fn resolve_auth() -> Result<super::ResolvedAuth, AgentError> {
-    if let Ok(key) = env::var("ANTHROPIC_API_KEY") {
-        debug!("using API key authentication");
-        return Ok(super::ResolvedAuth {
-            base_url: Some("https://api.anthropic.com/v1/messages".into()),
-            headers: vec![("x-api-key".into(), key)],
-        });
+fn resolve_auth_from_key(key: &str) -> super::ResolvedAuth {
+    super::ResolvedAuth {
+        base_url: Some("https://api.anthropic.com/v1/messages".into()),
+        headers: vec![("x-api-key".into(), key.to_string())],
     }
-
-    Err(AgentError::Config {
-        message: "set ANTHROPIC_API_KEY environment variable".into(),
-    })
 }
 
 pub struct Anthropic {
     client: HttpClient,
     auth: Arc<Mutex<super::ResolvedAuth>>,
+    key_pool: Option<KeyPool>,
     system_prefix: Option<String>,
     stream_timeout: Duration,
 }
 
 impl Anthropic {
     pub fn new(timeouts: super::Timeouts) -> Result<Self, AgentError> {
-        let resolved = resolve_auth()?;
+        let pool = KeyPool::from_env(ENV_VAR)?;
+        let resolved = resolve_auth_from_key(pool.current());
+        debug!(keys = pool.len(), "using API key authentication");
         Ok(Self {
             client: super::http_client(timeouts),
             auth: Arc::new(Mutex::new(resolved)),
+            key_pool: Some(pool),
             system_prefix: None,
             stream_timeout: timeouts.stream,
         })
@@ -64,6 +64,7 @@ impl Anthropic {
         Self {
             client: super::http_client(timeouts),
             auth,
+            key_pool: None,
             system_prefix: None,
             stream_timeout: timeouts.stream,
         }
@@ -192,10 +193,19 @@ impl Provider for Anthropic {
 
     fn reload_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
         Box::pin(async {
-            let resolved = resolve_auth()?;
-            *self.auth.lock().unwrap() = resolved;
+            let pool = KeyPool::from_env(ENV_VAR)?;
+            *self.auth.lock().unwrap() = resolve_auth_from_key(pool.current());
             debug!("reloaded Anthropic auth from env");
             Ok(())
+        })
+    }
+
+    fn rotate_key(&self) -> BoxFuture<'_, Result<bool, AgentError>> {
+        Box::pin(async {
+            Ok(self
+                .key_pool
+                .as_ref()
+                .is_some_and(|p| p.rotate_auth(&self.auth, resolve_auth_from_key)))
         })
     }
 }

@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures_lite::StreamExt;
@@ -146,6 +148,82 @@ pub(crate) fn http_client(timeouts: Timeouts) -> isahc::HttpClient {
         .expect("failed to build HTTP client")
 }
 
+#[derive(Clone)]
+pub struct KeyPool {
+    keys: Arc<Vec<String>>,
+    index: Arc<AtomicUsize>,
+}
+
+impl KeyPool {
+    pub fn from_env(env_var: &str) -> Result<Self, AgentError> {
+        let raw = std::env::var(env_var).map_err(|_| AgentError::Config {
+            message: format!("{env_var} not set"),
+        })?;
+        let keys: Vec<String> = raw
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if keys.is_empty() {
+            return Err(AgentError::Config {
+                message: format!("{env_var} is empty"),
+            });
+        }
+        Ok(Self {
+            keys: Arc::new(keys),
+            index: Arc::new(AtomicUsize::new(0)),
+        })
+    }
+
+    #[cfg(test)]
+    pub fn from_keys(keys: Vec<String>) -> Self {
+        Self {
+            keys: Arc::new(keys),
+            index: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    pub fn current(&self) -> &str {
+        &self.keys[self.index.load(Ordering::Relaxed) % self.keys.len()]
+    }
+
+    pub fn rotate(&self) -> bool {
+        if self.keys.len() <= 1 {
+            return false;
+        }
+        self.index.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    pub fn rotate_auth(
+        &self,
+        auth: &Mutex<ResolvedAuth>,
+        build: impl FnOnce(&str) -> ResolvedAuth,
+    ) -> bool {
+        if !self.rotate() {
+            return false;
+        }
+        *auth.lock().unwrap() = build(self.current());
+        true
+    }
+
+    pub fn rotate_headers(
+        &self,
+        auth: &Mutex<ResolvedAuth>,
+        build: impl FnOnce(&str) -> Vec<(String, String)>,
+    ) -> bool {
+        if !self.rotate() {
+            return false;
+        }
+        auth.lock().unwrap().headers = build(self.current());
+        true
+    }
+
+    pub fn len(&self) -> usize {
+        self.keys.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,5 +271,37 @@ mod tests {
                 .unwrap_err();
             assert!(matches!(err, AgentError::Timeout { .. }));
         })
+    }
+
+    #[test]
+    fn key_pool_single_key_current() {
+        let pool = KeyPool::from_keys(vec!["sk-1".into()]);
+        assert_eq!(pool.current(), "sk-1");
+        assert_eq!(pool.len(), 1);
+    }
+
+    #[test]
+    fn key_pool_single_key_rotate_returns_false() {
+        let pool = KeyPool::from_keys(vec!["sk-1".into()]);
+        assert!(!pool.rotate());
+        assert_eq!(pool.current(), "sk-1");
+    }
+
+    #[test]
+    fn key_pool_multi_key_rotates() {
+        let pool = KeyPool::from_keys(vec!["sk-1".into(), "sk-2".into(), "sk-3".into()]);
+        assert_eq!(pool.current(), "sk-1");
+        assert!(pool.rotate());
+        assert_eq!(pool.current(), "sk-2");
+        assert!(pool.rotate());
+        assert_eq!(pool.current(), "sk-3");
+    }
+
+    #[test]
+    fn key_pool_wraps_around() {
+        let pool = KeyPool::from_keys(vec!["a".into(), "b".into()]);
+        pool.rotate();
+        pool.rotate();
+        assert_eq!(pool.current(), "a");
     }
 }

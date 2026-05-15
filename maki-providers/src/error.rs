@@ -46,6 +46,10 @@ impl AgentError {
         matches!(self, Self::Api { status: 401, .. })
     }
 
+    pub fn should_rotate_key(&self) -> bool {
+        matches!(self, Self::Api { status, .. } if *status == 429 || *status == 401 || *status == 403)
+    }
+
     pub fn user_message(&self) -> String {
         match self {
             Self::Config { message } => message.clone(),

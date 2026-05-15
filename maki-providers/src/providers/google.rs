@@ -1,4 +1,3 @@
-use std::env;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -16,9 +15,10 @@ use crate::{
     ThinkingConfig, TokenUsage,
 };
 
-use super::{ResolvedAuth, http_client, next_sse_line};
+use super::{KeyPool, ResolvedAuth, http_client, next_sse_line};
 
 const BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
+const ENV_VAR: &str = "GEMINI_API_KEY";
 
 pub(crate) fn models() -> &'static [ModelEntry] {
     &[
@@ -67,30 +67,28 @@ pub(crate) fn models() -> &'static [ModelEntry] {
     ]
 }
 
-fn resolve_auth() -> Result<ResolvedAuth, AgentError> {
-    if let Ok(key) = env::var("GEMINI_API_KEY") {
-        return Ok(ResolvedAuth {
-            base_url: None,
-            headers: vec![("x-goog-api-key".into(), key)],
-        });
+fn resolve_auth_from_key(key: &str) -> ResolvedAuth {
+    ResolvedAuth {
+        base_url: None,
+        headers: vec![("x-goog-api-key".into(), key.to_string())],
     }
-    Err(AgentError::Config {
-        message: "set GEMINI_API_KEY environment variable".into(),
-    })
 }
 
 pub struct Google {
     client: HttpClient,
     auth: Arc<Mutex<ResolvedAuth>>,
+    key_pool: Option<KeyPool>,
     stream_timeout: Duration,
 }
 
 impl Google {
     pub fn new(timeouts: super::Timeouts) -> Result<Self, AgentError> {
-        let resolved = resolve_auth()?;
+        let pool = KeyPool::from_env(ENV_VAR)?;
+        let resolved = resolve_auth_from_key(pool.current());
         Ok(Self {
             client: http_client(timeouts),
             auth: Arc::new(Mutex::new(resolved)),
+            key_pool: Some(pool),
             stream_timeout: timeouts.stream,
         })
     }
@@ -102,6 +100,7 @@ impl Google {
         Self {
             client: http_client(timeouts),
             auth,
+            key_pool: None,
             stream_timeout: timeouts.stream,
         }
     }
@@ -255,9 +254,18 @@ impl Provider for Google {
 
     fn reload_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
         Box::pin(async {
-            let resolved = resolve_auth()?;
-            *self.auth.lock().unwrap() = resolved;
+            let pool = KeyPool::from_env(ENV_VAR)?;
+            *self.auth.lock().unwrap() = resolve_auth_from_key(pool.current());
             Ok(())
+        })
+    }
+
+    fn rotate_key(&self) -> BoxFuture<'_, Result<bool, AgentError>> {
+        Box::pin(async {
+            Ok(self
+                .key_pool
+                .as_ref()
+                .is_some_and(|p| p.rotate_auth(&self.auth, resolve_auth_from_key)))
         })
     }
 }

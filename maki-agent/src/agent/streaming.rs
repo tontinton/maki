@@ -53,6 +53,11 @@ pub(crate) async fn stream_with_retry(
             Ok(r) => return Ok(r),
             Err(AgentError::Cancelled) => return Err(AgentError::Cancelled),
             Err(e) if e.is_retryable() => {
+                if e.should_rotate_key()
+                    && let Ok(true) = provider.rotate_key().await
+                {
+                    warn!("rotated API key after error: {e}");
+                }
                 let (attempt, delay) = retry.next_delay();
                 if matches!(e, AgentError::Timeout { .. }) && attempt > MAX_TIMEOUT_RETRIES {
                     return Err(e);
