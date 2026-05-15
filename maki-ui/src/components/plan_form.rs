@@ -75,7 +75,7 @@ impl PlanForm {
         Self {
             visibility: Visibility::Hidden,
             selected: 0,
-            parallel: true,
+            parallel: false,
         }
     }
 
@@ -294,18 +294,19 @@ mod tests {
     #[test]
     fn space_toggles_parallel() {
         let mut form = PlanForm::new();
+        let initial = form.parallel();
         form.on_plan_ready();
-        assert!(form.parallel());
+        assert_eq!(form.parallel(), initial);
         assert_eq!(
             form.handle_key(key(KeyCode::Char(' '))),
             PlanFormAction::Consumed
         );
-        assert!(!form.parallel());
+        assert_eq!(form.parallel(), !initial);
         assert_eq!(
             form.handle_key(key(KeyCode::Char(' '))),
             PlanFormAction::Consumed
         );
-        assert!(form.parallel());
+        assert_eq!(form.parallel(), initial);
     }
 
     #[test_case(key(KeyCode::Esc)              ; "esc")]

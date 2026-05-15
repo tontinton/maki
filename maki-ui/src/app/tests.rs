@@ -2142,6 +2142,14 @@ fn done_event() -> Msg {
     })
 }
 
+fn implement_msg(parallel: bool) -> String {
+    if parallel {
+        format!("{IMPLEMENT_MSG_PREFIX} at `test-plan.md`. {IMPLEMENT_PARALLEL_HINT}")
+    } else {
+        format!("{IMPLEMENT_MSG_PREFIX} at `test-plan.md`.")
+    }
+}
+
 fn plan_app() -> App {
     let mut app = test_app();
     app.status = Status::Streaming;
@@ -2262,8 +2270,7 @@ fn plan_form_menu_options(
         actions.iter().any(|a| matches!(a, Action::NewSession)),
         has_new_session
     );
-    let expected_msg =
-        format!("{IMPLEMENT_MSG_PREFIX} at `test-plan.md`. {IMPLEMENT_PARALLEL_HINT}");
+    let expected_msg = implement_msg(PlanForm::new().parallel());
     assert_eq!(
         actions
             .iter()
@@ -2273,11 +2280,11 @@ fn plan_form_menu_options(
 }
 
 #[test]
-fn plan_form_implement_without_parallel() {
+fn plan_form_implement_toggled_parallel() {
     let mut app = plan_app();
     app.update(Msg::Key(key(KeyCode::Char(' '))));
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
-    let expected_msg = format!("{IMPLEMENT_MSG_PREFIX} at `test-plan.md`.");
+    let expected_msg = implement_msg(!PlanForm::new().parallel());
     assert!(
         actions
             .iter()
