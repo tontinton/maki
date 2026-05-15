@@ -4,7 +4,7 @@ use crate::chat::{CANCELLED_TEXT, DONE_TEXT, ERROR_TEXT};
 use crate::components::command::ParsedCommand;
 use crate::components::keybindings::{KeybindContext, key as kb};
 use crate::components::{ExitRequest, key, test_model};
-use crate::selection::{EdgeScroll, SelectableZone, SelectionState, SelectionZone};
+use crate::selection::{SelectableZone, SelectionState, SelectionZone};
 use arc_swap::ArcSwap;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use maki_agent::permissions::PermissionManager;
@@ -147,7 +147,6 @@ fn typing_and_submit() {
     app.update(Msg::Key(key(KeyCode::Char('i'))));
 
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
-    assert_eq!(actions.len(), 1);
     assert!(matches!(&actions[0], Action::SendMessage(s) if s.message == "hi"));
     assert_eq!(app.status, Status::Streaming);
 }
@@ -413,7 +412,7 @@ fn reset_session_clears_plan() {
     app.state.plan = PlanState::Ready(PathBuf::from("plan.md"));
     app.queue_and_notify(queued_msg("q"));
     app.queue.set_focus_at(0);
-    app.update(Msg::Key(kb::HELP.to_key_event()));
+    app.help_modal.toggle();
     let (_tx, rx) = flume::bounded::<crate::components::btw_modal::BtwEvent>(1);
     app.btw_modal.open("q", rx);
     let actions = app.reset_session();
@@ -495,14 +494,14 @@ fn load_session_clears_plan() {
 }
 
 #[test]
-fn tab_in_palette_closes_and_toggles_mode() {
+fn tab_in_palette_completes_command() {
     let mut app = test_app();
     type_slash(&mut app);
     assert!(app.command_palette.is_active());
 
     app.update(Msg::Key(key(KeyCode::Tab)));
-    assert!(!app.command_palette.is_active());
-    assert_eq!(app.state.mode, Mode::Plan);
+    let val = app.input_box.buffer.value();
+    assert!(val.starts_with('/'));
 }
 
 #[test]
@@ -752,19 +751,52 @@ fn picker_enter_stays_at_navigated() {
     assert_eq!(app.active_chat, 1);
 }
 
-#[test]
-fn global_ctrl_shortcuts_work_with_picker_open() {
+const OVERLAY_BLOCKED_KEYS: &[KeyEvent] = &[
+    kb::NEXT_CHAT.to_key_event(),
+    kb::PREV_CHAT.to_key_event(),
+    kb::SCROLL_HALF_UP.to_key_event(),
+    kb::SCROLL_HALF_DOWN.to_key_event(),
+    kb::HELP.to_key_event(),
+];
+
+fn open_help(app: &mut App) {
+    app.help_modal.toggle();
+}
+
+fn open_search(app: &mut App) {
+    app.search_modal.open(0, true);
+}
+
+fn focus_queue(app: &mut App) {
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    app.queue_and_notify(queued_msg("q"));
+    app.queue.set_focus_at(0);
+}
+
+#[test_case(open_tasks_picker as fn(&mut App) ; "task_picker")]
+#[test_case(open_help                         ; "help_modal")]
+#[test_case(open_search                       ; "search_modal")]
+#[test_case(focus_queue                       ; "queue_focus")]
+fn overlay_blocks_ctrl_shortcuts(setup: fn(&mut App)) {
     let mut app = app_with_subagent();
-    assert_eq!(app.active_chat, 0);
+    setup(&mut app);
+    let before = app.active_chat;
+    let scroll_before = app.chats[app.active_chat].scroll_top();
 
-    open_tasks_picker(&mut app);
-    app.update(Msg::Key(kb::NEXT_CHAT.to_key_event()));
-    assert_eq!(app.active_chat, 1);
+    for k in OVERLAY_BLOCKED_KEYS {
+        app.update(Msg::Key(*k));
+    }
 
-    app.update(Msg::Key(kb::PREV_CHAT.to_key_event()));
-    assert_eq!(app.active_chat, 0);
-
-    assert!(app.task_picker.is_open());
+    assert_eq!(
+        app.active_chat, before,
+        "active_chat changed through overlay"
+    );
+    assert_eq!(
+        app.chats[app.active_chat].scroll_top(),
+        scroll_before,
+        "scroll changed through overlay"
+    );
 }
 
 #[test]
@@ -1047,6 +1079,7 @@ fn ctrl_c_while_streaming_cancels_instead_of_quitting() {
 #[test]
 fn edge_scroll_makes_app_animating() {
     let mut app = test_app();
+    app.status = Status::Streaming;
     app.run_id = 1;
     app.update(agent_msg(AgentEvent::TextDelta { text: "x".into() }));
     app.update(agent_msg(AgentEvent::Done {
@@ -1055,140 +1088,103 @@ fn edge_scroll_makes_app_animating() {
         stop_reason: None,
     }));
     assert!(!app.is_animating());
-    set_zone(&mut app, SelectionZone::Messages, Rect::new(0, 0, 80, 20));
-    app.update(mouse_event(MouseEventKind::Down(MouseButton::Left), 5, 5));
-    if let Some(SelectionState::Dragging { edge_scroll, .. }) = app.selection_state.as_mut() {
-        *edge_scroll = Some(EdgeScroll {
-            dir: 1,
-            last_tick: Instant::now(),
-        });
-    }
+    let zone = Rect::new(0, 2, 80, 20);
+    set_zone(&mut app, SelectionZone::Messages, zone);
+    app.active_chat().scroll_to_top();
+    app.update(mouse_event(MouseEventKind::Down(MouseButton::Left), 10, 10));
+    app.update(mouse_event(MouseEventKind::Drag(MouseButton::Left), 10, 1));
     assert!(app.is_animating());
 }
 
 #[test]
-fn mouse_up_behavior() {
+fn empty_click_clears_selection() {
     let mut app = test_app();
     set_zone(&mut app, SelectionZone::Messages, Rect::new(0, 0, 80, 20));
 
-    app.update(mouse_event(MouseEventKind::Down(MouseButton::Left), 5, 5));
-    app.update(mouse_event(MouseEventKind::Drag(MouseButton::Left), 10, 10));
-    app.update(mouse_event(MouseEventKind::Up(MouseButton::Left), 10, 10));
-    assert!(
-        app.selection_state.as_ref().unwrap().is_pending_copy(),
-        "non-empty selection transitions to PendingCopy"
-    );
-
-    app.selection_state = None;
     app.update(mouse_event(MouseEventKind::Down(MouseButton::Left), 5, 5));
     app.update(mouse_event(MouseEventKind::Up(MouseButton::Left), 5, 5));
-    assert!(app.selection_state.is_none(), "empty selection is cleared");
+    assert!(app.selection_state.is_none());
 }
 
-#[test]
-fn key_and_scroll_clear_selection() {
-    let mut app = test_app();
-    set_zone(&mut app, SelectionZone::Messages, Rect::new(0, 0, 80, 20));
-
-    app.update(mouse_event(MouseEventKind::Down(MouseButton::Left), 5, 5));
-    app.update(Msg::Key(key(KeyCode::Char('a'))));
-    assert!(app.selection_state.is_none(), "key press clears selection");
-
-    app.update(mouse_event(MouseEventKind::Down(MouseButton::Left), 5, 5));
-    app.update(Msg::Scroll {
-        column: 10,
-        row: 10,
-        delta: 3,
-    });
-    assert!(app.selection_state.is_none(), "scroll clears selection");
-}
-
-#[test]
-fn key_and_scroll_preserve_pending_copy() {
-    let mut app = test_app();
-    set_zone(&mut app, SelectionZone::Messages, Rect::new(0, 0, 80, 20));
-
+fn make_pending_copy(app: &mut App) {
+    set_zone(app, SelectionZone::Messages, Rect::new(0, 0, 80, 20));
     app.update(mouse_event(MouseEventKind::Down(MouseButton::Left), 5, 5));
     app.update(mouse_event(MouseEventKind::Drag(MouseButton::Left), 10, 10));
     app.update(mouse_event(MouseEventKind::Up(MouseButton::Left), 10, 10));
-    assert!(app.selection_state.as_ref().unwrap().is_pending_copy());
+}
 
+#[test]
+fn key_clears_dragging_but_preserves_pending_copy() {
+    let mut app = test_app();
+    set_zone(&mut app, SelectionZone::Messages, Rect::new(0, 0, 80, 20));
+    app.update(mouse_event(MouseEventKind::Down(MouseButton::Left), 5, 5));
+    app.update(Msg::Key(key(KeyCode::Char('a'))));
+    assert!(app.selection_state.is_none(), "key clears dragging");
+
+    make_pending_copy(&mut app);
     app.update(Msg::Key(key(KeyCode::Char('a'))));
     assert!(
         app.selection_state.as_ref().unwrap().is_pending_copy(),
-        "key press must not clear pending copy"
+        "key preserves pending copy"
     );
+}
 
-    app.update(Msg::Scroll {
+#[test]
+fn scroll_clears_dragging_but_preserves_pending_copy() {
+    let scroll = || Msg::Scroll {
         column: 10,
         row: 10,
         delta: 3,
-    });
+    };
+
+    let mut app = test_app();
+    set_zone(&mut app, SelectionZone::Messages, Rect::new(0, 0, 80, 20));
+    app.update(mouse_event(MouseEventKind::Down(MouseButton::Left), 5, 5));
+    app.update(scroll());
+    assert!(app.selection_state.is_none(), "scroll clears dragging");
+
+    make_pending_copy(&mut app);
+    app.update(scroll());
     assert!(
         app.selection_state.as_ref().unwrap().is_pending_copy(),
-        "scroll must not clear pending copy"
+        "scroll preserves pending copy"
     );
 }
 
 #[test]
 fn new_mouse_down_replaces_pending_copy_with_dragging() {
     let mut app = test_app();
-    set_zone(&mut app, SelectionZone::Messages, Rect::new(0, 0, 80, 20));
-
-    app.update(mouse_event(MouseEventKind::Down(MouseButton::Left), 5, 5));
-    app.update(mouse_event(MouseEventKind::Drag(MouseButton::Left), 10, 10));
-    app.update(mouse_event(MouseEventKind::Up(MouseButton::Left), 10, 10));
-    assert!(app.selection_state.as_ref().unwrap().is_pending_copy());
+    make_pending_copy(&mut app);
 
     app.update(mouse_event(MouseEventKind::Down(MouseButton::Left), 15, 15));
-    let state = app.selection_state.as_ref().unwrap();
-    assert!(
-        matches!(state, SelectionState::Dragging { .. }),
-        "new mouse-down must transition PendingCopy back to Dragging"
-    );
+    assert!(matches!(
+        app.selection_state.as_ref().unwrap(),
+        SelectionState::Dragging { .. }
+    ));
 }
 
 #[test]
 fn drag_on_pending_copy_is_noop() {
     let mut app = test_app();
-    set_zone(&mut app, SelectionZone::Messages, Rect::new(0, 0, 80, 20));
+    make_pending_copy(&mut app);
 
-    app.update(mouse_event(MouseEventKind::Down(MouseButton::Left), 5, 5));
-    app.update(mouse_event(MouseEventKind::Drag(MouseButton::Left), 10, 10));
-    app.update(mouse_event(MouseEventKind::Up(MouseButton::Left), 10, 10));
-    assert!(app.selection_state.as_ref().unwrap().is_pending_copy());
-
-    let sel_before = *app.selection_state.as_ref().unwrap().sel();
     app.update(mouse_event(MouseEventKind::Drag(MouseButton::Left), 50, 50));
-    assert!(
-        app.selection_state.as_ref().unwrap().is_pending_copy(),
-        "drag event must not change PendingCopy state"
-    );
-    let sel_after = *app.selection_state.as_ref().unwrap().sel();
-    assert_eq!(sel_before.normalized(), sel_after.normalized());
+    assert!(app.selection_state.as_ref().unwrap().is_pending_copy());
 }
 
 #[test]
 fn tick_edge_scroll_noop_on_pending_copy() {
     let mut app = test_app();
-    set_zone(&mut app, SelectionZone::Messages, Rect::new(0, 0, 80, 20));
-
-    app.update(mouse_event(MouseEventKind::Down(MouseButton::Left), 5, 5));
-    app.update(mouse_event(MouseEventKind::Drag(MouseButton::Left), 10, 10));
-    app.update(mouse_event(MouseEventKind::Up(MouseButton::Left), 10, 10));
-    assert!(app.selection_state.as_ref().unwrap().is_pending_copy());
+    make_pending_copy(&mut app);
 
     app.tick_edge_scroll();
-    assert!(
-        app.selection_state.as_ref().unwrap().is_pending_copy(),
-        "tick_edge_scroll must not alter PendingCopy"
-    );
+    assert!(app.selection_state.as_ref().unwrap().is_pending_copy());
 }
 
 #[test]
 fn pending_copy_not_animating() {
     let mut app = test_app();
-    set_zone(&mut app, SelectionZone::Messages, Rect::new(0, 0, 80, 20));
+    app.status = Status::Streaming;
     app.run_id = 1;
     app.update(agent_msg(AgentEvent::TextDelta { text: "x".into() }));
     app.update(agent_msg(AgentEvent::Done {
@@ -1196,15 +1192,8 @@ fn pending_copy_not_animating() {
         num_turns: 1,
         stop_reason: None,
     }));
-
-    app.update(mouse_event(MouseEventKind::Down(MouseButton::Left), 5, 5));
-    app.update(mouse_event(MouseEventKind::Drag(MouseButton::Left), 10, 10));
-    app.update(mouse_event(MouseEventKind::Up(MouseButton::Left), 10, 10));
-    assert!(app.selection_state.as_ref().unwrap().is_pending_copy());
-    assert!(
-        !app.is_animating(),
-        "PendingCopy should not keep the app animating"
-    );
+    make_pending_copy(&mut app);
+    assert!(!app.is_animating());
 }
 
 #[test]

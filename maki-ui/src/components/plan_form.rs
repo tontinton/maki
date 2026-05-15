@@ -12,7 +12,7 @@ use ratatui::text::{Line, Span};
 const FORM_LABEL: &str = " Plan complete ";
 
 const DISMISS_KEYS: &str = if cfg!(target_os = "macos") {
-    "⌘T/Esc"
+    "⌃T/Esc"
 } else {
     "Ctrl+T/Esc"
 };

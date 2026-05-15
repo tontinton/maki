@@ -102,7 +102,7 @@ pub struct ParsedCommand {
 pub enum CommandAction {
     Consumed,
     Execute(ParsedCommand),
-    Close,
+    Complete(String),
     Passthrough,
 }
 
@@ -255,8 +255,17 @@ impl CommandPalette {
                 None => CommandAction::Consumed,
             },
             KeyCode::Tab => {
-                self.close();
-                CommandAction::Close
+                if let Some(item) = self.filtered.get(self.selected) {
+                    let name = self.item_name(item);
+                    let text = if self.item_has_args(item) {
+                        format!("{name} ")
+                    } else {
+                        name
+                    };
+                    CommandAction::Complete(text)
+                } else {
+                    CommandAction::Consumed
+                }
             }
             _ => CommandAction::Passthrough,
         }
@@ -381,6 +390,15 @@ impl CommandPalette {
             CommandType::Custom(i) => self.custom[*i].display_name(),
             CommandType::McpPrompt(i) => format!("/{}", self.mcp_prompts[*i].display_name),
             CommandType::Lua(i) => self.lua_commands[*i].name.to_string(),
+        }
+    }
+
+    fn item_has_args(&self, m: &Match) -> bool {
+        match &m.command_type {
+            CommandType::Builtin(cmd) => cmd.max_args > 0,
+            CommandType::Custom(i) => self.custom[*i].has_args(),
+            CommandType::McpPrompt(i) => !self.mcp_prompts[*i].arguments.is_empty(),
+            CommandType::Lua(_) => false,
         }
     }
 

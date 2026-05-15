@@ -374,18 +374,12 @@ impl App {
         self.task_picker.select(self.active_chat);
     }
 
-    /// Ctrl shortcuts that work regardless of form/overlay state.
-    fn handle_global_ctrl(&mut self, key: KeyEvent) -> Option<Vec<Action>> {
+    /// Ctrl shortcuts that apply when no overlay owns input.
+    fn handle_ctrl(&mut self, key: KeyEvent) -> Option<Vec<Action>> {
         if !is_ctrl(&key) {
             return None;
         }
-        if key::SUSPEND.matches(key) && cfg!(unix) {
-            return Some(self.suspend());
-        }
         if key::QUIT.matches(key) {
-            if self.any_overlay_open() || self.queue.focus().is_some() {
-                return None;
-            }
             self.command_palette.close();
             return Some(if !self.is_main_chat() || self.input_box.is_empty() {
                 if self.status == Status::Streaming {
@@ -396,6 +390,14 @@ impl App {
                 self.input_box.discard();
                 vec![]
             });
+        }
+        if key::HELP.matches(key) {
+            self.help_modal.toggle();
+            return Some(vec![]);
+        }
+        if key::TASKS.matches(key) {
+            self.open_tasks();
+            return Some(vec![]);
         }
         if key::PREV_CHAT.matches(key) {
             self.active_chat = self.active_chat.saturating_sub(1);
@@ -409,54 +411,39 @@ impl App {
             self.check_demo_questions();
             return Some(vec![]);
         }
-        if key::TASKS.matches(key) {
-            if self.task_picker.is_open() {
-                self.task_picker.close();
-            } else if !self.has_modal_overlay() {
-                self.open_tasks();
-            }
+        if key::SCROLL_HALF_UP.matches(key) {
+            let half = self.chats[self.active_chat].half_page();
+            self.active_chat().scroll(half);
             return Some(vec![]);
         }
-        if !self.has_modal_overlay() {
-            if key::SCROLL_HALF_UP.matches(key) {
-                let half = self.chats[self.active_chat].half_page();
-                self.active_chat().scroll(half);
-                return Some(vec![]);
-            }
-            if key::SCROLL_HALF_DOWN.matches(key) {
-                let half = self.chats[self.active_chat].half_page();
-                self.active_chat().scroll(-half);
-                return Some(vec![]);
-            }
-            if key::SCROLL_LINE_UP.matches(key) {
-                self.active_chat().scroll(1);
-                return Some(vec![]);
-            }
-            if key::SCROLL_LINE_DOWN.matches(key) {
-                self.active_chat().scroll(-1);
-                return Some(vec![]);
-            }
-            if key::SCROLL_TOP.matches(key) {
-                self.active_chat().scroll_to_top();
-                return Some(vec![]);
-            }
-            if key::SCROLL_BOTTOM.matches(key) {
-                self.active_chat().enable_auto_scroll();
-                return Some(vec![]);
-            }
+        if key::SCROLL_HALF_DOWN.matches(key) {
+            let half = self.chats[self.active_chat].half_page();
+            self.active_chat().scroll(-half);
+            return Some(vec![]);
         }
-        if key::HELP.matches(key) {
-            self.help_modal.toggle();
+        if key::SCROLL_LINE_UP.matches(key) {
+            self.active_chat().scroll(1);
+            return Some(vec![]);
+        }
+        if key::SCROLL_LINE_DOWN.matches(key) {
+            self.active_chat().scroll(-1);
+            return Some(vec![]);
+        }
+        if key::SCROLL_TOP.matches(key) {
+            self.active_chat().scroll_to_top();
+            return Some(vec![]);
+        }
+        if key::SCROLL_BOTTOM.matches(key) {
+            self.active_chat().enable_auto_scroll();
             return Some(vec![]);
         }
         None
     }
 
-    fn handle_key(&mut self, key: KeyEvent) -> Vec<Action> {
-        if let Some(actions) = self.handle_global_ctrl(key) {
-            return actions;
-        }
-
+    /// Routes input to whichever overlay currently owns focus.
+    /// Returns `Some` when an overlay is open (consuming the key),
+    /// `None` when no overlay is active and input should continue.
+    fn dispatch_overlay(&mut self, key: KeyEvent) -> Option<Vec<Action>> {
         if self.permission_prompt.is_open() {
             if let Some(answer) = self.permission_prompt.handle_key(key) {
                 let subagent_id = self.permission_prompt.subagent_id().map(str::to_owned);
@@ -464,7 +451,7 @@ impl App {
                 self.permission_prompt.close();
                 self.send_to_agent(subagent_id.as_deref(), encoded);
             }
-            return vec![];
+            return Some(vec![]);
         }
 
         if self.question_form.is_visible() {
@@ -476,35 +463,34 @@ impl App {
                     a
                 }
                 QuestionFormAction::Dismiss => String::new(),
-                QuestionFormAction::Consumed => return vec![],
+                QuestionFormAction::Consumed => return Some(vec![]),
             };
             self.question_form.close();
             self.send_answer(answer);
-            return vec![];
+            return Some(vec![]);
         }
 
+        // plan_form is non-modal: Passthrough falls through to the rest of dispatch
         if self.state.mode == Mode::Plan && self.plan_form.is_visible() {
             let action = self.plan_form.handle_key(key);
             if action != PlanFormAction::Passthrough {
-                return self.handle_plan_form_action(action);
+                return Some(self.handle_plan_form_action(action));
             }
         }
 
-        self.clear_selection_unless_pending_copy();
-
         if self.help_modal.is_open() {
             self.help_modal.handle_key(key);
-            return vec![];
+            return Some(vec![]);
         }
 
         if self.btw_modal.is_open() {
             self.btw_modal.handle_key(key);
-            return vec![];
+            return Some(vec![]);
         }
 
         if self.lua_float.is_open() {
             self.lua_float.handle_key(key);
-            return vec![];
+            return Some(vec![]);
         }
 
         if self.search_modal.is_open() {
@@ -533,11 +519,11 @@ impl App {
                     self.search_modal.close();
                 }
             }
-            return vec![];
+            return Some(vec![]);
         }
 
         if self.file_picker.is_open() {
-            return match self.file_picker.handle_key(key) {
+            return Some(match self.file_picker.handle_key(key) {
                 FilePickerModalAction::Consumed => vec![],
                 FilePickerModalAction::Select(path) => {
                     self.file_picker.close();
@@ -552,37 +538,32 @@ impl App {
                     self.file_picker.close();
                     vec![]
                 }
-            };
+            });
         }
 
         if self.queue.focus().is_some() {
             match key.code {
-                KeyCode::Up => {
-                    self.queue.move_focus_up();
-                    return vec![];
-                }
-                KeyCode::Down => {
-                    self.queue.move_focus_down();
-                    return vec![];
-                }
+                KeyCode::Up => self.queue.move_focus_up(),
+                KeyCode::Down => self.queue.move_focus_down(),
                 KeyCode::Enter => {
                     self.queue.remove_focused();
-                    return vec![];
                 }
-                KeyCode::Esc => {
-                    self.queue.unfocus();
-                    return vec![];
-                }
-                _ if key::QUIT.matches(key) => {
-                    self.queue.unfocus();
-                    return vec![];
+                KeyCode::Esc => self.queue.unfocus(),
+                _ if key::QUIT.matches(key) => self.queue.unfocus(),
+                _ if key::POP_QUEUE.matches(key) => {
+                    self.queue.remove(0);
                 }
                 _ => {}
             }
+            return Some(vec![]);
         }
 
         if self.task_picker.is_open() {
-            return match self.task_picker.handle_key(key) {
+            if key::TASKS.matches(key) {
+                self.task_picker.close();
+                return Some(vec![]);
+            }
+            return Some(match self.task_picker.handle_key(key) {
                 PickerAction::Consumed | PickerAction::Toggle(..) => vec![],
                 PickerAction::Select(idx, _) => {
                     self.task_picker_original = None;
@@ -595,11 +576,11 @@ impl App {
                     self.active_chat = self.task_picker_original.take().unwrap_or(0);
                     vec![]
                 }
-            };
+            });
         }
 
         if self.session_picker.is_open() {
-            return match self.session_picker.handle_key(key) {
+            return Some(match self.session_picker.handle_key(key) {
                 SessionPickerAction::Consumed => vec![],
                 SessionPickerAction::Select(id) => self.load_session(id),
                 SessionPickerAction::ConfirmDelete => {
@@ -611,26 +592,26 @@ impl App {
                 }
                 SessionPickerAction::Delete(id) => self.delete_session(id),
                 SessionPickerAction::Close => vec![],
-            };
+            });
         }
 
         if self.rewind_picker.is_open() {
-            return match self.rewind_picker.handle_key(key) {
+            return Some(match self.rewind_picker.handle_key(key) {
                 RewindPickerAction::Consumed => vec![],
                 RewindPickerAction::Select(entry) => self.rewind_to(entry),
                 RewindPickerAction::Close => vec![],
-            };
+            });
         }
 
         if self.theme_picker.is_open() {
-            return match self.theme_picker.handle_key(key) {
+            return Some(match self.theme_picker.handle_key(key) {
                 ThemePickerAction::Consumed => vec![],
                 ThemePickerAction::Closed => vec![],
-            };
+            });
         }
 
         if self.model_picker.is_open() {
-            return match self.model_picker.handle_key(key) {
+            return Some(match self.model_picker.handle_key(key) {
                 ModelPickerAction::Consumed => vec![],
                 ModelPickerAction::Select(spec) => {
                     vec![Action::ChangeModel(spec)]
@@ -639,11 +620,11 @@ impl App {
                     vec![Action::AssignTier(spec, tier)]
                 }
                 ModelPickerAction::Close => vec![],
-            };
+            });
         }
 
         if self.mcp_picker.is_open() {
-            return match self.mcp_picker.handle_key(key) {
+            return Some(match self.mcp_picker.handle_key(key) {
                 McpPickerAction::Consumed => vec![],
                 McpPickerAction::Toggle {
                     server_name,
@@ -652,7 +633,25 @@ impl App {
                     vec![Action::ToggleMcp(server_name, enabled)]
                 }
                 McpPickerAction::Close => vec![],
-            };
+            });
+        }
+
+        None
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) -> Vec<Action> {
+        self.clear_selection_unless_pending_copy();
+
+        if key::SUSPEND.matches(key) && cfg!(unix) {
+            return self.suspend();
+        }
+
+        if let Some(actions) = self.dispatch_overlay(key) {
+            return actions;
+        }
+
+        if let Some(actions) = self.handle_ctrl(key) {
+            return actions;
         }
 
         if !self.is_main_chat() {
@@ -709,7 +708,12 @@ impl App {
         {
             CommandAction::Consumed => return vec![],
             CommandAction::Execute(cmd) => return self.execute_command(cmd),
-            CommandAction::Close => {}
+            CommandAction::Complete(text) => {
+                self.command_palette.sync(&text);
+                self.input_box.set_input(text);
+                self.input_box.buffer.move_to_end();
+                return vec![];
+            }
             CommandAction::Passthrough => {}
         }
 
