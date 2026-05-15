@@ -14,7 +14,7 @@ An AI coding agent optimized for minimal use of context tokens, while providing 
 
 ### User experience
 
-* SUPER fast startup, 60 FPS, and light on memory. Not running any javascript, using [ratatui](https://ratatui.rs) for TUI. Even the splash screen animation uses SIMD.
+* SUPER fast startup, 60 FPS, and light on memory. Not running any JavaScript, using [ratatui](https://ratatui.rs) for TUI. Even the splash screen animation uses SIMD.
 * Philosophy of not hiding anything - while other coding agents hide information as models improve (e.g. not showing number of lines read), maki leaves you in control.
 * UI fits everything well on my small screen laptop.
 * Full visibility of subagents - each subagent gets their own "chat window" you can easily navigate between using `/tasks` (Ctrl-X), or Ctrl-N/P.
@@ -82,11 +82,11 @@ Or download a pre-built binary from [GitHub Releases](https://github.com/tontint
 
 More info at the [official docs](http://maki.sh/docs).
 
-> DISCLAIMER: >90% of code in maki was written by maki, guided by humans. The code is not as good as what I would've made in the artisinal hand-made style. But it's also not slop / vibe coded. I just think people should be honest about their use of AI in projects in this era.
+> DISCLAIMER: >90% of code in maki was written by maki, guided by humans. The code is not as good as what I would've made in the artisanal hand-made style. But it's also not slop / vibe coded. I just think people should be honest about their use of AI in projects in this era.
 
-## Extending with lua
+## Extending with Lua
 
-Currently working on a refactor so maki is a core agent UI loop with features like tools, UI elements, and storage all controlled by lua plugins.
+Currently working on a refactor so maki is a core agent UI loop with features like tools, UI elements, and storage all controlled by Lua plugins.
 This will allow you to customize the hell out of maki.
 
-Status: webfetch, websearch, index, bash, skill, and memory tools are lua plugins (in the `./plugins` dir).
+Status: webfetch, websearch, index, bash, skill, and memory tools are Lua plugins (in the `./plugins` dir).
