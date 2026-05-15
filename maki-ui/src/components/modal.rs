@@ -5,7 +5,7 @@ use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::widgets::{Block, BorderType, Clear};
 
-const CHROME_LINES: u16 = 2;
+pub const CHROME_LINES: u16 = 2;
 
 pub struct Modal<'a> {
     pub title: &'a str,

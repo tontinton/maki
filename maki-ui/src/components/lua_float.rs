@@ -11,7 +11,7 @@ use ratatui::widgets::Paragraph;
 use crate::components::{
     Overlay, hint_line, is_ctrl,
     keybindings::{key, key_event_to_string},
-    modal::Modal,
+    modal::{CHROME_LINES, Modal},
     scrollbar::render_vertical_scrollbar,
     tool_display::resolve_span_style,
 };
@@ -51,6 +51,12 @@ impl LuaFloatWindow {
         cmd_rx: flume::Receiver<WinCommand>,
     ) {
         let cached_lines = buf.read_if_dirty().unwrap_or_default();
+        let estimated_width = crossterm::terminal::size()
+            .map(|(cols, _)| cols * WIDTH_PERCENT / 100 - CHROME_LINES)
+            .unwrap_or(0);
+        let _ = event_tx.try_send(WinEvent::Resize {
+            width: estimated_width,
+        });
         self.state = Some(OpenState {
             buf,
             title: opts.title,
@@ -62,7 +68,7 @@ impl LuaFloatWindow {
             cmd_rx,
             cached_lines,
             viewport_h: 1,
-            content_width: 0,
+            content_width: estimated_width,
         });
     }
 
@@ -307,7 +313,10 @@ mod tests {
         let mut win = LuaFloatWindow::new();
         let (event_rx, _cmd_tx) = open_with_lines(&mut win, &["line1"]);
         win.handle_key(key(KeyCode::Char('a')));
-        let evt = event_rx.try_recv().unwrap();
+        let evt = event_rx
+            .drain()
+            .find(|e| matches!(e, WinEvent::Key { .. }))
+            .expect("expected a Key event");
         assert!(matches!(evt, WinEvent::Key { key, cursor: 0 } if key == "a"));
     }
 
@@ -374,7 +383,10 @@ mod tests {
         cmd_tx.send(WinCommand::Close).unwrap();
         win.tick();
         assert!(!win.is_open());
-        let evt = event_rx.try_recv().unwrap();
+        let evt = event_rx
+            .drain()
+            .find(|e| matches!(e, WinEvent::Close))
+            .expect("expected a Close event");
         assert!(matches!(evt, WinEvent::Close));
     }
 
