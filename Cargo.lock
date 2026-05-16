@@ -2332,6 +2332,7 @@ name = "maki-lua"
 version = "0.3.6"
 dependencies = [
  "arc-swap",
+ "crossterm",
  "event-listener",
  "flume 0.11.1",
  "futures-lite",

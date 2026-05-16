@@ -3,7 +3,6 @@ local TextInput = require("maki.text_input")
 local ListPicker = {}
 ListPicker.__index = ListPicker
 
-local DEFAULT_WIDTH = 80
 local DETAIL_RIGHT_PAD = 2
 local NO_MATCHES_LABEL = "  (no matches)"
 
@@ -41,7 +40,7 @@ local function find_match_pos(label, query)
 end
 
 local function render_lines(items, selected, width, query)
-  width = width or DEFAULT_WIDTH
+  width = width or 80
   query = query or ""
   local lines = {}
   for i, item in ipairs(items) do
@@ -93,7 +92,7 @@ function ListPicker.open(items, opts)
       submit_keys[k] = true
     end
   end
-  local width = DEFAULT_WIDTH
+  local width
   local input = TextInput.new()
   local filtered, original_indices = filter_items(items, "")
 
@@ -117,13 +116,21 @@ function ListPicker.open(items, opts)
   end
 
   local buf = maki.ui.buf()
-  buf:set_lines(build_lines())
+
+  local border_chrome = 2
+  local footer_h = opts.footer and #opts.footer > 0 and 1 or 0
+  local content_h = #items + 1
+  local total_h = content_h + footer_h + border_chrome
 
   local win = maki.ui.open_win(buf, {
     title = opts.title,
     footer = opts.footer,
+    height = total_h,
     reserved_bottom = 1,
   })
+
+  width = win.width
+  buf:set_lines(build_lines())
 
   if cursor > 1 then
     win:set_cursor(cursor)
@@ -140,13 +147,21 @@ function ListPicker.open(items, opts)
       width = ev.width
       buf:set_lines(build_lines())
     elseif ev.type == "key" then
-      local new_cursor = ev.cursor or cursor
-      if new_cursor ~= cursor then
-        cursor = new_cursor
-        buf:set_lines(build_lines())
-      end
-
-      if input:handle_key(ev.key) then
+      if ev.key == "up" then
+        if cursor > 1 then
+          cursor = cursor - 1
+          win:set_cursor(cursor)
+          buf:set_lines(build_lines())
+        end
+        confirming = nil
+      elseif ev.key == "down" then
+        if cursor < #filtered then
+          cursor = cursor + 1
+          win:set_cursor(cursor)
+          buf:set_lines(build_lines())
+        end
+        confirming = nil
+      elseif input:handle_key(ev.key) then
         filtered, original_indices = filter_items(items, input:value())
         if cursor > #filtered then
           cursor = #filtered
@@ -162,6 +177,9 @@ function ListPicker.open(items, opts)
           win:close()
           return { type = "choice", index = original_indices[cursor] }
         end
+      elseif ev.key == "esc" or ev.key == "ctrl+c" then
+        win:close()
+        return { type = "close" }
       elseif ev.key == "ctrl+d" then
         if #filtered > 0 then
           if confirming == cursor then

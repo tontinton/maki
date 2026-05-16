@@ -4,7 +4,9 @@ use std::time::Duration;
 use humantime::format_duration;
 use mlua::{Lua, Result as LuaResult, Table};
 
-use crate::api::command::{UiAction, WinCommand, WinEvent, WinOpts};
+use crate::api::command::{
+    Anchor, Border, Dimension, FloatConfig, TitlePos, UiAction, WinCommand, WinEvent,
+};
 use crate::api::win::WinHandle;
 use crate::runtime::with_task_bufs;
 
@@ -89,32 +91,108 @@ pub(crate) fn create_ui_table(
                 move |_lua, (buf_ud, opts_tbl): (mlua::AnyUserData, Table)| {
                     let buf_handle = buf_ud.borrow::<crate::api::buf::BufHandle>()?;
                     let title: String = opts_tbl.get("title").unwrap_or_default();
-                    let cursor_line: bool = opts_tbl.get("cursor_line").unwrap_or(true);
+                    let cursor_line: bool = opts_tbl.get("cursor_line").unwrap_or(false);
                     let footer = parse_footer(&opts_tbl)?;
                     let reserved_bottom: usize = opts_tbl.get("reserved_bottom").unwrap_or(0);
+                    let focus: bool = opts_tbl
+                        .get::<Option<bool>>("focus")
+                        .ok()
+                        .flatten()
+                        .unwrap_or(true);
+                    let zindex: u16 = opts_tbl.get("zindex").unwrap_or(50);
+
+                    let width = parse_dimension(&opts_tbl, "width", Dimension::Percent(60));
+                    let height = parse_dimension(&opts_tbl, "height", Dimension::Percent(70));
+                    let row: Option<i16> = opts_tbl.get("row").ok();
+                    let col: Option<i16> = opts_tbl.get("col").ok();
+                    let anchor = parse_anchor(&opts_tbl);
+                    let border = parse_border(&opts_tbl);
+                    let title_pos = parse_title_pos(&opts_tbl);
+
+                    let config = FloatConfig {
+                        width,
+                        height,
+                        row,
+                        col,
+                        anchor,
+                        border,
+                        title,
+                        title_pos,
+                        footer,
+                        zindex,
+                        cursor_line,
+                        reserved_bottom,
+                    };
+
+                    let (term_cols, term_rows) = crossterm::terminal::size().unwrap_or((80, 24));
+                    let border_chrome = match config.border {
+                        Border::None => 0,
+                        _ => 2,
+                    };
+                    let footer_h = u16::from(!config.footer.is_empty());
+                    let est_w = config
+                        .width
+                        .resolve(term_cols)
+                        .saturating_sub(border_chrome);
+                    let est_h = config
+                        .height
+                        .resolve(term_rows)
+                        .saturating_sub(border_chrome + footer_h);
 
                     let (event_tx, event_rx) = flume::bounded::<WinEvent>(8);
                     let (cmd_tx, cmd_rx) = flume::bounded::<WinCommand>(8);
 
                     let _ = open_win_tx.try_send(UiAction::OpenWin {
                         buf: buf_handle.buf.clone(),
-                        opts: WinOpts {
-                            title,
-                            footer,
-                            cursor_line,
-                            reserved_bottom,
-                        },
+                        config,
+                        focus,
                         event_tx,
                         cmd_rx,
                     });
 
-                    Ok(WinHandle::new(event_rx, cmd_tx))
+                    Ok(WinHandle::new(event_rx, cmd_tx, est_w, est_h))
                 },
             )?,
         )?;
     }
 
     Ok(t)
+}
+
+pub(crate) fn try_parse_dimension(tbl: &Table, key: &str) -> Option<Dimension> {
+    if let Ok(s) = tbl.get::<String>(key) {
+        if let Some(pct) = s.strip_suffix('%') {
+            if let Ok(v) = pct.parse::<u16>() {
+                return Some(Dimension::Percent(v));
+            }
+        }
+    }
+    if let Ok(v) = tbl.get::<u16>(key) {
+        return Some(Dimension::Abs(v));
+    }
+    None
+}
+
+pub(crate) fn parse_dimension(tbl: &Table, key: &str, default: Dimension) -> Dimension {
+    try_parse_dimension(tbl, key).unwrap_or(default)
+}
+
+fn parse_anchor(tbl: &Table) -> Anchor {
+    tbl.get::<String>("anchor")
+        .map(|s| Anchor::parse(&s))
+        .unwrap_or_default()
+}
+
+fn parse_border(tbl: &Table) -> Border {
+    tbl.get::<String>("border")
+        .map(|s| Border::parse(&s))
+        .unwrap_or_default()
+}
+
+fn parse_title_pos(tbl: &Table) -> TitlePos {
+    tbl.get::<String>("title_pos")
+        .map(|s| TitlePos::parse(&s))
+        .unwrap_or_default()
 }
 
 fn segments_to_lua_lines(

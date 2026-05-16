@@ -256,8 +256,8 @@ impl<'t> EventLoop<'t> {
         }
         loop {
             self.tick();
-            self.terminal.draw(|f| self.app.view(f))?;
             let had_agent_msg = self.drain_channels();
+            self.terminal.draw(|f| self.app.view(f))?;
 
             if self.app.exit_request != ExitRequest::None {
                 return Ok(self.shutdown());
@@ -274,6 +274,7 @@ impl<'t> EventLoop<'t> {
         self.app.btw_modal.poll();
         self.app.status_bar.poll_branch_update();
         self.app.mcp_picker.refresh();
+        self.app.float_mgr.tick();
     }
 
     fn drain_channels(&mut self) -> bool {
@@ -319,11 +320,14 @@ impl<'t> EventLoop<'t> {
                     }
                     UiAction::OpenWin {
                         buf,
-                        opts,
+                        config,
+                        focus,
                         event_tx,
                         cmd_rx,
                     } => {
-                        self.app.lua_float.open(buf, opts, event_tx, cmd_rx);
+                        self.app
+                            .float_mgr
+                            .open(buf, config, focus, event_tx, cmd_rx);
                     }
                 }
             }
@@ -333,7 +337,8 @@ impl<'t> EventLoop<'t> {
     }
 
     fn poll_and_handle_input(&mut self, had_agent_msg: bool) -> Result<()> {
-        let poll_duration = if had_agent_msg {
+        let has_pending_ui_action = self.ui_action_rx.as_ref().is_some_and(|rx| !rx.is_empty());
+        let poll_duration = if had_agent_msg || has_pending_ui_action {
             Duration::ZERO
         } else if self.app.is_animating() {
             Duration::from_millis(ANIMATION_INTERVAL_MS)

@@ -9,6 +9,7 @@ rust-version.workspace = true
 
 [dependencies]
 arc-swap = { workspace = true }
+crossterm = { workspace = true }
 maki-agent = { workspace = true }
 maki-config = { workspace = true }
 maki-highlight = { workspace = true }

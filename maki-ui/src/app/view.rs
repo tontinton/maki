@@ -221,8 +221,7 @@ impl App {
         if r.width > 0 {
             overlay_rect = r;
         }
-        self.lua_float.tick();
-        let r = self.lua_float.view(frame, full);
+        let r = self.float_mgr.view(frame, full);
         if r.width > 0 {
             overlay_rect = r;
         }

@@ -4,7 +4,10 @@ pub mod language;
 mod loader;
 mod runtime;
 
-pub use api::command::{LuaCommandInfo, LuaCommandReader, UiAction, WinCommand, WinEvent, WinOpts};
+pub use api::command::{
+    Anchor, Border, Dimension, FloatConfig, FloatConfigPatch, LuaCommandInfo, LuaCommandReader,
+    TitlePos, UiAction, WinCommand, WinEvent,
+};
 pub use error::PluginError;
 pub use loader::{EventHandle, PluginHost};
 pub use runtime::RestoreReply;

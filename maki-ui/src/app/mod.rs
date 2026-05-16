@@ -30,7 +30,7 @@ use crate::components::help_modal::HelpModal;
 use crate::components::input::{InputAction, InputBox, Submission};
 use crate::components::keybindings::key;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
-use crate::components::lua_float::LuaFloatWindow;
+use crate::components::lua_float::FloatManager;
 use crate::components::mcp_picker::{McpPicker, McpPickerAction};
 use crate::components::model_picker::{ModelPicker, ModelPickerAction};
 use crate::components::permission_prompt::PermissionPrompt;
@@ -137,7 +137,7 @@ pub struct App {
     pub(super) rewind_picker: RewindPicker,
     pub(super) help_modal: HelpModal,
     pub(super) btw_modal: BtwModal,
-    pub(super) lua_float: LuaFloatWindow,
+    pub(super) float_mgr: FloatManager,
     pub(super) search_modal: SearchModal,
     pub(super) file_picker: FilePickerModal,
     pub(super) permission_prompt: PermissionPrompt,
@@ -209,7 +209,7 @@ impl App {
             rewind_picker: RewindPicker::new(),
             help_modal: HelpModal::new(),
             btw_modal: BtwModal::new(ui_config.typewriter_ms_per_char),
-            lua_float: LuaFloatWindow::new(),
+            float_mgr: FloatManager::new(),
             search_modal: SearchModal::new(),
             file_picker: FilePickerModal::new(),
             permission_prompt: PermissionPrompt::new(),
@@ -488,8 +488,7 @@ impl App {
             return Some(vec![]);
         }
 
-        if self.lua_float.is_open() {
-            self.lua_float.handle_key(key);
+        if self.float_mgr.handle_key(key) {
             return Some(vec![]);
         }
 
@@ -1258,7 +1257,7 @@ impl App {
         [
             &self.help_modal,
             &self.btw_modal,
-            &self.lua_float,
+            &self.float_mgr,
             &self.search_modal,
             &self.file_picker,
             &self.task_picker,
@@ -1276,7 +1275,7 @@ impl App {
         [
             &mut self.help_modal,
             &mut self.btw_modal,
-            &mut self.lua_float,
+            &mut self.float_mgr,
             &mut self.search_modal,
             &mut self.file_picker,
             &mut self.task_picker,
@@ -1307,6 +1306,7 @@ impl App {
             || self.btw_modal.is_animating()
             || self.session_picker.is_loading()
             || self.file_picker.is_loading()
+            || self.float_mgr.is_open()
             || self
                 .selection_state
                 .as_ref()

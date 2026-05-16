@@ -1,20 +1,29 @@
 use mlua::{Table, UserData, UserDataMethods};
 
-use crate::api::command::{WinCommand, WinEvent};
-use crate::api::ui::parse_footer;
+use crate::api::command::{Anchor, Border, FloatConfigPatch, TitlePos, WinCommand, WinEvent};
+use crate::api::ui::{parse_footer, try_parse_dimension};
 
 pub(crate) struct WinHandle {
     event_rx: flume::Receiver<WinEvent>,
     cmd_tx: flume::Sender<WinCommand>,
     closed: bool,
+    init_width: u16,
+    init_height: u16,
 }
 
 impl WinHandle {
-    pub fn new(event_rx: flume::Receiver<WinEvent>, cmd_tx: flume::Sender<WinCommand>) -> Self {
+    pub fn new(
+        event_rx: flume::Receiver<WinEvent>,
+        cmd_tx: flume::Sender<WinCommand>,
+        init_width: u16,
+        init_height: u16,
+    ) -> Self {
         Self {
             event_rx,
             cmd_tx,
             closed: false,
+            init_width,
+            init_height,
         }
     }
 
@@ -34,6 +43,11 @@ impl Drop for WinHandle {
 }
 
 impl UserData for WinHandle {
+    fn add_fields<F: mlua::UserDataFields<Self>>(fields: &mut F) {
+        fields.add_field_method_get("width", |_, this| Ok(this.init_width));
+        fields.add_field_method_get("height", |_, this| Ok(this.init_height));
+    }
+
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_async_method_mut("recv", |lua, mut this, ()| async move {
             if this.closed {
@@ -47,10 +61,11 @@ impl UserData for WinHandle {
                     tbl.set("cursor", cursor + 1)?;
                     Ok(mlua::Value::Table(tbl))
                 }
-                Ok(WinEvent::Resize { width }) => {
+                Ok(WinEvent::Resize { width, height }) => {
                     let tbl = lua.create_table()?;
                     tbl.set("type", "resize")?;
                     tbl.set("width", width)?;
+                    tbl.set("height", height)?;
                     Ok(mlua::Value::Table(tbl))
                 }
                 Ok(WinEvent::Close) => {
@@ -70,14 +85,33 @@ impl UserData for WinHandle {
             if this.closed {
                 return Ok(());
             }
-            let title: Option<String> = opts.get("title").ok();
-            let footer = match parse_footer(&opts) {
-                Ok(f) if !f.is_empty() => Some(f),
-                _ => None,
-            };
-            let _ = this
-                .cmd_tx
-                .try_send(WinCommand::SetConfig { title, footer });
+            let mut patch = FloatConfigPatch::default();
+            if let Ok(t) = opts.get::<String>("title") {
+                patch.title = Some(t);
+            }
+            if let Ok(f) = parse_footer(&opts) {
+                if !f.is_empty() {
+                    patch.footer = Some(f);
+                }
+            }
+            if let Ok(b) = opts.get::<String>("border") {
+                patch.border = Some(Border::parse(&b));
+            }
+            if let Ok(tp) = opts.get::<String>("title_pos") {
+                patch.title_pos = Some(TitlePos::parse(&tp));
+            }
+            if let Ok(a) = opts.get::<String>("anchor") {
+                patch.anchor = Some(Anchor::parse(&a));
+            }
+            if let Ok(z) = opts.get::<u16>("zindex") {
+                patch.zindex = Some(z);
+            }
+            if let Ok(cl) = opts.get::<bool>("cursor_line") {
+                patch.cursor_line = Some(cl);
+            }
+            patch.width = try_parse_dimension(&opts, "width");
+            patch.height = try_parse_dimension(&opts, "height");
+            let _ = this.cmd_tx.try_send(WinCommand::SetConfig(patch));
             Ok(())
         });
 
@@ -111,7 +145,7 @@ mod tests {
     ) {
         let (event_tx, event_rx) = flume::bounded::<WinEvent>(8);
         let (cmd_tx, cmd_rx) = flume::bounded::<WinCommand>(8);
-        let handle = WinHandle::new(event_rx, cmd_tx);
+        let handle = WinHandle::new(event_rx, cmd_tx, 80, 24);
         (event_tx, cmd_rx, handle)
     }
 

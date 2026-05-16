@@ -94,7 +94,7 @@ impl MessagesPanel {
             scroll_top: u16::MAX,
             auto_scroll: true,
             viewport_height: 24,
-            viewport_width: 80,
+            viewport_width: crossterm::terminal::size().map_or(80, |(w, _)| w.saturating_sub(1)),
             cache: SegmentCache::new(),
             last_total_lines: 0,
             hl_worker: RenderWorker::new(),
@@ -699,6 +699,13 @@ impl MessagesPanel {
 
     pub fn view(&mut self, frame: &mut Frame, area: Rect, has_selection: bool) {
         self.viewport_height = area.height;
+        let width = area.width.saturating_sub(1);
+        let theme_gen = theme::generation();
+        let width_changed = self.viewport_width != width || self.theme_generation != theme_gen;
+        if width_changed {
+            self.viewport_width = width;
+            self.theme_generation = theme_gen;
+        }
 
         if self.show_idle_splash() {
             let accent = self.accent.resolve();
@@ -706,11 +713,7 @@ impl MessagesPanel {
             return;
         }
 
-        let width = area.width.saturating_sub(1);
-        let theme_gen = theme::generation();
-        if self.viewport_width != width || self.theme_generation != theme_gen {
-            self.viewport_width = width;
-            self.theme_generation = theme_gen;
+        if width_changed {
             self.cache.invalidate_from_msg_count();
             let thinking = thinking_style();
             let assistant = assistant_style();
