@@ -132,7 +132,6 @@ cmd_desc          = { fg = "comment" }
 highlight_text    = { fg = "orange" }
 panel_border      = { fg = "blue" }
 panel_title       = { fg = "blue", modifiers = ["bold"] }
-picker_search_prefix = { fg = "comment" }
 cursor            = { fg = "background", bg = "foreground" }
 keybind_key       = { fg = "cyan", modifiers = ["bold"] }
 keybind_section   = { fg = "blue", modifiers = ["bold"] }
@@ -145,7 +144,6 @@ status_retry_error = { fg = "red" }
 status_retry_info  = { fg = "comment" }
 input_placeholder  = { fg = "comment" }
 queue_delete       = { fg = "red", modifiers = ["bold"] }
-picker_search_text = { fg = "foreground" }
 timestamp          = { fg = "comment" }
 spinner            = { fg = "yellow" }
 form_separator     = { fg = "comment" }

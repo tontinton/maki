@@ -91,6 +91,7 @@ pub(crate) fn create_ui_table(
                     let title: String = opts_tbl.get("title").unwrap_or_default();
                     let cursor_line: bool = opts_tbl.get("cursor_line").unwrap_or(true);
                     let footer = parse_footer(&opts_tbl)?;
+                    let reserved_bottom: usize = opts_tbl.get("reserved_bottom").unwrap_or(0);
 
                     let (event_tx, event_rx) = flume::bounded::<WinEvent>(8);
                     let (cmd_tx, cmd_rx) = flume::bounded::<WinCommand>(8);
@@ -101,6 +102,7 @@ pub(crate) fn create_ui_table(
                             title,
                             footer,
                             cursor_line,
+                            reserved_bottom,
                         },
                         event_tx,
                         cmd_rx,

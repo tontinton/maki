@@ -159,7 +159,6 @@ panel_title          = { fg = "purple", modifiers = ["bold"] }
 cursor               = { fg = "background", bg = "foreground" }
 keybind_key          = { fg = "sapphire", modifiers = ["bold"] }
 keybind_section      = { fg = "purple", modifiers = ["bold"] }
-picker_search_prefix = { fg = "purple" }
 input_border         = { fg = "#585b70" }
 keybind_desc       = { fg = "foreground" }
 queue_compact      = { fg = "purple" }
@@ -169,7 +168,6 @@ status_retry_error = { fg = "red" }
 status_retry_info  = { fg = "comment" }
 input_placeholder  = { fg = "comment" }
 queue_delete       = { fg = "red", modifiers = ["bold"] }
-picker_search_text = { fg = "foreground" }
 timestamp          = { fg = "comment" }
 spinner            = { fg = "yellow" }
 form_separator     = { fg = "comment" }

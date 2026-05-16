@@ -93,6 +93,7 @@ pub struct WinOpts {
     pub title: String,
     pub footer: Vec<(String, String)>,
     pub cursor_line: bool,
+    pub reserved_bottom: usize,
 }
 
 pub enum WinEvent {

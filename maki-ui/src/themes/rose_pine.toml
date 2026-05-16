@@ -148,7 +148,6 @@ input_border         = { fg = "#403d52" }
 keybind_key          = { fg = "foam", modifiers = ["bold"] }
 keybind_section      = { fg = "iris", modifiers = ["bold"] }
 
-picker_search_prefix = { fg = "iris" }
 status_context       = { fg = "comment" }
 error                = { fg = "love" }
 
@@ -164,7 +163,6 @@ status_retry_error = { fg = "love" }
 status_retry_info  = { fg = "comment" }
 input_placeholder  = { fg = "comment" }
 queue_delete       = { fg = "love", modifiers = ["bold"] }
-picker_search_text = { fg = "foreground" }
 timestamp          = { fg = "comment" }
 spinner            = { fg = "gold" }
 form_separator     = { fg = "comment" }

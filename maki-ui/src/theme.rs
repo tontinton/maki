@@ -288,6 +288,9 @@ pub fn style_by_name(name: &str) -> Style {
         "cmd_selected" => t.cmd_selected,
         "cmd_name" => t.cmd_name,
         "cmd_desc" => t.cmd_desc,
+        "cmd_match" => t.cmd_match,
+        "cmd_match_selected" => t.cmd_match_selected,
+        "cursor" => t.cursor,
         _ => Style::default(),
     }
 }
@@ -333,9 +336,10 @@ pub struct Theme {
     pub cmd_selected: Style,
     pub cmd_name: Style,
     pub cmd_desc: Style,
+    pub cmd_match: Style,
+    pub cmd_match_selected: Style,
     pub panel_border: Style,
     pub panel_title: Style,
-    pub picker_search_prefix: Style,
     pub cursor: Style,
     pub input_border: Style,
     pub highlight_text: Style,
@@ -352,7 +356,6 @@ pub struct Theme {
     pub status_retry_info: Style,
     pub input_placeholder: Style,
     pub queue_delete: Style,
-    pub picker_search_text: Style,
     pub timestamp: Style,
     pub spinner: Style,
     pub form_separator: Style,
@@ -684,9 +687,28 @@ impl Theme {
             cmd_selected: style("cmd_selected"),
             cmd_name: style("cmd_name"),
             cmd_desc: style("cmd_desc"),
+            cmd_match: {
+                let s = style("cmd_match");
+                if s == Style::default() {
+                    style("cmd_name")
+                        .fg(style("highlight_text").fg.unwrap_or_default())
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    s
+                }
+            },
+            cmd_match_selected: {
+                let s = style("cmd_match_selected");
+                if s == Style::default() {
+                    style("cmd_selected")
+                        .fg(style("highlight_text").fg.unwrap_or_default())
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    s
+                }
+            },
             panel_border: style("panel_border"),
             panel_title: style("panel_title"),
-            picker_search_prefix: style("picker_search_prefix"),
             cursor: style("cursor"),
             input_border: style("input_border"),
             highlight_text: style("highlight_text"),
@@ -703,7 +725,6 @@ impl Theme {
             status_retry_info: style("status_retry_info"),
             input_placeholder: style("input_placeholder"),
             queue_delete: style("queue_delete"),
-            picker_search_text: style("picker_search_text"),
             timestamp: style("timestamp"),
             spinner: style("spinner"),
             form_separator: style("form_separator"),
@@ -1023,6 +1044,7 @@ mode_build = "#112233"
         assert_eq!(style_by_name("cmd_selected"), t.cmd_selected);
         assert_eq!(style_by_name("cmd_name"), t.cmd_name);
         assert_eq!(style_by_name("cmd_desc"), t.cmd_desc);
+        assert_eq!(style_by_name("cursor"), t.cursor);
     }
 
     #[test_case("nonexistent_style")]

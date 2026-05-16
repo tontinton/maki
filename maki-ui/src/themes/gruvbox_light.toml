@@ -139,8 +139,6 @@ input_border         = { fg = "comment" }
 keybind_key          = { fg = "cyan", modifiers = ["bold"] }
 keybind_desc         = { fg = "foreground" }
 keybind_section      = { fg = "blue", modifiers = ["bold"] }
-picker_search_prefix = { fg = "comment" }
-picker_search_text   = { fg = "foreground" }
 queue_compact        = { fg = "purple" }
 plan_path            = { fg = "orange", modifiers = ["bold"] }
 status_flash         = { fg = "orange" }

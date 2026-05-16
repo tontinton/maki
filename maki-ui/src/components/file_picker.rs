@@ -12,7 +12,7 @@ use nucleo::pattern::{CaseMatching, Normalization};
 use nucleo::{Config, Matcher, Nucleo, Utf32String};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
-use ratatui::style::Modifier;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use tracing::warn;
@@ -460,7 +460,7 @@ fn render_search(frame: &mut Frame, area: Rect, s: &Session) {
     let cursor_char = chars.next().unwrap_or(' ');
     let after = chars.as_str();
 
-    let mut spans = vec![Span::styled(super::CHEVRON, t.picker_search_prefix)];
+    let mut spans = vec![Span::styled(super::CHEVRON, t.tool_dim)];
 
     if s.walking {
         let ch = spinner_frame(s.started_at.elapsed().as_millis());
@@ -468,9 +468,9 @@ fn render_search(frame: &mut Frame, area: Rect, s: &Session) {
     }
 
     spans.extend([
-        Span::styled(before.to_owned(), t.picker_search_text),
+        Span::styled(before.to_owned(), Style::default()),
         Span::styled(cursor_char.to_string(), t.cursor),
-        Span::styled(after.to_owned(), t.picker_search_text),
+        Span::styled(after.to_owned(), Style::default()),
     ]);
 
     frame.render_widget(Paragraph::new(vec![Line::from(spans)]), area);

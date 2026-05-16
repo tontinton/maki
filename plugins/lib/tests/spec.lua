@@ -257,6 +257,98 @@ case("tool_view_append_after_toggle_still_works", function()
   eq(view.all_lines[6], "line6")
 end)
 
+local TextInput = require("maki.text_input")
+
+case("text_input_insert_and_value", function()
+  local input = TextInput.new()
+  input:handle_key("h")
+  input:handle_key("i")
+  eq(input:value(), "hi")
+  eq(input.cursor, 2)
+end)
+
+case("text_input_backspace_at_start_noop", function()
+  local input = TextInput.new()
+  input:handle_key("backspace")
+  eq(input:value(), "")
+  eq(input.cursor, 0)
+end)
+
+case("text_input_backspace_deletes", function()
+  local input = TextInput.new()
+  input:handle_key("a")
+  input:handle_key("b")
+  input:handle_key("c")
+  input:handle_key("backspace")
+  eq(input:value(), "ab")
+  eq(input.cursor, 2)
+end)
+
+case("text_input_cursor_movement", function()
+  local input = TextInput.new()
+  input:handle_key("a")
+  input:handle_key("b")
+  input:handle_key("c")
+  input:handle_key("left")
+  eq(input.cursor, 2)
+  input:handle_key("left")
+  eq(input.cursor, 1)
+  input:handle_key("left")
+  eq(input.cursor, 0)
+  input:handle_key("left")
+  eq(input.cursor, 0)
+  input:handle_key("right")
+  eq(input.cursor, 1)
+  input:handle_key("end")
+  eq(input.cursor, 3)
+  input:handle_key("home")
+  eq(input.cursor, 0)
+end)
+
+case("text_input_delete_word", function()
+  local input = TextInput.new()
+  for c in ("hello world"):gmatch(".") do
+    input:handle_key(c)
+  end
+  eq(input:value(), "hello world")
+  input:handle_key("ctrl+w")
+  eq(input:value(), "hello ")
+  input:handle_key("ctrl+w")
+  eq(input:value(), "hello")
+  input:handle_key("ctrl+w")
+  eq(input:value(), "")
+end)
+
+case("text_input_unknown_key_returns_false", function()
+  local input = TextInput.new()
+  eq(input:handle_key("ctrl+x"), false)
+  eq(input:handle_key("f1"), false)
+end)
+
+case("text_input_render_format", function()
+  local input = TextInput.new()
+  input:handle_key("a")
+  input:handle_key("b")
+  input:handle_key("left")
+  local spans = input:render("> ")
+  eq(#spans, 4)
+  eq(spans[1][1], "> ")
+  eq(spans[1][2], "dim")
+  eq(spans[2][1], "a")
+  eq(spans[2][2], "")
+  eq(spans[3][1], "b")
+  eq(spans[3][2], "cursor")
+  eq(spans[4][1], "")
+  eq(spans[4][2], "")
+end)
+
+case("text_input_is_empty", function()
+  local input = TextInput.new()
+  eq(input:is_empty(), true)
+  input:handle_key("x")
+  eq(input:is_empty(), false)
+end)
+
 local ListPicker = require("maki.list_picker")
 local highlight_to_view = require("maki.highlight")
 
@@ -350,11 +442,71 @@ case("render_lines_trailing_omitted_when_label_fills_width", function()
   eq(#lines[1], 1, "no trailing span when width - indent - label <= 0")
 end)
 
+case("render_lines_match_highlight_selected", function()
+  local lines = render_lines({ "alpha", "beta" }, 1, 40, "lph")
+  eq(lines[1][1][1], "  a")
+  eq(lines[1][1][2], "cmd_selected")
+  eq(lines[1][2][1], "lph")
+  eq(lines[1][2][2], "cmd_match_selected")
+  eq(lines[1][3][1], "a")
+  eq(lines[1][3][2], "cmd_selected")
+end)
+
+case("render_lines_match_highlight_not_selected", function()
+  local lines = render_lines({ "beta", "alpha" }, 2, 40, "et")
+  eq(lines[1][1][1], "  b")
+  eq(lines[1][1][2], "cmd_name")
+  eq(lines[1][2][1], "et")
+  eq(lines[1][2][2], "cmd_match")
+  eq(lines[1][3][1], "a")
+  eq(lines[1][3][2], "cmd_name")
+end)
+
 case("render_lines_detail_right_pad_always_present", function()
   local items = { { label = "x", detail = "d" } }
   local lines = render_lines(items, 1, 50)
   local right_pad = lines[1][4][1]
   eq(#right_pad, 2, "DETAIL_RIGHT_PAD = 2")
+end)
+
+local filter_items = ListPicker._filter_items
+
+case("filter_items_empty_query_returns_all", function()
+  local items = { "alpha", "beta", "gamma" }
+  local filtered, indices = filter_items(items, "")
+  eq(#filtered, 3)
+  eq(indices[1], 1)
+  eq(indices[2], 2)
+  eq(indices[3], 3)
+end)
+
+case("filter_items_case_insensitive", function()
+  local items = { "Alpha", "BETA", "gamma" }
+  local filtered, indices = filter_items(items, "al")
+  eq(#filtered, 1)
+  eq(filtered[1], "Alpha")
+  eq(indices[1], 1)
+end)
+
+case("filter_items_no_matches", function()
+  local items = { "apple", "banana" }
+  local filtered, indices = filter_items(items, "xyz")
+  eq(#filtered, 0)
+  eq(#indices, 0)
+end)
+
+case("filter_items_table_items_uses_label", function()
+  local items = {
+    { label = "Foo", detail = "d1" },
+    { label = "Bar", detail = "d2" },
+    { label = "Foobar", detail = "d3" },
+  }
+  local filtered, indices = filter_items(items, "foo")
+  eq(#filtered, 2)
+  eq(filtered[1].label, "Foo")
+  eq(filtered[2].label, "Foobar")
+  eq(indices[1], 1)
+  eq(indices[2], 3)
 end)
 
 if #failures > 0 then

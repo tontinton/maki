@@ -143,7 +143,6 @@ todo_completed     = { fg = "spring_green" }
 todo_in_progress   = { fg = "yellow" }
 todo_pending       = { fg = "comment" }
 todo_cancelled     = { fg = "red", modifiers = ["crossed_out"] }
-picker_search_prefix = { fg = "purple" }
 input_border       = { fg = "#54546d" }
 keybind_desc       = { fg = "foreground" }
 queue_compact      = { fg = "purple" }
@@ -153,7 +152,6 @@ status_retry_error = { fg = "red" }
 status_retry_info  = { fg = "comment" }
 input_placeholder  = { fg = "comment" }
 queue_delete       = { fg = "red", modifiers = ["bold"] }
-picker_search_text = { fg = "foreground" }
 timestamp          = { fg = "comment" }
 spinner            = { fg = "yellow" }
 form_separator     = { fg = "comment" }

@@ -25,6 +25,7 @@ struct OpenState {
     title: String,
     footer: Vec<(String, String)>,
     cursor_line: bool,
+    reserved_bottom: usize,
     cursor: usize,
     scroll_offset: usize,
     event_tx: flume::Sender<WinEvent>,
@@ -62,6 +63,7 @@ impl LuaFloatWindow {
             title: opts.title,
             footer: opts.footer,
             cursor_line: opts.cursor_line,
+            reserved_bottom: opts.reserved_bottom,
             cursor: 0,
             scroll_offset: 0,
             event_tx,
@@ -82,7 +84,9 @@ impl LuaFloatWindow {
 
         match key_event.code {
             KeyCode::Up => s.cursor = s.cursor.saturating_sub(1),
-            KeyCode::Down => s.cursor = clamp_cursor(s.cursor + 1, &s.cached_lines),
+            KeyCode::Down => {
+                s.cursor = clamp_cursor(s.cursor + 1, &s.cached_lines, s.reserved_bottom)
+            }
             _ => {}
         }
         adjust_scroll(s);
@@ -110,7 +114,7 @@ impl LuaFloatWindow {
                     }
                 }
                 Ok(WinCommand::SetCursor(row)) => {
-                    s.cursor = clamp_cursor(row, &s.cached_lines);
+                    s.cursor = clamp_cursor(row, &s.cached_lines, s.reserved_bottom);
                     adjust_scroll(s);
                 }
                 Ok(WinCommand::Close) => {
@@ -127,7 +131,7 @@ impl LuaFloatWindow {
 
         if let Some(lines) = s.buf.read_if_dirty() {
             s.cached_lines = lines;
-            s.cursor = clamp_cursor(s.cursor, &s.cached_lines);
+            s.cursor = clamp_cursor(s.cursor, &s.cached_lines, s.reserved_bottom);
             adjust_scroll(s);
         }
     }
@@ -155,16 +159,29 @@ impl LuaFloatWindow {
             (inner, None)
         };
 
-        s.viewport_h = content_area.height;
         let w = content_area.width;
         if s.content_width != w {
             let _ = s.event_tx.try_send(WinEvent::Resize { width: w });
         }
         s.content_width = w;
+
+        let reserved = s.reserved_bottom.min(s.cached_lines.len());
+        let scrollable_count = s.cached_lines.len() - reserved;
+        let reserved_h = reserved as u16;
+
+        let (scroll_area, pinned_area) = if reserved > 0 && content_area.height > reserved_h {
+            let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(reserved_h)])
+                .split(content_area);
+            (chunks[0], Some(chunks[1]))
+        } else {
+            (content_area, None)
+        };
+
+        s.viewport_h = scroll_area.height;
         adjust_scroll(s);
 
         let vh = s.viewport_h as usize;
-        let end = (s.scroll_offset + vh).min(s.cached_lines.len());
+        let end = (s.scroll_offset + vh).min(scrollable_count);
         let visible = &s.cached_lines[s.scroll_offset..end];
 
         let t = theme::current();
@@ -172,31 +189,33 @@ impl LuaFloatWindow {
             .iter()
             .enumerate()
             .map(|(i, sline)| {
-                let row_idx = s.scroll_offset + i;
-                let spans: Vec<Span<'_>> = sline
-                    .spans
-                    .iter()
-                    .map(|span| Span::styled(span.text.clone(), resolve_span_style(&span.style)))
-                    .collect();
-                let mut line = Line::from(spans);
-                if s.cursor_line && row_idx == s.cursor {
+                let mut line = snapshot_to_line(sline);
+                if s.cursor_line && s.scroll_offset + i == s.cursor {
                     line = line.style(t.cmd_selected);
                 }
                 line
             })
             .collect();
 
-        frame.render_widget(Paragraph::new(lines), content_area);
+        frame.render_widget(Paragraph::new(lines), scroll_area);
+
+        if let Some(pa) = pinned_area {
+            let pinned: Vec<Line<'_>> = s.cached_lines[scrollable_count..]
+                .iter()
+                .map(snapshot_to_line)
+                .collect();
+            frame.render_widget(Paragraph::new(pinned), pa);
+        }
 
         if let Some(fa) = footer_area {
             frame.render_widget(hint_line(&s.footer), fa);
         }
 
-        if s.cached_lines.len() as u16 > s.viewport_h {
+        if scrollable_count as u16 > s.viewport_h {
             render_vertical_scrollbar(
                 frame,
-                content_area,
-                s.cached_lines.len() as u16,
+                scroll_area,
+                scrollable_count as u16,
                 s.scroll_offset as u16,
             );
         }
@@ -215,8 +234,18 @@ impl LuaFloatWindow {
     }
 }
 
-fn clamp_cursor(cursor: usize, lines: &[SnapshotLine]) -> usize {
-    cursor.min(lines.len().saturating_sub(1))
+fn snapshot_to_line(sline: &SnapshotLine) -> Line<'_> {
+    Line::from(
+        sline
+            .spans
+            .iter()
+            .map(|span| Span::styled(span.text.clone(), resolve_span_style(&span.style)))
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn clamp_cursor(cursor: usize, lines: &[SnapshotLine], reserved: usize) -> usize {
+    cursor.min(lines.len().saturating_sub(1 + reserved))
 }
 
 fn adjust_scroll(s: &mut OpenState) {
@@ -224,7 +253,8 @@ fn adjust_scroll(s: &mut OpenState) {
     if vh == 0 {
         return;
     }
-    let max_offset = s.cached_lines.len().saturating_sub(vh);
+    let scrollable_count = s.cached_lines.len().saturating_sub(s.reserved_bottom);
+    let max_offset = scrollable_count.saturating_sub(vh);
     s.scroll_offset = s.scroll_offset.min(max_offset);
     if s.cursor < s.scroll_offset {
         s.scroll_offset = s.cursor;
@@ -280,6 +310,7 @@ mod tests {
             title: "Test".to_string(),
             footer: vec![],
             cursor_line: true,
+            reserved_bottom: 0,
         }
     }
 
@@ -363,31 +394,13 @@ mod tests {
     }
 
     #[test]
-    fn set_config_command() {
-        let mut win = LuaFloatWindow::new();
-        let (_event_rx, cmd_tx) = open_with_lines(&mut win, &["a"]);
-        cmd_tx
-            .send(WinCommand::SetConfig {
-                title: Some("New Title".to_string()),
-                footer: None,
-            })
-            .unwrap();
-        win.tick();
-        assert_eq!(state(&win).title, "New Title");
-    }
-
-    #[test]
     fn close_command_from_lua() {
         let mut win = LuaFloatWindow::new();
         let (event_rx, cmd_tx) = open_with_lines(&mut win, &["a"]);
         cmd_tx.send(WinCommand::Close).unwrap();
         win.tick();
         assert!(!win.is_open());
-        let evt = event_rx
-            .drain()
-            .find(|e| matches!(e, WinEvent::Close))
-            .expect("expected a Close event");
-        assert!(matches!(evt, WinEvent::Close));
+        assert!(event_rx.drain().any(|e| matches!(e, WinEvent::Close)));
     }
 
     #[test]
@@ -464,6 +477,7 @@ mod tests {
         scroll_offset: usize,
         num_lines: usize,
         viewport_h: u16,
+        reserved_bottom: usize,
     ) -> OpenState {
         let (event_tx, cmd_rx, _event_rx, _cmd_tx) = make_channels();
         let buf = Arc::new(SharedBuf::new());
@@ -473,6 +487,7 @@ mod tests {
             title: String::new(),
             footer: vec![],
             cursor_line: true,
+            reserved_bottom,
             cursor,
             scroll_offset,
             event_tx,
@@ -483,13 +498,20 @@ mod tests {
         }
     }
 
-    #[test_case(0, 5, 0, 10 => 0 ; "empty_content")]
-    #[test_case(3, 5, 10, 0 => 5 ; "zero_viewport_is_noop")]
-    #[test_case(2, 5, 20, 5 => 2 ; "cursor_above_viewport")]
-    #[test_case(15, 0, 20, 5 => 11 ; "cursor_below_viewport")]
-    #[test_case(7, 0, 10, 1 => 7 ; "single_line_viewport")]
-    fn adjust_scroll_cases(cursor: usize, scroll: usize, lines: usize, vh: u16) -> usize {
-        let mut s = make_open_state(cursor, scroll, lines, vh);
+    #[test_case(0, 5, 0, 10, 0 => 0 ; "empty_content")]
+    #[test_case(3, 5, 10, 0, 0 => 5 ; "zero_viewport_is_noop")]
+    #[test_case(2, 5, 20, 5, 0 => 2 ; "cursor_above_viewport")]
+    #[test_case(15, 0, 20, 5, 0 => 11 ; "cursor_below_viewport")]
+    #[test_case(7, 0, 10, 1, 0 => 7 ; "single_line_viewport")]
+    #[test_case(7, 0, 10, 5, 2 => 3 ; "reserved_bottom_limits_max_offset")]
+    fn adjust_scroll_cases(
+        cursor: usize,
+        scroll: usize,
+        lines: usize,
+        vh: u16,
+        reserved: usize,
+    ) -> usize {
+        let mut s = make_open_state(cursor, scroll, lines, vh, reserved);
         adjust_scroll(&mut s);
         s.scroll_offset
     }
@@ -517,8 +539,9 @@ mod tests {
             .unwrap();
         cmd_tx.send(WinCommand::SetCursor(3)).unwrap();
         win.tick();
-        assert_eq!(state(&win).title, "Updated");
-        assert_eq!(state(&win).cursor, 3);
+        let s = state(&win);
+        assert_eq!(s.title, "Updated");
+        assert_eq!(s.cursor, 3);
     }
 
     #[test]
@@ -532,5 +555,47 @@ mod tests {
         assert!(win.is_open());
         assert_eq!(state(&win).cached_lines.len(), 2);
         assert_eq!(state(&win).cursor, 0, "cursor resets on reopen");
+    }
+
+    #[test]
+    fn cursor_does_not_enter_reserved_bottom() {
+        let mut win = LuaFloatWindow::new();
+        let (event_tx, cmd_rx, _event_rx, _cmd_tx) = make_channels();
+        let buf = Arc::new(SharedBuf::new());
+        for i in 0..5 {
+            buf.append(make_line(&format!("line{i}")));
+        }
+        let mut opts = make_opts();
+        opts.reserved_bottom = 1;
+        win.open(buf, opts, event_tx, cmd_rx);
+        for _ in 0..10 {
+            win.handle_key(key(KeyCode::Down));
+        }
+        assert_eq!(
+            state(&win).cursor,
+            3,
+            "cursor stops before reserved bottom row"
+        );
+    }
+
+    #[test]
+    fn reserved_bottom_clamp_on_shrink() {
+        let mut win = LuaFloatWindow::new();
+        let (event_tx, cmd_rx, _event_rx, _cmd_tx) = make_channels();
+        let buf = Arc::new(SharedBuf::new());
+        for i in 0..5 {
+            buf.append(make_line(&format!("line{i}")));
+        }
+        let mut opts = make_opts();
+        opts.reserved_bottom = 1;
+        win.open(buf.clone(), opts, event_tx, cmd_rx);
+        state_mut(&mut win).cursor = 3;
+        buf.set_lines(vec![make_line("a"), make_line("b")]);
+        win.tick();
+        assert_eq!(
+            state(&win).cursor,
+            0,
+            "cursor clamps accounting for reserved rows"
+        );
     }
 }

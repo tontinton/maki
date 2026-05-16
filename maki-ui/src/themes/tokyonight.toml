@@ -141,7 +141,6 @@ todo_cancelled     = { fg = "red", modifiers = ["crossed_out"] }
 cmd_name           = { fg = "blue" }
 cmd_desc           = { fg = "comment" }
 highlight_text     = { fg = "orange" }
-picker_search_prefix = { fg = "blue" }
 keybind_section    = { fg = "blue", modifiers = ["bold"] }
 input_border       = { fg = "#3b4261" }
 keybind_desc       = { fg = "foreground" }
@@ -152,7 +151,6 @@ status_retry_error = { fg = "red" }
 status_retry_info  = { fg = "comment" }
 input_placeholder  = { fg = "comment" }
 queue_delete       = { fg = "red", modifiers = ["bold"] }
-picker_search_text = { fg = "foreground" }
 timestamp          = { fg = "comment" }
 spinner            = { fg = "orange" }
 form_separator     = { fg = "comment" }

@@ -146,8 +146,6 @@ input_border         = { fg = "selection" }
 keybind_key          = { fg = "sapphire", modifiers = ["bold"] }
 keybind_desc         = { fg = "foreground" }
 keybind_section      = { fg = "purple", modifiers = ["bold"] }
-picker_search_prefix = { fg = "purple" }
-picker_search_text   = { fg = "foreground" }
 queue_compact        = { fg = "purple" }
 plan_path            = { fg = "flamingo", modifiers = ["bold"] }
 status_flash         = { fg = "rosewater" }

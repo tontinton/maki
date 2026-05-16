@@ -11,7 +11,7 @@ use nucleo_matcher::pattern::{Atom, AtomKind, CaseMatching, Normalization};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::Modifier;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
@@ -266,10 +266,10 @@ impl SearchModal {
         let after = chars.as_str();
 
         let line = Line::from(vec![
-            Span::styled(SEARCH_PREFIX, t.picker_search_prefix),
-            Span::styled(before.to_owned(), t.picker_search_text),
+            Span::styled(SEARCH_PREFIX, t.tool_dim),
+            Span::styled(before.to_owned(), Style::default()),
             Span::styled(cursor_char.to_string(), t.cursor),
-            Span::styled(after.to_owned(), t.picker_search_text),
+            Span::styled(after.to_owned(), Style::default()),
         ]);
         frame.render_widget(Paragraph::new(vec![line]), area);
     }

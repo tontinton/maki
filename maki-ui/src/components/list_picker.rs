@@ -17,6 +17,7 @@ use crate::theme;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -833,10 +834,10 @@ fn render_search(frame: &mut Frame, area: Rect, search: &TextBuffer) {
     let after: String = chars[after_start..].iter().collect();
 
     let line = Line::from(vec![
-        Span::styled(SEARCH_PREFIX, theme::current().picker_search_prefix),
-        Span::styled(before, theme::current().picker_search_text),
+        Span::styled(SEARCH_PREFIX, theme::current().tool_dim),
+        Span::styled(before, Style::default()),
         Span::styled(cursor_char.to_string(), theme::current().cursor),
-        Span::styled(after, theme::current().picker_search_text),
+        Span::styled(after, Style::default()),
     ]);
     frame.render_widget(Paragraph::new(vec![line]), area);
 }

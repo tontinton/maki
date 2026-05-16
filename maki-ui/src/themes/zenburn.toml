@@ -142,7 +142,6 @@ panel_title          = { fg = "yellow", modifiers = ["bold"] }
 cursor               = { fg = "background", bg = "foreground" }
 keybind_key          = { fg = "cyan", modifiers = ["bold"] }
 keybind_section      = { fg = "yellow", modifiers = ["bold"] }
-picker_search_prefix = { fg = "yellow" }
 input_border         = { fg = "selection" }
 keybind_desc         = { fg = "foreground" }
 queue_compact        = { fg = "yellow" }
@@ -152,7 +151,6 @@ status_retry_error   = { fg = "red" }
 status_retry_info    = { fg = "comment" }
 input_placeholder    = { fg = "comment" }
 queue_delete         = { fg = "red", modifiers = ["bold"] }
-picker_search_text   = { fg = "foreground" }
 timestamp            = { fg = "comment" }
 spinner              = { fg = "yellow" }
 form_separator       = { fg = "comment" }
