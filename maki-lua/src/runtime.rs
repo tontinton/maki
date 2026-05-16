@@ -389,16 +389,26 @@ impl LuaRuntime {
         }
     }
 
-    fn collect_prompt_extras(&self) -> Vec<String> {
-        let Some(map) = self.lua.app_data_ref::<PromptExtraCallbacks>() else {
-            return Vec::new();
+    async fn collect_prompt_extras(&self) -> Vec<String> {
+        let callbacks: Vec<(Arc<str>, Function)> = {
+            let Some(map) = self.lua.app_data_ref::<PromptExtraCallbacks>() else {
+                return Vec::new();
+            };
+            map.iter()
+                .filter_map(|(plugin, key)| {
+                    let func = self.lua.registry_value::<Function>(key).ok()?;
+                    Some((Arc::clone(plugin), func))
+                })
+                .collect()
         };
         let mut extras = Vec::new();
-        for (plugin, key) in map.iter() {
-            let Ok(func) = self.lua.registry_value::<Function>(key) else {
-                continue;
-            };
-            match func.call::<LuaValue>(()) {
+        for (plugin, func) in &callbacks {
+            let result: mlua::Result<LuaValue> = async {
+                let thread = self.lua.create_thread(func.clone())?;
+                thread.into_async::<LuaValue>(())?.await
+            }
+            .await;
+            match result {
                 Ok(LuaValue::String(s)) => extras.push(s.to_string_lossy()),
                 Ok(LuaValue::Nil) => {}
                 Ok(_) => {
@@ -1283,7 +1293,7 @@ pub fn spawn(
                             let _ = reply.send(res);
                         }
                         Request::CollectPromptExtras { reply } => {
-                            let extras = rt.collect_prompt_extras();
+                            let extras = rt.collect_prompt_extras().await;
                             let _ = reply.send(extras);
                         }
                     Request::RestoreTool {
