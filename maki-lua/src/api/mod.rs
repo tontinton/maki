@@ -1,3 +1,4 @@
+mod async_api;
 pub(crate) mod buf;
 pub(crate) mod command;
 pub(crate) mod ctx;
@@ -56,6 +57,7 @@ pub(crate) fn create_maki_global(
                 .map_err(mlua::Error::runtime)
         })?,
     )?;
+    maki.set("async", async_api::create_async_table(lua)?)?;
 
     Ok(maki)
 }

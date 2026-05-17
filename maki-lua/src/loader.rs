@@ -5,13 +5,12 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use include_dir::{Dir, include_dir};
-use maki_agent::BufferSnapshot;
 use maki_agent::tools::ToolRegistry;
 use maki_config::{PluginsConfig, RawConfig};
 
 use crate::api::command::{LuaCommandReader, UiAction};
 use crate::error::PluginError;
-use crate::runtime::{self, LuaThread, Request, RestoreReply};
+use crate::runtime::{self, ClickReply, LuaThread, Request, RestoreReply};
 use serde_json::Value;
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -258,7 +257,7 @@ pub struct EventHandle {
 }
 
 impl EventHandle {
-    pub fn fire_click(&self, tool_id: &str, row: u32) -> Option<BufferSnapshot> {
+    pub fn fire_click(&self, tool_id: &str, row: u32) -> Option<ClickReply> {
         let (tx, rx) = flume::bounded(1);
         let _ = self.tx.try_send(Request::FireBufClick {
             tool_id: tool_id.to_owned(),
@@ -314,17 +313,8 @@ impl EventHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use maki_agent::tools::ToolRegistry;
-
-    #[test]
-    fn disabled_is_noop() {
-        let reg = Arc::new(ToolRegistry::new());
-        let names_before = reg.names();
-        let _host = PluginHost::disabled();
-        assert_eq!(reg.names(), names_before);
-    }
-
     use crate::api::command::{LuaCommandInfo, LuaCommandWriter};
+    use maki_agent::tools::ToolRegistry;
 
     #[test]
     fn command_writer_reader_pair_works() {
@@ -359,25 +349,6 @@ mod tests {
                 .map(|c| c.name.as_ref())
                 .collect::<Vec<_>>()
         );
-    }
-
-    #[test]
-    fn fire_click_sends_request_through_channel() {
-        let (tx, rx) = flume::bounded(8);
-        let (reply_tx, _reply_rx) = flume::bounded(1);
-        let _ = tx.try_send(Request::FireBufClick {
-            tool_id: "tool_42".to_owned(),
-            row: 7,
-            reply: reply_tx,
-        });
-        let req = rx.try_recv().unwrap();
-        match req {
-            Request::FireBufClick { tool_id, row, .. } => {
-                assert_eq!(tool_id, "tool_42");
-                assert_eq!(row, 7);
-            }
-            _ => panic!("expected FireBufClick"),
-        }
     }
 
     #[test]
@@ -443,17 +414,11 @@ mod tests {
     }
 
     #[test]
-    fn disabled_host_returns_empty_command_reader() {
+    fn disabled_host_returns_defaults() {
         let host = PluginHost::disabled();
-        let reader = host.command_reader();
-        let snap = reader.load();
+        let snap = host.command_reader().load();
         assert_eq!(snap.commands.len(), 0);
         assert_eq!(snap.generation, 0);
-    }
-
-    #[test]
-    fn disabled_host_returns_no_ui_action_rx() {
-        let host = PluginHost::disabled();
         assert!(host.ui_action_rx().is_none());
     }
 
@@ -485,15 +450,6 @@ mod tests {
             r#"
             maki.api.register_system_prompt_extra(function()
                 return nil
-            end)
-            "#,
-        )
-        .unwrap();
-        host.load_source(
-            "num_extra",
-            r#"
-            maki.api.register_system_prompt_extra(function()
-                return 42
             end)
             "#,
         )

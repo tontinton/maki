@@ -37,9 +37,15 @@ use maki_agent::{
     BatchToolEntry, BatchToolStatus, BufferSnapshot, InstructionBlock, NO_FILES_FOUND, SharedBuf,
     ToolDoneEvent, ToolOutput, ToolStartEvent,
 };
+
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
+
+struct LiveBufEntry {
+    buf: Arc<SharedBuf>,
+    dirty_seen: bool,
+}
 
 #[derive(Debug)]
 pub enum ClickResult {
@@ -65,7 +71,7 @@ pub struct MessagesPanel {
     idle_splash: Splash,
     accent: ColorTransition,
     expanded_tools: HashMap<String, SectionFlags>,
-    live_bufs: HashMap<String, Arc<SharedBuf>>,
+    live_bufs: HashMap<String, LiveBufEntry>,
     batch_children: HashMap<String, BatchChildState>,
     tool_output_lines: ToolOutputLines,
     render_hints: RenderHintsRegistry,
@@ -195,8 +201,8 @@ impl MessagesPanel {
     }
 
     pub fn tool_done(&mut self, event: ToolDoneEvent) {
-        if let Some(buf) = self.live_bufs.remove(&event.id)
-            && let Some(lines) = buf.read_if_dirty()
+        if let Some(entry) = self.live_bufs.remove(&event.id)
+            && let Some(lines) = entry.buf.read_if_dirty()
         {
             self.store_snapshot(&event.id, BufferSnapshot::from_arc(lines));
         }
@@ -864,17 +870,31 @@ impl MessagesPanel {
     }
 
     pub fn register_live_buf(&mut self, id: String, body: Arc<SharedBuf>) {
-        self.live_bufs.insert(id, body);
+        self.live_bufs.insert(
+            id,
+            LiveBufEntry {
+                buf: body,
+                dirty_seen: false,
+            },
+        );
     }
 
     fn poll_live_bufs(&mut self) {
-        let updates: Vec<_> = self
-            .live_bufs
-            .iter()
-            .filter_map(|(id, buf)| buf.read_if_dirty().map(|lines| (id.clone(), lines)))
-            .collect();
-        for (tool_id, lines) in updates {
+        let mut dirty = Vec::new();
+        let mut stale = Vec::new();
+        for (id, entry) in &mut self.live_bufs {
+            if let Some(lines) = entry.buf.read_if_dirty() {
+                entry.dirty_seen = true;
+                dirty.push((id.clone(), lines));
+            } else if entry.dirty_seen {
+                stale.push(id.clone());
+            }
+        }
+        for (tool_id, lines) in dirty {
             self.store_snapshot(&tool_id, BufferSnapshot::from_arc(lines));
+        }
+        for id in stale {
+            self.live_bufs.remove(&id);
         }
     }
 

@@ -10,7 +10,7 @@ pub use api::command::{
 };
 pub use error::PluginError;
 pub use loader::{EventHandle, PluginHost};
-pub use runtime::RestoreReply;
+pub use runtime::{ClickReply, RestoreReply};
 
 pub mod test_support {
     use crate::api::command::{LuaCommandInfo, LuaCommandReader, LuaCommandWriter};

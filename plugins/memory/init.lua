@@ -1,7 +1,6 @@
 local ToolView = require("maki.tool_view")
 local helpers = require("memory_helpers")
 local ListPicker = require("maki.list_picker")
-local highlight_to_view = require("maki.highlight")
 
 local function memories_path_suffix()
   local cwd = maki.uv.cwd()
@@ -58,7 +57,7 @@ local function render_content(content, path, ctx)
   end)
 
   local ext = path:match("%.([^%.]+)$") or "md"
-  if not highlight_to_view(view, content, ext) then
+  if not view:set_highlight(content, ext) then
     for line in (content .. "\n"):gmatch("([^\n]*)\n") do
       view:append(line)
     end

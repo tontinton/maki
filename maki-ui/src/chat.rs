@@ -18,8 +18,8 @@ use crate::markdown::truncate_output;
 use crate::selection::Selection;
 use maki_agent::tools::{ToolInvocation, ToolRegistry};
 use maki_agent::{
-    AgentEvent, BatchToolStatus, BufferSnapshot, NO_FILES_FOUND, QuestionInfo, ToolDoneEvent,
-    ToolOutput, ToolStartEvent,
+    AgentEvent, BatchToolStatus, BufferSnapshot, NO_FILES_FOUND, QuestionInfo, SharedBuf,
+    ToolDoneEvent, ToolOutput, ToolStartEvent,
 };
 use maki_config::{ToolOutputLines, UiConfig};
 use maki_providers::{ContentBlock, Message, Role, TokenUsage};
@@ -229,6 +229,10 @@ impl Chat {
 
     pub fn tool_snapshot(&mut self, tool_id: &str, snapshot: BufferSnapshot) {
         self.messages_panel.tool_snapshot(tool_id, snapshot);
+    }
+
+    pub fn register_live_buf(&mut self, id: String, buf: Arc<SharedBuf>) {
+        self.messages_panel.register_live_buf(id, buf);
     }
 
     pub fn stream_reset(&mut self) {

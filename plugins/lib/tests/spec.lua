@@ -350,9 +350,8 @@ case("text_input_is_empty", function()
 end)
 
 local ListPicker = require("maki.list_picker")
-local highlight_to_view = require("maki.highlight")
 
-case("highlight_to_view_number_width_scales", function()
+case("set_highlight_number_width_scales", function()
   local buf = mock_buf()
   local view = ToolView.new(buf, { max_lines = 200 })
   local lines = {}
@@ -360,7 +359,7 @@ case("highlight_to_view_number_width_scales", function()
     lines[i] = "x"
   end
   local content = table.concat(lines, "\n")
-  local ok = highlight_to_view(view, content, "txt")
+  local ok = view:set_highlight(content, "txt")
   eq(ok, true)
   eq(view.ring_count, 100)
   local first_nr = buf.lines[1][1][1]
