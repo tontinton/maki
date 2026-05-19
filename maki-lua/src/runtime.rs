@@ -36,6 +36,7 @@ const NIL_WITHOUT_FINISH_MSG: &str =
     "handler returned nil without calling ctx:finish() or starting jobs";
 const MAX_INFLIGHT_TOOLS: usize = 64;
 const GC_STEP_INTERVAL: usize = 4;
+const INTERRUPT_CANCEL_CHECK_INTERVAL: u32 = 128;
 const ASYNC_RUN_DEFAULT_DEADLINE: Duration = Duration::from_secs(60);
 
 pub type LoadResult = Result<(), PluginError>;
@@ -425,12 +426,19 @@ impl LuaRuntime {
 
         let interrupt_shutdown = Arc::clone(&shutdown);
         let interrupt_lua = lua.clone();
+        let interrupt_tick = Cell::new(0u32);
         lua.set_interrupt(move |_| {
             if interrupt_shutdown.load(Ordering::Acquire) {
                 return Err(mlua::Error::runtime(INTERRUPT_MSG));
             }
-            // current_thread() panics without a free stack slot.
-            // OK to skip: the global shutdown check above still fires every tick.
+            let tick = interrupt_tick.get().wrapping_add(1);
+            interrupt_tick.set(tick);
+            if tick % INTERRUPT_CANCEL_CHECK_INTERVAL != 0 {
+                return Ok(VmState::Continue);
+            }
+            // current_thread() pushes onto the Lua stack which is unsafe in
+            // interrupts (luau-lang/luau#446). Rate-limit this check to avoid
+            // exhausting the auxiliary stack in long-running coroutines.
             let thread = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 interrupt_lua.current_thread()
             }));
