@@ -54,11 +54,10 @@ impl UserData for WinHandle {
                 return Ok(mlua::Value::Nil);
             }
             match this.event_rx.recv_async().await {
-                Ok(WinEvent::Key { key, cursor }) => {
+                Ok(WinEvent::Key { key }) => {
                     let tbl = lua.create_table()?;
                     tbl.set("type", "key")?;
                     tbl.set("key", key)?;
-                    tbl.set("cursor", cursor + 1)?;
                     Ok(mlua::Value::Table(tbl))
                 }
                 Ok(WinEvent::Resize { width, height }) => {
@@ -66,6 +65,12 @@ impl UserData for WinHandle {
                     tbl.set("type", "resize")?;
                     tbl.set("width", width)?;
                     tbl.set("height", height)?;
+                    Ok(mlua::Value::Table(tbl))
+                }
+                Ok(WinEvent::Paste { text }) => {
+                    let tbl = lua.create_table()?;
+                    tbl.set("type", "paste")?;
+                    tbl.set("text", text)?;
                     Ok(mlua::Value::Table(tbl))
                 }
                 Ok(WinEvent::Close) => {
@@ -108,6 +113,9 @@ impl UserData for WinHandle {
             }
             if let Ok(cl) = opts.get::<bool>("cursor_line") {
                 patch.cursor_line = Some(cl);
+            }
+            if let Ok(rt) = opts.get::<usize>("reserved_top") {
+                patch.reserved_top = Some(rt);
             }
             patch.width = try_parse_dimension(&opts, "width");
             patch.height = try_parse_dimension(&opts, "height");
@@ -165,5 +173,25 @@ mod tests {
         let (_event_tx, cmd_rx, handle) = make_channels();
         drop(handle);
         assert!(matches!(cmd_rx.try_recv(), Ok(WinCommand::Close)));
+    }
+
+    #[test]
+    fn drop_after_close_does_not_resend() {
+        let (_event_tx, cmd_rx, mut handle) = make_channels();
+        handle.close();
+        assert!(matches!(cmd_rx.try_recv(), Ok(WinCommand::Close)));
+        drop(handle);
+        assert!(cmd_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn close_does_not_panic_when_receiver_dropped() {
+        let (event_tx, event_rx) = flume::bounded::<WinEvent>(8);
+        let (cmd_tx, cmd_rx) = flume::bounded::<WinCommand>(8);
+        let mut handle = WinHandle::new(event_rx, cmd_tx, 80, 24);
+        drop(cmd_rx);
+        handle.close();
+        assert!(handle.closed);
+        drop(event_tx);
     }
 }

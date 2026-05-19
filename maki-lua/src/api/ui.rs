@@ -53,6 +53,17 @@ pub(crate) fn create_ui_table(
         })?,
     )?;
 
+    t.set(
+        "terminal_size",
+        lua.create_function(|lua, ()| {
+            let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+            let tbl = lua.create_table()?;
+            tbl.set("cols", cols)?;
+            tbl.set("rows", rows)?;
+            Ok(tbl)
+        })?,
+    )?;
+
     if let Some(tx) = ui_action_tx {
         let flash_tx = tx.clone();
         t.set(
@@ -94,6 +105,7 @@ pub(crate) fn create_ui_table(
                     let cursor_line: bool = opts_tbl.get("cursor_line").unwrap_or(false);
                     let footer = parse_footer(&opts_tbl)?;
                     let reserved_bottom: usize = opts_tbl.get("reserved_bottom").unwrap_or(0);
+                    let reserved_top: usize = opts_tbl.get("reserved_top").unwrap_or(0);
                     let focus: bool = opts_tbl
                         .get::<Option<bool>>("focus")
                         .ok()
@@ -122,6 +134,7 @@ pub(crate) fn create_ui_table(
                         zindex,
                         cursor_line,
                         reserved_bottom,
+                        reserved_top,
                     };
 
                     let (term_cols, term_rows) = crossterm::terminal::size().unwrap_or((80, 24));
@@ -223,4 +236,249 @@ fn segments_to_lua_lines(
         result.raw_set(i32::try_from(i + 1).unwrap(), line_tbl)?;
     }
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use maki_highlight::StyledSegment;
+    use mlua::Lua;
+    use test_case::test_case;
+
+    const MISSING_KEY: &str = "missing";
+    const ORANGE_HEX: &str = "#ff8000";
+
+    fn footer_entry(lua: &Lua, key: &str, label: &str) -> Table {
+        let t = lua.create_table().unwrap();
+        t.raw_set(1, key).unwrap();
+        t.raw_set(2, label).unwrap();
+        t
+    }
+
+    #[test]
+    fn parse_footer_missing_returns_empty() {
+        let lua = Lua::new();
+        let tbl = lua.create_table().unwrap();
+        assert!(parse_footer(&tbl).unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_footer_non_table_value_returns_empty() {
+        let lua = Lua::new();
+        let tbl = lua.create_table().unwrap();
+        tbl.raw_set("footer", "not a table").unwrap();
+        assert!(parse_footer(&tbl).unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_footer_preserves_entry_order() {
+        let lua = Lua::new();
+        let tbl = lua.create_table().unwrap();
+        let entries = lua.create_table().unwrap();
+        entries.raw_set(1, footer_entry(&lua, "q", "quit")).unwrap();
+        entries.raw_set(2, footer_entry(&lua, "j", "down")).unwrap();
+        entries.raw_set(3, footer_entry(&lua, "k", "up")).unwrap();
+        tbl.raw_set("footer", entries).unwrap();
+
+        let parsed = parse_footer(&tbl).unwrap();
+        assert_eq!(
+            parsed,
+            vec![
+                ("q".into(), "quit".into()),
+                ("j".into(), "down".into()),
+                ("k".into(), "up".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_footer_missing_label_errors() {
+        let lua = Lua::new();
+        let tbl = lua.create_table().unwrap();
+        let entries = lua.create_table().unwrap();
+        let one_elem = lua.create_table().unwrap();
+        one_elem.raw_set(1, "q").unwrap();
+        entries.raw_set(1, one_elem).unwrap();
+        tbl.raw_set("footer", entries).unwrap();
+
+        assert!(parse_footer(&tbl).is_err());
+    }
+
+    #[test]
+    fn parse_footer_non_string_element_errors() {
+        let lua = Lua::new();
+        let tbl = lua.create_table().unwrap();
+        let entries = lua.create_table().unwrap();
+        let bad = lua.create_table().unwrap();
+        bad.raw_set(1, "q").unwrap();
+        bad.raw_set(2, lua.create_table().unwrap()).unwrap();
+        entries.raw_set(1, bad).unwrap();
+        tbl.raw_set("footer", entries).unwrap();
+
+        assert!(parse_footer(&tbl).is_err());
+    }
+
+    #[test]
+    fn try_parse_dimension_numeric_is_abs() {
+        let lua = Lua::new();
+        let tbl = lua.create_table().unwrap();
+        tbl.raw_set("width", 42u16).unwrap();
+        assert_eq!(try_parse_dimension(&tbl, "width"), Some(Dimension::Abs(42)));
+    }
+
+    #[test_case("0%", Dimension::Percent(0) ; "zero_percent")]
+    #[test_case("50%", Dimension::Percent(50) ; "half_percent")]
+    #[test_case("100%", Dimension::Percent(100) ; "full_percent")]
+    #[test_case("200%", Dimension::Percent(200) ; "over_hundred_accepted")]
+    fn try_parse_dimension_percent_strings(input: &str, expected: Dimension) {
+        let lua = Lua::new();
+        let tbl = lua.create_table().unwrap();
+        tbl.raw_set("width", input).unwrap();
+        assert_eq!(try_parse_dimension(&tbl, "width"), Some(expected));
+    }
+
+    #[test]
+    fn try_parse_dimension_missing_key_is_none() {
+        let lua = Lua::new();
+        let tbl = lua.create_table().unwrap();
+        assert!(try_parse_dimension(&tbl, MISSING_KEY).is_none());
+    }
+
+    #[test]
+    fn try_parse_dimension_non_numeric_string_is_none() {
+        let lua = Lua::new();
+        let tbl = lua.create_table().unwrap();
+        tbl.raw_set("width", "abc").unwrap();
+        assert!(try_parse_dimension(&tbl, "width").is_none());
+    }
+
+    #[test]
+    fn try_parse_dimension_malformed_percent_is_none() {
+        let lua = Lua::new();
+        let tbl = lua.create_table().unwrap();
+        tbl.raw_set("width", "xx%").unwrap();
+        assert!(try_parse_dimension(&tbl, "width").is_none());
+    }
+
+    #[test]
+    fn parse_dimension_missing_key_uses_default() {
+        let lua = Lua::new();
+        let tbl = lua.create_table().unwrap();
+        let default = Dimension::Percent(60);
+        assert_eq!(parse_dimension(&tbl, MISSING_KEY, default), default);
+    }
+
+    #[test]
+    fn parse_dimension_invalid_value_uses_default() {
+        let lua = Lua::new();
+        let tbl = lua.create_table().unwrap();
+        tbl.raw_set("width", "garbage").unwrap();
+        let default = Dimension::Abs(80);
+        assert_eq!(parse_dimension(&tbl, "width", default), default);
+    }
+
+    #[test_case("NW", Anchor::NW ; "nw")]
+    #[test_case("NE", Anchor::NE ; "ne")]
+    #[test_case("SW", Anchor::SW ; "sw")]
+    #[test_case("SE", Anchor::SE ; "se")]
+    #[test_case("garbage", Anchor::NW ; "invalid_falls_back_to_default")]
+    fn parse_anchor_cases(input: &str, expected: Anchor) {
+        let lua = Lua::new();
+        let tbl = lua.create_table().unwrap();
+        tbl.raw_set("anchor", input).unwrap();
+        assert_eq!(parse_anchor(&tbl), expected);
+    }
+
+    #[test]
+    fn parse_anchor_missing_uses_default() {
+        let lua = Lua::new();
+        let tbl = lua.create_table().unwrap();
+        assert_eq!(parse_anchor(&tbl), Anchor::default());
+    }
+
+    #[test_case("none", Border::None ; "none")]
+    #[test_case("single", Border::Single ; "single")]
+    #[test_case("double", Border::Double ; "double")]
+    #[test_case("rounded", Border::Rounded ; "rounded")]
+    #[test_case("garbage", Border::Rounded ; "invalid_falls_back_to_default")]
+    fn parse_border_cases(input: &str, expected: Border) {
+        let lua = Lua::new();
+        let tbl = lua.create_table().unwrap();
+        tbl.raw_set("border", input).unwrap();
+        assert_eq!(parse_border(&tbl), expected);
+    }
+
+    #[test]
+    fn parse_border_missing_uses_default() {
+        let lua = Lua::new();
+        let tbl = lua.create_table().unwrap();
+        assert_eq!(parse_border(&tbl), Border::default());
+    }
+
+    #[test_case("left", TitlePos::Left ; "left")]
+    #[test_case("center", TitlePos::Center ; "center")]
+    #[test_case("right", TitlePos::Right ; "right")]
+    #[test_case("garbage", TitlePos::Left ; "invalid_falls_back_to_default")]
+    fn parse_title_pos_cases(input: &str, expected: TitlePos) {
+        let lua = Lua::new();
+        let tbl = lua.create_table().unwrap();
+        tbl.raw_set("title_pos", input).unwrap();
+        assert_eq!(parse_title_pos(&tbl), expected);
+    }
+
+    fn seg(text: &str, bold: bool) -> StyledSegment {
+        StyledSegment {
+            text: text.into(),
+            fg: (255, 128, 0),
+            bold,
+            italic: false,
+            underline: false,
+        }
+    }
+
+    #[test]
+    fn segments_to_lua_lines_empty_input() {
+        let lua = Lua::new();
+        let result = segments_to_lua_lines(&lua, &[]).unwrap();
+        assert_eq!(result.len().unwrap(), 0);
+    }
+
+    #[test]
+    fn segments_to_lua_lines_shape_and_fg_hex() {
+        let lua = Lua::new();
+        let lines = vec![vec![seg("fn ", true), seg("main", false)]];
+        let result = segments_to_lua_lines(&lua, &lines).unwrap();
+
+        assert_eq!(result.len().unwrap(), 1);
+        let line: Table = result.get(1).unwrap();
+        assert_eq!(line.len().unwrap(), 2);
+
+        let span: Table = line.get(1).unwrap();
+        let text: String = span.get(1).unwrap();
+        assert_eq!(text, "fn ");
+        let style: Table = span.get(2).unwrap();
+        let fg: String = style.get("fg").unwrap();
+        assert_eq!(fg, ORANGE_HEX);
+        let bold: bool = style.get("bold").unwrap();
+        assert!(bold);
+        assert!(style.get::<Option<bool>>("italic").unwrap().is_none());
+
+        let span2: Table = line.get(2).unwrap();
+        let text2: String = span2.get(1).unwrap();
+        assert_eq!(text2, "main");
+        let style2: Table = span2.get(2).unwrap();
+        assert!(style2.get::<Option<bool>>("bold").unwrap().is_none());
+    }
+
+    #[test]
+    fn segments_to_lua_lines_preserves_utf8() {
+        let lua = Lua::new();
+        let utf8 = "héllo 🦀 ✨";
+        let lines = vec![vec![seg(utf8, false)]];
+        let result = segments_to_lua_lines(&lua, &lines).unwrap();
+        let line: Table = result.get(1).unwrap();
+        let span: Table = line.get(1).unwrap();
+        let text: String = span.get(1).unwrap();
+        assert_eq!(text, utf8);
+    }
 }

@@ -25,9 +25,8 @@ impl App {
         self.status_bar.clear_expired_hint();
 
         let in_plan = self.state.mode == Mode::Plan;
-        let form_visible = self.permission_prompt.is_open()
-            || self.question_form.is_visible()
-            || (in_plan && self.plan_form.is_visible());
+        let form_visible =
+            self.permission_prompt.is_open() || (in_plan && self.plan_form.is_visible());
         let layout = self.compute_layout(frame, form_visible);
         let render_chat = self.resolve_render_chat();
 
@@ -47,10 +46,8 @@ impl App {
             let max = area.height.saturating_sub(3);
             if self.permission_prompt.is_open() {
                 self.permission_prompt.height(area.width).min(max)
-            } else if self.plan_form.is_visible() {
-                self.plan_form.height().min(max)
             } else {
-                self.question_form.height(area.width).min(max)
+                self.plan_form.height().min(max)
             }
         } else if self.is_main_chat() {
             queue_panel::height(self.queue.len())
@@ -119,8 +116,6 @@ impl App {
         let in_plan = self.state.mode == Mode::Plan;
         if self.permission_prompt.is_open() {
             self.permission_prompt.view(frame, layout.bottom_area);
-        } else if self.question_form.is_visible() {
-            self.question_form.view(frame, layout.bottom_area);
         } else if !self.is_main_chat() {
             let todo_h = self.chats[self.active_chat].todo_panel.height();
             let (todo_area, sep_area) = if todo_h > 0 {
@@ -332,9 +327,7 @@ impl App {
     #[cfg(test)]
     pub(super) fn active_keybind_contexts(&self) -> Vec<KeybindContext> {
         let mut contexts = vec![KeybindContext::General];
-        if self.question_form.is_visible()
-            || (self.state.mode == Mode::Plan && self.plan_form.is_visible())
-        {
+        if self.state.mode == Mode::Plan && self.plan_form.is_visible() {
             contexts.push(KeybindContext::FormInput);
         } else if self.queue.focus().is_some() {
             contexts.push(KeybindContext::QueueFocus);

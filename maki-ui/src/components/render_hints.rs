@@ -1,7 +1,7 @@
 use crate::markdown::Keep;
 use maki_agent::tools::{
     CODE_EXECUTION_TOOL_NAME, EDIT_TOOL_NAME, GLOB_TOOL_NAME, GREP_TOOL_NAME, MULTIEDIT_TOOL_NAME,
-    READ_TOOL_NAME, TASK_TOOL_NAME, WRITE_TOOL_NAME,
+    QUESTION_TOOL_NAME, READ_TOOL_NAME, TASK_TOOL_NAME, WRITE_TOOL_NAME,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -89,6 +89,7 @@ const DEFAULT_HINTS: &[(&str, ToolRenderHints)] = &[
     hint!(WRITE_TOOL_NAME, header_style: HeaderStyle::Path),
     hint!(EDIT_TOOL_NAME, header_style: HeaderStyle::Path),
     hint!(MULTIEDIT_TOOL_NAME, header_style: HeaderStyle::Path),
+    hint!(QUESTION_TOOL_NAME, truncate_lines: Some(100)),
 ];
 
 pub struct RenderHintsRegistry {

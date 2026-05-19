@@ -228,7 +228,9 @@ impl MessagesPanel {
         }
 
         match &event.output {
-            ToolOutput::Plain(text) | ToolOutput::ReadDir { text, .. }
+            ToolOutput::Plain(text)
+            | ToolOutput::Markdown(text)
+            | ToolOutput::ReadDir { text, .. }
                 if msg.render_snapshot.is_none() =>
             {
                 let limits = output_limits_from_hints(&event.tool, hints, &self.tool_output_lines);
@@ -237,10 +239,6 @@ impl MessagesPanel {
                 if !tr.kept.is_empty() {
                     msg.text = format!("{}\n{}", msg.text, tr.kept);
                 }
-            }
-            ToolOutput::QuestionAnswers(pairs) => {
-                let n = pairs.len();
-                msg.text = format!("{n} question{} answered", if n == 1 { "" } else { "s" });
             }
             ToolOutput::GrepResult { entries } if entries.is_empty() => {
                 msg.text = format!("{}\n{NO_FILES_FOUND}", msg.text);

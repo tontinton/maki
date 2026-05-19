@@ -80,10 +80,6 @@ impl App {
         self.chat_index.clear();
         self.status = super::Status::Idle;
         self.queue.clear();
-        #[cfg(feature = "demo")]
-        {
-            self.demo_questions = None;
-        }
         self.close_all_overlays();
         self.pending_input = PendingInput::None;
         self.status_bar.clear_flash();

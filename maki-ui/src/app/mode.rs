@@ -19,7 +19,7 @@ pub(crate) enum Mode {
 
 pub(crate) enum PlanTrigger {
     WriteDone,
-    QuestionAsked,
+    InteractivePrompt,
 }
 
 impl Mode {
@@ -73,7 +73,7 @@ impl PlanState {
 }
 
 impl App {
-    pub(super) fn transition_plan(&mut self, trigger: PlanTrigger) {
+    pub(crate) fn transition_plan(&mut self, trigger: PlanTrigger) {
         if self.state.mode != Mode::Plan {
             return;
         }
@@ -85,7 +85,7 @@ impl App {
                 self.state.plan.mark_ready();
                 self.plan_form.on_plan_ready();
             }
-            PlanTrigger::QuestionAsked => {
+            PlanTrigger::InteractivePrompt => {
                 if self.state.plan.is_ready() {
                     self.state.plan.mark_drafting();
                     self.plan_form.on_plan_drafting();

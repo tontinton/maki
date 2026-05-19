@@ -37,21 +37,3 @@ pub(crate) fn selected_prefix(t: &Theme, is_selected: bool) -> (&'static str, St
         ("  ", Style::new().fg(t.foreground))
     }
 }
-
-macro_rules! overlay_impl {
-    ($ty:ty) => {
-        impl $crate::components::Overlay for $ty {
-            fn is_open(&self) -> bool {
-                self.visible
-            }
-            fn is_modal(&self) -> bool {
-                false
-            }
-            fn close(&mut self) {
-                // delegates to inherent close(), not trait (would recurse)
-                Self::close(self);
-            }
-        }
-    };
-}
-pub(crate) use overlay_impl;

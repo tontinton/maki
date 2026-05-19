@@ -62,6 +62,7 @@ pub const DEFAULT_BUILTINS: &[&str] = &[
     "glob",
     "index",
     "memory",
+    "question",
     "skill",
     "webfetch",
     "websearch",

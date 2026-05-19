@@ -112,7 +112,7 @@ Execute Python code in a sandboxed interpreter. Tools are available as callable 
 | `code` | string | yes |  | Python code to execute. Tools are async functions that return strings (not objects). You MUST await every call: `result = await read(path='/file')`. Use `await asyncio.gather(...)` for concurrency. |
 | `timeout` | integer | no | 30, max 300 | Timeout in seconds |
 
-### `question`
+### `question` *(lua plugin)*
 
 Use this tool when you need to ask the user questions during execution. This allows you to:
 - Gather user preferences or requirements

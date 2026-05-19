@@ -97,7 +97,7 @@ pub(crate) fn tool_output_annotation(output: &ToolOutput) -> Option<String> {
             let n = text.lines().count();
             Some(format!("{n} entries"))
         }
-        ToolOutput::Plain(text) => {
+        ToolOutput::Plain(text) | ToolOutput::Markdown(text) => {
             let n = text.lines().count();
             Some(format!("{n} lines"))
         }
@@ -248,10 +248,10 @@ impl HighlightRequest {
             | ToolOutput::GrepResult { .. }
             | ToolOutput::Instructions { .. } => Some(o),
             ToolOutput::Plain(_)
+            | ToolOutput::Markdown(_)
             | ToolOutput::ReadDir { .. }
             | ToolOutput::TodoList(_)
-            | ToolOutput::Batch { .. }
-            | ToolOutput::QuestionAnswers(_) => None,
+            | ToolOutput::Batch { .. } => None,
         });
         if input.is_none() && output.is_none() {
             return None;
@@ -368,7 +368,7 @@ fn resolve_output<'a>(
     limits: RenderLimits,
     keep: Keep,
 ) -> ResolvedOutput<'a> {
-    if let Some(ToolOutput::Batch { .. } | ToolOutput::QuestionAnswers(_)) = output {
+    if let Some(ToolOutput::Batch { .. }) = output {
         return ResolvedOutput {
             text: None,
             full_text: None,
@@ -377,7 +377,7 @@ fn resolve_output<'a>(
     }
 
     let full_text: Option<Cow<'a, str>> = match output {
-        Some(ToolOutput::Plain(t)) => Some(Cow::Borrowed(t.as_str())),
+        Some(ToolOutput::Plain(t) | ToolOutput::Markdown(t)) => Some(Cow::Borrowed(t.as_str())),
         Some(ToolOutput::ReadDir { text, .. }) => Some(Cow::Borrowed(text.as_str())),
         _ => None,
     };
@@ -471,6 +471,12 @@ impl ToolLineBuilder {
             keep: output_limits.keep,
             header_style: hints.header_style,
             body_format: hints.body_format,
+        }
+    }
+
+    fn apply_output_format(&mut self, output: Option<&ToolOutput>) {
+        if output.is_some_and(ToolOutput::is_markdown) {
+            self.body_format = BodyFormat::Markdown;
         }
     }
 
@@ -735,6 +741,7 @@ pub fn build_tool_lines(
     };
 
     let mut b = ToolLineBuilder::new(rctx.width, "", expanded, limits, hints);
+    b.apply_output_format(msg.tool_output.as_deref());
     b.push_header(
         tool_name,
         header,
@@ -748,7 +755,7 @@ pub fn build_tool_lines(
             .tool_output
             .as_ref()
             .and_then(|o| match o.as_ref() {
-                ToolOutput::Plain(t) => Some(t.as_str()),
+                ToolOutput::Plain(t) | ToolOutput::Markdown(t) => Some(t.as_str()),
                 _ => None,
             })
             .or(body);
@@ -791,6 +798,7 @@ pub fn build_batch_entry_lines(
     }
 
     let mut b = ToolLineBuilder::new(rctx.width, BATCH_INDENT, expanded, limits, hints);
+    b.apply_output_format(entry.output.as_ref());
     b.push_header(
         &entry.tool,
         &entry.summary,
@@ -801,7 +809,7 @@ pub fn build_batch_entry_lines(
     b.push_code_content(entry.input.as_ref(), entry.output.as_ref());
     if let Some(snap) = child_state.and_then(|s| s.snapshot.as_ref()) {
         let search_text = entry.output.as_ref().and_then(|o| match o {
-            ToolOutput::Plain(t) => Some(t.as_str()),
+            ToolOutput::Plain(t) | ToolOutput::Markdown(t) => Some(t.as_str()),
             _ => None,
         });
         b.push_snapshot(snap, search_text);

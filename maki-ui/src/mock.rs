@@ -5,14 +5,13 @@ use maki_agent::tools::{
 };
 use maki_agent::{
     AgentEvent, BatchToolEntry, BatchToolStatus, Envelope, GrepFileEntry, GrepMatchGroup,
-    QuestionInfo, QuestionOption, SubagentInfo, TodoItem, TodoPriority, TodoStatus, ToolDoneEvent,
-    ToolInput, ToolOutput, ToolStartEvent, TurnCompleteEvent,
+    SubagentInfo, TodoItem, TodoPriority, TodoStatus, ToolDoneEvent, ToolInput, ToolOutput,
+    ToolStartEvent, TurnCompleteEvent,
 };
 use maki_providers::{Message, TokenUsage};
 
 const TASK_TOOL_ID: &str = "t_task";
 const TASK_TOOL_ID_2: &str = "t_task2";
-const QUESTION_TOOL_ID: &str = "t_qform";
 
 pub enum MockEvent {
     User(String),
@@ -95,68 +94,6 @@ fn turn_complete() -> AgentEvent {
         model: "mock".into(),
         context_size: None,
     }))
-}
-
-pub fn mock_questions() -> Vec<QuestionInfo> {
-    vec![
-        QuestionInfo {
-            question: "What language do you want to use?".into(),
-            header: "Language".into(),
-            options: vec![
-                QuestionOption {
-                    label: "TypeScript".into(),
-                    description: "Popular for web".into(),
-                },
-                QuestionOption {
-                    label: "Rust".into(),
-                    description: "Fast and safe".into(),
-                },
-                QuestionOption {
-                    label: "Go".into(),
-                    description: "Simple concurrency".into(),
-                },
-            ],
-            multiple: false,
-        },
-        QuestionInfo {
-            question: "Which framework do you prefer?".into(),
-            header: "Framework".into(),
-            options: vec![
-                QuestionOption {
-                    label: "Next.js".into(),
-                    description: "React SSR".into(),
-                },
-                QuestionOption {
-                    label: "tRPC".into(),
-                    description: "End-to-end typesafe".into(),
-                },
-                QuestionOption {
-                    label: "SvelteKit".into(),
-                    description: "Compiler-based".into(),
-                },
-            ],
-            multiple: true,
-        },
-        QuestionInfo {
-            question: "What database should we use?".into(),
-            header: "Database".into(),
-            options: vec![
-                QuestionOption {
-                    label: "PostgreSQL".into(),
-                    description: "Relational".into(),
-                },
-                QuestionOption {
-                    label: "SQLite".into(),
-                    description: "Embedded".into(),
-                },
-            ],
-            multiple: false,
-        },
-    ]
-}
-
-pub fn question_tool_id() -> &'static str {
-    QUESTION_TOOL_ID
 }
 
 #[allow(clippy::vec_init_then_push)]
@@ -931,14 +868,14 @@ print(f'Total lines across config: {total}')"
             text: "I need to ask the user about their preferences before scaffolding the project."
                 .into(),
         },
-        QUESTION_TOOL_ID,
+        "t_qform",
         "Project setup",
         Some("Help me set up a new web project."),
     ));
 
     events.push(sub_evt(
-        tool_start(QUESTION_TOOL_ID, QUESTION_TOOL_NAME, "3 questions", None),
-        QUESTION_TOOL_ID,
+        tool_start("t_qform", QUESTION_TOOL_NAME, "3 questions", None),
+        "t_qform",
         "Project setup",
         None,
     ));
@@ -968,7 +905,7 @@ mod tests {
     fn mock_events_tool_starts_have_matching_dones() {
         let mut starts = HashSet::new();
         let mut dones = HashSet::new();
-        let intentionally_in_progress = ["t_bash_ip", QUESTION_TOOL_ID];
+        let intentionally_in_progress = ["t_bash_ip", "t_qform"];
 
         for event in mock_events() {
             let MockEvent::Agent(envelope) = event else {
@@ -995,10 +932,5 @@ mod tests {
                 assert!(dones.contains(id), "tool {id} started but never finished");
             }
         }
-    }
-
-    #[test]
-    fn mock_questions_non_empty() {
-        assert!(!mock_questions().is_empty());
     }
 }

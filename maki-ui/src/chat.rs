@@ -18,8 +18,8 @@ use crate::markdown::truncate_output;
 use crate::selection::Selection;
 use maki_agent::tools::{ToolInvocation, ToolRegistry};
 use maki_agent::{
-    AgentEvent, BatchToolStatus, BufferSnapshot, QuestionInfo, SharedBuf, ToolDoneEvent,
-    ToolOutput, ToolStartEvent,
+    AgentEvent, BatchToolStatus, BufferSnapshot, SharedBuf, ToolDoneEvent, ToolOutput,
+    ToolStartEvent,
 };
 use maki_config::{ToolOutputLines, UiConfig};
 use maki_providers::{ContentBlock, Message, Role, TokenUsage};
@@ -39,9 +39,6 @@ pub enum ChatEventResult {
         image_count: usize,
     },
     Error(String),
-    QuestionPrompt {
-        questions: Vec<QuestionInfo>,
-    },
     PermissionRequest {
         id: String,
         tool: String,
@@ -110,9 +107,6 @@ impl Chat {
                     e.output,
                     e.summary.as_deref(),
                 );
-            }
-            AgentEvent::QuestionPrompt { questions, .. } => {
-                return ChatEventResult::QuestionPrompt { questions };
             }
             AgentEvent::TurnComplete(_) => {}
             AgentEvent::ToolResultsSubmitted { .. } => {

@@ -2,10 +2,10 @@ use super::segment;
 use super::*;
 use crate::components::scrollbar::SCROLLBAR_THUMB;
 use crate::selection::{Selection, SelectionZone};
-use maki_agent::tools::{BASH_TOOL_NAME, GREP_TOOL_NAME, QUESTION_TOOL_NAME, WRITE_TOOL_NAME};
+use maki_agent::tools::{BASH_TOOL_NAME, GREP_TOOL_NAME, WRITE_TOOL_NAME};
 use maki_agent::{
-    BatchToolEntry, GrepFileEntry, GrepMatchGroup, QuestionAnswer, SnapshotLine, SnapshotSpan,
-    SpanStyle, ToolInput, ToolOutput,
+    BatchToolEntry, GrepFileEntry, GrepMatchGroup, SnapshotLine, SnapshotSpan, SpanStyle,
+    ToolInput, ToolOutput,
 };
 use ratatui::backend::TestBackend;
 use test_case::test_case;
@@ -394,29 +394,6 @@ fn tool_done_after_cancel_in_progress_does_not_underflow() {
     });
     assert_eq!(panel.in_progress_count(), 0);
     assert_eq!(msg_status(&panel, "t1"), ToolStatus::Success);
-}
-
-#[test]
-fn question_tool_renders_summary() {
-    let mut panel = MessagesPanel::new(UiConfig::default());
-    panel.tool_start(start("q1", QUESTION_TOOL_NAME));
-    panel.tool_done(ToolDoneEvent {
-        id: "q1".into(),
-        tool: QUESTION_TOOL_NAME.into(),
-        output: ToolOutput::QuestionAnswers(vec![
-            QuestionAnswer {
-                question: "Q1".into(),
-                answer: "A1".into(),
-            },
-            QuestionAnswer {
-                question: "Q2".into(),
-                answer: "A2".into(),
-            },
-        ]),
-        is_error: false,
-    });
-    rebuild(&mut panel);
-    assert_eq!(panel.messages[0].text, "2 questions answered");
 }
 
 #[test]

@@ -64,36 +64,6 @@ impl GrepFileEntry {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct QuestionAnswer {
-    pub question: String,
-    pub answer: String,
-}
-
-#[derive(Args, Debug, Clone, Serialize, Deserialize)]
-pub struct QuestionOption {
-    #[param(description = "Option label")]
-    pub label: String,
-    #[serde(default)]
-    #[param(description = "Option description")]
-    pub description: String,
-}
-
-#[derive(Args, Debug, Clone, Serialize, Deserialize)]
-pub struct QuestionInfo {
-    #[param(description = "The question text")]
-    pub question: String,
-    #[serde(default)]
-    #[param(description = "Short tab header for the question")]
-    pub header: String,
-    #[serde(default)]
-    #[param(description = "List of predefined options")]
-    pub options: Vec<QuestionOption>,
-    #[serde(default)]
-    #[param(description = "Whether multiple options can be selected")]
-    pub multiple: bool,
-}
-
 #[derive(Args, Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TodoItem {
     #[param(description = "Task description")]
@@ -174,6 +144,7 @@ fn append_instructions(out: &mut String, blocks: &[InstructionBlock]) {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ToolOutput {
     Plain(String),
+    Markdown(String),
     ReadCode {
         path: String,
         start_line: usize,
@@ -208,7 +179,6 @@ pub enum ToolOutput {
         entries: Vec<BatchToolEntry>,
         text: String,
     },
-    QuestionAnswers(Vec<QuestionAnswer>),
     Instructions {
         blocks: Vec<InstructionBlock>,
     },
@@ -243,6 +213,10 @@ impl ToolOutput {
             .map(|b| b.to_vec())
     }
 
+    pub fn is_markdown(&self) -> bool {
+        matches!(self, Self::Markdown(_))
+    }
+
     pub fn structured_display_text(&self) -> Option<String> {
         match self {
             Self::Diff { .. }
@@ -259,7 +233,7 @@ impl ToolOutput {
         match self {
             Self::GrepResult { entries } => entries.is_empty(),
             Self::ReadDir { text, .. } => text.is_empty(),
-            Self::Plain(text) => text.is_empty(),
+            Self::Plain(text) | Self::Markdown(text) => text.is_empty(),
 
             _ => false,
         }
@@ -282,7 +256,7 @@ impl ToolOutput {
 
     pub fn as_display_text(&self) -> String {
         match self {
-            Self::Plain(s) => s.clone(),
+            Self::Plain(s) | Self::Markdown(s) => s.clone(),
 
             Self::ReadDir { text, .. } => text.clone(),
             Self::ReadCode {
@@ -357,14 +331,6 @@ impl ToolOutput {
                 out
             }
             Self::Batch { text, .. } => text.clone(),
-            Self::QuestionAnswers(pairs) => {
-                let mut table = String::from("| Question | Answer |\n|----------|--------|\n");
-                for pair in pairs {
-                    table.push_str(&format!("| {} | {} |\n", pair.question, pair.answer));
-                }
-                table.truncate(table.trim_end().len());
-                table
-            }
             Self::Instructions { blocks } => {
                 let mut out = String::new();
                 append_instructions(&mut out, blocks);
@@ -456,10 +422,6 @@ pub enum AgentEvent {
     TurnComplete(Box<TurnCompleteEvent>),
     ToolResultsSubmitted {
         message: Box<Message>,
-    },
-    QuestionPrompt {
-        id: String,
-        questions: Vec<QuestionInfo>,
     },
     QueueItemConsumed {
         text: String,

@@ -10,8 +10,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventK
 use maki_agent::permissions::PermissionManager;
 use maki_agent::{
     ImageMediaType, McpConfigErrors, McpServerInfo, McpServerStatus, McpSnapshot,
-    McpSnapshotReader, QuestionInfo, QuestionOption, TodoItem, TodoPriority, TodoStatus,
-    ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent,
+    McpSnapshotReader, TodoItem, TodoPriority, TodoStatus, ToolDoneEvent, ToolOutput,
+    ToolStartEvent, TurnCompleteEvent,
 };
 use maki_config::{PermissionsConfig, UiConfig};
 use maki_lua::LuaCommandReader;
@@ -278,25 +278,6 @@ fn paste_normalizes_line_endings(input: &str, expected: &str) {
     let mut app = test_app();
     app.update(Msg::Paste(input.into()));
     assert_eq!(app.input_box.buffer.value(), expected);
-}
-
-#[test]
-fn paste_routed_to_question_form_in_custom_mode() {
-    let mut app = test_app();
-    app.question_form.open(vec![QuestionInfo {
-        question: "Pick one".into(),
-        header: String::new(),
-        options: vec![QuestionOption {
-            label: "A".into(),
-            description: String::new(),
-        }],
-        multiple: false,
-    }]);
-    app.update(Msg::Key(key(KeyCode::Down)));
-    app.update(Msg::Key(key(KeyCode::Enter)));
-
-    app.update(Msg::Paste("pasted".into()));
-    assert_eq!(app.input_box.buffer.value(), "");
 }
 
 #[test]
@@ -821,77 +802,12 @@ fn compact_during_streaming_queues_item() {
     assert_eq!(app.queue.entries()[0].text, "/compact");
 }
 
-fn long_question_no_options() -> AgentEvent {
-    let long = (0..20)
-        .map(|i| format!("line {i}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    AgentEvent::QuestionPrompt {
-        id: "q1".into(),
-        questions: vec![QuestionInfo {
-            question: long,
-            header: String::new(),
-            options: vec![],
-            multiple: false,
-        }],
-    }
-}
-
-fn short_question_with_options() -> AgentEvent {
-    AgentEvent::QuestionPrompt {
-        id: "q2".into(),
-        questions: vec![QuestionInfo {
-            question: "Pick a DB".into(),
-            header: "DB".into(),
-            options: vec![QuestionOption {
-                label: "PostgreSQL".into(),
-                description: "Relational".into(),
-            }],
-            multiple: false,
-        }],
-    }
-}
-
 #[test]
-fn question_routing_by_suitability() {
-    let cases = [
-        (long_question_no_options(), false, true),
-        (short_question_with_options(), true, false),
-    ];
-    for (event, expect_form, expect_pending) in cases {
-        let mut app = test_app();
-        app.status = Status::Streaming;
-        app.run_id = 1;
-        app.update(agent_msg(event));
-        assert_eq!(app.question_form.is_visible(), expect_form);
-        assert_eq!(app.pending_input == PendingInput::Question, expect_pending);
-    }
-}
-
-#[test]
-fn pending_question_submit_routes_through_answer_tx() {
+fn cancel_clears_pending_input() {
     let mut app = test_app();
     app.status = Status::Streaming;
     app.run_id = 1;
-    let (tx, rx) = flume::unbounded();
-    app.answer_tx = Some(tx);
-
-    app.update(agent_msg(long_question_no_options()));
-    assert_eq!(app.pending_input, PendingInput::Question);
-
-    let actions = type_and_submit(&mut app, "my answer");
-    assert!(actions.is_empty());
-    assert_eq!(app.pending_input, PendingInput::None);
-    assert_eq!(rx.try_recv().unwrap(), "my answer");
-}
-
-#[test_case(PendingInput::Question  ; "question")]
-#[test_case(PendingInput::AuthRetry { subagent_id: None } ; "auth_retry")]
-fn cancel_clears_pending_input(pending: PendingInput) {
-    let mut app = test_app();
-    app.status = Status::Streaming;
-    app.run_id = 1;
-    app.pending_input = pending;
+    app.pending_input = PendingInput::AuthRetry { subagent_id: None };
     cancel_app(&mut app);
     assert_eq!(app.pending_input, PendingInput::None);
 }
@@ -1256,41 +1172,6 @@ fn mouse_down_outside_all_zones_ignored() {
         app.selection_state.is_none(),
         "click outside zones must not create selection"
     );
-}
-
-#[test]
-fn form_submit_pushes_answer_to_chat() {
-    let mut app = test_app();
-    app.status = Status::Streaming;
-    app.run_id = 1;
-    let (tx, rx) = flume::unbounded();
-    app.answer_tx = Some(tx);
-
-    app.update(agent_msg(short_question_with_options()));
-    assert!(app.question_form.is_visible());
-
-    app.update(Msg::Key(key(KeyCode::Enter)));
-    assert!(!app.question_form.is_visible());
-    assert_eq!(
-        app.chats[0].last_message_text(),
-        "Q: Pick a DB\n  → **PostgreSQL**"
-    );
-    assert!(rx.try_recv().is_ok());
-}
-
-#[test]
-fn form_dismiss_does_not_push_to_chat() {
-    let mut app = test_app();
-    app.status = Status::Streaming;
-    app.run_id = 1;
-    let (tx, rx) = flume::unbounded();
-    app.answer_tx = Some(tx);
-
-    app.update(agent_msg(short_question_with_options()));
-    app.update(Msg::Key(key(KeyCode::Esc)));
-    assert!(!app.question_form.is_visible());
-    assert_eq!(app.chats[0].last_message_text(), "");
-    assert_eq!(rx.try_recv().unwrap(), "");
 }
 
 #[test_case(true  ; "non_empty")]
@@ -2199,29 +2080,6 @@ fn done_event_does_not_open_plan_form() {
 }
 
 #[test]
-fn question_demotes_ready_to_drafting() {
-    let mut app = plan_app();
-    assert!(app.state.plan.is_ready());
-    assert!(app.plan_form.is_visible());
-
-    app.update(agent_msg(AgentEvent::QuestionPrompt {
-        id: "q1".into(),
-        questions: vec![QuestionInfo {
-            question: "Pick one".into(),
-            header: "Choice".into(),
-            options: vec![QuestionOption {
-                label: "A".into(),
-                description: String::new(),
-            }],
-            multiple: false,
-        }],
-    }));
-    assert!(matches!(app.state.plan, PlanState::Drafting(_)));
-    assert!(!app.plan_form.is_visible());
-    assert!(app.question_form.is_visible());
-}
-
-#[test]
 fn re_edit_keeps_plan_form_visible() {
     let mut app = plan_app();
     assert!(app.state.plan.is_ready());
@@ -2380,32 +2238,6 @@ fn ctrl_t_toggles_todo_panel_on_subagent_chat() {
         app.chats[1].todo_panel.height() > 0,
         "panel should reappear after second toggle"
     );
-}
-
-#[test]
-fn question_resets_dismiss_then_rewrite_shows() {
-    let mut app = plan_app();
-    dismiss_plan_esc(&mut app);
-    assert!(!app.plan_form.is_visible());
-
-    app.update(agent_msg(AgentEvent::QuestionPrompt {
-        id: "q1".into(),
-        questions: vec![QuestionInfo {
-            question: "Pick one".into(),
-            header: "Choice".into(),
-            options: vec![QuestionOption {
-                label: "A".into(),
-                description: String::new(),
-            }],
-            multiple: false,
-        }],
-    }));
-    assert!(!app.plan_form.is_visible());
-
-    app.update(Msg::Key(key(KeyCode::Enter)));
-
-    rewrite_plan(&mut app);
-    assert!(app.plan_form.is_visible());
 }
 
 #[test]

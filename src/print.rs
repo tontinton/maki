@@ -216,7 +216,6 @@ pub fn run(
             | AgentEvent::AutoCompacting
             | AgentEvent::AuthRequired
             | AgentEvent::PermissionRequest { .. }
-            | AgentEvent::QuestionPrompt { .. }
             | AgentEvent::SubagentHistory { .. }
             | AgentEvent::ToolSnapshot { .. }
             | AgentEvent::ToolHeaderSnapshot { .. }

@@ -4,7 +4,7 @@
 
 mod btw;
 mod image_paste;
-mod mode;
+pub(crate) mod mode;
 mod mouse;
 mod queue;
 mod session;
@@ -35,7 +35,6 @@ use crate::components::mcp_picker::{McpPicker, McpPickerAction};
 use crate::components::model_picker::{ModelPicker, ModelPickerAction};
 use crate::components::permission_prompt::PermissionPrompt;
 use crate::components::plan_form::{PlanForm, PlanFormAction};
-use crate::components::question_form::{QuestionForm, QuestionFormAction};
 use crate::components::rewind_picker::{RewindPicker, RewindPickerAction};
 use crate::components::search_modal::{SearchAction, SearchModal};
 use crate::components::session_picker::{SessionPicker, SessionPickerAction};
@@ -50,8 +49,6 @@ use crate::image;
 use crate::selection::{SelectionState, SelectionZone, ZoneRegistry};
 use arc_swap::{ArcSwap, ArcSwapOption};
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
-#[cfg(feature = "demo")]
-use maki_agent::QuestionInfo;
 use maki_agent::permissions::PermissionManager;
 use maki_agent::{
     AgentEvent, Envelope, ImageSource, McpConfigErrors, McpPromptInfo, McpSnapshotReader,
@@ -109,7 +106,6 @@ impl PickerItem for TaskEntry {
 pub(super) enum PendingInput {
     #[default]
     None,
-    Question,
     AuthRetry {
         subagent_id: Option<String>,
     },
@@ -142,7 +138,6 @@ pub struct App {
     pub(super) search_modal: SearchModal,
     pub(super) file_picker: FilePickerModal,
     pub(super) permission_prompt: PermissionPrompt,
-    pub(super) question_form: QuestionForm,
     pub(super) plan_form: PlanForm,
     pub(super) status_bar: StatusBar,
     pub status: Status,
@@ -155,8 +150,6 @@ pub struct App {
     pub(super) pending_input: PendingInput,
     pub(crate) run_id: u64,
     pub(super) retry_info: Option<RetryInfo>,
-    #[cfg(feature = "demo")]
-    demo_questions: Option<(usize, Vec<QuestionInfo>)>,
     pub(super) zones: ZoneRegistry,
     pub(super) selection_state: Option<SelectionState>,
     pub(super) clipboard: ClipboardState,
@@ -215,7 +208,6 @@ impl App {
             search_modal: SearchModal::new(),
             file_picker: FilePickerModal::new(),
             permission_prompt: PermissionPrompt::new(),
-            question_form: QuestionForm::new(),
             plan_form: PlanForm::new(),
             status_bar: StatusBar::new(ui_config.flash_duration()),
             status: Status::Idle,
@@ -228,8 +220,6 @@ impl App {
             pending_input: PendingInput::None,
             run_id: 0,
             retry_info: None,
-            #[cfg(feature = "demo")]
-            demo_questions: None,
             zones: [None; SelectionZone::COUNT],
             selection_state: None,
             clipboard: ClipboardState::new(),
@@ -348,6 +338,10 @@ impl App {
             return;
         }
         let pos = Position::new(column, row);
+        if self.float_mgr.is_open() && self.float_mgr.contains(pos) {
+            self.float_mgr.scroll(delta);
+            return;
+        }
         macro_rules! try_picker {
             ($picker:expr) => {
                 if $picker.is_open() {
@@ -410,14 +404,10 @@ impl App {
         }
         if key::PREV_CHAT.matches(key) {
             self.active_chat = self.active_chat.saturating_sub(1);
-            #[cfg(feature = "demo")]
-            self.check_demo_questions();
             return Some(vec![]);
         }
         if key::NEXT_CHAT.matches(key) {
             self.active_chat = (self.active_chat + 1).min(self.chats.len() - 1);
-            #[cfg(feature = "demo")]
-            self.check_demo_questions();
             return Some(vec![]);
         }
         if key::SCROLL_HALF_UP.matches(key) {
@@ -460,22 +450,6 @@ impl App {
                 self.permission_prompt.close();
                 self.send_to_agent(subagent_id.as_deref(), encoded);
             }
-            return Some(vec![]);
-        }
-
-        if self.question_form.is_visible() {
-            let action = self.question_form.handle_key(key);
-            let answer = match action {
-                QuestionFormAction::Submit(a) => {
-                    let display = self.question_form.format_answers_display();
-                    self.main_chat().push_user_message(display);
-                    a
-                }
-                QuestionFormAction::Dismiss => String::new(),
-                QuestionFormAction::Consumed => return Some(vec![]),
-            };
-            self.question_form.close();
-            self.send_answer(answer);
             return Some(vec![]);
         }
 
@@ -576,8 +550,6 @@ impl App {
                 PickerAction::Select(idx, _) => {
                     self.task_picker_original = None;
                     self.active_chat = idx;
-                    #[cfg(feature = "demo")]
-                    self.check_demo_questions();
                     vec![]
                 }
                 PickerAction::Close => {
@@ -792,11 +764,6 @@ impl App {
                 self.send_to_agent(subagent_id.as_deref(), String::new());
                 return vec![];
             }
-            PendingInput::Question => {
-                self.main_chat().push_user_message(&sub.text);
-                self.send_answer(sub.text);
-                return vec![];
-            }
             PendingInput::None => {}
         }
         if sub.is_empty() {
@@ -1006,17 +973,6 @@ impl App {
                     }
                     if self.exit_on_done {
                         self.exit_request = ExitRequest::Error;
-                    }
-                }
-                ChatEventResult::QuestionPrompt { questions } => {
-                    self.transition_plan(PlanTrigger::QuestionAsked);
-                    if QuestionForm::is_form_suitable(&questions) {
-                        self.question_form.open(questions);
-                    } else {
-                        let text = QuestionForm::format_questions_as_text(&questions);
-                        self.main_chat()
-                            .push(DisplayMessage::new(DisplayRole::Assistant, text));
-                        self.pending_input = PendingInput::Question;
                     }
                 }
                 ChatEventResult::AuthRequired
@@ -1262,7 +1218,7 @@ impl App {
         vec![]
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 13] {
+    fn overlays(&self) -> [&dyn Overlay; 12] {
         [
             &self.help_modal,
             &self.btw_modal,
@@ -1276,11 +1232,10 @@ impl App {
             &self.model_picker,
             &self.mcp_picker,
             &self.permission_prompt,
-            &self.question_form,
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 13] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 12] {
         [
             &mut self.help_modal,
             &mut self.btw_modal,
@@ -1294,7 +1249,6 @@ impl App {
             &mut self.model_picker,
             &mut self.mcp_picker,
             &mut self.permission_prompt,
-            &mut self.question_form,
         ]
     }
 
@@ -1336,26 +1290,6 @@ impl App {
         }
     }
 
-    #[cfg(feature = "demo")]
-    pub fn chat_index_for(&self, tool_id: &str) -> Option<usize> {
-        self.chat_index.get(tool_id).copied()
-    }
-
-    #[cfg(feature = "demo")]
-    pub fn set_demo_questions(&mut self, chat_idx: usize, questions: Vec<QuestionInfo>) {
-        self.demo_questions = Some((chat_idx, questions));
-    }
-
-    #[cfg(feature = "demo")]
-    fn check_demo_questions(&mut self) {
-        if let Some((idx, _)) = &self.demo_questions
-            && self.active_chat == *idx
-        {
-            let (_, questions) = self.demo_questions.take().unwrap();
-            self.question_form.open(questions);
-        }
-    }
-
     fn route_text_paste(&mut self, text: &str) {
         if self.state.mode == Mode::Plan && self.plan_form.is_visible() {
             return;
@@ -1363,7 +1297,7 @@ impl App {
         if self.permission_prompt.handle_paste(text) {
             return;
         }
-        if self.question_form.handle_paste(text) {
+        if self.float_mgr.handle_paste(text) {
             return;
         }
         if self.search_modal.is_open() {

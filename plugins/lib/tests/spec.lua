@@ -264,14 +264,14 @@ case("text_input_insert_and_value", function()
   input:handle_key("h")
   input:handle_key("i")
   eq(input:value(), "hi")
-  eq(input.cursor, 2)
+  eq(input.col, 2)
 end)
 
 case("text_input_backspace_at_start_noop", function()
   local input = TextInput.new()
   input:handle_key("backspace")
   eq(input:value(), "")
-  eq(input.cursor, 0)
+  eq(input.col, 0)
 end)
 
 case("text_input_backspace_deletes", function()
@@ -281,7 +281,7 @@ case("text_input_backspace_deletes", function()
   input:handle_key("c")
   input:handle_key("backspace")
   eq(input:value(), "ab")
-  eq(input.cursor, 2)
+  eq(input.col, 2)
 end)
 
 case("text_input_cursor_movement", function()
@@ -290,19 +290,19 @@ case("text_input_cursor_movement", function()
   input:handle_key("b")
   input:handle_key("c")
   input:handle_key("left")
-  eq(input.cursor, 2)
+  eq(input.col, 2)
   input:handle_key("left")
-  eq(input.cursor, 1)
+  eq(input.col, 1)
   input:handle_key("left")
-  eq(input.cursor, 0)
+  eq(input.col, 0)
   input:handle_key("left")
-  eq(input.cursor, 0)
+  eq(input.col, 0)
   input:handle_key("right")
-  eq(input.cursor, 1)
+  eq(input.col, 1)
   input:handle_key("end")
-  eq(input.cursor, 3)
+  eq(input.col, 3)
   input:handle_key("home")
-  eq(input.cursor, 0)
+  eq(input.col, 0)
 end)
 
 case("text_input_delete_word", function()
@@ -330,7 +330,9 @@ case("text_input_render_format", function()
   input:handle_key("a")
   input:handle_key("b")
   input:handle_key("left")
-  local spans = input:render("> ")
+  local rendered = input:render("> ")
+  eq(#rendered, 1)
+  local spans = rendered[1]
   eq(#spans, 4)
   eq(spans[1][1], "> ")
   eq(spans[1][2], "dim")
@@ -347,6 +349,161 @@ case("text_input_is_empty", function()
   eq(input:is_empty(), true)
   input:handle_key("x")
   eq(input:is_empty(), false)
+end)
+
+case("text_input_utf8_insert_navigate_delete_render", function()
+  local input = TextInput.new()
+  input:insert_text("héllo — wörld")
+  eq(input:value(), "héllo — wörld", "paste preserves multibyte text")
+  eq(input:char_before_cursor(), "d", "char_before_cursor over single-byte")
+
+  input = TextInput.new()
+  input:insert_text("aé")
+  eq(input.col, 3, "cursor at end of 'aé' (1 + 2 bytes)")
+  input:handle_key("left")
+  eq(input.col, 1, "left jumps over whole codepoint")
+  eq(input:char_before_cursor(), "a")
+  input:handle_key("right")
+  eq(input.col, 3, "right jumps over whole codepoint")
+  input:handle_key("backspace")
+  eq(input:value(), "a", "backspace removes whole codepoint")
+
+  input = TextInput.new()
+  input:insert_text("aé")
+  input:handle_key("left")
+  local spans = input:render("> ")[1]
+  eq(spans[2][1], "a", "text before cursor")
+  eq(spans[3][1], "é", "cursor span is whole codepoint")
+  eq(spans[3][2], "cursor")
+end)
+
+case("text_input_insert_text_table_driven", function()
+  local cases = {
+    { "foo\nbar\nbaz", 3, "foo\nbar\nbaz", 3, 3 },
+    { "a\n", 2, "a\n", 2, 0 },
+    { "\nx", 2, "\nx", 2, 1 },
+    { "\n\n\n", 4, "\n\n\n", 4, 0 },
+    { "é\nö\n世界", 3, "é\nö\n世界", 3, #"世界" },
+  }
+  for i, c in ipairs(cases) do
+    local input = TextInput.new()
+    input:insert_text(c[1])
+    eq(input:line_count(), c[2], "case " .. i .. ": line_count")
+    eq(input:value(), c[3], "case " .. i .. ": value")
+    eq(input.line, c[4], "case " .. i .. ": line")
+    eq(input.col, c[5], "case " .. i .. ": col")
+  end
+end)
+
+case("text_input_newline_table_driven", function()
+  local cases = {
+    { { "left", "left" }, "hel\nlo" },
+    { { "home" }, "\nhello" },
+    { { "end" }, "hello\n" },
+  }
+  for i, c in ipairs(cases) do
+    local input = TextInput.new()
+    input:insert_text("hello")
+    for _, k in ipairs(c[1]) do
+      input:handle_key(k)
+    end
+    input:handle_key("newline")
+    eq(input:value(), c[2], "case " .. i)
+    eq(input:line_count(), 2, "case " .. i .. ": two lines")
+    eq(input.line, 2, "case " .. i .. ": cursor on new line")
+    eq(input.col, 0, "case " .. i .. ": cursor at col 0")
+  end
+end)
+
+case("text_input_up_down_navigation_clamps_and_no_ops", function()
+  local input = TextInput.new()
+  input:insert_text("abc\nlonger_line")
+  eq(input.line, 2)
+  eq(input.col, 11, "cursor at end of longer line")
+  input:handle_key("up")
+  eq(input.line, 1)
+  eq(input.col, 3, "col clamps to short line length")
+  input:handle_key("up")
+  eq(input.line, 1, "up at line 1 is a no-op")
+  input:handle_key("down")
+  input:handle_key("down")
+  eq(input.line, 2, "down at last line is a no-op")
+end)
+
+case("text_input_cursor_wraps_across_line_boundaries", function()
+  local input = TextInput.new()
+  input:insert_text("abc\nxy")
+  input:handle_key("home")
+  input:handle_key("left")
+  eq(input.line, 1)
+  eq(input.col, 3, "left at col 0 lands at end of previous line")
+  input:handle_key("right")
+  eq(input.line, 2)
+  eq(input.col, 0, "right at end of non-last line goes to start of next")
+end)
+
+case("text_input_backspace_joins_lines_table_driven", function()
+  local cases = {
+    { "foo\nbar", { "home" }, "foobar", 1, 3 },
+    { "\nabc", { "home" }, "abc", 1, 0 },
+    { "a\nb", { "end", "backspace" }, "a", 1, 1 },
+  }
+  for i, c in ipairs(cases) do
+    local input = TextInput.new()
+    input:insert_text(c[1])
+    for _, k in ipairs(c[2]) do
+      input:handle_key(k)
+    end
+    input:handle_key("backspace")
+    eq(input:value(), c[3], "case " .. i .. ": value")
+    eq(input.line, c[4], "case " .. i .. ": line")
+    eq(input.col, c[5], "case " .. i .. ": col")
+    eq(input:line_count(), 1, "case " .. i .. ": joined to one line")
+  end
+end)
+
+case("text_input_empty_input_movement_is_noop_and_char_before_cursor_is_nil", function()
+  local input = TextInput.new()
+  for _, k in ipairs({ "left", "right", "up", "down", "backspace" }) do
+    input:handle_key(k)
+  end
+  eq(input:value(), "")
+  eq(input:line_count(), 1)
+  eq(input.line, 1)
+  eq(input.col, 0)
+  eq(input:char_before_cursor(), nil, "no char before cursor at start of empty input")
+
+  input = TextInput.new()
+  input:insert_text("abc\ndef")
+  input:handle_key("home")
+  eq(input:char_before_cursor(), nil, "no char before cursor at col 0 on non-first line")
+end)
+
+case("text_input_ctrl_w_consumes_trailing_spaces_then_word", function()
+  local input = TextInput.new()
+  input:insert_text("hello world  ")
+  input:handle_key("ctrl+w")
+  eq(input:value(), "hello world", "first ctrl+w consumes trailing spaces only")
+  input:handle_key("ctrl+w")
+  eq(input:value(), "hello ", "second ctrl+w removes the word, stopping at the space")
+end)
+
+case("text_input_render_multiline_padding_and_cursor", function()
+  local input = TextInput.new()
+  input:insert_text("line1\nline2")
+  local prefix = "> "
+  local rendered = input:render(prefix, #prefix)
+  eq(#rendered, 2, "one render row per logical line")
+  eq(rendered[1][1][1], prefix, "first row uses the prefix")
+  eq(rendered[2][1][1], string.rep(" ", #prefix), "continuation rows use blank padding")
+  eq(rendered[1][2][1], "line1", "non-cursor row renders text in one span")
+  local saw_cursor
+  for _, span in ipairs(rendered[2]) do
+    if span[2] == "cursor" then
+      saw_cursor = true
+    end
+  end
+  assert(saw_cursor, "cursor span must appear on the row holding the cursor")
 end)
 
 local ListPicker = require("maki.list_picker")

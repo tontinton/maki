@@ -176,6 +176,7 @@ pub struct FloatConfig {
     pub zindex: u16,
     pub cursor_line: bool,
     pub reserved_bottom: usize,
+    pub reserved_top: usize,
 }
 
 impl Default for FloatConfig {
@@ -193,6 +194,7 @@ impl Default for FloatConfig {
             zindex: 50,
             cursor_line: false,
             reserved_bottom: 0,
+            reserved_top: 0,
         }
     }
 }
@@ -219,7 +221,8 @@ impl FloatConfig {
             footer,
             zindex,
             cursor_line,
-            reserved_bottom
+            reserved_bottom,
+            reserved_top
         );
     }
 }
@@ -238,11 +241,13 @@ pub struct FloatConfigPatch {
     pub zindex: Option<u16>,
     pub cursor_line: Option<bool>,
     pub reserved_bottom: Option<usize>,
+    pub reserved_top: Option<usize>,
 }
 
 pub enum WinEvent {
-    Key { key: String, cursor: usize },
+    Key { key: String },
     Resize { width: u16, height: u16 },
+    Paste { text: String },
     Close,
 }
 

@@ -25,7 +25,7 @@ use crate::runtime::{LiveCtx, PromptExtraCallbacks, Request};
 const TOOL_NAME_MAX: usize = 64;
 const TOOL_HANDLER_RETURN_ERR: &str =
     "tool handler must return string or {output=string, is_error?=bool}";
-const TOOL_CALL_MAX_TIME: Duration = Duration::from_secs(600);
+const TIMEOUT_PARSE_ERR: &str = "register_tool: 'timeout' must be a positive number, 0, or false";
 
 #[derive(Clone)]
 pub(crate) enum PermissionScopeKind {
@@ -43,6 +43,7 @@ pub(crate) struct PendingTool {
     pub(crate) restore_key: Option<RegistryKey>,
     pub(crate) permission_scope_kind: Option<PermissionScopeKind>,
     pub(crate) permission_scopes_key: Option<RegistryKey>,
+    pub(crate) timeout: Option<Duration>,
 }
 
 pub(crate) type PendingTools = Arc<Mutex<Vec<PendingTool>>>;
@@ -56,6 +57,7 @@ pub(crate) struct LuaTool {
     pub(crate) plugin: Arc<str>,
     pub(crate) has_header_fn: bool,
     pub(crate) permission_scope_kind: Option<PermissionScopeKind>,
+    pub(crate) timeout: Option<Duration>,
 }
 
 impl Tool for LuaTool {
@@ -95,6 +97,7 @@ impl Tool for LuaTool {
             input: validated,
             tx: self.tx.clone(),
             permission_state,
+            timeout: self.timeout,
         }))
     }
 }
@@ -111,6 +114,7 @@ struct LuaToolInvocation {
     input: Value,
     tx: Sender<Request>,
     permission_state: PermissionState,
+    timeout: Option<Duration>,
 }
 
 impl ToolInvocation for LuaToolInvocation {
@@ -184,9 +188,16 @@ impl ToolInvocation for LuaToolInvocation {
         let tool = self.tool;
         let input = self.input;
         let tx = self.tx;
+        let tool_timeout = self.timeout;
 
         Box::pin(async move {
-            let timeout_secs = deadline.cap_timeout(TOOL_CALL_MAX_TIME.as_secs())?;
+            let effective_secs: Option<u64> = match tool_timeout {
+                Some(d) => Some(deadline.cap_timeout(d.as_secs())?),
+                None => match deadline {
+                    Deadline::At(_) => Some(deadline.cap_timeout(u64::MAX)?),
+                    Deadline::None => None,
+                },
+            };
 
             let (reply_tx, reply_rx) = flume::bounded::<ToolCallReply>(1);
             let live = ctx.tool_use_id.clone().map(|id| LiveCtx {
@@ -216,18 +227,24 @@ impl ToolInvocation for LuaToolInvocation {
             .await
             .map_err(|_| "lua thread disconnected".to_string())?;
 
-            let timeout = smol::Timer::after(Duration::from_secs(timeout_secs));
-            let result =
-                futures_lite::future::race(async { Some(reply_rx.recv_async().await) }, async {
-                    timeout.await;
-                    None
-                })
-                .await;
+            let recv = async { Some(reply_rx.recv_async().await) };
+            let result = match effective_secs {
+                Some(secs) => {
+                    futures_lite::future::race(recv, async move {
+                        smol::Timer::after(Duration::from_secs(secs)).await;
+                        None
+                    })
+                    .await
+                }
+                None => recv.await,
+            };
 
             match result {
                 None => Err(format!(
-                    "plugin {} tool {} exceeded timeout ({timeout_secs}s)",
-                    plugin, tool
+                    "plugin {} tool {} exceeded timeout ({}s)",
+                    plugin,
+                    tool,
+                    effective_secs.unwrap_or(0)
                 )),
                 Some(Err(_)) => Err("lua thread disconnected".to_string()),
                 Some(Ok(reply)) => {
@@ -251,7 +268,11 @@ impl ToolInvocation for LuaToolInvocation {
                             });
                         }
                     }
-                    reply.result.map(ToolOutput::Plain)
+                    let format = reply.format;
+                    reply.result.map(|s| match format {
+                        LuaOutputFormat::Markdown => ToolOutput::Markdown(s),
+                        LuaOutputFormat::Plain => ToolOutput::Plain(s),
+                    })
                 }
             }
         })
@@ -339,6 +360,18 @@ fn parse_audience(audiences: Option<mlua::Table>) -> LuaResult<ToolAudience> {
     Ok(flags)
 }
 
+fn parse_timeout(spec: &Table) -> LuaResult<Option<Duration>> {
+    let value: LuaValue = spec.get("timeout").unwrap_or(LuaValue::Nil);
+    match value {
+        LuaValue::Nil | LuaValue::Boolean(false) => Ok(None),
+        LuaValue::Integer(0) => Ok(None),
+        LuaValue::Integer(n) if n > 0 => Ok(Some(Duration::from_secs(n as u64))),
+        LuaValue::Number(n) if n > 0.0 && n.is_finite() => Ok(Some(Duration::from_secs(n as u64))),
+        LuaValue::Number(0.0) => Ok(None),
+        _ => Err(mlua::Error::runtime(TIMEOUT_PARSE_ERR)),
+    }
+}
+
 fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> LuaResult<()> {
     let name: String = spec
         .get("name")
@@ -401,6 +434,7 @@ fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> Lua
     let header_fn: Option<Function> = spec.get("header").ok();
     let restore_fn: Option<Function> = spec.get("restore").ok();
     let audience = parse_audience(audiences)?;
+    let timeout = parse_timeout(spec)?;
     let handler_key: RegistryKey = lua.create_registry_value(handler)?;
     let header_key = header_fn
         .map(|f| lua.create_registry_value(f))
@@ -423,6 +457,7 @@ fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> Lua
             restore_key,
             permission_scope_kind,
             permission_scopes_key,
+            timeout,
         });
 
     Ok(())
@@ -472,11 +507,22 @@ fn register_command_from_lua(lua: &Lua, spec: &Table, plugin: Arc<str>) -> LuaRe
 
 pub(crate) type ToolCallResult = Result<String, String>;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum LuaOutputFormat {
+    #[default]
+    Plain,
+    Markdown,
+}
+
+const LUA_FORMAT_MARKDOWN: &str = "markdown";
+const LUA_FORMAT_PLAIN: &str = "plain";
+
 pub(crate) struct ToolCallReply {
     pub result: ToolCallResult,
     pub snapshot: Option<BufferSnapshot>,
     pub header: Option<BufferSnapshot>,
     pub live_buf: Option<Arc<SharedBuf>>,
+    pub format: LuaOutputFormat,
 }
 
 impl ToolCallReply {
@@ -488,6 +534,7 @@ impl ToolCallReply {
                 snapshot: None,
                 header: None,
                 live_buf: None,
+                format: LuaOutputFormat::default(),
             };
         };
         let (snapshot, live_buf) = Self::extract_body_handle(t);
@@ -495,11 +542,13 @@ impl ToolCallReply {
             .get::<LuaValue>("header")
             .ok()
             .and_then(|v| Self::extract_snapshot(&v));
+        let format = extract_format(t);
         Self {
             result,
             snapshot,
             header,
             live_buf,
+            format,
         }
     }
 
@@ -526,7 +575,22 @@ impl ToolCallReply {
             snapshot: None,
             header: None,
             live_buf: None,
+            format: LuaOutputFormat::default(),
         }
+    }
+}
+
+fn extract_format(t: &mlua::Table) -> LuaOutputFormat {
+    let Ok(LuaValue::String(s)) = t.get::<LuaValue>("format") else {
+        return LuaOutputFormat::default();
+    };
+    let Ok(s) = s.to_str() else {
+        return LuaOutputFormat::default();
+    };
+    match &*s {
+        LUA_FORMAT_MARKDOWN => LuaOutputFormat::Markdown,
+        LUA_FORMAT_PLAIN => LuaOutputFormat::Plain,
+        _ => LuaOutputFormat::default(),
     }
 }
 
@@ -576,6 +640,7 @@ mod tests {
             input,
             tx,
             permission_state: PermissionState::Ready(None),
+            timeout: Some(Duration::from_secs(60)),
         }
     }
 
@@ -605,6 +670,7 @@ mod tests {
             plugin: Arc::from("test"),
             has_header_fn: false,
             permission_scope_kind,
+            timeout: Some(Duration::from_secs(60)),
         }
     }
 
@@ -667,6 +733,23 @@ mod tests {
         assert!(coerce_tool_result(&LuaValue::Table(lua.create_table().unwrap())).is_err());
     }
 
+    #[test_case::test_case(LUA_FORMAT_MARKDOWN, LuaOutputFormat::Markdown ; "markdown")]
+    #[test_case::test_case(LUA_FORMAT_PLAIN,    LuaOutputFormat::Plain    ; "plain")]
+    #[test_case::test_case("unknown",           LuaOutputFormat::Plain    ; "unknown_defaults_to_plain")]
+    fn extract_format_known_values(value: &str, expected: LuaOutputFormat) {
+        let lua = Lua::new();
+        let t = lua.create_table().unwrap();
+        t.set("format", value).unwrap();
+        assert_eq!(extract_format(&t), expected);
+    }
+
+    #[test]
+    fn extract_format_missing_defaults_to_plain() {
+        let lua = Lua::new();
+        let t = lua.create_table().unwrap();
+        assert_eq!(extract_format(&t), LuaOutputFormat::Plain);
+    }
+
     #[test]
     fn needs_compute_fallback_on_failure() {
         // Closed channel → fallback to force_prompt
@@ -679,6 +762,7 @@ mod tests {
             input: serde_json::json!({"command": "ls"}),
             tx,
             permission_state: PermissionState::NeedsCompute,
+            timeout: None,
         };
         let scopes = smol::block_on(inv.permission_scopes()).expect("should fallback");
         assert!(scopes.force_prompt);
@@ -693,6 +777,7 @@ mod tests {
             input: serde_json::json!({"command": "echo hi"}),
             tx: tx2,
             permission_state: PermissionState::NeedsCompute,
+            timeout: None,
         };
         std::thread::spawn(move || {
             if let Ok(Request::ComputePermissionScopes { reply, .. }) = rx2.recv() {
@@ -713,6 +798,7 @@ mod tests {
             input: serde_json::json!({"command": "cargo test"}),
             tx,
             permission_state: PermissionState::NeedsCompute,
+            timeout: None,
         };
         std::thread::spawn(move || {
             if let Ok(Request::ComputePermissionScopes { reply, .. }) = rx.recv() {
@@ -748,8 +834,211 @@ mod tests {
             plugin: Arc::from("test"),
             has_header_fn: false,
             permission_scope_kind: Some(PermissionScopeKind::Field(Arc::from("count"))),
+            timeout: Some(Duration::from_secs(60)),
         };
         let inv = tool.parse(&serde_json::json!({"count": 42})).unwrap();
         assert!(smol::block_on(inv.permission_scopes()).is_none());
+    }
+
+    fn timeout_spec(lua: &Lua, value: LuaValue) -> Table {
+        let t = lua.create_table().unwrap();
+        if !matches!(value, LuaValue::Nil) {
+            t.set("timeout", value).unwrap();
+        }
+        t
+    }
+
+    #[test]
+    fn timeout_parsing_nil_yields_infinite() {
+        let lua = Lua::new();
+        let spec = timeout_spec(&lua, LuaValue::Nil);
+        assert_eq!(parse_timeout(&spec).unwrap(), None);
+    }
+
+    #[test]
+    fn timeout_parsing_false_yields_infinite() {
+        let lua = Lua::new();
+        let spec = timeout_spec(&lua, LuaValue::Boolean(false));
+        assert_eq!(parse_timeout(&spec).unwrap(), None);
+    }
+
+    #[test]
+    fn timeout_parsing_zero_yields_infinite() {
+        let lua = Lua::new();
+        let spec = timeout_spec(&lua, LuaValue::Integer(0));
+        assert_eq!(parse_timeout(&spec).unwrap(), None);
+    }
+
+    #[test]
+    fn timeout_parsing_positive_seconds() {
+        let lua = Lua::new();
+        let spec = timeout_spec(&lua, LuaValue::Integer(30));
+        assert_eq!(parse_timeout(&spec).unwrap(), Some(Duration::from_secs(30)));
+    }
+
+    #[test_case::test_case(LuaValue::Integer(-1) ; "negative_integer")]
+    #[test_case::test_case(LuaValue::Number(-1.5) ; "negative_float")]
+    #[test_case::test_case(LuaValue::Boolean(true) ; "true_value")]
+    fn timeout_parsing_invalid_rejected(value: LuaValue) {
+        let lua = Lua::new();
+        let spec = timeout_spec(&lua, value);
+        let err = parse_timeout(&spec).unwrap_err();
+        assert!(err.to_string().contains(TIMEOUT_PARSE_ERR));
+    }
+
+    #[test]
+    fn timeout_parsing_invalid_string_rejected() {
+        let lua = Lua::new();
+        let s = lua.create_string("forever").unwrap();
+        let spec = timeout_spec(&lua, LuaValue::String(s));
+        let err = parse_timeout(&spec).unwrap_err();
+        assert!(err.to_string().contains(TIMEOUT_PARSE_ERR));
+    }
+
+    #[test]
+    fn timeout_parsing_sub_second_float_truncates_to_zero() {
+        // A sub-second float slips past `n > 0.0 && n.is_finite()`, then the
+        // `n as u64` cast truncates it to 0, so the timeout fires right away.
+        // Pinning this down so a future refactor does not silently change it.
+        let lua = Lua::new();
+        let spec = timeout_spec(&lua, LuaValue::Number(0.5));
+        assert_eq!(parse_timeout(&spec).unwrap(), Some(Duration::from_secs(0)));
+    }
+
+    #[test_case::test_case(f64::INFINITY ; "positive_infinity")]
+    #[test_case::test_case(f64::NEG_INFINITY ; "negative_infinity")]
+    #[test_case::test_case(f64::NAN ; "nan")]
+    fn timeout_parsing_non_finite_float_rejected(n: f64) {
+        let lua = Lua::new();
+        let spec = timeout_spec(&lua, LuaValue::Number(n));
+        let err = parse_timeout(&spec).unwrap_err();
+        assert!(err.to_string().contains(TIMEOUT_PARSE_ERR));
+    }
+
+    #[test]
+    fn timeout_parsing_large_finite_float_accepted() {
+        let lua = Lua::new();
+        let big: f64 = 1e10;
+        let spec = timeout_spec(&lua, LuaValue::Number(big));
+        assert_eq!(
+            parse_timeout(&spec).unwrap(),
+            Some(Duration::from_secs(big as u64))
+        );
+    }
+
+    #[test]
+    fn timeout_parsing_zero_float_yields_infinite() {
+        let lua = Lua::new();
+        let spec = timeout_spec(&lua, LuaValue::Number(0.0));
+        assert_eq!(parse_timeout(&spec).unwrap(), None);
+    }
+
+    #[test]
+    fn lua_output_format_default_is_plain() {
+        assert_eq!(LuaOutputFormat::default(), LuaOutputFormat::Plain);
+    }
+
+    fn reply_table(lua: &Lua, output: &str, format: Option<&str>, is_error: bool) -> LuaValue {
+        let t = lua.create_table().unwrap();
+        t.set("llm_output", output).unwrap();
+        if is_error {
+            t.set("is_error", true).unwrap();
+        }
+        if let Some(f) = format {
+            t.set("format", f).unwrap();
+        }
+        LuaValue::Table(t)
+    }
+
+    #[test]
+    fn from_lua_value_table_with_markdown_format_ok() {
+        let lua = Lua::new();
+        let val = reply_table(&lua, "hi", Some(LUA_FORMAT_MARKDOWN), false);
+        let reply = ToolCallReply::from_lua_value(&val);
+        assert_eq!(reply.result, Ok("hi".to_string()));
+        assert_eq!(reply.format, LuaOutputFormat::Markdown);
+    }
+
+    #[test]
+    fn from_lua_value_table_with_markdown_format_and_is_error_captures_format() {
+        // The format field is read on its own, separate from is_error, so a
+        // handler that fails can still ask for its error message to be rendered
+        // as markdown.
+        let lua = Lua::new();
+        let val = reply_table(&lua, "boom", Some(LUA_FORMAT_MARKDOWN), true);
+        let reply = ToolCallReply::from_lua_value(&val);
+        assert_eq!(reply.result, Err("boom".to_string()));
+        assert_eq!(reply.format, LuaOutputFormat::Markdown);
+    }
+
+    #[test]
+    fn from_lua_value_table_without_format_defaults_to_plain() {
+        let lua = Lua::new();
+        let val = reply_table(&lua, "hi", None, false);
+        let reply = ToolCallReply::from_lua_value(&val);
+        assert_eq!(reply.result, Ok("hi".to_string()));
+        assert_eq!(reply.format, LuaOutputFormat::Plain);
+    }
+
+    #[test]
+    fn from_lua_value_string_value_defaults_to_plain() {
+        let lua = Lua::new();
+        let val = LuaValue::String(lua.create_string("hello").unwrap());
+        let reply = ToolCallReply::from_lua_value(&val);
+        assert_eq!(reply.result, Ok("hello".to_string()));
+        assert_eq!(reply.format, LuaOutputFormat::Plain);
+        assert!(reply.snapshot.is_none());
+        assert!(reply.live_buf.is_none());
+        assert!(reply.header.is_none());
+    }
+
+    #[test]
+    fn from_lua_value_non_table_non_string_is_err_with_default_format() {
+        let reply = ToolCallReply::from_lua_value(&LuaValue::Boolean(true));
+        assert_eq!(reply.result, Err(TOOL_HANDLER_RETURN_ERR.to_string()));
+        assert_eq!(reply.format, LuaOutputFormat::Plain);
+    }
+
+    #[test]
+    fn coerce_table_with_is_error_false_returns_ok() {
+        let lua = Lua::new();
+        let t = lua.create_table().unwrap();
+        t.set("llm_output", "fine").unwrap();
+        t.set("is_error", false).unwrap();
+        assert_eq!(
+            coerce_tool_result(&LuaValue::Table(t)),
+            Ok("fine".to_string())
+        );
+    }
+
+    #[test]
+    fn coerce_table_with_non_string_output_is_err() {
+        let lua = Lua::new();
+        let t = lua.create_table().unwrap();
+        t.set("llm_output", 123).unwrap();
+        assert_eq!(
+            coerce_tool_result(&LuaValue::Table(t)),
+            Err(TOOL_HANDLER_RETURN_ERR.to_string())
+        );
+    }
+
+    #[test_case::test_case("_leading", true ; "leading_underscore_allowed")]
+    #[test_case::test_case("_", true ; "single_underscore")]
+    #[test_case::test_case("snake_case_123", true ; "snake_with_digits")]
+    #[test_case::test_case("foo-bar", false ; "hyphen_rejected")]
+    #[test_case::test_case("foo.bar", false ; "dot_rejected")]
+    #[test_case::test_case("foo@bar", false ; "at_sign_rejected")]
+    #[test_case::test_case("café", false ; "non_ascii_rejected")]
+    #[test_case::test_case("名前", false ; "unicode_rejected")]
+    fn tool_name_validation_extra(name: &str, expected: bool) {
+        assert_eq!(is_valid_tool_name(name), expected);
+    }
+
+    #[test]
+    fn tool_name_validation_length_boundaries() {
+        let max_ok: String = "a".repeat(TOOL_NAME_MAX);
+        assert!(is_valid_tool_name(&max_ok));
+        let too_long: String = "a".repeat(TOOL_NAME_MAX + 1);
+        assert!(!is_valid_tool_name(&too_long));
     }
 }

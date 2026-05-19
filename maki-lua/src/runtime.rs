@@ -780,6 +780,7 @@ impl LuaRuntime {
                     plugin: Arc::clone(&name),
                     has_header_fn: t.header_key.is_some(),
                     permission_scope_kind: t.permission_scope_kind.clone(),
+                    timeout: t.timeout,
                 });
                 (
                     tool,

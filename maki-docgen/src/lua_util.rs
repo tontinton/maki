@@ -35,6 +35,20 @@ pub fn extract_lua_description(source: &str) -> Option<String> {
         let end = after.find("]]")?;
         return Some(after[..end].trim().to_string());
     }
+    for line in source.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("description = ") {
+            let rest = rest.trim_end_matches(',').trim();
+            if !rest.starts_with('"') && !rest.starts_with("[[") {
+                let var_pattern = format!("{rest} = [[");
+                if let Some(vs) = source.find(&var_pattern) {
+                    let after = &source[vs + var_pattern.len()..];
+                    let end = after.find("]]")?;
+                    return Some(after[..end].trim().to_string());
+                }
+            }
+        }
+    }
     let marker = "description = \"";
     let start = source.find(marker)?;
     let desc_block = &source[start..];
@@ -137,30 +151,60 @@ fn parse_lua_tool(source: &str) -> Option<Value> {
     let mut properties = Map::new();
     let mut required = Vec::new();
 
+    if let Some(req_start) = schema_src.find("required = {") {
+        let after = &schema_src[req_start + "required = {".len()..];
+        if let Some(end) = after.find('}') {
+            for item in after[..end].split(',') {
+                let item = item.trim().trim_matches('"');
+                if !item.is_empty() {
+                    required.push(Value::String(item.to_string()));
+                }
+            }
+        }
+    }
+
     let props_start = schema_src.find("properties = {")?;
     let props_block = &schema_src[props_start..];
     let props_end = find_matching_brace(props_block, props_block.find('{')?)?;
     let props_src = &props_block["properties = {".len()..props_end];
 
-    for line in props_src.lines() {
-        let line = line.trim();
-        let Some((pname, rest)) = line.split_once('=') else {
-            continue;
-        };
-        let pname = pname.trim();
-        if !rest.trim().starts_with('{') {
+    let mut pos = 0;
+    while pos < props_src.len() {
+        let remaining = &props_src[pos..];
+        let Some(eq) = remaining.find('=') else { break };
+        let pname = remaining[..eq]
+            .trim()
+            .trim_start_matches(|c: char| !c.is_ascii_alphabetic() && c != '_');
+        if pname.is_empty() {
+            pos += eq + 1;
             continue;
         }
+        let after_eq = remaining[eq + 1..].trim_start();
+        if !after_eq.starts_with('{') {
+            pos += eq + 1;
+            continue;
+        }
+        let brace_offset = pos + eq + 1 + (remaining.len() - eq - 1 - after_eq.len());
+        let Some(brace_end) = find_matching_brace(props_src, brace_offset) else {
+            break;
+        };
+        let block = &props_src[brace_offset..=brace_end];
 
-        let ptype = extract_lua_field(rest, "type")?;
-        let pdesc = extract_lua_field(rest, "description").unwrap_or_default();
-        let is_required = rest.contains("required = true");
-
-        let prop = json!({ "type": ptype, "description": pdesc });
-        if is_required {
+        let ptype = extract_lua_field(block, "type").unwrap_or_default();
+        let pdesc = extract_lua_field(block, "description").unwrap_or_default();
+        if block.contains("required = true")
+            && !required.contains(&Value::String(pname.to_string()))
+        {
             required.push(Value::String(pname.to_string()));
         }
-        properties.insert(pname.to_string(), prop);
+
+        if !ptype.is_empty() {
+            properties.insert(
+                pname.to_string(),
+                json!({ "type": ptype, "description": pdesc }),
+            );
+        }
+        pos = brace_end + 1;
     }
 
     let schema = json!({

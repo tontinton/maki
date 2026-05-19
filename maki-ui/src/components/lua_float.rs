@@ -14,8 +14,6 @@ use crate::components::{
 };
 use crate::theme;
 
-const BORDER_CHROME: u16 = 2;
-
 struct FloatWindow {
     id: u32,
     buf: Arc<SharedBuf>,
@@ -23,33 +21,44 @@ struct FloatWindow {
     scroll_offset: usize,
     cached_lines: Arc<Vec<SnapshotLine>>,
     viewport_h: u16,
-    content_width: u16,
-    content_height: u16,
+    last_content: Rect,
     cursor: usize,
     event_tx: flume::Sender<WinEvent>,
     cmd_rx: flume::Receiver<WinCommand>,
 }
 
 impl FloatWindow {
-    fn sync_scroll(&mut self) {
-        self.cursor = clamp_cursor(
-            self.cursor,
-            self.cached_lines.len(),
+    fn chrome(&self) -> (usize, usize, usize) {
+        chrome(
+            self.config.reserved_top,
             self.config.reserved_bottom,
-        );
-        self.scroll_offset = adjust_scroll(
-            self.cursor,
-            self.scroll_offset,
             self.cached_lines.len(),
-            self.viewport_h,
-            self.config.reserved_bottom,
-        );
+        )
     }
+
+    fn sync_scroll(&mut self) {
+        let (top, _bot, scrollable) = self.chrome();
+        let effective_cursor = self.cursor.saturating_sub(top);
+        let clamped = effective_cursor.min(scrollable.saturating_sub(1));
+        self.cursor = clamped + top;
+        self.scroll_offset =
+            adjust_scroll(clamped, self.scroll_offset, scrollable, self.viewport_h);
+    }
+}
+
+/// Splits the available `line_count` into top reserved rows, bottom reserved
+/// rows, and the scrollable middle. When the window is tight, the bottom wins:
+/// footers like keybind hints stay visible even if the top header gets squeezed.
+fn chrome(reserved_top: usize, reserved_bottom: usize, line_count: usize) -> (usize, usize, usize) {
+    let bottom = reserved_bottom.min(line_count);
+    let top = reserved_top.min(line_count - bottom);
+    (top, bottom, line_count - top - bottom)
 }
 
 pub(crate) struct FloatManager {
     windows: Vec<FloatWindow>,
     focused_id: Option<u32>,
+    focused_rect: Option<Rect>,
     next_id: u32,
 }
 
@@ -58,6 +67,7 @@ impl FloatManager {
         Self {
             windows: Vec::new(),
             focused_id: None,
+            focused_rect: None,
             next_id: 0,
         }
     }
@@ -74,21 +84,6 @@ impl FloatManager {
         let id = self.next_id;
         self.next_id += 1;
 
-        let (term_cols, term_rows) = crossterm::terminal::size().unwrap_or((80, 24));
-        let estimated_width = config
-            .width
-            .resolve(term_cols)
-            .saturating_sub(BORDER_CHROME);
-        let estimated_height = config
-            .height
-            .resolve(term_rows)
-            .saturating_sub(BORDER_CHROME);
-
-        let _ = event_tx.try_send(WinEvent::Resize {
-            width: estimated_width,
-            height: estimated_height,
-        });
-
         let win = FloatWindow {
             id,
             buf,
@@ -96,8 +91,7 @@ impl FloatManager {
             scroll_offset: 0,
             cached_lines,
             viewport_h: 1,
-            content_width: estimated_width,
-            content_height: estimated_height,
+            last_content: Rect::default(),
             cursor: 0,
             event_tx,
             cmd_rx,
@@ -115,6 +109,11 @@ impl FloatManager {
         let mut closed_ids = Vec::new();
 
         for win in &mut self.windows {
+            if let Some(lines) = win.buf.read_if_dirty() {
+                win.cached_lines = lines;
+                win.sync_scroll();
+            }
+
             loop {
                 match win.cmd_rx.try_recv() {
                     Ok(WinCommand::SetConfig(patch)) => {
@@ -136,15 +135,6 @@ impl FloatManager {
                     }
                 }
             }
-
-            if closed_ids.last() == Some(&win.id) {
-                continue;
-            }
-
-            if let Some(lines) = win.buf.read_if_dirty() {
-                win.cached_lines = lines;
-                win.sync_scroll();
-            }
         }
 
         if !closed_ids.is_empty() {
@@ -153,6 +143,7 @@ impl FloatManager {
                 && !self.windows.iter().any(|w| w.id == fid)
             {
                 self.focused_id = self.windows.last().map(|w| w.id);
+                self.focused_rect = None;
             }
         }
     }
@@ -167,11 +158,21 @@ impl FloatManager {
 
         let key_str = key_event_to_string(&key_event);
         if !key_str.is_empty() {
-            let _ = win.event_tx.try_send(WinEvent::Key {
-                key: key_str,
-                cursor: win.cursor,
-            });
+            let _ = win.event_tx.try_send(WinEvent::Key { key: key_str });
         }
+        true
+    }
+
+    pub fn handle_paste(&self, text: &str) -> bool {
+        let Some(fid) = self.focused_id else {
+            return false;
+        };
+        let Some(win) = self.windows.iter().find(|w| w.id == fid) else {
+            return false;
+        };
+        let _ = win.event_tx.try_send(WinEvent::Paste {
+            text: text.to_owned(),
+        });
         true
     }
 
@@ -239,52 +240,57 @@ impl FloatManager {
                 inner
             };
 
-            let w = content_area.width;
-            let h = content_area.height;
-            if win.content_width != w || win.content_height != h {
+            if win.last_content != content_area {
                 let _ = win.event_tx.try_send(WinEvent::Resize {
-                    width: w,
-                    height: h.saturating_sub(footer_h),
+                    width: content_area.width,
+                    height: content_area.height,
                 });
+                win.last_content = content_area;
             }
-            win.content_width = w;
-            win.content_height = h;
 
-            let reserved = win.config.reserved_bottom.min(win.cached_lines.len());
-            let scrollable_count = win.cached_lines.len() - reserved;
-            let reserved_h = reserved as u16;
+            let (top, bot, scrollable) = win.chrome();
+            let reserved_top_h = top as u16;
+            let reserved_bot_h = bot as u16;
+            let chrome_h = reserved_top_h + reserved_bot_h;
 
-            let (scroll_area, pinned_area) = if reserved > 0 && content_area.height > reserved_h {
-                let sa = Rect {
-                    x: content_area.x,
-                    y: content_area.y,
-                    width: content_area.width,
-                    height: content_area.height - reserved_h,
+            let (pinned_top_area, scroll_area, pinned_bot_area) =
+                if chrome_h > 0 && content_area.height > chrome_h {
+                    let top_area = (top > 0).then_some(Rect {
+                        x: content_area.x,
+                        y: content_area.y,
+                        width: content_area.width,
+                        height: reserved_top_h,
+                    });
+                    let sa = Rect {
+                        x: content_area.x,
+                        y: content_area.y + reserved_top_h,
+                        width: content_area.width,
+                        height: content_area.height - chrome_h,
+                    };
+                    let bot_area = (bot > 0).then_some(Rect {
+                        x: content_area.x,
+                        y: sa.y + sa.height,
+                        width: content_area.width,
+                        height: reserved_bot_h,
+                    });
+                    (top_area, sa, bot_area)
+                } else {
+                    (None, content_area, None)
                 };
-                let pa = Rect {
-                    x: content_area.x,
-                    y: content_area.y + sa.height,
-                    width: content_area.width,
-                    height: reserved_h,
-                };
-                (sa, Some(pa))
-            } else {
-                (content_area, None)
-            };
 
             win.viewport_h = scroll_area.height;
             win.sync_scroll();
 
             let vh = win.viewport_h as usize;
-            let end = (win.scroll_offset + vh).min(scrollable_count);
-            let visible = &win.cached_lines[win.scroll_offset..end];
+            let end = (top + win.scroll_offset + vh).min(top + scrollable);
+            let visible = &win.cached_lines[top + win.scroll_offset..end];
 
             let lines: Vec<Line<'_>> = visible
                 .iter()
                 .enumerate()
                 .map(|(i, sline)| {
                     let mut line = snapshot_to_line(sline);
-                    if win.config.cursor_line && win.scroll_offset + i == win.cursor {
+                    if win.config.cursor_line && top + win.scroll_offset + i == win.cursor {
                         line = line.style(t.cmd_selected);
                     }
                     line
@@ -293,27 +299,58 @@ impl FloatManager {
 
             frame.render_widget(Paragraph::new(lines), scroll_area);
 
-            if let Some(pa) = pinned_area {
-                let pinned: Vec<Line<'_>> = win.cached_lines[scrollable_count..]
+            if let Some(pa) = pinned_top_area {
+                let pinned: Vec<Line<'_>> = win.cached_lines[..top]
                     .iter()
                     .map(snapshot_to_line)
                     .collect();
                 frame.render_widget(Paragraph::new(pinned), pa);
             }
 
-            if scrollable_count as u16 > win.viewport_h {
+            if let Some(pa) = pinned_bot_area {
+                let pinned: Vec<Line<'_>> = win.cached_lines[top + scrollable..]
+                    .iter()
+                    .map(snapshot_to_line)
+                    .collect();
+                frame.render_widget(Paragraph::new(pinned), pa);
+            }
+
+            if scrollable as u16 > win.viewport_h {
                 render_vertical_scrollbar(
                     frame,
                     scroll_area,
-                    scrollable_count as u16,
+                    scrollable as u16,
                     win.scroll_offset as u16,
                 );
             }
 
+            if Some(win.id) == self.focused_id {
+                self.focused_rect = Some(popup);
+            }
             union = union_rect(union, popup);
         }
 
         union
+    }
+
+    pub fn contains(&self, pos: ratatui::layout::Position) -> bool {
+        self.focused_rect.is_some_and(|r| r.contains(pos))
+    }
+
+    pub fn scroll(&mut self, delta: i32) {
+        let Some(fid) = self.focused_id else {
+            return;
+        };
+        let Some(win) = self.windows.iter_mut().find(|w| w.id == fid) else {
+            return;
+        };
+        let (_, _, scrollable) = win.chrome();
+        let max_offset = scrollable.saturating_sub(win.viewport_h as usize);
+        if delta > 0 {
+            win.scroll_offset = win.scroll_offset.saturating_sub(delta as usize);
+        } else {
+            win.scroll_offset = (win.scroll_offset + delta.unsigned_abs() as usize).min(max_offset);
+        }
     }
 
     pub fn is_open(&self) -> bool {
@@ -326,6 +363,7 @@ impl FloatManager {
         }
         self.windows.clear();
         self.focused_id = None;
+        self.focused_rect = None;
     }
 }
 
@@ -372,15 +410,13 @@ fn resolve_rect(config: &FloatConfig, area: Rect) -> Rect {
 fn adjust_scroll(
     cursor: usize,
     scroll_offset: usize,
-    content_len: usize,
+    scrollable_count: usize,
     viewport_h: u16,
-    reserved_bottom: usize,
 ) -> usize {
     let vh = viewport_h as usize;
     if vh == 0 {
         return scroll_offset;
     }
-    let scrollable_count = content_len.saturating_sub(reserved_bottom);
     let max_offset = scrollable_count.saturating_sub(vh);
     let mut offset = scroll_offset.min(max_offset);
     if cursor < offset {
@@ -389,10 +425,6 @@ fn adjust_scroll(
         offset = cursor + 1 - vh;
     }
     offset
-}
-
-fn clamp_cursor(cursor: usize, line_count: usize, reserved_bottom: usize) -> usize {
-    cursor.min(line_count.saturating_sub(1 + reserved_bottom))
 }
 
 fn snapshot_to_line(sline: &SnapshotLine) -> Line<'_> {
@@ -445,6 +477,9 @@ mod tests {
     const EXPECT_OPEN: &str = "expected manager to have open windows";
     const EXPECT_CLOSED: &str = "expected manager to have no open windows";
     const EXPECT_CURSOR: &str = "unexpected cursor position";
+    const EXPECT_PASTE_TRUE: &str = "handle_paste should return true when focused";
+    const EXPECT_PASTE_FALSE: &str = "handle_paste should return false with no focus";
+    const PASTE_TEXT: &str = "hello";
 
     fn make_line(text: &str) -> SnapshotLine {
         SnapshotLine {
@@ -645,33 +680,32 @@ mod tests {
         assert_eq!(r.y, 0, "only col is set, so row falls back to 0");
     }
 
-    #[test_case(0, 5, 0, 10, 0 => 0 ; "empty_content")]
-    #[test_case(3, 5, 10, 0, 0 => 5 ; "zero_viewport_is_noop")]
-    #[test_case(2, 5, 20, 5, 0 => 2 ; "cursor_above_viewport")]
-    #[test_case(15, 0, 20, 5, 0 => 11 ; "cursor_below_viewport")]
-    #[test_case(7, 0, 10, 1, 0 => 7 ; "single_line_viewport")]
-    #[test_case(7, 0, 10, 5, 2 => 3 ; "reserved_bottom_limits_max_offset")]
-    #[test_case(4, 0, 10, 5, 0 => 0 ; "cursor_exactly_at_viewport_bottom_edge")]
-    #[test_case(5, 0, 10, 5, 0 => 1 ; "cursor_one_past_viewport_bottom")]
-    #[test_case(0, 0, 3, 10, 0 => 0 ; "content_smaller_than_viewport")]
-    #[test_case(0, 99, 5, 3, 0 => 0 ; "scroll_offset_past_max_cursor_pulls_down")]
+    #[test_case(0, 5, 0, 10 => 0 ; "empty_content")]
+    #[test_case(3, 5, 10, 0 => 5 ; "zero_viewport_is_noop")]
+    #[test_case(2, 5, 20, 5 => 2 ; "cursor_above_viewport")]
+    #[test_case(15, 0, 20, 5 => 11 ; "cursor_below_viewport")]
+    #[test_case(7, 0, 10, 1 => 7 ; "single_line_viewport")]
+    #[test_case(7, 0, 8, 5 => 3 ; "reserved_bottom_limits_max_offset")]
+    #[test_case(4, 0, 10, 5 => 0 ; "cursor_exactly_at_viewport_bottom_edge")]
+    #[test_case(5, 0, 10, 5 => 1 ; "cursor_one_past_viewport_bottom")]
+    #[test_case(0, 0, 3, 10 => 0 ; "content_smaller_than_viewport")]
+    #[test_case(0, 99, 5, 3 => 0 ; "scroll_offset_past_max_cursor_pulls_down")]
     fn adjust_scroll_cases(
         cursor: usize,
         scroll: usize,
-        lines: usize,
+        scrollable_count: usize,
         vh: u16,
-        reserved: usize,
     ) -> usize {
-        adjust_scroll(cursor, scroll, lines, vh, reserved)
+        adjust_scroll(cursor, scroll, scrollable_count, vh)
     }
 
-    #[test_case(0, 5, 0 => 0 ; "at_start")]
-    #[test_case(10, 5, 0 => 4 ; "past_end")]
-    #[test_case(3, 5, 1 => 3 ; "within_range_with_reserved")]
-    #[test_case(4, 5, 1 => 3 ; "clamped_by_reserved")]
-    #[test_case(0, 0, 0 => 0 ; "empty_content")]
-    fn clamp_cursor_cases(cursor: usize, line_count: usize, reserved: usize) -> usize {
-        clamp_cursor(cursor, line_count, reserved)
+    #[test_case(0, 0, 0 => (0, 0, 0) ; "empty_lines")]
+    #[test_case(2, 3, 10 => (2, 3, 5) ; "both_fit")]
+    #[test_case(5, 5, 6 => (1, 5, 0) ; "bottom_wins_when_tight")]
+    #[test_case(5, 10, 3 => (0, 3, 0) ; "bottom_caps_at_line_count")]
+    #[test_case(0, 0, 7 => (0, 0, 7) ; "no_chrome")]
+    fn chrome_cases(top: usize, bot: usize, lines: usize) -> (usize, usize, usize) {
+        chrome(top, bot, lines)
     }
 
     #[test]
@@ -1043,5 +1077,223 @@ mod tests {
 
         assert!(mgr.windows[0].config.zindex <= mgr.windows[1].config.zindex);
         assert_eq!(mgr.windows.len(), 2);
+    }
+
+    #[test]
+    fn tick_reads_dirty_buf_before_processing_set_cursor() {
+        let mut mgr = FloatManager::new();
+        let (event_tx, cmd_rx, _event_rx, cmd_tx) = make_channels();
+        let buf = Arc::new(SharedBuf::new());
+        mgr.open(buf.clone(), make_config(), true, event_tx, cmd_rx);
+        assert_eq!(mgr.windows[0].cached_lines.len(), 0);
+
+        cmd_tx.send(WinCommand::SetCursor(5)).unwrap();
+        for i in 0..10 {
+            buf.append(make_line(&format!("line{i}")));
+        }
+
+        mgr.tick();
+
+        assert_eq!(mgr.windows[0].cached_lines.len(), 10);
+        assert_eq!(
+            mgr.windows[0].cursor, 5,
+            "{EXPECT_CURSOR}: SetCursor must be applied after the dirty buf is consumed",
+        );
+    }
+
+    #[test]
+    fn handle_paste_forwards_event_to_focused_window() {
+        let mut mgr = FloatManager::new();
+        let (event_rx, _cmd_tx) = open_with_lines(&mut mgr, &["a"]);
+
+        assert!(mgr.handle_paste(PASTE_TEXT), "{EXPECT_PASTE_TRUE}");
+        let found = event_rx
+            .drain()
+            .any(|e| matches!(e, WinEvent::Paste { text } if text == PASTE_TEXT));
+        assert!(found, "expected Paste event with matching text");
+    }
+
+    #[test]
+    fn handle_paste_returns_false_when_empty() {
+        let mgr = FloatManager::new();
+        assert!(!mgr.handle_paste("x"), "{EXPECT_PASTE_FALSE}");
+    }
+
+    #[test]
+    fn paste_only_goes_to_focused_window() {
+        let mut mgr = FloatManager::new();
+
+        let (tx1, rx1, erx1, _) = make_channels();
+        mgr.open(make_buf(&["a"]), make_config(), true, tx1, rx1);
+
+        let (tx2, rx2, erx2, _) = make_channels();
+        mgr.open(make_buf(&["b"]), make_config(), true, tx2, rx2);
+
+        assert_eq!(mgr.focused_id, Some(1), "latest focused window");
+        assert!(mgr.handle_paste(PASTE_TEXT), "{EXPECT_PASTE_TRUE}");
+
+        let win1_pastes: Vec<_> = erx1
+            .drain()
+            .filter(|e| matches!(e, WinEvent::Paste { .. }))
+            .collect();
+        let win2_pastes: Vec<_> = erx2
+            .drain()
+            .filter(|e| matches!(e, WinEvent::Paste { .. }))
+            .collect();
+        assert!(win1_pastes.is_empty(), "unfocused window gets nothing");
+        assert_eq!(win2_pastes.len(), 1, "only focused window gets the paste");
+    }
+
+    #[test]
+    fn reserved_top_clamps_cursor_down() {
+        let mut mgr = FloatManager::new();
+        let (event_tx, cmd_rx, _event_rx, cmd_tx) = make_channels();
+        let buf = make_buf(&["a", "b", "c", "d", "e"]);
+        let mut cfg = make_config();
+        cfg.reserved_top = 2;
+        mgr.open(buf, cfg, true, event_tx, cmd_rx);
+
+        cmd_tx.send(WinCommand::SetCursor(0)).unwrap();
+        mgr.tick();
+        assert_eq!(
+            mgr.windows[0].cursor, 2,
+            "{EXPECT_CURSOR}: cursor cannot enter reserved top rows",
+        );
+    }
+
+    #[test]
+    fn reserved_top_and_bottom_leave_single_scrollable_row() {
+        let mut mgr = FloatManager::new();
+        let (event_tx, cmd_rx, _event_rx, cmd_tx) = make_channels();
+        let buf = make_buf(&["a", "b", "c", "d", "e"]);
+        let mut cfg = make_config();
+        cfg.reserved_top = 2;
+        cfg.reserved_bottom = 2;
+        mgr.open(buf, cfg, true, event_tx, cmd_rx);
+
+        cmd_tx.send(WinCommand::SetCursor(99)).unwrap();
+        mgr.tick();
+        assert_eq!(
+            mgr.windows[0].cursor, 2,
+            "{EXPECT_CURSOR}: only row 2 is scrollable",
+        );
+    }
+
+    #[test]
+    fn reserved_top_yields_when_bottom_exceeds_content() {
+        let mut mgr = FloatManager::new();
+        let (event_tx, cmd_rx, _event_rx, _cmd_tx) = make_channels();
+        let buf = make_buf(&["a", "b", "c", "d", "e"]);
+        let mut cfg = make_config();
+        cfg.reserved_top = 10;
+        cfg.reserved_bottom = 10;
+        mgr.open(buf, cfg, true, event_tx, cmd_rx);
+
+        let (top, bot, scrollable) = mgr.windows[0].chrome();
+        assert_eq!(top, 0, "top yields when bottom consumes everything");
+        assert_eq!(bot, 5);
+        assert_eq!(scrollable, 0);
+    }
+
+    #[test]
+    fn scroll_clamps_at_max_offset_with_reserved_bottom() {
+        let mut mgr = FloatManager::new();
+        let (event_tx, cmd_rx, _event_rx, _cmd_tx) = make_channels();
+        let lines: Vec<String> = (0..10).map(|i| format!("line{i}")).collect();
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let buf = make_buf(&refs);
+        let mut cfg = make_config();
+        cfg.reserved_bottom = 3;
+        mgr.open(buf, cfg, true, event_tx, cmd_rx);
+
+        mgr.scroll(-1000);
+
+        let win = &mgr.windows[0];
+        let (_, _, scrollable) = win.chrome();
+        let expected_max = scrollable.saturating_sub(win.viewport_h as usize);
+        assert_eq!(
+            win.scroll_offset, expected_max,
+            "scroll_offset must clamp at scrollable - viewport_h",
+        );
+    }
+
+    #[test]
+    fn tick_consumes_all_appends_accumulated_between_ticks() {
+        let mut mgr = FloatManager::new();
+        let (event_tx, cmd_rx, _event_rx, _cmd_tx) = make_channels();
+        let buf = make_buf(&["initial"]);
+        mgr.open(buf.clone(), make_config(), true, event_tx, cmd_rx);
+        assert_eq!(mgr.windows[0].cached_lines.len(), 1);
+
+        buf.append(make_line("second"));
+        buf.append(make_line("third"));
+        mgr.tick();
+
+        assert_eq!(
+            mgr.windows[0].cached_lines.len(),
+            3,
+            "all appends since last read must be visible after one tick",
+        );
+    }
+
+    #[test]
+    fn close_before_set_cursor_in_same_tick_is_safe() {
+        let mut mgr = FloatManager::new();
+        let (_event_rx, cmd_tx) = open_with_lines(&mut mgr, &["a", "b", "c"]);
+
+        cmd_tx.send(WinCommand::Close).unwrap();
+        cmd_tx.send(WinCommand::SetCursor(2)).unwrap();
+        mgr.tick();
+
+        assert!(!mgr.is_open(), "{EXPECT_CLOSED}");
+    }
+
+    #[test]
+    fn close_all_is_idempotent() {
+        let mut mgr = FloatManager::new();
+        let (_event_rx, _cmd_tx) = open_with_lines(&mut mgr, &["a"]);
+
+        mgr.close_all();
+        mgr.close_all();
+        assert!(!mgr.is_open(), "{EXPECT_CLOSED}");
+        assert_eq!(mgr.focused_id, None);
+    }
+
+    #[test]
+    fn handle_key_after_focused_window_closed_returns_false() {
+        let mut mgr = FloatManager::new();
+        let (_event_rx, cmd_tx) = open_with_lines(&mut mgr, &["a"]);
+
+        cmd_tx.send(WinCommand::Close).unwrap();
+        mgr.tick();
+
+        let key_event = KeyEvent::new(
+            crossterm::event::KeyCode::Char('a'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        assert!(
+            !mgr.handle_key(key_event),
+            "no windows remain, so handle_key must return false",
+        );
+    }
+
+    #[test]
+    fn drop_sends_close_to_all_windows() {
+        let (tx1, rx1, erx1, _cmd_tx1) = make_channels();
+        let (tx2, rx2, erx2, _cmd_tx2) = make_channels();
+        {
+            let mut mgr = FloatManager::new();
+            mgr.open(make_buf(&["a"]), make_config(), true, tx1, rx1);
+            mgr.open(make_buf(&["b"]), make_config(), true, tx2, rx2);
+        }
+
+        assert!(
+            erx1.drain().any(|e| matches!(e, WinEvent::Close)),
+            "Drop must send Close to window 1",
+        );
+        assert!(
+            erx2.drain().any(|e| matches!(e, WinEvent::Close)),
+            "Drop must send Close to window 2",
+        );
     }
 }
