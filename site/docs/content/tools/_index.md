@@ -63,14 +63,14 @@ Prefer this over edit when making multiple changes to the same file.
 | `edits` | array | yes | Array of edit operations to apply sequentially |
 | `path` | string | yes | Absolute path to the file |
 
-### `glob`
+### `glob` *(lua plugin)*
 
 Find files by glob pattern.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | `path` | string | no | cwd | Directory to search in |
-| `pattern` | string | yes |  | Glob pattern (e.g. **/*.rs, src/**/*.ts) |
+| `pattern` | string | no |  | Glob pattern (e.g. **/*.rs, src/**/*.ts) |
 
 ### `grep`
 

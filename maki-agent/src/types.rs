@@ -204,9 +204,6 @@ pub enum ToolOutput {
     GrepResult {
         entries: Vec<GrepFileEntry>,
     },
-    GlobResult {
-        files: Vec<String>,
-    },
     Batch {
         entries: Vec<BatchToolEntry>,
         text: String,
@@ -253,7 +250,6 @@ impl ToolOutput {
             | Self::ReadDir { .. }
             | Self::WriteCode { .. }
             | Self::GrepResult { .. }
-            | Self::GlobResult { .. }
             | Self::TodoList(_) => Some(self.as_display_text()),
             _ => None,
         }
@@ -261,7 +257,6 @@ impl ToolOutput {
 
     pub fn is_empty_result(&self) -> bool {
         match self {
-            Self::GlobResult { files } => files.is_empty(),
             Self::GrepResult { entries } => entries.is_empty(),
             Self::ReadDir { text, .. } => text.is_empty(),
             Self::Plain(text) => text.is_empty(),
@@ -339,12 +334,6 @@ impl ToolOutput {
             } => {
                 let display = crate::tools::relative_path(path);
                 format!("wrote {byte_count} bytes to {display}")
-            }
-            Self::GlobResult { files } => {
-                if files.is_empty() {
-                    return NO_FILES_FOUND.into();
-                }
-                files.join("\n")
             }
             Self::GrepResult { entries } => {
                 let mut out = String::new();
@@ -773,13 +762,6 @@ mod tests {
         assert_eq!(output.as_text(), "ok");
     }
 
-    #[test_case(vec!["src/a.rs".into(), "src/b.rs".into()], "src/a.rs\nsrc/b.rs" ; "with_files")]
-    #[test_case(vec![],                                       NO_FILES_FOUND       ; "empty")]
-    fn as_text_glob_result(files: Vec<String>, expected: &str) {
-        let output = ToolOutput::GlobResult { files };
-        assert_eq!(output.as_text(), expected);
-    }
-
     #[test]
     fn as_text_grep_result_multi_file() {
         let output = ToolOutput::GrepResult {
@@ -1061,5 +1043,11 @@ mod tests {
         let json = serde_json::to_string(&span).unwrap();
         let parsed: SnapshotSpan = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, span);
+    }
+
+    #[test_case("", true  ; "plain_output_is_empty_for_empty_string")]
+    #[test_case("a.rs\nb.rs", false ; "plain_output_not_empty_for_content")]
+    fn plain_output_is_empty(text: &str, expected: bool) {
+        assert_eq!(ToolOutput::Plain(text.into()).is_empty_result(), expected);
     }
 }

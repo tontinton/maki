@@ -242,18 +242,6 @@ impl MessagesPanel {
                 let n = pairs.len();
                 msg.text = format!("{n} question{} answered", if n == 1 { "" } else { "s" });
             }
-            output @ ToolOutput::GlobResult { .. } => {
-                if output.is_empty_result() {
-                    msg.text = format!("{}\n{NO_FILES_FOUND}", msg.text);
-                } else {
-                    let display = output.as_display_text();
-                    let limits =
-                        output_limits_from_hints(&event.tool, hints, &self.tool_output_lines);
-                    let tr = truncate_output(&display, limits.max_lines, limits.keep);
-                    msg.truncated_lines = tr.skipped;
-                    msg.text = format!("{}\n{}", msg.text, tr.kept);
-                }
-            }
             ToolOutput::GrepResult { entries } if entries.is_empty() => {
                 msg.text = format!("{}\n{NO_FILES_FOUND}", msg.text);
             }

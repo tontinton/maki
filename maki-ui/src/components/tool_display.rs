@@ -93,9 +93,6 @@ pub(crate) fn tool_output_annotation(output: &ToolOutput) -> Option<String> {
             let f = if files == 1 { "file" } else { "files" };
             Some(format!("{matches} matches in {files} {f}"))
         }
-        ToolOutput::GlobResult { files } if !files.is_empty() => {
-            Some(format!("{} files", files.len()))
-        }
         ToolOutput::ReadDir { text, .. } => {
             let n = text.lines().count();
             Some(format!("{n} entries"))
@@ -254,7 +251,6 @@ impl HighlightRequest {
             | ToolOutput::ReadDir { .. }
             | ToolOutput::TodoList(_)
             | ToolOutput::Batch { .. }
-            | ToolOutput::GlobResult { .. }
             | ToolOutput::QuestionAnswers(_) => None,
         });
         if input.is_none() && output.is_none() {
@@ -383,7 +379,6 @@ fn resolve_output<'a>(
     let full_text: Option<Cow<'a, str>> = match output {
         Some(ToolOutput::Plain(t)) => Some(Cow::Borrowed(t.as_str())),
         Some(ToolOutput::ReadDir { text, .. }) => Some(Cow::Borrowed(text.as_str())),
-        Some(o @ ToolOutput::GlobResult { .. }) => Some(Cow::Owned(o.as_display_text())),
         _ => None,
     };
 
@@ -1226,8 +1221,6 @@ mod tests {
     #[test_case("read",  ToolOutput::ReadCode { path: "a.rs".into(), start_line: 10, lines: vec!["x".into(); 5], total_lines: 100, instructions: None }, Some("5 of 100 lines") ; "read_code_partial")]
     #[test_case("write", ToolOutput::WriteCode { path: "a.rs".into(), byte_count: 99, lines: vec![] }, Some("99 bytes") ; "write_code_bytes")]
     #[test_case("grep",  ToolOutput::GrepResult { entries: vec![GrepFileEntry { path: "a.rs".into(), groups: vec![GrepMatchGroup::single(1, "hit")] }] }, Some("1 matches in 1 file") ; "grep_file_count")]
-    #[test_case("glob",  ToolOutput::GlobResult { files: vec!["a".into(), "b".into()] }, Some("2 files") ; "glob_file_count")]
-    #[test_case("glob",  ToolOutput::GlobResult { files: vec![] },            None                ; "glob_empty_no_annotation")]
     #[test_case("edit",  ToolOutput::Diff { path: "a.rs".into(), before: String::new(), after: String::new(), summary: "ok".into() }, None ; "diff_no_annotation")]
     fn annotation_cases(_tool: &str, output: ToolOutput, expected: Option<&str>) {
         assert_eq!(tool_output_annotation(&output).as_deref(), expected);
@@ -1498,11 +1491,6 @@ mod tests {
         Some(ToolOutput::ReadDir { text: "dir listing".into(), instructions: None }),
         None, "read", true
         ; "readdir_uses_text_field"
-    )]
-    #[test_case(
-        Some(ToolOutput::GlobResult { files: vec!["a.rs".into()] }),
-        None, "glob", true
-        ; "glob_uses_display_text"
     )]
     #[test_case(
         Some(ToolOutput::ReadCode { path: "a.rs".into(), start_line: 1, lines: vec![], total_lines: 0, instructions: None }),

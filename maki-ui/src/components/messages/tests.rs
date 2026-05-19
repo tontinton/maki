@@ -2,9 +2,7 @@ use super::segment;
 use super::*;
 use crate::components::scrollbar::SCROLLBAR_THUMB;
 use crate::selection::{Selection, SelectionZone};
-use maki_agent::tools::{
-    BASH_TOOL_NAME, GLOB_TOOL_NAME, GREP_TOOL_NAME, QUESTION_TOOL_NAME, WRITE_TOOL_NAME,
-};
+use maki_agent::tools::{BASH_TOOL_NAME, GREP_TOOL_NAME, QUESTION_TOOL_NAME, WRITE_TOOL_NAME};
 use maki_agent::{
     BatchToolEntry, GrepFileEntry, GrepMatchGroup, QuestionAnswer, SnapshotLine, SnapshotSpan,
     SpanStyle, ToolInput, ToolOutput,
@@ -107,33 +105,6 @@ fn grep_output(n_files: usize) -> ToolOutput {
             })
             .collect(),
     }
-}
-
-#[test_case(
-    ToolOutput::GlobResult { files: vec!["a.rs".into(), "b.rs".into()] },
-    true, false
-    ; "glob_with_files_shows_count"
-)]
-#[test_case(
-    ToolOutput::GlobResult { files: vec![] },
-    false, true
-    ; "glob_empty_shows_no_files_found"
-)]
-fn tool_done_glob_result(output: ToolOutput, has_file_count: bool, has_no_files_msg: bool) {
-    let mut panel = MessagesPanel::new(UiConfig::default());
-    panel.tool_start(start("t1", GLOB_TOOL_NAME));
-    panel.tool_done(ToolDoneEvent {
-        id: "t1".into(),
-        tool: GLOB_TOOL_NAME.into(),
-        output,
-        is_error: false,
-    });
-    let has_annotation = panel.messages[0].annotation.is_some();
-    assert_eq!(has_annotation, has_file_count);
-    assert_eq!(
-        panel.messages[0].text.contains(NO_FILES_FOUND),
-        has_no_files_msg
-    );
 }
 
 #[test]

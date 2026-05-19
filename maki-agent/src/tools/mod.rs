@@ -11,7 +11,6 @@ mod code_execution;
 mod edit;
 mod file_tracker;
 mod fuzzy_replace;
-mod glob;
 mod grep;
 mod multiedit;
 mod question;
@@ -124,7 +123,7 @@ pub fn is_tool_enabled(config: &AgentConfig, name: &str) -> bool {
 pub const BASH_TOOL_NAME: &str = "bash";
 pub const BATCH_TOOL_NAME: &str = batch::Batch::NAME;
 pub const EDIT_TOOL_NAME: &str = edit::Edit::NAME;
-pub const GLOB_TOOL_NAME: &str = glob::Glob::NAME;
+pub const GLOB_TOOL_NAME: &str = "glob";
 pub const GREP_TOOL_NAME: &str = grep::Grep::NAME;
 pub const MULTIEDIT_TOOL_NAME: &str = multiedit::MultiEdit::NAME;
 pub const QUESTION_TOOL_NAME: &str = question::Question::NAME;
@@ -222,7 +221,7 @@ pub(crate) fn resolve_path(path: &str) -> Result<String, String> {
     }
 }
 
-pub(crate) fn resolve_search_path(path: Option<&str>) -> Result<String, String> {
+pub fn resolve_search_path(path: Option<&str>) -> Result<String, String> {
     match path {
         Some(p) => resolve_path(p),
         None => env::current_dir()
@@ -258,8 +257,17 @@ fn format_rel(prefix: &str, fallback: &str, rel: &Path) -> String {
     }
 }
 
-/// Returns a `WalkBuilder` with `.hidden(false)` and `!.git` exclusion enforced.
-pub(crate) fn walk_builder(root: &str, patterns: &[&str]) -> Result<WalkBuilder, String> {
+/// Convenience wrapper that always respects gitignore.
+pub fn walk_builder(root: &str, patterns: &[&str]) -> Result<WalkBuilder, String> {
+    walk_builder_opts(root, patterns, true)
+}
+
+/// `.git` is always excluded, even when `gitignore` is false.
+pub fn walk_builder_opts(
+    root: &str,
+    patterns: &[&str],
+    gitignore: bool,
+) -> Result<WalkBuilder, String> {
     let mut ob = ignore::overrides::OverrideBuilder::new(root);
     ob.add("!.git").expect("!.git is a valid glob");
 
@@ -274,10 +282,16 @@ pub(crate) fn walk_builder(root: &str, patterns: &[&str]) -> Result<WalkBuilder,
 
     let mut wb = WalkBuilder::new(root);
     wb.hidden(false).overrides(overrides);
+    if !gitignore {
+        wb.ignore(false)
+            .git_ignore(false)
+            .git_global(false)
+            .git_exclude(false);
+    }
     Ok(wb)
 }
 
-pub(crate) fn mtime(path: &Path) -> SystemTime {
+pub fn mtime(path: &Path) -> SystemTime {
     fs::metadata(path)
         .and_then(|m| m.modified())
         .unwrap_or(SystemTime::UNIX_EPOCH)
@@ -530,7 +544,6 @@ register_tools! {
     write::Write,
     edit::Edit,
     multiedit::MultiEdit,
-    glob::Glob,
     grep::Grep,
     question::Question,
     todowrite::TodoWrite,
@@ -707,7 +720,7 @@ mod tests {
     use super::*;
     use crate::agent::tool_dispatch;
     use crate::template::Vars;
-    use crate::{AgentError, NO_FILES_FOUND, ToolOutput};
+    use crate::{AgentError, NO_FILES_FOUND};
 
     const LINE_LIMIT: usize = 500;
     const PARSE_INTERNAL_BUG: &str = "internal validator bug";
@@ -792,32 +805,6 @@ mod tests {
             assert!(slice.contains("3: line3"));
             assert!(slice.contains("4: line4"));
             assert!(!slice.contains("5: line5"));
-        });
-    }
-
-    #[test]
-    fn glob_finds_and_misses() {
-        smol::block_on(async {
-            let dir = TempDir::new().unwrap();
-            fs::write(dir.path().join("a.txt"), "hello").unwrap();
-            fs::write(dir.path().join("b.txt"), "world").unwrap();
-            fs::write(dir.path().join("c.rs"), "fn main(){}").unwrap();
-            let dir_str = dir.path().to_string_lossy().to_string();
-            let ctx = stub_ctx(&AgentMode::Build);
-
-            let g = glob::Glob::parse_input(&json!({"pattern": "*.txt", "path": dir_str})).unwrap();
-            let output = g.execute(&ctx).await.unwrap();
-            let ToolOutput::GlobResult { files } = &output else {
-                panic!("expected GlobResult");
-            };
-            assert_eq!(files.len(), 2);
-            assert!(files.iter().all(|f| f.contains(".txt")));
-            assert!(files.iter().all(|f| !f.contains(".rs")));
-
-            let g =
-                glob::Glob::parse_input(&json!({"pattern": "*.nope", "path": dir_str})).unwrap();
-            let output = g.execute(&ctx).await.unwrap();
-            assert!(matches!(output, ToolOutput::GlobResult { files } if files.is_empty()));
         });
     }
 
@@ -970,7 +957,7 @@ mod tests {
     #[test]
     fn definitions_filtered_returns_only_requested() {
         let vars = Vars::new().set("{cwd}", "/tmp");
-        let filter = ToolFilter::Only(vec!["read".into(), "glob".into()]);
+        let filter = ToolFilter::Only(vec!["read".into(), "grep".into()]);
         let ctx = DescriptionContext { filter: &filter };
         let filtered = ToolRegistry::native().definitions(&vars, &ctx, true);
         let names: Vec<&str> = filtered
@@ -979,7 +966,7 @@ mod tests {
             .iter()
             .map(|d| d["name"].as_str().unwrap())
             .collect();
-        assert_eq!(names, ["read", "glob"]);
+        assert_eq!(names, ["read", "grep"]);
     }
 
     #[test_case("write",     |p: &str, _: &str| json!({"path": p, "content": "plan"})                          , |_: &str, o: &str| json!({"path": o, "content": "x"})                           ; "write")]
@@ -1224,5 +1211,78 @@ mod tests {
             tool: "multiedit".into(),
             message,
         };
+    }
+
+    #[test]
+    fn walk_builder_opts_gitignore_false_includes_ignored() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(root)
+            .status()
+            .unwrap();
+        fs::write(root.join(".gitignore"), "*.log\n").unwrap();
+        fs::write(root.join("test.log"), "log data").unwrap();
+        fs::write(root.join("test.txt"), "text data").unwrap();
+
+        let root_str = root.to_string_lossy();
+
+        let collect = |wb: WalkBuilder| -> Vec<String> {
+            wb.build()
+                .flatten()
+                .filter(|e| e.file_type().is_some_and(|ft| ft.is_file()))
+                .map(|e| e.into_path().to_string_lossy().to_string())
+                .collect::<Vec<_>>()
+        };
+
+        let with_ignored = collect(walk_builder_opts(&root_str, &[], false).unwrap());
+        assert!(
+            with_ignored.iter().any(|p| p.ends_with("test.log")),
+            "gitignore=false should include test.log, got: {with_ignored:?}"
+        );
+        assert!(
+            with_ignored.iter().any(|p| p.ends_with("test.txt")),
+            "gitignore=false should include test.txt, got: {with_ignored:?}"
+        );
+
+        let without_ignored = collect(walk_builder_opts(&root_str, &[], true).unwrap());
+        assert!(
+            !without_ignored.iter().any(|p| p.ends_with("test.log")),
+            "gitignore=true should exclude test.log, got: {without_ignored:?}"
+        );
+        assert!(
+            without_ignored.iter().any(|p| p.ends_with("test.txt")),
+            "gitignore=true should include test.txt, got: {without_ignored:?}"
+        );
+
+        assert!(
+            !with_ignored.iter().any(|p| p.contains(".git/")),
+            ".git/ must be excluded even with gitignore=false, got: {with_ignored:?}"
+        );
+    }
+
+    #[test]
+    fn walk_builder_invalid_pattern_returns_error() {
+        let tmp = TempDir::new().unwrap();
+        let root_str = tmp.path().to_string_lossy();
+        let err = walk_builder(&root_str, &["["]).unwrap_err();
+        assert!(
+            err.contains("invalid glob pattern"),
+            "expected 'invalid glob pattern', got: {err}"
+        );
+    }
+
+    #[test]
+    fn glob_not_in_native_registry() {
+        let registry = ToolRegistry::native();
+        for entry in registry.iter().iter() {
+            assert_ne!(
+                entry.name(),
+                "glob",
+                "glob should not be in the native Rust tool registry"
+            );
+        }
     }
 }

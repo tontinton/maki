@@ -554,12 +554,12 @@ mod tests {
     fn flat_batch_entries_actually_execute() {
         smol::block_on(async {
             let dir = tempfile::TempDir::new().unwrap();
-            std::fs::write(dir.path().join("a.txt"), "hello").unwrap();
+            std::fs::write(dir.path().join("a.txt"), "hello world").unwrap();
             let dir_str = dir.path().to_string_lossy().to_string();
 
             let (entries, text) = run_batch(json!({
                 "tool_calls": [
-                    {"tool": "glob", "path": dir_str, "pattern": "*.txt"}
+                    {"tool": "grep", "path": dir_str, "pattern": "hello"}
                 ]
             }))
             .await;

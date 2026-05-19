@@ -57,8 +57,15 @@ pub const MIN_CONNECT_TIMEOUT_SECS: u64 = 1;
 pub const MIN_LOW_SPEED_TIMEOUT_SECS: u64 = 1;
 pub const MIN_STREAM_TIMEOUT_SECS: u64 = 10;
 
-pub const DEFAULT_BUILTINS: &[&str] =
-    &["bash", "index", "memory", "skill", "webfetch", "websearch"];
+pub const DEFAULT_BUILTINS: &[&str] = &[
+    "bash",
+    "glob",
+    "index",
+    "memory",
+    "skill",
+    "webfetch",
+    "websearch",
+];
 
 #[derive(Debug, Clone, Copy)]
 pub enum ConfigValue {
@@ -1577,5 +1584,17 @@ mod tests {
         assert!(config.plugins.tools.contains(&"bash".to_string()));
         assert!(!config.plugins.tools.contains(&"websearch".to_string()));
         assert!(config.plugins.tools.contains(&"index".to_string()));
+    }
+
+    #[test]
+    fn default_builtins_sorted() {
+        for pair in DEFAULT_BUILTINS.windows(2) {
+            assert!(
+                pair[0] < pair[1],
+                "DEFAULT_BUILTINS not sorted: {:?} >= {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
     }
 }

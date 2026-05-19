@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::collections::HashSet;
 use std::fs::FileType;
 use std::io::ErrorKind;
@@ -360,11 +361,92 @@ pub(crate) fn create_fs_table(lua: &Lua) -> LuaResult<Table> {
         })?,
     )?;
 
+    t.set(
+        "glob",
+        lua.create_async_function(
+            |lua, (patterns, opts): (mlua::Value, Option<Table>)| async move {
+                let patterns: Vec<String> = match patterns {
+                    mlua::Value::String(s) => vec![s.to_str()?.to_owned()],
+                    mlua::Value::Table(t) => {
+                        let mut v = Vec::new();
+                        for val in t.sequence_values::<String>() {
+                            v.push(val?);
+                        }
+                        v
+                    }
+                    _ => {
+                        return Err(mlua::Error::runtime(
+                            "glob: patterns must be a string or array of strings",
+                        ));
+                    }
+                };
+
+                let path = opts.as_ref().and_then(|t| t.get::<String>("path").ok());
+                let limit = opts.as_ref().and_then(|t| t.get::<usize>("limit").ok());
+                let gitignore = opts
+                    .as_ref()
+                    .and_then(|t| t.get::<bool>("gitignore").ok())
+                    .unwrap_or(true);
+                let sort = opts.as_ref().and_then(|t| t.get::<String>("sort").ok());
+                let sort_mtime = sort.as_deref() == Some("mtime");
+
+                let results = smol::unblock(move || {
+                    let root = maki_agent::tools::resolve_search_path(path.as_deref())
+                        .map_err(mlua::Error::runtime)?;
+                    let pattern_refs: Vec<&str> = patterns.iter().map(|s| s.as_str()).collect();
+
+                    let walker =
+                        maki_agent::tools::walk_builder_opts(&root, &pattern_refs, gitignore)
+                            .map_err(mlua::Error::runtime)?
+                            .build();
+
+                    let iter = walker
+                        .flatten()
+                        .filter(|e| e.file_type().is_some_and(|ft| ft.is_file()));
+
+                    let paths: Vec<String> = if sort_mtime {
+                        let mut entries: Vec<_> = iter
+                            .filter_map(|e| {
+                                let p = e.into_path();
+                                let mt = maki_agent::tools::mtime(&p);
+                                p.to_str().map(|s| (mt, s.to_owned()))
+                            })
+                            .collect();
+                        entries.sort_unstable_by_key(|e| Reverse(e.0));
+                        if let Some(lim) = limit {
+                            entries.truncate(lim);
+                        }
+                        entries.into_iter().map(|(_, s)| s).collect()
+                    } else {
+                        let bounded: Box<dyn Iterator<Item = _>> = match limit {
+                            Some(lim) => Box::new(iter.take(lim)),
+                            None => Box::new(iter),
+                        };
+                        bounded
+                            .filter_map(|e| e.into_path().to_str().map(|s| s.to_owned()))
+                            .collect()
+                    };
+
+                    Ok::<_, mlua::Error>(paths)
+                })
+                .await?;
+
+                let tbl = lua.create_table()?;
+                for (i, path) in results.iter().enumerate() {
+                    tbl.set(i + 1, path.as_str())?;
+                }
+                Ok(tbl)
+            },
+        )?,
+    )?;
+
     Ok(t)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, SystemTime};
+
     use super::*;
     use mlua::Lua;
     use tempfile::TempDir;
@@ -720,5 +802,178 @@ mod tests {
             matches!(ok, mlua::Value::Boolean(true)),
             "parents=true should be idempotent"
         );
+    }
+
+    #[test]
+    fn glob_finds_matching_files() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("a.rs"), "fn main(){}").unwrap();
+        std::fs::write(tmp.path().join("b.txt"), "hello").unwrap();
+        let dir_str = tmp.path().to_string_lossy().to_string();
+
+        let lua = Lua::new();
+        let tbl = create_fs_table(&lua).unwrap();
+        let glob: mlua::Function = tbl.get("glob").unwrap();
+
+        let opts = lua.create_table().unwrap();
+        opts.set("path", dir_str.as_str()).unwrap();
+
+        let result: Table = smol::block_on(glob.call_async::<Table>(("*.rs", opts))).unwrap();
+
+        let mut paths: Vec<String> = Vec::new();
+        for i in 1..=result.len().unwrap() {
+            paths.push(result.get::<String>(i).unwrap());
+        }
+        assert_eq!(paths.len(), 1);
+        assert!(paths[0].ends_with("a.rs"));
+    }
+
+    #[test]
+    fn glob_multiple_patterns_union() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("a.rs"), "").unwrap();
+        std::fs::write(tmp.path().join("b.txt"), "").unwrap();
+        std::fs::write(tmp.path().join("c.py"), "").unwrap();
+
+        let lua = Lua::new();
+        let tbl = create_fs_table(&lua).unwrap();
+        let glob: mlua::Function = tbl.get("glob").unwrap();
+
+        let patterns = lua.create_table().unwrap();
+        patterns.set(1, "*.rs").unwrap();
+        patterns.set(2, "*.txt").unwrap();
+
+        let opts = lua.create_table().unwrap();
+        opts.set("path", tmp.path().to_str().unwrap()).unwrap();
+
+        let result: Table = smol::block_on(glob.call_async::<Table>((patterns, opts))).unwrap();
+
+        let mut paths: Vec<String> = Vec::new();
+        for i in 1..=result.len().unwrap() {
+            paths.push(result.get::<String>(i).unwrap());
+        }
+        paths.sort();
+        assert_eq!(paths.len(), 2);
+        assert!(paths[0].ends_with("a.rs"));
+        assert!(paths[1].ends_with("b.txt"));
+    }
+
+    #[test]
+    fn glob_limit_caps_results() {
+        let tmp = TempDir::new().unwrap();
+        for i in 0..5 {
+            std::fs::write(tmp.path().join(format!("f{i}.rs")), "").unwrap();
+        }
+
+        let lua = Lua::new();
+        let tbl = create_fs_table(&lua).unwrap();
+        let glob: mlua::Function = tbl.get("glob").unwrap();
+
+        let opts = lua.create_table().unwrap();
+        opts.set("path", tmp.path().to_str().unwrap()).unwrap();
+        opts.set("limit", 2).unwrap();
+
+        let result: Table = smol::block_on(glob.call_async::<Table>(("*.rs", opts))).unwrap();
+        assert_eq!(result.len().unwrap(), 2);
+    }
+
+    #[test]
+    fn glob_no_matches_returns_empty_table() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("a.rs"), "").unwrap();
+
+        let lua = Lua::new();
+        let tbl = create_fs_table(&lua).unwrap();
+        let glob: mlua::Function = tbl.get("glob").unwrap();
+
+        let opts = lua.create_table().unwrap();
+        opts.set("path", tmp.path().to_str().unwrap()).unwrap();
+
+        let result: Table = smol::block_on(glob.call_async::<Table>(("*.nope", opts))).unwrap();
+        assert_eq!(result.len().unwrap(), 0);
+    }
+
+    #[test]
+    fn glob_invalid_pattern_type_errors() {
+        let lua = Lua::new();
+        let tbl = create_fs_table(&lua).unwrap();
+        let glob: mlua::Function = tbl.get("glob").unwrap();
+
+        let err = smol::block_on(glob.call_async::<Table>((mlua::Value::Integer(42), mlua::Nil)))
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("patterns must be a string or array of strings"),
+        );
+    }
+
+    #[test]
+    fn glob_mtime_sort_newest_first() {
+        let tmp = TempDir::new().unwrap();
+        let old_path = tmp.path().join("old.rs");
+        let new_path = tmp.path().join("new.rs");
+        std::fs::write(&old_path, "").unwrap();
+        std::fs::write(&new_path, "").unwrap();
+
+        let old_time = SystemTime::now() - Duration::from_secs(60);
+        let new_time = SystemTime::now();
+        std::fs::File::open(&old_path)
+            .unwrap()
+            .set_modified(old_time)
+            .unwrap();
+        std::fs::File::open(&new_path)
+            .unwrap()
+            .set_modified(new_time)
+            .unwrap();
+
+        let lua = Lua::new();
+        let tbl = create_fs_table(&lua).unwrap();
+        let glob: mlua::Function = tbl.get("glob").unwrap();
+
+        let opts = lua.create_table().unwrap();
+        opts.set("path", tmp.path().to_str().unwrap()).unwrap();
+        opts.set("sort", "mtime").unwrap();
+
+        let result: Table = smol::block_on(glob.call_async::<Table>(("*.rs", opts))).unwrap();
+
+        let first: String = result.get(1).unwrap();
+        let second: String = result.get(2).unwrap();
+        assert!(first.ends_with("new.rs"));
+        assert!(second.ends_with("old.rs"));
+    }
+
+    #[test]
+    fn glob_no_opts_uses_cwd() {
+        let lua = Lua::new();
+        let tbl = create_fs_table(&lua).unwrap();
+        let glob: mlua::Function = tbl.get("glob").unwrap();
+
+        let result = smol::block_on(glob.call_async::<Table>(("*.rs", mlua::Nil)));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn glob_path_option_scopes_to_directory() {
+        let tmp = TempDir::new().unwrap();
+        let sub = tmp.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("inner.rs"), "").unwrap();
+        std::fs::write(tmp.path().join("outer.rs"), "").unwrap();
+
+        let lua = Lua::new();
+        let tbl = create_fs_table(&lua).unwrap();
+        let glob: mlua::Function = tbl.get("glob").unwrap();
+
+        let opts = lua.create_table().unwrap();
+        opts.set("path", sub.to_str().unwrap()).unwrap();
+
+        let result: Table = smol::block_on(glob.call_async::<Table>(("*.rs", opts))).unwrap();
+
+        let mut paths: Vec<String> = Vec::new();
+        for i in 1..=result.len().unwrap() {
+            paths.push(result.get::<String>(i).unwrap());
+        }
+        assert_eq!(paths.len(), 1);
+        assert!(paths[0].ends_with("inner.rs"));
     }
 }

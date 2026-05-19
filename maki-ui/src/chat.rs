@@ -18,8 +18,8 @@ use crate::markdown::truncate_output;
 use crate::selection::Selection;
 use maki_agent::tools::{ToolInvocation, ToolRegistry};
 use maki_agent::{
-    AgentEvent, BatchToolStatus, BufferSnapshot, NO_FILES_FOUND, QuestionInfo, SharedBuf,
-    ToolDoneEvent, ToolOutput, ToolStartEvent,
+    AgentEvent, BatchToolStatus, BufferSnapshot, QuestionInfo, SharedBuf, ToolDoneEvent,
+    ToolOutput, ToolStartEvent,
 };
 use maki_config::{ToolOutputLines, UiConfig};
 use maki_providers::{ContentBlock, Message, Role, TokenUsage};
@@ -442,18 +442,6 @@ fn build_loaded_tool(
 ) -> (String, usize, Option<Arc<ToolOutput>>, Option<String>) {
     let hints = registry.get(tool);
     match reconstructed {
-        Some(ref output @ ToolOutput::GlobResult { .. }) => {
-            let annotation = tool_output_annotation(output);
-            let text = if output.is_empty_result() {
-                format!("{summary}\n{NO_FILES_FOUND}")
-            } else {
-                let display = output.as_display_text();
-                let limits = output_limits_from_hints(tool, hints, tool_output_lines);
-                let tr = truncate_output(&display, limits.max_lines, limits.keep);
-                format!("{}\n{}", summary, tr.kept)
-            };
-            (text, 0, reconstructed.map(Arc::new), annotation)
-        }
         Some(ref output @ ToolOutput::GrepResult { .. }) => {
             let annotation = tool_output_annotation(output);
             (

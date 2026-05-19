@@ -298,13 +298,9 @@ pub fn mock_events() -> Vec<MockEvent> {
     events.push(evt(tool_done(
         "t_glob",
         GLOB_TOOL_NAME,
-        ToolOutput::GlobResult {
-            files: vec![
-                "src/config/mod.rs".into(),
-                "src/config/builder.rs".into(),
-                "src/config/validation.rs".into(),
-            ],
-        },
+        ToolOutput::Plain(
+            "src/config/mod.rs\nsrc/config/builder.rs\nsrc/config/validation.rs".into(),
+        ),
         false,
     )));
 
