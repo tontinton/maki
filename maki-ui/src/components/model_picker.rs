@@ -33,13 +33,17 @@ fn footer_line() -> Line<'static> {
 }
 
 fn tier_for_shortcut(key: KeyEvent) -> Option<ModelTier> {
-    if !key.modifiers.contains(KeyModifiers::ALT) {
-        return None;
-    }
-    match key.code {
-        KeyCode::Char('1') => Some(ModelTier::Strong),
-        KeyCode::Char('2') => Some(ModelTier::Medium),
-        KeyCode::Char('3') => Some(ModelTier::Weak),
+    let digit = match key.code {
+        KeyCode::Char(c @ '1'..='3') if key.modifiers.contains(KeyModifiers::ALT) => c,
+        KeyCode::Char('¡') => '1',
+        KeyCode::Char('™') => '2',
+        KeyCode::Char('£') => '3',
+        _ => return None,
+    };
+    match digit {
+        '1' => Some(ModelTier::Strong),
+        '2' => Some(ModelTier::Medium),
+        '3' => Some(ModelTier::Weak),
         _ => None,
     }
 }
@@ -309,14 +313,16 @@ mod tests {
         assert!(parse_model_entry("no-slash").is_none());
     }
 
-    // Regression: Alt+1/2/3 must work on every provider, not just Ollama.
-    #[test_case(KeyCode::Char('1'), ModelTier::Strong ; "alt_1_strong")]
-    #[test_case(KeyCode::Char('2'), ModelTier::Medium ; "alt_2_medium")]
-    #[test_case(KeyCode::Char('3'), ModelTier::Weak   ; "alt_3_weak")]
-    fn tier_shortcut_assigns_and_keeps_picker_open(code: KeyCode, want: ModelTier) {
+    #[test_case(alt_key(KeyCode::Char('1')),       ModelTier::Strong ; "alt_1_strong")]
+    #[test_case(alt_key(KeyCode::Char('2')),       ModelTier::Medium ; "alt_2_medium")]
+    #[test_case(alt_key(KeyCode::Char('3')),       ModelTier::Weak   ; "alt_3_weak")]
+    #[test_case(key(KeyCode::Char('\u{00A1}')),    ModelTier::Strong ; "macos_opt_1_strong")]
+    #[test_case(key(KeyCode::Char('\u{2122}')),    ModelTier::Medium ; "macos_opt_2_medium")]
+    #[test_case(key(KeyCode::Char('\u{00A3}')),    ModelTier::Weak   ; "macos_opt_3_weak")]
+    fn tier_shortcut_assigns_and_keeps_picker_open(k: KeyEvent, want: ModelTier) {
         let mut p = ModelPicker::new(test_models());
         p.open("");
-        let action = p.handle_key(alt_key(code));
+        let action = p.handle_key(k);
         assert!(
             matches!(&action, ModelPickerAction::AssignTier(s, t)
                 if s == "anthropic/claude-sonnet-4-20250514" && *t == want),
