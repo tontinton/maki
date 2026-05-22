@@ -107,17 +107,13 @@ impl ToolFilter {
             )
         };
         let mut exclude: Vec<&str> = extra_exclude.to_vec();
-        exclude.extend(disabled_tool_names(config));
+        exclude.extend(config.disabled_tools.iter().map(|s| s.as_str()));
         base.excluding(&exclude)
     }
 }
 
-fn disabled_tool_names(_config: &AgentConfig) -> Vec<&'static str> {
-    Vec::new()
-}
-
 pub fn is_tool_enabled(config: &AgentConfig, name: &str) -> bool {
-    !disabled_tool_names(config).contains(&name)
+    !config.disabled_tools.iter().any(|s| s == name)
 }
 
 pub const BASH_TOOL_NAME: &str = "bash";

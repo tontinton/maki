@@ -170,10 +170,16 @@ impl RawConfig {
     }
 
     pub fn into_config(self, no_rtk: bool) -> Config {
+        let disabled_tools: Vec<String> = self
+            .tools
+            .iter()
+            .filter(|(_, cfg)| cfg.enabled == Some(false))
+            .map(|(name, _)| name.clone())
+            .collect();
         Config {
             always_yolo: self.always_yolo.unwrap_or(false),
             ui: UiConfig::from_file(self.ui),
-            agent: AgentConfig::from_file(self.agent, no_rtk, &self.index),
+            agent: AgentConfig::from_file(self.agent, no_rtk, &self.index, disabled_tools),
             provider: ProviderConfig::from_file(self.provider),
             storage: StorageConfig::from_file(self.storage),
             permissions: PermissionsConfig::default(),
@@ -592,10 +598,18 @@ pub struct AgentConfig {
 
     #[config(skip, default = "Vec::new()")]
     pub allowed_tools: Vec<String>,
+
+    #[config(skip, default = "Vec::new()")]
+    pub disabled_tools: Vec<String>,
 }
 
 impl AgentConfig {
-    fn from_file(file: AgentFileConfig, no_rtk: bool, index_file_config: &IndexFileConfig) -> Self {
+    fn from_file(
+        file: AgentFileConfig,
+        no_rtk: bool,
+        index_file_config: &IndexFileConfig,
+        disabled_tools: Vec<String>,
+    ) -> Self {
         Self {
             no_rtk,
             max_output_bytes: file.max_output_bytes.unwrap_or(DEFAULT_MAX_OUTPUT_BYTES),
@@ -624,6 +638,7 @@ impl AgentConfig {
                 * 1024
                 * 1024,
             allowed_tools: Vec::new(),
+            disabled_tools,
         }
     }
 
