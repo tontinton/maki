@@ -164,7 +164,7 @@ pub struct App {
     pub(crate) storage: StateDir,
     pub(crate) shared_history: Option<Arc<ArcSwap<Vec<Message>>>>,
     pub(crate) shared_tool_outputs: Option<Arc<Mutex<HashMap<String, ToolOutput>>>>,
-    pub(crate) image_paste_rx: Option<flume::Receiver<Result<ImageSource, String>>>,
+    pub(crate) image_paste_rx: Vec<flume::Receiver<Result<ImageSource, String>>>,
     storage_writer: Arc<StorageWriter>,
     pub(crate) shell: shell::ShellState,
     pub(crate) ui_config: UiConfig,
@@ -235,7 +235,7 @@ impl App {
             storage,
             shared_history: None,
             shared_tool_outputs: None,
-            image_paste_rx: None,
+            image_paste_rx: vec![],
             storage_writer,
             shell: shell::ShellState::default(),
             ui_config,
@@ -289,15 +289,22 @@ impl App {
             Msg::Paste(text) => {
                 let text = text.replace("\r\n", "\n").replace('\r', "\n");
                 if text.is_empty() {
-                    if self.is_main_chat() && self.image_paste_rx.is_none() {
+                    if self.is_main_chat() && self.image_paste_rx.is_empty() {
                         self.start_image_paste();
                     }
-                } else if let Some((path, media_type)) = image::try_parse_image_path(&text) {
-                    if self.is_main_chat() && self.image_paste_rx.is_none() {
-                        self.start_file_image_paste(path, media_type);
-                    }
                 } else {
-                    self.route_text_paste(&text);
+                    let mut any_image = false;
+                    if self.is_main_chat() {
+                        for line in text.lines() {
+                            if let Some((path, mt)) = image::try_parse_image_path(line) {
+                                self.start_file_image_paste(path, mt);
+                                any_image = true;
+                            }
+                        }
+                    }
+                    if !any_image {
+                        self.route_text_paste(&text);
+                    }
                 }
                 vec![]
             }
@@ -693,7 +700,7 @@ impl App {
                 self.search_modal.open(top, auto);
             } else if key::FILE_PICKER.matches(key) {
                 self.file_picker.open(&self.state.session.cwd);
-            } else if key.code == KeyCode::Char('v') && self.image_paste_rx.is_none() {
+            } else if key.code == KeyCode::Char('v') && self.image_paste_rx.is_empty() {
                 self.start_image_paste();
             } else if let InputAction::PaletteSync(val) = self.input_box.handle_key(key) {
                 self.command_palette.sync(&val);
@@ -1302,7 +1309,7 @@ impl App {
     }
 
     pub fn is_animating(&self) -> bool {
-        self.image_paste_rx.is_some()
+        !self.image_paste_rx.is_empty()
             || self.btw_modal.is_animating()
             || self.session_picker.is_loading()
             || self.file_picker.is_loading()

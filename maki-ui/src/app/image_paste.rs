@@ -25,24 +25,25 @@ impl App {
         thread::spawn(move || {
             let _ = tx.send(f());
         });
-        self.image_paste_rx = Some(rx);
+        self.image_paste_rx.push(rx);
         self.status_bar.flash(flash);
     }
 
     pub fn poll_image_paste(&mut self) {
-        let Some(ref rx) = self.image_paste_rx else {
-            return;
-        };
-        let Ok(result) = rx.try_recv() else {
-            return;
-        };
-        self.image_paste_rx = None;
-        match result {
-            Ok(source) => {
-                self.input_box.attach_image(source);
-                self.status_bar.flash("Image attached".into());
+        let mut i = 0;
+        while i < self.image_paste_rx.len() {
+            let Ok(result) = self.image_paste_rx[i].try_recv() else {
+                i += 1;
+                continue;
+            };
+            self.image_paste_rx.swap_remove(i);
+            match result {
+                Ok(source) => {
+                    self.input_box.attach_image(source);
+                    self.status_bar.flash("Image attached".into());
+                }
+                Err(e) => self.status_bar.flash(format!("Image paste failed: {e}")),
             }
-            Err(e) => self.status_bar.flash(format!("Image paste failed: {e}")),
         }
     }
 }

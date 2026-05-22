@@ -302,7 +302,7 @@ fn paste_routed_to_question_form_in_custom_mode() {
 fn paste_file_path_triggers_image_load() {
     let mut app = test_app();
     app.update(Msg::Paste("file:///tmp/nonexistent.png".into()));
-    assert!(app.image_paste_rx.is_some());
+    assert!(!app.image_paste_rx.is_empty());
     assert_eq!(app.input_box.buffer.value(), "");
 }
 
