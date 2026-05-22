@@ -164,22 +164,6 @@ function ListPicker.open(items, opts)
           buf:set_lines(build_lines())
         end
         confirming = nil
-      elseif input:handle_key(ev.key) then
-        filtered, original_indices = filter_items(items, input:value())
-        if cursor > #filtered then
-          cursor = #filtered
-          if cursor < 1 then
-            cursor = 1
-          end
-          win:set_cursor(cursor)
-        end
-        buf:set_lines(build_lines())
-        confirming = nil
-      elseif submit_keys[ev.key] then
-        if #filtered > 0 then
-          win:close()
-          return { type = "choice", index = original_indices[cursor] }
-        end
       elseif ev.key == "esc" or ev.key == "ctrl+c" then
         win:close()
         return { type = "close" }
@@ -193,8 +177,28 @@ function ListPicker.open(items, opts)
             maki.ui.flash("Press Ctrl+D again to delete")
           end
         end
+      elseif submit_keys[ev.key] then
+        if #filtered > 0 then
+          win:close()
+          return { type = "choice", index = original_indices[cursor] }
+        end
       else
-        confirming = nil
+        local result = input:handle_key(ev.key)
+        if result == TextInput.Result.CHANGED then
+          filtered, original_indices = filter_items(items, input:value())
+          if cursor > #filtered then
+            cursor = #filtered
+            if cursor < 1 then
+              cursor = 1
+            end
+            win:set_cursor(cursor)
+          end
+          buf:set_lines(build_lines())
+          confirming = nil
+        elseif result == TextInput.Result.MOVED then
+          buf:set_lines(build_lines())
+          confirming = nil
+        end
       end
     end
   end

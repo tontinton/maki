@@ -312,17 +312,17 @@ case("text_input_delete_word", function()
   end
   eq(input:value(), "hello world")
   input:handle_key("ctrl+w")
-  eq(input:value(), "hello ")
+  eq(input:value(), "hello ", "ctrl+w eats the last word in one press")
   input:handle_key("ctrl+w")
-  eq(input:value(), "hello")
-  input:handle_key("ctrl+w")
-  eq(input:value(), "")
+  eq(input:value(), "", "second ctrl+w eats remaining trailing space and word")
 end)
 
-case("text_input_unknown_key_returns_false", function()
+local R = TextInput.Result
+
+case("text_input_unknown_key_returns_ignored", function()
   local input = TextInput.new()
-  eq(input:handle_key("ctrl+x"), false)
-  eq(input:handle_key("f1"), false)
+  eq(input:handle_key("ctrl+z"), R.IGNORED)
+  eq(input:handle_key("f1"), R.IGNORED)
 end)
 
 case("text_input_render_format", function()
@@ -483,9 +483,9 @@ case("text_input_ctrl_w_consumes_trailing_spaces_then_word", function()
   local input = TextInput.new()
   input:insert_text("hello world  ")
   input:handle_key("ctrl+w")
-  eq(input:value(), "hello world", "first ctrl+w consumes trailing spaces only")
+  eq(input:value(), "hello ", "single ctrl+w eats trailing spaces AND the word")
   input:handle_key("ctrl+w")
-  eq(input:value(), "hello ", "second ctrl+w removes the word, stopping at the space")
+  eq(input:value(), "", "second ctrl+w eats what is left")
 end)
 
 case("text_input_render_multiline_padding_and_cursor", function()
@@ -504,6 +504,423 @@ case("text_input_render_multiline_padding_and_cursor", function()
     end
   end
   assert(saw_cursor, "cursor span must appear on the row holding the cursor")
+end)
+
+case("text_input_handle_key_returns_ignored_when_noop", function()
+  local function noop(setup, key)
+    local input = TextInput.new()
+    if setup then
+      setup(input)
+    end
+    eq(input:handle_key(key), R.IGNORED, key .. " on a no-op input must be IGNORED")
+  end
+  noop(nil, "backspace")
+  noop(nil, "left")
+  noop(nil, "up")
+  noop(nil, "down")
+  noop(nil, "ctrl+w")
+  noop(nil, "delete")
+  noop(function(i)
+    i:insert_text("abc")
+  end, "right")
+  noop(function(i)
+    i:insert_text("abc")
+  end, "delete")
+end)
+
+case("text_input_invariants_hold_under_random_sequence", function()
+  TextInput._debug = true
+  local input = TextInput.new()
+  local keys = {
+    "a",
+    "b",
+    "c",
+    "x",
+    "é",
+    "space",
+    "newline",
+    "left",
+    "right",
+    "up",
+    "down",
+    "home",
+    "end",
+    "backspace",
+    "delete",
+    "ctrl+w",
+    "ctrl+left",
+    "ctrl+right",
+    "ctrl+a",
+    "ctrl+k",
+    "alt+d",
+    "alt+b",
+    "alt+f",
+  }
+  math.randomseed(0xC0FFEE)
+  for _ = 1, 2000 do
+    local k = keys[math.random(#keys)]
+    if k == "é" then
+      input:insert_text("é")
+    else
+      input:handle_key(k)
+    end
+  end
+  TextInput._debug = false
+end)
+
+-- Inline parity cases. Each case sets up an initial value/cursor, applies a
+-- sequence of keys, and asserts final value+cursor. Add a case here whenever
+-- you change handle_key semantics. Lives in Lua now that there is no second
+-- implementation to cross-check against; if a Rust TextBuffer comes back,
+-- promote this back to a shared golden file.
+local TRACE_CASES = {
+  {
+    name = "plain_insert",
+    initial = "",
+    cur = { 1, 0 },
+    keys = { "h", "i" },
+    final_value = "hi",
+    final_cur = { 1, 2 },
+  },
+  {
+    name = "backspace_deletes_char",
+    initial = "abc",
+    cur = { 1, 3 },
+    keys = { "backspace" },
+    final_value = "ab",
+    final_cur = { 1, 2 },
+  },
+  {
+    name = "delete_at_end_joins_lines",
+    initial = "ab\ncd",
+    cur = { 1, 2 },
+    keys = { "delete" },
+    final_value = "abcd",
+    final_cur = { 1, 2 },
+  },
+  {
+    name = "backspace_at_line_start_joins",
+    initial = "ab\ncd",
+    cur = { 2, 0 },
+    keys = { "backspace" },
+    final_value = "abcd",
+    final_cur = { 1, 2 },
+  },
+  {
+    name = "left_then_right_round_trips",
+    initial = "abc",
+    cur = { 1, 2 },
+    keys = { "left", "right" },
+    final_value = "abc",
+    final_cur = { 1, 2 },
+  },
+  {
+    name = "right_wraps_to_next_line",
+    initial = "ab\ncd",
+    cur = { 1, 2 },
+    keys = { "right" },
+    final_value = "ab\ncd",
+    final_cur = { 2, 0 },
+  },
+  {
+    name = "left_wraps_to_prev_line",
+    initial = "ab\ncd",
+    cur = { 2, 0 },
+    keys = { "left" },
+    final_value = "ab\ncd",
+    final_cur = { 1, 2 },
+  },
+  {
+    name = "home_jumps_to_col_zero",
+    initial = "hello",
+    cur = { 1, 5 },
+    keys = { "home" },
+    final_value = "hello",
+    final_cur = { 1, 0 },
+  },
+  {
+    name = "end_jumps_to_line_length",
+    initial = "hello",
+    cur = { 1, 0 },
+    keys = { "end" },
+    final_value = "hello",
+    final_cur = { 1, 5 },
+  },
+  {
+    name = "up_clamps_to_short_line",
+    initial = "abc\nlonger_line",
+    cur = { 2, 11 },
+    keys = { "up" },
+    final_value = "abc\nlonger_line",
+    final_cur = { 1, 3 },
+  },
+  {
+    name = "down_moves_to_next_line",
+    initial = "ab\ncd",
+    cur = { 1, 0 },
+    keys = { "down" },
+    final_value = "ab\ncd",
+    final_cur = { 2, 0 },
+  },
+  {
+    name = "ctrl_left_jumps_word",
+    initial = "hello world",
+    cur = { 1, 11 },
+    keys = { "ctrl+left" },
+    final_value = "hello world",
+    final_cur = { 1, 6 },
+  },
+  {
+    name = "ctrl_left_twice_lands_at_zero",
+    initial = "hello world",
+    cur = { 1, 11 },
+    keys = { "ctrl+left", "ctrl+left" },
+    final_value = "hello world",
+    final_cur = { 1, 0 },
+  },
+  {
+    name = "ctrl_right_jumps_word",
+    initial = "hello world",
+    cur = { 1, 0 },
+    keys = { "ctrl+right" },
+    final_value = "hello world",
+    final_cur = { 1, 5 },
+  },
+  {
+    name = "ctrl_right_eats_leading_spaces_then_word",
+    initial = "hello  ",
+    cur = { 1, 0 },
+    keys = { "ctrl+right" },
+    final_value = "hello  ",
+    final_cur = { 1, 5 },
+  },
+  {
+    name = "ctrl_left_eats_leading_spaces_then_word",
+    initial = "  hello",
+    cur = { 1, 7 },
+    keys = { "ctrl+left" },
+    final_value = "  hello",
+    final_cur = { 1, 2 },
+  },
+  {
+    name = "ctrl_w_eats_trailing_spaces_and_word",
+    initial = "hello world  ",
+    cur = { 1, 13 },
+    keys = { "ctrl+w" },
+    final_value = "hello ",
+    final_cur = { 1, 6 },
+  },
+  {
+    name = "ctrl_w_twice_clears_input",
+    initial = "hello world",
+    cur = { 1, 11 },
+    keys = { "ctrl+w", "ctrl+w" },
+    final_value = "",
+    final_cur = { 1, 0 },
+  },
+  {
+    name = "ctrl_w_at_line_start_joins",
+    initial = "ab\ncd",
+    cur = { 2, 0 },
+    keys = { "ctrl+w" },
+    final_value = "abcd",
+    final_cur = { 1, 2 },
+  },
+  {
+    name = "ctrl_delete_eats_word_after",
+    initial = "hello world",
+    cur = { 1, 0 },
+    keys = { "ctrl+delete" },
+    final_value = " world",
+    final_cur = { 1, 0 },
+  },
+  {
+    name = "alt_d_eats_word_after_space",
+    initial = "hello world",
+    cur = { 1, 6 },
+    keys = { "alt+d" },
+    final_value = "hello ",
+    final_cur = { 1, 6 },
+  },
+  {
+    name = "ctrl_delete_at_line_end_joins",
+    initial = "ab\ncd",
+    cur = { 1, 2 },
+    keys = { "ctrl+delete" },
+    final_value = "abcd",
+    final_cur = { 1, 2 },
+  },
+  {
+    name = "ctrl_k_truncates_line",
+    initial = "hello world",
+    cur = { 1, 5 },
+    keys = { "ctrl+k" },
+    final_value = "hello",
+    final_cur = { 1, 5 },
+  },
+  {
+    name = "ctrl_k_at_line_end_joins",
+    initial = "ab\ncd",
+    cur = { 1, 2 },
+    keys = { "ctrl+k" },
+    final_value = "ab\ncd",
+    final_cur = { 1, 2 },
+  },
+  {
+    name = "ctrl_a_moves_home",
+    initial = "hello",
+    cur = { 1, 5 },
+    keys = { "ctrl+a" },
+    final_value = "hello",
+    final_cur = { 1, 0 },
+  },
+  {
+    name = "alt_b_aliases_ctrl_left",
+    initial = "hello world",
+    cur = { 1, 11 },
+    keys = { "alt+b" },
+    final_value = "hello world",
+    final_cur = { 1, 6 },
+  },
+  {
+    name = "alt_f_aliases_ctrl_right",
+    initial = "hello world",
+    cur = { 1, 0 },
+    keys = { "alt+f" },
+    final_value = "hello world",
+    final_cur = { 1, 5 },
+  },
+  {
+    name = "newline_splits_line",
+    initial = "abcd",
+    cur = { 1, 2 },
+    keys = { "newline" },
+    final_value = "ab\ncd",
+    final_cur = { 2, 0 },
+  },
+  {
+    name = "space_inserts_a_space",
+    initial = "abcd",
+    cur = { 1, 2 },
+    keys = { "space" },
+    final_value = "ab cd",
+    final_cur = { 1, 3 },
+  },
+  {
+    name = "utf8_left_over_multibyte",
+    initial = "aé",
+    cur = { 1, 3 },
+    keys = { "left" },
+    final_value = "aé",
+    final_cur = { 1, 1 },
+  },
+  {
+    name = "utf8_backspace_removes_codepoint",
+    initial = "aé",
+    cur = { 1, 3 },
+    keys = { "backspace" },
+    final_value = "a",
+    final_cur = { 1, 1 },
+  },
+  {
+    name = "utf8_ctrl_w_eats_multibyte_word",
+    initial = "hello wörld",
+    cur = { 1, 12 },
+    keys = { "ctrl+w" },
+    final_value = "hello ",
+    final_cur = { 1, 6 },
+  },
+  {
+    name = "tab_is_whitespace_for_ctrl_w",
+    initial = "hello\tworld",
+    cur = { 1, 11 },
+    keys = { "ctrl+w" },
+    final_value = "hello\t",
+    final_cur = { 1, 6 },
+  },
+  {
+    name = "ignored_backspace_at_buffer_start",
+    initial = "",
+    cur = { 1, 0 },
+    keys = { "backspace" },
+    final_value = "",
+    final_cur = { 1, 0 },
+    results = { R.IGNORED },
+  },
+  {
+    name = "ignored_left_at_buffer_start",
+    initial = "abc",
+    cur = { 1, 0 },
+    keys = { "left" },
+    final_value = "abc",
+    final_cur = { 1, 0 },
+    results = { R.IGNORED },
+  },
+  {
+    name = "ignored_right_at_buffer_end",
+    initial = "abc",
+    cur = { 1, 3 },
+    keys = { "right" },
+    final_value = "abc",
+    final_cur = { 1, 3 },
+    results = { R.IGNORED },
+  },
+  {
+    name = "ignored_up_on_first_line",
+    initial = "abc",
+    cur = { 1, 1 },
+    keys = { "up" },
+    final_value = "abc",
+    final_cur = { 1, 1 },
+    results = { R.IGNORED },
+  },
+  {
+    name = "ignored_down_on_last_line",
+    initial = "abc",
+    cur = { 1, 1 },
+    keys = { "down" },
+    final_value = "abc",
+    final_cur = { 1, 1 },
+    results = { R.IGNORED },
+  },
+  {
+    name = "ignored_ctrl_w_at_buffer_start",
+    initial = "abc",
+    cur = { 1, 0 },
+    keys = { "ctrl+w" },
+    final_value = "abc",
+    final_cur = { 1, 0 },
+    results = { R.IGNORED },
+  },
+  {
+    name = "ignored_delete_at_buffer_end",
+    initial = "abc",
+    cur = { 1, 3 },
+    keys = { "delete" },
+    final_value = "abc",
+    final_cur = { 1, 3 },
+    results = { R.IGNORED },
+  },
+}
+
+case("text_input_trace_cases", function()
+  for _, c in ipairs(TRACE_CASES) do
+    local input = TextInput.new()
+    input:insert_text(c.initial)
+    input.line, input.col = c.cur[1], c.cur[2]
+    local got = {}
+    for _, k in ipairs(c.keys) do
+      got[#got + 1] = input:handle_key(k)
+    end
+    eq(input:value(), c.final_value, c.name .. ": value")
+    eq(input.line, c.final_cur[1], c.name .. ": cursor line")
+    eq(input.col, c.final_cur[2], c.name .. ": cursor col")
+    if c.results then
+      for i, want in ipairs(c.results) do
+        eq(got[i], want, c.name .. ": key " .. i .. " result")
+      end
+    end
+  end
 end)
 
 local ListPicker = require("maki.list_picker")
