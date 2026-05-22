@@ -17,7 +17,7 @@ use maki_providers::Timeouts;
 use maki_providers::provider::{Provider, fetch_all_models, from_model};
 use maki_providers::{Message, Model};
 use maki_storage::StateDir;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::AppSession;
 use crate::agent::{AgentCommand, AgentHandles, ModelSlot, shared_queue::QueueItem};
@@ -67,16 +67,56 @@ pub(crate) struct EventLoop<'t> {
     shell_tx: flume::Sender<ShellEvent>,
     shell_rx: flume::Receiver<ShellEvent>,
     warn_rx: flume::Receiver<String>,
+    ctx_window_tx: flume::Sender<ContextWindowUpdate>,
+    ctx_window_rx: flume::Receiver<ContextWindowUpdate>,
     storage_writer: Arc<StorageWriter>,
     timeouts: Timeouts,
     ui_action_rx: Option<flume::Receiver<UiAction>>,
     _model_fetch_task: smol::Task<()>,
 }
 
+/// Result of `Provider::discover_context_window` flowing back to the UI thread.
+/// Carries the spec so a stale discovery (model switched while we were probing)
+/// can be discarded.
+struct ContextWindowUpdate {
+    spec: String,
+    context_window: u32,
+}
+
 struct BackgroundModels {
     available: Arc<ArcSwapOption<Vec<String>>>,
     warn_rx: flume::Receiver<String>,
     task: smol::Task<()>,
+}
+
+/// Probe the current provider for its real context window in the background.
+/// Discovery is best-effort: any error is logged but does not surface to the
+/// user, since the static fallback in `Model::context_window` still works.
+fn spawn_context_discovery(
+    model_slot: &Arc<ArcSwap<ModelSlot>>,
+    tx: &flume::Sender<ContextWindowUpdate>,
+) {
+    let slot = model_slot.load();
+    let spec = slot.model.spec();
+    let model_id = slot.model.id.clone();
+    let provider = Arc::clone(&slot.provider);
+    let tx = tx.clone();
+    smol::spawn(async move {
+        match provider.discover_context_window(&model_id).await {
+            Ok(Some(context_window)) => {
+                debug!(model = %model_id, context_window, "context window discovered");
+                let _ = tx
+                    .send_async(ContextWindowUpdate {
+                        spec,
+                        context_window,
+                    })
+                    .await;
+            }
+            Ok(None) => debug!(model = %model_id, "context window discovery returned None"),
+            Err(e) => warn!(model = %model_id, error = %e, "context window discovery failed"),
+        }
+    })
+    .detach();
 }
 
 fn spawn_model_fetch() -> BackgroundModels {
@@ -187,6 +227,8 @@ impl<'t> EventLoop<'t> {
             model: model.clone(),
             provider,
         }));
+        let (ctx_window_tx, ctx_window_rx) = flume::unbounded::<ContextWindowUpdate>();
+        spawn_context_discovery(&model_slot, &ctx_window_tx);
         let handles = AgentHandles::spawn(
             &model_slot,
             initial_history,
@@ -238,6 +280,8 @@ impl<'t> EventLoop<'t> {
             shell_tx,
             shell_rx,
             warn_rx: bg.warn_rx,
+            ctx_window_tx,
+            ctx_window_rx,
             storage_writer,
             timeouts,
             ui_action_rx,
@@ -280,6 +324,10 @@ impl<'t> EventLoop<'t> {
     fn drain_channels(&mut self) -> bool {
         while let Ok(event) = self.shell_rx.try_recv() {
             self.app.handle_shell_event(event);
+        }
+
+        while let Ok(update) = self.ctx_window_rx.try_recv() {
+            self.apply_context_window_update(update);
         }
 
         let mut had_agent_msg = false;
@@ -446,6 +494,7 @@ impl<'t> EventLoop<'t> {
                         model: new_model,
                         provider: Arc::from(new_provider),
                     }));
+                    spawn_context_discovery(&self.model_slot, &self.ctx_window_tx);
                 }
                 self.respawn_agent(loaded.messages);
                 *self
@@ -507,6 +556,20 @@ impl<'t> EventLoop<'t> {
         }
     }
 
+    fn apply_context_window_update(&mut self, update: ContextWindowUpdate) {
+        let slot = self.model_slot.load_full();
+        if slot.model.spec() != update.spec || slot.model.context_window == update.context_window {
+            return;
+        }
+        let mut new_model = slot.model.clone();
+        new_model.context_window = update.context_window;
+        self.app.update_model(&new_model);
+        self.model_slot.store(Arc::new(ModelSlot {
+            model: new_model,
+            provider: Arc::clone(&slot.provider),
+        }));
+    }
+
     fn change_model(&mut self, spec: String) {
         match Model::from_spec(&spec) {
             Ok(new_model) => match from_model(&new_model, self.timeouts) {
@@ -516,6 +579,7 @@ impl<'t> EventLoop<'t> {
                         model: new_model,
                         provider: Arc::from(new_provider),
                     }));
+                    spawn_context_discovery(&self.model_slot, &self.ctx_window_tx);
                 }
                 Err(e) => self.app.flash(format!("Failed to create provider: {e}")),
             },

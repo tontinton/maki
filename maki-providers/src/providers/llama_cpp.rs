@@ -120,6 +120,18 @@ impl Provider for LlamaCpp {
             }))
         })
     }
+
+    fn discover_context_window<'a>(
+        &'a self,
+        model_id: &'a str,
+    ) -> BoxFuture<'a, Result<Option<u32>, AgentError>> {
+        Box::pin(async move {
+            let auth = self.auth.lock().unwrap().clone();
+            self.compat
+                .do_discover_context_window(model_id, &auth)
+                .await
+        })
+    }
 }
 
 #[cfg(test)]

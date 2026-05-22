@@ -500,6 +500,13 @@ impl Provider for DynamicProvider {
         self.inner.list_models()
     }
 
+    fn discover_context_window<'a>(
+        &'a self,
+        model_id: &'a str,
+    ) -> BoxFuture<'a, Result<Option<u32>, AgentError>> {
+        self.inner.discover_context_window(model_id)
+    }
+
     fn refresh_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
         self.run_auth_script("refresh")
     }

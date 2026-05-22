@@ -144,6 +144,36 @@ impl OpenAiCompatProvider {
         models.sort();
         Ok(models)
     }
+
+    /// llama.cpp's llama-server reports the server-side context size as
+    /// `meta.n_ctx` on each `/v1/models` entry. Real OpenAI omits it, in which
+    /// case we return `None` and the caller keeps the static fallback.
+    pub async fn do_discover_context_window(
+        &self,
+        model_id: &str,
+        auth: &ResolvedAuth,
+    ) -> Result<Option<u32>, AgentError> {
+        let request = self.build_request("GET", "/models", auth).body(())?;
+        let mut response = self.client.send_async(request).await?;
+        if response.status().as_u16() != 200 {
+            return Err(AgentError::from_response(response).await);
+        }
+        let body: Value = serde_json::from_str(&response.text().await?)?;
+        Ok(extract_n_ctx(&body, model_id))
+    }
+}
+
+fn extract_n_ctx(body: &Value, model_id: &str) -> Option<u32> {
+    let entries = body["data"].as_array()?;
+    let entry = entries.iter().find(|m| {
+        m["id"].as_str() == Some(model_id)
+            || m["aliases"]
+                .as_array()
+                .is_some_and(|a| a.iter().any(|v| v.as_str() == Some(model_id)))
+    })?;
+    entry["meta"]["n_ctx"]
+        .as_u64()
+        .and_then(|n| u32::try_from(n).ok())
 }
 
 pub fn convert_messages(messages: &[Message], system: &str) -> Vec<Value> {
@@ -944,5 +974,42 @@ data: [DONE]\n";
             assert_eq!(text_deltas, vec!["Hello"]);
             assert_eq!(thinking_deltas, vec!["Let me think", "..."]);
         })
+    }
+
+    /// llama.cpp's /v1/models response includes a non-standard `meta.n_ctx`
+    /// field that reports the actual server-side context window. Match either
+    /// the canonical id or an alias (llama-server exposes both).
+    #[test]
+    fn extract_n_ctx_from_llamacpp_payload() {
+        let body = json!({
+            "object": "list",
+            "data": [{
+                "id": "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF",
+                "aliases": ["qwen3-coder"],
+                "meta": {"n_ctx": 32768, "n_ctx_train": 262144},
+            }],
+        });
+        assert_eq!(
+            extract_n_ctx(&body, "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF"),
+            Some(32768)
+        );
+        assert_eq!(extract_n_ctx(&body, "qwen3-coder"), Some(32768));
+    }
+
+    #[test]
+    fn extract_n_ctx_absent_for_real_openai_payload() {
+        let body = json!({
+            "object": "list",
+            "data": [{"id": "gpt-4.1", "object": "model", "owned_by": "openai"}],
+        });
+        assert_eq!(extract_n_ctx(&body, "gpt-4.1"), None);
+    }
+
+    #[test]
+    fn extract_n_ctx_unknown_model_is_none() {
+        let body = json!({
+            "data": [{"id": "other", "meta": {"n_ctx": 8192}}],
+        });
+        assert_eq!(extract_n_ctx(&body, "missing"), None);
     }
 }

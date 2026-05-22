@@ -214,6 +214,19 @@ pub trait Provider: Send + Sync {
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<String>, AgentError>>;
 
+    /// Probe the backend for the actual context window of `model_id`. Used to
+    /// correct the static fallback (128k for arbitrary Ollama/OpenAI models)
+    /// when pointed at a local server with its own configured window -- see
+    /// llama.cpp's `meta.n_ctx` or Ollama's `model_info.*.context_length`.
+    /// Default returns `Ok(None)` so providers with reliable static metadata
+    /// don't have to implement it.
+    fn discover_context_window<'a>(
+        &'a self,
+        _model_id: &'a str,
+    ) -> BoxFuture<'a, Result<Option<u32>, AgentError>> {
+        Box::pin(async { Ok(None) })
+    }
+
     fn refresh_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
         Box::pin(async { Ok(()) })
     }

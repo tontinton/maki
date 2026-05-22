@@ -1,7 +1,8 @@
 use std::sync::{Arc, Mutex};
 
 use flume::Sender;
-use serde_json::Value;
+use isahc::{AsyncReadResponseExt, Request};
+use serde_json::{Value, json};
 
 use crate::model::{Model, ModelEntry};
 use crate::provider::{BoxFuture, Provider};
@@ -124,6 +125,42 @@ impl Provider for Ollama {
             }))
         })
     }
+
+    fn discover_context_window<'a>(
+        &'a self,
+        model_id: &'a str,
+    ) -> BoxFuture<'a, Result<Option<u32>, AgentError>> {
+        Box::pin(async move {
+            let auth = self.auth.lock().unwrap().clone();
+            let base = auth.base_url.as_deref().unwrap_or(CONFIG.base_url);
+            let host = base.strip_suffix("/v1").unwrap_or(base);
+            let body = serde_json::to_vec(&json!({"name": model_id}))?;
+            let mut builder = Request::builder()
+                .method("POST")
+                .uri(format!("{host}/api/show"))
+                .header("content-type", "application/json");
+            for (key, value) in &auth.headers {
+                builder = builder.header(key.as_str(), value.as_str());
+            }
+            let request = builder.body(body)?;
+            let mut response = self.compat.client().send_async(request).await?;
+            if response.status().as_u16() != 200 {
+                return Err(AgentError::from_response(response).await);
+            }
+            let body: Value = serde_json::from_str(&response.text().await?)?;
+            Ok(extract_context_length(&body))
+        })
+    }
+}
+
+/// Ollama's `/api/show` response carries arch-prefixed metadata in
+/// `model_info`, e.g. `{"llama.context_length": 131072, ...}`. We scan for the
+/// first `*.context_length` entry rather than hard-coding architecture names.
+fn extract_context_length(body: &Value) -> Option<u32> {
+    let info = body.get("model_info")?.as_object()?;
+    info.iter()
+        .find_map(|(k, v)| k.ends_with(".context_length").then(|| v.as_u64()).flatten())
+        .and_then(|n| u32::try_from(n).ok())
 }
 
 #[cfg(test)]
@@ -173,5 +210,24 @@ mod tests {
         assert_eq!(auth.base_url.as_deref(), Some("http://local:1234/v1"));
         assert_eq!(auth.headers.len(), 1);
         assert_eq!(auth.headers[0].1, "Bearer test-key");
+    }
+
+    #[test]
+    fn extract_context_length_finds_arch_prefixed_field() {
+        let body = json!({
+            "model_info": {
+                "general.architecture": "llama",
+                "llama.context_length": 131072_u64,
+                "tokenizer.ggml.bos_token_id": 1,
+            }
+        });
+        assert_eq!(extract_context_length(&body), Some(131072));
+    }
+
+    #[test]
+    fn extract_context_length_missing_returns_none() {
+        let body = json!({"model_info": {"general.architecture": "llama"}});
+        assert_eq!(extract_context_length(&body), None);
+        assert_eq!(extract_context_length(&json!({})), None);
     }
 }

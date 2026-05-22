@@ -198,6 +198,24 @@ impl Provider for OpenAi {
         })
     }
 
+    fn discover_context_window<'a>(
+        &'a self,
+        model_id: &'a str,
+    ) -> BoxFuture<'a, Result<Option<u32>, AgentError>> {
+        Box::pin(async move {
+            if self.is_oauth() {
+                return Ok(None);
+            }
+            self.with_oauth_retry(|| async {
+                let auth = self.current_auth();
+                self.compat
+                    .do_discover_context_window(model_id, &auth)
+                    .await
+            })
+            .await
+        })
+    }
+
     fn refresh_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
         Box::pin(async {
             if self.is_oauth() {
