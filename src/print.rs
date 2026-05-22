@@ -7,31 +7,20 @@
 //! We adopt new fields when Claude Code adds them but never invent our own.
 //! Check their docs before changing anything here.
 
-use std::env;
 use std::io::{self, Read};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use clap::ValueEnum;
 use color_eyre::Result;
 use color_eyre::eyre::Context;
-use maki_agent::mcp;
-use maki_agent::tools::{
-    DescriptionContext, FileReadTracker, QUESTION_TOOL_NAME, ToolFilter, ToolRegistry,
-};
-use maki_agent::{
-    Agent, AgentConfig, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, Envelope,
-    EventSender, History, PermissionsConfig, ToolOutputLines, agent, template,
-};
+use maki_agent::headless::{HeadlessHandle, HeadlessParams};
+use maki_agent::tools::QUESTION_TOOL_NAME;
+use maki_agent::{AgentConfig, AgentEvent, Envelope, PermissionsConfig};
 use maki_lua::EventHandle;
-use maki_providers::StopReason;
-use maki_providers::TokenUsage;
 use maki_providers::model::Model;
-use maki_providers::provider::{self, Provider};
+use maki_providers::{StopReason, TokenUsage};
 use serde::Serialize;
 use serde_json::Value;
-use tracing::error;
-use uuid::Uuid;
 
 const AGENT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -148,94 +137,29 @@ pub fn run(
         }
     };
 
-    let cwd_path = env::current_dir().unwrap_or_else(|_| ".".into());
-    let cwd = cwd_path.to_string_lossy().into_owned();
-    let vars = template::env_vars();
-    let mode = AgentMode::Build;
-    let instructions = agent::load_instructions(&vars.apply("{cwd}"));
-    let filter = ToolFilter::from_config(&config, &[QUESTION_TOOL_NAME]);
-    let ctx = DescriptionContext { filter: &filter };
-    let mut tools = ToolRegistry::native().definitions(&vars, &ctx, model.supports_tool_examples());
-
-    let mcp_handle = smol::block_on(mcp::start(&cwd_path));
-
-    if let Some(ref handle) = mcp_handle {
-        handle.extend_tools(&mut tools);
-    }
-    let mcp_for_agent = mcp_handle.clone();
-
     let prompt_extras = lua_handle
         .as_ref()
         .map(|h| h.collect_prompt_extras())
         .unwrap_or_default();
-    let system = agent::build_system_prompt(&vars, &mode, &instructions.text, &prompt_extras);
 
-    let (raw_tx, event_rx) = flume::unbounded::<Envelope>();
-    let input = AgentInput {
-        message: prompt,
-        mode,
-        ..Default::default()
-    };
-
-    let session_id = Uuid::new_v4().to_string();
-    let start = Instant::now();
-
-    let tool_names: Vec<String> = tools
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|t| t["name"].as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let model_clone = model.clone();
-    let session_id_clone = session_id.clone();
-    let agent_task = smol::spawn(async move {
-        let event_tx = EventSender::new(raw_tx, 0);
-        let provider: Arc<dyn Provider> =
-            match provider::from_model_async(&model_clone, timeouts).await {
-                Ok(p) => Arc::from(p),
-                Err(e) => {
-                    error!(error = %e, "provider error");
-                    let _ = event_tx.send(AgentEvent::Error {
-                        message: e.user_message(),
-                    });
-                    return;
-                }
-            };
-        let error_tx = event_tx.clone();
-        let agent = Agent::new(
-            AgentParams {
-                provider,
-                model: model_clone,
-                config,
-                tool_output_lines: ToolOutputLines::default(),
-                permissions: Arc::new(maki_agent::permissions::PermissionManager::new(
-                    permissions_config,
-                    cwd_path.clone(),
-                )),
-                session_id: Some(session_id_clone),
-                timeouts,
-                file_tracker: FileReadTracker::fresh(),
-            },
-            AgentRunParams {
-                history: History::new(Vec::new()),
-                system,
-                event_tx,
-                tools,
-            },
-        )
-        .with_loaded_instructions(instructions.loaded)
-        .with_mcp(mcp_for_agent);
-        let outcome = agent.run(input).await;
-        if let Err(e) = outcome.result {
-            error!(error = %e, "agent error");
-            let _ = error_tx.send(AgentEvent::Error {
-                message: e.user_message(),
-            });
-        }
+    let handle = maki_agent::headless::spawn(HeadlessParams {
+        model: model.clone(),
+        config,
+        permissions_config,
+        timeouts,
+        prompt,
+        prompt_extras,
+        excluded_tools: vec![QUESTION_TOOL_NAME],
     });
+
+    let HeadlessHandle {
+        event_rx,
+        tool_names,
+        session_id,
+        cwd,
+        task,
+    } = handle;
+    let start = Instant::now();
 
     let mut verbose_out = match format {
         OutputFormat::StreamJson => Some(VerboseOutput::StreamJson),
@@ -353,13 +277,10 @@ pub fn run(
         }
     }
     smol::block_on(async {
-        futures_lite::future::or(agent_task, async {
+        futures_lite::future::or(task, async {
             smol::Timer::after(AGENT_SHUTDOWN_TIMEOUT).await;
         })
         .await;
-        if let Some(ref handle) = mcp_handle {
-            handle.shutdown().await;
-        }
     });
 
     let duration_ms = start.elapsed().as_millis();
