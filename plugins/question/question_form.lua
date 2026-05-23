@@ -10,6 +10,7 @@ local DESC_SEP = " — "
 local DESC_SEP_WIDTH = 3
 local ARROW_PREFIX = "    → "
 local ARROW_PREFIX_W = 6
+local SEPARATOR_CHAR = "─"
 
 local MODE = {
   SELECTING = "selecting",
@@ -353,6 +354,11 @@ local function render_tab_bar(state)
   return spans
 end
 
+local function separator_row(width)
+  local n = math.max(0, width - 1)
+  return { { string.rep(SEPARATOR_CHAR, n), "form_separator" } }
+end
+
 local function render_selecting(state, width)
   local lines = {}
   local focus_row = 1
@@ -404,12 +410,12 @@ local function render_selecting(state, width)
     end
 
     if i < #opts then
-      lines[#lines + 1] = {}
+      lines[#lines + 1] = separator_row(width)
     end
   end
 
   if #opts > 0 then
-    lines[#lines + 1] = {}
+    lines[#lines + 1] = separator_row(width)
   end
 
   local custom_cur = (state.cursor == #opts + 1)
@@ -482,7 +488,7 @@ local function render_confirming(state, width)
     )
 
     if i < #state.questions then
-      lines[#lines + 1] = {}
+      lines[#lines + 1] = separator_row(width)
     end
   end
 
