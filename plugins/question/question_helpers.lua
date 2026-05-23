@@ -1,24 +1,20 @@
 local QuestionHelpers = {}
 
-function QuestionHelpers.escape_cell(s)
-  return (s:gsub("\\", "\\\\"):gsub("|", "\\|"):gsub("\r?\n", "<br>"))
-end
-
-function QuestionHelpers.format_answer_table(questions, answers)
-  local lines = { "| Question | Answer |", "|----------|--------|" }
+function QuestionHelpers.format_answer_list(questions, answers)
+  local blocks = {}
   for i, q in ipairs(questions) do
+    local lines = { "**Q" .. i .. ".** " .. q.question }
     local ans = answers[i]
-    local text = "(no answer)"
     if ans and #ans > 0 then
-      local escaped = {}
-      for j, v in ipairs(ans) do
-        escaped[j] = QuestionHelpers.escape_cell(v)
+      for _, v in ipairs(ans) do
+        lines[#lines + 1] = "- " .. (v:gsub("\r?\n", "\n  "))
       end
-      text = table.concat(escaped, ", ")
+    else
+      lines[#lines + 1] = "- (no answer)"
     end
-    lines[#lines + 1] = "| " .. QuestionHelpers.escape_cell(q.question) .. " | " .. text .. " |"
+    blocks[#blocks + 1] = table.concat(lines, "\n")
   end
-  return table.concat(lines, "\n")
+  return table.concat(blocks, "\n\n")
 end
 
 return QuestionHelpers

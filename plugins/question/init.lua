@@ -68,6 +68,6 @@ maki.api.register_tool({
     if result.type == "dismiss" then
       return { llm_output = "(question dismissed by user)" }
     end
-    return { llm_output = QuestionHelpers.format_answer_table(input.questions, result.answers), format = "markdown" }
+    return { llm_output = QuestionHelpers.format_answer_list(input.questions, result.answers), format = "markdown" }
   end,
 })

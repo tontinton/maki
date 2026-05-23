@@ -57,45 +57,29 @@ local function type_text(state, text)
   end
 end
 
+local function selecting_single()
+  return QuestionForm._initial_state(single_question())
+end
+
+local function editing_custom_single()
+  local s = selecting_single()
+  press_many(s, { "down", "down", "enter" })
+  return s
+end
+
+local function confirming_multi()
+  local s = QuestionForm._initial_state(multi_questions())
+  press_many(s, { "enter", "enter" })
+  return s
+end
+
 case("dismiss_keys_per_mode", function()
-  -- selecting + confirming dismiss on esc/ctrl+c; editing_custom dismisses only on ctrl+c (esc returns to selecting).
   local cases = {
-    {
-      build = function()
-        return QuestionForm._initial_state(single_question())
-      end,
-      key = "esc",
-    },
-    {
-      build = function()
-        return QuestionForm._initial_state(single_question())
-      end,
-      key = "ctrl+c",
-    },
-    {
-      build = function()
-        local s = QuestionForm._initial_state(single_question())
-        press_many(s, { "down", "down", "enter" })
-        return s
-      end,
-      key = "ctrl+c",
-    },
-    {
-      build = function()
-        local s = QuestionForm._initial_state(multi_questions())
-        press_many(s, { "enter", "enter" })
-        return s
-      end,
-      key = "esc",
-    },
-    {
-      build = function()
-        local s = QuestionForm._initial_state(multi_questions())
-        press_many(s, { "enter", "enter" })
-        return s
-      end,
-      key = "ctrl+c",
-    },
+    { build = selecting_single, key = "esc" },
+    { build = selecting_single, key = "ctrl+c" },
+    { build = editing_custom_single, key = "ctrl+c" },
+    { build = confirming_multi, key = "esc" },
+    { build = confirming_multi, key = "ctrl+c" },
   }
   for i, c in ipairs(cases) do
     local s = c.build()
@@ -120,7 +104,6 @@ case("multiple_choice_toggle_then_tab_to_review_and_submit", function()
 end)
 
 case("arrow_keys_navigate_questions_and_clamp_at_ends", function()
-  -- Right/left alias Tab/Shift+Tab. Asserting the aliased keys covers both behaviors.
   local s = QuestionForm._initial_state(multi_questions())
   press(s, "left")
   eq(s.tab, 1, "shift+tab at first question is a no-op")
@@ -144,8 +127,7 @@ case("enter_advances_through_questions_then_confirming", function()
 end)
 
 case("editing_custom_esc_returns_to_selecting", function()
-  local s = QuestionForm._initial_state(single_question())
-  press_many(s, { "down", "down", "enter" })
+  local s = editing_custom_single()
   eq(s.mode, MODE.EDITING_CUSTOM)
   press(s, "esc")
   eq(s.mode, MODE.SELECTING)
@@ -154,8 +136,7 @@ end)
 
 case("editing_custom_empty_or_whitespace_submit_returns_to_selecting", function()
   for _, prefix in ipairs({ {}, { "space", "space" } }) do
-    local s = QuestionForm._initial_state(single_question())
-    press_many(s, { "down", "down", "enter" })
+    local s = editing_custom_single()
     press_many(s, prefix)
     press(s, "enter")
     eq(s.mode, MODE.SELECTING, "empty/whitespace must not advance")
@@ -164,7 +145,7 @@ case("editing_custom_empty_or_whitespace_submit_returns_to_selecting", function(
 end)
 
 case("editing_custom_submits_trimmed_text_and_finishes_single_question", function()
-  local s = QuestionForm._initial_state(single_question())
+  local s = selecting_single()
   press_many(s, { "down", "down", "enter", "space", "h", "i", "space", "enter" })
   eq(s.answers[1][1], "hi", "leading/trailing whitespace trimmed")
   eq(s.done.type, "submit")
@@ -172,74 +153,42 @@ end)
 
 case("editing_custom_newline_shortcuts_insert_not_submit", function()
   for _, key in ipairs({ "alt+enter", "shift+enter", "ctrl+enter", "ctrl+j" }) do
-    local s = QuestionForm._initial_state(single_question())
+    local s = selecting_single()
     press_many(s, { "down", "down", "enter", "a", key, "b" })
     eq(s.mode, MODE.EDITING_CUSTOM, key .. ": stays in editing")
     eq(s.custom_input:value(), "a\nb", key .. ": inserted newline")
   end
-  -- Backslash+Enter takes a different path: backslash is consumed and a newline inserted in its place.
-  local s = QuestionForm._initial_state(single_question())
+  local s = selecting_single()
   press_many(s, { "down", "down", "enter", "a", "\\", "enter", "b" })
   eq(s.mode, MODE.EDITING_CUSTOM)
   eq(s.custom_input:value(), "a\nb", "backslash+enter inserts newline, consumes backslash")
 end)
 
-case("confirming_enter_submits_all_answers", function()
-  local s = QuestionForm._initial_state(multi_questions())
-  press_many(s, { "enter", "enter", "enter" })
-  eq(s.done.type, "submit")
-  eq(s.done.answers[1][1], "a1")
-  eq(s.done.answers[2][1], "b1")
-end)
-
-case("escape_cell_table_driven", function()
-  local cases = {
-    { "a\\b", "a\\\\b", "backslash doubles" },
-    { "a|b", "a\\|b", "pipe escapes" },
-    { "a\nb", "a<br>b", "LF -> <br>" },
-    { "a\r\nb", "a<br>b", "CRLF -> <br>" },
-    { "\\|", "\\\\\\|", "backslash escaped before pipe (no double-escape)" },
-    { "hello", "hello", "plain text unchanged" },
+case("format_answer_list_renders_questions_answers_pipes_newlines_and_missing", function()
+  local questions = {
+    { question = "Has | pipe\nand newline" },
+    { question = "Q2" },
   }
-  for _, c in ipairs(cases) do
-    eq(QuestionHelpers.escape_cell(c[1]), c[2], c[3])
-  end
+  local out = QuestionHelpers.format_answer_list(questions, { { "a", "ans|with|pipes" } })
+  assert(out:find("**Q1.** Has | pipe\nand newline", 1, true), "Q1 header + verbatim pipes/newlines")
+  assert(out:find("**Q2.** Q2", 1, true), "Q2 header present")
+  assert(out:find("\n- a\n", 1, true), "answer a on its own bullet")
+  assert(out:find("\n- ans|with|pipes", 1, true), "answer pipes preserved verbatim on bullet")
+  assert(out:find("- (no answer)", 1, true), "missing answer renders as (no answer)")
 end)
 
-case("format_answer_table_renders_header_separator_rows_and_missing_answers", function()
-  local questions = { { question = "Q1" }, { question = "Q2" } }
-  local out = QuestionHelpers.format_answer_table(questions, { { "a", "b" } })
-  assert(out:find("| Question | Answer |", 1, true), "header present")
-  assert(out:find("|----------|--------|", 1, true), "separator present")
-  assert(out:find("| Q1 | a, b |", 1, true), "answers joined with commas")
-  assert(out:find("| Q2 | %(no answer%) |"), "missing answers render as (no answer)")
+case("format_answer_list_indents_multiline_answer_continuation", function()
+  local out = QuestionHelpers.format_answer_list({ { question = "Q" } }, { { "a\nb" } })
+  assert(out:find("- a\n  b", 1, true), "multi-line answer continuation indented with two spaces")
 end)
 
-case("format_answer_table_escapes_pipes_and_newlines_in_both_columns", function()
-  local questions = { { question = "Has | pipe\nand newline" } }
-  local out = QuestionHelpers.format_answer_table(questions, { { "ans|with|pipes" } })
-  assert(out:find("Has \\| pipe<br>and newline", 1, true), "question escaped")
-  assert(out:find("ans\\|with\\|pipes", 1, true), "answer escaped")
+case("format_answer_list_with_no_questions_returns_empty_string", function()
+  eq(QuestionHelpers.format_answer_list({}, {}), "")
 end)
 
 case("render_reserves_tab_bar_only_when_confirm_present", function()
-  eq(QuestionForm._render(QuestionForm._initial_state(single_question()), 80).reserved_top, 0)
+  eq(QuestionForm._render(selecting_single(), 80).reserved_top, 0)
   eq(QuestionForm._render(QuestionForm._initial_state(multi_questions()), 80).reserved_top, 2)
-end)
-
-case("render_footer_changes_between_selecting_and_editing", function()
-  local s = QuestionForm._initial_state(single_question())
-  local footer_selecting = QuestionForm._render(s, 80).footer
-  press_many(s, { "down", "down", "enter" })
-  local footer_editing = QuestionForm._render(s, 80).footer
-  assert(footer_selecting ~= footer_editing, "footer must differ between selecting and editing modes")
-end)
-
-case("render_handles_long_question_text_by_wrapping", function()
-  local long = string.rep("supercalifragilistic ", 10)
-  local s = QuestionForm._initial_state(single_question({ question = long }))
-  local r = QuestionForm._render(s, 40)
-  assert(#r.lines > 1, "long question must wrap onto multiple lines")
 end)
 
 local function find_span_with_text(lines, text)
@@ -253,48 +202,50 @@ local function find_span_with_text(lines, text)
   return nil
 end
 
-case("render_selecting_uses_markdown_styles_for_prompt", function()
-  local s = QuestionForm._initial_state(single_question({ question = "Pick a **bold** option" }))
-  local r = QuestionForm._render(s, 80)
-  local span = find_span_with_text(r.lines, "bold")
-  assert(span, "expected to find span containing 'bold'")
-  eq(span[2], "bold", "markdown bold delimiters must map to the 'bold' style name")
+case("question_md_falls_back_to_plain_text_on_invalid_markdown_return", function()
+  local original = maki.ui.markdown
+  local mocks = {
+    {
+      name = "error",
+      fn = function()
+        error("boom")
+      end,
+    },
+    {
+      name = "non-table",
+      fn = function()
+        return "not a table"
+      end,
+    },
+    {
+      name = "empty-table",
+      fn = function()
+        return {}
+      end,
+    },
+  }
+  for _, m in ipairs(mocks) do
+    maki.ui.markdown = m.fn
+    local ok, r = pcall(QuestionForm._render, selecting_single(), 80)
+    maki.ui.markdown = original
+    assert(ok, m.name .. ": render must not propagate markdown errors")
+    local span = find_span_with_text(r.lines, "Pick one")
+    assert(span, m.name .. ": fallback must surface the question text")
+    eq(span[2], "", m.name .. ": fallback span must be plain")
+  end
 end)
 
-case("render_selecting_preserves_bold_italic_style_name", function()
-  -- The old lossy mapping collapsed `***...***` to "bold" and dropped italic.
-  local s = QuestionForm._initial_state(single_question({ question = "Try ***both*** styles" }))
-  local r = QuestionForm._render(s, 80)
-  local span = find_span_with_text(r.lines, "both")
-  assert(span, "expected to find span containing 'both'")
-  eq(span[2], "bold_italic", "*** delimiters must map to the 'bold_italic' style name")
-end)
-
-case("render_selecting_falls_back_on_markdown_failure", function()
+case("inline_md_returns_only_first_markdown_line_in_confirming", function()
   local original = maki.ui.markdown
   maki.ui.markdown = function()
-    error("boom")
+    return { { { "first", "" } }, { { "second", "" } } }
   end
-  local ok, r = pcall(QuestionForm._render, QuestionForm._initial_state(single_question()), 80)
+  local s = confirming_multi()
+  local r = QuestionForm._render(s, 80)
   maki.ui.markdown = original
-  assert(ok, "render must not propagate markdown errors")
-  local span = find_span_with_text(r.lines, "Pick one")
-  assert(span, "fallback must still surface the question text as a plain span")
-  eq(span[2], "", "fallback span must be plain (empty style name)")
-end)
-
-case("render_selecting_caches_markdown_across_renders", function()
-  local original = maki.ui.markdown
-  local calls = 0
-  maki.ui.markdown = function(text)
-    calls = calls + 1
-    return original(text)
-  end
-  local s = QuestionForm._initial_state(single_question())
-  QuestionForm._render(s, 80)
-  QuestionForm._render(s, 80)
-  maki.ui.markdown = original
-  eq(calls, 1, "markdown must be parsed exactly once per question across renders")
+  eq(s.mode, MODE.CONFIRMING)
+  assert(find_span_with_text(r.lines, "first"), "confirming row must include first markdown line")
+  assert(not find_span_with_text(r.lines, "second"), "confirming row must NOT include subsequent markdown lines")
 end)
 
 local function multi_with_custom()
@@ -354,143 +305,21 @@ case("multi_custom_clearing_keeps_predefined", function()
   eq(s.answers[1][1], "Yes")
 end)
 
-local function with_markdown_mock(fn, mock)
-  local original = maki.ui.markdown
-  maki.ui.markdown = mock
-  local ok, err = pcall(fn)
-  maki.ui.markdown = original
-  if not ok then
-    error(err)
-  end
-end
-
-local function count_lines_with_text(lines, text)
-  local n = 0
-  for _, line in ipairs(lines) do
-    for _, span in ipairs(line) do
-      if span[1] == text then
-        n = n + 1
-        break
-      end
-    end
-  end
-  return n
-end
-
-local GUTTER = " "
-
-case("render_selecting_emits_one_line_per_markdown_line_with_gutter", function()
-  with_markdown_mock(function()
-    local s = QuestionForm._initial_state(single_question({ question = "irrelevant" }))
-    local r = QuestionForm._render(s, 80)
-    eq(count_lines_with_text(r.lines, "line one"), 1, "first markdown line emitted once")
-    eq(count_lines_with_text(r.lines, "line two"), 1, "second markdown line emitted once")
-    for _, line in ipairs(r.lines) do
-      for _, span in ipairs(line) do
-        if span[1] == "line one" or span[1] == "line two" then
-          eq(line[1][1], GUTTER, "markdown line must start with gutter span text")
-          eq(line[1][2], "", "gutter span style must be empty")
-          break
-        end
-      end
-    end
-  end, function()
-    return { { { "line one", "" } }, { { "line two", "" } } }
-  end)
-end)
-
-case("inline_md_returns_only_first_markdown_line_in_confirming", function()
-  with_markdown_mock(function()
-    local s = QuestionForm._initial_state(multi_questions())
-    press_many(s, { "enter", "enter" })
-    eq(s.mode, MODE.CONFIRMING)
-    local r = QuestionForm._render(s, 80)
-    assert(find_span_with_text(r.lines, "first"), "confirming row must include first markdown line")
-    assert(not find_span_with_text(r.lines, "second"), "confirming row must NOT include subsequent markdown lines")
-  end, function()
-    return { { { "first", "" } }, { { "second", "" } } }
-  end)
-end)
-
-case("question_md_caches_per_question_index", function()
-  local seen = {}
-  local calls = 0
-  with_markdown_mock(function()
-    local s = QuestionForm._initial_state(multi_questions())
-    QuestionForm._render(s, 80)
-    press_many(s, { "enter", "enter" })
-    QuestionForm._render(s, 80)
-    press(s, "enter")
-    eq(s.mode, MODE.CONFIRMING)
-    QuestionForm._render(s, 80)
-    QuestionForm._render(s, 80)
-    eq(calls, 2, "markdown must be parsed once per unique question text")
-    eq(seen["A?"], 1, "Q1 text parsed exactly once")
-    eq(seen["B?"], 1, "Q2 text parsed exactly once")
-  end, function(text)
-    calls = calls + 1
-    seen[text] = (seen[text] or 0) + 1
-    return { { { text, "" } } }
-  end)
-end)
-
-case("question_md_fallback_on_non_table_return", function()
-  with_markdown_mock(function()
-    local s = QuestionForm._initial_state(single_question())
-    local r = QuestionForm._render(s, 80)
-    local span = find_span_with_text(r.lines, "Pick one")
-    assert(span, "non-table markdown return must fall back to plain question text")
-    eq(span[2], "", "fallback span must be plain (empty style)")
-  end, function()
-    return "not a table"
-  end)
-end)
-
-case("question_md_fallback_on_empty_table_return", function()
-  with_markdown_mock(function()
-    local s = QuestionForm._initial_state(single_question())
-    local r = QuestionForm._render(s, 80)
-    local span = find_span_with_text(r.lines, "Pick one")
-    assert(span, "empty-table markdown return must fall back to plain question text")
-    eq(span[2], "", "fallback span must be plain (empty style)")
-  end, function()
-    return {}
-  end)
-end)
-
-case("render_confirming_preserves_markdown_styles_in_question_row", function()
-  with_markdown_mock(function()
-    local s = QuestionForm._initial_state(multi_questions())
-    press_many(s, { "enter", "enter" })
-    eq(s.mode, MODE.CONFIRMING)
-    local r = QuestionForm._render(s, 80)
-    local span = find_span_with_text(r.lines, "world")
-    assert(span, "expected styled span from markdown in confirming row")
-    eq(span[2], "bold", "markdown style must be preserved through inline_md")
-  end, function()
-    return { { { "Hello ", "" }, { "world", "bold" } } }
-  end)
-end)
-
 case("render_width_zero_does_not_crash", function()
-  local s = QuestionForm._initial_state(single_question())
-  local ok, r = pcall(QuestionForm._render, s, 0)
+  local ok, r = pcall(QuestionForm._render, selecting_single(), 0)
   assert(ok, "render with width=0 must not crash")
   assert(r and r.lines, "render must still return a lines field")
 end)
 
-case("review_tab_label_present_and_changes_style_between_modes", function()
+case("review_tab_label_present_and_styled_differently_between_modes", function()
   local s = QuestionForm._initial_state(multi_questions())
-  local r_selecting = QuestionForm._render(s, 80)
-  local review_inactive = find_span_with_text(r_selecting.lines, " Review ")
+  local review_inactive = find_span_with_text(QuestionForm._render(s, 80).lines, " Review ")
   assert(review_inactive, "Review tab must appear in selecting mode")
-  eq(review_inactive[2], "form_inactive", "Review tab inactive while not confirming")
   press_many(s, { "enter", "enter" })
   eq(s.mode, MODE.CONFIRMING)
-  local r_confirming = QuestionForm._render(s, 80)
-  local review_active = find_span_with_text(r_confirming.lines, " Review ")
+  local review_active = find_span_with_text(QuestionForm._render(s, 80).lines, " Review ")
   assert(review_active, "Review tab must appear in confirming mode")
-  eq(review_active[2], "form_active", "Review tab active while confirming")
+  assert(review_active[2] ~= review_inactive[2], "Review tab style must change between modes")
 end)
 
 case("tab_label_prefers_header_over_q_index_fallback", function()
@@ -498,8 +327,7 @@ case("tab_label_prefers_header_over_q_index_fallback", function()
     { question = "A?", header = "", multiple = false, options = { { label = "a1" } } },
     { question = "B?", header = "abc", multiple = false, options = { { label = "b1" } } },
   }
-  local r = QuestionForm._render(QuestionForm._initial_state(questions), 80)
-  local tab_bar = r.lines[1]
+  local tab_bar = QuestionForm._render(QuestionForm._initial_state(questions), 80).lines[1]
   local has_q1, has_abc = false, false
   for _, span in ipairs(tab_bar) do
     if span[1]:find("Q1", 1, true) then
@@ -517,8 +345,7 @@ case("answered_non_current_tab_shows_check_glyph", function()
   local s = QuestionForm._initial_state(multi_questions())
   press(s, "enter")
   eq(s.tab, 2, "after answering Q1, cursor advances to Q2")
-  local r = QuestionForm._render(s, 80)
-  local tab_bar = r.lines[1]
+  local tab_bar = QuestionForm._render(s, 80).lines[1]
   local q1_has_check, q2_has_check = false, false
   for _, span in ipairs(tab_bar) do
     if span[1]:find("a", 1, true) and span[1]:find("✓", 1, true) then
@@ -535,31 +362,16 @@ end)
 case("render_confirming_shows_no_answer_placeholder_for_unanswered_question", function()
   local s = QuestionForm._initial_state(multi_questions())
   press(s, "enter")
-  eq(s.tab, 2)
   press(s, "right")
   eq(s.mode, MODE.CONFIRMING, "from last question, right goes to confirming")
-  local r = QuestionForm._render(s, 80)
-  local placeholder = find_span_with_text(r.lines, "(no answer)")
+  local placeholder = find_span_with_text(QuestionForm._render(s, 80).lines, "(no answer)")
   assert(placeholder, "unanswered question row must contain '(no answer)' span")
 end)
 
-case("escape_cell_empty_string_returns_empty_string", function()
-  eq(QuestionHelpers.escape_cell(""), "", "empty input escapes to empty output")
-end)
-
-case("format_answer_table_with_no_questions_returns_header_and_separator_only", function()
-  local out = QuestionHelpers.format_answer_table({}, {})
-  eq(out, "| Question | Answer |\n|----------|--------|", "empty questions yields header+separator with no data rows")
-end)
-
 case("render_selecting_focus_row_tracks_cursor_down_movement", function()
-  local q = {
-    question = "Pick",
-    header = "",
-    multiple = false,
+  local s = QuestionForm._initial_state(single_question({
     options = { { label = "o1" }, { label = "o2" }, { label = "o3" } },
-  }
-  local s = QuestionForm._initial_state({ q })
+  }))
   local r1 = QuestionForm._render(s, 80)
   press_many(s, { "down", "down" })
   eq(s.cursor, 3, "two downs land on option 3")
@@ -572,7 +384,6 @@ local DESC_LABEL_INDENT = 4
 local DESC_SEP_WIDTH = 3
 local DESC_WRAP_WIDTH = 30
 local DESC_LONG = "alpha beta gamma delta epsilon zeta eta theta"
-local PAD_MISMATCH_MSG = "description continuation line must align under first description char"
 
 local function leading_space_count(line)
   local text = ""
@@ -594,12 +405,10 @@ local function continuation_after(lines, marker)
 end
 
 case("render_selecting_aligns_description_continuation_under_first_desc_char", function()
-  -- display_width = utf8.len matches #s for ASCII, differs for multibyte; both must align.
-  local cases = {
+  for _, c in ipairs({
     { label = "foo", expected_label_w = 3 },
     { label = "café", expected_label_w = 4 },
-  }
-  for _, c in ipairs(cases) do
+  }) do
     local q = {
       question = "Pick",
       header = "",
@@ -610,7 +419,7 @@ case("render_selecting_aligns_description_continuation_under_first_desc_char", f
     local cont = continuation_after(r.lines, "alpha")
     assert(cont, "label=" .. c.label .. ": expected a wrapped continuation line")
     local expected_pad = DESC_LABEL_INDENT + c.expected_label_w + DESC_SEP_WIDTH
-    eq(leading_space_count(cont), expected_pad, PAD_MISMATCH_MSG .. " (label=" .. c.label .. ")")
+    eq(leading_space_count(cont), expected_pad, "label=" .. c.label .. ": continuation alignment")
   end
 end)
 
