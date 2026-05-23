@@ -8,6 +8,8 @@ local CHROME = 3
 local LABEL_INDENT = 4
 local DESC_SEP = " — "
 local DESC_SEP_WIDTH = 3
+local ARROW_PREFIX = "    → "
+local ARROW_PREFIX_W = 6
 
 local MODE = {
   SELECTING = "selecting",
@@ -26,29 +28,93 @@ local function display_width(s)
   return utf8.len(s) or #s
 end
 
-local function wrap_text(text, max_width)
-  if max_width <= 0 or #text <= max_width then
-    return { text }
+local function split_at(s, max_cols)
+  local total = utf8.len(s) or #s
+  if total <= max_cols then
+    return s, ""
   end
-  local result = {}
-  local pos = 1
-  while pos <= #text do
-    local remaining = #text - pos + 1
-    if remaining <= max_width then
-      result[#result + 1] = text:sub(pos)
-      break
-    end
-    local window = text:sub(pos, pos + max_width - 1)
-    local space_rel = window:find("()%s[^%s]*$")
-    if space_rel then
-      result[#result + 1] = text:sub(pos, pos + space_rel - 2)
-      pos = pos + space_rel
+  local byte_end = utf8.offset(s, max_cols + 1)
+  return s:sub(1, byte_end - 1), s:sub(byte_end)
+end
+
+local function wrap_spans(spans, max_width)
+  if #spans == 0 then
+    return { {} }
+  end
+  if max_width <= 0 then
+    return { spans }
+  end
+
+  local lines, current, current_w = {}, {}, 0
+  local pending_ws, pending_ws_w = "", 0
+
+  local function flush()
+    lines[#lines + 1] = current
+    current, current_w = {}, 0
+    pending_ws, pending_ws_w = "", 0
+  end
+
+  local function push(text, style, width)
+    local last = current[#current]
+    if last and last[2] == style then
+      last[1] = last[1] .. text
     else
-      result[#result + 1] = window
-      pos = pos + max_width
+      current[#current + 1] = { text, style }
+    end
+    current_w = current_w + width
+  end
+
+  for _, span in ipairs(spans) do
+    local style, remaining = span[2], span[1]
+    while remaining ~= "" do
+      local _, ws_end = remaining:find("^%s+")
+      if ws_end then
+        if current_w > 0 then
+          local ws = remaining:sub(1, ws_end)
+          pending_ws = pending_ws .. ws
+          pending_ws_w = pending_ws_w + display_width(ws)
+        end
+        remaining = remaining:sub(ws_end + 1)
+      else
+        local word_end = remaining:find("%s") or (#remaining + 1)
+        local word = remaining:sub(1, word_end - 1)
+        remaining = remaining:sub(word_end)
+        local word_w = display_width(word)
+        if current_w + pending_ws_w + word_w <= max_width then
+          if pending_ws_w > 0 then
+            push(pending_ws, style, pending_ws_w)
+            pending_ws, pending_ws_w = "", 0
+          end
+          push(word, style, word_w)
+        elseif word_w <= max_width then
+          flush()
+          push(word, style, word_w)
+        else
+          while word ~= "" do
+            if current_w >= max_width then
+              flush()
+            end
+            local head, tail = split_at(word, max_width - current_w)
+            push(head, style, display_width(head))
+            word = tail
+          end
+        end
+      end
     end
   end
-  return result
+
+  flush()
+  return lines
+end
+
+local function append_wrapped(lines, spans, max_width, prefix, prefix_style, pad)
+  for j, wrapped_line in ipairs(wrap_spans(spans, max_width)) do
+    local row = { j == 1 and { prefix, prefix_style } or { pad, "" } }
+    for _, sp in ipairs(wrapped_line) do
+      row[#row + 1] = sp
+    end
+    lines[#lines + 1] = row
+  end
 end
 
 local function has_confirm(state)
@@ -69,8 +135,6 @@ local function initial_state(questions)
     rendered_questions = {},
   }
 end
-
-local GUTTER_SPAN = { " ", "" }
 
 local function question_md(state, idx)
   local cached = state.rendered_questions[idx]
@@ -302,11 +366,7 @@ local function render_selecting(state, width)
   end
 
   for _, md_line in ipairs(question_md(state, state.tab)) do
-    local row = { GUTTER_SPAN }
-    for _, sp in ipairs(md_line) do
-      row[#row + 1] = sp
-    end
-    lines[#lines + 1] = row
+    append_wrapped(lines, md_line, width - 1, " ", "", " ")
   end
   lines[#lines + 1] = {}
 
@@ -322,12 +382,19 @@ local function render_selecting(state, width)
     spans[#spans + 1] = { opt.label, is_cur and "form_active" or "" }
     if opt.description and opt.description ~= "" then
       local prefix_w = LABEL_INDENT + display_width(opt.label) + DESC_SEP_WIDTH
-      local desc_lines = wrap_text(opt.description, width - prefix_w)
-      spans[#spans + 1] = { DESC_SEP .. desc_lines[1], "form_description" }
+      local desc_lines = wrap_spans({ { opt.description, "form_description" } }, width - prefix_w)
+      spans[#spans + 1] = { DESC_SEP, "form_description" }
+      for _, sp in ipairs(desc_lines[1]) do
+        spans[#spans + 1] = sp
+      end
       lines[#lines + 1] = spans
       local pad = string.rep(" ", prefix_w)
       for j = 2, #desc_lines do
-        lines[#lines + 1] = { { pad .. desc_lines[j], "form_description" } }
+        local row = { { pad, "" } }
+        for _, sp in ipairs(desc_lines[j]) do
+          row[#row + 1] = sp
+        end
+        lines[#lines + 1] = row
       end
     else
       lines[#lines + 1] = spans
@@ -388,24 +455,32 @@ local function render_selecting(state, width)
   return { lines = lines, focus_row = focus_row, reserved_top = reserved_top, footer = footer }
 end
 
-local function render_confirming(state)
+local function render_confirming(state, width)
   local lines = {}
   lines[#lines + 1] = render_tab_bar(state)
   lines[#lines + 1] = {}
   lines[#lines + 1] = { { " Review your answers:", "bold" } }
   lines[#lines + 1] = {}
 
-  for i, q in ipairs(state.questions) do
+  local arrow_pad = string.rep(" ", ARROW_PREFIX_W)
+
+  for i = 1, #state.questions do
     local ans = state.answers[i]
     local ans_text = (ans and #ans > 0) and table.concat(ans, ", ") or "(no answer)"
-    local row = { { " " .. i .. ". ", "" } }
-    for _, sp in ipairs(inline_md(state, i)) do
-      row[#row + 1] = sp
-    end
-    row[#row + 1] = { " ", "" }
-    row[#row + 1] = { "→ ", "form_arrow" }
-    row[#row + 1] = { ans_text, "form_answer" }
-    lines[#lines + 1] = row
+    local q_prefix = " " .. i .. ". "
+    local q_prefix_w = display_width(q_prefix)
+    local q_pad = string.rep(" ", q_prefix_w)
+
+    append_wrapped(lines, inline_md(state, i), width - q_prefix_w, q_prefix, "", q_pad)
+    append_wrapped(
+      lines,
+      { { ans_text, "form_answer" } },
+      width - ARROW_PREFIX_W,
+      ARROW_PREFIX,
+      "form_arrow",
+      arrow_pad
+    )
+
     if i < #state.questions then
       lines[#lines + 1] = {}
     end
@@ -418,7 +493,7 @@ end
 
 local function render(state, width)
   if state.mode == MODE.CONFIRMING then
-    return render_confirming(state)
+    return render_confirming(state, width)
   end
   return render_selecting(state, width)
 end
@@ -427,6 +502,7 @@ QuestionForm._initial_state = initial_state
 QuestionForm._handle_key = handle_key
 QuestionForm._render = render
 QuestionForm._is_selected = is_selected
+QuestionForm._wrap_spans = wrap_spans
 QuestionForm.MODE = MODE
 
 function QuestionForm.open(questions)

@@ -191,6 +191,59 @@ case("render_reserves_tab_bar_only_when_confirm_present", function()
   eq(QuestionForm._render(QuestionForm._initial_state(multi_questions()), 80).reserved_top, 2)
 end)
 
+local function line_width(line)
+  local w = 0
+  for _, span in ipairs(line) do
+    w = w + (utf8.len(span[1]) or #span[1])
+  end
+  return w
+end
+
+local function assert_all_within(lines, max_width, label)
+  for i, line in ipairs(lines) do
+    assert(line_width(line) <= max_width, label .. " line " .. i .. " exceeds width " .. max_width)
+  end
+end
+
+case("render_selecting_wraps_long_question_within_width", function()
+  local long = string.rep("foo bar ", 20)
+  local s = QuestionForm._initial_state(single_question({ question = long }))
+  assert_all_within(QuestionForm._render(s, 40).lines, 40, "selecting")
+end)
+
+case("render_confirming_wraps_long_question_and_answer_within_width", function()
+  local long_ans = string.rep("answerword ", 15)
+  local long_q = string.rep("promptword ", 15)
+  local s = QuestionForm._initial_state({
+    { question = "Q1", header = "q1", multiple = false, options = { { label = "x" } } },
+    { question = long_q, header = "q2", multiple = false, options = { { label = "y" } } },
+  })
+  s.mode = MODE.CONFIRMING
+  s.answers = { { long_ans }, { "y" } }
+  assert_all_within(QuestionForm._render(s, 40).lines, 40, "confirming")
+end)
+
+case("wrap_spans_preserves_style_across_break", function()
+  local lines = QuestionForm._wrap_spans({ { "alpha beta gamma delta", "bold" } }, 11)
+  assert(#lines >= 2, "expected wrapping")
+  eq(lines[2][1][2], "bold", "style must carry to wrapped continuation")
+end)
+
+case("wrap_spans_hard_splits_oversize_word_on_valid_utf8_boundaries", function()
+  for _, c in ipairs({ { word = "abcdefghij", width = 4 }, { word = "ééééééé", width = 3 } }) do
+    local lines = QuestionForm._wrap_spans({ { c.word, "" } }, c.width)
+    local rebuilt = ""
+    for _, line in ipairs(lines) do
+      assert(line_width(line) <= c.width, c.word .. ": line exceeds width")
+      for _, span in ipairs(line) do
+        assert(utf8.len(span[1]), c.word .. ": span is not valid utf8")
+        rebuilt = rebuilt .. span[1]
+      end
+    end
+    eq(rebuilt, c.word, c.word .. ": reassembled output must equal input")
+  end
+end)
+
 local function find_span_with_text(lines, text)
   for _, line in ipairs(lines) do
     for _, span in ipairs(line) do
