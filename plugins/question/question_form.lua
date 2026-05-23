@@ -66,7 +66,28 @@ local function initial_state(questions)
     cursor = 1,
     answers = {},
     custom_input = TextInput.new(),
+    rendered_questions = {},
   }
+end
+
+local GUTTER_SPAN = { " ", "" }
+
+local function question_md(state, idx)
+  local cached = state.rendered_questions[idx]
+  if cached then
+    return cached
+  end
+  local text = state.questions[idx].question
+  local ok, lines = pcall(maki.ui.markdown, text)
+  if not ok or type(lines) ~= "table" or #lines == 0 then
+    lines = { { { text, "" } } }
+  end
+  state.rendered_questions[idx] = lines
+  return lines
+end
+
+local function inline_md(state, idx)
+  return question_md(state, idx)[1] or { { state.questions[idx].question, "" } }
 end
 
 local function is_selected(state, label)
@@ -280,10 +301,12 @@ local function render_selecting(state, width)
     reserved_top = 2
   end
 
-  for segment in q.question:gmatch("[^\n]+") do
-    for _, wrapped in ipairs(wrap_text(segment, width - 2)) do
-      lines[#lines + 1] = { { " " .. wrapped, "bold" } }
+  for _, md_line in ipairs(question_md(state, state.tab)) do
+    local row = { GUTTER_SPAN }
+    for _, sp in ipairs(md_line) do
+      row[#row + 1] = sp
     end
+    lines[#lines + 1] = row
   end
   lines[#lines + 1] = {}
 
@@ -375,11 +398,14 @@ local function render_confirming(state)
   for i, q in ipairs(state.questions) do
     local ans = state.answers[i]
     local ans_text = (ans and #ans > 0) and table.concat(ans, ", ") or "(no answer)"
-    lines[#lines + 1] = {
-      { " " .. i .. ". " .. q.question .. " ", "" },
-      { "→ ", "form_arrow" },
-      { ans_text, "form_answer" },
-    }
+    local row = { { " " .. i .. ". ", "" } }
+    for _, sp in ipairs(inline_md(state, i)) do
+      row[#row + 1] = sp
+    end
+    row[#row + 1] = { " ", "" }
+    row[#row + 1] = { "→ ", "form_arrow" }
+    row[#row + 1] = { ans_text, "form_answer" }
+    lines[#lines + 1] = row
     if i < #state.questions then
       lines[#lines + 1] = {}
     end

@@ -2342,6 +2342,7 @@ dependencies = [
  "maki-agent",
  "maki-config",
  "maki-highlight",
+ "maki-markdown",
  "maki-storage",
  "mlua",
  "regex",
@@ -2373,6 +2374,14 @@ dependencies = [
  "tree-sitter-swift",
  "tree-sitter-typescript",
  "tree-sitter-zig",
+]
+
+[[package]]
+name = "maki-markdown"
+version = "0.3.7"
+dependencies = [
+ "fastrand",
+ "test-case",
 ]
 
 [[package]]
@@ -2448,6 +2457,7 @@ dependencies = [
  "maki-config",
  "maki-highlight",
  "maki-lua",
+ "maki-markdown",
  "maki-providers",
  "maki-storage",
  "notify",

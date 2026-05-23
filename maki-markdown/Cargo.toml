@@ -1,0 +1,15 @@
+[package]
+name = "maki-markdown"
+description = "Theme-free markdown parser shared by maki-ui's renderer and the maki-lua bridge."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+test-case = { workspace = true }
+fastrand = { workspace = true }

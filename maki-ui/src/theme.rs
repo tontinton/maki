@@ -280,6 +280,13 @@ pub fn style_by_name(name: &str) -> Style {
         "tool" => t.tool,
         "error" => t.error,
         "bold" => t.bold,
+        "italic" => t.italic,
+        "bold_italic" => t.bold_italic,
+        "inline_code" => t.inline_code,
+        "strikethrough" => t.strikethrough,
+        "heading" => t.heading,
+        "list_marker" => t.list_marker,
+        "horizontal_rule" => t.horizontal_rule,
         "keyword" | "index_keyword" => t.index_keyword,
         "section" | "index_section" => t.index_section,
         "line_nr" | "index_line_nr" => t.index_line_nr,
@@ -323,6 +330,8 @@ pub struct Theme {
     pub error: Style,
     pub status_context: Style,
     pub bold: Style,
+    pub italic: Style,
+    pub bold_italic: Style,
     pub inline_code: Style,
     pub code_fallback: Style,
     pub code_bar: Style,
@@ -629,6 +638,12 @@ impl Theme {
 
         let color = |key: &str| -> Color { palette.get(key).copied().unwrap_or(Color::Reset) };
 
+        let bold_style = derived_style(
+            "bold",
+            &["markup.bold", "variable.parameter"],
+            Modifier::BOLD,
+        );
+
         Ok(Self {
             background: color("background"),
             foreground: color("foreground"),
@@ -652,11 +667,15 @@ impl Theme {
             tool_dim: style("tool_dim"),
             error: style("error"),
             status_context: style("status_context"),
-            bold: derived_style(
-                "bold",
-                &["markup.bold", "variable.parameter"],
-                Modifier::BOLD,
-            ),
+            bold: bold_style,
+            italic: ui
+                .get("italic")
+                .map(|d| resolve_style(d, &palette))
+                .unwrap_or_else(|| Style::default().add_modifier(Modifier::ITALIC)),
+            bold_italic: ui
+                .get("bold_italic")
+                .map(|d| resolve_style(d, &palette))
+                .unwrap_or_else(|| bold_style.add_modifier(Modifier::ITALIC)),
             inline_code: derived_style(
                 "inline_code",
                 &["function.call", "function"],
@@ -1045,6 +1064,8 @@ mode_build = "#112233"
         assert_eq!(style_by_name("tool"), t.tool);
         assert_eq!(style_by_name("error"), t.error);
         assert_eq!(style_by_name("bold"), t.bold);
+        assert_eq!(style_by_name("italic"), t.italic);
+        assert_eq!(style_by_name("bold_italic"), t.bold_italic);
         assert_eq!(style_by_name("diff_old"), t.diff_old);
         assert_eq!(style_by_name("diff_new"), t.diff_new);
         assert_eq!(style_by_name("cmd_selected"), t.cmd_selected);

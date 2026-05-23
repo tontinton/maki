@@ -242,6 +242,61 @@ case("render_handles_long_question_text_by_wrapping", function()
   assert(#r.lines > 1, "long question must wrap onto multiple lines")
 end)
 
+local function find_span_with_text(lines, text)
+  for _, line in ipairs(lines) do
+    for _, span in ipairs(line) do
+      if span[1] == text then
+        return span
+      end
+    end
+  end
+  return nil
+end
+
+case("render_selecting_uses_markdown_styles_for_prompt", function()
+  local s = QuestionForm._initial_state(single_question({ question = "Pick a **bold** option" }))
+  local r = QuestionForm._render(s, 80)
+  local span = find_span_with_text(r.lines, "bold")
+  assert(span, "expected to find span containing 'bold'")
+  eq(span[2], "bold", "markdown bold delimiters must map to the 'bold' style name")
+end)
+
+case("render_selecting_preserves_bold_italic_style_name", function()
+  -- The old lossy mapping collapsed `***...***` to "bold" and dropped italic.
+  local s = QuestionForm._initial_state(single_question({ question = "Try ***both*** styles" }))
+  local r = QuestionForm._render(s, 80)
+  local span = find_span_with_text(r.lines, "both")
+  assert(span, "expected to find span containing 'both'")
+  eq(span[2], "bold_italic", "*** delimiters must map to the 'bold_italic' style name")
+end)
+
+case("render_selecting_falls_back_on_markdown_failure", function()
+  local original = maki.ui.markdown
+  maki.ui.markdown = function()
+    error("boom")
+  end
+  local ok, r = pcall(QuestionForm._render, QuestionForm._initial_state(single_question()), 80)
+  maki.ui.markdown = original
+  assert(ok, "render must not propagate markdown errors")
+  local span = find_span_with_text(r.lines, "Pick one")
+  assert(span, "fallback must still surface the question text as a plain span")
+  eq(span[2], "", "fallback span must be plain (empty style name)")
+end)
+
+case("render_selecting_caches_markdown_across_renders", function()
+  local original = maki.ui.markdown
+  local calls = 0
+  maki.ui.markdown = function(text)
+    calls = calls + 1
+    return original(text)
+  end
+  local s = QuestionForm._initial_state(single_question())
+  QuestionForm._render(s, 80)
+  QuestionForm._render(s, 80)
+  maki.ui.markdown = original
+  eq(calls, 1, "markdown must be parsed exactly once per question across renders")
+end)
+
 local function multi_with_custom()
   return single_question({ multiple = true, options = { { label = "a1" }, { label = "a2" } } })
 end
@@ -297,6 +352,220 @@ case("multi_custom_clearing_keeps_predefined", function()
   press_many(s, { "enter", "backspace", "backspace", "enter" })
   eq(#s.answers[1], 1, "only predefined remains")
   eq(s.answers[1][1], "Yes")
+end)
+
+local function with_markdown_mock(fn, mock)
+  local original = maki.ui.markdown
+  maki.ui.markdown = mock
+  local ok, err = pcall(fn)
+  maki.ui.markdown = original
+  if not ok then
+    error(err)
+  end
+end
+
+local function count_lines_with_text(lines, text)
+  local n = 0
+  for _, line in ipairs(lines) do
+    for _, span in ipairs(line) do
+      if span[1] == text then
+        n = n + 1
+        break
+      end
+    end
+  end
+  return n
+end
+
+local GUTTER = " "
+
+case("render_selecting_emits_one_line_per_markdown_line_with_gutter", function()
+  with_markdown_mock(function()
+    local s = QuestionForm._initial_state(single_question({ question = "irrelevant" }))
+    local r = QuestionForm._render(s, 80)
+    eq(count_lines_with_text(r.lines, "line one"), 1, "first markdown line emitted once")
+    eq(count_lines_with_text(r.lines, "line two"), 1, "second markdown line emitted once")
+    for _, line in ipairs(r.lines) do
+      for _, span in ipairs(line) do
+        if span[1] == "line one" or span[1] == "line two" then
+          eq(line[1][1], GUTTER, "markdown line must start with gutter span text")
+          eq(line[1][2], "", "gutter span style must be empty")
+          break
+        end
+      end
+    end
+  end, function()
+    return { { { "line one", "" } }, { { "line two", "" } } }
+  end)
+end)
+
+case("inline_md_returns_only_first_markdown_line_in_confirming", function()
+  with_markdown_mock(function()
+    local s = QuestionForm._initial_state(multi_questions())
+    press_many(s, { "enter", "enter" })
+    eq(s.mode, MODE.CONFIRMING)
+    local r = QuestionForm._render(s, 80)
+    assert(find_span_with_text(r.lines, "first"), "confirming row must include first markdown line")
+    assert(not find_span_with_text(r.lines, "second"), "confirming row must NOT include subsequent markdown lines")
+  end, function()
+    return { { { "first", "" } }, { { "second", "" } } }
+  end)
+end)
+
+case("question_md_caches_per_question_index", function()
+  local seen = {}
+  local calls = 0
+  with_markdown_mock(function()
+    local s = QuestionForm._initial_state(multi_questions())
+    QuestionForm._render(s, 80)
+    press_many(s, { "enter", "enter" })
+    QuestionForm._render(s, 80)
+    press(s, "enter")
+    eq(s.mode, MODE.CONFIRMING)
+    QuestionForm._render(s, 80)
+    QuestionForm._render(s, 80)
+    eq(calls, 2, "markdown must be parsed once per unique question text")
+    eq(seen["A?"], 1, "Q1 text parsed exactly once")
+    eq(seen["B?"], 1, "Q2 text parsed exactly once")
+  end, function(text)
+    calls = calls + 1
+    seen[text] = (seen[text] or 0) + 1
+    return { { { text, "" } } }
+  end)
+end)
+
+case("question_md_fallback_on_non_table_return", function()
+  with_markdown_mock(function()
+    local s = QuestionForm._initial_state(single_question())
+    local r = QuestionForm._render(s, 80)
+    local span = find_span_with_text(r.lines, "Pick one")
+    assert(span, "non-table markdown return must fall back to plain question text")
+    eq(span[2], "", "fallback span must be plain (empty style)")
+  end, function()
+    return "not a table"
+  end)
+end)
+
+case("question_md_fallback_on_empty_table_return", function()
+  with_markdown_mock(function()
+    local s = QuestionForm._initial_state(single_question())
+    local r = QuestionForm._render(s, 80)
+    local span = find_span_with_text(r.lines, "Pick one")
+    assert(span, "empty-table markdown return must fall back to plain question text")
+    eq(span[2], "", "fallback span must be plain (empty style)")
+  end, function()
+    return {}
+  end)
+end)
+
+case("render_confirming_preserves_markdown_styles_in_question_row", function()
+  with_markdown_mock(function()
+    local s = QuestionForm._initial_state(multi_questions())
+    press_many(s, { "enter", "enter" })
+    eq(s.mode, MODE.CONFIRMING)
+    local r = QuestionForm._render(s, 80)
+    local span = find_span_with_text(r.lines, "world")
+    assert(span, "expected styled span from markdown in confirming row")
+    eq(span[2], "bold", "markdown style must be preserved through inline_md")
+  end, function()
+    return { { { "Hello ", "" }, { "world", "bold" } } }
+  end)
+end)
+
+case("render_width_zero_does_not_crash", function()
+  local s = QuestionForm._initial_state(single_question())
+  local ok, r = pcall(QuestionForm._render, s, 0)
+  assert(ok, "render with width=0 must not crash")
+  assert(r and r.lines, "render must still return a lines field")
+end)
+
+case("review_tab_label_present_and_changes_style_between_modes", function()
+  local s = QuestionForm._initial_state(multi_questions())
+  local r_selecting = QuestionForm._render(s, 80)
+  local review_inactive = find_span_with_text(r_selecting.lines, " Review ")
+  assert(review_inactive, "Review tab must appear in selecting mode")
+  eq(review_inactive[2], "form_inactive", "Review tab inactive while not confirming")
+  press_many(s, { "enter", "enter" })
+  eq(s.mode, MODE.CONFIRMING)
+  local r_confirming = QuestionForm._render(s, 80)
+  local review_active = find_span_with_text(r_confirming.lines, " Review ")
+  assert(review_active, "Review tab must appear in confirming mode")
+  eq(review_active[2], "form_active", "Review tab active while confirming")
+end)
+
+case("tab_label_prefers_header_over_q_index_fallback", function()
+  local questions = {
+    { question = "A?", header = "", multiple = false, options = { { label = "a1" } } },
+    { question = "B?", header = "abc", multiple = false, options = { { label = "b1" } } },
+  }
+  local r = QuestionForm._render(QuestionForm._initial_state(questions), 80)
+  local tab_bar = r.lines[1]
+  local has_q1, has_abc = false, false
+  for _, span in ipairs(tab_bar) do
+    if span[1]:find("Q1", 1, true) then
+      has_q1 = true
+    end
+    if span[1]:find("abc", 1, true) then
+      has_abc = true
+    end
+  end
+  assert(has_q1, "empty header must fall back to Q<n> label")
+  assert(has_abc, "non-empty header must be used as tab label")
+end)
+
+case("answered_non_current_tab_shows_check_glyph", function()
+  local s = QuestionForm._initial_state(multi_questions())
+  press(s, "enter")
+  eq(s.tab, 2, "after answering Q1, cursor advances to Q2")
+  local r = QuestionForm._render(s, 80)
+  local tab_bar = r.lines[1]
+  local q1_has_check, q2_has_check = false, false
+  for _, span in ipairs(tab_bar) do
+    if span[1]:find("a", 1, true) and span[1]:find("✓", 1, true) then
+      q1_has_check = true
+    end
+    if span[1]:find("b", 1, true) and span[1]:find("✓", 1, true) then
+      q2_has_check = true
+    end
+  end
+  assert(q1_has_check, "answered non-current tab must show ✓")
+  assert(not q2_has_check, "current unanswered tab must NOT show ✓")
+end)
+
+case("render_confirming_shows_no_answer_placeholder_for_unanswered_question", function()
+  local s = QuestionForm._initial_state(multi_questions())
+  press(s, "enter")
+  eq(s.tab, 2)
+  press(s, "right")
+  eq(s.mode, MODE.CONFIRMING, "from last question, right goes to confirming")
+  local r = QuestionForm._render(s, 80)
+  local placeholder = find_span_with_text(r.lines, "(no answer)")
+  assert(placeholder, "unanswered question row must contain '(no answer)' span")
+end)
+
+case("escape_cell_empty_string_returns_empty_string", function()
+  eq(QuestionHelpers.escape_cell(""), "", "empty input escapes to empty output")
+end)
+
+case("format_answer_table_with_no_questions_returns_header_and_separator_only", function()
+  local out = QuestionHelpers.format_answer_table({}, {})
+  eq(out, "| Question | Answer |\n|----------|--------|", "empty questions yields header+separator with no data rows")
+end)
+
+case("render_selecting_focus_row_tracks_cursor_down_movement", function()
+  local q = {
+    question = "Pick",
+    header = "",
+    multiple = false,
+    options = { { label = "o1" }, { label = "o2" }, { label = "o3" } },
+  }
+  local s = QuestionForm._initial_state({ q })
+  local r1 = QuestionForm._render(s, 80)
+  press_many(s, { "down", "down" })
+  eq(s.cursor, 3, "two downs land on option 3")
+  local r3 = QuestionForm._render(s, 80)
+  assert(r3.focus_row > r1.focus_row, "focus_row must advance when cursor moves down")
+  assert(r3.focus_row <= #r3.lines, "focus_row must stay within rendered line range")
 end)
 
 local DESC_LABEL_INDENT = 4

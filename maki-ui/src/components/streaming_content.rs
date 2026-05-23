@@ -1,6 +1,7 @@
 use crate::animation::Typewriter;
 use crate::highlight::CodeHighlighter;
-use crate::markdown::{RenderCtx, RenderState, finalize_lines, parse_blocks, render_block};
+use crate::markdown::{RenderCtx, RenderState, finalize_lines, render_block};
+use maki_markdown::parse;
 
 use ratatui::style::Style;
 use ratatui::text::Line;
@@ -45,25 +46,28 @@ impl StreamingCache {
         self.byte_len = len;
 
         let text = visible.trim_start_matches('\n');
-        let blocks = parse_blocks(text);
+        let blocks = parse(text);
 
         self.lines.clear();
-        let mut state = RenderState::new();
-        let mut hl_opt: Option<&mut Vec<CodeHighlighter>> = Some(&mut self.highlighters);
-        let mut ctx = RenderCtx {
-            prefix,
-            text_style,
-            prefix_style,
-            highlighters: &mut hl_opt,
-            width,
-            table_col_widths: Some(&mut self.table_col_widths),
+        let (code_idx, table_idx) = {
+            let mut state = RenderState {
+                highlighters: Some(&mut self.highlighters),
+                table_col_widths: Some(&mut self.table_col_widths),
+                ..RenderState::new()
+            };
+            let ctx = RenderCtx {
+                prefix,
+                text_style,
+                prefix_style,
+                width,
+            };
+            for block in &blocks {
+                render_block(block, &mut self.lines, &mut state, &ctx);
+            }
+            (state.code_idx, state.table_idx)
         };
-
-        for block in &blocks {
-            render_block(block, &mut self.lines, &mut state, &mut ctx);
-        }
-        self.highlighters.truncate(state.code_idx);
-        self.table_col_widths.truncate(state.table_idx);
+        self.highlighters.truncate(code_idx);
+        self.table_col_widths.truncate(table_idx);
 
         finalize_lines(&mut self.lines, prefix, prefix_style);
         true

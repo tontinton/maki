@@ -13,6 +13,7 @@ crossterm = { workspace = true }
 maki-agent = { workspace = true }
 maki-config = { workspace = true }
 maki-highlight = { workspace = true }
+maki-markdown = { workspace = true }
 mlua = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
