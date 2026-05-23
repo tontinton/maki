@@ -14,12 +14,51 @@ use crate::components::{
 };
 use crate::theme;
 
+/// Splits the lines into a top band, a bottom band, and the scrollable middle.
+/// When the window is too short to fit both bands, the bottom wins so footers
+/// like keybind hints stay on screen even if the header gets squeezed out.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct Layout {
+    reserved_top: usize,
+    reserved_bot: usize,
+    scrollable: usize,
+}
+
+impl Layout {
+    fn new(reserved_top: usize, reserved_bottom: usize, line_count: usize) -> Self {
+        let reserved_bot = reserved_bottom.min(line_count);
+        let reserved_top = reserved_top.min(line_count - reserved_bot);
+        Self {
+            reserved_top,
+            reserved_bot,
+            scrollable: line_count - reserved_top - reserved_bot,
+        }
+    }
+
+    fn max_offset(self, viewport_h: u16) -> usize {
+        self.scrollable.saturating_sub(viewport_h as usize)
+    }
+}
+
+/// A floating window managed by lua.
+///
+/// Every public method leaves these promises intact:
+///
+/// 1. `cursor` stays in bounds while `cached_lines` is non-empty.
+/// 2. `scroll_offset` stays at or below `layout().max_offset(viewport_h)`.
+/// 3. [`set_cursor`] and [`bring_cursor_into_view`] place the cursor inside
+///    the visible band whenever there is anything to scroll.
+/// 4. [`refresh_layout`] only ever clamps the offset down to fit. It never
+///    drags it back toward the cursor, which is the bug that ate wheel input
+///    on every frame.
 struct FloatWindow {
     id: u32,
     buf: Arc<SharedBuf>,
     config: FloatConfig,
     scroll_offset: usize,
     cached_lines: Arc<Vec<SnapshotLine>>,
+    /// Locked at the last render. Only [`refresh_layout`] writes here, so
+    /// scroll math stays consistent between frames.
     viewport_h: u16,
     last_content: Rect,
     cursor: usize,
@@ -28,31 +67,60 @@ struct FloatWindow {
 }
 
 impl FloatWindow {
-    fn chrome(&self) -> (usize, usize, usize) {
-        chrome(
+    fn layout(&self) -> Layout {
+        Layout::new(
             self.config.reserved_top,
             self.config.reserved_bottom,
             self.cached_lines.len(),
         )
     }
 
-    fn sync_scroll(&mut self) {
-        let (top, _bot, scrollable) = self.chrome();
-        let effective_cursor = self.cursor.saturating_sub(top);
-        let clamped = effective_cursor.min(scrollable.saturating_sub(1));
-        self.cursor = clamped + top;
-        self.scroll_offset =
-            adjust_scroll(clamped, self.scroll_offset, scrollable, self.viewport_h);
+    /// Positive `delta` scrolls up (closer to the top of the buffer, smaller
+    /// `scroll_offset`), negative scrolls down. The cursor is left alone on
+    /// purpose so the user can scroll past it and scroll back.
+    fn scroll_by(&mut self, delta: i32) {
+        let max_offset = self.layout().max_offset(self.viewport_h);
+        if delta >= 0 {
+            self.scroll_offset = self.scroll_offset.saturating_sub(delta as usize);
+        } else {
+            self.scroll_offset =
+                (self.scroll_offset + delta.unsigned_abs() as usize).min(max_offset);
+        }
     }
-}
 
-/// Splits the available `line_count` into top reserved rows, bottom reserved
-/// rows, and the scrollable middle. When the window is tight, the bottom wins:
-/// footers like keybind hints stay visible even if the top header gets squeezed.
-fn chrome(reserved_top: usize, reserved_bottom: usize, line_count: usize) -> (usize, usize, usize) {
-    let bottom = reserved_bottom.min(line_count);
-    let top = reserved_top.min(line_count - bottom);
-    (top, bottom, line_count - top - bottom)
+    fn set_cursor(&mut self, row: usize) {
+        self.cursor = row;
+        self.bring_cursor_into_view();
+    }
+
+    /// Called once per frame from the render path. Only shrinks the offset
+    /// when it falls off the end, never nudges it toward the cursor. That
+    /// restraint is what keeps mouse wheel scroll from snapping back.
+    fn refresh_layout(&mut self, viewport_h: u16) -> Layout {
+        self.viewport_h = viewport_h;
+        let layout = self.layout();
+        let max_offset = layout.max_offset(viewport_h);
+        if self.scroll_offset > max_offset {
+            self.scroll_offset = max_offset;
+        }
+        layout
+    }
+
+    /// Pulls the cursor into the scrollable band and then slides the offset
+    /// to follow it. Use this after the cursor moves or the buffer changes,
+    /// never on a plain redraw.
+    fn bring_cursor_into_view(&mut self) {
+        let layout = self.layout();
+        let effective_cursor = self.cursor.saturating_sub(layout.reserved_top);
+        let clamped = effective_cursor.min(layout.scrollable.saturating_sub(1));
+        self.cursor = clamped + layout.reserved_top;
+        self.scroll_offset = adjust_scroll(
+            clamped,
+            self.scroll_offset,
+            layout.scrollable,
+            self.viewport_h,
+        );
+    }
 }
 
 pub(crate) struct FloatManager {
@@ -111,7 +179,7 @@ impl FloatManager {
         for win in &mut self.windows {
             if let Some(lines) = win.buf.read_if_dirty() {
                 win.cached_lines = lines;
-                win.sync_scroll();
+                win.bring_cursor_into_view();
             }
 
             loop {
@@ -120,8 +188,7 @@ impl FloatManager {
                         win.config.apply_patch(patch);
                     }
                     Ok(WinCommand::SetCursor(row)) => {
-                        win.cursor = row;
-                        win.sync_scroll();
+                        win.set_cursor(row);
                     }
                     Ok(WinCommand::Close) => {
                         let _ = win.event_tx.try_send(WinEvent::Close);
@@ -248,14 +315,14 @@ impl FloatManager {
                 win.last_content = content_area;
             }
 
-            let (top, bot, scrollable) = win.chrome();
-            let reserved_top_h = top as u16;
-            let reserved_bot_h = bot as u16;
+            let layout = win.layout();
+            let reserved_top_h = layout.reserved_top as u16;
+            let reserved_bot_h = layout.reserved_bot as u16;
             let chrome_h = reserved_top_h + reserved_bot_h;
 
             let (pinned_top_area, scroll_area, pinned_bot_area) =
                 if chrome_h > 0 && content_area.height > chrome_h {
-                    let top_area = (top > 0).then_some(Rect {
+                    let top_area = (layout.reserved_top > 0).then_some(Rect {
                         x: content_area.x,
                         y: content_area.y,
                         width: content_area.width,
@@ -267,7 +334,7 @@ impl FloatManager {
                         width: content_area.width,
                         height: content_area.height - chrome_h,
                     };
-                    let bot_area = (bot > 0).then_some(Rect {
+                    let bot_area = (layout.reserved_bot > 0).then_some(Rect {
                         x: content_area.x,
                         y: sa.y + sa.height,
                         width: content_area.width,
@@ -278,8 +345,9 @@ impl FloatManager {
                     (None, content_area, None)
                 };
 
-            win.viewport_h = scroll_area.height;
-            win.sync_scroll();
+            win.refresh_layout(scroll_area.height);
+            let top = layout.reserved_top;
+            let scrollable = layout.scrollable;
 
             let vh = win.viewport_h as usize;
             let end = (top + win.scroll_offset + vh).min(top + scrollable);
@@ -344,13 +412,7 @@ impl FloatManager {
         let Some(win) = self.windows.iter_mut().find(|w| w.id == fid) else {
             return;
         };
-        let (_, _, scrollable) = win.chrome();
-        let max_offset = scrollable.saturating_sub(win.viewport_h as usize);
-        if delta > 0 {
-            win.scroll_offset = win.scroll_offset.saturating_sub(delta as usize);
-        } else {
-            win.scroll_offset = (win.scroll_offset + delta.unsigned_abs() as usize).min(max_offset);
-        }
+        win.scroll_by(delta);
     }
 
     pub fn is_open(&self) -> bool {
@@ -704,8 +766,9 @@ mod tests {
     #[test_case(5, 5, 6 => (1, 5, 0) ; "bottom_wins_when_tight")]
     #[test_case(5, 10, 3 => (0, 3, 0) ; "bottom_caps_at_line_count")]
     #[test_case(0, 0, 7 => (0, 0, 7) ; "no_chrome")]
-    fn chrome_cases(top: usize, bot: usize, lines: usize) -> (usize, usize, usize) {
-        chrome(top, bot, lines)
+    fn layout_chrome_cases(top: usize, bot: usize, lines: usize) -> (usize, usize, usize) {
+        let l = Layout::new(top, bot, lines);
+        (l.reserved_top, l.reserved_bot, l.scrollable)
     }
 
     #[test]
@@ -1189,10 +1252,13 @@ mod tests {
         cfg.reserved_bottom = 10;
         mgr.open(buf, cfg, true, event_tx, cmd_rx);
 
-        let (top, bot, scrollable) = mgr.windows[0].chrome();
-        assert_eq!(top, 0, "top yields when bottom consumes everything");
-        assert_eq!(bot, 5);
-        assert_eq!(scrollable, 0);
+        let layout = mgr.windows[0].layout();
+        assert_eq!(
+            layout.reserved_top, 0,
+            "top yields when bottom consumes everything"
+        );
+        assert_eq!(layout.reserved_bot, 5);
+        assert_eq!(layout.scrollable, 0);
     }
 
     #[test]
@@ -1209,8 +1275,7 @@ mod tests {
         mgr.scroll(-1000);
 
         let win = &mgr.windows[0];
-        let (_, _, scrollable) = win.chrome();
-        let expected_max = scrollable.saturating_sub(win.viewport_h as usize);
+        let expected_max = win.layout().max_offset(win.viewport_h);
         assert_eq!(
             win.scroll_offset, expected_max,
             "scroll_offset must clamp at scrollable - viewport_h",
@@ -1295,5 +1360,148 @@ mod tests {
             erx2.drain().any(|e| matches!(e, WinEvent::Close)),
             "Drop must send Close to window 2",
         );
+    }
+
+    const SCROLL_PRESERVED: &str = "refresh_layout must not pull offset toward cursor";
+    const CURSOR_VISIBLE: &str = "cursor must be inside the viewport";
+    const OFFSET_IN_RANGE: &str = "scroll_offset must be <= max_offset";
+
+    fn make_window_n(line_count: usize) -> FloatWindow {
+        let (event_tx, _event_rx) = flume::bounded::<WinEvent>(8);
+        let (_cmd_tx, cmd_rx) = flume::bounded::<WinCommand>(8);
+        let lines: Vec<String> = (0..line_count).map(|i| format!("l{i}")).collect();
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let buf = make_buf(&refs);
+        let cached_lines = buf.read_if_dirty().unwrap_or_default();
+        FloatWindow {
+            id: 0,
+            buf,
+            config: make_config(),
+            scroll_offset: 0,
+            cached_lines,
+            viewport_h: 1,
+            last_content: Rect::default(),
+            cursor: 0,
+            event_tx,
+            cmd_rx,
+        }
+    }
+
+    fn assert_invariants(win: &FloatWindow) {
+        if !win.cached_lines.is_empty() {
+            assert!(
+                win.cursor < win.cached_lines.len(),
+                "cursor {} out of bounds for {} lines",
+                win.cursor,
+                win.cached_lines.len(),
+            );
+        }
+        let max_offset = win.layout().max_offset(win.viewport_h);
+        assert!(
+            win.scroll_offset <= max_offset,
+            "{OFFSET_IN_RANGE}: got {} > max {max_offset}",
+            win.scroll_offset,
+        );
+    }
+
+    fn assert_cursor_visible(win: &FloatWindow) {
+        let lo = win.layout().reserved_top + win.scroll_offset;
+        let hi = lo + win.viewport_h as usize;
+        assert!(
+            win.cursor >= lo && win.cursor < hi,
+            "{CURSOR_VISIBLE}: cursor {} not in [{lo}, {hi})",
+            win.cursor,
+        );
+    }
+
+    /// Regression: `view()` used to re-snap the offset toward the cursor on
+    /// every frame, so wheel scrolls were silently undone before the next
+    /// paint.
+    #[test_case(-3 ; "small_delta")]
+    #[test_case(-7 ; "large_delta")]
+    fn scroll_by_persists_across_refresh_layout(delta: i32) {
+        let mut win = make_window_n(20);
+        win.refresh_layout(5);
+        win.scroll_by(delta);
+        let after_scroll = win.scroll_offset;
+        assert_eq!(win.cursor, 0, "cursor stayed put");
+
+        win.refresh_layout(5);
+        assert_eq!(win.scroll_offset, after_scroll, "{SCROLL_PRESERVED}");
+    }
+
+    #[test]
+    fn set_cursor_brings_cursor_into_view() {
+        let mut win = make_window_n(20);
+        win.refresh_layout(5);
+        win.set_cursor(19);
+        assert_cursor_visible(&win);
+    }
+
+    #[test]
+    fn bring_cursor_into_view_after_content_grows() {
+        let mut win = make_window_n(3);
+        win.refresh_layout(3);
+        win.set_cursor(2);
+
+        win.cached_lines = Arc::new((0..30).map(|i| make_line(&format!("l{i}"))).collect());
+        win.bring_cursor_into_view();
+
+        assert_cursor_visible(&win);
+        assert_invariants(&win);
+    }
+
+    #[test]
+    fn refresh_layout_clamps_when_viewport_grows() {
+        let mut win = make_window_n(10);
+        win.refresh_layout(3);
+        win.scroll_by(-7);
+        assert_eq!(win.scroll_offset, 7);
+
+        win.refresh_layout(8);
+        assert_eq!(win.scroll_offset, 2, "{OFFSET_IN_RANGE}");
+    }
+
+    #[test_case(0, 0, 5 => 0 ; "zero_delta")]
+    #[test_case(3, 2, 5 => 1 ; "positive_delta_scrolls_up")]
+    #[test_case(1, -2, 5 => 3 ; "negative_delta_scrolls_down")]
+    #[test_case(1, 99, 5 => 0 ; "overshoot_up_clamps_to_zero")]
+    #[test_case(1, -99, 5 => 5 ; "overshoot_down_clamps_to_max")]
+    #[test_case(0, -3, 0 => 0 ; "no_room_to_scroll")]
+    fn scroll_by_clamps_at_bounds(initial_offset: usize, delta: i32, max_offset: usize) -> usize {
+        let mut win = make_window_n(max_offset + 1);
+        win.refresh_layout(1);
+        win.scroll_offset = initial_offset;
+        win.scroll_by(delta);
+        win.scroll_offset
+    }
+
+    #[test]
+    fn invariants_hold_across_action_sequence() {
+        let mut win = make_window_n(20);
+        win.refresh_layout(4);
+
+        for op in [
+            &|w: &mut FloatWindow| w.scroll_by(-5) as _,
+            &|w| w.set_cursor(15),
+            &|w| {
+                w.refresh_layout(8);
+            },
+            &|w| w.scroll_by(-100),
+            &|w| w.set_cursor(0),
+            &|w| {
+                w.refresh_layout(2);
+            },
+            &|w| w.scroll_by(100),
+            &|w| {
+                w.refresh_layout(30);
+            },
+            &|w| w.set_cursor(19),
+            &|w| w.scroll_by(-3),
+        ] as [&dyn Fn(&mut FloatWindow); 10]
+        {
+            op(&mut win);
+            assert_invariants(&win);
+        }
     }
 }
