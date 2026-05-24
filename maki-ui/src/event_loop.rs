@@ -431,6 +431,7 @@ impl<'t> EventLoop<'t> {
                     image_count: input.images.len(),
                     input,
                     run_id,
+                    displayed: true,
                 });
             }
             Action::CancelAgent { run_id } => {

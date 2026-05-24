@@ -113,9 +113,12 @@ impl AgentLoop {
                 text,
                 image_count,
                 input,
+                displayed,
                 ..
             } => {
-                let _ = event_tx.send(AgentEvent::QueueItemConsumed { text, image_count });
+                if !displayed {
+                    let _ = event_tx.send(AgentEvent::QueueItemConsumed { text, image_count });
+                }
                 self.do_agent_run(input, event_tx, run_id).await
             }
             QueueItem::Compact { .. } => self.do_compact(&event_tx).await,

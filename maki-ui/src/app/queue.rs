@@ -77,8 +77,12 @@ impl MessageQueue {
         }
     }
 
-    pub(crate) fn entries(&self) -> Vec<QueueEntry<'static>> {
-        self.shared.as_ref().map_or(vec![], |s| s.entries())
+    pub(crate) fn panel_len(&self) -> usize {
+        self.shared.as_ref().map_or(0, |s| s.panel_len())
+    }
+
+    pub(crate) fn panel_entries(&self) -> Vec<QueueEntry<'static>> {
+        self.shared.as_ref().map_or(vec![], |s| s.panel_entries())
     }
 
     pub(crate) fn text_messages(&self) -> Vec<String> {
@@ -102,6 +106,8 @@ impl MessageQueue {
 }
 
 impl App {
+    /// Deferred path: the agent is busy, so park the message and let
+    /// `QueueItemConsumed` draw it once the agent picks it up.
     pub(super) fn queue_and_notify(&mut self, msg: QueuedMessage) {
         let Some(ref shared) = self.queue.shared else {
             return;
@@ -112,6 +118,7 @@ impl App {
             image_count: msg.images.len(),
             input,
             run_id: self.run_id,
+            displayed: false,
         });
     }
 
@@ -124,15 +131,19 @@ impl App {
         });
     }
 
+    /// Agent reached a deferred message: time to draw the bubble.
+    /// Immediate-dispatch items skip this event, so no dedup needed.
     pub(super) fn on_queue_item_consumed(&mut self, text: &str, image_count: usize) {
-        self.main_chat().flush();
         self.main_chat()
-            .push_user_message(format_with_images(text, image_count));
-        self.main_chat().enable_auto_scroll();
+            .show_user_message(format_with_images(text, image_count));
     }
 
+    /// Immediate path: kick off the agent and draw the bubble in the same
+    /// frame, so the user sees their message land where it will stay.
     pub(super) fn start_from_queue(&mut self, msg: &QueuedMessage) -> Vec<super::Action> {
         self.status = super::Status::Streaming;
+        self.main_chat()
+            .show_user_message(format_with_images(&msg.text, msg.images.len()));
         vec![super::Action::SendMessage(Box::new(
             self.build_agent_input(msg),
         ))]

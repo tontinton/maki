@@ -50,7 +50,7 @@ impl App {
                 self.plan_form.height().min(max)
             }
         } else if self.is_main_chat() {
-            queue_panel::height(self.queue.len())
+            queue_panel::height(self.queue.panel_len())
                 + self.chats[self.active_chat].todo_panel.height()
                 + self.input_box.height(area.width)
         } else {
@@ -65,7 +65,7 @@ impl App {
         ])
         .areas(area);
 
-        let queue_height = queue_panel::height(self.queue.len());
+        let queue_height = queue_panel::height(self.queue.panel_len());
         let todo_h = if form_visible {
             0
         } else {
@@ -135,7 +135,7 @@ impl App {
         } else if in_plan && self.plan_form.is_visible() {
             self.plan_form.view(frame, layout.bottom_area);
         } else if layout.bottom_area.height > 0 {
-            let queue_entries = self.queue.entries();
+            let queue_entries = self.queue.panel_entries();
             queue_panel::view(frame, layout.queue_area, &queue_entries, self.queue.focus());
             if layout.todo_area.height > 0 {
                 self.chats[self.active_chat]

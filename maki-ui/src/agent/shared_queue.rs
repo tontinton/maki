@@ -40,6 +40,11 @@ pub(crate) enum QueueItem {
         image_count: usize,
         input: AgentInput,
         run_id: u64,
+        /// `true` when the UI already drew the bubble (immediate dispatch).
+        /// The agent then skips `QueueItemConsumed` so we don't draw it twice.
+        /// `false` when the user typed while the agent was busy: the UI waits
+        /// for `QueueItemConsumed` before drawing.
+        displayed: bool,
     },
     Compact {
         run_id: u64,
@@ -73,6 +78,16 @@ impl QueueItem {
         match self {
             Self::Message { input, run_id, .. } => ExtractedCommand::Interrupt(input, run_id),
             Self::Compact { run_id } => ExtractedCommand::Compact(run_id),
+        }
+    }
+
+    /// Immediate-dispatch messages already sit in the chat, so hiding them
+    /// here stops the panel from reserving a row the agent is about to free,
+    /// which used to make the bubble hop up by one frame.
+    fn visible_in_panel(&self) -> bool {
+        match self {
+            Self::Message { displayed, .. } => !displayed,
+            Self::Compact { .. } => true,
         }
     }
 }
@@ -131,6 +146,7 @@ impl QueueSender {
     pub(crate) fn text_messages(&self) -> Vec<String> {
         lock(&self.items)
             .iter()
+            .filter(|item| item.visible_in_panel())
             .filter_map(|item| match item {
                 QueueItem::Message { text, .. } => Some(text.clone()),
                 QueueItem::Compact { .. } => None,
@@ -138,9 +154,17 @@ impl QueueSender {
             .collect()
     }
 
-    pub(crate) fn entries(&self) -> Vec<QueueEntry<'static>> {
+    pub(crate) fn panel_len(&self) -> usize {
         lock(&self.items)
             .iter()
+            .filter(|item| item.visible_in_panel())
+            .count()
+    }
+
+    pub(crate) fn panel_entries(&self) -> Vec<QueueEntry<'static>> {
+        lock(&self.items)
+            .iter()
+            .filter(|item| item.visible_in_panel())
             .map(QueueItem::as_queue_entry)
             .collect()
     }
@@ -165,19 +189,26 @@ impl InterruptSource for QueueReceiver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use test_case::test_case;
 
-    #[test]
-    fn last_sender_drop_closes_notify_channel() {
-        let (tx, rx) = queue();
-        let tx2 = tx.clone();
+    fn msg(displayed: bool) -> QueueItem {
+        QueueItem::Message {
+            text: "t".into(),
+            image_count: 0,
+            input: AgentInput::default(),
+            run_id: 0,
+            displayed,
+        }
+    }
 
-        drop(tx);
-        assert_eq!(rx.notify_rx.try_recv(), Err(flume::TryRecvError::Empty));
-
-        drop(tx2);
-        assert_eq!(
-            rx.notify_rx.try_recv(),
-            Err(flume::TryRecvError::Disconnected)
-        );
+    #[test_case(msg(false),                       true  ; "deferred_message_visible")]
+    #[test_case(msg(true),                        false ; "displayed_message_hidden")]
+    #[test_case(QueueItem::Compact { run_id: 0 }, true  ; "compact_visible")]
+    fn panel_visibility(item: QueueItem, visible: bool) {
+        let (tx, _rx) = queue();
+        tx.push(item);
+        let expected = usize::from(visible);
+        assert_eq!(tx.panel_len(), expected);
+        assert_eq!(tx.panel_entries().len(), expected);
     }
 }

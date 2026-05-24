@@ -150,6 +150,13 @@ fn typing_and_submit() {
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
     assert!(matches!(&actions[0], Action::SendMessage(s) if s.message == "hi"));
     assert_eq!(app.status, Status::Streaming);
+    // Regression check: the bubble has to be on screen the same frame we
+    // submit, otherwise it briefly sits one row too high before snapping down.
+    assert_eq!(
+        app.main_chat().last_message_role(),
+        Some(&DisplayRole::User),
+    );
+    assert_eq!(app.main_chat().last_message_text(), "hi");
 }
 
 fn with_text(app: &mut App) {
@@ -300,6 +307,35 @@ fn submit_during_streaming_queues_message() {
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
     assert!(actions.is_empty());
     assert_eq!(app.queue.len(), 1);
+}
+
+#[test]
+fn queue_item_consumed_pushes_deferred_user_message() {
+    let mut app = test_app();
+    type_and_submit(&mut app, "first");
+    assert_eq!(app.main_chat().message_count(), 1);
+
+    app.queue_and_notify(queued_msg("queued"));
+    assert_eq!(
+        app.main_chat().message_count(),
+        1,
+        "queueing while streaming must not render the bubble yet",
+    );
+
+    app.update(agent_msg_with_run_id(
+        AgentEvent::QueueItemConsumed {
+            text: "queued".into(),
+            image_count: 0,
+        },
+        app.run_id,
+    ));
+
+    assert_eq!(app.main_chat().message_count(), 2);
+    assert_eq!(app.main_chat().last_message_text(), "queued");
+    assert_eq!(
+        app.main_chat().last_message_role(),
+        Some(&DisplayRole::User),
+    );
 }
 
 #[test_case(error_app as fn(&mut App) ; "error")]
@@ -799,7 +835,7 @@ fn compact_during_streaming_queues_item() {
     let actions = app.execute_command(cmd("/compact"));
     assert!(actions.is_empty());
     assert_eq!(app.queue.len(), 1);
-    assert_eq!(app.queue.entries()[0].text, "/compact");
+    assert_eq!(app.queue.panel_entries()[0].text, "/compact");
 }
 
 #[test]
@@ -1206,7 +1242,7 @@ fn queue_enter_removes_selected() {
 
     app.update(Msg::Key(key(KeyCode::Enter)));
     assert_eq!(app.queue.len(), 1);
-    assert_eq!(app.queue.entries()[0].text, "second");
+    assert_eq!(app.queue.panel_entries()[0].text, "second");
     assert_eq!(app.queue.focus(), Some(0));
 }
 
@@ -1236,7 +1272,7 @@ fn ctrl_q_pops_front() {
     app.queue_and_notify(queued_msg("second"));
     app.update(Msg::Key(kb::POP_QUEUE.to_key_event()));
     assert_eq!(app.queue.len(), 1);
-    assert_eq!(app.queue.entries()[0].text, "second");
+    assert_eq!(app.queue.panel_entries()[0].text, "second");
     assert!(app.queue.focus().is_none(), "unfocused stays unfocused");
 
     app.queue_and_notify(queued_msg("third"));
@@ -1269,14 +1305,6 @@ fn stale_events_ignored_after_run_id_increment() {
     let actions = type_and_submit(&mut app, "new prompt");
     assert!(matches!(&actions[0], Action::SendMessage(i) if i.message == "new prompt"));
     let active_run = app.run_id;
-
-    app.update(agent_msg_with_run_id(
-        AgentEvent::QueueItemConsumed {
-            text: "new prompt".into(),
-            image_count: 0,
-        },
-        active_run,
-    ));
 
     app.update(agent_msg_with_run_id(
         AgentEvent::TextDelta {

@@ -12,7 +12,7 @@ pub(crate) mod session_state;
 pub(crate) mod shell;
 #[cfg(test)]
 mod tests;
-mod view;
+pub(crate) mod view;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -781,9 +781,7 @@ impl App {
             let id = self.shell.next_id();
             let sigil = if prefix.visible { "!" } else { "!!" };
             let display = format!("{sigil} {}", prefix.command);
-            self.main_chat().flush();
-            self.main_chat().push_user_message(display);
-            self.main_chat().enable_auto_scroll();
+            self.main_chat().show_user_message(display);
             return vec![Action::ShellCommand {
                 id,
                 command: prefix.command,
@@ -1131,7 +1129,7 @@ impl App {
             format!("{name} {args}")
         };
         let mut input = self.build_agent_input(&QueuedMessage {
-            text: display_text,
+            text: display_text.clone(),
             images: Vec::new(),
         });
         input.prompt = Some(Box::new(prompt_ref));
@@ -1142,6 +1140,7 @@ impl App {
         } else {
             self.run_id += 1;
             self.status = Status::Streaming;
+            self.main_chat().show_user_message(display_text);
             vec![Action::SendMessage(Box::new(input))]
         }
     }

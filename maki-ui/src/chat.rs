@@ -280,6 +280,15 @@ impl Chat {
             .push(DisplayMessage::new(DisplayRole::User, text.into()));
     }
 
+    /// Flush any in-flight stream, push the bubble, then re-pin auto-scroll.
+    /// Doing all three together keeps the bubble from briefly landing in the
+    /// wrong row, which is what caused the one-frame hop after submit.
+    pub fn show_user_message(&mut self, text: impl Into<String>) {
+        self.flush();
+        self.push_user_message(text);
+        self.enable_auto_scroll();
+    }
+
     pub fn shell_tool_start(&mut self, event: ToolStartEvent) {
         self.messages_panel.tool_start(event);
     }
