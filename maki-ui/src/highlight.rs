@@ -2,7 +2,7 @@ use crate::theme;
 
 use maki_highlight::StyledSegment;
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
+use ratatui::text::Span;
 
 pub use maki_highlight::TAB_SPACES;
 
@@ -28,55 +28,6 @@ pub fn highlight_line(hl: &mut maki_highlight::Highlighter, text: &str) -> Vec<S
             Span::styled(seg.text, style)
         })
         .collect()
-}
-
-pub fn highlight_code_plain(lang: &str, code: &str) -> Vec<Line<'static>> {
-    maki_highlight::highlight_code(lang, code)
-        .into_iter()
-        .map(|segs| segments_to_line(&segs))
-        .collect()
-}
-
-pub struct CodeHighlighter {
-    inner: maki_highlight::CodeHighlighter,
-    lines: Vec<Line<'static>>,
-    completed: usize,
-}
-
-impl CodeHighlighter {
-    pub fn new(lang: &str) -> Self {
-        Self {
-            inner: maki_highlight::CodeHighlighter::new(lang),
-            lines: Vec::new(),
-            completed: 0,
-        }
-    }
-
-    pub fn update(&mut self, code: &str) -> &[Line<'static>] {
-        let segments = self.inner.update(code);
-        let n = segments.len();
-        self.lines.truncate(n);
-        let stable = n.saturating_sub(1).min(self.completed);
-        for (i, segs) in segments[stable..].iter().enumerate() {
-            let idx = stable + i;
-            let line = segments_to_line(segs);
-            if idx < self.lines.len() {
-                self.lines[idx] = line;
-            } else {
-                self.lines.push(line);
-            }
-        }
-        self.completed = n.saturating_sub(1);
-        &self.lines
-    }
-}
-
-fn segments_to_line(segs: &[StyledSegment]) -> Line<'static> {
-    Line::from(
-        segs.iter()
-            .map(|s| Span::styled(s.text.clone(), convert_segment(s)))
-            .collect::<Vec<_>>(),
-    )
 }
 
 pub fn highlight_regex_inline(pattern: &str) -> Vec<Span<'static>> {

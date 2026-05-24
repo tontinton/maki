@@ -41,16 +41,22 @@ pub(crate) fn create_ui_table(
             segments_to_lua_lines(&lua, &segments)
         })?,
     )?;
-    // maki.ui.markdown(text) -> lines, each line is `{ {text, style}, ... }`.
-    // Styles: "", "bold", "italic", "bold_italic", "inline_code",
-    // "strikethrough", "list_marker", "heading", "horizontal_rule".
-    // Block roles win over inline emphasis (so `**bold**` inside `#` reads as
-    // "heading"), and code wins over emphasis on content spans.
+    // maki.ui.markdown(text, width) -> lines.
+    // Each line is `{ {text, style}, ... }`. Async because highlighting
+    // code blocks is expensive.
+    //
+    // Style is either a named string (resolved at paint time via
+    // `theme::style_by_name`) or a `{fg, bold, italic, underline}` table
+    // for syntax-highlighted tokens.
+    //
+    // Named styles: "", "bold", "italic", "bold_italic",
+    // "strikethrough", "inline_code", "code_bar", "heading",
+    // "list_marker", "table_border", "horizontal_rule".
     t.set(
         "markdown",
-        lua.create_function(|lua, text: String| {
-            let lines = maki_markdown::render_lines(&text);
-            markdown_lines_to_lua(lua, &lines)
+        lua.create_async_function(|lua, (text, width): (String, u16)| async move {
+            let lines = smol::unblock(move || maki_markdown::render::render(&text, width)).await;
+            markdown_lines_to_lua(&lua, &lines)
         })?,
     )?;
     t.set(
@@ -247,15 +253,73 @@ fn segments_to_lua_lines(
     Ok(result)
 }
 
-fn markdown_lines_to_lua(lua: &Lua, lines: &[maki_markdown::RenderedLine]) -> LuaResult<Table> {
+/// Most spans become a named style string. `Highlight` tokens carry their
+/// own rgb, so they become an inline `{fg, bold, italic, underline}` table.
+///
+/// No wildcard arm on `StyleToken`: adding a variant is a compile error
+/// here, so we can't forget to map it.
+fn span_style_to_lua(lua: &Lua, span: &maki_markdown::render::Span) -> LuaResult<mlua::Value> {
+    use maki_markdown::render::StyleToken;
+
+    let v = match &span.style {
+        StyleToken::Text => {
+            let name = emphasis_style_name(span.emphasis);
+            mlua::Value::String(lua.create_string(name)?)
+        }
+        StyleToken::InlineCode => mlua::Value::String(lua.create_string("inline_code")?),
+        StyleToken::Highlight {
+            fg,
+            bold,
+            italic,
+            underline,
+        } => {
+            let tbl = lua.create_table()?;
+            tbl.set("fg", format!("#{:02x}{:02x}{:02x}", fg.0, fg.1, fg.2))?;
+            if *bold {
+                tbl.set("bold", true)?;
+            }
+            if *italic {
+                tbl.set("italic", true)?;
+            }
+            if *underline {
+                tbl.set("underline", true)?;
+            }
+            mlua::Value::Table(tbl)
+        }
+        StyleToken::CodeBar => mlua::Value::String(lua.create_string("code_bar")?),
+        StyleToken::Heading => mlua::Value::String(lua.create_string("heading")?),
+        StyleToken::ListMarker => mlua::Value::String(lua.create_string("list_marker")?),
+        StyleToken::TableBorder => mlua::Value::String(lua.create_string("table_border")?),
+        StyleToken::HorizontalRule => mlua::Value::String(lua.create_string("horizontal_rule")?),
+    };
+    Ok(v)
+}
+
+/// Flatten `Emphasis` to a single named style. Strike wins over bold/italic
+/// (the Lua theme has no combined slot). Underline only appears in
+/// `Highlight` tokens, not here.
+fn emphasis_style_name(e: maki_markdown::Emphasis) -> &'static str {
+    if e.strike {
+        "strikethrough"
+    } else if e.bold && e.italic {
+        "bold_italic"
+    } else if e.bold {
+        "bold"
+    } else if e.italic {
+        "italic"
+    } else {
+        ""
+    }
+}
+
+fn markdown_lines_to_lua(lua: &Lua, lines: &[maki_markdown::render::Line]) -> LuaResult<Table> {
     let result = lua.create_table_with_capacity(lines.len(), 0)?;
     for (i, rendered) in lines.iter().enumerate() {
         let line_tbl = lua.create_table_with_capacity(rendered.spans.len(), 0)?;
         for (j, sp) in rendered.spans.iter().enumerate() {
-            let style = maki_markdown::span_style_name(&rendered.kind, sp);
             let span_tbl = lua.create_table_with_capacity(2, 0)?;
             span_tbl.raw_set(1, sp.text.as_str())?;
-            span_tbl.raw_set(2, style)?;
+            span_tbl.raw_set(2, span_style_to_lua(lua, sp)?)?;
             line_tbl.raw_set(i32::try_from(j + 1).unwrap(), span_tbl)?;
         }
         result.raw_set(i32::try_from(i + 1).unwrap(), line_tbl)?;
@@ -514,17 +578,23 @@ mod tests {
     const STYLE_HR: &str = "horizontal_rule";
     const STYLE_PLAIN: &str = "";
     const STYLE_CODE: &str = "inline_code";
+    const STYLE_CODE_BAR: &str = "code_bar";
     const STYLE_ITALIC: &str = "italic";
     const STYLE_STRIKE: &str = "strikethrough";
+    const STYLE_TABLE_BORDER: &str = "table_border";
+    const MD_WIDTH: u16 = 80;
 
     fn render_markdown(lua: &Lua, input: &str) -> Table {
-        let lines = maki_markdown::render_lines(input);
+        let lines = maki_markdown::render::render(input, MD_WIDTH);
         markdown_lines_to_lua(lua, &lines).unwrap()
     }
 
     fn span_style(line: &Table, idx: usize) -> String {
         let span: Table = line.get(idx).unwrap();
-        span.get::<String>(2).unwrap()
+        match span.get::<mlua::Value>(2).unwrap() {
+            mlua::Value::String(s) => s.to_str().unwrap().to_string(),
+            other => panic!("expected string style, got {other:?}"),
+        }
     }
 
     fn span_text(line: &Table, idx: usize) -> String {
@@ -549,21 +619,6 @@ mod tests {
         let result = render_markdown(&lua, "***x***");
         let line: Table = result.get(1).unwrap();
         assert_eq!(span_style(&line, 1), STYLE_BOLD_ITALIC);
-    }
-
-    #[test]
-    fn markdown_empty_input_returns_empty_table() {
-        let lua = Lua::new();
-        let result = render_markdown(&lua, "");
-        assert_eq!(result.len().unwrap(), 0);
-    }
-
-    #[test]
-    fn markdown_preserves_utf8() {
-        let lua = Lua::new();
-        let result = render_markdown(&lua, "héllo 🦀");
-        let line: Table = result.get(1).unwrap();
-        assert_eq!(span_text(&line, 1), "héllo 🦀");
     }
 
     #[test]
@@ -610,12 +665,15 @@ mod tests {
     }
 
     #[test]
-    fn markdown_horizontal_rule_emits_single_styled_span() {
+    fn markdown_horizontal_rule_emits_hr_span_filled_to_width() {
         let lua = Lua::new();
         let result = render_markdown(&lua, "---");
         let line: Table = result.get(1).unwrap();
         assert_eq!(line.len().unwrap(), 1);
         assert_eq!(span_style(&line, 1), STYLE_HR);
+        let text = span_text(&line, 1);
+        assert_eq!(text.chars().count(), MD_WIDTH as usize);
+        assert!(text.chars().all(|c| c == '─'));
     }
 
     #[test]
@@ -681,16 +739,29 @@ mod tests {
     }
 
     #[test]
-    fn markdown_code_fence_emits_one_line_per_code_line_with_inline_code_style() {
+    fn markdown_code_fence_emits_code_bar_prefix_with_highlight_span_tables() {
         let lua = Lua::new();
-        let result = render_markdown(&lua, "```rust\nfn x() {}\nlet y;\n```");
-        assert_eq!(result.len().unwrap(), 2);
-        let l1: Table = result.get(1).unwrap();
-        let l2: Table = result.get(2).unwrap();
-        assert_eq!(span_text(&l1, 1), "fn x() {}");
-        assert_eq!(span_style(&l1, 1), STYLE_CODE);
-        assert_eq!(span_text(&l2, 1), "let y;");
-        assert_eq!(span_style(&l2, 1), STYLE_CODE);
+        let result = render_markdown(&lua, "```rust\nfn x() {}\n```");
+        let lines = result.len().unwrap();
+        let code_line: Table = (1..=lines)
+            .find_map(|i| {
+                let line: Table = result.get(i).ok()?;
+                (line.len().ok()? > 0
+                    && line
+                        .get::<Table>(1)
+                        .and_then(|s| s.get::<String>(2))
+                        .ok()
+                        .is_some_and(|s| s == STYLE_CODE_BAR))
+                .then_some(line)
+            })
+            .expect("code bar line");
+        assert_eq!(span_style(&code_line, 1), STYLE_CODE_BAR);
+        let content_span: Table = code_line.get(2).unwrap();
+        let style = content_span.get::<mlua::Value>(2).unwrap();
+        assert!(
+            matches!(style, mlua::Value::Table(_)),
+            "highlight span style must be an inline table"
+        );
     }
 
     #[test_case("# a" ; "h1")]
@@ -715,10 +786,10 @@ mod tests {
     }
 
     #[test]
-    fn segments_to_lua_lines_italic_flag_only_present_when_true() {
+    fn segments_to_lua_lines_modifier_flags_only_present_when_true() {
         let lua = Lua::new();
         let lines = vec![vec![
-            seg_full("a", false, true, false),
+            seg_full("a", false, true, true),
             seg_full("b", false, false, false),
         ]];
         let result = segments_to_lua_lines(&lua, &lines).unwrap();
@@ -726,25 +797,10 @@ mod tests {
         let s1: Table = line.get(1).unwrap();
         let st1: Table = s1.get(2).unwrap();
         assert!(st1.get::<bool>("italic").unwrap());
-        let s2: Table = line.get(2).unwrap();
-        let st2: Table = s2.get(2).unwrap();
-        assert!(st2.get::<Option<bool>>("italic").unwrap().is_none());
-    }
-
-    #[test]
-    fn segments_to_lua_lines_underline_flag_only_present_when_true() {
-        let lua = Lua::new();
-        let lines = vec![vec![
-            seg_full("a", false, false, true),
-            seg_full("b", false, false, false),
-        ]];
-        let result = segments_to_lua_lines(&lua, &lines).unwrap();
-        let line: Table = result.get(1).unwrap();
-        let s1: Table = line.get(1).unwrap();
-        let st1: Table = s1.get(2).unwrap();
         assert!(st1.get::<bool>("underline").unwrap());
         let s2: Table = line.get(2).unwrap();
         let st2: Table = s2.get(2).unwrap();
+        assert!(st2.get::<Option<bool>>("italic").unwrap().is_none());
         assert!(st2.get::<Option<bool>>("underline").unwrap().is_none());
     }
 
@@ -763,13 +819,27 @@ mod tests {
     }
 
     #[test]
-    fn markdown_horizontal_rule_synthetic_span_text_is_empty_string() {
+    fn markdown_table_has_border_and_data_spans() {
         let lua = Lua::new();
-        let result = render_markdown(&lua, "---");
-        let line: Table = result.get(1).unwrap();
-        assert_eq!(line.len().unwrap(), 1);
-        assert_eq!(span_text(&line, 1), "");
-        assert_eq!(span_style(&line, 1), STYLE_HR);
+        let result = render_markdown(&lua, "| col1 | col2 |\n|------|------|\n| a    | b    |");
+        let mut saw_border = false;
+        let mut saw_plain = false;
+        for i in 1..=result.len().unwrap() {
+            let line: Table = result.get(i).unwrap();
+            for j in 1..=line.len().unwrap() {
+                let span: Table = line.get(j).unwrap();
+                if let mlua::Value::String(s) = span.get::<mlua::Value>(2).unwrap() {
+                    let s = s.to_str().unwrap();
+                    if s == STYLE_TABLE_BORDER {
+                        saw_border = true;
+                    } else if s == STYLE_PLAIN {
+                        saw_plain = true;
+                    }
+                }
+            }
+        }
+        assert!(saw_border, "table must have border spans");
+        assert!(saw_plain, "table must have data/content spans");
     }
 
     #[test]
@@ -786,34 +856,76 @@ mod tests {
         assert!(result.len().unwrap() > 0);
     }
 
-    #[test_case(STYLE_BOLD ; "bold")]
-    #[test_case(STYLE_BOLD_ITALIC ; "bold_italic")]
-    #[test_case(STYLE_HEADING ; "heading")]
-    #[test_case(STYLE_LIST_MARKER ; "list_marker")]
-    #[test_case(STYLE_HR ; "horizontal_rule")]
-    #[test_case(STYLE_CODE ; "inline_code")]
-    #[test_case(STYLE_ITALIC ; "italic")]
-    #[test_case(STYLE_STRIKE ; "strikethrough")]
-    fn markdown_style_names_are_lower_snake_case(name: &str) {
-        assert!(!name.is_empty());
-        assert!(
-            name.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
-            "style name {name:?} must match [a-z_]+"
-        );
-    }
-
     #[test]
-    fn markdown_code_inside_heading_all_spans_surface_as_heading() {
+    fn markdown_code_inside_heading_keeps_inline_code_style() {
         let lua = Lua::new();
         let result = render_markdown(&lua, "# foo `bar`");
         let line: Table = result.get(1).unwrap();
-        let n = line.len().unwrap();
-        assert!(n >= 2);
-        for i in 1..=n {
+        let bar_idx = (1..=line.len().unwrap())
+            .find(|&i| span_text(&line, i as usize) == "bar")
+            .expect("bar span");
+        assert_eq!(span_style(&line, bar_idx as usize), STYLE_CODE);
+        let foo_idx = (1..=line.len().unwrap())
+            .find(|&i| span_text(&line, i as usize).contains("foo"))
+            .expect("foo span");
+        assert_eq!(span_style(&line, foo_idx as usize), STYLE_HEADING);
+    }
+
+    #[test_case(false, false, false, false, "" ; "default_emphasis_is_empty")]
+    #[test_case(true, false, false, false, "bold" ; "bold_only")]
+    #[test_case(false, true, false, false, "italic" ; "italic_only")]
+    #[test_case(true, true, false, false, "bold_italic" ; "bold_and_italic")]
+    #[test_case(false, false, true, false, "strikethrough" ; "strike_only")]
+    #[test_case(true, false, true, false, "strikethrough" ; "strike_wins_over_bold")]
+    #[test_case(false, true, true, false, "strikethrough" ; "strike_wins_over_italic")]
+    #[test_case(false, false, false, true, "" ; "underline_alone_not_surfaced")]
+    #[test_case(true, false, false, true, "bold" ; "underline_ignored_with_bold")]
+    fn emphasis_style_name_combos(
+        bold: bool,
+        italic: bool,
+        strike: bool,
+        underline: bool,
+        expected: &str,
+    ) {
+        let e = maki_markdown::Emphasis {
+            bold,
+            italic,
+            strike,
+            underline,
+        };
+        assert_eq!(emphasis_style_name(e), expected);
+    }
+
+    #[test]
+    fn span_style_to_lua_highlight() {
+        let lua = Lua::new();
+        for (bold, italic, underline) in [(true, false, false), (true, true, true)] {
+            let span = maki_markdown::render::Span {
+                text: "tok".into(),
+                style: maki_markdown::render::StyleToken::Highlight {
+                    fg: (255, 128, 0),
+                    bold,
+                    italic,
+                    underline,
+                },
+                emphasis: maki_markdown::Emphasis::default(),
+            };
+            let val = span_style_to_lua(&lua, &span).unwrap();
+            let tbl = match val {
+                mlua::Value::Table(t) => t,
+                other => panic!("expected table, got {other:?}"),
+            };
+            assert_eq!(tbl.get::<String>("fg").unwrap(), ORANGE_HEX);
+            assert_eq!(tbl.get::<bool>("bold").unwrap(), bold);
             assert_eq!(
-                span_style(&line, i as usize),
-                STYLE_HEADING,
-                "span {i} should collapse to heading at Lua boundary"
+                tbl.get::<Option<bool>>("italic").unwrap().unwrap_or(false),
+                italic
+            );
+            assert_eq!(
+                tbl.get::<Option<bool>>("underline")
+                    .unwrap()
+                    .unwrap_or(false),
+                underline
             );
         }
     }

@@ -287,6 +287,8 @@ pub fn style_by_name(name: &str) -> Style {
         "heading" => t.heading,
         "list_marker" => t.list_marker,
         "horizontal_rule" => t.horizontal_rule,
+        "code_bar" => t.code_bar,
+        "table_border" => t.table_border,
         "keyword" | "index_keyword" => t.index_keyword,
         "section" | "index_section" => t.index_section,
         "line_nr" | "index_line_nr" => t.index_line_nr,

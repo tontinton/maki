@@ -1,6 +1,6 @@
 [package]
 name = "maki-markdown"
-description = "Theme-free markdown parser shared by maki-ui's renderer and the maki-lua bridge."
+description = "Theme-free markdown parser and width-aware renderer shared by maki-ui and the maki-lua bridge."
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -9,6 +9,8 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+maki-highlight = { workspace = true }
+unicode-width = { workspace = true }
 
 [dev-dependencies]
 test-case = { workspace = true }

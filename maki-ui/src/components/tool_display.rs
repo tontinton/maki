@@ -584,14 +584,7 @@ impl ToolLineBuilder {
     fn push_markdown_body(&mut self, text: &str) {
         let style = theme::current().assistant;
         let indent = TOOL_BODY_INDENT.len() as u16;
-        let md_lines = text_to_lines(
-            text,
-            "",
-            style,
-            style,
-            None,
-            self.width.saturating_sub(indent),
-        );
+        let md_lines = text_to_lines(text, "", style, style, self.width.saturating_sub(indent));
         for mut line in md_lines {
             line.spans.insert(0, Span::raw(TOOL_BODY_INDENT));
             self.lines.push(line);

@@ -2381,7 +2381,9 @@ name = "maki-markdown"
 version = "0.3.7"
 dependencies = [
  "fastrand",
+ "maki-highlight",
  "test-case",
+ "unicode-width",
 ]
 
 [[package]]

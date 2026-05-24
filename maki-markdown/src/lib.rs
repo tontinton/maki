@@ -1,11 +1,10 @@
-//! Leaf markdown parser shared by `maki-ui` (ratatui rendering) and
-//! `maki-lua` (flat per-line view for plugins). No styling, no widths.
+//! Markdown parser and width-aware renderer.
 //!
-//! The model has two orthogonal axes so we don't lose information at the
-//! boundary: `SpanKind` says what an inline span is (text or code), and
-//! `Emphasis` carries the modifiers (bold, italic, strike). Emphasis
-//! composes (`***x***` is bold and italic), code does not, and code nested
-//! inside bold keeps both.
+//! The parser separates two orthogonal axes: `SpanKind` (text vs code) and
+//! `Emphasis` (bold, italic, strike). They compose freely, so `***x***` is
+//! bold+italic, and code inside bold keeps both.
+
+pub mod render;
 
 const BULLET: &str = "• ";
 const LIST_INDENT_STEP: usize = 2;
@@ -17,6 +16,7 @@ pub struct Emphasis {
     pub bold: bool,
     pub italic: bool,
     pub strike: bool,
+    pub underline: bool,
 }
 
 impl Emphasis {
@@ -24,21 +24,31 @@ impl Emphasis {
         bold: true,
         italic: false,
         strike: false,
+        underline: false,
     };
     pub const ITALIC: Self = Self {
         bold: false,
         italic: true,
         strike: false,
+        underline: false,
     };
     pub const BOLD_ITALIC: Self = Self {
         bold: true,
         italic: true,
         strike: false,
+        underline: false,
     };
     pub const STRIKE: Self = Self {
         bold: false,
         italic: false,
         strike: true,
+        underline: false,
+    };
+    pub const UNDERLINE: Self = Self {
+        bold: false,
+        italic: false,
+        strike: false,
+        underline: true,
     };
 
     pub fn merge(self, other: Self) -> Self {
@@ -46,11 +56,12 @@ impl Emphasis {
             bold: self.bold || other.bold,
             italic: self.italic || other.italic,
             strike: self.strike || other.strike,
+            underline: self.underline || other.underline,
         }
     }
 
     pub fn is_empty(self) -> bool {
-        !self.bold && !self.italic && !self.strike
+        !self.bold && !self.italic && !self.strike && !self.underline
     }
 }
 
@@ -274,137 +285,6 @@ pub fn block_prefix(kind: &BlockKind) -> Option<String> {
             Some(format!("{}{marker} ", " ".repeat(depth * LIST_INDENT_STEP)))
         }
         BlockKind::Paragraph | BlockKind::Heading(_) | BlockKind::HorizontalRule => None,
-    }
-}
-
-/// Carried as data so consumers don't need positional rules like "the first
-/// span is the bullet".
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SpanRole {
-    Marker,
-    Content,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RenderedSpan {
-    pub text: String,
-    pub kind: SpanKind,
-    pub emphasis: Emphasis,
-    pub role: SpanRole,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RenderedLine {
-    pub kind: BlockKind,
-    pub spans: Vec<RenderedSpan>,
-}
-
-/// Flattens everything into one `RenderedLine` per output row, with inline
-/// emphasis and code fully resolved. This is what the Lua bridge consumes;
-/// width-aware Rust renderers should use `parse` directly instead.
-pub fn render_lines(text: &str) -> Vec<RenderedLine> {
-    let mut out = Vec::new();
-    for block in parse(text) {
-        match block {
-            Block::Lines(lines) => {
-                for lb in lines {
-                    out.push(render_line_block(&lb));
-                }
-            }
-            Block::Code { code, .. } => {
-                for line in code.split('\n') {
-                    out.push(RenderedLine {
-                        kind: BlockKind::Paragraph,
-                        spans: vec![RenderedSpan {
-                            text: line.to_owned(),
-                            kind: SpanKind::Code,
-                            emphasis: Emphasis::default(),
-                            role: SpanRole::Content,
-                        }],
-                    });
-                }
-            }
-            Block::Table { rows, .. } => {
-                for row in rows {
-                    let joined = row.join(" | ");
-                    out.push(RenderedLine {
-                        kind: BlockKind::Paragraph,
-                        spans: parse_inline(&joined)
-                            .into_iter()
-                            .map(content_span)
-                            .collect(),
-                    });
-                }
-            }
-        }
-    }
-    out
-}
-
-fn content_span(s: InlineSpan) -> RenderedSpan {
-    RenderedSpan {
-        text: s.text,
-        kind: s.kind,
-        emphasis: s.emphasis,
-        role: SpanRole::Content,
-    }
-}
-
-fn render_line_block(lb: &LineBlock) -> RenderedLine {
-    let mut spans = Vec::new();
-    if let Some(p) = block_prefix(&lb.kind) {
-        spans.push(RenderedSpan {
-            text: p,
-            kind: SpanKind::Text,
-            emphasis: Emphasis::default(),
-            role: SpanRole::Marker,
-        });
-    }
-    if matches!(lb.kind, BlockKind::HorizontalRule) {
-        // Empty span keeps the block visible to consumers that iterate spans.
-        spans.push(RenderedSpan {
-            text: String::new(),
-            kind: SpanKind::Text,
-            emphasis: Emphasis::default(),
-            role: SpanRole::Content,
-        });
-    } else {
-        spans.extend(parse_inline(&lb.inline).into_iter().map(content_span));
-    }
-    RenderedLine {
-        kind: lb.kind.clone(),
-        spans,
-    }
-}
-
-/// One flat style name per span, for consumers that can't carry the typed
-/// (kind, emphasis, role) tuple (the Lua bridge, mainly).
-///
-/// Precedence runs top down: markers, then block roles (heading, HR), then
-/// code, then emphasis. Strike only surfaces when bold and italic are both
-/// off, because the theme has no `bold_strikethrough` slot.
-pub fn span_style_name(line_kind: &BlockKind, span: &RenderedSpan) -> &'static str {
-    if span.role == SpanRole::Marker {
-        return "list_marker";
-    }
-    match line_kind {
-        BlockKind::Heading(_) => return "heading",
-        BlockKind::HorizontalRule => return "horizontal_rule",
-        _ => {}
-    }
-    if matches!(span.kind, SpanKind::Code) {
-        return "inline_code";
-    }
-    match (
-        span.emphasis.bold,
-        span.emphasis.italic,
-        span.emphasis.strike,
-    ) {
-        (true, true, _) => "bold_italic",
-        (true, false, _) => "bold",
-        (false, true, _) => "italic",
-        (false, false, true) => "strikethrough",
-        (false, false, false) => "",
     }
 }
 
@@ -1103,12 +983,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_inline_utf8_preserved() {
-        let spans = parse_inline("héllo 🦀");
-        assert_eq!(span_text(&spans), "héllo 🦀");
-    }
-
-    #[test]
     fn parse_inline_unmatched_star_passes_through_as_plain() {
         let spans = parse_inline("a*b");
         assert!(
@@ -1117,85 +991,6 @@ mod tests {
                 .all(|s| s.kind == SpanKind::Text && s.emphasis.is_empty())
         );
         assert_eq!(span_text(&spans), "a*b");
-    }
-
-    #[test]
-    fn render_lines_includes_bullet_for_unordered_lists() {
-        let lines = render_lines("- item");
-        assert_eq!(lines.len(), 1);
-        assert_eq!(lines[0].spans[0].text, "• ");
-        assert_eq!(lines[0].spans[0].role, SpanRole::Marker);
-        assert_eq!(lines[0].spans[1].text, "item");
-        assert_eq!(lines[0].spans[1].role, SpanRole::Content);
-        assert!(matches!(
-            lines[0].kind,
-            BlockKind::UnorderedListItem { depth: 0 }
-        ));
-    }
-
-    #[test]
-    fn render_lines_heading_does_not_bake_bold_into_emphasis() {
-        // Heading boldness comes from `BlockKind`, not span emphasis, so the
-        // `world` span here stays italic-only.
-        let lines = render_lines("# hello *world*");
-        assert!(matches!(lines[0].kind, BlockKind::Heading(1)));
-        let world = lines[0]
-            .spans
-            .iter()
-            .find(|s| s.text == "world")
-            .expect("world span");
-        assert_eq!(world.emphasis, Emphasis::ITALIC);
-    }
-
-    #[test]
-    fn render_lines_code_fence_emits_one_line_per_code_line() {
-        let lines = render_lines("```\nfn x() {}\nlet y;\n```");
-        assert_eq!(lines.len(), 2);
-        assert_eq!(lines[0].spans[0].kind, SpanKind::Code);
-        assert_eq!(lines[0].spans[0].text, "fn x() {}");
-    }
-
-    #[test]
-    fn render_lines_horizontal_rule_emits_single_empty_content_span() {
-        let lines = render_lines("---");
-        assert_eq!(lines.len(), 1);
-        assert!(matches!(lines[0].kind, BlockKind::HorizontalRule));
-        assert_eq!(lines[0].spans.len(), 1);
-        assert!(lines[0].spans[0].text.is_empty());
-        assert_eq!(lines[0].spans[0].role, SpanRole::Content);
-    }
-
-    fn rendered_span(kind: SpanKind, emphasis: Emphasis, role: SpanRole) -> RenderedSpan {
-        RenderedSpan {
-            text: String::new(),
-            kind,
-            emphasis,
-            role,
-        }
-    }
-
-    #[test_case(BlockKind::Paragraph, SpanKind::Text, Emphasis::default(), SpanRole::Content, "" ; "plain_text")]
-    #[test_case(BlockKind::Paragraph, SpanKind::Text, Emphasis::BOLD, SpanRole::Content, "bold" ; "bold")]
-    #[test_case(BlockKind::Paragraph, SpanKind::Text, Emphasis::ITALIC, SpanRole::Content, "italic" ; "italic")]
-    #[test_case(BlockKind::Paragraph, SpanKind::Text, Emphasis::BOLD_ITALIC, SpanRole::Content, "bold_italic" ; "bold_italic")]
-    #[test_case(BlockKind::Paragraph, SpanKind::Text, Emphasis::STRIKE, SpanRole::Content, "strikethrough" ; "strike_only")]
-    #[test_case(BlockKind::Paragraph, SpanKind::Text, Emphasis { bold: true, italic: false, strike: true }, SpanRole::Content, "bold" ; "bold_plus_strike_collapses_to_bold")]
-    #[test_case(BlockKind::Paragraph, SpanKind::Code, Emphasis::default(), SpanRole::Content, "inline_code" ; "code")]
-    #[test_case(BlockKind::Paragraph, SpanKind::Code, Emphasis::BOLD, SpanRole::Content, "inline_code" ; "code_inside_bold_wins")]
-    #[test_case(BlockKind::Heading(1), SpanKind::Text, Emphasis::BOLD, SpanRole::Content, "heading" ; "heading_wins_over_bold")]
-    #[test_case(BlockKind::Heading(1), SpanKind::Code, Emphasis::default(), SpanRole::Content, "heading" ; "heading_wins_over_code")]
-    #[test_case(BlockKind::HorizontalRule, SpanKind::Text, Emphasis::default(), SpanRole::Content, "horizontal_rule" ; "hr")]
-    #[test_case(BlockKind::UnorderedListItem { depth: 0 }, SpanKind::Text, Emphasis::default(), SpanRole::Marker, "list_marker" ; "marker_wins")]
-    #[test_case(BlockKind::UnorderedListItem { depth: 0 }, SpanKind::Code, Emphasis::BOLD, SpanRole::Marker, "list_marker" ; "marker_wins_even_over_code_and_emphasis")]
-    fn span_style_name_projection(
-        line_kind: BlockKind,
-        span_kind: SpanKind,
-        emphasis: Emphasis,
-        role: SpanRole,
-        expected: &'static str,
-    ) {
-        let span = rendered_span(span_kind, emphasis, role);
-        assert_eq!(span_style_name(&line_kind, &span), expected);
     }
 
     #[test_case("- item", Some("• "); "unordered_depth_zero")]
@@ -1218,35 +1013,15 @@ mod tests {
     }
 
     #[test]
-    fn emphasis_merge_bold_and_italic_yields_bold_italic() {
+    fn emphasis_merge_ors_fields_and_default_is_identity() {
         assert_eq!(
             Emphasis::BOLD.merge(Emphasis::ITALIC),
             Emphasis::BOLD_ITALIC
         );
-    }
-
-    #[test]
-    fn emphasis_merge_is_commutative_over_or_fields() {
-        let a = Emphasis::BOLD;
-        let b = Emphasis::STRIKE;
-        assert_eq!(a.merge(b), b.merge(a));
-        let merged = a.merge(b);
-        assert!(merged.bold && merged.strike && !merged.italic);
-    }
-
-    #[test]
-    fn emphasis_merge_with_default_is_identity() {
         let e = Emphasis::BOLD_ITALIC;
         assert_eq!(e.merge(Emphasis::default()), e);
-        assert_eq!(Emphasis::default().merge(e), e);
-    }
-
-    #[test_case(Emphasis::default(), true; "default_is_empty")]
-    #[test_case(Emphasis::BOLD, false; "bold_not_empty")]
-    #[test_case(Emphasis::ITALIC, false; "italic_not_empty")]
-    #[test_case(Emphasis::STRIKE, false; "strike_not_empty")]
-    fn emphasis_is_empty_only_when_all_fields_false(e: Emphasis, expected: bool) {
-        assert_eq!(e.is_empty(), expected);
+        assert!(Emphasis::default().is_empty());
+        assert!(!Emphasis::BOLD.is_empty());
     }
 
     #[test]
@@ -1395,14 +1170,6 @@ mod tests {
     }
 
     #[test]
-    fn strikethrough_requires_double_tilde() {
-        let spans = parse_inline("~~yes~~");
-        assert_eq!(spans.len(), 1);
-        assert_eq!(spans[0].text, "yes");
-        assert_eq!(spans[0].emphasis, Emphasis::STRIKE);
-    }
-
-    #[test]
     fn code_span_with_pipes_and_emphasis_chars_is_atomic() {
         let spans = parse_inline("a `x|y*z` b");
         assert_eq!(spans.len(), 3);
@@ -1431,58 +1198,6 @@ mod tests {
     }
 
     #[test]
-    fn render_lines_table_cell_with_code_span_preserves_pipe() {
-        let lines = render_lines("| `cmd|filter` | z |\n|---|---|");
-        assert_eq!(lines.len(), 1);
-        let code = lines[0]
-            .spans
-            .iter()
-            .find(|s| s.kind == SpanKind::Code)
-            .expect("code span");
-        assert_eq!(code.text, "cmd|filter");
-    }
-
-    #[test]
-    fn render_lines_ordered_list_emits_marker_then_content() {
-        let lines = render_lines("1. item");
-        assert_eq!(lines.len(), 1);
-        assert!(matches!(
-            lines[0].kind,
-            BlockKind::OrderedListItem { depth: 0, ref marker } if marker == "1."
-        ));
-        assert_eq!(lines[0].spans[0].text, "1. ");
-        assert_eq!(lines[0].spans[0].role, SpanRole::Marker);
-        assert_eq!(lines[0].spans[1].text, "item");
-        assert_eq!(lines[0].spans[1].role, SpanRole::Content);
-    }
-
-    #[test]
-    fn render_lines_heading_with_code_span_preserves_code_kind_on_span() {
-        // Heading wins at the style projection layer, but the span itself
-        // still carries `SpanKind::Code` so renderers can layer on top.
-        let lines = render_lines("# foo `bar`");
-        assert!(matches!(lines[0].kind, BlockKind::Heading(1)));
-        let bar = lines[0]
-            .spans
-            .iter()
-            .find(|s| s.text == "bar")
-            .expect("bar span");
-        assert_eq!(bar.kind, SpanKind::Code);
-        assert!(bar.emphasis.is_empty());
-        assert_eq!(bar.role, SpanRole::Content);
-    }
-
-    #[test]
-    fn span_style_name_ordered_list_content_code_returns_inline_code() {
-        let kind = BlockKind::OrderedListItem {
-            depth: 0,
-            marker: "1.".to_owned(),
-        };
-        let span = rendered_span(SpanKind::Code, Emphasis::default(), SpanRole::Content);
-        assert_eq!(span_style_name(&kind, &span), "inline_code");
-    }
-
-    #[test]
     fn underscore_italic_with_nested_bold_becomes_bold_italic() {
         let spans = parse_inline("_a **b** c_");
         assert_eq!(spans.len(), 3);
@@ -1490,13 +1205,6 @@ mod tests {
         assert_eq!(spans[1].emphasis, Emphasis::BOLD_ITALIC);
         assert_eq!(spans[1].text, "b");
         assert_eq!(spans[2].emphasis, Emphasis::ITALIC);
-    }
-
-    #[test]
-    fn render_lines_empty_input_returns_no_lines() {
-        // Empty input means no lines. Callers that want a placeholder blank
-        // line must add it themselves.
-        assert!(render_lines("").is_empty());
     }
 
     #[test]

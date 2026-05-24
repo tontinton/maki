@@ -1129,7 +1129,6 @@ impl MessagesPanel {
                         prefix,
                         style.text_style,
                         style.prefix_style,
-                        None,
                         self.viewport_width,
                     )
                 } else {

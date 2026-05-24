@@ -133,26 +133,27 @@ local function initial_state(questions)
     cursor = 1,
     answers = {},
     custom_input = TextInput.new(),
-    rendered_questions = {},
+    rendered_questions = { width = nil, by_idx = {} },
   }
 end
 
-local function question_md(state, idx)
-  local cached = state.rendered_questions[idx]
-  if cached then
-    return cached
+local function question_md(state, idx, width)
+  local cache = state.rendered_questions
+  if cache.width ~= width then
+    cache.width = width
+    cache.by_idx = {}
+  end
+  local hit = cache.by_idx[idx]
+  if hit then
+    return hit
   end
   local text = state.questions[idx].question
-  local ok, lines = pcall(maki.ui.markdown, text)
+  local ok, lines = pcall(maki.ui.markdown, text, width)
   if not ok or type(lines) ~= "table" or #lines == 0 then
     lines = { { { text, "" } } }
   end
-  state.rendered_questions[idx] = lines
+  cache.by_idx[idx] = lines
   return lines
-end
-
-local function inline_md(state, idx)
-  return question_md(state, idx)[1] or { { state.questions[idx].question, "" } }
 end
 
 local function is_selected(state, label)
@@ -371,7 +372,7 @@ local function render_selecting(state, width)
     reserved_top = 2
   end
 
-  for _, md_line in ipairs(question_md(state, state.tab)) do
+  for _, md_line in ipairs(question_md(state, state.tab, width - 1)) do
     append_wrapped(lines, md_line, width - 1, " ", "", " ")
   end
   lines[#lines + 1] = {}
@@ -477,7 +478,9 @@ local function render_confirming(state, width)
     local q_prefix_w = display_width(q_prefix)
     local q_pad = string.rep(" ", q_prefix_w)
 
-    append_wrapped(lines, inline_md(state, i), width - q_prefix_w, q_prefix, "", q_pad)
+    for j, md_line in ipairs(question_md(state, i, width - q_prefix_w)) do
+      append_wrapped(lines, md_line, width - q_prefix_w, j == 1 and q_prefix or q_pad, "", q_pad)
+    end
     append_wrapped(
       lines,
       { { ans_text, "form_answer" } },

@@ -260,19 +260,19 @@ case("question_md_falls_back_to_plain_text_on_invalid_markdown_return", function
   local mocks = {
     {
       name = "error",
-      fn = function()
+      fn = function(_text, _width)
         error("boom")
       end,
     },
     {
       name = "non-table",
-      fn = function()
+      fn = function(_text, _width)
         return "not a table"
       end,
     },
     {
       name = "empty-table",
-      fn = function()
+      fn = function(_text, _width)
         return {}
       end,
     },
@@ -288,9 +288,9 @@ case("question_md_falls_back_to_plain_text_on_invalid_markdown_return", function
   end
 end)
 
-case("inline_md_returns_only_first_markdown_line_in_confirming", function()
+case("confirming_view_renders_all_question_lines_at_inline_width", function()
   local original = maki.ui.markdown
-  maki.ui.markdown = function()
+  maki.ui.markdown = function(_text, _width)
     return { { { "first", "" } }, { { "second", "" } } }
   end
   local s = confirming_multi()
@@ -298,7 +298,24 @@ case("inline_md_returns_only_first_markdown_line_in_confirming", function()
   maki.ui.markdown = original
   eq(s.mode, MODE.CONFIRMING)
   assert(find_span_with_text(r.lines, "first"), "confirming row must include first markdown line")
-  assert(not find_span_with_text(r.lines, "second"), "confirming row must NOT include subsequent markdown lines")
+  assert(find_span_with_text(r.lines, "second"), "confirming row must also include subsequent markdown lines")
+end)
+
+case("question_md_cache_invalidates_on_width_change", function()
+  local original = maki.ui.markdown
+  local calls = 0
+  maki.ui.markdown = function(_text, width)
+    calls = calls + 1
+    return { { { "w=" .. tostring(width), "" } } }
+  end
+  local s = selecting_single()
+  QuestionForm._render(s, 80)
+  local calls_after_80 = calls
+  QuestionForm._render(s, 80)
+  eq(calls, calls_after_80, "same width must reuse cache")
+  QuestionForm._render(s, 60)
+  maki.ui.markdown = original
+  assert(calls > calls_after_80, "width change must invalidate cache and re-render")
 end)
 
 local function multi_with_custom()

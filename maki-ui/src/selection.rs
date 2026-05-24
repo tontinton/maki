@@ -37,8 +37,8 @@ use ratatui::text::Line;
 
 use unicode_width::UnicodeWidthChar;
 
-use crate::markdown::{CODE_BAR, CODE_BAR_WRAP};
 use crate::theme;
+use maki_markdown::render::{CODE_BAR, CODE_BAR_WRAP};
 
 /// Position in doc space (full logical document, not just visible window).
 /// Stored as (row, col) where col is a screen x coordinate.
