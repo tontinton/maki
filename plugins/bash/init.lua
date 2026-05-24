@@ -275,7 +275,10 @@ maki.api.register_tool({
   restore = function(input, output, is_error, ctx)
     local command = resolve_command(input)
     local buf, view = create_bash_view(command, ctx)
-    if is_error then
+    local timeout_secs = output:match("^tool bash timed out after (%d+)s$")
+    if timeout_secs then
+      view:append({ { "Timed out after " .. timeout_secs .. "s", "dim" } })
+    elseif is_error then
       local body, code = output:match("^(.-)\nExit code: (%d+)$")
       if body then
         for line in (body .. "\n"):gmatch("([^\n]*)\n") do
@@ -312,6 +315,8 @@ maki.api.register_tool({
     local max_lines = (config and config.max_output_lines) or 2000
     local max_bytes = (config and config.max_output_bytes) or (50 * 1024)
 
+    ctx:set_deadline(timeout_secs)
+
     local rewritten = rtk_rewrite(command, ctx)
     if rewritten then
       command = rewritten
@@ -321,14 +326,8 @@ maki.api.register_tool({
 
     local output_parts = {}
     local has_output = false
-    local finished = false
 
     local function finish(exit_code)
-      if finished then
-        return
-      end
-      finished = true
-
       local output = table.concat(output_parts)
       output = truncate(output, max_lines, max_bytes)
 
@@ -359,7 +358,7 @@ maki.api.register_tool({
 
     view:append({ { "Waiting for output...", "dim" } })
 
-    local id = maki.fn.jobstart(command, {
+    maki.fn.jobstart(command, {
       cwd = workdir,
       env = { GIT_TERMINAL_PROMPT = "0" },
       on_stdout = function(_, line)
@@ -382,26 +381,6 @@ maki.api.register_tool({
         finish(code)
       end,
     })
-
-    maki.defer_fn(function()
-      if not finished then
-        maki.fn.jobstop(id)
-        finished = true
-        local output = table.concat(output_parts)
-        output = truncate(output, max_lines, max_bytes)
-        local msg = "command timed out after " .. timeout_secs .. "s"
-        if output ~= "" then
-          msg = msg .. "\n" .. output
-        end
-        view:append({ { "Timed out after " .. timeout_secs .. "s", "dim" } })
-        view:finish()
-        ctx:finish({
-          llm_output = msg,
-          is_error = true,
-          body = buf,
-        })
-      end
-    end, timeout_secs * 1000)
 
     return nil
   end,

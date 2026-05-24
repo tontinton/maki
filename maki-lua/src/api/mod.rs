@@ -19,11 +19,10 @@ pub(crate) mod yaml;
 
 use std::sync::Arc;
 
-use mlua::{Function, Lua, Result as LuaResult, Table, Value};
+use mlua::{Lua, Result as LuaResult, Table, Value};
 
 use crate::api::command::UiAction;
 use crate::api::tool::PendingTools;
-use crate::runtime::with_task_jobs;
 
 pub(crate) fn create_maki_global(
     lua: &Lua,
@@ -48,15 +47,6 @@ pub(crate) fn create_maki_global(
     maki.set("text", text::create_text_table(lua)?)?;
     maki.set("ui", ui::create_ui_table(lua, ui_action_tx)?)?;
     maki.set("fn", fn_api::create_fn_table(lua)?)?;
-    maki.set(
-        "defer_fn",
-        lua.create_function(|lua, (func, timeout_ms): (Function, u64)| {
-            let on_exit = lua.create_registry_value(func)?;
-            with_task_jobs(lua, |store| store.start_timer(timeout_ms, Some(on_exit)))
-                .ok_or_else(|| mlua::Error::runtime("job store not initialized"))?
-                .map_err(mlua::Error::runtime)
-        })?,
-    )?;
     maki.set("async", async_api::create_async_table(lua)?)?;
 
     Ok(maki)

@@ -31,10 +31,7 @@ pub(crate) fn create_ui_table(
     let t = lua.create_table()?;
     t.set(
         "buf",
-        lua.create_function(|lua, ()| {
-            with_task_bufs(lua, |store| store.create_live())
-                .ok_or_else(|| mlua::Error::runtime("buffer store not initialized"))
-        })?,
+        lua.create_function(|lua, ()| Ok(with_task_bufs(lua, |store| store.create_live())))?,
     )?;
     t.set(
         "highlight",

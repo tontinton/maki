@@ -1,6 +1,8 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use maki_agent::tools::{ToolRegistry, ToolSource};
+use maki_config::{PluginsConfig, ToolOutputLines};
 use maki_lua::{PluginError, PluginHost};
 
 fn fresh_registry() -> Arc<ToolRegistry> {
@@ -56,6 +58,10 @@ const NON_STRING_FIELD_SCHEMA: &str = r#"{
 const NIL_WITHOUT_JOBS_ERR: &str =
     "handler returned nil without calling ctx:finish() or starting jobs";
 const FINISH_CALLED_TWICE_ERR: &str = "ctx:finish() already called";
+const DEADLINE_ALREADY_SET_ERR: &str = "ctx:set_deadline() already called";
+const DEADLINE_TIMEOUT_MSG: &str = "tool deadline_test timed out after 1s";
+const BASH_TIMEOUT_MSG: &str = "tool bash timed out after 1s";
+const BASH_TIMEOUT_MARKER: &str = "Timed out after 1s";
 
 #[test]
 fn stdlib_globals_accessible() {
@@ -992,4 +998,105 @@ fn unload_clears_commands() {
 
     host.unload("cmd_only").unwrap();
     assert_eq!(host.command_reader().load().commands.len(), 0);
+}
+
+#[test]
+fn job_callback_finishes_after_handler_returns_nil() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let src = format!(
+        r#"maki.api.register_tool({{
+            name = "job_after_return",
+            description = "on_exit finishes after handler returns nil",
+            schema = {MINIMAL_SCHEMA},
+            audiences = {{ "main" }},
+            handler = function(input, ctx)
+                maki.fn.jobstart("true", {{
+                    on_exit = function(_, code)
+                        ctx:finish("exit=" .. tostring(code))
+                    end,
+                }})
+                return nil
+            end
+        }})"#,
+    );
+    host.load_source("job_after_return", &src).unwrap();
+    let out = exec_tool(&reg, "job_after_return", serde_json::json!({})).unwrap();
+    assert_eq!(out, "exit=0");
+}
+
+#[test]
+fn ctx_set_deadline_times_out() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let src = format!(
+        r#"maki.api.register_tool({{
+            name = "deadline_test",
+            description = "uses ctx:set_deadline",
+            schema = {MINIMAL_SCHEMA},
+            audiences = {{ "main" }},
+            handler = function(input, ctx)
+                ctx:set_deadline(1)
+                maki.fn.jobstart("sleep 30", {{
+                    on_exit = function(_, _) ctx:finish("should-not-reach") end,
+                }})
+                return nil
+            end
+        }})"#,
+    );
+    host.load_source("deadline_test", &src).unwrap();
+    let err = exec_tool(&reg, "deadline_test", serde_json::json!({})).unwrap_err();
+    assert_eq!(err, DEADLINE_TIMEOUT_MSG);
+}
+
+#[test]
+fn ctx_set_deadline_twice_errors() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let src = format!(
+        r#"maki.api.register_tool({{
+            name = "deadline_twice",
+            description = "calls set_deadline twice",
+            schema = {MINIMAL_SCHEMA},
+            audiences = {{ "main" }},
+            handler = function(input, ctx)
+                ctx:set_deadline(5)
+                ctx:set_deadline(5)
+            end
+        }})"#,
+    );
+    host.load_source("deadline_twice", &src).unwrap();
+    let err = exec_tool(&reg, "deadline_twice", serde_json::json!({})).unwrap_err();
+    assert!(err.contains(DEADLINE_ALREADY_SET_ERR), "got: {err}");
+}
+
+#[test]
+fn bash_timeout_round_trip() {
+    let reg = fresh_registry();
+    let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_builtins(&PluginsConfig::from_tools(HashMap::new()))
+        .unwrap();
+
+    let input = serde_json::json!({"command": "sleep 30", "timeout": 1});
+    let err = exec_tool(&reg, "bash", input.clone()).unwrap_err();
+    assert_eq!(err, BASH_TIMEOUT_MSG);
+
+    let handle = host.event_handle().expect("event handle available");
+    let reply = handle
+        .restore_tool(
+            "bash",
+            "test_id",
+            BASH_TIMEOUT_MSG,
+            &input,
+            true,
+            &ToolOutputLines::default(),
+        )
+        .expect("restore should return a reply");
+    let body = reply.body.expect("restore body present");
+    let last = body.lines.last().expect("at least one line");
+    let text: String = last.spans.iter().map(|s| s.text.as_str()).collect();
+    assert!(
+        text.contains(BASH_TIMEOUT_MARKER),
+        "restored body missing timeout marker; got: {text:?}"
+    );
 }

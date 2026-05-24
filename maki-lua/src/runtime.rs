@@ -14,7 +14,7 @@ use maki_agent::cancel::CancelToken;
 use maki_agent::tools::{
     HeaderResult, PermissionScopes, RegistryError, Tool, ToolRegistry, ToolSource,
 };
-use maki_agent::{BufferSnapshot, SharedBuf};
+use maki_agent::{BufferSnapshot, SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle};
 use mlua::{Function, Lua, LuaSerdeExt, RegistryKey, Value as LuaValue, VmState};
 use serde_json::Value;
 
@@ -27,13 +27,14 @@ use crate::api::create_maki_global;
 use crate::api::ctx::LuaCtx;
 use crate::api::fn_api::{JobEvent, JobStore};
 use crate::api::setup::ConfigStore;
-use crate::api::tool::{LuaTool, PendingTool, PendingTools, ToolCallReply};
+use crate::api::tool::{LuaOutputFormat, LuaTool, PendingTool, PendingTools, ToolCallReply};
 use crate::error::PluginError;
 
 const INTERRUPT_MSG: &str = "plugin interrupted: cancelled, deadline exceeded, or shutting down";
 const DISPATCH_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const NIL_WITHOUT_FINISH_MSG: &str =
     "handler returned nil without calling ctx:finish() or starting jobs";
+pub(crate) const CANCELLED_MSG: &str = "cancelled";
 const MAX_INFLIGHT_TOOLS: usize = 64;
 const GC_STEP_INTERVAL: usize = 4;
 const INTERRUPT_CANCEL_CHECK_INTERVAL: u32 = 128;
@@ -123,19 +124,23 @@ pub struct LiveCtx {
     pub tool_use_id: String,
 }
 
-struct TaskCtx {
-    cancel: CancelToken,
-    deadline: Option<Instant>,
-    jobs: JobStore,
-    bufs: BufferStore,
-    live: Option<LiveCtx>,
+/// The `Mutex` is never contended (Lua is single-threaded) but
+/// `Lua::app_data` requires `Send + Sync` with the `send` feature.
+pub(crate) struct TaskCell {
+    pub(crate) cancel: CancelToken,
+    pub(crate) deadline: Cell<Option<Instant>>,
+    pub(crate) deadline_secs: Cell<Option<u64>>,
+    pub(crate) jobs: JobStore,
+    pub(crate) bufs: BufferStore,
+    pub(crate) live: Option<LiveCtx>,
 }
 
-impl TaskCtx {
+impl TaskCell {
     fn new(cancel: CancelToken, deadline: Option<Instant>, live: Option<LiveCtx>) -> Self {
         Self {
             cancel,
-            deadline,
+            deadline: Cell::new(deadline),
+            deadline_secs: Cell::new(None),
             jobs: JobStore::new(),
             bufs: BufferStore::new(),
             live,
@@ -143,32 +148,112 @@ impl TaskCtx {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct ThreadKey(usize);
-
-impl ThreadKey {
-    fn current(lua: &Lua) -> Self {
-        Self(lua.current_thread().to_pointer() as usize)
-    }
-}
-
-/// Keyed by coroutine pointer. Single-threaded, so no locking needed.
-type TaskMap = HashMap<ThreadKey, TaskCtx>;
+pub(crate) type TaskHandle = Arc<Mutex<TaskCell>>;
 
 type ClickHandlerMap = HashMap<String, (RegistryKey, Arc<SharedBuf>)>;
 
-pub(crate) fn with_task_jobs<R>(lua: &Lua, f: impl FnOnce(&mut JobStore) -> R) -> Option<R> {
-    let key = ThreadKey::current(lua);
-    let mut tasks = lua.app_data_mut::<TaskMap>()?;
-    let ctx = tasks.get_mut(&key)?;
-    Some(f(&mut ctx.jobs))
+pub(crate) fn lock_cell(handle: &TaskHandle) -> std::sync::MutexGuard<'_, TaskCell> {
+    handle.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-pub(crate) fn with_task_bufs<R>(lua: &Lua, f: impl FnOnce(&mut BufferStore) -> R) -> Option<R> {
-    let key = ThreadKey::current(lua);
-    let mut tasks = lua.app_data_mut::<TaskMap>()?;
-    let ctx = tasks.get_mut(&key)?;
-    Some(f(&mut ctx.bufs))
+/// Publishes a `TaskCell` into `Lua::app_data` for the duration of a
+/// task, and restores the previous one on drop. Async work must go
+/// through `scope_future` because concurrent tasks on the same executor
+/// overwrite `app_data` between yields.
+pub(crate) struct TaskScope {
+    lua: Lua,
+    handle: TaskHandle,
+    prev: Option<TaskHandle>,
+}
+
+impl TaskScope {
+    pub(crate) fn new(lua: &Lua, cell: TaskCell) -> Self {
+        let handle: TaskHandle = Arc::new(Mutex::new(cell));
+        let prev = lua.set_app_data::<TaskHandle>(Arc::clone(&handle));
+        Self {
+            lua: lua.clone(),
+            handle,
+            prev,
+        }
+    }
+
+    pub(crate) fn handle(&self) -> &TaskHandle {
+        &self.handle
+    }
+
+    pub(crate) fn scope_future<F>(&self, inner: F) -> ScopedFuture<F> {
+        ScopedFuture {
+            lua: self.lua.clone(),
+            handle: Arc::clone(&self.handle),
+            inner,
+        }
+    }
+}
+
+impl Drop for TaskScope {
+    fn drop(&mut self) {
+        {
+            let mut cell = lock_cell(&self.handle);
+            cell.jobs.kill_all();
+            cell.jobs.clear(&self.lua);
+            cell.bufs.clear();
+        }
+        match self.prev.take() {
+            Some(p) => {
+                self.lua.set_app_data(p);
+            }
+            None => {
+                self.lua.remove_app_data::<TaskHandle>();
+            }
+        }
+    }
+}
+
+/// Re-publishes the task handle around every `poll` so each concurrent
+/// task on the shared Lua instance sees its own `TaskCell`.
+pub(crate) struct ScopedFuture<F> {
+    lua: Lua,
+    handle: TaskHandle,
+    inner: F,
+}
+
+impl<F: std::future::Future> std::future::Future for ScopedFuture<F> {
+    type Output = F::Output;
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        // SAFETY: `inner` is structurally pinned; `lua`/`handle` are
+        // never moved out.
+        let this = unsafe { self.get_unchecked_mut() };
+        let prev = this
+            .lua
+            .set_app_data::<TaskHandle>(Arc::clone(&this.handle));
+        let result = unsafe { std::pin::Pin::new_unchecked(&mut this.inner) }.poll(cx);
+        match prev {
+            Some(p) => {
+                this.lua.set_app_data(p);
+            }
+            None => {
+                this.lua.remove_app_data::<TaskHandle>();
+            }
+        }
+        result
+    }
+}
+
+pub(crate) fn active_task(lua: &Lua) -> TaskHandle {
+    lua.app_data_ref::<TaskHandle>()
+        .map(|r| Arc::clone(&*r))
+        .expect("task accessor called outside a task scope")
+}
+
+pub(crate) fn with_task_jobs<R>(lua: &Lua, f: impl FnOnce(&mut JobStore) -> R) -> R {
+    f(&mut lock_cell(&active_task(lua)).jobs)
+}
+
+pub(crate) fn with_task_bufs<R>(lua: &Lua, f: impl FnOnce(&mut BufferStore) -> R) -> R {
+    f(&mut lock_cell(&active_task(lua)).bufs)
 }
 
 pub(crate) fn with_click_handlers<R>(
@@ -179,24 +264,22 @@ pub(crate) fn with_click_handlers<R>(
 }
 
 pub(crate) fn with_live_ctx<R>(lua: &Lua, f: impl FnOnce(&LiveCtx) -> R) -> Option<R> {
-    let key = ThreadKey::current(lua);
-    lua.app_data_ref::<TaskMap>()
-        .and_then(|tasks| tasks.get(&key)?.live.as_ref().map(f))
+    let handle = lua.app_data_ref::<TaskHandle>()?;
+    lock_cell(&handle).live.as_ref().map(f)
 }
 
 pub(crate) fn enqueue_async_task(lua: &Lua, work_fn: RegistryKey) -> Result<(), mlua::Error> {
-    let key = ThreadKey::current(lua);
-    let (cancel, live_ctx, live_buf) = lua
-        .app_data_ref::<TaskMap>()
-        .and_then(|m| {
-            let ctx = m.get(&key)?;
-            Some((
-                ctx.cancel.clone(),
-                ctx.live.clone(),
-                ctx.bufs.live_buf().cloned(),
-            ))
-        })
-        .unwrap_or((CancelToken::none(), None, None));
+    let (cancel, live_ctx, live_buf) = match lua.app_data_ref::<TaskHandle>() {
+        Some(h) => {
+            let cell = lock_cell(&h);
+            (
+                cell.cancel.clone(),
+                cell.live.clone(),
+                cell.bufs.live_buf().cloned(),
+            )
+        }
+        None => (CancelToken::none(), None, None),
+    };
 
     let task = PendingAsyncTask {
         work_fn,
@@ -211,35 +294,6 @@ pub(crate) fn enqueue_async_task(lua: &Lua, work_fn: RegistryKey) -> Result<(), 
         .ok_or_else(|| mlua::Error::runtime("spawn queue not initialized"))?;
     queue.borrow_mut().push(task);
     Ok(())
-}
-
-struct TaskCleanupGuard {
-    lua: Lua,
-    key: ThreadKey,
-}
-
-impl Drop for TaskCleanupGuard {
-    fn drop(&mut self) {
-        if let Some(mut task) = self
-            .lua
-            .app_data_mut::<TaskMap>()
-            .and_then(|mut m| m.remove(&self.key))
-        {
-            task.jobs.kill_all();
-            task.jobs.clear(&self.lua);
-            task.bufs.clear();
-        }
-    }
-}
-
-fn register_task(lua: &Lua, thread_key: ThreadKey, ctx: TaskCtx) -> TaskCleanupGuard {
-    if let Some(mut tasks) = lua.app_data_mut::<TaskMap>() {
-        tasks.insert(thread_key, ctx);
-    }
-    TaskCleanupGuard {
-        lua: lua.clone(),
-        key: thread_key,
-    }
 }
 
 /// Caps concurrent coroutines so they don't blow the Lua stack or starve
@@ -347,15 +401,13 @@ fn drain_spawn_queue(lua: &Lua, ex: &Rc<smol::LocalExecutor<'_>>, gate: &Rc<Infl
         ex.spawn(async move {
             let _gate_guard = GateGuard::new(&g);
 
-            let run = async {
+            let scope = TaskScope::new(
+                &lua,
+                TaskCell::new(task.cancel.clone(), task.deadline, task.live_ctx.clone()),
+            );
+            let run = scope.scope_future(async {
                 let work_fn: Function = lua.registry_value(&task.work_fn)?;
                 let thread = lua.create_thread(work_fn)?;
-                let thread_key = ThreadKey(thread.to_pointer() as usize);
-                let _cleanup = register_task(
-                    &lua,
-                    thread_key,
-                    TaskCtx::new(task.cancel.clone(), task.deadline, task.live_ctx.clone()),
-                );
                 let async_thread = thread.into_async::<LuaValue>(())?;
                 match task.deadline {
                     Some(dl) => {
@@ -367,7 +419,7 @@ fn drain_spawn_queue(lua: &Lua, ex: &Rc<smol::LocalExecutor<'_>>, gate: &Rc<Infl
                     }
                     None => async_thread.await,
                 }
-            };
+            });
 
             let result = run.await;
             if let Err(e) = &result {
@@ -383,6 +435,7 @@ fn drain_spawn_queue(lua: &Lua, ex: &Rc<smol::LocalExecutor<'_>>, gate: &Rc<Infl
                 }
             }
 
+            drop(scope);
             lua.remove_registry_value(task.work_fn).ok();
             drain_spawn_queue(&lua, &ex2, &g);
         })
@@ -436,23 +489,12 @@ impl LuaRuntime {
             if tick % INTERRUPT_CANCEL_CHECK_INTERVAL != 0 {
                 return Ok(VmState::Continue);
             }
-            // current_thread() pushes onto the Lua stack which is unsafe in
-            // interrupts (luau-lang/luau#446). Rate-limit this check to avoid
-            // exhausting the auxiliary stack in long-running coroutines.
-            let thread = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                interrupt_lua.current_thread()
-            }));
-            let Ok(thread) = thread else {
-                return Ok(VmState::Continue);
-            };
-            let key = ThreadKey(thread.to_pointer() as usize);
             let cancelled = interrupt_lua
-                .app_data_ref::<TaskMap>()
-                .and_then(|m| {
-                    let ctx = m.get(&key)?;
-                    let cancel = ctx.cancel.is_cancelled();
-                    let expired = ctx.deadline.is_some_and(|d| Instant::now() > d);
-                    Some(cancel || expired)
+                .app_data_ref::<TaskHandle>()
+                .map(|h| {
+                    let cell = lock_cell(&h);
+                    cell.cancel.is_cancelled()
+                        || cell.deadline.get().is_some_and(|d| Instant::now() > d)
                 })
                 .unwrap_or(false);
             if cancelled {
@@ -476,7 +518,6 @@ impl LuaRuntime {
             source: e,
         })?;
 
-        lua.set_app_data(TaskMap::new());
         lua.set_app_data(ClickHandlerMap::new());
         lua.set_app_data(CommandHandlerMap::new());
         lua.set_app_data(SpawnQueue::default());
@@ -552,11 +593,14 @@ impl LuaRuntime {
         };
         let mut extras = Vec::new();
         for (plugin, func) in &callbacks {
-            let result: mlua::Result<LuaValue> = async {
-                let thread = self.lua.create_thread(func.clone())?;
-                thread.into_async::<LuaValue>(())?.await
-            }
-            .await;
+            let scope = TaskScope::new(&self.lua, TaskCell::new(CancelToken::none(), None, None));
+            let result: mlua::Result<LuaValue> = scope
+                .scope_future(async {
+                    let thread = self.lua.create_thread(func.clone())?;
+                    thread.into_async::<LuaValue>(())?.await
+                })
+                .await;
+            drop(scope);
             match result {
                 Ok(LuaValue::String(s)) => extras.push(s.to_string_lossy()),
                 Ok(LuaValue::Nil) => {}
@@ -849,20 +893,11 @@ impl LuaRuntime {
             }
         };
 
-        let key = ThreadKey::current(&self.lua);
-        let task_ctx = TaskCtx::new(CancelToken::none(), None, None);
-        let Some(mut tasks) = self.lua.app_data_mut::<TaskMap>() else {
-            return HeaderResult::plain(tool.to_string());
-        };
-        tasks.insert(key, task_ctx);
-        drop(tasks);
+        let scope = TaskScope::new(&self.lua, TaskCell::new(CancelToken::none(), None, None));
+        let result = func.call::<LuaValue>(input_lua);
+        drop(scope);
 
-        let _cleanup = TaskCleanupGuard {
-            lua: self.lua.clone(),
-            key,
-        };
-
-        match func.call::<LuaValue>(input_lua) {
+        match result {
             Ok(LuaValue::String(s)) => match s.to_str() {
                 Ok(s) => HeaderResult::plain(s.to_owned()),
                 Err(_) => HeaderResult::plain(tool.to_string()),
@@ -896,29 +931,33 @@ impl LuaRuntime {
         };
         let input_lua = self.lua.to_value(&input).ok()?;
         let thread = self.lua.create_thread(func).ok()?;
-        let thread_key = ThreadKey(thread.to_pointer() as usize);
 
         let (dummy_tx, _) = flume::unbounded();
-        let task_ctx = TaskCtx::new(
-            CancelToken::none(),
-            None,
-            Some(LiveCtx {
-                event_tx: maki_agent::EventSender::new(dummy_tx, 0),
-                tool_use_id: tool_use_id.to_owned(),
-            }),
+        let scope = TaskScope::new(
+            &self.lua,
+            TaskCell::new(
+                CancelToken::none(),
+                None,
+                Some(LiveCtx {
+                    event_tx: maki_agent::EventSender::new(dummy_tx, 0),
+                    tool_use_id: tool_use_id.to_owned(),
+                }),
+            ),
         );
-        let _cleanup = register_task(&self.lua, thread_key, task_ctx);
 
         let ctx_ud = self
             .lua
             .create_userdata(crate::api::ctx::RestoreCtx { tool_output_lines })
             .ok()?;
-        let ret = thread
+        let inner = thread
             .into_async::<LuaValue>((input_lua, output, is_error, ctx_ud))
-            .ok()?
+            .ok()?;
+        let ret = scope
+            .scope_future(inner)
             .await
             .inspect_err(|e| tracing::warn!(tool, error = %e, "restore callback failed"))
             .ok()?;
+        drop(scope);
 
         extract_restore_reply(&ret)
     }
@@ -1044,20 +1083,19 @@ fn extract_restore_reply(ret: &LuaValue) -> Option<RestoreReply> {
     Some(RestoreReply { body, header })
 }
 
-/// A handler returning nil means "I went async". This loop polls job
-/// events until the plugin calls `ctx:finish()` or every job dies.
+/// Nil from the handler means "I went async". Polls job events until
+/// `ctx:finish()`, all jobs die, or the deadline (possibly set
+/// mid-flight via `ctx:set_deadline`) expires.
 async fn dispatch_async(
     lua: &Lua,
-    key: ThreadKey,
+    handle: TaskHandle,
+    plugin: &str,
+    tool: &str,
     finish_rx: flume::Receiver<ToolCallReply>,
 ) -> ToolCallReply {
-    let task_state = lua.app_data_ref::<TaskMap>().and_then(|m| {
-        let ctx = m.get(&key)?;
-        Some((ctx.cancel.clone(), ctx.deadline, !ctx.jobs.is_empty()))
-    });
-
-    let Some((cancel, deadline, has_jobs)) = task_state else {
-        return ToolCallReply::err(NIL_WITHOUT_FINISH_MSG);
+    let (cancel, has_jobs) = {
+        let cell = lock_cell(&handle);
+        (cell.cancel.clone(), !cell.jobs.is_empty())
     };
 
     if !has_jobs {
@@ -1069,12 +1107,20 @@ async fn dispatch_async(
         };
     }
 
-    let is_cancelled = || cancel.is_cancelled() || deadline.is_some_and(|d| Instant::now() > d);
+    let timed_out = || {
+        lock_cell(&handle)
+            .deadline
+            .get()
+            .is_some_and(|d| Instant::now() > d)
+    };
     let mut event_buf = Vec::new();
 
     loop {
-        if is_cancelled() {
-            return ToolCallReply::err("cancelled");
+        if cancel.is_cancelled() {
+            return ToolCallReply::err(CANCELLED_MSG);
+        }
+        if timed_out() {
+            return timeout_reply(&handle, plugin, tool);
         }
 
         match finish_rx.try_recv() {
@@ -1085,18 +1131,10 @@ async fn dispatch_async(
             Err(flume::TryRecvError::Empty) => {}
         }
 
-        if let Some(m) = lua.app_data_ref::<TaskMap>() {
-            if let Some(ctx) = m.get(&key) {
-                ctx.jobs.drain_events(&mut event_buf);
-            }
-        }
+        lock_cell(&handle).jobs.drain_events(&mut event_buf);
 
         if event_buf.is_empty() {
-            let has_alive = lua
-                .app_data_ref::<TaskMap>()
-                .and_then(|m| Some(m.get(&key)?.jobs.has_alive_jobs()))
-                .unwrap_or(false);
-
+            let has_alive = lock_cell(&handle).jobs.has_alive_jobs();
             if !has_alive {
                 smol::Timer::after(DISPATCH_POLL_INTERVAL).await;
                 return match finish_rx.try_recv() {
@@ -1111,12 +1149,10 @@ async fn dispatch_async(
         for (job_id, event) in event_buf.drain(..) {
             let is_exit = matches!(event, JobEvent::Exit(_));
 
-            let callback = lua.app_data_ref::<TaskMap>().and_then(|m| {
-                let ctx = m.get(&key)?;
-                ctx.jobs
-                    .callback_key(job_id, &event)
-                    .and_then(|k| lua.registry_value::<Function>(k).ok())
-            });
+            let callback = lock_cell(&handle)
+                .jobs
+                .callback_key(job_id, &event)
+                .and_then(|k| lua.registry_value::<Function>(k).ok());
 
             if let Some(func) = callback {
                 let arg: LuaValue = match &event {
@@ -1132,19 +1168,48 @@ async fn dispatch_async(
             }
 
             if is_exit {
-                if let Some(mut tasks) = lua.app_data_mut::<TaskMap>() {
-                    if let Some(ctx) = tasks.get_mut(&key) {
-                        ctx.jobs.mark_dead(job_id);
-                    }
-                }
+                lock_cell(&handle).jobs.mark_dead(job_id);
             }
         }
     }
 }
 
-/// Coroutines interleave at yield points on a single `smol::LocalExecutor`.
-/// Deadlines work in three layers: `set_interrupt` catches tight CPU loops,
-/// `smol::Timer` races catch I/O waits, and the dispatch loop covers jobs.
+/// The error message format is load-bearing: the bash plugin's `restore`
+/// parses it to re-render the timeout sentinel on session reload.
+fn timeout_reply(handle: &TaskHandle, plugin: &str, tool: &str) -> ToolCallReply {
+    let (secs, live_buf) = {
+        let cell = lock_cell(handle);
+        (
+            cell.deadline_secs.get().unwrap_or(0),
+            cell.bufs.live_buf().cloned(),
+        )
+    };
+    let qualified = if plugin == tool || plugin.is_empty() {
+        tool.to_owned()
+    } else {
+        format!("{plugin}.{tool}")
+    };
+
+    if let Some(ref buf) = live_buf {
+        buf.append(SnapshotLine {
+            spans: vec![SnapshotSpan {
+                text: format!("Timed out after {secs}s"),
+                style: SpanStyle::Named("dim".into()),
+            }],
+        });
+    }
+
+    ToolCallReply {
+        result: Err(format!("tool {qualified} timed out after {secs}s")),
+        snapshot: None,
+        header: None,
+        live_buf,
+        format: LuaOutputFormat::default(),
+    }
+}
+
+/// Deadlines work in two layers: the interrupt hook catches tight CPU
+/// loops, and the dispatch loop catches I/O waits between job events.
 #[allow(clippy::too_many_arguments)]
 async fn run_tool_call(
     lua: Lua,
@@ -1191,52 +1256,60 @@ async fn run_tool_call(
         Ok(t) => t,
         Err(e) => return ToolCallReply::err(e.to_string()),
     };
-    let thread_key = ThreadKey(thread.to_pointer() as usize);
-
-    let task_ctx = TaskCtx::new(cancel, deadline, live);
-    let _cleanup = register_task(&lua, thread_key, task_ctx);
+    let scope = TaskScope::new(&lua, TaskCell::new(cancel, deadline, live));
+    let handle = Arc::clone(scope.handle());
 
     let async_thread = match thread.into_async::<LuaValue>((input_lua, ctx_ud)) {
         Ok(at) => at,
         Err(e) => return ToolCallReply::err(e.to_string()),
     };
 
-    let call_future = async {
-        match async_thread.await {
+    let call_future = scope.scope_future(async {
+        let handler_result = {
+            let deadline = lock_cell(&handle).deadline.get();
+            match deadline {
+                Some(dl) => {
+                    futures_lite::future::race(async_thread, async {
+                        smol::Timer::at(dl).await;
+                        Err(mlua::Error::runtime("timeout"))
+                    })
+                    .await
+                }
+                None => async_thread.await,
+            }
+        };
+        match handler_result {
             Ok(LuaValue::Nil) => {
-                let live_shared = lua.app_data_ref::<TaskMap>().and_then(|m| {
-                    let ctx = m.get(&thread_key)?;
-                    let live = ctx.live.as_ref()?;
-                    let shared = ctx.bufs.live_buf()?;
-                    Some((
-                        live.event_tx.clone(),
-                        live.tool_use_id.clone(),
-                        Arc::clone(shared),
-                    ))
-                });
+                let live_shared = {
+                    let cell = lock_cell(&handle);
+                    cell.live.as_ref().and_then(|live| {
+                        let shared = cell.bufs.live_buf()?;
+                        Some((
+                            live.event_tx.clone(),
+                            live.tool_use_id.clone(),
+                            Arc::clone(shared),
+                        ))
+                    })
+                };
                 if let Some((event_tx, tool_use_id, shared)) = live_shared {
                     let _ = event_tx.send(maki_agent::AgentEvent::LiveToolBuf {
                         id: tool_use_id,
                         body: shared,
                     });
                 }
-                dispatch_async(&lua, thread_key, finish_rx).await
+                dispatch_async(&lua, Arc::clone(&handle), &plugin, &tool, finish_rx).await
             }
             Ok(val) => ToolCallReply::from_lua_value(&val),
             Err(e) => ToolCallReply::err(e.to_string()),
         }
-    };
+    });
 
-    match deadline {
-        Some(dl) => {
-            futures_lite::future::race(call_future, async {
-                smol::Timer::at(dl).await;
-                ToolCallReply::err("timeout")
-            })
-            .await
-        }
-        None => call_future.await,
-    }
+    // Both the dispatch loop and the interrupt hook read the live
+    // deadline from TaskCell. The outer `tool.rs` timeout is the
+    // absolute backstop.
+    let reply = call_future.await;
+    drop(scope);
+    reply
 }
 
 pub(crate) struct LuaThread {
@@ -1360,9 +1433,15 @@ pub fn spawn(
                                         return;
                                     };
                                     let _ = data.set("row", row);
-                                    if let Err(e) = func.call_async::<()>(data).await {
+                                    let scope = TaskScope::new(
+                                        &lua,
+                                        TaskCell::new(CancelToken::none(), None, None),
+                                    );
+                                    let scoped = scope.scope_future(func.call_async::<()>(data));
+                                    if let Err(e) = scoped.await {
                                         tracing::warn!(tool_id, error = %e, "click handler failed");
                                     }
+                                    drop(scope);
                                     drain_spawn_queue(&lua, &ex_ref, &g);
                                     let _ = reply.send(Some(ClickReply {
                                         snapshot: buf.take(),
@@ -1389,19 +1468,19 @@ pub fn spawn(
                                 let ex_ref = Rc::clone(&ex);
                                 let g = Rc::clone(&gate);
                                 ex.spawn(async move {
+                                    let scope = TaskScope::new(
+                                        &lua,
+                                        TaskCell::new(CancelToken::none(), None, None),
+                                    );
                                     let run = async {
                                         let thread = lua.create_thread(func)?;
-                                        let thread_key = ThreadKey(thread.to_pointer() as usize);
-                                        let _cleanup = register_task(&lua, thread_key, TaskCtx::new(
-                                            CancelToken::none(),
-                                            None,
-                                            None,
-                                        ));
                                         thread.into_async::<()>(args)?.await
                                     };
-                                    if let Err(e) = run.await {
+                                    let scoped = scope.scope_future(run);
+                                    if let Err(e) = scoped.await {
                                         tracing::warn!(plugin = %plugin, command = %command, error = %e, "command handler failed");
                                     }
+                                    drop(scope);
                                     drain_spawn_queue(&lua, &ex_ref, &g);
                                 })
                                 .detach();
@@ -1477,12 +1556,8 @@ pub fn spawn(
 
 #[cfg(test)]
 pub(crate) fn install_live_ctx(lua: &Lua, tool_use_id: &str) {
-    let key = ThreadKey::current(lua);
-    if lua.app_data_ref::<TaskMap>().is_none() {
-        lua.set_app_data(TaskMap::new());
-    }
     let (tx, _rx) = flume::unbounded();
-    let ctx = TaskCtx::new(
+    let cell = TaskCell::new(
         CancelToken::none(),
         None,
         Some(LiveCtx {
@@ -1490,14 +1565,14 @@ pub(crate) fn install_live_ctx(lua: &Lua, tool_use_id: &str) {
             tool_use_id: tool_use_id.to_owned(),
         }),
     );
-    lua.app_data_mut::<TaskMap>().unwrap().insert(key, ctx);
+    let handle: TaskHandle = Arc::new(Mutex::new(cell));
+    lua.set_app_data::<TaskHandle>(handle);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::api::tool::ToolCallReply;
-    use maki_agent::{SnapshotLine, SnapshotSpan, SpanStyle};
 
     fn make_buf_handle(text: &str) -> BufHandle {
         let buf = Arc::new(maki_agent::SharedBuf::new());
@@ -1553,47 +1628,35 @@ mod tests {
     }
 
     #[test]
-    fn task_cleanup_guard_removes_entry() {
+    fn task_scope_clears_jobs_and_bufs_on_drop() {
         let lua = Lua::new();
-        lua.set_app_data(TaskMap::new());
-        let key = ThreadKey::current(&lua);
-        {
-            lua.app_data_mut::<TaskMap>()
-                .unwrap()
-                .insert(key, task_ctx(None));
-        }
-        drop(TaskCleanupGuard {
-            lua: lua.clone(),
-            key,
-        });
-        let tasks = lua.app_data_ref::<TaskMap>().unwrap();
-        assert!(!tasks.contains_key(&key));
+        let scope = TaskScope::new(&lua, task_cell(None));
+        let handle = Arc::clone(scope.handle());
+        lock_cell(&handle).bufs.create_live();
+        assert!(lock_cell(&handle).bufs.live_buf().is_some());
+        drop(scope);
+        assert!(lock_cell(&handle).bufs.live_buf().is_none());
     }
 
-    fn task_ctx(live: Option<LiveCtx>) -> TaskCtx {
-        TaskCtx::new(CancelToken::none(), None, live)
+    fn task_cell(live: Option<LiveCtx>) -> TaskCell {
+        TaskCell::new(CancelToken::none(), None, live)
     }
 
     #[test]
     fn with_live_ctx_follows_task_live_field() {
         let lua = Lua::new();
-        lua.set_app_data(TaskMap::new());
-        let key = ThreadKey::current(&lua);
-
-        lua.app_data_mut::<TaskMap>()
-            .unwrap()
-            .insert(key, task_ctx(None));
-        assert!(with_live_ctx(&lua, |_| ()).is_none());
 
         let (tx, _rx) = flume::unbounded();
-        lua.app_data_mut::<TaskMap>()
-            .unwrap()
-            .get_mut(&key)
-            .unwrap()
-            .live = Some(LiveCtx {
+        let with_live = task_cell(Some(LiveCtx {
             event_tx: maki_agent::EventSender::new(tx, 0),
             tool_use_id: "tool_abc".into(),
-        });
+        }));
+
+        let scope = TaskScope::new(&lua, task_cell(None));
+        assert!(with_live_ctx(&lua, |_| ()).is_none());
+        drop(scope);
+
+        let _scope = TaskScope::new(&lua, with_live);
         assert_eq!(
             with_live_ctx(&lua, |ctx| ctx.tool_use_id.clone()).unwrap(),
             "tool_abc"
@@ -1669,7 +1732,6 @@ mod tests {
 
     fn enqueue_test_lua() -> Lua {
         let lua = Lua::new();
-        lua.set_app_data(TaskMap::new());
         lua.set_app_data(SpawnQueue::new(Vec::new()));
         lua
     }
@@ -1679,9 +1741,8 @@ mod tests {
         lua.create_registry_value(func).unwrap()
     }
 
-    fn enqueue_with_ctx(lua: &Lua, ctx: TaskCtx) {
-        let key = ThreadKey::current(lua);
-        lua.app_data_mut::<TaskMap>().unwrap().insert(key, ctx);
+    fn set_active(lua: &Lua, cell: TaskCell) -> TaskScope {
+        TaskScope::new(lua, cell)
     }
 
     #[test]
@@ -1721,7 +1782,7 @@ mod tests {
     fn enqueue_async_task_inherits_cancel_token() {
         let lua = enqueue_test_lua();
         let (trigger, token) = CancelToken::new();
-        enqueue_with_ctx(&lua, TaskCtx::new(token, None, None));
+        let _h = set_active(&lua, TaskCell::new(token, None, None));
         enqueue_async_task(&lua, enqueue_dummy(&lua)).unwrap();
 
         let queue = lua.app_data_ref::<SpawnQueue>().unwrap();
@@ -1738,9 +1799,9 @@ mod tests {
     fn enqueue_async_task_uses_fresh_deadline_regardless_of_parent() {
         let lua = enqueue_test_lua();
         let parent_deadline = Instant::now() - Duration::from_secs(10);
-        enqueue_with_ctx(
+        let _h = set_active(
             &lua,
-            TaskCtx::new(CancelToken::none(), Some(parent_deadline), None),
+            TaskCell::new(CancelToken::none(), Some(parent_deadline), None),
         );
 
         let before = Instant::now();

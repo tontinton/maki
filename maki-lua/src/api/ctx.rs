@@ -1,10 +1,14 @@
+use std::time::{Duration, Instant};
+
 use maki_agent::AgentEvent;
 use maki_agent::cancel::CancelToken;
 use maki_config::{AgentConfig, ToolOutputLines};
 use mlua::{LuaSerdeExt, UserData, UserDataMethods, Value as LuaValue};
 
 use crate::api::tool::ToolCallReply;
-use crate::runtime::LiveCtx;
+use crate::runtime::{LiveCtx, active_task};
+
+const DEADLINE_ALREADY_SET_MSG: &str = "ctx:set_deadline() already called";
 
 pub(crate) struct RestoreCtx {
     pub(crate) tool_output_lines: ToolOutputLines,
@@ -43,6 +47,18 @@ impl UserData for LuaCtx {
                     content,
                 });
             }
+            Ok(())
+        });
+
+        methods.add_method("set_deadline", |lua, _this, secs: u64| {
+            let handle = active_task(lua);
+            let cell = handle.lock().unwrap_or_else(|e| e.into_inner());
+            if cell.deadline_secs.get().is_some() {
+                return Err(mlua::Error::runtime(DEADLINE_ALREADY_SET_MSG));
+            }
+            cell.deadline_secs.set(Some(secs));
+            cell.deadline
+                .set(Some(Instant::now() + Duration::from_secs(secs)));
             Ok(())
         });
 

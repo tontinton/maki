@@ -17,13 +17,8 @@ pub(crate) enum JobEvent {
     Exit(i32),
 }
 
-enum JobKind {
-    Process { pid: u32 },
-    Timer,
-}
-
 struct JobMeta {
-    kind: JobKind,
+    pid: u32,
     alive: bool,
     on_stdout: Option<RegistryKey>,
     on_stderr: Option<RegistryKey>,
@@ -132,43 +127,10 @@ impl JobStore {
         self.jobs.insert(
             id,
             JobMeta {
-                kind: JobKind::Process { pid },
+                pid,
                 alive: true,
                 on_stdout,
                 on_stderr,
-                on_exit,
-                event_rx: Some(event_rx),
-            },
-        );
-
-        Ok(id)
-    }
-
-    pub fn start_timer(
-        &mut self,
-        timeout_ms: u64,
-        on_exit: Option<RegistryKey>,
-    ) -> Result<u32, String> {
-        let id = self.next_id;
-        self.next_id += 1;
-
-        let (event_tx, event_rx) = flume::unbounded();
-
-        thread::Builder::new()
-            .name("timer".into())
-            .spawn(move || {
-                thread::sleep(Duration::from_millis(timeout_ms));
-                let _ = event_tx.send(JobEvent::Exit(0));
-            })
-            .map_err(|e| e.to_string())?;
-
-        self.jobs.insert(
-            id,
-            JobMeta {
-                kind: JobKind::Timer,
-                alive: true,
-                on_stdout: None,
-                on_stderr: None,
                 on_exit,
                 event_rx: Some(event_rx),
             },
@@ -260,30 +222,24 @@ fn shell_command(cmd: &str) -> Command {
 }
 
 fn kill_job(meta: &mut JobMeta) {
-    match meta.kind {
-        JobKind::Timer => {
-            meta.alive = false;
+    let pid = meta.pid;
+    #[cfg(unix)]
+    unsafe {
+        libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+    }
+    #[cfg(windows)]
+    {
+        const PROCESS_TERMINATE: u32 = 0x0001;
+        unsafe extern "system" {
+            fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut std::ffi::c_void;
+            fn TerminateProcess(handle: *mut std::ffi::c_void, exit_code: u32) -> i32;
+            fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
         }
-        JobKind::Process { pid } => {
-            #[cfg(unix)]
-            unsafe {
-                libc::killpg(pid as libc::pid_t, libc::SIGKILL);
-            }
-            #[cfg(windows)]
-            {
-                const PROCESS_TERMINATE: u32 = 0x0001;
-                unsafe extern "system" {
-                    fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut std::ffi::c_void;
-                    fn TerminateProcess(handle: *mut std::ffi::c_void, exit_code: u32) -> i32;
-                    fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
-                }
-                unsafe {
-                    let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
-                    if !handle.is_null() {
-                        TerminateProcess(handle, 1);
-                        CloseHandle(handle);
-                    }
-                }
+        unsafe {
+            let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
+            if !handle.is_null() {
+                TerminateProcess(handle, 1);
+                CloseHandle(handle);
             }
         }
     }
@@ -325,7 +281,6 @@ pub(crate) fn create_fn_table(lua: &Lua) -> LuaResult<Table> {
             with_task_jobs(lua, |store| {
                 store.start(&cmd, cwd, env, on_stdout, on_stderr, on_exit)
             })
-            .ok_or_else(|| mlua::Error::runtime("job store not initialized"))?
             .map_err(mlua::Error::runtime)
         })?,
     )?;
@@ -333,8 +288,7 @@ pub(crate) fn create_fn_table(lua: &Lua) -> LuaResult<Table> {
     t.set(
         "jobstop",
         lua.create_function(|lua, job_id: u32| {
-            with_task_jobs(lua, |store| store.kill(job_id))
-                .ok_or_else(|| mlua::Error::runtime("job store not initialized"))?;
+            with_task_jobs(lua, |store| store.kill(job_id));
             Ok(())
         })?,
     )?;
@@ -343,7 +297,6 @@ pub(crate) fn create_fn_table(lua: &Lua) -> LuaResult<Table> {
         "jobwait",
         lua.create_async_function(|lua, (job_id, timeout_ms): (u32, Option<u64>)| async move {
             let rx = with_task_jobs(&lua, |store| store.take_receiver(job_id))
-                .ok_or_else(|| mlua::Error::runtime("job store not initialized"))?
                 .ok_or_else(|| mlua::Error::runtime("unknown job id or already waited"))?;
 
             let timeout = Duration::from_millis(timeout_ms.unwrap_or(30_000));
@@ -520,26 +473,5 @@ mod tests {
             buf.is_empty(),
             "drained receiver yields no events via drain_events"
         );
-    }
-
-    #[test]
-    fn start_timer_fires_exit_event() {
-        let mut store = make_store();
-        let id = store.start_timer(50, None).unwrap();
-        assert!(store.has_alive_jobs());
-
-        let rx = store.take_receiver(id).unwrap();
-        let event = rx.recv_timeout(Duration::from_secs(2));
-        assert!(matches!(event, Ok(JobEvent::Exit(0))));
-    }
-
-    #[test]
-    fn kill_timer_marks_dead() {
-        let mut store = make_store();
-        let id = store.start_timer(10_000, None).unwrap();
-        assert!(store.has_alive_jobs());
-
-        store.kill(id);
-        assert!(!store.has_alive_jobs());
     }
 }
