@@ -11,6 +11,9 @@ use crate::{AgentError, Message, ProviderEvent, StreamResponse, ThinkingConfig};
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use super::{KeyPool, ResolvedAuth};
 
+const PAD: &str = "";
+const V4_MARKER: &str = "deepseek-v4";
+
 static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
     api_key_env: "DEEPSEEK_API_KEY",
     base_url: "https://api.deepseek.com",
@@ -110,11 +113,13 @@ impl Provider for DeepSeek {
                 }
                 ThinkingConfig::Adaptive => {
                     body["thinking"] = serde_json::json!({"type": "enabled"});
+                    pad_reasoning_content(&model.id, &mut body);
                 }
-                ThinkingConfig::Budget(_n) => {
+                ThinkingConfig::Budget(_) => {
                     body["thinking"] = serde_json::json!({"type": "enabled"});
                     body["reasoning_effort"] = serde_json::json!("max");
                     warn!("DeepSeek reasoning does not support token budgets");
+                    pad_reasoning_content(&model.id, &mut body);
                 }
             }
 
@@ -138,5 +143,70 @@ impl Provider for DeepSeek {
                 .as_ref()
                 .is_some_and(|p| p.rotate_auth(&self.auth, ResolvedAuth::bearer)))
         })
+    }
+}
+
+/// DeepSeek's two reasoning models disagree about `reasoning_content`: V4 in
+/// thinking mode wants it on every assistant turn (missing = 400), R1 refuses
+/// it as input. So we gate on the V4 substring, same trick Vercel's AI SDK
+/// uses, and back-fill the turns that have none (plain replies, tool-only
+/// turns). The API only checks the field exists, so `""` is enough.
+///
+/// Ref: <https://api-docs.deepseek.com/guides/thinking_mode>
+fn pad_reasoning_content(model_id: &str, body: &mut Value) {
+    if !model_id.contains(V4_MARKER) {
+        return;
+    }
+    let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for msg in messages {
+        if msg.get("role").and_then(Value::as_str) != Some("assistant")
+            || msg
+                .get("reasoning_content")
+                .and_then(Value::as_str)
+                .is_some()
+        {
+            continue;
+        }
+        msg["reasoning_content"] = Value::String(PAD.to_string());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    const V4: &str = "deepseek-v4-pro";
+    const R1: &str = "deepseek-reasoner";
+
+    #[test]
+    fn v4_pads_only_assistant_turns_without_reasoning() {
+        let mut body = json!({"messages": [
+            {"role": "system",    "content": "sys"},
+            {"role": "user",      "content": "hi"},
+            {"role": "assistant", "content": "ok", "reasoning_content": "kept"},
+            {"role": "assistant", "content": "",   "tool_calls": [{"id": "c1"}]},
+            {"role": "tool",      "tool_call_id": "c1", "content": "out"},
+        ]});
+        pad_reasoning_content(V4, &mut body);
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs[2]["reasoning_content"], "kept");
+        assert_eq!(msgs[3]["reasoning_content"], PAD);
+        for i in [0, 1, 4] {
+            assert!(msgs[i].get("reasoning_content").is_none());
+        }
+    }
+
+    #[test]
+    fn non_v4_model_is_untouched() {
+        let input = json!({"messages": [
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "c1"}]},
+            {"role": "assistant", "content": "hi"},
+        ]});
+        let mut body = input.clone();
+        pad_reasoning_content(R1, &mut body);
+        assert_eq!(body, input);
     }
 }
