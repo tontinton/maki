@@ -1,10 +1,21 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState};
 
 pub const SCROLLBAR_THUMB: &str = "\u{2590}";
 
+static ENABLED: AtomicBool = AtomicBool::new(true);
+
+pub fn set_enabled(enabled: bool) {
+    ENABLED.store(enabled, Ordering::Relaxed);
+}
+
 pub fn render_vertical_scrollbar(frame: &mut Frame, area: Rect, content_len: u16, position: u16) {
+    if !ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
     let max_scroll = content_len.saturating_sub(area.height);
     let mut state = ScrollbarState::default()
         .content_length(max_scroll as usize + 1)

@@ -61,6 +61,7 @@ All fields are optional. Typos in field names cause an error right away.
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
 | `splash_animation` | bool | `true` | - | Show splash animation on startup |
+| `scrollbar` | bool | `true` | - | Show vertical scrollbar in scrollable areas |
 | `flash_duration_ms` | u64 | `1500` | - | Duration of flash messages (ms) |
 | `typewriter_ms_per_char` | u64 | `4` | - | Typewriter effect speed (ms/char) |
 | `mouse_scroll_lines` | u32 | `3` | 1 | Lines per mouse wheel scroll |

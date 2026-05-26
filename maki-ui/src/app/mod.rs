@@ -36,6 +36,7 @@ use crate::components::model_picker::{ModelPicker, ModelPickerAction};
 use crate::components::permission_prompt::PermissionPrompt;
 use crate::components::plan_form::{PlanForm, PlanFormAction};
 use crate::components::rewind_picker::{RewindPicker, RewindPickerAction};
+use crate::components::scrollbar;
 use crate::components::search_modal::{SearchAction, SearchModal};
 use crate::components::session_picker::{SessionPicker, SessionPickerAction};
 use crate::components::status_bar::StatusBar;
@@ -184,6 +185,7 @@ impl App {
         permissions: Arc<PermissionManager>,
         custom_commands: Arc<[maki_agent::command::CustomCommand]>,
     ) -> Self {
+        scrollbar::set_enabled(ui_config.scrollbar);
         let state = SessionState::from_session(session, model, &storage);
         Self {
             chats: vec![Chat::new("Main".into(), ui_config)],

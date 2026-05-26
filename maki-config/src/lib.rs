@@ -199,6 +199,7 @@ pub struct ToolFileConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct UiFileConfig {
     pub splash_animation: Option<bool>,
+    pub scrollbar: Option<bool>,
     pub flash_duration_ms: Option<u64>,
     pub typewriter_ms_per_char: Option<u64>,
     pub mouse_scroll_lines: Option<u32>,
@@ -211,6 +212,7 @@ impl UiFileConfig {
             self,
             overlay,
             splash_animation,
+            scrollbar,
             flash_duration_ms,
             typewriter_ms_per_char,
             mouse_scroll_lines
@@ -420,6 +422,9 @@ pub struct UiConfig {
     #[config(default = true, desc = "Show splash animation on startup")]
     pub splash_animation: bool,
 
+    #[config(default = true, desc = "Show vertical scrollbar in scrollable areas")]
+    pub scrollbar: bool,
+
     #[config(default = DEFAULT_FLASH_DURATION_MS, desc = "Duration of flash messages (ms)")]
     pub flash_duration_ms: u64,
 
@@ -441,6 +446,7 @@ impl UiConfig {
     fn from_file(f: UiFileConfig) -> Self {
         Self {
             splash_animation: f.splash_animation.unwrap_or(true),
+            scrollbar: f.scrollbar.unwrap_or(true),
             flash_duration_ms: f.flash_duration_ms.unwrap_or(DEFAULT_FLASH_DURATION_MS),
             typewriter_ms_per_char: f
                 .typewriter_ms_per_char
