@@ -72,7 +72,8 @@ local function is_section_header(line)
 end
 
 local function render_skeleton(view, text)
-  for line in text:gmatch("([^\n]*)\n?") do
+  text = text:gsub("\n+$", "") .. "\n"
+  for line in text:gmatch("([^\n]*)\n") do
     if line == "" then
       view:append("")
     elseif is_section_header(line) then
@@ -182,7 +183,7 @@ Return a compact overview of a source file: imports, type definitions, function 
 
     local buf, header = render_index(skeleton, path, ctx)
     return {
-      llm_output = skeleton,
+      llm_output = skeleton:gsub("\n+$", ""),
       body = buf,
       header = header,
     }
