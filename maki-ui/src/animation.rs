@@ -20,6 +20,7 @@ const MAX_DURATION_MS: u64 = 1000;
 pub struct Typewriter {
     buffer: String,
     visible_len: usize,
+    visible_byte_offset: usize,
     anim_start_visible: usize,
     anim_target: usize,
     anim_start_at: Instant,
@@ -42,6 +43,7 @@ impl Typewriter {
         Self {
             buffer: String::new(),
             visible_len: 0,
+            visible_byte_offset: 0,
             anim_start_visible: 0,
             anim_target: 0,
             anim_start_at: Instant::now(),
@@ -56,7 +58,7 @@ impl Typewriter {
         self.anim_start_visible = self.visible_len;
         self.anim_target = self.buffer.chars().count();
         if self.ms_per_char == 0 {
-            self.visible_len = self.anim_target;
+            self.advance_visible(self.anim_target);
             return;
         }
         let unrevealed = self.anim_target - self.anim_start_visible;
@@ -72,16 +74,12 @@ impl Typewriter {
         let elapsed = self.anim_start_at.elapsed();
         let progress = (elapsed.as_secs_f64() / self.anim_duration.as_secs_f64()).min(1.0);
         let delta = self.anim_target - self.anim_start_visible;
-        self.visible_len = self.anim_start_visible + (delta as f64 * progress).round() as usize;
+        let new_len = self.anim_start_visible + (delta as f64 * progress).round() as usize;
+        self.advance_visible(new_len);
     }
 
     pub fn visible(&self) -> &str {
-        let byte_offset = self
-            .buffer
-            .char_indices()
-            .nth(self.visible_len)
-            .map_or(self.buffer.len(), |(i, _)| i);
-        &self.buffer[..byte_offset]
+        &self.buffer[..self.visible_byte_offset]
     }
 
     pub fn is_animating(&self) -> bool {
@@ -94,15 +92,11 @@ impl Typewriter {
 
     pub fn clear(&mut self) {
         self.buffer.clear();
-        self.visible_len = 0;
-        self.anim_start_visible = 0;
-        self.anim_target = 0;
+        self.reset_anim();
     }
 
     pub fn take_all(&mut self) -> String {
-        self.visible_len = 0;
-        self.anim_start_visible = 0;
-        self.anim_target = 0;
+        self.reset_anim();
         mem::take(&mut self.buffer)
     }
 
@@ -111,9 +105,28 @@ impl Typewriter {
         self.buffer = text.into();
         let len = self.buffer.chars().count();
         self.visible_len = len;
+        self.visible_byte_offset = self.buffer.len();
         self.anim_start_visible = len;
         self.anim_target = len;
         self.anim_duration = Duration::ZERO;
+    }
+
+    fn reset_anim(&mut self) {
+        self.visible_len = 0;
+        self.visible_byte_offset = 0;
+        self.anim_start_visible = 0;
+        self.anim_target = 0;
+    }
+
+    fn advance_visible(&mut self, new_len: usize) {
+        let skip = new_len - self.visible_len;
+        if skip > 0 {
+            self.visible_byte_offset = self.buffer[self.visible_byte_offset..]
+                .char_indices()
+                .nth(skip)
+                .map_or(self.buffer.len(), |(i, _)| self.visible_byte_offset + i);
+        }
+        self.visible_len = new_len;
     }
 }
 
@@ -146,56 +159,90 @@ mod tests {
     }
 
     #[test]
-    fn typewriter_push_does_not_reveal_immediately() {
+    fn push_animates_and_empty_push_is_noop() {
         let mut tw = Typewriter::new();
+        tw.push("");
+        assert!(!tw.is_animating());
+        assert!(tw.is_empty());
+
         tw.push("hello world, this is a longer string");
         assert_eq!(tw.visible(), "");
         assert!(tw.is_animating());
     }
 
     #[test]
-    fn typewriter_empty_push_is_noop() {
-        let mut tw = Typewriter::new();
-        tw.push("");
-        assert!(!tw.is_animating());
-        assert!(tw.is_empty());
-    }
-
-    #[test]
-    fn typewriter_multibyte_visible() {
+    fn set_buffer_makes_everything_visible() {
         let mut tw = Typewriter::new();
         tw.set_buffer("héllo 🌍");
         assert_eq!(tw.visible(), "héllo 🌍");
+        assert!(!tw.is_animating());
     }
 
     #[test]
-    fn typewriter_extend_preserves_visible() {
+    fn extend_preserves_visible_and_animates_new() {
         let mut tw = Typewriter::new();
         tw.set_buffer("ab");
-        tw.push("cd");
+        tw.push("cdefghijklmnop");
         assert_eq!(tw.visible(), "ab");
         assert!(tw.is_animating());
     }
 
     #[test]
-    fn typewriter_take_all_resets() {
-        let mut tw = Typewriter::new();
-        tw.set_buffer("data");
-        let taken = tw.take_all();
-        assert_eq!(taken, "data");
-        assert!(tw.is_empty());
+    fn zero_speed_sequential_pushes_multibyte() {
+        let mut tw = Typewriter::with_speed(0);
+        tw.push("a");
+        tw.push("é");
+        tw.push("中");
+        tw.push("🦀");
+        assert_eq!(tw.visible(), "aé中🦀");
         assert!(!tw.is_animating());
-        assert_eq!(tw.visible(), "");
     }
 
     #[test]
-    fn typewriter_clear_discards_buffer() {
-        let mut tw = Typewriter::new();
-        tw.set_buffer("data");
-        tw.push("more");
+    fn clear_and_take_all_reset_byte_offset() {
+        let mut tw = Typewriter::with_speed(0);
+
+        tw.push("🔥🔥🔥");
+        assert_eq!(tw.visible(), "🔥🔥🔥");
         tw.clear();
         assert!(tw.is_empty());
-        assert!(!tw.is_animating());
+        assert_eq!(tw.visible(), "");
+
+        tw.push("日本語");
+        assert_eq!(tw.visible(), "日本語");
+        let taken = tw.take_all();
+        assert_eq!(taken, "日本語");
+        assert!(tw.is_empty());
+        assert_eq!(tw.visible(), "");
+
+        tw.push("ok");
+        assert_eq!(tw.visible(), "ok");
+    }
+
+    #[test]
+    fn set_buffer_then_push_multibyte() {
+        let mut tw = Typewriter::with_speed(0);
+        tw.set_buffer("àá");
+        tw.push("â🎉ã");
+        assert_eq!(tw.visible(), "àáâ🎉ã");
+    }
+
+    #[test]
+    fn repeated_clear_push_cycles() {
+        let mut tw = Typewriter::with_speed(0);
+        for _ in 0..3 {
+            tw.push("🎵test🎵");
+            assert_eq!(tw.visible(), "🎵test🎵");
+            tw.clear();
+            assert_eq!(tw.visible(), "");
+        }
+    }
+
+    #[test]
+    fn partial_eq_compares_full_buffer() {
+        let mut tw = Typewriter::new();
+        tw.push("hello world, this is enough text");
+        assert_eq!(tw, "hello world, this is enough text");
         assert_eq!(tw.visible(), "");
     }
 }
