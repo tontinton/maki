@@ -223,6 +223,11 @@ Commands run in ]] .. cwd .. [[ by default.
 - Output truncated beyond 2000 lines or 50KB.
 - Interactive commands (sudo, ssh prompts) fail immediately.]]
 
+maki.api.register_prompt_hint({
+  slot = "tool_usage",
+  content = "- Reserve bash for system commands (git, builds, tests). Do NOT use bash for file operations, including on files outside the working dir.",
+})
+
 maki.api.register_tool({
   name = "bash",
   description = description,

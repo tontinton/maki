@@ -137,9 +137,9 @@ pub fn run(
         }
     };
 
-    let prompt_extras = lua_handle
+    let prompt_slots = lua_handle
         .as_ref()
-        .map(|h| h.collect_prompt_extras())
+        .map(|h| h.collect_prompt_slots())
         .unwrap_or_default();
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
@@ -154,7 +154,7 @@ pub fn run(
         permissions_config,
         timeouts,
         prompt,
-        prompt_extras,
+        prompt_slots,
         excluded_tools: vec![QUESTION_TOOL_NAME],
         mcp_handle,
         initial_wd: cwd,

@@ -195,6 +195,7 @@ pub struct ToolContext {
     pub permissions: Arc<PermissionManager>,
     pub timeouts: maki_providers::Timeouts,
     pub file_tracker: Arc<FileReadTracker>,
+    pub prompt_slots: Arc<crate::prompt::ResolvedSlots>,
 }
 
 pub(crate) fn resolve_path(path: &str) -> Result<String, String> {
@@ -608,6 +609,7 @@ pub(crate) fn interpreter_ctx(
         permissions,
         timeouts: maki_providers::Timeouts::default(),
         file_tracker,
+        prompt_slots: Arc::new(crate::prompt::ResolvedSlots::default()),
     }
 }
 

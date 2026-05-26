@@ -49,9 +49,12 @@ impl Task {
     pub async fn execute(&self, ctx: &ToolContext) -> Result<ToolOutput, String> {
         let vars = template::env_vars();
         let agent_type = self.subagent_type.as_deref().unwrap_or("research");
-        let (prompt, audience) = match agent_type {
-            "research" => (crate::prompt::RESEARCH_PROMPT, ToolAudience::RESEARCH_SUB),
-            "general" => (crate::prompt::GENERAL_PROMPT, ToolAudience::GENERAL_SUB),
+        let (prompt_id, audience) = match agent_type {
+            "research" => (
+                crate::prompt::PromptId::Research,
+                ToolAudience::RESEARCH_SUB,
+            ),
+            "general" => (crate::prompt::PromptId::General, ToolAudience::GENERAL_SUB),
             other => return Err(format!("unknown subagent type: {other}")),
         };
 
@@ -85,10 +88,15 @@ impl Task {
             "subagent spawning",
         );
 
-        let mut system = vars.apply(prompt).into_owned();
         let cwd_owned = vars.apply("{cwd}").into_owned();
-        let text = smol::unblock(move || agent::load_instruction_text(&cwd_owned)).await;
-        system.push_str(&text);
+        let instructions = smol::unblock(move || agent::load_instruction_text(&cwd_owned)).await;
+        let system = vars
+            .apply(&crate::prompt::assemble(
+                prompt_id,
+                &ctx.prompt_slots,
+                &instructions,
+            ))
+            .into_owned();
         let snapshot = ToolRegistry::native().iter();
         let tool_names: Vec<String> = snapshot
             .iter()
@@ -154,6 +162,7 @@ impl Task {
                 session_id: Some(session_id),
                 timeouts: ctx.timeouts,
                 file_tracker: FileReadTracker::fresh(),
+                prompt_slots: Arc::clone(&ctx.prompt_slots),
             },
             AgentRunParams {
                 history: crate::History::new(Vec::new()),

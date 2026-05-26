@@ -138,7 +138,7 @@ impl AgentLoop {
         if self.init_cancel.is_cancelled() {
             return false;
         }
-        self.publish_btw_system(&[]);
+        self.publish_btw_system(&maki_agent::prompt::ResolvedSlots::default());
 
         let slot = self.model_slot.load();
         self.tools = self.build_tools(&slot.model);
@@ -206,17 +206,17 @@ impl AgentLoop {
 
         self.sync_shared_history_with_pending(&input);
 
-        let prompt_extras = match self.lua_handle.as_ref() {
-            Some(h) => h.collect_prompt_extras_async().await,
-            None => Vec::new(),
+        let prompt_slots = match self.lua_handle.as_ref() {
+            Some(h) => h.collect_prompt_slots_async().await,
+            None => maki_agent::prompt::ResolvedSlots::default(),
         };
         let system = agent::build_system_prompt(
             &self.vars,
             &input.mode,
             &self.instructions.text,
-            &prompt_extras,
+            &prompt_slots,
         );
-        self.publish_btw_system(&prompt_extras);
+        self.publish_btw_system(&prompt_slots);
         let (trigger, cancel) = CancelToken::new();
         self.set_cancel_trigger(run_id, trigger);
 
@@ -232,6 +232,7 @@ impl AgentLoop {
                 session_id: self.session_id.clone(),
                 timeouts: self.timeouts,
                 file_tracker: Arc::clone(&self.file_tracker),
+                prompt_slots: Arc::new(prompt_slots),
             },
             AgentRunParams {
                 history: mem::replace(&mut self.history, History::new(Vec::new())),
@@ -281,12 +282,12 @@ impl AgentLoop {
 
     /// Always pins `Build` mode: btw runs no tools, so Plan-mode constraints would only confuse
     /// the model. Everything else matches the live prompt.
-    fn publish_btw_system(&self, prompt_extras: &[String]) {
+    fn publish_btw_system(&self, prompt_slots: &maki_agent::prompt::ResolvedSlots) {
         let system = agent::build_system_prompt(
             &self.vars,
             &maki_agent::AgentMode::Build,
             &self.instructions.text,
-            prompt_extras,
+            prompt_slots,
         );
         self.btw_system.store(Arc::new(system));
     }

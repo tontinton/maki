@@ -7,6 +7,7 @@ use tracing::error;
 
 use crate::agent::{self, History};
 use crate::permissions::PermissionManager;
+use crate::prompt::ResolvedSlots;
 use crate::template;
 use crate::tools::{DescriptionContext, FileReadTracker, ToolFilter, ToolRegistry};
 use crate::{
@@ -23,7 +24,7 @@ pub struct HeadlessParams {
     pub permissions_config: PermissionsConfig,
     pub timeouts: Timeouts,
     pub prompt: String,
-    pub prompt_extras: Vec<String>,
+    pub prompt_slots: ResolvedSlots,
     pub excluded_tools: Vec<&'static str>,
     pub mcp_handle: Option<McpHandle>,
     pub initial_wd: PathBuf,
@@ -48,8 +49,7 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
     let tools =
         ToolRegistry::native().definitions(&vars, &ctx, params.model.supports_tool_examples());
 
-    let system =
-        agent::build_system_prompt(&vars, &mode, &instructions.text, &params.prompt_extras);
+    let system = agent::build_system_prompt(&vars, &mode, &instructions.text, &params.prompt_slots);
 
     let tool_names = extract_tool_names(&tools);
 
@@ -88,6 +88,7 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
                     session_id: Some(session_id),
                     timeouts: params.timeouts,
                     file_tracker: FileReadTracker::fresh(),
+                    prompt_slots: Arc::new(params.prompt_slots),
                 },
                 AgentRunParams {
                     history: History::new(Vec::new()),

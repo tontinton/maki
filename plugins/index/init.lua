@@ -110,6 +110,16 @@ local function render_index(skeleton, path, ctx)
   return buf, render_header(path, line_count)
 end
 
+maki.api.register_prompt_hint({
+  slot = "tool_usage",
+  content = "- Use **index** before **read**.",
+})
+
+maki.api.register_prompt_hint({
+  slot = "efficient_tools",
+  content = "index",
+})
+
 maki.api.register_tool({
   name = "index",
   description = [[

@@ -42,6 +42,7 @@ pub struct AgentParams {
     pub session_id: Option<String>,
     pub timeouts: maki_providers::Timeouts,
     pub file_tracker: Arc<FileReadTracker>,
+    pub prompt_slots: Arc<crate::prompt::ResolvedSlots>,
 }
 
 pub struct AgentRunParams {
@@ -77,6 +78,7 @@ pub struct Agent {
     session_id: Option<String>,
     timeouts: maki_providers::Timeouts,
     file_tracker: Arc<FileReadTracker>,
+    prompt_slots: Arc<crate::prompt::ResolvedSlots>,
 }
 
 impl Agent {
@@ -107,6 +109,7 @@ impl Agent {
             opts: RequestOptions::default(),
             session_id: params.session_id,
             file_tracker: params.file_tracker,
+            prompt_slots: params.prompt_slots,
         }
     }
 
@@ -336,6 +339,7 @@ impl Agent {
             permissions: Arc::clone(&self.permissions),
             timeouts: self.timeouts,
             file_tracker: Arc::clone(&self.file_tracker),
+            prompt_slots: Arc::clone(&self.prompt_slots),
         }
     }
 
@@ -503,6 +507,7 @@ mod tests {
                 session_id: None,
                 timeouts: maki_providers::Timeouts::default(),
                 file_tracker: FileReadTracker::fresh(),
+                prompt_slots: Arc::new(crate::prompt::ResolvedSlots::default()),
             },
             AgentRunParams {
                 history,
@@ -757,6 +762,7 @@ mod tests {
                     session_id: None,
                     timeouts: maki_providers::Timeouts::default(),
                     file_tracker: FileReadTracker::fresh(),
+                    prompt_slots: Arc::new(crate::prompt::ResolvedSlots::default()),
                 },
                 AgentRunParams {
                     history: History::new(Vec::new()),

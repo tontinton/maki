@@ -11,6 +11,7 @@ use maki_config::{PluginsConfig, RawConfig};
 use crate::api::command::{LuaCommandReader, UiAction};
 use crate::error::PluginError;
 use crate::runtime::{self, ClickReply, LuaThread, Request, RestoreReply};
+use maki_agent::prompt::ResolvedSlots;
 use serde_json::Value;
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -283,15 +284,15 @@ impl EventHandle {
         });
     }
 
-    pub fn collect_prompt_extras(&self) -> Vec<String> {
+    pub fn collect_prompt_slots(&self) -> ResolvedSlots {
         let (tx, rx) = flume::bounded(1);
-        let _ = self.tx.send(Request::CollectPromptExtras { reply: tx });
+        let _ = self.tx.send(Request::CollectPromptSlots { reply: tx });
         rx.recv().unwrap_or_default()
     }
 
-    pub async fn collect_prompt_extras_async(&self) -> Vec<String> {
+    pub async fn collect_prompt_slots_async(&self) -> ResolvedSlots {
         let (tx, rx) = flume::bounded(1);
-        let _ = self.tx.send(Request::CollectPromptExtras { reply: tx });
+        let _ = self.tx.send(Request::CollectPromptSlots { reply: tx });
         rx.recv_async().await.unwrap_or_default()
     }
 
@@ -322,7 +323,26 @@ impl EventHandle {
 mod tests {
     use super::*;
     use crate::api::command::{LuaCommandInfo, LuaCommandWriter};
+    use maki_agent::prompt::{PromptId, ResolvedSlots, Slot};
     use maki_agent::tools::ToolRegistry;
+    use test_case::test_case;
+
+    /// Load `src` as a single plugin and collect the resolved slots. Panics on
+    /// load failure; reach for `load_err` when you want to inspect the error.
+    fn slots_from(plugin: &str, src: &str) -> (PluginHost, ResolvedSlots) {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(plugin, src).unwrap();
+        let slots = host.event_handle().unwrap().collect_prompt_slots();
+        (host, slots)
+    }
+
+    fn contents(slots: &ResolvedSlots, prompt: PromptId, slot: Slot) -> Vec<&str> {
+        slots
+            .get(prompt, slot)
+            .iter()
+            .map(|e| e.content.as_str())
+            .collect()
+    }
 
     #[test]
     fn command_writer_reader_pair_works() {
@@ -431,117 +451,179 @@ mod tests {
     }
 
     #[test]
-    fn prompt_extra_callback_string_is_collected() {
-        let reg = Arc::new(ToolRegistry::new());
-        let host = PluginHost::new(Arc::clone(&reg)).unwrap();
-        host.load_source(
-            "test_extra",
+    fn callback_string_lands_in_targeted_prompt_only() {
+        let (_host, slots) = slots_from(
+            "cb",
             r#"
-            maki.api.register_system_prompt_extra(function()
-                return "\n\nfrom test_extra"
-            end)
+            maki.api.register_prompt_hint({
+                slot = "tool_usage",
+                prompt = "general",
+                content = function() return "from_cb" end,
+            })
             "#,
-        )
-        .unwrap();
-        let handle = host.event_handle().unwrap();
-        let extras = handle.collect_prompt_extras();
-        assert_eq!(extras.len(), 1);
-        assert_eq!(extras[0], "\n\nfrom test_extra");
+        );
+        assert_eq!(
+            contents(&slots, PromptId::General, Slot::ToolUsage),
+            ["from_cb"]
+        );
+        assert!(contents(&slots, PromptId::System, Slot::ToolUsage).is_empty());
     }
 
     #[test]
-    fn prompt_extra_non_string_returns_are_skipped() {
-        let reg = Arc::new(ToolRegistry::new());
-        let host = PluginHost::new(Arc::clone(&reg)).unwrap();
-        host.load_source(
-            "nil_extra",
+    fn callback_returning_nil_contributes_nothing() {
+        let (_host, slots) = slots_from(
+            "nil_cb",
             r#"
-            maki.api.register_system_prompt_extra(function()
-                return nil
-            end)
+            maki.api.register_prompt_hint({
+                slot = "tool_usage",
+                content = function() return nil end,
+            })
             "#,
-        )
-        .unwrap();
-        let handle = host.event_handle().unwrap();
-        assert!(handle.collect_prompt_extras().is_empty());
+        );
+        assert!(contents(&slots, PromptId::System, Slot::ToolUsage).is_empty());
+    }
+
+    /// A hint with no `prompt` is a default: it lands on every prompt that has the slot.
+    #[test]
+    fn static_no_prompt_lands_on_all_prompts_with_slot() {
+        let (_host, slots) = slots_from(
+            "static_hint",
+            r#"
+            maki.api.register_prompt_hint({
+                slot = "efficient_tools",
+                content = "index",
+            })
+            "#,
+        );
+        for &pid in PromptId::ALL {
+            assert_eq!(contents(&slots, pid, Slot::EfficientTools), ["index"]);
+        }
+    }
+
+    /// `conventions` lives on system and general but not research, so a default
+    /// hint follows the slot and skips research.
+    #[test]
+    fn default_hint_skips_prompts_lacking_the_slot() {
+        let (_host, slots) = slots_from(
+            "conv",
+            r#"
+            maki.api.register_prompt_hint({
+                slot = "conventions",
+                content = "follow conventions",
+            })
+            "#,
+        );
+        for pid in [PromptId::System, PromptId::General] {
+            assert_eq!(
+                contents(&slots, pid, Slot::Conventions),
+                ["follow conventions"]
+            );
+        }
+        assert!(contents(&slots, PromptId::Research, Slot::Conventions).is_empty());
+    }
+
+    /// Targeting a prompt that does not have the slot quietly drops the hint.
+    #[test]
+    fn explicit_prompt_without_slot_is_dropped() {
+        let (_host, slots) = slots_from(
+            "drop",
+            r#"
+            maki.api.register_prompt_hint({
+                slot = "after_instructions",
+                prompt = "research",
+                content = "never lands",
+            })
+            "#,
+        );
+        assert!(contents(&slots, PromptId::Research, Slot::AfterInstructions).is_empty());
     }
 
     #[test]
-    fn prompt_extra_multiple_plugins_ordered_by_name() {
-        let reg = Arc::new(ToolRegistry::new());
-        let host = PluginHost::new(Arc::clone(&reg)).unwrap();
-        host.load_source(
-            "zzz_plugin",
+    fn prompt_list_targets_each_listed_prompt() {
+        const CONTENT: &str = "shared";
+        let (_host, slots) = slots_from(
+            "list",
             r#"
-            maki.api.register_system_prompt_extra(function()
-                return "from_zzz"
-            end)
+            maki.api.register_prompt_hint({
+                slot = "tool_usage",
+                prompt = { "system", "research" },
+                content = "shared",
+            })
             "#,
-        )
-        .unwrap();
-        host.load_source(
-            "aaa_plugin",
-            r#"
-            maki.api.register_system_prompt_extra(function()
-                return "from_aaa"
-            end)
-            "#,
-        )
-        .unwrap();
-        let handle = host.event_handle().unwrap();
-        let extras = handle.collect_prompt_extras();
-        assert_eq!(extras.len(), 2);
-        assert_eq!(extras[0], "from_aaa", "BTreeMap should sort by plugin name");
-        assert_eq!(extras[1], "from_zzz");
+        );
+        assert_eq!(
+            contents(&slots, PromptId::System, Slot::ToolUsage),
+            [CONTENT]
+        );
+        assert_eq!(
+            contents(&slots, PromptId::Research, Slot::ToolUsage),
+            [CONTENT]
+        );
+        assert!(contents(&slots, PromptId::General, Slot::ToolUsage).is_empty());
     }
 
     #[test]
-    fn prompt_extra_unload_cleans_up_callback() {
-        let reg = Arc::new(ToolRegistry::new());
-        let host = PluginHost::new(Arc::clone(&reg)).unwrap();
-        host.load_source(
-            "temp_plugin",
-            r#"
-            maki.api.register_system_prompt_extra(function()
-                return "temporary"
-            end)
-            "#,
-        )
-        .unwrap();
-        let handle = host.event_handle().unwrap();
-        assert_eq!(handle.collect_prompt_extras().len(), 1);
-
-        host.unload("temp_plugin").unwrap();
-        assert!(handle.collect_prompt_extras().is_empty());
+    fn multiple_plugins_sorted_by_plugin_name() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        for plugin in ["zzz", "aaa"] {
+            host.load_source(
+                plugin,
+                r#"
+                maki.api.register_prompt_hint({ slot = "tool_usage", content = "from_PLUGIN" })
+                "#
+                .replace("PLUGIN", plugin)
+                .as_str(),
+            )
+            .unwrap();
+        }
+        let slots = host.event_handle().unwrap().collect_prompt_slots();
+        assert_eq!(
+            contents(&slots, PromptId::System, Slot::ToolUsage),
+            ["from_aaa", "from_zzz"],
+            "entries must be ordered by plugin name"
+        );
     }
 
+    /// One plugin can register several hints; unloading it clears all of them.
     #[test]
-    fn prompt_extra_re_register_replaces_old_callback() {
-        let reg = Arc::new(ToolRegistry::new());
-        let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    fn unload_clears_all_hints_from_plugin() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
         host.load_source(
-            "evolving",
+            "multi",
             r#"
-            maki.api.register_system_prompt_extra(function()
-                return "v1"
-            end)
+            maki.api.register_prompt_hint({ slot = "tool_usage", prompt = "system", content = "usage" })
+            maki.api.register_prompt_hint({ slot = "conventions", prompt = "system", content = "conv" })
             "#,
         )
         .unwrap();
         let handle = host.event_handle().unwrap();
-        assert_eq!(handle.collect_prompt_extras(), vec!["v1"]);
 
-        host.load_source(
-            "evolving",
-            r#"
-            maki.api.register_system_prompt_extra(function()
-                return "v2"
-            end)
-            "#,
-        )
-        .unwrap();
-        let extras = handle.collect_prompt_extras();
-        assert_eq!(extras.len(), 1, "should have exactly one, not two");
-        assert_eq!(extras[0], "v2");
+        let slots = handle.collect_prompt_slots();
+        assert_eq!(
+            contents(&slots, PromptId::System, Slot::ToolUsage),
+            ["usage"]
+        );
+        assert_eq!(
+            contents(&slots, PromptId::System, Slot::Conventions),
+            ["conv"]
+        );
+
+        host.unload("multi").unwrap();
+        let slots = handle.collect_prompt_slots();
+        assert!(contents(&slots, PromptId::System, Slot::ToolUsage).is_empty());
+        assert!(contents(&slots, PromptId::System, Slot::Conventions).is_empty());
+    }
+
+    #[test_case(r#"{ slot = "nonexistent", content = "x" }"# ; "invalid_slot")]
+    #[test_case(r#"{ slot = "tool_usage", content = "x", prompt = "nope" }"# ; "invalid_prompt")]
+    #[test_case(r#"{ slot = "tool_usage", content = "x", prompt = { "system", "bogus" } }"# ; "invalid_prompt_in_list")]
+    #[test_case(r#"{ slot = "tool_usage" }"# ; "missing_content")]
+    #[test_case(r#"{ content = "x" }"# ; "missing_slot")]
+    #[test_case(r#"{ slot = "tool_usage", content = 42 }"# ; "content_wrong_type")]
+    #[test_case(r#"{ slot = "tool_usage", content = "x", prompt = 42 }"# ; "prompt_wrong_type")]
+    fn invalid_hint_spec_is_rejected(spec: &str) {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let src = format!("maki.api.register_prompt_hint({spec})");
+        assert!(host.load_source("bad", &src).is_err());
     }
 }

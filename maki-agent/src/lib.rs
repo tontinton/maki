@@ -18,7 +18,7 @@ pub use maki_config::{AgentConfig, PermissionsConfig, ToolOutputLines};
 pub mod command;
 pub mod diff;
 pub mod permissions;
-pub(crate) mod prompt;
+pub mod prompt;
 pub mod template;
 pub mod tools;
 pub use tools::ToolFilter;

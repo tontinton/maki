@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use flume::Sender;
+use maki_agent::prompt::{PromptId, Slot};
 use maki_agent::tools::Tool;
 use maki_agent::tools::schema::{ParamSchema, to_json_schema, try_from_json, validate};
 use maki_agent::tools::{
@@ -20,7 +21,7 @@ use crate::api::command::{
     CommandEntry, CommandHandlerMap, LuaCommandWriter, publish_command_snapshot,
 };
 use crate::api::ctx::LuaCtx;
-use crate::runtime::{LiveCtx, PromptExtraCallbacks, Request};
+use crate::runtime::{HintContent, LiveCtx, PromptHintCallbacks, PromptHintRegistration, Request};
 
 const TOOL_NAME_MAX: usize = 64;
 const TOOL_HANDLER_RETURN_ERR: &str =
@@ -296,15 +297,62 @@ pub(crate) fn create_api_table(
     {
         let plugin = Arc::clone(&plugin);
         t.set(
-            "register_system_prompt_extra",
-            lua.create_function(move |lua, callback: Function| {
-                let key = lua.create_registry_value(callback)?;
+            "register_prompt_hint",
+            lua.create_function(move |lua, spec: Table| {
+                let slot: Slot = spec
+                    .get::<String>("slot")
+                    .map_err(|_| mlua::Error::runtime("'slot' is required"))?
+                    .parse()
+                    .map_err(|_| {
+                        mlua::Error::runtime(
+                            "unknown 'slot'. Valid: tool_usage, efficient_tools, conventions, after_instructions",
+                        )
+                    })?;
+
+                let parse_prompt = |s: &str| -> mlua::Result<PromptId> {
+                    s.parse().map_err(|_| {
+                        mlua::Error::runtime("unknown 'prompt'. Valid: system, research, general")
+                    })
+                };
+                let prompts: Option<Vec<PromptId>> = match spec.get::<LuaValue>("prompt") {
+                    Ok(LuaValue::String(s)) => Some(vec![parse_prompt(&s.to_str()?)?]),
+                    Ok(LuaValue::Table(t)) => {
+                        let mut ids = Vec::new();
+                        for pair in t.sequence_values::<mlua::String>() {
+                            ids.push(parse_prompt(&pair?.to_str()?)?);
+                        }
+                        Some(ids)
+                    }
+                    Ok(LuaValue::Nil) | Err(_) => None,
+                    Ok(_) => {
+                        return Err(mlua::Error::runtime(
+                            "'prompt' must be a string or list of strings",
+                        ));
+                    }
+                };
+
+                let content = match spec
+                    .get("content")
+                    .map_err(|_| mlua::Error::runtime("'content' is required"))?
+                {
+                    LuaValue::String(s) => HintContent::Static(s.to_string_lossy()),
+                    LuaValue::Function(f) => HintContent::Callback(lua.create_registry_value(f)?),
+                    _ => {
+                        return Err(mlua::Error::runtime(
+                            "'content' must be a string or function",
+                        ));
+                    }
+                };
+
+                let reg = PromptHintRegistration {
+                    prompts,
+                    slot,
+                    content,
+                };
                 let mut map = lua
-                    .app_data_mut::<PromptExtraCallbacks>()
+                    .app_data_mut::<PromptHintCallbacks>()
                     .ok_or_else(|| mlua::Error::runtime("not initialized"))?;
-                if let Some(old) = map.insert(Arc::clone(&plugin), key) {
-                    lua.remove_registry_value(old)?;
-                }
+                map.entry(Arc::clone(&plugin)).or_default().push(reg);
                 Ok(())
             })?,
         )?;

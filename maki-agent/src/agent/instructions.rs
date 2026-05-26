@@ -52,19 +52,13 @@ pub fn build_system_prompt(
     vars: &Vars,
     mode: &AgentMode,
     instructions: &str,
-    prompt_extras: &[String],
+    slots: &crate::prompt::ResolvedSlots,
 ) -> String {
-    let mut out = crate::prompt::SYSTEM_PROMPT.to_string();
-
-    out.push_str(&vars.apply(
+    let env = vars.apply(
         "\n\nEnvironment:\n- Working directory: {cwd}\n- Platform: {platform}\n- Date: {date}",
-    ));
-
-    out.push_str(instructions);
-
-    for extra in prompt_extras {
-        out.push_str(extra);
-    }
+    );
+    let instructions = format!("{env}{instructions}");
+    let mut out = crate::prompt::assemble(crate::prompt::PromptId::System, slots, &instructions);
 
     if let AgentMode::Plan(plan_path) = mode {
         let plan_vars = Vars::new().set("{plan_path}", plan_path.display().to_string());
@@ -186,7 +180,8 @@ mod tests {
     #[test_case(&AgentMode::Plan(PathBuf::from(PLAN_PATH)), true ; "plan_includes_plan")]
     fn plan_section_presence(mode: &AgentMode, expect_plan: bool) {
         let vars = Vars::new().set("{cwd}", "/tmp").set("{platform}", "linux");
-        let prompt = build_system_prompt(&vars, mode, "", &[]);
+        let slots = crate::prompt::ResolvedSlots::default();
+        let prompt = build_system_prompt(&vars, mode, "", &slots);
         assert_eq!(prompt.contains("Plan Mode"), expect_plan);
         if expect_plan {
             assert!(prompt.contains(PLAN_PATH));
@@ -194,22 +189,31 @@ mod tests {
     }
 
     #[test]
-    fn prompt_extras_ordered_after_instructions_before_plan() {
+    fn after_instructions_slot_lands_between_instructions_and_plan() {
+        use std::sync::Arc;
+        const INSTR: &str = "Project instructions here";
+        const EXTRA: &str = "MEMORY_EXTRA";
         let vars = Vars::new().set("{cwd}", "/tmp").set("{platform}", "linux");
-        let extras = vec!["EXTRA_A".to_string(), "EXTRA_B".to_string()];
+        let mut slots = crate::prompt::ResolvedSlots::default();
+        slots.insert(
+            crate::prompt::PromptId::System,
+            crate::prompt::Slot::AfterInstructions,
+            crate::prompt::SlotEntry {
+                plugin: Arc::from("memory"),
+                content: EXTRA.into(),
+            },
+        );
         let prompt = build_system_prompt(
             &vars,
             &AgentMode::Plan(PathBuf::from("plan.md")),
-            "\nProject instructions here",
-            &extras,
+            &format!("\n{INSTR}"),
+            &slots,
         );
-        let pos_instr = prompt.find("Project instructions here").unwrap();
-        let pos_a = prompt.find("EXTRA_A").expect("EXTRA_A missing");
-        let pos_b = prompt.find("EXTRA_B").expect("EXTRA_B missing");
-        let pos_plan = prompt.find("Plan Mode").unwrap();
-        assert!(pos_instr < pos_a, "extras after instructions");
-        assert!(pos_a < pos_b, "extras preserve insertion order");
-        assert!(pos_b < pos_plan, "extras before plan section");
+        let positions = [INSTR, EXTRA, "Plan Mode"].map(|n| prompt.find(n).unwrap());
+        assert!(
+            positions.is_sorted(),
+            "expected order instructions < slot extra < plan section, got {positions:?}"
+        );
     }
 
     #[test_case("AGENTS.md",                true  ; "direct_match")]
