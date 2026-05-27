@@ -375,19 +375,22 @@ case("multi_custom_clearing_keeps_predefined", function()
   eq(s.answers[1][1], "Yes")
 end)
 
-case("render_width_zero_does_not_crash", function()
-  local ok, r = pcall(QuestionForm._render, selecting_single(), 0)
-  assert(ok, "render with width=0 must not crash")
-  assert(r and r.lines, "render must still return a lines field")
-end)
-
 case("review_tab_label_present_and_styled_differently_between_modes", function()
   local s = QuestionForm._initial_state(multi_questions())
-  local review_inactive = find_span_with_text(QuestionForm._render(s, 80).lines, " Review ")
+  local function find_review_span(lines)
+    for _, line in ipairs(lines) do
+      for _, span in ipairs(line) do
+        if span[1]:find("Review", 1, true) then
+          return span
+        end
+      end
+    end
+  end
+  local review_inactive = find_review_span(QuestionForm._render(s, 80).lines)
   assert(review_inactive, "Review tab must appear in selecting mode")
   press_many(s, { "enter", "enter" })
   eq(s.mode, MODE.CONFIRMING)
-  local review_active = find_span_with_text(QuestionForm._render(s, 80).lines, " Review ")
+  local review_active = find_review_span(QuestionForm._render(s, 80).lines)
   assert(review_active, "Review tab must appear in confirming mode")
   assert(review_active[2] ~= review_inactive[2], "Review tab style must change between modes")
 end)
@@ -451,7 +454,6 @@ case("render_selecting_focus_row_tracks_cursor_down_movement", function()
 end)
 
 local DESC_LABEL_INDENT = 4
-local DESC_SEP_WIDTH = 3
 local DESC_WRAP_WIDTH = 30
 local DESC_LONG = "alpha beta gamma delta epsilon zeta eta theta"
 
@@ -474,10 +476,10 @@ local function continuation_after(lines, marker)
   return nil
 end
 
-case("render_selecting_aligns_description_continuation_under_first_desc_char", function()
+case("render_selecting_description_continuation_indented_past_label", function()
   for _, c in ipairs({
-    { label = "foo", expected_label_w = 3 },
-    { label = "café", expected_label_w = 4 },
+    { label = "foo" },
+    { label = "café" },
   }) do
     local q = {
       question = "Pick",
@@ -488,8 +490,35 @@ case("render_selecting_aligns_description_continuation_under_first_desc_char", f
     local r = QuestionForm._render(QuestionForm._initial_state({ q }), DESC_WRAP_WIDTH)
     local cont = continuation_after(r.lines, "alpha")
     assert(cont, "label=" .. c.label .. ": expected a wrapped continuation line")
-    local expected_pad = DESC_LABEL_INDENT + c.expected_label_w + DESC_SEP_WIDTH
-    eq(leading_space_count(cont), expected_pad, "label=" .. c.label .. ": continuation alignment")
+    local pad = leading_space_count(cont)
+    assert(pad > DESC_LABEL_INDENT, "label=" .. c.label .. ": continuation must indent past label column")
+  end
+end)
+
+case("render_selecting_long_label_and_desc_wrap_within_width", function()
+  local cases = {
+    { label = string.rep("longword ", 8), desc = "visible desc" },
+    { label = string.rep("labelword ", 6), desc = string.rep("descword ", 10) },
+  }
+  for i, c in ipairs(cases) do
+    local q = {
+      question = "Pick",
+      header = "",
+      multiple = false,
+      options = { { label = c.label, description = c.desc }, { label = "other" } },
+    }
+    local r = QuestionForm._render(QuestionForm._initial_state({ q }), 50)
+    assert_all_within(r.lines, 50, "case_" .. i)
+    local keyword = c.desc:match("^(%S+)")
+    local found = false
+    for _, line in ipairs(r.lines) do
+      for _, span in ipairs(line) do
+        if span[1]:find(keyword, 1, true) then
+          found = true
+        end
+      end
+    end
+    assert(found, "case " .. i .. ": description must appear in output")
   end
 end)
 

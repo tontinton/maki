@@ -11,6 +11,7 @@ local DESC_SEP_WIDTH = 3
 local ARROW_PREFIX = "    → "
 local ARROW_PREFIX_W = 6
 local SEPARATOR_CHAR = "─"
+local LABEL_MAX_RATIO = 0.5
 
 local MODE = {
   SELECTING = "selecting",
@@ -360,10 +361,87 @@ local function separator_row(width)
   return { { string.rep(SEPARATOR_CHAR, n), "form_separator" } }
 end
 
+local function render_option_rows(pointer, chk, chk_style, label, lbl_style, desc, usable)
+  local label_col_max = math.floor(usable * LABEL_MAX_RATIO)
+  local label_text_max = label_col_max - LABEL_INDENT
+  local rows = {}
+  local label_w = display_width(label)
+  local has_desc = desc and desc ~= ""
+
+  if has_desc and label_w > label_text_max then
+    local label_lines = wrap_spans({ { label, lbl_style } }, label_text_max)
+    local desc_max = usable - label_col_max - DESC_SEP_WIDTH
+    local desc_lines = wrap_spans({ { desc, "form_description" } }, desc_max)
+
+    local first = { { pointer, "form_arrow" }, { chk, chk_style } }
+    local first_label_w = 0
+    for _, sp in ipairs(label_lines[1]) do
+      first[#first + 1] = sp
+      first_label_w = first_label_w + display_width(sp[1])
+    end
+    local gap = label_col_max - LABEL_INDENT - first_label_w
+    if gap > 0 then
+      first[#first + 1] = { string.rep(" ", gap), "" }
+    end
+    first[#first + 1] = { DESC_SEP, "form_description" }
+    for _, sp in ipairs(desc_lines[1]) do
+      first[#first + 1] = sp
+    end
+    rows[#rows + 1] = first
+
+    local n = math.max(#label_lines, #desc_lines)
+    local indent = string.rep(" ", LABEL_INDENT)
+    for j = 2, n do
+      local row = { { indent, "" } }
+      local lw = 0
+      if label_lines[j] then
+        for _, sp in ipairs(label_lines[j]) do
+          row[#row + 1] = sp
+          lw = lw + display_width(sp[1])
+        end
+      end
+      if desc_lines[j] then
+        local col_gap = label_col_max - LABEL_INDENT - lw + DESC_SEP_WIDTH
+        if col_gap > 0 then
+          row[#row + 1] = { string.rep(" ", col_gap), "" }
+        end
+        for _, sp in ipairs(desc_lines[j]) do
+          row[#row + 1] = sp
+        end
+      end
+      rows[#rows + 1] = row
+    end
+  else
+    local first = { { pointer, "form_arrow" }, { chk, chk_style }, { label, lbl_style } }
+    if has_desc then
+      local prefix_w = LABEL_INDENT + label_w + DESC_SEP_WIDTH
+      local desc_lines = wrap_spans({ { desc, "form_description" } }, usable - prefix_w)
+      first[#first + 1] = { DESC_SEP, "form_description" }
+      for _, sp in ipairs(desc_lines[1]) do
+        first[#first + 1] = sp
+      end
+      rows[#rows + 1] = first
+      local pad = string.rep(" ", prefix_w)
+      for j = 2, #desc_lines do
+        local row = { { pad, "" } }
+        for _, sp in ipairs(desc_lines[j]) do
+          row[#row + 1] = sp
+        end
+        rows[#rows + 1] = row
+      end
+    else
+      rows[#rows + 1] = first
+    end
+  end
+
+  return rows
+end
+
 local function render_selecting(state, width)
   local lines = {}
   local focus_row = 1
   local reserved_top = 0
+  local usable = width - 1
   local q = state.questions[state.tab]
 
   if has_confirm(state) then
@@ -372,8 +450,8 @@ local function render_selecting(state, width)
     reserved_top = 2
   end
 
-  for _, md_line in ipairs(question_md(state, state.tab, width - 1)) do
-    append_wrapped(lines, md_line, width - 1, " ", "", " ")
+  for _, md_line in ipairs(question_md(state, state.tab, usable)) do
+    append_wrapped(lines, md_line, usable, " ", "", " ")
   end
   lines[#lines + 1] = {}
 
@@ -382,29 +460,18 @@ local function render_selecting(state, width)
     local is_cur = (i == state.cursor)
     local checked = is_selected(state, opt.label)
     local pointer = is_cur and "▸ " or "  "
-    local check = checked and "✓ " or "  "
-    local spans = {}
-    spans[#spans + 1] = { pointer, "form_arrow" }
-    spans[#spans + 1] = { check, checked and "form_check" or "" }
-    spans[#spans + 1] = { opt.label, is_cur and "form_active" or "" }
-    if opt.description and opt.description ~= "" then
-      local prefix_w = LABEL_INDENT + display_width(opt.label) + DESC_SEP_WIDTH
-      local desc_lines = wrap_spans({ { opt.description, "form_description" } }, width - prefix_w)
-      spans[#spans + 1] = { DESC_SEP, "form_description" }
-      for _, sp in ipairs(desc_lines[1]) do
-        spans[#spans + 1] = sp
-      end
-      lines[#lines + 1] = spans
-      local pad = string.rep(" ", prefix_w)
-      for j = 2, #desc_lines do
-        local row = { { pad, "" } }
-        for _, sp in ipairs(desc_lines[j]) do
-          row[#row + 1] = sp
-        end
-        lines[#lines + 1] = row
-      end
-    else
-      lines[#lines + 1] = spans
+    local chk = checked and "✓ " or "  "
+    local opt_rows = render_option_rows(
+      pointer,
+      chk,
+      checked and "form_check" or "",
+      opt.label,
+      is_cur and "form_active" or "",
+      opt.description,
+      usable
+    )
+    for _, row in ipairs(opt_rows) do
+      lines[#lines + 1] = row
     end
     if is_cur then
       focus_row = #lines
@@ -433,15 +500,19 @@ local function render_selecting(state, width)
   else
     local cptr = custom_cur and "▸ " or "  "
     local cchk = custom_checked and "✓ " or "  "
-    local row = {
-      { cptr, "form_arrow" },
-      { cchk, custom_checked and "form_check" or "" },
-      { CUSTOM_OPTION, custom_cur and "form_active" or "" },
-    }
-    if custom_checked then
-      row[#row + 1] = { DESC_SEP .. custom_text, "form_description" }
+    local custom_desc = custom_checked and custom_text or nil
+    local custom_rows = render_option_rows(
+      cptr,
+      cchk,
+      custom_checked and "form_check" or "",
+      CUSTOM_OPTION,
+      custom_cur and "form_active" or "",
+      custom_desc,
+      usable
+    )
+    for _, row in ipairs(custom_rows) do
+      lines[#lines + 1] = row
     end
-    lines[#lines + 1] = row
 
     if custom_cur then
       focus_row = #lines + 1
