@@ -48,11 +48,7 @@ Rust workspace, key crates in root dir:
 - maki-config: User config
 - maki-lua: Lua plugin system (API mirrored from neovim for plugin compatibility), built-in plugins in ./plugins dir
 
-Built-in lua plugins in ./plugins:
-- index: tool to return a compact skeleton of a source file using tree-sitter
-- webfetch: tool to fetch a url
-- websearch: tool to search exa.ai
-- bash: tool to run bash (experimental)
+Built-in lua plugins in ./plugins: index (return a compact skeleton of a source file using tree-sitter), bash, glob, question, skill, memory, webfetch, websearch.
 
 ## Docs
 
