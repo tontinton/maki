@@ -2476,3 +2476,75 @@ fn has_content(messages: bool, ephemeral: bool) -> bool {
     }
     app.has_content()
 }
+
+const TEST_AREA: Rect = Rect {
+    x: 0,
+    y: 0,
+    width: 80,
+    height: 40,
+};
+const SPLIT_HEIGHT: u16 = 8;
+
+fn open_split_window(app: &mut App) {
+    let buf = Arc::new(maki_agent::SharedBuf::new());
+    let config = maki_lua::FloatConfig {
+        height: maki_lua::Dimension::Abs(SPLIT_HEIGHT),
+        border: maki_lua::Border::None,
+        split: maki_lua::Split::Below,
+        ..maki_lua::FloatConfig::default()
+    };
+    let (event_tx, _event_rx) = flume::bounded::<maki_lua::WinEvent>(8);
+    let (_cmd_tx, cmd_rx) = flume::bounded::<maki_lua::WinCommand>(8);
+    app.float_mgr.open(buf, config, true, event_tx, cmd_rx);
+}
+
+#[test]
+fn push_window_reserves_bottom_and_suppresses_input() {
+    let mut app = test_app();
+    let (msg_before, _b, _s, input_before, push_before) = app.layout_geometry(TEST_AREA);
+    assert!(!push_before, "no push window open yet");
+    assert!(input_before.height > 0, "input box visible before push");
+
+    open_split_window(&mut app);
+    let (msg_after, bottom_after, _s, input_after, push_after) = app.layout_geometry(TEST_AREA);
+
+    assert!(push_after, "push window should reserve the bottom area");
+    assert_eq!(
+        bottom_after.height, SPLIT_HEIGHT,
+        "bottom area routes through bottom_split_height",
+    );
+    assert!(
+        msg_after.height < msg_before.height,
+        "chat must shrink to make room for the push window",
+    );
+    assert_eq!(
+        input_after.height, 0,
+        "input box is suppressed under a push"
+    );
+}
+
+#[test]
+fn closing_push_window_restores_input_layout() {
+    let mut app = test_app();
+    let before = app.layout_geometry(TEST_AREA);
+
+    open_split_window(&mut app);
+    app.float_mgr.close_all();
+
+    let after = app.layout_geometry(TEST_AREA);
+    assert_eq!(after, before, "closing the push window restores the layout");
+}
+
+#[test]
+fn permission_prompt_takes_bottom_precedence_over_push() {
+    let mut app = test_app();
+    open_split_window(&mut app);
+    app.permission_prompt
+        .open("perm-1".into(), "bash".into(), vec!["ls".into()], None);
+
+    let (_msg, _bottom, _status, _input, push) = app.layout_geometry(TEST_AREA);
+    assert!(
+        !push,
+        "push must yield the bottom area to an open permission prompt"
+    );
+}

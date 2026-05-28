@@ -1,6 +1,8 @@
 use mlua::{Table, UserData, UserDataMethods};
 
-use crate::api::command::{Anchor, Border, FloatConfigPatch, TitlePos, WinCommand, WinEvent};
+use crate::api::command::{
+    Anchor, Border, FloatConfigPatch, Split, TitlePos, WinCommand, WinEvent,
+};
 use crate::api::ui::{parse_footer, try_parse_dimension};
 
 pub(crate) struct WinHandle {
@@ -116,6 +118,9 @@ impl UserData for WinHandle {
             }
             if let Ok(rt) = opts.get::<usize>("reserved_top") {
                 patch.reserved_top = Some(rt);
+            }
+            if let Ok(s) = opts.get::<String>("split") {
+                patch.split = Some(Split::parse(&s));
             }
             patch.width = try_parse_dimension(&opts, "width");
             patch.height = try_parse_dimension(&opts, "height");

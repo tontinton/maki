@@ -597,8 +597,7 @@ function QuestionForm.open(questions)
     border = "rounded",
     reserved_bottom = 1,
     focus = true,
-    anchor = "SW",
-    row = -1,
+    split = "below",
   })
 
   local width = win.width

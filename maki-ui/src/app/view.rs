@@ -1,6 +1,7 @@
 use crate::components::Overlay;
 #[cfg(test)]
 use crate::components::keybindings::KeybindContext;
+use crate::components::lua_float::MIN_CHAT_AND_STATUS_ROWS;
 use crate::components::queue_panel;
 use crate::components::status_bar::{StatusBarContext, UsageStats};
 use crate::selection::{self, SelectableZone, SelectionZone};
@@ -18,6 +19,7 @@ struct ViewLayout {
     queue_area: Rect,
     todo_area: Rect,
     input_area: Rect,
+    push_active: bool,
 }
 
 impl App {
@@ -27,7 +29,7 @@ impl App {
         let in_plan = self.state.mode == Mode::Plan;
         let form_visible =
             self.permission_prompt.is_open() || (in_plan && self.plan_form.is_visible());
-        let layout = self.compute_layout(frame, form_visible);
+        let layout = self.compute_layout(frame.area(), form_visible);
         let render_chat = self.resolve_render_chat();
 
         self.render_background(frame);
@@ -40,15 +42,23 @@ impl App {
         self.apply_selection(frame, render_chat);
     }
 
-    fn compute_layout(&self, frame: &Frame, form_visible: bool) -> ViewLayout {
-        let area = frame.area();
-        let bottom_height = if form_visible {
-            let max = area.height.saturating_sub(3);
-            if self.permission_prompt.is_open() {
-                self.permission_prompt.height(area.width).min(max)
-            } else {
-                self.plan_form.height().min(max)
-            }
+    fn compute_layout(&self, area: Rect, form_visible: bool) -> ViewLayout {
+        let max_bottom = area.height.saturating_sub(MIN_CHAT_AND_STATUS_ROWS);
+        let permission_open = self.permission_prompt.is_open();
+        // The permission prompt wins the bottom area, so a push window only gets
+        // it when no prompt is open.
+        let push_height = if permission_open {
+            None
+        } else {
+            self.float_mgr.bottom_split_height(area)
+        };
+        let bottom_takeover = form_visible || push_height.is_some();
+        let bottom_height = if permission_open {
+            self.permission_prompt.height(area.width).min(max_bottom)
+        } else if let Some(h) = push_height {
+            h
+        } else if form_visible {
+            self.plan_form.height().min(max_bottom)
         } else if self.is_main_chat() {
             queue_panel::height(self.queue.panel_len())
                 + self.chats[self.active_chat].todo_panel.height()
@@ -65,13 +75,14 @@ impl App {
         ])
         .areas(area);
 
-        let queue_height = queue_panel::height(self.queue.panel_len());
-        let todo_h = if form_visible {
-            0
+        let (queue_height, todo_h, input_height) = if bottom_takeover {
+            (0, 0, 0)
         } else {
-            self.chats[self.active_chat].todo_panel.height()
+            let queue_height = queue_panel::height(self.queue.panel_len());
+            let todo_h = self.chats[self.active_chat].todo_panel.height();
+            let input_height = bottom_area.height.saturating_sub(queue_height + todo_h);
+            (queue_height, todo_h, input_height)
         };
-        let input_height = bottom_area.height.saturating_sub(queue_height + todo_h);
 
         let [queue_area, todo_area, input_area] = Layout::vertical([
             Constraint::Length(queue_height),
@@ -87,6 +98,7 @@ impl App {
             queue_area,
             todo_area,
             input_area,
+            push_active: push_height.is_some(),
         }
     }
 
@@ -116,6 +128,8 @@ impl App {
         let in_plan = self.state.mode == Mode::Plan;
         if self.permission_prompt.is_open() {
             self.permission_prompt.view(frame, layout.bottom_area);
+        } else if layout.push_active {
+            self.float_mgr.view_bottom_split(frame, layout.bottom_area);
         } else if !self.is_main_chat() {
             let todo_h = self.chats[self.active_chat].todo_panel.height();
             let (todo_area, sep_area) = if todo_h > 0 {
@@ -323,6 +337,23 @@ impl App {
             let sel = *sel;
             self.copy_selection(frame.buffer_mut(), &sel, render_chat);
         }
+    }
+
+    /// Layout geometry for tests: `(msg_area, bottom_area, status_area,
+    /// input_area, push_present)`.
+    #[cfg(test)]
+    pub(super) fn layout_geometry(&self, area: Rect) -> (Rect, Rect, Rect, Rect, bool) {
+        let in_plan = self.state.mode == Mode::Plan;
+        let form_visible =
+            self.permission_prompt.is_open() || (in_plan && self.plan_form.is_visible());
+        let layout = self.compute_layout(area, form_visible);
+        (
+            layout.msg_area,
+            layout.bottom_area,
+            layout.status_area,
+            layout.input_area,
+            layout.push_active,
+        )
     }
 
     #[cfg(test)]

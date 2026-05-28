@@ -522,6 +522,37 @@ case("render_selecting_long_label_and_desc_wrap_within_width", function()
   end
 end)
 
+case("open_requests_bottom_split", function()
+  local original_open = maki.ui.open_win
+  local original_buf = maki.ui.buf
+  local original_size = maki.ui.terminal_size
+  local captured
+  maki.ui.open_win = function(_buf, opts)
+    captured = opts
+    return {
+      width = 80,
+      set_config = function() end,
+      set_cursor = function() end,
+      recv = function()
+        return { type = "close" }
+      end,
+    }
+  end
+  maki.ui.buf = function()
+    return { set_lines = function() end }
+  end
+  maki.ui.terminal_size = function()
+    return { rows = 40, cols = 100 }
+  end
+  local ok, err = pcall(QuestionForm.open, single_question())
+  maki.ui.open_win = original_open
+  maki.ui.buf = original_buf
+  maki.ui.terminal_size = original_size
+  assert(ok, "open must not error: " .. tostring(err))
+  assert(captured, "open_win must be called")
+  eq(captured.split, "below", "form must request a bottom split")
+end)
+
 if #failures > 0 then
   error(#failures .. " case(s) failed:\n\n" .. table.concat(failures, "\n\n"))
 end

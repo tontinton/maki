@@ -145,6 +145,22 @@ impl Border {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Split {
+    #[default]
+    None,
+    Below,
+}
+
+impl Split {
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "below" => Self::Below,
+            _ => Self::None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TitlePos {
     #[default]
     Left,
@@ -177,6 +193,7 @@ pub struct FloatConfig {
     pub cursor_line: bool,
     pub reserved_bottom: usize,
     pub reserved_top: usize,
+    pub split: Split,
 }
 
 impl Default for FloatConfig {
@@ -195,6 +212,7 @@ impl Default for FloatConfig {
             cursor_line: false,
             reserved_bottom: 0,
             reserved_top: 0,
+            split: Split::None,
         }
     }
 }
@@ -222,7 +240,8 @@ impl FloatConfig {
             zindex,
             cursor_line,
             reserved_bottom,
-            reserved_top
+            reserved_top,
+            split
         );
     }
 }
@@ -242,6 +261,7 @@ pub struct FloatConfigPatch {
     pub cursor_line: Option<bool>,
     pub reserved_bottom: Option<usize>,
     pub reserved_top: Option<usize>,
+    pub split: Option<Split>,
 }
 
 pub enum WinEvent {
@@ -366,6 +386,15 @@ mod tests {
         TitlePos::parse(s)
     }
 
+    #[test_case("below" => Split::Below ; "below")]
+    #[test_case("none" => Split::None ; "none")]
+    #[test_case("" => Split::None ; "empty_defaults_none")]
+    #[test_case("Below" => Split::None ; "exact_match_is_case_sensitive")]
+    #[test_case("garbage" => Split::None ; "unknown_defaults_none")]
+    fn split_parse(s: &str) -> Split {
+        Split::parse(s)
+    }
+
     #[test]
     fn apply_patch_selective_fields() {
         let mut cfg = FloatConfig::default();
@@ -398,6 +427,19 @@ mod tests {
         cfg.apply_patch(patch);
         assert_eq!(cfg.row, None, "Some(None) clears the value");
         assert_eq!(cfg.col, Some(5), "Some(Some(5)) overwrites it");
+    }
+
+    #[test]
+    fn apply_patch_sets_split() {
+        let mut cfg = FloatConfig::default();
+        assert_eq!(cfg.split, Split::None);
+        let patch = FloatConfigPatch {
+            split: Some(Split::Below),
+            ..FloatConfigPatch::default()
+        };
+        cfg.apply_patch(patch);
+        assert_eq!(cfg.split, Split::Below);
+        assert_eq!(cfg.border, Border::Rounded, "untouched fields stay");
     }
 
     #[test]

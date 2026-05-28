@@ -6,7 +6,7 @@ mod runtime;
 
 pub use api::command::{
     Anchor, Border, Dimension, FloatConfig, FloatConfigPatch, LuaCommandInfo, LuaCommandReader,
-    TitlePos, UiAction, WinCommand, WinEvent,
+    Split, TitlePos, UiAction, WinCommand, WinEvent,
 };
 pub use error::PluginError;
 pub use loader::{EventHandle, PluginHost};

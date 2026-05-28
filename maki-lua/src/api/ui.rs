@@ -5,7 +5,7 @@ use humantime::format_duration;
 use mlua::{Lua, Result as LuaResult, Table};
 
 use crate::api::command::{
-    Anchor, Border, Dimension, FloatConfig, TitlePos, UiAction, WinCommand, WinEvent,
+    Anchor, Border, Dimension, FloatConfig, Split, TitlePos, UiAction, WinCommand, WinEvent,
 };
 use crate::api::win::WinHandle;
 use crate::runtime::with_task_bufs;
@@ -135,6 +135,7 @@ pub(crate) fn create_ui_table(
                     let anchor = parse_anchor(&opts_tbl);
                     let border = parse_border(&opts_tbl);
                     let title_pos = parse_title_pos(&opts_tbl);
+                    let split = parse_split(&opts_tbl);
 
                     let config = FloatConfig {
                         width,
@@ -150,6 +151,7 @@ pub(crate) fn create_ui_table(
                         cursor_line,
                         reserved_bottom,
                         reserved_top,
+                        split,
                     };
 
                     let (term_cols, term_rows) = crossterm::terminal::size().unwrap_or((80, 24));
@@ -208,6 +210,12 @@ pub(crate) fn parse_dimension(tbl: &Table, key: &str, default: Dimension) -> Dim
 fn parse_anchor(tbl: &Table) -> Anchor {
     tbl.get::<String>("anchor")
         .map(|s| Anchor::parse(&s))
+        .unwrap_or_default()
+}
+
+fn parse_split(tbl: &Table) -> Split {
+    tbl.get::<String>("split")
+        .map(|s| Split::parse(&s))
         .unwrap_or_default()
 }
 

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crossterm::event::KeyEvent;
 use maki_agent::{SharedBuf, SnapshotLine};
-use maki_lua::{Anchor, Border, FloatConfig, TitlePos, WinCommand, WinEvent};
+use maki_lua::{Anchor, Border, FloatConfig, Split, TitlePos, WinCommand, WinEvent};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
@@ -14,9 +14,13 @@ use crate::components::{
 };
 use crate::theme;
 
-/// Splits the lines into a top band, a bottom band, and the scrollable middle.
-/// When the window is too short to fit both bands, the bottom wins so footers
-/// like keybind hints stay on screen even if the header gets squeezed out.
+/// Rows a bottom split always leaves behind so the chat and status bar never
+/// get pushed off screen.
+pub(crate) const MIN_CHAT_AND_STATUS_ROWS: u16 = 3;
+
+/// A top band, a bottom band, and the scrollable middle. When the window is too
+/// short for both bands the bottom wins, so footers like keybind hints survive
+/// even when the header gets squeezed out.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 struct Layout {
     reserved_top: usize,
@@ -140,6 +144,35 @@ impl FloatManager {
         }
     }
 
+    fn split_window_idx(&self) -> Option<usize> {
+        self.windows
+            .iter()
+            .position(|w| w.config.split == Split::Below)
+    }
+
+    /// The one path windows take to leave the manager. Routing every removal
+    /// here is what keeps the close event, the window list, and `focused_id`
+    /// from ever drifting apart.
+    fn remove_windows(&mut self, should_remove: impl Fn(&FloatWindow) -> bool) {
+        let focus_lost = self
+            .focused_id
+            .and_then(|fid| self.windows.iter().find(|w| w.id == fid))
+            .is_some_and(&should_remove);
+
+        self.windows.retain(|w| {
+            let remove = should_remove(w);
+            if remove {
+                let _ = w.event_tx.try_send(WinEvent::Close);
+            }
+            !remove
+        });
+
+        if focus_lost {
+            self.focused_id = self.windows.last().map(|w| w.id);
+            self.focused_rect = None;
+        }
+    }
+
     pub fn open(
         &mut self,
         buf: Arc<SharedBuf>,
@@ -151,6 +184,12 @@ impl FloatManager {
         let cached_lines = buf.read_if_dirty().unwrap_or_default();
         let id = self.next_id;
         self.next_id += 1;
+
+        // Only one bottom split at a time, so evict the old one through the same
+        // removal path that guarantees it hears about its close.
+        if config.split == Split::Below {
+            self.remove_windows(|w| w.config.split == Split::Below);
+        }
 
         let win = FloatWindow {
             id,
@@ -190,28 +229,17 @@ impl FloatManager {
                     Ok(WinCommand::SetCursor(row)) => {
                         win.set_cursor(row);
                     }
-                    Ok(WinCommand::Close) => {
-                        let _ = win.event_tx.try_send(WinEvent::Close);
+                    Ok(WinCommand::Close) | Err(flume::TryRecvError::Disconnected) => {
                         closed_ids.push(win.id);
                         break;
                     }
                     Err(flume::TryRecvError::Empty) => break,
-                    Err(flume::TryRecvError::Disconnected) => {
-                        closed_ids.push(win.id);
-                        break;
-                    }
                 }
             }
         }
 
         if !closed_ids.is_empty() {
-            self.windows.retain(|w| !closed_ids.contains(&w.id));
-            if let Some(fid) = self.focused_id
-                && !self.windows.iter().any(|w| w.id == fid)
-            {
-                self.focused_id = self.windows.last().map(|w| w.id);
-                self.focused_rect = None;
-            }
+            self.remove_windows(|w| closed_ids.contains(&w.id));
         }
     }
 
@@ -245,160 +273,190 @@ impl FloatManager {
 
     pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
         let mut union = Rect::default();
-        let t = theme::current();
 
-        for win in &mut self.windows {
-            let popup = resolve_rect(&win.config, area);
+        for idx in 0..self.windows.len() {
+            if self.windows[idx].config.split != Split::None {
+                continue;
+            }
+            let popup = resolve_rect(&self.windows[idx].config, area);
             if popup.width == 0 || popup.height == 0 {
                 continue;
             }
-
-            frame.render_widget(Clear, popup);
-
-            let border_type = match win.config.border {
-                Border::None => None,
-                Border::Single => Some(BorderType::Plain),
-                Border::Double => Some(BorderType::Double),
-                Border::Rounded => Some(BorderType::Rounded),
-            };
-
-            let block = if let Some(bt) = border_type {
-                let mut b = Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(bt)
-                    .border_style(t.panel_border)
-                    .style(ratatui::style::Style::new().bg(t.background));
-
-                if !win.config.title.is_empty() {
-                    let alignment = match win.config.title_pos {
-                        TitlePos::Left => ratatui::layout::Alignment::Left,
-                        TitlePos::Center => ratatui::layout::Alignment::Center,
-                        TitlePos::Right => ratatui::layout::Alignment::Right,
-                    };
-                    b = b
-                        .title(win.config.title.as_str())
-                        .title_alignment(alignment)
-                        .title_style(t.panel_title);
-                }
-                b
-            } else {
-                Block::default().style(ratatui::style::Style::new().bg(t.background))
-            };
-
-            let inner = block.inner(popup);
-            frame.render_widget(block, popup);
-
-            let footer_h = u16::from(!win.config.footer.is_empty());
-            let content_area = if footer_h > 0 && inner.height > footer_h {
-                let footer_rect = Rect {
-                    x: inner.x,
-                    y: inner.y + inner.height - footer_h,
-                    width: inner.width,
-                    height: footer_h,
-                };
-                frame.render_widget(hint_line(&win.config.footer), footer_rect);
-                Rect {
-                    x: inner.x,
-                    y: inner.y,
-                    width: inner.width,
-                    height: inner.height - footer_h,
-                }
-            } else {
-                inner
-            };
-
-            if win.last_content != content_area {
-                let _ = win.event_tx.try_send(WinEvent::Resize {
-                    width: content_area.width,
-                    height: content_area.height,
-                });
-                win.last_content = content_area;
-            }
-
-            let layout = win.layout();
-            let reserved_top_h = layout.reserved_top as u16;
-            let reserved_bot_h = layout.reserved_bot as u16;
-            let chrome_h = reserved_top_h + reserved_bot_h;
-
-            let (pinned_top_area, scroll_area, pinned_bot_area) =
-                if chrome_h > 0 && content_area.height > chrome_h {
-                    let top_area = (layout.reserved_top > 0).then_some(Rect {
-                        x: content_area.x,
-                        y: content_area.y,
-                        width: content_area.width,
-                        height: reserved_top_h,
-                    });
-                    let sa = Rect {
-                        x: content_area.x,
-                        y: content_area.y + reserved_top_h,
-                        width: content_area.width,
-                        height: content_area.height - chrome_h,
-                    };
-                    let bot_area = (layout.reserved_bot > 0).then_some(Rect {
-                        x: content_area.x,
-                        y: sa.y + sa.height,
-                        width: content_area.width,
-                        height: reserved_bot_h,
-                    });
-                    (top_area, sa, bot_area)
-                } else {
-                    (None, content_area, None)
-                };
-
-            win.refresh_layout(scroll_area.height);
-            let top = layout.reserved_top;
-            let scrollable = layout.scrollable;
-
-            let vh = win.viewport_h as usize;
-            let end = (top + win.scroll_offset + vh).min(top + scrollable);
-            let visible = &win.cached_lines[top + win.scroll_offset..end];
-
-            let lines: Vec<Line<'_>> = visible
-                .iter()
-                .enumerate()
-                .map(|(i, sline)| {
-                    let mut line = snapshot_to_line(sline);
-                    if win.config.cursor_line && top + win.scroll_offset + i == win.cursor {
-                        line = line.style(t.cmd_selected);
-                    }
-                    line
-                })
-                .collect();
-
-            frame.render_widget(Paragraph::new(lines), scroll_area);
-
-            if let Some(pa) = pinned_top_area {
-                let pinned: Vec<Line<'_>> = win.cached_lines[..top]
-                    .iter()
-                    .map(snapshot_to_line)
-                    .collect();
-                frame.render_widget(Paragraph::new(pinned), pa);
-            }
-
-            if let Some(pa) = pinned_bot_area {
-                let pinned: Vec<Line<'_>> = win.cached_lines[top + scrollable..]
-                    .iter()
-                    .map(snapshot_to_line)
-                    .collect();
-                frame.render_widget(Paragraph::new(pinned), pa);
-            }
-
-            if scrollable as u16 > win.viewport_h {
-                render_vertical_scrollbar(
-                    frame,
-                    scroll_area,
-                    scrollable as u16,
-                    win.scroll_offset as u16,
-                );
-            }
-
-            if Some(win.id) == self.focused_id {
-                self.focused_rect = Some(popup);
-            }
+            self.render_window(frame, idx, popup);
             union = union_rect(union, popup);
         }
 
         union
+    }
+
+    /// The single source of truth for push height. The app layout asks here so
+    /// the rows it reserves and the rows we draw into can never disagree.
+    pub fn bottom_split_height(&self, area: Rect) -> Option<u16> {
+        let win = &self.windows[self.split_window_idx()?];
+        let max = area.height.saturating_sub(MIN_CHAT_AND_STATUS_ROWS);
+        Some(win.config.height.resolve(area.height).min(max))
+    }
+
+    /// Draws into the rect the layout hands us, untouched. The layout owns the
+    /// geometry; we only fill it.
+    pub fn view_bottom_split(&mut self, frame: &mut Frame, rect: Rect) {
+        let Some(idx) = self.split_window_idx() else {
+            return;
+        };
+        if rect.width == 0 || rect.height == 0 {
+            return;
+        }
+        // render_window only records focused_rect for the focused window, which
+        // keeps mouse hit-testing from ever landing on an unfocused split.
+        self.render_window(frame, idx, rect);
+    }
+
+    fn render_window(&mut self, frame: &mut Frame, idx: usize, popup: Rect) {
+        let t = theme::current();
+        let win = &mut self.windows[idx];
+
+        frame.render_widget(Clear, popup);
+
+        let border_type = match win.config.border {
+            Border::None => None,
+            Border::Single => Some(BorderType::Plain),
+            Border::Double => Some(BorderType::Double),
+            Border::Rounded => Some(BorderType::Rounded),
+        };
+
+        let block = if let Some(bt) = border_type {
+            let mut b = Block::default()
+                .borders(Borders::ALL)
+                .border_type(bt)
+                .border_style(t.panel_border)
+                .style(ratatui::style::Style::new().bg(t.background));
+
+            if !win.config.title.is_empty() {
+                let alignment = match win.config.title_pos {
+                    TitlePos::Left => ratatui::layout::Alignment::Left,
+                    TitlePos::Center => ratatui::layout::Alignment::Center,
+                    TitlePos::Right => ratatui::layout::Alignment::Right,
+                };
+                b = b
+                    .title(win.config.title.as_str())
+                    .title_alignment(alignment)
+                    .title_style(t.panel_title);
+            }
+            b
+        } else {
+            Block::default().style(ratatui::style::Style::new().bg(t.background))
+        };
+
+        let inner = block.inner(popup);
+        frame.render_widget(block, popup);
+
+        let footer_h = u16::from(!win.config.footer.is_empty());
+        let content_area = if footer_h > 0 && inner.height > footer_h {
+            let footer_rect = Rect {
+                x: inner.x,
+                y: inner.y + inner.height - footer_h,
+                width: inner.width,
+                height: footer_h,
+            };
+            frame.render_widget(hint_line(&win.config.footer), footer_rect);
+            Rect {
+                x: inner.x,
+                y: inner.y,
+                width: inner.width,
+                height: inner.height - footer_h,
+            }
+        } else {
+            inner
+        };
+
+        if win.last_content != content_area {
+            let _ = win.event_tx.try_send(WinEvent::Resize {
+                width: content_area.width,
+                height: content_area.height,
+            });
+            win.last_content = content_area;
+        }
+
+        let layout = win.layout();
+        let reserved_top_h = layout.reserved_top as u16;
+        let reserved_bot_h = layout.reserved_bot as u16;
+        let chrome_h = reserved_top_h + reserved_bot_h;
+
+        let (pinned_top_area, scroll_area, pinned_bot_area) =
+            if chrome_h > 0 && content_area.height > chrome_h {
+                let top_area = (layout.reserved_top > 0).then_some(Rect {
+                    x: content_area.x,
+                    y: content_area.y,
+                    width: content_area.width,
+                    height: reserved_top_h,
+                });
+                let sa = Rect {
+                    x: content_area.x,
+                    y: content_area.y + reserved_top_h,
+                    width: content_area.width,
+                    height: content_area.height - chrome_h,
+                };
+                let bot_area = (layout.reserved_bot > 0).then_some(Rect {
+                    x: content_area.x,
+                    y: sa.y + sa.height,
+                    width: content_area.width,
+                    height: reserved_bot_h,
+                });
+                (top_area, sa, bot_area)
+            } else {
+                (None, content_area, None)
+            };
+
+        win.refresh_layout(scroll_area.height);
+        let top = layout.reserved_top;
+        let scrollable = layout.scrollable;
+
+        let vh = win.viewport_h as usize;
+        let end = (top + win.scroll_offset + vh).min(top + scrollable);
+        let visible = &win.cached_lines[top + win.scroll_offset..end];
+
+        let lines: Vec<Line<'_>> = visible
+            .iter()
+            .enumerate()
+            .map(|(i, sline)| {
+                let mut line = snapshot_to_line(sline);
+                if win.config.cursor_line && top + win.scroll_offset + i == win.cursor {
+                    line = line.style(t.cmd_selected);
+                }
+                line
+            })
+            .collect();
+
+        frame.render_widget(Paragraph::new(lines), scroll_area);
+
+        if let Some(pa) = pinned_top_area {
+            let pinned: Vec<Line<'_>> = win.cached_lines[..top]
+                .iter()
+                .map(snapshot_to_line)
+                .collect();
+            frame.render_widget(Paragraph::new(pinned), pa);
+        }
+
+        if let Some(pa) = pinned_bot_area {
+            let pinned: Vec<Line<'_>> = win.cached_lines[top + scrollable..]
+                .iter()
+                .map(snapshot_to_line)
+                .collect();
+            frame.render_widget(Paragraph::new(pinned), pa);
+        }
+
+        if scrollable as u16 > win.viewport_h {
+            render_vertical_scrollbar(
+                frame,
+                scroll_area,
+                scrollable as u16,
+                win.scroll_offset as u16,
+            );
+        }
+
+        if Some(win.id) == self.focused_id {
+            self.focused_rect = Some(popup);
+        }
     }
 
     pub fn contains(&self, pos: ratatui::layout::Position) -> bool {
@@ -420,12 +478,7 @@ impl FloatManager {
     }
 
     pub fn close_all(&mut self) {
-        for win in &self.windows {
-            let _ = win.event_tx.try_send(WinEvent::Close);
-        }
-        self.windows.clear();
-        self.focused_id = None;
-        self.focused_rect = None;
+        self.remove_windows(|_| true);
     }
 }
 
@@ -1503,5 +1556,304 @@ mod tests {
             op(&mut win);
             assert_invariants(&win);
         }
+    }
+
+    const EXPECT_NO_SPLIT: &str = "expected no bottom split height without a Below window";
+    const EXPECT_SINGLE_SPLIT: &str = "expected exactly one Below window after re-open";
+    const EXPECT_SPLIT_DRAWN: &str = "expected the split window to receive its layout rect";
+
+    fn split_config(height: Dimension) -> FloatConfig {
+        FloatConfig {
+            height,
+            border: Border::None,
+            split: Split::Below,
+            ..FloatConfig::default()
+        }
+    }
+
+    fn render_into(
+        mgr: &mut FloatManager,
+        area: Rect,
+        f: impl FnOnce(&mut FloatManager, &mut Frame),
+    ) {
+        let backend = ratatui::backend::TestBackend::new(area.width, area.height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| f(mgr, frame)).unwrap();
+    }
+
+    #[test]
+    fn bottom_split_height_none_without_split_window() {
+        let mut mgr = FloatManager::new();
+        open_with_lines(&mut mgr, &["a"]);
+        let area = Rect::new(0, 0, 80, 40);
+        assert!(mgr.bottom_split_height(area).is_none(), "{EXPECT_NO_SPLIT}");
+    }
+
+    #[test]
+    fn bottom_split_height_resolves_and_clamps() {
+        let mut mgr = FloatManager::new();
+        let (event_tx, cmd_rx, _erx, _ctx) = make_channels();
+        mgr.open(
+            make_buf(&["a"]),
+            split_config(Dimension::Abs(10)),
+            true,
+            event_tx,
+            cmd_rx,
+        );
+        let area = Rect::new(0, 0, 80, 40);
+        assert_eq!(mgr.bottom_split_height(area), Some(10));
+
+        let area_tight = Rect::new(0, 0, 80, 8);
+        assert_eq!(
+            mgr.bottom_split_height(area_tight),
+            Some(8 - MIN_CHAT_AND_STATUS_ROWS),
+            "height clamps to area.height - MIN_CHAT_AND_STATUS_ROWS",
+        );
+    }
+
+    #[test]
+    fn view_skips_split_window() {
+        let mut mgr = FloatManager::new();
+        let (event_tx, cmd_rx, event_rx, _ctx) = make_channels();
+        mgr.open(
+            make_buf(&["hello"]),
+            split_config(Dimension::Abs(10)),
+            true,
+            event_tx,
+            cmd_rx,
+        );
+        let area = Rect::new(0, 0, 80, 40);
+        render_into(&mut mgr, area, |m, f| {
+            let u = m.view(f, area);
+            assert_eq!(u, Rect::default(), "overlay pass must not draw the split");
+        });
+        assert!(
+            !event_rx
+                .drain()
+                .any(|e| matches!(e, WinEvent::Resize { .. })),
+            "{EXPECT_SPLIT_DRAWN}: overlay pass must leave it undrawn",
+        );
+    }
+
+    #[test]
+    fn view_bottom_split_draws_into_given_rect() {
+        let mut mgr = FloatManager::new();
+        let (event_tx, cmd_rx, event_rx, _ctx) = make_channels();
+        mgr.open(
+            make_buf(&["hello"]),
+            split_config(Dimension::Abs(10)),
+            true,
+            event_tx,
+            cmd_rx,
+        );
+        let area = Rect::new(0, 0, 80, 40);
+        let rect = Rect::new(0, 30, 80, 10);
+        render_into(&mut mgr, area, |m, f| m.view_bottom_split(f, rect));
+
+        let resize = event_rx
+            .drain()
+            .find_map(|e| match e {
+                WinEvent::Resize { width, height } => Some((width, height)),
+                _ => None,
+            })
+            .expect(EXPECT_SPLIT_DRAWN);
+        assert_eq!(resize, (rect.width, rect.height), "{EXPECT_SPLIT_DRAWN}");
+        assert!(
+            mgr.contains(ratatui::layout::Position::new(rect.x + 1, rect.y + 1)),
+            "scroll/contains must target the pushed area",
+        );
+    }
+
+    #[test]
+    fn second_split_replaces_first() {
+        let mut mgr = FloatManager::new();
+        let (tx1, rx1, erx1, _ctx1) = make_channels();
+        mgr.open(
+            make_buf(&["a"]),
+            split_config(Dimension::Abs(5)),
+            true,
+            tx1,
+            rx1,
+        );
+
+        let (tx2, rx2, _erx2, _ctx2) = make_channels();
+        mgr.open(
+            make_buf(&["b"]),
+            split_config(Dimension::Abs(5)),
+            true,
+            tx2,
+            rx2,
+        );
+
+        let split_count = mgr
+            .windows
+            .iter()
+            .filter(|w| w.config.split == Split::Below)
+            .count();
+        assert_eq!(split_count, 1, "{EXPECT_SINGLE_SPLIT}");
+        assert!(
+            erx1.drain().any(|e| matches!(e, WinEvent::Close)),
+            "the replaced split must receive a Close event",
+        );
+    }
+
+    const EXPECT_UNFOCUSED_NO_RECT: &str =
+        "an unfocused split must not claim focused_rect (mouse hit-testing target)";
+    const EXPECT_FOCUS_RECOVERS: &str =
+        "removing the focused window must hand focus to a surviving window";
+
+    #[test]
+    fn unfocused_split_does_not_claim_focused_rect() {
+        let mut mgr = FloatManager::new();
+        let (event_tx, cmd_rx, _erx, _ctx) = make_channels();
+        mgr.open(
+            make_buf(&["hello"]),
+            split_config(Dimension::Abs(10)),
+            false,
+            event_tx,
+            cmd_rx,
+        );
+        let area = Rect::new(0, 0, 80, 40);
+        let rect = Rect::new(0, 30, 80, 10);
+        render_into(&mut mgr, area, |m, f| m.view_bottom_split(f, rect));
+        assert!(
+            !mgr.contains(ratatui::layout::Position::new(rect.x + 1, rect.y + 1)),
+            "{EXPECT_UNFOCUSED_NO_RECT}",
+        );
+    }
+
+    #[test]
+    fn removing_focused_window_recovers_focus_to_survivor() {
+        let mut mgr = FloatManager::new();
+        let (tx1, rx1, _erx1, _ctx1) = make_channels();
+        mgr.open(make_buf(&["a"]), FloatConfig::default(), false, tx1, rx1);
+        let survivor = mgr.windows[0].id;
+
+        let (tx2, rx2, _erx2, _ctx2) = make_channels();
+        mgr.open(
+            make_buf(&["b"]),
+            split_config(Dimension::Abs(5)),
+            true,
+            tx2,
+            rx2,
+        );
+
+        mgr.remove_windows(|w| w.config.split == Split::Below);
+        assert_eq!(mgr.focused_id, Some(survivor), "{EXPECT_FOCUS_RECOVERS}");
+    }
+
+    const EXPECT_ZERO_RECT_NOOP: &str =
+        "a zero-size rect must skip drawing: no Resize, no focused_rect";
+    const EXPECT_HAS_SPLIT: &str = "a Below window exists regardless of its resolved height";
+    const EXPECT_CLOSE_TO_SPLIT: &str = "close_all must send Close to the Below split window";
+
+    #[test_case(Rect::new(0, 30, 80, 0) ; "zero_height")]
+    #[test_case(Rect::new(0, 30, 0, 10) ; "zero_width")]
+    fn view_bottom_split_zero_size_rect_is_noop(rect: Rect) {
+        let mut mgr = FloatManager::new();
+        let (event_tx, cmd_rx, event_rx, _ctx) = make_channels();
+        mgr.open(
+            make_buf(&["hello"]),
+            split_config(Dimension::Abs(10)),
+            true,
+            event_tx,
+            cmd_rx,
+        );
+        let area = Rect::new(0, 0, 80, 40);
+        render_into(&mut mgr, area, |m, f| m.view_bottom_split(f, rect));
+
+        assert!(
+            !event_rx
+                .drain()
+                .any(|e| matches!(e, WinEvent::Resize { .. })),
+            "{EXPECT_ZERO_RECT_NOOP}",
+        );
+        assert!(
+            !mgr.contains(ratatui::layout::Position::new(rect.x, rect.y)),
+            "{EXPECT_ZERO_RECT_NOOP}",
+        );
+    }
+
+    #[test]
+    fn view_overlays_float_and_skips_coexisting_split() {
+        let mut mgr = FloatManager::new();
+        let (ftx, frx, ferx, _fctx) = make_channels();
+        mgr.open(
+            make_buf(&["float"]),
+            FloatConfig {
+                width: Dimension::Abs(20),
+                height: Dimension::Abs(10),
+                ..FloatConfig::default()
+            },
+            true,
+            ftx,
+            frx,
+        );
+
+        let (stx, srx, serx, _sctx) = make_channels();
+        mgr.open(
+            make_buf(&["split"]),
+            split_config(Dimension::Abs(10)),
+            false,
+            stx,
+            srx,
+        );
+
+        let area = Rect::new(0, 0, 80, 40);
+        render_into(&mut mgr, area, |m, f| {
+            let u = m.view(f, area);
+            assert_ne!(u, Rect::default(), "overlay pass must draw the float");
+        });
+
+        assert!(
+            ferx.drain().any(|e| matches!(e, WinEvent::Resize { .. })),
+            "the float must be drawn by the overlay pass",
+        );
+        assert!(
+            !serx.drain().any(|e| matches!(e, WinEvent::Resize { .. })),
+            "{EXPECT_SPLIT_DRAWN}: overlay pass must skip the split",
+        );
+
+        let rect = Rect::new(0, 30, 80, 10);
+        render_into(&mut mgr, area, |m, f| m.view_bottom_split(f, rect));
+        assert!(
+            serx.drain().any(|e| matches!(e, WinEvent::Resize { .. })),
+            "{EXPECT_SPLIT_DRAWN}: split joins layout via view_bottom_split",
+        );
+    }
+
+    #[test]
+    fn bottom_split_height_zero_config_is_some() {
+        let mut mgr = FloatManager::new();
+        let (event_tx, cmd_rx, _erx, _ctx) = make_channels();
+        mgr.open(
+            make_buf(&["a"]),
+            split_config(Dimension::Abs(0)),
+            true,
+            event_tx,
+            cmd_rx,
+        );
+        let area = Rect::new(0, 0, 80, 40);
+        assert_eq!(mgr.bottom_split_height(area), Some(0), "{EXPECT_HAS_SPLIT}");
+    }
+
+    #[test]
+    fn close_all_notifies_split_window() {
+        let mut mgr = FloatManager::new();
+        let (event_tx, cmd_rx, event_rx, _ctx) = make_channels();
+        mgr.open(
+            make_buf(&["a"]),
+            split_config(Dimension::Abs(10)),
+            true,
+            event_tx,
+            cmd_rx,
+        );
+
+        mgr.close_all();
+        assert!(!mgr.is_open(), "{EXPECT_CLOSED}");
+        assert!(
+            event_rx.drain().any(|e| matches!(e, WinEvent::Close)),
+            "{EXPECT_CLOSE_TO_SPLIT}",
+        );
     }
 }
