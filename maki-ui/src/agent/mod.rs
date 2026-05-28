@@ -44,6 +44,7 @@ pub(crate) struct AgentHandles {
     pub(crate) agent_rx: flume::Receiver<Envelope>,
     pub(crate) answer_tx: flume::Sender<String>,
     pub(crate) history: Arc<ArcSwap<Vec<Message>>>,
+    pub(crate) btw_system: Arc<ArcSwap<String>>,
     pub(crate) tool_outputs: Arc<Mutex<HashMap<String, ToolOutput>>>,
     pub(crate) mcp_handle: Option<McpHandle>,
     pub(crate) mcp_config_errors: McpConfigErrors,
@@ -93,6 +94,7 @@ impl AgentHandles {
         app.answer_tx = Some(self.answer_tx.clone());
         app.cmd_tx = Some(self.cmd_tx.clone());
         app.shared_history = Some(Arc::clone(&self.history));
+        app.btw_system = Some(Arc::clone(&self.btw_system));
         app.shared_tool_outputs = Some(Arc::clone(&self.tool_outputs));
         app.queue.set_shared(self.queue.clone());
     }
@@ -190,6 +192,7 @@ fn spawn_agent_internal(
     let queue_rx = Arc::new(queue_rx);
     let shared_history: Arc<ArcSwap<Vec<Message>>> =
         Arc::new(ArcSwap::from_pointee(initial_history.clone()));
+    let btw_system: Arc<ArcSwap<String>> = Arc::new(ArcSwap::from_pointee(String::new()));
     let shared_tool_outputs: Arc<Mutex<HashMap<String, ToolOutput>>> =
         Arc::new(Mutex::new(HashMap::new()));
     let (init_trigger, init_cancel) = CancelToken::new();
@@ -203,6 +206,7 @@ fn spawn_agent_internal(
         tool_output_lines,
         initial_history,
         Arc::clone(&shared_history),
+        Arc::clone(&btw_system),
         mcp_handle.clone(),
         Arc::clone(permissions),
         agent_tx,
@@ -222,6 +226,7 @@ fn spawn_agent_internal(
         agent_rx,
         answer_tx,
         history: shared_history,
+        btw_system,
         tool_outputs: shared_tool_outputs,
         mcp_handle,
         mcp_config_errors,

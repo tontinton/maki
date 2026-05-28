@@ -33,6 +33,7 @@ pub(super) struct AgentLoop {
     mcp_handle: Option<McpHandle>,
     history: History,
     shared_history: Arc<ArcSwap<Vec<Message>>>,
+    btw_system: Arc<ArcSwap<String>>,
     cancel_map: Arc<Mutex<CancelMap>>,
     init_cancel: CancelToken,
     permissions: Arc<PermissionManager>,
@@ -54,6 +55,7 @@ impl AgentLoop {
         tool_output_lines: ToolOutputLines,
         initial_history: Vec<Message>,
         shared_history: Arc<ArcSwap<Vec<Message>>>,
+        btw_system: Arc<ArcSwap<String>>,
         mcp_handle: Option<McpHandle>,
         permissions: Arc<PermissionManager>,
         agent_tx: flume::Sender<Envelope>,
@@ -75,6 +77,7 @@ impl AgentLoop {
             mcp_handle,
             history: History::new(initial_history),
             shared_history,
+            btw_system,
             cancel_map,
             init_cancel,
             permissions,
@@ -135,6 +138,7 @@ impl AgentLoop {
         if self.init_cancel.is_cancelled() {
             return false;
         }
+        self.publish_btw_system(&[]);
 
         let slot = self.model_slot.load();
         self.tools = self.build_tools(&slot.model);
@@ -212,6 +216,7 @@ impl AgentLoop {
             &self.instructions.text,
             &prompt_extras,
         );
+        self.publish_btw_system(&prompt_extras);
         let (trigger, cancel) = CancelToken::new();
         self.set_cancel_trigger(run_id, trigger);
 
@@ -272,6 +277,18 @@ impl AgentLoop {
     async fn reload_instructions(&mut self) {
         let cwd = self.vars.apply("{cwd}").into_owned();
         self.instructions = smol::unblock(move || agent::load_instructions(&cwd)).await;
+    }
+
+    /// Always pins `Build` mode: btw runs no tools, so Plan-mode constraints would only confuse
+    /// the model. Everything else matches the live prompt.
+    fn publish_btw_system(&self, prompt_extras: &[String]) {
+        let system = agent::build_system_prompt(
+            &self.vars,
+            &maki_agent::AgentMode::Build,
+            &self.instructions.text,
+            prompt_extras,
+        );
+        self.btw_system.store(Arc::new(system));
     }
 
     fn sync_shared_history(&self) {

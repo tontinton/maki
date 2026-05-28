@@ -161,6 +161,7 @@ pub struct App {
 
     pub(crate) storage: StateDir,
     pub(crate) shared_history: Option<Arc<ArcSwap<Vec<Message>>>>,
+    pub(crate) btw_system: Option<Arc<ArcSwap<String>>>,
     pub(crate) shared_tool_outputs: Option<Arc<Mutex<HashMap<String, ToolOutput>>>>,
     pub(crate) image_paste_rx: Vec<flume::Receiver<Result<ImageSource, String>>>,
     storage_writer: Arc<StorageWriter>,
@@ -231,6 +232,7 @@ impl App {
             last_esc: None,
             storage,
             shared_history: None,
+            btw_system: None,
             shared_tool_outputs: None,
             image_paste_rx: vec![],
             storage_writer,
