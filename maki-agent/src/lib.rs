@@ -66,5 +66,6 @@ pub struct AgentInput {
     pub images: Vec<ImageSource>,
     pub preamble: Vec<Message>,
     pub thinking: ThinkingConfig,
+    pub fast: bool,
     pub prompt: Option<Box<McpPromptRef>>,
 }

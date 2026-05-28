@@ -14,7 +14,7 @@ use tracing::{debug, warn};
 
 use crate::model::Model;
 use crate::provider::{BoxFuture, Provider};
-use crate::{AgentError, Message, ProviderEvent, StreamResponse, ThinkingConfig};
+use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
 
 use super::shared;
 
@@ -522,7 +522,7 @@ impl Provider for Bedrock {
         system: &'a str,
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
-        thinking: ThinkingConfig,
+        opts: RequestOptions,
         _session_id: Option<&'a str>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
@@ -542,8 +542,10 @@ impl Provider for Bedrock {
                     cache_control: Some(shared::EPHEMERAL),
                 }],
                 tools,
-                thinking,
+                opts.thinking,
             );
+            // Fast mode lives only on the direct API, so Bedrock skips `opts.fast`
+            // and never sends the `speed` param.
             body["anthropic_version"] = json!(BEDROCK_API_VERSION);
             let has_examples = tools
                 .as_array()

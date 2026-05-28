@@ -13,7 +13,7 @@ use tracing::{debug, warn};
 
 use crate::model::{Model, ModelPricing, ModelTier, models_for_provider};
 use crate::provider::{BoxFuture, Provider, ProviderKind};
-use crate::{AgentError, Message, ProviderEvent, StreamResponse, ThinkingConfig};
+use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
 
 use super::ResolvedAuth;
 use super::anthropic::Anthropic;
@@ -437,6 +437,7 @@ pub fn lookup_model(slug: &str, model_id: &str) -> Option<Model> {
         pricing: script_model.pricing.clone().unwrap_or_default(),
         max_output_tokens: script_model.max_output_tokens,
         context_window: script_model.context_window,
+        fast_capable: false,
     })
 }
 
@@ -453,6 +454,7 @@ pub fn find_model_for_tier(slug: &str, tier: ModelTier) -> Option<Model> {
         pricing: script_model.pricing.clone().unwrap_or_default(),
         max_output_tokens: script_model.max_output_tokens,
         context_window: script_model.context_window,
+        fast_capable: false,
     })
 }
 
@@ -492,12 +494,11 @@ impl Provider for DynamicProvider {
         system: &'a str,
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
-        thinking: ThinkingConfig,
+        opts: RequestOptions,
         session_id: Option<&'a str>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
-        self.inner.stream_message(
-            model, messages, system, tools, event_tx, thinking, session_id,
-        )
+        self.inner
+            .stream_message(model, messages, system, tools, event_tx, opts, session_id)
     }
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<String>, AgentError>> {

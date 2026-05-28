@@ -7,7 +7,7 @@ use tracing::{debug, warn};
 
 use crate::model::Model;
 use crate::provider::{BoxFuture, Provider};
-use crate::{AgentError, Message, ProviderEvent, StreamResponse, ThinkingConfig};
+use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
 
 use super::auth;
 use crate::providers::ResolvedAuth;
@@ -142,7 +142,7 @@ impl Provider for OpenAi {
         system: &'a str,
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
-        _thinking: ThinkingConfig,
+        _opts: RequestOptions,
         _session_id: Option<&str>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {

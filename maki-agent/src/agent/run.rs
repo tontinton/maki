@@ -4,7 +4,7 @@ use serde_json::Value;
 use tracing::{error, info, warn};
 
 use maki_providers::provider::Provider;
-use maki_providers::{Message, Model, StopReason, StreamResponse, ThinkingConfig, TokenUsage};
+use maki_providers::{Message, Model, RequestOptions, StopReason, StreamResponse, TokenUsage};
 
 use super::compaction::{self, CONTINUE_AFTER_COMPACT};
 use super::history::{History, sanitize_cancelled_history};
@@ -73,7 +73,7 @@ pub struct Agent {
     tool_output_lines: ToolOutputLines,
     reauth_attempts: u32,
     permissions: Arc<PermissionManager>,
-    thinking: ThinkingConfig,
+    opts: RequestOptions,
     session_id: Option<String>,
     timeouts: maki_providers::Timeouts,
     file_tracker: Arc<FileReadTracker>,
@@ -104,7 +104,7 @@ impl Agent {
             rollback_len: 0,
             mcp: None,
             reauth_attempts: 0,
-            thinking: ThinkingConfig::Off,
+            opts: RequestOptions::default(),
             session_id: params.session_id,
             file_tracker: params.file_tracker,
         }
@@ -143,7 +143,10 @@ impl Agent {
         let msg = Message::user_with_images(input.message.clone(), input.images);
         self.history.push(msg);
         self.mode = input.mode;
-        self.thinking = input.thinking;
+        self.opts = RequestOptions {
+            thinking: input.thinking,
+            fast: input.fast,
+        };
 
         info!(
             model = %self.model.id,
@@ -188,7 +191,7 @@ impl Agent {
             &self.tools,
             &self.event_tx,
             &self.cancel,
-            self.thinking,
+            self.opts,
             self.session_id.as_deref(),
         )
         .await
@@ -401,8 +404,8 @@ mod tests {
 
     use maki_providers::provider::{BoxFuture, Provider};
     use maki_providers::{
-        ContentBlock, Message, Model, ProviderEvent, Role, StopReason, StreamResponse,
-        ThinkingConfig, TokenUsage,
+        ContentBlock, Message, Model, ProviderEvent, RequestOptions, Role, StopReason,
+        StreamResponse, TokenUsage,
     };
     use serde_json::Value;
     use test_case::test_case;
@@ -449,7 +452,7 @@ mod tests {
             _: &'a str,
             _: &'a Value,
             _: &'a flume::Sender<ProviderEvent>,
-            _: ThinkingConfig,
+            _: RequestOptions,
             _: Option<&str>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async {
@@ -721,7 +724,7 @@ mod tests {
                     _: &'a str,
                     _: &'a Value,
                     _: &'a flume::Sender<ProviderEvent>,
-                    _: ThinkingConfig,
+                    _: RequestOptions,
                     _: Option<&'a str>,
                 ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
                     Box::pin(async {

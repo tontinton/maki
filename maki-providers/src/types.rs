@@ -319,6 +319,14 @@ impl From<ThinkingConfig> for StoredThinking {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RequestOptions {
+    pub thinking: ThinkingConfig,
+    /// Just what the user asked for. The provider re-checks `supports_fast()`
+    /// before sending it, so a stale flag never bills an ineligible model.
+    pub fast: bool,
+}
+
 #[derive(Debug)]
 pub struct StreamResponse {
     pub message: Message,

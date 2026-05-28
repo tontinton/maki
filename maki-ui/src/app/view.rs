@@ -247,6 +247,7 @@ impl App {
             chat_name,
             retry_info: self.retry_info.as_ref(),
             thinking_label: self.state.thinking.status_label(),
+            fast: self.state.fast,
         };
         self.status_bar.view(frame, status_area, &ctx);
     }

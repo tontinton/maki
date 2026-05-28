@@ -78,6 +78,9 @@ const FLASH_REWIND: &str = "Press esc again to rewind...";
 const AUTH_EXPIRED_MSG: &str =
     "Token expired. Run `maki auth login` in another terminal, then press Enter to retry.";
 const FLASH_NO_PLAN: &str = "No plan file";
+const FAST_UNSUPPORTED_MSG: &str = "Fast mode requires an Anthropic Opus 4.6+ model (API only)";
+const FAST_ON_MSG: &str = "Fast mode: on";
+const FAST_OFF_MSG: &str = "Fast mode: off";
 const IMPLEMENT_MSG_PREFIX: &str = "Implement the plan";
 const IMPLEMENT_PARALLEL_HINT: &str = "Use batch+task to parallelize, assign each subagent a separate module and restrict its tests to that module to avoid interference.";
 
@@ -1079,6 +1082,22 @@ impl App {
                     }
                     Err(msg) => self.flash(msg.into()),
                 }
+                vec![]
+            }
+            "/fast" => {
+                if !self.state.model.supports_fast() {
+                    self.flash(FAST_UNSUPPORTED_MSG.into());
+                    return vec![];
+                }
+                self.state.fast = !self.state.fast;
+                self.flash(
+                    if self.state.fast {
+                        FAST_ON_MSG
+                    } else {
+                        FAST_OFF_MSG
+                    }
+                    .into(),
+                );
                 vec![]
             }
             "/exit" => self.quit(),

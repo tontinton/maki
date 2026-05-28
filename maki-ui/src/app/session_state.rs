@@ -23,6 +23,7 @@ pub(crate) struct SessionState {
     pub plan: PlanState,
     pub warnings: Vec<String>,
     pub thinking: ThinkingConfig,
+    pub fast: bool,
 }
 
 const PLAN_FILE_MISSING_WARNING: &str = "Plan file was deleted \u{2014} started a new plan";
@@ -69,6 +70,10 @@ impl SessionState {
 
         Self {
             thinking: session.meta.thinking.map(Into::into).unwrap_or_default(),
+            // The saved model may have changed or fallen back to a parse failure
+            // since, so reconcile against the live model. This keeps the flag
+            // honest for everyone who reads it (the UI badge, the agent).
+            fast: session.meta.fast && model.supports_fast(),
             session,
             model,
             token_usage,
@@ -98,6 +103,7 @@ impl SessionState {
         self.session.meta.plan_written = self.plan.is_ready();
         self.session.meta.session_rules = rules_to_stored(&permissions.session_rules_snapshot());
         self.session.meta.thinking = Some(self.thinking.into());
+        self.session.meta.fast = self.fast;
         self.session.updated_at = maki_storage::now_epoch();
         self.session.update_title_if_default();
     }
@@ -105,6 +111,9 @@ impl SessionState {
     pub fn update_model(&mut self, model: &Model) {
         if !model.provider.supports_thinking() {
             self.thinking = ThinkingConfig::Off;
+        }
+        if !model.supports_fast() {
+            self.fast = false;
         }
         self.session.model = model.spec();
         self.model = model.clone();

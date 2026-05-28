@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 
 use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier};
 use crate::provider::{BoxFuture, Provider};
-use crate::{AgentError, Message, ProviderEvent, StreamResponse, ThinkingConfig};
+use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig};
 
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use super::{KeyPool, ResolvedAuth};
@@ -33,6 +33,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: 262_144,
             context_window: 262_144,
+            fast_capable: false,
         },
         ModelEntry {
             prefixes: &["mistral-large-latest", "mistral-large-2512"],
@@ -47,6 +48,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: 262_144,
             context_window: 262_144,
+            fast_capable: false,
         },
         ModelEntry {
             prefixes: &["mistral-small-latest", "mistral-small-2603"],
@@ -61,6 +63,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: 262_144,
             context_window: 262_144,
+            fast_capable: false,
         },
     ]
 }
@@ -106,7 +109,7 @@ impl Provider for Mistral {
         system: &'a str,
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
-        thinking: ThinkingConfig,
+        opts: RequestOptions,
         session_id: Option<&'a str>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
@@ -115,7 +118,7 @@ impl Provider for Mistral {
             let system = super::with_prefix(&self.system_prefix, system, &mut buf);
             let mut body = self.compat.build_body(model, messages, system, tools);
 
-            if !matches!(thinking, ThinkingConfig::Off) {
+            if !matches!(opts.thinking, ThinkingConfig::Off) {
                 body["reasoning_effort"] = json!("high");
             }
 

@@ -88,6 +88,11 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         max_args: 1,
     },
     BuiltinCommand {
+        name: "/fast",
+        description: "Toggle Anthropic fast mode (Opus only)",
+        max_args: 0,
+    },
+    BuiltinCommand {
         name: "/exit",
         description: "Exit the application",
         max_args: 0,

@@ -126,6 +126,7 @@ impl App {
             mode: self.agent_mode(),
             images: msg.images.clone(),
             thinking: self.state.thinking,
+            fast: self.state.fast,
             ..Default::default()
         }
     }

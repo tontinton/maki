@@ -61,6 +61,8 @@ pub struct SessionMeta {
     pub subagents: Vec<StoredSubagent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking: Option<StoredThinking>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fast: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1266,6 +1268,25 @@ mod tests {
             loaded.meta.thinking,
             Some(StoredThinking::Budget { tokens: 8192 })
         );
+    }
+
+    #[test]
+    fn session_meta_fast_backward_compat() {
+        let json = r#"{"mode":"build"}"#;
+        let meta: super::SessionMeta = serde_json::from_str(json).unwrap();
+        assert!(!meta.fast);
+    }
+
+    #[test]
+    fn session_fast_persists_through_save_load() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut session: TestSession = Session::new("m", "/project");
+        session.meta.fast = true;
+        session.save_to(dir).unwrap();
+
+        let loaded = TestSession::load_from(&session.id, dir).unwrap();
+        assert!(loaded.meta.fast);
     }
 
     #[test]

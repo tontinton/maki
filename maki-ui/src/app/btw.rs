@@ -3,7 +3,7 @@ use std::sync::Arc;
 use flume::Sender;
 use futures_lite::future;
 use maki_providers::provider::Provider;
-use maki_providers::{Message, Model, ProviderEvent, ThinkingConfig};
+use maki_providers::{Message, Model, ProviderEvent, RequestOptions};
 use serde_json::Value;
 
 use crate::components::btw_modal::BtwEvent;
@@ -50,7 +50,7 @@ async fn run_btw(
         BTW_SYSTEM,
         &tools,
         &event_tx,
-        ThinkingConfig::Off,
+        RequestOptions::default(),
         session_id.as_deref(),
     );
 

@@ -11,8 +11,8 @@ use tracing::warn;
 use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier};
 use crate::provider::{BoxFuture, Provider};
 use crate::{
-    AgentError, ContentBlock, Message, ProviderEvent, Role, StopReason, StreamResponse,
-    ThinkingConfig, TokenUsage,
+    AgentError, ContentBlock, Message, ProviderEvent, RequestOptions, Role, StopReason,
+    StreamResponse, ThinkingConfig, TokenUsage,
 };
 
 use super::{KeyPool, ResolvedAuth, http_client, next_sse_line};
@@ -35,6 +35,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: 65_536,
             context_window: 1_048_576,
+            fast_capable: false,
         },
         ModelEntry {
             prefixes: &["gemini-2.5-flash"],
@@ -49,6 +50,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: 65_536,
             context_window: 1_048_576,
+            fast_capable: false,
         },
         ModelEntry {
             prefixes: &["gemini-2.0-flash-lite"],
@@ -63,6 +65,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: 65_536,
             context_window: 1_048_576,
+            fast_capable: false,
         },
     ]
 }
@@ -215,10 +218,10 @@ impl Provider for Google {
         system: &'a str,
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
-        thinking: ThinkingConfig,
+        opts: RequestOptions,
         _session_id: Option<&'a str>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
-        Box::pin(self.do_stream(model, messages, system, tools, event_tx, thinking))
+        Box::pin(self.do_stream(model, messages, system, tools, event_tx, opts.thinking))
     }
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<String>, AgentError>> {
@@ -600,6 +603,7 @@ mod tests {
             pricing: ModelPricing::default(),
             max_output_tokens: 8192,
             context_window: 1_048_576,
+            fast_capable: false,
         };
         let messages = vec![Message::user("hello".into())];
         let body = google.build_body(
@@ -629,6 +633,7 @@ mod tests {
             pricing: ModelPricing::default(),
             max_output_tokens: 8192,
             context_window: 1_048_576,
+            fast_capable: false,
         };
         let messages = vec![Message::user("think about this".into())];
         let body = google.build_body(&model, &messages, "", &json!([]), ThinkingConfig::Adaptive);
@@ -652,6 +657,7 @@ mod tests {
             pricing: ModelPricing::default(),
             max_output_tokens: 8192,
             context_window: 1_048_576,
+            fast_capable: false,
         };
         let messages = vec![Message::user("think hard".into())];
         let body = google.build_body(

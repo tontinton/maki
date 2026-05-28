@@ -1,6 +1,6 @@
 use maki_providers::provider::Provider;
 use maki_providers::retry::{MAX_TIMEOUT_RETRIES, RetryState};
-use maki_providers::{Message, Model, ProviderEvent, StreamResponse, ThinkingConfig};
+use maki_providers::{Message, Model, ProviderEvent, RequestOptions, StreamResponse};
 use serde_json::Value;
 use tracing::warn;
 
@@ -29,7 +29,7 @@ pub(crate) async fn stream_with_retry(
     tools: &Value,
     event_tx: &EventSender,
     cancel: &CancelToken,
-    thinking: ThinkingConfig,
+    opts: RequestOptions,
     session_id: Option<&str>,
 ) -> Result<StreamResponse, AgentError> {
     let mut retry = RetryState::new();
@@ -40,7 +40,7 @@ pub(crate) async fn stream_with_retry(
             async move { forward_provider_events(prx, &event_tx).await }
         });
         let result = futures_lite::future::race(
-            provider.stream_message(model, messages, system, tools, &ptx, thinking, session_id),
+            provider.stream_message(model, messages, system, tools, &ptx, opts, session_id),
             async {
                 cancel.cancelled().await;
                 Err(AgentError::Cancelled)

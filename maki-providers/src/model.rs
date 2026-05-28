@@ -97,6 +97,9 @@ pub struct ModelEntry {
     pub pricing: ModelPricing,
     pub max_output_tokens: u32,
     pub context_window: u32,
+    /// Read this through `Model::supports_fast()`, never directly: it also
+    /// checks the provider, since only the Anthropic direct API serves fast mode.
+    pub fast_capable: bool,
 }
 
 fn lookup_entry<'a>(
@@ -144,6 +147,7 @@ pub struct Model {
     pub pricing: ModelPricing,
     pub max_output_tokens: u32,
     pub context_window: u32,
+    pub fast_capable: bool,
 }
 
 impl Model {
@@ -160,18 +164,21 @@ impl Model {
             provider,
             static_entry.map(|e| e.tier),
         );
-        let (family, pricing, max_output_tokens, context_window) = match static_entry {
+        let (family, pricing, max_output_tokens, context_window, fast_capable) = match static_entry
+        {
             Some(e) => (
                 e.family,
                 e.pricing.clone(),
                 e.max_output_tokens,
                 e.context_window,
+                e.fast_capable,
             ),
             None => (
                 provider.family(),
                 ModelPricing::ZERO,
                 provider.fallback_max_output(),
                 provider.fallback_context_window(),
+                false,
             ),
         };
         Self {
@@ -184,12 +191,19 @@ impl Model {
             pricing,
             max_output_tokens,
             context_window,
+            fast_capable,
         }
     }
 
     pub fn supports_tool_examples(&self) -> bool {
         self.supports_tool_examples_override
             .unwrap_or_else(|| self.family.supports_tool_examples())
+    }
+
+    /// Bedrock reuses `ProviderKind::Anthropic` and the same model table, so we
+    /// also check the provider here: fast mode only exists on the direct API.
+    pub fn supports_fast(&self) -> bool {
+        self.fast_capable && self.provider == ProviderKind::Anthropic
     }
 
     pub fn spec(&self) -> String {
@@ -437,5 +451,34 @@ mod tests {
             (p.input, p.output, p.cache_write, p.cache_read),
             (0.0, 0.0, 0.0, 0.0)
         );
+    }
+
+    #[test_case("claude-opus-4-6" ; "opus_4_6")]
+    #[test_case("claude-opus-4-7" ; "opus_4_7")]
+    #[test_case("claude-opus-4-8" ; "opus_4_8")]
+    fn supports_fast_true_for_anthropic_opus(model_id: &str) {
+        let model = Model::from_base(ProviderKind::Anthropic, model_id, None);
+        assert!(model.supports_fast());
+    }
+
+    #[test_case("claude-sonnet-4-5" ; "sonnet")]
+    #[test_case("claude-haiku-4-5" ; "haiku")]
+    #[test_case("claude-opus-4-5" ; "opus_4_5")]
+    fn supports_fast_false_for_other_anthropic_models(model_id: &str) {
+        let model = Model::from_base(ProviderKind::Anthropic, model_id, None);
+        assert!(!model.supports_fast());
+    }
+
+    #[test]
+    fn supports_fast_false_for_unknown_anthropic_model() {
+        let model = Model::from_base(ProviderKind::Anthropic, "claude-opus-99", None);
+        assert!(!model.supports_fast());
+    }
+
+    #[test]
+    fn supports_fast_false_for_non_anthropic_even_if_fast_capable() {
+        let mut model = Model::from_base(ProviderKind::Google, "gemini-2.5-pro", None);
+        model.fast_capable = true;
+        assert!(!model.supports_fast());
     }
 }

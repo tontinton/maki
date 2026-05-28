@@ -16,17 +16,29 @@ use tracing::debug;
 
 use crate::model::Model;
 use crate::provider::{BoxFuture, Provider};
-use crate::{AgentError, Message, ProviderEvent, StreamResponse, ThinkingConfig};
+use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
 
 use super::KeyPool;
 
 const API_VERSION: &str = "2023-06-01";
 const MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
 const MODELS_URL: &str = "https://api.anthropic.com/v1/models?limit=1000";
+const FAST_MODE_BETA: &str = "fast-mode-2026-02-01";
 
 const ENV_VAR: &str = "ANTHROPIC_API_KEY";
 
 pub(crate) use shared::models;
+
+/// Returns whether the fast-mode beta header must be attached. We re-check
+/// `supports_fast()` here rather than trusting `opts.fast` alone, so a stale UI
+/// flag can never bill an ineligible model at the premium fast-mode rate.
+fn apply_fast_mode(body: &mut Value, model: &Model, opts: RequestOptions) -> bool {
+    let on = opts.fast && model.supports_fast();
+    if on {
+        body["speed"] = json!("fast");
+    }
+    on
+}
 
 fn resolve_auth_from_key(key: &str) -> super::ResolvedAuth {
     super::ResolvedAuth {
@@ -92,12 +104,16 @@ impl Anthropic {
         &self,
         body: &Value,
         event_tx: &Sender<ProviderEvent>,
+        fast: bool,
     ) -> Result<StreamResponse, AgentError> {
         let json_body = serde_json::to_vec(body)?;
-        let request = self
+        let mut builder = self
             .build_request("POST", None)
-            .header("content-type", "application/json")
-            .body(json_body)?;
+            .header("content-type", "application/json");
+        if fast {
+            builder = builder.header("anthropic-beta", FAST_MODE_BETA);
+        }
+        let request = builder.body(json_body)?;
         let response = self.client.send_async(request).await?;
         let status = response.status().as_u16();
 
@@ -147,7 +163,7 @@ impl Provider for Anthropic {
         system: &'a str,
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
-        thinking: ThinkingConfig,
+        opts: RequestOptions,
         _session_id: Option<&str>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
@@ -177,13 +193,14 @@ impl Provider for Anthropic {
                 messages,
                 &system_blocks,
                 tools,
-                thinking,
+                opts.thinking,
             );
             body["model"] = json!(model.id);
             body["stream"] = json!(true);
+            let fast = apply_fast_mode(&mut body, model, opts);
 
-            debug!(model = %model.id, num_messages = messages.len(), ?thinking, "sending API request");
-            self.do_stream_request(&body, event_tx).await
+            debug!(model = %model.id, num_messages = messages.len(), thinking = ?opts.thinking, fast, "sending API request");
+            self.do_stream_request(&body, event_tx, fast).await
         })
     }
 
@@ -415,6 +432,48 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
             json[2]["content"][1]["cache_control"],
             json!({"type": "ephemeral"})
         );
+    }
+
+    #[test]
+    fn apply_fast_mode_sets_speed_on_capable_model() {
+        let model = Model::from_spec("anthropic/claude-opus-4-8").unwrap();
+        let mut body = json!({});
+        let header = apply_fast_mode(
+            &mut body,
+            &model,
+            RequestOptions {
+                fast: true,
+                ..Default::default()
+            },
+        );
+        assert!(header);
+        assert_eq!(body["speed"], json!("fast"));
+    }
+
+    #[test]
+    fn apply_fast_mode_ignores_stale_flag_on_ineligible_model() {
+        // Sonnet is not fast-capable, so opts.fast=true must still skip `speed`.
+        let model = Model::from_spec("anthropic/claude-sonnet-4-5").unwrap();
+        let mut body = json!({});
+        let header = apply_fast_mode(
+            &mut body,
+            &model,
+            RequestOptions {
+                fast: true,
+                ..Default::default()
+            },
+        );
+        assert!(!header);
+        assert!(body.get("speed").is_none());
+    }
+
+    #[test]
+    fn apply_fast_mode_off_when_not_requested() {
+        let model = Model::from_spec("anthropic/claude-opus-4-8").unwrap();
+        let mut body = json!({});
+        let header = apply_fast_mode(&mut body, &model, RequestOptions::default());
+        assert!(!header);
+        assert!(body.get("speed").is_none());
     }
 
     #[test]

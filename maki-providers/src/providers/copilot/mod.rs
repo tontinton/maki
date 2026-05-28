@@ -13,7 +13,7 @@ use super::openai::responses;
 use super::openai_compat;
 use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier};
 use crate::provider::{BoxFuture, Provider};
-use crate::{AgentError, Message, ProviderEvent, StreamResponse, ThinkingConfig};
+use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig};
 
 pub mod auth;
 
@@ -36,6 +36,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             pricing: ModelPricing::ZERO,
             max_output_tokens: 100_000,
             context_window: 200_000,
+            fast_capable: false,
         },
         ModelEntry {
             prefixes: &["gpt-5.2", "gpt-4.1", "claude-sonnet-4.5"],
@@ -45,6 +46,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             pricing: ModelPricing::ZERO,
             max_output_tokens: 100_000,
             context_window: 200_000,
+            fast_capable: false,
         },
         ModelEntry {
             prefixes: &[
@@ -59,6 +61,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             pricing: ModelPricing::ZERO,
             max_output_tokens: 100_000,
             context_window: 200_000,
+            fast_capable: false,
         },
     ]
 }
@@ -515,7 +518,7 @@ impl Provider for Copilot {
         system: &'a str,
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
-        thinking: ThinkingConfig,
+        opts: RequestOptions,
         _session_id: Option<&'a str>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
@@ -533,7 +536,7 @@ impl Provider for Copilot {
                         .await
                 }
                 Endpoint::Messages => {
-                    self.stream_messages(model, messages, system, tools, event_tx, thinking)
+                    self.stream_messages(model, messages, system, tools, event_tx, opts.thinking)
                         .await
                 }
             }

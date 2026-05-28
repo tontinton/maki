@@ -7,7 +7,7 @@ use tracing::warn;
 use crate::model::Model;
 use crate::model::{ModelEntry, ModelFamily, ModelPricing, ModelTier};
 use crate::provider::{BoxFuture, Provider};
-use crate::{AgentError, Message, ProviderEvent, StreamResponse, ThinkingConfig};
+use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
 
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use super::{KeyPool, ResolvedAuth};
@@ -43,6 +43,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: 131072,
             context_window: 200_000,
+            fast_capable: false,
         },
         ModelEntry {
             prefixes: &["glm-5"],
@@ -57,6 +58,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: 131072,
             context_window: 200_000,
+            fast_capable: false,
         },
         ModelEntry {
             prefixes: &["glm-4.7-flash"],
@@ -71,6 +73,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: 131072,
             context_window: 200_000,
+            fast_capable: false,
         },
         ModelEntry {
             prefixes: &["glm-4.7", "glm-4.6"],
@@ -85,6 +88,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: 131072,
             context_window: 200_000,
+            fast_capable: false,
         },
         ModelEntry {
             prefixes: &["glm-4.5-flash"],
@@ -99,6 +103,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: 98304,
             context_window: 131_072,
+            fast_capable: false,
         },
         ModelEntry {
             prefixes: &["glm-4.5-air"],
@@ -113,6 +118,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: 98304,
             context_window: 131_072,
+            fast_capable: false,
         },
         ModelEntry {
             prefixes: &["glm-4.5"],
@@ -127,6 +133,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: 98304,
             context_window: 131_072,
+            fast_capable: false,
         },
     ]
 }
@@ -190,7 +197,7 @@ impl Provider for Zai {
         system: &'a str,
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
-        _thinking: ThinkingConfig,
+        _opts: RequestOptions,
         _session_id: Option<&str>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {

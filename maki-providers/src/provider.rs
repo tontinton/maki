@@ -20,7 +20,7 @@ use crate::providers::ollama::Ollama;
 use crate::providers::openai::OpenAi;
 use crate::providers::synthetic::Synthetic;
 use crate::providers::zai::{Zai, ZaiPlan};
-use crate::{AgentError, Message, ProviderEvent, StreamResponse, ThinkingConfig};
+use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Display, EnumString, EnumIter)]
 #[strum(serialize_all = "kebab-case")]
@@ -208,7 +208,7 @@ pub trait Provider: Send + Sync {
         system: &'a str,
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
-        thinking: ThinkingConfig,
+        opts: RequestOptions,
         session_id: Option<&'a str>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>>;
 
