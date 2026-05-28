@@ -1,6 +1,6 @@
 use mlua::{Lua, LuaSerdeExt, Result as LuaResult, Table, Value};
 
-use super::err_pair;
+use super::{err_pair, json_to_lua};
 
 pub(crate) fn create_json_table(lua: &Lua) -> LuaResult<Table> {
     let json = lua.create_table()?;
@@ -23,7 +23,7 @@ pub(crate) fn create_json_table(lua: &Lua) -> LuaResult<Table> {
         "decode",
         lua.create_function(|lua, s: String| {
             match serde_json::from_str::<serde_json::Value>(&s) {
-                Ok(v) => Ok((lua.to_value(&v)?, Value::Nil)),
+                Ok(v) => Ok((json_to_lua(lua, &v)?, Value::Nil)),
                 Err(e) => err_pair(lua, e),
             }
         })?,

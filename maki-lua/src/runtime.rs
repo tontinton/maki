@@ -15,7 +15,7 @@ use maki_agent::tools::{
     HeaderResult, PermissionScopes, RegistryError, Tool, ToolRegistry, ToolSource,
 };
 use maki_agent::{BufferSnapshot, SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle};
-use mlua::{Function, Lua, LuaSerdeExt, RegistryKey, Value as LuaValue, VmState};
+use mlua::{Function, Lua, RegistryKey, Value as LuaValue, VmState};
 use serde_json::Value;
 
 use maki_config::RawConfig;
@@ -26,6 +26,7 @@ use crate::api::command::{LuaCommandReader, LuaCommandWriter, UiAction};
 use crate::api::create_maki_global;
 use crate::api::ctx::LuaCtx;
 use crate::api::fn_api::{JobEvent, JobStore};
+use crate::api::json_to_lua;
 use crate::api::setup::ConfigStore;
 use crate::api::tool::{LuaOutputFormat, LuaTool, PendingTool, PendingTools, ToolCallReply};
 use crate::error::PluginError;
@@ -885,7 +886,7 @@ impl LuaRuntime {
                 return HeaderResult::plain(tool.to_string());
             }
         };
-        let input_lua = match self.lua.to_value(&input) {
+        let input_lua = match json_to_lua(&self.lua, &input) {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(plugin, tool, error = %e, "header fn input serialization failed");
@@ -929,7 +930,7 @@ impl LuaRuntime {
             let key = tk.restore.as_ref()?;
             self.lua.registry_value::<Function>(key).ok()?
         };
-        let input_lua = self.lua.to_value(&input).ok()?;
+        let input_lua = json_to_lua(&self.lua, &input).ok()?;
         let thread = self.lua.create_thread(func).ok()?;
 
         let (dummy_tx, _) = flume::unbounded();
@@ -978,7 +979,7 @@ impl LuaRuntime {
                 return None;
             }
         };
-        let lua_input = match self.lua.to_value(&input) {
+        let lua_input = match json_to_lua(&self.lua, &input) {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(plugin, tool, error = %e, "failed to convert input for permission_scopes");
@@ -1243,7 +1244,7 @@ async fn run_tool_call(
     ctx.finish_tx = Some(finish_tx);
     let cancel = ctx.cancel.clone();
 
-    let input_lua = match lua.to_value(&input) {
+    let input_lua = match json_to_lua(&lua, &input) {
         Ok(v) => v,
         Err(e) => return ToolCallReply::err(e.to_string()),
     };

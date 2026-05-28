@@ -154,7 +154,7 @@ tree-sitter-starlark = "1.3"
 tree-sitter-swift = "0.7"
 tree-sitter-typescript = "0.23"
 tree-sitter-zig = "1.1"
-monty = { git = "https://github.com/pydantic/monty.git", rev = "2e9df4b", package = "monty" }
+monty = { git = "https://github.com/pydantic/monty.git", tag = "v0.0.17", package = "monty" }
 notify = { version = "9.0.0-rc.2", default-features = false, features = ["flume", "macos_fsevent"] }
 serde_yaml = "0.9"
 shell-words = "1"

@@ -69,7 +69,7 @@ pub fn run(
     limits: ResourceLimits,
 ) -> Result<InterpreterResult, InterpreterError> {
     let mut stdout = String::new();
-    let mut print_writer = PrintWriter::Collect(&mut stdout);
+    let mut print_writer = PrintWriter::CollectString(&mut stdout);
     let output = run_inner(code, tools, resolver, limits, &mut print_writer)?;
     Ok(InterpreterResult { output, stdout })
 }
