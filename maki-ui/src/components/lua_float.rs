@@ -2,21 +2,18 @@ use std::sync::Arc;
 
 use crossterm::event::KeyEvent;
 use maki_agent::{SharedBuf, SnapshotLine};
-use maki_lua::{Anchor, Border, FloatConfig, Split, TitlePos, WinCommand, WinEvent};
+use maki_lua::{Anchor, Axis, Border, FloatConfig, Split, TitlePos, WinCommand, WinEvent};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 
+use crate::components::split_layout::SplitReq;
 use crate::components::{
     Overlay, hint_line, keybindings::key_event_to_string, scrollbar::render_vertical_scrollbar,
     tool_display::resolve_span_style,
 };
 use crate::theme;
-
-/// Rows a bottom split always leaves behind so the chat and status bar never
-/// get pushed off screen.
-pub(crate) const MIN_CHAT_AND_STATUS_ROWS: u16 = 3;
 
 /// A top band, a bottom band, and the scrollable middle. When the window is too
 /// short for both bands the bottom wins, so footers like keybind hints survive
@@ -144,10 +141,8 @@ impl FloatManager {
         }
     }
 
-    fn split_window_idx(&self) -> Option<usize> {
-        self.windows
-            .iter()
-            .position(|w| w.config.split == Split::Below)
+    fn split_window_idx(&self, dir: Split) -> Option<usize> {
+        self.windows.iter().position(|w| w.config.split == dir)
     }
 
     /// The one path windows take to leave the manager. Routing every removal
@@ -185,10 +180,11 @@ impl FloatManager {
         let id = self.next_id;
         self.next_id += 1;
 
-        // Only one bottom split at a time, so evict the old one through the same
-        // removal path that guarantees it hears about its close.
-        if config.split == Split::Below {
-            self.remove_windows(|w| w.config.split == Split::Below);
+        // One split per direction, so evicting the old same-direction window
+        // goes through the same removal path that guarantees it hears its close.
+        if config.split != Split::None {
+            let dir = config.split;
+            self.remove_windows(|w| w.config.split == dir);
         }
 
         let win = FloatWindow {
@@ -289,25 +285,33 @@ impl FloatManager {
         union
     }
 
-    /// The single source of truth for push height. The app layout asks here so
-    /// the rows it reserves and the rows we draw into can never disagree.
-    pub fn bottom_split_height(&self, area: Rect) -> Option<u16> {
-        let win = &self.windows[self.split_window_idx()?];
-        let max = area.height.saturating_sub(MIN_CHAT_AND_STATUS_ROWS);
-        Some(win.config.height.resolve(area.height).min(max))
+    /// Turns each open split's requested Dimension into a cell count. `carve`
+    /// then clamps that against the chat minimum.
+    pub fn split_reqs(&self, area: Rect) -> Vec<SplitReq> {
+        self.windows
+            .iter()
+            .filter_map(|w| {
+                let split = w.config.split;
+                let edge = split.edge()?;
+                let extent = match edge.axis {
+                    Axis::Vertical => w.config.height.resolve(area.height),
+                    Axis::Horizontal => w.config.width.resolve(area.width),
+                };
+                Some(SplitReq { split, extent })
+            })
+            .collect()
     }
 
-    /// Draws into the rect the layout hands us, untouched. The layout owns the
-    /// geometry; we only fill it.
-    pub fn view_bottom_split(&mut self, frame: &mut Frame, rect: Rect) {
-        let Some(idx) = self.split_window_idx() else {
+    /// The layout owns the geometry; we only fill the rect it carved.
+    /// render_window records focused_rect for the focused window alone, so a
+    /// mouse click never lands on an unfocused split.
+    pub fn view_split(&mut self, frame: &mut Frame, dir: Split, rect: Rect) {
+        let Some(idx) = self.split_window_idx(dir) else {
             return;
         };
         if rect.width == 0 || rect.height == 0 {
             return;
         }
-        // render_window only records focused_rect for the focused window, which
-        // keeps mouse hit-testing from ever landing on an unfocused split.
         self.render_window(frame, idx, rect);
     }
 
@@ -1558,18 +1562,33 @@ mod tests {
         }
     }
 
-    const EXPECT_NO_SPLIT: &str = "expected no bottom split height without a Below window";
-    const EXPECT_SINGLE_SPLIT: &str = "expected exactly one Below window after re-open";
+    const EXPECT_NO_REQS: &str = "expected no split reqs without a split window";
+    const EXPECT_SINGLE_SPLIT: &str = "expected exactly one same-direction window after re-open";
     const EXPECT_SPLIT_DRAWN: &str = "expected the split window to receive its layout rect";
 
-    fn split_config(height: Dimension) -> FloatConfig {
+    fn split_config(dir: Split, extent: Dimension) -> FloatConfig {
         FloatConfig {
-            height,
+            width: extent,
+            height: extent,
             border: Border::None,
-            split: Split::Below,
+            split: dir,
             ..FloatConfig::default()
         }
     }
+
+    fn open_split(mgr: &mut FloatManager, dir: Split, extent: u16, focus: bool) -> SplitChannels {
+        let (event_tx, cmd_rx, event_rx, cmd_tx) = make_channels();
+        mgr.open(
+            make_buf(&["split"]),
+            split_config(dir, Dimension::Abs(extent)),
+            focus,
+            event_tx,
+            cmd_rx,
+        );
+        (event_rx, cmd_tx)
+    }
+
+    type SplitChannels = (flume::Receiver<WinEvent>, flume::Sender<WinCommand>);
 
     fn render_into(
         mgr: &mut FloatManager,
@@ -1582,46 +1601,27 @@ mod tests {
     }
 
     #[test]
-    fn bottom_split_height_none_without_split_window() {
+    fn split_reqs_empty_without_split_window() {
         let mut mgr = FloatManager::new();
         open_with_lines(&mut mgr, &["a"]);
         let area = Rect::new(0, 0, 80, 40);
-        assert!(mgr.bottom_split_height(area).is_none(), "{EXPECT_NO_SPLIT}");
+        assert!(mgr.split_reqs(area).is_empty(), "{EXPECT_NO_REQS}");
     }
 
-    #[test]
-    fn bottom_split_height_resolves_and_clamps() {
+    #[test_case(Split::Below, 10 ; "vertical_uses_height")]
+    #[test_case(Split::Left, 30 ; "horizontal_uses_width")]
+    fn split_reqs_resolves_extent_per_axis(dir: Split, extent: u16) {
         let mut mgr = FloatManager::new();
-        let (event_tx, cmd_rx, _erx, _ctx) = make_channels();
-        mgr.open(
-            make_buf(&["a"]),
-            split_config(Dimension::Abs(10)),
-            true,
-            event_tx,
-            cmd_rx,
-        );
+        let _ = open_split(&mut mgr, dir, extent, true);
         let area = Rect::new(0, 0, 80, 40);
-        assert_eq!(mgr.bottom_split_height(area), Some(10));
-
-        let area_tight = Rect::new(0, 0, 80, 8);
-        assert_eq!(
-            mgr.bottom_split_height(area_tight),
-            Some(8 - MIN_CHAT_AND_STATUS_ROWS),
-            "height clamps to area.height - MIN_CHAT_AND_STATUS_ROWS",
-        );
+        let reqs = mgr.split_reqs(area);
+        assert_eq!(reqs, vec![SplitReq { split: dir, extent }]);
     }
 
     #[test]
     fn view_skips_split_window() {
         let mut mgr = FloatManager::new();
-        let (event_tx, cmd_rx, event_rx, _ctx) = make_channels();
-        mgr.open(
-            make_buf(&["hello"]),
-            split_config(Dimension::Abs(10)),
-            true,
-            event_tx,
-            cmd_rx,
-        );
+        let (event_rx, _ctx) = open_split(&mut mgr, Split::Below, 10, true);
         let area = Rect::new(0, 0, 80, 40);
         render_into(&mut mgr, area, |m, f| {
             let u = m.view(f, area);
@@ -1636,19 +1636,13 @@ mod tests {
     }
 
     #[test]
-    fn view_bottom_split_draws_into_given_rect() {
+    fn view_split_draws_into_given_rect() {
         let mut mgr = FloatManager::new();
-        let (event_tx, cmd_rx, event_rx, _ctx) = make_channels();
-        mgr.open(
-            make_buf(&["hello"]),
-            split_config(Dimension::Abs(10)),
-            true,
-            event_tx,
-            cmd_rx,
-        );
-        let area = Rect::new(0, 0, 80, 40);
+        let dir = Split::Below;
         let rect = Rect::new(0, 30, 80, 10);
-        render_into(&mut mgr, area, |m, f| m.view_bottom_split(f, rect));
+        let (event_rx, _ctx) = open_split(&mut mgr, dir, 10, true);
+        let area = Rect::new(0, 0, 80, 40);
+        render_into(&mut mgr, area, |m, f| m.view_split(f, dir, rect));
 
         let resize = event_rx
             .drain()
@@ -1660,41 +1654,41 @@ mod tests {
         assert_eq!(resize, (rect.width, rect.height), "{EXPECT_SPLIT_DRAWN}");
         assert!(
             mgr.contains(ratatui::layout::Position::new(rect.x + 1, rect.y + 1)),
-            "scroll/contains must target the pushed area",
+            "scroll/contains must target the carved area",
         );
     }
 
     #[test]
-    fn second_split_replaces_first() {
+    fn second_split_of_same_direction_replaces_first() {
         let mut mgr = FloatManager::new();
-        let (tx1, rx1, erx1, _ctx1) = make_channels();
-        mgr.open(
-            make_buf(&["a"]),
-            split_config(Dimension::Abs(5)),
-            true,
-            tx1,
-            rx1,
-        );
+        let dir = Split::Below;
+        let (erx1, _ctx1) = open_split(&mut mgr, dir, 5, true);
+        let _ = open_split(&mut mgr, dir, 5, true);
 
-        let (tx2, rx2, _erx2, _ctx2) = make_channels();
-        mgr.open(
-            make_buf(&["b"]),
-            split_config(Dimension::Abs(5)),
-            true,
-            tx2,
-            rx2,
-        );
-
-        let split_count = mgr
-            .windows
-            .iter()
-            .filter(|w| w.config.split == Split::Below)
-            .count();
+        let split_count = mgr.windows.iter().filter(|w| w.config.split == dir).count();
         assert_eq!(split_count, 1, "{EXPECT_SINGLE_SPLIT}");
         assert!(
             erx1.drain().any(|e| matches!(e, WinEvent::Close)),
             "the replaced split must receive a Close event",
         );
+    }
+
+    #[test]
+    fn splits_of_different_directions_coexist() {
+        let mut mgr = FloatManager::new();
+        let (erx_left, _) = open_split(&mut mgr, Split::Left, 20, true);
+        let (erx_below, _) = open_split(&mut mgr, Split::Below, 10, true);
+
+        assert!(
+            mgr.split_window_idx(Split::Left).is_some(),
+            "left split must survive opening a below split",
+        );
+        assert!(mgr.split_window_idx(Split::Below).is_some());
+        assert!(
+            !erx_left.drain().any(|e| matches!(e, WinEvent::Close)),
+            "a different-direction split must not evict the left split",
+        );
+        let _ = erx_below;
     }
 
     const EXPECT_UNFOCUSED_NO_RECT: &str =
@@ -1705,17 +1699,10 @@ mod tests {
     #[test]
     fn unfocused_split_does_not_claim_focused_rect() {
         let mut mgr = FloatManager::new();
-        let (event_tx, cmd_rx, _erx, _ctx) = make_channels();
-        mgr.open(
-            make_buf(&["hello"]),
-            split_config(Dimension::Abs(10)),
-            false,
-            event_tx,
-            cmd_rx,
-        );
+        let _ = open_split(&mut mgr, Split::Below, 10, false);
         let area = Rect::new(0, 0, 80, 40);
         let rect = Rect::new(0, 30, 80, 10);
-        render_into(&mut mgr, area, |m, f| m.view_bottom_split(f, rect));
+        render_into(&mut mgr, area, |m, f| m.view_split(f, Split::Below, rect));
         assert!(
             !mgr.contains(ratatui::layout::Position::new(rect.x + 1, rect.y + 1)),
             "{EXPECT_UNFOCUSED_NO_RECT}",
@@ -1729,14 +1716,7 @@ mod tests {
         mgr.open(make_buf(&["a"]), FloatConfig::default(), false, tx1, rx1);
         let survivor = mgr.windows[0].id;
 
-        let (tx2, rx2, _erx2, _ctx2) = make_channels();
-        mgr.open(
-            make_buf(&["b"]),
-            split_config(Dimension::Abs(5)),
-            true,
-            tx2,
-            rx2,
-        );
+        let _ = open_split(&mut mgr, Split::Below, 5, true);
 
         mgr.remove_windows(|w| w.config.split == Split::Below);
         assert_eq!(mgr.focused_id, Some(survivor), "{EXPECT_FOCUS_RECOVERS}");
@@ -1744,23 +1724,15 @@ mod tests {
 
     const EXPECT_ZERO_RECT_NOOP: &str =
         "a zero-size rect must skip drawing: no Resize, no focused_rect";
-    const EXPECT_HAS_SPLIT: &str = "a Below window exists regardless of its resolved height";
-    const EXPECT_CLOSE_TO_SPLIT: &str = "close_all must send Close to the Below split window";
+    const EXPECT_CLOSE_TO_SPLIT: &str = "close_all must send Close to the split window";
 
     #[test_case(Rect::new(0, 30, 80, 0) ; "zero_height")]
     #[test_case(Rect::new(0, 30, 0, 10) ; "zero_width")]
-    fn view_bottom_split_zero_size_rect_is_noop(rect: Rect) {
+    fn view_split_zero_size_rect_is_noop(rect: Rect) {
         let mut mgr = FloatManager::new();
-        let (event_tx, cmd_rx, event_rx, _ctx) = make_channels();
-        mgr.open(
-            make_buf(&["hello"]),
-            split_config(Dimension::Abs(10)),
-            true,
-            event_tx,
-            cmd_rx,
-        );
+        let (event_rx, _ctx) = open_split(&mut mgr, Split::Below, 10, true);
         let area = Rect::new(0, 0, 80, 40);
-        render_into(&mut mgr, area, |m, f| m.view_bottom_split(f, rect));
+        render_into(&mut mgr, area, |m, f| m.view_split(f, Split::Below, rect));
 
         assert!(
             !event_rx
@@ -1790,14 +1762,7 @@ mod tests {
             frx,
         );
 
-        let (stx, srx, serx, _sctx) = make_channels();
-        mgr.open(
-            make_buf(&["split"]),
-            split_config(Dimension::Abs(10)),
-            false,
-            stx,
-            srx,
-        );
+        let (serx, _sctx) = open_split(&mut mgr, Split::Below, 10, false);
 
         let area = Rect::new(0, 0, 80, 40);
         render_into(&mut mgr, area, |m, f| {
@@ -1815,39 +1780,17 @@ mod tests {
         );
 
         let rect = Rect::new(0, 30, 80, 10);
-        render_into(&mut mgr, area, |m, f| m.view_bottom_split(f, rect));
+        render_into(&mut mgr, area, |m, f| m.view_split(f, Split::Below, rect));
         assert!(
             serx.drain().any(|e| matches!(e, WinEvent::Resize { .. })),
-            "{EXPECT_SPLIT_DRAWN}: split joins layout via view_bottom_split",
+            "{EXPECT_SPLIT_DRAWN}: split joins layout via view_split",
         );
-    }
-
-    #[test]
-    fn bottom_split_height_zero_config_is_some() {
-        let mut mgr = FloatManager::new();
-        let (event_tx, cmd_rx, _erx, _ctx) = make_channels();
-        mgr.open(
-            make_buf(&["a"]),
-            split_config(Dimension::Abs(0)),
-            true,
-            event_tx,
-            cmd_rx,
-        );
-        let area = Rect::new(0, 0, 80, 40);
-        assert_eq!(mgr.bottom_split_height(area), Some(0), "{EXPECT_HAS_SPLIT}");
     }
 
     #[test]
     fn close_all_notifies_split_window() {
         let mut mgr = FloatManager::new();
-        let (event_tx, cmd_rx, event_rx, _ctx) = make_channels();
-        mgr.open(
-            make_buf(&["a"]),
-            split_config(Dimension::Abs(10)),
-            true,
-            event_tx,
-            cmd_rx,
-        );
+        let (event_rx, _ctx) = open_split(&mut mgr, Split::Below, 10, true);
 
         mgr.close_all();
         assert!(!mgr.is_open(), "{EXPECT_CLOSED}");

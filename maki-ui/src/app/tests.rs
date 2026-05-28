@@ -2483,14 +2483,15 @@ const TEST_AREA: Rect = Rect {
     width: 80,
     height: 40,
 };
-const SPLIT_HEIGHT: u16 = 8;
+const SPLIT_EXTENT: u16 = 8;
 
-fn open_split_window(app: &mut App) {
+fn open_split_window(app: &mut App, dir: maki_lua::Split) {
     let buf = Arc::new(maki_agent::SharedBuf::new());
     let config = maki_lua::FloatConfig {
-        height: maki_lua::Dimension::Abs(SPLIT_HEIGHT),
+        width: maki_lua::Dimension::Abs(SPLIT_EXTENT),
+        height: maki_lua::Dimension::Abs(SPLIT_EXTENT),
         border: maki_lua::Border::None,
-        split: maki_lua::Split::Below,
+        split: dir,
         ..maki_lua::FloatConfig::default()
     };
     let (event_tx, _event_rx) = flume::bounded::<maki_lua::WinEvent>(8);
@@ -2499,52 +2500,91 @@ fn open_split_window(app: &mut App) {
 }
 
 #[test]
-fn push_window_reserves_bottom_and_suppresses_input() {
+fn below_split_reserves_bottom_and_suppresses_input() {
     let mut app = test_app();
-    let (msg_before, _b, _s, input_before, push_before) = app.layout_geometry(TEST_AREA);
-    assert!(!push_before, "no push window open yet");
-    assert!(input_before.height > 0, "input box visible before push");
+    let (msg_before, _b, _s, input_before, splits_before) = app.layout_geometry(TEST_AREA);
+    assert!(
+        splits_before.rect(maki_lua::Split::Below).is_none(),
+        "no split open yet"
+    );
+    assert!(input_before.height > 0, "input box visible before split");
 
-    open_split_window(&mut app);
-    let (msg_after, bottom_after, _s, input_after, push_after) = app.layout_geometry(TEST_AREA);
+    open_split_window(&mut app, maki_lua::Split::Below);
+    let (msg_after, _bottom, _s, input_after, splits_after) = app.layout_geometry(TEST_AREA);
 
-    assert!(push_after, "push window should reserve the bottom area");
+    let band = splits_after
+        .rect(maki_lua::Split::Below)
+        .expect("below split should reserve a bottom band");
     assert_eq!(
-        bottom_after.height, SPLIT_HEIGHT,
-        "bottom area routes through bottom_split_height",
+        band.height, SPLIT_EXTENT,
+        "below band reserves the requested rows",
     );
     assert!(
         msg_after.height < msg_before.height,
-        "chat must shrink to make room for the push window",
+        "chat must shrink to make room for the below split",
     );
     assert_eq!(
         input_after.height, 0,
-        "input box is suppressed under a push"
+        "input box is suppressed under a below split"
+    );
+}
+
+/// `carve` already tests the per-direction geometry; this pins the app wiring:
+/// a split shrinks the chat while the full-width status bar stays put. Below is
+/// tested separately since it also hides the input box.
+#[test_case(maki_lua::Split::Above ; "above")]
+#[test_case(maki_lua::Split::Left ; "left")]
+#[test_case(maki_lua::Split::Right ; "right")]
+fn non_below_split_reserves_band_and_keeps_status_full_width(dir: maki_lua::Split) {
+    let mut app = test_app();
+    let (msg_before, _b, _s, _i, _sp) = app.layout_geometry(TEST_AREA);
+
+    open_split_window(&mut app, dir);
+    let (msg_after, _bottom, status_after, _input, splits) = app.layout_geometry(TEST_AREA);
+
+    assert!(splits.rect(dir).is_some(), "split must reserve a band");
+    assert!(
+        msg_after.area() < msg_before.area(),
+        "chat must shrink to make room for the split",
+    );
+    assert_eq!(
+        status_after.width, TEST_AREA.width,
+        "status bar stays full width regardless of the split",
     );
 }
 
 #[test]
-fn closing_push_window_restores_input_layout() {
+fn closing_split_restores_layout() {
     let mut app = test_app();
     let before = app.layout_geometry(TEST_AREA);
 
-    open_split_window(&mut app);
+    open_split_window(&mut app, maki_lua::Split::Below);
     app.float_mgr.close_all();
 
     let after = app.layout_geometry(TEST_AREA);
-    assert_eq!(after, before, "closing the push window restores the layout");
+    assert_eq!(after, before, "closing the split restores the layout");
 }
 
 #[test]
-fn permission_prompt_takes_bottom_precedence_over_push() {
+fn permission_prompt_takes_bottom_precedence_over_below_split() {
     let mut app = test_app();
-    open_split_window(&mut app);
+    open_split_window(&mut app, maki_lua::Split::Below);
+    open_split_window(&mut app, maki_lua::Split::Left);
+    open_split_window(&mut app, maki_lua::Split::Above);
     app.permission_prompt
         .open("perm-1".into(), "bash".into(), vec!["ls".into()], None);
 
-    let (_msg, _bottom, _status, _input, push) = app.layout_geometry(TEST_AREA);
+    let (_msg, _bottom, _status, _input, splits) = app.layout_geometry(TEST_AREA);
     assert!(
-        !push,
-        "push must yield the bottom area to an open permission prompt"
+        splits.rect(maki_lua::Split::Below).is_none(),
+        "below split must yield the bottom area to an open permission prompt",
+    );
+    assert!(
+        splits.rect(maki_lua::Split::Left).is_some(),
+        "the prompt must leave a left split untouched",
+    );
+    assert!(
+        splits.rect(maki_lua::Split::Above).is_some(),
+        "the prompt must leave an above split untouched",
     );
 }

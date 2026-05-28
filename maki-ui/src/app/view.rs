@@ -1,11 +1,12 @@
 use crate::components::Overlay;
 #[cfg(test)]
 use crate::components::keybindings::KeybindContext;
-use crate::components::lua_float::MIN_CHAT_AND_STATUS_ROWS;
 use crate::components::queue_panel;
+use crate::components::split_layout::{MIN_CHAT_ROWS, SplitLayout, carve};
 use crate::components::status_bar::{StatusBarContext, UsageStats};
 use crate::selection::{self, SelectableZone, SelectionZone};
 use crate::theme;
+use maki_lua::Split;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::widgets::{Block, Borders, Widget};
@@ -19,7 +20,7 @@ struct ViewLayout {
     queue_area: Rect,
     todo_area: Rect,
     input_area: Rect,
-    push_active: bool,
+    splits: SplitLayout,
 }
 
 impl App {
@@ -35,6 +36,7 @@ impl App {
         self.render_background(frame);
         self.render_messages(frame, &layout, render_chat);
         self.render_bottom_panel(frame, &layout);
+        self.render_splits(frame, &layout);
         let mut overlay_rect = self.render_picker_overlays(frame, &layout);
         self.render_status_bar(frame, layout.status_area, render_chat);
         overlay_rect = self.render_top_modals(frame, overlay_rect);
@@ -43,37 +45,47 @@ impl App {
     }
 
     fn compute_layout(&self, area: Rect, form_visible: bool) -> ViewLayout {
-        let max_bottom = area.height.saturating_sub(MIN_CHAT_AND_STATUS_ROWS);
         let permission_open = self.permission_prompt.is_open();
-        // The permission prompt wins the bottom area, so a push window only gets
-        // it when no prompt is open.
-        let push_height = if permission_open {
-            None
-        } else {
-            self.float_mgr.bottom_split_height(area)
-        };
-        let bottom_takeover = form_visible || push_height.is_some();
+
+        // Carve the full-width status bar first so the split carving below only
+        // ever deals with the content region above it.
+        let [content, status_area] =
+            Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(area);
+
+        // The permission prompt owns the bottom area, so drop any `below` split
+        // here at the source. That keeps "prompt wins bottom" in one filter
+        // instead of needing a fix-up further down.
+        let reqs: Vec<_> = self
+            .float_mgr
+            .split_reqs(content)
+            .into_iter()
+            .filter(|r| !(permission_open && r.split == Split::Below))
+            .collect();
+        let splits = carve(content, &reqs);
+        let inner = splits.inner;
+
+        let below_active = splits.rect(Split::Below).is_some();
+        let bottom_takeover = form_visible || below_active;
+        let max_bottom = inner.height.saturating_sub(MIN_CHAT_ROWS);
         let bottom_height = if permission_open {
-            self.permission_prompt.height(area.width).min(max_bottom)
-        } else if let Some(h) = push_height {
-            h
+            self.permission_prompt.height(inner.width).min(max_bottom)
+        } else if below_active {
+            0
         } else if form_visible {
             self.plan_form.height().min(max_bottom)
         } else if self.is_main_chat() {
             queue_panel::height(self.queue.panel_len())
                 + self.chats[self.active_chat].todo_panel.height()
-                + self.input_box.height(area.width)
+                + self.input_box.height(inner.width)
         } else {
             let todo_h = self.chats[self.active_chat].todo_panel.height();
             if todo_h > 0 { todo_h + 1 } else { 1 }
         };
 
-        let [msg_area, bottom_area, status_area] = Layout::vertical([
-            Constraint::Min(1),
-            Constraint::Length(bottom_height),
-            Constraint::Length(1),
-        ])
-        .areas(area);
+        // The `below` split lives outside `inner` (drawn by render_splits), so
+        // the bottom panel only ever splits the chat region.
+        let [msg_area, bottom_area] =
+            Layout::vertical([Constraint::Min(1), Constraint::Length(bottom_height)]).areas(inner);
 
         let (queue_height, todo_h, input_height) = if bottom_takeover {
             (0, 0, 0)
@@ -98,7 +110,7 @@ impl App {
             queue_area,
             todo_area,
             input_area,
-            push_active: push_height.is_some(),
+            splits,
         }
     }
 
@@ -128,8 +140,6 @@ impl App {
         let in_plan = self.state.mode == Mode::Plan;
         if self.permission_prompt.is_open() {
             self.permission_prompt.view(frame, layout.bottom_area);
-        } else if layout.push_active {
-            self.float_mgr.view_bottom_split(frame, layout.bottom_area);
         } else if !self.is_main_chat() {
             let todo_h = self.chats[self.active_chat].todo_panel.height();
             let (todo_area, sep_area) = if todo_h > 0 {
@@ -174,6 +184,14 @@ impl App {
                 panel_hint,
             );
             self.command_palette.view(frame, layout.input_area);
+        }
+    }
+
+    fn render_splits(&mut self, frame: &mut Frame, layout: &ViewLayout) {
+        for dir in Split::ALL {
+            if let Some(rect) = layout.splits.rect(dir) {
+                self.float_mgr.view_split(frame, dir, rect);
+            }
         }
     }
 
@@ -340,9 +358,9 @@ impl App {
     }
 
     /// Layout geometry for tests: `(msg_area, bottom_area, status_area,
-    /// input_area, push_present)`.
+    /// input_area, splits)`.
     #[cfg(test)]
-    pub(super) fn layout_geometry(&self, area: Rect) -> (Rect, Rect, Rect, Rect, bool) {
+    pub(super) fn layout_geometry(&self, area: Rect) -> (Rect, Rect, Rect, Rect, SplitLayout) {
         let in_plan = self.state.mode == Mode::Plan;
         let form_visible =
             self.permission_prompt.is_open() || (in_plan && self.plan_form.is_visible());
@@ -352,7 +370,7 @@ impl App {
             layout.bottom_area,
             layout.status_area,
             layout.input_area,
-            layout.push_active,
+            layout.splits,
         )
     }
 
