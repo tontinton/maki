@@ -307,12 +307,34 @@ pub async fn fetch_all_models(mut on_ready: impl FnMut(ModelBatch)) {
         .detach();
     }
 
-    let dynamic_specs = dynamic::dynamic_model_specs();
-    if !dynamic_specs.is_empty() {
-        let _ = tx.send(ModelBatch {
-            models: dynamic_specs,
-            warnings: Vec::new(),
-        });
+    for slug in dynamic::discovered_slugs() {
+        let tx = tx.clone();
+        let slug = slug.to_string();
+        smol::spawn(async move {
+            let static_fallback = |reason: String| {
+                warn!(
+                    slug,
+                    error = reason,
+                    "dynamic model listing failed, using static fallback"
+                );
+                ModelBatch {
+                    models: dynamic::dynamic_model_specs_for(&slug),
+                    warnings: vec![format!("{slug}: {reason} (using static fallback)")],
+                }
+            };
+            let batch = match dynamic::create(&slug, timeouts) {
+                Ok(provider) => match provider.list_models().await {
+                    Ok(ids) => ModelBatch {
+                        models: ids.into_iter().map(|id| format!("{slug}/{id}")).collect(),
+                        warnings: Vec::new(),
+                    },
+                    Err(e) => static_fallback(e.to_string()),
+                },
+                Err(e) => static_fallback(e.to_string()),
+            };
+            let _ = tx.send_async(batch).await;
+        })
+        .detach();
     }
 
     drop(tx);

@@ -398,22 +398,26 @@ pub fn display_name(slug: &str) -> Option<&'static str> {
     find_meta(slug).map(|m| m.display_name.as_str())
 }
 
-pub fn dynamic_model_specs() -> Vec<String> {
-    let mut specs = Vec::new();
-    for meta in discover() {
-        if meta.models.is_empty() {
-            for entry in models_for_provider(meta.base) {
-                for prefix in entry.prefixes {
-                    specs.push(format!("{}/{prefix}", meta.slug));
-                }
-            }
-        } else {
-            for m in &meta.models {
-                specs.push(format!("{}/{}", meta.slug, m.id));
-            }
-        }
+pub fn dynamic_model_specs_for(slug: &str) -> Vec<String> {
+    let Some(meta) = find_meta(slug) else {
+        return Vec::new();
+    };
+    if meta.models.is_empty() {
+        models_for_provider(meta.base)
+            .iter()
+            .flat_map(|entry| entry.prefixes.iter())
+            .map(|prefix| format!("{slug}/{prefix}"))
+            .collect()
+    } else {
+        meta.models
+            .iter()
+            .map(|m| format!("{slug}/{}", m.id))
+            .collect()
     }
-    specs
+}
+
+pub fn discovered_slugs() -> Vec<&'static str> {
+    discover().iter().map(|m| m.slug.as_str()).collect()
 }
 
 pub fn base_for_slug(slug: &str) -> Option<ProviderKind> {
