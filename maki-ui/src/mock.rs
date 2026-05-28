@@ -800,7 +800,7 @@ print(f'Total lines across config: {total}')"
 
     // === Subagent: task tool with weak model ("Summarize test coverage") ===
     let task2_prompt = "Gather test coverage stats across the codebase. Return a summary of unit and integration test coverage.";
-    const WEAK_MODEL: &str = "anthropic/claude-3-5-haiku-20241022";
+    const WEAK_MODEL: &str = "anthropic/claude-haiku-4-5-20251001";
 
     events.push(sub_evt_with(
         AgentEvent::ThinkingDelta {

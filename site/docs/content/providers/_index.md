@@ -27,11 +27,11 @@ You can set multiple API keys in one env var (`ANTHROPIC_API_KEY=sk-1,sk-2,sk-3`
 
 | Tier | Models | Pricing (in/out per 1M tokens) | Context |
 |------|--------|-------------------------------|---------|
-| Weak | claude-3-haiku, claude-3-5-haiku, **claude-haiku-4-5** (default) | $0.25 / $1.25 | 200K ctx / 4K out |
-| Medium | claude-3-sonnet, claude-3-5-sonnet, claude-3-7-sonnet, claude-sonnet-4, claude-sonnet-4-5, claude-sonnet-4-6-1m, **claude-sonnet-4-6** (default) | $3.00 / $15.00 | 200K ctx / 4K out |
-| Strong | claude-opus-4-5, claude-opus-4-7-1m, **claude-opus-4-7** (default), claude-opus-4-6-1m, claude-opus-4-6, claude-3-opus, claude-opus-4-0, claude-opus-4-1 | $5.00 / $25.00 | 200K ctx / 64K out |
+| Weak | **claude-haiku-4-5** (default) | $1.00 / $5.00 | 200K ctx / 64K out |
+| Medium | claude-sonnet-4-5, **claude-sonnet-4-6** (default), claude-sonnet-4 | $3.00 / $15.00 | 200K ctx / 64K out |
+| Strong | claude-opus-4-5, claude-opus-4-6, claude-opus-4-7, **claude-opus-4-8** (default), claude-opus-4-0, claude-opus-4-1 | $5.00 / $25.00 | 200K ctx / 64K out |
 
-Defaults: claude-haiku-4-5 (weak), claude-sonnet-4-6 (medium), claude-opus-4-7 (strong)
+Defaults: claude-haiku-4-5 (weak), claude-sonnet-4-6 (medium), claude-opus-4-8 (strong)
 
 #### Amazon Bedrock
 

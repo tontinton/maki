@@ -424,11 +424,11 @@ mod tests {
     fn from_base_dynamic_unknown_model_uses_provider_fallbacks() {
         // Deliberately fake id so this stays valid when the model table changes.
         let base = ProviderKind::Anthropic;
-        let model = Model::from_base(base, "claude-opus-4-8", Some("anthropic-oauth"));
+        let model = Model::from_base(base, "claude-nonexistent-99", Some("anthropic-oauth"));
         assert_eq!(model.provider, base);
-        assert_eq!(model.id, "claude-opus-4-8");
+        assert_eq!(model.id, "claude-nonexistent-99");
         assert_eq!(model.dynamic_slug.as_deref(), Some("anthropic-oauth"));
-        assert_eq!(model.spec(), "anthropic-oauth/claude-opus-4-8");
+        assert_eq!(model.spec(), "anthropic-oauth/claude-nonexistent-99");
         assert_eq!(model.family, base.family());
         assert_eq!(model.max_output_tokens, base.fallback_max_output());
         assert_eq!(model.context_window, base.fallback_context_window());
