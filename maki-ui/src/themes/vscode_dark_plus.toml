@@ -98,52 +98,52 @@ current_line = "#282828"
 selection    = "#264f78"
 
 [ui]
-user              = { fg = "blue" }
-assistant         = { fg = "foreground" }
-assistant_prefix  = { fg = "pink" }
-thinking          = { fg = "comment", modifiers = ["italic"] }
-tool_bg           = { bg = "#181818" }
-tool              = { fg = "foreground" }
-tool_path         = { fg = "orange" }
-tool_annotation   = { fg = "comment" }
-tool_prefix       = { fg = "foreground", modifiers = ["bold"] }
-tool_success      = { fg = "cyan" }
-tool_error        = { fg = "red" }
-tool_dim          = { fg = "comment" }
-error             = { fg = "red" }
-status_context    = { fg = "comment" }
-strikethrough     = { fg = "comment", modifiers = ["crossed_out"] }
-plan_rule         = { fg = "pink", modifiers = ["bold"] }
-code_fallback     = { fg = "foreground" }
-horizontal_rule   = { fg = "comment" }
-table_border      = { fg = "comment" }
-diff_old          = { bg = "#4B1C1C" }
-diff_new          = { bg = "#1C3A1C" }
-diff_old_emphasis = { bg = "#6B2828" }
-diff_new_emphasis = { bg = "#285828" }
-diff_line_nr      = { fg = "comment" }
-todo_completed    = { fg = "cyan" }
-todo_in_progress  = { fg = "yellow" }
-todo_pending      = { fg = "comment" }
-todo_cancelled    = { fg = "red", modifiers = ["crossed_out"] }
-cmd_selected      = { fg = "background", bg = "blue" }
-cmd_name          = { fg = "yellow" }
-cmd_desc          = { fg = "comment" }
-highlight_text    = { fg = "pink" }
-panel_border      = { fg = "blue" }
-panel_title       = { fg = "blue", modifiers = ["bold"] }
-cursor            = { fg = "background", bg = "foreground" }
-keybind_key       = { fg = "yellow", modifiers = ["bold"] }
-keybind_section   = { fg = "blue", modifiers = ["bold"] }
-input_border      = { fg = "comment" }
+user               = { fg = "blue" }
+assistant          = { fg = "foreground" }
+assistant_prefix   = { fg = "pink" }
+thinking           = { fg = "comment", modifiers = ["italic"] }
+tool_bg            = { bg = "#181818" }
+tool               = { fg = "foreground" }
+tool_path          = { fg = "orange" }
+tool_annotation    = { fg = "comment" }
+tool_prefix        = { fg = "foreground", modifiers = ["bold"] }
+tool_success       = { fg = "cyan" }
+tool_error         = { fg = "red" }
+tool_dim           = { fg = "comment" }
+error              = { fg = "red" }
+status_dim         = { fg = "comment" }
+strikethrough      = { fg = "comment", modifiers = ["crossed_out"] }
+plan_rule          = { fg = "pink", modifiers = ["bold"] }
+code_block         = { fg = "foreground" }
+horizontal_rule    = { fg = "comment" }
+table_border       = { fg = "comment" }
+diff_old           = { bg = "#4B1C1C" }
+diff_new           = { bg = "#1C3A1C" }
+diff_old_emphasis  = { bg = "#6B2828" }
+diff_new_emphasis  = { bg = "#285828" }
+diff_line_nr       = { fg = "comment" }
+todo_completed     = { fg = "cyan" }
+todo_in_progress   = { fg = "yellow" }
+todo_pending       = { fg = "comment" }
+todo_cancelled     = { fg = "red", modifiers = ["crossed_out"] }
+item_selected      = { fg = "background", bg = "blue" }
+item               = { fg = "yellow" }
+item_desc          = { fg = "comment" }
+accent             = { fg = "pink" }
+panel_border       = { fg = "blue" }
+panel_title        = { fg = "blue", modifiers = ["bold"] }
+cursor             = { fg = "background", bg = "foreground" }
+keybind_key        = { fg = "yellow", modifiers = ["bold"] }
+keybind_section    = { fg = "blue", modifiers = ["bold"] }
+input_border       = { fg = "comment" }
 keybind_desc       = { fg = "foreground" }
-queue_compact      = { fg = "blue" }
+queue              = { fg = "blue" }
 plan_path          = { fg = "orange", modifiers = ["bold"] }
-status_flash       = { fg = "yellow" }
+status_notice      = { fg = "yellow" }
 status_retry_error = { fg = "red" }
 status_retry_info  = { fg = "comment" }
 input_placeholder  = { fg = "comment" }
 queue_delete       = { fg = "red", modifiers = ["bold"] }
 timestamp          = { fg = "comment" }
 spinner            = { fg = "yellow" }
-active            = { fg = "blue" }
+active             = { fg = "blue" }

@@ -265,7 +265,7 @@ impl PermissionPrompt {
 
         let mut tool_spans = vec![Span::raw("  "), Span::styled("tool  ", label_style)];
         if subagent_id.is_some() {
-            tool_spans.push(Span::styled("[subtask] ", t.cmd_desc));
+            tool_spans.push(Span::styled("[subtask] ", t.item_desc));
         }
         tool_spans.push(Span::styled(tool.clone(), value_style));
 

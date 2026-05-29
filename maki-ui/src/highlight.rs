@@ -41,7 +41,7 @@ pub fn highlight_regex_inline(pattern: &str) -> Vec<Span<'static>> {
 pub fn fallback_span(text: &str) -> Span<'static> {
     Span::styled(
         maki_highlight::normalize_text(text),
-        theme::current().code_fallback,
+        theme::current().code_block,
     )
 }
 

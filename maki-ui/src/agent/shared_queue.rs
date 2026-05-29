@@ -67,7 +67,7 @@ impl QueueItem {
             Self::Compact { .. } => QueueEntry {
                 text: Cow::Borrowed(COMPACT_LABEL),
                 color: theme::current()
-                    .queue_compact
+                    .queue
                     .fg
                     .unwrap_or(theme::current().foreground),
             },

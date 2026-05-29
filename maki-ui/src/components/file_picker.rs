@@ -416,7 +416,7 @@ fn render_list(frame: &mut Frame, area: Rect, s: &Session) {
     if s.matches.is_empty() {
         if !s.search.value().is_empty() {
             frame.render_widget(
-                Paragraph::new(vec![Line::from(Span::styled(NO_MATCHES, t.cmd_desc))]),
+                Paragraph::new(vec![Line::from(Span::styled(NO_MATCHES, t.item_desc))]),
                 area,
             );
         }
@@ -444,7 +444,7 @@ fn render_list(frame: &mut Frame, area: Rect, s: &Session) {
         let n = s.total_matches - MAX_MATERIALIZED;
         lines.push(Line::from(Span::styled(
             format!("{LABEL_INDENT}+{n} more files (not shown)"),
-            t.cmd_desc,
+            t.item_desc,
         )));
     }
 
@@ -464,7 +464,7 @@ fn render_search(frame: &mut Frame, area: Rect, s: &Session) {
 
     if s.walking {
         let ch = spinner_frame(s.started_at.elapsed().as_millis());
-        spans.push(Span::styled(format!("{ch} "), t.cmd_desc));
+        spans.push(Span::styled(format!("{ch} "), t.item_desc));
     }
 
     spans.extend([
@@ -483,9 +483,9 @@ fn build_highlighted_line<'a>(
     selected: bool,
     t: &'a theme::Theme,
 ) -> Line<'a> {
-    let base = if selected { t.cmd_selected } else { t.cmd_name };
+    let base = if selected { t.item_selected } else { t.item };
     let highlight = base
-        .fg(t.highlight_text.fg.unwrap_or_default())
+        .fg(t.accent.fg.unwrap_or_default())
         .add_modifier(Modifier::BOLD);
 
     let mut spans = vec![Span::styled(LABEL_INDENT, base)];

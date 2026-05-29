@@ -115,14 +115,14 @@ impl StatusBar {
         if let Some(name) = ctx.chat_name {
             left_spans.push(Span::styled(
                 format!(" [{name}]"),
-                theme::current().status_context,
+                theme::current().status_dim,
             ));
         }
 
         if !ctx.auto_scroll {
             left_spans.push(Span::styled(
                 " auto-scroll paused",
-                theme::current().status_context,
+                theme::current().status_dim,
             ));
         }
 
@@ -156,23 +156,23 @@ impl StatusBar {
 
                 right_spans.push(Span::styled(
                     self.cwd_branch.clone(),
-                    theme::current().status_context,
+                    theme::current().status_dim,
                 ));
                 right_spans.push(Span::raw("  "));
                 right_spans.push(Span::styled(
                     ctx.model_id.to_string(),
-                    theme::current().status_context,
+                    theme::current().status_dim,
                 ));
 
                 if let Some(ref label) = ctx.thinking_label {
                     right_spans.push(Span::styled(
                         format!(" [{label}]"),
-                        theme::current().status_context,
+                        theme::current().status_dim,
                     ));
                 }
 
                 if ctx.fast {
-                    right_spans.push(Span::styled(FAST_LABEL, theme::current().status_context));
+                    right_spans.push(Span::styled(FAST_LABEL, theme::current().status_dim));
                 }
 
                 let rest_text = format!(
@@ -202,7 +202,7 @@ impl StatusBar {
         if let Some((ref msg, _)) = self.flash {
             left_spans.push(Span::styled(
                 format!(" {msg}"),
-                theme::current().status_flash,
+                theme::current().status_notice,
             ));
         }
 

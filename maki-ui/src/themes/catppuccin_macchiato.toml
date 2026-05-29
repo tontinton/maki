@@ -107,58 +107,58 @@ current_line    = "#363a4f"
 selection       = "#494d64"
 
 [ui]
-user                 = { fg = "lavender" }
-assistant            = { fg = "foreground" }
-assistant_prefix     = { fg = "rosewater" }
-thinking             = { fg = "comment", modifiers = ["italic"] }
+user               = { fg = "lavender" }
+assistant          = { fg = "foreground" }
+assistant_prefix   = { fg = "rosewater" }
+thinking           = { fg = "comment", modifiers = ["italic"] }
 
-tool                 = { fg = "foreground" }
-tool_bg              = { bg = "background_2" }
-tool_prefix          = { fg = "foreground", modifiers = ["bold"] }
-tool_path            = { fg = "sapphire" }
-tool_annotation      = { fg = "comment" }
-tool_success         = { fg = "green" }
-tool_error           = { fg = "red" }
-tool_dim             = { fg = "comment" }
+tool               = { fg = "foreground" }
+tool_bg            = { bg = "background_2" }
+tool_prefix        = { fg = "foreground", modifiers = ["bold"] }
+tool_path          = { fg = "sapphire" }
+tool_annotation    = { fg = "comment" }
+tool_success       = { fg = "green" }
+tool_error         = { fg = "red" }
+tool_dim           = { fg = "comment" }
 
-error                = { fg = "red" }
-status_context       = { fg = "comment" }
+error              = { fg = "red" }
+status_dim         = { fg = "comment" }
 
-strikethrough        = { fg = "comment", modifiers = ["crossed_out"] }
-code_fallback        = { fg = "foreground" }
-horizontal_rule      = { fg = "comment" }
+strikethrough      = { fg = "comment", modifiers = ["crossed_out"] }
+code_block         = { fg = "foreground" }
+horizontal_rule    = { fg = "comment" }
 
-diff_old             = { bg = "#352233" }
-diff_new             = { bg = "#1e2d2b" }
-diff_old_emphasis    = { bg = "#4d2645" }
-diff_new_emphasis    = { bg = "#264040" }
-diff_line_nr         = { fg = "comment" }
+diff_old           = { bg = "#352233" }
+diff_new           = { bg = "#1e2d2b" }
+diff_old_emphasis  = { bg = "#4d2645" }
+diff_new_emphasis  = { bg = "#264040" }
+diff_line_nr       = { fg = "comment" }
 
-todo_completed       = { fg = "green" }
-todo_in_progress     = { fg = "yellow" }
-todo_pending         = { fg = "comment" }
-todo_cancelled       = { fg = "red", modifiers = ["crossed_out"] }
+todo_completed     = { fg = "green" }
+todo_in_progress   = { fg = "yellow" }
+todo_pending       = { fg = "comment" }
+todo_cancelled     = { fg = "red", modifiers = ["crossed_out"] }
 
-table_border         = { fg = "comment" }
-plan_rule            = { fg = "purple", modifiers = ["bold"] }
-cmd_selected         = { fg = "background", bg = "purple" }
-cmd_name             = { fg = "lavender" }
-cmd_desc             = { fg = "comment" }
-highlight_text       = { fg = "peach" }
-panel_border         = { fg = "lavender" }
-panel_title          = { fg = "purple", modifiers = ["bold"] }
-cursor               = { fg = "background", bg = "foreground" }
-keybind_key          = { fg = "sapphire", modifiers = ["bold"] }
-keybind_section      = { fg = "purple", modifiers = ["bold"] }
-input_border         = { fg = "selection" }
-keybind_desc         = { fg = "foreground" }
-queue_compact        = { fg = "purple" }
-plan_path            = { fg = "flamingo", modifiers = ["bold"] }
-status_flash         = { fg = "rosewater" }
-status_retry_error   = { fg = "red" }
-status_retry_info    = { fg = "comment" }
-input_placeholder    = { fg = "comment" }
-queue_delete         = { fg = "red", modifiers = ["bold"] }
-timestamp            = { fg = "comment" }
-spinner              = { fg = "yellow" }
-active              = { fg = "sapphire" }
+table_border       = { fg = "comment" }
+plan_rule          = { fg = "purple", modifiers = ["bold"] }
+item_selected      = { fg = "background", bg = "purple" }
+item               = { fg = "lavender" }
+item_desc          = { fg = "comment" }
+accent             = { fg = "peach" }
+panel_border       = { fg = "lavender" }
+panel_title        = { fg = "purple", modifiers = ["bold"] }
+cursor             = { fg = "background", bg = "foreground" }
+keybind_key        = { fg = "sapphire", modifiers = ["bold"] }
+keybind_section    = { fg = "purple", modifiers = ["bold"] }
+input_border       = { fg = "selection" }
+keybind_desc       = { fg = "foreground" }
+queue              = { fg = "purple" }
+plan_path          = { fg = "flamingo", modifiers = ["bold"] }
+status_notice      = { fg = "rosewater" }
+status_retry_error = { fg = "red" }
+status_retry_info  = { fg = "comment" }
+input_placeholder  = { fg = "comment" }
+queue_delete       = { fg = "red", modifiers = ["bold"] }
+timestamp          = { fg = "comment" }
+spinner            = { fg = "yellow" }
+active             = { fg = "sapphire" }

@@ -230,7 +230,7 @@ impl SearchModal {
 
         if self.matches.is_empty() {
             if !self.search.value().is_empty() {
-                let line = Line::from(Span::styled(NO_MATCHES, t.cmd_desc));
+                let line = Line::from(Span::styled(NO_MATCHES, t.item_desc));
                 frame.render_widget(Paragraph::new(vec![line]), area);
             }
             return;
@@ -312,13 +312,9 @@ fn build_highlighted_line<'a>(
     t: &'a theme::Theme,
 ) -> Line<'a> {
     let index_set: std::collections::HashSet<u32> = indices.iter().copied().collect();
-    let base_style = if is_selected {
-        t.cmd_selected
-    } else {
-        t.cmd_name
-    };
+    let base_style = if is_selected { t.item_selected } else { t.item };
     let match_style = base_style
-        .fg(t.highlight_text.fg.unwrap_or_default())
+        .fg(t.accent.fg.unwrap_or_default())
         .add_modifier(Modifier::BOLD);
 
     let mut spans = vec![Span::styled(LABEL_INDENT, base_style)];

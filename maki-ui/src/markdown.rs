@@ -86,7 +86,7 @@ fn style_for_token(
             }
             s
         }
-        StyleToken::CodeBar => t.code_bar,
+        StyleToken::CodeBar => t.code_gutter,
         StyleToken::ListMarker => t.list_marker,
         StyleToken::TableBorder => t.table_border,
         StyleToken::HorizontalRule => t.horizontal_rule,
@@ -340,7 +340,7 @@ mod tests {
             .flat_map(|l| &l.spans)
             .find(|s| s.content.as_ref() == CODE_BAR)
             .expect("code bar span");
-        assert_eq!(bar.style, theme::current().code_bar);
+        assert_eq!(bar.style, theme::current().code_gutter);
     }
 
     #[test]

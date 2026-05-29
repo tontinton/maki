@@ -464,7 +464,7 @@ pub(crate) fn strip_code_bar_prefix(
     out: &mut String,
     line_start: usize,
 ) -> usize {
-    if cell.style().fg != theme::current().code_bar.fg || cell.symbol() != "│" {
+    if cell.style().fg != theme::current().code_gutter.fg || cell.symbol() != "│" {
         return 0;
     }
     let line = &out[line_start..];
@@ -811,7 +811,7 @@ mod tests {
     fn code_bar_buffer() -> (Buffer, Rect) {
         let area = Rect::new(0, 0, 20, 2);
         let mut buf = Buffer::empty(area);
-        let code_bar_style = theme::current().code_bar;
+        let code_bar_style = theme::current().code_gutter;
         buf.set_string(0, 0, "│", code_bar_style);
         buf.set_string(2, 0, "fn main() {}        ", Style::default());
         buf.set_string(0, 1, "│", code_bar_style);
@@ -860,7 +860,7 @@ mod tests {
     fn strips_code_bar_wrap_prefix() {
         let area = Rect::new(0, 0, 12, 1);
         let mut buf = Buffer::empty(area);
-        let code_bar_style = theme::current().code_bar;
+        let code_bar_style = theme::current().code_gutter;
         buf.set_string(0, 0, "│", code_bar_style);
         buf.set_string(1, 0, "continued  ", Style::default());
         let region = ContentRegion {
@@ -957,7 +957,7 @@ mod tests {
     fn code_wrap_continuation_no_space() {
         let area = Rect::new(0, 0, 20, 2);
         let mut buf = Buffer::empty(area);
-        let code_style = theme::current().code_bar;
+        let code_style = theme::current().code_gutter;
         buf.set_string(0, 0, "│", code_style);
         buf.set_string(2, 0, "long_variable_na", Style::default());
         buf.set_string(0, 1, "│", code_style);

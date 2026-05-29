@@ -119,7 +119,7 @@ tool_success       = { fg = "spring_green" }
 tool_error         = { fg = "red" }
 tool_dim           = { fg = "comment" }
 error              = { fg = "red" }
-status_context     = { fg = "comment" }
+status_dim         = { fg = "comment" }
 strikethrough      = { fg = "comment", modifiers = ["crossed_out"] }
 plan_rule          = { fg = "purple", modifiers = ["bold"] }
 diff_old           = { bg = "#2d2027" }
@@ -127,16 +127,16 @@ diff_new           = { bg = "#232e26" }
 diff_old_emphasis  = { bg = "#432a30" }
 diff_new_emphasis  = { bg = "#2e3f30" }
 diff_line_nr       = { fg = "comment" }
-cmd_selected       = { fg = "background", bg = "blue" }
-cmd_name           = { fg = "cyan" }
-cmd_desc           = { fg = "comment" }
-highlight_text     = { fg = "orange" }
+item_selected      = { fg = "background", bg = "blue" }
+item               = { fg = "cyan" }
+item_desc          = { fg = "comment" }
+accent             = { fg = "orange" }
 panel_border       = { fg = "blue" }
 panel_title        = { fg = "blue", modifiers = ["bold"] }
 cursor             = { fg = "background", bg = "foreground" }
 keybind_key        = { fg = "cyan", modifiers = ["bold"] }
 keybind_section    = { fg = "blue", modifiers = ["bold"] }
-code_fallback      = { fg = "foreground" }
+code_block         = { fg = "foreground" }
 horizontal_rule    = { fg = "comment" }
 table_border       = { fg = "comment" }
 todo_completed     = { fg = "spring_green" }
@@ -145,13 +145,13 @@ todo_pending       = { fg = "comment" }
 todo_cancelled     = { fg = "red", modifiers = ["crossed_out"] }
 input_border       = { fg = "#54546d" }
 keybind_desc       = { fg = "foreground" }
-queue_compact      = { fg = "purple" }
+queue              = { fg = "purple" }
 plan_path          = { fg = "orange", modifiers = ["bold"] }
-status_flash       = { fg = "orange" }
+status_notice      = { fg = "orange" }
 status_retry_error = { fg = "red" }
 status_retry_info  = { fg = "comment" }
 input_placeholder  = { fg = "comment" }
 queue_delete       = { fg = "red", modifiers = ["bold"] }
 timestamp          = { fg = "comment" }
 spinner            = { fg = "yellow" }
-active            = { fg = "cyan" }
+active             = { fg = "cyan" }

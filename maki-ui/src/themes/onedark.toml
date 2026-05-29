@@ -108,7 +108,7 @@ assistant_prefix   = { fg = "purple" }
 assistant          = { fg = "foreground" }
 thinking           = { fg = "comment", modifiers = ["italic"] }
 strikethrough      = { fg = "comment", modifiers = ["crossed_out"] }
-code_fallback      = { fg = "foreground" }
+code_block         = { fg = "foreground" }
 horizontal_rule    = { fg = "selection" }
 table_border       = { fg = "comment" }
 plan_rule          = { fg = "purple", modifiers = ["bold"] }
@@ -132,23 +132,23 @@ todo_cancelled     = { fg = "red", modifiers = ["crossed_out"] }
 panel_border       = { fg = "blue" }
 panel_title        = { fg = "blue", modifiers = ["bold"] }
 input_border       = { fg = "selection" }
-cmd_selected       = { fg = "background", bg = "blue" }
-cmd_name           = { fg = "blue" }
-cmd_desc           = { fg = "comment" }
-highlight_text     = { fg = "orange" }
+item_selected      = { fg = "background", bg = "blue" }
+item               = { fg = "blue" }
+item_desc          = { fg = "comment" }
+accent             = { fg = "orange" }
 keybind_key        = { fg = "cyan", modifiers = ["bold"] }
 keybind_section    = { fg = "blue", modifiers = ["bold"] }
 cursor             = { fg = "background", bg = "foreground" }
-status_context     = { fg = "comment_lighter" }
+status_dim         = { fg = "comment_lighter" }
 error              = { fg = "red" }
 keybind_desc       = { fg = "foreground" }
-queue_compact      = { fg = "purple" }
+queue              = { fg = "purple" }
 plan_path          = { fg = "orange", modifiers = ["bold"] }
-status_flash       = { fg = "orange" }
+status_notice      = { fg = "orange" }
 status_retry_error = { fg = "red" }
 status_retry_info  = { fg = "comment" }
 input_placeholder  = { fg = "comment" }
 queue_delete       = { fg = "red", modifiers = ["bold"] }
 timestamp          = { fg = "comment" }
 spinner            = { fg = "yellow" }
-active            = { fg = "cyan" }
+active             = { fg = "cyan" }

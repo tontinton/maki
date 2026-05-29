@@ -488,7 +488,7 @@ impl CommandPalette {
                 let name_pad = max_name - name.len() + GAP;
 
                 if selected {
-                    let s = t.cmd_selected;
+                    let s = t.item_selected;
                     let highlighted_name = self.build_highlighted_spans(&name, &m.indices, s);
                     let mut spans = vec![Span::styled(" ".repeat(PAD), s)];
                     spans.extend(highlighted_name);
@@ -497,12 +497,11 @@ impl CommandPalette {
                     spans.push(Span::styled(" ".repeat(PAD), s));
                     Line::from(spans)
                 } else {
-                    let highlighted_name =
-                        self.build_highlighted_spans(&name, &m.indices, t.cmd_name);
+                    let highlighted_name = self.build_highlighted_spans(&name, &m.indices, t.item);
                     let mut spans = vec![Span::raw(" ".repeat(PAD))];
                     spans.extend(highlighted_name);
                     spans.push(Span::raw(" ".repeat(name_pad)));
-                    spans.push(Span::styled(desc, t.cmd_desc));
+                    spans.push(Span::styled(desc, t.item_desc));
                     spans.push(Span::raw(" ".repeat(PAD)));
                     Line::from(spans)
                 }
@@ -525,7 +524,7 @@ impl CommandPalette {
 
         let t = theme::current();
         let highlight = base
-            .fg(t.highlight_text.fg.unwrap_or_default())
+            .fg(t.accent.fg.unwrap_or_default())
             .add_modifier(Modifier::BOLD);
 
         let mut spans = Vec::new();

@@ -287,27 +287,23 @@ pub fn style_by_name(name: &str) -> Style {
         "heading" => t.heading,
         "list_marker" => t.list_marker,
         "horizontal_rule" => t.horizontal_rule,
-        "code_bar" => t.code_bar,
+        "code_gutter" => t.code_gutter,
         "table_border" => t.table_border,
         "keyword" | "index_keyword" => t.index_keyword,
         "section" | "index_section" => t.index_section,
         "line_nr" | "index_line_nr" => t.index_line_nr,
         "diff_old" => t.diff_old,
         "diff_new" => t.diff_new,
-        "cmd_selected" => t.cmd_selected,
-        "cmd_name" => t.cmd_name,
-        "cmd_desc" => t.cmd_desc,
-        "cmd_match" => t.cmd_match,
-        "cmd_match_selected" => t.cmd_match_selected,
+        "item" => t.item,
+        "item_desc" => t.item_desc,
+        "item_selected" | "selected" => t.item_selected,
+        "item_match" | "match" => t.item_match,
+        "item_match_selected" | "match_selected" => t.item_match_selected,
         "cursor" => t.cursor,
-        "accent" => t.highlight_text,
+        "accent" => t.accent,
         "active" => t.active,
-        "selected" => t.cmd_selected,
         "success" => t.todo_completed,
         "warning" => t.todo_in_progress,
-        "item" => t.cmd_name,
-        "match" => t.cmd_match,
-        "match_selected" => t.cmd_match_selected,
         _ => Style::default(),
     }
 }
@@ -330,13 +326,13 @@ pub struct Theme {
     pub tool_error: Style,
     pub tool_dim: Style,
     pub error: Style,
-    pub status_context: Style,
+    pub status_dim: Style,
     pub bold: Style,
     pub italic: Style,
     pub bold_italic: Style,
     pub inline_code: Style,
-    pub code_fallback: Style,
-    pub code_bar: Style,
+    pub code_block: Style,
+    pub code_gutter: Style,
     pub strikethrough: Style,
     pub heading: Style,
     pub list_marker: Style,
@@ -352,16 +348,16 @@ pub struct Theme {
     pub todo_in_progress: Style,
     pub todo_pending: Style,
     pub todo_cancelled: Style,
-    pub cmd_selected: Style,
-    pub cmd_name: Style,
-    pub cmd_desc: Style,
-    pub cmd_match: Style,
-    pub cmd_match_selected: Style,
+    pub item_selected: Style,
+    pub item: Style,
+    pub item_desc: Style,
+    pub item_match: Style,
+    pub item_match_selected: Style,
     pub panel_border: Style,
     pub panel_title: Style,
     pub cursor: Style,
     pub input_border: Style,
-    pub highlight_text: Style,
+    pub accent: Style,
     pub active: Style,
     pub keybind_key: Style,
     pub keybind_desc: Style,
@@ -369,9 +365,9 @@ pub struct Theme {
     pub mode_build: Color,
     pub mode_plan: Color,
     pub mode_bash: Color,
-    pub queue_compact: Style,
+    pub queue: Style,
     pub plan_path: Style,
-    pub status_flash: Style,
+    pub status_notice: Style,
     pub status_retry_error: Style,
     pub status_retry_info: Style,
     pub input_placeholder: Style,
@@ -661,7 +657,7 @@ impl Theme {
             tool_error: style("tool_error"),
             tool_dim: style("tool_dim"),
             error: style("error"),
-            status_context: style("status_context"),
+            status_dim: style("status_dim"),
             bold: bold_style,
             italic: ui
                 .get("italic")
@@ -676,9 +672,9 @@ impl Theme {
                 &["function.call", "function"],
                 Modifier::empty(),
             ),
-            code_fallback: style("code_fallback"),
-            code_bar: derived_style(
-                "code_bar",
+            code_block: style("code_block"),
+            code_gutter: derived_style(
+                "code_gutter",
                 &["variable.parameter", "string"],
                 Modifier::empty(),
             ),
@@ -705,24 +701,24 @@ impl Theme {
             todo_in_progress: style("todo_in_progress"),
             todo_pending: style("todo_pending"),
             todo_cancelled: style("todo_cancelled"),
-            cmd_selected: style("cmd_selected"),
-            cmd_name: style("cmd_name"),
-            cmd_desc: style("cmd_desc"),
-            cmd_match: {
-                let s = style("cmd_match");
+            item_selected: style("item_selected"),
+            item: style("item"),
+            item_desc: style("item_desc"),
+            item_match: {
+                let s = style("item_match");
                 if s == Style::default() {
-                    style("cmd_name")
-                        .fg(style("highlight_text").fg.unwrap_or_default())
+                    style("item")
+                        .fg(style("accent").fg.unwrap_or_default())
                         .add_modifier(Modifier::BOLD)
                 } else {
                     s
                 }
             },
-            cmd_match_selected: {
-                let s = style("cmd_match_selected");
+            item_match_selected: {
+                let s = style("item_match_selected");
                 if s == Style::default() {
-                    style("cmd_selected")
-                        .fg(style("highlight_text").fg.unwrap_or_default())
+                    style("item_selected")
+                        .fg(style("accent").fg.unwrap_or_default())
                         .add_modifier(Modifier::BOLD)
                 } else {
                     s
@@ -732,11 +728,11 @@ impl Theme {
             panel_title: style("panel_title"),
             cursor: style("cursor"),
             input_border: style("input_border"),
-            highlight_text: style("highlight_text"),
+            accent: style("accent"),
             active: {
                 let s = style("active");
                 if s == Style::default() {
-                    style("highlight_text")
+                    style("accent")
                 } else {
                     s
                 }
@@ -747,9 +743,9 @@ impl Theme {
             mode_build: derived_color("mode_build", &["keyword.storage.type", "keyword"]),
             mode_plan: derived_color("mode_plan", &["keyword", "keyword.storage.type"]),
             mode_bash: derived_color("mode_bash", &["function.builtin", "function"]),
-            queue_compact: style("queue_compact"),
+            queue: style("queue"),
             plan_path: style("plan_path"),
-            status_flash: style("status_flash"),
+            status_notice: style("status_notice"),
             status_retry_error: style("status_retry_error"),
             status_retry_info: style("status_retry_info"),
             input_placeholder: style("input_placeholder"),
@@ -844,7 +840,7 @@ mod tests {
         assert_eq!(t.heading.fg, Some(Color::Rgb(0x8b, 0xe9, 0xfd)));
         assert!(t.heading.add_modifier.contains(Modifier::BOLD));
         assert_eq!(t.inline_code.fg, Some(Color::Rgb(0x50, 0xfa, 0x7b)));
-        assert_eq!(t.code_bar.fg, Some(Color::Rgb(0xff, 0xb8, 0x6c)));
+        assert_eq!(t.code_gutter.fg, Some(Color::Rgb(0xff, 0xb8, 0x6c)));
         assert_eq!(t.list_marker.fg, Some(Color::Rgb(0x8b, 0xe9, 0xfd)));
         assert_eq!(t.bold.fg, Some(Color::Rgb(0xff, 0xb8, 0x6c)));
     }
@@ -1025,7 +1021,7 @@ background = "#282a36"
         assert_eq!(theme.heading.fg, Some(Color::Rgb(0x8b, 0xe9, 0xfd)));
         assert!(theme.heading.add_modifier.contains(Modifier::BOLD));
         assert_eq!(theme.inline_code.fg, Some(Color::Rgb(0x50, 0xfa, 0x7b)));
-        assert_eq!(theme.code_bar.fg, Some(Color::Rgb(0xff, 0xb8, 0x6c)));
+        assert_eq!(theme.code_gutter.fg, Some(Color::Rgb(0xff, 0xb8, 0x6c)));
     }
 
     #[test]
@@ -1063,18 +1059,17 @@ mode_build = "#112233"
         assert_eq!(style_by_name("bold_italic"), t.bold_italic);
         assert_eq!(style_by_name("diff_old"), t.diff_old);
         assert_eq!(style_by_name("diff_new"), t.diff_new);
-        assert_eq!(style_by_name("cmd_selected"), t.cmd_selected);
-        assert_eq!(style_by_name("cmd_name"), t.cmd_name);
-        assert_eq!(style_by_name("cmd_desc"), t.cmd_desc);
+        assert_eq!(style_by_name("item_selected"), t.item_selected);
+        assert_eq!(style_by_name("item"), t.item);
+        assert_eq!(style_by_name("item_desc"), t.item_desc);
         assert_eq!(style_by_name("cursor"), t.cursor);
-        assert_eq!(style_by_name("accent"), t.highlight_text);
+        assert_eq!(style_by_name("accent"), t.accent);
         assert_eq!(style_by_name("active"), t.active);
-        assert_eq!(style_by_name("selected"), t.cmd_selected);
+        assert_eq!(style_by_name("selected"), t.item_selected);
         assert_eq!(style_by_name("success"), t.todo_completed);
         assert_eq!(style_by_name("warning"), t.todo_in_progress);
-        assert_eq!(style_by_name("item"), t.cmd_name);
-        assert_eq!(style_by_name("match"), t.cmd_match);
-        assert_eq!(style_by_name("match_selected"), t.cmd_match_selected);
+        assert_eq!(style_by_name("match"), t.item_match);
+        assert_eq!(style_by_name("match_selected"), t.item_match_selected);
     }
 
     #[test_case("nonexistent_style")]

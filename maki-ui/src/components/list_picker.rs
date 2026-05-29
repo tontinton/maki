@@ -547,7 +547,7 @@ impl<T: PickerItem> ListPicker<T> {
                 let ch = spinner_frame(animation_elapsed_ms());
                 let line = Line::from(Span::styled(
                     format!("  {ch} {LOADING_LABEL}"),
-                    theme::current().cmd_desc,
+                    theme::current().item_desc,
                 ));
                 frame.render_widget(Paragraph::new(vec![line]), list_area);
                 render_search(frame, search_area, &TextBuffer::new(String::new()));
@@ -766,7 +766,7 @@ fn render_list<T: PickerItem>(
     if filtered.is_empty() {
         let line = Line::from(Span::styled(
             format!("  {NO_MATCHES}"),
-            theme::current().cmd_desc,
+            theme::current().item_desc,
         ));
         frame.render_widget(Paragraph::new(vec![line]), area);
         return;
@@ -805,18 +805,18 @@ fn render_list<T: PickerItem>(
         }
 
         let style = if i == selected {
-            theme::current().cmd_selected
+            theme::current().item_selected
         } else {
-            theme::current().cmd_name
+            theme::current().item
         };
         let checkbox = enabled.map(|en| {
             let sym = if en[item_idx] { "✓ " } else { "✗ " };
             let sty = if i == selected {
                 style
             } else if en[item_idx] {
-                theme::current().cmd_name
+                theme::current().item
             } else {
-                theme::current().cmd_desc
+                theme::current().item_desc
             };
             Span::styled(sym, sty)
         });
@@ -833,7 +833,7 @@ fn render_list<T: PickerItem>(
                 let detail_style = if i == selected {
                     style
                 } else {
-                    theme::current().cmd_desc
+                    theme::current().item_desc
                 };
                 let mut spans = Vec::with_capacity(5);
                 if let Some(cb) = checkbox {

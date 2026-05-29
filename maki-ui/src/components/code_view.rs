@@ -255,7 +255,7 @@ fn diff_change_spans(
 ) -> Vec<Span<'static>> {
     let mut spans = vec![Span::styled(
         prefix,
-        base.patch(theme::current().code_fallback),
+        base.patch(theme::current().code_block),
     )];
     match syntax {
         Some(syn) => spans.extend(merge_syntax_with_diff(&syn, ds, base, emph)),
@@ -263,7 +263,7 @@ fn diff_change_spans(
             let full: String = ds.iter().map(|s| s.text.as_str()).collect();
             spans.push(Span::styled(
                 maki_highlight::normalize_text(&full),
-                base.patch(theme::current().code_fallback),
+                base.patch(theme::current().code_block),
             ));
         }
     }

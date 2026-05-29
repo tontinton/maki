@@ -113,7 +113,7 @@ diff_old           = { bg = "#352a2c" }
 diff_new           = { bg = "#2a3530" }
 diff_old_emphasis  = { bg = "#4a3538" }
 diff_new_emphasis  = { bg = "#35473c" }
-cmd_selected       = { fg = "background", bg = "cyan" }
+item_selected      = { fg = "background", bg = "cyan" }
 panel_border       = { fg = "cyan" }
 panel_title        = { fg = "cyan", modifiers = ["bold"] }
 cursor             = { fg = "background", bg = "foreground" }
@@ -128,8 +128,8 @@ tool_success       = { fg = "green" }
 tool_error         = { fg = "red" }
 tool_dim           = { fg = "comment" }
 error              = { fg = "red" }
-status_context     = { fg = "comment" }
-code_fallback      = { fg = "foreground" }
+status_dim         = { fg = "comment" }
+code_block         = { fg = "foreground" }
 horizontal_rule    = { fg = "comment" }
 table_border       = { fg = "comment" }
 diff_line_nr       = { fg = "comment" }
@@ -137,19 +137,19 @@ todo_completed     = { fg = "green" }
 todo_in_progress   = { fg = "yellow" }
 todo_pending       = { fg = "comment" }
 todo_cancelled     = { fg = "red", modifiers = ["crossed_out"] }
-cmd_name           = { fg = "frost_light" }
-cmd_desc           = { fg = "comment" }
-highlight_text     = { fg = "orange" }
+item               = { fg = "frost_light" }
+item_desc          = { fg = "comment" }
+accent             = { fg = "orange" }
 keybind_section    = { fg = "cyan", modifiers = ["bold"] }
 input_border       = { fg = "#4c566a" }
 keybind_desc       = { fg = "foreground" }
-queue_compact      = { fg = "purple" }
+queue              = { fg = "purple" }
 plan_path          = { fg = "orange", modifiers = ["bold"] }
-status_flash       = { fg = "orange" }
+status_notice      = { fg = "orange" }
 status_retry_error = { fg = "red" }
 status_retry_info  = { fg = "comment" }
 input_placeholder  = { fg = "comment" }
 queue_delete       = { fg = "red", modifiers = ["bold"] }
 timestamp          = { fg = "comment" }
 spinner            = { fg = "yellow" }
-active            = { fg = "frost_light" }
+active             = { fg = "frost_light" }

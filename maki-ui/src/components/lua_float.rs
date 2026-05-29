@@ -425,7 +425,7 @@ impl FloatManager {
             .map(|(i, sline)| {
                 let mut line = snapshot_to_line(sline);
                 if win.config.cursor_line && top + win.scroll_offset + i == win.cursor {
-                    line = line.style(t.cmd_selected);
+                    line = line.style(t.item_selected);
                 }
                 line
             })
