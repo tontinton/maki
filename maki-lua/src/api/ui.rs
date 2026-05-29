@@ -41,17 +41,14 @@ pub(crate) fn create_ui_table(
             segments_to_lua_lines(&lua, &segments)
         })?,
     )?;
-    // maki.ui.markdown(text, width) -> lines.
-    // Each line is `{ {text, style}, ... }`. Async because highlighting
-    // code blocks is expensive.
+    // maki.ui.markdown(text, width) -> lines, each `{ {text, style}, ... }`.
+    // Async so the expensive code-block highlighting never blocks the UI.
     //
-    // Style is either a named string (resolved at paint time via
-    // `theme::style_by_name`) or a `{fg, bold, italic, underline}` table
-    // for syntax-highlighted tokens.
-    //
-    // Named styles: "", "bold", "italic", "bold_italic",
-    // "strikethrough", "inline_code", "code_bar", "heading",
-    // "list_marker", "table_border", "horizontal_rule".
+    // A style is a named string, resolved late at paint time so a theme
+    // switch repaints without re-rendering. Plugins should lean on the
+    // semantic palette ("accent", "active", "selected", "success", ...) since
+    // those names stay stable; see `theme::style_by_name` for the full set.
+    // Syntax tokens instead carry a `{fg, bold, italic, underline}` table.
     t.set(
         "markdown",
         lua.create_async_function(|lua, (text, width): (String, u16)| async move {

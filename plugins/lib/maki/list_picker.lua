@@ -47,9 +47,9 @@ local function render_lines(items, selected, width, query)
     local label = type(item) == "string" and item or item.label
     local detail = type(item) == "table" and item.detail or nil
     local is_sel = (i == selected)
-    local style = is_sel and "cmd_selected" or "cmd_name"
-    local detail_style = is_sel and "cmd_selected" or "cmd_desc"
-    local match_style = is_sel and "cmd_match_selected" or "cmd_match"
+    local style = is_sel and "selected" or "item"
+    local detail_style = is_sel and "selected" or "dim"
+    local match_style = is_sel and "match_selected" or "match"
 
     local spans = {}
     local ms, me = find_match_pos(label, query)
@@ -107,7 +107,7 @@ function ListPicker.open(items, opts)
   local function build_lines()
     local content
     if #filtered == 0 then
-      content = { { { NO_MATCHES_LABEL, "cmd_desc" } } }
+      content = { { { NO_MATCHES_LABEL, "dim" } } }
     else
       content = render_lines(filtered, cursor, width, input:value())
     end

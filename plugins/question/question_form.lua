@@ -339,26 +339,26 @@ local function render_tab_bar(state)
     local label = q.header ~= "" and q.header or ("Q" .. i)
     local answered = state.answers[i] and #state.answers[i] > 0
     if i == state.tab and state.mode ~= MODE.CONFIRMING then
-      spans[#spans + 1] = { " " .. label .. " ", "form_active" }
+      spans[#spans + 1] = { " " .. label .. " ", "active" }
     elseif answered then
-      spans[#spans + 1] = { " " .. label .. " ✓ ", "form_check" }
+      spans[#spans + 1] = { " " .. label .. " ✓ ", "success" }
     else
-      spans[#spans + 1] = { " " .. label .. " ", "form_inactive" }
+      spans[#spans + 1] = { " " .. label .. " ", "dim" }
     end
-    spans[#spans + 1] = { "│", "form_separator" }
+    spans[#spans + 1] = { "│", "dim" }
   end
   local confirm_label = " Review "
   if state.mode == MODE.CONFIRMING then
-    spans[#spans + 1] = { confirm_label, "form_active" }
+    spans[#spans + 1] = { confirm_label, "active" }
   else
-    spans[#spans + 1] = { confirm_label, "form_inactive" }
+    spans[#spans + 1] = { confirm_label, "dim" }
   end
   return spans
 end
 
 local function separator_row(width)
   local n = math.max(0, width - 1)
-  return { { string.rep(SEPARATOR_CHAR, n), "form_separator" } }
+  return { { string.rep(SEPARATOR_CHAR, n), "dim" } }
 end
 
 local function render_option_rows(pointer, chk, chk_style, label, lbl_style, desc, usable)
@@ -371,9 +371,9 @@ local function render_option_rows(pointer, chk, chk_style, label, lbl_style, des
   if has_desc and label_w > label_text_max then
     local label_lines = wrap_spans({ { label, lbl_style } }, label_text_max)
     local desc_max = usable - label_col_max - DESC_SEP_WIDTH
-    local desc_lines = wrap_spans({ { desc, "form_description" } }, desc_max)
+    local desc_lines = wrap_spans({ { desc, "dim" } }, desc_max)
 
-    local first = { { pointer, "form_arrow" }, { chk, chk_style } }
+    local first = { { pointer, "dim" }, { chk, chk_style } }
     local first_label_w = 0
     for _, sp in ipairs(label_lines[1]) do
       first[#first + 1] = sp
@@ -383,7 +383,7 @@ local function render_option_rows(pointer, chk, chk_style, label, lbl_style, des
     if gap > 0 then
       first[#first + 1] = { string.rep(" ", gap), "" }
     end
-    first[#first + 1] = { DESC_SEP, "form_description" }
+    first[#first + 1] = { DESC_SEP, "dim" }
     for _, sp in ipairs(desc_lines[1]) do
       first[#first + 1] = sp
     end
@@ -412,11 +412,11 @@ local function render_option_rows(pointer, chk, chk_style, label, lbl_style, des
       rows[#rows + 1] = row
     end
   else
-    local first = { { pointer, "form_arrow" }, { chk, chk_style }, { label, lbl_style } }
+    local first = { { pointer, "dim" }, { chk, chk_style }, { label, lbl_style } }
     if has_desc then
       local prefix_w = LABEL_INDENT + label_w + DESC_SEP_WIDTH
-      local desc_lines = wrap_spans({ { desc, "form_description" } }, usable - prefix_w)
-      first[#first + 1] = { DESC_SEP, "form_description" }
+      local desc_lines = wrap_spans({ { desc, "dim" } }, usable - prefix_w)
+      first[#first + 1] = { DESC_SEP, "dim" }
       for _, sp in ipairs(desc_lines[1]) do
         first[#first + 1] = sp
       end
@@ -464,9 +464,9 @@ local function render_selecting(state, width)
     local opt_rows = render_option_rows(
       pointer,
       chk,
-      checked and "form_check" or "",
+      checked and "success" or "",
       opt.label,
-      is_cur and "form_active" or "",
+      is_cur and "active" or "",
       opt.description,
       usable
     )
@@ -504,9 +504,9 @@ local function render_selecting(state, width)
     local custom_rows = render_option_rows(
       cptr,
       cchk,
-      custom_checked and "form_check" or "",
+      custom_checked and "success" or "",
       CUSTOM_OPTION,
-      custom_cur and "form_active" or "",
+      custom_cur and "active" or "",
       custom_desc,
       usable
     )
@@ -552,14 +552,7 @@ local function render_confirming(state, width)
     for j, md_line in ipairs(question_md(state, i, width - q_prefix_w)) do
       append_wrapped(lines, md_line, width - q_prefix_w, j == 1 and q_prefix or q_pad, "", q_pad)
     end
-    append_wrapped(
-      lines,
-      { { ans_text, "form_answer" } },
-      width - ARROW_PREFIX_W,
-      ARROW_PREFIX,
-      "form_arrow",
-      arrow_pad
-    )
+    append_wrapped(lines, { { ans_text, "success" } }, width - ARROW_PREFIX_W, ARROW_PREFIX, "dim", arrow_pad)
 
     if i < #state.questions then
       lines[#lines + 1] = separator_row(width)

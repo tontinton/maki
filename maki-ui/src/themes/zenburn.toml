@@ -153,12 +153,4 @@ input_placeholder    = { fg = "comment" }
 queue_delete         = { fg = "red", modifiers = ["bold"] }
 timestamp            = { fg = "comment" }
 spinner              = { fg = "yellow" }
-form_separator       = { fg = "comment" }
-form_hint            = { fg = "comment" }
-form_description     = { fg = "comment" }
-form_active          = { fg = "cyan" }
-form_answered        = { fg = "yellow_green" }
-form_inactive        = { fg = "comment" }
-form_check           = { fg = "yellow_green" }
-form_arrow           = { fg = "comment" }
-form_answer          = { fg = "yellow_green" }
+active              = { fg = "cyan" }

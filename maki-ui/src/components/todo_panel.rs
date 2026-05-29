@@ -138,7 +138,7 @@ impl TodoPanel {
             .title_bottom(
                 Line::from(vec![
                     Span::styled(format!(" {}", key::TODO_PANEL.label), t.keybind_key),
-                    Span::styled(HIDE_DESC, t.form_hint),
+                    Span::styled(HIDE_DESC, t.tool_dim),
                 ])
                 .right_aligned(),
             )

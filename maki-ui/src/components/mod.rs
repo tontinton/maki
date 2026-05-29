@@ -55,11 +55,11 @@ pub(crate) fn hint_line<K: AsRef<str>, V: AsRef<str>>(pairs: &[(K, V)]) -> Line<
         spans.push(Span::raw("  "));
         for (i, part) in key.as_ref().split('/').enumerate() {
             if i > 0 {
-                spans.push(Span::styled("/", t.form_hint));
+                spans.push(Span::styled("/", t.tool_dim));
             }
             spans.push(Span::styled(part.to_string(), t.keybind_key));
         }
-        spans.push(Span::styled(format!(" {}", desc.as_ref()), t.form_hint));
+        spans.push(Span::styled(format!(" {}", desc.as_ref()), t.tool_dim));
     }
     Line::from(spans)
 }

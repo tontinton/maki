@@ -300,14 +300,14 @@ pub fn style_by_name(name: &str) -> Style {
         "cmd_match" => t.cmd_match,
         "cmd_match_selected" => t.cmd_match_selected,
         "cursor" => t.cursor,
-        "form_separator" => t.form_separator,
-        "form_hint" => t.form_hint,
-        "form_description" => t.form_description,
-        "form_active" => t.form_active,
-        "form_inactive" => t.form_inactive,
-        "form_check" => t.form_check,
-        "form_arrow" => t.form_arrow,
-        "form_answer" => t.form_answer,
+        "accent" => t.highlight_text,
+        "active" => t.active,
+        "selected" => t.cmd_selected,
+        "success" => t.todo_completed,
+        "warning" => t.todo_in_progress,
+        "item" => t.cmd_name,
+        "match" => t.cmd_match,
+        "match_selected" => t.cmd_match_selected,
         _ => Style::default(),
     }
 }
@@ -362,6 +362,7 @@ pub struct Theme {
     pub cursor: Style,
     pub input_border: Style,
     pub highlight_text: Style,
+    pub active: Style,
     pub keybind_key: Style,
     pub keybind_desc: Style,
     pub keybind_section: Style,
@@ -377,14 +378,6 @@ pub struct Theme {
     pub queue_delete: Style,
     pub timestamp: Style,
     pub spinner: Style,
-    pub form_separator: Style,
-    pub form_hint: Style,
-    pub form_description: Style,
-    pub form_active: Style,
-    pub form_inactive: Style,
-    pub form_check: Style,
-    pub form_arrow: Style,
-    pub form_answer: Style,
     pub index_section: Style,
     pub index_line_nr: Style,
     pub index_keyword: Style,
@@ -740,6 +733,14 @@ impl Theme {
             cursor: style("cursor"),
             input_border: style("input_border"),
             highlight_text: style("highlight_text"),
+            active: {
+                let s = style("active");
+                if s == Style::default() {
+                    style("highlight_text")
+                } else {
+                    s
+                }
+            },
             keybind_key: style("keybind_key"),
             keybind_desc: style("keybind_desc"),
             keybind_section: style("keybind_section"),
@@ -755,14 +756,6 @@ impl Theme {
             queue_delete: style("queue_delete"),
             timestamp: style("timestamp"),
             spinner: style("spinner"),
-            form_separator: style("form_separator"),
-            form_hint: style("form_hint"),
-            form_description: style("form_description"),
-            form_active: style("form_active"),
-            form_inactive: style("form_inactive"),
-            form_check: style("form_check"),
-            form_arrow: style("form_arrow"),
-            form_answer: style("form_answer"),
             index_section: derived_style(
                 "index_section",
                 &["keyword.storage.type", "keyword"],
@@ -1074,6 +1067,14 @@ mode_build = "#112233"
         assert_eq!(style_by_name("cmd_name"), t.cmd_name);
         assert_eq!(style_by_name("cmd_desc"), t.cmd_desc);
         assert_eq!(style_by_name("cursor"), t.cursor);
+        assert_eq!(style_by_name("accent"), t.highlight_text);
+        assert_eq!(style_by_name("active"), t.active);
+        assert_eq!(style_by_name("selected"), t.cmd_selected);
+        assert_eq!(style_by_name("success"), t.todo_completed);
+        assert_eq!(style_by_name("warning"), t.todo_in_progress);
+        assert_eq!(style_by_name("item"), t.cmd_name);
+        assert_eq!(style_by_name("match"), t.cmd_match);
+        assert_eq!(style_by_name("match_selected"), t.cmd_match_selected);
     }
 
     #[test_case("nonexistent_style")]

@@ -70,7 +70,7 @@ fn aligned_hint_rows(rows: &[&[(&str, &str)]]) -> Vec<Line<'static>> {
                 };
                 spans.push(Span::styled(
                     format!(" {desc}{:width$}", "", width = pad),
-                    t.form_hint,
+                    t.tool_dim,
                 ));
             }
             Line::from(spans)
@@ -305,7 +305,7 @@ impl PermissionPrompt {
             let mut spans = vec![Span::raw("  "), Span::styled("guide ", label_style)];
             if text.is_empty() {
                 spans.push(Span::styled(cursor_ch.to_string(), Style::new().reversed()));
-                spans.push(Span::styled(rest, t.form_hint));
+                spans.push(Span::styled(rest, t.tool_dim));
             } else {
                 spans.push(Span::raw(before.to_string()));
                 spans.push(Span::styled(cursor_ch.to_string(), Style::new().reversed()));

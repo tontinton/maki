@@ -32,7 +32,7 @@ pub(crate) fn render_form(
 
 pub(crate) fn selected_prefix(t: &Theme, is_selected: bool) -> (&'static str, Style) {
     if is_selected {
-        ("▸ ", t.form_active)
+        ("▸ ", t.active)
     } else {
         ("  ", Style::new().fg(t.foreground))
     }

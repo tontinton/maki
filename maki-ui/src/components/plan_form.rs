@@ -174,12 +174,12 @@ impl PlanForm {
         for (i, item) in MENU.iter().enumerate() {
             let (prefix, style) = selected_prefix(&t, i == self.selected);
             let mut spans = vec![
-                Span::styled(prefix, t.form_arrow),
+                Span::styled(prefix, t.tool_dim),
                 Span::styled(item.label, style),
-                Span::styled(item.desc, t.form_description),
+                Span::styled(item.desc, t.tool_dim),
             ];
             if self.parallel {
-                spans.push(Span::styled(" (parallel)", t.form_description.bold()));
+                spans.push(Span::styled(" (parallel)", t.tool_dim.bold()));
             }
             lines.push(Line::from(spans));
         }

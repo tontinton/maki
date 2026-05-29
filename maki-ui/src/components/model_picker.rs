@@ -20,15 +20,15 @@ fn footer_line() -> Line<'static> {
     let t = theme::current();
     Line::from(vec![
         Span::styled("  Enter", t.keybind_key),
-        Span::styled(" select", t.form_hint),
+        Span::styled(" select", t.tool_dim),
         Span::styled("  Alt+1 ", t.keybind_key),
-        Span::styled("(set strong)", t.form_hint),
-        Span::styled(" / ", t.form_hint),
+        Span::styled("(set strong)", t.tool_dim),
+        Span::styled(" / ", t.tool_dim),
         Span::styled("Alt+2 ", t.keybind_key),
-        Span::styled("(set medium)", t.form_hint),
-        Span::styled(" / ", t.form_hint),
+        Span::styled("(set medium)", t.tool_dim),
+        Span::styled(" / ", t.tool_dim),
         Span::styled("Alt+3 ", t.keybind_key),
-        Span::styled("(set weak)", t.form_hint),
+        Span::styled("(set weak)", t.tool_dim),
     ])
 }
 
