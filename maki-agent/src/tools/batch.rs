@@ -127,6 +127,7 @@ impl BatchEntry {
             summary: summary.unwrap_or_else(|| reg.resolve_header(&self.tool, &self.parameters)),
             status,
             input: call.and_then(|c| c.start_input()),
+            raw_input: Some(self.parameters.clone()),
             output,
             annotation: None,
         }

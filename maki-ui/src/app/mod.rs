@@ -73,6 +73,9 @@ pub(crate) use queue::MessageQueue;
 use session_state::SessionState;
 
 const CANCEL_MSG: &str = "Cancelled.";
+/// Bypasses the per-run staleness filter in `handle_agent_event` since
+/// re-bake replies don't belong to any real agent run.
+pub(crate) const RESTORE_RUN_ID: u64 = u64::MAX;
 const FLASH_CANCEL: &str = "Press esc again to stop...";
 const FLASH_REWIND: &str = "Press esc again to rewind...";
 const AUTH_EXPIRED_MSG: &str =
@@ -170,6 +173,7 @@ pub struct App {
     pub(crate) permissions: Arc<PermissionManager>,
     pub(super) buf_click: Option<BufClickHandler>,
     pub(crate) lua_event_handle: Option<EventHandle>,
+    pub(crate) restore_event_tx: Option<maki_agent::EventSender>,
     subagent_answers: HashMap<String, flume::Sender<String>>,
 }
 
@@ -241,6 +245,7 @@ impl App {
             permissions,
             buf_click: None,
             lua_event_handle: None,
+            restore_event_tx: None,
             subagent_answers: HashMap::new(),
         }
     }
@@ -828,6 +833,29 @@ impl App {
     }
 
     fn handle_agent_event(&mut self, envelope: Envelope) -> Vec<Action> {
+        if envelope.run_id == RESTORE_RUN_ID {
+            let (id, snapshot, theme_gen, is_header) = match envelope.event {
+                AgentEvent::ToolSnapshot {
+                    id,
+                    snapshot,
+                    theme_gen,
+                } => (id, snapshot, theme_gen, false),
+                AgentEvent::ToolHeaderSnapshot {
+                    id,
+                    snapshot,
+                    theme_gen,
+                } => (id, snapshot, theme_gen, true),
+                _ => return vec![],
+            };
+            for chat in &mut self.chats {
+                if is_header {
+                    chat.tool_header_snapshot(&id, snapshot.clone(), theme_gen);
+                } else {
+                    chat.tool_snapshot(&id, snapshot.clone(), theme_gen);
+                }
+            }
+            return vec![];
+        }
         if envelope.run_id != self.run_id {
             // Stale run_id after cancel: agent updates shared_history before sending
             // Done/Error, so this is the first moment the full conversation is available.
@@ -1005,6 +1033,7 @@ impl App {
             self.chats[0].update_tool_model(id, model);
         }
         let mut chat = Chat::new(subagent.name.clone(), self.ui_config);
+        chat.set_restore_channel(self.lua_event_handle.clone(), self.restore_event_tx.clone());
         chat.model_id = subagent.model.clone();
         if let Some(ref prompt) = subagent.prompt {
             chat.push_user_message(prompt);

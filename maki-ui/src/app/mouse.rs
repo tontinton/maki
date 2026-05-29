@@ -54,7 +54,7 @@ impl App {
                                         && let Some(reply) = handler(&tool_id, row)
                                     {
                                         let chat = &mut self.chats[self.active_chat];
-                                        chat.tool_snapshot(&tool_id, reply.snapshot);
+                                        chat.tool_snapshot(&tool_id, reply.snapshot, None);
                                         chat.register_live_buf(tool_id, reply.live_buf);
                                     }
                                 }

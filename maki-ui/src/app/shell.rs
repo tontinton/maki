@@ -112,6 +112,7 @@ impl App {
                         language: "bash".into(),
                         code: command,
                     }),
+                    raw_input: None,
                     output: None,
                     render_header: None,
                 });

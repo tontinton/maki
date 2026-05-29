@@ -10,9 +10,8 @@ use maki_config::{PluginsConfig, RawConfig};
 
 use crate::api::command::{LuaCommandReader, UiAction};
 use crate::error::PluginError;
-use crate::runtime::{self, ClickReply, LuaThread, Request, RestoreReply};
+use crate::runtime::{self, ClickReply, LuaThread, Request, RestoreItem, RestoreReply};
 use maki_agent::prompt::ResolvedSlots;
-use serde_json::Value;
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -266,6 +265,11 @@ pub struct EventHandle {
 }
 
 impl EventHandle {
+    #[doc(hidden)]
+    pub fn disconnected_for_test() -> Self {
+        let (tx, _rx) = flume::unbounded();
+        Self { tx }
+    }
     pub fn fire_click(&self, tool_id: &str, row: u32) -> Option<ClickReply> {
         let (tx, rx) = flume::bounded(1);
         let _ = self.tx.try_send(Request::FireBufClick {
@@ -296,26 +300,17 @@ impl EventHandle {
         rx.recv_async().await.unwrap_or_default()
     }
 
-    pub fn restore_tool(
-        &self,
-        tool: &str,
-        tool_use_id: &str,
-        output: &str,
-        input: &Value,
-        is_error: bool,
-        tool_output_lines: &maki_config::ToolOutputLines,
-    ) -> Option<RestoreReply> {
+    /// One round-trip for N tools instead of N blocking channel hops.
+    pub fn restore_tool_batch(&self, items: Vec<RestoreItem>) -> Vec<Option<RestoreReply>> {
         let (tx, rx) = flume::bounded(1);
-        let _ = self.tx.send(Request::RestoreTool {
-            tool: Arc::from(tool),
-            tool_use_id: tool_use_id.to_owned(),
-            output: output.to_owned(),
-            input: input.clone(),
-            is_error,
-            tool_output_lines: *tool_output_lines,
-            reply: tx,
-        });
+        let _ = self.tx.send(Request::RestoreToolBatch { items, reply: tx });
         rx.recv().unwrap_or_default()
+    }
+
+    /// Non-blocking variant: result flows back through `event_tx` so theme
+    /// re-bakes don't block the UI thread.
+    pub fn request_restore(&self, item: RestoreItem, event_tx: maki_agent::EventSender) {
+        let _ = self.tx.send(Request::RestoreToolAsync { item, event_tx });
     }
 }
 

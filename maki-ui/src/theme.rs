@@ -240,13 +240,15 @@ pub fn current() -> Guard<Arc<Theme>> {
 }
 
 pub fn set(theme: Theme) {
+    // Order matters: install colors before bumping the counter, otherwise a
+    // reader could see the new generation but bake with the old palette.
     THEME.store(Arc::new(theme));
-    GENERATION.fetch_add(1, Ordering::Relaxed);
     crate::highlight::refresh_syntax_theme();
+    GENERATION.fetch_add(1, Ordering::Release);
 }
 
 pub fn generation() -> u64 {
-    GENERATION.load(Ordering::Relaxed)
+    GENERATION.load(Ordering::Acquire)
 }
 
 pub fn load_by_name(name: &str) -> Result<Theme, String> {
@@ -1077,5 +1079,55 @@ mode_build = "#112233"
     #[test_case("typo_keyword")]
     fn style_by_name_unknown_returns_default(name: &str) {
         assert_eq!(style_by_name(name), Style::default());
+    }
+
+    const DRACULA_BG: Color = Color::Rgb(0x28, 0x2a, 0x36);
+    const TOKYONIGHT_BG: Color = Color::Rgb(0x1a, 0x1b, 0x26);
+
+    fn tokyonight() -> Theme {
+        load_by_name("tokyonight").expect("tokyonight theme must exist")
+    }
+
+    #[test]
+    fn set_advances_generation() {
+        let before = generation();
+        set(dracula());
+        assert!(generation() > before);
+    }
+
+    #[test]
+    fn set_installs_theme_before_generation_observed() {
+        let theme = tokyonight();
+        let expected_syntax_bg = theme.syntax.settings.background;
+        let before = generation();
+
+        set(theme);
+
+        let observed = generation();
+        assert!(observed > before);
+        assert_eq!(current().background, TOKYONIGHT_BG);
+        assert_eq!(
+            maki_highlight::theme().settings.background,
+            expected_syntax_bg,
+            "syntax palette must reflect the new theme once generation advances",
+        );
+    }
+
+    #[test]
+    fn set_generation_is_monotonic_across_switches() {
+        let g0 = generation();
+        set(dracula());
+        let g1 = generation();
+        assert!(g1 > g0);
+        assert_eq!(current().background, DRACULA_BG);
+
+        set(tokyonight());
+        let g2 = generation();
+        assert!(g2 > g1);
+        assert_eq!(current().background, TOKYONIGHT_BG);
+        assert_eq!(
+            maki_highlight::theme().settings.background,
+            tokyonight().syntax.settings.background,
+        );
     }
 }

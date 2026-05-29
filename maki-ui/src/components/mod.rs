@@ -266,6 +266,7 @@ pub struct DisplayMessage {
     pub role: DisplayRole,
     pub text: String,
     pub tool_input: Option<Arc<ToolInput>>,
+    pub tool_raw_input: Option<Arc<serde_json::Value>>,
     pub tool_output: Option<Arc<ToolOutput>>,
     pub live_output: Option<String>,
     pub annotation: Option<String>,
@@ -275,6 +276,7 @@ pub struct DisplayMessage {
     pub truncated_lines: usize,
     pub render_snapshot: Option<BufferSnapshot>,
     pub render_header: Option<BufferSnapshot>,
+    pub snapshot_theme_gen: u64,
 }
 
 impl DisplayMessage {
@@ -283,6 +285,7 @@ impl DisplayMessage {
             role,
             text,
             tool_input: None,
+            tool_raw_input: None,
             tool_output: None,
             live_output: None,
             annotation: None,
@@ -292,6 +295,7 @@ impl DisplayMessage {
             truncated_lines: 0,
             render_snapshot: None,
             render_header: None,
+            snapshot_theme_gen: 0,
         }
     }
 
@@ -300,6 +304,7 @@ impl DisplayMessage {
             role: DisplayRole::Assistant,
             text,
             tool_input: None,
+            tool_raw_input: None,
             tool_output: None,
             live_output: None,
             annotation: None,
@@ -309,7 +314,13 @@ impl DisplayMessage {
             truncated_lines: 0,
             render_snapshot: None,
             render_header: None,
+            snapshot_theme_gen: 0,
         }
+    }
+
+    pub fn snapshot_is_stale(&self, current_gen: u64) -> bool {
+        (self.render_snapshot.is_some() || self.render_header.is_some())
+            && self.snapshot_theme_gen != current_gen
     }
 }
 
@@ -384,7 +395,39 @@ pub(crate) fn key(code: crossterm::event::KeyCode) -> crossterm::event::KeyEvent
 #[cfg(test)]
 mod tests {
     use super::*;
+    use maki_agent::{SnapshotLine, SnapshotSpan, SpanStyle};
     use test_case::test_case;
+
+    const SNAPSHOT_GEN: u64 = 7;
+
+    fn snapshot() -> BufferSnapshot {
+        BufferSnapshot::from_arc(Arc::new(vec![SnapshotLine {
+            spans: vec![SnapshotSpan {
+                text: "baked".into(),
+                style: SpanStyle::Default,
+            }],
+        }]))
+    }
+
+    #[test_case(false, false, false => false ; "no_snapshot_never_stale")]
+    #[test_case(true,  false, true  => false ; "has_snapshot_matching_gen_fresh")]
+    #[test_case(true,  false, false => true  ; "has_snapshot_mismatched_gen_stale")]
+    fn snapshot_is_stale_cases(has_body: bool, has_header: bool, gen_match: bool) -> bool {
+        let mut msg = DisplayMessage::new(DisplayRole::Assistant, "hi".into());
+        msg.snapshot_theme_gen = SNAPSHOT_GEN;
+        if has_body {
+            msg.render_snapshot = Some(snapshot());
+        }
+        if has_header {
+            msg.render_header = Some(snapshot());
+        }
+        let current_gen = if gen_match {
+            SNAPSHOT_GEN
+        } else {
+            SNAPSHOT_GEN + 1
+        };
+        msg.snapshot_is_stale(current_gen)
+    }
 
     #[test_case(0, 80, 1 ; "empty_text")]
     #[test_case(0, 0, 1 ; "zero_width")]

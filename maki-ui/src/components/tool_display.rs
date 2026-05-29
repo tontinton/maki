@@ -48,6 +48,13 @@ pub struct RenderCtx<'a> {
 pub struct BatchChildState {
     pub snapshot: Option<BufferSnapshot>,
     pub header: Option<BufferSnapshot>,
+    pub snapshot_theme_gen: u64,
+}
+
+impl BatchChildState {
+    pub fn snapshot_is_stale(&self, current_gen: u64) -> bool {
+        (self.snapshot.is_some() || self.header.is_some()) && self.snapshot_theme_gen != current_gen
+    }
 }
 
 pub(crate) fn output_limits_from_hints(
@@ -960,6 +967,7 @@ mod tests {
             })),
             text: text.into(),
             tool_input: input.map(Arc::new),
+            tool_raw_input: None,
             tool_output: output.map(Arc::new),
             live_output: None,
             annotation: None,
@@ -969,6 +977,7 @@ mod tests {
             turn_usage: None,
             render_snapshot: None,
             render_header: None,
+            snapshot_theme_gen: 0,
         }
     }
 
@@ -1102,6 +1111,7 @@ mod tests {
             summary: "test".into(),
             status,
             input,
+            raw_input: None,
             output,
             annotation: None,
         }
@@ -1250,6 +1260,7 @@ mod tests {
             })),
             text: "Find auth".into(),
             tool_input: None,
+            tool_raw_input: None,
             tool_output: Some(Arc::new(ToolOutput::Plain(output))),
             live_output: None,
             annotation: None,
@@ -1259,6 +1270,7 @@ mod tests {
             truncated_lines: 0,
             render_snapshot: None,
             render_header: None,
+            snapshot_theme_gen: 0,
         }
     }
 
@@ -1363,6 +1375,7 @@ mod tests {
             })),
             text: format!("src/lib.rs\n{body}"),
             tool_input: None,
+            tool_raw_input: None,
             tool_output: Some(Arc::new(ToolOutput::Plain(body.to_owned()))),
             live_output: None,
             annotation: None,
@@ -1372,6 +1385,7 @@ mod tests {
             truncated_lines: 0,
             render_snapshot: None,
             render_header: None,
+            snapshot_theme_gen: 0,
         }
     }
 
@@ -1400,6 +1414,7 @@ mod tests {
             })),
             text: "src/lib.rs\nplain fallback".into(),
             tool_input: None,
+            tool_raw_input: None,
             tool_output: Some(Arc::new(ToolOutput::Plain("plain fallback".into()))),
             live_output: None,
             annotation: None,
@@ -1409,6 +1424,7 @@ mod tests {
             truncated_lines: 0,
             render_snapshot: Some(snapshot),
             render_header: None,
+            snapshot_theme_gen: 0,
         }
     }
 
@@ -1421,6 +1437,23 @@ mod tests {
                     .collect(),
             ),
         }
+    }
+
+    #[test_case(false, false, false => false ; "no_snapshot_never_stale")]
+    #[test_case(true,  false, true  => false ; "has_snapshot_matching_gen_fresh")]
+    #[test_case(true,  false, false => true  ; "has_snapshot_mismatched_gen_stale")]
+    fn batch_child_snapshot_is_stale(has_body: bool, has_header: bool, gen_match: bool) -> bool {
+        const CURRENT_GEN: u64 = 7;
+        let state = BatchChildState {
+            snapshot: has_body.then(|| make_snapshot(vec![vec![]])),
+            header: has_header.then(|| make_snapshot(vec![vec![]])),
+            snapshot_theme_gen: if gen_match {
+                CURRENT_GEN
+            } else {
+                CURRENT_GEN + 1
+            },
+        };
+        state.snapshot_is_stale(CURRENT_GEN)
     }
 
     #[test]
@@ -1562,6 +1595,7 @@ mod tests {
             })),
             text,
             tool_input: None,
+            tool_raw_input: None,
             tool_output,
             live_output,
             annotation: None,
@@ -1571,6 +1605,7 @@ mod tests {
             turn_usage: None,
             render_snapshot: None,
             render_header: None,
+            snapshot_theme_gen: 0,
         }
     }
 
@@ -1659,6 +1694,7 @@ mod tests {
             })),
             text: "read /src/main.rs".into(),
             tool_input: None,
+            tool_raw_input: None,
             tool_output: Some(Arc::new(ToolOutput::ReadCode {
                 path: "main.rs".into(),
                 start_line: 1,
@@ -1674,6 +1710,7 @@ mod tests {
             turn_usage: None,
             render_snapshot: None,
             render_header: None,
+            snapshot_theme_gen: 0,
         }
     }
 
@@ -1810,6 +1847,7 @@ mod tests {
             })),
             text: "src/lib.rs\nbody_text_here".into(),
             tool_input: None,
+            tool_raw_input: None,
             tool_output: Some(Arc::new(ToolOutput::Plain("llm_output_here".into()))),
             live_output: None,
             annotation: None,
@@ -1819,6 +1857,7 @@ mod tests {
             truncated_lines: 0,
             render_snapshot: Some(snapshot),
             render_header: None,
+            snapshot_theme_gen: 0,
         };
         let tl = build_tool_lines(
             &msg,
@@ -1846,6 +1885,7 @@ mod tests {
             })),
             text: "header\nbody_fallback".into(),
             tool_input: None,
+            tool_raw_input: None,
             tool_output: None,
             live_output: None,
             annotation: None,
@@ -1855,6 +1895,7 @@ mod tests {
             truncated_lines: 0,
             render_snapshot: Some(snapshot),
             render_header: None,
+            snapshot_theme_gen: 0,
         };
         let tl = build_tool_lines(
             &msg,

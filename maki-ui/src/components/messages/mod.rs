@@ -34,9 +34,10 @@ use std::time::Instant;
 use super::scrollbar::render_vertical_scrollbar;
 use super::streaming_content::StreamingContent;
 use maki_agent::{
-    BatchToolEntry, BatchToolStatus, BufferSnapshot, InstructionBlock, NO_FILES_FOUND, SharedBuf,
-    ToolDoneEvent, ToolOutput, ToolStartEvent,
+    BatchToolEntry, BatchToolStatus, BufferSnapshot, EventSender, InstructionBlock, NO_FILES_FOUND,
+    SharedBuf, ToolDoneEvent, ToolOutput, ToolStartEvent,
 };
+use maki_lua::EventHandle;
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -75,6 +76,11 @@ pub struct MessagesPanel {
     batch_children: HashMap<String, BatchChildState>,
     tool_output_lines: ToolOutputLines,
     render_hints: RenderHintsRegistry,
+    lua_event_handle: Option<EventHandle>,
+    restore_event_tx: Option<EventSender>,
+    /// Deduplicates re-bake requests: we only fire one per tool per
+    /// generation, and `snapshot_theme_gen` only updates when colors land.
+    rebake_requested: HashMap<String, u64>,
 }
 
 impl MessagesPanel {
@@ -113,7 +119,19 @@ impl MessagesPanel {
             batch_children: HashMap::new(),
             tool_output_lines: ui_config.tool_output_lines,
             render_hints: RenderHintsRegistry::new(),
+            lua_event_handle: None,
+            restore_event_tx: None,
+            rebake_requested: HashMap::new(),
         }
+    }
+
+    pub fn set_restore_channel(
+        &mut self,
+        event_handle: Option<EventHandle>,
+        event_tx: Option<EventSender>,
+    ) {
+        self.lua_event_handle = event_handle;
+        self.restore_event_tx = event_tx;
     }
 
     pub fn push(&mut self, msg: DisplayMessage) {
@@ -157,6 +175,7 @@ impl MessagesPanel {
             }
             msg.text = event.summary;
             msg.tool_input = event.input.map(Arc::new);
+            msg.tool_raw_input = event.raw_input.map(Arc::new);
             msg.tool_output = event.output.map(Arc::new);
             msg.annotation = event.annotation;
             msg.render_header = event.render_header;
@@ -173,6 +192,7 @@ impl MessagesPanel {
             event.summary,
         );
         msg.tool_input = event.input.map(Arc::new);
+        msg.tool_raw_input = event.raw_input.map(Arc::new);
         msg.tool_output = event.output.map(Arc::new);
         msg.annotation = event.annotation;
         msg.render_header = event.render_header;
@@ -204,7 +224,7 @@ impl MessagesPanel {
         if let Some(entry) = self.live_bufs.remove(&event.id)
             && let Some(lines) = entry.buf.read_if_dirty()
         {
-            self.store_snapshot(&event.id, BufferSnapshot::from_arc(lines));
+            self.store_snapshot(&event.id, BufferSnapshot::from_arc(lines), false, None);
         }
         let Some(msg) = self
             .messages
@@ -268,6 +288,9 @@ impl MessagesPanel {
             for (existing, new) in existing.iter_mut().zip(new_entries) {
                 existing.status = new.status;
                 existing.output = new.output.clone();
+                if new.raw_input.is_some() {
+                    existing.raw_input = new.raw_input.clone();
+                }
             }
             *existing_text = text.clone();
         } else {
@@ -319,22 +342,22 @@ impl MessagesPanel {
         );
     }
 
-    pub fn tool_snapshot(&mut self, tool_id: &str, snapshot: BufferSnapshot) {
-        self.store_snapshot(tool_id, snapshot);
+    pub fn tool_snapshot(
+        &mut self,
+        tool_id: &str,
+        snapshot: BufferSnapshot,
+        theme_gen: Option<u64>,
+    ) {
+        self.store_snapshot(tool_id, snapshot, false, theme_gen);
     }
 
-    pub fn tool_header_snapshot(&mut self, tool_id: &str, snapshot: BufferSnapshot) {
-        if let Some((batch_id, _)) = parse_batch_inner_id(tool_id) {
-            self.batch_children
-                .entry(tool_id.to_owned())
-                .or_default()
-                .header = Some(snapshot);
-            self.rebuild_tool_segment(batch_id);
-        } else if let Some(msg) = self.find_tool_msg_mut(tool_id) {
-            msg.text = snapshot.first_line_text();
-            msg.render_header = Some(snapshot);
-            self.rebuild_tool_segment(tool_id);
-        }
+    pub fn tool_header_snapshot(
+        &mut self,
+        tool_id: &str,
+        snapshot: BufferSnapshot,
+        theme_gen: Option<u64>,
+    ) {
+        self.store_snapshot(tool_id, snapshot, true, theme_gen);
     }
 
     pub fn set_turn_usage_on_last_tool(&mut self, usage: String) {
@@ -534,6 +557,16 @@ impl MessagesPanel {
         self.messages.last().map(|m| &m.role)
     }
 
+    #[cfg(test)]
+    pub fn rebake_requested_gen(&self, tool_id: &str) -> Option<u64> {
+        self.rebake_requested.get(tool_id).copied()
+    }
+
+    #[cfg(test)]
+    pub fn snapshot_gen_of(&self, tool_id: &str) -> Option<u64> {
+        self.current_snapshot_gen(tool_id)
+    }
+
     pub fn flush(&mut self) {
         self.flush_thinking();
         if !self.streaming_text.is_empty() {
@@ -693,10 +726,14 @@ impl MessagesPanel {
         self.viewport_height = area.height;
         let width = area.width.saturating_sub(1);
         let theme_gen = theme::generation();
-        let width_changed = self.viewport_width != width || self.theme_generation != theme_gen;
+        let theme_changed = self.theme_generation != theme_gen;
+        let width_changed = self.viewport_width != width || theme_changed;
         if width_changed {
             self.viewport_width = width;
             self.theme_generation = theme_gen;
+        }
+        if theme_changed {
+            self.rebake_stale_snapshots(theme_gen);
         }
 
         if self.show_idle_splash() {
@@ -827,15 +864,132 @@ impl MessagesPanel {
                 .is_some_and(|m| m.render_snapshot.is_some())
     }
 
-    fn store_snapshot(&mut self, tool_id: &str, snapshot: BufferSnapshot) {
-        if let Some((batch_id, _)) = parse_batch_inner_id(tool_id) {
+    /// Fires async re-restores for every snapshot baked with an old theme.
+    /// Replies carry their generation, so a stale reply can never overwrite
+    /// fresher colors (monotonic guard in `resolve_snapshot_gen`).
+    fn rebake_stale_snapshots(&mut self, current_gen: u64) {
+        let (Some(eh), Some(tx)) = (self.lua_event_handle.clone(), self.restore_event_tx.clone())
+        else {
+            return;
+        };
+        self.rebake_requested.retain(|_, g| *g >= current_gen);
+        let tol = self.tool_output_lines;
+        let mut requested = Vec::new();
+        for msg in &self.messages {
+            let DisplayRole::Tool(role) = &msg.role else {
+                continue;
+            };
+            if !self.should_request_rebake(
+                &role.id,
+                msg.snapshot_is_stale(current_gen),
+                current_gen,
+            ) {
+                continue;
+            }
+            if let Some(item) = crate::chat::restore_item_for(msg, tol, current_gen) {
+                eh.request_restore(item, tx.clone());
+                requested.push(role.id.clone());
+            }
+        }
+        for item in self.stale_batch_child_items(current_gen) {
+            requested.push(item.tool_use_id.clone());
+            eh.request_restore(item, tx.clone());
+        }
+        for id in requested {
+            self.rebake_requested.insert(id, current_gen);
+        }
+    }
+
+    fn should_request_rebake(&self, tool_id: &str, stale: bool, current_gen: u64) -> bool {
+        stale && self.rebake_requested.get(tool_id) != Some(&current_gen)
+    }
+
+    /// Batch children live in `batch_children`, not in `self.messages`,
+    /// so they need a separate walk.
+    fn stale_batch_child_items(&self, current_gen: u64) -> Vec<maki_lua::RestoreItem> {
+        let tol = self.tool_output_lines;
+        let mut items = Vec::new();
+        for msg in &self.messages {
+            let DisplayRole::Tool(parent) = &msg.role else {
+                continue;
+            };
+            let Some(ToolOutput::Batch { entries, .. }) = msg.tool_output.as_deref() else {
+                continue;
+            };
+            for (idx, entry) in entries.iter().enumerate() {
+                let child_id = format!("{}__{idx}", parent.id);
+                let stale = self
+                    .batch_children
+                    .get(&child_id)
+                    .is_some_and(|c| c.snapshot_is_stale(current_gen));
+                if !self.should_request_rebake(&child_id, stale, current_gen) {
+                    continue;
+                }
+                if let Some(item) =
+                    crate::chat::restore_item_for_batch_entry(entry, child_id, tol, current_gen)
+                {
+                    items.push(item);
+                }
+            }
+        }
+        items
+    }
+
+    /// For live snapshots (`None`) we stamp the panel's generation. For
+    /// re-bake replies we enforce monotonicity: drop if something newer landed.
+    fn resolve_snapshot_gen(&self, tool_id: &str, incoming: Option<u64>) -> Option<u64> {
+        let Some(incoming_gen) = incoming else {
+            return Some(self.theme_generation);
+        };
+        match self.current_snapshot_gen(tool_id) {
+            Some(applied) if applied > incoming_gen => None,
+            _ => Some(incoming_gen),
+        }
+    }
+
+    fn current_snapshot_gen(&self, tool_id: &str) -> Option<u64> {
+        if parse_batch_inner_id(tool_id).is_some() {
             self.batch_children
-                .entry(tool_id.to_owned())
-                .or_default()
-                .snapshot = Some(snapshot);
+                .get(tool_id)
+                .map(|c| c.snapshot_theme_gen)
+        } else {
+            self.messages
+                .iter()
+                .rfind(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == tool_id))
+                .map(|m| m.snapshot_theme_gen)
+        }
+    }
+
+    fn store_snapshot(
+        &mut self,
+        tool_id: &str,
+        snapshot: BufferSnapshot,
+        is_header: bool,
+        theme_gen: Option<u64>,
+    ) {
+        let Some(applied_gen) = self.resolve_snapshot_gen(tool_id, theme_gen) else {
+            return;
+        };
+        if let Some((batch_id, _)) = parse_batch_inner_id(tool_id) {
+            if !self.has_tool_msg(batch_id) {
+                return;
+            }
+            let child = self.batch_children.entry(tool_id.to_owned()).or_default();
+            if is_header {
+                child.header = Some(snapshot);
+            } else {
+                child.snapshot = Some(snapshot);
+            }
+            child.snapshot_theme_gen = applied_gen;
             self.rebuild_tool_segment(batch_id);
         } else if let Some(msg) = self.find_tool_msg_mut(tool_id) {
-            msg.render_snapshot = Some(snapshot);
+            if is_header {
+                msg.text = snapshot.first_line_text();
+                msg.render_header = Some(snapshot);
+            } else {
+                msg.render_snapshot = Some(snapshot);
+            }
+            msg.snapshot_theme_gen = applied_gen;
             self.rebuild_tool_segment(tool_id);
         }
     }
@@ -844,6 +998,14 @@ impl MessagesPanel {
         self.messages
             .iter_mut()
             .rfind(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == tool_id))
+    }
+
+    /// Re-bake replies fan to every chat, so we need to skip chats that
+    /// don't own this tool (otherwise phantom batch children appear).
+    fn has_tool_msg(&self, tool_id: &str) -> bool {
+        self.messages
+            .iter()
+            .any(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == tool_id))
     }
 
     fn rctx(&self) -> RenderCtx<'_> {
@@ -877,7 +1039,7 @@ impl MessagesPanel {
             }
         }
         for (tool_id, lines) in dirty {
-            self.store_snapshot(&tool_id, BufferSnapshot::from_arc(lines));
+            self.store_snapshot(&tool_id, BufferSnapshot::from_arc(lines), false, None);
         }
         for id in stale {
             self.live_bufs.remove(&id);

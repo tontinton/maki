@@ -121,6 +121,10 @@ pub struct BatchToolEntry {
     pub summary: String,
     pub status: BatchToolStatus,
     pub input: Option<ToolInput>,
+    /// Lua plugins need the full JSON to re-run their snapshot on theme switch.
+    /// `input` only covers code_execution, so this stores the original call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_input: Option<serde_json::Value>,
     pub output: Option<ToolOutput>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub annotation: Option<String>,
@@ -348,6 +352,7 @@ pub struct ToolStartEvent {
     pub render_header: Option<BufferSnapshot>,
     pub annotation: Option<String>,
     pub input: Option<ToolInput>,
+    pub raw_input: Option<serde_json::Value>,
     pub output: Option<ToolOutput>,
 }
 
@@ -454,10 +459,15 @@ pub enum AgentEvent {
     ToolSnapshot {
         id: String,
         snapshot: BufferSnapshot,
+        /// Which theme baked these colors. `None` for live output.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        theme_gen: Option<u64>,
     },
     ToolHeaderSnapshot {
         id: String,
         snapshot: BufferSnapshot,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        theme_gen: Option<u64>,
     },
     LiveToolBuf {
         id: String,
@@ -1011,5 +1021,78 @@ mod tests {
     #[test_case("a.rs\nb.rs", false ; "plain_output_not_empty_for_content")]
     fn plain_output_is_empty(text: &str, expected: bool) {
         assert_eq!(ToolOutput::Plain(text.into()).is_empty_result(), expected);
+    }
+
+    #[test]
+    fn batch_tool_entry_raw_input_serde_round_trip() {
+        const MSG: &str = "raw_input should survive serde round-trip";
+        let entry = BatchToolEntry {
+            tool: "read".into(),
+            summary: "read a file".into(),
+            status: BatchToolStatus::Success,
+            input: None,
+            raw_input: Some(serde_json::json!({"path": "/a.rs"})),
+            output: None,
+            annotation: None,
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let parsed: BatchToolEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            parsed.raw_input,
+            Some(serde_json::json!({"path": "/a.rs"})),
+            "{MSG}"
+        );
+    }
+
+    #[test]
+    fn batch_tool_entry_raw_input_none_omitted_in_json() {
+        const MSG: &str = "raw_input: None must not appear in serialized JSON";
+        let entry = BatchToolEntry {
+            tool: "bash".into(),
+            summary: "run cmd".into(),
+            status: BatchToolStatus::Pending,
+            input: None,
+            raw_input: None,
+            output: None,
+            annotation: None,
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(!json.contains("raw_input"), "{MSG}");
+    }
+
+    #[test]
+    fn batch_tool_entry_missing_raw_input_deserializes_as_none() {
+        const MSG: &str = "missing raw_input field must deserialize as None (backwards compat)";
+        let json =
+            r#"{"tool":"grep","summary":"search","status":"Pending","input":null,"output":null}"#;
+        let entry: BatchToolEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.raw_input, None, "{MSG}");
+    }
+
+    #[test]
+    fn agent_event_tool_snapshot_theme_gen_backwards_compat() {
+        const OMIT_MSG: &str = "theme_gen: None must not appear in serialized JSON";
+        const COMPAT_MSG: &str = "missing theme_gen must deserialize as None (backwards compat)";
+
+        let event = AgentEvent::ToolSnapshot {
+            id: "t1".into(),
+            snapshot: BufferSnapshot {
+                lines: Arc::new(vec![]),
+            },
+            theme_gen: None,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(!json.contains("theme_gen"), "{OMIT_MSG}");
+
+        #[derive(Deserialize)]
+        struct ToolSnapshotFields {
+            #[allow(dead_code)]
+            id: String,
+            #[serde(default)]
+            theme_gen: Option<u64>,
+        }
+        let json_without = r#"{"id":"t1"}"#;
+        let parsed: ToolSnapshotFields = serde_json::from_str(json_without).unwrap();
+        assert_eq!(parsed.theme_gen, None, "{COMPAT_MSG}");
     }
 }

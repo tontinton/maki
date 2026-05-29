@@ -256,18 +256,11 @@ impl ToolInvocation for LuaToolInvocation {
                                 body: live_buf,
                             });
                         }
-                        if let Some(snapshot) = reply.snapshot {
-                            let _ = ctx.event_tx.send(AgentEvent::ToolSnapshot {
-                                id: id.clone(),
-                                snapshot,
-                            });
+                        crate::runtime::RestoreReply {
+                            body: reply.snapshot,
+                            header: reply.header,
                         }
-                        if let Some(header) = reply.header {
-                            let _ = ctx.event_tx.send(AgentEvent::ToolHeaderSnapshot {
-                                id: id.clone(),
-                                snapshot: header,
-                            });
-                        }
+                        .emit(id, None, &ctx.event_tx);
                     }
                     let format = reply.format;
                     reply.result.map(|s| match format {

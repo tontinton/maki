@@ -112,20 +112,59 @@ pub enum Request {
         reply: flume::Sender<ResolvedSlots>,
     },
     Shutdown,
-    RestoreTool {
-        tool: Arc<str>,
-        tool_use_id: String,
-        output: String,
-        input: Value,
-        is_error: bool,
-        tool_output_lines: maki_config::ToolOutputLines,
-        reply: flume::Sender<Option<RestoreReply>>,
+    RestoreToolAsync {
+        item: RestoreItem,
+        event_tx: maki_agent::EventSender,
     },
+    RestoreToolBatch {
+        items: Vec<RestoreItem>,
+        reply: flume::Sender<Vec<Option<RestoreReply>>>,
+    },
+}
+
+/// Single source of truth for re-running a lua restore callback, shared by
+/// session load, batch load, and theme re-bake.
+pub struct RestoreItem {
+    pub tool: Arc<str>,
+    pub tool_use_id: String,
+    pub output: String,
+    pub input: Value,
+    pub is_error: bool,
+    pub tool_output_lines: maki_config::ToolOutputLines,
+    /// Carried on the emitted snapshot so the UI can tell which theme
+    /// generation these colors belong to.
+    pub theme_gen: Option<u64>,
 }
 
 pub struct RestoreReply {
     pub body: Option<BufferSnapshot>,
     pub header: Option<BufferSnapshot>,
+}
+
+impl RestoreReply {
+    /// Shared by the live-tool path and re-bake path so snapshot routing
+    /// stays in one place.
+    pub fn emit(
+        self,
+        tool_use_id: &str,
+        theme_gen: Option<u64>,
+        event_tx: &maki_agent::EventSender,
+    ) {
+        if let Some(snapshot) = self.body {
+            let _ = event_tx.send(maki_agent::AgentEvent::ToolSnapshot {
+                id: tool_use_id.to_owned(),
+                snapshot,
+                theme_gen,
+            });
+        }
+        if let Some(snapshot) = self.header {
+            let _ = event_tx.send(maki_agent::AgentEvent::ToolHeaderSnapshot {
+                id: tool_use_id.to_owned(),
+                snapshot,
+                theme_gen,
+            });
+        }
+    }
 }
 
 pub struct ClickReply {
@@ -501,6 +540,7 @@ fn drain_spawn_queue(lua: &Lua, ex: &Rc<smol::LocalExecutor<'_>>, gate: &Rc<Infl
                     let _ = live.event_tx.send(maki_agent::AgentEvent::ToolSnapshot {
                         id: live.tool_use_id.clone(),
                         snapshot: buf.take(),
+                        theme_gen: None,
                     });
                 }
             }
@@ -1076,6 +1116,18 @@ impl LuaRuntime {
         extract_restore_reply(&ret)
     }
 
+    async fn restore_item(&self, item: RestoreItem) -> Option<RestoreReply> {
+        self.restore_tool(
+            &item.tool,
+            &item.tool_use_id,
+            &item.output,
+            item.input,
+            item.is_error,
+            item.tool_output_lines,
+        )
+        .await
+    }
+
     fn compute_permission_scopes(
         &self,
         plugin: &str,
@@ -1620,18 +1672,22 @@ pub fn spawn(
                             let slots = rt.collect_prompt_slots().await;
                             let _ = reply.send(slots);
                         }
-                    Request::RestoreTool {
-                        tool,
-                        tool_use_id,
-                        output,
-                        input,
-                        is_error,
-                        tool_output_lines,
-                        reply,
-                    } => {
-                        let res = rt.restore_tool(&tool, &tool_use_id, &output, input, is_error, tool_output_lines).await;
+                    Request::RestoreToolAsync { item, event_tx } => {
+                        let id = item.tool_use_id.clone();
+                        let theme_gen = item.theme_gen;
+                        let res = rt.restore_item(item).await;
                         drain_spawn_queue(&rt.lua, &ex, &gate);
-                        let _ = reply.send(res);
+                        if let Some(reply) = res {
+                            reply.emit(&id, theme_gen, &event_tx);
+                        }
+                    }
+                    Request::RestoreToolBatch { items, reply } => {
+                        let mut replies = Vec::with_capacity(items.len());
+                        for item in items {
+                            replies.push(rt.restore_item(item).await);
+                        }
+                        drain_spawn_queue(&rt.lua, &ex, &gate);
+                        let _ = reply.send(replies);
                     }
                     }
                 }

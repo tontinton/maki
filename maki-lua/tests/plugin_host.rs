@@ -1092,35 +1092,55 @@ fn ctx_set_deadline_twice_errors() {
     assert!(err.contains(DEADLINE_ALREADY_SET_ERR), "got: {err}");
 }
 
+const BATCH_ALIGN_MSG: &str =
+    "a tool with no restore callback must yield a None reply that keeps the batch aligned by index";
+
 #[test]
-fn bash_timeout_round_trip() {
+fn restore_tool_batch_ordering_and_alignment() {
     let reg = fresh_registry();
     let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
     host.load_builtins(&PluginsConfig::from_tools(HashMap::new()))
         .unwrap();
 
-    let input = serde_json::json!({"command": "sleep 30", "timeout": 1});
-    let err = exec_tool(&reg, "bash", input.clone()).unwrap_err();
-    assert_eq!(err, BASH_TIMEOUT_MSG);
+    let input = serde_json::json!({"command": "echo ok", "timeout": 1});
 
     let handle = host.event_handle().expect("event handle available");
-    let reply = handle
-        .restore_tool(
-            "bash",
-            "test_id",
-            BASH_TIMEOUT_MSG,
-            &input,
-            true,
-            &ToolOutputLines::default(),
-        )
-        .expect("restore should return a reply");
-    let body = reply.body.expect("restore body present");
-    let last = body.lines.last().expect("at least one line");
-    let text: String = last.spans.iter().map(|s| s.text.as_str()).collect();
-    assert!(
-        text.contains(BASH_TIMEOUT_MARKER),
-        "restored body missing timeout marker; got: {text:?}"
-    );
+    let bash_item = |id: &str| maki_lua::RestoreItem {
+        tool: std::sync::Arc::from("bash"),
+        tool_use_id: id.to_owned(),
+        output: BASH_TIMEOUT_MSG.to_owned(),
+        input: input.clone(),
+        is_error: true,
+        tool_output_lines: ToolOutputLines::default(),
+        theme_gen: None,
+    };
+    let unknown_item = maki_lua::RestoreItem {
+        tool: std::sync::Arc::from("definitely_not_a_tool"),
+        tool_use_id: "unknown_id".to_owned(),
+        output: "ignored".to_owned(),
+        input: serde_json::json!({}),
+        is_error: false,
+        tool_output_lines: ToolOutputLines::default(),
+        theme_gen: None,
+    };
+
+    let replies = handle.restore_tool_batch(vec![unknown_item, bash_item("a"), bash_item("b")]);
+    assert_eq!(replies.len(), 3, "one reply slot per item");
+    assert!(replies[0].is_none(), "{BATCH_ALIGN_MSG}");
+    for reply in &replies[1..] {
+        let body = reply
+            .as_ref()
+            .expect("restore reply present")
+            .body
+            .as_ref()
+            .expect("body present");
+        let last = body.lines.last().expect("at least one line");
+        let text: String = last.spans.iter().map(|s| s.text.as_str()).collect();
+        assert!(
+            text.contains(BASH_TIMEOUT_MARKER),
+            "batched restore body missing timeout marker; got: {text:?}"
+        );
+    }
 }
 
 /// Guards the stale-cancelled-handle bug: `permission_scopes` must run the
