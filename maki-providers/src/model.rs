@@ -170,7 +170,7 @@ impl Model {
                 e.family,
                 e.pricing.clone(),
                 e.max_output_tokens,
-                e.context_window,
+                anthropic::shared::long_context_window(model_id).unwrap_or(e.context_window),
                 e.fast_capable,
             ),
             None => (

@@ -13,6 +13,26 @@ use crate::{
 
 pub(super) const BETA_TOOL_EXAMPLES_BEDROCK: &str = "tool-examples-2025-10-29";
 
+/// A `-1m` suffix is our own convention for asking Anthropic for the 1M context
+/// window. We strip it from the id before sending and add [`LONG_CONTEXT_BETA`]
+/// to the request instead.
+pub(crate) const LONG_CONTEXT_SUFFIX: &str = "-1m";
+pub(crate) const LONG_CONTEXT_BETA: &str = "context-1m-2025-08-07";
+pub(crate) const LONG_CONTEXT_WINDOW: u32 = 1_000_000;
+
+pub(crate) fn strip_long_context(model_id: &str) -> &str {
+    model_id
+        .strip_suffix(LONG_CONTEXT_SUFFIX)
+        .unwrap_or(model_id)
+}
+
+/// A `-1m` model is just its base entry with a wider window.
+pub(crate) fn long_context_window(model_id: &str) -> Option<u32> {
+    model_id
+        .ends_with(LONG_CONTEXT_SUFFIX)
+        .then_some(LONG_CONTEXT_WINDOW)
+}
+
 pub(super) const MESSAGE_CACHE_BREAKPOINTS: usize = 2;
 
 #[derive(Serialize)]
@@ -495,4 +515,26 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             fast_capable: false,
         },
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use test_case::test_case;
+
+    use super::{
+        LONG_CONTEXT_SUFFIX, LONG_CONTEXT_WINDOW, long_context_window, strip_long_context,
+    };
+
+    #[test_case("claude-opus-4-8-1m", "claude-opus-4-8" ; "strips_suffix")]
+    #[test_case("claude-opus-4-8", "claude-opus-4-8" ; "leaves_plain_id")]
+    fn strip_long_context_removes_suffix(model_id: &str, expected: &str) {
+        assert_eq!(strip_long_context(model_id), expected);
+    }
+
+    #[test_case("claude-opus-4-8-1m", Some(LONG_CONTEXT_WINDOW) ; "suffix_opts_in")]
+    #[test_case("claude-opus-4-8", None ; "plain_id_keeps_base")]
+    fn long_context_window_follows_suffix(model_id: &str, expected: Option<u32>) {
+        assert_eq!(long_context_window(model_id), expected);
+        assert!(LONG_CONTEXT_SUFFIX.ends_with("1m"));
+    }
 }

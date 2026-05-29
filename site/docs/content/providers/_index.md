@@ -33,6 +33,8 @@ You can set multiple API keys in one env var (`ANTHROPIC_API_KEY=sk-1,sk-2,sk-3`
 
 Defaults: claude-haiku-4-5 (weak), claude-sonnet-4-6 (medium), claude-opus-4-8 (strong)
 
+Add `-1m` to any Claude model, like `claude-sonnet-4-6-1m`, to use the 1M token context window.
+
 #### Amazon Bedrock
 
 If you already use Claude through AWS Bedrock, you can point Maki at it instead of the direct Anthropic API. Set `CLAUDE_CODE_USE_BEDROCK=1` and Maki will route all Anthropic requests through Bedrock. The same models, the same features, just a different door.
