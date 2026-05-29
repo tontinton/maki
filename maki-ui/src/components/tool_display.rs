@@ -686,7 +686,7 @@ fn snapshot_to_lines_range(
 
 pub(crate) fn resolve_span_style(style: &SpanStyle) -> Style {
     match style {
-        SpanStyle::Default => Style::default(),
+        SpanStyle::Default => theme::current().tool,
         SpanStyle::Named(name) => theme::style_by_name(name),
         SpanStyle::Inline(inline) => {
             let mut s = Style::default();
@@ -1901,6 +1901,15 @@ mod tests {
         assert_eq!(resolved.fg, None);
         assert_eq!(resolved.bg, None);
         assert_eq!(resolved, Style::default());
+    }
+
+    #[test]
+    fn default_span_resolves_to_theme_tool() {
+        theme::set(theme::load_by_name("dracula").expect("dracula theme"));
+        assert_eq!(
+            resolve_span_style(&SpanStyle::Default),
+            theme::current().tool
+        );
     }
 
     #[test]
