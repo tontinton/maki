@@ -80,7 +80,10 @@ pub fn run(cli: Cli) -> Result<()> {
         .load_init_files(&cwd)
         .context("load init.lua files")?;
 
-    let mut config = raw_config.unwrap_or_default().into_config(cli.no_rtk);
+    let mut config = raw_config
+        .unwrap_or_default()
+        .into_config(cli.no_rtk)
+        .context("invalid config")?;
     config.permissions = load_permissions(&cwd);
 
     if cli.yolo || config.always_yolo {
@@ -129,13 +132,19 @@ pub fn run(cli: Cli) -> Result<()> {
         .context("run print mode")?;
     } else {
         let cwd_str = cwd.to_string_lossy().into_owned();
-        let session = resolve_session(
+        let mut session = resolve_session(
             cli.continue_session,
             cli.session,
             &model.spec(),
             &cwd_str,
             &storage,
         )?;
+        if session.messages.is_empty() {
+            session.meta.fast |= config.always_fast;
+            if let Some(thinking) = config.always_thinking {
+                session.meta.thinking = Some(thinking);
+            }
+        }
         let model = if session.messages.is_empty() {
             model
         } else {

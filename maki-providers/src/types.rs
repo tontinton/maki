@@ -237,7 +237,7 @@ impl StopReason {
     }
 }
 
-const MIN_THINKING_BUDGET: u32 = 1024;
+const THINKING_USAGE: &str = "Usage: /thinking [off|adaptive|<budget\u{2265}1024>]";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ThinkingConfig {
@@ -265,19 +265,16 @@ impl ThinkingConfig {
     }
 
     pub fn parse(input: &str, current: Self) -> Result<Self, &'static str> {
-        match input {
-            "" => Ok(if current.is_enabled() {
+        if input.is_empty() {
+            return Ok(if current.is_enabled() {
                 Self::Off
             } else {
                 Self::Adaptive
-            }),
-            "off" => Ok(Self::Off),
-            "adaptive" => Ok(Self::Adaptive),
-            n => match n.parse::<u32>() {
-                Ok(budget) if budget >= MIN_THINKING_BUDGET => Ok(Self::Budget(budget)),
-                _ => Err("Usage: /thinking [off|adaptive|<budget\u{2265}1024>]"),
-            },
+            });
         }
+        StoredThinking::parse_setting(input)
+            .map(Into::into)
+            .map_err(|_| THINKING_USAGE)
     }
 
     pub fn status_label(self) -> Option<Cow<'static, str>> {

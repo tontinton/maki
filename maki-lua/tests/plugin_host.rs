@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use maki_agent::tools::{ToolRegistry, ToolSource};
-use maki_config::{PluginsConfig, ToolOutputLines};
+use maki_config::{AlwaysThinking, PluginsConfig, ToolOutputLines};
 use maki_lua::{PluginError, PluginHost};
 
 fn fresh_registry() -> Arc<ToolRegistry> {
@@ -873,6 +873,8 @@ fn setup_all_sections_at_once() {
         .send_run_init_lua(
             r#"maki.setup({
                 always_yolo = true,
+                always_fast = true,
+                always_thinking = "adaptive",
                 ui = { splash_animation = false, mouse_scroll_lines = 5 },
                 agent = { bash_timeout_secs = 120, max_output_lines = 9000 },
                 provider = { default_model = "anthropic/claude-opus-4-6" },
@@ -887,6 +889,11 @@ fn setup_all_sections_at_once() {
         .unwrap()
         .expect("expected Some(RawConfig)");
     assert_eq!(raw.always_yolo, Some(true));
+    assert_eq!(raw.always_fast, Some(true));
+    assert_eq!(
+        raw.always_thinking,
+        Some(AlwaysThinking::Mode("adaptive".into()))
+    );
     assert_eq!(raw.ui.splash_animation, Some(false));
     assert_eq!(raw.ui.mouse_scroll_lines, Some(5));
     assert_eq!(raw.agent.bash_timeout_secs, Some(120));
@@ -898,6 +905,21 @@ fn setup_all_sections_at_once() {
     assert_eq!(raw.storage.max_log_files, Some(3));
     assert_eq!(raw.index.max_file_size_mb, Some(8));
     assert_eq!(raw.tools["bash"].enabled, Some(true));
+}
+
+#[test]
+fn setup_always_thinking_accepts_bool() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let raw = host
+        .send_run_init_lua(
+            "maki.setup({ always_thinking = true })".to_owned(),
+            "test_init.lua".to_owned(),
+            None,
+        )
+        .unwrap()
+        .expect("expected Some(RawConfig)");
+    assert_eq!(raw.always_thinking, Some(AlwaysThinking::Toggle(true)));
 }
 
 #[test]

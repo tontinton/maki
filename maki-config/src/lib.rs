@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use maki_config_macro::ConfigSection;
 use maki_storage::paths;
+use maki_storage::sessions::{StoredThinking, ThinkingParseError};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::warn;
@@ -98,13 +99,29 @@ pub struct ConfigField {
     pub description: &'static str,
 }
 
-pub const TOP_LEVEL_FIELDS: &[ConfigField] = &[ConfigField {
-    name: "always_yolo",
-    ty: "bool",
-    default: ConfigValue::Bool(false),
-    min: None,
-    description: "Start every session with YOLO mode (skip permission prompts, deny rules still apply)",
-}];
+pub const TOP_LEVEL_FIELDS: &[ConfigField] = &[
+    ConfigField {
+        name: "always_yolo",
+        ty: "bool",
+        default: ConfigValue::Bool(false),
+        min: None,
+        description: "Start every session with YOLO mode (skip permission prompts, deny rules still apply)",
+    },
+    ConfigField {
+        name: "always_fast",
+        ty: "bool",
+        default: ConfigValue::Bool(false),
+        min: None,
+        description: "Start every session with Anthropic fast mode (Opus only; ignored otherwise)",
+    },
+    ConfigField {
+        name: "always_thinking",
+        ty: "bool | string",
+        default: ConfigValue::Bool(false),
+        min: None,
+        description: "Start every session with extended thinking (true/\"adaptive\", \"off\", or a token budget)",
+    },
+];
 
 pub const INDEX_FIELDS: &[ConfigField] = &[ConfigField {
     name: "max_file_size_mb",
@@ -115,12 +132,16 @@ pub const INDEX_FIELDS: &[ConfigField] = &[ConfigField {
 }];
 
 #[derive(Debug, Error)]
-#[error("invalid config: {section}.{field} = {value} is below minimum ({min})")]
-pub struct ConfigError {
-    section: &'static str,
-    field: &'static str,
-    value: u64,
-    min: u64,
+pub enum ConfigError {
+    #[error("invalid config: {section}.{field} = {value} is below minimum ({min})")]
+    BelowMinimum {
+        section: &'static str,
+        field: &'static str,
+        value: u64,
+        min: u64,
+    },
+    #[error("invalid config: always_thinking: {0}")]
+    Thinking(#[from] ThinkingParseError),
 }
 
 fn check(
@@ -130,7 +151,7 @@ fn check(
     min: u64,
 ) -> Result<(), ConfigError> {
     if value < min {
-        return Err(ConfigError {
+        return Err(ConfigError::BelowMinimum {
             section,
             field,
             value,
@@ -146,10 +167,29 @@ macro_rules! merge_option {
     };
 }
 
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum AlwaysThinking {
+    Toggle(bool),
+    Mode(String),
+}
+
+impl AlwaysThinking {
+    fn resolve(self) -> Result<StoredThinking, ThinkingParseError> {
+        match self {
+            Self::Toggle(true) => Ok(StoredThinking::Adaptive),
+            Self::Toggle(false) => Ok(StoredThinking::Off),
+            Self::Mode(s) => StoredThinking::parse_setting(&s),
+        }
+    }
+}
+
 #[derive(Deserialize, Default, Debug)]
 #[serde(default, deny_unknown_fields)]
 pub struct RawConfig {
     pub always_yolo: Option<bool>,
+    pub always_fast: Option<bool>,
+    pub always_thinking: Option<AlwaysThinking>,
     #[serde(default)]
     pub ui: UiFileConfig,
     pub agent: AgentFileConfig,
@@ -161,7 +201,7 @@ pub struct RawConfig {
 
 impl RawConfig {
     pub fn merge(&mut self, overlay: RawConfig) {
-        merge_option!(self, overlay, always_yolo);
+        merge_option!(self, overlay, always_yolo, always_fast, always_thinking);
         self.ui.merge(overlay.ui);
         self.agent.merge(overlay.agent);
         self.provider.merge(overlay.provider);
@@ -170,22 +210,27 @@ impl RawConfig {
         self.tools.extend(overlay.tools);
     }
 
-    pub fn into_config(self, no_rtk: bool) -> Config {
+    pub fn into_config(self, no_rtk: bool) -> Result<Config, ConfigError> {
         let disabled_tools: Vec<String> = self
             .tools
             .iter()
             .filter(|(_, cfg)| cfg.enabled == Some(false))
             .map(|(name, _)| name.clone())
             .collect();
-        Config {
+        Ok(Config {
             always_yolo: self.always_yolo.unwrap_or(false),
+            always_fast: self.always_fast.unwrap_or(false),
+            always_thinking: self
+                .always_thinking
+                .map(AlwaysThinking::resolve)
+                .transpose()?,
             ui: UiConfig::from_file(self.ui),
             agent: AgentConfig::from_file(self.agent, no_rtk, &self.index, disabled_tools),
             provider: ProviderConfig::from_file(self.provider),
             storage: StorageConfig::from_file(self.storage),
             permissions: PermissionsConfig::default(),
             plugins: PluginsConfig::from_tools(self.tools),
-        }
+        })
     }
 }
 
@@ -408,6 +453,8 @@ pub struct PermissionsConfig {
 
 pub struct Config {
     pub always_yolo: bool,
+    pub always_fast: bool,
+    pub always_thinking: Option<StoredThinking>,
     pub ui: UiConfig,
     pub agent: AgentConfig,
     pub provider: ProviderConfig,
@@ -1057,7 +1104,7 @@ mod tests {
 
     #[test]
     fn empty_config_returns_defaults() {
-        let config = RawConfig::default().into_config(false);
+        let config = RawConfig::default().into_config(false).unwrap();
         assert!(config.ui.splash_animation);
         assert_eq!(config.agent.max_output_bytes, DEFAULT_MAX_OUTPUT_BYTES);
         assert_eq!(
@@ -1080,7 +1127,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let config = raw.into_config(false);
+        let config = raw.into_config(false).unwrap();
         assert_eq!(config.agent.max_output_lines, 5000);
         assert_eq!(config.agent.bash_timeout_secs, 60);
         assert_eq!(config.agent.max_output_bytes, DEFAULT_MAX_OUTPUT_BYTES);
@@ -1119,6 +1166,57 @@ mod tests {
         assert_eq!(base.ui.flash_duration_ms, Some(2000), "base preserved");
     }
 
+    #[test]
+    fn merge_always_fast_and_thinking_overlay_wins() {
+        let mut base = RawConfig {
+            always_fast: Some(false),
+            always_thinking: Some(AlwaysThinking::Mode("off".into())),
+            ..Default::default()
+        };
+        let overlay = RawConfig {
+            always_fast: Some(true),
+            always_thinking: Some(AlwaysThinking::Toggle(true)),
+            ..Default::default()
+        };
+        base.merge(overlay);
+
+        assert_eq!(base.always_fast, Some(true), "overlay wins");
+        assert_eq!(
+            base.always_thinking,
+            Some(AlwaysThinking::Toggle(true)),
+            "overlay wins"
+        );
+    }
+
+    #[test_case(AlwaysThinking::Toggle(true), StoredThinking::Adaptive ; "toggle_true")]
+    #[test_case(AlwaysThinking::Toggle(false), StoredThinking::Off ; "toggle_false")]
+    fn always_thinking_toggle_resolve(input: AlwaysThinking, expected: StoredThinking) {
+        assert_eq!(input.resolve(), Ok(expected));
+    }
+
+    #[test]
+    fn into_config_resolves_always_thinking() {
+        let defaults = RawConfig::default().into_config(false).unwrap();
+        assert!(defaults.always_thinking.is_none());
+
+        let raw = RawConfig {
+            always_thinking: Some(AlwaysThinking::Mode("8192".into())),
+            ..Default::default()
+        };
+        let config = raw.into_config(false).unwrap();
+        assert_eq!(
+            config.always_thinking,
+            Some(StoredThinking::Budget { tokens: 8192 })
+        );
+
+        let raw = RawConfig {
+            always_thinking: Some(AlwaysThinking::Mode("fast".into())),
+            ..Default::default()
+        };
+        let err = raw.into_config(false).err().expect("expected config error");
+        assert!(matches!(err, ConfigError::Thinking(_)));
+    }
+
     #[test_case("max_output_bytes",  0 ; "zero_output_bytes")]
     #[test_case("max_output_lines",  0 ; "zero_output_lines")]
     #[test_case("max_response_bytes", 0 ; "zero_response_bytes")]
@@ -1135,7 +1233,7 @@ mod tests {
             _ => unreachable!(),
         }
         let err = config.validate().unwrap_err();
-        assert_eq!(err.field, field);
+        assert!(matches!(err, ConfigError::BelowMinimum { field: f, .. } if f == field));
     }
 
     #[test]
@@ -1151,7 +1249,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let config = raw.into_config(false);
+        let config = raw.into_config(false).unwrap();
         assert_eq!(config.ui.tool_output_lines.bash, 20);
         assert_eq!(config.ui.tool_output_lines.read, 20);
         assert_eq!(
@@ -1168,6 +1266,8 @@ mod tests {
     fn validate_rejects_invalid_sections(section: &str, field: &str, value: u64) {
         let mut config = Config {
             always_yolo: false,
+            always_fast: false,
+            always_thinking: None,
             ui: UiConfig::default(),
             agent: AgentConfig::default(),
             provider: ProviderConfig::default(),
@@ -1186,8 +1286,10 @@ mod tests {
             _ => unreachable!(),
         }
         let err = config.validate().unwrap_err();
-        assert_eq!(err.section, section);
-        assert_eq!(err.field, field);
+        assert!(matches!(
+            err,
+            ConfigError::BelowMinimum { section: s, field: f, .. } if s == section && f == field
+        ));
     }
 
     #[test]
@@ -1396,7 +1498,7 @@ mod tests {
 
     #[test]
     fn plugins_default_builtins_populated_when_enabled() {
-        let config = RawConfig::default().into_config(false);
+        let config = RawConfig::default().into_config(false).unwrap();
         assert!(
             !config.plugins.tools.is_empty(),
             "enabled plugins should have default builtins"
@@ -1601,7 +1703,7 @@ mod tests {
             tools,
             ..Default::default()
         };
-        let config = raw.into_config(false);
+        let config = raw.into_config(false).unwrap();
 
         assert!(config.plugins.tools.contains(&"bash".to_string()));
         assert!(!config.plugins.tools.contains(&"websearch".to_string()));

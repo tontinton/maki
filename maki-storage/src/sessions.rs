@@ -112,12 +112,36 @@ pub struct StoredRule {
     pub effect: StoredEffect,
 }
 
+pub const MIN_THINKING_BUDGET: u32 = 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ThinkingParseError {
+    #[error("unknown thinking value {0:?} (use off, adaptive, or a token budget)")]
+    Unknown(String),
+    #[error("thinking budget {0} is below the minimum of {MIN_THINKING_BUDGET}")]
+    BudgetTooSmall(u32),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase", tag = "kind")]
 pub enum StoredThinking {
     Off,
     Adaptive,
     Budget { tokens: u32 },
+}
+
+impl StoredThinking {
+    pub fn parse_setting(input: &str) -> Result<Self, ThinkingParseError> {
+        match input.trim() {
+            "off" => Ok(Self::Off),
+            "adaptive" => Ok(Self::Adaptive),
+            other => match other.parse::<u32>() {
+                Ok(n) if n >= MIN_THINKING_BUDGET => Ok(Self::Budget { tokens: n }),
+                Ok(n) => Err(ThinkingParseError::BudgetTooSmall(n)),
+                Err(_) => Err(ThinkingParseError::Unknown(other.to_string())),
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -836,6 +860,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::StoredThinking;
+    use super::ThinkingParseError;
     use super::{
         CWD_INDEX_FILE, DEFAULT_TITLE, MAX_TITLE_LEN, SESSION_VERSION, generate_title,
         load_cwd_index, update_cwd_index,
@@ -1246,6 +1271,17 @@ mod tests {
         let json = serde_json::to_string(&variant).unwrap();
         let parsed: StoredThinking = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, variant);
+    }
+
+    #[test_case("off", Ok(StoredThinking::Off) ; "off")]
+    #[test_case("adaptive", Ok(StoredThinking::Adaptive) ; "adaptive")]
+    #[test_case(" adaptive ", Ok(StoredThinking::Adaptive) ; "trims_whitespace")]
+    #[test_case("4096", Ok(StoredThinking::Budget { tokens: 4096 }) ; "valid_budget")]
+    #[test_case("1024", Ok(StoredThinking::Budget { tokens: 1024 }) ; "minimum_budget")]
+    #[test_case("512", Err(ThinkingParseError::BudgetTooSmall(512)) ; "budget_too_small")]
+    #[test_case("fast", Err(ThinkingParseError::Unknown("fast".into())) ; "garbage")]
+    fn parse_setting(input: &str, expected: Result<StoredThinking, ThinkingParseError>) {
+        assert_eq!(StoredThinking::parse_setting(input), expected);
     }
 
     #[test]
