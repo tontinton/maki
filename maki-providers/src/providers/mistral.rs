@@ -30,10 +30,10 @@ pub(crate) fn models() -> &'static [ModelEntry] {
                 output: 2.0,
                 cache_write: 0.00,
                 cache_read: 0.00,
+                fast: None,
             },
             max_output_tokens: 262_144,
             context_window: 262_144,
-            fast_capable: false,
         },
         ModelEntry {
             prefixes: &["mistral-large-latest", "mistral-large-2512"],
@@ -45,10 +45,10 @@ pub(crate) fn models() -> &'static [ModelEntry] {
                 output: 1.5,
                 cache_write: 0.00,
                 cache_read: 0.00,
+                fast: None,
             },
             max_output_tokens: 262_144,
             context_window: 262_144,
-            fast_capable: false,
         },
         ModelEntry {
             prefixes: &["mistral-small-latest", "mistral-small-2603"],
@@ -60,10 +60,10 @@ pub(crate) fn models() -> &'static [ModelEntry] {
                 output: 0.60,
                 cache_write: 0.00,
                 cache_read: 0.00,
+                fast: None,
             },
             max_output_tokens: 262_144,
             context_window: 262_144,
-            fast_capable: false,
         },
     ]
 }

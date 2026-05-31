@@ -30,10 +30,10 @@ pub(crate) fn models() -> &'static [ModelEntry] {
                 output: 3.40,
                 cache_write: 0.00,
                 cache_read: 0.00,
+                fast: None,
             },
             max_output_tokens: 131072,
             context_window: 200_000,
-            fast_capable: false,
         },
         ModelEntry {
             prefixes: &["hf:deepseek-ai/DeepSeek-V3.2"],
@@ -45,10 +45,10 @@ pub(crate) fn models() -> &'static [ModelEntry] {
                 output: 1.68,
                 cache_write: 0.00,
                 cache_read: 0.00,
+                fast: None,
             },
             max_output_tokens: 131072,
             context_window: 200_000,
-            fast_capable: false,
         },
         ModelEntry {
             prefixes: &["hf:zai-org/GLM-4.7-Flash"],
@@ -60,10 +60,10 @@ pub(crate) fn models() -> &'static [ModelEntry] {
                 output: 0.50,
                 cache_write: 0.00,
                 cache_read: 0.00,
+                fast: None,
             },
             max_output_tokens: 131072,
             context_window: 200_000,
-            fast_capable: false,
         },
     ]
 }

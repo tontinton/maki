@@ -34,10 +34,10 @@ pub(crate) fn models() -> &'static [ModelEntry] {
                 output: 0.28,
                 cache_write: 0.00,
                 cache_read: 0.00,
+                fast: None,
             },
             max_output_tokens: 384_000,
             context_window: 1_000_000,
-            fast_capable: false,
         },
         ModelEntry {
             prefixes: &["deepseek-v4-pro"],
@@ -49,10 +49,10 @@ pub(crate) fn models() -> &'static [ModelEntry] {
                 output: 0.87,
                 cache_write: 0.00,
                 cache_read: 0.00,
+                fast: None,
             },
             max_output_tokens: 384_000,
             context_window: 1_000_000,
-            fast_capable: false,
         },
     ]
 }

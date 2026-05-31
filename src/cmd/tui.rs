@@ -119,6 +119,7 @@ pub fn run(cli: Cli) -> Result<()> {
     let commands = discover_commands(cli.no_commands);
 
     if cli.print {
+        let fast = config.always_fast && model.supports_fast();
         crate::print::run(
             &model,
             cli.prompt,
@@ -128,6 +129,7 @@ pub fn run(cli: Cli) -> Result<()> {
             config.permissions,
             timeouts,
             plugin_host.event_handle(),
+            fast,
         )
         .context("run print mode")?;
     } else {

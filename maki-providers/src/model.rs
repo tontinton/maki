@@ -37,6 +37,20 @@ pub struct ModelPricing {
     pub output: f64,
     pub cache_write: f64,
     pub cache_read: f64,
+    /// Anthropic fast mode charges a premium that differs per model (6x on Opus
+    /// 4.6/4.7, 2x on Opus 4.8). `None` means the model has no fast tier, so asking
+    /// for fast mode quietly falls back to standard rates instead of overcharging.
+    #[serde(default)]
+    pub fast: Option<FastPricing>,
+}
+
+/// Cache rates are missing on purpose: Anthropic derives them from `input` with
+/// the same multipliers it uses for standard pricing, so storing them would just
+/// invite the two copies to drift apart.
+#[derive(Debug, Clone, Deserialize)]
+pub struct FastPricing {
+    pub input: f64,
+    pub output: f64,
 }
 
 impl ModelPricing {
@@ -45,7 +59,12 @@ impl ModelPricing {
         output: 0.0,
         cache_write: 0.0,
         cache_read: 0.0,
+        fast: None,
     };
+
+    /// Cache multipliers Anthropic applies on top of the base input rate.
+    const CACHE_WRITE_MULTIPLIER: f64 = 1.25;
+    const CACHE_READ_MULTIPLIER: f64 = 0.10;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,9 +116,6 @@ pub struct ModelEntry {
     pub pricing: ModelPricing,
     pub max_output_tokens: u32,
     pub context_window: u32,
-    /// Read this through `Model::supports_fast()`, never directly: it also
-    /// checks the provider, since only the Anthropic direct API serves fast mode.
-    pub fast_capable: bool,
 }
 
 fn lookup_entry<'a>(
@@ -147,7 +163,6 @@ pub struct Model {
     pub pricing: ModelPricing,
     pub max_output_tokens: u32,
     pub context_window: u32,
-    pub fast_capable: bool,
 }
 
 impl Model {
@@ -164,21 +179,18 @@ impl Model {
             provider,
             static_entry.map(|e| e.tier),
         );
-        let (family, pricing, max_output_tokens, context_window, fast_capable) = match static_entry
-        {
+        let (family, pricing, max_output_tokens, context_window) = match static_entry {
             Some(e) => (
                 e.family,
                 e.pricing.clone(),
                 e.max_output_tokens,
                 anthropic::shared::long_context_window(model_id).unwrap_or(e.context_window),
-                e.fast_capable,
             ),
             None => (
                 provider.family(),
                 ModelPricing::ZERO,
                 provider.fallback_max_output(),
                 provider.fallback_context_window(),
-                false,
             ),
         };
         Self {
@@ -191,7 +203,6 @@ impl Model {
             pricing,
             max_output_tokens,
             context_window,
-            fast_capable,
         }
     }
 
@@ -200,10 +211,12 @@ impl Model {
             .unwrap_or_else(|| self.family.supports_tool_examples())
     }
 
-    /// Bedrock reuses `ProviderKind::Anthropic` and the same model table, so we
-    /// also check the provider here: fast mode only exists on the direct API.
+    /// A model supports fast mode exactly when it carries fast-tier pricing, so
+    /// capability and billing can never disagree. Bedrock reuses
+    /// `ProviderKind::Anthropic` and the same table, so we also gate on the
+    /// provider here: fast mode only exists on the direct API.
     pub fn supports_fast(&self) -> bool {
-        self.fast_capable && self.provider == ProviderKind::Anthropic
+        self.pricing.fast.is_some() && self.provider == ProviderKind::Anthropic
     }
 
     pub fn spec(&self) -> String {
@@ -287,11 +300,25 @@ impl TokenUsage {
         self.input + self.output + self.cache_creation + self.cache_read
     }
 
-    pub fn cost(&self, pricing: &ModelPricing) -> f64 {
-        self.input as f64 * pricing.input / PER_MILLION
-            + self.output as f64 * pricing.output / PER_MILLION
-            + self.cache_creation as f64 * pricing.cache_write / PER_MILLION
-            + self.cache_read as f64 * pricing.cache_read / PER_MILLION
+    pub fn cost(&self, pricing: &ModelPricing, fast: bool) -> f64 {
+        let (input, output, cache_write, cache_read) = match &pricing.fast {
+            Some(f) if fast => (
+                f.input,
+                f.output,
+                f.input * ModelPricing::CACHE_WRITE_MULTIPLIER,
+                f.input * ModelPricing::CACHE_READ_MULTIPLIER,
+            ),
+            _ => (
+                pricing.input,
+                pricing.output,
+                pricing.cache_write,
+                pricing.cache_read,
+            ),
+        };
+        self.input as f64 * input / PER_MILLION
+            + self.output as f64 * output / PER_MILLION
+            + self.cache_creation as f64 * cache_write / PER_MILLION
+            + self.cache_read as f64 * cache_read / PER_MILLION
     }
 }
 
@@ -341,6 +368,7 @@ mod tests {
             output: 15.00,
             cache_write: 3.75,
             cache_read: 0.30,
+            fast: None,
         };
         let usage = TokenUsage {
             input: 1_000_000,
@@ -348,9 +376,68 @@ mod tests {
             cache_creation: 200_000,
             cache_read: 500_000,
         };
-        let cost = usage.cost(&pricing);
+        let cost = usage.cost(&pricing, false);
         let expected = 3.0 + 1.5 + 0.75 + 0.15;
         assert!((cost - expected).abs() < 1e-10);
+    }
+
+    #[test]
+    fn fast_mode_applies_premium_rates() {
+        let pricing = ModelPricing {
+            input: 5.00,
+            output: 25.00,
+            cache_write: 6.25,
+            cache_read: 0.50,
+            fast: Some(FastPricing {
+                input: 30.00,
+                output: 150.00,
+            }),
+        };
+        let usage = TokenUsage {
+            input: 1_000_000,
+            output: 1_000_000,
+            cache_creation: 1_000_000,
+            cache_read: 1_000_000,
+        };
+        let fast = usage.cost(&pricing, true);
+        let expected = 30.0 + 150.0 + 37.5 + 3.0;
+        assert!((fast - expected).abs() < 1e-10);
+        assert!(fast > usage.cost(&pricing, false));
+    }
+
+    #[test]
+    fn fast_flag_ignored_without_fast_tier() {
+        let pricing = ModelPricing {
+            input: 3.00,
+            output: 15.00,
+            cache_write: 3.75,
+            cache_read: 0.30,
+            fast: None,
+        };
+        let usage = TokenUsage {
+            input: 1_000_000,
+            output: 1_000_000,
+            cache_creation: 0,
+            cache_read: 0,
+        };
+        assert_eq!(usage.cost(&pricing, true), usage.cost(&pricing, false));
+    }
+
+    #[test]
+    fn fast_pricing_is_always_a_premium() {
+        for provider in ProviderKind::iter() {
+            for entry in models_for_provider(provider) {
+                let Some(fast) = &entry.pricing.fast else {
+                    continue;
+                };
+                assert!(
+                    fast.input >= entry.pricing.input && fast.output >= entry.pricing.output,
+                    "{}/{}: fast pricing must not be cheaper than standard",
+                    provider,
+                    entry.prefixes[0],
+                );
+            }
+        }
     }
 
     #[test]
@@ -476,9 +563,12 @@ mod tests {
     }
 
     #[test]
-    fn supports_fast_false_for_non_anthropic_even_if_fast_capable() {
+    fn supports_fast_false_for_non_anthropic_even_with_fast_pricing() {
         let mut model = Model::from_base(ProviderKind::Google, "gemini-2.5-pro", None);
-        model.fast_capable = true;
+        model.pricing.fast = Some(FastPricing {
+            input: 30.0,
+            output: 150.0,
+        });
         assert!(!model.supports_fast());
     }
 }

@@ -36,7 +36,6 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             pricing: ModelPricing::ZERO,
             max_output_tokens: 100_000,
             context_window: 200_000,
-            fast_capable: false,
         },
         ModelEntry {
             prefixes: &["gpt-5.2", "gpt-4.1", "claude-sonnet-4.5"],
@@ -46,7 +45,6 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             pricing: ModelPricing::ZERO,
             max_output_tokens: 100_000,
             context_window: 200_000,
-            fast_capable: false,
         },
         ModelEntry {
             prefixes: &[
@@ -61,7 +59,6 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             pricing: ModelPricing::ZERO,
             max_output_tokens: 100_000,
             context_window: 200_000,
-            fast_capable: false,
         },
     ]
 }

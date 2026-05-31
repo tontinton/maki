@@ -32,10 +32,10 @@ pub(crate) fn models() -> &'static [ModelEntry] {
                 output: 5.00,
                 cache_write: 0.00,
                 cache_read: 0.31,
+                fast: None,
             },
             max_output_tokens: 65_536,
             context_window: 1_048_576,
-            fast_capable: false,
         },
         ModelEntry {
             prefixes: &["gemini-2.5-flash"],
@@ -47,10 +47,10 @@ pub(crate) fn models() -> &'static [ModelEntry] {
                 output: 0.60,
                 cache_write: 0.00,
                 cache_read: 0.04,
+                fast: None,
             },
             max_output_tokens: 65_536,
             context_window: 1_048_576,
-            fast_capable: false,
         },
         ModelEntry {
             prefixes: &["gemini-2.0-flash-lite"],
@@ -62,10 +62,10 @@ pub(crate) fn models() -> &'static [ModelEntry] {
                 output: 0.30,
                 cache_write: 0.00,
                 cache_read: 0.01,
+                fast: None,
             },
             max_output_tokens: 65_536,
             context_window: 1_048_576,
-            fast_capable: false,
         },
     ]
 }
@@ -603,7 +603,6 @@ mod tests {
             pricing: ModelPricing::default(),
             max_output_tokens: 8192,
             context_window: 1_048_576,
-            fast_capable: false,
         };
         let messages = vec![Message::user("hello".into())];
         let body = google.build_body(
@@ -633,7 +632,6 @@ mod tests {
             pricing: ModelPricing::default(),
             max_output_tokens: 8192,
             context_window: 1_048_576,
-            fast_capable: false,
         };
         let messages = vec![Message::user("think about this".into())];
         let body = google.build_body(&model, &messages, "", &json!([]), ThinkingConfig::Adaptive);
@@ -657,7 +655,6 @@ mod tests {
             pricing: ModelPricing::default(),
             max_output_tokens: 8192,
             context_window: 1_048_576,
-            fast_capable: false,
         };
         let messages = vec![Message::user("think hard".into())];
         let body = google.build_body(

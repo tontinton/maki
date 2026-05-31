@@ -179,7 +179,7 @@ impl StatusBar {
                     "  {} ({}%) ${:.3} ",
                     format_tokens(ctx.stats.context_size),
                     pct,
-                    ctx.stats.usage.cost(ctx.stats.pricing),
+                    ctx.stats.usage.cost(ctx.stats.pricing, ctx.fast),
                 );
                 right_spans.push(Span::styled(
                     rest_text,
@@ -189,7 +189,7 @@ impl StatusBar {
                 if ctx.stats.show_global {
                     let global_text = format!(
                         " \u{03a3}${:.3} ",
-                        ctx.stats.global_usage.cost(ctx.stats.pricing),
+                        ctx.stats.global_usage.cost(ctx.stats.pricing, ctx.fast),
                     );
                     right_spans.push(Span::styled(
                         global_text,

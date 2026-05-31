@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tracing::{debug, warn};
 
-use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier};
+use crate::model::{FastPricing, Model, ModelEntry, ModelFamily, ModelPricing, ModelTier};
 use crate::{
     AgentError, ContentBlock, Message, ProviderEvent, Role, StopReason, StreamResponse,
     ThinkingConfig, TokenUsage,
@@ -378,7 +378,7 @@ impl EventParser {
 }
 
 pub(crate) fn models() -> &'static [ModelEntry] {
-    &[
+    const MODELS: &[ModelEntry] = &[
         ModelEntry {
             prefixes: &["claude-haiku-4-5"],
             tier: ModelTier::Weak,
@@ -389,10 +389,10 @@ pub(crate) fn models() -> &'static [ModelEntry] {
                 output: 5.00,
                 cache_write: 1.25,
                 cache_read: 0.10,
+                fast: None,
             },
             max_output_tokens: 64000,
             context_window: 200_000,
-            fast_capable: false,
         },
         ModelEntry {
             prefixes: &["claude-sonnet-4-5"],
@@ -404,10 +404,10 @@ pub(crate) fn models() -> &'static [ModelEntry] {
                 output: 15.00,
                 cache_write: 3.75,
                 cache_read: 0.30,
+                fast: None,
             },
             max_output_tokens: 64000,
             context_window: 200_000,
-            fast_capable: false,
         },
         ModelEntry {
             prefixes: &["claude-sonnet-4-6"],
@@ -419,10 +419,10 @@ pub(crate) fn models() -> &'static [ModelEntry] {
                 output: 15.00,
                 cache_write: 3.75,
                 cache_read: 0.30,
+                fast: None,
             },
             max_output_tokens: 64000,
             context_window: 200_000,
-            fast_capable: false,
         },
         ModelEntry {
             prefixes: &["claude-sonnet-4"],
@@ -434,10 +434,10 @@ pub(crate) fn models() -> &'static [ModelEntry] {
                 output: 15.00,
                 cache_write: 3.75,
                 cache_read: 0.30,
+                fast: None,
             },
             max_output_tokens: 64000,
             context_window: 200_000,
-            fast_capable: false,
         },
         ModelEntry {
             prefixes: &["claude-opus-4-5"],
@@ -449,10 +449,10 @@ pub(crate) fn models() -> &'static [ModelEntry] {
                 output: 25.00,
                 cache_write: 6.25,
                 cache_read: 0.50,
+                fast: None,
             },
             max_output_tokens: 64000,
             context_window: 200_000,
-            fast_capable: false,
         },
         ModelEntry {
             prefixes: &["claude-opus-4-6"],
@@ -464,10 +464,13 @@ pub(crate) fn models() -> &'static [ModelEntry] {
                 output: 25.00,
                 cache_write: 6.25,
                 cache_read: 0.50,
+                fast: Some(FastPricing {
+                    input: 30.00,
+                    output: 150.00,
+                }),
             },
             max_output_tokens: 128000,
             context_window: 200_000,
-            fast_capable: true,
         },
         ModelEntry {
             prefixes: &["claude-opus-4-7"],
@@ -479,10 +482,13 @@ pub(crate) fn models() -> &'static [ModelEntry] {
                 output: 25.00,
                 cache_write: 6.25,
                 cache_read: 0.50,
+                fast: Some(FastPricing {
+                    input: 30.00,
+                    output: 150.00,
+                }),
             },
             max_output_tokens: 128000,
             context_window: 200_000,
-            fast_capable: true,
         },
         ModelEntry {
             prefixes: &["claude-opus-4-8"],
@@ -494,10 +500,13 @@ pub(crate) fn models() -> &'static [ModelEntry] {
                 output: 25.00,
                 cache_write: 6.25,
                 cache_read: 0.50,
+                fast: Some(FastPricing {
+                    input: 10.00,
+                    output: 50.00,
+                }),
             },
             max_output_tokens: 128000,
             context_window: 200_000,
-            fast_capable: true,
         },
         ModelEntry {
             prefixes: &["claude-opus-4-0", "claude-opus-4-1"],
@@ -509,12 +518,13 @@ pub(crate) fn models() -> &'static [ModelEntry] {
                 output: 75.00,
                 cache_write: 18.75,
                 cache_read: 1.50,
+                fast: None,
             },
             max_output_tokens: 32000,
             context_window: 200_000,
-            fast_capable: false,
         },
-    ]
+    ];
+    MODELS
 }
 
 #[cfg(test)]

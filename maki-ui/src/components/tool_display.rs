@@ -277,8 +277,8 @@ pub fn format_timestamp_now() -> String {
     zoned.strftime("%H:%M:%S").to_string()
 }
 
-pub fn format_turn_usage(usage: &TokenUsage, pricing: &ModelPricing) -> String {
-    let cost = usage.cost(pricing);
+pub fn format_turn_usage(usage: &TokenUsage, pricing: &ModelPricing, fast: bool) -> String {
+    let cost = usage.cost(pricing, fast);
     format!(
         "{}↑ {}↓ ${cost:.3}",
         format_tokens(usage.total_input()),

@@ -28,6 +28,7 @@ pub struct HeadlessParams {
     pub excluded_tools: Vec<&'static str>,
     pub mcp_handle: Option<McpHandle>,
     pub initial_wd: PathBuf,
+    pub fast: bool,
 }
 
 pub struct HeadlessHandle {
@@ -57,6 +58,7 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
 
     let session_id = uuid::Uuid::new_v4().to_string();
 
+    let fast = params.fast;
     let task = smol::spawn({
         let session_id = session_id.clone();
         let mcp_shutdown = params.mcp_handle.clone();
@@ -104,6 +106,7 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
                 .run(AgentInput {
                     message: params.prompt,
                     mode,
+                    fast,
                     ..Default::default()
                 })
                 .await;
