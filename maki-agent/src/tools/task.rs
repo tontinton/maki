@@ -149,6 +149,8 @@ impl Task {
         let input = AgentInput {
             message: self.prompt.clone(),
             mode: AgentMode::Build,
+            thinking: ctx.opts.thinking,
+            fast: ctx.opts.fast,
             ..Default::default()
         };
 

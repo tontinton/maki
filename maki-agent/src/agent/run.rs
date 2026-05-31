@@ -340,6 +340,7 @@ impl Agent {
             timeouts: self.timeouts,
             file_tracker: Arc::clone(&self.file_tracker),
             prompt_slots: Arc::clone(&self.prompt_slots),
+            opts: self.opts,
         }
     }
 

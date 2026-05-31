@@ -46,6 +46,7 @@ use crate::permissions::PermissionManager;
 use crate::{AgentConfig, AgentMode, EventSender};
 use maki_config::ToolOutputLines;
 use maki_providers::Model;
+use maki_providers::RequestOptions;
 use maki_providers::provider::Provider;
 
 pub struct DescriptionContext<'a> {
@@ -196,6 +197,7 @@ pub struct ToolContext {
     pub timeouts: maki_providers::Timeouts,
     pub file_tracker: Arc<FileReadTracker>,
     pub prompt_slots: Arc<crate::prompt::ResolvedSlots>,
+    pub opts: RequestOptions,
 }
 
 pub(crate) fn resolve_path(path: &str) -> Result<String, String> {
@@ -559,7 +561,7 @@ pub fn all_builtin_tool_names() -> Vec<&'static str> {
         .collect()
 }
 
-use maki_providers::{Message, ProviderEvent, RequestOptions, StreamResponse};
+use maki_providers::{Message, ProviderEvent, StreamResponse};
 
 struct NullProvider;
 
@@ -610,6 +612,7 @@ pub(crate) fn interpreter_ctx(
         timeouts: maki_providers::Timeouts::default(),
         file_tracker,
         prompt_slots: Arc::new(crate::prompt::ResolvedSlots::default()),
+        opts: RequestOptions::default(),
     }
 }
 
