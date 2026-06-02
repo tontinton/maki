@@ -35,12 +35,16 @@ An AI coding agent optimized for minimal use of context tokens, while providing 
 
 ## Supported providers
 
-* Anthropic - `ANTHROPIC_API_KEY` only (using OAuth is against TOS).
+* Anthropic - `ANTHROPIC_API_KEY` only (using OAuth is against TOS). Bedrock supported via `CLAUDE_CODE_USE_BEDROCK=1`.
 * OpenAI - `OPENAI_API_KEY` and OAuth via `maki auth login openai`.
+* Google - `GEMINI_API_KEY`.
 * Copilot - `GH_COPILOT_TOKEN` or an existing GitHub Copilot sign-in at `~/.config/github-copilot/`.
 * Ollama - `OLLAMA_HOST` for local (e.g. `http://localhost:11434`), or `OLLAMA_API_KEY` for cloud.
+* llama.cpp - `LLAMA_CPP_HOST` (e.g. `http://localhost:8080`), optionally `LLAMA_CPP_API_KEY`.
 * Mistral - `MISTRAL_API_KEY`.
 * Z.AI - `ZHIPU_API_KEY`.
+* DeepSeek - `DEEPSEEK_API_KEY`.
+* OpenRouter - `OPENROUTER_API_KEY`.
 * Synthetic - `SYNTHETIC_API_KEY`.
 
 **Dynamic providers** - drop an executable script into `~/.maki/providers/` to add custom providers or proxies. See [docs](https://maki.sh/docs/providers/#dynamic-providers) for details.
