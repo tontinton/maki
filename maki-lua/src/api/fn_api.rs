@@ -1,5 +1,7 @@
 use std::collections::HashMap;
+use std::env;
 use std::io::{BufRead, BufReader};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
@@ -328,6 +330,20 @@ pub(crate) fn create_fn_table(lua: &Lua) -> LuaResult<Table> {
             result.set("stderr", stderr_lines.join("\n"))?;
             result.set("exit_code", exit_code)?;
             Ok(mlua::Value::Table(result))
+        })?,
+    )?;
+
+    t.set(
+        "executable",
+        lua.create_function(|_, name: String| {
+            let found = env::var_os("PATH")
+                .map(|paths| {
+                    env::split_paths(&paths)
+                        .any(|dir| dir.join(&name).is_file())
+                })
+                .unwrap_or(false)
+                || Path::new(&name).is_file();
+            Ok(if found { 1 } else { 0 })
         })?,
     )?;
 
