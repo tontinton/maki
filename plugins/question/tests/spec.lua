@@ -171,15 +171,15 @@ case("format_answer_list_renders_questions_answers_pipes_newlines_and_missing", 
   }
   local out = QuestionHelpers.format_answer_list(questions, { { "a", "ans|with|pipes" } })
   assert(out:find("**Q1.** Has | pipe\nand newline", 1, true), "Q1 header + verbatim pipes/newlines")
+  assert(out:find("**A1.**\n- a\n", 1, true), "A1 label before answer bullets")
   assert(out:find("**Q2.** Q2", 1, true), "Q2 header present")
-  assert(out:find("\n- a\n", 1, true), "answer a on its own bullet")
+  assert(out:find("**A2.**\n- (no answer)", 1, true), "A2 label before no-answer bullet")
   assert(out:find("\n- ans|with|pipes", 1, true), "answer pipes preserved verbatim on bullet")
-  assert(out:find("- (no answer)", 1, true), "missing answer renders as (no answer)")
 end)
 
 case("format_answer_list_indents_multiline_answer_continuation", function()
   local out = QuestionHelpers.format_answer_list({ { question = "Q" } }, { { "a\nb" } })
-  assert(out:find("- a\n  b", 1, true), "multi-line answer continuation indented with two spaces")
+  assert(out:find("**A1.**\n- a\n  b", 1, true), "A1 label before multi-line answer continuation")
 end)
 
 case("format_answer_list_with_no_questions_returns_empty_string", function()
