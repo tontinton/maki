@@ -1300,7 +1300,10 @@ async fn dispatch_async(
                     JobEvent::Exit(code) => LuaValue::Integer(*code as i64),
                 };
                 if let Err(e) = func.call::<()>((job_id, arg)) {
-                    return ToolCallReply::err(format!("job callback error: {e}"));
+                    return ToolCallReply::err(format!(
+                        "job callback error: {}",
+                        strip_traceback(&e)
+                    ));
                 }
             }
 
@@ -1308,6 +1311,19 @@ async fn dispatch_async(
                 lock_cell(&handle).jobs.mark_dead(job_id);
             }
         }
+    }
+}
+
+fn strip_traceback(err: &mlua::Error) -> String {
+    match err {
+        mlua::Error::CallbackError { cause, .. } => {
+            let mut inner = cause;
+            while let mlua::Error::CallbackError { cause, .. } = inner.as_ref() {
+                inner = cause;
+            }
+            inner.to_string()
+        }
+        other => other.to_string(),
     }
 }
 
@@ -1369,7 +1385,7 @@ async fn run_tool_call(
         };
         match lua.registry_value(&tool_keys.handler) {
             Ok(f) => f,
-            Err(e) => return ToolCallReply::err(e.to_string()),
+            Err(e) => return ToolCallReply::err(strip_traceback(&e)),
         }
     };
     if shutdown.load(Ordering::Acquire) {
@@ -1382,23 +1398,23 @@ async fn run_tool_call(
 
     let input_lua = match json_to_lua(&lua, &input) {
         Ok(v) => v,
-        Err(e) => return ToolCallReply::err(e.to_string()),
+        Err(e) => return ToolCallReply::err(strip_traceback(&e)),
     };
     let ctx_ud = match lua.create_userdata(*ctx) {
         Ok(u) => u,
-        Err(e) => return ToolCallReply::err(e.to_string()),
+        Err(e) => return ToolCallReply::err(strip_traceback(&e)),
     };
 
     let thread = match lua.create_thread(handler) {
         Ok(t) => t,
-        Err(e) => return ToolCallReply::err(e.to_string()),
+        Err(e) => return ToolCallReply::err(strip_traceback(&e)),
     };
     let scope = TaskScope::new(&lua, TaskCell::new(cancel, deadline, live));
     let handle = Arc::clone(scope.handle());
 
     let async_thread = match thread.into_async::<LuaValue>((input_lua, ctx_ud)) {
         Ok(at) => at,
-        Err(e) => return ToolCallReply::err(e.to_string()),
+        Err(e) => return ToolCallReply::err(strip_traceback(&e)),
     };
 
     let call_future = scope.scope_future(async {
@@ -1437,7 +1453,7 @@ async fn run_tool_call(
                 dispatch_async(&lua, Arc::clone(&handle), &plugin, &tool, finish_rx).await
             }
             Ok(val) => ToolCallReply::from_lua_value(&val),
-            Err(e) => ToolCallReply::err(e.to_string()),
+            Err(e) => ToolCallReply::err(strip_traceback(&e)),
         }
     });
 
