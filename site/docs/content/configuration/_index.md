@@ -152,6 +152,22 @@ Maki uses XDG directories on Linux and macOS:
 
 `~/.maki/` is checked as a legacy fallback.
 
+### Migrating from ~/.maki/
+
+Older versions stored everything in `~/.maki/`. If that directory still exists, maki uses it
+as a fallback. To move to XDG directories, run:
+
+```
+maki migrate xdg
+```
+
+This safely moves sessions, auth, plans, memories, logs, and preferences to XDG locations.
+Where both old and new files exist, they are merged (input history, model tiers, etc.).
+Nothing is deleted until it has been copied. At the end you get a summary of where everything
+lives now.
+
+Safe to run more than once.
+
 ## Personal Instructions
 
 On top of `AGENTS.md`, you can add your own instructions in two places:

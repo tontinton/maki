@@ -95,6 +95,17 @@ pub enum Command {
     },
     /// Rollback to the previous version
     Rollback,
+    /// Data migration utilities
+    Migrate {
+        #[command(subcommand)]
+        action: MigrateAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum MigrateAction {
+    /// Migrate files from ~/.maki/ to XDG directories
+    Xdg,
 }
 
 #[derive(Subcommand)]

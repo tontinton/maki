@@ -97,6 +97,22 @@ pub fn cache_dir() -> Result<PathBuf, std::io::Error> {
     ensure(&p.cache)
 }
 
+pub struct XdgPaths {
+    pub config: PathBuf,
+    pub state: PathBuf,
+    pub logs: PathBuf,
+}
+
+pub fn xdg_paths() -> Result<XdgPaths, std::io::Error> {
+    let s = etcetera::choose_base_strategy().map_err(|_| err())?;
+    let data = s.data_dir().join(APP_NAME);
+    Ok(XdgPaths {
+        config: s.config_dir().join(APP_NAME),
+        state: xdg_sibling(&data, "state"),
+        logs: xdg_sibling(&data, "logs"),
+    })
+}
+
 pub fn home() -> Option<PathBuf> {
     etcetera::home_dir().ok()
 }

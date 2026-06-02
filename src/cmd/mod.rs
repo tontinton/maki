@@ -1,3 +1,4 @@
+mod migrate;
 mod subcmd;
 mod tui;
 
@@ -6,7 +7,7 @@ use color_eyre::eyre::Context;
 
 use maki_storage::StateDir;
 
-use crate::cli::{AuthAction, Cli, Command, McpAction};
+use crate::cli::{AuthAction, Cli, Command, McpAction, MigrateAction};
 use crate::update;
 
 pub fn dispatch(cli: Cli) -> Result<()> {
@@ -37,6 +38,9 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Some(Command::Rollback) => {
             update::rollback().map_err(|e| color_eyre::eyre::eyre!("{e}"))?;
         }
+        Some(Command::Migrate { action }) => match action {
+            MigrateAction::Xdg => migrate::xdg()?,
+        },
         None => {
             tui::run(cli)?;
         }
