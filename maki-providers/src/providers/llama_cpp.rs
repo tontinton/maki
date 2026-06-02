@@ -1,7 +1,11 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use flume::Sender;
+use isahc::ReadResponseExt;
+use isahc::config::Configurable;
 use serde_json::Value;
+use tracing::{debug, warn};
 
 use crate::model::{Model, ModelEntry};
 use crate::provider::{BoxFuture, Provider};
@@ -13,6 +17,8 @@ use super::{KeyPool, ResolvedAuth};
 const HOST_ENV: &str = "LLAMA_CPP_HOST";
 const API_KEY_ENV: &str = "LLAMA_CPP_API_KEY";
 const HOST_NOT_SET: &str = "LLAMA_CPP_HOST not set";
+const PROBE_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const PROBE_TOTAL_TIMEOUT: Duration = Duration::from_secs(5);
 
 static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
     api_key_env: "",
@@ -24,6 +30,73 @@ static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
 
 pub(crate) fn models() -> &'static [ModelEntry] {
     &[]
+}
+
+static CACHED_CONTEXT_WINDOW: OnceLock<Option<u32>> = OnceLock::new();
+
+/// Probe the running llama.cpp server for its actual context size by reading
+/// `default_generation_settings.n_ctx` from `/props`. Cached for the life of
+/// the process; returns `None` on any failure so callers fall back to a static
+/// default.
+pub(crate) fn fetch_context_window() -> Option<u32> {
+    *CACHED_CONTEXT_WINDOW.get_or_init(probe_context_window)
+}
+
+fn probe_context_window() -> Option<u32> {
+    let host = std::env::var(HOST_ENV).ok()?;
+    let host = host.trim_end_matches('/');
+    let client = isahc::HttpClient::builder()
+        .connect_timeout(PROBE_CONNECT_TIMEOUT)
+        .timeout(PROBE_TOTAL_TIMEOUT)
+        .build()
+        .ok()?;
+
+    let n_ctx = probe_props_n_ctx(&client, host)?;
+    debug!(n_ctx, "llama.cpp context window detected");
+    Some(n_ctx)
+}
+
+fn probe_props_n_ctx(client: &isahc::HttpClient, host: &str) -> Option<u32> {
+    let body = http_get(client, &format!("{host}/props"))?;
+    parse_props_n_ctx(&body)
+}
+
+fn http_get(client: &isahc::HttpClient, url: &str) -> Option<String> {
+    let mut builder = isahc::Request::get(url);
+    if let Some(key) = first_api_key() {
+        builder = builder.header("authorization", format!("Bearer {key}"));
+    }
+    let request = builder.body(()).ok()?;
+
+    let mut resp = match client.send(request) {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(error = %e, %url, "failed to probe llama.cpp; using fallback context window");
+            return None;
+        }
+    };
+
+    let status = resp.status().as_u16();
+    if status != 200 {
+        warn!(status, %url, "llama.cpp probe returned non-200; using fallback context window");
+        return None;
+    }
+
+    resp.text().ok()
+}
+
+fn parse_props_n_ctx(body: &str) -> Option<u32> {
+    let parsed: Value = serde_json::from_str(body).ok()?;
+    parsed
+        .get("default_generation_settings")
+        .and_then(|s| s.get("n_ctx"))
+        .or_else(|| parsed.get("n_ctx"))
+        .and_then(Value::as_u64)
+        .map(|n| n as u32)
+}
+
+fn first_api_key() -> Option<String> {
+    KeyPool::from_env(API_KEY_ENV).ok().map(|p| p.current().to_string())
 }
 
 pub struct LlamaCpp {
@@ -147,6 +220,24 @@ mod tests {
         let auth = llama.auth.lock().unwrap();
         assert_eq!(auth.base_url.as_deref(), Some("http://x:1234/v1"));
         assert!(auth.headers.is_empty());
+    }
+
+    #[test]
+    fn parse_props_n_ctx_reads_nested() {
+        let body = r#"{"default_generation_settings":{"n_ctx":8192,"temperature":0.8},"total_slots":1}"#;
+        assert_eq!(parse_props_n_ctx(body), Some(8192));
+    }
+
+    #[test]
+    fn parse_props_n_ctx_falls_back_to_top_level() {
+        let body = r#"{"n_ctx":4096,"total_slots":1}"#;
+        assert_eq!(parse_props_n_ctx(body), Some(4096));
+    }
+
+    #[test]
+    fn parse_props_n_ctx_handles_garbage() {
+        assert_eq!(parse_props_n_ctx("not json"), None);
+        assert_eq!(parse_props_n_ctx("{}"), None);
     }
 
     #[test]

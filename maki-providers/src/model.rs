@@ -187,12 +187,19 @@ impl Model {
                 e.max_output_tokens,
                 anthropic::shared::long_context_window(model_id).unwrap_or(e.context_window),
             ),
-            None => (
-                provider.family(),
-                ModelPricing::ZERO,
-                provider.fallback_max_output(),
-                provider.fallback_context_window(),
-            ),
+            None => {
+                let context_window = match provider {
+                    ProviderKind::LlamaCpp => llama_cpp::fetch_context_window()
+                        .unwrap_or_else(|| provider.fallback_context_window()),
+                    _ => provider.fallback_context_window(),
+                };
+                (
+                    provider.family(),
+                    ModelPricing::ZERO,
+                    provider.fallback_max_output(),
+                    context_window,
+                )
+            }
         };
         Self {
             id: model_id.to_string(),
