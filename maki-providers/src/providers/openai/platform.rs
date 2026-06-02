@@ -142,7 +142,7 @@ impl Provider for OpenAi {
         system: &'a str,
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
-        _opts: RequestOptions,
+        opts: RequestOptions,
         _session_id: Option<&str>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
@@ -168,7 +168,8 @@ impl Provider for OpenAi {
                     .await;
             }
 
-            let body = self.compat.build_body(model, messages, system, tools);
+            let mut body = self.compat.build_body(model, messages, system, tools);
+            opts.thinking.apply_reasoning_effort(&mut body);
             self.with_oauth_retry(|| async {
                 let auth = self.current_auth();
                 self.compat

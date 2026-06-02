@@ -264,6 +264,17 @@ impl ThinkingConfig {
         }
     }
 
+    pub fn apply_reasoning_effort(self, body: &mut Value) {
+        let effort = match self {
+            Self::Off => return,
+            Self::Adaptive => "medium",
+            Self::Budget(n) if n < 2048 => "low",
+            Self::Budget(n) if n < 8192 => "medium",
+            Self::Budget(_) => "high",
+        };
+        body["reasoning_effort"] = json!(effort);
+    }
+
     pub fn parse(input: &str, current: Self) -> Result<Self, &'static str> {
         if input.is_empty() {
             return Ok(if current.is_enabled() {
@@ -393,20 +404,30 @@ mod tests {
         assert_eq!(&*deserialized.data, "abc123");
     }
 
-    #[test]
-    fn thinking_apply_to_body() {
-        let mut off = json!({"model": "test"});
-        ThinkingConfig::Off.apply_to_body(&mut off);
-        assert!(off.get("thinking").is_none());
+    #[test_case(ThinkingConfig::Off,          None                                                ; "off")]
+    #[test_case(ThinkingConfig::Adaptive,     Some(json!({"type": "adaptive"}))                    ; "adaptive")]
+    #[test_case(ThinkingConfig::Budget(10000), Some(json!({"type": "enabled", "budget_tokens": 10000})) ; "budget")]
+    fn thinking_apply_to_body(config: ThinkingConfig, expected: Option<Value>) {
+        let mut body = json!({"model": "test"});
+        config.apply_to_body(&mut body);
+        match expected {
+            Some(e) => assert_eq!(body["thinking"], e),
+            None => assert!(body.get("thinking").is_none()),
+        }
+    }
 
-        let mut adaptive = json!({"model": "test"});
-        ThinkingConfig::Adaptive.apply_to_body(&mut adaptive);
-        assert_eq!(adaptive["thinking"]["type"], "adaptive");
-
-        let mut budget = json!({"model": "test"});
-        ThinkingConfig::Budget(10000).apply_to_body(&mut budget);
-        assert_eq!(budget["thinking"]["type"], "enabled");
-        assert_eq!(budget["thinking"]["budget_tokens"], 10000);
+    #[test_case(ThinkingConfig::Off,          None            ; "off")]
+    #[test_case(ThinkingConfig::Adaptive,     Some("medium")  ; "adaptive")]
+    #[test_case(ThinkingConfig::Budget(1024), Some("low")     ; "budget_low")]
+    #[test_case(ThinkingConfig::Budget(4096), Some("medium")  ; "budget_medium")]
+    #[test_case(ThinkingConfig::Budget(8192), Some("high")    ; "budget_high")]
+    fn thinking_apply_reasoning_effort(config: ThinkingConfig, expected: Option<&str>) {
+        let mut body = json!({"model": "test"});
+        config.apply_reasoning_effort(&mut body);
+        match expected {
+            Some(e) => assert_eq!(body["reasoning_effort"], e),
+            None => assert!(body.get("reasoning_effort").is_none()),
+        }
     }
 
     #[test_case("",         ThinkingConfig::Off,      Ok(ThinkingConfig::Adaptive)  ; "toggle_on")]

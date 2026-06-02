@@ -93,7 +93,12 @@ impl ProviderKind {
     pub const fn supports_thinking(self) -> bool {
         matches!(
             self,
-            Self::Anthropic | Self::Google | Self::Mistral | Self::DeepSeek | Self::Synthetic
+            Self::Anthropic
+                | Self::Google
+                | Self::Mistral
+                | Self::DeepSeek
+                | Self::Synthetic
+                | Self::OpenAi
         )
     }
 

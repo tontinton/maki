@@ -1,11 +1,11 @@
 use std::sync::{Arc, Mutex};
 
 use flume::Sender;
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier};
 use crate::provider::{BoxFuture, Provider};
-use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig};
+use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
 
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use super::{KeyPool, ResolvedAuth};
@@ -117,22 +117,7 @@ impl Provider for Synthetic {
             let mut buf = String::new();
             let system = super::with_prefix(&self.system_prefix, system, &mut buf);
             let mut body = self.compat.build_body(model, messages, system, tools);
-            match opts.thinking {
-                ThinkingConfig::Off => {}
-                ThinkingConfig::Adaptive => {
-                    body["reasoning_effort"] = json!("medium");
-                }
-                ThinkingConfig::Budget(n) => {
-                    let effort = if n < 2048 {
-                        "low"
-                    } else if n < 8192 {
-                        "medium"
-                    } else {
-                        "high"
-                    };
-                    body["reasoning_effort"] = json!(effort);
-                }
-            };
+            opts.thinking.apply_reasoning_effort(&mut body);
             self.compat
                 .do_stream(model, &[], &body, event_tx, &auth)
                 .await
