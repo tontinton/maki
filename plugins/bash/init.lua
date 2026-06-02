@@ -24,7 +24,15 @@ local function shell_quote(s)
   return "'" .. s:gsub("'", "'\\''") .. "'"
 end
 
-local function resolve_command(input)
+local function unquote(s)
+  local q = s:sub(1, 1)
+  if (q == '"' or q == "'") and s:sub(-1) == q then
+    return s:sub(2, -2)
+  end
+  return s
+end
+
+local function parse_cd_hint(input)
   if input.workdir then
     return input.command, input.workdir
   end
@@ -32,7 +40,7 @@ local function resolve_command(input)
   if rest then
     local dir, tail = rest:match("^(.-)%s+&&%s+(.+)$")
     if dir and dir ~= "" then
-      return tail, dir
+      return tail, unquote(dir)
     end
   end
   return input.command, nil
@@ -264,7 +272,7 @@ maki.api.register_tool({
   end,
 
   header = function(input)
-    local command, workdir = resolve_command(input)
+    local command, workdir = parse_cd_hint(input)
     local s = input.description or command
     if workdir then
       s = s .. " in " .. relative_path(workdir)
@@ -278,7 +286,7 @@ maki.api.register_tool({
   end,
 
   restore = function(input, output, is_error, ctx)
-    local command = resolve_command(input)
+    local command = input.command
     local buf, view = create_bash_view(command, ctx)
     local timeout_secs = output:match("^tool bash timed out after (%d+)s$")
     if timeout_secs then
@@ -314,7 +322,7 @@ maki.api.register_tool({
       return { llm_output = "error: command is required", is_error = true }
     end
 
-    local command, workdir = resolve_command(input)
+    local command, workdir = input.command, input.workdir
     local config = ctx:config()
     local timeout_secs = input.timeout or (config and config.bash_timeout_secs) or 120
     local max_lines = (config and config.max_output_lines) or 2000
