@@ -235,9 +235,17 @@ pub fn text_to_lines(
     text_style: Style,
     prefix_style: Style,
     width: u16,
+    max_line_bytes: Option<usize>,
 ) -> Vec<Line<'static>> {
-    let text = render::truncate_long_lines(text);
-    let semantic = render::Renderer::unwrapped().render(text.as_ref(), width, 0);
+    let truncated;
+    let text = match max_line_bytes {
+        Some(limit) => {
+            truncated = render::truncate_long_lines_at(text, limit);
+            truncated.as_ref()
+        }
+        None => text,
+    };
+    let semantic = render::Renderer::unwrapped().render(text, width, 0);
     paint_semantic(&semantic, prefix, text_style, prefix_style)
 }
 
@@ -301,6 +309,16 @@ mod tests {
     use test_case::test_case;
 
     const TEST_WIDTH: u16 = 80;
+
+    fn text_to_lines(
+        text: &str,
+        prefix: &str,
+        text_style: Style,
+        prefix_style: Style,
+        width: u16,
+    ) -> Vec<Line<'static>> {
+        super::text_to_lines(text, prefix, text_style, prefix_style, width, None)
+    }
 
     fn lines_text(lines: &[Line<'_>]) -> Vec<String> {
         lines

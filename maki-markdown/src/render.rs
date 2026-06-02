@@ -19,7 +19,7 @@ pub const CODE_BAR: &str = "│ ";
 pub const CODE_BAR_WRAP: &str = "│";
 /// Lines longer than this get truncated with `...` to protect the parser
 /// and terminal from runaway output.
-pub const MAX_LINE_BYTES: usize = 500;
+pub const TOOL_OUTPUT_MAX_LINE_BYTES: usize = 500;
 const HR_CHAR: char = '─';
 const MIN_COL_WIDTH: usize = 5;
 const LONG_LINE_SUFFIX: &str = "...";
@@ -721,10 +721,12 @@ pub fn hr_text(width: u16) -> String {
     iter::repeat_n(HR_CHAR, width as usize).collect()
 }
 
-/// Truncate lines longer than [`MAX_LINE_BYTES`]. Returns borrowed when
-/// nothing needs truncating (common path, zero alloc).
 pub fn truncate_long_lines(text: &str) -> Cow<'_, str> {
-    if !text.lines().any(|l| l.len() > MAX_LINE_BYTES) {
+    truncate_long_lines_at(text, TOOL_OUTPUT_MAX_LINE_BYTES)
+}
+
+pub fn truncate_long_lines_at(text: &str, max_bytes: usize) -> Cow<'_, str> {
+    if !text.lines().any(|l| l.len() > max_bytes) {
         return Cow::Borrowed(text);
     }
     let mut result = String::with_capacity(text.len());
@@ -732,8 +734,8 @@ pub fn truncate_long_lines(text: &str) -> Cow<'_, str> {
         if i > 0 {
             result.push('\n');
         }
-        if line.len() > MAX_LINE_BYTES {
-            let mut boundary = MAX_LINE_BYTES;
+        if line.len() > max_bytes {
+            let mut boundary = max_bytes;
             while !line.is_char_boundary(boundary) {
                 boundary -= 1;
             }
@@ -1021,23 +1023,23 @@ mod tests {
     }
 
     #[test_case("short\nlines\n", "short\nlines\n" ; "short_text_unchanged")]
-    #[test_case(&"a".repeat(MAX_LINE_BYTES), &"a".repeat(MAX_LINE_BYTES) ; "exactly_at_limit_unchanged")]
-    #[test_case(&"a".repeat(MAX_LINE_BYTES + 1), &format!("{}...", "a".repeat(MAX_LINE_BYTES)) ; "one_over_limit_truncated")]
+    #[test_case(&"a".repeat(TOOL_OUTPUT_MAX_LINE_BYTES), &"a".repeat(TOOL_OUTPUT_MAX_LINE_BYTES) ; "exactly_at_limit_unchanged")]
+    #[test_case(&"a".repeat(TOOL_OUTPUT_MAX_LINE_BYTES + 1), &format!("{}...", "a".repeat(TOOL_OUTPUT_MAX_LINE_BYTES)) ; "one_over_limit_truncated")]
     fn truncate_long_lines_cases(input: &str, expected: &str) {
         assert_eq!(&*truncate_long_lines(input), expected);
     }
 
     #[test]
     fn truncate_long_lines_multibyte_boundary() {
-        let mut line = "a".repeat(MAX_LINE_BYTES - 1);
+        let mut line = "a".repeat(TOOL_OUTPUT_MAX_LINE_BYTES - 1);
         line.push('\u{00e9}');
         let result = truncate_long_lines(&line);
         assert!(result.ends_with("..."));
         assert!(!result.contains('\u{00e9}'));
     }
 
-    #[test_case(&format!("{}\n", "z".repeat(MAX_LINE_BYTES + 10)), true ; "preserves_trailing_newline")]
-    #[test_case(&"z".repeat(MAX_LINE_BYTES + 10), false ; "no_trailing_newline_when_absent")]
+    #[test_case(&format!("{}\n", "z".repeat(TOOL_OUTPUT_MAX_LINE_BYTES + 10)), true ; "preserves_trailing_newline")]
+    #[test_case(&"z".repeat(TOOL_OUTPUT_MAX_LINE_BYTES + 10), false ; "no_trailing_newline_when_absent")]
     fn truncate_long_lines_trailing_newline(input: &str, expect_trailing: bool) {
         assert_eq!(truncate_long_lines(input).ends_with('\n'), expect_trailing);
     }

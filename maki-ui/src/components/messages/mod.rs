@@ -1292,6 +1292,7 @@ impl MessagesPanel {
                         style.text_style,
                         style.prefix_style,
                         self.viewport_width,
+                        style.max_line_bytes,
                     )
                 } else {
                     plain_lines(&msg.text, prefix, style.text_style, style.prefix_style)

@@ -7,6 +7,8 @@ use ratatui::style::Style;
 use ratatui::text::Line;
 use std::hash::{DefaultHasher, Hash, Hasher};
 
+const STREAMING_MAX_LINE_BYTES: usize = 5_000;
+
 /// Block-level streaming markdown cache.
 ///
 /// Memoizes the rendered line tree under a content-addressed key so
@@ -66,7 +68,7 @@ impl StreamingCache {
         if self.key == Some(key) {
             return false;
         }
-        let text = maki_markdown::render::truncate_long_lines(visible);
+        let text = maki_markdown::render::truncate_long_lines_at(visible, STREAMING_MAX_LINE_BYTES);
         let semantic = renderer.render(text.as_ref(), width, theme_gen);
         self.lines = paint_semantic(&semantic, prefix, text_style, prefix_style);
         self.key = Some(key);
@@ -186,7 +188,7 @@ mod tests {
 
     fn full_render_lines(text: &str, prefix: &str, width: u16) -> Vec<String> {
         let style = Style::default();
-        text_to_lines(text, prefix, style, style, width)
+        text_to_lines(text, prefix, style, style, width, None)
             .iter()
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect()

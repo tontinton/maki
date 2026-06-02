@@ -173,6 +173,7 @@ pub struct RoleStyle {
     pub text_style: Style,
     pub prefix_style: Style,
     pub use_markdown: bool,
+    pub max_line_bytes: Option<usize>,
 }
 
 pub fn assistant_style() -> RoleStyle {
@@ -181,6 +182,7 @@ pub fn assistant_style() -> RoleStyle {
         text_style: theme::current().assistant,
         prefix_style: theme::current().assistant_prefix,
         use_markdown: true,
+        max_line_bytes: Some(maki_markdown::render::TOOL_OUTPUT_MAX_LINE_BYTES),
     }
 }
 
@@ -190,6 +192,7 @@ pub fn user_style() -> RoleStyle {
         text_style: theme::current().assistant,
         prefix_style: theme::current().user,
         use_markdown: true,
+        max_line_bytes: None,
     }
 }
 
@@ -199,6 +202,7 @@ pub fn thinking_style() -> RoleStyle {
         text_style: theme::current().thinking,
         prefix_style: theme::current().thinking,
         use_markdown: true,
+        max_line_bytes: Some(maki_markdown::render::TOOL_OUTPUT_MAX_LINE_BYTES),
     }
 }
 
@@ -208,6 +212,7 @@ pub fn error_style() -> RoleStyle {
         text_style: theme::current().error,
         prefix_style: theme::current().tool_error,
         use_markdown: false,
+        max_line_bytes: None,
     }
 }
 
@@ -219,6 +224,7 @@ pub fn done_style() -> RoleStyle {
             .add_modifier(ratatui::style::Modifier::BOLD),
         prefix_style: theme::current().tool_success,
         use_markdown: false,
+        max_line_bytes: None,
     }
 }
 
@@ -591,7 +597,14 @@ impl ToolLineBuilder {
     fn push_markdown_body(&mut self, text: &str) {
         let style = theme::current().assistant;
         let indent = TOOL_BODY_INDENT.len() as u16;
-        let md_lines = text_to_lines(text, "", style, style, self.width.saturating_sub(indent));
+        let md_lines = text_to_lines(
+            text,
+            "",
+            style,
+            style,
+            self.width.saturating_sub(indent),
+            Some(maki_markdown::render::TOOL_OUTPUT_MAX_LINE_BYTES),
+        );
         for mut line in md_lines {
             line.spans.insert(0, Span::raw(TOOL_BODY_INDENT));
             self.lines.push(line);
