@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use async_lock::Mutex;
 use isahc::HttpClient;
-use isahc::config::Configurable;
+use isahc::config::{Configurable, RedirectPolicy};
 use isahc::http::header::{ACCEPT, CONTENT_TYPE};
 use isahc::http::{Method, Request, StatusCode, header::HeaderMap};
 use serde_json::Value;
@@ -16,6 +16,7 @@ use super::protocol::{JsonRpcNotification, JsonRpcRequest, JsonRpcResponse};
 use super::transport::{BoxFuture, McpTransport};
 use tracing::info;
 
+pub(super) const MAX_REDIRECTS: u32 = 10;
 const SESSION_HEADER: &str = "mcp-session-id";
 const CT_JSON: &str = "application/json";
 const CT_SSE: &str = "text/event-stream";
@@ -37,14 +38,14 @@ impl HttpTransport {
         headers: &HashMap<String, String>,
         timeout: Duration,
     ) -> Result<Self, McpError> {
-        let client =
-            HttpClient::builder()
-                .timeout(timeout)
-                .build()
-                .map_err(|e: isahc::Error| McpError::StartFailed {
-                    server: name.into(),
-                    reason: e.to_string(),
-                })?;
+        let client = HttpClient::builder()
+            .redirect_policy(RedirectPolicy::Limit(MAX_REDIRECTS))
+            .timeout(timeout)
+            .build()
+            .map_err(|e: isahc::Error| McpError::StartFailed {
+                server: name.into(),
+                reason: e.to_string(),
+            })?;
 
         Ok(Self {
             name: Arc::from(name),

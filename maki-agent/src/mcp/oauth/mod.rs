@@ -19,7 +19,7 @@ pub enum OAuthError {
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use isahc::HttpClient;
-use isahc::config::Configurable;
+use isahc::config::{Configurable, RedirectPolicy};
 use maki_storage::StateDir;
 use maki_storage::auth::{McpAuthData, load_mcp_auth, save_mcp_auth};
 use tracing::{info, warn};
@@ -203,6 +203,7 @@ async fn discover_auth_server_for(
 
 fn build_http_client() -> Result<HttpClient, isahc::Error> {
     HttpClient::builder()
+        .redirect_policy(RedirectPolicy::Limit(super::http::MAX_REDIRECTS))
         .timeout(std::time::Duration::from_secs(30))
         .build()
 }
