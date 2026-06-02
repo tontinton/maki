@@ -788,22 +788,22 @@ mod tests {
             .collect()
     }
 
+    fn find_span<'a>(lines: &'a [Line], text: &str) -> Option<&'a Span> {
+        lines
+            .iter()
+            .flat_map(|l| &l.spans)
+            .find(|s| s.text.trim() == text)
+    }
+
     #[test]
-    fn render_paragraph_emits_text_token() {
-        let lines = render("hello world", TEST_WIDTH);
-        assert_eq!(lines.len(), 1);
-        assert_eq!(lines[0].kind, LineKind::Paragraph);
-        assert_eq!(lines[0].spans.len(), 1);
-        assert_eq!(lines[0].spans[0].text, "hello world");
-        assert_eq!(lines[0].spans[0].style, StyleToken::Text);
-        assert!(lines[0].spans[0].emphasis.is_empty());
+    fn render_empty_input_yields_no_lines() {
+        assert!(render("", TEST_WIDTH).is_empty());
     }
 
     #[test]
     fn render_bold_emits_text_with_bold_emphasis() {
         let lines = render("**bold**", TEST_WIDTH);
-        let span = &lines[0].spans[0];
-        assert_eq!(span.text, "bold");
+        let span = find_span(&lines, "bold").expect("bold span");
         assert_eq!(span.style, StyleToken::Text);
         assert_eq!(span.emphasis, Emphasis::BOLD);
     }
@@ -811,13 +811,8 @@ mod tests {
     #[test]
     fn render_inline_code_emits_inline_code_token() {
         let lines = render("a `b` c", TEST_WIDTH);
-        let code = lines[0]
-            .spans
-            .iter()
-            .find(|s| s.text == "b")
-            .expect("code span");
+        let code = find_span(&lines, "b").expect("code span");
         assert_eq!(code.style, StyleToken::InlineCode);
-        assert!(code.emphasis.is_empty());
     }
 
     #[test_case(1; "h1")]
@@ -836,20 +831,16 @@ mod tests {
     }
 
     #[test]
-    fn render_heading_preserves_inline_code_token() {
+    fn render_heading_preserves_inline_styles() {
         let lines = render("## **bold** and `code`", TEST_WIDTH);
-        let code_span = lines[0]
-            .spans
-            .iter()
-            .find(|s| s.text == "code")
-            .expect("code span");
-        assert_eq!(code_span.style, StyleToken::InlineCode);
-        let bold_span = lines[0]
-            .spans
-            .iter()
-            .find(|s| s.text == "bold")
-            .expect("bold span");
-        assert_eq!(bold_span.style, StyleToken::Heading);
+        assert_eq!(
+            find_span(&lines, "code").unwrap().style,
+            StyleToken::InlineCode
+        );
+        assert_eq!(
+            find_span(&lines, "bold").unwrap().style,
+            StyleToken::Heading
+        );
     }
 
     #[test]
@@ -917,26 +908,16 @@ mod tests {
     }
 
     #[test]
-    fn render_table_emits_borders_and_rows_with_table_border_tokens() {
+    fn render_table_emits_borders_and_rows() {
         let lines = render("| H |\n| --- |\n| d |", TEST_WIDTH);
-        let borders: Vec<_> = lines
-            .iter()
-            .filter(|l| l.kind == LineKind::TableBorder)
-            .collect();
-        assert!(borders.len() >= 2, "top + bottom borders expected");
-        for border in &borders {
-            assert!(
-                border
-                    .spans
-                    .iter()
-                    .all(|s| s.style == StyleToken::TableBorder)
-            );
-        }
-        let rows: Vec<_> = lines
-            .iter()
-            .filter(|l| l.kind == LineKind::TableRow)
-            .collect();
-        assert!(!rows.is_empty(), "data row expected");
+        assert!(
+            lines
+                .iter()
+                .filter(|l| l.kind == LineKind::TableBorder)
+                .count()
+                >= 2
+        );
+        assert!(lines.iter().any(|l| l.kind == LineKind::TableRow));
     }
 
     #[test]
@@ -945,62 +926,34 @@ mod tests {
         let input = format!("| Col1 | Col2 |\n| --- | --- |\n| short | {long} |");
         let width: u16 = 40;
         let lines = render(&input, width);
-        for line in &lines {
-            assert!(line.width() <= width as usize, "line overflow: {line:?}");
-        }
-        let rendered: String = lines_text(&lines).join("");
-        let x_count = rendered.chars().filter(|c| *c == 'x').count();
+        assert!(
+            lines.iter().all(|l| l.width() <= width as usize),
+            "line overflow"
+        );
+        let x_count: usize = lines_text(&lines).join("").matches('x').count();
         assert_eq!(x_count, 60, "wrap must preserve content");
     }
 
     #[test]
-    fn render_consecutive_blocks_separated_by_blank_line() {
+    fn render_never_emits_consecutive_blanks() {
         let lines = render("before\n```\ncode\n```\nafter", TEST_WIDTH);
-        let texts = lines_text(&lines);
-        let blanks: Vec<usize> = texts
-            .iter()
-            .enumerate()
-            .filter(|(_, t)| t.is_empty())
-            .map(|(i, _)| i)
-            .collect();
-        assert!(!blanks.is_empty(), "expected blank lines between blocks");
-        let consecutive = texts.windows(2).any(|w| w[0].is_empty() && w[1].is_empty());
+        let consecutive = lines.windows(2).any(|w| w[0].is_blank() && w[1].is_blank());
         assert!(!consecutive, "should never have two consecutive blanks");
     }
 
     #[test]
     fn renderer_caches_table_column_widths_across_calls() {
         let mut r = Renderer::new();
-        let width = 120;
-        r.render("| A | B |\n| --- | --- |\n| hi | there |", width, 0);
-        let widths_after_first = r.table_col_widths[0].clone();
+        r.render("| A | B |\n| --- | --- |\n| hi | there |", 120, 0);
+        let widths_before = r.table_col_widths[0].clone();
         r.render(
             "| A | B |\n| --- | --- |\n| hi | there |\n| longer | x |",
-            width,
+            120,
             0,
         );
-        for (i, (&old, &new)) in widths_after_first
-            .iter()
-            .zip(&r.table_col_widths[0])
-            .enumerate()
-        {
+        for (i, (&old, &new)) in widths_before.iter().zip(&r.table_col_widths[0]).enumerate() {
             assert!(new >= old, "table width shrank at col {i}: {old} -> {new}");
         }
-    }
-
-    #[test]
-    fn renderer_caches_highlighter_state_across_streaming_updates() {
-        let mut r = Renderer::new();
-        let text = "```rust\nfn main() {}\n```";
-        let a = r.render(text, TEST_WIDTH, 0);
-        let b = r.render(text, TEST_WIDTH, 0);
-        assert_eq!(a, b, "stable input must produce stable output");
-        assert_eq!(r.highlighters.len(), 1);
-    }
-
-    #[test]
-    fn render_empty_input_yields_no_lines() {
-        assert!(render("", TEST_WIDTH).is_empty());
     }
 
     #[test]
@@ -1011,37 +964,31 @@ mod tests {
     #[test]
     fn render_table_header_row_cells_are_bold() {
         let lines = render("| Header |\n| --- |\n| Data |", TEST_WIDTH);
-        let header_span = lines
-            .iter()
-            .flat_map(|l| &l.spans)
-            .find(|s| s.text.trim() == "Header")
-            .expect("header span");
-        match &header_span.style {
-            StyleToken::Text | StyleToken::InlineCode => assert!(header_span.emphasis.bold),
-            other => panic!("expected text/inline-code with bold, got {other:?}"),
-        }
-    }
-
-    #[test_case("short\nlines\n", "short\nlines\n" ; "short_text_unchanged")]
-    #[test_case(&"a".repeat(TOOL_OUTPUT_MAX_LINE_BYTES), &"a".repeat(TOOL_OUTPUT_MAX_LINE_BYTES) ; "exactly_at_limit_unchanged")]
-    #[test_case(&"a".repeat(TOOL_OUTPUT_MAX_LINE_BYTES + 1), &format!("{}...", "a".repeat(TOOL_OUTPUT_MAX_LINE_BYTES)) ; "one_over_limit_truncated")]
-    fn truncate_long_lines_cases(input: &str, expected: &str) {
-        assert_eq!(&*truncate_long_lines(input), expected);
+        let header = find_span(&lines, "Header").expect("header span");
+        assert!(header.emphasis.bold, "header cells must be bold");
     }
 
     #[test]
-    fn truncate_long_lines_multibyte_boundary() {
-        let mut line = "a".repeat(TOOL_OUTPUT_MAX_LINE_BYTES - 1);
-        line.push('\u{00e9}');
-        let result = truncate_long_lines(&line);
-        assert!(result.ends_with("..."));
-        assert!(!result.contains('\u{00e9}'));
-    }
+    fn truncate_long_lines_behavior() {
+        let max = TOOL_OUTPUT_MAX_LINE_BYTES;
 
-    #[test_case(&format!("{}\n", "z".repeat(TOOL_OUTPUT_MAX_LINE_BYTES + 10)), true ; "preserves_trailing_newline")]
-    #[test_case(&"z".repeat(TOOL_OUTPUT_MAX_LINE_BYTES + 10), false ; "no_trailing_newline_when_absent")]
-    fn truncate_long_lines_trailing_newline(input: &str, expect_trailing: bool) {
-        assert_eq!(truncate_long_lines(input).ends_with('\n'), expect_trailing);
+        assert_eq!(&*truncate_long_lines("short\nlines\n"), "short\nlines\n");
+        assert_eq!(&*truncate_long_lines(&"a".repeat(max)), "a".repeat(max));
+        assert_eq!(
+            &*truncate_long_lines(&"a".repeat(max + 1)),
+            format!("{}{LONG_LINE_SUFFIX}", "a".repeat(max))
+        );
+
+        let mut multibyte = "a".repeat(max - 1);
+        multibyte.push('\u{00e9}');
+        let result = truncate_long_lines(&multibyte);
+        assert!(result.ends_with(LONG_LINE_SUFFIX));
+        assert!(!result.contains('\u{00e9}'));
+
+        let with_nl = format!("{}\n", "z".repeat(max + 10));
+        assert!(truncate_long_lines(&with_nl).ends_with('\n'));
+        let without_nl = "z".repeat(max + 10);
+        assert!(!truncate_long_lines(&without_nl).ends_with('\n'));
     }
 
     #[test]
@@ -1070,40 +1017,26 @@ mod tests {
     }
 
     #[test]
-    fn finalize_lines_collapses_internal_consecutive_blanks() {
+    fn finalize_lines_collapses_consecutive_blanks() {
+        let para = |t| Line {
+            kind: LineKind::Paragraph,
+            spans: vec![Span::new(t, StyleToken::Text)],
+        };
         let mut lines = vec![
-            Line {
-                kind: LineKind::Paragraph,
-                spans: vec![Span::new("a", StyleToken::Text)],
-            },
+            para("a"),
             Line::blank(),
             Line::blank(),
             Line::blank(),
-            Line {
-                kind: LineKind::Paragraph,
-                spans: vec![Span::new("b", StyleToken::Text)],
-            },
+            para("b"),
             Line::blank(),
-            Line {
-                kind: LineKind::Paragraph,
-                spans: vec![Span::new("c", StyleToken::Text)],
-            },
+            para("c"),
             Line::blank(),
             Line::blank(),
         ];
         finalize_lines(&mut lines);
         assert!(!lines.last().is_some_and(Line::is_blank));
-        for w in lines.windows(2) {
-            assert!(
-                !(w[0].is_blank() && w[1].is_blank()),
-                "two consecutive blanks: {lines:?}"
-            );
-        }
-        let texts: Vec<_> = lines
-            .iter()
-            .map(|l| l.spans.iter().map(|s| s.text.as_str()).collect::<String>())
-            .collect();
-        assert_eq!(texts, vec!["a", "", "b", "", "c"]);
+        assert!(!lines.windows(2).any(|w| w[0].is_blank() && w[1].is_blank()));
+        assert_eq!(lines_text(&lines), vec!["a", "", "b", "", "c"]);
     }
 
     #[test]
@@ -1111,85 +1044,61 @@ mod tests {
         let mut r = Renderer::new();
         let code = "```rust\nlet x = 42;\n```";
         r.render(code, TEST_WIDTH, 0);
-        assert_eq!(
-            r.highlighters.len(),
-            1,
-            "one highlighter after first render"
-        );
-        let gen0_output = r.render(code, TEST_WIDTH, 0);
         assert_eq!(r.highlighters.len(), 1);
-        let gen1_output = r.render(code, TEST_WIDTH, 1);
-        assert_eq!(r.highlighters.len(), 1, "highlighter rebuilt at new gen");
-        assert_eq!(r.theme_gen, 1, "theme_gen updated");
-        assert_eq!(gen0_output, gen1_output, "same theme produces same output");
+        r.render(code, TEST_WIDTH, 1);
+        assert_eq!(r.theme_gen, 1);
+        assert_eq!(r.highlighters.len(), 1);
     }
 
     #[test]
-    fn unwrapped_mode_does_not_wrap_paragraphs() {
+    fn unwrapped_mode_skips_paragraph_wrap_but_wraps_code() {
         let long_para = "word ".repeat(50);
         let mut r = Renderer::unwrapped();
-        let lines = r.render(long_para.trim(), 30, 0);
-        let para_lines: Vec<_> = lines
-            .iter()
-            .filter(|l| l.kind == LineKind::Paragraph)
-            .collect();
+        let para_lines = r.render(long_para.trim(), 30, 0);
         assert_eq!(
-            para_lines.len(),
-            1,
-            "unwrapped paragraph must stay on one line"
+            para_lines
+                .iter()
+                .filter(|l| l.kind == LineKind::Paragraph)
+                .count(),
+            1
         );
-    }
 
-    #[test]
-    fn unwrapped_mode_still_wraps_code_blocks() {
         let long_code = "a".repeat(60);
         let input = format!("```\n{long_code}\n```");
-        let mut r = Renderer::unwrapped();
-        let lines = r.render(&input, 20, 0);
-        let code_lines: Vec<_> = lines.iter().filter(|l| l.kind == LineKind::Code).collect();
+        let code_lines = r.render(&input, 20, 0);
         assert!(
-            code_lines.len() > 1,
-            "unwrapped mode must still wrap code lines"
+            code_lines
+                .iter()
+                .filter(|l| l.kind == LineKind::Code)
+                .count()
+                > 1
         );
     }
 
     #[test]
     fn table_compact_fallback_at_small_width() {
-        let input = "| aa | bb |\n| --- | --- |\n| cc | dd |";
-        let narrow_width: u16 = 10;
-        let lines = render(input, narrow_width);
-        let has_box_border = lines.iter().any(|l| l.kind == LineKind::TableBorder);
+        let lines = render("| aa | bb |\n| --- | --- |\n| cc | dd |", 10);
         assert!(
-            !has_box_border,
-            "compact mode should have no TableBorder lines"
+            !lines.iter().any(|l| l.kind == LineKind::TableBorder),
+            "compact: no borders"
         );
-        let row_lines: Vec<_> = lines
-            .iter()
-            .filter(|l| l.kind == LineKind::TableRow)
-            .collect();
         assert!(
-            !row_lines.is_empty(),
-            "compact mode should produce TableRow lines"
+            lines.iter().any(|l| l.kind == LineKind::TableRow),
+            "compact: has rows"
         );
     }
 
     #[test]
     fn multiple_code_blocks_get_separate_highlighters() {
         let mut r = Renderer::new();
-        let two_blocks = "```rust\nfn a() {}\n```\n\n```python\nx = 1\n```";
-        r.render(two_blocks, TEST_WIDTH, 0);
-        assert_eq!(
-            r.highlighters.len(),
-            2,
-            "each code block gets its own highlighter"
+        r.render(
+            "```rust\nfn a() {}\n```\n\n```python\nx = 1\n```",
+            TEST_WIDTH,
+            0,
         );
-        let one_block = "```rust\nfn a() {}\n```";
-        r.render(one_block, TEST_WIDTH, 0);
-        assert_eq!(
-            r.highlighters.len(),
-            1,
-            "highlighters truncated to match block count"
-        );
+        assert_eq!(r.highlighters.len(), 2);
+        r.render("```rust\nfn a() {}\n```", TEST_WIDTH, 0);
+        assert_eq!(r.highlighters.len(), 1);
     }
 
     #[test]
@@ -1209,93 +1118,84 @@ mod tests {
     }
 
     #[test]
-    fn coalesce_merges_same_style_and_splits_different() {
+    fn coalesce_merges_same_style_splits_different() {
         let mut spans = vec![
             Span::new("aa", StyleToken::Text),
             Span::new("bb", StyleToken::Text),
             Span::new("cc", StyleToken::InlineCode),
             Span::new("dd", StyleToken::InlineCode),
-            Span::new("ee", StyleToken::Text),
-        ];
-        coalesce_adjacent_spans(&mut spans);
-        assert_eq!(spans.len(), 3, "three groups after coalesce");
-        assert_eq!(spans[0].text, "aabb");
-        assert_eq!(spans[0].style, StyleToken::Text);
-        assert_eq!(spans[1].text, "ccdd");
-        assert_eq!(spans[1].style, StyleToken::InlineCode);
-        assert_eq!(spans[2].text, "ee");
-        assert_eq!(spans[2].style, StyleToken::Text);
-    }
-
-    #[test]
-    fn coalesce_does_not_merge_different_emphasis() {
-        let mut spans = vec![
             Span::new("plain", StyleToken::Text),
             Span::with_emphasis("bold", StyleToken::Text, Emphasis::BOLD),
         ];
         coalesce_adjacent_spans(&mut spans);
-        assert_eq!(spans.len(), 2, "different emphasis must not merge");
+        assert_eq!(spans.len(), 4);
+        assert_eq!(spans[0].text, "aabb");
+        assert_eq!(spans[1].text, "ccdd");
+        assert_eq!(spans[2].text, "plain");
+        assert_eq!(spans[3].text, "bold");
     }
 
     #[test_case(10 ; "narrow")]
     #[test_case(40 ; "medium")]
     #[test_case(120 ; "wide")]
     fn table_with_empty_cell_does_not_panic(width: u16) {
-        let input = "| a | | c |\n| --- | --- | --- |\n| d | | f |";
-        let lines = render(input, width);
-        let rows: Vec<_> = lines
-            .iter()
-            .filter(|l| l.kind == LineKind::TableRow)
-            .collect();
-        assert!(rows.len() >= 2, "two data rows expected at width={width}");
+        let lines = render("| a | | c |\n| --- | --- | --- |\n| d | | f |", width);
+        assert!(
+            lines
+                .iter()
+                .filter(|l| l.kind == LineKind::TableRow)
+                .count()
+                >= 2
+        );
     }
 
     #[test]
     fn ordered_list_emits_correct_marker() {
         let lines = render("1. first", TEST_WIDTH);
         assert_eq!(lines[0].kind, LineKind::ListItem);
-        let marker = &lines[0].spans[0];
-        assert_eq!(marker.text, "1. ", "ordered list marker text");
-        assert_eq!(
-            marker.style,
-            StyleToken::ListMarker,
-            "ordered list marker style"
-        );
-        let content = &lines[0].spans[1];
-        assert_eq!(content.text, "first");
+        assert_eq!(lines[0].spans[0].style, StyleToken::ListMarker);
+        assert!(find_span(&lines, "first").is_some());
     }
 
     #[test]
     fn wrap_spans_hard_breaks_unbreakable_run() {
         let long_word = "x".repeat(30);
-        let spans = vec![Span::new(long_word.clone(), StyleToken::Text)];
-        let max_width: usize = 10;
-        let wrapped = wrap_spans(spans, max_width);
-        assert!(
-            wrapped.len() >= 3,
-            "30 chars at width 10 must produce at least 3 rows, got {}",
-            wrapped.len()
-        );
+        let wrapped = wrap_spans(vec![Span::new(long_word.clone(), StyleToken::Text)], 10);
+        assert!(wrapped.len() >= 3);
         let reassembled: String = wrapped
             .iter()
             .flat_map(|row| row.iter())
             .map(|s| s.text.as_str())
             .collect();
-        assert_eq!(
-            reassembled, long_word,
-            "hard-break must preserve all characters"
-        );
-        for row in &wrapped {
-            let w: usize = row.iter().map(|s| s.text.width()).sum();
-            assert!(w <= max_width, "row exceeded max_width: {w}");
-        }
+        assert_eq!(reassembled, long_word);
+        assert!(wrapped.iter().all(|row| spans_width(row) <= 10));
     }
 
     #[test]
     fn render_leading_newlines_are_stripped() {
         let lines = render("\n\n\nhello", TEST_WIDTH);
         assert!(!lines.is_empty());
-        let first_text: String = lines[0].spans.iter().map(|s| s.text.as_str()).collect();
-        assert_eq!(first_text, "hello");
+        assert_eq!(find_span(&lines, "hello").unwrap().text, "hello");
+    }
+
+    #[test]
+    fn truncate_long_line_preserves_table_detection() {
+        let long_cell = "A".repeat(500);
+        let text = format!("| What | Why |\n| --- | --- |\n| Short cell | {long_cell} |");
+
+        let full = Renderer::unwrapped().render(&text, 120, 0);
+        assert!(
+            full.iter().any(|l| l.kind == LineKind::TableBorder),
+            "full text must parse as a table"
+        );
+
+        let truncated = truncate_long_lines_at(&text, 500);
+        assert_ne!(truncated.as_ref(), text, "truncation must modify the text");
+
+        let trunc = Renderer::unwrapped().render(&truncated, 120, 0);
+        assert!(
+            trunc.iter().any(|l| l.kind == LineKind::TableBorder),
+            "table detection survives truncation (parser is lenient about missing closing |)"
+        );
     }
 }

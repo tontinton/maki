@@ -182,7 +182,7 @@ pub fn assistant_style() -> RoleStyle {
         text_style: theme::current().assistant,
         prefix_style: theme::current().assistant_prefix,
         use_markdown: true,
-        max_line_bytes: Some(maki_markdown::render::TOOL_OUTPUT_MAX_LINE_BYTES),
+        max_line_bytes: None,
     }
 }
 
@@ -202,7 +202,7 @@ pub fn thinking_style() -> RoleStyle {
         text_style: theme::current().thinking,
         prefix_style: theme::current().thinking,
         use_markdown: true,
-        max_line_bytes: Some(maki_markdown::render::TOOL_OUTPUT_MAX_LINE_BYTES),
+        max_line_bytes: None,
     }
 }
 
