@@ -184,7 +184,7 @@ If the model name is unique across providers, the prefix can be omitted.
 
 ## Dynamic Providers
 
-To add a custom provider or proxy, drop an executable script into `~/.maki/providers/`. The script must handle these subcommands:
+To add a custom provider or proxy, drop an executable script into `~/.config/maki/providers/`. The script must handle these subcommands:
 
 | Subcommand | Timeout | What it does |
 |------------|---------|--------|

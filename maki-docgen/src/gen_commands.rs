@@ -55,7 +55,7 @@ pub fn generate() -> String {
 
     writeln!(out, "### User commands").unwrap();
     writeln!(out).unwrap();
-    writeln!(out, "Place `.md` files in `~/.maki/commands/`.").unwrap();
+    writeln!(out, "Place `.md` files in `~/.config/maki/commands/`.").unwrap();
     writeln!(out, "They appear in the palette as `/user:<filename>`.").unwrap();
     writeln!(out).unwrap();
     writeln!(

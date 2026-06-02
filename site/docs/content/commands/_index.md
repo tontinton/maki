@@ -41,7 +41,7 @@ They appear in the palette as `/project:<filename>`.
 
 ### User commands
 
-Place `.md` files in `~/.maki/commands/`.
+Place `.md` files in `~/.config/maki/commands/`.
 They appear in the palette as `/user:<filename>`.
 
 Project commands override user commands with the same name.

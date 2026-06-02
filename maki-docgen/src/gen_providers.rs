@@ -53,7 +53,7 @@ fn dynamic_providers_section() -> String {
     format!(
         r#"## Dynamic Providers
 
-To add a custom provider or proxy, drop an executable script into `~/.maki/providers/`. The script must handle these subcommands:
+To add a custom provider or proxy, drop an executable script into `~/.config/maki/providers/`. The script must handle these subcommands:
 
 | Subcommand | Timeout | What it does |
 |------------|---------|--------|
