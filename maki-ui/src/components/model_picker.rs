@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use arc_swap::ArcSwapOption;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use ratatui::text::{Line, Span};
@@ -9,6 +9,7 @@ use ratatui::text::{Line, Span};
 use maki_providers::ModelTier;
 use maki_providers::dynamic;
 use maki_providers::provider::ProviderKind;
+use maki_providers::tier_map;
 
 use crate::components::Overlay;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
@@ -21,20 +22,18 @@ fn footer_line() -> Line<'static> {
     Line::from(vec![
         Span::styled("  Enter", t.keybind_key),
         Span::styled(" select", t.tool_dim),
-        Span::styled("  Alt+1 ", t.keybind_key),
-        Span::styled("(set strong)", t.tool_dim),
-        Span::styled(" / ", t.tool_dim),
-        Span::styled("Alt+2 ", t.keybind_key),
-        Span::styled("(set medium)", t.tool_dim),
-        Span::styled(" / ", t.tool_dim),
-        Span::styled("Alt+3 ", t.keybind_key),
-        Span::styled("(set weak)", t.tool_dim),
+        Span::styled("  1", t.keybind_key),
+        Span::styled(" strong", t.tool_dim),
+        Span::styled("  2", t.keybind_key),
+        Span::styled(" medium", t.tool_dim),
+        Span::styled("  3", t.keybind_key),
+        Span::styled(" weak", t.tool_dim),
     ])
 }
 
 fn tier_for_shortcut(key: KeyEvent) -> Option<ModelTier> {
     let digit = match key.code {
-        KeyCode::Char(c @ '1'..='3') if key.modifiers.contains(KeyModifiers::ALT) => c,
+        KeyCode::Char(c @ '1'..='3') => c,
         KeyCode::Char('¡') => '1',
         KeyCode::Char('™') => '2',
         KeyCode::Char('£') => '3',
@@ -60,6 +59,7 @@ struct ModelEntry {
     id: String,
     provider_display: &'static str,
     tier: String,
+    tier_override: bool,
 }
 
 impl PickerItem for ModelEntry {
@@ -74,12 +74,17 @@ impl PickerItem for ModelEntry {
     fn section(&self) -> Option<&str> {
         Some(self.provider_display)
     }
+
+    fn is_highlighted(&self) -> bool {
+        self.tier_override
+    }
 }
 
 pub struct ModelPicker {
     picker: ListPicker<ModelEntry>,
     models: Arc<ArcSwapOption<Vec<String>>>,
     last_spec_count: usize,
+    dirty: bool,
 }
 
 impl ModelPicker {
@@ -88,6 +93,7 @@ impl ModelPicker {
             picker: ListPicker::new().with_footer_builder(footer_line),
             models,
             last_spec_count: 0,
+            dirty: false,
         }
     }
 
@@ -112,16 +118,16 @@ impl ModelPicker {
         }
         let guard = self.models.load();
         let spec_count = guard.as_deref().map_or(0, Vec::len);
-        if spec_count == self.last_spec_count {
+        let count_changed = spec_count != self.last_spec_count;
+        if !count_changed && !self.dirty {
             return;
         }
         self.last_spec_count = spec_count;
+        self.dirty = false;
         let entries: Vec<ModelEntry> = guard
             .as_deref()
-            .unwrap()
-            .iter()
-            .filter_map(|s| parse_model_entry(s))
-            .collect();
+            .map(|s| s.iter().filter_map(|s| parse_model_entry(s)).collect())
+            .unwrap_or_default();
         self.picker.replace_items(entries);
     }
 
@@ -150,9 +156,7 @@ impl ModelPicker {
             && let Some(entry) = self.picker.selected_item()
         {
             let spec = entry.spec.clone();
-            let id = entry.id.clone();
-            self.picker
-                .with_item_mut(&id, |e| e.tier = tier.to_string());
+            self.dirty = true;
             return ModelPickerAction::AssignTier(spec, tier);
         }
         match self.picker.handle_key(key) {
@@ -192,11 +196,13 @@ fn parse_model_entry(spec: &str) -> Option<ModelEntry> {
         Ok(m) => m.tier.to_string(),
         Err(_) => String::new(),
     };
+    let tier_override = tier_map::tier_map().read().unwrap().is_override(spec);
     Some(ModelEntry {
         spec: spec.to_string(),
         id: model_id.to_string(),
         provider_display,
         tier,
+        tier_override,
     })
 }
 
@@ -255,13 +261,17 @@ mod tests {
         let models = Arc::new(ArcSwapOption::empty());
         let mut p = ModelPicker::new(models.clone());
         p.open("");
-        assert_eq!(p.last_spec_count, 0);
+        assert!(matches!(
+            p.handle_key(key(KeyCode::Enter)),
+            ModelPickerAction::Consumed
+        ));
 
         models.store(Some(Arc::new(vec![
             "anthropic/claude-sonnet-4-20250514".into(),
         ])));
         p.try_refresh();
-        assert_eq!(p.last_spec_count, 1);
+        let action = p.handle_key(key(KeyCode::Enter));
+        assert!(matches!(action, ModelPickerAction::Select(ref s) if s.contains("sonnet")));
     }
 
     #[test]
@@ -313,6 +323,9 @@ mod tests {
         assert!(parse_model_entry("no-slash").is_none());
     }
 
+    #[test_case(key(KeyCode::Char('1')),           ModelTier::Strong ; "bare_1_strong")]
+    #[test_case(key(KeyCode::Char('2')),           ModelTier::Medium ; "bare_2_medium")]
+    #[test_case(key(KeyCode::Char('3')),           ModelTier::Weak   ; "bare_3_weak")]
     #[test_case(alt_key(KeyCode::Char('1')),       ModelTier::Strong ; "alt_1_strong")]
     #[test_case(alt_key(KeyCode::Char('2')),       ModelTier::Medium ; "alt_2_medium")]
     #[test_case(alt_key(KeyCode::Char('3')),       ModelTier::Weak   ; "alt_3_weak")]
@@ -329,16 +342,5 @@ mod tests {
             "expected AssignTier(claude-sonnet, {want:?}), got something else",
         );
         assert!(p.is_open());
-    }
-
-    #[test]
-    fn plain_number_keys_go_to_filter() {
-        let mut p = ModelPicker::new(test_models());
-        p.open("");
-        let action = p.handle_key(key(KeyCode::Char('1')));
-        assert!(
-            matches!(action, ModelPickerAction::Consumed),
-            "plain '1' should be consumed by filter, not trigger tier assignment"
-        );
     }
 }

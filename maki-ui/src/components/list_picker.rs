@@ -45,8 +45,10 @@ pub trait PickerItem {
     fn section(&self) -> Option<&str> {
         None
     }
-    /// Shows a spinner in the detail slot when true.
     fn is_spinning(&self) -> bool {
+        false
+    }
+    fn is_highlighted(&self) -> bool {
         false
     }
 }
@@ -484,14 +486,6 @@ impl<T: PickerItem> ListPicker<T> {
             .and_then(|s| s.items.get(idx))
     }
 
-    pub fn with_item_mut(&mut self, label: &str, f: impl FnOnce(&mut T)) {
-        if let Some(s) = self.state.as_mut().and_then(PickerState::ready_mut)
-            && let Some(item) = s.items.iter_mut().find(|i| i.label() == label)
-        {
-            f(item);
-        }
-    }
-
     pub fn handle_paste(&mut self, text: &str) -> bool {
         let Some(Some(s)) = self.state.as_mut().map(PickerState::ready_mut) else {
             return self.is_open();
@@ -532,15 +526,10 @@ impl<T: PickerItem> ListPicker<T> {
                     max_height_percent: MAX_HEIGHT_PERCENT,
                 };
                 let (popup, inner) = modal.render(frame, area, 1 + SEARCH_ROW + footer_rows);
-                let constraints: Vec<Constraint> = if footer.is_some() {
-                    vec![
-                        Constraint::Min(1),
-                        Constraint::Length(1),
-                        Constraint::Length(1),
-                    ]
-                } else {
-                    vec![Constraint::Min(1), Constraint::Length(1)]
-                };
+                let mut constraints = vec![Constraint::Min(1), Constraint::Length(1)];
+                if footer.is_some() {
+                    constraints.push(Constraint::Length(1));
+                }
                 let areas = Layout::vertical(constraints).split(inner);
                 let list_area = areas[0];
                 let search_area = areas[1];
@@ -623,7 +612,7 @@ fn render_ready<T: PickerItem>(
     constraints.push(Constraint::Min(1)); // list
     constraints.push(Constraint::Length(1)); // search
     if footer.is_some() {
-        constraints.push(Constraint::Length(1)); // footer
+        constraints.push(Constraint::Length(1));
     }
 
     let areas = Layout::vertical(constraints).split(inner);
@@ -804,10 +793,16 @@ fn render_list<T: PickerItem>(
             break;
         }
 
-        let style = if i == selected {
-            theme::current().item_selected
-        } else {
-            theme::current().item
+        let highlighted = item.is_highlighted();
+        let t = theme::current();
+        let (style, detail_style) = match (i == selected, highlighted) {
+            (true, true) => {
+                let s = t.item_selected.fg(t.accent.fg.unwrap_or_default());
+                (s, theme::dim_style(s, 0.4))
+            }
+            (true, false) => (t.item_selected, t.item_selected),
+            (false, true) => (t.accent, theme::dim_style(t.accent, 0.4)),
+            (false, false) => (t.item, t.item_desc),
         };
         let checkbox = enabled.map(|en| {
             let sym = if en[item_idx] { "✓ " } else { "✗ " };
@@ -830,11 +825,6 @@ fn render_list<T: PickerItem>(
             Some(detail) => {
                 let label = truncate_label(&label, max_label_width(detail, area.width));
                 let pad = detail_padding(&label, detail, area.width);
-                let detail_style = if i == selected {
-                    style
-                } else {
-                    theme::current().item_desc
-                };
                 let mut spans = Vec::with_capacity(5);
                 if let Some(cb) = checkbox {
                     spans.push(cb);
@@ -879,7 +869,7 @@ fn render_search(frame: &mut Frame, area: Rect, search: &TextBuffer) {
 }
 
 fn render_footer(frame: &mut Frame, area: Rect, spec: &FooterSpec) {
-    frame.render_widget(Paragraph::new(vec![spec.build()]), area);
+    frame.render_widget(Paragraph::new(spec.build()), area);
 }
 
 #[cfg(test)]

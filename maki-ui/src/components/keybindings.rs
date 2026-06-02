@@ -533,7 +533,7 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
-        label: KeyLabel::Single("Alt+1/2/3"),
+        label: KeyLabel::Single("1/2/3"),
         description: "Set tier (strong/medium/weak)",
         context: KeybindContext::ModelPicker,
         platform: Platform::All,

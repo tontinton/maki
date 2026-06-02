@@ -133,6 +133,24 @@ impl TierMap {
             _ => Some(spec),
         }
     }
+
+    pub fn spec_for_tier_any(&self, tier: ModelTier) -> Option<String> {
+        for (spec, &t) in &self.overrides {
+            if t == tier {
+                return Some(spec.clone());
+            }
+        }
+        for &provider in self.known_models.keys() {
+            if let Some(spec) = self.spec_for_tier(provider, tier) {
+                return Some(spec);
+            }
+        }
+        None
+    }
+
+    pub fn is_override(&self, spec: &str) -> bool {
+        self.overrides.contains_key(spec)
+    }
 }
 
 /// Pure function: map a list position to a tier. Position 0 is Strong, 1 is
@@ -275,8 +293,9 @@ mod tests {
     }
 
     #[test]
-    fn spec_for_tier_no_models_returns_none() {
-        let map = make_map(&[], &[]);
+    fn spec_for_tier_skips_model_overridden_elsewhere() {
+        // "big" is at the Strong slot but overridden to Weak; don't return it for Strong.
+        let map = make_map(&[("ollama/big", ModelTier::Weak)], &["big", "mid", "small"]);
         assert_eq!(
             map.spec_for_tier(ProviderKind::Ollama, ModelTier::Strong),
             None
@@ -284,12 +303,26 @@ mod tests {
     }
 
     #[test]
-    fn spec_for_tier_skips_model_overridden_elsewhere() {
-        // "big" is at the Strong slot but overridden to Weak; don't return it for Strong.
-        let map = make_map(&[("ollama/big", ModelTier::Weak)], &["big", "mid", "small"]);
+    fn spec_for_tier_any_cross_provider_and_sorted() {
+        let map = make_map(
+            &[
+                ("zai/glm-5", ModelTier::Weak),
+                ("anthropic/opus", ModelTier::Weak),
+                ("openai/gpt-foo", ModelTier::Strong),
+            ],
+            &["big", "mid", "small"],
+        );
         assert_eq!(
-            map.spec_for_tier(ProviderKind::Ollama, ModelTier::Strong),
-            None
+            map.spec_for_tier_any(ModelTier::Strong),
+            Some("openai/gpt-foo".into()),
+        );
+        assert_eq!(
+            map.spec_for_tier_any(ModelTier::Weak),
+            Some("anthropic/opus".into()),
+        );
+        assert_eq!(
+            map.spec_for_tier_any(ModelTier::Medium),
+            Some("ollama/mid".into()),
         );
     }
 

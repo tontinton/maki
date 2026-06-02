@@ -66,12 +66,20 @@ impl Task {
             if effective == ctx.model.tier {
                 (Model::clone(&ctx.model), Arc::clone(&ctx.provider))
             } else {
-                let resolved_model = Model::from_tier_dynamic(
-                    ctx.model.provider,
-                    effective,
-                    ctx.model.dynamic_slug.as_deref(),
-                )
-                .map_err(|e| e.to_string())?;
+                let resolved_model = {
+                    let map = maki_providers::tier_map::tier_map().read().unwrap();
+                    map.spec_for_tier(ctx.model.provider, effective)
+                        .or_else(|| map.spec_for_tier_any(effective))
+                        .and_then(|spec| Model::from_spec(&spec).ok())
+                }
+                .unwrap_or(
+                    Model::from_tier_dynamic(
+                        ctx.model.provider,
+                        effective,
+                        ctx.model.dynamic_slug.as_deref(),
+                    )
+                    .map_err(|e| e.to_string())?,
+                );
                 let resolved_provider = provider::from_model_async(&resolved_model, ctx.timeouts)
                     .await
                     .map_err(|e| e.to_string())?;

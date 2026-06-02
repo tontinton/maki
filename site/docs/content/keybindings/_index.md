@@ -82,7 +82,7 @@ Some pickers add extra bindings on top of the defaults:
 | Session Picker | `Ctrl+D` | Delete session |
 | Queue | `Enter` | Remove item |
 | Commands | `Tab` | Complete command |
-| Model Picker | `Alt+1/2/3` | Set tier (strong/medium/weak) |
+| Model Picker | `1/2/3` | Set tier (strong/medium/weak) |
 
 ## Context Inheritance
 
