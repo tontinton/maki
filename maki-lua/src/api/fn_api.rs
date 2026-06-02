@@ -337,10 +337,7 @@ pub(crate) fn create_fn_table(lua: &Lua) -> LuaResult<Table> {
         "executable",
         lua.create_function(|_, name: String| {
             let found = env::var_os("PATH")
-                .map(|paths| {
-                    env::split_paths(&paths)
-                        .any(|dir| dir.join(&name).is_file())
-                })
+                .map(|paths| env::split_paths(&paths).any(|dir| dir.join(&name).is_file()))
                 .unwrap_or(false)
                 || Path::new(&name).is_file();
             Ok(if found { 1 } else { 0 })

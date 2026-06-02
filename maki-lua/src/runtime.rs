@@ -910,7 +910,13 @@ impl LuaRuntime {
         name: Arc<str>,
         source: &str,
         plugin_dir: Option<PathBuf>,
+        config_store: Option<&ConfigStore>,
     ) -> LoadResult {
+        let map_err = |e: mlua::Error| PluginError::Lua {
+            plugin: name.to_string(),
+            source: e,
+        };
+
         let stale = self.drain_pending();
         debug_assert!(
             stale.is_empty(),
@@ -925,17 +931,15 @@ impl LuaRuntime {
             Arc::clone(&name),
             self.ui_action_tx.clone(),
         )
-        .map_err(|e| PluginError::Lua {
-            plugin: name.to_string(),
-            source: e,
-        })?;
+        .map_err(&map_err)?;
 
-        let env = self
-            .build_env(maki, require_root)
-            .map_err(|e| PluginError::Lua {
-                plugin: name.to_string(),
-                source: e,
-            })?;
+        if let Some(cs) = config_store {
+            let setup_fn =
+                crate::api::setup::create_setup_fn(&self.lua, Arc::clone(cs)).map_err(&map_err)?;
+            maki.set("setup", setup_fn).map_err(&map_err)?;
+        }
+
+        let env = self.build_env(maki, require_root).map_err(&map_err)?;
 
         self.drop_plugin_keys(&name);
 
@@ -951,10 +955,7 @@ impl LuaRuntime {
             let stale = self.drain_pending();
             self.discard_pending(stale);
             self.drop_plugin_keys(&name);
-            return Err(PluginError::Lua {
-                plugin: name.to_string(),
-                source: e,
-            });
+            return Err(map_err(e));
         }
 
         let pending = self.drain_pending();
@@ -1177,51 +1178,21 @@ impl LuaRuntime {
         })
     }
 
-    fn run_init_lua(
-        &self,
+    async fn run_init_lua(
+        &mut self,
         source: &str,
         source_name: &str,
         plugin_dir: Option<PathBuf>,
     ) -> Result<Option<RawConfig>, PluginError> {
-        let map_err = |e: mlua::Error| PluginError::Lua {
-            plugin: source_name.to_owned(),
-            source: e,
-        };
-
         let config_store: ConfigStore = Arc::new(Mutex::new(None));
-        let require_root = plugin_dir.as_ref().map(|d| d.join("lua"));
-
-        let setup_fn = crate::api::setup::create_setup_fn(&self.lua, Arc::clone(&config_store))
-            .map_err(&map_err)?;
-        let maki = self.lua.create_table().map_err(&map_err)?;
-        maki.set("setup", setup_fn).map_err(&map_err)?;
-        maki.set(
-            "fs",
-            crate::api::fs::create_fs_table(&self.lua).map_err(&map_err)?,
+        self.load_source(
+            Arc::from(source_name),
+            source,
+            plugin_dir,
+            Some(&config_store),
         )
-        .map_err(&map_err)?;
-        maki.set(
-            "json",
-            crate::api::json::create_json_table(&self.lua).map_err(&map_err)?,
-        )
-        .map_err(&map_err)?;
-        maki.set(
-            "uv",
-            crate::api::uv::create_uv_table(&self.lua).map_err(&map_err)?,
-        )
-        .map_err(&map_err)?;
-
-        let env = self.build_env(maki, require_root).map_err(&map_err)?;
-
-        self.lua
-            .load(source)
-            .set_name(source_name)
-            .set_environment(env)
-            .exec()
-            .map_err(&map_err)?;
-
-        let raw = config_store.lock().unwrap().take();
-        Ok(raw)
+        .await?;
+        Ok(config_store.lock().unwrap().take())
     }
 }
 
@@ -1539,7 +1510,7 @@ pub fn spawn(
                             reply,
                         } => {
                             gate.drain().await;
-                            let res = rt.load_source(Arc::clone(&name), &source, plugin_dir).await;
+                            let res = rt.load_source(Arc::clone(&name), &source, plugin_dir, None).await;
                             let _ = reply.send(res);
                         }
                         Request::CallTool {
@@ -1665,7 +1636,7 @@ pub fn spawn(
                             reply,
                         } => {
                             gate.drain().await;
-                            let res = rt.run_init_lua(&source, &source_name, plugin_dir);
+                            let res = rt.run_init_lua(&source, &source_name, plugin_dir).await;
                             let _ = reply.send(res);
                         }
                         Request::CollectPromptSlots { reply } => {
