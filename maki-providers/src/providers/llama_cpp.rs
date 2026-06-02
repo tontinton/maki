@@ -16,6 +16,7 @@ use super::{KeyPool, ResolvedAuth};
 
 const HOST_ENV: &str = "LLAMA_CPP_HOST";
 const API_KEY_ENV: &str = "LLAMA_CPP_API_KEY";
+const ID_SLOT_ENV: &str = "LLAMA_CPP_ID_SLOT";
 const HOST_NOT_SET: &str = "LLAMA_CPP_HOST not set";
 const PROBE_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const PROBE_TOTAL_TIMEOUT: Duration = Duration::from_secs(5);
@@ -34,10 +35,12 @@ pub(crate) fn models() -> &'static [ModelEntry] {
 
 static CACHED_CONTEXT_WINDOW: OnceLock<Option<u32>> = OnceLock::new();
 
-/// Probe the running llama.cpp server for its actual context size by reading
-/// `default_generation_settings.n_ctx` from `/props`. Cached for the life of
-/// the process; returns `None` on any failure so callers fall back to a static
-/// default.
+/// Probe the running llama.cpp server for its actual context size. By default
+/// reads `default_generation_settings.n_ctx` from `/props` (always enabled).
+/// If `LLAMA_CPP_ID_SLOT` is set, reads `n_ctx` for that slot from `/slots`
+/// instead (requires the server to be started with `--slots`). Cached for the
+/// life of the process; returns `None` on any failure so callers fall back to
+/// a static default.
 pub(crate) fn fetch_context_window() -> Option<u32> {
     *CACHED_CONTEXT_WINDOW.get_or_init(probe_context_window)
 }
@@ -51,7 +54,10 @@ fn probe_context_window() -> Option<u32> {
         .build()
         .ok()?;
 
-    let n_ctx = probe_props_n_ctx(&client, host)?;
+    let n_ctx = match id_slot() {
+        Some(id) => probe_slot_n_ctx(&client, host, id)?,
+        None => probe_props_n_ctx(&client, host)?,
+    };
     debug!(n_ctx, "llama.cpp context window detected");
     Some(n_ctx)
 }
@@ -59,6 +65,11 @@ fn probe_context_window() -> Option<u32> {
 fn probe_props_n_ctx(client: &isahc::HttpClient, host: &str) -> Option<u32> {
     let body = http_get(client, &format!("{host}/props"))?;
     parse_props_n_ctx(&body)
+}
+
+fn probe_slot_n_ctx(client: &isahc::HttpClient, host: &str, slot_id: i32) -> Option<u32> {
+    let body = http_get(client, &format!("{host}/slots"))?;
+    parse_slot_n_ctx(&body, slot_id)
 }
 
 fn http_get(client: &isahc::HttpClient, url: &str) -> Option<String> {
@@ -95,8 +106,21 @@ fn parse_props_n_ctx(body: &str) -> Option<u32> {
         .map(|n| n as u32)
 }
 
+fn parse_slot_n_ctx(body: &str, slot_id: i32) -> Option<u32> {
+    let parsed: Value = serde_json::from_str(body).ok()?;
+    let slots = parsed.as_array()?;
+    let slot = slots
+        .iter()
+        .find(|s| s.get("id").and_then(Value::as_i64) == Some(slot_id as i64))?;
+    slot.get("n_ctx").and_then(Value::as_u64).map(|n| n as u32)
+}
+
 fn first_api_key() -> Option<String> {
     KeyPool::from_env(API_KEY_ENV).ok().map(|p| p.current().to_string())
+}
+
+fn id_slot() -> Option<i32> {
+    std::env::var(ID_SLOT_ENV).ok()?.trim().parse().ok()
 }
 
 pub struct LlamaCpp {
@@ -104,6 +128,7 @@ pub struct LlamaCpp {
     auth: Arc<Mutex<ResolvedAuth>>,
     key_pool: Option<KeyPool>,
     system_prefix: Option<String>,
+    id_slot: Option<i32>,
 }
 
 impl LlamaCpp {
@@ -118,6 +143,7 @@ impl LlamaCpp {
             auth,
             key_pool: None,
             system_prefix: None,
+            id_slot: id_slot(),
         }
     }
 
@@ -151,6 +177,7 @@ impl LlamaCpp {
             })),
             key_pool,
             system_prefix: None,
+            id_slot: id_slot(),
         })
     }
 }
@@ -170,7 +197,10 @@ impl Provider for LlamaCpp {
             let auth = self.auth.lock().unwrap().clone();
             let mut buf = String::new();
             let system = super::with_prefix(&self.system_prefix, system, &mut buf);
-            let body = self.compat.build_body(model, messages, system, tools);
+            let mut body = self.compat.build_body(model, messages, system, tools);
+            if let Some(id) = self.id_slot {
+                body["id_slot"] = Value::from(id);
+            }
             self.compat
                 .do_stream(model, &[], &body, event_tx, &auth)
                 .await
@@ -238,6 +268,30 @@ mod tests {
     fn parse_props_n_ctx_handles_garbage() {
         assert_eq!(parse_props_n_ctx("not json"), None);
         assert_eq!(parse_props_n_ctx("{}"), None);
+    }
+
+    #[test]
+    fn parse_slot_n_ctx_finds_matching_slot() {
+        let body = r#"[
+            {"id":0,"n_ctx":4096},
+            {"id":1,"n_ctx":2048},
+            {"id":2,"n_ctx":8192}
+        ]"#;
+        assert_eq!(parse_slot_n_ctx(body, 0), Some(4096));
+        assert_eq!(parse_slot_n_ctx(body, 1), Some(2048));
+        assert_eq!(parse_slot_n_ctx(body, 2), Some(8192));
+    }
+
+    #[test]
+    fn parse_slot_n_ctx_missing_slot_returns_none() {
+        let body = r#"[{"id":0,"n_ctx":4096}]"#;
+        assert_eq!(parse_slot_n_ctx(body, 7), None);
+    }
+
+    #[test]
+    fn parse_slot_n_ctx_handles_garbage() {
+        assert_eq!(parse_slot_n_ctx("not json", 0), None);
+        assert_eq!(parse_slot_n_ctx(r#"{"error":"slots disabled"}"#, 0), None);
     }
 
     #[test]
