@@ -94,16 +94,15 @@ impl CodeExecution {
                 let code = format!("{PREAMBLE}{code}");
 
                 let result = if let Some(ref id) = tool_use_id {
-                    let mut pending = String::new();
+                    let mut accumulated = String::new();
                     let mut last_flush = Instant::now();
                     runner::run_streaming(&code, &tools, Some(&resolver), limits, &mut |line| {
-                        pending.push_str(line);
-                        if last_flush.elapsed() >= STREAM_FLUSH_INTERVAL && !pending.is_empty() {
+                        accumulated.push_str(line);
+                        if last_flush.elapsed() >= STREAM_FLUSH_INTERVAL {
                             env.event_tx.try_send(AgentEvent::ToolOutput {
                                 id: id.to_string(),
-                                content: pending.clone(),
+                                content: accumulated.clone(),
                             });
-                            pending.clear();
                             last_flush = Instant::now();
                         }
                     })

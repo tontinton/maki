@@ -1,12 +1,11 @@
 use std::time::{Duration, Instant};
 
-use maki_agent::AgentEvent;
 use maki_agent::cancel::CancelToken;
 use maki_config::{AgentConfig, ToolOutputLines};
 use mlua::{LuaSerdeExt, UserData, UserDataMethods, Value as LuaValue};
 
 use crate::api::tool::ToolCallReply;
-use crate::runtime::{LiveCtx, active_task};
+use crate::runtime::active_task;
 
 const DEADLINE_ALREADY_SET_MSG: &str = "ctx:set_deadline() already called";
 
@@ -27,7 +26,6 @@ pub(crate) struct LuaCtx {
     pub(crate) config: AgentConfig,
     pub(crate) tool_output_lines: ToolOutputLines,
     pub(crate) finish_tx: Option<flume::Sender<ToolCallReply>>,
-    pub(crate) live: Option<LiveCtx>,
 }
 
 impl UserData for LuaCtx {
@@ -38,16 +36,6 @@ impl UserData for LuaCtx {
 
         methods.add_method("tool_output_lines", |lua, this, ()| {
             lua.to_value(&this.tool_output_lines)
-        });
-
-        methods.add_method("emit_output", |_, this, content: String| {
-            if let Some(live) = &this.live {
-                live.event_tx.try_send(AgentEvent::ToolOutput {
-                    id: live.tool_use_id.clone(),
-                    content,
-                });
-            }
-            Ok(())
         });
 
         methods.add_method("set_deadline", |lua, _this, secs: u64| {

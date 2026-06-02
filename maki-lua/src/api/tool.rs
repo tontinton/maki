@@ -210,7 +210,6 @@ impl ToolInvocation for LuaToolInvocation {
                 config: ctx.config.clone(),
                 tool_output_lines: ctx.tool_output_lines,
                 finish_tx: None,
-                live: live.clone(),
             };
 
             tx.send_async(Request::CallTool {
