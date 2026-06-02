@@ -2,6 +2,7 @@ mod api;
 mod error;
 pub mod language;
 mod loader;
+pub(crate) mod plugin_permissions;
 mod runtime;
 
 pub use api::command::{
@@ -10,6 +11,7 @@ pub use api::command::{
 };
 pub use error::PluginError;
 pub use loader::{EventHandle, PluginHost};
+pub use plugin_permissions::{Permission, PluginPermissions};
 pub use runtime::{ClickReply, RestoreItem, RestoreReply};
 
 pub mod test_support {

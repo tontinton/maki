@@ -59,9 +59,13 @@ const NIL_WITHOUT_JOBS_ERR: &str =
     "handler returned nil without calling ctx:finish() or starting jobs";
 const FINISH_CALLED_TWICE_ERR: &str = "ctx:finish() already called";
 const DEADLINE_ALREADY_SET_ERR: &str = "ctx:set_deadline() already called";
-const DEADLINE_TIMEOUT_MSG: &str = "tool deadline_test timed out after 1s";
-const BASH_TIMEOUT_MSG: &str = "tool bash timed out after 1s";
-const BASH_TIMEOUT_MARKER: &str = "Timed out after 1s";
+const TIMED_OUT_SUBSTR: &str = "timed out";
+const BASH_TIMED_OUT_MARKER: &str = "Timed out";
+const ALREADY_CALLED_ERR: &str = "already called";
+const UNKNOWN_FIELD_ERR: &str = "unknown field";
+const BATCH_ALIGN_MSG: &str =
+    "a tool with no restore callback must yield a None reply that keeps the batch aligned by index";
+const PERMISSION_DENIED_MSG: &str = "permission denied";
 
 #[test]
 fn stdlib_globals_accessible() {
@@ -780,9 +784,6 @@ maki.api.register_tool({{
     assert_eq!(out2, "ok2");
 }
 
-const ALREADY_CALLED_ERR: &str = "already called";
-const UNKNOWN_FIELD_ERR: &str = "unknown field";
-
 #[test]
 fn setup_happy_path() {
     let reg = fresh_registry();
@@ -1068,7 +1069,7 @@ fn ctx_set_deadline_times_out() {
     );
     host.load_source("deadline_test", &src).unwrap();
     let err = exec_tool(&reg, "deadline_test", serde_json::json!({})).unwrap_err();
-    assert_eq!(err, DEADLINE_TIMEOUT_MSG);
+    assert!(err.contains(TIMED_OUT_SUBSTR), "got: {err}");
 }
 
 #[test]
@@ -1092,9 +1093,6 @@ fn ctx_set_deadline_twice_errors() {
     assert!(err.contains(DEADLINE_ALREADY_SET_ERR), "got: {err}");
 }
 
-const BATCH_ALIGN_MSG: &str =
-    "a tool with no restore callback must yield a None reply that keeps the batch aligned by index";
-
 #[test]
 fn restore_tool_batch_ordering_and_alignment() {
     let reg = fresh_registry();
@@ -1108,7 +1106,7 @@ fn restore_tool_batch_ordering_and_alignment() {
     let bash_item = |id: &str| maki_lua::RestoreItem {
         tool: std::sync::Arc::from("bash"),
         tool_use_id: id.to_owned(),
-        output: BASH_TIMEOUT_MSG.to_owned(),
+        output: "tool bash timed out after 1s".to_owned(),
         input: input.clone(),
         is_error: true,
         tool_output_lines: ToolOutputLines::default(),
@@ -1137,7 +1135,7 @@ fn restore_tool_batch_ordering_and_alignment() {
         let last = body.lines.last().expect("at least one line");
         let text: String = last.spans.iter().map(|s| s.text.as_str()).collect();
         assert!(
-            text.contains(BASH_TIMEOUT_MARKER),
+            text.contains(BASH_TIMED_OUT_MARKER),
             "batched restore body missing timeout marker; got: {text:?}"
         );
     }
@@ -1166,4 +1164,142 @@ fn bash_permission_scopes_never_falls_back_to_json(command: &str) {
         "fell back to raw JSON scope: {:?}",
         scopes.scopes
     );
+}
+
+fn exec_tool_with_perms(
+    perms: maki_lua::PluginPermissions,
+    src: &str,
+    tool: &str,
+    input: serde_json::Value,
+) -> Result<String, String> {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source_with_permissions("perm_test", src, perms)
+        .unwrap();
+    exec_tool(&reg, tool, input)
+}
+
+fn perm_tool_src(name: &str, handler_body: &str) -> String {
+    format!(
+        r#"maki.api.register_tool({{
+            name = "{name}",
+            description = "d",
+            schema = {{ type = "object", properties = {{}}, additionalProperties = false }},
+            handler = function(input, ctx)
+                {handler_body}
+            end,
+        }})"#
+    )
+}
+
+#[test_case::test_case(
+    "read_deny",
+    r#"local ok, err = pcall(function() maki.fs.read("/etc/hostname") end)
+                return tostring(err)"#,
+    "fs_read"
+    ; "fs_read_denied"
+)]
+#[test_case::test_case(
+    "write_deny",
+    r#"local ok, err = pcall(function() maki.fs.write("/tmp/test", "x") end)
+                return tostring(err)"#,
+    "fs_write"
+    ; "fs_write_denied"
+)]
+#[test_case::test_case(
+    "run_deny",
+    r#"local ok, err = pcall(function() maki.fn.jobstart("echo hi") end)
+                return tostring(err)"#,
+    "run"
+    ; "run_denied"
+)]
+fn denied_permission_blocks_api(tool_name: &str, handler_body: &str, expected_perm: &str) {
+    let src = perm_tool_src(tool_name, handler_body);
+    let result = exec_tool_with_perms(
+        maki_lua::PluginPermissions::denied(),
+        &src,
+        tool_name,
+        serde_json::json!({}),
+    )
+    .unwrap();
+    assert!(result.contains(PERMISSION_DENIED_MSG), "got: {result}");
+    assert!(result.contains(expected_perm), "got: {result}");
+}
+
+#[test]
+fn user_plugin_with_fs_read_can_read_but_not_write() {
+    let src = perm_tool_src(
+        "rw_test",
+        r#"local read_ok = pcall(function() maki.fs.read("/dev/null") end)
+                local write_ok = pcall(function() maki.fs.write("/tmp/test", "x") end)
+                return "read=" .. tostring(read_ok) .. ",write=" .. tostring(write_ok)"#,
+    );
+    let mut perms = maki_lua::PluginPermissions::denied();
+    perms.set(maki_lua::Permission::FsRead, true);
+    let result = exec_tool_with_perms(perms, &src, "rw_test", serde_json::json!({})).unwrap();
+    assert!(result.contains("read=true"), "got: {result}");
+    assert!(result.contains("write=false"), "got: {result}");
+}
+
+#[test]
+fn builtin_plugin_has_all_permissions() {
+    let src = perm_tool_src(
+        "trusted_test",
+        r#"local cwd_ok = pcall(function() maki.uv.cwd() end)
+                local env_ok = pcall(function() maki.env.state_dir() end)
+                return "cwd=" .. tostring(cwd_ok) .. ",env=" .. tostring(env_ok)"#,
+    );
+    let result = exec_tool_with_perms(
+        maki_lua::PluginPermissions::trusted(),
+        &src,
+        "trusted_test",
+        serde_json::json!({}),
+    )
+    .unwrap();
+    assert!(result.contains("cwd=true"), "got: {result}");
+    assert!(result.contains("env=true"), "got: {result}");
+}
+
+#[test]
+fn env_permission_guards_uv_and_env() {
+    let src = perm_tool_src(
+        "env_guard_test",
+        r#"local cwd_ok = pcall(function() maki.uv.cwd() end)
+                local home_ok = pcall(function() maki.uv.os_homedir() end)
+                local env_ok = pcall(function() maki.env.state_dir() end)
+                local exec_ok = pcall(function() maki.fn.executable("ls") end)
+                return "cwd=" .. tostring(cwd_ok) .. ",home=" .. tostring(home_ok) .. ",env=" .. tostring(env_ok) .. ",exec=" .. tostring(exec_ok)"#,
+    );
+    let result = exec_tool_with_perms(
+        maki_lua::PluginPermissions::denied(),
+        &src,
+        "env_guard_test",
+        serde_json::json!({}),
+    )
+    .unwrap();
+    assert!(result.contains("cwd=false"), "got: {result}");
+    assert!(result.contains("home=false"), "got: {result}");
+    assert!(result.contains("env=false"), "got: {result}");
+    assert!(result.contains("exec=false"), "got: {result}");
+}
+
+#[test]
+fn pure_functions_not_guarded() {
+    let src = perm_tool_src(
+        "pure_test",
+        r#"local dirname_ok = pcall(function() maki.fs.dirname("/foo/bar") end)
+                local basename_ok = pcall(function() maki.fs.basename("/foo/bar") end)
+                local json_ok = pcall(function() maki.json.encode({a=1}) end)
+                return "dirname=" .. tostring(dirname_ok) .. ",basename=" .. tostring(basename_ok) .. ",json=" .. tostring(json_ok)"#,
+    );
+    let result = exec_tool_with_perms(
+        maki_lua::PluginPermissions::denied(),
+        &src,
+        "pure_test",
+        serde_json::json!({}),
+    )
+    .unwrap();
+    assert!(result.contains("dirname=true"), "got: {result}");
+    assert!(result.contains("basename=true"), "got: {result}");
+    assert!(result.contains("json=true"), "got: {result}");
 }

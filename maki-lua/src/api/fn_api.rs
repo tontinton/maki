@@ -10,6 +10,11 @@ use mlua::{Function, Lua, RegistryKey, Result as LuaResult, Table};
 
 use crate::runtime::with_task_jobs;
 
+use crate::plugin_permissions::{
+    Permission::{Env, Run},
+    PluginPermissions,
+};
+
 const READER_BUF_SIZE: usize = 8 * 1024;
 
 #[derive(Clone)]
@@ -247,12 +252,12 @@ fn kill_job(meta: &mut JobMeta) {
     }
 }
 
-pub(crate) fn create_fn_table(lua: &Lua) -> LuaResult<Table> {
+pub(crate) fn create_fn_table(lua: &Lua, perms: &PluginPermissions) -> LuaResult<Table> {
     let t = lua.create_table()?;
 
     t.set(
         "jobstart",
-        lua.create_function(|lua, (cmd, opts): (String, Option<Table>)| {
+        perms.guard(Run, lua, |lua, (cmd, opts): (String, Option<Table>)| {
             let (cwd, env, on_stdout, on_stderr, on_exit) = match opts {
                 Some(ref opts) => {
                     let cwd: Option<String> = opts.get("cwd").ok();
@@ -289,7 +294,7 @@ pub(crate) fn create_fn_table(lua: &Lua) -> LuaResult<Table> {
 
     t.set(
         "jobstop",
-        lua.create_function(|lua, job_id: u32| {
+        perms.guard(Run, lua, |lua, job_id: u32| {
             with_task_jobs(lua, |store| store.kill(job_id));
             Ok(())
         })?,
@@ -297,45 +302,50 @@ pub(crate) fn create_fn_table(lua: &Lua) -> LuaResult<Table> {
 
     t.set(
         "jobwait",
-        lua.create_async_function(|lua, (job_id, timeout_ms): (u32, Option<u64>)| async move {
-            let rx = with_task_jobs(&lua, |store| store.take_receiver(job_id))
-                .ok_or_else(|| mlua::Error::runtime("unknown job id or already waited"))?;
+        perms.guard_async(
+            Run,
+            lua,
+            |lua, (job_id, timeout_ms): (u32, Option<u64>)| async move {
+                let rx = with_task_jobs(&lua, |store| store.take_receiver(job_id))
+                    .ok_or_else(|| mlua::Error::runtime("unknown job id or already waited"))?;
 
-            let timeout = Duration::from_millis(timeout_ms.unwrap_or(30_000));
-            let deadline = smol::Timer::after(timeout);
-            futures_lite::pin!(deadline);
+                let timeout = Duration::from_millis(timeout_ms.unwrap_or(30_000));
+                let deadline = smol::Timer::after(timeout);
+                futures_lite::pin!(deadline);
 
-            let mut stdout_lines = Vec::new();
-            let mut stderr_lines = Vec::new();
+                let mut stdout_lines = Vec::new();
+                let mut stderr_lines = Vec::new();
 
-            let exit_code = loop {
-                let event = futures_lite::future::or(async { rx.recv_async().await.ok() }, async {
-                    (&mut deadline).await;
-                    None
-                })
-                .await;
+                let exit_code = loop {
+                    let event =
+                        futures_lite::future::or(async { rx.recv_async().await.ok() }, async {
+                            (&mut deadline).await;
+                            None
+                        })
+                        .await;
 
-                match event {
-                    None => return Ok(mlua::Value::Nil),
-                    Some(JobEvent::Stdout(line)) => stdout_lines.push(line),
-                    Some(JobEvent::Stderr(line)) => stderr_lines.push(line),
-                    Some(JobEvent::Exit(code)) => {
-                        break code;
+                    match event {
+                        None => return Ok(mlua::Value::Nil),
+                        Some(JobEvent::Stdout(line)) => stdout_lines.push(line),
+                        Some(JobEvent::Stderr(line)) => stderr_lines.push(line),
+                        Some(JobEvent::Exit(code)) => {
+                            break code;
+                        }
                     }
-                }
-            };
+                };
 
-            let result = lua.create_table()?;
-            result.set("stdout", stdout_lines.join("\n"))?;
-            result.set("stderr", stderr_lines.join("\n"))?;
-            result.set("exit_code", exit_code)?;
-            Ok(mlua::Value::Table(result))
-        })?,
+                let result = lua.create_table()?;
+                result.set("stdout", stdout_lines.join("\n"))?;
+                result.set("stderr", stderr_lines.join("\n"))?;
+                result.set("exit_code", exit_code)?;
+                Ok(mlua::Value::Table(result))
+            },
+        )?,
     )?;
 
     t.set(
         "executable",
-        lua.create_function(|_, name: String| {
+        perms.guard(Env, lua, |_, name: String| {
             let found = env::var_os("PATH")
                 .map(|paths| env::split_paths(&paths).any(|dir| dir.join(&name).is_file()))
                 .unwrap_or(false)

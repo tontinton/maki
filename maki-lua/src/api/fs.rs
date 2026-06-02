@@ -6,6 +6,11 @@ use std::path::{Component, Path, PathBuf};
 
 use mlua::{Lua, Result as LuaResult, Table};
 
+use crate::plugin_permissions::{
+    Permission::{FsRead, FsWrite},
+    PluginPermissions,
+};
+
 fn expand_tilde(path: &str) -> PathBuf {
     if let Some(rest) = path.strip_prefix("~/") {
         if let Some(home) = maki_storage::paths::home() {
@@ -97,12 +102,12 @@ fn io_result(lua: &Lua, result: std::io::Result<()>) -> LuaResult<(mlua::Value, 
     }
 }
 
-pub(crate) fn create_fs_table(lua: &Lua) -> LuaResult<Table> {
+pub(crate) fn create_fs_table(lua: &Lua, perms: &PluginPermissions) -> LuaResult<Table> {
     let t = lua.create_table()?;
 
     t.set(
         "read",
-        lua.create_async_function(|_, path: String| async move {
+        perms.guard_async(FsRead, lua, |_, path: String| async move {
             let abs = make_absolute(&path)?;
             smol::fs::read_to_string(&abs).await.map_err(|e| {
                 if e.kind() == ErrorKind::InvalidData {
@@ -116,7 +121,7 @@ pub(crate) fn create_fs_table(lua: &Lua) -> LuaResult<Table> {
 
     t.set(
         "read_bytes",
-        lua.create_async_function(|lua, path: String| async move {
+        perms.guard_async(FsRead, lua, |lua, path: String| async move {
             let abs = make_absolute(&path)?;
             let bytes = smol::fs::read(&abs)
                 .await
@@ -127,7 +132,7 @@ pub(crate) fn create_fs_table(lua: &Lua) -> LuaResult<Table> {
 
     t.set(
         "metadata",
-        lua.create_async_function(|lua, path: String| async move {
+        perms.guard_async(FsRead, lua, |lua, path: String| async move {
             let abs = make_absolute(&path)?;
             match smol::fs::metadata(&abs).await {
                 Ok(meta) => {
@@ -220,46 +225,50 @@ pub(crate) fn create_fs_table(lua: &Lua) -> LuaResult<Table> {
 
     t.set(
         "root",
-        lua.create_async_function(|_, (source, marker): (String, mlua::Value)| async move {
-            let markers: Vec<String> = match marker {
-                mlua::Value::String(s) => vec![s.to_str()?.to_owned()],
-                mlua::Value::Table(t) => {
-                    let mut v = Vec::new();
-                    for pair in t.sequence_values::<String>() {
-                        v.push(pair?);
+        perms.guard_async(
+            FsRead,
+            lua,
+            |_, (source, marker): (String, mlua::Value)| async move {
+                let markers: Vec<String> = match marker {
+                    mlua::Value::String(s) => vec![s.to_str()?.to_owned()],
+                    mlua::Value::Table(t) => {
+                        let mut v = Vec::new();
+                        for pair in t.sequence_values::<String>() {
+                            v.push(pair?);
+                        }
+                        v
                     }
-                    v
-                }
-                _ => {
-                    return Err(mlua::Error::runtime(
-                        "fs.root: marker must be a string or list of strings",
-                    ));
-                }
-            };
-
-            smol::unblock(move || {
-                let start = Path::new(&source);
-                let start = if start.is_file() || !start.exists() {
-                    start.parent().unwrap_or(start)
-                } else {
-                    start
+                    _ => {
+                        return Err(mlua::Error::runtime(
+                            "fs.root: marker must be a string or list of strings",
+                        ));
+                    }
                 };
 
-                let mut dir = make_absolute(start.to_str().unwrap_or_default())?;
+                smol::unblock(move || {
+                    let start = Path::new(&source);
+                    let start = if start.is_file() || !start.exists() {
+                        start.parent().unwrap_or(start)
+                    } else {
+                        start
+                    };
 
-                loop {
-                    for m in &markers {
-                        if dir.join(m).exists() {
-                            return Ok(Some(path_to_string(&dir)?));
+                    let mut dir = make_absolute(start.to_str().unwrap_or_default())?;
+
+                    loop {
+                        for m in &markers {
+                            if dir.join(m).exists() {
+                                return Ok(Some(path_to_string(&dir)?));
+                            }
+                        }
+                        if !dir.pop() {
+                            return Ok(None);
                         }
                     }
-                    if !dir.pop() {
-                        return Ok(None);
-                    }
-                }
-            })
-            .await
-        })?,
+                })
+                .await
+            },
+        )?,
     )?;
 
     t.set(
@@ -297,47 +306,55 @@ pub(crate) fn create_fs_table(lua: &Lua) -> LuaResult<Table> {
 
     t.set(
         "dir",
-        lua.create_async_function(|lua, (path, opts): (String, Option<Table>)| async move {
-            let abs = make_absolute(&path)?;
-            let max_depth: u32 = match &opts {
-                Some(t) => t.get::<u32>("depth").unwrap_or(1),
-                None => 1,
-            };
+        perms.guard_async(
+            FsRead,
+            lua,
+            |lua, (path, opts): (String, Option<Table>)| async move {
+                let abs = make_absolute(&path)?;
+                let max_depth: u32 = match &opts {
+                    Some(t) => t.get::<u32>("depth").unwrap_or(1),
+                    None => 1,
+                };
 
-            let entries = smol::unblock(move || {
-                if !abs.exists() {
-                    return Vec::new();
+                let entries = smol::unblock(move || {
+                    if !abs.exists() {
+                        return Vec::new();
+                    }
+                    let mut out = Vec::new();
+                    let mut visited = HashSet::new();
+                    collect_dir_entries(&abs, &abs, 1, max_depth, &mut visited, &mut out);
+                    out
+                })
+                .await;
+
+                let result = lua.create_table()?;
+                for (i, (name, typ)) in entries.iter().enumerate() {
+                    let entry = lua.create_table()?;
+                    entry.set(1, name.as_str())?;
+                    entry.set(2, *typ)?;
+                    result.set(i + 1, entry)?;
                 }
-                let mut out = Vec::new();
-                let mut visited = HashSet::new();
-                collect_dir_entries(&abs, &abs, 1, max_depth, &mut visited, &mut out);
-                out
-            })
-            .await;
-
-            let result = lua.create_table()?;
-            for (i, (name, typ)) in entries.iter().enumerate() {
-                let entry = lua.create_table()?;
-                entry.set(1, name.as_str())?;
-                entry.set(2, *typ)?;
-                result.set(i + 1, entry)?;
-            }
-            Ok(mlua::Value::Table(result))
-        })?,
+                Ok(mlua::Value::Table(result))
+            },
+        )?,
     )?;
 
     t.set(
         "write",
-        lua.create_async_function(|lua, (path, content): (String, String)| async move {
-            let abs = make_absolute(&path)?;
-            let result = smol::fs::write(&abs, content).await;
-            io_result(&lua, result)
-        })?,
+        perms.guard_async(
+            FsWrite,
+            lua,
+            |lua, (path, content): (String, String)| async move {
+                let abs = make_absolute(&path)?;
+                let result = smol::fs::write(&abs, content).await;
+                io_result(&lua, result)
+            },
+        )?,
     )?;
 
     t.set(
         "rm",
-        lua.create_async_function(|lua, path: String| async move {
+        perms.guard_async(FsWrite, lua, |lua, path: String| async move {
             let abs = make_absolute(&path)?;
             let result = smol::fs::remove_file(&abs).await;
             io_result(&lua, result)
@@ -346,24 +363,30 @@ pub(crate) fn create_fs_table(lua: &Lua) -> LuaResult<Table> {
 
     t.set(
         "mkdir",
-        lua.create_async_function(|lua, (path, opts): (String, Option<Table>)| async move {
-            let abs = make_absolute(&path)?;
-            let parents = opts
-                .as_ref()
-                .and_then(|t| t.get::<bool>("parents").ok())
-                .unwrap_or(false);
-            let result = if parents {
-                smol::fs::create_dir_all(&abs).await
-            } else {
-                smol::fs::create_dir(&abs).await
-            };
-            io_result(&lua, result)
-        })?,
+        perms.guard_async(
+            FsWrite,
+            lua,
+            |lua, (path, opts): (String, Option<Table>)| async move {
+                let abs = make_absolute(&path)?;
+                let parents = opts
+                    .as_ref()
+                    .and_then(|t| t.get::<bool>("parents").ok())
+                    .unwrap_or(false);
+                let result = if parents {
+                    smol::fs::create_dir_all(&abs).await
+                } else {
+                    smol::fs::create_dir(&abs).await
+                };
+                io_result(&lua, result)
+            },
+        )?,
     )?;
 
     t.set(
         "glob",
-        lua.create_async_function(
+        perms.guard_async(
+            FsRead,
+            lua,
             |lua, (patterns, opts): (mlua::Value, Option<Table>)| async move {
                 let patterns: Vec<String> = match patterns {
                     mlua::Value::String(s) => vec![s.to_str()?.to_owned()],
@@ -448,6 +471,7 @@ mod tests {
     use std::time::{Duration, SystemTime};
 
     use super::*;
+    use crate::plugin_permissions::PluginPermissions;
     use mlua::Lua;
     use tempfile::TempDir;
 
@@ -458,7 +482,7 @@ mod tests {
         std::fs::write(&file, "world").unwrap();
 
         let lua = Lua::new();
-        let tbl = create_fs_table(&lua).unwrap();
+        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
         let read: mlua::Function = tbl.get("read").unwrap();
         let result: String = smol::block_on(read.call_async(file.to_str().unwrap())).unwrap();
         assert_eq!(result, "world");
@@ -471,7 +495,7 @@ mod tests {
         std::fs::create_dir(tmp.path().join("sub")).unwrap();
 
         let lua = Lua::new();
-        let tbl = create_fs_table(&lua).unwrap();
+        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
         let dir: mlua::Function = tbl.get("dir").unwrap();
         let result: Table =
             smol::block_on(dir.call_async::<Table>(tmp.path().to_str().unwrap())).unwrap();
@@ -496,7 +520,7 @@ mod tests {
         std::fs::write(tmp.path().join("d/nested.txt"), "").unwrap();
 
         let lua = Lua::new();
-        let tbl = create_fs_table(&lua).unwrap();
+        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
         let dir: mlua::Function = tbl.get("dir").unwrap();
 
         let opts = lua.create_table().unwrap();
@@ -519,7 +543,7 @@ mod tests {
     fn dir_nonexistent_returns_empty() {
         let tmp = TempDir::new().unwrap();
         let lua = Lua::new();
-        let tbl = create_fs_table(&lua).unwrap();
+        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
         let dir: mlua::Function = tbl.get("dir").unwrap();
         let missing = tmp.path().join("does_not_exist");
         let result: Table =
@@ -534,7 +558,7 @@ mod tests {
         std::fs::write(&file, "hello").unwrap();
 
         let lua = Lua::new();
-        let tbl = create_fs_table(&lua).unwrap();
+        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
         let metadata: mlua::Function = tbl.get("metadata").unwrap();
 
         let f: Table =
@@ -564,7 +588,7 @@ mod tests {
         std::os::unix::fs::symlink(&real_dir, tmp.path().join("link")).unwrap();
 
         let lua = Lua::new();
-        let tbl = create_fs_table(&lua).unwrap();
+        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
         let dir: mlua::Function = tbl.get("dir").unwrap();
 
         let opts = lua.create_table().unwrap();
@@ -593,7 +617,7 @@ mod tests {
         std::os::unix::fs::symlink("/nonexistent_target_xyz", tmp.path().join("broken")).unwrap();
 
         let lua = Lua::new();
-        let tbl = create_fs_table(&lua).unwrap();
+        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
         let dir: mlua::Function = tbl.get("dir").unwrap();
 
         let result: Table =
@@ -621,7 +645,7 @@ mod tests {
         std::os::unix::fs::symlink(tmp.path(), child.join("loop")).unwrap();
 
         let lua = Lua::new();
-        let tbl = create_fs_table(&lua).unwrap();
+        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
         let dir: mlua::Function = tbl.get("dir").unwrap();
 
         let opts = lua.create_table().unwrap();
@@ -643,7 +667,7 @@ mod tests {
         let file = tmp.path().join("new.txt");
 
         let lua = Lua::new();
-        let tbl = create_fs_table(&lua).unwrap();
+        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
         let write: mlua::Function = tbl.get("write").unwrap();
         let (ok, err): (mlua::Value, mlua::Value) =
             smol::block_on(write.call_async((file.to_str().unwrap(), "hello world"))).unwrap();
@@ -662,7 +686,7 @@ mod tests {
         std::fs::write(&file, "old").unwrap();
 
         let lua = Lua::new();
-        let tbl = create_fs_table(&lua).unwrap();
+        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
         let write: mlua::Function = tbl.get("write").unwrap();
         smol::block_on(
             write.call_async::<(mlua::Value, mlua::Value)>((file.to_str().unwrap(), "new")),
@@ -677,7 +701,7 @@ mod tests {
         let file = tmp.path().join("no_parent/deep/file.txt");
 
         let lua = Lua::new();
-        let tbl = create_fs_table(&lua).unwrap();
+        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
         let write: mlua::Function = tbl.get("write").unwrap();
         let (ok, err): (mlua::Value, mlua::Value) =
             smol::block_on(write.call_async((file.to_str().unwrap(), "data"))).unwrap();
@@ -695,7 +719,7 @@ mod tests {
         std::fs::write(&file, "bye").unwrap();
 
         let lua = Lua::new();
-        let tbl = create_fs_table(&lua).unwrap();
+        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
         let rm: mlua::Function = tbl.get("rm").unwrap();
         let (ok, _): (mlua::Value, mlua::Value) =
             smol::block_on(rm.call_async(file.to_str().unwrap())).unwrap();
@@ -709,7 +733,7 @@ mod tests {
         let file = tmp.path().join("ghost.txt");
 
         let lua = Lua::new();
-        let tbl = create_fs_table(&lua).unwrap();
+        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
         let rm: mlua::Function = tbl.get("rm").unwrap();
         let (ok, err): (mlua::Value, mlua::Value) =
             smol::block_on(rm.call_async(file.to_str().unwrap())).unwrap();
@@ -726,7 +750,7 @@ mod tests {
         let dir = tmp.path().join("newdir");
 
         let lua = Lua::new();
-        let tbl = create_fs_table(&lua).unwrap();
+        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
         let mkdir: mlua::Function = tbl.get("mkdir").unwrap();
         let (ok, _): (mlua::Value, mlua::Value) =
             smol::block_on(mkdir.call_async(dir.to_str().unwrap())).unwrap();
@@ -740,7 +764,7 @@ mod tests {
         let dir = tmp.path().join("a/b/c");
 
         let lua = Lua::new();
-        let tbl = create_fs_table(&lua).unwrap();
+        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
         let mkdir: mlua::Function = tbl.get("mkdir").unwrap();
         let (ok, err): (mlua::Value, mlua::Value) =
             smol::block_on(mkdir.call_async(dir.to_str().unwrap())).unwrap();
@@ -757,7 +781,7 @@ mod tests {
         let dir = tmp.path().join("x/y/z");
 
         let lua = Lua::new();
-        let tbl = create_fs_table(&lua).unwrap();
+        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
         let mkdir: mlua::Function = tbl.get("mkdir").unwrap();
         let opts = lua.create_table().unwrap();
         opts.set("parents", true).unwrap();
@@ -774,7 +798,7 @@ mod tests {
         std::fs::create_dir(&dir).unwrap();
 
         let lua = Lua::new();
-        let tbl = create_fs_table(&lua).unwrap();
+        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
         let mkdir: mlua::Function = tbl.get("mkdir").unwrap();
         let (ok, err): (mlua::Value, mlua::Value) =
             smol::block_on(mkdir.call_async(dir.to_str().unwrap())).unwrap();
@@ -792,7 +816,7 @@ mod tests {
         std::fs::create_dir(&dir).unwrap();
 
         let lua = Lua::new();
-        let tbl = create_fs_table(&lua).unwrap();
+        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
         let mkdir: mlua::Function = tbl.get("mkdir").unwrap();
         let opts = lua.create_table().unwrap();
         opts.set("parents", true).unwrap();
@@ -812,7 +836,7 @@ mod tests {
         let dir_str = tmp.path().to_string_lossy().to_string();
 
         let lua = Lua::new();
-        let tbl = create_fs_table(&lua).unwrap();
+        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
         let glob: mlua::Function = tbl.get("glob").unwrap();
 
         let opts = lua.create_table().unwrap();
@@ -836,7 +860,7 @@ mod tests {
         std::fs::write(tmp.path().join("c.py"), "").unwrap();
 
         let lua = Lua::new();
-        let tbl = create_fs_table(&lua).unwrap();
+        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
         let glob: mlua::Function = tbl.get("glob").unwrap();
 
         let patterns = lua.create_table().unwrap();
@@ -866,7 +890,7 @@ mod tests {
         }
 
         let lua = Lua::new();
-        let tbl = create_fs_table(&lua).unwrap();
+        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
         let glob: mlua::Function = tbl.get("glob").unwrap();
 
         let opts = lua.create_table().unwrap();
@@ -883,7 +907,7 @@ mod tests {
         std::fs::write(tmp.path().join("a.rs"), "").unwrap();
 
         let lua = Lua::new();
-        let tbl = create_fs_table(&lua).unwrap();
+        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
         let glob: mlua::Function = tbl.get("glob").unwrap();
 
         let opts = lua.create_table().unwrap();
@@ -896,7 +920,7 @@ mod tests {
     #[test]
     fn glob_invalid_pattern_type_errors() {
         let lua = Lua::new();
-        let tbl = create_fs_table(&lua).unwrap();
+        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
         let glob: mlua::Function = tbl.get("glob").unwrap();
 
         let err = smol::block_on(glob.call_async::<Table>((mlua::Value::Integer(42), mlua::Nil)))
@@ -927,7 +951,7 @@ mod tests {
             .unwrap();
 
         let lua = Lua::new();
-        let tbl = create_fs_table(&lua).unwrap();
+        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
         let glob: mlua::Function = tbl.get("glob").unwrap();
 
         let opts = lua.create_table().unwrap();
@@ -945,7 +969,7 @@ mod tests {
     #[test]
     fn glob_no_opts_uses_cwd() {
         let lua = Lua::new();
-        let tbl = create_fs_table(&lua).unwrap();
+        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
         let glob: mlua::Function = tbl.get("glob").unwrap();
 
         let result = smol::block_on(glob.call_async::<Table>(("*.rs", mlua::Nil)));
@@ -961,7 +985,7 @@ mod tests {
         std::fs::write(tmp.path().join("outer.rs"), "").unwrap();
 
         let lua = Lua::new();
-        let tbl = create_fs_table(&lua).unwrap();
+        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
         let glob: mlua::Function = tbl.get("glob").unwrap();
 
         let opts = lua.create_table().unwrap();

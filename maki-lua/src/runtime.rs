@@ -31,6 +31,7 @@ use crate::api::json_to_lua;
 use crate::api::setup::ConfigStore;
 use crate::api::tool::{LuaOutputFormat, LuaTool, PendingTool, PendingTools, ToolCallReply};
 use crate::error::PluginError;
+use crate::plugin_permissions::{PluginPermissions, load_plugin_permissions};
 
 const INTERRUPT_SHUTDOWN_MSG: &str = "plugin interrupted: host shutting down";
 const INTERRUPT_CANCELLED_MSG: &str = "plugin interrupted: task cancelled";
@@ -65,6 +66,7 @@ pub enum Request {
         name: Arc<str>,
         source: String,
         plugin_dir: Option<PathBuf>,
+        permissions: PluginPermissions,
         reply: flume::Sender<LoadResult>,
     },
     CallTool {
@@ -910,6 +912,7 @@ impl LuaRuntime {
         name: Arc<str>,
         source: &str,
         plugin_dir: Option<PathBuf>,
+        permissions: &PluginPermissions,
         config_store: Option<&ConfigStore>,
     ) -> LoadResult {
         let map_err = |e: mlua::Error| PluginError::Lua {
@@ -930,6 +933,7 @@ impl LuaRuntime {
             Arc::clone(&self.pending),
             Arc::clone(&name),
             self.ui_action_tx.clone(),
+            permissions,
         )
         .map_err(&map_err)?;
 
@@ -1185,10 +1189,12 @@ impl LuaRuntime {
         plugin_dir: Option<PathBuf>,
     ) -> Result<Option<RawConfig>, PluginError> {
         let config_store: ConfigStore = Arc::new(Mutex::new(None));
+        let perms = load_plugin_permissions(plugin_dir.as_deref());
         self.load_source(
             Arc::from(source_name),
             source,
             plugin_dir,
+            &perms,
             Some(&config_store),
         )
         .await?;
@@ -1523,10 +1529,11 @@ pub fn spawn(
                             name,
                             source,
                             plugin_dir,
+                            permissions,
                             reply,
                         } => {
                             gate.drain().await;
-                            let res = rt.load_source(Arc::clone(&name), &source, plugin_dir, None).await;
+                            let res = rt.load_source(Arc::clone(&name), &source, plugin_dir, &permissions, None).await;
                             let _ = reply.send(res);
                         }
                         Request::CallTool {
