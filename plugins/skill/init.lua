@@ -13,7 +13,6 @@ local PROJECT_SKILL_DIRS = {
   ".agents/skills",
 }
 local GLOBAL_SKILL_DIRS = {
-  ".maki/skills",
   ".claude/skills",
   ".config/opencode/skills",
   ".agents/skills",
@@ -59,8 +58,13 @@ end
 
 local function discover_skills()
   local skills = {}
-  local home = maki.uv.os_homedir()
 
+  local config = maki.env.config_dir()
+  if config then
+    scan_skill_dir(maki.fs.joinpath(config, "skills"), skills)
+  end
+
+  local home = maki.uv.os_homedir()
   if home then
     for _, rel in ipairs(GLOBAL_SKILL_DIRS) do
       scan_skill_dir(maki.fs.joinpath(home, rel), skills)
