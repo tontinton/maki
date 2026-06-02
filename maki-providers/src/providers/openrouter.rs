@@ -3,79 +3,36 @@ use std::sync::{Arc, Mutex};
 use flume::Sender;
 use serde_json::{Value, json};
 
-use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier};
+use crate::model::{Model, ModelEntry};
 use crate::provider::{BoxFuture, Provider};
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig};
 
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use super::{KeyPool, ResolvedAuth};
 
+const REFERER: &str = "https://maki.sh";
+const APP_TITLE: &str = "maki";
+
 static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
-    api_key_env: "MISTRAL_API_KEY",
-    base_url: "https://api.mistral.ai/v1",
+    api_key_env: "OPENROUTER_API_KEY",
+    base_url: "https://openrouter.ai/api/v1",
     max_tokens_field: "max_tokens",
     include_stream_usage: true,
-    provider_name: "Mistral",
+    provider_name: "OpenRouter",
 };
 
 pub(crate) fn models() -> &'static [ModelEntry] {
-    &[
-        ModelEntry {
-            prefixes: &["devstral-latest", "devstral-medium-latest", "devstral-2512"],
-            tier: ModelTier::Strong,
-            family: ModelFamily::Generic,
-            default: true,
-            pricing: ModelPricing {
-                input: 0.4,
-                output: 2.0,
-                cache_write: 0.00,
-                cache_read: 0.00,
-                fast: None,
-            },
-            max_output_tokens: 262_144,
-            context_window: 262_144,
-        },
-        ModelEntry {
-            prefixes: &["mistral-large-latest", "mistral-large-2512"],
-            tier: ModelTier::Medium,
-            family: ModelFamily::Generic,
-            default: true,
-            pricing: ModelPricing {
-                input: 0.5,
-                output: 1.5,
-                cache_write: 0.00,
-                cache_read: 0.00,
-                fast: None,
-            },
-            max_output_tokens: 262_144,
-            context_window: 262_144,
-        },
-        ModelEntry {
-            prefixes: &["mistral-small-latest", "mistral-small-2603"],
-            tier: ModelTier::Weak,
-            family: ModelFamily::Generic,
-            default: true,
-            pricing: ModelPricing {
-                input: 0.15,
-                output: 0.60,
-                cache_write: 0.00,
-                cache_read: 0.00,
-                fast: None,
-            },
-            max_output_tokens: 262_144,
-            context_window: 262_144,
-        },
-    ]
+    &[]
 }
 
-pub struct Mistral {
+pub struct OpenRouter {
     compat: OpenAiCompatProvider,
     auth: Arc<Mutex<ResolvedAuth>>,
     key_pool: Option<KeyPool>,
     system_prefix: Option<String>,
 }
 
-impl Mistral {
+impl OpenRouter {
     pub fn new(timeouts: super::Timeouts) -> Result<Self, AgentError> {
         let pool = KeyPool::from_env(CONFIG.api_key_env)?;
         Ok(Self {
@@ -101,7 +58,7 @@ impl Mistral {
     }
 }
 
-impl Provider for Mistral {
+impl Provider for OpenRouter {
     fn stream_message<'a>(
         &'a self,
         model: &'a Model,
@@ -118,14 +75,23 @@ impl Provider for Mistral {
             let system = super::with_prefix(&self.system_prefix, system, &mut buf);
             let mut body = self.compat.build_body(model, messages, system, tools);
 
-            if !matches!(opts.thinking, ThinkingConfig::Off) {
-                body["reasoning_effort"] = json!("high");
+            body["cache_control"] = json!({"type": "ephemeral"});
+
+            match opts.thinking {
+                ThinkingConfig::Off => {}
+                ThinkingConfig::Adaptive => {
+                    body["reasoning_effort"] = json!("high");
+                }
+                ThinkingConfig::Budget(n) => {
+                    body["reasoning_effort"] = json!(ThinkingConfig::budget_to_effort(n));
+                }
             }
 
-            let mut extra_headers = vec![];
-            if let Some(session_id) = session_id {
-                extra_headers.push(("x-affinity", session_id));
+            if let Some(sid) = session_id {
+                body["session_id"] = json!(sid);
             }
+
+            let extra_headers = [("HTTP-Referer", REFERER), ("X-OpenRouter-Title", APP_TITLE)];
             self.compat
                 .do_stream(model, &extra_headers, &body, event_tx, &auth)
                 .await

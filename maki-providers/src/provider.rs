@@ -18,6 +18,7 @@ use crate::providers::llama_cpp::LlamaCpp;
 use crate::providers::mistral::Mistral;
 use crate::providers::ollama::Ollama;
 use crate::providers::openai::OpenAi;
+use crate::providers::openrouter::OpenRouter;
 use crate::providers::synthetic::Synthetic;
 use crate::providers::zai::{Zai, ZaiPlan};
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
@@ -37,6 +38,8 @@ pub enum ProviderKind {
     ZaiCodingPlan,
     #[strum(serialize = "deepseek")]
     DeepSeek,
+    #[strum(serialize = "openrouter")]
+    OpenRouter,
     Synthetic,
 }
 
@@ -53,6 +56,7 @@ impl ProviderKind {
             Self::Zai => "Z.AI",
             Self::ZaiCodingPlan => "Z.AI Coding",
             Self::DeepSeek => "DeepSeek",
+            Self::OpenRouter => "OpenRouter",
             Self::Synthetic => "Synthetic",
         }
     }
@@ -68,6 +72,7 @@ impl ProviderKind {
             Self::Mistral => "MISTRAL_API_KEY",
             Self::Zai | Self::ZaiCodingPlan => "ZHIPU_API_KEY",
             Self::DeepSeek => "DEEPSEEK_API_KEY",
+            Self::OpenRouter => "OPENROUTER_API_KEY",
             Self::Synthetic => "SYNTHETIC_API_KEY",
         }
     }
@@ -86,6 +91,7 @@ impl ProviderKind {
             Self::Zai => "https://api.z.ai/api/paas/v4",
             Self::ZaiCodingPlan => "https://api.z.ai/api/coding/paas/v4",
             Self::DeepSeek => "https://api.deepseek.com",
+            Self::OpenRouter => "https://openrouter.ai/api/v1",
             Self::Synthetic => "https://api.synthetic.new/openai/v1",
         }
     }
@@ -99,6 +105,7 @@ impl ProviderKind {
                 | Self::DeepSeek
                 | Self::Synthetic
                 | Self::OpenAi
+                | Self::OpenRouter
         )
     }
 
@@ -119,6 +126,9 @@ impl ProviderKind {
                 Some("Reasoning effort support (low/medium/high), open-weight models")
             }
             Self::DeepSeek => Some("Thinking mode toggle (on/off), open-weight models"),
+            Self::OpenRouter => {
+                Some("300+ models from all providers, prompt caching, provider routing")
+            }
             _ => None,
         }
     }
@@ -134,6 +144,7 @@ impl ProviderKind {
             Self::Mistral => ModelFamily::Generic,
             Self::Zai | Self::ZaiCodingPlan => ModelFamily::Glm,
             Self::DeepSeek => ModelFamily::Generic,
+            Self::OpenRouter => ModelFamily::Generic,
             Self::Synthetic => ModelFamily::Synthetic,
         }
     }
@@ -141,7 +152,7 @@ impl ProviderKind {
     pub const fn accepts_arbitrary_models(self) -> bool {
         matches!(
             self,
-            Self::Ollama | Self::LlamaCpp | Self::Google | Self::Copilot
+            Self::Ollama | Self::LlamaCpp | Self::Google | Self::Copilot | Self::OpenRouter
         )
     }
 
@@ -156,6 +167,7 @@ impl ProviderKind {
             Self::Mistral => 32_000,
             Self::Zai | Self::ZaiCodingPlan => 16_000,
             Self::DeepSeek => 384_000,
+            Self::OpenRouter => 128_000,
             Self::Synthetic => 32_000,
         }
     }
@@ -171,6 +183,7 @@ impl ProviderKind {
             Self::Mistral => 128_000,
             Self::Zai | Self::ZaiCodingPlan => 128_000,
             Self::DeepSeek => 1_000_000,
+            Self::OpenRouter => 200_000,
             Self::Synthetic => 128_000,
         }
     }
@@ -193,6 +206,7 @@ impl ProviderKind {
             Self::Zai => Ok(Box::new(Zai::new(ZaiPlan::Standard, timeouts)?)),
             Self::ZaiCodingPlan => Ok(Box::new(Zai::new(ZaiPlan::Coding, timeouts)?)),
             Self::DeepSeek => Ok(Box::new(DeepSeek::new(timeouts)?)),
+            Self::OpenRouter => Ok(Box::new(OpenRouter::new(timeouts)?)),
             Self::Synthetic => Ok(Box::new(Synthetic::new(timeouts)?)),
         }
     }

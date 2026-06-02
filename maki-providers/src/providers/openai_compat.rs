@@ -89,7 +89,7 @@ impl OpenAiCompatProvider {
     pub async fn do_stream(
         &self,
         model: &crate::model::Model,
-        extra_headers: &[(String, String)],
+        extra_headers: &[(&str, &str)],
         body: &Value,
         event_tx: &Sender<ProviderEvent>,
         auth: &ResolvedAuth,
@@ -98,8 +98,8 @@ impl OpenAiCompatProvider {
         let mut request = self
             .build_request("POST", "/chat/completions", auth)
             .header("content-type", "application/json");
-        for (key, value) in extra_headers {
-            request = request.header(key.as_str(), value.as_str());
+        for &(key, value) in extra_headers {
+            request = request.header(key, value);
         }
 
         let request = request.body(json_body)?;

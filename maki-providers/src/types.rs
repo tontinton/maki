@@ -252,6 +252,16 @@ impl ThinkingConfig {
         !matches!(self, Self::Off)
     }
 
+    pub fn budget_to_effort(n: u32) -> &'static str {
+        if n < 2048 {
+            "low"
+        } else if n < 8192 {
+            "medium"
+        } else {
+            "high"
+        }
+    }
+
     pub fn apply_to_body(self, body: &mut Value) {
         match self {
             Self::Off => {}
@@ -268,9 +278,7 @@ impl ThinkingConfig {
         let effort = match self {
             Self::Off => return,
             Self::Adaptive => "medium",
-            Self::Budget(n) if n < 2048 => "low",
-            Self::Budget(n) if n < 8192 => "medium",
-            Self::Budget(_) => "high",
+            Self::Budget(n) => Self::budget_to_effort(n),
         };
         body["reasoning_effort"] = json!(effort);
     }
