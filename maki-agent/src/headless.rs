@@ -47,8 +47,12 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
 
     let filter = ToolFilter::from_config(&params.config, &params.excluded_tools);
     let ctx = DescriptionContext { filter: &filter };
-    let tools =
+    let mut tools =
         ToolRegistry::native().definitions(&vars, &ctx, params.model.supports_tool_examples());
+
+    if let Some(handle) = &params.mcp_handle {
+        handle.extend_tools(&mut tools);
+    }
 
     let system = agent::build_system_prompt(&vars, &mode, &instructions.text, &params.prompt_slots);
 
