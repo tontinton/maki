@@ -103,7 +103,7 @@ fn parse_props_n_ctx(body: &str) -> Option<u32> {
         .and_then(|s| s.get("n_ctx"))
         .or_else(|| parsed.get("n_ctx"))
         .and_then(Value::as_u64)
-        .map(|n| n as u32)
+        .and_then(|n| u32::try_from(n).ok())
 }
 
 fn parse_slot_n_ctx(body: &str, slot_id: i32) -> Option<u32> {
@@ -112,7 +112,7 @@ fn parse_slot_n_ctx(body: &str, slot_id: i32) -> Option<u32> {
     let slot = slots
         .iter()
         .find(|s| s.get("id").and_then(Value::as_i64) == Some(slot_id as i64))?;
-    slot.get("n_ctx").and_then(Value::as_u64).map(|n| n as u32)
+    slot.get("n_ctx").and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok())
 }
 
 fn first_api_key() -> Option<String> {
