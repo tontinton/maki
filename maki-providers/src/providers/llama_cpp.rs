@@ -112,11 +112,15 @@ fn parse_slot_n_ctx(body: &str, slot_id: i32) -> Option<u32> {
     let slot = slots
         .iter()
         .find(|s| s.get("id").and_then(Value::as_i64) == Some(slot_id as i64))?;
-    slot.get("n_ctx").and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok())
+    slot.get("n_ctx")
+        .and_then(Value::as_u64)
+        .and_then(|n| u32::try_from(n).ok())
 }
 
 fn first_api_key() -> Option<String> {
-    KeyPool::from_env(API_KEY_ENV).ok().map(|p| p.current().to_string())
+    KeyPool::from_env(API_KEY_ENV)
+        .ok()
+        .map(|p| p.current().to_string())
 }
 
 fn id_slot() -> Option<i32> {
@@ -254,7 +258,8 @@ mod tests {
 
     #[test]
     fn parse_props_n_ctx_reads_nested() {
-        let body = r#"{"default_generation_settings":{"n_ctx":8192,"temperature":0.8},"total_slots":1}"#;
+        let body =
+            r#"{"default_generation_settings":{"n_ctx":8192,"temperature":0.8},"total_slots":1}"#;
         assert_eq!(parse_props_n_ctx(body), Some(8192));
     }
 
