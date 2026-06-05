@@ -57,6 +57,12 @@ impl Read {
             let raw = fs::read_to_string(p).map_err(|e| format!("read error: {e}"))?;
             let total_lines = raw.lines().count();
 
+            if offset.is_none() && limit.is_none() && total_lines > 500 {
+                return Err(format!(
+                    "File has {total_lines} lines. Please provide offset and limit parameters to read a specific range."
+                ));
+            }
+
             let start = offset.unwrap_or(1).saturating_sub(1);
             let limit = limit.unwrap_or(max_output_lines);
 
@@ -159,6 +165,9 @@ mod tests {
     use serde_json::json;
     use test_case::test_case;
 
+    use crate::AgentMode;
+    use crate::tools::test_support::stub_ctx;
+
     use super::*;
 
     #[test_case(None,      None,      "/a/b.rs"       ; "path_only")]
@@ -172,6 +181,106 @@ mod tests {
             limit,
         };
         assert_eq!(r.start_header(), expected);
+    }
+
+    const LARGE_FILE_MSG: &str = "File has 501 lines";
+
+    #[test]
+    fn rejects_large_file_without_offset_and_limit() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let file_path = dir.path().join("large.rs");
+        let content = (0..501)
+            .map(|i| format!("line {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&file_path, content).unwrap();
+
+        let read = Read {
+            path: file_path.to_string_lossy().into(),
+            offset: None,
+            limit: None,
+        };
+        let ctx = stub_ctx(&AgentMode::Build);
+        let result = smol::block_on(read.execute(&ctx));
+        let err = result.unwrap_err();
+        assert!(
+            err.contains(LARGE_FILE_MSG),
+            "expected line count in error: {err}"
+        );
+        assert!(err.contains("offset"), "expected offset suggestion: {err}");
+        assert!(err.contains("limit"), "expected limit suggestion: {err}");
+    }
+
+    #[test]
+    fn allows_large_file_with_offset() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let file_path = dir.path().join("large.rs");
+        let content = (0..600)
+            .map(|i| format!("line {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&file_path, content).unwrap();
+
+        let read = Read {
+            path: file_path.to_string_lossy().into(),
+            offset: Some(1),
+            limit: None,
+        };
+        let ctx = stub_ctx(&AgentMode::Build);
+        let result = smol::block_on(read.execute(&ctx));
+        assert!(
+            result.is_ok(),
+            "should succeed with offset: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn allows_large_file_with_limit() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let file_path = dir.path().join("large.rs");
+        let content = (0..600)
+            .map(|i| format!("line {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&file_path, content).unwrap();
+
+        let read = Read {
+            path: file_path.to_string_lossy().into(),
+            offset: None,
+            limit: Some(100),
+        };
+        let ctx = stub_ctx(&AgentMode::Build);
+        let result = smol::block_on(read.execute(&ctx));
+        assert!(
+            result.is_ok(),
+            "should succeed with limit: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn allows_small_file_without_offset_and_limit() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let file_path = dir.path().join("small.rs");
+        let content = (0..100)
+            .map(|i| format!("line {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&file_path, content).unwrap();
+
+        let read = Read {
+            path: file_path.to_string_lossy().into(),
+            offset: None,
+            limit: None,
+        };
+        let ctx = stub_ctx(&AgentMode::Build);
+        let result = smol::block_on(read.execute(&ctx));
+        assert!(
+            result.is_ok(),
+            "small file should succeed: {:?}",
+            result.err()
+        );
     }
 
     #[test]
