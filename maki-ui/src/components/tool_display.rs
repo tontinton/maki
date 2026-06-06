@@ -77,6 +77,7 @@ pub const TOOL_INDICATOR: &str = "● ";
 pub const TOOL_BODY_INDENT: &str = "  ";
 
 const TOOL_SEPARATOR: &str = "──────────────────";
+const CODE_OUTPUT_DIVIDER: &str = "  ────────────";
 const BATCH_INDENT: &str = "  ";
 const BATCH_CONTENT_INDENT: &str = "    ";
 
@@ -562,7 +563,7 @@ impl ToolLineBuilder {
             self.lines.push(line);
         }
         self.content_range = (start, self.lines.len());
-        if let Some(ToolInput::Code { code, .. }) = input {
+        if let Some(ToolInput::Code { code, .. } | ToolInput::Script { code, .. }) = input {
             self.push_search_text(code.trim_end());
         }
         if let Some(text) = output.and_then(|o| o.structured_display_text()) {
@@ -573,6 +574,13 @@ impl ToolLineBuilder {
     fn push_resolved_output(&mut self, resolved: &ResolvedOutput<'_>) {
         if resolved.text.is_none() {
             return;
+        }
+
+        if self.content_range.1 > self.content_range.0 {
+            self.lines.push(Line::from(Span::styled(
+                CODE_OUTPUT_DIVIDER,
+                theme::current().tool_dim,
+            )));
         }
 
         if let Some(text) = &resolved.text {
