@@ -41,9 +41,7 @@ impl Write {
         let file_tracker = ctx.file_tracker.clone();
         smol::unblock(move || {
             let p = Path::new(&path);
-            if p.exists() {
-                file_tracker.check_before_edit(p)?;
-            }
+            file_tracker.check_before_edit(p)?;
             if let Some(parent) = p.parent() {
                 fs::create_dir_all(parent).map_err(|e| format!("mkdir error: {e}"))?;
             }
@@ -98,8 +96,6 @@ mod tests {
 
     use super::*;
 
-    const ERR_NOT_READ: &str = "file must be read before editing";
-
     #[test]
     fn write_new_file_succeeds() {
         smol::block_on(async {
@@ -120,23 +116,22 @@ mod tests {
     }
 
     #[test]
-    fn write_existing_without_read_fails() {
+    fn write_existing_without_read_allowed() {
         smol::block_on(async {
             let dir = TempDir::new().unwrap();
             let ctx = stub_ctx(&AgentMode::Build);
             let path = dir.path().join("existing.txt");
             fs::write(&path, "original").unwrap();
 
-            let err = Write {
+            Write {
                 path: path.to_string_lossy().to_string(),
                 content: "overwrite".into(),
             }
             .execute(&ctx)
             .await
-            .unwrap_err();
+            .unwrap();
 
-            assert!(err.contains(ERR_NOT_READ));
-            assert_eq!(fs::read_to_string(&path).unwrap(), "original");
+            assert_eq!(fs::read_to_string(&path).unwrap(), "overwrite");
         });
     }
 

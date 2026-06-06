@@ -43,15 +43,11 @@ impl FileReadTracker {
 
         let guard = self.0.lock().unwrap();
         match guard.get(&normalized) {
-            None => Err(format!(
-                "file must be read before editing with read tool: {}",
-                path.display()
-            )),
             Some(&recorded) if recorded != current_mtime => Err(format!(
                 "file changed since last read: {} - re-read using read tool before editing",
                 path.display()
             )),
-            Some(_) => Ok(()),
+            _ => Ok(()),
         }
     }
 }
@@ -60,17 +56,14 @@ impl FileReadTracker {
 mod tests {
     use super::*;
 
-    const ERR_NOT_READ: &str = "file must be read before editing";
-
     #[test]
-    fn edit_without_read_fails() {
+    fn edit_without_read_allowed() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("untracked.rs");
         fs::write(&path, "content").unwrap();
 
         let tracker = FileReadTracker::new();
-        let err = tracker.check_before_edit(&path).unwrap_err();
-        assert!(err.contains(ERR_NOT_READ));
+        tracker.check_before_edit(&path).unwrap();
     }
 
     #[test]
