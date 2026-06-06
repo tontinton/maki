@@ -7,7 +7,7 @@ use maki_providers::model::{Model, ModelTier};
 use maki_providers::provider::ProviderKind;
 use maki_storage::StateDir;
 use maki_storage::log::RotatingFileWriter;
-use maki_storage::model::{persist_model, read_model};
+use maki_storage::model::read_model;
 use tracing_subscriber::EnvFilter;
 
 const PROVIDER_PRIORITY: &[ProviderKind] = &[
@@ -27,7 +27,6 @@ pub fn resolve_model(
 ) -> Result<Model> {
     if let Some(spec) = explicit {
         let model = Model::from_spec(spec).context("invalid --model spec")?;
-        persist_model(storage, &model.spec());
         return Ok(model);
     }
     if let Some(spec) = read_model(storage) {
