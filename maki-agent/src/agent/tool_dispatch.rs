@@ -298,7 +298,9 @@ pub(super) async fn process_tool_calls(
     }
 
     let mut set = TaskSet::new();
+    let mut spawned_ids: Vec<String> = Vec::new();
     for (id, name, input) in runnable {
+        spawned_ids.push(id.clone());
         let event_tx_clone = ctx.event_tx.clone();
         let tool_ctx = ToolContext {
             tool_use_id: Some(id.clone()),
@@ -325,11 +327,12 @@ pub(super) async fn process_tool_calls(
         .join_all()
         .await
         .into_iter()
-        .filter_map(|r| match r {
-            Ok(out) => Some(out),
+        .zip(spawned_ids)
+        .map(|(r, id)| match r {
+            Ok(out) => out,
             Err(e) => {
                 error!(error = %e, "tool task panicked");
-                None
+                ToolDoneEvent::error(id, format!("internal error: tool panicked: {e}"))
             }
         })
         .collect();
