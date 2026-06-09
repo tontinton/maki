@@ -45,6 +45,9 @@ end
 
 local function find_project_ancestors()
   local cwd = maki.uv.cwd()
+  if not cwd then
+    return {}
+  end
   local dirs = { cwd }
   for _, parent in ipairs(maki.fs.parents(cwd)) do
     dirs[#dirs + 1] = parent
