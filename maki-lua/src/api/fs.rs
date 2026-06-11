@@ -11,7 +11,7 @@ use crate::plugin_permissions::{
     PluginPermissions,
 };
 
-fn expand_tilde(path: &str) -> PathBuf {
+pub(crate) fn expand_tilde(path: &str) -> PathBuf {
     if let Some(rest) = path.strip_prefix("~/") {
         if let Some(home) = maki_storage::paths::home() {
             return home.join(rest);

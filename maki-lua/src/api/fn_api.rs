@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use mlua::{Function, Lua, RegistryKey, Result as LuaResult, Table};
 
+use crate::api::fs::expand_tilde;
 use crate::runtime::with_task_jobs;
 
 use crate::plugin_permissions::{
@@ -72,7 +73,10 @@ impl JobStore {
             }
         }
 
-        if let Some(ref dir) = cwd {
+        if let Some(dir) = cwd.as_deref().map(expand_tilde) {
+            if !dir.is_dir() {
+                return Err(format!("cwd is not a directory: {}", dir.display()));
+            }
             command.current_dir(dir);
         }
         if let Some(ref env_map) = env {

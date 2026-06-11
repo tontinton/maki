@@ -55,6 +55,8 @@ const NON_STRING_FIELD_SCHEMA: &str = r#"{
     properties = { count = { type = "integer" } },
     required = { "count" },
 }"#;
+const JOB_BAD_CWD: &str = "~/definitely/not/a/dir";
+const JOB_BAD_CWD_ERR_PREFIX: &str = "cwd is not a directory: ";
 const NIL_WITHOUT_JOBS_ERR: &str =
     "handler returned nil without calling ctx:finish() or starting jobs";
 const FINISH_CALLED_TWICE_ERR: &str = "ctx:finish() already called";
@@ -678,6 +680,31 @@ fn async_job_on_exit_receives_exit_code() {
     host.load_source("job_exit_code", &src).unwrap();
     let out = exec_tool(&reg, "job_exit_code", serde_json::json!({})).unwrap();
     assert_eq!(out, "code=42");
+}
+
+#[test]
+fn jobstart_invalid_cwd_errors_with_expanded_path() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let src = format!(
+        r#"maki.api.register_tool({{
+            name = "job_bad_cwd",
+            description = "jobstart with missing tilde cwd",
+            schema = {MINIMAL_SCHEMA},
+            audiences = {{ "main" }},
+            handler = function(input, ctx)
+                local _, err = pcall(maki.fn.jobstart, "pwd", {{ cwd = "{JOB_BAD_CWD}" }})
+                return tostring(err)
+            end
+        }})"#,
+    );
+    host.load_source("job_bad_cwd", &src).unwrap();
+    let out = exec_tool(&reg, "job_bad_cwd", serde_json::json!({})).unwrap();
+    let expanded = maki_storage::paths::home()
+        .expect("home dir")
+        .join(JOB_BAD_CWD.strip_prefix("~/").unwrap());
+    let expected = format!("{JOB_BAD_CWD_ERR_PREFIX}{}", expanded.display());
+    assert!(out.contains(&expected), "got: {out}");
 }
 
 #[test]
