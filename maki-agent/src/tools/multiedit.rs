@@ -22,6 +22,7 @@ struct EditEntry {
 #[derive(Tool, Debug, Clone, Deserialize)]
 pub struct MultiEdit {
     #[param(description = "Absolute path to the file")]
+    #[param(alias = "file_path")]
     path: String,
     #[param(description = "Array of edit operations to apply sequentially")]
     edits: Vec<EditEntry>,

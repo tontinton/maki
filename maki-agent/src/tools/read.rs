@@ -12,6 +12,7 @@ use super::{relative_path, truncate_bytes};
 #[derive(Tool, Debug, Clone, Deserialize)]
 pub struct Read {
     #[param(description = "Absolute path to the file or directory")]
+    #[param(alias = "file_path")]
     path: String,
     #[param(description = "Line number to start from (1-indexed)")]
     offset: Option<usize>,

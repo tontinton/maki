@@ -29,6 +29,26 @@ fn param_description(attrs: &[Attribute]) -> Option<String> {
     })
 }
 
+fn param_aliases(attrs: &[Attribute]) -> Vec<String> {
+    attrs
+        .iter()
+        .filter_map(|attr| {
+            if !attr.path().is_ident("param") {
+                return None;
+            }
+            let nested: Meta = attr.parse_args().ok()?;
+            if let Meta::NameValue(nv) = nested
+                && nv.path.is_ident("alias")
+                && let Expr::Lit(expr_lit) = &nv.value
+                && let Lit::Str(lit) = &expr_lit.lit
+            {
+                return Some(lit.value());
+            }
+            None
+        })
+        .collect()
+}
+
 fn inner_type<'a>(ty: &'a Type, wrapper: &str) -> Option<&'a Type> {
     if let Type::Path(tp) = ty
         && let Some(seg) = tp.path.segments.last()
@@ -166,11 +186,14 @@ fn object_property_tokens(fields: &syn::FieldsNamed) -> Vec<TokenStream2> {
             let desc = param_description(&field.attrs).unwrap_or_default();
             let schema = schema_ref(&field.ty, &desc, true);
             let required = !(is_option(&field.ty) || has_serde_default(&field.attrs));
+            let aliases = param_aliases(&field.attrs);
+            let alias_tokens: Vec<TokenStream2> = aliases.iter().map(|a| quote! { #a }).collect();
             quote! {
                 (
                     #field_str,
                     #schema,
                     #required,
+                    &[#(#alias_tokens),*],
                 )
             }
         })

@@ -9,7 +9,7 @@ local DESCRIPTION = [[Use this tool when you need to ask the user questions duri
 
 Rules:
 - `custom` enabled by default adds "Type your own answer" - don't include catch-all options.
-- Answers returned as arrays of labels. Set `multiple: true` for multi-select.
+- Answers returned as arrays of labels. Set `multiSelect: true` for multi-select.
 - Put recommended option first with "(Recommended)" suffix.]]
 
 maki.api.register_tool({
@@ -40,9 +40,10 @@ maki.api.register_tool({
                 },
               },
             },
-            multiple = {
+            multiSelect = {
               type = "boolean",
               description = "Whether multiple options can be selected",
+              alias = "multiple",
             },
           },
         },
@@ -62,7 +63,7 @@ maki.api.register_tool({
     for _, q in ipairs(input.questions) do
       q.options = q.options or {}
       q.header = q.header or ""
-      q.multiple = q.multiple or false
+      q.multiple = q.multiSelect or false
     end
     local result = QuestionForm.open(input.questions)
     if result.type == "dismiss" then

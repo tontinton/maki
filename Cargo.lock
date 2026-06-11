@@ -2019,6 +2019,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "jsonrepair"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fbd084aab201d699b6da54bc10fbedf1ab92c984eeb306d40546fa675184ec06"
+dependencies = [
+ "memchr",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "kasuari"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2243,6 +2255,7 @@ dependencies = [
  "ignore",
  "isahc",
  "jiff",
+ "jsonrepair",
  "libc",
  "maki-config",
  "maki-interpreter",

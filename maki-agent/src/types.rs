@@ -69,6 +69,7 @@ pub struct TodoItem {
     #[param(description = "Task description")]
     pub content: String,
     pub status: TodoStatus,
+    #[serde(default)]
     pub priority: TodoPriority,
 }
 
@@ -92,11 +93,14 @@ impl TodoStatus {
     }
 }
 
-#[derive(ArgEnum, Debug, Clone, Copy, Serialize, Deserialize, PartialEq, strum::Display)]
+#[derive(
+    ArgEnum, Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, strum::Display,
+)]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum TodoPriority {
     High,
+    #[default]
     Medium,
     Low,
 }

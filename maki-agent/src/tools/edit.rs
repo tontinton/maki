@@ -11,6 +11,7 @@ use super::relative_path;
 #[derive(Tool, Debug, Clone, Deserialize)]
 pub struct Edit {
     #[param(description = "Absolute path to the file")]
+    #[param(alias = "file_path")]
     path: String,
     #[param(description = "Exact string to find (must match uniquely unless replace_all is true)")]
     old_string: String,

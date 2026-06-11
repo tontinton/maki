@@ -29,6 +29,7 @@ pub struct Grep {
     #[param(description = "Directory to search in (default: cwd)")]
     path: Option<String>,
     #[param(description = "File glob filter (e.g. *.c)")]
+    #[param(alias = "glob")]
     include: Option<String>,
     #[param(description = "Context lines before match")]
     context_before: Option<usize>,

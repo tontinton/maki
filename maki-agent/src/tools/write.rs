@@ -10,6 +10,7 @@ use super::relative_path;
 #[derive(Tool, Debug, Clone, Deserialize)]
 pub struct Write {
     #[param(description = "Absolute path to the file")]
+    #[param(alias = "file_path")]
     path: String,
     #[param(description = "The complete file content to write")]
     content: String,

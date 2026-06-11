@@ -8,9 +8,10 @@
 
 use std::fmt::{self, Display, Formatter, Write};
 
+use jsonrepair::{Options as RepairOpts, loads as repair_loads};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
-use tracing::warn;
+use tracing::{debug, warn};
 
 pub(crate) const PARAM_PREVIEW_MAX: usize = 120;
 
@@ -61,7 +62,12 @@ impl Display for ParamKind {
     }
 }
 
-pub(crate) type Property = (&'static str, &'static ParamSchema, bool);
+pub(crate) type Property = (
+    &'static str,
+    &'static ParamSchema,
+    bool,
+    &'static [&'static str],
+);
 
 #[derive(Debug)]
 pub enum ParamSchema {
@@ -112,11 +118,11 @@ pub fn to_json_schema(s: &ParamSchema) -> Value {
         } => {
             let props: serde_json::Map<String, Value> = properties
                 .iter()
-                .map(|(name, sub, _)| ((*name).into(), to_json_schema(sub)))
+                .map(|(name, sub, _, _)| ((*name).into(), to_json_schema(sub)))
                 .collect();
             let required: Vec<&&str> = properties
                 .iter()
-                .filter_map(|(name, _, req)| req.then_some(name))
+                .filter_map(|(name, _, req, _)| req.then_some(name))
                 .collect();
             let mut v = json!({
                 "type": "object",
@@ -211,7 +217,23 @@ pub fn try_from_json(v: &Value) -> Result<&'static ParamSchema, String> {
                             .unwrap_or(false);
                         let static_schema: &'static ParamSchema = try_from_json(sub)?;
                         let is_required = inline_required || required.contains(&name.as_str());
-                        Ok((static_name, static_schema, is_required))
+                        let aliases: &'static [&'static str] = match sub.get("alias") {
+                            Some(Value::String(s)) => {
+                                let leaked: &'static str = Box::leak(s.clone().into_boxed_str());
+                                Box::leak(vec![leaked].into_boxed_slice())
+                            }
+                            Some(Value::Array(arr)) => Box::leak(
+                                arr.iter()
+                                    .filter_map(|v| v.as_str())
+                                    .map(|s| -> &'static str {
+                                        Box::leak(s.to_owned().into_boxed_str())
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .into_boxed_slice(),
+                            ),
+                            _ => &[],
+                        };
+                        Ok((static_name, static_schema, is_required, aliases))
                     })
                     .collect::<Result<Vec<_>, _>>()?
                     .into_boxed_slice(),
@@ -487,8 +509,25 @@ fn validate_object(
     let Value::Object(mut map) = coerce_container(value, ParamKind::Object, path)? else {
         unreachable!("coerce_container(_, Object) returns an Object")
     };
+    for &(name, _, _, aliases) in properties {
+        if map.contains_key(name) {
+            for alias in aliases {
+                if map.remove(*alias).is_some() {
+                    warn!(path = %path, alias = %alias, canonical = %name, "dropped alias (canonical present)");
+                }
+            }
+            continue;
+        }
+        for alias in aliases {
+            if let Some(v) = map.remove(*alias) {
+                warn!(path = %path, alias = %alias, canonical = %name, "resolved alias to canonical key");
+                map.insert(name.to_owned(), v);
+                break;
+            }
+        }
+    }
     let mut out = serde_json::Map::new();
-    for (name, sub_schema, required) in properties {
+    for (name, sub_schema, required, _) in properties {
         match map.remove(*name) {
             Some(v) if v.is_null() && !required => {}
             Some(v) => {
@@ -525,6 +564,24 @@ fn coerce_container(
     {
         log_coercion(path, ParamKind::String, expected, &value, &parsed);
         return Ok(parsed);
+    }
+    if expected == ParamKind::Array {
+        let single = match &value {
+            v if ParamKind::of(v) == ParamKind::Object => Some(value.clone()),
+            Value::String(s) => coerce_str_to(s, ParamKind::Object),
+            _ => None,
+        };
+        if let Some(obj) = single {
+            let wrapped = Value::Array(vec![obj]);
+            log_coercion(
+                path,
+                ParamKind::of(&value),
+                ParamKind::Array,
+                &value,
+                &wrapped,
+            );
+            return Ok(wrapped);
+        }
     }
     let got = ParamKind::of(&value);
     let preview = if let Value::String(s) = &value {
@@ -565,8 +622,24 @@ fn coerce_primitive(v: &Value, expected: ParamKind) -> Option<Value> {
 }
 
 fn coerce_str_to(s: &str, expected: ParamKind) -> Option<Value> {
-    let parsed: Value = serde_json::from_str(s).ok()?;
-    (ParamKind::of(&parsed) == expected).then_some(parsed)
+    let trimmed = s.trim();
+    if !matches!(trimmed.as_bytes().first(), Some(b'[' | b'{')) {
+        return None;
+    }
+
+    if let Ok(parsed) = serde_json::from_str::<Value>(s)
+        && ParamKind::of(&parsed) == expected
+    {
+        return Some(parsed);
+    }
+
+    let repaired = repair_loads(s, &RepairOpts::default()).ok()?;
+    if ParamKind::of(&repaired) == expected {
+        debug!(input = %preview(s), "repaired malformed JSON");
+        Some(repaired)
+    } else {
+        None
+    }
 }
 
 fn log_coercion(
@@ -629,9 +702,9 @@ mod tests {
 
     const EDIT_ENTRY: ParamSchema = ParamSchema::Object {
         properties: &[
-            ("old_string", &STR_PRIM, true),
-            ("new_string", &STR_PRIM, true),
-            ("replace_all", &BOOL_PRIM, false),
+            ("old_string", &STR_PRIM, true, &[]),
+            ("new_string", &STR_PRIM, true, &[]),
+            ("replace_all", &BOOL_PRIM, false, &[]),
         ],
         description: "",
     };
@@ -642,7 +715,10 @@ mod tests {
     };
 
     const MULTIEDIT_LIKE: ParamSchema = ParamSchema::Object {
-        properties: &[("path", &STR_PRIM, true), ("edits", &EDITS_ARRAY, true)],
+        properties: &[
+            ("path", &STR_PRIM, true, &[]),
+            ("edits", &EDITS_ARRAY, true, &[]),
+        ],
         description: "",
     };
 
@@ -771,7 +847,10 @@ mod tests {
     #[test]
     fn optional_null_treated_as_absent() {
         const SCHEMA: ParamSchema = ParamSchema::Object {
-            properties: &[("name", &STR_PRIM, true), ("hint", &STR_PRIM, false)],
+            properties: &[
+                ("name", &STR_PRIM, true, &[]),
+                ("hint", &STR_PRIM, false, &[]),
+            ],
             description: "",
         };
         let out = validate(&SCHEMA, json!({"name": "x", "hint": null})).unwrap();
@@ -792,7 +871,7 @@ mod tests {
     #[test]
     fn extra_keys_dropped() {
         const SCHEMA: ParamSchema = ParamSchema::Object {
-            properties: &[("name", &STR_PRIM, true)],
+            properties: &[("name", &STR_PRIM, true, &[])],
             description: "",
         };
         let out = validate(&SCHEMA, json!({"name": "x", "extra": 42})).unwrap();
@@ -820,7 +899,10 @@ mod tests {
             description: "",
         };
         const SCHEMA: ParamSchema = ParamSchema::Object {
-            properties: &[("name", &STR_PRIM, true), ("count", &INT_PRIM, false)],
+            properties: &[
+                ("name", &STR_PRIM, true, &[]),
+                ("count", &INT_PRIM, false, &[]),
+            ],
             description: "",
         };
         let json_schema = to_json_schema(&SCHEMA);
@@ -842,5 +924,78 @@ mod tests {
         let schema = try_from_json(&schema_json).unwrap();
         assert!(validate(schema, json!({"path": "/x"})).is_ok());
         assert!(validate(schema, json!({"hint": "y"})).is_err());
+    }
+
+    #[test]
+    fn coerce_stringified_array_with_unescaped_inner_quotes_via_repair() {
+        let broken = r#"[{"old_string": "const x = { \"color\": 1 };", "new_string": "fixed"}]"#;
+        let input = json!({"path": "/x", "edits": broken});
+        let out = validate(&MULTIEDIT_LIKE, input).unwrap();
+        assert_eq!(out["edits"][0]["new_string"], "fixed");
+    }
+
+    #[test]
+    fn coerce_single_object_wrapped_as_array() {
+        let input = json!({
+            "path": "/x",
+            "edits": {"old_string": "a", "new_string": "b"}
+        });
+        let out = validate(&MULTIEDIT_LIKE, input).unwrap();
+        assert_eq!(out["edits"][0]["old_string"], "a");
+    }
+
+    #[test]
+    fn coerce_stringified_single_object_wrapped_as_array() {
+        let input = json!({
+            "path": "/x",
+            "edits": r#"{"old_string": "a", "new_string": "b"}"#
+        });
+        let out = validate(&MULTIEDIT_LIKE, input).unwrap();
+        assert_eq!(out["edits"][0]["old_string"], "a");
+    }
+
+    #[test]
+    fn prose_string_where_array_expected_still_errors() {
+        let input = json!({"path": "/x", "edits": "please edit the file"});
+        let err = validate(&MULTIEDIT_LIKE, input).unwrap_err();
+        assert!(matches!(
+            err.kind,
+            ToolInputErrorKind::TypeMismatch {
+                expected: ParamKind::Array,
+                ..
+            }
+        ));
+    }
+
+    const ALIAS_SCHEMA: ParamSchema = ParamSchema::Object {
+        properties: &[
+            ("path", &STR_PRIM, true, &["file_path"]),
+            ("content", &STR_PRIM, true, &[]),
+        ],
+        description: "",
+    };
+
+    #[test_case(json!({"file_path": "/x", "content": "hi"}), "/x" ; "alias_resolves_to_canonical")]
+    #[test_case(json!({"path": "/real", "file_path": "/alias", "content": "hi"}), "/real" ; "canonical_wins_over_alias")]
+    fn alias_resolution(input: Value, expected_path: &str) {
+        let out = validate(&ALIAS_SCHEMA, input).unwrap();
+        assert_eq!(out["path"], expected_path);
+    }
+
+    #[test_case(json!({"alias": "file_path"}), json!({"file_path": "/x"}) ; "single_string_alias")]
+    #[test_case(json!({"alias": ["file_path", "fp"]}), json!({"fp": "/x"}) ; "array_alias")]
+    fn try_from_json_alias_parsing(alias_field: Value, input: Value) {
+        let mut schema_json = json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "required": true },
+            }
+        });
+        schema_json["properties"]["path"]
+            .as_object_mut()
+            .unwrap()
+            .extend(alias_field.as_object().unwrap().clone());
+        let schema = try_from_json(&schema_json).unwrap();
+        assert!(validate(schema, input).is_ok());
     }
 }
