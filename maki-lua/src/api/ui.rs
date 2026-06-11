@@ -187,12 +187,11 @@ pub(crate) fn create_ui_table(
 }
 
 pub(crate) fn try_parse_dimension(tbl: &Table, key: &str) -> Option<Dimension> {
-    if let Ok(s) = tbl.get::<String>(key) {
-        if let Some(pct) = s.strip_suffix('%') {
-            if let Ok(v) = pct.parse::<u16>() {
-                return Some(Dimension::Percent(v));
-            }
-        }
+    if let Ok(s) = tbl.get::<String>(key)
+        && let Some(pct) = s.strip_suffix('%')
+        && let Ok(v) = pct.parse::<u16>()
+    {
+        return Some(Dimension::Percent(v));
     }
     if let Ok(v) = tbl.get::<u16>(key) {
         return Some(Dimension::Abs(v));

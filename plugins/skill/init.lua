@@ -86,6 +86,7 @@ local description = "Load a skill that provides instructions and workflows for s
 
 maki.api.register_tool({
   name = "skill",
+  kind = "read",
   description = description,
 
   schema = {

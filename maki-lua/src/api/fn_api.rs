@@ -190,10 +190,10 @@ impl JobStore {
     }
 
     pub fn kill(&mut self, job_id: u32) {
-        if let Some(meta) = self.jobs.get_mut(&job_id) {
-            if meta.alive {
-                kill_job(meta);
-            }
+        if let Some(meta) = self.jobs.get_mut(&job_id)
+            && meta.alive
+        {
+            kill_job(meta);
         }
     }
 

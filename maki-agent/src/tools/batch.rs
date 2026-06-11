@@ -177,6 +177,7 @@ impl Batch {
                         BatchProgressEvent {
                             batch_id,
                             index: i,
+                            tool: name,
                             status: BatchToolStatus::Error,
                             output: None,
                             summary: None,
@@ -200,6 +201,7 @@ impl Batch {
                     .try_send(AgentEvent::BatchProgress(Box::new(BatchProgressEvent {
                         batch_id: batch_id.clone(),
                         index: i,
+                        tool: name.clone(),
                         status: BatchToolStatus::InProgress,
                         output: None,
                         summary: Some(summary.clone()),
@@ -232,6 +234,7 @@ impl Batch {
                     .try_send(AgentEvent::BatchProgress(Box::new(BatchProgressEvent {
                         batch_id,
                         index: i,
+                        tool: name,
                         status,
                         output: Some(done.output.clone()),
                         summary: Some(summary.clone()),

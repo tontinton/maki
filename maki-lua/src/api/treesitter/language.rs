@@ -20,12 +20,12 @@ pub(crate) fn create_language_module(lua: &Lua) -> mlua::Result<Table> {
     t.set(
         "add",
         lua.create_function(move |_, (lang, opts): (String, Option<Table>)| {
-            if let Some(ref opts) = opts {
-                if opts.contains_key("path")? {
-                    return Err(mlua::Error::runtime(
-                        "custom grammar paths not supported yet",
-                    ));
-                }
+            if let Some(ref opts) = opts
+                && opts.contains_key("path")?
+            {
+                return Err(mlua::Error::runtime(
+                    "custom grammar paths not supported yet",
+                ));
             }
             if Language::from_name(&lang).is_none() {
                 return Err(mlua::Error::runtime(format!("language not found: {lang}")));

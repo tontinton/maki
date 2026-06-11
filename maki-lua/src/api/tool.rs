@@ -39,6 +39,7 @@ pub(crate) struct PendingTool {
     pub(crate) description: String,
     pub(crate) schema: &'static ParamSchema,
     pub(crate) audience: ToolAudience,
+    pub(crate) kind: Option<Arc<str>>,
     pub(crate) handler_key: RegistryKey,
     pub(crate) header_key: Option<RegistryKey>,
     pub(crate) restore_key: Option<RegistryKey>,
@@ -54,6 +55,7 @@ pub(crate) struct LuaTool {
     pub(crate) description: String,
     pub(crate) schema: &'static ParamSchema,
     pub(crate) audience: ToolAudience,
+    pub(crate) kind: Option<Arc<str>>,
     pub(crate) tx: Sender<Request>,
     pub(crate) plugin: Arc<str>,
     pub(crate) has_header_fn: bool,
@@ -76,6 +78,10 @@ impl Tool for LuaTool {
 
     fn audience(&self) -> ToolAudience {
         self.audience
+    }
+
+    fn tool_kind(&self) -> Option<&str> {
+        self.kind.as_deref()
     }
 
     fn parse(&self, input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
@@ -473,6 +479,10 @@ fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> Lua
 
     let header_fn: Option<Function> = spec.get("header").ok();
     let restore_fn: Option<Function> = spec.get("restore").ok();
+    let kind: Option<Arc<str>> = spec
+        .get::<String>("kind")
+        .ok()
+        .map(|s| Arc::from(s.as_str()));
     let audience = parse_audience(audiences)?;
     let timeout = parse_timeout(spec)?;
     let handler_key: RegistryKey = lua.create_registry_value(handler)?;
@@ -492,6 +502,7 @@ fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> Lua
             description,
             schema: param_schema,
             audience,
+            kind,
             handler_key,
             header_key,
             restore_key,
@@ -706,6 +717,7 @@ mod tests {
             description: "test".into(),
             schema,
             audience: ToolAudience::default(),
+            kind: None,
             tx,
             plugin: Arc::from("test"),
             has_header_fn: false,
@@ -870,6 +882,7 @@ mod tests {
             description: "test".into(),
             schema,
             audience: ToolAudience::default(),
+            kind: None,
             tx,
             plugin: Arc::from("test"),
             has_header_fn: false,
@@ -1080,5 +1093,34 @@ mod tests {
         assert!(is_valid_tool_name(&max_ok));
         let too_long: String = "a".repeat(TOOL_NAME_MAX + 1);
         assert!(!is_valid_tool_name(&too_long));
+    }
+
+    #[test]
+    fn lua_tool_kind_returns_configured_value() {
+        let schema = try_from_json(&serde_json::json!({
+            "type": "object",
+            "properties": {},
+        }))
+        .unwrap();
+        let (tx, _rx) = flume::unbounded();
+        let tool = LuaTool {
+            name: Arc::from("my_reader"),
+            description: "reads things".into(),
+            schema,
+            audience: ToolAudience::default(),
+            kind: Some(Arc::from("read")),
+            tx,
+            plugin: Arc::from("test"),
+            has_header_fn: false,
+            permission_scope_kind: None,
+            timeout: None,
+        };
+        assert_eq!(tool.tool_kind(), Some("read"));
+    }
+
+    #[test]
+    fn lua_tool_kind_none_by_default() {
+        let tool = make_lua_tool(None);
+        assert_eq!(tool.tool_kind(), None);
     }
 }

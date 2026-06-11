@@ -16,10 +16,10 @@ pub(crate) fn expand_tilde(path: &str) -> PathBuf {
         if let Some(home) = maki_storage::paths::home() {
             return home.join(rest);
         }
-    } else if path == "~" {
-        if let Some(home) = maki_storage::paths::home() {
-            return home;
-        }
+    } else if path == "~"
+        && let Some(home) = maki_storage::paths::home()
+    {
+        return home;
     }
     PathBuf::from(path)
 }

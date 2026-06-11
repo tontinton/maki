@@ -70,6 +70,7 @@ end
 
 maki.api.register_tool({
   name = "webfetch",
+  kind = "fetch",
   description = [[Fetch a URL and return its contents.
 
 - Supports markdown (default), text, or html output formats.

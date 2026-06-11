@@ -96,10 +96,10 @@ impl UserData for WinHandle {
             if let Ok(t) = opts.get::<String>("title") {
                 patch.title = Some(t);
             }
-            if let Ok(f) = parse_footer(&opts) {
-                if !f.is_empty() {
-                    patch.footer = Some(f);
-                }
+            if let Ok(f) = parse_footer(&opts)
+                && !f.is_empty()
+            {
+                patch.footer = Some(f);
             }
             if let Ok(b) = opts.get::<String>("border") {
                 patch.border = Some(Border::parse(&b));

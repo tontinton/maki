@@ -191,6 +191,34 @@ fn permission_scope_valid_string_field_accepted() {
 }
 
 #[test]
+fn tool_kind_flows_to_trait() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+
+    let src = format!(
+        r#"maki.api.register_tool({{
+            name = "my_fetcher",
+            description = "fetches things",
+            schema = {MINIMAL_SCHEMA},
+            kind = "fetch",
+            handler = function() return "" end
+        }})"#,
+    );
+    host.load_source("kind_plugin", &src).unwrap();
+    let entry = reg.get("my_fetcher").expect("tool not registered");
+    assert_eq!(entry.tool.tool_kind(), Some("fetch"));
+}
+
+#[test]
+fn tool_kind_defaults_to_none() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source("echo_plugin", ECHO_PLUGIN).unwrap();
+    let entry = reg.get("echo_").expect("tool not registered");
+    assert_eq!(entry.tool.tool_kind(), None);
+}
+
+#[test]
 fn interrupt_kills_infinite_loop_and_vm_recovers() {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();

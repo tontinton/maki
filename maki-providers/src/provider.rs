@@ -281,6 +281,24 @@ pub struct ModelBatch {
     pub warnings: Vec<String>,
 }
 
+/// Offline version of model discovery: returns specs from static tables
+/// and configured dynamic providers. See [`fetch_all_models`] for live lookups.
+pub fn available_model_specs() -> Vec<String> {
+    let mut specs: Vec<String> = ProviderKind::iter()
+        .filter(|kind| kind.is_available())
+        .flat_map(|kind| {
+            models_for_provider(kind)
+                .iter()
+                .flat_map(|entry| entry.prefixes.iter())
+                .map(move |p| format!("{kind}/{p}"))
+        })
+        .collect();
+    for slug in dynamic::discovered_slugs() {
+        specs.extend(dynamic::dynamic_model_specs_for(slug));
+    }
+    specs
+}
+
 pub async fn fetch_all_models(mut on_ready: impl FnMut(ModelBatch)) {
     let (tx, rx) = flume::unbounded();
     let timeouts = Timeouts::default();

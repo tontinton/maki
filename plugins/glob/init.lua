@@ -12,6 +12,7 @@ end
 
 maki.api.register_tool({
   name = "glob",
+  kind = "search",
   description = [[Find files by glob pattern.
 
 - Respects .gitignore.

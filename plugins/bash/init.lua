@@ -238,6 +238,7 @@ maki.api.register_prompt_hint({
 
 maki.api.register_tool({
   name = "bash",
+  kind = "execute",
   description = description,
   schema = {
     type = "object",

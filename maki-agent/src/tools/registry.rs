@@ -165,6 +165,9 @@ pub trait Tool: Send + Sync + 'static {
     fn audience(&self) -> ToolAudience {
         ToolAudience::default()
     }
+    fn tool_kind(&self) -> Option<&str> {
+        None
+    }
     fn parse(&self, input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError>;
 }
 

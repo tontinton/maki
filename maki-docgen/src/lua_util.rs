@@ -58,10 +58,10 @@ pub fn extract_lua_description(source: &str) -> Option<String> {
         let quoted = trimmed
             .strip_prefix(".. \"")
             .or_else(|| trimmed.strip_prefix("description = \""));
-        if let Some(s) = quoted {
-            if let Some(end) = s.rfind('"') {
-                parts.push(unescape_lua_string(&s[..end]));
-            }
+        if let Some(s) = quoted
+            && let Some(end) = s.rfind('"')
+        {
+            parts.push(unescape_lua_string(&s[..end]));
         }
         if !trimmed.contains("..") && trimmed.ends_with(',') {
             break;

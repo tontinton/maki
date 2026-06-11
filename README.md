@@ -82,6 +82,24 @@ nix run github:tontinton/maki
 
 Or download a pre-built binary from [GitHub Releases](https://github.com/tontinton/maki/releases/latest).
 
+## ACP
+
+Run `maki acp` or configure your ACP supporting editor to use maki, e.g. in [Zed](https://zed.dev/)'s `settings.json`:
+
+```json
+"agent_servers": {
+  "Maki": {
+    "default_config_options": {
+      "model": "deepseek/deepseek-v4-flash"
+    },
+    "type": "custom",
+    "command": "maki",
+    "args": ["acp"],
+    "env": {}
+  }
+}
+```
+
 ## Documentation
 
 More info at the [official docs](http://maki.sh/docs).

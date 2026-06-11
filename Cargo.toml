@@ -10,7 +10,7 @@ homepage = "https://maki.sh"
 readme = "README.md"
 keywords = ["ai", "agent", "cli", "tui", "coding"]
 categories = ["command-line-utilities", "development-tools"]
-rust-version = "1.85"
+rust-version = "1.88"
 
 [[bin]]
 name = "maki"
@@ -22,6 +22,7 @@ demo = ["maki-ui/demo"]
 [dependencies]
 maki-ui = { workspace = true }
 maki-agent = { workspace = true }
+maki-acp = { workspace = true }
 maki-config = { workspace = true }
 maki-providers = { workspace = true }
 maki-storage = { workspace = true }
@@ -44,6 +45,7 @@ test-case = { workspace = true }
 
 [workspace]
 members = [
+  "maki-acp",
   "maki-agent",
   "maki-config",
   "maki-docgen",
@@ -65,10 +67,11 @@ edition = "2024"
 authors = ["Tony Solomonik <tony.solomonik@gmail.com>"]
 license = "MIT"
 repository = "https://github.com/tontinton/maki"
-rust-version = "1.85"
+rust-version = "1.88"
 
 [workspace.dependencies]
 maki-agent = { path = "maki-agent" }
+maki-acp = { path = "maki-acp" }
 maki-config = { path = "maki-config" }
 maki-interpreter = { path = "maki-interpreter" }
 maki-providers = { path = "maki-providers" }
@@ -159,6 +162,7 @@ monty = { git = "https://github.com/pydantic/monty.git", tag = "v0.0.17", packag
 notify = { version = "9.0.0-rc.2", default-features = false, features = ["flume", "macos_fsevent"] }
 serde_yaml = "0.9"
 shell-words = "1"
+agent-client-protocol-schema = "0.13"
 
 wait-timeout = "0.2"
 

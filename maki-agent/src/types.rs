@@ -616,6 +616,7 @@ pub struct TurnCompleteEvent {
 pub struct BatchProgressEvent {
     pub batch_id: String,
     pub index: usize,
+    pub tool: String,
     pub status: BatchToolStatus,
     pub output: Option<ToolOutput>,
     pub summary: Option<String>,

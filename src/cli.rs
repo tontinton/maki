@@ -95,6 +95,15 @@ pub enum Command {
     },
     /// Rollback to the previous version
     Rollback,
+    /// Run as an ACP (Agent Client Protocol) server over stdio
+    Acp {
+        /// Model spec (provider/model-id)
+        #[arg(short, long)]
+        model: Option<String>,
+        /// Skip all permission prompts
+        #[arg(long)]
+        yolo: bool,
+    },
     /// Data migration utilities
     Migrate {
         #[command(subcommand)]

@@ -1,3 +1,4 @@
+mod acp;
 mod migrate;
 mod subcmd;
 mod tui;
@@ -37,6 +38,9 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         }
         Some(Command::Rollback) => {
             update::rollback().map_err(|e| color_eyre::eyre::eyre!("{e}"))?;
+        }
+        Some(Command::Acp { model, yolo }) => {
+            acp::run(model, yolo)?;
         }
         Some(Command::Migrate { action }) => match action {
             MigrateAction::Xdg => migrate::xdg()?,

@@ -225,7 +225,7 @@ fn install_interrupt(lua: &Lua, shutdown: Arc<AtomicBool>) {
         }
         let tick = interrupt_tick.get().wrapping_add(1);
         interrupt_tick.set(tick);
-        if tick % INTERRUPT_CANCEL_CHECK_INTERVAL != 0 {
+        if !tick.is_multiple_of(INTERRUPT_CANCEL_CHECK_INTERVAL) {
             return Ok(VmState::Continue);
         }
         let stop = interrupt_lua.app_data_ref::<TaskHandle>().and_then(|h| {
@@ -537,14 +537,14 @@ fn drain_spawn_queue(lua: &Lua, ex: &Rc<smol::LocalExecutor<'_>>, gate: &Rc<Infl
                 tracing::debug!(error = %e, "async.run: task failed");
             }
 
-            if let Some(ref live) = task.live_ctx {
-                if let Some(ref buf) = task.live_buf {
-                    let _ = live.event_tx.send(maki_agent::AgentEvent::ToolSnapshot {
-                        id: live.tool_use_id.clone(),
-                        snapshot: buf.take(),
-                        theme_gen: None,
-                    });
-                }
+            if let Some(ref live) = task.live_ctx
+                && let Some(ref buf) = task.live_buf
+            {
+                let _ = live.event_tx.send(maki_agent::AgentEvent::ToolSnapshot {
+                    id: live.tool_use_id.clone(),
+                    snapshot: buf.take(),
+                    theme_gen: None,
+                });
             }
 
             drop(scope);
@@ -630,42 +630,42 @@ impl LuaRuntime {
                 if let Err(e) = self.lua.remove_registry_value(tk.handler) {
                     tracing::warn!(plugin = name, error = %e, "failed to drop lua handler key");
                 }
-                if let Some(sk) = tk.header {
-                    if let Err(e) = self.lua.remove_registry_value(sk) {
-                        tracing::warn!(plugin = name, error = %e, "failed to drop lua header key");
-                    }
+                if let Some(sk) = tk.header
+                    && let Err(e) = self.lua.remove_registry_value(sk)
+                {
+                    tracing::warn!(plugin = name, error = %e, "failed to drop lua header key");
                 }
-                if let Some(sk) = tk.permission_scopes {
-                    if let Err(e) = self.lua.remove_registry_value(sk) {
-                        tracing::warn!(plugin = name, error = %e, "failed to drop lua permission_scopes key");
-                    }
-                }
-            }
-        }
-        if let Some(mut cmd_map) = self.lua.app_data_mut::<CommandHandlerMap>() {
-            if let Some(cmds) = cmd_map.remove(name) {
-                for (_, entry) in cmds {
-                    if let Err(e) = self.lua.remove_registry_value(entry.handler) {
-                        tracing::warn!(plugin = name, error = %e, "failed to drop command handler key");
-                    }
-                }
-                drop(cmd_map);
-                if let (Some(map), Some(writer)) = (
-                    self.lua.app_data_ref::<CommandHandlerMap>(),
-                    self.lua.app_data_ref::<LuaCommandWriter>(),
-                ) {
-                    publish_command_snapshot(&map, &writer);
+                if let Some(sk) = tk.permission_scopes
+                    && let Err(e) = self.lua.remove_registry_value(sk)
+                {
+                    tracing::warn!(plugin = name, error = %e, "failed to drop lua permission_scopes key");
                 }
             }
         }
-        if let Some(mut hints) = self.lua.app_data_mut::<PromptHintCallbacks>() {
-            if let Some(regs) = hints.remove(name) {
-                for reg in regs {
-                    if let HintContent::Callback(key) = reg.content {
-                        if let Err(e) = self.lua.remove_registry_value(key) {
-                            tracing::warn!(plugin = name, error = %e, "failed to drop prompt hint key");
-                        }
-                    }
+        if let Some(mut cmd_map) = self.lua.app_data_mut::<CommandHandlerMap>()
+            && let Some(cmds) = cmd_map.remove(name)
+        {
+            for (_, entry) in cmds {
+                if let Err(e) = self.lua.remove_registry_value(entry.handler) {
+                    tracing::warn!(plugin = name, error = %e, "failed to drop command handler key");
+                }
+            }
+            drop(cmd_map);
+            if let (Some(map), Some(writer)) = (
+                self.lua.app_data_ref::<CommandHandlerMap>(),
+                self.lua.app_data_ref::<LuaCommandWriter>(),
+            ) {
+                publish_command_snapshot(&map, &writer);
+            }
+        }
+        if let Some(mut hints) = self.lua.app_data_mut::<PromptHintCallbacks>()
+            && let Some(regs) = hints.remove(name)
+        {
+            for reg in regs {
+                if let HintContent::Callback(key) = reg.content
+                    && let Err(e) = self.lua.remove_registry_value(key)
+                {
+                    tracing::warn!(plugin = name, error = %e, "failed to drop prompt hint key");
                 }
             }
         }
@@ -777,15 +777,15 @@ impl LuaRuntime {
             if let Err(e) = self.lua.remove_registry_value(t.handler_key) {
                 tracing::warn!(error = %e, "failed to drop lua handler key on rollback");
             }
-            if let Some(sk) = t.header_key {
-                if let Err(e) = self.lua.remove_registry_value(sk) {
-                    tracing::warn!(error = %e, "failed to drop lua header key on rollback");
-                }
+            if let Some(sk) = t.header_key
+                && let Err(e) = self.lua.remove_registry_value(sk)
+            {
+                tracing::warn!(error = %e, "failed to drop lua header key on rollback");
             }
-            if let Some(sk) = t.permission_scopes_key {
-                if let Err(e) = self.lua.remove_registry_value(sk) {
-                    tracing::warn!(error = %e, "failed to drop lua permission_scopes key on rollback");
-                }
+            if let Some(sk) = t.permission_scopes_key
+                && let Err(e) = self.lua.remove_registry_value(sk)
+            {
+                tracing::warn!(error = %e, "failed to drop lua permission_scopes key on rollback");
             }
         }
     }
@@ -829,10 +829,10 @@ impl LuaRuntime {
                 ));
             }
 
-            if let Ok(cached) = loaded.get::<LuaValue>(modname.as_str()) {
-                if cached != LuaValue::Nil {
-                    return Ok(cached);
-                }
+            if let Ok(cached) = loaded.get::<LuaValue>(modname.as_str())
+                && cached != LuaValue::Nil
+            {
+                return Ok(cached);
             }
 
             if loading.get::<bool>(modname.as_str()).unwrap_or(false) {
@@ -845,10 +845,10 @@ impl LuaRuntime {
 
             let source_str: Result<Option<String>, mlua::Error> = (|| {
                 for dir in bundled_dirs {
-                    if let Some(file) = dir.get_file(&rel_path) {
-                        if let Some(contents) = file.contents_utf8() {
-                            return Ok(Some(contents.to_owned()));
-                        }
+                    if let Some(file) = dir.get_file(&rel_path)
+                        && let Some(contents) = file.contents_utf8()
+                    {
+                        return Ok(Some(contents.to_owned()));
                     }
                 }
                 let Some(dir) = lua_dir.as_ref() else {
@@ -972,6 +972,7 @@ impl LuaRuntime {
                     description: t.description.clone(),
                     schema: t.schema,
                     audience: t.audience,
+                    kind: t.kind.clone(),
                     tx: self.tx.clone(),
                     plugin: Arc::clone(&name),
                     has_header_fn: t.header_key.is_some(),
