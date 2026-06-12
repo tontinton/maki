@@ -3,32 +3,38 @@ name: Rust
 on:
   push:
     branches: ["main"]
-    paths:
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "src/**"
-      - "maki-*/src/**"
-      - "plugins/**"
-      - "justfile"
-      - ".github/workflows/rust.yml"
   pull_request:
     branches: ["main"]
-    paths:
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "src/**"
-      - "maki-*/src/**"
-      - "plugins/**"
-      - "justfile"
-      - ".github/workflows/rust.yml"
 
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
 
 jobs:
+  changes:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            code:
+              - "Cargo.toml"
+              - "Cargo.lock"
+              - "src/**"
+              - "maki-*/src/**"
+              - "plugins/**"
+              - "justfile"
+              - ".github/workflows/rust.yml"
+
   fmt:
     name: Format (Rust)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -36,6 +42,8 @@ jobs:
 
   fmt-lua:
     name: Format (Lua)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -47,6 +55,8 @@ jobs:
 
   lint:
     name: Lint
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -56,6 +66,8 @@ jobs:
 
   test:
     name: Test
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -69,6 +81,8 @@ jobs:
 
   machete:
     name: Unused deps
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -79,6 +93,8 @@ jobs:
 
   docs:
     name: Docs
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -88,6 +104,8 @@ jobs:
 
   build:
     name: Build
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -97,6 +115,8 @@ jobs:
 
   lint-windows:
     name: Lint (Windows)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -106,9 +126,20 @@ jobs:
 
   build-windows:
     name: Build (Windows)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
       - uses: extractions/setup-just@v2
       - run: just build
+
+  ci-pass:
+    name: CI
+    if: always()
+    needs: [fmt, fmt-lua, lint, test, machete, docs, build, lint-windows, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1
