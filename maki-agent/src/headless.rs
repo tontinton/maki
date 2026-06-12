@@ -239,10 +239,13 @@ pub struct InteractiveParams {
     pub session_id: Option<String>,
     pub initial_history: Vec<Message>,
     pub yolo: bool,
+    pub system_prompt_override: Option<String>,
+    pub append_system_prompt: Option<String>,
 }
 
 pub struct InteractiveHandle {
     pub event_rx: Receiver<Envelope>,
+    pub tool_names: Vec<String>,
     pub input_tx: flume::Sender<AgentInput>,
     pub answer_tx: flume::Sender<String>,
     pub cancel_tx: flume::Sender<()>,
@@ -262,6 +265,8 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
         &params.excluded_tools,
         params.mcp_handle.as_ref(),
     );
+
+    let tool_names = extract_tool_names(&tools);
 
     let (raw_tx, event_rx) = flume::unbounded::<Envelope>();
     let (input_tx, input_rx) = flume::unbounded::<AgentInput>();
@@ -335,12 +340,18 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                     }
                 }
 
-                let system = agent::build_system_prompt(
-                    &vars,
-                    &input.mode,
-                    &instructions.text,
-                    &params.prompt_slots,
-                );
+                let mut system = params.system_prompt_override.clone().unwrap_or_else(|| {
+                    agent::build_system_prompt(
+                        &vars,
+                        &input.mode,
+                        &instructions.text,
+                        &params.prompt_slots,
+                    )
+                });
+                if let Some(append) = &params.append_system_prompt {
+                    system.push('\n');
+                    system.push_str(append);
+                }
 
                 let (trigger, cancel) = CancelToken::new();
                 let cancel_task = smol::spawn({
@@ -403,6 +414,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
 
     InteractiveHandle {
         event_rx,
+        tool_names,
         input_tx,
         answer_tx,
         cancel_tx,
@@ -489,5 +501,11 @@ mod tests {
         let loaded = load(&tmp);
         assert_eq!(loaded.messages.len(), 2);
         assert_eq!(loaded.model, "other/model");
+    }
+
+    #[test]
+    fn extract_tool_names_filters_valid_entries() {
+        let tools = serde_json::json!([{"name": "read"}, {"type": "function"}, {"name": "bash"}]);
+        assert_eq!(extract_tool_names(&tools), vec!["read", "bash"]);
     }
 }

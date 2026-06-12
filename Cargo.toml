@@ -39,6 +39,8 @@ tempfile = { workspace = true }
 isahc = { workspace = true }
 thiserror = { workspace = true }
 libc = { workspace = true }
+uuid = { workspace = true }
+flume = { workspace = true }
 
 [dev-dependencies]
 test-case = { workspace = true }

@@ -49,7 +49,39 @@ maki "fix the bug" --print --output-format json
 
 Same JSON fields, same `--output-format` options, same `--verbose` behavior. Scripts that parse Claude Code output work unchanged.
 
-Difference: ~40% fewer tokens used on average.
+## SDK / Stream Mode
+
+For tools like Conductor, Windsurf, or custom orchestrators that speak the Claude Code SDK wire protocol, use `--input-format stream-json`:
+
+```bash
+maki --print --input-format stream-json
+```
+
+This enters a bidirectional NDJSON loop over stdio instead of the one-shot print path. Inbound messages (`user`, `control_request`, `control_response`) drive the agent; outbound messages (`system`, `assistant`, `result`, `stream_event`, `control_request`) match the Claude Code SDK shape.
+
+Under the hood it reuses the same `spawn_interactive` driver as the TUI and ACP server, so sessions, tools, and permissions all work the same way.
+
+### Flags
+
+| Flag | Description |
+|------|-------------|
+| `--system-prompt` | Override the system prompt entirely |
+| `--append-system-prompt` | Append text to the built-in system prompt |
+| `--max-turns` | Cap the number of agent turns |
+| `--session-id <id>` | Set a specific session ID |
+| `--resume <id>` / `-s <id>` | Resume an existing session |
+| `--fork-session` | Load a session's history under a new ID |
+| `--continue` | Resume the most recent session in the current directory |
+| `--permission-mode <mode>` | `default`, `acceptEdits`, `plan`, or `bypassPermissions` |
+| `--include-partial-messages` | Stream Anthropic-shaped deltas (`message_start`, `content_block_delta`, ...) |
+| `--allowed-tools` / `--disallowed-tools` | Comma-separated tool allow/deny lists (PascalCase or snake_case) |
+
+### Quick example
+
+```bash
+echo '{"type":"user","message":{"content":"explain this repo"}}' \
+  | maki --print --input-format stream-json --max-turns 3
+```
 
 ## Examples
 

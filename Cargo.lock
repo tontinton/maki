@@ -2299,6 +2299,7 @@ version = "0.3.16"
 dependencies = [
  "clap",
  "color-eyre",
+ "flume 0.11.1",
  "futures-lite",
  "isahc",
  "libc",
@@ -2317,6 +2318,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

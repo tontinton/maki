@@ -650,6 +650,9 @@ pub struct AgentConfig {
     #[config(skip, default = "DEFAULT_MAX_FILE_SIZE_MB * 1024 * 1024")]
     pub index_max_file_size: u64,
 
+    #[config(skip, default = "None")]
+    pub max_turns: Option<u32>,
+
     #[config(skip, default = "Vec::new()")]
     pub allowed_tools: Vec<String>,
 
@@ -691,6 +694,7 @@ impl AgentConfig {
                 .unwrap_or(DEFAULT_MAX_FILE_SIZE_MB)
                 * 1024
                 * 1024,
+            max_turns: None,
             allowed_tools: Vec::new(),
             disabled_tools,
         }

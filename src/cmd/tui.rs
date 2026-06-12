@@ -96,6 +96,13 @@ pub fn run(cli: Cli) -> Result<()> {
             .map(|t| normalize_tool_name(t))
             .collect::<Result<Vec<_>>>()?;
     }
+    if !cli.disallowed_tools.is_empty() {
+        config.agent.disabled_tools.extend(
+            cli.disallowed_tools
+                .iter()
+                .filter_map(|t| normalize_tool_name(t).ok()),
+        );
+    }
     config.validate()?;
 
     plugin_host
@@ -118,7 +125,23 @@ pub fn run(cli: Cli) -> Result<()> {
 
     let commands = discover_commands(cli.no_commands);
 
-    if cli.print {
+    if cli.is_sdk_mode() {
+        let fast = config.always_fast && model.supports_fast();
+        let prompt_slots = plugin_host
+            .event_handle()
+            .map(|h| h.collect_prompt_slots())
+            .unwrap_or_default();
+        crate::sdk_mode::run(crate::sdk_mode::SdkParams {
+            cli,
+            model,
+            config: config.agent,
+            permissions_config: config.permissions,
+            timeouts,
+            prompt_slots,
+            fast,
+        })
+        .context("run sdk mode")?;
+    } else if cli.print {
         let fast = config.always_fast && model.supports_fast();
         crate::print::run(
             &model,

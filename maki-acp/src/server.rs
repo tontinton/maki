@@ -173,6 +173,8 @@ fn spawn_session(
         session_id,
         initial_history: history,
         yolo: params.yolo,
+        system_prompt_override: None,
+        append_system_prompt: None,
     })
 }
 

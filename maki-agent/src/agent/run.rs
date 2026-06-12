@@ -164,6 +164,12 @@ impl<'h> Agent<'h> {
 
     async fn run_loop(&mut self) -> Result<(), AgentError> {
         loop {
+            if let Some(max) = self.config.max_turns
+                && self.num_turns >= max
+            {
+                self.emit_done(None)?;
+                return Ok(());
+            }
             match self.turn().await? {
                 TurnOutcome::Continue => {}
                 TurnOutcome::Done(stop_reason) => {

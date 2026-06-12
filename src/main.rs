@@ -1,6 +1,7 @@
 mod cli;
 mod cmd;
 mod print;
+mod sdk_mode;
 mod setup;
 mod update;
 
