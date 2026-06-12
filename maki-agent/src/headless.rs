@@ -1,4 +1,3 @@
-use std::mem;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -170,7 +169,8 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
                     }
                 };
             let error_tx = event_tx.clone();
-            let agent = Agent::new(
+            let mut history = History::new(Vec::new());
+            let mut agent = Agent::new(
                 AgentParams {
                     provider,
                     model: params.model,
@@ -186,7 +186,7 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
                     prompt_slots: Arc::new(params.prompt_slots),
                 },
                 AgentRunParams {
-                    history: History::new(Vec::new()),
+                    history: &mut history,
                     system,
                     event_tx,
                     tools,
@@ -195,7 +195,7 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
             .with_loaded_instructions(instructions.loaded)
             .with_mcp(params.mcp_handle);
 
-            let outcome = agent
+            let result = agent
                 .run(AgentInput {
                     message: params.prompt,
                     mode,
@@ -203,8 +203,9 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
                     ..Default::default()
                 })
                 .await;
+            drop(agent);
 
-            if let Err(e) = outcome.result {
+            if let Err(e) = result {
                 error!(error = %e, "agent error");
                 let _ = error_tx.send(AgentEvent::Error {
                     message: e.user_message(),
@@ -353,7 +354,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
 
                 while answer_rx.lock().await.try_recv().is_ok() {}
 
-                let agent = Agent::new(
+                let mut agent = Agent::new(
                     AgentParams {
                         provider: Arc::clone(&provider),
                         model: model.clone(),
@@ -366,7 +367,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                         prompt_slots: Arc::clone(&params.prompt_slots),
                     },
                     AgentRunParams {
-                        history: mem::replace(&mut history, History::new(Vec::new())),
+                        history: &mut history,
                         system,
                         event_tx,
                         tools: tools.clone(),
@@ -377,17 +378,17 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                 .with_cancel(cancel)
                 .with_mcp(params.mcp_handle.clone());
 
-                let outcome = agent.run(input).await;
+                let result = agent.run(input).await;
+                drop(agent);
                 cancel_task.cancel().await;
 
-                if let Err(ref e) = outcome.result {
+                if let Err(ref e) = result {
                     error!(error = %e, "agent error");
                     let _ = error_tx.send(AgentEvent::Error {
                         message: e.user_message(),
                     });
                 }
 
-                history = outcome.history;
                 if let Some(store) = &mut store {
                     store.record_turn(history.as_slice(), model.spec());
                 }

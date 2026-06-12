@@ -1,14 +1,30 @@
+use std::sync::Arc;
+
+use arc_swap::ArcSwap;
 use maki_providers::{ContentBlock, Message, Role};
 
 const CANCEL_MARKER: &str = "[Cancelled by user]";
+const UNAVAILABLE_RESULT: &str = "[Tool result not available]";
+
+pub type SharedMessages = Arc<ArcSwap<Vec<Message>>>;
 
 pub struct History {
     messages: Vec<Message>,
+    mirror: Option<SharedMessages>,
 }
 
 impl History {
     pub fn new(messages: Vec<Message>) -> Self {
-        Self { messages }
+        Self {
+            messages,
+            mirror: None,
+        }
+    }
+
+    pub fn with_mirror(mut self, mirror: SharedMessages) -> Self {
+        self.mirror = Some(mirror);
+        self.publish();
+        self
     }
 
     pub fn as_slice(&self) -> &[Message] {
@@ -16,7 +32,7 @@ impl History {
     }
 
     pub fn push(&mut self, msg: Message) {
-        self.messages.push(msg);
+        self.edit(|msgs| msgs.push(msg));
     }
 
     pub fn len(&self) -> usize {
@@ -28,39 +44,58 @@ impl History {
     }
 
     pub fn replace(&mut self, messages: Vec<Message>) {
-        self.messages = messages;
+        self.edit(|msgs| *msgs = messages);
     }
 
     pub fn truncate(&mut self, len: usize) {
-        self.messages.truncate(len);
+        self.edit(|msgs| msgs.truncate(len));
     }
 
     pub fn into_vec(self) -> Vec<Message> {
         self.messages
     }
+
+    fn edit(&mut self, f: impl FnOnce(&mut Vec<Message>)) {
+        f(&mut self.messages);
+        self.publish();
+    }
+
+    fn publish(&self) {
+        let Some(mirror) = &self.mirror else { return };
+        let mut snapshot = self.messages.clone();
+        close_dangling_tool_calls(&mut snapshot, UNAVAILABLE_RESULT);
+        mirror.store(Arc::new(snapshot));
+    }
+}
+
+fn close_dangling_tool_calls(messages: &mut Vec<Message>, note: &str) {
+    let Some(last) = messages.last() else { return };
+    if !matches!(last.role, Role::Assistant) || !last.has_tool_calls() {
+        return;
+    }
+    let error_results: Vec<ContentBlock> = last
+        .tool_uses()
+        .map(|(id, _, _)| ContentBlock::ToolResult {
+            tool_use_id: id.to_owned(),
+            content: note.to_owned(),
+            is_error: true,
+        })
+        .collect();
+    messages.push(Message {
+        role: Role::User,
+        content: error_results,
+        display_text: Some(String::new()),
+    });
 }
 
 pub(crate) fn sanitize_cancelled_history(history: &mut History, rollback_len: usize) {
     if history.len() <= rollback_len {
         return;
     }
-    let last = history.as_slice().last().unwrap();
-    if matches!(last.role, Role::Assistant) && last.has_tool_calls() {
-        let error_results: Vec<ContentBlock> = last
-            .tool_uses()
-            .map(|(id, _, _)| ContentBlock::ToolResult {
-                tool_use_id: id.to_owned(),
-                content: CANCEL_MARKER.to_owned(),
-                is_error: true,
-            })
-            .collect();
-        history.push(Message {
-            role: Role::User,
-            content: error_results,
-            display_text: Some(String::new()),
-        });
-    }
-    history.push(Message::synthetic(CANCEL_MARKER.into()));
+    history.edit(|msgs| {
+        close_dangling_tool_calls(msgs, CANCEL_MARKER);
+        msgs.push(Message::synthetic(CANCEL_MARKER.into()));
+    });
 }
 
 #[cfg(test)]
@@ -75,6 +110,40 @@ mod tests {
         let last = history.as_slice().last().unwrap();
         assert!(matches!(last.role, Role::User));
         assert!(matches!(&last.content[0], ContentBlock::Text { text } if text == CANCEL_MARKER));
+    }
+
+    fn make_tool_use_msg(ids: &[&str]) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: ids
+                .iter()
+                .map(|id| ContentBlock::ToolUse {
+                    id: id.to_string(),
+                    name: "read".into(),
+                    input: serde_json::json!({}),
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn make_mirror() -> SharedMessages {
+        Arc::new(ArcSwap::from_pointee(Vec::new()))
+    }
+
+    #[track_caller]
+    fn extract_error_ids(msg: &Message) -> Vec<&str> {
+        msg.content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    is_error: true,
+                    ..
+                } => Some(tool_use_id.as_str()),
+                _ => None,
+            })
+            .collect()
     }
 
     #[test_case(
@@ -119,42 +188,107 @@ mod tests {
     fn sanitize_dangling_tool_use_adds_error_results() {
         let mut history = History::new(vec![
             Message::user("hello".into()),
-            Message {
-                role: Role::Assistant,
-                content: vec![
-                    ContentBlock::Text {
-                        text: "let me check".into(),
-                    },
-                    ContentBlock::ToolUse {
-                        id: "t1".into(),
-                        name: "read".into(),
-                        input: serde_json::json!({"path": "/tmp"}),
-                    },
-                    ContentBlock::ToolUse {
-                        id: "t2".into(),
-                        name: "glob".into(),
-                        input: serde_json::json!({"pattern": "*.rs"}),
-                    },
-                ],
-                ..Default::default()
-            },
+            make_tool_use_msg(&["t1", "t2"]),
         ]);
         sanitize_cancelled_history(&mut history, 0);
 
-        let tool_result_msg = &history.as_slice()[2];
-        let error_ids: Vec<&str> = tool_result_msg
-            .content
-            .iter()
-            .filter_map(|b| match b {
-                ContentBlock::ToolResult {
-                    tool_use_id,
-                    is_error: true,
-                    ..
-                } => Some(tool_use_id.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(error_ids, ["t1", "t2"]);
+        assert_eq!(extract_error_ids(&history.as_slice()[2]), ["t1", "t2"]);
         assert_ends_with_cancel_marker(&history);
+    }
+
+    #[test]
+    fn mirror_sequential_mutations_always_consistent() {
+        let mirror = make_mirror();
+        let mut history = History::new(Vec::new()).with_mirror(Arc::clone(&mirror));
+
+        for i in 0..10 {
+            history.push(Message::user(format!("msg-{i}")));
+            assert_eq!(mirror.load().len(), i + 1);
+        }
+
+        history.truncate(3);
+        assert_eq!(mirror.load().len(), 3);
+
+        history.replace(vec![Message::user("fresh".into())]);
+        assert_eq!(mirror.load().len(), 1);
+
+        history.push(make_tool_use_msg(&["t_final"]));
+        assert_eq!(history.len(), 2, "history has 2");
+        assert_eq!(mirror.load().len(), 3, "mirror has 3 (dangling closed)");
+    }
+
+    #[test]
+    fn snapshot_closes_dangling_tool_uses_without_mutating_history() {
+        let mirror = make_mirror();
+        let history = History::new(vec![
+            Message::user("go".into()),
+            make_tool_use_msg(&["t1", "t2"]),
+        ])
+        .with_mirror(Arc::clone(&mirror));
+
+        assert_eq!(history.len(), 2, "history itself unchanged");
+
+        let snap = mirror.load();
+        assert_eq!(snap.len(), 3, "snapshot has extra closing message");
+
+        let closing = &snap[2];
+        assert!(matches!(closing.role, Role::User));
+        assert_eq!(extract_error_ids(closing), ["t1", "t2"]);
+        assert_eq!(closing.display_text.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn snapshot_not_dangling_when_tool_result_already_present() {
+        let mirror = make_mirror();
+        let mut history =
+            History::new(vec![Message::user("go".into()), make_tool_use_msg(&["t1"])])
+                .with_mirror(Arc::clone(&mirror));
+
+        assert_eq!(mirror.load().len(), 3, "dangling before result");
+
+        history.push(Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "t1".into(),
+                content: "file contents".into(),
+                is_error: false,
+            }],
+            ..Default::default()
+        });
+
+        let snap = mirror.load();
+        assert_eq!(snap.len(), 3, "no extra closing after real result");
+    }
+
+    #[test]
+    fn into_vec_returns_inner_not_snapshot() {
+        let mirror = make_mirror();
+        let history = History::new(vec![Message::user("go".into()), make_tool_use_msg(&["t1"])])
+            .with_mirror(Arc::clone(&mirror));
+
+        assert_eq!(mirror.load().len(), 3, "snapshot has closing message");
+        assert_eq!(history.into_vec().len(), 2, "into_vec returns raw messages");
+    }
+
+    #[test]
+    fn sanitize_cancelled_on_mirrored_history() {
+        let mirror = make_mirror();
+        let mut history =
+            History::new(vec![Message::user("go".into()), make_tool_use_msg(&["t1"])])
+                .with_mirror(Arc::clone(&mirror));
+
+        sanitize_cancelled_history(&mut history, 0);
+
+        let snap = mirror.load();
+        assert_eq!(snap.len(), history.len(), "mirror matches history length");
+
+        let last = snap.last().unwrap();
+        assert!(matches!(&last.content[0], ContentBlock::Text { text } if text == CANCEL_MARKER));
+
+        let tool_result_msg = &snap[snap.len() - 2];
+        assert!(tool_result_msg.content.iter().any(|b| matches!(
+            b,
+            ContentBlock::ToolResult { content, is_error: true, .. } if content == CANCEL_MARKER
+        )));
     }
 }

@@ -28,11 +28,6 @@ enum TurnOutcome {
     Done(Option<StopReason>),
 }
 
-pub struct RunOutcome {
-    pub history: History,
-    pub result: Result<(), AgentError>,
-}
-
 pub struct AgentParams {
     pub provider: Arc<dyn Provider>,
     pub model: Model,
@@ -45,17 +40,17 @@ pub struct AgentParams {
     pub prompt_slots: Arc<crate::prompt::ResolvedSlots>,
 }
 
-pub struct AgentRunParams {
-    pub history: History,
+pub struct AgentRunParams<'h> {
+    pub history: &'h mut History,
     pub system: String,
     pub event_tx: EventSender,
     pub tools: Value,
 }
 
-pub struct Agent {
+pub struct Agent<'h> {
     provider: Arc<dyn Provider>,
     model: Arc<Model>,
-    history: History,
+    history: &'h mut History,
     system: String,
     event_tx: EventSender,
     tools: Value,
@@ -81,8 +76,8 @@ pub struct Agent {
     prompt_slots: Arc<crate::prompt::ResolvedSlots>,
 }
 
-impl Agent {
-    pub fn new(params: AgentParams, run: AgentRunParams) -> Self {
+impl<'h> Agent<'h> {
+    pub fn new(params: AgentParams, run: AgentRunParams<'h>) -> Self {
         Self {
             provider: params.provider,
             model: Arc::new(params.model),
@@ -141,7 +136,7 @@ impl Agent {
         self
     }
 
-    pub async fn run(mut self, input: AgentInput) -> RunOutcome {
+    pub async fn run(&mut self, input: AgentInput) -> Result<(), AgentError> {
         self.rollback_len = self.history.len();
         let msg = Message::user_with_images(input.message.clone(), input.images);
         self.history.push(msg);
@@ -161,13 +156,10 @@ impl Agent {
         let result = self.run_loop().await;
 
         if matches!(result, Err(AgentError::Cancelled)) {
-            sanitize_cancelled_history(&mut self.history, self.rollback_len);
+            sanitize_cancelled_history(self.history, self.rollback_len);
         }
 
-        RunOutcome {
-            history: self.history,
-            result,
-        }
+        result
     }
 
     async fn run_loop(&mut self) -> Result<(), AgentError> {
@@ -315,7 +307,7 @@ impl Agent {
             response,
             &mut self.recent_calls,
             self.mcp.as_ref(),
-            &mut self.history,
+            self.history,
             &self.event_tx,
             &ctx,
         )
@@ -360,7 +352,7 @@ impl Agent {
         self.total_usage += compaction::compact_history(
             &*self.provider,
             &self.model,
-            &mut self.history,
+            self.history,
             &self.event_tx,
             &self.cancel,
         )
@@ -490,7 +482,10 @@ mod tests {
         }
     }
 
-    fn make_agent(provider: MockProvider, history: History) -> (Agent, flume::Receiver<Envelope>) {
+    fn make_agent(
+        provider: MockProvider,
+        history: &mut History,
+    ) -> (Agent<'_>, flume::Receiver<Envelope>) {
         let (raw_tx, event_rx) = flume::unbounded();
         let agent = Agent::new(
             AgentParams {
@@ -537,7 +532,8 @@ mod tests {
     }
 
     async fn run_agent(provider: MockProvider) -> (u32, Option<StopReason>) {
-        let (agent, event_rx) = make_agent(provider, History::new(Vec::new()));
+        let mut history = History::new(Vec::new());
+        let (mut agent, event_rx) = make_agent(provider, &mut history);
         let _ = agent.run(default_input()).await;
         drain_events(&event_rx)
             .into_iter()
@@ -636,13 +632,12 @@ mod tests {
                 ]
             };
 
-            let (agent, event_rx) =
-                make_agent(MockProvider::new(responses), History::new(Vec::new()));
-            let agent = match source {
-                Some(s) => agent.with_interrupt_source(s),
-                None => agent,
-            };
-            let outcome = agent.run(default_input()).await;
+            let mut history = History::new(Vec::new());
+            let (mut agent, event_rx) = make_agent(MockProvider::new(responses), &mut history);
+            if let Some(s) = source {
+                agent = agent.with_interrupt_source(s);
+            }
+            let _ = agent.run(default_input()).await;
             let events = drain_events(&event_rx);
 
             assert_eq!(
@@ -653,7 +648,7 @@ mod tests {
                 expect_consumed,
             );
             assert_eq!(
-                has_interrupt_in_history(outcome.history.as_slice()),
+                has_interrupt_in_history(history.as_slice()),
                 expect_injected
             );
         });
@@ -673,13 +668,14 @@ mod tests {
         smol::block_on(async {
             let source = MockInterruptSource::new(commands);
 
-            let (agent, _event_rx) = make_agent(MockProvider::new(responses), History::new(prior));
-            let outcome = agent
+            let mut history = History::new(prior);
+            let (agent, _event_rx) = make_agent(MockProvider::new(responses), &mut history);
+            let result = agent
                 .with_interrupt_source(source)
                 .run(default_input())
                 .await;
 
-            assert!(outcome.result.is_ok());
+            assert!(result.is_ok());
         });
     }
 
@@ -693,10 +689,8 @@ mod tests {
             } else {
                 vec![]
             };
-            let (mut agent, event_rx) = make_agent(
-                MockProvider::new(responses),
-                History::new(vec![Message::user("go".into())]),
-            );
+            let mut history = History::new(vec![Message::user("go".into())]);
+            let (mut agent, event_rx) = make_agent(MockProvider::new(responses), &mut history);
             agent.model = Arc::new(small_context_model(1000, 200));
             agent.auto_compact = enabled;
 
@@ -747,7 +741,8 @@ mod tests {
             trigger.cancel();
 
             let (raw_tx, _rx) = flume::unbounded();
-            let agent = Agent::new(
+            let mut history = History::new(Vec::new());
+            let mut agent = Agent::new(
                 AgentParams {
                     provider: Arc::new(HangingProvider),
                     model: default_model(),
@@ -766,7 +761,7 @@ mod tests {
                     prompt_slots: Arc::new(crate::prompt::ResolvedSlots::default()),
                 },
                 AgentRunParams {
-                    history: History::new(Vec::new()),
+                    history: &mut history,
                     system: "system".into(),
                     event_tx: EventSender::new(raw_tx, 0),
                     tools: serde_json::json!([]),
@@ -774,9 +769,10 @@ mod tests {
             )
             .with_cancel(cancel);
 
-            let outcome = agent.run(default_input()).await;
-            assert!(matches!(outcome.result, Err(AgentError::Cancelled)));
-            assert_ends_with_cancel_marker(&outcome.history);
+            let result = agent.run(default_input()).await;
+            assert!(matches!(result, Err(AgentError::Cancelled)));
+            drop(agent);
+            assert_ends_with_cancel_marker(&history);
         });
     }
 
@@ -792,9 +788,10 @@ mod tests {
     )]
     fn error_emits_tool_done_event(responses: Vec<StreamResponse>, expected_error_id: &str) {
         smol::block_on(async {
-            let (agent, event_rx) =
-                make_agent(MockProvider::new(responses), History::new(Vec::new()));
+            let mut history = History::new(Vec::new());
+            let (mut agent, event_rx) = make_agent(MockProvider::new(responses), &mut history);
             let _ = agent.run(default_input()).await;
+            drop(agent);
             let events = drain_events(&event_rx);
 
             assert!(has_event(&events, |e| matches!(

@@ -1,4 +1,3 @@
-use std::mem;
 use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
@@ -32,7 +31,6 @@ pub(super) struct AgentLoop {
     tools: Value,
     mcp_handle: Option<McpHandle>,
     history: History,
-    shared_history: Arc<ArcSwap<Vec<Message>>>,
     btw_system: Arc<ArcSwap<String>>,
     cancel_map: Arc<Mutex<CancelMap>>,
     init_cancel: CancelToken,
@@ -75,8 +73,7 @@ impl AgentLoop {
             instructions: Instructions::default(),
             tools: Value::Null,
             mcp_handle,
-            history: History::new(initial_history),
-            shared_history,
+            history: History::new(initial_history).with_mirror(shared_history),
             btw_system,
             cancel_map,
             init_cancel,
@@ -151,10 +148,7 @@ impl AgentLoop {
 
     async fn do_compact(&mut self, event_tx: &EventSender) -> Result<(), AgentError> {
         let slot = self.model_slot.load();
-        let result =
-            agent::compact(&*slot.provider, &slot.model, &mut self.history, event_tx).await;
-        self.sync_shared_history();
-        result
+        agent::compact(&*slot.provider, &slot.model, &mut self.history, event_tx).await
     }
 
     async fn do_agent_run(
@@ -172,7 +166,7 @@ impl AgentLoop {
         }
         self.rebuild_tools(&slot.model);
 
-        for msg in mem::take(&mut input.preamble) {
+        for msg in std::mem::take(&mut input.preamble) {
             self.history.push(msg);
         }
 
@@ -204,8 +198,6 @@ impl AgentLoop {
             }
         }
 
-        self.sync_shared_history_with_pending(&input);
-
         let prompt_slots = match self.lua_handle.as_ref() {
             Some(h) => h.collect_prompt_slots_async().await,
             None => maki_agent::prompt::ResolvedSlots::default(),
@@ -222,7 +214,7 @@ impl AgentLoop {
 
         while self.answer_rx.lock().await.try_recv().is_ok() {}
 
-        let agent = Agent::new(
+        let mut agent = Agent::new(
             AgentParams {
                 provider: Arc::clone(&slot.provider),
                 model: slot.model.clone(),
@@ -235,7 +227,7 @@ impl AgentLoop {
                 prompt_slots: Arc::new(prompt_slots),
             },
             AgentRunParams {
-                history: mem::replace(&mut self.history, History::new(Vec::new())),
+                history: &mut self.history,
                 system,
                 event_tx,
                 tools: self.tools.clone(),
@@ -247,17 +239,16 @@ impl AgentLoop {
         .with_cancel(cancel)
         .with_mcp(self.mcp_handle.clone());
 
-        let outcome = agent.run(input).await;
+        let result = agent.run(input).await;
+        drop(agent);
 
         self.clear_cancel_trigger(run_id);
-        self.history = outcome.history;
-        self.sync_shared_history();
 
-        if matches!(outcome.result, Err(AgentError::Cancelled)) {
+        if matches!(result, Err(AgentError::Cancelled)) {
             self.min_run_id = run_id + 1;
         }
 
-        outcome.result
+        result
     }
 
     fn rebuild_tools(&mut self, model: &Model) {
@@ -290,17 +281,6 @@ impl AgentLoop {
             prompt_slots,
         );
         self.btw_system.store(Arc::new(system));
-    }
-
-    fn sync_shared_history(&self) {
-        self.shared_history
-            .store(Arc::new(self.history.as_slice().to_vec()));
-    }
-
-    fn sync_shared_history_with_pending(&self, input: &AgentInput) {
-        let mut snapshot = self.history.as_slice().to_vec();
-        snapshot.push(Message::user(input.message.clone()));
-        self.shared_history.store(Arc::new(snapshot));
     }
 
     fn set_cancel_trigger(&self, run_id: u64, trigger: CancelTrigger) {
