@@ -21,5 +21,6 @@ Written in Rust. Built to keep cost and token usage low without losing capabilit
 - **Python sandbox.** A minimal interpreter for running Python snippets safely inside the agent loop.
 - **Code indexing.** Tree-sitter powered file skeletons for 15+ languages, so the model can understand structure without reading every line.
 - **Headless mode.** Run non-interactively with `--print` for scripts and CI. Compatible with Claude Code output format.
+- **ACP server.** Use Maki from your editor (e.g. [Zed](https://zed.dev/)) over the Agent Client Protocol with `maki acp`.
 
 Ready to try it? Head to the [Quick Start](/docs/quick-start/).
