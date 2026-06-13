@@ -140,6 +140,7 @@ impl App {
                     tool: "bash".into(),
                     output: ToolOutput::Plain(output),
                     is_error,
+                    annotation: None,
                 });
                 if let Some(msg) = result_msg {
                     self.shell.push_result(msg);

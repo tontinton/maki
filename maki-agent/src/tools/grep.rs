@@ -227,7 +227,7 @@ impl super::ToolInvocation for Grep {
         super::HeaderFuture::Ready(super::HeaderResult::plain(Grep::start_header(self)))
     }
     fn execute<'a>(self: Box<Self>, ctx: &'a super::ToolContext) -> super::ExecFuture<'a> {
-        Box::pin(async move { Grep::execute(&self, ctx).await })
+        Box::pin(async move { Grep::execute(&self, ctx).await.into() })
     }
 }
 

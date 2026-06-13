@@ -77,9 +77,8 @@ pub fn index(path: &str, no_plugins: bool) -> Result<()> {
         .parse(&input)
         .map_err(|e| color_eyre::eyre::eyre!("parse index input: {e}"))?;
     let ctx = maki_agent::tools::cli_tool_ctx();
-    let result: Result<maki_agent::ToolOutput, String> =
-        smol::block_on(async { inv.execute(&ctx).await });
-    match result {
+    let result = smol::block_on(async { inv.execute(&ctx).await });
+    match result.output {
         Ok(output) => print!("{}", output.as_text()),
         Err(e) => bail!("index failed: {e}"),
     }

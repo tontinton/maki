@@ -242,7 +242,11 @@ impl MessagesPanel {
         }
         truncate_to_header(&mut msg.text);
         let hints = self.render_hints.get(&event.tool);
-        let done_annotation = tool_output_annotation(&event.output);
+        let done_annotation = event
+            .annotation
+            .as_deref()
+            .map(str::to_owned)
+            .or_else(|| tool_output_annotation(&event.output));
         if let Some(suffix) = &done_annotation {
             append_annotation(&mut msg.annotation, suffix);
         }
@@ -466,6 +470,7 @@ impl MessagesPanel {
                 tool,
                 output: ToolOutput::Plain(message.clone()),
                 is_error: true,
+                annotation: None,
             });
         }
     }

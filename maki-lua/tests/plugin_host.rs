@@ -15,10 +15,12 @@ fn exec_tool(reg: &ToolRegistry, name: &str, input: serde_json::Value) -> Result
         .unwrap_or_else(|| panic!("tool {name} not registered"));
     let inv = entry.tool.parse(&input).expect("parse failed");
     let ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
-    smol::block_on(async { inv.execute(&ctx).await }).map(|out| match out {
-        maki_agent::ToolOutput::Plain(s) => s,
-        other => panic!("unexpected output: {other:?}"),
-    })
+    smol::block_on(async { inv.execute(&ctx).await })
+        .output
+        .map(|out| match out {
+            maki_agent::ToolOutput::Plain(s) => s,
+            other => panic!("unexpected output: {other:?}"),
+        })
 }
 
 const ECHO_PLUGIN: &str = r#"
@@ -250,7 +252,7 @@ maki.api.register_tool({{
 
     let result = smol::block_on(async { inv.execute(&ctx).await });
 
-    assert!(result.is_err(), "expected error from timed-out loop");
+    assert!(result.output.is_err(), "expected error from timed-out loop");
 
     let ok = exec_tool(&reg, "noop_after_loop", serde_json::json!({}));
     assert!(ok.is_ok(), "VM poisoned after interrupt: {ok:?}");

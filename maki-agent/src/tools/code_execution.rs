@@ -167,7 +167,7 @@ impl super::ToolInvocation for CodeExecution {
         Some(super::timeout_annotation(self.timeout.unwrap_or(30)))
     }
     fn execute<'a>(self: Box<Self>, ctx: &'a super::ToolContext) -> super::ExecFuture<'a> {
-        Box::pin(async move { CodeExecution::execute(&self, ctx).await })
+        Box::pin(async move { CodeExecution::execute(&self, ctx).await.into() })
     }
 }
 

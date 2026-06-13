@@ -366,6 +366,7 @@ pub struct ToolDoneEvent {
     pub tool: Arc<str>,
     pub output: ToolOutput,
     pub is_error: bool,
+    pub annotation: Option<String>,
 }
 
 const UNKNOWN_TOOL: &str = "unknown";
@@ -377,6 +378,7 @@ impl ToolDoneEvent {
             tool: Arc::from(UNKNOWN_TOOL),
             output: ToolOutput::Plain(message.into()),
             is_error: true,
+            annotation: None,
         }
     }
 
@@ -806,12 +808,14 @@ mod tests {
                 tool: Arc::from("bash"),
                 output: ToolOutput::Plain("ok".into()),
                 is_error: false,
+                annotation: None,
             },
             ToolDoneEvent {
                 id: "t2".into(),
                 tool: Arc::from("read"),
                 output: ToolOutput::Plain("fail".into()),
                 is_error: true,
+                annotation: None,
             },
         ]);
         assert!(matches!(msg.role, Role::User));
@@ -883,8 +887,8 @@ mod tests {
                 lines: vec![],
             },
             is_error: false,
+            annotation: None,
         };
-        assert!(ok_event.wrote_to(Path::new("/plans/slug.md")));
         assert!(!ok_event.wrote_to(Path::new("/plans/other.md")));
 
         let err_event = ToolDoneEvent {

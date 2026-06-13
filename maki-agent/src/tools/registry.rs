@@ -52,7 +52,21 @@ impl ToolSource {
 
 pub type ParseError = super::schema::ToolInputError;
 
-pub type ExecFuture<'a> = Pin<Box<dyn Future<Output = Result<ToolOutput, String>> + Send + 'a>>;
+pub struct ToolExecResult {
+    pub output: Result<ToolOutput, String>,
+    pub annotation: Option<String>,
+}
+
+impl From<Result<ToolOutput, String>> for ToolExecResult {
+    fn from(output: Result<ToolOutput, String>) -> Self {
+        Self {
+            output,
+            annotation: None,
+        }
+    }
+}
+
+pub type ExecFuture<'a> = Pin<Box<dyn Future<Output = ToolExecResult> + Send + 'a>>;
 
 #[derive(Debug, Clone)]
 pub enum HeaderResult {
@@ -559,7 +573,7 @@ mod tests {
             HeaderFuture::Ready(HeaderResult::plain("mock".into()))
         }
         fn execute<'a>(self: Box<Self>, _ctx: &'a super::ToolContext) -> ExecFuture<'a> {
-            Box::pin(async { Ok(ToolOutput::Plain(String::new())) })
+            Box::pin(async { Ok(ToolOutput::Plain(String::new())).into() })
         }
     }
 

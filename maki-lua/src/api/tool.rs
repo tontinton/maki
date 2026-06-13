@@ -8,7 +8,7 @@ use maki_agent::tools::Tool;
 use maki_agent::tools::schema::{ParamSchema, to_json_schema, try_from_json, validate};
 use maki_agent::tools::{
     BoxFuture, Deadline, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError,
-    PermissionScopes, ToolAudience, ToolContext, ToolInvocation,
+    PermissionScopes, ToolAudience, ToolContext, ToolExecResult, ToolInvocation,
 };
 use maki_agent::{AgentEvent, BufferSnapshot, SharedBuf, ToolOutput};
 use mlua::{
@@ -199,9 +199,15 @@ impl ToolInvocation for LuaToolInvocation {
 
         Box::pin(async move {
             let effective_secs: Option<u64> = match tool_timeout {
-                Some(d) => Some(deadline.cap_timeout(d.as_secs())?),
+                Some(d) => match deadline.cap_timeout(d.as_secs()) {
+                    Ok(s) => Some(s),
+                    Err(e) => return Err(e).into(),
+                },
                 None => match deadline {
-                    Deadline::At(_) => Some(deadline.cap_timeout(u64::MAX)?),
+                    Deadline::At(_) => match deadline.cap_timeout(u64::MAX) {
+                        Ok(s) => Some(s),
+                        Err(e) => return Err(e).into(),
+                    },
                     Deadline::None => None,
                 },
             };
@@ -218,20 +224,24 @@ impl ToolInvocation for LuaToolInvocation {
                 finish_tx: None,
             };
 
-            tx.send_async(Request::CallTool {
-                plugin: Arc::clone(&plugin),
-                tool: Arc::clone(&tool),
-                input,
-                ctx: Box::new(lua_ctx),
-                deadline: match deadline {
-                    Deadline::At(t) => Some(t),
-                    Deadline::None => None,
-                },
-                reply: reply_tx,
-                live,
-            })
-            .await
-            .map_err(|_| "lua thread disconnected".to_string())?;
+            if tx
+                .send_async(Request::CallTool {
+                    plugin: Arc::clone(&plugin),
+                    tool: Arc::clone(&tool),
+                    input,
+                    ctx: Box::new(lua_ctx),
+                    deadline: match deadline {
+                        Deadline::At(t) => Some(t),
+                        Deadline::None => None,
+                    },
+                    reply: reply_tx,
+                    live,
+                })
+                .await
+                .is_err()
+            {
+                return Err("lua thread disconnected".to_string()).into();
+            }
 
             let recv = async { Some(reply_rx.recv_async().await) };
             let result = match effective_secs {
@@ -251,8 +261,9 @@ impl ToolInvocation for LuaToolInvocation {
                     plugin,
                     tool,
                     effective_secs.unwrap_or(0)
-                )),
-                Some(Err(_)) => Err("lua thread disconnected".to_string()),
+                ))
+                .into(),
+                Some(Err(_)) => Err("lua thread disconnected".to_string()).into(),
                 Some(Ok(reply)) => {
                     if let Some(ref id) = ctx.tool_use_id {
                         if let Some(live_buf) = reply.live_buf {
@@ -268,10 +279,13 @@ impl ToolInvocation for LuaToolInvocation {
                         .emit(id, None, &ctx.event_tx);
                     }
                     let format = reply.format;
-                    reply.result.map(|s| match format {
-                        LuaOutputFormat::Markdown => ToolOutput::Markdown(s),
-                        LuaOutputFormat::Plain => ToolOutput::Plain(s),
-                    })
+                    ToolExecResult {
+                        output: reply.result.map(|s| match format {
+                            LuaOutputFormat::Markdown => ToolOutput::Markdown(s),
+                            LuaOutputFormat::Plain => ToolOutput::Plain(s),
+                        }),
+                        annotation: reply.annotation,
+                    }
                 }
             }
         })
@@ -574,6 +588,7 @@ pub(crate) struct ToolCallReply {
     pub header: Option<BufferSnapshot>,
     pub live_buf: Option<Arc<SharedBuf>>,
     pub format: LuaOutputFormat,
+    pub annotation: Option<String>,
 }
 
 impl ToolCallReply {
@@ -586,6 +601,7 @@ impl ToolCallReply {
                 header: None,
                 live_buf: None,
                 format: LuaOutputFormat::default(),
+                annotation: None,
             };
         };
         let (snapshot, live_buf) = Self::extract_body_handle(t);
@@ -594,12 +610,14 @@ impl ToolCallReply {
             .ok()
             .and_then(|v| Self::extract_snapshot(&v));
         let format = extract_format(t);
+        let annotation = t.get::<String>("annotation").ok();
         Self {
             result,
             snapshot,
             header,
             live_buf,
             format,
+            annotation,
         }
     }
 
@@ -627,6 +645,7 @@ impl ToolCallReply {
             header: None,
             live_buf: None,
             format: LuaOutputFormat::default(),
+            annotation: None,
         }
     }
 }

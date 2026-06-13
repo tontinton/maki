@@ -80,6 +80,7 @@ pub async fn run(
         tool: Arc::clone(&tool_id),
         output: ToolOutput::Plain(msg),
         is_error: true,
+        annotation: None,
     };
 
     if let Some(entry) = entry {
@@ -132,7 +133,7 @@ pub async fn run(
         let result = invocation.execute(ctx).await;
 
         let elapsed = started.elapsed();
-        match result {
+        match result.output {
             Ok(output) => {
                 debug!(
                     tool = %name,
@@ -145,6 +146,7 @@ pub async fn run(
                     tool: tool_id,
                     output,
                     is_error: false,
+                    annotation: result.annotation,
                 }
             }
             Err(message) => {
@@ -215,6 +217,7 @@ async fn execute_mcp_tool(
         tool: Arc::clone(&tool_id),
         output: ToolOutput::Plain(output),
         is_error,
+        annotation: None,
     };
 
     if matches!(ctx.mode, AgentMode::Plan(_)) {

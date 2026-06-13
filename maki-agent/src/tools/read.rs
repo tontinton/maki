@@ -151,7 +151,7 @@ impl super::ToolInvocation for Read {
         super::HeaderFuture::Ready(super::HeaderResult::plain(Read::start_header(self)))
     }
     fn execute<'a>(self: Box<Self>, ctx: &'a super::ToolContext) -> super::ExecFuture<'a> {
-        Box::pin(async move { Read::execute(&self, ctx).await })
+        Box::pin(async move { Read::execute(&self, ctx).await.into() })
     }
 }
 

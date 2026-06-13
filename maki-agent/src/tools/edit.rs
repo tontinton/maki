@@ -82,7 +82,7 @@ impl super::ToolInvocation for Edit {
         ))))
     }
     fn execute<'a>(self: Box<Self>, ctx: &'a super::ToolContext) -> super::ExecFuture<'a> {
-        Box::pin(async move { Edit::execute(&self, ctx).await })
+        Box::pin(async move { Edit::execute(&self, ctx).await.into() })
     }
 }
 

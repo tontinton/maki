@@ -50,6 +50,7 @@ fn tool_done_updates_start_status(is_error: bool, expected: ToolStatus) {
         tool: "bash".into(),
         output: ToolOutput::Plain("output".into()),
         is_error,
+        annotation: None,
     });
 
     assert_eq!(panel.messages.len(), 1);
@@ -77,6 +78,7 @@ fn tool_done_sets_annotation(tool: &'static str, output: ToolOutput, expected: O
         tool: tool.into(),
         output,
         is_error: false,
+        annotation: None,
     });
     assert_eq!(panel.messages[0].annotation.as_deref(), expected);
 }
@@ -93,6 +95,7 @@ fn tool_done_annotation_merge(output: &str, expected: Option<&str>) {
         tool: BASH_TOOL_NAME.into(),
         output: ToolOutput::Plain(output.into()),
         is_error: false,
+        annotation: None,
     });
     assert_eq!(panel.messages[0].annotation.as_deref(), expected);
 }
@@ -117,6 +120,7 @@ fn tool_done_grep_shows_matches() {
         tool: GREP_TOOL_NAME.into(),
         output: grep_output(2),
         is_error: false,
+        annotation: None,
     });
     let text = &panel.messages[0].text;
     assert!(!text.contains('\n'), "grep body should not be in msg.text");
@@ -217,6 +221,7 @@ fn unknown_tool_id_is_noop() {
         tool: "bash".into(),
         output: ToolOutput::Plain("output".into()),
         is_error: false,
+        annotation: None,
     });
     assert!(panel.messages.is_empty());
 }
@@ -231,6 +236,7 @@ fn in_progress_tracking() {
         tool: "bash".into(),
         output: ToolOutput::Plain("ok".into()),
         is_error: false,
+        annotation: None,
     });
     assert_eq!(panel.in_progress_count(), 1);
 
@@ -239,6 +245,7 @@ fn in_progress_tracking() {
         tool: "read".into(),
         output: ToolOutput::Plain("ok".into()),
         is_error: false,
+        annotation: None,
     });
     assert_eq!(panel.in_progress_count(), 0);
 }
@@ -304,6 +311,7 @@ fn events_before_cache_built_render_correctly() {
         tool: "bash".into(),
         output: ToolOutput::Plain("result".into()),
         is_error: false,
+        annotation: None,
     });
     rebuild(&mut panel);
     assert!(seg_text(&panel, "t1").contains("early output"));
@@ -341,6 +349,7 @@ fn bash_live_output_with_code_input() {
         tool: BASH_TOOL_NAME.into(),
         output: ToolOutput::Plain("done".into()),
         is_error: false,
+        annotation: None,
     });
     let text = seg_text(&panel, "t1");
     assert!(text.contains("echo hello") && text.contains("done"));
@@ -356,6 +365,7 @@ fn cancel_in_progress_marks_pending_as_error(cache_built: bool) {
         tool: "bash".into(),
         output: ToolOutput::Plain("ok".into()),
         is_error: false,
+        annotation: None,
     });
     if cache_built {
         rebuild(&mut panel);
@@ -393,6 +403,7 @@ fn tool_done_after_cancel_in_progress_does_not_underflow() {
         tool: "bash".into(),
         output: ToolOutput::Plain("late".into()),
         is_error: false,
+        annotation: None,
     });
     assert_eq!(panel.in_progress_count(), 0);
     assert_eq!(msg_status(&panel, "t1"), ToolStatus::Success);
@@ -437,6 +448,7 @@ fn search_text_grep_result_includes_structured_output() {
         tool: "grep".into(),
         output: grep_output(2),
         is_error: false,
+        annotation: None,
     });
     rebuild(&mut panel);
     let text = seg_search(&panel, "t1");
@@ -457,6 +469,7 @@ fn search_text_diff_output_includes_hunks() {
             summary: "1 edit".into(),
         },
         is_error: false,
+        annotation: None,
     });
     rebuild(&mut panel);
     let text = seg_search(&panel, "t1");
@@ -472,6 +485,7 @@ fn search_text_bash_with_code_input() {
         tool: BASH_TOOL_NAME.into(),
         output: ToolOutput::Plain("hello".into()),
         is_error: false,
+        annotation: None,
     });
     rebuild(&mut panel);
     let text = seg_search(&panel, "t1");
@@ -558,6 +572,7 @@ fn batch_done(panel: &mut MessagesPanel, entries: Vec<BatchToolEntry>) {
             text: String::new(),
         },
         is_error: false,
+        annotation: None,
     });
 }
 
@@ -827,6 +842,7 @@ fn panel_with_long_tool(line_count: usize) -> MessagesPanel {
         tool: BASH_TOOL_NAME.into(),
         output: ToolOutput::Plain(body),
         is_error: false,
+        annotation: None,
     });
     render(&mut panel, 80, 24);
     panel
@@ -890,6 +906,7 @@ fn panel_with_grep_tool(match_count: usize) -> MessagesPanel {
         tool: GREP_TOOL_NAME.into(),
         output: ToolOutput::GrepResult { entries },
         is_error: false,
+        annotation: None,
     });
     render(&mut panel, 80, 24);
     panel
@@ -974,6 +991,7 @@ fn search_text_includes_truncated_bash_output() {
         tool: BASH_TOOL_NAME.into(),
         output: ToolOutput::Plain(full_output.clone()),
         is_error: false,
+        annotation: None,
     });
     rebuild(&mut panel);
     assert!(seg_search(&panel, "t1").contains(&full_output));
@@ -1010,6 +1028,7 @@ fn instruction_segment_has_spacer_before_it() {
         tool: "read".into(),
         output: read_code_with_instructions(instruction_blocks()),
         is_error: false,
+        annotation: None,
     });
     rebuild(&mut panel);
 
@@ -1055,6 +1074,7 @@ fn toggle_instruction_segment_expands_and_collapses() {
         tool: "read".into(),
         output: read_code_with_instructions(blocks),
         is_error: false,
+        annotation: None,
     });
     rebuild(&mut panel);
 
@@ -1085,6 +1105,7 @@ fn handle_click_returns_lua_tool_click_when_snapshot_exists() {
         tool: BASH_TOOL_NAME.into(),
         output: ToolOutput::Plain("output".into()),
         is_error: false,
+        annotation: None,
     });
     panel.tool_snapshot(
         "t1",
@@ -1165,6 +1186,7 @@ fn tool_done_removes_live_buf_and_snapshots_dirty() {
         tool: BASH_TOOL_NAME.into(),
         output: ToolOutput::Plain("output".into()),
         is_error: false,
+        annotation: None,
     });
 
     let msg = panel.find_tool_msg_mut("t1").unwrap();
@@ -1188,6 +1210,7 @@ fn tool_done_without_live_buf_preserves_existing_snapshot() {
         tool: BASH_TOOL_NAME.into(),
         output: ToolOutput::Plain("output".into()),
         is_error: false,
+        annotation: None,
     });
 
     let msg = panel.find_tool_msg_mut("t1").unwrap();
@@ -1209,6 +1232,7 @@ fn tool_done_clean_live_buf_does_not_snapshot() {
         tool: BASH_TOOL_NAME.into(),
         output: ToolOutput::Plain("output".into()),
         is_error: false,
+        annotation: None,
     });
 
     let msg = panel.find_tool_msg_mut("t1").unwrap();
@@ -1234,6 +1258,7 @@ fn bash_tool_with_snapshot(id: &str) -> MessagesPanel {
         tool: BASH_TOOL_NAME.into(),
         output: ToolOutput::Plain("output".into()),
         is_error: false,
+        annotation: None,
     });
     panel.tool_snapshot(
         id,

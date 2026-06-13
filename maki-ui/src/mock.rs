@@ -85,6 +85,7 @@ fn tool_done(id: &str, tool: &str, output: ToolOutput, is_error: bool) -> AgentE
         tool: tool.into(),
         output,
         is_error,
+        annotation: None,
     }))
 }
 

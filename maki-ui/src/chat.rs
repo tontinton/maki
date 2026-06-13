@@ -640,6 +640,7 @@ mod tests {
             tool: tool.into(),
             output,
             is_error: false,
+            annotation: None,
         }))
     }
 
