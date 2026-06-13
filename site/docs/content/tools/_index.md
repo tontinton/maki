@@ -23,7 +23,7 @@ Commands run in
 | `timeout` | integer | no | 120 | Timeout in seconds |
 | `workdir` | string | no | cwd | Working directory |
 
-### `read`
+### `read` *(lua plugin)*
 
 Read a file or directory. Returns contents with line numbers (1-indexed).
 

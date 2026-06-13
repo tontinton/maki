@@ -537,7 +537,6 @@ macro_rules! register_tools {
 }
 
 register_tools! {
-    read::Read,
     write::Write,
     edit::Edit,
     multiedit::MultiEdit,
@@ -924,7 +923,7 @@ mod tests {
     #[test]
     fn definitions_filtered_returns_only_requested() {
         let vars = Vars::new().set("{cwd}", "/tmp");
-        let filter = ToolFilter::Only(vec!["read".into()]);
+        let filter = ToolFilter::Only(vec!["write".into()]);
         let ctx = DescriptionContext { filter: &filter };
         let filtered = ToolRegistry::native().definitions(&vars, &ctx, true);
         let names: Vec<&str> = filtered
@@ -933,7 +932,7 @@ mod tests {
             .iter()
             .map(|d| d["name"].as_str().unwrap())
             .collect();
-        assert_eq!(names, ["read"]);
+        assert_eq!(names, ["write"]);
     }
 
     #[test_case("write",     |p: &str, _: &str| json!({"path": p, "content": "plan"})                          , |_: &str, o: &str| json!({"path": o, "content": "x"})                           ; "write")]

@@ -414,19 +414,18 @@ mod tests {
         smol::block_on(async {
             let dir = tempfile::TempDir::new().unwrap();
             let f = dir.path().join("a.txt");
-            std::fs::write(&f, "content").unwrap();
 
             let (entries, text) = run_batch(json!({
                 "tool_calls": [
-                    {"tool": "read", "parameters": {"path": f.to_str().unwrap()}},
-                    {"tool": "read", "parameters": {"path": "/nonexistent/path.txt"}}
+                    {"tool": "write", "parameters": {"path": f.to_str().unwrap(), "content": "content"}},
+                    {"tool": "write", "parameters": {"path": "/nonexistent/dir/path.txt", "content": "x"}}
                 ]
             }))
             .await;
             assert_eq!(entries.len(), 2);
             assert_eq!(entries[0].status, BatchToolStatus::Success);
             assert_eq!(entries[1].status, BatchToolStatus::Error);
-            assert!(text.contains("content"));
+            assert!(text.contains("wrote"));
         });
     }
 
@@ -469,7 +468,6 @@ mod tests {
         smol::block_on(async {
             let dir = tempfile::TempDir::new().unwrap();
             let f = dir.path().join("hello.txt");
-            std::fs::write(&f, "hello").unwrap();
 
             let (tx, rx) = flume::unbounded::<Envelope>();
             let event_tx = EventSender::new(tx, 0);
@@ -477,7 +475,7 @@ mod tests {
             execute_batch(
                 &ctx,
                 json!({
-                    "tool_calls": [{"tool": "read", "parameters": {"path": f.to_str().unwrap()}}]
+                    "tool_calls": [{"tool": "write", "parameters": {"path": f.to_str().unwrap(), "content": "hello"}}]
                 }),
             )
             .await;

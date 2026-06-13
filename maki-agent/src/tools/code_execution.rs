@@ -340,8 +340,6 @@ fn build_tool_input(args: &[Value], kwargs: &[(String, Value)]) -> Result<Value,
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
-
     use serde_json::json;
     use test_case::test_case;
 
@@ -355,16 +353,17 @@ mod tests {
         smol::block_on(async {
             let dir = tempfile::TempDir::new().unwrap();
             let path = dir.path().join("test.txt");
-            fs::write(&path, "line1\nline2\n").unwrap();
             let path_str = path.to_string_lossy();
 
             let ctx = stub_ctx(&AgentMode::Build);
             let ci = CodeExecution {
-                code: format!("result = await read(path='{path_str}')\nprint(result)"),
+                code: format!(
+                    "result = await write(path='{path_str}', content='hello')\nprint(result)"
+                ),
                 timeout: None,
             };
             let output = ci.execute(&ctx).await.unwrap().as_text();
-            assert!(output.contains("line1"));
+            assert!(output.contains("wrote"));
         });
     }
 
