@@ -31,6 +31,7 @@ use crate::components::help_modal::HelpModal;
 use crate::components::input::{InputAction, InputBox, Submission};
 use crate::components::keybindings::key;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
+use crate::components::login_picker::{LoginPicker, LoginPickerAction};
 use crate::components::lua_float::FloatManager;
 use crate::components::mcp_picker::{McpPicker, McpPickerAction};
 use crate::components::model_picker::{ModelPicker, ModelPickerAction};
@@ -137,6 +138,7 @@ pub struct App {
     pub(super) task_picker_original: Option<usize>,
     pub(super) theme_picker: ThemePicker,
     pub(super) model_picker: ModelPicker,
+    pub(super) login_picker: LoginPicker,
     pub(super) mcp_picker: McpPicker,
     pub(super) session_picker: SessionPicker,
     pub(super) rewind_picker: RewindPicker,
@@ -211,6 +213,7 @@ impl App {
             task_picker_original: None,
             theme_picker: ThemePicker::new(),
             model_picker: ModelPicker::new(available_models),
+            login_picker: LoginPicker::new(),
             mcp_picker: McpPicker::new(mcp_reader, mcp_config_errors),
             session_picker: SessionPicker::new(),
             rewind_picker: RewindPicker::new(),
@@ -615,6 +618,19 @@ impl App {
                     vec![Action::AssignTier(spec, tier)]
                 }
                 ModelPickerAction::Close => vec![],
+            });
+        }
+
+        if self.login_picker.is_open() {
+            return Some(match self.login_picker.handle_key(key) {
+                LoginPickerAction::Consumed => vec![],
+                LoginPickerAction::Close => vec![],
+                LoginPickerAction::Authenticated { model_spec } => {
+                    vec![Action::ChangeModel(model_spec), Action::RefreshModels]
+                }
+                LoginPickerAction::Configured { slug } => {
+                    vec![Action::RefreshProvider { slug }, Action::RefreshModels]
+                }
             });
         }
 
@@ -1091,6 +1107,10 @@ impl App {
                 self.mcp_picker.open();
                 vec![]
             }
+            "/login" => {
+                self.login_picker.open(self.storage.clone());
+                vec![]
+            }
             "/cd" => self.cmd_cd(&cmd.args),
             "/yolo" => {
                 let enabled = self.permissions.toggle_yolo();
@@ -1273,7 +1293,7 @@ impl App {
         vec![]
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 12] {
+    fn overlays(&self) -> [&dyn Overlay; 13] {
         [
             &self.help_modal,
             &self.btw_modal,
@@ -1285,12 +1305,13 @@ impl App {
             &self.rewind_picker,
             &self.theme_picker,
             &self.model_picker,
+            &self.login_picker,
             &self.mcp_picker,
             &self.permission_prompt,
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 12] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 13] {
         [
             &mut self.help_modal,
             &mut self.btw_modal,
@@ -1302,6 +1323,7 @@ impl App {
             &mut self.rewind_picker,
             &mut self.theme_picker,
             &mut self.model_picker,
+            &mut self.login_picker,
             &mut self.mcp_picker,
             &mut self.permission_prompt,
         ]
@@ -1378,6 +1400,7 @@ impl App {
         try_picker!(self.theme_picker);
         try_picker!(self.model_picker);
         try_picker!(self.mcp_picker);
+        try_picker!(self.login_picker);
         if !self.is_main_chat() {
             return;
         }

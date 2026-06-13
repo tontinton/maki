@@ -7,6 +7,7 @@ pub(crate) mod help_modal;
 pub mod input;
 pub mod keybindings;
 pub(crate) mod list_picker;
+pub(crate) mod login_picker;
 pub(crate) mod lua_float;
 pub(crate) mod mcp_picker;
 pub mod messages;
@@ -188,7 +189,11 @@ pub enum Action {
     NewSession,
     LoadSession(Box<LoadedSession>),
     ChangeModel(String),
+    RefreshProvider {
+        slug: String,
+    },
     AssignTier(String, ModelTier),
+    RefreshModels,
     Compact,
     ToggleMcp(String, bool),
     OpenEditor(PathBuf),

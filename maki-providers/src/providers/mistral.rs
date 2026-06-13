@@ -41,7 +41,7 @@ inventory::submit!(maki_config::providers::BuiltInProvider {
                 display_name: "Vibe / Coding",
                 base_url: "https://api.mistral.ai/v1",
                 default_model: Some("mistral/mistral-vibe-cli-latest"),
-                login_url: None,
+                login_url: Some("https://console.mistral.ai/codestral/cli"),
             }
         ),
     ]),

@@ -68,6 +68,11 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         max_args: 0,
     },
     BuiltinCommand {
+        name: "/login",
+        description: "Authenticate with an LLM provider",
+        max_args: 0,
+    },
+    BuiltinCommand {
         name: "/cd",
         description: "Change working directory",
         max_args: 1,

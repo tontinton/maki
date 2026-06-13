@@ -235,6 +235,7 @@ impl App {
         render_if_open!(self.rewind_picker);
         render_if_open!(self.theme_picker);
         render_if_open!(self.model_picker);
+        render_if_open!(self.login_picker);
         render_if_open!(self.mcp_picker);
 
         overlay_rect
