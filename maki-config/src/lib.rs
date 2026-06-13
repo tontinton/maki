@@ -66,6 +66,7 @@ pub const DEFAULT_BUILTINS: &[&str] = &[
     "memory",
     "question",
     "skill",
+    "todo_write",
     "webfetch",
     "websearch",
 ];

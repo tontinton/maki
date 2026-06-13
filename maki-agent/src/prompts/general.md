@@ -18,7 +18,6 @@ You must NEVER generate or guess URLs unless they are for helping the user with 
 - Read files before editing them. Look at surrounding context and imports to match conventions.
 - Prefer edit/multiedit over write; targeted edits use far fewer tokens.
 - NEVER create files unless absolutely necessary. Prefer editing existing files.
-- Use todo_write to plan and track multi-step tasks (must be 3+ steps). Update after EACH step.
 {{tool_usage}}
 
 {{efficient_tools}}

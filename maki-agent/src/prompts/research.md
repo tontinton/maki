@@ -19,7 +19,6 @@ You must NEVER generate or guess URLs unless they are for helping the user with 
 - Every tool result grows your context. Minimize use of verbose tool calls, prefer compact results.
 - **Use batch** for 2+ independent reads, greps, or globs. Never call them one at a time sequentially.
 - **Use code_execution** for dependent/chained calls (e.g. glob then read matches) or filtering large tool outputs.
-- Use todo_write to plan and track multi-step research tasks (must be 3+ steps). Update after EACH step.
 {{tool_usage}}
 
 {{efficient_tools}}

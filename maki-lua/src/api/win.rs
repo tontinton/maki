@@ -20,12 +20,13 @@ impl WinHandle {
         cmd_tx: flume::Sender<WinCommand>,
         init_width: u16,
         init_height: u16,
+        visible: bool,
     ) -> Self {
         Self {
             event_rx,
             cmd_tx,
             closed: false,
-            visible: true,
+            visible,
             init_width,
             init_height,
         }
@@ -198,7 +199,7 @@ mod tests {
     ) {
         let (event_tx, event_rx) = flume::bounded::<WinEvent>(8);
         let (cmd_tx, cmd_rx) = flume::bounded::<WinCommand>(8);
-        let handle = WinHandle::new(event_rx, cmd_tx, 80, 24);
+        let handle = WinHandle::new(event_rx, cmd_tx, 80, 24, true);
         (event_tx, cmd_rx, handle)
     }
 
@@ -233,7 +234,7 @@ mod tests {
     fn close_does_not_panic_when_receiver_dropped() {
         let (event_tx, event_rx) = flume::bounded::<WinEvent>(8);
         let (cmd_tx, cmd_rx) = flume::bounded::<WinCommand>(8);
-        let mut handle = WinHandle::new(event_rx, cmd_tx, 80, 24);
+        let mut handle = WinHandle::new(event_rx, cmd_tx, 80, 24, true);
         drop(cmd_rx);
         handle.close();
         assert!(handle.closed);

@@ -246,7 +246,7 @@ pub(crate) fn create_ui_table(
                         cmd_rx,
                     });
 
-                    Ok(WinHandle::new(event_rx, cmd_tx, est_w, est_h))
+                    Ok(WinHandle::new(event_rx, cmd_tx, est_w, est_h, visible))
                 },
             )?,
         )?;
