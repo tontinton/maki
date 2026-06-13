@@ -1,3 +1,4 @@
+pub(crate) mod autocmd;
 mod async_api;
 pub(crate) mod buf;
 pub(crate) mod command;
@@ -35,13 +36,12 @@ pub(crate) fn create_maki_global(
 ) -> LuaResult<Table> {
     let maki = lua.create_table()?;
 
-    maki.set(
-        "api",
-        tool::create_api_table(lua, pending, Arc::clone(&plugin))?,
-    )?;
+    let api = tool::create_api_table(lua, pending, Arc::clone(&plugin))?;
+    autocmd::add_autocmd_methods(&api, lua, Arc::clone(&plugin))?;
+    maki.set("api", api)?;
     maki.set("env", env::create_env_table(lua, permissions)?)?;
     maki.set("fs", fs::create_fs_table(lua, permissions)?)?;
-    maki.set("log", log::create_log_table(lua, plugin)?)?;
+    maki.set("log", log::create_log_table(lua, Arc::clone(&plugin))?)?;
     maki.set("treesitter", treesitter::create_treesitter_table(lua)?)?;
     maki.set("uv", uv::create_uv_table(lua, permissions)?)?;
     maki.set("json", json::create_json_table(lua)?)?;

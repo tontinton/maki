@@ -320,6 +320,13 @@ impl EventHandle {
     pub fn send_restore_complete(&self, flag: Arc<AtomicBool>) {
         let _ = self.tx.send(Request::RestoreComplete { flag });
     }
+
+    pub fn fire_autocmd(&self, event: &str, data: serde_json::Value) {
+        let _ = self.tx.try_send(Request::FireAutocmd {
+            event: event.to_owned(),
+            data,
+        });
+    }
 }
 
 #[cfg(test)]

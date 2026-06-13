@@ -988,12 +988,14 @@ impl App {
         if chat_idx == 0 {
             match result {
                 ChatEventResult::Done => {
-                    self.chats[0].todo_panel.on_turn_done();
                     self.status_bar.clear_flash();
                     self.save_session();
                     self.chat_index.clear();
                     self.subagent_answers.clear();
                     self.status = Status::Idle;
+                    if let Some(ref handle) = self.lua_event_handle {
+                        handle.fire_autocmd("TurnEnd", serde_json::json!({}));
+                    }
                     if self.exit_on_done {
                         self.exit_request = ExitRequest::Success;
                     }
@@ -1007,6 +1009,9 @@ impl App {
                     self.finish_subagents(DisplayRole::Error, ERROR_TEXT);
                     for chat in &mut self.chats {
                         chat.fail_in_progress_with_message(message.clone());
+                    }
+                    if let Some(ref handle) = self.lua_event_handle {
+                        handle.fire_autocmd("TurnError", serde_json::json!({ "message": message }));
                     }
                     if self.exit_on_done {
                         self.exit_request = ExitRequest::Error;

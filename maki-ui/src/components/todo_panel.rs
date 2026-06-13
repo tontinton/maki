@@ -79,6 +79,7 @@ impl TodoPanel {
         };
     }
 
+    #[allow(dead_code)]
     pub fn on_turn_done(&mut self) {
         self.reset();
     }

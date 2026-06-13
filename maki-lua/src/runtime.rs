@@ -24,6 +24,7 @@ use maki_config::RawConfig;
 use crate::api::buf::{BufHandle, BufferStore};
 use crate::api::command::{CommandHandlerMap, publish_command_snapshot};
 use crate::api::command::{LuaCommandReader, LuaCommandWriter, UiAction};
+use crate::api::autocmd::AutocmdStore;
 use crate::api::create_maki_global;
 use crate::api::ctx::LuaCtx;
 use crate::api::fn_api::{JobEvent, JobStore};
@@ -120,6 +121,10 @@ pub enum Request {
     },
     RestoreComplete {
         flag: Arc<AtomicBool>,
+    },
+    FireAutocmd {
+        event: String,
+        data: Value,
     },
 }
 
@@ -607,6 +612,7 @@ impl LuaRuntime {
         lua.set_app_data(SpawnQueue::default());
         lua.set_app_data(command_writer);
         lua.set_app_data(PromptHintCallbacks::default());
+        lua.set_app_data(AutocmdStore::default());
 
         Ok(Self {
             lua,
@@ -1016,6 +1022,13 @@ impl LuaRuntime {
     fn clear_plugin(&mut self, plugin: &str) {
         self.registry.clear_plugin(plugin);
         self.drop_plugin_keys(plugin);
+        if let Some(mut store) = self.lua.app_data_mut::<AutocmdStore>() {
+            let keys = store.clear_plugin(plugin);
+            drop(store);
+            for key in keys {
+                let _ = self.lua.remove_registry_value(key);
+            }
+        }
     }
 
     /// The sync sibling of [`run_detached`]: runs a synchronous system callback
@@ -1659,6 +1672,47 @@ pub fn spawn(
                         }
                         Request::RestoreComplete { flag } => {
                             flag.store(false, Ordering::Relaxed);
+                        }
+                        Request::FireAutocmd { event, data } => {
+                            let entries = {
+                                let mut store = match rt.lua.app_data_mut::<AutocmdStore>() {
+                                    Some(s) => s,
+                                    None => continue,
+                                };
+                                let Some(list) = store.listeners.get_mut(&event) else {
+                                    continue;
+                                };
+                                std::mem::take(list)
+                            };
+                            let ctx_table = rt.lua.create_table().ok();
+                            if let Some(ref tbl) = ctx_table
+                                && let Some(obj) = data.as_object()
+                            {
+                                for (k, v) in obj {
+                                    let _ = tbl.set(k.as_str(), json_to_lua(&rt.lua, v).unwrap_or(LuaValue::Nil));
+                                }
+                            }
+                            let mut keep = Vec::with_capacity(entries.len());
+                            for entry in entries {
+                                let once = entry.once;
+                                if let Ok(func) = rt.lua.registry_value::<Function>(&entry.callback) {
+                                    let arg = ctx_table.as_ref().map(|t| LuaValue::Table(t.clone())).unwrap_or(LuaValue::Nil);
+                                    if let Err(e) = rt.call_sync_detached::<()>(&func, arg) {
+                                        tracing::warn!(event = %event, plugin = %entry.plugin, error = %e, "autocmd callback failed");
+                                    }
+                                }
+                                if once {
+                                    let _ = rt.lua.remove_registry_value(entry.callback);
+                                } else {
+                                    keep.push(entry);
+                                }
+                            }
+                            if !keep.is_empty()
+                                && let Some(mut store) = rt.lua.app_data_mut::<AutocmdStore>()
+                            {
+                                store.listeners.entry(event).or_default().extend(keep);
+                            }
+                            drain_spawn_queue(&rt.lua, &ex, &gate);
                         }
                     }
                 }

@@ -142,6 +142,9 @@ impl App {
     /// frame, so the user sees their message land where it will stay.
     pub(super) fn start_from_queue(&mut self, msg: &QueuedMessage) -> Vec<super::Action> {
         self.status = super::Status::Streaming;
+        if let Some(ref handle) = self.lua_event_handle {
+            handle.fire_autocmd("TurnStart", serde_json::json!({}));
+        }
         self.main_chat()
             .show_user_message(format_with_images(&msg.text, msg.images.len()));
         vec![super::Action::SendMessage(Box::new(
