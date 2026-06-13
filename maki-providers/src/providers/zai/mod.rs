@@ -69,7 +69,22 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             context_window: 200_000,
         },
         ModelEntry {
-            prefixes: &["glm-5"],
+            prefixes: &["glm-5.2"],
+            tier: ModelTier::Strong,
+            family: ModelFamily::Glm,
+            default: false,
+            pricing: ModelPricing {
+                input: 1.00,
+                output: 3.20,
+                cache_write: 0.00,
+                cache_read: 0.20,
+                fast: None,
+            },
+            max_output_tokens: 131072,
+            context_window: 1_000_000,
+        },
+        ModelEntry {
+            prefixes: &["glm-5.1", "glm-5"],
             tier: ModelTier::Strong,
             family: ModelFamily::Glm,
             default: false,

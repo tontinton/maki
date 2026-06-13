@@ -357,8 +357,18 @@ pub async fn fetch_all_models(mut on_ready: impl FnMut(ModelBatch)) {
                             .unwrap()
                             .set_known_models(kind, ids.clone());
                     }
+                    let mut models: Vec<String> =
+                        ids.into_iter().map(|id| format!("{kind}/{id}")).collect();
+                    for entry in models_for_provider(kind) {
+                        for prefix in entry.prefixes {
+                            let spec = format!("{kind}/{prefix}");
+                            if !models.contains(&spec) {
+                                models.push(spec);
+                            }
+                        }
+                    }
                     ModelBatch {
-                        models: ids.into_iter().map(|id| format!("{kind}/{id}")).collect(),
+                        models,
                         warnings: Vec::new(),
                     }
                 }
