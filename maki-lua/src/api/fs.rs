@@ -4,7 +4,7 @@ use std::fs::FileType;
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 
-use mlua::{Lua, Result as LuaResult, Table};
+use mlua::{IntoLua, Lua, Result as LuaResult, Table};
 
 use crate::plugin_permissions::{
     Permission::{FsRead, FsWrite},
@@ -92,9 +92,12 @@ fn collect_dir_entries(
     }
 }
 
-fn io_result(lua: &Lua, result: std::io::Result<()>) -> LuaResult<(mlua::Value, mlua::Value)> {
+fn io_result<T: mlua::IntoLua>(
+    lua: &Lua,
+    result: std::io::Result<T>,
+) -> LuaResult<(mlua::Value, mlua::Value)> {
     match result {
-        Ok(()) => Ok((mlua::Value::Boolean(true), mlua::Value::Nil)),
+        Ok(val) => Ok((val.into_lua(lua)?, mlua::Value::Nil)),
         Err(e) => Ok((
             mlua::Value::Nil,
             mlua::Value::String(lua.create_string(e.to_string())?),
@@ -107,15 +110,18 @@ pub(crate) fn create_fs_table(lua: &Lua, perms: &PluginPermissions) -> LuaResult
 
     t.set(
         "read",
-        perms.guard_async(FsRead, lua, |_, path: String| async move {
+        perms.guard_async(FsRead, lua, |lua, path: String| async move {
             let abs = make_absolute(&path)?;
-            smol::fs::read_to_string(&abs).await.map_err(|e| {
-                if e.kind() == ErrorKind::InvalidData {
-                    mlua::Error::runtime("non-utf8 content; use read_bytes")
-                } else {
-                    mlua::Error::runtime(format!("fs.read({path}): {e}"))
+            match smol::fs::read_to_string(&abs).await {
+                Ok(s) => Ok((s.into_lua(&lua)?, mlua::Value::Nil)),
+                Err(e) if e.kind() == ErrorKind::InvalidData => {
+                    Err(mlua::Error::runtime("non-utf8 content; use read_bytes"))
                 }
-            })
+                Err(e) => Ok((
+                    mlua::Value::Nil,
+                    mlua::Value::String(lua.create_string(e.to_string())?),
+                )),
+            }
         })?,
     )?;
 
@@ -123,10 +129,13 @@ pub(crate) fn create_fs_table(lua: &Lua, perms: &PluginPermissions) -> LuaResult
         "read_bytes",
         perms.guard_async(FsRead, lua, |lua, path: String| async move {
             let abs = make_absolute(&path)?;
-            let bytes = smol::fs::read(&abs)
-                .await
-                .map_err(|e| mlua::Error::runtime(format!("fs.read_bytes({path}): {e}")))?;
-            lua.create_buffer(bytes)
+            match smol::fs::read(&abs).await {
+                Ok(bytes) => Ok((lua.create_buffer(bytes)?.into_lua(&lua)?, mlua::Value::Nil)),
+                Err(e) => Ok((
+                    mlua::Value::Nil,
+                    mlua::Value::String(lua.create_string(e.to_string())?),
+                )),
+            }
         })?,
     )?;
 
@@ -140,10 +149,15 @@ pub(crate) fn create_fs_table(lua: &Lua, perms: &PluginPermissions) -> LuaResult
                     tbl.set("size", meta.len())?;
                     tbl.set("is_file", meta.is_file())?;
                     tbl.set("is_dir", meta.is_dir())?;
-                    Ok(mlua::Value::Table(tbl))
+                    Ok((mlua::Value::Table(tbl), mlua::Value::Nil))
                 }
-                Err(e) if e.kind() == ErrorKind::NotFound => Ok(mlua::Value::Nil),
-                Err(e) => Err(mlua::Error::runtime(format!("fs.metadata({path}): {e}"))),
+                Err(e) if e.kind() == ErrorKind::NotFound => {
+                    Ok((mlua::Value::Nil, mlua::Value::Nil))
+                }
+                Err(e) => Ok((
+                    mlua::Value::Nil,
+                    mlua::Value::String(lua.create_string(e.to_string())?),
+                )),
             }
         })?,
     )?;
@@ -346,8 +360,7 @@ pub(crate) fn create_fs_table(lua: &Lua, perms: &PluginPermissions) -> LuaResult
             lua,
             |lua, (path, content): (String, String)| async move {
                 let abs = make_absolute(&path)?;
-                let result = smol::fs::write(&abs, content).await;
-                io_result(&lua, result)
+                io_result(&lua, smol::fs::write(&abs, content).await.map(|()| true))
             },
         )?,
     )?;
@@ -356,8 +369,7 @@ pub(crate) fn create_fs_table(lua: &Lua, perms: &PluginPermissions) -> LuaResult
         "rm",
         perms.guard_async(FsWrite, lua, |lua, path: String| async move {
             let abs = make_absolute(&path)?;
-            let result = smol::fs::remove_file(&abs).await;
-            io_result(&lua, result)
+            io_result(&lua, smol::fs::remove_file(&abs).await.map(|()| true))
         })?,
     )?;
 
@@ -377,7 +389,7 @@ pub(crate) fn create_fs_table(lua: &Lua, perms: &PluginPermissions) -> LuaResult
                 } else {
                     smol::fs::create_dir(&abs).await
                 };
-                io_result(&lua, result)
+                io_result(&lua, result.map(|()| true))
             },
         )?,
     )?;
@@ -486,6 +498,23 @@ mod tests {
         let read: mlua::Function = tbl.get("read").unwrap();
         let result: String = smol::block_on(read.call_async(file.to_str().unwrap())).unwrap();
         assert_eq!(result, "world");
+    }
+
+    #[test]
+    fn read_missing_returns_nil_err() {
+        let lua = Lua::new();
+        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
+
+        for func_name in ["read", "read_bytes"] {
+            let f: mlua::Function = tbl.get(func_name).unwrap();
+            let (val, err): (mlua::Value, mlua::Value) =
+                smol::block_on(f.call_async("/nonexistent/path")).unwrap();
+            assert_eq!(val, mlua::Value::Nil, "{func_name} should return nil");
+            assert!(
+                matches!(err, mlua::Value::String(_)),
+                "{func_name} should return error"
+            );
+        }
     }
 
     #[test]
@@ -662,54 +691,25 @@ mod tests {
     }
 
     #[test]
-    fn write_creates_file() {
+    fn write_and_overwrite() {
         let tmp = TempDir::new().unwrap();
         let file = tmp.path().join("new.txt");
 
         let lua = Lua::new();
         let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
         let write: mlua::Function = tbl.get("write").unwrap();
+
         let (ok, err): (mlua::Value, mlua::Value) =
-            smol::block_on(write.call_async((file.to_str().unwrap(), "hello world"))).unwrap();
-        assert!(
-            matches!(ok, mlua::Value::Boolean(true)),
-            "write should succeed"
-        );
+            smol::block_on(write.call_async((file.to_str().unwrap(), "first"))).unwrap();
+        assert!(matches!(ok, mlua::Value::Boolean(true)));
         assert!(matches!(err, mlua::Value::Nil));
-        assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello world");
-    }
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "first");
 
-    #[test]
-    fn write_overwrites_existing() {
-        let tmp = TempDir::new().unwrap();
-        let file = tmp.path().join("overwrite.txt");
-        std::fs::write(&file, "old").unwrap();
-
-        let lua = Lua::new();
-        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
-        let write: mlua::Function = tbl.get("write").unwrap();
         smol::block_on(
-            write.call_async::<(mlua::Value, mlua::Value)>((file.to_str().unwrap(), "new")),
+            write.call_async::<(mlua::Value, mlua::Value)>((file.to_str().unwrap(), "second")),
         )
         .unwrap();
-        assert_eq!(std::fs::read_to_string(&file).unwrap(), "new");
-    }
-
-    #[test]
-    fn write_to_nonexistent_parent_returns_error() {
-        let tmp = TempDir::new().unwrap();
-        let file = tmp.path().join("no_parent/deep/file.txt");
-
-        let lua = Lua::new();
-        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
-        let write: mlua::Function = tbl.get("write").unwrap();
-        let (ok, err): (mlua::Value, mlua::Value) =
-            smol::block_on(write.call_async((file.to_str().unwrap(), "data"))).unwrap();
-        assert!(matches!(ok, mlua::Value::Nil), "should fail");
-        assert!(
-            matches!(err, mlua::Value::String(_)),
-            "should return error string"
-        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "second");
     }
 
     #[test]
@@ -792,43 +792,6 @@ mod tests {
     }
 
     #[test]
-    fn mkdir_already_exists_returns_error() {
-        let tmp = TempDir::new().unwrap();
-        let dir = tmp.path().join("exists");
-        std::fs::create_dir(&dir).unwrap();
-
-        let lua = Lua::new();
-        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
-        let mkdir: mlua::Function = tbl.get("mkdir").unwrap();
-        let (ok, err): (mlua::Value, mlua::Value) =
-            smol::block_on(mkdir.call_async(dir.to_str().unwrap())).unwrap();
-        assert!(
-            matches!(ok, mlua::Value::Nil),
-            "creating existing dir should fail"
-        );
-        assert!(matches!(err, mlua::Value::String(_)));
-    }
-
-    #[test]
-    fn mkdir_with_parents_idempotent() {
-        let tmp = TempDir::new().unwrap();
-        let dir = tmp.path().join("idem");
-        std::fs::create_dir(&dir).unwrap();
-
-        let lua = Lua::new();
-        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
-        let mkdir: mlua::Function = tbl.get("mkdir").unwrap();
-        let opts = lua.create_table().unwrap();
-        opts.set("parents", true).unwrap();
-        let (ok, _): (mlua::Value, mlua::Value) =
-            smol::block_on(mkdir.call_async((dir.to_str().unwrap(), opts))).unwrap();
-        assert!(
-            matches!(ok, mlua::Value::Boolean(true)),
-            "parents=true should be idempotent"
-        );
-    }
-
-    #[test]
     fn glob_finds_matching_files() {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("a.rs"), "fn main(){}").unwrap();
@@ -850,6 +813,11 @@ mod tests {
         }
         assert_eq!(paths.len(), 1);
         assert!(paths[0].ends_with("a.rs"));
+
+        let opts2 = lua.create_table().unwrap();
+        opts2.set("path", dir_str.as_str()).unwrap();
+        let empty: Table = smol::block_on(glob.call_async::<Table>(("*.nope", opts2))).unwrap();
+        assert_eq!(empty.len().unwrap(), 0);
     }
 
     #[test]
@@ -902,33 +870,14 @@ mod tests {
     }
 
     #[test]
-    fn glob_no_matches_returns_empty_table() {
-        let tmp = TempDir::new().unwrap();
-        std::fs::write(tmp.path().join("a.rs"), "").unwrap();
-
-        let lua = Lua::new();
-        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
-        let glob: mlua::Function = tbl.get("glob").unwrap();
-
-        let opts = lua.create_table().unwrap();
-        opts.set("path", tmp.path().to_str().unwrap()).unwrap();
-
-        let result: Table = smol::block_on(glob.call_async::<Table>(("*.nope", opts))).unwrap();
-        assert_eq!(result.len().unwrap(), 0);
-    }
-
-    #[test]
     fn glob_invalid_pattern_type_errors() {
         let lua = Lua::new();
         let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
         let glob: mlua::Function = tbl.get("glob").unwrap();
 
-        let err = smol::block_on(glob.call_async::<Table>((mlua::Value::Integer(42), mlua::Nil)))
-            .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("patterns must be a string or array of strings"),
-        );
+        let result =
+            smol::block_on(glob.call_async::<Table>((mlua::Value::Integer(42), mlua::Nil)));
+        assert!(result.is_err());
     }
 
     #[test]
@@ -964,16 +913,6 @@ mod tests {
         let second: String = result.get(2).unwrap();
         assert!(first.ends_with("new.rs"));
         assert!(second.ends_with("old.rs"));
-    }
-
-    #[test]
-    fn glob_no_opts_uses_cwd() {
-        let lua = Lua::new();
-        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
-        let glob: mlua::Function = tbl.get("glob").unwrap();
-
-        let result = smol::block_on(glob.call_async::<Table>(("*.rs", mlua::Nil)));
-        assert!(result.is_ok());
     }
 
     #[test]

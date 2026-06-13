@@ -182,9 +182,9 @@ Return a compact overview of a source file: imports, type definitions, function 
         .. "). Use read with offset/limit instead."
     end
 
-    local ok, source = pcall(maki.fs.read, path)
-    if not ok then
-      return "error: " .. tostring(source)
+    local source, err = maki.fs.read(path)
+    if not source then
+      return "error: " .. err
     end
 
     local skeleton, err = indexer.index_source(source, lang)

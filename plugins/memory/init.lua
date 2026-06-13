@@ -83,9 +83,9 @@ local function cmd_view(path, dir, ctx)
   if not file_path then
     return nil, err
   end
-  local ok, content = pcall(maki.fs.read, file_path)
-  if not ok then
-    return nil, "read error: " .. tostring(content)
+  local content, err = maki.fs.read(file_path)
+  if not content then
+    return nil, "read error: " .. err
   end
   return {
     llm_output = content,
