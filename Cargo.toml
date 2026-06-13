@@ -38,6 +38,7 @@ thiserror = { workspace = true }
 libc = { workspace = true }
 uuid = { workspace = true }
 flume = { workspace = true }
+open = { workspace = true }
 
 [dev-dependencies]
 test-case = { workspace = true }
@@ -166,6 +167,7 @@ shell-words = "1"
 agent-client-protocol-schema = "0.13"
 
 wait-timeout = "0.2"
+inventory = "0.3"
 
 [profile.bench]
 debug = true

@@ -13,6 +13,8 @@ use tracing::warn;
 const PROJECT_DIR: &str = ".maki";
 const PERMISSIONS_FILE: &str = "permissions.toml";
 
+pub mod providers;
+
 pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 50 * 1024;
 pub const DEFAULT_MAX_OUTPUT_LINES: usize = 2000;
 pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 5 * 1024 * 1024;

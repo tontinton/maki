@@ -42,6 +42,11 @@ pub struct McpAuthData {
     pub redirect_uri: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderCredentials {
+    pub api_key: String,
+}
+
 pub fn now_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -116,6 +121,22 @@ pub fn save_mcp_auth(
 
 pub fn delete_mcp_auth(dir: &StateDir, server_name: &str) -> Result<bool, StorageError> {
     delete_auth(&auth_path(dir, &format!("mcp-{server_name}")))
+}
+
+pub fn load_provider_credentials(dir: &StateDir, slug: &str) -> Option<ProviderCredentials> {
+    load_auth(&auth_path(dir, slug))
+}
+
+pub fn save_provider_credentials(
+    dir: &StateDir,
+    slug: &str,
+    creds: &ProviderCredentials,
+) -> Result<(), StorageError> {
+    save_auth(&auth_path(dir, slug), creds)
+}
+
+pub fn delete_provider_credentials(dir: &StateDir, slug: &str) -> Result<bool, StorageError> {
+    delete_auth(&auth_path(dir, slug))
 }
 
 #[cfg(test)]
