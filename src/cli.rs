@@ -239,16 +239,18 @@ pub enum McpAction {
 
 #[derive(Subcommand)]
 pub enum AuthAction {
-    /// Authenticate with a provider
+    /// Authenticate with a provider (interactive if no provider specified)
     Login {
-        /// Provider slug (e.g. openai)
-        provider: String,
+        /// Provider slug (e.g. zai, openai). Omit for interactive selection.
+        provider: Option<String>,
     },
     /// Remove stored credentials for a provider
     Logout {
         /// Provider slug (e.g. openai)
         provider: String,
     },
+    /// Show authentication status for all providers
+    Status,
 }
 
 pub fn normalize_tool_name(name: &str) -> Result<String> {

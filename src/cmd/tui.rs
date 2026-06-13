@@ -118,7 +118,16 @@ pub fn run(cli: Cli) -> Result<()> {
         stream: config.provider.stream_timeout,
     };
 
-    let model = setup::resolve_model(cli.model.as_deref(), &config.provider, &storage)?;
+    let model_result = setup::resolve_model(cli.model.as_deref(), &config.provider, &storage);
+    let (model, needs_login) = match model_result {
+        Ok(m) => (m, false),
+        Err(_) if !cli.print => {
+            let fallback =
+                Model::from_spec("anthropic/claude-sonnet-4-20250514").expect("fallback model");
+            (fallback, true)
+        }
+        Err(e) => return Err(e),
+    };
 
     setup::init_logging(&storage, &config.storage);
     setup::install_panic_log_hook();
@@ -179,6 +188,7 @@ pub fn run(cli: Cli) -> Result<()> {
         let (session_id, exit_code) = maki_ui::run(
             maki_ui::EventLoopParams {
                 model,
+                needs_login,
                 commands,
                 session,
                 storage,
