@@ -21,19 +21,19 @@ use serde_json::Value;
 
 use maki_config::RawConfig;
 
+use crate::api::autocmd::AutocmdStore;
 use crate::api::buf::{BufHandle, BufferStore};
 use crate::api::command::{CommandHandlerMap, HintWriter, publish_command_snapshot};
 use crate::api::command::{LuaCommandReader, LuaCommandWriter, UiAction};
-use crate::api::keymap::KeymapReader;
-use crate::api::ui::HintStore;
-use crate::api::autocmd::AutocmdStore;
-use crate::api::keymap::{KeymapStore, KeymapWriter};
 use crate::api::create_maki_global;
 use crate::api::ctx::LuaCtx;
 use crate::api::fn_api::{JobEvent, JobStore};
 use crate::api::json_to_lua;
+use crate::api::keymap::KeymapReader;
+use crate::api::keymap::{KeymapStore, KeymapWriter};
 use crate::api::setup::ConfigStore;
 use crate::api::tool::{LuaOutputFormat, LuaTool, PendingTool, PendingTools, ToolCallReply};
+use crate::api::ui::HintStore;
 use crate::error::PluginError;
 use crate::plugin_permissions::{PluginPermissions, load_plugin_permissions};
 

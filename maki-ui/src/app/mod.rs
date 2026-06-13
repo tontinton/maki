@@ -457,6 +457,13 @@ impl App {
             self.active_chat().enable_auto_scroll();
             return Some(vec![]);
         }
+        if key::PLAN_TOGGLE.matches(key)
+            && self.state.mode == Mode::Plan
+            && self.state.plan.is_ready()
+        {
+            self.plan_form.toggle();
+            return Some(vec![]);
+        }
         None
     }
 
@@ -662,10 +669,6 @@ impl App {
         if !self.is_main_chat() {
             return match key.code {
                 KeyCode::Tab if !self.is_bash_input() => self.toggle_mode(),
-                _ if key::TODO_PANEL.matches(key) => {
-                    self.chats[self.active_chat].todo_panel.toggle();
-                    vec![]
-                }
                 _ => vec![],
             };
         }
@@ -701,11 +704,6 @@ impl App {
                         vec![]
                     }
                 };
-            } else if key::TODO_PANEL.matches(key) {
-                match self.state.mode {
-                    Mode::Plan => self.plan_form.toggle(),
-                    Mode::Build => self.chats[self.active_chat].todo_panel.toggle(),
-                }
             } else if key::SEARCH.matches(key) {
                 let top = self.chats[self.active_chat].scroll_top();
                 let auto = self.chats[self.active_chat].auto_scroll();
@@ -927,9 +925,6 @@ impl App {
                     .lock()
                     .unwrap()
                     .insert(e.id.clone(), e.output.clone());
-            }
-            if let ToolOutput::TodoList(ref items) = e.output {
-                self.chats[chat_idx].todo_panel.on_todowrite(items);
             }
             if let Some(&sub_idx) = self.chat_index.get(&e.id) {
                 let (role, text) = if e.is_error {

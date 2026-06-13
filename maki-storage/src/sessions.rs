@@ -53,8 +53,6 @@ pub struct SessionMeta {
     pub context_size: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_draft: Option<String>,
-    #[serde(default)]
-    pub todo_dismissed: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub queued_messages: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

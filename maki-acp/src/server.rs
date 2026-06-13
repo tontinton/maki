@@ -14,7 +14,7 @@ use agent_client_protocol_schema::{
 use color_eyre::eyre::Context;
 use flume::{Receiver, Sender};
 use maki_agent::headless::{self, InteractiveHandle, InteractiveParams};
-use maki_agent::types::{AgentEvent, BatchToolStatus, ToolOutput};
+use maki_agent::types::{AgentEvent, BatchToolStatus};
 use maki_agent::{AgentInput, AgentMode, Envelope, ImageMediaType, ImageSource};
 use maki_providers::Message;
 use maki_providers::model::Model;
@@ -370,12 +370,7 @@ fn start_event_pump(
                 AgentEvent::ToolPending { id, name } => translate::tool_pending(&id, &name),
                 AgentEvent::ToolStart(event) => translate::tool_start(&event),
                 AgentEvent::ToolOutput { id, content } => translate::tool_output(&id, &content),
-                AgentEvent::ToolDone(event) => {
-                    if let ToolOutput::TodoList(items) = &event.output {
-                        session_update(&out_tx, &sid, translate::todo_list_to_plan(items));
-                    }
-                    translate::tool_done(&event)
-                }
+                AgentEvent::ToolDone(event) => translate::tool_done(&event),
                 AgentEvent::BatchProgress(event) => {
                     if event.status != BatchToolStatus::InProgress {
                         continue;
@@ -481,7 +476,7 @@ mod tests {
                 display_text: None,
             },
         ];
-        let mut session: Session<Message, TokenUsage, ToolOutput> =
+        let mut session: Session<Message, TokenUsage, maki_agent::ToolOutput> =
             Session::new("anthropic/test-model", "/project");
         session.messages = messages.clone();
         session.save(&dir).unwrap();

@@ -125,7 +125,7 @@ impl PlanForm {
         let t = theme::current();
         Some(Line::from(vec![
             Span::styled(" Plan ", Style::new().fg(t.foreground)),
-            Span::styled(key::TODO_PANEL.label, t.keybind_key),
+            Span::styled(key::PLAN_TOGGLE.label, t.keybind_key),
             Span::raw(" "),
         ]))
     }
@@ -137,7 +137,7 @@ impl PlanForm {
     pub fn handle_key(&mut self, key_event: KeyEvent) -> PlanFormAction {
         if key::QUIT.matches(key_event)
             || key_event.code == KeyCode::Esc
-            || key::TODO_PANEL.matches(key_event)
+            || key::PLAN_TOGGLE.matches(key_event)
         {
             return PlanFormAction::Hide;
         }
@@ -311,7 +311,7 @@ mod tests {
 
     #[test_case(key(KeyCode::Esc)              ; "esc")]
     #[test_case(key::QUIT.to_key_event()      ; "ctrl_c")]
-    #[test_case(key::TODO_PANEL.to_key_event(); "ctrl_t")]
+    #[test_case(key::PLAN_TOGGLE.to_key_event(); "ctrl_t")]
     fn dismiss(k: KeyEvent) {
         let mut form = PlanForm::new();
         form.on_plan_ready();

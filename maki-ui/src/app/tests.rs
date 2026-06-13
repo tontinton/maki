@@ -10,8 +10,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventK
 use maki_agent::permissions::PermissionManager;
 use maki_agent::{
     ImageMediaType, McpConfigErrors, McpServerInfo, McpServerStatus, McpSnapshot,
-    McpSnapshotReader, TodoItem, TodoPriority, TodoStatus, ToolDoneEvent, ToolOutput,
-    ToolStartEvent, TurnCompleteEvent,
+    McpSnapshotReader, ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent,
 };
 use maki_config::{PermissionsConfig, UiConfig};
 use maki_lua::{HintReader, KeymapReader, LuaCommandReader};
@@ -2230,56 +2229,22 @@ fn ctrl_t_toggles_plan_form_in_plan_mode() {
     let mut app = plan_app();
     assert!(app.plan_form.is_visible());
 
-    app.update(Msg::Key(kb::TODO_PANEL.to_key_event()));
+    app.update(Msg::Key(kb::PLAN_TOGGLE.to_key_event()));
     assert!(!app.plan_form.is_visible());
 
-    app.update(Msg::Key(kb::TODO_PANEL.to_key_event()));
+    app.update(Msg::Key(kb::PLAN_TOGGLE.to_key_event()));
     assert!(app.plan_form.is_visible());
 }
 
-fn send_subagent_todo(app: &mut App, items: Vec<TodoItem>) {
-    app.update(subagent_msg(
-        AgentEvent::ToolDone(Box::new(ToolDoneEvent {
-            id: "tw1".into(),
-            tool: "todo_write".into(),
-            output: ToolOutput::TodoList(items),
-            is_error: false,
-            annotation: None,
-        })),
-        "task1",
-        Some("research"),
-    ));
-}
-
 #[test]
-fn ctrl_t_toggles_todo_panel_on_subagent_chat() {
-    let mut app = app_with_subagent();
-    send_subagent_todo(
-        &mut app,
-        vec![TodoItem {
-            content: "task".into(),
-            status: TodoStatus::Pending,
-            priority: TodoPriority::Medium,
-        }],
-    );
-    app.active_chat = 1;
-    assert!(
-        app.chats[1].todo_panel.height() > 0,
-        "panel should be visible after todo_write"
-    );
+fn ctrl_t_noop_when_plan_not_ready() {
+    let mut app = test_app();
+    app.state.mode = Mode::Plan;
+    app.state.plan = PlanState::Drafting(PathBuf::from("test-plan.md"));
+    assert!(!app.plan_form.is_visible());
 
-    app.update(Msg::Key(kb::TODO_PANEL.to_key_event()));
-    assert_eq!(
-        app.chats[1].todo_panel.height(),
-        0,
-        "panel should hide after toggle"
-    );
-
-    app.update(Msg::Key(kb::TODO_PANEL.to_key_event()));
-    assert!(
-        app.chats[1].todo_panel.height() > 0,
-        "panel should reappear after second toggle"
-    );
+    app.update(Msg::Key(kb::PLAN_TOGGLE.to_key_event()));
+    assert!(!app.plan_form.is_visible());
 }
 
 #[test]
@@ -2480,6 +2445,7 @@ fn ctrl_c_denies_permission_prompt() {
 #[test_case(true,  true  => true  ; "both")]
 fn has_content(messages: bool, ephemeral: bool) -> bool {
     let mut app = test_app();
+    app.state.session.meta.mode = Some(maki_storage::sessions::StoredMode::Build);
     if messages {
         app.state
             .session
@@ -2487,7 +2453,7 @@ fn has_content(messages: bool, ephemeral: bool) -> bool {
             .push(maki_providers::Message::user("hello".into()));
     }
     if ephemeral {
-        app.state.session.meta.todo_dismissed = true;
+        app.state.session.meta.input_draft = Some("wip".into());
     }
     app.has_content()
 }

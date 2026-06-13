@@ -105,7 +105,7 @@ pub(crate) fn tool_output_annotation(output: &ToolOutput) -> Option<String> {
             let n = text.lines().count();
             Some(format!("{n} entries"))
         }
-        ToolOutput::Plain(text) | ToolOutput::Markdown(text) => {
+        ToolOutput::Plain(text) | ToolOutput::Markdown(text) if !text.is_empty() => {
             let n = text.lines().count();
             Some(format!("{n} lines"))
         }
@@ -1257,6 +1257,7 @@ mod tests {
 
     #[test_case("bash",  ToolOutput::Plain("ok".into()),                      Some("1 lines")     ; "plain_short_annotates")]
     #[test_case("bash",  ToolOutput::Plain((0..20).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n")), Some("20 lines") ; "plain_long_annotates")]
+    #[test_case("bash",  ToolOutput::Plain(String::new()),                     None                 ; "plain_empty_no_annotation")]
     #[test_case("read",  ToolOutput::ReadCode { path: "a.rs".into(), start_line: 1, lines: vec!["x".into(); 5], total_lines: 5, instructions: None }, Some("5 lines") ; "read_code_full_file")]
     #[test_case("read",  ToolOutput::ReadCode { path: "a.rs".into(), start_line: 10, lines: vec!["x".into(); 5], total_lines: 100, instructions: None }, Some("5 of 100 lines") ; "read_code_partial")]
     #[test_case("write", ToolOutput::WriteCode { path: "a.rs".into(), byte_count: 99, lines: vec![] }, Some("99 bytes") ; "write_code_bytes")]

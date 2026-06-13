@@ -712,38 +712,6 @@ mod tests {
     }
 
     #[test]
-    fn as_display_text_todolist_formats_all_statuses() {
-        let output = ToolOutput::TodoList(vec![
-            TodoItem {
-                content: "done".into(),
-                status: TodoStatus::Completed,
-                priority: TodoPriority::High,
-            },
-            TodoItem {
-                content: "wip".into(),
-                status: TodoStatus::InProgress,
-                priority: TodoPriority::Medium,
-            },
-            TodoItem {
-                content: "todo".into(),
-                status: TodoStatus::Pending,
-                priority: TodoPriority::Low,
-            },
-            TodoItem {
-                content: "nope".into(),
-                status: TodoStatus::Cancelled,
-                priority: TodoPriority::Low,
-            },
-        ]);
-        let display = output.as_display_text();
-        assert!(display.contains("[✓] (high) done"));
-        assert!(display.contains("[•] (medium) wip"));
-        assert!(display.contains("[ ] (low) todo"));
-        assert!(display.contains("[x] (low) nope"));
-        assert_eq!(output.as_text(), "ok");
-    }
-
-    #[test]
     fn as_text_grep_result_multi_file() {
         let output = ToolOutput::GrepResult {
             entries: vec![

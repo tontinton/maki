@@ -21,7 +21,6 @@ impl App {
 
     pub(crate) fn has_ephemeral(&self) -> bool {
         self.state.session.meta.input_draft.is_some()
-            || self.state.session.meta.todo_dismissed
             || !self.state.session.meta.queued_messages.is_empty()
             || self.state.session.meta.mode != Some(maki_storage::sessions::StoredMode::Build)
     }
@@ -46,8 +45,6 @@ impl App {
     fn sync_ephemeral_state(&mut self) {
         let draft = self.input_box.buffer.value();
         self.state.session.meta.input_draft = if draft.is_empty() { None } else { Some(draft) };
-
-        self.state.session.meta.todo_dismissed = self.chats[0].todo_panel.is_user_dismissed();
 
         self.state.session.meta.queued_messages = self.queue.text_messages();
 
@@ -90,7 +87,6 @@ impl App {
         self.status_bar.clear_flash();
         self.task_picker_original = None;
         self.last_esc = None;
-        self.chats[0].todo_panel.reset();
         self.restoring = Arc::new(AtomicBool::new(false));
         self.plan_form.reset();
     }
@@ -107,11 +103,6 @@ impl App {
         self.main_chat().load_messages(display_msgs);
         self.main_chat().token_usage = self.state.token_usage;
         self.main_chat().context_size = self.state.context_size;
-        self.chats[0].todo_panel.restore(
-            &self.state.session.tool_outputs,
-            self.state.session.meta.todo_dismissed,
-        );
-
         if let Some(draft) = self.state.session.meta.input_draft.take() {
             self.input_box.set_input(draft);
             self.input_box.buffer.move_to_end();

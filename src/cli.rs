@@ -282,8 +282,6 @@ mod tests {
     #[test_case("Bash", "bash")]
     #[test_case("CodeExecution", "code_execution")]
     #[test_case("code_execution", "code_execution"; "snake_passthrough")]
-    #[test_case("TodoWrite", "todo_write")]
-    #[test_case("todo_write", "todo_write"; "todo_write_already_snake_case")]
     fn normalize_tool_name_valid_inputs(input: &str, expected: &str) {
         assert_eq!(normalize_tool_name(input).unwrap(), expected);
     }

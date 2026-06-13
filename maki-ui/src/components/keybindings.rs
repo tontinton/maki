@@ -142,7 +142,7 @@ pub mod key {
     pub const SEARCH: Bind = ctrl_bind!('f');
     pub const FILE_PICKER: Bind = ctrl_bind!('s');
     pub const OPEN_EDITOR: Bind = ctrl_bind!('o');
-    pub const TODO_PANEL: Bind = ctrl_bind!('t');
+    pub const PLAN_TOGGLE: Bind = ctrl_bind!('t');
     pub const TASKS: Bind = ctrl_bind!('x');
     pub const SUSPEND: Bind = ctrl_bind!('z');
     pub const DELETE: Bind = ctrl_bind!('d');
@@ -341,8 +341,8 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
-        label: KeyLabel::Single(key::TODO_PANEL.label),
-        description: "Toggle todo / plan panel",
+        label: KeyLabel::Single(key::PLAN_TOGGLE.label),
+        description: "Toggle plan panel",
         context: KeybindContext::General,
         platform: Platform::All,
     },

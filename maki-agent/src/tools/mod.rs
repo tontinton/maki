@@ -17,7 +17,6 @@ mod read;
 pub mod registry;
 pub mod schema;
 mod task;
-mod todowrite;
 mod write;
 
 pub use file_tracker::FileReadTracker;
@@ -125,7 +124,7 @@ pub const MULTIEDIT_TOOL_NAME: &str = multiedit::MultiEdit::NAME;
 pub const QUESTION_TOOL_NAME: &str = "question";
 pub const READ_TOOL_NAME: &str = read::Read::NAME;
 pub const TASK_TOOL_NAME: &str = task::Task::NAME;
-pub const TODOWRITE_TOOL_NAME: &str = todowrite::TodoWrite::NAME;
+pub const TODOWRITE_TOOL_NAME: &str = "todo_write";
 pub const WRITE_TOOL_NAME: &str = write::Write::NAME;
 pub const CODE_EXECUTION_TOOL_NAME: &str = code_execution::CodeExecution::NAME;
 
@@ -542,7 +541,7 @@ register_tools! {
     write::Write,
     edit::Edit,
     multiedit::MultiEdit,
-    todowrite::TodoWrite,
+
     task::Task,
     batch::Batch,
     code_execution::CodeExecution,

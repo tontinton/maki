@@ -1,11 +1,10 @@
 use agent_client_protocol_schema::{
-    Content, ContentBlock, ContentChunk, Diff, ImageContent, Plan, PlanEntry, PlanEntryPriority,
-    PlanEntryStatus, SessionUpdate, TextContent, ToolCall, ToolCallContent, ToolCallId,
-    ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+    Content, ContentBlock, ContentChunk, Diff, ImageContent, SessionUpdate, TextContent, ToolCall,
+    ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
+    ToolCallUpdateFields, ToolKind,
 };
 use maki_agent::tools::ToolRegistry;
 use maki_agent::types::{BatchProgressEvent, ToolDoneEvent, ToolOutput, ToolStartEvent};
-use maki_agent::{TodoItem, TodoPriority, TodoStatus};
 use maki_providers::{ContentBlock as MsgBlock, ImageMediaType, Message, Role as MsgRole};
 
 const MIN_FENCE_LEN: usize = 3;
@@ -176,36 +175,6 @@ pub fn tool_done(event: &ToolDoneEvent) -> SessionUpdate {
     ))
 }
 
-pub fn todo_list_to_plan(items: &[TodoItem]) -> SessionUpdate {
-    let entries: Vec<PlanEntry> = items
-        .iter()
-        .map(|item| {
-            PlanEntry::new(
-                &item.content,
-                map_priority(item.priority),
-                map_status(item.status),
-            )
-        })
-        .collect();
-    SessionUpdate::Plan(Plan::new(entries))
-}
-
-fn map_priority(p: TodoPriority) -> PlanEntryPriority {
-    match p {
-        TodoPriority::High => PlanEntryPriority::High,
-        TodoPriority::Medium => PlanEntryPriority::Medium,
-        TodoPriority::Low => PlanEntryPriority::Low,
-    }
-}
-
-fn map_status(s: TodoStatus) -> PlanEntryStatus {
-    match s {
-        TodoStatus::Pending => PlanEntryStatus::Pending,
-        TodoStatus::InProgress => PlanEntryStatus::InProgress,
-        TodoStatus::Completed | TodoStatus::Cancelled => PlanEntryStatus::Completed,
-    }
-}
-
 pub fn map_stop_reason(
     sr: Option<maki_providers::StopReason>,
 ) -> agent_client_protocol_schema::StopReason {
@@ -335,17 +304,6 @@ mod tests {
         let json = serde_json::to_value(batch_inner_start(&event)).unwrap();
         assert_eq!(json["toolCallId"], "b1__2");
         assert_eq!(json["title"], title);
-    }
-
-    #[test]
-    fn cancelled_todo_renders_as_completed_plan_entry() {
-        let items = [TodoItem {
-            content: "task".into(),
-            status: TodoStatus::Cancelled,
-            priority: TodoPriority::Low,
-        }];
-        let json = serde_json::to_value(todo_list_to_plan(&items)).unwrap();
-        assert_eq!(json["entries"][0]["status"], "completed");
     }
 
     #[test_case(None; "missing_stop_reason")]

@@ -164,7 +164,12 @@ impl FloatManager {
         });
 
         if focus_lost {
-            self.focused_id = self.windows.last().map(|w| w.id);
+            self.focused_id = self
+                .windows
+                .iter()
+                .rev()
+                .find(|w| w.config.split != Split::Panel)
+                .map(|w| w.id);
             self.focused_rect = None;
         }
     }
@@ -1827,5 +1832,108 @@ mod tests {
             event_rx.drain().any(|e| matches!(e, WinEvent::Close)),
             "{EXPECT_CLOSE_TO_SPLIT}",
         );
+    }
+
+    #[test]
+    fn panel_reqs_returns_visible_panels_sorted_by_order() {
+        let mut mgr = FloatManager::new();
+        let (tx1, rx1, _, _) = make_channels();
+        let (tx2, rx2, _, _) = make_channels();
+
+        let cfg1 = FloatConfig {
+            split: Split::Panel,
+            height: Dimension::Abs(5),
+            order: 20,
+            ..FloatConfig::default()
+        };
+        let cfg2 = FloatConfig {
+            split: Split::Panel,
+            height: Dimension::Abs(3),
+            order: 10,
+            ..FloatConfig::default()
+        };
+
+        mgr.open(make_buf(&["a"]), cfg1, false, tx1, rx1);
+        mgr.open(make_buf(&["b"]), cfg2, false, tx2, rx2);
+
+        let reqs = mgr.panel_reqs();
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(reqs[0].1, 3, "order=10 should come first");
+        assert_eq!(reqs[1].1, 5, "order=20 should come second");
+    }
+
+    #[test]
+    fn panel_window_not_evicted_on_second_open() {
+        let mut mgr = FloatManager::new();
+        let (tx1, rx1, _, _) = make_channels();
+        let (tx2, rx2, _, _) = make_channels();
+
+        let cfg = FloatConfig {
+            split: Split::Panel,
+            height: Dimension::Abs(3),
+            ..FloatConfig::default()
+        };
+
+        mgr.open(make_buf(&["a"]), cfg.clone(), false, tx1, rx1);
+        mgr.open(make_buf(&["b"]), cfg, false, tx2, rx2);
+
+        assert_eq!(mgr.panel_reqs().len(), 2);
+    }
+
+    #[test]
+    fn hidden_panel_excluded_from_reqs() {
+        let mut mgr = FloatManager::new();
+        let (tx, _rx, _, _) = make_channels();
+        let (cmd_tx, cmd_rx) = flume::bounded::<WinCommand>(8);
+
+        let cfg = FloatConfig {
+            split: Split::Panel,
+            height: Dimension::Abs(5),
+            ..FloatConfig::default()
+        };
+
+        mgr.open(make_buf(&["a"]), cfg, false, tx, cmd_rx);
+        assert_eq!(mgr.panel_reqs().len(), 1);
+
+        cmd_tx.send(WinCommand::SetVisible(false)).unwrap();
+        mgr.tick();
+        assert_eq!(mgr.panel_reqs().len(), 0);
+
+        cmd_tx.send(WinCommand::SetVisible(true)).unwrap();
+        mgr.tick();
+        assert_eq!(mgr.panel_reqs().len(), 1);
+    }
+
+    #[test]
+    fn focus_fallback_skips_panel_windows() {
+        let mut mgr = FloatManager::new();
+
+        let (tx_panel, rx_panel, _, _cmd_tx_panel) = make_channels();
+        let panel_cfg = FloatConfig {
+            split: Split::Panel,
+            height: Dimension::Abs(5),
+            ..FloatConfig::default()
+        };
+        mgr.open(make_buf(&["panel"]), panel_cfg, false, tx_panel, rx_panel);
+
+        let (tx_modal, rx_modal, _, cmd_tx_modal) = make_channels();
+        mgr.open(
+            make_buf(&["modal"]),
+            make_config(),
+            true,
+            tx_modal,
+            rx_modal,
+        );
+
+        assert_eq!(mgr.focused_id, Some(1));
+
+        cmd_tx_modal.send(WinCommand::Close).unwrap();
+        mgr.tick();
+
+        assert_eq!(
+            mgr.focused_id, None,
+            "focus must not fall back to a panel window"
+        );
+        assert_eq!(mgr.windows.len(), 1, "panel window must survive");
     }
 }
