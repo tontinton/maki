@@ -1,7 +1,8 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use maki_agent::agent::LoadedInstructions;
 use maki_agent::cancel::CancelToken;
 use maki_agent::tools::FileReadTracker;
 use maki_config::{AgentConfig, ToolOutputLines};
@@ -30,6 +31,7 @@ pub(crate) struct LuaCtx {
     pub(crate) tool_output_lines: ToolOutputLines,
     pub(crate) finish_tx: Option<flume::Sender<ToolCallReply>>,
     pub(crate) file_tracker: Arc<FileReadTracker>,
+    pub(crate) loaded_instructions: LoadedInstructions,
 }
 
 impl UserData for LuaCtx {
@@ -55,13 +57,33 @@ impl UserData for LuaCtx {
         });
 
         methods.add_method("record_read", |_, this, path: String| {
-            let abs = if Path::new(&path).is_absolute() {
-                path.into()
-            } else {
-                std::env::current_dir().unwrap_or_default().join(&path)
-            };
-            this.file_tracker.record_read(&abs);
+            this.file_tracker.record_read(&resolve_abs(path));
             Ok(())
+        });
+
+        methods.add_async_method(
+            "find_instructions",
+            |lua, this, dir_path: String| async move {
+                let loaded = this.loaded_instructions.clone();
+                let results = smol::unblock(move || {
+                    let cwd = std::env::current_dir().unwrap_or_default();
+                    let abs = resolve_abs_with_cwd(dir_path, &cwd);
+                    maki_agent::find_subdirectory_instructions(&abs, &cwd, &loaded)
+                })
+                .await;
+                let tbl = lua.create_table()?;
+                for (i, (path, content)) in results.into_iter().enumerate() {
+                    let entry = lua.create_table()?;
+                    entry.set("path", path)?;
+                    entry.set("content", content)?;
+                    tbl.set(i + 1, entry)?;
+                }
+                Ok(tbl)
+            },
+        );
+
+        methods.add_method("is_instruction_file", |_, _, name: String| {
+            Ok(maki_agent::is_instruction_file(&name))
         });
 
         methods.add_method_mut("finish", |_lua, this, val: LuaValue| {
@@ -74,4 +96,16 @@ impl UserData for LuaCtx {
             Ok(())
         });
     }
+}
+
+fn resolve_abs_with_cwd(path: String, cwd: &Path) -> PathBuf {
+    if Path::new(&path).is_absolute() {
+        path.into()
+    } else {
+        cwd.join(&path)
+    }
+}
+
+fn resolve_abs(path: String) -> PathBuf {
+    resolve_abs_with_cwd(path, &std::env::current_dir().unwrap_or_default())
 }

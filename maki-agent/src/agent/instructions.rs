@@ -41,7 +41,7 @@ pub struct Instructions {
     pub loaded: LoadedInstructions,
 }
 
-pub(crate) fn is_instruction_file(name: &str) -> bool {
+pub fn is_instruction_file(name: &str) -> bool {
     name == LOCAL_INSTRUCTION_FILE
         || INSTRUCTION_FILES
             .iter()

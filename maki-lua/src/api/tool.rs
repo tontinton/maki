@@ -223,6 +223,7 @@ impl ToolInvocation for LuaToolInvocation {
                 tool_output_lines: ctx.tool_output_lines,
                 finish_tx: None,
                 file_tracker: ctx.file_tracker.clone(),
+                loaded_instructions: ctx.loaded_instructions.clone(),
             };
 
             if tx
