@@ -111,8 +111,8 @@ function ListPicker.open(items, opts)
     else
       content = render_lines(filtered, cursor, width, input:value())
     end
-    local input_lines = input:render("\xe2\x9d\xaf ")
-    for _, ln in ipairs(input_lines) do
+    local r = input:render("\xe2\x9d\xaf ")
+    for _, ln in ipairs(r.lines) do
       content[#content + 1] = ln
     end
     return content

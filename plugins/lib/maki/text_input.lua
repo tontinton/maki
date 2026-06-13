@@ -93,9 +93,6 @@ end
 function TextInput:line_count()
   return #self.lines
 end
-function TextInput:cursor_line()
-  return self.line
-end
 
 function TextInput:clear()
   self.lines, self.line, self.col = { "" }, 1, 0
@@ -397,28 +394,50 @@ function TextInput:handle_key(key)
   return result
 end
 
-function TextInput:render(prefix, prefix_width)
+function TextInput:render(prefix, prefix_width, width)
   local result = {}
   local pw = prefix_width or #prefix
   local pad = string.rep(" ", pw)
+  local usable = math.max((width or 0x40000000) - pw, 1)
+  local cursor_row = 1
+  local first = true
+
   for i, ln in ipairs(self.lines) do
-    local pfx = i == 1 and prefix or pad
-    if i == self.line then
-      local before, cursor_char, after = split_at_cursor(ln, self.col)
-      result[#result + 1] = {
-        { pfx, "dim" },
-        { before, "" },
-        { cursor_char, "cursor" },
-        { after, "" },
-      }
-    else
-      result[#result + 1] = {
-        { pfx, "dim" },
-        { ln, "" },
-      }
-    end
+    local is_cursor_line = (i == self.line)
+    local pos = 0
+
+    repeat
+      local chunk_start = pos + 1
+      local chunk_end = pos
+      local chars = 0
+      while chunk_end < #ln and chars < usable do
+        chunk_end = (utf8.offset(ln, 2, chunk_end + 1) or (#ln + 1)) - 1
+        chars = chars + 1
+      end
+
+      local pfx_str = first and prefix or pad
+      first = false
+      local chunk = ln:sub(chunk_start, chunk_end)
+      local has_cursor = is_cursor_line and self.col >= pos and (self.col < chunk_end or chunk_end >= #ln)
+
+      if has_cursor then
+        local before, cur, after = split_at_cursor(chunk, self.col - pos)
+        cursor_row = #result + 1
+        result[#result + 1] = {
+          { pfx_str, "dim" },
+          { before, "" },
+          { cur, "cursor" },
+          { after, "" },
+        }
+      else
+        result[#result + 1] = { { pfx_str, "dim" }, { chunk, "" } }
+      end
+
+      pos = chunk_end
+    until pos >= #ln
   end
-  return result
+
+  return { lines = result, cursor_row = cursor_row }
 end
 
 return TextInput

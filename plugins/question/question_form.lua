@@ -491,10 +491,9 @@ local function render_selecting(state, width)
   local custom_checked = custom_text ~= nil
 
   if state.mode == MODE.EDITING_CUSTOM then
-    local input_lines = state.custom_input:render("  \xe2\x9d\xaf ", 4)
-    local cursor_offset = state.custom_input:cursor_line()
-    focus_row = #lines + cursor_offset
-    for _, ln in ipairs(input_lines) do
+    local r = state.custom_input:render("  \xe2\x9d\xaf ", 4, usable)
+    focus_row = #lines + r.cursor_row
+    for _, ln in ipairs(r.lines) do
       lines[#lines + 1] = ln
     end
   else

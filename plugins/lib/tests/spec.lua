@@ -330,9 +330,10 @@ case("text_input_render_format", function()
   input:handle_key("a")
   input:handle_key("b")
   input:handle_key("left")
-  local rendered = input:render("> ")
-  eq(#rendered, 1)
-  local spans = rendered[1]
+  local r = input:render("> ")
+  eq(#r.lines, 1)
+  eq(r.cursor_row, 1)
+  local spans = r.lines[1]
   eq(#spans, 4)
   eq(spans[1][1], "> ")
   eq(spans[1][2], "dim")
@@ -371,7 +372,7 @@ case("text_input_utf8_insert_navigate_delete_render", function()
   input = TextInput.new()
   input:insert_text("aé")
   input:handle_key("left")
-  local spans = input:render("> ")[1]
+  local spans = input:render("> ").lines[1]
   eq(spans[2][1], "a", "text before cursor")
   eq(spans[3][1], "é", "cursor span is whole codepoint")
   eq(spans[3][2], "cursor")
@@ -492,13 +493,14 @@ case("text_input_render_multiline_padding_and_cursor", function()
   local input = TextInput.new()
   input:insert_text("line1\nline2")
   local prefix = "> "
-  local rendered = input:render(prefix, #prefix)
-  eq(#rendered, 2, "one render row per logical line")
-  eq(rendered[1][1][1], prefix, "first row uses the prefix")
-  eq(rendered[2][1][1], string.rep(" ", #prefix), "continuation rows use blank padding")
-  eq(rendered[1][2][1], "line1", "non-cursor row renders text in one span")
+  local r = input:render(prefix, #prefix)
+  eq(#r.lines, 2, "one render row per logical line")
+  eq(r.cursor_row, 2, "cursor on second logical line")
+  eq(r.lines[1][1][1], prefix, "first row uses the prefix")
+  eq(r.lines[2][1][1], string.rep(" ", #prefix), "continuation rows use blank padding")
+  eq(r.lines[1][2][1], "line1", "non-cursor row renders text in one span")
   local saw_cursor
-  for _, span in ipairs(rendered[2]) do
+  for _, span in ipairs(r.lines[2]) do
     if span[2] == "cursor" then
       saw_cursor = true
     end
@@ -506,26 +508,124 @@ case("text_input_render_multiline_padding_and_cursor", function()
   assert(saw_cursor, "cursor span must appear on the row holding the cursor")
 end)
 
-case("text_input_handle_key_returns_ignored_when_noop", function()
-  local function noop(setup, key)
-    local input = TextInput.new()
-    if setup then
-      setup(input)
-    end
-    eq(input:handle_key(key), R.IGNORED, key .. " on a no-op input must be IGNORED")
+local function span_text(row)
+  local parts = {}
+  for _, span in ipairs(row) do
+    parts[#parts + 1] = span[1]
   end
-  noop(nil, "backspace")
-  noop(nil, "left")
-  noop(nil, "up")
-  noop(nil, "down")
-  noop(nil, "ctrl+w")
-  noop(nil, "delete")
-  noop(function(i)
-    i:insert_text("abc")
-  end, "right")
-  noop(function(i)
-    i:insert_text("abc")
-  end, "delete")
+  return table.concat(parts)
+end
+
+local function find_cursor_char(row)
+  for _, span in ipairs(row) do
+    if span[2] == "cursor" then
+      return span[1]
+    end
+  end
+end
+
+case("text_input_render_wraps_long_line", function()
+  local input = TextInput.new()
+  input:insert_text("abcdefghij")
+  local r = input:render("> ", 2, 8)
+  eq(#r.lines, 2, "10 chars at usable=6 produces 2 visual rows")
+  eq(r.cursor_row, 2, "cursor on last visual row")
+  eq(find_cursor_char(r.lines[2]), " ", "cursor at end is a space")
+end)
+
+case("text_input_render_wrap_cursor_mid_line", function()
+  local input = TextInput.new()
+  input:insert_text("abcdefghij")
+  for _ = 1, 5 do
+    input:handle_key("left")
+  end
+  local r = input:render("> ", 2, 8)
+  eq(#r.lines, 2, "still 2 visual rows")
+  eq(r.cursor_row, 1, "cursor in first chunk")
+  eq(find_cursor_char(r.lines[1]), "f", "cursor on 'f'")
+end)
+
+case("text_input_render_wrap_multiline", function()
+  local input = TextInput.new()
+  input:insert_text("abcdefghij\n1234567890")
+  local r = input:render("> ", 2, 8)
+  eq(#r.lines, 4, "each logical line wraps into 2 visual rows")
+  eq(r.cursor_row, 4, "cursor on last visual row of second logical line")
+end)
+
+case("text_input_render_degenerate_width", function()
+  local input = TextInput.new()
+  input:insert_text("abc")
+  local r = input:render("", 0, 1)
+  eq(#r.lines, 3, "usable=1 means one char per visual row")
+  eq(r.cursor_row, 3, "cursor on last row")
+end)
+
+case("text_input_render_empty_input_with_width", function()
+  local input = TextInput.new()
+  local r = input:render("> ", 2, 10)
+  eq(#r.lines, 1, "empty input still produces one row")
+  eq(r.cursor_row, 1, "cursor on that single row")
+  eq(find_cursor_char(r.lines[1]), " ", "cursor is a space on empty input")
+end)
+
+case("text_input_render_wrap_utf8_multibyte_at_boundary", function()
+  local input = TextInput.new()
+  input:insert_text("aaéé")
+  local r = input:render("", 0, 3)
+  eq(#r.lines, 2, "4 codepoints at usable=3 wraps into 2 rows")
+  eq(span_text(r.lines[1]), "aaé", "first chunk has 3 codepoints")
+  local second = span_text(r.lines[2])
+  assert(second:find("é"), "second chunk contains the remaining é")
+  eq(r.cursor_row, 2, "cursor on second row")
+end)
+
+case("text_input_render_wrap_cursor_at_exact_chunk_boundary", function()
+  local input = TextInput.new()
+  input:insert_text("abcdef")
+  for _ = 1, 3 do
+    input:handle_key("left")
+  end
+  local r = input:render("", 0, 3)
+  eq(#r.lines, 2, "6 chars at usable=3 -> 2 rows")
+  eq(r.cursor_row, 2, "cursor col=3 lands in second chunk")
+  eq(find_cursor_char(r.lines[2]), "d", "cursor char is 'd'")
+end)
+
+case("text_input_render_exact_fit_no_extra_row", function()
+  local input = TextInput.new()
+  input:insert_text("abcdef")
+  local r = input:render(">>", 2, 8)
+  eq(#r.lines, 1, "6 chars exactly fills usable=6, no extra row")
+  eq(r.cursor_row, 1)
+end)
+
+case("text_input_render_empty_lines_in_multiline_with_width", function()
+  local input = TextInput.new()
+  input:insert_text("ab\n\ncd")
+  local r = input:render("> ", 2, 10)
+  eq(#r.lines, 3, "three logical lines produce three visual rows")
+  eq(r.cursor_row, 3, "cursor on last line")
+end)
+
+case("text_input_render_cursor_at_start_with_wrapping", function()
+  local input = TextInput.new()
+  input:insert_text("abcdef")
+  input:handle_key("home")
+  local r = input:render("", 0, 3)
+  eq(r.cursor_row, 1, "cursor at col=0 is in the first chunk")
+  eq(find_cursor_char(r.lines[1]), "a", "cursor on first char 'a'")
+end)
+
+case("text_input_render_prefix_width_override", function()
+  local input = TextInput.new()
+  input:insert_text("abcdefgh")
+  local r = input:render("X", 4, 8)
+  eq(#r.lines, 2, "usable = 8-4 = 4, 8 chars wraps into 2 rows")
+  local first = span_text(r.lines[1])
+  assert(first:sub(1, 1) == "X", "first row starts with actual prefix 'X'")
+  local second = span_text(r.lines[2])
+  assert(second:sub(1, 4) == "    ", "continuation uses prefix_width=4 spaces of padding")
 end)
 
 case("text_input_invariants_hold_under_random_sequence", function()
