@@ -131,7 +131,7 @@ Defaults: devstral-latest (strong), mistral-large-latest (medium), mistral-small
 |------|--------|-------------------------------|---------|
 | Weak | **glm-4.7-flash** (default), glm-4.5-flash, glm-4.5-air | $0.00 / $0.00 | 200K ctx / 131K out |
 | Medium | **glm-4.7, glm-4.6** (default), glm-4.5 | $0.60 / $2.20 | 200K ctx / 131K out |
-| Strong | **glm-5-code** (default), glm-5 | $1.20 / $5.00 | 200K ctx / 131K out |
+| Strong | **glm-5-code** (default), glm-5.2, glm-5.1, glm-5 | $1.20 / $5.00 | 200K ctx / 131K out |
 
 Defaults: glm-5-code (strong), glm-4.7-flash (weak), glm-4.7 (medium)
 
@@ -197,7 +197,7 @@ To add a custom provider or proxy, drop an executable script into `~/.config/mak
 
 `resolve` is called each time a new agent spawns, so scripts should read tokens from disk instead of caching them in memory. That way auth changes from other processes get picked up.
 
-The `base` field specifies which built-in provider to inherit the model catalog from. Valid values: `anthropic`, `openai`, `google`, `copilot`, `ollama`, `llama-cpp`, `mistral`, `zai`, `zai-coding-plan`, `deepseek`, `openrouter`, `synthetic`.
+The `base` field specifies which built-in provider to inherit the model catalog from. Valid values: `anthropic`, `openai`, `google`, `copilot`, `ollama`, `llama-cpp`, `mistral`, `zai`, `deepseek`, `openrouter`, `synthetic`.
 
 If your provider serves models not in the base catalog, add a `models` subcommand returning:
 

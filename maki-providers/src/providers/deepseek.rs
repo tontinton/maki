@@ -22,6 +22,18 @@ static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
     provider_name: "DeepSeek",
 };
 
+inventory::submit!(maki_config::providers::BuiltInProvider {
+    slug: "deepseek",
+    display_name: "DeepSeek",
+    protocol: maki_config::providers::Protocol::Openai,
+    default_base_url: "https://api.deepseek.com",
+    default_api_key_env: "DEEPSEEK_API_KEY",
+    default_model: "deepseek/deepseek-v4-flash",
+    plans: None,
+    login_url: Some("https://platform.deepseek.com/api_keys"),
+    needs_url: false,
+});
+
 pub(crate) fn models() -> &'static [ModelEntry] {
     &[
         ModelEntry {
@@ -66,7 +78,7 @@ pub struct DeepSeek {
 
 impl DeepSeek {
     pub fn new(timeouts: super::Timeouts) -> Result<Self, AgentError> {
-        let pool = KeyPool::from_env(CONFIG.api_key_env)?;
+        let pool = KeyPool::resolve("deepseek", CONFIG.api_key_env)?;
         Ok(Self {
             compat: OpenAiCompatProvider::new(&CONFIG, timeouts),
             auth: Arc::new(Mutex::new(ResolvedAuth::bearer(pool.current()))),

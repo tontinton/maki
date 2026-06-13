@@ -18,6 +18,18 @@ static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
     provider_name: "Synthetic",
 };
 
+inventory::submit!(maki_config::providers::BuiltInProvider {
+    slug: "synthetic",
+    display_name: "Synthetic",
+    protocol: maki_config::providers::Protocol::Openai,
+    default_base_url: "https://api.synthetic.new/openai/v1",
+    default_api_key_env: "SYNTHETIC_API_KEY",
+    default_model: "synthetic/hf:moonshotai/Kimi-K2.5",
+    plans: None,
+    login_url: Some("https://synthetic.new"),
+    needs_url: false,
+});
+
 pub(crate) fn models() -> &'static [ModelEntry] {
     &[
         ModelEntry {
@@ -77,7 +89,7 @@ pub struct Synthetic {
 
 impl Synthetic {
     pub fn new(timeouts: super::Timeouts) -> Result<Self, AgentError> {
-        let pool = KeyPool::from_env(CONFIG.api_key_env)?;
+        let pool = KeyPool::resolve("synthetic", CONFIG.api_key_env)?;
         Ok(Self {
             compat: OpenAiCompatProvider::new(&CONFIG, timeouts),
             auth: Arc::new(Mutex::new(ResolvedAuth::bearer(pool.current()))),

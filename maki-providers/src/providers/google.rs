@@ -20,6 +20,18 @@ use super::{KeyPool, ResolvedAuth, http_client, next_sse_line};
 const BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 const ENV_VAR: &str = "GEMINI_API_KEY";
 
+inventory::submit!(maki_config::providers::BuiltInProvider {
+    slug: "google",
+    display_name: "Google",
+    protocol: maki_config::providers::Protocol::Google,
+    default_base_url: BASE_URL,
+    default_api_key_env: ENV_VAR,
+    default_model: "google/gemini-2.5-pro",
+    plans: None,
+    login_url: Some("https://aistudio.google.com/apikey"),
+    needs_url: false,
+});
+
 pub(crate) fn models() -> &'static [ModelEntry] {
     &[
         ModelEntry {
@@ -86,7 +98,7 @@ pub struct Google {
 
 impl Google {
     pub fn new(timeouts: super::Timeouts) -> Result<Self, AgentError> {
-        let pool = KeyPool::from_env(ENV_VAR)?;
+        let pool = KeyPool::resolve("google", ENV_VAR)?;
         let resolved = resolve_auth_from_key(pool.current());
         Ok(Self {
             client: http_client(timeouts),
@@ -257,7 +269,7 @@ impl Provider for Google {
 
     fn reload_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
         Box::pin(async {
-            let pool = KeyPool::from_env(ENV_VAR)?;
+            let pool = KeyPool::resolve("google", ENV_VAR)?;
             *self.auth.lock().unwrap() = resolve_auth_from_key(pool.current());
             Ok(())
         })

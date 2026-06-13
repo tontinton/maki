@@ -137,7 +137,7 @@ pub fn models_for_provider(provider: ProviderKind) -> &'static [ModelEntry] {
         ProviderKind::LlamaCpp => llama_cpp::models(),
         ProviderKind::Mistral => mistral::models(),
         ProviderKind::Google => google::models(),
-        ProviderKind::Zai | ProviderKind::ZaiCodingPlan => zai::models(),
+        ProviderKind::Zai => zai::models(),
         ProviderKind::Synthetic => synthetic::models(),
         ProviderKind::DeepSeek => deepseek::models(),
         ProviderKind::OpenRouter => openrouter::models(),
@@ -273,6 +273,10 @@ impl Model {
                 return Ok(model);
             }
             return Ok(Self::from_base(base, model_id, Some(provider_str)));
+        }
+
+        if let Some(model) = super::providers::custom::lookup_model(provider_str, model_id) {
+            return Ok(model);
         }
 
         Err(ModelError::UnsupportedProvider(provider_str.to_string()))

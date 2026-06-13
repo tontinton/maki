@@ -19,6 +19,12 @@ pub(crate) fn load_token() -> Result<String, AgentError> {
         }
     }
 
+    if let Ok(dir) = maki_storage::StateDir::resolve()
+        && let Some(creds) = maki_storage::auth::load_provider_credentials(&dir, "copilot")
+    {
+        return Ok(creds.api_key);
+    }
+
     for path in copilot_config_paths() {
         if let Ok(contents) = fs::read_to_string(path)
             && let Some(token) = extract_json_oauth_token(&contents, COPILOT_DOMAIN)

@@ -296,6 +296,14 @@ pub fn resolve(dir: &StateDir) -> Result<ResolvedAuth, AgentError> {
         });
     }
 
+    if let Some(creds) = maki_storage::auth::load_provider_credentials(dir, PROVIDER) {
+        debug!("using OpenAI saved API key");
+        return Ok(ResolvedAuth {
+            base_url: None,
+            headers: vec![("authorization".into(), format!("Bearer {}", creds.api_key))],
+        });
+    }
+
     Err(AgentError::Config {
         message: "not authenticated, run `maki auth login openai` or set OPENAI_API_KEY".into(),
     })

@@ -126,15 +126,10 @@ fn format_auth(kind: ProviderKind) -> String {
 
 fn build_sections() -> Vec<ProviderSection> {
     let mut sections = Vec::new();
-    let mut zai_done = false;
 
     for kind in ProviderKind::iter() {
         match kind {
             ProviderKind::Zai => {
-                if zai_done {
-                    continue;
-                }
-                zai_done = true;
                 sections.push(ProviderSection {
                     kind: ProviderKind::Zai,
                     name: "Z.AI",
@@ -144,14 +139,11 @@ fn build_sections() -> Vec<ProviderSection> {
                     ),
                     urls: vec![
                         ProviderKind::Zai.base_url(),
-                        ProviderKind::ZaiCodingPlan.base_url(),
+                        "https://api.z.ai/api/coding/paas/v4",
                     ],
                     features: ProviderKind::Zai.features(),
                     entries: models_for_provider(ProviderKind::Zai),
                 });
-            }
-            ProviderKind::ZaiCodingPlan => {
-                zai_done = true;
             }
             ProviderKind::OpenAi => {
                 sections.push(ProviderSection {

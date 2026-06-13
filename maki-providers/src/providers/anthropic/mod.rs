@@ -27,6 +27,18 @@ const FAST_MODE_BETA: &str = "fast-mode-2026-02-01";
 
 const ENV_VAR: &str = "ANTHROPIC_API_KEY";
 
+inventory::submit!(maki_config::providers::BuiltInProvider {
+    slug: "anthropic",
+    display_name: "Anthropic",
+    protocol: maki_config::providers::Protocol::Anthropic,
+    default_base_url: "https://api.anthropic.com/v1/messages",
+    default_api_key_env: ENV_VAR,
+    default_model: "anthropic/claude-sonnet-4-6",
+    plans: None,
+    login_url: Some("https://console.anthropic.com/settings/keys"),
+    needs_url: false,
+});
+
 pub(crate) use shared::models;
 
 /// Returns whether the fast-mode beta header must be attached. We re-check
@@ -57,7 +69,7 @@ pub struct Anthropic {
 
 impl Anthropic {
     pub fn new(timeouts: super::Timeouts) -> Result<Self, AgentError> {
-        let pool = KeyPool::from_env(ENV_VAR)?;
+        let pool = KeyPool::resolve("anthropic", ENV_VAR)?;
         let resolved = resolve_auth_from_key(pool.current());
         debug!(keys = pool.len(), "using API key authentication");
         Ok(Self {
@@ -227,7 +239,7 @@ impl Provider for Anthropic {
 
     fn reload_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
         Box::pin(async {
-            let pool = KeyPool::from_env(ENV_VAR)?;
+            let pool = KeyPool::resolve("anthropic", ENV_VAR)?;
             *self.auth.lock().unwrap() = resolve_auth_from_key(pool.current());
             debug!("reloaded Anthropic auth from env");
             Ok(())

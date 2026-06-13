@@ -18,6 +18,18 @@ use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, 
 pub mod auth;
 
 const DEFAULT_API_ENDPOINT: &str = "https://api.githubcopilot.com";
+
+inventory::submit!(maki_config::providers::BuiltInProvider {
+    slug: "copilot",
+    display_name: "Copilot",
+    protocol: maki_config::providers::Protocol::Openai,
+    default_base_url: DEFAULT_API_ENDPOINT,
+    default_api_key_env: "GH_COPILOT_TOKEN",
+    default_model: "copilot/gpt-5.2",
+    plans: None,
+    login_url: Some("https://github.com/settings/copilot"),
+    needs_url: false,
+});
 const GRAPHQL_QUERY: &str = "query { viewer { copilotEndpoints { api } } }";
 const API_VERSION_HEADER: &str = "2025-10-01";
 const EDITOR_VERSION_HEADER: &str = concat!("Maki/", env!("CARGO_PKG_VERSION"));

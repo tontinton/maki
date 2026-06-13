@@ -20,13 +20,12 @@ use super::anthropic::Anthropic;
 use super::copilot::Copilot;
 use super::deepseek::DeepSeek;
 use super::google::Google;
-use super::llama_cpp::LlamaCpp;
+use super::local::{LLAMACPP, LocalEndpoint, OLLAMA};
 use super::mistral::Mistral;
-use super::ollama::Ollama;
 use super::openai::OpenAi;
 use super::openrouter::OpenRouter;
 use super::synthetic::Synthetic;
-use super::zai::{Zai, ZaiPlan};
+use super::zai::Zai;
 
 const INFO_TIMEOUT: Duration = Duration::from_secs(5);
 const SCRIPT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -359,11 +358,11 @@ pub fn create(slug: &str, timeouts: super::Timeouts) -> Result<Box<dyn Provider>
                 .with_system_prefix(meta.system_prefix.clone()),
         ),
         ProviderKind::Ollama => Box::new(
-            Ollama::with_auth(auth.clone(), timeouts)
+            LocalEndpoint::with_auth(&OLLAMA, auth.clone(), timeouts)
                 .with_system_prefix(meta.system_prefix.clone()),
         ),
         ProviderKind::LlamaCpp => Box::new(
-            LlamaCpp::with_auth(auth.clone(), timeouts)
+            LocalEndpoint::with_auth(&LLAMACPP, auth.clone(), timeouts)
                 .with_system_prefix(meta.system_prefix.clone()),
         ),
         ProviderKind::Mistral => Box::new(
@@ -371,12 +370,7 @@ pub fn create(slug: &str, timeouts: super::Timeouts) -> Result<Box<dyn Provider>
                 .with_system_prefix(meta.system_prefix.clone()),
         ),
         ProviderKind::Zai => Box::new(
-            Zai::with_auth(ZaiPlan::Standard, auth.clone(), timeouts)
-                .with_system_prefix(meta.system_prefix.clone()),
-        ),
-        ProviderKind::ZaiCodingPlan => Box::new(
-            Zai::with_auth(ZaiPlan::Coding, auth.clone(), timeouts)
-                .with_system_prefix(meta.system_prefix.clone()),
+            Zai::with_auth(auth.clone(), timeouts).with_system_prefix(meta.system_prefix.clone()),
         ),
         ProviderKind::Synthetic => Box::new(
             Synthetic::with_auth(auth.clone(), timeouts)
@@ -670,7 +664,6 @@ esac
     #[test_case("llama-cpp", ProviderKind::LlamaCpp ; "base_llama_cpp")]
     #[test_case("mistral", ProviderKind::Mistral ; "base_mistral")]
     #[test_case("zai", ProviderKind::Zai ; "base_zai")]
-    #[test_case("zai-coding-plan", ProviderKind::ZaiCodingPlan ; "base_zai_coding_plan")]
     #[test_case("synthetic", ProviderKind::Synthetic ; "base_synthetic")]
     #[test_case("deepseek", ProviderKind::DeepSeek ; "base_deepseek")]
     fn discover_accepts_all_bases(base: &str, expected: ProviderKind) {

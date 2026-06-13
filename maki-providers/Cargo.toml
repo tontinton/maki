@@ -20,6 +20,8 @@ sha2 = { workspace = true }
 hmac = { workspace = true }
 wait-timeout = { workspace = true }
 fastrand = { workspace = true }
+maki-config = { workspace = true }
+inventory = { workspace = true }
 
 [dev-dependencies]
 test-case = { workspace = true }
