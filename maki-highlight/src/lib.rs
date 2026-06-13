@@ -40,6 +40,18 @@ pub fn theme() -> Arc<Theme> {
         .clone()
 }
 
+pub fn theme_color(name: &str) -> Option<(u8, u8, u8)> {
+    let settings = &theme().settings;
+    let map = serde_json::to_value(settings).ok()?;
+    let obj = map.as_object()?;
+    let val = obj.get(name)?;
+    let obj = val.as_object()?;
+    let r = obj.get("r")?.as_u64()? as u8;
+    let g = obj.get("g")?.as_u64()? as u8;
+    let b = obj.get("b")?.as_u64()? as u8;
+    Some((r, g, b))
+}
+
 pub fn syntax_set() -> &'static SyntaxSet {
     SYNTAX_SET.get_or_init(two_face::syntax::extra_newlines)
 }

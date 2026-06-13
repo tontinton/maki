@@ -34,6 +34,17 @@ pub(crate) fn create_ui_table(
         lua.create_function(|lua, ()| Ok(with_task_bufs(lua, |store| store.create_live())))?,
     )?;
     t.set(
+        "theme_color",
+        lua.create_function(|lua, name: String| {
+            let Some((r, g, b)) = maki_highlight::theme_color(&name) else {
+                return Ok(mlua::Value::Nil);
+            };
+            Ok(mlua::Value::String(
+                lua.create_string(format!("#{r:02x}{g:02x}{b:02x}"))?,
+            ))
+        })?,
+    )?;
+    t.set(
         "highlight",
         lua.create_async_function(|lua, (code, lang): (String, String)| async move {
             let segments =

@@ -2426,6 +2426,7 @@ dependencies = [
 name = "maki-highlight"
 version = "0.3.17"
 dependencies = [
+ "serde_json",
  "syntect",
  "test-case",
  "two-face",
