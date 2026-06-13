@@ -36,6 +36,7 @@ function ToolView.new(buf, opts)
   self.all_lines = {}
   self.all_skipped = 0
   self.expanded = false
+  self.ring_map = {}
   return self
 end
 
@@ -51,13 +52,16 @@ function ToolView:clear()
   self.skipped = 0
   self.all_lines = {}
   self.all_skipped = 0
+  self.ring_map = {}
   self._hl = nil
   self:flush()
 end
 
 function ToolView:append(line)
+  local all_idx
   if #self.all_lines < self.max_expand_lines then
     self.all_lines[#self.all_lines + 1] = line
+    all_idx = #self.all_lines
   else
     self.all_skipped = self.all_skipped + 1
   end
@@ -66,6 +70,9 @@ function ToolView:append(line)
     if self.ring_count < self.max then
       self.ring_count = self.ring_count + 1
       self.ring[self.ring_count] = line
+      if all_idx then
+        self.ring_map[self.ring_count] = all_idx
+      end
       self:flush()
     else
       self.skipped = self.skipped + 1
@@ -74,8 +81,14 @@ function ToolView:append(line)
     if self.ring_count < self.max then
       self.ring_count = self.ring_count + 1
       self.ring[self.ring_count] = line
+      if all_idx then
+        self.ring_map[self.ring_count] = all_idx
+      end
     else
       self.ring[self.ring_start] = line
+      if all_idx then
+        self.ring_map[self.ring_start] = all_idx
+      end
       self.ring_start = (self.ring_start % self.max) + 1
       self.skipped = self.skipped + 1
     end
@@ -189,6 +202,16 @@ function ToolView:flush()
   end
 
   self.buf:set_lines(lines)
+end
+
+function ToolView:update_line(all_idx, line)
+  self.all_lines[all_idx] = line
+  for ri = 1, self.ring_count do
+    if self.ring_map[ri] == all_idx then
+      self.ring[ri] = line
+      return
+    end
+  end
 end
 
 function ToolView:finish()

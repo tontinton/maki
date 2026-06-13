@@ -1,6 +1,9 @@
+use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use maki_agent::cancel::CancelToken;
+use maki_agent::tools::FileReadTracker;
 use maki_config::{AgentConfig, ToolOutputLines};
 use mlua::{LuaSerdeExt, UserData, UserDataMethods, Value as LuaValue};
 
@@ -26,6 +29,7 @@ pub(crate) struct LuaCtx {
     pub(crate) config: AgentConfig,
     pub(crate) tool_output_lines: ToolOutputLines,
     pub(crate) finish_tx: Option<flume::Sender<ToolCallReply>>,
+    pub(crate) file_tracker: Arc<FileReadTracker>,
 }
 
 impl UserData for LuaCtx {
@@ -47,6 +51,16 @@ impl UserData for LuaCtx {
             cell.deadline_secs.set(Some(secs));
             cell.deadline
                 .set(Some(Instant::now() + Duration::from_secs(secs)));
+            Ok(())
+        });
+
+        methods.add_method("record_read", |_, this, path: String| {
+            let abs = if Path::new(&path).is_absolute() {
+                path.into()
+            } else {
+                std::env::current_dir().unwrap_or_default().join(&path)
+            };
+            this.file_tracker.record_read(&abs);
             Ok(())
         });
 

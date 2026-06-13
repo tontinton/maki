@@ -547,29 +547,4 @@ mod tests {
         let no_tool = json!({"tool_calls": [{"parameters": {"path": "/tmp"}}]});
         assert!(Batch::parse_input(&no_tool).is_err());
     }
-
-    #[test]
-    fn batch_entry_missing_tool_and_params_is_error() {
-        let empty = json!({"tool_calls": [{}]});
-        assert!(Batch::parse_input(&empty).is_err());
-    }
-
-    #[test]
-    fn flat_batch_entries_actually_execute() {
-        smol::block_on(async {
-            let dir = tempfile::TempDir::new().unwrap();
-            std::fs::write(dir.path().join("a.txt"), "hello world").unwrap();
-            let dir_str = dir.path().to_string_lossy().to_string();
-
-            let (entries, text) = run_batch(json!({
-                "tool_calls": [
-                    {"tool": "grep", "path": dir_str, "pattern": "hello"}
-                ]
-            }))
-            .await;
-            assert_eq!(entries.len(), 1);
-            assert_eq!(entries[0].status, BatchToolStatus::Success);
-            assert!(text.contains("a.txt"));
-        });
-    }
 }

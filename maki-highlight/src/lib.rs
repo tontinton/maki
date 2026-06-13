@@ -191,6 +191,13 @@ pub fn highlight_code(lang: &str, code: &str) -> Vec<Vec<StyledSegment>> {
         .collect()
 }
 
+pub fn highlight_lines_independent(lang: &str, code: &str) -> Vec<Vec<StyledSegment>> {
+    let syntax = syntax_for_token(lang);
+    LinesWithEndings::from(code)
+        .map(|raw| Highlighter::for_syntax(syntax).highlight_line(raw))
+        .collect()
+}
+
 pub fn highlight_ansi(lang: &str, code: &str, bg: (u8, u8, u8)) -> String {
     let bg_code = format!("\x1b[48;2;{};{};{}m", bg.0, bg.1, bg.2);
     let mut hl = Highlighter::for_token(lang);
@@ -313,6 +320,28 @@ mod tests {
         let trailing = highlight_code("rust", "let x = 1;\n\n\n");
         assert_eq!(trailing.len(), 3);
         assert_eq!(segments_text(&trailing[1]), "");
+    }
+
+    #[test]
+    fn highlight_lines_independent_ignores_cross_line_state() {
+        warmup();
+        let context_line = "/* start of block comment\n";
+        let target_line = "let x = 42;\n";
+        let combined = format!("{context_line}{target_line}");
+
+        let stateful = highlight_code("rust", &combined);
+        let independent = highlight_lines_independent("rust", &combined);
+
+        assert_eq!(
+            stateful.len(),
+            independent.len(),
+            "both should produce the same number of lines"
+        );
+        assert_ne!(
+            stateful[1], independent[1],
+            "inside a block comment the stateful highlighter should parse \
+             `let x = 42;` differently than a fresh independent highlighter"
+        );
     }
 
     #[test]

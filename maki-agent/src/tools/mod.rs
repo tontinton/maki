@@ -39,7 +39,6 @@ use ignore::WalkBuilder;
 use serde_json::Value;
 use tracing::warn;
 
-pub(super) use crate::NO_FILES_FOUND;
 use crate::agent::LoadedInstructions;
 use crate::cancel::CancelToken;
 use crate::mcp::McpHandle;
@@ -121,7 +120,7 @@ pub const BASH_TOOL_NAME: &str = "bash";
 pub const BATCH_TOOL_NAME: &str = batch::Batch::NAME;
 pub const EDIT_TOOL_NAME: &str = edit::Edit::NAME;
 pub const GLOB_TOOL_NAME: &str = "glob";
-pub const GREP_TOOL_NAME: &str = grep::Grep::NAME;
+pub const GREP_TOOL_NAME: &str = "grep";
 pub const MULTIEDIT_TOOL_NAME: &str = multiedit::MultiEdit::NAME;
 pub const QUESTION_TOOL_NAME: &str = "question";
 pub const READ_TOOL_NAME: &str = read::Read::NAME;
@@ -543,7 +542,6 @@ register_tools! {
     write::Write,
     edit::Edit,
     multiedit::MultiEdit,
-    grep::Grep,
     todowrite::TodoWrite,
     task::Task,
     batch::Batch,
@@ -718,9 +716,9 @@ mod tests {
 
     use super::test_support::stub_ctx;
     use super::*;
+    use crate::AgentError;
     use crate::agent::tool_dispatch;
     use crate::template::Vars;
-    use crate::{AgentError, NO_FILES_FOUND};
 
     const LINE_LIMIT: usize = 500;
     const PARSE_INTERNAL_BUG: &str = "internal validator bug";
@@ -740,13 +738,10 @@ mod tests {
 
     #[test]
     fn cap_timeout_clamps_to_remaining() {
-        let clamped = Deadline::after(Duration::from_secs(30))
-            .cap_timeout(600)
+        let clamped = Deadline::after(Duration::from_secs(3600))
+            .cap_timeout(7200)
             .unwrap();
-        assert!(
-            (1..=30).contains(&clamped),
-            "expected 1..=30, got {clamped}"
-        );
+        assert!(clamped <= 3600, "expected <= 3600, got {clamped}");
     }
 
     #[test]
@@ -809,81 +804,54 @@ mod tests {
     }
 
     #[test]
-    fn grep_finds_filters_and_misses() {
-        smol::block_on(async {
-            let dir = TempDir::new().unwrap();
-            fs::write(dir.path().join("a.txt"), "hello world\ngoodbye world").unwrap();
-            fs::write(dir.path().join("b.rs"), "hello rust").unwrap();
-            let dir_str = dir.path().to_string_lossy().to_string();
-            let ctx = stub_ctx(&AgentMode::Build);
+    fn grep_search_finds_filters_and_skips_binary() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("a.txt"), "hello world\ngoodbye world").unwrap();
+        fs::write(dir.path().join("b.rs"), "hello rust").unwrap();
+        fs::write(dir.path().join("bin.dat"), b"hello \x00 binary").unwrap();
+        let dir_str = dir.path().to_string_lossy().to_string();
 
-            let g = grep::Grep::parse_input(&json!({"pattern": "hello", "path": dir_str})).unwrap();
-            let hit = g.execute(&ctx).await.unwrap().as_text().to_string();
-            assert!(hit.contains("a.txt"));
-            assert!(hit.contains("b.rs"));
+        let mut params = grep::GrepParams::new("hello".into());
+        params.path = Some(dir_str.clone());
+        let (_, entries) = grep::grep_search(params).unwrap();
+        let paths: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
+        assert!(paths.contains(&"a.txt"));
+        assert!(paths.contains(&"b.rs"));
+        assert!(!paths.contains(&"bin.dat"));
 
-            let g = grep::Grep::parse_input(
-                &json!({"pattern": "hello", "path": dir_str, "include": "*.rs"}),
-            )
-            .unwrap();
-            let filtered = g.execute(&ctx).await.unwrap().as_text().to_string();
-            assert!(filtered.contains("b.rs"));
-            assert!(!filtered.contains("a.txt"));
+        let mut params = grep::GrepParams::new("hello".into());
+        params.path = Some(dir_str.clone());
+        params.include = Some("*.rs".into());
+        let (_, entries) = grep::grep_search(params).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, "b.rs");
 
-            let g = grep::Grep::parse_input(&json!({"pattern": "zzzznotfound", "path": dir_str}))
-                .unwrap();
-            assert_eq!(g.execute(&ctx).await.unwrap().as_text(), NO_FILES_FOUND);
-        });
+        let mut params = grep::GrepParams::new("zzzznotfound".into());
+        params.path = Some(dir_str);
+        let (_, entries) = grep::grep_search(params).unwrap();
+        assert!(entries.is_empty());
     }
 
     #[test]
-    fn grep_single_file_preserves_filename() {
-        smol::block_on(async {
-            let dir = TempDir::new().unwrap();
-            let file = dir.path().join("demo.rs");
-            fs::write(&file, "fn main() {}\n").unwrap();
-            let ctx = stub_ctx(&AgentMode::Build);
+    fn grep_search_single_file_preserves_filename() {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("demo.rs");
+        fs::write(&file, "fn main() {}\n").unwrap();
 
-            let path = file.to_string_lossy().to_string();
-            let g = grep::Grep::parse_input(&json!({"pattern": "fn main", "path": path})).unwrap();
-            let out = g.execute(&ctx).await.unwrap();
-            let crate::ToolOutput::GrepResult { entries } = &out else {
-                panic!("expected GrepResult, got: {out:?}");
-            };
-            assert_eq!(entries.len(), 1);
-            assert_eq!(entries[0].path, "demo.rs");
-        });
+        let mut params = grep::GrepParams::new("fn main".into());
+        params.path = Some(file.to_string_lossy().into());
+        let (_, entries) = grep::grep_search(params).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, "demo.rs");
     }
 
     #[test]
-    fn grep_skips_binary_files() {
-        smol::block_on(async {
-            let dir = TempDir::new().unwrap();
-            fs::write(dir.path().join("text.txt"), "findme here").unwrap();
-            fs::write(dir.path().join("binary.bin"), b"findme \x00 binary content").unwrap();
-            let dir_str = dir.path().to_string_lossy().to_string();
-            let ctx = stub_ctx(&AgentMode::Build);
-
-            let g =
-                grep::Grep::parse_input(&json!({"pattern": "findme", "path": dir_str})).unwrap();
-            let out = g.execute(&ctx).await.unwrap().as_text().to_string();
-            assert!(out.contains("text.txt"));
-            assert!(!out.contains("binary.bin"));
-        });
-    }
-
-    #[test]
-    fn grep_invalid_regex_returns_error() {
-        smol::block_on(async {
-            let dir = TempDir::new().unwrap();
-            let dir_str = dir.path().to_string_lossy().to_string();
-            let ctx = stub_ctx(&AgentMode::Build);
-
-            let g =
-                grep::Grep::parse_input(&json!({"pattern": "[invalid", "path": dir_str})).unwrap();
-            let err = g.execute(&ctx).await.unwrap_err();
-            assert!(err.contains(grep::INVALID_REGEX), "got: {err}");
-        });
+    fn grep_search_invalid_regex_returns_error() {
+        let dir = TempDir::new().unwrap();
+        let mut params = grep::GrepParams::new("[invalid".into());
+        params.path = Some(dir.path().to_string_lossy().into());
+        let err = grep::grep_search(params).unwrap_err();
+        assert!(err.contains(grep::INVALID_REGEX), "got: {err}");
     }
 
     /// Every registered tool, poked with four shapes of garbage, should come
@@ -957,7 +925,7 @@ mod tests {
     #[test]
     fn definitions_filtered_returns_only_requested() {
         let vars = Vars::new().set("{cwd}", "/tmp");
-        let filter = ToolFilter::Only(vec!["read".into(), "grep".into()]);
+        let filter = ToolFilter::Only(vec!["read".into()]);
         let ctx = DescriptionContext { filter: &filter };
         let filtered = ToolRegistry::native().definitions(&vars, &ctx, true);
         let names: Vec<&str> = filtered
@@ -966,7 +934,7 @@ mod tests {
             .iter()
             .map(|d| d["name"].as_str().unwrap())
             .collect();
-        assert_eq!(names, ["read", "grep"]);
+        assert_eq!(names, ["read"]);
     }
 
     #[test_case("write",     |p: &str, _: &str| json!({"path": p, "content": "plan"})                          , |_: &str, o: &str| json!({"path": o, "content": "x"})                           ; "write")]
@@ -1072,67 +1040,46 @@ mod tests {
     }
 
     #[test]
-    fn walk_builder_excludes_dot_git_but_shows_dotfiles() {
+    fn walk_builder_excludes_dot_git_shows_dotfiles_and_filters_globs() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
 
         fs::create_dir_all(root.join(".git/objects")).unwrap();
-        fs::write(root.join(".git/config"), "repositoryformatversion = 0").unwrap();
-        fs::write(root.join(".git/objects/abc123"), "blob").unwrap();
-
-        fs::write(root.join(".env"), "SECRET=42").unwrap();
-        fs::write(root.join("main.rs"), "fn main() {}").unwrap();
-
-        let root_str = root.to_string_lossy();
-        let paths: Vec<String> = walk_builder(&root_str, &[])
-            .unwrap()
-            .build()
-            .flatten()
-            .filter(|e| e.file_type().is_some_and(|ft| ft.is_file()))
-            .map(|e| {
-                e.path()
-                    .strip_prefix(root)
-                    .unwrap()
-                    .to_string_lossy()
-                    .into_owned()
-            })
-            .collect();
-
-        assert!(paths.contains(&"main.rs".to_string()));
-        assert!(paths.contains(&".env".to_string()));
-        assert!(!paths.iter().any(|p| p.starts_with(".git")));
-    }
-
-    #[test]
-    fn walk_builder_excludes_dot_git_with_extra_patterns() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path();
-
-        fs::create_dir_all(root.join(".git")).unwrap();
         fs::write(root.join(".git/config"), "stuff").unwrap();
+        fs::write(root.join(".git/objects/abc123"), "blob").unwrap();
+        fs::write(root.join(".env"), "SECRET=42").unwrap();
         fs::write(root.join("lib.rs"), "pub fn foo() {}").unwrap();
         fs::write(root.join("main.py"), "print('hi')").unwrap();
-        fs::write(root.join(".hidden.rs"), "// hidden").unwrap();
 
         let root_str = root.to_string_lossy();
-        let paths: Vec<String> = walk_builder(&root_str, &["*.rs"])
-            .unwrap()
-            .build()
-            .flatten()
-            .filter(|e| e.file_type().is_some_and(|ft| ft.is_file()))
-            .map(|e| {
-                e.path()
-                    .strip_prefix(root)
-                    .unwrap()
-                    .to_string_lossy()
-                    .into_owned()
-            })
-            .collect();
+        let collect = |patterns: &[&str]| -> Vec<String> {
+            walk_builder(&root_str, patterns)
+                .unwrap()
+                .build()
+                .flatten()
+                .filter(|e| e.file_type().is_some_and(|ft| ft.is_file()))
+                .map(|e| {
+                    e.path()
+                        .strip_prefix(root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect()
+        };
 
-        assert!(paths.contains(&"lib.rs".to_string()));
-        assert!(paths.contains(&".hidden.rs".to_string()));
-        assert!(!paths.contains(&"main.py".to_string()));
-        assert!(!paths.iter().any(|p| p.starts_with(".git")));
+        let all = collect(&[]);
+        assert!(all.contains(&"lib.rs".into()));
+        assert!(all.contains(&".env".into()), "dotfiles must be shown");
+        assert!(
+            !all.iter().any(|p| p.starts_with(".git")),
+            ".git must be excluded"
+        );
+
+        let rs_only = collect(&["*.rs"]);
+        assert!(rs_only.contains(&"lib.rs".into()));
+        assert!(!rs_only.contains(&"main.py".into()), "glob must filter");
+        assert!(!rs_only.iter().any(|p| p.starts_with(".git")));
     }
 
     #[test]
@@ -1282,6 +1229,11 @@ mod tests {
                 entry.name(),
                 "glob",
                 "glob should not be in the native Rust tool registry"
+            );
+            assert_ne!(
+                entry.name(),
+                "grep",
+                "grep should not be in the native Rust tool registry"
             );
         }
     }

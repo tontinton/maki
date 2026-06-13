@@ -46,11 +46,22 @@ pub(crate) fn create_ui_table(
     )?;
     t.set(
         "highlight",
-        lua.create_async_function(|lua, (code, lang): (String, String)| async move {
-            let segments =
-                smol::unblock(move || maki_highlight::highlight_code(&lang, &code)).await;
-            segments_to_lua_lines(&lua, &segments)
-        })?,
+        lua.create_async_function(
+            |lua, (code, lang, opts): (String, String, Option<mlua::Table>)| async move {
+                let independent = opts
+                    .and_then(|t| t.get::<bool>("independent").ok())
+                    .unwrap_or(false);
+                let segments = smol::unblock(move || {
+                    if independent {
+                        maki_highlight::highlight_lines_independent(&lang, &code)
+                    } else {
+                        maki_highlight::highlight_code(&lang, &code)
+                    }
+                })
+                .await;
+                segments_to_lua_lines(&lua, &segments)
+            },
+        )?,
     )?;
     // maki.ui.markdown(text, width) -> lines, each `{ {text, style}, ... }`.
     // Async so the expensive code-block highlighting never blocks the UI.
