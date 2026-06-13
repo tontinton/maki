@@ -11,7 +11,7 @@ mod code_execution;
 mod edit;
 mod file_tracker;
 mod fuzzy_replace;
-mod grep;
+pub mod grep;
 mod multiedit;
 mod read;
 pub mod registry;

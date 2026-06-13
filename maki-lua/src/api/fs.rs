@@ -475,6 +475,68 @@ pub(crate) fn create_fs_table(lua: &Lua, perms: &PluginPermissions) -> LuaResult
         )?,
     )?;
 
+    t.set(
+        "grep",
+        perms.guard_async(
+            FsRead,
+            lua,
+            |lua, (pattern, opts): (String, Option<Table>)| async move {
+                let mut params = maki_agent::tools::grep::GrepParams::new(pattern);
+                if let Some(ref opts) = opts {
+                    if let Ok(v) = opts.get::<String>("path") {
+                        params.path = Some(v);
+                    }
+                    if let Ok(v) = opts.get::<String>("include") {
+                        params.include = Some(v);
+                    }
+                    if let Ok(v) = opts.get::<usize>("context_before") {
+                        params.context_before = v;
+                    }
+                    if let Ok(v) = opts.get::<usize>("context_after") {
+                        params.context_after = v;
+                    }
+                    if let Ok(v) = opts.get::<usize>("limit") {
+                        params.limit = v;
+                    }
+                    if let Ok(v) = opts.get::<usize>("max_line_bytes") {
+                        params.max_line_bytes = v;
+                    }
+                }
+
+                let result =
+                    smol::unblock(move || maki_agent::tools::grep::grep_search(params)).await;
+
+                match result {
+                    Ok((base, entries)) => {
+                        let arr = lua.create_table()?;
+                        for (i, entry) in entries.iter().enumerate() {
+                            let etbl = lua.create_table()?;
+                            etbl.set("path", base.join(&entry.path).to_string_lossy().as_ref())?;
+                            let groups_tbl = lua.create_table()?;
+                            for (gi, group) in entry.groups.iter().enumerate() {
+                                let gtbl = lua.create_table()?;
+                                let lines_tbl = lua.create_table()?;
+                                for (li, line) in group.lines.iter().enumerate() {
+                                    let ltbl = lua.create_table()?;
+                                    ltbl.set("line_nr", line.line_nr)?;
+                                    ltbl.set("text", line.text.as_str())?;
+                                    ltbl.set("is_match", line.is_match)?;
+                                    lines_tbl.set(li + 1, ltbl)?;
+                                }
+                                gtbl.set("lines", lines_tbl)?;
+                                groups_tbl.set(gi + 1, gtbl)?;
+                            }
+                            etbl.set("groups", groups_tbl)?;
+                            arr.set(i + 1, etbl)?;
+                        }
+                        Ok((mlua::Value::Table(arr), mlua::Value::Nil))
+                    }
+                    Err(e) => Ok((mlua::Value::Nil, mlua::Value::String(lua.create_string(e)?))),
+                }
+            },
+        )?,
+    )?;
+
     Ok(t)
 }
 
@@ -938,5 +1000,118 @@ mod tests {
         }
         assert_eq!(paths.len(), 1);
         assert!(paths[0].ends_with("inner.rs"));
+    }
+
+    fn grep_call(tbl: &Table, pattern: &str, opts: Table) -> (mlua::Value, mlua::Value) {
+        let grep: mlua::Function = tbl.get("grep").unwrap();
+        smol::block_on(grep.call_async((pattern, opts))).unwrap()
+    }
+
+    #[test]
+    fn grep_returns_matches_with_context_and_limit() {
+        let tmp = TempDir::new().unwrap();
+        let mut content = String::new();
+        for i in 1..=20 {
+            content.push_str(&format!("line_{i}\n"));
+        }
+        std::fs::write(tmp.path().join("data.txt"), &content).unwrap();
+        std::fs::write(tmp.path().join("other.txt"), "no hits here\n").unwrap();
+
+        let lua = Lua::new();
+        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
+
+        // basic match: hits data.txt, skips other.txt
+        let opts = lua.create_table().unwrap();
+        opts.set("path", tmp.path().to_str().unwrap()).unwrap();
+        let (val, err) = grep_call(&tbl, "line_", opts);
+        assert_eq!(err, mlua::Value::Nil);
+        let result: Table = mlua::FromLua::from_lua(val, &lua).unwrap();
+        assert_eq!(result.len().unwrap(), 1);
+        let entry: Table = result.get(1).unwrap();
+        let path = entry.get::<String>("path").unwrap();
+        assert!(path.ends_with("data.txt"));
+        assert!(std::path::Path::new(&path).is_absolute());
+        let groups: Table = entry.get("groups").unwrap();
+        assert!(groups.len().unwrap() > 0);
+        let line: Table = groups
+            .get::<Table>(1)
+            .unwrap()
+            .get::<Table>("lines")
+            .unwrap()
+            .get(1)
+            .unwrap();
+        assert!(line.get::<bool>("is_match").unwrap());
+        assert!(line.get::<usize>("line_nr").unwrap() > 0);
+
+        // context lines
+        let opts = lua.create_table().unwrap();
+        opts.set("path", tmp.path().to_str().unwrap()).unwrap();
+        opts.set("context_before", 1).unwrap();
+        opts.set("context_after", 1).unwrap();
+        let (val, _) = grep_call(&tbl, "line_10", opts);
+        let result: Table = mlua::FromLua::from_lua(val, &lua).unwrap();
+        let lines: Table = result
+            .get::<Table>(1)
+            .unwrap()
+            .get::<Table>("groups")
+            .unwrap()
+            .get::<Table>(1)
+            .unwrap()
+            .get("lines")
+            .unwrap();
+        assert_eq!(lines.len().unwrap(), 3);
+        assert!(
+            !lines
+                .get::<Table>(1)
+                .unwrap()
+                .get::<bool>("is_match")
+                .unwrap()
+        );
+        assert!(
+            lines
+                .get::<Table>(2)
+                .unwrap()
+                .get::<bool>("is_match")
+                .unwrap()
+        );
+        assert!(
+            !lines
+                .get::<Table>(3)
+                .unwrap()
+                .get::<bool>("is_match")
+                .unwrap()
+        );
+
+        // limit caps group count
+        let opts = lua.create_table().unwrap();
+        opts.set("path", tmp.path().to_str().unwrap()).unwrap();
+        opts.set("limit", 5).unwrap();
+        let (val, _) = grep_call(&tbl, "line_", opts);
+        let result: Table = mlua::FromLua::from_lua(val, &lua).unwrap();
+        let groups: Table = result.get::<Table>(1).unwrap().get("groups").unwrap();
+        assert_eq!(groups.len().unwrap(), 5);
+
+        // no match returns empty table, not error
+        let opts = lua.create_table().unwrap();
+        opts.set("path", tmp.path().to_str().unwrap()).unwrap();
+        let (val, err) = grep_call(&tbl, "zzz_no_match", opts);
+        assert_eq!(err, mlua::Value::Nil);
+        let result: Table = mlua::FromLua::from_lua(val, &lua).unwrap();
+        assert_eq!(result.len().unwrap(), 0);
+    }
+
+    #[test]
+    fn grep_invalid_regex_returns_nil_err() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("x.txt"), "hello\n").unwrap();
+
+        let lua = Lua::new();
+        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
+
+        let opts = lua.create_table().unwrap();
+        opts.set("path", tmp.path().to_str().unwrap()).unwrap();
+        let (val, err) = grep_call(&tbl, "[invalid", opts);
+        assert_eq!(val, mlua::Value::Nil);
+        assert!(matches!(err, mlua::Value::String(_)));
     }
 }
