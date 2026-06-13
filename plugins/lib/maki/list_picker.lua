@@ -121,9 +121,8 @@ function ListPicker.open(items, opts)
   local buf = maki.ui.buf()
 
   local border_chrome = 2
-  local footer_h = opts.footer and #opts.footer > 0 and 1 or 0
   local content_h = #items + 1
-  local total_h = content_h + footer_h + border_chrome
+  local total_h = content_h + border_chrome
 
   local win = maki.ui.open_win(buf, {
     title = opts.title,

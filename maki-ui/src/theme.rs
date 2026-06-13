@@ -348,7 +348,9 @@ pub struct Theme {
     pub diff_line_nr: Style,
     pub todo_completed: Style,
     pub todo_in_progress: Style,
+    #[allow(dead_code)]
     pub todo_pending: Style,
+    #[allow(dead_code)]
     pub todo_cancelled: Style,
     pub item_selected: Style,
     pub item: Style,

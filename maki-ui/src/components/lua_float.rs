@@ -10,7 +10,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 
 use crate::components::split_layout::SplitReq;
 use crate::components::{
-    Overlay, hint_line, keybindings::key_event_to_string, scrollbar::render_vertical_scrollbar,
+    Overlay, keybindings::key_event_to_string, scrollbar::render_vertical_scrollbar,
     tool_display::resolve_span_style,
 };
 use crate::theme;
@@ -63,6 +63,7 @@ struct FloatWindow {
     viewport_h: u16,
     last_content: Rect,
     cursor: usize,
+    visible: bool,
     event_tx: flume::Sender<WinEvent>,
     cmd_rx: flume::Receiver<WinCommand>,
 }
@@ -182,11 +183,12 @@ impl FloatManager {
 
         // One split per direction, so evicting the old same-direction window
         // goes through the same removal path that guarantees it hears its close.
-        if config.split != Split::None {
+        if config.split != Split::None && config.split != Split::Panel {
             let dir = config.split;
             self.remove_windows(|w| w.config.split == dir);
         }
 
+        let visible = config.visible;
         let win = FloatWindow {
             id,
             buf,
@@ -196,6 +198,7 @@ impl FloatManager {
             viewport_h: 1,
             last_content: Rect::default(),
             cursor: 0,
+            visible,
             event_tx,
             cmd_rx,
         };
@@ -224,6 +227,9 @@ impl FloatManager {
                     }
                     Ok(WinCommand::SetCursor(row)) => {
                         win.set_cursor(row);
+                    }
+                    Ok(WinCommand::SetVisible(v)) => {
+                        win.visible = v;
                     }
                     Ok(WinCommand::Close) | Err(flume::TryRecvError::Disconnected) => {
                         closed_ids.push(win.id);
@@ -315,6 +321,25 @@ impl FloatManager {
         self.render_window(frame, idx, rect);
     }
 
+    pub fn panel_reqs(&self) -> Vec<(usize, u16)> {
+        let mut reqs: Vec<(usize, u16)> = self
+            .windows
+            .iter()
+            .enumerate()
+            .filter(|(_, w)| w.config.split == Split::Panel && w.visible)
+            .map(|(i, w)| (i, w.config.height.resolve(100)))
+            .collect();
+        reqs.sort_by_key(|(i, _)| self.windows[*i].config.order);
+        reqs
+    }
+
+    pub fn view_panel(&mut self, frame: &mut Frame, idx: usize, rect: Rect) {
+        if rect.width == 0 || rect.height == 0 {
+            return;
+        }
+        self.render_window(frame, idx, rect);
+    }
+
     fn render_window(&mut self, frame: &mut Frame, idx: usize, popup: Rect) {
         let t = theme::current();
         let win = &mut self.windows[idx];
@@ -346,6 +371,9 @@ impl FloatManager {
                     .title_alignment(alignment)
                     .title_style(t.panel_title);
             }
+            if !win.config.footer.is_empty() {
+                b = b.title_bottom(hint_footer(&win.config.footer).right_aligned());
+            }
             b
         } else {
             Block::default().style(ratatui::style::Style::new().bg(t.background))
@@ -354,24 +382,7 @@ impl FloatManager {
         let inner = block.inner(popup);
         frame.render_widget(block, popup);
 
-        let footer_h = u16::from(!win.config.footer.is_empty());
-        let content_area = if footer_h > 0 && inner.height > footer_h {
-            let footer_rect = Rect {
-                x: inner.x,
-                y: inner.y + inner.height - footer_h,
-                width: inner.width,
-                height: footer_h,
-            };
-            frame.render_widget(hint_line(&win.config.footer), footer_rect);
-            Rect {
-                x: inner.x,
-                y: inner.y,
-                width: inner.width,
-                height: inner.height - footer_h,
-            }
-        } else {
-            inner
-        };
+        let content_area = inner;
 
         if win.last_content != content_area {
             let _ = win.event_tx.try_send(WinEvent::Resize {
@@ -486,6 +497,23 @@ impl FloatManager {
     }
 }
 
+fn hint_footer<K: AsRef<str>, V: AsRef<str>>(pairs: &[(K, V)]) -> Line<'static> {
+    let t = crate::theme::current();
+    let mut spans = Vec::with_capacity(pairs.len() * 3);
+    for (key, desc) in pairs {
+        spans.push(Span::raw(" "));
+        for (i, part) in key.as_ref().split('/').enumerate() {
+            if i > 0 {
+                spans.push(Span::styled("/", t.tool_dim));
+            }
+            spans.push(Span::styled(part.to_string(), t.keybind_key));
+        }
+        spans.push(Span::styled(format!(" {}", desc.as_ref()), t.tool_dim));
+    }
+    spans.push(Span::raw(" "));
+    Line::from(spans)
+}
+
 fn resolve_rect(config: &FloatConfig, area: Rect) -> Rect {
     let w = config.width.resolve(area.width).min(area.width);
     let h = config.height.resolve(area.height).min(area.height);
@@ -578,7 +606,7 @@ impl Drop for FloatManager {
 
 impl Overlay for FloatManager {
     fn is_open(&self) -> bool {
-        self.is_open()
+        self.focused_id.is_some()
     }
 
     fn close(&mut self) {
@@ -1439,6 +1467,7 @@ mod tests {
             viewport_h: 1,
             last_content: Rect::default(),
             cursor: 0,
+            visible: true,
             event_tx,
             cmd_rx,
         }

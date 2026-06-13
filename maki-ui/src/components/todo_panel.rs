@@ -8,7 +8,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use std::collections::HashMap;
 
+#[allow(dead_code)]
 const PANEL_TITLE: &str = " Todos ";
+#[allow(dead_code)]
 const HIDE_DESC: &str = " to hide ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,6 +101,7 @@ impl TodoPanel {
         ]))
     }
 
+    #[allow(dead_code)]
     pub fn height(&self) -> u16 {
         if !self.visibility.is_shown() || self.items.is_empty() {
             0
@@ -107,6 +110,7 @@ impl TodoPanel {
         }
     }
 
+    #[allow(dead_code)]
     pub fn view(&self, frame: &mut Frame, area: Rect) {
         if self.items.is_empty() {
             return;

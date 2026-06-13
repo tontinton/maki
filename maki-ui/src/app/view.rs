@@ -20,7 +20,7 @@ struct ViewLayout {
     bottom_area: Rect,
     status_area: Rect,
     queue_area: Rect,
-    todo_area: Rect,
+    panel_windows: Vec<(usize, Rect)>,
     input_area: Rect,
     splits: SplitLayout,
 }
@@ -76,12 +76,13 @@ impl App {
         } else if form_visible {
             self.plan_form.height().min(max_bottom)
         } else if self.is_main_chat() {
+            let panel_h: u16 = self.float_mgr.panel_reqs().iter().map(|(_, h)| *h).sum();
             queue_panel::height(self.queue.panel_len())
-                + self.chats[self.active_chat].todo_panel.height()
+                + panel_h
                 + self.input_box.height(inner.width)
         } else {
-            let todo_h = self.chats[self.active_chat].todo_panel.height();
-            if todo_h > 0 { todo_h + 1 } else { 1 }
+            let panel_h: u16 = self.float_mgr.panel_reqs().iter().map(|(_, h)| *h).sum();
+            if panel_h > 0 { panel_h + 1 } else { 1 }
         };
 
         // The `below` split lives outside `inner` (drawn by render_splits), so
@@ -89,28 +90,42 @@ impl App {
         let [msg_area, bottom_area] =
             Layout::vertical([Constraint::Min(1), Constraint::Length(bottom_height)]).areas(inner);
 
-        let (queue_height, todo_h, input_height) = if bottom_takeover {
-            (0, 0, 0)
+        let panel_reqs = if bottom_takeover {
+            Vec::new()
         } else {
-            let queue_height = queue_panel::height(self.queue.panel_len());
-            let todo_h = self.chats[self.active_chat].todo_panel.height();
-            let input_height = bottom_area.height.saturating_sub(queue_height + todo_h);
-            (queue_height, todo_h, input_height)
+            self.float_mgr.panel_reqs()
         };
 
-        let [queue_area, todo_area, input_area] = Layout::vertical([
-            Constraint::Length(queue_height),
-            Constraint::Length(todo_h),
-            Constraint::Length(input_height),
-        ])
-        .areas(bottom_area);
+        let (queue_height, _input_height) = if bottom_takeover {
+            (0, 0)
+        } else {
+            let queue_height = queue_panel::height(self.queue.panel_len());
+            let panel_h: u16 = panel_reqs.iter().map(|(_, h)| *h).sum();
+            let input_height = bottom_area.height.saturating_sub(queue_height + panel_h);
+            (queue_height, input_height)
+        };
+
+        let mut constraints = vec![Constraint::Length(queue_height)];
+        for &(_, h) in &panel_reqs {
+            constraints.push(Constraint::Length(h));
+        }
+        constraints.push(Constraint::Min(1));
+
+        let areas = Layout::vertical(constraints).split(bottom_area);
+        let queue_area = areas[0];
+        let panel_windows: Vec<(usize, Rect)> = panel_reqs
+            .iter()
+            .enumerate()
+            .map(|(i, &(idx, _))| (idx, areas[1 + i]))
+            .collect();
+        let input_area = areas[areas.len() - 1];
 
         ViewLayout {
             msg_area,
             bottom_area,
             status_area,
             queue_area,
-            todo_area,
+            panel_windows,
             input_area,
             splits,
         }
@@ -143,16 +158,27 @@ impl App {
         if self.permission_prompt.is_open() {
             self.permission_prompt.view(frame, layout.bottom_area);
         } else if !self.is_main_chat() {
-            let todo_h = self.chats[self.active_chat].todo_panel.height();
-            let (todo_area, sep_area) = if todo_h > 0 {
-                let [t, s] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)])
+            let panel_reqs = self.float_mgr.panel_reqs();
+            let panel_h: u16 = panel_reqs.iter().map(|(_, h)| *h).sum();
+            let (panel_areas, sep_area) = if panel_h > 0 {
+                let [panels, s] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)])
                     .areas(layout.bottom_area);
-                (Some(t), s)
+                let constraints: Vec<_> =
+                    panel_reqs.iter().map(|&(_, h)| Constraint::Length(h)).collect();
+                let sub = Layout::vertical(constraints).split(panels);
+                let areas: Vec<(usize, Rect)> = panel_reqs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &(idx, _))| (idx, sub[i]))
+                    .collect();
+                (Some(areas), s)
             } else {
                 (None, layout.bottom_area)
             };
-            if let Some(area) = todo_area {
-                self.chats[self.active_chat].todo_panel.view(frame, area);
+            if let Some(areas) = panel_areas {
+                for (idx, rect) in areas {
+                    self.float_mgr.view_panel(frame, idx, rect);
+                }
             }
             let sep = Block::default()
                 .borders(Borders::TOP)
@@ -163,10 +189,8 @@ impl App {
         } else if layout.bottom_area.height > 0 {
             let queue_entries = self.queue.panel_entries();
             queue_panel::view(frame, layout.queue_area, &queue_entries, self.queue.focus());
-            if layout.todo_area.height > 0 {
-                self.chats[self.active_chat]
-                    .todo_panel
-                    .view(frame, layout.todo_area);
+            for &(idx, rect) in &layout.panel_windows {
+                self.float_mgr.view_panel(frame, idx, rect);
             }
             let streaming = self.status == Status::Streaming;
             let panel_hint = in_plan

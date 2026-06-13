@@ -155,6 +155,8 @@ pub(crate) fn create_ui_table(
                     let border = parse_border(&opts_tbl);
                     let title_pos = parse_title_pos(&opts_tbl);
                     let split = parse_split(&opts_tbl);
+                    let order: u16 = opts_tbl.get("order").unwrap_or(50);
+                    let visible: bool = opts_tbl.get("visible").unwrap_or(true);
 
                     let config = FloatConfig {
                         width,
@@ -171,6 +173,8 @@ pub(crate) fn create_ui_table(
                         reserved_bottom,
                         reserved_top,
                         split,
+                        order,
+                        visible,
                     };
 
                     let (term_cols, term_rows) = crossterm::terminal::size().unwrap_or((80, 24));
@@ -178,7 +182,6 @@ pub(crate) fn create_ui_table(
                         Border::None => 0,
                         _ => 2,
                     };
-                    let footer_h = u16::from(!config.footer.is_empty());
                     let est_w = config
                         .width
                         .resolve(term_cols)
@@ -186,7 +189,7 @@ pub(crate) fn create_ui_table(
                     let est_h = config
                         .height
                         .resolve(term_rows)
-                        .saturating_sub(border_chrome + footer_h);
+                        .saturating_sub(border_chrome);
 
                     let (event_tx, event_rx) = flume::bounded::<WinEvent>(8);
                     let (cmd_tx, cmd_rx) = flume::bounded::<WinCommand>(8);

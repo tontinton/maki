@@ -27,6 +27,16 @@ pub(crate) mod theme_picker;
 pub(crate) mod todo_panel;
 pub(crate) mod tool_display;
 
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use maki_agent::AgentInput;
+use maki_agent::{BufferSnapshot, ToolInput, ToolOutput};
+use maki_providers::{Message, ModelTier};
+use ratatui::text::{Line, Span};
+
 pub(crate) const CHEVRON: &str = "❯ ";
 
 pub(crate) trait Overlay {
@@ -37,16 +47,6 @@ pub(crate) trait Overlay {
         true
     }
 }
-
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use maki_agent::AgentInput;
-use maki_agent::{BufferSnapshot, ToolInput, ToolOutput};
-use maki_providers::{Message, ModelTier};
-use ratatui::text::{Line, Span};
 
 pub(crate) fn hint_line<K: AsRef<str>, V: AsRef<str>>(pairs: &[(K, V)]) -> Line<'static> {
     let t = crate::theme::current();

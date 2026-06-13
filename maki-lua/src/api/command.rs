@@ -152,6 +152,7 @@ pub enum Split {
     Below,
     Left,
     Right,
+    Panel,
 }
 
 /// The renderer and layout read `Axis` rather than matching on `Split`, so a
@@ -178,6 +179,7 @@ impl Split {
             "below" => Self::Below,
             "left" => Self::Left,
             "right" => Self::Right,
+            "panel" => Self::Panel,
             _ => Self::None,
         }
     }
@@ -186,7 +188,7 @@ impl Split {
     /// single spot. `None` means the split is off.
     pub fn edge(self) -> Option<Edge> {
         Some(match self {
-            Self::None => return None,
+            Self::None | Self::Panel => return None,
             Self::Above => Edge {
                 axis: Axis::Vertical,
                 at_start: true,
@@ -246,6 +248,8 @@ pub struct FloatConfig {
     pub reserved_bottom: usize,
     pub reserved_top: usize,
     pub split: Split,
+    pub order: u16,
+    pub visible: bool,
 }
 
 impl Default for FloatConfig {
@@ -265,6 +269,8 @@ impl Default for FloatConfig {
             reserved_bottom: 0,
             reserved_top: 0,
             split: Split::None,
+            order: 50,
+            visible: true,
         }
     }
 }
@@ -293,7 +299,9 @@ impl FloatConfig {
             cursor_line,
             reserved_bottom,
             reserved_top,
-            split
+            split,
+            order,
+            visible
         );
     }
 }
@@ -314,6 +322,8 @@ pub struct FloatConfigPatch {
     pub reserved_bottom: Option<usize>,
     pub reserved_top: Option<usize>,
     pub split: Option<Split>,
+    pub order: Option<u16>,
+    pub visible: Option<bool>,
 }
 
 pub enum WinEvent {
@@ -326,6 +336,7 @@ pub enum WinEvent {
 pub enum WinCommand {
     SetConfig(FloatConfigPatch),
     SetCursor(usize),
+    SetVisible(bool),
     Close,
 }
 
@@ -438,6 +449,7 @@ mod tests {
         TitlePos::parse(s)
     }
 
+    #[test_case("panel" => Split::Panel ; "panel")]
     #[test_case("above" => Split::Above ; "above")]
     #[test_case("below" => Split::Below ; "below")]
     #[test_case("left" => Split::Left ; "left")]
@@ -450,6 +462,7 @@ mod tests {
         Split::parse(s)
     }
 
+    #[test_case(Split::Panel => None ; "panel_has_no_edge")]
     #[test_case(Split::None => None ; "none_has_no_edge")]
     #[test_case(Split::Above => Some(Edge { axis: Axis::Vertical, at_start: true }) ; "above_is_vertical_start")]
     #[test_case(Split::Below => Some(Edge { axis: Axis::Vertical, at_start: false }) ; "below_is_vertical_end")]
@@ -467,6 +480,7 @@ mod tests {
     #[test_case(Split::Below)]
     #[test_case(Split::Left)]
     #[test_case(Split::Right)]
+    #[test_case(Split::Panel)]
     fn all_lists_exactly_the_edge_bearing_variants(variant: Split) {
         assert_eq!(
             variant.edge().is_some(),
