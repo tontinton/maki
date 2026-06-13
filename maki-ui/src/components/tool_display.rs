@@ -770,7 +770,15 @@ pub fn build_tool_lines(
         msg.render_header.as_ref(),
     );
     b.prepend_indicator(status.into(), rctx.started_at);
-    b.push_code_content(msg.tool_input.as_deref(), msg.tool_output.as_deref());
+    let has_snapshot = msg.render_snapshot.is_some();
+    b.push_code_content(
+        msg.tool_input.as_deref(),
+        if has_snapshot {
+            None
+        } else {
+            msg.tool_output.as_deref()
+        },
+    );
     if let Some(ref snapshot) = msg.render_snapshot {
         let search_text = msg
             .tool_output

@@ -147,6 +147,36 @@ local function build_grep_view(entries, ctx)
   return buf
 end
 
+local function parse_llm_output(text)
+  local entries = {}
+  local current
+  for line in (text .. "\n"):gmatch("([^\n]*)\n") do
+    local path = line:match("^(%S.+):$")
+    if path then
+      current = { path = path, groups = { { lines = {} } } }
+      entries[#entries + 1] = current
+    elseif current then
+      if line == "  --" then
+        current.groups[#current.groups + 1] = { lines = {} }
+      else
+        local nr, sep, content = line:match("^%s+(%d+)([:]) (.*)$")
+        if not nr then
+          nr, sep, content = line:match("^%s+(%d+)( ) (.*)$")
+        end
+        if nr then
+          local group = current.groups[#current.groups]
+          group.lines[#group.lines + 1] = {
+            line_nr = tonumber(nr),
+            text = content or "",
+            is_match = sep == ":",
+          }
+        end
+      end
+    end
+  end
+  return entries
+end
+
 maki.api.register_tool({
   name = "grep",
   kind = "search",
@@ -179,7 +209,7 @@ maki.api.register_tool({
     local pattern = (input.pattern or ""):gsub('"$', "")
     local spans = { { pattern, "tool" } }
     if input.include then
-      spans[#spans + 1] = { " [" .. input.include .. "]", "tool_annotation" }
+      spans[#spans + 1] = { " [" .. input.include .. "]", "dim" }
     end
     if input.path then
       spans[#spans + 1] = { " " .. shorten_path(input.path), "path" }
@@ -189,7 +219,11 @@ maki.api.register_tool({
   end,
 
   restore = function(_input, output, _is_error, ctx)
-    return ToolView.restore(output, grep_view_opts(ctx))
+    local entries = parse_llm_output(output)
+    if #entries == 0 then
+      return nil
+    end
+    return build_grep_view(entries, ctx)
   end,
 
   handler = function(input, ctx)
