@@ -13,10 +13,23 @@ use node::LuaNode;
 pub(crate) fn create_treesitter_table(lua: &Lua) -> LuaResult<Table> {
     let t = lua.create_table()?;
 
-    let get_parser = lua.create_function(move |_, (source, lang_name): (String, String)| {
-        let lang = Language::from_name(&lang_name)
-            .ok_or_else(|| mlua::Error::runtime(format!("no language registered: {lang_name}")))?;
-        Ok(LuaLanguageTree::new(source.into(), lang_name.into(), lang))
+    let get_parser = lua.create_function(move |lua, (source, lang_name): (String, String)| {
+        let Some(lang) = Language::from_name(&lang_name) else {
+            return Ok((
+                mlua::Value::Nil,
+                mlua::Value::String(
+                    lua.create_string(format!("no language registered: {lang_name}"))?,
+                ),
+            ));
+        };
+        Ok((
+            mlua::Value::UserData(lua.create_userdata(LuaLanguageTree::new(
+                source.into(),
+                lang_name.into(),
+                lang,
+            ))?),
+            mlua::Value::Nil,
+        ))
     })?;
 
     t.set("get_parser", get_parser.clone())?;

@@ -5,8 +5,15 @@ pub(crate) fn create_text_table(lua: &Lua) -> LuaResult<Table> {
 
     text.set(
         "html_to_markdown",
-        lua.create_function(|_, html: String| {
-            htmd::convert(&html).map_err(|e| mlua::Error::runtime(format!("html_to_markdown: {e}")))
+        lua.create_function(|lua, html: String| match htmd::convert(&html) {
+            Ok(md) => Ok((
+                mlua::Value::String(lua.create_string(&md)?),
+                mlua::Value::Nil,
+            )),
+            Err(e) => Ok((
+                mlua::Value::Nil,
+                mlua::Value::String(lua.create_string(format!("html_to_markdown: {e}"))?),
+            )),
         })?,
     )?;
 

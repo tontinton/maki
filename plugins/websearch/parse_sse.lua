@@ -12,12 +12,9 @@ local function parse_sse_response(body)
   for line in body:gmatch("[^\n]+") do
     local data = line:match("^data: (.+)")
     if data then
-      local ok, parsed = pcall(maki.json.decode, data)
-      if not ok then
-        return nil, "SSE JSON parse error: " .. tostring(parsed)
-      end
-      if parsed == nil then
-        return nil, "SSE JSON parse error: decode returned nil"
+      local parsed, parse_err = maki.json.decode(data)
+      if not parsed then
+        return nil, "SSE JSON parse error: " .. parse_err
       end
       local text = extract_text(parsed)
       if text then

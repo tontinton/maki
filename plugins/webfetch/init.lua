@@ -140,8 +140,8 @@ maki.api.register_tool({
     local is_html = ct:find("text/html") ~= nil
 
     if fmt == "markdown" and is_html then
-      local ok, converted = pcall(maki.text.html_to_markdown, body)
-      body = ok and converted or body
+      local converted = maki.text.html_to_markdown(body)
+      body = converted or body
     elseif fmt == "text" and is_html then
       body = strip_html(body)
     end
