@@ -14,7 +14,7 @@ use maki_agent::{
     ToolStartEvent, TurnCompleteEvent,
 };
 use maki_config::{PermissionsConfig, UiConfig};
-use maki_lua::LuaCommandReader;
+use maki_lua::{KeymapReader, LuaCommandReader};
 use maki_providers::{ContentBlock, Role, TokenUsage};
 use maki_storage::sessions::StoredThinking;
 use ratatui::layout::Rect;
@@ -49,6 +49,7 @@ fn test_app() -> App {
         McpSnapshotReader::empty(),
         McpConfigErrors::new(PathBuf::new()),
         LuaCommandReader::empty(),
+        KeymapReader::empty(),
         writer,
         UiConfig::default(),
         100,
@@ -488,6 +489,7 @@ fn load_session_clears_plan() {
         McpSnapshotReader::empty(),
         McpConfigErrors::new(PathBuf::new()),
         LuaCommandReader::empty(),
+        KeymapReader::empty(),
         writer,
         UiConfig::default(),
         100,

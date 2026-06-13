@@ -57,7 +57,7 @@ use maki_agent::{
     SubagentInfo, ToolOutput,
 };
 use maki_config::UiConfig;
-use maki_lua::{EventHandle, LuaCommandReader};
+use maki_lua::{EventHandle, KeymapReader, LuaCommandReader};
 use maki_providers::{Message, Model, ThinkingConfig};
 use maki_storage::StateDir;
 use maki_storage::input_history::InputHistory;
@@ -174,6 +174,7 @@ pub struct App {
     pub(crate) permissions: Arc<PermissionManager>,
     pub(super) buf_click: Option<BufClickHandler>,
     pub(crate) lua_event_handle: Option<EventHandle>,
+    pub(super) keymap_reader: KeymapReader,
     pub(crate) restore_event_tx: Option<maki_agent::EventSender>,
     pub(super) restoring: Arc<AtomicBool>,
     subagent_answers: HashMap<String, flume::Sender<String>>,
@@ -189,6 +190,7 @@ impl App {
         mcp_reader: McpSnapshotReader,
         mcp_config_errors: McpConfigErrors,
         lua_command_reader: LuaCommandReader,
+        keymap_reader: KeymapReader,
         storage_writer: Arc<StorageWriter>,
         ui_config: UiConfig,
         input_history_size: usize,
@@ -247,6 +249,7 @@ impl App {
             permissions,
             buf_click: None,
             lua_event_handle: None,
+            keymap_reader,
             restore_event_tx: None,
             restoring: Arc::new(AtomicBool::new(false)),
             subagent_answers: HashMap::new(),
@@ -649,6 +652,10 @@ impl App {
             return actions;
         }
 
+        if self.dispatch_plugin_keymap(key) {
+            return vec![];
+        }
+
         if !self.is_main_chat() {
             return match key.code {
                 KeyCode::Tab if !self.is_bash_input() => self.toggle_mode(),
@@ -661,6 +668,19 @@ impl App {
         }
 
         self.handle_main_chat_key(key)
+    }
+
+    fn dispatch_plugin_keymap(&self, key: KeyEvent) -> bool {
+        let snap = self.keymap_reader.load();
+        for entry in &snap.entries {
+            if entry.key == key.code && entry.modifiers == key.modifiers {
+                if let Some(ref handle) = self.lua_event_handle {
+                    handle.run_keybind_callback(entry.id);
+                }
+                return true;
+            }
+        }
+        false
     }
 
     fn handle_main_chat_key(&mut self, key: KeyEvent) -> Vec<Action> {

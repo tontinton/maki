@@ -9,6 +9,7 @@ use maki_agent::tools::ToolRegistry;
 use maki_config::{PluginsConfig, RawConfig};
 
 use crate::api::command::{LuaCommandReader, UiAction};
+use crate::api::keymap::KeymapReader;
 use crate::error::PluginError;
 use crate::plugin_permissions::{PluginPermissions, load_plugin_permissions};
 use crate::runtime::{self, ClickReply, LuaThread, Request, RestoreItem};
@@ -267,6 +268,13 @@ impl PluginHost {
             .unwrap_or_else(LuaCommandReader::empty)
     }
 
+    pub fn keymap_reader(&self) -> KeymapReader {
+        self.inner
+            .as_ref()
+            .map(|t| t.keymap_reader.clone())
+            .unwrap_or_else(KeymapReader::empty)
+    }
+
     pub fn ui_action_rx(&self) -> Option<flume::Receiver<UiAction>> {
         self.inner.as_ref().map(|t| t.ui_action_rx.clone())
     }
@@ -326,6 +334,10 @@ impl EventHandle {
             event: event.to_owned(),
             data,
         });
+    }
+
+    pub fn run_keybind_callback(&self, id: u64) {
+        let _ = self.tx.try_send(Request::RunKeybindCallback { id });
     }
 }
 

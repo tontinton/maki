@@ -2,6 +2,7 @@ pub(crate) mod autocmd;
 mod async_api;
 pub(crate) mod buf;
 pub(crate) mod command;
+pub(crate) mod keymap;
 pub(crate) mod ctx;
 pub(crate) mod env;
 pub(crate) mod fn_api;
@@ -51,6 +52,7 @@ pub(crate) fn create_maki_global(
     maki.set("ui", ui::create_ui_table(lua, ui_action_tx)?)?;
     maki.set("fn", fn_api::create_fn_table(lua, permissions)?)?;
     maki.set("async", async_api::create_async_table(lua)?)?;
+    maki.set("keymap", keymap::create_keymap_table(lua, Arc::clone(&plugin))?)?;
 
     Ok(maki)
 }

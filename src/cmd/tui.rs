@@ -192,6 +192,7 @@ pub fn run(cli: Cli) -> Result<()> {
                 timeouts,
                 exit_on_done: cli.exit_on_done,
                 lua_command_reader,
+                keymap_reader: plugin_host.keymap_reader(),
                 ui_action_rx,
                 lua_event_handle: plugin_host.event_handle(),
                 buf_click: plugin_host.event_handle().map(|eh| {

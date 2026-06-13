@@ -25,6 +25,7 @@ use crate::api::buf::{BufHandle, BufferStore};
 use crate::api::command::{CommandHandlerMap, publish_command_snapshot};
 use crate::api::command::{LuaCommandReader, LuaCommandWriter, UiAction};
 use crate::api::autocmd::AutocmdStore;
+use crate::api::keymap::{KeymapStore, KeymapWriter};
 use crate::api::create_maki_global;
 use crate::api::ctx::LuaCtx;
 use crate::api::fn_api::{JobEvent, JobStore};
@@ -125,6 +126,9 @@ pub enum Request {
     FireAutocmd {
         event: String,
         data: Value,
+    },
+    RunKeybindCallback {
+        id: u64,
     },
 }
 
@@ -579,6 +583,7 @@ struct LuaRuntime {
 }
 
 impl LuaRuntime {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         registry: Arc<ToolRegistry>,
         tx: flume::Sender<Request>,
@@ -586,6 +591,7 @@ impl LuaRuntime {
         bundled_dirs: &'static [&'static Dir<'static>],
         ui_action_tx: Option<flume::Sender<UiAction>>,
         command_writer: LuaCommandWriter,
+        keymap_writer: KeymapWriter,
     ) -> Result<Self, PluginError> {
         let lua = Lua::new();
         let pending: PendingTools = Arc::new(Mutex::new(Vec::new()));
@@ -613,6 +619,8 @@ impl LuaRuntime {
         lua.set_app_data(command_writer);
         lua.set_app_data(PromptHintCallbacks::default());
         lua.set_app_data(AutocmdStore::default());
+        lua.set_app_data(KeymapStore::new());
+        lua.set_app_data(keymap_writer);
 
         Ok(Self {
             lua,
@@ -1027,6 +1035,17 @@ impl LuaRuntime {
             drop(store);
             for key in keys {
                 let _ = self.lua.remove_registry_value(key);
+            }
+        }
+        if let Some(mut store) = self.lua.app_data_mut::<KeymapStore>() {
+            let keys = store.clear_plugin(plugin);
+            let entries = store.snapshot_entries();
+            drop(store);
+            for key in keys {
+                let _ = self.lua.remove_registry_value(key);
+            }
+            if let Some(writer) = self.lua.app_data_ref::<KeymapWriter>() {
+                writer.publish(entries);
             }
         }
     }
@@ -1471,6 +1490,7 @@ pub(crate) struct LuaThread {
     pub join: Option<JoinHandle<()>>,
     pub shutdown: Arc<AtomicBool>,
     pub command_reader: LuaCommandReader,
+    pub keymap_reader: crate::api::keymap::KeymapReader,
     pub ui_action_rx: flume::Receiver<UiAction>,
 }
 
@@ -1487,6 +1507,7 @@ pub fn spawn(
     let (init_tx, init_rx) = flume::bounded::<Result<(), PluginError>>(1);
     let (ui_action_tx, ui_action_rx) = flume::unbounded::<UiAction>();
     let (command_writer, command_reader) = LuaCommandWriter::new();
+    let (keymap_writer, keymap_reader) = KeymapWriter::new();
 
     let handle = thread::Builder::new()
         .name("maki-lua".to_owned())
@@ -1498,6 +1519,7 @@ pub fn spawn(
                 bundled_dirs,
                 Some(ui_action_tx),
                 command_writer,
+                keymap_writer,
             ) {
                 Ok(r) => {
                     let _ = init_tx.send(Ok(()));
@@ -1714,6 +1736,23 @@ pub fn spawn(
                             }
                             drain_spawn_queue(&rt.lua, &ex, &gate);
                         }
+                        Request::RunKeybindCallback { id } => {
+                            let func = rt.lua.app_data_ref::<KeymapStore>().and_then(|store| {
+                                let key = store.callback_for_id(id)?;
+                                rt.lua.registry_value::<Function>(key).ok()
+                            });
+                            if let Some(func) = func {
+                                let lua = rt.lua.clone();
+                                let ex_ref = Rc::clone(&ex);
+                                let g = Rc::clone(&gate);
+                                ex.spawn(async move {
+                                    if let Err(e) = run_detached(&lua, func.call_async::<()>(())).await {
+                                        tracing::warn!(keybind_id = id, error = %e, "keybind callback failed");
+                                    }
+                                    drain_spawn_queue(&lua, &ex_ref, &g);
+                                }).detach();
+                            }
+                        }
                     }
                 }
             }));
@@ -1733,6 +1772,7 @@ pub fn spawn(
         join: Some(handle),
         shutdown,
         command_reader,
+        keymap_reader,
         ui_action_rx,
     })
 }
