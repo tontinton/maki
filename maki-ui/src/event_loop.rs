@@ -12,7 +12,7 @@ use maki_agent::command::CustomCommand;
 use maki_agent::permissions::PermissionManager;
 use maki_agent::{AgentConfig, CancelToken, McpCommand};
 use maki_config::UiConfig;
-use maki_lua::{EventHandle, KeymapReader, LuaCommandReader, UiAction};
+use maki_lua::{EventHandle, HintReader, KeymapReader, LuaCommandReader, UiAction};
 use maki_providers::Timeouts;
 use maki_providers::provider::{Provider, fetch_all_models, from_model};
 use maki_providers::{Message, Model};
@@ -47,6 +47,7 @@ pub struct EventLoopParams {
     pub exit_on_done: bool,
     pub lua_command_reader: LuaCommandReader,
     pub keymap_reader: KeymapReader,
+    pub hint_reader: HintReader,
     pub ui_action_rx: Option<flume::Receiver<UiAction>>,
     pub lua_event_handle: Option<EventHandle>,
     pub buf_click: Option<BufClickHandler>,
@@ -133,6 +134,7 @@ impl<'t> EventLoop<'t> {
             exit_on_done,
             lua_command_reader,
             keymap_reader,
+            hint_reader,
             ui_action_rx,
             lua_event_handle,
             buf_click,
@@ -177,6 +179,7 @@ impl<'t> EventLoop<'t> {
             handles.mcp_config_errors.clone(),
             lua_command_reader,
             keymap_reader,
+            hint_reader,
             Arc::clone(&storage_writer),
             ui_config,
             input_history_size,

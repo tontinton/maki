@@ -1,14 +1,57 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use humantime::format_duration;
 use mlua::{Lua, Result as LuaResult, Table};
 
 use crate::api::command::{
-    Anchor, Border, Dimension, FloatConfig, Split, TitlePos, UiAction, WinCommand, WinEvent,
+    Anchor, Border, Dimension, FloatConfig, HintEntries, HintWriter, Split, TitlePos, UiAction,
+    WinCommand, WinEvent,
 };
 use crate::api::win::WinHandle;
 use crate::runtime::with_task_bufs;
+
+pub(crate) struct HintStore {
+    hints: BTreeMap<Arc<str>, Vec<(String, String)>>,
+}
+
+impl HintStore {
+    pub fn new() -> Self {
+        Self {
+            hints: BTreeMap::new(),
+        }
+    }
+
+    pub fn set(&mut self, plugin: Arc<str>, spans: Vec<(String, String)>) {
+        if spans.is_empty() {
+            self.hints.remove(&plugin);
+        } else {
+            self.hints.insert(plugin, spans);
+        }
+    }
+
+    pub fn clear_plugin(&mut self, plugin: &str) {
+        self.hints.retain(|k, _| k.as_ref() != plugin);
+    }
+
+    pub fn snapshot_entries(&self) -> HintEntries {
+        self.hints
+            .iter()
+            .map(|(k, v)| (Arc::clone(k), v.clone()))
+            .collect()
+    }
+}
+
+fn publish_hint_snapshot(lua: &Lua) {
+    if let Some(store) = lua.app_data_ref::<HintStore>() {
+        let entries = store.snapshot_entries();
+        if let Some(writer) = lua.app_data_ref::<HintWriter>() {
+            writer.publish(entries);
+        }
+    }
+}
 
 pub(crate) fn parse_footer(tbl: &Table) -> LuaResult<Vec<(String, String)>> {
     let footer_tbl: Table = match tbl.get("footer") {
@@ -27,6 +70,7 @@ pub(crate) fn parse_footer(tbl: &Table) -> LuaResult<Vec<(String, String)>> {
 pub(crate) fn create_ui_table(
     lua: &Lua,
     ui_action_tx: Option<flume::Sender<UiAction>>,
+    plugin: Arc<str>,
 ) -> LuaResult<Table> {
     let t = lua.create_table()?;
     t.set(
@@ -207,6 +251,42 @@ pub(crate) fn create_ui_table(
             )?,
         )?;
     }
+
+    let p = Arc::clone(&plugin);
+    t.set(
+        "set_status_hint",
+        lua.create_function(move |lua, value: mlua::Value| {
+            match value {
+                mlua::Value::Nil => {
+                    if let Some(mut store) = lua.app_data_mut::<HintStore>() {
+                        store.clear_plugin(&p);
+                    }
+                }
+                mlua::Value::Table(tbl) => {
+                    let spans: Vec<(String, String)> = tbl
+                        .sequence_values::<Table>()
+                        .map(|entry| {
+                            let entry = entry?;
+                            Ok((
+                                entry.get::<String>(1)?,
+                                entry.get::<String>(2).unwrap_or_default(),
+                            ))
+                        })
+                        .collect::<LuaResult<_>>()?;
+                    if let Some(mut store) = lua.app_data_mut::<HintStore>() {
+                        store.set(Arc::clone(&p), spans);
+                    }
+                }
+                _ => {
+                    return Err(mlua::Error::runtime(
+                        "set_status_hint expects a table or nil",
+                    ));
+                }
+            }
+            publish_hint_snapshot(lua);
+            Ok(())
+        })?,
+    )?;
 
     Ok(t)
 }
@@ -982,5 +1062,33 @@ mod tests {
 
         let list_line: Table = result.get(5).unwrap();
         assert_eq!(span_style(&list_line, 1), STYLE_LIST_MARKER);
+    }
+
+    #[test]
+    fn hint_store_set_and_clear() {
+        let mut store = HintStore::new();
+        store.set(Arc::from("plug"), vec![("a".into(), "b".into())]);
+        assert_eq!(store.snapshot_entries().len(), 1);
+
+        store.clear_plugin("plug");
+        assert!(store.snapshot_entries().is_empty());
+    }
+
+    #[test]
+    fn hint_store_deterministic_order() {
+        let mut store = HintStore::new();
+        store.set(Arc::from("zzz"), vec![("z".into(), "z".into())]);
+        store.set(Arc::from("aaa"), vec![("a".into(), "a".into())]);
+        let entries = store.snapshot_entries();
+        assert_eq!(entries[0].0.as_ref(), "aaa");
+        assert_eq!(entries[1].0.as_ref(), "zzz");
+    }
+
+    #[test]
+    fn hint_store_empty_clears() {
+        let mut store = HintStore::new();
+        store.set(Arc::from("plug"), vec![("a".into(), "b".into())]);
+        store.set(Arc::from("plug"), vec![]);
+        assert!(store.snapshot_entries().is_empty());
     }
 }

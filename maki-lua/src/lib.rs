@@ -6,8 +6,8 @@ pub(crate) mod plugin_permissions;
 mod runtime;
 
 pub use api::command::{
-    Anchor, Axis, Border, Dimension, Edge, FloatConfig, FloatConfigPatch, LuaCommandInfo,
-    LuaCommandReader, Split, TitlePos, UiAction, WinCommand, WinEvent,
+    Anchor, Axis, Border, Dimension, Edge, FloatConfig, FloatConfigPatch, HintReader, HintSnapshot,
+    LuaCommandInfo, LuaCommandReader, Split, TitlePos, UiAction, WinCommand, WinEvent,
 };
 pub use api::keymap::{KeymapEntry, KeymapReader, KeymapSnapshot};
 pub use error::PluginError;

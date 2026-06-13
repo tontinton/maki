@@ -11,6 +11,7 @@ use crate::theme;
 use maki_lua::Split;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Widget};
 
 use super::{App, Mode, Status};
@@ -163,8 +164,10 @@ impl App {
             let (panel_areas, sep_area) = if panel_h > 0 {
                 let [panels, s] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)])
                     .areas(layout.bottom_area);
-                let constraints: Vec<_> =
-                    panel_reqs.iter().map(|&(_, h)| Constraint::Length(h)).collect();
+                let constraints: Vec<_> = panel_reqs
+                    .iter()
+                    .map(|&(_, h)| Constraint::Length(h))
+                    .collect();
                 let sub = Layout::vertical(constraints).split(panels);
                 let areas: Vec<(usize, Rect)> = panel_reqs
                     .iter()
@@ -196,11 +199,7 @@ impl App {
             let panel_hint = in_plan
                 .then(|| self.plan_form.hint_line())
                 .flatten()
-                .or_else(|| {
-                    streaming
-                        .then(|| self.chats[self.active_chat].todo_panel.hint_line())
-                        .flatten()
-                });
+                .or_else(|| self.lua_hint_line());
             self.input_box.view(
                 frame,
                 layout.input_area,
@@ -399,6 +398,21 @@ impl App {
             layout.input_area,
             layout.splits,
         )
+    }
+
+    fn lua_hint_line(&self) -> Option<Line<'static>> {
+        let snap = self.hint_reader.load();
+        if snap.entries.is_empty() {
+            return None;
+        }
+        let mut spans = Vec::new();
+        for (_, pairs) in &snap.entries {
+            for (text, style_name) in pairs {
+                let style = theme::style_by_name(style_name);
+                spans.push(Span::styled(text.clone(), style));
+            }
+        }
+        Some(Line::from(spans))
     }
 
     #[cfg(test)]

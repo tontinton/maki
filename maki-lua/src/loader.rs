@@ -8,7 +8,7 @@ use include_dir::{Dir, include_dir};
 use maki_agent::tools::ToolRegistry;
 use maki_config::{PluginsConfig, RawConfig};
 
-use crate::api::command::{LuaCommandReader, UiAction};
+use crate::api::command::{HintReader, LuaCommandReader, UiAction};
 use crate::api::keymap::KeymapReader;
 use crate::error::PluginError;
 use crate::plugin_permissions::{PluginPermissions, load_plugin_permissions};
@@ -273,6 +273,13 @@ impl PluginHost {
             .as_ref()
             .map(|t| t.keymap_reader.clone())
             .unwrap_or_else(KeymapReader::empty)
+    }
+
+    pub fn hint_reader(&self) -> HintReader {
+        self.inner
+            .as_ref()
+            .map(|t| t.hint_reader.clone())
+            .unwrap_or_else(HintReader::empty)
     }
 
     pub fn ui_action_rx(&self) -> Option<flume::Receiver<UiAction>> {

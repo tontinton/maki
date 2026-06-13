@@ -57,7 +57,7 @@ use maki_agent::{
     SubagentInfo, ToolOutput,
 };
 use maki_config::UiConfig;
-use maki_lua::{EventHandle, KeymapReader, LuaCommandReader};
+use maki_lua::{EventHandle, HintReader, KeymapReader, LuaCommandReader};
 use maki_providers::{Message, Model, ThinkingConfig};
 use maki_storage::StateDir;
 use maki_storage::input_history::InputHistory;
@@ -175,6 +175,7 @@ pub struct App {
     pub(super) buf_click: Option<BufClickHandler>,
     pub(crate) lua_event_handle: Option<EventHandle>,
     pub(super) keymap_reader: KeymapReader,
+    pub(super) hint_reader: HintReader,
     pub(crate) restore_event_tx: Option<maki_agent::EventSender>,
     pub(super) restoring: Arc<AtomicBool>,
     subagent_answers: HashMap<String, flume::Sender<String>>,
@@ -191,6 +192,7 @@ impl App {
         mcp_config_errors: McpConfigErrors,
         lua_command_reader: LuaCommandReader,
         keymap_reader: KeymapReader,
+        hint_reader: HintReader,
         storage_writer: Arc<StorageWriter>,
         ui_config: UiConfig,
         input_history_size: usize,
@@ -250,6 +252,7 @@ impl App {
             buf_click: None,
             lua_event_handle: None,
             keymap_reader,
+            hint_reader,
             restore_event_tx: None,
             restoring: Arc::new(AtomicBool::new(false)),
             subagent_answers: HashMap::new(),

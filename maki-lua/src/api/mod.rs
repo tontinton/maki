@@ -1,13 +1,13 @@
-pub(crate) mod autocmd;
 mod async_api;
+pub(crate) mod autocmd;
 pub(crate) mod buf;
 pub(crate) mod command;
-pub(crate) mod keymap;
 pub(crate) mod ctx;
 pub(crate) mod env;
 pub(crate) mod fn_api;
 pub(crate) mod fs;
 pub(crate) mod json;
+pub(crate) mod keymap;
 pub(crate) mod log;
 pub(crate) mod net;
 pub(crate) mod setup;
@@ -49,10 +49,16 @@ pub(crate) fn create_maki_global(
     maki.set("yaml", yaml::create_yaml_table(lua)?)?;
     maki.set("net", net::create_net_table(lua, permissions)?)?;
     maki.set("text", text::create_text_table(lua)?)?;
-    maki.set("ui", ui::create_ui_table(lua, ui_action_tx)?)?;
+    maki.set(
+        "ui",
+        ui::create_ui_table(lua, ui_action_tx, Arc::clone(&plugin))?,
+    )?;
     maki.set("fn", fn_api::create_fn_table(lua, permissions)?)?;
     maki.set("async", async_api::create_async_table(lua)?)?;
-    maki.set("keymap", keymap::create_keymap_table(lua, Arc::clone(&plugin))?)?;
+    maki.set(
+        "keymap",
+        keymap::create_keymap_table(lua, Arc::clone(&plugin))?,
+    )?;
 
     Ok(maki)
 }

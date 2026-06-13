@@ -84,24 +84,6 @@ impl TodoPanel {
         self.reset();
     }
 
-    pub fn hint_line(&self) -> Option<Line<'static>> {
-        if self.visibility.is_shown() || self.items.is_empty() {
-            return None;
-        }
-        let done = self
-            .items
-            .iter()
-            .filter(|i| i.status == TodoStatus::Completed)
-            .count();
-        let total = self.items.len();
-        let t = theme::current();
-        Some(Line::from(vec![
-            Span::styled(format!(" {done}/{total} "), Style::new().fg(t.foreground)),
-            Span::styled(key::TODO_PANEL.label, t.keybind_key),
-            Span::raw(" "),
-        ]))
-    }
-
     #[allow(dead_code)]
     pub fn height(&self) -> u16 {
         if !self.visibility.is_shown() || self.items.is_empty() {
@@ -182,18 +164,6 @@ mod tests {
             .collect()
     }
 
-    fn make_items_with_status(statuses: &[TodoStatus]) -> Vec<TodoItem> {
-        statuses
-            .iter()
-            .enumerate()
-            .map(|(i, &status)| TodoItem {
-                content: format!("task {i}"),
-                status,
-                priority: TodoPriority::Medium,
-            })
-            .collect()
-    }
-
     #[test]
     fn on_todowrite_lifecycle() {
         let mut panel = TodoPanel::new();
@@ -226,28 +196,6 @@ mod tests {
 
         panel.on_todowrite(&make_items(1));
         assert_eq!(panel.visibility, Visibility::Shown);
-    }
-
-    #[test]
-    fn hint_line_when_dismissed_with_items() {
-        let mut panel = TodoPanel::new();
-
-        assert!(panel.hint_line().is_none());
-
-        let items = make_items_with_status(&[
-            TodoStatus::Completed,
-            TodoStatus::Completed,
-            TodoStatus::InProgress,
-            TodoStatus::Pending,
-        ]);
-        panel.on_todowrite(&items);
-        assert!(panel.hint_line().is_none());
-
-        panel.toggle();
-        let hint = panel.hint_line().unwrap();
-        let text: String = hint.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(text.contains("2/4"));
-        assert!(text.contains(key::TODO_PANEL.label));
     }
 
     #[test]

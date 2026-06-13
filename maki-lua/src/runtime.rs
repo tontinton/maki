@@ -22,8 +22,10 @@ use serde_json::Value;
 use maki_config::RawConfig;
 
 use crate::api::buf::{BufHandle, BufferStore};
-use crate::api::command::{CommandHandlerMap, publish_command_snapshot};
+use crate::api::command::{CommandHandlerMap, HintWriter, publish_command_snapshot};
 use crate::api::command::{LuaCommandReader, LuaCommandWriter, UiAction};
+use crate::api::keymap::KeymapReader;
+use crate::api::ui::HintStore;
 use crate::api::autocmd::AutocmdStore;
 use crate::api::keymap::{KeymapStore, KeymapWriter};
 use crate::api::create_maki_global;
@@ -592,6 +594,7 @@ impl LuaRuntime {
         ui_action_tx: Option<flume::Sender<UiAction>>,
         command_writer: LuaCommandWriter,
         keymap_writer: KeymapWriter,
+        hint_writer: HintWriter,
     ) -> Result<Self, PluginError> {
         let lua = Lua::new();
         let pending: PendingTools = Arc::new(Mutex::new(Vec::new()));
@@ -621,6 +624,8 @@ impl LuaRuntime {
         lua.set_app_data(AutocmdStore::default());
         lua.set_app_data(KeymapStore::new());
         lua.set_app_data(keymap_writer);
+        lua.set_app_data(HintStore::new());
+        lua.set_app_data(hint_writer);
 
         Ok(Self {
             lua,
@@ -1045,6 +1050,14 @@ impl LuaRuntime {
                 let _ = self.lua.remove_registry_value(key);
             }
             if let Some(writer) = self.lua.app_data_ref::<KeymapWriter>() {
+                writer.publish(entries);
+            }
+        }
+        if let Some(mut store) = self.lua.app_data_mut::<HintStore>() {
+            store.clear_plugin(plugin);
+            let entries = store.snapshot_entries();
+            drop(store);
+            if let Some(writer) = self.lua.app_data_ref::<HintWriter>() {
                 writer.publish(entries);
             }
         }
@@ -1490,7 +1503,8 @@ pub(crate) struct LuaThread {
     pub join: Option<JoinHandle<()>>,
     pub shutdown: Arc<AtomicBool>,
     pub command_reader: LuaCommandReader,
-    pub keymap_reader: crate::api::keymap::KeymapReader,
+    pub keymap_reader: KeymapReader,
+    pub hint_reader: crate::api::command::HintReader,
     pub ui_action_rx: flume::Receiver<UiAction>,
 }
 
@@ -1508,6 +1522,7 @@ pub fn spawn(
     let (ui_action_tx, ui_action_rx) = flume::unbounded::<UiAction>();
     let (command_writer, command_reader) = LuaCommandWriter::new();
     let (keymap_writer, keymap_reader) = KeymapWriter::new();
+    let (hint_writer, hint_reader) = HintWriter::new();
 
     let handle = thread::Builder::new()
         .name("maki-lua".to_owned())
@@ -1520,6 +1535,7 @@ pub fn spawn(
                 Some(ui_action_tx),
                 command_writer,
                 keymap_writer,
+                hint_writer,
             ) {
                 Ok(r) => {
                     let _ = init_tx.send(Ok(()));
@@ -1773,6 +1789,7 @@ pub fn spawn(
         shutdown,
         command_reader,
         keymap_reader,
+        hint_reader,
         ui_action_rx,
     })
 }
