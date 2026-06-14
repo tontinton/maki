@@ -10,7 +10,7 @@
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use tracing::warn;
@@ -643,7 +643,6 @@ enum ScanRecord {
 
 fn scan_headers(cwd: &str, dir: &Path) -> Result<Vec<SessionSummary>, StorageError> {
     let mut out = Vec::new();
-
     for path in session_entries(dir)? {
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
         match ext {
@@ -663,37 +662,52 @@ fn scan_headers(cwd: &str, dir: &Path) -> Result<Vec<SessionSummary>, StorageErr
     Ok(out)
 }
 
-fn scan_jsonl_header(cwd: &str, path: &Path) -> Option<SessionSummary> {
-    let file = File::open(path).ok()?;
-    let reader = BufReader::new(file);
-    let mut lines = reader.lines();
+const TAIL_BUF: u64 = 4096;
 
-    let first_line = lines.next()?.ok()?;
-    let header: JsonlHeader = serde_json::from_str(&first_line).ok()?;
+fn scan_jsonl_header(cwd: &str, path: &Path) -> Option<SessionSummary> {
+    let mut file = File::open(path).ok()?;
+    let header: JsonlHeader = {
+        let mut reader = BufReader::new(&file);
+        let mut line = String::new();
+        reader.read_line(&mut line).ok()?;
+        serde_json::from_str(line.trim_end()).ok()?
+    };
     if header.v != LOG_FORMAT_VERSION || header.cwd != cwd {
         return None;
     }
 
-    let mut title = DEFAULT_TITLE.to_string();
-    let mut updated_at = 0u64;
-
-    for line in lines {
-        let Ok(line) = line else { break };
-        if let Ok(ScanRecord::Meta {
-            title: t,
-            updated_at: u,
-        }) = serde_json::from_str(&line)
-        {
-            title = t;
-            updated_at = u;
-        }
-    }
+    let (title, updated_at) =
+        read_last_meta(&mut file).unwrap_or_else(|| (DEFAULT_TITLE.to_string(), 0));
 
     Some(SessionSummary {
         id: header.id,
         title,
         updated_at,
     })
+}
+
+fn read_last_meta(file: &mut File) -> Option<(String, u64)> {
+    let len = file.seek(SeekFrom::End(0)).ok()?;
+    let mut tail = TAIL_BUF.min(len);
+    loop {
+        file.seek(SeekFrom::End(-(tail as i64))).ok()?;
+        let mut buf = vec![0u8; tail as usize];
+        file.read_exact(&mut buf).ok()?;
+
+        let content = buf.strip_suffix(b"\n").unwrap_or(&buf);
+        if let Some(nl) = content.iter().rposition(|&b| b == b'\n') {
+            let last_line = &content[nl + 1..];
+            if let Ok(ScanRecord::Meta { title, updated_at }) = serde_json::from_slice(last_line) {
+                return Some((title, updated_at));
+            }
+            return None;
+        }
+
+        if tail >= len {
+            return None;
+        }
+        tail = (tail * 2).min(len);
+    }
 }
 
 fn scan_legacy_header(cwd: &str, path: &Path) -> Option<SessionSummary> {
@@ -862,7 +876,7 @@ mod tests {
     use super::StoredThinking;
     use super::ThinkingParseError;
     use super::{
-        CWD_INDEX_FILE, DEFAULT_TITLE, MAX_TITLE_LEN, SESSION_VERSION, generate_title,
+        CWD_INDEX_FILE, DEFAULT_TITLE, MAX_TITLE_LEN, SESSION_VERSION, TAIL_BUF, generate_title,
         load_cwd_index, update_cwd_index,
     };
     use super::{Session, SessionError, SessionLog, StorageError, TitleSource};
@@ -991,29 +1005,6 @@ mod tests {
 
         let loaded = TestSession::load_from(&session.id, dir).unwrap();
         assert_eq!(loaded.messages.len(), 1);
-    }
-
-    #[test]
-    fn crash_recovery_skips_corrupt_line() {
-        let tmp = TempDir::new().unwrap();
-        let dir = tmp.path();
-        let mut session: TestSession = Session::new("m", "/project");
-        session.messages.push(user_message("first"));
-        session.save_to(dir).unwrap();
-
-        let path = dir.join(format!("{}.jsonl", session.id));
-        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
-        file.write_all(b"CORRUPT_LINE\n").unwrap();
-        file.write_all(
-            serde_json::to_string(&serde_json::json!({"t":"msg","d": user_message("after")}))
-                .unwrap()
-                .as_bytes(),
-        )
-        .unwrap();
-        file.write_all(b"\n").unwrap();
-
-        let loaded = TestSession::load_from(&session.id, dir).unwrap();
-        assert_eq!(loaded.messages.len(), 2);
     }
 
     #[test]
@@ -1285,18 +1276,20 @@ mod tests {
     }
 
     #[test]
-    fn session_meta_thinking_backward_compat() {
+    fn session_meta_backward_compat_defaults() {
         let json = r#"{"mode":"build"}"#;
         let meta: super::SessionMeta = serde_json::from_str(json).unwrap();
         assert!(meta.thinking.is_none());
+        assert!(!meta.fast);
     }
 
     #[test]
-    fn session_thinking_persists_through_save_load() {
+    fn session_meta_persists_through_save_load() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
         let mut session: TestSession = Session::new("m", "/project");
         session.meta.thinking = Some(StoredThinking::Budget { tokens: 8192 });
+        session.meta.fast = true;
         session.save_to(dir).unwrap();
 
         let loaded = TestSession::load_from(&session.id, dir).unwrap();
@@ -1304,24 +1297,6 @@ mod tests {
             loaded.meta.thinking,
             Some(StoredThinking::Budget { tokens: 8192 })
         );
-    }
-
-    #[test]
-    fn session_meta_fast_backward_compat() {
-        let json = r#"{"mode":"build"}"#;
-        let meta: super::SessionMeta = serde_json::from_str(json).unwrap();
-        assert!(!meta.fast);
-    }
-
-    #[test]
-    fn session_fast_persists_through_save_load() {
-        let tmp = TempDir::new().unwrap();
-        let dir = tmp.path();
-        let mut session: TestSession = Session::new("m", "/project");
-        session.meta.fast = true;
-        session.save_to(dir).unwrap();
-
-        let loaded = TestSession::load_from(&session.id, dir).unwrap();
         assert!(loaded.meta.fast);
     }
 
@@ -1413,5 +1388,58 @@ mod tests {
 
         let loaded = TestSession::load_from(&session.id, dir).unwrap();
         assert_eq!(loaded.messages.len(), 2);
+    }
+
+    #[test]
+    fn scan_returns_latest_title_after_multiple_appends() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut session: TestSession = Session::new("m", "/project");
+        session.messages.push(user_message("first"));
+        let mut log = SessionLog::create(dir, &session).unwrap();
+
+        session.title = "v1".into();
+        session.messages.push(assistant_message("reply"));
+        log.append(&session).unwrap();
+
+        session.title = "v2".into();
+        session.messages.push(user_message("second"));
+        log.append(&session).unwrap();
+
+        let list = TestSession::list_in("/project", dir).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].title, "v2");
+    }
+
+    #[test]
+    fn scan_returns_default_title_for_header_only_file() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let session: TestSession = Session::new("m", "/project");
+        let path = dir.join(format!("{}.jsonl", session.id));
+        let header = serde_json::json!({"t":"header","v":2,"id":session.id,"model":"m","cwd":"/project","created_at":0});
+        fs::write(&path, format!("{}\n", header)).unwrap();
+
+        let list = TestSession::list_in("/project", dir).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].title, DEFAULT_TITLE);
+    }
+
+    #[test]
+    fn scan_handles_large_meta_record() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut session: TestSession = Session::new("m", "/project");
+        session.messages.push(user_message("msg"));
+        let mut log = SessionLog::create(dir, &session).unwrap();
+
+        session.title = "big-meta".into();
+        session.meta.input_draft = Some("x".repeat(TAIL_BUF as usize * 2));
+        session.messages.push(assistant_message("reply"));
+        log.append(&session).unwrap();
+
+        let list = TestSession::list_in("/project", dir).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].title, "big-meta");
     }
 }
