@@ -30,6 +30,10 @@ pub(crate) mod tool_display;
 
 pub(crate) const CHEVRON: &str = "❯ ";
 
+pub(crate) fn chevron_span() -> ratatui::text::Span<'static> {
+    ratatui::text::Span::styled(CHEVRON, crate::theme::current().tool_dim)
+}
+
 pub(crate) trait Overlay {
     fn is_open(&self) -> bool;
     fn close(&mut self);

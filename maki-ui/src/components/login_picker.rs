@@ -738,7 +738,7 @@ fn input_line_with_cursor(input: &TextBuffer) -> Line<'static> {
     let cursor_char = chars.next().unwrap_or(' ');
     let after = chars.as_str();
     Line::from(vec![
-        Span::styled(super::CHEVRON, t.tool_dim),
+        super::chevron_span(),
         Span::raw(before.to_string()),
         Span::styled(cursor_char.to_string(), t.cursor),
         Span::raw(after.to_string()),

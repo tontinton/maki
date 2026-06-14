@@ -24,7 +24,6 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const NO_MATCHES: &str = "No matches";
 const LOADING_LABEL: &str = "Loading...";
-const SEARCH_PREFIX: &str = super::CHEVRON;
 const MIN_WIDTH_PERCENT: u16 = 65;
 const MAX_HEIGHT_PERCENT: u16 = 80;
 const SEARCH_ROW: u16 = 1;
@@ -860,7 +859,7 @@ fn render_search(frame: &mut Frame, area: Rect, search: &TextBuffer) {
     let after: String = chars[after_start..].iter().collect();
 
     let line = Line::from(vec![
-        Span::styled(SEARCH_PREFIX, theme::current().tool_dim),
+        super::chevron_span(),
         Span::styled(before, Style::default()),
         Span::styled(cursor_char.to_string(), theme::current().cursor),
         Span::styled(after, Style::default()),

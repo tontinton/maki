@@ -460,7 +460,7 @@ fn render_search(frame: &mut Frame, area: Rect, s: &Session) {
     let cursor_char = chars.next().unwrap_or(' ');
     let after = chars.as_str();
 
-    let mut spans = vec![Span::styled(super::CHEVRON, t.tool_dim)];
+    let mut spans = vec![super::chevron_span()];
 
     if s.walking {
         let ch = spinner_frame(s.started_at.elapsed().as_millis());

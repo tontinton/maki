@@ -338,13 +338,12 @@ impl InputBox {
         let max_scroll = total_vl.saturating_sub(content_height);
         self.scroll_y = self.scroll_y.min(max_scroll);
 
-        let prefix_style = theme::current().input_placeholder;
         let is_empty = self.buffer.value().is_empty();
         let mut styled_lines: Vec<Line> = if is_empty && self.pending_images.is_empty() {
             let placeholder_base = theme::current().input_placeholder;
             if streaming {
                 vec![Line::from(vec![
-                    Span::styled(CHEVRON, prefix_style),
+                    super::chevron_span(),
                     if focused {
                         Span::styled("Q", placeholder_base.reversed())
                     } else {
@@ -354,7 +353,7 @@ impl InputBox {
                 ])]
             } else {
                 vec![Line::from(vec![
-                    Span::styled(CHEVRON, prefix_style),
+                    super::chevron_span(),
                     if focused {
                         Span::styled("A", placeholder_base.reversed())
                     } else {
@@ -388,7 +387,6 @@ impl InputBox {
                         is_cursor_line,
                         cursor_x,
                         i == 0,
-                        prefix_style,
                         shell_spans.as_deref(),
                     )
                 })
@@ -459,7 +457,6 @@ fn wrap_line(
     is_cursor_line: bool,
     cursor_x: usize,
     is_first_line: bool,
-    prefix_style: Style,
     shell_spans: Option<&[Span<'static>]>,
 ) -> Vec<Line<'static>> {
     let chars: Vec<char> = line.chars().collect();
@@ -488,14 +485,14 @@ fn wrap_line(
         .into_iter()
         .enumerate()
         .map(|(row, (start, end))| {
-            let prefix = if row == 0 && is_first_line {
-                CHEVRON
+            let prefix_span = if row == 0 && is_first_line {
+                super::chevron_span()
             } else if row == 0 {
-                NEWLINE_PAD
+                Span::raw(NEWLINE_PAD)
             } else {
-                ""
+                Span::raw("")
             };
-            let mut spans = vec![Span::styled(prefix.to_owned(), prefix_style)];
+            let mut spans = vec![prefix_span];
 
             let chunk_spans = if let Some(styled) = &shell_spans {
                 slice_styled_spans(styled, start, end)
