@@ -144,6 +144,7 @@ impl MessagesPanel {
         self.expanded_tools.clear();
         self.batch_children.clear();
         self.live_bufs.clear();
+        self.rebake_requested.clear();
         self.highlight_segment = None;
     }
 

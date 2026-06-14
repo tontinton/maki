@@ -92,11 +92,10 @@ impl App {
     }
 
     pub(crate) fn restore_display(&mut self) {
-        let display_msgs = history_to_display(
+        let (display_msgs, restore_items) = history_to_display(
             &self.state.session.messages,
             &self.state.session.tool_outputs,
             &self.ui_config.tool_output_lines,
-            self.lua_event_handle.as_ref(),
         );
         self.main_chat().load_messages(display_msgs);
         self.main_chat().token_usage = self.state.token_usage;
@@ -119,6 +118,8 @@ impl App {
             self.queue_and_notify(msg);
         }
 
+        self.fire_restore_items(restore_items);
+
         for sa in std::mem::take(&mut self.state.session.meta.subagents) {
             let idx = self.chats.len();
             self.chat_index.insert(sa.tool_use_id.clone(), idx);
@@ -126,16 +127,27 @@ impl App {
             chat.set_restore_channel(self.lua_event_handle.clone(), self.restore_event_tx.clone());
             chat.model_id = sa.model;
             if let Some(messages) = self.state.session.subagent_messages.get(&sa.tool_use_id) {
-                let display = history_to_display(
+                let (display, items) = history_to_display(
                     messages,
                     &self.state.session.tool_outputs,
                     &self.ui_config.tool_output_lines,
-                    self.lua_event_handle.as_ref(),
                 );
                 chat.load_messages(display);
                 chat.mark_finished(DisplayRole::Done, DONE_TEXT);
+                self.fire_restore_items(items);
             }
             self.chats.push(chat);
+        }
+    }
+
+    fn fire_restore_items(&self, items: Vec<maki_lua::RestoreItem>) {
+        let (Some(eh), Some(tx)) = (&self.lua_event_handle, &self.restore_event_tx) else {
+            return;
+        };
+        let theme_gen = crate::theme::generation();
+        for mut item in items {
+            item.theme_gen = Some(theme_gen);
+            eh.request_restore(item, tx.clone());
         }
     }
 

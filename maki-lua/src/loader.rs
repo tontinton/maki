@@ -11,7 +11,7 @@ use maki_config::{PluginsConfig, RawConfig};
 use crate::api::command::{LuaCommandReader, UiAction};
 use crate::error::PluginError;
 use crate::plugin_permissions::{PluginPermissions, load_plugin_permissions};
-use crate::runtime::{self, ClickReply, LuaThread, Request, RestoreItem, RestoreReply};
+use crate::runtime::{self, ClickReply, LuaThread, Request, RestoreItem};
 use maki_agent::prompt::ResolvedSlots;
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -313,15 +313,6 @@ impl EventHandle {
         rx.recv_async().await.unwrap_or_default()
     }
 
-    /// One round-trip for N tools instead of N blocking channel hops.
-    pub fn restore_tool_batch(&self, items: Vec<RestoreItem>) -> Vec<Option<RestoreReply>> {
-        let (tx, rx) = flume::bounded(1);
-        let _ = self.tx.send(Request::RestoreToolBatch { items, reply: tx });
-        rx.recv().unwrap_or_default()
-    }
-
-    /// Non-blocking variant: result flows back through `event_tx` so theme
-    /// re-bakes don't block the UI thread.
     pub fn request_restore(&self, item: RestoreItem, event_tx: maki_agent::EventSender) {
         let _ = self.tx.send(Request::RestoreToolAsync { item, event_tx });
     }

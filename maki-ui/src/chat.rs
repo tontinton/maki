@@ -1,6 +1,5 @@
-//! When loading old sessions, stored `ToolOutput` gets syntax highlighting.
-//! Missing outputs fall back to plain text from `ToolResult`.
-//! Webfetch bodies are hidden to save screen space.
+//! Rebuilds display messages from stored sessions. Tool outputs get syntax
+//! highlighted, missing outputs fall back to plain text from `ToolResult`.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -16,7 +15,6 @@ use crate::components::{DisplayMessage, DisplayRole, ToolRole, ToolStatus};
 use crate::markdown::truncate_output;
 
 use crate::selection::Selection;
-use crate::theme;
 use maki_agent::tools::{ToolInvocation, ToolRegistry};
 use maki_agent::{
     AgentEvent, BatchToolStatus, BufferSnapshot, SharedBuf, ToolDoneEvent, ToolOutput,
@@ -366,13 +364,11 @@ pub fn history_to_display(
     messages: &[Message],
     tool_outputs: &HashMap<String, ToolOutput>,
     tool_output_lines: &ToolOutputLines,
-    event_handle: Option<&maki_lua::EventHandle>,
-) -> Vec<DisplayMessage> {
+) -> (Vec<DisplayMessage>, Vec<maki_lua::RestoreItem>) {
     let registry = RenderHintsRegistry::new();
     let results = build_tool_results_map(messages);
     let mut display = Vec::new();
     let mut restore_items: Vec<maki_lua::RestoreItem> = Vec::new();
-    let mut restore_targets: Vec<usize> = Vec::new();
     for msg in messages {
         match msg.role {
             Role::User => {
@@ -423,23 +419,20 @@ pub fn history_to_display(
                             {
                                 append_annotation(&mut annotation, &ta);
                             }
-                            if event_handle.is_some() {
-                                let output = tool_outputs
-                                    .get(id.as_str())
-                                    .map(|o| o.as_text())
-                                    .or_else(|| result_text.map(str::to_owned))
-                                    .unwrap_or_default();
-                                restore_items.push(maki_lua::RestoreItem {
-                                    tool: Arc::from(static_name),
-                                    tool_use_id: id.clone(),
-                                    output,
-                                    input: input.clone(),
-                                    is_error: status == ToolStatus::Error,
-                                    tool_output_lines: *tool_output_lines,
-                                    theme_gen: None,
-                                });
-                                restore_targets.push(display.len());
-                            }
+                            let output = tool_outputs
+                                .get(id.as_str())
+                                .map(|o| o.as_text())
+                                .or_else(|| result_text.map(str::to_owned))
+                                .unwrap_or_default();
+                            restore_items.push(maki_lua::RestoreItem {
+                                tool: Arc::from(static_name),
+                                tool_use_id: id.clone(),
+                                output,
+                                input: input.clone(),
+                                is_error: status == ToolStatus::Error,
+                                tool_output_lines: *tool_output_lines,
+                                theme_gen: None,
+                            });
                             display.push(DisplayMessage {
                                 role: DisplayRole::Tool(Box::new(ToolRole {
                                     id: id.clone(),
@@ -467,25 +460,11 @@ pub fn history_to_display(
             }
         }
     }
-    if let Some(eh) = event_handle
-        && !restore_items.is_empty()
-    {
-        let theme_gen = theme::generation();
-        let replies = eh.restore_tool_batch(restore_items);
-        for (idx, reply) in restore_targets.into_iter().zip(replies) {
-            let Some(reply) = reply else { continue };
-            if reply.body.is_some() || reply.header.is_some() {
-                display[idx].snapshot_theme_gen = theme_gen;
-            }
-            display[idx].render_snapshot = reply.body;
-            display[idx].render_header = reply.header;
-        }
-    }
-    display
+    (display, restore_items)
 }
 
-/// After session load the original `ToolResult` is gone, so we reconstruct
-/// from whatever the `DisplayMessage` kept. Returns `None` when data is missing.
+/// The original `ToolResult` is gone after session load, so we rebuild a
+/// `RestoreItem` from whatever the `DisplayMessage` kept.
 pub(crate) fn restore_item_for(
     msg: &DisplayMessage,
     tool_output_lines: maki_config::ToolOutputLines,
@@ -507,7 +486,7 @@ pub(crate) fn restore_item_for(
     })
 }
 
-/// Same idea as `restore_item_for` but for batch children.
+/// Batch variant of `restore_item_for`.
 pub(crate) fn restore_item_for_batch_entry(
     entry: &maki_agent::BatchToolEntry,
     child_id: String,
@@ -527,7 +506,8 @@ pub(crate) fn restore_item_for_batch_entry(
     })
 }
 
-/// Mirrors the live `tool_done` path so loaded tools look the same as streamed ones.
+/// Builds a loaded tool the same way the live `tool_done` path does, so
+/// restored sessions look identical to streamed ones.
 fn build_loaded_tool(
     tool: &str,
     summary: &str,
@@ -737,7 +717,8 @@ mod tests {
             ..Default::default()
         }];
         assert!(
-            history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default(), None)
+            history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default())
+                .0
                 .is_empty()
         );
     }
@@ -779,8 +760,7 @@ mod tests {
             "output",
             is_error,
         );
-        let display =
-            history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default(), None);
+        let display = history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default()).0;
         assert_eq!(display.len(), 1);
         assert!(matches!(&display[0].role, DisplayRole::Tool(t) if t.status == expected));
     }
@@ -820,8 +800,7 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let display =
-            history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default(), None);
+        let display = history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default()).0;
         assert_eq!(display.len(), 4);
         assert_eq!(display[0].role, DisplayRole::User);
         assert_eq!(display[1].role, DisplayRole::Assistant);
@@ -869,7 +848,7 @@ mod tests {
             let discriminant = std::mem::discriminant(&output);
             let msgs = tool_use_pair(tool_name, input_json, "ok", false);
             let outputs = HashMap::from([("t1".into(), output)]);
-            let display = history_to_display(&msgs, &outputs, &ToolOutputLines::default(), None);
+            let display = history_to_display(&msgs, &outputs, &ToolOutputLines::default()).0;
             assert_eq!(
                 std::mem::discriminant(display[0].tool_output.as_deref().unwrap()),
                 discriminant,
@@ -892,7 +871,7 @@ mod tests {
             false,
         );
         let outputs = HashMap::from([("t1".into(), write_output)]);
-        let display = history_to_display(&msgs, &outputs, &ToolOutputLines::default(), None);
+        let display = history_to_display(&msgs, &outputs, &ToolOutputLines::default()).0;
         assert!(display[0].annotation.is_some());
     }
 
@@ -906,8 +885,7 @@ mod tests {
             &joined,
             false,
         );
-        let display =
-            history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default(), None);
+        let display = history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default()).0;
         let line_count = display[0].text.lines().count();
         assert!(
             line_count < long_output.len(),
@@ -942,7 +920,7 @@ mod tests {
         };
         let msgs = tool_use_pair("batch", serde_json::json!({"tool_calls": []}), "", false);
         let outputs = HashMap::from([("t1".into(), batch_output)]);
-        let display = history_to_display(&msgs, &outputs, &ToolOutputLines::default(), None);
+        let display = history_to_display(&msgs, &outputs, &ToolOutputLines::default()).0;
         let ToolOutput::Batch { entries, .. } = display[0].tool_output.as_deref().unwrap() else {
             panic!("expected Batch output");
         };
@@ -959,8 +937,7 @@ mod tests {
             "1: fn main() {}",
             false,
         );
-        let display =
-            history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default(), None);
+        let display = history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default()).0;
         assert!(display[0].tool_output.is_none());
         assert!(display[0].text.contains("fn main"));
     }
@@ -981,7 +958,7 @@ mod tests {
             ],
             ..Default::default()
         }];
-        let display = history_to_display(&msgs, &HashMap::new(), &ToolOutputLines::default(), None);
+        let display = history_to_display(&msgs, &HashMap::new(), &ToolOutputLines::default()).0;
         assert_eq!(display.len(), 2);
         assert_eq!(display[0].role, DisplayRole::Thinking);
         assert_eq!(display[0].text, "reasoning");
@@ -1060,15 +1037,27 @@ mod tests {
         assert_eq!(item.theme_gen, Some(RESTORE_THEME_GEN));
     }
 
-    #[test]
-    fn restore_item_for_batch_entry_returns_none_without_raw_input() {
+    #[test_case(
+        None,
+        Some(ToolOutput::Plain("output".into()))
+        ; "missing_raw_input"
+    )]
+    #[test_case(
+        Some(serde_json::json!({"cmd": "ls"})),
+        None
+        ; "missing_output"
+    )]
+    fn restore_item_for_batch_entry_returns_none(
+        raw_input: Option<serde_json::Value>,
+        output: Option<ToolOutput>,
+    ) {
         let entry = BatchToolEntry {
             tool: "bash".into(),
             summary: String::new(),
             status: BatchToolStatus::Success,
             input: None,
-            raw_input: None,
-            output: Some(ToolOutput::Plain("output".into())),
+            raw_input,
+            output,
             annotation: None,
         };
         assert!(
@@ -1078,52 +1067,7 @@ mod tests {
                 ToolOutputLines::default(),
                 RESTORE_THEME_GEN
             )
-            .is_none(),
-            "missing raw_input must yield None"
+            .is_none()
         );
-    }
-
-    #[test]
-    fn restore_item_for_batch_entry_returns_none_without_output() {
-        let entry = BatchToolEntry {
-            tool: "bash".into(),
-            summary: String::new(),
-            status: BatchToolStatus::Success,
-            input: None,
-            raw_input: Some(serde_json::json!({"cmd": "ls"})),
-            output: None,
-            annotation: None,
-        };
-        assert!(
-            restore_item_for_batch_entry(
-                &entry,
-                "id".into(),
-                ToolOutputLines::default(),
-                RESTORE_THEME_GEN
-            )
-            .is_none(),
-            "missing output must yield None"
-        );
-    }
-
-    #[test]
-    fn restore_item_for_batch_entry_success_sets_is_error_false() {
-        let entry = BatchToolEntry {
-            tool: "bash".into(),
-            summary: String::new(),
-            status: BatchToolStatus::Success,
-            input: None,
-            raw_input: Some(serde_json::json!({"cmd": "ls"})),
-            output: Some(ToolOutput::Plain("ok".into())),
-            annotation: None,
-        };
-        let item = restore_item_for_batch_entry(
-            &entry,
-            "id".into(),
-            ToolOutputLines::default(),
-            RESTORE_THEME_GEN,
-        )
-        .expect("valid entry must produce a RestoreItem");
-        assert!(!item.is_error, "success status must set is_error to false");
     }
 }

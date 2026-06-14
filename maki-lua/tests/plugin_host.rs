@@ -67,8 +67,6 @@ const TIMED_OUT_SUBSTR: &str = "timed out";
 const BASH_TIMED_OUT_MARKER: &str = "Timed out";
 const ALREADY_CALLED_ERR: &str = "already called";
 const UNKNOWN_FIELD_ERR: &str = "unknown field";
-const BATCH_ALIGN_MSG: &str =
-    "a tool with no restore callback must yield a None reply that keeps the batch aligned by index";
 const PERMISSION_DENIED_MSG: &str = "permission denied";
 
 #[test]
@@ -907,23 +905,6 @@ fn setup_not_called_returns_none() {
 }
 
 #[test]
-fn setup_tools_section() {
-    let reg = fresh_registry();
-    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    let raw = host
-        .send_run_init_lua(
-            "maki.setup({ tools = { websearch = { enabled = false }, bash = { enabled = true } } })"
-                .to_owned(),
-            "test_init.lua".to_owned(),
-            None,
-        )
-        .unwrap()
-        .expect("expected Some(RawConfig)");
-    assert_eq!(raw.tools["websearch"].enabled, Some(false));
-    assert_eq!(raw.tools["bash"].enabled, Some(true));
-}
-
-#[test]
 fn setup_all_sections_at_once() {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
@@ -938,7 +919,7 @@ fn setup_all_sections_at_once() {
                 provider = { default_model = "anthropic/claude-opus-4-6" },
                 storage = { max_log_files = 3 },
                 index = { max_file_size_mb = 8 },
-                tools = { bash = { enabled = true } },
+                tools = { bash = { enabled = true }, websearch = { enabled = false } },
             })"#
             .to_owned(),
             "test_init.lua".to_owned(),
@@ -963,6 +944,7 @@ fn setup_all_sections_at_once() {
     assert_eq!(raw.storage.max_log_files, Some(3));
     assert_eq!(raw.index.max_file_size_mb, Some(8));
     assert_eq!(raw.tools["bash"].enabled, Some(true));
+    assert_eq!(raw.tools["websearch"].enabled, Some(false));
 }
 
 #[test]
@@ -1151,7 +1133,7 @@ fn ctx_set_deadline_twice_errors() {
 }
 
 #[test]
-fn restore_tool_batch_ordering_and_alignment() {
+fn restore_tool_async_ordering_and_delivery() {
     let reg = fresh_registry();
     let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
     host.load_builtins(&PluginsConfig::from_tools(HashMap::new()))
@@ -1160,6 +1142,9 @@ fn restore_tool_batch_ordering_and_alignment() {
     let input = serde_json::json!({"command": "echo ok", "timeout": 1});
 
     let handle = host.event_handle().expect("event handle available");
+    let (tx, rx) = flume::unbounded();
+    let event_tx = maki_agent::EventSender::new(tx, 0);
+
     let bash_item = |id: &str| maki_lua::RestoreItem {
         tool: std::sync::Arc::from("bash"),
         tool_use_id: id.to_owned(),
@@ -1179,21 +1164,31 @@ fn restore_tool_batch_ordering_and_alignment() {
         theme_gen: None,
     };
 
-    let replies = handle.restore_tool_batch(vec![unknown_item, bash_item("a"), bash_item("b")]);
-    assert_eq!(replies.len(), 3, "one reply slot per item");
-    assert!(replies[0].is_none(), "{BATCH_ALIGN_MSG}");
-    for reply in &replies[1..] {
-        let body = reply
-            .as_ref()
-            .expect("restore reply present")
-            .body
-            .as_ref()
-            .expect("body present");
-        let last = body.lines.last().expect("at least one line");
+    handle.request_restore(unknown_item, event_tx.clone());
+    handle.request_restore(bash_item("a"), event_tx.clone());
+    handle.request_restore(bash_item("b"), event_tx.clone());
+
+    // collect_prompt_slots is a synchronous round-trip: since the Lua
+    // thread is FIFO, it won't return until all prior requests (our
+    // restores) have been processed. Neat trick to drain without a latch.
+    let _ = handle.collect_prompt_slots();
+
+    let snapshots: Vec<maki_agent::Envelope> = rx.drain().collect();
+
+    assert_eq!(
+        snapshots.len(),
+        2,
+        "unknown tool emits nothing, bash tools each emit a snapshot"
+    );
+    for env in &snapshots {
+        let maki_agent::AgentEvent::ToolSnapshot { snapshot, .. } = &env.event else {
+            panic!("expected ToolSnapshot event");
+        };
+        let last = snapshot.lines.last().expect("at least one line");
         let text: String = last.spans.iter().map(|s| s.text.as_str()).collect();
         assert!(
             text.contains(BASH_TIMED_OUT_MARKER),
-            "batched restore body missing timeout marker; got: {text:?}"
+            "restore body missing timeout marker; got: {text:?}"
         );
     }
 }
