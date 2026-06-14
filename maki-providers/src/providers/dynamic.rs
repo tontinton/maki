@@ -23,6 +23,7 @@ use super::google::Google;
 use super::local::{LLAMACPP, LocalEndpoint, OLLAMA};
 use super::mistral::Mistral;
 use super::openai::OpenAi;
+use super::opencode::Opencode;
 use super::openrouter::OpenRouter;
 use super::synthetic::Synthetic;
 use super::tensorx::TensorX;
@@ -392,7 +393,11 @@ pub fn create(slug: &str, timeouts: super::Timeouts) -> Result<Box<dyn Provider>
         ),
         ProviderKind::TensorX => Box::new(
             TensorX::with_auth(auth.clone(), timeouts)
-                .with_system_prefix(meta.system_prefix.clone()),
+                .with_system_prefix(meta.system_prefix.clone())
+        ),
+        ProviderKind::Opencode => Box::new(
+            Opencode::with_auth(auth.clone(), timeouts)
+                .with_system_prefix(meta.system_prefix.clone())
         ),
     };
 

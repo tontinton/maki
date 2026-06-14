@@ -185,6 +185,7 @@ pub fn models_for_provider(provider: ProviderKind) -> &'static [ModelEntry] {
         ProviderKind::TensorX => tensorx::models(),
         ProviderKind::DeepSeek => deepseek::models(),
         ProviderKind::OpenRouter => openrouter::models(),
+        ProviderKind::Opencode => &[],
     }
 }
 
