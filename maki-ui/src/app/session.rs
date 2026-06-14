@@ -1,3 +1,6 @@
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+
 use crate::chat::{Chat, DONE_TEXT, history_to_display};
 use crate::components::DisplayRole;
 use crate::components::rewind_picker::RewindEntry;
@@ -88,10 +91,14 @@ impl App {
         self.task_picker_original = None;
         self.last_esc = None;
         self.chats[0].todo_panel.reset();
+        self.restoring = Arc::new(AtomicBool::new(false));
         self.plan_form.reset();
     }
 
     pub(crate) fn restore_display(&mut self) {
+        let restoring = Arc::new(AtomicBool::new(true));
+        self.restoring = restoring.clone();
+
         let (display_msgs, restore_items) = history_to_display(
             &self.state.session.messages,
             &self.state.session.tool_outputs,
@@ -137,6 +144,13 @@ impl App {
                 self.fire_restore_items(items);
             }
             self.chats.push(chat);
+        }
+
+        if let Some(eh) = &self.lua_event_handle {
+            eh.send_restore_complete(restoring);
+        } else {
+            self.restoring
+                .store(false, std::sync::atomic::Ordering::Relaxed);
         }
     }
 

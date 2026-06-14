@@ -118,6 +118,9 @@ pub enum Request {
         item: RestoreItem,
         event_tx: maki_agent::EventSender,
     },
+    RestoreComplete {
+        flag: Arc<AtomicBool>,
+    },
 }
 
 /// Everything needed to re-run a lua restore callback. Used by session
@@ -1653,6 +1656,9 @@ pub fn spawn(
                             if let Some(reply) = res {
                                 reply.emit(&id, theme_gen, &event_tx);
                             }
+                        }
+                        Request::RestoreComplete { flag } => {
+                            flag.store(false, Ordering::Relaxed);
                         }
                     }
                 }

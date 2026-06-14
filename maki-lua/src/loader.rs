@@ -1,6 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
@@ -315,6 +315,10 @@ impl EventHandle {
 
     pub fn request_restore(&self, item: RestoreItem, event_tx: maki_agent::EventSender) {
         let _ = self.tx.send(Request::RestoreToolAsync { item, event_tx });
+    }
+
+    pub fn send_restore_complete(&self, flag: Arc<AtomicBool>) {
+        let _ = self.tx.send(Request::RestoreComplete { flag });
     }
 }
 

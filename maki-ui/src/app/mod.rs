@@ -16,6 +16,7 @@ pub(crate) mod view;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -174,6 +175,7 @@ pub struct App {
     pub(super) buf_click: Option<BufClickHandler>,
     pub(crate) lua_event_handle: Option<EventHandle>,
     pub(crate) restore_event_tx: Option<maki_agent::EventSender>,
+    pub(super) restoring: Arc<AtomicBool>,
     subagent_answers: HashMap<String, flume::Sender<String>>,
 }
 
@@ -246,6 +248,7 @@ impl App {
             buf_click: None,
             lua_event_handle: None,
             restore_event_tx: None,
+            restoring: Arc::new(AtomicBool::new(false)),
             subagent_answers: HashMap::new(),
         }
     }
@@ -1326,6 +1329,7 @@ impl App {
                 .selection_state
                 .as_ref()
                 .is_some_and(|s| s.is_edge_scrolling())
+            || self.restoring.load(Ordering::Relaxed)
             || self.chats.iter().any(|c| c.is_animating())
     }
 

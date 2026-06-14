@@ -45,6 +45,7 @@ pub struct StatusBarContext<'a> {
     pub retry_info: Option<&'a RetryInfo>,
     pub thinking_label: Option<Cow<'static, str>>,
     pub fast: bool,
+    pub restoring: bool,
 }
 
 pub struct StatusBar {
@@ -108,6 +109,14 @@ impl StatusBar {
         if *ctx.status == Status::Streaming {
             let ch = spinner_frame(self.started_at.elapsed().as_millis());
             left_spans.push(Span::styled(format!(" {ch}"), theme::current().spinner));
+        }
+
+        if ctx.restoring {
+            let ch = spinner_frame(self.started_at.elapsed().as_millis());
+            left_spans.push(Span::styled(
+                format!(" {ch}"),
+                theme::current().status_notice,
+            ));
         }
 
         left_spans.push(Span::styled(format!(" {}", ctx.mode_label), ctx.mode_style));

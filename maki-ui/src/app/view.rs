@@ -1,3 +1,5 @@
+use std::sync::atomic::Ordering;
+
 use crate::components::Overlay;
 #[cfg(test)]
 use crate::components::keybindings::KeybindContext;
@@ -280,6 +282,7 @@ impl App {
             retry_info: self.retry_info.as_ref(),
             thinking_label: self.state.thinking.status_label(),
             fast: self.state.fast,
+            restoring: self.restoring.load(Ordering::Relaxed),
         };
         self.status_bar.view(frame, status_area, &ctx);
     }
