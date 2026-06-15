@@ -1177,13 +1177,15 @@ fn restore_tool_async_ordering_and_delivery() {
 
     assert_eq!(
         snapshots.len(),
-        2,
-        "unknown tool emits nothing, bash tools each emit a snapshot"
+        4,
+        "unknown tool emits nothing, bash tools each emit body + header snapshot"
     );
-    for env in &snapshots {
-        let maki_agent::AgentEvent::ToolSnapshot { snapshot, .. } = &env.event else {
-            panic!("expected ToolSnapshot event");
-        };
+    let mut body_count = 0;
+    for snapshot in snapshots.iter().filter_map(|env| match &env.event {
+        maki_agent::AgentEvent::ToolSnapshot { snapshot, .. } => Some(snapshot),
+        _ => None,
+    }) {
+        body_count += 1;
         let last = snapshot.lines.last().expect("at least one line");
         let text: String = last.spans.iter().map(|s| s.text.as_str()).collect();
         assert!(
@@ -1191,6 +1193,7 @@ fn restore_tool_async_ordering_and_delivery() {
             "restore body missing timeout marker; got: {text:?}"
         );
     }
+    assert_eq!(body_count, 2, "two body snapshots for two bash items");
 }
 
 /// Guards the stale-cancelled-handle bug: `permission_scopes` must run the

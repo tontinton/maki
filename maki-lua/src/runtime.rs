@@ -1118,11 +1118,13 @@ impl LuaRuntime {
     }
 
     async fn restore_item(&self, item: RestoreItem) -> Option<RestoreReply> {
-        let func = {
+        let (func, plugin_name) = {
             let plugins = self.plugins.borrow();
-            let tk = plugins.values().find_map(|tools| tools.get(&*item.tool))?;
+            let (pname, tk) = plugins
+                .iter()
+                .find_map(|(pname, tools)| tools.get(&*item.tool).map(|tk| (pname.clone(), tk)))?;
             let key = tk.restore.as_ref()?;
-            self.lua.registry_value::<Function>(key).ok()?
+            (self.lua.registry_value::<Function>(key).ok()?, pname)
         };
         let input_lua = json_to_lua(&self.lua, &item.input).ok()?;
         let thread = self.lua.create_thread(func).ok()?;
@@ -1156,7 +1158,14 @@ impl LuaRuntime {
             .ok()?;
         drop(scope);
 
-        extract_restore_reply(&ret)
+        let mut reply = extract_restore_reply(&ret)?;
+        if reply.header.is_none() {
+            reply.header = Some(
+                self.compute_header(&plugin_name, &item.tool, item.input)
+                    .into_snapshot(),
+            );
+        }
+        Some(reply)
     }
 
     fn compute_permission_scopes(

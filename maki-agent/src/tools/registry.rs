@@ -92,6 +92,13 @@ impl HeaderResult {
             Self::Styled(snap) => Some(snap),
         }
     }
+
+    pub fn into_snapshot(self) -> BufferSnapshot {
+        match self {
+            Self::Plain(text) => BufferSnapshot::plain_text(text),
+            Self::Styled(snap) => snap,
+        }
+    }
 }
 
 pub enum HeaderFuture {

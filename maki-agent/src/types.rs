@@ -613,6 +613,10 @@ impl BufferSnapshot {
         Self { lines }
     }
 
+    pub fn plain_text(text: String) -> Self {
+        Self::from_arc(Arc::new(vec![SnapshotLine::plain(text)]))
+    }
+
     pub fn first_line_text(&self) -> String {
         self.lines
             .first()
@@ -624,6 +628,17 @@ impl BufferSnapshot {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SnapshotLine {
     pub spans: Vec<SnapshotSpan>,
+}
+
+impl SnapshotLine {
+    pub fn plain(text: String) -> Self {
+        Self {
+            spans: vec![SnapshotSpan {
+                text,
+                style: SpanStyle::Default,
+            }],
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
