@@ -14,8 +14,6 @@ mod highlight;
 pub use highlight::highlight_ansi;
 mod image;
 mod markdown;
-#[cfg(feature = "demo")]
-mod mock;
 mod render_worker;
 mod selection;
 pub mod splash;

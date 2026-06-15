@@ -39,10 +39,6 @@ pub struct Cli {
     #[arg(short = 's', long, alias = "resume")]
     pub session: Option<String>,
 
-    #[arg(long)]
-    #[cfg(feature = "demo")]
-    pub demo: bool,
-
     /// Output format for --print mode
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     pub output_format: OutputFormat,

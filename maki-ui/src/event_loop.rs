@@ -23,13 +23,9 @@ use crate::AppSession;
 use crate::agent::{AgentCommand, AgentHandles, ModelSlot, shared_queue::QueueItem};
 use crate::app::shell::{ShellEvent, spawn_shell};
 use crate::app::{App, Msg};
-#[cfg(feature = "demo")]
-use crate::components;
 use crate::components::input::Submission;
 use crate::components::{Action, ExitRequest, Status};
 
-#[cfg(feature = "demo")]
-use crate::mock;
 use crate::storage_writer::StorageWriter;
 use crate::terminal;
 
@@ -53,8 +49,6 @@ pub struct EventLoopParams {
     pub ui_action_rx: Option<flume::Receiver<UiAction>>,
     pub lua_event_handle: Option<EventHandle>,
     pub buf_click: Option<BufClickHandler>,
-    #[cfg(feature = "demo")]
-    pub demo: bool,
 }
 
 pub(crate) struct EventLoop<'t> {
@@ -120,29 +114,6 @@ fn restore_session(app: &mut App, handles: &AgentHandles) {
     }
 }
 
-#[cfg(feature = "demo")]
-fn apply_demo(app: &mut App) {
-    app.status = components::Status::Streaming;
-    app.run_id = 1;
-    for event in mock::mock_events() {
-        match event {
-            mock::MockEvent::User(text) => app.main_chat().push_user_message(&text),
-            mock::MockEvent::Error(text) => {
-                app.main_chat().push(components::DisplayMessage::new(
-                    components::DisplayRole::Error,
-                    text,
-                ));
-            }
-            mock::MockEvent::Flush => app.flush_all_chats(),
-            mock::MockEvent::Agent(envelope) => {
-                app.update(Msg::Agent(envelope));
-            }
-        }
-    }
-    app.flush_all_chats();
-    app.status = components::Status::Idle;
-}
-
 impl<'t> EventLoop<'t> {
     pub(crate) fn new(
         terminal: &'t mut ratatui::DefaultTerminal,
@@ -163,8 +134,6 @@ impl<'t> EventLoop<'t> {
             ui_action_rx,
             lua_event_handle,
             buf_click,
-            #[cfg(feature = "demo")]
-            demo,
         } = params;
 
         std::thread::spawn(crate::highlight::warmup);
@@ -214,11 +183,6 @@ impl<'t> EventLoop<'t> {
         app.exit_on_done = exit_on_done;
         app.buf_click = buf_click;
         app.lua_event_handle = lua_event_handle;
-
-        #[cfg(feature = "demo")]
-        if demo {
-            apply_demo(&mut app);
-        }
 
         handles.apply_to_app(&mut app);
 

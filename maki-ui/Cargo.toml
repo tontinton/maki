@@ -40,8 +40,6 @@ notify = { workspace = true }
 tempfile = { workspace = true }
 shell-words = { workspace = true }
 
-[features]
-demo = []
 
 [dev-dependencies]
 test-case = { workspace = true }

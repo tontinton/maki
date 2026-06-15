@@ -201,8 +201,6 @@ pub fn run(cli: Cli) -> Result<()> {
                         },
                     ) as maki_ui::BufClickHandler
                 }),
-                #[cfg(feature = "demo")]
-                demo: cli.demo,
             },
             initial_prompt,
         )

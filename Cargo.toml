@@ -16,9 +16,6 @@ rust-version = "1.88"
 name = "maki"
 path = "src/main.rs"
 
-[features]
-demo = ["maki-ui/demo"]
-
 [dependencies]
 maki-ui = { workspace = true }
 maki-agent = { workspace = true }
