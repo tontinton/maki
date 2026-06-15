@@ -40,7 +40,25 @@ local function read_view_opts(ctx)
   return { max_lines = (tol and tol.read) or 10, keep = "head" }
 end
 
-local function build_file_view(lines, start_line, total_lines, path, ctx)
+local function apply_highlights(view, hl_lines, ext)
+  local texts = {}
+  for _, fl in ipairs(hl_lines) do
+    texts[#texts + 1] = fl.text
+  end
+  local highlighted = maki.ui.highlight(table.concat(texts, "\n"), ext)
+  if not highlighted then
+    return
+  end
+  for i, fl in ipairs(hl_lines) do
+    local hl_spans = highlighted[i]
+    if hl_spans then
+      view:update_line(fl.idx, { view.all_lines[fl.idx][1], table.unpack(hl_spans) })
+    end
+  end
+  view:flush()
+end
+
+local function build_file_view(lines, start_line, total_lines, path, ctx, sync)
   local buf = maki.ui.buf()
   local view = ToolView.new(buf, read_view_opts(ctx))
   local nr_fmt = line_nr_fmt(total_lines)
@@ -68,23 +86,13 @@ local function build_file_view(lines, start_line, total_lines, path, ctx)
   view:finish()
 
   local ext = path:match("%.([^%.]+)$") or ""
-  maki.async.run(function()
-    local texts = {}
-    for _, fl in ipairs(hl_lines) do
-      texts[#texts + 1] = fl.text
-    end
-    local highlighted = maki.ui.highlight(table.concat(texts, "\n"), ext)
-    if not highlighted then
-      return
-    end
-    for i, fl in ipairs(hl_lines) do
-      local hl_spans = highlighted[i]
-      if hl_spans then
-        view:update_line(fl.idx, { view.all_lines[fl.idx][1], table.unpack(hl_spans) })
-      end
-    end
-    view:flush()
-  end)
+  if sync then
+    apply_highlights(view, hl_lines, ext)
+  else
+    maki.async.run(function()
+      apply_highlights(view, hl_lines, ext)
+    end)
+  end
 
   buf:on("click", function()
     view:toggle()
@@ -253,18 +261,11 @@ maki.api.register_tool({
   end,
 
   restore = function(input, output, _is_error, ctx)
-    local path = input.path or ""
-    local lines = {}
-    local start_line = nil
-    local total_lines = nil
-
+    local lines, start_line, total_lines = {}, nil, nil
     for raw in (output .. "\n"):gmatch("([^\n]*)\n") do
       local nr, text = raw:match("^%s*(%d+): (.*)$")
       if nr then
-        local n = tonumber(nr)
-        if not start_line then
-          start_line = n
-        end
+        start_line = start_line or tonumber(nr)
         lines[#lines + 1] = text
       else
         local trunc_end = raw:match("Truncated lines: %d+%-(%d+)")
@@ -273,14 +274,12 @@ maki.api.register_tool({
         end
       end
     end
-
     if #lines == 0 then
       return ToolView.restore(output, read_view_opts(ctx))
     end
-
     start_line = start_line or 1
     total_lines = total_lines or (start_line + #lines - 1)
-    return build_file_view(lines, start_line, total_lines, path, ctx)
+    return build_file_view(lines, start_line, total_lines, input.path or "", ctx, true)
   end,
 
   handler = function(input, ctx)
