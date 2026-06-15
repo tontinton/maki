@@ -163,7 +163,7 @@ impl ProviderKind {
             Self::Google => 65_536,
             Self::Copilot => 100_000,
             Self::Ollama => 16_384,
-            Self::LlamaCpp => 16_384,
+            Self::LlamaCpp => 0,
             Self::Mistral => 32_000,
             Self::Zai | Self::ZaiCodingPlan => 16_000,
             Self::DeepSeek => 384_000,

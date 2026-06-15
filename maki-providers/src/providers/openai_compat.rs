@@ -59,8 +59,10 @@ impl OpenAiCompatProvider {
             "model": model.id,
             "messages": wire_messages,
             "stream": true,
-            self.config.max_tokens_field: model.max_output_tokens,
         });
+        if model.max_output_tokens != 0 {
+            body[self.config.max_tokens_field] = json!(model.max_output_tokens);
+        }
         if self.config.include_stream_usage {
             body["stream_options"] = json!({"include_usage": true});
         }
