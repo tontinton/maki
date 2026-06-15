@@ -40,14 +40,6 @@ local function read_view_opts(ctx)
   return { max_lines = (tol and tol.read) or 10, keep = "head" }
 end
 
-local function format_instructions(instructions)
-  local parts = {}
-  for _, inst in ipairs(instructions) do
-    parts[#parts + 1] = "\n\n---\nInstructions from: " .. inst.path .. "\n" .. inst.content
-  end
-  return table.concat(parts, "")
-end
-
 local function build_file_view(lines, start_line, total_lines, path, ctx)
   local buf = maki.ui.buf()
   local view = ToolView.new(buf, read_view_opts(ctx))
@@ -158,20 +150,25 @@ local function read_file(path, offset, limit, ctx)
       )
   end
 
+  local shown = #lines
+  local annotation = shown < total_lines and string.format("%d of %d lines", shown, total_lines)
+    or string.format("%d lines", shown)
+
   local basename = path:match("([^/]+)$")
   if not ctx:is_instruction_file(basename) then
     local parent = maki.fs.dirname(path)
     if parent then
       local instructions = ctx:find_instructions(parent)
       if #instructions > 0 then
-        llm_output = llm_output .. format_instructions(instructions)
+        return {
+          llm_output = llm_output,
+          body = build_file_view(lines, start, total_lines, path, ctx),
+          annotation = annotation,
+          instructions = instructions,
+        }
       end
     end
   end
-
-  local shown = #lines
-  local annotation = shown < total_lines and string.format("%d of %d lines", shown, total_lines)
-    or string.format("%d lines", shown)
 
   return {
     llm_output = llm_output,
@@ -209,13 +206,15 @@ local function list_dir(path, ctx)
   local text = table.concat(names, "\n")
 
   local instructions = ctx:find_instructions(path)
-  local llm_output = #instructions > 0 and text .. format_instructions(instructions) or text
-
-  return {
-    llm_output = llm_output,
+  local result = {
+    llm_output = text,
     body = build_dir_view(text, ctx),
     annotation = #sorted .. " entries",
   }
+  if #instructions > 0 then
+    result.instructions = instructions
+  end
+  return result
 end
 
 maki.api.register_tool({

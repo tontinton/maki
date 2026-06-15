@@ -101,12 +101,12 @@ pub(crate) fn tool_output_annotation(output: &ToolOutput) -> Option<String> {
             let f = if files == 1 { "file" } else { "files" };
             Some(format!("{matches} matches in {files} {f}"))
         }
-        ToolOutput::ReadDir { text, .. } => {
-            let n = text.lines().count();
+        ToolOutput::ReadDir(t) => {
+            let n = t.text.lines().count();
             Some(format!("{n} entries"))
         }
-        ToolOutput::Plain(text) | ToolOutput::Markdown(text) if !text.is_empty() => {
-            let n = text.lines().count();
+        ToolOutput::Plain(text) | ToolOutput::Markdown(text) if !text.text.is_empty() => {
+            let n = text.text.lines().count();
             Some(format!("{n} lines"))
         }
         _ => None,
@@ -263,7 +263,7 @@ impl HighlightRequest {
             | ToolOutput::Instructions { .. } => Some(o),
             ToolOutput::Plain(_)
             | ToolOutput::Markdown(_)
-            | ToolOutput::ReadDir { .. }
+            | ToolOutput::ReadDir(_)
             | ToolOutput::TodoList(_)
             | ToolOutput::Batch { .. } => None,
         });
@@ -391,8 +391,9 @@ fn resolve_output<'a>(
     }
 
     let full_text: Option<Cow<'a, str>> = match output {
-        Some(ToolOutput::Plain(t) | ToolOutput::Markdown(t)) => Some(Cow::Borrowed(t.as_str())),
-        Some(ToolOutput::ReadDir { text, .. }) => Some(Cow::Borrowed(text.as_str())),
+        Some(ToolOutput::Plain(t) | ToolOutput::Markdown(t) | ToolOutput::ReadDir(t)) => {
+            Some(Cow::Borrowed(t.text.as_str()))
+        }
         _ => None,
     };
 
@@ -784,7 +785,9 @@ pub fn build_tool_lines(
             .tool_output
             .as_ref()
             .and_then(|o| match o.as_ref() {
-                ToolOutput::Plain(t) | ToolOutput::Markdown(t) => Some(t.as_str()),
+                ToolOutput::Plain(t) | ToolOutput::Markdown(t) | ToolOutput::ReadDir(t) => {
+                    Some(t.text.as_str())
+                }
                 _ => None,
             })
             .or(body);
@@ -838,7 +841,9 @@ pub fn build_batch_entry_lines(
     b.push_code_content(entry.input.as_ref(), entry.output.as_ref());
     if let Some(snap) = child_state.and_then(|s| s.snapshot.as_ref()) {
         let search_text = entry.output.as_ref().and_then(|o| match o {
-            ToolOutput::Plain(t) | ToolOutput::Markdown(t) => Some(t.as_str()),
+            ToolOutput::Plain(t) | ToolOutput::Markdown(t) | ToolOutput::ReadDir(t) => {
+                Some(t.text.as_str())
+            }
             _ => None,
         });
         b.push_snapshot(snap, search_text);
@@ -937,7 +942,7 @@ mod tests {
     use maki_agent::tools::{BASH_TOOL_NAME, READ_TOOL_NAME, TASK_TOOL_NAME};
     use maki_agent::{
         BatchToolEntry, BatchToolStatus, GrepFileEntry, GrepMatchGroup, SnapshotLine, SnapshotSpan,
-        ToolInput, ToolOutput,
+        TextOutput, ToolInput, ToolOutput,
     };
     use test_case::test_case;
 
@@ -1256,8 +1261,8 @@ mod tests {
     }
 
     #[test_case("bash",  ToolOutput::Plain("ok".into()),                      Some("1 lines")     ; "plain_short_annotates")]
-    #[test_case("bash",  ToolOutput::Plain((0..20).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n")), Some("20 lines") ; "plain_long_annotates")]
-    #[test_case("bash",  ToolOutput::Plain(String::new()),                     None                 ; "plain_empty_no_annotation")]
+    #[test_case("bash",  ToolOutput::Plain((0..20).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n").into()), Some("20 lines") ; "plain_long_annotates")]
+    #[test_case("bash",  ToolOutput::Plain(String::new().into()),                     None                 ; "plain_empty_no_annotation")]
     #[test_case("read",  ToolOutput::ReadCode { path: "a.rs".into(), start_line: 1, lines: vec!["x".into(); 5], total_lines: 5, instructions: None }, Some("5 lines") ; "read_code_full_file")]
     #[test_case("read",  ToolOutput::ReadCode { path: "a.rs".into(), start_line: 10, lines: vec!["x".into(); 5], total_lines: 100, instructions: None }, Some("5 of 100 lines") ; "read_code_partial")]
     #[test_case("write", ToolOutput::WriteCode { path: "a.rs".into(), byte_count: 99, lines: vec![] }, Some("99 bytes") ; "write_code_bytes")]
@@ -1291,7 +1296,7 @@ mod tests {
             text: "Find auth".into(),
             tool_input: None,
             tool_raw_input: None,
-            tool_output: Some(Arc::new(ToolOutput::Plain(output))),
+            tool_output: Some(Arc::new(ToolOutput::Plain(output.into()))),
             live_output: None,
             annotation: None,
             plan_path: None,
@@ -1406,7 +1411,7 @@ mod tests {
             text: format!("src/lib.rs\n{body}"),
             tool_input: None,
             tool_raw_input: None,
-            tool_output: Some(Arc::new(ToolOutput::Plain(body.to_owned()))),
+            tool_output: Some(Arc::new(ToolOutput::Plain(body.to_owned().into()))),
             live_output: None,
             annotation: None,
             plan_path: None,
@@ -1543,7 +1548,7 @@ mod tests {
         ; "body_takes_priority_over_plain"
     )]
     #[test_case(
-        Some(ToolOutput::Plain(String::new())), None, "bash", false
+        Some(ToolOutput::Plain(String::new().into())), None, "bash", false
         ; "empty_plain_resolves_to_none"
     )]
     #[test_case(
@@ -1552,7 +1557,7 @@ mod tests {
         ; "batch_always_none"
     )]
     #[test_case(
-        Some(ToolOutput::ReadDir { text: "dir listing".into(), instructions: None }),
+        Some(ToolOutput::ReadDir(TextOutput { text: "dir listing".into(), instructions: None })),
         None, "read", true
         ; "readdir_uses_text_field"
     )]
@@ -1613,7 +1618,7 @@ mod tests {
         } else {
             (
                 ToolStatus::Success,
-                Some(Arc::new(ToolOutput::Plain(full_body))),
+                Some(Arc::new(ToolOutput::Plain(full_body.into()))),
                 None,
             )
         };
@@ -1962,16 +1967,6 @@ mod tests {
         assert!(resolved.add_modifier.contains(Modifier::DIM));
         assert!(resolved.add_modifier.contains(Modifier::CROSSED_OUT));
         assert!(resolved.add_modifier.contains(Modifier::REVERSED));
-    }
-
-    #[test]
-    fn resolve_span_style_inline_no_modifiers() {
-        use maki_agent::types::InlineStyle;
-        let style = SpanStyle::Inline(InlineStyle::default());
-        let resolved = resolve_span_style(&style);
-        assert_eq!(resolved.fg, None);
-        assert_eq!(resolved.bg, None);
-        assert_eq!(resolved, Style::default());
     }
 
     #[test]

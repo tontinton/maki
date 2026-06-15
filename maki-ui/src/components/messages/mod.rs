@@ -253,13 +253,11 @@ impl MessagesPanel {
         }
 
         match &event.output {
-            ToolOutput::Plain(text)
-            | ToolOutput::Markdown(text)
-            | ToolOutput::ReadDir { text, .. }
+            ToolOutput::Plain(text) | ToolOutput::Markdown(text) | ToolOutput::ReadDir(text)
                 if msg.render_snapshot.is_none() =>
             {
                 let limits = output_limits_from_hints(&event.tool, hints, &self.tool_output_lines);
-                let tr = truncate_output(text, limits.max_lines, limits.keep);
+                let tr = truncate_output(&text.text, limits.max_lines, limits.keep);
                 msg.truncated_lines = tr.skipped;
                 if !tr.kept.is_empty() {
                     msg.text = format!("{}\n{}", msg.text, tr.kept);
@@ -469,7 +467,7 @@ impl MessagesPanel {
             self.tool_done(ToolDoneEvent {
                 id,
                 tool,
-                output: ToolOutput::Plain(message.clone()),
+                output: ToolOutput::Plain(message.clone().into()),
                 is_error: true,
                 annotation: None,
             });

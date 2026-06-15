@@ -215,7 +215,7 @@ impl Task {
             });
         }
 
-        Ok(ToolOutput::Plain(text))
+        Ok(ToolOutput::Plain(text.into()))
     }
 
     pub fn start_header(&self) -> String {

@@ -78,7 +78,7 @@ pub async fn run(
     let done_error = |msg: String| ToolDoneEvent {
         id: id.clone(),
         tool: Arc::clone(&tool_id),
-        output: ToolOutput::Plain(msg),
+        output: ToolOutput::Plain(msg.into()),
         is_error: true,
         annotation: None,
     };
@@ -215,7 +215,7 @@ async fn execute_mcp_tool(
     let done = |output: String, is_error: bool| ToolDoneEvent {
         id: id.to_owned(),
         tool: Arc::clone(&tool_id),
-        output: ToolOutput::Plain(output),
+        output: ToolOutput::Plain(output.into()),
         is_error,
         annotation: None,
     };

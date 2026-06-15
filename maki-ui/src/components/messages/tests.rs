@@ -840,7 +840,7 @@ fn panel_with_long_tool(line_count: usize) -> MessagesPanel {
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
         tool: BASH_TOOL_NAME.into(),
-        output: ToolOutput::Plain(body),
+        output: ToolOutput::Plain(body.into()),
         is_error: false,
         annotation: None,
     });
@@ -989,7 +989,7 @@ fn search_text_includes_truncated_bash_output() {
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
         tool: BASH_TOOL_NAME.into(),
-        output: ToolOutput::Plain(full_output.clone()),
+        output: ToolOutput::Plain(full_output.clone().into()),
         is_error: false,
         annotation: None,
     });

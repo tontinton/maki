@@ -138,7 +138,7 @@ impl App {
                 self.main_chat().shell_tool_done(ToolDoneEvent {
                     id,
                     tool: "bash".into(),
-                    output: ToolOutput::Plain(output),
+                    output: ToolOutput::Plain(output.into()),
                     is_error,
                     annotation: None,
                 });

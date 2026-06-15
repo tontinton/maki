@@ -573,7 +573,7 @@ mod tests {
             HeaderFuture::Ready(HeaderResult::plain("mock".into()))
         }
         fn execute<'a>(self: Box<Self>, _ctx: &'a super::ToolContext) -> ExecFuture<'a> {
-            Box::pin(async { Ok(ToolOutput::Plain(String::new())).into() })
+            Box::pin(async { Ok(ToolOutput::Plain(String::new().into())).into() })
         }
     }
 

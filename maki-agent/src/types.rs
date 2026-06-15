@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use flume::Sender;
 use maki_providers::{AgentError, ContentBlock, Message, Role, StopReason, TokenUsage};
 use maki_tool_macro::{ArgEnum, Args};
+use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
 
 pub const NO_FILES_FOUND: &str = "No files found";
@@ -149,10 +150,57 @@ fn append_instructions(out: &mut String, blocks: &[InstructionBlock]) {
     }
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct TextOutput {
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<Vec<InstructionBlock>>,
+}
+
+impl From<String> for TextOutput {
+    fn from(text: String) -> Self {
+        Self {
+            text,
+            instructions: None,
+        }
+    }
+}
+
+impl From<&str> for TextOutput {
+    fn from(text: &str) -> Self {
+        Self {
+            text: text.to_owned(),
+            instructions: None,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for TextOutput {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Legacy(String),
+            Full {
+                text: String,
+                #[serde(default)]
+                instructions: Option<Vec<InstructionBlock>>,
+            },
+        }
+        match Raw::deserialize(deserializer)? {
+            Raw::Legacy(text) => Ok(Self {
+                text,
+                instructions: None,
+            }),
+            Raw::Full { text, instructions } => Ok(Self { text, instructions }),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ToolOutput {
-    Plain(String),
-    Markdown(String),
+    Plain(TextOutput),
+    Markdown(TextOutput),
     ReadCode {
         path: String,
         start_line: usize,
@@ -162,11 +210,7 @@ pub enum ToolOutput {
         #[serde(default)]
         instructions: Option<Vec<InstructionBlock>>,
     },
-    ReadDir {
-        text: String,
-        #[serde(default)]
-        instructions: Option<Vec<InstructionBlock>>,
-    },
+    ReadDir(TextOutput),
     Diff {
         path: String,
         before: String,
@@ -208,9 +252,8 @@ impl ToolOutput {
 
     pub fn instructions(&self) -> Option<&[InstructionBlock]> {
         match self {
-            Self::ReadCode { instructions, .. } | Self::ReadDir { instructions, .. } => {
-                instructions.as_deref()
-            }
+            Self::Plain(t) | Self::Markdown(t) | Self::ReadDir(t) => t.instructions.as_deref(),
+            Self::ReadCode { instructions, .. } => instructions.as_deref(),
             _ => None,
         }
     }
@@ -229,7 +272,7 @@ impl ToolOutput {
         match self {
             Self::Diff { .. }
             | Self::ReadCode { .. }
-            | Self::ReadDir { .. }
+            | Self::ReadDir(_)
             | Self::WriteCode { .. }
             | Self::GrepResult { .. }
             | Self::TodoList(_) => Some(self.as_display_text()),
@@ -240,9 +283,7 @@ impl ToolOutput {
     pub fn is_empty_result(&self) -> bool {
         match self {
             Self::GrepResult { entries } => entries.is_empty(),
-            Self::ReadDir { text, .. } => text.is_empty(),
-            Self::Plain(text) | Self::Markdown(text) => text.is_empty(),
-
+            Self::Plain(t) | Self::Markdown(t) | Self::ReadDir(t) => t.text.is_empty(),
             _ => false,
         }
     }
@@ -251,7 +292,14 @@ impl ToolOutput {
         match self {
             Self::Diff { summary, .. } => summary.clone(),
             Self::TodoList(_) => "ok".into(),
-            Self::ReadCode { instructions, .. } | Self::ReadDir { instructions, .. } => {
+            Self::Plain(t) | Self::Markdown(t) | Self::ReadDir(t) => {
+                let mut out = t.text.clone();
+                if let Some(blocks) = &t.instructions {
+                    append_instructions(&mut out, blocks);
+                }
+                out
+            }
+            Self::ReadCode { instructions, .. } => {
                 let mut out = self.as_display_text();
                 if let Some(blocks) = instructions {
                     append_instructions(&mut out, blocks);
@@ -264,9 +312,7 @@ impl ToolOutput {
 
     pub fn as_display_text(&self) -> String {
         match self {
-            Self::Plain(s) | Self::Markdown(s) => s.clone(),
-
-            Self::ReadDir { text, .. } => text.clone(),
+            Self::Plain(t) | Self::Markdown(t) | Self::ReadDir(t) => t.text.clone(),
             Self::ReadCode {
                 start_line,
                 lines,
@@ -373,6 +419,7 @@ const UNKNOWN_TOOL: &str = "unknown";
 
 impl ToolDoneEvent {
     pub fn error(id: String, message: impl Into<String>) -> Self {
+        let message: String = message.into();
         Self {
             id,
             tool: Arc::from(UNKNOWN_TOOL),
@@ -1073,5 +1120,68 @@ mod tests {
         let json_without = r#"{"id":"t1"}"#;
         let parsed: ToolSnapshotFields = serde_json::from_str(json_without).unwrap();
         assert_eq!(parsed.theme_gen, None, "{COMPAT_MSG}");
+    }
+
+    #[test]
+    fn text_output_serde_legacy_bare_string() {
+        const MSG: &str = "old sessions store Plain as a bare string";
+        let json = r#"{"Plain":"hello world"}"#;
+        let output: ToolOutput = serde_json::from_str(json).unwrap();
+        match &output {
+            ToolOutput::Plain(t) => {
+                assert_eq!(t.text, "hello world", "{MSG}");
+                assert!(t.instructions.is_none(), "{MSG}");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn text_output_serde_full_roundtrip() {
+        const MSG: &str = "new format with instructions must roundtrip";
+        let blocks = vec![InstructionBlock {
+            path: "AGENTS.md".into(),
+            content: "be nice".into(),
+        }];
+        let output = ToolOutput::Plain(TextOutput {
+            text: "file contents".into(),
+            instructions: Some(blocks),
+        });
+        let json = serde_json::to_string(&output).unwrap();
+        let parsed: ToolOutput = serde_json::from_str(&json).unwrap();
+        match &parsed {
+            ToolOutput::Plain(t) => {
+                assert_eq!(t.text, "file contents", "{MSG}");
+                let inst = t.instructions.as_ref().expect("instructions missing");
+                assert_eq!(inst.len(), 1, "{MSG}");
+                assert_eq!(inst[0].path, "AGENTS.md", "{MSG}");
+                assert_eq!(inst[0].content, "be nice", "{MSG}");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn plain_with_instructions_as_text_includes_instructions() {
+        const INCLUDES_MSG: &str = "as_text must include instructions";
+        const EXCLUDES_MSG: &str = "as_display_text must exclude instructions";
+        let output = ToolOutput::Plain(TextOutput {
+            text: "fn main()".into(),
+            instructions: Some(vec![InstructionBlock {
+                path: "AGENTS.md".into(),
+                content: "do stuff".into(),
+            }]),
+        });
+        let text = output.as_text();
+        assert!(text.contains("fn main()"), "{INCLUDES_MSG}");
+        assert!(
+            text.contains("Instructions from: AGENTS.md"),
+            "{INCLUDES_MSG}"
+        );
+        assert!(text.contains("do stuff"), "{INCLUDES_MSG}");
+
+        let display = output.as_display_text();
+        assert!(display.contains("fn main()"), "{EXCLUDES_MSG}");
+        assert!(!display.contains("Instructions from:"), "{EXCLUDES_MSG}");
     }
 }

@@ -514,7 +514,7 @@ pub fn render_tool_content(
                 render_instructions(blocks, &mut instruction_lines, limits.output, highlight);
             (instruction_lines, trunc)
         }
-        Some(ToolOutput::ReadDir { .. }) => (Vec::new(), false),
+        Some(ToolOutput::ReadDir(_)) => (Vec::new(), false),
         _ => (Vec::new(), false),
     };
     truncation.output = output_trunc;

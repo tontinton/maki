@@ -126,11 +126,14 @@ impl CodeExecution {
                     output.push_str("(no output)");
                 }
 
-                Ok(ToolOutput::Plain(truncate_output(
-                    output,
-                    env.config.max_output_lines,
-                    env.config.max_output_bytes,
-                )))
+                Ok(ToolOutput::Plain(
+                    truncate_output(
+                        output,
+                        env.config.max_output_lines,
+                        env.config.max_output_bytes,
+                    )
+                    .into(),
+                ))
             }))
             .await?
     }

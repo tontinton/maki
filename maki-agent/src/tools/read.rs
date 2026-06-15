@@ -3,7 +3,7 @@ use std::fs;
 use std::path::Path;
 
 use crate::agent::{self, LoadedInstructions};
-use crate::{InstructionBlock, ToolOutput};
+use crate::{InstructionBlock, TextOutput, ToolOutput};
 use maki_tool_macro::Tool;
 use serde::Deserialize;
 
@@ -125,7 +125,7 @@ impl Read {
             ))
         });
 
-        Ok(ToolOutput::ReadDir { text, instructions })
+        Ok(ToolOutput::ReadDir(TextOutput { text, instructions }))
     }
 
     pub fn start_header(&self) -> String {
@@ -189,10 +189,10 @@ mod tests {
         let result =
             Read::list_dir(&dir_path, None, &crate::agent::LoadedInstructions::new()).unwrap();
         match &result {
-            ToolOutput::ReadDir { text, instructions } => {
-                let entries: Vec<&str> = text.lines().collect();
+            ToolOutput::ReadDir(t) => {
+                let entries: Vec<&str> = t.text.lines().collect();
                 assert_eq!(entries, vec!["adir/", "zdir/", "a.rs", "b.txt"]);
-                assert!(instructions.is_none());
+                assert!(t.instructions.is_none());
             }
             other => panic!("expected ReadDir, got {other:?}"),
         }
@@ -210,8 +210,8 @@ mod tests {
         let loaded = crate::agent::LoadedInstructions::new();
         let result = Read::list_dir(&sub_path, Some(root.path()), &loaded).unwrap();
         match &result {
-            ToolOutput::ReadDir { instructions, .. } => {
-                let blocks = instructions.as_ref().expect("should have instructions");
+            ToolOutput::ReadDir(t) => {
+                let blocks = t.instructions.as_ref().expect("should have instructions");
                 assert_eq!(blocks.len(), 1);
                 assert!(blocks[0].path.ends_with("AGENTS.md"));
                 assert_eq!(blocks[0].content, "sub rules");

@@ -18,7 +18,7 @@ fn exec_tool(reg: &ToolRegistry, name: &str, input: serde_json::Value) -> Result
     smol::block_on(async { inv.execute(&ctx).await })
         .output
         .map(|out| match out {
-            maki_agent::ToolOutput::Plain(s) => s,
+            maki_agent::ToolOutput::Plain(s) => s.text,
             other => panic!("unexpected output: {other:?}"),
         })
 }

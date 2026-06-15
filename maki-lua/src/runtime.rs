@@ -32,7 +32,7 @@ use crate::api::json_to_lua;
 use crate::api::keymap::KeymapReader;
 use crate::api::keymap::{KeymapStore, KeymapWriter};
 use crate::api::setup::ConfigStore;
-use crate::api::tool::{LuaOutputFormat, LuaTool, PendingTool, PendingTools, ToolCallReply};
+use crate::api::tool::{LuaTool, PendingTool, PendingTools, ToolCallReply};
 use crate::api::ui::HintStore;
 use crate::error::PluginError;
 use crate::plugin_permissions::{PluginPermissions, load_plugin_permissions};
@@ -1384,14 +1384,9 @@ fn timeout_reply(handle: &TaskHandle, plugin: &str, tool: &str) -> ToolCallReply
         });
     }
 
-    ToolCallReply {
-        result: Err(format!("tool {qualified} timed out after {secs}s")),
-        snapshot: None,
-        header: None,
-        live_buf,
-        format: LuaOutputFormat::default(),
-        annotation: None,
-    }
+    let mut reply = ToolCallReply::err(format!("tool {qualified} timed out after {secs}s"));
+    reply.live_buf = live_buf;
+    reply
 }
 
 /// Deadlines work in two layers: the interrupt hook catches tight CPU

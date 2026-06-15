@@ -34,8 +34,8 @@ pub use maki_providers::{ImageMediaType, ImageSource, ThinkingConfig};
 pub use types::{
     AgentEvent, BatchProgressEvent, BatchToolEntry, BatchToolStatus, BufferSnapshot, Envelope,
     EventSender, GrepFileEntry, GrepLine, GrepMatchGroup, InstructionBlock, NO_FILES_FOUND,
-    SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle, SubagentInfo, ToolDoneEvent, ToolInput,
-    ToolOutput, ToolStartEvent, TurnCompleteEvent,
+    SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle, SubagentInfo, TextOutput, ToolDoneEvent,
+    ToolInput, ToolOutput, ToolStartEvent, TurnCompleteEvent,
 };
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
