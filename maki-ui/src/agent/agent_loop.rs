@@ -73,7 +73,7 @@ impl AgentLoop {
             instructions: Instructions::default(),
             tools: Value::Null,
             mcp_handle,
-            history: History::new(initial_history).with_mirror(shared_history),
+            history: History::restored(initial_history).with_mirror(shared_history),
             btw_system,
             cancel_map,
             init_cancel,

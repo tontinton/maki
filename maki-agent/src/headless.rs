@@ -307,7 +307,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                 };
 
             let mut store = SessionStore::open(&session_id, &working_dir, &model.spec());
-            let mut history = History::new(params.initial_history);
+            let mut history = History::restored(params.initial_history);
             let mut run_id: u64 = 0;
 
             while let Ok(input) = input_rx.recv_async().await {
