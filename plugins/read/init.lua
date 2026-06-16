@@ -14,7 +14,7 @@ local DESCRIPTION = [[Read a file or directory. Returns contents with line numbe
 - Avoid tiny repeated slices - read a larger window if you need more context.]]
 
 local DEFAULT_MAX_OUTPUT_LINES = 2000
-local DEFAULT_MAX_LINE_BYTES = 500
+local DEFAULT_MAX_LINE_BYTES = 3000
 
 local function line_nr_fmt(count)
   local w = math.max(1, math.floor(math.log(count + 1, 10)) + 1)
