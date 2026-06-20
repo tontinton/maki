@@ -262,11 +262,8 @@ mod tests {
         const MAIN: ToolAudience = ToolAudience::MAIN;
         const RES: ToolAudience = ToolAudience::RESEARCH_SUB;
         const GEN: ToolAudience = ToolAudience::GENERAL_SUB;
-        const INT: ToolAudience = ToolAudience::INTERPRETER;
 
         let expected: BTreeMap<&str, ToolAudience> = BTreeMap::from([
-            (super::super::EDIT_TOOL_NAME, MAIN | GEN | INT),
-            (super::super::MULTIEDIT_TOOL_NAME, MAIN | GEN | INT),
             (super::super::BATCH_TOOL_NAME, MAIN | RES | GEN),
             (super::super::CODE_EXECUTION_TOOL_NAME, MAIN | RES | GEN),
             (super::super::TASK_TOOL_NAME, MAIN),

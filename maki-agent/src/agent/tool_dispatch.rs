@@ -464,46 +464,33 @@ mod tests {
         use crate::permissions::{PERMISSION_DENIED_PREFIX, PermissionManager};
 
         smol::block_on(async {
-            let deny_all_edit = PermissionsConfig {
+            let deny_task = PermissionsConfig {
                 allow_all: false,
                 rules: vec![PermissionRule {
-                    tool: crate::tools::EDIT_TOOL_NAME.into(),
+                    tool: crate::tools::TASK_TOOL_NAME.into(),
                     scope: None,
                     effect: Effect::Deny,
                 }],
             };
             let dir = TempDir::new().unwrap();
-            let permissions = Arc::new(PermissionManager::new(
-                deny_all_edit,
-                dir.path().to_path_buf(),
-            ));
+            let permissions = Arc::new(PermissionManager::new(deny_task, dir.path().to_path_buf()));
             let ctx = crate::tools::test_support::stub_ctx_with_permissions(
                 &AgentMode::Build,
                 permissions,
             );
 
-            let marker = dir.path().join("marker.txt");
-            let marker_str = marker.to_str().unwrap();
-            std::fs::write(&marker, "x").unwrap();
-            crate::tools::test_support::pre_read(&ctx, marker_str);
-
             let done = run(
                 ToolRegistry::native(),
                 None,
                 "t1".into(),
-                crate::tools::EDIT_TOOL_NAME,
-                &serde_json::json!({ "path": marker_str, "old_string": "x", "new_string": "y" }),
+                crate::tools::TASK_TOOL_NAME,
+                &serde_json::json!({ "description": "test task", "prompt": "hello" }),
                 &ctx,
                 Emit::Silent,
             )
             .await;
 
             assert!(done.is_error, "permission denial must produce error event");
-            assert_eq!(
-                std::fs::read_to_string(&marker).unwrap(),
-                "x",
-                "tool executed despite permission denial"
-            );
             assert!(
                 done.output.as_text().starts_with(PERMISSION_DENIED_PREFIX),
                 "error should be the permission-denied message, got: {}",

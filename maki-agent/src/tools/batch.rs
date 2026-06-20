@@ -370,7 +370,7 @@ mod tests {
     use serde_json::json;
 
     use crate::AgentMode;
-    use crate::tools::test_support::{pre_read, stub_ctx};
+    use crate::tools::test_support::stub_ctx;
 
     use super::*;
 
@@ -412,17 +412,12 @@ mod tests {
     #[test]
     fn parallel_execution_with_mixed_results() {
         smol::block_on(async {
-            let dir = tempfile::TempDir::new().unwrap();
-            let f = dir.path().join("a.txt");
-            let f_str = f.to_str().unwrap();
-            std::fs::write(&f, "content").unwrap();
             let ctx = stub_ctx(&crate::AgentMode::Build);
-            pre_read(&ctx, f_str);
 
             let (entries, _text) = execute_batch(&ctx, json!({
                 "tool_calls": [
-                    {"tool": "edit", "parameters": {"path": f_str, "old_string": "content", "new_string": "new_content"}},
-                    {"tool": "edit", "parameters": {"path": "/nonexistent/dir/path.txt", "old_string": "x", "new_string": "y"}}
+                    {"tool": "code_execution", "parameters": {"code": "print('ok')"}},
+                    {"tool": "code_execution", "parameters": {"code": "raise Exception('fail')"}}
                 ]
             }))
             .await;
@@ -469,19 +464,13 @@ mod tests {
         use crate::{Envelope, EventSender};
 
         smol::block_on(async {
-            let dir = tempfile::TempDir::new().unwrap();
-            let f = dir.path().join("hello.txt");
-            let f_str = f.to_str().unwrap();
-            std::fs::write(&f, "hello").unwrap();
-
             let (tx, rx) = flume::unbounded::<Envelope>();
             let event_tx = EventSender::new(tx, 0);
             let ctx = stub_ctx_with(&AgentMode::Build, Some(&event_tx), None);
-            pre_read(&ctx, f_str);
             execute_batch(
                 &ctx,
                 json!({
-                    "tool_calls": [{"tool": "edit", "parameters": {"path": f_str, "old_string": "hello", "new_string": "world"}}]
+                    "tool_calls": [{"tool": "code_execution", "parameters": {"code": "print('hello')"}}]
                 }),
             )
             .await;

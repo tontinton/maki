@@ -42,7 +42,7 @@ Write content to a file, replacing existing content.
 | `content` | string | yes | The complete file content to write |
 | `path` | string | yes | Absolute path to the file |
 
-### `edit`
+### `edit` *(lua plugin)*
 
 Replace an exact string match in a file.
 
@@ -53,7 +53,7 @@ Replace an exact string match in a file.
 | `path` | string | yes |  | Absolute path to the file |
 | `replace_all` | boolean | no | false | Replace all occurrences |
 
-### `multiedit`
+### `multiedit` *(lua plugin)*
 
 Make multiple find-and-replace edits to a single file atomically.
 Prefer this over edit when making multiple changes to the same file.

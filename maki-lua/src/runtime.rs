@@ -994,6 +994,7 @@ impl LuaRuntime {
                     permission_scope_kind: t.permission_scope_kind.clone(),
                     mutable_path_field: t.mutable_path_field.clone(),
                     timeout: t.timeout,
+                    start_annotation_array_field: t.start_annotation_array_field.clone(),
                 });
                 (
                     tool,

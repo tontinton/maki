@@ -122,11 +122,12 @@ pub fn load_builtin_plugin_tools() -> Vec<Value> {
     };
     let mut plugins: Vec<Value> = entries
         .filter_map(|e| e.ok())
-        .filter_map(|e| {
+        .flat_map(|e| {
             let path = e.path().join("init.lua");
             let source = std::fs::read_to_string(&path).ok()?;
-            parse_lua_tool(&source)
+            Some(parse_lua_tools(&source))
         })
+        .flatten()
         .collect();
     plugins.sort_by(|a, b| {
         let na = a.get("name").and_then(|n| n.as_str()).unwrap_or("");
@@ -136,7 +137,29 @@ pub fn load_builtin_plugin_tools() -> Vec<Value> {
     plugins
 }
 
-fn parse_lua_tool(source: &str) -> Option<Value> {
+fn parse_lua_tools(source: &str) -> Vec<Value> {
+    let marker = "register_tool({";
+    let preamble_end = source.find(marker).unwrap_or(0);
+    let preamble = &source[..preamble_end];
+
+    let mut tools = Vec::new();
+    let mut search = source;
+    while let Some(start) = search.find(marker) {
+        let block_start = &search[start + marker.len() - 1..];
+        let Some(end) = find_matching_brace(block_start, 0) else {
+            break;
+        };
+        let block = &block_start[..=end];
+        let scoped = format!("{preamble}{block}");
+        if let Some(tool) = parse_single_tool(&scoped) {
+            tools.push(tool);
+        }
+        search = &block_start[end..];
+    }
+    tools
+}
+
+fn parse_single_tool(source: &str) -> Option<Value> {
     let name = source
         .lines()
         .find_map(|l| l.trim().strip_prefix("name = \"")?.strip_suffix("\","))?;

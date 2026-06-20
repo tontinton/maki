@@ -48,6 +48,7 @@ pub(crate) struct PendingTool {
     pub(crate) permission_scopes_key: Option<RegistryKey>,
     pub(crate) mutable_path_field: Option<Arc<str>>,
     pub(crate) timeout: Option<Duration>,
+    pub(crate) start_annotation_array_field: Option<Arc<str>>,
 }
 
 pub(crate) type PendingTools = Arc<Mutex<Vec<PendingTool>>>;
@@ -64,6 +65,7 @@ pub(crate) struct LuaTool {
     pub(crate) permission_scope_kind: Option<PermissionScopeKind>,
     pub(crate) mutable_path_field: Option<Arc<str>>,
     pub(crate) timeout: Option<Duration>,
+    pub(crate) start_annotation_array_field: Option<Arc<str>>,
 }
 
 impl Tool for LuaTool {
@@ -109,6 +111,7 @@ impl Tool for LuaTool {
             permission_state,
             mutable_path_field: self.mutable_path_field.clone(),
             timeout: self.timeout,
+            start_annotation_array_field: self.start_annotation_array_field.clone(),
         }))
     }
 }
@@ -127,6 +130,7 @@ struct LuaToolInvocation {
     permission_state: PermissionState,
     mutable_path_field: Option<Arc<str>>,
     timeout: Option<Duration>,
+    start_annotation_array_field: Option<Arc<str>>,
 }
 
 impl ToolInvocation for LuaToolInvocation {
@@ -160,6 +164,19 @@ impl ToolInvocation for LuaToolInvocation {
                     .unwrap_or_else(|_| HeaderResult::plain(fallback))
             }),
         }
+    }
+
+    fn start_annotation(&self) -> Option<String> {
+        let field = self.start_annotation_array_field.as_deref()?;
+        let arr = self.input.get(field)?.as_array()?;
+        let n = arr.len();
+        let (singular, plural) = if let Some(stem) = field.strip_suffix('s') {
+            (stem, field)
+        } else {
+            (field, &*format!("{field}s"))
+        };
+        let label = if n == 1 { singular } else { plural };
+        Some(format!("{n} {label}"))
     }
 
     fn permission_scopes(&self) -> BoxFuture<'_, Option<PermissionScopes>> {
@@ -295,16 +312,25 @@ impl ToolInvocation for LuaToolInvocation {
                     let instructions = reply.instructions;
                     ToolExecResult {
                         output: reply.result.map(|s| {
-                            let inner = match instructions {
-                                Some(blocks) if !blocks.is_empty() => TextOutput {
-                                    text: s,
-                                    instructions: Some(blocks),
-                                },
-                                _ => s.into(),
-                            };
-                            match format {
-                                LuaOutputFormat::Markdown => ToolOutput::Markdown(inner),
-                                LuaOutputFormat::Plain => ToolOutput::Plain(inner),
+                            if let Some(diff) = reply.diff {
+                                ToolOutput::Diff {
+                                    summary: s,
+                                    path: diff.path,
+                                    before: diff.before,
+                                    after: diff.after,
+                                }
+                            } else {
+                                let inner = match instructions {
+                                    Some(blocks) if !blocks.is_empty() => TextOutput {
+                                        text: s,
+                                        instructions: Some(blocks),
+                                    },
+                                    _ => s.into(),
+                                };
+                                match format {
+                                    LuaOutputFormat::Markdown => ToolOutput::Markdown(inner),
+                                    LuaOutputFormat::Plain => ToolOutput::Plain(inner),
+                                }
                             }
                         }),
                         annotation: reply.annotation,
@@ -526,6 +552,23 @@ fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> Lua
         .map(|s| Arc::from(s.as_str()));
     let audience = parse_audience(audiences)?;
     let timeout = parse_timeout(spec)?;
+    let start_annotation_array_field: Option<Arc<str>> = spec
+        .get::<String>("start_annotation")
+        .ok()
+        .map(|s| Arc::from(s.as_str()));
+    if let Some(ref field) = start_annotation_array_field {
+        let is_array = schema_val
+            .get("properties")
+            .and_then(|p| p.get(field.as_ref()))
+            .and_then(|s| s.get("type"))
+            .and_then(|t| t.as_str())
+            .is_some_and(|t| t == "array");
+        if !is_array {
+            return Err(mlua::Error::runtime(format!(
+                "register_tool: start_annotation field '{field}' not in schema properties or not type 'array'"
+            )));
+        }
+    }
     let handler_key: RegistryKey = lua.create_registry_value(handler)?;
     let header_key = header_fn
         .map(|f| lua.create_registry_value(f))
@@ -551,6 +594,7 @@ fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> Lua
             permission_scopes_key,
             mutable_path_field,
             timeout,
+            start_annotation_array_field,
         });
 
     Ok(())
@@ -610,6 +654,12 @@ pub(crate) enum LuaOutputFormat {
 const LUA_FORMAT_MARKDOWN: &str = "markdown";
 const LUA_FORMAT_PLAIN: &str = "plain";
 
+pub(crate) struct DiffPayload {
+    pub path: String,
+    pub before: String,
+    pub after: String,
+}
+
 pub(crate) struct ToolCallReply {
     pub result: ToolCallResult,
     pub snapshot: Option<BufferSnapshot>,
@@ -619,6 +669,7 @@ pub(crate) struct ToolCallReply {
     pub annotation: Option<String>,
     pub instructions: Option<Vec<InstructionBlock>>,
     pub written_path: Option<String>,
+    pub diff: Option<DiffPayload>,
 }
 
 impl ToolCallReply {
@@ -636,6 +687,11 @@ impl ToolCallReply {
         let annotation = t.get::<String>("annotation").ok();
         let instructions = extract_instructions(t);
         let written_path = t.get::<String>("written_path").ok();
+        let diff = t.get::<String>("diff_path").ok().map(|path| DiffPayload {
+            path,
+            before: t.get::<String>("diff_before").ok().unwrap_or_default(),
+            after: t.get::<String>("diff_after").ok().unwrap_or_default(),
+        });
         Self {
             result,
             snapshot,
@@ -645,6 +701,7 @@ impl ToolCallReply {
             annotation,
             instructions,
             written_path,
+            diff,
         }
     }
 
@@ -675,6 +732,7 @@ impl ToolCallReply {
             annotation: None,
             instructions: None,
             written_path: None,
+            diff: None,
         }
     }
 
@@ -778,13 +836,8 @@ mod tests {
             permission_state: PermissionState::Ready(None),
             mutable_path_field: None,
             timeout: Some(Duration::from_secs(60)),
+            start_annotation_array_field: None,
         }
-    }
-
-    #[test]
-    fn no_header_fn_returns_tool_name() {
-        let inv = invocation(serde_json::json!({"path": "/home/x/foo.rs"}));
-        assert_eq!(inv.start_header().into_ready().text(), "test_tool");
     }
 
     fn make_lua_tool(permission_scope_kind: Option<PermissionScopeKind>) -> LuaTool {
@@ -810,6 +863,7 @@ mod tests {
             permission_scope_kind,
             mutable_path_field: None,
             timeout: Some(Duration::from_secs(60)),
+            start_annotation_array_field: None,
         }
     }
 
@@ -903,6 +957,7 @@ mod tests {
             permission_state: PermissionState::NeedsCompute,
             mutable_path_field: None,
             timeout: None,
+            start_annotation_array_field: None,
         };
         let scopes = smol::block_on(inv.permission_scopes()).expect("should fallback");
         assert!(scopes.force_prompt);
@@ -919,6 +974,7 @@ mod tests {
             permission_state: PermissionState::NeedsCompute,
             mutable_path_field: None,
             timeout: None,
+            start_annotation_array_field: None,
         };
         std::thread::spawn(move || {
             if let Ok(Request::ComputePermissionScopes { reply, .. }) = rx2.recv() {
@@ -941,6 +997,7 @@ mod tests {
             permission_state: PermissionState::NeedsCompute,
             mutable_path_field: None,
             timeout: None,
+            start_annotation_array_field: None,
         };
         std::thread::spawn(move || {
             if let Ok(Request::ComputePermissionScopes { reply, .. }) = rx.recv() {
@@ -979,6 +1036,7 @@ mod tests {
             permission_scope_kind: Some(PermissionScopeKind::Field(Arc::from("count"))),
             mutable_path_field: None,
             timeout: Some(Duration::from_secs(60)),
+            start_annotation_array_field: None,
         };
         let inv = tool.parse(&serde_json::json!({"count": 42})).unwrap();
         assert!(smol::block_on(inv.permission_scopes()).is_none());
@@ -1116,5 +1174,49 @@ mod tests {
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].path, "AGENTS.md");
         assert_eq!(blocks[0].content, "be nice");
+    }
+
+    #[test]
+    fn from_lua_value_extracts_diff_fields() {
+        let lua = Lua::new();
+
+        let t = lua.create_table().unwrap();
+        t.set("llm_output", "edited file.rs").unwrap();
+        t.set("diff_path", "/tmp/file.rs").unwrap();
+        t.set("diff_before", "old content").unwrap();
+        t.set("diff_after", "new content").unwrap();
+        let diff = ToolCallReply::from_lua_value(&LuaValue::Table(t))
+            .diff
+            .expect("diff should be Some");
+        assert_eq!(diff.path, "/tmp/file.rs");
+        assert_eq!(diff.before, "old content");
+        assert_eq!(diff.after, "new content");
+
+        let partial = lua.create_table().unwrap();
+        partial.set("llm_output", "patched").unwrap();
+        partial.set("diff_path", "/tmp/file.rs").unwrap();
+        let d = ToolCallReply::from_lua_value(&LuaValue::Table(partial))
+            .diff
+            .unwrap();
+        assert_eq!(d.before, "");
+        assert_eq!(d.after, "");
+    }
+
+    #[test]
+    fn start_annotation_returns_none_for_non_array_or_missing() {
+        let no_field = invocation(serde_json::json!({"edits": [1, 2]}));
+        assert_eq!(no_field.start_annotation(), None);
+
+        let not_array = LuaToolInvocation {
+            start_annotation_array_field: Some(Arc::from("edit")),
+            ..invocation(serde_json::json!({"edit": "not an array"}))
+        };
+        assert_eq!(not_array.start_annotation(), None);
+
+        let wrong_key = LuaToolInvocation {
+            start_annotation_array_field: Some(Arc::from("edit")),
+            ..invocation(serde_json::json!({"other_field": [1, 2]}))
+        };
+        assert_eq!(wrong_key.start_annotation(), None);
     }
 }

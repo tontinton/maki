@@ -2377,7 +2377,6 @@ dependencies = [
  "maki-storage",
  "maki-tool-macro",
  "open",
- "regex",
  "serde",
  "serde_json",
  "serde_yaml",

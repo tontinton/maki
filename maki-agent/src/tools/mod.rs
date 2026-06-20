@@ -8,11 +8,8 @@
 
 mod batch;
 mod code_execution;
-mod edit;
 mod file_tracker;
-mod fuzzy_replace;
 pub mod grep;
-mod multiedit;
 pub mod registry;
 pub mod schema;
 mod task;
@@ -115,10 +112,10 @@ pub fn is_tool_enabled(config: &AgentConfig, name: &str) -> bool {
 
 pub const BASH_TOOL_NAME: &str = "bash";
 pub const BATCH_TOOL_NAME: &str = batch::Batch::NAME;
-pub const EDIT_TOOL_NAME: &str = edit::Edit::NAME;
+pub const EDIT_TOOL_NAME: &str = "edit";
 pub const GLOB_TOOL_NAME: &str = "glob";
 pub const GREP_TOOL_NAME: &str = "grep";
-pub const MULTIEDIT_TOOL_NAME: &str = multiedit::MultiEdit::NAME;
+pub const MULTIEDIT_TOOL_NAME: &str = "multiedit";
 pub const QUESTION_TOOL_NAME: &str = "question";
 pub const READ_TOOL_NAME: &str = "read";
 pub const TASK_TOOL_NAME: &str = task::Task::NAME;
@@ -536,9 +533,6 @@ macro_rules! register_tools {
 }
 
 register_tools! {
-    edit::Edit,
-    multiedit::MultiEdit,
-
     task::Task,
     batch::Batch,
     code_execution::CodeExecution,
@@ -697,26 +691,17 @@ pub mod test_support {
         ctx.tool_use_id = None;
         ctx
     }
-
-    #[cfg(test)]
-    pub(crate) fn pre_read(ctx: &ToolContext, path: &str) {
-        ctx.file_tracker.record_read(Path::new(path));
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::path::Path;
 
     use serde_json::json;
     use tempfile::TempDir;
     use test_case::test_case;
 
-    use super::test_support::stub_ctx;
     use super::*;
-    use crate::AgentError;
-    use crate::agent::tool_dispatch;
     use crate::template::Vars;
 
     const LINE_LIMIT: usize = 500;
@@ -897,7 +882,7 @@ mod tests {
     #[test]
     fn definitions_filtered_returns_only_requested() {
         let vars = Vars::new().set("{cwd}", "/tmp");
-        let filter = ToolFilter::Only(vec!["edit".into()]);
+        let filter = ToolFilter::Only(vec!["task".into()]);
         let ctx = DescriptionContext { filter: &filter };
         let filtered = ToolRegistry::native().definitions(&vars, &ctx, true);
         let names: Vec<&str> = filtered
@@ -906,59 +891,7 @@ mod tests {
             .iter()
             .map(|d| d["name"].as_str().unwrap())
             .collect();
-        assert_eq!(names, ["edit"]);
-    }
-
-    #[test_case("edit",      |p: &str, _: &str| json!({"path": p, "old_string": "old", "new_string": "new"})  , |_: &str, o: &str| json!({"path": o, "old_string": "old", "new_string": "new"})  ; "edit")]
-    #[test_case("multiedit", |p: &str, _: &str| json!({"path": p, "edits": [{"old_string": "old", "new_string": "new"}]}) , |_: &str, o: &str| json!({"path": o, "edits": [{"old_string": "old", "new_string": "new"}]}) ; "multiedit")]
-    fn plan_mode_restricts_mutations(
-        tool: &str,
-        plan_input: fn(&str, &str) -> Value,
-        other_input: fn(&str, &str) -> Value,
-    ) {
-        smol::block_on(async {
-            let dir = TempDir::new().unwrap();
-            let plan_path = dir.path().join("plan.md");
-            fs::write(&plan_path, "old").unwrap();
-            let other = dir.path().join("other.rs");
-            fs::write(&other, "old").unwrap();
-            let mode = AgentMode::Plan(plan_path.clone());
-            let ctx = stub_ctx(&mode);
-
-            let plan_str = plan_path.to_str().unwrap();
-            let other_str = other.to_str().unwrap();
-
-            ctx.file_tracker.record_read(Path::new(plan_str));
-            ctx.file_tracker.record_read(Path::new(other_str));
-
-            let registry = ToolRegistry::native();
-            let blocked = tool_dispatch::run(
-                registry,
-                None,
-                "t1".into(),
-                tool,
-                &other_input(plan_str, other_str),
-                &ctx,
-                tool_dispatch::Emit::Silent,
-            )
-            .await;
-            assert!(
-                blocked.is_error,
-                "{tool} should be blocked on non-plan file"
-            );
-
-            let allowed = tool_dispatch::run(
-                registry,
-                None,
-                "t2".into(),
-                tool,
-                &plan_input(plan_str, other_str),
-                &ctx,
-                tool_dispatch::Emit::Silent,
-            )
-            .await;
-            assert!(!allowed.is_error, "{tool} should be allowed on plan file");
-        });
+        assert_eq!(names, ["task"]);
     }
 
     #[test_case(
@@ -1090,45 +1023,6 @@ mod tests {
             resolve_path("src/main.rs").unwrap(),
             cwd.join("src/main.rs").to_string_lossy()
         );
-    }
-
-    #[test]
-    fn multiedit_reports_inner_shape_with_path() {
-        let registry = ToolRegistry::native();
-        let entry = registry.get("multiedit").unwrap();
-        let err = match entry.tool.parse(&json!({
-            "path": "/x",
-            "edits": [{"old_string": "a"}]
-        })) {
-            Ok(_) => panic!("expected parse error"),
-            Err(e) => e,
-        };
-        let msg = err.to_string();
-        assert!(msg.contains("edits[0].new_string"), "got: {msg}");
-        assert!(msg.contains("required"), "got: {msg}");
-    }
-
-    #[test]
-    fn multiedit_huge_string_error_is_bounded() {
-        let huge: String = "x".repeat(50 * 1024);
-        let registry = ToolRegistry::native();
-        let entry = registry.get("multiedit").unwrap();
-        let err = match entry.tool.parse(&json!({"path": "/x", "edits": huge})) {
-            Ok(_) => panic!("expected parse error"),
-            Err(e) => e,
-        };
-        let message = err.to_string();
-        assert!(
-            message.len() < schema::BOUNDED_ERR_MAX,
-            "error message too long: {} bytes",
-            message.len()
-        );
-        // Check the error fits inside `AgentError::Tool` without tripping the bounded-error
-        // cap, since that is the shape the real agent loop constructs.
-        let _ = AgentError::Tool {
-            tool: "multiedit".into(),
-            message,
-        };
     }
 
     #[test]
