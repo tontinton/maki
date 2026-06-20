@@ -280,8 +280,11 @@ impl Opencode {
         let mut body = self.chat_compat.build_body(model, messages, system, tools);
         match opts.thinking {
             ThinkingConfig::Off => {}
-            _ => {
-                body["thinking"] = json!({"type": "enabled"});
+            ThinkingConfig::Adaptive => {
+                body["reasoning_effort"] = json!("high");
+            }
+            ThinkingConfig::Budget(n) => {
+                body["reasoning_effort"] = json!(ThinkingConfig::budget_to_effort(n));
             }
         }
         self.chat_compat
