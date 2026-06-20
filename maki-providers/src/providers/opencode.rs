@@ -1001,7 +1001,7 @@ mod tests {
             "opencode".into(),
             CatalogProvider {
                 name: "Opencode".into(),
-                env: vec!["OPENCODE_API_KEY".into()],
+                env: vec!["MAKI_TEST_OPENCODE_FREE_60924".into()],
                 npm: "@ai-sdk/openai-compatible".into(),
                 api: Some("https://opencode.ai/zen/v1".into()),
                 models,
@@ -1009,7 +1009,7 @@ mod tests {
         );
 
         let result = catalog_to_data(providers);
-        // Without OPENCODE_API_KEY, "public" is used as default key (auth only),
+        // Without key set, has_api_key is false, so only free models pass
         // but has_api_key is false, so only free models pass
         assert!(result.entries.contains_key("free-model"));
         assert!(!result.entries.contains_key("paid-model"));
@@ -1052,18 +1052,18 @@ mod tests {
             "opencode".into(),
             CatalogProvider {
                 name: "Opencode".into(),
-                env: vec!["OPENCODE_API_KEY".into()],
+                env: vec!["MAKI_TEST_OPENCODE_ALL_81274".into()],
                 npm: "@ai-sdk/openai-compatible".into(),
                 api: Some("https://opencode.ai/zen/v1".into()),
                 models,
             },
         );
 
-        unsafe { std::env::set_var("OPENCODE_API_KEY", "real-key") };
+        unsafe { std::env::set_var("MAKI_TEST_OPENCODE_ALL_81274", "real-key") };
         let result = catalog_to_data(providers);
-        unsafe { std::env::remove_var("OPENCODE_API_KEY") };
+        unsafe { std::env::remove_var("MAKI_TEST_OPENCODE_ALL_81274") };
 
-        // With OPENCODE_API_KEY set, has_api_key is true, so all models pass
+        // With key set, has_api_key is true, so all models pass
         assert!(result.entries.contains_key("free-model"));
         assert!(result.entries.contains_key("paid-model"));
         assert!(result.auths.contains_key("opencode"));
