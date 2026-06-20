@@ -112,8 +112,15 @@ impl TierMap {
         None
     }
 
-    pub fn is_override(&self, spec: &str) -> bool {
-        self.overrides.values().any(|s| s == spec)
+    pub fn override_tier_label(&self, spec: &str) -> Option<String> {
+        let tiers: Vec<_> = self
+            .overrides
+            .iter()
+            .rev()
+            .filter(|(_, s)| s.as_str() == spec)
+            .map(|(t, _)| t.to_string())
+            .collect();
+        (!tiers.is_empty()).then(|| tiers.join("/"))
     }
 }
 

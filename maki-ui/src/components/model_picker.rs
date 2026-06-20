@@ -196,11 +196,15 @@ fn parse_model_entry(spec: &str) -> Option<ModelEntry> {
         maki_config::providers::resolve_display_name(provider_str, config.get(provider_str))
     };
 
-    let tier = match maki_providers::Model::from_spec(spec) {
+    let override_label = tier_map::tier_map()
+        .read()
+        .unwrap()
+        .override_tier_label(spec);
+    let tier_override = override_label.is_some();
+    let tier = override_label.unwrap_or_else(|| match maki_providers::Model::from_spec(spec) {
         Ok(m) => m.tier.to_string(),
         Err(_) => String::new(),
-    };
-    let tier_override = tier_map::tier_map().read().unwrap().is_override(spec);
+    });
     Some(ModelEntry {
         spec: spec.to_string(),
         id: model_id.to_string(),
