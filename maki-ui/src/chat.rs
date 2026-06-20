@@ -14,7 +14,7 @@ use crate::components::{DisplayMessage, DisplayRole, ToolRole, ToolStatus};
 use crate::markdown::truncate_output;
 
 use crate::selection::Selection;
-use maki_agent::tools::{ToolInvocation, ToolRegistry};
+use maki_agent::tools::{ToolInvocation, ToolRegistry, WRITE_TOOL_NAME};
 use maki_agent::{
     AgentEvent, BatchToolStatus, BufferSnapshot, SharedBuf, ToolDoneEvent, ToolOutput,
     ToolStartEvent,
@@ -92,10 +92,10 @@ impl Chat {
             }
             AgentEvent::ToolDone(e) => {
                 let plan_write = plan_path.filter(|pp| e.wrote_to(pp));
-                let is_write = matches!(e.output, ToolOutput::WriteCode { .. });
+                let is_full_write = &*e.tool == WRITE_TOOL_NAME;
                 self.messages_panel.tool_done(*e);
                 if let Some(pp) = plan_write {
-                    let content = if is_write {
+                    let content = if is_full_write {
                         std::fs::read_to_string(pp).unwrap_or_default()
                     } else {
                         String::new()
@@ -612,21 +612,30 @@ mod tests {
     }
 
     fn tool_done(id: &str, tool: &str, output: ToolOutput) -> AgentEvent {
+        tool_done_with_written_path(id, tool, output, None)
+    }
+
+    fn tool_done_with_written_path(
+        id: &str,
+        tool: &str,
+        output: ToolOutput,
+        written_path: Option<String>,
+    ) -> AgentEvent {
         AgentEvent::ToolDone(Box::new(ToolDoneEvent {
             id: id.into(),
             tool: tool.into(),
             output,
             is_error: false,
             annotation: None,
+            written_path,
         }))
     }
 
-    fn write_output(path: &str) -> ToolOutput {
-        ToolOutput::WriteCode {
-            path: path.into(),
-            byte_count: 42,
-            lines: vec![],
-        }
+    fn write_output(path: &str) -> (ToolOutput, Option<String>) {
+        (
+            ToolOutput::Plain(format!("wrote 42 bytes to {path}").into()),
+            Some(path.to_owned()),
+        )
     }
 
     fn edit_output(path: &str) -> ToolOutput {
@@ -664,8 +673,9 @@ mod tests {
         let plan_str = plan_path.to_str().unwrap();
 
         chat.handle_event(tool_start("w1", "write"), Some(plan_path.as_path()));
+        let (output, wp) = write_output(plan_str);
         chat.handle_event(
-            tool_done("w1", "write", write_output(plan_str)),
+            tool_done_with_written_path("w1", "write", output, wp),
             Some(plan_path.as_path()),
         );
 
@@ -679,8 +689,9 @@ mod tests {
         let mut chat = Chat::new("Main".into(), UiConfig::default());
         let plan_path = Path::new("/plans/123.md");
         chat.handle_event(tool_start("w1", "write"), Some(plan_path));
+        let (output, wp) = write_output("src/main.rs");
         chat.handle_event(
-            tool_done("w1", "write", write_output("src/main.rs")),
+            tool_done_with_written_path("w1", "write", output, wp),
             Some(plan_path),
         );
         assert!(!chat.last_message_is_plan());

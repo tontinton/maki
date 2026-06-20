@@ -243,6 +243,8 @@ fn lines_remaining_after(total: usize, start_line: usize, shown: usize) -> usize
 }
 
 impl ToolOutput {
+    /// Only here for old persisted sessions that still have `WriteCode`/`Diff` variants.
+    /// New code should use `ToolDoneEvent::written_path` instead.
     pub fn written_path(&self) -> Option<&str> {
         match self {
             Self::WriteCode { path, .. } | Self::Diff { path, .. } => Some(path),
@@ -413,6 +415,7 @@ pub struct ToolDoneEvent {
     pub output: ToolOutput,
     pub is_error: bool,
     pub annotation: Option<String>,
+    pub written_path: Option<String>,
 }
 
 const UNKNOWN_TOOL: &str = "unknown";
@@ -426,6 +429,7 @@ impl ToolDoneEvent {
             output: ToolOutput::Plain(message.into()),
             is_error: true,
             annotation: None,
+            written_path: None,
         }
     }
 
@@ -433,7 +437,9 @@ impl ToolDoneEvent {
         if self.is_error {
             return None;
         }
-        self.output.written_path()
+        self.written_path
+            .as_deref()
+            .or_else(|| self.output.written_path())
     }
 
     pub fn wrote_to(&self, plan_path: &Path) -> bool {
@@ -839,6 +845,7 @@ mod tests {
                 output: ToolOutput::Plain("ok".into()),
                 is_error: false,
                 annotation: None,
+                written_path: None,
             },
             ToolDoneEvent {
                 id: "t2".into(),
@@ -846,6 +853,7 @@ mod tests {
                 output: ToolOutput::Plain("fail".into()),
                 is_error: true,
                 annotation: None,
+                written_path: None,
             },
         ]);
         assert!(matches!(msg.role, Role::User));
@@ -911,13 +919,10 @@ mod tests {
         let ok_event = ToolDoneEvent {
             id: "id".into(),
             tool: Arc::from("write"),
-            output: ToolOutput::WriteCode {
-                path: "/plans/slug.md".into(),
-                byte_count: 10,
-                lines: vec![],
-            },
+            output: ToolOutput::Plain("wrote 10 bytes".into()),
             is_error: false,
             annotation: None,
+            written_path: Some("/plans/slug.md".into()),
         };
         assert!(!ok_event.wrote_to(Path::new("/plans/other.md")));
 
@@ -1174,6 +1179,37 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test_case(
+        ToolOutput::WriteCode { path: "/old/path".into(), byte_count: 10, lines: vec![] },
+        Some("/new/path".into()), false, Some("/new/path")
+        ; "prefers_field_over_output"
+    )]
+    #[test_case(
+        ToolOutput::Diff { path: "/diff/path".into(), before: String::new(), after: String::new(), summary: String::new() },
+        None, false, Some("/diff/path")
+        ; "falls_back_to_output"
+    )]
+    #[test_case(
+        ToolOutput::Plain("failed".into()), Some("/some/path".into()), true, None
+        ; "none_when_error"
+    )]
+    fn tool_done_written_path(
+        output: ToolOutput,
+        written_path: Option<String>,
+        is_error: bool,
+        expected: Option<&str>,
+    ) {
+        let event = ToolDoneEvent {
+            id: "id".into(),
+            tool: Arc::from("tool"),
+            output,
+            is_error,
+            annotation: None,
+            written_path,
+        };
+        assert_eq!(event.written_path(), expected);
     }
 
     #[test]

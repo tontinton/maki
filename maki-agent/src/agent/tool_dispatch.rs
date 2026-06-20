@@ -81,6 +81,7 @@ pub async fn run(
         output: ToolOutput::Plain(msg.into()),
         is_error: true,
         annotation: None,
+        written_path: None,
     };
 
     if let Some(entry) = entry {
@@ -147,6 +148,7 @@ pub async fn run(
                     output,
                     is_error: false,
                     annotation: result.annotation,
+                    written_path: result.written_path,
                 }
             }
             Err(message) => {
@@ -218,6 +220,7 @@ async fn execute_mcp_tool(
         output: ToolOutput::Plain(output.into()),
         is_error,
         annotation: None,
+        written_path: None,
     };
 
     if matches!(ctx.mode, AgentMode::Plan(_)) {
@@ -451,7 +454,6 @@ mod tests {
         });
     }
 
-    /// Denies write and verifies the marker file is never created.
     #[test]
     fn permission_denial_short_circuits_execute() {
         use std::sync::Arc;
@@ -462,17 +464,17 @@ mod tests {
         use crate::permissions::{PERMISSION_DENIED_PREFIX, PermissionManager};
 
         smol::block_on(async {
-            let deny_all_write = PermissionsConfig {
+            let deny_all_edit = PermissionsConfig {
                 allow_all: false,
                 rules: vec![PermissionRule {
-                    tool: crate::tools::WRITE_TOOL_NAME.into(),
+                    tool: crate::tools::EDIT_TOOL_NAME.into(),
                     scope: None,
                     effect: Effect::Deny,
                 }],
             };
             let dir = TempDir::new().unwrap();
             let permissions = Arc::new(PermissionManager::new(
-                deny_all_write,
+                deny_all_edit,
                 dir.path().to_path_buf(),
             ));
             let ctx = crate::tools::test_support::stub_ctx_with_permissions(
@@ -480,22 +482,28 @@ mod tests {
                 permissions,
             );
 
-            let marker = dir.path().join("should_never_exist");
+            let marker = dir.path().join("marker.txt");
             let marker_str = marker.to_str().unwrap();
+            std::fs::write(&marker, "x").unwrap();
+            crate::tools::test_support::pre_read(&ctx, marker_str);
 
             let done = run(
                 ToolRegistry::native(),
                 None,
                 "t1".into(),
-                crate::tools::WRITE_TOOL_NAME,
-                &serde_json::json!({ "path": marker_str, "content": "x" }),
+                crate::tools::EDIT_TOOL_NAME,
+                &serde_json::json!({ "path": marker_str, "old_string": "x", "new_string": "y" }),
                 &ctx,
                 Emit::Silent,
             )
             .await;
 
             assert!(done.is_error, "permission denial must produce error event");
-            assert!(!marker.exists(), "tool executed despite permission denial");
+            assert_eq!(
+                std::fs::read_to_string(&marker).unwrap(),
+                "x",
+                "tool executed despite permission denial"
+            );
             assert!(
                 done.output.as_text().starts_with(PERMISSION_DENIED_PREFIX),
                 "error should be the permission-denied message, got: {}",

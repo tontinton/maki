@@ -370,7 +370,7 @@ mod tests {
     use serde_json::json;
 
     use crate::AgentMode;
-    use crate::tools::test_support::stub_ctx;
+    use crate::tools::test_support::{pre_read, stub_ctx};
 
     use super::*;
 
@@ -414,18 +414,21 @@ mod tests {
         smol::block_on(async {
             let dir = tempfile::TempDir::new().unwrap();
             let f = dir.path().join("a.txt");
+            let f_str = f.to_str().unwrap();
+            std::fs::write(&f, "content").unwrap();
+            let ctx = stub_ctx(&crate::AgentMode::Build);
+            pre_read(&ctx, f_str);
 
-            let (entries, text) = run_batch(json!({
+            let (entries, _text) = execute_batch(&ctx, json!({
                 "tool_calls": [
-                    {"tool": "write", "parameters": {"path": f.to_str().unwrap(), "content": "content"}},
-                    {"tool": "write", "parameters": {"path": "/nonexistent/dir/path.txt", "content": "x"}}
+                    {"tool": "edit", "parameters": {"path": f_str, "old_string": "content", "new_string": "new_content"}},
+                    {"tool": "edit", "parameters": {"path": "/nonexistent/dir/path.txt", "old_string": "x", "new_string": "y"}}
                 ]
             }))
             .await;
             assert_eq!(entries.len(), 2);
             assert_eq!(entries[0].status, BatchToolStatus::Success);
             assert_eq!(entries[1].status, BatchToolStatus::Error);
-            assert!(text.contains("wrote"));
         });
     }
 
@@ -468,14 +471,17 @@ mod tests {
         smol::block_on(async {
             let dir = tempfile::TempDir::new().unwrap();
             let f = dir.path().join("hello.txt");
+            let f_str = f.to_str().unwrap();
+            std::fs::write(&f, "hello").unwrap();
 
             let (tx, rx) = flume::unbounded::<Envelope>();
             let event_tx = EventSender::new(tx, 0);
             let ctx = stub_ctx_with(&AgentMode::Build, Some(&event_tx), None);
+            pre_read(&ctx, f_str);
             execute_batch(
                 &ctx,
                 json!({
-                    "tool_calls": [{"tool": "write", "parameters": {"path": f.to_str().unwrap(), "content": "hello"}}]
+                    "tool_calls": [{"tool": "edit", "parameters": {"path": f_str, "old_string": "hello", "new_string": "world"}}]
                 }),
             )
             .await;

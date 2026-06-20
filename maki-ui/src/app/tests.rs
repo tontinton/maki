@@ -235,10 +235,14 @@ fn toggle_mode_state_machine() {
     assert_eq!(app.state.plan.path().unwrap(), first_path);
 }
 
-#[test_case(ToolOutput::WriteCode { path: "/tmp/plans/test.md".into(), byte_count: 100, lines: vec![] }, true  ; "write_matching")]
-#[test_case(ToolOutput::Diff { path: "/tmp/plans/test.md".into(), before: String::new(), after: String::new(), summary: String::new() }, true  ; "edit_matching")]
-#[test_case(ToolOutput::WriteCode { path: "/tmp/other.rs".into(), byte_count: 100, lines: vec![] }, false ; "write_non_matching")]
-fn tool_done_transitions_plan_to_ready(output: ToolOutput, expect_ready: bool) {
+#[test_case(ToolOutput::Plain("wrote 100 bytes to /tmp/plans/test.md".into()), Some("/tmp/plans/test.md".into()), true  ; "write_matching")]
+#[test_case(ToolOutput::Diff { path: "/tmp/plans/test.md".into(), before: String::new(), after: String::new(), summary: String::new() }, None, true  ; "edit_matching")]
+#[test_case(ToolOutput::Plain("wrote 100 bytes to /tmp/other.rs".into()), Some("/tmp/other.rs".into()), false ; "write_non_matching")]
+fn tool_done_transitions_plan_to_ready(
+    output: ToolOutput,
+    written_path: Option<String>,
+    expect_ready: bool,
+) {
     let mut app = test_app();
     app.state.mode = Mode::Plan;
     app.state.plan = PlanState::Drafting(PathBuf::from("/tmp/plans/test.md"));
@@ -251,6 +255,7 @@ fn tool_done_transitions_plan_to_ready(output: ToolOutput, expect_ready: bool) {
         output,
         is_error: false,
         annotation: None,
+        written_path,
     }))));
 
     assert_eq!(app.state.plan.is_ready(), expect_ready);
@@ -670,6 +675,7 @@ fn finish_subagent(app: &mut App, id: &str, is_error: bool) {
         output: ToolOutput::Plain("result".into()),
         is_error,
         annotation: None,
+        written_path: None,
     }))));
 }
 
@@ -2070,13 +2076,10 @@ fn plan_app() -> App {
     app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
         id: "t1".into(),
         tool: "write".into(),
-        output: ToolOutput::WriteCode {
-            path: "test-plan.md".into(),
-            byte_count: 42,
-            lines: vec![],
-        },
+        output: ToolOutput::Plain("wrote 42 bytes to test-plan.md".into()),
         is_error: false,
         annotation: None,
+        written_path: Some("test-plan.md".into()),
     }))));
     app
 }
@@ -2092,13 +2095,10 @@ fn tool_done_write_opens_plan_form(mode: Mode, expect_form: bool) {
     app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
         id: "t1".into(),
         tool: "write".into(),
-        output: ToolOutput::WriteCode {
-            path: "/tmp/plans/test.md".into(),
-            byte_count: 42,
-            lines: vec![],
-        },
+        output: ToolOutput::Plain("wrote 42 bytes to /tmp/plans/test.md".into()),
         is_error: false,
         annotation: None,
+        written_path: Some("/tmp/plans/test.md".into()),
     }))));
     assert_eq!(app.plan_form.is_visible(), expect_form);
     if expect_form {
@@ -2127,13 +2127,10 @@ fn re_edit_keeps_plan_form_visible() {
     app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
         id: "t2".into(),
         tool: "write".into(),
-        output: ToolOutput::WriteCode {
-            path: "test-plan.md".into(),
-            byte_count: 50,
-            lines: vec![],
-        },
+        output: ToolOutput::Plain("wrote 50 bytes to test-plan.md".into()),
         is_error: false,
         annotation: None,
+        written_path: Some("test-plan.md".into()),
     }))));
     assert!(matches!(app.state.plan, PlanState::Ready(_)));
     assert!(app.plan_form.is_visible());
@@ -2196,13 +2193,10 @@ fn rewrite_plan(app: &mut App) {
     app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
         id: "t2".into(),
         tool: "write".into(),
-        output: ToolOutput::WriteCode {
-            path: "test-plan.md".into(),
-            byte_count: 99,
-            lines: vec![],
-        },
+        output: ToolOutput::Plain("wrote 99 bytes to test-plan.md".into()),
         is_error: false,
         annotation: None,
+        written_path: Some("test-plan.md".into()),
     }))));
 }
 

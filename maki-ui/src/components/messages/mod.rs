@@ -470,6 +470,7 @@ impl MessagesPanel {
                 output: ToolOutput::Plain(message.clone().into()),
                 is_error: true,
                 annotation: None,
+                written_path: None,
             });
         }
     }

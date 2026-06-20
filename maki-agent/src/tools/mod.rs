@@ -13,11 +13,9 @@ mod file_tracker;
 mod fuzzy_replace;
 pub mod grep;
 mod multiedit;
-mod read;
 pub mod registry;
 pub mod schema;
 mod task;
-mod write;
 
 pub use file_tracker::FileReadTracker;
 pub use registry::{
@@ -122,10 +120,10 @@ pub const GLOB_TOOL_NAME: &str = "glob";
 pub const GREP_TOOL_NAME: &str = "grep";
 pub const MULTIEDIT_TOOL_NAME: &str = multiedit::MultiEdit::NAME;
 pub const QUESTION_TOOL_NAME: &str = "question";
-pub const READ_TOOL_NAME: &str = read::Read::NAME;
+pub const READ_TOOL_NAME: &str = "read";
 pub const TASK_TOOL_NAME: &str = task::Task::NAME;
 pub const TODOWRITE_TOOL_NAME: &str = "todo_write";
-pub const WRITE_TOOL_NAME: &str = write::Write::NAME;
+pub const WRITE_TOOL_NAME: &str = "write";
 pub const CODE_EXECUTION_TOOL_NAME: &str = code_execution::CodeExecution::NAME;
 
 pub(crate) const PLAN_WRITE_RESTRICTED: &str = "write restricted to plan file in plan mode";
@@ -537,7 +535,6 @@ macro_rules! register_tools {
 }
 
 register_tools! {
-    write::Write,
     edit::Edit,
     multiedit::MultiEdit,
 
@@ -775,33 +772,6 @@ mod tests {
     }
 
     #[test]
-    fn read_with_offset_and_limit() {
-        smol::block_on(async {
-            let dir = TempDir::new().unwrap();
-            let path = dir.path().join("test.txt");
-            let content = (1..=10)
-                .map(|i| format!("line{i}"))
-                .collect::<Vec<_>>()
-                .join("\n");
-            fs::write(&path, &content).unwrap();
-            let path = path.to_string_lossy().to_string();
-            let ctx = stub_ctx(&AgentMode::Build);
-
-            let r = read::Read::parse_input(&json!({"path": path})).unwrap();
-            let full = r.execute(&ctx).await.unwrap().as_text().to_string();
-            assert!(full.contains("1: line1"));
-            assert!(full.contains("10: line10"));
-
-            let r =
-                read::Read::parse_input(&json!({"path": path, "offset": 3, "limit": 2})).unwrap();
-            let slice = r.execute(&ctx).await.unwrap().as_text().to_string();
-            assert!(slice.contains("3: line3"));
-            assert!(slice.contains("4: line4"));
-            assert!(!slice.contains("5: line5"));
-        });
-    }
-
-    #[test]
     fn grep_search_finds_filters_and_skips_binary() {
         let dir = TempDir::new().unwrap();
         fs::write(dir.path().join("a.txt"), "hello world\ngoodbye world").unwrap();
@@ -923,7 +893,7 @@ mod tests {
     #[test]
     fn definitions_filtered_returns_only_requested() {
         let vars = Vars::new().set("{cwd}", "/tmp");
-        let filter = ToolFilter::Only(vec!["write".into()]);
+        let filter = ToolFilter::Only(vec!["edit".into()]);
         let ctx = DescriptionContext { filter: &filter };
         let filtered = ToolRegistry::native().definitions(&vars, &ctx, true);
         let names: Vec<&str> = filtered
@@ -932,10 +902,9 @@ mod tests {
             .iter()
             .map(|d| d["name"].as_str().unwrap())
             .collect();
-        assert_eq!(names, ["write"]);
+        assert_eq!(names, ["edit"]);
     }
 
-    #[test_case("write",     |p: &str, _: &str| json!({"path": p, "content": "plan"})                          , |_: &str, o: &str| json!({"path": o, "content": "x"})                           ; "write")]
     #[test_case("edit",      |p: &str, _: &str| json!({"path": p, "old_string": "old", "new_string": "new"})  , |_: &str, o: &str| json!({"path": o, "old_string": "old", "new_string": "new"})  ; "edit")]
     #[test_case("multiedit", |p: &str, _: &str| json!({"path": p, "edits": [{"old_string": "old", "new_string": "new"}]}) , |_: &str, o: &str| json!({"path": o, "edits": [{"old_string": "old", "new_string": "new"}]}) ; "multiedit")]
     fn plan_mode_restricts_mutations(

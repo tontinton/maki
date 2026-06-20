@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -45,6 +46,7 @@ pub(crate) struct PendingTool {
     pub(crate) restore_key: Option<RegistryKey>,
     pub(crate) permission_scope_kind: Option<PermissionScopeKind>,
     pub(crate) permission_scopes_key: Option<RegistryKey>,
+    pub(crate) mutable_path_field: Option<Arc<str>>,
     pub(crate) timeout: Option<Duration>,
 }
 
@@ -60,6 +62,7 @@ pub(crate) struct LuaTool {
     pub(crate) plugin: Arc<str>,
     pub(crate) has_header_fn: bool,
     pub(crate) permission_scope_kind: Option<PermissionScopeKind>,
+    pub(crate) mutable_path_field: Option<Arc<str>>,
     pub(crate) timeout: Option<Duration>,
 }
 
@@ -104,6 +107,7 @@ impl Tool for LuaTool {
             input: validated,
             tx: self.tx.clone(),
             permission_state,
+            mutable_path_field: self.mutable_path_field.clone(),
             timeout: self.timeout,
         }))
     }
@@ -121,6 +125,7 @@ struct LuaToolInvocation {
     input: Value,
     tx: Sender<Request>,
     permission_state: PermissionState,
+    mutable_path_field: Option<Arc<str>>,
     timeout: Option<Duration>,
 }
 
@@ -187,6 +192,12 @@ impl ToolInvocation for LuaToolInvocation {
                 })
             }
         }
+    }
+
+    fn mutable_path(&self) -> Option<&Path> {
+        let field = self.mutable_path_field.as_deref()?;
+        let val = self.input.get(field)?.as_str()?;
+        Some(Path::new(val))
     }
 
     fn execute<'a>(self: Box<Self>, ctx: &'a ToolContext) -> ExecFuture<'a> {
@@ -297,6 +308,7 @@ impl ToolInvocation for LuaToolInvocation {
                             }
                         }),
                         annotation: reply.annotation,
+                        written_path: reply.written_path,
                     }
                 }
             }
@@ -444,6 +456,24 @@ fn parse_timeout(spec: &Table) -> LuaResult<Option<Duration>> {
     }
 }
 
+fn require_string_field(spec: &Table, key: &str, schema: &Value) -> LuaResult<Option<Arc<str>>> {
+    let field: Option<Arc<str>> = spec.get::<String>(key).ok().map(|s| Arc::from(s.as_str()));
+    if let Some(ref field) = field {
+        let is_string = schema
+            .get("properties")
+            .and_then(|p| p.get(field.as_ref()))
+            .and_then(|s| s.get("type"))
+            .and_then(|t| t.as_str())
+            .is_some_and(|t| t == "string");
+        if !is_string {
+            return Err(mlua::Error::runtime(format!(
+                "register_tool: {key} field '{field}' not in schema properties or not type 'string'"
+            )));
+        }
+    }
+    Ok(field)
+}
+
 fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> LuaResult<()> {
     let name: String = spec
         .get("name")
@@ -470,23 +500,8 @@ fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> Lua
     let schema_val: Value = lua.from_value(schema_table)?;
     let param_schema = try_from_json(&schema_val).map_err(mlua::Error::runtime)?;
 
-    let permission_scope_field: Option<Arc<str>> = spec
-        .get::<String>("permission_scope")
-        .ok()
-        .map(|s| Arc::from(s.as_str()));
-    if let Some(ref field) = permission_scope_field {
-        let is_string = schema_val
-            .get("properties")
-            .and_then(|p| p.get(field.as_ref()))
-            .and_then(|s| s.get("type"))
-            .and_then(|t| t.as_str())
-            .is_some_and(|t| t == "string");
-        if !is_string {
-            return Err(mlua::Error::runtime(format!(
-                "register_tool: permission_scope field '{field}' not in schema properties or not type 'string'"
-            )));
-        }
-    }
+    let permission_scope_field = require_string_field(spec, "permission_scope", &schema_val)?;
+    let mutable_path_field = require_string_field(spec, "mutable_path", &schema_val)?;
 
     let permission_scopes_fn: Option<Function> = spec.get("permission_scopes").ok();
     if permission_scope_field.is_some() && permission_scopes_fn.is_some() {
@@ -534,6 +549,7 @@ fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> Lua
             restore_key,
             permission_scope_kind,
             permission_scopes_key,
+            mutable_path_field,
             timeout,
         });
 
@@ -602,6 +618,7 @@ pub(crate) struct ToolCallReply {
     pub format: LuaOutputFormat,
     pub annotation: Option<String>,
     pub instructions: Option<Vec<InstructionBlock>>,
+    pub written_path: Option<String>,
 }
 
 impl ToolCallReply {
@@ -618,6 +635,7 @@ impl ToolCallReply {
         let format = extract_format(t);
         let annotation = t.get::<String>("annotation").ok();
         let instructions = extract_instructions(t);
+        let written_path = t.get::<String>("written_path").ok();
         Self {
             result,
             snapshot,
@@ -626,6 +644,7 @@ impl ToolCallReply {
             format,
             annotation,
             instructions,
+            written_path,
         }
     }
 
@@ -655,6 +674,7 @@ impl ToolCallReply {
             format: LuaOutputFormat::default(),
             annotation: None,
             instructions: None,
+            written_path: None,
         }
     }
 
@@ -756,6 +776,7 @@ mod tests {
             input,
             tx,
             permission_state: PermissionState::Ready(None),
+            mutable_path_field: None,
             timeout: Some(Duration::from_secs(60)),
         }
     }
@@ -787,6 +808,7 @@ mod tests {
             plugin: Arc::from("test"),
             has_header_fn: false,
             permission_scope_kind,
+            mutable_path_field: None,
             timeout: Some(Duration::from_secs(60)),
         }
     }
@@ -879,6 +901,7 @@ mod tests {
             input: serde_json::json!({"command": "ls"}),
             tx,
             permission_state: PermissionState::NeedsCompute,
+            mutable_path_field: None,
             timeout: None,
         };
         let scopes = smol::block_on(inv.permission_scopes()).expect("should fallback");
@@ -894,6 +917,7 @@ mod tests {
             input: serde_json::json!({"command": "echo hi"}),
             tx: tx2,
             permission_state: PermissionState::NeedsCompute,
+            mutable_path_field: None,
             timeout: None,
         };
         std::thread::spawn(move || {
@@ -915,6 +939,7 @@ mod tests {
             input: serde_json::json!({"command": "cargo test"}),
             tx,
             permission_state: PermissionState::NeedsCompute,
+            mutable_path_field: None,
             timeout: None,
         };
         std::thread::spawn(move || {
@@ -952,6 +977,7 @@ mod tests {
             plugin: Arc::from("test"),
             has_header_fn: false,
             permission_scope_kind: Some(PermissionScopeKind::Field(Arc::from("count"))),
+            mutable_path_field: None,
             timeout: Some(Duration::from_secs(60)),
         };
         let inv = tool.parse(&serde_json::json!({"count": 42})).unwrap();

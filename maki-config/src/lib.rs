@@ -72,6 +72,7 @@ pub const DEFAULT_BUILTINS: &[&str] = &[
     "todo_write",
     "webfetch",
     "websearch",
+    "write",
 ];
 
 #[derive(Debug, Clone, Copy)]

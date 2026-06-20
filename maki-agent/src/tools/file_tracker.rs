@@ -4,12 +4,14 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
+use tracing::warn;
+
+const STALE_READ_MSG: &str = "file changed since last read";
+
 pub struct FileReadTracker(Mutex<HashMap<PathBuf, SystemTime>>);
 
-fn get_mtime(path: &Path) -> SystemTime {
-    fs::metadata(path)
-        .and_then(|m| m.modified())
-        .unwrap_or(SystemTime::UNIX_EPOCH)
+fn get_mtime(path: &Path) -> Option<SystemTime> {
+    fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
 fn normalize_path(path: &Path) -> PathBuf {
@@ -33,33 +35,57 @@ impl FileReadTracker {
 
     pub fn record_read(&self, path: &Path) {
         let normalized = normalize_path(path);
-        let mtime = get_mtime(&normalized);
-        self.0.lock().unwrap().insert(normalized, mtime);
+        match get_mtime(&normalized) {
+            Some(mtime) => {
+                self.0.lock().unwrap().insert(normalized, mtime);
+            }
+            None => warn!(
+                path = %path.display(),
+                "record_read: could not get mtime, file will not be tracked"
+            ),
+        }
     }
 
     pub fn check_before_edit(&self, path: &Path) -> Result<(), String> {
         let normalized = normalize_path(path);
-        let current_mtime = get_mtime(&normalized);
-
-        let guard = self.0.lock().unwrap();
-        match guard.get(&normalized) {
-            Some(&recorded) if recorded != current_mtime => Err(format!(
-                "file changed since last read: {} - re-read using read tool before editing",
-                path.display()
-            )),
-            _ => Ok(()),
+        let mut guard = self.0.lock().unwrap();
+        let Some(&recorded) = guard.get(&normalized) else {
+            return Ok(());
+        };
+        let Some(current) = get_mtime(&normalized) else {
+            guard.remove(&normalized);
+            return Ok(());
+        };
+        if recorded != current {
+            return Err(format!(
+                "{STALE_READ_MSG}: {} - re-read using read tool before editing",
+                path.display(),
+            ));
         }
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
+    fn future_mtime(path: &Path) {
+        let future = SystemTime::now() + Duration::from_secs(10);
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(future)
+            .unwrap();
+    }
+
     #[test]
-    fn edit_without_read_allowed() {
+    fn untracked_file_allows_edit() {
         let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("untracked.rs");
+        let path = dir.path().join("f.rs");
         fs::write(&path, "content").unwrap();
 
         let tracker = FileReadTracker::new();
@@ -67,10 +93,47 @@ mod tests {
     }
 
     #[test]
-    fn edit_after_read_succeeds() {
+    fn stale_read_rejects_edit() {
         let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("test.rs");
+        let path = dir.path().join("f.rs");
+        fs::write(&path, "original").unwrap();
+
+        let tracker = FileReadTracker::new();
+        tracker.record_read(&path);
+        future_mtime(&path);
+        let err = tracker.check_before_edit(&path).unwrap_err();
+        assert!(err.contains(STALE_READ_MSG), "{err}");
+    }
+
+    #[test]
+    fn deleted_file_allows_edit() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("f.rs");
         fs::write(&path, "content").unwrap();
+
+        let tracker = FileReadTracker::new();
+        tracker.record_read(&path);
+        fs::remove_file(&path).unwrap();
+        tracker.check_before_edit(&path).unwrap();
+    }
+
+    #[test]
+    fn re_read_after_change_allows_edit() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("f.rs");
+        fs::write(&path, "v1").unwrap();
+
+        let tracker = FileReadTracker::new();
+        tracker.record_read(&path);
+        future_mtime(&path);
+        tracker.record_read(&path);
+        tracker.check_before_edit(&path).unwrap();
+    }
+
+    #[test]
+    fn nonexistent_file_not_tracked() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("ghost.rs");
 
         let tracker = FileReadTracker::new();
         tracker.record_read(&path);
@@ -79,15 +142,15 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn symlink_resolves_to_same_file() {
+    fn symlink_resolves_to_canonical() {
         let dir = tempfile::TempDir::new().unwrap();
-        let real_path = dir.path().join("real.rs");
-        let link_path = dir.path().join("link.rs");
-        fs::write(&real_path, "content").unwrap();
-        std::os::unix::fs::symlink(&real_path, &link_path).unwrap();
+        let real = dir.path().join("real.rs");
+        let link = dir.path().join("link.rs");
+        fs::write(&real, "content").unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
 
         let tracker = FileReadTracker::new();
-        tracker.record_read(&real_path);
-        tracker.check_before_edit(&link_path).unwrap();
+        tracker.record_read(&real);
+        tracker.check_before_edit(&link).unwrap();
     }
 }

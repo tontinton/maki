@@ -347,7 +347,7 @@ mod tests {
     use test_case::test_case;
 
     use crate::AgentMode;
-    use crate::tools::test_support::stub_ctx;
+    use crate::tools::test_support::{pre_read, stub_ctx};
 
     use super::*;
 
@@ -357,16 +357,18 @@ mod tests {
             let dir = tempfile::TempDir::new().unwrap();
             let path = dir.path().join("test.txt");
             let path_str = path.to_string_lossy();
+            std::fs::write(&path, "hello").unwrap();
 
             let ctx = stub_ctx(&AgentMode::Build);
+            pre_read(&ctx, &path_str);
             let ci = CodeExecution {
                 code: format!(
-                    "result = await write(path='{path_str}', content='hello')\nprint(result)"
+                    "result = await edit(path='{path_str}', old_string='hello', new_string='world')\nprint(result)"
                 ),
                 timeout: None,
             };
             let output = ci.execute(&ctx).await.unwrap().as_text();
-            assert!(output.contains("wrote"));
+            assert!(output.contains("edited"));
         });
     }
 

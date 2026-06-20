@@ -57,8 +57,15 @@ impl UserData for LuaCtx {
         });
 
         methods.add_method("record_read", |_, this, path: String| {
-            this.file_tracker.record_read(&resolve_abs(path));
+            this.file_tracker.record_read(Path::new(&path));
             Ok(())
+        });
+
+        methods.add_method("check_before_edit", |_, this, path: String| {
+            match this.file_tracker.check_before_edit(Path::new(&path)) {
+                Ok(()) => Ok((true, Option::<String>::None)),
+                Err(msg) => Ok((false, Some(msg))),
+            }
         });
 
         methods.add_async_method(
@@ -104,8 +111,4 @@ fn resolve_abs_with_cwd(path: String, cwd: &Path) -> PathBuf {
     } else {
         cwd.join(&path)
     }
-}
-
-fn resolve_abs(path: String) -> PathBuf {
-    resolve_abs_with_cwd(path, &std::env::current_dir().unwrap_or_default())
 }

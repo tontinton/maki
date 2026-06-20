@@ -117,7 +117,11 @@ impl super::ToolInvocation for MultiEdit {
         ))))
     }
     fn execute<'a>(self: Box<Self>, ctx: &'a super::ToolContext) -> super::ExecFuture<'a> {
-        Box::pin(async move { MultiEdit::execute(&self, ctx).await.into() })
+        Box::pin(async move {
+            let path = super::resolve_path(&self.path).ok();
+            let result: super::ToolExecResult = MultiEdit::execute(&self, ctx).await.into();
+            result.with_written_path(path)
+        })
     }
 }
 

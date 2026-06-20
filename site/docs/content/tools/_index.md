@@ -33,7 +33,7 @@ Read a file or directory. Returns contents with line numbers (1-indexed).
 | `offset` | integer | no | Line number to start from (1-indexed) |
 | `path` | string | yes | Absolute path to the file or directory |
 
-### `write`
+### `write` *(lua plugin)*
 
 Write content to a file, replacing existing content.
 

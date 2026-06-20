@@ -4,6 +4,7 @@ use std::sync::Arc;
 use maki_agent::tools::{ToolRegistry, ToolSource};
 use maki_config::{AlwaysThinking, PluginsConfig, ToolOutputLines};
 use maki_lua::{PluginError, PluginHost};
+use std::path::Path;
 
 fn fresh_registry() -> Arc<ToolRegistry> {
     Arc::new(ToolRegistry::new())
@@ -1351,6 +1352,63 @@ fn env_permission_guards_uv_and_env() {
     assert!(result.contains("home=false"), "got: {result}");
     assert!(result.contains("env=false"), "got: {result}");
     assert!(result.contains("exec=false"), "got: {result}");
+}
+
+const PATH_FIELD_SCHEMA: &str = r#"{
+    type = "object",
+    properties = { path = { type = "string" } },
+    required = { "path" },
+}"#;
+
+#[test_case::test_case(STRING_FIELD_SCHEMA, "nonexistent" ; "missing_field")]
+#[test_case::test_case(NON_STRING_FIELD_SCHEMA, "count" ; "non_string_field")]
+fn mutable_path_invalid_rejected(schema: &str, scope_field: &str) {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+
+    let src = format!(
+        r#"maki.api.register_tool({{
+            name = "bad_mpath",
+            description = "test",
+            schema = {schema},
+            mutable_path = "{scope_field}",
+            handler = function() return "" end
+        }})"#,
+    );
+    let err = host
+        .load_source("bad_mpath_plugin", &src)
+        .expect_err("expected error for invalid mutable_path");
+
+    assert!(matches!(err, PluginError::Lua { .. }));
+    assert!(
+        err.to_string().contains("mutable_path")
+            && err.to_string().contains(INVALID_PERMISSION_SCOPE_ERR),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn mutable_path_returns_path_from_input() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+
+    let src = format!(
+        r#"maki.api.register_tool({{
+            name = "mp_read",
+            description = "test",
+            schema = {PATH_FIELD_SCHEMA},
+            mutable_path = "path",
+            handler = function() return "" end
+        }})"#,
+    );
+    host.load_source("mp_read_plugin", &src).unwrap();
+
+    let entry = reg.get("mp_read").expect("tool not registered");
+    let inv = entry
+        .tool
+        .parse(&serde_json::json!({ "path": "/tmp/foo.txt" }))
+        .expect("parse failed");
+    assert_eq!(inv.mutable_path(), Some(Path::new("/tmp/foo.txt")));
 }
 
 #[test]

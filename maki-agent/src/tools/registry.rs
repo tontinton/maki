@@ -55,6 +55,7 @@ pub type ParseError = super::schema::ToolInputError;
 pub struct ToolExecResult {
     pub output: Result<ToolOutput, String>,
     pub annotation: Option<String>,
+    pub written_path: Option<String>,
 }
 
 impl From<Result<ToolOutput, String>> for ToolExecResult {
@@ -62,7 +63,17 @@ impl From<Result<ToolOutput, String>> for ToolExecResult {
         Self {
             output,
             annotation: None,
+            written_path: None,
         }
+    }
+}
+
+impl ToolExecResult {
+    pub fn with_written_path(mut self, path: Option<String>) -> Self {
+        if self.output.is_ok() {
+            self.written_path = path;
+        }
+        self
     }
 }
 
@@ -568,6 +579,7 @@ impl<T: 'static> Default for Native<T> {
 mod tests {
     use super::*;
     use crate::template::Vars;
+    use test_case::test_case;
 
     struct MockTool {
         name: String,
@@ -739,5 +751,17 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(err, RegistryError::NameConflict { .. }));
+    }
+
+    #[test_case(Err("boom".into()), Some("/tmp/foo".into()), None          ; "clears_on_error")]
+    #[test_case(Ok(ToolOutput::Plain("ok".into())), Some("/tmp/foo".into()), Some("/tmp/foo") ; "sets_on_success")]
+    fn with_written_path(
+        base: Result<ToolOutput, String>,
+        path: Option<String>,
+        expected: Option<&str>,
+    ) {
+        let result: ToolExecResult = base.into();
+        let result = result.with_written_path(path);
+        assert_eq!(result.written_path.as_deref(), expected);
     }
 }
