@@ -142,12 +142,23 @@ struct CatalogData {
 
 impl CatalogData {
     fn lookup(&self, model_id: &str) -> Result<(CatalogMeta, ResolvedAuth), AgentError> {
-        let meta = self.entries.get(model_id).cloned().ok_or_else(|| AgentError::Config {
-            message: format!("model '{model_id}' not found in catalog"),
-        })?;
-        let auth = self.auths.get(&meta.provider_id).cloned().ok_or_else(|| AgentError::Config {
-            message: format!("auth for provider '{}' not found in catalog", meta.provider_id),
-        })?;
+        let meta = self
+            .entries
+            .get(model_id)
+            .cloned()
+            .ok_or_else(|| AgentError::Config {
+                message: format!("model '{model_id}' not found in catalog"),
+            })?;
+        let auth =
+            self.auths
+                .get(&meta.provider_id)
+                .cloned()
+                .ok_or_else(|| AgentError::Config {
+                    message: format!(
+                        "auth for provider '{}' not found in catalog",
+                        meta.provider_id
+                    ),
+                })?;
         Ok((meta, auth))
     }
 
@@ -377,9 +388,14 @@ fn catalog_cache_path() -> Option<PathBuf> {
     Some(dir.join(CATALOG_CACHE_FILE))
 }
 
-fn load_cached_catalog() -> Option<CatalogIndex> {
+async fn load_cached_catalog_async() -> Option<CatalogIndex> {
     let path = catalog_cache_path()?;
-    let meta = fs::metadata(&path).ok()?;
+    let meta = smol::unblock({
+        let path = path.clone();
+        move || fs::metadata(&path)
+    })
+    .await
+    .ok()?;
 
     let modified = meta.modified().ok()?;
     let age = SystemTime::now().duration_since(modified).ok()?;
@@ -388,30 +404,38 @@ fn load_cached_catalog() -> Option<CatalogIndex> {
         return None;
     }
 
-    let text = fs::read_to_string(&path).ok()?;
+    let text = smol::unblock(move || fs::read_to_string(&path))
+        .await
+        .ok()?;
     let index: CatalogIndex = serde_json::from_str(&text).ok()?;
     debug!("loaded catalog from cache");
     Some(index)
 }
 
-fn save_cached_catalog(index: &CatalogIndex) {
+async fn save_cached_catalog_async(index: &CatalogIndex) {
     let path = match catalog_cache_path() {
         Some(p) => p,
         None => return,
     };
     if let Some(dir) = path.parent() {
-        let _ = fs::create_dir_all(dir);
+        let dir = dir.to_path_buf();
+        let _ = smol::unblock(move || fs::create_dir_all(&dir)).await;
     }
-    match serde_json::to_string_pretty(index) {
-        Ok(text) => {
-            if let Err(e) = fs::write(&path, &text) {
-                warn!(error = %e, path = %path.display(), "failed to write catalog cache");
-            } else {
-                debug!(path = %path.display(), "cached catalog");
-            }
+    let text = match serde_json::to_string_pretty(index) {
+        Ok(t) => t,
+        Err(e) => {
+            warn!(error = %e, "failed to serialize catalog for cache");
+            return;
         }
-        Err(e) => warn!(error = %e, "failed to serialize catalog for cache"),
-    }
+    };
+    smol::unblock(move || {
+        if let Err(e) = fs::write(&path, &text) {
+            warn!(error = %e, path = %path.display(), "failed to write catalog cache");
+        } else {
+            debug!(path = %path.display(), "cached catalog");
+        }
+    })
+    .await;
 }
 
 async fn fetch_remote_catalog_async(client: &HttpClient) -> Result<CatalogIndex, AgentError> {
@@ -538,7 +562,7 @@ fn catalog_to_data(index: CatalogIndex) -> CatalogData {
 }
 
 async fn fetch_catalog_async() -> Result<CatalogData, AgentError> {
-    if let Some(index) = load_cached_catalog() {
+    if let Some(index) = load_cached_catalog_async().await {
         return Ok(catalog_to_data(index));
     }
 
@@ -551,7 +575,7 @@ async fn fetch_catalog_async() -> Result<CatalogData, AgentError> {
         })?;
 
     let index = fetch_remote_catalog_async(&client).await?;
-    save_cached_catalog(&index);
+    save_cached_catalog_async(&index).await;
     Ok(catalog_to_data(index))
 }
 
