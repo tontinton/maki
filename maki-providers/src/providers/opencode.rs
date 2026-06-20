@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tracing::{debug, warn};
 
-use crate::model::Model;
+use crate::model::{Model, ModelInfo, ModelPricing};
 use crate::provider::{BoxFuture, Provider};
 use crate::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use crate::{
@@ -81,7 +81,7 @@ impl CatalogProvider {
     }
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, Clone)]
 struct CatalogModel {
     limit: Option<CatalogLimits>,
     #[serde(default)]
@@ -90,7 +90,7 @@ struct CatalogModel {
     provider: Option<CatalogShape>,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, Clone)]
 struct CatalogLimits {
     #[serde(default)]
     context: Option<u32>,
@@ -100,7 +100,7 @@ struct CatalogLimits {
     output: Option<u32>,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, Clone)]
 struct CatalogCost {
     #[serde(default)]
     input: Option<f64>,
@@ -112,7 +112,7 @@ struct CatalogCost {
     cache_write: Option<f64>,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, Clone)]
 struct CatalogShape {
     #[serde(default)]
     shape: Option<String>,
@@ -124,30 +124,31 @@ struct CatalogMeta {
     api_format: EndpointType,
     context: u32,
     output: u32,
-    #[allow(dead_code)]
     input_price: f64,
-    #[allow(dead_code)]
     output_price: f64,
-    #[allow(dead_code)]
     cache_read: f64,
-    #[allow(dead_code)]
     cache_write: f64,
 }
 
+type ModelWithProvider = (String, String);
+
 #[derive(Default)]
 struct CatalogData {
-    entries: HashMap<String, CatalogMeta>,
+    entries: HashMap<ModelWithProvider, CatalogMeta>,
     auths: HashMap<String, ResolvedAuth>,
 }
 
 impl CatalogData {
-    fn lookup(&self, model_id: &str) -> Result<(CatalogMeta, ResolvedAuth), AgentError> {
+    fn lookup(&self, key: &str) -> Result<(CatalogMeta, ResolvedAuth), AgentError> {
+        let (provider, model_id) = key.split_once('/').ok_or_else(|| AgentError::Config {
+            message: format!("invalid model key '{key}': expected 'provider/model_id'"),
+        })?;
         let meta = self
             .entries
-            .get(model_id)
+            .get(&(provider.to_string(), model_id.to_string()))
             .cloned()
             .ok_or_else(|| AgentError::Config {
-                message: format!("model '{model_id}' not found in catalog"),
+                message: format!("model '{key}' not found in catalog"),
             })?;
         let auth =
             self.auths
@@ -162,25 +163,25 @@ impl CatalogData {
         Ok((meta, auth))
     }
 
-    fn sorted_model_ids(&self) -> Vec<String> {
-        let mut ids: Vec<String> = self.entries.keys().cloned().collect();
-        ids.sort();
-        ids
-    }
-}
-
-impl Default for CatalogMeta {
-    fn default() -> Self {
-        Self {
-            provider_id: String::new(),
-            api_format: EndpointType::ChatCompletions,
-            context: 128_000,
-            output: 64_000,
-            input_price: 0.0,
-            output_price: 0.0,
-            cache_read: 0.0,
-            cache_write: 0.0,
-        }
+    fn all_models(&self) -> Vec<ModelInfo> {
+        let mut models: Vec<ModelInfo> = self
+            .entries
+            .iter()
+            .map(|((provider, model_id), meta)| ModelInfo {
+                id: format!("{provider}/{model_id}"),
+                context_window: Some(meta.context),
+                max_output_tokens: Some(meta.output),
+                pricing: Some(ModelPricing {
+                    input: meta.input_price,
+                    output: meta.output_price,
+                    cache_read: meta.cache_read,
+                    cache_write: meta.cache_write,
+                    fast: None,
+                }),
+            })
+            .collect();
+        models.sort_by(|a, b| a.id.cmp(&b.id));
+        models
     }
 }
 
@@ -234,9 +235,9 @@ impl Opencode {
         }
     }
 
-    async fn do_list_models(&self) -> Result<Vec<String>, AgentError> {
+    async fn do_list_models(&self) -> Result<Vec<ModelInfo>, AgentError> {
         self.try_init_catalog().await;
-        Ok(self.catalog_mutex().lock().unwrap().sorted_model_ids())
+        Ok(self.catalog_mutex().lock().unwrap().all_models())
     }
 
     pub fn new(timeouts: super::Timeouts) -> Result<Self, AgentError> {
@@ -375,7 +376,7 @@ impl Provider for Opencode {
         })
     }
 
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<String>, AgentError>> {
+    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
         Box::pin(self.do_list_models())
     }
 
@@ -476,7 +477,7 @@ fn determine_catalog_format(npm: &str) -> EndpointType {
 const ALLOWED_NPM: &[&str] = &["@ai-sdk/openai-compatible", "@ai-sdk/anthropic"];
 
 fn catalog_to_data(index: CatalogIndex) -> CatalogData {
-    let mut entries = HashMap::new();
+    let mut entries: HashMap<ModelWithProvider, CatalogMeta> = HashMap::new();
     let mut auths = HashMap::new();
 
     for (provider_id, provider) in &index {
@@ -523,6 +524,7 @@ fn catalog_to_data(index: CatalogIndex) -> CatalogData {
                 .as_ref()
                 .and_then(|l| l.output)
                 .unwrap_or(64_000);
+
             let cache_read = model_data
                 .cost
                 .as_ref()
@@ -534,8 +536,9 @@ fn catalog_to_data(index: CatalogIndex) -> CatalogData {
                 .and_then(|c| c.cache_write)
                 .unwrap_or(0.0);
 
+            let key = (provider_id.clone(), model_id.clone());
             entries.insert(
-                model_id.clone(),
+                key,
                 CatalogMeta {
                     provider_id: provider_id.clone(),
                     api_format,
@@ -1014,8 +1017,16 @@ mod tests {
         let result = catalog_to_data(providers);
         // Without key set, has_api_key is false, so only free models pass
         // but has_api_key is false, so only free models pass
-        assert!(result.entries.contains_key("free-model"));
-        assert!(!result.entries.contains_key("paid-model"));
+        assert!(
+            result
+                .entries
+                .contains_key(&("opencode".into(), "free-model".into()))
+        );
+        assert!(
+            !result
+                .entries
+                .contains_key(&("opencode".into(), "paid-model".into()))
+        );
         // Route should exist
         assert!(result.auths.contains_key("opencode"));
     }
@@ -1067,8 +1078,16 @@ mod tests {
         unsafe { std::env::remove_var("MAKI_TEST_OPENCODE_ALL_81274") };
 
         // With key set, has_api_key is true, so all models pass
-        assert!(result.entries.contains_key("free-model"));
-        assert!(result.entries.contains_key("paid-model"));
+        assert!(
+            result
+                .entries
+                .contains_key(&("opencode".into(), "free-model".into()))
+        );
+        assert!(
+            result
+                .entries
+                .contains_key(&("opencode".into(), "paid-model".into()))
+        );
         assert!(result.auths.contains_key("opencode"));
     }
 
@@ -1080,8 +1099,8 @@ mod tests {
             CatalogModel {
                 limit: None,
                 cost: Some(CatalogCost {
-                    input: Some(0.5),
-                    output: Some(1.5),
+                    input: Some(0.0),
+                    output: Some(0.0),
                     cache_read: None,
                     cache_write: None,
                 }),
@@ -1119,8 +1138,16 @@ mod tests {
         let result = catalog_to_data(providers);
         unsafe { std::env::remove_var("MAKI_TEST_VENDOR_KEY_81274") };
 
-        assert!(result.entries.contains_key("cheap"));
-        assert!(result.entries.contains_key("freebie"));
+        assert!(
+            result
+                .entries
+                .contains_key(&("some-vendor".into(), "cheap".into()))
+        );
+        assert!(
+            result
+                .entries
+                .contains_key(&("some-vendor".into(), "freebie".into()))
+        );
     }
 
     #[test]
@@ -1140,5 +1167,75 @@ mod tests {
         let result = catalog_to_data(providers);
         assert!(result.entries.is_empty());
         assert!(result.auths.is_empty());
+    }
+
+    #[test]
+    fn catalog_to_data_handles_model_id_collisions() {
+        let mut models: HashMap<String, CatalogModel> = HashMap::new();
+        models.insert(
+            "shared-model".into(),
+            CatalogModel {
+                limit: Some(CatalogLimits {
+                    context: Some(64_000),
+                    input: Some(64_000),
+                    output: Some(8_000),
+                }),
+                cost: Some(CatalogCost {
+                    input: Some(0.0),
+                    output: Some(0.0),
+                    cache_read: None,
+                    cache_write: None,
+                }),
+                provider: None,
+            },
+        );
+
+        let mut providers = HashMap::new();
+
+        // Provider "opencode" has "shared-model"
+        providers.insert(
+            "opencode".into(),
+            CatalogProvider {
+                name: "Opencode".into(),
+                env: vec![],
+                npm: "@ai-sdk/openai-compatible".into(),
+                api: Some("https://opencode.ai/zen/v1".into()),
+                models: models.clone(),
+            },
+        );
+
+        // Provider "other-vendor" also has "shared-model"
+        providers.insert(
+            "other-vendor".into(),
+            CatalogProvider {
+                name: "Other".into(),
+                env: vec!["MAKI_TEST_OTHER_KEY_COLLISION".into()],
+                npm: "@ai-sdk/openai-compatible".into(),
+                api: Some("https://other.api/v1".into()),
+                models,
+            },
+        );
+
+        unsafe { std::env::set_var("MAKI_TEST_OTHER_KEY_COLLISION", "key") };
+        let result = catalog_to_data(providers);
+        unsafe { std::env::remove_var("MAKI_TEST_OTHER_KEY_COLLISION") };
+
+        // Both providers' entries are preserved
+        assert!(
+            result
+                .entries
+                .contains_key(&("opencode".into(), "shared-model".into()))
+        );
+        assert!(
+            result
+                .entries
+                .contains_key(&("other-vendor".into(), "shared-model".into()))
+        );
+        assert_eq!(result.entries.len(), 2);
+
+        // lookup prefers the "opencode" provider
+        // lookup expects \"provider/model_id\" format
+        let (meta, _) = result.lookup("opencode/shared-model").unwrap();
+        assert_eq!(meta.provider_id, "opencode");
     }
 }
