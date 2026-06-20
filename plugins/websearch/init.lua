@@ -13,7 +13,7 @@ end
 
 maki.api.register_tool({
   name = "websearch",
-  kind = "search",
+  kind = "fetch",
   description = "Search the web for real-time information using Exa AI.\n\n"
     .. "Today's date is "
     .. os.date("%Y-%m-%d")

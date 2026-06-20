@@ -23,21 +23,15 @@ fn fenced(text: &str) -> String {
 }
 
 pub fn tool_kind(name: &str) -> ToolKind {
-    if let Some(kind_str) = ToolRegistry::native()
-        .get(name)
-        .and_then(|e| e.tool.tool_kind().map(str::to_owned))
-    {
-        return parse_tool_kind(&kind_str);
-    }
-    match name {
-        "read" => ToolKind::Read,
-        "edit" | "multiedit" | "write" => ToolKind::Edit,
-        "grep" | "glob" | "semble" => ToolKind::Search,
-        "bash" | "code_execution" => ToolKind::Execute,
-        "webfetch" | "websearch" => ToolKind::Fetch,
-        "task" => ToolKind::Think,
-        _ => ToolKind::Other,
-    }
+    let entry = match ToolRegistry::native().get(name) {
+        Some(e) => e,
+        None => return ToolKind::Other,
+    };
+    entry
+        .tool
+        .tool_kind()
+        .map(parse_tool_kind)
+        .unwrap_or(ToolKind::Other)
 }
 
 fn parse_tool_kind(s: &str) -> ToolKind {
@@ -372,7 +366,7 @@ mod tests {
         assert_eq!(json[2]["content"]["text"], "let me check");
         assert_eq!(json[3]["sessionUpdate"], "tool_call");
         assert_eq!(json[3]["toolCallId"], "tu-1");
-        assert_eq!(json[3]["kind"], "execute");
+        assert!(json[3]["kind"].is_null());
         assert_eq!(json[3]["rawInput"]["command"], "ls");
         assert_eq!(json[4]["sessionUpdate"], "tool_call_update");
         assert_eq!(json[4]["toolCallId"], "tu-1");
@@ -446,11 +440,8 @@ mod tests {
         assert_eq!(parse_tool_kind(input), expected);
     }
 
-    #[test_case("read", ToolKind::Read ; "native_read")]
-    #[test_case("bash", ToolKind::Execute ; "native_bash")]
-    #[test_case("task", ToolKind::Think ; "native_task")]
     #[test_case("nonexistent_plugin_tool", ToolKind::Other ; "unknown_tool_is_other")]
-    fn tool_kind_name_based_fallback(name: &str, expected: ToolKind) {
+    fn tool_kind_from_registry(name: &str, expected: ToolKind) {
         assert_eq!(tool_kind(name), expected);
     }
 }

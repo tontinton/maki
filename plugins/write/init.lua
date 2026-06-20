@@ -59,7 +59,7 @@ end
 
 maki.api.register_tool({
   name = "write",
-  kind = "execute",
+  kind = "edit",
   mutable_path = "path",
   permission_scope = "path",
   audiences = { "main", "general_sub", "interpreter" },
