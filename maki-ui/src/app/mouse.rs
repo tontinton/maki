@@ -2,9 +2,7 @@ use std::time::{Duration, Instant};
 
 use crate::clipboard::CopyResult;
 use crate::components::messages::ClickResult;
-use crate::selection::{
-    self, ContentRegion, EdgeScroll, SelectableZone, Selection, SelectionState, SelectionZone,
-};
+use crate::selection::{self, ContentRegion, EdgeScroll, Selection, SelectionState, SelectionZone};
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
@@ -191,7 +189,7 @@ impl App {
                 }];
                 selection::extract_selected_text(buf, &screen_sel, &regions)
             }
-            SelectionZone::StatusBar | SelectionZone::Overlay => {
+            SelectionZone::Overlay => {
                 let scroll = self.scroll_offset(sel.zone);
                 let Some(screen_sel) = sel.to_screen(scroll) else {
                     self.selection_state = None;
@@ -213,15 +211,15 @@ impl App {
         self.selection_state = None;
     }
 
-    pub(super) fn zone_at(&self, row: u16, col: u16) -> Option<SelectableZone> {
-        selection::zone_at(&self.zones, row, col)
+    pub(super) fn zone_at(&self, row: u16, col: u16) -> Option<selection::SelectableZone> {
+        self.zones.zone_at(row, col)
     }
 
     pub(super) fn scroll_offset(&self, zone: SelectionZone) -> u32 {
         match zone {
             SelectionZone::Messages => self.chats[self.active_chat].scroll_top() as u32,
             SelectionZone::Input => self.input_box.scroll_y() as u32,
-            SelectionZone::StatusBar | SelectionZone::Overlay => 0,
+            SelectionZone::Overlay => 0,
         }
     }
 
@@ -229,13 +227,17 @@ impl App {
         match zone {
             SelectionZone::Messages => self.chats[self.active_chat].scroll(delta),
             SelectionZone::Input => self.input_box.scroll(delta),
-            SelectionZone::StatusBar | SelectionZone::Overlay => {}
+            SelectionZone::Overlay => {}
         }
     }
 
     pub(super) fn msg_area(&self) -> Rect {
-        self.zones[SelectionZone::Messages.idx()]
-            .map(|z| z.highlight_area)
+        self.zones
+            .find(SelectionZone::Messages)
+            .map(|z| {
+                let a = z.area;
+                Rect::new(a.x, a.y, a.width.saturating_sub(1), a.height)
+            })
             .unwrap_or_default()
     }
 }

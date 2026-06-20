@@ -49,7 +49,7 @@ use crate::components::{
 };
 use crate::event_loop::BufClickHandler;
 use crate::image;
-use crate::selection::{SelectionState, SelectionZone, ZoneRegistry};
+use crate::selection::{SelectionState, ZoneRegistry};
 use arc_swap::{ArcSwap, ArcSwapOption};
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use maki_agent::permissions::PermissionManager;
@@ -239,7 +239,7 @@ impl App {
             pending_input: PendingInput::None,
             run_id: 0,
             retry_info: None,
-            zones: [None; SelectionZone::COUNT],
+            zones: ZoneRegistry::new(),
             selection_state: None,
             clipboard: ClipboardState::new(),
             last_esc: None,
@@ -268,6 +268,10 @@ impl App {
 
     fn is_main_chat(&self) -> bool {
         self.active_chat == 0
+    }
+
+    fn plan_form_active(&self) -> bool {
+        self.state.mode == Mode::Plan && self.plan_form.is_visible()
     }
 
     pub(crate) fn update_model(&mut self, model: &Model) {
@@ -485,7 +489,7 @@ impl App {
         }
 
         // plan_form is non-modal: Passthrough falls through to the rest of dispatch
-        if self.state.mode == Mode::Plan && self.plan_form.is_visible() {
+        if self.plan_form_active() {
             let action = self.plan_form.handle_key(key);
             if action != PlanFormAction::Passthrough {
                 return Some(self.handle_plan_form_action(action));
@@ -1425,7 +1429,7 @@ impl App {
     }
 
     fn route_text_paste(&mut self, text: &str) {
-        if self.state.mode == Mode::Plan && self.plan_form.is_visible() {
+        if self.plan_form_active() {
             return;
         }
         if self.permission_prompt.handle_paste(text) {

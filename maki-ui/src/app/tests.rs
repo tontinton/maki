@@ -23,11 +23,7 @@ use tempfile::TempDir;
 use test_case::test_case;
 
 fn set_zone(app: &mut App, zone: SelectionZone, area: Rect) {
-    app.zones[zone.idx()] = Some(SelectableZone {
-        area,
-        highlight_area: area,
-        zone,
-    });
+    app.zones.push(SelectableZone { area, zone });
 }
 
 fn test_app() -> App {
@@ -1356,22 +1352,6 @@ fn stale_done_does_not_drain_queue() {
     ));
     assert_eq!(app.queue.len(), 1);
     assert_eq!(app.status, Status::Idle);
-}
-
-#[test]
-fn zone_at_returns_correct_zone() {
-    let mut app = test_app();
-    let msg = Rect::new(0, 0, 80, 15);
-    let input = Rect::new(0, 15, 80, 5);
-    let status = Rect::new(0, 20, 80, 1);
-    set_zone(&mut app, SelectionZone::Messages, msg);
-    set_zone(&mut app, SelectionZone::Input, input);
-    set_zone(&mut app, SelectionZone::StatusBar, status);
-
-    assert_eq!(app.zone_at(5, 10).unwrap().zone, SelectionZone::Messages);
-    assert_eq!(app.zone_at(16, 10).unwrap().zone, SelectionZone::Input);
-    assert_eq!(app.zone_at(20, 10).unwrap().zone, SelectionZone::StatusBar);
-    assert!(app.zone_at(22, 10).is_none());
 }
 
 #[test]

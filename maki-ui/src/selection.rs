@@ -16,7 +16,7 @@
 //! messages panel so the viewport stays put while the user drags.
 //!
 //! The rightmost column of each area is reserved for the scrollbar, so
-//! `highlight_area` / `msg_area()` are 1 column narrower than the full
+//! `highlight_area()` / `msg_area()` are 1 column narrower than the full
 //! area and all column math uses `width - 1`.
 //!
 //! When text is word-wrapped, ratatui eats the space at the break point,
@@ -67,46 +67,79 @@ impl Ord for DocPos {
 }
 
 /// Selection is locked to one zone for its entire lifetime.
-///
-/// Variant order matters: higher index = higher z-order priority in `zone_at`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SelectionZone {
     Messages,
     Input,
-    StatusBar,
     Overlay,
-}
-
-impl SelectionZone {
-    pub const COUNT: usize = 4;
-
-    pub const fn idx(self) -> usize {
-        self as usize
-    }
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct SelectableZone {
     pub area: Rect,
-    pub highlight_area: Rect,
     pub zone: SelectionZone,
 }
 
-pub type ZoneRegistry = [Option<SelectableZone>; SelectionZone::COUNT];
+const ZONE_CAP: usize = 12;
 
-/// Returns the zone at `(row, col)`, preferring higher-index (higher z-order) zones.
-pub fn zone_at(zones: &ZoneRegistry, row: u16, col: u16) -> Option<SelectableZone> {
-    let pos = ratatui::layout::Position::new(col, row);
-    zones
-        .iter()
-        .rev()
-        .flatten()
-        .find(|z| z.area.contains(pos))
-        .copied()
+const EMPTY_ZONE: SelectableZone = SelectableZone {
+    area: Rect::new(0, 0, 0, 0),
+    zone: SelectionZone::Messages,
+};
+
+pub struct ZoneRegistry {
+    entries: [SelectableZone; ZONE_CAP],
+    len: u8,
+}
+
+impl ZoneRegistry {
+    pub fn new() -> Self {
+        Self {
+            entries: [EMPTY_ZONE; ZONE_CAP],
+            len: 0,
+        }
+    }
+
+    pub fn push(&mut self, zone: SelectableZone) {
+        let i = self.len as usize;
+        if i >= ZONE_CAP {
+            return;
+        }
+        self.entries[i] = zone;
+        self.len += 1;
+    }
+
+    pub fn push_overlay(&mut self, area: Rect) {
+        self.push(SelectableZone {
+            area,
+            zone: SelectionZone::Overlay,
+        });
+    }
+
+    pub fn zone_at(&self, row: u16, col: u16) -> Option<SelectableZone> {
+        let pos = ratatui::layout::Position::new(col, row);
+        self.entries[..self.len as usize]
+            .iter()
+            .rev()
+            .find(|z| z.area.contains(pos))
+            .copied()
+    }
+
+    pub fn find(&self, zone: SelectionZone) -> Option<&SelectableZone> {
+        self.entries[..self.len as usize]
+            .iter()
+            .find(|z| z.zone == zone)
+    }
+
+    pub fn find_area(&self, area: Rect) -> Option<&SelectableZone> {
+        self.entries[..self.len as usize]
+            .iter()
+            .find(|z| z.area == area)
+    }
 }
 
 /// Anchor + cursor in doc space. `area` and `zone` are captured at mouse-down
-/// and stay fixed so layout changes mid-drag don't break the selection.
+/// so layout changes mid-drag don't break the selection.
 #[derive(Clone, Copy, Debug)]
 pub struct Selection {
     anchor: DocPos,
@@ -146,6 +179,18 @@ impl Selection {
 
     pub fn is_empty(&self) -> bool {
         self.anchor == self.cursor
+    }
+
+    pub fn highlight_area(&self) -> Rect {
+        match self.zone {
+            SelectionZone::Messages => Rect::new(
+                self.area.x,
+                self.area.y,
+                self.area.width.saturating_sub(1),
+                self.area.height,
+            ),
+            _ => self.area,
+        }
     }
 
     pub fn normalized(&self) -> (DocPos, DocPos) {
@@ -898,24 +943,19 @@ mod tests {
     fn zone_at_overlay_wins_over_messages() {
         let msg_area = Rect::new(0, 0, 80, 20);
         let overlay_area = Rect::new(10, 5, 60, 10);
-        let mut zones: ZoneRegistry = [None; SelectionZone::COUNT];
-        zones[SelectionZone::Messages.idx()] = Some(SelectableZone {
+        let mut zones = ZoneRegistry::new();
+        zones.push(SelectableZone {
             area: msg_area,
-            highlight_area: msg_area,
             zone: SelectionZone::Messages,
         });
-        zones[SelectionZone::Overlay.idx()] = Some(SelectableZone {
+        zones.push(SelectableZone {
             area: overlay_area,
-            highlight_area: overlay_area,
             zone: SelectionZone::Overlay,
         });
 
-        assert_eq!(zone_at(&zones, 7, 20).unwrap().zone, SelectionZone::Overlay);
-        assert_eq!(
-            zone_at(&zones, 2, 20).unwrap().zone,
-            SelectionZone::Messages
-        );
-        assert_eq!(zone_at(&zones, 7, 5).unwrap().zone, SelectionZone::Messages);
+        assert_eq!(zones.zone_at(7, 20).unwrap().zone, SelectionZone::Overlay);
+        assert_eq!(zones.zone_at(2, 20).unwrap().zone, SelectionZone::Messages);
+        assert_eq!(zones.zone_at(7, 5).unwrap().zone, SelectionZone::Messages);
     }
 
     #[test_case(doc(0, 0), doc(2, 9), 0, 2, 0, 9, true  ; "exact_match")]
@@ -1042,14 +1082,13 @@ mod tests {
 
     #[test]
     fn zone_at_returns_none_when_outside() {
-        let mut zones: ZoneRegistry = [None; SelectionZone::COUNT];
-        assert!(zone_at(&zones, 10, 10).is_none(), "no zones registered");
-        zones[SelectionZone::Messages.idx()] = Some(SelectableZone {
+        let mut zones = ZoneRegistry::new();
+        assert!(zones.zone_at(10, 10).is_none(), "no zones registered");
+        zones.push(SelectableZone {
             area: Rect::new(0, 0, 80, 20),
-            highlight_area: Rect::new(0, 0, 80, 20),
             zone: SelectionZone::Messages,
         });
-        assert!(zone_at(&zones, 25, 10).is_none(), "outside all zones");
+        assert!(zones.zone_at(25, 10).is_none(), "outside all zones");
     }
 
     fn wrap_extract(input: &str, width: u16) -> String {
