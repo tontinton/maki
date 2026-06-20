@@ -1,6 +1,7 @@
 local helpers = require("tests.helpers")
 local case = helpers.case
 local idx = helpers.idx
+local idx_with_meta = helpers.idx_with_meta
 local has = helpers.has
 
 case("swift_all_sections", function()
@@ -57,4 +58,19 @@ let MAX_COUNT = 100
     "fns:",
     "process",
   })
+end)
+
+case("swift_class_methods_have_ranged_meta", function()
+  local src = [==[
+public class Engine {
+    public func start() {
+        print("started")
+    }
+    public func stop() {
+        print("stopped")
+    }
+}
+]==]
+  local text, meta = idx_with_meta(src, "swift")
+  helpers.assert_ranged_meta(text, meta, { "func start", "func stop" })
 end)

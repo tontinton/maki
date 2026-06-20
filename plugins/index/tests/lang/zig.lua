@@ -1,6 +1,7 @@
 local helpers = require("tests.helpers")
 local case = helpers.case
 local idx = helpers.idx
+local idx_with_meta = helpers.idx_with_meta
 local has = helpers.has
 
 case("zig_all_sections", function()
@@ -180,4 +181,15 @@ pub const Big = struct {
     "h: u8",
     "truncated",
   })
+end)
+
+case("zig_struct_fields_plain_children_no_meta", function()
+  local src = [==[
+pub const Point = struct {
+    x: f32,
+    y: f32,
+};
+]==]
+  local text, meta = idx_with_meta(src, "zig")
+  helpers.assert_fields_no_ranged_meta(text, meta, "struct Point", { "x: f32", "y: f32" })
 end)

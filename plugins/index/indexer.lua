@@ -87,6 +87,10 @@ local function format_range(s, e)
   return "[" .. s .. "-" .. e .. "]"
 end
 
+local function ranged(text, range)
+  return { body = text, range = range }
+end
+
 local function find_child(node, kind)
   for _, child in ipairs(node:children()) do
     if child:type() == kind then
@@ -108,7 +112,11 @@ local function truncate(s, max)
   if boundary < 0 then
     boundary = 0
   end
-  return s:sub(1, boundary) .. "[truncated]"
+  local cut = s:sub(1, boundary)
+  if cut:find("\n", 1, true) then
+    return cut .. "\n[truncated]"
+  end
+  return cut .. "[truncated]"
 end
 
 local function truncated_msg(total)
@@ -426,7 +434,7 @@ local function extract_body_members(body, source, rules)
         local sig = rule.fn(child, source)
         if sig then
           local lr = format_range(line_start(child), line_end(child))
-          members[#members + 1] = sig .. " " .. lr
+          members[#members + 1] = ranged(sig, lr)
         end
       elseif rule.handler == "field" then
         local counter = rule.counter or kind
@@ -434,7 +442,7 @@ local function extract_body_members(body, source, rules)
         if field_counts[counter] <= FIELD_TRUNCATE_THRESHOLD then
           local text = rule.fn(child, source)
           local lr = format_range(line_start(child), line_end(child))
-          members[#members + 1] = text .. " " .. lr
+          members[#members + 1] = ranged(text, lr)
         end
       end
     end
@@ -519,22 +527,84 @@ end
 
 local render_item_lines
 
-render_item_lines = function(entry, out, indent)
+local TRUNCATED_SUFFIX = "[truncated]"
+local TRUNCATED_INFIX = " more truncated]"
+
+local function ends_with_truncation(s)
+  if s:sub(-#TRUNCATED_SUFFIX) == TRUNCATED_SUFFIX then
+    return true
+  end
+  return s:sub(1, 1) == "[" and s:sub(-#TRUNCATED_INFIX) == TRUNCATED_INFIX
+end
+
+local function emit_body_with_range(body, range, out, meta)
+  if body:find("\n", 1, true) then
+    local leading = body:match("^(%s*)") or ""
+    local lines = {}
+    for line in (body .. "\n"):gmatch("([^\n]*)\n") do
+      lines[#lines + 1] = line
+    end
+    for i, line in ipairs(lines) do
+      if i == 1 then
+        out[#out + 1] = line .. " " .. range
+        meta[#out] = { body = line, range = range }
+      else
+        line = leading .. line
+        out[#out + 1] = line
+        if ends_with_truncation(line) then
+          meta[#out] = { tag = "dim" }
+        end
+      end
+    end
+  else
+    out[#out + 1] = body .. " " .. range
+    if ends_with_truncation(body) then
+      meta[#out] = { tag = "dim" }
+    else
+      meta[#out] = { body = body, range = range }
+    end
+  end
+end
+
+render_item_lines = function(entry, out, indent, meta)
   local prefix = string.rep(" ", indent)
   for _, attr in ipairs(entry.attrs or {}) do
     out[#out + 1] = prefix .. attr
   end
-  out[#out + 1] = prefix .. entry.text .. " " .. format_range(entry.line_start, entry.line_end)
+  local range = format_range(entry.line_start, entry.line_end)
+  local body = prefix .. entry.text
+  emit_body_with_range(body, range, out, meta)
   if entry.child_kind == CHILD_BRIEF and #(entry.children or {}) > 0 then
-    for _, line in ipairs(wrap_csv(entry.children, prefix .. "  ")) do
+    local children = entry.children
+    local last = children[#children]
+    local has_trunc = type(last) == "string" and ends_with_truncation(last)
+    if has_trunc then
+      children = { table.unpack(children, 1, #children - 1) }
+    end
+    local csv_items = {}
+    for _, c in ipairs(children) do
+      csv_items[#csv_items + 1] = type(c) == "table" and (c.body .. " " .. c.range) or c
+    end
+    for _, line in ipairs(wrap_csv(csv_items, prefix .. "  ")) do
       out[#out + 1] = line
+      meta[#out] = { tag = "dim" }
+    end
+    if has_trunc then
+      out[#out + 1] = prefix .. "  " .. last
+      meta[#out] = { tag = "dim" }
     end
   else
     for _, child in ipairs(entry.children or {}) do
-      if type(child) == "table" then
-        render_item_lines(child, out, indent + 2)
+      if type(child) == "table" and child.body then
+        local cbody = prefix .. "  " .. child.body
+        emit_body_with_range(cbody, child.range, out, meta)
+      elseif type(child) == "table" then
+        render_item_lines(child, out, indent + 2, meta)
       else
         out[#out + 1] = prefix .. "  " .. child
+        if type(child) == "string" and ends_with_truncation(child) then
+          meta[#out] = { tag = "dim" }
+        end
       end
     end
   end
@@ -542,9 +612,41 @@ end
 
 local function format_skeleton(entries, test_lines, module_doc, import_sep)
   local out = {}
+  local meta = {}
+
+  local function emit_section(label, range)
+    out[#out + 1] = label .. (range or "")
+    meta[#out] = range and { tag = "section", body = label, range = range } or { tag = "section" }
+  end
+
+  local function items_range(items)
+    local lo, hi = MAX_INT, 0
+    for _, e in ipairs(items) do
+      if e.line_start < lo then
+        lo = e.line_start
+      end
+      if e.line_end > hi then
+        hi = e.line_end
+      end
+    end
+    return format_range(lo, hi)
+  end
+
+  local function lines_range(lines)
+    local lo, hi = MAX_INT, 0
+    for _, l in ipairs(lines) do
+      if l < lo then
+        lo = l
+      end
+      if l > hi then
+        hi = l
+      end
+    end
+    return format_range(lo, hi)
+  end
 
   if module_doc then
-    out[#out + 1] = "module doc: " .. format_range(module_doc[1], module_doc[2])
+    emit_section("module doc: ", format_range(module_doc[1], module_doc[2]))
   end
 
   local grouped = {}
@@ -563,20 +665,10 @@ local function format_skeleton(entries, test_lines, module_doc, import_sep)
     if items and #items > 0 then
       local header = SECTION_HEADER[sec]
       if sec == SECTION.Import then
-        local min_line, max_line = MAX_INT, 0
-        for _, e in ipairs(items) do
-          if e.line_start < min_line then
-            min_line = e.line_start
-          end
-          if e.line_end > max_line then
-            max_line = e.line_end
-          end
-        end
-
         if #out > 0 then
           out[#out + 1] = ""
         end
-        out[#out + 1] = "imports: " .. format_range(min_line, max_line)
+        emit_section("imports: ", items_range(items))
 
         local keyword_order = {}
         local keyword_tries = {}
@@ -608,19 +700,10 @@ local function format_skeleton(entries, test_lines, module_doc, import_sep)
           end
         end
       elseif sec == SECTION.Module then
-        local min_line, max_line = MAX_INT, 0
-        for _, e in ipairs(items) do
-          if e.line_start < min_line then
-            min_line = e.line_start
-          end
-          if e.line_end > max_line then
-            max_line = e.line_end
-          end
-        end
         if #out > 0 then
           out[#out + 1] = ""
         end
-        out[#out + 1] = header .. " " .. format_range(min_line, max_line)
+        emit_section(header .. " ", items_range(items))
         local names = {}
         for _, e in ipairs(items) do
           names[#names + 1] = e.text
@@ -632,18 +715,21 @@ local function format_skeleton(entries, test_lines, module_doc, import_sep)
         if #out > 0 then
           out[#out + 1] = ""
         end
-        out[#out + 1] = header
+        emit_section(header)
         for _, entry in ipairs(items) do
-          out[#out + 1] = "  " .. entry.text .. " " .. format_range(entry.line_start, entry.line_end)
+          local range = format_range(entry.line_start, entry.line_end)
+          local body = "  " .. entry.text
+          out[#out + 1] = body .. " " .. range
+          meta[#out] = { body = body, range = range }
         end
       else
         if #out > 0 then
           out[#out + 1] = ""
         end
-        out[#out + 1] = header
+        emit_section(header)
         for _, entry in ipairs(items) do
           if entry.kind == "item" then
-            render_item_lines(entry, out, 2)
+            render_item_lines(entry, out, 2, meta)
           end
         end
       end
@@ -651,25 +737,16 @@ local function format_skeleton(entries, test_lines, module_doc, import_sep)
   end
 
   if test_lines and #test_lines > 0 then
-    local min_t, max_t = MAX_INT, 0
-    for _, l in ipairs(test_lines) do
-      if l < min_t then
-        min_t = l
-      end
-      if l > max_t then
-        max_t = l
-      end
-    end
     if #out > 0 then
       out[#out + 1] = ""
     end
-    out[#out + 1] = "tests: " .. format_range(min_t, max_t)
+    emit_section("tests: ", lines_range(test_lines))
   end
 
   if #out == 0 then
-    return ""
+    return "", {}
   end
-  return table.concat(out, "\n") .. "\n"
+  return table.concat(out, "\n") .. "\n", meta
 end
 
 local U = {
@@ -682,6 +759,7 @@ local U = {
   line_end = line_end,
   find_child = find_child,
   compact_ws = compact_ws,
+  TRUNCATED_SUFFIX = TRUNCATED_SUFFIX,
   truncate = truncate,
   truncated_msg = truncated_msg,
   new_entry = new_entry,
@@ -689,6 +767,7 @@ local U = {
   simple_import = simple_import,
   expand_import = expand_import,
   format_range = format_range,
+  ranged = ranged,
   prefixed = prefixed,
   extract_enum_variants = extract_enum_variants,
   extract_fields_truncated = extract_fields_truncated,
@@ -805,8 +884,17 @@ local function index_source(source, lang_name)
   return extractor(source, root)
 end
 
+local LANG_TO_EXT = {}
+for ext, lang in pairs(EXT_TO_LANG) do
+  if not LANG_TO_EXT[lang] then
+    LANG_TO_EXT[lang] = ext
+  end
+end
+
 return {
   index_source = index_source,
   EXT_TO_LANG = EXT_TO_LANG,
+  LANG_TO_EXT = LANG_TO_EXT,
   FILENAME_TO_LANG = FILENAME_TO_LANG,
+  TRUNCATED_SUFFIX = TRUNCATED_SUFFIX,
 }

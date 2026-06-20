@@ -7,6 +7,7 @@ return function(U)
   local line_end = U.line_end
   local new_entry = U.new_entry
   local new_import_entry = U.new_import_entry
+  local ranged = U.ranged
   local SECTION = U.SECTION
 
   local DEF = "def"
@@ -158,7 +159,7 @@ return function(U)
             local t = call_target(child, source)
             local prefix = t == DEFP and "defp " or "def "
             local lr = format_range(line_start(child), line_end(child))
-            methods[#methods + 1] = compact_ws(prefix .. sig) .. " " .. lr
+            methods[#methods + 1] = ranged(compact_ws(prefix .. sig), lr)
           end
         end
       end

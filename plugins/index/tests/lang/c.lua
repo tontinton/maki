@@ -5,7 +5,9 @@
 local helpers = require("tests.helpers")
 local case = helpers.case
 local idx = helpers.idx
+local idx_with_meta = helpers.idx_with_meta
 local has = helpers.has
+local lacks = helpers.lacks
 
 case("c_all_sections", function()
   local src = [==[
@@ -216,6 +218,37 @@ void process(const char *input, size_t len);
       "void process(const char *input, size_t len)",
     })
   end
+end)
+
+case("c_struct_fields_are_plain_children", function()
+  local src = [==[
+struct Config {
+    int port;
+    char *host;
+    int timeout;
+};
+]==]
+  local text, meta = idx_with_meta(src, "c")
+  helpers.assert_fields_no_ranged_meta(text, meta, "struct Config", { "int port", "int timeout" })
+end)
+
+case("c_many_fields_truncated_dim_meta", function()
+  local src = [==[
+struct Big {
+    int a;
+    int b;
+    int c;
+    int d;
+    int e;
+    int f;
+    int g;
+    int h;
+    int i;
+    int j;
+};
+]==]
+  local text, meta = idx_with_meta(src, "c")
+  helpers.assert_truncated_dim(text, meta)
 end)
 
 case("c_single_include_pragma", function()

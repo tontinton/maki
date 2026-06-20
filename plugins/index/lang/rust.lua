@@ -13,6 +13,7 @@ return function(U)
   local FIELD_TRUNCATE_THRESHOLD = U.FIELD_TRUNCATE_THRESHOLD
   local CHILD_BRIEF = U.CHILD_BRIEF
   local prefixed = U.prefixed
+  local ranged = U.ranged
 
   local function vis_prefix(node, source)
     for _, child in ipairs(node:children()) do
@@ -102,9 +103,9 @@ return function(U)
           local lr = format_range(line_start(child), line_end(child))
           if include_vis then
             local v = vis_prefix(child, source)
-            methods[#methods + 1] = prefixed(v, sig) .. " " .. lr
+            methods[#methods + 1] = ranged(prefixed(v, sig), lr)
           else
-            methods[#methods + 1] = sig .. " " .. lr
+            methods[#methods + 1] = ranged(sig, lr)
           end
         end
       end

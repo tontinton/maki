@@ -11,6 +11,7 @@ return function(U)
   local format_range = U.format_range
   local line_start = U.line_start
   local line_end = U.line_end
+  local ranged = U.ranged
 
   local function modifiers_text(node, source)
     local mods = find_child(node, "modifiers")
@@ -153,13 +154,13 @@ return function(U)
         end
         local lr = format_range(line_start(child), line_end(child))
         if #cases > 0 then
-          children[#children + 1] = table.concat(cases, ", ") .. " " .. lr
+          children[#children + 1] = ranged(table.concat(cases, ", "), lr)
         end
       elseif ckind == "function_declaration" then
         local sig = swift_fn_signature(child, source)
         if sig then
           local lr = format_range(line_start(child), line_end(child))
-          children[#children + 1] = sig .. " " .. lr
+          children[#children + 1] = ranged(sig, lr)
         end
       end
     end

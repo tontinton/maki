@@ -1,6 +1,7 @@
 local helpers = require("tests.helpers")
 local case = helpers.case
 local idx = helpers.idx
+local idx_with_meta = helpers.idx_with_meta
 local has = helpers.has
 
 case("ts_all_sections", function()
@@ -41,4 +42,15 @@ export function handler(req: Request): Response { return new Response(); }
     "fns:",
     "export handler(req: Request)",
   })
+end)
+
+case("ts_class_members_have_ranged_meta", function()
+  local src = [==[export class Router {
+    private routes: Map<string, Function>;
+    add(path: string, handler: Function): void { this.routes.set(path, handler); }
+    match(url: string): Function | null { return this.routes.get(url) || null; }
+}
+]==]
+  local text, meta = idx_with_meta(src, "typescript")
+  helpers.assert_ranged_meta(text, meta, { "add(", "match(" })
 end)

@@ -1,6 +1,7 @@
 local helpers = require("tests.helpers")
 local case = helpers.case
 local idx = helpers.idx
+local idx_with_meta = helpers.idx_with_meta
 local has = helpers.has
 
 case("elixir_all_sections", function()
@@ -51,4 +52,20 @@ end
     "fns:",
     "handle_event(event, state)",
   })
+end)
+
+case("elixir_module_methods_have_ranged_meta", function()
+  local src = [==[
+defmodule Calculator do
+  def add(a, b) do
+    a + b
+  end
+
+  defp validate(x) do
+    x > 0
+  end
+end
+]==]
+  local text, meta = idx_with_meta(src, "elixir")
+  helpers.assert_ranged_meta(text, meta, { "add", "validate" })
 end)

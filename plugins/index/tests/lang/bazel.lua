@@ -1,6 +1,7 @@
 local helpers = require("tests.helpers")
 local case = helpers.case
 local idx = helpers.idx
+local idx_with_meta = helpers.idx_with_meta
 local has = helpers.has
 local lacks = helpers.lacks
 
@@ -411,15 +412,17 @@ loads:
 
 variable bindings:
   __MAX_ITERATIONS__ = 2 << 31 - 2 [22]
-  _BRACKETS = {
-    "close": {
-        "dict": "}",
-        "li[truncated] [24-35]
+  _BRACKETS = { [24-35]
+      "close": {
+          "dict": "}",
+          "li
+  [truncated]
   _FN_SENTINEL = "__starlark_fn__" [37]
   _FN_ARGS = "__starlark_fn_args__" [38]
-  foobar = struct(
-    bar = _bar,
-    lbar = lambda arg, **[truncated] [66-73]
+  foobar = struct( [66-73]
+      bar = _bar,
+      lbar = lambda arg, **
+  [truncated]
 
 functions:
   _foo(s) [40-41]
@@ -927,4 +930,76 @@ case("bazel_module_inline_comment_in_bazel_dep", function()
   local out = idx(src, "bazel_module")
   has(out, { '"@protobuf": "31.1"' })
   lacks(out, { "use latest version" })
+end)
+
+case("bazel_ranges_at_end_of_line", function()
+  local src = [==[
+cc_library(
+    name = "foo",
+    srcs = ["a.cc", "b.cc"],
+    deps = [
+        "//lib:bar",
+        "//lib:baz",
+    ],
+)
+
+FOO = 42]==]
+  local out = idx(src, "bazel_build")
+  local lines = helpers.split_lines(out)
+  for _, line in ipairs(lines) do
+    if line:find("foo: cc_library", 1, true) then
+      assert(line:find("%[%d+%-%d+%]$"), "multiline range not at end: " .. line)
+    end
+    if line:find("FOO: 42", 1, true) then
+      assert(line:match("%[%d+%]$"), "single-line range not at end: " .. line)
+    end
+  end
+end)
+
+case("bazel_multiline_continuation_indented", function()
+  local src = [==[
+MY_DICT = {
+    "key1": "val1",
+    "key2": "val2",
+}]==]
+  local out = idx(src, "bazel_bzl")
+  local lines = helpers.split_lines(out)
+  local in_binding = false
+  for _, line in ipairs(lines) do
+    if line:find("MY_DICT", 1, true) then
+      in_binding = true
+    elseif in_binding then
+      if line:find("%S") then
+        if line:find("MY_DICT", 1, true) or line:find("functions:", 1, true) or line:find("loads:", 1, true) then
+          break
+        end
+        assert(line:match("^%s"), "continuation line not indented: '" .. line .. "'")
+      end
+    end
+  end
+  assert(in_binding, "MY_DICT binding not found in output:\n" .. out)
+end)
+
+case("bazel_truncated_multiline_marker_on_own_line", function()
+  local src = [==[
+_BRACKETS = {
+    "close": {
+        "dict": "}",
+        "list": "]",
+        "tuple": ")",
+    },
+    "open": {
+        "dict": "{",
+        "list": "[",
+        "tuple": "(",
+    },
+}]==]
+  local out = idx(src, "bazel_bzl")
+  has(out, { "[truncated]" })
+  local lines = helpers.split_lines(out)
+  for _, line in ipairs(lines) do
+    if line:find("%[truncated%]") then
+      assert(line:match("^%s+%[truncated%]$"), "[truncated] not on its own indented line: '" .. line .. "'")
+    end
+  end
 end)

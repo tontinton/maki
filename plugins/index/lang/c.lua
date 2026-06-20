@@ -3,9 +3,6 @@ return function(U)
   local find_child = U.find_child
   local compact_ws = U.compact_ws
   local truncate = U.truncate
-  local format_range = U.format_range
-  local line_start = U.line_start
-  local line_end = U.line_end
   local new_entry = U.new_entry
   local new_import_entry = U.new_import_entry
   local SECTION = U.SECTION
@@ -65,8 +62,7 @@ return function(U)
   local function field_format(child, source)
     local raw = get_text(child, source)
     raw = raw:gsub(";%s*$", "")
-    local lr = format_range(line_start(child), line_end(child))
-    return compact_ws(raw):match("^%s*(.-)%s*$") .. " " .. lr
+    return compact_ws(raw):match("^%s*(.-)%s*$")
   end
 
   local function extract_struct(node, source)

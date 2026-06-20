@@ -9,7 +9,6 @@ local INDENT_WIDTH = 2
 
 return function(U)
   local format_range = U.format_range
-
   local R = {}
 
   local function render_lines(header_line, items, render_fn)
@@ -40,6 +39,14 @@ return function(U)
     return table.concat(fields, " ")
   end
 
+  local function join_line_range_first(text, line_range)
+    if not text:find("\n", 1, true) then
+      return join_line(text, line_range)
+    end
+    local first_nl = text:find("\n", 1, true)
+    return text:sub(1, first_nl - 1) .. " " .. line_range .. text:sub(first_nl)
+  end
+
   function R.append_section_if_present(sections, section)
     if section then
       sections[#sections + 1] = section
@@ -58,16 +65,29 @@ return function(U)
     return format_range(item.line_start, item.line_end)
   end
 
+  local function indent_continuation(text, prefix)
+    if not text:find("\n", 1, true) then
+      return text
+    end
+    return (text:gsub("\n", "\n" .. prefix))
+  end
+
   function R.item_line(value, line_range, opts)
     local indent_level = opts and opts.indent or DEFAULT_INDENT_LEVEL
+    local prefix = indent(indent_level)
 
-    return join_line(indent(indent_level) .. value, line_range)
+    return join_line_range_first(prefix .. indent_continuation(value, prefix), line_range)
   end
 
   function R.label_line(label, value, line_range, opts)
     local indent_level = opts and opts.indent or DEFAULT_INDENT_LEVEL
+    local prefix = indent(indent_level)
+    local text = prefix .. label .. ":"
+    if value and value ~= "" then
+      text = text .. " " .. indent_continuation(value, prefix)
+    end
 
-    return join_line(indent(indent_level) .. label .. ":", value, line_range)
+    return join_line_range_first(text, line_range)
   end
 
   function R.render_doc(kind, collected)

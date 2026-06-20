@@ -54,7 +54,7 @@ return function(U)
         local sig = class_member_sig(child, source)
         if sig then
           local lr = U.format_range(U.line_start(child), U.line_end(child))
-          methods[#methods + 1] = sig .. " " .. lr
+          methods[#methods + 1] = U.ranged(sig, lr)
         end
       elseif ckind == "public_field_definition" or ckind == "property_definition" then
         local counter = "field"
@@ -63,7 +63,7 @@ return function(U)
           local sig = class_member_sig(child, source)
           if sig then
             local lr = U.format_range(U.line_start(child), U.line_end(child))
-            methods[#methods + 1] = sig .. " " .. lr
+            methods[#methods + 1] = U.ranged(sig, lr)
           end
         end
       end

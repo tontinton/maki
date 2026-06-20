@@ -2,86 +2,108 @@ local indexer = require("indexer")
 local ToolView = require("maki.tool_view")
 local shorten_path = require("maki.shorten_path")
 
-local KEYWORDS = {
-  pub = true,
-  fn = true,
-  struct = true,
-  enum = true,
-  trait = true,
-  type = true,
-  impl = true,
-  mod = true,
-  const = true,
-  static = true,
-  async = true,
-  class = true,
-  interface = true,
-  export = true,
-  ["macro_rules!"] = true,
-}
+local TRUNCATED_SUFFIX = indexer.TRUNCATED_SUFFIX
+local TRUNCATED_INFIX = " more truncated]"
 
-local function extract_line_range(line)
-  local pos = line:find("%[%d[%d%-%,% ]*%]$")
-  if not pos or pos <= 1 then
-    return nil
+local function split_trailing_range(line)
+  local pos = line:find(" %[%d[%d%-,]*%]$")
+  if not pos then
+    return nil, nil
   end
-  return line:sub(1, pos - 1), line:sub(pos)
-end
-
-local function append_styled(view, line, style)
-  local text, range = extract_line_range(line)
-  if range then
-    view:append({ { text, style }, { range, "line_nr" } })
-  else
-    view:append({ { line, style } })
-  end
-end
-
-local function append_entry(view, line)
-  local indent = line:sub(1, 2) == "  " and "  " or ""
-  local content = line:sub(#indent + 1)
-
-  local spans = {}
-  if indent ~= "" then
-    spans[#spans + 1] = { indent }
-  end
-
-  for kw in pairs(KEYWORDS) do
-    local next_char = content:sub(#kw + 1, #kw + 1)
-    if content:sub(1, #kw) == kw and (next_char == " " or next_char == "(") then
-      spans[#spans + 1] = { kw, "keyword" }
-      content = content:sub(#kw + 1)
-      break
-    end
-  end
-
-  local text, range = extract_line_range(content)
-  if range then
-    spans[#spans + 1] = { text, "tool" }
-    spans[#spans + 1] = { range, "line_nr" }
-  else
-    spans[#spans + 1] = { content, "tool" }
-  end
-
-  view:append(spans)
+  return line:sub(1, pos - 1), line:sub(pos + 1)
 end
 
 local function is_section_header(line)
+  if line:sub(1, 1) == " " then
+    return false
+  end
   local trimmed = line:match("^(.-)%s*$")
-  return trimmed:sub(-1) == ":" or (trimmed:sub(-1) == "]" and trimmed:find(": %[") ~= nil)
+  if trimmed:sub(-1) == ":" then
+    return true
+  end
+  local body = split_trailing_range(trimmed)
+  return body ~= nil and body:sub(-1) == ":"
 end
 
-local function render_skeleton(view, text)
+local function infer_line_meta(line)
+  if line == "" then
+    return nil
+  end
+  if is_section_header(line) then
+    local body, range = split_trailing_range(line)
+    if range then
+      return { tag = "section", body = body .. " ", range = range }
+    end
+    return { tag = "section" }
+  end
+  if
+    line:sub(-#TRUNCATED_SUFFIX) == TRUNCATED_SUFFIX
+    or (line:match("^%s*%[") and line:sub(-#TRUNCATED_INFIX) == TRUNCATED_INFIX)
+  then
+    return { tag = "dim" }
+  end
+  local body, range = split_trailing_range(line)
+  if range then
+    return { body = body, range = range }
+  end
+  return nil
+end
+
+local function render_skeleton(view, text, meta)
   text = text:gsub("\n+$", "") .. "\n"
+  local hl_entries = {}
+  local line_nr = 0
   for line in text:gmatch("([^\n]*)\n") do
+    line_nr = line_nr + 1
+    local m = (meta and meta[line_nr]) or infer_line_meta(line)
     if line == "" then
       view:append("")
-    elseif is_section_header(line) then
-      append_styled(view, line, "section")
+    elseif m and m.tag == "section" then
+      if m.range then
+        view:append({ { m.body, "section" }, { m.range, "line_nr" } })
+      else
+        view:append({ { line, "section" } })
+      end
+    elseif m and m.tag == "dim" then
+      view:append({ { line, "dim" } })
+    elseif m and m.range then
+      view:append({ { m.body }, { " " }, { m.range, "line_nr" } })
+      hl_entries[#hl_entries + 1] = { idx = #view.all_lines, text = m.body, range = m.range }
     else
-      append_entry(view, line)
+      view:append({ { line } })
+      hl_entries[#hl_entries + 1] = { idx = #view.all_lines, text = line }
     end
   end
+  return hl_entries
+end
+
+local function apply_highlights(view, hl_entries, ext)
+  if #hl_entries == 0 then
+    return
+  end
+  local texts = {}
+  for _, e in ipairs(hl_entries) do
+    texts[#texts + 1] = e.text
+  end
+  local highlighted = maki.ui.highlight(table.concat(texts, "\n"), ext, { independent = true })
+  if not highlighted then
+    return
+  end
+  for i, e in ipairs(hl_entries) do
+    local hl_spans = highlighted[i]
+    if hl_spans then
+      local new_line = {}
+      for _, span in ipairs(hl_spans) do
+        new_line[#new_line + 1] = span
+      end
+      if e.range then
+        new_line[#new_line + 1] = { " " }
+        new_line[#new_line + 1] = { e.range, "line_nr" }
+      end
+      view:update_line(e.idx, new_line)
+    end
+  end
+  view:flush()
 end
 
 local function render_header(path, line_count)
@@ -94,7 +116,7 @@ local function render_header(path, line_count)
   return buf
 end
 
-local function render_index(skeleton, path, ctx)
+local function render_index(skeleton, path, ctx, ext, line_meta)
   local tol = ctx:tool_output_lines()
   local buf = maki.ui.buf()
   local view = ToolView.new(buf, {
@@ -104,8 +126,15 @@ local function render_index(skeleton, path, ctx)
   buf:on("click", function()
     view:toggle()
   end)
-  render_skeleton(view, skeleton)
+  local hl_entries = render_skeleton(view, skeleton, line_meta)
   view:finish()
+
+  if ext then
+    maki.async.run(function()
+      apply_highlights(view, hl_entries, ext)
+    end)
+  end
+
   local line_count = select(2, skeleton:gsub("\n", "\n")) + 1
   return buf, render_header(path, line_count)
 end
@@ -140,7 +169,8 @@ Return a compact overview of a source file: imports, type definitions, function 
     return render_header(input.path)
   end,
   restore = function(input, output, _is_error, ctx)
-    local buf, header = render_index(output, input.path, ctx)
+    local ext = input.path:match("%.([^%.]+)$") or ""
+    local buf, header = render_index(output, input.path, ctx, ext)
     return { body = buf, header = header }
   end,
   handler = function(input, ctx)
@@ -174,7 +204,7 @@ Return a compact overview of a source file: imports, type definitions, function 
 
     local config = ctx:config()
     local max_file_size = (config and config.index_max_file_size) or (2 * 1024 * 1024)
-    if meta_ok and meta.size > max_file_size then
+    if meta and meta.size > max_file_size then
       return "error: File too large ("
         .. meta.size
         .. " bytes, max "
@@ -187,12 +217,13 @@ Return a compact overview of a source file: imports, type definitions, function 
       return "error: " .. err
     end
 
-    local skeleton, err = indexer.index_source(source, lang)
+    local skeleton, line_meta = indexer.index_source(source, lang)
     if not skeleton then
-      return "error: " .. tostring(err)
+      return "error: " .. tostring(line_meta)
     end
 
-    local buf, header = render_index(skeleton, path, ctx)
+    local ext = indexer.LANG_TO_EXT[lang] or path:match("%.([^%.]+)$") or ""
+    local buf, header = render_index(skeleton, path, ctx, ext, line_meta)
     return {
       llm_output = skeleton:gsub("\n+$", ""),
       body = buf,

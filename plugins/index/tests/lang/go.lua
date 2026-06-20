@@ -1,6 +1,7 @@
 local helpers = require("tests.helpers")
 local case = helpers.case
 local idx = helpers.idx
+local idx_with_meta = helpers.idx_with_meta
 local has = helpers.has
 
 case("go_all_sections", function()
@@ -63,4 +64,18 @@ func main() {
     "fns:",
     "main()",
   })
+end)
+
+case("go_interface_methods_have_ranged_meta", function()
+  local src = [==[
+package main
+
+type Storage interface {
+	Get(key string) (string, error)
+	Set(key string, value string) error
+	Delete(key string) error
+}
+]==]
+  local text, meta = idx_with_meta(src, "go")
+  helpers.assert_ranged_meta(text, meta, { "Get(key", "Set(key", "Delete(key" })
 end)

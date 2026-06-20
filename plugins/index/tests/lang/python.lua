@@ -1,6 +1,7 @@
 local helpers = require("tests.helpers")
 local case = helpers.case
 local idx = helpers.idx
+local idx_with_meta = helpers.idx_with_meta
 local has = helpers.has
 
 case("python_all_sections", function()
@@ -44,4 +45,17 @@ def process(data: list) -> dict:
     "fns:",
     "process(data: list) -> dict",
   })
+end)
+
+case("python_class_methods_have_ranged_meta", function()
+  local src = [==[class Repo:
+    def connect(self, url: str) -> None:
+        pass
+    def fetch(self, id: int) -> dict:
+        return {}
+    def close(self) -> None:
+        pass
+]==]
+  local text, meta = idx_with_meta(src, "python")
+  helpers.assert_ranged_meta(text, meta, { "connect(", "fetch(", "close(" })
 end)

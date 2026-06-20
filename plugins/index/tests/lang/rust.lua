@@ -1,6 +1,7 @@
 local helpers = require("tests.helpers")
 local case = helpers.case
 local idx = helpers.idx
+local idx_with_meta = helpers.idx_with_meta
 local has = helpers.has
 local lacks = helpers.lacks
 
@@ -86,12 +87,35 @@ macro_rules! my_macro { () => {}; }
   })
 end)
 
-case("rust_many_fields_truncated", function()
-  local out = idx(
-    "struct Big {\n    a: u8,\n    b: u8,\n    c: u8,\n    d: u8,\n    e: u8,\n    f: u8,\n    g: u8,\n    h: u8,\n    i: u8,\n    j: u8,\n}\n",
-    "rust"
-  )
-  has(out, { "[2 more truncated]" })
+case("rust_truncated_children_tagged_dim", function()
+  local src = "struct Big {\n"
+  for i = 1, 10 do
+    src = src .. "    f" .. i .. ": u8,\n"
+  end
+  src = src .. "}\n"
+  local text, meta = idx_with_meta(src, "rust")
+  has(text, { "[2 more truncated]" })
+  helpers.assert_truncated_dim(text, meta)
+end)
+
+case("rust_struct_fields_no_ranged_meta", function()
+  local src = "pub struct Point {\n    pub x: f64,\n    pub y: f64,\n    pub z: f64,\n}\n"
+  local text, meta = idx_with_meta(src, "rust")
+  helpers.assert_fields_no_ranged_meta(text, meta, "pub struct Point", { "pub x:", "pub y:", "pub z:" })
+end)
+
+case("rust_impl_methods_have_ranged_meta", function()
+  local src = [[
+pub struct Widget;
+
+impl Widget {
+    pub fn new() -> Self { Widget }
+    pub fn render(&self) -> String { String::new() }
+    fn internal(&mut self, flag: bool) {}
+}
+]]
+  local text, meta = idx_with_meta(src, "rust")
+  helpers.assert_ranged_meta(text, meta, { "pub new()", "pub render(&self)", "internal(&mut self" })
 end)
 
 case("rust_test_module_collapsed", function()

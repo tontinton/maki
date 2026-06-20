@@ -5,6 +5,7 @@
 -- existing file as a template) and adding a require line below — keep them
 -- alphabetized. Each spec uses the shared `case` helper from tests/helpers.lua,
 -- which collects failures so a single broken case does not abort the suite.
+require("tests.indexer_core")
 require("tests.lang.bash")
 require("tests.lang.bazel")
 require("tests.lang.c")

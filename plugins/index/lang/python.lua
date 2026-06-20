@@ -8,6 +8,7 @@ return function(U)
   local truncate = U.truncate
   local new_entry = U.new_entry
   local new_import_entry = U.new_import_entry
+  local ranged = U.ranged
   local SECTION = U.SECTION
 
   local function is_module_doc(node, source)
@@ -87,7 +88,7 @@ return function(U)
             end
           end
         end
-        methods[#methods + 1] = compact_ws(fn_name .. params .. ret_str .. " " .. lr)
+        methods[#methods + 1] = ranged(compact_ws(fn_name .. params .. ret_str), lr)
       end
     end
     local entry = new_entry(SECTION.Class, node, name)

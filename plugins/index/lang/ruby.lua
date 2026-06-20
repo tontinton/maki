@@ -7,6 +7,7 @@ return function(U)
   local line_end = U.line_end
   local new_entry = U.new_entry
   local new_import_entry = U.new_import_entry
+  local ranged = U.ranged
   local truncate = U.truncate
   local SECTION = U.SECTION
 
@@ -74,7 +75,7 @@ return function(U)
           sig = inner and ("self." .. inner) or nil
         end
         if sig then
-          methods[#methods + 1] = sig .. " " .. format_range(line_start(child), line_end(child))
+          methods[#methods + 1] = ranged(sig, format_range(line_start(child), line_end(child)))
         end
       end
     end

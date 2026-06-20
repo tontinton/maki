@@ -11,6 +11,7 @@ return function(U)
   local FIELD_TRUNCATE_THRESHOLD = U.FIELD_TRUNCATE_THRESHOLD
   local CHILD_BRIEF = U.CHILD_BRIEF
   local truncated_msg = U.truncated_msg
+  local ranged = U.ranged
 
   local function modifiers_text(node, source)
     local mods = find_child(node, "modifiers")
@@ -130,7 +131,7 @@ return function(U)
         local sig = fn_sig(child, source)
         if sig then
           local lr = format_range(line_start(child), line_end(child))
-          members[#members + 1] = sig .. " " .. lr
+          members[#members + 1] = ranged(sig, lr)
         end
       elseif ck == "property_declaration" then
         prop_count = prop_count + 1
@@ -138,7 +139,7 @@ return function(U)
           local text = property_text(child, source)
           if text then
             local lr = format_range(line_start(child), line_end(child))
-            members[#members + 1] = text .. " " .. lr
+            members[#members + 1] = ranged(text, lr)
           end
         end
       elseif ck == "companion_object" then

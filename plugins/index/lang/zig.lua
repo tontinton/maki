@@ -1,9 +1,6 @@
 return function(U)
   local get_text = U.get_text
   local find_child = U.find_child
-  local format_range = U.format_range
-  local line_start = U.line_start
-  local line_end = U.line_end
   local new_entry = U.new_entry
   local new_import_entry = U.new_import_entry
   local compact_ws = U.compact_ws
@@ -105,8 +102,7 @@ return function(U)
       local fname = field_name_node and get_text(field_name_node, src) or "_"
       local ftype = field_type_node and get_text(field_type_node, src) or ""
       local text = ftype ~= "" and (fname .. ": " .. ftype) or fname
-      local lr = format_range(line_start(f), line_end(f))
-      return text .. " " .. lr
+      return text
     end)
     return entry
   end

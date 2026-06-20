@@ -9,6 +9,7 @@ return function(U)
   local new_import_entry = U.new_import_entry
   local truncate = U.truncate
   local extract_fields_truncated = U.extract_fields_truncated
+  local ranged = U.ranged
   local SECTION = U.SECTION
 
   local function strip_quotes(s)
@@ -113,11 +114,11 @@ return function(U)
                     local mname = get_text(mname_node, source)
                     local msig = mname .. params_result(m, source)
                     local lr = format_range(line_start(m), line_end(m))
-                    members[#members + 1] = compact_ws(msig) .. " " .. lr
+                    members[#members + 1] = ranged(compact_ws(msig), lr)
                   end
                 elseif mkind == "type_elem" then
                   local lr = format_range(line_start(m), line_end(m))
-                  members[#members + 1] = truncate(get_text(m, source), 60) .. " " .. lr
+                  members[#members + 1] = ranged(truncate(get_text(m, source), 60), lr)
                 end
               end
               entry.children = members

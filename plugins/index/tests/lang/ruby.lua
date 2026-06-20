@@ -1,6 +1,7 @@
 local helpers = require("tests.helpers")
 local case = helpers.case
 local idx = helpers.idx
+local idx_with_meta = helpers.idx_with_meta
 local has = helpers.has
 
 case("ruby_all_sections", function()
@@ -63,4 +64,19 @@ end
     "fns:",
     "standalone(x, y)",
   })
+end)
+
+case("ruby_class_methods_have_ranged_meta", function()
+  local src = [==[
+class Greeter
+  def hello(name)
+    puts name
+  end
+  def goodbye(name)
+    puts name
+  end
+end
+]==]
+  local text, meta = idx_with_meta(src, "ruby")
+  helpers.assert_ranged_meta(text, meta, { "hello", "goodbye" })
 end)
