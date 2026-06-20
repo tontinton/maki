@@ -630,6 +630,9 @@ impl App {
                 ModelPickerAction::AssignTier(spec, tier) => {
                     vec![Action::AssignTier(spec, tier)]
                 }
+                ModelPickerAction::UnassignTier(spec, tier) => {
+                    vec![Action::UnassignTier(spec, tier)]
+                }
                 ModelPickerAction::Close => vec![],
             });
         }

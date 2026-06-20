@@ -196,6 +196,7 @@ pub enum Action {
         slug: String,
     },
     AssignTier(String, ModelTier),
+    UnassignTier(String, ModelTier),
     RefreshModels,
     Compact,
     ToggleMcp(String, bool),

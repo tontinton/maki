@@ -36,6 +36,15 @@ pub fn set_and_persist(spec: String, tier: ModelTier, dir: &StateDir) {
     write_overrides(dir.path().join(TIERS_FILE).as_path(), &snapshot);
 }
 
+pub fn unset_and_persist(spec: &str, tier: ModelTier, dir: &StateDir) {
+    let snapshot = {
+        let mut map = tier_map().write().unwrap();
+        map.unset(spec, tier);
+        map.overrides.clone()
+    };
+    write_overrides(dir.path().join(TIERS_FILE).as_path(), &snapshot);
+}
+
 #[derive(Debug, Default)]
 pub struct TierMap {
     /// Keyed by tier (not spec) so inserting a model automatically evicts the
@@ -56,6 +65,16 @@ impl TierMap {
 
     pub fn set(&mut self, spec: String, tier: ModelTier) {
         self.overrides.insert(tier, spec);
+    }
+
+    pub fn unset(&mut self, spec: &str, tier: ModelTier) {
+        if self.overrides.get(&tier).map(String::as_str) == Some(spec) {
+            self.overrides.remove(&tier);
+        }
+    }
+
+    pub fn has_override(&self, spec: &str, tier: ModelTier) -> bool {
+        self.overrides.get(&tier).map(String::as_str) == Some(spec)
     }
 
     pub fn tier_for(
@@ -272,6 +291,34 @@ mod tests {
             std::fs::write(&path, bad).unwrap();
             assert!(read_overrides(&path).is_empty());
         }
+    }
+
+    #[test]
+    fn unset_removes_matching_override() {
+        let mut map = make_map(&[(ModelTier::Strong, "ollama/a")], &[]);
+        map.unset("ollama/a", ModelTier::Strong);
+        assert!(!map.has_override("ollama/a", ModelTier::Strong));
+        assert!(map.overrides.is_empty());
+    }
+
+    #[test]
+    fn unset_ignores_mismatched_spec() {
+        let mut map = make_map(&[(ModelTier::Strong, "ollama/a")], &[]);
+        map.unset("ollama/b", ModelTier::Strong);
+        assert!(map.has_override("ollama/a", ModelTier::Strong));
+    }
+
+    #[test]
+    fn unset_ignores_mismatched_tier() {
+        let mut map = make_map(&[(ModelTier::Strong, "ollama/a")], &[]);
+        map.unset("ollama/a", ModelTier::Weak);
+        assert!(map.has_override("ollama/a", ModelTier::Strong));
+    }
+
+    #[test]
+    fn has_override_returns_false_for_no_override() {
+        let map = make_map(&[], &[]);
+        assert!(!map.has_override("ollama/a", ModelTier::Strong));
     }
 
     #[test]

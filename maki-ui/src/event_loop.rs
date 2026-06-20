@@ -463,6 +463,9 @@ impl<'t> EventLoop<'t> {
             Action::AssignTier(spec, tier) => {
                 maki_providers::tier_map::set_and_persist(spec, tier, &self.app.storage);
             }
+            Action::UnassignTier(spec, tier) => {
+                maki_providers::tier_map::unset_and_persist(&spec, tier, &self.app.storage);
+            }
             Action::Compact => {
                 self.handles.queue.push(QueueItem::Compact {
                     run_id: self.app.run_id,

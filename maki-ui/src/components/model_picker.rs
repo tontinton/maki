@@ -51,6 +51,7 @@ pub enum ModelPickerAction {
     Consumed,
     Select(String),
     AssignTier(String, ModelTier),
+    UnassignTier(String, ModelTier),
     Close,
 }
 
@@ -59,7 +60,7 @@ struct ModelEntry {
     id: String,
     provider_display: String,
     tier: String,
-    tier_override: bool,
+    override_tiers: Vec<ModelTier>,
 }
 
 impl PickerItem for ModelEntry {
@@ -76,7 +77,7 @@ impl PickerItem for ModelEntry {
     }
 
     fn is_highlighted(&self) -> bool {
-        self.tier_override
+        !self.override_tiers.is_empty()
     }
 }
 
@@ -157,6 +158,9 @@ impl ModelPicker {
         {
             let spec = entry.spec.clone();
             self.dirty = true;
+            if entry.override_tiers.contains(&tier) {
+                return ModelPickerAction::UnassignTier(spec, tier);
+            }
             return ModelPickerAction::AssignTier(spec, tier);
         }
         match self.picker.handle_key(key) {
@@ -196,11 +200,13 @@ fn parse_model_entry(spec: &str) -> Option<ModelEntry> {
         maki_config::providers::resolve_display_name(provider_str, config.get(provider_str))
     };
 
-    let override_label = tier_map::tier_map()
-        .read()
-        .unwrap()
-        .override_tier_label(spec);
-    let tier_override = override_label.is_some();
+    let map = tier_map::tier_map().read().unwrap();
+    let override_tiers: Vec<ModelTier> = [ModelTier::Strong, ModelTier::Medium, ModelTier::Weak]
+        .into_iter()
+        .filter(|&t| map.has_override(spec, t))
+        .collect();
+    let override_label = map.override_tier_label(spec);
+    drop(map);
     let tier = override_label.unwrap_or_else(|| match maki_providers::Model::from_spec(spec) {
         Ok(m) => m.tier.to_string(),
         Err(_) => String::new(),
@@ -210,7 +216,7 @@ fn parse_model_entry(spec: &str) -> Option<ModelEntry> {
         id: model_id.to_string(),
         provider_display,
         tier,
-        tier_override,
+        override_tiers,
     })
 }
 
