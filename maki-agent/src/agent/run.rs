@@ -11,7 +11,7 @@ use super::history::{History, sanitize_cancelled_history};
 use super::instructions::LoadedInstructions;
 use super::streaming::stream_with_retry;
 use super::tool_dispatch::{self, RecentCalls};
-use crate::cancel::CancelToken;
+use crate::cancel::{CancelMap, CancelToken};
 use crate::mcp::McpHandle;
 use crate::permissions::PermissionManager;
 use crate::tools::{Deadline, FileReadTracker, ToolContext};
@@ -38,6 +38,7 @@ pub struct AgentParams {
     pub timeouts: maki_providers::Timeouts,
     pub file_tracker: Arc<FileReadTracker>,
     pub prompt_slots: Arc<crate::prompt::ResolvedSlots>,
+    pub subagent_cancels: Arc<CancelMap<String>>,
 }
 
 pub struct AgentRunParams<'h> {
@@ -74,6 +75,7 @@ pub struct Agent<'h> {
     timeouts: maki_providers::Timeouts,
     file_tracker: Arc<FileReadTracker>,
     prompt_slots: Arc<crate::prompt::ResolvedSlots>,
+    subagent_cancels: Arc<CancelMap<String>>,
 }
 
 impl<'h> Agent<'h> {
@@ -105,6 +107,7 @@ impl<'h> Agent<'h> {
             session_id: params.session_id,
             file_tracker: params.file_tracker,
             prompt_slots: params.prompt_slots,
+            subagent_cancels: params.subagent_cancels,
         }
     }
 
@@ -339,6 +342,7 @@ impl<'h> Agent<'h> {
             file_tracker: Arc::clone(&self.file_tracker),
             prompt_slots: Arc::clone(&self.prompt_slots),
             opts: self.opts,
+            subagent_cancels: Arc::clone(&self.subagent_cancels),
         }
     }
 
@@ -510,6 +514,7 @@ mod tests {
                 timeouts: maki_providers::Timeouts::default(),
                 file_tracker: FileReadTracker::fresh(),
                 prompt_slots: Arc::new(crate::prompt::ResolvedSlots::default()),
+                subagent_cancels: Arc::new(crate::cancel::CancelMap::new()),
             },
             AgentRunParams {
                 history,
@@ -765,6 +770,7 @@ mod tests {
                     timeouts: maki_providers::Timeouts::default(),
                     file_tracker: FileReadTracker::fresh(),
                     prompt_slots: Arc::new(crate::prompt::ResolvedSlots::default()),
+                    subagent_cancels: Arc::new(crate::cancel::CancelMap::new()),
                 },
                 AgentRunParams {
                     history: &mut history,

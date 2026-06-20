@@ -688,6 +688,17 @@ impl App {
         if !self.is_main_chat() {
             return match key.code {
                 KeyCode::Tab if !self.is_bash_input() => self.toggle_mode(),
+                KeyCode::Esc if !self.chats[self.active_chat].is_finished() => {
+                    if let Some(t) = self.last_esc.take()
+                        && t.elapsed() < self.status_bar.flash_duration
+                    {
+                        self.handle_subagent_cancel()
+                    } else {
+                        self.last_esc = Some(Instant::now());
+                        self.status_bar.flash(FLASH_CANCEL.into());
+                        vec![]
+                    }
+                }
                 _ => vec![],
             };
         }
@@ -873,6 +884,25 @@ impl App {
         vec![Action::CancelAgent {
             run_id: cancelled_run,
         }]
+    }
+
+    fn handle_subagent_cancel(&mut self) -> Vec<Action> {
+        let tool_use_id = self
+            .chat_index
+            .iter()
+            .find(|&(_, &idx)| idx == self.active_chat)
+            .map(|(id, _)| id.clone());
+
+        let Some(tool_use_id) = tool_use_id else {
+            return vec![];
+        };
+
+        self.chats[self.active_chat].flush();
+        self.chats[self.active_chat].cancel_in_progress();
+        self.chats[self.active_chat].mark_finished(DisplayRole::Error, CANCELLED_TEXT);
+        self.subagent_answers.remove(&tool_use_id);
+
+        vec![Action::CancelSubagent { tool_use_id }]
     }
 
     fn handle_agent_event(&mut self, envelope: Envelope) -> Vec<Action> {

@@ -13,12 +13,12 @@ use arc_swap::ArcSwap;
 use maki_agent::mcp;
 use maki_agent::permissions::PermissionManager;
 use maki_agent::{
-    AgentConfig, CancelToken, Envelope, McpCommand, McpConfigErrors, McpHandle, McpSnapshotReader,
-    ToolOutput, ToolOutputLines,
+    AgentConfig, CancelMap, CancelToken, Envelope, McpCommand, McpConfigErrors, McpHandle,
+    McpSnapshotReader, ToolOutput, ToolOutputLines,
 };
 use maki_lua::EventHandle;
 
-use self::cancel_map::CancelMap;
+use self::cancel_map::new_run_cancel_map;
 use maki_providers::provider::Provider;
 use maki_providers::{Message, Model};
 use tracing::{info, warn};
@@ -37,6 +37,7 @@ pub(crate) struct ModelSlot {
 pub(crate) enum AgentCommand {
     Cancel { run_id: u64 },
     CancelAll,
+    CancelSubagent { tool_use_id: String },
 }
 
 pub(crate) struct AgentHandles {
@@ -204,9 +205,14 @@ fn spawn_agent_internal(
     let shared_tool_outputs: Arc<Mutex<HashMap<String, ToolOutput>>> =
         Arc::new(Mutex::new(HashMap::new()));
     let (init_trigger, init_cancel) = CancelToken::new();
-    let cancel_map = Arc::new(Mutex::new(CancelMap::new(0, init_trigger)));
+    let cancel_map = Arc::new(new_run_cancel_map(0, init_trigger));
+    let subagent_cancels: Arc<CancelMap<String>> = Arc::new(CancelMap::new());
 
-    spawn_command_router(cmd_rx, Arc::clone(&cancel_map));
+    spawn_command_router(
+        cmd_rx,
+        Arc::clone(&cancel_map),
+        Arc::clone(&subagent_cancels),
+    );
 
     let agent_loop = AgentLoop::new(
         Arc::clone(model_slot),
@@ -225,6 +231,7 @@ fn spawn_agent_internal(
         session_id,
         timeouts,
         lua_handle,
+        subagent_cancels,
     );
 
     let task = smol::spawn(agent_loop.run());

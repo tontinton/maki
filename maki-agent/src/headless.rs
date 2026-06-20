@@ -14,7 +14,7 @@ use serde_json::Value;
 use tracing::{error, warn};
 
 use crate::agent::{self, History};
-use crate::cancel::CancelToken;
+use crate::cancel::{CancelMap, CancelToken};
 use crate::permissions::PermissionManager;
 use crate::prompt::ResolvedSlots;
 use crate::template;
@@ -184,6 +184,7 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
                     timeouts: params.timeouts,
                     file_tracker: FileReadTracker::fresh(),
                     prompt_slots: Arc::new(params.prompt_slots),
+                    subagent_cancels: Arc::new(CancelMap::new()),
                 },
                 AgentRunParams {
                     history: &mut history,
@@ -376,6 +377,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                         timeouts: params.timeouts,
                         file_tracker: Arc::clone(&file_tracker),
                         prompt_slots: Arc::clone(&params.prompt_slots),
+                        subagent_cancels: Arc::new(CancelMap::new()),
                     },
                     AgentRunParams {
                         history: &mut history,

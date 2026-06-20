@@ -189,6 +189,9 @@ pub enum Action {
     CancelAgent {
         run_id: u64,
     },
+    CancelSubagent {
+        tool_use_id: String,
+    },
     NewSession,
     LoadSession(Box<LoadedSession>),
     ChangeModel(String),

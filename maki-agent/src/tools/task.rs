@@ -154,6 +154,11 @@ impl Task {
         .detach();
 
         let (child_trigger, child_cancel) = ctx.cancel.child();
+        if let Some(ref id) = ctx.tool_use_id {
+            ctx.subagent_cancels.insert(id.clone(), child_trigger);
+        } else {
+            drop(child_trigger);
+        }
         let input = AgentInput {
             message: self.prompt.clone(),
             mode: AgentMode::Build,
@@ -174,6 +179,7 @@ impl Task {
                 timeouts: ctx.timeouts,
                 file_tracker: FileReadTracker::fresh(),
                 prompt_slots: Arc::clone(&ctx.prompt_slots),
+                subagent_cancels: Arc::new(crate::cancel::CancelMap::new()),
             },
             AgentRunParams {
                 history: &mut history,
@@ -189,7 +195,9 @@ impl Task {
         let result = agent.run(input).await;
         let duration_ms = start.elapsed().as_millis() as u64;
         drop(agent);
-        drop(child_trigger);
+        if let Some(ref id) = ctx.tool_use_id {
+            ctx.subagent_cancels.remove(id);
+        }
         let success = result.is_ok();
         info!(description = %self.description, duration_ms, success, "subagent completed");
         result.map_err(|e| format!("sub-agent error: {e}"))?;

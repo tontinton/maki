@@ -37,7 +37,7 @@ use serde_json::Value;
 use tracing::warn;
 
 use crate::agent::LoadedInstructions;
-use crate::cancel::CancelToken;
+use crate::cancel::{CancelMap, CancelToken};
 use crate::mcp::McpHandle;
 use crate::permissions::PermissionManager;
 use crate::{AgentConfig, AgentMode, EventSender};
@@ -195,6 +195,7 @@ pub struct ToolContext {
     pub file_tracker: Arc<FileReadTracker>,
     pub prompt_slots: Arc<crate::prompt::ResolvedSlots>,
     pub opts: RequestOptions,
+    pub subagent_cancels: Arc<CancelMap<String>>,
 }
 
 pub(crate) fn resolve_path(path: &str) -> Result<String, String> {
@@ -607,6 +608,7 @@ pub(crate) fn interpreter_ctx(
         file_tracker,
         prompt_slots: Arc::new(crate::prompt::ResolvedSlots::default()),
         opts: RequestOptions::default(),
+        subagent_cancels: Arc::new(CancelMap::new()),
     }
 }
 

@@ -2563,3 +2563,105 @@ fn permission_prompt_takes_bottom_precedence_over_below_split() {
         "the prompt must leave an above split untouched",
     );
 }
+
+fn app_with_active_subagent() -> App {
+    let mut app = app_with_subagent();
+    app.update(Msg::Key(kb::NEXT_CHAT.to_key_event()));
+    assert_eq!(app.active_chat, 1);
+    app
+}
+
+#[test]
+fn double_esc_in_subagent_cancels_subagent() {
+    let mut app = app_with_active_subagent();
+    app.last_esc = Some(Instant::now());
+    let actions = app.update(Msg::Key(key(KeyCode::Esc)));
+    assert_eq!(actions.len(), 1);
+    assert!(matches!(
+        &actions[0],
+        Action::CancelSubagent { tool_use_id } if tool_use_id == "task1"
+    ));
+    assert!(app.chats[1].is_finished());
+    assert_eq!(app.chats[1].last_message_text(), CANCELLED_TEXT);
+}
+
+#[test]
+fn single_or_stale_esc_in_subagent_flashes() {
+    let mut app = app_with_active_subagent();
+    let actions = app.update(Msg::Key(key(KeyCode::Esc)));
+    assert!(actions.is_empty());
+    assert_eq!(app.status_bar.flash_text().unwrap(), FLASH_CANCEL);
+
+    app.last_esc = Some(Instant::now().checked_sub(Duration::from_secs(10)).unwrap());
+    let actions = app.update(Msg::Key(key(KeyCode::Esc)));
+    assert!(actions.is_empty());
+    assert!(!app.chats[1].is_finished());
+}
+
+#[test]
+fn esc_in_main_chat_with_active_subagent_no_cancel() {
+    let mut app = app_with_subagent();
+    assert_eq!(app.active_chat, 0);
+    app.last_esc = Some(Instant::now());
+    let actions = app.update(Msg::Key(key(KeyCode::Esc)));
+    assert_eq!(actions.len(), 1);
+    assert!(matches!(&actions[0], Action::CancelAgent { .. }));
+    assert!(!matches!(&actions[0], Action::CancelSubagent { .. }));
+}
+
+#[test]
+fn cancel_subagent_removes_answer_sender() {
+    let (mut app, _sub_rx, _main_rx) = app_with_subagent_tx("task1");
+    assert!(!app.subagent_answers.is_empty());
+    app.update(Msg::Key(kb::NEXT_CHAT.to_key_event()));
+    assert_eq!(app.active_chat, 1);
+    app.last_esc = Some(Instant::now());
+    app.update(Msg::Key(key(KeyCode::Esc)));
+    assert!(!app.subagent_answers.contains_key("task1"));
+}
+
+#[test]
+fn multiple_subagents_cancel_one_other_unaffected() {
+    let mut app = app_with_subagent_id("task1");
+    app.update(subagent_msg(
+        AgentEvent::TextDelta { text: "y".into() },
+        "task2",
+        Some("build"),
+    ));
+    assert_eq!(app.chats.len(), 3);
+
+    app.active_chat = *app.chat_index.get("task2").unwrap();
+    app.last_esc = Some(Instant::now());
+    let actions = app.update(Msg::Key(key(KeyCode::Esc)));
+
+    assert_eq!(actions.len(), 1);
+    assert!(matches!(
+        &actions[0],
+        Action::CancelSubagent { tool_use_id } if tool_use_id == "task2"
+    ));
+    let task1_idx = *app.chat_index.get("task1").unwrap();
+    assert!(!app.chats[task1_idx].is_finished());
+    assert!(app.chats[app.active_chat].is_finished());
+}
+
+#[test]
+fn double_esc_in_finished_subagent_noop() {
+    let mut app = app_with_active_subagent();
+    finish_subagent_task(&mut app, false);
+    app.last_esc = Some(Instant::now());
+    let actions = app.update(Msg::Key(key(KeyCode::Esc)));
+    assert!(actions.is_empty());
+}
+
+#[test]
+fn subagent_cancel_then_navigate_back_main_unaffected() {
+    let mut app = app_with_active_subagent();
+    app.last_esc = Some(Instant::now());
+    app.update(Msg::Key(key(KeyCode::Esc)));
+    assert!(app.chats[1].is_finished());
+
+    app.update(Msg::Key(kb::PREV_CHAT.to_key_event()));
+    assert_eq!(app.active_chat, 0);
+    assert_eq!(app.status, Status::Streaming);
+    assert!(!app.chats[0].is_finished());
+}

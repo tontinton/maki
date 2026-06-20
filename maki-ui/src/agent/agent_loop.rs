@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use maki_agent::agent;
@@ -9,9 +9,9 @@ use maki_agent::template;
 use maki_agent::template::Vars;
 use maki_agent::tools::{DescriptionContext, FileReadTracker, ToolFilter, ToolRegistry};
 use maki_agent::{
-    Agent, AgentConfig, AgentEvent, AgentInput, AgentParams, AgentRunParams, CancelToken,
-    CancelTrigger, Envelope, EventSender, History, Instructions, McpCommand, PromptRole,
-    ToolOutputLines,
+    Agent, AgentConfig, AgentEvent, AgentInput, AgentParams, AgentRunParams, CancelMap,
+    CancelToken, CancelTrigger, Envelope, EventSender, History, Instructions, McpCommand,
+    PromptRole, ToolOutputLines,
 };
 use maki_lua::EventHandle;
 use maki_providers::{AgentError, Message, Model, TokenUsage};
@@ -19,7 +19,7 @@ use serde_json::Value;
 use tracing::error;
 
 use super::ModelSlot;
-use super::cancel_map::CancelMap;
+use super::cancel_map::RunCancelMap;
 use super::shared_queue::{QueueItem, QueueReceiver};
 
 pub(super) struct AgentLoop {
@@ -32,7 +32,7 @@ pub(super) struct AgentLoop {
     mcp_handle: Option<McpHandle>,
     history: History,
     btw_system: Arc<ArcSwap<String>>,
-    cancel_map: Arc<Mutex<CancelMap>>,
+    cancel_map: Arc<RunCancelMap>,
     init_cancel: CancelToken,
     permissions: Arc<PermissionManager>,
     file_tracker: Arc<FileReadTracker>,
@@ -43,6 +43,7 @@ pub(super) struct AgentLoop {
     session_id: Option<String>,
     timeouts: maki_providers::Timeouts,
     lua_handle: Option<EventHandle>,
+    subagent_cancels: Arc<CancelMap<String>>,
 }
 
 impl AgentLoop {
@@ -59,11 +60,12 @@ impl AgentLoop {
         agent_tx: flume::Sender<Envelope>,
         answer_rx: flume::Receiver<String>,
         queue: Arc<QueueReceiver>,
-        cancel_map: Arc<Mutex<CancelMap>>,
+        cancel_map: Arc<RunCancelMap>,
         init_cancel: CancelToken,
         session_id: Option<String>,
         timeouts: maki_providers::Timeouts,
         lua_handle: Option<EventHandle>,
+        subagent_cancels: Arc<CancelMap<String>>,
     ) -> Self {
         Self {
             model_slot,
@@ -86,6 +88,7 @@ impl AgentLoop {
             session_id,
             timeouts,
             lua_handle,
+            subagent_cancels,
         }
     }
 
@@ -225,6 +228,7 @@ impl AgentLoop {
                 timeouts: self.timeouts,
                 file_tracker: Arc::clone(&self.file_tracker),
                 prompt_slots: Arc::new(prompt_slots),
+                subagent_cancels: Arc::clone(&self.subagent_cancels),
             },
             AgentRunParams {
                 history: &mut self.history,
@@ -284,17 +288,11 @@ impl AgentLoop {
     }
 
     fn set_cancel_trigger(&self, run_id: u64, trigger: CancelTrigger) {
-        self.cancel_map
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(run_id, trigger);
+        self.cancel_map.insert(run_id, trigger);
     }
 
     fn clear_cancel_trigger(&self, run_id: u64) {
-        self.cancel_map
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(run_id);
+        self.cancel_map.remove(&run_id);
     }
 
     fn emit_error(&self, run_id: u64, error: AgentError) {

@@ -437,6 +437,12 @@ impl<'t> EventLoop<'t> {
                     .cmd_tx
                     .try_send(AgentCommand::Cancel { run_id });
             }
+            Action::CancelSubagent { tool_use_id } => {
+                let _ = self
+                    .handles
+                    .cmd_tx
+                    .try_send(AgentCommand::CancelSubagent { tool_use_id });
+            }
             Action::NewSession => {
                 self.respawn_agent(Vec::new());
             }

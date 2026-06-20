@@ -3,9 +3,10 @@
 //! `CancelTrigger` fires on Drop, so cleanup happens even if the trigger is forgotten.
 //! `cancelled()` uses a double-check around the listener to close the TOCTOU window between flag read and listener registration.
 
+use std::collections::HashMap;
 use std::future::Future;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use event_listener::Event;
 
@@ -95,6 +96,63 @@ impl Drop for CancelTrigger {
     }
 }
 
+enum Entry {
+    Live(#[allow(dead_code)] CancelTrigger),
+    PreCancelled,
+}
+
+pub struct CancelMap<K> {
+    entries: Mutex<HashMap<K, Entry>>,
+}
+
+impl<K: Eq + std::hash::Hash> Default for CancelMap<K> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<K: Eq + std::hash::Hash> CancelMap<K> {
+    pub fn new() -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn insert(&self, id: K, trigger: CancelTrigger) {
+        let mut map = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        match map.remove(&id) {
+            Some(Entry::PreCancelled) => drop(trigger),
+            _ => {
+                map.insert(id, Entry::Live(trigger));
+            }
+        }
+    }
+
+    pub fn cancel_or_precancel(&self, id: K) {
+        let mut map = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        match map.remove(&id) {
+            Some(Entry::Live(_)) => {} // trigger dropped, fires cancel
+            _ => {
+                map.insert(id, Entry::PreCancelled);
+            }
+        }
+    }
+
+    pub fn remove(&self, id: &K) {
+        self.entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id);
+    }
+
+    pub fn cancel_all(&self) {
+        self.entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,5 +228,75 @@ mod tests {
             let result = token.race(std::future::pending::<()>()).await;
             assert!(result.is_err());
         });
+    }
+
+    #[test]
+    fn cancel_map_insert_and_cancel() {
+        let map = CancelMap::new();
+        let (trigger, token) = CancelToken::new();
+        map.insert("t1".to_owned(), trigger);
+        assert!(!token.is_cancelled());
+        map.cancel_or_precancel("t1".to_owned());
+        assert!(token.is_cancelled());
+    }
+
+    #[test]
+    fn cancel_map_cancel_before_insert() {
+        let map = CancelMap::new();
+        map.cancel_or_precancel("t1".to_owned());
+        let (trigger, token) = CancelToken::new();
+        map.insert("t1".to_owned(), trigger);
+        assert!(token.is_cancelled());
+    }
+
+    #[test]
+    fn cancel_map_remove_clears_precancelled() {
+        let map: CancelMap<String> = CancelMap::new();
+        map.cancel_or_precancel("t1".to_owned());
+        map.remove(&"t1".to_owned());
+        let (trigger, token) = CancelToken::new();
+        map.insert("t1".to_owned(), trigger);
+        assert!(!token.is_cancelled(), "remove should clear PreCancelled");
+    }
+
+    #[test]
+    fn cancel_map_cancel_all() {
+        let map = CancelMap::new();
+        let (t1, tok1) = CancelToken::new();
+        let (t2, tok2) = CancelToken::new();
+        map.insert("a".to_owned(), t1);
+        map.insert("b".to_owned(), t2);
+        map.cancel_all();
+        assert!(tok1.is_cancelled());
+        assert!(tok2.is_cancelled());
+    }
+
+    #[test]
+    fn cancel_map_cancel_all_clears_precancelled() {
+        let map: CancelMap<String> = CancelMap::new();
+        map.cancel_or_precancel("t1".to_owned());
+        map.cancel_all();
+        let (trigger, token) = CancelToken::new();
+        map.insert("t1".to_owned(), trigger);
+        assert!(
+            !token.is_cancelled(),
+            "cancel_all should clear PreCancelled entries"
+        );
+    }
+
+    #[test]
+    fn cancel_map_insert_overwrites_live() {
+        let map = CancelMap::new();
+        let (t1, tok1) = CancelToken::new();
+        let (t2, tok2) = CancelToken::new();
+        map.insert("x".to_owned(), t1);
+        map.insert("x".to_owned(), t2);
+        assert!(
+            tok1.is_cancelled(),
+            "first trigger should be dropped on overwrite"
+        );
+        assert!(!tok2.is_cancelled(), "second trigger should remain live");
+        map.cancel_or_precancel("x".to_owned());
+        assert!(tok2.is_cancelled());
     }
 }
