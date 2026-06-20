@@ -176,6 +176,7 @@ macro_rules! merge_option {
 #[serde(untagged)]
 pub enum AlwaysThinking {
     Toggle(bool),
+    Budget(u32),
     Mode(String),
 }
 
@@ -184,6 +185,7 @@ impl AlwaysThinking {
         match self {
             Self::Toggle(true) => Ok(StoredThinking::Adaptive),
             Self::Toggle(false) => Ok(StoredThinking::Off),
+            Self::Budget(n) => StoredThinking::parse_setting(&n.to_string()),
             Self::Mode(s) => StoredThinking::parse_setting(&s),
         }
     }
@@ -1199,6 +1201,7 @@ mod tests {
 
     #[test_case(AlwaysThinking::Toggle(true), StoredThinking::Adaptive ; "toggle_true")]
     #[test_case(AlwaysThinking::Toggle(false), StoredThinking::Off ; "toggle_false")]
+    #[test_case(AlwaysThinking::Budget(8192), StoredThinking::Budget { tokens: 8192 } ; "budget_number")]
     fn always_thinking_toggle_resolve(input: AlwaysThinking, expected: StoredThinking) {
         assert_eq!(input.resolve(), Ok(expected));
     }

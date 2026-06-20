@@ -464,7 +464,8 @@ mod tests {
     #[test_case("off",      ThinkingConfig::Adaptive, Ok(ThinkingConfig::Off)       ; "explicit_off")]
     #[test_case("adaptive", ThinkingConfig::Off,      Ok(ThinkingConfig::Adaptive)  ; "explicit_adaptive")]
     #[test_case("8192",     ThinkingConfig::Off,      Ok(ThinkingConfig::Budget(8192)) ; "explicit_budget")]
-    #[test_case("512",      ThinkingConfig::Off,      Err(())                       ; "budget_too_small")]
+    #[test_case("512",      ThinkingConfig::Off,      Ok(ThinkingConfig::Budget(512)) ; "small_budget")]
+    #[test_case("0",        ThinkingConfig::Off,      Err(())                       ; "budget_zero")]
     #[test_case("garbage",  ThinkingConfig::Off,      Err(())                       ; "invalid_input")]
     fn thinking_parse(input: &str, current: ThinkingConfig, expected: Result<ThinkingConfig, ()>) {
         let result = ThinkingConfig::parse(input, current).map_err(|_| ());

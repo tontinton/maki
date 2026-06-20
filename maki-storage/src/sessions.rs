@@ -110,14 +110,12 @@ pub struct StoredRule {
     pub effect: StoredEffect,
 }
 
-pub const MIN_THINKING_BUDGET: u32 = 1024;
-
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ThinkingParseError {
     #[error("unknown thinking value {0:?} (use off, adaptive, or a token budget)")]
     Unknown(String),
-    #[error("thinking budget {0} is below the minimum of {MIN_THINKING_BUDGET}")]
-    BudgetTooSmall(u32),
+    #[error("thinking budget must be greater than zero")]
+    BudgetZero,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -134,8 +132,8 @@ impl StoredThinking {
             "off" => Ok(Self::Off),
             "adaptive" => Ok(Self::Adaptive),
             other => match other.parse::<u32>() {
-                Ok(n) if n >= MIN_THINKING_BUDGET => Ok(Self::Budget { tokens: n }),
-                Ok(n) => Err(ThinkingParseError::BudgetTooSmall(n)),
+                Ok(0) => Err(ThinkingParseError::BudgetZero),
+                Ok(n) => Ok(Self::Budget { tokens: n }),
                 Err(_) => Err(ThinkingParseError::Unknown(other.to_string())),
             },
         }
@@ -1266,8 +1264,8 @@ mod tests {
     #[test_case("adaptive", Ok(StoredThinking::Adaptive) ; "adaptive")]
     #[test_case(" adaptive ", Ok(StoredThinking::Adaptive) ; "trims_whitespace")]
     #[test_case("4096", Ok(StoredThinking::Budget { tokens: 4096 }) ; "valid_budget")]
-    #[test_case("1024", Ok(StoredThinking::Budget { tokens: 1024 }) ; "minimum_budget")]
-    #[test_case("512", Err(ThinkingParseError::BudgetTooSmall(512)) ; "budget_too_small")]
+    #[test_case("1", Ok(StoredThinking::Budget { tokens: 1 }) ; "minimum_budget")]
+    #[test_case("0", Err(ThinkingParseError::BudgetZero) ; "budget_zero")]
     #[test_case("fast", Err(ThinkingParseError::Unknown("fast".into())) ; "garbage")]
     fn parse_setting(input: &str, expected: Result<StoredThinking, ThinkingParseError>) {
         assert_eq!(StoredThinking::parse_setting(input), expected);

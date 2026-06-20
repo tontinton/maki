@@ -963,6 +963,21 @@ fn setup_always_thinking_accepts_bool() {
 }
 
 #[test]
+fn setup_always_thinking_accepts_number() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let raw = host
+        .send_run_init_lua(
+            "maki.setup({ always_thinking = 8192 })".to_owned(),
+            "test_init.lua".to_owned(),
+            None,
+        )
+        .unwrap()
+        .expect("expected Some(RawConfig)");
+    assert_eq!(raw.always_thinking, Some(AlwaysThinking::Budget(8192)));
+}
+
+#[test]
 fn setup_no_tool_registration_in_init_env() {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
