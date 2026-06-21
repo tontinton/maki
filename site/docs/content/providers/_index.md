@@ -178,6 +178,12 @@ Defaults: hf:moonshotai/Kimi-K2.5 (strong), hf:deepseek-ai/DeepSeek-V3.2 (medium
 
 No hardcoded model catalog. Use any model ID supported by this provider.
 
+### Opencode
+
+- **Env var**: `OPENCODE_API_KEY`
+- **API**: `https://opencode.ai/zen/v1`
+- **Features**: Dynamically discovered models via [models.dev](https://models.dev/) + all the models provided by Opencode Zen API.
+
 ## Model Identifiers
 
 Models are referenced as `provider/model_id`:
@@ -205,7 +211,7 @@ To add a custom provider or proxy, drop an executable script into `~/.config/mak
 
 `resolve` is called each time a new agent spawns, so scripts should read tokens from disk instead of caching them in memory. That way auth changes from other processes get picked up.
 
-The `base` field specifies which built-in provider to inherit the model catalog from. Valid values: `anthropic`, `openai`, `google`, `copilot`, `ollama`, `llama-cpp`, `mistral`, `zai`, `deepseek`, `openrouter`, `synthetic`, `tensorx`.
+The `base` field specifies which built-in provider to inherit the model catalog from. Valid values: `anthropic`, `openai`, `google`, `copilot`, `ollama`, `llama-cpp`, `mistral`, `zai`, `deepseek`, `openrouter`, `synthetic`, `tensorx`, `opencode`.
 
 If your provider serves models not in the base catalog, add a `models` subcommand returning:
 
