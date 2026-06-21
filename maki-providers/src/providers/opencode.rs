@@ -14,12 +14,10 @@ use tracing::{debug, warn};
 use crate::model::{Model, ModelInfo, ModelPricing};
 use crate::provider::{BoxFuture, Provider};
 use crate::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
-use crate::{
-    AgentError, ContentBlock, Message, ProviderEvent, RequestOptions, Role, StreamResponse,
-    ThinkingConfig,
-};
+use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig};
 
 use super::{ResolvedAuth, http_client};
+use crate::providers::anthropic::shared;
 
 const CATALOG_URL: &str = "https://models.dev/api.json";
 const CATALOG_CACHE_FILE: &str = "models-dev-catalog.json";
@@ -265,7 +263,20 @@ impl Opencode {
         event_tx: &Sender<ProviderEvent>,
         auth: &ResolvedAuth,
     ) -> Result<StreamResponse, AgentError> {
-        let body = build_anthropic_body(model, messages, system, tools);
+        let system_blocks = vec![shared::SystemBlock {
+            r#type: "text",
+            text: system,
+            cache_control: None,
+        }];
+        let mut body = shared::build_request_body_with_system(
+            model,
+            messages,
+            &system_blocks,
+            tools,
+            ThinkingConfig::Off,
+        );
+        body["model"] = json!(model.id);
+        body["stream"] = json!(true);
         let json_body = serde_json::to_vec(&body)?;
         let mut rb = Request::builder()
             .method("POST")
@@ -563,172 +574,9 @@ fn init_catalog_blocking() -> CatalogData {
     }
 }
 
-// --- Anthropic-format body building ---
-
-pub(crate) fn build_anthropic_body(
-    model: &Model,
-    messages: &[Message],
-    system: &str,
-    tools: &Value,
-) -> Value {
-    let wire_messages = convert_to_anthropic_messages(messages);
-    let wire_tools = convert_to_anthropic_tools(tools);
-
-    let system_blocks: Vec<Value> = if system.is_empty() {
-        vec![]
-    } else {
-        vec![json!({"type": "text", "text": system})]
-    };
-
-    let mut body = json!({
-        "model": model.id,
-        "max_tokens": model.max_output_tokens,
-        "stream": true,
-        "messages": wire_messages,
-    });
-    if !system_blocks.is_empty() {
-        body["system"] = json!(system_blocks);
-    }
-    if wire_tools.as_array().is_some_and(|a| !a.is_empty()) {
-        body["tools"] = wire_tools;
-    }
-    body
-}
-
-pub(crate) fn convert_to_anthropic_messages(messages: &[Message]) -> Vec<Value> {
-    messages
-        .iter()
-        .map(|msg| {
-            let role = match msg.role {
-                Role::User => "user",
-                Role::Assistant => "assistant",
-            };
-            let content: Vec<Value> = msg
-                .content
-                .iter()
-                .map(|block| match block {
-                    ContentBlock::Text { text } => {
-                        json!({"type": "text", "text": text})
-                    }
-                    ContentBlock::Image { source } => {
-                        json!({
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": match source.media_type {
-                                    crate::ImageMediaType::Png => "image/png",
-                                    crate::ImageMediaType::Jpeg => "image/jpeg",
-                                    crate::ImageMediaType::Gif => "image/gif",
-                                    crate::ImageMediaType::Webp => "image/webp",
-                                },
-                                "data": source.data,
-                            }
-                        })
-                    }
-                    ContentBlock::ToolUse { id, name, input } => {
-                        json!({
-                            "type": "tool_use",
-                            "id": id,
-                            "name": name,
-                            "input": input,
-                        })
-                    }
-                    ContentBlock::ToolResult {
-                        tool_use_id,
-                        content,
-                        is_error,
-                    } => {
-                        json!({
-                            "type": "tool_result",
-                            "tool_use_id": tool_use_id,
-                            "content": content,
-                            "is_error": is_error,
-                        })
-                    }
-                    ContentBlock::Thinking { thinking, .. } => {
-                        json!({"type": "thinking", "thinking": thinking})
-                    }
-                    ContentBlock::RedactedThinking { data } => {
-                        json!({"type": "redacted_thinking", "data": data})
-                    }
-                })
-                .collect();
-            json!({"role": role, "content": content})
-        })
-        .collect()
-}
-
-pub(crate) fn convert_to_anthropic_tools(tools: &Value) -> Value {
-    let Some(arr) = tools.as_array() else {
-        return tools.clone();
-    };
-    Value::Array(arr.to_vec())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn convert_to_anthropic_messages_basic() {
-        use crate::types::Message as Msg;
-        let messages = vec![Msg::user("hello".into())];
-        let result = convert_to_anthropic_messages(&messages);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0]["role"], "user");
-        assert_eq!(result[0]["content"][0]["type"], "text");
-        assert_eq!(result[0]["content"][0]["text"], "hello");
-    }
-
-    #[test]
-    fn convert_to_anthropic_messages_with_tools() {
-        use crate::types::{ContentBlock as CB, Message as Msg, Role};
-        let messages = vec![
-            Msg {
-                role: Role::Assistant,
-                content: vec![
-                    CB::Text {
-                        text: "I'll check".into(),
-                    },
-                    CB::ToolUse {
-                        id: "tc_1".into(),
-                        name: "bash".into(),
-                        input: json!({"cmd": "ls"}),
-                    },
-                ],
-                ..Default::default()
-            },
-            Msg {
-                role: Role::User,
-                content: vec![CB::ToolResult {
-                    tool_use_id: "tc_1".into(),
-                    content: "ok".into(),
-                    is_error: false,
-                }],
-                ..Default::default()
-            },
-        ];
-        let result = convert_to_anthropic_messages(&messages);
-
-        assert_eq!(result[0]["role"], "assistant");
-        assert_eq!(result[0]["content"][0]["text"], "I'll check");
-        assert_eq!(result[0]["content"][1]["type"], "tool_use");
-        assert_eq!(result[0]["content"][1]["id"], "tc_1");
-        assert_eq!(result[1]["role"], "user");
-        assert_eq!(result[1]["content"][0]["type"], "tool_result");
-    }
-
-    #[test]
-    fn build_anthropic_body_includes_system_and_model() {
-        let model = Model::from_spec("opencode/claude-sonnet-4-6").unwrap();
-        let messages = vec![Message::user("hi".into())];
-        let body = build_anthropic_body(&model, &messages, "be helpful", &json!([]));
-
-        assert_eq!(body["model"], "claude-sonnet-4-6");
-        assert_eq!(body["system"][0]["text"], "be helpful");
-        assert_eq!(body["max_tokens"], 128000);
-        assert_eq!(body["stream"], true);
-    }
 
     #[test]
     fn catalog_format_messages_for_anthropic() {

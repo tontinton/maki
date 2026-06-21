@@ -36,11 +36,11 @@ pub(crate) fn long_context_window(model_id: &str) -> Option<u32> {
 pub(super) const MESSAGE_CACHE_BREAKPOINTS: usize = 2;
 
 #[derive(Serialize)]
-pub(super) struct CacheControl {
+pub(crate) struct CacheControl {
     pub r#type: &'static str,
 }
 
-pub(super) const EPHEMERAL: CacheControl = CacheControl {
+pub(crate) const EPHEMERAL: CacheControl = CacheControl {
     r#type: "ephemeral",
 };
 
@@ -127,7 +127,7 @@ struct MessageDeltaEvent {
 }
 
 #[derive(Serialize)]
-pub(super) struct SystemBlock<'a> {
+pub(crate) struct SystemBlock<'a> {
     pub r#type: &'static str,
     pub text: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -188,7 +188,7 @@ pub(super) fn build_wire_tools(tools: &Value) -> Value {
     Value::Array(out)
 }
 
-pub(super) fn build_request_body_with_system(
+pub(crate) fn build_request_body_with_system(
     model: &Model,
     messages: &[Message],
     system_blocks: &[SystemBlock<'_>],
