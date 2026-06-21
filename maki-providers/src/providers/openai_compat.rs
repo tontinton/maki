@@ -393,7 +393,7 @@ pub async fn parse_sse(
     let mut deadline = Instant::now() + stream_timeout;
 
     while let Some(line) = super::next_sse_line(&mut lines, &mut deadline, stream_timeout).await? {
-        let data = match line.strip_prefix("data: ") {
+        let data = match line.strip_prefix("data:") {
             Some(d) => d.trim(),
             None => continue,
         };

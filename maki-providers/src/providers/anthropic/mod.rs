@@ -284,13 +284,13 @@ pub(crate) async fn parse_sse(
     let mut deadline = Instant::now() + stream_timeout;
 
     while let Some(line) = super::next_sse_line(&mut lines, &mut deadline, stream_timeout).await? {
-        if let Some(event_type) = line.strip_prefix("event: ") {
-            current_event = event_type.to_string();
+        if let Some(rest) = line.strip_prefix("event:") {
+            current_event = rest.strip_prefix(' ').unwrap_or(rest).to_string();
             continue;
         }
 
-        let data = match line.strip_prefix("data: ") {
-            Some(d) => d,
+        let data = match line.strip_prefix("data:") {
+            Some(d) => d.strip_prefix(' ').unwrap_or(d),
             None => continue,
         };
 
@@ -372,6 +372,39 @@ data: {\"type\":\"message_stop\"}\n";
                 }
             }
             assert_eq!(deltas, vec!["Hello", " world"]);
+        })
+    }
+
+    #[test]
+    fn parse_sse_no_space_after_colon() {
+        smol::block_on(async {
+            let sse_data = b"\
+event:message_start\n\
+data:{\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":7}}}\n\
+\n\
+event:content_block_start\n\
+data:{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\
+\n\
+event:content_block_delta\n\
+data:{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"OK\"}}\n\
+\n\
+event:message_delta\n\
+data:{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\
+\n\
+event:message_stop\n\
+data:{\"type\":\"message_stop\"}\n";
+
+            let (tx, _rx) = flume::unbounded();
+            let resp = parse_sse(mock_response(sse_data), &tx, TEST_STREAM_TIMEOUT)
+                .await
+                .unwrap();
+
+            assert!(
+                matches!(&resp.message.content[0], ContentBlock::Text { text } if text == "OK")
+            );
+            assert_eq!(resp.stop_reason, Some(StopReason::EndTurn));
+            assert_eq!(resp.usage.input, 7);
+            assert_eq!(resp.usage.output, 1);
         })
     }
 

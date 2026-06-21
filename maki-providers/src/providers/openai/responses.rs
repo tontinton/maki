@@ -204,12 +204,12 @@ pub(crate) async fn parse_sse(
     while let Some(line) =
         crate::providers::next_sse_line(&mut lines, &mut deadline, stream_timeout).await?
     {
-        if let Some(event_type) = line.strip_prefix("event: ") {
+        if let Some(event_type) = line.strip_prefix("event:") {
             current_event = event_type.trim().to_string();
             continue;
         }
 
-        let data = match line.strip_prefix("data: ") {
+        let data = match line.strip_prefix("data:") {
             Some(d) => d.trim(),
             None => continue,
         };

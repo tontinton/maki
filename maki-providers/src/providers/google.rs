@@ -495,8 +495,8 @@ async fn parse_sse(
     let mut deadline = Instant::now() + stream_timeout;
 
     while let Some(line) = next_sse_line(&mut lines, &mut deadline, stream_timeout).await? {
-        let data = match line.strip_prefix("data: ") {
-            Some(d) => d,
+        let data = match line.strip_prefix("data:") {
+            Some(d) => d.strip_prefix(' ').unwrap_or(d),
             _ => continue,
         };
 
