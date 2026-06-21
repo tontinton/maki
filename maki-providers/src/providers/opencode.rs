@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, SystemTime};
 
 use flume::Sender;
@@ -132,7 +132,6 @@ struct CatalogMeta {
 
 type ModelWithProvider = (String, String);
 
-#[derive(Default)]
 struct CatalogData {
     entries: HashMap<ModelWithProvider, CatalogMeta>,
     auths: HashMap<String, ResolvedAuth>,
@@ -198,73 +197,37 @@ pub struct Opencode {
     chat_compat: OpenAiCompatProvider,
     auth: Option<Arc<Mutex<ResolvedAuth>>>,
     system_prefix: Option<String>,
-    catalog: OnceLock<Mutex<CatalogData>>,
+    catalog: LazyLock<Mutex<CatalogData>>,
     stream_timeout: Duration,
 }
 
 impl Opencode {
-    fn catalog_mutex(&self) -> &Mutex<CatalogData> {
-        self.catalog
-            .get_or_init(|| Mutex::new(CatalogData::default()))
-    }
-
-    async fn try_init_catalog(&self) {
-        {
-            let guard = self.catalog_mutex().lock().unwrap();
-            if !guard.entries.is_empty() {
-                return;
-            }
-        }
-
-        match fetch_catalog_async().await {
-            Ok(mut data) => {
-                // If a dynamic provider resolved auth (e.g. via Lua script), override
-                // the opencode route's auth so env vars aren't required.
-                if let (Some(provider_auth), Some(auth)) =
-                    (&self.auth, data.auths.get_mut("opencode"))
-                {
-                    *auth = provider_auth.lock().unwrap().clone();
-                }
-
-                let mut guard = self.catalog_mutex().lock().unwrap();
-                *guard = data;
-            }
-            Err(e) => {
-                warn!(error = %e, "catalog fetch failed, will retry on next request");
-            }
-        }
-    }
-
-    async fn do_list_models(&self) -> Result<Vec<ModelInfo>, AgentError> {
-        self.try_init_catalog().await;
-        Ok(self.catalog_mutex().lock().unwrap().all_models())
-    }
-
-    pub fn new(timeouts: super::Timeouts) -> Result<Self, AgentError> {
-        Ok(Self {
-            client: http_client(timeouts),
-            chat_compat: OpenAiCompatProvider::new(&CATALOG_CHAT_CONFIG, timeouts),
-            auth: None,
-            system_prefix: None,
-            catalog: OnceLock::new(),
-            stream_timeout: timeouts.stream,
-        })
-    }
-
-    pub(crate) fn with_auth(auth: Arc<Mutex<ResolvedAuth>>, timeouts: super::Timeouts) -> Self {
+    fn new_impl(timeouts: super::Timeouts, auth: Option<Arc<Mutex<ResolvedAuth>>>) -> Self {
         Self {
             client: http_client(timeouts),
             chat_compat: OpenAiCompatProvider::new(&CATALOG_CHAT_CONFIG, timeouts),
-            auth: Some(auth),
+            auth,
             system_prefix: None,
-            catalog: OnceLock::new(),
+            catalog: LazyLock::new(|| Mutex::new(init_catalog_blocking())),
             stream_timeout: timeouts.stream,
         }
+    }
+
+    pub fn new(timeouts: super::Timeouts) -> Result<Self, AgentError> {
+        Ok(Self::new_impl(timeouts, None))
+    }
+
+    pub(crate) fn with_auth(auth: Arc<Mutex<ResolvedAuth>>, timeouts: super::Timeouts) -> Self {
+        Self::new_impl(timeouts, Some(auth))
     }
 
     pub(crate) fn with_system_prefix(mut self, prefix: Option<String>) -> Self {
         self.system_prefix = prefix;
         self
+    }
+
+    async fn do_list_models(&self) -> Result<Vec<ModelInfo>, AgentError> {
+        Ok(self.catalog.lock().unwrap().all_models())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -343,12 +306,16 @@ impl Provider for Opencode {
         _session_id: Option<&'a str>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
-            self.try_init_catalog().await;
-
             let (meta, auth) = {
-                let guard = self.catalog_mutex().lock().unwrap();
-                guard.lookup(&model.id)
-            }?;
+                let guard = self.catalog.lock().unwrap();
+                let (meta, auth) = guard.lookup(&model.id)?;
+                // Dynamic provider auth (e.g. from Lua) overrides the opencode route
+                let auth = match (&self.auth, meta.provider_id.as_str()) {
+                    (Some(provider_auth), "opencode") => provider_auth.lock().unwrap().clone(),
+                    _ => auth,
+                };
+                (meta, auth)
+            };
 
             let model_for_stream = model.clone();
 
@@ -567,22 +534,33 @@ fn catalog_to_data(index: CatalogIndex) -> CatalogData {
     CatalogData { entries, auths }
 }
 
-async fn fetch_catalog_async() -> Result<CatalogData, AgentError> {
-    if let Some(index) = load_cached_catalog_async().await {
-        return Ok(catalog_to_data(index));
+fn init_catalog_blocking() -> CatalogData {
+    // Try cache first (fast, no network)
+    if let Some(index) = smol::block_on(load_cached_catalog_async()) {
+        debug!("using cached catalog");
+        return catalog_to_data(index);
     }
 
+    // Fetch from remote (blocks the current thread)
     let client = isahc::HttpClient::builder()
         .connect_timeout(Duration::from_secs(10))
         .low_speed_timeout(1, Duration::from_secs(30))
         .build()
-        .map_err(|e| AgentError::Config {
-            message: format!("failed to build HTTP client for catalog fetch: {e}"),
-        })?;
+        .expect("failed to build catalog HTTP client");
 
-    let index = fetch_remote_catalog_async(&client).await?;
-    save_cached_catalog_async(&index).await;
-    Ok(catalog_to_data(index))
+    match smol::block_on(fetch_remote_catalog_async(&client)) {
+        Ok(index) => {
+            smol::block_on(save_cached_catalog_async(&index));
+            catalog_to_data(index)
+        }
+        Err(e) => {
+            warn!(error = %e, "catalog fetch failed, using empty catalog");
+            CatalogData {
+                entries: HashMap::new(),
+                auths: HashMap::new(),
+            }
+        }
+    }
 }
 
 // --- Anthropic-format body building ---
