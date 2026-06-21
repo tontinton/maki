@@ -698,6 +698,7 @@ esac
     #[test_case("zai", ProviderKind::Zai ; "base_zai")]
     #[test_case("synthetic", ProviderKind::Synthetic ; "base_synthetic")]
     #[test_case("deepseek", ProviderKind::DeepSeek ; "base_deepseek")]
+    #[test_case("opencode", ProviderKind::Opencode ; "base_opencode")]
     fn discover_accepts_all_bases(base: &str, expected: ProviderKind) {
         let tmp = TempDir::new().unwrap();
         let info = format!(r#"{{"display_name": "Test", "base": "{base}", "has_auth": false}}"#);
