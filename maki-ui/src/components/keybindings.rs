@@ -390,7 +390,7 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
-        label: KeyLabel::Alt("⌥←", "⌥→"),
+        label: KeyLabel::MacMulti(&["Alt+←", "Alt+→"], &["⌥←", "⌥→"]),
         description: "Move word left / right",
         context: KeybindContext::Editing,
         platform: Platform::All,
