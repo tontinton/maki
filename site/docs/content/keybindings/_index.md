@@ -31,8 +31,10 @@ On macOS, some bindings use Option or Fn keys instead (run `/help` for exact key
 | `Tab` | Toggle mode |
 | `/command` | Open command palette |
 | `Ctrl+W` | Delete word backward |
+| `Ctrl+A` | Jump to start of line |
+| `Ctrl+E` | Jump to end of line |
+| `Home` / `End` | Jump to start/end of line |
 | `Ctrl+U` / `Ctrl+D` | Scroll half page up / down |
-| `Ctrl+Y` / `Ctrl+E` | Scroll one line up / down |
 | `Ctrl+G` | Scroll to top |
 | `Ctrl+B` | Scroll to bottom |
 | `Ctrl+Q` | Pop queue |
@@ -46,8 +48,6 @@ On macOS, some bindings use Option or Fn keys instead (run `/help` for exact key
 | `⌥←` / `⌥→` | Move word left / right |
 | `Ctrl+Del` / `⌥Del` | Delete word forward |
 | `Ctrl+K` | Delete to end of line |
-| `Ctrl+A` | Jump to start of line |
-| `Home` / `End` | Jump to start/end of line |
 
 ## While Streaming
 

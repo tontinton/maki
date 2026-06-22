@@ -148,6 +148,7 @@ pub mod key {
     pub const DELETE: Bind = ctrl_bind!('d');
     pub const KILL_LINE: Bind = ctrl_bind!('k');
     pub const LINE_START: Bind = ctrl_bind!('a');
+    pub const LINE_END: Bind = ctrl_bind!('e');
     pub const EDIT_INPUT: Bind = Bind {
         code: KeyCode::Char('o'),
         modifiers: KeyModifiers::ALT,
@@ -392,7 +393,7 @@ pub const KEYBINDS: &[Keybind] = &[
         label: KeyLabel::Alt("⌥←", "⌥→"),
         description: "Move word left / right",
         context: KeybindContext::Editing,
-        platform: Platform::MacOnly,
+        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Alt(mod_key!("Del"), "⌥Del"),
@@ -410,13 +411,13 @@ pub const KEYBINDS: &[Keybind] = &[
         label: KeyLabel::Single(key::LINE_START.label),
         description: "Jump to start of line",
         context: KeybindContext::Editing,
-        platform: Platform::MacOnly,
+        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Alt("Home", "End"),
         description: "Jump to start/end of line",
         context: KeybindContext::Editing,
-        platform: Platform::MacOnly,
+        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Alt(key::SCROLL_HALF_UP.label, key::SCROLL_HALF_DOWN.label),
@@ -425,8 +426,8 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
-        label: KeyLabel::Alt(key::SCROLL_LINE_UP.label, key::SCROLL_LINE_DOWN.label),
-        description: "Scroll one line up / down",
+        label: KeyLabel::Single(key::LINE_END.label),
+        description: "Jump to end of line",
         context: KeybindContext::Editing,
         platform: Platform::All,
     },

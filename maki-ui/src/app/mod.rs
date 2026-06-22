@@ -444,14 +444,6 @@ impl App {
             self.active_chat().scroll(-half);
             return Some(vec![]);
         }
-        if key::SCROLL_LINE_UP.matches(key) {
-            self.active_chat().scroll(1);
-            return Some(vec![]);
-        }
-        if key::SCROLL_LINE_DOWN.matches(key) {
-            self.active_chat().scroll(-1);
-            return Some(vec![]);
-        }
         if key::SCROLL_TOP.matches(key) {
             self.active_chat().scroll_to_top();
             return Some(vec![]);
