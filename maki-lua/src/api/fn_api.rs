@@ -220,7 +220,7 @@ impl JobStore {
 fn shell_command(cmd: &str) -> Command {
     #[cfg(unix)]
     {
-        let mut c = Command::new("sh");
+        let mut c = Command::new("bash");
         c.arg("-c").arg(cmd);
         c
     }
