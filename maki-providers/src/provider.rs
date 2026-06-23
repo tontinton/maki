@@ -102,6 +102,7 @@ impl ProviderKind {
                 | Self::Synthetic
                 | Self::OpenAi
                 | Self::OpenRouter
+                | Self::LlamaCpp
         )
     }
 

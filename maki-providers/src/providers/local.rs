@@ -1,11 +1,11 @@
 use std::sync::{Arc, Mutex};
 
 use flume::Sender;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::model::Model;
 use crate::provider::{BoxFuture, Provider};
-use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
+use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig};
 
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use super::{KeyPool, ResolvedAuth};
@@ -19,6 +19,7 @@ pub(crate) struct LocalEndpointConfig {
     pub default_model: &'static str,
     pub cloud_fallback_url: Option<&'static str>,
     pub compat: OpenAiCompatConfig,
+    pub thinking_budget_field: bool,
 }
 
 pub(crate) struct LocalEndpoint {
@@ -26,6 +27,7 @@ pub(crate) struct LocalEndpoint {
     auth: Arc<Mutex<ResolvedAuth>>,
     key_pool: Option<KeyPool>,
     system_prefix: Option<String>,
+    thinking_budget_field: bool,
 }
 
 impl LocalEndpoint {
@@ -52,6 +54,7 @@ impl LocalEndpoint {
             auth,
             key_pool: None,
             system_prefix: None,
+            thinking_budget_field: cfg.thinking_budget_field,
         }
     }
 
@@ -91,6 +94,7 @@ impl LocalEndpoint {
             })),
             key_pool,
             system_prefix: None,
+            thinking_budget_field: cfg.thinking_budget_field,
         })
     }
 }
@@ -103,14 +107,24 @@ impl Provider for LocalEndpoint {
         system: &'a str,
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
-        _opts: RequestOptions,
+        opts: RequestOptions,
         _session_id: Option<&'a str>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let auth = self.auth.lock().unwrap().clone();
             let mut buf = String::new();
             let system = super::with_prefix(&self.system_prefix, system, &mut buf);
-            let body = self.compat.build_body(model, messages, system, tools);
+            let mut body = self.compat.build_body(model, messages, system, tools);
+
+            if self.thinking_budget_field {
+                let budget = match opts.thinking {
+                    ThinkingConfig::Off => 0,
+                    ThinkingConfig::Adaptive => -1,
+                    ThinkingConfig::Budget(n) => n as i64,
+                };
+                body["thinking_budget_tokens"] = json!(budget);
+            }
+
             self.compat
                 .do_stream(model, &[], &body, event_tx, &auth)
                 .await
@@ -150,6 +164,7 @@ pub(crate) const OLLAMA: LocalEndpointConfig = LocalEndpointConfig {
         include_stream_usage: true,
         provider_name: "Ollama",
     },
+    thinking_budget_field: false,
 };
 
 pub(crate) const LLAMACPP: LocalEndpointConfig = LocalEndpointConfig {
@@ -167,6 +182,7 @@ pub(crate) const LLAMACPP: LocalEndpointConfig = LocalEndpointConfig {
         include_stream_usage: true,
         provider_name: "LlamaCpp",
     },
+    thinking_budget_field: true,
 };
 
 #[cfg(test)]
