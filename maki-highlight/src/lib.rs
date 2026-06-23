@@ -184,8 +184,13 @@ impl StyledSegment {
     }
 }
 
-pub fn highlight_code(lang: &str, code: &str) -> Vec<Vec<StyledSegment>> {
+pub fn highlight_code(lang: &str, code: &str, prefix: &str) -> Vec<Vec<StyledSegment>> {
     let mut hl = Highlighter::for_token(lang);
+    if !prefix.is_empty() {
+        for line in LinesWithEndings::from(prefix) {
+            hl.advance(line);
+        }
+    }
     LinesWithEndings::from(code)
         .map(|raw| hl.highlight_line(raw))
         .collect()
@@ -309,15 +314,15 @@ mod tests {
     #[test]
     fn highlight_code_line_handling() {
         warmup();
-        let single = highlight_code("rust", "fn main() {}\n");
+        let single = highlight_code("rust", "fn main() {}\n", "");
         assert_eq!(single.len(), 1);
         assert_eq!(segments_text(&single[0]), "fn main() {}");
 
-        let no_newline = highlight_code("rust", "let x = 1;");
+        let no_newline = highlight_code("rust", "let x = 1;", "");
         assert_eq!(no_newline.len(), 1);
         assert_eq!(segments_text(&no_newline[0]), "let x = 1;");
 
-        let trailing = highlight_code("rust", "let x = 1;\n\n\n");
+        let trailing = highlight_code("rust", "let x = 1;\n\n\n", "");
         assert_eq!(trailing.len(), 3);
         assert_eq!(segments_text(&trailing[1]), "");
     }
@@ -329,7 +334,7 @@ mod tests {
         let target_line = "let x = 42;\n";
         let combined = format!("{context_line}{target_line}");
 
-        let stateful = highlight_code("rust", &combined);
+        let stateful = highlight_code("rust", &combined, "");
         let independent = highlight_lines_independent("rust", &combined);
 
         assert_eq!(
@@ -368,7 +373,7 @@ mod tests {
     fn code_highlighter_streaming_consistency() {
         warmup();
         let full_code = "fn main() {\n    let x = 42;\n    println!(\"{}\", x);\n}\n";
-        let full = highlight_code("rust", full_code);
+        let full = highlight_code("rust", full_code, "");
 
         let mut ch = CodeHighlighter::new("rust");
         ch.update("fn main() {\n");

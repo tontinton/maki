@@ -40,12 +40,13 @@ local function read_view_opts(ctx)
   return { max_lines = (tol and tol.read) or 10, keep = "head" }
 end
 
-local function apply_highlights(view, hl_lines, ext)
+local function apply_highlights(view, hl_lines, ext, prefix)
   local texts = {}
   for _, fl in ipairs(hl_lines) do
     texts[#texts + 1] = fl.text
   end
-  local highlighted = maki.ui.highlight(table.concat(texts, "\n"), ext)
+  local opts = prefix and { prefix = prefix } or nil
+  local highlighted = maki.ui.highlight(table.concat(texts, "\n"), ext, opts)
   if not highlighted then
     return
   end
@@ -58,7 +59,7 @@ local function apply_highlights(view, hl_lines, ext)
   view:flush()
 end
 
-local function build_file_view(lines, start_line, total_lines, path, ctx, sync)
+local function build_file_view(lines, start_line, total_lines, path, ctx, sync, prefix)
   local buf = maki.ui.buf()
   local view = ToolView.new(buf, read_view_opts(ctx))
   local nr_fmt = line_nr_fmt(total_lines)
@@ -87,10 +88,10 @@ local function build_file_view(lines, start_line, total_lines, path, ctx, sync)
 
   local ext = path:match("%.([^%.]+)$") or ""
   if sync then
-    apply_highlights(view, hl_lines, ext)
+    apply_highlights(view, hl_lines, ext, prefix)
   else
     maki.async.run(function()
-      apply_highlights(view, hl_lines, ext)
+      apply_highlights(view, hl_lines, ext, prefix)
     end)
   end
 
@@ -162,6 +163,8 @@ local function read_file(path, offset, limit, ctx)
   local annotation = shown < total_lines and string.format("%d of %d lines", shown, total_lines)
     or string.format("%d lines", shown)
 
+  local prefix = start > 1 and table.concat(all_lines, "\n", 1, start - 1) or nil
+
   local basename = path:match("([^/]+)$")
   if not ctx:is_instruction_file(basename) then
     local parent = maki.fs.dirname(path)
@@ -170,7 +173,7 @@ local function read_file(path, offset, limit, ctx)
       if #instructions > 0 then
         return {
           llm_output = llm_output,
-          body = build_file_view(lines, start, total_lines, path, ctx),
+          body = build_file_view(lines, start, total_lines, path, ctx, false, prefix),
           annotation = annotation,
           instructions = instructions,
         }
@@ -180,7 +183,7 @@ local function read_file(path, offset, limit, ctx)
 
   return {
     llm_output = llm_output,
-    body = build_file_view(lines, start, total_lines, path, ctx),
+    body = build_file_view(lines, start, total_lines, path, ctx, false, prefix),
     annotation = annotation,
   }
 end

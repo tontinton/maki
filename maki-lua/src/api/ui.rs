@@ -93,13 +93,17 @@ pub(crate) fn create_ui_table(
         lua.create_async_function(
             |lua, (code, lang, opts): (String, String, Option<mlua::Table>)| async move {
                 let independent = opts
+                    .as_ref()
                     .and_then(|t| t.get::<bool>("independent").ok())
                     .unwrap_or(false);
+                let prefix = opts
+                    .and_then(|t| t.get::<String>("prefix").ok())
+                    .unwrap_or_default();
                 let segments = smol::unblock(move || {
                     if independent {
                         maki_highlight::highlight_lines_independent(&lang, &code)
                     } else {
-                        maki_highlight::highlight_code(&lang, &code)
+                        maki_highlight::highlight_code(&lang, &code, &prefix)
                     }
                 })
                 .await;
