@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use flume::Sender;
-use maki_agent::prompt::{PromptId, Slot};
+use maki_agent::prompt::{PromptId, Slot, SlotKind, ValidNames};
 use maki_agent::tools::Tool;
 use maki_agent::tools::schema::{ParamSchema, to_json_schema, try_from_json, validate};
 use maki_agent::tools::{
@@ -28,6 +28,7 @@ const TOOL_NAME_MAX: usize = 64;
 const TOOL_HANDLER_RETURN_ERR: &str =
     "tool handler must return string or {output=string, is_error?=bool}";
 const TIMEOUT_PARSE_ERR: &str = "register_tool: 'timeout' must be a positive number, 0, or false";
+const MAX_HINT_CONTENT_SIZE: usize = 1024 * 1024;
 
 #[derive(Clone)]
 pub(crate) enum PermissionScopeKind {
@@ -342,6 +343,89 @@ impl ToolInvocation for LuaToolInvocation {
     }
 }
 
+fn parse_slot(spec: &Table) -> LuaResult<Slot> {
+    spec.get::<String>("slot")
+        .map_err(|_| mlua::Error::runtime("'slot' is required"))?
+        .parse()
+        .map_err(|_| {
+            mlua::Error::runtime(format!("unknown 'slot'. Valid: {}", Slot::valid_names()))
+        })
+}
+
+fn parse_prompt_field(spec: &Table) -> LuaResult<Option<Vec<PromptId>>> {
+    let parse_one = |s: &str| -> mlua::Result<PromptId> {
+        s.parse().map_err(|_| {
+            mlua::Error::runtime(format!(
+                "unknown 'prompt'. Valid: {}",
+                PromptId::valid_names()
+            ))
+        })
+    };
+    match spec.get::<LuaValue>("prompt") {
+        Ok(LuaValue::String(s)) => Ok(Some(vec![parse_one(&s.to_str()?)?])),
+        Ok(LuaValue::Table(t)) => {
+            let mut ids = Vec::new();
+            for pair in t.sequence_values::<mlua::String>() {
+                ids.push(parse_one(&pair?.to_str()?)?);
+            }
+            if ids.is_empty() {
+                return Err(mlua::Error::runtime(
+                    "'prompt' table is empty or has no sequence entries; expected a list like {\"system\", \"general\"}",
+                ));
+            }
+            Ok(Some(ids))
+        }
+        Ok(LuaValue::Nil) | Err(_) => Ok(None),
+        Ok(_) => Err(mlua::Error::runtime(
+            "'prompt' must be a string or list of strings",
+        )),
+    }
+}
+
+fn validate_slot_prompt_compatibility(
+    slot: Slot,
+    prompts: &Option<Vec<PromptId>>,
+) -> LuaResult<()> {
+    if let Some(prompts) = prompts {
+        for &pid in prompts {
+            if !pid.has_slot(slot) {
+                return Err(mlua::Error::runtime(format!(
+                    "slot '{}' is not available for prompt '{}'",
+                    slot, pid
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_hint_content(lua: &Lua, spec: &Table) -> LuaResult<HintContent> {
+    let has_content = spec.contains_key("content")?;
+    if !has_content {
+        return Err(mlua::Error::runtime("'content' is required"));
+    }
+
+    match spec.get("content")? {
+        LuaValue::String(s) => {
+            let text = s.to_string_lossy();
+            if text.is_empty() {
+                return Err(mlua::Error::runtime("'content' must not be empty"));
+            }
+            if text.len() > MAX_HINT_CONTENT_SIZE {
+                return Err(mlua::Error::runtime(format!(
+                    "content exceeds the {} byte limit",
+                    MAX_HINT_CONTENT_SIZE
+                )));
+            }
+            Ok(HintContent::Static(text))
+        }
+        LuaValue::Function(f) => Ok(HintContent::Callback(lua.create_registry_value(f)?)),
+        _ => Err(mlua::Error::runtime(
+            "'content' must be a string or function",
+        )),
+    }
+}
+
 pub(crate) fn create_api_table(
     lua: &Lua,
     pending: PendingTools,
@@ -361,51 +445,19 @@ pub(crate) fn create_api_table(
         t.set(
             "register_prompt_hint",
             lua.create_function(move |lua, spec: Table| {
-                let slot: Slot = spec
-                    .get::<String>("slot")
-                    .map_err(|_| mlua::Error::runtime("'slot' is required"))?
-                    .parse()
-                    .map_err(|_| {
-                        mlua::Error::runtime(
-                            "unknown 'slot'. Valid: tool_usage, efficient_tools, conventions, after_instructions",
-                        )
-                    })?;
+                let slot: Slot = parse_slot(&spec)?;
+                if slot.kind() == SlotKind::Singleton {
+                    return Err(mlua::Error::runtime(format!(
+                        "register_prompt_hint is for aggregate slots ({}); \
+                         use set_prompt for singleton slots ({})",
+                        Slot::names_for_kind(SlotKind::Aggregate),
+                        Slot::names_for_kind(SlotKind::Singleton),
+                    )));
+                }
+                let prompts = parse_prompt_field(&spec)?;
+                validate_slot_prompt_compatibility(slot, &prompts)?;
 
-                let parse_prompt = |s: &str| -> mlua::Result<PromptId> {
-                    s.parse().map_err(|_| {
-                        mlua::Error::runtime("unknown 'prompt'. Valid: system, research, general")
-                    })
-                };
-                let prompts: Option<Vec<PromptId>> = match spec.get::<LuaValue>("prompt") {
-                    Ok(LuaValue::String(s)) => Some(vec![parse_prompt(&s.to_str()?)?]),
-                    Ok(LuaValue::Table(t)) => {
-                        let mut ids = Vec::new();
-                        for pair in t.sequence_values::<mlua::String>() {
-                            ids.push(parse_prompt(&pair?.to_str()?)?);
-                        }
-                        Some(ids)
-                    }
-                    Ok(LuaValue::Nil) | Err(_) => None,
-                    Ok(_) => {
-                        return Err(mlua::Error::runtime(
-                            "'prompt' must be a string or list of strings",
-                        ));
-                    }
-                };
-
-                let content = match spec
-                    .get("content")
-                    .map_err(|_| mlua::Error::runtime("'content' is required"))?
-                {
-                    LuaValue::String(s) => HintContent::Static(s.to_string_lossy()),
-                    LuaValue::Function(f) => HintContent::Callback(lua.create_registry_value(f)?),
-                    _ => {
-                        return Err(mlua::Error::runtime(
-                            "'content' must be a string or function",
-                        ));
-                    }
-                };
-
+                let content = parse_hint_content(lua, &spec)?;
                 let reg = PromptHintRegistration {
                     prompts,
                     slot,
@@ -418,6 +470,39 @@ pub(crate) fn create_api_table(
                 Ok(())
             })?,
         )?;
+    }
+
+    {
+        let plugin = Arc::clone(&plugin);
+        t.set(
+            "set_prompt",
+            lua.create_function(move |lua, spec: Table| {
+                let slot: Slot = parse_slot(&spec)?;
+                if slot.kind() == SlotKind::Aggregate {
+                    return Err(mlua::Error::runtime(format!(
+                        "set_prompt is for singleton slots ({}); \
+                         use register_prompt_hint for aggregate slots ({})",
+                        Slot::names_for_kind(SlotKind::Singleton),
+                        Slot::names_for_kind(SlotKind::Aggregate),
+                    )));
+                }
+
+                let prompts = parse_prompt_field(&spec)?;
+                validate_slot_prompt_compatibility(slot, &prompts)?;
+
+                let content = parse_hint_content(lua, &spec)?;
+                let reg = PromptHintRegistration {
+                    prompts,
+                    slot,
+                    content,
+                };
+                let mut map = lua
+                    .app_data_mut::<PromptHintCallbacks>()
+                    .ok_or_else(|| mlua::Error::runtime("not initialized"))?;
+                map.entry(Arc::clone(&plugin)).or_default().push(reg);
+                Ok(())
+            })?,
+        )?
     }
 
     t.set(

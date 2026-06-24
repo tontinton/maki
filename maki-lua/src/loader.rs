@@ -569,8 +569,9 @@ mod tests {
 
     /// Targeting a prompt that does not have the slot quietly drops the hint.
     #[test]
-    fn explicit_prompt_without_slot_is_dropped() {
-        let (_host, slots) = slots_from(
+    fn register_prompt_hint_rejects_incompatible_slot_prompt() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let r = host.load_source(
             "drop",
             r#"
             maki.api.register_prompt_hint({
@@ -580,7 +581,8 @@ mod tests {
             })
             "#,
         );
-        assert!(contents(&slots, PromptId::Research, Slot::AfterInstructions).is_empty());
+        assert!(r.is_err());
+        assert!(r.unwrap_err().to_string().contains("not available"));
     }
 
     #[test]
@@ -670,5 +672,215 @@ mod tests {
         let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
         let src = format!("maki.api.register_prompt_hint({spec})");
         assert!(host.load_source("bad", &src).is_err());
+    }
+
+    #[test]
+    fn identity_slot_lands_on_system_only() {
+        let (_host, slots) = slots_from(
+            "id",
+            r#"
+            maki.api.set_prompt({
+                slot = "identity",
+                content = "Custom identity",
+            })
+            "#,
+        );
+        assert_eq!(
+            contents(&slots, PromptId::System, Slot::Identity),
+            ["Custom identity"]
+        );
+        assert!(contents(&slots, PromptId::Research, Slot::Identity).is_empty());
+        assert!(contents(&slots, PromptId::General, Slot::Identity).is_empty());
+    }
+
+    #[test]
+    fn tone_slot_lands_on_system_only() {
+        let (_host, slots) = slots_from(
+            "tone",
+            r#"
+            maki.api.set_prompt({
+                slot = "tone",
+                content = "Custom tone",
+            })
+            "#,
+        );
+        assert_eq!(
+            contents(&slots, PromptId::System, Slot::Tone),
+            ["Custom tone"]
+        );
+        assert!(contents(&slots, PromptId::Research, Slot::Tone).is_empty());
+        assert!(contents(&slots, PromptId::General, Slot::Tone).is_empty());
+    }
+
+    #[test]
+    fn singleton_last_wins_across_plugins() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(
+            "aaa",
+            r#"maki.api.set_prompt({ slot = "identity", content = "AAA" })"#,
+        )
+        .unwrap();
+        host.load_source(
+            "zzz",
+            r#"maki.api.set_prompt({ slot = "identity", content = "ZZZ" })"#,
+        )
+        .unwrap();
+        let slots = host.event_handle().unwrap().collect_prompt_slots();
+        let entries = slots.get(PromptId::System, Slot::Identity);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries.last().unwrap().content, "ZZZ");
+    }
+
+    #[test]
+    fn content_required() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let r = host.load_source("bad", r#"maki.api.set_prompt({ slot = "identity" })"#);
+        assert!(r.is_err());
+        assert!(r.unwrap_err().to_string().contains("'content' is required"));
+    }
+
+    #[test]
+    fn set_prompt_sets_identity() {
+        let (_host, slots) = slots_from(
+            "setter",
+            r#"
+            maki.api.set_prompt({
+                slot = "identity",
+                content = "New identity",
+            })
+            "#,
+        );
+        assert_eq!(
+            contents(&slots, PromptId::System, Slot::Identity),
+            ["New identity"]
+        );
+    }
+
+    #[test]
+    fn set_prompt_explicit_system_prompt() {
+        let (_host, slots) = slots_from(
+            "setter",
+            r#"
+            maki.api.set_prompt({
+                slot = "identity",
+                prompt = "system",
+                content = "Explicit identity",
+            })
+            "#,
+        );
+        assert_eq!(
+            contents(&slots, PromptId::System, Slot::Identity),
+            ["Explicit identity"]
+        );
+    }
+
+    #[test]
+    fn prompt_field_targets_specific_prompt() {
+        let (_host, slots) = slots_from(
+            "targeter",
+            r#"
+            maki.api.register_prompt_hint({
+                slot = "tool_usage",
+                prompt = "general",
+                content = "General hint",
+            })
+            "#,
+        );
+        assert_eq!(
+            contents(&slots, PromptId::General, Slot::ToolUsage),
+            ["General hint"]
+        );
+        assert!(contents(&slots, PromptId::System, Slot::ToolUsage).is_empty());
+    }
+
+    #[test]
+    fn set_prompt_invalid_prompt_rejected() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let r = host.load_source(
+            "bad",
+            r#"maki.api.set_prompt({ slot = "identity", prompt = "nope", content = "x" })"#,
+        );
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn set_prompt_and_register_prompt_hint_coexist() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(
+            "hint",
+            r#"maki.api.register_prompt_hint({ slot = "tool_usage", content = "HINT" })"#,
+        )
+        .unwrap();
+        host.load_source(
+            "setter",
+            r#"maki.api.set_prompt({ slot = "identity", content = "SET" })"#,
+        )
+        .unwrap();
+        let slots = host.event_handle().unwrap().collect_prompt_slots();
+        assert_eq!(
+            contents(&slots, PromptId::System, Slot::ToolUsage),
+            ["HINT"]
+        );
+        assert_eq!(contents(&slots, PromptId::System, Slot::Identity), ["SET"]);
+    }
+
+    #[test]
+    fn set_prompt_rejects_aggregate_slot() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let r = host.load_source(
+            "bad",
+            r#"maki.api.set_prompt({ slot = "tool_usage", content = "nope" })"#,
+        );
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn set_prompt_rejects_incompatible_slot_prompt() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let r = host.load_source(
+            "bad",
+            r#"maki.api.set_prompt({ slot = "identity", prompt = "research", content = "x" })"#,
+        );
+        assert!(r.is_err());
+        assert!(r.unwrap_err().to_string().contains("not available"));
+    }
+
+    #[test]
+    fn empty_prompt_table_is_rejected() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let r = host.load_source(
+            "bad",
+            r#"maki.api.set_prompt({ slot = "identity", prompt = {}, content = "x" })"#,
+        );
+        assert!(r.is_err());
+        assert!(r.unwrap_err().to_string().contains("no sequence entries"));
+    }
+
+    #[test]
+    fn content_must_not_be_empty() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let r = host.load_source(
+            "bad",
+            r#"maki.api.set_prompt({ slot = "identity", content = "" })"#,
+        );
+        assert!(r.is_err());
+        assert!(r.unwrap_err().to_string().contains("empty"));
+    }
+
+    #[test]
+    fn set_prompt_with_callback() {
+        let (_host, slots) = slots_from(
+            "setter_cb",
+            r#"
+            maki.api.set_prompt({
+                slot = "identity",
+                content = function() return "Dyn identity" end,
+            })
+            "#,
+        );
+        assert_eq!(
+            contents(&slots, PromptId::System, Slot::Identity),
+            ["Dyn identity"]
+        );
     }
 }
