@@ -2,6 +2,7 @@ local M = {}
 
 M.NO_MATCH = "old_string not found in file"
 M.MULTIPLE_MATCHES = "old_string matches multiple locations; add surrounding context to make it unique"
+M.EMPTY_OLD_STRING = "old_string must not be empty"
 
 local SINGLE_CANDIDATE_THRESHOLD = 0.0
 local MULTI_CANDIDATE_THRESHOLD = 0.3
@@ -484,6 +485,10 @@ local function replace_all_occurrences(content, matched, replacement)
 end
 
 function M.replace(content, old_string, new_string, replace_all)
+  if old_string == "" then
+    return nil, M.EMPTY_OLD_STRING
+  end
+
   local any_found = false
 
   local function try_match(candidates, replacement)

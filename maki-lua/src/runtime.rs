@@ -48,6 +48,9 @@ const MAX_INFLIGHT_TOOLS: usize = 64;
 const GC_STEP_INTERVAL: usize = 4;
 const INTERRUPT_CANCEL_CHECK_INTERVAL: u32 = 128;
 const ASYNC_RUN_DEFAULT_DEADLINE: Duration = Duration::from_secs(60);
+/// Without a cap, a runaway plugin gets OOM-killed by the OS and takes the
+/// whole host down. With one, it hits a catchable Lua error instead.
+const LUA_MEMORY_LIMIT: usize = 512 * 1024 * 1024;
 
 pub type LoadResult = Result<(), PluginError>;
 pub(crate) enum HintContent {
@@ -597,6 +600,11 @@ impl LuaRuntime {
         hint_writer: HintWriter,
     ) -> Result<Self, PluginError> {
         let lua = Lua::new();
+        lua.set_memory_limit(LUA_MEMORY_LIMIT)
+            .map_err(|e| PluginError::Lua {
+                plugin: "<init>".to_owned(),
+                source: e,
+            })?;
         let pending: PendingTools = Arc::new(Mutex::new(Vec::new()));
 
         install_interrupt(&lua, Arc::clone(&shutdown));

@@ -1431,3 +1431,25 @@ fn pure_functions_not_guarded() {
     assert!(result.contains("basename=true"), "got: {result}");
     assert!(result.contains("json=true"), "got: {result}");
 }
+
+#[test]
+fn runaway_allocation_hits_memory_limit_instead_of_oom() {
+    const LIMITED: &str = "limited";
+    let src = r#"
+        local ok, err = pcall(function()
+            local t = {}
+            local chunk = string.rep("x", 1024 * 1024)
+            while true do
+                t[#t + 1] = chunk .. tostring(#t)
+            end
+        end)
+        if ok then error("expected allocation to fail under the memory limit") end
+        if not string.find(tostring(err), "memory") then
+            error("expected an out-of-memory error, got: " .. tostring(err))
+        end
+    "#;
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source(LIMITED, src)
+        .expect("plugin should hit the memory limit and recover, not crash the process");
+}

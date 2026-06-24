@@ -24,6 +24,7 @@ end
 local R = "REPLACED"
 local NO_MATCH = fr.NO_MATCH
 local MULTIPLE_MATCHES = fr.MULTIPLE_MATCHES
+local EMPTY_OLD_STRING = fr.EMPTY_OLD_STRING
 
 -- fuzzy_replace unit tests
 
@@ -154,7 +155,13 @@ end)
 case("empty_old_string", function()
   local result, err = fr.replace("abc", "", "x", false)
   eq(result, nil)
-  eq(err, MULTIPLE_MATCHES)
+  eq(err, EMPTY_OLD_STRING)
+end)
+
+case("empty_old_string_replace_all_does_not_hang", function()
+  local result, err = fr.replace("abc", "", "x", true)
+  eq(result, nil)
+  eq(err, EMPTY_OLD_STRING)
 end)
 
 case("replace_all_no_occurrences", function()
