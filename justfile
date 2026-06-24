@@ -34,5 +34,8 @@ gen-docs:
 gen-docs-check:
     cargo run -p maki-docgen -- --check
 
+machete:
+    cargo machete
+
 # Full CI check
-ci: fmt-check lint pylint test gen-docs-check
+ci: fmt-check lint pylint test gen-docs-check machete
