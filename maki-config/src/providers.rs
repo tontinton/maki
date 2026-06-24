@@ -9,6 +9,50 @@ use tracing::debug;
 use maki_storage::paths;
 
 const PROVIDERS_FILE: &str = "providers.toml";
+const DEFAULT_TIER: &str = "medium";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelDef {
+    pub id: String,
+    #[serde(default = "default_tier")]
+    pub tier: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_tool_examples: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing_input: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing_output: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing_cache_write: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing_cache_read: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing_fast_input: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing_fast_output: Option<f64>,
+}
+
+impl ModelDef {
+    /// Any pricing field set means the user provided pricing (other fields default to 0).
+    pub fn has_pricing(&self) -> bool {
+        self.pricing_input.is_some()
+            || self.pricing_output.is_some()
+            || self.pricing_cache_write.is_some()
+            || self.pricing_cache_read.is_some()
+    }
+
+    pub fn has_fast_pricing(&self) -> bool {
+        self.pricing_fast_input.is_some() || self.pricing_fast_output.is_some()
+    }
+}
+
+fn default_tier() -> String {
+    DEFAULT_TIER.to_string()
+}
 
 /// Normalize a provider name into a lowercase, hyphen-separated slug.
 /// "My Cool Provider" -> "my-cool-provider"
@@ -87,6 +131,8 @@ pub struct ProviderDef {
     pub default_model: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub discover_models: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<ModelDef>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

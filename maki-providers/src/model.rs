@@ -290,6 +290,9 @@ impl Model {
             if let Some(model) = dynamic::find_model_for_tier(slug, tier) {
                 return Ok(model);
             }
+            if let Some(model) = super::providers::custom::find_model_for_tier(slug, tier) {
+                return Ok(model);
+            }
             let mut model = Self::from_tier(provider, tier)?;
             model.dynamic_slug = Some(slug.to_string());
             return Ok(model);

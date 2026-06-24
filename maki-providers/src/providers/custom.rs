@@ -10,7 +10,7 @@ use maki_config::providers::{
 
 use super::ResolvedAuth;
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
-use crate::model::{Model, ModelTier};
+use crate::model::{FastPricing, Model, ModelPricing, ModelTier};
 use crate::provider::{BoxFuture, Provider, ProviderKind};
 use crate::providers::Timeouts;
 use crate::types::ThinkingConfig;
@@ -75,20 +75,83 @@ pub fn create(slug: &str, timeouts: Timeouts) -> Result<Box<dyn Provider>, Agent
 }
 
 pub fn lookup_model(slug: &str, model_id: &str) -> Option<Model> {
-    let kind = resolve_provider_kind(slug)?;
+    let config = ProvidersConfig::load();
+    let def = config.get(slug)?;
+    let kind = match def.protocol? {
+        Protocol::Openai => ProviderKind::OpenAi,
+        Protocol::Anthropic => ProviderKind::Anthropic,
+        Protocol::Google => ProviderKind::Google,
+    };
+    let declared = def.models.iter().find(|m| m.id == model_id);
+    let tier = declared
+        .and_then(|m| m.tier.parse::<ModelTier>().ok())
+        .unwrap_or(ModelTier::Medium);
+    let max_output_tokens = declared
+        .and_then(|m| m.max_output_tokens)
+        .unwrap_or_else(|| kind.fallback_max_output());
+    let context_window = declared
+        .and_then(|m| m.context_window)
+        .unwrap_or_else(|| kind.fallback_context_window());
+    let supports_tool_examples_override = declared.and_then(|m| m.supports_tool_examples);
+    let pricing = declared
+        .filter(|m| m.has_pricing())
+        .map(|m| ModelPricing {
+            input: m.pricing_input.unwrap_or(0.0),
+            output: m.pricing_output.unwrap_or(0.0),
+            cache_write: m.pricing_cache_write.unwrap_or(0.0),
+            cache_read: m.pricing_cache_read.unwrap_or(0.0),
+            fast: declared
+                .filter(|d| d.has_fast_pricing())
+                .map(|d| FastPricing {
+                    input: d.pricing_fast_input.unwrap_or(0.0),
+                    output: d.pricing_fast_output.unwrap_or(0.0),
+                }),
+        })
+        .unwrap_or_default();
     Some(Model {
         id: model_id.to_string(),
         provider: kind,
         dynamic_slug: Some(slug.to_string()),
-        tier: ModelTier::Medium,
+        tier,
         family: kind.family(),
-        supports_tool_examples_override: None,
-        pricing: Default::default(),
-        max_output_tokens: kind.fallback_max_output(),
-        context_window: kind.fallback_context_window(),
+        supports_tool_examples_override,
+        pricing,
+        max_output_tokens,
+        context_window,
     })
 }
 
+/// Specs declared statically in `providers.toml` (no HTTP).
+pub fn declared_model_specs() -> Vec<String> {
+    let config = ProvidersConfig::load();
+    let mut specs = Vec::new();
+    for (slug, def) in &config.providers {
+        if builtin_provider(slug).is_some() {
+            continue;
+        }
+        if resolve_protocol(slug, Some(def)).is_none() {
+            continue;
+        }
+        for m in &def.models {
+            specs.push(format!("{slug}/{}", m.id));
+        }
+    }
+    specs
+}
+
+pub fn find_model_for_tier(slug: &str, tier: ModelTier) -> Option<Model> {
+    let config = ProvidersConfig::load();
+    let def = config.get(slug)?;
+    let declared = def
+        .models
+        .iter()
+        .find(|m| m.tier.parse::<ModelTier>().ok() == Some(tier))?;
+    lookup_model(slug, &declared.id)
+}
+
+/// Skip definitions handled by [`declared_model_specs`]; only HTTP `/models`
+/// goes through here, so an empty `discover_models = false` provider returns
+/// nothing and never hits the network.
 pub fn discover_models(timeouts: Timeouts) -> Vec<String> {
     let config = ProvidersConfig::load();
     let mut all_specs = Vec::new();

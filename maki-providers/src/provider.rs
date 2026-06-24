@@ -342,6 +342,11 @@ pub fn available_model_specs() -> Vec<String> {
     for slug in dynamic::discovered_slugs() {
         specs.extend(dynamic::dynamic_model_specs_for(slug));
     }
+    for spec in crate::providers::custom::declared_model_specs() {
+        if !specs.contains(&spec) {
+            specs.push(spec);
+        }
+    }
     specs
 }
 
@@ -436,13 +441,24 @@ pub async fn fetch_all_models(
     let custom_timeouts = timeouts;
     let tx_custom = tx.clone();
     smol::spawn(async move {
+        let declared = crate::providers::custom::declared_model_specs();
+        if !declared.is_empty() {
+            let _ = tx_custom
+                .send_async(ModelBatch {
+                    models: declared,
+                    warnings: Vec::new(),
+                })
+                .await;
+        }
         let custom_specs =
             smol::unblock(move || crate::providers::custom::discover_models(custom_timeouts)).await;
         if !custom_specs.is_empty() {
-            let _ = tx_custom.send(ModelBatch {
-                models: custom_specs,
-                warnings: Vec::new(),
-            });
+            let _ = tx_custom
+                .send_async(ModelBatch {
+                    models: custom_specs,
+                    warnings: Vec::new(),
+                })
+                .await;
         }
     })
     .detach();
