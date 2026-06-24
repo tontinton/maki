@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use flume::Sender;
@@ -195,18 +195,19 @@ pub struct Opencode {
     chat_compat: OpenAiCompatProvider,
     auth: Option<Arc<Mutex<ResolvedAuth>>>,
     system_prefix: Option<String>,
-    catalog: LazyLock<Mutex<CatalogData>>,
     stream_timeout: Duration,
 }
 
+static CATALOG: OnceLock<Mutex<CatalogData>> = OnceLock::new();
+
 impl Opencode {
     fn new_impl(timeouts: super::Timeouts, auth: Option<Arc<Mutex<ResolvedAuth>>>) -> Self {
+        CATALOG.get_or_init(|| Mutex::new(init_catalog_blocking()));
         Self {
             client: http_client(timeouts),
             chat_compat: OpenAiCompatProvider::new(&CATALOG_CHAT_CONFIG, timeouts),
             auth,
             system_prefix: None,
-            catalog: LazyLock::new(|| Mutex::new(init_catalog_blocking())),
             stream_timeout: timeouts.stream,
         }
     }
@@ -225,7 +226,7 @@ impl Opencode {
     }
 
     async fn do_list_models(&self) -> Result<Vec<ModelInfo>, AgentError> {
-        Ok(self.catalog.lock().unwrap().all_models())
+        Ok(CATALOG.get().unwrap().lock().unwrap().all_models())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -262,18 +263,19 @@ impl Opencode {
         tools: &Value,
         event_tx: &Sender<ProviderEvent>,
         auth: &ResolvedAuth,
+        opts: &RequestOptions,
     ) -> Result<StreamResponse, AgentError> {
         let system_blocks = vec![shared::SystemBlock {
             r#type: "text",
             text: system,
-            cache_control: None,
+            cache_control: Some(shared::EPHEMERAL),
         }];
         let mut body = shared::build_request_body_with_system(
             model,
             messages,
             &system_blocks,
             tools,
-            ThinkingConfig::Off,
+            opts.thinking,
         );
         body["model"] = json!(model.id);
         body["stream"] = json!(true);
@@ -318,7 +320,7 @@ impl Provider for Opencode {
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let (meta, auth) = {
-                let guard = self.catalog.lock().unwrap();
+                let guard = CATALOG.get().unwrap().lock().unwrap();
                 let (meta, auth) = guard.lookup(&model.id)?;
                 // Dynamic provider auth (e.g. from Lua) overrides the opencode route
                 let auth = match (&self.auth, meta.provider_id.as_str()) {
@@ -347,8 +349,10 @@ impl Provider for Opencode {
                     .await
                 }
                 EndpointType::Messages => {
-                    self.handle_catalog_messages(&model, messages, system, tools, event_tx, &auth)
-                        .await
+                    self.handle_catalog_messages(
+                        &model, messages, system, tools, event_tx, &auth, &opts,
+                    )
+                    .await
                 }
             }
         })
