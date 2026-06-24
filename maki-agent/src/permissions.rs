@@ -1,10 +1,11 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use maki_config::{
-    Effect, PermissionRule, PermissionTarget, PermissionsConfig, append_permission_rule,
+    DefaultEffect, Effect, PermissionRule, PermissionTarget, PermissionsConfig,
+    append_permission_rule,
 };
 use thiserror::Error;
 use tracing::{info, warn};
@@ -154,7 +155,9 @@ pub struct PermissionManager {
     session_rules: Mutex<Vec<PermissionRule>>,
     config_rules: Vec<PermissionRule>,
     builtin_rules: Vec<PermissionRule>,
-    allow_all: AtomicBool,
+    yolo: AtomicBool,
+    default: DefaultEffect,
+    tool_defaults: HashMap<String, DefaultEffect>,
     cwd: PathBuf,
 }
 
@@ -164,7 +167,9 @@ impl PermissionManager {
             builtin_rules: builtin_rules(&cwd),
             session_rules: Mutex::new(Vec::new()),
             config_rules: config.rules,
-            allow_all: AtomicBool::new(config.allow_all),
+            yolo: AtomicBool::new(config.yolo),
+            default: config.default,
+            tool_defaults: config.tool_defaults,
             cwd,
         }
     }
@@ -192,7 +197,7 @@ impl PermissionManager {
             }
         }
 
-        if self.allow_all.load(Ordering::Relaxed) {
+        if self.yolo.load(Ordering::Relaxed) {
             return PermissionCheck::Allowed;
         }
 
@@ -212,10 +217,22 @@ impl PermissionManager {
             return PermissionCheck::Allowed;
         }
 
-        PermissionCheck::NeedsPrompt {
-            tool: tool.to_string(),
-            scopes: pending.into_iter().map(|s| s.to_string()).collect(),
-            force_prompt,
+        let eff = self
+            .tool_defaults
+            .get(tool)
+            .copied()
+            .unwrap_or(self.default);
+        match eff {
+            DefaultEffect::Deny => {
+                info!(tool, "denied by default");
+                PermissionCheck::Denied
+            }
+            DefaultEffect::Allow => PermissionCheck::Allowed,
+            DefaultEffect::Prompt => PermissionCheck::NeedsPrompt {
+                tool: tool.to_string(),
+                scopes: pending.into_iter().map(|s| s.to_string()).collect(),
+                force_prompt,
+            },
         }
     }
 
@@ -238,12 +255,12 @@ impl PermissionManager {
     }
 
     pub fn toggle_yolo(&self) -> bool {
-        let prev = self.allow_all.fetch_xor(true, Ordering::Relaxed);
+        let prev = self.yolo.fetch_xor(true, Ordering::Relaxed);
         !prev
     }
 
     pub fn is_yolo(&self) -> bool {
-        self.allow_all.load(Ordering::Relaxed)
+        self.yolo.load(Ordering::Relaxed)
     }
 
     pub fn session_rules_snapshot(&self) -> Vec<PermissionRule> {
@@ -463,8 +480,8 @@ mod tests {
 
     fn make_config(rules: Vec<PermissionRule>) -> PermissionsConfig {
         PermissionsConfig {
-            allow_all: false,
             rules,
+            ..Default::default()
         }
     }
 
@@ -570,11 +587,12 @@ mod tests {
     }
 
     #[test]
-    fn deny_overrides_allow_all() {
+    fn deny_overrides_default_allow() {
         let mgr = PermissionManager::new(
             PermissionsConfig {
-                allow_all: true,
+                default: DefaultEffect::Allow,
                 rules: vec![deny_rule("rm *")],
+                ..Default::default()
             },
             PathBuf::from("/tmp"),
         );
@@ -801,5 +819,85 @@ mod tests {
         let mgr = default_mgr();
         mgr.apply_decision("bash", &["cargo test".into()], &answer);
         assert!(mgr.session_rules_snapshot().is_empty());
+    }
+
+    #[test]
+    fn default_deny_blocks_unmatched() {
+        let mgr = PermissionManager::new(
+            PermissionsConfig {
+                default: DefaultEffect::Deny,
+                ..Default::default()
+            },
+            PathBuf::from("/tmp"),
+        );
+        assert!(matches!(
+            mgr.check("bash", "cargo test"),
+            PermissionCheck::Denied
+        ));
+    }
+
+    #[test]
+    fn default_deny_with_allow_rules() {
+        let mgr = PermissionManager::new(
+            PermissionsConfig {
+                default: DefaultEffect::Deny,
+                rules: vec![allow_rule("cargo *")],
+                ..Default::default()
+            },
+            PathBuf::from("/tmp"),
+        );
+        assert!(matches!(
+            mgr.check("bash", "cargo test"),
+            PermissionCheck::Allowed
+        ));
+        assert!(matches!(
+            mgr.check("bash", "rm -rf /"),
+            PermissionCheck::Denied
+        ));
+    }
+
+    #[test]
+    fn default_allow_allows_unmatched() {
+        let mgr = PermissionManager::new(
+            PermissionsConfig {
+                default: DefaultEffect::Allow,
+                ..Default::default()
+            },
+            PathBuf::from("/tmp"),
+        );
+        assert!(matches!(
+            mgr.check("bash", "cargo test"),
+            PermissionCheck::Allowed
+        ));
+    }
+
+    #[test]
+    fn default_prompt_is_default_behavior() {
+        let mgr = PermissionManager::new(PermissionsConfig::default(), PathBuf::from("/tmp"));
+        assert!(matches!(
+            mgr.check("bash", "cargo test"),
+            PermissionCheck::NeedsPrompt { .. }
+        ));
+    }
+
+    #[test]
+    fn per_tool_default_overrides_global() {
+        let mgr = PermissionManager::new(
+            PermissionsConfig {
+                default: DefaultEffect::Deny,
+                tool_defaults: HashMap::from([("bash".into(), DefaultEffect::Allow)]),
+                rules: vec![],
+                ..Default::default()
+            },
+            PathBuf::from("/tmp"),
+        );
+        assert!(matches!(
+            mgr.check("bash", "cargo test"),
+            PermissionCheck::Allowed
+        ));
+        assert!(matches!(
+            mgr.check("write", "/etc/passwd"),
+            PermissionCheck::Denied
+        ));
     }
 }

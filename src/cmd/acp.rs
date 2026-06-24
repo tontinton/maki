@@ -32,7 +32,7 @@ pub fn run(model_arg: Option<String>, yolo: bool) -> Result<()> {
     config.permissions = load_permissions(&cwd);
 
     if yolo || config.always_yolo {
-        config.permissions.allow_all = true;
+        config.permissions.yolo = true;
     }
     config.validate()?;
 

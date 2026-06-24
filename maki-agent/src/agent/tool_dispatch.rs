@@ -465,12 +465,12 @@ mod tests {
 
         smol::block_on(async {
             let deny_task = PermissionsConfig {
-                allow_all: false,
                 rules: vec![PermissionRule {
                     tool: crate::tools::TASK_TOOL_NAME.into(),
                     scope: None,
                     effect: Effect::Deny,
                 }],
+                ..Default::default()
             };
             let dir = TempDir::new().unwrap();
             let permissions = Arc::new(PermissionManager::new(deny_task, dir.path().to_path_buf()));

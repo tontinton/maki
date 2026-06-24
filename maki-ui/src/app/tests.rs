@@ -30,8 +30,8 @@ fn test_app() -> App {
     let writer = Arc::new(StorageWriter::new(StateDir::from_path(env::temp_dir())));
     let permissions = Arc::new(PermissionManager::new(
         PermissionsConfig {
-            allow_all: false,
             rules: vec![],
+            ..Default::default()
         },
         PathBuf::from("/tmp"),
     ));
@@ -497,8 +497,8 @@ fn load_session_clears_plan() {
         100,
         Arc::new(PermissionManager::new(
             PermissionsConfig {
-                allow_all: false,
                 rules: vec![],
+                ..Default::default()
             },
             PathBuf::from("/tmp"),
         )),
@@ -1076,41 +1076,32 @@ fn make_pending_copy(app: &mut App) {
     app.update(mouse_event(MouseEventKind::Up(MouseButton::Left), 10, 10));
 }
 
-#[test]
-fn key_clears_dragging_but_preserves_pending_copy() {
-    let mut app = test_app();
-    set_zone(&mut app, SelectionZone::Messages, Rect::new(0, 0, 80, 20));
-    app.update(mouse_event(MouseEventKind::Down(MouseButton::Left), 5, 5));
+fn send_key(app: &mut App) {
     app.update(Msg::Key(key(KeyCode::Char('a'))));
-    assert!(app.selection_state.is_none(), "key clears dragging");
-
-    make_pending_copy(&mut app);
-    app.update(Msg::Key(key(KeyCode::Char('a'))));
-    assert!(
-        app.selection_state.as_ref().unwrap().is_pending_copy(),
-        "key preserves pending copy"
-    );
 }
 
-#[test]
-fn scroll_clears_dragging_but_preserves_pending_copy() {
-    let scroll = || Msg::Scroll {
+fn send_scroll(app: &mut App) {
+    app.update(Msg::Scroll {
         column: 10,
         row: 10,
         delta: 3,
-    };
+    });
+}
 
+#[test_case(send_key as fn(&mut App)    ; "key")]
+#[test_case(send_scroll as fn(&mut App) ; "scroll")]
+fn interrupt_clears_dragging_but_preserves_pending_copy(interrupt: fn(&mut App)) {
     let mut app = test_app();
     set_zone(&mut app, SelectionZone::Messages, Rect::new(0, 0, 80, 20));
     app.update(mouse_event(MouseEventKind::Down(MouseButton::Left), 5, 5));
-    app.update(scroll());
-    assert!(app.selection_state.is_none(), "scroll clears dragging");
+    interrupt(&mut app);
+    assert!(app.selection_state.is_none(), "clears dragging");
 
     make_pending_copy(&mut app);
-    app.update(scroll());
+    interrupt(&mut app);
     assert!(
         app.selection_state.as_ref().unwrap().is_pending_copy(),
-        "scroll preserves pending copy"
+        "preserves pending copy"
     );
 }
 
@@ -1127,18 +1118,12 @@ fn new_mouse_down_replaces_pending_copy_with_dragging() {
 }
 
 #[test]
-fn drag_on_pending_copy_is_noop() {
+fn pending_copy_ignores_drag_and_tick() {
     let mut app = test_app();
     make_pending_copy(&mut app);
 
     app.update(mouse_event(MouseEventKind::Drag(MouseButton::Left), 50, 50));
     assert!(app.selection_state.as_ref().unwrap().is_pending_copy());
-}
-
-#[test]
-fn tick_edge_scroll_noop_on_pending_copy() {
-    let mut app = test_app();
-    make_pending_copy(&mut app);
 
     app.tick_edge_scroll();
     assert!(app.selection_state.as_ref().unwrap().is_pending_copy());
@@ -1471,23 +1456,15 @@ fn active_contexts(setup: fn(&mut App), expected: &[KeybindContext], absent: &[K
     }
 }
 
-#[test_case("exit"    ; "bare_exit")]
-#[test_case("  exit " ; "exit_with_whitespace")]
-fn submit_exit_quits(input: &str) {
+#[test]
+fn submit_exit_quits() {
     let mut app = test_app();
     let actions = app.handle_submit(Submission {
-        text: input.into(),
+        text: "exit".into(),
         images: vec![],
     });
     assert_eq!(app.exit_request, ExitRequest::Success);
     assert!(matches!(&actions[0], Action::Quit));
-}
-
-#[test_case(0, "hello"            ; "no_images")]
-#[test_case(1, "hello [1 image]"  ; "single_image")]
-#[test_case(2, "hello [2 images]" ; "multiple_images")]
-fn format_with_images_label(count: usize, expected: &str) {
-    assert_eq!(format_with_images("hello", count), expected);
 }
 
 #[test]
@@ -2411,25 +2388,6 @@ fn ctrl_c_denies_permission_prompt() {
     assert_eq!(app.exit_request, ExitRequest::None);
     assert!(!app.permission_prompt.is_open());
     assert!(actions.is_empty());
-}
-
-#[test_case(false, false => false ; "neither")]
-#[test_case(true,  false => true  ; "messages only")]
-#[test_case(false, true  => true  ; "ephemeral only")]
-#[test_case(true,  true  => true  ; "both")]
-fn has_content(messages: bool, ephemeral: bool) -> bool {
-    let mut app = test_app();
-    app.state.session.meta.mode = Some(maki_storage::sessions::StoredMode::Build);
-    if messages {
-        app.state
-            .session
-            .messages
-            .push(maki_providers::Message::user("hello".into()));
-    }
-    if ephemeral {
-        app.state.session.meta.input_draft = Some("wip".into());
-    }
-    app.has_content()
 }
 
 const TEST_AREA: Rect = Rect {

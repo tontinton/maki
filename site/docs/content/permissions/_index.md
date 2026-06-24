@@ -23,8 +23,8 @@ For every tool call, Maki resolves permission like this:
 
 1. If any **deny** rule matches, denied. Full stop.
 2. If **YOLO** is active, allowed.
-3. If any **allow** rule matches all scopes, allowed.
-4. Otherwise, prompt the user.
+3. If all scopes match an **allow** rule, allowed.
+4. Fall back to `default` (per-tool, then global). Built-in default is `"prompt"`.
 
 ## Builtin Defaults
 
@@ -51,7 +51,7 @@ There are two permission files:
 - **Project**: `.maki/permissions.toml` (takes precedence over global)
 
 ```toml
-allow_all = false
+default = "deny"
 
 [bash]
 allow = [
@@ -63,11 +63,27 @@ deny = [
     "sudo *",
 ]
 
-[write]
-deny = ["/etc/*"]
+[read]
+allow = true
 ```
 
 Each tool gets its own section with `allow` and `deny` arrays. Values are glob-like scope patterns, or `true` to match everything.
+
+### The `default` key
+
+Controls what happens when no allow or deny rule matches. Can be `"prompt"` (built-in default), `"deny"`, or `"allow"`. Set it globally or per-tool:
+
+```toml
+default = "deny"
+
+[bash]
+default = "prompt"
+allow = ["cargo *"]
+```
+
+Here everything is denied by default, except `bash` which still prompts, and `cargo *` commands which are allowed.
+
+Note: `default = "allow"` only works in the global file. Projects cannot grant themselves full access.
 
 ## Scope Patterns
 

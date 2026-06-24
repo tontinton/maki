@@ -619,8 +619,9 @@ pub fn cli_tool_ctx() -> ToolContext {
         CancelToken::none(),
         Arc::new(PermissionManager::new(
             maki_config::PermissionsConfig {
-                allow_all: true,
+                default: maki_config::DefaultEffect::Allow,
                 rules: vec![],
+                ..Default::default()
             },
             std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
         )),
@@ -637,8 +638,9 @@ pub mod test_support {
     static TEST_PERMISSIONS: LazyLock<Arc<PermissionManager>> = LazyLock::new(|| {
         Arc::new(PermissionManager::new(
             maki_config::PermissionsConfig {
-                allow_all: true,
+                default: maki_config::DefaultEffect::Allow,
                 rules: vec![],
+                ..Default::default()
             },
             std::path::PathBuf::from("/tmp"),
         ))

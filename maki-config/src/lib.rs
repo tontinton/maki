@@ -402,24 +402,28 @@ impl IndexFileConfig {
 
 #[derive(Default)]
 struct PermissionsFileConfig {
-    allow_all: Option<bool>,
+    default: Option<DefaultEffect>,
     tools: HashMap<String, ToolPermissions>,
 }
 
 impl<'de> Deserialize<'de> for PermissionsFileConfig {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let table = toml::Table::deserialize(deserializer)?;
-        let allow_all = table.get("allow_all").and_then(|v| v.as_bool());
-        let mut tools = HashMap::new();
-        for (k, v) in &table {
-            if k == "allow_all" {
-                continue;
-            }
-            if let Ok(tp) = v.clone().try_into::<ToolPermissions>() {
-                tools.insert(k.clone(), tp);
-            }
-        }
-        Ok(Self { allow_all, tools })
+        let default = table
+            .get("default")
+            .and_then(|v| DefaultEffect::deserialize(v.clone()).ok())
+            .or_else(|| {
+                table
+                    .get("allow_all")?
+                    .as_bool()?
+                    .then_some(DefaultEffect::Allow)
+            });
+        let tools = table
+            .iter()
+            .filter(|(k, _)| k != &"allow_all" && k != &"default")
+            .filter_map(|(k, v)| Some((k.clone(), v.clone().try_into::<ToolPermissions>().ok()?)))
+            .collect();
+        Ok(Self { default, tools })
     }
 }
 
@@ -427,6 +431,7 @@ impl<'de> Deserialize<'de> for PermissionsFileConfig {
 struct ToolPermissions {
     allow: Option<ScopeSet>,
     deny: Option<ScopeSet>,
+    default: Option<DefaultEffect>,
 }
 
 #[derive(Deserialize)]
@@ -434,6 +439,15 @@ struct ToolPermissions {
 enum ScopeSet {
     All(bool),
     Scopes(Vec<String>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum DefaultEffect {
+    #[default]
+    Prompt,
+    Deny,
+    Allow,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -457,8 +471,10 @@ pub struct PermissionRule {
 
 #[derive(Debug, Clone, Default)]
 pub struct PermissionsConfig {
-    pub allow_all: bool,
+    pub default: DefaultEffect,
+    pub tool_defaults: HashMap<String, DefaultEffect>,
     pub rules: Vec<PermissionRule>,
+    pub yolo: bool,
 }
 
 pub struct Config {
@@ -892,13 +908,38 @@ fn build_permissions(
     global: PermissionsFileConfig,
     project: PermissionsFileConfig,
 ) -> PermissionsConfig {
-    let allow_all = global.allow_all.unwrap_or(false);
+    let global_default = global.default.unwrap_or(DefaultEffect::Prompt);
+    let default = match project.default {
+        Some(DefaultEffect::Allow) => global_default,
+        Some(d) => d,
+        None => global_default,
+    };
+
+    let mut tool_defaults = HashMap::new();
+    for (tool, perms) in &global.tools {
+        if let Some(d) = perms.default {
+            tool_defaults.insert(tool.clone(), d);
+        }
+    }
+    for (tool, perms) in &project.tools {
+        if let Some(d) = perms.default
+            && d != DefaultEffect::Allow
+        {
+            tool_defaults.insert(tool.clone(), d);
+        }
+    }
+
     let mut rules = Vec::new();
     for tools in [&global.tools, &project.tools] {
         push_rules(&mut rules, tools, Effect::Deny);
         push_rules(&mut rules, tools, Effect::Allow);
     }
-    PermissionsConfig { allow_all, rules }
+    PermissionsConfig {
+        default,
+        tool_defaults,
+        rules,
+        yolo: false,
+    }
 }
 
 fn global_dir() -> Option<PathBuf> {
@@ -954,15 +995,36 @@ pub fn load_permissions(cwd: &Path) -> PermissionsConfig {
 fn load_permissions_inner(cwd: &Path, global_dirs: &[PathBuf]) -> PermissionsConfig {
     let mut global_perms = PermissionsFileConfig::default();
     for dir in global_dirs {
-        if let Some(p) = read_permissions_file(&dir.join(PERMISSIONS_FILE)) {
+        let path = dir.join(PERMISSIONS_FILE);
+        migrate_permissions_file(&path);
+        if let Some(p) = read_permissions_file(&path) {
             global_perms = p;
         }
     }
 
-    let project_perms =
-        read_permissions_file(&cwd.join(PROJECT_DIR).join(PERMISSIONS_FILE)).unwrap_or_default();
+    let project_path = cwd.join(PROJECT_DIR).join(PERMISSIONS_FILE);
+    migrate_permissions_file(&project_path);
+    let project_perms = read_permissions_file(&project_path).unwrap_or_default();
 
     build_permissions(global_perms, project_perms)
+}
+
+fn migrate_permissions_file(path: &Path) {
+    let Ok(content) = fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(mut doc) = content.parse::<toml_edit::DocumentMut>() else {
+        return;
+    };
+    let Some(item) = doc.remove("allow_all") else {
+        return;
+    };
+    if item.as_bool() == Some(true) {
+        doc.insert("default", toml_edit::value("allow"));
+    }
+    if let Err(e) = fs::write(path, doc.to_string()) {
+        warn!(path = %path.display(), error = %e, "failed to migrate permissions file");
+    }
 }
 
 fn read_permissions_file(path: &Path) -> Option<PermissionsFileConfig> {
@@ -1313,12 +1375,12 @@ mod tests {
         let global = global_config_dir(dir.path());
         write_global_permissions(
             dir.path(),
-            "allow_all = true\n\n\
+            "default = \"allow\"\n\n\
              [bash]\nallow = [\n    \"cargo *\",\n]\ndeny = [\n    \"rm -rf *\",\n]\n",
         );
 
         let perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
-        assert!(perms.allow_all);
+        assert_eq!(perms.default, DefaultEffect::Allow);
         assert_eq!(perms.rules.len(), 2);
         assert_eq!(perms.rules[0].effect, Effect::Deny);
         assert_eq!(perms.rules[0].tool, "bash");
@@ -1346,7 +1408,7 @@ mod tests {
         .unwrap();
 
         let perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
-        assert!(!perms.allow_all);
+        assert_eq!(perms.default, DefaultEffect::Prompt);
         assert_eq!(perms.rules.len(), 4);
 
         let deny_rules: Vec<_> = perms
@@ -1370,15 +1432,15 @@ mod tests {
     }
 
     #[test]
-    fn project_allow_all_ignored() {
+    fn project_default_allow_ignored() {
         let dir = TempDir::new().unwrap();
         let global = global_config_dir(dir.path());
         let maki_dir = dir.path().join(".maki");
         fs::create_dir_all(&maki_dir).unwrap();
-        fs::write(maki_dir.join("permissions.toml"), "allow_all = true\n").unwrap();
+        fs::write(maki_dir.join("permissions.toml"), "default = \"allow\"\n").unwrap();
 
         let perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
-        assert!(!perms.allow_all);
+        assert_eq!(perms.default, DefaultEffect::Prompt);
     }
 
     #[test]
@@ -1416,7 +1478,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let global = global_config_dir(dir.path());
         let perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
-        assert!(!perms.allow_all);
+        assert_eq!(perms.default, DefaultEffect::Prompt);
         assert!(perms.rules.is_empty());
     }
 
@@ -1432,6 +1494,96 @@ mod tests {
         let perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
         assert_eq!(perms.rules[0].effect, Effect::Deny);
         assert_eq!(perms.rules[1].effect, Effect::Allow);
+    }
+
+    #[test]
+    fn permissions_default_deny_global() {
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        write_global_permissions(dir.path(), "default = \"deny\"\n");
+
+        let perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
+        assert_eq!(perms.default, DefaultEffect::Deny);
+    }
+
+    #[test]
+    fn permissions_default_per_tool() {
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        write_global_permissions(
+            dir.path(),
+            "default = \"deny\"\n\n[bash]\ndefault = \"allow\"\nallow = [\"cargo *\"]\n",
+        );
+
+        let perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
+        assert_eq!(perms.default, DefaultEffect::Deny);
+        assert_eq!(
+            perms.tool_defaults.get("bash").copied(),
+            Some(DefaultEffect::Allow)
+        );
+    }
+
+    #[test]
+    fn permissions_default_merge_project_overrides_global_per_tool() {
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        write_global_permissions(dir.path(), "[bash]\ndefault = \"allow\"\n");
+        let maki_dir = dir.path().join(".maki");
+        fs::create_dir_all(&maki_dir).unwrap();
+        fs::write(
+            maki_dir.join("permissions.toml"),
+            "[bash]\ndefault = \"deny\"\n",
+        )
+        .unwrap();
+
+        let perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
+        assert_eq!(
+            perms.tool_defaults.get("bash").copied(),
+            Some(DefaultEffect::Deny)
+        );
+    }
+
+    #[test]
+    fn permissions_allow_all_migrated() {
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        write_global_permissions(
+            dir.path(),
+            "allow_all = true\n\n[bash]\nallow = [\"cargo *\"]\n",
+        );
+
+        let perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
+        assert_eq!(perms.default, DefaultEffect::Allow);
+
+        let content = fs::read_to_string(global.join("permissions.toml")).unwrap();
+        assert!(!content.contains("allow_all"));
+        assert!(content.contains("default = \"allow\""));
+    }
+
+    #[test]
+    fn permissions_allow_all_false_migrated_removed() {
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        write_global_permissions(dir.path(), "allow_all = false\n");
+
+        let perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
+        assert_eq!(perms.default, DefaultEffect::Prompt);
+
+        let content = fs::read_to_string(global.join("permissions.toml")).unwrap();
+        assert!(!content.contains("allow_all"));
+        assert!(!content.contains("default"));
+    }
+
+    #[test]
+    fn project_default_deny_allowed() {
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        let maki_dir = dir.path().join(".maki");
+        fs::create_dir_all(&maki_dir).unwrap();
+        fs::write(maki_dir.join("permissions.toml"), "default = \"deny\"\n").unwrap();
+
+        let perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
+        assert_eq!(perms.default, DefaultEffect::Deny);
     }
 
     #[test]

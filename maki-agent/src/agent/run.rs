@@ -554,8 +554,9 @@ mod tests {
                 tool_output_lines: ToolOutputLines::default(),
                 permissions: Arc::new(PermissionManager::new(
                     maki_config::PermissionsConfig {
-                        allow_all: true,
+                        default: maki_config::DefaultEffect::Allow,
                         rules: vec![],
+                        ..Default::default()
                     },
                     std::path::PathBuf::from("/tmp"),
                 )),
@@ -809,8 +810,9 @@ mod tests {
                     tool_output_lines: ToolOutputLines::default(),
                     permissions: Arc::new(PermissionManager::new(
                         maki_config::PermissionsConfig {
-                            allow_all: true,
+                            default: maki_config::DefaultEffect::Allow,
                             rules: vec![],
+                            ..Default::default()
                         },
                         std::path::PathBuf::from("/tmp"),
                     )),
