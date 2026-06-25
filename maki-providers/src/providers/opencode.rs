@@ -255,6 +255,7 @@ impl Opencode {
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn handle_catalog_messages(
         &self,
         model: &Model,
@@ -319,9 +320,11 @@ impl Provider for Opencode {
         _session_id: Option<&'a str>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
+            let model_for_stream = model.clone();
+
             let (meta, auth) = {
                 let guard = CATALOG.get().unwrap().lock().unwrap();
-                let (meta, auth) = guard.lookup(&model.id)?;
+                let (meta, auth) = guard.lookup(&model_for_stream.spec())?;
                 // Dynamic provider auth (e.g. from Lua) overrides the opencode route
                 let auth = match (&self.auth, meta.provider_id.as_str()) {
                     (Some(provider_auth), "opencode") => provider_auth.lock().unwrap().clone(),
@@ -329,8 +332,6 @@ impl Provider for Opencode {
                 };
                 (meta, auth)
             };
-
-            let model_for_stream = model.clone();
 
             let mut buf = String::new();
             let system = super::with_prefix(&self.system_prefix, system, &mut buf);
