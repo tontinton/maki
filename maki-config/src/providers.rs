@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+use std::process;
 
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
@@ -9,13 +10,26 @@ use tracing::debug;
 use maki_storage::paths;
 
 const PROVIDERS_FILE: &str = "providers.toml";
-const DEFAULT_TIER: &str = "medium";
+const BAD_CONFIG_EXIT_CODE: i32 = 2;
+
+/// Coarse capability classification used by maki-providers to dispatch tiered
+/// requests. Mirrors `maki_providers::ModelTier` shape but lives here so the
+/// config layer can validate inputs without depending on maki-providers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Tier {
+    Weak,
+    #[default]
+    Medium,
+    Strong,
+    Compaction,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelDef {
     pub id: String,
-    #[serde(default = "default_tier")]
-    pub tier: String,
+    #[serde(default)]
+    pub tier: Tier,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -48,10 +62,6 @@ impl ModelDef {
     pub fn has_fast_pricing(&self) -> bool {
         self.pricing_fast_input.is_some() || self.pricing_fast_output.is_some()
     }
-}
-
-fn default_tier() -> String {
-    DEFAULT_TIER.to_string()
 }
 
 /// Normalize a provider name into a lowercase, hyphen-separated slug.
@@ -142,25 +152,29 @@ pub struct ProvidersConfig {
 }
 
 impl ProvidersConfig {
+    /// Read and parse `providers.toml`. Hard-exits on parse errors so a typo
+    /// in tier or pricing surfaces immediately instead of silently dropping
+    /// every provider and starting maki with an empty registry.
     pub fn load() -> Self {
         let path = providers_file_path();
         if !path.exists() {
             return Self::default();
         }
-        match fs::read_to_string(&path) {
-            Ok(content) => match toml::from_str(&content) {
-                Ok(config) => {
-                    debug!(path = %path.display(), "loaded providers config");
-                    config
-                }
-                Err(e) => {
-                    tracing::warn!(path = %path.display(), error = %e, "invalid providers.toml, ignoring");
-                    Self::default()
-                }
-            },
+        let content = match fs::read_to_string(&path) {
+            Ok(c) => c,
             Err(e) => {
                 tracing::warn!(path = %path.display(), error = %e, "cannot read providers.toml");
-                Self::default()
+                return Self::default();
+            }
+        };
+        match toml::from_str(&content) {
+            Ok(config) => {
+                debug!(path = %path.display(), "loaded providers config");
+                config
+            }
+            Err(e) => {
+                eprintln!("error: invalid {}: {e}", path.display());
+                process::exit(BAD_CONFIG_EXIT_CODE);
             }
         }
     }
@@ -322,6 +336,37 @@ mod tests {
             parsed.get("my-provider").unwrap().base_url,
             Some("https://api.example.com/v1".into())
         );
+    }
+
+    const UNKNOWN_TIER_TOML: &str = r#"id = "x"
+tier = "mediums"
+"#;
+
+    #[test]
+    fn model_def_rejects_unknown_tier() {
+        let err = toml::from_str::<ModelDef>(UNKNOWN_TIER_TOML).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("medium"), "expected enum hint, got: {msg}");
+    }
+
+    #[test]
+    fn model_def_tier_defaults_to_medium() {
+        let m: ModelDef = toml::from_str(r#"id = "x""#).unwrap();
+        assert_eq!(m.tier, Tier::Medium);
+    }
+
+    #[test_case("weak", Tier::Weak ; "weak")]
+    #[test_case("medium", Tier::Medium ; "medium")]
+    #[test_case("strong", Tier::Strong ; "strong")]
+    #[test_case("compaction", Tier::Compaction ; "compaction")]
+    fn model_def_tier_roundtrip(input: &str, expected: Tier) {
+        let toml = format!(
+            r#"id = "x"
+tier = "{input}"
+"#
+        );
+        let m: ModelDef = toml::from_str(&toml).unwrap();
+        assert_eq!(m.tier, expected);
     }
 
     #[test_case("anthropic", None => "ANTHROPIC_API_KEY".to_string(); "builtin_default")]

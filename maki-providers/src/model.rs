@@ -132,6 +132,18 @@ impl FromStr for ModelTier {
     }
 }
 
+impl From<maki_config::providers::Tier> for ModelTier {
+    fn from(t: maki_config::providers::Tier) -> Self {
+        use maki_config::providers::Tier;
+        match t {
+            Tier::Weak => Self::Weak,
+            Tier::Medium => Self::Medium,
+            Tier::Strong => Self::Strong,
+            Tier::Compaction => Self::Compaction,
+        }
+    }
+}
+
 pub struct ModelEntry {
     pub prefixes: &'static [&'static str],
     pub tier: ModelTier,
