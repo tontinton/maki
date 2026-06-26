@@ -233,7 +233,12 @@ fn discover_in(dir: &Path) -> Vec<DynamicProviderMeta> {
             }
         }
 
-        let slug = match path.file_name().and_then(|n| n.to_str()) {
+        let name_part = if cfg!(windows) {
+            path.file_stem()
+        } else {
+            path.file_name()
+        };
+        let slug = match name_part.and_then(|n| n.to_str()) {
             Some(s) => s.to_string(),
             None => continue,
         };
