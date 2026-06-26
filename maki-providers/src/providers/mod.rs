@@ -28,6 +28,15 @@ pub(crate) mod zai;
 
 const LOW_SPEED_BYTES_PER_SEC: u32 = 1;
 
+pub(crate) fn user_agent() -> &'static str {
+    concat!(
+        "maki/v",
+        env!("CARGO_PKG_VERSION"),
+        "-g",
+        env!("GIT_SHORT_HASH")
+    )
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Timeouts {
     pub connect: Duration,

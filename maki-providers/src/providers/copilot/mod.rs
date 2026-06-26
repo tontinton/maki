@@ -421,6 +421,7 @@ async fn try_discover_api_endpoint(client: &HttpClient, token: &str) -> Result<S
         .uri("https://api.github.com/graphql")
         .header("authorization", format!("Bearer {token}"))
         .header("content-type", "application/json")
+        .header("user-agent", super::user_agent())
         .body(serde_json::to_vec(&body)?)?;
 
     let mut response = client.send_async(request).await?;
@@ -446,7 +447,8 @@ fn copilot_request(
         .header("authorization", format!("Bearer {}", auth.token))
         .header("content-type", "application/json")
         .header("editor-version", EDITOR_VERSION_HEADER)
-        .header("x-github-api-version", API_VERSION_HEADER);
+        .header("x-github-api-version", API_VERSION_HEADER)
+        .header("user-agent", super::user_agent());
 
     if let Some(interaction_type) = interaction_type {
         builder

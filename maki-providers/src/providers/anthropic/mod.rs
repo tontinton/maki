@@ -105,7 +105,8 @@ impl Anthropic {
         let mut builder = Request::builder()
             .method(method)
             .uri(url)
-            .header("anthropic-version", API_VERSION);
+            .header("anthropic-version", API_VERSION)
+            .header("user-agent", super::user_agent());
         for (key, value) in &auth.headers {
             builder = builder.header(key.as_str(), value.as_str());
         }

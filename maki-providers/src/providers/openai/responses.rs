@@ -152,7 +152,8 @@ pub(crate) async fn do_stream(
     let mut builder = Request::builder()
         .method("POST")
         .uri(format!("{base}{RESPONSES_PATH}"))
-        .header("content-type", "application/json");
+        .header("content-type", "application/json")
+        .header("user-agent", super::super::user_agent());
     for (key, value) in &auth.headers {
         builder = builder.header(key.as_str(), value.as_str());
     }
