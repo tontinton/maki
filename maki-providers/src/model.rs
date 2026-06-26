@@ -203,6 +203,7 @@ pub struct Model {
     pub id: String,
     pub provider: ProviderKind,
     pub dynamic_slug: Option<String>,
+    pub sub_provider: Option<String>,
     pub tier: ModelTier,
     pub family: ModelFamily,
     pub supports_tool_examples_override: Option<bool>,
@@ -252,6 +253,7 @@ impl Model {
             id: model_id.to_string(),
             provider,
             dynamic_slug: dynamic_slug.map(str::to_string),
+            sub_provider: None,
             tier,
             family,
             supports_tool_examples_override: None,
@@ -277,6 +279,8 @@ impl Model {
     pub fn spec(&self) -> String {
         if let Some(slug) = &self.dynamic_slug {
             format!("{slug}/{}", self.id)
+        } else if let Some(sub) = &self.sub_provider {
+            format!("{}/{}/{}", self.provider, sub, self.id)
         } else {
             format!("{}/{}", self.provider, self.id)
         }
@@ -322,6 +326,13 @@ impl Model {
         let (provider_str, model_id) = spec.split_once('/').ok_or(ModelError::InvalidFormat)?;
 
         if let Ok(provider) = ProviderKind::from_str(provider_str) {
+            if provider == ProviderKind::Opencode {
+                let (sub_provider, actual_model_id) =
+                    model_id.split_once('/').ok_or(ModelError::InvalidFormat)?;
+                let mut model = Self::from_base(provider, actual_model_id, None);
+                model.sub_provider = Some(sub_provider.to_string());
+                return Ok(model);
+            }
             return Ok(Self::from_base(provider, model_id, None));
         }
 
@@ -409,6 +420,7 @@ mod tests {
 
     #[test_case("no-slash-here", ModelError::InvalidFormat ; "invalid_format")]
     #[test_case("foobar/gpt-4", ModelError::UnsupportedProvider("foobar".into()) ; "unsupported_provider")]
+    #[test_case("opencode/opus", ModelError::InvalidFormat ; "opencode_two_levels")]
     fn from_spec_errors(spec: &str, expected: ModelError) {
         let err = Model::from_spec(spec).unwrap_err();
         assert_eq!(
@@ -518,6 +530,44 @@ mod tests {
             assert_eq!(round.id, model.id);
             assert_eq!(round.provider, model.provider);
         }
+    }
+
+    #[test]
+    fn opencode_from_spec_parses_sub_provider() {
+        let model = Model::from_spec("opencode/nvidia/openai/gpt-oss-120b").unwrap();
+        assert_eq!(model.provider, ProviderKind::Opencode);
+        assert_eq!(model.sub_provider.as_deref(), Some("nvidia"));
+        assert_eq!(model.id, "openai/gpt-oss-120b");
+    }
+
+    #[test]
+    fn opencode_from_spec_explicit_opencode_sub_provider() {
+        let model = Model::from_spec("opencode/opencode/opus").unwrap();
+        assert_eq!(model.provider, ProviderKind::Opencode);
+        assert_eq!(model.sub_provider.as_deref(), Some("opencode"));
+        assert_eq!(model.id, "opus");
+    }
+
+    #[test]
+    fn opencode_spec_roundtrips_with_sub_provider() {
+        let spec = "opencode/nvidia/openai/gpt-oss-120b";
+        let model = Model::from_spec(spec).unwrap();
+        assert_eq!(model.spec(), spec);
+    }
+
+    #[test]
+    fn opencode_spec_roundtrips_explicit_sub_provider() {
+        let spec = "opencode/opencode/opus";
+        let model = Model::from_spec(spec).unwrap();
+        assert_eq!(model.spec(), spec);
+    }
+
+    #[test]
+    fn opencode_spec_includes_sub_provider() {
+        let model = Model::from_spec("opencode/fireworks/deepseek-ai/DeepSeek-R1").unwrap();
+        assert_eq!(model.spec(), "opencode/fireworks/deepseek-ai/DeepSeek-R1");
+        assert_eq!(model.sub_provider.as_deref(), Some("fireworks"));
+        assert_eq!(model.id, "deepseek-ai/DeepSeek-R1");
     }
 
     #[test]

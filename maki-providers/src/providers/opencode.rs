@@ -324,7 +324,11 @@ impl Provider for Opencode {
 
             let (meta, auth) = {
                 let guard = CATALOG.get().unwrap().lock().unwrap();
-                let (meta, auth) = guard.lookup(&model_for_stream.spec())?;
+                let sub = model_for_stream
+                    .sub_provider
+                    .as_deref()
+                    .unwrap_or("opencode");
+                let (meta, auth) = guard.lookup(&format!("{}/{}", sub, model_for_stream.id))?;
                 // Dynamic provider auth (e.g. from Lua) overrides the opencode route
                 let auth = match (&self.auth, meta.provider_id.as_str()) {
                     (Some(provider_auth), "opencode") => provider_auth.lock().unwrap().clone(),
@@ -1068,5 +1072,157 @@ mod tests {
         // lookup expects \"provider/model_id\" format
         let (meta, _) = result.lookup("opencode/shared-model").unwrap();
         assert_eq!(meta.provider_id, "opencode");
+    }
+
+    #[test]
+    fn lookup_finds_opencode_own_models() {
+        let mut models = HashMap::new();
+        models.insert(
+            "opus".into(),
+            CatalogModel {
+                limit: None,
+                cost: Some(CatalogCost {
+                    input: Some(0.0),
+                    output: Some(0.0),
+                    cache_read: None,
+                    cache_write: None,
+                }),
+                provider: None,
+            },
+        );
+        let mut providers = HashMap::new();
+        providers.insert(
+            "opencode".into(),
+            CatalogProvider {
+                name: "Opencode".into(),
+                env: vec!["OPENCODE_API_KEY".into()],
+                npm: "@ai-sdk/openai-compatible".into(),
+                api: Some("https://opencode.ai/zen/v1".into()),
+                models,
+            },
+        );
+
+        let data = catalog_to_data(providers);
+        let (meta, _) = data.lookup("opencode/opus").unwrap();
+        assert_eq!(meta.provider_id, "opencode");
+    }
+
+    #[test]
+    fn lookup_finds_model_id_with_slashes() {
+        let mut models = HashMap::new();
+        models.insert(
+            "openai/gpt-oss-120b".into(),
+            CatalogModel {
+                limit: None,
+                cost: Some(CatalogCost {
+                    input: Some(0.0),
+                    output: Some(0.0),
+                    cache_read: None,
+                    cache_write: None,
+                }),
+                provider: None,
+            },
+        );
+        let mut providers = HashMap::new();
+        providers.insert(
+            "nvidia".into(),
+            CatalogProvider {
+                name: "NVIDIA".into(),
+                env: vec!["MAKI_TEST_NVIDIA_KEY_LOOKUP".into()],
+                npm: "@ai-sdk/openai-compatible".into(),
+                api: Some("https://nvapi.xyz/v1".into()),
+                models,
+            },
+        );
+
+        unsafe { std::env::set_var("MAKI_TEST_NVIDIA_KEY_LOOKUP", "key") };
+        let data = catalog_to_data(providers);
+        unsafe { std::env::remove_var("MAKI_TEST_NVIDIA_KEY_LOOKUP") };
+
+        // Entry is stored as ("nvidia", "openai/gpt-oss-120b")
+        let (meta, _) = data.lookup("nvidia/openai/gpt-oss-120b").unwrap();
+        assert_eq!(meta.provider_id, "nvidia");
+    }
+
+    #[test]
+    fn lookup_spec_is_sub_provider_plus_model_id() {
+        // Simulates the stream_message pattern:
+        // lookup key = "{sub_provider}/{model.id}"
+        // e.g. "nvidia/openai/gpt-oss-120b"
+        let mut models = HashMap::new();
+        models.insert(
+            "openai/gpt-oss-120b".into(),
+            CatalogModel {
+                limit: None,
+                cost: Some(CatalogCost {
+                    input: Some(0.0),
+                    output: Some(0.0),
+                    cache_read: None,
+                    cache_write: None,
+                }),
+                provider: None,
+            },
+        );
+        let mut providers = HashMap::new();
+        providers.insert(
+            "nvidia".into(),
+            CatalogProvider {
+                name: "NVIDIA".into(),
+                env: vec!["MAKI_TEST_NVIDIA_DIRECT".into()],
+                npm: "@ai-sdk/openai-compatible".into(),
+                api: Some("https://nvapi.xyz/v1".into()),
+                models,
+            },
+        );
+
+        unsafe { std::env::set_var("MAKI_TEST_NVIDIA_DIRECT", "key") };
+        let data = catalog_to_data(providers);
+        unsafe { std::env::remove_var("MAKI_TEST_NVIDIA_DIRECT") };
+
+        // The lookup key constructed by stream_message:
+        // format!("{}/{}", sub_provider, model.id)
+        // = "nvidia/openai/gpt-oss-120b"
+        let key = format!("{}/{}", "nvidia", "openai/gpt-oss-120b");
+        let (meta, _) = data.lookup(&key).unwrap();
+        assert_eq!(meta.provider_id, "nvidia");
+    }
+
+    #[test]
+    fn lookup_nested_model_id_uses_sub_provider_key() {
+        let mut models = HashMap::new();
+        models.insert(
+            "deepseek-ai/DeepSeek-R1".into(),
+            CatalogModel {
+                limit: None,
+                cost: Some(CatalogCost {
+                    input: Some(0.0),
+                    output: Some(0.0),
+                    cache_read: None,
+                    cache_write: None,
+                }),
+                provider: None,
+            },
+        );
+        let mut providers = HashMap::new();
+        providers.insert(
+            "fireworks".into(),
+            CatalogProvider {
+                name: "Fireworks".into(),
+                env: vec!["MAKI_TEST_FIREWORKS_DEEP".into()],
+                npm: "@ai-sdk/openai-compatible".into(),
+                api: Some("https://fireworks.ai/v1".into()),
+                models,
+            },
+        );
+
+        unsafe { std::env::set_var("MAKI_TEST_FIREWORKS_DEEP", "key") };
+        let data = catalog_to_data(providers);
+        unsafe { std::env::remove_var("MAKI_TEST_FIREWORKS_DEEP") };
+
+        // stream_message constructs key as "{sub_provider}/{model.id}"
+        // = "fireworks/deepseek-ai/DeepSeek-R1"
+        let key = format!("{}/{}", "fireworks", "deepseek-ai/DeepSeek-R1");
+        let (meta, _) = data.lookup(&key).unwrap();
+        assert_eq!(meta.provider_id, "fireworks");
     }
 }

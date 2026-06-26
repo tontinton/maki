@@ -385,6 +385,7 @@ pub(crate) fn test_model() -> maki_providers::Model {
         id: "test-model".into(),
         provider: maki_providers::provider::ProviderKind::Anthropic,
         dynamic_slug: None,
+        sub_provider: None,
         tier: maki_providers::ModelTier::Medium,
         family: maki_providers::ModelFamily::Claude,
         supports_tool_examples_override: None,
