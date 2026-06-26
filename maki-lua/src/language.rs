@@ -68,7 +68,7 @@ impl Language {
             "html" | "htm" => Some(Self::Html),
             "java" => Some(Self::Java),
             "c" | "h" => Some(Self::C),
-            "cpp" | "cc" | "cxx" | "hpp" | "hxx" | "hh" => Some(Self::Cpp),
+            "cpp" | "cc" | "cxx" | "hpp" | "hxx" | "hh" | "ixx" => Some(Self::Cpp),
             "cs" => Some(Self::CSharp),
             "rb" | "rake" | "gemspec" => Some(Self::Ruby),
             "php" => Some(Self::Php),

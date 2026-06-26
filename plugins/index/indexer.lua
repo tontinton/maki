@@ -25,6 +25,7 @@ local EXT_TO_LANG = {
   hpp = "cpp",
   hxx = "cpp",
   hh = "cpp",
+  ixx = "cpp",
   cs = "c_sharp",
   rb = "ruby",
   rake = "ruby",
