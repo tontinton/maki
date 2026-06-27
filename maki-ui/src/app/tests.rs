@@ -2093,8 +2093,8 @@ fn re_edit_keeps_plan_form_visible() {
     assert!(app.plan_form.is_visible());
 }
 
-#[test_case(0, Mode::Build, true,  true  ; "clear_and_implement")]
-#[test_case(1, Mode::Build, false, true  ; "implement_keeps_context")]
+#[test_case(1, Mode::Build, true,  true  ; "clear_and_implement")]
+#[test_case(2, Mode::Build, false, true  ; "implement_keeps_context")]
 fn plan_form_menu_options(
     downs: usize,
     expected_mode: Mode,
@@ -2128,6 +2128,8 @@ fn plan_form_menu_options(
 fn plan_form_implement_toggled_parallel() {
     let mut app = plan_app();
     app.update(Msg::Key(key(KeyCode::Char(' '))));
+    app.update(Msg::Key(key(KeyCode::Down)));
+    app.update(Msg::Key(key(KeyCode::Down)));
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
     let expected_msg = implement_msg(!PlanForm::new().parallel());
     assert!(

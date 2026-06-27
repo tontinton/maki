@@ -32,6 +32,11 @@ struct MenuItem {
 
 const MENU: &[MenuItem] = &[
     MenuItem {
+        label: "Refine plan",
+        desc: "  Dismiss and keep editing the plan",
+        action: || PlanFormAction::Hide,
+    },
+    MenuItem {
         label: "Clear context and implement",
         desc: "  Start fresh session, then implement the plan",
         action: || PlanFormAction::ClearAndImplement,
@@ -282,8 +287,9 @@ mod tests {
         assert_eq!(form.selected, expected);
     }
 
-    #[test_case(0, PlanFormAction::ClearAndImplement ; "enter_at_0")]
-    #[test_case(1, PlanFormAction::Implement          ; "enter_at_1")]
+    #[test_case(0, PlanFormAction::Hide              ; "enter_at_0_refine")]
+    #[test_case(1, PlanFormAction::ClearAndImplement ; "enter_at_1")]
+    #[test_case(2, PlanFormAction::Implement          ; "enter_at_2")]
     fn enter_dispatches(selected: usize, expected: PlanFormAction) {
         let mut form = PlanForm::new();
         form.on_plan_ready();
