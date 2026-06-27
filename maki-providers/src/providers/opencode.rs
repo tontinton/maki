@@ -288,6 +288,7 @@ impl Opencode {
                 auth.base_url.as_deref().unwrap_or(""),
                 MESSAGES_PATH
             ))
+            .header("user-agent", super::user_agent())
             .header("content-type", "application/json")
             .header("anthropic-version", "2023-06-01");
         for (key, value) in &auth.headers {
@@ -430,7 +431,12 @@ async fn save_cached_catalog_async(index: &CatalogIndex) {
 }
 
 async fn fetch_remote_catalog_async(client: &HttpClient) -> Result<CatalogIndex, AgentError> {
-    let mut resp = client.get_async(CATALOG_URL).await.map_err(|e| {
+    let request = Request::builder()
+        .uri(CATALOG_URL)
+        .header("user-agent", super::user_agent())
+        .body(())?;
+
+    let mut resp = client.send_async(request).await.map_err(|e| {
         warn!(error = %e, CATALOG_URL, "failed to fetch catalog");
         AgentError::Config {
             message: format!("failed to fetch catalog from {CATALOG_URL}: {e}"),
