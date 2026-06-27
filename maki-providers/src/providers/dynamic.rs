@@ -25,6 +25,7 @@ use super::mistral::Mistral;
 use super::openai::OpenAi;
 use super::openrouter::OpenRouter;
 use super::synthetic::Synthetic;
+use super::tensorx::TensorX;
 use super::zai::Zai;
 
 const INFO_TIMEOUT: Duration = Duration::from_secs(5);
@@ -387,6 +388,10 @@ pub fn create(slug: &str, timeouts: super::Timeouts) -> Result<Box<dyn Provider>
         ),
         ProviderKind::OpenRouter => Box::new(
             OpenRouter::with_auth(auth.clone(), timeouts)
+                .with_system_prefix(meta.system_prefix.clone()),
+        ),
+        ProviderKind::TensorX => Box::new(
+            TensorX::with_auth(auth.clone(), timeouts)
                 .with_system_prefix(meta.system_prefix.clone()),
         ),
     };

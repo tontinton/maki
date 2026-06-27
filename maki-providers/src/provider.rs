@@ -19,6 +19,7 @@ use crate::providers::mistral::Mistral;
 use crate::providers::openai::OpenAi;
 use crate::providers::openrouter::OpenRouter;
 use crate::providers::synthetic::Synthetic;
+use crate::providers::tensorx::TensorX;
 use crate::providers::zai::Zai;
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
 
@@ -39,6 +40,8 @@ pub enum ProviderKind {
     #[strum(serialize = "openrouter")]
     OpenRouter,
     Synthetic,
+    #[strum(serialize = "tensorx")]
+    TensorX,
 }
 
 impl ProviderKind {
@@ -55,6 +58,7 @@ impl ProviderKind {
             Self::DeepSeek => "DeepSeek",
             Self::OpenRouter => "OpenRouter",
             Self::Synthetic => "Synthetic",
+            Self::TensorX => "TensorX",
         }
     }
 
@@ -71,6 +75,7 @@ impl ProviderKind {
             Self::DeepSeek => "DEEPSEEK_API_KEY",
             Self::OpenRouter => "OPENROUTER_API_KEY",
             Self::Synthetic => "SYNTHETIC_API_KEY",
+            Self::TensorX => "TENSORX_API_KEY",
         }
     }
 
@@ -89,6 +94,7 @@ impl ProviderKind {
             Self::DeepSeek => "https://api.deepseek.com",
             Self::OpenRouter => "https://openrouter.ai/api/v1",
             Self::Synthetic => "https://api.synthetic.new/openai/v1",
+            Self::TensorX => "https://api.tensorx.ai/v1",
         }
     }
 
@@ -103,6 +109,7 @@ impl ProviderKind {
                 | Self::OpenAi
                 | Self::OpenRouter
                 | Self::LlamaCpp
+                | Self::TensorX
         )
     }
 
@@ -122,6 +129,7 @@ impl ProviderKind {
             Self::Synthetic => {
                 Some("Reasoning effort support (low/medium/high), open-weight models")
             }
+            Self::TensorX => Some("Open-weight models, zero data retention, prompt caching"),
             Self::DeepSeek => Some("Thinking mode toggle (on/off), open-weight models"),
             Self::OpenRouter => {
                 Some("300+ models from all providers, prompt caching, provider routing")
@@ -143,13 +151,19 @@ impl ProviderKind {
             Self::DeepSeek => ModelFamily::Generic,
             Self::OpenRouter => ModelFamily::Generic,
             Self::Synthetic => ModelFamily::Synthetic,
+            Self::TensorX => ModelFamily::Generic,
         }
     }
 
     pub const fn accepts_arbitrary_models(self) -> bool {
         matches!(
             self,
-            Self::Ollama | Self::LlamaCpp | Self::Google | Self::Copilot | Self::OpenRouter
+            Self::Ollama
+                | Self::LlamaCpp
+                | Self::Google
+                | Self::Copilot
+                | Self::OpenRouter
+                | Self::TensorX
         )
     }
 
@@ -166,6 +180,8 @@ impl ProviderKind {
             Self::DeepSeek => 384_000,
             Self::OpenRouter => 128_000,
             Self::Synthetic => 32_000,
+            // FIXME: See comment in tensorx.rs
+            Self::TensorX => 0,
         }
     }
 
@@ -182,6 +198,7 @@ impl ProviderKind {
             Self::DeepSeek => 1_000_000,
             Self::OpenRouter => 200_000,
             Self::Synthetic => 128_000,
+            Self::TensorX => 200_000,
         }
     }
 
@@ -204,6 +221,7 @@ impl ProviderKind {
             Self::DeepSeek => Ok(Box::new(DeepSeek::new(timeouts)?)),
             Self::OpenRouter => Ok(Box::new(OpenRouter::new(timeouts)?)),
             Self::Synthetic => Ok(Box::new(Synthetic::new(timeouts)?)),
+            Self::TensorX => Ok(Box::new(TensorX::new(timeouts)?)),
         }
     }
 

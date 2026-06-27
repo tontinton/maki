@@ -170,6 +170,14 @@ OpenRouter aggregates models from many providers behind a single API key. Browse
 
 Defaults: hf:moonshotai/Kimi-K2.5 (strong), hf:deepseek-ai/DeepSeek-V3.2 (medium), hf:zai-org/GLM-4.7-Flash (weak)
 
+### TensorX
+
+- **Env var**: `TENSORX_API_KEY`
+- **API**: `https://api.tensorx.ai/v1`
+- **Features**: Open-weight models, zero data retention, prompt caching
+
+No hardcoded model catalog. Use any model ID supported by this provider.
+
 ## Model Identifiers
 
 Models are referenced as `provider/model_id`:
@@ -197,7 +205,7 @@ To add a custom provider or proxy, drop an executable script into `~/.config/mak
 
 `resolve` is called each time a new agent spawns, so scripts should read tokens from disk instead of caching them in memory. That way auth changes from other processes get picked up.
 
-The `base` field specifies which built-in provider to inherit the model catalog from. Valid values: `anthropic`, `openai`, `google`, `copilot`, `ollama`, `llama-cpp`, `mistral`, `zai`, `deepseek`, `openrouter`, `synthetic`.
+The `base` field specifies which built-in provider to inherit the model catalog from. Valid values: `anthropic`, `openai`, `google`, `copilot`, `ollama`, `llama-cpp`, `mistral`, `zai`, `deepseek`, `openrouter`, `synthetic`, `tensorx`.
 
 If your provider serves models not in the base catalog, add a `models` subcommand returning:
 
