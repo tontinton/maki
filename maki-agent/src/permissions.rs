@@ -469,6 +469,12 @@ fn generalize_scope(tool: &str, scope: &str) -> String {
                 _ => "**".to_string(),
             }
         }
+        // MCP tool calls are dispatched as `mcp:<tool_name>` with a scope equal
+        // to the JSON-stringified input. "Allow always" should whitelist the
+        // tool regardless of its arguments, so generalize the scope to `*`. The
+        // rule's `tool` field (`mcp:<tool_name>`) still gates which MCP tool it
+        // applies to, keeping distinct tools distinct.
+        t if t.starts_with("mcp:") => "*".to_string(),
         _ => scope.to_string(),
     }
 }
@@ -731,6 +737,7 @@ mod tests {
     #[test_case("edit", "/home/user/project/src/main.rs" => "/home/user/project/src/**" ; "edit_uses_parent_dir")]
     #[test_case("edit", "/Cargo.toml" => "//**" ; "edit_root_file")]
     #[test_case("webfetch", "some:scope" => "some:scope" ; "unknown_tool_preserves_exact")]
+    #[test_case("mcp:fetch", "{\"url\":\"https://a\"}" => "*" ; "mcp_tool_generalizes_to_wildcard")]
     fn generalize_single_scope(tool: &str, scope: &str) -> String {
         generalized_scopes(tool, &[scope.into()])
             .into_iter()
@@ -746,12 +753,36 @@ mod tests {
     #[test_case("bash", "git status --short" ; "bash_command_with_flags")]
     #[test_case("edit", "/home/user/project/src/main.rs" ; "edit_path")]
     #[test_case("webfetch", "https://example.com" ; "unknown_tool_exact")]
+    #[test_case("mcp:fetch", "{\"url\":\"https://a\"}" ; "mcp_tool_call")]
     fn command_matches_its_own_generalized_rule(tool: &str, scope: &str) {
         let rule = &generalized_scopes(tool, &[scope.into()])[0];
         assert!(
             scope_matches(rule, scope),
             "{scope:?} does not match its generalized rule {rule:?}"
         );
+    }
+
+    /// "Allow always" on an MCP tool generalizes the stored scope to `*`, so a
+    /// later call with different arguments matches the persisted rule instead of
+    /// reprompting, while a different MCP tool is still gated by its `tool` name.
+    #[test]
+    fn mcp_allow_always_matches_any_args_but_stays_per_tool() {
+        let mgr = default_mgr();
+        mgr.apply_decision(
+            "mcp:fetch",
+            &["{\"url\":\"https://a\"}".into()],
+            &PermissionAnswer::AllowSession,
+        );
+        // Same tool, different arguments -> allowed without reprompting.
+        assert!(matches!(
+            mgr.check("mcp:fetch", "{\"url\":\"https://b\"}"),
+            PermissionCheck::Allowed
+        ));
+        // A distinct MCP tool is not covered by the fetch rule.
+        assert!(!matches!(
+            mgr.check("mcp:exec", "{\"cmd\":\"ls\"}"),
+            PermissionCheck::Allowed
+        ));
     }
 
     #[test]
