@@ -96,9 +96,10 @@ case("safe_resolve_rejects_bad_paths", function()
 end)
 
 case("safe_resolve_accepts_good_paths", function()
+  local s = "[/\\\\]"
   local good = {
     { "notes.md", "notes%.md" },
-    { "sub/deep/notes.md", "sub/deep/notes%.md" },
+    { "sub/deep/notes.md", "sub" .. s .. "deep" .. s .. "notes%.md" },
     { "./notes.md", "notes%.md" },
   }
   for _, v in ipairs(good) do

@@ -1,5 +1,6 @@
 use std::env;
 use std::ops::ControlFlow;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -91,7 +92,7 @@ fn resolve_bedrock_auth() -> Result<BedrockAuth, AgentError> {
     } else {
         let profile = env::var("AWS_PROFILE").unwrap_or_else(|_| "default".into());
         let creds_path = env::var("HOME")
-            .map(|h| format!("{h}/.aws/credentials"))
+            .map(|h| PathBuf::from(h).join(".aws").join("credentials"))
             .unwrap_or_default();
         if let Ok(content) = std::fs::read_to_string(&creds_path)
             && let Ok((access_key, secret_key, session_token)) =

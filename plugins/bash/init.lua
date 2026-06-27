@@ -46,19 +46,30 @@ local function parse_cd_hint(input)
   return input.command, nil
 end
 
+local function normalize_sep(s)
+  return s:gsub("\\", "/")
+end
+
 local function relative_path(p)
+  local np = normalize_sep(p)
   local cwd = maki.uv.cwd()
-  if cwd and p:sub(1, #cwd + 1) == cwd .. "/" then
-    local rel = p:sub(#cwd + 2)
-    return rel == "" and "." or rel
-  end
-  if cwd and p == cwd then
-    return "."
+  if cwd then
+    cwd = normalize_sep(cwd)
+    if np:sub(1, #cwd + 1) == cwd .. "/" then
+      local rel = np:sub(#cwd + 2)
+      return rel == "" and "." or rel
+    end
+    if np == cwd then
+      return "."
+    end
   end
   local home = maki.uv.os_homedir()
-  if home and p:sub(1, #home + 1) == home .. "/" then
-    local rel = p:sub(#home + 2)
-    return rel == "" and "~" or "~/" .. rel
+  if home then
+    home = normalize_sep(home)
+    if np:sub(1, #home + 1) == home .. "/" then
+      local rel = np:sub(#home + 2)
+      return rel == "" and "~" or "~/" .. rel
+    end
   end
   return p
 end

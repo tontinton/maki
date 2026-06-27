@@ -204,6 +204,9 @@ async fn enforce_permission(
             .await
             .map_err(|e| e.to_string())?;
     }
+    if let Some(target) = inv.mutable_path() {
+        ctx.permissions.check_physical_boundary(target)?;
+    }
     Ok(())
 }
 

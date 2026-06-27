@@ -542,6 +542,7 @@ pub(crate) fn create_fs_table(lua: &Lua, perms: &PluginPermissions) -> LuaResult
 
 #[cfg(test)]
 mod tests {
+    use std::fs::OpenOptions;
     use std::time::{Duration, SystemTime};
 
     use super::*;
@@ -952,11 +953,15 @@ mod tests {
 
         let old_time = SystemTime::now() - Duration::from_secs(60);
         let new_time = SystemTime::now();
-        std::fs::File::open(&old_path)
+        OpenOptions::new()
+            .write(true)
+            .open(&old_path)
             .unwrap()
             .set_modified(old_time)
             .unwrap();
-        std::fs::File::open(&new_path)
+        OpenOptions::new()
+            .write(true)
+            .open(&new_path)
             .unwrap()
             .set_modified(new_time)
             .unwrap();

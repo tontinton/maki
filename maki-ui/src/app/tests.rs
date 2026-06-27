@@ -1490,8 +1490,12 @@ fn cd_command_behavior() {
     });
     let flash = app.status_bar.flash_text().unwrap();
     assert!(flash.starts_with("cd /tmp"), "flash={flash:?}");
-    let canonical = std::fs::canonicalize("/tmp").unwrap();
-    assert_eq!(app.state.session.cwd, canonical.to_string_lossy());
+    // Use `canonicalize_clean` (resolves symlinks like the OS does) rather
+    // than `absolute` which preserves symlinks. On macOS `/tmp` is a symlink
+    // to `/private/tmp`; production `cmd_cd` reads back `current_dir()` which
+    // returns the resolved form, so the test expectation must match.
+    let resolved = maki_storage::paths::canonicalize_clean(Path::new("/tmp"));
+    assert_eq!(app.state.session.cwd, resolved.to_string_lossy());
 
     app.execute_command(ParsedCommand {
         name: "/cd".into(),

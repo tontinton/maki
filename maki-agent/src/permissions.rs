@@ -21,9 +21,7 @@ pub const PERMISSION_DENIED_PREFIX: &str = "Permission denied for";
 fn builtin_rules(cwd: &Path) -> Vec<PermissionRule> {
     let cwd_glob = format!(
         "{}/**",
-        cwd.canonicalize()
-            .unwrap_or_else(|_| cwd.to_path_buf())
-            .display()
+        maki_storage::paths::canonicalize_clean(cwd).display()
     );
     let allow = |tool: &str, scope: &str| PermissionRule {
         tool: tool.into(),
@@ -263,6 +261,25 @@ impl PermissionManager {
         self.yolo.load(Ordering::Relaxed)
     }
 
+    /// Check whether a mutable path physically resolves inside the project
+    /// boundary (`cwd`). Returns `Err` if the path escapes via symlink,
+    /// or if the boundary itself cannot be determined (fails closed).
+    pub fn check_physical_boundary(&self, path: &Path) -> Result<(), String> {
+        match physical_boundary_check(&self.cwd, path) {
+            Some(true) => Ok(()),
+            Some(false) => Err(format!(
+                "Path {} resolves outside the project boundary \
+                 (symlink escape detected)",
+                path.display()
+            )),
+            None => Err(format!(
+                "Cannot verify project boundary for {} \
+                 (project root could not be resolved)",
+                path.display()
+            )),
+        }
+    }
+
     pub fn session_rules_snapshot(&self) -> Vec<PermissionRule> {
         self.session_rules().clone()
     }
@@ -406,12 +423,24 @@ fn matches_rule(rule: &PermissionRule, tool: &str, scope: &str) -> bool {
 /// must be tried before the bare `*`, otherwise a plain prefix would swallow
 /// them. `" *"` is the bash form `<command> *`: it has to match the bare
 /// command too (`pwd *` covers `pwd` and `pwd -L`, but not `pwdx`).
+///
+/// For the `/**` path pattern, `Path::starts_with` is used to compare
+/// components rather than characters, which handles both `/` and `\`
+/// transparently on all platforms.
 pub fn scope_matches(pattern: &str, value: &str) -> bool {
     if pattern == "*" || pattern == "**" {
         return true;
     }
     if let Some(prefix) = pattern.strip_suffix("/**") {
-        return value == prefix || value.starts_with(&format!("{prefix}/"));
+        let norm_prefix = maki_storage::paths::canonicalize_clean(Path::new(prefix));
+        // Use incremental canonicalization for the value so symlinks in
+        // existing path components are resolved before any `..` traversal.
+        // `canonicalize_clean` falls back to lexical normalization when the
+        // file doesn't exist, which breaks scope matching when the project
+        // dir itself is a symlink.
+        let norm_value = maki_storage::paths::incremental_canonicalize(Path::new(value))
+            .unwrap_or_else(|| maki_storage::paths::normalize_path(Path::new(value)));
+        return norm_value == norm_prefix || norm_value.starts_with(&norm_prefix);
     }
     if let Some(prefix) = pattern.strip_suffix(" *") {
         return value == prefix || value.starts_with(&format!("{prefix} "));
@@ -422,25 +451,33 @@ pub fn scope_matches(pattern: &str, value: &str) -> bool {
     pattern == value
 }
 
-pub fn canonicalize_scope_path(path: &str) -> String {
+/// Lexical normalization for scope paths. Resolves `..` and `.` without
+/// hitting the filesystem and without producing `\\?\` prefixes on Windows.
+/// Use this for display, logging, and scope matching.
+///
+/// For symlink-aware security checks, use [`physical_boundary_check`].
+pub fn normalize_scope_path(path: &str) -> String {
     let resolved = crate::tools::resolve_path(path).unwrap_or_else(|_| path.to_string());
-    let p = Path::new(&resolved);
-    match p.canonicalize() {
-        Ok(abs) => abs.to_string_lossy().into_owned(),
-        Err(_) => {
-            let mut result = PathBuf::new();
-            for component in p.components() {
-                match component {
-                    std::path::Component::ParentDir => {
-                        result.pop();
-                    }
-                    std::path::Component::CurDir => {}
-                    c => result.push(c),
-                }
-            }
-            result.to_string_lossy().into_owned()
-        }
-    }
+    maki_storage::paths::normalize_path(Path::new(&resolved))
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Check whether `child` is physically inside `parent`, following symlinks.
+///
+/// Uses incremental left-to-right canonicalization: each component is
+/// resolved through the filesystem (including symlinks) *before* any
+/// subsequent `..` component can act on it. This prevents symlink-based
+/// boundary escapes where a symlink followed by `..` resolves to a
+/// location outside the parent.
+///
+/// Returns `true` only when the resolved filesystem location of `child`
+/// is under `parent`. Returns `None` if the parent itself cannot be resolved.
+pub fn physical_boundary_check(parent: &Path, child: &Path) -> Option<bool> {
+    let parent_canon = maki_storage::paths::incremental_canonicalize(parent)?;
+    let child_canon =
+        maki_storage::paths::incremental_canonicalize(child).unwrap_or_else(|| child.to_path_buf());
+    Some(child_canon.starts_with(&parent_canon))
 }
 
 fn generalize_bash_segment(segment: &str) -> String {
@@ -571,8 +608,30 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn scope_matches_resolves_symlinked_parent() {
+        let tmp = std::env::temp_dir();
+        let real = tmp.join("__maki_test_scope_symlink_real");
+        let link = tmp.join("__maki_test_scope_symlink_link");
+        let _ = std::fs::remove_dir_all(&real);
+        let _ = std::fs::remove_file(&link);
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let pattern = format!("{}/**", real.display());
+        let value = format!("{}/new_file.txt", link.display());
+        assert!(
+            scope_matches(&pattern, &value),
+            "symlinked parent should resolve: pattern={pattern}, value={value}"
+        );
+
+        let _ = std::fs::remove_dir_all(&real);
+        let _ = std::fs::remove_file(&link);
+    }
+
+    #[test]
     fn path_traversal_prompts() {
-        let path = canonicalize_scope_path("/tmp/../etc/passwd");
+        let path = normalize_scope_path("/tmp/../etc/passwd");
         assert!(matches!(
             default_mgr().check("write", &path),
             PermissionCheck::NeedsPrompt { .. }
@@ -640,6 +699,92 @@ mod tests {
             mgr.check("bash", "cargo build"),
             PermissionCheck::NeedsPrompt { .. }
         ));
+    }
+
+    #[test]
+    fn check_physical_boundary_inside_passes() {
+        let tmp = std::env::temp_dir();
+        let mgr = PermissionManager::new(PermissionsConfig::default(), tmp.clone());
+        assert!(
+            mgr.check_physical_boundary(&tmp.join("some_file.txt"))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn check_physical_boundary_outside_fails() {
+        let tmp = std::env::temp_dir();
+        let mgr = PermissionManager::new(PermissionsConfig::default(), tmp);
+        // /etc/hosts (unix) or C:\Windows\System32\drivers\etc\hosts (windows)
+        // should always be outside the temp dir.
+        #[cfg(unix)]
+        let outside = Path::new("/etc/hosts");
+        #[cfg(windows)]
+        let outside = Path::new(r"C:\Windows\System32\drivers\etc\hosts");
+        assert!(mgr.check_physical_boundary(outside).is_err());
+    }
+
+    #[test]
+    fn physical_boundary_blocks_dotdot_smuggling() {
+        let tmp = std::env::temp_dir();
+        // Create a real subdir so the walk-up logic has an existing ancestor
+        // to canonicalize, but the `..` components end up in the tail.
+        let sub = tmp.join("__maki_test_boundary");
+        std::fs::create_dir_all(&sub).unwrap();
+        // Attack: /tmp/__maki_test_boundary/fake/../../actually_outside
+        // After normalization: /tmp/actually_outside (inside tmp, fine)
+        // But /tmp/__maki_test_boundary/../../../etc/passwd escapes tmp.
+        #[cfg(unix)]
+        let attack = sub
+            .join("x")
+            .join("..")
+            .join("..")
+            .join("..")
+            .join("etc")
+            .join("passwd");
+        #[cfg(windows)]
+        let attack = sub
+            .join("x")
+            .join("..")
+            .join("..")
+            .join("..")
+            .join("Windows")
+            .join("System32");
+        let mgr = PermissionManager::new(PermissionsConfig::default(), sub.clone());
+        assert!(
+            mgr.check_physical_boundary(&attack).is_err(),
+            "dotdot smuggling should be caught: {}",
+            attack.display()
+        );
+        let _ = std::fs::remove_dir_all(&sub);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn physical_boundary_catches_symlink_escape() {
+        // Simulates: /project/link -> /etc, target /project/link/../hosts
+        // Lexical normalization would resolve to /project/hosts (passes!).
+        // Incremental canonicalization follows the symlink to /etc first,
+        // then `..` goes to /, making the target /hosts (caught!).
+        let tmp = std::env::temp_dir();
+        let project = tmp.join("__maki_test_symlink_escape");
+        let _ = std::fs::remove_dir_all(&project);
+        std::fs::create_dir_all(&project).unwrap();
+
+        // Create symlink: project/link -> /tmp (points somewhere safe but outside project)
+        let link = project.join("link");
+        let _ = std::os::unix::fs::symlink(&tmp, &link);
+
+        // Attack: project/link/../escape_target
+        // OS resolution: follow link to /tmp, then .. to /, then escape_target = /escape_target
+        let attack = link.join("..").join("escape_target");
+        let mgr = PermissionManager::new(PermissionsConfig::default(), project.clone());
+        assert!(
+            mgr.check_physical_boundary(&attack).is_err(),
+            "symlink escape should be caught: {}",
+            attack.display()
+        );
+        let _ = std::fs::remove_dir_all(&project);
     }
 
     #[test]
@@ -734,8 +879,6 @@ mod tests {
         assert_eq!(result, vec!["cargo *", "git *"]);
     }
 
-    #[test_case("edit", "/home/user/project/src/main.rs" => "/home/user/project/src/**" ; "edit_uses_parent_dir")]
-    #[test_case("edit", "/Cargo.toml" => "//**" ; "edit_root_file")]
     #[test_case("webfetch", "some:scope" => "some:scope" ; "unknown_tool_preserves_exact")]
     #[test_case("mcp:fetch", "{\"url\":\"https://a\"}" => "*" ; "mcp_tool_generalizes_to_wildcard")]
     fn generalize_single_scope(tool: &str, scope: &str) -> String {
@@ -743,6 +886,29 @@ mod tests {
             .into_iter()
             .next()
             .unwrap()
+    }
+
+    #[test]
+    fn generalize_edit_uses_parent_dir() {
+        let result = generalize_scope("edit", "/home/user/project/src/main.rs");
+        let expected = format!(
+            "{}/**",
+            Path::new("/home/user/project/src/main.rs")
+                .parent()
+                .unwrap()
+                .display()
+        );
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn generalize_edit_root_file() {
+        let result = generalize_scope("edit", "/Cargo.toml");
+        let expected = format!(
+            "{}/**",
+            Path::new("/Cargo.toml").parent().unwrap().display()
+        );
+        assert_eq!(result, expected);
     }
 
     /// "Allow always" stores a command's generalized scope as a rule, so the
