@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use arc_swap::ArcSwapOption;
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use ratatui::text::{Line, Span};
@@ -22,24 +22,26 @@ fn footer_line() -> Line<'static> {
     Line::from(vec![
         Span::styled("  Enter", t.keybind_key),
         Span::styled(" select", t.tool_dim),
-        Span::styled("  1", t.keybind_key),
+        Span::styled("  !", t.keybind_key),
         Span::styled(" strong", t.tool_dim),
-        Span::styled("  2", t.keybind_key),
+        Span::styled("  @", t.keybind_key),
         Span::styled(" medium", t.tool_dim),
-        Span::styled("  3", t.keybind_key),
+        Span::styled("  #", t.keybind_key),
         Span::styled(" weak", t.tool_dim),
-        Span::styled("  4", t.keybind_key),
+        Span::styled("  $", t.keybind_key),
         Span::styled(" compaction", t.tool_dim),
     ])
 }
 
 fn tier_for_shortcut(key: KeyEvent) -> Option<ModelTier> {
-    let digit = match key.code {
-        KeyCode::Char(c @ '1'..='4') => c,
-        KeyCode::Char('¡') => '1',
-        KeyCode::Char('™') => '2',
-        KeyCode::Char('£') => '3',
-        KeyCode::Char('$') | KeyCode::Char('€') => '4',
+    let digit = match (key.code, key.modifiers.contains(KeyModifiers::SHIFT)) {
+        // Kitty protocol: Shift+digit reported with base key + SHIFT modifier
+        (KeyCode::Char(c @ '1'..='4'), true) => c,
+        // Legacy terminals: Shift+digit reported as the resulting character
+        (KeyCode::Char('!' | '¡'), false) => '1', // US, ES
+        (KeyCode::Char('@' | '"' | '™'), false) => '2', // US, UK/DE
+        (KeyCode::Char('#' | '§' | '£'), false) => '3', // US, DE, UK
+        (KeyCode::Char('$' | '€' | '¤'), false) => '4', // US, EU, Nordic
         _ => return None,
     };
     match digit {
@@ -237,10 +239,6 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use test_case::test_case;
 
-    fn alt_key(code: KeyCode) -> KeyEvent {
-        KeyEvent::new(code, KeyModifiers::ALT)
-    }
-
     fn test_models() -> Arc<ArcSwapOption<Vec<String>>> {
         let models = Arc::new(ArcSwapOption::empty());
         models.store(Some(Arc::new(vec![
@@ -346,18 +344,15 @@ mod tests {
         assert!(parse_model_entry("no-slash").is_none());
     }
 
-    #[test_case(key(KeyCode::Char('1')),           ModelTier::Strong     ; "bare_1_strong")]
-    #[test_case(key(KeyCode::Char('2')),           ModelTier::Medium     ; "bare_2_medium")]
-    #[test_case(key(KeyCode::Char('3')),           ModelTier::Weak       ; "bare_3_weak")]
-    #[test_case(key(KeyCode::Char('4')),           ModelTier::Compaction ; "bare_4_compaction")]
-    #[test_case(alt_key(KeyCode::Char('1')),       ModelTier::Strong     ; "alt_1_strong")]
-    #[test_case(alt_key(KeyCode::Char('2')),       ModelTier::Medium     ; "alt_2_medium")]
-    #[test_case(alt_key(KeyCode::Char('3')),       ModelTier::Weak       ; "alt_3_weak")]
-    #[test_case(key(KeyCode::Char('\u{00A1}')),    ModelTier::Strong     ; "macos_opt_1_strong")]
-    #[test_case(key(KeyCode::Char('\u{2122}')),    ModelTier::Medium     ; "macos_opt_2_medium")]
-    #[test_case(key(KeyCode::Char('\u{00A3}')),    ModelTier::Weak       ; "macos_opt_3_weak")]
-    #[test_case(key(KeyCode::Char('$')),           ModelTier::Compaction ; "dollar_compaction")]
-    #[test_case(key(KeyCode::Char('€')),           ModelTier::Compaction ; "euro_compaction")]
+    #[test_case(key(KeyCode::Char('!')),           ModelTier::Strong     ; "shift_1_strong")]
+    #[test_case(key(KeyCode::Char('@')),           ModelTier::Medium     ; "shift_2_medium")]
+    #[test_case(key(KeyCode::Char('#')),           ModelTier::Weak       ; "shift_3_weak")]
+    #[test_case(key(KeyCode::Char('$')),           ModelTier::Compaction ; "shift_4_dollar_compaction")]
+    #[test_case(key(KeyCode::Char('€')),           ModelTier::Compaction ; "shift_4_euro_compaction")]
+    #[test_case(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::SHIFT), ModelTier::Strong     ; "kitty_shift_1_strong")]
+    #[test_case(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::SHIFT), ModelTier::Medium     ; "kitty_shift_2_medium")]
+    #[test_case(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::SHIFT), ModelTier::Weak       ; "kitty_shift_3_weak")]
+    #[test_case(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::SHIFT), ModelTier::Compaction ; "kitty_shift_4_compaction")]
     fn tier_shortcut_assigns_and_keeps_picker_open(k: KeyEvent, want: ModelTier) {
         let mut p = ModelPicker::new(test_models());
         p.open("");
