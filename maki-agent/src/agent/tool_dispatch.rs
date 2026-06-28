@@ -99,17 +99,21 @@ pub async fn run(
             }
         };
 
-        if let AgentMode::Plan(plan_path) = &ctx.mode
-            && let Some(target) = invocation.mutable_path()
-            && target != plan_path.as_path()
-        {
-            warn!(
-                tool = %name,
-                target = %target.display(),
-                plan = %plan_path.display(),
-                "blocked write in plan mode"
-            );
-            return done_error(crate::tools::PLAN_WRITE_RESTRICTED.into());
+        if let Some(target) = invocation.mutable_path() {
+            let is_plan_target = matches!(&ctx.mode, AgentMode::Plan(pp) if target == pp.as_path());
+            if !is_plan_target {
+                if matches!(&ctx.mode, AgentMode::Plan(_)) {
+                    warn!(
+                        tool = %name,
+                        target = %target.display(),
+                        "blocked write in plan mode"
+                    );
+                    return done_error(crate::tools::PLAN_WRITE_RESTRICTED.into());
+                }
+                if let Err(e) = ctx.permissions.check_physical_boundary(target) {
+                    return done_error(e);
+                }
+            }
         }
 
         let header_result = invocation.start_header().await;
@@ -203,9 +207,6 @@ async fn enforce_permission(
             )
             .await
             .map_err(|e| e.to_string())?;
-    }
-    if let Some(target) = inv.mutable_path() {
-        ctx.permissions.check_physical_boundary(target)?;
     }
     Ok(())
 }
