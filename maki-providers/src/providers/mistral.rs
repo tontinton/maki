@@ -24,14 +24,14 @@ inventory::submit!(maki_config::providers::BuiltInProvider {
     protocol: maki_config::providers::Protocol::Openai,
     default_base_url: "https://api.mistral.ai/v1",
     default_api_key_env: "MISTRAL_API_KEY",
-    default_model: "mistral/devstral-latest",
+    default_model: "mistral/mistral-medium-latest",
     plans: Some(&[
         (
             "standard",
             maki_config::providers::ProviderPlan {
                 display_name: "Standard",
                 base_url: "https://api.mistral.ai/v1",
-                default_model: Some("mistral/devstral-latest"),
+                default_model: Some("mistral/mistral-medium-latest"),
                 login_url: None,
             }
         ),
@@ -52,28 +52,17 @@ inventory::submit!(maki_config::providers::BuiltInProvider {
 pub(crate) fn models() -> &'static [ModelEntry] {
     &[
         ModelEntry {
-            prefixes: &["devstral-latest", "devstral-medium-latest", "devstral-2512"],
+            prefixes: &[
+                "mistral-medium-latest",
+                "mistral-medium-3.5",
+                "mistral-medium-2604",
+            ],
             tier: ModelTier::Strong,
             family: ModelFamily::Generic,
             default: true,
             pricing: ModelPricing {
-                input: 0.4,
-                output: 2.0,
-                cache_write: 0.00,
-                cache_read: 0.00,
-                fast: None,
-            },
-            max_output_tokens: 262_144,
-            context_window: 262_144,
-        },
-        ModelEntry {
-            prefixes: &["mistral-large-latest", "mistral-large-2512"],
-            tier: ModelTier::Medium,
-            family: ModelFamily::Generic,
-            default: true,
-            pricing: ModelPricing {
-                input: 0.5,
-                output: 1.5,
+                input: 1.5,
+                output: 7.5,
                 cache_write: 0.00,
                 cache_read: 0.00,
                 fast: None,
@@ -83,12 +72,27 @@ pub(crate) fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["mistral-small-latest", "mistral-small-2603"],
-            tier: ModelTier::Weak,
+            tier: ModelTier::Medium,
             family: ModelFamily::Generic,
             default: true,
             pricing: ModelPricing {
                 input: 0.15,
                 output: 0.60,
+                cache_write: 0.00,
+                cache_read: 0.00,
+                fast: None,
+            },
+            max_output_tokens: 262_144,
+            context_window: 262_144,
+        },
+        ModelEntry {
+            prefixes: &["ministral-14b-latest", "ministral-14b-2512"],
+            tier: ModelTier::Weak,
+            family: ModelFamily::Generic,
+            default: true,
+            pricing: ModelPricing {
+                input: 0.20,
+                output: 0.20,
                 cache_write: 0.00,
                 cache_read: 0.00,
                 fast: None,

@@ -114,11 +114,11 @@ Connects to any OpenAI-compatible `/v1` endpoint. Point `LLAMA_CPP_HOST` to your
 
 | Tier | Models | Pricing (in/out per 1M tokens) | Context |
 |------|--------|-------------------------------|---------|
-| Weak | **mistral-small-latest, mistral-small-2603** (default) | $0.15 / $0.60 | 262K ctx / 262K out |
-| Medium | **mistral-large-latest, mistral-large-2512** (default) | $0.50 / $1.50 | 262K ctx / 262K out |
-| Strong | **devstral-latest, devstral-medium-latest, devstral-2512** (default) | $0.40 / $2.00 | 262K ctx / 262K out |
+| Weak | **ministral-14b-latest, ministral-14b-2512** (default) | $0.20 / $0.20 | 262K ctx / 262K out |
+| Medium | **mistral-small-latest, mistral-small-2603** (default) | $0.15 / $0.60 | 262K ctx / 262K out |
+| Strong | **mistral-medium-latest, mistral-medium-3.5, mistral-medium-2604** (default) | $1.50 / $7.50 | 262K ctx / 262K out |
 
-Defaults: devstral-latest (strong), mistral-large-latest (medium), mistral-small-latest (weak)
+Defaults: mistral-medium-latest (strong), mistral-small-latest (medium), ministral-14b-latest (weak)
 
 ### Z.AI
 
