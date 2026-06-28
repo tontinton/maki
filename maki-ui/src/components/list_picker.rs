@@ -1,8 +1,12 @@
 //! Modal list picker with search. Supports immediate (`open`) or lazy loading
 //! (`open_loading` → `resolve`) where a spinner is shown until items arrive.
 
+use std::collections::HashSet;
 use std::sync::OnceLock;
 use std::time::Instant;
+
+use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
+use nucleo_matcher::{Config, Matcher};
 
 use crate::animation::{spinner_frame, spinner_str};
 use crate::components::Overlay;
@@ -118,6 +122,7 @@ struct State<T> {
     viewport_height: usize,
     inner_area: Rect,
     enabled: Option<Vec<bool>>,
+    matcher: Matcher,
 }
 
 impl<T: PickerItem> State<T> {
@@ -132,6 +137,7 @@ impl<T: PickerItem> State<T> {
             viewport_height: 20,
             inner_area: Rect::default(),
             enabled: None,
+            matcher: Matcher::new(Config::DEFAULT),
         }
     }
 
@@ -146,13 +152,29 @@ impl<T: PickerItem> State<T> {
         if query.is_empty() {
             self.filtered = (0..self.items.len()).collect();
         } else {
-            let query_lower = query.to_ascii_lowercase();
-            self.filtered = self
+            let pattern = Pattern::new(
+                &query,
+                CaseMatching::Smart,
+                Normalization::Smart,
+                AtomKind::Fuzzy,
+            );
+            // Create labels with their original indices
+            let labeled: Vec<(usize, &str)> = self
                 .items
                 .iter()
                 .enumerate()
-                .filter(|(_, item)| item.label().to_ascii_lowercase().contains(&query_lower))
-                .map(|(i, _)| i)
+                .map(|(idx, item)| (idx, item.label()))
+                .collect();
+            let matches: HashSet<&str> = pattern
+                .match_list(labeled.iter().map(|(_, label)| *label), &mut self.matcher)
+                .into_iter()
+                .map(|(matched_str, _score)| matched_str)
+                .collect();
+            // Find back all indices that have matching labels
+            self.filtered = labeled
+                .into_iter()
+                .filter(|(_, label)| matches.contains(label))
+                .map(|(idx, _)| idx)
                 .collect();
         }
     }
@@ -943,6 +965,32 @@ mod tests {
 
         p.handle_key(key(KeyCode::Char('l')));
         assert_eq!(ready_state(&p).filtered, vec![0]);
+    }
+
+    #[test]
+    fn fuzzy_search_with_nucleo_matcher() {
+        let mut p = ListPicker::new();
+        p.open(
+            entries(&["claude-sonnet", "claude-opus", "gemini-pro", "gpt-4"]),
+            " Test ",
+        );
+
+        // Test fuzzy matching - should find "claude-sonnet" with "clu"
+        p.handle_key(key(KeyCode::Char('c')));
+        p.handle_key(key(KeyCode::Char('l')));
+        p.handle_key(key(KeyCode::Char('u')));
+        let filtered = ready_state(&p).filtered.clone();
+        assert!(filtered.contains(&0)); // claude-sonnet should match
+        assert!(filtered.contains(&1)); // claude-opus should match
+
+        // Test that non-matching items are filtered out
+        p.close();
+        p.open(entries(&["claude-sonnet", "gemini-pro", "gpt-4"]), " Test ");
+        p.handle_key(key(KeyCode::Char('c')));
+        p.handle_key(key(KeyCode::Char('l')));
+        p.handle_key(key(KeyCode::Char('u')));
+        let filtered = ready_state(&p).filtered.clone();
+        assert_eq!(filtered, vec![0]); // only claude-sonnet should match
     }
 
     #[test]
