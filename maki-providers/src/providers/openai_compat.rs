@@ -190,6 +190,7 @@ impl OpenAiCompatProvider {
                         let context_window = m["context_length"]
                             .as_u64()
                             .or_else(|| m["max_model_len"].as_u64())
+                            .or_else(|| m["max_context_length"].as_u64())
                             .and_then(|v| u32::try_from(v).ok());
                         let max_output_tokens =
                             m["max_tokens"].as_u64().and_then(|v| u32::try_from(v).ok());
