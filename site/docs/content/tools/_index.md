@@ -126,7 +126,7 @@ Use this tool when you need to ask the user questions during execution. This all
 
 ## Agent & Knowledge
 
-### `task`
+### `task` *(lua plugin)*
 
 Launch an autonomous subagent to perform tasks independently. Best combined with batch.
 

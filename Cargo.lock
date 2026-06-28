@@ -2510,6 +2510,7 @@ name = "maki-lua"
 version = "0.3.21"
 dependencies = [
  "arc-swap",
+ "async-lock",
  "crossterm",
  "event-listener",
  "flume 0.11.1",
@@ -2523,6 +2524,7 @@ dependencies = [
  "maki-config",
  "maki-highlight",
  "maki-markdown",
+ "maki-providers",
  "maki-storage",
  "mlua",
  "regex",
@@ -2558,6 +2560,7 @@ dependencies = [
  "tree-sitter-swift",
  "tree-sitter-typescript",
  "tree-sitter-zig",
+ "uuid",
 ]
 
 [[package]]

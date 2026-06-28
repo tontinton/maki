@@ -377,10 +377,16 @@ async fn dispatch_mcp(
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::sync::Arc;
 
+    use maki_config::{Effect, PermissionRule, PermissionsConfig};
+    use tempfile::TempDir;
     use test_case::test_case;
 
     use super::*;
+    use crate::permissions::{PERMISSION_DENIED_PREFIX, PermissionManager};
+    use crate::tools::registry::ToolSource;
+    use crate::tools::test_support::{GUARDED_TOOL_NAME, GuardedMock};
 
     fn recent_calls(entries: &[(&str, Value)]) -> RecentCalls {
         let mut rc = RecentCalls::new();
@@ -460,35 +466,33 @@ mod tests {
 
     #[test]
     fn permission_denial_short_circuits_execute() {
-        use std::sync::Arc;
-
-        use maki_config::{Effect, PermissionRule, PermissionsConfig};
-        use tempfile::TempDir;
-
-        use crate::permissions::{PERMISSION_DENIED_PREFIX, PermissionManager};
-
         smol::block_on(async {
-            let deny_task = PermissionsConfig {
+            let deny_cfg = PermissionsConfig {
                 rules: vec![PermissionRule {
-                    tool: crate::tools::TASK_TOOL_NAME.into(),
+                    tool: GUARDED_TOOL_NAME.into(),
                     scope: None,
                     effect: Effect::Deny,
                 }],
                 ..Default::default()
             };
             let dir = TempDir::new().unwrap();
-            let permissions = Arc::new(PermissionManager::new(deny_task, dir.path().to_path_buf()));
+            let permissions = Arc::new(PermissionManager::new(deny_cfg, dir.path().to_path_buf()));
             let ctx = crate::tools::test_support::stub_ctx_with_permissions(
                 &AgentMode::Build,
                 permissions,
             );
 
+            let registry = ToolRegistry::new();
+            registry
+                .register(Arc::new(GuardedMock), ToolSource::Native)
+                .unwrap();
+
             let done = run(
-                ToolRegistry::native(),
+                &registry,
                 None,
                 "t1".into(),
-                crate::tools::TASK_TOOL_NAME,
-                &serde_json::json!({ "description": "test task", "prompt": "hello" }),
+                GUARDED_TOOL_NAME,
+                &serde_json::json!({}),
                 &ctx,
                 Emit::Silent,
             )

@@ -12,7 +12,6 @@ mod file_tracker;
 pub mod grep;
 pub mod registry;
 pub mod schema;
-mod task;
 
 pub use file_tracker::FileReadTracker;
 pub use registry::{
@@ -119,7 +118,7 @@ pub const GREP_TOOL_NAME: &str = "grep";
 pub const MULTIEDIT_TOOL_NAME: &str = "multiedit";
 pub const QUESTION_TOOL_NAME: &str = "question";
 pub const READ_TOOL_NAME: &str = "read";
-pub const TASK_TOOL_NAME: &str = task::Task::NAME;
+pub const TASK_TOOL_NAME: &str = "task";
 pub const TODOWRITE_TOOL_NAME: &str = "todo_write";
 pub const WRITE_TOOL_NAME: &str = "write";
 
@@ -533,7 +532,6 @@ macro_rules! register_tools {
 }
 
 register_tools! {
-    task::Task,
     batch::Batch,
     code_execution::CodeExecution,
 }
@@ -631,9 +629,51 @@ pub fn cli_tool_ctx() -> ToolContext {
 }
 
 pub mod test_support {
-    use crate::{Envelope, EventSender};
+    use std::borrow::Cow;
+
+    use crate::{Envelope, EventSender, ToolOutput};
 
     use super::*;
+
+    pub const GUARDED_TOOL_NAME: &str = "guarded_mock";
+
+    pub struct GuardedMock;
+
+    struct GuardedInvocation;
+
+    impl registry::ToolInvocation for GuardedInvocation {
+        fn start_header(&self) -> registry::HeaderFuture {
+            registry::HeaderFuture::Ready(registry::HeaderResult::plain("mock".into()))
+        }
+        fn permission_scopes(&self) -> registry::BoxFuture<'_, Option<registry::PermissionScopes>> {
+            Box::pin(std::future::ready(Some(
+                registry::PermissionScopes::single("guarded".into()),
+            )))
+        }
+        fn execute<'a>(self: Box<Self>, _ctx: &'a ToolContext) -> registry::ExecFuture<'a> {
+            Box::pin(async {
+                registry::ToolExecResult::from(Ok::<_, String>(ToolOutput::Plain("ok".into())))
+            })
+        }
+    }
+
+    impl registry::Tool for GuardedMock {
+        fn name(&self) -> &str {
+            GUARDED_TOOL_NAME
+        }
+        fn description(&self, _ctx: &DescriptionContext) -> Cow<'_, str> {
+            "guarded mock".into()
+        }
+        fn schema(&self) -> Value {
+            serde_json::json!({"type": "object", "properties": {}, "additionalProperties": false})
+        }
+        fn parse(
+            &self,
+            _input: &Value,
+        ) -> Result<Box<dyn registry::ToolInvocation>, registry::ParseError> {
+            Ok(Box::new(GuardedInvocation))
+        }
+    }
 
     static TEST_PERMISSIONS: LazyLock<Arc<PermissionManager>> = LazyLock::new(|| {
         Arc::new(PermissionManager::new(
@@ -884,7 +924,7 @@ mod tests {
     #[test]
     fn definitions_filtered_returns_only_requested() {
         let vars = Vars::new().set("{cwd}", "/tmp");
-        let filter = ToolFilter::Only(vec!["task".into()]);
+        let filter = ToolFilter::Only(vec!["batch".into()]);
         let ctx = DescriptionContext { filter: &filter };
         let filtered = ToolRegistry::native().definitions(&vars, &ctx, true);
         let names: Vec<&str> = filtered
@@ -893,7 +933,46 @@ mod tests {
             .iter()
             .map(|d| d["name"].as_str().unwrap())
             .collect();
-        assert_eq!(names, ["task"]);
+        assert_eq!(names, ["batch"]);
+    }
+
+    #[test]
+    fn audience_matrix_is_locked() {
+        const MAIN: ToolAudience = ToolAudience::MAIN;
+        const RES: ToolAudience = ToolAudience::RESEARCH_SUB;
+        const GEN: ToolAudience = ToolAudience::GENERAL_SUB;
+
+        let expected: std::collections::BTreeMap<&str, ToolAudience> =
+            std::collections::BTreeMap::from([
+                (BATCH_TOOL_NAME, MAIN | RES | GEN),
+                (CODE_EXECUTION_TOOL_NAME, MAIN | RES | GEN),
+            ]);
+
+        let snapshot = ToolRegistry::native().iter();
+        let actual: std::collections::BTreeMap<String, ToolAudience> = snapshot
+            .iter()
+            .map(|e| (e.name().to_owned(), e.tool.audience()))
+            .collect();
+
+        assert_eq!(
+            actual.len(),
+            expected.len(),
+            "native tool count drift: expected {}, got {} ({:?})",
+            expected.len(),
+            actual.len(),
+            actual.keys().collect::<Vec<_>>()
+        );
+
+        for (name, want) in &expected {
+            let got = actual
+                .get(*name)
+                .unwrap_or_else(|| panic!("missing tool '{name}'"));
+            assert_eq!(
+                got.bits(),
+                want.bits(),
+                "audience drift for '{name}': expected {want:?}, got {got:?}"
+            );
+        }
     }
 
     #[test_case(
@@ -1103,19 +1182,24 @@ mod tests {
     }
 
     #[test]
-    fn glob_not_in_native_registry() {
+    fn lua_tools_not_in_native_registry() {
+        let lua_only = ["glob", "grep", "task"];
         let registry = ToolRegistry::native();
         for entry in registry.iter().iter() {
-            assert_ne!(
-                entry.name(),
-                "glob",
-                "glob should not be in the native Rust tool registry"
+            assert!(
+                !lua_only.contains(&entry.name()),
+                "{} should not be in the native Rust tool registry",
+                entry.name()
             );
-            assert_ne!(
-                entry.name(),
-                "grep",
-                "grep should not be in the native Rust tool registry"
-            );
+        }
+    }
+
+    #[test]
+    fn all_builtin_names_no_duplicates() {
+        let names = all_builtin_tool_names();
+        let mut seen = std::collections::HashSet::new();
+        for name in &names {
+            assert!(seen.insert(name), "duplicate builtin tool name: {name}");
         }
     }
 }

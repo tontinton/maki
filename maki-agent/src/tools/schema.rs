@@ -126,10 +126,12 @@ pub fn to_json_schema(s: &ParamSchema) -> Value {
                 .collect();
             let mut v = json!({
                 "type": "object",
-                "required": required,
                 "properties": props,
                 "additionalProperties": false,
             });
+            if !required.is_empty() {
+                v["required"] = json!(required);
+            }
             if !description.is_empty() {
                 v["description"] = json!(description);
             }
@@ -731,6 +733,19 @@ mod tests {
     fn param_kind_distinguishes_integer_from_number() {
         assert_eq!(ParamKind::of(&json!(3)), ParamKind::Integer);
         assert_eq!(ParamKind::of(&json!(1.5)), ParamKind::Number);
+    }
+
+    #[test]
+    fn to_json_schema_omits_required_when_empty() {
+        const ALL_OPTIONAL: ParamSchema = ParamSchema::Object {
+            properties: &[("hint", &STR_PRIM, false, &[])],
+            description: "",
+        };
+        let v = to_json_schema(&ALL_OPTIONAL);
+        assert!(
+            v.get("required").is_none(),
+            "empty required should be omitted, got: {v}"
+        );
     }
 
     #[test]

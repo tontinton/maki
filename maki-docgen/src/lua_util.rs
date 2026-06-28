@@ -18,11 +18,18 @@ pub fn find_matching_brace(s: &str, open: usize) -> Option<usize> {
 }
 
 pub fn extract_lua_field(s: &str, field: &str) -> Option<String> {
-    let pattern = format!("{field} = \"");
-    let start = s.find(&pattern)?;
-    let after = &s[start + pattern.len()..];
-    let end = after.find('"')?;
-    Some(after[..end].to_string())
+    let dq = format!("{field} = \"");
+    let sq = format!("{field} = '");
+    if let Some(start) = s.find(&dq) {
+        let after = &s[start + dq.len()..];
+        let end = after.find('"')?;
+        Some(unescape_lua_string(&after[..end]))
+    } else {
+        let start = s.find(&sq)?;
+        let after = &s[start + sq.len()..];
+        let end = after.find('\'')?;
+        Some(unescape_lua_string(&after[..end]))
+    }
 }
 
 fn unescape_lua_string(s: &str) -> String {

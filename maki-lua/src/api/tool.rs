@@ -253,6 +253,7 @@ impl ToolInvocation for LuaToolInvocation {
                 finish_tx: None,
                 file_tracker: ctx.file_tracker.clone(),
                 loaded_instructions: ctx.loaded_instructions.clone(),
+                agent: Some(crate::api::ctx::AgentContext::from(ctx)),
             };
 
             if tx

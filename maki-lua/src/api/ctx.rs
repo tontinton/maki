@@ -2,10 +2,16 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use maki_agent::EventSender;
 use maki_agent::agent::LoadedInstructions;
-use maki_agent::cancel::CancelToken;
+use maki_agent::cancel::{CancelMap, CancelToken};
+use maki_agent::mcp::McpHandle;
+use maki_agent::permissions::PermissionManager;
+use maki_agent::prompt::ResolvedSlots;
 use maki_agent::tools::FileReadTracker;
 use maki_config::{AgentConfig, ToolOutputLines};
+use maki_providers::provider::Provider;
+use maki_providers::{Model, RequestOptions, Timeouts};
 use mlua::{LuaSerdeExt, UserData, UserDataMethods, Value as LuaValue};
 
 use crate::api::tool::ToolCallReply;
@@ -25,6 +31,42 @@ impl UserData for RestoreCtx {
     }
 }
 
+pub(crate) struct AgentContext {
+    pub(crate) provider: Arc<dyn Provider>,
+    pub(crate) model: Arc<Model>,
+    pub(crate) event_tx: EventSender,
+    pub(crate) tool_use_id: Option<String>,
+    pub(crate) permissions: Arc<PermissionManager>,
+    pub(crate) timeouts: Timeouts,
+    pub(crate) prompt_slots: Arc<ResolvedSlots>,
+    pub(crate) opts: RequestOptions,
+    pub(crate) subagent_cancels: Arc<CancelMap<String>>,
+    pub(crate) cancel: CancelToken,
+    pub(crate) mcp: Option<McpHandle>,
+    pub(crate) config: AgentConfig,
+}
+
+impl From<&maki_agent::tools::ToolContext> for AgentContext {
+    fn from(ctx: &maki_agent::tools::ToolContext) -> Self {
+        Self {
+            provider: Arc::clone(&ctx.provider),
+            model: Arc::clone(&ctx.model),
+            event_tx: ctx.event_tx.clone(),
+            tool_use_id: ctx.tool_use_id.clone(),
+            permissions: Arc::clone(&ctx.permissions),
+            timeouts: ctx.timeouts,
+            prompt_slots: Arc::clone(&ctx.prompt_slots),
+            opts: ctx.opts,
+            subagent_cancels: Arc::clone(&ctx.subagent_cancels),
+            cancel: ctx.cancel.clone(),
+            mcp: ctx.mcp.clone(),
+            config: ctx.config.clone(),
+        }
+    }
+}
+
+impl UserData for AgentContext {}
+
 pub(crate) struct LuaCtx {
     pub(crate) cancel: CancelToken,
     pub(crate) config: AgentConfig,
@@ -32,6 +74,7 @@ pub(crate) struct LuaCtx {
     pub(crate) finish_tx: Option<flume::Sender<ToolCallReply>>,
     pub(crate) file_tracker: Arc<FileReadTracker>,
     pub(crate) loaded_instructions: LoadedInstructions,
+    pub(crate) agent: Option<AgentContext>,
 }
 
 impl UserData for LuaCtx {
@@ -91,6 +134,12 @@ impl UserData for LuaCtx {
 
         methods.add_method("is_instruction_file", |_, _, name: String| {
             Ok(maki_agent::is_instruction_file(&name))
+        });
+
+        methods.add_method_mut("agent_context", |_, this, ()| {
+            this.agent
+                .take()
+                .ok_or_else(|| mlua::Error::runtime("agent context not available"))
         });
 
         methods.add_method_mut("finish", |_lua, this, val: LuaValue| {
