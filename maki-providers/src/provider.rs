@@ -15,6 +15,7 @@ use crate::model::{Model, ModelFamily, ModelInfo};
 use crate::providers::Timeouts;
 use crate::providers::anthropic::Anthropic;
 use crate::providers::anthropic::bedrock;
+use crate::providers::aperture::Aperture;
 use crate::providers::catalog::{
     OPENCODE_FAMILY_SLUGS, available_if_warm, catalog_providers, catalog_providers_if_available,
 };
@@ -56,6 +57,7 @@ pub enum ProviderKind {
     Opencode,
     #[strum(serialize = "xai")]
     Xai,
+    Aperture,
 }
 
 impl ProviderKind {
@@ -75,6 +77,7 @@ impl ProviderKind {
             Self::TensorX => "TensorX",
             Self::Opencode => "Opencode Zen",
             Self::Xai => "xAI",
+            Self::Aperture => "Aperture",
         }
     }
 
@@ -94,6 +97,7 @@ impl ProviderKind {
             Self::TensorX => "TENSORX_API_KEY",
             Self::Opencode => "OPENCODE_API_KEY",
             Self::Xai => "XAI_API_KEY",
+            Self::Aperture => "",
         }
     }
 
@@ -115,6 +119,7 @@ impl ProviderKind {
             Self::TensorX => "https://api.tensorx.ai/v1",
             Self::Opencode => "https://opencode.ai/zen/v1",
             Self::Xai => "https://api.x.ai/v1",
+            Self::Aperture => "Aperture gateway (set APERTURE_HOST)",
         }
     }
 
@@ -145,6 +150,9 @@ impl ProviderKind {
             Self::Xai => Some(
                 "OAuth login, account-specific model catalog, Grok reasoning (low/medium/high/xhigh)",
             ),
+            Self::Aperture => Some(
+                "Tailscale Aperture LLM gateway; set APERTURE_HOST or configure in providers.toml",
+            ),
             _ => None,
         }
     }
@@ -165,6 +173,7 @@ impl ProviderKind {
             Self::TensorX => ModelFamily::Generic,
             Self::Opencode => ModelFamily::Generic,
             Self::Xai => ModelFamily::Generic,
+            Self::Aperture => ModelFamily::Generic,
         }
     }
 
@@ -189,6 +198,7 @@ impl ProviderKind {
             Self::TensorX => None,
             Self::Opencode => Some(128_000),
             Self::Xai => Some(131_072),
+            Self::Aperture => Some(16_384),
         }
     }
 
@@ -208,6 +218,7 @@ impl ProviderKind {
             Self::TensorX => 200_000,
             Self::Opencode => 256_000,
             Self::Xai => 500_000,
+            Self::Aperture => 128_000,
         }
     }
 
@@ -233,6 +244,7 @@ impl ProviderKind {
             Self::TensorX => Ok(Box::new(TensorX::new(timeouts)?)),
             Self::Opencode => Ok(Box::new(Opencode::new(timeouts)?)),
             Self::Xai => Ok(Box::new(Xai::new(timeouts)?)),
+            Self::Aperture => Ok(Box::new(Aperture::new(timeouts)?)),
         }
     }
 }
@@ -315,6 +327,14 @@ pub fn from_model(model: &mut Model, timeouts: Timeouts) -> Result<Box<dyn Provi
     provider.adjust_model(model);
     debug!(provider = %model.provider, model = %model.id, "provider created");
     Ok(provider)
+}
+
+/// Adjust a model against its provider's static table without retaining the
+/// provider. Used to reconcile a resumed model so it matches one started
+/// fresh (e.g. inherited thinking support for a routed Aperture model).
+pub fn adjust_model(model: &mut Model, timeouts: Timeouts) -> Result<(), AgentError> {
+    provider_for_slug(&model.provider, timeouts)?.adjust_model(model);
+    Ok(())
 }
 
 pub fn from_model_fallback(model: &mut Model, timeouts: Timeouts) -> Box<dyn Provider> {

@@ -201,6 +201,7 @@ supports_vision = false
 | `discover_models` | bool | When true, also probe the provider's model list endpoint (default false) |
 | `enable_free_models` | bool | Opencode only. Show free catalog models (default false) |
 | `models` | array | Declared models for custom providers (see below) |
+| `overrides` | table | Aperture only. Per-upstream model overrides (see below) |
 
 ### Model fields
 
@@ -221,6 +222,25 @@ supports_vision = false
 Custom slugs must not reuse a built-in provider name. A bad TOML parse exits with code 2 at startup so a typo cannot silently empty the registry.
 
 You can also create a custom provider interactively with `maki auth login` and choosing the custom option. That writes a starter entry to this file.
+
+### Aperture overrides
+
+Aperture proxies upstream providers, exposing each model as `aperture/<upstream>/<model>`. Overrides keyed by upstream provider id live under `[aperture.overrides]`:
+
+```toml
+[aperture.overrides.llmserver]
+base = "llama-cpp"
+context_window = 131072
+max_output_tokens = 16384
+
+[aperture.overrides.llmserver.models."qwen-3.6"]
+context_window = 262144
+supports_vision = true
+```
+
+Provider-level fields apply to every model from that upstream; per-model entries under `models` win field by field. Fields: `context_window`, `max_output_tokens`, `supports_thinking`, `supports_vision`, `base` (remaps an opaque vendor to a native provider; e.g. `llama-cpp`, `google`, `anthropic`), and `path_prefix`. Model ids containing dots must be quoted (`"qwen3.6"`) since TOML treats a bare dotted key as a nested table.
+
+Maki sends `/v1` (or `/v1beta` for Gemini routes), and Aperture appends that path to the upstream's base url. If an upstream base url already carries its own path, set `path_prefix = ""` for it to avoid a doubled path.
 
 ### Plans
 
@@ -334,6 +354,8 @@ fn format_auth(kind: ProviderKind) -> String {
     let env = kind.api_key_env();
     if kind == ProviderKind::Ollama {
         format!("`OLLAMA_HOST` for local/remote (e.g. `http://localhost:11434`), `{env}` for auth")
+    } else if kind == ProviderKind::Aperture {
+        "`APERTURE_HOST` (e.g. `https://your-host.tailnet.ts.net`)".into()
     } else {
         format!("`{env}`")
     }
@@ -471,6 +493,10 @@ fn no_catalog_note(kind: ProviderKind) -> &'static str {
         ProviderKind::LlamaCpp => {
             "Connects to any OpenAI-compatible `/v1` endpoint. Point `LLAMA_CPP_HOST` \
              to your server address (defaults to `http://localhost:8080`)."
+        }
+        ProviderKind::Aperture => {
+            "Aperture discovers models from your gateway. Set `APERTURE_HOST` to your Tailscale Aperture \
+             endpoint (e.g. `https://your-host.tailnet.ts.net`). No API key needed, Tailscale handles auth."
         }
         ProviderKind::OpenRouter => {
             "OpenRouter aggregates models from many providers behind a single API key. \

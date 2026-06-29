@@ -264,6 +264,14 @@ OAuth uses the same first-party xAI client as the official Grok CLI (`maki auth 
 
 If `~/.grok/auth.json` already exists, login offers to reuse it without writing that file.
 
+### Aperture
+
+- **Env var**: `APERTURE_HOST` (e.g. `https://your-host.tailnet.ts.net`)
+- **API**: `Aperture gateway (set APERTURE_HOST)`
+- **Features**: Tailscale Aperture LLM gateway; set APERTURE_HOST or configure in providers.toml
+
+Aperture discovers models from your gateway. Set `APERTURE_HOST` to your Tailscale Aperture endpoint (e.g. `https://your-host.tailnet.ts.net`). No API key needed, Tailscale handles auth.
+
 ### Opencode Go
 
 - **Env var**: `OPENCODE_API_KEY`
@@ -338,6 +346,7 @@ supports_vision = false
 | `discover_models` | bool | When true, also probe the provider's model list endpoint (default false) |
 | `enable_free_models` | bool | Opencode only. Show free catalog models (default false) |
 | `models` | array | Declared models for custom providers (see below) |
+| `overrides` | table | Aperture only. Per-upstream model overrides (see below) |
 
 ### Model fields
 
@@ -358,6 +367,25 @@ supports_vision = false
 Custom slugs must not reuse a built-in provider name. A bad TOML parse exits with code 2 at startup so a typo cannot silently empty the registry.
 
 You can also create a custom provider interactively with `maki auth login` and choosing the custom option. That writes a starter entry to this file.
+
+### Aperture overrides
+
+Aperture proxies upstream providers, exposing each model as `aperture/<upstream>/<model>`. Overrides keyed by upstream provider id live under `[aperture.overrides]`:
+
+```toml
+[aperture.overrides.llmserver]
+base = "llama-cpp"
+context_window = 131072
+max_output_tokens = 16384
+
+[aperture.overrides.llmserver.models."qwen-3.6"]
+context_window = 262144
+supports_vision = true
+```
+
+Provider-level fields apply to every model from that upstream; per-model entries under `models` win field by field. Fields: `context_window`, `max_output_tokens`, `supports_thinking`, `supports_vision`, `base` (remaps an opaque vendor to a native provider; e.g. `llama-cpp`, `google`, `anthropic`), and `path_prefix`. Model ids containing dots must be quoted (`"qwen3.6"`) since TOML treats a bare dotted key as a nested table.
+
+Maki sends `/v1` (or `/v1beta` for Gemini routes), and Aperture appends that path to the upstream's base url. If an upstream base url already carries its own path, set `path_prefix = ""` for it to avoid a doubled path.
 
 ### Plans
 
@@ -397,7 +425,7 @@ To add a custom provider or proxy, drop an executable script into the config `pr
 
 `resolve` is called each time a new agent spawns, so scripts should read tokens from disk instead of caching them in memory. That way auth changes from other processes get picked up.
 
-The `base` field specifies which built-in provider to inherit the model catalog from. Valid values: `anthropic`, `openai`, `google`, `copilot`, `ollama`, `llama-cpp`, `mistral`, `zai`, `deepseek`, `openrouter`, `synthetic`, `tensorx`, `opencode`, `xai`.
+The `base` field specifies which built-in provider to inherit the model catalog from. Valid values: `anthropic`, `openai`, `google`, `copilot`, `ollama`, `llama-cpp`, `mistral`, `zai`, `deepseek`, `openrouter`, `synthetic`, `tensorx`, `opencode`, `xai`, `aperture`.
 
 If your provider serves models not in the base catalog, add a `models` subcommand returning:
 
