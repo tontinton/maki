@@ -323,13 +323,14 @@ impl Provider for Opencode {
         Box::pin(async move {
             let model_for_stream = model.clone();
 
+            let model_id = &model_for_stream.id;
+            let (sub_provider, actual_id) =
+                model_id.split_once('/').unwrap_or(("opencode", model_id));
+
             let (meta, auth) = {
                 let guard = CATALOG.get().unwrap().lock().unwrap();
-                let sub = model_for_stream
-                    .sub_provider
-                    .as_deref()
-                    .unwrap_or("opencode");
-                let (meta, auth) = guard.lookup(&format!("{}/{}", sub, model_for_stream.id))?;
+                let (meta, auth) =
+                    guard.lookup(&format!("{sub_provider}/{actual_id}"))?;
                 // Dynamic provider auth (e.g. from Lua) overrides the opencode route
                 let auth = match (&self.auth, meta.provider_id.as_str()) {
                     (Some(provider_auth), "opencode") => provider_auth.lock().unwrap().clone(),
@@ -342,6 +343,7 @@ impl Provider for Opencode {
             let system = super::with_prefix(&self.system_prefix, system, &mut buf);
 
             let model = Model {
+                id: actual_id.to_string(),
                 max_output_tokens: meta.output,
                 context_window: meta.context,
                 ..model_for_stream

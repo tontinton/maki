@@ -114,7 +114,6 @@ pub fn lookup_model(slug: &str, model_id: &str) -> Option<Model> {
         dynamic_slug: Some(slug.to_string()),
         tier,
         family: kind.family(),
-        sub_provider: None,
         supports_tool_examples_override,
         pricing,
         max_output_tokens,
