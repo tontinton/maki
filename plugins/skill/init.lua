@@ -126,7 +126,7 @@ maki.api.register_tool({
     local buf = maki.ui.buf()
     local tol = ctx:tool_output_lines()
     local view = ToolView.new(buf, {
-      max_lines = (tol and tol.skill) or 20,
+      max_lines = (tol and tol.other) or 20,
       keep = "head",
     })
     buf:on("click", function()
