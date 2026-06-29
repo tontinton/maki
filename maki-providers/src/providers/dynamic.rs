@@ -393,11 +393,11 @@ pub fn create(slug: &str, timeouts: super::Timeouts) -> Result<Box<dyn Provider>
         ),
         ProviderKind::TensorX => Box::new(
             TensorX::with_auth(auth.clone(), timeouts)
-                .with_system_prefix(meta.system_prefix.clone())
+                .with_system_prefix(meta.system_prefix.clone()),
         ),
         ProviderKind::Opencode => Box::new(
             Opencode::with_auth(auth.clone(), timeouts)
-                .with_system_prefix(meta.system_prefix.clone())
+                .with_system_prefix(meta.system_prefix.clone()),
         ),
     };
 

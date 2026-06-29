@@ -182,7 +182,9 @@ No hardcoded model catalog. Use any model ID supported by this provider.
 
 - **Env var**: `OPENCODE_API_KEY`
 - **API**: `https://opencode.ai/zen/v1`
-- **Features**: Dynamically discovered models via [models.dev](https://models.dev/) + all the models provided by Opencode Zen API.
+- **Features**: Dynamically discovered models via [models.dev](https://models.dev/) + all the models provided by Opencode Zen API
+
+No hardcoded model catalog. Use any model ID supported by this provider.
 
 ## Model Identifiers
 

@@ -329,8 +329,7 @@ impl Provider for Opencode {
 
             let (meta, auth) = {
                 let guard = CATALOG.get().unwrap().lock().unwrap();
-                let (meta, auth) =
-                    guard.lookup(&format!("{sub_provider}/{actual_id}"))?;
+                let (meta, auth) = guard.lookup(&format!("{sub_provider}/{actual_id}"))?;
                 // Dynamic provider auth (e.g. from Lua) overrides the opencode route
                 let auth = match (&self.auth, meta.provider_id.as_str()) {
                     (Some(provider_auth), "opencode") => provider_auth.lock().unwrap().clone(),

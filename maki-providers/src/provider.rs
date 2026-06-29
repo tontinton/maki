@@ -141,7 +141,9 @@ impl ProviderKind {
             Self::OpenRouter => {
                 Some("300+ models from all providers, prompt caching, provider routing")
             }
-            Self::Opencode => Some("Zen API + dynamically discovered models via models.dev"),
+            Self::Opencode => Some(
+                "Dynamically discovered models via [models.dev](https://models.dev/) + all the models provided by Opencode Zen API",
+            ),
             _ => None,
         }
     }
