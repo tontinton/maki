@@ -43,11 +43,6 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 
-struct LiveBufEntry {
-    buf: Arc<SharedBuf>,
-    dirty_seen: bool,
-}
-
 pub struct MessagesPanel {
     messages: Vec<DisplayMessage>,
     streaming_thinking: StreamingContent,
@@ -66,7 +61,7 @@ pub struct MessagesPanel {
     accent: ColorTransition,
     expanded_tools: HashMap<String, SectionFlags>,
     lua_expanded: HashSet<String>,
-    live_bufs: HashMap<String, LiveBufEntry>,
+    live_bufs: HashMap<String, Arc<SharedBuf>>,
     batch_children: HashMap<String, BatchChildState>,
     tool_output_lines: ToolOutputLines,
     render_hints: RenderHintsRegistry,
@@ -218,8 +213,8 @@ impl MessagesPanel {
     }
 
     pub fn tool_done(&mut self, event: ToolDoneEvent) {
-        if let Some(entry) = self.live_bufs.remove(&event.id)
-            && let Some(lines) = entry.buf.read_if_dirty()
+        if let Some(buf) = self.live_bufs.remove(&event.id)
+            && let Some(lines) = buf.read_if_dirty()
         {
             self.store_snapshot(&event.id, BufferSnapshot::from_arc(lines), false, None);
         }
@@ -641,6 +636,12 @@ impl MessagesPanel {
         };
 
         if self.has_snapshot(tool_id) {
+            if self.tool_in_progress(tool_id) {
+                if let Some(eh) = &self.lua_event_handle {
+                    eh.request_click(tool_id.to_owned());
+                }
+                return true;
+            }
             let expanded = !self.lua_expanded.contains(tool_id);
             if expanded {
                 self.lua_expanded.insert(tool_id.to_owned());
@@ -865,6 +866,28 @@ impl MessagesPanel {
         selection::extract_selection_text(&self.cache, self.viewport_width, sel, msg_area)
     }
 
+    fn tool_in_progress(&self, tool_id: &str) -> bool {
+        if let Some((batch_id, idx)) = parse_batch_inner_id(tool_id) {
+            return self
+                .messages
+                .iter()
+                .rfind(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == batch_id))
+                .and_then(|m| match m.tool_output.as_deref() {
+                    Some(ToolOutput::Batch { entries, .. }) => entries.get(idx),
+                    _ => None,
+                })
+                .is_some_and(|e| e.status == BatchToolStatus::InProgress);
+        }
+        self.messages
+            .iter()
+            .rev()
+            .find_map(|m| match &m.role {
+                DisplayRole::Tool(t) if t.id == tool_id => Some(t.status),
+                _ => None,
+            })
+            .is_some_and(|s| s == ToolStatus::InProgress)
+    }
+
     fn has_snapshot(&self, tool_id: &str) -> bool {
         self.batch_children
             .get(tool_id)
@@ -1058,31 +1081,17 @@ impl MessagesPanel {
     }
 
     pub fn register_live_buf(&mut self, id: String, body: Arc<SharedBuf>) {
-        self.live_bufs.insert(
-            id,
-            LiveBufEntry {
-                buf: body,
-                dirty_seen: false,
-            },
-        );
+        self.live_bufs.insert(id, body);
     }
 
     fn poll_live_bufs(&mut self) {
-        let mut dirty = Vec::new();
-        let mut stale = Vec::new();
-        for (id, entry) in &mut self.live_bufs {
-            if let Some(lines) = entry.buf.read_if_dirty() {
-                entry.dirty_seen = true;
-                dirty.push((id.clone(), lines));
-            } else if entry.dirty_seen {
-                stale.push(id.clone());
-            }
-        }
+        let dirty: Vec<_> = self
+            .live_bufs
+            .iter()
+            .filter_map(|(id, buf)| buf.read_if_dirty().map(|lines| (id.clone(), lines)))
+            .collect();
         for (tool_id, lines) in dirty {
             self.store_snapshot(&tool_id, BufferSnapshot::from_arc(lines), false, None);
-        }
-        for id in stale {
-            self.live_bufs.remove(&id);
         }
     }
 

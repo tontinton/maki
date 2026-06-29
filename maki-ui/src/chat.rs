@@ -16,8 +16,7 @@ use crate::markdown::truncate_output;
 use crate::selection::Selection;
 use maki_agent::tools::{ToolInvocation, ToolRegistry, WRITE_TOOL_NAME};
 use maki_agent::{
-    AgentEvent, BatchToolStatus, BufferSnapshot, SharedBuf, ToolDoneEvent, ToolOutput,
-    ToolStartEvent,
+    AgentEvent, BatchToolStatus, BufferSnapshot, ToolDoneEvent, ToolOutput, ToolStartEvent,
 };
 use maki_config::{ToolOutputLines, UiConfig};
 use maki_providers::{ContentBlock, Message, Role, TokenUsage};
@@ -256,10 +255,6 @@ impl Chat {
     ) {
         self.messages_panel
             .tool_header_snapshot(tool_id, snapshot, theme_gen);
-    }
-
-    pub fn register_live_buf(&mut self, id: String, buf: Arc<SharedBuf>) {
-        self.messages_panel.register_live_buf(id, buf);
     }
 
     pub fn stream_reset(&mut self) {

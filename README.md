@@ -111,7 +111,7 @@ More info at the [official docs](http://maki.sh/docs).
 Currently working on a refactor so maki is a core agent UI loop with features like tools, UI elements, and storage all controlled by Lua plugins.
 This will allow you to customize the hell out of maki.
 
-Status: all tools but `batch` and `code_execution` are Lua plugins (in the `./plugins` dir).
+Status: all tools but `batch` are Lua plugins (in the `./plugins` dir).
 
 ## Example config
 

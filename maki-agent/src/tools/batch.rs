@@ -368,11 +368,21 @@ impl super::ToolInvocation for Batch {
 mod tests {
     use crate::BatchToolEntry;
     use serde_json::json;
+    use std::sync::{Arc, Once};
 
     use crate::AgentMode;
-    use crate::tools::test_support::stub_ctx;
+    use crate::tools::ToolSource;
+    use crate::tools::test_support::{GUARDED_TOOL_NAME, GuardedMock, stub_ctx};
 
     use super::*;
+
+    static REGISTER_TEST_TOOL: Once = Once::new();
+
+    fn ensure_test_tool() {
+        REGISTER_TEST_TOOL.call_once(|| {
+            let _ = ToolRegistry::native().register(Arc::new(GuardedMock), ToolSource::Native);
+        });
+    }
 
     async fn run_batch(input: Value) -> (Vec<BatchToolEntry>, String) {
         let ctx = stub_ctx(&AgentMode::Build);
@@ -412,14 +422,18 @@ mod tests {
     #[test]
     fn parallel_execution_with_mixed_results() {
         smol::block_on(async {
+            ensure_test_tool();
             let ctx = stub_ctx(&crate::AgentMode::Build);
 
-            let (entries, _text) = execute_batch(&ctx, json!({
-                "tool_calls": [
-                    {"tool": "code_execution", "parameters": {"code": "print('ok')"}},
-                    {"tool": "code_execution", "parameters": {"code": "raise Exception('fail')"}}
-                ]
-            }))
+            let (entries, _text) = execute_batch(
+                &ctx,
+                json!({
+                    "tool_calls": [
+                        {"tool": GUARDED_TOOL_NAME, "parameters": {}},
+                        {"tool": "nonexistent_tool", "parameters": {}}
+                    ]
+                }),
+            )
             .await;
             assert_eq!(entries.len(), 2);
             assert_eq!(entries[0].status, BatchToolStatus::Success);
@@ -464,13 +478,14 @@ mod tests {
         use crate::{Envelope, EventSender};
 
         smol::block_on(async {
+            ensure_test_tool();
             let (tx, rx) = flume::unbounded::<Envelope>();
             let event_tx = EventSender::new(tx, 0);
             let ctx = stub_ctx_with(&AgentMode::Build, Some(&event_tx), None);
             execute_batch(
                 &ctx,
                 json!({
-                    "tool_calls": [{"tool": "code_execution", "parameters": {"code": "print('hello')"}}]
+                    "tool_calls": [{"tool": GUARDED_TOOL_NAME, "parameters": {}}]
                 }),
             )
             .await;

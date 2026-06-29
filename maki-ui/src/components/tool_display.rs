@@ -636,14 +636,12 @@ impl ToolLineBuilder {
     }
 
     fn push_snapshot(&mut self, snapshot: &BufferSnapshot, search_fallback: Option<&str>) {
-        let start = self.lines.len();
         let total = snapshot.lines.len();
         self.lines.extend(snapshot_to_lines_range(
             snapshot,
             TOOL_BODY_INDENT,
             0..total,
         ));
-        self.content_range = (start, self.lines.len());
         if let Some(text) = search_fallback {
             self.push_search_text(text);
         }

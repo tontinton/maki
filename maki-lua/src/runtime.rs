@@ -128,6 +128,9 @@ pub enum Request {
         event: String,
         data: Value,
     },
+    ClickTool {
+        tool_use_id: String,
+    },
     RunKeybindCallback {
         id: u64,
     },
@@ -207,6 +210,8 @@ impl TaskCell {
 }
 
 pub(crate) type TaskHandle = Arc<Mutex<TaskCell>>;
+
+type LiveTasks = Rc<RefCell<HashMap<String, TaskHandle>>>;
 
 pub(crate) fn lock_cell(handle: &TaskHandle) -> std::sync::MutexGuard<'_, TaskCell> {
     handle.lock().unwrap_or_else(|e| e.into_inner())
@@ -559,6 +564,7 @@ struct LuaRuntime {
     lua: Lua,
     pending: PendingTools,
     plugins: PluginMap,
+    live_tasks: LiveTasks,
     registry: Arc<ToolRegistry>,
     tx: flume::Sender<Request>,
     shutdown: Arc<AtomicBool>,
@@ -617,6 +623,7 @@ impl LuaRuntime {
             lua,
             pending,
             plugins: Rc::new(RefCell::new(HashMap::new())) as PluginMap,
+            live_tasks: Rc::new(RefCell::new(HashMap::new())),
             registry,
             tx,
             shutdown,
@@ -980,7 +987,10 @@ impl LuaRuntime {
                     permission_scope_kind: t.permission_scope_kind.clone(),
                     mutable_path_field: t.mutable_path_field.clone(),
                     timeout: t.timeout,
-                    start_annotation_array_field: t.start_annotation_array_field.clone(),
+                    start_annotation: t.start_annotation.clone(),
+                    start_input: t.start_input.clone(),
+                    examples: t.examples.clone(),
+                    augment: t.augment,
                 });
                 (
                     tool,
@@ -1408,6 +1418,7 @@ async fn run_tool_call(
     mut ctx: Box<LuaCtx>,
     deadline: Option<Instant>,
     live: Option<LiveCtx>,
+    live_tasks: LiveTasks,
     plugins: PluginMap,
     shutdown: Arc<AtomicBool>,
 ) -> ToolCallReply {
@@ -1445,6 +1456,7 @@ async fn run_tool_call(
         Ok(t) => t,
         Err(e) => return ToolCallReply::err(strip_traceback(&e)),
     };
+    let live_id = live.as_ref().map(|l| l.tool_use_id.clone());
     let scope = TaskScope::new(&lua, TaskCell::new(cancel, deadline, live));
     let handle = Arc::clone(scope.handle());
 
@@ -1452,6 +1464,11 @@ async fn run_tool_call(
         Ok(at) => at,
         Err(e) => return ToolCallReply::err(strip_traceback(&e)),
     };
+    if let Some(id) = &live_id {
+        live_tasks
+            .borrow_mut()
+            .insert(id.clone(), Arc::clone(&handle));
+    }
 
     let call_future = scope.scope_future(async {
         let handler_result = {
@@ -1496,6 +1513,9 @@ async fn run_tool_call(
     // `tool.rs` timeout is the absolute backstop; the dispatch loop
     // and interrupt hook enforce the per-plugin deadline from TaskCell.
     let reply = call_future.await;
+    if let Some(id) = &live_id {
+        live_tasks.borrow_mut().remove(id);
+    }
     drop(scope);
     reply
 }
@@ -1583,6 +1603,7 @@ pub fn spawn(
                             gate.wait_below(MAX_INFLIGHT_TOOLS).await;
                             let lua = rt.lua.clone();
                             let plugins = Rc::clone(&rt.plugins);
+                            let live_tasks = Rc::clone(&rt.live_tasks);
                             let shutdown_ref = Arc::clone(&rt.shutdown);
                             let g = Rc::clone(&gate);
                             let ex_ref = Rc::clone(&ex);
@@ -1597,6 +1618,7 @@ pub fn spawn(
                                     ctx,
                                     deadline,
                                     live,
+                                    live_tasks,
                                     plugins,
                                     shutdown_ref,
                                 )
@@ -1681,6 +1703,31 @@ pub fn spawn(
                         }
                         Request::RestoreComplete { flag } => {
                             flag.store(false, Ordering::Relaxed);
+                        }
+                        Request::ClickTool { tool_use_id } => {
+                            let handle = rt.live_tasks.borrow().get(&tool_use_id).map(Arc::clone);
+                            let func = handle.as_ref().and_then(|h| {
+                                let cell = lock_cell(h);
+                                let key = cell.click.as_ref()?;
+                                rt.lua.registry_value::<Function>(key).ok()
+                            });
+                            if let (Some(handle), Some(func)) = (handle, func) {
+                                let lua = rt.lua.clone();
+                                let g = Rc::clone(&gate);
+                                let ex_ref = Rc::clone(&ex);
+                                ex.spawn(async move {
+                                    let call = ScopedFuture {
+                                        lua: lua.clone(),
+                                        handle,
+                                        inner: func.call_async::<()>(()),
+                                    };
+                                    if let Err(e) = call.await {
+                                        tracing::warn!(tool_use_id, error = %e, "live click failed");
+                                    }
+                                    drain_spawn_queue(&lua, &ex_ref, &g);
+                                })
+                                .detach();
+                            }
                         }
                         Request::FireAutocmd { event, data } => {
                             if let Some(mut store) = rt.lua.app_data_mut::<AutocmdStore>()

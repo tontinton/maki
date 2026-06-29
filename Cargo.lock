@@ -2516,6 +2516,7 @@ dependencies = [
  "maki-agent",
  "maki-config",
  "maki-highlight",
+ "maki-interpreter",
  "maki-markdown",
  "maki-providers",
  "maki-storage",

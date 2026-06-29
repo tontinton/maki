@@ -82,6 +82,10 @@ static BUNDLED_PLUGINS: &[BundledPlugin] = &[
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/task"),
     },
     BundledPlugin {
+        name: "code_execution",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/code_execution"),
+    },
+    BundledPlugin {
         name: "lib",
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/lib"),
     },
@@ -341,6 +345,10 @@ impl EventHandle {
 
     pub fn request_restore(&self, item: RestoreItem, event_tx: maki_agent::EventSender) {
         let _ = self.tx.send(Request::RestoreToolAsync { item, event_tx });
+    }
+
+    pub fn request_click(&self, tool_use_id: String) {
+        let _ = self.tx.send(Request::ClickTool { tool_use_id });
     }
 
     pub fn send_restore_complete(&self, flag: Arc<AtomicBool>) {

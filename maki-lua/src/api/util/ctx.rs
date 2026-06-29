@@ -2,13 +2,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use maki_agent::EventSender;
 use maki_agent::agent::LoadedInstructions;
 use maki_agent::cancel::{CancelMap, CancelToken};
 use maki_agent::mcp::McpHandle;
 use maki_agent::permissions::PermissionManager;
 use maki_agent::prompt::ResolvedSlots;
 use maki_agent::tools::FileReadTracker;
+use maki_agent::{AgentMode, EventSender};
 use maki_config::{AgentConfig, ToolOutputLines};
 use maki_providers::provider::Provider;
 use maki_providers::{Model, RequestOptions, Timeouts};
@@ -35,6 +35,7 @@ pub(crate) struct AgentContext {
     pub(crate) provider: Arc<dyn Provider>,
     pub(crate) model: Arc<Model>,
     pub(crate) event_tx: EventSender,
+    pub(crate) mode: AgentMode,
     pub(crate) tool_use_id: Option<String>,
     pub(crate) permissions: Arc<PermissionManager>,
     pub(crate) timeouts: Timeouts,
@@ -44,6 +45,8 @@ pub(crate) struct AgentContext {
     pub(crate) cancel: CancelToken,
     pub(crate) mcp: Option<McpHandle>,
     pub(crate) config: AgentConfig,
+    pub(crate) file_tracker: Arc<FileReadTracker>,
+    pub(crate) user_response_rx: Option<Arc<async_lock::Mutex<flume::Receiver<String>>>>,
 }
 
 impl From<&maki_agent::tools::ToolContext> for AgentContext {
@@ -52,6 +55,7 @@ impl From<&maki_agent::tools::ToolContext> for AgentContext {
             provider: Arc::clone(&ctx.provider),
             model: Arc::clone(&ctx.model),
             event_tx: ctx.event_tx.clone(),
+            mode: ctx.mode.clone(),
             tool_use_id: ctx.tool_use_id.clone(),
             permissions: Arc::clone(&ctx.permissions),
             timeouts: ctx.timeouts,
@@ -61,6 +65,8 @@ impl From<&maki_agent::tools::ToolContext> for AgentContext {
             cancel: ctx.cancel.clone(),
             mcp: ctx.mcp.clone(),
             config: ctx.config.clone(),
+            file_tracker: Arc::clone(&ctx.file_tracker),
+            user_response_rx: ctx.user_response_rx.clone(),
         }
     }
 }

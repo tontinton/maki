@@ -1140,6 +1140,21 @@ fn handle_click_returns_toggled_when_snapshot_exists() {
 }
 
 #[test]
+fn handle_click_on_running_tool_with_snapshot_skips_expand_toggle() {
+    let mut panel = MessagesPanel::new(UiConfig::default());
+    panel.tool_start(start("t1", BASH_TOOL_NAME));
+    panel.tool_snapshot(
+        "t1",
+        BufferSnapshot::from_arc(Arc::new(vec![snap_line("streaming")])),
+        None,
+    );
+    render(&mut panel, 80, 24);
+    let area = Rect::new(0, 0, 80, 24);
+    assert!(panel.handle_click(area.y, area));
+    assert!(!panel.lua_expanded.contains("t1"));
+}
+
+#[test]
 fn handle_click_returns_toggled_for_truncated_tool_without_snapshot() {
     let mut panel = panel_with_long_tool(200);
     let area = Rect::new(0, 0, 80, 24);
@@ -1212,6 +1227,25 @@ fn tool_done_removes_live_buf_and_snapshots_dirty() {
         msg.render_snapshot.as_ref().unwrap().first_line_text(),
         "dirty content"
     );
+}
+
+#[test]
+fn live_buf_streams_across_clean_polls() {
+    let buf = Arc::new(maki_agent::SharedBuf::new());
+    let mut panel = MessagesPanel::new(UiConfig::default());
+    panel.tool_start(start("t1", BASH_TOOL_NAME));
+    panel.register_live_buf("t1".into(), Arc::clone(&buf));
+
+    buf.append(snap_line("first"));
+    panel.poll_live_bufs();
+    panel.poll_live_bufs();
+
+    buf.append(snap_line("second"));
+    panel.poll_live_bufs();
+
+    let msg = panel.find_tool_msg_mut("t1").unwrap();
+    let snapshot = msg.render_snapshot.as_ref().unwrap();
+    assert_eq!(snapshot.lines.len(), 2);
 }
 
 #[test]

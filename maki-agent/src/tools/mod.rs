@@ -7,9 +7,9 @@
 //! rejects writes to anything but the plan file before they reach the tool.
 
 mod batch;
-mod code_execution;
 mod file_tracker;
 pub mod grep;
+pub mod interpreter_bridge;
 pub mod registry;
 pub mod schema;
 
@@ -111,7 +111,7 @@ pub fn is_tool_enabled(config: &AgentConfig, name: &str) -> bool {
 
 pub const BASH_TOOL_NAME: &str = "bash";
 pub const BATCH_TOOL_NAME: &str = batch::Batch::NAME;
-pub const CODE_EXECUTION_TOOL_NAME: &str = code_execution::CodeExecution::NAME;
+pub const CODE_EXECUTION_TOOL_NAME: &str = "code_execution";
 pub const EDIT_TOOL_NAME: &str = "edit";
 pub const GLOB_TOOL_NAME: &str = "glob";
 pub const GREP_TOOL_NAME: &str = "grep";
@@ -162,7 +162,7 @@ impl Deadline {
     }
 }
 
-pub(crate) fn timeout_annotation(secs: u64) -> String {
+pub fn timeout_annotation(secs: u64) -> String {
     let d = Duration::from_secs(secs);
     let formatted: String = format_duration(d)
         .to_string()
@@ -298,7 +298,7 @@ pub(crate) fn truncate_bytes(line: &str, max_bytes: usize) -> String {
     }
 }
 
-pub(crate) fn truncate_output(text: String, max_lines: usize, max_bytes: usize) -> String {
+pub fn truncate_output(text: String, max_lines: usize, max_bytes: usize) -> String {
     const TRUNCATED_MARKER: &str = "[truncated]";
     let mut lines = text.lines();
     let mut result = String::new();
@@ -367,7 +367,7 @@ fn format_tool_signature(name: &str, schema: &Value) -> String {
 }
 
 /// Walks the registry so adding a new `INTERPRETER` tool shows up automatically.
-pub(crate) fn build_interpreter_tools_description(filter: &ToolFilter) -> String {
+pub fn build_interpreter_tools_description(filter: &ToolFilter) -> String {
     let mut desc =
         String::from("\n\nAvailable tools (called as Python functions with keyword arguments):\n");
     let registry = ToolRegistry::native();
@@ -533,7 +533,6 @@ macro_rules! register_tools {
 
 register_tools! {
     batch::Batch,
-    code_execution::CodeExecution,
 }
 
 pub fn is_builtin_tool(name: &str) -> bool {
@@ -573,7 +572,7 @@ impl Provider for NullProvider {
     }
 }
 
-pub(crate) fn interpreter_ctx(
+pub fn interpreter_ctx(
     mode: &AgentMode,
     event_tx: &EventSender,
     cancel: CancelToken,
@@ -943,10 +942,7 @@ mod tests {
         const GEN: ToolAudience = ToolAudience::GENERAL_SUB;
 
         let expected: std::collections::BTreeMap<&str, ToolAudience> =
-            std::collections::BTreeMap::from([
-                (BATCH_TOOL_NAME, MAIN | RES | GEN),
-                (CODE_EXECUTION_TOOL_NAME, MAIN | RES | GEN),
-            ]);
+            std::collections::BTreeMap::from([(BATCH_TOOL_NAME, MAIN | RES | GEN)]);
 
         let snapshot = ToolRegistry::native().iter();
         let actual: std::collections::BTreeMap<String, ToolAudience> = snapshot

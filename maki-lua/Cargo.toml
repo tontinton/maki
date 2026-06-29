@@ -14,6 +14,7 @@ crossterm = { workspace = true }
 maki-agent = { workspace = true }
 maki-config = { workspace = true }
 maki-highlight = { workspace = true }
+maki-interpreter = { workspace = true }
 maki-markdown = { workspace = true }
 maki-providers = { workspace = true }
 mlua = { workspace = true }

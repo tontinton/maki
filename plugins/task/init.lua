@@ -35,8 +35,13 @@ local schema = {
   },
 }
 
-local examples =
-  '[{"description": "Find auth middleware", "prompt": "Search the codebase for authentication middleware. Return file paths and a summary of how auth is implemented.", "model_tier": "weak"}]'
+local examples = {
+  {
+    description = "Find auth middleware",
+    prompt = "Search the codebase for authentication middleware. Return file paths and a summary of how auth is implemented.",
+    model_tier = "weak",
+  },
+}
 
 local function handler(input, ctx)
   local agent_ctx = ctx:agent_context()

@@ -103,7 +103,7 @@ Executes multiple independent tool calls concurrently to reduce round-trips.
 |-----------|------|----------|-------------|
 | `tool_calls` | array | yes | Array of tool calls to execute in parallel |
 
-### `code_execution`
+### `code_execution` *(lua plugin)*
 
 Execute Python code in a sandboxed interpreter. Tools are available as callable functions.
 

@@ -4,6 +4,7 @@ pub(crate) mod autocmd;
 pub(crate) mod env;
 pub(crate) mod r#fn;
 pub(crate) mod fs;
+mod interpreter;
 pub(crate) mod json;
 pub(crate) mod keymap;
 pub(crate) mod log;
@@ -51,6 +52,10 @@ pub(crate) fn create_maki_global(
     )?;
     maki.set("fn", r#fn::create_fn_table(lua, permissions)?)?;
     maki.set("async", r#async::create_async_table(lua)?)?;
+    maki.set(
+        "interpreter",
+        interpreter::create_interpreter_table(lua, permissions)?,
+    )?;
     agent::register(lua, &maki)?;
     maki.set(
         "keymap",
