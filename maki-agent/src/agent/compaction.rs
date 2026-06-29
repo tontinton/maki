@@ -118,8 +118,7 @@ pub async fn compact(
 }
 
 pub(super) fn is_overflow(usage: &TokenUsage, model: &Model, compaction_buffer: u32) -> bool {
-    let reserved = compaction_buffer.max(model.max_output_tokens);
-    let usable = model.context_window.saturating_sub(reserved);
+    let usable = model.context_window.saturating_sub(compaction_buffer);
     usage.context_tokens() >= usable
 }
 
@@ -270,10 +269,9 @@ mod tests {
         Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap()
     }
 
-    fn small_context_model(context_window: u32, max_output_tokens: u32) -> Model {
+    fn small_context_model(context_window: u32) -> Model {
         let mut model = default_model();
         model.context_window = context_window;
-        model.max_output_tokens = max_output_tokens;
         model
     }
 
@@ -325,22 +323,21 @@ mod tests {
         });
     }
 
-    #[test_case(159_999, 0,       0,       0,      200_000, 20_000, false ; "below_threshold")]
-    #[test_case(160_000, 0,       0,       0,      200_000, 20_000, true  ; "at_threshold")]
-    #[test_case(190_000, 0,       0,       0,      200_000, 10_000, true  ; "large_buffer_takes_precedence_over_small_max_output")]
-    #[test_case(100,     0,       0,       0,      100,     20_000, true  ; "tiny_context_window")]
-    #[test_case(5_000,   165_000, 10_000,  0,      200_000, 20_000, true  ; "cached_tokens_count_toward_overflow")]
-    #[test_case(100_000, 0,       0,       80_000, 200_000, 20_000, true  ; "output_tokens_count_toward_overflow")]
+    #[test_case(159_999, 0,       0,       0,      200_000, false ; "below_threshold")]
+    #[test_case(160_000, 0,       0,       0,      200_000, true  ; "at_threshold")]
+    #[test_case(100,     0,       0,       0,      100,     true  ; "tiny_context_window")]
+    #[test_case(5_000,   165_000, 10_000,  0,      200_000, true  ; "cached_tokens_count_toward_overflow")]
+    #[test_case(100_000, 0,       0,       80_000, 200_000, true  ; "output_tokens_count_toward_overflow")]
+    #[test_case(262_144, 0,       0,       0,      262_144, true  ; "equal_context_and_max_output")]
     fn overflow_detection(
         input: u32,
         cache_read: u32,
         cache_creation: u32,
         output: u32,
         ctx_window: u32,
-        max_out: u32,
         expected: bool,
     ) {
-        let model = small_context_model(ctx_window, max_out);
+        let model = small_context_model(ctx_window);
         let usage = TokenUsage {
             input,
             output,
