@@ -1,6 +1,6 @@
 use mlua::{Lua, LuaSerdeExt, Result as LuaResult, Table, Value};
 
-use super::err_pair;
+use super::util::convert::err_pair;
 
 pub(crate) fn create_yaml_table(lua: &Lua) -> LuaResult<Table> {
     let yaml = lua.create_table()?;

@@ -17,8 +17,8 @@ use serde_json::Value as JsonValue;
 use tracing::info;
 use uuid::Uuid;
 
-use crate::api::ctx::AgentContext;
-use crate::api::{json_to_lua, lua_to_json};
+use crate::api::util::convert::{json_to_lua, lua_to_json};
+use crate::api::util::ctx::AgentContext;
 
 pub(crate) fn register(lua: &Lua, maki: &Table) -> LuaResult<()> {
     let agent = lua.create_table()?;

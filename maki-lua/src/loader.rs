@@ -8,8 +8,8 @@ use include_dir::{Dir, include_dir};
 use maki_agent::tools::ToolRegistry;
 use maki_config::{PluginsConfig, RawConfig};
 
-use crate::api::command::{HintReader, LuaCommandReader, UiAction};
 use crate::api::keymap::KeymapReader;
+use crate::api::util::command::{HintReader, LuaCommandReader, UiAction};
 use crate::error::PluginError;
 use crate::plugin_permissions::{PluginPermissions, load_plugin_permissions};
 use crate::runtime::{self, ClickReply, LuaThread, Request, RestoreItem};
@@ -371,7 +371,7 @@ impl EventHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::command::{LuaCommandInfo, LuaCommandWriter};
+    use crate::api::util::command::{LuaCommandInfo, LuaCommandWriter};
     use maki_agent::prompt::{PromptId, ResolvedSlots, Slot};
     use maki_agent::tools::ToolRegistry;
     use test_case::test_case;

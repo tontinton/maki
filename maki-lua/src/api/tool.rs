@@ -17,11 +17,11 @@ use mlua::{
 };
 use serde_json::Value;
 
-use crate::api::buf::BufHandle;
-use crate::api::command::{
+use crate::api::ui::buf::BufHandle;
+use crate::api::util::command::{
     CommandEntry, CommandHandlerMap, LuaCommandWriter, publish_command_snapshot,
 };
-use crate::api::ctx::LuaCtx;
+use crate::api::util::ctx::LuaCtx;
 use crate::runtime::{HintContent, LiveCtx, PromptHintCallbacks, PromptHintRegistration, Request};
 
 const TOOL_NAME_MAX: usize = 64;
@@ -253,7 +253,7 @@ impl ToolInvocation for LuaToolInvocation {
                 finish_tx: None,
                 file_tracker: ctx.file_tracker.clone(),
                 loaded_instructions: ctx.loaded_instructions.clone(),
-                agent: Some(crate::api::ctx::AgentContext::from(ctx)),
+                agent: Some(crate::api::util::ctx::AgentContext::from(ctx)),
             };
 
             if tx

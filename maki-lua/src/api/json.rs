@@ -1,6 +1,6 @@
 use mlua::{Lua, LuaSerdeExt, Result as LuaResult, Table, Value};
 
-use super::{err_pair, json_to_lua};
+use super::util::convert::{err_pair, json_to_lua};
 
 pub(crate) fn create_json_table(lua: &Lua) -> LuaResult<Table> {
     let json = lua.create_table()?;
