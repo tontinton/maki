@@ -72,6 +72,15 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             max_output_tokens: 100_000,
             context_window: 200_000,
         },
+        ModelEntry {
+            prefixes: &["claude-opus-4.7"],
+            tier: ModelTier::Strong,
+            family: ModelFamily::Generic,
+            default: false,
+            pricing: ModelPricing::ZERO,
+            max_output_tokens: 64_000,
+            context_window: 264_000,
+        },
     ]
 }
 
