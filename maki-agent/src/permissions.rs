@@ -4,7 +4,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use maki_config::{
-    DefaultEffect, Effect, PermissionRule, PermissionTarget, PermissionsConfig,
+    DefaultEffect, Effect, FILE_WRITE_TOOLS, PermissionRule, PermissionTarget, PermissionsConfig,
     append_permission_rule,
 };
 use thiserror::Error;
@@ -28,12 +28,12 @@ fn builtin_rules(cwd: &Path) -> Vec<PermissionRule> {
         scope: Some(scope.into()),
         effect: Effect::Allow,
     };
-    vec![
-        allow("write", &cwd_glob),
-        allow("edit", &cwd_glob),
-        allow("multiedit", &cwd_glob),
-        allow("task", "*"),
-    ]
+    let mut rules: Vec<PermissionRule> = FILE_WRITE_TOOLS
+        .iter()
+        .map(|tool| allow(tool, &cwd_glob))
+        .collect();
+    rules.push(allow("task", "*"));
+    rules
 }
 
 pub const BOUNDARY_UNVERIFIABLE_PREFIX: &str = "Cannot verify project boundary for";
@@ -494,7 +494,7 @@ pub fn generalized_scopes(tool: &str, scopes: &[String]) -> Vec<String> {
 fn generalize_scope(tool: &str, scope: &str) -> String {
     match tool {
         "bash" => generalize_bash_segment(scope),
-        "write" | "edit" | "multiedit" => {
+        tool if FILE_WRITE_TOOLS.contains(&tool) => {
             let p = Path::new(scope);
             match p.parent() {
                 Some(parent) if !parent.as_os_str().is_empty() => {

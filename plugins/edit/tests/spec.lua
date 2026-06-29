@@ -219,6 +219,46 @@ case("cjk_exact_match", function()
   has(result, "hello")
 end)
 
+local replace_lines = require("edit_helpers").replace_lines
+
+case("replace_lines_range_replace_and_delete", function()
+  local content = "aaa\nbbb\nccc\nddd\neee\n"
+
+  local r1 = replace_lines(content, 2, 4, "XXX\nYYY")
+  eq(r1, "aaa\nXXX\nYYY\neee\n")
+
+  local r2 = replace_lines(content, 3, 3, "ZZZ")
+  eq(r2, "aaa\nbbb\nZZZ\nddd\neee\n")
+
+  local r3 = replace_lines(content, 2, 3, "")
+  eq(r3, "aaa\nddd\neee\n")
+
+  local _, e1 = replace_lines(content, 0, 1, "x")
+  has(e1, "out of range")
+  local _, e2 = replace_lines(content, 2, 6, "x")
+  has(e2, "out of range")
+  local _, e3 = replace_lines(content, 3, 2, "x")
+  has(e3, "out of range")
+end)
+
+case("replace_lines_insert_mode", function()
+  local content = "aaa\nbbb\nccc\n"
+
+  local r1 = replace_lines(content, 1, nil, "ZZZ")
+  eq(r1, "ZZZ\naaa\nbbb\nccc\n")
+
+  local r2 = replace_lines(content, 2, nil, "XXX\nYYY")
+  eq(r2, "aaa\nXXX\nYYY\nbbb\nccc\n")
+
+  local r3 = replace_lines(content, 4, nil, "END")
+  eq(r3, "aaa\nbbb\nccc\nEND\n")
+
+  local _, e1 = replace_lines(content, 0, nil, "x")
+  has(e1, "out of range")
+  local _, e2 = replace_lines(content, 5, nil, "x")
+  has(e2, "out of range")
+end)
+
 if #failures > 0 then
   error(#failures .. " case(s) failed:\n\n" .. table.concat(failures, "\n\n"))
 end
