@@ -554,7 +554,9 @@ impl Provider for DynamicProvider {
 mod tests {
     use super::*;
     #[cfg(unix)]
-    use std::fs;
+    use std::fs::{self, File};
+    #[cfg(unix)]
+    use std::io::Write;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     #[cfg(unix)]
@@ -628,7 +630,10 @@ mod tests {
         let script = format!(
             "#!/bin/sh\ncase \"$1\" in\n  info) echo '{info_json}' ;;\n  resolve) echo '{{\"headers\": {{\"authorization\": \"Bearer test\"}}}}' ;;\n  refresh) echo '{{\"headers\": {{\"authorization\": \"Bearer refreshed\"}}}}' ;;\n  *) exit 1 ;;\nesac\n"
         );
-        fs::write(&path, script).unwrap();
+        let mut file = File::create(&path).unwrap();
+        file.write_all(script.as_bytes()).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
         path
     }
@@ -674,7 +679,10 @@ case "$1" in
   *) exit 1 ;;
 esac
 "#;
-        fs::write(&path, script).unwrap();
+        let mut file = File::create(&path).unwrap();
+        file.write_all(script.as_bytes()).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
         let providers = discover_in(tmp.path());
         assert_eq!(providers.len(), 1);
