@@ -11,7 +11,7 @@ use tracing::{debug, warn};
 
 use super::openai::responses;
 use super::openai_compat;
-use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier};
+use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier, ReasoningSupport};
 use crate::provider::{BoxFuture, Provider};
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig};
 
@@ -48,6 +48,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             pricing: ModelPricing::ZERO,
             max_output_tokens: 100_000,
             context_window: 200_000,
+            reasoning: ReasoningSupport::None,
         },
         ModelEntry {
             prefixes: &["gpt-5.2", "gpt-4.1", "claude-sonnet-4.5"],
@@ -57,6 +58,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             pricing: ModelPricing::ZERO,
             max_output_tokens: 100_000,
             context_window: 200_000,
+            reasoning: ReasoningSupport::None,
         },
         ModelEntry {
             prefixes: &[
@@ -71,6 +73,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             pricing: ModelPricing::ZERO,
             max_output_tokens: 100_000,
             context_window: 200_000,
+            reasoning: ReasoningSupport::None,
         },
         ModelEntry {
             prefixes: &["claude-opus-4.7"],
@@ -80,6 +83,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             pricing: ModelPricing::ZERO,
             max_output_tokens: 64_000,
             context_window: 264_000,
+            reasoning: ReasoningSupport::None,
         },
     ]
 }

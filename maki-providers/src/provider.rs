@@ -98,19 +98,20 @@ impl ProviderKind {
         }
     }
 
-    pub const fn supports_thinking(self) -> bool {
-        matches!(
-            self,
-            Self::Anthropic
-                | Self::Google
-                | Self::Mistral
-                | Self::DeepSeek
-                | Self::Synthetic
-                | Self::OpenAi
-                | Self::OpenRouter
-                | Self::LlamaCpp
-                | Self::TensorX
-        )
+    pub const fn reasoning(self) -> crate::model::ReasoningSupport {
+        use crate::model::ReasoningSupport;
+        match self {
+            Self::Anthropic => ReasoningSupport::Anthropic,
+            Self::OpenAi
+            | Self::Google
+            | Self::Mistral
+            | Self::DeepSeek
+            | Self::Synthetic
+            | Self::OpenRouter
+            | Self::LlamaCpp
+            | Self::TensorX => ReasoningSupport::OpenAiEffort,
+            Self::Copilot | Self::Ollama | Self::Zai => ReasoningSupport::None,
+        }
     }
 
     pub const fn features(self) -> Option<&'static str> {

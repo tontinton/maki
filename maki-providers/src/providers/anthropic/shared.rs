@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tracing::{debug, warn};
 
-use crate::model::{FastPricing, Model, ModelEntry, ModelFamily, ModelPricing, ModelTier};
+use crate::model::{
+    FastPricing, Model, ModelEntry, ModelFamily, ModelPricing, ModelTier, ReasoningSupport,
+};
 use crate::{
     AgentError, ContentBlock, Message, ProviderEvent, Role, StopReason, StreamResponse,
     ThinkingConfig, TokenUsage,
@@ -393,6 +395,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: 64000,
             context_window: 200_000,
+            reasoning: ReasoningSupport::Anthropic,
         },
         ModelEntry {
             prefixes: &["claude-sonnet-4-5"],
@@ -408,6 +411,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: 64000,
             context_window: 200_000,
+            reasoning: ReasoningSupport::Anthropic,
         },
         ModelEntry {
             prefixes: &["claude-sonnet-4-6"],
@@ -423,6 +427,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: 64000,
             context_window: 200_000,
+            reasoning: ReasoningSupport::Anthropic,
         },
         ModelEntry {
             prefixes: &["claude-sonnet-4"],
@@ -438,6 +443,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: 64000,
             context_window: 200_000,
+            reasoning: ReasoningSupport::Anthropic,
         },
         ModelEntry {
             prefixes: &["claude-opus-4-5"],
@@ -453,6 +459,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: 64000,
             context_window: 200_000,
+            reasoning: ReasoningSupport::Anthropic,
         },
         ModelEntry {
             prefixes: &["claude-opus-4-6"],
@@ -471,6 +478,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: 128000,
             context_window: 200_000,
+            reasoning: ReasoningSupport::Anthropic,
         },
         ModelEntry {
             prefixes: &["claude-opus-4-7"],
@@ -489,6 +497,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: 128000,
             context_window: 200_000,
+            reasoning: ReasoningSupport::Anthropic,
         },
         ModelEntry {
             prefixes: &["claude-opus-4-8"],
@@ -507,6 +516,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: 128000,
             context_window: 200_000,
+            reasoning: ReasoningSupport::Anthropic,
         },
         ModelEntry {
             prefixes: &["claude-fable-5"],
@@ -522,6 +532,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: 128000,
             context_window: 200_000,
+            reasoning: ReasoningSupport::Anthropic,
         },
         ModelEntry {
             prefixes: &["claude-opus-4-0", "claude-opus-4-1"],
@@ -537,6 +548,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: 32000,
             context_window: 200_000,
+            reasoning: ReasoningSupport::Anthropic,
         },
     ];
     MODELS

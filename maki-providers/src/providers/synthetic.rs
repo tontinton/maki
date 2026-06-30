@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use flume::Sender;
 use serde_json::Value;
 
-use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier};
+use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier, ReasoningSupport};
 use crate::provider::{BoxFuture, Provider};
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
 
@@ -46,6 +46,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: 131072,
             context_window: 200_000,
+            reasoning: ReasoningSupport::OpenAiEffort,
         },
         ModelEntry {
             prefixes: &["hf:deepseek-ai/DeepSeek-V3.2"],
@@ -61,6 +62,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: 131072,
             context_window: 200_000,
+            reasoning: ReasoningSupport::OpenAiEffort,
         },
         ModelEntry {
             prefixes: &["hf:zai-org/GLM-4.7-Flash"],
@@ -76,6 +78,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: 131072,
             context_window: 200_000,
+            reasoning: ReasoningSupport::OpenAiEffort,
         },
     ]
 }

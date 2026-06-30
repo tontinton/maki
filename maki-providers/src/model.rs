@@ -102,6 +102,22 @@ pub enum ModelFamily {
     Synthetic,
 }
 
+/// Per-model reasoning capability and wire format. Replaces the old
+/// provider-level `supports_thinking` allowlist and the `is_glm_52` string
+/// match: each model declares its own value space.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReasoningSupport {
+    #[default]
+    None,
+    /// Anthropic `thinking` field with `budget_tokens` (adaptive for opus 4.7+).
+    Anthropic,
+    /// OpenAI `reasoning_effort` field, value space low/medium/high.
+    OpenAiEffort,
+    /// GLM-5.2 `reasoning_effort` field, value space none/high/xhigh.
+    GlmEffort,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ModelTier {
@@ -156,6 +172,7 @@ pub struct ModelEntry {
     pub pricing: ModelPricing,
     pub max_output_tokens: u32,
     pub context_window: u32,
+    pub reasoning: ReasoningSupport,
 }
 
 fn lookup_entry<'a>(
@@ -205,6 +222,7 @@ pub struct Model {
     pub tier: ModelTier,
     pub family: ModelFamily,
     pub supports_tool_examples_override: Option<bool>,
+    pub reasoning: ReasoningSupport,
     pub pricing: ModelPricing,
     pub max_output_tokens: u32,
     pub context_window: u32,
@@ -223,12 +241,13 @@ impl Model {
             .read()
             .unwrap()
             .tier_for(&spec, provider, static_entry.map(|e| e.tier));
-        let (family, pricing, max_output_tokens, context_window) = match static_entry {
+        let (family, pricing, max_output_tokens, context_window, reasoning) = match static_entry {
             Some(e) => (
                 e.family,
                 e.pricing.clone(),
                 e.max_output_tokens,
                 anthropic::shared::long_context_window(model_id).unwrap_or(e.context_window),
+                e.reasoning,
             ),
             None => {
                 let guard = crate::model_registry::model_registry().read().unwrap();
@@ -244,6 +263,7 @@ impl Model {
                     discovered
                         .and_then(|d| d.context_window)
                         .unwrap_or_else(|| provider.fallback_context_window()),
+                    provider.reasoning(),
                 )
             }
         };
@@ -254,10 +274,15 @@ impl Model {
             tier,
             family,
             supports_tool_examples_override: None,
+            reasoning,
             pricing,
             max_output_tokens,
             context_window,
         }
+    }
+
+    pub fn supports_thinking(&self) -> bool {
+        self.reasoning != ReasoningSupport::None
     }
 
     pub fn supports_tool_examples(&self) -> bool {
@@ -612,6 +637,30 @@ mod tests {
             (p.input, p.output, p.cache_write, p.cache_read),
             (0.0, 0.0, 0.0, 0.0)
         );
+    }
+
+    #[test_case("zai/glm-5.2", ReasoningSupport::GlmEffort, true ; "glm_5_2_supports_thinking")]
+    #[test_case("zai/glm-5.1", ReasoningSupport::None, false ; "glm_5_1_no_thinking")]
+    #[test_case("zai/glm-4.7", ReasoningSupport::None, false ; "glm_4_7_no_thinking")]
+    #[test_case("anthropic/claude-opus-4-8", ReasoningSupport::Anthropic, true ; "anthropic_supports_thinking")]
+    fn per_model_reasoning_from_static_table(
+        spec: &str,
+        expected_reasoning: ReasoningSupport,
+        expected_supports: bool,
+    ) {
+        let model = Model::from_spec(spec).unwrap();
+        assert_eq!(model.reasoning, expected_reasoning);
+        assert_eq!(model.supports_thinking(), expected_supports);
+    }
+
+    #[test_case("openrouter/unknown-model", true ; "openrouter_falls_back_to_openai_effort")]
+    #[test_case("ollama/llama3", false ; "ollama_falls_back_to_none")]
+    fn dynamic_model_reasoning_falls_back_to_provider(spec: &str, expected_supports: bool) {
+        // Dynamic/discovered models with no static entry inherit the provider's
+        // reasoning capability: OpenRouter -> OpenAiEffort (true), Ollama -> None (false).
+        // reasoning capability (Ollama -> None).
+        let model = Model::from_spec(spec).unwrap();
+        assert_eq!(model.supports_thinking(), expected_supports);
     }
 
     #[test_case("claude-opus-4-6" ; "opus_4_6")]

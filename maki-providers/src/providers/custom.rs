@@ -115,6 +115,7 @@ pub fn lookup_model(slug: &str, model_id: &str) -> Option<Model> {
         tier,
         family: kind.family(),
         supports_tool_examples_override,
+        reasoning: kind.reasoning(),
         pricing,
         max_output_tokens,
         context_window,

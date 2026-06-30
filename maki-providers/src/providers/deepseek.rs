@@ -4,7 +4,7 @@ use flume::Sender;
 use serde_json::Value;
 use tracing::warn;
 
-use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier};
+use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier, ReasoningSupport};
 use crate::provider::{BoxFuture, Provider};
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig};
 
@@ -50,6 +50,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: 384_000,
             context_window: 1_000_000,
+            reasoning: ReasoningSupport::OpenAiEffort,
         },
         ModelEntry {
             prefixes: &["deepseek-v4-pro"],
@@ -65,6 +66,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: 384_000,
             context_window: 1_000_000,
+            reasoning: ReasoningSupport::OpenAiEffort,
         },
     ]
 }

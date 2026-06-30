@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use flume::Sender;
 use serde_json::{Value, json};
 
-use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier};
+use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier, ReasoningSupport};
 use crate::provider::{BoxFuture, Provider};
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig};
 
@@ -69,6 +69,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: 262_144,
             context_window: 262_144,
+            reasoning: ReasoningSupport::OpenAiEffort,
         },
         ModelEntry {
             prefixes: &["mistral-small-latest", "mistral-small-2603"],
@@ -84,6 +85,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: 262_144,
             context_window: 262_144,
+            reasoning: ReasoningSupport::OpenAiEffort,
         },
         ModelEntry {
             prefixes: &["ministral-14b-latest", "ministral-14b-2512"],
@@ -99,6 +101,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: 262_144,
             context_window: 262_144,
+            reasoning: ReasoningSupport::OpenAiEffort,
         },
     ]
 }

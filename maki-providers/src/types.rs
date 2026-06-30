@@ -302,6 +302,19 @@ impl ThinkingConfig {
         body["reasoning_effort"] = json!(effort);
     }
 
+    /// GLM-5.2 `reasoning_effort` value space: none/high/xhigh. Budgets at or
+    /// above the threshold map to xhigh (max), below it to high.
+    pub fn apply_glm_effort(self, body: &mut Value) {
+        const GLM_XHIGH_THRESHOLD: u32 = 8192;
+        let effort = match self {
+            Self::Off => "none",
+            Self::Adaptive => "high",
+            Self::Budget(n) if n >= GLM_XHIGH_THRESHOLD => "xhigh",
+            Self::Budget(_) => "high",
+        };
+        body["reasoning_effort"] = json!(effort);
+    }
+
     pub fn parse(input: &str, current: Self) -> Result<Self, &'static str> {
         if input.is_empty() {
             return Ok(if current.is_enabled() {

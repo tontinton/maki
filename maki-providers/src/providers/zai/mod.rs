@@ -5,7 +5,7 @@ use maki_config::providers::{BuiltInProvider, Protocol, ProviderPlan};
 use serde_json::Value;
 use tracing::warn;
 
-use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier};
+use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier, ReasoningSupport};
 use crate::provider::{BoxFuture, Provider};
 use crate::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
@@ -67,6 +67,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: 131072,
             context_window: 200_000,
+            reasoning: ReasoningSupport::None,
         },
         ModelEntry {
             prefixes: &["glm-5.2"],
@@ -82,6 +83,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: 131072,
             context_window: 1_000_000,
+            reasoning: ReasoningSupport::GlmEffort,
         },
         ModelEntry {
             prefixes: &["glm-5.1", "glm-5"],
@@ -97,6 +99,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: 131072,
             context_window: 200_000,
+            reasoning: ReasoningSupport::None,
         },
         ModelEntry {
             prefixes: &["glm-4.7-flash"],
@@ -112,6 +115,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: 131072,
             context_window: 200_000,
+            reasoning: ReasoningSupport::None,
         },
         ModelEntry {
             prefixes: &["glm-4.7", "glm-4.6"],
@@ -127,6 +131,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: 131072,
             context_window: 200_000,
+            reasoning: ReasoningSupport::None,
         },
         ModelEntry {
             prefixes: &["glm-4.5-flash"],
@@ -142,6 +147,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: 98304,
             context_window: 131_072,
+            reasoning: ReasoningSupport::None,
         },
         ModelEntry {
             prefixes: &["glm-4.5-air"],
@@ -157,6 +163,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: 98304,
             context_window: 131_072,
+            reasoning: ReasoningSupport::None,
         },
         ModelEntry {
             prefixes: &["glm-4.5"],
@@ -172,6 +179,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: 98304,
             context_window: 131_072,
+            reasoning: ReasoningSupport::None,
         },
     ]
 }
@@ -224,14 +232,23 @@ impl Provider for Zai {
         system: &'a str,
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
-        _opts: RequestOptions,
+        opts: RequestOptions,
         _session_id: Option<&str>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let auth = self.auth.lock().unwrap().clone();
             let mut buf = String::new();
             let system = super::with_prefix(&self.system_prefix, system, &mut buf);
-            let body = self.compat.build_body(model, messages, system, tools);
+            let mut body = self.compat.build_body(model, messages, system, tools);
+            match model.reasoning {
+                crate::model::ReasoningSupport::GlmEffort => {
+                    opts.thinking.apply_glm_effort(&mut body);
+                }
+                crate::model::ReasoningSupport::OpenAiEffort => {
+                    opts.thinking.apply_reasoning_effort(&mut body);
+                }
+                _ => {}
+            }
             match self
                 .compat
                 .do_stream(model, &[], &body, event_tx, &auth)

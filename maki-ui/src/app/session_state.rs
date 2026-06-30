@@ -109,7 +109,7 @@ impl SessionState {
     }
 
     pub fn update_model(&mut self, model: &Model) {
-        if !model.provider.supports_thinking() {
+        if !model.supports_thinking() {
             self.thinking = ThinkingConfig::Off;
         }
         if !model.supports_fast() {

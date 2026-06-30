@@ -4,7 +4,7 @@ pub(crate) mod responses;
 
 pub use platform::OpenAi;
 
-use crate::model::{ModelEntry, ModelFamily, ModelPricing, ModelTier};
+use crate::model::{ModelEntry, ModelFamily, ModelPricing, ModelTier, ReasoningSupport};
 
 inventory::submit!(maki_config::providers::BuiltInProvider {
     slug: "openai",
@@ -34,6 +34,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: 128_000,
             context_window: 400_000,
+            reasoning: ReasoningSupport::OpenAiEffort,
         },
         ModelEntry {
             prefixes: &["gpt-5.4-mini"],
@@ -49,6 +50,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: 128_000,
             context_window: 400_000,
+            reasoning: ReasoningSupport::OpenAiEffort,
         },
         ModelEntry {
             prefixes: &["gpt-4.1-nano"],
@@ -64,6 +66,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: 32_768,
             context_window: 1_047_576,
+            reasoning: ReasoningSupport::OpenAiEffort,
         },
         ModelEntry {
             prefixes: &["gpt-4.1-mini"],
@@ -79,6 +82,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: 32_768,
             context_window: 1_047_576,
+            reasoning: ReasoningSupport::OpenAiEffort,
         },
         ModelEntry {
             prefixes: &["gpt-4.1"],
@@ -94,6 +98,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: 32_768,
             context_window: 1_047_576,
+            reasoning: ReasoningSupport::OpenAiEffort,
         },
         ModelEntry {
             prefixes: &["o4-mini"],
@@ -109,6 +114,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: 100_000,
             context_window: 200_000,
+            reasoning: ReasoningSupport::OpenAiEffort,
         },
         ModelEntry {
             prefixes: &["gpt-5.5"],
@@ -124,6 +130,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: 128_000,
             context_window: 1_050_000,
+            reasoning: ReasoningSupport::OpenAiEffort,
         },
         ModelEntry {
             prefixes: &["gpt-5.4"],
@@ -139,6 +146,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: 128_000,
             context_window: 1_050_000,
+            reasoning: ReasoningSupport::OpenAiEffort,
         },
         ModelEntry {
             prefixes: &["o3"],
@@ -154,6 +162,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: 100_000,
             context_window: 200_000,
+            reasoning: ReasoningSupport::OpenAiEffort,
         },
         ModelEntry {
             prefixes: &["gpt-5.3-codex"],
@@ -169,6 +178,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: 128_000,
             context_window: 400_000,
+            reasoning: ReasoningSupport::OpenAiEffort,
         },
         ModelEntry {
             prefixes: &["gpt-5.2-codex"],
@@ -184,6 +194,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: 128_000,
             context_window: 400_000,
+            reasoning: ReasoningSupport::OpenAiEffort,
         },
         ModelEntry {
             prefixes: &["gpt-5.1-codex-mini"],
@@ -199,6 +210,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: 128_000,
             context_window: 400_000,
+            reasoning: ReasoningSupport::OpenAiEffort,
         },
         ModelEntry {
             prefixes: &["gpt-5.1-codex-max"],
@@ -214,6 +226,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: 128_000,
             context_window: 400_000,
+            reasoning: ReasoningSupport::OpenAiEffort,
         },
         ModelEntry {
             prefixes: &["gpt-5.1-codex"],
@@ -229,6 +242,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: 128_000,
             context_window: 400_000,
+            reasoning: ReasoningSupport::OpenAiEffort,
         },
     ]
 }
