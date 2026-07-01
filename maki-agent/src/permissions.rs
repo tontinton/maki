@@ -36,6 +36,8 @@ fn builtin_rules(cwd: &Path) -> Vec<PermissionRule> {
     ]
 }
 
+pub const BOUNDARY_UNVERIFIABLE_PREFIX: &str = "Cannot verify project boundary for";
+
 #[derive(Debug)]
 pub enum PermissionCheck {
     Allowed,
@@ -261,19 +263,14 @@ impl PermissionManager {
         self.yolo.load(Ordering::Relaxed)
     }
 
-    /// Check whether a mutable path physically resolves inside the project
-    /// boundary (`cwd`). Returns `Err` if the path escapes via symlink,
-    /// or if the boundary itself cannot be determined (fails closed).
-    pub fn check_physical_boundary(&self, path: &Path) -> Result<(), String> {
+    /// Outside-cwd paths are not blocked here. They flow through the normal
+    /// permission prompt (which uses the same canonicalization via
+    /// [`scope_matches`]). Only unresolvable boundaries are hard-blocked.
+    pub fn boundary_block_reason(&self, path: &Path) -> Option<String> {
         match physical_boundary_check(&self.cwd, path) {
-            Some(true) => Ok(()),
-            Some(false) => Err(format!(
-                "Path {} resolves outside the project boundary \
-                 (symlink escape detected)",
-                path.display()
-            )),
-            None => Err(format!(
-                "Cannot verify project boundary for {} \
+            Some(_) => None,
+            None => Some(format!(
+                "{BOUNDARY_UNVERIFIABLE_PREFIX} {} \
                  (project root could not be resolved)",
                 path.display()
             )),
@@ -702,38 +699,31 @@ mod tests {
     }
 
     #[test]
-    fn check_physical_boundary_inside_passes() {
+    fn boundary_inside_proceeds() {
         let tmp = std::env::temp_dir();
         let mgr = PermissionManager::new(PermissionsConfig::default(), tmp.clone());
         assert!(
-            mgr.check_physical_boundary(&tmp.join("some_file.txt"))
-                .is_ok()
+            mgr.boundary_block_reason(&tmp.join("some_file.txt"))
+                .is_none()
         );
     }
 
     #[test]
-    fn check_physical_boundary_outside_fails() {
+    fn boundary_outside_proceeds_via_prompt() {
         let tmp = std::env::temp_dir();
         let mgr = PermissionManager::new(PermissionsConfig::default(), tmp);
-        // /etc/hosts (unix) or C:\Windows\System32\drivers\etc\hosts (windows)
-        // should always be outside the temp dir.
         #[cfg(unix)]
         let outside = Path::new("/etc/hosts");
         #[cfg(windows)]
         let outside = Path::new(r"C:\Windows\System32\drivers\etc\hosts");
-        assert!(mgr.check_physical_boundary(outside).is_err());
+        assert!(mgr.boundary_block_reason(outside).is_none());
     }
 
     #[test]
-    fn physical_boundary_blocks_dotdot_smuggling() {
+    fn boundary_dotdot_smuggling_proceeds_via_prompt() {
         let tmp = std::env::temp_dir();
-        // Create a real subdir so the walk-up logic has an existing ancestor
-        // to canonicalize, but the `..` components end up in the tail.
         let sub = tmp.join("__maki_test_boundary");
         std::fs::create_dir_all(&sub).unwrap();
-        // Attack: /tmp/__maki_test_boundary/fake/../../actually_outside
-        // After normalization: /tmp/actually_outside (inside tmp, fine)
-        // But /tmp/__maki_test_boundary/../../../etc/passwd escapes tmp.
         #[cfg(unix)]
         let attack = sub
             .join("x")
@@ -752,8 +742,8 @@ mod tests {
             .join("System32");
         let mgr = PermissionManager::new(PermissionsConfig::default(), sub.clone());
         assert!(
-            mgr.check_physical_boundary(&attack).is_err(),
-            "dotdot smuggling should be caught: {}",
+            mgr.boundary_block_reason(&attack).is_none(),
+            "outside-cwd dotdot path should prompt, not hard-block: {}",
             attack.display()
         );
         let _ = std::fs::remove_dir_all(&sub);
@@ -761,30 +751,36 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn physical_boundary_catches_symlink_escape() {
-        // Simulates: /project/link -> /etc, target /project/link/../hosts
-        // Lexical normalization would resolve to /project/hosts (passes!).
-        // Incremental canonicalization follows the symlink to /etc first,
-        // then `..` goes to /, making the target /hosts (caught!).
+    fn boundary_symlink_escape_proceeds_via_prompt() {
+        // Lexical normalization resolves this inside (/project/escape), but
+        // incremental canonicalization follows the symlink first, so `..`
+        // escapes outside. The permission prompt catches it, not this function.
         let tmp = std::env::temp_dir();
         let project = tmp.join("__maki_test_symlink_escape");
         let _ = std::fs::remove_dir_all(&project);
         std::fs::create_dir_all(&project).unwrap();
-
-        // Create symlink: project/link -> /tmp (points somewhere safe but outside project)
         let link = project.join("link");
         let _ = std::os::unix::fs::symlink(&tmp, &link);
 
-        // Attack: project/link/../escape_target
-        // OS resolution: follow link to /tmp, then .. to /, then escape_target = /escape_target
         let attack = link.join("..").join("escape_target");
         let mgr = PermissionManager::new(PermissionsConfig::default(), project.clone());
         assert!(
-            mgr.check_physical_boundary(&attack).is_err(),
-            "symlink escape should be caught: {}",
+            mgr.boundary_block_reason(&attack).is_none(),
+            "outside-boundary edits are gated by the prompt, not hard-blocked: {}",
             attack.display()
         );
         let _ = std::fs::remove_dir_all(&project);
+    }
+
+    #[test]
+    fn boundary_nonexistent_cwd_proceeds_via_lexical_tail() {
+        let missing = std::env::temp_dir().join("__maki_test_absent_cwd_xyz");
+        let _ = std::fs::remove_dir_all(&missing);
+        let mgr = PermissionManager::new(PermissionsConfig::default(), missing.clone());
+        assert!(
+            mgr.boundary_block_reason(&missing.join("file.txt"))
+                .is_none()
+        );
     }
 
     #[test]

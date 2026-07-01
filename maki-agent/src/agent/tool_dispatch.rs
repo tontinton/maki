@@ -110,8 +110,8 @@ pub async fn run(
                     );
                     return done_error(crate::tools::PLAN_WRITE_RESTRICTED.into());
                 }
-                if let Err(e) = ctx.permissions.check_physical_boundary(target) {
-                    return done_error(e);
+                if let Some(reason) = ctx.permissions.boundary_block_reason(target) {
+                    return done_error(reason);
                 }
             }
         }
