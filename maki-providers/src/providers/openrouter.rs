@@ -101,67 +101,52 @@ impl Provider for OpenRouter {
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
         Box::pin(async move {
             let auth = self.auth.lock().unwrap().clone();
-            let base = auth
-                .base_url
-                .as_deref()
-                .unwrap_or(self.compat.config().base_url);
-            let url = format!("{base}/models");
-            let body_text = self.compat.get_text(&auth, &url).await?;
-            let body: Value = serde_json::from_str(&body_text)?;
-            let mut models: Vec<crate::model::ModelInfo> = body["data"]
-                .as_array()
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|m| {
-                            // Skip models without required architecture fields
-                            let architecture = m["architecture"].as_object()?;
-                            let input_modalities = architecture["input_modalities"].as_array()?;
-                            let output_modalities = architecture["output_modalities"].as_array()?;
+            self.compat
+                .fetch_and_parse_models(&auth, |m| {
+                    // Filter: only text input/output models
+                    let architecture = m["architecture"].as_object()?;
+                    let input_modalities = architecture["input_modalities"].as_array()?;
+                    let output_modalities = architecture["output_modalities"].as_array()?;
 
-                            // Check if both input and output modalities contain "text"
-                            let has_text_input =
-                                input_modalities.iter().any(|m| m.as_str() == Some("text"));
-                            let has_text_output =
-                                output_modalities.iter().any(|m| m.as_str() == Some("text"));
+                    let has_text_input =
+                        input_modalities.iter().any(|m| m.as_str() == Some("text"));
+                    let has_text_output =
+                        output_modalities.iter().any(|m| m.as_str() == Some("text"));
+                    if !has_text_input || !has_text_output {
+                        return None;
+                    }
 
-                            if !has_text_input || !has_text_output {
-                                return None;
-                            }
-
-                            let id = m["id"].as_str()?;
-                            let context_window = m["context_length"]
-                                .as_u64()
-                                .and_then(|v| u32::try_from(v).ok());
-                            let pricing = m["pricing"]
-                                .as_object()
-                                .and_then(|p| {
-                                    Some(crate::model::ModelPricing {
-                                        input: p.get("prompt")?.as_str()?.parse().ok()?,
-                                        output: p.get("completion")?.as_str()?.parse().ok()?,
-                                        cache_write: p
-                                            .get("input_cache_write")
-                                            .and_then(|p| p.as_str()?.parse().ok())
-                                            .unwrap_or(0.0),
-                                        cache_read: p
-                                            .get("input_cache_read")
-                                            .and_then(|p| p.as_str()?.parse().ok())
-                                            .unwrap_or(0.0),
-                                        fast: None,
-                                    })
-                                })
-                                .unwrap_or_default();
-                            Some(crate::model::ModelInfo {
-                                id: id.to_string(),
-                                context_window,
-                                max_output_tokens: None,
-                                pricing: Some(pricing),
+                    // Parse with OpenRouter-specific pricing field names
+                    let id = m["id"].as_str()?;
+                    let context_window = m["context_length"]
+                        .as_u64()
+                        .and_then(|v| u32::try_from(v).ok());
+                    let pricing = m["pricing"]
+                        .as_object()
+                        .and_then(|p| {
+                            Some(crate::model::ModelPricing {
+                                input: p.get("prompt")?.as_str()?.parse().ok()?,
+                                output: p.get("completion")?.as_str()?.parse().ok()?,
+                                cache_write: p
+                                    .get("input_cache_write")
+                                    .and_then(|p| p.as_str()?.parse().ok())
+                                    .unwrap_or(0.0),
+                                cache_read: p
+                                    .get("input_cache_read")
+                                    .and_then(|p| p.as_str()?.parse().ok())
+                                    .unwrap_or(0.0),
+                                fast: None,
                             })
                         })
-                        .collect()
+                        .unwrap_or_default();
+                    Some(crate::model::ModelInfo {
+                        id: id.to_string(),
+                        context_window,
+                        max_output_tokens: None,
+                        pricing: Some(pricing),
+                    })
                 })
-                .unwrap_or_default();
-            models.sort_by(|a, b| a.id.cmp(&b.id));
-            Ok(models)
+                .await
         })
     }
 

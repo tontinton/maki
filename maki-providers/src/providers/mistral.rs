@@ -215,44 +215,32 @@ impl Provider for Mistral {
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
         Box::pin(async move {
             let auth = self.auth.lock().unwrap().clone();
-            let base = auth
-                .base_url
-                .as_deref()
-                .unwrap_or(self.compat.config().base_url);
-            let url = format!("{base}/models");
-            let body_text = self.compat.get_text(&auth, &url).await?;
-            let body: Value = serde_json::from_str(&body_text)?;
-            let mut models: Vec<crate::model::ModelInfo> = body["data"]
-                .as_array()
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|m| {
-                            // Only include models with completion_chat: true
-                            let has_completion_chat = m
-                                .get("capabilities")
-                                .and_then(Value::as_object)
-                                .and_then(|c| c.get("completion_chat"))
-                                .and_then(Value::as_bool)
-                                .unwrap_or(false);
-                            if !has_completion_chat {
-                                return None;
-                            }
-                            let id = m["id"].as_str()?;
-                            let context_window = m["max_context_length"]
-                                .as_u64()
-                                .and_then(|v| u32::try_from(v).ok());
-                            Some(crate::model::ModelInfo {
-                                id: id.to_string(),
-                                context_window,
-                                max_output_tokens: None,
-                                pricing: None,
-                            })
-                        })
-                        .collect()
+            self.compat
+                .fetch_and_parse_models(&auth, |m| {
+                    // Filter: only completion_chat capable models
+                    let has_completion_chat = m
+                        .get("capabilities")
+                        .and_then(Value::as_object)
+                        .and_then(|c| c.get("completion_chat"))
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    if !has_completion_chat {
+                        return None;
+                    }
+
+                    // Parse with Mistral-specific field names
+                    let id = m["id"].as_str()?;
+                    let context_window = m["max_context_length"]
+                        .as_u64()
+                        .and_then(|v| u32::try_from(v).ok());
+                    Some(crate::model::ModelInfo {
+                        id: id.to_string(),
+                        context_window,
+                        max_output_tokens: None,
+                        pricing: None,
+                    })
                 })
-                .unwrap_or_default();
-            models.sort_by(|a, b| a.id.cmp(&b.id));
-            Ok(models)
+                .await
         })
     }
 
