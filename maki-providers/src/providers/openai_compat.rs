@@ -54,7 +54,10 @@ impl OpenAiCompatProvider {
         auth: &ResolvedAuth,
         url: &str,
     ) -> Result<String, AgentError> {
-        let mut builder = Request::builder().method("GET").uri(url);
+        let mut builder = Request::builder()
+            .method("GET")
+            .uri(url)
+            .header("user-agent", super::user_agent());
         for (key, value) in &auth.headers {
             builder = builder.header(key.as_str(), value.as_str());
         }
@@ -73,7 +76,10 @@ impl OpenAiCompatProvider {
         content_type: &str,
         body: &[u8],
     ) -> Result<String, AgentError> {
-        let mut builder = Request::builder().method("POST").uri(url);
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri(url)
+            .header("user-agent", super::user_agent());
         for (key, value) in &auth.headers {
             builder = builder.header(key.as_str(), value.as_str());
         }
