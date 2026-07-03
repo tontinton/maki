@@ -166,6 +166,9 @@ impl App {
 
     pub(super) fn reset_session(&mut self) -> Vec<Action> {
         self.reset_ui_chrome();
+        if let Some(ref handle) = self.lua_event_handle {
+            handle.fire_autocmd("SessionReset", serde_json::json!({}));
+        }
         self.state.token_usage = TokenUsage::default();
         self.state.context_size = 0;
         self.state.plan = PlanState::None;

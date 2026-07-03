@@ -164,13 +164,13 @@ end
 
 maki.keymap.set("n", "<C-t>", toggle, { desc = "Toggle todo panel" })
 
-maki.api.create_autocmd("TurnEnd", {
-  callback = function()
-    items = {}
-    seen_first = false
-    if win and win:is_open() then
-      win:hide()
-    end
-    maki.ui.set_status_hint(nil)
-  end,
-})
+local function clear_todos()
+  items = {}
+  seen_first = false
+  if win and win:is_open() then
+    win:hide()
+  end
+  maki.ui.set_status_hint(nil)
+end
+
+maki.api.create_autocmd({ "TurnEnd", "SessionReset" }, { callback = clear_todos })
