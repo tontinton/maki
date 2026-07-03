@@ -26,7 +26,7 @@ use maki_storage::model::persist_model;
 pub fn auth_login(provider: Option<&str>, storage: &StateDir) -> Result<()> {
     match provider {
         Some("openai") => openai_auth::login(storage)?,
-        Some("copilot") => copilot_auth::login()?,
+        Some("copilot") => copilot_auth::login(storage)?,
         Some(slug) => login_provider(&slugify(slug), storage)?,
         None => login_interactive(storage)?,
     }
@@ -333,7 +333,7 @@ pub fn auth_logout(provider: &str, storage: &StateDir) -> Result<()> {
     let slug = slugify(provider);
     match provider {
         "openai" => openai_auth::logout(storage)?,
-        "copilot" => copilot_auth::logout()?,
+        "copilot" => copilot_auth::logout(storage)?,
         _ => {
             let mut config = ProvidersConfig::load();
             let deleted =

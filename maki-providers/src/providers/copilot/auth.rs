@@ -2,13 +2,20 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
+use maki_storage::StateDir;
+use maki_storage::auth::{
+    ProviderCredentials, delete_provider_credentials, load_provider_credentials,
+    save_provider_credentials,
+};
 use serde_json::Value as JsonValue;
 use serde_yaml::Value as YamlValue;
+use tracing::debug;
 
 use crate::AgentError;
 
 const TOKEN_ENV_VARS: &[&str] = &["GH_COPILOT_TOKEN", "COPILOT_GITHUB_TOKEN"];
 const COPILOT_DOMAIN: &str = "github.com";
+const PROVIDER: &str = "copilot";
 
 pub(crate) fn load_token() -> Result<String, AgentError> {
     for key in TOKEN_ENV_VARS {
@@ -19,12 +26,19 @@ pub(crate) fn load_token() -> Result<String, AgentError> {
         }
     }
 
-    if let Ok(dir) = maki_storage::StateDir::resolve()
-        && let Some(creds) = maki_storage::auth::load_provider_credentials(&dir, "copilot")
+    if let Ok(dir) = StateDir::resolve()
+        && let Some(creds) = load_provider_credentials(&dir, PROVIDER)
     {
+        debug!("using saved Copilot credentials");
         return Ok(creds.api_key);
     }
 
+    Err(AgentError::Config {
+        message: "not authenticated, run `maki auth login copilot` or set GH_COPILOT_TOKEN".into(),
+    })
+}
+
+fn discover_token() -> Result<String, AgentError> {
     for path in copilot_config_paths() {
         if let Ok(contents) = fs::read_to_string(path)
             && let Some(token) = extract_json_oauth_token(&contents, COPILOT_DOMAIN)
@@ -42,25 +56,37 @@ pub(crate) fn load_token() -> Result<String, AgentError> {
     }
 
     Err(AgentError::Config {
-        message: "Copilot token not found. Run `gh auth login --web`, sign in with GitHub Copilot, or set GH_COPILOT_TOKEN.".into(),
+        message: "Copilot token not found. Run `gh auth login --web`, sign in with the Copilot \
+            client, or set GH_COPILOT_TOKEN."
+            .into(),
     })
 }
 
-pub fn login() -> Result<(), AgentError> {
-    let _ = load_token()?;
-    println!("Copilot token found.");
+pub fn login(dir: &StateDir) -> Result<(), AgentError> {
+    if load_token().is_ok() {
+        println!("Already authenticated with Copilot.");
+        return Ok(());
+    }
+
+    let token = discover_token()?;
+    save_provider_credentials(dir, PROVIDER, &ProviderCredentials { api_key: token })?;
+    println!("Copilot token imported from gh CLI / Copilot client config.");
     Ok(())
 }
 
-pub fn logout() -> Result<(), AgentError> {
-    Err(AgentError::Config {
-        message: "Copilot auth is managed by GitHub Copilot. Sign out from your Copilot client or remove GH_COPILOT_TOKEN.".into(),
-    })
+pub fn logout(dir: &StateDir) -> Result<(), AgentError> {
+    if delete_provider_credentials(dir, PROVIDER)? {
+        println!("Logged out of Copilot.");
+    } else {
+        println!("Not currently logged in to Copilot.");
+    }
+    Ok(())
 }
 
 fn copilot_config_paths() -> Vec<PathBuf> {
-    let base = config_dir().map(|config| config.join("github-copilot"));
-    base.map(|base| vec![base.join("hosts.json"), base.join("apps.json")])
+    config_dir()
+        .map(|config| config.join("github-copilot"))
+        .map(|base| vec![base.join("hosts.json"), base.join("apps.json")])
         .unwrap_or_default()
 }
 
@@ -101,49 +127,25 @@ fn extract_yaml_oauth_token(contents: &str, domain: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use test_case::test_case;
 
-    #[test]
-    fn extracts_matching_oauth_token() {
-        let contents = r#"{
-            "github.com": {
-                "oauth_token": "token-1"
-            }
-        }"#;
-        assert_eq!(
-            extract_json_oauth_token(contents, "github.com").as_deref(),
-            Some("token-1")
-        );
+    #[test_case(
+        r#"{"github.com": {"oauth_token": "token-1"}}"#, "github.com" => Some("token-1".to_string()); "json_matching_domain"
+    )]
+    #[test_case(
+        r#"{"enterprise.example.com": {"oauth_token": "token-1"}}"#, "github.com" => None; "json_other_domain"
+    )]
+    fn extract_json_oauth_token_by_domain(contents: &str, domain: &str) -> Option<String> {
+        extract_json_oauth_token(contents, domain)
     }
 
-    #[test]
-    fn ignores_other_domains() {
-        let contents = r#"{
-            "enterprise.example.com": {
-                "oauth_token": "token-1"
-            }
-        }"#;
-        assert_eq!(extract_json_oauth_token(contents, "github.com"), None);
-    }
-
-    #[test]
-    fn extracts_matching_gh_oauth_token() {
-        let contents = r#"
-github.com:
-  oauth_token: token-1
-  user: octocat
-"#;
-        assert_eq!(
-            extract_yaml_oauth_token(contents, "github.com").as_deref(),
-            Some("token-1")
-        );
-    }
-
-    #[test]
-    fn ignores_other_gh_domains() {
-        let contents = r#"
-enterprise.example.com:
-  oauth_token: token-1
-"#;
-        assert_eq!(extract_yaml_oauth_token(contents, "github.com"), None);
+    #[test_case(
+        "github.com:\n  oauth_token: token-1\n  user: octocat\n", "github.com" => Some("token-1".to_string()); "yaml_matching_domain"
+    )]
+    #[test_case(
+        "enterprise.example.com:\n  oauth_token: token-1\n", "github.com" => None; "yaml_other_domain"
+    )]
+    fn extract_yaml_oauth_token_by_domain(contents: &str, domain: &str) -> Option<String> {
+        extract_yaml_oauth_token(contents, domain)
     }
 }
