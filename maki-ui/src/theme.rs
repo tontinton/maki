@@ -209,6 +209,14 @@ pub static BUNDLED_THEMES: &[ThemeEntry] = &[
         toml: include_str!("themes/rose_pine.toml"),
     },
     ThemeEntry {
+        name: "rose_pine_dawn",
+        toml: include_str!("themes/rose_pine_dawn.toml"),
+    },
+    ThemeEntry {
+        name: "rose_pine_moon",
+        toml: include_str!("themes/rose_pine_moon.toml"),
+    },
+    ThemeEntry {
         name: "solarized_dark",
         toml: include_str!("themes/solarized_dark.toml"),
     },
