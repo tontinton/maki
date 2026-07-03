@@ -12,8 +12,10 @@ static STRATEGY: OnceLock<Option<Paths>> = OnceLock::new();
 struct Paths {
     config: PathBuf,
     data: PathBuf,
+    state: PathBuf,
+    logs: PathBuf,
     cache: PathBuf,
-    fallback: bool,
+    xdg_config: PathBuf,
 }
 
 /// Lexical path normalization that never hits the filesystem.
@@ -150,6 +152,19 @@ fn strip_windows_extended_prefix(canon: &Path) -> PathBuf {
     canon.to_path_buf()
 }
 
+fn state_logs(s: &impl BaseStrategy, fallback: &Path) -> (PathBuf, PathBuf) {
+    let state_base = s.state_dir();
+    let state = state_base
+        .as_ref()
+        .map(|d| d.join(APP_NAME))
+        .unwrap_or_else(|| fallback.to_path_buf());
+    let logs = state_base
+        .as_ref()
+        .and_then(|d| d.parent().map(|p| p.join("logs").join(APP_NAME)))
+        .unwrap_or_else(|| fallback.to_path_buf());
+    (state, logs)
+}
+
 fn resolve() -> Option<&'static Paths> {
     STRATEGY
         .get_or_init(|| {
@@ -158,16 +173,27 @@ fn resolve() -> Option<&'static Paths> {
                 .ok()
                 .map(|h| h.join(FALLBACK_DIR))
                 .filter(|d| d.is_dir());
-            let fallback = fallback_dir.is_some();
-            let (data, cache) = match fallback_dir {
-                Some(dir) => (dir.clone(), dir),
-                None => (s.data_dir().join(APP_NAME), s.cache_dir().join(APP_NAME)),
+            let xdg_config = s.config_dir().join(APP_NAME);
+            let (data, cache, config) = match &fallback_dir {
+                Some(dir) => (dir.clone(), dir.clone(), dir.clone()),
+                None => (
+                    s.data_dir().join(APP_NAME),
+                    s.cache_dir().join(APP_NAME),
+                    xdg_config.clone(),
+                ),
+            };
+            let (state, logs) = if fallback_dir.is_some() {
+                (data.clone(), data.clone())
+            } else {
+                state_logs(&s, &data)
             };
             Some(Paths {
-                config: s.config_dir().join(APP_NAME),
+                config,
                 data,
+                state,
+                logs,
                 cache,
-                fallback,
+                xdg_config,
             })
         })
         .as_ref()
@@ -185,24 +211,14 @@ fn ensure(path: &Path) -> Result<PathBuf, std::io::Error> {
     Ok(path.to_path_buf())
 }
 
-fn xdg_sibling(data: &Path, name: &str) -> PathBuf {
-    data.parent()
-        .and_then(|p| p.parent())
-        .map(|base| base.join(name).join(APP_NAME))
-        .unwrap_or_else(|| data.join(name))
-}
-
 pub fn config_dir() -> Result<PathBuf, std::io::Error> {
     let p = resolve().ok_or_else(err)?;
-    if p.fallback {
-        return ensure(&p.data);
-    }
     ensure(&p.config)
 }
 
 pub fn xdg_config_dir() -> Result<PathBuf, std::io::Error> {
     let p = resolve().ok_or_else(err)?;
-    ensure(&p.config)
+    ensure(&p.xdg_config)
 }
 
 pub fn data_dir() -> Result<PathBuf, std::io::Error> {
@@ -212,18 +228,12 @@ pub fn data_dir() -> Result<PathBuf, std::io::Error> {
 
 pub fn state_dir() -> Result<PathBuf, std::io::Error> {
     let p = resolve().ok_or_else(err)?;
-    if p.fallback {
-        return ensure(&p.data);
-    }
-    ensure(&xdg_sibling(&p.data, "state"))
+    ensure(&p.state)
 }
 
 pub fn logs_dir() -> Result<PathBuf, std::io::Error> {
     let p = resolve().ok_or_else(err)?;
-    if p.fallback {
-        return ensure(&p.data);
-    }
-    ensure(&xdg_sibling(&p.data, "logs"))
+    ensure(&p.logs)
 }
 
 pub fn cache_dir() -> Result<PathBuf, std::io::Error> {
@@ -240,10 +250,11 @@ pub struct XdgPaths {
 pub fn xdg_paths() -> Result<XdgPaths, std::io::Error> {
     let s = etcetera::choose_base_strategy().map_err(|_| err())?;
     let data = s.data_dir().join(APP_NAME);
+    let (state, logs) = state_logs(&s, &data);
     Ok(XdgPaths {
         config: s.config_dir().join(APP_NAME),
-        state: xdg_sibling(&data, "state"),
-        logs: xdg_sibling(&data, "logs"),
+        state,
+        logs,
     })
 }
 
