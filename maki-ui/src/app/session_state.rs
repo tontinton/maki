@@ -69,10 +69,14 @@ impl SessionState {
         let context_size = session.meta.context_size;
 
         Self {
-            thinking: session.meta.thinking.map(Into::into).unwrap_or_default(),
-            // The saved model may have changed or fallen back to a parse failure
-            // since, so reconcile against the live model. This keeps the flag
-            // honest for everyone who reads it (the UI badge, the agent).
+            // Saved model may differ from the live one (updated, removed, etc).
+            // Reconcile so the UI badge and agent always see the truth.
+            thinking: session
+                .meta
+                .thinking
+                .map(Into::into)
+                .filter(|_| model.supports_thinking())
+                .unwrap_or_default(),
             fast: session.meta.fast && model.supports_fast(),
             session,
             model,
@@ -109,7 +113,7 @@ impl SessionState {
     }
 
     pub fn update_model(&mut self, model: &Model) {
-        if !model.provider.supports_thinking() {
+        if !model.supports_thinking() {
             self.thinking = ThinkingConfig::Off;
         }
         if !model.supports_fast() {

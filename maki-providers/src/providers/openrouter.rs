@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 
 use crate::model::{Model, ModelEntry};
 use crate::provider::{BoxFuture, Provider};
-use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig};
+use crate::{AgentError, EffortScale, Message, ProviderEvent, RequestOptions, StreamResponse};
 
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use super::{KeyPool, ResolvedAuth};
@@ -77,15 +77,8 @@ impl Provider for OpenRouter {
 
             body["cache_control"] = json!({"type": "ephemeral"});
 
-            match opts.thinking {
-                ThinkingConfig::Off => {}
-                ThinkingConfig::Adaptive => {
-                    body["reasoning_effort"] = json!("high");
-                }
-                ThinkingConfig::Budget(n) => {
-                    body["reasoning_effort"] = json!(ThinkingConfig::budget_to_effort(n));
-                }
-            }
+            opts.thinking
+                .apply_reasoning_effort(&mut body, EffortScale::PreferHigh);
 
             if let Some(sid) = session_id {
                 body["session_id"] = json!(sid);

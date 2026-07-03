@@ -8,7 +8,7 @@ use tracing::warn;
 
 use crate::model::Model;
 use crate::provider::{BoxFuture, Provider};
-use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig};
+use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
 
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use super::{KeyPool, ResolvedAuth};
@@ -124,12 +124,7 @@ impl Provider for LocalEndpoint {
             let mut body = self.compat.build_body(model, messages, system, tools);
 
             if self.thinking_budget_field {
-                let budget = match opts.thinking {
-                    ThinkingConfig::Off => 0,
-                    ThinkingConfig::Adaptive => -1,
-                    ThinkingConfig::Budget(n) => n as i64,
-                };
-                body["thinking_budget_tokens"] = json!(budget);
+                opts.thinking.apply_local_thinking(&mut body);
             }
 
             self.compat

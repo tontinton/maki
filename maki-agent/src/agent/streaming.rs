@@ -32,6 +32,7 @@ pub(crate) async fn stream_with_retry(
     opts: RequestOptions,
     session_id: Option<&str>,
 ) -> Result<StreamResponse, AgentError> {
+    let opts = opts.clamped(model);
     let mut retry = RetryState::new();
     loop {
         let (ptx, prx) = flume::unbounded();
