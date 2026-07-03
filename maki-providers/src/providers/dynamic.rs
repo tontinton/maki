@@ -520,6 +520,9 @@ impl Provider for DynamicProvider {
     }
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
+        if self.models.is_empty() {
+            return self.inner.list_models();
+        }
         Box::pin(async {
             Ok(self
                 .models
