@@ -283,6 +283,8 @@ impl LocalEndpoint {
                     context_window: Some(context_window),
                     max_output_tokens: None,
                     pricing: Some(crate::model::ModelPricing::ZERO),
+                    supports_thinking: None,
+                    provider_info: None,
                 }
             })
             .collect();
@@ -388,6 +390,8 @@ impl LocalEndpoint {
                 context_window,
                 max_output_tokens: None,
                 pricing: Some(crate::model::ModelPricing::ZERO),
+                supports_thinking: None,
+                provider_info: None,
             })
             .collect();
         models.sort_by(|a, b| a.id.cmp(&b.id));

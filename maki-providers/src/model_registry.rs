@@ -316,12 +316,16 @@ mod tests {
                     context_window: Some(32_000),
                     max_output_tokens: None,
                     pricing: None,
+                    supports_thinking: None,
+                    provider_info: None,
                 },
                 ModelInfo {
                     id: "model-b".into(),
                     context_window: Some(128_000),
                     max_output_tokens: None,
                     pricing: None,
+                    supports_thinking: None,
+                    provider_info: None,
                 },
             ],
         );

@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 
 use crate::model::{Model, ModelEntry};
 use crate::provider::{BoxFuture, Provider};
-use crate::{AgentError, EffortScale, Message, ProviderEvent, RequestOptions, StreamResponse};
+use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig};
 
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use super::{KeyPool, ResolvedAuth};
@@ -23,6 +23,13 @@ static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
 
 pub(crate) fn models() -> &'static [ModelEntry] {
     &[]
+}
+
+#[derive(Debug)]
+struct OpenRouterModelInfo {
+    reasoning_mandatory: bool,
+    reasoning_default_enabled: bool,
+    reasoning_efforts: Vec<String>,
 }
 
 pub struct OpenRouter {
@@ -58,6 +65,24 @@ impl OpenRouter {
     }
 }
 
+fn map_effort_to_supported<'a>(requested: &'a str, supported: &'a [String]) -> &'a str {
+    const EFFORT_ORDER: &[&str] = &["max", "xhigh", "high", "medium", "low", "minimal", "none"];
+
+    if supported.iter().any(|s| s == requested) {
+        return requested;
+    }
+    let req_idx = EFFORT_ORDER
+        .iter()
+        .position(|&e| e == requested)
+        .unwrap_or(0);
+    for effort in EFFORT_ORDER.iter().skip(req_idx) {
+        if supported.contains(&effort.to_string()) {
+            return effort;
+        }
+    }
+    supported.last().map(|s| s.as_str()).unwrap_or(requested)
+}
+
 impl Provider for OpenRouter {
     fn stream_message<'a>(
         &'a self,
@@ -77,8 +102,53 @@ impl Provider for OpenRouter {
 
             body["cache_control"] = json!({"type": "ephemeral"});
 
-            opts.thinking
-                .apply_reasoning_effort(&mut body, EffortScale::PreferHigh);
+            let reasoning_info: Option<Arc<OpenRouterModelInfo>> = {
+                let guard = crate::model_registry::model_registry().read().unwrap();
+                guard
+                    .discovered(model.provider, &model.id)
+                    .and_then(|d| d.provider_info.clone())
+                    .map(|arc| {
+                        Arc::downcast::<OpenRouterModelInfo>(arc).expect("wrong provider info type")
+                    })
+            };
+
+            let (mandatory, default_enabled) = reasoning_info
+                .as_ref()
+                .map(|r| (r.reasoning_mandatory, r.reasoning_default_enabled))
+                .unwrap_or((false, false));
+
+            // Determine if and how to send reasoning config for OpenRouter.
+            // Models have three states:
+            // 1. mandatory: true - reasoning always on, can't be disabled.
+            // 2. default_enabled: true - reasoning on by default, disable with effort: "none".
+            // 3. default off - reasoning off by default, enabled with any reasoning object.
+            let reasoning_body = if model.supports_thinking() {
+                let effort = match opts.thinking {
+                    ThinkingConfig::Off => "none",
+                    // FIXME: Should probably use default_effort if provided instead of high
+                    ThinkingConfig::Adaptive => "high",
+                    ThinkingConfig::Budget(n) => ThinkingConfig::budget_to_effort(n),
+                };
+                match opts.thinking {
+                    ThinkingConfig::Off if mandatory => None,
+                    ThinkingConfig::Off if default_enabled => Some(json!({"effort": "none"})),
+                    ThinkingConfig::Off => None,
+                    _ => {
+                        let final_effort = if let Some(info) = &reasoning_info {
+                            map_effort_to_supported(effort, &info.reasoning_efforts)
+                        } else {
+                            effort
+                        };
+                        Some(json!({"effort": final_effort}))
+                    }
+                }
+            } else {
+                None
+            };
+
+            if let Some(reasoning) = reasoning_body {
+                body["reasoning"] = reasoning;
+            }
 
             if let Some(sid) = session_id {
                 body["session_id"] = json!(sid);
@@ -132,11 +202,40 @@ impl Provider for OpenRouter {
                             })
                         })
                         .unwrap_or_default();
+
+                    let reasoning = m.get("reasoning").and_then(|v| v.as_object()).map(|v| {
+                        OpenRouterModelInfo {
+                            reasoning_mandatory: v.get("mandatory").and_then(Value::as_bool)
+                                == Some(true),
+                            reasoning_default_enabled: v
+                                .get("default_enabled")
+                                .and_then(Value::as_bool)
+                                == Some(true),
+                            reasoning_efforts: v
+                                .get("supported_efforts")
+                                .and_then(Value::as_array)
+                                .map(|arr| {
+                                    arr.iter()
+                                        .filter_map(|v| v.as_str().map(String::from))
+                                        .collect()
+                                })
+                                .unwrap_or_default(),
+                        }
+                    });
+
+                    let supports_thinking = reasoning.is_some()
+                        || m.get("supported_parameters")
+                            .and_then(|v| v.as_array())
+                            .is_some_and(|v| v.iter().any(|v| v.as_str() == Some("reasoning")));
+
                     Some(crate::model::ModelInfo {
                         id: id.to_string(),
                         context_window,
                         max_output_tokens: None,
                         pricing: Some(pricing),
+                        supports_thinking: Some(supports_thinking),
+                        provider_info: reasoning
+                            .map(|r| Arc::new(r) as Arc<dyn std::any::Any + Send + Sync>),
                     })
                 })
                 .await

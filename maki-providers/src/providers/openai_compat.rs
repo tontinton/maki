@@ -227,6 +227,8 @@ impl OpenAiCompatProvider {
             context_window,
             max_output_tokens,
             pricing: Some(pricing),
+            supports_thinking: None,
+            provider_info: None,
         })
     }
 

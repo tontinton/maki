@@ -233,11 +233,18 @@ impl Provider for Mistral {
                     let context_window = m["max_context_length"]
                         .as_u64()
                         .and_then(|v| u32::try_from(v).ok());
+                    let supports_thinking = m
+                        .get("capabilities")
+                        .and_then(Value::as_object)
+                        .and_then(|c| c.get("reasoning"))
+                        .and_then(Value::as_bool);
                     Some(crate::model::ModelInfo {
                         id: id.to_string(),
                         context_window,
                         max_output_tokens: None,
                         pricing: None,
+                        supports_thinking,
+                        provider_info: None,
                     })
                 })
                 .await

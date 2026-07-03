@@ -3,9 +3,11 @@
 //! so dated snapshots resolve without registry churn. `context_tokens()` sums input + output
 //! + cache reads/writes because the context window limit applies to all of them combined.
 
+use std::any::Any;
 use std::fmt;
 use std::ops::AddAssign;
 use std::str::FromStr;
+use std::sync::Arc;
 
 use maki_storage::sessions::StoredTokenUsage;
 use serde::{Deserialize, Serialize};
@@ -53,6 +55,9 @@ pub struct ModelInfo {
     pub context_window: Option<u32>,
     pub max_output_tokens: Option<u32>,
     pub pricing: Option<ModelPricing>,
+    pub supports_thinking: Option<bool>,
+    /// Store of additional metadata from the provider.
+    pub provider_info: Option<Arc<dyn Any + Send + Sync>>,
 }
 
 impl ModelInfo {
@@ -62,6 +67,8 @@ impl ModelInfo {
             context_window: None,
             max_output_tokens: None,
             pricing: None,
+            supports_thinking: None,
+            provider_info: None,
         }
     }
 }
@@ -279,6 +286,12 @@ impl Model {
 
     pub fn supports_thinking(&self) -> bool {
         self.supports_thinking_override
+            .or_else(|| {
+                let guard = crate::model_registry::model_registry().read().unwrap();
+                guard
+                    .discovered(self.provider, &self.id)
+                    .and_then(|d| d.supports_thinking)
+            })
             .unwrap_or_else(|| self.provider.supports_thinking())
     }
 
@@ -741,6 +754,8 @@ mod tests {
                     context_window: Some(expected_window),
                     max_output_tokens: None,
                     pricing: None,
+                    supports_thinking: None,
+                    provider_info: None,
                 }],
             );
         }

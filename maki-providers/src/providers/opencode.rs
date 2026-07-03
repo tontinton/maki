@@ -175,6 +175,8 @@ impl CatalogData {
                     cache_write: meta.cache_write,
                     fast: None,
                 }),
+                supports_thinking: None,
+                provider_info: None,
             })
             .collect();
         models.sort_by(|a, b| a.id.cmp(&b.id));

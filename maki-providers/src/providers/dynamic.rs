@@ -536,6 +536,8 @@ impl Provider for DynamicProvider {
                     context_window: Some(m.context_window),
                     max_output_tokens: Some(m.max_output_tokens),
                     pricing: m.pricing.clone(),
+                    supports_thinking: None,
+                    provider_info: None,
                 })
                 .collect())
         })
