@@ -47,7 +47,6 @@ use crate::components::tool_display::format_turn_usage;
 use crate::components::{
     Action, DisplayMessage, DisplayRole, ExitRequest, Overlay, RetryInfo, Status, is_ctrl,
 };
-use crate::event_loop::BufClickHandler;
 use crate::image;
 use crate::selection::{SelectionState, ZoneRegistry};
 use arc_swap::{ArcSwap, ArcSwapOption};
@@ -75,8 +74,8 @@ pub(crate) use queue::MessageQueue;
 use session_state::SessionState;
 
 const CANCEL_MSG: &str = "Cancelled.";
-/// Bypasses the per-run staleness filter in `handle_agent_event` since
-/// re-bake replies don't belong to any real agent run.
+/// Bypasses the per-run staleness filter because re-bake replies
+/// don't belong to any real agent run.
 pub(crate) const RESTORE_RUN_ID: u64 = u64::MAX;
 const FLASH_CANCEL: &str = "Press esc again to stop...";
 const FLASH_REWIND: &str = "Press esc again to rewind...";
@@ -91,8 +90,6 @@ const IMPLEMENT_PARALLEL_HINT: &str = "Use batch+task to parallelize, assign eac
 
 const TASK_DONE_DETAIL: &str = "✓ ";
 
-/// `Option<bool>` lets us distinguish the main chat (None, no status indicator)
-/// from subagents (Some, with spinner or checkmark).
 #[derive(Clone)]
 pub(super) struct TaskEntry {
     name: String,
@@ -174,7 +171,6 @@ pub struct App {
     pub(crate) shell: shell::ShellState,
     pub(crate) ui_config: UiConfig,
     pub(crate) permissions: Arc<PermissionManager>,
-    pub(super) buf_click: Option<BufClickHandler>,
     pub(crate) lua_event_handle: Option<EventHandle>,
     pub(super) keymap_reader: KeymapReader,
     pub(super) hint_reader: HintReader,
@@ -252,7 +248,6 @@ impl App {
             shell: shell::ShellState::default(),
             ui_config,
             permissions,
-            buf_click: None,
             lua_event_handle: None,
             keymap_reader,
             hint_reader,
@@ -405,7 +400,6 @@ impl App {
         self.task_picker.select(self.active_chat);
     }
 
-    /// Ctrl shortcuts that apply when no overlay owns input.
     fn handle_ctrl(&mut self, key: KeyEvent) -> Option<Vec<Action>> {
         if !is_ctrl(&key) {
             return None;
@@ -466,9 +460,6 @@ impl App {
         None
     }
 
-    /// Routes input to whichever overlay currently owns focus.
-    /// Returns `Some` when an overlay is open (consuming the key),
-    /// `None` when no overlay is active and input should continue.
     fn dispatch_overlay(&mut self, key: KeyEvent) -> Option<Vec<Action>> {
         if self.permission_prompt.is_open() {
             if let Some(answer) = self.permission_prompt.handle_key(key) {

@@ -1113,11 +1113,11 @@ fn handle_click_returns_nothing_when_no_segment_at_row() {
     let mut panel = MessagesPanel::new(UiConfig::default());
     render(&mut panel, 80, 24);
     let area = Rect::new(0, 0, 80, 24);
-    assert!(matches!(panel.handle_click(23, area), ClickResult::Nothing));
+    assert!(!panel.handle_click(23, area));
 }
 
 #[test]
-fn handle_click_returns_lua_tool_click_when_snapshot_exists() {
+fn handle_click_returns_toggled_when_snapshot_exists() {
     let mut panel = MessagesPanel::new(UiConfig::default());
     panel.tool_start(start("t1", BASH_TOOL_NAME));
     panel.tool_done(ToolDoneEvent {
@@ -1135,22 +1135,15 @@ fn handle_click_returns_lua_tool_click_when_snapshot_exists() {
     );
     render(&mut panel, 80, 24);
     let area = Rect::new(0, 0, 80, 24);
-    match panel.handle_click(area.y, area) {
-        ClickResult::LuaToolClick { tool_id, .. } => {
-            assert_eq!(tool_id, "t1");
-        }
-        other => panic!("expected LuaToolClick, got {other:?}"),
-    }
+    assert!(panel.handle_click(area.y, area));
+    assert!(panel.lua_expanded.contains("t1"));
 }
 
 #[test]
 fn handle_click_returns_toggled_for_truncated_tool_without_snapshot() {
     let mut panel = panel_with_long_tool(200);
     let area = Rect::new(0, 0, 80, 24);
-    match panel.handle_click(area.y, area) {
-        ClickResult::Toggled => {}
-        other => panic!("expected Toggled, got {other:?}"),
-    }
+    assert!(panel.handle_click(area.y, area));
 }
 
 #[test]
@@ -1162,14 +1155,11 @@ fn handle_click_non_tool_segment_returns_nothing() {
     ));
     render(&mut panel, 80, 24);
     let area = Rect::new(0, 0, 80, 24);
-    assert!(matches!(
-        panel.handle_click(area.y, area),
-        ClickResult::Nothing
-    ));
+    assert!(!panel.handle_click(area.y, area));
 }
 
 #[test]
-fn handle_click_returns_lua_tool_click_for_batch_child() {
+fn handle_click_returns_toggled_for_batch_child_with_snapshot() {
     let mut panel = MessagesPanel::new(UiConfig::default());
     batch_start(
         &mut panel,
@@ -1186,12 +1176,18 @@ fn handle_click_returns_lua_tool_click_for_batch_child() {
     );
     render(&mut panel, 80, 24);
 
-    let area = Rect::new(0, 0, 80, 24);
-    let clicked = (0..area.height).find_map(|row| match panel.handle_click(row, area) {
-        ClickResult::LuaToolClick { tool_id, .. } if tool_id == "b1__0" => Some(tool_id),
-        _ => None,
-    });
-    assert_eq!(clicked.as_deref(), Some("b1__0"));
+    let width = 80;
+    let seg_idx = panel
+        .cache
+        .find_by_tool_id("b1__0")
+        .expect("child segment exists");
+    let row: u16 = panel.cache.segments()[..seg_idx]
+        .iter()
+        .map(|s| s.height(width))
+        .sum();
+    let area = Rect::new(0, 0, width, 24);
+    assert!(panel.handle_click(row, area));
+    assert!(panel.lua_expanded.contains("b1__0"));
 }
 
 #[test]

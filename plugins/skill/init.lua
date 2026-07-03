@@ -103,6 +103,14 @@ maki.api.register_tool({
     return input.name
   end,
 
+  restore = function(_input, output, _is_error, ctx)
+    local tol = ctx:tool_output_lines()
+    return ToolView.restore(output, {
+      max_lines = (tol and tol.other) or 20,
+      keep = "head",
+    })
+  end,
+
   handler = function(input, ctx)
     if not input.name then
       return "error: name is required"

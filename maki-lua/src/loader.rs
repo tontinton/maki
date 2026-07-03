@@ -12,7 +12,7 @@ use crate::api::keymap::KeymapReader;
 use crate::api::util::command::{HintReader, LuaCommandReader, UiAction};
 use crate::error::PluginError;
 use crate::plugin_permissions::{PluginPermissions, load_plugin_permissions};
-use crate::runtime::{self, ClickReply, LuaThread, Request, RestoreItem};
+use crate::runtime::{self, LuaThread, Request, RestoreItem};
 use maki_agent::prompt::ResolvedSlots;
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -22,8 +22,8 @@ struct BundledPlugin {
     dir: Dir<'static>,
 }
 
-/// `lib` is not a default builtin; it only exists so plugins can
-/// `require()` shared modules across plugin boundaries.
+/// `lib` is not a default builtin; it exists so plugins can
+/// `require()` shared modules across boundaries.
 static BUNDLED_PLUGINS: &[BundledPlugin] = &[
     BundledPlugin {
         name: "index",
@@ -318,15 +318,6 @@ impl EventHandle {
         let (tx, _rx) = flume::unbounded();
         Self { tx }
     }
-    pub fn fire_click(&self, tool_id: &str, row: u32) -> Option<ClickReply> {
-        let (tx, rx) = flume::bounded(1);
-        let _ = self.tx.try_send(Request::FireBufClick {
-            tool_id: tool_id.to_owned(),
-            row,
-            reply: tx,
-        });
-        rx.recv().ok().flatten()
-    }
 
     pub fn run_command(&self, plugin: Arc<str>, command: Arc<str>, args: String) {
         let _ = self.tx.try_send(Request::RunCommand {
@@ -376,8 +367,8 @@ mod tests {
     use maki_agent::tools::ToolRegistry;
     use test_case::test_case;
 
-    /// Load `src` as a single plugin and collect the resolved slots. Panics on
-    /// load failure; reach for `load_err` when you want to inspect the error.
+    /// Load `src` as one plugin, collect resolved slots.
+    /// Panics on failure; use `load_err` to inspect errors.
     fn slots_from(plugin: &str, src: &str) -> (PluginHost, ResolvedSlots) {
         let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
         host.load_source(plugin, src).unwrap();

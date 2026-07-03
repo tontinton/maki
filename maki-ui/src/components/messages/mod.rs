@@ -27,7 +27,7 @@ use crate::splash::{ColorTransition, Splash};
 use crate::theme;
 use maki_config::{ToolOutputLines, UiConfig};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -48,13 +48,6 @@ struct LiveBufEntry {
     dirty_seen: bool,
 }
 
-#[derive(Debug)]
-pub enum ClickResult {
-    Nothing,
-    Toggled,
-    LuaToolClick { tool_id: String, row: u32 },
-}
-
 pub struct MessagesPanel {
     messages: Vec<DisplayMessage>,
     streaming_thinking: StreamingContent,
@@ -72,14 +65,15 @@ pub struct MessagesPanel {
     idle_splash: Splash,
     accent: ColorTransition,
     expanded_tools: HashMap<String, SectionFlags>,
+    lua_expanded: HashSet<String>,
     live_bufs: HashMap<String, LiveBufEntry>,
     batch_children: HashMap<String, BatchChildState>,
     tool_output_lines: ToolOutputLines,
     render_hints: RenderHintsRegistry,
     lua_event_handle: Option<EventHandle>,
     restore_event_tx: Option<EventSender>,
-    /// Deduplicates re-bake requests: we only fire one per tool per
-    /// generation, and `snapshot_theme_gen` only updates when colors land.
+    /// One re-bake per tool per generation; `snapshot_theme_gen`
+    /// only bumps when colors actually land.
     rebake_requested: HashMap<String, u64>,
 }
 
@@ -115,6 +109,7 @@ impl MessagesPanel {
             idle_splash: Splash::new(ui_config.splash_animation),
             accent: ColorTransition::new(theme::current().mode_build),
             expanded_tools: HashMap::new(),
+            lua_expanded: HashSet::new(),
             live_bufs: HashMap::new(),
             batch_children: HashMap::new(),
             tool_output_lines: ui_config.tool_output_lines,
@@ -142,6 +137,7 @@ impl MessagesPanel {
         self.messages = msgs;
         self.cache.clear();
         self.expanded_tools.clear();
+        self.lua_expanded.clear();
         self.batch_children.clear();
         self.live_bufs.clear();
         self.rebake_requested.clear();
@@ -631,24 +627,35 @@ impl MessagesPanel {
         self.accent.set(color);
     }
 
-    pub fn handle_click(&mut self, row: u16, area: Rect) -> ClickResult {
+    pub fn handle_click(&mut self, row: u16, area: Rect) -> bool {
         if area.height == 0 {
-            return ClickResult::Nothing;
+            return false;
         }
         let doc_row = (row.saturating_sub(area.y)) as u32 + self.scroll_top as u32;
         let width = self.viewport_width;
-        let Some((_, seg, seg_start)) = self.cache.segment_at_row(doc_row, width) else {
-            return ClickResult::Nothing;
+        let Some((_, seg, _seg_start)) = self.cache.segment_at_row(doc_row, width) else {
+            return false;
         };
         let Some(tool_id) = seg.tool_id.as_deref() else {
-            return ClickResult::Nothing;
+            return false;
         };
 
         if self.has_snapshot(tool_id) {
-            return ClickResult::LuaToolClick {
-                tool_id: tool_id.to_owned(),
-                row: doc_row - seg_start,
-            };
+            let expanded = !self.lua_expanded.contains(tool_id);
+            if expanded {
+                self.lua_expanded.insert(tool_id.to_owned());
+            } else {
+                self.lua_expanded.remove(tool_id);
+            }
+            if let Some(mut item) = self.lua_restore_item(tool_id) {
+                item.expanded = expanded;
+                if let (Some(eh), Some(tx)) =
+                    (self.lua_event_handle.clone(), self.restore_event_tx.clone())
+                {
+                    eh.request_restore(item, tx);
+                }
+            }
+            return true;
         }
 
         let exp = self
@@ -657,7 +664,7 @@ impl MessagesPanel {
             .copied()
             .unwrap_or_default();
         if !seg.truncation.any() && !exp.any() {
-            return ClickResult::Nothing;
+            return false;
         }
         let tool_id = tool_id.to_owned();
         let truncation = seg.truncation;
@@ -669,12 +676,12 @@ impl MessagesPanel {
             entry.script = !entry.script;
         }
         self.rebuild_expanded_tool(&tool_id);
-        ClickResult::Toggled
+        true
     }
 
     #[cfg(test)]
     pub fn toggle_expansion_at(&mut self, row: u16, area: Rect) -> bool {
-        matches!(self.handle_click(row, area), ClickResult::Toggled)
+        self.handle_click(row, area)
     }
 
     fn rebuild_expanded_tool(&mut self, tool_id: &str) {
@@ -869,9 +876,34 @@ impl MessagesPanel {
                 .is_some_and(|m| m.render_snapshot.is_some())
     }
 
-    /// Fires async re-restores for every snapshot baked with an old theme.
-    /// Replies carry their generation, so a stale reply can never overwrite
-    /// fresher colors (monotonic guard in `resolve_snapshot_gen`).
+    fn lua_restore_item(&self, tool_id: &str) -> Option<maki_lua::RestoreItem> {
+        if let Some((parent_id, idx)) = parse_batch_inner_id(tool_id) {
+            let msg = self
+                .messages
+                .iter()
+                .rfind(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == parent_id))?;
+            let entries = match msg.tool_output.as_deref()? {
+                ToolOutput::Batch { entries, .. } => entries,
+                _ => return None,
+            };
+            let entry = entries.get(idx)?;
+            crate::chat::restore_item_for_batch_entry(
+                entry,
+                tool_id.to_owned(),
+                self.tool_output_lines,
+                self.theme_generation,
+            )
+        } else {
+            let msg = self
+                .messages
+                .iter()
+                .rfind(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == tool_id))?;
+            crate::chat::restore_item_for(msg, self.tool_output_lines, self.theme_generation)
+        }
+    }
+
+    /// Re-restores every snapshot still painted with old-theme colors.
+    /// Replies carry a generation so stale ones can't overwrite fresher colors.
     fn rebake_stale_snapshots(&mut self, current_gen: u64) {
         let (Some(eh), Some(tx)) = (self.lua_event_handle.clone(), self.restore_event_tx.clone())
         else {
@@ -891,7 +923,8 @@ impl MessagesPanel {
             ) {
                 continue;
             }
-            if let Some(item) = crate::chat::restore_item_for(msg, tol, current_gen) {
+            if let Some(mut item) = crate::chat::restore_item_for(msg, tol, current_gen) {
+                item.expanded = self.lua_expanded.contains(&role.id);
                 eh.request_restore(item, tx.clone());
                 requested.push(role.id.clone());
             }
@@ -909,8 +942,6 @@ impl MessagesPanel {
         stale && self.rebake_requested.get(tool_id) != Some(&current_gen)
     }
 
-    /// Batch children live in `batch_children`, not in `self.messages`,
-    /// so they need a separate walk.
     fn stale_batch_child_items(&self, current_gen: u64) -> Vec<maki_lua::RestoreItem> {
         let tol = self.tool_output_lines;
         let mut items = Vec::new();
@@ -930,9 +961,13 @@ impl MessagesPanel {
                 if !self.should_request_rebake(&child_id, stale, current_gen) {
                     continue;
                 }
-                if let Some(item) =
-                    crate::chat::restore_item_for_batch_entry(entry, child_id, tol, current_gen)
-                {
+                if let Some(mut item) = crate::chat::restore_item_for_batch_entry(
+                    entry,
+                    child_id.clone(),
+                    tol,
+                    current_gen,
+                ) {
+                    item.expanded = self.lua_expanded.contains(&child_id);
                     items.push(item);
                 }
             }
@@ -940,8 +975,8 @@ impl MessagesPanel {
         items
     }
 
-    /// For live snapshots (`None`) we stamp the panel's generation. For
-    /// re-bake replies we enforce monotonicity: drop if something newer landed.
+    /// Live snapshots (`None`) get the panel's current generation.
+    /// Re-bake replies are monotonic: drop if something newer landed.
     fn resolve_snapshot_gen(&self, tool_id: &str, incoming: Option<u64>) -> Option<u64> {
         let Some(incoming_gen) = incoming else {
             return Some(self.theme_generation);
@@ -1005,8 +1040,8 @@ impl MessagesPanel {
             .rfind(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == tool_id))
     }
 
-    /// Re-bake replies fan to every chat, so we need to skip chats that
-    /// don't own this tool (otherwise phantom batch children appear).
+    /// Re-bake replies fan to every chat, so skip chats that don't
+    /// own this tool (avoids phantom batch children).
     fn has_tool_msg(&self, tool_id: &str) -> bool {
         self.messages
             .iter()

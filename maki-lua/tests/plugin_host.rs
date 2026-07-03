@@ -1169,6 +1169,7 @@ fn restore_tool_async_ordering_and_delivery() {
         is_error: true,
         tool_output_lines: ToolOutputLines::default(),
         theme_gen: None,
+        expanded: false,
     };
     let unknown_item = maki_lua::RestoreItem {
         tool: std::sync::Arc::from("definitely_not_a_tool"),
@@ -1178,15 +1179,15 @@ fn restore_tool_async_ordering_and_delivery() {
         is_error: false,
         tool_output_lines: ToolOutputLines::default(),
         theme_gen: None,
+        expanded: false,
     };
 
     handle.request_restore(unknown_item, event_tx.clone());
     handle.request_restore(bash_item("a"), event_tx.clone());
     handle.request_restore(bash_item("b"), event_tx.clone());
 
-    // collect_prompt_slots is a synchronous round-trip: since the Lua
-    // thread is FIFO, it won't return until all prior requests (our
-    // restores) have been processed. Neat trick to drain without a latch.
+    // collect_prompt_slots is synchronous and FIFO, so it won't return
+    // until all prior requests (our restores) have drained. No latch needed.
     let _ = handle.collect_prompt_slots();
 
     let snapshots: Vec<maki_agent::Envelope> = rx.drain().collect();
@@ -1212,10 +1213,9 @@ fn restore_tool_async_ordering_and_delivery() {
     assert_eq!(body_count, 2, "two body snapshots for two bash items");
 }
 
-/// Guards the stale-cancelled-handle bug: `permission_scopes` must run the
-/// plugin callback and return its parsed result, never fall back to the raw
-/// input JSON. A leaked `{"command":...}` scope breaks allow rules, so we
-/// reprompt on every call. Covers both a parseable and an unparseable command.
+/// Guards the stale-cancelled-handle bug: `permission_scopes` must call
+/// the plugin callback and return parsed scopes, not fall back to raw JSON.
+/// A leaked `{"command":...}` scope would break allow rules.
 #[test_case::test_case("git status" ; "parseable command")]
 #[test_case::test_case("echo 'unterminated" ; "unparseable command")]
 fn bash_permission_scopes_never_falls_back_to_json(command: &str) {

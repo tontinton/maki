@@ -48,8 +48,9 @@ const MAX_INFLIGHT_TOOLS: usize = 64;
 const GC_STEP_INTERVAL: usize = 4;
 const INTERRUPT_CANCEL_CHECK_INTERVAL: u32 = 128;
 const ASYNC_RUN_DEFAULT_DEADLINE: Duration = Duration::from_secs(60);
-/// Without a cap, a runaway plugin gets OOM-killed by the OS and takes the
-/// whole host down. With one, it hits a catchable Lua error instead.
+const TURN_END_EVENT: &str = "TurnEnd";
+/// Without a cap, a runaway plugin OOM-kills the whole process.
+/// With one, it hits a catchable Lua error instead.
 const LUA_MEMORY_LIMIT: usize = 512 * 1024 * 1024;
 
 pub type LoadResult = Result<(), PluginError>;
@@ -66,8 +67,8 @@ pub(crate) struct PromptHintRegistration {
 
 pub(crate) type PromptHintCallbacks = BTreeMap<Arc<str>, Vec<PromptHintRegistration>>;
 
-/// Load and clear requests drain in-flight tools first so we never
-/// mutate a plugin environment while a tool call is still running.
+/// Load/clear drain in-flight tools first so we never mutate a
+/// plugin environment while a tool call is still running.
 pub enum Request {
     LoadSource {
         name: Arc<str>,
@@ -107,11 +108,6 @@ pub enum Request {
         plugin_dir: Option<PathBuf>,
         reply: flume::Sender<Result<Option<RawConfig>, PluginError>>,
     },
-    FireBufClick {
-        tool_id: String,
-        row: u32,
-        reply: flume::Sender<Option<ClickReply>>,
-    },
     RunCommand {
         plugin: Arc<str>,
         command: Arc<str>,
@@ -137,8 +133,6 @@ pub enum Request {
     },
 }
 
-/// Everything needed to re-run a lua restore callback. Used by session
-/// restore and theme re-bake so both paths share a single struct.
 pub struct RestoreItem {
     pub tool: Arc<str>,
     pub tool_use_id: String,
@@ -148,6 +142,7 @@ pub struct RestoreItem {
     pub tool_output_lines: maki_config::ToolOutputLines,
     /// Lets the UI discard snapshots from a stale theme.
     pub theme_gen: Option<u64>,
+    pub expanded: bool,
 }
 
 pub(crate) struct RestoreReply {
@@ -179,18 +174,13 @@ impl RestoreReply {
     }
 }
 
-pub struct ClickReply {
-    pub snapshot: BufferSnapshot,
-    pub live_buf: Arc<SharedBuf>,
-}
-
 #[derive(Clone)]
 pub struct LiveCtx {
     pub event_tx: maki_agent::EventSender,
     pub tool_use_id: String,
 }
 
-/// The `Mutex` is never contended (Lua is single-threaded) but
+/// Lua is single-threaded so this Mutex never contends, but
 /// `Lua::app_data` requires `Send + Sync` with the `send` feature.
 pub(crate) struct TaskCell {
     pub(crate) cancel: CancelToken,
@@ -199,6 +189,7 @@ pub(crate) struct TaskCell {
     pub(crate) jobs: JobStore,
     pub(crate) bufs: BufferStore,
     pub(crate) live: Option<LiveCtx>,
+    pub(crate) click: Option<RegistryKey>,
 }
 
 impl TaskCell {
@@ -210,22 +201,19 @@ impl TaskCell {
             jobs: JobStore::new(),
             bufs: BufferStore::new(),
             live,
+            click: None,
         }
     }
 }
 
 pub(crate) type TaskHandle = Arc<Mutex<TaskCell>>;
 
-type ClickHandlerMap = HashMap<String, (RegistryKey, Arc<SharedBuf>)>;
-
 pub(crate) fn lock_cell(handle: &TaskHandle) -> std::sync::MutexGuard<'_, TaskCell> {
     handle.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Bails out of a plugin call once its `TaskHandle` is cancelled, its deadline
-/// passed, or the host is shutting down. Cancel and deadline sit behind a mutex,
-/// so we only peek every `INTERRUPT_CANCEL_CHECK_INTERVAL` ticks to keep this
-/// hot path cheap.
+/// Fires on every Lua VM instruction. Checking the mutex on each tick
+/// would be too expensive, so we only peek every N ticks.
 fn install_interrupt(lua: &Lua, shutdown: Arc<AtomicBool>) {
     let interrupt_lua = lua.clone();
     let interrupt_tick = Cell::new(0u32);
@@ -255,10 +243,9 @@ fn install_interrupt(lua: &Lua, shutdown: Arc<AtomicBool>) {
     });
 }
 
-/// Publishes a `TaskCell` into `Lua::app_data` for the duration of a
-/// task, and restores the previous one on drop. Async work must go
-/// through `scope_future` because concurrent tasks on the same executor
-/// overwrite `app_data` between yields.
+/// Scopes a `TaskCell` into `Lua::app_data` for one task, restoring
+/// the previous on drop. Async work must use `scope_future` because
+/// concurrent tasks on the same executor overwrite app_data between yields.
 pub(crate) struct TaskScope {
     lua: Lua,
     handle: TaskHandle,
@@ -276,12 +263,10 @@ impl TaskScope {
         }
     }
 
-    /// A fresh non-cancelled scope. The shared Lua keeps the last task's
-    /// `TaskHandle` around, so a system callback must run under one of these or
-    /// the interrupt checker aborts it the moment that stale handle looks
-    /// cancelled. Prefer [`run_detached`] (async) or
-    /// [`LuaRuntime::call_sync_detached`] (sync): a raw scope is easy to leak by
-    /// forgetting `drop`.
+    /// The shared Lua keeps the last task's handle around, so system
+    /// callbacks need a fresh scope or the interrupt hook kills them
+    /// (stale handle looks cancelled). Prefer [`run_detached`] or
+    /// [`LuaRuntime::call_sync_detached`] over raw scopes.
     pub(crate) fn detached(lua: &Lua) -> Self {
         Self::new(lua, TaskCell::new(CancelToken::none(), None, None))
     }
@@ -299,9 +284,8 @@ impl TaskScope {
     }
 }
 
-/// The one safe way to run an async system callback (hints, click/command
-/// handlers) on the shared Lua. It owns the [detached] scope for the whole
-/// call, so no caller can forget to set it up or `drop` it.
+/// Runs an async system callback under a [detached] scope so callers
+/// can't forget to set one up.
 ///
 /// [detached]: TaskScope::detached
 pub(crate) async fn run_detached<F: std::future::Future>(lua: &Lua, fut: F) -> F::Output {
@@ -318,6 +302,9 @@ impl Drop for TaskScope {
             cell.jobs.kill_all();
             cell.jobs.clear(&self.lua);
             cell.bufs.clear();
+            if let Some(k) = cell.click.take() {
+                let _ = self.lua.remove_registry_value(k);
+            }
         }
         match self.prev.take() {
             Some(p) => {
@@ -330,8 +317,8 @@ impl Drop for TaskScope {
     }
 }
 
-/// Re-publishes the task handle around every `poll` so each concurrent
-/// task on the shared Lua instance sees its own `TaskCell`.
+/// Re-publishes the task handle on every `poll` so concurrent tasks
+/// on the shared Lua each see their own `TaskCell`.
 pub(crate) struct ScopedFuture<F> {
     lua: Lua,
     handle: TaskHandle,
@@ -377,13 +364,7 @@ pub(crate) fn with_task_bufs<R>(lua: &Lua, f: impl FnOnce(&mut BufferStore) -> R
     f(&mut lock_cell(&active_task(lua)).bufs)
 }
 
-pub(crate) fn with_click_handlers<R>(
-    lua: &Lua,
-    f: impl FnOnce(&mut ClickHandlerMap) -> R,
-) -> Option<R> {
-    lua.app_data_mut::<ClickHandlerMap>().map(|mut m| f(&mut m))
-}
-
+#[cfg(test)]
 pub(crate) fn with_live_ctx<R>(lua: &Lua, f: impl FnOnce(&LiveCtx) -> R) -> Option<R> {
     let handle = lua.app_data_ref::<TaskHandle>()?;
     lock_cell(&handle).live.as_ref().map(f)
@@ -417,8 +398,8 @@ pub(crate) fn enqueue_async_task(lua: &Lua, work_fn: RegistryKey) -> Result<(), 
     Ok(())
 }
 
-/// Caps concurrent coroutines so they don't blow the Lua stack or starve
-/// the executor. Also serves as a drain barrier for load/clear ops.
+/// Caps concurrent coroutines to avoid blowing the Lua stack.
+/// Also serves as a drain barrier for load/clear ops.
 struct InflightGate {
     lua: Lua,
     count: Cell<usize>,
@@ -574,8 +555,6 @@ struct ToolKeys {
 
 type PluginMap = Rc<RefCell<HashMap<Arc<str>, HashMap<Arc<str>, ToolKeys>>>>;
 
-/// Plugins run sandboxed: `require`/`io`/`package` are removed, and
-/// `os`/`debug` go through Luau's built-in restrictions.
 struct LuaRuntime {
     lua: Lua,
     pending: PendingTools,
@@ -624,7 +603,6 @@ impl LuaRuntime {
             source: e,
         })?;
 
-        lua.set_app_data(ClickHandlerMap::new());
         lua.set_app_data(CommandHandlerMap::new());
         lua.set_app_data(SpawnQueue::default());
         lua.set_app_data(command_writer);
@@ -1073,8 +1051,6 @@ impl LuaRuntime {
         }
     }
 
-    /// The sync sibling of [`run_detached`]: runs a synchronous system callback
-    /// on the shared Lua under a [`TaskScope::detached`] guard.
     fn call_sync_detached<R: mlua::FromLuaMulti>(
         &self,
         func: &Function,
@@ -1084,7 +1060,6 @@ impl LuaRuntime {
         func.call::<R>(args)
     }
 
-    /// Registers a TaskCtx so `maki.ui.buf()` works inside the handler.
     fn compute_header(&self, plugin: &str, tool: &str, input: Value) -> HeaderResult {
         let plugins = self.plugins.borrow();
         let Some(tk) = plugins.get(plugin).and_then(|p| p.get(tool)) else {
@@ -1166,6 +1141,21 @@ impl LuaRuntime {
                 |e| tracing::warn!(tool = &*item.tool, error = %e, "restore callback failed"),
             )
             .ok()?;
+
+        if item.expanded {
+            let click_key = lock_cell(scope.handle()).click.take();
+            if let Some(key) = click_key
+                && let Ok(func) = self.lua.registry_value::<Function>(&key)
+                && let Ok(data) = self.lua.create_table()
+            {
+                let _ = data.set("row", 0);
+                if let Err(e) = scope.scope_future(func.call_async::<()>(data)).await {
+                    tracing::warn!(tool = &*item.tool, error = %e, "click expand failed");
+                }
+                let _ = self.lua.remove_registry_value(key);
+            }
+        }
+
         drop(scope);
 
         let mut reply = extract_restore_reply(&ret)?;
@@ -1271,9 +1261,8 @@ fn extract_restore_reply(ret: &LuaValue) -> Option<RestoreReply> {
     Some(RestoreReply { body, header })
 }
 
-/// Nil from the handler means "I went async". Polls job events until
-/// `ctx:finish()`, all jobs die, or the deadline (possibly set
-/// mid-flight via `ctx:set_deadline`) expires.
+/// Handler returned nil, meaning it went async. Polls job events
+/// until `ctx:finish()`, all jobs die, or the deadline expires.
 async fn dispatch_async(
     lua: &Lua,
     handle: TaskHandle,
@@ -1408,8 +1397,8 @@ fn timeout_reply(handle: &TaskHandle, plugin: &str, tool: &str) -> ToolCallReply
     reply
 }
 
-/// Deadlines work in two layers: the interrupt hook catches tight CPU
-/// loops, and the dispatch loop catches I/O waits between job events.
+/// Two layers of deadline enforcement: the interrupt hook catches
+/// tight CPU loops, the dispatch loop catches I/O waits.
 #[allow(clippy::too_many_arguments)]
 async fn run_tool_call(
     lua: Lua,
@@ -1504,9 +1493,8 @@ async fn run_tool_call(
         }
     });
 
-    // Both the dispatch loop and the interrupt hook read the live
-    // deadline from TaskCell. The outer `tool.rs` timeout is the
-    // absolute backstop.
+    // `tool.rs` timeout is the absolute backstop; the dispatch loop
+    // and interrupt hook enforce the per-plugin deadline from TaskCell.
     let reply = call_future.await;
     drop(scope);
     reply
@@ -1522,8 +1510,8 @@ pub(crate) struct LuaThread {
     pub ui_action_rx: flume::Receiver<UiAction>,
 }
 
-/// Lua gets its own OS thread so nothing needs a Mutex. `smol::block_on`
-/// drives cooperative async, and load/clear requests wait for in-flight tools.
+/// Lua lives on its own OS thread (no Send needed). `smol::block_on`
+/// drives async, load/clear requests wait for in-flight tools.
 pub fn spawn(
     registry: Arc<ToolRegistry>,
     bundled_dirs: &'static [&'static Dir<'static>],
@@ -1623,37 +1611,6 @@ pub fn spawn(
                             rt.clear_plugin(&plugin);
                             let _ = reply.send(());
                         }
-                        Request::FireBufClick { tool_id, row, reply } => {
-                            let entry =
-                                rt.lua.app_data_ref::<ClickHandlerMap>().and_then(|m| {
-                                    let (key, buf) = m.get(&tool_id)?;
-                                    let func = rt.lua.registry_value::<Function>(key).ok()?;
-                                    Some((func, Arc::clone(buf)))
-                                });
-                            if let Some((func, buf)) = entry {
-                                let lua = rt.lua.clone();
-                                let ex_ref = Rc::clone(&ex);
-                                let g = Rc::clone(&gate);
-                                ex.spawn(async move {
-                                    let Ok(data) = lua.create_table() else {
-                                        let _ = reply.send(None);
-                                        return;
-                                    };
-                                    let _ = data.set("row", row);
-                                    if let Err(e) = run_detached(&lua, func.call_async::<()>(data)).await {
-                                        tracing::warn!(tool_id, error = %e, "click handler failed");
-                                    }
-                                    drain_spawn_queue(&lua, &ex_ref, &g);
-                                    let _ = reply.send(Some(ClickReply {
-                                        snapshot: buf.take(),
-                                        live_buf: buf,
-                                    }));
-                                })
-                                .detach();
-                            } else {
-                                let _ = reply.send(None);
-                            }
-                        }
                         Request::RunCommand {
                             plugin,
                             command,
@@ -1726,45 +1683,44 @@ pub fn spawn(
                             flag.store(false, Ordering::Relaxed);
                         }
                         Request::FireAutocmd { event, data } => {
-                            let entries = {
-                                let mut store = match rt.lua.app_data_mut::<AutocmdStore>() {
-                                    Some(s) => s,
-                                    None => continue,
-                                };
-                                let Some(list) = store.listeners.get_mut(&event) else {
-                                    continue;
-                                };
-                                std::mem::take(list)
-                            };
-                            let ctx_table = rt.lua.create_table().ok();
-                            if let Some(ref tbl) = ctx_table
-                                && let Some(obj) = data.as_object()
+                            if let Some(mut store) = rt.lua.app_data_mut::<AutocmdStore>()
+                                && let Some(list) = store.listeners.get_mut(&event)
                             {
-                                for (k, v) in obj {
-                                    let _ = tbl.set(k.as_str(), json_to_lua(&rt.lua, v).unwrap_or(LuaValue::Nil));
-                                }
-                            }
-                            let mut keep = Vec::with_capacity(entries.len());
-                            for entry in entries {
-                                let once = entry.once;
-                                if let Ok(func) = rt.lua.registry_value::<Function>(&entry.callback) {
-                                    let arg = ctx_table.as_ref().map(|t| LuaValue::Table(t.clone())).unwrap_or(LuaValue::Nil);
-                                    if let Err(e) = rt.call_sync_detached::<()>(&func, arg) {
-                                        tracing::warn!(event = %event, plugin = %entry.plugin, error = %e, "autocmd callback failed");
+                                let entries = std::mem::take(list);
+                                drop(store);
+                                let ctx_table = rt.lua.create_table().ok();
+                                if let Some(ref tbl) = ctx_table
+                                    && let Some(obj) = data.as_object()
+                                {
+                                    for (k, v) in obj {
+                                        let _ = tbl.set(k.as_str(), json_to_lua(&rt.lua, v).unwrap_or(LuaValue::Nil));
                                     }
                                 }
-                                if once {
-                                    let _ = rt.lua.remove_registry_value(entry.callback);
-                                } else {
-                                    keep.push(entry);
+                                let mut keep = Vec::with_capacity(entries.len());
+                                for entry in entries {
+                                    let once = entry.once;
+                                    if let Ok(func) = rt.lua.registry_value::<Function>(&entry.callback) {
+                                        let arg = ctx_table.as_ref().map(|t| LuaValue::Table(t.clone())).unwrap_or(LuaValue::Nil);
+                                        if let Err(e) = rt.call_sync_detached::<()>(&func, arg) {
+                                            tracing::warn!(event = %event, plugin = %entry.plugin, error = %e, "autocmd callback failed");
+                                        }
+                                    }
+                                    if once {
+                                        let _ = rt.lua.remove_registry_value(entry.callback);
+                                    } else {
+                                        keep.push(entry);
+                                    }
                                 }
+                                if !keep.is_empty()
+                                    && let Some(mut store) = rt.lua.app_data_mut::<AutocmdStore>()
+                                {
+                                    store.listeners.entry(event.clone()).or_default().extend(keep);
+                                }
+                                drain_spawn_queue(&rt.lua, &ex, &gate);
                             }
-                            if !keep.is_empty()
-                                && let Some(mut store) = rt.lua.app_data_mut::<AutocmdStore>()
-                            {
-                                store.listeners.entry(event).or_default().extend(keep);
+                            if event == TURN_END_EVENT {
+                                rt.lua.gc_collect().ok();
                             }
-                            drain_spawn_queue(&rt.lua, &ex, &gate);
                         }
                         Request::RunKeybindCallback { id } => {
                             let func = rt.lua.app_data_ref::<KeymapStore>().and_then(|store| {
@@ -2099,8 +2055,6 @@ mod tests {
         }));
     }
 
-    /// Loops far past `INTERRUPT_CANCEL_CHECK_INTERVAL` so the interrupt handler
-    /// is guaranteed to run the cancel check at least once mid-call.
     fn looping_callback(lua: &Lua) -> Function {
         lua.load("for _ = 1, 100000 do end return true")
             .into_function()

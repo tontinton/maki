@@ -32,8 +32,6 @@ use crate::terminal;
 const ANIMATION_INTERVAL_MS: u64 = 16;
 const IDLE_POLL_INTERVAL_MS: u64 = 100;
 
-pub type BufClickHandler = Arc<dyn Fn(&str, u32) -> Option<maki_lua::ClickReply> + Send + Sync>;
-
 pub struct EventLoopParams {
     pub model: Model,
     pub needs_login: bool,
@@ -51,7 +49,6 @@ pub struct EventLoopParams {
     pub hint_reader: HintReader,
     pub ui_action_rx: Option<flume::Receiver<UiAction>>,
     pub lua_event_handle: Option<EventHandle>,
-    pub buf_click: Option<BufClickHandler>,
 }
 
 pub(crate) struct EventLoop<'t> {
@@ -175,7 +172,6 @@ impl<'t> EventLoop<'t> {
             hint_reader,
             ui_action_rx,
             lua_event_handle,
-            buf_click,
         } = params;
 
         std::thread::spawn(crate::highlight::warmup);
@@ -230,7 +226,6 @@ impl<'t> EventLoop<'t> {
             custom_commands,
         );
         app.exit_on_done = exit_on_done;
-        app.buf_click = buf_click;
         app.lua_event_handle = lua_event_handle;
 
         if needs_login {

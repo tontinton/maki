@@ -234,12 +234,8 @@ impl Chat {
         self.messages_panel.extract_selection_text(sel, msg_area)
     }
 
-    pub fn handle_click(
-        &mut self,
-        row: u16,
-        area: Rect,
-    ) -> super::components::messages::ClickResult {
-        self.messages_panel.handle_click(row, area)
+    pub fn handle_click(&mut self, row: u16, area: Rect) {
+        self.messages_panel.handle_click(row, area);
     }
 
     pub fn tool_snapshot(
@@ -317,9 +313,8 @@ impl Chat {
             .push(DisplayMessage::new(DisplayRole::User, text.into()));
     }
 
-    /// Flush any in-flight stream, push the bubble, then re-pin auto-scroll.
-    /// Doing all three together keeps the bubble from briefly landing in the
-    /// wrong row, which is what caused the one-frame hop after submit.
+    /// Flush, push, and re-pin scroll in one shot to avoid
+    /// the one-frame hop where the bubble briefly lands in the wrong row.
     pub fn show_user_message(&mut self, text: impl Into<String>) {
         self.flush();
         self.push_user_message(text);
@@ -436,6 +431,7 @@ pub fn history_to_display(
                                 is_error: status == ToolStatus::Error,
                                 tool_output_lines: *tool_output_lines,
                                 theme_gen: None,
+                                expanded: false,
                             });
                             display.push(DisplayMessage {
                                 role: DisplayRole::Tool(Box::new(ToolRole {
@@ -467,8 +463,8 @@ pub fn history_to_display(
     (display, restore_items)
 }
 
-/// The original `ToolResult` is gone after session load, so we rebuild a
-/// `RestoreItem` from whatever the `DisplayMessage` kept.
+/// `ToolResult` is gone after session load, so we rebuild from
+/// whatever the `DisplayMessage` kept.
 pub(crate) fn restore_item_for(
     msg: &DisplayMessage,
     tool_output_lines: maki_config::ToolOutputLines,
@@ -487,10 +483,10 @@ pub(crate) fn restore_item_for(
         is_error: role.status == ToolStatus::Error,
         tool_output_lines,
         theme_gen: Some(theme_gen),
+        expanded: false,
     })
 }
 
-/// Batch variant of `restore_item_for`.
 pub(crate) fn restore_item_for_batch_entry(
     entry: &maki_agent::BatchToolEntry,
     child_id: String,
@@ -507,11 +503,12 @@ pub(crate) fn restore_item_for_batch_entry(
         is_error: entry.status == BatchToolStatus::Error,
         tool_output_lines,
         theme_gen: Some(theme_gen),
+        expanded: false,
     })
 }
 
-/// Builds a loaded tool the same way the live `tool_done` path does, so
-/// restored sessions look identical to streamed ones.
+/// Mirrors the live `tool_done` path so restored sessions
+/// look the same as streamed ones.
 fn build_loaded_tool(
     tool: &str,
     summary: &str,
