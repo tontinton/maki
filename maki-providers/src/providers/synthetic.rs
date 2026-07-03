@@ -5,7 +5,7 @@ use serde_json::Value;
 
 use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier};
 use crate::provider::{BoxFuture, Provider};
-use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
+use crate::{AgentError, EffortScale, Message, ProviderEvent, RequestOptions, StreamResponse};
 
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use super::{KeyPool, ResolvedAuth};
@@ -129,7 +129,8 @@ impl Provider for Synthetic {
             let mut buf = String::new();
             let system = super::with_prefix(&self.system_prefix, system, &mut buf);
             let mut body = self.compat.build_body(model, messages, system, tools);
-            opts.thinking.apply_reasoning_effort(&mut body);
+            opts.thinking
+                .apply_reasoning_effort(&mut body, EffortScale::Standard);
             self.compat
                 .do_stream(model, &[], &body, event_tx, &auth)
                 .await

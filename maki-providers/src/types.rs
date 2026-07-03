@@ -238,6 +238,22 @@ impl StopReason {
 }
 
 const THINKING_USAGE: &str = "Usage: /thinking [off|adaptive|<budget\u{2265}1024>]";
+const GLM_XHIGH_THRESHOLD: u32 = 8192;
+
+/// Each provider speaks a different dialect of `reasoning_effort`.
+/// New providers get a variant here instead of a new body-mutating method.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EffortScale {
+    /// low / medium / high. Adaptive = medium.
+    Standard,
+    /// low / medium / high. Adaptive = high.
+    PreferHigh,
+    /// Always "high", ignores budget.
+    HighOnly,
+    /// none / high / xhigh. GLM reasons by default, so Off sends "none"
+    /// explicitly. Only use behind `Model::supports_thinking`.
+    Glm,
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ThinkingConfig {
@@ -293,13 +309,46 @@ impl ThinkingConfig {
         (major, minor) >= (4, 7)
     }
 
-    pub fn apply_reasoning_effort(self, body: &mut Value) {
-        let effort = match self {
-            Self::Off => return,
-            Self::Adaptive => "medium",
-            Self::Budget(n) => Self::budget_to_effort(n),
+    pub fn apply_reasoning_effort(self, body: &mut Value, scale: EffortScale) {
+        let effort = match (self, scale) {
+            (Self::Off, EffortScale::Glm) => "none",
+            (Self::Off, _) => return,
+            (Self::Adaptive, EffortScale::Standard) => "medium",
+            (Self::Adaptive, _) => "high",
+            (Self::Budget(_), EffortScale::HighOnly) => "high",
+            (Self::Budget(n), EffortScale::Glm) => {
+                if n >= GLM_XHIGH_THRESHOLD {
+                    "xhigh"
+                } else {
+                    "high"
+                }
+            }
+            (Self::Budget(n), EffortScale::Standard | EffortScale::PreferHigh) => {
+                Self::budget_to_effort(n)
+            }
         };
         body["reasoning_effort"] = json!(effort);
+    }
+
+    pub fn apply_google_thinking(self, body: &mut Value) {
+        match self {
+            Self::Off => {}
+            Self::Adaptive => {
+                body["generationConfig"]["thinkingConfig"] = json!({"includeThoughts": true});
+            }
+            Self::Budget(n) => {
+                body["generationConfig"]["thinkingConfig"] = json!({"thinkingBudget": n});
+            }
+        }
+    }
+
+    pub fn apply_local_thinking(self, body: &mut Value) {
+        let budget = match self {
+            Self::Off => 0,
+            Self::Adaptive => -1,
+            Self::Budget(n) => n as i64,
+        };
+        body["thinking_budget_tokens"] = json!(budget);
     }
 
     pub fn parse(input: &str, current: Self) -> Result<Self, &'static str> {
@@ -357,9 +406,24 @@ impl From<ThinkingConfig> for StoredThinking {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RequestOptions {
     pub thinking: ThinkingConfig,
-    /// Just what the user asked for. The provider re-checks `supports_fast()`
-    /// before sending it, so a stale flag never bills an ineligible model.
+    /// Raw user preference, reconciled by [`RequestOptions::clamped`] before use.
     pub fast: bool,
+}
+
+impl RequestOptions {
+    /// Strips options the model does not support. Called once before every
+    /// request so UI state, restored sessions, and subagent flags all go
+    /// through the same gate.
+    pub fn clamped(self, model: &crate::model::Model) -> Self {
+        Self {
+            thinking: if model.supports_thinking() {
+                self.thinking
+            } else {
+                ThinkingConfig::Off
+            },
+            fast: self.fast && model.supports_fast(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -445,18 +509,91 @@ mod tests {
         assert_eq!(body, expected);
     }
 
-    #[test_case(ThinkingConfig::Off,          None            ; "off")]
-    #[test_case(ThinkingConfig::Adaptive,     Some("medium")  ; "adaptive")]
-    #[test_case(ThinkingConfig::Budget(1024), Some("low")     ; "budget_low")]
-    #[test_case(ThinkingConfig::Budget(4096), Some("medium")  ; "budget_medium")]
-    #[test_case(ThinkingConfig::Budget(8192), Some("high")    ; "budget_high")]
-    fn thinking_apply_reasoning_effort(config: ThinkingConfig, expected: Option<&str>) {
+    use EffortScale::{Glm, HighOnly, PreferHigh, Standard};
+
+    #[test_case(Standard,   ThinkingConfig::Off,          None            ; "off_noop")]
+    #[test_case(Standard,   ThinkingConfig::Adaptive,     Some("medium")  ; "standard_adaptive")]
+    #[test_case(Standard,   ThinkingConfig::Budget(1024), Some("low")     ; "standard_budget_low")]
+    #[test_case(Standard,   ThinkingConfig::Budget(4096), Some("medium")  ; "standard_budget_medium")]
+    #[test_case(Standard,   ThinkingConfig::Budget(8192), Some("high")    ; "standard_budget_high")]
+    #[test_case(PreferHigh, ThinkingConfig::Adaptive,     Some("high")    ; "prefer_high_adaptive")]
+    #[test_case(PreferHigh, ThinkingConfig::Budget(1024), Some("low")     ; "prefer_high_budget_low")]
+    #[test_case(HighOnly,   ThinkingConfig::Adaptive,     Some("high")    ; "high_only_adaptive")]
+    #[test_case(HighOnly,   ThinkingConfig::Budget(1024), Some("high")    ; "high_only_budget")]
+    #[test_case(Glm,        ThinkingConfig::Off,          Some("none")    ; "glm_off_explicit_none")]
+    #[test_case(Glm,        ThinkingConfig::Adaptive,     Some("high")    ; "glm_adaptive")]
+    #[test_case(Glm,        ThinkingConfig::Budget(1024), Some("high")    ; "glm_budget_low")]
+    #[test_case(Glm,        ThinkingConfig::Budget(8192), Some("xhigh")   ; "glm_budget_xhigh")]
+    fn thinking_apply_reasoning_effort(
+        scale: EffortScale,
+        config: ThinkingConfig,
+        expected: Option<&str>,
+    ) {
         let mut body = json!({"model": "test"});
-        config.apply_reasoning_effort(&mut body);
+        config.apply_reasoning_effort(&mut body, scale);
         match expected {
             Some(e) => assert_eq!(body["reasoning_effort"], e),
             None => assert!(body.get("reasoning_effort").is_none()),
         }
+    }
+
+    #[test_case(ThinkingConfig::Off,          json!({})                                                                  ; "off")]
+    #[test_case(ThinkingConfig::Adaptive,     json!({"generationConfig": {"thinkingConfig": {"includeThoughts": true}}}) ; "adaptive")]
+    #[test_case(ThinkingConfig::Budget(4096), json!({"generationConfig": {"thinkingConfig": {"thinkingBudget": 4096}}}) ; "budget")]
+    fn thinking_apply_google_thinking(config: ThinkingConfig, expected: Value) {
+        let mut body = json!({});
+        config.apply_google_thinking(&mut body);
+        assert_eq!(body, expected);
+    }
+
+    #[test_case(ThinkingConfig::Off,          0    ; "off")]
+    #[test_case(ThinkingConfig::Adaptive,     -1   ; "adaptive")]
+    #[test_case(ThinkingConfig::Budget(4096), 4096 ; "budget")]
+    fn thinking_apply_local_thinking(config: ThinkingConfig, expected: i64) {
+        let mut body = json!({});
+        config.apply_local_thinking(&mut body);
+        assert_eq!(body["thinking_budget_tokens"], expected);
+    }
+
+    fn clamp_test_model(provider: crate::provider::ProviderKind) -> crate::model::Model {
+        crate::model::Model {
+            id: "test-model".into(),
+            provider,
+            dynamic_slug: None,
+            tier: crate::model::ModelTier::Medium,
+            family: provider.family(),
+            supports_tool_examples_override: None,
+            supports_thinking_override: None,
+            pricing: crate::model::ModelPricing::default(),
+            max_output_tokens: 8192,
+            context_window: 200_000,
+        }
+    }
+
+    #[test_case(None,        ThinkingConfig::Adaptive, ThinkingConfig::Adaptive ; "provider_default_keeps")]
+    #[test_case(Some(false), ThinkingConfig::Adaptive, ThinkingConfig::Off      ; "override_false_clamps")]
+    fn request_options_clamped_thinking(
+        supports: Option<bool>,
+        thinking: ThinkingConfig,
+        expected: ThinkingConfig,
+    ) {
+        let mut model = clamp_test_model(crate::provider::ProviderKind::Anthropic);
+        model.supports_thinking_override = supports;
+        let opts = RequestOptions {
+            thinking,
+            fast: false,
+        };
+        assert_eq!(opts.clamped(&model).thinking, expected);
+    }
+
+    #[test]
+    fn request_options_clamped_fast_requires_model_support() {
+        let model = clamp_test_model(crate::provider::ProviderKind::Google);
+        let opts = RequestOptions {
+            thinking: ThinkingConfig::Off,
+            fast: true,
+        };
+        assert!(!opts.clamped(&model).fast);
     }
 
     #[test_case("",         ThinkingConfig::Off,      Ok(ThinkingConfig::Adaptive)  ; "toggle_on")]

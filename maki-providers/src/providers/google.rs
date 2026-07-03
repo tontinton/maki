@@ -175,14 +175,7 @@ impl Google {
             body["systemInstruction"] = json!({"parts": [{"text": system}]});
         }
 
-        if !matches!(thinking, ThinkingConfig::Off) {
-            let config = match thinking {
-                ThinkingConfig::Budget(n) => json!({"thinkingBudget": n}),
-                ThinkingConfig::Adaptive => json!({"includeThoughts": true}),
-                ThinkingConfig::Off => unreachable!(),
-            };
-            body["generationConfig"]["thinkingConfig"] = config;
-        }
+        thinking.apply_google_thinking(&mut body);
 
         if model.max_output_tokens > 0 {
             body["generationConfig"]["maxOutputTokens"] = json!(model.max_output_tokens);
@@ -607,20 +600,25 @@ mod tests {
         }
     }
 
-    #[test]
-    fn google_build_body_basic() {
-        let google = Google::with_auth(test_auth(), test_timeouts());
-        let model = Model {
+    fn test_model() -> Model {
+        Model {
             id: "gemini-2.5-flash".into(),
             provider: crate::provider::ProviderKind::Google,
             dynamic_slug: None,
             tier: ModelTier::Medium,
             family: ModelFamily::Gemini,
             supports_tool_examples_override: None,
+            supports_thinking_override: None,
             pricing: ModelPricing::default(),
             max_output_tokens: 8192,
             context_window: 1_048_576,
-        };
+        }
+    }
+
+    #[test]
+    fn google_build_body_basic() {
+        let google = Google::with_auth(test_auth(), test_timeouts());
+        let model = test_model();
         let messages = vec![Message::user("hello".into())];
         let body = google.build_body(
             &model,
@@ -639,19 +637,14 @@ mod tests {
     #[test]
     fn google_build_body_thinking_adaptive() {
         let google = Google::with_auth(test_auth(), test_timeouts());
-        let model = Model {
-            id: "gemini-2.5-flash".into(),
-            provider: crate::provider::ProviderKind::Google,
-            dynamic_slug: None,
-            tier: ModelTier::Medium,
-            family: ModelFamily::Gemini,
-            supports_tool_examples_override: None,
-            pricing: ModelPricing::default(),
-            max_output_tokens: 8192,
-            context_window: 1_048_576,
-        };
-        let messages = vec![Message::user("think about this".into())];
-        let body = google.build_body(&model, &messages, "", &json!([]), ThinkingConfig::Adaptive);
+        let messages = vec![Message::user("think".into())];
+        let body = google.build_body(
+            &test_model(),
+            &messages,
+            "",
+            &json!([]),
+            ThinkingConfig::Adaptive,
+        );
 
         assert_eq!(
             body["generationConfig"]["thinkingConfig"]["includeThoughts"],
@@ -662,20 +655,9 @@ mod tests {
     #[test]
     fn google_build_body_thinking_budget() {
         let google = Google::with_auth(test_auth(), test_timeouts());
-        let model = Model {
-            id: "gemini-2.5-flash".into(),
-            provider: crate::provider::ProviderKind::Google,
-            dynamic_slug: None,
-            tier: ModelTier::Medium,
-            family: ModelFamily::Gemini,
-            supports_tool_examples_override: None,
-            pricing: ModelPricing::default(),
-            max_output_tokens: 8192,
-            context_window: 1_048_576,
-        };
         let messages = vec![Message::user("think hard".into())];
         let body = google.build_body(
-            &model,
+            &test_model(),
             &messages,
             "",
             &json!([]),

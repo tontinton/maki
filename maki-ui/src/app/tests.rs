@@ -2267,9 +2267,9 @@ fn thinking_explicit_args() {
 }
 
 #[test]
-fn thinking_non_anthropic_flashes_error() {
+fn thinking_unsupported_model_flashes_error() {
     let mut app = test_app();
-    app.state.model.provider = maki_providers::provider::ProviderKind::Ollama;
+    app.state.model.supports_thinking_override = Some(false);
 
     app.execute_command(cmd("/thinking"));
     assert_eq!(app.state.thinking, ThinkingConfig::Off);

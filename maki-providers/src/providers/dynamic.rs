@@ -59,6 +59,8 @@ struct ScriptModel {
     tier: ModelTier,
     #[serde(default)]
     supports_tool_examples: Option<bool>,
+    #[serde(default)]
+    supports_thinking: Option<bool>,
     #[serde(default = "default_max_output_tokens")]
     max_output_tokens: u32,
     #[serde(default = "default_context_window")]
@@ -453,6 +455,7 @@ pub fn lookup_model(slug: &str, model_id: &str) -> Option<Model> {
         tier: script_model.tier,
         family: meta.base.family(),
         supports_tool_examples_override: script_model.supports_tool_examples,
+        supports_thinking_override: script_model.supports_thinking,
         pricing: script_model.pricing.clone().unwrap_or_default(),
         max_output_tokens: script_model.max_output_tokens,
         context_window: script_model.context_window,
@@ -469,6 +472,7 @@ pub fn find_model_for_tier(slug: &str, tier: ModelTier) -> Option<Model> {
         tier,
         family: meta.base.family(),
         supports_tool_examples_override: script_model.supports_tool_examples,
+        supports_thinking_override: script_model.supports_thinking,
         pricing: script_model.pricing.clone().unwrap_or_default(),
         max_output_tokens: script_model.max_output_tokens,
         context_window: script_model.context_window,

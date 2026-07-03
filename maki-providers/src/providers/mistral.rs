@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 
 use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier};
 use crate::provider::{BoxFuture, Provider};
-use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig};
+use crate::{AgentError, EffortScale, Message, ProviderEvent, RequestOptions, StreamResponse};
 
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use super::{KeyPool, ResolvedAuth};
@@ -194,11 +194,8 @@ impl Provider for Mistral {
             let mut buf = String::new();
             let system = super::with_prefix(&self.system_prefix, system, &mut buf);
             let mut body = self.compat.build_body(model, messages, system, tools);
-            // Ministral does not support reasoning, Mistral Small 4 and Mistral Medium 3.5 do
-            if !matches!(opts.thinking, ThinkingConfig::Off) && !model.id.starts_with("ministral-")
-            {
-                body["reasoning_effort"] = json!("high");
-            }
+            opts.thinking
+                .apply_reasoning_effort(&mut body, EffortScale::HighOnly);
             // Convert assistant messages to Mistral's expected format with thinking content
             convert_assistant_messages_in_place(body.get_mut("messages").unwrap());
 
@@ -251,6 +248,16 @@ impl Provider for Mistral {
                 .as_ref()
                 .is_some_and(|p| p.rotate_auth(&self.auth, ResolvedAuth::bearer)))
         })
+    }
+
+    fn adjust_model(&self, model: &mut Model) {
+        adjust_model(model);
+    }
+}
+
+fn adjust_model(model: &mut Model) {
+    if model.id.starts_with("ministral-") {
+        model.supports_thinking_override = Some(false);
     }
 }
 
@@ -320,5 +327,13 @@ mod tests {
         let mut input_clone = input.clone();
         convert_assistant_messages_in_place(&mut input_clone);
         assert_eq!(input_clone, expected);
+    }
+
+    #[test_case("mistral/ministral-14b-latest", false ; "ministral_no_thinking")]
+    #[test_case("mistral/mistral-medium-latest", true ; "mistral_medium_supports_thinking")]
+    fn adjust_model_sets_thinking_support(spec: &str, expected: bool) {
+        let mut model = Model::from_spec(spec).unwrap();
+        adjust_model(&mut model);
+        assert_eq!(model.supports_thinking(), expected);
     }
 }

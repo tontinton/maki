@@ -8,7 +8,7 @@ use tracing::warn;
 use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier};
 use crate::provider::{BoxFuture, Provider};
 use crate::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
-use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
+use crate::{AgentError, EffortScale, Message, ProviderEvent, RequestOptions, StreamResponse};
 
 use super::{KeyPool, ResolvedAuth};
 
@@ -224,14 +224,18 @@ impl Provider for Zai {
         system: &'a str,
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
-        _opts: RequestOptions,
+        opts: RequestOptions,
         _session_id: Option<&str>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let auth = self.auth.lock().unwrap().clone();
             let mut buf = String::new();
             let system = super::with_prefix(&self.system_prefix, system, &mut buf);
-            let body = self.compat.build_body(model, messages, system, tools);
+            let mut body = self.compat.build_body(model, messages, system, tools);
+            if model.supports_thinking() {
+                opts.thinking
+                    .apply_reasoning_effort(&mut body, EffortScale::Glm);
+            }
             match self
                 .compat
                 .do_stream(model, &[], &body, event_tx, &auth)
@@ -266,5 +270,30 @@ impl Provider for Zai {
                 .as_ref()
                 .is_some_and(|p| p.rotate_auth(&self.auth, ResolvedAuth::bearer)))
         })
+    }
+
+    fn adjust_model(&self, model: &mut Model) {
+        adjust_model(model);
+    }
+}
+
+fn adjust_model(model: &mut Model) {
+    if model.id.starts_with("glm-5.2") {
+        model.supports_thinking_override = Some(true);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_case::test_case;
+
+    #[test_case("zai/glm-5.2", true ; "glm_5_2_supports_thinking")]
+    #[test_case("zai/glm-5.1", false ; "glm_5_1_no_thinking")]
+    #[test_case("zai/glm-4.7", false ; "glm_4_7_no_thinking")]
+    fn adjust_model_sets_thinking_support(spec: &str, expected: bool) {
+        let mut model = Model::from_spec(spec).unwrap();
+        adjust_model(&mut model);
+        assert_eq!(model.supports_thinking(), expected);
     }
 }

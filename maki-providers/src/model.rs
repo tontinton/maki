@@ -206,6 +206,7 @@ pub struct Model {
     pub tier: ModelTier,
     pub family: ModelFamily,
     pub supports_tool_examples_override: Option<bool>,
+    pub supports_thinking_override: Option<bool>,
     pub pricing: ModelPricing,
     pub max_output_tokens: u32,
     pub context_window: u32,
@@ -255,10 +256,16 @@ impl Model {
             tier,
             family,
             supports_tool_examples_override: None,
+            supports_thinking_override: None,
             pricing,
             max_output_tokens,
             context_window,
         }
+    }
+
+    pub fn supports_thinking(&self) -> bool {
+        self.supports_thinking_override
+            .unwrap_or_else(|| self.provider.supports_thinking())
     }
 
     pub fn supports_tool_examples(&self) -> bool {
