@@ -1,4 +1,5 @@
 # Rosé Pine theme for Maki
+# https://rosepinetheme.com/palette/
 
 "comment"                         = { fg = "comment" }
 "comment.block"                   = { fg = "comment" }
@@ -85,84 +86,76 @@
 "variable.parameter"              = { fg = "orange", modifiers = ["italic"] }
 
 [palette]
-background       = "#191724"
-background_2     = "#1f1d2e"
-foreground       = "#e0def4"
-comment          = "#6e6a86"
-comment_lighter  = "#908caa"
-cyan             = "#9ccfd8"
-green            = "#9ccfd8"
-orange           = "#f6c177"
-pink             = "#eb6f92"
-purple           = "#c4a7e7"
-red              = "#eb6f92"
-yellow           = "#f6c177"
-current_line     = "#26233a"
-selection        = "#2a273f"
-gold             = "#f6c177"
-rose             = "#ebbcba"
-pine             = "#31748f"
-foam             = "#9ccfd8"
-iris             = "#c4a7e7"
-love             = "#eb6f92"
-mode_plan        = "#ebbcba"
+background        = "#191724"
+background_2      = "#1f1d2e"
+foreground        = "#e0def4"
+comment           = "#6e6a86"
+comment_lighter   = "#908caa"
+current_line      = "#21202e"
+selection         = "#403d52"
+highlight_high    = "#524f67"
+gold              = "#f6c177"
+rose              = "#ebbcba"
+pine              = "#31748f"
+foam              = "#9ccfd8"
+iris              = "#c4a7e7"
+love              = "#eb6f92"
+cyan              = "#9ccfd8"
+green             = "#9ccfd8"
+orange            = "#f6c177"
+pink              = "#eb6f92"
+purple            = "#c4a7e7"
+red               = "#eb6f92"
+yellow            = "#f6c177"
+mode_plan         = "#ebbcba"
 
 [ui]
-user               = { fg = "rose" }
-assistant_prefix   = { fg = "iris" }
-assistant          = { fg = "foreground" }
-thinking           = { fg = "comment", modifiers = ["italic"] }
-
-strikethrough      = { fg = "comment", modifiers = ["crossed_out"] }
-code_block         = { fg = "foreground" }
-
-plan_rule          = { fg = "rose", modifiers = ["bold"] }
-horizontal_rule    = { fg = "comment" }
-table_border       = { fg = "comment" }
-
-tool_bg            = { bg = "#1f1d2e" }
-tool               = { fg = "foreground" }
-tool_prefix        = { fg = "foreground", modifiers = ["bold"] }
-tool_path          = { fg = "foam" }
-tool_annotation    = { fg = "comment" }
-tool_success       = { fg = "foam" }
-tool_error         = { fg = "love" }
-tool_dim           = { fg = "comment" }
-
-diff_old           = { bg = "#2a1b2a" }
-diff_new           = { bg = "#1a2a2d" }
-diff_old_emphasis  = { bg = "#3d2636" }
-diff_new_emphasis  = { bg = "#223838" }
-diff_line_nr       = { fg = "comment" }
-
-item_selected      = { fg = "background", bg = "iris" }
-item               = { fg = "rose" }
-item_desc          = { fg = "comment" }
-accent             = { fg = "gold" }
-
-panel_border       = { fg = "iris" }
-panel_title        = { fg = "iris", modifiers = ["bold"] }
-cursor             = { fg = "background", bg = "foreground" }
-input_border       = { fg = "#403d52" }
-
-keybind_key        = { fg = "foam", modifiers = ["bold"] }
-keybind_section    = { fg = "iris", modifiers = ["bold"] }
-
-status_dim         = { fg = "comment" }
-error              = { fg = "love" }
-
-todo_completed     = { fg = "foam" }
-todo_in_progress   = { fg = "gold" }
-todo_pending       = { fg = "comment" }
-todo_cancelled     = { fg = "love", modifiers = ["crossed_out"] }
-keybind_desc       = { fg = "foreground" }
-queue              = { fg = "iris" }
-plan_path          = { fg = "gold", modifiers = ["bold"] }
-status_notice      = { fg = "gold" }
-status_retry_error = { fg = "love" }
-status_retry_info  = { fg = "comment" }
-input_placeholder  = { fg = "comment" }
-queue_delete       = { fg = "love", modifiers = ["bold"] }
-timestamp          = { fg = "comment" }
-spinner            = { fg = "gold" }
-active             = { fg = "foam" }
+user              = { fg = "rose" }
+assistant_prefix  = { fg = "iris" }
+assistant         = { fg = "foreground" }
+thinking          = { fg = "comment", modifiers = ["italic"] }
+strikethrough     = { fg = "comment", modifiers = ["crossed_out"] }
+code_block        = { fg = "foreground" }
+plan_rule         = { fg = "rose", modifiers = ["bold"] }
+horizontal_rule   = { fg = "comment" }
+table_border      = { fg = "comment" }
+tool_bg           = { bg = "background_2" }
+tool              = { fg = "foreground" }
+tool_prefix       = { fg = "foreground", modifiers = ["bold"] }
+tool_path         = { fg = "foam" }
+tool_annotation   = { fg = "comment" }
+tool_success      = { fg = "foam" }
+tool_error        = { fg = "love" }
+tool_dim          = { fg = "comment" }
+diff_old          = { bg = "#472a3c" }
+diff_new          = { bg = "#363f4c" }
+diff_old_emphasis = { bg = "#713c52" }
+diff_new_emphasis = { bg = "#506470" }
+diff_line_nr      = { fg = "comment" }
+item_selected     = { fg = "background", bg = "iris" }
+item              = { fg = "rose" }
+item_desc         = { fg = "comment" }
+accent            = { fg = "gold" }
+panel_border      = { fg = "iris" }
+panel_title       = { fg = "iris", modifiers = ["bold"] }
+cursor            = { fg = "background", bg = "foreground" }
+input_border      = { fg = "highlight_high" }
+keybind_key       = { fg = "foam", modifiers = ["bold"] }
+keybind_section   = { fg = "iris", modifiers = ["bold"] }
+status_dim        = { fg = "comment" }
+error             = { fg = "love" }
+todo_completed    = { fg = "foam" }
+todo_in_progress  = { fg = "gold" }
+todo_pending      = { fg = "comment" }
+todo_cancelled    = { fg = "love", modifiers = ["crossed_out"] }
+keybind_desc      = { fg = "foreground" }
+queue             = { fg = "iris" }
+plan_path         = { fg = "gold", modifiers = ["bold"] }
+status_notice     = { fg = "gold" }
+status_retry_error= { fg = "love" }
+status_retry_info = { fg = "comment" }
+input_placeholder = { fg = "comment" }
+queue_delete      = { fg = "love", modifiers = ["bold"] }
+timestamp         = { fg = "comment" }
+spinner           = { fg = "gold" }
+active            = { fg = "foam" }

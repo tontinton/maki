@@ -42,7 +42,7 @@
 "keyword.return"                  = { fg = "pine" }
 "keyword.storage"                 = { fg = "pine" }
 "keyword.storage.modifier"        = { fg = "pine" }
-"keyword.storage.type"           = { fg = "pine", modifiers = ["italic"] }
+"keyword.storage.type"            = { fg = "pine", modifiers = ["italic"] }
 
 "label"                           = { fg = "cyan" }
 "attribute"                       = { fg = "purple", modifiers = ["italic"] }
@@ -86,84 +86,76 @@
 "variable.parameter"              = { fg = "orange", modifiers = ["italic"] }
 
 [palette]
-background       = "#faf4ed"
-background_2     = "#fffaf3"
-foreground       = "#464261"
-comment          = "#9893a5"
-comment_lighter  = "#797593"
-cyan             = "#56949f"
-green            = "#56949f"
-orange           = "#ea9d34"
-pink             = "#b4637a"
-purple           = "#907aa9"
-red              = "#b4637a"
-yellow           = "#ea9d34"
-current_line     = "#f2e9e1"
-selection        = "#f2e9e1"
-gold             = "#ea9d34"
-rose             = "#d7827e"
-pine             = "#286983"
-foam             = "#56949f"
-iris             = "#907aa9"
-love             = "#b4637a"
-mode_plan        = "#d7827e"
+background        = "#faf4ed"
+background_2      = "#fffaf3"
+foreground        = "#464261"
+comment           = "#9893a5"
+comment_lighter   = "#797593"
+current_line      = "#f4ede8"
+selection         = "#dfdad9"
+highlight_high    = "#cecacd"
+gold              = "#ea9d34"
+rose              = "#d7827e"
+pine              = "#286983"
+foam              = "#56949f"
+iris              = "#907aa9"
+love              = "#b4637a"
+cyan              = "#56949f"
+green             = "#56949f"
+orange            = "#ea9d34"
+pink              = "#b4637a"
+purple            = "#907aa9"
+red               = "#b4637a"
+yellow            = "#ea9d34"
+mode_plan         = "#d7827e"
 
 [ui]
-user               = { fg = "rose" }
-assistant_prefix   = { fg = "iris" }
-assistant          = { fg = "foreground" }
-thinking           = { fg = "comment", modifiers = ["italic"] }
-
-strikethrough      = { fg = "comment", modifiers = ["crossed_out"] }
-code_block         = { fg = "foreground" }
-
-plan_rule          = { fg = "rose", modifiers = ["bold"] }
-horizontal_rule    = { fg = "comment" }
-table_border       = { fg = "comment" }
-
-tool_bg            = { bg = "#fffaf3" }
-tool               = { fg = "foreground" }
-tool_prefix        = { fg = "foreground", modifiers = ["bold"] }
-tool_path          = { fg = "foam" }
-tool_annotation    = { fg = "comment" }
-tool_success       = { fg = "foam" }
-tool_error         = { fg = "love" }
-tool_dim           = { fg = "comment" }
-
-diff_old           = { bg = "#f0dadb" }
-diff_new           = { bg = "#dde9e9" }
-diff_old_emphasis  = { bg = "#e8c4c6" }
-diff_new_emphasis  = { bg = "#c6dcdc" }
-diff_line_nr       = { fg = "comment" }
-
-item_selected      = { fg = "background", bg = "iris" }
-item               = { fg = "rose" }
-item_desc          = { fg = "comment" }
-accent             = { fg = "gold" }
-
-panel_border       = { fg = "iris" }
-panel_title        = { fg = "iris", modifiers = ["bold"] }
-cursor             = { fg = "background", bg = "foreground" }
-input_border       = { fg = "#c5c2d4" }
-
-keybind_key        = { fg = "foam", modifiers = ["bold"] }
-keybind_section    = { fg = "iris", modifiers = ["bold"] }
-
-status_dim         = { fg = "comment" }
-error              = { fg = "love" }
-
-todo_completed     = { fg = "foam" }
-todo_in_progress   = { fg = "gold" }
-todo_pending       = { fg = "comment" }
-todo_cancelled     = { fg = "love", modifiers = ["crossed_out"] }
-keybind_desc       = { fg = "foreground" }
-queue              = { fg = "iris" }
-plan_path          = { fg = "gold", modifiers = ["bold"] }
-status_notice      = { fg = "gold" }
-status_retry_error = { fg = "love" }
-status_retry_info  = { fg = "comment" }
-input_placeholder  = { fg = "comment" }
-queue_delete       = { fg = "love", modifiers = ["bold"] }
-timestamp          = { fg = "comment" }
-spinner            = { fg = "gold" }
-active             = { fg = "foam" }
+user              = { fg = "rose" }
+assistant_prefix  = { fg = "iris" }
+assistant         = { fg = "foreground" }
+thinking          = { fg = "comment", modifiers = ["italic"] }
+strikethrough     = { fg = "comment", modifiers = ["crossed_out"] }
+code_block        = { fg = "foreground" }
+plan_rule         = { fg = "rose", modifiers = ["bold"] }
+horizontal_rule   = { fg = "comment" }
+table_border      = { fg = "comment" }
+tool_bg           = { bg = "background_2" }
+tool              = { fg = "foreground" }
+tool_prefix       = { fg = "foreground", modifiers = ["bold"] }
+tool_path         = { fg = "foam" }
+tool_annotation   = { fg = "comment" }
+tool_success      = { fg = "foam" }
+tool_error        = { fg = "love" }
+tool_dim          = { fg = "comment" }
+diff_old          = { bg = "#ebd4d4" }
+diff_new          = { bg = "#d6dfdc" }
+diff_old_emphasis = { bg = "#ddb7bd" }
+diff_new_emphasis = { bg = "#b5cccc" }
+diff_line_nr      = { fg = "comment" }
+item_selected     = { fg = "background", bg = "iris" }
+item              = { fg = "rose" }
+item_desc         = { fg = "comment" }
+accent            = { fg = "gold" }
+panel_border      = { fg = "iris" }
+panel_title       = { fg = "iris", modifiers = ["bold"] }
+cursor            = { fg = "background", bg = "foreground" }
+input_border      = { fg = "highlight_high" }
+keybind_key       = { fg = "foam", modifiers = ["bold"] }
+keybind_section   = { fg = "iris", modifiers = ["bold"] }
+status_dim        = { fg = "comment" }
+error             = { fg = "love" }
+todo_completed    = { fg = "foam" }
+todo_in_progress  = { fg = "gold" }
+todo_pending      = { fg = "comment" }
+todo_cancelled    = { fg = "love", modifiers = ["crossed_out"] }
+keybind_desc      = { fg = "foreground" }
+queue             = { fg = "iris" }
+plan_path         = { fg = "gold", modifiers = ["bold"] }
+status_notice     = { fg = "gold" }
+status_retry_error= { fg = "love" }
+status_retry_info = { fg = "comment" }
+input_placeholder = { fg = "comment" }
+queue_delete      = { fg = "love", modifiers = ["bold"] }
+timestamp         = { fg = "comment" }
+spinner           = { fg = "gold" }
+active            = { fg = "foam" }
