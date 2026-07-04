@@ -30,6 +30,7 @@ On macOS, some bindings use Option or Fn keys instead (run `/help` for exact key
 | `\+Enter` / `Ctrl+J` / `Alt+Enter` | Newline |
 | `Tab` | Toggle mode |
 | `/command` | Open command palette |
+| `@` | Mention a file (Esc leaves a literal @) |
 | `Ctrl+W` | Delete word backward |
 | `Alt+←` / `Alt+→` | Move word left / right |
 | `Ctrl+A` | Jump to start of line |

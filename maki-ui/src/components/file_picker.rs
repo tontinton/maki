@@ -78,15 +78,20 @@ impl Drop for Session {
 
 pub struct FilePickerModal {
     session: Option<Session>,
+    opened_via_at: bool,
 }
 
 impl FilePickerModal {
     pub fn new() -> Self {
-        Self { session: None }
+        Self {
+            session: None,
+            opened_via_at: false,
+        }
     }
 
     pub fn open(&mut self, cwd: &str) {
         self.close();
+        self.opened_via_at = false;
 
         let notify = Arc::new(|| {});
         let nucleo = Nucleo::new(Config::DEFAULT.match_paths(), notify, None, 1);
@@ -162,8 +167,18 @@ impl FilePickerModal {
         });
     }
 
+    pub fn open_via_at(&mut self, cwd: &str) {
+        self.open(cwd);
+        self.opened_via_at = true;
+    }
+
+    pub fn take_at_mention(&mut self) -> bool {
+        std::mem::replace(&mut self.opened_via_at, false)
+    }
+
     pub fn close(&mut self) {
         self.session = None;
+        self.opened_via_at = false;
     }
 
     pub fn is_open(&self) -> bool {

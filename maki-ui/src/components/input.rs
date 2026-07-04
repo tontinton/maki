@@ -47,6 +47,7 @@ pub enum InputAction {
     ContinueLine,
     PaletteSync(String),
     Passthrough(KeyEvent),
+    OpenFilePicker,
     None,
 }
 
@@ -93,6 +94,11 @@ impl InputBox {
                 return InputAction::None;
             }
             KeyCode::Tab | KeyCode::Esc => return InputAction::Passthrough(key),
+            KeyCode::Char('@')
+                if key.modifiers.is_empty() && self.char_before_cursor_is_whitespace_or_start() =>
+            {
+                return InputAction::OpenFilePicker;
+            }
             _ if is_newline_key(&key) => {
                 self.buffer.add_line();
                 return InputAction::ContinueLine;
@@ -209,14 +215,21 @@ impl InputBox {
         self.buffer.y() == self.buffer.line_count().saturating_sub(1)
     }
 
-    pub fn char_before_cursor_is_backslash(&self) -> bool {
-        let line = &self.buffer.lines()[self.buffer.y()];
+    fn byte_before_cursor(&self) -> Option<u8> {
         let x = self.buffer.x();
-        if x == 0 {
-            return false;
+        let line = &self.buffer.lines()[self.buffer.y()];
+        (x > 0).then(|| line.as_bytes()[TextBuffer::char_to_byte(line, x - 1)])
+    }
+
+    pub fn char_before_cursor_is_backslash(&self) -> bool {
+        self.byte_before_cursor() == Some(b'\\')
+    }
+
+    fn char_before_cursor_is_whitespace_or_start(&self) -> bool {
+        match self.byte_before_cursor() {
+            None => true,
+            Some(b) => b.is_ascii_whitespace(),
         }
-        let byte_idx = TextBuffer::char_to_byte(line, x - 1);
-        line.as_bytes()[byte_idx] == b'\\'
     }
 
     pub fn continue_line(&mut self) {
@@ -608,6 +621,7 @@ fn total_visual_lines(buffer: &TextBuffer, ew: usize, cursor_visible: bool) -> u
 mod tests {
     use super::*;
     use crate::components::scrollbar::SCROLLBAR_THUMB;
+    use crossterm::event::KeyModifiers;
     use test_case::test_case;
 
     fn type_text(input: &mut InputBox, text: &str) {
@@ -1041,5 +1055,63 @@ mod tests {
         type_text(&mut input, "read");
         input.handle_paste_with_spaces("file.rs");
         assert_eq!(input.buffer.value(), "read file.rs");
+    }
+
+    const TEST_AT: char = '@';
+
+    fn key_char(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn at_mention_opens_picker_at_line_start() {
+        let mut input = InputBox::new(InputHistory::default());
+        let action = input.handle_key(key_char(TEST_AT));
+        assert!(matches!(action, InputAction::OpenFilePicker));
+        assert_eq!(input.buffer.value(), "");
+    }
+
+    #[test]
+    fn at_mention_opens_picker_after_space() {
+        let mut input = InputBox::new(InputHistory::default());
+        type_text(&mut input, "hello ");
+        let action = input.handle_key(key_char(TEST_AT));
+        assert!(matches!(action, InputAction::OpenFilePicker));
+        assert_eq!(input.buffer.value(), "hello ");
+    }
+
+    #[test]
+    fn at_mention_opens_picker_at_second_line_start() {
+        let mut input = InputBox::new(InputHistory::default());
+        type_text(&mut input, "hi");
+        input.buffer.add_line();
+        let action = input.handle_key(key_char(TEST_AT));
+        assert!(matches!(action, InputAction::OpenFilePicker));
+        assert_eq!(input.buffer.value(), "hi\n");
+    }
+
+    #[test]
+    fn at_mention_literal_mid_word() {
+        let mut input = InputBox::new(InputHistory::default());
+        type_text(&mut input, "em");
+        let action = input.handle_key(key_char(TEST_AT));
+        assert!(!matches!(action, InputAction::OpenFilePicker));
+        assert_eq!(input.buffer.value(), "em@");
+    }
+
+    #[test]
+    fn at_mention_literal_after_punctuation() {
+        let mut input = InputBox::new(InputHistory::default());
+        type_text(&mut input, "see (");
+        let action = input.handle_key(key_char(TEST_AT));
+        assert!(!matches!(action, InputAction::OpenFilePicker));
+        assert_eq!(input.buffer.value(), "see (@");
+    }
+
+    #[test]
+    fn at_mention_literal_with_ctrl_modifier() {
+        let mut input = InputBox::new(InputHistory::default());
+        let action = input.handle_key(KeyEvent::new(KeyCode::Char(TEST_AT), KeyModifiers::CONTROL));
+        assert!(!matches!(action, InputAction::OpenFilePicker));
     }
 }
