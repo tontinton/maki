@@ -16,6 +16,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 const FAST_LABEL: &str = " [fast]";
+const WORKFLOW_LABEL: &str = " [workflow]";
 
 pub(crate) fn format_tokens(n: u32) -> String {
     match n {
@@ -45,6 +46,7 @@ pub struct StatusBarContext<'a> {
     pub retry_info: Option<&'a RetryInfo>,
     pub thinking_label: Option<Cow<'static, str>>,
     pub fast: bool,
+    pub workflow: bool,
     pub restoring: bool,
 }
 
@@ -182,6 +184,9 @@ impl StatusBar {
 
                 if ctx.fast {
                     right_spans.push(Span::styled(FAST_LABEL, theme::current().status_dim));
+                }
+                if ctx.workflow {
+                    right_spans.push(Span::styled(WORKFLOW_LABEL, theme::current().status_dim));
                 }
 
                 let context_text = format!(

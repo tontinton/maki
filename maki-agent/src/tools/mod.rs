@@ -20,7 +20,7 @@ pub use registry::{
     ToolRegistry, ToolSource,
 };
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -44,6 +44,8 @@ use maki_providers::provider::Provider;
 
 pub struct DescriptionContext<'a> {
     pub filter: &'a ToolFilter,
+    pub audience: ToolAudience,
+    pub workflow: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -105,8 +107,10 @@ impl ToolFilter {
     }
 }
 
-pub fn is_tool_enabled(config: &AgentConfig, name: &str) -> bool {
-    !config.disabled_tools.iter().any(|s| s == name)
+/// A tool is enabled unless named in `disabled_tools` (config, or the raw
+/// list a Lua caller holds, e.g. `maki.api.get_tools`).
+pub fn is_tool_enabled(disabled_tools: &[String], name: &str) -> bool {
+    !disabled_tools.iter().any(|s| s == name)
 }
 
 pub const BASH_TOOL_NAME: &str = "bash";
@@ -172,6 +176,9 @@ pub fn timeout_annotation(secs: u64) -> String {
     format!("{formatted} timeout")
 }
 
+pub type LocalToolFn = Arc<dyn Fn(&Value) -> Result<String, String> + Send + Sync>;
+pub type LocalTools = Arc<HashMap<String, LocalToolFn>>;
+
 #[derive(Clone)]
 pub struct ToolContext {
     pub provider: Arc<dyn Provider>,
@@ -193,6 +200,9 @@ pub struct ToolContext {
     pub opts: RequestOptions,
     pub subagent_cancels: Arc<CancelMap<String>>,
     pub registry: Arc<ToolRegistry>,
+    pub workflow: bool,
+    pub audience: ToolAudience,
+    pub local_tools: LocalTools,
 }
 
 pub(crate) fn resolve_path(path: &str) -> Result<String, String> {
@@ -328,63 +338,6 @@ pub fn truncate_output(text: String, max_lines: usize, max_bytes: usize) -> Stri
         result.push_str(TRUNCATED_MARKER);
     }
     result
-}
-
-fn format_tool_signature(name: &str, schema: &Value) -> String {
-    let empty_props = serde_json::Map::new();
-    let props = schema
-        .get("properties")
-        .and_then(|p| p.as_object())
-        .unwrap_or(&empty_props);
-    let required: HashSet<&str> = schema
-        .get("required")
-        .and_then(|r| r.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
-        .unwrap_or_default();
-
-    let params: Vec<String> = props
-        .iter()
-        .map(|(pname, pschema)| {
-            let ptype = pschema
-                .get("type")
-                .and_then(|t| t.as_str())
-                .unwrap_or("any");
-            let ptype_py = match ptype {
-                "string" => "str",
-                "integer" => "int",
-                "boolean" => "bool",
-                "array" => "list",
-                _ => "any",
-            };
-            if required.contains(pname.as_str()) {
-                format!("{pname}: {ptype_py}")
-            } else {
-                format!("{pname}: {ptype_py} = None")
-            }
-        })
-        .collect();
-
-    format!("- {name}({}) -> str", params.join(", "))
-}
-
-/// Walks the registry so adding a new `INTERPRETER` tool shows up automatically.
-pub fn build_interpreter_tools_description(filter: &ToolFilter) -> String {
-    let mut desc =
-        String::from("\n\nAvailable tools (called as Python functions with keyword arguments):\n");
-    let registry = ToolRegistry::native();
-    for entry in registry.iter().iter() {
-        let name = entry.name();
-        if !entry.tool.audience().contains(ToolAudience::INTERPRETER) {
-            continue;
-        }
-        if !filter.matches(name) {
-            continue;
-        }
-        let schema = entry.tool.schema();
-        desc.push_str(&format_tool_signature(name, &schema));
-        desc.push('\n');
-    }
-    desc
 }
 
 pub(crate) fn sanitize_tool_input(input: &Value) -> Value {
@@ -605,6 +558,9 @@ pub fn interpreter_ctx(
         opts: RequestOptions::default(),
         subagent_cancels: Arc::new(CancelMap::new()),
         registry,
+        workflow: false,
+        audience: ToolAudience::MAIN,
+        local_tools: LocalTools::default(),
     }
 }
 
@@ -917,6 +873,8 @@ mod tests {
             &vars,
             &DescriptionContext {
                 filter: &ToolFilter::All,
+                audience: ToolAudience::MAIN,
+                workflow: false,
             },
             true,
         );
@@ -930,7 +888,11 @@ mod tests {
     fn definitions_filtered_returns_only_requested() {
         let vars = Vars::new().set("{cwd}", "/tmp");
         let filter = ToolFilter::Only(vec!["batch".into()]);
-        let ctx = DescriptionContext { filter: &filter };
+        let ctx = DescriptionContext {
+            filter: &filter,
+            audience: ToolAudience::MAIN,
+            workflow: false,
+        };
         let filtered = ToolRegistry::native().definitions(&vars, &ctx, true);
         let names: Vec<&str> = filtered
             .as_array()

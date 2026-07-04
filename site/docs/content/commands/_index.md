@@ -28,6 +28,7 @@ Type `/` in the input box to open the command palette.
 | `/yolo` | Toggle YOLO mode (skip all permission prompts) |
 | `/thinking` | Toggle extended thinking (off, adaptive, or budget) |
 | `/fast` | Toggle Anthropic fast mode (Opus only) |
+| `/workflow` | Toggle workflow mode (task callable inside code_execution) |
 | `/exit` | Exit the application |
 | `/memory` | View, edit, and delete memory files |
 

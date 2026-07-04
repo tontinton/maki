@@ -1,11 +1,73 @@
-use mlua::{Function, Lua, MultiValue, Result as LuaResult, Table, Value};
+use std::sync::Arc;
 
-use crate::runtime::enqueue_async_task;
+use async_lock::{Semaphore, SemaphoreGuardArc};
+use maki_agent::cancel::CancelToken;
+use mlua::{
+    Function, Lua, MultiValue, Result as LuaResult, Table, UserData, UserDataMethods, Value,
+};
+
+use crate::runtime::{TaskHandle, enqueue_async_task, lock_cell};
 
 const AWAIT_MIN_ARGS: usize = 2;
+const PERMIT_RELEASED_ERR: &str = "permit already released";
+
+/// Cancel-aware counting semaphore. Permits release on `:release()` or gc.
+struct LuaSemaphore {
+    sem: Arc<Semaphore>,
+}
+
+struct LuaPermit {
+    guard: std::sync::Mutex<Option<SemaphoreGuardArc>>,
+}
+
+impl UserData for LuaSemaphore {
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_async_method("acquire", |lua, this, ()| async move {
+            let sem = Arc::clone(&this.sem);
+            drop(this);
+            let cancel = lua
+                .app_data_ref::<TaskHandle>()
+                .map(|h| lock_cell(&h).cancel.clone())
+                .unwrap_or_else(CancelToken::none);
+            let guard = cancel
+                .race(sem.acquire_arc())
+                .await
+                .map_err(mlua::Error::runtime)?;
+            Ok(LuaPermit {
+                guard: std::sync::Mutex::new(Some(guard)),
+            })
+        });
+    }
+}
+
+impl UserData for LuaPermit {
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method("release", |_, this, ()| {
+            let released = this
+                .guard
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+                .is_some();
+            if !released {
+                return Err(mlua::Error::runtime(PERMIT_RELEASED_ERR));
+            }
+            Ok(())
+        });
+    }
+}
 
 pub(crate) fn create_async_table(lua: &Lua) -> LuaResult<Table> {
     let tbl = lua.create_table()?;
+
+    tbl.set(
+        "semaphore",
+        lua.create_function(|_, n: usize| {
+            Ok(LuaSemaphore {
+                sem: Arc::new(Semaphore::new(n.max(1))),
+            })
+        })?,
+    )?;
 
     tbl.set(
         "run",
@@ -128,9 +190,18 @@ pub(crate) fn create_async_table(lua: &Lua) -> LuaResult<Table> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::cell::Cell;
+    use std::pin::pin;
+    use std::sync::Mutex;
+
+    use futures_lite::future::poll_once;
     use mlua::Lua;
     use test_case::test_case;
+
+    use super::*;
+    use crate::api::r#fn::JobStore;
+    use crate::api::ui::buf::BufferStore;
+    use crate::runtime::{CANCELLED_MSG, TaskCell};
 
     const ERR_TOO_FEW_ARGS: &str = "maki.async.await requires at least 2 arguments: argc, fun, ...";
     const ERR_ARGC_GE_1: &str = "argc must be >= 1";
@@ -232,6 +303,98 @@ mod tests {
             "#;
             let result = lua.load(code).eval_async::<i64>().await.unwrap();
             assert_eq!(result, 42);
+        });
+    }
+
+    fn cancelled_task_handle() -> TaskHandle {
+        let (trigger, token) = CancelToken::new();
+        trigger.cancel();
+        Arc::new(Mutex::new(TaskCell {
+            cancel: token,
+            deadline: Cell::new(None),
+            deadline_secs: Cell::new(None),
+            jobs: JobStore::new(),
+            bufs: BufferStore::new(),
+            live: None,
+            click: None,
+        }))
+    }
+
+    #[test_case(0 ; "zero_clamps_to_capacity_one")]
+    #[test_case(1 ; "capacity_one")]
+    fn semaphore_acquire_blocks_at_capacity_until_release(n: usize) {
+        smol::block_on(async {
+            let (lua, _tbl) = setup();
+            lua.load(format!(
+                "sem = async_tbl.semaphore({n}); p1 = sem:acquire()"
+            ))
+            .exec_async()
+            .await
+            .unwrap();
+            let mut second = pin!(lua.load("p2 = sem:acquire()").exec_async());
+            assert!(
+                poll_once(second.as_mut()).await.is_none(),
+                "second acquire must block while first permit is held"
+            );
+            lua.load("p1:release()").exec().unwrap();
+            second.await.unwrap();
+            lua.load("assert(p2 ~= nil)").exec().unwrap();
+        });
+    }
+
+    #[test]
+    fn semaphore_double_release_errors() {
+        smol::block_on(async {
+            let (lua, _tbl) = setup();
+            lua.load("local sem = async_tbl.semaphore(1); p = sem:acquire(); p:release()")
+                .exec_async()
+                .await
+                .unwrap();
+            let msg = lua.load("p:release()").exec().unwrap_err().to_string();
+            assert!(
+                msg.contains(PERMIT_RELEASED_ERR),
+                "expected error containing {PERMIT_RELEASED_ERR:?}, got: {msg}"
+            );
+        });
+    }
+
+    #[test]
+    fn semaphore_gc_of_permit_releases_slot() {
+        smol::block_on(async {
+            let (lua, _tbl) = setup();
+            lua.load("sem = async_tbl.semaphore(1); do local p = sem:acquire() end")
+                .exec_async()
+                .await
+                .unwrap();
+            lua.gc_collect().unwrap();
+            lua.gc_collect().unwrap();
+            let reacquire = pin!(lua.load("return sem:acquire() ~= nil").eval_async::<bool>());
+            match poll_once(reacquire).await {
+                Some(result) => assert!(result.unwrap()),
+                None => panic!("acquire must complete immediately after permit was gc'd"),
+            }
+        });
+    }
+
+    #[test]
+    fn semaphore_acquire_errors_when_task_cancelled() {
+        smol::block_on(async {
+            let (lua, _tbl) = setup();
+            lua.load("sem = async_tbl.semaphore(1); held = sem:acquire()")
+                .exec_async()
+                .await
+                .unwrap();
+            lua.set_app_data::<TaskHandle>(cancelled_task_handle());
+            let msg = lua
+                .load("return sem:acquire()")
+                .eval_async::<Value>()
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                msg.contains(CANCELLED_MSG),
+                "expected error containing {CANCELLED_MSG:?}, got: {msg}"
+            );
         });
     }
 }

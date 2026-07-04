@@ -20,11 +20,23 @@ fn builtins_host() -> (Arc<ToolRegistry>, PluginHost) {
 }
 
 fn exec_tool(reg: &ToolRegistry, name: &str, input: serde_json::Value) -> Result<String, String> {
+    exec_tool_in(reg, name, input, None)
+}
+
+fn exec_tool_in(
+    reg: &ToolRegistry,
+    name: &str,
+    input: serde_json::Value,
+    registry_override: Option<Arc<ToolRegistry>>,
+) -> Result<String, String> {
     let entry = reg
         .get(name)
         .unwrap_or_else(|| panic!("tool {name} not registered"));
     let inv = entry.tool.parse(&input).expect("parse failed");
-    let ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
+    let mut ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
+    if let Some(r) = registry_override {
+        ctx.registry = r;
+    }
     smol::block_on(async { inv.execute(&ctx).await })
         .output
         .map(|out| match out {
@@ -62,7 +74,8 @@ const INVALID_PERMISSION_SCOPE_ERR: &str = "not in schema properties or not type
 const BAD_NAME_SRC: &str = r#"name = "bad name!", description = "test""#;
 const EMPTY_DESC_SRC: &str = r#"name = "valid_name", description = """#;
 const EMPTY_AUD_SRC: &str = r#"name = "no_aud", description = "test", audiences = {}"#;
-const UNKNOWN_AUGMENT_SRC: &str = r#"name = "aug_bad", description = "test", augment = "nope""#;
+const UNKNOWN_AUD_SRC: &str =
+    r#"name = "bad_aud", description = "test", audiences = { "wurkflow" }"#;
 const STRING_EXAMPLES_SRC: &str = r#"name = "ex_bad", description = "test", examples = "[]""#;
 const TIMEOUT_FIELD_NOT_IN_SCHEMA_SRC: &str = r#"name = "to_bad", description = "test", start_annotation = { field = "timeout", kind = "timeout" }"#;
 const NON_STRING_FIELD_SCHEMA: &str = r#"{
@@ -167,7 +180,7 @@ fn unload_round_trip() {
 #[test_case::test_case(BAD_NAME_SRC, "invalid name" ; "invalid_tool_name")]
 #[test_case::test_case(EMPTY_DESC_SRC, "description must be non-empty" ; "empty_description")]
 #[test_case::test_case(EMPTY_AUD_SRC, "audiences" ; "empty_audiences")]
-#[test_case::test_case(UNKNOWN_AUGMENT_SRC, "unknown augment" ; "unknown_augment")]
+#[test_case::test_case(UNKNOWN_AUD_SRC, "unknown audience" ; "unknown_audience")]
 #[test_case::test_case(STRING_EXAMPLES_SRC, "'examples' must be a table" ; "string_examples")]
 #[test_case::test_case(TIMEOUT_FIELD_NOT_IN_SCHEMA_SRC, "not type 'integer'" ; "timeout_field_not_in_schema")]
 fn registration_validation_rejects(fields: &str, expected_err: &str) {
@@ -1689,8 +1702,6 @@ fn interpreter_on_output_streams_lines() {
                 local result, err = maki.interpreter.run("print('a')\nprint('b')", {{
                     timeout = 10,
                     max_memory_mb = 50,
-                    buf = maki.ui.buf(),
-                    agent_ctx = ctx:agent_context(),
                     on_output = function(line)
                         table.insert(lines, line)
                     end,
@@ -1703,4 +1714,153 @@ fn interpreter_on_output_streams_lines() {
     host.load_source("interp_stream_plugin", &src).unwrap();
     let out = exec_tool(&reg, "interp_stream", serde_json::json!({})).unwrap();
     assert_eq!(out, "a|b;stdout=a\nb");
+}
+
+const SESSION_CLOSED_ERR: &str = "session closed";
+
+fn interp_tool_plugin(name: &str, python: &str, tools_lua: &str) -> String {
+    format!(
+        r#"maki.api.register_tool({{
+            name = "{name}",
+            description = "test",
+            schema = {MINIMAL_SCHEMA},
+            audiences = {{ "main" }},
+            handler = function(input, ctx)
+                local lines = {{}}
+                local result, err = maki.interpreter.run("{python}", {{
+                    timeout = 10,
+                    max_memory_mb = 50,
+                    on_output = function(line) table.insert(lines, line) end,
+                    tools = {tools_lua},
+                }})
+                if err then return "err: " .. err end
+                return table.concat(lines, "|")
+            end
+        }})"#
+    )
+}
+
+#[test]
+fn interpreter_tools_fn_map_kwargs_reach_lua_tool() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let src = interp_tool_plugin(
+        "interp_tools",
+        r"r = await greet(name='bob')\nprint(r)",
+        "{ greet = function(input) return 'hi:' .. input.name end }",
+    );
+    host.load_source("interp_tools_plugin", &src).unwrap();
+    let out = exec_tool(&reg, "interp_tools", serde_json::json!({})).unwrap();
+    assert_eq!(out, "hi:bob");
+}
+
+#[test]
+fn interpreter_tools_nil_err_pair_fails_call() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let src = interp_tool_plugin(
+        "interp_err",
+        r"await bad()",
+        "{ bad = function(input) return nil, 'boom' end }",
+    );
+    host.load_source("interp_err_plugin", &src).unwrap();
+    let out = exec_tool(&reg, "interp_err", serde_json::json!({})).unwrap();
+    assert!(out.starts_with("err: "), "got: {out}");
+    assert!(out.contains("boom"), "got: {out}");
+}
+
+#[test]
+fn interpreter_tools_gather_resolves_parallel_batch() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let src = interp_tool_plugin(
+        "interp_gather",
+        r"import asyncio\nasync def main():\n    a, b = await asyncio.gather(t_a(), t_b())\n    print(a + '|' + b)\nawait main()",
+        "{ t_a = function(input) return 'A' end, t_b = function(input) return 'B' end }",
+    );
+    host.load_source("interp_gather_plugin", &src).unwrap();
+    let out = exec_tool(&reg, "interp_gather", serde_json::json!({})).unwrap();
+    assert_eq!(out, "A|B");
+}
+
+#[test]
+fn call_tool_resolves_lua_tool_and_reports_unknown() {
+    let reg = Arc::clone(ToolRegistry::native_arc());
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source("echo_plugin", ECHO_PLUGIN).unwrap();
+    let src = format!(
+        r#"maki.api.register_tool({{
+            name = "call_tool_probe",
+            description = "test",
+            schema = {MINIMAL_SCHEMA},
+            audiences = {{ "main" }},
+            handler = function(input, ctx)
+                local out, err = maki.agent.call_tool(ctx, "echo_", {{ msg = "hello" }})
+                if err ~= nil then return "unexpected err: " .. err end
+                local out2, err2 = maki.agent.call_tool(ctx, "no_such_tool_xyz", {{}})
+                if out2 ~= nil then return "unexpected output: " .. out2 end
+                if err2 == nil then return "expected err for unknown tool" end
+                return out
+            end
+        }})"#
+    );
+    host.load_source("call_tool_plugin", &src).unwrap();
+    let out = exec_tool_in(
+        &reg,
+        "call_tool_probe",
+        serde_json::json!({}),
+        Some(Arc::clone(&reg)),
+    )
+    .unwrap();
+    assert_eq!(out, "hello");
+    host.unload("call_tool_plugin").unwrap();
+    host.unload("echo_plugin").unwrap();
+}
+
+#[test]
+fn session_close_idempotent_and_prompt_after_close_errors() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let src = format!(
+        r#"maki.api.register_tool({{
+            name = "session_probe",
+            description = "test",
+            schema = {MINIMAL_SCHEMA},
+            audiences = {{ "main" }},
+            handler = function(input, ctx)
+                local sess = maki.agent.session(ctx, {{}})
+                sess:close()
+                sess:close()
+                local result, err = sess:prompt("x")
+                if result ~= nil then return "unexpected result" end
+                return err or "no error"
+            end
+        }})"#
+    );
+    host.load_source("session_plugin", &src).unwrap();
+    let out = exec_tool(&reg, "session_probe", serde_json::json!({})).unwrap();
+    assert_eq!(out, SESSION_CLOSED_ERR);
+}
+
+#[test_case::test_case("{ audience = 'wurkflow' }", "unknown audience: wurkflow" ; "unknown_audience")]
+#[test_case::test_case("{ local_tools = { foo = { handler = function() return '' end } } }", "local_tools.foo: 'description' is required" ; "local_tool_missing_description")]
+#[test_case::test_case("{ local_tools = { foo = { description = 'd' } } }", "local_tools.foo: 'handler' is required" ; "local_tool_missing_handler")]
+fn session_opts_validation_rejects(opts: &str, expected: &str) {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let src = format!(
+        r#"maki.api.register_tool({{
+            name = "session_opts_probe",
+            description = "test",
+            schema = {MINIMAL_SCHEMA},
+            audiences = {{ "main" }},
+            handler = function(input, ctx)
+                maki.agent.session(ctx, {opts})
+                return "no error"
+            end
+        }})"#
+    );
+    host.load_source("session_opts_plugin", &src).unwrap();
+    let err = exec_tool(&reg, "session_opts_probe", serde_json::json!({})).unwrap_err();
+    assert!(err.contains(expected), "got: {err}");
 }

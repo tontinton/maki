@@ -25,6 +25,7 @@ tracing = { workspace = true }
 smol = { workspace = true }
 event-listener = { workspace = true }
 flume = { workspace = true }
+futures = { workspace = true }
 futures-lite = { workspace = true }
 tree-sitter = { workspace = true }
 regex = { workspace = true }
@@ -33,6 +34,7 @@ maki-storage = { workspace = true }
 humantime = { workspace = true }
 isahc = { workspace = true }
 htmd = { workspace = true }
+jsonschema = { workspace = true }
 toml = { workspace = true }
 uuid = { workspace = true }
 tree-sitter-bash = { workspace = true }

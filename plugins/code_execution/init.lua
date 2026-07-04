@@ -1,3 +1,6 @@
+-- Policy for the Python interpreter: which tools it may call, what the model
+-- sees, and the import preamble. The sandbox and dispatch live in Rust.
+
 local truncate = require("maki.truncate")
 local ToolView = require("maki.tool_view")
 
@@ -6,6 +9,11 @@ local DEFAULT_MAX_MEMORY_MB = 50
 local DEFAULT_MAX_OUTPUT_LINES = 2000
 local DEFAULT_MAX_OUTPUT_BYTES = 50 * 1024
 local NO_OUTPUT = "(no output)"
+local PREAMBLE = "import re\nimport asyncio\nimport sys\nimport os\nimport json\n"
+local TOOLS_HEADER = "\n\nAvailable tools (called as Python functions with keyword arguments):\n"
+local WORKFLOW_TOOLS_NOTE =
+  "\nWorkflow mode: orchestrate subagents from this script. Await every `task(...)` call and use `asyncio.gather` for parallel fan-out. Pass `output_schema` to task for machine-readable results (a JSON string, parse with `json.loads`). Raise this tool's `timeout` param: subagents outlive the default code_execution timeout.\n"
+local PY_TYPES = { string = "str", integer = "int", boolean = "bool", array = "list" }
 
 local function new_view(ctx, buf)
   return ToolView.new(buf, { max_lines = ctx:tool_output_lines().code_execution or 30 })
@@ -64,6 +72,85 @@ for line in content.splitlines():
   },
 }
 
+-- Shared predicate for describe and handler so advertised == callable.
+-- The interpreter is a calling convention, not a capability grant: a read-only
+-- subagent must not reach edit/write through Python.
+local function interpreter_tools(tools, audience, workflow)
+  local out = {}
+  for _, t in ipairs(tools) do
+    local aud = {}
+    for _, a in ipairs(t.audiences) do
+      aud[a] = true
+    end
+    if t.enabled and aud[audience] and (aud.interpreter or (workflow and aud.workflow)) then
+      t.workflow_only = not aud.interpreter
+      out[#out + 1] = t
+    end
+  end
+  return out
+end
+
+local function matches_filter(name, dctx)
+  if dctx.only then
+    for _, n in ipairs(dctx.only) do
+      if n == name then
+        return true
+      end
+    end
+    return false
+  end
+  if dctx.except then
+    for _, n in ipairs(dctx.except) do
+      if n == name then
+        return false
+      end
+    end
+  end
+  return true
+end
+
+local function signature(t)
+  local schema_props = (t.schema and t.schema.properties) or {}
+  local required = {}
+  for _, r in ipairs((t.schema and t.schema.required) or {}) do
+    required[r] = true
+  end
+  local names = {}
+  for pname in pairs(schema_props) do
+    names[#names + 1] = pname
+  end
+  table.sort(names, function(a, b)
+    local ra, rb = required[a] or false, required[b] or false
+    if ra ~= rb then
+      return ra
+    end
+    return a < b
+  end)
+  local params = {}
+  for _, pname in ipairs(names) do
+    local ptype = PY_TYPES[schema_props[pname].type] or "any"
+    params[#params + 1] = required[pname] and (pname .. ": " .. ptype) or (pname .. ": " .. ptype .. " = None")
+  end
+  return "- " .. t.name .. "(" .. table.concat(params, ", ") .. ") -> str"
+end
+
+-- Keep cheap: runs on every request build. get_tools skips descriptions
+-- to avoid recursion from describe callbacks.
+local function describe(dctx)
+  local parts = { description, TOOLS_HEADER }
+  local has_workflow_only = false
+  for _, t in ipairs(interpreter_tools(maki.api.get_tools(), dctx.audience, dctx.workflow)) do
+    if matches_filter(t.name, dctx) then
+      has_workflow_only = has_workflow_only or t.workflow_only
+      parts[#parts + 1] = signature(t) .. "\n"
+    end
+  end
+  if has_workflow_only then
+    parts[#parts + 1] = WORKFLOW_TOOLS_NOTE
+  end
+  return table.concat(parts)
+end
+
 local function handler(input, ctx)
   local config = ctx:config()
   local timeout = input.timeout or config.code_execution_timeout_secs or DEFAULT_TIMEOUT
@@ -73,6 +160,7 @@ local function handler(input, ctx)
   buf:on("click", function()
     view:toggle()
   end)
+  ctx:live_buf(buf)
 
   ctx:set_deadline(timeout)
 
@@ -87,12 +175,19 @@ local function handler(input, ctx)
     view:append(line)
   end
 
-  local result, err = maki.interpreter.run(input.code, {
+  local tools = {}
+  for _, t in ipairs(interpreter_tools(maki.api.get_tools({ config = config }), ctx:audience(), ctx:workflow())) do
+    local name = t.name
+    tools[name] = function(tool_input)
+      return maki.agent.call_tool(ctx, name, tool_input, { timeout = timeout })
+    end
+  end
+
+  local result, err = maki.interpreter.run(PREAMBLE .. input.code, {
     timeout = timeout,
     max_memory_mb = config.interpreter_max_memory_mb or DEFAULT_MAX_MEMORY_MB,
-    buf = buf,
-    agent_ctx = ctx:agent_context(),
     on_output = show,
+    tools = tools,
   })
 
   if err then
@@ -150,7 +245,7 @@ end
 maki.api.register_tool({
   name = "code_execution",
   description = description,
-  augment = "interpreter_tools",
+  describe = describe,
   schema = schema,
   examples = examples,
   kind = "execute",

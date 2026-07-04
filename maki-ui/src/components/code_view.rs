@@ -9,7 +9,7 @@ use ratatui::text::{Line, Span};
 use syntect::parsing::SyntaxReference;
 use syntect::util::LinesWithEndings;
 
-pub(crate) const MAX_CODE_EXECUTION_LINES: usize = 100;
+pub(crate) const MAX_CODE_EXECUTION_LINES: usize = 2000;
 pub(crate) const MAX_INSTRUCTION_LINES: usize = 15;
 
 pub(crate) fn instruction_limit(expanded: bool) -> usize {

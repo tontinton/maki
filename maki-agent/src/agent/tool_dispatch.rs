@@ -9,8 +9,8 @@ use tracing::{debug, error, warn};
 
 use crate::mcp::{McpHandle, UNKNOWN_MCP};
 use crate::task_set::TaskSet;
-use crate::tools::ToolContext;
 use crate::tools::registry::{ToolInvocation, ToolRegistry};
+use crate::tools::{LocalToolFn, ToolContext};
 use crate::{AgentError, AgentEvent, ToolDoneEvent, ToolOutput, ToolStartEvent};
 
 #[derive(Clone, Copy)]
@@ -67,6 +67,9 @@ pub async fn run(
     ctx: &ToolContext,
     emit: Emit,
 ) -> ToolDoneEvent {
+    if let Some(local) = ctx.local_tools.get(name) {
+        return run_local_tool(local, id, name, input, ctx, emit);
+    }
     let entry = registry.get(name);
     let tool_id: Arc<str> = entry
         .as_ref()
@@ -186,6 +189,45 @@ pub async fn run(
         let msg = format!("{UNKNOWN_TOOL_PREFIX}: {name}");
         warn!(tool = %name, "unknown tool");
         done_error(msg)
+    }
+}
+
+fn run_local_tool(
+    local: &LocalToolFn,
+    id: String,
+    name: &str,
+    input: &Value,
+    ctx: &ToolContext,
+    emit: Emit,
+) -> ToolDoneEvent {
+    let tool_id: Arc<str> = Arc::from(name);
+    if matches!(emit, Emit::Notify) {
+        let start = ToolStartEvent {
+            id: id.clone(),
+            tool: Arc::clone(&tool_id),
+            summary: name.to_owned(),
+            render_header: None,
+            annotation: None,
+            input: None,
+            raw_input: Some(input.clone()),
+            output: None,
+        };
+        let _ = ctx.event_tx.send(AgentEvent::ToolStart(Box::new(start)));
+    }
+    let (output, is_error) = match local(input) {
+        Ok(output) => (output, false),
+        Err(e) => {
+            warn!(tool = %name, error = %e, "local tool failed");
+            (e, true)
+        }
+    };
+    ToolDoneEvent {
+        id,
+        tool: tool_id,
+        output: ToolOutput::Plain(output.into()),
+        is_error,
+        annotation: None,
+        written_path: None,
     }
 }
 
@@ -411,6 +453,89 @@ mod tests {
             .collect();
         let input = serde_json::json!({"path": "/a"});
         assert_eq!(recent_calls(&entries).is_doom_loop(name, &input), expected);
+    }
+
+    fn local_ctx(
+        name: &str,
+        f: impl Fn(&Value) -> Result<String, String> + Send + Sync + 'static,
+    ) -> ToolContext {
+        let mut ctx = crate::tools::test_support::stub_ctx(&AgentMode::Build);
+        let mut map = std::collections::HashMap::new();
+        map.insert(name.to_owned(), Arc::new(f) as LocalToolFn);
+        ctx.local_tools = Arc::new(map);
+        ctx
+    }
+
+    #[test]
+    fn local_tool_shadows_registry_and_maps_errors() {
+        smol::block_on(async {
+            let ctx = local_ctx("batch", |input| Ok(format!("local:{}", input["path"])));
+            let done = run(
+                ToolRegistry::native(),
+                None,
+                "t1".into(),
+                "batch",
+                &serde_json::json!({"path": "/a"}),
+                &ctx,
+                Emit::Silent,
+            )
+            .await;
+            assert!(!done.is_error);
+            assert_eq!(done.output.as_text(), r#"local:"/a""#);
+
+            let ctx = local_ctx("boom", |_| Err("nope".into()));
+            let done = run(
+                ToolRegistry::native(),
+                None,
+                "t2".into(),
+                "boom",
+                &serde_json::json!({}),
+                &ctx,
+                Emit::Silent,
+            )
+            .await;
+            assert!(done.is_error);
+            assert_eq!(done.output.as_text(), "nope");
+        });
+    }
+
+    #[test]
+    fn local_tool_notify_emits_tool_start_with_raw_input() {
+        smol::block_on(async {
+            let (tx, rx) = flume::unbounded::<crate::Envelope>();
+            let event_tx = crate::EventSender::new(tx, 0);
+            let mut ctx =
+                crate::tools::test_support::stub_ctx_with(&AgentMode::Build, Some(&event_tx), None);
+            let mut map = std::collections::HashMap::new();
+            map.insert(
+                "local_echo".to_owned(),
+                Arc::new(|input: &Value| Ok(input.to_string())) as LocalToolFn,
+            );
+            ctx.local_tools = Arc::new(map);
+
+            let input = serde_json::json!({"path": "/a"});
+            let done = run(
+                ToolRegistry::native(),
+                None,
+                "t1".into(),
+                "local_echo",
+                &input,
+                &ctx,
+                Emit::Notify,
+            )
+            .await;
+            assert!(!done.is_error);
+
+            let envelope = rx
+                .try_recv()
+                .expect("ToolStart must be emitted before the tool completes");
+            let AgentEvent::ToolStart(start) = envelope.event else {
+                panic!("expected ToolStart, got {:?}", envelope.event);
+            };
+            assert_eq!(start.tool.as_ref(), "local_echo");
+            assert_eq!(start.summary, "local_echo");
+            assert_eq!(start.raw_input, Some(input));
+        });
     }
 
     #[test]

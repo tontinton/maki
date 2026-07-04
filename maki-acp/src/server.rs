@@ -175,6 +175,7 @@ fn spawn_session(
         yolo: params.yolo,
         system_prompt_override: None,
         append_system_prompt: None,
+        workflow: false,
     })
 }
 
@@ -223,7 +224,11 @@ fn handle_prompt(srv: &mut Server, raw: &Value, id: &RequestId) -> Result<(), Ac
         message,
         mode: session.current_mode.clone(),
         images,
-        ..Default::default()
+        preamble: Vec::new(),
+        thinking: Default::default(),
+        fast: false,
+        workflow: false,
+        prompt: None,
     };
 
     session

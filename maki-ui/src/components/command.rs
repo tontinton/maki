@@ -98,6 +98,11 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         max_args: 0,
     },
     BuiltinCommand {
+        name: "/workflow",
+        description: "Toggle workflow mode (task callable inside code_execution)",
+        max_args: 0,
+    },
+    BuiltinCommand {
         name: "/exit",
         description: "Exit the application",
         max_args: 0,

@@ -7,7 +7,9 @@ use maki_agent::mcp::config::McpServerStatus;
 use maki_agent::permissions::PermissionManager;
 use maki_agent::template;
 use maki_agent::template::Vars;
-use maki_agent::tools::{DescriptionContext, FileReadTracker, ToolFilter, ToolRegistry};
+use maki_agent::tools::{
+    DescriptionContext, FileReadTracker, ToolAudience, ToolFilter, ToolRegistry,
+};
 use maki_agent::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentParams, AgentRunParams, CancelMap,
     CancelToken, CancelTrigger, Envelope, EventSender, History, Instructions, McpCommand,
@@ -141,7 +143,7 @@ impl AgentLoop {
         self.publish_btw_system(&maki_agent::prompt::ResolvedSlots::default());
 
         let slot = self.model_slot.load();
-        self.tools = self.build_tools(&slot.model);
+        self.tools = self.build_tools(&slot.model, false);
         if let Some(ref mcp) = self.mcp_handle {
             mcp.extend_tools(&mut self.tools);
             spawn_oauth_for_needs_auth(mcp);
@@ -169,7 +171,7 @@ impl AgentLoop {
         if *self.vars.apply("{cwd}") != old_cwd {
             self.reload_instructions().await;
         }
-        self.rebuild_tools(&slot.model);
+        self.rebuild_tools(&slot.model, input.workflow);
 
         for msg in std::mem::take(&mut input.preamble) {
             self.history.push(msg);
@@ -233,6 +235,7 @@ impl AgentLoop {
                 prompt_slots: Arc::new(prompt_slots),
                 subagent_cancels: Arc::clone(&self.subagent_cancels),
                 registry: Arc::clone(maki_agent::tools::ToolRegistry::native_arc()),
+                audience: ToolAudience::MAIN,
             },
             AgentRunParams {
                 history: &mut self.history,
@@ -259,18 +262,22 @@ impl AgentLoop {
         result
     }
 
-    fn rebuild_tools(&mut self, model: &Model) {
-        let mut tools = self.build_tools(model);
+    fn rebuild_tools(&mut self, model: &Model, workflow: bool) {
+        let mut tools = self.build_tools(model, workflow);
         if let Some(ref mcp) = self.mcp_handle {
             mcp.extend_tools(&mut tools);
         }
         self.tools = tools;
     }
 
-    fn build_tools(&self, model: &Model) -> Value {
+    fn build_tools(&self, model: &Model, workflow: bool) -> Value {
         let examples = model.supports_tool_examples();
         let filter = ToolFilter::from_config(&self.config, &[]);
-        let ctx = DescriptionContext { filter: &filter };
+        let ctx = DescriptionContext {
+            filter: &filter,
+            audience: ToolAudience::MAIN,
+            workflow,
+        };
         ToolRegistry::native().definitions(&self.vars, &ctx, examples)
     }
 

@@ -61,6 +61,8 @@ pub struct SessionMeta {
     pub thinking: Option<StoredThinking>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub fast: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub workflow: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1277,6 +1279,7 @@ mod tests {
         let meta: super::SessionMeta = serde_json::from_str(json).unwrap();
         assert!(meta.thinking.is_none());
         assert!(!meta.fast);
+        assert!(!meta.workflow);
     }
 
     #[test]
@@ -1286,6 +1289,7 @@ mod tests {
         let mut session: TestSession = Session::new("m", "/project");
         session.meta.thinking = Some(StoredThinking::Budget { tokens: 8192 });
         session.meta.fast = true;
+        session.meta.workflow = true;
         session.save_to(dir).unwrap();
 
         let loaded = TestSession::load_from(&session.id, dir).unwrap();
@@ -1294,6 +1298,7 @@ mod tests {
             Some(StoredThinking::Budget { tokens: 8192 })
         );
         assert!(loaded.meta.fast);
+        assert!(loaded.meta.workflow);
     }
 
     #[test]

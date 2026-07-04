@@ -85,6 +85,8 @@ const FLASH_NO_PLAN: &str = "No plan file";
 const FAST_UNSUPPORTED_MSG: &str = "Fast mode requires an Anthropic Opus 4.6+ model (API only)";
 const FAST_ON_MSG: &str = "Fast mode: on";
 const FAST_OFF_MSG: &str = "Fast mode: off";
+const WORKFLOW_ON_MSG: &str = "Workflow mode: on";
+const WORKFLOW_OFF_MSG: &str = "Workflow mode: off";
 const IMPLEMENT_MSG_PREFIX: &str = "Implement the plan";
 const IMPLEMENT_PARALLEL_HINT: &str = "Use batch+task to parallelize, assign each subagent a separate module and restrict its tests to that module to avoid interference.";
 
@@ -933,6 +935,11 @@ impl App {
             messages,
         } = envelope.event
         {
+            // Workflow sessions use synthetic ids that no ToolDone will match,
+            // so we finish them here on SubagentHistory.
+            if let Some(&sub_idx) = self.chat_index.get(tool_use_id.as_str()) {
+                self.chats[sub_idx].mark_finished(DisplayRole::Done, DONE_TEXT);
+            }
             self.state
                 .session
                 .subagent_messages
@@ -1190,6 +1197,18 @@ impl App {
                         FAST_ON_MSG
                     } else {
                         FAST_OFF_MSG
+                    }
+                    .into(),
+                );
+                vec![]
+            }
+            "/workflow" => {
+                self.state.workflow = !self.state.workflow;
+                self.flash(
+                    if self.state.workflow {
+                        WORKFLOW_ON_MSG
+                    } else {
+                        WORKFLOW_OFF_MSG
                     }
                     .into(),
                 );

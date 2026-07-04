@@ -1,21 +1,17 @@
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use maki_agent::agent::LoadedInstructions;
-use maki_agent::cancel::{CancelMap, CancelToken};
-use maki_agent::mcp::McpHandle;
-use maki_agent::permissions::PermissionManager;
-use maki_agent::prompt::ResolvedSlots;
-use maki_agent::tools::FileReadTracker;
-use maki_agent::{AgentMode, EventSender};
+use maki_agent::cancel::CancelToken;
+use maki_agent::tools::{Deadline, FileReadTracker, LocalTools, ToolContext};
 use maki_config::{AgentConfig, ToolOutputLines};
-use maki_providers::provider::Provider;
-use maki_providers::{Model, RequestOptions, Timeouts};
 use mlua::{LuaSerdeExt, UserData, UserDataMethods, Value as LuaValue};
 
 use crate::api::tool::ToolCallReply;
-use crate::runtime::active_task;
+use crate::api::ui::buf::BufHandle;
+use crate::runtime::{active_task, lock_cell};
 
 const DEADLINE_ALREADY_SET_MSG: &str = "ctx:set_deadline() already called";
 
@@ -31,47 +27,37 @@ impl UserData for RestoreCtx {
     }
 }
 
-pub(crate) struct AgentContext {
-    pub(crate) provider: Arc<dyn Provider>,
-    pub(crate) model: Arc<Model>,
-    pub(crate) event_tx: EventSender,
-    pub(crate) mode: AgentMode,
-    pub(crate) tool_use_id: Option<String>,
-    pub(crate) permissions: Arc<PermissionManager>,
-    pub(crate) timeouts: Timeouts,
-    pub(crate) prompt_slots: Arc<ResolvedSlots>,
-    pub(crate) opts: RequestOptions,
-    pub(crate) subagent_cancels: Arc<CancelMap<String>>,
-    pub(crate) cancel: CancelToken,
-    pub(crate) mcp: Option<McpHandle>,
-    pub(crate) config: AgentConfig,
-    pub(crate) file_tracker: Arc<FileReadTracker>,
-    pub(crate) user_response_rx: Option<Arc<async_lock::Mutex<flume::Receiver<String>>>>,
-}
+/// Captured snapshot of the parent `ToolContext`. Per-call state (deadline,
+/// instructions, output lines) is reset so child calls start clean.
+#[derive(Clone)]
+pub(crate) struct AgentContext(ToolContext);
 
-impl From<&maki_agent::tools::ToolContext> for AgentContext {
-    fn from(ctx: &maki_agent::tools::ToolContext) -> Self {
-        Self {
-            provider: Arc::clone(&ctx.provider),
-            model: Arc::clone(&ctx.model),
-            event_tx: ctx.event_tx.clone(),
-            mode: ctx.mode.clone(),
-            tool_use_id: ctx.tool_use_id.clone(),
-            permissions: Arc::clone(&ctx.permissions),
-            timeouts: ctx.timeouts,
-            prompt_slots: Arc::clone(&ctx.prompt_slots),
-            opts: ctx.opts,
-            subagent_cancels: Arc::clone(&ctx.subagent_cancels),
-            cancel: ctx.cancel.clone(),
-            mcp: ctx.mcp.clone(),
-            config: ctx.config.clone(),
-            file_tracker: Arc::clone(&ctx.file_tracker),
-            user_response_rx: ctx.user_response_rx.clone(),
-        }
+impl From<&ToolContext> for AgentContext {
+    fn from(ctx: &ToolContext) -> Self {
+        let mut c = ctx.clone();
+        c.loaded_instructions = LoadedInstructions::new();
+        c.deadline = Deadline::None;
+        c.tool_output_lines = ToolOutputLines::default();
+        c.local_tools = LocalTools::default();
+        Self(c)
     }
 }
 
-impl UserData for AgentContext {}
+impl Deref for AgentContext {
+    type Target = ToolContext;
+    fn deref(&self) -> &ToolContext {
+        &self.0
+    }
+}
+
+impl AgentContext {
+    /// Drops `tool_use_id` so inner tools never emit UI events for the outer call.
+    pub(crate) fn to_tool_context(&self) -> ToolContext {
+        let mut c = self.0.clone();
+        c.tool_use_id = None;
+        c
+    }
+}
 
 pub(crate) struct LuaCtx {
     pub(crate) cancel: CancelToken,
@@ -80,12 +66,30 @@ pub(crate) struct LuaCtx {
     pub(crate) finish_tx: Option<flume::Sender<ToolCallReply>>,
     pub(crate) file_tracker: Arc<FileReadTracker>,
     pub(crate) loaded_instructions: LoadedInstructions,
-    pub(crate) agent: Option<AgentContext>,
+    pub(crate) agent: AgentContext,
 }
 
 impl UserData for LuaCtx {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_method("cancelled", |_, this, ()| Ok(this.cancel.is_cancelled()));
+
+        methods.add_method("workflow", |_, this, ()| Ok(this.agent.workflow));
+
+        methods.add_method("audience", |_, this, ()| {
+            Ok(this.agent.audience.name().unwrap_or("main"))
+        });
+
+        methods.add_method("live_buf", |lua, _this, buf: mlua::AnyUserData| {
+            let shared = buf.borrow::<BufHandle>().map(|h| Arc::clone(&h.buf))?;
+            let live = lock_cell(&active_task(lua)).live.clone();
+            if let Some(live) = live {
+                let _ = live.event_tx.send(maki_agent::AgentEvent::LiveToolBuf {
+                    id: live.tool_use_id.clone(),
+                    body: shared,
+                });
+            }
+            Ok(())
+        });
 
         methods.add_method("config", |lua, this, ()| lua.to_value(&this.config));
 
@@ -142,12 +146,6 @@ impl UserData for LuaCtx {
             Ok(maki_agent::is_instruction_file(&name))
         });
 
-        methods.add_method_mut("agent_context", |_, this, ()| {
-            this.agent
-                .take()
-                .ok_or_else(|| mlua::Error::runtime("agent context not available"))
-        });
-
         methods.add_method_mut("finish", |_lua, this, val: LuaValue| {
             let tx = this
                 .finish_tx
@@ -165,5 +163,63 @@ fn resolve_abs_with_cwd(path: String, cwd: &Path) -> PathBuf {
         path.into()
     } else {
         cwd.join(&path)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use maki_agent::AgentMode;
+    use maki_agent::tools::LocalToolFn;
+    use maki_agent::tools::test_support::stub_ctx_with;
+
+    use super::*;
+
+    const TOOL_USE_ID: &str = "tu-1";
+    const INSTRUCTION_PATH: &str = "/tmp/nested/AGENTS.md";
+    const LOCAL_TOOL_NAME: &str = "sess_tool";
+
+    fn populated_ctx() -> ToolContext {
+        let mut ctx = stub_ctx_with(&AgentMode::Build, None, Some(TOOL_USE_ID));
+        ctx.deadline = Deadline::after(Duration::from_secs(60));
+        ctx.tool_output_lines = ToolOutputLines {
+            bash: 999,
+            ..ToolOutputLines::default()
+        };
+        assert!(
+            !ctx.loaded_instructions
+                .contains_or_insert(PathBuf::from(INSTRUCTION_PATH))
+        );
+        let mut tools: HashMap<String, LocalToolFn> = HashMap::new();
+        tools.insert(
+            LOCAL_TOOL_NAME.into(),
+            Arc::new(|_: &serde_json::Value| Ok(String::new())) as LocalToolFn,
+        );
+        ctx.local_tools = Arc::new(tools);
+        ctx
+    }
+
+    #[test]
+    fn agent_context_keeps_tool_use_id_and_resets_per_call_state() {
+        let agent = AgentContext::from(&populated_ctx());
+        assert_eq!(agent.tool_use_id.as_deref(), Some(TOOL_USE_ID));
+        assert!(matches!(agent.deadline, Deadline::None));
+        assert_eq!(agent.tool_output_lines, ToolOutputLines::default());
+        assert!(agent.local_tools.is_empty());
+        assert!(
+            !agent
+                .loaded_instructions
+                .contains_or_insert(PathBuf::from(INSTRUCTION_PATH)),
+            "loaded_instructions must be a fresh set, not a shared clone"
+        );
+    }
+
+    #[test]
+    fn agent_context_to_tool_context_drops_tool_use_id() {
+        let agent = AgentContext::from(&populated_ctx());
+        let inner = agent.to_tool_context();
+        assert_eq!(inner.tool_use_id, None);
+        assert_eq!(agent.tool_use_id.as_deref(), Some(TOOL_USE_ID));
     }
 }

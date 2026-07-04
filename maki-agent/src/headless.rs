@@ -18,7 +18,7 @@ use crate::cancel::{CancelMap, CancelToken};
 use crate::permissions::PermissionManager;
 use crate::prompt::ResolvedSlots;
 use crate::template;
-use crate::tools::{DescriptionContext, FileReadTracker, ToolFilter, ToolRegistry};
+use crate::tools::{DescriptionContext, FileReadTracker, ToolAudience, ToolFilter, ToolRegistry};
 use crate::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, Envelope,
     EventSender, ImageSource, McpHandle, PermissionsConfig, ToolOutput, ToolOutputLines,
@@ -78,6 +78,7 @@ pub struct HeadlessParams {
     pub mcp_handle: Option<McpHandle>,
     pub initial_wd: PathBuf,
     pub fast: bool,
+    pub workflow: bool,
 }
 
 pub struct HeadlessHandle {
@@ -99,6 +100,7 @@ fn setup(
     config: &AgentConfig,
     excluded_tools: &[&'static str],
     mcp_handle: Option<&McpHandle>,
+    workflow: bool,
 ) -> AgentSetup {
     let vars = template::env_vars();
     let instructions = agent::load_instructions(&vars.apply("{cwd}"));
@@ -108,6 +110,7 @@ fn setup(
         config,
         excluded_tools,
         mcp_handle,
+        workflow,
         ToolRegistry::native(),
     );
 
@@ -124,10 +127,15 @@ fn tool_definitions(
     config: &AgentConfig,
     excluded_tools: &[&'static str],
     mcp_handle: Option<&McpHandle>,
+    workflow: bool,
     registry: &ToolRegistry,
 ) -> Value {
     let filter = ToolFilter::from_config(config, excluded_tools);
-    let ctx = DescriptionContext { filter: &filter };
+    let ctx = DescriptionContext {
+        filter: &filter,
+        audience: ToolAudience::MAIN,
+        workflow,
+    };
     let mut tools = registry.definitions(vars, &ctx, model.supports_tool_examples());
 
     if let Some(handle) = mcp_handle {
@@ -149,6 +157,7 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
         &params.config,
         &params.excluded_tools,
         params.mcp_handle.as_ref(),
+        params.workflow,
     );
 
     let system = agent::build_system_prompt(
@@ -166,6 +175,7 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
     let session_id = uuid::Uuid::new_v4().to_string();
 
     let fast = params.fast;
+    let workflow = params.workflow;
     let task = smol::spawn({
         let session_id = session_id.clone();
         let mcp_shutdown = params.mcp_handle.clone();
@@ -202,6 +212,7 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
                     prompt_slots: Arc::new(params.prompt_slots),
                     subagent_cancels: Arc::new(CancelMap::new()),
                     registry: Arc::clone(ToolRegistry::native_arc()),
+                    audience: ToolAudience::MAIN,
                 },
                 AgentRunParams {
                     history: &mut history,
@@ -218,8 +229,11 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
                     message: params.prompt,
                     mode,
                     images: params.images,
+                    preamble: Vec::new(),
+                    thinking: Default::default(),
                     fast,
-                    ..Default::default()
+                    workflow,
+                    prompt: None,
                 })
                 .await;
             drop(agent);
@@ -260,6 +274,7 @@ pub struct InteractiveParams {
     pub yolo: bool,
     pub system_prompt_override: Option<String>,
     pub append_system_prompt: Option<String>,
+    pub workflow: bool,
 }
 
 pub struct InteractiveHandle {
@@ -284,6 +299,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
         &params.config,
         &params.excluded_tools,
         params.mcp_handle.as_ref(),
+        params.workflow,
     );
 
     let tool_names = extract_tool_names(&tools);
@@ -347,6 +363,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                                 &params.config,
                                 &params.excluded_tools,
                                 params.mcp_handle.as_ref(),
+                                params.workflow,
                                 ToolRegistry::native(),
                             );
                             model = new_model;
@@ -401,6 +418,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                         prompt_slots: Arc::clone(&params.prompt_slots),
                         subagent_cancels: Arc::new(CancelMap::new()),
                         registry: Arc::clone(ToolRegistry::native_arc()),
+                        audience: ToolAudience::MAIN,
                     },
                     AgentRunParams {
                         history: &mut history,

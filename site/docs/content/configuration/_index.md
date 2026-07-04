@@ -56,6 +56,7 @@ All fields are optional. Typos in field names cause an error right away.
 |-------|------|---------|-------------|
 | `always_yolo` | bool | `false` | Start every session with YOLO mode (skip permission prompts, deny rules still apply) |
 | `always_fast` | bool | `false` | Start every session with Anthropic fast mode (Opus only; ignored otherwise) |
+| `always_workflow` | bool | `false` | Start every session with workflow mode (task callable inside code_execution) |
 | `always_thinking` | bool \| string | `false` | Start every session with extended thinking (true/"adaptive", "off", or a token budget) |
 
 ### `ui`
@@ -98,6 +99,7 @@ How many lines of output to show per tool in the UI. All values are `usize` with
 | `compaction_buffer` | u32 | `40000` | 1000 | Token buffer reserved during compaction |
 | `search_result_limit` | usize | `100` | 10 | Max results from grep/glob searches |
 | `interpreter_max_memory_mb` | usize | `50` | 10 | Memory limit for code interpreter (MB) |
+| `task_max_concurrent` | usize | `8` | 1 | Max concurrently running subagents (task tool) |
 
 ### `provider`
 

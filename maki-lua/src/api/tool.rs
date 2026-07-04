@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -6,11 +7,12 @@ use std::time::Duration;
 use flume::Sender;
 use maki_agent::prompt::{PromptId, Slot, SlotKind, ValidNames};
 use maki_agent::tools::Tool;
+use maki_agent::tools::registry::ToolRegistry;
 use maki_agent::tools::schema::{ParamSchema, to_json_schema, try_from_json, validate};
 use maki_agent::tools::{
     BoxFuture, Deadline, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError,
-    PermissionScopes, ToolAudience, ToolContext, ToolExecResult, ToolInvocation,
-    build_interpreter_tools_description, timeout_annotation,
+    PermissionScopes, ToolAudience, ToolContext, ToolExecResult, ToolFilter, ToolInvocation,
+    is_tool_enabled, timeout_annotation,
 };
 use maki_agent::{
     AgentEvent, BufferSnapshot, InstructionBlock, SharedBuf, TextOutput,
@@ -19,12 +21,13 @@ use maki_agent::{
 use mlua::{
     Function, Lua, LuaSerdeExt, RegistryKey, Result as LuaResult, Table, Value as LuaValue,
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::api::ui::buf::BufHandle;
 use crate::api::util::command::{
     CommandEntry, CommandHandlerMap, LuaCommandWriter, publish_command_snapshot,
 };
+use crate::api::util::convert::json_to_lua;
 use crate::api::util::ctx::LuaCtx;
 use crate::runtime::{HintContent, LiveCtx, PromptHintCallbacks, PromptHintRegistration, Request};
 
@@ -33,10 +36,35 @@ const TOOL_HANDLER_RETURN_ERR: &str =
     "tool handler must return string or {output=string, is_error?=bool}";
 const TIMEOUT_PARSE_ERR: &str = "register_tool: 'timeout' must be a positive number, 0, or false";
 const MAX_HINT_CONTENT_SIZE: usize = 1024 * 1024;
+const DESCRIBE_TIMEOUT: Duration = Duration::from_secs(3);
 
-#[derive(Clone, Copy)]
-pub(crate) enum DescriptionAugment {
-    InterpreterTools,
+type DescribeFn = Box<dyn Fn(&str, &str, &Value) -> Option<String>>;
+
+thread_local! {
+    /// Lives on the Lua runtime thread only. Calling `Request::Describe` from
+    /// that same thread would self-deadlock, so we resolve in-thread instead.
+    static LOCAL_DESCRIBE: RefCell<Option<DescribeFn>> = const { RefCell::new(None) };
+}
+
+pub(crate) fn set_local_describe(f: impl Fn(&str, &str, &Value) -> Option<String> + 'static) {
+    LOCAL_DESCRIBE.with(|c| *c.borrow_mut() = Some(Box::new(f)));
+}
+
+fn local_describe(plugin: &str, tool: &str, dctx: &Value) -> Option<Option<String>> {
+    LOCAL_DESCRIBE.with(|c| c.borrow().as_ref().map(|f| f(plugin, tool, dctx)))
+}
+
+fn dctx_json(ctx: &DescriptionContext) -> Value {
+    let mut obj = json!({
+        "audience": ctx.audience.name().unwrap_or("main"),
+        "workflow": ctx.workflow,
+    });
+    match ctx.filter {
+        ToolFilter::All => {}
+        ToolFilter::Only(names) => obj["only"] = json!(names),
+        ToolFilter::AllExcept(names) => obj["except"] = json!(names),
+    }
+    obj
 }
 
 #[derive(Clone)]
@@ -73,7 +101,7 @@ pub(crate) struct PendingTool {
     pub(crate) start_annotation: Option<StartAnnotation>,
     pub(crate) start_input: Option<StartInputConfig>,
     pub(crate) examples: Option<Value>,
-    pub(crate) augment: Option<DescriptionAugment>,
+    pub(crate) describe_key: Option<RegistryKey>,
 }
 
 pub(crate) type PendingTools = Arc<Mutex<Vec<PendingTool>>>;
@@ -93,7 +121,7 @@ pub(crate) struct LuaTool {
     pub(crate) start_annotation: Option<StartAnnotation>,
     pub(crate) start_input: Option<StartInputConfig>,
     pub(crate) examples: Option<Value>,
-    pub(crate) augment: Option<DescriptionAugment>,
+    pub(crate) has_describe_fn: bool,
 }
 
 impl Tool for LuaTool {
@@ -102,14 +130,38 @@ impl Tool for LuaTool {
     }
 
     fn description(&self, ctx: &DescriptionContext) -> Cow<'_, str> {
-        match self.augment {
-            Some(DescriptionAugment::InterpreterTools) => Cow::Owned(format!(
-                "{}{}",
-                self.description,
-                build_interpreter_tools_description(ctx.filter)
-            )),
-            None => Cow::Borrowed(&self.description),
+        if !self.has_describe_fn {
+            return Cow::Borrowed(&self.description);
         }
+        let dctx = dctx_json(ctx);
+        if let Some(result) = local_describe(&self.plugin, &self.name, &dctx) {
+            return match result {
+                Some(s) => Cow::Owned(s),
+                None => Cow::Borrowed(&self.description),
+            };
+        }
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        let sent = self
+            .tx
+            .send(Request::Describe {
+                plugin: Arc::clone(&self.plugin),
+                tool: Arc::clone(&self.name),
+                dctx,
+                reply: reply_tx,
+            })
+            .is_ok();
+        if sent {
+            match reply_rx.recv_timeout(DESCRIBE_TIMEOUT) {
+                Ok(Some(s)) => return Cow::Owned(s),
+                Ok(None) => {}
+                Err(e) => tracing::warn!(
+                    tool = %self.name,
+                    error = %e,
+                    "describe round trip failed; falling back to static description"
+                ),
+            }
+        }
+        Cow::Borrowed(&self.description)
     }
 
     fn schema(&self) -> Value {
@@ -309,7 +361,7 @@ impl ToolInvocation for LuaToolInvocation {
                 finish_tx: None,
                 file_tracker: ctx.file_tracker.clone(),
                 loaded_instructions: ctx.loaded_instructions.clone(),
-                agent: Some(crate::api::util::ctx::AgentContext::from(ctx)),
+                agent: crate::api::util::ctx::AgentContext::from(ctx),
             };
 
             if tx
@@ -569,7 +621,46 @@ pub(crate) fn create_api_table(
         })?,
     )?;
 
+    t.set("get_tools", lua.create_function(get_tools_from_lua)?)?;
+
     Ok(t)
+}
+
+/// Registry snapshot without descriptions (avoids recursion from describe callbacks).
+fn get_tools_from_lua(lua: &Lua, opts: Option<Table>) -> LuaResult<Table> {
+    let registry = lua
+        .app_data_ref::<Arc<ToolRegistry>>()
+        .map(|r| Arc::clone(&r))
+        .ok_or_else(|| mlua::Error::runtime("get_tools: tool registry not available"))?;
+    let mut disabled: Vec<String> = Vec::new();
+    if let Some(o) = opts
+        && let Some(config) = o.get::<Option<Table>>("config")?
+    {
+        disabled = config
+            .get::<Option<Vec<String>>>("disabled_tools")?
+            .unwrap_or_default();
+    }
+
+    let out = lua.create_table()?;
+    for (i, entry) in registry.iter().iter().enumerate() {
+        let audience = entry.tool.audience();
+        let audiences = lua.create_table()?;
+        for (flag, name) in maki_agent::tools::registry::AUDIENCE_NAMES {
+            if audience.contains(*flag) {
+                audiences.push(*name)?;
+            }
+        }
+        let t = lua.create_table()?;
+        t.set("name", entry.name())?;
+        t.set("schema", json_to_lua(lua, &entry.tool.schema())?)?;
+        t.set("audiences", audiences)?;
+        if let Some(kind) = entry.tool.tool_kind() {
+            t.set("kind", kind)?;
+        }
+        t.set("enabled", is_tool_enabled(&disabled, entry.name()))?;
+        out.set(i + 1, t)?;
+    }
+    Ok(out)
 }
 
 fn is_valid_tool_name(name: &str) -> bool {
@@ -595,13 +686,8 @@ fn parse_audience(audiences: Option<mlua::Table>) -> LuaResult<ToolAudience> {
         count += 1;
         flags |= match s.as_str() {
             "all" => ToolAudience::all(),
-            "main" => ToolAudience::MAIN,
-            "research_sub" => ToolAudience::RESEARCH_SUB,
-            "general_sub" => ToolAudience::GENERAL_SUB,
-            "interpreter" => ToolAudience::INTERPRETER,
-            _ => {
-                return Err(mlua::Error::runtime(format!("unknown audience: {s}")));
-            }
+            other => ToolAudience::parse_name(other)
+                .ok_or_else(|| mlua::Error::runtime(format!("unknown audience: {other}")))?,
         };
     }
     if count == 0 {
@@ -698,16 +784,6 @@ fn parse_start_input(spec: &Table, schema: &Value) -> LuaResult<Option<StartInpu
     }))
 }
 
-fn parse_augment(spec: &Table) -> LuaResult<Option<DescriptionAugment>> {
-    match spec_opt::<String>(spec, "augment", "a string")?.as_deref() {
-        None => Ok(None),
-        Some("interpreter_tools") => Ok(Some(DescriptionAugment::InterpreterTools)),
-        Some(other) => Err(mlua::Error::runtime(format!(
-            "register_tool: unknown augment '{other}' (expected 'interpreter_tools')"
-        ))),
-    }
-}
-
 fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> LuaResult<()> {
     let name: String = spec
         .get("name")
@@ -770,7 +846,10 @@ fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> Lua
         .transpose()?;
 
     let start_input = parse_start_input(spec, &schema_val)?;
-    let augment = parse_augment(spec)?;
+    let describe_fn: Option<Function> = spec.get("describe").ok();
+    let describe_key = describe_fn
+        .map(|f| lua.create_registry_value(f))
+        .transpose()?;
 
     let examples: Option<Value> =
         spec_opt::<Table>(spec, "examples", "a table (array of example inputs)")?
@@ -799,7 +878,7 @@ fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> Lua
             start_annotation,
             start_input,
             examples,
-            augment,
+            describe_key,
         });
 
     Ok(())
@@ -1057,20 +1136,17 @@ mod tests {
     }
 
     #[test]
-    fn augment_appends_interpreter_signatures_at_description_time() {
+    fn describe_falls_back_to_static_description_when_runtime_unavailable() {
         use maki_agent::tools::ToolFilter;
 
         let mut tool = make_lua_tool(None);
-        tool.augment = Some(DescriptionAugment::InterpreterTools);
+        tool.has_describe_fn = true;
         let ctx = DescriptionContext {
             filter: &ToolFilter::All,
+            audience: ToolAudience::MAIN,
+            workflow: false,
         };
-        let desc = tool.description(&ctx);
-        assert!(desc.starts_with("test"), "base description kept: {desc}");
-        assert!(
-            desc.contains("Available tools (called as Python functions"),
-            "signatures appended: {desc}"
-        );
+        assert_eq!(tool.description(&ctx), "test");
     }
 
     fn make_lua_tool(permission_scope_kind: Option<PermissionScopeKind>) -> LuaTool {
@@ -1099,7 +1175,7 @@ mod tests {
             start_annotation: None,
             start_input: None,
             examples: None,
-            augment: None,
+            has_describe_fn: false,
         }
     }
 
@@ -1278,7 +1354,7 @@ mod tests {
             start_annotation: None,
             start_input: None,
             examples: None,
-            augment: None,
+            has_describe_fn: false,
         };
         let inv = tool.parse(&serde_json::json!({"count": 42})).unwrap();
         assert!(smol::block_on(inv.permission_scopes()).is_none());

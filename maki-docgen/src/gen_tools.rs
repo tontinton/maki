@@ -1,5 +1,5 @@
 use maki_agent::template::Vars;
-use maki_agent::tools::{DescriptionContext, ToolFilter, ToolRegistry, ToolSource};
+use maki_agent::tools::{DescriptionContext, ToolAudience, ToolFilter, ToolRegistry, ToolSource};
 use maki_config::OPT_IN_TOOLS;
 use regex::Regex;
 use serde_json::Value;
@@ -243,6 +243,8 @@ pub fn generate() -> String {
         &vars,
         &DescriptionContext {
             filter: &ToolFilter::All,
+            audience: ToolAudience::MAIN,
+            workflow: false,
         },
         false,
     );

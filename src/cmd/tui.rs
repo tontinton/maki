@@ -148,6 +148,7 @@ pub fn run(cli: Cli) -> Result<()> {
             timeouts,
             prompt_slots,
             fast,
+            workflow: config.always_workflow,
         })
         .context("run sdk mode")?;
     } else if cli.print {
@@ -163,6 +164,7 @@ pub fn run(cli: Cli) -> Result<()> {
             timeouts,
             plugin_host.event_handle(),
             fast,
+            config.always_workflow,
         )
         .context("run print mode")?;
     } else {
@@ -176,6 +178,7 @@ pub fn run(cli: Cli) -> Result<()> {
         )?;
         if session.messages.is_empty() {
             session.meta.fast |= config.always_fast;
+            session.meta.workflow |= config.always_workflow;
             if let Some(thinking) = config.always_thinking {
                 session.meta.thinking = Some(thinking);
             }

@@ -434,6 +434,7 @@ pub struct SdkParams {
     pub timeouts: Timeouts,
     pub prompt_slots: ResolvedSlots,
     pub fast: bool,
+    pub workflow: bool,
 }
 
 struct Shared {
@@ -452,6 +453,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         timeouts,
         prompt_slots,
         fast,
+        workflow,
     } = params;
     cli.warn_ignored_flags();
     if let Some(max) = cli.max_turns {
@@ -483,6 +485,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         yolo: permission_mode == PermissionMode::BypassPermissions,
         system_prompt_override: cli.system_prompt.clone().filter(|s| !s.is_empty()),
         append_system_prompt: cli.append_system_prompt.clone().filter(|s| !s.is_empty()),
+        workflow,
     });
 
     let (out_tx, out_rx) = flume::unbounded::<String>();
@@ -569,8 +572,11 @@ pub fn run(params: SdkParams) -> Result<()> {
                     message: prompt,
                     mode: mode.agent_mode(&cwd),
                     images,
+                    preamble: Vec::new(),
+                    thinking: Default::default(),
                     fast,
-                    ..Default::default()
+                    workflow,
+                    prompt: None,
                 };
                 if handle.input_tx.send(input).is_err() {
                     break;

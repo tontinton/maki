@@ -20,16 +20,41 @@ use super::{DescriptionContext, ToolContext};
 bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct ToolAudience: u8 {
-        const MAIN         = 0b0001;
-        const RESEARCH_SUB = 0b0010;
-        const GENERAL_SUB  = 0b0100;
-        const INTERPRETER  = 0b1000;
+        const MAIN         = 0b0000_0001;
+        const RESEARCH_SUB = 0b0000_0010;
+        const GENERAL_SUB  = 0b0000_0100;
+        const INTERPRETER  = 0b0000_1000;
+        const WORKFLOW     = 0b0001_0000;
     }
 }
 
 impl Default for ToolAudience {
     fn default() -> Self {
         Self::all()
+    }
+}
+
+pub const AUDIENCE_NAMES: &[(ToolAudience, &str)] = &[
+    (ToolAudience::MAIN, "main"),
+    (ToolAudience::RESEARCH_SUB, "research_sub"),
+    (ToolAudience::GENERAL_SUB, "general_sub"),
+    (ToolAudience::INTERPRETER, "interpreter"),
+    (ToolAudience::WORKFLOW, "workflow"),
+];
+
+impl ToolAudience {
+    pub fn name(self) -> Option<&'static str> {
+        AUDIENCE_NAMES
+            .iter()
+            .find(|(flag, _)| *flag == self)
+            .map(|(_, name)| *name)
+    }
+
+    pub fn parse_name(name: &str) -> Option<Self> {
+        AUDIENCE_NAMES
+            .iter()
+            .find(|(_, n)| *n == name)
+            .map(|(flag, _)| *flag)
     }
 }
 
@@ -499,6 +524,9 @@ impl ToolRegistry {
         let snapshot = self.tools.load();
         let mut out = Vec::with_capacity(snapshot.len());
         for entry in snapshot.iter() {
+            if !entry.tool.audience().contains(ctx.audience) {
+                continue;
+            }
             if !ctx.filter.matches(entry.name()) {
                 continue;
             }
@@ -583,6 +611,7 @@ mod tests {
 
     struct MockTool {
         name: String,
+        audience: ToolAudience,
     }
 
     struct MockInvocation;
@@ -606,14 +635,22 @@ mod tests {
         fn schema(&self) -> Value {
             json!({"type": "object", "properties": {}, "additionalProperties": false})
         }
+        fn audience(&self) -> ToolAudience {
+            self.audience
+        }
         fn parse(&self, _input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
             Ok(Box::new(MockInvocation))
         }
     }
 
     fn mock(name: &str) -> Arc<dyn Tool> {
+        mock_scoped(name, ToolAudience::all())
+    }
+
+    fn mock_scoped(name: &str, audience: ToolAudience) -> Arc<dyn Tool> {
         Arc::new(MockTool {
             name: name.to_owned(),
+            audience,
         })
     }
 
@@ -639,7 +676,11 @@ mod tests {
         .unwrap();
 
         let filter = crate::tools::ToolFilter::All;
-        let ctx = DescriptionContext { filter: &filter };
+        let ctx = DescriptionContext {
+            filter: &filter,
+            audience: ToolAudience::MAIN,
+            workflow: false,
+        };
         let vars = Vars::new();
         let defs = reg.definitions(&vars, &ctx, false);
         let arr = defs.as_array().expect("definitions returns array");
@@ -751,6 +792,54 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(err, RegistryError::NameConflict { .. }));
+    }
+
+    #[test]
+    fn audience_names_round_trip() {
+        let mut union = ToolAudience::empty();
+        for (flag, name) in AUDIENCE_NAMES {
+            assert_eq!(flag.name(), Some(*name));
+            assert_eq!(ToolAudience::parse_name(name), Some(*flag));
+            union |= *flag;
+        }
+        assert_eq!(union, ToolAudience::all());
+        assert_eq!(ToolAudience::parse_name("nope"), None);
+        assert_eq!(ToolAudience::all().name(), None);
+    }
+
+    #[test]
+    fn definitions_excludes_wrong_audience() {
+        let reg = ToolRegistry::new();
+        reg.register(
+            mock_scoped("main_only_tool", ToolAudience::MAIN),
+            ToolSource::Native,
+        )
+        .unwrap();
+        reg.register(mock("everywhere"), ToolSource::Native)
+            .unwrap();
+
+        let vars = Vars::new();
+        let filter = crate::tools::ToolFilter::All;
+        let names_for = |audience: ToolAudience| -> Vec<String> {
+            let ctx = DescriptionContext {
+                filter: &filter,
+                audience,
+                workflow: false,
+            };
+            reg.definitions(&vars, &ctx, false)
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|d| d["name"].as_str().unwrap().to_owned())
+                .collect()
+        };
+
+        assert_eq!(
+            names_for(ToolAudience::MAIN),
+            vec!["main_only_tool", "everywhere"]
+        );
+        assert_eq!(names_for(ToolAudience::RESEARCH_SUB), vec!["everywhere"]);
+        assert_eq!(names_for(ToolAudience::GENERAL_SUB), vec!["everywhere"]);
     }
 
     #[test_case(Err("boom".into()), Some("/tmp/foo".into()), None          ; "clears_on_error")]

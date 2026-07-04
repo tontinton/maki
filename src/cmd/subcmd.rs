@@ -529,7 +529,7 @@ pub fn prompt(
     use maki_agent::agent::{build_system_prompt, load_instruction_text};
     use maki_agent::prompt::{PromptId, assemble};
     use maki_agent::template;
-    use maki_agent::tools::{DescriptionContext, ToolFilter, ToolRegistry};
+    use maki_agent::tools::{DescriptionContext, ToolAudience, ToolFilter, ToolRegistry};
     use maki_providers::Model;
 
     if plan && !matches!(variant, PromptVariant::System) {
@@ -553,6 +553,8 @@ pub fn prompt(
     if tools {
         let ctx = DescriptionContext {
             filter: &ToolFilter::All,
+            audience: ToolAudience::MAIN,
+            workflow: false,
         };
         let defs = reg.definitions(&vars, &ctx, true);
         if names {

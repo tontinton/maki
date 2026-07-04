@@ -134,6 +134,12 @@ pub enum Request {
     RunKeybindCallback {
         id: u64,
     },
+    Describe {
+        plugin: Arc<str>,
+        tool: Arc<str>,
+        dctx: Value,
+        reply: flume::Sender<Option<String>>,
+    },
 }
 
 pub struct RestoreItem {
@@ -556,6 +562,7 @@ struct ToolKeys {
     header: Option<RegistryKey>,
     restore: Option<RegistryKey>,
     permission_scopes: Option<RegistryKey>,
+    describe: Option<RegistryKey>,
 }
 
 type PluginMap = Rc<RefCell<HashMap<Arc<str>, HashMap<Arc<str>, ToolKeys>>>>;
@@ -618,11 +625,21 @@ impl LuaRuntime {
         lua.set_app_data(keymap_writer);
         lua.set_app_data(HintStore::new());
         lua.set_app_data(hint_writer);
+        lua.set_app_data(Arc::clone(&registry));
+
+        let plugins: PluginMap = Rc::new(RefCell::new(HashMap::new()));
+        {
+            let lua = lua.clone();
+            let plugins = Rc::clone(&plugins);
+            crate::api::tool::set_local_describe(move |plugin, tool, dctx| {
+                run_describe(&lua, &plugins, plugin, tool, dctx)
+            });
+        }
 
         Ok(Self {
             lua,
             pending,
-            plugins: Rc::new(RefCell::new(HashMap::new())) as PluginMap,
+            plugins,
             live_tasks: Rc::new(RefCell::new(HashMap::new())),
             registry,
             tx,
@@ -647,6 +664,11 @@ impl LuaRuntime {
                     && let Err(e) = self.lua.remove_registry_value(sk)
                 {
                     tracing::warn!(plugin = name, error = %e, "failed to drop lua permission_scopes key");
+                }
+                if let Some(sk) = tk.describe
+                    && let Err(e) = self.lua.remove_registry_value(sk)
+                {
+                    tracing::warn!(plugin = name, error = %e, "failed to drop lua describe key");
                 }
             }
         }
@@ -794,6 +816,11 @@ impl LuaRuntime {
                 && let Err(e) = self.lua.remove_registry_value(sk)
             {
                 tracing::warn!(error = %e, "failed to drop lua permission_scopes key on rollback");
+            }
+            if let Some(sk) = t.describe_key
+                && let Err(e) = self.lua.remove_registry_value(sk)
+            {
+                tracing::warn!(error = %e, "failed to drop lua describe key on rollback");
             }
         }
     }
@@ -990,7 +1017,7 @@ impl LuaRuntime {
                     start_annotation: t.start_annotation.clone(),
                     start_input: t.start_input.clone(),
                     examples: t.examples.clone(),
-                    augment: t.augment,
+                    has_describe_fn: t.describe_key.is_some(),
                 });
                 (
                     tool,
@@ -1021,6 +1048,7 @@ impl LuaRuntime {
                         header: t.header_key,
                         restore: t.restore_key,
                         permission_scopes: t.permission_scopes_key,
+                        describe: t.describe_key,
                     },
                 )
             })
@@ -1407,6 +1435,34 @@ fn timeout_reply(handle: &TaskHandle, plugin: &str, tool: &str) -> ToolCallReply
     reply
 }
 
+fn run_describe(
+    lua: &Lua,
+    plugins: &PluginMap,
+    plugin: &str,
+    tool: &str,
+    dctx: &Value,
+) -> Option<String> {
+    let func: Function = {
+        let plugins_ref = plugins.borrow();
+        let key = plugins_ref.get(plugin)?.get(tool)?.describe.as_ref()?;
+        lua.registry_value(key).ok()?
+    };
+    let arg = match json_to_lua(lua, dctx) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(plugin, tool, error = %e, "describe dctx conversion failed");
+            return None;
+        }
+    };
+    match func.call::<String>(arg) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            tracing::warn!(plugin, tool, error = %e, "describe callback failed");
+            None
+        }
+    }
+}
+
 /// Two layers of deadline enforcement: the interrupt hook catches
 /// tight CPU loops, the dispatch loop catches I/O waits.
 #[allow(clippy::too_many_arguments)]
@@ -1768,6 +1824,15 @@ pub fn spawn(
                             if event == TURN_END_EVENT {
                                 rt.lua.gc_collect().ok();
                             }
+                        }
+                        Request::Describe {
+                            plugin,
+                            tool,
+                            dctx,
+                            reply,
+                        } => {
+                            let _ = reply
+                                .send(run_describe(&rt.lua, &rt.plugins, &plugin, &tool, &dctx));
                         }
                         Request::RunKeybindCallback { id } => {
                             let func = rt.lua.app_data_ref::<KeymapStore>().and_then(|store| {

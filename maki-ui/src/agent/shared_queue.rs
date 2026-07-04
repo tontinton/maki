@@ -195,7 +195,16 @@ mod tests {
         QueueItem::Message {
             text: "t".into(),
             image_count: 0,
-            input: AgentInput::default(),
+            input: AgentInput {
+                message: String::new(),
+                mode: Default::default(),
+                images: Vec::new(),
+                preamble: Vec::new(),
+                thinking: Default::default(),
+                fast: false,
+                workflow: false,
+                prompt: None,
+            },
             run_id: 0,
             displayed,
         }

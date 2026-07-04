@@ -5,6 +5,23 @@ pub(crate) fn err_pair(lua: &Lua, e: impl std::fmt::Display) -> LuaResult<(Value
     Ok((Value::Nil, Value::String(lua.create_string(e.to_string())?)))
 }
 
+pub(crate) const NIL_TOOL_RESULT_ERR: &str = "tool returned nil without an error message";
+
+pub(crate) fn lua_tool_result(values: mlua::MultiValue) -> Result<String, String> {
+    let mut iter = values.into_iter();
+    match iter.next() {
+        Some(Value::String(s)) => Ok(s.to_string_lossy()),
+        Some(Value::Nil) | None => match iter.next() {
+            Some(Value::String(err)) => Err(err.to_string_lossy()),
+            _ => Err(NIL_TOOL_RESULT_ERR.into()),
+        },
+        Some(other) => Err(format!(
+            "tool returned {} (expected string)",
+            other.type_name()
+        )),
+    }
+}
+
 /// Convert a [`serde_json::Value`] into a Lua value by hand.
 ///
 /// mlua's `to_value` looks like the easy path, but monty turns on serde_json's

@@ -24,6 +24,7 @@ pub(crate) struct SessionState {
     pub warnings: Vec<String>,
     pub thinking: ThinkingConfig,
     pub fast: bool,
+    pub workflow: bool,
 }
 
 const PLAN_FILE_MISSING_WARNING: &str = "Plan file was deleted \u{2014} started a new plan";
@@ -78,6 +79,7 @@ impl SessionState {
                 .filter(|_| model.supports_thinking())
                 .unwrap_or_default(),
             fast: session.meta.fast && model.supports_fast(),
+            workflow: session.meta.workflow,
             session,
             model,
             token_usage,
@@ -108,6 +110,7 @@ impl SessionState {
         self.session.meta.session_rules = rules_to_stored(&permissions.session_rules_snapshot());
         self.session.meta.thinking = Some(self.thinking.into());
         self.session.meta.fast = self.fast;
+        self.session.meta.workflow = self.workflow;
         self.session.updated_at = maki_storage::now_epoch();
         self.session.update_title_if_default();
     }

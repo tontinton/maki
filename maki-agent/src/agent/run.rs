@@ -16,7 +16,7 @@ use super::tool_dispatch::{self, RecentCalls};
 use crate::cancel::{CancelMap, CancelToken};
 use crate::mcp::McpHandle;
 use crate::permissions::PermissionManager;
-use crate::tools::{Deadline, FileReadTracker, ToolContext};
+use crate::tools::{Deadline, FileReadTracker, LocalTools, ToolAudience, ToolContext};
 use crate::{
     AgentConfig, AgentError, AgentEvent, AgentInput, AgentMode, EventSender, ExtractedCommand,
     InterruptSource, TurnCompleteEvent,
@@ -48,6 +48,7 @@ enum TurnOutcome {
     Done(Option<StopReason>),
 }
 
+#[derive(Clone)]
 pub struct AgentParams {
     pub provider: Arc<dyn Provider>,
     pub model: Model,
@@ -60,6 +61,7 @@ pub struct AgentParams {
     pub prompt_slots: Arc<crate::prompt::ResolvedSlots>,
     pub subagent_cancels: Arc<CancelMap<String>>,
     pub registry: Arc<crate::tools::ToolRegistry>,
+    pub audience: ToolAudience,
 }
 
 pub struct AgentRunParams<'h> {
@@ -100,6 +102,9 @@ pub struct Agent<'h> {
     prompt_slots: Arc<crate::prompt::ResolvedSlots>,
     subagent_cancels: Arc<crate::cancel::CancelMap<String>>,
     registry: Arc<crate::tools::ToolRegistry>,
+    audience: ToolAudience,
+    workflow: bool,
+    local_tools: LocalTools,
 }
 
 impl<'h> Agent<'h> {
@@ -135,6 +140,9 @@ impl<'h> Agent<'h> {
             prompt_slots: params.prompt_slots,
             subagent_cancels: params.subagent_cancels,
             registry: params.registry,
+            audience: params.audience,
+            workflow: false,
+            local_tools: LocalTools::default(),
         }
     }
 
@@ -161,6 +169,11 @@ impl<'h> Agent<'h> {
         self
     }
 
+    pub fn with_local_tools(mut self, local_tools: LocalTools) -> Self {
+        self.local_tools = local_tools;
+        self
+    }
+
     pub fn with_loaded_instructions(mut self, loaded: LoadedInstructions) -> Self {
         self.loaded_instructions = loaded;
         self
@@ -171,6 +184,7 @@ impl<'h> Agent<'h> {
         let msg = Message::user_with_images(input.message.clone(), input.images);
         self.history.push(msg);
         self.mode = input.mode;
+        self.workflow = input.workflow;
         self.opts = RequestOptions {
             thinking: input.thinking,
             fast: input.fast,
@@ -394,6 +408,9 @@ impl<'h> Agent<'h> {
             opts: self.opts,
             subagent_cancels: Arc::clone(&self.subagent_cancels),
             registry: Arc::clone(&self.registry),
+            workflow: self.workflow,
+            audience: self.audience,
+            local_tools: Arc::clone(&self.local_tools),
         }
     }
 
@@ -605,6 +622,7 @@ mod tests {
                 prompt_slots: Arc::new(crate::prompt::ResolvedSlots::default()),
                 subagent_cancels: Arc::new(crate::cancel::CancelMap::new()),
                 registry: Arc::new(crate::tools::ToolRegistry::with_natives()),
+                audience: ToolAudience::MAIN,
             },
             AgentRunParams {
                 history,
@@ -620,7 +638,12 @@ mod tests {
         AgentInput {
             message: "hello".into(),
             mode: AgentMode::Build,
-            ..Default::default()
+            images: Vec::new(),
+            preamble: Vec::new(),
+            thinking: Default::default(),
+            fast: false,
+            workflow: false,
+            prompt: None,
         }
     }
 
@@ -862,6 +885,7 @@ mod tests {
                     prompt_slots: Arc::new(crate::prompt::ResolvedSlots::default()),
                     subagent_cancels: Arc::new(crate::cancel::CancelMap::new()),
                     registry: Arc::new(crate::tools::ToolRegistry::with_natives()),
+                    audience: ToolAudience::MAIN,
                 },
                 AgentRunParams {
                     history: &mut history,

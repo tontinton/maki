@@ -144,6 +144,7 @@ pub fn run(
     timeouts: maki_providers::Timeouts,
     lua_handle: Option<EventHandle>,
     fast: bool,
+    workflow: bool,
 ) -> Result<()> {
     let prompt = match prompt_arg {
         Some(p) => p,
@@ -179,6 +180,7 @@ pub fn run(
         mcp_handle,
         initial_wd: cwd,
         fast,
+        workflow,
     });
 
     let HeadlessHandle {

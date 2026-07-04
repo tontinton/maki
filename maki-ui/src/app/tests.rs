@@ -2306,6 +2306,50 @@ fn fast_toggle_on_off_on_opus() {
     assert_eq!(app.status_bar.flash_text(), Some(FAST_OFF_MSG));
 }
 
+#[test]
+fn workflow_toggle_flows_into_agent_input() {
+    let mut app = test_app();
+    let msg = QueuedMessage {
+        text: "hi".into(),
+        images: Vec::new(),
+    };
+    assert!(!app.build_agent_input(&msg).workflow);
+
+    app.execute_command(cmd("/workflow"));
+    assert!(app.build_agent_input(&msg).workflow);
+    assert_eq!(app.status_bar.flash_text(), Some(WORKFLOW_ON_MSG));
+
+    app.execute_command(cmd("/workflow"));
+    assert!(!app.build_agent_input(&msg).workflow);
+    assert_eq!(app.status_bar.flash_text(), Some(WORKFLOW_OFF_MSG));
+}
+
+/// Workflow sessions have synthetic ids that no ToolDone matches, so
+/// SubagentHistory is what finishes their chat.
+#[test]
+fn subagent_history_finishes_workflow_chat() {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    app.update(subagent_msg(
+        AgentEvent::TextDelta { text: "sub".into() },
+        "session-abc",
+        Some("researcher"),
+    ));
+    assert_eq!(app.chats.len(), 2);
+    assert!(!app.chats[1].is_finished());
+
+    app.update(agent_msg_with_run_id(
+        AgentEvent::SubagentHistory {
+            tool_use_id: "session-abc".into(),
+            messages: vec![],
+        },
+        1,
+    ));
+    assert!(app.chats[1].is_finished());
+    assert_eq!(app.chats[1].last_message_text(), DONE_TEXT);
+}
+
 #[test_case("anthropic/claude-sonnet-4-5" ; "non_opus_anthropic")]
 #[test_case("openai/gpt-5.5" ; "non_anthropic")]
 fn fast_flashes_error_on_ineligible_model(spec: &str) {
