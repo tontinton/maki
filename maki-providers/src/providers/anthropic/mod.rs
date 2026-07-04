@@ -4,6 +4,7 @@
 pub(crate) mod bedrock;
 pub(crate) mod shared;
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -19,6 +20,7 @@ use crate::provider::{BoxFuture, Provider};
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
 
 use super::KeyPool;
+use super::transform::TransformProcess;
 
 const API_VERSION: &str = "2023-06-01";
 const MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
@@ -64,6 +66,7 @@ pub struct Anthropic {
     auth: Arc<Mutex<super::ResolvedAuth>>,
     key_pool: Option<KeyPool>,
     system_prefix: Option<String>,
+    transform: Option<PathBuf>,
     stream_timeout: Duration,
 }
 
@@ -77,6 +80,7 @@ impl Anthropic {
             auth: Arc::new(Mutex::new(resolved)),
             key_pool: Some(pool),
             system_prefix: None,
+            transform: None,
             stream_timeout: timeouts.stream,
         })
     }
@@ -90,12 +94,18 @@ impl Anthropic {
             auth,
             key_pool: None,
             system_prefix: None,
+            transform: None,
             stream_timeout: timeouts.stream,
         }
     }
 
     pub(crate) fn with_system_prefix(mut self, prefix: Option<String>) -> Self {
         self.system_prefix = prefix;
+        self
+    }
+
+    pub(crate) fn with_transform(mut self, path: Option<PathBuf>) -> Self {
+        self.transform = path;
         self
     }
 
@@ -119,6 +129,7 @@ impl Anthropic {
         event_tx: &Sender<ProviderEvent>,
         fast: bool,
         long_context: bool,
+        transform: Option<TransformProcess>,
     ) -> Result<StreamResponse, AgentError> {
         let json_body = serde_json::to_vec(body)?;
         let mut builder = self
@@ -138,11 +149,19 @@ impl Anthropic {
         let response = self.client.send_async(request).await?;
         let status = response.status().as_u16();
 
-        if status == 200 {
-            parse_sse(response, event_tx, self.stream_timeout).await
-        } else {
-            Err(AgentError::from_response(response).await)
+        if status != 200 {
+            return Err(AgentError::from_response(response).await);
         }
+
+        let stream_timeout = self.stream_timeout;
+        super::transform::stream_with_transform(
+            event_tx,
+            transform,
+            move |sink: Sender<ProviderEvent>| {
+                Box::pin(async move { parse_sse(response, &sink, stream_timeout).await })
+            },
+        )
+        .await
     }
 
     async fn do_list_models(&self) -> Result<Vec<crate::model::ModelInfo>, AgentError> {
@@ -231,7 +250,16 @@ impl Provider for Anthropic {
             let long_context = model.id.ends_with(shared::LONG_CONTEXT_SUFFIX);
 
             debug!(model = %model.id, num_messages = messages.len(), thinking = ?opts.thinking, fast, long_context, "sending API request");
-            self.do_stream_request(&body, event_tx, fast, long_context)
+
+            let (transform, body) = if let Some(path) = &self.transform {
+                let auth = self.auth.lock().unwrap().clone();
+                TransformProcess::spawn_and_request(Some(path), body, &auth.headers, &model.id)
+                    .await?
+            } else {
+                (None, body)
+            };
+
+            self.do_stream_request(&body, event_tx, fast, long_context, transform)
                 .await
         })
     }

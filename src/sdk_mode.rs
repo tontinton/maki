@@ -434,6 +434,7 @@ pub struct SdkParams {
     pub timeouts: Timeouts,
     pub prompt_slots: ResolvedSlots,
     pub fast: bool,
+    pub hooks: Option<Arc<dyn maki_agent::agent::ProviderHookSink + Send + Sync>>,
 }
 
 struct Shared {
@@ -452,6 +453,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         timeouts,
         prompt_slots,
         fast,
+        hooks,
     } = params;
     cli.warn_ignored_flags();
     if let Some(max) = cli.max_turns {
@@ -483,6 +485,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         yolo: permission_mode == PermissionMode::BypassPermissions,
         system_prompt_override: cli.system_prompt.clone().filter(|s| !s.is_empty()),
         append_system_prompt: cli.append_system_prompt.clone().filter(|s| !s.is_empty()),
+        hooks,
     });
 
     let (out_tx, out_rx) = flume::unbounded::<String>();

@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use flume::Sender;
@@ -35,6 +36,7 @@ pub struct OpenAi {
     auth: Arc<Mutex<ResolvedAuth>>,
     storage: Option<StateDir>,
     system_prefix: Option<String>,
+    transform: Option<PathBuf>,
 }
 
 impl OpenAi {
@@ -47,6 +49,7 @@ impl OpenAi {
             auth: Arc::new(Mutex::new(resolved)),
             storage: Some(storage),
             system_prefix: None,
+            transform: None,
         })
     }
 
@@ -59,11 +62,18 @@ impl OpenAi {
             auth,
             storage: None,
             system_prefix: None,
+            transform: None,
         }
     }
 
     pub(crate) fn with_system_prefix(mut self, prefix: Option<String>) -> Self {
         self.system_prefix = prefix;
+        self
+    }
+
+    pub(crate) fn with_transform(mut self, path: Option<PathBuf>) -> Self {
+        self.compat = self.compat.with_transform(path.clone());
+        self.transform = path;
         self
     }
 
@@ -164,6 +174,7 @@ impl Provider for OpenAi {
                             event_tx,
                             &codex_auth,
                             stream_timeout,
+                            self.transform.as_deref(),
                         )
                         .await
                     })

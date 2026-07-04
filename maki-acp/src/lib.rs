@@ -6,6 +6,7 @@ pub mod translate;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use maki_agent::agent::ProviderHookSink;
 use maki_agent::prompt::ResolvedSlots;
 use maki_agent::{AgentConfig, PermissionsConfig};
 use maki_providers::Timeouts;
@@ -20,6 +21,7 @@ pub struct AcpParams {
     pub mcp_handle: Option<maki_agent::McpHandle>,
     pub prompt_slots: Arc<ResolvedSlots>,
     pub yolo: bool,
+    pub hooks: Option<Arc<dyn ProviderHookSink + Send + Sync>>,
 }
 
 pub fn run(params: AcpParams) -> color_eyre::Result<()> {

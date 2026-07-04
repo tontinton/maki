@@ -58,6 +58,12 @@ pub fn run(model_arg: Option<String>, yolo: bool) -> Result<()> {
         .map(|h| h.collect_prompt_slots())
         .unwrap_or_default();
 
+    let hooks = plugin_host
+        .event_handle()
+        .map(|h| Arc::new(h) as Arc<dyn maki_agent::agent::ProviderHookSink + Send + Sync>);
+
+    let _plugin_host = plugin_host;
+
     maki_acp::run(maki_acp::AcpParams {
         model,
         config: config.agent,
@@ -67,5 +73,6 @@ pub fn run(model_arg: Option<String>, yolo: bool) -> Result<()> {
         mcp_handle,
         prompt_slots: Arc::new(prompt_slots),
         yolo,
+        hooks,
     })
 }

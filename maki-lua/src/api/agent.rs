@@ -307,7 +307,8 @@ async fn run(lua: Lua, (agent_ctx_ud, opts): (mlua::AnyUserData, Table)) -> LuaR
     )
     .with_user_response_rx(answer_rx)
     .with_cancel(child_cancel)
-    .with_mcp(agent_ctx.mcp.clone());
+    .with_mcp(agent_ctx.mcp.clone())
+    .with_provider_hooks(agent_ctx.hooks.clone());
 
     let start = Instant::now();
     let result = agent.run(input).await;

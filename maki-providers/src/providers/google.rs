@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -15,6 +16,7 @@ use crate::{
     StreamResponse, ThinkingConfig, TokenUsage,
 };
 
+use super::transform::TransformProcess;
 use super::{KeyPool, ResolvedAuth, http_client, next_sse_line};
 
 const BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
@@ -94,6 +96,7 @@ pub struct Google {
     auth: Arc<Mutex<ResolvedAuth>>,
     key_pool: Option<KeyPool>,
     stream_timeout: Duration,
+    transform: Option<PathBuf>,
 }
 
 impl Google {
@@ -105,6 +108,7 @@ impl Google {
             auth: Arc::new(Mutex::new(resolved)),
             key_pool: Some(pool),
             stream_timeout: timeouts.stream,
+            transform: None,
         })
     }
 
@@ -117,7 +121,13 @@ impl Google {
             auth,
             key_pool: None,
             stream_timeout: timeouts.stream,
+            transform: None,
         }
+    }
+
+    pub(crate) fn with_transform(mut self, path: Option<PathBuf>) -> Self {
+        self.transform = path;
+        self
     }
 
     fn build_request(&self, method: &str, url: &str) -> isahc::http::request::Builder {
@@ -199,6 +209,14 @@ impl Google {
         thinking: ThinkingConfig,
     ) -> Result<StreamResponse, AgentError> {
         let body = self.build_body(model, messages, system, tools, thinking);
+        let auth = self.auth.lock().unwrap().clone();
+        let (transform, body) = TransformProcess::spawn_and_request(
+            self.transform.as_deref(),
+            body,
+            &auth.headers,
+            &model.id,
+        )
+        .await?;
         let url = self.stream_url(&model.id);
         let json_body = serde_json::to_vec(&body)?;
 
@@ -210,11 +228,21 @@ impl Google {
         let response = self.client.send_async(request).await?;
         let status = response.status().as_u16();
 
-        if status == 200 {
-            parse_sse(response, event_tx, self.stream_timeout).await
-        } else {
-            Err(AgentError::from_response(response).await)
+        if status != 200 {
+            if let Some(tf) = transform {
+                tf.shutdown().await;
+            }
+            return Err(AgentError::from_response(response).await);
         }
+        let stream_timeout = self.stream_timeout;
+        super::transform::stream_with_transform(
+            event_tx,
+            transform,
+            move |sink: Sender<ProviderEvent>| {
+                Box::pin(async move { parse_sse(response, &sink, stream_timeout).await })
+            },
+        )
+        .await
     }
 }
 

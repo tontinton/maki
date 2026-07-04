@@ -148,6 +148,9 @@ pub fn run(cli: Cli) -> Result<()> {
             timeouts,
             prompt_slots,
             fast,
+            hooks: plugin_host
+                .event_handle()
+                .map(|h| Arc::new(h) as Arc<dyn maki_agent::agent::ProviderHookSink + Send + Sync>),
         })
         .context("run sdk mode")?;
     } else if cli.print {

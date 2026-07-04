@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use event_listener::Event;
 
 use include_dir::Dir;
+use maki_agent::AgentError;
 use maki_agent::cancel::CancelToken;
 use maki_agent::prompt::{PromptId, ResolvedSlots, Slot, SlotEntry};
 use maki_agent::tools::{
@@ -26,12 +27,14 @@ use crate::api::create_maki_global;
 use crate::api::r#fn::{JobEvent, JobStore};
 use crate::api::keymap::KeymapReader;
 use crate::api::keymap::{KeymapStore, KeymapWriter};
+use crate::api::provider_hooks::ProviderHookStore;
 use crate::api::tool::{LuaTool, PendingTool, PendingTools, ToolCallReply};
 use crate::api::ui::HintStore;
 use crate::api::ui::buf::{BufHandle, BufferStore};
 use crate::api::util::command::{CommandHandlerMap, HintWriter, publish_command_snapshot};
 use crate::api::util::command::{LuaCommandReader, LuaCommandWriter, UiAction};
 use crate::api::util::convert::json_to_lua;
+use crate::api::util::convert::lua_to_json;
 use crate::api::util::ctx::LuaCtx;
 use crate::api::util::setup::ConfigStore;
 use crate::error::PluginError;
@@ -49,6 +52,7 @@ const GC_STEP_INTERVAL: usize = 4;
 const INTERRUPT_CANCEL_CHECK_INTERVAL: u32 = 128;
 const ASYNC_RUN_DEFAULT_DEADLINE: Duration = Duration::from_secs(60);
 const TURN_END_EVENT: &str = "TurnEnd";
+const PROVIDER_HOOKS_TOOL: &str = "provider_hooks";
 /// Without a cap, a runaway plugin OOM-kills the whole process.
 /// With one, it hits a catchable Lua error instead.
 const LUA_MEMORY_LIMIT: usize = 512 * 1024 * 1024;
@@ -130,6 +134,12 @@ pub enum Request {
     },
     ClickTool {
         tool_use_id: String,
+    },
+    RunProviderHooks {
+        stage: String,
+        slug: String,
+        ctx: Value,
+        reply: flume::Sender<Result<Value, AgentError>>,
     },
     RunKeybindCallback {
         id: u64,
@@ -614,6 +624,7 @@ impl LuaRuntime {
         lua.set_app_data(command_writer);
         lua.set_app_data(PromptHintCallbacks::default());
         lua.set_app_data(AutocmdStore::default());
+        lua.set_app_data(ProviderHookStore::default());
         lua.set_app_data(KeymapStore::new());
         lua.set_app_data(keymap_writer);
         lua.set_app_data(HintStore::new());
@@ -770,6 +781,68 @@ impl LuaRuntime {
             }
         }
         slots
+    }
+
+    async fn run_provider_hooks(
+        &self,
+        stage: &str,
+        slug: &str,
+        ctx: Value,
+    ) -> Result<Value, AgentError> {
+        let entries: Vec<(Arc<str>, Function)> = {
+            let Some(store) = self.lua.app_data_ref::<ProviderHookStore>() else {
+                return Ok(ctx);
+            };
+            let Some(list) = store.listeners.get(stage) else {
+                return Ok(ctx);
+            };
+            let mut filtered: Vec<(Arc<str>, Function)> = list
+                .iter()
+                .filter(|e| e.slug_filter.as_deref().is_none_or(|s| s == slug))
+                .filter_map(|e| {
+                    self.lua
+                        .registry_value::<Function>(&e.callback)
+                        .map(|f| (Arc::clone(&e.plugin), f))
+                        .ok()
+                })
+                .collect();
+            filtered.sort_by(|a, b| a.0.cmp(&b.0));
+            filtered
+        };
+
+        if entries.is_empty() {
+            return Ok(ctx);
+        }
+
+        let mut current = json_to_lua(&self.lua, &ctx).map_err(|e| AgentError::Tool {
+            tool: PROVIDER_HOOKS_TOOL.into(),
+            message: e.to_string(),
+        })?;
+
+        for (plugin, func) in entries {
+            let result: mlua::Result<LuaValue> = run_detached(&self.lua, async {
+                let thread = self.lua.create_thread(func)?;
+                thread.into_async::<LuaValue>(current.clone())?.await
+            })
+            .await;
+            match result {
+                Ok(LuaValue::Table(t)) if t.get::<bool>("stop").unwrap_or(false) => {
+                    if let Ok(Some(v)) = t.get::<Option<LuaValue>>("value") {
+                        current = v;
+                    }
+                    break;
+                }
+                Ok(ret) => current = ret,
+                Err(e) => {
+                    tracing::warn!(plugin = %plugin, stage, error = %e, "provider hook failed; skipping");
+                }
+            }
+        }
+
+        lua_to_json(&current).map_err(|e| AgentError::Tool {
+            tool: PROVIDER_HOOKS_TOOL.into(),
+            message: e.to_string(),
+        })
     }
 
     fn drain_pending(&self) -> Vec<PendingTool> {
@@ -1034,6 +1107,13 @@ impl LuaRuntime {
         self.registry.clear_plugin(plugin);
         self.drop_plugin_keys(plugin);
         if let Some(mut store) = self.lua.app_data_mut::<AutocmdStore>() {
+            let keys = store.clear_plugin(plugin);
+            drop(store);
+            for key in keys {
+                let _ = self.lua.remove_registry_value(key);
+            }
+        }
+        if let Some(mut store) = self.lua.app_data_mut::<ProviderHookStore>() {
             let keys = store.clear_plugin(plugin);
             drop(store);
             for key in keys {
@@ -1768,6 +1848,10 @@ pub fn spawn(
                             if event == TURN_END_EVENT {
                                 rt.lua.gc_collect().ok();
                             }
+                        }
+                        Request::RunProviderHooks { stage, slug, ctx, reply } => {
+                            let res = rt.run_provider_hooks(&stage, &slug, ctx).await;
+                            let _ = reply.send(res);
                         }
                         Request::RunKeybindCallback { id } => {
                             let func = rt.lua.app_data_ref::<KeymapStore>().and_then(|store| {

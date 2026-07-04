@@ -13,7 +13,7 @@ use maki_storage::sessions::Session;
 use serde_json::Value;
 use tracing::{error, warn};
 
-use crate::agent::{self, History};
+use crate::agent::{self, History, ProviderHookSink};
 use crate::cancel::{CancelMap, CancelToken};
 use crate::permissions::PermissionManager;
 use crate::prompt::ResolvedSlots;
@@ -77,6 +77,7 @@ pub struct HeadlessParams {
     pub mcp_handle: Option<McpHandle>,
     pub initial_wd: PathBuf,
     pub fast: bool,
+    pub hooks: Option<Arc<dyn ProviderHookSink + Send + Sync>>,
 }
 
 pub struct HeadlessHandle {
@@ -201,7 +202,8 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
                 },
             )
             .with_loaded_instructions(instructions.loaded)
-            .with_mcp(params.mcp_handle);
+            .with_mcp(params.mcp_handle)
+            .with_provider_hooks(params.hooks);
 
             let result = agent
                 .run(AgentInput {
@@ -249,6 +251,7 @@ pub struct InteractiveParams {
     pub yolo: bool,
     pub system_prompt_override: Option<String>,
     pub append_system_prompt: Option<String>,
+    pub hooks: Option<Arc<dyn ProviderHookSink + Send + Sync>>,
 }
 
 pub struct InteractiveHandle {
@@ -399,7 +402,8 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                 .with_loaded_instructions(instructions.loaded.clone())
                 .with_user_response_rx(Arc::clone(&answer_rx))
                 .with_cancel(cancel)
-                .with_mcp(params.mcp_handle.clone());
+                .with_mcp(params.mcp_handle.clone())
+                .with_provider_hooks(params.hooks.clone());
 
                 let result = agent.run(input).await;
                 drop(agent);

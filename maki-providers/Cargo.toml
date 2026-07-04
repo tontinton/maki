@@ -23,6 +23,9 @@ wait-timeout = { workspace = true }
 fastrand = { workspace = true }
 maki-config = { workspace = true }
 inventory = { workspace = true }
+async-process = { workspace = true }
+async-lock = { workspace = true }
+libc = { workspace = true }
 
 [dev-dependencies]
 test-case = { workspace = true }

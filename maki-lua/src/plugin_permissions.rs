@@ -13,15 +13,17 @@ pub enum Permission {
     Net,
     Run,
     Env,
+    ProviderHooks,
 }
 
 impl Permission {
-    const ALL: [Permission; 5] = [
+    const ALL: [Permission; 6] = [
         Permission::FsRead,
         Permission::FsWrite,
         Permission::Net,
         Permission::Run,
         Permission::Env,
+        Permission::ProviderHooks,
     ];
 
     fn manifest_key(self) -> &'static str {
@@ -31,6 +33,7 @@ impl Permission {
             Permission::Net => "net",
             Permission::Run => "run",
             Permission::Env => "env",
+            Permission::ProviderHooks => "provider_hooks",
         }
     }
 }
@@ -43,17 +46,17 @@ impl fmt::Display for Permission {
 
 #[derive(Debug, Clone)]
 pub struct PluginPermissions {
-    allowed: [bool; 5],
+    allowed: [bool; 6],
 }
 
 impl PluginPermissions {
     pub fn trusted() -> Self {
-        Self { allowed: [true; 5] }
+        Self { allowed: [true; 6] }
     }
 
     pub fn denied() -> Self {
         Self {
-            allowed: [false; 5],
+            allowed: [false; 6],
         }
     }
 
@@ -63,7 +66,7 @@ impl PluginPermissions {
 
     pub fn from_manifest(manifest: &toml::Value) -> Self {
         let perms = manifest.get("permissions");
-        let mut allowed = [true; 5];
+        let mut allowed = [true; 6];
         for perm in Permission::ALL {
             allowed[perm as usize] = perms
                 .and_then(|p| p.get(perm.manifest_key()))
@@ -178,6 +181,7 @@ mod tests {
         assert!(!p.is_allowed(Permission::Net));
         assert!(p.is_allowed(Permission::Run));
         assert!(p.is_allowed(Permission::Env));
+        assert!(p.is_allowed(Permission::ProviderHooks));
     }
 
     #[test]
@@ -199,6 +203,7 @@ mod tests {
         assert!(!p.is_allowed(Permission::Net));
         assert!(!p.is_allowed(Permission::Run));
         assert!(p.is_allowed(Permission::Env));
+        assert!(p.is_allowed(Permission::ProviderHooks));
     }
 
     #[test]

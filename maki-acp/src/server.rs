@@ -175,6 +175,7 @@ fn spawn_session(
         yolo: params.yolo,
         system_prompt_override: None,
         append_system_prompt: None,
+        hooks: params.hooks.clone(),
     })
 }
 

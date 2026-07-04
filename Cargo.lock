@@ -2571,6 +2571,8 @@ dependencies = [
 name = "maki-providers"
 version = "0.3.23"
 dependencies = [
+ "async-lock",
+ "async-process",
  "base64",
  "fastrand",
  "flume 0.11.1",
@@ -2579,6 +2581,7 @@ dependencies = [
  "hmac",
  "inventory",
  "isahc",
+ "libc",
  "maki-config",
  "maki-storage",
  "serde",

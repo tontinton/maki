@@ -244,7 +244,12 @@ impl AgentLoop {
         .with_user_response_rx(Arc::clone(&self.answer_rx))
         .with_interrupt_source(Arc::clone(&self.queue) as Arc<dyn maki_agent::InterruptSource>)
         .with_cancel(cancel)
-        .with_mcp(self.mcp_handle.clone());
+        .with_mcp(self.mcp_handle.clone())
+        .with_provider_hooks(
+            self.lua_handle
+                .clone()
+                .map(|h| Arc::new(h) as Arc<dyn maki_agent::agent::ProviderHookSink + Send + Sync>),
+        );
 
         let result = agent.run(input).await;
         drop(agent);

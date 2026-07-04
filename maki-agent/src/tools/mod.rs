@@ -192,6 +192,7 @@ pub struct ToolContext {
     pub prompt_slots: Arc<crate::prompt::ResolvedSlots>,
     pub opts: RequestOptions,
     pub subagent_cancels: Arc<CancelMap<String>>,
+    pub hooks: Option<Arc<dyn crate::agent::ProviderHookSink + Send + Sync>>,
 }
 
 pub(crate) fn resolve_path(path: &str) -> Result<String, String> {
@@ -602,6 +603,7 @@ pub fn interpreter_ctx(
         prompt_slots: Arc::new(crate::prompt::ResolvedSlots::default()),
         opts: RequestOptions::default(),
         subagent_cancels: Arc::new(CancelMap::new()),
+        hooks: None,
     }
 }
 

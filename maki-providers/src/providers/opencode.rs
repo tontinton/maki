@@ -16,6 +16,7 @@ use crate::provider::{BoxFuture, Provider};
 use crate::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use crate::{AgentError, EffortScale, Message, ProviderEvent, RequestOptions, StreamResponse};
 
+use super::transform::TransformProcess;
 use super::{ResolvedAuth, http_client};
 use crate::providers::anthropic::shared;
 
@@ -195,6 +196,7 @@ pub struct Opencode {
     chat_compat: OpenAiCompatProvider,
     auth: Option<Arc<Mutex<ResolvedAuth>>>,
     system_prefix: Option<String>,
+    transform: Option<PathBuf>,
     stream_timeout: Duration,
 }
 
@@ -208,6 +210,7 @@ impl Opencode {
             chat_compat: OpenAiCompatProvider::new(&CATALOG_CHAT_CONFIG, timeouts),
             auth,
             system_prefix: None,
+            transform: None,
             stream_timeout: timeouts.stream,
         }
     }
@@ -222,6 +225,12 @@ impl Opencode {
 
     pub(crate) fn with_system_prefix(mut self, prefix: Option<String>) -> Self {
         self.system_prefix = prefix;
+        self
+    }
+
+    pub(crate) fn with_transform(mut self, path: Option<PathBuf>) -> Self {
+        self.chat_compat = self.chat_compat.with_transform(path.clone());
+        self.transform = path;
         self
     }
 
@@ -273,6 +282,15 @@ impl Opencode {
         );
         body["model"] = json!(model.id);
         body["stream"] = json!(true);
+
+        let (transform, body) = TransformProcess::spawn_and_request(
+            self.transform.as_deref(),
+            body,
+            &auth.headers,
+            &model.id,
+        )
+        .await?;
+
         let json_body = serde_json::to_vec(&body)?;
         let mut rb = Request::builder()
             .method("POST")
@@ -294,11 +312,21 @@ impl Opencode {
         let response = self.client.send_async(request).await?;
         let status = response.status().as_u16();
 
-        if status == 200 {
-            crate::providers::anthropic::parse_sse(response, event_tx, self.stream_timeout).await
-        } else {
-            Err(AgentError::from_response(response).await)
+        if status != 200 {
+            return Err(AgentError::from_response(response).await);
         }
+
+        let stream_timeout = self.stream_timeout;
+        super::transform::stream_with_transform(
+            event_tx,
+            transform,
+            move |sink: Sender<ProviderEvent>| {
+                Box::pin(async move {
+                    crate::providers::anthropic::parse_sse(response, &sink, stream_timeout).await
+                })
+            },
+        )
+        .await
     }
 }
 

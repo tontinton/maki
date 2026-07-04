@@ -343,6 +343,24 @@ impl EventHandle {
         rx.recv_async().await.unwrap_or_default()
     }
 
+    pub async fn run_provider_hooks(
+        &self,
+        stage: &str,
+        slug: &str,
+        ctx: serde_json::Value,
+    ) -> Result<serde_json::Value, maki_agent::AgentError> {
+        let (tx, rx) = flume::bounded(1);
+        let _ = self.tx.send(Request::RunProviderHooks {
+            stage: stage.to_owned(),
+            slug: slug.to_owned(),
+            ctx,
+            reply: tx,
+        });
+        rx.recv_async()
+            .await
+            .map_err(|_| maki_agent::AgentError::Channel)?
+    }
+
     pub fn request_restore(&self, item: RestoreItem, event_tx: maki_agent::EventSender) {
         let _ = self.tx.send(Request::RestoreToolAsync { item, event_tx });
     }
@@ -364,6 +382,18 @@ impl EventHandle {
 
     pub fn run_keybind_callback(&self, id: u64) {
         let _ = self.tx.try_send(Request::RunKeybindCallback { id });
+    }
+}
+
+impl maki_agent::agent::ProviderHookSink for EventHandle {
+    fn run_hooks<'a>(
+        &'a self,
+        stage: &'a str,
+        slug: &'a str,
+        ctx: serde_json::Value,
+    ) -> maki_providers::provider::BoxFuture<'a, Result<serde_json::Value, maki_agent::AgentError>>
+    {
+        Box::pin(async move { self.run_provider_hooks(stage, slug, ctx).await })
     }
 }
 

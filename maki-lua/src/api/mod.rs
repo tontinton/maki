@@ -9,6 +9,8 @@ pub(crate) mod json;
 pub(crate) mod keymap;
 pub(crate) mod log;
 pub(crate) mod net;
+pub(crate) mod provider;
+pub(crate) mod provider_hooks;
 pub(crate) mod text;
 pub(crate) mod tool;
 pub(crate) mod treesitter;
@@ -57,6 +59,10 @@ pub(crate) fn create_maki_global(
         interpreter::create_interpreter_table(lua, permissions)?,
     )?;
     agent::register(lua, &maki)?;
+    maki.set(
+        "provider",
+        provider::create_provider_table(lua, Arc::clone(&plugin), permissions)?,
+    )?;
     maki.set(
         "keymap",
         keymap::create_keymap_table(lua, Arc::clone(&plugin))?,

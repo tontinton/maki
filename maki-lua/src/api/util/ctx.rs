@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use maki_agent::agent::LoadedInstructions;
+use maki_agent::agent::{LoadedInstructions, ProviderHookSink};
 use maki_agent::cancel::{CancelMap, CancelToken};
 use maki_agent::mcp::McpHandle;
 use maki_agent::permissions::PermissionManager;
@@ -47,6 +47,7 @@ pub(crate) struct AgentContext {
     pub(crate) config: AgentConfig,
     pub(crate) file_tracker: Arc<FileReadTracker>,
     pub(crate) user_response_rx: Option<Arc<async_lock::Mutex<flume::Receiver<String>>>>,
+    pub(crate) hooks: Option<Arc<dyn ProviderHookSink + Send + Sync>>,
 }
 
 impl From<&maki_agent::tools::ToolContext> for AgentContext {
@@ -67,6 +68,7 @@ impl From<&maki_agent::tools::ToolContext> for AgentContext {
             config: ctx.config.clone(),
             file_tracker: Arc::clone(&ctx.file_tracker),
             user_response_rx: ctx.user_response_rx.clone(),
+            hooks: ctx.hooks.clone(),
         }
     }
 }

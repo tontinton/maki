@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use flume::Sender;
@@ -6,6 +8,7 @@ use isahc::{HttpClient, Request};
 use serde_json::{Value, json};
 use tracing::{debug, warn};
 
+use super::super::transform::TransformProcess;
 use crate::providers::ResolvedAuth;
 use crate::{
     AgentError, ContentBlock, Message, ProviderEvent, Role, StopReason, StreamResponse, TokenUsage,
@@ -143,11 +146,22 @@ pub(crate) async fn do_stream(
     event_tx: &Sender<ProviderEvent>,
     auth: &ResolvedAuth,
     stream_timeout: Duration,
+    transform_path: Option<&Path>,
 ) -> Result<StreamResponse, AgentError> {
     let base = auth.base_url.as_deref().ok_or_else(|| AgentError::Config {
         message: "Responses API requires a base_url in auth".into(),
     })?;
-    let json_body = serde_json::to_vec(body)?;
+    let transform = if let Some(path) = transform_path {
+        Some(TransformProcess::spawn(path)?)
+    } else {
+        None
+    };
+    let body = if let Some(tf) = &transform {
+        Cow::Owned(tf.request(body, &auth.headers, &model.id).await?)
+    } else {
+        Cow::Borrowed(body)
+    };
+    let json_body = serde_json::to_vec(&body)?;
 
     let mut builder = Request::builder()
         .method("POST")
@@ -168,16 +182,23 @@ pub(crate) async fn do_stream(
     let response = client.send_async(request).await?;
     let status = response.status().as_u16();
 
-    if status == 200 {
-        parse_sse(
-            BufReader::new(response.into_body()),
-            event_tx,
-            stream_timeout,
-        )
-        .await
-    } else {
-        Err(AgentError::from_response(response).await)
+    if status != 200 {
+        if let Some(tf) = transform {
+            tf.shutdown().await;
+        }
+        return Err(AgentError::from_response(response).await);
     }
+
+    super::super::transform::stream_with_transform(
+        event_tx,
+        transform,
+        move |sink: Sender<ProviderEvent>| {
+            Box::pin(async move {
+                parse_sse(BufReader::new(response.into_body()), &sink, stream_timeout).await
+            })
+        },
+    )
+    .await
 }
 
 struct ToolAccumulator {

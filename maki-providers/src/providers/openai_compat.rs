@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use flume::Sender;
@@ -8,6 +9,7 @@ use serde_json::{Value, json};
 use tracing::{debug, warn};
 
 use super::ResolvedAuth;
+use super::transform::TransformProcess;
 use crate::{
     AgentError, ContentBlock, Message, ProviderEvent, Role, StopReason, StreamResponse, TokenUsage,
 };
@@ -26,6 +28,7 @@ pub(crate) struct OpenAiCompatProvider {
     client: HttpClient,
     config: &'static OpenAiCompatConfig,
     stream_timeout: Duration,
+    transform: Option<PathBuf>,
 }
 
 impl OpenAiCompatProvider {
@@ -34,7 +37,13 @@ impl OpenAiCompatProvider {
             client: super::http_client(timeouts),
             config,
             stream_timeout: timeouts.stream,
+            transform: None,
         }
+    }
+
+    pub(crate) fn with_transform(mut self, path: Option<PathBuf>) -> Self {
+        self.transform = path;
+        self
     }
 
     pub(crate) fn client(&self) -> &HttpClient {
@@ -145,7 +154,14 @@ impl OpenAiCompatProvider {
         event_tx: &Sender<ProviderEvent>,
         auth: &ResolvedAuth,
     ) -> Result<StreamResponse, AgentError> {
-        let json_body = serde_json::to_vec(body)?;
+        let (transform, body) = TransformProcess::spawn_and_request(
+            self.transform.as_deref(),
+            body.clone(),
+            &auth.headers,
+            &model.id,
+        )
+        .await?;
+        let json_body = serde_json::to_vec(&body)?;
         let mut request = self
             .build_request("POST", "/chat/completions", auth)
             .header("content-type", "application/json");
@@ -164,16 +180,24 @@ impl OpenAiCompatProvider {
         let response = self.client.send_async(request).await?;
         let status = response.status().as_u16();
 
-        if status == 200 {
-            parse_sse(
-                BufReader::new(response.into_body()),
-                event_tx,
-                self.stream_timeout,
-            )
-            .await
-        } else {
-            Err(AgentError::from_response(response).await)
+        if status != 200 {
+            if let Some(tf) = transform {
+                tf.shutdown().await;
+            }
+            return Err(AgentError::from_response(response).await);
         }
+
+        let stream_timeout = self.stream_timeout;
+        super::transform::stream_with_transform(
+            event_tx,
+            transform,
+            move |sink: Sender<ProviderEvent>| {
+                Box::pin(async move {
+                    parse_sse(BufReader::new(response.into_body()), &sink, stream_timeout).await
+                })
+            },
+        )
+        .await
     }
 
     pub async fn fetch_and_parse_models(

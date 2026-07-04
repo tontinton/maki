@@ -8,6 +8,7 @@
 //! Check their docs before changing anything here.
 
 use std::io::{self, Read};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use clap::ValueEnum;
@@ -160,6 +161,8 @@ pub fn run(
         mcp_handle,
         initial_wd: cwd,
         fast,
+        hooks: lua_handle
+            .map(|h| Arc::new(h) as Arc<dyn maki_agent::agent::ProviderHookSink + Send + Sync>),
     });
 
     let HeadlessHandle {

@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use flume::Sender;
@@ -105,6 +106,11 @@ impl Synthetic {
             key_pool: None,
             system_prefix: None,
         }
+    }
+
+    pub(crate) fn with_transform(mut self, path: Option<PathBuf>) -> Self {
+        self.compat = self.compat.with_transform(path);
+        self
     }
 
     pub(crate) fn with_system_prefix(mut self, prefix: Option<String>) -> Self {

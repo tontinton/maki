@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -11,6 +12,7 @@ use tracing::{debug, warn};
 
 use super::openai::responses;
 use super::openai_compat;
+use super::transform::TransformProcess;
 use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier};
 use crate::provider::{BoxFuture, Provider};
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig};
@@ -90,6 +92,7 @@ pub struct Copilot {
     auth: Arc<Mutex<Option<CopilotAuth>>>,
     resolved_auth: Option<Arc<Mutex<super::ResolvedAuth>>>,
     system_prefix: Option<String>,
+    transform: Option<PathBuf>,
     models: Arc<Mutex<HashMap<String, CopilotModel>>>,
 }
 
@@ -102,6 +105,7 @@ impl Copilot {
             auth: Arc::default(),
             resolved_auth: None,
             system_prefix: None,
+            transform: None,
             models: Arc::default(),
         })
     }
@@ -116,12 +120,18 @@ impl Copilot {
             auth: Arc::default(),
             resolved_auth: Some(auth),
             system_prefix: None,
+            transform: None,
             models: Arc::default(),
         }
     }
 
     pub(crate) fn with_system_prefix(mut self, prefix: Option<String>) -> Self {
         self.system_prefix = prefix;
+        self
+    }
+
+    pub(crate) fn with_transform(mut self, path: Option<PathBuf>) -> Self {
+        self.transform = path;
         self
     }
 
@@ -217,6 +227,10 @@ impl Copilot {
             body["tools"] = wire_tools;
         }
 
+        let (transform, body) =
+            TransformProcess::spawn_and_request(self.transform.as_deref(), body, &[], &model.id)
+                .await?;
+
         let request = self
             .build_post(
                 &auth,
@@ -226,16 +240,28 @@ impl Copilot {
             )?
             .body(serde_json::to_vec(&body)?)?;
         let response = self.client.send_async(request).await?;
-        if response.status().is_success() {
-            openai_compat::parse_sse(
-                BufReader::new(response.into_body()),
-                event_tx,
-                self.stream_timeout,
-            )
-            .await
-        } else {
-            Err(AgentError::from_response(response).await)
+        if !response.status().is_success() {
+            if let Some(tf) = transform {
+                tf.shutdown().await;
+            }
+            return Err(AgentError::from_response(response).await);
         }
+        let stream_timeout = self.stream_timeout;
+        super::transform::stream_with_transform(
+            event_tx,
+            transform,
+            move |sink: Sender<ProviderEvent>| {
+                Box::pin(async move {
+                    openai_compat::parse_sse(
+                        BufReader::new(response.into_body()),
+                        &sink,
+                        stream_timeout,
+                    )
+                    .await
+                })
+            },
+        )
+        .await
     }
 
     async fn stream_responses(
@@ -259,6 +285,7 @@ impl Copilot {
             event_tx,
             &resolved,
             self.stream_timeout,
+            self.transform.as_deref(),
         )
         .await
     }
@@ -283,16 +310,32 @@ impl Copilot {
         });
         thinking.apply_to_body(&mut body, &model.id);
 
+        let (transform, body) =
+            TransformProcess::spawn_and_request(self.transform.as_deref(), body, &[], &model.id)
+                .await?;
+
         let request = self
             .build_post(&auth, MESSAGES_PATH, Some("conversation-agent"), &body)?
             .header("anthropic-version", "2023-06-01")
             .body(serde_json::to_vec(&body)?)?;
         let response = self.client.send_async(request).await?;
-        if response.status().is_success() {
-            super::anthropic::parse_sse(response, event_tx, self.stream_timeout).await
-        } else {
-            Err(AgentError::from_response(response).await)
+        if !response.status().is_success() {
+            if let Some(tf) = transform {
+                tf.shutdown().await;
+            }
+            return Err(AgentError::from_response(response).await);
         }
+        let stream_timeout = self.stream_timeout;
+        super::transform::stream_with_transform(
+            event_tx,
+            transform,
+            move |sink: Sender<ProviderEvent>| {
+                Box::pin(async move {
+                    super::anthropic::parse_sse(response, &sink, stream_timeout).await
+                })
+            },
+        )
+        .await
     }
 
     fn build_post(

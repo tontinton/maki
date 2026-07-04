@@ -11,6 +11,7 @@ use maki_providers::{
 use super::compaction::{self, CONTINUE_AFTER_COMPACT};
 use super::history::{History, sanitize_cancelled_history};
 use super::instructions::LoadedInstructions;
+use super::provider_hooks::ProviderHookSink;
 use super::streaming::stream_with_retry;
 use super::tool_dispatch::{self, RecentCalls};
 use crate::cancel::{CancelMap, CancelToken};
@@ -87,6 +88,7 @@ pub struct Agent<'h> {
     loaded_instructions: LoadedInstructions,
     rollback_len: usize,
     mcp: Option<McpHandle>,
+    hooks: Option<Arc<dyn ProviderHookSink + Send + Sync>>,
     config: AgentConfig,
     tool_output_lines: ToolOutputLines,
     reauth_attempts: u32,
@@ -125,6 +127,7 @@ impl<'h> Agent<'h> {
             loaded_instructions: LoadedInstructions::new(),
             rollback_len: 0,
             mcp: None,
+            hooks: None,
             reauth_attempts: 0,
             post_tool_empty_retried: false,
             opts: RequestOptions::default(),
@@ -137,6 +140,14 @@ impl<'h> Agent<'h> {
 
     pub fn with_mcp(mut self, mcp: Option<McpHandle>) -> Self {
         self.mcp = mcp;
+        self
+    }
+
+    pub fn with_provider_hooks(
+        mut self,
+        hooks: Option<Arc<dyn ProviderHookSink + Send + Sync>>,
+    ) -> Self {
+        self.hooks = hooks;
         self
     }
 
@@ -221,6 +232,9 @@ impl<'h> Agent<'h> {
             &self.cancel,
             self.opts,
             self.session_id.as_deref(),
+            self.hooks
+                .as_ref()
+                .map(|h| h.as_ref() as &dyn ProviderHookSink),
         )
         .await
         {
@@ -390,6 +404,7 @@ impl<'h> Agent<'h> {
             prompt_slots: Arc::clone(&self.prompt_slots),
             opts: self.opts,
             subagent_cancels: Arc::clone(&self.subagent_cancels),
+            hooks: self.hooks.clone(),
         }
     }
 

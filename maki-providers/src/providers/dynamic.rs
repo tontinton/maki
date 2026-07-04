@@ -39,6 +39,7 @@ struct DynamicProviderMeta {
     base: ProviderKind,
     system_prefix: Option<String>,
     has_auth: bool,
+    has_transform: bool,
     script_path: PathBuf,
     models: Vec<ScriptModel>,
 }
@@ -50,6 +51,8 @@ struct ScriptInfo {
     #[serde(default)]
     system_prefix: Option<String>,
     has_auth: bool,
+    #[serde(default)]
+    has_transform: bool,
 }
 
 #[derive(Deserialize)]
@@ -295,6 +298,7 @@ fn discover_in(dir: &Path) -> Vec<DynamicProviderMeta> {
             base,
             system_prefix: info.system_prefix.filter(|s| !s.is_empty()),
             has_auth: info.has_auth,
+            has_transform: info.has_transform,
             script_path: path,
             models,
         });
@@ -351,55 +355,71 @@ pub fn create(slug: &str, timeouts: super::Timeouts) -> Result<Box<dyn Provider>
     })?;
     let resolved = resolve_auth(meta)?;
     let auth = Arc::new(Mutex::new(resolved));
+    let transform_path = meta.has_transform.then(|| meta.script_path.clone());
 
     let inner: Box<dyn Provider> = match meta.base {
         ProviderKind::Anthropic => Box::new(
             Anthropic::with_auth(auth.clone(), timeouts)
-                .with_system_prefix(meta.system_prefix.clone()),
+                .with_system_prefix(meta.system_prefix.clone())
+                .with_transform(transform_path.clone()),
         ),
         ProviderKind::OpenAi => Box::new(
             OpenAi::with_auth(auth.clone(), timeouts)
-                .with_system_prefix(meta.system_prefix.clone()),
+                .with_system_prefix(meta.system_prefix.clone())
+                .with_transform(transform_path.clone()),
         ),
-        ProviderKind::Google => Box::new(Google::with_auth(auth.clone(), timeouts)),
+        ProviderKind::Google => Box::new(
+            Google::with_auth(auth.clone(), timeouts).with_transform(transform_path.clone()),
+        ),
         ProviderKind::Copilot => Box::new(
             Copilot::with_auth(auth.clone(), timeouts)
-                .with_system_prefix(meta.system_prefix.clone()),
+                .with_system_prefix(meta.system_prefix.clone())
+                .with_transform(transform_path.clone()),
         ),
         ProviderKind::Ollama => Box::new(
             LocalEndpoint::with_auth(&OLLAMA, auth.clone(), timeouts)
-                .with_system_prefix(meta.system_prefix.clone()),
+                .with_system_prefix(meta.system_prefix.clone())
+                .with_transform(transform_path.clone()),
         ),
         ProviderKind::LlamaCpp => Box::new(
             LocalEndpoint::with_auth(&LLAMACPP, auth.clone(), timeouts)
-                .with_system_prefix(meta.system_prefix.clone()),
+                .with_system_prefix(meta.system_prefix.clone())
+                .with_transform(transform_path.clone()),
         ),
         ProviderKind::Mistral => Box::new(
             Mistral::with_auth(auth.clone(), timeouts)
-                .with_system_prefix(meta.system_prefix.clone()),
+                .with_system_prefix(meta.system_prefix.clone())
+                .with_transform(transform_path.clone()),
         ),
         ProviderKind::Zai => Box::new(
-            Zai::with_auth(auth.clone(), timeouts).with_system_prefix(meta.system_prefix.clone()),
+            Zai::with_auth(auth.clone(), timeouts)
+                .with_system_prefix(meta.system_prefix.clone())
+                .with_transform(transform_path.clone()),
         ),
         ProviderKind::Synthetic => Box::new(
             Synthetic::with_auth(auth.clone(), timeouts)
-                .with_system_prefix(meta.system_prefix.clone()),
+                .with_system_prefix(meta.system_prefix.clone())
+                .with_transform(transform_path.clone()),
         ),
         ProviderKind::DeepSeek => Box::new(
             DeepSeek::with_auth(auth.clone(), timeouts)
-                .with_system_prefix(meta.system_prefix.clone()),
+                .with_system_prefix(meta.system_prefix.clone())
+                .with_transform(transform_path.clone()),
         ),
         ProviderKind::OpenRouter => Box::new(
             OpenRouter::with_auth(auth.clone(), timeouts)
-                .with_system_prefix(meta.system_prefix.clone()),
+                .with_system_prefix(meta.system_prefix.clone())
+                .with_transform(transform_path.clone()),
         ),
         ProviderKind::TensorX => Box::new(
             TensorX::with_auth(auth.clone(), timeouts)
-                .with_system_prefix(meta.system_prefix.clone()),
+                .with_system_prefix(meta.system_prefix.clone())
+                .with_transform(transform_path.clone()),
         ),
         ProviderKind::Opencode => Box::new(
             Opencode::with_auth(auth.clone(), timeouts)
-                .with_system_prefix(meta.system_prefix.clone()),
+                .with_system_prefix(meta.system_prefix.clone())
+                .with_transform(transform_path.clone()),
         ),
     };
 
@@ -600,11 +620,16 @@ mod tests {
         assert_eq!(info.display_name, "Test");
         assert_eq!(info.base, "anthropic");
         assert!(info.has_auth);
+        assert!(!info.has_transform);
         assert!(info.system_prefix.is_none());
 
         let with_prefix = r#"{"display_name": "T", "base": "openai", "has_auth": false, "system_prefix": "You are X."}"#;
         let info: ScriptInfo = serde_json::from_str(with_prefix).unwrap();
         assert_eq!(info.system_prefix.as_deref(), Some("You are X."));
+
+        let with_transform = r#"{"display_name": "T", "base": "anthropic", "has_auth": false, "has_transform": true}"#;
+        let info: ScriptInfo = serde_json::from_str(with_transform).unwrap();
+        assert!(info.has_transform);
     }
 
     #[test]
@@ -653,7 +678,22 @@ mod tests {
         assert_eq!(providers[0].display_name, "Test");
         assert_eq!(providers[0].base, ProviderKind::Anthropic);
         assert!(providers[0].has_auth);
+        assert!(!providers[0].has_transform);
         assert!(providers[0].models.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discover_detects_transform_support() {
+        let tmp = TempDir::new().unwrap();
+        write_script(
+            tmp.path(),
+            "transform-provider",
+            r#"{"display_name": "T", "base": "openai", "has_auth": false, "has_transform": true}"#,
+        );
+        let providers = discover_in(tmp.path());
+        assert_eq!(providers.len(), 1);
+        assert!(providers[0].has_transform);
     }
 
     #[cfg(unix)]
