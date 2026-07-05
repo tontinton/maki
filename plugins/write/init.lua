@@ -13,6 +13,17 @@ local function write_view_opts(ctx)
   return { max_lines = (tol and tol.write) or 10, keep = "head" }
 end
 
+local function split_lines(content)
+  local lines = {}
+  for line in (content .. "\n"):gmatch("([^\n]*)\n") do
+    lines[#lines + 1] = line
+  end
+  if #lines > 0 and lines[#lines] == "" then
+    lines[#lines] = nil
+  end
+  return lines
+end
+
 local function line_nr_fmt(count)
   local w = math.max(1, math.floor(math.log(count + 1, 10)) + 1)
   return "%" .. w .. "d "
@@ -89,13 +100,7 @@ maki.api.register_tool({
   end,
 
   restore = function(input, output, _is_error, ctx)
-    local lines = {}
-    for line in (output .. "\n"):gmatch("([^\n]*)\n") do
-      lines[#lines + 1] = line
-    end
-    if #lines > 0 and lines[#lines] == "" then
-      lines[#lines] = nil
-    end
+    local lines = split_lines(input.content or "")
     if #lines == 0 then
       return ToolView.restore(output, write_view_opts(ctx))
     end
@@ -136,17 +141,9 @@ maki.api.register_tool({
     local llm_output = string.format("wrote %d bytes to %s", byte_count, rel)
     local annotation = string.format("%d bytes", byte_count)
 
-    local preview_lines = {}
-    for line in (content .. "\n"):gmatch("([^\n]*)\n") do
-      preview_lines[#preview_lines + 1] = line
-    end
-    if #preview_lines > 0 and preview_lines[#preview_lines] == "" then
-      preview_lines[#preview_lines] = nil
-    end
-
     return {
       llm_output = llm_output,
-      body = build_view(preview_lines, path, ctx),
+      body = build_view(split_lines(content), path, ctx),
       annotation = annotation,
       written_path = path,
     }

@@ -11,6 +11,14 @@ fn fresh_registry() -> Arc<ToolRegistry> {
     Arc::new(ToolRegistry::new())
 }
 
+fn builtins_host() -> (Arc<ToolRegistry>, PluginHost) {
+    let reg = fresh_registry();
+    let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_builtins(&PluginsConfig::from_tools(HashMap::new()))
+        .unwrap();
+    (reg, host)
+}
+
 fn exec_tool(reg: &ToolRegistry, name: &str, input: serde_json::Value) -> Result<String, String> {
     let entry = reg
         .get(name)
@@ -1216,10 +1224,7 @@ fn ctx_set_deadline_twice_errors() {
 
 #[test]
 fn restore_tool_async_ordering_and_delivery() {
-    let reg = fresh_registry();
-    let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    host.load_builtins(&PluginsConfig::from_tools(HashMap::new()))
-        .unwrap();
+    let (_reg, host) = builtins_host();
 
     let input = serde_json::json!({"command": "echo ok", "timeout": 1});
 
@@ -1228,7 +1233,7 @@ fn restore_tool_async_ordering_and_delivery() {
     let event_tx = maki_agent::EventSender::new(tx, 0);
 
     let bash_item = |id: &str| maki_lua::RestoreItem {
-        tool: std::sync::Arc::from("bash"),
+        tool: Arc::from("bash"),
         tool_use_id: id.to_owned(),
         output: "tool bash timed out after 1s".to_owned(),
         input: input.clone(),
@@ -1238,7 +1243,7 @@ fn restore_tool_async_ordering_and_delivery() {
         expanded: false,
     };
     let unknown_item = maki_lua::RestoreItem {
-        tool: std::sync::Arc::from("definitely_not_a_tool"),
+        tool: Arc::from("definitely_not_a_tool"),
         tool_use_id: "unknown_id".to_owned(),
         output: "ignored".to_owned(),
         input: serde_json::json!({}),
@@ -1278,16 +1283,75 @@ fn restore_tool_async_ordering_and_delivery() {
     );
 }
 
+#[test_case::test_case(
+    "write",
+    serde_json::json!({"path": "/tmp/x.md", "content": "alpha\nbeta"}),
+    "wrote 10 bytes to /tmp/x.md",
+    &["alpha", "beta"]
+    ; "write_tool_restores_file_content"
+)]
+#[test_case::test_case(
+    "memory",
+    serde_json::json!({"command": "write", "path": "n.md", "content": "gamma"}),
+    "wrote n.md (1 lines)",
+    &["gamma"]
+    ; "memory_write_restores_saved_content"
+)]
+fn restore_rebuilds_body_from_input_content(
+    tool: &str,
+    input: serde_json::Value,
+    summary: &str,
+    expected: &[&str],
+) {
+    let (_reg, host) = builtins_host();
+    let handle = host.event_handle().expect("event handle available");
+    let (tx, rx) = flume::unbounded();
+
+    handle.request_restore(
+        maki_lua::RestoreItem {
+            tool: Arc::from(tool),
+            tool_use_id: "restore_id".to_owned(),
+            output: summary.to_owned(),
+            input,
+            is_error: false,
+            tool_output_lines: ToolOutputLines::default(),
+            theme_gen: None,
+            expanded: true,
+        },
+        maki_agent::EventSender::new(tx, 0),
+    );
+    let _ = handle.collect_prompt_slots();
+
+    let mut text = String::new();
+    for env in rx.drain() {
+        if let maki_agent::AgentEvent::ToolSnapshot { snapshot, .. } = env.event {
+            for line in snapshot.lines.iter() {
+                for span in &line.spans {
+                    text.push_str(&span.text);
+                }
+            }
+        }
+    }
+
+    for needle in expected {
+        assert!(
+            text.contains(needle),
+            "restored body missing '{needle}', got: {text}"
+        );
+    }
+    assert!(
+        !text.contains(summary),
+        "restored body should show content, not the summary: {text}"
+    );
+}
+
 /// Guards the stale-cancelled-handle bug: `permission_scopes` must call
 /// the plugin callback and return parsed scopes, not fall back to raw JSON.
 /// A leaked `{"command":...}` scope would break allow rules.
 #[test_case::test_case("git status" ; "parseable command")]
 #[test_case::test_case("echo 'unterminated" ; "unparseable command")]
 fn bash_permission_scopes_never_falls_back_to_json(command: &str) {
-    let reg = fresh_registry();
-    let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    host.load_builtins(&PluginsConfig::from_tools(HashMap::new()))
-        .unwrap();
+    let (reg, _host) = builtins_host();
 
     let input = serde_json::json!({ "command": command });
     let entry = reg.get("bash").expect("bash registered");
