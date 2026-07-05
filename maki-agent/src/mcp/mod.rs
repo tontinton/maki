@@ -21,7 +21,7 @@ pub mod transport;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -42,14 +42,12 @@ const SEPARATOR: &str = "__";
 pub const UNKNOWN_MCP: &str = "unknown_mcp";
 const MCP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Signals warmup progress from the `run` task to anyone waiting on MCP tools to be live.
+/// Signals warmup completion from the `run` task to anyone waiting on MCP tools to be live.
 ///
-/// `warming` is a single-task counter (only `run` reads or writes it) so it's `Relaxed`. `done`
-/// is the cross-task signal: `Release` on `set_done` pairs with `Acquire` on `is_done` so a
-/// returning `wait_until_warm` sees the `ToolIndex` ArcSwap store that `publish` ran first. The
-/// bounded channel wakes a parked `wait_until_warm` immediately on `set_done` instead of polling.
+/// `done` is the cross-task signal: `Release` on `set_done` pairs with `Acquire` on `is_done` so
+/// `wait_until_warm` sees the latest `ToolIndex` ArcSwap store that `finish_warmup` ran
+/// first. The bounded channel wakes a parked `wait_until_warm` immediately instead of polling.
 struct WarmSignal {
-    warming: AtomicUsize,
     done: AtomicBool,
     done_tx: flume::Sender<()>,
     done_rx: flume::Receiver<()>,
@@ -59,7 +57,6 @@ impl Default for WarmSignal {
     fn default() -> Self {
         let (done_tx, done_rx) = flume::bounded(1);
         Self {
-            warming: AtomicUsize::new(0),
             done: AtomicBool::new(false),
             done_tx,
             done_rx,
@@ -68,18 +65,6 @@ impl Default for WarmSignal {
 }
 
 impl WarmSignal {
-    fn set_warming(&self, n: usize) {
-        self.warming.store(n, Ordering::Relaxed);
-    }
-
-    fn warming_count(&self) -> usize {
-        self.warming.load(Ordering::Relaxed)
-    }
-
-    fn decrement(&self) {
-        self.warming.fetch_sub(1, Ordering::Relaxed);
-    }
-
     fn set_done(&self) {
         self.done.store(true, Ordering::Release);
         let _ = self.done_tx.try_send(());
@@ -427,17 +412,6 @@ pub async fn start_with_config(config: McpConfig) -> Option<McpHandle> {
         warm: Arc::clone(&warm),
     };
 
-    let warming = inner
-        .entries
-        .iter()
-        .filter(|e| e.status == McpServerStatus::Connecting)
-        .count();
-    info!(
-        warming,
-        total = inner.entries.len(),
-        "MCP servers scheduling warmup"
-    );
-
     smol::spawn(run(inner, index, snapshot, cmd_rx, warm)).detach();
     Some(handle)
 }
@@ -497,7 +471,12 @@ async fn run(
         .filter(|(_, e)| e.status == McpServerStatus::Connecting)
         .filter_map(|(i, e)| e.config.clone().map(|c| (i, c)))
         .collect();
-    warm.set_warming(connecting.len());
+    let mut pending = connecting.len();
+    info!(
+        warming = pending,
+        total = inner.entries.len(),
+        "MCP servers scheduling warmup"
+    );
 
     let (done_tx, done_rx) = flume::unbounded::<(usize, Result<StartResult, McpError>)>();
     for (i, cfg) in connecting {
@@ -510,7 +489,7 @@ async fn run(
     drop(done_tx);
 
     let mut shutdown_during_warmup: Option<flume::Sender<()>> = None;
-    while warm.warming_count() > 0 {
+    while pending > 0 {
         // `race` returns the first ready future's output and drops the other. For a dropped
         // `recv_async` that hadn't resolved, the channel item stays queued; wrapping both in
         // `WarmEvent` captures the resolved value intact — no lost commands.
@@ -536,7 +515,7 @@ async fn run(
                 }
                 inner.generation += 1;
                 publish(&inner, &index, &snapshot);
-                warm.decrement();
+                pending -= 1;
             }
             WarmEvent::Cmd(cmd) => {
                 if let Some(ack) = handle_command_during_warmup(cmd, &mut inner).await {
@@ -550,13 +529,12 @@ async fn run(
     if let Some(ack) = shutdown_during_warmup {
         shutdown_all(&mut inner).await;
         inner.generation += 1;
-        publish(&inner, &index, &snapshot);
-        warm.set_done();
+        finish_warmup(&inner, &index, &snapshot, &warm);
         let _ = ack.try_send(());
         return;
     }
 
-    warm.set_done();
+    finish_warmup(&inner, &index, &snapshot, &warm);
 
     // --- normal command loop (unchanged) ---
     let mut ack: Option<flume::Sender<()>> = None;
@@ -801,6 +779,19 @@ fn apply_start_result(
             Err(e)
         }
     }
+}
+
+/// Publish the latest state, then signal warmup done. `publish` must run before `set_done` so
+/// `wait_until_warm` never observes a stale empty `ToolIndex`. Fusing them here makes the
+/// ordering mechanical instead of convention-enforced.
+fn finish_warmup(
+    inner: &McpManagerInner,
+    index: &ArcSwap<ToolIndex>,
+    snapshot: &ArcSwap<McpSnapshot>,
+    warm: &WarmSignal,
+) {
+    publish(inner, index, snapshot);
+    warm.set_done();
 }
 
 /// The only place read-side state is updated. Every mutation in the command loop ends here.
