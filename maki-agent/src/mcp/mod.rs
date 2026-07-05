@@ -46,11 +46,25 @@ const MCP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 ///
 /// `warming` is a single-task counter (only `run` reads or writes it) so it's `Relaxed`. `done`
 /// is the cross-task signal: `Release` on `set_done` pairs with `Acquire` on `is_done` so a
-/// returning `wait_until_warm` sees the `ToolIndex` ArcSwap store that `publish` ran first.
-#[derive(Default)]
+/// returning `wait_until_warm` sees the `ToolIndex` ArcSwap store that `publish` ran first. The
+/// bounded channel wakes a parked `wait_until_warm` immediately on `set_done` instead of polling.
 struct WarmSignal {
     warming: AtomicUsize,
     done: AtomicBool,
+    done_tx: flume::Sender<()>,
+    done_rx: flume::Receiver<()>,
+}
+
+impl Default for WarmSignal {
+    fn default() -> Self {
+        let (done_tx, done_rx) = flume::bounded(1);
+        Self {
+            warming: AtomicUsize::new(0),
+            done: AtomicBool::new(false),
+            done_tx,
+            done_rx,
+        }
+    }
 }
 
 impl WarmSignal {
@@ -68,6 +82,7 @@ impl WarmSignal {
 
     fn set_done(&self) {
         self.done.store(true, Ordering::Release);
+        let _ = self.done_tx.try_send(());
     }
 
     fn is_done(&self) -> bool {
@@ -75,16 +90,25 @@ impl WarmSignal {
     }
 
     async fn wait_until_warm(&self, timeout: Duration) -> bool {
-        let deadline = std::time::Instant::now() + timeout;
-        loop {
-            if self.is_done() {
-                return true;
-            }
-            if std::time::Instant::now() >= deadline {
-                return false;
-            }
-            smol::Timer::after(Duration::from_millis(20)).await;
+        if self.is_done() {
+            return true;
         }
+        // Race the done-signal against the timeout, mirroring `McpHandle::shutdown`'s ack-wait
+        // shape. `done_rx` is cloned per waiter so multiple concurrent callers each get their own
+        // receive; the `done` flag short-circuits late callers.
+        let rx = self.done_rx.clone();
+        let timed_out = futures_lite::future::or(
+            async {
+                let _ = rx.recv_async().await;
+                false
+            },
+            async {
+                smol::Timer::after(timeout).await;
+                true
+            },
+        )
+        .await;
+        !timed_out || self.is_done()
     }
 }
 
