@@ -42,18 +42,9 @@ const SEPARATOR: &str = "__";
 pub const UNKNOWN_MCP: &str = "unknown_mcp";
 const MCP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Cooperative signal between `start_background` (returns immediately) and any caller that
-/// needs MCP tools to be live before its first turn. The `run` task clears `warming` as each
-/// server finishes connecting, then sets `done` once the warmup preamble exits. `wait_until_warm`
-/// parks on a periodic timer until `done` is set or `timeout` elapses.
-///
-/// Invariants:
-/// - `warming` counts enabled servers that have not yet finished `start_server` (success or
-///   failure). `run` decrements under the publish-done pair, so a returning `wait_until_warm`
-///   never observes a stale empty `ToolIndex` (publish happens before `decrement`/`set_done`).
-/// - `done` is set exactly once, after the last warmup completion has been applied and
-///   published, OR immediately on `Shutdown` during warmup (after acknowledged shutdown).
-/// - Order matters: `publish` THEN `decrement`/`set_done`, never the reverse.
+/// Signals warmup progress from the `run` task to anyone waiting on MCP tools to be live.
+/// Invariant: `publish` runs before `decrement`/`set_done`, so a returning `wait_until_warm`
+/// never observes a stale empty `ToolIndex`.
 #[derive(Default)]
 struct WarmSignal {
     warming: AtomicUsize,
@@ -82,16 +73,13 @@ impl WarmSignal {
     }
 
     async fn wait_until_warm(&self, timeout: Duration) -> bool {
-        if self.is_done() {
-            return true;
-        }
         let deadline = std::time::Instant::now() + timeout;
         loop {
             if self.is_done() {
                 return true;
             }
             if std::time::Instant::now() >= deadline {
-                return self.is_done();
+                return false;
             }
             smol::Timer::after(Duration::from_millis(20)).await;
         }
@@ -365,38 +353,20 @@ impl McpHandle {
     }
 }
 
-pub async fn start(cwd: &Path) -> (Option<McpHandle>, McpConfigErrors) {
-    start_impl(cwd, StartMode::Background).await
-}
-
-/// Background variant: returns immediately after config load, with every enabled server still
-/// in `Connecting`. The `run` task warms them concurrently off-UI-thread. Callers that need MCP
-/// tools on the first turn must call `McpHandle::wait_until_warm` themselves (TUI path, where a
-/// short first-prompt wait is preferable to a 2s blank-first-paint).
 pub async fn start_background(cwd: &Path) -> (Option<McpHandle>, McpConfigErrors) {
-    start_impl(cwd, StartMode::Background).await
+    tracing::info!(cwd = %cwd.display(), "starting MCP");
+    let cwd = cwd.to_owned();
+    let (config, config_errors) = smol::unblock(move || load_config(&cwd)).await;
+    let handle = start_with_config(config).await;
+    (handle, config_errors)
 }
 
 /// Synchronous variant: blocks until every enabled server has finished its initial handshake
 /// (or failed). Preserves the historical "start returns fully ready" contract for headless
 /// callers (`--print`, `--sdk`, ACP) that build tools once and never rebuild.
 pub async fn start_sync(cwd: &Path) -> (Option<McpHandle>, McpConfigErrors) {
-    start_impl(cwd, StartMode::Sync).await
-}
-
-enum StartMode {
-    Background,
-    Sync,
-}
-
-async fn start_impl(cwd: &Path, mode: StartMode) -> (Option<McpHandle>, McpConfigErrors) {
-    tracing::info!(cwd = %cwd.display(), "starting MCP");
-    let cwd = cwd.to_owned();
-    let (config, config_errors) = smol::unblock(move || load_config(&cwd)).await;
-    let handle = start_with_config(config).await;
-    if let Some(h) = &handle
-        && matches!(mode, StartMode::Sync)
-    {
+    let (handle, config_errors) = start_background(cwd).await;
+    if let Some(h) = &handle {
         h.wait_until_warm(MCP_SYNC_START_TIMEOUT).await;
     }
     (handle, config_errors)
@@ -431,12 +401,13 @@ pub async fn start_with_config(config: McpConfig) -> Option<McpHandle> {
         warm: Arc::clone(&warm),
     };
 
+    let warming = inner
+        .entries
+        .iter()
+        .filter(|e| e.status == McpServerStatus::Connecting)
+        .count();
     info!(
-        warming = inner
-            .entries
-            .iter()
-            .filter(|e| e.status == McpServerStatus::Connecting)
-            .count(),
+        warming,
         total = inner.entries.len(),
         "MCP servers scheduling warmup"
     );
@@ -446,16 +417,14 @@ pub async fn start_with_config(config: McpConfig) -> Option<McpHandle> {
 }
 
 enum WarmEvent {
-    Done(Option<(usize, Result<StartResult, McpError>)>),
-    Cmd(Option<McpCommand>),
+    Done((usize, Result<StartResult, McpError>)),
+    Cmd(McpCommand),
 }
 
 /// Apply a command received during the warmup preamble. Returns `Some(ack)` if the command is
-/// `Shutdown` (caller breaks the warmup loop and tears down). Other commands are best-effort:
-/// `Toggle{false}` marks the entry Disabled so any in-flight `start_server` completion gets
-/// discarded; `Toggle{true}`/`Reconnect` against a not-yet-started server fall through (the
-/// normal loop post-warmup re-handles them via the user retrying, which is acceptable since
-/// warmup is brief).
+/// `Shutdown` (caller breaks the warmup loop and tears down). `Toggle{false}` marks the entry
+/// Disabled so any in-flight `start_server` completion for it gets discarded post-hoc; other
+/// commands are no-ops during warmup (the normal loop handles them after warmup completes).
 async fn handle_command_during_warmup(
     cmd: McpCommand,
     inner: &mut McpManagerInner,
@@ -477,8 +446,6 @@ async fn handle_command_during_warmup(
             enabled: true,
         }
         | McpCommand::Reconnect { server, .. } => {
-            // Defer to the normal loop post-warmup; refresh against a mid-handshake server would
-            // fail-noop anyway. Log so the deferral is debuggable.
             tracing::debug!(server = %server, "MCP command deferred past warmup");
             None
         }
@@ -493,11 +460,10 @@ async fn run(
     warm: Arc<WarmSignal>,
 ) {
     // --- warmup preamble ---
-    // Concurrently start every enabled (Connecting) server. Completions are routed through a
-    // channel so the preamble can race them against incoming commands without holding join
-    // handles (smol Tasks can't be cancelled mid-flight; sending results through a channel lets
-    // a Shutdown during warmup simply drop the receiver and let the orphaned wrappers finish +
-    // drop their transport → child killed).
+    // Concurrently start every enabled (Connecting) server, racing each completion against
+    // incoming commands. Completions flow through a channel (not join handles) so a Shutdown
+    // during warmup can drop the receiver and let orphaned wrappers finish + drop their
+    // transport → child killed via ChildGuard.
     let connecting: Vec<(usize, ServerConfig)> = inner
         .entries
         .iter()
@@ -511,8 +477,7 @@ async fn run(
     for (i, cfg) in connecting {
         let tx = done_tx.clone();
         smol::spawn(async move {
-            let result = start_server(&cfg).await;
-            let _ = tx.send((i, result));
+            let _ = tx.send((i, start_server(&cfg).await));
         })
         .detach();
     }
@@ -520,27 +485,25 @@ async fn run(
 
     let mut shutdown_during_warmup: Option<flume::Sender<()>> = None;
     while warm.warming_count() > 0 {
-        // Poll a server completion and an incoming command concurrently. `race` returns the
-        // first ready future's output and drops the other; for the dropped `recv_async`, an
-        // unresolved receive leaves its item in the channel (still queued here), but a resolved
-        // one has already pulled the value out. Wrapping both in `WarmEvent` lets `race` hand
-        // us whichever fired with its value intact — no lost commands.
+        // `race` returns the first ready future's output and drops the other. For a dropped
+        // `recv_async` that hadn't resolved, the channel item stays queued; wrapping both in
+        // `WarmEvent` captures the resolved value intact — no lost commands.
         let event = futures_lite::future::race(
-            async { WarmEvent::Done(done_rx.recv_async().await.ok()) },
-            async { WarmEvent::Cmd(cmd_rx.recv_async().await.ok()) },
+            async { WarmEvent::Done(done_rx.recv_async().await.unwrap()) },
+            async { WarmEvent::Cmd(cmd_rx.recv_async().await.unwrap()) },
         )
         .await;
 
         match event {
-            WarmEvent::Done(Some((i, result))) => {
+            WarmEvent::Done((i, result)) => {
+                // Toggle{false} arrived mid-warmup races this completion; honor the disabled
+                // flag by discarding the transport (Drop closes stdin → child exits).
                 let dismiss = inner
                     .entries
                     .get(i)
                     .map(|e| e.status == McpServerStatus::Disabled)
                     .unwrap_or(true);
                 if dismiss {
-                    // Toggle{false} arrived mid-warmup; discard the just-finished transport
-                    // (Drop closes stdin → child exits).
                     drop(result);
                 } else {
                     let _ = apply_start_result(&mut inner.entries[i], result, "start");
@@ -549,18 +512,12 @@ async fn run(
                 publish(&inner, &index, &snapshot);
                 warm.decrement();
             }
-            WarmEvent::Done(None) => {
-                // done_tx senders all dropped before warming hit zero — shouldn't happen, but
-                // break to avoid spinning.
-                break;
-            }
-            WarmEvent::Cmd(Some(cmd)) => {
+            WarmEvent::Cmd(cmd) => {
                 if let Some(ack) = handle_command_during_warmup(cmd, &mut inner).await {
                     shutdown_during_warmup = Some(ack);
                     break;
                 }
             }
-            WarmEvent::Cmd(None) => break,
         }
     }
 
