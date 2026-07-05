@@ -43,8 +43,10 @@ pub const UNKNOWN_MCP: &str = "unknown_mcp";
 const MCP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Signals warmup progress from the `run` task to anyone waiting on MCP tools to be live.
-/// Invariant: `publish` runs before `decrement`/`set_done`, so a returning `wait_until_warm`
-/// never observes a stale empty `ToolIndex`.
+///
+/// `warming` is a single-task counter (only `run` reads or writes it) so it's `Relaxed`. `done`
+/// is the cross-task signal: `Release` on `set_done` pairs with `Acquire` on `is_done` so a
+/// returning `wait_until_warm` sees the `ToolIndex` ArcSwap store that `publish` ran first.
 #[derive(Default)]
 struct WarmSignal {
     warming: AtomicUsize,
@@ -53,15 +55,15 @@ struct WarmSignal {
 
 impl WarmSignal {
     fn set_warming(&self, n: usize) {
-        self.warming.store(n, Ordering::Release);
+        self.warming.store(n, Ordering::Relaxed);
     }
 
     fn warming_count(&self) -> usize {
-        self.warming.load(Ordering::Acquire)
+        self.warming.load(Ordering::Relaxed)
     }
 
     fn decrement(&self) {
-        self.warming.fetch_sub(1, Ordering::AcqRel);
+        self.warming.fetch_sub(1, Ordering::Relaxed);
     }
 
     fn set_done(&self) {
