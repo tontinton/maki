@@ -84,14 +84,21 @@ impl CustomCommand {
 }
 
 pub fn discover_commands(cwd: &Path) -> Vec<CustomCommand> {
-    let home = maki_storage::paths::home();
-    discover_commands_inner(cwd, home.as_deref())
+    discover_commands_inner(
+        cwd,
+        maki_storage::paths::home().as_deref(),
+        maki_storage::paths::config_dir().ok().as_deref(),
+    )
 }
 
-fn discover_commands_inner(cwd: &Path, home: Option<&Path>) -> Vec<CustomCommand> {
+fn discover_commands_inner(
+    cwd: &Path,
+    home: Option<&Path>,
+    xdg_config: Option<&Path>,
+) -> Vec<CustomCommand> {
     let mut commands: HashMap<String, CustomCommand> = HashMap::new();
 
-    for dir in maki_storage::paths::user_config_dirs(home, "commands") {
+    for dir in maki_storage::paths::user_config_dirs(home, xdg_config, "commands") {
         scan_command_dir(&dir, CommandScope::User, &mut commands);
     }
     if let Some(home) = home {
@@ -242,7 +249,7 @@ mod tests {
         )
         .unwrap();
 
-        let commands = discover_commands_inner(project.path(), Some(global.path()));
+        let commands = discover_commands_inner(project.path(), Some(global.path()), None);
         let overlap: Vec<_> = commands.iter().filter(|c| c.name == "overlap").collect();
         assert_eq!(overlap.len(), 1);
         assert_eq!(overlap[0].description, "Project version");
@@ -262,7 +269,7 @@ mod tests {
             fs::write(path.join(filename), "Content").unwrap();
         }
 
-        let commands = discover_commands_inner(dir.path(), None);
+        let commands = discover_commands_inner(dir.path(), None, None);
         let names: Vec<_> = commands.iter().map(|c| c.name.as_str()).collect();
         assert!(names.contains(&"a-cmd"));
         assert!(names.contains(&"b-cmd"));
@@ -276,7 +283,7 @@ mod tests {
         fs::write(cmd_dir.join("valid.md"), "Content").unwrap();
         fs::write(cmd_dir.join("invalid.txt"), "Content").unwrap();
 
-        let commands = discover_commands_inner(dir.path(), None);
+        let commands = discover_commands_inner(dir.path(), None, None);
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0].name, "valid");
     }
