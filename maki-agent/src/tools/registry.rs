@@ -220,14 +220,13 @@ impl RegisteredTool {
     }
 }
 
-/// Lock-free reads via `ArcSwap`, writes swap in a new snapshot atomically.
-///
-/// Bundled Lua plugins can replace a native tool with their own version.
-/// The original native tool is kept in `native_fallbacks` so we can still
-/// look up its header info. User plugins are not allowed to replace tools
-/// that aren't native (that gives a `NameConflict` error).
+/// `tools` is the live list mutated by `register`/`replace_plugin`/`clear_*`.
+/// `native_core` is the frozen native set, never mutated, so tests enumerating
+/// natives are immune to other tests registering fixtures into the live list.
+/// `native_fallbacks` retains headers for natives displaced by plugins.
 pub struct ToolRegistry {
     tools: ArcSwap<Vec<RegisteredTool>>,
+    native_core: Arc<Vec<RegisteredTool>>,
     native_fallbacks: ArcSwap<Vec<RegisteredTool>>,
 }
 
@@ -247,6 +246,7 @@ impl ToolRegistry {
     pub fn new() -> Self {
         Self {
             tools: ArcSwap::from_pointee(Vec::new()),
+            native_core: Arc::new(Vec::new()),
             native_fallbacks: ArcSwap::from_pointee(Vec::new()),
         }
     }
@@ -268,7 +268,6 @@ impl ToolRegistry {
     /// `register_tools!` catches dupes at compile time. Plugins and MCP skip
     /// that macro, so this runtime check is the safety net.
     fn build_native() -> Self {
-        let registry = Self::new();
         let natives = super::native_tools();
         let mut vec: Vec<RegisteredTool> = Vec::with_capacity(natives.len());
         for tool in natives {
@@ -282,8 +281,12 @@ impl ToolRegistry {
                 source: ToolSource::Native,
             });
         }
-        registry.tools.store(Arc::new(vec));
-        registry
+        let native_core = Arc::new(vec.clone());
+        Self {
+            tools: ArcSwap::from_pointee(vec),
+            native_core,
+            native_fallbacks: ArcSwap::from_pointee(Vec::new()),
+        }
     }
 
     pub fn get(&self, name: &str) -> Option<RegisteredTool> {
@@ -524,6 +527,10 @@ impl ToolRegistry {
 
     pub fn iter(&self) -> RegistrySnapshot {
         RegistrySnapshot(self.tools.load_full())
+    }
+
+    pub fn native_iter(&self) -> RegistrySnapshot {
+        RegistrySnapshot(Arc::clone(&self.native_core))
     }
 }
 

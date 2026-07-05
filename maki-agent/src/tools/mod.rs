@@ -866,7 +866,7 @@ mod tests {
             "{\"path\": 123, \"pattern\": []}",
         ];
         let registry = ToolRegistry::native();
-        for entry in registry.iter().iter() {
+        for entry in registry.native_iter().iter() {
             let name = entry.name().to_owned();
             for raw in BOGUS_INPUTS {
                 let input: Value = serde_json::from_str(raw).unwrap();
@@ -944,7 +944,7 @@ mod tests {
         let expected: std::collections::BTreeMap<&str, ToolAudience> =
             std::collections::BTreeMap::from([(BATCH_TOOL_NAME, MAIN | RES | GEN)]);
 
-        let snapshot = ToolRegistry::native().iter();
+        let snapshot = ToolRegistry::native().native_iter();
         let actual: std::collections::BTreeMap<String, ToolAudience> = snapshot
             .iter()
             .map(|e| (e.name().to_owned(), e.tool.audience()))
@@ -1181,7 +1181,7 @@ mod tests {
     fn lua_tools_not_in_native_registry() {
         let lua_only = ["glob", "grep", "task"];
         let registry = ToolRegistry::native();
-        for entry in registry.iter().iter() {
+        for entry in registry.native_iter().iter() {
             assert!(
                 !lua_only.contains(&entry.name()),
                 "{} should not be in the native Rust tool registry",
