@@ -56,6 +56,7 @@ async fn interpreter_run(
         Arc::clone(&agent_ctx.permissions),
         Arc::clone(&agent_ctx.file_tracker),
         agent_ctx.user_response_rx.clone(),
+        Arc::clone(maki_agent::tools::ToolRegistry::native_arc()),
     );
     ctx.deadline = Deadline::after(timeout);
     ctx.config = agent_ctx.config.clone();

@@ -192,6 +192,7 @@ pub struct ToolContext {
     pub prompt_slots: Arc<crate::prompt::ResolvedSlots>,
     pub opts: RequestOptions,
     pub subagent_cancels: Arc<CancelMap<String>>,
+    pub registry: Arc<ToolRegistry>,
 }
 
 pub(crate) fn resolve_path(path: &str) -> Result<String, String> {
@@ -579,6 +580,7 @@ pub fn interpreter_ctx(
     permissions: Arc<PermissionManager>,
     file_tracker: Arc<FileReadTracker>,
     user_response_rx: Option<Arc<async_lock::Mutex<flume::Receiver<String>>>>,
+    registry: Arc<ToolRegistry>,
 ) -> ToolContext {
     static PROVIDER: LazyLock<Arc<dyn Provider>> = LazyLock::new(|| Arc::new(NullProvider));
     static MODEL: LazyLock<Arc<Model>> =
@@ -602,6 +604,7 @@ pub fn interpreter_ctx(
         prompt_slots: Arc::new(crate::prompt::ResolvedSlots::default()),
         opts: RequestOptions::default(),
         subagent_cancels: Arc::new(CancelMap::new()),
+        registry,
     }
 }
 
@@ -624,6 +627,7 @@ pub fn cli_tool_ctx() -> ToolContext {
         )),
         Arc::new(FileReadTracker::new()),
         None,
+        Arc::clone(ToolRegistry::native_arc()),
     )
 }
 
@@ -705,6 +709,7 @@ pub mod test_support {
             Arc::clone(&TEST_PERMISSIONS),
             Arc::new(FileReadTracker::new()),
             None,
+            Arc::new(ToolRegistry::with_natives()),
         );
         ctx.tool_use_id = tool_use_id.map(String::from);
         ctx
@@ -728,6 +733,7 @@ pub mod test_support {
             permissions,
             Arc::new(FileReadTracker::new()),
             None,
+            Arc::new(ToolRegistry::with_natives()),
         );
         ctx.tool_use_id = None;
         ctx

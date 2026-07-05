@@ -8,7 +8,7 @@ use smol::future::block_on;
 use crate::agent::tool_dispatch::{self, Emit};
 use crate::task_set::TaskSet;
 
-use super::{ToolAudience, ToolContext, ToolRegistry};
+use super::{ToolAudience, ToolContext};
 
 async fn call(
     ctx: &ToolContext,
@@ -19,7 +19,7 @@ async fn call(
     ctx.deadline.check()?;
     let input = build_tool_input(args, kwargs)?;
     let done = tool_dispatch::run(
-        ToolRegistry::native(),
+        &ctx.registry,
         ctx.mcp.as_ref(),
         String::new(),
         name,
@@ -36,7 +36,7 @@ async fn call(
 }
 
 pub fn build_tool_fns(ctx: &ToolContext) -> HashMap<String, ToolFn> {
-    ToolRegistry::native()
+    ctx.registry
         .iter()
         .iter()
         .filter(|entry| entry.tool.audience().contains(ToolAudience::INTERPRETER))

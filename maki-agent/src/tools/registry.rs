@@ -175,7 +175,7 @@ pub trait ToolInvocation: Send + Sync {
     fn start_input(&self) -> Option<ToolInputEvent> {
         None
     }
-    fn start_output(&self) -> Option<ToolOutput> {
+    fn start_output(&self, _ctx: &ToolContext) -> Option<ToolOutput> {
         None
     }
     fn mutable_path(&self) -> Option<&Path> {

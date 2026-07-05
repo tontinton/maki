@@ -232,6 +232,7 @@ impl AgentLoop {
                 file_tracker: Arc::clone(&self.file_tracker),
                 prompt_slots: Arc::new(prompt_slots),
                 subagent_cancels: Arc::clone(&self.subagent_cancels),
+                registry: Arc::clone(maki_agent::tools::ToolRegistry::native_arc()),
             },
             AgentRunParams {
                 history: &mut self.history,

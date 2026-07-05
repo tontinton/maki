@@ -114,17 +114,18 @@ impl<'de> Deserialize<'de> for BatchEntry {
 impl BatchEntry {
     fn to_batch_entry(
         &self,
+        registry: &ToolRegistry,
         status: BatchToolStatus,
         output: Option<ToolOutput>,
         summary: Option<String>,
     ) -> BatchToolEntry {
-        let reg = ToolRegistry::native();
-        let call = reg
+        let call = registry
             .get(&self.tool)
             .and_then(|e| e.tool.parse(&self.parameters).ok());
         BatchToolEntry {
             tool: self.tool.clone(),
-            summary: summary.unwrap_or_else(|| reg.resolve_header(&self.tool, &self.parameters)),
+            summary: summary
+                .unwrap_or_else(|| registry.resolve_header(&self.tool, &self.parameters)),
             status,
             input: call.and_then(|c| c.start_input()),
             raw_input: Some(self.parameters.clone()),
@@ -193,9 +194,7 @@ impl Batch {
                     );
                 }
 
-                let summary = ToolRegistry::native()
-                    .resolve_header_async(&name, &params)
-                    .await;
+                let summary = ctx.registry.resolve_header_async(&name, &params).await;
 
                 ctx.event_tx
                     .try_send(AgentEvent::BatchProgress(Box::new(BatchProgressEvent {
@@ -212,7 +211,7 @@ impl Batch {
                     ..ctx.clone()
                 };
                 let done = tool_dispatch::run(
-                    ToolRegistry::native(),
+                    &ctx.registry,
                     inner_ctx.mcp.as_ref(),
                     id,
                     &name,
@@ -284,7 +283,7 @@ impl Batch {
                 } else {
                     BatchToolStatus::Error
                 };
-                entry.to_batch_entry(status, br.output.clone(), br.summary.clone())
+                entry.to_batch_entry(&ctx.registry, status, br.output.clone(), br.summary.clone())
             })
             .collect();
 
@@ -306,7 +305,7 @@ impl Batch {
                 "## {}\n[ERROR] maximum of {MAX_BATCH_SIZE} tools per batch\n\n",
                 entry.tool
             );
-            entries.push(entry.to_batch_entry(BatchToolStatus::Error, None, None));
+            entries.push(entry.to_batch_entry(&ctx.registry, BatchToolStatus::Error, None, None));
         }
 
         let succeeded = total - failed;
@@ -348,11 +347,11 @@ impl super::ToolInvocation for Batch {
     fn start_header(&self) -> super::HeaderFuture {
         super::HeaderFuture::Ready(super::HeaderResult::plain(Batch::start_header(self)))
     }
-    fn start_output(&self) -> Option<ToolOutput> {
+    fn start_output(&self, ctx: &super::ToolContext) -> Option<ToolOutput> {
         let entries = self
             .tool_calls
             .iter()
-            .map(|entry| entry.to_batch_entry(BatchToolStatus::Pending, None, None))
+            .map(|entry| entry.to_batch_entry(&ctx.registry, BatchToolStatus::Pending, None, None))
             .collect();
         Some(ToolOutput::Batch {
             entries,
@@ -368,7 +367,7 @@ impl super::ToolInvocation for Batch {
 mod tests {
     use crate::BatchToolEntry;
     use serde_json::json;
-    use std::sync::{Arc, Once};
+    use std::sync::Arc;
 
     use crate::AgentMode;
     use crate::tools::ToolSource;
@@ -376,12 +375,10 @@ mod tests {
 
     use super::*;
 
-    static REGISTER_TEST_TOOL: Once = Once::new();
-
-    fn ensure_test_tool() {
-        REGISTER_TEST_TOOL.call_once(|| {
-            let _ = ToolRegistry::native().register(Arc::new(GuardedMock), ToolSource::Native);
-        });
+    fn register_guarded(ctx: &ToolContext) {
+        let _ = ctx
+            .registry
+            .register(Arc::new(GuardedMock), ToolSource::Native);
     }
 
     async fn run_batch(input: Value) -> (Vec<BatchToolEntry>, String) {
@@ -422,8 +419,8 @@ mod tests {
     #[test]
     fn parallel_execution_with_mixed_results() {
         smol::block_on(async {
-            ensure_test_tool();
             let ctx = stub_ctx(&crate::AgentMode::Build);
+            register_guarded(&ctx);
 
             let (entries, _text) = execute_batch(
                 &ctx,
@@ -478,10 +475,10 @@ mod tests {
         use crate::{Envelope, EventSender};
 
         smol::block_on(async {
-            ensure_test_tool();
             let (tx, rx) = flume::unbounded::<Envelope>();
             let event_tx = EventSender::new(tx, 0);
             let ctx = stub_ctx_with(&AgentMode::Build, Some(&event_tx), None);
+            register_guarded(&ctx);
             execute_batch(
                 &ctx,
                 json!({

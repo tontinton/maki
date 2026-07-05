@@ -297,6 +297,7 @@ async fn run(lua: Lua, (agent_ctx_ud, opts): (mlua::AnyUserData, Table)) -> LuaR
             file_tracker: FileReadTracker::fresh(),
             prompt_slots: Arc::clone(&agent_ctx.prompt_slots),
             subagent_cancels: Arc::new(CancelMap::new()),
+            registry: Arc::clone(maki_agent::tools::ToolRegistry::native_arc()),
         },
         AgentRunParams {
             history: &mut history,
