@@ -51,7 +51,7 @@ pub fn run(model_arg: Option<String>, yolo: bool) -> Result<()> {
     setup::init_logging(&storage, &config.storage);
     setup::install_panic_log_hook();
 
-    let (mcp_handle, _mcp_config_errors) = smol::block_on(maki_agent::mcp::start(&cwd));
+    let (mcp_handle, _mcp_config_errors) = smol::block_on(maki_agent::mcp::start_sync(&cwd));
 
     let prompt_slots = plugin_host
         .event_handle()

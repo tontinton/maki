@@ -1,4 +1,6 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use maki_agent::agent;
@@ -24,6 +26,11 @@ use super::ModelSlot;
 use super::cancel_map::RunCancelMap;
 use super::shared_queue::{QueueItem, QueueReceiver};
 
+/// Upper bound the first user prompt waits for MCP warmup to finish before building tools.
+/// Covers a slow MCP server's handshake with margin; if warmup exceeds this, the first prompt
+/// runs tool-less and follow-up prompts pick up late-arriving tools via `rebuild_tools`.
+const MCP_FIRST_PROMPT_WARM_TIMEOUT: Duration = Duration::from_secs(5);
+
 pub(super) struct AgentLoop {
     model_slot: Arc<ArcSwap<ModelSlot>>,
     config: AgentConfig,
@@ -46,6 +53,7 @@ pub(super) struct AgentLoop {
     timeouts: maki_providers::Timeouts,
     lua_handle: Option<EventHandle>,
     subagent_cancels: Arc<CancelMap<String>>,
+    first_prompt: Arc<AtomicBool>,
 }
 
 impl AgentLoop {
@@ -91,6 +99,7 @@ impl AgentLoop {
             timeouts,
             lua_handle,
             subagent_cancels,
+            first_prompt: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -172,6 +181,16 @@ impl AgentLoop {
             self.reload_instructions().await;
         }
         self.rebuild_tools(&slot.model, input.workflow);
+
+        // First prompt only: wait briefly for MCP warmup so tools are present on turn 1 even if
+        // the user fired a prompt before any server finished its handshake. Subsequent prompts
+        // skip the wait — `rebuild_tools` above picks up late-arriving tools on every turn.
+        if self.first_prompt.swap(false, Ordering::AcqRel)
+            && let Some(ref mcp) = self.mcp_handle
+        {
+            mcp.wait_until_warm(MCP_FIRST_PROMPT_WARM_TIMEOUT).await;
+            self.rebuild_tools(&slot.model, input.workflow);
+        }
 
         for msg in std::mem::take(&mut input.preamble) {
             self.history.push(msg);

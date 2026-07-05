@@ -70,7 +70,7 @@ impl AgentHandles {
         timeouts: maki_providers::Timeouts,
         lua_handle: Option<EventHandle>,
     ) -> Self {
-        let (mcp_handle, mcp_config_errors) = smol::block_on(mcp::start(&cwd));
+        let (mcp_handle, mcp_config_errors) = smol::block_on(mcp::start_background(&cwd));
         spawn_agent_internal(
             model_slot,
             initial_history,
