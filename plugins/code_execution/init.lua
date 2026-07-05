@@ -17,18 +17,16 @@ local function append_lines(view, text)
   end
 end
 
-local description = [[Execute Python code in a sandboxed interpreter. Tools are available as callable functions.
+local description = [[Execute Python code in a sandboxed interpreter with tools as callable functions.
 
-Use for workflows of dependent/chained tool calls and filtering/processing results. This **DRAMATICALLY** improves performance over sequential tool calls!
-Good use case is filtering on web tool results.
+Use for chained/dependent tool calls and filtering/processing results, e.g. filtering web tool output. **DRAMATICALLY** faster than sequential tool calls!
 
-- All tools are async: `result = await read(path='file.txt')`
-- Tools return strings, not Python objects. Parse output yourself.
-- Use `asyncio.gather()` for concurrent calls within one execution.
-- Available libs: re, asyncio, sys, os, json.
-- No imports, no classes, no filesystem/network access.
+- All tools are async and return strings: `result = await read(path='file.txt')`. Parse output yourself.
+- Use `asyncio.gather()` for concurrency within one execution.
+- Available libs: re, asyncio, sys, os, json. No other imports, no classes, no filesystem/network access.
+- Fresh sandbox each run: no state persists between executions.
 - 30 second timeout (configurable via `timeout` parameter).
-- Avoid calling another tool when no transformation of its output is performed.
+- Skip it when a single tool call needs no transformation.
 - NOT a thinking scratchpad. Reason in your response text.
 ]]
 
