@@ -10,6 +10,7 @@ use maki_providers::model::Model;
 use maki_providers::provider::{self, Provider};
 use maki_storage::StateDir;
 use maki_storage::sessions::Session;
+use maki_util::EntityId;
 use serde_json::Value;
 use tracing::{error, warn};
 
@@ -32,19 +33,19 @@ struct SessionStore {
 }
 
 impl SessionStore {
-    fn open(session_id: &str, cwd: &str, model_spec: &str) -> Option<Self> {
+    fn open(session_id: EntityId, cwd: &str, model_spec: &str) -> Option<Self> {
         let dir = StateDir::resolve()
             .map_err(|e| warn!(error = %e, "state dir unavailable; session will not be persisted"))
             .ok()?;
         Some(Self::open_in(dir, session_id, cwd, model_spec))
     }
 
-    fn open_in(dir: StateDir, session_id: &str, cwd: &str, model_spec: &str) -> Self {
+    fn open_in(dir: StateDir, session_id: EntityId, cwd: &str, model_spec: &str) -> Self {
         match StoredSession::load(session_id, &dir) {
             Ok(session) => Self { dir, session },
             Err(_) => {
                 let mut session = StoredSession::new(model_spec, cwd);
-                session.id = session_id.to_owned();
+                session.id = session_id;
                 let mut store = Self { dir, session };
                 store.save();
                 store
@@ -84,7 +85,7 @@ pub struct HeadlessParams {
 pub struct HeadlessHandle {
     pub event_rx: Receiver<Envelope>,
     pub tool_names: Vec<String>,
-    pub session_id: String,
+    pub session_id: EntityId,
     pub cwd: String,
     pub task: smol::Task<()>,
 }
@@ -172,12 +173,11 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
 
     let (raw_tx, event_rx) = flume::unbounded::<Envelope>();
 
-    let session_id = uuid::Uuid::new_v4().to_string();
+    let session_id = maki_util::EntityId::generate();
 
     let fast = params.fast;
     let workflow = params.workflow;
     let task = smol::spawn({
-        let session_id = session_id.clone();
         let mcp_shutdown = params.mcp_handle.clone();
         let working_dir_path = params.initial_wd.clone();
         async move {
@@ -269,7 +269,7 @@ pub struct InteractiveParams {
     pub excluded_tools: Vec<&'static str>,
     pub mcp_handle: Option<McpHandle>,
     pub initial_wd: PathBuf,
-    pub session_id: Option<String>,
+    pub session_id: Option<EntityId>,
     pub initial_history: Vec<Message>,
     pub yolo: bool,
     pub system_prompt_override: Option<String>,
@@ -284,7 +284,7 @@ pub struct InteractiveHandle {
     pub answer_tx: flume::Sender<String>,
     pub cancel_tx: flume::Sender<()>,
     pub model_tx: flume::Sender<Model>,
-    pub session_id: String,
+    pub session_id: EntityId,
     pub permissions: Arc<PermissionManager>,
     pub task: smol::Task<()>,
 }
@@ -310,9 +310,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
     let (cancel_tx, cancel_rx) = flume::bounded::<()>(1);
     let (model_tx, model_rx) = flume::unbounded::<Model>();
 
-    let session_id = params
-        .session_id
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let session_id = params.session_id.unwrap_or_else(EntityId::generate);
 
     let working_dir = params.initial_wd.to_string_lossy().into_owned();
     let permissions = Arc::new(PermissionManager::new(
@@ -327,7 +325,6 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
     let file_tracker = FileReadTracker::fresh();
 
     let task = smol::spawn({
-        let session_id = session_id.clone();
         let permissions = Arc::clone(&permissions);
         async move {
             let mut model = params.model;
@@ -343,7 +340,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                     }
                 };
 
-            let mut store = SessionStore::open(&session_id, &working_dir, &model.spec());
+            let mut store = SessionStore::open(session_id, &working_dir, &model.spec());
             let mut history = History::restored(params.initial_history);
             let mut run_id: u64 = 0;
 
@@ -412,7 +409,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                         config: params.config.clone(),
                         tool_output_lines: ToolOutputLines::default(),
                         permissions: Arc::clone(&permissions),
-                        session_id: Some(session_id.clone()),
+                        session_id: Some(session_id),
                         timeouts: params.timeouts,
                         file_tracker: Arc::clone(&file_tracker),
                         prompt_slots: Arc::clone(&params.prompt_slots),
@@ -486,21 +483,25 @@ mod tests {
 
     use super::*;
 
-    const SESSION_ID: &str = "acp-test-session";
+    const SESSION_ID: &str = "01965087-4c71-7f00-8000-000000000000";
     const CWD: &str = "/project";
     const MODEL_SPEC: &str = "anthropic/claude-test";
+
+    fn session_id() -> maki_util::EntityId {
+        SESSION_ID.parse().unwrap()
+    }
 
     fn store_in(tmp: &TempDir) -> SessionStore {
         SessionStore::open_in(
             StateDir::from_path(tmp.path().to_path_buf()),
-            SESSION_ID,
+            session_id(),
             CWD,
             MODEL_SPEC,
         )
     }
 
     fn load(tmp: &TempDir) -> StoredSession {
-        StoredSession::load(SESSION_ID, &StateDir::from_path(tmp.path().to_path_buf())).unwrap()
+        StoredSession::load(session_id(), &StateDir::from_path(tmp.path().to_path_buf())).unwrap()
     }
 
     #[test]
@@ -508,7 +509,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         store_in(&tmp);
         let loaded = load(&tmp);
-        assert_eq!(loaded.id, SESSION_ID);
+        assert_eq!(loaded.id, session_id());
         assert_eq!(loaded.cwd, CWD);
         assert_eq!(loaded.model, MODEL_SPEC);
         assert!(loaded.messages.is_empty());

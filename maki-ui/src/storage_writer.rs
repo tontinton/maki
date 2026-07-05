@@ -98,11 +98,12 @@ fn open_or_create_log(
 ) -> Result<SessionLog, maki_storage::sessions::SessionError> {
     let jsonl_path = sessions_dir.join(format!("{}.jsonl", session.id));
     if jsonl_path.exists() {
+        let id = session.id;
         let (_loaded, log) = SessionLog::open::<
             maki_providers::Message,
             maki_providers::TokenUsage,
             maki_agent::ToolOutput,
-        >(sessions_dir, &session.id)?;
+        >(sessions_dir, id)?;
         Ok(log)
     } else {
         AppSession::migrate_to_jsonl(sessions_dir, session)

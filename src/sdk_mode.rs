@@ -25,6 +25,7 @@ use maki_providers::model::Model;
 use maki_providers::{ImageSource, Message, StopReason, Timeouts, TokenUsage};
 use maki_storage::StateDir;
 use maki_storage::sessions::Session;
+use maki_util::EntityId;
 use serde::Serialize;
 use serde_json::Value;
 use tracing::warn;
@@ -101,7 +102,7 @@ impl PermissionMode {
 struct WireMessage {
     #[serde(flatten)]
     inner: WireInner,
-    session_id: String,
+    session_id: EntityId,
     uuid: String,
 }
 
@@ -336,7 +337,7 @@ impl StreamSynth {
         vec![serde_json::json!({
             "type": "message_start",
             "message": {
-                "id": uuid::Uuid::new_v4().to_string(),
+                "id": maki_util::EntityId::generate().to_string(),
                 "type": "message",
                 "role": "assistant",
                 "content": [],
@@ -389,7 +390,7 @@ fn maki_to_claude_tool_name(name: &str) -> &str {
 
 #[derive(Clone)]
 struct SdkWriter {
-    session_id: String,
+    session_id: EntityId,
     out_tx: Sender<String>,
 }
 
@@ -397,8 +398,8 @@ impl SdkWriter {
     fn emit(&self, inner: WireInner) -> Result<()> {
         let msg = WireMessage {
             inner,
-            session_id: self.session_id.clone(),
-            uuid: uuid::Uuid::new_v4().to_string(),
+            session_id: self.session_id,
+            uuid: maki_util::EntityId::generate().to_string(),
         };
         self.out_tx
             .send(serde_json::to_string(&msg)?)
@@ -499,7 +500,7 @@ pub fn run(params: SdkParams) -> Result<()> {
     });
 
     let writer = SdkWriter {
-        session_id: handle.session_id.clone(),
+        session_id: handle.session_id,
         out_tx,
     };
     let tools: Vec<&str> = handle
@@ -633,11 +634,14 @@ pub fn run(params: SdkParams) -> Result<()> {
 
 type StoredSession = Session<Message, TokenUsage, ToolOutput>;
 
-fn resolve_session(cli: &Cli, cwd: &str) -> Result<(Option<String>, Vec<Message>)> {
+fn resolve_session(cli: &Cli, cwd: &str) -> Result<(Option<EntityId>, Vec<Message>)> {
     let (resumed_id, history) = if let Some(id) = &cli.session {
         let storage = StateDir::resolve().context("resolve state dir")?;
+        let parsed: maki_util::EntityId = id
+            .parse()
+            .map_err(|e| eyre!("invalid session id {id}: {e}"))?;
         let session =
-            StoredSession::load(id, &storage).map_err(|e| eyre!("load session {id}: {e}"))?;
+            StoredSession::load(parsed, &storage).map_err(|e| eyre!("load session {id}: {e}"))?;
         let resumed = (!cli.fork_session).then_some(session.id);
         (resumed, session.messages)
     } else if cli.continue_session {
@@ -650,7 +654,17 @@ fn resolve_session(cli: &Cli, cwd: &str) -> Result<(Option<String>, Vec<Message>
         (None, Vec::new())
     };
 
-    Ok((cli.session_id.clone().or(resumed_id), history))
+    let cli_session_id = cli.session_id.as_deref().map(|s| {
+        s.parse::<maki_util::EntityId>()
+            .map_err(|e| eyre!("invalid session id {s:?}: {e}"))
+    });
+    let cli_session_id = match cli_session_id {
+        Some(Ok(id)) => Some(id),
+        Some(Err(e)) => return Err(e),
+        None => None,
+    };
+
+    Ok((cli_session_id.or(resumed_id), history))
 }
 
 fn parse_or_warn<T: serde::de::DeserializeOwned>(payload: Value, what: &str) -> Option<T> {
@@ -939,7 +953,7 @@ impl EventPump {
                 }
                 self.writer.emit(WireInner::Assistant(AssistantPayload {
                     message: AssistantMessage {
-                        id: uuid::Uuid::new_v4().to_string(),
+                        id: maki_util::EntityId::generate().to_string(),
                         model: tc.model.clone(),
                         role: "assistant",
                         content: map_tool_names_in_content(&content_value),
@@ -1260,7 +1274,7 @@ mod tests {
                 usage: TokenUsage::default(),
                 permission_denials: Vec::new(),
             }),
-            session_id: "s".into(),
+            session_id: EntityId::generate(),
             uuid: "u".into(),
         };
         let json: Value = serde_json::to_value(&msg).unwrap();
@@ -1282,7 +1296,7 @@ mod tests {
                     "permissionMode": "default",
                 }),
             }),
-            session_id: "s".into(),
+            session_id: EntityId::generate(),
             uuid: "u".into(),
         };
         let json: Value = serde_json::to_value(&msg).unwrap();
@@ -1302,7 +1316,7 @@ mod tests {
                     error: None,
                 },
             }),
-            session_id: "s".into(),
+            session_id: EntityId::generate(),
             uuid: "u".into(),
         };
         let json: Value = serde_json::to_value(&msg).unwrap();
@@ -1322,7 +1336,7 @@ mod tests {
                     tool_use_id: Some("tool_123".into()),
                 },
             }),
-            session_id: "s".into(),
+            session_id: EntityId::generate(),
             uuid: "u".into(),
         };
         let json: Value = serde_json::to_value(&msg).unwrap();

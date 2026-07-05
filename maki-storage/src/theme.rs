@@ -1,11 +1,15 @@
 use std::fs;
 
+use tracing::warn;
+
 use crate::StateDir;
 
 const THEME_FILE: &str = "theme";
 
 pub fn persist_theme_name(dir: &StateDir, name: &str) {
-    let _ = fs::write(dir.path().join(THEME_FILE), name);
+    if let Err(e) = fs::write(dir.path().join(THEME_FILE), name) {
+        warn!(error = %e, "failed to persist theme name");
+    }
 }
 
 pub fn read_theme_name(dir: &StateDir) -> Option<String> {

@@ -4,6 +4,8 @@ use std::io::{self, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
+use tracing::warn;
+
 use crate::StateDir;
 
 const LOG_FILE_NAME: &str = "maki.log";
@@ -74,7 +76,11 @@ impl RotatingFileWriter {
 
         if needs_rotate {
             let last = self.max_files - 1;
-            let _ = fs::remove_file(file_path(&self.dir, last));
+            match fs::remove_file(file_path(&self.dir, last)) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => warn!(error = %e, "log rotate: failed to remove oldest file"),
+            }
 
             for i in (0..last).rev() {
                 let src = file_path(&self.dir, i);

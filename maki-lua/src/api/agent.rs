@@ -30,7 +30,6 @@ use mlua::{
 };
 use serde_json::Value as JsonValue;
 use tracing::info;
-use uuid::Uuid;
 
 use crate::api::ui::buf::BufHandle;
 use crate::api::util::convert::{json_to_lua, lua_to_json, lua_tool_result};
@@ -535,7 +534,7 @@ async fn session(
         None => agent_ctx.opts.thinking,
     };
 
-    let session_id = Uuid::new_v4().to_string();
+    let session_id = maki_util::EntityId::generate();
     let (sub_tx, sub_rx) = flume::unbounded::<Envelope>();
     let sub_event_tx = EventSender::new(sub_tx, agent_ctx.event_tx.run_id());
     let parent_tx = agent_ctx.event_tx.clone();

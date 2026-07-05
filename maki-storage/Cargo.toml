@@ -12,7 +12,7 @@ tempfile = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 etcetera = { workspace = true }
-uuid = { workspace = true }
+maki-util = { workspace = true }
 
 [dev-dependencies]
 test-case = { workspace = true }

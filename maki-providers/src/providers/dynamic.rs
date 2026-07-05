@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use flume::Sender;
+use maki_util::EntityId;
 use serde::Deserialize;
 use serde_json::Value;
 use strum::IntoEnumIterator;
@@ -517,7 +518,7 @@ impl Provider for DynamicProvider {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        session_id: Option<&'a str>,
+        session_id: Option<EntityId>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         self.inner
             .stream_message(model, messages, system, tools, event_tx, opts, session_id)

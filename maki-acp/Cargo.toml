@@ -7,6 +7,7 @@ edition.workspace = true
 maki-agent = { workspace = true }
 maki-providers = { workspace = true }
 maki-storage = { workspace = true }
+maki-util = { workspace = true }
 agent-client-protocol-schema = { workspace = true }
 smol = { workspace = true }
 flume = { workspace = true }

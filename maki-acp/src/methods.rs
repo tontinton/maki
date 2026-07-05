@@ -34,7 +34,7 @@ pub fn mode_state(current: &str) -> SessionModeState {
     )
 }
 
-pub fn new_session_response(session_id: &str) -> NewSessionResponse {
+pub fn new_session_response(session_id: maki_util::EntityId) -> NewSessionResponse {
     NewSessionResponse::new(session_id.to_string()).modes(mode_state(MODE_BUILD))
 }
 

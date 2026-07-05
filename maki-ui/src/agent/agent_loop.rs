@@ -17,6 +17,7 @@ use maki_agent::{
 };
 use maki_lua::EventHandle;
 use maki_providers::{AgentError, Message, Model, TokenUsage};
+use maki_util::EntityId;
 use serde_json::Value;
 use tracing::error;
 
@@ -42,7 +43,7 @@ pub(super) struct AgentLoop {
     agent_tx: flume::Sender<Envelope>,
     answer_rx: Arc<async_lock::Mutex<flume::Receiver<String>>>,
     queue: Arc<QueueReceiver>,
-    session_id: Option<String>,
+    session_id: Option<EntityId>,
     timeouts: maki_providers::Timeouts,
     lua_handle: Option<EventHandle>,
     subagent_cancels: Arc<CancelMap<String>>,
@@ -64,7 +65,7 @@ impl AgentLoop {
         queue: Arc<QueueReceiver>,
         cancel_map: Arc<RunCancelMap>,
         init_cancel: CancelToken,
-        session_id: Option<String>,
+        session_id: Option<EntityId>,
         timeouts: maki_providers::Timeouts,
         lua_handle: Option<EventHandle>,
         subagent_cancels: Arc<CancelMap<String>>,
@@ -229,7 +230,7 @@ impl AgentLoop {
                 config: self.config.clone(),
                 tool_output_lines: self.tool_output_lines,
                 permissions: Arc::clone(&self.permissions),
-                session_id: self.session_id.clone(),
+                session_id: self.session_id,
                 timeouts: self.timeouts,
                 file_tracker: Arc::clone(&self.file_tracker),
                 prompt_slots: Arc::new(prompt_slots),

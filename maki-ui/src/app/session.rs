@@ -221,7 +221,7 @@ impl App {
     pub(super) fn open_session_picker(&mut self) -> Vec<Action> {
         self.session_picker.open(
             &self.state.session.cwd,
-            &self.state.session.id,
+            self.state.session.id,
             &self.storage,
         );
         vec![]
@@ -245,8 +245,8 @@ impl App {
         self.loaded_session_snapshot()
     }
 
-    pub(super) fn load_session(&mut self, session_id: String) -> Vec<Action> {
-        let session = match AppSession::load(&session_id, &self.storage) {
+    pub(super) fn load_session(&mut self, session_id: maki_util::EntityId) -> Vec<Action> {
+        let session = match AppSession::load(session_id, &self.storage) {
             Ok(s) => s,
             Err(e) => {
                 self.status_bar
@@ -259,13 +259,13 @@ impl App {
         vec![Action::LoadSession(Box::new(loaded))]
     }
 
-    pub(super) fn delete_session(&mut self, session_id: String) -> Vec<Action> {
-        if let Err(e) = AppSession::delete(&session_id, &self.storage) {
+    pub(super) fn delete_session(&mut self, session_id: maki_util::EntityId) -> Vec<Action> {
+        if let Err(e) = AppSession::delete(session_id, &self.storage) {
             self.status_bar
                 .flash(format!("Failed to delete session: {e}"));
             return vec![];
         }
-        self.session_picker.remove_entry(&session_id);
+        self.session_picker.remove_entry(session_id);
         self.status_bar.flash("Session deleted".into());
         vec![]
     }
