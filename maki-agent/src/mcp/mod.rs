@@ -21,7 +21,6 @@ pub mod transport;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -42,36 +41,28 @@ const SEPARATOR: &str = "__";
 pub const UNKNOWN_MCP: &str = "unknown_mcp";
 const MCP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Signals warmup completion from the `run` task to anyone waiting on MCP tools to be live.
+/// Signals warmup completion from the `run` task to anyone waiting on MCP tools to be
+/// live. Carries a single `flume::Receiver<()>` whose sender lives in `run`'s scope and is
+/// dropped once warmup finishes (success, failure, or shutdown). `wait_until_warm` parks on
+/// `recv_async` until that drop flips the channel to `Disconnected`.
 ///
-/// `done` is the cross-task signal: `Release` on `set_done` pairs with `Acquire` on `is_done` so
-/// `wait_until_warm` sees the latest `ToolIndex` ArcSwap store that `finish_warmup` ran
-/// first. The bounded channel wakes a parked `wait_until_warm` immediately instead of polling.
+/// Ordering is mechanical: `finish_warmup` runs `publish` (the ArcSwap store) before dropping
+/// the sender, and flume guarantees every send happens-before a sender drop that happens-before
+/// an observing `is_disconnected`/`recv_async`. No atomics required.
 struct WarmSignal {
-    done: AtomicBool,
-    done_tx: flume::Sender<()>,
     done_rx: flume::Receiver<()>,
 }
 
-impl Default for WarmSignal {
-    fn default() -> Self {
-        let (done_tx, done_rx) = flume::bounded(1);
-        Self {
-            done: AtomicBool::new(false),
-            done_tx,
-            done_rx,
-        }
-    }
-}
-
 impl WarmSignal {
-    fn set_done(&self) {
-        self.done.store(true, Ordering::Release);
-        let _ = self.done_tx.try_send(());
+    fn new() -> (Self, flume::Sender<()>) {
+        let (done_tx, done_rx) = flume::bounded(1);
+        (Self { done_rx }, done_tx)
     }
 
     fn is_done(&self) -> bool {
-        self.done.load(Ordering::Acquire)
+        // `is_disconnected` is non-destructive (unlike `try_recv`, which would consume the
+        // single queued token and break later waiters). True once every sender has dropped.
+        self.done_rx.is_disconnected()
     }
 
     async fn wait_until_warm(&self, timeout: Duration) -> bool {
@@ -79,8 +70,8 @@ impl WarmSignal {
             return true;
         }
         // Race the done-signal against the timeout, mirroring `McpHandle::shutdown`'s ack-wait
-        // shape. `done_rx` is cloned per waiter so multiple concurrent callers each get their own
-        // receive; the `done` flag short-circuits late callers.
+        // shape. `done_rx` is cloned per waiter so multiple concurrent callers each get their
+        // own receive.
         let rx = self.done_rx.clone();
         let timed_out = futures_lite::future::or(
             async {
@@ -404,7 +395,8 @@ pub async fn start_with_config(config: McpConfig) -> Option<McpHandle> {
     publish(&inner, &index, &snapshot);
 
     let (cmd_tx, cmd_rx) = flume::unbounded();
-    let warm = Arc::new(WarmSignal::default());
+    let (warm, warm_tx) = WarmSignal::new();
+    let warm = Arc::new(warm);
     let handle = McpHandle {
         cmd_tx,
         index: Arc::clone(&index),
@@ -412,7 +404,7 @@ pub async fn start_with_config(config: McpConfig) -> Option<McpHandle> {
         warm: Arc::clone(&warm),
     };
 
-    smol::spawn(run(inner, index, snapshot, cmd_rx, warm)).detach();
+    smol::spawn(run(inner, index, snapshot, cmd_rx, warm_tx)).detach();
     Some(handle)
 }
 
@@ -457,7 +449,7 @@ async fn run(
     index: Arc<ArcSwap<ToolIndex>>,
     snapshot: Arc<ArcSwap<McpSnapshot>>,
     cmd_rx: flume::Receiver<McpCommand>,
-    warm: Arc<WarmSignal>,
+    warm_tx: flume::Sender<()>,
 ) {
     // --- warmup preamble ---
     // Concurrently start every enabled (Connecting) server, racing each completion against
@@ -529,12 +521,12 @@ async fn run(
     if let Some(ack) = shutdown_during_warmup {
         shutdown_all(&mut inner).await;
         inner.generation += 1;
-        finish_warmup(&inner, &index, &snapshot, &warm);
+        finish_warmup(&inner, &index, &snapshot, warm_tx);
         let _ = ack.try_send(());
         return;
     }
 
-    finish_warmup(&inner, &index, &snapshot, &warm);
+    finish_warmup(&inner, &index, &snapshot, warm_tx);
 
     // --- normal command loop (unchanged) ---
     let mut ack: Option<flume::Sender<()>> = None;
@@ -781,17 +773,17 @@ fn apply_start_result(
     }
 }
 
-/// Publish the latest state, then signal warmup done. `publish` must run before `set_done` so
-/// `wait_until_warm` never observes a stale empty `ToolIndex`. Fusing them here makes the
-/// ordering mechanical instead of convention-enforced.
+/// Publish the latest state, then signal warmup done by dropping the warmup sender. `publish`
+/// must run first so `wait_until_warm` never observes a stale empty `ToolIndex`; fusing them
+/// makes the ordering mechanical instead of convention-enforced.
 fn finish_warmup(
     inner: &McpManagerInner,
     index: &ArcSwap<ToolIndex>,
     snapshot: &ArcSwap<McpSnapshot>,
-    warm: &WarmSignal,
+    warm_tx: flume::Sender<()>,
 ) {
     publish(inner, index, snapshot);
-    warm.set_done();
+    drop(warm_tx);
 }
 
 /// The only place read-side state is updated. Every mutation in the command loop ends here.
@@ -1047,7 +1039,7 @@ mod tests {
             cmd_tx: flume::unbounded().0,
             index,
             snapshot,
-            warm: Arc::new(WarmSignal::default()),
+            warm: Arc::new(WarmSignal::new().0),
         };
         (inner, handle)
     }
@@ -1211,13 +1203,14 @@ mod tests {
             let index = Arc::new(ArcSwap::from_pointee(ToolIndex::default()));
             let snapshot = Arc::new(ArcSwap::from_pointee(McpSnapshot::default()));
             let (cmd_tx, cmd_rx) = flume::unbounded();
-            let warm = Arc::new(WarmSignal::default());
+            let (iter_warm, iter_warm_tx) = WarmSignal::new();
+            let warm = Arc::new(iter_warm);
             let loop_task = smol::spawn(run(
                 inner,
                 Arc::clone(&index),
                 Arc::clone(&snapshot),
                 cmd_rx,
-                Arc::clone(&warm),
+                iter_warm_tx,
             ));
 
             let (ack_tx, ack_rx) = flume::bounded(1);
@@ -1228,7 +1221,9 @@ mod tests {
             assert_eq!(t1.shutdowns(), 1);
             assert_eq!(t2.shutdowns(), 1);
             assert!(snapshot.load().infos.iter().all(|i| i.tool_count == 0));
-            assert!(warm.is_done());
+            // Shutdown completes warmup; a zero-timeout wait returns true (observable contract),
+            // so late callers never park forever.
+            assert!(warm.wait_until_warm(Duration::ZERO).await);
         });
     }
 }
