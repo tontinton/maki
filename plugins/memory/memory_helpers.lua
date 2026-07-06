@@ -200,9 +200,6 @@ function M.collect_file_entries_with_tags(dir)
     local path = maki.fs.joinpath(dir, name)
     local content, err = maki.fs.read(path)
     local tags = {}
-    if content and not err then
-      tags = M.parse_frontmatter(content).tags
-    end
     local from_stem = false
     if content and not err then
       tags = M.parse_frontmatter(content).tags
