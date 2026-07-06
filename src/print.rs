@@ -8,14 +8,15 @@
 //! Check their docs before changing anything here.
 
 use std::io::{self, Read};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use clap::ValueEnum;
 use color_eyre::Result;
-use color_eyre::eyre::Context;
+use color_eyre::eyre::{Context, eyre};
 use maki_agent::headless::{HeadlessHandle, HeadlessParams};
 use maki_agent::tools::QUESTION_TOOL_NAME;
-use maki_agent::{AgentConfig, AgentEvent, Envelope, PermissionsConfig};
+use maki_agent::{AgentConfig, AgentEvent, Envelope, ImageSource, PermissionsConfig};
 use maki_lua::EventHandle;
 use maki_providers::model::Model;
 use maki_providers::{StopReason, TokenUsage};
@@ -23,6 +24,20 @@ use serde::Serialize;
 use serde_json::Value;
 
 const AGENT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+// Fails fast: silently dropping an image the caller explicitly attached
+// would be worse than erroring.
+fn load_images(paths: &[PathBuf]) -> Result<Vec<ImageSource>> {
+    paths
+        .iter()
+        .map(|path| {
+            let media_type = maki_ui::image::media_type_for(path)
+                .ok_or_else(|| eyre!("unsupported image type: {}", path.display()))?;
+            maki_ui::image::load_file_image(path, media_type)
+                .map_err(|e| eyre!("failed to load image: {e}"))
+        })
+        .collect()
+}
 
 #[derive(Clone, ValueEnum)]
 pub enum OutputFormat {
@@ -121,6 +136,7 @@ impl VerboseOutput {
 pub fn run(
     model: &Model,
     prompt_arg: Option<String>,
+    image_paths: Vec<PathBuf>,
     format: OutputFormat,
     verbose: bool,
     config: AgentConfig,
@@ -137,6 +153,8 @@ pub fn run(
             buf
         }
     };
+
+    let images = load_images(&image_paths)?;
 
     let prompt_slots = lua_handle
         .as_ref()
@@ -155,6 +173,7 @@ pub fn run(
         permissions_config,
         timeouts,
         prompt,
+        images,
         prompt_slots,
         excluded_tools: vec![QUESTION_TOOL_NAME],
         mcp_handle,

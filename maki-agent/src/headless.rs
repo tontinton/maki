@@ -21,7 +21,7 @@ use crate::template;
 use crate::tools::{DescriptionContext, FileReadTracker, ToolFilter, ToolRegistry};
 use crate::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, Envelope,
-    EventSender, McpHandle, PermissionsConfig, ToolOutput, ToolOutputLines,
+    EventSender, ImageSource, McpHandle, PermissionsConfig, ToolOutput, ToolOutputLines,
 };
 
 type StoredSession = Session<Message, TokenUsage, ToolOutput>;
@@ -72,6 +72,7 @@ pub struct HeadlessParams {
     pub permissions_config: PermissionsConfig,
     pub timeouts: Timeouts,
     pub prompt: String,
+    pub images: Vec<ImageSource>,
     pub prompt_slots: ResolvedSlots,
     pub excluded_tools: Vec<&'static str>,
     pub mcp_handle: Option<McpHandle>,
@@ -207,6 +208,7 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
                 .run(AgentInput {
                     message: params.prompt,
                     mode,
+                    images: params.images,
                     fast,
                     ..Default::default()
                 })

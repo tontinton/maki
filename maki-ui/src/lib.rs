@@ -12,7 +12,7 @@ pub use components::command::{BUILTIN_COMMANDS, BuiltinCommand};
 pub use components::keybindings;
 mod highlight;
 pub use highlight::highlight_ansi;
-mod image;
+pub mod image;
 mod markdown;
 mod render_worker;
 mod selection;
