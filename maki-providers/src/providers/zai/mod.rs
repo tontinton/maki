@@ -70,6 +70,7 @@ impl From<QuotaResponse> for ProviderUsage {
                     label: quota_label(&l.kind, l.unit),
                     percentage: l.percentage,
                     reset_at: l.next_reset_time,
+                    detail: None,
                 })
                 .collect(),
         }

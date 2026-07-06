@@ -25,6 +25,9 @@ const MODEL_COL_MIN: usize = 16;
 const NUM_COL: usize = 7;
 const COL_GAP: usize = 2;
 const NO_USAGE_ENDPOINT: &str = "no usage endpoint for this provider";
+const HOUR: i64 = 3600;
+const DAY: i64 = 24 * HOUR;
+const WEEK: i64 = 7 * DAY;
 
 /// Live provider quota fetch, shared from the event loop. `Loading` is shown
 /// until the background fetch completes; the modal reads this each render.
@@ -294,15 +297,28 @@ fn quota_lines(state: &UsageFetchState, theme: &crate::theme::Theme) -> Vec<Line
                 )));
             }
             let tz = TimeZone::system();
+            let label_w = usage
+                .limits
+                .iter()
+                .map(|l| l.label.chars().count())
+                .max()
+                .unwrap_or(0);
             for limit in &usage.limits {
-                let reset = limit.reset_at.map_or_else(String::new, |ms| {
-                    format!("  resets {}", format_reset(ms, &tz))
-                });
-                out.push(Line::from(vec![
-                    Span::styled(format!("{PREFIX}{:<18}", limit.label), fg),
+                let mut spans = vec![
+                    Span::styled(format!("{PREFIX}{:<label_w$}", limit.label), fg),
                     Span::styled(format!("{:>3}%", limit.percentage), theme.accent),
-                    Span::styled(reset, dim),
-                ]));
+                    Span::styled(" used", dim),
+                ];
+                if let Some(detail) = &limit.detail {
+                    spans.push(Span::styled(format!("  {detail}"), dim));
+                }
+                if let Some(ms) = limit.reset_at {
+                    spans.push(Span::styled(
+                        format!("  Resets {}", format_reset(ms, &tz)),
+                        dim,
+                    ));
+                }
+                out.push(Line::from(spans));
             }
             out
         }
@@ -314,28 +330,27 @@ fn format_reset(epoch_ms: u64, tz: &TimeZone) -> String {
     let Ok(ts) = Timestamp::from_second(secs) else {
         return epoch_ms.to_string();
     };
-    let zoned = ts.to_zoned(tz.clone());
-    let absolute = zoned.strftime("%b %d %H:%M").to_string();
-    let now = Timestamp::now().as_second();
-    match relative(secs - now) {
-        Some(rel) => format!("{absolute} ({rel})"),
-        None => absolute,
+    let delta = secs - Timestamp::now().as_second();
+    if (1..DAY).contains(&delta) {
+        return relative(delta);
     }
+    let zoned = ts.to_zoned(tz.clone());
+    let fmt = if delta < WEEK {
+        "%a %-I:%M %p"
+    } else {
+        "%b %-d, %-I:%M %p"
+    };
+    zoned.strftime(fmt).to_string()
 }
 
-fn relative(seconds: i64) -> Option<String> {
-    if seconds <= 0 {
-        return None;
-    }
-    let hrs = seconds / 3600;
-    let label = if hrs >= 24 {
-        format!("in {}d", hrs / 24)
-    } else if hrs > 0 {
-        format!("in {hrs}h")
+fn relative(seconds: i64) -> String {
+    let hrs = seconds / HOUR;
+    let mins = (seconds % HOUR) / 60;
+    if hrs > 0 {
+        format!("in {hrs} hr {mins} min")
     } else {
-        format!("in {}m", seconds / 60)
-    };
-    Some(label)
+        format!("in {mins} min")
+    }
 }
 
 #[cfg(test)]
@@ -384,14 +399,16 @@ mod tests {
             plan: Some("lite".into()),
             limits: vec![
                 UsageLimit {
-                    label: "5-hour tokens".into(),
+                    label: "Current session".into(),
                     percentage: 16,
                     reset_at: Some(0),
+                    detail: None,
                 },
                 UsageLimit {
-                    label: "Weekly tokens".into(),
+                    label: "Usage credits".into(),
                     percentage: 4,
                     reset_at: None,
+                    detail: Some("$2.33 spent".into()),
                 },
             ],
         };
@@ -407,16 +424,23 @@ mod tests {
             lines[1]
                 .spans
                 .iter()
-                .any(|s| s.content.contains("5-hour tokens"))
+                .any(|s| s.content.contains("Current session"))
         );
         assert!(lines[1].spans.iter().any(|s| s.content.contains("16%")));
+        assert!(lines[1].spans.iter().any(|s| s.content.contains("used")));
         assert!(
             lines[2]
                 .spans
                 .iter()
-                .any(|s| s.content.contains("Weekly tokens"))
+                .any(|s| s.content.contains("Usage credits"))
         );
         assert!(lines[2].spans.iter().any(|s| s.content.contains("4%")));
+        assert!(
+            lines[2]
+                .spans
+                .iter()
+                .any(|s| s.content.contains("$2.33 spent"))
+        );
     }
 
     #[test]
@@ -438,10 +462,9 @@ mod tests {
 
     #[test]
     fn relative_formats_future_windows() {
-        assert_eq!(relative(30).as_deref(), Some("in 0m"));
-        assert_eq!(relative(120).as_deref(), Some("in 2m"));
-        assert_eq!(relative(3 * 3600).as_deref(), Some("in 3h"));
-        assert_eq!(relative(2 * 24 * 3600).as_deref(), Some("in 2d"));
-        assert_eq!(relative(-5), None);
+        assert_eq!(relative(30), "in 0 min");
+        assert_eq!(relative(120), "in 2 min");
+        assert_eq!(relative(3 * HOUR + 36 * 60), "in 3 hr 36 min");
+        assert_eq!(relative(5 * HOUR), "in 5 hr 0 min");
     }
 }

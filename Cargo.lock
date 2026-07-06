@@ -2652,6 +2652,7 @@ dependencies = [
  "hmac",
  "inventory",
  "isahc",
+ "jiff",
  "maki-config",
  "maki-storage",
  "serde",

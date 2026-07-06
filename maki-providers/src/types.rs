@@ -453,6 +453,9 @@ pub struct UsageLimit {
     /// When the window resets, as epoch milliseconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reset_at: Option<u64>,
+    /// Extra provider-supplied context, e.g. "$2.33 spent" for usage credits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 #[cfg(test)]

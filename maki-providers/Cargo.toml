@@ -23,6 +23,7 @@ wait-timeout = { workspace = true }
 fastrand = { workspace = true }
 maki-config = { workspace = true }
 inventory = { workspace = true }
+jiff = { workspace = true }
 
 [dev-dependencies]
 test-case = { workspace = true }

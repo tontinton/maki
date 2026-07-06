@@ -16,7 +16,9 @@ use tracing::debug;
 
 use crate::model::Model;
 use crate::provider::{BoxFuture, Provider};
-use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
+use crate::{
+    AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse, UsageLimit,
+};
 
 use super::KeyPool;
 
@@ -24,6 +26,11 @@ const API_VERSION: &str = "2023-06-01";
 const MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
 const MODELS_URL: &str = "https://api.anthropic.com/v1/models?limit=1000";
 const FAST_MODE_BETA: &str = "fast-mode-2026-02-01";
+const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
+const OAUTH_BETA: &str = "oauth-2025-04-20";
+const MONEY_EXPONENT: u32 = 2;
+const LABEL_SESSION: &str = "Current session";
+const LABEL_WEEK_ALL: &str = "Current week (all models)";
 
 const ENV_VAR: &str = "ANTHROPIC_API_KEY";
 
@@ -50,6 +57,163 @@ fn apply_fast_mode(body: &mut Value, model: &Model, opts: RequestOptions) -> boo
         body["speed"] = json!("fast");
     }
     on
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct OauthUsage {
+    limits: Vec<ApiLimit>,
+    spend: Option<Spend>,
+    five_hour: Option<UsageWindow>,
+    seven_day: Option<UsageWindow>,
+    seven_day_sonnet: Option<UsageWindow>,
+    seven_day_opus: Option<UsageWindow>,
+    extra_usage: Option<ExtraUsage>,
+}
+
+#[derive(Deserialize)]
+struct ApiLimit {
+    kind: String,
+    #[serde(default)]
+    percent: Option<f64>,
+    #[serde(default)]
+    resets_at: Option<String>,
+    #[serde(default)]
+    scope: Value,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct Spend {
+    enabled: bool,
+    percent: Option<f64>,
+    used: Option<Money>,
+}
+
+#[derive(Deserialize)]
+struct Money {
+    amount_minor: i64,
+    #[serde(default)]
+    currency: Option<String>,
+    #[serde(default)]
+    exponent: Option<u32>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct UsageWindow {
+    utilization: Option<f64>,
+    resets_at: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct ExtraUsage {
+    is_enabled: bool,
+    utilization: Option<f64>,
+    used_credits: Option<f64>,
+    currency: Option<String>,
+    decimal_places: Option<u32>,
+}
+
+fn parse_reset(rfc3339: &str) -> Option<u64> {
+    let ts: jiff::Timestamp = rfc3339.parse().ok()?;
+    u64::try_from(ts.as_millisecond()).ok()
+}
+
+fn spent(minor_units: f64, exponent: Option<u32>, currency: Option<&str>) -> String {
+    let amount = minor_units / 10f64.powi(exponent.unwrap_or(MONEY_EXPONENT) as i32);
+    match currency {
+        None | Some("USD") => format!("${amount:.2} spent"),
+        Some(c) => format!("{amount:.2} {c} spent"),
+    }
+}
+
+fn limit_label(l: &ApiLimit) -> String {
+    match l.kind.as_str() {
+        "session" => LABEL_SESSION.into(),
+        "weekly_all" => LABEL_WEEK_ALL.into(),
+        "weekly_scoped" => match l
+            .scope
+            .pointer("/model/display_name")
+            .and_then(Value::as_str)
+        {
+            Some(name) => format!("Current week ({name})"),
+            None => "Current week".into(),
+        },
+        other => other.into(),
+    }
+}
+
+fn credits_limit(u: &OauthUsage) -> Option<UsageLimit> {
+    let (percent, detail) = match (&u.spend, &u.extra_usage) {
+        (Some(s), _) if s.enabled => (
+            s.percent.unwrap_or_default(),
+            s.used
+                .as_ref()
+                .map(|m| spent(m.amount_minor as f64, m.exponent, m.currency.as_deref())),
+        ),
+        (None, Some(e)) if e.is_enabled => (
+            e.utilization?,
+            e.used_credits
+                .map(|c| spent(c, e.decimal_places, e.currency.as_deref())),
+        ),
+        _ => return None,
+    };
+    Some(UsageLimit {
+        label: "Usage credits".into(),
+        percentage: percent.round() as u32,
+        reset_at: None,
+        detail,
+    })
+}
+
+impl From<OauthUsage> for ProviderUsage {
+    fn from(u: OauthUsage) -> Self {
+        let mut limits: Vec<UsageLimit> = u
+            .limits
+            .iter()
+            .filter_map(|l| {
+                Some(UsageLimit {
+                    label: limit_label(l),
+                    percentage: l.percent?.round() as u32,
+                    reset_at: l.resets_at.as_deref().and_then(parse_reset),
+                    detail: None,
+                })
+            })
+            .collect();
+        if limits.is_empty() {
+            let windows = [
+                (LABEL_SESSION, &u.five_hour),
+                (LABEL_WEEK_ALL, &u.seven_day),
+                ("Current week (Sonnet)", &u.seven_day_sonnet),
+                ("Current week (Opus)", &u.seven_day_opus),
+            ];
+            limits.extend(windows.into_iter().filter_map(|(label, w)| {
+                let w = w.as_ref()?;
+                Some(UsageLimit {
+                    label: label.into(),
+                    percentage: w.utilization?.round() as u32,
+                    reset_at: w.resets_at.as_deref().and_then(parse_reset),
+                    detail: None,
+                })
+            }));
+        }
+        limits.extend(credits_limit(&u));
+        ProviderUsage { plan: None, limits }
+    }
+}
+
+/// Subscription quota only exists for OAuth tokens against the real Anthropic
+/// API; API keys and anthropic-protocol third-party endpoints have none.
+fn usage_eligible(auth: &super::ResolvedAuth) -> bool {
+    auth.headers
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+        && auth
+            .base_url
+            .as_deref()
+            .is_none_or(|u| u.contains("api.anthropic.com"))
 }
 
 fn resolve_auth_from_key(key: &str) -> super::ResolvedAuth {
@@ -257,6 +421,24 @@ impl Provider for Anthropic {
                 .is_some_and(|p| p.rotate_auth(&self.auth, resolve_auth_from_key)))
         })
     }
+
+    fn fetch_usage(&self) -> BoxFuture<'_, Result<Option<ProviderUsage>, AgentError>> {
+        Box::pin(async move {
+            if !usage_eligible(&self.auth.lock().unwrap()) {
+                return Ok(None);
+            }
+            let request = self
+                .build_request("GET", Some(USAGE_URL))
+                .header("anthropic-beta", OAUTH_BETA)
+                .body(())?;
+            let mut response = self.client.send_async(request).await?;
+            if response.status().as_u16() != 200 {
+                return Err(AgentError::from_response(response).await);
+            }
+            let parsed: OauthUsage = serde_json::from_str(&response.text().await?)?;
+            Ok(Some(parsed.into()))
+        })
+    }
 }
 
 #[derive(Deserialize)]
@@ -314,8 +496,100 @@ mod tests {
     use serde_json::{Value, json};
     use shared::build_wire_messages;
     use std::time::Duration;
+    use test_case::test_case;
 
     const TEST_STREAM_TIMEOUT: Duration = Duration::from_secs(300);
+
+    const USAGE_BODY: &str = r#"{
+        "five_hour": {"utilization": 14.0, "resets_at": "2026-02-06T22:00:00+00:00"},
+        "seven_day": {"utilization": 2.0,  "resets_at": "2026-02-09T00:00:00+00:00"},
+        "limits": [
+            {"kind": "session",       "group": "session", "percent": 14, "severity": "normal",
+             "resets_at": "2026-02-06T22:00:00+00:00", "scope": null, "is_active": true},
+            {"kind": "weekly_all",    "group": "weekly",  "percent": 2,  "severity": "normal",
+             "resets_at": "2026-02-09T00:00:00+00:00", "scope": null, "is_active": false},
+            {"kind": "weekly_scoped", "group": "weekly",  "percent": 3,  "severity": "normal",
+             "resets_at": "2026-02-09T00:00:00+00:00",
+             "scope": {"model": {"id": null, "display_name": "Fable"}, "surface": null},
+             "is_active": false}
+        ],
+        "extra_usage": {"is_enabled": true, "monthly_limit": 15000, "used_credits": 233.0,
+                        "utilization": 1.55, "currency": "USD", "decimal_places": 2},
+        "spend": {
+            "used":  {"amount_minor": 233,   "currency": "USD", "exponent": 2},
+            "limit": {"amount_minor": 15000, "currency": "USD", "exponent": 2},
+            "percent": 2, "severity": "normal", "enabled": true
+        }
+    }"#;
+
+    #[test]
+    fn parse_oauth_usage_response() {
+        let parsed: OauthUsage = serde_json::from_str(USAGE_BODY).unwrap();
+        let usage: ProviderUsage = parsed.into();
+        assert!(usage.plan.is_none());
+        assert_eq!(usage.limits.len(), 4);
+        assert_eq!(usage.limits[0].label, "Current session");
+        assert_eq!(usage.limits[0].percentage, 14);
+        assert_eq!(usage.limits[0].reset_at, Some(1770415200000));
+        assert_eq!(usage.limits[1].label, "Current week (all models)");
+        assert_eq!(usage.limits[1].percentage, 2);
+        assert_eq!(usage.limits[2].label, "Current week (Fable)");
+        assert_eq!(usage.limits[2].percentage, 3);
+        assert_eq!(usage.limits[3].label, "Usage credits");
+        assert_eq!(usage.limits[3].percentage, 2);
+        assert_eq!(usage.limits[3].reset_at, None);
+        assert_eq!(usage.limits[3].detail.as_deref(), Some("$2.33 spent"));
+    }
+
+    #[test]
+    fn parse_oauth_usage_windows_fallback() {
+        let body = r#"{
+            "five_hour":        {"utilization": 35.4, "resets_at": "2026-02-06T22:00:00+00:00"},
+            "seven_day":        {"utilization": 14.0, "resets_at": "2026-02-09T00:00:00+00:00"},
+            "seven_day_sonnet": {"utilization": 39.0, "resets_at": "2026-02-09T00:00:00+00:00"},
+            "seven_day_opus":   {"utilization": 2.6,  "resets_at": "2026-02-09T00:00:00+00:00"},
+            "extra_usage":      {"is_enabled": true, "used_credits": 233.0, "utilization": 2.0}
+        }"#;
+        let parsed: OauthUsage = serde_json::from_str(body).unwrap();
+        let usage: ProviderUsage = parsed.into();
+        assert_eq!(usage.limits.len(), 5);
+        assert_eq!(usage.limits[0].label, "Current session");
+        assert_eq!(usage.limits[0].percentage, 35);
+        assert_eq!(usage.limits[0].reset_at, Some(1770415200000));
+        assert_eq!(usage.limits[1].label, "Current week (all models)");
+        assert_eq!(usage.limits[2].label, "Current week (Sonnet)");
+        assert_eq!(usage.limits[3].label, "Current week (Opus)");
+        assert_eq!(usage.limits[3].percentage, 3);
+        assert_eq!(usage.limits[4].label, "Usage credits");
+        assert_eq!(usage.limits[4].percentage, 2);
+        assert_eq!(usage.limits[4].detail.as_deref(), Some("$2.33 spent"));
+    }
+
+    #[test]
+    fn parse_oauth_usage_null_windows_skipped() {
+        let body = r#"{
+            "five_hour": {"utilization": 5.0, "resets_at": "not a timestamp"},
+            "seven_day_opus": null,
+            "extra_usage": {"is_enabled": true, "utilization": null}
+        }"#;
+        let parsed: OauthUsage = serde_json::from_str(body).unwrap();
+        let usage: ProviderUsage = parsed.into();
+        assert_eq!(usage.limits.len(), 1);
+        assert_eq!(usage.limits[0].label, "Current session");
+        assert_eq!(usage.limits[0].reset_at, None);
+    }
+
+    #[test_case("Authorization", None, true ; "bearer_default_url_eligible")]
+    #[test_case("authorization", Some("https://api.anthropic.com/v1/messages"), true ; "bearer_anthropic_url_eligible")]
+    #[test_case("x-api-key", None, false ; "api_key_not_eligible")]
+    #[test_case("Authorization", Some("https://proxy.example.com/v1/messages"), false ; "foreign_base_url_not_eligible")]
+    fn usage_eligibility(header: &str, base_url: Option<&str>, expected: bool) {
+        let auth = crate::providers::ResolvedAuth {
+            base_url: base_url.map(String::from),
+            headers: vec![(header.into(), "token".into())],
+        };
+        assert_eq!(usage_eligible(&auth), expected);
+    }
 
     fn mock_response(data: &'static [u8]) -> isahc::Response<isahc::AsyncBody> {
         let body = isahc::AsyncBody::from_bytes_static(data);

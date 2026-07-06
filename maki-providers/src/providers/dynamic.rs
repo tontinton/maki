@@ -13,7 +13,7 @@ use tracing::{debug, warn};
 
 use crate::model::{Model, ModelPricing, ModelTier, models_for_provider};
 use crate::provider::{BoxFuture, Provider, ProviderKind};
-use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
+use crate::{AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse};
 
 use super::ResolvedAuth;
 use super::anthropic::Anthropic;
@@ -546,7 +546,11 @@ impl Provider for DynamicProvider {
     }
 
     fn reload_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
-        self.run_auth_script("resolve")
+        self.run_auth_script("reload")
+    }
+
+    fn fetch_usage(&self) -> BoxFuture<'_, Result<Option<ProviderUsage>, AgentError>> {
+        self.inner.fetch_usage()
     }
 }
 
