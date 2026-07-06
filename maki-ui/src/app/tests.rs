@@ -1547,6 +1547,20 @@ fn usage_command_toggles_modal() {
 }
 
 #[test]
+fn ctrl_r_refreshes_usage_while_modal_open() {
+    let mut app = test_app();
+    app.execute_command(cmd("/usage"));
+    assert!(app.usage_modal.is_open());
+
+    let actions = app.update(Msg::Key(kb::REFRESH.to_key_event()));
+    assert!(
+        actions.iter().any(|a| matches!(a, Action::RefreshUsage)),
+        "Ctrl+R should emit RefreshUsage"
+    );
+    assert!(app.usage_modal.is_open(), "modal should stay open");
+}
+
+#[test]
 fn cd_command_behavior() {
     let mut app = test_app();
     app.execute_command(ParsedCommand {

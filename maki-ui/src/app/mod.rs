@@ -504,6 +504,9 @@ impl App {
         }
 
         if self.usage_modal.is_open() {
+            if key::REFRESH.matches(key) {
+                return Some(vec![Action::RefreshUsage]);
+            }
             self.usage_modal.handle_key(key);
             return Some(vec![]);
         }

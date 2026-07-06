@@ -109,6 +109,20 @@ impl UsageModal {
             render_vertical_scrollbar(frame, inner, total, scroll);
         }
 
+        let hint = Line::from(vec![
+            Span::raw(" "),
+            Span::styled("Ctrl+R", theme.keybind_key),
+            Span::styled(" reload ", theme.tool_dim),
+        ]);
+        let hint_w = hint.width() as u16;
+        let hint_area = Rect {
+            x: popup.x + popup.width.saturating_sub(hint_w + 1),
+            y: popup.y + popup.height.saturating_sub(1),
+            width: hint_w,
+            height: 1,
+        };
+        frame.render_widget(Paragraph::new(hint), hint_area);
+
         popup
     }
 }
