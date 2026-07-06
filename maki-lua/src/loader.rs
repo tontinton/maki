@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -130,6 +131,16 @@ impl PluginHost {
 
     pub fn disabled() -> Self {
         Self { inner: None }
+    }
+
+    /// Boots the runtime and loads every default bundled plugin into `registry`.
+    /// A convenience over `new` + `load_builtins(PluginsConfig::from_tools(defaults))`
+    /// for callers (tests, docgen, headless runs) that want the full builtin set
+    /// without permuting a config.
+    pub fn with_all_builtins(registry: Arc<ToolRegistry>) -> Result<Self, PluginError> {
+        let mut host = Self::new(registry)?;
+        host.load_builtins(&PluginsConfig::from_tools(HashMap::new()))?;
+        Ok(host)
     }
 
     pub fn load_init_files(&self, cwd: &Path) -> Result<Option<RawConfig>, PluginError> {
@@ -411,9 +422,7 @@ mod tests {
     #[test]
     fn memory_builtin_registers_command() {
         let reg = Arc::new(ToolRegistry::new());
-        let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
-        host.load_builtins(&PluginsConfig::from_tools(std::collections::HashMap::new()))
-            .unwrap();
+        let host = PluginHost::with_all_builtins(Arc::clone(&reg)).unwrap();
         let reader = host.command_reader();
         let snap = reader.load();
         let found = snap.commands.iter().any(|c| c.name.as_ref() == "/memory");

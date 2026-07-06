@@ -14,7 +14,7 @@ Maki ships with 18 built-in tools. This is the full reference.
 ### `bash` *(lua plugin)*
 
 Execute a bash command.
-Commands run in
+Commands run in <cwd> by default.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
@@ -63,6 +63,17 @@ Prefer this over edit when making multiple changes to the same file.
 | `edits` | array | yes | Array of edit operations to apply sequentially |
 | `path` | string | yes | Absolute path to the file |
 
+### `edit_lines` *(lua plugin, opt-in)*
+
+Edit lines by number. Omit `end` to insert before `start` without removing lines. Set `end` to replace or delete (empty `new_string`) a range.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `end` | integer | no | Last line, inclusive. Omit to insert before start without removing lines. |
+| `new_string` | string | yes | Replacement text |
+| `path` | string | yes | Absolute path to the file |
+| `start` | integer | yes | First line (1-indexed) |
+
 ### `glob` *(lua plugin)*
 
 Find files by glob pattern.
@@ -95,7 +106,7 @@ Return a compact overview of a source file: imports, type definitions, function 
 
 ## Execution & Control
 
-### `batch`
+### `batch` *(native)*
 
 Executes multiple independent tool calls concurrently to reduce round-trips.
 

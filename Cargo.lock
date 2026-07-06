@@ -2470,11 +2470,14 @@ version = "0.3.25"
 dependencies = [
  "maki-agent",
  "maki-config",
+ "maki-lua",
  "maki-providers",
  "maki-ui",
+ "regex",
  "serde_json",
  "smol",
  "strum 0.27.2",
+ "test-case",
 ]
 
 [[package]]
