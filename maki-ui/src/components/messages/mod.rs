@@ -6,14 +6,11 @@ mod tests;
 
 use self::render::RenderCursor;
 use self::segment::{Segment, SegmentCache, wrapped_line_count};
-use self::selection::parse_batch_inner_id;
 
-use super::render_hints::RenderHintsRegistry;
 use super::tool_display::{
-    BatchChildState, RenderCtx, ToolLines, append_annotation, append_right_info, assistant_style,
-    build_batch_entry_lines, build_instructions_lines, build_tool_lines, done_style, error_style,
-    format_timestamp_now, output_limits_from_hints, thinking_style, tool_output_annotation,
-    truncate_to_header, user_style,
+    RenderCtx, ToolLines, append_annotation, append_right_info, assistant_style,
+    build_instructions_lines, build_tool_lines, done_style, error_style, format_timestamp_now,
+    thinking_style, truncate_to_header, user_style,
 };
 use super::{
     DisplayMessage, DisplayRole, ToolRole, ToolStatus, apply_scroll_delta, code_view::SectionFlags,
@@ -27,15 +24,15 @@ use crate::splash::{ColorTransition, Splash};
 use crate::theme;
 use maki_config::{ToolOutputLines, UiConfig};
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
 use super::scrollbar::render_vertical_scrollbar;
 use super::streaming_content::StreamingContent;
 use maki_agent::{
-    BatchToolEntry, BatchToolStatus, BufferSnapshot, EventSender, InstructionBlock, NO_FILES_FOUND,
-    SharedBuf, ToolDoneEvent, ToolOutput, ToolStartEvent,
+    BufferSnapshot, EventSender, InstructionBlock, NO_FILES_FOUND, SharedBuf, ToolDoneEvent,
+    ToolOutput, ToolStartEvent,
 };
 use maki_lua::EventHandle;
 
@@ -62,11 +59,10 @@ pub struct MessagesPanel {
     idle_splash: Splash,
     accent: ColorTransition,
     expanded_tools: HashMap<String, SectionFlags>,
-    lua_expanded: HashSet<String>,
+    /// Per-tool log of post-completion click rows, replayed on restore.
+    lua_clicks: HashMap<String, Vec<usize>>,
     live_bufs: HashMap<String, Arc<SharedBuf>>,
-    batch_children: HashMap<String, BatchChildState>,
     tool_output_lines: ToolOutputLines,
-    render_hints: RenderHintsRegistry,
     lua_event_handle: Option<EventHandle>,
     restore_event_tx: Option<EventSender>,
     show_thinking: bool,
@@ -108,11 +104,9 @@ impl MessagesPanel {
             idle_splash: Splash::new(ui_config.splash_animation),
             accent: ColorTransition::new(theme::current().mode_build),
             expanded_tools: HashMap::new(),
-            lua_expanded: HashSet::new(),
+            lua_clicks: HashMap::new(),
             live_bufs: HashMap::new(),
-            batch_children: HashMap::new(),
             tool_output_lines: ui_config.tool_output_lines,
-            render_hints: RenderHintsRegistry::new(),
             lua_event_handle: None,
             restore_event_tx: None,
             show_thinking: ui_config.show_thinking,
@@ -145,8 +139,7 @@ impl MessagesPanel {
         self.messages = msgs;
         self.cache.clear();
         self.expanded_tools.clear();
-        self.lua_expanded.clear();
-        self.batch_children.clear();
+        self.lua_clicks.clear();
         self.live_bufs.clear();
         self.rebake_requested.clear();
         self.highlight_segment = None;
@@ -215,10 +208,8 @@ impl MessagesPanel {
             return;
         };
         let tool_name = msg.role.tool_name().unwrap_or("");
-        let hints = self.render_hints.get(tool_name);
-        let limits = output_limits_from_hints(tool_name, hints, &self.tool_output_lines);
         truncate_to_header(&mut msg.text);
-        let truncated = truncate_output(content, limits.max_lines, limits.keep);
+        let truncated = truncate_output(content, self.tool_output_lines.get(tool_name));
         msg.truncated_lines = truncated.skipped;
         msg.text.push('\n');
         msg.text.push_str(&truncated.kept);
@@ -247,12 +238,11 @@ impl MessagesPanel {
             };
         }
         truncate_to_header(&mut msg.text);
-        let hints = self.render_hints.get(&event.tool);
         let done_annotation = event
             .annotation
             .as_deref()
             .map(str::to_owned)
-            .or_else(|| tool_output_annotation(&event.output));
+            .or_else(|| event.output.annotation());
         if let Some(suffix) = &done_annotation {
             append_annotation(&mut msg.annotation, suffix);
         }
@@ -261,8 +251,7 @@ impl MessagesPanel {
             ToolOutput::Plain(text) | ToolOutput::Markdown(text) | ToolOutput::ReadDir(text)
                 if msg.render_snapshot.is_none() =>
             {
-                let limits = output_limits_from_hints(&event.tool, hints, &self.tool_output_lines);
-                let tr = truncate_output(&text.text, limits.max_lines, limits.keep);
+                let tr = truncate_output(&text.text, self.tool_output_lines.get(&event.tool));
                 msg.truncated_lines = tr.skipped;
                 if !tr.kept.is_empty() {
                     msg.text = format!("{}\n{}", msg.text, tr.kept);
@@ -271,83 +260,19 @@ impl MessagesPanel {
             ToolOutput::GrepResult { entries } if entries.is_empty() => {
                 msg.text = format!("{}\n{NO_FILES_FOUND}", msg.text);
             }
-            ToolOutput::Batch { entries, .. } => {
-                let failed = entries
-                    .iter()
-                    .filter(|e| e.status == BatchToolStatus::Error)
-                    .count();
-                if failed > 0 {
-                    let total = entries.len();
-                    msg.text = format!("{}/{total} tools succeeded", total - failed);
-                }
-            }
             _ => {}
         }
-        if let ToolOutput::Batch {
-            entries: new_entries,
-            text,
-        } = &event.output
-            && let Some(arc) = &mut msg.tool_output
-            && let ToolOutput::Batch {
-                entries: existing,
-                text: existing_text,
-            } = Arc::make_mut(arc)
-        {
-            for (existing, new) in existing.iter_mut().zip(new_entries) {
-                existing.status = new.status;
-                existing.output = new.output.clone();
-                if new.raw_input.is_some() {
-                    existing.raw_input = new.raw_input.clone();
-                }
-            }
-            *existing_text = text.clone();
-        } else {
-            msg.tool_output = Some(Arc::new(event.output));
-        }
+        msg.tool_output = Some(Arc::new(event.output));
         msg.live_output = None;
         self.rebuild_tool_segment(&event.id);
     }
 
-    pub fn batch_progress(
-        &mut self,
-        batch_id: &str,
-        index: usize,
-        status: BatchToolStatus,
-        output: Option<ToolOutput>,
-        summary: Option<&str>,
-    ) {
-        let Some(msg) = self.find_tool_msg_mut(batch_id) else {
-            return;
-        };
-        if let Some(arc) = &mut msg.tool_output
-            && let ToolOutput::Batch { entries, .. } = Arc::make_mut(arc)
-            && let Some(entry) = entries.get_mut(index)
-        {
-            entry.status = status;
-            if output.is_some() {
-                entry.output = output;
-            }
-            if let Some(s) = summary {
-                entry.summary = s.to_owned();
-            }
-        }
-        self.rebuild_tool_segment(batch_id);
-    }
-
     pub fn update_tool_summary(&mut self, tool_id: &str, summary: &str) {
-        self.update_tool(
-            tool_id,
-            |msg| msg.text = summary.to_owned(),
-            |entry| entry.summary = summary.to_owned(),
-        );
+        self.update_tool(tool_id, |msg| msg.text = summary.to_owned());
     }
 
     pub fn update_tool_model(&mut self, tool_id: &str, model: &str) {
-        self.update_tool(
-            tool_id,
-            |msg| append_annotation(&mut msg.annotation, model),
-            |entry| append_annotation(&mut entry.annotation, model),
-        );
+        self.update_tool(tool_id, |msg| append_annotation(&mut msg.annotation, model));
     }
 
     pub fn tool_snapshot(
@@ -389,63 +314,37 @@ impl MessagesPanel {
         parent_id: &str,
         blocks: &[InstructionBlock],
         parent_idx: usize,
-        msg_index: Option<usize>,
     ) {
         if blocks.is_empty() {
             return;
         }
         let inst_id = segment::instruction_id(parent_id);
-        let batch_index = parse_batch_inner_id(parent_id).map(|(_, idx)| idx + 1);
         let exp = self
             .expanded_tools
             .get(&inst_id)
             .copied()
             .unwrap_or_default();
-        let tl = build_instructions_lines(blocks, self.viewport_width, exp.output, batch_index);
+        let tl = build_instructions_lines(blocks, self.viewport_width, exp.output);
 
         if let Some(seg_idx) = self.cache.find_by_tool_id(&inst_id) {
             let seg = self.cache.get_mut(seg_idx).unwrap();
             seg.search_text = tl.search_text.clone();
             seg.update_with_reuse(tl, &self.hl_worker);
         } else {
-            let mut seg = Segment::with_tool(inst_id, msg_index);
+            let mut seg = Segment::with_tool(inst_id);
             seg.search_text = tl.search_text.clone();
             seg.apply_highlight(tl, &self.hl_worker);
-            if batch_index.is_some() {
-                self.cache.insert(parent_idx + 1, seg);
-            } else {
-                self.cache.insert(parent_idx + 1, Segment::spacer());
-                self.cache.insert(parent_idx + 2, seg);
-            }
+            self.cache.insert(parent_idx + 1, Segment::spacer());
+            self.cache.insert(parent_idx + 2, seg);
         }
     }
 
-    fn update_tool(
-        &mut self,
-        tool_id: &str,
-        update_msg: impl FnOnce(&mut DisplayMessage),
-        update_entry: impl FnOnce(&mut BatchToolEntry),
-    ) {
-        let rebuild_id;
-        if let Some((batch_id, idx)) = parse_batch_inner_id(tool_id) {
-            let Some(msg) = self.find_tool_msg_mut(batch_id) else {
-                return;
-            };
-            if let Some(arc) = &mut msg.tool_output
-                && let ToolOutput::Batch { entries, .. } = Arc::make_mut(arc)
-                && let Some(entry) = entries.get_mut(idx)
-            {
-                update_entry(entry);
-            }
-            rebuild_id = batch_id.to_owned();
-        } else {
-            let Some(msg) = self.find_tool_msg_mut(tool_id) else {
-                return;
-            };
-            update_msg(msg);
-            rebuild_id = tool_id.to_owned();
-        }
-        self.rebuild_tool_segment(&rebuild_id);
+    fn update_tool(&mut self, tool_id: &str, update_msg: impl FnOnce(&mut DisplayMessage)) {
+        let Some(msg) = self.find_tool_msg_mut(tool_id) else {
+            return;
+        };
+        update_msg(msg);
+        self.rebuild_tool_segment(tool_id);
     }
 
     pub fn stream_reset(&mut self) {
@@ -490,17 +389,6 @@ impl MessagesPanel {
                     && t.status == ToolStatus::InProgress
                 {
                     t.status = ToolStatus::Error;
-                    if let Some(arc) = &mut msg.tool_output
-                        && let ToolOutput::Batch { entries, .. } = Arc::make_mut(arc)
-                    {
-                        for entry in entries.iter_mut() {
-                            if entry.status == BatchToolStatus::InProgress
-                                || entry.status == BatchToolStatus::Pending
-                            {
-                                entry.status = BatchToolStatus::Error;
-                            }
-                        }
-                    }
                     Some(t.id.clone())
                 } else {
                     None
@@ -643,7 +531,10 @@ impl MessagesPanel {
         }
         let doc_row = (row.saturating_sub(area.y)) as u32 + self.scroll_top as u32;
         let width = self.viewport_width;
-        let Some((_, seg, _seg_start)) = self.cache.segment_at_row(doc_row, width) else {
+        // Both fallbacks toggle thinking: a row past the cached segments
+        // belongs to the still-streaming indicator, and a segment without a
+        // tool_id is a finished message's text.
+        let Some((_, seg, seg_start)) = self.cache.segment_at_row(doc_row, width) else {
             return self.try_toggle_collapsed_thinking(doc_row, width);
         };
         let Some(tool_id) = seg.tool_id.as_deref() else {
@@ -652,20 +543,20 @@ impl MessagesPanel {
         };
 
         if self.has_snapshot(tool_id) {
+            let rel = u16::try_from(doc_row - seg_start).unwrap_or(u16::MAX);
+            let buf_row = seg.source_line_at(rel, width).map_or(0, |l| seg.buf_row(l));
             if self.tool_in_progress(tool_id) {
                 if let Some(eh) = &self.lua_event_handle {
-                    eh.request_click(tool_id.to_owned());
+                    eh.request_click(tool_id.to_owned(), buf_row);
                 }
                 return true;
             }
-            let expanded = !self.lua_expanded.contains(tool_id);
-            if expanded {
-                self.lua_expanded.insert(tool_id.to_owned());
-            } else {
-                self.lua_expanded.remove(tool_id);
-            }
+            self.lua_clicks
+                .entry(tool_id.to_owned())
+                .or_default()
+                .push(buf_row);
             if let Some(mut item) = self.lua_restore_item(tool_id) {
-                item.expanded = expanded;
+                item.clicks = self.lua_clicks[tool_id].clone();
                 if let (Some(eh), Some(tx)) =
                     (self.lua_event_handle.clone(), self.restore_event_tx.clone())
                 {
@@ -707,33 +598,19 @@ impl MessagesPanel {
                 && let Some(parent_idx) = self.cache.find_by_tool_id(parent_id)
                 && let Some(blocks) = self.get_instructions_for_tool(parent_id)
             {
-                self.upsert_instruction_segment(parent_id, &blocks, parent_idx, None);
+                self.upsert_instruction_segment(parent_id, &blocks, parent_idx);
             }
         } else {
-            let rebuild_id =
-                parse_batch_inner_id(tool_id).map_or(tool_id, |(batch_id, _)| batch_id);
-            self.rebuild_tool_segment(rebuild_id);
+            self.rebuild_tool_segment(tool_id);
         }
     }
 
     fn get_instructions_for_tool(&self, tool_id: &str) -> Option<Vec<InstructionBlock>> {
-        let output = if let Some((batch_id, idx)) = parse_batch_inner_id(tool_id) {
-            let msg = self
-                .messages
-                .iter()
-                .rfind(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == batch_id))?;
-            match msg.tool_output.as_deref()? {
-                ToolOutput::Batch { entries, .. } => entries.get(idx)?.output.as_ref()?,
-                _ => return None,
-            }
-        } else {
-            let msg = self
-                .messages
-                .iter()
-                .rfind(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == tool_id))?;
-            msg.tool_output.as_deref()?
-        };
-        output.owned_instructions()
+        let msg = self
+            .messages
+            .iter()
+            .rfind(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == tool_id))?;
+        msg.tool_output.as_deref()?.owned_instructions()
     }
 
     pub fn is_animating(&self) -> bool {
@@ -914,17 +791,6 @@ impl MessagesPanel {
     }
 
     fn tool_in_progress(&self, tool_id: &str) -> bool {
-        if let Some((batch_id, idx)) = parse_batch_inner_id(tool_id) {
-            return self
-                .messages
-                .iter()
-                .rfind(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == batch_id))
-                .and_then(|m| match m.tool_output.as_deref() {
-                    Some(ToolOutput::Batch { entries, .. }) => entries.get(idx),
-                    _ => None,
-                })
-                .is_some_and(|e| e.status == BatchToolStatus::InProgress);
-        }
         self.messages
             .iter()
             .rev()
@@ -936,40 +802,18 @@ impl MessagesPanel {
     }
 
     fn has_snapshot(&self, tool_id: &str) -> bool {
-        self.batch_children
-            .get(tool_id)
-            .is_some_and(|c| c.snapshot.is_some())
-            || self
-                .messages
-                .iter()
-                .rfind(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == tool_id))
-                .is_some_and(|m| m.render_snapshot.is_some())
+        self.messages
+            .iter()
+            .rfind(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == tool_id))
+            .is_some_and(|m| m.render_snapshot.is_some())
     }
 
     fn lua_restore_item(&self, tool_id: &str) -> Option<maki_lua::RestoreItem> {
-        if let Some((parent_id, idx)) = parse_batch_inner_id(tool_id) {
-            let msg = self
-                .messages
-                .iter()
-                .rfind(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == parent_id))?;
-            let entries = match msg.tool_output.as_deref()? {
-                ToolOutput::Batch { entries, .. } => entries,
-                _ => return None,
-            };
-            let entry = entries.get(idx)?;
-            crate::chat::restore_item_for_batch_entry(
-                entry,
-                tool_id.to_owned(),
-                self.tool_output_lines,
-                self.theme_generation,
-            )
-        } else {
-            let msg = self
-                .messages
-                .iter()
-                .rfind(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == tool_id))?;
-            crate::chat::restore_item_for(msg, self.tool_output_lines, self.theme_generation)
-        }
+        let msg = self
+            .messages
+            .iter()
+            .rfind(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == tool_id))?;
+        crate::chat::restore_item_for(msg, self.tool_output_lines, self.theme_generation)
     }
 
     /// Re-restores every snapshot still painted with old-theme colors.
@@ -994,14 +838,10 @@ impl MessagesPanel {
                 continue;
             }
             if let Some(mut item) = crate::chat::restore_item_for(msg, tol, current_gen) {
-                item.expanded = self.lua_expanded.contains(&role.id);
+                item.clicks = self.lua_clicks.get(&role.id).cloned().unwrap_or_default();
                 eh.request_restore(item, tx.clone());
                 requested.push(role.id.clone());
             }
-        }
-        for item in self.stale_batch_child_items(current_gen) {
-            requested.push(item.tool_use_id.clone());
-            eh.request_restore(item, tx.clone());
         }
         for id in requested {
             self.rebake_requested.insert(id, current_gen);
@@ -1010,39 +850,6 @@ impl MessagesPanel {
 
     fn should_request_rebake(&self, tool_id: &str, stale: bool, current_gen: u64) -> bool {
         stale && self.rebake_requested.get(tool_id) != Some(&current_gen)
-    }
-
-    fn stale_batch_child_items(&self, current_gen: u64) -> Vec<maki_lua::RestoreItem> {
-        let tol = self.tool_output_lines;
-        let mut items = Vec::new();
-        for msg in &self.messages {
-            let DisplayRole::Tool(parent) = &msg.role else {
-                continue;
-            };
-            let Some(ToolOutput::Batch { entries, .. }) = msg.tool_output.as_deref() else {
-                continue;
-            };
-            for (idx, entry) in entries.iter().enumerate() {
-                let child_id = format!("{}__{idx}", parent.id);
-                let stale = self
-                    .batch_children
-                    .get(&child_id)
-                    .is_some_and(|c| c.snapshot_is_stale(current_gen));
-                if !self.should_request_rebake(&child_id, stale, current_gen) {
-                    continue;
-                }
-                if let Some(mut item) = crate::chat::restore_item_for_batch_entry(
-                    entry,
-                    child_id.clone(),
-                    tol,
-                    current_gen,
-                ) {
-                    item.expanded = self.lua_expanded.contains(&child_id);
-                    items.push(item);
-                }
-            }
-        }
-        items
     }
 
     /// Live snapshots (`None`) get the panel's current generation.
@@ -1058,16 +865,10 @@ impl MessagesPanel {
     }
 
     fn current_snapshot_gen(&self, tool_id: &str) -> Option<u64> {
-        if parse_batch_inner_id(tool_id).is_some() {
-            self.batch_children
-                .get(tool_id)
-                .map(|c| c.snapshot_theme_gen)
-        } else {
-            self.messages
-                .iter()
-                .rfind(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == tool_id))
-                .map(|m| m.snapshot_theme_gen)
-        }
+        self.messages
+            .iter()
+            .rfind(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == tool_id))
+            .map(|m| m.snapshot_theme_gen)
     }
 
     fn store_snapshot(
@@ -1080,19 +881,7 @@ impl MessagesPanel {
         let Some(applied_gen) = self.resolve_snapshot_gen(tool_id, theme_gen) else {
             return;
         };
-        if let Some((batch_id, _)) = parse_batch_inner_id(tool_id) {
-            if !self.has_tool_msg(batch_id) {
-                return;
-            }
-            let child = self.batch_children.entry(tool_id.to_owned()).or_default();
-            if is_header {
-                child.header = Some(snapshot);
-            } else {
-                child.snapshot = Some(snapshot);
-            }
-            child.snapshot_theme_gen = applied_gen;
-            self.rebuild_tool_segment(batch_id);
-        } else if let Some(msg) = self.find_tool_msg_mut(tool_id) {
+        if let Some(msg) = self.find_tool_msg_mut(tool_id) {
             if is_header {
                 msg.text = snapshot.first_line_text();
                 msg.render_header = Some(snapshot);
@@ -1110,20 +899,11 @@ impl MessagesPanel {
             .rfind(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == tool_id))
     }
 
-    /// Re-bake replies fan to every chat, so skip chats that don't
-    /// own this tool (avoids phantom batch children).
-    fn has_tool_msg(&self, tool_id: &str) -> bool {
-        self.messages
-            .iter()
-            .any(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == tool_id))
-    }
-
     fn rctx(&self) -> RenderCtx<'_> {
         RenderCtx {
             started_at: self.started_at,
             width: self.viewport_width,
             tool_output_lines: &self.tool_output_lines,
-            registry: &self.render_hints,
         }
     }
 
@@ -1252,14 +1032,7 @@ impl MessagesPanel {
             theme::current().spinner,
         );
         for seg in self.cache.segments_mut() {
-            let is_child = seg
-                .tool_id
-                .as_deref()
-                .is_some_and(segment::is_child_segment);
-            for &line_idx in &seg.spinner_lines.clone() {
-                let span_idx = if line_idx == 0 && !is_child { 0 } else { 1 };
-                seg.update_spinner(line_idx, span_idx, spinner_span.clone());
-            }
+            seg.update_spinners(&spinner_span);
         }
     }
 
@@ -1309,75 +1082,8 @@ impl MessagesPanel {
         seg.search_text = tl.search_text.clone();
         seg.update_with_reuse(tl, &self.hl_worker);
 
-        self.build_and_upsert_batch_children(seg_idx, tool_id);
-
         if let Some(blocks) = instructions {
-            self.upsert_instruction_segment(tool_id, &blocks, seg_idx, None);
-        }
-    }
-
-    fn build_and_upsert_batch_children(&mut self, parent_idx: usize, tool_id: &str) {
-        let Some(msg) = self
-            .messages
-            .iter()
-            .rfind(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == tool_id))
-        else {
-            return;
-        };
-        let Some(ToolOutput::Batch { entries, .. }) = msg.tool_output.as_deref() else {
-            return;
-        };
-        let rctx = self.rctx();
-        let children: Vec<_> = entries
-            .iter()
-            .enumerate()
-            .map(|(j, entry)| {
-                let child_id = format!("{tool_id}__{j}");
-                let child_exp = self
-                    .expanded_tools
-                    .get(&child_id)
-                    .copied()
-                    .unwrap_or_default();
-                let tl = build_batch_entry_lines(
-                    entry,
-                    j,
-                    &rctx,
-                    child_exp,
-                    self.batch_children.get(&child_id),
-                );
-                let search = tl.search_text.clone();
-                let instructions = entry.output.as_ref().and_then(|o| o.owned_instructions());
-                (child_id, search, tl, instructions)
-            })
-            .collect();
-        let child_prefix = format!("{tool_id}__");
-        let msg_index = self.cache.get(parent_idx).and_then(|s| s.msg_index);
-        for (child_id, search, tl, instructions) in children {
-            let child_seg_idx = if let Some(cseg_idx) = self.cache.find_by_tool_id(&child_id) {
-                let cseg = self.cache.get_mut(cseg_idx).unwrap();
-                cseg.search_text = search;
-                cseg.update_with_reuse(tl, &self.hl_worker);
-                cseg_idx
-            } else {
-                let mut seg = Segment::with_tool(child_id.clone(), msg_index);
-                seg.search_text = search;
-                seg.apply_highlight(tl, &self.hl_worker);
-                let insert_pos = self
-                    .cache
-                    .segments()
-                    .iter()
-                    .rposition(|s| {
-                        s.tool_id
-                            .as_deref()
-                            .is_some_and(|id| id == tool_id || id.starts_with(&child_prefix))
-                    })
-                    .map_or(parent_idx + 1, |p| p + 1);
-                self.cache.insert(insert_pos, seg);
-                insert_pos
-            };
-            if let Some(blocks) = instructions {
-                self.upsert_instruction_segment(&child_id, &blocks, child_seg_idx, msg_index);
-            }
+            self.upsert_instruction_segment(tool_id, &blocks, seg_idx);
         }
     }
 
@@ -1395,52 +1101,18 @@ impl MessagesPanel {
                 let id = t.id.clone();
                 let search_text = tl.search_text.clone();
                 self.cache.push_spacer_if_needed();
-                let mut seg = Segment::with_tool(id.clone(), Some(i));
+                let mut seg = Segment::with_tool(id.clone());
                 seg.search_text = search_text;
                 seg.apply_highlight(tl, &self.hl_worker);
                 self.cache.push(seg);
 
-                if let Some(ToolOutput::Batch { entries, .. }) = msg.tool_output.as_deref() {
-                    let inst_data: Vec<_> = entries
-                        .iter()
-                        .enumerate()
-                        .map(|(j, entry)| {
-                            let child_id = format!("{id}__{j}");
-                            let child_exp = self
-                                .expanded_tools
-                                .get(&child_id)
-                                .copied()
-                                .unwrap_or_default();
-                            let tl = build_batch_entry_lines(
-                                entry,
-                                j,
-                                &self.rctx(),
-                                child_exp,
-                                self.batch_children.get(&child_id),
-                            );
-                            let blocks = entry.output.as_ref().and_then(|o| o.owned_instructions());
-                            (child_id, tl, blocks)
-                        })
-                        .collect();
-                    for (child_id, tl, blocks) in inst_data {
-                        let mut seg = Segment::with_tool(child_id.clone(), Some(i));
-                        seg.search_text = tl.search_text.clone();
-                        seg.apply_highlight(tl, &self.hl_worker);
-                        self.cache.push(seg);
-                        if let Some(blocks) = blocks {
-                            let last_idx = self.cache.len().saturating_sub(1);
-                            self.upsert_instruction_segment(&child_id, &blocks, last_idx, Some(i));
-                        }
-                    }
-                } else {
-                    let blocks = msg
-                        .tool_output
-                        .as_deref()
-                        .and_then(|o| o.owned_instructions());
-                    if let Some(blocks) = blocks {
-                        let last_idx = self.cache.len().saturating_sub(1);
-                        self.upsert_instruction_segment(&id, &blocks, last_idx, Some(i));
-                    }
+                let blocks = msg
+                    .tool_output
+                    .as_deref()
+                    .and_then(|o| o.owned_instructions());
+                if let Some(blocks) = blocks {
+                    let last_idx = self.cache.len().saturating_sub(1);
+                    self.upsert_instruction_segment(&id, &blocks, last_idx);
                 }
             } else {
                 if matches!(&msg.role, DisplayRole::Thinking) && msg.thinking_collapsed {

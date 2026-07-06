@@ -174,7 +174,7 @@ fn exec_tool(reg: &ToolRegistry, name: &str, input: Value) -> Result<String, Str
     smol::block_on(async { inv.execute(&ctx).await })
         .output
         .map(|out| match out {
-            ToolOutput::Plain(s) => s.text,
+            ToolOutput::Plain(s) | ToolOutput::Markdown(s) => s.text,
             other => panic!("unexpected output: {other:?}"),
         })
 }

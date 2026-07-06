@@ -20,10 +20,6 @@ pub fn instruction_parent(id: &str) -> Option<&str> {
     id.strip_suffix(INST_SUFFIX)
 }
 
-pub fn is_child_segment(id: &str) -> bool {
-    id.contains("__")
-}
-
 #[derive(Clone, Copy, Default)]
 struct CachedHeight {
     at_width: u16,
@@ -48,21 +44,25 @@ pub(super) struct Segment {
     lines: Vec<Line<'static>>,
     pub search_text: String,
     pub tool_id: Option<String>,
+    /// Backlink to `self.messages`, set only by `with_lines`. A click on a
+    /// collapsed thinking indicator has no tool_id to route by, so this is
+    /// how the click finds its message. It looks unused; delete it and the
+    /// show_thinking toggle breaks.
     pub msg_index: Option<usize>,
     pub truncation: SectionFlags,
     cached_height: Cell<Option<CachedHeight>>,
     pending_highlight: Option<u64>,
     highlight_range: Option<(usize, usize)>,
     highlight_key: HighlightKey,
-    pub spinner_lines: Vec<usize>,
+    pub spinner_lines: Vec<(usize, usize)>,
+    snapshot_base: Option<usize>,
     pub content_indent: &'static str,
 }
 
 impl Segment {
-    pub fn with_tool(tool_id: String, msg_index: Option<usize>) -> Self {
+    pub fn with_tool(tool_id: String) -> Self {
         Self {
             tool_id: Some(tool_id),
-            msg_index,
             ..Self::default()
         }
     }
@@ -110,15 +110,40 @@ impl Segment {
         h
     }
 
+    /// Maps a display row (after wrapping) back to the source line index.
+    pub fn source_line_at(&self, rel_row: u16, width: u16) -> Option<usize> {
+        let mut acc = 0u16;
+        for (i, line) in self.lines.iter().enumerate() {
+            acc = acc.saturating_add(wrapped_line_count(std::slice::from_ref(line), width));
+            if rel_row < acc {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// Maps a source line to a 1-based row in the tool's live buffer, or 0
+    /// for lines outside it (header etc.). The Lua click-row contract is
+    /// computed here and nowhere else, from the base recorded when the
+    /// buffer snapshot was laid out.
+    pub fn buf_row(&self, source_line: usize) -> usize {
+        match self.snapshot_base {
+            Some(base) if source_line >= base => source_line - base + 1,
+            _ => 0,
+        }
+    }
+
     fn invalidate_height(&self) {
         self.cached_height.set(None);
     }
 
-    pub fn update_spinner(&mut self, line_idx: usize, span_idx: usize, span: Span<'static>) {
-        if let Some(line) = self.lines.get_mut(line_idx)
-            && line.spans.len() > span_idx
-        {
-            line.spans[span_idx] = span;
+    pub fn update_spinners(&mut self, span: &Span<'static>) {
+        for &(line_idx, span_idx) in &self.spinner_lines {
+            if let Some(line) = self.lines.get_mut(line_idx)
+                && line.spans.len() > span_idx
+            {
+                line.spans[span_idx] = span.clone();
+            }
         }
     }
 
@@ -145,6 +170,7 @@ impl Segment {
         self.highlight_range = tl.highlight.as_ref().map(|h| h.range);
         self.highlight_key = HighlightKey::from_request(tl.highlight.as_ref());
         self.spinner_lines = tl.spinner_lines;
+        self.snapshot_base = tl.snapshot_base;
         self.content_indent = tl.content_indent;
         self.truncation = tl.truncation;
         self.set_lines(tl.lines);
@@ -165,6 +191,7 @@ impl Segment {
             self.highlight_range = Some((s, e));
             self.pending_highlight = None;
             self.spinner_lines = tl.spinner_lines;
+            self.snapshot_base = tl.snapshot_base;
             self.content_indent = tl.content_indent;
         } else {
             self.apply_highlight(tl, worker);
@@ -190,9 +217,29 @@ impl Segment {
             let new_end = start + indented.len();
             self.lines.splice(start..end, indented);
             self.highlight_range = Some((start, new_end));
+            self.shift_after(end, new_end as isize - end as isize);
             self.invalidate_height();
         }
         self.pending_highlight = None;
+    }
+
+    /// Keeps recorded line positions (spinners, buffer base) in step when
+    /// a splice changes the number of lines before them.
+    fn shift_after(&mut self, from: usize, delta: isize) {
+        if delta == 0 {
+            return;
+        }
+        let shift = |v: &mut usize| {
+            if *v >= from {
+                *v = v.saturating_add_signed(delta);
+            }
+        };
+        for (line, _) in &mut self.spinner_lines {
+            shift(line);
+        }
+        if let Some(base) = &mut self.snapshot_base {
+            shift(base);
+        }
     }
 }
 
@@ -302,4 +349,58 @@ pub(super) fn wrapped_line_count(lines: &[Line<'_>], width: u16) -> u16 {
     Paragraph::new(lines.to_vec())
         .wrap(Wrap { trim: false })
         .line_count(width) as u16
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_case::test_case;
+
+    fn seg_with_base(line_count: usize, base: Option<usize>) -> Segment {
+        Segment {
+            lines: (0..line_count)
+                .map(|i| Line::raw(format!("l{i}")))
+                .collect(),
+            snapshot_base: base,
+            ..Segment::default()
+        }
+    }
+
+    #[test_case(0, 0 ; "header_maps_to_zero")]
+    #[test_case(1, 1 ; "first_snapshot_line_is_row_one")]
+    #[test_case(4, 4 ; "later_line_offsets_from_base")]
+    fn buf_row_maps_source_lines_through_snapshot_base(source_line: usize, expected: usize) {
+        let seg = seg_with_base(5, Some(1));
+        assert_eq!(seg.buf_row(source_line), expected);
+    }
+
+    #[test]
+    fn buf_row_is_zero_without_snapshot() {
+        let seg = seg_with_base(3, None);
+        assert_eq!(seg.buf_row(2), 0);
+    }
+
+    #[test]
+    fn buf_row_tracks_base_when_lines_precede_snapshot() {
+        let seg = seg_with_base(6, Some(3));
+        assert_eq!(seg.buf_row(2), 0, "pre-snapshot lines map outside the buf");
+        assert_eq!(seg.buf_row(3), 1);
+        assert_eq!(seg.buf_row(5), 3);
+    }
+
+    #[test_case(4, 6 ; "splice_grows")]
+    #[test_case(1, 3 ; "splice_shrinks")]
+    fn highlight_splice_shifts_spinners_and_base(replacement_lines: usize, expected_base: usize) {
+        let mut seg = seg_with_base(8, Some(4));
+        seg.highlight_range = Some((1, 3));
+        seg.spinner_lines = vec![(0, 0), (5, 1)];
+        seg.apply_highlight_result((0..replacement_lines).map(|_| Line::raw("hl")).collect());
+        let delta = expected_base as isize - 4;
+        assert_eq!(seg.snapshot_base, Some(expected_base));
+        assert_eq!(
+            seg.spinner_lines,
+            vec![(0, 0), (5usize.saturating_add_signed(delta), 1)],
+            "positions before the splice stay, after it shift by the delta"
+        );
+    }
 }

@@ -43,6 +43,10 @@ static BUNDLED_PLUGINS: &[BundledPlugin] = &[
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/bash"),
     },
     BundledPlugin {
+        name: "batch",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/batch"),
+    },
+    BundledPlugin {
         name: "grep",
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/grep"),
     },
@@ -362,8 +366,10 @@ impl EventHandle {
         let _ = self.tx.send(Request::RestoreToolAsync { item, event_tx });
     }
 
-    pub fn request_click(&self, tool_use_id: String) {
-        let _ = self.tx.send(Request::ClickTool { tool_use_id });
+    /// `row` is the 1-based line in the tool's live buffer, 0 for clicks
+    /// outside it (header line etc.).
+    pub fn request_click(&self, tool_use_id: String, row: usize) {
+        let _ = self.tx.send(Request::ClickTool { tool_use_id, row });
     }
 
     pub fn send_restore_complete(&self, flag: Arc<AtomicBool>) {

@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use async_lock::{Semaphore, SemaphoreGuardArc};
+use futures::future::join_all;
 use maki_agent::cancel::CancelToken;
 use mlua::{
     Function, Lua, MultiValue, Result as LuaResult, Table, UserData, UserDataMethods, Value,
@@ -171,6 +172,42 @@ pub(crate) fn create_async_table(lua: &Lua) -> LuaResult<Table> {
     )?;
 
     tbl.set(
+        "gather",
+        lua.create_async_function(|lua, funs: Table| async move {
+            let count = funs.raw_len();
+            let mut children = Vec::with_capacity(count);
+            for i in 1..=count {
+                let f: Function = funs.raw_get(i).map_err(|_| {
+                    mlua::Error::runtime(format!("gather: funs[{i}] must be a function"))
+                })?;
+                children.push(lua.create_thread(f)?);
+            }
+            let results = join_all(
+                children
+                    .into_iter()
+                    .map(|thread| async move { thread.into_async::<Value>(())?.await }),
+            )
+            .await;
+            let out = lua.create_table_with_capacity(count, 0)?;
+            for (i, res) in results.into_iter().enumerate() {
+                let entry = lua.create_table()?;
+                match res {
+                    Ok(value) => {
+                        entry.set("ok", true)?;
+                        entry.set("value", value)?;
+                    }
+                    Err(e) => {
+                        entry.set("ok", false)?;
+                        entry.set("err", e.to_string())?;
+                    }
+                }
+                out.raw_set(i + 1, entry)?;
+            }
+            Ok(out)
+        })?,
+    )?;
+
+    tbl.set(
         "wrap",
         lua.load(
             r#"
@@ -306,6 +343,119 @@ mod tests {
         });
     }
 
+    #[test]
+    fn gather_preserves_input_order_and_values() {
+        smol::block_on(async {
+            let (lua, _tbl) = setup();
+            let code = r#"
+                local r = async_tbl.gather({
+                    function() return "a" end,
+                    function() error("boom") end,
+                    function() return 42 end,
+                })
+                return r[1].ok, r[1].value, r[2].ok, tostring(r[2].err), r[3].value
+            "#;
+            let vals: Vec<Value> = lua
+                .load(code)
+                .eval_async::<MultiValue>()
+                .await
+                .unwrap()
+                .into_vec();
+            assert!(vals[0].as_boolean().unwrap());
+            assert_eq!(vals[1].as_string().unwrap().to_string_lossy(), "a");
+            assert!(!vals[2].as_boolean().unwrap());
+            assert!(
+                vals[3]
+                    .as_string()
+                    .unwrap()
+                    .to_string_lossy()
+                    .contains("boom"),
+                "err should contain the child's message"
+            );
+            assert_eq!(vals[4].as_integer().unwrap(), 42);
+        });
+    }
+
+    #[test]
+    fn gather_rejects_non_function_entries() {
+        smol::block_on(async {
+            let (lua, _tbl) = setup();
+            let msg = lua
+                .load(r#"return async_tbl.gather({ function() end, 42 })"#)
+                .eval_async::<Value>()
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(msg.contains("funs[2] must be a function"), "got: {msg}");
+        });
+    }
+
+    #[test]
+    fn gather_runs_children_concurrently() {
+        smol::block_on(async {
+            let (lua, _tbl) = setup();
+            // child 1 parks on a held semaphore; child 2 releases it.
+            // Sequential execution would deadlock here.
+            lua.load("sem = async_tbl.semaphore(1); held = sem:acquire()")
+                .exec_async()
+                .await
+                .unwrap();
+            let code = r#"
+                local r = async_tbl.gather({
+                    function()
+                        local p = sem:acquire()
+                        p:release()
+                        return "waited"
+                    end,
+                    function()
+                        held:release()
+                        return "released"
+                    end,
+                })
+                return r[1].value, r[2].value
+            "#;
+            let vals: Vec<Value> = lua
+                .load(code)
+                .eval_async::<MultiValue>()
+                .await
+                .unwrap()
+                .into_vec();
+            assert_eq!(vals[0].as_string().unwrap().to_string_lossy(), "waited");
+            assert_eq!(vals[1].as_string().unwrap().to_string_lossy(), "released");
+        });
+    }
+
+    #[test]
+    fn gather_children_see_caller_cancel() {
+        smol::block_on(async {
+            let (lua, _tbl) = setup();
+            lua.load("sem = async_tbl.semaphore(1); held = sem:acquire()")
+                .exec_async()
+                .await
+                .unwrap();
+            lua.set_app_data::<TaskHandle>(cancelled_task_handle());
+            let code = r#"
+                local r = async_tbl.gather({ function() return sem:acquire() end })
+                return r[1].ok, tostring(r[1].err)
+            "#;
+            let vals: Vec<Value> = lua
+                .load(code)
+                .eval_async::<MultiValue>()
+                .await
+                .unwrap()
+                .into_vec();
+            assert!(!vals[0].as_boolean().unwrap());
+            assert!(
+                vals[1]
+                    .as_string()
+                    .unwrap()
+                    .to_string_lossy()
+                    .contains(CANCELLED_MSG),
+                "child should observe caller's cancel token"
+            );
+        });
+    }
+
     fn cancelled_task_handle() -> TaskHandle {
         let (trigger, token) = CancelToken::new();
         trigger.cancel();
@@ -316,7 +466,8 @@ mod tests {
             jobs: JobStore::new(),
             bufs: BufferStore::new(),
             live: None,
-            click: None,
+            root_buf: None,
+            live_sink: None,
         }))
     }
 

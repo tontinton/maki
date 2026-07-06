@@ -473,7 +473,7 @@ mod tests {
         smol::block_on(async {
             let ctx = local_ctx("batch", |input| Ok(format!("local:{}", input["path"])));
             let done = run(
-                ToolRegistry::native(),
+                ToolRegistry::global(),
                 None,
                 "t1".into(),
                 "batch",
@@ -487,7 +487,7 @@ mod tests {
 
             let ctx = local_ctx("boom", |_| Err("nope".into()));
             let done = run(
-                ToolRegistry::native(),
+                ToolRegistry::global(),
                 None,
                 "t2".into(),
                 "boom",
@@ -517,7 +517,7 @@ mod tests {
 
             let input = serde_json::json!({"path": "/a"});
             let done = run(
-                ToolRegistry::native(),
+                ToolRegistry::global(),
                 None,
                 "t1".into(),
                 "local_echo",
@@ -614,7 +614,12 @@ mod tests {
 
             let registry = ToolRegistry::new();
             registry
-                .register(Arc::new(GuardedMock), ToolSource::Native)
+                .register(
+                    Arc::new(GuardedMock),
+                    ToolSource::Lua {
+                        plugin: "test".into(),
+                    },
+                )
                 .unwrap();
 
             let done = run(
@@ -719,7 +724,12 @@ mod tests {
             let (started, executed) = (Arc::clone(&probe.started), Arc::clone(&probe.executed));
             let registry = ToolRegistry::new();
             registry
-                .register(Arc::new(probe), ToolSource::Native)
+                .register(
+                    Arc::new(probe),
+                    ToolSource::Lua {
+                        plugin: "test".into(),
+                    },
+                )
                 .unwrap();
 
             let done = run(

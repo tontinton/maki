@@ -14,7 +14,7 @@ use agent_client_protocol_schema::{
 use color_eyre::eyre::Context;
 use flume::{Receiver, Sender};
 use maki_agent::headless::{self, InteractiveHandle, InteractiveParams};
-use maki_agent::types::{AgentEvent, BatchToolStatus};
+use maki_agent::types::AgentEvent;
 use maki_agent::{AgentInput, AgentMode, Envelope, ImageMediaType, ImageSource};
 use maki_providers::Message;
 use maki_providers::model::Model;
@@ -376,12 +376,6 @@ fn start_event_pump(
                 AgentEvent::ToolStart(event) => translate::tool_start(&event),
                 AgentEvent::ToolOutput { id, content } => translate::tool_output(&id, &content),
                 AgentEvent::ToolDone(event) => translate::tool_done(&event),
-                AgentEvent::BatchProgress(event) => {
-                    if event.status != BatchToolStatus::InProgress {
-                        continue;
-                    }
-                    translate::batch_inner_start(&event)
-                }
                 AgentEvent::PermissionRequest { id, tool, scopes } => {
                     let fields =
                         ToolCallUpdateFields::new().title(format!("{tool}: {}", scopes.join(", ")));

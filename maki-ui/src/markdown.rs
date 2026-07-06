@@ -120,12 +120,6 @@ fn paint_line(line: &RLine, text_style: Style, t: &Theme) -> Line<'static> {
     Line::from(spans)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Keep {
-    Head,
-    Tail,
-}
-
 pub fn should_truncate(hidden: usize) -> bool {
     hidden >= MIN_TRUNCATABLE_LINES
 }
@@ -254,44 +248,29 @@ pub struct TruncatedOutput<'a> {
     pub skipped: usize,
 }
 
-pub fn truncate_output(text: &str, max: usize, keep: Keep) -> TruncatedOutput<'_> {
-    let tr = truncate_lines(text, max, keep);
+pub fn truncate_output(text: &str, max: usize) -> TruncatedOutput<'_> {
+    let tr = truncate_lines(text, max);
     TruncatedOutput {
         kept: render::truncate_long_lines(tr.kept),
         skipped: tr.skipped,
     }
 }
 
-pub fn truncate_lines(s: &str, max: usize, keep: Keep) -> Truncated<'_> {
-    let split = match keep {
-        Keep::Head => s.match_indices('\n').nth(max.saturating_sub(1)),
-        Keep::Tail => s.rmatch_indices('\n').nth(max.saturating_sub(1)),
-    };
-    let Some((i, _)) = split else {
+/// Keeps the head. Tools that want tail truncation do it in Lua instead
+/// (ToolView `keep = "tail"`).
+pub fn truncate_lines(s: &str, max: usize) -> Truncated<'_> {
+    let Some((i, _)) = s.match_indices('\n').nth(max.saturating_sub(1)) else {
         return Truncated {
             kept: s,
             skipped: 0,
         };
     };
-    let result = match keep {
-        Keep::Head => {
-            let tail = &s[i..];
-            let newlines = tail.matches('\n').count();
-            let has_content = tail.bytes().any(|b| b != b'\n');
-            Truncated {
-                kept: &s[..i],
-                skipped: if has_content { newlines } else { 0 },
-            }
-        }
-        Keep::Tail => {
-            let head = &s[..i];
-            let newlines = head.matches('\n').count() + 1;
-            let has_content = head.bytes().any(|b| b != b'\n');
-            Truncated {
-                kept: &s[i + 1..],
-                skipped: if has_content { newlines } else { 0 },
-            }
-        }
+    let tail = &s[i..];
+    let newlines = tail.matches('\n').count();
+    let has_content = tail.bytes().any(|b| b != b'\n');
+    let result = Truncated {
+        kept: &s[..i],
+        skipped: if has_content { newlines } else { 0 },
     };
     if result.skipped > 0 && !should_truncate(result.skipped) {
         return Truncated {
@@ -448,17 +427,10 @@ mod tests {
         }
     }
 
-    #[test_case("a\nb\nc", 5, Keep::Head, "a\nb\nc", 0     ; "under_limit")]
-    #[test_case("a\nb\nc\nd", 2, Keep::Head, "a\nb", 2     ; "head_over_limit")]
-    #[test_case("a\nb\nc\nd", 2, Keep::Tail, "c\nd", 2     ; "tail_over_limit")]
-    fn truncate_lines_cases(
-        input: &str,
-        max: usize,
-        keep: Keep,
-        expected_kept: &str,
-        expected_skipped: usize,
-    ) {
-        let tr = truncate_lines(input, max, keep);
+    #[test_case("a\nb\nc", 5, "a\nb\nc", 0     ; "under_limit")]
+    #[test_case("a\nb\nc\nd", 2, "a\nb", 2     ; "over_limit_keeps_head")]
+    fn truncate_lines_cases(input: &str, max: usize, expected_kept: &str, expected_skipped: usize) {
+        let tr = truncate_lines(input, max);
         assert_eq!(tr.kept, expected_kept);
         assert_eq!(tr.skipped, expected_skipped);
     }

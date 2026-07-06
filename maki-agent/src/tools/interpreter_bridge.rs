@@ -19,14 +19,21 @@ pub async fn dispatch(ctx: &ToolContext, name: &str, input: &Value) -> Result<St
         Emit::Silent,
     )
     .await;
-    if done.is_error {
-        Err(done.output.as_text())
-    } else if let crate::ToolOutput::Image { text, .. } = &done.output {
+    flatten(&done)
+}
+
+/// The one place a `ToolDoneEvent` becomes text a caller can read.
+/// Both the interpreter and `maki.agent.call_tool` come through here,
+/// so the two can never drift apart.
+pub fn flatten(done: &crate::ToolDoneEvent) -> Result<String, String> {
+    let text = match &done.output {
         // The pixels are dropped here; say so instead of implying they were seen.
-        Ok(format!("{text} ({IMAGE_NOT_VISIBLE_NOTE})"))
-    } else {
-        Ok(done.output.as_text())
-    }
+        crate::ToolOutput::Image { text, .. } if !done.is_error => {
+            format!("{text} ({IMAGE_NOT_VISIBLE_NOTE})")
+        }
+        out => out.as_text(),
+    };
+    if done.is_error { Err(text) } else { Ok(text) }
 }
 
 pub fn build_tool_input(args: &[Value], kwargs: &[(String, Value)]) -> Result<Value, String> {

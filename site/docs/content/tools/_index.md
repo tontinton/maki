@@ -114,7 +114,7 @@ View an image file (png, jpeg, gif, webp) so you can actually see it; it is retu
 
 ## Execution & Control
 
-### `batch` *(native)*
+### `batch` *(lua plugin)*
 
 Executes multiple independent tool calls concurrently to reduce round-trips.
 

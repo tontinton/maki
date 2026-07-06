@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use maki_agent::agent::LoadedInstructions;
 use maki_agent::cancel::CancelToken;
-use maki_agent::tools::{Deadline, FileReadTracker, LocalTools, ToolContext};
+use maki_agent::tools::{Deadline, FileReadTracker, LocalTools, ToolContext, ToolLive};
 use maki_config::{AgentConfig, ToolOutputLines};
 use mlua::{LuaSerdeExt, UserData, UserDataMethods, Value as LuaValue};
 
@@ -17,12 +17,17 @@ const DEADLINE_ALREADY_SET_MSG: &str = "ctx:set_deadline() already called";
 
 pub(crate) struct RestoreCtx {
     pub(crate) tool_output_lines: ToolOutputLines,
+    pub(crate) state: Option<serde_json::Value>,
 }
 
 impl UserData for RestoreCtx {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_method("tool_output_lines", |lua, this, ()| {
             lua.to_value(&this.tool_output_lines)
+        });
+        methods.add_method("state", |lua, this, ()| match &this.state {
+            Some(v) => crate::api::util::convert::json_to_lua(lua, v),
+            None => Ok(LuaValue::Nil),
         });
     }
 }
@@ -47,11 +52,20 @@ impl UserData for StartCtx {
 
 fn send_live_buf(lua: &mlua::Lua, buf: &mlua::AnyUserData) -> mlua::Result<()> {
     let shared = buf.borrow::<BufHandle>().map(|h| Arc::clone(&h.buf))?;
-    if let Some(live) = lock_cell(&active_task(lua)).live.clone() {
+    let task = active_task(lua);
+    let (live, sink) = {
+        let mut cell = lock_cell(&task);
+        cell.root_buf = Some(Arc::clone(&shared));
+        (cell.live.clone(), cell.live_sink.clone())
+    };
+    if let Some(live) = live {
         let _ = live.event_tx.send(maki_agent::AgentEvent::LiveToolBuf {
             id: live.tool_use_id.clone(),
-            body: shared,
+            body: Arc::clone(&shared),
         });
+    }
+    if let Some(sink) = sink {
+        let _ = sink.send(ToolLive::Buf(shared));
     }
     Ok(())
 }
@@ -80,10 +94,13 @@ impl Deref for AgentContext {
 }
 
 impl AgentContext {
-    /// Drops `tool_use_id` so inner tools never emit UI events for the outer call.
+    /// Drops `tool_use_id` so an inner tool never emits UI events under the
+    /// outer call's id, and `live_sink` so a grandchild never streams into
+    /// a sink meant for its parent.
     pub(crate) fn to_tool_context(&self) -> ToolContext {
         let mut c = self.0.clone();
         c.tool_use_id = None;
+        c.live_sink = None;
         c
     }
 }
@@ -167,12 +184,15 @@ impl UserData for LuaCtx {
             Ok(maki_agent::is_instruction_file(&name))
         });
 
-        methods.add_method_mut("finish", |_lua, this, val: LuaValue| {
+        methods.add_method_mut("finish", |lua, this, val: LuaValue| {
             let tx = this
                 .finish_tx
                 .take()
                 .ok_or_else(|| mlua::Error::runtime("ctx:finish() already called"))?;
 
+            if let Some(buf) = crate::api::ui::buf::buf_from_reply(&val) {
+                lock_cell(&active_task(lua)).root_buf = Some(buf);
+            }
             let _ = tx.send(ToolCallReply::from_lua_value(&val));
             Ok(())
         });
@@ -218,6 +238,7 @@ mod tests {
             Arc::new(|_: &serde_json::Value| Ok(String::new())) as LocalToolFn,
         );
         ctx.local_tools = Arc::new(tools);
+        ctx.live_sink = Some(flume::unbounded().0);
         ctx
     }
 
@@ -237,10 +258,15 @@ mod tests {
     }
 
     #[test]
-    fn agent_context_to_tool_context_drops_tool_use_id() {
+    fn agent_context_to_tool_context_drops_tool_use_id_and_sink() {
         let agent = AgentContext::from(&populated_ctx());
+        assert!(
+            agent.live_sink.is_some(),
+            "the sink set by the caller must survive into AgentContext"
+        );
         let inner = agent.to_tool_context();
         assert_eq!(inner.tool_use_id, None);
+        assert!(inner.live_sink.is_none(), "sink must not be inherited");
         assert_eq!(agent.tool_use_id.as_deref(), Some(TOOL_USE_ID));
     }
 }

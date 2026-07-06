@@ -2,21 +2,25 @@
 //! validation, concurrency) lives in the task plugin, not here.
 
 use std::collections::HashMap;
+use std::pin::pin;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use async_lock::Mutex as AsyncMutex;
+use futures::future::{Either, select};
+use maki_agent::agent::tool_dispatch::{self, Emit};
 use maki_agent::cancel::CancelMap;
+use maki_agent::tools::interpreter_bridge;
 use maki_agent::tools::registry::ToolRegistry;
 use maki_agent::tools::{
     Deadline, DescriptionContext, FileReadTracker, LocalToolFn, LocalTools, ToolAudience,
-    ToolFilter, interpreter_bridge,
+    ToolContext, ToolFilter, ToolLive,
 };
 use maki_agent::{
     Agent, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, Envelope, EventSender,
-    History, SubagentInfo,
+    History, SubagentInfo, ToolDoneEvent,
 };
 use maki_providers::model::ModelTier;
 use maki_providers::provider;
@@ -28,6 +32,7 @@ use serde_json::Value as JsonValue;
 use tracing::info;
 use uuid::Uuid;
 
+use crate::api::ui::buf::BufHandle;
 use crate::api::util::convert::{json_to_lua, lua_to_json, lua_tool_result};
 use crate::api::util::ctx::{AgentContext, LuaCtx};
 
@@ -175,7 +180,7 @@ async fn tools(lua: Lua, (ctx, opts): (mlua::UserDataRef<LuaCtx>, Table)) -> Lua
         workflow,
     };
     let mut defs =
-        ToolRegistry::native().definitions(&vars, &ctx_desc, model.supports_tool_examples());
+        ToolRegistry::global().definitions(&vars, &ctx_desc, model.supports_tool_examples());
 
     if include_mcp && let Some(ref mcp) = ctx.agent.mcp {
         mcp.extend_tools(&mut defs);
@@ -184,21 +189,98 @@ async fn tools(lua: Lua, (ctx, opts): (mlua::UserDataRef<LuaCtx>, Table)) -> Lua
     json_to_lua(&lua, &defs)
 }
 
+/// Returns `(text, err, annotation)`. While the child runs,
+/// `opts.on_live_buf` receives each buf it publishes (as a foreign
+/// `BufHandle`) and `opts.on_annotation` each live annotation (e.g. a
+/// subagent's model). Both run synchronously on the Lua thread and must
+/// not yield.
 async fn call_tool(
     _lua: Lua,
     (ctx, name, input, opts): (mlua::UserDataRef<LuaCtx>, String, LuaValue, Option<Table>),
-) -> LuaResult<(Option<String>, Option<String>)> {
+) -> LuaResult<(Option<String>, Option<String>, Option<String>)> {
     let input_json = lua_to_json(&input)?;
     let mut tctx = ctx.agent.to_tool_context();
-    if let Some(o) = opts
-        && let Some(secs) = o.get::<Option<u64>>("timeout")?
-    {
-        tctx.deadline = Deadline::after(Duration::from_secs(secs));
+    let mut on_live = None;
+    if let Some(o) = opts {
+        if let Some(secs) = o.get::<Option<u64>>("timeout")? {
+            tctx.deadline = Deadline::after(Duration::from_secs(secs));
+        }
+        let on_buf = o.get::<Option<Function>>("on_live_buf")?;
+        let on_ann = o.get::<Option<Function>>("on_annotation")?;
+        if on_buf.is_some() || on_ann.is_some() {
+            let (tx, rx) = flume::unbounded();
+            tctx.live_sink = Some(tx);
+            on_live = Some((rx, on_buf, on_ann));
+        }
     }
     drop(ctx);
-    match interpreter_bridge::dispatch(&tctx, &name, &input_json).await {
-        Ok(s) => Ok((Some(s), None)),
-        Err(e) => Ok((None, Some(e))),
+    if let Err(e) = tctx.deadline.check() {
+        return Ok((None, Some(e), None));
+    }
+    let done = dispatch_racing_live(&tctx, &name, &input_json, on_live).await;
+    // Same fallback the UI applies on tool completion, so a batch child's
+    // header carries the annotation its standalone run would get.
+    let annotation = done
+        .annotation
+        .clone()
+        .or_else(|| (!done.is_error).then(|| done.output.annotation()).flatten());
+    match interpreter_bridge::flatten(&done) {
+        Ok(text) => Ok((Some(text), None, annotation)),
+        Err(err) => Ok((None, Some(err), annotation)),
+    }
+}
+
+type OnLive = (
+    flume::Receiver<ToolLive>,
+    Option<Function>,
+    Option<Function>,
+);
+
+/// Like `interpreter_bridge::dispatch`, but keeps the full `ToolDoneEvent`
+/// (the annotation lives there) and delivers live bufs and annotations
+/// while the child runs.
+async fn dispatch_racing_live(
+    tctx: &ToolContext,
+    name: &str,
+    input: &JsonValue,
+    on_live: Option<OnLive>,
+) -> ToolDoneEvent {
+    let run = tool_dispatch::run(
+        &tctx.registry,
+        tctx.mcp.as_ref(),
+        String::new(),
+        name,
+        input,
+        tctx,
+        Emit::Silent,
+    );
+    let Some((rx, on_buf, on_ann)) = on_live else {
+        return run.await;
+    };
+    let deliver = |ev: ToolLive| {
+        let res = match ev {
+            ToolLive::Buf(buf) => on_buf
+                .as_ref()
+                .map(|f| f.call::<()>(BufHandle::foreign(buf))),
+            ToolLive::Annotation(ann) => on_ann.as_ref().map(|f| f.call::<()>(ann)),
+        };
+        if let Some(Err(e)) = res {
+            tracing::warn!(tool = name, error = %e, "live callback failed");
+        }
+    };
+    let mut run = pin!(run);
+    loop {
+        match select(run.as_mut(), pin!(rx.recv_async())).await {
+            Either::Left((done, _)) => {
+                while let Ok(ev) = rx.try_recv() {
+                    deliver(ev);
+                }
+                return done;
+            }
+            Either::Right((Ok(ev), _)) => deliver(ev),
+            // The sender is gone but no result arrived: just wait for the run.
+            Either::Right((Err(_), _)) => return run.await,
+        }
     }
 }
 
@@ -398,6 +480,11 @@ async fn session(
             Arc::clone(&agent_ctx.provider),
         )
     };
+    // A standalone task shows its model via SubagentInfo on the header;
+    // a dispatching caller (batch) gets the same thing as a live annotation.
+    if let Some(sink) = &agent_ctx.live_sink {
+        let _ = sink.send(ToolLive::Annotation(model.spec()));
+    }
 
     let mut tools_json: JsonValue = match tools_val {
         Some(val) => {
@@ -510,7 +597,7 @@ async fn session(
             file_tracker: FileReadTracker::fresh(),
             prompt_slots: Arc::clone(&agent_ctx.prompt_slots),
             subagent_cancels: Arc::new(CancelMap::new()),
-            registry: Arc::clone(maki_agent::tools::ToolRegistry::native_arc()),
+            registry: Arc::clone(maki_agent::tools::ToolRegistry::global_arc()),
             audience,
         },
         system: system.unwrap_or_default(),

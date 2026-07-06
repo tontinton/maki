@@ -30,14 +30,6 @@ pub fn highlight_line(hl: &mut maki_highlight::Highlighter, text: &str) -> Vec<S
         .collect()
 }
 
-pub fn highlight_regex_inline(pattern: &str) -> Vec<Span<'static>> {
-    let Some(syntax) = maki_highlight::syntax_set().find_syntax_by_token("re") else {
-        return vec![fallback_span(pattern)];
-    };
-    let mut hl = maki_highlight::Highlighter::for_syntax(syntax);
-    highlight_line(&mut hl, pattern)
-}
-
 pub fn fallback_span(text: &str) -> Span<'static> {
     Span::styled(
         maki_highlight::normalize_text(text),
@@ -105,13 +97,5 @@ mod tests {
         let span = fallback_span("\thello\n");
         let expected = format!("{TAB_SPACES}hello");
         assert_eq!(span.content.as_ref(), expected);
-    }
-
-    #[test]
-    fn highlight_regex_inline_roundtrips_text() {
-        let pattern = "[a-z]+\\d{2,}";
-        let spans = highlight_regex_inline(pattern);
-        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(text, pattern);
     }
 }

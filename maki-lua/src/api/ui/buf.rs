@@ -3,7 +3,11 @@ use std::sync::Arc;
 
 use maki_agent::types::InlineStyle;
 use maki_agent::{SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle};
-use mlua::{Function, Result as LuaResult, UserData, UserDataMethods, Value as LuaValue};
+use mlua::{
+    Function, Lua, Result as LuaResult, Table, UserData, UserDataMethods, Value as LuaValue,
+};
+
+use crate::runtime::{TaskHandle, lock_cell};
 
 /// `live_buf` tracks the first buffer a handler creates, the one
 /// that gets streamed to the UI during execution.
@@ -11,6 +15,31 @@ pub(crate) struct BufferStore {
     buffers: HashMap<u32, Arc<SharedBuf>>,
     next_id: u32,
     live_buf: Option<Arc<SharedBuf>>,
+    slots: Vec<HandlerSlot>,
+}
+
+/// `buf:on(...)` roots a Lua closure from the Rust side, and that closure
+/// usually captures its own handle. The Lua GC cannot see this cycle, so
+/// each registration is tracked on the task that made it and `clear`
+/// (TaskScope drop) breaks the cycle when the task retires.
+pub(crate) enum HandlerSlot {
+    Click(Arc<SharedBuf>),
+    Change(Arc<SharedBuf>),
+}
+
+impl HandlerSlot {
+    fn clear(&self) {
+        match self {
+            Self::Click(buf) => buf.clear_click(),
+            Self::Change(buf) => buf.clear_on_change(),
+        }
+    }
+}
+
+fn track_slot(lua: &Lua, slot: HandlerSlot) {
+    if let Some(h) = lua.app_data_ref::<TaskHandle>() {
+        lock_cell(&h).bufs.track(slot);
+    }
 }
 
 impl BufferStore {
@@ -19,6 +48,7 @@ impl BufferStore {
             buffers: HashMap::new(),
             next_id: 1,
             live_buf: None,
+            slots: Vec::new(),
         }
     }
 
@@ -55,7 +85,14 @@ impl BufferStore {
         self.buffers.remove(&id).map(|b| b.take())
     }
 
+    pub fn track(&mut self, slot: HandlerSlot) {
+        self.slots.push(slot);
+    }
+
     pub fn clear(&mut self) {
+        for slot in self.slots.drain(..) {
+            slot.clear();
+        }
         self.buffers.clear();
         self.live_buf = None;
     }
@@ -65,11 +102,48 @@ impl BufferStore {
     }
 }
 
+/// The click handler lives on the `SharedBuf` itself, so every handle
+/// wrapping the same buf (clones, replies, restores, foreign wrappers from
+/// `on_live_buf`) routes clicks to the one handler the owner registered.
 #[derive(Clone)]
 pub(crate) struct BufHandle {
     #[cfg_attr(not(test), allow(dead_code))]
     pub id: u32,
     pub buf: Arc<SharedBuf>,
+}
+
+impl BufHandle {
+    /// Wraps a buf owned by another task, e.g. a child tool's live buf
+    /// delivered through `on_live_buf`. Clicks still reach the owner's
+    /// handler.
+    pub(crate) fn foreign(buf: Arc<SharedBuf>) -> Self {
+        Self { id: 0, buf }
+    }
+
+    pub(crate) fn click_fn(&self) -> Option<Function> {
+        click_fn(&self.buf)
+    }
+
+    fn set_click(&self, f: Function) {
+        self.buf.set_click(Arc::new(f));
+    }
+}
+
+pub(crate) fn click_fn(buf: &SharedBuf) -> Option<Function> {
+    let f = buf.click()?.downcast::<Function>().ok()?;
+    Some((*f).clone())
+}
+
+/// The buf a tool reply or restore return uses as its body: the value
+/// itself, or its `body` field.
+pub(crate) fn buf_from_reply(val: &LuaValue) -> Option<Arc<SharedBuf>> {
+    let ud = match val {
+        LuaValue::UserData(ud) => ud.clone(),
+        LuaValue::Table(t) => t.get::<mlua::AnyUserData>("body").ok()?,
+        _ => return None,
+    };
+    let h = ud.borrow::<BufHandle>().ok()?;
+    Some(Arc::clone(&h.buf))
 }
 
 impl UserData for BufHandle {
@@ -80,7 +154,7 @@ impl UserData for BufHandle {
             Ok(())
         });
 
-        methods.add_method("lines", |_lua, this, tbl: mlua::Table| {
+        methods.add_method("lines", |_lua, this, tbl: Table| {
             let mut parsed = Vec::with_capacity(tbl.raw_len());
             for i in 1..=tbl.raw_len() {
                 let val: LuaValue = tbl.raw_get(i)?;
@@ -92,7 +166,7 @@ impl UserData for BufHandle {
             Ok(())
         });
 
-        methods.add_method("set_lines", |_lua, this, tbl: mlua::Table| {
+        methods.add_method("set_lines", |_lua, this, tbl: Table| {
             let mut parsed = Vec::with_capacity(tbl.raw_len());
             for i in 1..=tbl.raw_len() {
                 let val: LuaValue = tbl.raw_get(i)?;
@@ -104,18 +178,48 @@ impl UserData for BufHandle {
 
         methods.add_method("len", |_lua, this, ()| Ok(this.buf.len()));
 
-        methods.add_method("on", |lua, _this, (event, callback): (String, Function)| {
-            if event != "click" {
-                return Err(mlua::Error::runtime(format!("unsupported event: {event}")));
+        methods.add_method("get_lines", |lua, this, ()| {
+            let lines = this.buf.read();
+            let out = lua.create_table_with_capacity(lines.len(), 0)?;
+            for (i, line) in lines.iter().enumerate() {
+                out.raw_set(i + 1, line_to_lua(lua, line)?)?;
             }
-            let Some(handle) = lua.app_data_ref::<crate::runtime::TaskHandle>() else {
-                return Ok(());
-            };
-            let key = lua.create_registry_value(callback)?;
-            if let Some(old) = crate::runtime::lock_cell(&handle).click.replace(key) {
-                let _ = lua.remove_registry_value(old);
+            Ok(out)
+        });
+
+        methods.add_method("on", |lua, this, (event, callback): (String, Function)| {
+            match event.as_str() {
+                "click" => {
+                    this.set_click(callback);
+                    track_slot(lua, HandlerSlot::Click(Arc::clone(&this.buf)));
+                    Ok(())
+                }
+                // Change callbacks fire inline from buf mutations, so they
+                // must not yield or mutate this buffer.
+                "change" => {
+                    this.buf.set_on_change(move || {
+                        if let Err(e) = callback.call::<()>(()) {
+                            tracing::warn!(error = %e, "buf change callback failed");
+                        }
+                    });
+                    track_slot(lua, HandlerSlot::Change(Arc::clone(&this.buf)));
+                    Ok(())
+                }
+                _ => Err(mlua::Error::runtime(format!("unsupported event: {event}"))),
             }
-            Ok(())
+        });
+
+        // Extract the handler before the await: holding the UserDataRef
+        // across it would block the handler's own calls back into this buf
+        // (mlua `send` borrows are exclusive).
+        methods.add_async_method("click", |_lua, this, ev: LuaValue| {
+            let f = this.click_fn();
+            async move {
+                match f {
+                    Some(f) => f.call_async::<()>(ev).await,
+                    None => Ok(()),
+                }
+            }
         });
     }
 }
@@ -187,6 +291,52 @@ fn parse_style(val: &LuaValue) -> LuaResult<SpanStyle> {
             "style must be nil, a string name, or a table {fg?, bg?, bold?, ...}",
         )),
     }
+}
+
+fn line_to_lua(lua: &Lua, line: &SnapshotLine) -> LuaResult<Table> {
+    let tbl = lua.create_table_with_capacity(line.spans.len(), 0)?;
+    for (i, span) in line.spans.iter().enumerate() {
+        tbl.raw_set(i + 1, span_to_lua(lua, span)?)?;
+    }
+    Ok(tbl)
+}
+
+fn span_to_lua(lua: &Lua, span: &SnapshotSpan) -> LuaResult<Table> {
+    let tbl = lua.create_table_with_capacity(2, 0)?;
+    tbl.raw_set(1, span.text.as_str())?;
+    match &span.style {
+        SpanStyle::Default => {}
+        SpanStyle::Named(name) => tbl.raw_set(2, name.as_str())?,
+        SpanStyle::Inline(inline) => tbl.raw_set(2, inline_to_lua(lua, inline)?)?,
+    }
+    Ok(tbl)
+}
+
+fn inline_to_lua(lua: &Lua, inline: &InlineStyle) -> LuaResult<Table> {
+    let tbl = lua.create_table()?;
+    if let Some(rgb) = inline.fg {
+        tbl.raw_set("fg", hex_color(rgb))?;
+    }
+    if let Some(rgb) = inline.bg {
+        tbl.raw_set("bg", hex_color(rgb))?;
+    }
+    for (key, on) in [
+        ("bold", inline.bold),
+        ("italic", inline.italic),
+        ("underline", inline.underline),
+        ("dim", inline.dim),
+        ("strikethrough", inline.strikethrough),
+        ("reversed", inline.reversed),
+    ] {
+        if on {
+            tbl.raw_set(key, true)?;
+        }
+    }
+    Ok(tbl)
+}
+
+fn hex_color((r, g, b): (u8, u8, u8)) -> String {
+    format!("#{r:02x}{g:02x}{b:02x}")
 }
 
 fn parse_hex_color(s: &str) -> Option<(u8, u8, u8)> {
@@ -516,6 +666,45 @@ mod tests {
     }
 
     #[test]
+    fn get_lines_round_trips_styles() {
+        let lua = test_lua();
+        set_buf_global(&lua);
+
+        lua.load(
+            r##"
+            buf:set_lines({
+                "plain",
+                { { "named ", "tool" }, { "rest" } },
+                { { "inline", { fg = "#ff8000", bg = "#001122", bold = true, dim = true } } },
+                {},
+            })
+            buf:set_lines(buf:get_lines())
+            "##,
+        )
+        .exec()
+        .unwrap();
+
+        let ud: mlua::AnyUserData = lua.globals().get("buf").unwrap();
+        let lines = ud.borrow::<BufHandle>().unwrap().buf.read();
+        assert_eq!(lines.len(), 4);
+        assert_eq!(lines[0].spans[0].text, "plain");
+        assert_eq!(lines[0].spans[0].style, SpanStyle::Default);
+        assert_eq!(lines[1].spans[0].style, SpanStyle::Named("tool".into()));
+        assert_eq!(lines[1].spans[1].style, SpanStyle::Default);
+        assert_eq!(
+            lines[2].spans[0].style,
+            SpanStyle::Inline(InlineStyle {
+                fg: Some((255, 128, 0)),
+                bg: Some((0, 17, 34)),
+                bold: true,
+                dim: true,
+                ..InlineStyle::default()
+            })
+        );
+        assert!(lines[3].spans.is_empty());
+    }
+
+    #[test]
     fn buf_on_unsupported_event_errors() {
         let lua = test_lua();
         set_buf_global(&lua);
@@ -536,44 +725,143 @@ mod tests {
     }
 
     #[test]
-    fn buf_on_click_without_task_scope_is_noop() {
+    fn buf_on_click_stores_in_handle_slot_and_replaces() {
         let lua = test_lua();
         set_buf_global(&lua);
 
-        lua.load(r#"buf:on("click", function() end)"#)
-            .exec()
-            .unwrap();
-
-        assert!(
-            lua.app_data_ref::<crate::runtime::TaskHandle>().is_none(),
-            "no-op should not register a handler"
-        );
-    }
-
-    #[test]
-    fn buf_on_click_stores_in_task_cell_and_replaces() {
-        let lua = test_lua();
-        crate::runtime::install_live_ctx(&lua, "tool_123");
-        set_buf_global(&lua);
+        let handle = {
+            let ud: mlua::AnyUserData = lua.globals().get("buf").unwrap();
+            ud.borrow::<BufHandle>().unwrap().clone()
+        };
+        assert!(handle.click_fn().is_none());
 
         lua.load(r#"buf:on("click", function() return 1 end)"#)
             .exec()
             .unwrap();
-        let handle = lua
-            .app_data_ref::<crate::runtime::TaskHandle>()
-            .unwrap()
-            .clone();
-        assert!(
-            crate::runtime::lock_cell(&handle).click.is_some(),
-            "handler should be stored in task cell"
-        );
+        let first = handle.click_fn().expect("handler stored in handle slot");
 
         lua.load(r#"buf:on("click", function() return 2 end)"#)
             .exec()
             .unwrap();
-        assert!(
-            crate::runtime::lock_cell(&handle).click.is_some(),
-            "second on() should replace, not remove"
+        let second = handle
+            .click_fn()
+            .expect("second on() replaces, not removes");
+        assert_ne!(
+            first.call::<i64>(()).unwrap(),
+            second.call::<i64>(()).unwrap()
         );
+    }
+
+    #[test]
+    fn buf_click_invokes_own_handler_and_noops_without_one() {
+        let lua = test_lua();
+        set_buf_global(&lua);
+
+        smol::block_on(async {
+            lua.load(r#"buf:click({ row = 3 })"#)
+                .exec_async()
+                .await
+                .expect("click without handler is a no-op");
+
+            lua.load(
+                r#"
+                clicked_row = nil
+                buf:on("click", function(ev) clicked_row = ev.row end)
+                buf:click({ row = 3 })
+                "#,
+            )
+            .exec_async()
+            .await
+            .unwrap();
+        });
+        let row: i64 = lua.globals().get("clicked_row").unwrap();
+        assert_eq!(row, 3);
+    }
+
+    /// A foreign wrapper (the shape `on_live_buf` hands to a batch) must
+    /// route clicks to the handler the owning task registered: the click
+    /// slot lives on the SharedBuf, not on any one handle.
+    #[test]
+    fn foreign_handle_shares_click_handler() {
+        let lua = test_lua();
+        set_buf_global(&lua);
+        lua.load(r#"buf:on("click", function(ev) clicked_row = ev.row end)"#)
+            .exec()
+            .unwrap();
+
+        let buf = lua
+            .globals()
+            .get::<mlua::AnyUserData>("buf")
+            .unwrap()
+            .borrow::<BufHandle>()
+            .map(|h| Arc::clone(&h.buf))
+            .unwrap();
+        lua.globals()
+            .set(
+                "foreign",
+                lua.create_userdata(BufHandle::foreign(buf)).unwrap(),
+            )
+            .unwrap();
+
+        smol::block_on(async {
+            lua.load(r#"foreign:click({ row = 7 })"#)
+                .exec_async()
+                .await
+                .unwrap();
+        });
+        let row: i64 = lua.globals().get("clicked_row").unwrap();
+        assert_eq!(row, 7);
+    }
+
+    /// A handler must be able to call back into its own buf (every
+    /// ToolView toggle does), so the click method may not hold the
+    /// userdata borrow across the handler call.
+    #[test]
+    fn buf_click_handler_can_mutate_own_buf() {
+        let lua = test_lua();
+        set_buf_global(&lua);
+
+        smol::block_on(async {
+            lua.load(
+                r#"
+                buf:on("click", function() buf:set_lines({ { { "toggled" } } }) end)
+                buf:click({ row = 1 })
+                "#,
+            )
+            .exec_async()
+            .await
+            .expect("handler mutating its own buf must not fail borrow");
+        });
+        let text: String = lua
+            .load(r#"return buf:get_lines()[1][1][1]"#)
+            .eval()
+            .unwrap();
+        assert_eq!(text, "toggled");
+    }
+
+    #[test]
+    fn buf_on_change_fires_for_mutations_without_recursion() {
+        let lua = test_lua();
+        set_buf_global(&lua);
+
+        lua.load(
+            r#"
+            changes = 0
+            buf:on("change", function()
+                changes = changes + 1
+                -- Mutating the watched buf must not recurse.
+                if changes == 1 then buf:line("from-watcher") end
+            end)
+            buf:line("a")
+            buf:lines({ "b", "c" })
+            buf:set_lines({ "x" })
+            "#,
+        )
+        .exec()
+        .unwrap();
+
+        // line + 2x lines + set_lines = 4; the recursive append was dropped.
+        let changes: i64 = lua.globals().get("changes").unwrap();
+        assert_eq!(changes, 4);
     }
 }

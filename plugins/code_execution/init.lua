@@ -1,5 +1,7 @@
 -- Policy for the Python interpreter: which tools it may call, what the model
--- sees, and the import preamble. The sandbox and dispatch live in Rust.
+-- sees (via the `describe(dctx)` callback), and the import preamble. The
+-- sandbox and dispatch live in Rust, which exposes primitives only
+-- (`maki.api.get_tools`, `maki.agent.call_tool`); orchestration policy is here.
 
 local truncate = require("maki.truncate")
 local ToolView = require("maki.tool_view")

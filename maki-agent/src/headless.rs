@@ -111,7 +111,7 @@ fn setup(
         excluded_tools,
         mcp_handle,
         workflow,
-        ToolRegistry::native(),
+        ToolRegistry::global(),
     );
 
     AgentSetup {
@@ -211,7 +211,7 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
                     file_tracker: FileReadTracker::fresh(),
                     prompt_slots: Arc::new(params.prompt_slots),
                     subagent_cancels: Arc::new(CancelMap::new()),
-                    registry: Arc::clone(ToolRegistry::native_arc()),
+                    registry: Arc::clone(ToolRegistry::global_arc()),
                     audience: ToolAudience::MAIN,
                 },
                 AgentRunParams {
@@ -364,7 +364,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                                 &params.excluded_tools,
                                 params.mcp_handle.as_ref(),
                                 params.workflow,
-                                ToolRegistry::native(),
+                                ToolRegistry::global(),
                             );
                             model = new_model;
                         }
@@ -417,7 +417,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                         file_tracker: Arc::clone(&file_tracker),
                         prompt_slots: Arc::clone(&params.prompt_slots),
                         subagent_cancels: Arc::new(CancelMap::new()),
-                        registry: Arc::clone(ToolRegistry::native_arc()),
+                        registry: Arc::clone(ToolRegistry::global_arc()),
                         audience: ToolAudience::MAIN,
                     },
                     AgentRunParams {

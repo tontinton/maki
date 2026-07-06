@@ -4,8 +4,7 @@ use crate::components::scrollbar::SCROLLBAR_THUMB;
 use crate::selection::{Selection, SelectionZone};
 use maki_agent::tools::{BASH_TOOL_NAME, GREP_TOOL_NAME, WRITE_TOOL_NAME};
 use maki_agent::{
-    BatchToolEntry, GrepFileEntry, GrepMatchGroup, SnapshotLine, SnapshotSpan, SpanStyle,
-    ToolInput, ToolOutput,
+    GrepFileEntry, GrepMatchGroup, SnapshotLine, SnapshotSpan, SpanStyle, ToolInput, ToolOutput,
 };
 use ratatui::backend::TestBackend;
 use test_case::test_case;
@@ -549,100 +548,6 @@ fn update_tool_model_sets_annotation() {
     );
 }
 
-fn batch_entry(tool: &str, summary: &str, status: BatchToolStatus) -> BatchToolEntry {
-    BatchToolEntry {
-        tool: tool.into(),
-        summary: summary.into(),
-        status,
-        input: None,
-        raw_input: None,
-        output: None,
-        annotation: None,
-    }
-}
-
-fn batch_start(panel: &mut MessagesPanel, entries: Vec<BatchToolEntry>) {
-    panel.tool_start(ToolStartEvent {
-        id: "b1".into(),
-        tool: "batch".into(),
-        summary: format!("{} tools", entries.len()),
-        annotation: None,
-        input: None,
-        raw_input: None,
-        output: Some(ToolOutput::Batch {
-            entries,
-            text: String::new(),
-        }),
-        render_header: None,
-    });
-}
-
-fn batch_done(panel: &mut MessagesPanel, entries: Vec<BatchToolEntry>) {
-    panel.tool_done(ToolDoneEvent {
-        id: "b1".into(),
-        tool: "batch".into(),
-        output: ToolOutput::Batch {
-            entries,
-            text: String::new(),
-        },
-        is_error: false,
-        annotation: None,
-        written_path: None,
-    });
-}
-
-fn batch_entries(panel: &MessagesPanel) -> &[BatchToolEntry] {
-    let ToolOutput::Batch { entries, .. } = panel.messages[0].tool_output.as_deref().unwrap()
-    else {
-        panic!("expected Batch");
-    };
-    entries
-}
-
-#[test]
-fn tool_done_batch_preserves_entry_annotations() {
-    let mut panel = MessagesPanel::new(UiConfig::default());
-    batch_start(
-        &mut panel,
-        vec![
-            batch_entry("task", "research", BatchToolStatus::InProgress),
-            batch_entry("read", "file.rs", BatchToolStatus::Pending),
-        ],
-    );
-
-    let model = "anthropic/claude-haiku-4-20250414";
-    panel.update_tool_model("b1__0", model);
-
-    let mut done_entries = vec![
-        batch_entry("task", "research", BatchToolStatus::Success),
-        batch_entry("read", "file.rs", BatchToolStatus::Success),
-    ];
-    done_entries[0].output = Some(ToolOutput::Plain("result".into()));
-    done_entries[1].output = Some(ToolOutput::Plain("contents".into()));
-    batch_done(&mut panel, done_entries);
-
-    let entries = batch_entries(&panel);
-    assert_eq!(entries[0].annotation.as_deref(), Some(model));
-    assert!(entries[1].annotation.is_none());
-}
-
-#[test]
-fn tool_done_batch_preserves_entry_summaries() {
-    let mut panel = MessagesPanel::new(UiConfig::default());
-    batch_start(
-        &mut panel,
-        vec![batch_entry("task", "original", BatchToolStatus::InProgress)],
-    );
-
-    panel.update_tool_summary("b1__0", "renamed by ui");
-
-    let mut done_entries = vec![batch_entry("task", "original", BatchToolStatus::Success)];
-    done_entries[0].output = Some(ToolOutput::Plain("done".into()));
-    batch_done(&mut panel, done_entries);
-
-    assert_eq!(batch_entries(&panel)[0].summary, "renamed by ui");
-}
-
 #[test]
 fn scroll_clamps_to_max_scroll() {
     let mut panel = MessagesPanel::new(UiConfig::default());
@@ -652,15 +557,6 @@ fn scroll_clamps_to_max_scroll() {
 
     panel.scroll(-3);
     assert_eq!(panel.scroll_top, max);
-}
-
-#[test_case("b1__0",          Some(("b1", 0))   ; "simple")]
-#[test_case("b1__2",          Some(("b1", 2))   ; "higher_index")]
-#[test_case("a__b__1",        Some(("a__b", 1)) ; "nested_separators")]
-#[test_case("no_separator",   None               ; "no_double_underscore")]
-#[test_case("b1__notnum",     None               ; "non_numeric_suffix")]
-fn parse_batch_inner_id_cases(input: &str, expected: Option<(&str, usize)>) {
-    assert_eq!(parse_batch_inner_id(input), expected);
 }
 
 #[test_case("bash", 1, 1 ; "known_tool_creates_message")]
@@ -981,21 +877,6 @@ fn streaming_with_cached_segments_shows_end_on_auto_scroll() {
 }
 
 #[test]
-fn batch_parent_search_text_excludes_children() {
-    let mut panel = MessagesPanel::new(UiConfig::default());
-    let mut entry = batch_entry("read", "file.rs", BatchToolStatus::Success);
-    entry.output = Some(ToolOutput::Plain("file contents".into()));
-    let entries = vec![entry];
-    batch_start(&mut panel, entries.clone());
-    batch_done(&mut panel, entries);
-    rebuild(&mut panel);
-    let parent = seg_search(&panel, "b1");
-    assert!(!parent.contains("file contents"));
-    let child = seg_search(&panel, "b1__0");
-    assert!(child.contains("file contents"));
-}
-
-#[test]
 fn search_text_includes_truncated_bash_output() {
     let full_output = (0..100)
         .map(|i| format!("line {i}"))
@@ -1055,20 +936,6 @@ fn instruction_segment_has_spacer_before_it() {
     assert!(prev_segment_is_spacer(&panel, &inst_id));
 }
 
-#[test]
-fn batch_instruction_segment_has_no_spacer() {
-    let mut panel = MessagesPanel::new(UiConfig::default());
-    let mut entry = batch_entry("read", "file.rs", BatchToolStatus::Success);
-    entry.output = Some(read_code_with_instructions(instruction_blocks()));
-    let entries = vec![entry];
-    batch_start(&mut panel, entries.clone());
-    batch_done(&mut panel, entries);
-    rebuild(&mut panel);
-
-    let inst_id = segment::instruction_id("b1__0");
-    assert!(!prev_segment_is_spacer(&panel, &inst_id));
-}
-
 fn seg_line_count(panel: &MessagesPanel, tool_id: &str) -> usize {
     panel
         .cache
@@ -1117,7 +984,7 @@ fn handle_click_returns_nothing_when_no_segment_at_row() {
 }
 
 #[test]
-fn handle_click_returns_toggled_when_snapshot_exists() {
+fn handle_click_on_done_tool_records_click_row() {
     let mut panel = MessagesPanel::new(UiConfig::default());
     panel.tool_start(start("t1", BASH_TOOL_NAME));
     panel.tool_done(ToolDoneEvent {
@@ -1136,11 +1003,11 @@ fn handle_click_returns_toggled_when_snapshot_exists() {
     render(&mut panel, 80, 24);
     let area = Rect::new(0, 0, 80, 24);
     assert!(panel.handle_click(area.y, area));
-    assert!(panel.lua_expanded.contains("t1"));
+    assert_eq!(panel.lua_clicks.get("t1").map(Vec::len), Some(1));
 }
 
 #[test]
-fn handle_click_on_running_tool_with_snapshot_skips_expand_toggle() {
+fn handle_click_on_running_tool_forwards_live_without_recording() {
     let mut panel = MessagesPanel::new(UiConfig::default());
     panel.tool_start(start("t1", BASH_TOOL_NAME));
     panel.tool_snapshot(
@@ -1151,7 +1018,7 @@ fn handle_click_on_running_tool_with_snapshot_skips_expand_toggle() {
     render(&mut panel, 80, 24);
     let area = Rect::new(0, 0, 80, 24);
     assert!(panel.handle_click(area.y, area));
-    assert!(!panel.lua_expanded.contains("t1"));
+    assert!(panel.lua_clicks.is_empty());
 }
 
 #[test]
@@ -1171,38 +1038,6 @@ fn handle_click_non_tool_segment_returns_nothing() {
     render(&mut panel, 80, 24);
     let area = Rect::new(0, 0, 80, 24);
     assert!(!panel.handle_click(area.y, area));
-}
-
-#[test]
-fn handle_click_returns_toggled_for_batch_child_with_snapshot() {
-    let mut panel = MessagesPanel::new(UiConfig::default());
-    batch_start(
-        &mut panel,
-        vec![batch_entry("bash", "echo hi", BatchToolStatus::Success)],
-    );
-    let mut done_entries = vec![batch_entry("bash", "echo hi", BatchToolStatus::Success)];
-    done_entries[0].output = Some(ToolOutput::Plain("hi".into()));
-    batch_done(&mut panel, done_entries);
-
-    panel.tool_snapshot(
-        "b1__0",
-        BufferSnapshot::from_arc(Arc::new(vec![snap_line("rendered")])),
-        None,
-    );
-    render(&mut panel, 80, 24);
-
-    let width = 80;
-    let seg_idx = panel
-        .cache
-        .find_by_tool_id("b1__0")
-        .expect("child segment exists");
-    let row: u16 = panel.cache.segments()[..seg_idx]
-        .iter()
-        .map(|s| s.height(width))
-        .sum();
-    let area = Rect::new(0, 0, width, 24);
-    assert!(panel.handle_click(row, area));
-    assert!(panel.lua_expanded.contains("b1__0"));
 }
 
 #[test]
@@ -1322,7 +1157,6 @@ const REQUEST_RECORDED_MSG: &str = "a fired re-bake records the requested genera
 const NOT_RESTAMPED_MSG: &str =
     "the re-bake walk must not optimistically stamp the displayed generation";
 const NO_REQUEST_MSG: &str = "snapshot-free message must not trigger a re-bake request";
-const NO_RESPAM_MSG: &str = "an in-flight re-bake must not be re-requested at the same generation";
 const SUPERSEDED_DROP_MSG: &str =
     "a re-bake reply older than the applied generation must be dropped (monotonic)";
 
@@ -1396,65 +1230,10 @@ fn test_event_sender() -> maki_agent::EventSender {
     maki_agent::EventSender::new(tx, 0)
 }
 
-#[test]
-fn rebake_walk_requests_stale_batch_child_once() {
-    let mut panel = MessagesPanel::new(UiConfig::default());
-    batch_start(
-        &mut panel,
-        vec![batch_entry("bash", "echo hi", BatchToolStatus::Success)],
-    );
-    let mut done_entries = vec![batch_entry("bash", "echo hi", BatchToolStatus::Success)];
-    done_entries[0].output = Some(ToolOutput::Plain("hi".into()));
-    done_entries[0].raw_input = Some(serde_json::json!({ "command": "echo hi" }));
-    batch_done(&mut panel, done_entries);
-    panel.tool_snapshot("b1__0", rendered_snapshot(), None);
-
-    panel.set_restore_channel(
-        Some(maki_lua::EventHandle::disconnected_for_test()),
-        Some(test_event_sender()),
-    );
-
-    let baked = panel.snapshot_gen_of("b1__0").unwrap();
-    let next_gen = baked + 1;
-
-    panel.rebake_stale_snapshots(next_gen);
-    assert_eq!(
-        panel.rebake_requested_gen("b1__0"),
-        Some(next_gen),
-        "{REQUEST_RECORDED_MSG}"
-    );
-    assert_eq!(
-        panel.snapshot_gen_of("b1__0"),
-        Some(baked),
-        "{NOT_RESTAMPED_MSG}"
-    );
-
-    panel.rebake_stale_snapshots(next_gen);
-    assert_eq!(
-        panel.rebake_requested_gen("b1__0"),
-        Some(next_gen),
-        "{NO_RESPAM_MSG}"
-    );
-}
-
-const PHANTOM_CHILD_MSG: &str =
-    "a batch-child snapshot for a tool this panel does not own must be ignored, not stored";
-
-#[test]
-fn batch_child_snapshot_for_unknown_parent_is_ignored() {
-    let mut panel = MessagesPanel::new(UiConfig::default());
-    panel.tool_snapshot("missing__0", rendered_snapshot(), None);
-    assert!(
-        panel.snapshot_gen_of("missing__0").is_none(),
-        "{PHANTOM_CHILD_MSG}"
-    );
-}
-
 const RAW_INPUT_SET_MSG: &str = "tool_raw_input must be set from event payload";
 const HEADER_GEN_MSG: &str = "header snapshot must stamp the provided generation";
 const LIVE_PANEL_GEN_MSG: &str = "live snapshot (None gen) must stamp with panel theme_generation";
 const REBAKE_NOOP_MSG: &str = "rebake without channel must be a no-op (no requested gen)";
-const BATCH_RAW_INPUT_MSG: &str = "batch done must propagate raw_input to existing entries";
 
 #[test_case(false ; "fresh_start")]
 #[test_case(true  ; "upgrade_from_pending")]
@@ -1513,44 +1292,6 @@ fn rebake_without_channel_is_noop() {
         panel.rebake_requested_gen("t1").is_none(),
         "{REBAKE_NOOP_MSG}"
     );
-}
-
-#[test]
-fn batch_done_propagates_raw_input_to_existing_entries() {
-    let mut panel = MessagesPanel::new(UiConfig::default());
-    batch_start(
-        &mut panel,
-        vec![batch_entry("bash", "echo hi", BatchToolStatus::InProgress)],
-    );
-
-    let mut done_entries = vec![batch_entry("bash", "echo hi", BatchToolStatus::Success)];
-    done_entries[0].output = Some(ToolOutput::Plain("hi".into()));
-    done_entries[0].raw_input = Some(serde_json::json!({"command": "echo hi"}));
-    batch_done(&mut panel, done_entries);
-
-    let entries = batch_entries(&panel);
-    assert!(entries[0].raw_input.is_some(), "{BATCH_RAW_INPUT_MSG}");
-    assert_eq!(
-        entries[0].raw_input.as_ref().unwrap(),
-        &serde_json::json!({"command": "echo hi"}),
-        "{BATCH_RAW_INPUT_MSG}"
-    );
-}
-
-#[test]
-fn header_snapshot_for_batch_child_stamps_gen() {
-    let mut panel = MessagesPanel::new(UiConfig::default());
-    batch_start(
-        &mut panel,
-        vec![batch_entry("bash", "echo hi", BatchToolStatus::Success)],
-    );
-    let mut done_entries = vec![batch_entry("bash", "echo hi", BatchToolStatus::Success)];
-    done_entries[0].output = Some(ToolOutput::Plain("hi".into()));
-    batch_done(&mut panel, done_entries);
-
-    panel.tool_header_snapshot("b1__0", rendered_snapshot(), Some(7));
-
-    assert_eq!(panel.snapshot_gen_of("b1__0"), Some(7), "{HEADER_GEN_MSG}");
 }
 
 #[test]

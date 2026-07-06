@@ -9,7 +9,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use flume::Sender;
 use maki_agent::prompt::{PromptId, Slot, SlotKind, ValidNames};
 use maki_agent::tools::Tool;
-use maki_agent::tools::registry::ToolRegistry;
+use maki_agent::tools::registry::{RegisteredTool, ToolRegistry};
 use maki_agent::tools::schema::{ParamSchema, to_json_schema, try_from_json, validate};
 use maki_agent::tools::{
     BoxFuture, Deadline, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError,
@@ -54,6 +54,21 @@ pub(crate) fn set_local_describe(f: impl Fn(&str, &str, &Value) -> Option<String
 
 fn local_describe(plugin: &str, tool: &str, dctx: &Value) -> Option<Option<String>> {
     LOCAL_DESCRIBE.with(|c| c.borrow().as_ref().map(|f| f(plugin, tool, dctx)))
+}
+
+type ToolHandles = (Option<Function>, Option<Function>);
+type ToolHandlesFn = Box<dyn Fn(&str) -> Option<ToolHandles>>;
+
+thread_local! {
+    static LOCAL_TOOL_HANDLES: RefCell<Option<ToolHandlesFn>> = const { RefCell::new(None) };
+}
+
+pub(crate) fn set_local_tool_handles(f: impl Fn(&str) -> Option<ToolHandles> + 'static) {
+    LOCAL_TOOL_HANDLES.with(|c| *c.borrow_mut() = Some(Box::new(f)));
+}
+
+fn local_tool_handles(tool: &str) -> Option<ToolHandles> {
+    LOCAL_TOOL_HANDLES.with(|c| c.borrow().as_ref().and_then(|f| f(tool)))
 }
 
 fn dctx_json(ctx: &DescriptionContext) -> Value {
@@ -433,6 +448,7 @@ impl ToolInvocation for LuaToolInvocation {
                     let format = reply.format;
                     let instructions = reply.instructions;
                     let image = reply.image;
+                    let state = reply.state;
                     ToolExecResult {
                         output: reply.result.map(|s| {
                             if let Some(source) = image {
@@ -445,12 +461,10 @@ impl ToolInvocation for LuaToolInvocation {
                                     after: diff.after,
                                 }
                             } else {
-                                let inner = match instructions {
-                                    Some(blocks) if !blocks.is_empty() => TextOutput {
-                                        text: s,
-                                        instructions: Some(blocks),
-                                    },
-                                    _ => s.into(),
+                                let inner = TextOutput {
+                                    text: s,
+                                    instructions: instructions.filter(|b| !b.is_empty()),
+                                    state,
                                 };
                                 match format {
                                     LuaOutputFormat::Markdown => ToolOutput::Markdown(inner),
@@ -637,6 +651,7 @@ pub(crate) fn create_api_table(
     )?;
 
     t.set("get_tools", lua.create_function(get_tools_from_lua)?)?;
+    t.set("get_tool", lua.create_function(get_tool_from_lua)?)?;
 
     Ok(t)
 }
@@ -658,24 +673,52 @@ fn get_tools_from_lua(lua: &Lua, opts: Option<Table>) -> LuaResult<Table> {
 
     let out = lua.create_table()?;
     for (i, entry) in registry.iter().iter().enumerate() {
-        let audience = entry.tool.audience();
-        let audiences = lua.create_table()?;
-        for (flag, name) in maki_agent::tools::registry::AUDIENCE_NAMES {
-            if audience.contains(*flag) {
-                audiences.push(*name)?;
-            }
-        }
-        let t = lua.create_table()?;
-        t.set("name", entry.name())?;
-        t.set("schema", json_to_lua(lua, &entry.tool.schema())?)?;
-        t.set("audiences", audiences)?;
-        if let Some(kind) = entry.tool.tool_kind() {
-            t.set("kind", kind)?;
-        }
+        let t = tool_entry_to_lua(lua, entry)?;
         t.set("enabled", is_tool_enabled(&disabled, entry.name()))?;
         out.set(i + 1, t)?;
     }
     Ok(out)
+}
+
+fn tool_entry_to_lua(lua: &Lua, entry: &RegisteredTool) -> LuaResult<Table> {
+    let audience = entry.tool.audience();
+    let audiences = lua.create_table()?;
+    for (flag, name) in maki_agent::tools::registry::AUDIENCE_NAMES {
+        if audience.contains(*flag) {
+            audiences.push(*name)?;
+        }
+    }
+    let t = lua.create_table()?;
+    t.set("name", entry.name())?;
+    t.set("schema", json_to_lua(lua, &entry.tool.schema())?)?;
+    t.set("audiences", audiences)?;
+    if let Some(kind) = entry.tool.tool_kind() {
+        t.set("kind", kind)?;
+    }
+    Ok(t)
+}
+
+/// Single-tool lookup that also hands out `header`/`restore` function
+/// handles for Lua tools (nil for MCP or missing tools). Kept apart from
+/// `get_tools` so the listing stays a cheap data-only snapshot.
+fn get_tool_from_lua(lua: &Lua, name: String) -> LuaResult<LuaValue> {
+    let registry = lua
+        .app_data_ref::<Arc<ToolRegistry>>()
+        .map(|r| Arc::clone(&r))
+        .ok_or_else(|| mlua::Error::runtime("get_tool: tool registry not available"))?;
+    let Some(entry) = registry.get(&name) else {
+        return Ok(LuaValue::Nil);
+    };
+    let t = tool_entry_to_lua(lua, &entry)?;
+    if let Some((header, restore)) = local_tool_handles(&name) {
+        if let Some(f) = header {
+            t.set("header", f)?;
+        }
+        if let Some(f) = restore {
+            t.set("restore", f)?;
+        }
+    }
+    Ok(LuaValue::Table(t))
 }
 
 fn is_valid_tool_name(name: &str) -> bool {
@@ -954,6 +997,7 @@ pub(crate) struct ToolCallReply {
     /// Set via `image = { media_type = "image/png", data = <base64> }` in the
     /// handler return; becomes `ToolOutput::Image` with `llm_output` as caption.
     pub image: Option<ImageSource>,
+    pub state: Option<Value>,
 }
 
 impl ToolCallReply {
@@ -985,6 +1029,12 @@ impl ToolCallReply {
                 None
             }
         };
+        let state = match t.get::<LuaValue>("state") {
+            Ok(LuaValue::Nil) | Err(_) => None,
+            Ok(v) => crate::api::util::convert::lua_to_json(&v)
+                .inspect_err(|e| tracing::warn!(error = %e, "tool state is not JSON-serializable, dropping it"))
+                .ok(),
+        };
         Self {
             result,
             snapshot,
@@ -996,6 +1046,7 @@ impl ToolCallReply {
             written_path,
             diff,
             image,
+            state,
         }
     }
 
@@ -1028,6 +1079,7 @@ impl ToolCallReply {
             written_path: None,
             diff: None,
             image: None,
+            state: None,
         }
     }
 

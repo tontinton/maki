@@ -234,7 +234,7 @@ impl AgentLoop {
                 file_tracker: Arc::clone(&self.file_tracker),
                 prompt_slots: Arc::new(prompt_slots),
                 subagent_cancels: Arc::clone(&self.subagent_cancels),
-                registry: Arc::clone(maki_agent::tools::ToolRegistry::native_arc()),
+                registry: Arc::clone(maki_agent::tools::ToolRegistry::global_arc()),
                 audience: ToolAudience::MAIN,
             },
             AgentRunParams {
@@ -278,7 +278,7 @@ impl AgentLoop {
             audience: ToolAudience::MAIN,
             workflow,
         };
-        ToolRegistry::native().definitions(&self.vars, &ctx, examples)
+        ToolRegistry::global().definitions(&self.vars, &ctx, examples)
     }
 
     async fn reload_instructions(&mut self) {

@@ -135,7 +135,6 @@ fn write_param_table(out: &mut String, params: &[Param]) {
 
 fn source_label(source: &ToolSource) -> &'static str {
     match source {
-        ToolSource::Native => "native",
         ToolSource::Lua { .. } => "lua plugin",
         ToolSource::Mcp { .. } => "mcp",
     }
@@ -227,7 +226,7 @@ fn collect_tool_info(
 }
 
 fn load_registry_with_builtins() -> Arc<ToolRegistry> {
-    let registry = Arc::new(ToolRegistry::with_natives());
+    let registry = Arc::new(ToolRegistry::new());
     let _host =
         PluginHost::with_all_builtins(Arc::clone(&registry)).expect("loading builtin plugins");
     registry

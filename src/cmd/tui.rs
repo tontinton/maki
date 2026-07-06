@@ -72,7 +72,7 @@ pub fn run(cli: Cli) -> Result<()> {
     let mut plugin_host = if cli.no_plugins {
         PluginHost::disabled()
     } else {
-        PluginHost::new(Arc::clone(ToolRegistry::native_arc()))
+        PluginHost::new(Arc::clone(ToolRegistry::global_arc()))
             .context("initialize lua plugin host")?
     };
 

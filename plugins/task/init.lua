@@ -1,7 +1,9 @@
 -- Structured-output story: the subagent gets a session-local structured_output
 -- tool whose handler validates and captures the result as closure upvalues.
 -- Invalid input is an inline tool error the model can fix in the same run.
--- Rust provides session, schema_validator, and semaphore primitives only.
+-- This plugin owns structured output and subagent concurrency; Rust exposes
+-- primitives only (`maki.agent.session`, `maki.json.schema_validator`,
+-- `maki.async.semaphore`).
 
 local STRUCTURED_OUTPUT_NAME = "structured_output"
 local STRUCTURED_OUTPUT_DESCRIPTION = "Report your final result. Call it exactly once when your task is complete."
@@ -166,7 +168,7 @@ local function handler(input, ctx)
       local msg = last_errors and (STRUCTURED_INVALID_ERROR .. ":\n" .. last_errors) or STRUCTURED_MISSING_ERROR
       return { llm_output = msg, is_error = true }
     end
-    return { llm_output = captured and maki.json.encode(captured) or result.text }
+    return { llm_output = captured and maki.json.encode(captured) or result.text, format = "markdown" }
   end)
 
   permit:release()

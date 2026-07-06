@@ -55,7 +55,6 @@ members = [
   "maki-markdown",
   "maki-providers",
   "maki-storage",
-  "maki-tool-macro",
   "maki-config-macro",
   "maki-ui",
 ]
@@ -78,7 +77,6 @@ maki-providers = { path = "maki-providers" }
 maki-storage = { path = "maki-storage" }
 maki-ui = { path = "maki-ui" }
 maki-lua = { path = "maki-lua" }
-maki-tool-macro = { path = "maki-tool-macro" }
 maki-config-macro = { path = "maki-config-macro" }
 maki-highlight = { path = "maki-highlight" }
 maki-markdown = { path = "maki-markdown" }

@@ -411,6 +411,7 @@ impl<'h> Agent<'h> {
             workflow: self.workflow,
             audience: self.audience,
             local_tools: Arc::clone(&self.local_tools),
+            live_sink: None,
         }
     }
 
@@ -621,7 +622,7 @@ mod tests {
                 file_tracker: FileReadTracker::fresh(),
                 prompt_slots: Arc::new(crate::prompt::ResolvedSlots::default()),
                 subagent_cancels: Arc::new(crate::cancel::CancelMap::new()),
-                registry: Arc::new(crate::tools::ToolRegistry::with_natives()),
+                registry: Arc::new(crate::tools::ToolRegistry::new()),
                 audience: ToolAudience::MAIN,
             },
             AgentRunParams {
@@ -884,7 +885,7 @@ mod tests {
                     file_tracker: FileReadTracker::fresh(),
                     prompt_slots: Arc::new(crate::prompt::ResolvedSlots::default()),
                     subagent_cancels: Arc::new(crate::cancel::CancelMap::new()),
-                    registry: Arc::new(crate::tools::ToolRegistry::with_natives()),
+                    registry: Arc::new(crate::tools::ToolRegistry::new()),
                     audience: ToolAudience::MAIN,
                 },
                 AgentRunParams {

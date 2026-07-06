@@ -42,16 +42,14 @@ Rust workspace, key crates in root dir:
 
 - maki-ui: Uses ratatui for an interactive UI (elm like architecture)
 - maki-providers: Integration with LLM providers via APIs (e.g. Anthropic, Z.AI)
-- maki-agent: An async agent loop that runs on smol + tools descriptions and implementations
+- maki-agent: An async agent loop that runs on smol
 - maki-interpreter: code_execution tool implementation using pydantic/monty (a minimal python sandbox)
 - maki-storage: Persistent state across runs (e.g. sessions, auth)
 - maki-config: User config
 - maki-lua: Lua plugin system (API mirrored from neovim for plugin compatibility), built-in plugins in ./plugins dir
 - maki-acp: ACP ndjson stdio server
 
-Built-in lua plugins in ./plugins: index (return a compact skeleton of a source file using tree-sitter), bash, glob, question, skill, memory, webfetch, websearch, todo_write, read, write, edit, task, code_execution.
-
-Tool orchestration policy lives in these plugins, not in Rust: code_execution decides which tools the interpreter sees and describes them (`describe(dctx)` callback), task owns structured output and subagent concurrency. Rust exposes primitives only (`maki.api.get_tools`, `maki.agent.call_tool`/`session`, `maki.json.schema_validator`, `maki.async.semaphore`).
+Built-in lua plugins in ./plugins: index (return a compact skeleton of a source file using tree-sitter), bash, glob, question, skill, memory, webfetch, websearch, todo_write, read, write, edit, task, code_execution (python sandbox), batch.
 
 ## Docs
 

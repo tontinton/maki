@@ -18,7 +18,7 @@ pub fn run(model_arg: Option<String>, yolo: bool) -> Result<()> {
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
     load_env_files(&cwd);
 
-    let mut plugin_host = PluginHost::new(Arc::clone(ToolRegistry::native_arc()))
+    let mut plugin_host = PluginHost::new(Arc::clone(ToolRegistry::global_arc()))
         .context("initialize lua plugin host")?;
 
     let raw_config = plugin_host

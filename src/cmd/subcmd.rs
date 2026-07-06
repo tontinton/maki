@@ -455,7 +455,7 @@ pub fn index(path: &str, no_plugins: bool) -> Result<()> {
     let mut host = if no_plugins {
         PluginHost::disabled()
     } else {
-        PluginHost::new(Arc::clone(ToolRegistry::native_arc()))
+        PluginHost::new(Arc::clone(ToolRegistry::global_arc()))
             .context("initialize lua plugin host")?
     };
 
@@ -474,7 +474,7 @@ pub fn index(path: &str, no_plugins: bool) -> Result<()> {
         .canonicalize()
         .unwrap_or_else(|_| Path::new(path).to_path_buf());
     let input = serde_json::json!({"path": abs_path.to_str().unwrap_or(path)});
-    let reg = ToolRegistry::native_arc();
+    let reg = ToolRegistry::global_arc();
     let entry = reg
         .get("index")
         .ok_or_else(|| color_eyre::eyre::eyre!("index tool not registered"))?;
@@ -540,7 +540,7 @@ pub fn prompt(
     load_env_files(&cwd);
 
     let vars = template::env_vars();
-    let reg = ToolRegistry::native_arc();
+    let reg = ToolRegistry::global_arc();
     let mut host = PluginHost::new(Arc::clone(reg)).context("initialize lua plugin host")?;
     let raw_config = host.load_init_files(&cwd).context("load init.lua files")?;
     let config = raw_config

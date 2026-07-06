@@ -1,4 +1,4 @@
-//! Single source of truth for all tools (native, MCP, Lua). One registry, one lookup
+//! Single source of truth for all tools (Lua plugins and MCP servers). One registry, one lookup
 //! path, no parallel lists that can drift.
 
 use std::borrow::Cow;
@@ -60,7 +60,6 @@ impl ToolAudience {
 
 #[derive(Clone, Debug)]
 pub enum ToolSource {
-    Native,
     Mcp { server: Arc<str> },
     Lua { plugin: Arc<str> },
 }
@@ -68,7 +67,6 @@ pub enum ToolSource {
 impl ToolSource {
     pub fn as_log_field(&self) -> Cow<'static, str> {
         match self {
-            Self::Native => Cow::Borrowed("native"),
             Self::Mcp { server } => Cow::Owned(format!("mcp:{server}")),
             Self::Lua { plugin } => Cow::Owned(format!("lua:{plugin}")),
         }
@@ -249,14 +247,8 @@ impl RegisteredTool {
 }
 
 /// Lock-free reads via `ArcSwap`, writes swap in a new snapshot atomically.
-///
-/// Bundled Lua plugins can replace a native tool with their own version.
-/// The original native tool is kept in `native_fallbacks` so we can still
-/// look up its header info. User plugins are not allowed to replace tools
-/// that aren't native (that gives a `NameConflict` error).
 pub struct ToolRegistry {
     tools: ArcSwap<Vec<RegisteredTool>>,
-    native_fallbacks: ArcSwap<Vec<RegisteredTool>>,
 }
 
 impl Default for ToolRegistry {
@@ -275,43 +267,19 @@ impl ToolRegistry {
     pub fn new() -> Self {
         Self {
             tools: ArcSwap::from_pointee(Vec::new()),
-            native_fallbacks: ArcSwap::from_pointee(Vec::new()),
         }
     }
 
-    pub fn native() -> &'static Self {
-        Self::native_arc()
+    /// The process-wide registry. Every tool in it comes from a Lua plugin
+    /// or an MCP server; Rust itself registers nothing.
+    pub fn global() -> &'static Self {
+        Self::global_arc()
     }
 
-    pub fn native_arc() -> &'static Arc<Self> {
-        static NATIVE: LazyLock<Arc<ToolRegistry>> =
-            LazyLock::new(|| Arc::new(ToolRegistry::build_native()));
-        &NATIVE
-    }
-
-    pub fn with_natives() -> Self {
-        Self::build_native()
-    }
-
-    /// `register_tools!` catches dupes at compile time. Plugins and MCP skip
-    /// that macro, so this runtime check is the safety net.
-    fn build_native() -> Self {
-        let registry = Self::new();
-        let natives = super::native_tools();
-        let mut vec: Vec<RegisteredTool> = Vec::with_capacity(natives.len());
-        for tool in natives {
-            let name = tool.name().to_owned();
-            assert!(
-                !vec.iter().any(|t| t.name() == name),
-                "duplicate native tool name: {name}"
-            );
-            vec.push(RegisteredTool {
-                tool,
-                source: ToolSource::Native,
-            });
-        }
-        registry.tools.store(Arc::new(vec));
-        registry
+    pub fn global_arc() -> &'static Arc<Self> {
+        static GLOBAL: LazyLock<Arc<ToolRegistry>> =
+            LazyLock::new(|| Arc::new(ToolRegistry::new()));
+        &GLOBAL
     }
 
     pub fn get(&self, name: &str) -> Option<RegisteredTool> {
@@ -396,10 +364,8 @@ impl ToolRegistry {
         new_entries: Vec<(Arc<dyn Tool>, ToolSource)>,
     ) -> Result<(), RegistryError> {
         let mut conflict = None;
-        let mut displaced: Vec<RegisteredTool> = Vec::new();
         self.tools.rcu(|current| {
             conflict = None;
-            displaced = Vec::new();
             let mut next: Vec<RegisteredTool> = current
                 .iter()
                 .filter(
@@ -409,17 +375,12 @@ impl ToolRegistry {
                 .collect();
             for (tool, source) in &new_entries {
                 let name = tool.name();
-                if let Some(idx) = next.iter().position(|t| t.name() == name) {
-                    if matches!(next[idx].source, ToolSource::Native) {
-                        displaced.push(next.remove(idx));
-                    } else {
-                        conflict = Some(RegistryError::NameConflict {
-                            name: name.to_owned(),
-                            existing: next[idx].source.as_log_field().into_owned(),
-                        });
-                        displaced = Vec::new();
-                        return Vec::clone(current);
-                    }
+                if let Some(existing) = next.iter().find(|t| t.name() == name) {
+                    conflict = Some(RegistryError::NameConflict {
+                        name: name.to_owned(),
+                        existing: existing.source.as_log_field().into_owned(),
+                    });
+                    return Vec::clone(current);
                 }
                 next.push(RegisteredTool {
                     tool: Arc::clone(tool),
@@ -431,81 +392,28 @@ impl ToolRegistry {
         if let Some(e) = conflict {
             return Err(e);
         }
-        if !displaced.is_empty() {
-            self.native_fallbacks.rcu(|current| {
-                let mut next = Vec::clone(current);
-                next.extend(displaced.iter().cloned());
-                next
-            });
-        }
         Ok(())
     }
 
     pub fn clear_plugin(&self, plugin: &str) {
-        let fallbacks = self.native_fallbacks.load();
-        let tools_guard = self.tools.load();
-        let plugin_names: Vec<&str> = tools_guard
-            .iter()
-            .filter(|t| matches!(&t.source, ToolSource::Lua { plugin: p } if p.as_ref() == plugin))
-            .map(|t| t.name())
-            .collect();
-        let restore: Vec<RegisteredTool> = fallbacks
-            .iter()
-            .filter(|t| plugin_names.contains(&t.name()))
-            .cloned()
-            .collect();
         self.tools.rcu(|current| {
-            let mut next: Vec<RegisteredTool> = current
+            current
                 .iter()
                 .filter(
                     |t| !matches!(&t.source, ToolSource::Lua { plugin: p } if p.as_ref() == plugin),
                 )
                 .cloned()
-                .collect();
-            next.extend(restore.iter().cloned());
-            next
+                .collect::<Vec<_>>()
         });
-        if !restore.is_empty() {
-            self.native_fallbacks.rcu(|current| {
-                current
-                    .iter()
-                    .filter(|t| !plugin_names.contains(&t.name()))
-                    .cloned()
-                    .collect::<Vec<_>>()
-            });
-        }
     }
 
-    fn native_fallback(&self, name: &str) -> Option<RegisteredTool> {
-        self.native_fallbacks
-            .load()
-            .iter()
-            .find(|t| t.name() == name)
-            .cloned()
-    }
-
-    /// Resolve a human-friendly summary for a tool invocation.
-    /// Prefers the native tool's summary (which parses args into a readable
-    /// string like a file path), falling back to the current registered tool,
-    /// then to the raw tool name.
+    /// Human-friendly summary of an invocation; the raw tool name when
+    /// there is nothing better.
     pub fn resolve_header(&self, name: &str, input: &Value) -> String {
-        self.resolve_invocation(name, input)
+        self.get(name)
+            .and_then(|e| e.try_parse(input))
             .map(|inv| inv.start_header().into_ready().text())
             .unwrap_or_else(|| name.to_owned())
-    }
-
-    /// Like [`resolve_header`] but awaits async headers (e.g. Lua plugins).
-    pub async fn resolve_header_async(&self, name: &str, input: &Value) -> String {
-        match self.resolve_invocation(name, input) {
-            Some(inv) => inv.start_header().await.text(),
-            None => name.to_owned(),
-        }
-    }
-
-    fn resolve_invocation(&self, name: &str, input: &Value) -> Option<Box<dyn ToolInvocation>> {
-        self.native_fallback(name)
-            .and_then(|e| e.try_parse(input))
-            .or_else(|| self.get(name).and_then(|e| e.try_parse(input)))
     }
 
     pub fn names(&self) -> Vec<Arc<str>> {
@@ -590,22 +498,6 @@ fn format_examples_as_text(examples: &Value) -> Option<String> {
     Some(text)
 }
 
-/// `impl_tool!` wires up the `Tool` trait on this wrapper using consts from
-/// `#[derive(Tool)]`. Tool files only need to write their actual logic.
-pub struct Native<T: 'static>(std::marker::PhantomData<T>);
-
-impl<T: 'static> Native<T> {
-    pub const fn new() -> Self {
-        Self(std::marker::PhantomData)
-    }
-}
-
-impl<T: 'static> Default for Native<T> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -657,11 +549,17 @@ mod tests {
         })
     }
 
+    fn lua_source(plugin: &str) -> ToolSource {
+        ToolSource::Lua {
+            plugin: plugin.into(),
+        }
+    }
+
     #[test]
     fn name_conflict_is_rejected() {
         let reg = ToolRegistry::new();
-        reg.register(mock("dupe"), ToolSource::Native).unwrap();
-        let err = reg.register(mock("dupe"), ToolSource::Native).unwrap_err();
+        reg.register(mock("dupe"), lua_source("p")).unwrap();
+        let err = reg.register(mock("dupe"), lua_source("p")).unwrap_err();
         assert!(matches!(err, RegistryError::NameConflict { .. }));
     }
 
@@ -711,14 +609,14 @@ mod tests {
             },
         )
         .unwrap();
-        reg.register(mock("native_tool"), ToolSource::Native)
+        reg.register(mock("other_tool"), lua_source("other"))
             .unwrap();
 
         reg.clear_mcp_server("serverA");
 
         assert!(!reg.has("serverA__one"));
         assert!(reg.has("serverB__one"));
-        assert!(reg.has("native_tool"));
+        assert!(reg.has("other_tool"));
     }
 
     #[test]
@@ -738,47 +636,39 @@ mod tests {
             },
         )
         .unwrap();
-        reg.register(mock("native_tool2"), ToolSource::Native)
-            .unwrap();
+        reg.register(
+            mock("mcp__tool"),
+            ToolSource::Mcp {
+                server: "srv".into(),
+            },
+        )
+        .unwrap();
 
         reg.clear_plugin("pluginA");
 
         assert!(!reg.has("pluginA__foo"));
         assert!(reg.has("pluginB__bar"));
-        assert!(reg.has("native_tool2"));
+        assert!(reg.has("mcp__tool"));
     }
 
     #[test]
-    fn replace_plugin_displaces_native_and_clear_restores_it() {
+    fn replace_plugin_swaps_own_tools() {
         let reg = ToolRegistry::new();
-        reg.register(mock("mytool"), ToolSource::Native).unwrap();
+        reg.register(mock("mytool"), lua_source("myplugin"))
+            .unwrap();
 
-        reg.replace_plugin(
-            "myplugin",
-            vec![(
-                mock("mytool"),
-                ToolSource::Lua {
-                    plugin: "myplugin".into(),
-                },
-            )],
-        )
-        .unwrap();
+        reg.replace_plugin("myplugin", vec![(mock("mytool"), lua_source("myplugin"))])
+            .unwrap();
 
         let entry = reg.get("mytool").unwrap();
         assert!(matches!(entry.source, ToolSource::Lua { .. }));
 
-        let fallback = reg.native_fallback("mytool");
-        assert!(fallback.is_some());
-        assert!(matches!(fallback.unwrap().source, ToolSource::Native));
-
         reg.clear_plugin("myplugin");
-        let restored = reg.get("mytool").unwrap();
-        assert!(matches!(restored.source, ToolSource::Native));
-        assert!(reg.native_fallback("mytool").is_none());
+        assert!(!reg.has("mytool"));
     }
 
     #[test]
-    fn replace_plugin_rejects_conflict_with_non_native() {
+    fn replace_plugin_rejects_conflict_with_other_plugin() {
         let reg = ToolRegistry::new();
         reg.register(mock("shared"), ToolSource::Mcp { server: "s".into() })
             .unwrap();
@@ -815,11 +705,10 @@ mod tests {
         let reg = ToolRegistry::new();
         reg.register(
             mock_scoped("main_only_tool", ToolAudience::MAIN),
-            ToolSource::Native,
+            lua_source("p"),
         )
         .unwrap();
-        reg.register(mock("everywhere"), ToolSource::Native)
-            .unwrap();
+        reg.register(mock("everywhere"), lua_source("p")).unwrap();
 
         let vars = Vars::new();
         let filter = crate::tools::ToolFilter::All;

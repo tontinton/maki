@@ -2519,7 +2519,6 @@ dependencies = [
  "maki-config",
  "maki-providers",
  "maki-storage",
- "maki-tool-macro",
  "open",
  "serde",
  "serde_json",
@@ -2715,15 +2714,6 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "uuid",
-]
-
-[[package]]
-name = "maki-tool-macro"
-version = "0.3.27"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.117",
 ]
 
 [[package]]

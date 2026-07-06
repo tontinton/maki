@@ -76,7 +76,7 @@ fn setup() -> (Arc<ToolRegistry>, PluginHost) {
 /// Uses the global native registry because `interpreter_bridge::dispatch` does.
 /// Safe: nextest runs each test in its own process.
 fn setup_native() -> (Arc<ToolRegistry>, PluginHost) {
-    let reg = Arc::clone(ToolRegistry::native_arc());
+    let reg = Arc::clone(ToolRegistry::global_arc());
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     host.load_source("code_execution", CODE_EXECUTION_SRC)
         .expect("real plugin should load");
@@ -345,7 +345,7 @@ fn handler_error_keeps_script_and_drops_waiting_notice() {
     );
 }
 
-fn restore_lines_with(code: &str, output: &str, is_error: bool, expanded: bool) -> Vec<String> {
+fn restore_lines_with(code: &str, output: &str, is_error: bool, clicks: Vec<usize>) -> Vec<String> {
     let (_reg, host) = setup();
     let eh = host.event_handle().expect("event handle");
     let (tx, rx) = flume::unbounded::<maki_agent::Envelope>();
@@ -358,7 +358,8 @@ fn restore_lines_with(code: &str, output: &str, is_error: bool, expanded: bool) 
             is_error,
             tool_output_lines: maki_config::ToolOutputLines::default(),
             theme_gen: None,
-            expanded,
+            clicks,
+            state: None,
         },
         maki_agent::EventSender::new(tx, 0),
     );
@@ -376,7 +377,7 @@ fn restore_lines_with(code: &str, output: &str, is_error: bool, expanded: bool) 
 }
 
 fn restore_lines(output: &str, is_error: bool) -> Vec<String> {
-    restore_lines_with("print('x')", output, is_error, false)
+    restore_lines_with("print('x')", output, is_error, Vec::new())
 }
 
 #[test_case::test_case("out1\nout2", false, &["out1", "out2"] ; "output_lines_below_divider")]
@@ -397,7 +398,7 @@ fn restore_expanded_shows_full_script_beyond_cap() {
         .map(|i| format!("print({i})"))
         .collect::<Vec<_>>()
         .join("\n");
-    let lines = restore_lines_with(&code, "out1", false, true);
+    let lines = restore_lines_with(&code, "out1", false, vec![0]);
     let text = lines.join("\n");
     assert!(
         text.contains(&format!("print({over})")),

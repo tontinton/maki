@@ -1,12 +1,10 @@
-//! Shared plumbing for native tools. The registry itself lives in `registry.rs`; this file
+//! Shared plumbing for tools. The registry itself lives in `registry.rs`; this file
 //! holds the helpers every tool leans on: `ToolFilter` to enable/disable per caller,
 //! `Deadline` so a parent tool can cap a child's timeout, the walker that skips `.git`,
 //! and `sanitize_tool_input` which patches up small JSON mistakes models make (stray
-//! quotes, camelCase keys, extra wrappers). The `register_tools!` and `impl_tool!` macros
-//! at the bottom wire each native tool into the registry through `Native<T>`. Plan mode
-//! rejects writes to anything but the plan file before they reach the tool.
+//! quotes, camelCase keys, extra wrappers). Plan mode rejects writes to
+//! anything but the plan file before they reach the tool.
 
-mod batch;
 mod file_tracker;
 pub mod grep;
 pub mod interpreter_bridge;
@@ -15,7 +13,7 @@ pub mod schema;
 
 pub use file_tracker::FileReadTracker;
 pub use registry::{
-    BoxFuture, ExecFuture, HeaderFuture, HeaderResult, Native, ParseError, PermissionScopes,
+    BoxFuture, ExecFuture, HeaderFuture, HeaderResult, ParseError, PermissionScopes,
     RegisteredTool, RegistryError, Tool, ToolAudience, ToolExecResult, ToolInvocation,
     ToolRegistry, ToolSource,
 };
@@ -30,13 +28,12 @@ use std::time::{Duration, Instant, SystemTime};
 use humantime::format_duration;
 use ignore::WalkBuilder;
 use serde_json::Value;
-use tracing::warn;
 
 use crate::agent::LoadedInstructions;
 use crate::cancel::{CancelMap, CancelToken};
 use crate::mcp::McpHandle;
 use crate::permissions::PermissionManager;
-use crate::{AgentConfig, AgentMode, EventSender};
+use crate::{AgentConfig, AgentMode, EventSender, SharedBuf};
 use maki_config::ToolOutputLines;
 use maki_providers::Model;
 use maki_providers::RequestOptions;
@@ -125,7 +122,6 @@ pub fn is_tool_enabled(disabled_tools: &[String], name: &str) -> bool {
 }
 
 pub const BASH_TOOL_NAME: &str = "bash";
-pub const BATCH_TOOL_NAME: &str = batch::Batch::NAME;
 pub const CODE_EXECUTION_TOOL_NAME: &str = "code_execution";
 pub const EDIT_TOOL_NAME: &str = "edit";
 pub const GLOB_TOOL_NAME: &str = "glob";
@@ -215,6 +211,17 @@ pub struct ToolContext {
     pub workflow: bool,
     pub audience: ToolAudience,
     pub local_tools: LocalTools,
+    /// Streams a dispatched child's live bufs and annotations back to the
+    /// caller (`maki.agent.call_tool` with `on_live_buf`/`on_annotation`).
+    /// Never inherited: `to_tool_context` clears it, and each caller sets
+    /// it for its own call only.
+    pub live_sink: Option<flume::Sender<ToolLive>>,
+}
+
+/// Live progress of a dispatched child tool, streamed while it runs.
+pub enum ToolLive {
+    Buf(Arc<SharedBuf>),
+    Annotation(String),
 }
 
 pub(crate) fn resolve_path(path: &str) -> Result<String, String> {
@@ -352,163 +359,14 @@ pub fn truncate_output(text: String, max_lines: usize, max_bytes: usize) -> Stri
     result
 }
 
-pub(crate) fn sanitize_tool_input(input: &Value) -> Value {
-    let obj = match input.as_object() {
-        Some(o) => o,
-        None => {
-            return input
-                .as_str()
-                .and_then(|s| serde_json::from_str::<Value>(s).ok())
-                .filter(|v| v.is_object())
-                .map(|v| sanitize_tool_input(&v))
-                .unwrap_or_else(|| input.clone());
-        }
-    };
-
-    if let Some(inner) = obj.get("parameters").filter(|_| obj.len() == 1) {
-        return sanitize_tool_input(inner);
-    }
-
-    let mut out = serde_json::Map::new();
-    for (key, val) in obj {
-        let norm_key = to_snake_case(key);
-        let new_val = match val.as_str() {
-            Some(s) => Value::String(strip_stray_quotes(key, s)),
-            None => val.clone(),
-        };
-        if norm_key != *key {
-            warn!(original = %key, normalized = %norm_key, "normalized camelCase key to snake_case");
-        }
-        out.insert(norm_key, new_val);
-    }
-    Value::Object(out)
-}
-
-fn strip_stray_quotes(field: &str, s: &str) -> String {
-    let t = s.trim();
-    if let Some(inner) = t.strip_prefix('"').and_then(|s| s.strip_suffix('"'))
-        && !inner.contains('"')
-    {
-        warn!(field = %field, original = %s, fixed = %inner, "stripped stray quotes from tool param");
-        return inner.to_string();
-    }
-    s.to_string()
-}
-
-fn to_snake_case(s: &str) -> String {
-    let mut result = String::with_capacity(s.len() + 4);
-    for (i, c) in s.chars().enumerate() {
-        if c.is_uppercase() {
-            if i > 0 {
-                result.push('_');
-            }
-            result.push(c.to_ascii_lowercase());
-        } else {
-            result.push(c);
-        }
-    }
-    result
-}
-
-/// Builds the `Tool` impl for `Native<T>` from the consts `#[derive(Tool)]` produces, so
-/// tool files only write logic. `augment` lets a tool tweak its description at request
-/// time (e.g. appending the interpreter tool list).
-macro_rules! impl_tool {
-    (@augment_body $desc:ident, $ctx:ident,) => {};
-    (@augment_body $desc:ident, $ctx:ident, $f:expr) => { ($f)(&mut $desc, $ctx); };
-    (@audience_body) => { $crate::tools::ToolAudience::all() };
-    (@audience_body $aud:expr) => { $aud };
-    (
-        $ty:ty
-        $(, audience = $aud:expr)?
-        $(, augment = $augment:expr)?
-        $(,)?
-    ) => {
-        impl $crate::tools::Tool for $crate::tools::Native<$ty> {
-            fn name(&self) -> &str { <$ty>::NAME }
-
-            fn description(&self, _ctx: &$crate::tools::DescriptionContext)
-                -> std::borrow::Cow<'_, str>
-            {
-                #[allow(unused_mut)]
-                let mut s = <$ty>::DESCRIPTION.to_owned();
-                $crate::tools::impl_tool!(@augment_body s, _ctx, $($augment)?);
-                std::borrow::Cow::Owned(s)
-            }
-
-            fn schema(&self) -> serde_json::Value {
-                $crate::tools::schema::to_json_schema(<$ty>::SCHEMA)
-            }
-
-            fn examples(&self) -> Option<serde_json::Value> {
-                let raw = <$ty>::EXAMPLES?;
-                Some(serde_json::from_str(raw).unwrap_or_else(|e|
-                    panic!("invalid EXAMPLES JSON for {}: {e}", <$ty>::NAME)))
-            }
-
-            fn audience(&self) -> $crate::tools::ToolAudience {
-                $crate::tools::impl_tool!(@audience_body $($aud)?)
-            }
-
-            fn parse(&self, input: &serde_json::Value)
-                -> Result<Box<dyn $crate::tools::ToolInvocation>, $crate::tools::ParseError>
-            {
-                Ok(Box::new(<$ty>::parse_input(input)?))
-            }
-        }
-    };
-}
-pub(crate) use impl_tool;
-
-/// Checks at compile time that no two tools share a `NAME`. Without this, duplicates would
-/// only show up as a confused model calling the wrong tool at runtime.
-macro_rules! register_tools {
-    ($($inner:path),+ $(,)?) => {
-        const _: () = {
-            const NAMES: &[&str] = &[$(<$inner>::NAME),+];
-            const fn str_eq(a: &str, b: &str) -> bool {
-                let (a, b) = (a.as_bytes(), b.as_bytes());
-                if a.len() != b.len() { return false; }
-                let mut i = 0;
-                while i < a.len() {
-                    if a[i] != b[i] { return false; }
-                    i += 1;
-                }
-                true
-            }
-            let mut i = 0;
-            while i < NAMES.len() {
-                let mut j = i + 1;
-                while j < NAMES.len() {
-                    assert!(!str_eq(NAMES[i], NAMES[j]), "duplicate tool NAME detected");
-                    j += 1;
-                }
-                i += 1;
-            }
-        };
-
-        pub(crate) fn native_tools() -> Vec<std::sync::Arc<dyn $crate::tools::Tool>> {
-            vec![
-                $(std::sync::Arc::new($crate::tools::Native::<$inner>::new())),+
-            ]
-        }
-
-        pub const NATIVE_TOOL_NAMES: &[&str] = &[$(<$inner>::NAME),+];
-    };
-}
-
-register_tools! {
-    batch::Batch,
-}
-
 pub fn is_builtin_tool(name: &str) -> bool {
-    NATIVE_TOOL_NAMES.contains(&name) || maki_config::DEFAULT_BUILTINS.contains(&name)
+    maki_config::DEFAULT_BUILTINS.contains(&name) || maki_config::OPT_IN_TOOLS.contains(&name)
 }
 
 pub fn all_builtin_tool_names() -> Vec<&'static str> {
-    NATIVE_TOOL_NAMES
+    maki_config::DEFAULT_BUILTINS
         .iter()
-        .chain(maki_config::DEFAULT_BUILTINS.iter())
+        .chain(maki_config::OPT_IN_TOOLS.iter())
         .copied()
         .collect()
 }
@@ -573,6 +431,7 @@ pub fn interpreter_ctx(
         workflow: false,
         audience: ToolAudience::MAIN,
         local_tools: LocalTools::default(),
+        live_sink: None,
     }
 }
 
@@ -595,7 +454,7 @@ pub fn cli_tool_ctx() -> ToolContext {
         )),
         Arc::new(FileReadTracker::new()),
         None,
-        Arc::clone(ToolRegistry::native_arc()),
+        Arc::clone(ToolRegistry::global_arc()),
     )
 }
 
@@ -677,7 +536,7 @@ pub mod test_support {
             Arc::clone(&TEST_PERMISSIONS),
             Arc::new(FileReadTracker::new()),
             None,
-            Arc::new(ToolRegistry::with_natives()),
+            Arc::new(ToolRegistry::new()),
         );
         ctx.tool_use_id = tool_use_id.map(String::from);
         ctx
@@ -701,7 +560,7 @@ pub mod test_support {
             permissions,
             Arc::new(FileReadTracker::new()),
             None,
-            Arc::new(ToolRegistry::with_natives()),
+            Arc::new(ToolRegistry::new()),
         );
         ctx.tool_use_id = None;
         ctx
@@ -712,15 +571,12 @@ pub mod test_support {
 mod tests {
     use std::fs;
 
-    use serde_json::json;
     use tempfile::TempDir;
     use test_case::test_case;
 
     use super::*;
-    use crate::template::Vars;
 
     const LINE_LIMIT: usize = 500;
-    const PARSE_INTERNAL_BUG: &str = "internal validator bug";
 
     #[test_case(true  ; "vision_model_keeps_view_image")]
     #[test_case(false ; "text_only_model_loses_view_image")]
@@ -837,180 +693,6 @@ mod tests {
         params.path = Some(dir.path().to_string_lossy().into());
         let err = grep::grep_search(params).unwrap_err();
         assert!(err.contains(grep::INVALID_REGEX), "got: {err}");
-    }
-
-    /// Every registered tool, poked with four shapes of garbage, should come
-    /// back with a plain validator error the LLM can read (Missing,
-    /// TypeMismatch, NotInEnum). If any of them trips the `InternalBug`
-    /// path, the schema no longer matches the Rust type and serde exploded
-    /// after validation said it was fine.
-    #[test]
-    fn every_tool_rejects_bogus_input_without_internal_bug() {
-        const BOGUS_INPUTS: &[&str] = &[
-            "{}",
-            "\"raw string\"",
-            "{\"unknown_field\": 42}",
-            "{\"path\": 123, \"pattern\": []}",
-        ];
-        let registry = ToolRegistry::native();
-        for entry in registry.iter().iter() {
-            let name = entry.name().to_owned();
-            for raw in BOGUS_INPUTS {
-                let input: Value = serde_json::from_str(raw).unwrap();
-                match entry.tool.parse(&input) {
-                    Ok(_) => {}
-                    Err(e) => {
-                        let msg = e.to_string();
-                        assert!(
-                            !msg.contains(PARSE_INTERNAL_BUG),
-                            "tool `{name}` with input `{raw}` produced InternalBug: {msg}",
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn tool_definitions_schema_requires_additional_properties_false() {
-        fn check_object_schemas(schema: &Value, path: &str) {
-            if schema.get("type").and_then(|v| v.as_str()) == Some("object")
-                && schema.get("properties").is_some()
-            {
-                assert_eq!(
-                    schema.get("additionalProperties"),
-                    Some(&json!(false)),
-                    "{path} missing additionalProperties: false",
-                );
-            }
-            if let Some(props) = schema.get("properties").and_then(|v| v.as_object()) {
-                for (key, val) in props {
-                    check_object_schemas(val, &format!("{path}.properties.{key}"));
-                }
-            }
-            if let Some(items) = schema.get("items") {
-                check_object_schemas(items, &format!("{path}.items"));
-            }
-        }
-
-        let vars = Vars::new().set("{cwd}", "/tmp");
-        let all = ToolRegistry::native().definitions(
-            &vars,
-            &DescriptionContext {
-                filter: &ToolFilter::All,
-                audience: ToolAudience::MAIN,
-                workflow: false,
-            },
-            true,
-        );
-        for def in all.as_array().unwrap() {
-            let name = def["name"].as_str().unwrap();
-            check_object_schemas(&def["input_schema"], name);
-        }
-    }
-
-    #[test]
-    fn definitions_filtered_returns_only_requested() {
-        let vars = Vars::new().set("{cwd}", "/tmp");
-        let filter = ToolFilter::Only(vec!["batch".into()]);
-        let ctx = DescriptionContext {
-            filter: &filter,
-            audience: ToolAudience::MAIN,
-            workflow: false,
-        };
-        let filtered = ToolRegistry::native().definitions(&vars, &ctx, true);
-        let names: Vec<&str> = filtered
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|d| d["name"].as_str().unwrap())
-            .collect();
-        assert_eq!(names, ["batch"]);
-    }
-
-    #[test]
-    fn audience_matrix_is_locked() {
-        const MAIN: ToolAudience = ToolAudience::MAIN;
-        const RES: ToolAudience = ToolAudience::RESEARCH_SUB;
-        const GEN: ToolAudience = ToolAudience::GENERAL_SUB;
-
-        let expected: std::collections::BTreeMap<&str, ToolAudience> =
-            std::collections::BTreeMap::from([(BATCH_TOOL_NAME, MAIN | RES | GEN)]);
-
-        let snapshot = ToolRegistry::native().iter();
-        let actual: std::collections::BTreeMap<String, ToolAudience> = snapshot
-            .iter()
-            .map(|e| (e.name().to_owned(), e.tool.audience()))
-            .collect();
-
-        assert_eq!(
-            actual.len(),
-            expected.len(),
-            "native tool count drift: expected {}, got {} ({:?})",
-            expected.len(),
-            actual.len(),
-            actual.keys().collect::<Vec<_>>()
-        );
-
-        for (name, want) in &expected {
-            let got = actual
-                .get(*name)
-                .unwrap_or_else(|| panic!("missing tool '{name}'"));
-            assert_eq!(
-                got.bits(),
-                want.bits(),
-                "audience drift for '{name}': expected {want:?}, got {got:?}"
-            );
-        }
-    }
-
-    #[test_case(
-        json!({"pattern": "\"TODO\""}),
-        json!({"pattern": "TODO"})
-        ; "wrapping_quotes"
-    )]
-    #[test_case(
-        json!({"pattern": "\"TODO\"", "path": "\"src/\""}),
-        json!({"pattern": "TODO", "path": "src/"})
-        ; "wrapping_quotes_multiple_fields"
-    )]
-    #[test_case(
-        json!({"pattern": "TODO"}),
-        json!({"pattern": "TODO"})
-        ; "no_quotes_unchanged"
-    )]
-    #[test_case(
-        json!({"pattern": "TODO\""}),
-        json!({"pattern": "TODO\""})
-        ; "trailing_quote_preserved"
-    )]
-    #[test_case(
-        json!({"pattern": "say \"hello\""}),
-        json!({"pattern": "say \"hello\""})
-        ; "interior_quotes_preserved"
-    )]
-    #[test_case(
-        json!({"limit": 10}),
-        json!({"limit": 10})
-        ; "non_string_values_unchanged"
-    )]
-    #[test_case(
-        json!({"parameters": {"path": "/tmp/x"}}),
-        json!({"path": "/tmp/x"})
-        ; "unwrap_nested_parameters"
-    )]
-    #[test_case(
-        json!({"oldString": "foo", "newString": "bar"}),
-        json!({"old_string": "foo", "new_string": "bar"})
-        ; "camel_to_snake_case"
-    )]
-    #[test_case(
-        json!("{\"path\": \"/tmp/x\"}"),
-        json!({"path": "/tmp/x"})
-        ; "parse_stringified_json"
-    )]
-    fn sanitize_tool_input_cases(input: Value, expected: Value) {
-        assert_eq!(sanitize_tool_input(&input), expected);
     }
 
     #[test]
@@ -1168,19 +850,6 @@ mod tests {
             err.contains("invalid glob pattern"),
             "expected 'invalid glob pattern', got: {err}"
         );
-    }
-
-    #[test]
-    fn lua_tools_not_in_native_registry() {
-        let lua_only = ["glob", "grep", "task"];
-        let registry = ToolRegistry::native();
-        for entry in registry.iter().iter() {
-            assert!(
-                !lua_only.contains(&entry.name()),
-                "{} should not be in the native Rust tool registry",
-                entry.name()
-            );
-        }
     }
 
     #[test]
