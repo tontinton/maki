@@ -74,7 +74,9 @@ maki.api.register_prompt_hint({
       out = out
         .. "...and "
         .. overflow
-        .. " more (use `memory list_tags` to see all; `memory delete` stale files to prune)\n"
+        .. " more tags. "
+        .. HINT_MAX_TAGS
+        .. " highest-count tags listed above; consider `memory delete` on stale files under the heaviest tags to reduce tag count, or `memory list_tags` for the full list.\n"
     end
     return out
   end,
