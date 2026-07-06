@@ -108,8 +108,16 @@ pub enum TodoPriority {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ToolInput {
-    Code { language: String, code: String },
-    Script { language: String, code: String },
+    Code {
+        language: String,
+        code: String,
+    },
+    /// Nothing produces this anymore (script rendering moved to Lua), but
+    /// old persisted sessions still contain it and must keep loading.
+    Script {
+        language: String,
+        code: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -630,6 +638,21 @@ impl BufferSnapshot {
             .map(|l| l.spans.iter().map(|s| s.text.as_str()).collect())
             .unwrap_or_default()
     }
+
+    /// Search matches against this, so it must mirror exactly what the UI
+    /// renders.
+    pub fn text(&self) -> String {
+        let mut out = String::new();
+        for (i, line) in self.lines.iter().enumerate() {
+            if i > 0 {
+                out.push('\n');
+            }
+            for span in &line.spans {
+                out.push_str(&span.text);
+            }
+        }
+        out
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -761,6 +784,44 @@ pub struct Envelope {
 mod tests {
     use super::*;
     use test_case::test_case;
+
+    #[test]
+    fn batch_entry_with_script_input_still_deserializes() {
+        let json = r#"{"tool":"code_execution","summary":"1 lines","status":"Success","input":{"Script":{"language":"python","code":"print('x')"}},"output":null}"#;
+        let entry: BatchToolEntry =
+            serde_json::from_str(json).expect("old persisted session JSON must load");
+        assert_eq!(
+            entry.input,
+            Some(ToolInput::Script {
+                language: "python".into(),
+                code: "print('x')".into(),
+            })
+        );
+    }
+
+    /// Search and the UI's error-dedup guard depend on this exact shape:
+    /// spans join bare, lines join with one newline, no trailing newline.
+    #[test]
+    fn buffer_snapshot_text_joins_spans_and_lines() {
+        let snap = BufferSnapshot::from_arc(Arc::new(vec![
+            SnapshotLine {
+                spans: vec![
+                    SnapshotSpan {
+                        text: "1 ".into(),
+                        style: SpanStyle::Named("line_nr".into()),
+                    },
+                    SnapshotSpan {
+                        text: "print('hi')".into(),
+                        style: SpanStyle::Default,
+                    },
+                ],
+            },
+            SnapshotLine { spans: vec![] },
+            SnapshotLine::plain("out".into()),
+        ]));
+        assert_eq!(snap.text(), "1 print('hi')\n\nout");
+        assert_eq!(BufferSnapshot::from_arc(Arc::new(vec![])).text(), "");
+    }
 
     #[test]
     fn as_display_text_diff_renders_unified_text() {

@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use maki_agent::ToolInput as ToolInputEvent;
 use maki_agent::tools::{ToolRegistry, ToolSource, timeout_annotation};
 use maki_config::{AlwaysThinking, PluginsConfig, ToolOutputLines};
 use maki_lua::{PluginError, PluginHost};
@@ -102,8 +101,6 @@ const ARRAY_SCHEMA: &str = r#"{
     required = { "edits" },
 }"#;
 
-const START_INPUT_MISSING_FIELD_SRC: &str = r#"name = "si_bad", description = "test", start_input = { field = "code", language = "python" }"#;
-const START_INPUT_WRONG_TYPE_SRC: &str = r#"name = "si_bad2", description = "test", start_input = { field = "count", language = "python" }"#;
 const START_ANNOTATION_COUNT_NON_ARRAY_SRC: &str =
     r#"name = "sa_bad", description = "test", start_annotation = "name""#;
 const STRING_NAME_SCHEMA: &str = r#"{
@@ -1597,30 +1594,132 @@ fn runaway_allocation_hits_memory_limit_instead_of_oom() {
 }
 
 #[test]
-fn start_input_happy_path() {
+fn start_hook_publishes_live_buf_for_tool_use_id() {
+    let (reg, _host) = start_hook_fixture();
+    let rx = run_start(&reg, "st_tool", serde_json::json!({"code": "line1\nline2"}));
+    let body = recv_live_buf(&rx, START_TOOL_USE_ID).expect("start must publish a LiveToolBuf");
+    let text = body.take().text();
+    assert!(text.contains("line1"), "preview must render input: {text}");
+}
+
+#[test]
+fn start_hook_error_does_not_fail_tool() {
+    let (reg, _host) = start_hook_fixture();
+    let _rx = run_start(&reg, "st_boom", serde_json::json!({"code": "x"}));
+    let out = exec_tool(&reg, "st_boom", serde_json::json!({"code": "x"})).expect("handler ok");
+    assert_eq!(out, "handled");
+}
+
+#[test]
+fn start_skipped_for_tool_without_start_fn() {
+    let (reg, _host) = start_hook_fixture();
+    let rx = run_start(&reg, "st_plain", serde_json::json!({"code": "x"}));
+    assert!(
+        recv_live_buf(&rx, START_TOOL_USE_ID).is_none(),
+        "no start fn must mean no preview"
+    );
+}
+
+/// `start` runs before permission checks, so its ctx is not a `LuaCtx` and
+/// `maki.agent.call_tool` (which borrows `LuaCtx`) rejects it outright.
+#[test]
+fn start_ctx_cannot_dispatch_tools() {
+    let (reg, _host) = start_hook_fixture();
+    let rx = run_start(&reg, "st_probe", serde_json::json!({"code": "x"}));
+    let body = recv_live_buf(&rx, START_TOOL_USE_ID).expect("probe publishes a buf");
+    let text = body.take().text();
+    assert_eq!(
+        text, "call_tool_rejected finish_missing set_deadline_missing",
+        "StartCtx must expose no dispatch/finish/deadline capability"
+    );
+}
+
+const START_TOOL_USE_ID: &str = "start-tu-1";
+
+fn start_hook_fixture() -> (Arc<ToolRegistry>, PluginHost) {
+    let src = format!(
+        r#"
+local function preview(input, ctx)
+    local buf = maki.ui.buf()
+    buf:set_lines({{ input.code }})
+    ctx:live_buf(buf)
+end
+maki.api.register_tool({{
+    name = "st_tool",
+    description = "test",
+    schema = {CODE_SCHEMA},
+    start = preview,
+    handler = function(input, ctx) return "handled" end,
+}})
+maki.api.register_tool({{
+    name = "st_boom",
+    description = "test",
+    schema = {CODE_SCHEMA},
+    start = function(input, ctx) error("boom") end,
+    handler = function(input, ctx) return "handled" end,
+}})
+maki.api.register_tool({{
+    name = "st_plain",
+    description = "test",
+    schema = {CODE_SCHEMA},
+    handler = function(input, ctx) return "handled" end,
+}})
+maki.api.register_tool({{
+    name = "st_probe",
+    description = "test",
+    schema = {CODE_SCHEMA},
+    start = function(input, ctx)
+        local parts = {{}}
+        local ok = pcall(function() return maki.agent.call_tool(ctx, "st_plain", {{ code = "x" }}) end)
+        parts[1] = ok and "call_tool_allowed" or "call_tool_rejected"
+        parts[2] = ctx.finish == nil and "finish_missing" or "finish_present"
+        parts[3] = ctx.set_deadline == nil and "set_deadline_missing" or "set_deadline_present"
+        local buf = maki.ui.buf()
+        buf:set_lines({{ table.concat(parts, " ") }})
+        ctx:live_buf(buf)
+    end,
+    handler = function(input, ctx) return "handled" end,
+}})
+"#
+    );
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    let src = format!(
-        r#"maki.api.register_tool({{
-            name = "si_ok",
-            description = "test",
-            schema = {CODE_SCHEMA},
-            start_input = {{ field = "code", language = "python" }},
-            handler = function(input, ctx) return "" end
-        }})"#,
+    host.load_source("start_hooks", &src).unwrap();
+    (reg, host)
+}
+
+/// `start` is awaited to completion, so the returned receiver already holds
+/// everything the hook emitted.
+fn run_start(
+    reg: &ToolRegistry,
+    name: &str,
+    input: serde_json::Value,
+) -> flume::Receiver<maki_agent::Envelope> {
+    let (tx, rx) = flume::unbounded::<maki_agent::Envelope>();
+    let event_tx = maki_agent::EventSender::new(tx, 0);
+    let ctx = maki_agent::tools::test_support::stub_ctx_with(
+        &maki_agent::AgentMode::Build,
+        Some(&event_tx),
+        Some(START_TOOL_USE_ID),
     );
-    host.load_source("si_ok_plugin", &src).unwrap();
-    let entry = reg.get("si_ok").expect("tool not registered");
-    let inv = entry
+    let inv = reg
+        .get(name)
+        .unwrap_or_else(|| panic!("tool {name} not registered"))
         .tool
-        .parse(&serde_json::json!({"code": "print('hi')"}))
+        .parse(&input)
         .expect("parse failed");
-    let result = inv.start_input().expect("expected Some");
-    assert!(matches!(
-        result,
-        ToolInputEvent::Script { language, code }
-            if language == "python" && code == "print('hi')"
-    ));
+    smol::block_on(inv.start(&ctx));
+    rx
+}
+
+fn recv_live_buf(
+    rx: &flume::Receiver<maki_agent::Envelope>,
+    id: &str,
+) -> Option<Arc<maki_agent::SharedBuf>> {
+    rx.drain().find_map(|env| match env.event {
+        maki_agent::AgentEvent::LiveToolBuf { id: got, body } if got == id => Some(body),
+        _ => None,
+    })
 }
 
 #[test]
@@ -1667,8 +1766,6 @@ fn start_annotation_count_happy_path() {
     assert_eq!(inv.start_annotation(), Some("3 edits".to_owned()));
 }
 
-#[test_case::test_case(START_INPUT_MISSING_FIELD_SRC, MINIMAL_SCHEMA, "not in schema properties or not type 'string'" ; "start_input_validation_missing_field")]
-#[test_case::test_case(START_INPUT_WRONG_TYPE_SRC, NON_STRING_FIELD_SCHEMA, "not in schema properties or not type 'string'" ; "start_input_validation_wrong_type")]
 #[test_case::test_case(START_ANNOTATION_COUNT_NON_ARRAY_SRC, STRING_NAME_SCHEMA, "not in schema properties or not type 'array'" ; "start_annotation_count_non_array")]
 fn registration_with_schema_rejects(fields: &str, schema: &str, expected_err: &str) {
     let reg = fresh_registry();

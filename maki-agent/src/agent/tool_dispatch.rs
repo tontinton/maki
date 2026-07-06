@@ -126,13 +126,15 @@ pub async fn run(
             summary: header_result.text(),
             render_header: header_result.snapshot(),
             annotation: invocation.start_annotation(),
-            input: invocation.start_input(),
+            input: None,
             raw_input: Some(input.clone()),
             output: invocation.start_output(ctx),
         };
         if matches!(emit, Emit::Notify) {
             let _ = ctx.event_tx.send(AgentEvent::ToolStart(Box::new(start)));
         }
+
+        invocation.start(ctx).await;
 
         if let Err(e) = enforce_permission(invocation.as_ref(), name, ctx, &id).await {
             return done_error(e);
@@ -631,6 +633,114 @@ mod tests {
                 done.output.as_text().starts_with(PERMISSION_DENIED_PREFIX),
                 "error should be the permission-denied message, got: {}",
                 done.output.as_text()
+            );
+        });
+    }
+
+    const START_PROBE_NAME: &str = "start_probe";
+
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use crate::tools::{
+        BoxFuture, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError,
+        PermissionScopes, Tool, ToolExecResult,
+    };
+
+    #[derive(Default)]
+    struct StartProbe {
+        started: Arc<AtomicBool>,
+        executed: Arc<AtomicBool>,
+    }
+
+    struct StartProbeInvocation {
+        started: Arc<AtomicBool>,
+        executed: Arc<AtomicBool>,
+    }
+
+    impl ToolInvocation for StartProbeInvocation {
+        fn start_header(&self) -> HeaderFuture {
+            HeaderFuture::Ready(HeaderResult::plain("probe".into()))
+        }
+        fn start<'a>(&'a self, _ctx: &'a ToolContext) -> BoxFuture<'a, ()> {
+            self.started.store(true, Ordering::SeqCst);
+            Box::pin(std::future::ready(()))
+        }
+        fn permission_scopes(&self) -> BoxFuture<'_, Option<PermissionScopes>> {
+            Box::pin(std::future::ready(Some(PermissionScopes::single(
+                "probe".into(),
+            ))))
+        }
+        fn execute<'a>(self: Box<Self>, _ctx: &'a ToolContext) -> ExecFuture<'a> {
+            self.executed.store(true, Ordering::SeqCst);
+            Box::pin(async {
+                ToolExecResult::from(Ok::<_, String>(ToolOutput::Plain("ok".into())))
+            })
+        }
+    }
+
+    impl Tool for StartProbe {
+        fn name(&self) -> &str {
+            START_PROBE_NAME
+        }
+        fn description(&self, _ctx: &DescriptionContext) -> std::borrow::Cow<'_, str> {
+            "start probe".into()
+        }
+        fn schema(&self) -> Value {
+            serde_json::json!({"type": "object", "properties": {}, "additionalProperties": false})
+        }
+        fn parse(&self, _input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
+            Ok(Box::new(StartProbeInvocation {
+                started: Arc::clone(&self.started),
+                executed: Arc::clone(&self.executed),
+            }))
+        }
+    }
+
+    /// A denied tool should still get its preview, but never its `execute`.
+    #[test]
+    fn start_runs_before_permission_denial_blocks_execute() {
+        smol::block_on(async {
+            let deny_cfg = PermissionsConfig {
+                rules: vec![PermissionRule {
+                    tool: START_PROBE_NAME.into(),
+                    scope: None,
+                    effect: Effect::Deny,
+                }],
+                ..Default::default()
+            };
+            let dir = TempDir::new().unwrap();
+            let permissions = Arc::new(PermissionManager::new(deny_cfg, dir.path().to_path_buf()));
+            let ctx = crate::tools::test_support::stub_ctx_with_permissions(
+                &AgentMode::Build,
+                permissions,
+            );
+
+            let probe = StartProbe::default();
+            let (started, executed) = (Arc::clone(&probe.started), Arc::clone(&probe.executed));
+            let registry = ToolRegistry::new();
+            registry
+                .register(Arc::new(probe), ToolSource::Native)
+                .unwrap();
+
+            let done = run(
+                &registry,
+                None,
+                "t1".into(),
+                START_PROBE_NAME,
+                &serde_json::json!({}),
+                &ctx,
+                Emit::Silent,
+            )
+            .await;
+
+            assert!(done.is_error, "denial must error");
+            assert!(
+                started.load(Ordering::SeqCst),
+                "start must run before permission enforcement"
+            );
+            assert!(
+                !executed.load(Ordering::SeqCst),
+                "execute must not run after denial"
             );
         });
     }

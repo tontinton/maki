@@ -14,10 +14,7 @@ use maki_agent::tools::{
     PermissionScopes, ToolAudience, ToolContext, ToolExecResult, ToolFilter, ToolInvocation,
     is_tool_enabled, timeout_annotation,
 };
-use maki_agent::{
-    AgentEvent, BufferSnapshot, InstructionBlock, SharedBuf, TextOutput,
-    ToolInput as ToolInputEvent, ToolOutput,
-};
+use maki_agent::{AgentEvent, BufferSnapshot, InstructionBlock, SharedBuf, TextOutput, ToolOutput};
 use mlua::{
     Function, Lua, LuaSerdeExt, RegistryKey, Result as LuaResult, Table, Value as LuaValue,
 };
@@ -68,12 +65,6 @@ fn dctx_json(ctx: &DescriptionContext) -> Value {
 }
 
 #[derive(Clone)]
-pub(crate) struct StartInputConfig {
-    field: Arc<str>,
-    language: Arc<str>,
-}
-
-#[derive(Clone)]
 pub(crate) enum StartAnnotation {
     Count(Arc<str>),
     Timeout(Arc<str>),
@@ -94,12 +85,12 @@ pub(crate) struct PendingTool {
     pub(crate) handler_key: RegistryKey,
     pub(crate) header_key: Option<RegistryKey>,
     pub(crate) restore_key: Option<RegistryKey>,
+    pub(crate) start_key: Option<RegistryKey>,
     pub(crate) permission_scope_kind: Option<PermissionScopeKind>,
     pub(crate) permission_scopes_key: Option<RegistryKey>,
     pub(crate) mutable_path_field: Option<Arc<str>>,
     pub(crate) timeout: Option<Duration>,
     pub(crate) start_annotation: Option<StartAnnotation>,
-    pub(crate) start_input: Option<StartInputConfig>,
     pub(crate) examples: Option<Value>,
     pub(crate) describe_key: Option<RegistryKey>,
 }
@@ -115,11 +106,11 @@ pub(crate) struct LuaTool {
     pub(crate) tx: Sender<Request>,
     pub(crate) plugin: Arc<str>,
     pub(crate) has_header_fn: bool,
+    pub(crate) has_start_fn: bool,
     pub(crate) permission_scope_kind: Option<PermissionScopeKind>,
     pub(crate) mutable_path_field: Option<Arc<str>>,
     pub(crate) timeout: Option<Duration>,
     pub(crate) start_annotation: Option<StartAnnotation>,
-    pub(crate) start_input: Option<StartInputConfig>,
     pub(crate) examples: Option<Value>,
     pub(crate) has_describe_fn: bool,
 }
@@ -197,13 +188,13 @@ impl Tool for LuaTool {
             tool: Arc::clone(&self.name),
             plugin: Arc::clone(&self.plugin),
             has_header_fn: self.has_header_fn,
+            has_start_fn: self.has_start_fn,
             input: validated,
             tx: self.tx.clone(),
             permission_state,
             mutable_path_field: self.mutable_path_field.clone(),
             timeout: self.timeout,
             start_annotation: self.start_annotation.clone(),
-            start_input: self.start_input.clone(),
         }))
     }
 }
@@ -217,13 +208,13 @@ struct LuaToolInvocation {
     tool: Arc<str>,
     plugin: Arc<str>,
     has_header_fn: bool,
+    has_start_fn: bool,
     input: Value,
     tx: Sender<Request>,
     permission_state: PermissionState,
     mutable_path_field: Option<Arc<str>>,
     timeout: Option<Duration>,
     start_annotation: Option<StartAnnotation>,
-    start_input: Option<StartInputConfig>,
 }
 
 impl ToolInvocation for LuaToolInvocation {
@@ -279,12 +270,28 @@ impl ToolInvocation for LuaToolInvocation {
         }
     }
 
-    fn start_input(&self) -> Option<ToolInputEvent> {
-        let cfg = self.start_input.as_ref()?;
-        let code = self.input.get(cfg.field.as_ref())?.as_str()?.to_owned();
-        Some(ToolInputEvent::Script {
-            language: cfg.language.to_string(),
-            code,
+    fn start<'a>(&'a self, ctx: &'a ToolContext) -> BoxFuture<'a, ()> {
+        let id = ctx.tool_use_id.as_ref().filter(|_| self.has_start_fn);
+        let Some(id) = id else {
+            return Box::pin(std::future::ready(()));
+        };
+        let (reply_tx, reply_rx) = flume::bounded::<()>(1);
+        let req = Request::StartTool {
+            plugin: Arc::clone(&self.plugin),
+            tool: Arc::clone(&self.tool),
+            input: self.input.clone(),
+            live: LiveCtx {
+                event_tx: ctx.event_tx.clone(),
+                tool_use_id: id.clone(),
+            },
+            tool_output_lines: ctx.tool_output_lines,
+            reply: reply_tx,
+        };
+        let tx = self.tx.clone();
+        Box::pin(async move {
+            if tx.send_async(req).await.is_ok() {
+                let _ = reply_rx.recv_async().await;
+            }
         })
     }
 
@@ -765,25 +772,6 @@ fn parse_start_annotation(spec: &Table, schema: &Value) -> LuaResult<Option<Star
     }
 }
 
-fn parse_start_input(spec: &Table, schema: &Value) -> LuaResult<Option<StartInputConfig>> {
-    let Some(tbl) = spec_opt::<Table>(spec, "start_input", "a table")? else {
-        return Ok(None);
-    };
-
-    let field: String = tbl
-        .get("field")
-        .map_err(|_| mlua::Error::runtime("register_tool: start_input.field required"))?;
-    let language: String = tbl
-        .get("language")
-        .map_err(|_| mlua::Error::runtime("register_tool: start_input.language required"))?;
-    check_schema_field(schema, "start_input", &field, "string")?;
-
-    Ok(Some(StartInputConfig {
-        field: Arc::from(field.as_str()),
-        language: Arc::from(language.as_str()),
-    }))
-}
-
 fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> LuaResult<()> {
     let name: String = spec
         .get("name")
@@ -830,6 +818,7 @@ fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> Lua
 
     let header_fn: Option<Function> = spec.get("header").ok();
     let restore_fn: Option<Function> = spec.get("restore").ok();
+    let start_fn: Option<Function> = spec.get("start").ok();
     let kind: Option<Arc<str>> = spec
         .get::<String>("kind")
         .ok()
@@ -844,8 +833,8 @@ fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> Lua
     let restore_key = restore_fn
         .map(|f| lua.create_registry_value(f))
         .transpose()?;
+    let start_key = start_fn.map(|f| lua.create_registry_value(f)).transpose()?;
 
-    let start_input = parse_start_input(spec, &schema_val)?;
     let describe_fn: Option<Function> = spec.get("describe").ok();
     let describe_key = describe_fn
         .map(|f| lua.create_registry_value(f))
@@ -871,12 +860,12 @@ fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> Lua
             handler_key,
             header_key,
             restore_key,
+            start_key,
             permission_scope_kind,
             permission_scopes_key,
             mutable_path_field,
             timeout,
             start_annotation,
-            start_input,
             examples,
             describe_key,
         });
@@ -1121,7 +1110,7 @@ mod tests {
             mutable_path_field: None,
             timeout: Some(Duration::from_secs(60)),
             start_annotation: None,
-            start_input: None,
+            has_start_fn: false,
         }
     }
 
@@ -1173,7 +1162,7 @@ mod tests {
             mutable_path_field: None,
             timeout: Some(Duration::from_secs(60)),
             start_annotation: None,
-            start_input: None,
+            has_start_fn: false,
             examples: None,
             has_describe_fn: false,
         }
@@ -1270,7 +1259,7 @@ mod tests {
             mutable_path_field: None,
             timeout: None,
             start_annotation: None,
-            start_input: None,
+            has_start_fn: false,
         };
         let scopes = smol::block_on(inv.permission_scopes()).expect("should fallback");
         assert!(scopes.force_prompt);
@@ -1288,7 +1277,7 @@ mod tests {
             mutable_path_field: None,
             timeout: None,
             start_annotation: None,
-            start_input: None,
+            has_start_fn: false,
         };
         std::thread::spawn(move || {
             if let Ok(Request::ComputePermissionScopes { reply, .. }) = rx2.recv() {
@@ -1312,7 +1301,7 @@ mod tests {
             mutable_path_field: None,
             timeout: None,
             start_annotation: None,
-            start_input: None,
+            has_start_fn: false,
         };
         std::thread::spawn(move || {
             if let Ok(Request::ComputePermissionScopes { reply, .. }) = rx.recv() {
@@ -1352,7 +1341,7 @@ mod tests {
             mutable_path_field: None,
             timeout: Some(Duration::from_secs(60)),
             start_annotation: None,
-            start_input: None,
+            has_start_fn: false,
             examples: None,
             has_describe_fn: false,
         };
@@ -1551,32 +1540,12 @@ mod tests {
     }
 
     #[test]
-    fn start_input_returns_script_when_field_present() {
+    fn start_without_tool_use_id_is_noop() {
         let inv = LuaToolInvocation {
-            start_input: Some(StartInputConfig {
-                field: Arc::from("code"),
-                language: Arc::from("python"),
-            }),
-            ..invocation(serde_json::json!({"code": "print('hello')"}))
+            has_start_fn: true,
+            ..invocation(serde_json::json!({"code": "x"}))
         };
-        let result = inv.start_input().unwrap();
-        assert!(matches!(
-            result,
-            ToolInputEvent::Script { language, code }
-                if language == "python" && code == "print('hello')"
-        ));
-    }
-
-    #[test_case::test_case(serde_json::json!({"other": "value"}) ; "field_missing")]
-    #[test_case::test_case(serde_json::json!({"code": 42})       ; "field_not_string")]
-    fn start_input_returns_none_on_bad_input(input: Value) {
-        let inv = LuaToolInvocation {
-            start_input: Some(StartInputConfig {
-                field: Arc::from("code"),
-                language: Arc::from("python"),
-            }),
-            ..invocation(input)
-        };
-        assert_eq!(inv.start_input(), None);
+        let ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
+        smol::block_on(inv.start(&ctx));
     }
 }

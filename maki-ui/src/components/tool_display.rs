@@ -642,6 +642,7 @@ impl ToolLineBuilder {
             TOOL_BODY_INDENT,
             0..total,
         ));
+        self.push_search_text(&snapshot.text());
         if let Some(text) = search_fallback {
             self.push_search_text(text);
         }
@@ -795,6 +796,24 @@ pub fn build_tool_lines(
             })
             .or(body);
         b.push_snapshot(snapshot, search_text);
+        // With pre-permission previews, an error (say a denial) can land
+        // while only the script snapshot is on screen. Show the error below
+        // it, unless the handler already drew it into the body.
+        if matches!(status, ToolStatus::Error) {
+            let err_text = msg.tool_output.as_deref().map(|o| o.as_text());
+            let shown = err_text.as_deref().or(body).map_or("", str::trim);
+            if !shown.is_empty() && !snapshot.text().contains(shown) {
+                let resolved = resolve_output(
+                    msg.tool_output.as_deref(),
+                    body,
+                    msg.live_output.as_deref(),
+                    msg.truncated_lines,
+                    b.limits,
+                    b.keep,
+                );
+                b.push_resolved_output(&resolved);
+            }
+        }
     } else {
         let resolved = resolve_output(
             msg.tool_output.as_deref(),
@@ -1492,6 +1511,74 @@ mod tests {
             },
         };
         state.snapshot_is_stale(CURRENT_GEN)
+    }
+
+    #[test]
+    fn snapshot_search_text_derives_from_rendered_lines() {
+        let snapshot = make_snapshot(vec![vec![SnapshotSpan {
+            text: "import asyncio".into(),
+            style: SpanStyle::Named("keyword".into()),
+        }]]);
+        let tl = build_tool_lines(
+            &snapshot_msg(snapshot),
+            ToolStatus::Success,
+            &test_rctx(80, &reg()),
+            SectionFlags::default(),
+        );
+        assert!(
+            tl.search_text.contains("import asyncio"),
+            "search must index the rendered snapshot body, got: {}",
+            tl.search_text
+        );
+    }
+
+    const DENIAL_MSG: &str = "Permission denied: user rejected";
+
+    fn error_snapshot_msg(snapshot_text: &str) -> DisplayMessage {
+        DisplayMessage {
+            role: DisplayRole::Tool(Box::new(ToolRole {
+                id: "t1".into(),
+                status: ToolStatus::Error,
+                name: "code_execution".into(),
+            })),
+            text: "2 lines".into(),
+            tool_output: Some(Arc::new(ToolOutput::Plain(DENIAL_MSG.into()))),
+            ..snapshot_msg(make_snapshot(vec![vec![SnapshotSpan {
+                text: snapshot_text.into(),
+                style: SpanStyle::Default,
+            }]]))
+        }
+    }
+
+    #[test]
+    fn error_with_snapshot_renders_error_below() {
+        let msg = error_snapshot_msg("1 print('hi')");
+        let tl = build_tool_lines(
+            &msg,
+            ToolStatus::Error,
+            &test_rctx(80, &reg()),
+            SectionFlags::default(),
+        );
+        let text = lines_text(&tl);
+        assert!(text.contains("print('hi')"), "snapshot stays: {text}");
+        assert!(text.contains(DENIAL_MSG), "denial must show: {text}");
+    }
+
+    #[test]
+    fn error_already_in_snapshot_is_not_duplicated() {
+        let msg = error_snapshot_msg(DENIAL_MSG);
+        let tl = build_tool_lines(
+            &msg,
+            ToolStatus::Error,
+            &test_rctx(80, &reg()),
+            SectionFlags::default(),
+        );
+        let text = lines_text(&tl);
+        assert_eq!(
+            text.matches(DENIAL_MSG).count(),
+            1,
+            "error must render exactly once: {text}"
+        );
     }
 
     #[test]

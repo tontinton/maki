@@ -386,7 +386,6 @@ pub fn history_to_display(
                             let tool_call: Option<Box<dyn ToolInvocation>> =
                                 reg.get(name).and_then(|entry| entry.try_parse(input));
                             let summary = reg.resolve_header(name, input);
-                            let tool_input = tool_call.as_deref().and_then(|tc| tc.start_input());
                             let (status, result_text) = results
                                 .get(id.as_str())
                                 .map(|(err, text)| {
@@ -435,7 +434,7 @@ pub fn history_to_display(
                                     name: static_name.into(),
                                 })),
                                 text,
-                                tool_input: tool_input.map(Arc::new),
+                                tool_input: None,
                                 tool_raw_input: Some(Arc::new(input.clone())),
                                 tool_output,
                                 live_output: None,

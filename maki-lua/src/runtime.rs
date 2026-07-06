@@ -140,6 +140,17 @@ pub enum Request {
         dctx: Value,
         reply: flume::Sender<Option<String>>,
     },
+    /// Runs the tool's `start` fn so it can publish a live buf before the
+    /// permission prompt paints. Best-effort: Lua errors are logged, never
+    /// propagated.
+    StartTool {
+        plugin: Arc<str>,
+        tool: Arc<str>,
+        input: Value,
+        live: LiveCtx,
+        tool_output_lines: maki_config::ToolOutputLines,
+        reply: flume::Sender<()>,
+    },
 }
 
 pub struct RestoreItem {
@@ -561,6 +572,7 @@ struct ToolKeys {
     handler: RegistryKey,
     header: Option<RegistryKey>,
     restore: Option<RegistryKey>,
+    start: Option<RegistryKey>,
     permission_scopes: Option<RegistryKey>,
     describe: Option<RegistryKey>,
 }
@@ -664,6 +676,11 @@ impl LuaRuntime {
                     && let Err(e) = self.lua.remove_registry_value(sk)
                 {
                     tracing::warn!(plugin = name, error = %e, "failed to drop lua permission_scopes key");
+                }
+                if let Some(sk) = tk.start
+                    && let Err(e) = self.lua.remove_registry_value(sk)
+                {
+                    tracing::warn!(plugin = name, error = %e, "failed to drop lua start key");
                 }
                 if let Some(sk) = tk.describe
                     && let Err(e) = self.lua.remove_registry_value(sk)
@@ -1011,11 +1028,11 @@ impl LuaRuntime {
                     tx: self.tx.clone(),
                     plugin: Arc::clone(&name),
                     has_header_fn: t.header_key.is_some(),
+                    has_start_fn: t.start_key.is_some(),
                     permission_scope_kind: t.permission_scope_kind.clone(),
                     mutable_path_field: t.mutable_path_field.clone(),
                     timeout: t.timeout,
                     start_annotation: t.start_annotation.clone(),
-                    start_input: t.start_input.clone(),
                     examples: t.examples.clone(),
                     has_describe_fn: t.describe_key.is_some(),
                 });
@@ -1047,6 +1064,7 @@ impl LuaRuntime {
                         handler: t.handler_key,
                         header: t.header_key,
                         restore: t.restore_key,
+                        start: t.start_key,
                         permission_scopes: t.permission_scopes_key,
                         describe: t.describe_key,
                     },
@@ -1463,6 +1481,28 @@ fn run_describe(
     }
 }
 
+/// Sends no `ToolSnapshot` on completion: the preview buf must stay live so
+/// the UI keeps polling it until the handler's own `LiveToolBuf` takes over.
+async fn run_tool_start(
+    lua: &Lua,
+    func: Function,
+    tool: &str,
+    input: Value,
+    live: LiveCtx,
+    tool_output_lines: maki_config::ToolOutputLines,
+) {
+    let scope = TaskScope::new(lua, TaskCell::new(CancelToken::none(), None, Some(live)));
+    let run = async {
+        let input_lua = json_to_lua(lua, &input)?;
+        let ctx_ud = lua.create_userdata(crate::api::util::ctx::StartCtx { tool_output_lines })?;
+        let thread = lua.create_thread(func)?;
+        thread.into_async::<LuaValue>((input_lua, ctx_ud))?.await
+    };
+    if let Err(e) = scope.scope_future(run).await {
+        tracing::warn!(tool, error = %e, "start callback failed");
+    }
+}
+
 /// Two layers of deadline enforcement: the interrupt hook catches
 /// tight CPU loops, the dispatch loop catches I/O waits.
 #[allow(clippy::too_many_arguments)]
@@ -1833,6 +1873,39 @@ pub fn spawn(
                         } => {
                             let _ = reply
                                 .send(run_describe(&rt.lua, &rt.plugins, &plugin, &tool, &dctx));
+                        }
+                        Request::StartTool {
+                            plugin,
+                            tool,
+                            input,
+                            live,
+                            tool_output_lines,
+                            reply,
+                        } => {
+                            let func = {
+                                let plugins = rt.plugins.borrow();
+                                plugins
+                                    .get(&*plugin)
+                                    .and_then(|p| p.get(&*tool))
+                                    .and_then(|tk| tk.start.as_ref())
+                                    .and_then(|key| rt.lua.registry_value::<Function>(key).ok())
+                            };
+                            let Some(func) = func else {
+                                let _ = reply.send(());
+                                continue;
+                            };
+                            gate.wait_below(MAX_INFLIGHT_TOOLS).await;
+                            let lua = rt.lua.clone();
+                            let g = Rc::clone(&gate);
+                            let ex_ref = Rc::clone(&ex);
+                            ex.spawn(async move {
+                                let _gate_guard = GateGuard::new(&g);
+                                run_tool_start(&lua, func, &tool, input, live, tool_output_lines)
+                                    .await;
+                                drain_spawn_queue(&lua, &ex_ref, &g);
+                                let _ = reply.send(());
+                            })
+                            .detach();
                         }
                         Request::RunKeybindCallback { id } => {
                             let func = rt.lua.app_data_ref::<KeymapStore>().and_then(|store| {

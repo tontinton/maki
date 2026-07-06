@@ -8,7 +8,9 @@ local DEFAULT_TIMEOUT = 30
 local DEFAULT_MAX_MEMORY_MB = 50
 local DEFAULT_MAX_OUTPUT_LINES = 2000
 local DEFAULT_MAX_OUTPUT_BYTES = 50 * 1024
+local MAX_SCRIPT_LINES = 2000
 local NO_OUTPUT = "(no output)"
+local SEPARATOR = "──────"
 local PREAMBLE = "import re\nimport asyncio\nimport sys\nimport os\nimport json\n"
 local TOOLS_HEADER = "\n\nAvailable tools (called as Python functions with keyword arguments):\n"
 local WORKFLOW_TOOLS_NOTE =
@@ -23,6 +25,58 @@ local function append_lines(view, text)
   for line in (text .. "\n"):gmatch("([^\n]*)\n") do
     view:append(line)
   end
+end
+
+local function line_nr_fmt(count)
+  local w = math.max(1, math.floor(math.log(count, 10)) + 1)
+  return "%" .. w .. "d "
+end
+
+-- One body builder for every path (start preview, handler, restore), so the
+-- script renders the same no matter which lifecycle callbacks ran. The
+-- header is always rebuilt from scratch; nothing mutates existing lines.
+local function build_body(ctx, code)
+  local lines = {}
+  for line in (code:gsub("\n+$", "") .. "\n"):gmatch("([^\n]*)\n") do
+    lines[#lines + 1] = line
+  end
+  local hl
+  local buf = maki.ui.buf()
+  local view = new_view(ctx, buf)
+
+  local function header()
+    local total = #lines
+    local shown = view.expanded and total or math.min(total, MAX_SCRIPT_LINES)
+    local fmt = line_nr_fmt(shown)
+    local out = {}
+    for i = 1, shown do
+      local spans = { { string.format(fmt, i), "line_nr" } }
+      for _, seg in ipairs(hl and hl[i] or { { lines[i] } }) do
+        spans[#spans + 1] = seg
+      end
+      out[#out + 1] = spans
+    end
+    if shown < total then
+      out[#out + 1] = { { "... (" .. (total - shown) .. " lines) (click to expand)", "dim" } }
+    end
+    out[#out + 1] = { { SEPARATOR, "dim" } }
+    return out
+  end
+
+  view:set_header(header())
+  buf:on("click", function()
+    view:toggle()
+    view:set_header(header())
+  end)
+
+  local function highlight()
+    local highlighted = maki.ui.highlight(table.concat(lines, "\n"), "py")
+    if highlighted then
+      hl = highlighted
+      view:set_header(header())
+    end
+  end
+  return buf, view, highlight
 end
 
 local description = [[Execute Python code in a sandboxed interpreter with tools as callable functions.
@@ -151,16 +205,22 @@ local function describe(dctx)
   return table.concat(parts)
 end
 
+-- Publishes the script before the permission prompt paints. Highlight is
+-- awaited inline: an async task from here could outlive ToolDone on fast
+-- auto-allowed runs and bake a stale script-only snapshot.
+local function start(input, ctx)
+  local buf, _, highlight = build_body(ctx, input.code)
+  ctx:live_buf(buf)
+  highlight()
+end
+
 local function handler(input, ctx)
   local config = ctx:config()
   local timeout = input.timeout or config.code_execution_timeout_secs or DEFAULT_TIMEOUT
 
-  local buf = maki.ui.buf()
-  local view = new_view(ctx, buf)
-  buf:on("click", function()
-    view:toggle()
-  end)
+  local buf, view, highlight = build_body(ctx, input.code)
   ctx:live_buf(buf)
+  maki.async.run(highlight)
 
   ctx:set_deadline(timeout)
 
@@ -225,9 +285,8 @@ local function header(input)
   return lines .. " lines"
 end
 
-local function restore(_input, output, is_error, ctx)
-  local buf = maki.ui.buf()
-  local view = new_view(ctx, buf)
+local function restore(input, output, is_error, ctx)
+  local buf, view, highlight = build_body(ctx, input.code)
   if is_error then
     view:append(output)
   elseif output == NO_OUTPUT then
@@ -236,9 +295,7 @@ local function restore(_input, output, is_error, ctx)
     append_lines(view, output)
   end
   view:finish()
-  buf:on("click", function()
-    view:toggle()
-  end)
+  highlight()
   return buf
 end
 
@@ -250,8 +307,8 @@ maki.api.register_tool({
   examples = examples,
   kind = "execute",
   audiences = { "main", "research_sub", "general_sub" },
-  start_input = { field = "code", language = "python" },
   start_annotation = { field = "timeout", kind = "timeout" },
+  start = start,
   handler = handler,
   header = header,
   restore = restore,

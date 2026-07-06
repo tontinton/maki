@@ -9,7 +9,6 @@ use ratatui::text::{Line, Span};
 use syntect::parsing::SyntaxReference;
 use syntect::util::LinesWithEndings;
 
-pub(crate) const MAX_CODE_EXECUTION_LINES: usize = 2000;
 pub(crate) const MAX_INSTRUCTION_LINES: usize = 15;
 
 pub(crate) fn instruction_limit(expanded: bool) -> usize {
@@ -424,7 +423,7 @@ impl RenderLimits {
             script: if expanded.script {
                 usize::MAX
             } else {
-                MAX_CODE_EXECUTION_LINES
+                output_limit
             },
             output: if expanded.output {
                 usize::MAX

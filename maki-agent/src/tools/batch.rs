@@ -119,15 +119,12 @@ impl BatchEntry {
         output: Option<ToolOutput>,
         summary: Option<String>,
     ) -> BatchToolEntry {
-        let call = registry
-            .get(&self.tool)
-            .and_then(|e| e.tool.parse(&self.parameters).ok());
         BatchToolEntry {
             tool: self.tool.clone(),
             summary: summary
                 .unwrap_or_else(|| registry.resolve_header(&self.tool, &self.parameters)),
             status,
-            input: call.and_then(|c| c.start_input()),
+            input: None,
             raw_input: Some(self.parameters.clone()),
             output,
             annotation: None,

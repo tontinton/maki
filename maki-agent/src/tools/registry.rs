@@ -13,7 +13,7 @@ use bitflags::bitflags;
 use serde_json::{Value, json};
 
 use crate::template::Vars;
-use crate::{BufferSnapshot, ToolInput as ToolInputEvent, ToolOutput};
+use crate::{BufferSnapshot, ToolOutput};
 
 use super::{DescriptionContext, ToolContext};
 
@@ -197,9 +197,6 @@ pub trait ToolInvocation: Send + Sync {
     fn start_annotation(&self) -> Option<String> {
         None
     }
-    fn start_input(&self) -> Option<ToolInputEvent> {
-        None
-    }
     fn start_output(&self, _ctx: &ToolContext) -> Option<ToolOutput> {
         None
     }
@@ -208,6 +205,12 @@ pub trait ToolInvocation: Send + Sync {
     }
     fn permission_scopes(&self) -> BoxFuture<'_, Option<PermissionScopes>> {
         Box::pin(std::future::ready(None))
+    }
+    /// Runs after `ToolStart` but before permission enforcement, so a tool
+    /// can paint a preview while the prompt is still up. Some call paths skip
+    /// it, so `execute` must never rely on it having run.
+    fn start<'a>(&'a self, _ctx: &'a ToolContext) -> BoxFuture<'a, ()> {
+        Box::pin(std::future::ready(()))
     }
     fn execute<'a>(self: Box<Self>, ctx: &'a ToolContext) -> ExecFuture<'a>;
 }

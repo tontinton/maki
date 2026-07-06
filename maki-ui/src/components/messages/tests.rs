@@ -1229,6 +1229,28 @@ fn tool_done_removes_live_buf_and_snapshots_dirty() {
     );
 }
 
+/// The handler's buf must supersede the `start` preview: the UI keeps only
+/// the last registered buf per tool_use_id.
+#[test]
+fn second_register_live_buf_replaces_first() {
+    let preview = Arc::new(maki_agent::SharedBuf::new());
+    preview.set_lines(vec![snap_line("preview")]);
+    let handler = Arc::new(maki_agent::SharedBuf::new());
+    handler.set_lines(vec![snap_line("handler")]);
+
+    let mut panel = MessagesPanel::new(UiConfig::default());
+    panel.tool_start(start("t1", BASH_TOOL_NAME));
+    panel.register_live_buf("t1".into(), Arc::clone(&preview));
+    panel.register_live_buf("t1".into(), Arc::clone(&handler));
+    panel.poll_live_bufs();
+
+    let msg = panel.find_tool_msg_mut("t1").unwrap();
+    assert_eq!(
+        msg.render_snapshot.as_ref().unwrap().first_line_text(),
+        "handler"
+    );
+}
+
 #[test]
 fn live_buf_streams_across_clean_polls() {
     let buf = Arc::new(maki_agent::SharedBuf::new());

@@ -27,6 +27,35 @@ impl UserData for RestoreCtx {
     }
 }
 
+/// The `start` hook runs before permission checks, so its ctx only lets a
+/// tool publish a preview; dispatching tools from it is structurally
+/// impossible.
+pub(crate) struct StartCtx {
+    pub(crate) tool_output_lines: ToolOutputLines,
+}
+
+impl UserData for StartCtx {
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method("live_buf", |lua, _this, buf: mlua::AnyUserData| {
+            send_live_buf(lua, &buf)
+        });
+        methods.add_method("tool_output_lines", |lua, this, ()| {
+            lua.to_value(&this.tool_output_lines)
+        });
+    }
+}
+
+fn send_live_buf(lua: &mlua::Lua, buf: &mlua::AnyUserData) -> mlua::Result<()> {
+    let shared = buf.borrow::<BufHandle>().map(|h| Arc::clone(&h.buf))?;
+    if let Some(live) = lock_cell(&active_task(lua)).live.clone() {
+        let _ = live.event_tx.send(maki_agent::AgentEvent::LiveToolBuf {
+            id: live.tool_use_id.clone(),
+            body: shared,
+        });
+    }
+    Ok(())
+}
+
 /// Captured snapshot of the parent `ToolContext`. Per-call state (deadline,
 /// instructions, output lines) is reset so child calls start clean.
 #[derive(Clone)]
@@ -80,15 +109,7 @@ impl UserData for LuaCtx {
         });
 
         methods.add_method("live_buf", |lua, _this, buf: mlua::AnyUserData| {
-            let shared = buf.borrow::<BufHandle>().map(|h| Arc::clone(&h.buf))?;
-            let live = lock_cell(&active_task(lua)).live.clone();
-            if let Some(live) = live {
-                let _ = live.event_tx.send(maki_agent::AgentEvent::LiveToolBuf {
-                    id: live.tool_use_id.clone(),
-                    body: shared,
-                });
-            }
-            Ok(())
+            send_live_buf(lua, &buf)
         });
 
         methods.add_method("config", |lua, this, ()| lua.to_value(&this.config));
