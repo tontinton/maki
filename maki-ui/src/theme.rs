@@ -133,6 +133,14 @@ pub static BUNDLED_THEMES: &[ThemeEntry] = &[
         toml: include_str!("themes/ayu_dark.toml"),
     },
     ThemeEntry {
+        name: "ayu_light",
+        toml: include_str!("themes/ayu_light.toml"),
+    },
+    ThemeEntry {
+        name: "ayu_mirage",
+        toml: include_str!("themes/ayu_mirage.toml"),
+    },
+    ThemeEntry {
         name: "carbonfox",
         toml: include_str!("themes/carbonfox.toml"),
     },

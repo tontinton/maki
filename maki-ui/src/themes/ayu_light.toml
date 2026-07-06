@@ -1,4 +1,4 @@
-# Ayu Dark -- palette sourced from ayu-colors/themes/dark.yaml
+# Ayu Light -- palette sourced from ayu-colors/themes/light.yaml
 # Each palette entry is commented with its official Ayu YAML path.
 
 "comment"                         = { fg = "comment" }
@@ -87,39 +87,39 @@
 
 [palette]
 # surface.base
-background   = "#0d1017"
+background   = "#f8f9fa"
 # editor.fg
-foreground   = "#bfbdb6"
+foreground   = "#5c6166"
 # syntax.comment  (palette.gray.l4)
-comment      = "#5a6673"
-# syntax.entity  (palette.blue.l3)
-blue         = "#59c2ff"
-# syntax.regexp  (palette.teal.l5)
-cyan         = "#95e6cb"
-# syntax.string  (palette.green.l4)
-green        = "#aad94c"
+comment      = "#adaeb1"
+# syntax.entity  (palette.blue.l2)
+blue         = "#22a4e6"
+# syntax.regexp  (palette.teal.l3)
+cyan         = "#4cbf99"
+# syntax.string  (palette.green.l3)
+green        = "#86b300"
 # syntax.keyword  (palette.orange.l3)
-orange       = "#ff8f40"
-# palette.pink.l3
-pink         = "#f29668"
-# syntax.constant  (palette.purple.l3)
-purple       = "#d2a6ff"
+orange       = "#fa8532"
+# palette.pink.l4
+pink         = "#f2a191"
+# syntax.constant  (palette.purple.l2)
+purple       = "#a37acc"
 # vcs.removed
-red          = "#f26d78"
+red          = "#ff7383"
 # syntax.func  (palette.yellow.l4)
-yellow       = "#ffb454"
-# editor.line
-current_line = "#161a24"
-# ui.line
-selection    = "#1b1f29"
+yellow       = "#eba400"
+# surface.sunk
+current_line = "#ebeef0"
+# Derived: subtle shade of surface.base
+selection    = "#e5e8ec"
 
 [ui]
 user               = { fg = "blue" }
 assistant          = { fg = "foreground" }
 assistant_prefix   = { fg = "orange" }
 thinking           = { fg = "comment", modifiers = ["italic"] }
-# surface.base
-tool_bg            = { bg = "#0d1017" }
+# surface.sunk
+tool_bg            = { bg = "#ebeef0" }
 tool               = { fg = "foreground" }
 tool_path          = { fg = "yellow" }
 tool_annotation    = { fg = "comment" }
@@ -134,10 +134,10 @@ plan_rule          = { fg = "orange", modifiers = ["bold"] }
 code_block         = { fg = "foreground" }
 horizontal_rule    = { fg = "comment" }
 table_border       = { fg = "comment" }
-diff_old           = { bg = "#3d1c1c" }
-diff_new           = { bg = "#1c3020" }
-diff_old_emphasis  = { bg = "#5c2a2a" }
-diff_new_emphasis  = { bg = "#2a4a30" }
+diff_old           = { bg = "#f5d5d5" }
+diff_new           = { bg = "#d5ecd5" }
+diff_old_emphasis  = { bg = "#edb0b0" }
+diff_new_emphasis  = { bg = "#b5dd9a" }
 diff_line_nr       = { fg = "comment" }
 todo_completed     = { fg = "green" }
 todo_in_progress   = { fg = "yellow" }
