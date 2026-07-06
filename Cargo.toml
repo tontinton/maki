@@ -167,6 +167,7 @@ notify = { version = "9.0.0-rc.2", default-features = false, features = ["flume"
 serde_yaml = "0.9"
 shell-words = "1"
 agent-client-protocol-schema = "0.13"
+zstd = "0.13"
 
 wait-timeout = "0.2"
 inventory = "0.3"

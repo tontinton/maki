@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use maki_storage::StateDir;
+use maki_storage::StorageError;
 use maki_storage::sessions::{SESSIONS_DIR, SessionError, SessionLog};
 use tracing::warn;
 
@@ -96,16 +97,17 @@ fn open_or_create_log(
     sessions_dir: &Path,
     session: &AppSession,
 ) -> Result<SessionLog, maki_storage::sessions::SessionError> {
-    let jsonl_path = sessions_dir.join(format!("{}.jsonl", session.id));
-    if jsonl_path.exists() {
-        let (_loaded, log) = SessionLog::open::<
-            maki_providers::Message,
-            maki_providers::TokenUsage,
-            maki_agent::ToolOutput,
-        >(sessions_dir, &session.id)?;
-        Ok(log)
-    } else {
-        AppSession::migrate_to_jsonl(sessions_dir, session)
+    match SessionLog::open::<
+        maki_providers::Message,
+        maki_providers::TokenUsage,
+        maki_agent::ToolOutput,
+    >(sessions_dir, &session.id)
+    {
+        Ok((_loaded, log)) => Ok(log),
+        Err(SessionError::Storage(StorageError::NotFound(_))) => {
+            Ok(SessionLog::create(sessions_dir, session)?)
+        }
+        Err(e) => Err(e),
     }
 }
 
