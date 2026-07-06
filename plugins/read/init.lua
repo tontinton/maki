@@ -164,7 +164,7 @@ local function read_file(path, offset, limit, ctx)
   local annotation = shown < total_lines and string.format("%d of %d lines", shown, total_lines)
     or string.format("%d lines", shown)
 
-  local prefix = start > 1 and table.concat(all_lines, "\n", 1, start - 1) or nil
+  local prefix = start > 1 and table.concat(all_lines, "\n", 1, math.min(start - 1, total_lines)) or nil
 
   local basename = path:match("([^/]+)$")
   if not ctx:is_instruction_file(basename) then
