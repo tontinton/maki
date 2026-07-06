@@ -18,7 +18,7 @@ use std::sync::{OnceLock, RwLock};
 use maki_storage::{StateDir, atomic_write};
 use tracing::warn;
 
-use crate::model::{ModelInfo, ModelTier};
+use crate::model::{ModelInfo, ModelTier, models_for_provider};
 use crate::provider::ProviderKind;
 
 const TIERS_FILE: &str = "model-tiers";
@@ -123,6 +123,21 @@ impl ModelRegistry {
             return Some(spec.clone());
         }
 
+        let candidate = self
+            .static_candidate(provider, tier)
+            .or_else(|| self.positional_candidate(provider, tier))?;
+
+        (!self.claimed_elsewhere(&candidate, tier)).then_some(candidate)
+    }
+
+    fn static_candidate(&self, provider: ProviderKind, tier: ModelTier) -> Option<String> {
+        models_for_provider(provider)
+            .iter()
+            .find(|e| e.default && e.tier == tier)
+            .map(|e| format!("{provider}/{}", e.prefixes[0]))
+    }
+
+    fn positional_candidate(&self, provider: ProviderKind, tier: ModelTier) -> Option<String> {
         let models = self.known_models.get(&provider).filter(|m| !m.is_empty())?;
         let slot = match tier {
             ModelTier::Strong => 0,
@@ -130,11 +145,14 @@ impl ModelRegistry {
             ModelTier::Weak => 2,
             ModelTier::Compaction => return None,
         };
-        let idx = slot.min(models.len() - 1);
-        let spec = format!("{provider}/{}", models[idx].id);
+        Some(format!(
+            "{provider}/{}",
+            models[slot.min(models.len() - 1)].id
+        ))
+    }
 
-        let overridden_elsewhere = self.overrides.iter().any(|(&t, s)| s == &spec && t != tier);
-        (!overridden_elsewhere).then_some(spec)
+    fn claimed_elsewhere(&self, spec: &str, tier: ModelTier) -> bool {
+        self.overrides.iter().any(|(&t, s)| s == spec && t != tier)
     }
 
     pub fn spec_for_tier_any(&self, tier: ModelTier) -> Option<String> {
