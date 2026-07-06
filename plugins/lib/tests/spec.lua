@@ -1192,6 +1192,96 @@ case("filter_items_table_items_uses_label", function()
   eq(indices[2], 3)
 end)
 
+local fuzzy_match = ListPicker._fuzzy_match
+local is_header = ListPicker._is_header
+
+case("is_header_detects_header_flag", function()
+  assert(is_header({ label = "x", header = true }), "header=true is a header")
+  assert(not is_header({ label = "x" }), "no header field is selectable")
+  assert(not is_header("plain"), "string item is selectable")
+end)
+
+case("fuzzy_match_subsequence_in_order", function()
+  assert(fuzzy_match({ label = "alpha" }, "lph"), "lph is a subsequence of alpha")
+  assert(not fuzzy_match({ label = "ba" }, "ab"), "ab is not a subsequence of ba (order matters)")
+  assert(fuzzy_match({ label = "auth-flow.md" }, "afm"), "subsequence across non-alnum")
+end)
+
+case("fuzzy_match_via_match_text", function()
+  local item = { label = "flow.md", match_text = "auth decisions" }
+  assert(fuzzy_match(item, "auth"), "matches via match_text tag token")
+  assert(fuzzy_match(item, "dec"), "matches via second tag token")
+  assert(not fuzzy_match(item, "xyz"), "no match when absent from label and tags")
+end)
+
+case("fuzzy_match_empty_query_returns_nil", function()
+  assert(fuzzy_match({ label = "x" }, "") == nil, "empty query returns nil (no highlight)")
+end)
+
+case("filter_items_drops_header_with_no_matching_children", function()
+  local items = {
+    { label = "auth (2)", header = true },
+    { label = "flow.md", match_text = "auth" },
+    { label = "tokens.md", match_text = "auth" },
+    { label = "decisions (1)", header = true },
+    { label = "use_result.md", match_text = "decisions" },
+  }
+  local filtered, indices = filter_items(items, "flow")
+  eq(#filtered, 2, "header + one matching child, other group dropped")
+  eq(filtered[1].label, "auth (2)")
+  eq(filtered[2].label, "flow.md")
+  eq(indices[1], 1)
+  eq(indices[2], 2)
+end)
+
+case("filter_items_empty_query_keeps_headers", function()
+  local items = {
+    { label = "auth (1)", header = true },
+    { label = "flow.md", match_text = "auth" },
+  }
+  local filtered, indices = filter_items(items, "")
+  eq(#filtered, 2, "empty query keeps all rows")
+  eq(indices[1], 1)
+  eq(indices[2], 2)
+end)
+
+case("render_lines_header_uses_dim_style", function()
+  local items = {
+    { label = "auth (1)", header = true },
+    { label = "flow.md", detail = "(10 bytes)" },
+  }
+  local lines = render_lines(items, 2, 60, "")
+  eq(lines[1][1][2], "dim", "header row uses dim style")
+  eq(lines[2][1][2], "selected", "selected file row uses selected")
+end)
+
+case("render_lines_header_not_indented", function()
+  local items = {
+    { label = "auth (1)", header = true },
+    { label = "flow.md", detail = "(10 bytes)" },
+  }
+  local lines = render_lines(items, 1, 60, "")
+  eq(lines[1][1][1], "auth (1)", "header has no leading indent")
+  eq(lines[2][1][1], "  flow.md", "file row indented two spaces")
+end)
+
+case("render_lines_fuzzy_highlight_spans", function()
+  local lines = render_lines({ "alpha" }, 1, 40, "lph")
+  eq(lines[1][1][1], "  a")
+  eq(lines[1][1][2], "selected")
+  eq(lines[1][2][1], "lph")
+  eq(lines[1][2][2], "match_selected")
+  eq(lines[1][3][1], "a")
+  eq(lines[1][3][2], "selected")
+end)
+
+case("render_lines_fuzzy_via_tag_highlights_label", function()
+  local item = { label = "flow.md", match_text = "auth" }
+  local lines = render_lines({ item }, 1, 40, "auth")
+  eq(lines[1][1][1], "  flow.md", "label shown plain when match is via tag")
+  eq(lines[1][1][2], "selected")
+end)
+
 if #failures > 0 then
   error(#failures .. " case(s) failed:\n\n" .. table.concat(failures, "\n\n"))
 end

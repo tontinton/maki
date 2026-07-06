@@ -336,7 +336,7 @@ maki.api.register_tool({
 
 maki.api.register_command({
   name = "/memory",
-  description = "View, edit, and delete memory files",
+  description = "View, edit, and delete memory files, grouped by tag",
   handler = function()
     local dir = resolve_dir(true)
     if not dir then
@@ -344,26 +344,66 @@ maki.api.register_command({
       return
     end
 
-    local entries = helpers.collect_file_entries(dir)
+    local UNTAGGED = "(untagged)"
+
+    local function build_items(entries)
+      local counts = helpers.collect_tag_counts(entries)
+      local tag_order = sorted_tag_keys(counts)
+
+      local grouped = {}
+      for _, t in ipairs(tag_order) do
+        grouped[t] = {}
+      end
+      grouped[UNTAGGED] = {}
+
+      for _, e in ipairs(entries) do
+        if e.from_stem then
+          grouped[UNTAGGED][#grouped[UNTAGGED] + 1] = e
+        else
+          for _, t in ipairs(e.tags) do
+            if grouped[t] then
+              grouped[t][#grouped[t] + 1] = e
+            end
+          end
+        end
+      end
+
+      local items = {}
+      local function emit_group(label, members)
+        if #members == 0 then
+          return
+        end
+        table.sort(members, function(a, b)
+          return a.name < b.name
+        end)
+        items[#items + 1] = { label = label .. " (" .. #members .. ")", header = true }
+        for _, e in ipairs(members) do
+          items[#items + 1] = {
+            label = e.name,
+            detail = "(" .. e.bytes .. " bytes)",
+            match_text = table.concat(e.tags, " "),
+            _entry = e,
+          }
+        end
+      end
+
+      for _, t in ipairs(tag_order) do
+        emit_group(t, grouped[t])
+      end
+      emit_group(UNTAGGED, grouped[UNTAGGED])
+      return items
+    end
+
+    local entries = helpers.collect_file_entries_with_tags(dir)
     if #entries == 0 then
       maki.ui.flash("No memory files yet")
       return
     end
-    table.sort(entries, function(a, b)
-      return a[1] < b[1]
-    end)
-
-    local function build_items()
-      local items = {}
-      for _, e in ipairs(entries) do
-        items[#items + 1] = { label = e[1], detail = "(" .. e[2] .. " bytes)" }
-      end
-      return items
-    end
 
     local last_cursor = 1
     while true do
-      local event = ListPicker.open(build_items(), {
+      local items = build_items(entries)
+      local event = ListPicker.open(items, {
         title = " Memory Files ",
         cursor = last_cursor,
         submit_keys = { "ctrl+o" },
@@ -379,29 +419,33 @@ maki.api.register_command({
       end
 
       last_cursor = event.index
+      local item = items[event.index]
+      if not (item and item._entry) then
+        break
+      end
+      local entry = item._entry
+      local path = maki.fs.joinpath(dir, entry.name)
+
       if event.type == "choice" then
-        local item = entries[event.index]
-        if item then
-          local path = maki.fs.joinpath(dir, item[1])
-          local code = maki.ui.open_editor(path)
-          if code == 0 then
-            local meta = maki.fs.metadata(path)
-            if meta then
-              item[2] = meta.size
-            end
+        local code = maki.ui.open_editor(path)
+        if code == 0 then
+          local meta = maki.fs.metadata(path)
+          if meta then
+            entry.bytes = meta.size
           end
         end
       elseif event.type == "delete" then
-        local item = entries[event.index]
-        local ok, err = maki.fs.rm(maki.fs.joinpath(dir, item[1]))
+        local ok, err = maki.fs.rm(path)
         if ok then
-          maki.ui.flash("Deleted " .. item[1])
-          table.remove(entries, event.index)
+          maki.ui.flash("Deleted " .. entry.name)
+          for i, e in ipairs(entries) do
+            if e == entry then
+              table.remove(entries, i)
+              break
+            end
+          end
           if #entries == 0 then
             break
-          end
-          if last_cursor > #entries then
-            last_cursor = #entries
           end
         else
           maki.ui.flash("Delete failed: " .. tostring(err))

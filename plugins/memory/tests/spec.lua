@@ -225,8 +225,11 @@ case("collect_file_entries_with_tags", function()
     by_name[e.name] = e
   end
   tags_eq(by_name["tagged.md"].tags, { "auth", "decision" })
+  eq(by_name["tagged.md"].from_stem, false, "explicit tags: not from_stem")
   tags_eq(by_name["plain.md"].tags, { "plain" })
+  eq(by_name["plain.md"].from_stem, true, "no frontmatter: from_stem")
   tags_eq(by_name["fmbutnotags.md"].tags, { "fmbutnotags" })
+  eq(by_name["fmbutnotags.md"].from_stem, true, "frontmatter without tags: from_stem")
   assert(by_name["tagged.md"].bytes > 0, "bytes should be set")
   rmtree(tmpdir)
 end)

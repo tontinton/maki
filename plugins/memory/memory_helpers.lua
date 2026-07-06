@@ -203,14 +203,19 @@ function M.collect_file_entries_with_tags(dir)
     if content and not err then
       tags = M.parse_frontmatter(content).tags
     end
+    local from_stem = false
+    if content and not err then
+      tags = M.parse_frontmatter(content).tags
+    end
     if #tags == 0 then
       local stem = name:gsub("%.[^.]*$", "")
       local t = M.normalize_tag(stem)
       if #t > 0 then
         tags = { t }
+        from_stem = true
       end
     end
-    result[#result + 1] = { name = name, bytes = bytes, tags = tags }
+    result[#result + 1] = { name = name, bytes = bytes, tags = tags, from_stem = from_stem }
   end
   return result
 end

@@ -6,6 +6,59 @@ ListPicker.__index = ListPicker
 local DETAIL_RIGHT_PAD = 2
 local NO_MATCHES_LABEL = "  (no matches)"
 
+local function is_header(item)
+  return type(item) == "table" and item.header == true
+end
+
+local function label_of(item)
+  return type(item) == "string" and item or item.label
+end
+
+local function search_text(item)
+  local label = label_of(item)
+  if type(item) == "table" and item.match_text and #item.match_text > 0 then
+    return label .. " " .. item.match_text
+  end
+  return label
+end
+
+-- Subsequence match of query over search_text (case-insensitive).
+-- Returns the matched positions within LABEL (for highlight spans), or nil if
+-- no subsequence match. An empty table means: matched, but only via match_text
+-- tokens past the label, so no label span to highlight.
+local function fuzzy_match(item, query)
+  if query == "" then
+    return nil
+  end
+  local label = label_of(item)
+  local hay = search_text(item):lower()
+  local q = query:lower()
+  local label_len = #label
+  local hpos = 1
+  local label_indices = {}
+  for qi = 1, #q do
+    local needle = q:byte(qi)
+    local found = false
+    while hpos <= #hay do
+      local ch = hay:byte(hpos)
+      hpos = hpos + 1
+      if ch == needle then
+        if hpos - 1 <= label_len then
+          label_indices[#label_indices + 1] = hpos - 1
+        end
+        found = true
+        break
+      end
+    end
+    if not found then
+      return nil
+    end
+  end
+  return label_indices
+end
+
+-- Group-aware filter. Header rows are kept iff at least one following child
+-- (up to the next header) matches; headers with no matching children collapse.
 local function filter_items(items, query)
   if query == "" then
     local indices = {}
@@ -14,29 +67,72 @@ local function filter_items(items, query)
     end
     return items, indices
   end
-  local q = query:lower()
   local filtered, indices = {}, {}
-  for i, item in ipairs(items) do
-    local label = type(item) == "string" and item or item.label
-    if label:lower():find(q, 1, true) then
-      filtered[#filtered + 1] = item
-      indices[#indices + 1] = i
+  local i = 1
+  while i <= #items do
+    if is_header(items[i]) then
+      local header_idx = i
+      local children = {}
+      i = i + 1
+      while i <= #items and not is_header(items[i]) do
+        children[#children + 1] = i
+        i = i + 1
+      end
+      local any_child = false
+      for _, ci in ipairs(children) do
+        if fuzzy_match(items[ci], query) then
+          any_child = true
+          break
+        end
+      end
+      if any_child then
+        filtered[#filtered + 1] = items[header_idx]
+        indices[#indices + 1] = header_idx
+        for _, ci in ipairs(children) do
+          if fuzzy_match(items[ci], query) then
+            filtered[#filtered + 1] = items[ci]
+            indices[#indices + 1] = ci
+          end
+        end
+      end
+    else
+      if fuzzy_match(items[i], query) then
+        filtered[#filtered + 1] = items[i]
+        indices[#indices + 1] = i
+      end
+      i = i + 1
     end
   end
   return filtered, indices
 end
 
-local function find_match_pos(label, query)
-  if query == "" then
-    return nil
+local function label_spans(item, query, style, match_style)
+  local label = label_of(item)
+  local indices = fuzzy_match(item, query)
+  if not indices or #indices == 0 then
+    return { { label, style } }
   end
-  local ll = label:lower()
-  local ql = query:lower()
-  local start = ll:find(ql, 1, true)
-  if not start then
-    return nil
+  local match_set = {}
+  for _, idx in ipairs(indices) do
+    match_set[idx] = true
   end
-  return start, start + #ql - 1
+  local spans = {}
+  local run_start = 1
+  local in_match = false
+  for pos = 1, #label do
+    local is_m = match_set[pos] == true
+    if is_m ~= in_match then
+      if pos > run_start then
+        spans[#spans + 1] = { label:sub(run_start, pos - 1), in_match and match_style or style }
+      end
+      run_start = pos
+      in_match = is_m
+    end
+  end
+  if #label >= run_start then
+    spans[#spans + 1] = { label:sub(run_start, #label), in_match and match_style or style }
+  end
+  return spans
 end
 
 local function render_lines(items, selected, width, query)
@@ -44,28 +140,43 @@ local function render_lines(items, selected, width, query)
   query = query or ""
   local lines = {}
   for i, item in ipairs(items) do
-    local label = type(item) == "string" and item or item.label
+    local label = label_of(item)
     local detail = type(item) == "table" and item.detail or nil
     local is_sel = (i == selected)
-    local style = is_sel and "selected" or "item"
-    local detail_style = is_sel and "selected" or "dim"
-    local match_style = is_sel and "match_selected" or "match"
+    local is_hdr = is_header(item)
 
-    local spans = {}
-    local ms, me = find_match_pos(label, query)
-    if ms then
-      local before = label:sub(1, ms - 1)
-      local match = label:sub(ms, me)
-      local after = label:sub(me + 1)
-      spans[#spans + 1] = { "  " .. before, style }
-      spans[#spans + 1] = { match, match_style }
-      spans[#spans + 1] = { after, style }
+    local style, detail_style, match_style
+    if is_hdr then
+      style = "dim"
+      detail_style = "dim"
+      match_style = "dim"
+    elseif is_sel then
+      style = "selected"
+      detail_style = "selected"
+      match_style = "match_selected"
     else
-      spans[#spans + 1] = { "  " .. label, style }
+      style = "item"
+      detail_style = "dim"
+      match_style = "match"
     end
 
-    if detail then
-      local pad = width - 2 - #label - #detail - DETAIL_RIGHT_PAD
+    local spans = {}
+    if is_hdr then
+      spans[#spans + 1] = { label, style }
+    else
+      local lspans = label_spans(item, query, style, match_style)
+      if #lspans > 0 then
+        lspans[1][1] = "  " .. lspans[1][1]
+      end
+      for _, s in ipairs(lspans) do
+        spans[#spans + 1] = s
+      end
+    end
+
+    local label_w = #label
+    local detail_w = detail and #detail or 0
+    if detail ~= nil then
+      local pad = width - 2 - label_w - detail_w - DETAIL_RIGHT_PAD
       if pad < 1 then
         pad = 1
       end
@@ -73,7 +184,7 @@ local function render_lines(items, selected, width, query)
       spans[#spans + 1] = { detail, detail_style }
       spans[#spans + 1] = { string.rep(" ", DETAIL_RIGHT_PAD), style }
     else
-      local trail = width - 2 - #label
+      local trail = width - 2 - label_w
       if trail > 0 then
         spans[#spans + 1] = { string.rep(" ", trail), style }
       end
@@ -82,6 +193,38 @@ local function render_lines(items, selected, width, query)
     lines[#lines + 1] = spans
   end
   return lines
+end
+
+local function next_selectable(items, from, delta)
+  local i = from + delta
+  while i >= 1 and i <= #items do
+    if not is_header(items[i]) then
+      return i
+    end
+    i = i + delta
+  end
+  return from
+end
+
+local function clamp_selectable(items, target)
+  if #items == 0 then
+    return 1
+  end
+  if target < 1 then
+    target = 1
+  end
+  if target > #items then
+    target = #items
+  end
+  if not is_header(items[target]) then
+    return target
+  end
+  local fwd = next_selectable(items, target, 1)
+  if fwd ~= target then
+    return fwd
+  end
+  local bwd = next_selectable(items, target, -1)
+  return bwd
 end
 
 function ListPicker.open(items, opts)
@@ -96,13 +239,7 @@ function ListPicker.open(items, opts)
   local input = TextInput.new()
   local filtered, original_indices = filter_items(items, "")
 
-  local cursor = opts.cursor or 1
-  if cursor > #filtered then
-    cursor = #filtered
-  end
-  if cursor < 1 then
-    cursor = 1
-  end
+  local cursor = clamp_selectable(filtered, opts.cursor or 1)
 
   local function build_lines()
     local content
@@ -150,15 +287,17 @@ function ListPicker.open(items, opts)
       buf:set_lines(build_lines())
     elseif ev.type == "key" then
       if ev.key == "up" then
-        if cursor > 1 then
-          cursor = cursor - 1
+        local nxt = next_selectable(filtered, cursor, -1)
+        if nxt ~= cursor then
+          cursor = nxt
           win:set_cursor(cursor)
           buf:set_lines(build_lines())
         end
         confirming = nil
       elseif ev.key == "down" then
-        if cursor < #filtered then
-          cursor = cursor + 1
+        local nxt = next_selectable(filtered, cursor, 1)
+        if nxt ~= cursor then
+          cursor = nxt
           win:set_cursor(cursor)
           buf:set_lines(build_lines())
         end
@@ -167,7 +306,7 @@ function ListPicker.open(items, opts)
         win:close()
         return { type = "close" }
       elseif ev.key == "ctrl+d" then
-        if #filtered > 0 then
+        if #filtered > 0 and not is_header(filtered[cursor]) then
           if confirming == cursor then
             win:close()
             return { type = "delete", index = original_indices[cursor] }
@@ -177,7 +316,7 @@ function ListPicker.open(items, opts)
           end
         end
       elseif submit_keys[ev.key] then
-        if #filtered > 0 then
+        if #filtered > 0 and not is_header(filtered[cursor]) then
           win:close()
           return { type = "choice", index = original_indices[cursor] }
         end
@@ -185,13 +324,8 @@ function ListPicker.open(items, opts)
         local result = input:handle_key(ev.key)
         if result == TextInput.Result.CHANGED then
           filtered, original_indices = filter_items(items, input:value())
-          if cursor > #filtered then
-            cursor = #filtered
-            if cursor < 1 then
-              cursor = 1
-            end
-            win:set_cursor(cursor)
-          end
+          cursor = clamp_selectable(filtered, cursor)
+          win:set_cursor(cursor)
           buf:set_lines(build_lines())
           confirming = nil
         elseif result == TextInput.Result.MOVED then
@@ -205,6 +339,7 @@ end
 
 ListPicker._render_lines = render_lines
 ListPicker._filter_items = filter_items
-ListPicker._find_match_pos = find_match_pos
+ListPicker._fuzzy_match = fuzzy_match
+ListPicker._is_header = is_header
 
 return ListPicker
