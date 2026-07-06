@@ -174,8 +174,8 @@ local function render_lines(items, selected, width, query)
     end
 
     local label_w = #label
-    local detail_w = detail and #detail or 0
     if detail ~= nil then
+      local detail_w = #detail
       local pad = width - 2 - label_w - detail_w - DETAIL_RIGHT_PAD
       if pad < 1 then
         pad = 1

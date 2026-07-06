@@ -5,8 +5,6 @@ local ListPicker = require("maki.list_picker")
 
 local HINT_MAX_TAGS = 50
 
-local hint_overflowed = false
-
 local function memories_path_suffix()
   local cwd = maki.uv.cwd()
   local root = maki.fs.root(cwd, ".git") or cwd
@@ -73,7 +71,6 @@ maki.api.register_prompt_hint({
       out = out .. "- " .. t .. " (" .. counts[t] .. ")\n"
     end
     if overflow > 0 then
-      hint_overflowed = true
       out = out
         .. "...and "
         .. overflow
@@ -127,22 +124,6 @@ local function build_frontmatter(preserved, tags)
   return out .. "---\n"
 end
 
-local function drift_notice(dir)
-  if hint_overflowed then
-    return nil
-  end
-  local counts = helpers.collect_tag_counts(helpers.collect_file_entries_with_tags(dir))
-  local n = 0
-  for _ in pairs(counts) do
-    n = n + 1
-  end
-  if n <= HINT_MAX_TAGS then
-    return nil
-  end
-  return n
-    .. " tags now (session-prompt hint is stale; `memory list_tags` before writing again, `memory delete` to prune)"
-end
-
 local function cmd_write(input, dir, ctx)
   local file_path, err = helpers.safe_resolve(dir, input.path)
   if not file_path then
@@ -165,10 +146,6 @@ local function cmd_write(input, dir, ctx)
     return nil, "write error: " .. tostring(write_err)
   end
   local msg = "wrote " .. input.path
-  local notice = drift_notice(dir)
-  if notice then
-    msg = msg .. "\nnote: " .. notice
-  end
   return {
     llm_output = msg,
     body = render_content(new_content, input.path, ctx),
@@ -347,8 +324,15 @@ maki.api.register_command({
     local UNTAGGED = "(untagged)"
 
     local function build_items(entries)
-      local counts = helpers.collect_tag_counts(entries)
-      local tag_order = sorted_tag_keys(counts)
+      local tag_set = {}
+      for _, e in ipairs(entries) do
+        if not e.from_stem then
+          for _, t in ipairs(e.tags) do
+            tag_set[t] = true
+          end
+        end
+      end
+      local tag_order = sorted_tag_keys(tag_set)
 
       local grouped = {}
       for _, t in ipairs(tag_order) do
@@ -400,12 +384,21 @@ maki.api.register_command({
       return
     end
 
-    local last_cursor = 1
+    local last_name
     while true do
       local items = build_items(entries)
+      local cursor = 1
+      if last_name then
+        for i, it in ipairs(items) do
+          if it._entry and it._entry.name == last_name then
+            cursor = i
+            break
+          end
+        end
+      end
       local event = ListPicker.open(items, {
         title = " Memory Files ",
-        cursor = last_cursor,
+        cursor = cursor,
         submit_keys = { "ctrl+o" },
         footer = {
           { "Enter", "open" },
@@ -418,12 +411,12 @@ maki.api.register_command({
         break
       end
 
-      last_cursor = event.index
       local item = items[event.index]
       if not (item and item._entry) then
         break
       end
       local entry = item._entry
+      last_name = entry.name
       local path = maki.fs.joinpath(dir, entry.name)
 
       if event.type == "choice" then
