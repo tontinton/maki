@@ -29,7 +29,7 @@ Type `/` in the input box to open the command palette.
 | `/thinking` | Toggle extended thinking (off, adaptive, or budget) |
 | `/fast` | Toggle Anthropic fast mode (Opus only) |
 | `/exit` | Exit the application |
-| `/memory` | View, edit, and delete memory files |
+| `/memory` | View, edit, and delete memory files, grouped by tag |
 
 ## Custom commands
 
