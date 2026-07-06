@@ -178,6 +178,7 @@ fn config_value_expr(ty_name: &str, default: &Option<Expr>) -> TokenStream2 {
             let val = default.as_ref().expect("usize field requires default");
             quote! { ConfigValue::Usize(#val) }
         }
+        "Option<u64>" => quote! { ConfigValue::OptionalU64 },
         "String" => quote! { ConfigValue::OptionalString },
         other => panic!("unsupported config type: {other}"),
     }
@@ -231,6 +232,8 @@ fn derive_impl(input: &DeriveInput) -> syn::Result<TokenStream2> {
         let ty_string = type_to_name(ty);
         let ty_name = attrs.ty_override.as_deref().unwrap_or(&ty_string);
         let desc = attrs.desc.as_deref().unwrap_or("");
+        let is_optional_u64 = ty_name == "Option<u64>";
+        let display_ty = if is_optional_u64 { "u64" } else { ty_name };
         let default_expr = config_value_expr(ty_name, &attrs.default);
         let min_expr = match &attrs.min {
             Some(m) => quote! { Some(#m as u64) },
@@ -240,7 +243,7 @@ fn derive_impl(input: &DeriveInput) -> syn::Result<TokenStream2> {
         fields_entries.push(quote! {
             ConfigField {
                 name: #field_name,
-                ty: #ty_name,
+                ty: #display_ty,
                 default: #default_expr,
                 min: #min_expr,
                 description: #desc,
@@ -257,9 +260,17 @@ fn derive_impl(input: &DeriveInput) -> syn::Result<TokenStream2> {
             };
             let ident_str = ident.to_string();
             let field_name_for_check = attrs.key.as_deref().unwrap_or(&ident_str);
-            validate_checks.push(quote! {
-                check(#section, #field_name_for_check, #val_expr as u64, #min as u64)?;
-            });
+            if is_optional_u64 {
+                validate_checks.push(quote! {
+                    if let Some(v) = #val_expr {
+                        check(#section, #field_name_for_check, v as u64, #min as u64)?;
+                    }
+                });
+            } else {
+                validate_checks.push(quote! {
+                    check(#section, #field_name_for_check, #val_expr as u64, #min as u64)?;
+                });
+            }
         }
     }
 

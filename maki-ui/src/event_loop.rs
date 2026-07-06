@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use color_eyre::Result;
@@ -31,6 +31,7 @@ use crate::terminal;
 
 const ANIMATION_INTERVAL_MS: u64 = 16;
 const IDLE_POLL_INTERVAL_MS: u64 = 100;
+const MIN_MESSAGES_FOR_IDLE_COMPACT: usize = 2;
 
 pub struct EventLoopParams {
     pub model: Model,
@@ -66,6 +67,9 @@ pub(crate) struct EventLoop<'t> {
     storage_writer: Arc<StorageWriter>,
     timeouts: Timeouts,
     ui_action_rx: Option<flume::Receiver<UiAction>>,
+    idle_threshold: Option<Duration>,
+    last_input: Instant,
+    idle_compact_fired: bool,
     _model_fetch_task: smol::Task<()>,
 }
 
@@ -94,6 +98,33 @@ fn merge_batch(
         }
     }
     available.store(Some(Arc::new(merged)));
+}
+
+fn idle_threshold(config: &AgentConfig) -> Option<Duration> {
+    if !maki_agent::auto_compact_enabled() {
+        return None;
+    }
+    config
+        .compaction_idle_minutes
+        .map(|m| Duration::from_secs(m * 60))
+}
+
+fn should_idle_compact(
+    threshold: Option<Duration>,
+    elapsed_since_input: Duration,
+    already_fired: bool,
+    history_len: usize,
+) -> bool {
+    let Some(threshold) = threshold else {
+        return false;
+    };
+    if already_fired {
+        return false;
+    }
+    if elapsed_since_input < threshold {
+        return false;
+    }
+    history_len > MIN_MESSAGES_FOR_IDLE_COMPACT
 }
 
 fn spawn_model_fetch(model_slot: &Arc<ArcSwap<ModelSlot>>, timeouts: Timeouts) -> BackgroundModels {
@@ -195,6 +226,7 @@ impl<'t> EventLoop<'t> {
             model: model.clone(),
             provider,
         }));
+        let idle_threshold = idle_threshold(&config);
         let bg = spawn_model_fetch(&model_slot, timeouts);
         let handles = AgentHandles::spawn(
             &model_slot,
@@ -257,6 +289,9 @@ impl<'t> EventLoop<'t> {
             storage_writer,
             timeouts,
             ui_action_rx,
+            idle_threshold,
+            last_input: Instant::now(),
+            idle_compact_fired: false,
             _model_fetch_task: bg.task,
         })
     }
@@ -363,6 +398,10 @@ impl<'t> EventLoop<'t> {
 
     fn poll_and_handle_input(&mut self, had_agent_msg: bool) -> Result<()> {
         let has_pending_ui_action = self.ui_action_rx.as_ref().is_some_and(|rx| !rx.is_empty());
+        let idle = !had_agent_msg
+            && !has_pending_ui_action
+            && !self.app.is_animating()
+            && self.app.status != Status::Streaming;
         let poll_duration = if had_agent_msg || has_pending_ui_action {
             Duration::ZERO
         } else if self.app.is_animating() {
@@ -372,14 +411,41 @@ impl<'t> EventLoop<'t> {
         };
 
         if !event::poll(poll_duration)? {
+            if idle {
+                self.maybe_idle_compact();
+            }
             return Ok(());
         }
 
         if let Some(msg) = self.translate_input()? {
+            self.last_input = Instant::now();
+            self.idle_compact_fired = false;
             let actions = self.app.update(msg);
             self.dispatch(actions);
         }
         Ok(())
+    }
+
+    fn maybe_idle_compact(&mut self) {
+        let history_len = self
+            .app
+            .shared_history
+            .as_ref()
+            .map(|h| h.load().len())
+            .unwrap_or(0);
+        let elapsed = self.last_input.elapsed();
+        if !should_idle_compact(
+            self.idle_threshold,
+            elapsed,
+            self.idle_compact_fired,
+            history_len,
+        ) {
+            return;
+        }
+        self.idle_compact_fired = true;
+        self.handles.queue.push(QueueItem::Compact {
+            run_id: self.app.run_id,
+        });
     }
 
     fn translate_input(&mut self) -> Result<Option<Msg>> {
@@ -651,4 +717,65 @@ fn coalesce_drag(mut latest: CtMouseEvent) -> (CtMouseEvent, Option<Msg>) {
         }
     }
     (latest, None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MIN_MESSAGES_FOR_IDLE_COMPACT, should_idle_compact};
+    use std::time::Duration;
+
+    const THRESHOLD: Duration = Duration::from_secs(60);
+
+    #[test]
+    fn fires_when_idle_beyond_threshold_with_enough_history() {
+        assert!(should_idle_compact(
+            Some(THRESHOLD),
+            THRESHOLD + Duration::from_secs(1),
+            false,
+            MIN_MESSAGES_FOR_IDLE_COMPACT + 1,
+        ));
+    }
+
+    #[test]
+    fn no_threshold_means_disabled() {
+        // MAKI_DISABLE_AUTOCOMPACT=1 path: idle_threshold returns None.
+        assert!(!should_idle_compact(
+            None,
+            THRESHOLD + Duration::from_secs(1),
+            false,
+            MIN_MESSAGES_FOR_IDLE_COMPACT + 1,
+        ));
+    }
+
+    #[test]
+    fn typing_resets_clock() {
+        // User typed within the idle window: elapsed < threshold.
+        assert!(!should_idle_compact(
+            Some(THRESHOLD),
+            THRESHOLD - Duration::from_secs(1),
+            false,
+            MIN_MESSAGES_FOR_IDLE_COMPACT + 1,
+        ));
+    }
+
+    #[test]
+    fn short_history_skips_compaction() {
+        // 2-message history is the post-compaction summary; don't re-compact it.
+        assert!(!should_idle_compact(
+            Some(THRESHOLD),
+            THRESHOLD + Duration::from_secs(1),
+            false,
+            MIN_MESSAGES_FOR_IDLE_COMPACT,
+        ));
+    }
+
+    #[test]
+    fn already_fired_does_not_refire() {
+        assert!(!should_idle_compact(
+            Some(THRESHOLD),
+            THRESHOLD + Duration::from_secs(1),
+            true,
+            MIN_MESSAGES_FOR_IDLE_COMPACT + 1,
+        ));
+    }
 }

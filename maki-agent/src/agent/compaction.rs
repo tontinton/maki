@@ -209,7 +209,7 @@ fn truncate_oldest_round(messages: &mut Vec<Message>) {
     }
 }
 
-pub(super) fn auto_compact_enabled() -> bool {
+pub fn auto_compact_enabled() -> bool {
     env::var("MAKI_DISABLE_AUTOCOMPACT")
         .map(|v| v != "1" && v != "true")
         .unwrap_or(true)

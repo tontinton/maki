@@ -121,6 +121,7 @@ maki.setup({{
     agent = {{
         bash_timeout_secs = {bash_timeout},
         max_output_lines = {max_output_lines},
+        compaction_idle_minutes = 30,
     }},
     provider = {{
         default_model = \"anthropic/claude-sonnet-4-6\",

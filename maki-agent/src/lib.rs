@@ -12,7 +12,7 @@ pub use mcp::{McpCommand, McpHandle, McpPromptArg, McpPromptInfo, McpSnapshot, M
 pub(crate) mod task_set;
 pub use agent::{
     Agent, AgentParams, AgentRunParams, History, Instructions, LoadedInstructions, SharedMessages,
-    find_subdirectory_instructions, is_instruction_file,
+    auto_compact_enabled, find_subdirectory_instructions, is_instruction_file,
 };
 pub use cancel::{CancelMap, CancelToken, CancelTrigger};
 pub use maki_config::{AgentConfig, PermissionsConfig, ToolOutputLines};

@@ -31,6 +31,7 @@ maki.setup({
     agent = {
         bash_timeout_secs = 180,
         max_output_lines = 3000,
+        compaction_idle_minutes = 30,
     },
     provider = {
         default_model = "anthropic/claude-sonnet-4-6",
@@ -96,6 +97,7 @@ How many lines of output to show per tool in the UI. All values are `usize` with
 | `code_execution_timeout_secs` | u64 | `30` | 5 | Code execution timeout (seconds) |
 | `max_continuation_turns` | u32 | `3` | 1 | Max automatic continuation turns |
 | `compaction_buffer` | u32 | `40000` | 1000 | Token buffer reserved during compaction |
+| `compaction_idle_minutes` | u64 | `none` | 1 | Compact the conversation after this many minutes of no user input. `nil` (the default) disables it. Respects `MAKI_DISABLE_AUTOCOMPACT` |
 | `search_result_limit` | usize | `100` | 10 | Max results from grep/glob searches |
 | `interpreter_max_memory_mb` | usize | `50` | 10 | Memory limit for code interpreter (MB) |
 

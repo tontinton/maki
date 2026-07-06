@@ -27,6 +27,7 @@ pub const DEFAULT_BASH_TIMEOUT_SECS: u64 = 120;
 pub const DEFAULT_CODE_EXECUTION_TIMEOUT_SECS: u64 = 30;
 pub const DEFAULT_MAX_CONTINUATION_TURNS: u32 = 3;
 pub const DEFAULT_COMPACTION_BUFFER: u32 = 40_000;
+pub const DEFAULT_COMPACTION_IDLE_MINUTES: Option<u64> = None;
 pub const DEFAULT_SEARCH_RESULT_LIMIT: usize = 100;
 pub const DEFAULT_INTERPRETER_MAX_MEMORY_MB: usize = 50;
 
@@ -48,6 +49,7 @@ pub const MIN_BASH_TIMEOUT_SECS: u64 = 5;
 pub const MIN_CODE_EXECUTION_TIMEOUT_SECS: u64 = 5;
 pub const MIN_MAX_CONTINUATION_TURNS: u32 = 1;
 pub const MIN_COMPACTION_BUFFER: u32 = 1_000;
+pub const MIN_COMPACTION_IDLE_MINUTES: u64 = 1;
 pub const MIN_SEARCH_RESULT_LIMIT: usize = 10;
 pub const MIN_INTERPRETER_MAX_MEMORY_MB: usize = 10;
 pub const MIN_MOUSE_SCROLL_LINES: u32 = 1;
@@ -90,6 +92,7 @@ pub enum ConfigValue {
     U64(u64),
     Usize(usize),
     OptionalString,
+    OptionalU64,
 }
 
 impl ConfigValue {
@@ -99,7 +102,7 @@ impl ConfigValue {
             Self::U32(v) => v.to_string(),
             Self::U64(v) => v.to_string(),
             Self::Usize(v) => v.to_string(),
-            Self::OptionalString => "none".to_string(),
+            Self::OptionalString | Self::OptionalU64 => "none".to_string(),
         }
     }
 }
@@ -334,6 +337,7 @@ pub struct AgentFileConfig {
     pub code_execution_timeout_secs: Option<u64>,
     pub max_continuation_turns: Option<u32>,
     pub compaction_buffer: Option<u32>,
+    pub compaction_idle_minutes: Option<u64>,
     pub search_result_limit: Option<usize>,
     pub interpreter_max_memory_mb: Option<usize>,
 }
@@ -351,6 +355,7 @@ impl AgentFileConfig {
             code_execution_timeout_secs,
             max_continuation_turns,
             compaction_buffer,
+            compaction_idle_minutes,
             search_result_limit,
             interpreter_max_memory_mb
         );
@@ -676,6 +681,9 @@ pub struct AgentConfig {
     #[config(default = DEFAULT_COMPACTION_BUFFER, min = MIN_COMPACTION_BUFFER, desc = "Token buffer reserved during compaction")]
     pub compaction_buffer: u32,
 
+    #[config(default = DEFAULT_COMPACTION_IDLE_MINUTES, min = MIN_COMPACTION_IDLE_MINUTES, desc = "Compact the conversation after this many minutes of no user input. `nil` (the default) disables it. Respects `MAKI_DISABLE_AUTOCOMPACT`")]
+    pub compaction_idle_minutes: Option<u64>,
+
     #[config(default = DEFAULT_SEARCH_RESULT_LIMIT, min = MIN_SEARCH_RESULT_LIMIT, desc = "Max results from grep/glob searches")]
     pub search_result_limit: usize,
 
@@ -721,6 +729,7 @@ impl AgentConfig {
                 .max_continuation_turns
                 .unwrap_or(DEFAULT_MAX_CONTINUATION_TURNS),
             compaction_buffer: file.compaction_buffer.unwrap_or(DEFAULT_COMPACTION_BUFFER),
+            compaction_idle_minutes: file.compaction_idle_minutes,
             search_result_limit: file
                 .search_result_limit
                 .unwrap_or(DEFAULT_SEARCH_RESULT_LIMIT),
@@ -1861,6 +1870,61 @@ mod tests {
         assert_eq!(tol.bash, Some(100), "overlay wins");
         assert_eq!(tol.read, Some(30), "base preserved");
         assert_eq!(tol.grep, Some(15), "overlay added");
+    }
+
+    #[test]
+    fn merge_compaction_idle_minutes_overlay() {
+        let mut base = RawConfig {
+            agent: AgentFileConfig {
+                compaction_idle_minutes: Some(10),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let overlay = RawConfig {
+            agent: AgentFileConfig {
+                compaction_idle_minutes: Some(30),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        base.merge(overlay);
+        assert_eq!(base.agent.compaction_idle_minutes, Some(30), "overlay wins");
+    }
+
+    #[test]
+    fn into_config_compaction_idle_minutes() {
+        let raw = RawConfig {
+            agent: AgentFileConfig {
+                compaction_idle_minutes: Some(25),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let config = raw.into_config(false).unwrap();
+        assert_eq!(config.agent.compaction_idle_minutes, Some(25));
+    }
+
+    #[test]
+    fn into_config_compaction_default_off() {
+        let config = RawConfig::default().into_config(false).unwrap();
+        assert_eq!(config.agent.compaction_idle_minutes, None, "off by default");
+    }
+
+    #[test]
+    fn compaction_idle_minutes_below_min_errors() {
+        let raw = RawConfig {
+            agent: AgentFileConfig {
+                compaction_idle_minutes: Some(0),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let config = raw.into_config(false).unwrap();
+        let err = config.validate().unwrap_err();
+        assert!(
+            matches!(err, ConfigError::BelowMinimum { field, min, .. } if field == "compaction_idle_minutes" && min == MIN_COMPACTION_IDLE_MINUTES)
+        );
     }
 
     #[test]
