@@ -147,13 +147,14 @@ Create or update a structured todo list to track tasks.
 
 ### `memory` *(lua plugin)*
 
-Persistent, project-scoped scratchpad for learnings, patterns, decisions, and gotchas across sessions.
+Persistent, project-scoped memory for learnings, decisions, and gotchas across sessions.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `command` | string | yes | Command: view, write, delete |
-| `content` | string | no | File content for 'write' |
-| `path` | string | no | Relative path (e.g. 'architecture.md'). Omit to list all. |
+| `command` | string | yes | Command: fetch, write, delete, list_tags |
+| `content` | string | no | File content for 'write'. |
+| `path` | string | no | Relative path (e.g. 'architecture.md'). Required for write/delete. |
+| `tags` | array | no | Tags for fetch (any-match union) or write (set on file). Normalized to lowercase snake_case. |
 
 ### `skill` *(lua plugin)*
 

@@ -1,8 +1,5 @@
 local M = {}
 
-M.MAX_LINES_PER_FILE = 200
-M.MAX_DIR_BYTES = 50 * 1024
-
 -- Lua's bit32 is 32-bit only, so we split the 64-bit FNV-1a state into
 -- hi/lo halves and propagate carries by hand during multiplication.
 function M.fnv1a_64(data)
@@ -20,19 +17,6 @@ function M.fnv1a_64(data)
     hi = new_hi
   end
   return string.format("%08x%08x", hi, lo)
-end
-
--- Counts lines the way editors do: empty string is 1 line,
--- and a trailing newline does not start a new line.
-function M.count_lines(s)
-  if s == "" then
-    return 1
-  end
-  local _, newlines = s:gsub("\n", "")
-  if s:sub(-1) == "\n" then
-    return math.max(newlines, 1)
-  end
-  return newlines + 1
 end
 
 function M.project_id(path)
@@ -81,31 +65,182 @@ function M.collect_file_entries(dir)
   return files
 end
 
-function M.dir_total_bytes(dir)
-  local total = 0
-  for _, f in ipairs(M.collect_file_entries(dir)) do
-    total = total + f[2]
-  end
-  return total
+local function trim(s)
+  return (s:gsub("^%s+", ""):gsub("%s+$", ""))
 end
 
-function M.list_memories(dir)
-  local files = M.collect_file_entries(dir)
-  if #files == 0 then
-    return "No memories yet."
-  end
-  table.sort(files, function(a, b)
-    return a[1] < b[1]
-  end)
+local function split_lines(s)
   local lines = {}
-  local total = 0
-  for _, f in ipairs(files) do
-    lines[#lines + 1] = f[1] .. " (" .. f[2] .. " bytes)"
-    total = total + f[2]
+  local pos = 1
+  while pos <= #s do
+    local nl = s:find("\n", pos, true)
+    if not nl then
+      lines[#lines + 1] = s:sub(pos)
+      break
+    end
+    lines[#lines + 1] = s:sub(pos, nl - 1)
+    pos = nl + 1
   end
-  lines[#lines + 1] = ""
-  lines[#lines + 1] = #files .. " files, " .. total .. " bytes total"
-  return table.concat(lines, "\n")
+  return lines
+end
+
+-- Collapse any run of non-alphanumeric chars to a single underscore,
+-- then trim leading/trailing underscores. "User Decision" -> "user_decision",
+-- "auth-token" -> "auth_token", "  API " -> "api".
+-- Applied at write time (canonical stored form) and at fetch time
+-- so caller-provided variants still match the stored form.
+function M.normalize_tag(tag)
+  local t = trim(tag):lower()
+  t = t:gsub("[^%w]+", "_")
+  t = t:gsub("^_+", ""):gsub("_+$", "")
+  return t
+end
+
+-- Normalize and dedup a list of tags, preserving first-seen order.
+function M.normalize_tag_list(tags)
+  local seen = {}
+  local out = {}
+  for _, t in ipairs(tags or {}) do
+    local n = M.normalize_tag(t)
+    if #n > 0 and not seen[n] then
+      seen[n] = true
+      out[#out + 1] = n
+    end
+  end
+  return out
+end
+
+local function parse_inline_tags(value)
+  local v = trim(value)
+  local tags = {}
+  if v:sub(1, 1) == "[" and v:sub(-1) == "]" then
+    local seen = {}
+    for part in v:sub(2, -2):gmatch("([^,]+)") do
+      local t = trim(part)
+      if #t >= 2 then
+        local q = t:sub(1, 1)
+        if (q == '"' or q == "'") and t:sub(-1) == q then
+          t = trim(t:sub(2, -2))
+        end
+      end
+      t = M.normalize_tag(t)
+      if #t > 0 and not seen[t] then
+        seen[t] = true
+        tags[#tags + 1] = t
+      end
+    end
+  else
+    local token = v:match("^(%S+)$")
+    if token then
+      tags = { M.normalize_tag(token) }
+    end
+  end
+  return tags
+end
+
+function M.parse_frontmatter(content)
+  local s = content:gsub("\r\n", "\n")
+  if s:sub(1, 4) ~= "---\n" then
+    return { tags = {}, preserved = {} }
+  end
+  local lines = split_lines(s)
+  local close_line
+  for i = 2, #lines do
+    if lines[i] == "---" then
+      close_line = i
+      break
+    end
+  end
+  if not close_line then
+    return { tags = {}, preserved = {} }
+  end
+  local tags, preserved = {}, {}
+  local i = 2
+  while i < close_line do
+    local line = lines[i]
+    if line:lower():sub(1, 5) == "tags:" then
+      local rest = trim(line:sub(6))
+      if rest == "" then
+        local seen = {}
+        i = i + 1
+        while i < close_line do
+          local item = lines[i]
+          local bullet = item:match("^%s*-%s+(.*)$")
+          if bullet then
+            local t = M.normalize_tag(bullet)
+            if #t > 0 and not seen[t] then
+              seen[t] = true
+              tags[#tags + 1] = t
+            end
+            i = i + 1
+          else
+            break
+          end
+        end
+      else
+        local inline = parse_inline_tags(rest)
+        for _, t in ipairs(inline) do
+          tags[#tags + 1] = t
+        end
+        i = i + 1
+      end
+    else
+      preserved[#preserved + 1] = line
+      i = i + 1
+    end
+  end
+  return { tags = tags, preserved = preserved }
+end
+
+function M.collect_file_entries_with_tags(dir)
+  local entries = M.collect_file_entries(dir)
+  local result = {}
+  for _, entry in ipairs(entries) do
+    local name, bytes = entry[1], entry[2]
+    local path = maki.fs.joinpath(dir, name)
+    local content, err = maki.fs.read(path)
+    local tags = {}
+    if content and not err then
+      tags = M.parse_frontmatter(content).tags
+    end
+    if #tags == 0 then
+      local stem = name:gsub("%.[^.]*$", "")
+      local t = M.normalize_tag(stem)
+      if #t > 0 then
+        tags = { t }
+      end
+    end
+    result[#result + 1] = { name = name, bytes = bytes, tags = tags }
+  end
+  return result
+end
+
+function M.collect_tag_counts(entries)
+  local counts = {}
+  for _, e in ipairs(entries) do
+    for _, t in ipairs(e.tags or {}) do
+      counts[t] = (counts[t] or 0) + 1
+    end
+  end
+  return counts
+end
+
+-- True if any of the file's tags matches any of the requested tags (union).
+-- Matches are normalized internally on both sides.
+function M.file_matches_any_tag(entry, requested)
+  if not entry.tags or #entry.tags == 0 then
+    return false
+  end
+  local wanted = {}
+  for _, t in ipairs(requested or {}) do
+    wanted[M.normalize_tag(t)] = true
+  end
+  for _, t in ipairs(entry.tags) do
+    if wanted[t] then
+      return true
+    end
+  end
+  return false
 end
 
 return M

@@ -1293,7 +1293,7 @@ fn restore_tool_async_ordering_and_delivery() {
 #[test_case::test_case(
     "memory",
     serde_json::json!({"command": "write", "path": "n.md", "content": "gamma"}),
-    "wrote n.md (1 lines)",
+    "wrote n.md",
     &["gamma"]
     ; "memory_write_restores_saved_content"
 )]
