@@ -123,25 +123,25 @@ fn handle_request(srv: &mut Server, method: &str, id: RequestId, raw: &Value, pa
         "initialize" => Ok(AgentResponse::InitializeResponse(
             methods::initialize_response(),
         )),
-        "session/new" => parse_params::<NewSessionRequest>(raw).map(|req| {
-            let handle = spawn_session(params, req.cwd, None, Vec::new());
+        "session/new" => parse_params::<NewSessionRequest>(raw).and_then(|req| {
+            let handle = spawn_session(params, req.cwd, None, Vec::new())?;
             let spec = params.model.spec();
-            let resp = methods::new_session_response(handle.session_id)
+            let resp = methods::new_session_response(&handle.wire_id)
                 .config_options(vec![methods::model_config_option(&spec, &srv.model_specs)]);
             install_session(srv, handle, spec);
-            AgentResponse::NewSessionResponse(resp)
+            Ok(AgentResponse::NewSessionResponse(resp))
         }),
         "session/load" => parse_params::<LoadSessionRequest>(raw).and_then(|req| {
-            let session_id: EntityId =
-                req.session_id.0.parse().map_err(|_| {
-                    AcpError::resource_not_found(Some(req.session_id.0.to_string()))
-                })?;
+            let raw = req.session_id.0.to_string();
+            let session_id: EntityId = raw.parse().map_err(|_| {
+                AcpError::resource_not_found(Some(raw.clone()))
+            })?;
             let history = load_history(session_id)?;
-            let sid = SessionId::from(session_id.to_string());
+            let sid = SessionId::from(raw.clone());
             for update in translate::replay_history(&history) {
                 session_update(&srv.out_tx, &sid, update);
             }
-            let handle = spawn_session(params, req.cwd, Some(session_id), history);
+            let handle = spawn_session(params, req.cwd, Some(raw), history)?;
             let spec = params.model.spec();
             let resp = methods::load_session_response()
                 .config_options(vec![methods::model_config_option(&spec, &srv.model_specs)]);
@@ -162,9 +162,9 @@ fn handle_request(srv: &mut Server, method: &str, id: RequestId, raw: &Value, pa
 fn spawn_session(
     params: &AcpParams,
     cwd: PathBuf,
-    session_id: Option<EntityId>,
+    session_id: Option<String>,
     history: Vec<Message>,
-) -> InteractiveHandle {
+) -> Result<InteractiveHandle, AcpError> {
     headless::spawn_interactive(InteractiveParams {
         model: params.model.clone(),
         config: params.config.clone(),
@@ -181,13 +181,14 @@ fn spawn_session(
         append_system_prompt: None,
         workflow: false,
     })
+    .map_err(|e| AcpError::internal_error().data(json_str(&e)))
 }
 
 fn install_session(srv: &mut Server, handle: InteractiveHandle, current_model: String) {
     let pending = PendingPrompt::default();
     start_event_pump(
         handle.event_rx.clone(),
-        handle.session_id,
+        handle.wire_id.clone(),
         srv.out_tx.clone(),
         Arc::clone(&pending),
     );
@@ -253,7 +254,7 @@ fn handle_set_mode(srv: &mut Server, raw: &Value) -> Result<AgentResponse, AcpEr
     let session = srv.session.as_mut().ok_or_else(no_session)?;
     session.current_mode = new_mode;
 
-    let sid = SessionId::from(session.handle.session_id.to_string());
+    let sid = SessionId::from(session.handle.wire_id.clone());
     session_update(
         &srv.out_tx,
         &sid,
@@ -357,12 +358,12 @@ fn image_media_type(mime: &str) -> ImageMediaType {
 
 fn start_event_pump(
     event_rx: Receiver<Envelope>,
-    session_id: EntityId,
+    wire_id: String,
     out_tx: Sender<Value>,
     pending: PendingPrompt,
 ) {
     smol::spawn(async move {
-        let sid = SessionId::from(session_id.to_string());
+        let sid = SessionId::from(wire_id);
         let mut next_request_id = FIRST_OUTGOING_REQUEST_ID;
 
         while let Ok(Envelope {

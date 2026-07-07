@@ -20,7 +20,6 @@ use maki_agent::{AgentConfig, AgentEvent, Envelope, ImageSource, PermissionsConf
 use maki_lua::EventHandle;
 use maki_providers::model::Model;
 use maki_providers::{StopReason, TokenUsage};
-use maki_util::EntityId;
 use serde::Serialize;
 use serde_json::Value;
 
@@ -57,7 +56,8 @@ struct PrintResult {
     num_turns: u32,
     result: String,
     stop_reason: Option<StopReason>,
-    session_id: EntityId,
+    #[serde(rename = "session_id")]
+    wire_id: String,
     total_cost_usd: f64,
     usage: TokenUsage,
 }
@@ -68,7 +68,8 @@ struct InitEvent<'a> {
     event_type: &'static str,
     subtype: &'static str,
     cwd: &'a str,
-    session_id: EntityId,
+    #[serde(rename = "session_id")]
+    wire_id: &'a str,
     tools: &'a [String],
     model: &'a str,
 }
@@ -78,7 +79,8 @@ struct AssistantEvent<'a> {
     #[serde(rename = "type")]
     event_type: &'static str,
     message: AssistantMessage<'a>,
-    session_id: EntityId,
+    #[serde(rename = "session_id")]
+    wire_id: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     parent_tool_use_id: Option<&'a str>,
 }
@@ -96,7 +98,8 @@ struct UserEvent<'a> {
     #[serde(rename = "type")]
     event_type: &'static str,
     message: UserMessage<'a>,
-    session_id: EntityId,
+    #[serde(rename = "session_id")]
+    wire_id: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     parent_tool_use_id: Option<&'a str>,
 }
@@ -115,7 +118,8 @@ struct RetryEvent<'a> {
     attempt: u32,
     retry_delay_ms: u64,
     error: &'a str,
-    session_id: EntityId,
+    #[serde(rename = "session_id")]
+    wire_id: &'a str,
 }
 
 enum VerboseOutput {
@@ -187,7 +191,8 @@ pub fn run(
     let HeadlessHandle {
         event_rx,
         tool_names,
-        session_id,
+        session_id: _,
+        wire_id,
         cwd,
         task,
     } = handle;
@@ -204,7 +209,7 @@ pub fn run(
             event_type: "system",
             subtype: "init",
             cwd: &cwd,
-            session_id,
+            wire_id: &wire_id,
             tools: &tool_names,
             model: &model.id,
         })?;
@@ -256,7 +261,7 @@ pub fn run(
                         attempt: *attempt,
                         retry_delay_ms: *delay_ms,
                         error: message,
-                        session_id,
+                        wire_id: &wire_id,
                     })?;
                 }
             }
@@ -271,7 +276,7 @@ pub fn run(
                             content: &content_value,
                             usage: &tc.usage,
                         },
-                        session_id,
+                        wire_id: &wire_id,
                         parent_tool_use_id,
                     })?;
                 }
@@ -285,7 +290,7 @@ pub fn run(
                             role: "user",
                             content: &content_value,
                         },
-                        session_id,
+                        wire_id: &wire_id,
                         parent_tool_use_id,
                     })?;
                 }
@@ -330,7 +335,7 @@ pub fn run(
                 num_turns,
                 result: result_text,
                 stop_reason,
-                session_id,
+                wire_id,
                 total_cost_usd,
                 usage,
             };
@@ -384,7 +389,7 @@ mod tests {
             num_turns: 2,
             result: "done".into(),
             stop_reason: Some(StopReason::EndTurn),
-            session_id: EntityId::generate(),
+            wire_id: maki_util::EntityId::generate().to_string(),
             total_cost_usd: 0.003,
             usage: TokenUsage::default(),
         };
@@ -397,7 +402,7 @@ mod tests {
             event_type: "system",
             subtype: "init",
             cwd: "/tmp",
-            session_id: EntityId::generate(),
+            wire_id: "abc",
             tools: &["bash".into(), "read".into()],
             model: "test-model",
         };
@@ -412,7 +417,7 @@ mod tests {
             attempt: 2,
             retry_delay_ms: 3000,
             error: "rate_limit",
-            session_id: EntityId::generate(),
+            wire_id: "abc",
         };
         let json: Value = serde_json::to_value(&retry).unwrap();
         for field in RETRY_EVENT_FIELDS {

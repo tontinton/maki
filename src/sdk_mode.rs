@@ -25,7 +25,6 @@ use maki_providers::model::Model;
 use maki_providers::{ImageSource, Message, StopReason, Timeouts, TokenUsage};
 use maki_storage::StateDir;
 use maki_storage::sessions::Session;
-use maki_util::EntityId;
 use serde::Serialize;
 use serde_json::Value;
 use tracing::warn;
@@ -102,7 +101,8 @@ impl PermissionMode {
 struct WireMessage {
     #[serde(flatten)]
     inner: WireInner,
-    session_id: EntityId,
+    #[serde(rename = "session_id")]
+    wire_id: String,
     uuid: String,
 }
 
@@ -390,7 +390,7 @@ fn maki_to_claude_tool_name(name: &str) -> &str {
 
 #[derive(Clone)]
 struct SdkWriter {
-    session_id: EntityId,
+    wire_id: String,
     out_tx: Sender<String>,
 }
 
@@ -398,7 +398,7 @@ impl SdkWriter {
     fn emit(&self, inner: WireInner) -> Result<()> {
         let msg = WireMessage {
             inner,
-            session_id: self.session_id,
+            wire_id: self.wire_id.clone(),
             uuid: maki_util::EntityId::generate().to_string(),
         };
         self.out_tx
@@ -487,7 +487,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         system_prompt_override: cli.system_prompt.clone().filter(|s| !s.is_empty()),
         append_system_prompt: cli.append_system_prompt.clone().filter(|s| !s.is_empty()),
         workflow,
-    });
+    })?;
 
     let (out_tx, out_rx) = flume::unbounded::<String>();
     let writer_thread = std::thread::spawn(move || {
@@ -500,7 +500,7 @@ pub fn run(params: SdkParams) -> Result<()> {
     });
 
     let writer = SdkWriter {
-        session_id: handle.session_id,
+        wire_id: handle.wire_id.clone(),
         out_tx,
     };
     let tools: Vec<&str> = handle
@@ -634,7 +634,7 @@ pub fn run(params: SdkParams) -> Result<()> {
 
 type StoredSession = Session<Message, TokenUsage, ToolOutput>;
 
-fn resolve_session(cli: &Cli, cwd: &str) -> Result<(Option<EntityId>, Vec<Message>)> {
+fn resolve_session(cli: &Cli, cwd: &str) -> Result<(Option<String>, Vec<Message>)> {
     let (resumed_id, history) = if let Some(id) = &cli.session {
         let storage = StateDir::resolve().context("resolve state dir")?;
         let parsed: maki_util::EntityId = id
@@ -642,12 +642,12 @@ fn resolve_session(cli: &Cli, cwd: &str) -> Result<(Option<EntityId>, Vec<Messag
             .map_err(|e| eyre!("invalid session id {id}: {e}"))?;
         let session =
             StoredSession::load(parsed, &storage).map_err(|e| eyre!("load session {id}: {e}"))?;
-        let resumed = (!cli.fork_session).then_some(session.id);
+        let resumed = (!cli.fork_session).then_some(id.clone());
         (resumed, session.messages)
     } else if cli.continue_session {
         let storage = StateDir::resolve().context("resolve state dir")?;
         match StoredSession::latest(cwd, &storage) {
-            Ok(Some(session)) => (Some(session.id), session.messages),
+            Ok(Some(session)) => (Some(session.id.to_string()), session.messages),
             _ => (None, Vec::new()),
         }
     } else {
@@ -656,6 +656,7 @@ fn resolve_session(cli: &Cli, cwd: &str) -> Result<(Option<EntityId>, Vec<Messag
 
     let cli_session_id = cli.session_id.as_deref().map(|s| {
         s.parse::<maki_util::EntityId>()
+            .map(|_| s.to_string())
             .map_err(|e| eyre!("invalid session id {s:?}: {e}"))
     });
     let cli_session_id = match cli_session_id {
@@ -1274,7 +1275,7 @@ mod tests {
                 usage: TokenUsage::default(),
                 permission_denials: Vec::new(),
             }),
-            session_id: EntityId::generate(),
+            wire_id: maki_util::EntityId::generate().to_string(),
             uuid: "u".into(),
         };
         let json: Value = serde_json::to_value(&msg).unwrap();
@@ -1296,7 +1297,7 @@ mod tests {
                     "permissionMode": "default",
                 }),
             }),
-            session_id: EntityId::generate(),
+            wire_id: maki_util::EntityId::generate().to_string(),
             uuid: "u".into(),
         };
         let json: Value = serde_json::to_value(&msg).unwrap();
@@ -1316,7 +1317,7 @@ mod tests {
                     error: None,
                 },
             }),
-            session_id: EntityId::generate(),
+            wire_id: maki_util::EntityId::generate().to_string(),
             uuid: "u".into(),
         };
         let json: Value = serde_json::to_value(&msg).unwrap();
@@ -1336,7 +1337,7 @@ mod tests {
                     tool_use_id: Some("tool_123".into()),
                 },
             }),
-            session_id: EntityId::generate(),
+            wire_id: maki_util::EntityId::generate().to_string(),
             uuid: "u".into(),
         };
         let json: Value = serde_json::to_value(&msg).unwrap();

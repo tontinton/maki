@@ -86,6 +86,7 @@ pub struct HeadlessHandle {
     pub event_rx: Receiver<Envelope>,
     pub tool_names: Vec<String>,
     pub session_id: EntityId,
+    pub wire_id: String,
     pub cwd: String,
     pub task: smol::Task<()>,
 }
@@ -255,6 +256,7 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
         event_rx,
         tool_names,
         session_id,
+        wire_id: session_id.to_string(),
         cwd: working_dir,
         task,
     }
@@ -269,7 +271,7 @@ pub struct InteractiveParams {
     pub excluded_tools: Vec<&'static str>,
     pub mcp_handle: Option<McpHandle>,
     pub initial_wd: PathBuf,
-    pub session_id: Option<EntityId>,
+    pub session_id: Option<String>,
     pub initial_history: Vec<Message>,
     pub yolo: bool,
     pub system_prompt_override: Option<String>,
@@ -284,12 +286,17 @@ pub struct InteractiveHandle {
     pub answer_tx: flume::Sender<String>,
     pub cancel_tx: flume::Sender<()>,
     pub model_tx: flume::Sender<Model>,
+    /// Canonical storage id; the parsed form of `wire_id`.
     pub session_id: EntityId,
+    /// Transport form echoed on the wire; the original caller string or base58 when self-generated.
+    pub wire_id: String,
     pub permissions: Arc<PermissionManager>,
     pub task: smol::Task<()>,
 }
 
-pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
+pub fn spawn_interactive(
+    params: InteractiveParams,
+) -> Result<InteractiveHandle, maki_util::EntityIdParseError> {
     let AgentSetup {
         vars,
         instructions,
@@ -310,7 +317,16 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
     let (cancel_tx, cancel_rx) = flume::bounded::<()>(1);
     let (model_tx, model_rx) = flume::unbounded::<Model>();
 
-    let session_id = params.session_id.unwrap_or_else(EntityId::generate);
+    let (session_id, wire_id) = match params.session_id.as_deref() {
+        Some(raw) => {
+            let id = raw.parse::<EntityId>()?;
+            (id, raw.to_string())
+        }
+        None => {
+            let id = EntityId::generate();
+            (id, id.to_string())
+        }
+    };
 
     let working_dir = params.initial_wd.to_string_lossy().into_owned();
     let permissions = Arc::new(PermissionManager::new(
@@ -452,7 +468,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
         }
     });
 
-    InteractiveHandle {
+    Ok(InteractiveHandle {
         event_rx,
         tool_names,
         input_tx,
@@ -460,9 +476,10 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
         cancel_tx,
         model_tx,
         session_id,
+        wire_id,
         permissions,
         task,
-    }
+    })
 }
 
 fn extract_tool_names(tools: &Value) -> Vec<String> {

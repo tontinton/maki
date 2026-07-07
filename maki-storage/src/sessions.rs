@@ -775,24 +775,11 @@ fn session_entries(dir: &Path) -> Result<Vec<PathBuf>, StorageError> {
     Ok(entries)
 }
 
-fn header_id_at(path: &Path) -> Option<EntityId> {
-    if path.extension().is_some_and(|e| e == "jsonl") {
-        let file = File::open(path).ok()?;
-        let mut reader = BufReader::new(&file);
-        let mut line = String::new();
-        reader.read_line(&mut line).ok()?;
-        let header: JsonlHeader = serde_json::from_str(line.trim_end()).ok()?;
-        return Some(header.id);
-    }
-    let data = fs::read(path).ok()?;
-    let header: LegacyHeader = serde_json::from_slice(&data).ok()?;
-    Some(header.id)
-}
-
 fn find_legacy_file(dir: &Path, id: EntityId) -> Option<PathBuf> {
     session_entries(dir).ok()?.into_iter().find(|p| {
-        p.file_stem().and_then(|s| s.to_str()) != Some(id.to_string().as_str())
-            && header_id_at(p) == Some(id)
+        p.file_stem()
+            .and_then(|s| s.to_str())
+            .is_some_and(|s| s.parse::<EntityId>() == Ok(id) && s != id.to_string().as_str())
     })
 }
 
