@@ -6,7 +6,7 @@ use serde_json::Value;
 use strum::{Display, EnumIter, EnumString, IntoEnumIterator};
 use tracing::{debug, warn};
 
-use maki_util::EntityId;
+use maki_util::WireSessionId;
 
 use crate::model::{Model, ModelFamily, ModelInfo, models_for_provider};
 use crate::providers::Timeouts;
@@ -260,7 +260,7 @@ pub trait Provider: Send + Sync {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        session_id: Option<EntityId>,
+        session_id: Option<&'a WireSessionId>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>>;
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>>;
@@ -328,7 +328,7 @@ impl Provider for UnconfiguredProvider {
         _tools: &'a Value,
         _event_tx: &'a Sender<ProviderEvent>,
         _opts: RequestOptions,
-        _session_id: Option<EntityId>,
+        _session_id: Option<&'a WireSessionId>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async {
             Err(AgentError::Config {

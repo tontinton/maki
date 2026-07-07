@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime};
 use flume::Sender;
 use isahc::config::Configurable;
 use isahc::{AsyncReadResponseExt, HttpClient, Request};
-use maki_util::EntityId;
+use maki_util::WireSessionId;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tracing::{debug, warn};
@@ -312,7 +312,7 @@ impl Provider for Opencode {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        _session_id: Option<EntityId>,
+        _session_id: Option<&'a WireSessionId>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let model_for_stream = model.clone();

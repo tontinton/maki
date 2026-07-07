@@ -205,7 +205,7 @@ impl<'t> EventLoop<'t> {
             ui_config.tool_output_lines,
             &permissions,
             cwd,
-            Some(session.id),
+            Some(maki_util::WireSessionId::from(session.id)),
             timeouts,
             lua_event_handle.clone(),
         );

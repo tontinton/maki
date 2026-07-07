@@ -7,7 +7,7 @@ use maki_config::providers::{
     Protocol, ProvidersConfig, builtin_provider, resolve_api_key_env, resolve_base_url,
     resolve_protocol,
 };
-use maki_util::EntityId;
+use maki_util::WireSessionId;
 
 use super::ResolvedAuth;
 use super::openai::responses;
@@ -216,7 +216,7 @@ impl Provider for CustomOpenAiProvider {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        _session_id: Option<EntityId>,
+        _session_id: Option<&'a WireSessionId>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let auth = self.auth.lock().unwrap().clone();

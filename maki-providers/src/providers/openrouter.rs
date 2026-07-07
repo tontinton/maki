@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use flume::Sender;
-use maki_util::EntityId;
+use maki_util::WireSessionId;
 use serde_json::{Value, json};
 
 use crate::model::{Model, ModelEntry};
@@ -68,7 +68,7 @@ impl Provider for OpenRouter {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        session_id: Option<EntityId>,
+        session_id: Option<&'a WireSessionId>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let auth = self.auth.lock().unwrap().clone();

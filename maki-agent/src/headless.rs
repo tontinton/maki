@@ -10,7 +10,7 @@ use maki_providers::model::Model;
 use maki_providers::provider::{self, Provider};
 use maki_storage::StateDir;
 use maki_storage::sessions::Session;
-use maki_util::EntityId;
+use maki_util::{EntityId, WireSessionId};
 use serde_json::Value;
 use tracing::{error, warn};
 
@@ -85,8 +85,7 @@ pub struct HeadlessParams {
 pub struct HeadlessHandle {
     pub event_rx: Receiver<Envelope>,
     pub tool_names: Vec<String>,
-    pub session_id: EntityId,
-    pub wire_id: String,
+    pub session_id: WireSessionId,
     pub cwd: String,
     pub task: smol::Task<()>,
 }
@@ -174,8 +173,9 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
 
     let (raw_tx, event_rx) = flume::unbounded::<Envelope>();
 
-    let session_id = maki_util::EntityId::generate();
-
+    let session_id = EntityId::generate();
+    let wire = WireSessionId::from(session_id);
+    let wire_clone = wire.clone();
     let fast = params.fast;
     let workflow = params.workflow;
     let task = smol::spawn({
@@ -207,7 +207,7 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
                         params.permissions_config,
                         working_dir_path,
                     )),
-                    session_id: Some(session_id),
+                    session_id: Some(wire_clone.clone()),
                     timeouts: params.timeouts,
                     file_tracker: FileReadTracker::fresh(),
                     prompt_slots: Arc::new(params.prompt_slots),
@@ -255,8 +255,7 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
     HeadlessHandle {
         event_rx,
         tool_names,
-        session_id,
-        wire_id: session_id.to_string(),
+        session_id: wire,
         cwd: working_dir,
         task,
     }
@@ -271,7 +270,7 @@ pub struct InteractiveParams {
     pub excluded_tools: Vec<&'static str>,
     pub mcp_handle: Option<McpHandle>,
     pub initial_wd: PathBuf,
-    pub session_id: Option<String>,
+    pub session_id: Option<WireSessionId>,
     pub initial_history: Vec<Message>,
     pub yolo: bool,
     pub system_prompt_override: Option<String>,
@@ -286,17 +285,12 @@ pub struct InteractiveHandle {
     pub answer_tx: flume::Sender<String>,
     pub cancel_tx: flume::Sender<()>,
     pub model_tx: flume::Sender<Model>,
-    /// Canonical storage id; the parsed form of `wire_id`.
-    pub session_id: EntityId,
-    /// Transport form echoed on the wire; the original caller string or base58 when self-generated.
-    pub wire_id: String,
+    pub session_id: WireSessionId,
     pub permissions: Arc<PermissionManager>,
     pub task: smol::Task<()>,
 }
 
-pub fn spawn_interactive(
-    params: InteractiveParams,
-) -> Result<InteractiveHandle, maki_util::EntityIdParseError> {
+pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
     let AgentSetup {
         vars,
         instructions,
@@ -317,14 +311,14 @@ pub fn spawn_interactive(
     let (cancel_tx, cancel_rx) = flume::bounded::<()>(1);
     let (model_tx, model_rx) = flume::unbounded::<Model>();
 
-    let (session_id, wire_id) = match params.session_id.as_deref() {
-        Some(raw) => {
-            let id = raw.parse::<EntityId>()?;
-            (id, raw.to_string())
+    let (session_id, wire) = match params.session_id.clone() {
+        Some(w) => {
+            let id = w.parse().expect("WireSessionId is pre-validated");
+            (id, w)
         }
         None => {
             let id = EntityId::generate();
-            (id, id.to_string())
+            (id, WireSessionId::from(id))
         }
     };
 
@@ -340,6 +334,7 @@ pub fn spawn_interactive(
     let answer_rx = Arc::new(Mutex::new(answer_rx));
     let file_tracker = FileReadTracker::fresh();
 
+    let wire_clone = wire.clone();
     let task = smol::spawn({
         let permissions = Arc::clone(&permissions);
         async move {
@@ -425,7 +420,7 @@ pub fn spawn_interactive(
                         config: params.config.clone(),
                         tool_output_lines: ToolOutputLines::default(),
                         permissions: Arc::clone(&permissions),
-                        session_id: Some(session_id),
+                        session_id: Some(wire_clone.clone()),
                         timeouts: params.timeouts,
                         file_tracker: Arc::clone(&file_tracker),
                         prompt_slots: Arc::clone(&params.prompt_slots),
@@ -468,18 +463,17 @@ pub fn spawn_interactive(
         }
     });
 
-    Ok(InteractiveHandle {
+    InteractiveHandle {
         event_rx,
         tool_names,
         input_tx,
         answer_tx,
         cancel_tx,
         model_tx,
-        session_id,
-        wire_id,
+        session_id: wire,
         permissions,
         task,
-    })
+    }
 }
 
 fn extract_tool_names(tools: &Value) -> Vec<String> {

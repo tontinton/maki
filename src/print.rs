@@ -56,8 +56,7 @@ struct PrintResult {
     num_turns: u32,
     result: String,
     stop_reason: Option<StopReason>,
-    #[serde(rename = "session_id")]
-    wire_id: String,
+    session_id: maki_util::WireSessionId,
     total_cost_usd: f64,
     usage: TokenUsage,
 }
@@ -68,8 +67,7 @@ struct InitEvent<'a> {
     event_type: &'static str,
     subtype: &'static str,
     cwd: &'a str,
-    #[serde(rename = "session_id")]
-    wire_id: &'a str,
+    session_id: &'a maki_util::WireSessionId,
     tools: &'a [String],
     model: &'a str,
 }
@@ -79,8 +77,7 @@ struct AssistantEvent<'a> {
     #[serde(rename = "type")]
     event_type: &'static str,
     message: AssistantMessage<'a>,
-    #[serde(rename = "session_id")]
-    wire_id: &'a str,
+    session_id: &'a maki_util::WireSessionId,
     #[serde(skip_serializing_if = "Option::is_none")]
     parent_tool_use_id: Option<&'a str>,
 }
@@ -98,8 +95,7 @@ struct UserEvent<'a> {
     #[serde(rename = "type")]
     event_type: &'static str,
     message: UserMessage<'a>,
-    #[serde(rename = "session_id")]
-    wire_id: &'a str,
+    session_id: &'a maki_util::WireSessionId,
     #[serde(skip_serializing_if = "Option::is_none")]
     parent_tool_use_id: Option<&'a str>,
 }
@@ -118,8 +114,7 @@ struct RetryEvent<'a> {
     attempt: u32,
     retry_delay_ms: u64,
     error: &'a str,
-    #[serde(rename = "session_id")]
-    wire_id: &'a str,
+    session_id: &'a maki_util::WireSessionId,
 }
 
 enum VerboseOutput {
@@ -191,11 +186,11 @@ pub fn run(
     let HeadlessHandle {
         event_rx,
         tool_names,
-        session_id: _,
-        wire_id,
+        session_id,
         cwd,
         task,
     } = handle;
+    let wire_id = &session_id;
     let start = Instant::now();
 
     let mut verbose_out = match format {
@@ -209,7 +204,7 @@ pub fn run(
             event_type: "system",
             subtype: "init",
             cwd: &cwd,
-            wire_id: &wire_id,
+            session_id: wire_id,
             tools: &tool_names,
             model: &model.id,
         })?;
@@ -261,7 +256,7 @@ pub fn run(
                         attempt: *attempt,
                         retry_delay_ms: *delay_ms,
                         error: message,
-                        wire_id: &wire_id,
+                        session_id: wire_id,
                     })?;
                 }
             }
@@ -276,7 +271,7 @@ pub fn run(
                             content: &content_value,
                             usage: &tc.usage,
                         },
-                        wire_id: &wire_id,
+                        session_id: wire_id,
                         parent_tool_use_id,
                     })?;
                 }
@@ -290,7 +285,7 @@ pub fn run(
                             role: "user",
                             content: &content_value,
                         },
-                        wire_id: &wire_id,
+                        session_id: wire_id,
                         parent_tool_use_id,
                     })?;
                 }
@@ -335,7 +330,7 @@ pub fn run(
                 num_turns,
                 result: result_text,
                 stop_reason,
-                wire_id,
+                session_id: wire_id.clone(),
                 total_cost_usd,
                 usage,
             };
@@ -389,7 +384,7 @@ mod tests {
             num_turns: 2,
             result: "done".into(),
             stop_reason: Some(StopReason::EndTurn),
-            wire_id: maki_util::EntityId::generate().to_string(),
+            session_id: maki_util::WireSessionId::generate(),
             total_cost_usd: 0.003,
             usage: TokenUsage::default(),
         };
@@ -398,11 +393,12 @@ mod tests {
             assert!(json.get(field).is_some(), "PrintResult missing: {field}");
         }
 
+        let sid = maki_util::WireSessionId::generate();
         let init = InitEvent {
             event_type: "system",
             subtype: "init",
             cwd: "/tmp",
-            wire_id: "abc",
+            session_id: &sid,
             tools: &["bash".into(), "read".into()],
             model: "test-model",
         };
@@ -417,7 +413,7 @@ mod tests {
             attempt: 2,
             retry_delay_ms: 3000,
             error: "rate_limit",
-            wire_id: "abc",
+            session_id: &sid,
         };
         let json: Value = serde_json::to_value(&retry).unwrap();
         for field in RETRY_EVENT_FIELDS {

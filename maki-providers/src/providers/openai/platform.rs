@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use flume::Sender;
 use maki_storage::StateDir;
-use maki_util::EntityId;
+use maki_util::WireSessionId;
 use serde_json::Value;
 use tracing::{debug, warn};
 
@@ -174,7 +174,7 @@ impl Provider for OpenAi {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        _session_id: Option<EntityId>,
+        _session_id: Option<&'a WireSessionId>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let mut buf = String::new();

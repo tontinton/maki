@@ -2,6 +2,11 @@
 //!
 //! Wire protocol matches Claude Code's SDK interface so tools like Conductor, Windsurf, and custom
 //! orchestrators work without adaptation.
+//!
+//! Per-message wire ids (`uuid`, assistant `message.id`) use `uuid::Uuid::now_v7()` to emit the
+//! hyphenated-hex UUIDv7 shape that Claude Code SDK consumers expect, rather than maki's base58
+//! `EntityId` canonical form.
+#![allow(clippy::disallowed_methods)]
 
 use std::collections::{HashMap, HashSet};
 use std::io::{self, BufRead, Write};
@@ -101,8 +106,7 @@ impl PermissionMode {
 struct WireMessage {
     #[serde(flatten)]
     inner: WireInner,
-    #[serde(rename = "session_id")]
-    wire_id: String,
+    session_id: maki_util::WireSessionId,
     uuid: String,
 }
 
@@ -337,7 +341,7 @@ impl StreamSynth {
         vec![serde_json::json!({
             "type": "message_start",
             "message": {
-                "id": maki_util::EntityId::generate().to_string(),
+                "id": uuid::Uuid::now_v7().to_string(),
                 "type": "message",
                 "role": "assistant",
                 "content": [],
@@ -390,7 +394,7 @@ fn maki_to_claude_tool_name(name: &str) -> &str {
 
 #[derive(Clone)]
 struct SdkWriter {
-    wire_id: String,
+    session_id: maki_util::WireSessionId,
     out_tx: Sender<String>,
 }
 
@@ -398,8 +402,8 @@ impl SdkWriter {
     fn emit(&self, inner: WireInner) -> Result<()> {
         let msg = WireMessage {
             inner,
-            wire_id: self.wire_id.clone(),
-            uuid: maki_util::EntityId::generate().to_string(),
+            session_id: self.session_id.clone(),
+            uuid: uuid::Uuid::now_v7().to_string(),
         };
         self.out_tx
             .send(serde_json::to_string(&msg)?)
@@ -487,7 +491,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         system_prompt_override: cli.system_prompt.clone().filter(|s| !s.is_empty()),
         append_system_prompt: cli.append_system_prompt.clone().filter(|s| !s.is_empty()),
         workflow,
-    })?;
+    });
 
     let (out_tx, out_rx) = flume::unbounded::<String>();
     let writer_thread = std::thread::spawn(move || {
@@ -500,7 +504,7 @@ pub fn run(params: SdkParams) -> Result<()> {
     });
 
     let writer = SdkWriter {
-        wire_id: handle.wire_id.clone(),
+        session_id: handle.session_id.clone(),
         out_tx,
     };
     let tools: Vec<&str> = handle
@@ -634,7 +638,10 @@ pub fn run(params: SdkParams) -> Result<()> {
 
 type StoredSession = Session<Message, TokenUsage, ToolOutput>;
 
-fn resolve_session(cli: &Cli, cwd: &str) -> Result<(Option<String>, Vec<Message>)> {
+fn resolve_session(
+    cli: &Cli,
+    cwd: &str,
+) -> Result<(Option<maki_util::WireSessionId>, Vec<Message>)> {
     let (resumed_id, history) = if let Some(id) = &cli.session {
         let storage = StateDir::resolve().context("resolve state dir")?;
         let parsed: maki_util::EntityId = id
@@ -642,12 +649,20 @@ fn resolve_session(cli: &Cli, cwd: &str) -> Result<(Option<String>, Vec<Message>
             .map_err(|e| eyre!("invalid session id {id}: {e}"))?;
         let session =
             StoredSession::load(parsed, &storage).map_err(|e| eyre!("load session {id}: {e}"))?;
-        let resumed = (!cli.fork_session).then_some(id.clone());
+        let resumed = (!cli.fork_session)
+            .then(|| {
+                id.parse()
+                    .map_err(|e| eyre!("invalid session id {id:?}: {e}"))
+            })
+            .transpose()?;
         (resumed, session.messages)
     } else if cli.continue_session {
         let storage = StateDir::resolve().context("resolve state dir")?;
         match StoredSession::latest(cwd, &storage) {
-            Ok(Some(session)) => (Some(session.id.to_string()), session.messages),
+            Ok(Some(session)) => (
+                Some(maki_util::WireSessionId::from(session.id)),
+                session.messages,
+            ),
             _ => (None, Vec::new()),
         }
     } else {
@@ -655,8 +670,7 @@ fn resolve_session(cli: &Cli, cwd: &str) -> Result<(Option<String>, Vec<Message>
     };
 
     let cli_session_id = cli.session_id.as_deref().map(|s| {
-        s.parse::<maki_util::EntityId>()
-            .map(|_| s.to_string())
+        s.parse::<maki_util::WireSessionId>()
             .map_err(|e| eyre!("invalid session id {s:?}: {e}"))
     });
     let cli_session_id = match cli_session_id {
@@ -954,7 +968,7 @@ impl EventPump {
                 }
                 self.writer.emit(WireInner::Assistant(AssistantPayload {
                     message: AssistantMessage {
-                        id: maki_util::EntityId::generate().to_string(),
+                        id: uuid::Uuid::now_v7().to_string(),
                         model: tc.model.clone(),
                         role: "assistant",
                         content: map_tool_names_in_content(&content_value),
@@ -1275,7 +1289,7 @@ mod tests {
                 usage: TokenUsage::default(),
                 permission_denials: Vec::new(),
             }),
-            wire_id: maki_util::EntityId::generate().to_string(),
+            session_id: maki_util::WireSessionId::generate(),
             uuid: "u".into(),
         };
         let json: Value = serde_json::to_value(&msg).unwrap();
@@ -1297,7 +1311,7 @@ mod tests {
                     "permissionMode": "default",
                 }),
             }),
-            wire_id: maki_util::EntityId::generate().to_string(),
+            session_id: maki_util::WireSessionId::generate(),
             uuid: "u".into(),
         };
         let json: Value = serde_json::to_value(&msg).unwrap();
@@ -1317,7 +1331,7 @@ mod tests {
                     error: None,
                 },
             }),
-            wire_id: maki_util::EntityId::generate().to_string(),
+            session_id: maki_util::WireSessionId::generate(),
             uuid: "u".into(),
         };
         let json: Value = serde_json::to_value(&msg).unwrap();
@@ -1337,7 +1351,7 @@ mod tests {
                     tool_use_id: Some("tool_123".into()),
                 },
             }),
-            wire_id: maki_util::EntityId::generate().to_string(),
+            session_id: maki_util::WireSessionId::generate(),
             uuid: "u".into(),
         };
         let json: Value = serde_json::to_value(&msg).unwrap();

@@ -29,6 +29,7 @@ pub enum EntityIdParseError {
 pub struct EntityId([u8; UUID_BYTES]);
 
 impl EntityId {
+    #[allow(clippy::disallowed_methods)]
     pub fn generate() -> Self {
         Self(Uuid::now_v7().into_bytes())
     }
@@ -86,6 +87,62 @@ impl<'de> Deserialize<'de> for EntityId {
     }
 }
 
+/// A session id in its exchangeable string form.
+///
+/// Opaque above the storage boundary; parsed to [`EntityId`] only at storage
+/// ops via [`parse`](Self::parse). Preserves the caller's exact string verbatim
+/// (legacy hex ids resume unchanged) so wire echo and client correlation hold.
+/// Canonical when self-generated via [`from_entity`](Self::from_entity) (base58).
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
+pub struct WireSessionId(String);
+
+impl WireSessionId {
+    pub fn from_entity(id: EntityId) -> Self {
+        Self(id.to_string())
+    }
+
+    pub fn generate() -> Self {
+        Self::from_entity(EntityId::generate())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn parse(&self) -> Result<EntityId, EntityIdParseError> {
+        self.0.parse()
+    }
+}
+
+impl From<EntityId> for WireSessionId {
+    fn from(id: EntityId) -> Self {
+        Self::from_entity(id)
+    }
+}
+
+impl fmt::Display for WireSessionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl FromStr for WireSessionId {
+    type Err = EntityIdParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        s.parse::<EntityId>()?;
+        Ok(Self(s.to_string()))
+    }
+}
+
+impl<'de> Deserialize<'de> for WireSessionId {
+    fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(de)?;
+        s.parse().map_err(serde::de::Error::custom)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,5 +190,21 @@ mod tests {
         assert!((23..=24).contains(&s.len()));
         let back: EntityId = serde_json::from_str(&s).unwrap();
         assert_eq!(back, id);
+    }
+
+    #[test_case(SAMPLE_HEX)]
+    #[test_case("019650874c717f008000000000000000")]
+    fn wire_preserves_caller_string(s: &str) {
+        let wire: WireSessionId = s.parse().unwrap();
+        assert_eq!(wire.as_str(), s);
+        assert_eq!(wire.parse().unwrap(), parse(s));
+    }
+
+    #[test]
+    fn wire_from_entity_is_canonical_base58() {
+        let id = EntityId::generate();
+        let wire = WireSessionId::from(id);
+        assert_eq!(wire.as_str(), id.to_string());
+        assert_eq!(wire.parse().unwrap(), id);
     }
 }

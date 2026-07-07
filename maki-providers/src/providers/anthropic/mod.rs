@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use flume::Sender;
 use futures_lite::io::{AsyncBufReadExt, BufReader};
 use isahc::{AsyncReadResponseExt, HttpClient, Request};
-use maki_util::EntityId;
+use maki_util::WireSessionId;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::debug;
@@ -357,7 +357,7 @@ impl Provider for Anthropic {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        _session_id: Option<EntityId>,
+        _session_id: Option<&'a WireSessionId>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let system_blocks = if let Some(prefix) = &self.system_prefix {
