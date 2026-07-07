@@ -153,6 +153,8 @@ pub struct ModelEntry {
     pub prefixes: &'static [&'static str],
     pub tier: ModelTier,
     pub family: ModelFamily,
+    /// Gates vision-only tools (`view_image`) and image blocks at request time.
+    pub vision: bool,
     pub default: bool,
     pub pricing: ModelPricing,
     pub max_output_tokens: u32,
@@ -197,6 +199,12 @@ impl ModelFamily {
             ModelFamily::Generic | ModelFamily::Gemini | ModelFamily::Glm => false,
         }
     }
+
+    /// Fallback for models missing from the static tables; per-model truth
+    /// lives in `ModelEntry::vision`.
+    pub fn supports_vision(self) -> bool {
+        matches!(self, Self::Claude | Self::Gpt | Self::Gemini)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -208,6 +216,8 @@ pub struct Model {
     pub family: ModelFamily,
     pub supports_tool_examples_override: Option<bool>,
     pub supports_thinking_override: Option<bool>,
+    /// Resolved once at construction so every consumer reads the same answer.
+    pub vision: bool,
     pub pricing: ModelPricing,
     pub max_output_tokens: u32,
     pub context_window: u32,
@@ -226,12 +236,13 @@ impl Model {
             .read()
             .unwrap()
             .tier_for(&spec, provider, static_entry.map(|e| e.tier));
-        let (family, pricing, max_output_tokens, context_window) = match static_entry {
+        let (family, pricing, max_output_tokens, context_window, vision) = match static_entry {
             Some(e) => (
                 e.family,
                 e.pricing.clone(),
                 e.max_output_tokens,
                 anthropic::shared::long_context_window(model_id).unwrap_or(e.context_window),
+                e.vision,
             ),
             None => {
                 let guard = crate::model_registry::model_registry().read().unwrap();
@@ -247,6 +258,7 @@ impl Model {
                     discovered
                         .and_then(|d| d.context_window)
                         .unwrap_or_else(|| provider.fallback_context_window()),
+                    provider.family().supports_vision(),
                 )
             }
         };
@@ -258,6 +270,7 @@ impl Model {
             family,
             supports_tool_examples_override: None,
             supports_thinking_override: None,
+            vision,
             pricing,
             max_output_tokens,
             context_window,
@@ -661,6 +674,20 @@ mod tests {
             (p.input, p.output, p.cache_write, p.cache_read),
             (0.0, 0.0, 0.0, 0.0)
         );
+    }
+
+    #[test_case("anthropic/claude-opus-4-8",       true  ; "claude")]
+    #[test_case("openai/gpt-5.4",                   true  ; "gpt")]
+    #[test_case("google/gemini-2.5-pro",            true  ; "gemini")]
+    #[test_case("copilot/claude-opus-4.7",          true  ; "copilot_entry_beats_generic_family")]
+    #[test_case("zai/glm-5-code",                   false ; "glm_code_text_only")]
+    #[test_case("deepseek/deepseek-v4-pro",         false ; "deepseek_text_only")]
+    #[test_case("mistral/mistral-medium-latest",    true  ; "mistral_medium")]
+    #[test_case("mistral/ministral-14b-latest",     false ; "ministral_text_only")]
+    #[test_case("anthropic/claude-nonexistent-99",  true  ; "unknown_model_uses_family_fallback")]
+    #[test_case("deepseek/my-custom-model",         false ; "unknown_generic_defaults_off")]
+    fn vision_resolved_from_entry_or_family(spec: &str, expected: bool) {
+        assert_eq!(Model::from_spec(spec).unwrap().vision, expected);
     }
 
     #[test_case("claude-opus-4-6" ; "opus_4_6")]

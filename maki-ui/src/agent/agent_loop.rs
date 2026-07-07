@@ -272,7 +272,7 @@ impl AgentLoop {
 
     fn build_tools(&self, model: &Model, workflow: bool) -> Value {
         let examples = model.supports_tool_examples();
-        let filter = ToolFilter::from_config(&self.config, &[]);
+        let filter = ToolFilter::from_config(&self.config, model, &[]);
         let ctx = DescriptionContext {
             filter: &filter,
             audience: ToolAudience::MAIN,

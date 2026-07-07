@@ -147,13 +147,10 @@ async fn tools(lua: Lua, (ctx, opts): (mlua::UserDataRef<LuaCtx>, Table)) -> Lua
     let workflow: bool = opts.get::<Option<bool>>("workflow")?.unwrap_or(false);
     let spec_str: Option<String> = opts.get("spec")?;
 
-    let supports_examples = if let Some(ref spec) = spec_str {
-        Model::from_spec(spec)
-            .map(|m| m.supports_tool_examples())
-            .unwrap_or(false)
-    } else {
-        ctx.agent.model.supports_tool_examples()
-    };
+    let parsed = spec_str
+        .as_deref()
+        .and_then(|spec| Model::from_spec(spec).ok());
+    let model = parsed.as_ref().unwrap_or(&ctx.agent.model);
 
     let base = match (only, except) {
         (Some(o), _) => ToolFilter::Only(o),
@@ -167,7 +164,9 @@ async fn tools(lua: Lua, (ctx, opts): (mlua::UserDataRef<LuaCtx>, Table)) -> Lua
         .iter()
         .map(String::as_str)
         .collect();
-    let filter = base.excluding(&disabled);
+    let filter = base
+        .excluding(&disabled)
+        .excluding(maki_agent::tools::capability_exclusions(model));
 
     let vars = maki_agent::template::env_vars();
     let ctx_desc = DescriptionContext {
@@ -175,7 +174,8 @@ async fn tools(lua: Lua, (ctx, opts): (mlua::UserDataRef<LuaCtx>, Table)) -> Lua
         audience,
         workflow,
     };
-    let mut defs = ToolRegistry::native().definitions(&vars, &ctx_desc, supports_examples);
+    let mut defs =
+        ToolRegistry::native().definitions(&vars, &ctx_desc, model.supports_tool_examples());
 
     if include_mcp && let Some(ref mcp) = ctx.agent.mcp {
         mcp.extend_tools(&mut defs);

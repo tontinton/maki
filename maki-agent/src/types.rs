@@ -242,6 +242,12 @@ pub enum ToolOutput {
     Instructions {
         blocks: Vec<InstructionBlock>,
     },
+    Image {
+        source: maki_providers::ImageSource,
+        /// Caption for the tool_result block, e.g. "[image: slack.jpeg 222KB]";
+        /// the pixels ride separately as a `ContentBlock::Image`.
+        text: String,
+    },
 }
 
 /// Saturating arithmetic so callers can't overflow with any combination of inputs.
@@ -394,7 +400,7 @@ impl ToolOutput {
                 }
                 out
             }
-            Self::Batch { text, .. } => text.clone(),
+            Self::Batch { text, .. } | Self::Image { text, .. } => text.clone(),
             Self::Instructions { blocks } => {
                 let mut out = String::new();
                 append_instructions(&mut out, blocks);
@@ -456,17 +462,39 @@ impl ToolDoneEvent {
     }
 }
 
+fn collect_images(output: &ToolOutput, images: &mut Vec<ContentBlock>) {
+    match output {
+        ToolOutput::Image { source, .. } => images.push(ContentBlock::Image {
+            source: source.clone(),
+        }),
+        ToolOutput::Batch { entries, .. } => {
+            for entry in entries {
+                if let Some(output) = &entry.output {
+                    collect_images(output, images);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 pub fn tool_results(results: Vec<ToolDoneEvent>) -> Message {
+    let mut content = Vec::with_capacity(results.len());
+    let mut images = Vec::new();
+    for r in results {
+        content.push(ContentBlock::ToolResult {
+            tool_use_id: r.id,
+            content: r.output.as_text(),
+            is_error: r.is_error,
+        });
+        collect_images(&r.output, &mut images);
+    }
+    // Anthropic wants every tool_result before other content in the user
+    // message, so images go after all results.
+    content.extend(images);
     Message {
         role: Role::User,
-        content: results
-            .into_iter()
-            .map(|r| ContentBlock::ToolResult {
-                tool_use_id: r.id,
-                content: r.output.as_text(),
-                is_error: r.is_error,
-            })
-            .collect(),
+        content,
         ..Default::default()
     }
 }
@@ -925,6 +953,59 @@ mod tests {
         );
         assert!(
             matches!(&msg.content[1], ContentBlock::ToolResult { tool_use_id, is_error, .. } if tool_use_id == "t2" && *is_error)
+        );
+    }
+
+    #[test]
+    fn tool_results_appends_images_after_all_results_including_batch() {
+        let image = |data: &str| ToolOutput::Image {
+            source: maki_providers::ImageSource::new(
+                maki_providers::ImageMediaType::Png,
+                Arc::from(data),
+            ),
+            text: "[image: pic.png 1KB]".into(),
+        };
+        let batch_output = ToolOutput::Batch {
+            entries: vec![BatchToolEntry {
+                tool: "view_image".into(),
+                summary: String::new(),
+                status: BatchToolStatus::Success,
+                input: None,
+                raw_input: None,
+                output: Some(image("aW1n")),
+                annotation: None,
+            }],
+            text: "batch output".into(),
+        };
+        let done = |id: &str, output: ToolOutput| ToolDoneEvent {
+            id: id.into(),
+            tool: Arc::from("t"),
+            output,
+            is_error: false,
+            annotation: None,
+            written_path: None,
+        };
+
+        let msg = tool_results(vec![
+            done("t1", image("aGVsbG8=")),
+            done("t2", batch_output),
+            done("t3", ToolOutput::Plain("ok".into())),
+        ]);
+        assert_eq!(msg.content.len(), 5);
+        assert!(
+            matches!(&msg.content[0], ContentBlock::ToolResult { tool_use_id, content, .. } if tool_use_id == "t1" && content == "[image: pic.png 1KB]")
+        );
+        assert!(
+            matches!(&msg.content[1], ContentBlock::ToolResult { tool_use_id, content, .. } if tool_use_id == "t2" && content == "batch output")
+        );
+        assert!(
+            matches!(&msg.content[2], ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "t3")
+        );
+        assert!(
+            matches!(&msg.content[3], ContentBlock::Image { source } if &*source.data == "aGVsbG8=")
+        );
+        assert!(
+            matches!(&msg.content[4], ContentBlock::Image { source } if &*source.data == "aW1n")
         );
     }
 

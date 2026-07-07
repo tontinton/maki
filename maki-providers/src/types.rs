@@ -13,17 +13,47 @@ use strum::{Display, IntoStaticStr};
 use tracing::warn;
 
 use crate::TokenUsage;
+use crate::model::Model;
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageMediaType {
-    #[serde(rename = "image/png")]
     Png,
-    #[serde(rename = "image/jpeg")]
     Jpeg,
-    #[serde(rename = "image/gif")]
     Gif,
-    #[serde(rename = "image/webp")]
     Webp,
+}
+
+impl ImageMediaType {
+    pub const ALL: [Self; 4] = [Self::Png, Self::Jpeg, Self::Gif, Self::Webp];
+
+    /// Single source of truth for media-type strings: serde, data URLs,
+    /// wire formats, and the Lua bridge all go through here.
+    pub const fn mime(self) -> &'static str {
+        match self {
+            Self::Png => "image/png",
+            Self::Jpeg => "image/jpeg",
+            Self::Gif => "image/gif",
+            Self::Webp => "image/webp",
+        }
+    }
+
+    pub fn from_mime(mime: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|m| m.mime() == mime)
+    }
+}
+
+impl Serialize for ImageMediaType {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.mime())
+    }
+}
+
+impl<'de> Deserialize<'de> for ImageMediaType {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        Self::from_mime(&s)
+            .ok_or_else(|| serde::de::Error::custom(format!("unknown image media type '{s}'")))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -49,14 +79,40 @@ impl ImageSource {
     }
 
     pub fn to_data_url(&self) -> String {
-        let mime = match self.media_type {
-            ImageMediaType::Png => "image/png",
-            ImageMediaType::Jpeg => "image/jpeg",
-            ImageMediaType::Gif => "image/gif",
-            ImageMediaType::Webp => "image/webp",
-        };
-        format!("data:{mime};base64,{}", self.data)
+        format!("data:{};base64,{}", self.media_type.mime(), self.data)
     }
+}
+
+pub const IMAGE_OMITTED_NOTE: &str =
+    "[image omitted: the current model does not support image input]";
+
+/// For models without vision, image blocks become a text note instead of a
+/// wire block the API would reject. History keeps the pixels, so switching
+/// back to a vision-capable model restores them.
+pub fn adapt_images_for_model<'a>(model: &Model, messages: &'a [Message]) -> Cow<'a, [Message]> {
+    let has_image = |m: &Message| {
+        m.content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::Image { .. }))
+    };
+    if model.vision || !messages.iter().any(has_image) {
+        return Cow::Borrowed(messages);
+    }
+    let adapted = messages
+        .iter()
+        .map(|m| {
+            let mut m = m.clone();
+            for block in &mut m.content {
+                if matches!(block, ContentBlock::Image { .. }) {
+                    *block = ContentBlock::Text {
+                        text: IMAGE_OMITTED_NOTE.into(),
+                    };
+                }
+            }
+            m
+        })
+        .collect();
+    Cow::Owned(adapted)
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -508,6 +564,66 @@ mod tests {
         assert_eq!(source.to_data_url(), format!("data:{mime};base64,dGVzdA=="));
     }
 
+    #[test_case("image/png",  Some(ImageMediaType::Png)  ; "png")]
+    #[test_case("image/webp", Some(ImageMediaType::Webp) ; "webp")]
+    #[test_case("image/bmp",  None                       ; "unsupported")]
+    fn media_type_from_mime(mime: &str, expected: Option<ImageMediaType>) {
+        assert_eq!(ImageMediaType::from_mime(mime), expected);
+    }
+
+    #[test]
+    fn adapt_images_borrows_when_model_has_vision_or_no_images() {
+        let model = clamp_test_model(crate::provider::ProviderKind::Anthropic);
+        let with_image = vec![Message {
+            role: Role::User,
+            content: vec![ContentBlock::Image {
+                source: ImageSource::new(ImageMediaType::Png, Arc::from("abc123")),
+            }],
+            ..Default::default()
+        }];
+        assert!(matches!(
+            adapt_images_for_model(&model, &with_image),
+            Cow::Borrowed(_)
+        ));
+
+        let mut text_only_model = model;
+        text_only_model.vision = false;
+        let no_images = vec![Message::user("hi".into())];
+        assert!(matches!(
+            adapt_images_for_model(&text_only_model, &no_images),
+            Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn adapt_images_replaces_blocks_for_text_only_model() {
+        let mut model = clamp_test_model(crate::provider::ProviderKind::Anthropic);
+        model.vision = false;
+        let messages = vec![Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::ToolResult {
+                    tool_use_id: "t1".into(),
+                    content: "[image: pic.png 1KB]".into(),
+                    is_error: false,
+                },
+                ContentBlock::Image {
+                    source: ImageSource::new(ImageMediaType::Png, Arc::from("abc123")),
+                },
+            ],
+            ..Default::default()
+        }];
+        let adapted = adapt_images_for_model(&model, &messages);
+        assert_eq!(adapted[0].content.len(), 2);
+        assert!(matches!(
+            &adapted[0].content[0],
+            ContentBlock::ToolResult { .. }
+        ));
+        assert!(
+            matches!(&adapted[0].content[1], ContentBlock::Text { text } if text == IMAGE_OMITTED_NOTE)
+        );
+    }
+
     #[test]
     fn image_source_serde_injects_type_base64() {
         let source = ImageSource::new(ImageMediaType::Png, Arc::from("abc123"));
@@ -589,6 +705,7 @@ mod tests {
             family: provider.family(),
             supports_tool_examples_override: None,
             supports_thinking_override: None,
+            vision: provider.family().supports_vision(),
             pricing: crate::model::ModelPricing::default(),
             max_output_tokens: 8192,
             context_window: 200_000,

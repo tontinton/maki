@@ -130,7 +130,7 @@ fn tool_definitions(
     workflow: bool,
     registry: &ToolRegistry,
 ) -> Value {
-    let filter = ToolFilter::from_config(config, excluded_tools);
+    let filter = ToolFilter::from_config(config, model, excluded_tools);
     let ctx = DescriptionContext {
         filter: &filter,
         audience: ToolAudience::MAIN,

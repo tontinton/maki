@@ -7,7 +7,7 @@ group = "Reference"
 
 # Tools
 
-Maki ships with 18 built-in tools. This is the full reference.
+Maki ships with 19 built-in tools. This is the full reference.
 
 ## File Operations
 
@@ -103,6 +103,14 @@ Return a compact overview of a source file: imports, type definitions, function 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `path` | string | yes | Absolute path to the file |
+
+### `view_image` *(lua plugin)*
+
+View an image file (png, jpeg, gif, webp) so you can actually see it; it is returned as vision input alongside the tool result. Use instead of `read` for images.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `path` | string | yes | Path to the image file |
 
 ## Execution & Control
 

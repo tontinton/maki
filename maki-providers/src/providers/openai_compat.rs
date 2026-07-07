@@ -277,6 +277,9 @@ pub fn convert_messages(messages: &[Message], system: &str) -> Vec<Value> {
                     }
                 }
 
+                // Tool messages must directly follow the assistant's
+                // tool_calls, before any user content.
+                out.extend(tool_results);
                 if !image_parts.is_empty() {
                     let mut parts = image_parts;
                     if !text_parts.is_empty() {
@@ -286,7 +289,6 @@ pub fn convert_messages(messages: &[Message], system: &str) -> Vec<Value> {
                 } else if !text_parts.is_empty() {
                     out.push(json!({"role": "user", "content": text_parts.join("\n")}));
                 }
-                out.extend(tool_results);
             }
             Role::Assistant => {
                 let mut text = String::new();
@@ -937,6 +939,31 @@ data: [DONE]\n";
         );
         assert_eq!(content[1]["type"], "text");
         assert_eq!(content[1]["text"], "describe");
+    }
+
+    #[test]
+    fn convert_messages_tool_results_precede_tool_returned_image() {
+        use crate::types::{ImageMediaType, ImageSource};
+        use std::sync::Arc;
+        let msgs = vec![Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::ToolResult {
+                    tool_use_id: "t1".into(),
+                    content: "[image: pic.png 1KB]".into(),
+                    is_error: false,
+                },
+                ContentBlock::Image {
+                    source: ImageSource::new(ImageMediaType::Png, Arc::from("abc123")),
+                },
+            ],
+            ..Default::default()
+        }];
+        let result = convert_messages(&msgs, "system");
+        assert_eq!(result[1]["role"], "tool");
+        assert_eq!(result[1]["tool_call_id"], "t1");
+        assert_eq!(result[2]["role"], "user");
+        assert_eq!(result[2]["content"][0]["type"], "image_url");
     }
 
     #[test]

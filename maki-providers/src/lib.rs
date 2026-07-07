@@ -16,6 +16,7 @@ pub use providers::copilot::auth as copilot_auth;
 pub use providers::dynamic;
 pub use providers::openai::auth as openai_auth;
 pub use types::{
-    ContentBlock, EffortScale, ImageMediaType, ImageSource, Message, ProviderEvent, ProviderUsage,
-    RequestOptions, Role, StopReason, StreamResponse, ThinkingConfig, UsageLimit,
+    ContentBlock, EffortScale, IMAGE_OMITTED_NOTE, ImageMediaType, ImageSource, Message,
+    ProviderEvent, ProviderUsage, RequestOptions, Role, StopReason, StreamResponse, ThinkingConfig,
+    UsageLimit, adapt_images_for_model,
 };

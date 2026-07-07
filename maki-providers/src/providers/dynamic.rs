@@ -61,12 +61,34 @@ struct ScriptModel {
     supports_tool_examples: Option<bool>,
     #[serde(default)]
     supports_thinking: Option<bool>,
+    #[serde(default)]
+    supports_vision: Option<bool>,
     #[serde(default = "default_max_output_tokens")]
     max_output_tokens: u32,
     #[serde(default = "default_context_window")]
     context_window: u32,
     #[serde(default)]
     pricing: Option<ModelPricing>,
+}
+
+impl ScriptModel {
+    fn to_model(&self, slug: &str, base: ProviderKind, id: String, tier: ModelTier) -> Model {
+        Model {
+            id,
+            provider: base,
+            dynamic_slug: Some(slug.to_string()),
+            tier,
+            family: base.family(),
+            supports_tool_examples_override: self.supports_tool_examples,
+            supports_thinking_override: self.supports_thinking,
+            vision: self
+                .supports_vision
+                .unwrap_or_else(|| base.family().supports_vision()),
+            pricing: self.pricing.clone().unwrap_or_default(),
+            max_output_tokens: self.max_output_tokens,
+            context_window: self.context_window,
+        }
+    }
 }
 
 fn default_tier() -> ModelTier {
@@ -448,35 +470,13 @@ pub fn lookup_model(slug: &str, model_id: &str) -> Option<Model> {
         .iter()
         .filter(|m| model_id.starts_with(&m.id))
         .max_by_key(|m| m.id.len())?;
-    Some(Model {
-        id: model_id.to_string(),
-        provider: meta.base,
-        dynamic_slug: Some(slug.to_string()),
-        tier: script_model.tier,
-        family: meta.base.family(),
-        supports_tool_examples_override: script_model.supports_tool_examples,
-        supports_thinking_override: script_model.supports_thinking,
-        pricing: script_model.pricing.clone().unwrap_or_default(),
-        max_output_tokens: script_model.max_output_tokens,
-        context_window: script_model.context_window,
-    })
+    Some(script_model.to_model(slug, meta.base, model_id.to_string(), script_model.tier))
 }
 
 pub fn find_model_for_tier(slug: &str, tier: ModelTier) -> Option<Model> {
     let meta = find_meta(slug)?;
     let script_model = meta.models.iter().find(|m| m.tier == tier)?;
-    Some(Model {
-        id: script_model.id.clone(),
-        provider: meta.base,
-        dynamic_slug: Some(slug.to_string()),
-        tier,
-        family: meta.base.family(),
-        supports_tool_examples_override: script_model.supports_tool_examples,
-        supports_thinking_override: script_model.supports_thinking,
-        pricing: script_model.pricing.clone().unwrap_or_default(),
-        max_output_tokens: script_model.max_output_tokens,
-        context_window: script_model.context_window,
-    })
+    Some(script_model.to_model(slug, meta.base, script_model.id.clone(), tier))
 }
 
 struct DynamicProvider {

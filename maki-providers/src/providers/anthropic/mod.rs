@@ -776,6 +776,44 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
     }
 
     #[test]
+    fn tool_result_with_trailing_image_serializes_valid_wire_blocks() {
+        let messages = vec![Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::ToolResult {
+                    tool_use_id: "t1".into(),
+                    content: "[image: pic.png 1KB]".into(),
+                    is_error: false,
+                },
+                ContentBlock::Image {
+                    source: crate::ImageSource::new(
+                        crate::ImageMediaType::Png,
+                        std::sync::Arc::from("aGVsbG8="),
+                    ),
+                },
+            ],
+            ..Default::default()
+        }];
+        let wire = build_wire_messages(&messages);
+        let json: Value = serde_json::to_value(&wire).unwrap();
+
+        assert_eq!(json[0]["content"][0]["type"], "tool_result");
+        assert_eq!(json[0]["content"][0]["tool_use_id"], "t1");
+        assert_eq!(
+            json[0]["content"][1],
+            json!({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": "aGVsbG8=",
+                },
+                "cache_control": {"type": "ephemeral"},
+            })
+        );
+    }
+
+    #[test]
     fn apply_fast_mode_sets_speed_on_capable_model() {
         let model = Model::from_spec("anthropic/claude-opus-4-8").unwrap();
         let mut body = json!({});

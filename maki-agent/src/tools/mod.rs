@@ -88,7 +88,7 @@ impl ToolFilter {
         }
     }
 
-    pub fn from_config(config: &AgentConfig, extra_exclude: &[&str]) -> Self {
+    pub fn from_config(config: &AgentConfig, model: &Model, extra_exclude: &[&str]) -> Self {
         let base = if config.allowed_tools.is_empty() {
             Self::All
         } else {
@@ -102,8 +102,19 @@ impl ToolFilter {
             )
         };
         let mut exclude: Vec<&str> = extra_exclude.to_vec();
+        exclude.extend(capability_exclusions(model));
         exclude.extend(config.disabled_tools.iter().map(|s| s.as_str()));
         base.excluding(&exclude)
+    }
+}
+
+/// One gate for every definitions builder (main loop, headless, Lua): a model
+/// without vision never learns `view_image` exists.
+pub fn capability_exclusions(model: &Model) -> &'static [&'static str] {
+    if model.vision {
+        &[]
+    } else {
+        &[VIEW_IMAGE_TOOL_NAME]
     }
 }
 
@@ -124,6 +135,7 @@ pub const QUESTION_TOOL_NAME: &str = "question";
 pub const READ_TOOL_NAME: &str = "read";
 pub const TASK_TOOL_NAME: &str = "task";
 pub const TODOWRITE_TOOL_NAME: &str = "todo_write";
+pub const VIEW_IMAGE_TOOL_NAME: &str = "view_image";
 pub const WRITE_TOOL_NAME: &str = "write";
 
 pub(crate) const PLAN_WRITE_RESTRICTED: &str = "write restricted to plan file in plan mode";
@@ -709,6 +721,19 @@ mod tests {
 
     const LINE_LIMIT: usize = 500;
     const PARSE_INTERNAL_BUG: &str = "internal validator bug";
+
+    #[test_case(true  ; "vision_model_keeps_view_image")]
+    #[test_case(false ; "text_only_model_loses_view_image")]
+    fn from_config_gates_view_image_on_vision(vision: bool) {
+        let mut model = Model::from_spec("anthropic/claude-opus-4-8").unwrap();
+        model.vision = vision;
+        let filter = ToolFilter::from_config(&AgentConfig::default(), &model, &[]);
+        assert_eq!(filter.matches(VIEW_IMAGE_TOOL_NAME), vision);
+        assert!(
+            filter.matches(READ_TOOL_NAME),
+            "unrelated tools stay enabled"
+        );
+    }
 
     #[test_case(30,  "30s timeout"   ; "seconds_only")]
     #[test_case(120, "2m timeout"    ; "minutes_only")]

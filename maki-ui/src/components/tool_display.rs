@@ -109,6 +109,12 @@ pub(crate) fn tool_output_annotation(output: &ToolOutput) -> Option<String> {
             let n = text.text.lines().count();
             Some(format!("{n} lines"))
         }
+        ToolOutput::Image { text, .. } => Some(
+            text.strip_prefix("[image: ")
+                .and_then(|t| t.strip_suffix(']'))
+                .unwrap_or(text)
+                .to_string(),
+        ),
         _ => None,
     }
 }
@@ -265,7 +271,8 @@ impl HighlightRequest {
             | ToolOutput::Markdown(_)
             | ToolOutput::ReadDir(_)
             | ToolOutput::TodoList(_)
-            | ToolOutput::Batch { .. } => None,
+            | ToolOutput::Batch { .. }
+            | ToolOutput::Image { .. } => None,
         });
         if input.is_none() && output.is_none() {
             return None;

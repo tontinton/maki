@@ -107,12 +107,24 @@ fn sanitize_restored(messages: &mut Vec<Message>) {
             Vec::new()
         };
 
+        let (mut had_results, mut kept_results) = (false, false);
         messages[i].content.retain(|b| match b {
             ContentBlock::ToolResult { tool_use_id, .. } => {
-                valid_ids.iter().any(|id| id == tool_use_id)
+                had_results = true;
+                let keep = valid_ids.iter().any(|id| id == tool_use_id);
+                kept_results |= keep;
+                keep
             }
             _ => true,
         });
+        // A tool-returned image whose results were all orphaned would float
+        // with no context, so it goes too. Chat-pasted images live in
+        // messages without tool results and stay untouched.
+        if had_results && !kept_results {
+            messages[i]
+                .content
+                .retain(|b| !matches!(b, ContentBlock::Image { .. }));
+        }
 
         if messages[i].content.is_empty() {
             messages.remove(i);
@@ -410,6 +422,55 @@ mod tests {
     fn sanitize_restored_cases(messages: Vec<Message>, expected_len: usize) {
         let history = History::restored(messages);
         assert_eq!(history.len(), expected_len);
+    }
+
+    #[test]
+    fn sanitize_restored_drops_image_when_all_results_orphaned() {
+        let image_block = ContentBlock::Image {
+            source: maki_providers::ImageSource::new(
+                maki_providers::ImageMediaType::Png,
+                std::sync::Arc::from("aGVsbG8="),
+            ),
+        };
+        let mut orphaned = make_tool_result_msg(&["orphan"]);
+        orphaned.content.push(image_block.clone());
+        let history = History::restored(vec![Message::user("go".into()), orphaned]);
+        assert_eq!(history.len(), 1);
+
+        // Chat-pasted image (no tool results) is untouched.
+        let history = History::restored(vec![Message {
+            role: Role::User,
+            content: vec![image_block],
+            ..Default::default()
+        }]);
+        assert_eq!(history.len(), 1);
+        assert!(matches!(
+            history.as_slice()[0].content[0],
+            ContentBlock::Image { .. }
+        ));
+    }
+
+    #[test]
+    fn sanitize_restored_keeps_image_when_any_result_survives() {
+        let mut msg = make_tool_result_msg(&["t1", "orphan"]);
+        msg.content.push(ContentBlock::Image {
+            source: maki_providers::ImageSource::new(
+                maki_providers::ImageMediaType::Png,
+                std::sync::Arc::from("aGVsbG8="),
+            ),
+        });
+        let history = History::restored(vec![
+            Message::user("go".into()),
+            make_tool_use_msg(&["t1"]),
+            msg,
+        ]);
+        let content = &history.as_slice()[2].content;
+        assert_eq!(content.len(), 2);
+        assert!(matches!(
+            &content[0],
+            ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "t1"
+        ));
+        assert!(matches!(content[1], ContentBlock::Image { .. }));
     }
 
     #[test]

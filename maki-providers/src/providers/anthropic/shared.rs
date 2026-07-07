@@ -383,6 +383,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             prefixes: &["claude-haiku-4-5"],
             tier: ModelTier::Weak,
             family: ModelFamily::Claude,
+            vision: true,
             default: true,
             pricing: ModelPricing {
                 input: 1.00,
@@ -398,6 +399,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             prefixes: &["claude-sonnet-4-5"],
             tier: ModelTier::Medium,
             family: ModelFamily::Claude,
+            vision: true,
             default: false,
             pricing: ModelPricing {
                 input: 3.00,
@@ -413,6 +415,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             prefixes: &["claude-sonnet-4-6"],
             tier: ModelTier::Medium,
             family: ModelFamily::Claude,
+            vision: true,
             default: true,
             pricing: ModelPricing {
                 input: 3.00,
@@ -428,6 +431,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             prefixes: &["claude-sonnet-4"],
             tier: ModelTier::Medium,
             family: ModelFamily::Claude,
+            vision: true,
             default: false,
             pricing: ModelPricing {
                 input: 3.00,
@@ -443,6 +447,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             prefixes: &["claude-opus-4-5"],
             tier: ModelTier::Strong,
             family: ModelFamily::Claude,
+            vision: true,
             default: false,
             pricing: ModelPricing {
                 input: 5.00,
@@ -458,6 +463,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             prefixes: &["claude-opus-4-6"],
             tier: ModelTier::Strong,
             family: ModelFamily::Claude,
+            vision: true,
             default: false,
             pricing: ModelPricing {
                 input: 5.00,
@@ -476,6 +482,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             prefixes: &["claude-opus-4-7"],
             tier: ModelTier::Strong,
             family: ModelFamily::Claude,
+            vision: true,
             default: false,
             pricing: ModelPricing {
                 input: 5.00,
@@ -494,6 +501,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             prefixes: &["claude-opus-4-8"],
             tier: ModelTier::Strong,
             family: ModelFamily::Claude,
+            vision: true,
             default: true,
             pricing: ModelPricing {
                 input: 5.00,
@@ -512,6 +520,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             prefixes: &["claude-fable-5"],
             tier: ModelTier::Strong,
             family: ModelFamily::Claude,
+            vision: true,
             default: false,
             pricing: ModelPricing {
                 input: 10.00,
@@ -527,6 +536,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             prefixes: &["claude-opus-4-0", "claude-opus-4-1"],
             tier: ModelTier::Strong,
             family: ModelFamily::Claude,
+            vision: true,
             default: false,
             pricing: ModelPricing {
                 input: 15.00,

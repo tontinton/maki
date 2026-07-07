@@ -87,6 +87,10 @@ static BUNDLED_PLUGINS: &[BundledPlugin] = &[
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/code_execution"),
     },
     BundledPlugin {
+        name: "view_image",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/view_image"),
+    },
+    BundledPlugin {
         name: "lib",
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/lib"),
     },

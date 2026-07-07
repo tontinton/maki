@@ -10,6 +10,8 @@ rust-version.workspace = true
 [dependencies]
 arc-swap = { workspace = true }
 async-lock = { workspace = true }
+base64 = { workspace = true }
+image = { workspace = true, features = ["jpeg", "gif", "webp"] }
 crossterm = { workspace = true }
 maki-agent = { workspace = true }
 maki-config = { workspace = true }
@@ -64,6 +66,8 @@ tree-sitter-zig = { workspace = true }
 libc = { workspace = true }
 
 [dev-dependencies]
+base64 = { workspace = true }
+image = { workspace = true }
 maki-agent = { workspace = true }
 tempfile = { workspace = true }
 test-case = { workspace = true }

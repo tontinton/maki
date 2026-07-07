@@ -40,6 +40,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             prefixes: &["deepseek-v4-flash"],
             tier: ModelTier::Medium,
             family: ModelFamily::Generic,
+            vision: false,
             default: true,
             pricing: ModelPricing {
                 input: 0.14,
@@ -55,6 +56,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             prefixes: &["deepseek-v4-pro"],
             tier: ModelTier::Strong,
             family: ModelFamily::Generic,
+            vision: false,
             default: true,
             pricing: ModelPricing {
                 input: 0.435,

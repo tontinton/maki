@@ -36,6 +36,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             prefixes: &["hf:moonshotai/Kimi-K2.5"],
             tier: ModelTier::Strong,
             family: ModelFamily::Synthetic,
+            vision: false,
             default: true,
             pricing: ModelPricing {
                 input: 0.45,
@@ -51,6 +52,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             prefixes: &["hf:deepseek-ai/DeepSeek-V3.2"],
             tier: ModelTier::Medium,
             family: ModelFamily::Synthetic,
+            vision: false,
             default: true,
             pricing: ModelPricing {
                 input: 0.56,
@@ -66,6 +68,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             prefixes: &["hf:zai-org/GLM-4.7-Flash"],
             tier: ModelTier::Weak,
             family: ModelFamily::Synthetic,
+            vision: false,
             default: true,
             pricing: ModelPricing {
                 input: 0.10,

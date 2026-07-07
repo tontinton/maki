@@ -28,6 +28,26 @@ fn exec_tool_in(
     input: serde_json::Value,
     registry_override: Option<Arc<ToolRegistry>>,
 ) -> Result<String, String> {
+    exec_output_in(reg, name, input, registry_override).map(|out| match out {
+        maki_agent::ToolOutput::Plain(s) => s.text,
+        other => panic!("unexpected output: {other:?}"),
+    })
+}
+
+fn exec_tool_output(
+    reg: &ToolRegistry,
+    name: &str,
+    input: serde_json::Value,
+) -> Result<maki_agent::ToolOutput, String> {
+    exec_output_in(reg, name, input, None)
+}
+
+fn exec_output_in(
+    reg: &ToolRegistry,
+    name: &str,
+    input: serde_json::Value,
+    registry_override: Option<Arc<ToolRegistry>>,
+) -> Result<maki_agent::ToolOutput, String> {
     let entry = reg
         .get(name)
         .unwrap_or_else(|| panic!("tool {name} not registered"));
@@ -36,12 +56,7 @@ fn exec_tool_in(
     if let Some(r) = registry_override {
         ctx.registry = r;
     }
-    smol::block_on(async { inv.execute(&ctx).await })
-        .output
-        .map(|out| match out {
-            maki_agent::ToolOutput::Plain(s) => s.text,
-            other => panic!("unexpected output: {other:?}"),
-        })
+    smol::block_on(async { inv.execute(&ctx).await }).output
 }
 
 const ECHO_PLUGIN: &str = r#"
@@ -1960,4 +1975,211 @@ fn session_opts_validation_rejects(opts: &str, expected: &str) {
     host.load_source("session_opts_plugin", &src).unwrap();
     let err = exec_tool(&reg, "session_opts_probe", serde_json::json!({})).unwrap_err();
     assert!(err.contains(expected), "got: {err}");
+}
+
+fn load_img_tool(host: &PluginHost) {
+    let src = format!(
+        r#"maki.api.register_tool({{
+            name = "img_probe",
+            description = "test",
+            schema = {MINIMAL_SCHEMA},
+            audiences = {{ "main" }},
+            handler = function(input, ctx)
+                return {{
+                    llm_output = "[image: test 1x1]",
+                    image = {{ media_type = "image/png", data = "aGVsbG8=" }},
+                }}
+            end
+        }})"#
+    );
+    host.load_source("img_plugin", &src).unwrap();
+}
+
+#[test]
+fn lua_tool_image_reply_maps_to_image_output() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    load_img_tool(&host);
+    let out = exec_tool_output(&reg, "img_probe", serde_json::json!({})).unwrap();
+    let maki_agent::ToolOutput::Image { source, text } = out else {
+        panic!("expected Image output, got {out:?}");
+    };
+    assert_eq!(source.media_type, maki_agent::ImageMediaType::Png);
+    assert_eq!(&*source.data, "aGVsbG8=");
+    assert_eq!(text, "[image: test 1x1]");
+}
+
+#[test]
+fn view_image_tool_returns_image_output() {
+    use base64::Engine as _;
+
+    let (reg, _host) = builtins_host();
+
+    // The code_execution bridge flattens output to text, so view_image is
+    // pointless from the interpreter.
+    let audience = reg.get("view_image").unwrap().tool.audience();
+    assert!(audience.contains(maki_agent::tools::ToolAudience::MAIN));
+    assert!(!audience.contains(maki_agent::tools::ToolAudience::INTERPRETER));
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tiny.png");
+    let img = image::DynamicImage::new_rgb8(4, 2);
+    img.save_with_format(&path, image::ImageFormat::Png)
+        .unwrap();
+
+    let out = exec_tool_output(
+        &reg,
+        "view_image",
+        serde_json::json!({"path": path.to_str().unwrap()}),
+    )
+    .unwrap();
+    let maki_agent::ToolOutput::Image { source, text } = out else {
+        panic!("expected Image output, got {out:?}");
+    };
+    assert_eq!(source.media_type, maki_agent::ImageMediaType::Png);
+    assert!(text.contains("tiny.png"), "caption: {text}");
+    assert!(text.contains("4x2"), "caption: {text}");
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(&*source.data)
+        .unwrap();
+    assert_eq!(decoded, std::fs::read(&path).unwrap());
+}
+
+#[test]
+fn view_image_tool_rejects_non_image() {
+    let (reg, _host) = builtins_host();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("notes.txt");
+    std::fs::write(&path, "plain text").unwrap();
+    let err = exec_tool_output(
+        &reg,
+        "view_image",
+        serde_json::json!({"path": path.to_str().unwrap()}),
+    )
+    .unwrap_err();
+    assert!(err.contains("not an image"), "got: {err}");
+}
+
+fn probe_output(data: &str) -> (image::ImageFormat, u32, u32) {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .unwrap();
+    let reader = image::ImageReader::new(std::io::Cursor::new(&bytes))
+        .with_guessed_format()
+        .unwrap();
+    let format = reader.format().unwrap();
+    let (w, h) = reader.into_dimensions().unwrap();
+    (format, w, h)
+}
+
+#[test]
+fn view_image_downscales_oversized_png_with_honest_caption() {
+    let (reg, _host) = builtins_host();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("wide.png");
+    image::DynamicImage::new_rgb8(2000, 100)
+        .save_with_format(&path, image::ImageFormat::Png)
+        .unwrap();
+
+    let out = exec_tool_output(
+        &reg,
+        "view_image",
+        serde_json::json!({"path": path.to_str().unwrap()}),
+    )
+    .unwrap();
+    let maki_agent::ToolOutput::Image { source, text } = out else {
+        panic!("expected Image output, got {out:?}");
+    };
+    assert_eq!(source.media_type, maki_agent::ImageMediaType::Png);
+    assert!(text.contains("downscaled from 2000x100"), "caption: {text}");
+
+    let (format, w, h) = probe_output(&source.data);
+    assert_eq!(format, image::ImageFormat::Png);
+    assert_eq!(w, 1568, "long edge must land exactly on the API limit");
+    assert!(h <= 79, "aspect ratio broken: {w}x{h}");
+    // Caption must report the dimensions actually shipped, not the original.
+    assert!(text.contains(&format!("{w}x{h}")), "caption: {text}");
+}
+
+#[test]
+fn view_image_oversized_gif_reencodes_to_png_first_frame() {
+    let (reg, _host) = builtins_host();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("banner.gif");
+    image::DynamicImage::new_rgb8(2000, 8)
+        .save_with_format(&path, image::ImageFormat::Gif)
+        .unwrap();
+
+    let out = exec_tool_output(
+        &reg,
+        "view_image",
+        serde_json::json!({"path": path.to_str().unwrap()}),
+    )
+    .unwrap();
+    let maki_agent::ToolOutput::Image { source, text } = out else {
+        panic!("expected Image output, got {out:?}");
+    };
+    // gif encoding is unsupported, so downscaling forces png; the caption
+    // must confess the downscale and the lost animation.
+    assert_eq!(source.media_type, maki_agent::ImageMediaType::Png);
+    assert!(text.contains("downscaled from 2000x8"), "caption: {text}");
+    assert!(text.contains("first frame only"), "caption: {text}");
+    assert_eq!(probe_output(&source.data).0, image::ImageFormat::Png);
+}
+
+#[test]
+fn view_image_small_gif_passes_through_unchanged() {
+    use base64::Engine as _;
+
+    let (reg, _host) = builtins_host();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tiny.gif");
+    image::DynamicImage::new_rgb8(4, 2)
+        .save_with_format(&path, image::ImageFormat::Gif)
+        .unwrap();
+
+    let out = exec_tool_output(
+        &reg,
+        "view_image",
+        serde_json::json!({"path": path.to_str().unwrap()}),
+    )
+    .unwrap();
+    let maki_agent::ToolOutput::Image { source, text } = out else {
+        panic!("expected Image output, got {out:?}");
+    };
+    assert_eq!(source.media_type, maki_agent::ImageMediaType::Gif);
+    assert!(
+        !text.contains("first frame only"),
+        "pass-through keeps animation, caption must not claim otherwise: {text}"
+    );
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(&*source.data)
+        .unwrap();
+    assert_eq!(
+        decoded,
+        std::fs::read(&path).unwrap(),
+        "under-limit gif must ship byte-identical, not re-encoded"
+    );
+}
+
+#[test]
+fn interpreter_bridge_flattens_image_with_visibility_note() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    load_img_tool(&host);
+
+    let mut ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
+    ctx.registry = Arc::clone(&reg);
+    let out = smol::block_on(maki_agent::tools::interpreter_bridge::dispatch(
+        &ctx,
+        "img_probe",
+        &serde_json::json!({}),
+    ))
+    .unwrap();
+    assert!(out.starts_with("[image: test 1x1]"), "got: {out}");
+    assert!(
+        out.contains(maki_agent::tools::interpreter_bridge::IMAGE_NOT_VISIBLE_NOTE),
+        "got: {out}"
+    );
 }

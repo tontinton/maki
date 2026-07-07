@@ -24,6 +24,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             prefixes: &["gpt-5.4-nano"],
             tier: ModelTier::Weak,
             family: ModelFamily::Gpt,
+            vision: true,
             default: true,
             pricing: ModelPricing {
                 input: 0.20,
@@ -39,6 +40,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             prefixes: &["gpt-5.4-mini"],
             tier: ModelTier::Weak,
             family: ModelFamily::Gpt,
+            vision: true,
             default: false,
             pricing: ModelPricing {
                 input: 0.75,
@@ -54,6 +56,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             prefixes: &["gpt-4.1-nano"],
             tier: ModelTier::Weak,
             family: ModelFamily::Gpt,
+            vision: true,
             default: false,
             pricing: ModelPricing {
                 input: 0.10,
@@ -69,6 +72,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             prefixes: &["gpt-4.1-mini"],
             tier: ModelTier::Medium,
             family: ModelFamily::Gpt,
+            vision: true,
             default: false,
             pricing: ModelPricing {
                 input: 0.40,
@@ -84,6 +88,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             prefixes: &["gpt-4.1"],
             tier: ModelTier::Medium,
             family: ModelFamily::Gpt,
+            vision: true,
             default: true,
             pricing: ModelPricing {
                 input: 2.00,
@@ -99,6 +104,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             prefixes: &["o4-mini"],
             tier: ModelTier::Medium,
             family: ModelFamily::Gpt,
+            vision: true,
             default: false,
             pricing: ModelPricing {
                 input: 1.10,
@@ -114,6 +120,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             prefixes: &["gpt-5.5"],
             tier: ModelTier::Strong,
             family: ModelFamily::Gpt,
+            vision: true,
             default: true,
             pricing: ModelPricing {
                 input: 5.00,
@@ -129,6 +136,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             prefixes: &["gpt-5.4"],
             tier: ModelTier::Strong,
             family: ModelFamily::Gpt,
+            vision: true,
             default: false,
             pricing: ModelPricing {
                 input: 2.50,
@@ -144,6 +152,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             prefixes: &["o3"],
             tier: ModelTier::Strong,
             family: ModelFamily::Gpt,
+            vision: true,
             default: false,
             pricing: ModelPricing {
                 input: 2.00,
@@ -159,6 +168,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             prefixes: &["gpt-5.3-codex"],
             tier: ModelTier::Strong,
             family: ModelFamily::Gpt,
+            vision: true,
             default: false,
             pricing: ModelPricing {
                 input: 1.75,
@@ -174,6 +184,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             prefixes: &["gpt-5.2-codex"],
             tier: ModelTier::Strong,
             family: ModelFamily::Gpt,
+            vision: true,
             default: false,
             pricing: ModelPricing {
                 input: 1.75,
@@ -189,6 +200,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             prefixes: &["gpt-5.1-codex-mini"],
             tier: ModelTier::Medium,
             family: ModelFamily::Gpt,
+            vision: true,
             default: false,
             pricing: ModelPricing {
                 input: 0.25,
@@ -204,6 +216,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             prefixes: &["gpt-5.1-codex-max"],
             tier: ModelTier::Strong,
             family: ModelFamily::Gpt,
+            vision: true,
             default: false,
             pricing: ModelPricing {
                 input: 1.25,
@@ -219,6 +232,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             prefixes: &["gpt-5.1-codex"],
             tier: ModelTier::Strong,
             family: ModelFamily::Gpt,
+            vision: true,
             default: false,
             pricing: ModelPricing {
                 input: 1.25,

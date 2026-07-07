@@ -114,6 +114,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             prefixes: &["glm-5-code"],
             tier: ModelTier::Strong,
             family: ModelFamily::Glm,
+            vision: false,
             default: true,
             pricing: ModelPricing {
                 input: 1.20,
@@ -129,6 +130,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             prefixes: &["glm-5.2"],
             tier: ModelTier::Strong,
             family: ModelFamily::Glm,
+            vision: false,
             default: false,
             pricing: ModelPricing {
                 input: 1.00,
@@ -144,6 +146,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             prefixes: &["glm-5.1", "glm-5"],
             tier: ModelTier::Strong,
             family: ModelFamily::Glm,
+            vision: false,
             default: false,
             pricing: ModelPricing {
                 input: 1.00,
@@ -159,6 +162,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             prefixes: &["glm-4.7-flash"],
             tier: ModelTier::Weak,
             family: ModelFamily::Glm,
+            vision: false,
             default: true,
             pricing: ModelPricing {
                 input: 0.00,
@@ -174,6 +178,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             prefixes: &["glm-4.7", "glm-4.6"],
             tier: ModelTier::Medium,
             family: ModelFamily::Glm,
+            vision: false,
             default: true,
             pricing: ModelPricing {
                 input: 0.60,
@@ -189,6 +194,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             prefixes: &["glm-4.5-flash"],
             tier: ModelTier::Weak,
             family: ModelFamily::Glm,
+            vision: false,
             default: false,
             pricing: ModelPricing {
                 input: 0.00,
@@ -204,6 +210,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             prefixes: &["glm-4.5-air"],
             tier: ModelTier::Weak,
             family: ModelFamily::Glm,
+            vision: false,
             default: false,
             pricing: ModelPricing {
                 input: 0.20,
@@ -219,6 +226,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             prefixes: &["glm-4.5"],
             tier: ModelTier::Medium,
             family: ModelFamily::Glm,
+            vision: false,
             default: false,
             pricing: ModelPricing {
                 input: 0.60,
