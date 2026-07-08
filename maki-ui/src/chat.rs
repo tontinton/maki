@@ -10,7 +10,7 @@ use crate::components::render_hints::RenderHintsRegistry;
 use crate::components::tool_display::{
     append_annotation, output_limits_from_hints, tool_output_annotation,
 };
-use crate::components::{DisplayMessage, DisplayRole, ToolRole, ToolStatus};
+use crate::components::{DisplayMessage, DisplayRole, ToolOutputHandle, ToolRole, ToolStatus};
 use crate::markdown::truncate_output;
 
 use crate::selection::Selection;
@@ -78,6 +78,14 @@ impl Chat {
     ) {
         self.messages_panel
             .set_restore_channel(event_handle, event_tx);
+    }
+
+    pub(crate) fn set_renders(&mut self, renders: crate::components::Renders) {
+        self.messages_panel.set_renders(renders);
+    }
+
+    pub(crate) fn queue_restore_items(&mut self, items: Vec<maki_lua::RestoreItem>) {
+        self.messages_panel.queue_restore_items(items);
     }
 
     pub fn handle_event(&mut self, event: AgentEvent, plan_path: Option<&Path>) -> ChatEventResult {
@@ -398,11 +406,11 @@ pub fn history_to_display(
                                 })
                                 .unwrap_or((ToolStatus::Success, None));
                             let stored = tool_outputs.get(id).cloned();
-                            let (text, truncated_lines, tool_output, mut annotation) =
+                            let (text, truncated_lines, _reconstructed, mut annotation) =
                                 build_loaded_tool(
                                     static_name,
                                     &summary,
-                                    stored,
+                                    stored.clone(),
                                     result_text,
                                     tool_output_lines,
                                     &registry,
@@ -427,6 +435,12 @@ pub fn history_to_display(
                                 theme_gen: None,
                                 expanded: false,
                             });
+                            // §11: a restored tool holds a Deferred handle, not
+                            // the resolved render — the render is decoded from
+                            // the shared store only when its segment is built.
+                            let tool_output = stored
+                                .is_some()
+                                .then(|| ToolOutputHandle::Deferred(id.clone()));
                             display.push(DisplayMessage {
                                 role: DisplayRole::Tool(Box::new(ToolRole {
                                     id: id.clone(),
@@ -468,7 +482,7 @@ pub(crate) fn restore_item_for(
         return None;
     };
     let input = msg.tool_raw_input.as_deref()?;
-    let output = msg.tool_output.as_ref().map(|o| o.as_text())?;
+    let output = msg.output_ref()?.as_text();
     Some(maki_lua::RestoreItem {
         tool: role.name.clone(),
         tool_use_id: role.id.clone(),
@@ -590,10 +604,12 @@ fn build_tool_results_map(messages: &[Message]) -> HashMap<&str, (bool, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::components::Renders;
     use maki_agent::{
         AgentEvent, BatchToolEntry, BatchToolStatus, ToolDoneEvent, ToolOutput, ToolStartEvent,
     };
     use maki_config::UiConfig;
+    use std::sync::Mutex;
     use test_case::test_case;
 
     fn tool_start(id: &str, tool: &str) -> AgentEvent {
@@ -854,9 +870,11 @@ mod tests {
             let discriminant = std::mem::discriminant(&output);
             let msgs = tool_use_pair(tool_name, input_json, "ok", false);
             let outputs = HashMap::from([("t1".into(), output)]);
-            let display = history_to_display(&msgs, &outputs, &ToolOutputLines::default()).0;
+            let renders = Renders::from_memo(Arc::new(Mutex::new(outputs.clone())));
+            let mut display = history_to_display(&msgs, &outputs, &ToolOutputLines::default()).0;
+            display[0].resolve_tool_output(&renders);
             assert_eq!(
-                std::mem::discriminant(display[0].tool_output.as_deref().unwrap()),
+                std::mem::discriminant(display[0].output_ref().unwrap()),
                 discriminant,
                 "stored {tool_name} output should pass through"
             );
@@ -926,8 +944,10 @@ mod tests {
         };
         let msgs = tool_use_pair("batch", serde_json::json!({"tool_calls": []}), "", false);
         let outputs = HashMap::from([("t1".into(), batch_output)]);
-        let display = history_to_display(&msgs, &outputs, &ToolOutputLines::default()).0;
-        let ToolOutput::Batch { entries, .. } = display[0].tool_output.as_deref().unwrap() else {
+        let renders = Renders::from_memo(Arc::new(Mutex::new(outputs.clone())));
+        let mut display = history_to_display(&msgs, &outputs, &ToolOutputLines::default()).0;
+        display[0].resolve_tool_output(&renders);
+        let ToolOutput::Batch { entries, .. } = display[0].output_ref().unwrap() else {
             panic!("expected Batch output");
         };
         assert_eq!(entries.len(), 2);
@@ -981,7 +1001,9 @@ mod tests {
             name: tool.into(),
         }));
         msg.tool_raw_input = Some(Arc::new(serde_json::json!({ "q": tool })));
-        msg.tool_output = Some(Arc::new(ToolOutput::Plain(RESTORE_OUTPUT.into())));
+        msg.tool_output = Some(ToolOutputHandle::Ready(Arc::new(ToolOutput::Plain(
+            RESTORE_OUTPUT.into(),
+        ))));
         msg
     }
 

@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+bs58 = { workspace = true }
+fs4 = { workspace = true }
 getrandom = { workspace = true }
 isahc = { workspace = true }
 serde = { workspace = true }
@@ -13,6 +15,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 etcetera = { workspace = true }
 uuid = { workspace = true }
+zstd = { workspace = true }
 
 [dev-dependencies]
 test-case = { workspace = true }

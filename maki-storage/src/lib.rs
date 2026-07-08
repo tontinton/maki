@@ -5,11 +5,15 @@
 pub mod auth;
 pub mod input_history;
 pub mod log;
+pub mod migration;
 pub mod model;
 pub mod paths;
 pub mod plans;
+pub mod renders;
+pub mod session_log;
 pub mod sessions;
 pub mod theme;
+pub mod tree;
 pub mod version;
 
 use std::fs;
@@ -77,7 +81,10 @@ pub fn atomic_write(path: &Path, data: &[u8]) -> Result<(), StorageError> {
     retry_rename(&tmp_path, path).map_err(|e| {
         let _ = fs::remove_file(&tmp_path);
         StorageError::Io(e)
-    })
+    })?;
+    #[cfg(unix)]
+    fsync_dir(parent)?;
+    Ok(())
 }
 
 pub(crate) fn atomic_write_permissions(
@@ -137,4 +144,13 @@ pub fn now_epoch() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+/// fsync a directory (parent-dir fsync after file-introducing renames, §12).
+/// Windows has no directory fsync; the `retry_rename` path stands alone there.
+#[cfg(unix)]
+pub fn fsync_dir(path: &Path) -> Result<(), StorageError> {
+    let f = fs::File::open(path)?;
+    f.sync_all()?;
+    Ok(())
 }

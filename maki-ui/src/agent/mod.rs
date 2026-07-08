@@ -18,6 +18,8 @@ use maki_agent::{
 };
 use maki_lua::EventHandle;
 
+use crate::components::Renders;
+
 use self::cancel_map::new_run_cancel_map;
 use maki_providers::provider::Provider;
 use maki_providers::{Message, Model};
@@ -98,12 +100,14 @@ impl AgentHandles {
         app.shared_history = Some(Arc::clone(&self.history));
         app.btw_system = Some(Arc::clone(&self.btw_system));
         app.shared_tool_outputs = Some(Arc::clone(&self.tool_outputs));
+        app.renders = Renders::from_memo(Arc::clone(&self.tool_outputs));
         app.queue.set_shared(self.queue.clone());
         let restore_tx =
             maki_agent::EventSender::new(self.agent_tx.clone(), crate::app::RESTORE_RUN_ID);
         app.restore_event_tx = Some(restore_tx.clone());
         for chat in &mut app.chats {
             chat.set_restore_channel(app.lua_event_handle.clone(), Some(restore_tx.clone()));
+            chat.set_renders(app.renders.clone());
         }
     }
 

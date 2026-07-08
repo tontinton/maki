@@ -115,19 +115,7 @@ pub fn adapt_images_for_model<'a>(model: &Model, messages: &'a [Message]) -> Cow
     Cow::Owned(adapted)
 }
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Role {
-    #[default]
-    User,
-    Assistant,
-}
-
-impl Role {
-    fn is_user(&self) -> bool {
-        matches!(self, Self::User)
-    }
-}
+pub use maki_storage::tree::Role;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]

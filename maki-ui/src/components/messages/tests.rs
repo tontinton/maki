@@ -8,6 +8,7 @@ use maki_agent::{
     ToolInput, ToolOutput,
 };
 use ratatui::backend::TestBackend;
+use std::sync::Mutex;
 use test_case::test_case;
 
 fn snap_line(text: &str) -> SnapshotLine {
@@ -592,8 +593,7 @@ fn batch_done(panel: &mut MessagesPanel, entries: Vec<BatchToolEntry>) {
 }
 
 fn batch_entries(panel: &MessagesPanel) -> &[BatchToolEntry] {
-    let ToolOutput::Batch { entries, .. } = panel.messages[0].tool_output.as_deref().unwrap()
-    else {
+    let ToolOutput::Batch { entries, .. } = panel.messages[0].output_ref().unwrap() else {
         panic!("expected Batch");
     };
     entries
@@ -1551,4 +1551,126 @@ fn header_snapshot_for_batch_child_stamps_gen() {
     panel.tool_header_snapshot("b1__0", rendered_snapshot(), Some(7));
 
     assert_eq!(panel.snapshot_gen_of("b1__0"), Some(7), "{HEADER_GEN_MSG}");
+}
+
+// ---------------------------------------------------------------------
+// §11 viewport-bounded restore
+// ---------------------------------------------------------------------
+
+const VIEWPORT_TOOL_MSGS: usize = 60;
+
+/// §11: a panel whose history is all deferred tool renders, each resolvable
+/// through `Renders`. None are `Ready` until their segment is built.
+fn resume_panel_with_deferred_tools(n: usize) -> (MessagesPanel, Vec<String>) {
+    let mut memo: HashMap<String, ToolOutput> = HashMap::new();
+    let mut msgs = Vec::with_capacity(n);
+    let mut ids = Vec::with_capacity(n);
+    for i in 0..n {
+        let id = format!("tool_{i}");
+        ids.push(id.clone());
+        memo.insert(id.clone(), ToolOutput::Plain(format!("output {i}").into()));
+        let role = DisplayRole::Tool(Box::new(ToolRole {
+            id: id.clone(),
+            status: ToolStatus::Success,
+            name: "bash".into(),
+        }));
+        let mut msg = DisplayMessage::new(role, format!("cmd {i}"));
+        msg.tool_output = Some(ToolOutputHandle::Deferred(id.clone()));
+        msgs.push(msg);
+    }
+    let renders = Renders::from_memo(Arc::new(Mutex::new(memo)));
+    let mut panel = MessagesPanel::new(UiConfig::default());
+    panel.set_renders(renders);
+    panel.load_messages(msgs);
+    (panel, ids)
+}
+
+fn ready_tool_count(panel: &MessagesPanel) -> usize {
+    panel
+        .messages
+        .iter()
+        .filter(|m| {
+            matches!(&m.role, DisplayRole::Tool(_))
+                && matches!(m.tool_output, Some(ToolOutputHandle::Ready(_)))
+        })
+        .count()
+}
+
+const DECODE_BOUNDED_MSG: &str =
+    "resume must only resolve renders for the in-viewport tools, not the whole history";
+
+#[test]
+fn resume_resolves_only_in_viewport_renders() {
+    let (mut panel, _ids) = resume_panel_with_deferred_tools(VIEWPORT_TOOL_MSGS);
+    render(&mut panel, 80, 10);
+
+    let ready = ready_tool_count(&panel);
+    assert!(ready < VIEWPORT_TOOL_MSGS, "{DECODE_BOUNDED_MSG}");
+    // One viewport page of margin each side: window ≈ 3·viewport_height rows.
+    // Each tool stub is a few rows, so the resolved set is bounded by a small
+    // multiple of the viewport, nowhere near the full history.
+    assert!(
+        ready <= 2 * 10 + 5,
+        "resolved renders must be bounded by viewport+margin, got {ready}"
+    );
+}
+
+const FIRST_FRAME_NEWEST_ONLY_MSG: &str =
+    "first frame after resume must build only newest-viewport segments";
+
+#[test]
+fn first_frame_builds_only_newest_viewport_segments() {
+    let (mut panel, _ids) = resume_panel_with_deferred_tools(VIEWPORT_TOOL_MSGS);
+    render(&mut panel, 80, 10);
+
+    let built = panel.built_segment_count();
+    assert!(built < VIEWPORT_TOOL_MSGS, "{FIRST_FRAME_NEWEST_ONLY_MSG}");
+    assert!(
+        built <= 2 * 10 + 5,
+        "built segment count must be viewport-bounded, got {built}"
+    );
+    // The newest tool (last message) is at the auto-scrolled bottom, so its
+    // render must be resolved on the first frame.
+    assert!(matches!(
+        panel.messages[VIEWPORT_TOOL_MSGS - 1].tool_output,
+        Some(ToolOutputHandle::Ready(_))
+    ));
+    // The oldest tool is far above the viewport and stays deferred.
+    assert!(matches!(
+        panel.messages[0].tool_output,
+        Some(ToolOutputHandle::Deferred(_))
+    ));
+}
+
+const TOTAL_SANE_MSG: &str = "scrollbar total must be finite and non-zero before scroll-in";
+
+#[test]
+fn estimate_then_refine_height_on_scroll_in() {
+    let (mut panel, _ids) = resume_panel_with_deferred_tools(VIEWPORT_TOOL_MSGS);
+
+    // Render once at the bottom viewport; out-of-viewport tools stay stubs.
+    render(&mut panel, 80, 10);
+    let bottom_total = panel.last_total_lines;
+    assert!(bottom_total > 10, "{TOTAL_SANE_MSG}");
+    let bottom_built = panel.built_segment_count();
+    assert!(
+        panel.unbuilt_count() > 0,
+        "out-of-viewport messages must remain stubbed before scroll-in"
+    );
+
+    // Scroll all the way to the top: previously-stubbed segments scroll into
+    // view and materialize, refining their stub estimates to true heights.
+    panel.scroll_to_top();
+    render(&mut panel, 80, 10);
+    let top_built = panel.built_segment_count();
+    assert!(
+        top_built > bottom_built,
+        "scrolling in must build more segments ({top_built} <= {bottom_built})"
+    );
+    // The oldest tool is now in view and resolved.
+    assert!(matches!(
+        panel.messages[0].tool_output,
+        Some(ToolOutputHandle::Ready(_))
+    ));
+    assert!(panel.last_total_lines > 10);
 }

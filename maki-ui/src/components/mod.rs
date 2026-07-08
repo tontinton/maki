@@ -29,7 +29,7 @@ pub(crate) mod tool_display;
 pub(crate) mod usage_modal;
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -42,6 +42,83 @@ pub(crate) const CHEVRON: &str = "❯ ";
 
 pub(crate) fn chevron_span() -> ratatui::text::Span<'static> {
     ratatui::text::Span::styled(CHEVRON, crate::theme::current().tool_dim)
+}
+
+/// Shared render store (§10.1): the UI-only `ToolOutput` memo. Read-your-writes
+/// by construction — the agent inserts each completed render synchronously, so a
+/// tool that just completed is never unreadable regardless of writer batching.
+/// For C1 the memo is the in-memory `HashMap` populated at load and on `ToolDone`;
+/// the file-backed `RenderStore` (lazy on-disk decode) swaps in incrementally as
+/// the folder-format load path lands, without changing this interface.
+#[derive(Clone)]
+pub(crate) struct Renders {
+    memo: Arc<Mutex<HashMap<String, ToolOutput>>>,
+}
+
+impl Renders {
+    pub(crate) fn from_memo(memo: Arc<Mutex<HashMap<String, ToolOutput>>>) -> Self {
+        Self { memo }
+    }
+
+    pub(crate) fn empty() -> Self {
+        Self {
+            memo: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Resolve a deferred render at segment-build time (§11). Only segments
+    /// that are actually built decode a render, so restores never materialize
+    /// the whole store up front.
+    pub(crate) fn resolve(&self, id: &str) -> Option<Arc<ToolOutput>> {
+        self.memo
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+            .cloned()
+            .map(Arc::new)
+    }
+}
+
+/// Lazy handle to a tool's render (§11). `Deferred` carries the `tool_use_id`
+/// and is resolved through `Renders` only when the segment is built; `Ready`
+/// holds an already-resolved render for live tool completions in the current
+/// session.
+#[derive(Debug, Clone)]
+pub enum ToolOutputHandle {
+    Deferred(String),
+    Ready(Arc<ToolOutput>),
+}
+
+impl ToolOutputHandle {
+    pub(crate) fn ready(output: ToolOutput) -> Self {
+        Self::Ready(Arc::new(output))
+    }
+
+    pub(crate) fn ready_arc(&self) -> Option<Arc<ToolOutput>> {
+        match self {
+            Self::Ready(arc) => Some(Arc::clone(arc)),
+            Self::Deferred(_) => None,
+        }
+    }
+
+    /// Mutable access to the live `Arc` for in-place batch entry updates
+    /// (only valid for `Ready` handles — a `Deferred` render is immutable).
+    pub(crate) fn as_ready_arc_mut(&mut self) -> Option<&mut Arc<ToolOutput>> {
+        match self {
+            Self::Ready(arc) => Some(arc),
+            Self::Deferred(_) => None,
+        }
+    }
+
+    /// Borrow the render if already resolved (`Ready`). Returns `None` for a
+    /// `Deferred` handle — callers must have upgraded via `resolve_tool_output`
+    /// first. Keeps the segment-build path's `Option<&ToolOutput>` shape.
+    pub(crate) fn as_resolved(&self) -> Option<&ToolOutput> {
+        match self {
+            Self::Ready(arc) => Some(arc),
+            Self::Deferred(_) => None,
+        }
+    }
 }
 
 pub(crate) trait Overlay {
@@ -281,7 +358,7 @@ pub struct DisplayMessage {
     pub text: String,
     pub tool_input: Option<Arc<ToolInput>>,
     pub tool_raw_input: Option<Arc<serde_json::Value>>,
-    pub tool_output: Option<Arc<ToolOutput>>,
+    pub tool_output: Option<ToolOutputHandle>,
     pub live_output: Option<String>,
     pub annotation: Option<String>,
     pub plan_path: Option<String>,
@@ -335,6 +412,48 @@ impl DisplayMessage {
     pub fn snapshot_is_stale(&self, current_gen: u64) -> bool {
         (self.render_snapshot.is_some() || self.render_header.is_some())
             && self.snapshot_theme_gen != current_gen
+    }
+
+    /// Upgrade a `Deferred` handle to `Ready` in place once the render is needed
+    /// (§11). Called at segment-build time, so only built (viewport-visible)
+    /// tools pay the decode; the rest stay deferred. Idempotent for `Ready`.
+    pub(crate) fn resolve_tool_output(&mut self, renders: &Renders) {
+        if let Some(ToolOutputHandle::Deferred(id)) = &self.tool_output
+            && let Some(arc) = renders.resolve(id)
+        {
+            self.tool_output = Some(ToolOutputHandle::Ready(arc));
+        }
+    }
+
+    /// Borrow the render if already resolved (`Ready`); `None` for a `Deferred`
+    /// handle that `resolve_tool_output` has not yet upgraded. Segment-build
+    /// callers upgrade first, so this is the post-resolution `&ToolOutput` view.
+    pub fn output_ref(&self) -> Option<&ToolOutput> {
+        self.tool_output.as_ref()?.as_resolved()
+    }
+
+    /// §11: cheap per-message height estimate used to size out-of-viewport
+    /// stub segments so `total_height`/scrollbar stay valid before the real
+    /// segment is built on scroll-in. Counts wrapped text lines plus the
+    /// inter-message gap; never materializes `Line`s or decodes a render.
+    pub(crate) fn estimate_segment_height(&self, width: u16) -> u16 {
+        const TOOL_HEADER_LINES: u16 = 2;
+        const GAP_LINE: u16 = 1;
+
+        let w = width.max(1) as usize;
+        let text_lines: u16 = if self.text.is_empty() {
+            1
+        } else {
+            self.text
+                .split('\n')
+                .map(|line| line.len().div_ceil(w).max(1) as u16)
+                .sum()
+        };
+        let base = match &self.role {
+            DisplayRole::Tool(_) => text_lines.saturating_add(TOOL_HEADER_LINES),
+            _ => text_lines,
+        };
+        base.saturating_add(GAP_LINE).max(1)
     }
 }
 
