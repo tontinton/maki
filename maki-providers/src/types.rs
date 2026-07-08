@@ -95,7 +95,7 @@ pub fn adapt_images_for_model<'a>(model: &Model, messages: &'a [Message]) -> Cow
             .iter()
             .any(|b| matches!(b, ContentBlock::Image { .. }))
     };
-    if model.vision || !messages.iter().any(has_image) {
+    if model.supports_vision() || !messages.iter().any(has_image) {
         return Cow::Borrowed(messages);
     }
     let adapted = messages
@@ -587,7 +587,7 @@ mod tests {
         ));
 
         let mut text_only_model = model;
-        text_only_model.vision = false;
+        text_only_model.supports_vision_override = Some(false);
         let no_images = vec![Message::user("hi".into())];
         assert!(matches!(
             adapt_images_for_model(&text_only_model, &no_images),
@@ -598,7 +598,7 @@ mod tests {
     #[test]
     fn adapt_images_replaces_blocks_for_text_only_model() {
         let mut model = clamp_test_model(crate::provider::ProviderKind::Anthropic);
-        model.vision = false;
+        model.supports_vision_override = Some(false);
         let messages = vec![Message {
             role: Role::User,
             content: vec![
@@ -705,7 +705,7 @@ mod tests {
             family: provider.family(),
             supports_tool_examples_override: None,
             supports_thinking_override: None,
-            vision: provider.family().supports_vision(),
+            supports_vision_override: Some(provider.family().supports_vision()),
             pricing: crate::model::ModelPricing::default(),
             max_output_tokens: 8192,
             context_window: 200_000,

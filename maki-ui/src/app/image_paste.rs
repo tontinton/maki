@@ -10,7 +10,7 @@ const IMAGE_NOT_SUPPORTED_MSG: &str = "Model does not support image input";
 
 impl App {
     pub(super) fn start_file_image_paste(&mut self, path: PathBuf, media_type: ImageMediaType) {
-        if !self.state.model.vision {
+        if !self.state.model.supports_vision() {
             self.status_bar.flash(IMAGE_NOT_SUPPORTED_MSG.into());
             return;
         }
@@ -19,7 +19,7 @@ impl App {
     }
 
     pub(super) fn start_image_paste(&mut self) {
-        if !self.state.model.vision {
+        if !self.state.model.supports_vision() {
             self.status_bar.flash(IMAGE_NOT_SUPPORTED_MSG.into());
             return;
         }
@@ -49,7 +49,7 @@ impl App {
             self.image_paste_rx.swap_remove(i);
             match result {
                 Ok(source) => {
-                    if !self.state.model.vision {
+                    if !self.state.model.supports_vision() {
                         self.status_bar.flash(IMAGE_NOT_SUPPORTED_MSG.into());
                     } else {
                         self.input_box.attach_image(source);

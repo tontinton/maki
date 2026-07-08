@@ -618,7 +618,7 @@ mod tests {
             dynamic_slug: None,
             tier: ModelTier::Medium,
             family: ModelFamily::Gemini,
-            vision: true,
+            supports_vision_override: Some(true),
             supports_tool_examples_override: None,
             supports_thinking_override: None,
             pricing: ModelPricing::default(),

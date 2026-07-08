@@ -176,6 +176,7 @@ impl CatalogData {
                     fast: None,
                 }),
                 supports_thinking: None,
+                supports_vision: None,
                 provider_info: None,
             })
             .collect();

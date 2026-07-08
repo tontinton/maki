@@ -222,6 +222,16 @@ struct LlamaCppModelData {
     status: Option<LlamaCppStatus>,
     #[serde(default)]
     max_model_len: Option<u32>,
+    #[serde(default)]
+    architecture: Option<LlamaCppArchitecture>,
+}
+
+#[derive(Deserialize)]
+struct LlamaCppArchitecture {
+    #[serde(default)]
+    input_modalities: Vec<String>,
+    #[serde(default)]
+    output_modalities: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -276,16 +286,28 @@ impl LocalEndpoint {
         let mut models: Vec<crate::model::ModelInfo> = body
             .data
             .into_iter()
-            .map(|m| {
+            .filter_map(|m| {
+                let arch = m.architecture.as_ref();
+                let has_text_input = arch
+                    .map(|a| a.input_modalities.iter().any(|m| m == "text"))
+                    .unwrap_or(true);
+                let has_text_output = arch
+                    .map(|a| a.output_modalities.iter().any(|m| m == "text"))
+                    .unwrap_or(true);
+                if !has_text_input || !has_text_output {
+                    return None;
+                }
                 let context_window = llamacpp_extract_ctx_from_model(&m, &mode, props_n_ctx);
-                crate::model::ModelInfo {
+                let supports_vision = arch.map(|a| a.input_modalities.iter().any(|m| m == "image"));
+                Some(crate::model::ModelInfo {
                     id: m.id,
                     context_window: Some(context_window),
                     max_output_tokens: None,
                     pricing: Some(crate::model::ModelPricing::ZERO),
                     supports_thinking: None,
+                    supports_vision,
                     provider_info: None,
-                }
+                })
             })
             .collect();
         models.sort_by(|a, b| a.id.cmp(&b.id));
@@ -391,6 +413,7 @@ impl LocalEndpoint {
                 max_output_tokens: None,
                 pricing: Some(crate::model::ModelPricing::ZERO),
                 supports_thinking: None,
+                supports_vision: None,
                 provider_info: None,
             })
             .collect();
@@ -639,6 +662,7 @@ mod tests {
                 meta: Some(LlamaCppMeta { n_ctx }),
                 status: None,
                 max_model_len: None,
+                architecture: None,
             }
         }
 
@@ -648,6 +672,7 @@ mod tests {
                 meta: None,
                 status: Some(LlamaCppStatus { args }),
                 max_model_len: None,
+                architecture: None,
             }
         }
 
@@ -657,6 +682,7 @@ mod tests {
                 meta: None,
                 status: None,
                 max_model_len: Some(v),
+                architecture: None,
             }
         }
 
@@ -666,6 +692,7 @@ mod tests {
                 meta: None,
                 status: None,
                 max_model_len: None,
+                architecture: None,
             }
         }
 

@@ -317,6 +317,7 @@ mod tests {
                     max_output_tokens: None,
                     pricing: None,
                     supports_thinking: None,
+                    supports_vision: None,
                     provider_info: None,
                 },
                 ModelInfo {
@@ -325,6 +326,7 @@ mod tests {
                     max_output_tokens: None,
                     pricing: None,
                     supports_thinking: None,
+                    supports_vision: None,
                     provider_info: None,
                 },
             ],

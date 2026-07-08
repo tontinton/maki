@@ -179,6 +179,9 @@ impl Provider for OpenRouter {
                         return None;
                     }
 
+                    let supports_vision =
+                        input_modalities.iter().any(|m| m.as_str() == Some("image"));
+
                     // Parse with OpenRouter-specific pricing field names
                     let id = m["id"].as_str()?;
                     let context_window = m["context_length"]
@@ -234,6 +237,7 @@ impl Provider for OpenRouter {
                         max_output_tokens: None,
                         pricing: Some(pricing),
                         supports_thinking: Some(supports_thinking),
+                        supports_vision: Some(supports_vision),
                         provider_info: reasoning
                             .map(|r| Arc::new(r) as Arc<dyn std::any::Any + Send + Sync>),
                     })

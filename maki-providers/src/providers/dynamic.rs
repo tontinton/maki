@@ -81,9 +81,7 @@ impl ScriptModel {
             family: base.family(),
             supports_tool_examples_override: self.supports_tool_examples,
             supports_thinking_override: self.supports_thinking,
-            vision: self
-                .supports_vision
-                .unwrap_or_else(|| base.family().supports_vision()),
+            supports_vision_override: self.supports_vision,
             pricing: self.pricing.clone().unwrap_or_default(),
             max_output_tokens: self.max_output_tokens,
             context_window: self.context_window,
@@ -537,6 +535,7 @@ impl Provider for DynamicProvider {
                     max_output_tokens: Some(m.max_output_tokens),
                     pricing: m.pricing.clone(),
                     supports_thinking: None,
+                    supports_vision: m.supports_vision,
                     provider_info: None,
                 })
                 .collect())

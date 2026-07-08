@@ -189,6 +189,11 @@ impl Provider for TensorX {
                                 None
                             };
 
+                            let supports_vision = info
+                                .get("supports_vision")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false);
+
                             let supports_thinking =
                                 info.get("supports_reasoning").and_then(Value::as_bool);
 
@@ -210,6 +215,7 @@ impl Provider for TensorX {
                                 max_output_tokens,
                                 pricing,
                                 supports_thinking,
+                                supports_vision: Some(supports_vision),
                                 provider_info: supported_params
                                     .map(|p| Arc::new(p) as Arc<dyn std::any::Any + Send + Sync>),
                             })

@@ -228,6 +228,7 @@ impl OpenAiCompatProvider {
             max_output_tokens,
             pricing: Some(pricing),
             supports_thinking: None,
+            supports_vision: None,
             provider_info: None,
         })
     }

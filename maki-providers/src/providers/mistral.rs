@@ -238,12 +238,19 @@ impl Provider for Mistral {
                         .and_then(Value::as_object)
                         .and_then(|c| c.get("reasoning"))
                         .and_then(Value::as_bool);
+                    let supports_vision = m
+                        .get("capabilities")
+                        .and_then(Value::as_object)
+                        .and_then(|c| c.get("vision"))
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
                     Some(crate::model::ModelInfo {
                         id: id.to_string(),
                         context_window,
                         max_output_tokens: None,
                         pricing: None,
                         supports_thinking,
+                        supports_vision: Some(supports_vision),
                         provider_info: None,
                     })
                 })

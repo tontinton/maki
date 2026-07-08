@@ -108,7 +108,7 @@ impl ToolFilter {
 /// One gate for every definitions builder (main loop, headless, Lua): a model
 /// without vision never learns `view_image` exists.
 pub fn capability_exclusions(model: &Model) -> &'static [&'static str] {
-    if model.vision {
+    if model.supports_vision() {
         &[]
     } else {
         &[VIEW_IMAGE_TOOL_NAME]
@@ -582,7 +582,7 @@ mod tests {
     #[test_case(false ; "text_only_model_loses_view_image")]
     fn from_config_gates_view_image_on_vision(vision: bool) {
         let mut model = Model::from_spec("anthropic/claude-opus-4-8").unwrap();
-        model.vision = vision;
+        model.supports_vision_override = Some(vision);
         let filter = ToolFilter::from_config(&AgentConfig::default(), &model, &[]);
         assert_eq!(filter.matches(VIEW_IMAGE_TOOL_NAME), vision);
         assert!(

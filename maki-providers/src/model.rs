@@ -56,6 +56,7 @@ pub struct ModelInfo {
     pub max_output_tokens: Option<u32>,
     pub pricing: Option<ModelPricing>,
     pub supports_thinking: Option<bool>,
+    pub supports_vision: Option<bool>,
     /// Store of additional metadata from the provider.
     pub provider_info: Option<Arc<dyn Any + Send + Sync>>,
 }
@@ -68,6 +69,7 @@ impl ModelInfo {
             max_output_tokens: None,
             pricing: None,
             supports_thinking: None,
+            supports_vision: None,
             provider_info: None,
         }
     }
@@ -223,8 +225,7 @@ pub struct Model {
     pub family: ModelFamily,
     pub supports_tool_examples_override: Option<bool>,
     pub supports_thinking_override: Option<bool>,
-    /// Resolved once at construction so every consumer reads the same answer.
-    pub vision: bool,
+    pub supports_vision_override: Option<bool>,
     pub pricing: ModelPricing,
     pub max_output_tokens: u32,
     pub context_window: u32,
@@ -243,13 +244,12 @@ impl Model {
             .read()
             .unwrap()
             .tier_for(&spec, provider, static_entry.map(|e| e.tier));
-        let (family, pricing, max_output_tokens, context_window, vision) = match static_entry {
+        let (family, pricing, max_output_tokens, context_window) = match static_entry {
             Some(e) => (
                 e.family,
                 e.pricing.clone(),
                 e.max_output_tokens,
                 anthropic::shared::long_context_window(model_id).unwrap_or(e.context_window),
-                e.vision,
             ),
             None => {
                 let guard = crate::model_registry::model_registry().read().unwrap();
@@ -265,7 +265,6 @@ impl Model {
                     discovered
                         .and_then(|d| d.context_window)
                         .unwrap_or_else(|| provider.fallback_context_window()),
-                    provider.family().supports_vision(),
                 )
             }
         };
@@ -277,7 +276,7 @@ impl Model {
             family,
             supports_tool_examples_override: None,
             supports_thinking_override: None,
-            vision,
+            supports_vision_override: None,
             pricing,
             max_output_tokens,
             context_window,
@@ -293,6 +292,22 @@ impl Model {
                     .and_then(|d| d.supports_thinking)
             })
             .unwrap_or_else(|| self.provider.supports_thinking())
+    }
+
+    pub fn supports_vision(&self) -> bool {
+        self.supports_vision_override
+            .or_else(|| {
+                let guard = crate::model_registry::model_registry().read().unwrap();
+                guard
+                    .discovered(self.provider, &self.id)
+                    .and_then(|d| d.supports_vision)
+            })
+            .or_else(|| {
+                lookup_entry(models_for_provider(self.provider), &self.id)
+                    .ok()
+                    .map(|e| e.vision)
+            })
+            .unwrap_or_else(|| self.family.supports_vision())
     }
 
     pub fn supports_tool_examples(&self) -> bool {
@@ -700,7 +715,7 @@ mod tests {
     #[test_case("anthropic/claude-nonexistent-99",  true  ; "unknown_model_uses_family_fallback")]
     #[test_case("deepseek/my-custom-model",         false ; "unknown_generic_defaults_off")]
     fn vision_resolved_from_entry_or_family(spec: &str, expected: bool) {
-        assert_eq!(Model::from_spec(spec).unwrap().vision, expected);
+        assert_eq!(Model::from_spec(spec).unwrap().supports_vision(), expected);
     }
 
     #[test_case("claude-opus-4-6" ; "opus_4_6")]
@@ -755,6 +770,7 @@ mod tests {
                     max_output_tokens: None,
                     pricing: None,
                     supports_thinking: None,
+                    supports_vision: None,
                     provider_info: None,
                 }],
             );
