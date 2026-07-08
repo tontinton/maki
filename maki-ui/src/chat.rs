@@ -13,7 +13,7 @@ use crate::markdown::truncate_output;
 use crate::selection::Selection;
 use maki_agent::tools::{ToolInvocation, ToolRegistry, WRITE_TOOL_NAME};
 use maki_agent::{AgentEvent, BufferSnapshot, ToolDoneEvent, ToolOutput, ToolStartEvent};
-use maki_config::{ToolOutputLines, UiConfig};
+use maki_config::{ToolKey, ToolOutputLines, UiConfig};
 use maki_providers::{ContentBlock, Message, Role, TokenUsage};
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -33,7 +33,7 @@ pub enum ChatEventResult {
     Error(String),
     PermissionRequest {
         id: String,
-        tool: String,
+        tool: ToolKey,
         scopes: Vec<String>,
     },
     AuthRequired,

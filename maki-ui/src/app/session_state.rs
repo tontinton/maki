@@ -139,27 +139,70 @@ impl From<Mode> for StoredMode {
 pub(crate) fn rules_to_stored(rules: &[maki_config::PermissionRule]) -> Vec<StoredRule> {
     rules
         .iter()
-        .map(|r| StoredRule {
-            tool: r.tool.clone(),
-            scope: r.scope.clone(),
-            effect: match r.effect {
+        .map(|r| {
+            let effect = match r.effect {
                 Effect::Allow => StoredEffect::Allow,
                 Effect::Deny => StoredEffect::Deny,
-            },
+            };
+            StoredRule {
+                tool: r.tool.to_string(),
+                scope: r.scope.clone(),
+                effect,
+            }
         })
         .collect()
+}
+
+/// Migrate old stored tool key formats to `ToolKey`.
+/// Handles `"mcp:server__tool"` (pre-PR1 format) -> `McpTool`.
+/// All other formats go through `ToolKey::parse` (current format: `server.tool`).
+fn migrate_stored_tool_key(s: &str) -> Option<maki_config::ToolKey> {
+    // Pre-PR1 format: "mcp:server__tool" — rewrite to new format and parse.
+    if let Some(rest) = s.strip_prefix("mcp:")
+        && let Some((server, tool)) = rest.split_once("__")
+    {
+        let new_form = format!("{server}.{tool}");
+        return maki_config::ToolKey::parse(&new_form)
+            .map_err(
+                |e| tracing::warn!(key = s, error = %e, "malformed stored tool key — skipping"),
+            )
+            .ok();
+    }
+    match maki_config::ToolKey::parse(s) {
+        Ok(key) => Some(key),
+        Err(e) => {
+            tracing::error!(key = s, error = %e, "malformed stored tool key — rule DROPPED; a deny rule may have been lost");
+            None
+        }
+    }
 }
 
 pub(crate) fn stored_to_rules(stored: &[StoredRule]) -> Vec<maki_config::PermissionRule> {
     stored
         .iter()
-        .map(|r| maki_config::PermissionRule {
-            tool: r.tool.clone(),
-            scope: r.scope.clone(),
-            effect: match r.effect {
+        .filter_map(|r| {
+            let tool = match migrate_stored_tool_key(&r.tool) {
+                Some(t) => t,
+                None => {
+                    if matches!(r.effect, StoredEffect::Deny) {
+                        tracing::error!(
+                            key = %r.tool,
+                            "SECURITY: stored DENY rule dropped — tool may now be accessible. \
+                             Re-add this rule manually in permissions.toml"
+                        );
+                    }
+                    return None;
+                }
+            };
+            let effect = match r.effect {
                 StoredEffect::Allow => Effect::Allow,
                 StoredEffect::Deny => Effect::Deny,
-            },
+            };
+            Some(maki_config::PermissionRule {
+                tool,
+                scope: r.scope.clone(),
+                effect,
+            })
         })
         .collect()
 }

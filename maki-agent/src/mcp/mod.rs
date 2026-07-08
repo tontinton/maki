@@ -1,6 +1,6 @@
 //! MCP client: manages transports and routes tool calls to servers.
 //!
-//! Tool names are namespaced as `server__tool` so two servers can both expose `search`
+//! Tool names are namespaced as `server.tool` so two servers can both expose `search`
 //! without colliding. Names are deduped via `Arc<str>` in a small cache.
 //!
 //! All mutable state lives in the `run` task, which owns `McpManagerInner` exclusively.
@@ -37,8 +37,25 @@ use self::http::HttpTransport;
 use self::stdio::StdioTransport;
 use self::transport::McpTransport;
 
-const SEPARATOR: &str = "__";
+const SEPARATOR: &str = ".";
+const WIRE_SEPARATOR: &str = "__";
 pub const UNKNOWN_MCP: &str = "unknown_mcp";
+
+/// Convert internal qualified name (`server.tool`) to wire format (`server__tool`)
+/// for LLM provider APIs that reject dots in tool names.
+///
+/// Lossless: server names can't contain `__` (only alphanumeric + `-`),
+/// so the first `__` in the wire name is always the separator boundary.
+pub fn wire_tool_name(qualified: &str) -> String {
+    qualified.replacen(SEPARATOR, WIRE_SEPARATOR, 1)
+}
+
+/// Convert wire format (`server__tool`) back to internal qualified name (`server.tool`).
+///
+/// Only the first `__` is the separator — tool names may contain underscores.
+pub fn internal_tool_name(wire: &str) -> String {
+    wire.replacen(WIRE_SEPARATOR, SEPARATOR, 1)
+}
 const MCP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 struct McpToolDef {
@@ -114,6 +131,24 @@ impl ServerEntry {
         } = result;
         self.tools = tool_infos
             .into_iter()
+            .filter(|info| {
+                if !config::is_valid_tool_name(&info.name) {
+                    warn!(tool = %info.name, server = %self.name, "skipping tool with invalid name");
+                    return false;
+                }
+                // Wire format is server__tool — check total length fits LLM API limits
+                let wire_len = self.name.len() + 2 + info.name.len();
+                if wire_len > 64 {
+                    warn!(
+                        tool = %info.name,
+                        server = %self.name,
+                        wire_len,
+                        "skipping tool — wire name exceeds 64 char LLM API limit"
+                    );
+                    return false;
+                }
+                true
+            })
             .map(|info| McpToolDef {
                 qualified_name: intern(format!("{}{SEPARATOR}{}", self.name, info.name)),
                 raw_name: info.name,
@@ -634,7 +669,7 @@ fn publish(inner: &McpManagerInner, index: &ArcSwap<ToolIndex>, snapshot: &ArcSw
                     },
                 );
                 descriptors.push(json!({
-                    "name": t.qualified_name.as_ref(),
+                    "name": wire_tool_name(&t.qualified_name),
                     "description": t.description,
                     "input_schema": t.input_schema,
                 }));
@@ -750,7 +785,8 @@ mod tests {
         McpConfig { mcp, origins }
     }
 
-    const TOOL_NAME: &str = "srv__tool";
+    const TOOL_NAME: &str = "srv.tool";
+    const WIRE_TOOL_NAME: &str = "srv__tool";
 
     /// Counts shutdowns, signals on `call_entered` the moment a `tools/call` begins, and holds
     /// the call inside `call_gate` until tests release it. That way tests can meet an in-flight
@@ -918,7 +954,7 @@ mod tests {
             assert!(handle.has_tool(TOOL_NAME));
             let mut tools = json!([]);
             handle.extend_tools(&mut tools);
-            assert_eq!(tools[0]["name"], TOOL_NAME);
+            assert_eq!(tools[0]["name"], WIRE_TOOL_NAME);
 
             handle_toggle(&mut inner, "srv", false).await;
             publish(&inner, &handle.index, &handle.snapshot);
@@ -992,5 +1028,22 @@ mod tests {
             assert_eq!(t2.shutdowns(), 1);
             assert!(snapshot.load().infos.iter().all(|i| i.tool_count == 0));
         });
+    }
+
+    #[test]
+    fn is_valid_tool_name_enforces_wire_format() {
+        use config::is_valid_tool_name;
+        // Valid: alphanumeric, underscore, hyphen, 1-64 chars
+        assert!(is_valid_tool_name("search"));
+        assert!(is_valid_tool_name("web_search"));
+        assert!(is_valid_tool_name("my-tool"));
+        assert!(is_valid_tool_name(&"a".repeat(64)));
+        // Invalid: empty, dots, special chars, too long
+        assert!(!is_valid_tool_name(""));
+        assert!(!is_valid_tool_name("web.search"));
+        assert!(!is_valid_tool_name("admin.delete"));
+        assert!(!is_valid_tool_name("tool!"));
+        assert!(!is_valid_tool_name("*"));
+        assert!(!is_valid_tool_name(&"a".repeat(65)));
     }
 }

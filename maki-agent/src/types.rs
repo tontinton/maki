@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use flume::Sender;
+use maki_config::ToolKey;
 use maki_providers::{AgentError, ContentBlock, Message, Role, StopReason, TokenUsage};
 use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
@@ -568,7 +569,7 @@ pub enum AgentEvent {
     },
     PermissionRequest {
         id: String,
-        tool: String,
+        tool: ToolKey,
         scopes: Vec<String>,
     },
     AuthRequired,

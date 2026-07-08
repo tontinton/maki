@@ -2509,8 +2509,12 @@ fn agent_error_creates_synthetic_tool_done_with_message() {
 #[test]
 fn ctrl_c_denies_permission_prompt() {
     let mut app = test_app();
-    app.permission_prompt
-        .open("id".into(), "bash".into(), vec!["execute".into()], None);
+    app.permission_prompt.open(
+        "id".into(),
+        maki_config::ToolKey::native("bash"),
+        vec!["execute".into()],
+        None,
+    );
     assert!(app.permission_prompt.is_open());
 
     let actions = app.update(Msg::Key(kb::QUIT.to_key_event()));
@@ -2613,8 +2617,12 @@ fn permission_prompt_takes_bottom_precedence_over_below_split() {
     open_split_window(&mut app, maki_lua::Split::Below);
     open_split_window(&mut app, maki_lua::Split::Left);
     open_split_window(&mut app, maki_lua::Split::Above);
-    app.permission_prompt
-        .open("perm-1".into(), "bash".into(), vec!["ls".into()], None);
+    app.permission_prompt.open(
+        "perm-1".into(),
+        maki_config::ToolKey::native("bash"),
+        vec!["ls".into()],
+        None,
+    );
 
     let (_msg, _bottom, _status, _input, splits) = app.layout_geometry(TEST_AREA);
     assert!(

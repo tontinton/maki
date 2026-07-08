@@ -9,21 +9,21 @@ group = "Reference"
 
 Maki uses a permission system to decide what each tool is allowed to do and when to ask you first.
 
-Rules come from three layers, checked in this order:
+Rules come from three layers, combined for resolution:
 
 1. **Session rules**, set during the current session (in-memory only)
 2. **Config rules**, loaded from TOML permission files
 3. **Builtin rules**, the hardcoded defaults
 
-First match wins.
+Any matching deny blocks the tool. No exceptions.
 
 ## Check Flow
 
 For every tool call, Maki resolves permission like this:
 
-1. If any **deny** rule matches, denied. Full stop.
-2. If **YOLO** is active, allowed.
-3. If all scopes match an **allow** rule, allowed.
+1. **Deny wins**: if any rule from any layer matches the tool and scope with a deny, the call is blocked immediately.
+2. If **YOLO** is active and no deny matched, allowed.
+3. **Plan file auto-allow**: file write tools targeting the plan file path are allowed automatically (only if no deny rule matched in step 1).
 4. Fall back to `default` (per-tool, then global). Built-in default is `"prompt"`.
 
 ## Builtin Defaults
@@ -64,10 +64,18 @@ deny = [
 ]
 
 [read]
-allow = true
+default = "allow"
+
+[mcp.deepwiki]
+allow = ["search", "fetch"]
+
+[mcp.github]
+deny = ["admin_delete"]
 ```
 
-Each tool gets its own section with `allow` and `deny` arrays. Values are glob-like scope patterns, or `true` to match everything.
+Each tool gets its own section with `allow` and `deny` arrays. Values are glob-like scope patterns.
+
+> **Note:** In MCP server sections (`[mcp.*]`), the boolean forms `allow = true` and `deny = true` are deprecated and ignored. Use `default = "allow"` or `default = "deny"` instead. For native tool sections (e.g. `[bash]`), `allow = true` still works.
 
 ### The `default` key
 
@@ -95,6 +103,23 @@ Note: `default = "allow"` only works in the global file. Projects cannot grant t
 | `dir/**` | `dir` itself or anything under it |
 | `exact` | Exact match only |
 
+## MCP Tool Permissions
+
+MCP tools use natural TOML nesting. Server names are table keys under `[mcp]`, tool names are array values:
+
+```toml
+[mcp.deepwiki]
+allow = ["search", "fetch"]    # allow these tools
+
+[mcp.github]
+deny = ["admin_delete"]         # deny this tool
+
+[mcp.lean-lsp]
+default = "allow"               # allow all tools on this server
+```
+
+Tool names must match `^[a-zA-Z0-9_-]{1,64}$` (no dots, max 64 chars). Server names cannot contain dots.
+
 ## Permission Prompts
 
 When a tool needs permission, Maki asks you. Here are the keys:
@@ -115,10 +140,10 @@ When you pick "always allow", the saved scope is generalized so it stays useful 
 
 - **bash**: `cargo test --all` becomes `cargo *`
 - **write/edit/multiedit**: `/path/to/file.rs` becomes `/path/to/**`
-- **MCP tools**: always `*` (per-tool, so allowing `mcp:fetch` won't cover `mcp:exec`)
+- **MCP tools**: always `*` (per-tool, so allowing `deepwiki.search` won't cover `deepwiki.fetch`)
 - **webfetch/websearch**: always `*`
 
-Deny rules are saved with the exact scope. You denied something specific, so it stays specific.
+For MCP tools, both allow and deny decisions generalize to `*` (the entire tool). This is because MCP tool inputs are opaque JSON with no meaningful scope pattern to differentiate. Denying a single MCP invocation denies the tool entirely until you revoke the rule.
 
 ## YOLO Mode
 

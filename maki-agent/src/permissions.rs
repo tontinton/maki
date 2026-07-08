@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use maki_config::{
     DefaultEffect, Effect, FILE_WRITE_TOOLS, PermissionRule, PermissionTarget, PermissionsConfig,
-    append_permission_rule,
+    ToolKey, append_permission_rule,
 };
 use thiserror::Error;
 use tracing::{info, warn};
@@ -24,7 +24,7 @@ fn builtin_rules(cwd: &Path) -> Vec<PermissionRule> {
         maki_storage::paths::canonicalize_clean(cwd).display()
     );
     let allow = |tool: &str, scope: &str| PermissionRule {
-        tool: tool.into(),
+        tool: ToolKey::native(tool),
         scope: Some(scope.into()),
         effect: Effect::Allow,
     };
@@ -43,7 +43,7 @@ pub enum PermissionCheck {
     Allowed,
     Denied,
     NeedsPrompt {
-        tool: String,
+        tool: ToolKey,
         scopes: Vec<String>,
         force_prompt: bool,
     },
@@ -157,16 +157,42 @@ pub struct PermissionManager {
     builtin_rules: Vec<PermissionRule>,
     yolo: AtomicBool,
     default: DefaultEffect,
-    tool_defaults: HashMap<String, DefaultEffect>,
+    tool_defaults: HashMap<ToolKey, DefaultEffect>,
     cwd: PathBuf,
 }
 
 impl PermissionManager {
     pub fn new(config: PermissionsConfig, cwd: PathBuf) -> Self {
+        let config_rules = config.rules;
+        let builtin_rules = builtin_rules(&cwd);
+
+        // Warn if wildcard deny is present — it blocks ALL tools including builtins.
+        let has_wildcard_deny = config_rules
+            .iter()
+            .any(|r| matches!(r.tool, ToolKey::Wildcard) && r.effect == Effect::Deny);
+        if has_wildcard_deny {
+            warn!(
+                "wildcard deny detected — this blocks ALL tools including \
+                 builtins (write/edit/multiedit/task). Use per-tool rules \
+                 instead if you want selective access."
+            );
+        }
+        // Warn if wildcard allow is present — it permits ALL tools including write/edit/task.
+        let has_wildcard_allow = config_rules
+            .iter()
+            .any(|r| matches!(r.tool, ToolKey::Wildcard) && r.effect == Effect::Allow);
+        if has_wildcard_allow {
+            warn!(
+                "wildcard allow detected — this permits ALL tools including \
+                 write/edit/multiedit/task. Use per-tool rules \
+                 instead if you want selective access."
+            );
+        }
+
         Self {
-            builtin_rules: builtin_rules(&cwd),
+            builtin_rules,
             session_rules: Mutex::new(Vec::new()),
-            config_rules: config.rules,
+            config_rules,
             yolo: AtomicBool::new(config.yolo),
             default: config.default,
             tool_defaults: config.tool_defaults,
@@ -183,81 +209,120 @@ impl PermissionManager {
 
     fn check_inner(
         &self,
-        tool: &str,
+        tool: &ToolKey,
         scopes: &[&str],
         force_prompt: bool,
         plan_path: Option<&Path>,
     ) -> PermissionCheck {
         let session = self.session_rules();
-        let rules = session
-            .iter()
-            .chain(&self.config_rules)
-            .chain(&self.builtin_rules);
+
+        // Any matching deny wins. No specificity hierarchy — a Wildcard
+        // deny blocks everything, a tool-specific deny blocks that tool.
+        let mut unclaimed_scopes: Vec<&str> = if force_prompt {
+            Vec::new()
+        } else {
+            Vec::with_capacity(scopes.len())
+        };
 
         for scope in scopes {
-            for rule in rules.clone() {
-                if rule.effect == Effect::Deny && matches_rule(rule, tool, scope) {
-                    info!(tool, scope = %scope, "permission denied");
-                    return PermissionCheck::Denied;
+            let mut has_allow = false;
+            for r in session
+                .iter()
+                .chain(&self.config_rules)
+                .chain(&self.builtin_rules)
+            {
+                if !matches_rule(&r.tool, tool) || !rule_matches_scope(r, scope) {
+                    continue;
+                }
+                match r.effect {
+                    Effect::Deny => {
+                        info!(tool = %tool, scope = %scope, "permission denied");
+                        return PermissionCheck::Denied;
+                    }
+                    Effect::Allow => {
+                        has_allow = true;
+                    }
                 }
             }
+
+            if has_allow {
+                // allow wins for this scope (no deny matched)
+            } else if !force_prompt {
+                unclaimed_scopes.push(scope);
+            }
+            // force_prompt: all scopes will be prompted anyway
         }
 
         if self.yolo.load(Ordering::Relaxed) {
             return PermissionCheck::Allowed;
         }
 
-        if FILE_WRITE_TOOLS.contains(&tool)
-            && let Some(pp) = plan_path
-        {
-            let plan_scope = normalize_scope_path(&pp.display().to_string());
-            if scopes.iter().any(|s| normalize_scope_path(s) == plan_scope) {
-                return PermissionCheck::Allowed;
-            }
-        }
-
-        let is_allowed = |scope: &&str| {
-            rules
-                .clone()
-                .any(|rule| rule.effect == Effect::Allow && matches_rule(rule, tool, scope))
-        };
-
         let pending: Vec<&str> = if force_prompt {
             scopes.to_vec()
         } else {
-            scopes.iter().filter(|s| !is_allowed(s)).copied().collect()
+            unclaimed_scopes
         };
 
         if pending.is_empty() {
             return PermissionCheck::Allowed;
         }
 
+        // Plan file auto-allow: fires AFTER deny rules have been evaluated.
+        // Only triggers if ALL pending scopes match the plan file path.
+        // A single non-plan scope means we must prompt for the rest.
+        if !force_prompt && !pending.is_empty() {
+            let is_plan_write = plan_path.is_some_and(|pp| {
+                matches!(tool, ToolKey::Native(name) if FILE_WRITE_TOOLS.contains(&name.as_ref()))
+                    && {
+                        let normalized_plan = normalize_scope_path(&pp.display().to_string());
+                        pending
+                            .iter()
+                            .all(|s| normalize_scope_path(s) == normalized_plan)
+                    }
+            });
+            if is_plan_write {
+                return PermissionCheck::Allowed;
+            }
+        }
+
         let eff = self
             .tool_defaults
             .get(tool)
             .copied()
+            .or_else(|| {
+                // McpTool falls back to McpServer-level default (Arc clone, ~2ns)
+                let server = match tool {
+                    ToolKey::McpTool { server, .. } => server,
+                    _ => return None,
+                };
+                self.tool_defaults
+                    .get(&ToolKey::McpServer {
+                        server: server.clone(),
+                    })
+                    .copied()
+            })
             .unwrap_or(self.default);
         match eff {
             DefaultEffect::Deny => {
-                info!(tool, "denied by default");
+                info!(tool = %tool, "denied by default");
                 PermissionCheck::Denied
             }
             DefaultEffect::Allow => PermissionCheck::Allowed,
             DefaultEffect::Prompt => PermissionCheck::NeedsPrompt {
-                tool: tool.to_string(),
+                tool: tool.clone(),
                 scopes: pending.into_iter().map(|s| s.to_string()).collect(),
                 force_prompt,
             },
         }
     }
 
-    pub fn check(&self, tool: &str, scope: &str, plan_path: Option<&Path>) -> PermissionCheck {
+    pub fn check(&self, tool: &ToolKey, scope: &str, plan_path: Option<&Path>) -> PermissionCheck {
         self.check_inner(tool, &[scope], false, plan_path)
     }
 
     pub fn check_multi(
         &self,
-        tool: &str,
+        tool: &ToolKey,
         scopes: &[&str],
         force_prompt: bool,
         plan_path: Option<&Path>,
@@ -306,8 +371,11 @@ impl PermissionManager {
         *self.session_rules() = rules;
     }
 
-    pub fn apply_decision(&self, tool: &str, scopes: &[String], answer: &PermissionAnswer) {
-        let resolved = if answer.is_allow() {
+    pub fn apply_decision(&self, tool: &ToolKey, scopes: &[String], answer: &PermissionAnswer) {
+        let resolved = if answer.is_allow() || tool.is_mcp() {
+            // MCP scopes are always wildcarded — both allow and deny generalize to "*".
+            // This makes session and persisted rules consistent: a deny on an MCP tool
+            // blocks the tool entirely, not just the specific input that triggered it.
             generalized_scopes(tool, scopes)
         } else {
             scopes.to_vec()
@@ -320,7 +388,7 @@ impl PermissionManager {
             PermissionAnswer::AllowSession => {
                 for s in &resolved {
                     self.add_session_rule(PermissionRule {
-                        tool: tool.to_string(),
+                        tool: tool.clone(),
                         scope: Some(s.clone()),
                         effect: Effect::Allow,
                     });
@@ -343,7 +411,7 @@ impl PermissionManager {
                 };
                 for s in &resolved {
                     self.add_session_rule(PermissionRule {
-                        tool: tool.to_string(),
+                        tool: tool.clone(),
                         scope: Some(s.clone()),
                         effect,
                     });
@@ -358,7 +426,7 @@ impl PermissionManager {
     #[allow(clippy::too_many_arguments)]
     pub async fn enforce(
         &self,
-        tool: &str,
+        tool: &ToolKey,
         scopes: &crate::tools::PermissionScopes,
         event_tx: &EventSender,
         user_response_rx: Option<&async_lock::Mutex<flume::Receiver<String>>>,
@@ -367,12 +435,11 @@ impl PermissionManager {
         plan_path: Option<&Path>,
     ) -> Result<(), PermissionError> {
         let scope_refs: Vec<&str> = scopes.scopes.iter().map(|s| s.as_str()).collect();
-        let deny = |guidance: Option<String>| {
-            let display = scopes.scopes.join("; ");
-            match guidance {
-                Some(g) => PermissionError::with_guidance(tool, &display, g),
-                None => PermissionError::new(tool, &display),
-            }
+        let tool_string = tool.to_string();
+        let scope_display = || scopes.scopes.join("; ");
+        let deny = |guidance: Option<String>| match guidance {
+            Some(g) => PermissionError::with_guidance(&tool_string, &scope_display(), g),
+            None => PermissionError::new(&tool_string, &scope_display()),
         };
 
         let (pt, ps, force_prompt) =
@@ -387,7 +454,7 @@ impl PermissionManager {
             };
 
         let Some(rx) = user_response_rx else {
-            warn!(tool, scope = %scopes.scopes.join("; "), "no permission response channel");
+            warn!(tool = %tool, scope = %scope_display(), "no permission response channel");
             return Err(deny(None));
         };
 
@@ -410,7 +477,7 @@ impl PermissionManager {
         let answer = match response {
             Ok(Ok(a)) => a,
             Ok(Err(_)) => {
-                warn!(tool, scope = %scopes.scopes.join("; "), "permission channel closed");
+                warn!(tool = %tool, scope = %scope_display(), "permission channel closed");
                 return Err(deny(None));
             }
             Err(_) => return Err(deny(None)),
@@ -428,11 +495,27 @@ impl PermissionManager {
     }
 }
 
-fn matches_rule(rule: &PermissionRule, tool: &str, scope: &str) -> bool {
-    let tool_matches = rule.tool == "*" || rule.tool == tool;
-    if !tool_matches {
-        return false;
+fn matches_rule(rule_key: &ToolKey, actual: &ToolKey) -> bool {
+    match (rule_key, actual) {
+        (ToolKey::Wildcard, _) => true,
+        (ToolKey::Native(a), ToolKey::Native(b)) => a == b,
+        (ToolKey::McpServer { server: rs }, ToolKey::McpServer { server: as_ }) => rs == as_,
+        (ToolKey::McpServer { server: rs }, ToolKey::McpTool { server: as_, .. }) => rs == as_,
+        (
+            ToolKey::McpTool {
+                server: rs,
+                tool: rt,
+            },
+            ToolKey::McpTool {
+                server: as_,
+                tool: at,
+            },
+        ) => rs == as_ && rt == at,
+        _ => false,
     }
+}
+
+fn rule_matches_scope(rule: &PermissionRule, scope: &str) -> bool {
     match &rule.scope {
         None => true,
         Some(pattern) => scope_matches(pattern, scope),
@@ -505,7 +588,7 @@ fn generalize_bash_segment(segment: &str) -> String {
     format!("{first_token} *")
 }
 
-pub fn generalized_scopes(tool: &str, scopes: &[String]) -> Vec<String> {
+pub fn generalized_scopes(tool: &ToolKey, scopes: &[String]) -> Vec<String> {
     let mut seen = HashSet::new();
     scopes
         .iter()
@@ -514,10 +597,10 @@ pub fn generalized_scopes(tool: &str, scopes: &[String]) -> Vec<String> {
         .collect()
 }
 
-fn generalize_scope(tool: &str, scope: &str) -> String {
+fn generalize_scope(tool: &ToolKey, scope: &str) -> String {
     match tool {
-        "bash" => generalize_bash_segment(scope),
-        tool if FILE_WRITE_TOOLS.contains(&tool) => {
+        ToolKey::Native(name) if name.as_ref() == "bash" => generalize_bash_segment(scope),
+        ToolKey::Native(name) if FILE_WRITE_TOOLS.contains(&name.as_ref()) => {
             let p = Path::new(scope);
             match p.parent() {
                 Some(parent) if !parent.as_os_str().is_empty() => {
@@ -526,12 +609,11 @@ fn generalize_scope(tool: &str, scope: &str) -> String {
                 _ => "**".to_string(),
             }
         }
-        // MCP tool calls are dispatched as `mcp:<tool_name>` with a scope equal
-        // to the JSON-stringified input. "Allow always" should whitelist the
-        // tool regardless of its arguments, so generalize the scope to `*`. The
-        // rule's `tool` field (`mcp:<tool_name>`) still gates which MCP tool it
-        // applies to, keeping distinct tools distinct.
-        t if t.starts_with("mcp:") => "*".to_string(),
+        // MCP tool calls have a scope equal to the JSON-stringified input.
+        // "Allow always" should whitelist the tool regardless of its arguments,
+        // so generalize the scope to `*`. The rule's `tool` field still gates
+        // which MCP tool it applies to, keeping distinct tools distinct.
+        ToolKey::McpTool { .. } | ToolKey::McpServer { .. } => "*".to_string(),
         _ => scope.to_string(),
     }
 }
@@ -550,7 +632,7 @@ mod tests {
 
     fn allow_rule(scope: &str) -> PermissionRule {
         PermissionRule {
-            tool: "bash".into(),
+            tool: ToolKey::native("bash"),
             scope: Some(scope.into()),
             effect: Effect::Allow,
         }
@@ -558,7 +640,7 @@ mod tests {
 
     fn deny_rule(scope: &str) -> PermissionRule {
         PermissionRule {
-            tool: "bash".into(),
+            tool: ToolKey::native("bash"),
             scope: Some(scope.into()),
             effect: Effect::Deny,
         }
@@ -590,7 +672,7 @@ mod tests {
             make_config(rules.into_iter().map(allow_rule).collect()),
             PathBuf::from("/tmp"),
         );
-        let check = mgr.check_multi("bash", &scopes, false, None);
+        let check = mgr.check_multi(&ToolKey::native("bash"), &scopes, false, None);
         assert_eq!(matches!(check, PermissionCheck::Allowed), expect_allowed);
     }
 
@@ -605,7 +687,12 @@ mod tests {
             PathBuf::from("/tmp"),
         );
         assert!(matches!(
-            mgr.check_multi("bash", &["cd /tmp", "cargo test", "rm -rf /"], false, None),
+            mgr.check_multi(
+                &ToolKey::native("bash"),
+                &["cd /tmp", "cargo test", "rm -rf /"],
+                false,
+                None
+            ),
             PermissionCheck::Denied
         ));
     }
@@ -614,7 +701,7 @@ mod tests {
     fn complex_constructs_force_prompt_even_with_allow_star() {
         let mgr = PermissionManager::new(make_config(vec![allow_rule("*")]), PathBuf::from("/tmp"));
         assert!(matches!(
-            mgr.check_multi("bash", &["echo $(whoami)"], true, None),
+            mgr.check_multi(&ToolKey::native("bash"), &["echo $(whoami)"], true, None),
             PermissionCheck::NeedsPrompt { .. }
         ));
     }
@@ -625,7 +712,7 @@ mod tests {
     #[test_case("bash", "cargo test" => false ; "bash_prompts")]
     fn builtin_check(tool: &str, scope: &str) -> bool {
         matches!(
-            default_mgr().check(tool, scope, None),
+            default_mgr().check(&ToolKey::native(tool), scope, None),
             PermissionCheck::Allowed
         )
     }
@@ -656,7 +743,7 @@ mod tests {
     fn path_traversal_prompts() {
         let path = normalize_scope_path("/tmp/../etc/passwd");
         assert!(matches!(
-            default_mgr().check("write", &path, None),
+            default_mgr().check(&ToolKey::native("write"), &path, None),
             PermissionCheck::NeedsPrompt { .. }
         ));
     }
@@ -669,7 +756,7 @@ mod tests {
         );
         mgr.add_session_rule(deny_rule("cargo *"));
         assert!(matches!(
-            mgr.check("bash", "cargo test", None),
+            mgr.check(&ToolKey::native("bash"), "cargo test", None),
             PermissionCheck::Denied
         ));
     }
@@ -685,7 +772,7 @@ mod tests {
             PathBuf::from("/tmp"),
         );
         assert!(matches!(
-            mgr.check("bash", "rm -rf /", None),
+            mgr.check(&ToolKey::native("bash"), "rm -rf /", None),
             PermissionCheck::Denied
         ));
     }
@@ -696,12 +783,12 @@ mod tests {
     fn allow_decision_generalizes() {
         let mgr = default_mgr();
         mgr.apply_decision(
-            "bash",
+            &ToolKey::native("bash"),
             &["cargo test --all".into()],
             &PermissionAnswer::AllowSession,
         );
         assert!(matches!(
-            mgr.check("bash", "cargo build", None),
+            mgr.check(&ToolKey::native("bash"), "cargo build", None),
             PermissionCheck::Allowed
         ));
     }
@@ -710,16 +797,16 @@ mod tests {
     fn deny_decision_uses_exact() {
         let mgr = default_mgr();
         mgr.apply_decision(
-            "bash",
+            &ToolKey::native("bash"),
             &["cargo test".into()],
             &PermissionAnswer::DenyAlwaysLocal,
         );
         assert!(matches!(
-            mgr.check("bash", "cargo test", None),
+            mgr.check(&ToolKey::native("bash"), "cargo test", None),
             PermissionCheck::Denied
         ));
         assert!(matches!(
-            mgr.check("bash", "cargo build", None),
+            mgr.check(&ToolKey::native("bash"), "cargo build", None),
             PermissionCheck::NeedsPrompt { .. }
         ));
     }
@@ -829,10 +916,20 @@ mod tests {
             PathBuf::from("/tmp"),
         );
         assert!(matches!(
-            mgr.check_multi("bash", &["cargo test", "git push"], false, None),
+            mgr.check_multi(
+                &ToolKey::native("bash"),
+                &["cargo test", "git push"],
+                false,
+                None
+            ),
             PermissionCheck::Allowed
         ));
-        match mgr.check_multi("bash", &["cargo test", "git push"], true, None) {
+        match mgr.check_multi(
+            &ToolKey::native("bash"),
+            &["cargo test", "git push"],
+            true,
+            None,
+        ) {
             PermissionCheck::NeedsPrompt {
                 scopes,
                 force_prompt,
@@ -850,7 +947,7 @@ mod tests {
         let mgr =
             PermissionManager::new(make_config(vec![deny_rule("rm *")]), PathBuf::from("/tmp"));
         assert!(matches!(
-            mgr.check_multi("bash", &["rm -rf /"], true, None),
+            mgr.check_multi(&ToolKey::native("bash"), &["rm -rf /"], true, None),
             PermissionCheck::Denied
         ));
     }
@@ -861,7 +958,12 @@ mod tests {
             make_config(vec![allow_rule("cargo *")]),
             PathBuf::from("/tmp"),
         );
-        match mgr.check_multi("bash", &["cargo test", "git push", "ls"], false, None) {
+        match mgr.check_multi(
+            &ToolKey::native("bash"),
+            &["cargo test", "git push", "ls"],
+            false,
+            None,
+        ) {
             PermissionCheck::NeedsPrompt { scopes, .. } => {
                 assert_eq!(scopes, vec!["git push", "ls"]);
             }
@@ -873,16 +975,16 @@ mod tests {
     fn apply_decision_multi_scope_generalizes_all() {
         let mgr = default_mgr();
         mgr.apply_decision(
-            "bash",
+            &ToolKey::native("bash"),
             &["cargo test".into(), "git status".into()],
             &PermissionAnswer::AllowSession,
         );
         assert!(matches!(
-            mgr.check("bash", "cargo build", None),
+            mgr.check(&ToolKey::native("bash"), "cargo build", None),
             PermissionCheck::Allowed
         ));
         assert!(matches!(
-            mgr.check("bash", "git push", None),
+            mgr.check(&ToolKey::native("bash"), "git push", None),
             PermissionCheck::Allowed
         ));
     }
@@ -890,21 +992,21 @@ mod tests {
     #[test]
     fn generalized_scopes_deduplicates() {
         let scopes = vec!["cargo test".into(), "cargo build".into()];
-        let result = generalized_scopes("bash", &scopes);
+        let result = generalized_scopes(&ToolKey::native("bash"), &scopes);
         assert_eq!(result, vec!["cargo *"]);
     }
 
     #[test]
     fn generalized_scopes_preserves_distinct() {
         let scopes = vec!["cargo test".into(), "git status".into()];
-        let result = generalized_scopes("bash", &scopes);
+        let result = generalized_scopes(&ToolKey::native("bash"), &scopes);
         assert_eq!(result, vec!["cargo *", "git *"]);
     }
 
     #[test_case("webfetch", "some:scope" => "some:scope" ; "unknown_tool_preserves_exact")]
-    #[test_case("mcp:fetch", "{\"url\":\"https://a\"}" => "*" ; "mcp_tool_generalizes_to_wildcard")]
+    #[test_case("myserver.fetch", "{\"url\":\"https://a\"}" => "*" ; "mcp_tool_generalizes_to_wildcard")]
     fn generalize_single_scope(tool: &str, scope: &str) -> String {
-        generalized_scopes(tool, &[scope.into()])
+        generalized_scopes(&ToolKey::parse(tool).unwrap(), &[scope.into()])
             .into_iter()
             .next()
             .unwrap()
@@ -912,7 +1014,7 @@ mod tests {
 
     #[test]
     fn generalize_edit_uses_parent_dir() {
-        let result = generalize_scope("edit", "/home/user/project/src/main.rs");
+        let result = generalize_scope(&ToolKey::native("edit"), "/home/user/project/src/main.rs");
         let expected = format!(
             "{}/**",
             Path::new("/home/user/project/src/main.rs")
@@ -925,7 +1027,7 @@ mod tests {
 
     #[test]
     fn generalize_edit_root_file() {
-        let result = generalize_scope("edit", "/Cargo.toml");
+        let result = generalize_scope(&ToolKey::native("edit"), "/Cargo.toml");
         let expected = format!(
             "{}/**",
             Path::new("/Cargo.toml").parent().unwrap().display()
@@ -941,9 +1043,10 @@ mod tests {
     #[test_case("bash", "git status --short" ; "bash_command_with_flags")]
     #[test_case("edit", "/home/user/project/src/main.rs" ; "edit_path")]
     #[test_case("webfetch", "https://example.com" ; "unknown_tool_exact")]
-    #[test_case("mcp:fetch", "{\"url\":\"https://a\"}" ; "mcp_tool_call")]
+    #[test_case("myfetch.search", "{\"url\":\"https://a\"}" ; "mcp_tool_call")]
     fn command_matches_its_own_generalized_rule(tool: &str, scope: &str) {
-        let rule = &generalized_scopes(tool, &[scope.into()])[0];
+        let tool_key = ToolKey::parse(tool).unwrap();
+        let rule = &generalized_scopes(&tool_key, &[scope.into()])[0];
         assert!(
             scope_matches(rule, scope),
             "{scope:?} does not match its generalized rule {rule:?}"
@@ -957,18 +1060,26 @@ mod tests {
     fn mcp_allow_always_matches_any_args_but_stays_per_tool() {
         let mgr = default_mgr();
         mgr.apply_decision(
-            "mcp:fetch",
+            &ToolKey::parse("myfetch.search").unwrap(),
             &["{\"url\":\"https://a\"}".into()],
             &PermissionAnswer::AllowSession,
         );
         // Same tool, different arguments -> allowed without reprompting.
         assert!(matches!(
-            mgr.check("mcp:fetch", "{\"url\":\"https://b\"}", None),
+            mgr.check(
+                &ToolKey::parse("myfetch.search").unwrap(),
+                "{\"url\":\"https://b\"}",
+                None
+            ),
             PermissionCheck::Allowed
         ));
         // A distinct MCP tool is not covered by the fetch rule.
         assert!(!matches!(
-            mgr.check("mcp:exec", "{\"cmd\":\"ls\"}", None),
+            mgr.check(
+                &ToolKey::parse("myfetch.exec").unwrap(),
+                "{\"cmd\":\"ls\"}",
+                None
+            ),
             PermissionCheck::Allowed
         ));
     }
@@ -977,34 +1088,60 @@ mod tests {
     fn deny_rule_with_none_scope_blocks_everything() {
         let mgr = PermissionManager::new(
             make_config(vec![PermissionRule {
-                tool: "bash".into(),
+                tool: ToolKey::native("bash"),
                 scope: None,
                 effect: Effect::Deny,
             }]),
             PathBuf::from("/tmp"),
         );
         assert!(matches!(
-            mgr.check("bash", "anything", None),
+            mgr.check(&ToolKey::native("bash"), "anything", None),
             PermissionCheck::Denied
         ));
     }
 
     #[test]
-    fn wildcard_tool_rule_applies_cross_tool() {
+    fn wildcard_deny_blocks_all_tools() {
         let mgr = PermissionManager::new(
             make_config(vec![PermissionRule {
-                tool: "*".into(),
+                tool: ToolKey::Wildcard,
                 scope: None,
                 effect: Effect::Deny,
             }]),
             PathBuf::from("/tmp"),
         );
+        // Any deny wins: Wildcard deny blocks everything including builtins
         assert!(matches!(
-            mgr.check("bash", "ls", None),
+            mgr.check(&ToolKey::native("bash"), "ls", None),
             PermissionCheck::Denied
         ));
         assert!(matches!(
-            mgr.check("write", "/tmp/x", None),
+            mgr.check(&ToolKey::native("write"), "/tmp/x", None),
+            PermissionCheck::Denied
+        ));
+    }
+
+    #[test]
+    fn mcp_deny_always_blocks_all_arguments() {
+        let mgr = PermissionManager::new(make_config(vec![]), PathBuf::from("/tmp"));
+        let tool = ToolKey::McpTool {
+            server: "deepwiki".into(),
+            tool: "search".into(),
+        };
+        // User denies with specific arguments — should generalize to block all.
+        mgr.apply_decision(
+            &tool,
+            &["{\"q\":\"dangerous\"}".into()],
+            &PermissionAnswer::DenyAlwaysLocal,
+        );
+        // Different arguments: still denied.
+        assert!(matches!(
+            mgr.check(&tool, "{\"q\":\"safe\"}", None),
+            PermissionCheck::Denied
+        ));
+        // Even wildcard scope: denied.
+        assert!(matches!(
+            mgr.check(&tool, "*", None),
             PermissionCheck::Denied
         ));
     }
@@ -1016,11 +1153,11 @@ mod tests {
         mgr.toggle_yolo();
         assert!(mgr.is_yolo());
         assert!(matches!(
-            mgr.check("bash", "cargo test", None),
+            mgr.check(&ToolKey::native("bash"), "cargo test", None),
             PermissionCheck::Allowed
         ));
         assert!(matches!(
-            mgr.check("bash", "rm -rf /", None),
+            mgr.check(&ToolKey::native("bash"), "rm -rf /", None),
             PermissionCheck::Denied
         ));
     }
@@ -1039,7 +1176,7 @@ mod tests {
     #[test_case(PermissionAnswer::Deny ; "deny_once")]
     fn once_decisions_add_no_session_rules(answer: PermissionAnswer) {
         let mgr = default_mgr();
-        mgr.apply_decision("bash", &["cargo test".into()], &answer);
+        mgr.apply_decision(&ToolKey::native("bash"), &["cargo test".into()], &answer);
         assert!(mgr.session_rules_snapshot().is_empty());
     }
 
@@ -1053,7 +1190,7 @@ mod tests {
             PathBuf::from("/tmp"),
         );
         assert!(matches!(
-            mgr.check("bash", "cargo test", None),
+            mgr.check(&ToolKey::native("bash"), "cargo test", None),
             PermissionCheck::Denied
         ));
     }
@@ -1069,11 +1206,11 @@ mod tests {
             PathBuf::from("/tmp"),
         );
         assert!(matches!(
-            mgr.check("bash", "cargo test", None),
+            mgr.check(&ToolKey::native("bash"), "cargo test", None),
             PermissionCheck::Allowed
         ));
         assert!(matches!(
-            mgr.check("bash", "rm -rf /", None),
+            mgr.check(&ToolKey::native("bash"), "rm -rf /", None),
             PermissionCheck::Denied
         ));
     }
@@ -1088,7 +1225,7 @@ mod tests {
             PathBuf::from("/tmp"),
         );
         assert!(matches!(
-            mgr.check("bash", "cargo test", None),
+            mgr.check(&ToolKey::native("bash"), "cargo test", None),
             PermissionCheck::Allowed
         ));
     }
@@ -1097,8 +1234,69 @@ mod tests {
     fn default_prompt_is_default_behavior() {
         let mgr = PermissionManager::new(PermissionsConfig::default(), PathBuf::from("/tmp"));
         assert!(matches!(
-            mgr.check("bash", "cargo test", None),
+            mgr.check(&ToolKey::native("bash"), "cargo test", None),
             PermissionCheck::NeedsPrompt { .. }
+        ));
+    }
+
+    #[test]
+    fn mcp_server_wildcard_matches_all_server_tools() {
+        let mgr = PermissionManager::new(
+            make_config(vec![PermissionRule {
+                tool: ToolKey::McpServer {
+                    server: "deepwiki".into(),
+                },
+                scope: None,
+                effect: Effect::Allow,
+            }]),
+            PathBuf::from("/tmp"),
+        );
+        assert!(matches!(
+            mgr.check(
+                &ToolKey::McpTool {
+                    server: "deepwiki".into(),
+                    tool: "search".into()
+                },
+                "{}",
+                None
+            ),
+            PermissionCheck::Allowed
+        ));
+        assert!(matches!(
+            mgr.check(
+                &ToolKey::McpTool {
+                    server: "deepwiki".into(),
+                    tool: "web_search".into()
+                },
+                "{}",
+                None
+            ),
+            PermissionCheck::Allowed
+        ));
+    }
+
+    #[test]
+    fn mcp_server_wildcard_does_not_match_other_server() {
+        let mgr = PermissionManager::new(
+            make_config(vec![PermissionRule {
+                tool: ToolKey::McpServer {
+                    server: "deepwiki".into(),
+                },
+                scope: None,
+                effect: Effect::Allow,
+            }]),
+            PathBuf::from("/tmp"),
+        );
+        assert!(!matches!(
+            mgr.check(
+                &ToolKey::McpTool {
+                    server: "github".into(),
+                    tool: "search".into()
+                },
+                "{}",
+                None
+            ),
+            PermissionCheck::Allowed
         ));
     }
 
@@ -1107,18 +1305,18 @@ mod tests {
         let mgr = PermissionManager::new(
             PermissionsConfig {
                 default: DefaultEffect::Deny,
-                tool_defaults: HashMap::from([("bash".into(), DefaultEffect::Allow)]),
+                tool_defaults: HashMap::from([(ToolKey::native("bash"), DefaultEffect::Allow)]),
                 rules: vec![],
                 ..Default::default()
             },
             PathBuf::from("/tmp"),
         );
         assert!(matches!(
-            mgr.check("bash", "cargo test", None),
+            mgr.check(&ToolKey::native("bash"), "cargo test", None),
             PermissionCheck::Allowed
         ));
         assert!(matches!(
-            mgr.check("write", "/etc/passwd", None),
+            mgr.check(&ToolKey::native("write"), "/etc/passwd", None),
             PermissionCheck::Denied
         ));
     }
@@ -1132,10 +1330,39 @@ mod tests {
         let mgr = default_mgr();
         assert_eq!(
             matches!(
-                mgr.check(tool, plan, Some(plan_path)),
+                mgr.check(&ToolKey::native(tool), plan, Some(plan_path)),
                 PermissionCheck::Allowed
             ),
             expect_allowed,
         );
+    }
+
+    #[test]
+    fn plan_path_multi_scope_all_must_match() {
+        let plan = "/home/user/.local/state/maki/plans/test.md";
+        let plan_path = Path::new(plan);
+        let mgr = default_mgr();
+
+        // All scopes match plan → allowed
+        assert!(matches!(
+            mgr.check_multi(
+                &ToolKey::native("write"),
+                &[plan, plan],
+                false,
+                Some(plan_path),
+            ),
+            PermissionCheck::Allowed
+        ));
+
+        // One scope is non-plan → needs prompt
+        assert!(matches!(
+            mgr.check_multi(
+                &ToolKey::native("write"),
+                &[plan, "/etc/passwd"],
+                false,
+                Some(plan_path),
+            ),
+            PermissionCheck::NeedsPrompt { .. }
+        ));
     }
 }

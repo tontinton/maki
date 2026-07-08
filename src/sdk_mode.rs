@@ -969,7 +969,7 @@ impl EventPump {
                     .tool_inputs
                     .get(id)
                     .cloned()
-                    .unwrap_or_else(|| (tool.clone(), Value::Null));
+                    .unwrap_or_else(|| (tool.to_string(), Value::Null));
 
                 self.request_counter += 1;
                 let req_id = format!("req_{}", self.request_counter);

@@ -6,10 +6,9 @@ use std::time::Duration;
 use serde::Deserialize;
 use toml_edit::DocumentMut;
 
-use super::SEPARATOR;
 use super::error::McpError;
 use crate::tools::is_builtin_tool;
-use maki_config::global_config_dir;
+use maki_config::{global_config_dir, is_valid_server_name};
 
 const MCP_CONFIG_FILE: &str = "mcp.toml";
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
@@ -183,11 +182,7 @@ pub enum Transport {
     },
 }
 
-fn is_valid_server_name(name: &str) -> bool {
-    !name.is_empty()
-        && !name.contains(SEPARATOR)
-        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
-}
+pub(super) use maki_config::is_valid_wire_name as is_valid_tool_name;
 
 impl McpConfig {
     pub fn is_empty(&self) -> bool {

@@ -6,6 +6,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
 use maki_agent::permissions::{DEFAULT_DENY_GUIDANCE, PermissionAnswer, generalized_scopes};
+use maki_config::ToolKey;
 
 use crate::components::Overlay;
 use crate::components::form::render_form;
@@ -95,7 +96,7 @@ pub enum PermissionPrompt {
     Open {
         #[allow(dead_code)]
         id: String,
-        tool: String,
+        tool: ToolKey,
         scopes: Vec<String>,
         subagent_id: Option<String>,
         allow_scopes: Vec<String>,
@@ -126,7 +127,7 @@ impl PermissionPrompt {
     pub fn open(
         &mut self,
         id: String,
-        tool: String,
+        tool: ToolKey,
         scopes: Vec<String>,
         subagent_id: Option<String>,
     ) {
@@ -267,7 +268,7 @@ impl PermissionPrompt {
         if subagent_id.is_some() {
             tool_spans.push(Span::styled("[subtask] ", t.item_desc));
         }
-        tool_spans.push(Span::styled(tool.clone(), value_style));
+        tool_spans.push(Span::styled(tool.to_string(), value_style));
 
         let mut lines = vec![Line::raw(""), Line::from(tool_spans)];
         for (i, s) in scopes.iter().enumerate() {
@@ -365,12 +366,18 @@ impl PermissionPrompt {
 mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use maki_agent::permissions::PermissionAnswer;
+    use maki_config::ToolKey;
 
     use super::{PermissionPrompt, PromptState};
 
     fn open_prompt() -> PermissionPrompt {
         let mut prompt = PermissionPrompt::new();
-        prompt.open("id".into(), "bash".into(), vec!["execute".into()], None);
+        prompt.open(
+            "id".into(),
+            ToolKey::native("bash"),
+            vec!["execute".into()],
+            None,
+        );
         prompt
     }
 
@@ -450,5 +457,12 @@ mod tests {
         } else {
             panic!("expected Open");
         }
+    }
+
+    #[test]
+    fn wildcard_tool_key_opens() {
+        let mut prompt = PermissionPrompt::new();
+        prompt.open("id".into(), ToolKey::Wildcard, vec![], None);
+        assert!(matches!(prompt, PermissionPrompt::Open { .. }));
     }
 }

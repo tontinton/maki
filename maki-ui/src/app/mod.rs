@@ -1059,7 +1059,8 @@ impl App {
         }
 
         if let ChatEventResult::PermissionRequest { id, tool, scopes } = result {
-            self.permission_prompt.open(id, tool, scopes, subagent_id);
+            self.permission_prompt
+                .open(id, tool, scopes, subagent_id.clone());
             return vec![];
         }
 

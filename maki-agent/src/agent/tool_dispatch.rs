@@ -12,6 +12,7 @@ use crate::task_set::TaskSet;
 use crate::tools::registry::{ToolInvocation, ToolRegistry};
 use crate::tools::{LocalToolFn, ToolContext};
 use crate::{AgentError, AgentEvent, ToolDoneEvent, ToolOutput, ToolStartEvent};
+use maki_config::ToolKey;
 
 #[derive(Clone, Copy)]
 pub enum Emit {
@@ -71,10 +72,20 @@ pub async fn run(
         return run_local_tool(local, id, name, input, ctx, emit);
     }
     let entry = registry.get(name);
+    // LLM providers send tool names in wire format (server__tool) but our
+    // internal index uses server.tool. Only convert if the name isn't a
+    // native tool — avoids mangling native names that happen to contain __.
+    let mcp_name;
+    let mcp_lookup = if entry.is_none() && name.contains("__") && mcp.is_some() {
+        mcp_name = crate::mcp::internal_tool_name(name);
+        mcp_name.as_str()
+    } else {
+        name
+    };
     let tool_id: Arc<str> = entry
         .as_ref()
         .map(|e| Arc::from(e.tool.name()))
-        .or_else(|| mcp.map(|m| m.interned_name(name)))
+        .or_else(|| mcp.map(|m| m.interned_name(mcp_lookup)))
         .unwrap_or_else(|| Arc::from(UNKNOWN_MCP));
     let started = Instant::now();
 
@@ -171,12 +182,12 @@ pub async fn run(
                 done_error(message)
             }
         }
-    } else if mcp.is_some_and(|m| m.has_tool(name)) {
+    } else if mcp.is_some_and(|m| m.has_tool(mcp_lookup)) {
         // MCP tools skip parsing, so we assemble the start event manually.
         let start = ToolStartEvent {
             id: id.clone(),
             tool: Arc::clone(&tool_id),
-            summary: format!("mcp: {name}"),
+            summary: format!("mcp: {mcp_lookup}"),
             render_header: None,
             annotation: None,
             input: None,
@@ -186,10 +197,10 @@ pub async fn run(
         if matches!(emit, Emit::Notify) {
             let _ = ctx.event_tx.send(AgentEvent::ToolStart(Box::new(start)));
         }
-        execute_mcp_tool(ctx, &id, tool_id, name, input).await
+        execute_mcp_tool(ctx, &id, tool_id, mcp_lookup, input).await
     } else {
-        let msg = format!("{UNKNOWN_TOOL_PREFIX}: {name}");
-        warn!(tool = %name, "unknown tool");
+        let msg = format!("{UNKNOWN_TOOL_PREFIX}: {mcp_lookup}");
+        warn!(tool = %mcp_lookup, "unknown tool");
         done_error(msg)
     }
 }
@@ -233,16 +244,26 @@ fn run_local_tool(
     }
 }
 
+/// Enforce permission for a native tool. MCP tools bypass this — they go
+/// through `execute_mcp_tool` which handles permission checking internally.
+///
+/// Returns an error if `name` contains dots (not a valid native tool name).
 async fn enforce_permission(
     inv: &dyn ToolInvocation,
     name: &str,
     ctx: &ToolContext,
     id: &str,
 ) -> Result<(), String> {
+    if name.contains('.') {
+        return Err(format!(
+            "enforce_permission called with dotted name: {name}"
+        ));
+    }
     if let Some(scopes) = inv.permission_scopes().await {
+        let tool_key = ToolKey::native(name);
         ctx.permissions
             .enforce(
-                name,
+                &tool_key,
                 &scopes,
                 &ctx.event_tx,
                 ctx.user_response_rx.as_deref(),
@@ -276,7 +297,12 @@ async fn execute_mcp_tool(
         return done(MCP_BLOCKED_IN_PLAN.into(), true);
     }
 
-    let perm_tool = format!("mcp:{tool_name}");
+    let perm_tool = match ToolKey::parse(tool_name) {
+        Ok(k) => k,
+        Err(e) => {
+            return done(format!("invalid MCP tool key '{tool_name}': {e}"), true);
+        }
+    };
     let perm_scope = {
         let json = input.to_string();
         if json.len() > 200 {
@@ -425,7 +451,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    use maki_config::{Effect, PermissionRule, PermissionsConfig};
+    use maki_config::{Effect, PermissionRule, PermissionsConfig, ToolKey};
     use tempfile::TempDir;
     use test_case::test_case;
 
@@ -548,7 +574,7 @@ mod tests {
                 &ctx.registry,
                 None,
                 "t1".into(),
-                "nonexistent__tool",
+                "nonexistent.tool",
                 &serde_json::json!({}),
                 &ctx,
                 Emit::Silent,
@@ -558,7 +584,7 @@ mod tests {
             assert_eq!(done.tool.as_ref(), UNKNOWN_MCP);
             let text = done.output.as_text();
             assert!(text.starts_with(UNKNOWN_TOOL_PREFIX));
-            assert!(text.contains("nonexistent__tool"));
+            assert!(text.contains("nonexistent.tool"));
         });
     }
 
@@ -570,7 +596,7 @@ mod tests {
                     "/tmp/plan.md",
                 ))),
                 "t1",
-                "myserver__mytool",
+                "myserver.mytool",
                 &serde_json::json!({}),
             )
             .await;
@@ -585,7 +611,7 @@ mod tests {
             let result = dispatch_mcp(
                 &crate::tools::test_support::stub_ctx(&AgentMode::Build),
                 "t1",
-                "myserver__mytool",
+                "myserver.mytool",
                 &serde_json::json!({}),
             )
             .await;
@@ -599,7 +625,7 @@ mod tests {
         smol::block_on(async {
             let deny_cfg = PermissionsConfig {
                 rules: vec![PermissionRule {
-                    tool: GUARDED_TOOL_NAME.into(),
+                    tool: ToolKey::native(GUARDED_TOOL_NAME),
                     scope: None,
                     effect: Effect::Deny,
                 }],
@@ -707,7 +733,7 @@ mod tests {
         smol::block_on(async {
             let deny_cfg = PermissionsConfig {
                 rules: vec![PermissionRule {
-                    tool: START_PROBE_NAME.into(),
+                    tool: ToolKey::native(START_PROBE_NAME),
                     scope: None,
                     effect: Effect::Deny,
                 }],
