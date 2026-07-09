@@ -17,6 +17,7 @@ use maki_agent::{
 };
 use maki_lua::EventHandle;
 use maki_providers::{AgentError, Message, Model, TokenUsage};
+use maki_storage::tree::NodeRef;
 use serde_json::Value;
 use tracing::error;
 
@@ -127,6 +128,14 @@ impl AgentLoop {
                 self.do_agent_run(input, event_tx, run_id).await
             }
             QueueItem::Compact { .. } => self.do_compact(&event_tx).await,
+            QueueItem::BranchSummary {
+                run_id,
+                parent,
+                fold_from_id,
+            } => {
+                self.do_branch_summary(run_id, parent, fold_from_id, &event_tx)
+                    .await
+            }
         };
 
         if let Err(e) = result {
@@ -156,6 +165,38 @@ impl AgentLoop {
         let (provider, model) =
             agent::resolve_compaction_model(&slot.provider, &slot.model, self.timeouts);
         agent::compact(&*provider, &model, &mut self.history, event_tx).await
+    }
+
+    async fn do_branch_summary(
+        &mut self,
+        run_id: u64,
+        parent: NodeRef,
+        fold_from_id: NodeRef,
+        event_tx: &EventSender,
+    ) -> Result<(), AgentError> {
+        let slot = self.model_slot.load();
+        let (provider, model) =
+            agent::resolve_compaction_model(&slot.provider, &slot.model, self.timeouts);
+        let (trigger, cancel) = CancelToken::new();
+        self.cancel_map.insert(run_id, trigger);
+        let result = agent::branch_summary(
+            &*provider,
+            &model,
+            &mut self.history,
+            parent,
+            fold_from_id,
+            event_tx,
+            &cancel,
+        )
+        .await;
+        self.cancel_map.remove(&run_id);
+        let usage = result?;
+        event_tx.send(AgentEvent::Done {
+            usage,
+            num_turns: 1,
+            stop_reason: None,
+        })?;
+        Ok(())
     }
 
     async fn do_agent_run(

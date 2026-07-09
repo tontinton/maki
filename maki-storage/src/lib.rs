@@ -3,6 +3,7 @@
 //! `atomic_write_permissions` sets file mode before persist (for auth keys at 0600).
 
 pub mod auth;
+pub mod fork;
 pub mod input_history;
 pub mod log;
 pub mod migration;
@@ -137,6 +138,10 @@ fn retry_rename(src: &Path, dest: &Path) -> std::io::Result<()> {
 #[cfg(not(windows))]
 fn retry_rename(src: &Path, dest: &Path) -> std::io::Result<()> {
     fs::rename(src, dest)
+}
+
+pub fn new_session_id() -> String {
+    uuid::Uuid::new_v4().to_string()
 }
 
 pub fn now_epoch() -> u64 {

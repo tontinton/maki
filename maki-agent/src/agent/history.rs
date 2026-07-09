@@ -150,6 +150,29 @@ impl History {
         id
     }
 
+    #[cfg(test)]
+    pub fn test_rewind_leaf_to(&mut self, nref: NodeRef) {
+        self.tree.leaf = Position::At(nref);
+        self.bump();
+    }
+
+    #[cfg(test)]
+    pub fn test_leaf_ref(&self) -> Option<NodeRef> {
+        self.tree.leaf.node_ref().cloned()
+    }
+
+    #[cfg(test)]
+    pub fn test_find_msg_by_content(&self, needle: &str) -> Option<NodeRef> {
+        self.tree.nodes.iter().find_map(|(nref, node)| match node {
+            TreeNode::Message(m) => m
+                .content
+                .iter()
+                .any(|r| r.get().contains(needle))
+                .then(|| nref.clone()),
+            _ => None,
+        })
+    }
+
     /// Push a cancelled-tool result group as one hidden user node (§8). The
     /// interrupt-finalize wiring is C6; this keeps the cancelled-results path
     /// working as an ordinary hidden node.
@@ -269,7 +292,56 @@ impl History {
         out
     }
 
-    /// Freeze the narrative into a `SummaryRecord` (compaction kind) parented
+    /// The abandoned branch messages for branch-summary (§6): walk from
+    /// `fold_from_id` toward root until (but excluding) `parent`, collecting
+    /// the abandoned branch. `parent` is the landing node the summary will be
+    /// parented at; `fold_from_id` is the abandoned tip.
+    pub fn abandoned_branch_prefix(
+        &self,
+        parent: &NodeRef,
+        fold_from_id: &NodeRef,
+    ) -> Vec<Message> {
+        let mut path: Vec<&TreeNode> = Vec::new();
+        let mut cur = Some(fold_from_id.clone());
+        while let Some(nref) = cur {
+            if &nref == parent {
+                break;
+            }
+            let Some(node) = self.tree.nodes.get(&nref) else {
+                break;
+            };
+            path.push(node);
+            cur = node.parent_id();
+        }
+        path.reverse();
+        let mut out: Vec<Message> = path
+            .into_iter()
+            .map(|node| match node {
+                TreeNode::Message(m) => {
+                    let flavor = self
+                        .tree
+                        .flavors
+                        .get(&NodeRef::Msg(m.id.clone()))
+                        .copied()
+                        .unwrap_or(Flavor::UserPrompt);
+                    let display_text = if matches!(flavor, Flavor::Hidden) {
+                        Some(String::new())
+                    } else {
+                        None
+                    };
+                    Message {
+                        role: m.role,
+                        content: rehydrate(m),
+                        display_text,
+                    }
+                }
+                TreeNode::Summary(s) => hidden_user_msg(s.narrative.clone()),
+            })
+            .collect();
+        repair(&mut out);
+        out
+    }
+
     /// at the current leaf and advance the leaf onto it (§6). If the
     /// pre-compaction tip is an assistant turn, push the hidden continue-prompt
     /// as a normal node so the branch ends in a user turn.
@@ -301,6 +373,44 @@ impl History {
             },
             read_files,
             modified_files,
+        };
+        let nref = NodeRef::Sum(record.id.clone());
+        self.tree
+            .nodes
+            .insert(nref.clone(), TreeNode::Summary(record));
+        self.tree.order.push(OrderedRecord::Node(nref.clone()));
+        self.tree.leaf = Position::At(nref);
+        if tip_is_assistant {
+            self.push(Message::synthetic(continue_prompt.into()));
+        }
+        self.bump();
+    }
+
+    /// Freeze the narrative into a `SummaryRecord` (branch kind) parented at
+    /// `parent` and advance the leaf onto it (§6). The branch summary folds
+    /// **in place** on the active path: the abandoned branch itself is never
+    /// walked, `fold_from_id` records its tip as provenance only. If the tip
+    /// (parent) is an assistant turn, push the hidden continue-prompt as a
+    /// normal node so the branch ends in a user turn.
+    pub fn append_branch_summary(
+        &mut self,
+        parent: NodeRef,
+        fold_from_id: NodeRef,
+        narrative: String,
+        continue_prompt: &str,
+    ) {
+        let tip_is_assistant = self
+            .tree
+            .flavors
+            .get(&parent)
+            .is_some_and(|f| matches!(f, Flavor::Assistant { .. }));
+        let record = SummaryRecord {
+            id: SummaryId::new(),
+            parent_id: parent.clone(),
+            narrative,
+            kind: SummaryKind::Branch { fold_from_id },
+            read_files: Vec::new(),
+            modified_files: Vec::new(),
         };
         let nref = NodeRef::Sum(record.id.clone());
         self.tree

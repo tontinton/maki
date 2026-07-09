@@ -18,7 +18,7 @@ use tracing::warn;
 use crate::paths::{lock_path, log_path, meta_path, renders_path, session_dir};
 use crate::renders::{self, RenderStore};
 use crate::sessions::SessionError;
-use crate::tree::TreeEvent::{Append, Navigate, Summary};
+use crate::tree::TreeEvent::{Append, Fork, Navigate, Summary};
 use crate::tree::{
     AppendKind, Flavor, Header, LeafId, LeafRecord, MessageId, MessageNode, NodeRef, OrderedRecord,
     Position, Role, SessionTree, SummaryRecord, ToolUseId, TreeEvent, TreeMutation, TreeNode,
@@ -84,6 +84,11 @@ pub struct SessionWriter {
 impl SessionWriter {
     pub fn session_id(&self) -> &str {
         &self.loaded.header.session_id
+    }
+
+    /// `<base>/sessions/` — where fork installs the new session folder (§A.8).
+    pub fn sessions_base(&self) -> &Path {
+        self.session_dir.parent().unwrap_or(&self.session_dir)
     }
 
     pub fn renders(&mut self) -> &mut RenderStore {
@@ -614,6 +619,36 @@ impl TreeWriter {
                 TreeMutation::Barrier(ack) => {
                     let _ = self.writer.sync();
                     let _ = ack.send(());
+                }
+                TreeMutation::Fork {
+                    new_session_id,
+                    from_node_id,
+                    ack,
+                } => {
+                    let _ = self.writer.sync();
+                    let sessions_base = self.writer.sessions_base().to_path_buf();
+                    let result = crate::fork::fork_to(
+                        &self.writer.loaded,
+                        &mut self.writer.renders,
+                        &sessions_base,
+                        &new_session_id,
+                        &from_node_id,
+                    );
+                    match result {
+                        Ok(parent_title) => {
+                            self.emit(Fork {
+                                new_session_id: new_session_id.clone(),
+                                parent_title: parent_title.clone(),
+                            });
+                            let _ = ack.send(Ok(crate::tree::ForkResult {
+                                new_session_id,
+                                parent_title,
+                            }));
+                        }
+                        Err(e) => {
+                            let _ = ack.send(Err(e.to_string()));
+                        }
+                    }
                 }
             }
         }

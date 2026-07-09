@@ -112,6 +112,9 @@ const NO_TOOL_RESULT: &str = "no tool result";
 const ONLY: &str = "only";
 const PLAIN_REPLY: &str = "plain reply";
 const HELLO: &str = "hello";
+const BRANCH_NARRATIVE: &str = "abandoned branch was about X";
+const ABANDONED_USER_MSG: &str = "abandoned question";
+const LANDING_USER_MSG: &str = "landing question";
 
 #[test_case(159_999, 0,       0,       0,      200_000, false ; "below_threshold")]
 #[test_case(160_000, 0,       0,       0,      200_000, true  ; "at_threshold")]
@@ -292,4 +295,108 @@ fn truncate_oldest_round_consecutive_assistants_drains_until_user() {
     truncate_oldest_round(&mut messages);
     assert!(!messages.is_empty());
     assert!(matches!(messages[0].role, Role::User));
+}
+
+fn narrative_response(text: &str) -> StreamResponse {
+    StreamResponse {
+        message: Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text { text: text.into() }],
+            ..Default::default()
+        },
+        usage: TokenUsage::default(),
+        stop_reason: Some(StopReason::EndTurn),
+    }
+}
+
+#[test]
+fn branch_summary_appends_narrative_in_place() {
+    smol::block_on(async {
+        let provider: std::sync::Arc<dyn Provider> =
+            std::sync::Arc::new(MockProvider::new(vec![narrative_response(
+                BRANCH_NARRATIVE,
+            )]));
+        let model = default_model();
+        let (raw_tx, _rx) = flume::unbounded();
+        let mut history = History::new(vec![
+            Message::user(LANDING_USER_MSG.into()),
+            Message::user(ABANDONED_USER_MSG.into()),
+        ]);
+
+        let parent = history.test_find_msg_by_content(LANDING_USER_MSG).unwrap();
+        let leaf = history.test_leaf_ref().unwrap();
+        history.test_rewind_leaf_to(parent.clone());
+
+        branch_summary(
+            &*provider,
+            &model,
+            &mut history,
+            parent,
+            leaf,
+            &EventSender::new(raw_tx, 0),
+            &CancelToken::none(),
+        )
+        .await
+        .unwrap();
+
+        let ctx = history.active_branch();
+        assert!(
+            ctx.iter().any(|m| m.content.iter().any(|b| matches!(
+                b,
+                ContentBlock::Text { text } if text == BRANCH_NARRATIVE
+            ))),
+            "branch-summary narrative must fold in place"
+        );
+        assert!(
+            !ctx.iter().any(|m| m.content.iter().any(|b| matches!(
+                b,
+                ContentBlock::Text { text } if text == ABANDONED_USER_MSG
+            ))),
+            "abandoned message must not appear in the fold"
+        );
+    });
+}
+
+#[test]
+fn branch_summary_aborts_on_cancel_leaves_no_record() {
+    smol::block_on(async {
+        let provider: std::sync::Arc<dyn Provider> =
+            std::sync::Arc::new(MockProvider::new(vec![narrative_response(
+                BRANCH_NARRATIVE,
+            )]));
+        let model = default_model();
+        let (raw_tx, _rx) = flume::unbounded();
+        let mut history = History::new(vec![
+            Message::user(LANDING_USER_MSG.into()),
+            Message::user(ABANDONED_USER_MSG.into()),
+        ]);
+
+        let parent = history.test_find_msg_by_content(LANDING_USER_MSG).unwrap();
+        let leaf = history.test_leaf_ref().unwrap();
+        history.test_rewind_leaf_to(parent.clone());
+
+        let (trigger, cancel) = CancelToken::new();
+        trigger.cancel();
+
+        let result = branch_summary(
+            &*provider,
+            &model,
+            &mut history,
+            parent,
+            leaf,
+            &EventSender::new(raw_tx, 0),
+            &cancel,
+        )
+        .await;
+
+        assert!(result.is_err(), "cancelled summary must return an error");
+        let ctx = history.active_branch();
+        assert!(
+            !ctx.iter().any(|m| m.content.iter().any(|b| matches!(
+                b,
+                ContentBlock::Text { text } if text == BRANCH_NARRATIVE
+            ))),
+            "no narrative appended after cancel"
+        );
+    });
 }

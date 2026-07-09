@@ -156,6 +156,47 @@ impl StorageWriter {
         &self.dir
     }
 
+    /// Fork root→cursor into a new session (§5, §A.8). Enqueues the `Fork`
+    /// mutation; the writer flushes buffered appends, copies the on-path nodes,
+    /// renders, and subagent transcripts into a staged temp dir, atomically
+    /// renames it into place, then acks. Returns the new session id and parent
+    /// title on success. The caller copies snapshots post-ack. Returns
+    /// `Err(Readonly)` if the writer is read-only, or `Err(NoWriter)` if the
+    /// channel is gone.
+    pub fn fork(
+        &self,
+        new_session_id: String,
+        from_node_id: NodeRef,
+    ) -> Result<maki_storage::tree::ForkResult, RewindError> {
+        {
+            let state = self.state.lock().unwrap();
+            if state.readonly {
+                return Err(RewindError::Readonly);
+            }
+        }
+        let (ack_tx, ack_rx) = flume::bounded::<Result<maki_storage::tree::ForkResult, String>>(1);
+        let guard = self.handle.lock().unwrap();
+        let Some(handle) = guard.as_ref() else {
+            return Err(RewindError::NoWriter);
+        };
+        if handle
+            .tx
+            .send(TreeMutation::Fork {
+                new_session_id: new_session_id.clone(),
+                from_node_id,
+                ack: ack_tx,
+            })
+            .is_err()
+        {
+            return Err(RewindError::NoWriter);
+        }
+        drop(guard);
+        ack_rx
+            .recv()
+            .map_err(|_| RewindError::NoWriter)?
+            .map_err(|_| RewindError::Readonly)
+    }
+
     /// Reset the cursor to match a rebuilt messages vec after a rewind. The
     /// folded active branch is already on disk (the rewind committed it); the
     /// cursor must not re-append it. `last_leaf` is preserved — it was set by
@@ -600,6 +641,43 @@ mod tests {
         // A second send is also a no-op.
         w.send(&session);
         w.barrier().ok();
+        w.shutdown(Duration::from_secs(2));
+    }
+
+    /// Fork copies the path nodes + renders into a new session folder that
+    /// loads clean with header lineage (§5, §A.8). `fold_from_id` dangling is
+    /// exempt; the fork loads clean.
+    #[test]
+    fn fork_copies_path_and_loads_clean() {
+        let tmp = TempDir::new().unwrap();
+        let w = writer_at(tmp.path());
+
+        let session = session_with(
+            "fork-src",
+            vec![
+                Message::user("first".into()),
+                Message::user("second".into()),
+            ],
+        );
+        w.send(&session);
+        barrier_ack(&w);
+
+        let src_loaded = load_folder(&session_dir(tmp.path(), "fork-src"), "fork-src").unwrap();
+        let tree = build_session_tree(&src_loaded).unwrap();
+        let cursor = tree.leaf.node_ref().cloned().expect("non-empty leaf");
+
+        let new_id = maki_storage::new_session_id();
+        let result = w.fork(new_id.clone(), cursor).expect("fork ack");
+        assert_eq!(result.new_session_id, new_id);
+        assert_eq!(result.parent_title, "New session", "default title");
+
+        let dst_loaded = load_folder(&session_dir(tmp.path(), &new_id), &new_id).unwrap();
+        assert_eq!(dst_loaded.messages.len(), 2, "path nodes copied");
+        assert_eq!(
+            dst_loaded.header.parent_session_id.as_deref(),
+            Some("fork-src"),
+            "lineage recorded"
+        );
         w.shutdown(Duration::from_secs(2));
     }
 }

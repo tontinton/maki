@@ -131,6 +131,21 @@ impl App {
         });
     }
 
+    pub(super) fn queue_branch_summary(
+        &mut self,
+        parent: maki_storage::tree::NodeRef,
+        fold_from_id: maki_storage::tree::NodeRef,
+    ) {
+        let Some(ref shared) = self.queue.shared else {
+            return;
+        };
+        shared.push(QueueItem::BranchSummary {
+            run_id: self.run_id,
+            parent,
+            fold_from_id,
+        });
+    }
+
     /// Agent reached a deferred message: time to draw the bubble.
     /// Immediate-dispatch items skip this event, so no dedup needed.
     pub(super) fn on_queue_item_consumed(&mut self, text: &str, image_count: usize) {

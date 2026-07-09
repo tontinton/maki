@@ -488,6 +488,10 @@ impl<'t> EventLoop<'t> {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner()) = loaded.tool_outputs;
             }
+            Action::LoadForkedSession { id } => {
+                let actions = self.app.load_session(id);
+                self.dispatch(actions);
+            }
             Action::ChangeModel(spec) => self.change_model(spec),
             Action::RefreshProvider { slug } => self.refresh_provider(slug),
             Action::AssignTier(spec, tier) => {

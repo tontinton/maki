@@ -5,7 +5,7 @@ mod run;
 mod streaming;
 pub mod tool_dispatch;
 
-pub use compaction::compact;
+pub use compaction::{branch_summary, compact};
 pub use history::{CutPoint, History, SharedContext, ValidContext, finalize::FinalizedPartial};
 pub use instructions::{
     Instructions, LoadedInstructions, build_system_prompt, find_subdirectory_instructions,

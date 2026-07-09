@@ -79,6 +79,69 @@ pub(super) async fn compact_history(
     Err(last_error.unwrap())
 }
 
+/// Generate a branch-summary narrative for the abandoned branch (§6), then
+/// freeze it into a `SummaryRecord` with `SummaryKind::Branch`. Mirrors
+/// `compact_history` but summarizes the abandoned off-path branch rather than
+/// the compaction cut. On cancel, returns `AgentError::Cancelled` and no record
+/// is appended (rewind proceeds clean, §6).
+pub async fn branch_summary(
+    provider: &dyn maki_providers::provider::Provider,
+    model: &Model,
+    history: &mut History,
+    parent: maki_storage::tree::NodeRef,
+    fold_from_id: maki_storage::tree::NodeRef,
+    event_tx: &EventSender,
+    cancel: &CancelToken,
+) -> Result<TokenUsage, AgentError> {
+    let summary_start = std::time::Instant::now();
+
+    let mut prefix = history.abandoned_branch_prefix(&parent, &fold_from_id);
+    if prefix.is_empty() {
+        warn!("branch-summary refused: empty abandoned branch");
+        return Ok(TokenUsage::default());
+    }
+    strip_images(&mut prefix);
+    strip_thinking(&mut prefix);
+    prefix.push(Message::user(crate::prompt::COMPACTION_USER.to_string()));
+
+    let empty_tools = serde_json::json!([]);
+    let response = stream_with_retry(
+        provider,
+        model,
+        &prefix,
+        crate::prompt::COMPACTION_SYSTEM,
+        &empty_tools,
+        event_tx,
+        cancel,
+        RequestOptions::default(),
+        None,
+    )
+    .await?;
+
+    let _ = event_tx.send(AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
+        message: response.message.clone(),
+        usage: response.usage,
+        model: model.id.clone(),
+        context_size: Some(response.usage.output),
+    })));
+
+    let narrative = response
+        .message
+        .first_text_content()
+        .unwrap_or_default()
+        .to_owned();
+
+    history.append_branch_summary(parent, fold_from_id, narrative, CONTINUE_AFTER_COMPACT);
+
+    info!(
+        model = %model.id,
+        duration_ms = summary_start.elapsed().as_millis() as u64,
+        "branch-summary completed"
+    );
+
+    Ok(response.usage)
+}
+
 fn finish_compact(
     response: StreamResponse,
     history: &mut History,

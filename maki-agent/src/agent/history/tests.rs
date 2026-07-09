@@ -522,3 +522,92 @@ fn compaction_prefix_returns_cut_region() {
         );
     }
 }
+
+fn build_branched_history() -> History {
+    let messages = vec![
+        user_msg(USER_MSG_A),
+        assistant_text(ASSISTANT_REPLY),
+        user_msg("second question"),
+        assistant_text("second reply"),
+    ];
+    let mut history = History::new(messages);
+    let landing = history.test_leaf_ref().expect("leaf after 4 messages");
+    let _abandoned_tip = history.push(user_msg("abandoned branch message"));
+    history.test_rewind_leaf_to(landing);
+    history
+}
+
+#[test]
+fn abandoned_branch_prefix_collects_off_path_messages() {
+    let history = build_branched_history();
+    let parent = history.test_leaf_ref().unwrap();
+    let fold_from_id = history
+        .test_find_msg_by_content("abandoned branch")
+        .expect("abandoned tip");
+
+    let prefix = history.abandoned_branch_prefix(&parent, &fold_from_id);
+    assert_eq!(
+        prefix.len(),
+        1,
+        "prefix must contain exactly the abandoned branch message"
+    );
+    assert!(
+        prefix[0].content.iter().any(
+            |b| matches!(b, ContentBlock::Text { text } if text == "abandoned branch message")
+        ),
+        "prefix must contain the abandoned message text"
+    );
+}
+
+#[test]
+fn append_branch_summary_folds_in_place() {
+    let mut history = build_branched_history();
+    let parent = history.test_leaf_ref().unwrap();
+    let fold_from_id = history
+        .test_find_msg_by_content("abandoned branch")
+        .expect("abandoned tip");
+
+    history.append_branch_summary(parent, fold_from_id, NARRATIVE_A.into(), CONTINUE_PROMPT);
+
+    let ctx = history.active_branch();
+    assert!(
+        ctx.iter().any(|m| m
+            .content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::Text { text } if text == NARRATIVE_A))),
+        "branch-summary narrative must fold in place on the active path"
+    );
+    assert!(
+        !ctx.iter().any(|m| m.content.iter().any(
+            |b| matches!(b, ContentBlock::Text { text } if text == "abandoned branch message")
+        )),
+        "abandoned branch message must not appear in the fold"
+    );
+}
+
+#[test]
+fn branch_summary_absent_after_undo_of_rewind() {
+    let mut history = build_branched_history();
+    let parent = history.test_leaf_ref().unwrap();
+    let fold_from_id = history
+        .test_find_msg_by_content("abandoned branch")
+        .expect("abandoned tip");
+
+    history.append_branch_summary(
+        parent.clone(),
+        fold_from_id,
+        NARRATIVE_A.into(),
+        CONTINUE_PROMPT,
+    );
+
+    history.test_rewind_leaf_to(parent.clone());
+
+    let ctx = history.active_branch();
+    assert!(
+        !ctx.iter().any(|m| m
+            .content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::Text { text } if text == NARRATIVE_A))),
+        "moving the leaf off the branch summary must remove it from the fold"
+    );
+}

@@ -51,6 +51,15 @@ pub enum TreeSelectorAction {
     Select(TreeSelectorOutcome),
     /// Undo-of-rewind (§4): only offered while the last record is a `Leaf`.
     Undo,
+    /// Fork from the cursor node (§5, `f`): copy root→cursor into a new session.
+    Fork(NodeRef),
+    /// Branch-summary (§6, `s`): summarize the abandoned branch. `parent` is
+    /// the landing node (current leaf); `fold_from_id` is the abandoned tip.
+    /// Only offered while an undo-of-rewind target exists.
+    BranchSummary {
+        parent: NodeRef,
+        fold_from_id: NodeRef,
+    },
     Close,
 }
 
@@ -181,6 +190,19 @@ impl TreeSelector {
         {
             return TreeSelectorAction::Select(outcome);
         }
+        if key.code == KeyCode::Char('f')
+            && let Some(nref) = self.selected_node_ref()
+        {
+            return TreeSelectorAction::Fork(nref);
+        }
+        if key.code == KeyCode::Char('s')
+            && let Some((parent, fold_from_id)) = self.branch_summary_target()
+        {
+            return TreeSelectorAction::BranchSummary {
+                parent,
+                fold_from_id,
+            };
+        }
         match self.picker.handle_key(key) {
             PickerAction::Consumed | PickerAction::Toggle(..) => TreeSelectorAction::Consumed,
             PickerAction::Close => TreeSelectorAction::Close,
@@ -189,6 +211,27 @@ impl TreeSelector {
                 None => TreeSelectorAction::Consumed,
             },
         }
+    }
+
+    /// The selected row's node ref (the fork cursor, §5). Passive rows
+    /// (summaries, branch markers) are non-selectable.
+    fn selected_node_ref(&self) -> Option<NodeRef> {
+        let row = self.picker.selected_item()?;
+        match row {
+            TreeRow::Node { nref, .. } => Some(nref.clone()),
+            _ => None,
+        }
+    }
+
+    /// Branch-summary target (§6): the current leaf is the parent (landing
+    /// node), the abandoned branch tip (`fold_from_id`) is the undo-of-rewind
+    /// target. Only offered while an undo target exists — i.e. the last record
+    /// is a `Leaf` pointing away from a still-preserved branch.
+    fn branch_summary_target(&self) -> Option<(NodeRef, NodeRef)> {
+        let tree = self.tree.as_ref()?;
+        let parent = tree.leaf.node_ref()?.clone();
+        let fold_from_id = undo_target_for_tree(tree).and_then(|p| p.node_ref().cloned())?;
+        Some((parent, fold_from_id))
     }
 
     /// The selected assistant row's first non-empty boundary landing (§4).

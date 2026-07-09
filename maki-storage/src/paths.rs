@@ -268,7 +268,7 @@ pub fn snapshots_dir(dir: &Path) -> PathBuf {
     dir.join(SNAPSHOTS_DIR)
 }
 
-const SESSIONS_DIR: &str = "sessions";
+pub const SESSIONS_DIR: &str = "sessions";
 const SNAPSHOTS_DIR: &str = "snapshots";
 const LOG_FILE: &str = "log.jsonl";
 const META_FILE: &str = "meta.json";

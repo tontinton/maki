@@ -475,6 +475,24 @@ impl<'h> Agent<'h> {
             ExtractedCommand::Compact(_) => {
                 self.do_compact().await?;
             }
+            ExtractedCommand::BranchSummary {
+                parent,
+                fold_from_id,
+                ..
+            } => {
+                let (compact_provider, compact_model) =
+                    resolve_compaction_model(&self.provider, &self.model, self.timeouts);
+                compaction::branch_summary(
+                    &*compact_provider,
+                    &compact_model,
+                    self.history,
+                    parent,
+                    fold_from_id,
+                    &self.event_tx,
+                    &self.cancel,
+                )
+                .await?;
+            }
         }
         Ok(true)
     }

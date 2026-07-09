@@ -11,12 +11,14 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use maki_agent::{AgentInput, ExtractedCommand, ImageSource, InterruptSource};
+use maki_storage::tree::NodeRef;
 
 use crate::components::input::Submission;
 use crate::components::queue_panel::QueueEntry;
 use crate::theme;
 
 const COMPACT_LABEL: &str = "/compact";
+const BRANCH_SUMMARY_LABEL: &str = "/summarize branch";
 
 type Items = Arc<Mutex<VecDeque<QueueItem>>>;
 
@@ -49,12 +51,22 @@ pub(crate) enum QueueItem {
     Compact {
         run_id: u64,
     },
+    /// Branch-summary (§6): generate a narrative for the abandoned branch and
+    /// append a `SummaryRecord` with `SummaryKind::Branch`. `parent` is the
+    /// landing node; `fold_from_id` is the abandoned tip (provenance only).
+    BranchSummary {
+        run_id: u64,
+        parent: NodeRef,
+        fold_from_id: NodeRef,
+    },
 }
 
 impl QueueItem {
     pub(crate) fn run_id(&self) -> u64 {
         match self {
-            Self::Message { run_id, .. } | Self::Compact { run_id } => *run_id,
+            Self::Message { run_id, .. }
+            | Self::Compact { run_id }
+            | Self::BranchSummary { run_id, .. } => *run_id,
         }
     }
 
@@ -71,6 +83,13 @@ impl QueueItem {
                     .fg
                     .unwrap_or(theme::current().foreground),
             },
+            Self::BranchSummary { .. } => QueueEntry {
+                text: Cow::Borrowed(BRANCH_SUMMARY_LABEL),
+                color: theme::current()
+                    .queue
+                    .fg
+                    .unwrap_or(theme::current().foreground),
+            },
         }
     }
 
@@ -78,16 +97,22 @@ impl QueueItem {
         match self {
             Self::Message { input, run_id, .. } => ExtractedCommand::Interrupt(input, run_id),
             Self::Compact { run_id } => ExtractedCommand::Compact(run_id),
+            Self::BranchSummary {
+                run_id,
+                parent,
+                fold_from_id,
+            } => ExtractedCommand::BranchSummary {
+                run_id,
+                parent,
+                fold_from_id,
+            },
         }
     }
 
-    /// Immediate-dispatch messages already sit in the chat, so hiding them
-    /// here stops the panel from reserving a row the agent is about to free,
-    /// which used to make the bubble hop up by one frame.
     fn visible_in_panel(&self) -> bool {
         match self {
             Self::Message { displayed, .. } => !displayed,
-            Self::Compact { .. } => true,
+            Self::Compact { .. } | Self::BranchSummary { .. } => true,
         }
     }
 }
@@ -149,7 +174,7 @@ impl QueueSender {
             .filter(|item| item.visible_in_panel())
             .filter_map(|item| match item {
                 QueueItem::Message { text, .. } => Some(text.clone()),
-                QueueItem::Compact { .. } => None,
+                QueueItem::Compact { .. } | QueueItem::BranchSummary { .. } => None,
             })
             .collect()
     }
@@ -213,6 +238,15 @@ mod tests {
     #[test_case(msg(false),                       true  ; "deferred_message_visible")]
     #[test_case(msg(true),                        false ; "displayed_message_hidden")]
     #[test_case(QueueItem::Compact { run_id: 0 }, true  ; "compact_visible")]
+    #[test_case(
+        QueueItem::BranchSummary {
+            run_id: 0,
+            parent: NodeRef::Msg(serde_json::from_str("\"msg_x\"").unwrap()),
+            fold_from_id: NodeRef::Msg(serde_json::from_str("\"msg_y\"").unwrap()),
+        },
+        true
+        ; "branch_summary_visible"
+    )]
     fn panel_visibility(item: QueueItem, visible: bool) {
         let (tx, _rx) = queue();
         tx.push(item);

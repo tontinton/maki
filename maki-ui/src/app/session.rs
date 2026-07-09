@@ -15,6 +15,7 @@ use maki_providers::{Model, TokenUsage};
 use maki_storage::paths::{session_dir, snapshots_dir};
 use maki_storage::session_log::load_folder;
 use maki_storage::sessions::StoredSubagent;
+use maki_storage::tree::NodeRef;
 use serde_json::value::RawValue;
 
 use crate::AppSession;
@@ -435,6 +436,75 @@ impl App {
         vec![]
     }
 
+    /// Fork from `cursor` into a new session (§5, `f`). Saves + barriers so
+    /// the on-disk log reflects every prior push, then enqueues a `Fork`
+    /// mutation. On ack, copies the cursor snapshot + session-start anchor
+    /// (the writer owns log/renders/meta; snapshots are owned by the agent
+    /// layer, §13). The new session is opened only after the ack (§13).
+    /// Render frames + subagent transcripts travel with the path (§5).
+    pub(super) fn fork_from(&mut self, cursor: NodeRef) -> Vec<Action> {
+        if self.status != super::Status::Idle {
+            return vec![];
+        }
+        self.save_session();
+        if let Err(e) = self.storage_writer.barrier() {
+            self.status_bar.flash(format!("Fork barrier failed: {e}"));
+            return vec![];
+        }
+        let old_session_id = match self.storage_writer.session_id() {
+            Some(id) => id,
+            None => {
+                self.status_bar.flash("No writer for fork".into());
+                return vec![];
+            }
+        };
+        let new_session_id = maki_storage::new_session_id();
+        match self
+            .storage_writer
+            .fork(new_session_id.clone(), cursor.clone())
+        {
+            Ok(result) => {
+                let sessions_base = self.storage.path().join(maki_storage::paths::SESSIONS_DIR);
+                if let Some(tree) = &self.state.tree
+                    && let Err(e) = maki_storage::fork::copy_snapshots_for_tree(
+                        &sessions_base,
+                        &old_session_id,
+                        &new_session_id,
+                        &cursor,
+                        tree,
+                    )
+                {
+                    tracing::warn!(error = %e, "fork snapshot copy failed");
+                }
+                let _ = result;
+                vec![Action::LoadForkedSession { id: new_session_id }]
+            }
+            Err(e) => {
+                self.status_bar.flash(format!("Fork failed: {e}"));
+                vec![]
+            }
+        }
+    }
+
+    /// Start a branch-summary generation (§6, `s`). Runs off the main thread:
+    /// reuses the compaction transcript serialization + an LLM call to produce
+    /// the narrative, then appends `SummaryRecord` with `SummaryKind::Branch`.
+    /// Aborts on Esc (cancel token keyed by run_id). On error or cancel, no
+    /// record is appended (rewind proceeds clean).
+    pub(super) fn start_branch_summary(
+        &mut self,
+        parent: NodeRef,
+        fold_from_id: NodeRef,
+    ) -> Vec<Action> {
+        if self.status != super::Status::Idle {
+            return vec![];
+        }
+        self.run_id += 1;
+        self.status = super::Status::Streaming;
+        self.queue_branch_summary(parent, fold_from_id);
+        vec![]
+    }
+
     pub(crate) fn apply_loaded_session(
         &mut self,
         session: AppSession,
@@ -453,7 +523,7 @@ impl App {
         self.loaded_session_snapshot()
     }
 
-    pub(super) fn load_session(&mut self, session_id: String) -> Vec<Action> {
+    pub(crate) fn load_session(&mut self, session_id: String) -> Vec<Action> {
         let session = match AppSession::load(&session_id, &self.storage) {
             Ok(s) => s,
             Err(e) => {

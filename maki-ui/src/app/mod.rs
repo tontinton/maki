@@ -648,6 +648,11 @@ impl App {
                     vec![]
                 }
                 TreeSelectorAction::Undo => self.undo_rewind(),
+                TreeSelectorAction::Fork(cursor) => self.fork_from(cursor),
+                TreeSelectorAction::BranchSummary {
+                    parent,
+                    fold_from_id,
+                } => self.start_branch_summary(parent, fold_from_id),
                 TreeSelectorAction::Close => vec![],
             });
         }

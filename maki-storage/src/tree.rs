@@ -385,8 +385,8 @@ impl SessionTree {
     }
 }
 
-/// `TreeMutation` variants per §13 (minus `AppendLabel`/`Fork` until C5).
-/// Every mutation is durable; the writer never coalesces.
+/// `TreeMutation` variants per §13. Every mutation is durable; the writer
+/// never coalesces.
 #[derive(Debug)]
 pub enum TreeMutation {
     AppendMessage(MessageNode),
@@ -401,8 +401,25 @@ pub enum TreeMutation {
         target: Position,
     },
     AppendSummary(SummaryRecord),
+    /// Fork the root→cursor path into a new session (§5, §A.8). The writer
+    /// flushes buffered appends first, copies the on-path nodes, their renders,
+    /// subagent transcripts, and the cursor snapshot, then acks. The new
+    /// session may not be opened before the ack.
+    Fork {
+        new_session_id: String,
+        from_node_id: NodeRef,
+        ack: flume::Sender<Result<ForkResult, String>>,
+    },
     /// fsync + ack oneshot (§13, §8 interrupt barrier).
     Barrier(flume::Sender<()>),
+}
+
+/// The writer's fork completion signal (§5). `Ok` carries the new sessions dir
+/// so the UI can open it; `Err` surfaces a copy failure.
+#[derive(Debug)]
+pub struct ForkResult {
+    pub new_session_id: String,
+    pub parent_title: String,
 }
 
 /// `TreeEvent` variants per §13. Emitted after the write, before the batched
@@ -420,6 +437,12 @@ pub enum TreeEvent {
     Summary {
         node_id: SummaryId,
         kind: SummaryKind,
+    },
+    /// Fork completed (§5): the new session folder is durable. Carries the new
+    /// id and the parent title for the `(fork of …)` label.
+    Fork {
+        new_session_id: String,
+        parent_title: String,
     },
 }
 

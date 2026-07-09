@@ -59,6 +59,11 @@ impl AgentMode {
 pub enum ExtractedCommand {
     Interrupt(AgentInput, u64),
     Compact(u64),
+    BranchSummary {
+        run_id: u64,
+        parent: maki_storage::tree::NodeRef,
+        fold_from_id: maki_storage::tree::NodeRef,
+    },
 }
 
 pub trait InterruptSource: Send + Sync {

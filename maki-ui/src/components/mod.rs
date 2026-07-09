@@ -273,6 +273,9 @@ pub enum Action {
     },
     NewSession,
     LoadSession(Box<LoadedSession>),
+    LoadForkedSession {
+        id: String,
+    },
     ChangeModel(String),
     RefreshProvider {
         slug: String,
