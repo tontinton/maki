@@ -38,13 +38,11 @@ impl RenderStore {
         })
     }
 
-    pub fn append(
-        &mut self,
-        id: &ToolUseId,
-        frame: &[u8],
-        compressor: &mut zstd::bulk::Compressor<'static>,
-    ) -> Result<(), std::io::Error> {
-        let compressed = compressor.compress(frame)?;
+    pub fn append(&mut self, id: &ToolUseId, frame: &[u8]) -> Result<(), std::io::Error> {
+        let compressed = structured_zstd::encoding::compress_slice_to_vec(
+            frame,
+            structured_zstd::encoding::CompressionLevel::from_level(COMPRESS_LEVEL),
+        );
         let id_bytes = id.as_str().as_bytes();
         let id_len = u8::try_from(id_bytes.len()).map_err(|_| invalid_id_len(id_bytes.len()))?;
 
@@ -71,10 +69,9 @@ impl RenderStore {
         &mut self,
         id: &ToolUseId,
         frame: &[u8],
-        compressor: &mut zstd::bulk::Compressor<'static>,
         fsync: bool,
     ) -> Result<(), std::io::Error> {
-        self.append(id, frame, compressor)?;
+        self.append(id, frame)?;
         if fsync {
             self.file.sync_data()?;
         }
@@ -103,13 +100,22 @@ impl RenderStore {
         self.file.seek(SeekFrom::Start(entry.frame_offset))?;
         let mut record = vec![0u8; entry.frame_len as usize];
         self.file.read_exact(&mut record)?;
-        match zstd::stream::decode_all(&record[..]) {
-            Ok(decoded) => Ok(Some(decoded)),
+        let mut decoded = Vec::new();
+        let mut decoder = match structured_zstd::decoding::StreamingDecoder::new(&record[..]) {
+            Ok(d) => d,
             Err(e) => {
-                warn!(error = %e, "failed to decompress render frame");
-                Ok(None)
+                warn!(error = %e, "failed to set up render frame decoder");
+                return Ok(None);
             }
-        }
+        };
+        Ok(
+            structured_zstd::io::Read::read_to_end(&mut decoder, &mut decoded)
+                .map(|_| Some(decoded))
+                .unwrap_or_else(|e| {
+                    warn!(error = %e, "failed to decompress render frame");
+                    None
+                }),
+        )
     }
 
     fn scan_index(mut file: &File) -> Result<HashMap<ToolUseId, FrameEntry>, std::io::Error> {
@@ -177,7 +183,9 @@ impl RenderStore {
         if frame_end > len {
             return ScanOutcome::TornTail;
         }
-        match zstd::zstd_safe::find_frame_compressed_size(&data[frame_offset as usize..frame_end]) {
+        match structured_zstd::decoding::find_frame_compressed_size(
+            &data[frame_offset as usize..frame_end],
+        ) {
             Ok(actual) if actual == frame_len as usize => ScanOutcome::Record {
                 id,
                 frame_offset,
@@ -214,44 +222,31 @@ fn invalid_id_len(len: usize) -> std::io::Error {
     std::io::Error::other(format!("tool_use_id length {len} exceeds u8"))
 }
 
-pub fn new_compressor() -> Result<zstd::bulk::Compressor<'static>, std::io::Error> {
-    let mut c = zstd::bulk::Compressor::new(COMPRESS_LEVEL)?;
-    c.include_checksum(true)?;
-    Ok(c)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn make_store() -> (
-        tempfile::TempDir,
-        RenderStore,
-        zstd::bulk::Compressor<'static>,
-    ) {
+    fn make_store() -> (tempfile::TempDir, RenderStore) {
         let tmp = tempfile::tempdir().unwrap();
         let store = RenderStore::open(&tmp.path().join("renders.bin")).unwrap();
-        let compressor = new_compressor().unwrap();
-        (tmp, store, compressor)
+        (tmp, store)
     }
 
     #[test]
     fn read_your_writes() {
-        let (_tmp, mut store, mut comp) = make_store();
+        let (_tmp, mut store) = make_store();
         let id = ToolUseId::new("toolu_01".into()).unwrap();
         let payload = b"hello render".as_slice();
-        store.append(&id, payload, &mut comp).unwrap();
+        store.append(&id, payload).unwrap();
         let got = store.get(&id).unwrap();
         assert_eq!(got, payload);
     }
 
     #[test]
     fn reopening_preserves_index() {
-        let (tmp, mut store, mut comp) = make_store();
+        let (tmp, mut store) = make_store();
         let id = ToolUseId::new("toolu_02".into()).unwrap();
-        store
-            .append(&id, b"persisted data".as_slice(), &mut comp)
-            .unwrap();
+        store.append(&id, b"persisted data".as_slice()).unwrap();
         drop(store);
         let reopened = RenderStore::open(&tmp.path().join("renders.bin")).unwrap();
         assert!(reopened.index.contains_key(&id));
@@ -259,11 +254,11 @@ mod tests {
 
     #[test]
     fn torn_tail_loses_last_frame() {
-        let (tmp, mut store, mut comp) = make_store();
+        let (tmp, mut store) = make_store();
         let id1 = ToolUseId::new("toolu_03".into()).unwrap();
         let id2 = ToolUseId::new("toolu_04".into()).unwrap();
-        store.append(&id1, b"first".as_slice(), &mut comp).unwrap();
-        store.append(&id2, b"second".as_slice(), &mut comp).unwrap();
+        store.append(&id1, b"first".as_slice()).unwrap();
+        store.append(&id2, b"second".as_slice()).unwrap();
         let path = tmp.path().join("renders.bin");
         drop(store);
         let data = std::fs::read(&path).unwrap();
@@ -276,15 +271,11 @@ mod tests {
 
     #[test]
     fn mid_file_corruption_resyncs() {
-        let (tmp, mut store, mut comp) = make_store();
+        let (tmp, mut store) = make_store();
         let id1 = ToolUseId::new("toolu_05".into()).unwrap();
         let id2 = ToolUseId::new("toolu_06".into()).unwrap();
-        store
-            .append(&id1, b"survivor".as_slice(), &mut comp)
-            .unwrap();
-        store
-            .append(&id2, b"corrupt victim".as_slice(), &mut comp)
-            .unwrap();
+        store.append(&id1, b"survivor".as_slice()).unwrap();
+        store.append(&id2, b"corrupt victim".as_slice()).unwrap();
         let path = tmp.path().join("renders.bin");
         drop(store);
         let mut data = std::fs::read(&path).unwrap();

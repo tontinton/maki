@@ -86,7 +86,7 @@ serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["raw_value"] }
 uuid = { version = "1", default-features = false, features = ["v4", "v7", "std"] }
 bs58 = "0.5"
-zstd = "0.13"
+structured-zstd = "0.0.48"
 blake3 = "1"
 fs4 = "0.13"
 ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }

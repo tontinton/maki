@@ -12,7 +12,7 @@ use serde_json::value::RawValue;
 use tracing::warn;
 
 use crate::paths::{log_path, meta_path, renders_path};
-use crate::renders::{self, RenderStore};
+use crate::renders::RenderStore;
 use crate::tree::{Header, MessageId, MessageNode, NodeRef, Role, ToolUseId, TreeRecord};
 use crate::{StorageError, fsync_dir, now_epoch};
 
@@ -244,14 +244,13 @@ fn write_folder(
     let out_count = scan.outs.len();
     if out_count > 0 {
         let mut store = RenderStore::open(&renders_path(dir))?;
-        let mut comp = renders::new_compressor()?;
         for (tool_id, raw) in &scan.outs {
             let frame = serde_json::to_vec(raw)?;
             if let Some(id) = ToolUseId::new(tool_id.clone()) {
-                store.append(&id, &frame, &mut comp)?;
+                store.append(&id, &frame)?;
             }
         }
-        drop((store, comp));
+        drop(store);
     }
 
     // sub_msg verbatim

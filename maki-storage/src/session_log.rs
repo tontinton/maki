@@ -16,7 +16,7 @@ use serde_json::value::RawValue;
 use tracing::warn;
 
 use crate::paths::{lock_path, log_path, meta_path, renders_path, session_dir};
-use crate::renders::{self, RenderStore};
+use crate::renders::RenderStore;
 use crate::sessions::SessionError;
 use crate::tree::TreeEvent::{Append, Fork, Navigate, Summary};
 use crate::tree::{
@@ -74,7 +74,6 @@ pub struct SessionWriter {
     log_file: File,
     lock: File,
     renders: RenderStore,
-    compressor: zstd::bulk::Compressor<'static>,
     unclean: bool,
     nodes: HashMap<NodeRef, TreeNode>,
     order: Vec<OrderedRecord>,
@@ -158,9 +157,7 @@ impl SessionWriter {
         if self.unclean {
             return Err(unclean_error());
         }
-        self.renders
-            .append(id, frame, &mut self.compressor)
-            .map_err(StorageError::from)
+        self.renders.append(id, frame).map_err(StorageError::from)
     }
 
     pub fn write_meta(&mut self) -> Result<(), StorageError> {
@@ -359,10 +356,9 @@ impl SessionWriter {
         let tmp_path = path.with_extension("bin.tmp");
 
         let mut new_store = RenderStore::open(&tmp_path)?;
-        let mut compressor = renders::new_compressor()?;
         for id in &live_ids {
             if let Some(frame) = self.renders.get(id) {
-                new_store.append(id, &frame, &mut compressor)?;
+                new_store.append(id, &frame)?;
             }
         }
         new_store.sync_file()?;
@@ -470,20 +466,12 @@ pub fn open(base: &Path, id: &str) -> OpenResult {
             return OpenResult::Error(SessionError::Storage(StorageError::Io(e)));
         }
     };
-    let compressor = match renders::new_compressor() {
-        Ok(c) => c,
-        Err(e) => {
-            let _ = FileExt::unlock(&lock);
-            return OpenResult::Error(SessionError::Storage(StorageError::Io(e)));
-        }
-    };
     let mut writer = SessionWriter {
         session_dir: dir,
         loaded,
         log_file,
         lock,
         renders,
-        compressor,
         unclean: false,
         nodes,
         order,

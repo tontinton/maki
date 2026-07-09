@@ -16,7 +16,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 etcetera = { workspace = true }
 uuid = { workspace = true }
-zstd = { workspace = true }
+structured-zstd = { workspace = true }
 
 [dev-dependencies]
 test-case = { workspace = true }

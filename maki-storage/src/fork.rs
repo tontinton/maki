@@ -15,7 +15,7 @@ use serde::Deserialize;
 use serde_json::value::RawValue;
 
 use crate::paths::{log_path, meta_path, renders_path};
-use crate::renders::{self, RenderStore};
+use crate::renders::RenderStore;
 use crate::session_log::LoadedSession;
 use crate::tree::{Header, NodeRef, SubMsgRecord, ToolUseId, TreeNode, TreeRecord};
 use crate::{StorageError, atomic_write, fsync_dir, now_epoch};
@@ -250,9 +250,8 @@ fn write_renders(
         return Ok(());
     }
     let mut dest = RenderStore::open(&renders_path(new_dir))?;
-    let mut compressor = renders::new_compressor()?;
     for (id, frame) in &frames {
-        dest.append(id, frame, &mut compressor)?;
+        dest.append(id, frame)?;
     }
     dest.sync_file()?;
     Ok(())
