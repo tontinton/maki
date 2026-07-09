@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use maki_providers::{ContentBlock, Message};
 use maki_storage::StateDir;
+use maki_storage::paths::{session_dir, snapshots_dir};
 use maki_storage::session_log::{OpenResult, TreeWriter, active_leaf};
 use maki_storage::sessions::SESSIONS_DIR;
 use maki_storage::tree::{
@@ -184,6 +185,47 @@ impl StorageWriter {
             .send(TreeMutation::Fork {
                 new_session_id: new_session_id.clone(),
                 from_node_id,
+                ack: ack_tx,
+            })
+            .is_err()
+        {
+            return Err(RewindError::NoWriter);
+        }
+        drop(guard);
+        ack_rx
+            .recv()
+            .map_err(|_| RewindError::NoWriter)?
+            .map_err(|_| RewindError::Readonly)
+    }
+
+    /// Storage-GC (§15): rewrite `log.jsonl` + `renders.bin` keeping only
+    /// reachable branches, drop orphaned renders and snapshots. Blocks until
+    /// the writer completes. Returns the number of pruned nodes.
+    pub fn compact_session(&self) -> Result<usize, RewindError> {
+        {
+            let state = self.state.lock().unwrap();
+            if state.readonly {
+                return Err(RewindError::Readonly);
+            }
+        }
+        let snapshots_dir = {
+            let state = self.state.lock().unwrap();
+            if state.session_id.is_empty() {
+                None
+            } else {
+                let session_dir = session_dir(self.dir.path(), &state.session_id);
+                Some(snapshots_dir(&session_dir))
+            }
+        };
+        let (ack_tx, ack_rx) = flume::bounded::<Result<usize, String>>(1);
+        let guard = self.handle.lock().unwrap();
+        let Some(handle) = guard.as_ref() else {
+            return Err(RewindError::NoWriter);
+        };
+        if handle
+            .tx
+            .send(TreeMutation::CompactSession {
+                snapshots_dir,
                 ack: ack_tx,
             })
             .is_err()

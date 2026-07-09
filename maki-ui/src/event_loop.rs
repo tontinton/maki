@@ -505,6 +505,15 @@ impl<'t> EventLoop<'t> {
                     run_id: self.app.run_id,
                 });
             }
+            Action::CompactSession => match self.storage_writer.compact_session() {
+                Ok(dropped) => {
+                    self.app
+                        .flash(format!("Compacted session: {dropped} nodes pruned"));
+                }
+                Err(e) => {
+                    self.app.flash(format!("Compact failed: {e}"));
+                }
+            },
             Action::ToggleMcp(server_name, enabled) => {
                 self.handles.send_mcp(McpCommand::Toggle {
                     server: server_name,

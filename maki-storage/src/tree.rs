@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use serde::de::Deserializer;
 use serde::ser::Serializer;
@@ -39,6 +40,10 @@ macro_rules! prefixed_id {
                 let uuid = Uuid::now_v7();
                 let encoded = bs58::encode(uuid.as_bytes()).into_string();
                 Self(format!("{}{encoded}", $prefix))
+            }
+
+            pub fn from_prefixed(s: String) -> Option<Self> {
+                s.starts_with($prefix).then_some(Self(s))
             }
 
             pub fn as_str(&self) -> &str {
@@ -149,6 +154,18 @@ impl std::fmt::Display for NodeRef {
         match self {
             Self::Msg(id) => f.write_str(id.as_str()),
             Self::Sum(id) => f.write_str(id.as_str()),
+        }
+    }
+}
+
+impl NodeRef {
+    pub fn parse(s: &str) -> Option<Self> {
+        if let Some(rest) = s.strip_prefix(MSG_PREFIX) {
+            MessageId::from_prefixed(format!("{MSG_PREFIX}{rest}")).map(Self::Msg)
+        } else if let Some(rest) = s.strip_prefix(SUM_PREFIX) {
+            SummaryId::from_prefixed(format!("{SUM_PREFIX}{rest}")).map(Self::Sum)
+        } else {
+            None
         }
     }
 }
@@ -412,6 +429,13 @@ pub enum TreeMutation {
     },
     /// fsync + ack oneshot (§13, §8 interrupt barrier).
     Barrier(flume::Sender<()>),
+    /// Storage-GC (§15): rewrite `log.jsonl` + `renders.bin` keeping only
+    /// reachable branches, drop orphaned renders. Snapshot manifests for
+    /// pruned nodes are dropped. Acks the dropped-node count.
+    CompactSession {
+        snapshots_dir: Option<PathBuf>,
+        ack: flume::Sender<Result<usize, String>>,
+    },
 }
 
 /// The writer's fork completion signal (§5). `Ok` carries the new sessions dir

@@ -285,6 +285,7 @@ pub enum Action {
     RefreshModels,
     RefreshUsage,
     Compact,
+    CompactSession,
     ToggleMcp(String, bool),
     OpenEditor(PathBuf),
     EditInputInEditor,

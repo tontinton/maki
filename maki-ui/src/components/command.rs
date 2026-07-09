@@ -33,6 +33,11 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         max_args: 0,
     },
     BuiltinCommand {
+        name: "/compact-session",
+        description: "Reclaim disk space by pruning unreachable branches",
+        max_args: 0,
+    },
+    BuiltinCommand {
         name: "/new",
         description: "Start a new session",
         max_args: 0,

@@ -1197,6 +1197,7 @@ impl App {
                 self.status = Status::Streaming;
                 vec![Action::Compact]
             }
+            "/compact-session" => vec![Action::CompactSession],
             "/help" => {
                 self.help_modal.toggle();
                 vec![]

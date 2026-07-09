@@ -15,6 +15,7 @@ Type `/` in the input box to open the command palette.
 |---------|-------------|
 | `/tasks` | Browse and search tasks |
 | `/compact` | Summarize and compact conversation history |
+| `/compact-session` | Reclaim disk space by pruning unreachable branches |
 | `/new` | Start a new session |
 | `/help` | Show keybindings |
 | `/usage` | Show token usage breakdown |

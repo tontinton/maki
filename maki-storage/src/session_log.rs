@@ -218,6 +218,163 @@ impl SessionWriter {
     pub fn flavors(&self) -> &HashMap<NodeRef, Flavor> {
         &self.flavors
     }
+
+    /// Storage-GC (§15): rewrite `log.jsonl` + `renders.bin` keeping only
+    /// reachable nodes, drop orphaned renders and stale `Leaf` records.
+    /// Snapshot manifests for pruned nodes are dropped separately (the writer
+    /// does not own the snapshot dir). Write-new-then-atomic-swap per file.
+    /// Returns the count of nodes dropped.
+    pub fn compact_session(&mut self) -> Result<usize, StorageError> {
+        if self.unclean {
+            return Err(unclean_error());
+        }
+        self.sync()?;
+
+        let reachable = reachable_nodes(&self.nodes, &self.order);
+        let dropped = self.nodes.len() - reachable.len();
+
+        self.rewrite_log(&reachable)?;
+        self.rewrite_renders(&reachable)?;
+
+        Ok(dropped)
+    }
+
+    fn rewrite_log(&mut self, reachable: &HashSet<NodeRef>) -> Result<(), StorageError> {
+        let path = log_path(&self.session_dir);
+        let tmp_path = path.with_extension("jsonl.tmp");
+
+        {
+            let mut tmp = File::create(&tmp_path)?;
+            let mut buf = serde_json::to_vec(&TreeRecord::Header(self.loaded.header.clone()))?;
+            buf.push(b'\n');
+            tmp.write_all(&buf)?;
+
+            for record in &self.order {
+                match record {
+                    OrderedRecord::Node(nref) if reachable.contains(nref) => {
+                        let Some(node) = self.nodes.get(nref) else {
+                            continue;
+                        };
+                        let record = match node {
+                            TreeNode::Message(m) => TreeRecord::Message(m.clone()),
+                            TreeNode::Summary(s) => TreeRecord::Summary(s.clone()),
+                        };
+                        let mut buf = serde_json::to_vec(&record)?;
+                        buf.push(b'\n');
+                        tmp.write_all(&buf)?;
+                    }
+                    OrderedRecord::Node(_) => {}
+                    OrderedRecord::Leaf { target } => {
+                        if let Some(t) = target
+                            && !reachable.contains(t)
+                        {
+                            continue;
+                        }
+                        let record = LeafRecord {
+                            id: LeafId::new(),
+                            target_node_id: target.clone(),
+                        };
+                        let mut buf = serde_json::to_vec(&TreeRecord::Leaf(record))?;
+                        buf.push(b'\n');
+                        tmp.write_all(&buf)?;
+                    }
+                }
+            }
+
+            for sub in &self.loaded.sub_msgs {
+                let mut buf = serde_json::to_vec(&TreeRecord::SubMsg(sub.clone()))?;
+                buf.push(b'\n');
+                tmp.write_all(&buf)?;
+            }
+
+            tmp.sync_data()?;
+        }
+
+        std::fs::rename(&tmp_path, &path)?;
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        crate::fsync_dir(parent)?;
+
+        self.log_file = OpenOptions::new().read(true).append(true).open(&path)?;
+
+        let mut new_order = Vec::new();
+        let mut new_nodes = HashMap::new();
+        let mut new_flavors = HashMap::new();
+        let mut new_messages = Vec::new();
+        let mut new_summaries = Vec::new();
+        let mut new_leaves = Vec::new();
+
+        for record in &self.order {
+            match record {
+                OrderedRecord::Node(nref) if reachable.contains(nref) => {
+                    let Some(node) = self.nodes.get(nref) else {
+                        continue;
+                    };
+                    new_order.push(OrderedRecord::Node(nref.clone()));
+                    new_flavors.insert(nref.clone(), self.flavors.get(nref).copied().unwrap());
+                    match node {
+                        TreeNode::Message(m) => {
+                            new_messages.push(m.clone());
+                            new_nodes.insert(nref.clone(), TreeNode::Message(m.clone()));
+                        }
+                        TreeNode::Summary(s) => {
+                            new_summaries.push(s.clone());
+                            new_nodes.insert(nref.clone(), TreeNode::Summary(s.clone()));
+                        }
+                    }
+                }
+                OrderedRecord::Node(_) => {}
+                OrderedRecord::Leaf { target } => {
+                    if let Some(t) = target
+                        && !reachable.contains(t)
+                    {
+                        continue;
+                    }
+                    new_order.push(OrderedRecord::Leaf {
+                        target: target.clone(),
+                    });
+                    new_leaves.push(LeafRecord {
+                        id: LeafId::new(),
+                        target_node_id: target.clone(),
+                    });
+                }
+            }
+        }
+        let new_sub_msgs = self.loaded.sub_msgs.clone();
+
+        self.nodes = new_nodes;
+        self.order = new_order;
+        self.flavors = new_flavors;
+        self.loaded.messages = new_messages;
+        self.loaded.summaries = new_summaries;
+        self.loaded.leaves = new_leaves;
+        self.loaded.sub_msgs = new_sub_msgs;
+        self.loaded.order = self.order.clone();
+
+        Ok(())
+    }
+
+    fn rewrite_renders(&mut self, reachable: &HashSet<NodeRef>) -> Result<(), StorageError> {
+        let live_ids = live_render_ids(&self.loaded, &self.nodes, reachable);
+        let path = renders_path(&self.session_dir);
+        let tmp_path = path.with_extension("bin.tmp");
+
+        let mut new_store = RenderStore::open(&tmp_path)?;
+        let mut compressor = renders::new_compressor()?;
+        for id in &live_ids {
+            if let Some(frame) = self.renders.get(id) {
+                new_store.append(id, &frame, &mut compressor)?;
+            }
+        }
+        new_store.sync_file()?;
+        drop(new_store);
+
+        std::fs::rename(&tmp_path, &path)?;
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        crate::fsync_dir(parent)?;
+
+        self.renders = RenderStore::open(&path)?;
+        Ok(())
+    }
 }
 
 impl Drop for SessionWriter {
@@ -529,6 +686,143 @@ pub fn position_before_last_leaf(
     active_leaf(&order[..i], nodes)
 }
 
+/// Walk from the active leaf root-ward, collecting all reachable node refs.
+fn reachable_nodes(
+    nodes: &HashMap<NodeRef, TreeNode>,
+    order: &[OrderedRecord],
+) -> HashSet<NodeRef> {
+    let leaf = active_leaf(order, nodes);
+    let mut reachable = HashSet::new();
+    let mut cur = leaf.node_ref().cloned();
+    while let Some(nref) = cur {
+        let Some(node) = nodes.get(&nref) else {
+            break;
+        };
+        reachable.insert(nref.clone());
+        cur = node.parent_id();
+    }
+    reachable
+}
+
+const SNAPSHOT_MANIFEST_EXT: &str = "json";
+const SNAPSHOT_SESSION_START: &str = "session-start";
+const SNAPSHOT_OBJECTS_SUBDIR: &str = "objects";
+
+/// Drop snapshot manifests for nodes not in `reachable`, then clean up
+/// unreferenced content-addressed objects (§15). Best-effort: errors are
+/// warned and skipped, never propagated (storage-GC is opportunistic).
+fn drop_orphaned_snapshots(dir: &Path, reachable: &HashSet<NodeRef>) {
+    let manifest_names: Vec<String> = match fs::read_dir(dir) {
+        Ok(rd) => rd
+            .flatten()
+            .filter_map(|e| {
+                let path = e.path();
+                if path.extension().and_then(|s| s.to_str()) != Some(SNAPSHOT_MANIFEST_EXT) {
+                    return None;
+                }
+                path.file_stem()?.to_str().map(String::from)
+            })
+            .filter(|name| name != SNAPSHOT_SESSION_START)
+            .collect(),
+        Err(e) => {
+            warn!(error = %e, dir = %dir.display(), "snapshot GC: read_dir failed");
+            return;
+        }
+    };
+
+    let mut dropped = false;
+    for name in &manifest_names {
+        let nref = NodeRef::parse(name);
+        if nref.is_some_and(|n| reachable.contains(&n)) {
+            continue;
+        }
+        let path = dir.join(format!("{name}.{SNAPSHOT_MANIFEST_EXT}"));
+        if let Err(e) = fs::remove_file(&path) {
+            warn!(error = %e, path = %path.display(), "snapshot GC: remove manifest failed");
+        } else {
+            dropped = true;
+        }
+    }
+
+    if dropped {
+        gc_unreferenced_objects(dir);
+    }
+}
+
+fn gc_unreferenced_objects(dir: &Path) {
+    let mut live_hashes: HashSet<String> = HashSet::new();
+    let rd = match fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(_) => return,
+    };
+    for entry in rd.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some(SNAPSHOT_MANIFEST_EXT) {
+            continue;
+        }
+        let data = match fs::read(&path) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        let manifest: HashMap<String, serde_json::Value> = match serde_json::from_slice(&data) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        for value in manifest.values() {
+            if let Some(hash) = value.get("hash").and_then(|v| v.as_str()) {
+                live_hashes.insert(hash.to_string());
+            }
+        }
+    }
+
+    let objects_dir = dir.join(SNAPSHOT_OBJECTS_SUBDIR);
+    let rd = match fs::read_dir(&objects_dir) {
+        Ok(rd) => rd,
+        Err(_) => return,
+    };
+    for entry in rd.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if !live_hashes.contains(name) {
+            let _ = fs::remove_file(&path);
+        }
+    }
+}
+
+/// Collect tool_use_ids from reachable message nodes + reach-through summaries
+/// whose `fold_to` target is reachable.
+fn live_render_ids(
+    loaded: &LoadedSession,
+    nodes: &HashMap<NodeRef, TreeNode>,
+    reachable: &HashSet<NodeRef>,
+) -> HashSet<ToolUseId> {
+    let mut ids = HashSet::new();
+    for msg in &loaded.messages {
+        let nref = NodeRef::Msg(msg.id.clone());
+        if !reachable.contains(&nref) {
+            continue;
+        }
+        for raw in &msg.content {
+            let Ok(tag) = serde_json::from_str::<serde_json::Value>(raw.get()) else {
+                continue;
+            };
+            if tag.get("type").and_then(|v| v.as_str()) == Some("tool_use")
+                && let Some(id) = tag.get("id").and_then(|v| v.as_str())
+                && let Some(tuid) = ToolUseId::new(id.to_string())
+            {
+                ids.insert(tuid);
+            }
+        }
+    }
+    for sub in &loaded.sub_msgs {
+        ids.insert(sub.sub.clone());
+    }
+    let _ = nodes;
+    ids
+}
+
 /// §13 writer: owns a `SessionWriter`, drains an unbounded `flume<TreeMutation>`
 /// (no coalescing — every mutation durable), emits `TreeEvent`s after the write
 /// and before the batched fsync, and acks `Barrier` once fsync succeeds. Never
@@ -620,6 +914,17 @@ impl TreeWriter {
                     let _ = self.writer.sync();
                     let _ = ack.send(());
                 }
+                TreeMutation::CompactSession { snapshots_dir, ack } => {
+                    let _ = self.writer.sync();
+                    let reachable: HashSet<NodeRef> =
+                        reachable_nodes(&self.writer.nodes, &self.writer.order);
+                    let result = self.writer.compact_session().inspect(|_dropped| {
+                        if let Some(dir) = snapshots_dir.as_ref() {
+                            drop_orphaned_snapshots(dir, &reachable);
+                        }
+                    });
+                    let _ = ack.send(result.map_err(|e| e.to_string()));
+                }
                 TreeMutation::Fork {
                     new_session_id,
                     from_node_id,
@@ -662,6 +967,7 @@ impl TreeWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::paths::snapshots_dir;
     use crate::tree::{SummaryId, SummaryKind};
 
     #[test]
@@ -1097,5 +1403,153 @@ mod tests {
             read_files: Vec::new(),
             modified_files: Vec::new(),
         }
+    }
+
+    fn json_content(json: &str) -> Box<RawValue> {
+        serde_json::value::to_raw_value(&serde_json::from_str::<serde_json::Value>(json).unwrap())
+            .unwrap()
+    }
+
+    #[test]
+    fn compact_session_drops_unreachable_nodes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = "compact-test";
+        let mut w = match open(tmp.path(), id) {
+            OpenResult::Writer(w) => w,
+            _ => unreachable!(),
+        };
+        w.write_header().unwrap();
+
+        let user = next_message(None, Role::User, Vec::new(), 100);
+        let user_id = user.id.clone();
+        w.append_message(user).unwrap();
+        let asst = next_message(
+            Some(NodeRef::Msg(user_id.clone())),
+            Role::Assistant,
+            Vec::new(),
+            200,
+        );
+        let asst_id = asst.id.clone();
+        w.append_message(asst).unwrap();
+        let branched = next_message(
+            Some(NodeRef::Msg(asst_id.clone())),
+            Role::User,
+            Vec::new(),
+            300,
+        );
+        let branched_id = branched.id.clone();
+        w.append_message(branched).unwrap();
+
+        w.append_leaf(LeafRecord {
+            id: LeafId::new(),
+            target_node_id: Some(NodeRef::Msg(asst_id.clone())),
+        })
+        .unwrap();
+
+        let dropped = w.compact_session().unwrap();
+        assert_eq!(dropped, 1, "one unreachable node pruned");
+        assert_eq!(w.loaded.messages.len(), 2, "only reachable nodes remain");
+
+        w.sync().unwrap();
+        drop(w);
+
+        match open(tmp.path(), id) {
+            OpenResult::Writer(w2) => {
+                assert_eq!(
+                    w2.loaded.messages.len(),
+                    2,
+                    "reloaded session has pruned tree"
+                );
+                assert!(
+                    w2.loaded.messages.iter().all(|m| m.id != branched_id),
+                    "branched node must not be in reloaded session"
+                );
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn compact_session_drops_orphaned_renders() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = "compact-renders";
+        let mut w = match open(tmp.path(), id) {
+            OpenResult::Writer(w) => w,
+            _ => unreachable!(),
+        };
+        w.write_header().unwrap();
+
+        let live_tool = ToolUseId::new("toolu_live".into()).unwrap();
+        let dead_tool = ToolUseId::new("toolu_dead".into()).unwrap();
+
+        let user = next_message(
+            None,
+            Role::User,
+            vec![json_content(r#"{"type":"text","text":"hello"}"#)],
+            100,
+        );
+        let user_id = user.id.clone();
+        w.append_message(user).unwrap();
+        let asst = next_message(
+            Some(NodeRef::Msg(user_id.clone())),
+            Role::Assistant,
+            vec![
+                json_content(r#"{"type":"tool_use","id":"toolu_live","name":"bash","input":{}}"#),
+                json_content(r#"{"type":"text","text":"done"}"#),
+            ],
+            200,
+        );
+        w.append_message(asst).unwrap();
+
+        w.append_render(&live_tool, b"live frame").unwrap();
+        w.append_render(&dead_tool, b"dead frame").unwrap();
+
+        w.sync().unwrap();
+        assert!(w.renders.contains(&live_tool));
+        assert!(w.renders.contains(&dead_tool));
+
+        w.compact_session().unwrap();
+
+        assert!(
+            w.renders.contains(&live_tool),
+            "live render must survive compact"
+        );
+        assert!(
+            !w.renders.contains(&dead_tool),
+            "orphaned render must be pruned"
+        );
+    }
+
+    #[test]
+    fn compact_session_preserves_session_start_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = "compact-snapshots";
+        let session_dir = session_dir(tmp.path(), id);
+        let snapshots_dir = snapshots_dir(&session_dir);
+        fs::create_dir_all(&snapshots_dir).unwrap();
+
+        let start_path = snapshots_dir.join("session-start.json");
+        fs::write(&start_path, r#"{"file.rs":{"hash":"abc123","mode":420}}"#).unwrap();
+        let orphan_path = snapshots_dir.join("msg_deadbeef.json");
+        fs::write(&orphan_path, r#"{"file.rs":{"hash":"dead","mode":420}}"#).unwrap();
+
+        let objects_dir = snapshots_dir.join("objects");
+        fs::create_dir_all(&objects_dir).unwrap();
+        fs::write(objects_dir.join("abc123"), b"content").unwrap();
+        fs::write(objects_dir.join("dead"), b"orphan").unwrap();
+
+        let reachable = HashSet::new();
+        drop_orphaned_snapshots(&snapshots_dir, &reachable);
+
+        assert!(start_path.exists(), "session-start manifest must survive");
+        assert!(!orphan_path.exists(), "orphan manifest must be pruned");
+        assert!(
+            objects_dir.join("abc123").exists(),
+            "live object must survive"
+        );
+        assert!(
+            !objects_dir.join("dead").exists(),
+            "orphan object must be pruned"
+        );
     }
 }
