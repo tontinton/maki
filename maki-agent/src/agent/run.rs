@@ -8,8 +8,8 @@ use maki_providers::{
     ContentBlock, Message, Model, RequestOptions, Role, StopReason, StreamResponse, TokenUsage,
 };
 
-use super::compaction::{self, CONTINUE_AFTER_COMPACT};
-use super::history::{History, sanitize_cancelled_history};
+use super::compaction;
+use super::history::History;
 use super::instructions::LoadedInstructions;
 use super::streaming::stream_with_retry;
 use super::tool_dispatch::{self, RecentCalls};
@@ -88,7 +88,6 @@ pub struct Agent<'h> {
     recent_calls: RecentCalls,
     auto_compact: bool,
     loaded_instructions: LoadedInstructions,
-    rollback_len: usize,
     mcp: Option<McpHandle>,
     config: AgentConfig,
     tool_output_lines: ToolOutputLines,
@@ -130,7 +129,6 @@ impl<'h> Agent<'h> {
             recent_calls: RecentCalls::new(),
             auto_compact: compaction::auto_compact_enabled(),
             loaded_instructions: LoadedInstructions::new(),
-            rollback_len: 0,
             mcp: None,
             reauth_attempts: 0,
             post_tool_empty_retried: false,
@@ -180,7 +178,6 @@ impl<'h> Agent<'h> {
     }
 
     pub async fn run(&mut self, input: AgentInput) -> Result<(), AgentError> {
-        self.rollback_len = self.history.len();
         let msg = Message::user_with_images(input.message.clone(), input.images);
         self.history.push(msg);
         self.mode = input.mode;
@@ -200,7 +197,7 @@ impl<'h> Agent<'h> {
         let result = self.run_loop().await;
 
         if matches!(result, Err(AgentError::Cancelled)) {
-            sanitize_cancelled_history(self.history, self.rollback_len);
+            self.history.close_cancelled_tool_calls();
         }
 
         result
@@ -228,10 +225,13 @@ impl<'h> Agent<'h> {
         if self.cancel.is_cancelled() {
             return Err(AgentError::Cancelled);
         }
+        let context = self.history.active_branch();
+        let mut messages = context.to_vec();
+        super::history::lower_for_provider(&mut messages, self.model.supports_thinking());
         let response = match stream_with_retry(
             &*self.provider,
             &self.model,
-            self.history.as_slice(),
+            &messages,
             &self.system,
             &self.tools,
             &self.event_tx,
@@ -275,10 +275,12 @@ impl<'h> Agent<'h> {
         self.context_size = usage.total_input();
 
         if has_tools {
-            let history_len_before = self.history.len();
+            let len_before = context.len();
             self.process_tool_calls(response).await?;
-            self.context_size +=
-                estimate_message_tokens(&self.history.as_slice()[history_len_before..]);
+            let after = self.history.active_branch();
+            if after.len() > len_before {
+                self.context_size += estimate_message_tokens(&after[len_before..]);
+            }
         } else {
             let has_text = response.message.first_text_content().is_some();
 
@@ -444,9 +446,6 @@ impl<'h> Agent<'h> {
             &self.cancel,
         )
         .await?;
-        self.rollback_len = self.history.len();
-        self.history
-            .push(Message::synthetic(CONTINUE_AFTER_COMPACT.into()));
         Ok(())
     }
 
@@ -707,15 +706,6 @@ mod tests {
         model
     }
 
-    #[track_caller]
-    fn assert_ends_with_cancel_marker(history: &History) {
-        let last = history.as_slice().last().unwrap();
-        assert!(matches!(last.role, Role::User));
-        assert!(
-            matches!(&last.content[0], ContentBlock::Text { text } if text == "[Cancelled by user]")
-        );
-    }
-
     #[test_case(&[StopReason::EndTurn],                                                     1, Some(StopReason::EndTurn)  ; "end_turn_completes")]
     #[test_case(&[StopReason::MaxTokens, StopReason::EndTurn],                                 2, Some(StopReason::EndTurn)  ; "max_tokens_continues")]
     #[test_case(&[StopReason::MaxTokens, StopReason::MaxTokens, StopReason::MaxTokens, StopReason::MaxTokens], 4, Some(StopReason::MaxTokens) ; "max_tokens_gives_up_after_limit")]
@@ -772,7 +762,7 @@ mod tests {
                 expect_consumed,
             );
             assert_eq!(
-                has_interrupt_in_history(history.as_slice()),
+                has_interrupt_in_history(&history.active_branch()),
                 expect_injected
             );
         });
@@ -899,7 +889,10 @@ mod tests {
             let result = agent.run(default_input()).await;
             assert!(matches!(result, Err(AgentError::Cancelled)));
             drop(agent);
-            assert_ends_with_cancel_marker(&history);
+            // No dangling tool_uses → close_cancelled_tool_calls pushes nothing.
+            let ctx = history.active_branch();
+            assert_eq!(ctx.len(), 1);
+            assert!(matches!(ctx[0].role, Role::User));
         });
     }
 

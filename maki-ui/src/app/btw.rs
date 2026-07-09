@@ -34,7 +34,7 @@ impl App {
         let mut messages = self
             .shared_history
             .as_ref()
-            .map(|h| Vec::clone(&h.load()))
+            .map(|h| h.load().to_vec())
             .unwrap_or_default();
         let system = self
             .btw_system

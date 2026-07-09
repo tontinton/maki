@@ -55,11 +55,11 @@ use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use maki_agent::permissions::PermissionManager;
 use maki_agent::{
     AgentEvent, Envelope, ImageSource, McpConfigErrors, McpPromptInfo, McpSnapshotReader,
-    SubagentInfo, ToolOutput,
+    SharedContext, SubagentInfo, ToolOutput,
 };
 use maki_config::UiConfig;
 use maki_lua::{EventHandle, HintReader, KeymapReader, LuaCommandReader};
-use maki_providers::{Message, Model, ThinkingConfig};
+use maki_providers::{Model, ThinkingConfig};
 use maki_storage::StateDir;
 use maki_storage::input_history::InputHistory;
 use maki_storage::model::persist_model;
@@ -168,7 +168,7 @@ pub struct App {
 
     pub(crate) storage: StateDir,
     pub(crate) usage_slot: Arc<ArcSwapOption<UsageFetchState>>,
-    pub(crate) shared_history: Option<Arc<ArcSwap<Vec<Message>>>>,
+    pub(crate) shared_history: Option<SharedContext>,
     pub(crate) btw_system: Option<Arc<ArcSwap<String>>>,
     pub(crate) shared_tool_outputs: Option<Arc<Mutex<HashMap<String, ToolOutput>>>>,
     pub(crate) renders: Renders,

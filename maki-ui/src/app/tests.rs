@@ -14,7 +14,7 @@ use maki_agent::{
 };
 use maki_config::{PermissionsConfig, UiConfig};
 use maki_lua::{HintReader, KeymapReader, LuaCommandReader};
-use maki_providers::{ContentBlock, Role, TokenUsage};
+use maki_providers::{ContentBlock, Message, Role, TokenUsage};
 use maki_storage::sessions::StoredThinking;
 use ratatui::layout::Rect;
 use std::env;
@@ -1637,9 +1637,10 @@ fn build_rewind_app() -> App {
 }
 
 #[test]
-fn rewind_to_middle_truncates_and_populates_input() {
+fn rewind_to_middle_preserves_history_and_populates_input() {
     let mut app = build_rewind_app();
     let old_run_id = app.run_id;
+    let before_len = app.state.session.messages.len();
     let entry = crate::components::rewind_picker::RewindEntry {
         turn_index: 2,
         prompt_preview: "2: second".into(),
@@ -1647,7 +1648,8 @@ fn rewind_to_middle_truncates_and_populates_input() {
     };
     let actions = app.rewind_to(entry);
 
-    assert_eq!(app.state.session.messages.len(), 2);
+    // Non-destructive rewind (§4): the abandoned branch is preserved.
+    assert_eq!(app.state.session.messages.len(), before_len);
     assert!(app.state.session.tool_outputs.contains_key("tool-1"));
     assert_eq!(app.input_box.buffer.value(), "second prompt");
     assert_eq!(app.run_id, old_run_id + 1);
@@ -1655,13 +1657,14 @@ fn rewind_to_middle_truncates_and_populates_input() {
     let Action::LoadSession(ref loaded) = actions[0] else {
         panic!("expected LoadSession");
     };
-    assert_eq!(loaded.messages.len(), 2);
+    assert_eq!(loaded.messages.len(), before_len);
     assert!(loaded.tool_outputs.contains_key("tool-1"));
 }
 
 #[test]
-fn rewind_to_first_turn_clears_everything() {
+fn rewind_to_first_turn_preserves_history() {
     let mut app = build_rewind_app();
+    let before_len = app.state.session.messages.len();
     app.state.token_usage.input = 500;
     app.state.token_usage.output = 200;
     let entry = crate::components::rewind_picker::RewindEntry {
@@ -1671,8 +1674,9 @@ fn rewind_to_first_turn_clears_everything() {
     };
     let actions = app.rewind_to(entry);
 
-    assert!(app.state.session.messages.is_empty());
-    assert!(!app.state.session.tool_outputs.contains_key("tool-1"));
+    // Non-destructive rewind: nothing truncated.
+    assert_eq!(app.state.session.messages.len(), before_len);
+    assert!(app.state.session.tool_outputs.contains_key("tool-1"));
     assert_eq!(app.state.token_usage.input, 500);
     assert_eq!(app.state.token_usage.output, 200);
     assert!(matches!(&actions[0], Action::LoadSession(_)));
@@ -2041,7 +2045,9 @@ fn streaming_app_with_history() -> App {
             ..Default::default()
         },
     ];
-    app.shared_history = Some(Arc::new(ArcSwap::from_pointee(history)));
+    app.shared_history = Some(Arc::new(ArcSwap::from_pointee(
+        maki_agent::ValidContext::fold_linear(history),
+    )));
     app
 }
 

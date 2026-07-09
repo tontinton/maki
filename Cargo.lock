@@ -2717,6 +2717,7 @@ version = "0.3.26"
 dependencies = [
  "bs58",
  "etcetera",
+ "flume 0.11.1",
  "fs4",
  "getrandom 0.3.4",
  "isahc",

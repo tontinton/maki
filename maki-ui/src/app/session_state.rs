@@ -2,11 +2,11 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use arc_swap::ArcSwap;
+use maki_agent::SharedContext;
 use maki_agent::ToolOutput;
 use maki_agent::permissions::PermissionManager;
 use maki_config::Effect;
-use maki_providers::{Message, Model, ThinkingConfig, TokenUsage};
+use maki_providers::{Model, ThinkingConfig, TokenUsage};
 use maki_storage::StateDir;
 use maki_storage::sessions::{StoredEffect, StoredMode, StoredRule};
 
@@ -92,12 +92,12 @@ impl SessionState {
 
     pub fn sync_session(
         &mut self,
-        shared_history: &Option<Arc<ArcSwap<Vec<Message>>>>,
+        shared_history: &Option<SharedContext>,
         shared_tool_outputs: &Option<Arc<Mutex<HashMap<String, ToolOutput>>>>,
         permissions: &Arc<PermissionManager>,
     ) {
         if let Some(history) = shared_history {
-            self.session.messages = Vec::clone(&history.load());
+            self.session.messages = history.load().to_vec();
         }
         if let Some(outputs) = shared_tool_outputs {
             self.session.tool_outputs = outputs.lock().unwrap_or_else(|e| e.into_inner()).clone();

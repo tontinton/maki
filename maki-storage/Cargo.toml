@@ -10,6 +10,7 @@ getrandom = { workspace = true }
 isahc = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+flume = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

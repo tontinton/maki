@@ -14,7 +14,7 @@ use maki_agent::mcp;
 use maki_agent::permissions::PermissionManager;
 use maki_agent::{
     AgentConfig, CancelMap, CancelToken, Envelope, McpCommand, McpConfigErrors, McpHandle,
-    McpSnapshotReader, ToolOutput, ToolOutputLines,
+    McpSnapshotReader, SharedContext, ToolOutput, ToolOutputLines, ValidContext,
 };
 use maki_lua::EventHandle;
 
@@ -47,7 +47,7 @@ pub(crate) struct AgentHandles {
     pub(crate) agent_rx: flume::Receiver<Envelope>,
     pub(crate) agent_tx: flume::Sender<Envelope>,
     pub(crate) answer_tx: flume::Sender<String>,
-    pub(crate) history: Arc<ArcSwap<Vec<Message>>>,
+    pub(crate) history: SharedContext,
     pub(crate) btw_system: Arc<ArcSwap<String>>,
     pub(crate) tool_outputs: Arc<Mutex<HashMap<String, ToolOutput>>>,
     pub(crate) mcp_handle: Option<McpHandle>,
@@ -203,8 +203,9 @@ fn spawn_agent_internal(
     let (answer_tx, answer_rx) = flume::unbounded::<String>();
     let (queue_tx, queue_rx) = shared_queue::queue();
     let queue_rx = Arc::new(queue_rx);
-    let shared_history: Arc<ArcSwap<Vec<Message>>> =
-        Arc::new(ArcSwap::from_pointee(initial_history.clone()));
+    let shared_history: SharedContext = Arc::new(ArcSwap::from_pointee(ValidContext::fold_linear(
+        initial_history.clone(),
+    )));
     let btw_system: Arc<ArcSwap<String>> = Arc::new(ArcSwap::from_pointee(String::new()));
     let shared_tool_outputs: Arc<Mutex<HashMap<String, ToolOutput>>> =
         Arc::new(Mutex::new(HashMap::new()));

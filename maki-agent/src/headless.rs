@@ -444,7 +444,8 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                 }
 
                 if let Some(store) = &mut store {
-                    store.record_turn(history.as_slice(), model.spec());
+                    let ctx = history.active_branch();
+                    store.record_turn(&ctx, model.spec());
                 }
                 run_id += 1;
             }

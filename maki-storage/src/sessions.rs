@@ -39,6 +39,8 @@ pub enum SessionError {
     IdMismatch { log_id: String, given_id: String },
     #[error("cursor ahead of session (log has {saved}, session has {actual}); compact required")]
     CursorAhead { saved: usize, actual: usize },
+    #[error("session tree cycle detected at {cycle_at}")]
+    CorruptTree { cycle_at: String },
 }
 
 /// Per-model token breakdown entry. Mirrors the four usage counters tracked by

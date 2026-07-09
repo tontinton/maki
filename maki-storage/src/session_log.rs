@@ -6,7 +6,7 @@
 //! failure, or unsupported version) yields a `SessionReader`, which has NO
 //! append methods. Read-only mode is the absence of capability, not a flag.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -17,16 +17,28 @@ use tracing::warn;
 
 use crate::paths::{lock_path, log_path, meta_path, renders_path, session_dir};
 use crate::renders::{self, RenderStore};
-use crate::tree::{Header, MessageId, MessageNode, NodeRef, Role, ToolUseId, TreeRecord};
+use crate::sessions::SessionError;
+use crate::tree::TreeEvent::{Append, Navigate, Summary};
+use crate::tree::{
+    AppendKind, Flavor, Header, LeafId, LeafRecord, MessageId, MessageNode, NodeRef, OrderedRecord,
+    Position, Role, SessionTree, SummaryRecord, ToolUseId, TreeEvent, TreeMutation, TreeNode,
+    TreeRecord,
+};
 use crate::{StorageError, atomic_write, fsync_dir, now_epoch};
 
 const LOG_VERSION: u32 = 3;
 
 /// C1 linear model: a chain of message nodes, sub_msgs (raw), meta, warnings.
+/// Tree records (leaves/summaries/labels) hang off the side; `build_session_tree`
+/// assembles the §A.5 domain model from them.
 pub struct LoadedSession {
     pub header: Header,
     pub messages: Vec<MessageNode>,
     pub sub_msgs: Vec<crate::tree::SubMsgRecord>,
+    pub leaves: Vec<LeafRecord>,
+    pub summaries: Vec<SummaryRecord>,
+    pub labels: Vec<crate::tree::LabelRecord>,
+    pub order: Vec<OrderedRecord>,
     pub meta: crate::tree::MetaRecord,
     pub warnings: Vec<String>,
 }
@@ -64,6 +76,9 @@ pub struct SessionWriter {
     renders: RenderStore,
     compressor: zstd::bulk::Compressor<'static>,
     unclean: bool,
+    nodes: HashMap<NodeRef, TreeNode>,
+    order: Vec<OrderedRecord>,
+    flavors: HashMap<NodeRef, Flavor>,
 }
 
 impl SessionWriter {
@@ -83,6 +98,11 @@ impl SessionWriter {
         buf.push(b'\n');
         self.log_file.write_all(&buf)?;
         let id = node.id.clone();
+        let nref = NodeRef::Msg(id.clone());
+        self.flavors
+            .insert(nref.clone(), SessionTree::node_flavor(&node));
+        self.order.push(OrderedRecord::Node(nref.clone()));
+        self.nodes.insert(nref, TreeNode::Message(node.clone()));
         self.loaded.messages.push(node);
         Ok(id)
     }
@@ -98,6 +118,34 @@ impl SessionWriter {
         buf.push(b'\n');
         self.log_file.write_all(&buf)?;
         self.loaded.sub_msgs.push(record);
+        Ok(())
+    }
+
+    pub fn append_leaf(&mut self, record: LeafRecord) -> Result<(), StorageError> {
+        if self.unclean {
+            return Err(unclean_error());
+        }
+        let mut buf = serde_json::to_vec(&TreeRecord::Leaf(record.clone()))?;
+        buf.push(b'\n');
+        self.log_file.write_all(&buf)?;
+        self.order.push(OrderedRecord::Leaf {
+            target: record.target_node_id.clone(),
+        });
+        self.loaded.leaves.push(record);
+        Ok(())
+    }
+
+    pub fn append_summary(&mut self, record: SummaryRecord) -> Result<(), StorageError> {
+        if self.unclean {
+            return Err(unclean_error());
+        }
+        let mut buf = serde_json::to_vec(&TreeRecord::Summary(record.clone()))?;
+        buf.push(b'\n');
+        self.log_file.write_all(&buf)?;
+        let nref = NodeRef::Sum(record.id.clone());
+        self.order.push(OrderedRecord::Node(nref.clone()));
+        self.nodes.insert(nref, TreeNode::Summary(record.clone()));
+        self.loaded.summaries.push(record);
         Ok(())
     }
 
@@ -120,11 +168,28 @@ impl SessionWriter {
         atomic_write(&meta_path(&self.session_dir), &json)
     }
 
+    /// Persist the session header as the first `log.jsonl` line (§14). Idempotent
+    /// for a brand-new session opened via `open`; the header is the only record
+    /// written before the first mutation.
+    pub fn write_header(&mut self) -> Result<(), StorageError> {
+        if self.unclean {
+            return Err(unclean_error());
+        }
+        let mut buf = serde_json::to_vec(&TreeRecord::Header(self.loaded.header.clone()))?;
+        buf.push(b'\n');
+        self.log_file.write_all(&buf)?;
+        Ok(())
+    }
+
     pub fn sync(&mut self) -> Result<(), StorageError> {
         if self.unclean {
             return Err(unclean_error());
         }
         if let Err(e) = self.log_file.sync_data() {
+            self.downgrade(e);
+            return Err(unclean_error());
+        }
+        if let Err(e) = self.renders.sync_file() {
             self.downgrade(e);
             return Err(unclean_error());
         }
@@ -135,6 +200,18 @@ impl SessionWriter {
         warn!(error = %err, "fsync failed; downgrading writer to read-only");
         self.unclean = true;
         let _ = FileExt::unlock(&self.lock);
+    }
+
+    pub fn nodes(&self) -> &HashMap<NodeRef, TreeNode> {
+        &self.nodes
+    }
+
+    pub fn order(&self) -> &[OrderedRecord] {
+        &self.order
+    }
+
+    pub fn flavors(&self) -> &HashMap<NodeRef, Flavor> {
+        &self.flavors
     }
 
     /// Rewrite the folder to the given linear message set: write-new-log-then-
@@ -192,8 +269,25 @@ impl SessionWriter {
         self.log_file = OpenOptions::new().append(true).open(&final_log)?;
         self.renders = RenderStore::open(&final_renders)?;
         self.compressor = renders::new_compressor()?;
+        self.loaded.leaves.clear();
+        self.loaded.summaries.clear();
+        self.loaded.labels.clear();
         self.loaded.messages = messages;
+        self.rebuild_tree_state();
         Ok(())
+    }
+
+    fn rebuild_tree_state(&mut self) {
+        self.loaded.order = self
+            .loaded
+            .messages
+            .iter()
+            .map(|m| OrderedRecord::Node(NodeRef::Msg(m.id.clone())))
+            .collect();
+        let (nodes, order, flavors) = tree_state_from_loaded(&self.loaded);
+        self.nodes = nodes;
+        self.order = order;
+        self.flavors = flavors;
     }
 }
 
@@ -216,40 +310,53 @@ pub enum OpenResult {
     Writer(SessionWriter),
     Reader(SessionReader),
     Unsupported(u32),
-    Error(StorageError),
+    Error(SessionError),
 }
 
 /// Open a session folder. Tries to acquire the writer lock; on contention (or
 /// fsync failure) returns a `SessionReader`.
 pub fn open(base: &Path, id: &str) -> OpenResult {
     let dir = session_dir(base, id);
+    let mut is_new = false;
     let loaded = match load_folder(&dir, id) {
         Ok(l) => l,
-        Err(StorageError::NotFound(_)) => LoadedSession {
-            header: init_header(id, "", now_epoch()),
-            messages: Vec::new(),
-            sub_msgs: Vec::new(),
-            meta: crate::tree::MetaRecord {
-                title: String::new(),
-                cwd: String::new(),
-                model: String::new(),
-                updated_at: now_epoch(),
-                migration: None,
-                meta: crate::sessions::SessionMeta::default(),
-            },
-            warnings: Vec::new(),
-        },
-        Err(e) => return OpenResult::Error(e),
+        Err(StorageError::NotFound(_)) => {
+            is_new = true;
+            LoadedSession {
+                header: init_header(id, "", now_epoch()),
+                messages: Vec::new(),
+                sub_msgs: Vec::new(),
+                leaves: Vec::new(),
+                summaries: Vec::new(),
+                labels: Vec::new(),
+                order: Vec::new(),
+                meta: crate::tree::MetaRecord {
+                    title: String::new(),
+                    cwd: String::new(),
+                    model: String::new(),
+                    updated_at: now_epoch(),
+                    migration: None,
+                    meta: crate::sessions::SessionMeta::default(),
+                },
+                warnings: Vec::new(),
+            }
+        }
+        Err(e) => return OpenResult::Error(SessionError::Storage(e)),
     };
     if loaded.header.version > LOG_VERSION {
         return OpenResult::Unsupported(loaded.header.version);
     }
+    // §A.5 open step 2: cycle check here is what lets `fold` be infallible.
+    let (nodes, order, flavors) = tree_state_from_loaded(&loaded);
+    if let Err(e) = check_cycles(&nodes) {
+        return OpenResult::Error(e);
+    }
     if fs::create_dir_all(&dir).is_err() {
-        return OpenResult::Error(StorageError::NotFound(id.into()));
+        return OpenResult::Error(SessionError::Storage(StorageError::NotFound(id.into())));
     }
     let lock = match File::create(lock_path(&dir)) {
         Ok(f) => f,
-        Err(e) => return OpenResult::Error(StorageError::Io(e)),
+        Err(e) => return OpenResult::Error(SessionError::Storage(StorageError::Io(e))),
     };
     if !FileExt::try_lock_exclusive(&lock).unwrap_or(false) {
         let reader = SessionReader {
@@ -267,24 +374,24 @@ pub fn open(base: &Path, id: &str) -> OpenResult {
         Ok(f) => f,
         Err(e) => {
             let _ = FileExt::unlock(&lock);
-            return OpenResult::Error(StorageError::Io(e));
+            return OpenResult::Error(SessionError::Storage(StorageError::Io(e)));
         }
     };
     let renders = match RenderStore::open(&renders_path(&dir)) {
         Ok(r) => r,
         Err(e) => {
             let _ = FileExt::unlock(&lock);
-            return OpenResult::Error(StorageError::Io(e));
+            return OpenResult::Error(SessionError::Storage(StorageError::Io(e)));
         }
     };
     let compressor = match renders::new_compressor() {
         Ok(c) => c,
         Err(e) => {
             let _ = FileExt::unlock(&lock);
-            return OpenResult::Error(StorageError::Io(e));
+            return OpenResult::Error(SessionError::Storage(StorageError::Io(e)));
         }
     };
-    let writer = SessionWriter {
+    let mut writer = SessionWriter {
         session_dir: dir,
         loaded,
         log_file,
@@ -292,7 +399,15 @@ pub fn open(base: &Path, id: &str) -> OpenResult {
         renders,
         compressor,
         unclean: false,
+        nodes,
+        order,
+        flavors,
     };
+    // A brand-new session has an in-memory header but no log line yet (§14);
+    // persist it so a later load_folder finds the header.
+    if is_new && let Err(e) = writer.write_header() {
+        writer.downgrade(std::io::Error::other(format!("header write: {e}")));
+    }
     OpenResult::Writer(writer)
 }
 
@@ -302,6 +417,10 @@ pub fn load_folder(dir: &Path, id: &str) -> Result<LoadedSession, StorageError> 
     let mut header: Option<Header> = None;
     let mut messages = Vec::new();
     let mut sub_msgs = Vec::new();
+    let mut leaves = Vec::new();
+    let mut summaries = Vec::new();
+    let mut labels = Vec::new();
+    let mut order: Vec<OrderedRecord> = Vec::new();
 
     let file = File::open(&log).map_err(|e| StorageError::NotFound(format!("{id}: {e}")))?;
     let reader = BufReader::new(file);
@@ -312,7 +431,21 @@ pub fn load_folder(dir: &Path, id: &str) -> Result<LoadedSession, StorageError> 
         }
         match crate::tree::parse_line(&line) {
             Ok(Some(TreeRecord::Header(h))) => header = Some(h),
-            Ok(Some(TreeRecord::Message(m))) => messages.push(m),
+            Ok(Some(TreeRecord::Message(m))) => {
+                order.push(OrderedRecord::Node(NodeRef::Msg(m.id.clone())));
+                messages.push(m);
+            }
+            Ok(Some(TreeRecord::Leaf(l))) => {
+                order.push(OrderedRecord::Leaf {
+                    target: l.target_node_id.clone(),
+                });
+                leaves.push(l);
+            }
+            Ok(Some(TreeRecord::Summary(s))) => {
+                order.push(OrderedRecord::Node(NodeRef::Sum(s.id.clone())));
+                summaries.push(s);
+            }
+            Ok(Some(TreeRecord::Label(l))) => labels.push(l),
             Ok(Some(TreeRecord::SubMsg(s))) => sub_msgs.push(s),
             Ok(None) => {}
             Err(e) => {
@@ -335,6 +468,10 @@ pub fn load_folder(dir: &Path, id: &str) -> Result<LoadedSession, StorageError> 
         header,
         messages,
         sub_msgs,
+        leaves,
+        summaries,
+        labels,
+        order,
         meta,
         warnings,
     })
@@ -376,9 +513,197 @@ pub fn next_message(
     }
 }
 
+fn tree_state_from_loaded(
+    loaded: &LoadedSession,
+) -> (
+    HashMap<NodeRef, TreeNode>,
+    Vec<OrderedRecord>,
+    HashMap<NodeRef, Flavor>,
+) {
+    let mut nodes = HashMap::new();
+    let mut flavors = HashMap::new();
+    for m in &loaded.messages {
+        let nref = NodeRef::Msg(m.id.clone());
+        flavors.insert(nref.clone(), SessionTree::node_flavor(m));
+        nodes.insert(nref, TreeNode::Message(m.clone()));
+    }
+    for s in &loaded.summaries {
+        nodes.insert(NodeRef::Sum(s.id.clone()), TreeNode::Summary(s.clone()));
+    }
+    (nodes, loaded.order.clone(), flavors)
+}
+
+/// Assemble the §A.5 domain model from a load: nodes/order/flavors, the leaf
+/// resolved via the leaf rule, and the open-time cycle check.
+pub fn build_session_tree(loaded: &LoadedSession) -> Result<SessionTree, SessionError> {
+    let (nodes, order, flavors) = tree_state_from_loaded(loaded);
+    check_cycles(&nodes)?;
+    let leaf = active_leaf(&order, &nodes);
+    Ok(SessionTree {
+        nodes,
+        order,
+        leaf,
+        labels: loaded.labels.clone(),
+        sub_msgs: loaded.sub_msgs.clone(),
+        flavors,
+    })
+}
+
+/// §A.5 open step 2: one O(n) parent-walk over `nodes`. A cycle is the one
+/// unservable shape → `CorruptTree` at open (what lets `fold` be infallible).
+fn check_cycles(nodes: &HashMap<NodeRef, TreeNode>) -> Result<(), SessionError> {
+    for start in nodes.keys() {
+        let mut cur = Some(start.clone());
+        let mut seen = HashSet::new();
+        while let Some(nref) = cur {
+            if !seen.insert(nref.clone()) {
+                return Err(SessionError::CorruptTree {
+                    cycle_at: start.to_string(),
+                });
+            }
+            cur = nodes.get(&nref).and_then(TreeNode::parent_id);
+        }
+    }
+    Ok(())
+}
+
+/// The leaf rule (§4/§A.5), as code. Reverse append order; first Leaf wins by
+/// its target (skipping unresolved targets with a warn); first Node wins by its
+/// id; else Root.
+pub fn active_leaf(order: &[OrderedRecord], nodes: &HashMap<NodeRef, TreeNode>) -> Position {
+    for r in order.iter().rev() {
+        match r {
+            OrderedRecord::Leaf { target: None } => return Position::Root,
+            OrderedRecord::Leaf { target: Some(t) } if nodes.contains_key(t) => {
+                return Position::At(t.clone());
+            }
+            OrderedRecord::Leaf { target: Some(t) } => {
+                warn!(target = %t, "leaf target missing; skipping");
+            }
+            OrderedRecord::Node(nref) => return Position::At(nref.clone()),
+        }
+    }
+    Position::Root
+}
+
+/// Undo-of-rewind (§A.5): the position before the last Leaf record, recovered
+/// by running `active_leaf` over the prefix ending just before it. Only called
+/// when `order.last()` is itself a `Leaf`, so `i` always exists.
+pub fn position_before_last_leaf(
+    order: &[OrderedRecord],
+    nodes: &HashMap<NodeRef, TreeNode>,
+) -> Position {
+    let i = order
+        .iter()
+        .rposition(|r| matches!(r, OrderedRecord::Leaf { .. }))
+        .expect("position_before_last_leaf requires order to end with a Leaf");
+    active_leaf(&order[..i], nodes)
+}
+
+/// §13 writer: owns a `SessionWriter`, drains an unbounded `flume<TreeMutation>`
+/// (no coalescing — every mutation durable), emits `TreeEvent`s after the write
+/// and before the batched fsync, and acks `Barrier` once fsync succeeds. Never
+/// blocks on or calls a model; fsync failure downgrades the writer (§13).
+pub struct TreeWriter {
+    writer: SessionWriter,
+    rx: flume::Receiver<TreeMutation>,
+    events: flume::Sender<TreeEvent>,
+    event_rx: flume::Receiver<TreeEvent>,
+}
+
+impl TreeWriter {
+    pub fn new(writer: SessionWriter, rx: flume::Receiver<TreeMutation>) -> Self {
+        let (events, event_rx) = flume::unbounded();
+        Self {
+            writer,
+            rx,
+            events,
+            event_rx,
+        }
+    }
+
+    pub fn events(&self) -> flume::Receiver<TreeEvent> {
+        self.event_rx.clone()
+    }
+
+    pub fn run(mut self) {
+        while let Ok(mutation) = self.rx.recv() {
+            if self.writer.unclean {
+                continue;
+            }
+            match mutation {
+                TreeMutation::AppendMessage(node) => {
+                    let nref = NodeRef::Msg(node.id.clone());
+                    if self.writer.append_message(node).is_ok() {
+                        self.emit(Append {
+                            node_id: Some(nref),
+                            kind: AppendKind::Message,
+                        });
+                    }
+                }
+                TreeMutation::AppendSubMsg(record) => {
+                    if self.writer.append_sub_msg(record).is_ok() {
+                        self.emit(Append {
+                            node_id: None,
+                            kind: AppendKind::SubMsg,
+                        });
+                    }
+                }
+                TreeMutation::AppendRender { tool_use_id, frame } => {
+                    if self.writer.append_render(&tool_use_id, &frame).is_ok() {
+                        self.emit(Append {
+                            node_id: None,
+                            kind: AppendKind::Render,
+                        });
+                    }
+                }
+                TreeMutation::SetMeta(meta) => {
+                    self.writer.loaded.meta = meta;
+                    if self.writer.write_meta().is_ok() {
+                        self.emit(Append {
+                            node_id: None,
+                            kind: AppendKind::Meta,
+                        });
+                    }
+                }
+                TreeMutation::Rewind { target } => {
+                    let old = active_leaf(&self.writer.order, &self.writer.nodes);
+                    let record = LeafRecord {
+                        id: LeafId::new(),
+                        target_node_id: target.node_ref().cloned(),
+                    };
+                    if self.writer.append_leaf(record).is_ok() {
+                        let new = active_leaf(&self.writer.order, &self.writer.nodes);
+                        self.emit(Navigate {
+                            old_leaf: old,
+                            new_leaf: new,
+                        });
+                    }
+                }
+                TreeMutation::AppendSummary(record) => {
+                    let sid = record.id.clone();
+                    let kind = record.kind.clone();
+                    if self.writer.append_summary(record).is_ok() {
+                        self.emit(Summary { node_id: sid, kind });
+                    }
+                }
+                TreeMutation::Barrier(ack) => {
+                    let _ = self.writer.sync();
+                    let _ = ack.send(());
+                }
+            }
+        }
+    }
+
+    fn emit(&self, event: TreeEvent) {
+        let _ = self.events.send(event);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tree::{SummaryId, SummaryKind};
 
     #[test]
     fn second_instance_lock_yields_reader() {
@@ -499,5 +824,319 @@ mod tests {
         assert_eq!(loaded.title, "Test Title");
         assert_eq!(loaded.model, "test-model");
         assert_eq!(loaded.updated_at, 999);
+    }
+
+    fn write_log(dir: &Path, id: &str, lines: &[String]) {
+        let log = crate::paths::log_path(&crate::paths::session_dir(dir, id));
+        fs::create_dir_all(log.parent().unwrap()).unwrap();
+        fs::write(&log, lines.join("\n") + "\n").unwrap();
+    }
+
+    fn load_tree(dir: &Path, id: &str) -> SessionTree {
+        let loaded = load_folder(&crate::paths::session_dir(dir, id), id).unwrap();
+        build_session_tree(&loaded).unwrap()
+    }
+
+    fn msg_line(parent: Option<NodeRef>, role: Role, ts: u64) -> (String, MessageId) {
+        let node = next_message(parent, role, Vec::new(), ts);
+        let id = node.id.clone();
+        (
+            serde_json::to_string(&TreeRecord::Message(node)).unwrap(),
+            id,
+        )
+    }
+
+    fn leaf_line(target: Option<NodeRef>) -> String {
+        let record = LeafRecord {
+            id: LeafId::new(),
+            target_node_id: target,
+        };
+        serde_json::to_string(&TreeRecord::Leaf(record)).unwrap()
+    }
+
+    #[test]
+    fn active_leaf_last_message_wins() {
+        let m1 = MessageId::new();
+        let m2 = MessageId::new();
+        let mut nodes = HashMap::new();
+        nodes.insert(NodeRef::Msg(m1.clone()), TreeNode::Message(node_only(&m1)));
+        nodes.insert(NodeRef::Msg(m2.clone()), TreeNode::Message(node_only(&m2)));
+        let order = vec![
+            OrderedRecord::Node(NodeRef::Msg(m1)),
+            OrderedRecord::Node(NodeRef::Msg(m2.clone())),
+        ];
+        assert_eq!(active_leaf(&order, &nodes), Position::At(NodeRef::Msg(m2)));
+    }
+
+    #[test]
+    fn active_leaf_leaf_record_overrides_last_message() {
+        let m1 = MessageId::new();
+        let m2 = MessageId::new();
+        let mut nodes = HashMap::new();
+        nodes.insert(NodeRef::Msg(m1.clone()), TreeNode::Message(node_only(&m1)));
+        nodes.insert(NodeRef::Msg(m2.clone()), TreeNode::Message(node_only(&m2)));
+        let order = vec![
+            OrderedRecord::Node(NodeRef::Msg(m1.clone())),
+            OrderedRecord::Node(NodeRef::Msg(m2)),
+            OrderedRecord::Leaf {
+                target: Some(NodeRef::Msg(m1.clone())),
+            },
+        ];
+        assert_eq!(active_leaf(&order, &nodes), Position::At(NodeRef::Msg(m1)));
+    }
+
+    #[test]
+    fn active_leaf_root_target_returns_root() {
+        let m1 = MessageId::new();
+        let mut nodes = HashMap::new();
+        nodes.insert(NodeRef::Msg(m1.clone()), TreeNode::Message(node_only(&m1)));
+        let order = vec![
+            OrderedRecord::Node(NodeRef::Msg(m1)),
+            OrderedRecord::Leaf { target: None },
+        ];
+        assert_eq!(active_leaf(&order, &nodes), Position::Root);
+    }
+
+    #[test]
+    fn active_leaf_skips_dangling_target() {
+        let m1 = MessageId::new();
+        let dangling = NodeRef::Msg(MessageId::new());
+        let mut nodes = HashMap::new();
+        nodes.insert(NodeRef::Msg(m1.clone()), TreeNode::Message(node_only(&m1)));
+        let order = vec![
+            OrderedRecord::Node(NodeRef::Msg(m1.clone())),
+            OrderedRecord::Leaf {
+                target: Some(dangling),
+            },
+            OrderedRecord::Node(NodeRef::Msg(m1.clone())),
+        ];
+        assert_eq!(active_leaf(&order, &nodes), Position::At(NodeRef::Msg(m1)));
+    }
+
+    #[test]
+    fn active_leaf_summary_advances_leaf() {
+        let s = SummaryId::new();
+        let m1 = MessageId::new();
+        let mut nodes = HashMap::new();
+        nodes.insert(NodeRef::Msg(m1.clone()), TreeNode::Message(node_only(&m1)));
+        nodes.insert(
+            NodeRef::Sum(s.clone()),
+            TreeNode::Summary(compaction_summary(NodeRef::Msg(m1.clone()), s.clone())),
+        );
+        let order = vec![
+            OrderedRecord::Node(NodeRef::Msg(m1)),
+            OrderedRecord::Node(NodeRef::Sum(s.clone())),
+        ];
+        assert_eq!(active_leaf(&order, &nodes), Position::At(NodeRef::Sum(s)));
+    }
+
+    #[test]
+    fn position_before_last_leaf_restores_pre_rewind_tip() {
+        let m1 = MessageId::new();
+        let m2 = MessageId::new();
+        let mut nodes = HashMap::new();
+        nodes.insert(NodeRef::Msg(m1.clone()), TreeNode::Message(node_only(&m1)));
+        nodes.insert(NodeRef::Msg(m2.clone()), TreeNode::Message(node_only(&m2)));
+        let order = vec![
+            OrderedRecord::Node(NodeRef::Msg(m1.clone())),
+            OrderedRecord::Node(NodeRef::Msg(m2.clone())),
+            OrderedRecord::Leaf {
+                target: Some(NodeRef::Msg(m1.clone())),
+            },
+        ];
+        assert_eq!(
+            position_before_last_leaf(&order, &nodes),
+            Position::At(NodeRef::Msg(m2))
+        );
+    }
+
+    #[test]
+    fn leaf_rule_rewind_then_push_resolves_to_push() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = "rewind-push-resume";
+        let (m1_line, m1) = msg_line(None, Role::User, 1);
+        let (m2_line, _m2) = msg_line(Some(NodeRef::Msg(m1.clone())), Role::Assistant, 2);
+        let (m3_line, m3) = msg_line(Some(NodeRef::Msg(m1.clone())), Role::User, 3);
+        let rewind = leaf_line(Some(NodeRef::Msg(m1)));
+        let header = serde_json::to_string(&TreeRecord::Header(init_header(id, "/c", 0))).unwrap();
+        write_log(tmp.path(), id, &[header, m1_line, m2_line, rewind, m3_line]);
+        let tree = load_tree(tmp.path(), id);
+        assert_eq!(tree.leaf, Position::At(NodeRef::Msg(m3)));
+    }
+
+    #[test]
+    fn leaf_rule_summary_append_advances_leaf() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = "summary-advances";
+        let (m1_line, m1) = msg_line(None, Role::User, 1);
+        let s = compaction_summary(NodeRef::Msg(m1), SummaryId::new());
+        let s_id = s.id.clone();
+        let s_line = serde_json::to_string(&TreeRecord::Summary(s)).unwrap();
+        let header = serde_json::to_string(&TreeRecord::Header(init_header(id, "/c", 0))).unwrap();
+        write_log(tmp.path(), id, &[header, m1_line, s_line]);
+        let tree = load_tree(tmp.path(), id);
+        assert_eq!(tree.leaf, Position::At(NodeRef::Sum(s_id)));
+    }
+
+    #[test]
+    fn leaf_rule_undo_of_first_rewind_restores_tip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = "undo-first-rewind";
+        let (m1_line, m1) = msg_line(None, Role::User, 1);
+        let (m2_line, m2) = msg_line(Some(NodeRef::Msg(m1.clone())), Role::Assistant, 2);
+        let rewind = leaf_line(Some(NodeRef::Msg(m1.clone())));
+        let header = serde_json::to_string(&TreeRecord::Header(init_header(id, "/c", 0))).unwrap();
+        write_log(tmp.path(), id, &[header, m1_line, m2_line, rewind]);
+        let tree = load_tree(tmp.path(), id);
+        assert_eq!(tree.leaf, Position::At(NodeRef::Msg(m1)));
+        assert_eq!(
+            position_before_last_leaf(&tree.order, &tree.nodes),
+            Position::At(NodeRef::Msg(m2))
+        );
+    }
+
+    #[test]
+    fn leaf_rule_dangling_leaf_target_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = "dangling-leaf";
+        let (m1_line, m1) = msg_line(None, Role::User, 1);
+        let dangling = NodeRef::Msg(MessageId::new());
+        let rewind = leaf_line(Some(dangling));
+        let header = serde_json::to_string(&TreeRecord::Header(init_header(id, "/c", 0))).unwrap();
+        // Duplicate m1 line so the dangling leaf does not sit at the tail.
+        write_log(
+            tmp.path(),
+            id,
+            &[header.clone(), m1_line.clone(), rewind, m1_line],
+        );
+        let tree = load_tree(tmp.path(), id);
+        assert_eq!(tree.leaf, Position::At(NodeRef::Msg(m1)));
+    }
+
+    #[test]
+    fn cycle_detected_at_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = "cycle";
+        let m1 = MessageId::new();
+        let m2 = MessageId::new();
+        let n1 = MessageNode {
+            id: m1.clone(),
+            parent_id: Some(NodeRef::Msg(m2.clone())),
+            role: Role::User,
+            content: Vec::new(),
+            timestamp: 1,
+            run_id: None,
+            interrupted: false,
+            hidden: false,
+        };
+        let n2 = MessageNode {
+            id: m2.clone(),
+            parent_id: Some(NodeRef::Msg(m1.clone())),
+            role: Role::Assistant,
+            content: Vec::new(),
+            timestamp: 2,
+            run_id: None,
+            interrupted: false,
+            hidden: false,
+        };
+        let header = serde_json::to_string(&TreeRecord::Header(init_header(id, "/c", 0))).unwrap();
+        let l1 = serde_json::to_string(&TreeRecord::Message(n1)).unwrap();
+        let l2 = serde_json::to_string(&TreeRecord::Message(n2)).unwrap();
+        write_log(tmp.path(), id, &[header, l1, l2]);
+        let loaded = load_folder(&crate::paths::session_dir(tmp.path(), id), id).unwrap();
+        let err = build_session_tree(&loaded).unwrap_err();
+        assert!(matches!(err, SessionError::CorruptTree { .. }));
+    }
+
+    #[test]
+    fn cycle_in_open_returns_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = "open-cycle";
+        let m1 = MessageId::new();
+        let m2 = MessageId::new();
+        let n1 = MessageNode {
+            id: m1.clone(),
+            parent_id: Some(NodeRef::Msg(m2.clone())),
+            role: Role::User,
+            content: Vec::new(),
+            timestamp: 1,
+            run_id: None,
+            interrupted: false,
+            hidden: false,
+        };
+        let n2 = MessageNode {
+            id: m2.clone(),
+            parent_id: Some(NodeRef::Msg(m1)),
+            role: Role::Assistant,
+            content: Vec::new(),
+            timestamp: 2,
+            run_id: None,
+            interrupted: false,
+            hidden: false,
+        };
+        let dir = crate::paths::session_dir(tmp.path(), id);
+        fs::create_dir_all(&dir).unwrap();
+        let header = serde_json::to_string(&TreeRecord::Header(init_header(id, "/c", 0))).unwrap();
+        let l1 = serde_json::to_string(&TreeRecord::Message(n1)).unwrap();
+        let l2 = serde_json::to_string(&TreeRecord::Message(n2)).unwrap();
+        write_log(tmp.path(), id, &[header, l1, l2]);
+        assert!(matches!(
+            open(tmp.path(), id),
+            OpenResult::Error(SessionError::CorruptTree { .. })
+        ));
+    }
+
+    #[test]
+    fn broken_parent_chain_serves_reachable_suffix() {
+        let m1 = MessageId::new();
+        let m2 = MessageId::new();
+        let mut nodes = HashMap::new();
+        nodes.insert(NodeRef::Msg(m1.clone()), TreeNode::Message(node_only(&m1)));
+        nodes.insert(
+            NodeRef::Msg(m2.clone()),
+            TreeNode::Message(MessageNode {
+                id: m2.clone(),
+                parent_id: Some(NodeRef::Msg(MessageId::new())),
+                role: Role::User,
+                content: Vec::new(),
+                timestamp: 2,
+                run_id: None,
+                interrupted: false,
+                hidden: false,
+            }),
+        );
+        let order = vec![
+            OrderedRecord::Node(NodeRef::Msg(m1)),
+            OrderedRecord::Node(NodeRef::Msg(m2.clone())),
+        ];
+        // No panic: active_leaf resolves; the broken parent (m2.parent absent)
+        // is a walk boundary for fold, not a load failure.
+        assert_eq!(active_leaf(&order, &nodes), Position::At(NodeRef::Msg(m2)));
+    }
+
+    fn node_only(id: &MessageId) -> MessageNode {
+        MessageNode {
+            id: id.clone(),
+            parent_id: None,
+            role: Role::User,
+            content: Vec::new(),
+            timestamp: 0,
+            run_id: None,
+            interrupted: false,
+            hidden: false,
+        }
+    }
+
+    fn compaction_summary(parent: NodeRef, sid: SummaryId) -> SummaryRecord {
+        SummaryRecord {
+            id: sid,
+            parent_id: parent,
+            narrative: "compaction narrative".into(),
+            kind: SummaryKind::Compaction {
+                fold_to_id: MessageId::new(),
+            },
+            read_files: Vec::new(),
+            modified_files: Vec::new(),
+        }
     }
 }

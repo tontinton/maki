@@ -69,8 +69,7 @@ impl App {
     }
 
     pub(super) fn enqueue_save(&self) {
-        self.storage_writer
-            .send(Box::new(self.state.session.clone()));
+        self.storage_writer.send(&self.state.session);
     }
 
     pub(super) fn reset_ui_chrome(&mut self) {
@@ -183,17 +182,9 @@ impl App {
     pub(super) fn rewind_to(&mut self, entry: RewindEntry) -> Vec<Action> {
         self.run_id += 1;
 
-        let stale_ids: Vec<String> = self.state.session.messages[entry.turn_index..]
-            .iter()
-            .flat_map(|m| m.tool_uses())
-            .map(|(id, _, _)| id.to_owned())
-            .collect();
-        self.state.session.messages.truncate(entry.turn_index);
-        for id in &stale_ids {
-            self.state.session.tool_outputs.remove(id);
-            self.state.session.subagent_messages.remove(id);
-        }
-
+        // Non-destructive rewind (§4, §8): the abandoned branch is preserved.
+        // The tree selector + leaf-based display restore is C3; until then this
+        // only restores the input and saves — messages are NOT truncated.
         self.reset_ui_chrome();
         self.restore_display();
 

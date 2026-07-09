@@ -17,6 +17,8 @@ pub enum RewindPickerAction {
 }
 
 pub struct RewindEntry {
+    /// Position in the linear message vec; used by the C3 tree selector.
+    #[allow(dead_code)]
     pub turn_index: usize,
     pub prompt_preview: String,
     pub prompt_text: String,

@@ -318,9 +318,8 @@ impl UserData for LuaSession {
                 return Ok((LuaValue::Nil, Some(e.to_string())));
             }
 
-            let text = s
-                .history
-                .as_slice()
+            let ctx = s.history.active_branch();
+            let text = ctx
                 .iter()
                 .rev()
                 .filter(|m| matches!(m.role, Role::Assistant))

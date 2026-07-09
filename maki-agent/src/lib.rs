@@ -11,8 +11,9 @@ pub use mcp::protocol::PromptRole;
 pub use mcp::{McpCommand, McpHandle, McpPromptArg, McpPromptInfo, McpSnapshot, McpSnapshotReader};
 pub(crate) mod task_set;
 pub use agent::{
-    Agent, AgentParams, AgentRunParams, History, Instructions, LoadedInstructions, SharedMessages,
-    find_subdirectory_instructions, is_instruction_file,
+    Agent, AgentParams, AgentRunParams, CutPoint, FinalizedPartial, History, Instructions,
+    LoadedInstructions, SharedContext, ValidContext, find_subdirectory_instructions,
+    is_instruction_file,
 };
 pub use cancel::{CancelMap, CancelToken, CancelTrigger};
 pub use maki_config::{AgentConfig, PermissionsConfig, ToolOutputLines};

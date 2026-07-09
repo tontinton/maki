@@ -95,6 +95,10 @@ impl RenderStore {
         self.memo.contains_key(id) || self.index.contains_key(id)
     }
 
+    pub fn sync_file(&self) -> Result<(), std::io::Error> {
+        self.file.sync_data()
+    }
+
     fn read_frame(&mut self, entry: &FrameEntry) -> Result<Option<Vec<u8>>, std::io::Error> {
         self.file.seek(SeekFrom::Start(entry.frame_offset))?;
         let mut record = vec![0u8; entry.frame_len as usize];

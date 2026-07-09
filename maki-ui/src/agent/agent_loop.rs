@@ -13,7 +13,7 @@ use maki_agent::tools::{
 use maki_agent::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentParams, AgentRunParams, CancelMap,
     CancelToken, CancelTrigger, Envelope, EventSender, History, Instructions, McpCommand,
-    PromptRole, ToolOutputLines,
+    PromptRole, SharedContext, ToolOutputLines,
 };
 use maki_lua::EventHandle;
 use maki_providers::{AgentError, Message, Model, TokenUsage};
@@ -55,7 +55,7 @@ impl AgentLoop {
         config: AgentConfig,
         tool_output_lines: ToolOutputLines,
         initial_history: Vec<Message>,
-        shared_history: Arc<ArcSwap<Vec<Message>>>,
+        shared_history: SharedContext,
         btw_system: Arc<ArcSwap<String>>,
         mcp_handle: Option<McpHandle>,
         permissions: Arc<PermissionManager>,

@@ -1,59 +1,197 @@
+use std::collections::HashSet;
+use std::ops::Deref;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use maki_providers::{ContentBlock, Message, Role};
+use maki_storage::tree::{
+    Flavor, MessageId, MessageNode, NodeRef, OrderedRecord, Position, SessionTree, SummaryId,
+    SummaryKind, SummaryRecord, TreeNode,
+};
+use serde_json::value::RawValue;
 use tracing::warn;
 
-const CANCEL_MARKER: &str = "[Cancelled by user]";
-const UNAVAILABLE_RESULT: &str = "[Tool result not available]";
+/// Synthetic result text for a `tool_use` whose result never arrived (crash
+/// mid-tool, rewind onto an assistant turn, walk-boundary truncation). Part of
+/// the fold determinism invariant (§2): never changed casually.
+pub const TOOL_RESULT_UNAVAILABLE: &str = "[Tool result not available]";
 
-pub type SharedMessages = Arc<ArcSwap<Vec<Message>>>;
+/// Cancelled-tool result text (mid-tool cancel path, §8).
+const CANCELLED_BY_USER: &str = "[Cancelled by user]";
 
+const CHARS_PER_TOKEN: usize = 4;
+
+/// The only thing the request layer accepts (§A.0(4)). Constructed solely by
+/// `fold` (assembly + repair + lowering), so an unrepaired history cannot reach
+/// a provider by construction. Cache hits and UI hand-offs are an Arc bump.
+pub struct ValidContext {
+    messages: Arc<[Message]>,
+}
+
+impl ValidContext {
+    fn new(messages: Vec<Message>) -> Self {
+        Self {
+            messages: Arc::from(messages),
+        }
+    }
+
+    /// Build a `ValidContext` from a linear message vec by folding a linear
+    /// tree (§A.4). The sole public constructor: it runs `fold` (assembly +
+    /// repair), so an unrepaired history can never be minted (§A.0(4)).
+    pub fn fold_linear(messages: Vec<Message>) -> Self {
+        let tree = linear_tree(&messages);
+        fold(&tree)
+    }
+}
+
+impl Deref for ValidContext {
+    type Target = [Message];
+
+    fn deref(&self) -> &Self::Target {
+        &self.messages
+    }
+}
+
+impl Clone for ValidContext {
+    fn clone(&self) -> Self {
+        Self {
+            messages: Arc::clone(&self.messages),
+        }
+    }
+}
+
+/// UI/plugin snapshot container (§A.7). `ArcSwapAny<Arc<[Message]>>` does not
+/// compile (`RefCnt` is `Sized`-only), which is one reason the newtype exists.
+pub type SharedContext = Arc<ArcSwap<ValidContext>>;
+
+/// Tree-aware wrapper over `SessionTree` (§10). Holds the pure-fold cache keyed
+/// by a generation counter bumped on every structural mutation; streaming
+/// deltas mutate only an in-memory accumulator and leave `generation` (and thus the
+/// cache) unchanged mid-stream (§A.7).
 pub struct History {
-    messages: Vec<Message>,
-    mirror: Option<SharedMessages>,
+    tree: SessionTree,
+    generation: u64,
+    cache: Option<(u64, Arc<ValidContext>)>,
+    mirror: Option<SharedContext>,
 }
 
 impl History {
     pub fn new(messages: Vec<Message>) -> Self {
-        Self {
-            messages,
-            mirror: None,
-        }
+        Self::from_messages(messages)
     }
 
-    pub fn restored(mut messages: Vec<Message>) -> Self {
-        sanitize_restored(&mut messages);
-        Self {
-            messages,
-            mirror: None,
-        }
+    pub fn restored(messages: Vec<Message>) -> Self {
+        // `fold` runs the repair pass unconditionally, so a dirty persisted log
+        // (orphaned results, dangling tool calls) can never reach a provider
+        // (§A.4.1). No separate sanitize step is needed.
+        Self::from_messages(messages)
     }
 
-    pub fn with_mirror(mut self, mirror: SharedMessages) -> Self {
+    /// C2 behaves linearly: each node parents onto the previous one. Builds a
+    /// linear `SessionTree` from the message vec and folds it once for the cache.
+    fn from_messages(messages: Vec<Message>) -> Self {
+        let tree = linear_tree(&messages);
+        let ctx = Arc::new(fold(&tree));
+        Self {
+            tree,
+            generation: 0,
+            cache: Some((0, Arc::clone(&ctx))),
+            mirror: None,
+        }
+        .with_published(ctx)
+    }
+
+    pub fn with_mirror(mut self, mirror: SharedContext) -> Self {
         self.mirror = Some(mirror);
         self.publish();
         self
     }
 
-    pub fn as_slice(&self) -> &[Message] {
-        &self.messages
+    fn with_published(mut self, ctx: Arc<ValidContext>) -> Self {
+        self.cache = Some((0, Arc::clone(&ctx)));
+        if let Some(mirror) = &self.mirror {
+            mirror.store(Arc::clone(&ctx));
+        }
+        self
     }
 
-    pub fn push(&mut self, msg: Message) {
-        self.edit(|msgs| msgs.push(msg));
+    /// The cached `fold(active_branch(leaf))` (§10/§A.7). Returns the cached
+    /// value (Arc bump) when `generation` is current, else re-folds and stores.
+    pub fn active_branch(&mut self) -> ValidContext {
+        if let Some((g, ctx)) = &self.cache
+            && *g == self.generation
+        {
+            return (**ctx).clone();
+        }
+        let ctx = Arc::new(fold(&self.tree));
+        self.cache = Some((self.generation, Arc::clone(&ctx)));
+        if let Some(mirror) = &self.mirror {
+            mirror.store(Arc::clone(&ctx));
+        }
+        (*ctx).clone()
     }
 
-    pub fn len(&self) -> usize {
-        self.messages.len()
+    /// Enqueue a message node: parents onto the current leaf position and
+    /// becomes the new leaf (§4). A `Message` whose `display_text` is the
+    /// empty-string sentinel is a hidden chrome turn (§9) → stored `hidden`.
+    /// Bumps `generation`, invalidating the cache. Returns the new node id.
+    pub fn push(&mut self, msg: Message) -> MessageId {
+        let id = append_message_node(&mut self.tree, msg);
+        self.bump();
+        id
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.messages.is_empty()
+    /// Push a cancelled-tool result group as one hidden user node (§8). The
+    /// interrupt-finalize wiring is C6; this keeps the cancelled-results path
+    /// working as an ordinary hidden node.
+    pub fn push_cancelled_results(&mut self, tool_use_ids: &[String]) {
+        if tool_use_ids.is_empty() {
+            return;
+        }
+        let content: Vec<ContentBlock> = tool_use_ids
+            .iter()
+            .map(|id| ContentBlock::ToolResult {
+                tool_use_id: id.clone(),
+                content: CANCELLED_BY_USER.into(),
+                is_error: true,
+            })
+            .collect();
+        self.push(Message {
+            role: Role::User,
+            content,
+            display_text: Some(String::new()),
+        });
     }
 
-    pub fn has_recent_tool_results(&self, depth: usize) -> bool {
-        let msgs = self.as_slice();
+    /// On cancel, close dangling `tool_use`s in the folded context as
+    /// persisted hidden nodes carrying `[Cancelled by user]` results (§8). The
+    /// mid-tool cancel wiring is C6; this keeps the path API-valid and visible.
+    /// Idempotent: already-answered tool_uses are skipped.
+    pub fn close_cancelled_tool_calls(&mut self) {
+        let ctx = self.active_branch();
+        let dangling = dangling_tool_use_ids(&ctx);
+        drop(ctx);
+        if dangling.is_empty() {
+            return;
+        }
+        self.push_cancelled_results(&dangling);
+    }
+
+    /// Number of messages in the folded active branch.
+    pub fn len(&mut self) -> usize {
+        self.active_branch().len()
+    }
+
+    pub fn is_empty(&mut self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn into_vec(self) -> Vec<Message> {
+        fold(&self.tree).messages.to_vec()
+    }
+
+    pub fn has_recent_tool_results(&mut self, depth: usize) -> bool {
+        let msgs = self.active_branch();
         let start = msgs.len().saturating_sub(depth);
         msgs[start..].iter().any(|m| {
             m.content
@@ -62,53 +200,296 @@ impl History {
         })
     }
 
-    pub fn replace(&mut self, messages: Vec<Message>) {
-        self.edit(|msgs| *msgs = messages);
+    /// Select a compaction `CutPoint` over the active branch (§6), or `None`
+    /// when nothing eligible folds or the leaf is already a compaction.
+    pub fn compaction_cut(&self, keep_budget: u32) -> Option<CutPoint> {
+        if matches!(self.tree.leaf, Position::Root) {
+            return None;
+        }
+        if leaf_is_compaction(&self.tree) {
+            return None;
+        }
+        CutPoint::select(&self.tree, self.tree.leaf.clone(), keep_budget)
     }
 
-    pub fn truncate(&mut self, len: usize) {
-        self.edit(|msgs| msgs.truncate(len));
+    /// The prefix messages to summarize: the active branch up to (but
+    /// excluding) the cut node (the region `[root .. cut)` a compaction
+    /// replaces, §6). Walks the tree directly so node identity is preserved.
+    pub fn compaction_prefix(&self, cut: &CutPoint) -> Vec<Message> {
+        let cut_id = cut.message_id();
+        let mut path: Vec<&TreeNode> = Vec::new();
+        let mut cur = self.tree.leaf.node_ref().cloned();
+        while let Some(nref) = cur {
+            let Some(node) = self.tree.nodes.get(&nref) else {
+                break;
+            };
+            if let NodeRef::Msg(m) = &nref
+                && m == cut_id
+            {
+                break;
+            }
+            path.push(node);
+            cur = node.parent_id();
+        }
+        path.reverse();
+        let mut out: Vec<Message> = path
+            .into_iter()
+            .map(|node| match node {
+                TreeNode::Message(m) => {
+                    let flavor = self
+                        .tree
+                        .flavors
+                        .get(&NodeRef::Msg(m.id.clone()))
+                        .copied()
+                        .unwrap_or(Flavor::UserPrompt);
+                    let display_text = if matches!(flavor, Flavor::Hidden) {
+                        Some(String::new())
+                    } else {
+                        None
+                    };
+                    Message {
+                        role: m.role,
+                        content: rehydrate(m),
+                        display_text,
+                    }
+                }
+                TreeNode::Summary(s) => hidden_user_msg(s.narrative.clone()),
+            })
+            .collect();
+        repair(&mut out);
+        out
     }
 
-    pub fn into_vec(self) -> Vec<Message> {
-        self.messages
+    /// Freeze the narrative into a `SummaryRecord` (compaction kind) parented
+    /// at the current leaf and advance the leaf onto it (§6). If the
+    /// pre-compaction tip is an assistant turn, push the hidden continue-prompt
+    /// as a normal node so the branch ends in a user turn.
+    pub fn append_compaction(
+        &mut self,
+        cut: CutPoint,
+        narrative: String,
+        continue_prompt: &str,
+        read_files: Vec<String>,
+        modified_files: Vec<String>,
+    ) {
+        let tip_is_assistant = self
+            .tree
+            .leaf
+            .node_ref()
+            .and_then(|nref| self.tree.flavors.get(nref))
+            .is_some_and(|f| matches!(f, Flavor::Assistant { .. }));
+        let record = SummaryRecord {
+            id: SummaryId::new(),
+            parent_id: self
+                .tree
+                .leaf
+                .node_ref()
+                .cloned()
+                .unwrap_or_else(|| NodeRef::Msg(MessageId::new())),
+            narrative,
+            kind: SummaryKind::Compaction {
+                fold_to_id: cut.message_id().clone(),
+            },
+            read_files,
+            modified_files,
+        };
+        let nref = NodeRef::Sum(record.id.clone());
+        self.tree
+            .nodes
+            .insert(nref.clone(), TreeNode::Summary(record));
+        self.tree.order.push(OrderedRecord::Node(nref.clone()));
+        self.tree.leaf = Position::At(nref);
+        if tip_is_assistant {
+            self.push(Message::synthetic(continue_prompt.into()));
+        }
+        self.bump();
     }
 
-    fn edit(&mut self, f: impl FnOnce(&mut Vec<Message>)) {
-        f(&mut self.messages);
-        self.publish();
+    fn bump(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        let ctx = Arc::new(fold(&self.tree));
+        self.cache = Some((self.generation, Arc::clone(&ctx)));
+        if let Some(mirror) = &self.mirror {
+            mirror.store(ctx);
+        }
     }
 
-    fn publish(&self) {
-        let Some(mirror) = &self.mirror else { return };
-        let mut snapshot = self.messages.clone();
-        close_dangling_tool_calls(&mut snapshot, UNAVAILABLE_RESULT);
-        mirror.store(Arc::new(snapshot));
+    fn publish(&mut self) {
+        let ctx = Arc::new(fold(&self.tree));
+        self.cache = Some((self.generation, Arc::clone(&ctx)));
+        if let Some(mirror) = &self.mirror {
+            mirror.store(ctx);
+        }
     }
 }
 
-/// Restored sessions can have orphaned tool_results or unclosed tool_uses
-/// (e.g. the process was killed mid-turn). The API returns 400 if it sees those.
-fn sanitize_restored(messages: &mut Vec<Message>) {
-    let len_before = messages.len();
+/// Append a `Message` to the tree as a `MessageNode`, parenting onto the
+/// current leaf and advancing the leaf onto the new node (§4). Returns the id.
+fn append_message_node(tree: &mut SessionTree, msg: Message) -> MessageId {
+    let parent = tree.leaf.node_ref().cloned();
+    let content = msg
+        .content
+        .iter()
+        .filter_map(to_raw_value)
+        .collect::<Vec<_>>();
+    let hidden = msg.display_text.as_deref() == Some("");
+    let node = MessageNode {
+        id: MessageId::new(),
+        parent_id: parent,
+        role: msg.role,
+        content,
+        timestamp: maki_storage::now_epoch(),
+        run_id: None,
+        interrupted: false,
+        hidden,
+    };
+    let id = node.id.clone();
+    let nref = NodeRef::Msg(id.clone());
+    tree.flavors
+        .insert(nref.clone(), SessionTree::node_flavor(&node));
+    tree.nodes.insert(nref.clone(), TreeNode::Message(node));
+    tree.order.push(OrderedRecord::Node(nref.clone()));
+    tree.leaf = Position::At(nref);
+    id
+}
+
+/// `fold(active_branch(leaf))` — pure, infallible (cycles were rejected at
+/// open, §A.5). Walks leaf→root, hoists the newest compaction narrative to the
+/// FRONT, keeps `[fold_to .. leaf]`, runs the repair pass, and constructs the
+/// sole `ValidContext`.
+fn fold(tree: &SessionTree) -> ValidContext {
+    let mut path: Vec<&TreeNode> = Vec::new();
+    let mut seen: HashSet<NodeRef> = HashSet::new();
+    let mut cur = tree.leaf.node_ref().cloned();
+    let mut narrative: Option<String> = None;
+    let mut stop_after: Option<MessageId> = None;
+    let mut hit_stop = false;
+
+    while let Some(nref) = cur {
+        if !seen.insert(nref.clone()) {
+            warn!(node = %nref, "cycle survived open-check in fold");
+            break;
+        }
+        let Some(node) = tree.nodes.get(&nref) else {
+            warn!(node = %nref, "broken parent chain in fold; serving reachable suffix");
+            break;
+        };
+        if let TreeNode::Summary(summary) = node {
+            // Newest compaction wins (encountered first walking leaf→root);
+            // lossless because recompaction subsumes the prior narrative (§6).
+            if narrative.is_none() {
+                narrative = Some(summary.narrative.clone());
+                if let SummaryKind::Compaction { fold_to_id } = &summary.kind {
+                    stop_after = Some(fold_to_id.clone());
+                }
+            }
+            cur = node.parent_id();
+            continue;
+        }
+        path.push(node);
+        if let Some(stop) = &stop_after
+            && let NodeRef::Msg(m) = &nref
+            && m == stop
+        {
+            hit_stop = true;
+            break;
+        }
+        cur = node.parent_id();
+    }
+
+    if stop_after.is_some() && !hit_stop {
+        warn!("compaction cut not on path; serving full walk");
+    }
+
+    path.reverse();
+
+    let mut out: Vec<Message> = Vec::new();
+    if let Some(n) = narrative {
+        out.push(hidden_user_msg(n));
+    }
+    for node in path {
+        match node {
+            TreeNode::Message(m) => {
+                let flavor = tree
+                    .flavors
+                    .get(&NodeRef::Msg(m.id.clone()))
+                    .copied()
+                    .unwrap_or(Flavor::UserPrompt);
+                let display_text = if matches!(flavor, Flavor::Hidden) {
+                    Some(String::new())
+                } else {
+                    None
+                };
+                let content = rehydrate(m);
+                out.push(Message {
+                    role: m.role,
+                    content,
+                    display_text,
+                });
+            }
+            TreeNode::Summary(s) => out.push(hidden_user_msg(s.narrative.clone())),
+        }
+    }
+
+    repair(&mut out);
+    ValidContext::new(out)
+}
+
+/// Lower a narrative to the provider's hidden-user-message convention (§9):
+/// `Message { role: User, content: [Text{narrative}], display_text: Some("") }`.
+/// The narrative is emitted verbatim; wrapper prose was frozen at creation.
+fn hidden_user_msg(narrative: String) -> Message {
+    Message {
+        role: Role::User,
+        content: vec![ContentBlock::Text { text: narrative }],
+        display_text: Some(String::new()),
+    }
+}
+
+/// Rehydrate a node's inline `RawValue` content to `ContentBlock`s (§A.2).
+/// Fallible per block: external corruption is warned and dropped, never
+/// unwrapped — repair then removes anything the drop orphaned (§A.4).
+fn rehydrate(node: &MessageNode) -> Vec<ContentBlock> {
+    node.content
+        .iter()
+        .filter_map(|raw| {
+            serde_json::from_str::<ContentBlock>(raw.get())
+                .map_err(|e| warn!(error = %e, "dropping unparseable content block"))
+                .ok()
+        })
+        .collect()
+}
+
+fn to_raw_value(block: &ContentBlock) -> Option<Box<RawValue>> {
+    serde_json::value::to_raw_value(block)
+        .map_err(|e| warn!(error = %e, "failed to serialize content block"))
+        .ok()
+}
+
+/// Deterministic API-validity pass (§A.4.1). Pure function of the assembled
+/// message array; subsumes both `sanitize_restored` and
+/// `close_dangling_tool_calls`. Rules, in order:
+/// 1. orphaned `tool_result` (no match in immediately preceding assistant
+///    message) removed; empty carrier dropped; orphaned tool images dropped.
+/// 2. dangling `tool_use` (no following result) closed with a synthetic error.
+fn repair(out: &mut Vec<Message>) {
+    let len_before = out.len();
     let mut i = 0;
-    while i < messages.len() {
-        if !matches!(messages[i].role, Role::User) {
+    while i < out.len() {
+        if !matches!(out[i].role, Role::User) {
             i += 1;
             continue;
         }
-
-        let valid_ids: Vec<String> = if i > 0 && matches!(messages[i - 1].role, Role::Assistant) {
-            messages[i - 1]
+        let valid_ids: Vec<String> = if i > 0 && matches!(out[i - 1].role, Role::Assistant) {
+            out[i - 1]
                 .tool_uses()
                 .map(|(id, _, _)| id.to_owned())
                 .collect()
         } else {
             Vec::new()
         };
-
         let (mut had_results, mut kept_results) = (false, false);
-        messages[i].content.retain(|b| match b {
+        out[i].content.retain(|b| match b {
             ContentBlock::ToolResult { tool_use_id, .. } => {
                 had_results = true;
                 let keep = valid_ids.iter().any(|id| id == tool_use_id);
@@ -117,412 +498,328 @@ fn sanitize_restored(messages: &mut Vec<Message>) {
             }
             _ => true,
         });
-        // A tool-returned image whose results were all orphaned would float
-        // with no context, so it goes too. Chat-pasted images live in
-        // messages without tool results and stay untouched.
         if had_results && !kept_results {
-            messages[i]
+            out[i]
                 .content
                 .retain(|b| !matches!(b, ContentBlock::Image { .. }));
         }
-
-        if messages[i].content.is_empty() {
-            messages.remove(i);
+        if out[i].content.is_empty() {
+            out.remove(i);
         } else {
             i += 1;
         }
     }
 
-    close_dangling_tool_calls(messages, UNAVAILABLE_RESULT);
+    close_dangling_tool_uses(out);
 
-    if messages.len() != len_before {
+    if out.len() != len_before {
         warn!(
             before = len_before,
-            after = messages.len(),
-            "sanitized restored history"
+            after = out.len(),
+            "repaired folded context"
         );
     }
 }
 
-fn close_dangling_tool_calls(messages: &mut Vec<Message>, note: &str) {
-    let Some(last) = messages.last() else { return };
-    if !matches!(last.role, Role::Assistant) || !last.has_tool_calls() {
-        return;
+/// Collect `tool_use` ids with no matching `tool_result` in the immediately
+/// following message (the persisted analogue of `close_dangling_tool_uses`).
+fn dangling_tool_use_ids(messages: &[Message]) -> Vec<String> {
+    let mut dangling = Vec::new();
+    for i in 0..messages.len() {
+        if !matches!(messages[i].role, Role::Assistant) || !messages[i].has_tool_calls() {
+            continue;
+        }
+        let use_ids: Vec<String> = messages[i]
+            .tool_uses()
+            .map(|(id, _, _)| id.to_owned())
+            .collect();
+        let already: HashSet<&str> = messages
+            .get(i + 1)
+            .map(|m| {
+                m.content
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        dangling.extend(
+            use_ids
+                .iter()
+                .filter(|id| !already.contains(id.as_str()))
+                .cloned(),
+        );
     }
-    let error_results: Vec<ContentBlock> = last
-        .tool_uses()
-        .map(|(id, _, _)| ContentBlock::ToolResult {
-            tool_use_id: id.to_owned(),
-            content: note.to_owned(),
-            is_error: true,
-        })
-        .collect();
-    messages.push(Message {
-        role: Role::User,
-        content: error_results,
-        display_text: Some(String::new()),
-    });
+    dangling
 }
 
-pub(crate) fn sanitize_cancelled_history(history: &mut History, rollback_len: usize) {
-    if history.len() <= rollback_len {
+/// Rule 2 (§A.4.1): close dangling `tool_use`s with synthetic error results,
+/// grouped into one hidden user message after the assistant turn (or merged
+/// into an existing following user message carrying results).
+fn close_dangling_tool_uses(out: &mut Vec<Message>) {
+    let mut inserts: Vec<(usize, Vec<ContentBlock>)> = Vec::new();
+    for i in 0..out.len() {
+        if !matches!(out[i].role, Role::Assistant) || !out[i].has_tool_calls() {
+            continue;
+        }
+        let use_ids: Vec<String> = out[i].tool_uses().map(|(id, _, _)| id.to_owned()).collect();
+        let already: HashSet<&str> = out
+            .get(i + 1)
+            .map(|m| {
+                m.content
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let dangling: Vec<ContentBlock> = use_ids
+            .iter()
+            .filter(|id| !already.contains(id.as_str()))
+            .map(|id| ContentBlock::ToolResult {
+                tool_use_id: id.clone(),
+                content: TOOL_RESULT_UNAVAILABLE.into(),
+                is_error: true,
+            })
+            .collect();
+        if dangling.is_empty() {
+            continue;
+        }
+        if let Some(next) = out.get_mut(i + 1)
+            && matches!(next.role, Role::User)
+            && next
+                .content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::ToolResult { .. }))
+        {
+            next.content.extend(dangling);
+        } else {
+            inserts.push((i + 1, dangling));
+        }
+    }
+    while let Some((at, blocks)) = inserts.pop() {
+        out.insert(
+            at,
+            Message {
+                role: Role::User,
+                content: blocks,
+                display_text: Some(String::new()),
+            },
+        );
+    }
+}
+
+/// Provider lowering (§9): strip thinking blocks a provider can't replay, then
+/// drop any assistant message left empty after the strip. Deterministic per
+/// provider; the predicate decides whether thinking survives.
+pub fn lower_for_provider(messages: &mut Vec<Message>, can_replay_thinking: bool) {
+    if can_replay_thinking {
         return;
     }
-    history.edit(|msgs| {
-        close_dangling_tool_calls(msgs, CANCEL_MARKER);
-        msgs.push(Message::synthetic(CANCEL_MARKER.into()));
-    });
+    for msg in messages.iter_mut() {
+        msg.content.retain(|b| {
+            !matches!(
+                b,
+                ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. }
+            )
+        });
+    }
+    messages.retain(|m| !matches!(m.role, Role::Assistant) || !m.content.is_empty());
+}
+
+/// Build a linear `SessionTree` from a message vec (C2 behaves linearly: each
+/// node parents onto the previous one, last node is the leaf).
+fn linear_tree(messages: &[Message]) -> SessionTree {
+    let mut nodes = std::collections::HashMap::new();
+    let mut order = Vec::new();
+    let mut flavors = std::collections::HashMap::new();
+    let mut parent: Option<NodeRef> = None;
+    let mut leaf = Position::Root;
+    for msg in messages {
+        let content = msg
+            .content
+            .iter()
+            .filter_map(to_raw_value)
+            .collect::<Vec<_>>();
+        let node = MessageNode {
+            id: MessageId::new(),
+            parent_id: parent.clone(),
+            role: msg.role,
+            content,
+            timestamp: 0,
+            run_id: None,
+            interrupted: false,
+            hidden: msg.display_text.as_deref() == Some(""),
+        };
+        let nref = NodeRef::Msg(node.id.clone());
+        flavors.insert(nref.clone(), SessionTree::node_flavor(&node));
+        parent = Some(nref.clone());
+        leaf = Position::At(nref.clone());
+        order.push(OrderedRecord::Node(nref.clone()));
+        nodes.insert(nref, TreeNode::Message(node));
+    }
+    SessionTree {
+        nodes,
+        order,
+        leaf,
+        labels: Vec::new(),
+        sub_msgs: Vec::new(),
+        flavors,
+    }
+}
+
+/// The sole constructor of `interrupted: true` node content (§A.0(6), §A.6).
+/// Both consumers (mid-stream interrupt, block-boundary landing) go through it,
+/// so an unfiltered partial cannot be persisted.
+pub mod finalize {
+    use maki_providers::ContentBlock;
+
+    pub enum FinalizedPartial {
+        Node(Vec<ContentBlock>),
+        Discard,
+    }
+
+    impl FinalizedPartial {
+        /// `completed` must contain only COMPLETED blocks — an in-flight
+        /// partial is stream-accumulator state, structurally indistinguishable
+        /// from a complete block, so the CALLER owns that distinction.
+        pub fn from_completed_blocks(completed: &[ContentBlock]) -> Self {
+            let mut kept: Vec<ContentBlock> = Vec::new();
+            for block in completed {
+                match block {
+                    // Drop every ToolUse — none has executed mid-stream, and a
+                    // dangling persisted ToolUse is API-invalid (§A.6).
+                    ContentBlock::ToolUse { .. } => continue,
+                    // Unsigned thinking is rejected on replay; signed thinking
+                    // and RedactedThinking survive, including alone.
+                    ContentBlock::Thinking {
+                        signature: None, ..
+                    } => continue,
+                    other => kept.push(other.clone()),
+                }
+            }
+            if kept.is_empty() {
+                Self::Discard
+            } else {
+                Self::Node(kept)
+            }
+        }
+    }
+}
+
+/// Compaction cut (§6): the only source of a compaction's `fold_to`. Carries
+/// the user-prompt-boundary and tip-ward-of-prior-cut proofs with it.
+pub struct CutPoint(MessageId);
+
+impl CutPoint {
+    pub fn message_id(&self) -> &MessageId {
+        &self.0
+    }
+
+    /// Walk tip-ward→root-ward accumulating estimated tokens until the
+    /// keep-recent budget is reached, then cut at the nearest user-prompt node
+    /// root-ward of that point (§6). Rejects cuts root-ward of any prior
+    /// compaction's cut on the path, and rejects when the leaf itself is a
+    /// compaction or nothing eligible is foldable.
+    pub fn select(tree: &SessionTree, leaf: Position, keep_budget: u32) -> Option<Self> {
+        let prior_cut = prior_compaction_cut(tree, &leaf);
+        let path = active_path(tree, leaf);
+        let mut budget: u32 = 0;
+        let mut cut_floor: Option<usize> = None;
+        for (i, node) in path.iter().enumerate() {
+            budget = budget.saturating_add(estimated_tokens(node));
+            if budget >= keep_budget {
+                cut_floor = Some(i);
+                break;
+            }
+        }
+        let floor = cut_floor?;
+
+        // Walk root-ward from the floor to the nearest user-prompt node.
+        for node in &path[floor..] {
+            if let TreeNode::Message(m) = node {
+                let flavor = tree
+                    .flavors
+                    .get(&NodeRef::Msg(m.id.clone()))
+                    .copied()
+                    .unwrap_or(Flavor::UserPrompt);
+                if matches!(flavor, Flavor::UserPrompt) {
+                    // Reject cuts root-ward of a prior compaction's cut.
+                    if let Some(prior) = &prior_cut
+                        && !is_tipward_of(m, prior, tree)
+                    {
+                        return None;
+                    }
+                    return Some(Self(m.id.clone()));
+                }
+            }
+        }
+        None
+    }
+}
+
+fn prior_compaction_cut(tree: &SessionTree, leaf: &Position) -> Option<MessageId> {
+    let mut cur = leaf.node_ref().cloned();
+    while let Some(nref) = cur {
+        let Some(node) = tree.nodes.get(&nref) else {
+            break;
+        };
+        if let TreeNode::Summary(s) = node
+            && let SummaryKind::Compaction { fold_to_id } = &s.kind
+        {
+            return Some(fold_to_id.clone());
+        }
+        cur = node.parent_id();
+    }
+    None
+}
+
+/// `candidate` is tip-ward of (or equal to) `prior` on the path.
+fn is_tipward_of(candidate: &MessageNode, prior: &MessageId, tree: &SessionTree) -> bool {
+    let mut cur = Some(NodeRef::Msg(candidate.id.clone()));
+    while let Some(nref) = cur {
+        if let NodeRef::Msg(m) = &nref
+            && m == prior
+        {
+            return true;
+        }
+        cur = tree.nodes.get(&nref).and_then(TreeNode::parent_id);
+    }
+    false
+}
+
+fn active_path(tree: &SessionTree, leaf: Position) -> Vec<&TreeNode> {
+    let mut path = Vec::new();
+    let mut cur = leaf.node_ref().cloned();
+    while let Some(nref) = cur {
+        let Some(node) = tree.nodes.get(&nref) else {
+            break;
+        };
+        path.push(node);
+        cur = node.parent_id();
+    }
+    path.reverse();
+    path
+}
+
+fn leaf_is_compaction(tree: &SessionTree) -> bool {
+    let Some(nref) = tree.leaf.node_ref() else {
+        return false;
+    };
+    matches!(tree.nodes.get(nref), Some(TreeNode::Summary(s)) if matches!(s.kind, SummaryKind::Compaction { .. }))
+}
+
+fn estimated_tokens(node: &TreeNode) -> u32 {
+    let bytes: usize = match node {
+        TreeNode::Message(m) => m.content.iter().map(|r| r.get().len()).sum(),
+        TreeNode::Summary(s) => s.narrative.len(),
+    };
+    (bytes.max(CHARS_PER_TOKEN) / CHARS_PER_TOKEN) as u32
 }
 
 #[cfg(test)]
-mod tests {
-    use maki_providers::{ContentBlock, Message, Role};
-    use test_case::test_case;
-
-    use super::*;
-
-    #[track_caller]
-    fn assert_ends_with_cancel_marker(history: &History) {
-        let last = history.as_slice().last().unwrap();
-        assert!(matches!(last.role, Role::User));
-        assert!(matches!(&last.content[0], ContentBlock::Text { text } if text == CANCEL_MARKER));
-    }
-
-    fn make_tool_use_msg(ids: &[&str]) -> Message {
-        Message {
-            role: Role::Assistant,
-            content: ids
-                .iter()
-                .map(|id| ContentBlock::ToolUse {
-                    id: id.to_string(),
-                    name: "read".into(),
-                    input: serde_json::json!({}),
-                })
-                .collect(),
-            ..Default::default()
-        }
-    }
-
-    fn make_tool_result_msg(ids: &[&str]) -> Message {
-        Message {
-            role: Role::User,
-            content: ids
-                .iter()
-                .map(|id| ContentBlock::ToolResult {
-                    tool_use_id: id.to_string(),
-                    content: "ok".into(),
-                    is_error: false,
-                })
-                .collect(),
-            display_text: Some(String::new()),
-        }
-    }
-
-    fn make_mirror() -> SharedMessages {
-        Arc::new(ArcSwap::from_pointee(Vec::new()))
-    }
-
-    #[track_caller]
-    fn extract_error_ids(msg: &Message) -> Vec<&str> {
-        msg.content
-            .iter()
-            .filter_map(|b| match b {
-                ContentBlock::ToolResult {
-                    tool_use_id,
-                    is_error: true,
-                    ..
-                } => Some(tool_use_id.as_str()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    #[test_case(
-        vec![Message::user("old".into())],
-        1,
-        1,
-        false
-        ; "no_new_messages_is_noop"
-    )]
-    #[test_case(
-        vec![Message::user("hello".into())],
-        0,
-        2,
-        true
-        ; "user_only_appends_marker"
-    )]
-    #[test_case(
-        vec![
-            Message::user("hello".into()),
-            Message { role: Role::Assistant, content: vec![ContentBlock::Text { text: "hi".into() }], ..Default::default() },
-        ],
-        0,
-        3,
-        true
-        ; "complete_turn_appends_marker"
-    )]
-    fn sanitize_cancelled_history_cases(
-        messages: Vec<Message>,
-        rollback_len: usize,
-        expected_len: usize,
-        expect_cancel_marker: bool,
-    ) {
-        let mut history = History::new(messages);
-        sanitize_cancelled_history(&mut history, rollback_len);
-        assert_eq!(history.len(), expected_len);
-        if expect_cancel_marker {
-            assert_ends_with_cancel_marker(&history);
-        }
-    }
-
-    #[test]
-    fn sanitize_dangling_tool_use_adds_error_results() {
-        let mut history = History::new(vec![
-            Message::user("hello".into()),
-            make_tool_use_msg(&["t1", "t2"]),
-        ]);
-        sanitize_cancelled_history(&mut history, 0);
-
-        assert_eq!(extract_error_ids(&history.as_slice()[2]), ["t1", "t2"]);
-        assert_ends_with_cancel_marker(&history);
-    }
-
-    #[test]
-    fn mirror_sequential_mutations_always_consistent() {
-        let mirror = make_mirror();
-        let mut history = History::new(Vec::new()).with_mirror(Arc::clone(&mirror));
-
-        for i in 0..10 {
-            history.push(Message::user(format!("msg-{i}")));
-            assert_eq!(mirror.load().len(), i + 1);
-        }
-
-        history.truncate(3);
-        assert_eq!(mirror.load().len(), 3);
-
-        history.replace(vec![Message::user("fresh".into())]);
-        assert_eq!(mirror.load().len(), 1);
-
-        history.push(make_tool_use_msg(&["t_final"]));
-        assert_eq!(history.len(), 2, "history has 2");
-        assert_eq!(mirror.load().len(), 3, "mirror has 3 (dangling closed)");
-    }
-
-    #[test]
-    fn snapshot_closes_dangling_tool_uses_without_mutating_history() {
-        let mirror = make_mirror();
-        let history = History::new(vec![
-            Message::user("go".into()),
-            make_tool_use_msg(&["t1", "t2"]),
-        ])
-        .with_mirror(Arc::clone(&mirror));
-
-        assert_eq!(history.len(), 2, "history itself unchanged");
-
-        let snap = mirror.load();
-        assert_eq!(snap.len(), 3, "snapshot has extra closing message");
-
-        let closing = &snap[2];
-        assert!(matches!(closing.role, Role::User));
-        assert_eq!(extract_error_ids(closing), ["t1", "t2"]);
-        assert_eq!(closing.display_text.as_deref(), Some(""));
-    }
-
-    #[test]
-    fn snapshot_not_dangling_when_tool_result_already_present() {
-        let mirror = make_mirror();
-        let mut history =
-            History::new(vec![Message::user("go".into()), make_tool_use_msg(&["t1"])])
-                .with_mirror(Arc::clone(&mirror));
-
-        assert_eq!(mirror.load().len(), 3, "dangling before result");
-
-        history.push(Message {
-            role: Role::User,
-            content: vec![ContentBlock::ToolResult {
-                tool_use_id: "t1".into(),
-                content: "file contents".into(),
-                is_error: false,
-            }],
-            ..Default::default()
-        });
-
-        let snap = mirror.load();
-        assert_eq!(snap.len(), 3, "no extra closing after real result");
-    }
-
-    #[test]
-    fn into_vec_returns_inner_not_snapshot() {
-        let mirror = make_mirror();
-        let history = History::new(vec![Message::user("go".into()), make_tool_use_msg(&["t1"])])
-            .with_mirror(Arc::clone(&mirror));
-
-        assert_eq!(mirror.load().len(), 3, "snapshot has closing message");
-        assert_eq!(history.into_vec().len(), 2, "into_vec returns raw messages");
-    }
-
-    #[test]
-    fn sanitize_cancelled_on_mirrored_history() {
-        let mirror = make_mirror();
-        let mut history =
-            History::new(vec![Message::user("go".into()), make_tool_use_msg(&["t1"])])
-                .with_mirror(Arc::clone(&mirror));
-
-        sanitize_cancelled_history(&mut history, 0);
-
-        let snap = mirror.load();
-        assert_eq!(snap.len(), history.len(), "mirror matches history length");
-
-        let last = snap.last().unwrap();
-        assert!(matches!(&last.content[0], ContentBlock::Text { text } if text == CANCEL_MARKER));
-
-        let tool_result_msg = &snap[snap.len() - 2];
-        assert!(tool_result_msg.content.iter().any(|b| matches!(
-            b,
-            ContentBlock::ToolResult { content, is_error: true, .. } if content == CANCEL_MARKER
-        )));
-    }
-
-    fn text_msg(role: Role, text: &str) -> Message {
-        Message {
-            role,
-            content: vec![ContentBlock::Text { text: text.into() }],
-            ..Default::default()
-        }
-    }
-
-    #[test_case(
-        vec![make_tool_result_msg(&["t1"])],
-        0
-        ; "orphan_at_start_removed"
-    )]
-    #[test_case(
-        vec![
-            Message::user("go".into()),
-            text_msg(Role::Assistant, "done"),
-            make_tool_result_msg(&["orphan1", "orphan2"]),
-        ],
-        2
-        ; "orphans_after_non_tool_assistant_removed"
-    )]
-    #[test_case(
-        vec![
-            Message::user("go".into()),
-            make_tool_use_msg(&["t1", "t2"]),
-            make_tool_result_msg(&["t1", "t2"]),
-        ],
-        3
-        ; "valid_pairing_preserved"
-    )]
-    #[test_case(
-        vec![Message::user("go".into()), make_tool_use_msg(&["t1"])],
-        3
-        ; "dangling_tool_use_closed_with_synthetic_result"
-    )]
-    fn sanitize_restored_cases(messages: Vec<Message>, expected_len: usize) {
-        let history = History::restored(messages);
-        assert_eq!(history.len(), expected_len);
-    }
-
-    #[test]
-    fn sanitize_restored_drops_image_when_all_results_orphaned() {
-        let image_block = ContentBlock::Image {
-            source: maki_providers::ImageSource::new(
-                maki_providers::ImageMediaType::Png,
-                std::sync::Arc::from("aGVsbG8="),
-            ),
-        };
-        let mut orphaned = make_tool_result_msg(&["orphan"]);
-        orphaned.content.push(image_block.clone());
-        let history = History::restored(vec![Message::user("go".into()), orphaned]);
-        assert_eq!(history.len(), 1);
-
-        // Chat-pasted image (no tool results) is untouched.
-        let history = History::restored(vec![Message {
-            role: Role::User,
-            content: vec![image_block],
-            ..Default::default()
-        }]);
-        assert_eq!(history.len(), 1);
-        assert!(matches!(
-            history.as_slice()[0].content[0],
-            ContentBlock::Image { .. }
-        ));
-    }
-
-    #[test]
-    fn sanitize_restored_keeps_image_when_any_result_survives() {
-        let mut msg = make_tool_result_msg(&["t1", "orphan"]);
-        msg.content.push(ContentBlock::Image {
-            source: maki_providers::ImageSource::new(
-                maki_providers::ImageMediaType::Png,
-                std::sync::Arc::from("aGVsbG8="),
-            ),
-        });
-        let history = History::restored(vec![
-            Message::user("go".into()),
-            make_tool_use_msg(&["t1"]),
-            msg,
-        ]);
-        let content = &history.as_slice()[2].content;
-        assert_eq!(content.len(), 2);
-        assert!(matches!(
-            &content[0],
-            ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "t1"
-        ));
-        assert!(matches!(content[1], ContentBlock::Image { .. }));
-    }
-
-    #[test]
-    fn sanitize_restored_partial_orphan_keeps_matched_ids() {
-        let history = History::restored(vec![
-            Message::user("go".into()),
-            make_tool_use_msg(&["t1"]),
-            make_tool_result_msg(&["t1", "t2"]),
-        ]);
-        let results: Vec<&str> = history.as_slice()[2]
-            .content
-            .iter()
-            .filter_map(|b| match b {
-                ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(results, ["t1"]);
-    }
-
-    #[test_case(
-        vec![Message::user("go".into())],
-        0
-        ; "no_tool_results"
-    )]
-    #[test_case(
-        vec![
-            Message::user("go".into()),
-            make_tool_result_msg(&["t1"]),
-        ],
-        1
-        ; "recent_tool_result"
-    )]
-    #[test_case(
-        vec![
-            Message::user("old1".into()),
-            Message::user("old2".into()),
-            Message::user("old3".into()),
-            Message::user("old4".into()),
-            Message::user("old5".into()),
-            make_tool_result_msg(&["t1"]),
-        ],
-        1
-        ; "at_depth_boundary"
-    )]
-    fn has_recent_tool_results(messages: Vec<Message>, depth: usize) {
-        let history = History::new(messages);
-        let result = if depth == 0 {
-            history.has_recent_tool_results(0)
-        } else {
-            history.has_recent_tool_results(depth)
-        };
-        assert_eq!(result, depth > 0);
-    }
-}
+mod tests;
