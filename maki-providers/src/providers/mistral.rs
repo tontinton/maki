@@ -1,3 +1,4 @@
+use crate::CancellationToken;
 use std::sync::{Arc, Mutex};
 
 use flume::Sender;
@@ -191,6 +192,7 @@ impl Provider for Mistral {
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
         session_id: Option<&'a str>,
+        cancel: CancellationToken,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let auth = self.auth.lock().unwrap().clone();
@@ -207,7 +209,7 @@ impl Provider for Mistral {
                 extra_headers.push(("x-affinity", session_id));
             }
             self.compat
-                .do_stream(model, &extra_headers, &body, event_tx, &auth)
+                .do_stream(model, &extra_headers, &body, event_tx, &auth, cancel)
                 .await
         })
     }

@@ -513,7 +513,7 @@ pub fn all_builtin_tool_names() -> Vec<&'static str> {
         .collect()
 }
 
-use maki_providers::{Message, ProviderEvent, StreamResponse};
+use maki_providers::{CancellationToken, Message, ProviderEvent, StreamResponse};
 
 struct NullProvider;
 
@@ -526,7 +526,8 @@ impl Provider for NullProvider {
         _: &'a Value,
         _: &'a flume::Sender<ProviderEvent>,
         _: RequestOptions,
-        _: Option<&str>,
+        _: Option<&'a str>,
+        _: CancellationToken,
     ) -> BoxFuture<'a, Result<StreamResponse, crate::AgentError>> {
         Box::pin(async { unimplemented!() })
     }

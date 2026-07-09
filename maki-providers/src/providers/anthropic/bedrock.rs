@@ -1,3 +1,4 @@
+use crate::CancellationToken;
 use std::env;
 use std::ops::ControlFlow;
 use std::path::PathBuf;
@@ -525,6 +526,7 @@ impl Provider for Bedrock {
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
         _session_id: Option<&'a str>,
+        _cancel: CancellationToken,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             if self.needs_refresh() {

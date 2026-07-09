@@ -173,6 +173,51 @@ impl History {
         })
     }
 
+    /// Finalize a mid-stream interrupt (§8): append the completed blocks as
+    /// an assistant `MessageNode` with `interrupted: true`, so the user can
+    /// re-guide from the reasoning. Callers MUST pass blocks already filtered
+    /// through [`finalize::FinalizedPartial`] (no ToolUse, no unsigned
+    /// thinking). Sets the node's `run_id` so the barrier can flush it.
+    pub fn push_interrupted(
+        &mut self,
+        blocks: Vec<ContentBlock>,
+        run_id: u64,
+    ) -> Option<MessageId> {
+        if blocks.is_empty() {
+            return None;
+        }
+        let msg = Message {
+            role: Role::Assistant,
+            content: blocks,
+            ..Default::default()
+        };
+        let parent = self.tree.leaf.node_ref().cloned();
+        let content: Vec<Box<RawValue>> = msg.content.iter().filter_map(to_raw_value).collect();
+        let hidden = msg.display_text.as_deref() == Some("");
+        let node = MessageNode {
+            id: MessageId::new(),
+            parent_id: parent,
+            role: msg.role,
+            content,
+            timestamp: maki_storage::now_epoch(),
+            run_id: Some(run_id),
+            interrupted: true,
+            hidden,
+        };
+        let id = node.id.clone();
+        let nref = NodeRef::Msg(id.clone());
+        self.tree
+            .flavors
+            .insert(nref.clone(), SessionTree::node_flavor(&node));
+        self.tree
+            .nodes
+            .insert(nref.clone(), TreeNode::Message(node));
+        self.tree.order.push(OrderedRecord::Node(nref.clone()));
+        self.tree.leaf = Position::At(nref);
+        self.bump();
+        Some(id)
+    }
+
     /// Push a cancelled-tool result group as one hidden user node (§8). The
     /// interrupt-finalize wiring is C6; this keeps the cancelled-results path
     /// working as an ordinary hidden node.
@@ -195,18 +240,28 @@ impl History {
         });
     }
 
-    /// On cancel, close dangling `tool_use`s in the folded context as
-    /// persisted hidden nodes carrying `[Cancelled by user]` results (§8). The
-    /// mid-tool cancel wiring is C6; this keeps the path API-valid and visible.
-    /// Idempotent: already-answered tool_uses are skipped.
+    /// On cancel, close dangling `tool_use`s as persisted hidden nodes
+    /// carrying `[Cancelled by user]` results (§8). Walks the raw tree path
+    /// (not the repaired fold) so that `repair`'s transient `[Tool result
+    /// not available]` results don't mask cancel-time persist. Idempotent.
     pub fn close_cancelled_tool_calls(&mut self) {
-        let ctx = self.active_branch();
-        let dangling = dangling_tool_use_ids(&ctx);
-        drop(ctx);
+        let dangling = dangling_tool_use_ids_in_tree(&self.tree);
         if dangling.is_empty() {
             return;
         }
         self.push_cancelled_results(&dangling);
+    }
+
+    /// Whether the current leaf is an `interrupted` assistant node (§8
+    /// request-time guard). When true, the trailing turn is excluded from
+    /// the next provider request so the context doesn't end in an assistant
+    /// message some providers reject for continuation.
+    pub fn leaf_is_interrupted(&self) -> bool {
+        self.tree
+            .leaf
+            .node_ref()
+            .and_then(|nr| self.tree.nodes.get(nr))
+            .is_some_and(|n| matches!(n, TreeNode::Message(m) if m.interrupted))
     }
 
     /// Number of messages in the folded active branch.
@@ -640,36 +695,53 @@ fn repair(out: &mut Vec<Message>) {
     }
 }
 
-/// Collect `tool_use` ids with no matching `tool_result` in the immediately
-/// following message (the persisted analogue of `close_dangling_tool_uses`).
-fn dangling_tool_use_ids(messages: &[Message]) -> Vec<String> {
+/// Tree-level dangling `tool_use` detection (§8): walks the active path
+/// without `repair`, so cancel-time persist sees the true persisted state
+/// and isn't masked by `repair`'s transient synthetic results.
+fn dangling_tool_use_ids_in_tree(tree: &SessionTree) -> Vec<String> {
+    let path = active_path(tree, tree.leaf.clone());
     let mut dangling = Vec::new();
-    for i in 0..messages.len() {
-        if !matches!(messages[i].role, Role::Assistant) || !messages[i].has_tool_calls() {
+    for i in 0..path.len() {
+        let TreeNode::Message(m) = path[i] else {
+            continue;
+        };
+        if !matches!(m.role, Role::Assistant) || m.content.is_empty() {
             continue;
         }
-        let use_ids: Vec<String> = messages[i]
-            .tool_uses()
-            .map(|(id, _, _)| id.to_owned())
+        let use_ids: Vec<String> = m
+            .content
+            .iter()
+            .filter_map(|raw| {
+                let block: ContentBlock = serde_json::from_str(raw.get()).ok()?;
+                match block {
+                    ContentBlock::ToolUse { id, .. } => Some(id),
+                    _ => None,
+                }
+            })
             .collect();
-        let already: HashSet<&str> = messages
+        if use_ids.is_empty() {
+            continue;
+        }
+        let already: HashSet<String> = path
             .get(i + 1)
+            .and_then(|n| match n {
+                TreeNode::Message(m) if matches!(m.role, Role::User) => Some(m),
+                _ => None,
+            })
             .map(|m| {
                 m.content
                     .iter()
-                    .filter_map(|b| match b {
-                        ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
-                        _ => None,
+                    .filter_map(|raw| {
+                        let block: ContentBlock = serde_json::from_str(raw.get()).ok()?;
+                        match block {
+                            ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id),
+                            _ => None,
+                        }
                     })
                     .collect()
             })
             .unwrap_or_default();
-        dangling.extend(
-            use_ids
-                .iter()
-                .filter(|id| !already.contains(id.as_str()))
-                .cloned(),
-        );
+        dangling.extend(use_ids.into_iter().filter(|id| !already.contains(id)));
     }
     dangling
 }

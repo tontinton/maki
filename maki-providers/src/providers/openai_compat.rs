@@ -144,6 +144,7 @@ impl OpenAiCompatProvider {
         body: &Value,
         event_tx: &Sender<ProviderEvent>,
         auth: &ResolvedAuth,
+        cancel: crate::CancellationToken,
     ) -> Result<StreamResponse, AgentError> {
         let json_body = serde_json::to_vec(body)?;
         let mut request = self
@@ -169,6 +170,7 @@ impl OpenAiCompatProvider {
                 BufReader::new(response.into_body()),
                 event_tx,
                 self.stream_timeout,
+                cancel,
             )
             .await
         } else {
@@ -447,6 +449,7 @@ pub async fn parse_sse(
     reader: impl AsyncBufRead + Unpin,
     event_tx: &Sender<ProviderEvent>,
     stream_timeout: Duration,
+    cancel: crate::CancellationToken,
 ) -> Result<StreamResponse, AgentError> {
     let mut lines = reader.lines();
 
@@ -459,6 +462,9 @@ pub async fn parse_sse(
     let mut deadline = Instant::now() + stream_timeout;
 
     while let Some(line) = super::next_sse_line(&mut lines, &mut deadline, stream_timeout).await? {
+        if cancel.is_cancelled() {
+            break;
+        }
         let data = match line.strip_prefix("data:") {
             Some(d) => d.trim(),
             None => continue,
@@ -680,9 +686,14 @@ data: {\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}],\"usage\":{\"prom
 data: [DONE]\n";
 
             let (tx, rx) = flume::unbounded();
-            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
-                .await
-                .unwrap();
+            let resp = parse_sse(
+                Cursor::new(sse.as_bytes()),
+                &tx,
+                TEST_STREAM_TIMEOUT,
+                crate::CancellationToken::never(),
+            )
+            .await
+            .unwrap();
 
             assert_eq!(resp.usage.input, 60);
             assert_eq!(resp.usage.output, 10);
@@ -718,9 +729,14 @@ data: {\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}],\"usage\":{\"prom
 data: [DONE]\n";
 
             let (tx, rx) = flume::unbounded();
-            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
-                .await
-                .unwrap();
+            let resp = parse_sse(
+                Cursor::new(sse.as_bytes()),
+                &tx,
+                TEST_STREAM_TIMEOUT,
+                crate::CancellationToken::never(),
+            )
+            .await
+            .unwrap();
 
             assert!(
                 matches!(&resp.message.content[0], ContentBlock::Thinking { thinking, .. } if thinking == "Let me think...")
@@ -825,9 +841,14 @@ data: {\"choices\":[{\"finish_reason\":\"tool_calls\",\"delta\":{}}],\"usage\":{
 data: [DONE]\n";
 
             let (tx, rx) = flume::unbounded();
-            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
-                .await
-                .unwrap();
+            let resp = parse_sse(
+                Cursor::new(sse.as_bytes()),
+                &tx,
+                TEST_STREAM_TIMEOUT,
+                crate::CancellationToken::never(),
+            )
+            .await
+            .unwrap();
 
             let tools: Vec<_> = resp.message.tool_uses().collect();
             assert_eq!(tools.len(), 2);
@@ -860,9 +881,14 @@ data: [DONE]\n";
 data: {\"error\":{\"message\":\"Server overloaded\",\"type\":\"overloaded_error\"}}\n";
 
             let (tx, _rx) = flume::unbounded();
-            let err = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
-                .await
-                .unwrap_err();
+            let err = parse_sse(
+                Cursor::new(sse.as_bytes()),
+                &tx,
+                TEST_STREAM_TIMEOUT,
+                crate::CancellationToken::never(),
+            )
+            .await
+            .unwrap_err();
 
             match err {
                 AgentError::Api { status, message } => {
@@ -885,9 +911,14 @@ data: {\"choices\":[{\"finish_reason\":\"tool_calls\",\"delta\":{}}],\"usage\":{
 data: [DONE]\n";
 
             let (tx, _rx) = flume::unbounded();
-            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
-                .await
-                .unwrap();
+            let resp = parse_sse(
+                Cursor::new(sse.as_bytes()),
+                &tx,
+                TEST_STREAM_TIMEOUT,
+                crate::CancellationToken::never(),
+            )
+            .await
+            .unwrap();
 
             let tools: Vec<_> = resp.message.tool_uses().collect();
             assert_eq!(tools.len(), 1);
@@ -909,9 +940,14 @@ data: {\"choices\":[{\"finish_reason\":\"tool_calls\",\"delta\":{}}],\"usage\":{
 data: [DONE]\n";
 
             let (tx, _rx) = flume::unbounded();
-            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
-                .await
-                .unwrap();
+            let resp = parse_sse(
+                Cursor::new(sse.as_bytes()),
+                &tx,
+                TEST_STREAM_TIMEOUT,
+                crate::CancellationToken::never(),
+            )
+            .await
+            .unwrap();
 
             let tools: Vec<_> = resp.message.tool_uses().collect();
             assert_eq!(tools.len(), 1);
@@ -1017,9 +1053,14 @@ data: [DONE]\n";
         smol::block_on(async {
             let sse = "data: [DONE]\n";
             let (tx, _rx) = flume::unbounded();
-            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
-                .await
-                .unwrap();
+            let resp = parse_sse(
+                Cursor::new(sse.as_bytes()),
+                &tx,
+                TEST_STREAM_TIMEOUT,
+                crate::CancellationToken::never(),
+            )
+            .await
+            .unwrap();
             assert!(resp.message.content.is_empty());
             assert_eq!(resp.usage, TokenUsage::default());
             assert_eq!(resp.stop_reason, None);
@@ -1040,9 +1081,14 @@ data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\
 data: [DONE]\n";
 
             let (tx, rx) = flume::unbounded();
-            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
-                .await
-                .unwrap();
+            let resp = parse_sse(
+                Cursor::new(sse.as_bytes()),
+                &tx,
+                TEST_STREAM_TIMEOUT,
+                crate::CancellationToken::never(),
+            )
+            .await
+            .unwrap();
 
             assert!(
                 matches!(&resp.message.content[0], ContentBlock::Thinking { thinking, .. } if thinking == "Let me think..."),

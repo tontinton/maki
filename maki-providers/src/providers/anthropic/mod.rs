@@ -4,6 +4,7 @@
 pub(crate) mod bedrock;
 pub(crate) mod shared;
 
+use crate::CancellationToken;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -283,6 +284,7 @@ impl Anthropic {
         event_tx: &Sender<ProviderEvent>,
         fast: bool,
         long_context: bool,
+        cancel: CancellationToken,
     ) -> Result<StreamResponse, AgentError> {
         let json_body = serde_json::to_vec(body)?;
         let mut builder = self
@@ -303,7 +305,7 @@ impl Anthropic {
         let status = response.status().as_u16();
 
         if status == 200 {
-            parse_sse(response, event_tx, self.stream_timeout).await
+            parse_sse(response, event_tx, self.stream_timeout, cancel).await
         } else {
             Err(AgentError::from_response(response).await)
         }
@@ -359,6 +361,7 @@ impl Provider for Anthropic {
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
         _session_id: Option<&str>,
+        cancel: CancellationToken,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let system_blocks = if let Some(prefix) = &self.system_prefix {
@@ -395,7 +398,7 @@ impl Provider for Anthropic {
             let long_context = model.id.ends_with(shared::LONG_CONTEXT_SUFFIX);
 
             debug!(model = %model.id, num_messages = messages.len(), thinking = ?opts.thinking, fast, long_context, "sending API request");
-            self.do_stream_request(&body, event_tx, fast, long_context)
+            self.do_stream_request(&body, event_tx, fast, long_context, cancel)
                 .await
         })
     }
@@ -459,6 +462,7 @@ pub(crate) async fn parse_sse(
     response: isahc::Response<isahc::AsyncBody>,
     event_tx: &Sender<ProviderEvent>,
     stream_timeout: Duration,
+    cancel: CancellationToken,
 ) -> Result<StreamResponse, AgentError> {
     let reader = BufReader::new(response.into_body());
     let mut lines = reader.lines();
@@ -467,6 +471,9 @@ pub(crate) async fn parse_sse(
     let mut deadline = Instant::now() + stream_timeout;
 
     while let Some(line) = super::next_sse_line(&mut lines, &mut deadline, stream_timeout).await? {
+        if cancel.is_cancelled() {
+            break;
+        }
         if let Some(rest) = line.strip_prefix("event:") {
             current_event = rest.strip_prefix(' ').unwrap_or(rest).to_string();
             continue;
@@ -622,9 +629,14 @@ event: message_stop\n\
 data: {\"type\":\"message_stop\"}\n";
 
             let (tx, rx) = flume::unbounded();
-            let resp = parse_sse(mock_response(sse_data), &tx, TEST_STREAM_TIMEOUT)
-                .await
-                .unwrap();
+            let resp = parse_sse(
+                mock_response(sse_data),
+                &tx,
+                TEST_STREAM_TIMEOUT,
+                CancellationToken::never(),
+            )
+            .await
+            .unwrap();
 
             assert_eq!(
                 resp.usage,
@@ -670,9 +682,14 @@ event:message_stop\n\
 data:{\"type\":\"message_stop\"}\n";
 
             let (tx, _rx) = flume::unbounded();
-            let resp = parse_sse(mock_response(sse_data), &tx, TEST_STREAM_TIMEOUT)
-                .await
-                .unwrap();
+            let resp = parse_sse(
+                mock_response(sse_data),
+                &tx,
+                TEST_STREAM_TIMEOUT,
+                CancellationToken::never(),
+            )
+            .await
+            .unwrap();
 
             assert!(
                 matches!(&resp.message.content[0], ContentBlock::Text { text } if text == "OK")
@@ -706,9 +723,14 @@ event: message_delta\n\
 data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
 
             let (tx, rx) = flume::unbounded();
-            let resp = parse_sse(mock_response(sse_data.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
-                .await
-                .unwrap();
+            let resp = parse_sse(
+                mock_response(sse_data.as_bytes()),
+                &tx,
+                TEST_STREAM_TIMEOUT,
+                CancellationToken::never(),
+            )
+            .await
+            .unwrap();
 
             let tools: Vec<_> = resp.message.tool_uses().collect();
             assert_eq!(tools.len(), 1);
@@ -904,9 +926,14 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
         smol::block_on(async {
             let input = b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n";
             let (tx, _rx) = flume::unbounded();
-            let err = parse_sse(mock_response(input), &tx, TEST_STREAM_TIMEOUT)
-                .await
-                .unwrap_err();
+            let err = parse_sse(
+                mock_response(input),
+                &tx,
+                TEST_STREAM_TIMEOUT,
+                CancellationToken::never(),
+            )
+            .await
+            .unwrap_err();
             match err {
                 AgentError::Api { status, message } => {
                     assert_eq!(status, 529);
@@ -922,9 +949,14 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
         smol::block_on(async {
             let input = b"event: error\ndata: not-json\n";
             let (tx, _rx) = flume::unbounded();
-            let err = parse_sse(mock_response(input), &tx, TEST_STREAM_TIMEOUT)
-                .await
-                .unwrap_err();
+            let err = parse_sse(
+                mock_response(input),
+                &tx,
+                TEST_STREAM_TIMEOUT,
+                CancellationToken::never(),
+            )
+            .await
+            .unwrap_err();
             match err {
                 AgentError::Api { status, message } => {
                     assert_eq!(status, 400);
@@ -955,9 +987,14 @@ event: message_delta\n\
 data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":1}}\n";
 
             let (tx, _rx) = flume::unbounded();
-            let resp = parse_sse(mock_response(sse_data.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
-                .await
-                .unwrap();
+            let resp = parse_sse(
+                mock_response(sse_data.as_bytes()),
+                &tx,
+                TEST_STREAM_TIMEOUT,
+                CancellationToken::never(),
+            )
+            .await
+            .unwrap();
 
             let tools: Vec<_> = resp.message.tool_uses().collect();
             assert_eq!(tools.len(), 1);
@@ -1001,9 +1038,14 @@ event: message_delta\n\
 data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n";
 
             let (tx, rx) = flume::unbounded();
-            let resp = parse_sse(mock_response(sse_data), &tx, TEST_STREAM_TIMEOUT)
-                .await
-                .unwrap();
+            let resp = parse_sse(
+                mock_response(sse_data),
+                &tx,
+                TEST_STREAM_TIMEOUT,
+                CancellationToken::never(),
+            )
+            .await
+            .unwrap();
 
             assert!(
                 matches!(&resp.message.content[0], ContentBlock::Thinking { thinking, signature }
@@ -1050,9 +1092,14 @@ event: message_delta\n\
 data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n";
 
             let (tx, _rx) = flume::unbounded();
-            let resp = parse_sse(mock_response(sse_data), &tx, TEST_STREAM_TIMEOUT)
-                .await
-                .unwrap();
+            let resp = parse_sse(
+                mock_response(sse_data),
+                &tx,
+                TEST_STREAM_TIMEOUT,
+                CancellationToken::never(),
+            )
+            .await
+            .unwrap();
 
             assert!(
                 matches!(&resp.message.content[0], ContentBlock::RedactedThinking { data } if data == "opaque_data")

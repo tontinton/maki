@@ -1,6 +1,8 @@
 use maki_providers::provider::Provider;
 use maki_providers::retry::{MAX_TIMEOUT_RETRIES, RetryState};
-use maki_providers::{Message, Model, ProviderEvent, RequestOptions, StreamResponse};
+use maki_providers::{
+    CancellationToken, Message, Model, ProviderEvent, RequestOptions, StreamResponse,
+};
 use serde_json::Value;
 use tracing::warn;
 
@@ -20,6 +22,14 @@ async fn forward_provider_events(prx: flume::Receiver<ProviderEvent>, event_tx: 
     }
 }
 
+/// Outcome of a stream attempt: a full response, a partial (cancelled
+/// mid-stream) one, or an error. The partial carries whatever blocks the
+/// provider accumulated before cancel (§8).
+pub(crate) enum StreamOutcome {
+    Full(StreamResponse),
+    Partial(StreamResponse),
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn stream_with_retry(
     provider: &dyn Provider,
@@ -31,10 +41,11 @@ pub(crate) async fn stream_with_retry(
     cancel: &CancelToken,
     opts: RequestOptions,
     session_id: Option<&str>,
-) -> Result<StreamResponse, AgentError> {
+) -> Result<StreamOutcome, AgentError> {
     let opts = opts.clamped(model);
     let messages = maki_providers::adapt_images_for_model(model, messages);
     let messages = &*messages;
+    let provider_cancel = CancellationToken::from_flag(cancel.shared_flag());
     let mut retry = RetryState::new();
     loop {
         let (ptx, prx) = flume::unbounded();
@@ -42,18 +53,27 @@ pub(crate) async fn stream_with_retry(
             let event_tx = event_tx.clone();
             async move { forward_provider_events(prx, &event_tx).await }
         });
-        let result = futures_lite::future::race(
-            provider.stream_message(model, messages, system, tools, &ptx, opts, session_id),
-            async {
-                cancel.cancelled().await;
-                Err(AgentError::Cancelled)
-            },
-        )
-        .await;
+        let result = provider
+            .stream_message(
+                model,
+                messages,
+                system,
+                tools,
+                &ptx,
+                opts,
+                session_id,
+                provider_cancel.clone(),
+            )
+            .await;
         drop(ptx);
         let _ = forwarder.await;
         match result {
-            Ok(r) => return Ok(r),
+            Ok(r) => {
+                if cancel.is_cancelled() {
+                    return Ok(StreamOutcome::Partial(r));
+                }
+                return Ok(StreamOutcome::Full(r));
+            }
             Err(AgentError::Cancelled) => return Err(AgentError::Cancelled),
             Err(e) if e.is_retryable() => {
                 if e.should_rotate_key()

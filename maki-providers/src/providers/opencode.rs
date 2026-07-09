@@ -1,3 +1,4 @@
+use crate::CancellationToken;
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
@@ -239,12 +240,13 @@ impl Opencode {
         event_tx: &Sender<ProviderEvent>,
         auth: &ResolvedAuth,
         opts: &RequestOptions,
+        cancel: CancellationToken,
     ) -> Result<StreamResponse, AgentError> {
         let mut body = self.chat_compat.build_body(model, messages, system, tools);
         opts.thinking
             .apply_reasoning_effort(&mut body, EffortScale::PreferHigh);
         self.chat_compat
-            .do_stream(model, &[], &body, event_tx, auth)
+            .do_stream(model, &[], &body, event_tx, auth, cancel)
             .await
     }
 
@@ -258,6 +260,7 @@ impl Opencode {
         event_tx: &Sender<ProviderEvent>,
         auth: &ResolvedAuth,
         opts: &RequestOptions,
+        cancel: CancellationToken,
     ) -> Result<StreamResponse, AgentError> {
         let system_blocks = vec![shared::SystemBlock {
             r#type: "text",
@@ -295,7 +298,8 @@ impl Opencode {
         let status = response.status().as_u16();
 
         if status == 200 {
-            crate::providers::anthropic::parse_sse(response, event_tx, self.stream_timeout).await
+            crate::providers::anthropic::parse_sse(response, event_tx, self.stream_timeout, cancel)
+                .await
         } else {
             Err(AgentError::from_response(response).await)
         }
@@ -312,6 +316,7 @@ impl Provider for Opencode {
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
         _session_id: Option<&'a str>,
+        cancel: CancellationToken,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let model_for_stream = model.clone();
@@ -344,13 +349,13 @@ impl Provider for Opencode {
             match meta.api_format {
                 EndpointType::ChatCompletions => {
                     self.handle_catalog_chat_completions(
-                        &model, messages, system, tools, event_tx, &auth, &opts,
+                        &model, messages, system, tools, event_tx, &auth, &opts, cancel,
                     )
                     .await
                 }
                 EndpointType::Messages => {
                     self.handle_catalog_messages(
-                        &model, messages, system, tools, event_tx, &auth, &opts,
+                        &model, messages, system, tools, event_tx, &auth, &opts, cancel,
                     )
                     .await
                 }

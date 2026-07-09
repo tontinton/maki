@@ -4,12 +4,19 @@ use maki_providers::{ContentBlock, Message, Model, RequestOptions, StreamRespons
 use tracing::{info, warn};
 
 use super::history::{CutPoint, History};
-use super::streaming::stream_with_retry;
+use super::streaming::{StreamOutcome, stream_with_retry};
 use crate::cancel::CancelToken;
 use crate::{AgentError, AgentEvent, EventSender, TurnCompleteEvent};
 
 pub(super) const CONTINUE_AFTER_COMPACT: &str = "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed. If you learned important project context during this session, consider saving it to memory before it's lost.";
 const IMAGE_PLACEHOLDER: &str = "[image]";
+
+fn full_response(outcome: StreamOutcome) -> Result<StreamResponse, AgentError> {
+    match outcome {
+        StreamOutcome::Full(r) => Ok(r),
+        StreamOutcome::Partial(_) => Err(AgentError::Cancelled),
+    }
+}
 
 pub(super) async fn compact_history(
     provider: &dyn maki_providers::provider::Provider,
@@ -52,13 +59,14 @@ pub(super) async fn compact_history(
         )
         .await
         {
-            Ok(response) => {
+            Ok(outcome) => {
                 if attempt > 0 {
                     info!(
                         attempt,
                         "compaction succeeded after truncating oldest rounds"
                     );
                 }
+                let response = full_response(outcome)?;
                 return Ok(finish_compact(
                     response,
                     history,
@@ -105,18 +113,20 @@ pub async fn branch_summary(
     prefix.push(Message::user(crate::prompt::COMPACTION_USER.to_string()));
 
     let empty_tools = serde_json::json!([]);
-    let response = stream_with_retry(
-        provider,
-        model,
-        &prefix,
-        crate::prompt::COMPACTION_SYSTEM,
-        &empty_tools,
-        event_tx,
-        cancel,
-        RequestOptions::default(),
-        None,
-    )
-    .await?;
+    let response = full_response(
+        stream_with_retry(
+            provider,
+            model,
+            &prefix,
+            crate::prompt::COMPACTION_SYSTEM,
+            &empty_tools,
+            event_tx,
+            cancel,
+            RequestOptions::default(),
+            None,
+        )
+        .await?,
+    )?;
 
     let _ = event_tx.send(AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
         message: response.message.clone(),

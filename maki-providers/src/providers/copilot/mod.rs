@@ -1,3 +1,4 @@
+use crate::CancellationToken;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -207,6 +208,7 @@ impl Copilot {
         system: &str,
         tools: &Value,
         event_tx: &Sender<ProviderEvent>,
+        cancel: CancellationToken,
     ) -> Result<StreamResponse, AgentError> {
         let auth = self.auth().await?;
         let wire_tools = openai_compat::convert_tools(tools);
@@ -235,6 +237,7 @@ impl Copilot {
                 BufReader::new(response.into_body()),
                 event_tx,
                 self.stream_timeout,
+                cancel,
             )
             .await
         } else {
@@ -249,6 +252,7 @@ impl Copilot {
         system: &str,
         tools: &Value,
         event_tx: &Sender<ProviderEvent>,
+        cancel: CancellationToken,
     ) -> Result<StreamResponse, AgentError> {
         let auth = self.auth().await?;
         let body = responses::build_body(model, messages, system, tools);
@@ -263,10 +267,12 @@ impl Copilot {
             event_tx,
             &resolved,
             self.stream_timeout,
+            cancel,
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn stream_messages(
         &self,
         model: &Model,
@@ -275,6 +281,7 @@ impl Copilot {
         tools: &Value,
         event_tx: &Sender<ProviderEvent>,
         thinking: ThinkingConfig,
+        cancel: CancellationToken,
     ) -> Result<StreamResponse, AgentError> {
         let auth = self.auth().await?;
         let mut body = json!({
@@ -293,7 +300,7 @@ impl Copilot {
             .body(serde_json::to_vec(&body)?)?;
         let response = self.client.send_async(request).await?;
         if response.status().is_success() {
-            super::anthropic::parse_sse(response, event_tx, self.stream_timeout).await
+            super::anthropic::parse_sse(response, event_tx, self.stream_timeout, cancel).await
         } else {
             Err(AgentError::from_response(response).await)
         }
@@ -544,6 +551,7 @@ impl Provider for Copilot {
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
         _session_id: Option<&'a str>,
+        cancel: CancellationToken,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let mut prefixed_system = String::new();
@@ -552,16 +560,24 @@ impl Provider for Copilot {
             debug!(model = %model.id, ?endpoint, "running Copilot request");
             match endpoint {
                 Endpoint::ChatCompletions => {
-                    self.stream_chat_completions(model, messages, system, tools, event_tx)
+                    self.stream_chat_completions(model, messages, system, tools, event_tx, cancel)
                         .await
                 }
                 Endpoint::Responses => {
-                    self.stream_responses(model, messages, system, tools, event_tx)
+                    self.stream_responses(model, messages, system, tools, event_tx, cancel)
                         .await
                 }
                 Endpoint::Messages => {
-                    self.stream_messages(model, messages, system, tools, event_tx, opts.thinking)
-                        .await
+                    self.stream_messages(
+                        model,
+                        messages,
+                        system,
+                        tools,
+                        event_tx,
+                        opts.thinking,
+                        cancel,
+                    )
+                    .await
                 }
             }
         })

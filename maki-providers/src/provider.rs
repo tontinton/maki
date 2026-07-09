@@ -6,6 +6,7 @@ use serde_json::Value;
 use strum::{Display, EnumIter, EnumString, IntoEnumIterator};
 use tracing::{debug, warn};
 
+use crate::CancellationToken;
 use crate::model::{Model, ModelFamily, ModelInfo, models_for_provider};
 use crate::providers::Timeouts;
 use crate::providers::anthropic::Anthropic;
@@ -259,6 +260,7 @@ pub trait Provider: Send + Sync {
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
         session_id: Option<&'a str>,
+        cancel: CancellationToken,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>>;
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>>;
@@ -327,6 +329,7 @@ impl Provider for UnconfiguredProvider {
         _event_tx: &'a Sender<ProviderEvent>,
         _opts: RequestOptions,
         _session_id: Option<&'a str>,
+        _cancel: CancellationToken,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async {
             Err(AgentError::Config {

@@ -143,6 +143,7 @@ pub(crate) async fn do_stream(
     event_tx: &Sender<ProviderEvent>,
     auth: &ResolvedAuth,
     stream_timeout: Duration,
+    cancel: crate::CancellationToken,
 ) -> Result<StreamResponse, AgentError> {
     let base = auth.base_url.as_deref().ok_or_else(|| AgentError::Config {
         message: "Responses API requires a base_url in auth".into(),
@@ -173,6 +174,7 @@ pub(crate) async fn do_stream(
             BufReader::new(response.into_body()),
             event_tx,
             stream_timeout,
+            cancel,
         )
         .await
     } else {
@@ -191,6 +193,7 @@ pub(crate) async fn parse_sse(
     reader: impl AsyncBufRead + Unpin,
     event_tx: &Sender<ProviderEvent>,
     stream_timeout: Duration,
+    cancel: crate::CancellationToken,
 ) -> Result<StreamResponse, AgentError> {
     let mut lines = reader.lines();
 
@@ -205,6 +208,9 @@ pub(crate) async fn parse_sse(
     while let Some(line) =
         crate::providers::next_sse_line(&mut lines, &mut deadline, stream_timeout).await?
     {
+        if cancel.is_cancelled() {
+            break;
+        }
         if let Some(event_type) = line.strip_prefix("event:") {
             current_event = event_type.trim().to_string();
             continue;
@@ -481,7 +487,13 @@ mod tests {
 
     async fn run_sse(sse: &str) -> (Result<StreamResponse, AgentError>, Vec<ProviderEvent>) {
         let (tx, rx) = flume::unbounded();
-        let result = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT).await;
+        let result = parse_sse(
+            Cursor::new(sse.as_bytes()),
+            &tx,
+            TEST_STREAM_TIMEOUT,
+            crate::CancellationToken::never(),
+        )
+        .await;
         (result, rx.drain().collect())
     }
 

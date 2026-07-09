@@ -1,3 +1,4 @@
+use crate::CancellationToken;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -192,6 +193,7 @@ impl Google {
         body
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn do_stream(
         &self,
         model: &Model,
@@ -200,6 +202,7 @@ impl Google {
         tools: &Value,
         event_tx: &Sender<ProviderEvent>,
         thinking: ThinkingConfig,
+        cancel: crate::CancellationToken,
     ) -> Result<StreamResponse, AgentError> {
         let body = self.build_body(model, messages, system, tools, thinking);
         let url = self.stream_url(&model.id);
@@ -214,7 +217,7 @@ impl Google {
         let status = response.status().as_u16();
 
         if status == 200 {
-            parse_sse(response, event_tx, self.stream_timeout).await
+            parse_sse(response, event_tx, self.stream_timeout, cancel).await
         } else {
             Err(AgentError::from_response(response).await)
         }
@@ -231,8 +234,17 @@ impl Provider for Google {
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
         _session_id: Option<&'a str>,
+        cancel: CancellationToken,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
-        Box::pin(self.do_stream(model, messages, system, tools, event_tx, opts.thinking))
+        Box::pin(self.do_stream(
+            model,
+            messages,
+            system,
+            tools,
+            event_tx,
+            opts.thinking,
+            cancel,
+        ))
     }
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
@@ -494,6 +506,7 @@ async fn parse_sse(
     response: isahc::Response<isahc::AsyncBody>,
     event_tx: &Sender<ProviderEvent>,
     stream_timeout: Duration,
+    cancel: crate::CancellationToken,
 ) -> Result<StreamResponse, AgentError> {
     let reader = BufReader::new(response.into_body());
     let mut lines = reader.lines();
@@ -504,6 +517,9 @@ async fn parse_sse(
     let mut deadline = Instant::now() + stream_timeout;
 
     while let Some(line) = next_sse_line(&mut lines, &mut deadline, stream_timeout).await? {
+        if cancel.is_cancelled() {
+            break;
+        }
         let data = match line.strip_prefix("data:") {
             Some(d) => d.strip_prefix(' ').unwrap_or(d),
             _ => continue,
@@ -909,7 +925,13 @@ mod tests {
         let data = b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hello\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":5,\"candidatesTokenCount\":10}}\n\n";
         let response = mock_response(data);
         let (tx, _rx) = flume::unbounded();
-        let result = smol::block_on(parse_sse(response, &tx, Duration::from_secs(30))).unwrap();
+        let result = smol::block_on(parse_sse(
+            response,
+            &tx,
+            Duration::from_secs(30),
+            crate::CancellationToken::never(),
+        ))
+        .unwrap();
         assert_eq!(result.stop_reason, Some(StopReason::EndTurn));
         assert_eq!(result.usage.input, 5);
         assert_eq!(result.usage.output, 10);
@@ -924,7 +946,13 @@ mod tests {
         let data = b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"thinking...\",\"thought\":true,\"thoughtSignature\":\"sig1\"}]}},{\"content\":{\"parts\":[{\"text\":\"answer\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":5,\"candidatesTokenCount\":20}}\n\n";
         let response = mock_response(data);
         let (tx, _rx) = flume::unbounded();
-        let result = smol::block_on(parse_sse(response, &tx, Duration::from_secs(30))).unwrap();
+        let result = smol::block_on(parse_sse(
+            response,
+            &tx,
+            Duration::from_secs(30),
+            crate::CancellationToken::never(),
+        ))
+        .unwrap();
         assert!(matches!(
             &result.message.content[0],
             ContentBlock::Thinking { thinking, signature } if thinking == "thinking..." && signature.as_deref() == Some("sig1")
@@ -940,7 +968,13 @@ mod tests {
         let data = b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"bash\",\"args\":{\"cmd\":\"ls\"}}}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":5,\"candidatesTokenCount\":15}}\n\n";
         let response = mock_response(data);
         let (tx, _rx) = flume::unbounded();
-        let result = smol::block_on(parse_sse(response, &tx, Duration::from_secs(30))).unwrap();
+        let result = smol::block_on(parse_sse(
+            response,
+            &tx,
+            Duration::from_secs(30),
+            crate::CancellationToken::never(),
+        ))
+        .unwrap();
         assert_eq!(result.stop_reason, Some(StopReason::ToolUse));
         assert!(matches!(
             &result.message.content[0],
@@ -953,7 +987,13 @@ mod tests {
         let data = b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hi\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":100,\"candidatesTokenCount\":10,\"cachedContentTokenCount\":50}}\n\n";
         let response = mock_response(data);
         let (tx, _rx) = flume::unbounded();
-        let result = smol::block_on(parse_sse(response, &tx, Duration::from_secs(30))).unwrap();
+        let result = smol::block_on(parse_sse(
+            response,
+            &tx,
+            Duration::from_secs(30),
+            crate::CancellationToken::never(),
+        ))
+        .unwrap();
         assert_eq!(result.usage.input, 100);
         assert_eq!(result.usage.output, 10);
         assert_eq!(result.usage.cache_read, 50);

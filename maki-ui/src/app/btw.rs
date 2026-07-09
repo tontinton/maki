@@ -80,6 +80,7 @@ async fn run_btw(
         &event_tx,
         RequestOptions::default(),
         session_id.as_deref(),
+        maki_providers::CancellationToken::never(),
     );
 
     let forward_fut = async {

@@ -1,3 +1,4 @@
+pub mod cancel;
 pub(crate) mod error;
 pub mod model;
 pub mod model_registry;
@@ -6,6 +7,7 @@ pub(crate) mod providers;
 pub mod retry;
 pub(crate) mod types;
 
+pub use cancel::CancellationToken;
 pub use error::AgentError;
 pub use model::{
     FastPricing, Model, ModelEntry, ModelError, ModelFamily, ModelInfo, ModelPricing, ModelTier,

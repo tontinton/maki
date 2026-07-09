@@ -611,3 +611,80 @@ fn branch_summary_absent_after_undo_of_rewind() {
         "moving the leaf off the branch summary must remove it from the fold"
     );
 }
+
+const INTERRUPT_RUN_ID: u64 = 42;
+const CANCELLED_BY_USER_MSG: &str = "[Cancelled by user]";
+
+#[test]
+fn push_interrupted_marks_leaf() {
+    let messages = vec![user_msg("hello")];
+    let mut history = History::new(messages);
+    assert!(!history.leaf_is_interrupted());
+
+    let blocks = vec![ContentBlock::Text {
+        text: "partial answer".into(),
+    }];
+    history.push_interrupted(blocks, INTERRUPT_RUN_ID);
+    assert!(
+        history.leaf_is_interrupted(),
+        "leaf must be interrupted after push_interrupted"
+    );
+}
+
+#[test]
+fn push_interrupted_discard_keeps_leaf_unchanged() {
+    let messages = vec![user_msg("hello"), assistant_text("full reply")];
+    let mut history = History::new(messages);
+    let id = history.push_interrupted(Vec::new(), INTERRUPT_RUN_ID);
+    assert!(id.is_none(), "empty blocks must not append a node");
+    assert!(
+        !history.leaf_is_interrupted(),
+        "discard must not mark the leaf as interrupted"
+    );
+}
+
+#[test]
+fn interrupted_leaf_excluded_from_next_request() {
+    let messages = vec![user_msg("hello")];
+    let mut history = History::new(messages);
+
+    let blocks = vec![ContentBlock::Thinking {
+        thinking: "partial reasoning".into(),
+        signature: Some("sig".into()),
+    }];
+    history.push_interrupted(blocks, INTERRUPT_RUN_ID);
+
+    let leaf_interrupted = history.leaf_is_interrupted();
+    let ctx = history.active_branch();
+    let mut messages = ctx.to_vec();
+    super::lower_for_provider(&mut messages, true);
+    if leaf_interrupted && matches!(messages.last(), Some(m) if m.role == Role::Assistant) {
+        messages.pop();
+    }
+    assert!(
+        !messages.last().is_some_and(|m| m.role == Role::Assistant),
+        "trailing interrupted assistant turn must be excluded from the next request"
+    );
+}
+
+#[test]
+fn mid_tool_cancel_closes_dangling_tool_uses() {
+    let messages = vec![
+        user_msg("run a command"),
+        assistant_tool_use(TOOL_ID_T1, TOOL_NAME_BASH),
+    ];
+    let mut history = History::new(messages);
+
+    history.close_cancelled_tool_calls();
+
+    let ctx = history.active_branch();
+    let last = ctx.last().expect("context non-empty after cancel");
+    assert_eq!(last.role, Role::User, "cancelled results land as user node");
+    assert!(
+        last.content.iter().any(|b| matches!(
+            b,
+            ContentBlock::ToolResult { content, is_error: true, .. } if content == CANCELLED_BY_USER_MSG
+        )),
+        "dangling tool_use must be closed with [Cancelled by user] error"
+    );
+}

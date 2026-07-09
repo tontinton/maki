@@ -1,3 +1,4 @@
+use crate::CancellationToken;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -518,9 +519,11 @@ impl Provider for DynamicProvider {
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
         session_id: Option<&'a str>,
+        cancel: CancellationToken,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
-        self.inner
-            .stream_message(model, messages, system, tools, event_tx, opts, session_id)
+        self.inner.stream_message(
+            model, messages, system, tools, event_tx, opts, session_id, cancel,
+        )
     }
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {

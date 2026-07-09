@@ -225,10 +225,14 @@ impl<'h> Agent<'h> {
         if self.cancel.is_cancelled() {
             return Err(AgentError::Cancelled);
         }
+        let leaf_interrupted = self.history.leaf_is_interrupted();
         let context = self.history.active_branch();
         let mut messages = context.to_vec();
         super::history::lower_for_provider(&mut messages, self.model.supports_thinking());
-        let response = match stream_with_retry(
+        if leaf_interrupted && matches!(messages.last(), Some(m) if m.role == Role::Assistant) {
+            messages.pop();
+        }
+        let outcome = match stream_with_retry(
             &*self.provider,
             &self.model,
             &messages,
@@ -241,9 +245,9 @@ impl<'h> Agent<'h> {
         )
         .await
         {
-            Ok(r) => {
+            Ok(o) => {
                 self.reauth_attempts = 0;
-                r
+                o
             }
             Err(e) if e.is_auth_error() => {
                 return self.wait_for_reauth(e).await;
@@ -253,8 +257,35 @@ impl<'h> Agent<'h> {
                 return Err(e);
             }
         };
-        self.num_turns += 1;
 
+        match outcome {
+            super::streaming::StreamOutcome::Partial(partial) => {
+                let finalized = super::history::finalize::FinalizedPartial::from_completed_blocks(
+                    &partial.message.content,
+                );
+                let interrupted = matches!(
+                    finalized,
+                    super::history::finalize::FinalizedPartial::Node(_)
+                );
+                if let super::history::finalize::FinalizedPartial::Node(blocks) = finalized {
+                    self.history.push_interrupted(blocks, self.num_turns as u64);
+                }
+                self.event_tx
+                    .send(AgentEvent::CancelledPartial { interrupted })?;
+                Err(AgentError::Cancelled)
+            }
+            super::streaming::StreamOutcome::Full(response) => {
+                self.num_turns += 1;
+                self.process_full_response(response, context.len()).await
+            }
+        }
+    }
+
+    async fn process_full_response(
+        &mut self,
+        response: StreamResponse,
+        context_len: usize,
+    ) -> Result<TurnOutcome, AgentError> {
         let has_tools = response.message.has_tool_calls();
         let stop_reason = response.stop_reason;
         info!(
@@ -275,7 +306,7 @@ impl<'h> Agent<'h> {
         self.context_size = usage.total_input();
 
         if has_tools {
-            let len_before = context.len();
+            let len_before = context_len;
             self.process_tool_calls(response).await?;
             let after = self.history.active_branch();
             if after.len() > len_before {
@@ -571,6 +602,7 @@ mod tests {
             _: &'a flume::Sender<ProviderEvent>,
             _: RequestOptions,
             _: Option<&str>,
+            _: maki_providers::CancellationToken,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async {
                 let mut responses = self.responses.lock().unwrap();
@@ -854,6 +886,7 @@ mod tests {
                     _: &'a flume::Sender<ProviderEvent>,
                     _: RequestOptions,
                     _: Option<&'a str>,
+                    _: maki_providers::CancellationToken,
                 ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
                     Box::pin(async {
                         futures_lite::future::pending::<()>().await;

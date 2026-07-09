@@ -33,6 +33,7 @@ impl Provider for MockProvider {
         _: &'a flume::Sender<ProviderEvent>,
         _: RequestOptions,
         _: Option<&'a str>,
+        _: maki_providers::CancellationToken,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async {
             let mut responses = self.responses.lock().unwrap();

@@ -121,6 +121,9 @@ impl Chat {
                 );
             }
             AgentEvent::TurnComplete(_) => {}
+            AgentEvent::CancelledPartial { .. } => {
+                self.messages_panel.flush();
+            }
             AgentEvent::ToolResultsSubmitted { .. } => {
                 if let Some(usage) = self.pending_turn_usage.take() {
                     self.messages_panel.set_turn_usage_on_last_tool(usage);

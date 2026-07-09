@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use event_listener::Event;
 
 struct Shared {
-    cancelled: AtomicBool,
+    cancelled: Arc<AtomicBool>,
     event: Event,
 }
 
@@ -30,7 +30,7 @@ pub struct CancelTrigger(Arc<Shared>);
 impl CancelToken {
     pub fn new() -> (CancelTrigger, Self) {
         let shared = Arc::new(Shared {
-            cancelled: AtomicBool::new(false),
+            cancelled: Arc::new(AtomicBool::new(false)),
             event: Event::new(),
         });
         (CancelTrigger(Arc::clone(&shared)), Self(shared))
@@ -38,13 +38,20 @@ impl CancelToken {
 
     pub fn none() -> Self {
         Self(Arc::new(Shared {
-            cancelled: AtomicBool::new(false),
+            cancelled: Arc::new(AtomicBool::new(false)),
             event: Event::new(),
         }))
     }
 
     pub fn is_cancelled(&self) -> bool {
         self.0.cancelled.load(Ordering::Acquire)
+    }
+
+    /// Shared flag for provider SSE loops (§8): the provider polls this
+    /// between SSE lines and breaks early on cancel so its accumulator
+    /// survives as a partial `StreamResponse`.
+    pub fn shared_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.0.cancelled)
     }
 
     pub async fn race<T>(&self, future: impl Future<Output = T>) -> Result<T, String> {

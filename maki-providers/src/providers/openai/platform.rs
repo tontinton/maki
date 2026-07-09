@@ -1,3 +1,4 @@
+use crate::CancellationToken;
 use std::sync::{Arc, Mutex};
 
 use flume::Sender;
@@ -146,6 +147,7 @@ impl Provider for OpenAi {
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
         _session_id: Option<&str>,
+        cancel: CancellationToken,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let mut buf = String::new();
@@ -154,6 +156,7 @@ impl Provider for OpenAi {
             if is_codex_model(&model.id) {
                 let body = super::responses::build_body(model, messages, system, tools);
                 let stream_timeout = self.compat.stream_timeout();
+                let cancel = cancel.clone();
                 return self
                     .with_oauth_retry(|| async {
                         let codex_auth = self.codex_auth()?;
@@ -164,6 +167,7 @@ impl Provider for OpenAi {
                             event_tx,
                             &codex_auth,
                             stream_timeout,
+                            cancel.clone(),
                         )
                         .await
                     })
@@ -176,7 +180,7 @@ impl Provider for OpenAi {
             self.with_oauth_retry(|| async {
                 let auth = self.current_auth();
                 self.compat
-                    .do_stream(model, &[], &body, event_tx, &auth)
+                    .do_stream(model, &[], &body, event_tx, &auth, cancel.clone())
                     .await
             })
             .await

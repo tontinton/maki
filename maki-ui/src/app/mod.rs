@@ -838,9 +838,6 @@ impl App {
                             && t.elapsed() < self.status_bar.flash_duration
                         {
                             if streaming {
-                                // C6 hook: interrupt-finalize will replace
-                                // `handle_cancel` with §A.6 finalize + append
-                                // `interrupted: true` node (§8). Left as-is.
                                 self.handle_cancel()
                             } else {
                                 self.open_tree_selector()

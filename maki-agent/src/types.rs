@@ -535,6 +535,11 @@ pub enum AgentEvent {
         stop_reason: Option<StopReason>,
     },
     AutoCompacting,
+    /// Mid-stream interrupt finalized (§8). `interrupted` is true when a
+    /// partial assistant node was persisted (signed thinking / text kept).
+    CancelledPartial {
+        interrupted: bool,
+    },
     Retry {
         attempt: u32,
         message: String,

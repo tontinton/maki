@@ -1,3 +1,4 @@
+use crate::CancellationToken;
 use std::sync::{Arc, Mutex};
 
 use flume::Sender;
@@ -116,6 +117,7 @@ impl Provider for LocalEndpoint {
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
         _session_id: Option<&'a str>,
+        cancel: CancellationToken,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let auth = self.auth.lock().unwrap().clone();
@@ -128,7 +130,7 @@ impl Provider for LocalEndpoint {
             }
 
             self.compat
-                .do_stream(model, &[], &body, event_tx, &auth)
+                .do_stream(model, &[], &body, event_tx, &auth, cancel)
                 .await
         })
     }

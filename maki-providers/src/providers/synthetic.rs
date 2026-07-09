@@ -1,3 +1,4 @@
+use crate::CancellationToken;
 use std::sync::{Arc, Mutex};
 
 use flume::Sender;
@@ -126,6 +127,7 @@ impl Provider for Synthetic {
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
         _session_id: Option<&str>,
+        cancel: CancellationToken,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let auth = self.auth.lock().unwrap().clone();
@@ -135,7 +137,7 @@ impl Provider for Synthetic {
             opts.thinking
                 .apply_reasoning_effort(&mut body, EffortScale::Standard);
             self.compat
-                .do_stream(model, &[], &body, event_tx, &auth)
+                .do_stream(model, &[], &body, event_tx, &auth, cancel)
                 .await
         })
     }
