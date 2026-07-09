@@ -139,6 +139,12 @@ impl StorageWriter {
             .unwrap_or_else(|| flume::unbounded().1)
     }
 
+    /// The current leaf position the writer's cursor tracks (§4). This is the
+    /// node that closed the last run — the key for a run-end snapshot (§7).
+    pub fn leaf_position(&self) -> Position {
+        self.state.lock().unwrap().cursor.last_leaf.clone()
+    }
+
     /// Open session id for the active writer, if any.
     pub fn session_id(&self) -> Option<String> {
         let state = self.state.lock().unwrap();

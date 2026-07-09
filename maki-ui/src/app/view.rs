@@ -256,6 +256,7 @@ impl App {
         }
 
         render_if_open!(self.tree_selector);
+        render_if_open!(self.restore_mode_picker);
         render_if_open!(self.theme_picker);
         render_if_open!(self.model_picker);
         render_if_open!(self.login_picker);

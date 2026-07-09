@@ -37,13 +37,14 @@ use crate::components::mcp_picker::{McpPicker, McpPickerAction};
 use crate::components::model_picker::{ModelPicker, ModelPickerAction};
 use crate::components::permission_prompt::PermissionPrompt;
 use crate::components::plan_form::{PlanForm, PlanFormAction};
+use crate::components::restore_mode_picker::{RestoreModeAction, RestoreModePicker};
 use crate::components::scrollbar;
 use crate::components::search_modal::{SearchAction, SearchModal};
 use crate::components::session_picker::{SessionPicker, SessionPickerAction};
 use crate::components::status_bar::StatusBar;
 use crate::components::theme_picker::{ThemePicker, ThemePickerAction};
 use crate::components::tool_display::format_turn_usage;
-use crate::components::tree_selector::{TreeSelector, TreeSelectorAction};
+use crate::components::tree_selector::{TreeSelector, TreeSelectorAction, TreeSelectorOutcome};
 use crate::components::usage_modal::{UsageFetchState, UsageModal};
 use crate::components::{
     Action, DisplayMessage, DisplayRole, ExitRequest, Overlay, Renders, RetryInfo, Status, is_ctrl,
@@ -142,6 +143,8 @@ pub struct App {
     pub(super) mcp_picker: McpPicker,
     pub(super) session_picker: SessionPicker,
     pub(super) tree_selector: TreeSelector,
+    pub(super) restore_mode_picker: RestoreModePicker,
+    pub(super) restore_mode_outcome: Option<TreeSelectorOutcome>,
     pub(super) help_modal: HelpModal,
     pub(super) usage_modal: UsageModal,
     pub(super) btw_modal: BtwModal,
@@ -223,6 +226,8 @@ impl App {
             mcp_picker: McpPicker::new(mcp_reader, mcp_config_errors),
             session_picker: SessionPicker::new(),
             tree_selector: TreeSelector::new(),
+            restore_mode_picker: RestoreModePicker::new(),
+            restore_mode_outcome: None,
             help_modal: HelpModal::new(),
             usage_modal: UsageModal::new(),
             btw_modal: BtwModal::new(ui_config.typewriter_ms_per_char),
@@ -398,6 +403,7 @@ impl App {
         }
         try_picker!(self.session_picker);
         try_picker!(self.tree_selector);
+        try_picker!(self.restore_mode_picker);
         try_picker!(self.task_picker);
         try_picker!(self.model_picker);
         try_picker!(self.file_picker);
@@ -622,10 +628,25 @@ impl App {
             });
         }
 
+        if self.restore_mode_picker.is_open() {
+            return Some(match self.restore_mode_picker.handle_key(key) {
+                RestoreModeAction::Consumed => vec![],
+                RestoreModeAction::Select(mode) => {
+                    let outcome = self.restore_mode_outcome.take();
+                    self.rewind_with_mode(outcome, mode)
+                }
+                RestoreModeAction::Close => vec![],
+            });
+        }
+
         if self.tree_selector.is_open() {
             return Some(match self.tree_selector.handle_key(key) {
                 TreeSelectorAction::Consumed => vec![],
-                TreeSelectorAction::Select(outcome) => self.rewind_to(outcome),
+                TreeSelectorAction::Select(outcome) => {
+                    self.restore_mode_outcome = Some(outcome);
+                    self.restore_mode_picker.open();
+                    vec![]
+                }
                 TreeSelectorAction::Undo => self.undo_rewind(),
                 TreeSelectorAction::Close => vec![],
             });
@@ -958,11 +979,13 @@ impl App {
         if envelope.run_id != self.run_id {
             // Stale run_id after cancel: agent updates shared_history before sending
             // Done/Error, so this is the first moment the full conversation is available.
+            // Cancelled runs may have mutated the working tree (§7), so they snapshot too.
             if matches!(
                 envelope.event,
                 AgentEvent::Done { .. } | AgentEvent::Error { .. }
             ) {
                 self.save_session();
+                self.snapshot_at_run_end();
             }
             return vec![];
         }
@@ -1095,6 +1118,7 @@ impl App {
                 ChatEventResult::Done => {
                     self.status_bar.clear_flash();
                     self.save_session();
+                    self.snapshot_at_run_end();
                     self.chat_index.clear();
                     self.subagent_answers.clear();
                     self.status = Status::Idle;
@@ -1405,7 +1429,7 @@ impl App {
         vec![]
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 14] {
+    fn overlays(&self) -> [&dyn Overlay; 15] {
         [
             &self.help_modal,
             &self.usage_modal,
@@ -1416,6 +1440,7 @@ impl App {
             &self.task_picker,
             &self.session_picker,
             &self.tree_selector,
+            &self.restore_mode_picker,
             &self.theme_picker,
             &self.model_picker,
             &self.login_picker,
@@ -1424,7 +1449,7 @@ impl App {
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 14] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 15] {
         [
             &mut self.help_modal,
             &mut self.usage_modal,
@@ -1435,6 +1460,7 @@ impl App {
             &mut self.task_picker,
             &mut self.session_picker,
             &mut self.tree_selector,
+            &mut self.restore_mode_picker,
             &mut self.theme_picker,
             &mut self.model_picker,
             &mut self.login_picker,
@@ -1511,6 +1537,7 @@ impl App {
         try_picker!(self.task_picker);
         try_picker!(self.session_picker);
         try_picker!(self.tree_selector);
+        try_picker!(self.restore_mode_picker);
         try_picker!(self.theme_picker);
         try_picker!(self.model_picker);
         try_picker!(self.mcp_picker);

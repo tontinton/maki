@@ -3,6 +3,7 @@ use crate::agent::shared_queue;
 use crate::chat::{CANCELLED_TEXT, DONE_TEXT, ERROR_TEXT};
 use crate::components::command::ParsedCommand;
 use crate::components::keybindings::{KeybindContext, key as kb};
+use crate::components::restore_mode_picker::RestoreMode;
 use crate::components::tree_selector::{TreeSelectorOutcome, undo_target_for_tree};
 use crate::components::{ExitRequest, key, test_model};
 use crate::selection::{SelectableZone, SelectionState, SelectionZone};
@@ -1674,9 +1675,12 @@ fn build_rewind_app() -> (App, TempDir) {
 fn rewind_to_middle_preserves_history_and_populates_input() {
     let (mut app, _tmp) = build_rewind_app();
     let old_run_id = app.run_id;
-    let actions = app.rewind_to(TreeSelectorOutcome::RewindBefore {
-        prompt_text: "second prompt".into(),
-    });
+    let actions = app.rewind_with_mode(
+        Some(TreeSelectorOutcome::RewindBefore {
+            prompt_text: "second prompt".into(),
+        }),
+        RestoreMode::Conversation,
+    );
 
     // §4: rewinds are appends — the on-disk branch is preserved (nothing
     // deleted). The chat scrollback rebuilds from the folded active branch
@@ -1697,9 +1701,12 @@ fn rewind_to_first_turn_preserves_history() {
     let (mut app, _tmp) = build_rewind_app();
     app.state.token_usage.input = 500;
     app.state.token_usage.output = 200;
-    let actions = app.rewind_to(TreeSelectorOutcome::RewindBefore {
-        prompt_text: "first prompt".into(),
-    });
+    let actions = app.rewind_with_mode(
+        Some(TreeSelectorOutcome::RewindBefore {
+            prompt_text: "first prompt".into(),
+        }),
+        RestoreMode::Conversation,
+    );
 
     // Non-destructive rewind: landing before the first prompt → Root; the
     // folded branch is empty (next push creates a new root). Token usage is
@@ -1722,9 +1729,12 @@ fn undo_target_present_after_rewind_absent_after_push() {
     assert!(undo_target_for_tree(&tree).is_none());
 
     // Rewind to "second prompt" appends a Leaf → undo available.
-    let _ = app.rewind_to(TreeSelectorOutcome::RewindBefore {
-        prompt_text: "second prompt".into(),
-    });
+    let _ = app.rewind_with_mode(
+        Some(TreeSelectorOutcome::RewindBefore {
+            prompt_text: "second prompt".into(),
+        }),
+        RestoreMode::Conversation,
+    );
     let tree = app.state.tree.clone().unwrap();
     assert!(undo_target_for_tree(&tree).is_some());
 
@@ -1744,9 +1754,12 @@ fn undo_target_present_after_rewind_absent_after_push() {
 #[test]
 fn rewind_to_first_message_lands_at_root() {
     let (mut app, _tmp) = build_rewind_app();
-    let _ = app.rewind_to(TreeSelectorOutcome::RewindBefore {
-        prompt_text: "first prompt".into(),
-    });
+    let _ = app.rewind_with_mode(
+        Some(TreeSelectorOutcome::RewindBefore {
+            prompt_text: "first prompt".into(),
+        }),
+        RestoreMode::Conversation,
+    );
 
     // Folded active branch at Root is empty.
     assert!(app.state.session.messages.is_empty());

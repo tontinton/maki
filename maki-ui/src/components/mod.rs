@@ -17,6 +17,7 @@ pub(crate) mod permission_prompt;
 pub(crate) mod plan_form;
 pub mod queue_panel;
 pub(crate) mod render_hints;
+pub(crate) mod restore_mode_picker;
 pub(crate) mod scrollbar;
 pub(crate) mod search_modal;
 pub(crate) mod session_picker;

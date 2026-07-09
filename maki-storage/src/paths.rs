@@ -263,7 +263,13 @@ pub fn lock_path(dir: &Path) -> PathBuf {
     dir.join(LOCK_FILE)
 }
 
+/// `sessions/<id>/snapshots/` — content-addressed working-tree snapshots (§A.9).
+pub fn snapshots_dir(dir: &Path) -> PathBuf {
+    dir.join(SNAPSHOTS_DIR)
+}
+
 const SESSIONS_DIR: &str = "sessions";
+const SNAPSHOTS_DIR: &str = "snapshots";
 const LOG_FILE: &str = "log.jsonl";
 const META_FILE: &str = "meta.json";
 const RENDERS_FILE: &str = "renders.bin";

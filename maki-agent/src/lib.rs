@@ -3,6 +3,7 @@
 pub mod agent;
 pub mod cancel;
 pub mod child_guard;
+pub mod snapshots;
 pub use child_guard::ChildGuard;
 pub mod headless;
 pub mod mcp;

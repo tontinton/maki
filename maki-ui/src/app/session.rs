@@ -1,15 +1,18 @@
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use crate::chat::{Chat, DONE_TEXT, history_to_display};
 use crate::components::DisplayRole;
+use crate::components::restore_mode_picker::RestoreMode;
 use crate::components::tree_selector::{
     NO_TURNS_MSG, TreeSelectorOutcome, landing_target_before, last_user_prompt_text,
     undo_target_for_tree,
 };
 use crate::components::{Action, LoadedSession};
+use maki_agent::snapshots::{SnapshotError, SnapshotStore};
 use maki_providers::{Model, TokenUsage};
-use maki_storage::paths::session_dir;
+use maki_storage::paths::{session_dir, snapshots_dir};
 use maki_storage::session_log::load_folder;
 use maki_storage::sessions::StoredSubagent;
 use serde_json::value::RawValue;
@@ -76,6 +79,38 @@ impl App {
 
     pub(super) fn enqueue_save(&self) {
         self.storage_writer.send(&self.state.session);
+    }
+
+    /// Snapshot the working tree at run end (§7 — completed AND cancelled
+    /// runs), keyed by the closing node. The first turn also writes the
+    /// session-start anchor (turn-0 snapshot, keyed to the session not a node).
+    /// A missing cwd or readonly session is skipped silently; snapshot errors
+    /// surface as a status flash (snapshots are opt-in, never fatal).
+    pub(super) fn snapshot_at_run_end(&mut self) {
+        let Some(session_id) = self.storage_writer.session_id() else {
+            return;
+        };
+        let cwd = Path::new(&self.state.session.cwd);
+        if !cwd.is_dir() {
+            return;
+        }
+        let dir = session_dir(self.storage.path(), &session_id);
+        let store = SnapshotStore::new(snapshots_dir(&dir));
+        if !store.has_session_start()
+            && let Err(e) = store.snapshot_session_start(cwd)
+        {
+            self.status_bar
+                .flash(format!("Session-start snapshot failed: {e}"));
+            return;
+        }
+        let leaf = self.storage_writer.leaf_position();
+        if let Some(node) = leaf.node_ref() {
+            let node_id = node.to_string();
+            if let Err(e) = store.snapshot(cwd, &node_id) {
+                self.status_bar
+                    .flash(format!("Working-tree snapshot failed: {e}"));
+            }
+        }
     }
 
     pub(super) fn reset_ui_chrome(&mut self) {
@@ -205,12 +240,20 @@ impl App {
         vec![]
     }
 
-    /// Commit a rewind per the §4 landing rule. Rewinds are appends
-    /// (`TreeMutation::Rewind` writes a `Leaf`); nothing is deleted — the
-    /// abandoned branch is preserved on disk (decision 1). After the barrier,
-    /// the chat scrollback is rebuilt from the folded active branch and the
-    /// tree is refreshed so the next push parents onto the new leaf.
-    pub(super) fn rewind_to(&mut self, outcome: TreeSelectorOutcome) -> Vec<Action> {
+    /// Commit a rewind per the §4 landing rule (§7 restore modes). Rewinds are
+    /// appends (`TreeMutation::Rewind` writes a `Leaf`); nothing is deleted —
+    /// the abandoned branch is preserved on disk (decision 1). `mode` selects
+    /// conversation-only (C3 leaf move), code restore (working-tree snapshot),
+    /// or both. Code restore touches only the union of the two manifests' paths
+    /// (§A.9); the current tree is snapshotted first so the restore is undoable.
+    pub(super) fn rewind_with_mode(
+        &mut self,
+        outcome: Option<TreeSelectorOutcome>,
+        mode: RestoreMode,
+    ) -> Vec<Action> {
+        let Some(outcome) = outcome else {
+            return vec![];
+        };
         if self.status != super::Status::Idle {
             return vec![];
         }
@@ -222,12 +265,18 @@ impl App {
                 .filter_map(|b| serde_json::value::to_raw_value(b).ok())
                 .collect();
             self.run_id += 1;
-            if let Err(e) = self
+            let new_id = match self
                 .storage_writer
                 .rewind_to_interrupted_sibling(parent.clone(), content_raw)
             {
-                self.status_bar.flash(format!("Rewind failed: {e}"));
-                return vec![];
+                Ok(id) => id,
+                Err(e) => {
+                    self.status_bar.flash(format!("Rewind failed: {e}"));
+                    return vec![];
+                }
+            };
+            if mode.restores_code() {
+                self.restore_code_at(new_id.as_str());
             }
             self.rebuild_after_rewind();
             self.state.session.update_title_if_default();
@@ -257,6 +306,12 @@ impl App {
             }
         }
 
+        if mode.restores_code()
+            && let Some(node_id) = target.node_ref()
+        {
+            self.restore_code_at(&node_id.to_string());
+        }
+
         let prefill = match &outcome {
             TreeSelectorOutcome::RewindBefore { prompt_text } => Some(prompt_text.clone()),
             _ => None,
@@ -276,6 +331,37 @@ impl App {
         ))]
     }
 
+    /// Restore the working tree to `node_id`'s snapshot (§7). Opens the
+    /// snapshot store under the active session folder and restores, touching
+    /// only the union of the pre-restore and target manifests' paths. The
+    /// restore is undoable (current state snapshotted first, §A.9). The caller
+    /// supplies the target node — the store falls back to the session-start
+    /// anchor when the node has no manifest (so restore-to-root undoes
+    /// everything this session did). Errors are surfaced as a status flash; a
+    /// missing snapshot is silent.
+    fn restore_code_at(&mut self, node_id: &str) {
+        let Some(session_id) = self.storage_writer.session_id() else {
+            return;
+        };
+        let dir = session_dir(self.storage.path(), &session_id);
+        let snapshots = snapshots_dir(&dir);
+        let store = SnapshotStore::new(snapshots);
+        let cwd = Path::new(&self.state.session.cwd);
+        if !cwd.is_dir() {
+            tracing::warn!(cwd = %self.state.session.cwd, "restore: cwd missing, skipping");
+            return;
+        }
+        match store.restore(cwd, &[node_id]) {
+            Ok(_) => {}
+            Err(SnapshotError::NotFound(_)) => {
+                self.status_bar.flash("No code snapshot to restore".into());
+            }
+            Err(e) => {
+                self.status_bar.flash(format!("Code restore failed: {e}"));
+            }
+        }
+    }
+
     /// Fast path (§11): single-Esc-then-Enter. Lands before the last user
     /// prompt on the active branch (same as selecting it in the tree
     /// selector). No-op if there is no user prompt to rewind to.
@@ -292,7 +378,10 @@ impl App {
             self.status_bar.flash(NO_TURNS_MSG.into());
             return vec![];
         };
-        self.rewind_to(TreeSelectorOutcome::RewindBefore { prompt_text })
+        self.rewind_with_mode(
+            Some(TreeSelectorOutcome::RewindBefore { prompt_text }),
+            RestoreMode::Conversation,
+        )
     }
 
     /// Undo-of-rewind (§4): `position_before_last_leaf`, offered only while the
