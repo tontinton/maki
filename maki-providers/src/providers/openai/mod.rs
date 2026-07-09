@@ -6,6 +6,9 @@ pub use platform::OpenAi;
 
 use crate::model::{ModelEntry, ModelFamily, ModelPricing, ModelTier};
 
+const GPT_5_6_CONTEXT_WINDOW: u32 = 372_000;
+const GPT_5_6_MAX_OUTPUT_TOKENS: u32 = 128_000;
+
 inventory::submit!(maki_config::providers::BuiltInProvider {
     slug: "openai",
     display_name: "OpenAI",
@@ -21,11 +24,59 @@ inventory::submit!(maki_config::providers::BuiltInProvider {
 pub(crate) fn models() -> &'static [ModelEntry] {
     &[
         ModelEntry {
-            prefixes: &["gpt-5.4-nano"],
+            prefixes: &["gpt-5.6-luna"],
             tier: ModelTier::Weak,
             family: ModelFamily::Gpt,
             vision: true,
             default: true,
+            pricing: ModelPricing {
+                input: 1.00,
+                output: 6.00,
+                cache_write: 1.25,
+                cache_read: 0.10,
+                fast: None,
+            },
+            max_output_tokens: GPT_5_6_MAX_OUTPUT_TOKENS,
+            context_window: GPT_5_6_CONTEXT_WINDOW,
+        },
+        ModelEntry {
+            prefixes: &["gpt-5.6-terra"],
+            tier: ModelTier::Medium,
+            family: ModelFamily::Gpt,
+            vision: true,
+            default: true,
+            pricing: ModelPricing {
+                input: 2.50,
+                output: 15.00,
+                cache_write: 3.125,
+                cache_read: 0.25,
+                fast: None,
+            },
+            max_output_tokens: GPT_5_6_MAX_OUTPUT_TOKENS,
+            context_window: GPT_5_6_CONTEXT_WINDOW,
+        },
+        ModelEntry {
+            prefixes: &["gpt-5.6-sol"],
+            tier: ModelTier::Strong,
+            family: ModelFamily::Gpt,
+            vision: true,
+            default: true,
+            pricing: ModelPricing {
+                input: 5.00,
+                output: 30.00,
+                cache_write: 6.25,
+                cache_read: 0.50,
+                fast: None,
+            },
+            max_output_tokens: GPT_5_6_MAX_OUTPUT_TOKENS,
+            context_window: GPT_5_6_CONTEXT_WINDOW,
+        },
+        ModelEntry {
+            prefixes: &["gpt-5.4-nano"],
+            tier: ModelTier::Weak,
+            family: ModelFamily::Gpt,
+            vision: true,
+            default: false,
             pricing: ModelPricing {
                 input: 0.20,
                 output: 1.25,
@@ -89,7 +140,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             tier: ModelTier::Medium,
             family: ModelFamily::Gpt,
             vision: true,
-            default: true,
+            default: false,
             pricing: ModelPricing {
                 input: 2.00,
                 output: 8.00,
@@ -121,7 +172,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             tier: ModelTier::Strong,
             family: ModelFamily::Gpt,
             vision: true,
-            default: true,
+            default: false,
             pricing: ModelPricing {
                 input: 5.00,
                 output: 30.00,
@@ -245,4 +296,35 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             context_window: 400_000,
         },
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use test_case::test_case;
+
+    use super::*;
+
+    #[test_case("gpt-5.6-luna", ModelTier::Weak, 1.0, 0.1, 1.25, 6.0)]
+    #[test_case("gpt-5.6-terra", ModelTier::Medium, 2.5, 0.25, 3.125, 15.0)]
+    #[test_case("gpt-5.6-sol", ModelTier::Strong, 5.0, 0.5, 6.25, 30.0)]
+    fn gpt_5_6_models_have_expected_tier_and_short_context_pricing(
+        model_id: &str,
+        tier: ModelTier,
+        input: f64,
+        cache_read: f64,
+        cache_write: f64,
+        output: f64,
+    ) {
+        let model = models()
+            .iter()
+            .find(|model| model.prefixes.contains(&model_id))
+            .expect("GPT-5.6 model should be registered");
+
+        assert_eq!(model.tier, tier);
+        assert_eq!(model.context_window, GPT_5_6_CONTEXT_WINDOW);
+        assert_eq!(model.pricing.input, input);
+        assert_eq!(model.pricing.cache_read, cache_read);
+        assert_eq!(model.pricing.cache_write, cache_write);
+        assert_eq!(model.pricing.output, output);
+    }
 }
