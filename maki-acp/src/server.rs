@@ -19,6 +19,7 @@ use maki_agent::{AgentInput, AgentMode, Envelope, ImageMediaType, ImageSource};
 use maki_providers::Message;
 use maki_providers::model::Model;
 use maki_providers::provider::available_model_specs;
+use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
 use smol::io::AsyncBufReadExt;
@@ -27,6 +28,36 @@ use tracing::{debug, warn};
 use crate::{AcpParams, methods, permissions, translate};
 
 const FIRST_OUTGOING_REQUEST_ID: i64 = 1000;
+
+#[derive(Deserialize)]
+struct ForkRequest {
+    from_node_id: Option<String>,
+    new_session_id: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ForkResponse {
+    new_session_id: String,
+    parent_title: String,
+}
+
+#[derive(Deserialize)]
+struct RewindRequest {
+    to_node_id: String,
+}
+
+#[derive(Serialize)]
+struct RewindResponse {
+    new_leaf: String,
+}
+
+#[derive(Deserialize)]
+struct CompactRequest {}
+
+#[derive(Serialize)]
+struct CompactResponse {
+    dropped_count: usize,
+}
 
 type PendingPrompt = Arc<Mutex<Option<RequestId>>>;
 
@@ -150,6 +181,39 @@ fn handle_request(srv: &mut Server, method: &str, id: RequestId, raw: &Value, pa
         },
         "session/set_mode" => handle_set_mode(srv, raw),
         "session/set_config_option" => handle_set_config(srv, raw),
+        "session/fork" => match handle_fork(srv, raw) {
+            Ok(resp) => {
+                send_result(
+                    &srv.out_tx,
+                    id,
+                    serde_json::to_value(&resp).unwrap_or(Value::Null),
+                );
+                return;
+            }
+            Err(e) => Err(e),
+        },
+        "session/rewind" => match handle_rewind(srv, raw) {
+            Ok(resp) => {
+                send_result(
+                    &srv.out_tx,
+                    id,
+                    serde_json::to_value(&resp).unwrap_or(Value::Null),
+                );
+                return;
+            }
+            Err(e) => Err(e),
+        },
+        "session/compact" => match handle_compact(srv, raw) {
+            Ok(resp) => {
+                send_result(
+                    &srv.out_tx,
+                    id,
+                    serde_json::to_value(&resp).unwrap_or(Value::Null),
+                );
+                return;
+            }
+            Err(e) => Err(e),
+        },
         _ => Err(AcpError::method_not_found()),
     };
     srv.respond(id, result);
@@ -176,6 +240,8 @@ fn spawn_session(
         system_prompt_override: None,
         append_system_prompt: None,
         workflow: false,
+        provider_override: None,
+        state_dir: None,
     })
 }
 
@@ -205,6 +271,9 @@ fn load_history_from(
     storage: &maki_storage::StateDir,
     session_id: &str,
 ) -> Result<Vec<Message>, AcpError> {
+    if let Some(messages) = maki_agent::tree_sink::load_messages_from_tree(storage, session_id) {
+        return Ok(messages);
+    }
     let session: maki_storage::sessions::Session<
         Message,
         maki_providers::TokenUsage,
@@ -213,6 +282,63 @@ fn load_history_from(
         AcpError::resource_not_found(Some(format!("session/{session_id}"))).data(json_str(&e))
     })?;
     Ok(session.messages)
+}
+
+fn tree_sink(srv: &Server) -> Result<&Arc<maki_agent::tree_sink::TreeSink>, AcpError> {
+    srv.session
+        .as_ref()
+        .and_then(|s| s.handle.tree_sink.as_ref())
+        .ok_or_else(|| AcpError::internal_error().data(json_str("no tree sink")))
+}
+
+fn handle_fork(srv: &mut Server, raw: &Value) -> Result<ForkResponse, AcpError> {
+    let req: ForkRequest = parse_params(raw)?;
+    let sink = tree_sink(srv)?;
+    let from_node = req
+        .from_node_id
+        .as_deref()
+        .and_then(maki_storage::tree::NodeRef::parse)
+        .or_else(|| sink.leaf_position().node_ref().cloned())
+        .ok_or_else(|| {
+            AcpError::invalid_params().data(json_str("no from_node_id and no active leaf"))
+        })?;
+    let new_session_id = req
+        .new_session_id
+        .unwrap_or_else(maki_storage::new_session_id);
+    let result = sink
+        .fork(new_session_id, from_node)
+        .map_err(|e| AcpError::internal_error().data(json_str(&e)))?;
+    Ok(ForkResponse {
+        new_session_id: result.new_session_id,
+        parent_title: result.parent_title,
+    })
+}
+
+fn handle_rewind(srv: &mut Server, raw: &Value) -> Result<RewindResponse, AcpError> {
+    let req: RewindRequest = parse_params(raw)?;
+    let sink = tree_sink(srv)?;
+    let target_node = maki_storage::tree::NodeRef::parse(&req.to_node_id)
+        .ok_or_else(|| AcpError::invalid_params().data(json_str("invalid to_node_id")))?;
+    let target = maki_storage::tree::Position::At(target_node);
+    sink.rewind(target)
+        .map_err(|e| AcpError::internal_error().data(json_str(&e)))?;
+    let new_leaf = sink
+        .leaf_position()
+        .node_ref()
+        .map(|n| n.to_string())
+        .unwrap_or_default();
+    Ok(RewindResponse { new_leaf })
+}
+
+fn handle_compact(srv: &mut Server, raw: &Value) -> Result<CompactResponse, AcpError> {
+    let _: CompactRequest = parse_params(raw)?;
+    let sink = tree_sink(srv)?;
+    let dropped = sink
+        .compact(None)
+        .map_err(|e| AcpError::internal_error().data(json_str(&e)))?;
+    Ok(CompactResponse {
+        dropped_count: dropped,
+    })
 }
 
 fn handle_prompt(srv: &mut Server, raw: &Value, id: &RequestId) -> Result<(), AcpError> {
@@ -433,6 +559,10 @@ fn send(out_tx: &Sender<Value>, msg: impl Serialize) {
     }
 }
 
+fn send_result(out_tx: &Sender<Value>, id: RequestId, result: Value) {
+    send(out_tx, Response::<Value>::Result { id, result });
+}
+
 fn session_update(out_tx: &Sender<Value>, sid: &SessionId, update: SessionUpdate) {
     let notification =
         AgentNotification::SessionNotification(SessionNotification::new(sid.clone(), update));
@@ -454,7 +584,7 @@ fn parse_params<T: serde::de::DeserializeOwned>(raw: &Value) -> Result<T, AcpErr
         .map_err(|e| AcpError::invalid_params().data(json_str(&e)))
 }
 
-fn json_str(e: &impl std::fmt::Display) -> Value {
+fn json_str(e: impl std::fmt::Display) -> Value {
     Value::String(e.to_string())
 }
 

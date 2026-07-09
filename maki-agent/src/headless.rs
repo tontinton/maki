@@ -3,13 +3,10 @@ use std::sync::Arc;
 
 use async_lock::Mutex;
 use flume::Receiver;
-use maki_providers::Message;
-use maki_providers::Timeouts;
-use maki_providers::TokenUsage;
 use maki_providers::model::Model;
 use maki_providers::provider::{self, Provider};
+use maki_providers::{Message, Timeouts};
 use maki_storage::StateDir;
-use maki_storage::sessions::Session;
 use serde_json::Value;
 use tracing::{error, warn};
 
@@ -19,52 +16,11 @@ use crate::permissions::PermissionManager;
 use crate::prompt::ResolvedSlots;
 use crate::template;
 use crate::tools::{DescriptionContext, FileReadTracker, ToolAudience, ToolFilter, ToolRegistry};
+use crate::tree_sink::TreeSink;
 use crate::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, Envelope,
-    EventSender, ImageSource, McpHandle, PermissionsConfig, ToolOutput, ToolOutputLines,
+    EventSender, ImageSource, McpHandle, PermissionsConfig, ToolOutputLines,
 };
-
-type StoredSession = Session<Message, TokenUsage, ToolOutput>;
-
-struct SessionStore {
-    dir: StateDir,
-    session: StoredSession,
-}
-
-impl SessionStore {
-    fn open(session_id: &str, cwd: &str, model_spec: &str) -> Option<Self> {
-        let dir = StateDir::resolve()
-            .map_err(|e| warn!(error = %e, "state dir unavailable; session will not be persisted"))
-            .ok()?;
-        Some(Self::open_in(dir, session_id, cwd, model_spec))
-    }
-
-    fn open_in(dir: StateDir, session_id: &str, cwd: &str, model_spec: &str) -> Self {
-        match StoredSession::load(session_id, &dir) {
-            Ok(session) => Self { dir, session },
-            Err(_) => {
-                let mut session = StoredSession::new(model_spec, cwd);
-                session.id = session_id.to_owned();
-                let mut store = Self { dir, session };
-                store.save();
-                store
-            }
-        }
-    }
-
-    fn save(&mut self) {
-        if let Err(e) = self.session.save(&self.dir) {
-            warn!(error = %e, session_id = %self.session.id, "failed to persist session");
-        }
-    }
-
-    fn record_turn(&mut self, messages: &[Message], model_spec: String) {
-        self.session.messages = messages.to_vec();
-        self.session.model = model_spec;
-        self.session.update_title_if_default();
-        self.save();
-    }
-}
 
 pub struct HeadlessParams {
     pub model: Model,
@@ -79,6 +35,7 @@ pub struct HeadlessParams {
     pub initial_wd: PathBuf,
     pub fast: bool,
     pub workflow: bool,
+    pub provider_override: Option<Arc<dyn Provider>>,
 }
 
 pub struct HeadlessHandle {
@@ -183,8 +140,9 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
         async move {
             let event_tx = EventSender::new(raw_tx, 0);
             let mut model = params.model;
-            let provider: Arc<dyn Provider> =
-                match provider::from_model_async(&mut model, params.timeouts).await {
+            let provider: Arc<dyn Provider> = match params.provider_override {
+                Some(p) => p,
+                None => match provider::from_model_async(&mut model, params.timeouts).await {
                     Ok(p) => Arc::from(p),
                     Err(e) => {
                         error!(error = %e, "provider error");
@@ -193,7 +151,8 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
                         });
                         return;
                     }
-                };
+                },
+            };
             let error_tx = event_tx.clone();
             let mut history = History::new(Vec::new());
             let mut agent = Agent::new(
@@ -275,6 +234,8 @@ pub struct InteractiveParams {
     pub system_prompt_override: Option<String>,
     pub append_system_prompt: Option<String>,
     pub workflow: bool,
+    pub provider_override: Option<Arc<dyn Provider>>,
+    pub state_dir: Option<StateDir>,
 }
 
 pub struct InteractiveHandle {
@@ -286,10 +247,11 @@ pub struct InteractiveHandle {
     pub model_tx: flume::Sender<Model>,
     pub session_id: String,
     pub permissions: Arc<PermissionManager>,
+    pub tree_sink: Option<Arc<TreeSink>>,
     pub task: smol::Task<()>,
 }
 
-pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
+pub fn spawn_interactive(mut params: InteractiveParams) -> InteractiveHandle {
     let AgentSetup {
         vars,
         instructions,
@@ -326,13 +288,28 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
     let answer_rx = Arc::new(Mutex::new(answer_rx));
     let file_tracker = FileReadTracker::fresh();
 
+    let model_spec = params.model.spec();
+    let state_dir = match params.state_dir.clone() {
+        Some(d) => Some(d),
+        None => StateDir::resolve()
+            .map_err(|e| warn!(error = %e, "state dir unavailable; session will not be persisted"))
+            .ok(),
+    };
+    let sink = state_dir
+        .as_ref()
+        .and_then(|dir| TreeSink::open(dir, &session_id, &working_dir, &model_spec).map(Arc::new));
+
     let task = smol::spawn({
         let session_id = session_id.clone();
         let permissions = Arc::clone(&permissions);
+        let sink = sink.clone();
+        let provider_override = params.provider_override.take();
         async move {
             let mut model = params.model;
-            let mut provider: Arc<dyn Provider> =
-                match provider::from_model_async(&mut model, params.timeouts).await {
+            let has_provider_override = provider_override.is_some();
+            let mut provider: Arc<dyn Provider> = match provider_override {
+                Some(p) => p,
+                None => match provider::from_model_async(&mut model, params.timeouts).await {
                     Ok(p) => Arc::from(p),
                     Err(e) => {
                         error!(error = %e, "provider error");
@@ -341,9 +318,9 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                         });
                         return;
                     }
-                };
+                },
+            };
 
-            let mut store = SessionStore::open(&session_id, &working_dir, &model.spec());
             let mut history = History::restored(params.initial_history);
             let mut run_id: u64 = 0;
 
@@ -354,29 +331,31 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                 if let Some(mut new_model) = model_rx.try_iter().last()
                     && new_model.spec() != model.spec()
                 {
-                    match provider::from_model_async(&mut new_model, params.timeouts).await {
-                        Ok(p) => {
-                            provider = Arc::from(p);
-                            tools = tool_definitions(
-                                &vars,
-                                &new_model,
-                                &params.config,
-                                &params.excluded_tools,
-                                params.mcp_handle.as_ref(),
-                                params.workflow,
-                                ToolRegistry::native(),
-                            );
-                            model = new_model;
-                        }
-                        Err(e) => {
-                            error!(error = %e, "provider error");
-                            let _ = error_tx.send(AgentEvent::Error {
-                                message: e.user_message(),
-                            });
-                            run_id += 1;
-                            continue;
+                    if !has_provider_override {
+                        match provider::from_model_async(&mut new_model, params.timeouts).await {
+                            Ok(p) => {
+                                provider = Arc::from(p);
+                            }
+                            Err(e) => {
+                                error!(error = %e, "provider error");
+                                let _ = error_tx.send(AgentEvent::Error {
+                                    message: e.user_message(),
+                                });
+                                run_id += 1;
+                                continue;
+                            }
                         }
                     }
+                    tools = tool_definitions(
+                        &vars,
+                        &new_model,
+                        &params.config,
+                        &params.excluded_tools,
+                        params.mcp_handle.as_ref(),
+                        params.workflow,
+                        ToolRegistry::native(),
+                    );
+                    model = new_model;
                 }
 
                 let mut system = params.system_prompt_override.clone().unwrap_or_else(|| {
@@ -443,9 +422,11 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                     });
                 }
 
-                if let Some(store) = &mut store {
+                if let Some(sink) = &sink {
                     let ctx = history.active_branch();
-                    store.record_turn(&ctx, model.spec());
+                    let nodes = history.active_branch_nodes();
+                    let title = maki_storage::sessions::generate_title(&ctx);
+                    sink.record_turn(&nodes, &model.spec(), &working_dir, &title);
                 }
                 run_id += 1;
             }
@@ -465,6 +446,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
         model_tx,
         session_id,
         permissions,
+        tree_sink: sink,
         task,
     }
 }
@@ -482,70 +464,76 @@ fn extract_tool_names(tools: &Value) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use maki_storage::sessions::generate_title;
+    use maki_storage::paths::session_dir;
+    use maki_storage::session_log::{build_session_tree, load_folder};
     use tempfile::TempDir;
 
     use super::*;
+    use crate::tree_sink::fold_to_messages;
 
     const SESSION_ID: &str = "acp-test-session";
     const CWD: &str = "/project";
     const MODEL_SPEC: &str = "anthropic/claude-test";
+    const TITLE: &str = "";
 
-    fn store_in(tmp: &TempDir) -> SessionStore {
-        SessionStore::open_in(
-            StateDir::from_path(tmp.path().to_path_buf()),
+    fn sink_in(tmp: &TempDir) -> TreeSink {
+        TreeSink::open(
+            &StateDir::from_path(tmp.path().to_path_buf()),
             SESSION_ID,
             CWD,
             MODEL_SPEC,
         )
+        .expect("open sink")
     }
 
-    fn load(tmp: &TempDir) -> StoredSession {
-        StoredSession::load(SESSION_ID, &StateDir::from_path(tmp.path().to_path_buf())).unwrap()
-    }
-
-    #[test]
-    fn new_session_is_loadable_before_first_turn() {
-        let tmp = TempDir::new().unwrap();
-        store_in(&tmp);
-        let loaded = load(&tmp);
-        assert_eq!(loaded.id, SESSION_ID);
-        assert_eq!(loaded.cwd, CWD);
-        assert_eq!(loaded.model, MODEL_SPEC);
-        assert!(loaded.messages.is_empty());
+    fn load_messages(tmp: &TempDir) -> Vec<Message> {
+        let loaded =
+            load_folder(&session_dir(tmp.path(), SESSION_ID), SESSION_ID).expect("load folder");
+        let tree = build_session_tree(&loaded).expect("build tree");
+        fold_to_messages(&tree)
     }
 
     #[test]
-    fn record_turn_persists_messages_and_title() {
+    fn record_turn_persists_messages() {
         let tmp = TempDir::new().unwrap();
-        let mut store = store_in(&tmp);
+        let sink = sink_in(&tmp);
         let messages = vec![Message::user("fix the login bug".into())];
-        store.record_turn(&messages, MODEL_SPEC.into());
+        let history = History::new(messages.clone());
+        let nodes = history.active_branch_nodes();
+        sink.record_turn(&nodes, MODEL_SPEC, CWD, TITLE);
+        sink.barrier().expect("barrier ack");
 
-        let loaded = load(&tmp);
-        assert_eq!(loaded.messages.len(), 1);
-        assert_eq!(loaded.title, generate_title(&messages));
+        let loaded = load_messages(&tmp);
+        assert_eq!(loaded.len(), 1);
+        sink.shutdown();
     }
 
     #[test]
     fn reopening_resumes_existing_session() {
         let tmp = TempDir::new().unwrap();
-        let mut store = store_in(&tmp);
-        store.record_turn(&[Message::user("first prompt".into())], MODEL_SPEC.into());
-        drop(store);
-
-        let mut store = store_in(&tmp);
-        assert_eq!(store.session.messages.len(), 1);
+        let dir = StateDir::from_path(tmp.path().to_path_buf());
+        {
+            let sink = TreeSink::open(&dir, SESSION_ID, CWD, MODEL_SPEC).expect("open");
+            let history = History::new(vec![Message::user("first prompt".into())]);
+            let nodes = history.active_branch_nodes();
+            sink.record_turn(&nodes, MODEL_SPEC, CWD, TITLE);
+            sink.barrier().expect("ack");
+            sink.shutdown();
+        }
 
         let messages = vec![
             Message::user("first prompt".into()),
             Message::user("second prompt".into()),
         ];
-        store.record_turn(&messages, "other/model".into());
+        let history = History::new(messages);
+        let nodes = history.active_branch_nodes();
+        let sink = TreeSink::open(&dir, SESSION_ID, CWD, MODEL_SPEC).expect("reopen");
+        sink.record_turn(&nodes, "other/model", CWD, TITLE);
+        sink.barrier().expect("ack");
 
-        let loaded = load(&tmp);
-        assert_eq!(loaded.messages.len(), 2);
-        assert_eq!(loaded.model, "other/model");
+        let loaded = load_messages(&tmp);
+        assert_eq!(loaded.len(), 2, "resumed cursor appended only new");
+        sink.shutdown();
     }
 
     #[test]

@@ -140,6 +140,14 @@ impl History {
         (*ctx).clone()
     }
 
+    /// Fold the active branch into the on-path `MessageNode`s (§A.4 walk),
+    /// preserving node-level flags (`interrupted`, `run_id`, `hidden`) that
+    /// `active_branch()` drops when lowering to `Message`. Used by the
+    /// headless persistence path to durably append interrupted nodes.
+    pub fn active_branch_nodes(&self) -> Vec<MessageNode> {
+        fold_nodes(&self.tree)
+    }
+
     /// Enqueue a message node: parents onto the current leaf position and
     /// becomes the new leaf (§4). A `Message` whose `display_text` is the
     /// empty-string sentinel is a hidden chrome turn (§9) → stored `hidden`.
@@ -607,6 +615,55 @@ fn fold(tree: &SessionTree) -> ValidContext {
 
     repair(&mut out);
     ValidContext::new(out)
+}
+
+/// Like `fold` but returns the on-path `MessageNode`s with their node-level
+/// flags intact (`interrupted`, `run_id`, `hidden`). The headless persistence
+/// path uses this to durably append interrupted nodes without losing the flag.
+fn fold_nodes(tree: &SessionTree) -> Vec<MessageNode> {
+    let mut path: Vec<&TreeNode> = Vec::new();
+    let mut seen: HashSet<NodeRef> = HashSet::new();
+    let mut cur = tree.leaf.node_ref().cloned();
+    let mut stop_after: Option<MessageId> = None;
+    let mut hit_stop = false;
+
+    while let Some(nref) = cur {
+        if !seen.insert(nref.clone()) {
+            break;
+        }
+        let Some(node) = tree.nodes.get(&nref) else {
+            break;
+        };
+        if let TreeNode::Summary(summary) = node {
+            if stop_after.is_none()
+                && let SummaryKind::Compaction { fold_to_id } = &summary.kind
+            {
+                stop_after = Some(fold_to_id.clone());
+            }
+            cur = node.parent_id();
+            continue;
+        }
+        path.push(node);
+        if let Some(stop) = &stop_after
+            && let NodeRef::Msg(m) = &nref
+            && m == stop
+        {
+            hit_stop = true;
+            break;
+        }
+        cur = node.parent_id();
+    }
+
+    let _ = hit_stop;
+    path.reverse();
+
+    let mut out: Vec<MessageNode> = Vec::new();
+    for node in path {
+        if let TreeNode::Message(m) = node {
+            out.push(m.clone());
+        }
+    }
+    out
 }
 
 /// Lower a narrative to the provider's hidden-user-message convention (§9):

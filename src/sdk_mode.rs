@@ -486,6 +486,8 @@ pub fn run(params: SdkParams) -> Result<()> {
         system_prompt_override: cli.system_prompt.clone().filter(|s| !s.is_empty()),
         append_system_prompt: cli.append_system_prompt.clone().filter(|s| !s.is_empty()),
         workflow,
+        provider_override: None,
+        state_dir: None,
     });
 
     let (out_tx, out_rx) = flume::unbounded::<String>();
@@ -636,14 +638,25 @@ type StoredSession = Session<Message, TokenUsage, ToolOutput>;
 fn resolve_session(cli: &Cli, cwd: &str) -> Result<(Option<String>, Vec<Message>)> {
     let (resumed_id, history) = if let Some(id) = &cli.session {
         let storage = StateDir::resolve().context("resolve state dir")?;
-        let session =
-            StoredSession::load(id, &storage).map_err(|e| eyre!("load session {id}: {e}"))?;
-        let resumed = (!cli.fork_session).then_some(session.id);
-        (resumed, session.messages)
+        let messages = maki_agent::tree_sink::load_messages_from_tree(&storage, id)
+            .or_else(|| {
+                StoredSession::load(id, &storage)
+                    .map_err(|e| eyre!("load session {id}: {e}"))
+                    .ok()
+                    .map(|s| s.messages)
+            })
+            .ok_or_else(|| eyre!("session {id} not found"))?;
+        let resumed = (!cli.fork_session).then_some(id.clone());
+        (resumed, messages)
     } else if cli.continue_session {
         let storage = StateDir::resolve().context("resolve state dir")?;
         match StoredSession::latest(cwd, &storage) {
-            Ok(Some(session)) => (Some(session.id), session.messages),
+            Ok(Some(session)) => {
+                let id = session.id.clone();
+                let messages = maki_agent::tree_sink::load_messages_from_tree(&storage, &id)
+                    .unwrap_or(session.messages);
+                (Some(id), messages)
+            }
             _ => (None, Vec::new()),
         }
     } else {

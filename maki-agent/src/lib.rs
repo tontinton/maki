@@ -7,6 +7,7 @@ pub mod snapshots;
 pub use child_guard::ChildGuard;
 pub mod headless;
 pub mod mcp;
+pub mod tree_sink;
 pub use mcp::config::{McpConfigError, McpConfigErrors, McpServerInfo, McpServerStatus};
 pub use mcp::protocol::PromptRole;
 pub use mcp::{McpCommand, McpHandle, McpPromptArg, McpPromptInfo, McpSnapshot, McpSnapshotReader};

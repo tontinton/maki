@@ -181,6 +181,7 @@ pub fn run(
         initial_wd: cwd,
         fast,
         workflow,
+        provider_override: None,
     });
 
     let HeadlessHandle {
