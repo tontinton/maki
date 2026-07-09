@@ -3,10 +3,16 @@ use std::sync::atomic::AtomicBool;
 
 use crate::chat::{Chat, DONE_TEXT, history_to_display};
 use crate::components::DisplayRole;
-use crate::components::rewind_picker::RewindEntry;
+use crate::components::tree_selector::{
+    NO_TURNS_MSG, TreeSelectorOutcome, landing_target_before, last_user_prompt_text,
+    undo_target_for_tree,
+};
 use crate::components::{Action, LoadedSession};
 use maki_providers::{Model, TokenUsage};
+use maki_storage::paths::session_dir;
+use maki_storage::session_log::load_folder;
 use maki_storage::sessions::StoredSubagent;
+use serde_json::value::RawValue;
 
 use crate::AppSession;
 
@@ -168,28 +174,99 @@ impl App {
         vec![Action::NewSession]
     }
 
-    pub(super) fn open_rewind_picker(&mut self) -> Vec<Action> {
+    /// Open the tree selector (C3, §11). Barriers first so the on-disk log
+    /// reflects every prior push, then reloads the tree and builds the view.
+    pub(super) fn open_tree_selector(&mut self) -> Vec<Action> {
         self.save_session();
-        match self.rewind_picker.open(&self.state.session.messages) {
-            Ok(()) => vec![],
-            Err(msg) => {
-                self.status_bar.flash(msg);
-                vec![]
+        if let Err(e) = self.storage_writer.barrier() {
+            tracing::warn!(error = %e, "barrier before tree selector failed");
+        }
+        self.state.refresh_tree(&self.storage);
+        let Some(tree) = &self.state.tree else {
+            self.status_bar.flash(NO_TURNS_MSG.into());
+            return vec![];
+        };
+        if tree.nodes.is_empty() {
+            self.status_bar.flash(NO_TURNS_MSG.into());
+            return vec![];
+        }
+        let dir = session_dir(self.storage.path(), &self.state.session.id);
+        match load_folder(&dir, &self.state.session.id) {
+            Ok(loaded) => {
+                if let Err(msg) = self.tree_selector.open(&loaded) {
+                    self.status_bar.flash(msg);
+                }
+            }
+            Err(e) => {
+                self.status_bar
+                    .flash(format!("Failed to load session tree: {e}"));
             }
         }
+        vec![]
     }
 
-    pub(super) fn rewind_to(&mut self, entry: RewindEntry) -> Vec<Action> {
+    /// Commit a rewind per the §4 landing rule. Rewinds are appends
+    /// (`TreeMutation::Rewind` writes a `Leaf`); nothing is deleted — the
+    /// abandoned branch is preserved on disk (decision 1). After the barrier,
+    /// the chat scrollback is rebuilt from the folded active branch and the
+    /// tree is refreshed so the next push parents onto the new leaf.
+    pub(super) fn rewind_to(&mut self, outcome: TreeSelectorOutcome) -> Vec<Action> {
+        if self.status != super::Status::Idle {
+            return vec![];
+        }
+        let tree = self.state.tree.clone();
+
+        if let TreeSelectorOutcome::RewindBoundary { parent, blocks } = &outcome {
+            let content_raw: Vec<Box<RawValue>> = blocks
+                .iter()
+                .filter_map(|b| serde_json::value::to_raw_value(b).ok())
+                .collect();
+            self.run_id += 1;
+            if let Err(e) = self
+                .storage_writer
+                .rewind_to_interrupted_sibling(parent.clone(), content_raw)
+            {
+                self.status_bar.flash(format!("Rewind failed: {e}"));
+                return vec![];
+            }
+            self.rebuild_after_rewind();
+            self.state.session.update_title_if_default();
+            self.enqueue_save();
+            return vec![Action::LoadSession(Box::new(
+                self.loaded_session_snapshot(),
+            ))];
+        }
+
+        let Some(tree) = tree else {
+            return vec![];
+        };
+        let target = match &outcome {
+            TreeSelectorOutcome::RewindBefore { prompt_text } => {
+                landing_target_before(&tree, prompt_text)
+            }
+            TreeSelectorOutcome::RewindOn => tree.leaf.clone(),
+            TreeSelectorOutcome::RewindBoundary { .. } => unreachable!(),
+        };
+
         self.run_id += 1;
+        match self.storage_writer.rewind(target.clone()) {
+            Ok(_) => {}
+            Err(e) => {
+                self.status_bar.flash(format!("Rewind failed: {e}"));
+                return vec![];
+            }
+        }
 
-        // Non-destructive rewind (§4, §8): the abandoned branch is preserved.
-        // The tree selector + leaf-based display restore is C3; until then this
-        // only restores the input and saves — messages are NOT truncated.
-        self.reset_ui_chrome();
-        self.restore_display();
+        let prefill = match &outcome {
+            TreeSelectorOutcome::RewindBefore { prompt_text } => Some(prompt_text.clone()),
+            _ => None,
+        };
 
-        self.input_box.set_input(entry.prompt_text);
-        self.input_box.buffer.move_to_end();
+        self.rebuild_after_rewind();
+        if let Some(text) = prefill {
+            self.input_box.set_input(text);
+            self.input_box.buffer.move_to_end();
+        }
 
         self.state.session.update_title_if_default();
         self.enqueue_save();
@@ -197,6 +274,67 @@ impl App {
         vec![Action::LoadSession(Box::new(
             self.loaded_session_snapshot(),
         ))]
+    }
+
+    /// Fast path (§11): single-Esc-then-Enter. Lands before the last user
+    /// prompt on the active branch (same as selecting it in the tree
+    /// selector). No-op if there is no user prompt to rewind to.
+    pub(super) fn rewind_to_last_user_message(&mut self) -> Vec<Action> {
+        if self.status != super::Status::Idle {
+            return vec![];
+        }
+        self.state.refresh_tree(&self.storage);
+        let Some(tree) = self.state.tree.clone() else {
+            self.status_bar.flash(NO_TURNS_MSG.into());
+            return vec![];
+        };
+        let Some(prompt_text) = last_user_prompt_text(&tree) else {
+            self.status_bar.flash(NO_TURNS_MSG.into());
+            return vec![];
+        };
+        self.rewind_to(TreeSelectorOutcome::RewindBefore { prompt_text })
+    }
+
+    /// Undo-of-rewind (§4): `position_before_last_leaf`, offered only while the
+    /// most recent record is itself a `Leaf`. Commits by appending another
+    /// `Leaf` (undo is a rewind to the pre-tip position).
+    pub(super) fn undo_rewind(&mut self) -> Vec<Action> {
+        if self.status != super::Status::Idle {
+            return vec![];
+        }
+        self.state.refresh_tree(&self.storage);
+        let Some(target) = self.state.tree.as_ref().and_then(undo_target_for_tree) else {
+            self.status_bar.flash("Nothing to undo".into());
+            return vec![];
+        };
+
+        self.run_id += 1;
+        if let Err(e) = self.storage_writer.rewind(target) {
+            self.status_bar.flash(format!("Undo failed: {e}"));
+            return vec![];
+        }
+        self.rebuild_after_rewind();
+        self.enqueue_save();
+        vec![Action::LoadSession(Box::new(
+            self.loaded_session_snapshot(),
+        ))]
+    }
+
+    /// Rebuild chat + tree from the post-rewind active branch. The folded
+    /// `ValidContext` is the active branch (§2); `messages` becomes it so the
+    /// chat renders the post-rewind conversation. Non-destructive: the on-disk
+    /// abandoned branch is untouched (decision 1).
+    fn rebuild_after_rewind(&mut self) {
+        self.state.refresh_tree(&self.storage);
+        if let Some(tree) = &self.state.tree {
+            let ctx = maki_agent::History::fold_tree(tree);
+            self.state.session.messages = ctx.to_vec();
+            self.storage_writer
+                .reset_msg_cursor(self.state.session.messages.len());
+        }
+        self.reset_ui_chrome();
+        self.restore_display();
+        self.shared_history = None;
     }
 
     pub(super) fn open_session_picker(&mut self) -> Vec<Action> {

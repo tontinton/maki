@@ -17,7 +17,6 @@ pub(crate) mod permission_prompt;
 pub(crate) mod plan_form;
 pub mod queue_panel;
 pub(crate) mod render_hints;
-pub(crate) mod rewind_picker;
 pub(crate) mod scrollbar;
 pub(crate) mod search_modal;
 pub(crate) mod session_picker;
@@ -26,6 +25,7 @@ pub mod status_bar;
 pub(crate) mod streaming_content;
 pub(crate) mod theme_picker;
 pub(crate) mod tool_display;
+pub(crate) mod tree_selector;
 pub(crate) mod usage_modal;
 
 use std::collections::HashMap;

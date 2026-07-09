@@ -255,7 +255,7 @@ impl App {
             };
         }
 
-        render_if_open!(self.rewind_picker);
+        render_if_open!(self.tree_selector);
         render_if_open!(self.theme_picker);
         render_if_open!(self.model_picker);
         render_if_open!(self.login_picker);
@@ -441,8 +441,8 @@ impl App {
             contexts.push(KeybindContext::QueueFocus);
         } else if self.session_picker.is_open() {
             contexts.push(KeybindContext::SessionPicker);
-        } else if self.rewind_picker.is_open() {
-            contexts.push(KeybindContext::RewindPicker);
+        } else if self.tree_selector.is_open() {
+            contexts.push(KeybindContext::TreeSelector);
         } else if self.task_picker.is_open() {
             contexts.push(KeybindContext::TaskPicker);
         } else if self.theme_picker.is_open() {

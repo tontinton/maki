@@ -3,6 +3,7 @@ use crate::agent::shared_queue;
 use crate::chat::{CANCELLED_TEXT, DONE_TEXT, ERROR_TEXT};
 use crate::components::command::ParsedCommand;
 use crate::components::keybindings::{KeybindContext, key as kb};
+use crate::components::tree_selector::{TreeSelectorOutcome, undo_target_for_tree};
 use crate::components::{ExitRequest, key, test_model};
 use crate::selection::{SelectableZone, SelectionState, SelectionZone};
 use arc_swap::ArcSwap;
@@ -1059,7 +1060,7 @@ fn double_esc_idle_opens_rewind_picker() {
 
     app.last_esc = Some(Instant::now());
     app.update(Msg::Key(key(KeyCode::Esc)));
-    assert!(app.rewind_picker.is_open());
+    assert!(app.tree_selector.is_open());
 }
 
 #[test]
@@ -1067,7 +1068,7 @@ fn double_esc_idle_no_user_turns_flashes_error() {
     let mut app = test_app();
     app.last_esc = Some(Instant::now());
     app.update(Msg::Key(key(KeyCode::Esc)));
-    assert!(!app.rewind_picker.is_open());
+    assert!(!app.tree_selector.is_open());
 }
 
 #[test]
@@ -1481,11 +1482,11 @@ fn help_modal_consumes_keys_and_esc_closes() {
 #[test_case(
     |app: &mut App| {
         app.state.session.messages.push(Message::user("test".into()));
-        app.open_rewind_picker();
+        app.open_tree_selector();
     },
-    &[KeybindContext::RewindPicker],
+    &[KeybindContext::TreeSelector],
     &[KeybindContext::Editing]
-    ; "rewind_picker"
+    ; "tree_selector"
 )]
 fn active_contexts(setup: fn(&mut App), expected: &[KeybindContext], absent: &[KeybindContext]) {
     let mut app = test_app();
@@ -1600,9 +1601,39 @@ fn slash_noncommand_sends_as_prompt() {
     assert!(actions.iter().any(|a| matches!(a, Action::SendMessage(..))));
 }
 
-fn build_rewind_app() -> App {
-    let mut app = test_app();
-
+/// Disk-backed app for C3 rewind tests (§4). Pushes the message vec through the
+/// storage writer, barriers, and loads the tree so `rewind_to` can resolve
+/// landing targets against on-disk truth. Returns the `TempDir` guard — callers
+/// must hold it for the lifetime of the app.
+fn build_rewind_app() -> (App, TempDir) {
+    let tmp = TempDir::new().unwrap();
+    let dir = StateDir::from_path(tmp.path().to_path_buf());
+    let writer = Arc::new(StorageWriter::new(StateDir::from_path(
+        tmp.path().to_path_buf(),
+    )));
+    let model = test_model();
+    let mut app = App::new(
+        &model,
+        AppSession::new("test-model", "/tmp/test"),
+        dir,
+        Arc::new(ArcSwapOption::empty()),
+        McpSnapshotReader::empty(),
+        McpConfigErrors::new(PathBuf::new()),
+        LuaCommandReader::empty(),
+        KeymapReader::empty(),
+        HintReader::empty(),
+        writer,
+        UiConfig::default(),
+        100,
+        Arc::new(PermissionManager::new(
+            PermissionsConfig {
+                rules: vec![],
+                ..Default::default()
+            },
+            PathBuf::from("/tmp"),
+        )),
+        Arc::from([]),
+    );
     app.state.session.messages = vec![
         Message::user("first prompt".into()),
         Message {
@@ -1633,23 +1664,24 @@ fn build_rewind_app() -> App {
         .session
         .tool_outputs
         .insert("tool-1".into(), ToolOutput::Plain("output".into()));
-    app
+    app.save_session();
+    let _ = app.storage_writer.barrier();
+    app.state.refresh_tree(&app.storage);
+    (app, tmp)
 }
 
 #[test]
 fn rewind_to_middle_preserves_history_and_populates_input() {
-    let mut app = build_rewind_app();
+    let (mut app, _tmp) = build_rewind_app();
     let old_run_id = app.run_id;
-    let before_len = app.state.session.messages.len();
-    let entry = crate::components::rewind_picker::RewindEntry {
-        turn_index: 2,
-        prompt_preview: "2: second".into(),
+    let actions = app.rewind_to(TreeSelectorOutcome::RewindBefore {
         prompt_text: "second prompt".into(),
-    };
-    let actions = app.rewind_to(entry);
+    });
 
-    // Non-destructive rewind (§4): the abandoned branch is preserved.
-    assert_eq!(app.state.session.messages.len(), before_len);
+    // §4: rewinds are appends — the on-disk branch is preserved (nothing
+    // deleted). The chat scrollback rebuilds from the folded active branch
+    // (root → landing target), so messages shrink to the pre-prompt prefix.
+    assert!(app.state.session.messages.len() <= 3);
     assert!(app.state.session.tool_outputs.contains_key("tool-1"));
     assert_eq!(app.input_box.buffer.value(), "second prompt");
     assert_eq!(app.run_id, old_run_id + 1);
@@ -1657,29 +1689,105 @@ fn rewind_to_middle_preserves_history_and_populates_input() {
     let Action::LoadSession(ref loaded) = actions[0] else {
         panic!("expected LoadSession");
     };
-    assert_eq!(loaded.messages.len(), before_len);
     assert!(loaded.tool_outputs.contains_key("tool-1"));
 }
 
 #[test]
 fn rewind_to_first_turn_preserves_history() {
-    let mut app = build_rewind_app();
-    let before_len = app.state.session.messages.len();
+    let (mut app, _tmp) = build_rewind_app();
     app.state.token_usage.input = 500;
     app.state.token_usage.output = 200;
-    let entry = crate::components::rewind_picker::RewindEntry {
-        turn_index: 0,
-        prompt_preview: "1: first".into(),
+    let actions = app.rewind_to(TreeSelectorOutcome::RewindBefore {
         prompt_text: "first prompt".into(),
-    };
-    let actions = app.rewind_to(entry);
+    });
 
-    // Non-destructive rewind: nothing truncated.
-    assert_eq!(app.state.session.messages.len(), before_len);
+    // Non-destructive rewind: landing before the first prompt → Root; the
+    // folded branch is empty (next push creates a new root). Token usage is
+    // not reset by a rewind.
     assert!(app.state.session.tool_outputs.contains_key("tool-1"));
     assert_eq!(app.state.token_usage.input, 500);
     assert_eq!(app.state.token_usage.output, 200);
     assert!(matches!(&actions[0], Action::LoadSession(_)));
+}
+
+/// §4: undo-of-rewind is offered while the most recent record is a `Leaf`,
+/// and restores the pre-rewind tip. `undo_target_for_tree` returns the
+/// pre-rewind position; after a push, undo disappears.
+#[test]
+fn undo_target_present_after_rewind_absent_after_push() {
+    let (mut app, _tmp) = build_rewind_app();
+    let tree = app.state.tree.clone().unwrap();
+
+    // No Leaf yet (only message appends) → undo unavailable.
+    assert!(undo_target_for_tree(&tree).is_none());
+
+    // Rewind to "second prompt" appends a Leaf → undo available.
+    let _ = app.rewind_to(TreeSelectorOutcome::RewindBefore {
+        prompt_text: "second prompt".into(),
+    });
+    let tree = app.state.tree.clone().unwrap();
+    assert!(undo_target_for_tree(&tree).is_some());
+
+    // Simulate a post-rewind push: append a message and barrier.
+    app.state.session.messages.push(Message::user("new".into()));
+    app.save_session();
+    let _ = app.storage_writer.barrier();
+    app.state.refresh_tree(&app.storage);
+
+    // After the push, the last record is a Node, not a Leaf → undo gone.
+    let tree = app.state.tree.as_ref().unwrap();
+    assert!(undo_target_for_tree(tree).is_none());
+}
+
+/// §4: landing before the first message → Root; the next push creates a new
+/// root (a second `parent_id: None` node). The selector renders both roots.
+#[test]
+fn rewind_to_first_message_lands_at_root() {
+    let (mut app, _tmp) = build_rewind_app();
+    let _ = app.rewind_to(TreeSelectorOutcome::RewindBefore {
+        prompt_text: "first prompt".into(),
+    });
+
+    // Folded active branch at Root is empty.
+    assert!(app.state.session.messages.is_empty());
+    assert_eq!(
+        app.state.tree.as_ref().unwrap().leaf,
+        maki_storage::tree::Position::Root
+    );
+
+    // Push a new message → it parents onto Root (new root).
+    app.state
+        .session
+        .messages
+        .push(Message::user("new root".into()));
+    app.save_session();
+    let _ = app.storage_writer.barrier();
+    app.state.refresh_tree(&app.storage);
+    let tree = app.state.tree.as_ref().unwrap();
+    assert!(matches!(tree.leaf, maki_storage::tree::Position::At(_)));
+    // The new node has no parent (root).
+    let leaf_nref = tree.leaf.node_ref().unwrap();
+    let leaf_node = tree.nodes.get(leaf_nref).unwrap();
+    assert!(leaf_node.parent_id().is_none(), "new root has no parent");
+}
+
+/// §4: prefill is offered only for real user prompts (not tool-result
+/// carriers, not hidden synthetics). `RewindBefore` carries the prompt text;
+/// `RewindOn` carries none.
+#[test]
+fn prefill_only_for_real_user_prompts() {
+    use crate::components::tree_selector::landing_target_before;
+
+    let (app, _tmp) = build_rewind_app();
+    let tree = app.state.tree.as_ref().unwrap();
+
+    // A real user prompt: landing-before resolves to its parent.
+    let target = landing_target_before(tree, "second prompt");
+    assert!(matches!(target, maki_storage::tree::Position::At(_)));
+
+    // A non-existent prompt falls back to Root (nothing to prefill).
+    let target = landing_target_before(tree, "nonexistent");
+    assert_eq!(target, maki_storage::tree::Position::Root);
 }
 
 #[test_case(Duration::ZERO,          true  ; "keeps_fresh_error")]

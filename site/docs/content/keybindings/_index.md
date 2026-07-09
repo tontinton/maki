@@ -90,4 +90,4 @@ Some pickers add extra bindings on top of the defaults:
 
 Child contexts inherit their parent's bindings and add their own.
 
-- **Pickers** is the base for: Task Picker, Session Picker, Rewind Picker, Theme Picker, Model Picker, Queue, Commands, Search, File Picker
+- **Pickers** is the base for: Task Picker, Session Picker, Tree Selector, Theme Picker, Model Picker, Queue, Commands, Search, File Picker

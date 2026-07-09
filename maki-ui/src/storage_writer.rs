@@ -15,7 +15,7 @@ use maki_storage::StateDir;
 use maki_storage::session_log::{OpenResult, TreeWriter, active_leaf};
 use maki_storage::sessions::SESSIONS_DIR;
 use maki_storage::tree::{
-    MessageId, MessageNode, MetaRecord, NodeRef, Position, ToolUseId, TreeEvent, TreeMutation,
+    MessageId, MessageNode, MetaRecord, NodeRef, Position, Role, ToolUseId, TreeEvent, TreeMutation,
 };
 use serde_json::value::RawValue;
 use tracing::warn;
@@ -61,6 +61,15 @@ pub struct StorageWriter {
     dir: StateDir,
     handle: Mutex<Option<SessionHandle>>,
     state: Mutex<WriterState>,
+}
+
+/// Failures from a C3 rewind/landing commit.
+#[derive(Debug, thiserror::Error)]
+pub enum RewindError {
+    #[error("session is read-only; cannot rewind")]
+    Readonly,
+    #[error("no writer for this session")]
+    NoWriter,
 }
 
 impl StorageWriter {
@@ -128,6 +137,125 @@ impl StorageWriter {
             .as_ref()
             .map(|h| h.events.clone())
             .unwrap_or_else(|| flume::unbounded().1)
+    }
+
+    /// Open session id for the active writer, if any.
+    pub fn session_id(&self) -> Option<String> {
+        let state = self.state.lock().unwrap();
+        (!state.session_id.is_empty()).then(|| state.session_id.clone())
+    }
+
+    /// The state-dir base the writer opens session folders under.
+    pub fn dir(&self) -> &StateDir {
+        &self.dir
+    }
+
+    /// Reset the cursor to match a rebuilt messages vec after a rewind. The
+    /// folded active branch is already on disk (the rewind committed it); the
+    /// cursor must not re-append it. `last_leaf` is preserved — it was set by
+    /// `rewind`/`rewind_to_interrupted_sibling` and is where the next push
+    /// parents onto.
+    pub fn reset_msg_cursor(&self, msg_count: usize) {
+        let mut state = self.state.lock().unwrap();
+        state.cursor.saved_msg_count = msg_count;
+    }
+
+    /// Enqueue a `TreeMutation::Rewind { target }` (§4: appends a `Leaf`),
+    /// then a `Barrier` and block for the ack. Rewinds are appends — nothing is
+    /// deleted; the abandoned branch is preserved on disk. The cursor's
+    /// `last_leaf` advances to `target` so the next `send` parents onto it.
+    /// Returns `Err` if the writer is readonly or the barrier fails.
+    pub fn rewind(&self, target: Position) -> Result<Position, RewindError> {
+        let prev = {
+            let mut state = self.state.lock().unwrap();
+            if state.readonly {
+                return Err(RewindError::Readonly);
+            }
+            let prev = state.cursor.last_leaf.clone();
+            state.cursor.last_leaf = target.clone();
+            prev
+        };
+
+        let guard = self.handle.lock().unwrap();
+        let Some(handle) = guard.as_ref() else {
+            return Err(RewindError::NoWriter);
+        };
+        if handle.tx.send(TreeMutation::Rewind { target }).is_err() {
+            return Err(RewindError::NoWriter);
+        }
+        drop(guard);
+
+        let (ack_tx, ack_rx) = flume::bounded::<()>(1);
+        {
+            let guard = self.handle.lock().unwrap();
+            let Some(handle) = guard.as_ref() else {
+                return Err(RewindError::NoWriter);
+            };
+            if handle.tx.send(TreeMutation::Barrier(ack_tx)).is_err() {
+                return Err(RewindError::NoWriter);
+            }
+        }
+        ack_rx.recv().map_err(|_| RewindError::NoWriter)?;
+        Ok(prev)
+    }
+
+    /// Enqueue an `interrupted` assistant sibling node (§4 block-boundary
+    /// landing): a new `MessageNode` with `parent_id = parent` and `interrupted:
+    /// true`, then `Rewind` onto it. `content` must already be the output of
+    /// `FinalizedPartial::from_completed_blocks`. Returns the new node's id.
+    pub fn rewind_to_interrupted_sibling(
+        &self,
+        parent: Option<NodeRef>,
+        content_raw: Vec<Box<RawValue>>,
+    ) -> Result<MessageId, RewindError> {
+        let id = MessageId::new();
+        let node = MessageNode {
+            id: id.clone(),
+            parent_id: parent.clone(),
+            role: Role::Assistant,
+            content: content_raw,
+            timestamp: maki_storage::now_epoch(),
+            run_id: None,
+            interrupted: true,
+            hidden: false,
+        };
+        let target = Position::At(NodeRef::Msg(id.clone()));
+
+        {
+            let mut state = self.state.lock().unwrap();
+            if state.readonly {
+                return Err(RewindError::Readonly);
+            }
+            // The derived node is durably appended directly (not via a future
+            // `send`), so it must not also be re-derived from the messages vec.
+            state.cursor.saved_msg_count = state.cursor.saved_msg_count.saturating_add(1);
+            state.cursor.last_leaf = target.clone();
+        }
+
+        let guard = self.handle.lock().unwrap();
+        let Some(handle) = guard.as_ref() else {
+            return Err(RewindError::NoWriter);
+        };
+        if handle.tx.send(TreeMutation::AppendMessage(node)).is_err() {
+            return Err(RewindError::NoWriter);
+        }
+        if handle.tx.send(TreeMutation::Rewind { target }).is_err() {
+            return Err(RewindError::NoWriter);
+        }
+        drop(guard);
+
+        let (ack_tx, ack_rx) = flume::bounded::<()>(1);
+        {
+            let guard = self.handle.lock().unwrap();
+            let Some(handle) = guard.as_ref() else {
+                return Err(RewindError::NoWriter);
+            };
+            if handle.tx.send(TreeMutation::Barrier(ack_tx)).is_err() {
+                return Err(RewindError::NoWriter);
+            }
+        }
+        ack_rx.recv().map_err(|_| RewindError::NoWriter)?;
+        Ok(id)
     }
 
     pub fn shutdown(self, timeout: Duration) {

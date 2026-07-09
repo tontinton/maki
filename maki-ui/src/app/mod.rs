@@ -37,13 +37,13 @@ use crate::components::mcp_picker::{McpPicker, McpPickerAction};
 use crate::components::model_picker::{ModelPicker, ModelPickerAction};
 use crate::components::permission_prompt::PermissionPrompt;
 use crate::components::plan_form::{PlanForm, PlanFormAction};
-use crate::components::rewind_picker::{RewindPicker, RewindPickerAction};
 use crate::components::scrollbar;
 use crate::components::search_modal::{SearchAction, SearchModal};
 use crate::components::session_picker::{SessionPicker, SessionPickerAction};
 use crate::components::status_bar::StatusBar;
 use crate::components::theme_picker::{ThemePicker, ThemePickerAction};
 use crate::components::tool_display::format_turn_usage;
+use crate::components::tree_selector::{TreeSelector, TreeSelectorAction};
 use crate::components::usage_modal::{UsageFetchState, UsageModal};
 use crate::components::{
     Action, DisplayMessage, DisplayRole, ExitRequest, Overlay, Renders, RetryInfo, Status, is_ctrl,
@@ -141,7 +141,7 @@ pub struct App {
     pub(super) login_picker: LoginPicker,
     pub(super) mcp_picker: McpPicker,
     pub(super) session_picker: SessionPicker,
-    pub(super) rewind_picker: RewindPicker,
+    pub(super) tree_selector: TreeSelector,
     pub(super) help_modal: HelpModal,
     pub(super) usage_modal: UsageModal,
     pub(super) btw_modal: BtwModal,
@@ -222,7 +222,7 @@ impl App {
             login_picker: LoginPicker::new(),
             mcp_picker: McpPicker::new(mcp_reader, mcp_config_errors),
             session_picker: SessionPicker::new(),
-            rewind_picker: RewindPicker::new(),
+            tree_selector: TreeSelector::new(),
             help_modal: HelpModal::new(),
             usage_modal: UsageModal::new(),
             btw_modal: BtwModal::new(ui_config.typewriter_ms_per_char),
@@ -397,7 +397,7 @@ impl App {
             };
         }
         try_picker!(self.session_picker);
-        try_picker!(self.rewind_picker);
+        try_picker!(self.tree_selector);
         try_picker!(self.task_picker);
         try_picker!(self.model_picker);
         try_picker!(self.file_picker);
@@ -622,11 +622,12 @@ impl App {
             });
         }
 
-        if self.rewind_picker.is_open() {
-            return Some(match self.rewind_picker.handle_key(key) {
-                RewindPickerAction::Consumed => vec![],
-                RewindPickerAction::Select(entry) => self.rewind_to(entry),
-                RewindPickerAction::Close => vec![],
+        if self.tree_selector.is_open() {
+            return Some(match self.tree_selector.handle_key(key) {
+                TreeSelectorAction::Consumed => vec![],
+                TreeSelectorAction::Select(outcome) => self.rewind_to(outcome),
+                TreeSelectorAction::Undo => self.undo_rewind(),
+                TreeSelectorAction::Close => vec![],
             });
         }
 
@@ -781,6 +782,12 @@ impl App {
 
         let streaming = self.status == Status::Streaming;
         match self.input_box.handle_key(key) {
+            // Fast path (§11): single-Esc-then-Enter rewinds to the last user
+            // message. Double-Esc opens the full selector.
+            InputAction::Submit(sub) if !streaming && self.last_esc.take().is_some() => {
+                let _ = sub;
+                self.rewind_to_last_user_message()
+            }
             InputAction::Submit(sub) => self.handle_submit(sub),
             InputAction::PaletteSync(val) => {
                 self.command_palette.sync(&val);
@@ -805,9 +812,12 @@ impl App {
                             && t.elapsed() < self.status_bar.flash_duration
                         {
                             if streaming {
+                                // C6 hook: interrupt-finalize will replace
+                                // `handle_cancel` with §A.6 finalize + append
+                                // `interrupted: true` node (§8). Left as-is.
                                 self.handle_cancel()
                             } else {
-                                self.open_rewind_picker()
+                                self.open_tree_selector()
                             }
                         } else {
                             self.last_esc = Some(Instant::now());
@@ -1405,7 +1415,7 @@ impl App {
             &self.file_picker,
             &self.task_picker,
             &self.session_picker,
-            &self.rewind_picker,
+            &self.tree_selector,
             &self.theme_picker,
             &self.model_picker,
             &self.login_picker,
@@ -1424,7 +1434,7 @@ impl App {
             &mut self.file_picker,
             &mut self.task_picker,
             &mut self.session_picker,
-            &mut self.rewind_picker,
+            &mut self.tree_selector,
             &mut self.theme_picker,
             &mut self.model_picker,
             &mut self.login_picker,
@@ -1500,7 +1510,7 @@ impl App {
         try_picker!(self.file_picker);
         try_picker!(self.task_picker);
         try_picker!(self.session_picker);
-        try_picker!(self.rewind_picker);
+        try_picker!(self.tree_selector);
         try_picker!(self.theme_picker);
         try_picker!(self.model_picker);
         try_picker!(self.mcp_picker);

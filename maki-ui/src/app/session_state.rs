@@ -8,7 +8,10 @@ use maki_agent::permissions::PermissionManager;
 use maki_config::Effect;
 use maki_providers::{Model, ThinkingConfig, TokenUsage};
 use maki_storage::StateDir;
+use maki_storage::paths::session_dir;
+use maki_storage::session_log::{build_session_tree, load_folder};
 use maki_storage::sessions::{StoredEffect, StoredMode, StoredRule};
+use maki_storage::tree::SessionTree;
 
 use crate::AppSession;
 
@@ -25,6 +28,10 @@ pub(crate) struct SessionState {
     pub thinking: ThinkingConfig,
     pub fast: bool,
     pub workflow: bool,
+    /// The on-disk tree model (§A.0(2)). Built on load and refreshed after a
+    /// rewind commit (the selector + undo availability read it). `None` if the
+    /// session folder hasn't been persisted yet (a brand-new session).
+    pub tree: Option<SessionTree>,
 }
 
 const PLAN_FILE_MISSING_WARNING: &str = "Plan file was deleted \u{2014} started a new plan";
@@ -68,6 +75,7 @@ impl SessionState {
 
         let token_usage = session.token_usage;
         let context_size = session.meta.context_size;
+        let tree = load_tree(storage, &session.id);
 
         Self {
             // Saved model may differ from the live one (updated, removed, etc).
@@ -87,7 +95,15 @@ impl SessionState {
             mode,
             plan,
             warnings,
+            tree,
         }
+    }
+
+    /// Reload the on-disk tree after a structural mutation (e.g. a rewind
+    /// commit appended a `Leaf`). The caller barriers first so `log.jsonl` is
+    /// durable. `None` if the folder can't be read (brand-new session).
+    pub fn refresh_tree(&mut self, storage: &StateDir) {
+        self.tree = load_tree(storage, &self.session.id);
     }
 
     pub fn sync_session(
@@ -134,6 +150,12 @@ impl From<Mode> for StoredMode {
             Mode::Plan => StoredMode::Plan,
         }
     }
+}
+
+fn load_tree(storage: &StateDir, session_id: &str) -> Option<SessionTree> {
+    let dir = session_dir(storage.path(), session_id);
+    let loaded = load_folder(&dir, session_id).ok()?;
+    build_session_tree(&loaded).ok()
 }
 
 pub(crate) fn rules_to_stored(rules: &[maki_config::PermissionRule]) -> Vec<StoredRule> {

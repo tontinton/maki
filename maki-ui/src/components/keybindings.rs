@@ -166,7 +166,7 @@ pub enum KeybindContext {
     FormInput,
     TaskPicker,
     SessionPicker,
-    RewindPicker,
+    TreeSelector,
     ThemePicker,
     ModelPicker,
     QueueFocus,
@@ -185,7 +185,7 @@ impl KeybindContext {
             Self::FormInput => "Form",
             Self::TaskPicker => "Task Picker",
             Self::SessionPicker => "Session Picker",
-            Self::RewindPicker => "Rewind Picker",
+            Self::TreeSelector => "Tree Selector",
             Self::ThemePicker => "Theme Picker",
             Self::ModelPicker => "Model Picker",
             Self::QueueFocus => "Queue",
@@ -199,7 +199,7 @@ impl KeybindContext {
         match self {
             Self::TaskPicker
             | Self::SessionPicker
-            | Self::RewindPicker
+            | Self::TreeSelector
             | Self::ThemePicker
             | Self::ModelPicker
             | Self::QueueFocus

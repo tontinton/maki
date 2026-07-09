@@ -115,7 +115,16 @@ impl History {
         self
     }
 
-    /// The cached `fold(active_branch(leaf))` (§10/§A.7). Returns the cached
+    /// Fold a `SessionTree`'s active branch into a `ValidContext` (§A.4). The
+    /// only consumer outside `History` is the C3 UI, which rebuilds the chat
+    /// scrollback from the active branch after a rewind commit (`Rewind`
+    /// appends a `Leaf`; `fold` follows it). Infallible — cycles were rejected
+    /// at open (§A.5).
+    pub fn fold_tree(tree: &SessionTree) -> ValidContext {
+        fold(tree)
+    }
+
+    /// The cached `active_branch(leaf)` (§10/§A.7). Returns the cached
     /// value (Arc bump) when `generation` is current, else re-folds and stores.
     pub fn active_branch(&mut self) -> ValidContext {
         if let Some((g, ctx)) = &self.cache

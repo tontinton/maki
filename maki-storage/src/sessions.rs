@@ -37,8 +37,6 @@ pub enum SessionError {
     VersionMismatch { found: u32, expected: u32 },
     #[error("session ID mismatch: log owns {log_id}, got {given_id}")]
     IdMismatch { log_id: String, given_id: String },
-    #[error("cursor ahead of session (log has {saved}, session has {actual}); compact required")]
-    CursorAhead { saved: usize, actual: usize },
     #[error("session tree cycle detected at {cycle_at}")]
     CorruptTree { cycle_at: String },
 }
@@ -323,29 +321,15 @@ impl SessionLog {
             });
         }
 
-        if self.saved_msg_count > session.messages.len()
-            || self
-                .saved_tool_ids
-                .iter()
-                .any(|id| !session.tool_outputs.contains_key(id))
-            || self.saved_sub_msg_counts.iter().any(|(sub, &count)| {
-                session
-                    .subagent_messages
-                    .get(sub)
-                    .is_none_or(|msgs| count > msgs.len())
-            })
-        {
-            return Err(SessionError::CursorAhead {
-                saved: self.saved_msg_count,
-                actual: session.messages.len(),
-            });
-        }
-
+        // A shorter snapshot can't arrive via the tree mutation queue (forward-
+        // only cursor, §A.10): the legacy defensive `CursorAhead` check is gone.
+        // Saturating guards keep a stale cursor from panic-slicing on shrinkage.
+        let saved_msg_count = self.saved_msg_count.min(session.messages.len());
         let mut buf = Vec::new();
-        let mut new_msg_count = self.saved_msg_count;
+        let mut new_msg_count = saved_msg_count;
         let mut new_tool_ids = Vec::new();
 
-        for msg in &session.messages[self.saved_msg_count..] {
+        for msg in &session.messages[saved_msg_count..] {
             append_record(&mut buf, &LogRecord::<&M, &U, &T>::Msg { d: msg })?;
             new_msg_count += 1;
         }

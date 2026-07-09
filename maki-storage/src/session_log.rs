@@ -24,7 +24,7 @@ use crate::tree::{
     Position, Role, SessionTree, SummaryRecord, ToolUseId, TreeEvent, TreeMutation, TreeNode,
     TreeRecord,
 };
-use crate::{StorageError, atomic_write, fsync_dir, now_epoch};
+use crate::{StorageError, atomic_write, now_epoch};
 
 const LOG_VERSION: u32 = 3;
 
@@ -212,82 +212,6 @@ impl SessionWriter {
 
     pub fn flavors(&self) -> &HashMap<NodeRef, Flavor> {
         &self.flavors
-    }
-
-    /// Rewrite the folder to the given linear message set: write-new-log-then-
-    /// atomic-swap, also rewriting `renders.bin` without pruned tool_use_ids.
-    /// TEMPORARY: replaced by leaf-move rewind in PR-3 (§4).
-    pub fn rewrite_linear(
-        &mut self,
-        messages: Vec<MessageNode>,
-        keep_render_ids: &HashSet<ToolUseId>,
-    ) -> Result<(), StorageError> {
-        if self.unclean {
-            return Err(unclean_error());
-        }
-        let tmp_dir = self.session_dir.with_extension("rewrite.tmp");
-        let _ = fs::remove_dir_all(&tmp_dir);
-        fs::create_dir_all(&tmp_dir)?;
-
-        let tmp_log = log_path(&tmp_dir);
-        let tmp_renders = renders_path(&tmp_dir);
-        let tmp_meta = meta_path(&tmp_dir);
-
-        let mut log = File::create(&tmp_log)?;
-        serde_json::to_writer(&mut log, &TreeRecord::Header(self.loaded.header.clone()))?;
-        log.write_all(b"\n")?;
-        for m in &messages {
-            serde_json::to_writer(&mut log, &TreeRecord::Message(m.clone()))?;
-            log.write_all(b"\n")?;
-        }
-        log.sync_all()?;
-
-        let mut new_renders = RenderStore::open(&tmp_renders)?;
-        let mut comp = renders::new_compressor()?;
-        for id in keep_render_ids {
-            if let Some(frame) = self.renders.get(id) {
-                new_renders.append(id, &frame, &mut comp)?;
-            }
-        }
-        drop((new_renders, comp));
-
-        let meta_json = serde_json::to_vec_pretty(&self.loaded.meta)?;
-        let mut mf = File::create(&tmp_meta)?;
-        mf.write_all(&meta_json)?;
-        mf.sync_all()?;
-        fsync_dir(&tmp_dir)?;
-
-        let final_log = log_path(&self.session_dir);
-        let final_renders = renders_path(&self.session_dir);
-        let final_meta = meta_path(&self.session_dir);
-        fs::rename(&tmp_log, &final_log)?;
-        fs::rename(&tmp_renders, &final_renders)?;
-        fs::rename(&tmp_meta, &final_meta)?;
-        let _ = fs::remove_dir_all(&tmp_dir);
-        fsync_dir(&self.session_dir)?;
-
-        self.log_file = OpenOptions::new().append(true).open(&final_log)?;
-        self.renders = RenderStore::open(&final_renders)?;
-        self.compressor = renders::new_compressor()?;
-        self.loaded.leaves.clear();
-        self.loaded.summaries.clear();
-        self.loaded.labels.clear();
-        self.loaded.messages = messages;
-        self.rebuild_tree_state();
-        Ok(())
-    }
-
-    fn rebuild_tree_state(&mut self) {
-        self.loaded.order = self
-            .loaded
-            .messages
-            .iter()
-            .map(|m| OrderedRecord::Node(NodeRef::Msg(m.id.clone())))
-            .collect();
-        let (nodes, order, flavors) = tree_state_from_loaded(&self.loaded);
-        self.nodes = nodes;
-        self.order = order;
-        self.flavors = flavors;
     }
 }
 
