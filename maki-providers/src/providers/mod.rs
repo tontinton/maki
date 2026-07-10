@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use futures_lite::StreamExt;
 use futures_lite::io::AsyncBufRead;
 use isahc::config::Configurable;
+use isahc::http::request::Builder;
 use serde::Deserialize;
 use tracing::debug;
 
@@ -68,6 +69,13 @@ impl ResolvedAuth {
             base_url: None,
             headers: vec![("authorization".into(), format!("Bearer {api_key}"))],
         }
+    }
+
+    /// Apply all auth headers to an HTTP request builder.
+    pub fn configure_request(&self, builder: Builder) -> Builder {
+        self.headers.iter().fold(builder, |b, (key, value)| {
+            b.header(key.as_str(), value.as_str())
+        })
     }
 }
 

@@ -274,20 +274,20 @@ impl Opencode {
         body["model"] = json!(model.id);
         body["stream"] = json!(true);
         let json_body = serde_json::to_vec(&body)?;
-        let mut rb = Request::builder()
-            .method("POST")
-            .uri(format!(
-                "{}{}",
-                auth.base_url.as_deref().unwrap_or(""),
-                MESSAGES_PATH
-            ))
-            .header("user-agent", super::user_agent())
-            .header("content-type", "application/json")
-            .header("anthropic-version", "2023-06-01");
-        for (key, value) in &auth.headers {
-            rb = rb.header(key.as_str(), value.as_str());
-        }
-        let request = rb.body(json_body)?;
+        let request = auth
+            .configure_request(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "{}{}",
+                        auth.base_url.as_deref().unwrap_or(""),
+                        MESSAGES_PATH
+                    ))
+                    .header("user-agent", super::user_agent())
+                    .header("content-type", "application/json")
+                    .header("anthropic-version", "2023-06-01"),
+            )
+            .body(json_body)?;
 
         debug!(model = %model.id, "sending Anthropic-format request via catalog");
 

@@ -54,14 +54,14 @@ impl OpenAiCompatProvider {
         auth: &ResolvedAuth,
         url: &str,
     ) -> Result<String, AgentError> {
-        let mut builder = Request::builder()
-            .method("GET")
-            .uri(url)
-            .header("user-agent", super::user_agent());
-        for (key, value) in &auth.headers {
-            builder = builder.header(key.as_str(), value.as_str());
-        }
-        let request = builder.body(())?;
+        let request = auth
+            .configure_request(
+                Request::builder()
+                    .method("GET")
+                    .uri(url)
+                    .header("user-agent", super::user_agent()),
+            )
+            .body(())?;
         let mut response = self.client.send_async(request).await?;
         if response.status().as_u16() != 200 {
             return Err(AgentError::from_response(response).await);
@@ -127,14 +127,12 @@ impl OpenAiCompatProvider {
         auth: &ResolvedAuth,
     ) -> isahc::http::request::Builder {
         let base = auth.base_url.as_deref().unwrap_or(self.config.base_url);
-        let mut builder = Request::builder()
-            .method(method)
-            .uri(format!("{base}{path}"))
-            .header("user-agent", super::user_agent());
-        for (key, value) in &auth.headers {
-            builder = builder.header(key.as_str(), value.as_str());
-        }
-        builder
+        auth.configure_request(
+            Request::builder()
+                .method(method)
+                .uri(format!("{base}{path}"))
+                .header("user-agent", super::user_agent()),
+        )
     }
 
     pub async fn do_stream(

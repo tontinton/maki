@@ -125,14 +125,12 @@ impl Google {
 
     fn build_request(&self, method: &str, url: &str) -> isahc::http::request::Builder {
         let auth = self.auth.lock().unwrap();
-        let mut builder = Request::builder()
-            .method(method)
-            .uri(url)
-            .header("user-agent", super::user_agent());
-        for (key, value) in &auth.headers {
-            builder = builder.header(key.as_str(), value.as_str());
-        }
-        builder
+        auth.configure_request(
+            Request::builder()
+                .method(method)
+                .uri(url)
+                .header("user-agent", super::user_agent()),
+        )
     }
 
     fn api_key(&self) -> String {
