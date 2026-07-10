@@ -6,6 +6,7 @@ use serde_json::Value;
 
 use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier};
 use crate::provider::{BoxFuture, Provider};
+use crate::types::ThinkingFieldConfig;
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, dialect};
 
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
@@ -19,6 +20,13 @@ static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
     include_stream_usage: false,
     provider_name: "Synthetic",
 };
+
+fn synthetic_fields() -> ThinkingFieldConfig {
+    ThinkingFieldConfig {
+        effort_path: Some("reasoning_effort".into()),
+        ..Default::default()
+    }
+}
 
 inventory::submit!(maki_config::providers::BuiltInProvider {
     slug: "synthetic",
@@ -135,7 +143,8 @@ impl Provider for Synthetic {
             let system = super::with_prefix(&self.system_prefix, system, &mut buf);
             let mut body = self.compat.build_body(model, messages, system, tools);
             opts.thinking
-                .apply_reasoning_effort(&mut body, &dialect::STANDARD, model);
+                .apply_thinking(&mut body, model, &dialect::STANDARD, &synthetic_fields());
+            super::apply_body_overrides(&mut body, model, &["messages"]);
             self.compat
                 .do_stream(model, &[], &body, event_tx, &auth)
                 .await

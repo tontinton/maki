@@ -33,6 +33,7 @@ pub(crate) fn build_body(
     if wire_tools.as_array().is_some_and(|a| !a.is_empty()) {
         body["tools"] = wire_tools;
     }
+    super::super::apply_body_overrides(&mut body, model, &["input"]);
     body
 }
 

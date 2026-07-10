@@ -9,12 +9,15 @@ use std::ops::AddAssign;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use maki_storage::sessions::{MIN_THINKING_BUDGET, StoredTokenUsage};
+use maki_storage::sessions::{
+    BodyOverride, EffortDialectId, MIN_THINKING_BUDGET, StoredTokenUsage, ThinkingFieldConfig,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::manifest::{ManifestRegistry, ProviderManifest};
 use crate::model_registry::model_registry;
 use crate::providers::{anthropic, custom, dynamic};
+use crate::types::{EffortDialect, effort_dialect_for};
 
 const PER_MILLION: f64 = 1_000_000.0;
 
@@ -214,6 +217,16 @@ pub struct Model {
     /// `None` when unknown, see [`ProviderKind::fallback_max_output`].
     pub max_output_tokens: Option<u32>,
     pub context_window: u32,
+    /// Override the effort dialect for this model. When `None`, the base
+    /// provider's hardcoded dialect is used.
+    pub thinking_dialect: Option<EffortDialectId>,
+    /// Override where thinking values go in the body. When `None`, the base
+    /// provider's hardcoded field layout is used.
+    pub thinking_fields: Option<ThinkingFieldConfig>,
+    /// Per-model body overrides applied after all typed thinking setup.
+    /// `defaults` fills absent keys, `replace` overwrites, `filter` strips.
+    /// Each provider guards its conversation field from all three.
+    pub body_override: Option<BodyOverride>,
 }
 
 impl Model {
@@ -253,6 +266,9 @@ impl Model {
             pricing,
             max_output_tokens,
             context_window,
+            thinking_dialect: None,
+            thinking_fields: None,
+            body_override: None,
         }
     }
 
@@ -271,6 +287,14 @@ impl Model {
             .discovered(manifest.slug, &self.id)
             .and_then(|d| d.supports_thinking)
             .unwrap_or(manifest.supports_thinking)
+    }
+
+    /// The effort dialect for this model. Uses the model's override if set,
+    /// otherwise falls back to the provider's default.
+    pub fn effort_dialect<'a>(&self, default: &'a EffortDialect<'a>) -> &'a EffortDialect<'a> {
+        self.thinking_dialect
+            .map(effort_dialect_for)
+            .unwrap_or(default)
     }
 
     pub fn supports_vision(&self) -> bool {
@@ -351,7 +375,7 @@ impl Model {
         // protocol default under the custom slug, keeping its tier and pricing),
         // or no such provider.
         match custom::resolve_tier(slug, tier) {
-            custom::TierLookup::Model(model) => return Ok(model),
+            custom::TierLookup::Model(model) => return Ok(*model),
             custom::TierLookup::NoModelForTier(base) => {
                 let manifest = ManifestRegistry::get(&base.to_string())
                     .ok_or_else(|| ModelError::NoDefault(slug.to_string(), tier))?;

@@ -23,6 +23,7 @@ use tracing::warn;
 use crate::id::{MakiId, MakiIdParseError};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::{StateDir, StorageError, atomic_write, now_epoch};
 
@@ -340,6 +341,72 @@ impl FromStr for Effort {
             .find(|e| e.as_str() == s)
             .ok_or_else(|| ThinkingParseError::Unknown(s.to_string()))
     }
+}
+
+/// Serializable identifier for a built-in effort dialect. Resolved to
+/// the actual `EffortDialect` by `maki_providers::effort_dialect_for`.
+/// Lives here so both `maki-config` (TOML) and `maki-providers` (JSON
+/// dynamic scripts) can deserialize it without a cross-dependency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EffortDialectId {
+    Standard,
+    PreferHigh,
+    HighOnly,
+    Glm,
+    DeepSeek,
+    AnthropicAdaptive,
+    TensorX,
+}
+
+/// One toggle object written to the body based on the thinking state.
+/// `on` is deep-merged for Effort/Budget, `adaptive` for Adaptive (falls
+/// back to `on`), `off` is set for Off. `budget_key` nests the computed
+/// budget inside this toggle's object.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct ToggleEntry {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub off: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adaptive: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_key: Option<String>,
+}
+
+/// Where thinking values go in the request body. When set on a model it
+/// overrides the base provider's hardcoded thinking layout. Supports
+/// multiple toggle objects (ElectronHub writes both `thinking` and
+/// `reasoning`), nested paths (OpenRouter's `reasoning.effort`), budgets
+/// nested inside toggles (Anthropic's `budget_tokens`), and budget caps
+/// (Google's family-specific limits).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct ThinkingFieldConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_max: Option<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub toggles: Vec<ToggleEntry>,
+}
+
+/// Unified body manipulation for per-model overrides. Three operations
+/// run in order: `defaults` (additive, only fills absent keys), `replace`
+/// (deep-merge, overwrites existing), `filter` (strips keys). Each
+/// provider guards its conversation field so none of the three can touch
+/// `messages`, `input`, or `contents`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct BodyOverride {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub defaults: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replace: Option<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub filter: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1512,9 +1579,13 @@ where
 
 #[cfg(test)]
 mod tests {
+    use super::BodyOverride;
     use super::Effort;
+    use super::EffortDialectId;
     use super::StoredThinking;
+    use super::ThinkingFieldConfig;
     use super::ThinkingParseError;
+    use super::ToggleEntry;
     use super::{
         CWD_INDEX_FILE, DEFAULT_TITLE, LOG_BLOATED, MAX_APPENDS, MAX_TITLE_LEN, SESSION_VERSION,
         StoredSubagent, TAIL_BUF, generate_title, json_path, jsonl_path, load_cwd_index,
@@ -2982,5 +3053,64 @@ mod tests {
 
         let loaded = TestSession::load_from(session.id, dir).unwrap();
         assert_same_session(&loaded, &session);
+    }
+
+    #[test_case(EffortDialectId::Standard ; "standard")]
+    #[test_case(EffortDialectId::PreferHigh ; "prefer_high")]
+    #[test_case(EffortDialectId::HighOnly ; "high_only")]
+    #[test_case(EffortDialectId::Glm ; "glm")]
+    #[test_case(EffortDialectId::DeepSeek ; "deep_seek")]
+    #[test_case(EffortDialectId::AnthropicAdaptive ; "anthropic_adaptive")]
+    #[test_case(EffortDialectId::TensorX ; "tensor_x")]
+    fn effort_dialect_id_serde_round_trip(id: EffortDialectId) {
+        let json = serde_json::to_string(&id).unwrap();
+        let parsed: EffortDialectId = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, id);
+    }
+
+    #[test]
+    fn thinking_field_config_empty_round_trip() {
+        let config = ThinkingFieldConfig::default();
+        let json = serde_json::to_string(&config).unwrap();
+        assert_eq!(json, "{}");
+        let parsed: ThinkingFieldConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, config);
+    }
+
+    #[test]
+    fn thinking_field_config_with_toggles_round_trip() {
+        let config = ThinkingFieldConfig {
+            effort_path: Some("reasoning_effort".into()),
+            toggles: vec![ToggleEntry {
+                path: "thinking".into(),
+                on: Some(serde_json::json!({"type": "enabled"})),
+                off: Some(serde_json::json!({"type": "disabled"})),
+                adaptive: Some(serde_json::json!({"type": "adaptive"})),
+                budget_key: Some("budget_tokens".into()),
+            }],
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let parsed: ThinkingFieldConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, config);
+    }
+
+    #[test]
+    fn body_override_round_trip() {
+        let ov = BodyOverride {
+            defaults: Some(serde_json::json!({"temperature": 0.1})),
+            replace: Some(serde_json::json!({"max_tokens": 8192})),
+            filter: vec!["poison".into()],
+        };
+        let json = serde_json::to_string(&ov).unwrap();
+        let parsed: BodyOverride = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, ov);
+    }
+
+    #[test]
+    fn body_override_empty_serializes_to_empty_object() {
+        let ov = BodyOverride::default();
+        let json = serde_json::to_string(&ov).unwrap();
+        assert_eq!(json, "{}");
     }
 }

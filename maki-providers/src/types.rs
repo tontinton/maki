@@ -7,6 +7,7 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 pub use maki_storage::sessions::Effort;
+pub use maki_storage::sessions::{BodyOverride, EffortDialectId, ThinkingFieldConfig, ToggleEntry};
 use maki_storage::sessions::{MIN_THINKING_BUDGET, StoredThinking, TitleSource};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -403,6 +404,21 @@ pub mod dialect {
     };
 }
 
+/// Map a config-level dialect ID to the static `EffortDialect` it represents.
+/// Lives here (not on the enum in maki-storage) because the dialect consts
+/// are defined in this crate.
+pub fn effort_dialect_for(id: EffortDialectId) -> &'static EffortDialect<'static> {
+    match id {
+        EffortDialectId::Standard => &dialect::STANDARD,
+        EffortDialectId::PreferHigh => &dialect::PREFER_HIGH,
+        EffortDialectId::HighOnly => &dialect::HIGH_ONLY,
+        EffortDialectId::Glm => &dialect::GLM,
+        EffortDialectId::DeepSeek => &dialect::DEEPSEEK,
+        EffortDialectId::AnthropicAdaptive => &dialect::ANTHROPIC_ADAPTIVE,
+        EffortDialectId::TensorX => &dialect::TENSORX,
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ThinkingConfig {
     #[default]
@@ -418,6 +434,47 @@ enum Budgeted {
     Off,
     Adaptive,
     Tokens(u32),
+}
+
+/// Write `value` at a dot-separated path in `body`, creating intermediate
+/// objects as needed. `"reasoning.effort"` navigates `body["reasoning"]`
+/// (creating it if absent) then sets `["effort"]`.
+fn set_by_path(body: &mut Value, path: &str, value: Value) {
+    let segments: Vec<&str> = path.split('.').collect();
+    let mut current = body;
+    for segment in &segments[..segments.len() - 1] {
+        let entry = &mut current[*segment];
+        if !entry.is_object() {
+            *entry = Value::Object(Default::default());
+        }
+        current = entry;
+    }
+    current[*segments.last().unwrap()] = value;
+}
+
+/// Same navigation as [`set_by_path`] but shallow-merges objects at the leaf
+/// instead of overwriting. Lets a toggle's static fields coexist with dynamic
+/// effort/budget values written to the same object by a later step.
+fn merge_by_path(body: &mut Value, path: &str, value: Value) {
+    let segments: Vec<&str> = path.split('.').collect();
+    let mut current = body;
+    for segment in &segments[..segments.len() - 1] {
+        let entry = &mut current[*segment];
+        if !entry.is_object() {
+            *entry = Value::Object(Default::default());
+        }
+        current = entry;
+    }
+    let target = &mut current[*segments.last().unwrap()];
+    if target.is_object() && value.is_object() {
+        if let (Some(t), Some(v)) = (target.as_object_mut(), value.as_object()) {
+            for (k, val) in v {
+                t.insert(k.clone(), val.clone());
+            }
+        }
+    } else {
+        *target = value;
+    }
 }
 
 impl ThinkingConfig {
@@ -463,8 +520,14 @@ impl ThinkingConfig {
 
     /// Anthropic messages API body. Adaptive-thinking models get the native
     /// adaptive knob plus `output_config.effort`; legacy models get a plain
-    /// token budget.
+    /// token budget. When `model.thinking_fields` is set (dynamic or custom
+    /// provider override), the model takes full control of the wire format
+    /// and the version check is skipped.
     pub fn apply_to_body(self, body: &mut Value, model: &Model) {
+        if let Some(fields) = &model.thinking_fields {
+            self.apply_thinking(body, model, &dialect::ANTHROPIC_ADAPTIVE, fields);
+            return;
+        }
         if Self::requires_adaptive(&model.id) {
             match self {
                 Self::Off => {}
@@ -526,6 +589,100 @@ impl ThinkingConfig {
             Budgeted::Tokens(n) => i64::from(n),
         };
         body["thinking_budget_tokens"] = json!(budget);
+    }
+
+    /// Serialize thinking to `body` using a declarative field config. When
+    /// `model.thinking_fields` fields are set they override `default_fields`;
+    /// fields that are `None`/empty fall back to the provider default.
+    /// `model.thinking_dialect` overrides `default_dialect` when set.
+    ///
+    /// Pipeline: toggles (set for Off, deep-merge for enabled states)
+    /// then budget (at `budget_path`, or nested in the first toggle with
+    /// `budget_key`) then effort string (at `effort_path`).
+    pub fn apply_thinking(
+        self,
+        body: &mut Value,
+        model: &Model,
+        default_dialect: &EffortDialect,
+        default_fields: &ThinkingFieldConfig,
+    ) {
+        let dialect = model.effort_dialect(default_dialect);
+
+        // Partial merge: model fields take priority when set, otherwise we
+        // fall back to the provider default. A script that only sets a
+        // toggle (like BlazeAPI's enable_thinking) still gets the base
+        // provider's effort_path and budget_path for free.
+        let effort_path = model
+            .thinking_fields
+            .as_ref()
+            .and_then(|f| f.effort_path.as_deref())
+            .or(default_fields.effort_path.as_deref());
+        let budget_path = model
+            .thinking_fields
+            .as_ref()
+            .and_then(|f| f.budget_path.as_deref())
+            .or(default_fields.budget_path.as_deref());
+        let budget_max = model
+            .thinking_fields
+            .as_ref()
+            .and_then(|f| f.budget_max)
+            .or(default_fields.budget_max);
+        let toggles = model
+            .thinking_fields
+            .as_ref()
+            .filter(|f| !f.toggles.is_empty())
+            .map(|f| &f.toggles)
+            .unwrap_or(&default_fields.toggles);
+
+        let max = budget_max
+            .map(|cap| {
+                model
+                    .max_thinking_budget()
+                    .map(|m| m.min(cap))
+                    .or(Some(cap))
+            })
+            .unwrap_or_else(|| model.max_thinking_budget());
+
+        for toggle in toggles {
+            match self {
+                Self::Off => {
+                    if let Some(v) = &toggle.off {
+                        set_by_path(body, &toggle.path, v.clone());
+                    }
+                }
+                Self::Adaptive => {
+                    let val = toggle.adaptive.as_ref().or(toggle.on.as_ref());
+                    if let Some(v) = val {
+                        merge_by_path(body, &toggle.path, v.clone());
+                    }
+                }
+                _ => {
+                    if let Some(v) = &toggle.on {
+                        merge_by_path(body, &toggle.path, v.clone());
+                    }
+                }
+            }
+        }
+
+        if let Budgeted::Tokens(n) = self.budget(max) {
+            if let Some(bp) = budget_path {
+                set_by_path(body, bp, json!(n));
+            } else {
+                for toggle in toggles {
+                    if let Some(key) = &toggle.budget_key {
+                        let path = format!("{}.{}", toggle.path, key);
+                        set_by_path(body, &path, json!(n));
+                        break;
+                    }
+                }
+            }
+        }
+
+        if let Some(ep) = effort_path
+            && let Some(effort) = self.effort_str(dialect, model)
+        {
+            set_by_path(body, ep, json!(effort));
+        }
     }
 
     pub fn parse(input: &str, current: Self) -> Result<Self, &'static str> {
@@ -902,6 +1059,9 @@ mod tests {
             pricing: crate::model::ModelPricing::default(),
             max_output_tokens: Some(8192),
             context_window: 200_000,
+            thinking_dialect: None,
+            thinking_fields: None,
+            body_override: None,
         }
     }
 

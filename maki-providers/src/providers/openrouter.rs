@@ -8,7 +8,7 @@ use crate::model::{Model, ModelEntry, ModelInfo, ModelPricing};
 use crate::provider::{BoxFuture, Provider};
 use crate::{
     AgentError, Effort, EffortDialect, Message, ProviderEvent, RequestOptions, StreamResponse,
-    dialect,
+    ThinkingFieldConfig, dialect,
 };
 
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
@@ -198,16 +198,20 @@ impl Provider for OpenRouter {
             };
 
             let effort_dialect = effort_dialect(reasoning_info.as_deref());
-            if model.supports_thinking()
-                && let Some(effort) = opts.thinking.effort_str(&effort_dialect, model)
-            {
-                body["reasoning"] = json!({"effort": effort});
+            if model.supports_thinking() {
+                let fields = ThinkingFieldConfig {
+                    effort_path: Some("reasoning.effort".into()),
+                    ..Default::default()
+                };
+                opts.thinking
+                    .apply_thinking(&mut body, model, &effort_dialect, &fields);
             }
 
             if let Some(sid) = session_id {
                 body["session_id"] = json!(sid.to_string());
             }
 
+            super::apply_body_overrides(&mut body, model, &["messages"]);
             let extra_headers = [("HTTP-Referer", REFERER), ("X-OpenRouter-Title", APP_TITLE)];
             self.compat
                 .do_stream(model, &extra_headers, &body, event_tx, &auth)
@@ -314,6 +318,9 @@ mod tests {
             pricing: ModelPricing::default(),
             max_output_tokens: Some(8192),
             context_window: 200_000,
+            thinking_dialect: None,
+            thinking_fields: None,
+            body_override: None,
         };
         (effort_dialect(info), model)
     }

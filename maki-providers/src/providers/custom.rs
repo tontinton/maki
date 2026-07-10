@@ -15,8 +15,15 @@ use crate::manifest::ManifestRegistry;
 use crate::model::{FastPricing, Model, ModelPricing, ModelTier};
 use crate::provider::{BoxFuture, Provider, ProviderKind};
 use crate::providers::Timeouts;
-use crate::types::ThinkingConfig;
-use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
+use crate::types::ThinkingFieldConfig;
+use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, dialect};
+
+fn custom_openai_fields() -> ThinkingFieldConfig {
+    ThinkingFieldConfig {
+        effort_path: Some("reasoning_effort".into()),
+        ..Default::default()
+    }
+}
 
 static CUSTOM_OPENAI_CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
     // Custom providers resolve their own base URL (including any override) from
@@ -147,6 +154,9 @@ fn model_from_def(def: &ProviderDef, kind: ProviderKind, slug: &str, model_id: &
         pricing,
         max_output_tokens,
         context_window,
+        thinking_dialect: declared.and_then(|m| m.thinking_dialect),
+        thinking_fields: declared.and_then(|m| m.thinking_fields.clone()),
+        body_override: declared.and_then(|m| m.body_override.clone()),
     }
 }
 
@@ -173,7 +183,7 @@ fn declared_specs_from(config: &ProvidersConfig) -> Vec<String> {
 
 /// Outcome of resolving a tier against `providers.toml` in a single read.
 pub enum TierLookup {
-    Model(Model),
+    Model(Box<Model>),
     /// Provider exists but declares no model at this tier; carries the base kind
     /// so the caller can inherit the base protocol's default.
     NoModelForTier(ProviderKind),
@@ -195,7 +205,9 @@ pub fn resolve_tier(slug: &str, tier: ModelTier) -> TierLookup {
     };
     let kind = protocol_kind(protocol);
     match def.models.iter().find(|m| ModelTier::from(m.tier) == tier) {
-        Some(declared) => TierLookup::Model(model_from_def(def, kind, slug, &declared.id)),
+        Some(declared) => {
+            TierLookup::Model(Box::new(model_from_def(def, kind, slug, &declared.id)))
+        }
         None => TierLookup::NoModelForTier(kind),
     }
 }
@@ -275,9 +287,13 @@ impl Provider for CustomOpenAiProvider {
             }
 
             let mut body = self.compat.build_body(model, messages, system, tools);
-            if matches!(opts.thinking, ThinkingConfig::Off) {
-                body["thinking"] = serde_json::json!({"type": "disabled"});
-            }
+            opts.thinking.apply_thinking(
+                &mut body,
+                model,
+                &dialect::PREFER_HIGH,
+                &custom_openai_fields(),
+            );
+            super::apply_body_overrides(&mut body, model, &["messages"]);
             self.compat
                 .do_stream(model, &[], &body, event_tx, &auth)
                 .await

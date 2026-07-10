@@ -8,7 +8,7 @@ use tracing::warn;
 
 use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier};
 use crate::provider::{BoxFuture, Provider};
-use crate::types::{ProviderUsage, UsageLimit};
+use crate::types::{ProviderUsage, ThinkingFieldConfig, UsageLimit};
 use crate::{
     AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig, dialect,
 };
@@ -28,6 +28,19 @@ static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
     include_stream_usage: true,
     provider_name: "DeepSeek",
 };
+
+fn deepseek_fields() -> ThinkingFieldConfig {
+    ThinkingFieldConfig {
+        effort_path: Some("reasoning_effort".into()),
+        toggles: vec![crate::types::ToggleEntry {
+            path: "thinking".into(),
+            on: Some(serde_json::json!({"type": "enabled"})),
+            off: Some(serde_json::json!({"type": "disabled"})),
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+}
 
 inventory::submit!(maki_config::providers::BuiltInProvider {
     slug: "deepseek",
@@ -173,18 +186,16 @@ impl Provider for DeepSeek {
             let system = super::with_prefix(&self.system_prefix, system, &mut buf);
             let mut body = self.compat.build_body(model, messages, system, tools);
 
+            opts.thinking
+                .apply_thinking(&mut body, model, &dialect::DEEPSEEK, &deepseek_fields());
             if opts.thinking.is_enabled() {
-                body["thinking"] = serde_json::json!({"type": "enabled"});
-                opts.thinking
-                    .apply_reasoning_effort(&mut body, &dialect::DEEPSEEK, model);
                 if matches!(opts.thinking, ThinkingConfig::Budget(_)) {
                     warn!("DeepSeek reasoning does not support token budgets");
                 }
                 pad_reasoning_content(&model.id, &mut body);
-            } else {
-                body["thinking"] = serde_json::json!({"type": "disabled"});
             }
 
+            super::apply_body_overrides(&mut body, model, &["messages"]);
             self.compat
                 .do_stream(model, &[], &body, event_tx, &auth)
                 .await

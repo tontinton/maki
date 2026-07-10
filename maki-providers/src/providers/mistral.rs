@@ -6,6 +6,7 @@ use serde_json::{Value, json};
 
 use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier};
 use crate::provider::{BoxFuture, Provider};
+use crate::types::ThinkingFieldConfig;
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, dialect};
 
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
@@ -19,6 +20,13 @@ static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
     include_stream_usage: true,
     provider_name: "Mistral",
 };
+
+fn mistral_fields() -> ThinkingFieldConfig {
+    ThinkingFieldConfig {
+        effort_path: Some("reasoning_effort".into()),
+        ..Default::default()
+    }
+}
 
 inventory::submit!(maki_config::providers::BuiltInProvider {
     slug: "mistral",
@@ -200,10 +208,11 @@ impl Provider for Mistral {
             let system = super::with_prefix(&self.system_prefix, system, &mut buf);
             let mut body = self.compat.build_body(model, messages, system, tools);
             opts.thinking
-                .apply_reasoning_effort(&mut body, &dialect::HIGH_ONLY, model);
+                .apply_thinking(&mut body, model, &dialect::HIGH_ONLY, &mistral_fields());
             // Convert assistant messages to Mistral's expected format with thinking content
             convert_assistant_messages_in_place(body.get_mut("messages").unwrap());
 
+            super::apply_body_overrides(&mut body, model, &["messages"]);
             let mut extra_headers = vec![];
             if let Some(session_id) = session_id {
                 extra_headers.push(("x-affinity", session_id.as_str()));

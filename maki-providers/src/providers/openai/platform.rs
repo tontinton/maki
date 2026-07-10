@@ -8,6 +8,7 @@ use tracing::{debug, warn};
 
 use crate::model::Model;
 use crate::provider::{BoxFuture, Provider};
+use crate::types::ThinkingFieldConfig;
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, dialect};
 
 use super::auth;
@@ -35,6 +36,13 @@ pub(crate) const PLAN_MODELS: &[&str] = &[
     "gpt-5.4-mini",
     "gpt-5.2",
 ];
+
+fn standard_fields() -> ThinkingFieldConfig {
+    ThinkingFieldConfig {
+        effort_path: Some("reasoning_effort".into()),
+        ..Default::default()
+    }
+}
 
 const CODEX_PLAN_CONTEXT_WINDOW: u32 = 272_000;
 const GPT_5_6_PLAN_CONTEXT_WINDOW: u32 = 372_000;
@@ -218,7 +226,8 @@ impl Provider for OpenAi {
 
             let mut body = self.compat.build_body(model, messages, system, tools);
             opts.thinking
-                .apply_reasoning_effort(&mut body, &dialect::STANDARD, model);
+                .apply_thinking(&mut body, model, &dialect::STANDARD, &standard_fields());
+            super::super::apply_body_overrides(&mut body, model, &["messages"]);
             self.with_oauth_retry(|| async {
                 let auth = self.current_auth();
                 self.compat

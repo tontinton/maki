@@ -19,6 +19,7 @@ use maki_storage::auth::load_provider_credentials;
 use crate::model::{Model, ModelInfo, ModelPricing};
 use crate::provider::{BoxFuture, Provider};
 use crate::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
+use crate::types::ThinkingFieldConfig;
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, dialect};
 
 use super::{ResolvedAuth, http_client};
@@ -413,6 +414,13 @@ impl CatalogData {
     }
 }
 
+fn opencode_compat_fields() -> ThinkingFieldConfig {
+    ThinkingFieldConfig {
+        effort_path: Some("reasoning_effort".into()),
+        ..Default::default()
+    }
+}
+
 static CATALOG_CHAT_CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
     slug: "opencode",
     api_key_env: "",
@@ -477,8 +485,13 @@ impl Opencode {
         opts: &RequestOptions,
     ) -> Result<StreamResponse, AgentError> {
         let mut body = self.chat_compat.build_body(model, messages, system, tools);
-        opts.thinking
-            .apply_reasoning_effort(&mut body, &dialect::PREFER_HIGH, model);
+        opts.thinking.apply_thinking(
+            &mut body,
+            model,
+            &dialect::PREFER_HIGH,
+            &opencode_compat_fields(),
+        );
+        super::apply_body_overrides(&mut body, model, &["messages"]);
         self.chat_compat
             .do_stream(model, &[], &body, event_tx, auth)
             .await

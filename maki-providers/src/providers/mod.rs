@@ -7,9 +7,11 @@ use futures_lite::io::AsyncBufRead;
 use isahc::config::Configurable;
 use isahc::http::request::Builder;
 use serde::Deserialize;
+use serde_json::Value;
 use tracing::debug;
 
 use crate::AgentError;
+use crate::model::Model;
 
 pub(crate) mod anthropic;
 pub(crate) mod copilot;
@@ -107,6 +109,78 @@ pub(crate) fn urlenc(s: &str) -> String {
         }
     }
     out
+}
+
+/// Apply per-model body overrides after all typed thinking setup. Three
+/// operations run in order: `defaults` (additive, only fills absent keys),
+/// `replace` (deep-merge, overwrites existing), `filter` (strips keys).
+/// `protected` is the conversation field for this provider's protocol
+/// (`messages`, `input`, or `contents`); none of the three can touch it.
+///
+/// Nothing happens when `body_override` is `None`, so the no-override path
+/// stays zero-cost.
+pub(crate) fn apply_body_overrides(body: &mut Value, model: &Model, protected: &[&str]) {
+    let Some(ov) = model.body_override.as_ref() else {
+        return;
+    };
+    if let Some(defaults) = &ov.defaults {
+        shallow_inject(body, defaults, protected);
+    }
+    if let Some(replace) = &ov.replace {
+        deep_merge(body, replace, protected);
+    }
+    if !ov.filter.is_empty() {
+        filter_body(body, &ov.filter, protected);
+    }
+}
+
+fn shallow_inject(body: &mut Value, defaults: &Value, protected: &[&str]) {
+    let (Some(body_obj), Some(defaults_obj)) = (body.as_object_mut(), defaults.as_object()) else {
+        return;
+    };
+    for (k, v) in defaults_obj {
+        if protected.contains(&k.as_str()) {
+            continue;
+        }
+        if !body_obj.contains_key(k) {
+            body_obj.insert(k.clone(), v.clone());
+        }
+    }
+}
+
+fn deep_merge(body: &mut Value, replace: &Value, protected: &[&str]) {
+    let (Some(body_obj), Some(replace_obj)) = (body.as_object_mut(), replace.as_object()) else {
+        return;
+    };
+    for (k, v) in replace_obj {
+        if protected.contains(&k.as_str()) {
+            continue;
+        }
+        match body_obj.get_mut(k) {
+            Some(existing) if existing.is_object() && v.is_object() => {
+                if let (Some(e), Some(r)) = (existing.as_object_mut(), v.as_object()) {
+                    for (rk, rv) in r {
+                        e.insert(rk.clone(), rv.clone());
+                    }
+                }
+            }
+            _ => {
+                body_obj.insert(k.clone(), v.clone());
+            }
+        }
+    }
+}
+
+fn filter_body(body: &mut Value, filter: &[String], protected: &[&str]) {
+    let Some(obj) = body.as_object_mut() else {
+        return;
+    };
+    for k in filter {
+        if protected.contains(&k.as_str()) {
+            continue;
+        }
+        obj.remove(k);
+    }
 }
 
 #[derive(Deserialize)]
@@ -386,5 +460,171 @@ mod tests {
         assert!(result.is_err());
         let msg = format!("{result:?}");
         assert!(msg.contains(&env_var) || msg.contains(&slug));
+    }
+
+    #[test]
+    fn shallow_inject_fills_absent_keys_only() {
+        let mut body = serde_json::json!({"temperature": 0.1, "messages": []});
+        let defaults = serde_json::json!({"temperature": 0.7, "max_tokens": 8192});
+        shallow_inject(&mut body, &defaults, &["messages"]);
+        assert_eq!(body["temperature"], 0.1);
+        assert_eq!(body["max_tokens"], 8192);
+    }
+
+    #[test]
+    fn shallow_inject_empty_is_noop() {
+        let mut body = serde_json::json!({"x": 1});
+        shallow_inject(&mut body, &serde_json::json!({}), &[]);
+        assert_eq!(body, serde_json::json!({"x": 1}));
+    }
+
+    #[test]
+    fn shallow_inject_nested_value_lands_whole() {
+        let mut absent = serde_json::json!({"a": 1});
+        shallow_inject(
+            &mut absent,
+            &serde_json::json!({"chat_template_kwargs": {"x": 1}}),
+            &[],
+        );
+        assert_eq!(absent["chat_template_kwargs"]["x"], 1);
+
+        let mut present = serde_json::json!({"chat_template_kwargs": {"y": 1}});
+        shallow_inject(
+            &mut present,
+            &serde_json::json!({"chat_template_kwargs": {"x": 999}}),
+            &[],
+        );
+        assert_eq!(present["chat_template_kwargs"]["y"], 1);
+        assert!(present["chat_template_kwargs"].get("x").is_none());
+    }
+
+    #[test]
+    fn filter_body_removes_listed_keys() {
+        let mut body = serde_json::json!({
+            "context_management": {"x": 1},
+            "keep": true,
+            "also_drop": null
+        });
+        filter_body(
+            &mut body,
+            &["context_management".into(), "also_drop".into()],
+            &[],
+        );
+        assert_eq!(body, serde_json::json!({"keep": true}));
+    }
+
+    #[test]
+    fn filter_body_missing_key_is_noop() {
+        let mut body = serde_json::json!({"keep": true});
+        filter_body(&mut body, &["context_management".into()], &[]);
+        assert_eq!(body, serde_json::json!({"keep": true}));
+    }
+
+    #[test]
+    fn apply_body_overrides_defaults_then_replace_then_filter() {
+        let model = Model {
+            id: "test-model".into(),
+            provider: Arc::from("anthropic"),
+            tier: crate::model::ModelTier::Medium,
+            family: crate::model::ModelFamily::Claude,
+            supports_tool_examples_override: None,
+            supports_thinking_override: None,
+            supports_vision_override: None,
+            pricing: Default::default(),
+            max_output_tokens: Some(8192),
+            context_window: 200_000,
+            thinking_dialect: None,
+            thinking_fields: None,
+            body_override: Some(crate::types::BodyOverride {
+                defaults: Some(serde_json::json!({"temperature": 0.7, "poison": "bad"})),
+                replace: Some(serde_json::json!({"temperature": 0.1})),
+                filter: vec!["poison".into()],
+            }),
+        };
+        let mut body = serde_json::json!({"messages": [], "temperature": 0.5});
+        apply_body_overrides(&mut body, &model, &["messages"]);
+        // Replace overwrites the existing temperature (not the defaults value).
+        assert_eq!(body["temperature"], 0.1);
+        assert_eq!(body["messages"], serde_json::json!([]));
+        assert!(body.get("poison").is_none());
+    }
+
+    #[test]
+    fn apply_body_overrides_no_override_is_noop() {
+        let model = Model {
+            id: "test-model".into(),
+            provider: Arc::from("anthropic"),
+            tier: crate::model::ModelTier::Medium,
+            family: crate::model::ModelFamily::Claude,
+            supports_tool_examples_override: None,
+            supports_thinking_override: None,
+            supports_vision_override: None,
+            pricing: Default::default(),
+            max_output_tokens: Some(8192),
+            context_window: 200_000,
+            thinking_dialect: None,
+            thinking_fields: None,
+            body_override: None,
+        };
+        let mut body = serde_json::json!({"messages": [], "temperature": 0.5});
+        apply_body_overrides(&mut body, &model, &["messages"]);
+        assert_eq!(
+            body,
+            serde_json::json!({"messages": [], "temperature": 0.5})
+        );
+    }
+
+    #[test]
+    fn apply_body_overrides_protected_key_survives_filter() {
+        let model = Model {
+            id: "test-model".into(),
+            provider: Arc::from("anthropic"),
+            tier: crate::model::ModelTier::Medium,
+            family: crate::model::ModelFamily::Claude,
+            supports_tool_examples_override: None,
+            supports_thinking_override: None,
+            supports_vision_override: None,
+            pricing: Default::default(),
+            max_output_tokens: Some(8192),
+            context_window: 200_000,
+            thinking_dialect: None,
+            thinking_fields: None,
+            body_override: Some(crate::types::BodyOverride {
+                defaults: None,
+                replace: None,
+                filter: vec!["messages".into()],
+            }),
+        };
+        let mut body = serde_json::json!({"messages": [{"role": "user"}]});
+        apply_body_overrides(&mut body, &model, &["messages"]);
+        assert_eq!(body["messages"], serde_json::json!([{"role": "user"}]));
+    }
+
+    #[test]
+    fn apply_body_overrides_replace_deep_merges_nested() {
+        let model = Model {
+            id: "test-model".into(),
+            provider: Arc::from("anthropic"),
+            tier: crate::model::ModelTier::Medium,
+            family: crate::model::ModelFamily::Claude,
+            supports_tool_examples_override: None,
+            supports_thinking_override: None,
+            supports_vision_override: None,
+            pricing: Default::default(),
+            max_output_tokens: Some(8192),
+            context_window: 200_000,
+            thinking_dialect: None,
+            thinking_fields: None,
+            body_override: Some(crate::types::BodyOverride {
+                defaults: None,
+                replace: Some(serde_json::json!({"generationConfig": {"thinkingBudget": 8192}})),
+                filter: vec![],
+            }),
+        };
+        let mut body =
+            serde_json::json!({"messages": [], "generationConfig": {"includeThoughts": true}});
+        apply_body_overrides(&mut body, &model, &["messages"]);
+        assert_eq!(body["generationConfig"]["thinkingBudget"], 8192);
+        assert_eq!(body["generationConfig"]["includeThoughts"], true);
     }
 }

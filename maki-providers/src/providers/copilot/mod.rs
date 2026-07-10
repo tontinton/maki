@@ -230,6 +230,7 @@ impl Copilot {
         if wire_tools.as_array().is_some_and(|tools| !tools.is_empty()) {
             body["tools"] = wire_tools;
         }
+        super::apply_body_overrides(&mut body, model, &["messages"]);
 
         let request = self
             .build_post(
@@ -314,6 +315,7 @@ impl Copilot {
             "stream": true,
         });
         thinking.apply_to_body(&mut body, model);
+        super::apply_body_overrides(&mut body, model, &["messages"]);
 
         let request = self
             .build_post(&auth, MESSAGES_PATH, Some("conversation-agent"), &body)?

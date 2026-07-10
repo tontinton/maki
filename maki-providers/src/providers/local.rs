@@ -11,7 +11,8 @@ use maki_config::providers::Protocol;
 
 use crate::model::Model;
 use crate::provider::{BoxFuture, Provider};
-use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
+use crate::types::{ThinkingFieldConfig, ToggleEntry};
+use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, dialect};
 
 use super::openai::responses;
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
@@ -35,6 +36,19 @@ fn resolve_protocol_for_local(slug: &str) -> Option<Protocol> {
         slug,
         maki_config::providers::ProvidersConfig::load().get(slug),
     )
+}
+
+fn local_fields() -> ThinkingFieldConfig {
+    ThinkingFieldConfig {
+        budget_path: Some("thinking_budget_tokens".into()),
+        toggles: vec![ToggleEntry {
+            path: "thinking_budget_tokens".into(),
+            off: Some(json!(0)),
+            adaptive: Some(json!(-1)),
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
 }
 
 pub(crate) struct LocalEndpoint {
@@ -162,9 +176,11 @@ impl Provider for LocalEndpoint {
             let mut body = self.compat.build_body(model, messages, system, tools);
 
             if self.thinking_budget_field {
-                opts.thinking.apply_local_thinking(&mut body, model);
+                opts.thinking
+                    .apply_thinking(&mut body, model, &dialect::STANDARD, &local_fields());
             }
 
+            super::apply_body_overrides(&mut body, model, &["messages"]);
             self.compat
                 .do_stream(model, &[], &body, event_tx, &auth)
                 .await

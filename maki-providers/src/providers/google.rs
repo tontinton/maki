@@ -11,9 +11,10 @@ use tracing::warn;
 
 use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier};
 use crate::provider::{BoxFuture, Provider};
+use crate::types::{ThinkingFieldConfig, ToggleEntry};
 use crate::{
     AgentError, ContentBlock, Message, ProviderEvent, RequestOptions, Role, StopReason,
-    StreamResponse, ThinkingConfig, TokenUsage,
+    StreamResponse, ThinkingConfig, TokenUsage, dialect,
 };
 
 use super::{KeyPool, ResolvedAuth, http_client, next_sse_line};
@@ -25,13 +26,22 @@ const PRO_MAX_THINKING: u32 = 32_768;
 
 /// The generic per-model max, capped by Google's documented `thinkingBudget`
 /// hard limits per family.
-fn max_thinking(model: &Model) -> u32 {
+fn google_fields(model: &Model) -> ThinkingFieldConfig {
     let cap = if model.id.contains("flash") {
         FLASH_MAX_THINKING
     } else {
         PRO_MAX_THINKING
     };
-    model.max_thinking_budget().map_or(cap, |m| m.min(cap))
+    ThinkingFieldConfig {
+        budget_path: Some("generationConfig.thinkingConfig.thinkingBudget".into()),
+        budget_max: Some(cap),
+        toggles: vec![ToggleEntry {
+            path: "generationConfig.thinkingConfig.includeThoughts".into(),
+            adaptive: Some(json!(true)),
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
 }
 
 inventory::submit!(maki_config::providers::BuiltInProvider {
@@ -201,7 +211,7 @@ impl Google {
             body["systemInstruction"] = json!({"parts": [{"text": system}]});
         }
 
-        thinking.apply_google_thinking(&mut body, max_thinking(model));
+        thinking.apply_thinking(&mut body, model, &dialect::STANDARD, &google_fields(model));
 
         if let Some(max_output) = model.max_output_tokens {
             body["generationConfig"]["maxOutputTokens"] = json!(max_output);
@@ -212,6 +222,7 @@ impl Google {
             body["tools"] = json!([{"functionDeclarations": tool_decls}]);
         }
 
+        super::apply_body_overrides(&mut body, model, &["contents"]);
         body
     }
 
@@ -651,6 +662,9 @@ mod tests {
             pricing: ModelPricing::default(),
             max_output_tokens: Some(8192),
             context_window: 1_048_576,
+            thinking_dialect: None,
+            thinking_fields: None,
+            body_override: None,
         }
     }
 

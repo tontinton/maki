@@ -20,7 +20,8 @@ pub use providers::opencode::{
     ProviderData, catalog_provider, catalog_providers, catalog_providers_if_available,
 };
 pub use types::{
-    ContentBlock, Effort, EffortDialect, IMAGE_OMITTED_NOTE, ImageMediaType, ImageSource, Message,
-    ProviderEvent, ProviderUsage, RequestOptions, Role, StopReason, StreamResponse, ThinkingConfig,
-    UsageLimit, adapt_images_for_model, dialect,
+    BodyOverride, ContentBlock, Effort, EffortDialect, EffortDialectId, IMAGE_OMITTED_NOTE,
+    ImageMediaType, ImageSource, Message, ProviderEvent, ProviderUsage, RequestOptions, Role,
+    StopReason, StreamResponse, ThinkingConfig, ThinkingFieldConfig, ToggleEntry, UsageLimit,
+    adapt_images_for_model, dialect, effort_dialect_for,
 };

@@ -3,6 +3,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::process;
 
+use maki_storage::sessions::{BodyOverride, EffortDialectId, ThinkingFieldConfig};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use tracing::debug;
@@ -54,6 +55,19 @@ pub struct ModelDef {
     pub pricing_fast_input: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pricing_fast_output: Option<f64>,
+    /// Override the effort dialect for this model. When `None`, the base
+    /// provider's default dialect is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_dialect: Option<EffortDialectId>,
+    /// Override where thinking values go in the body. When `None`, the base
+    /// provider's hardcoded field layout is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_fields: Option<ThinkingFieldConfig>,
+    /// Per-model body overrides: `defaults` fills absent keys, `replace`
+    /// overwrites, `filter` strips. Each provider guards its conversation
+    /// field from all three.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_override: Option<BodyOverride>,
 }
 
 impl ModelDef {
@@ -420,6 +434,28 @@ tier = "mediums"
     fn model_def_tier_defaults_to_medium() {
         let m: ModelDef = toml::from_str(r#"id = "x""#).unwrap();
         assert_eq!(m.tier, Tier::Medium);
+    }
+
+    #[test]
+    fn model_def_body_override_roundtrip() {
+        let toml_str = r#"
+id = "my-model"
+tier = "strong"
+thinking_dialect = "glm"
+body_override = { defaults = { generationConfig = { temperature = 0.1 } }, filter = ["poison", "red"] }
+"#;
+        let m: ModelDef = toml::from_str(toml_str).unwrap();
+        assert_eq!(m.id, "my-model");
+        assert_eq!(m.thinking_dialect, Some(EffortDialectId::Glm));
+        let ov = m.body_override.expect("body_override parsed");
+        let defaults = ov.defaults.expect("defaults parsed");
+        assert_eq!(defaults["generationConfig"]["temperature"], 0.1);
+        assert_eq!(ov.filter, vec!["poison".to_string(), "red".to_string()]);
+
+        let minimal: ModelDef = toml::from_str(r#"id = "x""#).unwrap();
+        assert!(minimal.thinking_dialect.is_none());
+        assert!(minimal.thinking_fields.is_none());
+        assert!(minimal.body_override.is_none());
     }
 
     #[test_case("weak", Tier::Weak ; "weak")]

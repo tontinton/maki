@@ -239,7 +239,15 @@ If your provider serves models not in the base catalog, add a `models` subcomman
 [{{"id": "my-model-v2", "tier": "strong", "context_window": 200000, "max_output_tokens": 16384}}]
 ```
 
-Only `id` is required. Optional fields: `tier` (default `medium`), `context_window` (128K), `max_output_tokens` (16K), `pricing` (`{{input, output, cache_write, cache_read}}`, all per 1M tokens), `supports_tool_examples` (defaults to the base provider's setting), `supports_thinking` (defaults to the base provider's setting), `supports_vision` (defaults to the base provider's setting; when false, image input and the `view_image` tool are disabled). The first model listed per tier is used for sub-agents. Without this subcommand, the base provider's models are used.
+Only `id` is required. Optional fields: `tier` (default `medium`), `context_window` (128K), `max_output_tokens` (16K), `pricing` (`{{input, output, cache_write, cache_read}}`, all per 1M tokens), `supports_tool_examples` (defaults to the base provider's setting), `supports_thinking` (defaults to the base provider's setting), `supports_vision` (defaults to the base provider's setting; when false, image input and the `view_image` tool are disabled), `thinking_dialect` (overrides the base provider's effort level mapping; one of `standard`, `prefer-high`, `high-only`, `glm`, `deep-seek`, `anthropic-adaptive`, `tensor-x`), `thinking_fields` (overrides where thinking values go in the body; see below), `body_override` (per-model body manipulation with three operations: `defaults` fills absent keys, `replace` overwrites existing keys, `filter` strips keys). The first model listed per tier is used for selecting that tier at runtime.
+
+`body_override` is the escape hatch when a model needs a field the base provider does not set, or needs to remove one the base provider always sets. All three operations run after the typed thinking setup, and each provider guards its conversation field (`messages`, `input`, or `contents`) from all three. Example:
+
+```json
+[{{"id": "my-model", "tier": "strong", "body_override": {{"defaults": {{"chat_template_kwargs": {{"enable_thinking": true}}}}, "filter": ["some_base_key"]}}}}]
+```
+
+`thinking_fields` lets you control where effort strings, toggles, and budgets go in the body. It has `effort_path` (dot-path for the effort string), `budget_path` (dot-path for a budget integer), `budget_max` (cap), and `toggles` (a list of toggle objects, each with `path`, `on`, `off`, `adaptive`, and `budget_key`). This lets you handle providers like DeepSeek (toggle + effort), Google (budget + thoughts flag), OpenRouter (nested `reasoning.effort`), and exotic setups like ElectronHub (multiple toggle objects + effort in a nested object).
 
 Dynamic provider models are namespaced as `{{slug}}/{{model_id}}` (e.g. `myproxy/claude-sonnet-4-6`).
 

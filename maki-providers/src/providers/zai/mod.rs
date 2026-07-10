@@ -10,6 +10,7 @@ use tracing::warn;
 use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier};
 use crate::provider::{BoxFuture, Provider};
 use crate::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
+use crate::types::ThinkingFieldConfig;
 use crate::{
     AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse, UsageLimit,
     dialect,
@@ -25,6 +26,13 @@ static CONFIG_STANDARD: OpenAiCompatConfig = OpenAiCompatConfig {
     include_stream_usage: false,
     provider_name: "Z.AI",
 };
+
+fn zai_fields() -> ThinkingFieldConfig {
+    ThinkingFieldConfig {
+        effort_path: Some("reasoning_effort".into()),
+        ..Default::default()
+    }
+}
 
 const QUOTA_LIMIT_URL: &str = "https://api.z.ai/api/monitor/usage/quota/limit";
 
@@ -301,8 +309,9 @@ impl Provider for Zai {
             let mut body = self.compat.build_body(model, messages, system, tools);
             if model.supports_thinking() {
                 opts.thinking
-                    .apply_reasoning_effort(&mut body, &dialect::GLM, model);
+                    .apply_thinking(&mut body, model, &dialect::GLM, &zai_fields());
             }
+            super::apply_body_overrides(&mut body, model, &["messages"]);
             match self
                 .compat
                 .do_stream(model, &[], &body, event_tx, &auth)

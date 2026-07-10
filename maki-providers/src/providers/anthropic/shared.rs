@@ -211,6 +211,7 @@ pub(crate) fn build_request_body_with_system(
     });
 
     thinking.apply_to_body(&mut body, model);
+    super::super::apply_body_overrides(&mut body, model, &["messages"]);
     body
 }
 
@@ -593,9 +594,14 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
 mod tests {
     use test_case::test_case;
 
+    use super::build_request_body_with_system;
     use super::{
         LONG_CONTEXT_SUFFIX, LONG_CONTEXT_WINDOW, long_context_window, strip_long_context,
     };
+    use crate::model::{Model, ModelFamily, ModelPricing, ModelTier};
+    use crate::types::{BodyOverride, ThinkingConfig};
+    use serde_json::json;
+    use std::sync::Arc;
 
     #[test_case("claude-opus-4-8-1m", "claude-opus-4-8" ; "strips_suffix")]
     #[test_case("claude-opus-4-8", "claude-opus-4-8" ; "leaves_plain_id")]
@@ -608,5 +614,57 @@ mod tests {
     fn long_context_window_follows_suffix(model_id: &str, expected: Option<u32>) {
         assert_eq!(long_context_window(model_id), expected);
         assert!(LONG_CONTEXT_SUFFIX.ends_with("1m"));
+    }
+
+    fn model_with_body_override(override_config: Option<BodyOverride>) -> Model {
+        Model {
+            id: "claude-opus-4-8".into(),
+            provider: Arc::from("anthropic"),
+            tier: ModelTier::Strong,
+            family: ModelFamily::Claude,
+            supports_tool_examples_override: None,
+            supports_thinking_override: None,
+            supports_vision_override: None,
+            pricing: ModelPricing::default(),
+            max_output_tokens: Some(8192),
+            context_window: 200_000,
+            thinking_dialect: None,
+            thinking_fields: None,
+            body_override: override_config,
+        }
+    }
+
+    #[test]
+    fn defaults_do_not_overwrite_standard_thinking() {
+        let model = model_with_body_override(Some(BodyOverride {
+            defaults: Some(json!({"thinking": {"type": "enabled", "budget_tokens": 2048}})),
+            replace: None,
+            filter: vec![],
+        }));
+        let body =
+            build_request_body_with_system(&model, &[], &[], &json!([]), ThinkingConfig::Adaptive);
+        assert_eq!(body["thinking"]["type"], "adaptive");
+        assert_eq!(body["max_tokens"], 8192);
+    }
+
+    #[test]
+    fn filter_strips_thinking_set_by_apply_to_body() {
+        let model = model_with_body_override(Some(BodyOverride {
+            defaults: Some(json!({"thinking": {"type": "enabled", "budget_tokens": 2048}})),
+            replace: None,
+            filter: vec!["thinking".into()],
+        }));
+        let body =
+            build_request_body_with_system(&model, &[], &[], &json!([]), ThinkingConfig::Adaptive);
+        assert!(body.get("thinking").is_none());
+        assert_eq!(body["max_tokens"], 8192);
+    }
+
+    #[test]
+    fn no_overrides_keeps_standard_body() {
+        let model = model_with_body_override(None);
+        let body =
+            build_request_body_with_system(&model, &[], &[], &json!([]), ThinkingConfig::Adaptive);
+        assert_eq!(body["thinking"]["type"], "adaptive");
     }
 }

@@ -6,6 +6,7 @@ use serde_json::{Value, json};
 
 use crate::model::{Model, ModelEntry, ModelInfo, ModelPricing};
 use crate::provider::{BoxFuture, Provider};
+use crate::types::{ThinkingFieldConfig, ToggleEntry};
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, dialect};
 
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
@@ -109,21 +110,47 @@ impl Provider for TensorX {
                 }
             };
 
-            if has_thinking {
-                body["thinking"] = json!(opts.thinking.is_enabled());
-            }
-            if has_reasoning_effort {
-                opts.thinking
-                    .apply_reasoning_effort(&mut body, &dialect::TENSORX, model);
-            }
+            let fields = if has_thinking && has_reasoning_effort {
+                ThinkingFieldConfig {
+                    effort_path: Some("reasoning_effort".into()),
+                    toggles: vec![ToggleEntry {
+                        path: "thinking".into(),
+                        on: Some(json!(true)),
+                        off: Some(json!(false)),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }
+            } else if has_thinking {
+                ThinkingFieldConfig {
+                    toggles: vec![ToggleEntry {
+                        path: "thinking".into(),
+                        on: Some(json!(true)),
+                        off: Some(json!(false)),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }
+            } else if has_reasoning_effort {
+                ThinkingFieldConfig {
+                    effort_path: Some("reasoning_effort".into()),
+                    ..Default::default()
+                }
+            } else {
+                ThinkingFieldConfig::default()
+            };
+            opts.thinking
+                .apply_thinking(&mut body, model, &dialect::TENSORX, &fields);
             // Fallback for deepseek models that use chat_template_kwargs
-            else if !has_thinking
+            if !has_thinking
+                && !has_reasoning_effort
                 && opts.thinking.is_enabled()
                 && model.id.starts_with("deepseek/deepseek-v4")
             {
                 body["chat_template_kwargs"] = json!({"thinking": true});
             }
 
+            super::apply_body_overrides(&mut body, model, &["messages"]);
             self.compat
                 .do_stream(model, &[], &body, event_tx, &auth)
                 .await
