@@ -10,12 +10,12 @@
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use tracing::warn;
 
-use maki_util::EntityId;
+use maki_util::MakiId;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -35,9 +35,12 @@ pub enum SessionError {
     #[error("incompatible session version {found} (expected {expected})")]
     VersionMismatch { found: u32, expected: u32 },
     #[error("session ID mismatch: log owns {log_id}, got {given_id}")]
-    IdMismatch {
-        log_id: EntityId,
-        given_id: EntityId,
+    IdMismatch { log_id: MakiId, given_id: MakiId },
+    #[error("session log {path} has header id {raw_id:?} that is not a valid id: {source}")]
+    CorruptHeaderId {
+        path: String,
+        raw_id: String,
+        source: maki_util::MakiIdParseError,
     },
     #[error("cursor ahead of session (log has {saved}, session has {actual}); compact required")]
     CursorAhead { saved: usize, actual: usize },
@@ -108,7 +111,7 @@ pub struct SessionMeta {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session<M, U, T> {
     pub version: u32,
-    pub id: EntityId,
+    pub id: MakiId,
     pub title: String,
     pub cwd: String,
     pub model: String,
@@ -125,7 +128,7 @@ pub struct Session<M, U, T> {
 }
 
 pub struct SessionSummary {
-    pub id: EntityId,
+    pub id: MakiId,
     pub title: String,
     pub updated_at: u64,
 }
@@ -195,7 +198,7 @@ pub struct StoredSubagent {
 #[derive(Deserialize)]
 struct LegacyHeader {
     version: u32,
-    id: EntityId,
+    id: MakiId,
     title: String,
     cwd: String,
     updated_at: u64,
@@ -232,7 +235,7 @@ enum LogRecord<M, U, T> {
     #[serde(rename = "header")]
     Header {
         v: u32,
-        id: EntityId,
+        id: MakiId,
         model: String,
         cwd: String,
         created_at: u64,
@@ -256,7 +259,7 @@ enum LogRecord<M, U, T> {
 // -- SessionLog: append-only persistence --
 
 pub struct SessionLog {
-    session_id: EntityId,
+    session_id: MakiId,
     file: File,
     saved_msg_count: usize,
     saved_tool_ids: HashSet<String>,
@@ -274,20 +277,35 @@ impl SessionLog {
         U: Serialize,
         T: Serialize,
     {
+        let log = Self::write_canonical(dir, session)?;
+        update_cwd_index(dir, &session.cwd, session.id)?;
+        Ok(log)
+    }
+
+    /// Writes the canonical `{id}.jsonl` without touching the cwd→latest index.
+    /// Used by read-path migration, where merely opening an old session must not
+    /// repoint "latest" at it.
+    fn write_canonical<M, U, T>(
+        dir: &Path,
+        session: &Session<M, U, T>,
+    ) -> Result<Self, SessionError>
+    where
+        M: Serialize,
+        U: Serialize,
+        T: Serialize,
+    {
         fs::create_dir_all(dir).map_err(StorageError::from)?;
         let path = dir.join(format!("{}.jsonl", session.id));
         let mut file = File::create(&path).map_err(StorageError::from)?;
         write_full_session(&mut file, session)?;
         file.sync_data().map_err(StorageError::from)?;
 
-        update_cwd_index(dir, &session.cwd, session.id)?;
-
         Ok(Self::cursor_from(session, file))
     }
 
     pub fn open<M, U, T>(
         dir: &Path,
-        session_id: EntityId,
+        session_id: MakiId,
     ) -> Result<(Session<M, U, T>, Self), SessionError>
     where
         M: Serialize + DeserializeOwned,
@@ -306,7 +324,7 @@ impl SessionLog {
         Ok((session, log))
     }
 
-    pub fn session_id(&self) -> EntityId {
+    pub fn session_id(&self) -> MakiId {
         self.session_id
     }
 
@@ -524,6 +542,18 @@ fn append_record<R: Serialize>(buf: &mut Vec<u8>, record: &R) -> Result<(), Sess
     Ok(())
 }
 
+/// Tag-only probe used to classify a line that failed the strict `LogRecord`
+/// parse: distinguishes a header with a bad id from a genuinely unknown record.
+#[derive(Deserialize)]
+#[serde(tag = "t", rename_all = "lowercase")]
+enum RawTag {
+    Header {
+        id: String,
+    },
+    #[serde(other)]
+    Other,
+}
+
 fn load_jsonl<M, U, T>(path: &Path) -> Result<Session<M, U, T>, SessionError>
 where
     M: DeserializeOwned,
@@ -534,7 +564,7 @@ where
     let reader = BufReader::new(file);
     let mut line_count = 0usize;
 
-    let mut id: Option<EntityId> = None;
+    let mut id: Option<MakiId> = None;
     let mut model = String::new();
     let mut cwd = String::new();
     let mut created_at = 0u64;
@@ -556,6 +586,20 @@ where
         let record: LogRecord<M, U, T> = match serde_json::from_str(&line) {
             Ok(r) => r,
             Err(e) => {
+                // A header whose only defect is an unparseable id fails the
+                // strict LogRecord parse; surface that precisely instead of
+                // silently skipping to a misleading NotFound. The header is
+                // always the first line, so only probe until we have one.
+                if !got_header
+                    && let Ok(RawTag::Header { id: raw_id }) = serde_json::from_str::<RawTag>(&line)
+                    && let Err(source) = raw_id.parse::<MakiId>()
+                {
+                    return Err(SessionError::CorruptHeaderId {
+                        path: path.display().to_string(),
+                        raw_id,
+                        source,
+                    });
+                }
                 warn!(
                     path = %path.display(),
                     error = %e,
@@ -636,16 +680,24 @@ fn load_cwd_index(dir: &Path) -> HashMap<String, String> {
         .unwrap_or_default()
 }
 
-fn update_cwd_index(dir: &Path, cwd: &str, session_id: EntityId) -> Result<(), StorageError> {
+fn update_cwd_index(dir: &Path, cwd: &str, session_id: MakiId) -> Result<(), StorageError> {
     let mut index = load_cwd_index(dir);
     index.insert(cwd.to_string(), session_id.to_string());
     atomic_write(&dir.join(CWD_INDEX_FILE), &serde_json::to_vec(&index)?)
 }
 
-fn remove_from_cwd_index(dir: &Path, session_id: EntityId) -> Result<(), StorageError> {
+fn try_remove(path: &Path) -> Result<bool, StorageError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn remove_from_cwd_index(dir: &Path, session_id: MakiId) -> Result<(), StorageError> {
     let mut index = load_cwd_index(dir);
     let before = index.len();
-    index.retain(|_, v| v.parse::<EntityId>() != Ok(session_id));
+    index.retain(|_, v| v.parse::<MakiId>() != Ok(session_id));
     if index.len() != before {
         atomic_write(&dir.join(CWD_INDEX_FILE), &serde_json::to_vec(&index)?)?;
     }
@@ -657,7 +709,7 @@ fn remove_from_cwd_index(dir: &Path, session_id: EntityId) -> Result<(), Storage
 #[derive(Deserialize)]
 struct JsonlHeader {
     v: u32,
-    id: EntityId,
+    id: MakiId,
     cwd: String,
 }
 
@@ -775,15 +827,16 @@ fn session_entries(dir: &Path) -> Result<Vec<PathBuf>, StorageError> {
     Ok(entries)
 }
 
-fn find_legacy_file(dir: &Path, id: EntityId) -> Option<PathBuf> {
+fn find_legacy_file(dir: &Path, id: MakiId) -> Option<PathBuf> {
+    let canonical = id.to_string();
     session_entries(dir).ok()?.into_iter().find(|p| {
         p.file_stem()
             .and_then(|s| s.to_str())
-            .is_some_and(|s| s.parse::<EntityId>() == Ok(id) && s != id.to_string().as_str())
+            .is_some_and(|s| s != canonical && s.parse::<MakiId>() == Ok(id))
     })
 }
 
-fn locate_session_file(dir: &Path, id: EntityId) -> Option<PathBuf> {
+fn locate_session_file(dir: &Path, id: MakiId) -> Option<PathBuf> {
     for ext in ["jsonl", "json"] {
         let path = dir.join(format!("{id}.{ext}"));
         if path.exists() {
@@ -825,7 +878,7 @@ where
         let now = now_epoch();
         Self {
             version: SESSION_VERSION,
-            id: EntityId::generate(),
+            id: MakiId::generate(),
             title: DEFAULT_TITLE.into(),
             cwd: cwd.into(),
             model: model.into(),
@@ -853,12 +906,12 @@ where
         Ok(())
     }
 
-    pub fn load(id: EntityId, dir: &StateDir) -> Result<Self, SessionError> {
+    pub fn load(id: MakiId, dir: &StateDir) -> Result<Self, SessionError> {
         let sessions_dir = dir.ensure_subdir(SESSIONS_DIR)?;
         Self::load_from(id, &sessions_dir)
     }
 
-    pub fn load_from(id: EntityId, dir: &Path) -> Result<Self, SessionError> {
+    pub fn load_from(id: MakiId, dir: &Path) -> Result<Self, SessionError> {
         let Some(path) = locate_session_file(dir, id) else {
             return Err(StorageError::NotFound(id.to_string()).into());
         };
@@ -869,7 +922,7 @@ where
                 .and_then(|s| s.to_str())
                 .is_some_and(|s| s != id.to_string().as_str());
         if needs_migration {
-            if let Err(e) = SessionLog::create(dir, &session) {
+            if let Err(e) = SessionLog::write_canonical(dir, &session) {
                 warn!(error = %e, "failed migrate to canonical jsonl; keeping legacy file");
             } else if let Err(e) = fs::remove_file(&path) {
                 warn!(error = %e, path = %path.display(), "legacy file remains after migration");
@@ -897,7 +950,7 @@ where
     pub fn latest_in(cwd: &str, dir: &Path) -> Result<Option<Self>, SessionError> {
         let index = load_cwd_index(dir);
         if let Some(id) = index.get(cwd) {
-            match id.parse::<EntityId>() {
+            match id.parse::<MakiId>() {
                 Ok(id) => match Self::load_from(id, dir) {
                     Ok(s) => return Ok(Some(s)),
                     Err(e) => warn!(error = %e, cwd, "indexed session missing on disk; rescanning"),
@@ -919,16 +972,23 @@ where
         }
     }
 
-    pub fn delete(id: EntityId, dir: &StateDir) -> Result<(), SessionError> {
+    pub fn delete(id: MakiId, dir: &StateDir) -> Result<(), SessionError> {
         let sessions_dir = dir.ensure_subdir(SESSIONS_DIR)?;
         Self::delete_from(id, &sessions_dir)
     }
 
-    pub fn delete_from(id: EntityId, dir: &Path) -> Result<(), SessionError> {
-        let Some(path) = locate_session_file(dir, id) else {
+    pub fn delete_from(id: MakiId, dir: &Path) -> Result<(), SessionError> {
+        // Remove every on-disk copy for this id: both canonical extensions plus
+        // any legacy-named file. A surviving copy would be re-migrated on the
+        // next load, resurrecting a "deleted" session.
+        let mut removed = try_remove(&dir.join(format!("{id}.jsonl")))?;
+        removed |= try_remove(&dir.join(format!("{id}.json")))?;
+        if let Some(legacy) = find_legacy_file(dir, id) {
+            removed |= try_remove(&legacy)?;
+        }
+        if !removed {
             return Err(StorageError::NotFound(id.to_string()).into());
-        };
-        fs::remove_file(&path).map_err(StorageError::from)?;
+        }
         remove_from_cwd_index(dir, id)?;
         Ok(())
     }
@@ -951,7 +1011,7 @@ mod tests {
         load_cwd_index, update_cwd_index, write_full_session,
     };
     use super::{Session, SessionError, SessionLog, StorageError, TitleSource};
-    use maki_util::EntityId;
+    use maki_util::MakiId;
     use serde_json::Value;
     use std::collections::HashMap;
     use std::fs::{self, OpenOptions};
@@ -1051,7 +1111,7 @@ mod tests {
 
     #[test]
     fn usage_by_model_absent_on_legacy_session() {
-        let id: EntityId = LEGACY_HEX_ID.parse().unwrap();
+        let id: MakiId = LEGACY_HEX_ID.parse().unwrap();
         let json = format!(
             r#"{{"t":"header","v":2,"id":"{LEGACY_HEX_ID}","model":"m","cwd":"/","created_at":0}}
 {{"t":"meta","title":"t","token_usage":null,"updated_at":0}}"#
@@ -1184,7 +1244,7 @@ mod tests {
     #[test]
     fn load_nonexistent_returns_not_found() {
         let tmp = TempDir::new().unwrap();
-        let id = EntityId::generate();
+        let id = MakiId::generate();
         let err = TestSession::load_from(id, tmp.path()).unwrap_err();
         assert!(matches!(
             err,
@@ -1198,7 +1258,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
 
-        let id: EntityId = legacy.parse().unwrap();
+        let id: MakiId = legacy.parse().unwrap();
         let mut session: TestSession = Session::new("m", "/project");
         session.id = id;
         session.messages.push(user_message("legacy"));
@@ -1307,7 +1367,7 @@ mod tests {
     #[test]
     fn delete_nonexistent_returns_not_found() {
         let tmp = TempDir::new().unwrap();
-        let id = EntityId::generate();
+        let id = MakiId::generate();
         let err = TestSession::delete_from(id, tmp.path()).unwrap_err();
         assert!(matches!(
             err,
@@ -1321,7 +1381,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
 
-        let id: EntityId = legacy.parse().unwrap();
+        let id: MakiId = legacy.parse().unwrap();
         let mut session: TestSession = Session::new("m", "/project");
         session.id = id;
         session.messages.push(user_message("legacy"));
@@ -1337,12 +1397,79 @@ mod tests {
     }
 
     #[test]
+    fn delete_removes_coexisting_json_and_jsonl() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut session: TestSession = Session::new("m", "/project");
+        session.messages.push(user_message("hi"));
+
+        let jsonl_path = dir.join(format!("{}.jsonl", session.id));
+        let mut file = std::fs::File::create(&jsonl_path).unwrap();
+        write_full_session(&mut file, &session).unwrap();
+        drop(file);
+        let json_path = dir.join(format!("{}.json", session.id));
+        fs::write(&json_path, serde_json::to_vec(&session).unwrap()).unwrap();
+
+        TestSession::delete_from(session.id, dir).unwrap();
+        assert!(!jsonl_path.exists());
+        assert!(!json_path.exists());
+    }
+
+    #[test]
+    fn load_migration_does_not_steal_latest_pointer() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        let mut newest: TestSession = Session::new("m", "/project");
+        newest.title = "newest".into();
+        save_with_time(&mut newest, dir, 3000);
+
+        let mut older: TestSession = Session::new("m", "/project");
+        older.title = "older".into();
+        older.updated_at = 1000;
+        let json_path = dir.join(format!("{}.json", older.id));
+        fs::write(&json_path, serde_json::to_vec(&older).unwrap()).unwrap();
+
+        // Opening the older session migrates it to canonical jsonl, but must not
+        // repoint cwd→latest at it.
+        let loaded = TestSession::load_from(older.id, dir).unwrap();
+        assert_eq!(loaded.title, "older");
+        assert!(!json_path.exists());
+
+        let latest = TestSession::latest_in("/project", dir).unwrap().unwrap();
+        assert_eq!(latest.title, "newest");
+    }
+
+    #[test]
+    fn load_surfaces_corrupt_header_id() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let id = MakiId::generate();
+        let mut session: TestSession = Session::new("m", "/project");
+        session.id = id;
+
+        let path = dir.join(format!("{id}.jsonl"));
+        let mut file = std::fs::File::create(&path).unwrap();
+        write_full_session(&mut file, &session).unwrap();
+        drop(file);
+
+        let corrupted =
+            fs::read_to_string(&path)
+                .unwrap()
+                .replacen(&id.to_string(), "not-a-valid-id", 1);
+        fs::write(&path, corrupted).unwrap();
+
+        let err = TestSession::load_from(id, dir).unwrap_err();
+        assert!(matches!(err, SessionError::CorruptHeaderId { .. }));
+    }
+
+    #[test]
     fn remove_from_cwd_index_matches_legacy_hex_value() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
 
         let legacy = "550e8400-e29b-41d4-a716-446655440000";
-        let id: EntityId = legacy.parse().unwrap();
+        let id: MakiId = legacy.parse().unwrap();
         let mut session: TestSession = Session::new("m", "/project");
         session.id = id;
 
@@ -1436,7 +1563,7 @@ mod tests {
             "cwd": "/tmp",
             "created_at": 0
         });
-        let id: EntityId = "01965087-4c71-7f00-8000-000000000000".parse().unwrap();
+        let id: MakiId = "01965087-4c71-7f00-8000-000000000000".parse().unwrap();
         let path = dir.join(format!("{id}.jsonl"));
         fs::write(&path, format!("{}\n", bad_header)).unwrap();
 
@@ -1527,7 +1654,7 @@ mod tests {
     fn corrupt_header_line_only_returns_not_found() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
-        let id: EntityId = "01965087-4c71-7f00-8000-000000000000".parse().unwrap();
+        let id: MakiId = "01965087-4c71-7f00-8000-000000000000".parse().unwrap();
         let path = dir.join(format!("{id}.jsonl"));
         fs::write(&path, "NOT_A_HEADER\n").unwrap();
 

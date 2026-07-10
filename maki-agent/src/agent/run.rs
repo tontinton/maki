@@ -22,7 +22,7 @@ use crate::{
     InterruptSource, TurnCompleteEvent,
 };
 use maki_config::ToolOutputLines;
-use maki_util::WireSessionId;
+use maki_util::SessionRef;
 
 const MAX_REAUTH_ATTEMPTS: u32 = 2;
 const NUDGE_PROMPT: &str = "You just executed tool calls but returned an empty response. Please process the tool results above and continue with the task.";
@@ -56,7 +56,7 @@ pub struct AgentParams {
     pub config: AgentConfig,
     pub tool_output_lines: ToolOutputLines,
     pub permissions: Arc<PermissionManager>,
-    pub session_id: Option<WireSessionId>,
+    pub session_id: Option<SessionRef>,
     pub timeouts: maki_providers::Timeouts,
     pub file_tracker: Arc<FileReadTracker>,
     pub prompt_slots: Arc<crate::prompt::ResolvedSlots>,
@@ -97,7 +97,7 @@ pub struct Agent<'h> {
     post_tool_empty_retried: bool,
     permissions: Arc<PermissionManager>,
     opts: RequestOptions,
-    session_id: Option<WireSessionId>,
+    session_id: Option<SessionRef>,
     timeouts: maki_providers::Timeouts,
     file_tracker: Arc<FileReadTracker>,
     prompt_slots: Arc<crate::prompt::ResolvedSlots>,
@@ -555,7 +555,7 @@ mod tests {
             _: &'a Value,
             _: &'a flume::Sender<ProviderEvent>,
             _: RequestOptions,
-            _: Option<&'a WireSessionId>,
+            _: Option<&'a SessionRef>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async {
                 let mut responses = self.responses.lock().unwrap();
@@ -847,7 +847,7 @@ mod tests {
                     _: &'a Value,
                     _: &'a flume::Sender<ProviderEvent>,
                     _: RequestOptions,
-                    _: Option<&'a WireSessionId>,
+                    _: Option<&'a SessionRef>,
                 ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
                     Box::pin(async {
                         futures_lite::future::pending::<()>().await;

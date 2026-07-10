@@ -32,7 +32,7 @@ fn resolve_session(
     storage: &StateDir,
 ) -> Result<AppSession> {
     if let Some(raw) = session_id {
-        let id: maki_util::EntityId = raw
+        let id: maki_util::MakiId = raw
             .parse()
             .map_err(|e| color_eyre::eyre::eyre!("invalid session id {raw:?}: {e}"))?;
         return AppSession::load(id, storage).map_err(|e| color_eyre::eyre::eyre!("{e}"));

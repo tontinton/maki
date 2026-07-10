@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use flume::Sender;
-use maki_util::WireSessionId;
+use maki_util::SessionRef;
 use serde_json::{Value, json};
 
 use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier};
@@ -191,7 +191,7 @@ impl Provider for Mistral {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        session_id: Option<&'a WireSessionId>,
+        session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let auth = self.auth.lock().unwrap().clone();
@@ -204,8 +204,8 @@ impl Provider for Mistral {
             convert_assistant_messages_in_place(body.get_mut("messages").unwrap());
 
             let mut extra_headers = vec![];
-            if let Some(sid) = session_id {
-                extra_headers.push(("x-affinity", sid.as_str()));
+            if let Some(session_id) = session_id {
+                extra_headers.push(("x-affinity", session_id.as_str()));
             }
             self.compat
                 .do_stream(model, &extra_headers, &body, event_tx, &auth)

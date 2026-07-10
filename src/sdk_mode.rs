@@ -5,7 +5,7 @@
 //!
 //! Per-message wire ids (`uuid`, assistant `message.id`) use `uuid::Uuid::now_v7()` to emit the
 //! hyphenated-hex UUIDv7 shape that Claude Code SDK consumers expect, rather than maki's base58
-//! `EntityId` canonical form.
+//! `MakiId` canonical form.
 #![allow(clippy::disallowed_methods)]
 
 use std::collections::{HashMap, HashSet};
@@ -106,7 +106,7 @@ impl PermissionMode {
 struct WireMessage {
     #[serde(flatten)]
     inner: WireInner,
-    session_id: maki_util::WireSessionId,
+    session_id: maki_util::SessionRef,
     uuid: String,
 }
 
@@ -394,7 +394,7 @@ fn maki_to_claude_tool_name(name: &str) -> &str {
 
 #[derive(Clone)]
 struct SdkWriter {
-    session_id: maki_util::WireSessionId,
+    session_id: maki_util::SessionRef,
     out_tx: Sender<String>,
 }
 
@@ -638,13 +638,10 @@ pub fn run(params: SdkParams) -> Result<()> {
 
 type StoredSession = Session<Message, TokenUsage, ToolOutput>;
 
-fn resolve_session(
-    cli: &Cli,
-    cwd: &str,
-) -> Result<(Option<maki_util::WireSessionId>, Vec<Message>)> {
+fn resolve_session(cli: &Cli, cwd: &str) -> Result<(Option<maki_util::SessionRef>, Vec<Message>)> {
     let (resumed_id, history) = if let Some(id) = &cli.session {
         let storage = StateDir::resolve().context("resolve state dir")?;
-        let parsed: maki_util::EntityId = id
+        let parsed: maki_util::MakiId = id
             .parse()
             .map_err(|e| eyre!("invalid session id {id}: {e}"))?;
         let session =
@@ -660,7 +657,7 @@ fn resolve_session(
         let storage = StateDir::resolve().context("resolve state dir")?;
         match StoredSession::latest(cwd, &storage) {
             Ok(Some(session)) => (
-                Some(maki_util::WireSessionId::from(session.id)),
+                Some(maki_util::SessionRef::from(session.id)),
                 session.messages,
             ),
             _ => (None, Vec::new()),
@@ -670,7 +667,7 @@ fn resolve_session(
     };
 
     let cli_session_id = cli.session_id.as_deref().map(|s| {
-        s.parse::<maki_util::WireSessionId>()
+        s.parse::<maki_util::SessionRef>()
             .map_err(|e| eyre!("invalid session id {s:?}: {e}"))
     });
     let cli_session_id = match cli_session_id {
@@ -1289,7 +1286,7 @@ mod tests {
                 usage: TokenUsage::default(),
                 permission_denials: Vec::new(),
             }),
-            session_id: maki_util::WireSessionId::generate(),
+            session_id: maki_util::SessionRef::generate(),
             uuid: "u".into(),
         };
         let json: Value = serde_json::to_value(&msg).unwrap();
@@ -1311,7 +1308,7 @@ mod tests {
                     "permissionMode": "default",
                 }),
             }),
-            session_id: maki_util::WireSessionId::generate(),
+            session_id: maki_util::SessionRef::generate(),
             uuid: "u".into(),
         };
         let json: Value = serde_json::to_value(&msg).unwrap();
@@ -1331,7 +1328,7 @@ mod tests {
                     error: None,
                 },
             }),
-            session_id: maki_util::WireSessionId::generate(),
+            session_id: maki_util::SessionRef::generate(),
             uuid: "u".into(),
         };
         let json: Value = serde_json::to_value(&msg).unwrap();
@@ -1351,7 +1348,7 @@ mod tests {
                     tool_use_id: Some("tool_123".into()),
                 },
             }),
-            session_id: maki_util::WireSessionId::generate(),
+            session_id: maki_util::SessionRef::generate(),
             uuid: "u".into(),
         };
         let json: Value = serde_json::to_value(&msg).unwrap();

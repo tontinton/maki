@@ -4,7 +4,7 @@ use flume::Sender;
 use futures_lite::future;
 use maki_providers::provider::Provider;
 use maki_providers::{Message, Model, ProviderEvent, RequestOptions};
-use maki_util::WireSessionId;
+use maki_util::SessionRef;
 use serde_json::Value;
 
 use crate::components::btw_modal::BtwEvent;
@@ -48,7 +48,7 @@ impl App {
         let (tx, rx) = flume::bounded(64);
         self.btw_modal.open(&question, rx);
 
-        let session_id = maki_util::WireSessionId::from(self.state.session.id);
+        let session_id = maki_util::SessionRef::from(self.state.session.id);
         smol::spawn(run_btw(
             provider,
             model,
@@ -67,7 +67,7 @@ async fn run_btw(
     system: String,
     messages: Vec<Message>,
     btw_tx: Sender<BtwEvent>,
-    session_id: Option<WireSessionId>,
+    session_id: Option<SessionRef>,
 ) {
     let (event_tx, event_rx) = flume::unbounded();
     let tools = Value::Array(vec![]);

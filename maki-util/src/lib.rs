@@ -11,24 +11,28 @@ use uuid::Uuid;
 const UUID_BYTES: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
-pub enum EntityIdParseError {
+pub enum MakiIdParseError {
     #[error("empty id")]
     Empty,
     #[error("invalid base58 character {0:?} at {1}")]
     InvalidBase58(char, usize),
+    #[error("base58 string has a length that cannot decode to whole bytes")]
+    InvalidBase58Length,
     #[error("id decoded to {0} bytes, expected {UUID_BYTES}")]
     InvalidByteLen(usize),
 }
 
-/// Time-ordered, base58-encoded identifier backed by a UUIDv7.
+/// The canonical unique id for anything in maki (sessions, and message
+/// nodes once history is a tree): time-ordered, base58-encoded, backed by a
+/// UUIDv7.
 ///
 /// Serializes as base58. Accepts legacy v4-hex-uuid strings on parse
 /// (either hyphenated 8-4-4-4-12 or the unhyphenated 32 hex variant)
 /// so existing on-disk sessions resume; the canonical form is base58.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct EntityId([u8; UUID_BYTES]);
+pub struct MakiId([u8; UUID_BYTES]);
 
-impl EntityId {
+impl MakiId {
     #[allow(clippy::disallowed_methods)]
     pub fn generate() -> Self {
         Self(Uuid::now_v7().into_bytes())
@@ -39,18 +43,18 @@ impl EntityId {
     }
 }
 
-impl fmt::Display for EntityId {
+impl fmt::Display for MakiId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0.to_base58())
     }
 }
 
-impl FromStr for EntityId {
-    type Err = EntityIdParseError;
+impl FromStr for MakiId {
+    type Err = MakiIdParseError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         if s.is_empty() {
-            return Err(EntityIdParseError::Empty);
+            return Err(MakiIdParseError::Empty);
         }
         if let Ok(u) = Uuid::parse_str(s) {
             return Ok(Self(u.into_bytes()));
@@ -59,84 +63,85 @@ impl FromStr for EntityId {
     }
 }
 
-fn decode_base58(s: &str) -> Result<EntityId, EntityIdParseError> {
+fn decode_base58(s: &str) -> Result<MakiId, MakiIdParseError> {
     let bytes = s.from_base58().map_err(|e| match e {
         base58::FromBase58Error::InvalidBase58Character(c, pos) => {
-            EntityIdParseError::InvalidBase58(c, pos)
+            MakiIdParseError::InvalidBase58(c, pos)
         }
-        base58::FromBase58Error::InvalidBase58Length => EntityIdParseError::InvalidByteLen(0),
+        base58::FromBase58Error::InvalidBase58Length => MakiIdParseError::InvalidBase58Length,
     })?;
     if bytes.len() != UUID_BYTES {
-        return Err(EntityIdParseError::InvalidByteLen(bytes.len()));
+        return Err(MakiIdParseError::InvalidByteLen(bytes.len()));
     }
     let mut arr = [0u8; UUID_BYTES];
     arr.copy_from_slice(&bytes);
-    Ok(EntityId(arr))
+    Ok(MakiId(arr))
 }
 
-impl Serialize for EntityId {
+impl Serialize for MakiId {
     fn serialize<S: Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
         ser.collect_str(self)
     }
 }
 
-impl<'de> Deserialize<'de> for EntityId {
+impl<'de> Deserialize<'de> for MakiId {
     fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
         let s = String::deserialize(de)?;
         s.parse().map_err(serde::de::Error::custom)
     }
 }
 
-/// A session id in its exchangeable string form.
+/// A reference to a session as provided at an application boundary (ACP,
+/// session resume, SDK mode).
 ///
-/// Opaque above the storage boundary; parsed to [`EntityId`] only at storage
+/// Opaque above the storage boundary; resolved to a [`MakiId`] only at storage
 /// ops via [`parse`](Self::parse). Preserves the caller's exact string verbatim
 /// (legacy hex ids resume unchanged) so wire echo and client correlation hold.
-/// Canonical when self-generated via [`from_entity`](Self::from_entity) (base58).
+/// Canonical when self-generated via [`from_id`](Self::from_id) (base58).
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
-pub struct WireSessionId(String);
+pub struct SessionRef(String);
 
-impl WireSessionId {
-    pub fn from_entity(id: EntityId) -> Self {
+impl SessionRef {
+    pub fn from_id(id: MakiId) -> Self {
         Self(id.to_string())
     }
 
     pub fn generate() -> Self {
-        Self::from_entity(EntityId::generate())
+        Self::from_id(MakiId::generate())
     }
 
     pub fn as_str(&self) -> &str {
         &self.0
     }
 
-    pub fn parse(&self) -> Result<EntityId, EntityIdParseError> {
+    pub fn parse(&self) -> Result<MakiId, MakiIdParseError> {
         self.0.parse()
     }
 }
 
-impl From<EntityId> for WireSessionId {
-    fn from(id: EntityId) -> Self {
-        Self::from_entity(id)
+impl From<MakiId> for SessionRef {
+    fn from(id: MakiId) -> Self {
+        Self::from_id(id)
     }
 }
 
-impl fmt::Display for WireSessionId {
+impl fmt::Display for SessionRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
     }
 }
 
-impl FromStr for WireSessionId {
-    type Err = EntityIdParseError;
+impl FromStr for SessionRef {
+    type Err = MakiIdParseError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        s.parse::<EntityId>()?;
+        s.parse::<MakiId>()?;
         Ok(Self(s.to_string()))
     }
 }
 
-impl<'de> Deserialize<'de> for WireSessionId {
+impl<'de> Deserialize<'de> for SessionRef {
     fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
         let s = String::deserialize(de)?;
         s.parse().map_err(serde::de::Error::custom)
@@ -150,61 +155,68 @@ mod tests {
 
     const SAMPLE_HEX: &str = "01965087-4c71-7f00-8000-000000000000";
 
-    fn parse(s: &str) -> EntityId {
+    fn parse(s: &str) -> MakiId {
         s.parse().unwrap()
     }
 
     #[test]
     fn generate_is_v7() {
-        let id = EntityId::generate();
+        let id = MakiId::generate();
         let uuid = Uuid::from_bytes(id.0);
         assert_eq!(uuid.get_version(), Some(uuid::Version::SortRand));
     }
 
     #[test]
     fn roundtrip_base58() {
-        let id = EntityId::generate();
+        let id = MakiId::generate();
         let s = id.to_string();
         assert!((21..=22).contains(&s.len()));
-        assert_eq!(s.parse::<EntityId>().unwrap(), id);
+        assert_eq!(s.parse::<MakiId>().unwrap(), id);
+    }
+
+    #[test_case("00000000-0000-7000-8000-000000000000")]
+    #[test_case("00000001-0002-7000-8000-000000000000")]
+    fn roundtrips_leading_zero_bytes(hex: &str) {
+        let id: MakiId = hex.parse().unwrap();
+        assert_eq!(id.to_string().parse::<MakiId>().unwrap(), id);
     }
 
     #[test_case(SAMPLE_HEX)]
     #[test_case("019650874c717f008000000000000000")]
     fn parses_legacy_and_canonical(s: &str) {
-        let expected = EntityId(Uuid::parse_str(SAMPLE_HEX).unwrap().into_bytes());
+        let expected = MakiId(Uuid::parse_str(SAMPLE_HEX).unwrap().into_bytes());
         assert_eq!(parse(s), expected);
     }
 
-    #[test_case("" => matches Err(EntityIdParseError::Empty))]
-    #[test_case("O" => matches Err(EntityIdParseError::InvalidBase58('O', 0)))]
-    #[test_case("2j87v4grC" => matches Err(EntityIdParseError::InvalidByteLen(_)))]
-    fn rejects_bad(s: &str) -> Result<EntityId, EntityIdParseError> {
+    #[test_case("" => matches Err(MakiIdParseError::Empty))]
+    #[test_case("O" => matches Err(MakiIdParseError::InvalidBase58('O', 0)))]
+    #[test_case("2j87v4grC" => matches Err(MakiIdParseError::InvalidByteLen(_)))]
+    fn rejects_bad(s: &str) -> Result<MakiId, MakiIdParseError> {
         s.parse()
     }
 
     #[test]
     fn serde_keyed_base58() {
-        let id = EntityId::generate();
+        let id = MakiId::generate();
         let s = serde_json::to_string(&id).unwrap();
         assert!((23..=24).contains(&s.len()));
-        let back: EntityId = serde_json::from_str(&s).unwrap();
+        let back: MakiId = serde_json::from_str(&s).unwrap();
         assert_eq!(back, id);
     }
 
     #[test_case(SAMPLE_HEX)]
     #[test_case("019650874c717f008000000000000000")]
-    fn wire_preserves_caller_string(s: &str) {
-        let wire: WireSessionId = s.parse().unwrap();
-        assert_eq!(wire.as_str(), s);
-        assert_eq!(wire.parse().unwrap(), parse(s));
+    fn ref_preserves_caller_string(s: &str) {
+        let session_ref: SessionRef = s.parse().unwrap();
+        assert_eq!(session_ref.as_str(), s);
+        assert_eq!(session_ref.parse().unwrap(), parse(s));
     }
 
     #[test]
-    fn wire_from_entity_is_canonical_base58() {
-        let id = EntityId::generate();
-        let wire = WireSessionId::from(id);
-        assert_eq!(wire.as_str(), id.to_string());
-        assert_eq!(wire.parse().unwrap(), id);
+    fn ref_from_id_is_canonical_base58() {
+        let id = MakiId::generate();
+        let session_ref = SessionRef::from(id);
+        assert_eq!(session_ref.as_str(), id.to_string());
+        assert_eq!(session_ref.parse().unwrap(), id);
     }
 }

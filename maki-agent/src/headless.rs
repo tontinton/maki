@@ -10,7 +10,7 @@ use maki_providers::model::Model;
 use maki_providers::provider::{self, Provider};
 use maki_storage::StateDir;
 use maki_storage::sessions::Session;
-use maki_util::{EntityId, WireSessionId};
+use maki_util::{MakiId, SessionRef};
 use serde_json::Value;
 use tracing::{error, warn};
 
@@ -33,14 +33,14 @@ struct SessionStore {
 }
 
 impl SessionStore {
-    fn open(session_id: EntityId, cwd: &str, model_spec: &str) -> Option<Self> {
+    fn open(session_id: MakiId, cwd: &str, model_spec: &str) -> Option<Self> {
         let dir = StateDir::resolve()
             .map_err(|e| warn!(error = %e, "state dir unavailable; session will not be persisted"))
             .ok()?;
         Some(Self::open_in(dir, session_id, cwd, model_spec))
     }
 
-    fn open_in(dir: StateDir, session_id: EntityId, cwd: &str, model_spec: &str) -> Self {
+    fn open_in(dir: StateDir, session_id: MakiId, cwd: &str, model_spec: &str) -> Self {
         match StoredSession::load(session_id, &dir) {
             Ok(session) => Self { dir, session },
             Err(_) => {
@@ -85,7 +85,7 @@ pub struct HeadlessParams {
 pub struct HeadlessHandle {
     pub event_rx: Receiver<Envelope>,
     pub tool_names: Vec<String>,
-    pub session_id: WireSessionId,
+    pub session_id: SessionRef,
     pub cwd: String,
     pub task: smol::Task<()>,
 }
@@ -173,9 +173,9 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
 
     let (raw_tx, event_rx) = flume::unbounded::<Envelope>();
 
-    let session_id = EntityId::generate();
-    let wire = WireSessionId::from(session_id);
-    let wire_clone = wire.clone();
+    let session_id = MakiId::generate();
+    let session_ref = SessionRef::from(session_id);
+    let session_ref_clone = session_ref.clone();
     let fast = params.fast;
     let workflow = params.workflow;
     let task = smol::spawn({
@@ -207,7 +207,7 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
                         params.permissions_config,
                         working_dir_path,
                     )),
-                    session_id: Some(wire_clone.clone()),
+                    session_id: Some(session_ref_clone.clone()),
                     timeouts: params.timeouts,
                     file_tracker: FileReadTracker::fresh(),
                     prompt_slots: Arc::new(params.prompt_slots),
@@ -255,7 +255,7 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
     HeadlessHandle {
         event_rx,
         tool_names,
-        session_id: wire,
+        session_id: session_ref,
         cwd: working_dir,
         task,
     }
@@ -270,7 +270,7 @@ pub struct InteractiveParams {
     pub excluded_tools: Vec<&'static str>,
     pub mcp_handle: Option<McpHandle>,
     pub initial_wd: PathBuf,
-    pub session_id: Option<WireSessionId>,
+    pub session_id: Option<SessionRef>,
     pub initial_history: Vec<Message>,
     pub yolo: bool,
     pub system_prompt_override: Option<String>,
@@ -285,7 +285,7 @@ pub struct InteractiveHandle {
     pub answer_tx: flume::Sender<String>,
     pub cancel_tx: flume::Sender<()>,
     pub model_tx: flume::Sender<Model>,
-    pub session_id: WireSessionId,
+    pub session_id: SessionRef,
     pub permissions: Arc<PermissionManager>,
     pub task: smol::Task<()>,
 }
@@ -311,14 +311,14 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
     let (cancel_tx, cancel_rx) = flume::bounded::<()>(1);
     let (model_tx, model_rx) = flume::unbounded::<Model>();
 
-    let (session_id, wire) = match params.session_id.clone() {
+    let (session_id, session_ref) = match params.session_id.clone() {
         Some(w) => {
-            let id = w.parse().expect("WireSessionId is pre-validated");
+            let id = w.parse().expect("SessionRef is pre-validated");
             (id, w)
         }
         None => {
-            let id = EntityId::generate();
-            (id, WireSessionId::from(id))
+            let id = MakiId::generate();
+            (id, SessionRef::from(id))
         }
     };
 
@@ -334,7 +334,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
     let answer_rx = Arc::new(Mutex::new(answer_rx));
     let file_tracker = FileReadTracker::fresh();
 
-    let wire_clone = wire.clone();
+    let session_ref_clone = session_ref.clone();
     let task = smol::spawn({
         let permissions = Arc::clone(&permissions);
         async move {
@@ -420,7 +420,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                         config: params.config.clone(),
                         tool_output_lines: ToolOutputLines::default(),
                         permissions: Arc::clone(&permissions),
-                        session_id: Some(wire_clone.clone()),
+                        session_id: Some(session_ref_clone.clone()),
                         timeouts: params.timeouts,
                         file_tracker: Arc::clone(&file_tracker),
                         prompt_slots: Arc::clone(&params.prompt_slots),
@@ -470,7 +470,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
         answer_tx,
         cancel_tx,
         model_tx,
-        session_id: wire,
+        session_id: session_ref,
         permissions,
         task,
     }
@@ -498,7 +498,7 @@ mod tests {
     const CWD: &str = "/project";
     const MODEL_SPEC: &str = "anthropic/claude-test";
 
-    fn session_id() -> maki_util::EntityId {
+    fn session_id() -> maki_util::MakiId {
         SESSION_ID.parse().unwrap()
     }
 

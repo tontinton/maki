@@ -1,5 +1,5 @@
 disallowed-methods = [
-  { path = "uuid::Uuid::new_v4", reason = "use maki_util::EntityId::generate (base58-encoded UUIDv7)", allow-invalid = true },
-  { path = "uuid::Uuid::new_v7", reason = "use maki_util::EntityId::generate (base58-encoded UUIDv7)", allow-invalid = true },
-  { path = "uuid::Uuid::now_v7", reason = "use maki_util::EntityId::generate (base58-encoded UUIDv7)", allow-invalid = true },
+  { path = "uuid::Uuid::new_v4", reason = "use maki_util::MakiId::generate (base58-encoded UUIDv7)", allow-invalid = true },
+  { path = "uuid::Uuid::new_v7", reason = "use maki_util::MakiId::generate (base58-encoded UUIDv7)", allow-invalid = true },
+  { path = "uuid::Uuid::now_v7", reason = "use maki_util::MakiId::generate (base58-encoded UUIDv7)", allow-invalid = true },
 ]

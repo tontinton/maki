@@ -56,7 +56,7 @@ struct PrintResult {
     num_turns: u32,
     result: String,
     stop_reason: Option<StopReason>,
-    session_id: maki_util::WireSessionId,
+    session_id: maki_util::SessionRef,
     total_cost_usd: f64,
     usage: TokenUsage,
 }
@@ -67,7 +67,7 @@ struct InitEvent<'a> {
     event_type: &'static str,
     subtype: &'static str,
     cwd: &'a str,
-    session_id: &'a maki_util::WireSessionId,
+    session_id: &'a maki_util::SessionRef,
     tools: &'a [String],
     model: &'a str,
 }
@@ -77,7 +77,7 @@ struct AssistantEvent<'a> {
     #[serde(rename = "type")]
     event_type: &'static str,
     message: AssistantMessage<'a>,
-    session_id: &'a maki_util::WireSessionId,
+    session_id: &'a maki_util::SessionRef,
     #[serde(skip_serializing_if = "Option::is_none")]
     parent_tool_use_id: Option<&'a str>,
 }
@@ -95,7 +95,7 @@ struct UserEvent<'a> {
     #[serde(rename = "type")]
     event_type: &'static str,
     message: UserMessage<'a>,
-    session_id: &'a maki_util::WireSessionId,
+    session_id: &'a maki_util::SessionRef,
     #[serde(skip_serializing_if = "Option::is_none")]
     parent_tool_use_id: Option<&'a str>,
 }
@@ -114,7 +114,7 @@ struct RetryEvent<'a> {
     attempt: u32,
     retry_delay_ms: u64,
     error: &'a str,
-    session_id: &'a maki_util::WireSessionId,
+    session_id: &'a maki_util::SessionRef,
 }
 
 enum VerboseOutput {
@@ -190,7 +190,6 @@ pub fn run(
         cwd,
         task,
     } = handle;
-    let wire_id = &session_id;
     let start = Instant::now();
 
     let mut verbose_out = match format {
@@ -204,7 +203,7 @@ pub fn run(
             event_type: "system",
             subtype: "init",
             cwd: &cwd,
-            session_id: wire_id,
+            session_id: &session_id,
             tools: &tool_names,
             model: &model.id,
         })?;
@@ -256,7 +255,7 @@ pub fn run(
                         attempt: *attempt,
                         retry_delay_ms: *delay_ms,
                         error: message,
-                        session_id: wire_id,
+                        session_id: &session_id,
                     })?;
                 }
             }
@@ -271,7 +270,7 @@ pub fn run(
                             content: &content_value,
                             usage: &tc.usage,
                         },
-                        session_id: wire_id,
+                        session_id: &session_id,
                         parent_tool_use_id,
                     })?;
                 }
@@ -285,7 +284,7 @@ pub fn run(
                             role: "user",
                             content: &content_value,
                         },
-                        session_id: wire_id,
+                        session_id: &session_id,
                         parent_tool_use_id,
                     })?;
                 }
@@ -330,7 +329,7 @@ pub fn run(
                 num_turns,
                 result: result_text,
                 stop_reason,
-                session_id: wire_id.clone(),
+                session_id,
                 total_cost_usd,
                 usage,
             };
@@ -384,7 +383,7 @@ mod tests {
             num_turns: 2,
             result: "done".into(),
             stop_reason: Some(StopReason::EndTurn),
-            session_id: maki_util::WireSessionId::generate(),
+            session_id: maki_util::SessionRef::generate(),
             total_cost_usd: 0.003,
             usage: TokenUsage::default(),
         };
@@ -393,7 +392,7 @@ mod tests {
             assert!(json.get(field).is_some(), "PrintResult missing: {field}");
         }
 
-        let sid = maki_util::WireSessionId::generate();
+        let sid = maki_util::SessionRef::generate();
         let init = InitEvent {
             event_type: "system",
             subtype: "init",

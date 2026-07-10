@@ -534,7 +534,7 @@ async fn session(
         None => agent_ctx.opts.thinking,
     };
 
-    let session_id = maki_util::EntityId::generate();
+    let session_id = maki_util::MakiId::generate();
     let (sub_tx, sub_rx) = flume::unbounded::<Envelope>();
     let sub_event_tx = EventSender::new(sub_tx, agent_ctx.event_tx.run_id());
     let parent_tx = agent_ctx.event_tx.clone();

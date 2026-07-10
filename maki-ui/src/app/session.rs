@@ -245,7 +245,7 @@ impl App {
         self.loaded_session_snapshot()
     }
 
-    pub(super) fn load_session(&mut self, session_id: maki_util::EntityId) -> Vec<Action> {
+    pub(super) fn load_session(&mut self, session_id: maki_util::MakiId) -> Vec<Action> {
         let session = match AppSession::load(session_id, &self.storage) {
             Ok(s) => s,
             Err(e) => {
@@ -259,7 +259,7 @@ impl App {
         vec![Action::LoadSession(Box::new(loaded))]
     }
 
-    pub(super) fn delete_session(&mut self, session_id: maki_util::EntityId) -> Vec<Action> {
+    pub(super) fn delete_session(&mut self, session_id: maki_util::MakiId) -> Vec<Action> {
         if let Err(e) = AppSession::delete(session_id, &self.storage) {
             self.status_bar
                 .flash(format!("Failed to delete session: {e}"));

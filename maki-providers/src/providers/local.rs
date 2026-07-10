@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use flume::Sender;
 use futures::future::join_all;
-use maki_util::WireSessionId;
+use maki_util::SessionRef;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::warn;
@@ -135,7 +135,7 @@ impl Provider for LocalEndpoint {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        _session_id: Option<&'a WireSessionId>,
+        _session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let auth = self.auth.lock().unwrap().clone();

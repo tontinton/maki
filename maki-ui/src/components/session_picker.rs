@@ -8,7 +8,7 @@ use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use jiff::Timestamp;
 use maki_storage::StateDir;
-use maki_util::EntityId;
+use maki_util::MakiId;
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 
@@ -18,14 +18,14 @@ const FOOTER_HINTS: &[(&str, &str)] = &[("Enter", "open"), (key::DELETE.label, "
 
 pub enum SessionPickerAction {
     Consumed,
-    Select(EntityId),
+    Select(MakiId),
     ConfirmDelete,
-    Delete(EntityId),
+    Delete(MakiId),
     Close,
 }
 
 struct SessionEntry {
-    id: EntityId,
+    id: MakiId,
     title: String,
     relative_time: String,
 }
@@ -41,7 +41,7 @@ impl PickerItem for SessionEntry {
 
 pub struct SessionPicker {
     picker: ListPicker<SessionEntry>,
-    confirming: Option<(EntityId, u64)>,
+    confirming: Option<(MakiId, u64)>,
     pending_rx: Option<flume::Receiver<Result<Vec<SessionEntry>, String>>>,
     flash: Option<String>,
 }
@@ -56,7 +56,7 @@ impl SessionPicker {
         }
     }
 
-    pub fn open(&mut self, cwd: &str, current_session_id: EntityId, dir: &StateDir) {
+    pub fn open(&mut self, cwd: &str, current_session_id: MakiId, dir: &StateDir) {
         self.picker.open_loading(TITLE);
         let cwd = cwd.to_owned();
         let dir = dir.clone();
@@ -120,7 +120,7 @@ impl SessionPicker {
         self.pending_rx = None;
     }
 
-    pub fn remove_entry(&mut self, id: EntityId) {
+    pub fn remove_entry(&mut self, id: MakiId) {
         self.picker.retain(|e| e.id != id);
     }
 

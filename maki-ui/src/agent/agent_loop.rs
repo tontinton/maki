@@ -17,7 +17,7 @@ use maki_agent::{
 };
 use maki_lua::EventHandle;
 use maki_providers::{AgentError, Message, Model, TokenUsage};
-use maki_util::WireSessionId;
+use maki_util::SessionRef;
 use serde_json::Value;
 use tracing::error;
 
@@ -43,7 +43,7 @@ pub(super) struct AgentLoop {
     agent_tx: flume::Sender<Envelope>,
     answer_rx: Arc<async_lock::Mutex<flume::Receiver<String>>>,
     queue: Arc<QueueReceiver>,
-    session_id: Option<WireSessionId>,
+    session_id: Option<SessionRef>,
     timeouts: maki_providers::Timeouts,
     lua_handle: Option<EventHandle>,
     subagent_cancels: Arc<CancelMap<String>>,
@@ -65,7 +65,7 @@ impl AgentLoop {
         queue: Arc<QueueReceiver>,
         cancel_map: Arc<RunCancelMap>,
         init_cancel: CancelToken,
-        session_id: Option<WireSessionId>,
+        session_id: Option<SessionRef>,
         timeouts: maki_providers::Timeouts,
         lua_handle: Option<EventHandle>,
         subagent_cancels: Arc<CancelMap<String>>,
