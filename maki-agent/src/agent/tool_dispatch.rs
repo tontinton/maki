@@ -7,6 +7,7 @@ use std::time::Instant;
 use serde_json::Value;
 use tracing::{debug, error, warn};
 
+use super::hooks::DynHooks;
 use crate::mcp::{McpHandle, UNKNOWN_MCP};
 use crate::task_set::TaskSet;
 use crate::tools::registry::{ToolInvocation, ToolRegistry};
@@ -321,6 +322,7 @@ pub(super) async fn process_tool_calls(
     history: &mut super::history::History,
     event_tx: &crate::EventSender,
     ctx: &ToolContext,
+    hooks: Option<&DynHooks>,
 ) -> Result<(), AgentError> {
     let tool_uses: Vec<(String, String, Value)> = response
         .message
@@ -355,8 +357,10 @@ pub(super) async fn process_tool_calls(
 
     let mut set = TaskSet::new();
     let mut spawned_ids: Vec<String> = Vec::new();
+    let mut spawned_inputs: Vec<(Arc<str>, Value)> = Vec::new();
     for (id, name, input) in runnable {
         spawned_ids.push(id.clone());
+        spawned_inputs.push((Arc::from(name.as_str()), input.clone()));
         let event_tx_clone = ctx.event_tx.clone();
         let tool_ctx = ToolContext {
             tool_use_id: Some(id.clone()),
@@ -392,6 +396,31 @@ pub(super) async fn process_tool_calls(
             }
         })
         .collect();
+
+    if let Some(hooks) = hooks {
+        for (done, (_, input)) in results.iter().zip(&spawned_inputs) {
+            let payload = serde_json::json!({
+                "tool": done.tool.as_ref(),
+                "input": input,
+                "output": done.output.as_text(),
+                "is_error": done.is_error,
+            });
+            if let Err(e) = hooks.fire("PostToolResult", payload).await {
+                warn!(error = %e, "PostToolResult hook failed");
+            }
+        }
+        for err in &immediate_errors {
+            let payload = serde_json::json!({
+                "tool": err.tool.as_ref(),
+                "input": Value::Null,
+                "output": err.output.as_text(),
+                "is_error": true,
+            });
+            if let Err(e) = hooks.fire("PostToolResult", payload).await {
+                warn!(error = %e, "PostToolResult hook failed");
+            }
+        }
+    }
 
     let mut all_results = results;
     all_results.extend(immediate_errors);

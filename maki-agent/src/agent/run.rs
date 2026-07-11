@@ -27,6 +27,15 @@ use maki_config::ToolOutputLines;
 const MAX_REAUTH_ATTEMPTS: u32 = 2;
 const NUDGE_PROMPT: &str = "You just executed tool calls but returned an empty response. Please process the tool results above and continue with the task.";
 
+fn usage_json(usage: TokenUsage) -> Value {
+    serde_json::json!({
+        "input": usage.input,
+        "output": usage.output,
+        "cache_creation": usage.cache_creation,
+        "cache_read": usage.cache_read,
+    })
+}
+
 pub fn resolve_compaction_model(
     provider: &Arc<dyn Provider>,
     model: &Model,
@@ -297,6 +306,17 @@ impl<'h> Agent<'h> {
                 self.total_usage += usage;
                 self.context_size = usage.total_input();
 
+                if let Some(hooks) = &self.hooks {
+                    let payload = serde_json::json!({
+                        "usage": usage_json(usage),
+                        "has_tools": has_tools,
+                        "stop_reason": stop_reason.map(|s| s.to_string()),
+                    });
+                    if let Err(e) = hooks.fire("PostStream", payload).await {
+                        warn!(error = %e, "PostStream hook failed");
+                    }
+                }
+
                 if has_tools {
                     Ok(Phase::Dispatching { response })
                 } else {
@@ -353,6 +373,16 @@ impl<'h> Agent<'h> {
                 if self.try_auto_compact().await? || self.handle_queued_command().await? {
                     Ok(Phase::Streaming { nudged })
                 } else {
+                    if let Some(hooks) = &self.hooks {
+                        let payload = serde_json::json!({
+                            "stop_reason": stop_reason.map(|s| s.to_string()),
+                            "num_turns": self.num_turns,
+                            "total_usage": usage_json(self.total_usage),
+                        });
+                        if let Err(e) = hooks.fire("PostTurn", payload).await {
+                            warn!(error = %e, "PostTurn hook failed");
+                        }
+                    }
                     self.emit_done(stop_reason)?;
                     Ok(Phase::Done)
                 }
@@ -421,6 +451,7 @@ impl<'h> Agent<'h> {
             self.history,
             &self.event_tx,
             &ctx,
+            self.hooks.as_ref(),
         )
         .await
     }
@@ -468,14 +499,23 @@ impl<'h> Agent<'h> {
         }
         info!(context_size = self.context_size, "auto-compacting");
         self.event_tx.send(AgentEvent::AutoCompacting)?;
-        self.do_compact().await?;
+        let compaction_usage = self.do_compact().await?;
+        if let Some(hooks) = &self.hooks {
+            let payload = serde_json::json!({
+                "new_history_len": self.history.len(),
+                "compaction_usage": usage_json(compaction_usage),
+            });
+            if let Err(e) = hooks.fire("PostCompaction", payload).await {
+                warn!(error = %e, "PostCompaction hook failed");
+            }
+        }
         Ok(true)
     }
 
-    async fn do_compact(&mut self) -> Result<(), AgentError> {
+    async fn do_compact(&mut self) -> Result<TokenUsage, AgentError> {
         let (compact_provider, compact_model) =
             resolve_compaction_model(&self.provider, &self.model, self.timeouts);
-        self.total_usage += compaction::compact_history(
+        let usage = compaction::compact_history(
             &*compact_provider,
             &compact_model,
             self.history,
@@ -483,10 +523,11 @@ impl<'h> Agent<'h> {
             &self.cancel,
         )
         .await?;
+        self.total_usage += usage;
         self.rollback_len = self.history.len();
         self.history
             .push(Message::synthetic(CONTINUE_AFTER_COMPACT.into()));
-        Ok(())
+        Ok(usage)
     }
 
     async fn handle_queued_command(&mut self) -> Result<bool, AgentError> {
@@ -513,7 +554,7 @@ impl<'h> Agent<'h> {
                 self.history.push(Message::user_display(wrapped, display));
             }
             ExtractedCommand::Compact(_) => {
-                self.do_compact().await?;
+                let _ = self.do_compact().await?;
             }
         }
         Ok(true)

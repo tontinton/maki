@@ -1086,9 +1086,6 @@ impl App {
                     self.chat_index.clear();
                     self.subagent_answers.clear();
                     self.status = Status::Idle;
-                    if let Some(ref handle) = self.lua_event_handle {
-                        handle.fire_autocmd("TurnEnd", serde_json::json!({}));
-                    }
                     if self.exit_on_done {
                         self.exit_request = ExitRequest::Success;
                     }

@@ -250,6 +250,10 @@ impl AgentLoop {
         .with_cancel(cancel)
         .with_mcp(self.mcp_handle.clone());
 
+        if let Some(ref handle) = self.lua_handle {
+            agent = agent.with_hooks(Arc::new(handle.hooks()));
+        }
+
         let result = agent.run(input).await;
         drop(agent);
 

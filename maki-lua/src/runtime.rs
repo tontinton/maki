@@ -50,7 +50,6 @@ const MAX_INFLIGHT_TOOLS: usize = 64;
 const GC_STEP_INTERVAL: usize = 4;
 const INTERRUPT_CANCEL_CHECK_INTERVAL: u32 = 128;
 const ASYNC_RUN_DEFAULT_DEADLINE: Duration = Duration::from_secs(60);
-const TURN_END_EVENT: &str = "TurnEnd";
 /// Without a cap, a runaway plugin OOM-kills the whole process.
 /// With one, it hits a catchable Lua error instead.
 const LUA_MEMORY_LIMIT: usize = 512 * 1024 * 1024;
@@ -2046,12 +2045,12 @@ pub fn spawn(
                                 }
                                 drain_spawn_queue(&rt.lua, &ex, &gate);
                             }
-                            if event == TURN_END_EVENT {
-                                rt.lua.gc_collect().ok();
-                            }
                         }
                         Request::RunHook { event, payload, reply } => {
                             let result = run_hook(&rt, &event, payload);
+                            if event == "PostTurn" {
+                                rt.lua.gc_collect().ok();
+                            }
                             let _ = reply.send(result);
                         }
                         Request::Describe {

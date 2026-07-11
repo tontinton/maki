@@ -173,4 +173,4 @@ local function clear_todos()
   maki.ui.set_status_hint(nil)
 end
 
-maki.api.create_autocmd({ "TurnEnd", "SessionReset" }, { callback = clear_todos })
+maki.api.create_autocmd({ "PostTurn", "SessionReset" }, { callback = clear_todos })
