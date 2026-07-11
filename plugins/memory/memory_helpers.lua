@@ -224,7 +224,7 @@ function M.collect_file_entries_with_tags(dir)
         from_stem = true
       end
     end
-    result[#result + 1] = { name = name, bytes = bytes, tags = tags, from_stem = from_stem }
+    result[#result + 1] = { name = name, bytes = bytes, tags = tags, from_stem = from_stem, content = content }
   end
   return result
 end
@@ -239,22 +239,34 @@ function M.collect_tag_counts(entries)
   return counts
 end
 
--- True if any of the file's tags matches any of the requested tags (union).
--- Matches are normalized internally on both sides.
-function M.file_matches_any_tag(entry, requested)
+-- Build a set of normalized tags for O(1) lookup.
+function M.tag_set(requested)
+  local set = {}
+  for _, t in ipairs(requested or {}) do
+    set[M.normalize_tag(t)] = true
+  end
+  return set
+end
+
+-- True if any of the file's tags matches any tag in the set (union).
+-- Use `tag_set` to build the set once, then check many entries.
+function M.matches_tag_set(entry, tag_set)
   if not entry.tags or #entry.tags == 0 then
     return false
   end
-  local wanted = {}
-  for _, t in ipairs(requested or {}) do
-    wanted[M.normalize_tag(t)] = true
-  end
   for _, t in ipairs(entry.tags) do
-    if wanted[t] then
+    if tag_set[t] then
       return true
     end
   end
   return false
+end
+
+-- True if any of the file's tags matches any of the requested tags (union).
+-- Convenience for one-off checks; prefer `tag_set` + `matches_tag_set` when
+-- checking multiple entries against the same request.
+function M.file_matches_any_tag(entry, requested)
+  return M.matches_tag_set(entry, M.tag_set(requested))
 end
 
 return M

@@ -177,9 +177,10 @@ local function cmd_fetch(input, dir, ctx)
     return nil, "'tags' is required for fetch"
   end
   local entries = helpers.collect_file_entries_with_tags(dir)
+  local wanted = helpers.tag_set(input.tags)
   local matched = {}
   for _, e in ipairs(entries) do
-    if helpers.file_matches_any_tag(e, input.tags) then
+    if helpers.matches_tag_set(e, wanted) then
       matched[#matched + 1] = e
     end
   end
@@ -191,12 +192,13 @@ local function cmd_fetch(input, dir, ctx)
   end)
   local parts = {}
   for _, e in ipairs(matched) do
-    local content, rerr = maki.fs.read(maki.fs.joinpath(dir, e.name))
-    if content and not rerr then
-      parts[#parts + 1] = "# " .. e.name .. "\n\n" .. content
-    else
-      parts[#parts + 1] = "# " .. e.name .. "\n\n[unread: " .. tostring(rerr) .. "]"
+    local content = e.content
+    local suffix = ""
+    if not content then
+      suffix = "[unread]"
+      content = ""
     end
+    parts[#parts + 1] = "# " .. e.name .. "\n\n" .. content .. suffix
   end
   local llm_output = table.concat(parts, SEPARATOR)
   return {
