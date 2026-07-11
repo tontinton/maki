@@ -43,7 +43,8 @@ pub(crate) fn create_text_table(lua: &Lua) -> LuaResult<Table> {
             let hay = Utf32Str::new(&haystack, &mut buf);
             let mut indices = Vec::new();
             let matched = MATCHER.with(|m| {
-                atom.indices(hay, &mut m.borrow_mut(), &mut indices).is_some()
+                atom.indices(hay, &mut m.borrow_mut(), &mut indices)
+                    .is_some()
             });
             if !matched {
                 return Ok(None);
