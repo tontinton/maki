@@ -239,6 +239,30 @@ function M.collect_tag_counts(entries)
   return counts
 end
 
+-- Sort tag keys by descending count, then alphabetically for stable order.
+function M.sorted_tag_keys(counts)
+  local keys = {}
+  for t in pairs(counts) do
+    keys[#keys + 1] = t
+  end
+  table.sort(keys, function(a, b)
+    if counts[a] ~= counts[b] then
+      return counts[a] > counts[b]
+    end
+    return a < b
+  end)
+  return keys
+end
+
+-- One-call pipeline: read entries, count tags, sort keys.
+-- Returns entries (with content), counts table, and sorted tag keys.
+function M.collect_tag_summary(dir)
+  local entries = M.collect_file_entries_with_tags(dir)
+  local counts = M.collect_tag_counts(entries)
+  local keys = M.sorted_tag_keys(counts)
+  return entries, counts, keys
+end
+
 -- Build a set of normalized tags for O(1) lookup.
 function M.tag_set(requested)
   local set = {}
@@ -260,13 +284,6 @@ function M.matches_tag_set(entry, tag_set)
     end
   end
   return false
-end
-
--- True if any of the file's tags matches any of the requested tags (union).
--- Convenience for one-off checks; prefer `tag_set` + `matches_tag_set` when
--- checking multiple entries against the same request.
-function M.file_matches_any_tag(entry, requested)
-  return M.matches_tag_set(entry, M.tag_set(requested))
 end
 
 return M

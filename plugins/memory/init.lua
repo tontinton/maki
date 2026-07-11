@@ -29,20 +29,6 @@ local function resolve_dir(check_legacy)
   return maki.fs.joinpath(state_dir, memories_path_suffix())
 end
 
-local function sorted_tag_keys(counts)
-  local keys = {}
-  for t in pairs(counts) do
-    keys[#keys + 1] = t
-  end
-  table.sort(keys, function(a, b)
-    if counts[a] ~= counts[b] then
-      return counts[a] > counts[b]
-    end
-    return a < b
-  end)
-  return keys
-end
-
 maki.api.register_prompt_hint({
   prompt = "system",
   slot = "after_instructions",
@@ -51,9 +37,7 @@ maki.api.register_prompt_hint({
     if not dir then
       return nil
     end
-    local entries = helpers.collect_file_entries_with_tags(dir)
-    local counts = helpers.collect_tag_counts(entries)
-    local keys = sorted_tag_keys(counts)
+    local entries, counts, keys = helpers.collect_tag_summary(dir)
     if #keys == 0 then
       return nil
     end
@@ -208,9 +192,7 @@ local function cmd_fetch(input, dir, ctx)
 end
 
 local function cmd_list_tags(dir)
-  local entries = helpers.collect_file_entries_with_tags(dir)
-  local counts = helpers.collect_tag_counts(entries)
-  local keys = sorted_tag_keys(counts)
+  local _entries, counts, keys = helpers.collect_tag_summary(dir)
   if #keys == 0 then
     return { llm_output = "No tags found." }
   end
@@ -329,15 +311,15 @@ maki.api.register_command({
     local UNTAGGED = "(untagged)"
 
     local function build_items(entries)
-      local tag_set = {}
+      local real_tag_set = {}
       for _, e in ipairs(entries) do
         if not e.from_stem then
           for _, t in ipairs(e.tags) do
-            tag_set[t] = true
+            real_tag_set[t] = true
           end
         end
       end
-      local tag_order = sorted_tag_keys(tag_set)
+      local tag_order = helpers.sorted_tag_keys(real_tag_set)
 
       local grouped = {}
       for _, t in ipairs(tag_order) do

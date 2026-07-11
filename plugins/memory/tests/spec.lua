@@ -6,7 +6,8 @@ local safe_resolve = h.safe_resolve
 local parse_frontmatter = h.parse_frontmatter
 local collect_file_entries_with_tags = h.collect_file_entries_with_tags
 local collect_tag_counts = h.collect_tag_counts
-local file_matches_any_tag = h.file_matches_any_tag
+local tag_set = h.tag_set
+local matches_tag_set = h.matches_tag_set
 local normalize_tag = h.normalize_tag
 
 local function tags_eq(actual, expected, msg)
@@ -242,12 +243,12 @@ case("collect_file_entries_with_tags_normalizes_implicit_tag", function()
   rmtree(tmpdir)
 end)
 
-case("file_matches_any_tag_without_explicit_tags", function()
+case("matches_tag_set_without_explicit_tags", function()
   local tmpdir = mktmpdir()
   maki.fs.write(maki.fs.joinpath(tmpdir, "architecture.md"), "no frontmatter\n")
   local entries = collect_file_entries_with_tags(tmpdir)
-  assert(file_matches_any_tag(entries[1], { "architecture" }))
-  assert(file_matches_any_tag(entries[1], { "Architecture" }))
+  assert(matches_tag_set(entries[1], tag_set({ "architecture" })))
+  assert(matches_tag_set(entries[1], tag_set({ "Architecture" })))
   rmtree(tmpdir)
 end)
 
@@ -265,22 +266,22 @@ case("collect_tag_counts_aggregates_across_files", function()
   assert(c["missing"] == nil, "absent tags should not appear")
 end)
 
-case("file_matches_any_tag_union", function()
+case("matches_tag_set_union", function()
   local entry = { name = "x.md", tags = { "auth", "api" } }
-  assert(file_matches_any_tag(entry, { "auth" }), "single tag match")
-  assert(file_matches_any_tag(entry, { "api", "decision" }), "union: one of two matches")
-  assert(file_matches_any_tag(entry, { "Auth", "API" }), "normalized: case-insensitive")
-  assert(not file_matches_any_tag(entry, { "user-decision" }), "normalized: dash form does not falsely match")
-  assert(not file_matches_any_tag(entry, { "decision" }), "no match when tag absent")
-  assert(not file_matches_any_tag(entry, {}), "no match when no requested tags")
-  assert(not file_matches_any_tag({ name = "y.md", tags = {} }, { "auth" }), "no match when file has no tags")
+  assert(matches_tag_set(entry, tag_set({ "auth" })), "single tag match")
+  assert(matches_tag_set(entry, tag_set({ "api", "decision" })), "union: one of two matches")
+  assert(matches_tag_set(entry, tag_set({ "Auth", "API" })), "normalized: case-insensitive")
+  assert(not matches_tag_set(entry, tag_set({ "user-decision" })), "normalized: dash form does not falsely match")
+  assert(not matches_tag_set(entry, tag_set({ "decision" })), "no match when tag absent")
+  assert(not matches_tag_set(entry, tag_set({})), "no match when no requested tags")
+  assert(not matches_tag_set({ name = "y.md", tags = {} }, tag_set({ "auth" })), "no match when file has no tags")
 end)
 
-case("file_matches_any_tag_normalizes_requested", function()
+case("matches_tag_set_normalizes_requested", function()
   local entry = { name = "z.md", tags = { "user_decision" } }
-  assert(file_matches_any_tag(entry, { "User Decision" }), "request with spaces matches stored snake_case")
-  assert(file_matches_any_tag(entry, { "user-decision" }), "request with dashes matches stored snake_case")
-  assert(file_matches_any_tag(entry, { "USER_DECISION" }), "request uppercase matches stored snake_case")
+  assert(matches_tag_set(entry, tag_set({ "User Decision" })), "request with spaces matches stored snake_case")
+  assert(matches_tag_set(entry, tag_set({ "user-decision" })), "request with dashes matches stored snake_case")
+  assert(matches_tag_set(entry, tag_set({ "USER_DECISION" })), "request uppercase matches stored snake_case")
 end)
 
 if #failures > 0 then
