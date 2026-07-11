@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
@@ -53,7 +52,7 @@ pub(super) struct AgentLoop {
     timeouts: maki_providers::Timeouts,
     lua_handle: Option<EventHandle>,
     subagent_cancels: Arc<CancelMap<String>>,
-    first_prompt: Arc<AtomicBool>,
+    first_prompt: bool,
 }
 
 impl AgentLoop {
@@ -99,7 +98,7 @@ impl AgentLoop {
             timeouts,
             lua_handle,
             subagent_cancels,
-            first_prompt: Arc::new(AtomicBool::new(true)),
+            first_prompt: true,
         }
     }
 
@@ -185,11 +184,11 @@ impl AgentLoop {
         // First prompt only: wait briefly for MCP warmup so tools are present on turn 1 even if
         // the user fired a prompt before any server finished its handshake. Subsequent prompts
         // skip the wait — `rebuild_tools` above picks up late-arriving tools on every turn.
-        if self.first_prompt.swap(false, Ordering::AcqRel)
+        if std::mem::replace(&mut self.first_prompt, false)
             && let Some(ref mcp) = self.mcp_handle
         {
             mcp.wait_until_warm(MCP_FIRST_PROMPT_WARM_TIMEOUT).await;
-// `initialize` scanned an all-Connecting snapshot and found no NeedsAuth entries.
+            // `initialize` scanned an all-Connecting snapshot and found no NeedsAuth entries.
             // Re-scan now that warmup has published terminal statuses so OAuth fires
             // automatically for HTTP servers requiring auth. If warmup exceeded the timeout
             // above, late-arriving NeedsAuth entries are missed until a manual reconnect.
