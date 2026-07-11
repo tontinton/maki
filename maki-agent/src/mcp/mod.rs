@@ -413,34 +413,15 @@ enum WarmEvent {
     Cmd(McpCommand),
 }
 
-/// Apply a command received during the warmup preamble. Returns `Some(ack)` if the command is
-/// `Shutdown` (caller breaks the warmup loop and tears down). `Toggle{false}` marks the entry
-/// Disabled so any in-flight `start_server` completion for it gets discarded post-hoc; other
-/// commands are no-ops during warmup (the normal loop handles them after warmup completes).
-async fn handle_command_during_warmup(
-    cmd: McpCommand,
-    inner: &mut McpManagerInner,
-) -> Option<flume::Sender<()>> {
+/// Dispatch a non-`Shutdown` command against live state. Shared by the warmup-deferred replay
+/// and the normal command loop; `Shutdown` is handled by each caller's own control flow.
+async fn dispatch_command(inner: &mut McpManagerInner, cmd: McpCommand) {
     match cmd {
-        McpCommand::Shutdown { ack } => Some(ack),
-        McpCommand::Toggle {
-            server,
-            enabled: false,
-        } => {
-            if let Some(entry) = inner.entries.iter_mut().find(|e| e.name == server) {
-                entry.clear_connection().await;
-                entry.status = McpServerStatus::Disabled;
-            }
-            None
+        McpCommand::Toggle { server, enabled } => handle_toggle(inner, &server, enabled).await,
+        McpCommand::Reconnect { server, url, token } => {
+            handle_reconnect(inner, &server, &url, &token).await
         }
-        McpCommand::Toggle {
-            server,
-            enabled: true,
-        }
-        | McpCommand::Reconnect { server, .. } => {
-            tracing::debug!(server = %server, "MCP command deferred past warmup");
-            None
-        }
+        McpCommand::Shutdown { .. } => unreachable!("Shutdown handled by caller control flow"),
     }
 }
 
@@ -481,6 +462,10 @@ async fn run(
     drop(done_tx);
 
     let mut shutdown_during_warmup: Option<flume::Sender<()>> = None;
+    // Non-Shutdown commands that arrive mid-warmup are stashed and replayed against settled
+    // state once warmup completes, so none are dropped and both directions of Toggle go through
+    // the normal path (a server toggled off mid-warmup connects, then the replay disconnects it).
+    let mut deferred: Vec<McpCommand> = Vec::new();
     while pending > 0 {
         // `race` returns the first ready future's output and drops the other. For a dropped
         // `recv_async` that hadn't resolved, the channel item stays queued; wrapping both in
@@ -493,28 +478,16 @@ async fn run(
 
         match event {
             WarmEvent::Done((i, result)) => {
-                // Toggle{false} arrived mid-warmup races this completion; honor the disabled
-                // flag by discarding the transport (Drop closes stdin → child exits).
-                let dismiss = inner
-                    .entries
-                    .get(i)
-                    .map(|e| e.status == McpServerStatus::Disabled)
-                    .unwrap_or(true);
-                if dismiss {
-                    drop(result);
-                } else {
-                    let _ = apply_start_result(&mut inner.entries[i], result, "start");
-                }
+                let _ = apply_start_result(&mut inner.entries[i], result, "start");
                 inner.generation += 1;
                 publish(&inner, &index, &snapshot);
                 pending -= 1;
             }
-            WarmEvent::Cmd(cmd) => {
-                if let Some(ack) = handle_command_during_warmup(cmd, &mut inner).await {
-                    shutdown_during_warmup = Some(ack);
-                    break;
-                }
+            WarmEvent::Cmd(McpCommand::Shutdown { ack }) => {
+                shutdown_during_warmup = Some(ack);
+                break;
             }
+            WarmEvent::Cmd(cmd) => deferred.push(cmd),
         }
     }
 
@@ -538,21 +511,21 @@ async fn run(
 
     finish_warmup(&inner, &index, &snapshot, warm_tx);
 
-    // --- normal command loop (unchanged) ---
+    // Replay commands received during warmup against now-settled state.
+    for cmd in deferred {
+        dispatch_command(&mut inner, cmd).await;
+        inner.generation += 1;
+        publish(&inner, &index, &snapshot);
+    }
+
+    // --- normal command loop ---
     let mut ack: Option<flume::Sender<()>> = None;
     while let Ok(cmd) = cmd_rx.recv_async().await {
-        match cmd {
-            McpCommand::Toggle { server, enabled } => {
-                handle_toggle(&mut inner, &server, enabled).await;
-            }
-            McpCommand::Reconnect { server, url, token } => {
-                handle_reconnect(&mut inner, &server, &url, &token).await;
-            }
-            McpCommand::Shutdown { ack: tx } => {
-                ack = Some(tx);
-                break;
-            }
+        if let McpCommand::Shutdown { ack: tx } = cmd {
+            ack = Some(tx);
+            break;
         }
+        dispatch_command(&mut inner, cmd).await;
         inner.generation += 1;
         publish(&inner, &index, &snapshot);
     }
