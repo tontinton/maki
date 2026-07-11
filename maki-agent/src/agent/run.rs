@@ -43,9 +43,23 @@ pub fn resolve_compaction_model(
     (Arc::clone(provider), model.clone())
 }
 
-enum TurnOutcome {
-    Continue,
-    Done(Option<StopReason>),
+enum Phase {
+    Streaming {
+        nudged: bool,
+    },
+    StreamDone {
+        response: StreamResponse,
+        nudged: bool,
+    },
+    Dispatching {
+        response: StreamResponse,
+    },
+    PostToolNudge,
+    PostTurn {
+        stop_reason: Option<StopReason>,
+        nudged: bool,
+    },
+    Done,
 }
 
 #[derive(Clone)]
@@ -93,7 +107,6 @@ pub struct Agent<'h> {
     config: AgentConfig,
     tool_output_lines: ToolOutputLines,
     reauth_attempts: u32,
-    post_tool_empty_retried: bool,
     permissions: Arc<PermissionManager>,
     opts: RequestOptions,
     session_id: Option<String>,
@@ -133,7 +146,6 @@ impl<'h> Agent<'h> {
             rollback_len: 0,
             mcp: None,
             reauth_attempts: 0,
-            post_tool_empty_retried: false,
             opts: RequestOptions::default(),
             session_id: params.session_id,
             file_tracker: params.file_tracker,
@@ -207,84 +219,113 @@ impl<'h> Agent<'h> {
     }
 
     async fn run_loop(&mut self) -> Result<(), AgentError> {
+        let mut phase = Phase::Streaming { nudged: false };
         loop {
-            if let Some(max) = self.config.max_turns
+            if matches!(phase, Phase::Streaming { .. })
+                && let Some(max) = self.config.max_turns
                 && self.num_turns >= max
             {
                 self.emit_done(None)?;
                 return Ok(());
             }
-            match self.turn().await? {
-                TurnOutcome::Continue => {}
-                TurnOutcome::Done(stop_reason) => {
-                    self.emit_done(stop_reason)?;
-                    return Ok(());
-                }
+            phase = self.step(phase).await?;
+            if matches!(phase, Phase::Done) {
+                return Ok(());
             }
         }
     }
 
-    async fn turn(&mut self) -> Result<TurnOutcome, AgentError> {
-        if self.cancel.is_cancelled() {
-            return Err(AgentError::Cancelled);
-        }
-        let response = match stream_with_retry(
-            &*self.provider,
-            &self.model,
-            self.history.as_slice(),
-            &self.system,
-            &self.tools,
-            &self.event_tx,
-            &self.cancel,
-            self.opts,
-            self.session_id.as_deref(),
-        )
-        .await
-        {
-            Ok(r) => {
-                self.reauth_attempts = 0;
-                r
+    async fn step(&mut self, phase: Phase) -> Result<Phase, AgentError> {
+        match phase {
+            Phase::Streaming { nudged } => {
+                if self.cancel.is_cancelled() {
+                    return Err(AgentError::Cancelled);
+                }
+                let response = match stream_with_retry(
+                    &*self.provider,
+                    &self.model,
+                    self.history.as_slice(),
+                    &self.system,
+                    &self.tools,
+                    &self.event_tx,
+                    &self.cancel,
+                    self.opts,
+                    self.session_id.as_deref(),
+                )
+                .await
+                {
+                    Ok(r) => {
+                        self.reauth_attempts = 0;
+                        r
+                    }
+                    Err(e) if e.is_auth_error() => {
+                        return self.handle_reauth(e).await;
+                    }
+                    Err(e) => {
+                        error!(error = %e, model = %self.model.id, self.num_turns, "stream_message failed");
+                        return Err(e);
+                    }
+                };
+                self.num_turns += 1;
+                Ok(Phase::StreamDone { response, nudged })
             }
-            Err(e) if e.is_auth_error() => {
-                return self.wait_for_reauth(e).await;
+            Phase::StreamDone { response, nudged } => {
+                let has_tools = response.message.has_tool_calls();
+                let stop_reason = response.stop_reason;
+                info!(
+                    input_tokens = response.usage.input,
+                    output_tokens = response.usage.output,
+                    cache_creation = response.usage.cache_creation,
+                    cache_read = response.usage.cache_read,
+                    has_tools,
+                    self.num_turns,
+                    model = %self.model.id,
+                    stop_reason = stop_reason.map_or("none", Into::into),
+                    "API response received"
+                );
+
+                self.emit_turn_complete(&response)?;
+                let usage = response.usage;
+                self.total_usage += usage;
+                self.context_size = usage.total_input();
+
+                if has_tools {
+                    Ok(Phase::Dispatching { response })
+                } else {
+                    let has_text = response.message.first_text_content().is_some();
+                    if !has_text && !nudged && self.history.has_recent_tool_results(5) {
+                        Ok(Phase::PostToolNudge)
+                    } else {
+                        self.history.push(response.message);
+                        if stop_reason == Some(StopReason::MaxTokens)
+                            && self.num_turns <= self.config.max_continuation_turns
+                        {
+                            warn!(
+                                self.num_turns,
+                                "response truncated (max_tokens), re-prompting"
+                            );
+                            Ok(Phase::Streaming { nudged })
+                        } else {
+                            Ok(Phase::PostTurn {
+                                stop_reason,
+                                nudged,
+                            })
+                        }
+                    }
+                }
             }
-            Err(e) => {
-                error!(error = %e, model = %self.model.id, self.num_turns, "stream_message failed");
-                return Err(e);
+            Phase::Dispatching { response } => {
+                let history_len_before = self.history.len();
+                self.process_tool_calls(response).await?;
+                self.context_size +=
+                    estimate_message_tokens(&self.history.as_slice()[history_len_before..]);
+                let compacted = self.try_auto_compact().await?;
+                if !compacted {
+                    self.handle_queued_command().await?;
+                }
+                Ok(Phase::Streaming { nudged: false })
             }
-        };
-        self.num_turns += 1;
-
-        let has_tools = response.message.has_tool_calls();
-        let stop_reason = response.stop_reason;
-        info!(
-            input_tokens = response.usage.input,
-            output_tokens = response.usage.output,
-            cache_creation = response.usage.cache_creation,
-            cache_read = response.usage.cache_read,
-            has_tools,
-            self.num_turns,
-            model = %self.model.id,
-            stop_reason = stop_reason.map_or("none", Into::into),
-            "API response received"
-        );
-
-        self.emit_turn_complete(&response)?;
-        let usage = response.usage;
-        self.total_usage += usage;
-        self.context_size = usage.total_input();
-
-        if has_tools {
-            let history_len_before = self.history.len();
-            self.process_tool_calls(response).await?;
-            self.context_size +=
-                estimate_message_tokens(&self.history.as_slice()[history_len_before..]);
-        } else {
-            let has_text = response.message.first_text_content().is_some();
-
-            if !has_text && !self.post_tool_empty_retried && self.history.has_recent_tool_results(5)
-            {
-                self.post_tool_empty_retried = true;
+            Phase::PostToolNudge => {
                 warn!("empty response after tool calls, nudging model to continue");
                 self.event_tx.send(AgentEvent::Nudge)?;
                 self.history.push(Message {
@@ -295,34 +336,24 @@ impl<'h> Agent<'h> {
                     ..Default::default()
                 });
                 self.history.push(Message::synthetic(NUDGE_PROMPT.into()));
-                return Ok(TurnOutcome::Continue);
+                Ok(Phase::Streaming { nudged: true })
             }
-
-            self.history.push(response.message);
-
-            if stop_reason == Some(StopReason::MaxTokens)
-                && self.num_turns <= self.config.max_continuation_turns
-            {
-                warn!(
-                    self.num_turns,
-                    "response truncated (max_tokens), re-prompting"
-                );
-                return Ok(TurnOutcome::Continue);
+            Phase::PostTurn {
+                stop_reason,
+                nudged,
+            } => {
+                if self.try_auto_compact().await? || self.handle_queued_command().await? {
+                    Ok(Phase::Streaming { nudged })
+                } else {
+                    self.emit_done(stop_reason)?;
+                    Ok(Phase::Done)
+                }
             }
-        }
-
-        if self.try_auto_compact().await? || self.handle_queued_command().await? {
-            return Ok(TurnOutcome::Continue);
-        }
-
-        if has_tools {
-            Ok(TurnOutcome::Continue)
-        } else {
-            Ok(TurnOutcome::Done(stop_reason))
+            Phase::Done => Ok(Phase::Done),
         }
     }
 
-    async fn wait_for_reauth(&mut self, err: AgentError) -> Result<TurnOutcome, AgentError> {
+    async fn handle_reauth(&mut self, err: AgentError) -> Result<Phase, AgentError> {
         if self.reauth_attempts >= MAX_REAUTH_ATTEMPTS {
             error!(error = %err, attempts = self.reauth_attempts, "max re-auth attempts reached");
             return Err(err);
@@ -343,7 +374,7 @@ impl<'h> Agent<'h> {
         {
             Ok(_) => {
                 self.provider.refresh_auth().await?;
-                Ok(TurnOutcome::Continue)
+                Ok(Phase::Streaming { nudged: false })
             }
             Err(_) => Err(AgentError::Cancelled),
         }
@@ -374,7 +405,6 @@ impl<'h> Agent<'h> {
     }
 
     async fn process_tool_calls(&mut self, response: StreamResponse) -> Result<(), AgentError> {
-        self.post_tool_empty_retried = false;
         let ctx = self.tool_context();
         tool_dispatch::process_tool_calls(
             response,
