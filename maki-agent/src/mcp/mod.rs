@@ -453,9 +453,9 @@ async fn run(
 ) {
     // --- warmup preamble ---
     // Concurrently start every enabled (Connecting) server, racing each completion against
-    // incoming commands. Completions flow through a channel (not join handles) so a Shutdown
-    // during warmup can drop the receiver and let orphaned wrappers finish + drop their
-    // transport → child killed via ChildGuard.
+    // incoming commands. Completions flow through a channel so a Shutdown during warmup can
+    // .cancel() every still-running warmup task — dropping each transport (and its ChildGuard,
+    // which SIGKILLs the child) immediately rather than waiting for the handshake timeout.
     let connecting: Vec<(usize, ServerConfig)> = inner
         .entries
         .iter()
@@ -471,12 +471,12 @@ async fn run(
     );
 
     let (done_tx, done_rx) = flume::unbounded::<(usize, Result<StartResult, McpError>)>();
+    let mut warm_tasks: Vec<smol::Task<()>> = Vec::with_capacity(pending);
     for (i, cfg) in connecting {
         let tx = done_tx.clone();
-        smol::spawn(async move {
+        warm_tasks.push(smol::spawn(async move {
             let _ = tx.send((i, start_server(&cfg).await));
-        })
-        .detach();
+        }));
     }
     drop(done_tx);
 
@@ -519,11 +519,21 @@ async fn run(
     }
 
     if let Some(ack) = shutdown_during_warmup {
+        // Cancel every still-running warmup task so partial `StdioTransport`s drop immediately
+        // (ChildGuard SIGKILLs the child) instead of lingering until the handshake timeout.
+        for task in warm_tasks {
+            task.cancel().await;
+        }
         shutdown_all(&mut inner).await;
         inner.generation += 1;
         finish_warmup(&inner, &index, &snapshot, warm_tx);
         let _ = ack.try_send(());
         return;
+    }
+
+    // Normal warmup completion: every warm task already sent its result and exited.
+    for task in warm_tasks {
+        task.detach();
     }
 
     finish_warmup(&inner, &index, &snapshot, warm_tx);
