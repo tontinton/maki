@@ -126,6 +126,9 @@ impl App {
         let Some(ref shared) = self.queue.shared else {
             return;
         };
+        if shared.has_compact() {
+            return;
+        }
         shared.push(QueueItem::Compact {
             run_id: self.run_id,
         });

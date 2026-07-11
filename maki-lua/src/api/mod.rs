@@ -11,6 +11,7 @@ pub(crate) mod json;
 pub(crate) mod keymap;
 pub(crate) mod log;
 pub(crate) mod net;
+mod session;
 pub(crate) mod text;
 pub(crate) mod tool;
 pub(crate) mod treesitter;
@@ -43,7 +44,10 @@ pub(crate) fn create_maki_global(
     maki.set("fs", fs::create_fs_table(lua, permissions)?)?;
     maki.set("log", log::create_log_table(lua, Arc::clone(&plugin))?)?;
     maki.set("treesitter", treesitter::create_treesitter_table(lua)?)?;
-    maki.set("uv", uv::create_uv_table(lua, permissions)?)?;
+    maki.set(
+        "uv",
+        uv::create_uv_table(lua, permissions, Arc::clone(&plugin))?,
+    )?;
     maki.set("base64", base64::create_base64_table(lua)?)?;
     maki.set("image", image::create_image_table(lua)?)?;
     maki.set("json", json::create_json_table(lua)?)?;
@@ -52,7 +56,7 @@ pub(crate) fn create_maki_global(
     maki.set("text", text::create_text_table(lua)?)?;
     maki.set(
         "ui",
-        ui::create_ui_table(lua, ui_action_tx, Arc::clone(&plugin))?,
+        ui::create_ui_table(lua, ui_action_tx.clone(), Arc::clone(&plugin))?,
     )?;
     maki.set("fn", r#fn::create_fn_table(lua, permissions)?)?;
     maki.set("async", r#async::create_async_table(lua)?)?;
@@ -61,6 +65,7 @@ pub(crate) fn create_maki_global(
         interpreter::create_interpreter_table(lua, permissions)?,
     )?;
     agent::register(lua, &maki)?;
+    session::register(lua, &maki, ui_action_tx)?;
     maki.set(
         "keymap",
         keymap::create_keymap_table(lua, Arc::clone(&plugin))?,

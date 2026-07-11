@@ -383,6 +383,10 @@ impl EventHandle {
         });
     }
 
+    pub fn set_history(&self, history: maki_agent::SharedMessages) {
+        let _ = self.tx.send(Request::SetHistory { history });
+    }
+
     pub fn run_keybind_callback(&self, id: u64) {
         let _ = self.tx.try_send(Request::RunKeybindCallback { id });
     }

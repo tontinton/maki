@@ -235,6 +235,10 @@ impl<'t> EventLoop<'t> {
 
         handles.apply_to_app(&mut app);
 
+        if let (Some(handle), Some(history)) = (&app.lua_event_handle, &app.shared_history) {
+            handle.set_history(Arc::clone(history));
+        }
+
         if !handles.mcp_config_errors.is_empty() {
             app.flash(format!("MCP config error: {}", handles.mcp_config_errors));
         }
@@ -324,6 +328,7 @@ impl<'t> EventLoop<'t> {
             self.app.update_model(&slot_model.model);
         }
 
+        let mut pending_actions: Vec<Action> = Vec::new();
         if let Some(rx) = &self.ui_action_rx {
             while let Ok(action) = rx.try_recv() {
                 match action {
@@ -355,8 +360,14 @@ impl<'t> EventLoop<'t> {
                                 .transition_plan(crate::app::mode::PlanTrigger::InteractivePrompt);
                         }
                     }
+                    UiAction::Compact => {
+                        pending_actions.extend(self.app.request_compact());
+                    }
                 }
             }
+        }
+        if !pending_actions.is_empty() {
+            self.dispatch(pending_actions);
         }
 
         had_agent_msg
@@ -438,6 +449,11 @@ impl<'t> EventLoop<'t> {
             &mut self.app,
             lua_handle,
         );
+        if let (Some(handle), Some(history)) =
+            (&self.app.lua_event_handle, &self.app.shared_history)
+        {
+            handle.set_history(Arc::clone(history));
+        }
     }
 
     fn handle_action(&mut self, action: Action) {

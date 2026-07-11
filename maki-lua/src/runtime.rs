@@ -128,6 +128,15 @@ pub enum Request {
         event: String,
         data: Value,
     },
+    SetHistory {
+        history: maki_agent::SharedMessages,
+    },
+    TimerFire {
+        id: u64,
+    },
+    TimerClose {
+        id: u64,
+    },
     ClickTool {
         tool_use_id: String,
         /// 1-based line in the tool's live buffer; 0 means the click landed
@@ -659,6 +668,8 @@ impl LuaRuntime {
         lua.set_app_data(keymap_writer);
         lua.set_app_data(HintStore::new());
         lua.set_app_data(hint_writer);
+        lua.set_app_data(crate::api::uv::TimerStore::default());
+        lua.set_app_data(crate::api::uv::TimerTx(tx.clone()));
         lua.set_app_data(Arc::clone(&registry));
 
         let plugins: PluginMap = Rc::new(RefCell::new(HashMap::new()));
@@ -1139,6 +1150,9 @@ impl LuaRuntime {
                 writer.publish(entries);
             }
         }
+        if let Some(mut store) = self.lua.app_data_mut::<crate::api::uv::TimerStore>() {
+            store.clear_plugin(&self.lua, plugin);
+        }
     }
 
     fn call_sync_detached<R: mlua::FromLuaMulti>(
@@ -1358,8 +1372,17 @@ fn extract_restore_reply(ret: &LuaValue) -> Option<RestoreReply> {
     Some(RestoreReply { body, header })
 }
 
-/// Handler returned nil, meaning it went async. Polls job events
-/// until `ctx:finish()`, all jobs die, or the deadline expires.
+fn is_timed_out(handle: &TaskHandle) -> bool {
+    lock_cell(handle)
+        .deadline
+        .get()
+        .is_some_and(|d| Instant::now() > d)
+}
+
+// Handler returned nil, meaning it went async. Polls job events
+// until `ctx:finish()`, all jobs die, or the deadline expires.
+// When there are no jobs to observe, this still loops: a timer or other
+// async completion may fire `finish` from outside the job system.
 async fn dispatch_async(
     lua: &Lua,
     handle: TaskHandle,
@@ -1374,26 +1397,31 @@ async fn dispatch_async(
 
     if !has_jobs {
         lua.gc_collect().ok();
-        smol::Timer::after(DISPATCH_POLL_INTERVAL).await;
-        return match finish_rx.try_recv() {
-            Ok(reply) => reply,
-            _ => ToolCallReply::err(NIL_WITHOUT_FINISH_MSG),
-        };
+        loop {
+            if cancel.is_cancelled() {
+                return ToolCallReply::err(CANCELLED_MSG);
+            }
+            if is_timed_out(&handle) {
+                return timeout_reply(&handle, plugin, tool);
+            }
+            match finish_rx.try_recv() {
+                Ok(reply) => return reply,
+                Err(flume::TryRecvError::Disconnected) => {
+                    return ToolCallReply::err(NIL_WITHOUT_FINISH_MSG);
+                }
+                Err(flume::TryRecvError::Empty) => {}
+            }
+            smol::Timer::after(DISPATCH_POLL_INTERVAL).await;
+        }
     }
 
-    let timed_out = || {
-        lock_cell(&handle)
-            .deadline
-            .get()
-            .is_some_and(|d| Instant::now() > d)
-    };
     let mut event_buf = Vec::new();
 
     loop {
         if cancel.is_cancelled() {
             return ToolCallReply::err(CANCELLED_MSG);
         }
-        if timed_out() {
+        if is_timed_out(&handle) {
             return timeout_reply(&handle, plugin, tool);
         }
 
@@ -1411,10 +1439,15 @@ async fn dispatch_async(
             let has_alive = lock_cell(&handle).jobs.has_alive_jobs();
             if !has_alive {
                 smol::Timer::after(DISPATCH_POLL_INTERVAL).await;
-                return match finish_rx.try_recv() {
-                    Ok(reply) => reply,
-                    _ => ToolCallReply::err(NIL_WITHOUT_FINISH_MSG),
-                };
+                match finish_rx.try_recv() {
+                    Ok(reply) => return reply,
+                    Err(flume::TryRecvError::Disconnected) => {
+                        return ToolCallReply::err(NIL_WITHOUT_FINISH_MSG);
+                    }
+                    Err(flume::TryRecvError::Empty) => {
+                        return ToolCallReply::err(NIL_WITHOUT_FINISH_MSG);
+                    }
+                }
             }
             smol::Timer::after(DISPATCH_POLL_INTERVAL).await;
             continue;
@@ -1920,6 +1953,26 @@ pub fn spawn(
                             }
                             if event == TURN_END_EVENT {
                                 rt.lua.gc_collect().ok();
+                            }
+                        }
+                        Request::SetHistory { history } => {
+                            rt.lua.set_app_data(history);
+                        }
+                        Request::TimerFire { id } => {
+                            let func = rt
+                                .lua
+                                .app_data_ref::<crate::api::uv::TimerStore>()
+                                .and_then(|store| store.load_callback(&rt.lua, id));
+                            if let Some(func) = func {
+                                if let Err(e) = rt.call_sync_detached::<()>(&func, ()) {
+                                    tracing::warn!(timer = id, error = %e, "timer callback failed");
+                                }
+                                drain_spawn_queue(&rt.lua, &ex, &gate);
+                            }
+                        }
+                        Request::TimerClose { id } => {
+                            if let Some(mut store) = rt.lua.app_data_mut::<crate::api::uv::TimerStore>() {
+                                store.close(&rt.lua, id);
                             }
                         }
                         Request::Describe {

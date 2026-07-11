@@ -868,6 +868,15 @@ impl App {
                 visible: prefix.visible,
             }];
         }
+        if let Some(ref handle) = self.lua_event_handle {
+            handle.fire_autocmd(
+                "UserInput",
+                serde_json::json!({
+                    "text": sub.text,
+                    "image_count": sub.images.len(),
+                }),
+            );
+        }
         let msg: QueuedMessage = sub.into();
         if self.status == Status::Streaming {
             self.queue_and_notify(msg);
@@ -1143,6 +1152,16 @@ impl App {
         idx
     }
 
+    pub(crate) fn request_compact(&mut self) -> Vec<Action> {
+        if self.status == Status::Streaming {
+            self.queue_compact();
+            return vec![];
+        }
+        self.run_id += 1;
+        self.status = Status::Streaming;
+        vec![Action::Compact]
+    }
+
     fn execute_command(&mut self, cmd: ParsedCommand) -> Vec<Action> {
         self.input_box.discard();
         match cmd.name.as_str() {
@@ -1150,14 +1169,7 @@ impl App {
                 self.open_tasks();
                 vec![]
             }
-            "/compact" => {
-                if self.status == Status::Streaming {
-                    self.queue_compact();
-                    return vec![];
-                }
-                self.status = Status::Streaming;
-                vec![Action::Compact]
-            }
+            "/compact" => self.request_compact(),
             "/help" => {
                 self.help_modal.toggle();
                 vec![]

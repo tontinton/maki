@@ -143,6 +143,12 @@ impl QueueSender {
         lock(&self.items).clear();
     }
 
+    pub(crate) fn has_compact(&self) -> bool {
+        lock(&self.items)
+            .iter()
+            .any(|item| matches!(item, QueueItem::Compact { .. }))
+    }
+
     pub(crate) fn text_messages(&self) -> Vec<String> {
         lock(&self.items)
             .iter()

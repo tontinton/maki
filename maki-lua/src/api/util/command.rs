@@ -400,6 +400,7 @@ pub enum UiAction {
         path: PathBuf,
         reply_tx: flume::Sender<i32>,
     },
+    Compact,
 }
 
 #[cfg(test)]
