@@ -189,6 +189,11 @@ impl AgentLoop {
             && let Some(ref mcp) = self.mcp_handle
         {
             mcp.wait_until_warm(MCP_FIRST_PROMPT_WARM_TIMEOUT).await;
+// `initialize` scanned an all-Connecting snapshot and found no NeedsAuth entries.
+            // Re-scan now that warmup has published terminal statuses so OAuth fires
+            // automatically for HTTP servers requiring auth. If warmup exceeded the timeout
+            // above, late-arriving NeedsAuth entries are missed until a manual reconnect.
+            spawn_oauth_for_needs_auth(mcp);
             self.rebuild_tools(&slot.model, input.workflow);
         }
 
