@@ -1,13 +1,21 @@
--- Concurrent tool dispatch. The state table is the single source of truth:
--- llm output, UI rendering, and session restore are all pure functions of
--- it. Each child body is the child tool's own live/restored buf, so a
--- batch child renders exactly like the same tool run standalone.
+-- Concurrent tool dispatch. Rules that keep this file boring to debug:
+--
+--   1. `children` is the single source of truth: llm output, UI lines,
+--      persisted state, and click routing are all pure functions of it.
+--   2. Every child ends through one door, `Batch:settle`, which refuses
+--      to run twice, so status, output, and body buf never disagree.
+--   3. Once a `Batch` owns the children, only its methods touch them,
+--      and each method ends with a rerender, so the screen never goes
+--      stale.
+--   4. Child callbacks (header, restore) run under pcall: a broken
+--      child falls back to plain rendering instead of sinking the batch.
 
 local ToolView = require("maki.tool_view")
 
 local MAX_BATCH_SIZE = 25
 local SEPARATOR = "──────────────────"
 local BODY_INDENT = "  "
+local ANNOTATION_SEP = " · "
 local ERROR_PREFIX = "[ERROR] "
 local EMPTY_ERROR = "provide at least one tool call"
 local NESTED_ERROR = "cannot nest batch inside batch"
@@ -16,6 +24,16 @@ local DISCARDED_ERROR = string.format("maximum of %d tools per batch", MAX_BATCH
 local SECTION_FMT = "## %s\n"
 local SUMMARY_MIXED_FMT = "Executed %d/%d successfully. %d failed."
 local SUMMARY_ALL_OK_FMT = "All %d tools executed successfully."
+local RESETTLE_FMT = "batch: child %s settled twice (%s -> %s)"
+
+local STATUS = { PENDING = "pending", RUNNING = "running", SUCCESS = "success", ERROR = "error" }
+local TERMINAL = { [STATUS.SUCCESS] = true, [STATUS.ERROR] = true }
+local INDICATOR = {
+  [STATUS.PENDING] = { "○ ", "dim" },
+  [STATUS.RUNNING] = { "· ", "spinner" },
+  [STATUS.SUCCESS] = { "● ", "tool_success" },
+  [STATUS.ERROR] = { "● ", "tool_error" },
+}
 
 local description = string.format(
   [[Executes multiple independent tool calls concurrently to reduce round-trips.
@@ -55,9 +73,11 @@ local examples = {
   },
 }
 
--- Models send entries in two shapes: { tool, parameters } and flat
--- { tool, ...params }. Accept either, or both merged (duplicate keys
--- rejected). Never mutates the input entry.
+--- Input normalization (pure) ---------------------------------------------
+
+-- Models send entries in two shapes, { tool, parameters } and flat
+-- { tool, ...params }, so accept either, or even both merged, as long
+-- as no key appears twice.
 local function normalize_entry(entry)
   if type(entry) ~= "table" then
     return nil, "batch entry must be an object"
@@ -97,8 +117,11 @@ local function normalize_entry(entry)
   return { tool = tool, params = params }
 end
 
--- The child's own header fn draws the header, pcall-isolated. On error or
--- absence (e.g. MCP tools) the plain tool name is enough.
+--- Child presentation (pcall-isolated) -------------------------------------
+
+-- Let the child tool draw its own header. Some tools have none (MCP
+-- ones, for example) and a broken one may throw; either way the plain
+-- tool name is enough.
 local function header_spans(tool, params)
   local ok, spans = pcall(function()
     local t = maki.api.get_tool(tool)
@@ -123,10 +146,10 @@ local function header_spans(tool, params)
   return { { tool, "tool" } }
 end
 
--- The child's own restore fn builds the body buf, with the real is_error,
--- so an error child renders exactly like the standalone tool. It is
--- pcall-isolated; on error or absence the ToolView fallback matches the
--- standalone plain rendering.
+-- The child's own restore fn builds the body, fed the real is_error, so
+-- a failed child looks exactly like the same tool run standalone. When
+-- restore is missing or throws, the ToolView fallback matches the
+-- standalone plain rendering too.
 local function child_body_buf(c, tol)
   local output = c.output or ""
   local ok, buf = pcall(function()
@@ -134,14 +157,15 @@ local function child_body_buf(c, tol)
     if not (t and t.restore) then
       return nil
     end
-    local rctx = {}
-    function rctx:tool_output_lines()
-      return tol
-    end
-    function rctx:state()
-      return nil
-    end
-    local reply = t.restore(c.params, output, c.status == "error", rctx)
+    local rctx = {
+      tool_output_lines = function()
+        return tol
+      end,
+      state = function()
+        return nil
+      end,
+    }
+    local reply = t.restore(c.params, output, c.status == STATUS.ERROR, rctx)
     local body = reply
     if type(reply) == "table" then
       body = reply.body
@@ -157,6 +181,34 @@ local function child_body_buf(c, tol)
   return ToolView.restore(output, { max_lines = tol[c.tool] or tol.other, keep = "head" })
 end
 
+-- Parsing plus per-entry policy: entries past MAX_BATCH_SIZE and nested
+-- batches are born terminal (error), so they render but never run. Only
+-- a malformed entry fails the batch as a whole, and that happens before
+-- anything runs.
+local function prepare_children(tool_calls)
+  if type(tool_calls) ~= "table" then
+    return nil, "tool_calls must be an array"
+  end
+  local children = {}
+  for i, entry in ipairs(tool_calls) do
+    local c, err = normalize_entry(entry)
+    if not c then
+      return nil, err
+    end
+    c.status = STATUS.PENDING
+    if i > MAX_BATCH_SIZE then
+      c.status, c.output = STATUS.ERROR, DISCARDED_ERROR
+    elseif c.tool == "batch" then
+      c.status, c.output = STATUS.ERROR, NESTED_ERROR
+    end
+    c.header = header_spans(c.tool, c.params)
+    children[i] = c
+  end
+  return children
+end
+
+--- Rendering (pure) ---------------------------------------------------------
+
 local function indented(line)
   local out = { { BODY_INDENT } }
   for _, s in ipairs(line) do
@@ -165,44 +217,35 @@ local function indented(line)
   return out
 end
 
-local function indicator_span(status)
-  if status == "running" then
-    return { "· ", "spinner" }
-  elseif status == "success" then
-    return { "● ", "tool_success" }
-  elseif status == "error" then
-    return { "● ", "tool_error" }
+local function append_separator(lines)
+  lines[#lines + 1] = {}
+  lines[#lines + 1] = { { SEPARATOR, "dim" } }
+  lines[#lines + 1] = {}
+end
+
+local function child_header_line(c)
+  local ind = INDICATOR[c.status]
+  local spans = { { ind[1], ind[2] }, { c.tool .. "> ", "tool_prefix" } }
+  for _, s in ipairs(c.header or {}) do
+    spans[#spans + 1] = s
   end
-  return { "○ ", "dim" }
+  if c.annotation then
+    spans[#spans + 1] = { " (" .. c.annotation .. ")", "tool_annotation" }
+  end
+  return spans
 end
 
--- Live annotations (e.g. a task child's model) arrive before the done
--- annotation (e.g. "12 lines"); append with the same separator the
--- standalone header uses.
-local function annotate(c, ann)
-  c.annotation = c.annotation and (c.annotation .. " · " .. ann) or ann
-end
-
--- Rebuilds the full body on every change. Each child body is read fresh
--- from the child's own buf, and click ranges come out of the same pass, so
--- the row -> child map can never drift from the lines.
-local function render(children, tol)
+-- Lines and click ranges come out of the same pass, so the row -> child
+-- map can never drift from what is on screen. Bodies are read fresh from
+-- each child's own buf, never cached.
+local function render_children(children)
   local lines, ranges = {}, {}
   for i, c in ipairs(children) do
     if i > 1 then
-      lines[#lines + 1] = {}
-      lines[#lines + 1] = { { SEPARATOR, "dim" } }
-      lines[#lines + 1] = {}
+      append_separator(lines)
     end
     local first = #lines + 1
-    local spans = { indicator_span(c.status), { c.tool .. "> ", "tool_prefix" } }
-    for _, s in ipairs(c.header or {}) do
-      spans[#spans + 1] = s
-    end
-    if c.annotation then
-      spans[#spans + 1] = { " (" .. c.annotation .. ")", "tool_annotation" }
-    end
-    lines[#lines + 1] = spans
+    lines[#lines + 1] = child_header_line(c)
     if c.buf then
       for _, bl in ipairs(c.buf:get_lines()) do
         lines[#lines + 1] = indented(bl)
@@ -213,15 +256,14 @@ local function render(children, tol)
   return lines, ranges
 end
 
--- Byte-identical to the old native batch's llm format; batch_policy.rs
--- pins it.
+-- batch_policy.rs pins this exact llm format; keep it byte-identical.
 local function render_llm(children)
   local out = {}
   local total = #children
   local failed = 0
   for _, c in ipairs(children) do
     out[#out + 1] = string.format(SECTION_FMT, c.tool)
-    if c.status == "success" then
+    if c.status == STATUS.SUCCESS then
       out[#out + 1] = c.output or ""
     else
       failed = failed + 1
@@ -245,80 +287,133 @@ local function to_state(children)
   return { children = out }
 end
 
--- Normalizes children and attaches statuses and headers; the one entry
--- point both phases (handler, restore) go through. Bodies come later,
--- once a rerender closure exists to watch them.
-local function prepare_children(tool_calls)
-  if type(tool_calls) ~= "table" then
-    return nil, "tool_calls must be an array"
-  end
-  local children = {}
-  for i, entry in ipairs(tool_calls) do
-    local c, err = normalize_entry(entry)
-    if not c then
-      return nil, err
-    end
-    if i > MAX_BATCH_SIZE then
-      c.status, c.output = "error", DISCARDED_ERROR
-    elseif c.tool == "batch" then
-      c.status, c.output = "error", NESTED_ERROR
-    else
-      c.status = "pending"
-    end
-    c.header = header_spans(c.tool, c.params)
-    children[i] = c
-  end
-  return children
-end
+--- Batch view-model ---------------------------------------------------------
 
--- One buf whose lines and click ranges always come from the same render
--- pass over state. A click is forwarded to the child's own buf handler:
--- a row inside a child's range maps to that child's buffer row; row 0
--- (header, or the restore-expand replay) and unmapped rows go to every
--- child. Either way the child's real toggle logic runs.
-local function make_view(children, tol)
-  local buf = maki.ui.buf()
-  local ranges
-  local function rerender()
-    local lines
-    lines, ranges = render(children, tol)
-    buf:set_lines(lines)
-  end
-  rerender()
-  local function forward_click(row)
-    if row >= 1 and ranges then
-      for i, r in ipairs(ranges) do
-        if row >= r.first and row <= r.last then
-          local c = children[i]
-          if c.buf then
-            c.buf:click({ row = row - r.first })
-          end
-          return
-        end
-      end
-    end
-    for _, c in ipairs(children) do
-      if c.buf then
-        c.buf:click({ row = 0 })
-      end
-    end
-  end
-  buf:on("click", function(ev)
-    forward_click(ev and ev.row or 0)
-    rerender()
+local Batch = {}
+Batch.__index = Batch
+
+function Batch.new(children, tol)
+  local self = setmetatable({ children = children, tol = tol }, Batch)
+  self.buf = maki.ui.buf()
+  self.buf:on("click", function(ev)
+    self:route_click(ev and ev.row or 0)
+    self:rerender()
   end)
-  return buf, rerender
+  for _, c in ipairs(children) do
+    if TERMINAL[c.status] then
+      self:attach_body(c)
+    end
+  end
+  self:rerender()
+  return self
 end
 
--- Builds the child's body buf and recomposes the batch view whenever it
--- changes (e.g. async highlights arriving after restore).
-local function attach_body(c, tol, rerender)
-  c.buf = child_body_buf(c, tol)
-  c.buf:on("change", rerender)
+function Batch:rerender()
+  local lines, ranges = render_children(self.children)
+  self.ranges = ranges
+  self.buf:set_lines(lines)
 end
+
+-- A child's buf keeps changing after we get it (async highlights land
+-- later), so watch it and recompose the batch on every change.
+function Batch:watch(c, buf)
+  c.buf = buf
+  buf:on("change", function()
+    self:rerender()
+  end)
+end
+
+function Batch:attach_body(c)
+  self:watch(c, child_body_buf(c, self.tol))
+end
+
+-- Forward the click to the child's own buf so its real toggle logic
+-- runs. A row inside a child's range becomes that child's buffer row;
+-- row 0 (the header, or the expand replay on restore) and unmapped rows
+-- go to every child.
+function Batch:route_click(row)
+  if row >= 1 then
+    for i, r in ipairs(self.ranges) do
+      if row >= r.first and row <= r.last then
+        local c = self.children[i]
+        if c.buf then
+          c.buf:click({ row = row - r.first })
+        end
+        return
+      end
+    end
+  end
+  for _, c in ipairs(self.children) do
+    if c.buf then
+      c.buf:click({ row = 0 })
+    end
+  end
+end
+
+-- Live annotations (say, a task child's model) arrive before the done
+-- annotation ("12 lines"), so append rather than replace, with the same
+-- separator the standalone header uses.
+function Batch:annotate(c, ann)
+  c.annotation = c.annotation and (c.annotation .. ANNOTATION_SEP .. ann) or ann
+  self:rerender()
+end
+
+function Batch:settle(c, status, output)
+  if TERMINAL[c.status] then
+    error(string.format(RESETTLE_FMT, c.tool, c.status, status))
+  end
+  c.status = status
+  c.output = output
+  self:attach_body(c)
+  self:rerender()
+end
+
+function Batch:run_child(c, ctx)
+  c.status = STATUS.RUNNING
+  self:rerender()
+  local text, err, ann = maki.agent.call_tool(ctx, c.tool, c.params, {
+    -- Clicks on a still-streaming child are a no-op: its click handler
+    -- lives on the child's own handle, not on this wrapper buf.
+    on_live_buf = function(b)
+      self:watch(c, b)
+      self:rerender()
+    end,
+    on_annotation = function(a)
+      self:annotate(c, a)
+    end,
+  })
+  if ann then
+    self:annotate(c, ann)
+  end
+  if err then
+    self:settle(c, STATUS.ERROR, err)
+  else
+    self:settle(c, STATUS.SUCCESS, text)
+  end
+end
+
+-- gather returns early when the user cancels, so sweep whatever is
+-- still non-terminal into an error; no child is left dangling.
+function Batch:run(ctx)
+  local funs = {}
+  for _, c in ipairs(self.children) do
+    if c.status == STATUS.PENDING then
+      funs[#funs + 1] = function()
+        self:run_child(c, ctx)
+      end
+    end
+  end
+  maki.async.gather(funs)
+  for _, c in ipairs(self.children) do
+    if not TERMINAL[c.status] then
+      self:settle(c, STATUS.ERROR, CANCELLED_ERROR)
+    end
+  end
+end
+
+--- Tool entry points --------------------------------------------------------
 
 local function handler(input, ctx)
-  local tol = ctx:tool_output_lines()
   local children, err = prepare_children(input.tool_calls)
   if not children then
     return { llm_output = err, is_error = true }
@@ -327,61 +422,34 @@ local function handler(input, ctx)
     return { llm_output = EMPTY_ERROR, is_error = true }
   end
 
-  local buf, rerender = make_view(children, tol)
-  for _, c in ipairs(children) do
-    if c.status == "error" then
-      attach_body(c, tol, rerender)
-    end
-  end
-  rerender()
-  ctx:live_buf(buf)
-
-  local funs = {}
-  for _, c in ipairs(children) do
-    if c.status == "pending" then
-      funs[#funs + 1] = function()
-        c.status = "running"
-        rerender()
-        local text, cerr, ann = maki.agent.call_tool(ctx, c.tool, c.params, {
-          -- Clicks on a still-streaming child are a no-op: its click
-          -- handler lives on the child's own handle, not this wrapper.
-          on_live_buf = function(b)
-            c.buf = b
-            b:on("change", rerender)
-            rerender()
-          end,
-          on_annotation = function(a)
-            annotate(c, a)
-            rerender()
-          end,
-        })
-        if ann then
-          annotate(c, ann)
-        end
-        if cerr then
-          c.status, c.output = "error", cerr
-        else
-          c.status, c.output = "success", text
-        end
-        attach_body(c, tol, rerender)
-        rerender()
-      end
-    end
-  end
-  maki.async.gather(funs)
-  for _, c in ipairs(children) do
-    if c.status == "pending" or c.status == "running" then
-      c.status, c.output = "error", CANCELLED_ERROR
-      attach_body(c, tol, rerender)
-    end
-  end
-  rerender()
+  local batch = Batch.new(children, ctx:tool_output_lines())
+  ctx:live_buf(batch.buf)
+  batch:run(ctx)
 
   return {
     llm_output = render_llm(children),
-    body = buf,
+    body = batch.buf,
     state = to_state(children),
   }
+end
+
+-- Old or foreign session with no structured state: headers are still a
+-- pure function of the input, and the stored llm output becomes one
+-- plain collapsible body.
+local function legacy_restore(children, output, tol)
+  local buf = maki.ui.buf()
+  local view = ToolView.new(buf, { max_lines = tol.other, keep = "head" })
+  local header = render_children(children)
+  append_separator(header)
+  view:set_header(header)
+  for line in (output .. "\n"):gmatch("([^\n]*)\n") do
+    view:append(BODY_INDENT .. line)
+  end
+  view:finish()
+  buf:on("click", function()
+    view:toggle()
+  end)
+  return buf
 end
 
 local function restore(input, output, _is_error, rctx)
@@ -393,35 +461,17 @@ local function restore(input, output, _is_error, rctx)
 
   local st = rctx:state()
   if st and type(st.children) == "table" and #st.children == #children then
-    local buf, rerender = make_view(children, tol)
+    -- Rehydrate before a Batch owns the children, and do not trust
+    -- storage: anything non-terminal there (corrupt or foreign) becomes
+    -- an error. Batch.new attaches the terminal bodies itself.
     for i, sc in ipairs(st.children) do
       local c = children[i]
-      c.status = sc.status or "error"
-      c.output = sc.output
-      c.annotation = sc.annotation
-      attach_body(c, tol, rerender)
+      c.status = TERMINAL[sc.status] and sc.status or STATUS.ERROR
+      c.output, c.annotation = sc.output, sc.annotation
     end
-    rerender()
-    return buf
+    return Batch.new(children, tol).buf
   end
-
-  -- Old or foreign session without structured state: headers are still a
-  -- pure function of the input; the stored output renders as one plain body.
-  local buf = maki.ui.buf()
-  local view = ToolView.new(buf, { max_lines = tol.other, keep = "head" })
-  local header = render(children, tol)
-  header[#header + 1] = {}
-  header[#header + 1] = { { SEPARATOR, "dim" } }
-  header[#header + 1] = {}
-  view:set_header(header)
-  for line in (output .. "\n"):gmatch("([^\n]*)\n") do
-    view:append(BODY_INDENT .. line)
-  end
-  view:finish()
-  buf:on("click", function()
-    view:toggle()
-  end)
-  return buf
+  return legacy_restore(children, output, tol)
 end
 
 maki.api.register_tool({
