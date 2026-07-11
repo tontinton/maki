@@ -98,6 +98,10 @@ static BUNDLED_PLUGINS: &[BundledPlugin] = &[
         name: "lib",
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/lib"),
     },
+    BundledPlugin {
+        name: "system",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/system"),
+    },
 ];
 
 static BUNDLED_DIRS: LazyLock<&'static [&'static Dir<'static>]> = LazyLock::new(|| {

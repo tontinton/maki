@@ -44,6 +44,7 @@ pub(crate) fn register(lua: &Lua, maki: &Table) -> LuaResult<()> {
 
     agent.set("resolve_model", lua.create_async_function(resolve_model)?)?;
     agent.set("system_prompt", lua.create_async_function(system_prompt)?)?;
+    agent.set("plan_prompt", lua.create_async_function(plan_prompt)?)?;
     agent.set("tools", lua.create_async_function(tools)?)?;
     agent.set("call_tool", lua.create_async_function(call_tool)?)?;
     agent.set("session", lua.create_async_function(session)?)?;
@@ -139,6 +140,10 @@ async fn system_prompt(
 
     let assembled = maki_agent::prompt::assemble(prompt_id, &ctx.agent.prompt_slots, &instructions);
     Ok(vars.apply(&assembled).into_owned())
+}
+
+async fn plan_prompt(_lua: Lua, (): ()) -> LuaResult<String> {
+    Ok(maki_agent::prompt::PLAN_PROMPT.to_string())
 }
 
 async fn tools(lua: Lua, (ctx, opts): (mlua::UserDataRef<LuaCtx>, Table)) -> LuaResult<LuaValue> {

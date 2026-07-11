@@ -72,6 +72,24 @@ enum Phase {
     Done,
 }
 
+const PRESTREAM_EVENT: &str = "PreStream";
+
+enum PreStreamOutcome {
+    Proceed { system: String, tools: Value },
+    Aborted,
+}
+
+fn extract_tool_names_from_value(tools: &Value) -> Vec<String> {
+    tools
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 #[derive(Clone)]
 pub struct AgentParams {
     pub provider: Arc<dyn Provider>,
@@ -129,6 +147,7 @@ pub struct Agent<'h> {
     workflow: bool,
     local_tools: LocalTools,
     hooks: Option<Arc<dyn Hooks>>,
+    previous_tool_names: Option<Vec<String>>,
 }
 
 impl<'h> Agent<'h> {
@@ -167,6 +186,7 @@ impl<'h> Agent<'h> {
             workflow: false,
             local_tools: LocalTools::default(),
             hooks: None,
+            previous_tool_names: None,
         }
     }
 
@@ -206,6 +226,74 @@ impl<'h> Agent<'h> {
     pub fn with_hooks(mut self, hooks: Arc<dyn Hooks>) -> Self {
         self.hooks = Some(hooks);
         self
+    }
+
+    async fn resolve_stream_inputs(&mut self) -> Result<PreStreamOutcome, AgentError> {
+        let Some(hooks) = &self.hooks else {
+            return Ok(PreStreamOutcome::Proceed {
+                system: self.system.clone(),
+                tools: self.tools.clone(),
+            });
+        };
+
+        let mode_str = match self.mode {
+            AgentMode::Build => "build",
+            AgentMode::Plan(_) => "plan",
+        };
+        let payload = serde_json::json!({
+            "system": &self.system,
+            "tools": &self.tools,
+            "mode": mode_str,
+            "workflow": self.workflow,
+        });
+
+        let result = match hooks.fire(PRESTREAM_EVENT, payload).await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(error = %e, "PreStream hook failed, using defaults");
+                return Ok(PreStreamOutcome::Proceed {
+                    system: self.system.clone(),
+                    tools: self.tools.clone(),
+                });
+            }
+        };
+
+        if result
+            .get("abort")
+            .is_some_and(|a| a.as_bool() == Some(true))
+        {
+            return Ok(PreStreamOutcome::Aborted);
+        }
+
+        let system = result
+            .get("system")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .unwrap_or_else(|| self.system.clone());
+
+        if system.is_empty() {
+            warn!("PreStream returned empty system prompt, falling back");
+            return Ok(PreStreamOutcome::Proceed {
+                system: self.system.clone(),
+                tools: self.tools.clone(),
+            });
+        }
+
+        let tools = result
+            .get("tools")
+            .filter(|v| v.is_array())
+            .cloned()
+            .unwrap_or_else(|| self.tools.clone());
+
+        let new_names = extract_tool_names_from_value(&tools);
+        if let Some(prev) = &self.previous_tool_names
+            && prev != &new_names
+        {
+            warn!("PreStream returned a different tool set than the previous turn");
+        }
+        self.previous_tool_names = Some(new_names);
+
+        Ok(PreStreamOutcome::Proceed { system, tools })
     }
 
     pub async fn run(&mut self, input: AgentInput) -> Result<(), AgentError> {
@@ -258,12 +346,21 @@ impl<'h> Agent<'h> {
                 if self.cancel.is_cancelled() {
                     return Err(AgentError::Cancelled);
                 }
+
+                let (system, tools) = match self.resolve_stream_inputs().await? {
+                    PreStreamOutcome::Proceed { system, tools } => (system, tools),
+                    PreStreamOutcome::Aborted => {
+                        self.emit_done(None)?;
+                        return Ok(Phase::Done);
+                    }
+                };
+
                 let response = match stream_with_retry(
                     &*self.provider,
                     &self.model,
                     self.history.as_slice(),
-                    &self.system,
-                    &self.tools,
+                    &system,
+                    &tools,
                     &self.event_tx,
                     &self.cancel,
                     self.opts,
