@@ -99,6 +99,20 @@ pub(crate) enum PermissionScopeKind {
     Callback,
 }
 
+pub(crate) enum PermissionScopeSpec {
+    Field(Arc<str>),
+    Callback(RegistryKey),
+}
+
+impl PermissionScopeSpec {
+    pub(crate) fn kind(&self) -> PermissionScopeKind {
+        match self {
+            Self::Field(f) => PermissionScopeKind::Field(Arc::clone(f)),
+            Self::Callback(_) => PermissionScopeKind::Callback,
+        }
+    }
+}
+
 pub(crate) struct PendingTool {
     pub(crate) name: Arc<str>,
     pub(crate) description: String,
@@ -109,8 +123,7 @@ pub(crate) struct PendingTool {
     pub(crate) header_key: Option<RegistryKey>,
     pub(crate) restore_key: Option<RegistryKey>,
     pub(crate) start_key: Option<RegistryKey>,
-    pub(crate) permission_scope_kind: Option<PermissionScopeKind>,
-    pub(crate) permission_scopes_key: Option<RegistryKey>,
+    pub(crate) permission_scopes: Option<PermissionScopeSpec>,
     pub(crate) mutable_path_field: Option<Arc<str>>,
     pub(crate) timeout: Option<Duration>,
     pub(crate) start_annotation: Option<StartAnnotation>,
@@ -198,11 +211,11 @@ impl Tool for LuaTool {
         let validated = validate(self.schema, input.clone())?;
         let permission_state = match &self.permission_scope_kind {
             Some(PermissionScopeKind::Field(field)) => {
-                let scope = validated
-                    .get(field.as_ref())
-                    .and_then(|v| v.as_str())
-                    .map(|s| PermissionScopes::single(s.to_owned()));
-                PermissionState::Ready(scope)
+                let scope = validated.get(field.as_ref()).and_then(|v| v.as_str());
+                PermissionState::Ready(Some(match scope {
+                    Some(s) => PermissionScopes::single(s.to_owned()),
+                    None => PermissionScopes::force_prompt(validated.to_string()),
+                }))
             }
             Some(PermissionScopeKind::Callback) => PermissionState::NeedsCompute,
             None => PermissionState::Ready(None),
@@ -941,22 +954,26 @@ fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> Lua
     let schema_val: Value = lua.from_value(schema_table)?;
     let param_schema = try_from_json(&schema_val).map_err(mlua::Error::runtime)?;
 
-    let permission_scope_field = require_schema_field(spec, "permission_scope", &schema_val)?;
-    let mutable_path_field = require_schema_field(spec, "mutable_path", &schema_val)?;
-
-    let permission_scopes_fn: Option<Function> = spec.get("permission_scopes").ok();
-    if permission_scope_field.is_some() && permission_scopes_fn.is_some() {
+    if !spec.get::<LuaValue>("permission_scope")?.is_nil() {
         return Err(mlua::Error::runtime(
-            "register_tool: cannot specify both 'permission_scope' and 'permission_scopes'",
+            "register_tool: 'permission_scope' was removed; use permission_scopes = \"<field>\" or permission_scopes = function(input) ... end",
         ));
     }
-    let permission_scopes_key = permission_scopes_fn
-        .map(|f| lua.create_registry_value(f))
-        .transpose()?;
-    let permission_scope_kind = if permission_scopes_key.is_some() {
-        Some(PermissionScopeKind::Callback)
-    } else {
-        permission_scope_field.map(PermissionScopeKind::Field)
+    let mutable_path_field = require_schema_field(spec, "mutable_path", &schema_val)?;
+
+    let permission_scopes = match spec.get::<LuaValue>("permission_scopes")? {
+        LuaValue::Nil => None,
+        LuaValue::String(s) => {
+            let field = s.to_str()?.to_owned();
+            check_schema_field(&schema_val, "permission_scopes", &field, "string")?;
+            Some(PermissionScopeSpec::Field(Arc::from(field.as_str())))
+        }
+        LuaValue::Function(f) => Some(PermissionScopeSpec::Callback(lua.create_registry_value(f)?)),
+        _ => {
+            return Err(mlua::Error::runtime(
+                "register_tool: 'permission_scopes' must be a string field name or a function",
+            ));
+        }
     };
 
     let header_fn: Option<Function> = spec.get("header").ok();
@@ -1004,8 +1021,7 @@ fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> Lua
             header_key,
             restore_key,
             start_key,
-            permission_scope_kind,
-            permission_scopes_key,
+            permission_scopes,
             mutable_path_field,
             timeout,
             start_annotation,
@@ -1372,6 +1388,7 @@ mod tests {
             "properties": {
                 "url": { "type": "string" },
                 "format": { "type": "string" },
+                "count": { "type": "integer" },
             },
             "required": ["url"],
         }))
@@ -1409,13 +1426,20 @@ mod tests {
         );
     }
 
-    #[test]
-    fn permission_scope_none_when_field_absent_or_unconfigured() {
-        let absent = make_lua_tool(Some(PermissionScopeKind::Field(Arc::from("format"))))
-            .parse(&serde_json::json!({"url": "https://example.com"}))
+    #[test_case::test_case("format" ; "absent_field")]
+    #[test_case::test_case("count" ; "non_string_field")]
+    fn permission_scope_field_invalid_forces_prompt(field: &str) {
+        let input = serde_json::json!({"url": "https://example.com", "count": 42});
+        let inv = make_lua_tool(Some(PermissionScopeKind::Field(Arc::from(field))))
+            .parse(&input)
             .unwrap();
-        assert!(smol::block_on(absent.permission_scopes()).is_none());
+        let scopes = smol::block_on(inv.permission_scopes()).expect("should fail closed");
+        assert!(scopes.force_prompt);
+        assert_eq!(scopes.scopes, vec![input.to_string()]);
+    }
 
+    #[test]
+    fn permission_scope_none_when_unconfigured() {
         let unconfigured = make_lua_tool(None)
             .parse(&serde_json::json!({"url": "https://example.com"}))
             .unwrap();
@@ -1543,38 +1567,6 @@ mod tests {
         let scopes = result.unwrap();
         assert_eq!(scopes.scopes, vec!["cargo", "test"]);
         assert!(!scopes.force_prompt);
-    }
-
-    #[test]
-    fn permission_scope_field_non_string_value_returns_none() {
-        let schema = try_from_json(&serde_json::json!({
-            "type": "object",
-            "properties": {
-                "count": { "type": "integer" },
-            },
-            "required": ["count"],
-        }))
-        .unwrap();
-        let (tx, _rx) = flume::unbounded();
-        let tool = LuaTool {
-            name: Arc::from("test_tool"),
-            description: "test".into(),
-            schema,
-            audience: ToolAudience::default(),
-            kind: None,
-            tx,
-            plugin: Arc::from("test"),
-            has_header_fn: false,
-            permission_scope_kind: Some(PermissionScopeKind::Field(Arc::from("count"))),
-            mutable_path_field: None,
-            timeout: Some(Duration::from_secs(60)),
-            start_annotation: None,
-            has_start_fn: false,
-            examples: None,
-            has_describe_fn: false,
-        };
-        let inv = tool.parse(&serde_json::json!({"count": 42})).unwrap();
-        assert!(smol::block_on(inv.permission_scopes()).is_none());
     }
 
     fn timeout_spec(lua: &Lua, value: LuaValue) -> Table {

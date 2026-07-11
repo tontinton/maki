@@ -127,7 +127,7 @@ maki.api.register_tool({
   name = "edit",
   kind = "edit",
   mutable_path = "path",
-  permission_scope = "path",
+  permission_scopes = "path",
   audiences = { "main", "general_sub", "interpreter" },
   description = EDIT_DESCRIPTION,
 
@@ -178,7 +178,7 @@ maki.api.register_tool({
   name = "multiedit",
   kind = "edit",
   mutable_path = "path",
-  permission_scope = "path",
+  permission_scopes = "path",
   start_annotation = "edits",
   audiences = { "main", "general_sub", "interpreter" },
   description = MULTIEDIT_DESCRIPTION,
@@ -259,7 +259,7 @@ maki.api.register_tool({
   name = "edit_lines",
   kind = "edit",
   mutable_path = "path",
-  permission_scope = "path",
+  permission_scopes = "path",
   audiences = { "main", "general_sub", "interpreter" },
   description = EDIT_LINES_DESCRIPTION,
 

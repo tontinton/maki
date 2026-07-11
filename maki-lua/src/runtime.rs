@@ -27,7 +27,7 @@ use crate::api::r#fn::{JobEvent, JobStore};
 use crate::api::keymap::KeymapReader;
 use crate::api::keymap::{KeymapStore, KeymapWriter};
 use crate::api::slot::SlotStore;
-use crate::api::tool::{LuaTool, PendingTool, PendingTools, ToolCallReply};
+use crate::api::tool::{LuaTool, PendingTool, PendingTools, PermissionScopeSpec, ToolCallReply};
 use crate::api::ui::HintStore;
 use crate::api::ui::buf::{BufHandle, BufferStore};
 use crate::api::util::command::{CommandHandlerMap, HintWriter, publish_command_snapshot};
@@ -893,7 +893,7 @@ impl LuaRuntime {
             {
                 tracing::warn!(error = %e, "failed to drop lua header key on rollback");
             }
-            if let Some(sk) = t.permission_scopes_key
+            if let Some(PermissionScopeSpec::Callback(sk)) = t.permission_scopes
                 && let Err(e) = self.lua.remove_registry_value(sk)
             {
                 tracing::warn!(error = %e, "failed to drop lua permission_scopes key on rollback");
@@ -1093,7 +1093,10 @@ impl LuaRuntime {
                     plugin: Arc::clone(&name),
                     has_header_fn: t.header_key.is_some(),
                     has_start_fn: t.start_key.is_some(),
-                    permission_scope_kind: t.permission_scope_kind.clone(),
+                    permission_scope_kind: t
+                        .permission_scopes
+                        .as_ref()
+                        .map(PermissionScopeSpec::kind),
                     mutable_path_field: t.mutable_path_field.clone(),
                     timeout: t.timeout,
                     start_annotation: t.start_annotation.clone(),
@@ -1129,7 +1132,10 @@ impl LuaRuntime {
                         header: t.header_key,
                         restore: t.restore_key,
                         start: t.start_key,
-                        permission_scopes: t.permission_scopes_key,
+                        permission_scopes: match t.permission_scopes {
+                            Some(PermissionScopeSpec::Callback(k)) => Some(k),
+                            _ => None,
+                        },
                         describe: t.describe_key,
                     },
                 )

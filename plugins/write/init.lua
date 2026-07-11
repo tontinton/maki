@@ -28,7 +28,7 @@ maki.api.register_tool({
   name = "write",
   kind = "edit",
   mutable_path = "path",
-  permission_scope = "path",
+  permission_scopes = "path",
   audiences = { "main", "general_sub", "interpreter" },
   description = DESCRIPTION,
 
