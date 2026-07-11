@@ -24,6 +24,7 @@ const DOOM_LOOP_THRESHOLD: usize = 3;
 const DOOM_LOOP_MESSAGE: &str = "You have called this tool with identical input 3 times in a row. You are stuck in a loop. Break out and try a different approach.";
 const MCP_BLOCKED_IN_PLAN: &str = "MCP tools are not available in plan mode";
 const UNKNOWN_TOOL_PREFIX: &str = "unknown tool";
+const PRETOOLDISPATCH_EVENT: &str = "PreToolDispatch";
 
 pub(super) struct RecentCalls(VecDeque<(String, u64)>);
 
@@ -355,10 +356,42 @@ pub(super) async fn process_tool_calls(
         event_tx.try_send(AgentEvent::ToolDone(Box::new(err.clone())));
     }
 
+    let effective_runnable = match hooks {
+        Some(hooks) => {
+            let tool_calls_json: Vec<Value> = runnable
+                .iter()
+                .map(|(id, name, input)| {
+                    serde_json::json!({ "id": id, "name": name, "input": input })
+                })
+                .collect();
+            let payload = serde_json::json!({ "tool_calls": tool_calls_json });
+            match hooks.fire(PRETOOLDISPATCH_EVENT, payload).await {
+                Ok(result) => match result.get("tool_calls").and_then(Value::as_array) {
+                    Some(filtered) => filtered
+                        .iter()
+                        .filter_map(|tc| {
+                            Some((
+                                tc.get("id")?.as_str()?.to_owned(),
+                                tc.get("name")?.as_str()?.to_owned(),
+                                tc.get("input").cloned().unwrap_or(Value::Null),
+                            ))
+                        })
+                        .collect::<Vec<_>>(),
+                    None => runnable,
+                },
+                Err(e) => {
+                    warn!(error = %e, "PreToolDispatch hook failed, proceeding with all calls");
+                    runnable
+                }
+            }
+        }
+        None => runnable,
+    };
+
     let mut set = TaskSet::new();
     let mut spawned_ids: Vec<String> = Vec::new();
     let mut spawned_inputs: Vec<(Arc<str>, Value)> = Vec::new();
-    for (id, name, input) in runnable {
+    for (id, name, input) in effective_runnable {
         spawned_ids.push(id.clone());
         spawned_inputs.push((Arc::from(name.as_str()), input.clone()));
         let event_tx_clone = ctx.event_tx.clone();

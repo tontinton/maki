@@ -73,6 +73,7 @@ enum Phase {
 }
 
 const PRESTREAM_EVENT: &str = "PreStream";
+const PRECOMPACTION_EVENT: &str = "PreCompaction";
 
 enum PreStreamOutcome {
     Proceed { system: String, tools: Value },
@@ -612,6 +613,15 @@ impl<'h> Agent<'h> {
     async fn do_compact(&mut self) -> Result<TokenUsage, AgentError> {
         let (compact_provider, compact_model) =
             resolve_compaction_model(&self.provider, &self.model, self.timeouts);
+        if let Some(hooks) = &self.hooks {
+            let payload = serde_json::json!({
+                "history_len": self.history.len(),
+                "context_size": self.context_size,
+            });
+            if let Err(e) = hooks.fire(PRECOMPACTION_EVENT, payload).await {
+                warn!(error = %e, "PreCompaction hook failed");
+            }
+        }
         let usage = compaction::compact_history(
             &*compact_provider,
             &compact_model,
