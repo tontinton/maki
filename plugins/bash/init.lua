@@ -335,10 +335,9 @@ maki.api.register_tool({
     end
 
     local command, workdir = parse_cd_hint(input)
-    local config = ctx:config()
-    local timeout_secs = input.timeout or (config and config.bash_timeout_secs) or 120
-    local max_lines = (config and config.max_output_lines) or 2000
-    local max_bytes = (config and config.max_output_bytes) or (50 * 1024)
+    local timeout_secs = input.timeout or ctx:config("bash_timeout_secs", 120)
+    local max_lines = ctx:config("max_output_lines", 2000)
+    local max_bytes = ctx:config("max_output_bytes", (50 * 1024))
 
     ctx:set_deadline(timeout_secs)
 

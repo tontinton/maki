@@ -135,7 +135,25 @@ impl UserData for LuaCtx {
             send_live_buf(lua, &buf)
         });
 
-        methods.add_method("config", |lua, this, ()| lua.to_value(&this.config));
+        methods.add_method("config", |lua, this, args: MultiValue| {
+            let config_val = lua.to_value(&this.config)?;
+            if args.is_empty() {
+                return Ok(config_val);
+            }
+            let key: String = lua.from_value(args[0].clone())?;
+            let default = args.get(1).cloned().unwrap_or(LuaValue::Nil);
+            match config_val {
+                LuaValue::Table(ref tbl) => {
+                    let val = tbl.raw_get::<LuaValue>(key.as_str())?;
+                    if matches!(val, LuaValue::Nil) {
+                        Ok(default)
+                    } else {
+                        Ok(val)
+                    }
+                }
+                _ => Ok(default),
+            }
+        });
 
         methods.add_method("tool_output_lines", |lua, this, ()| {
             lua.to_value(&this.tool_output_lines)

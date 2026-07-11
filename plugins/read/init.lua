@@ -122,10 +122,9 @@ local function read_file(path, offset, limit, ctx)
   end
   local total_lines = #all_lines
 
-  local config = ctx:config()
   local start = math.max(offset or 1, 1)
-  local max_lines = limit or (config and config.max_output_lines) or DEFAULT_MAX_OUTPUT_LINES
-  local max_line_bytes = (config and config.max_line_bytes) or DEFAULT_MAX_LINE_BYTES
+  local max_lines = limit or ctx:config("max_output_lines", DEFAULT_MAX_OUTPUT_LINES)
+  local max_line_bytes = ctx:config("max_line_bytes", DEFAULT_MAX_LINE_BYTES)
 
   local lines = {}
   for i = start, math.min(start + max_lines - 1, total_lines) do
@@ -181,9 +180,9 @@ local function read_file(path, offset, limit, ctx)
 end
 
 local function list_dir(path, ctx)
-  local entries = maki.fs.dir(path)
+  local entries, err = maki.fs.dir(path)
   if not entries then
-    return { llm_output = "read error: cannot read directory: " .. path, is_error = true }
+    return { llm_output = "read error: " .. tostring(err), is_error = true }
   end
 
   local sorted = {}

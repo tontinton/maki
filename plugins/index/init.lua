@@ -202,8 +202,7 @@ Return a compact overview of a source file: imports, type definitions, function 
       end
     end
 
-    local config = ctx:config()
-    local max_file_size = (config and config.index_max_file_size) or (2 * 1024 * 1024)
+    local max_file_size = ctx:config("index_max_file_size", (2 * 1024 * 1024))
     if meta and meta.size > max_file_size then
       return "error: File too large ("
         .. meta.size

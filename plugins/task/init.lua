@@ -132,7 +132,7 @@ local function handler(input, ctx)
 
   -- Process-wide cap on concurrent subagents, sized from config on first use.
   if not semaphore then
-    semaphore = maki.async.semaphore(math.max(ctx:config().task_max_concurrent or 1, 1))
+    semaphore = maki.async.semaphore(math.max(ctx:config("task_max_concurrent", 1), 1))
   end
   local permit = semaphore:acquire()
 
