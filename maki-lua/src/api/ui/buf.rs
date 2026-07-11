@@ -293,7 +293,7 @@ fn parse_style(val: &LuaValue) -> LuaResult<SpanStyle> {
     }
 }
 
-fn line_to_lua(lua: &Lua, line: &SnapshotLine) -> LuaResult<Table> {
+pub(crate) fn line_to_lua(lua: &Lua, line: &SnapshotLine) -> LuaResult<Table> {
     let tbl = lua.create_table_with_capacity(line.spans.len(), 0)?;
     for (i, span) in line.spans.iter().enumerate() {
         tbl.raw_set(i + 1, span_to_lua(lua, span)?)?;

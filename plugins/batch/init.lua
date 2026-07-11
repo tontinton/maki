@@ -7,8 +7,9 @@
 --   3. Once a `Batch` owns the children, only its methods touch them,
 --      and each method ends with a rerender, so the screen never goes
 --      stale.
---   4. Child callbacks (header, restore) run under pcall: a broken
---      child falls back to plain rendering instead of sinking the batch.
+--   4. Child handles from `get_tool` come isolated and normalized by the
+--      host: a broken child degrades to plain rendering, never sinks the
+--      batch.
 
 local ToolView = require("maki.tool_view")
 
@@ -117,68 +118,35 @@ local function normalize_entry(entry)
   return { tool = tool, params = params }
 end
 
---- Child presentation (pcall-isolated) -------------------------------------
+--- Child presentation ------------------------------------------------------
 
 -- Let the child tool draw its own header. Some tools have none (MCP
--- ones, for example) and a broken one may throw; either way the plain
--- tool name is enough.
+-- ones, for example) and a broken one comes back nil; either way the
+-- plain tool name is enough.
 local function header_spans(tool, params)
-  local ok, spans = pcall(function()
-    local t = maki.api.get_tool(tool)
-    if not (t and t.header) then
-      return nil
-    end
-    local res = t.header(params)
-    if type(res) == "string" then
-      return { { res, "tool" } }
-    end
-    if type(res) == "userdata" then
-      local lines = res:get_lines()
-      if lines[1] then
-        return lines[1]
-      end
-    end
-    return nil
-  end)
-  if ok and spans then
-    return spans
-  end
-  return { { tool, "tool" } }
+  local t = maki.api.get_tool(tool)
+  local spans = t and t.header and t.header(params)
+  return spans or { { tool, "tool" } }
 end
 
 -- The child's own restore fn builds the body, fed the real is_error, so
 -- a failed child looks exactly like the same tool run standalone. When
--- restore is missing or throws, the ToolView fallback matches the
--- standalone plain rendering too.
+-- restore is missing, throws, or returns no buf, the ToolView fallback
+-- matches the standalone plain rendering too.
 local function child_body_buf(c, tol)
   local output = c.output or ""
-  local ok, buf = pcall(function()
-    local t = maki.api.get_tool(c.tool)
-    if not (t and t.restore) then
-      return nil
-    end
-    local rctx = {
+  local t = maki.api.get_tool(c.tool)
+  local buf = t
+    and t.restore
+    and t.restore(c.params, output, c.status == STATUS.ERROR, {
       tool_output_lines = function()
         return tol
       end,
       state = function()
         return nil
       end,
-    }
-    local reply = t.restore(c.params, output, c.status == STATUS.ERROR, rctx)
-    local body = reply
-    if type(reply) == "table" then
-      body = reply.body
-    end
-    if type(body) == "userdata" then
-      return body
-    end
-    return nil
-  end)
-  if ok and buf then
-    return buf
-  end
-  return ToolView.restore(output, { max_lines = tol[c.tool] or tol.other, keep = "head" })
+    })
+  return buf or ToolView.restore(output, { max_lines = tol[c.tool] or tol.other, keep = "head" })
 end
 
 -- Parsing plus per-entry policy: entries past MAX_BATCH_SIZE and nested
@@ -371,7 +339,7 @@ end
 function Batch:run_child(c, ctx)
   c.status = STATUS.RUNNING
   self:rerender()
-  local text, err, ann = maki.agent.call_tool(ctx, c.tool, c.params, {
+  local text, err = maki.agent.call_tool(ctx, c.tool, c.params, {
     -- Clicks on a still-streaming child are a no-op: its click handler
     -- lives on the child's own handle, not on this wrapper buf.
     on_live_buf = function(b)
@@ -382,9 +350,6 @@ function Batch:run_child(c, ctx)
       self:annotate(c, a)
     end,
   })
-  if ann then
-    self:annotate(c, ann)
-  end
   if err then
     self:settle(c, STATUS.ERROR, err)
   else

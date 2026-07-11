@@ -39,8 +39,9 @@ maki.agent.call_tool = function(ctx, name, input, opts)
   elseif name == "annotated" then
     if opts and opts.on_annotation then
       opts.on_annotation("model-x")
+      opts.on_annotation("5 lines")
     end
-    return "annotated_done", nil, "5 lines"
+    return "annotated_done"
   elseif name == "park" then
     -- Deadlocks unless a sibling runs concurrently and releases.
     local p = sem:acquire()
@@ -498,10 +499,11 @@ fn restore_child_header_shows_annotation_span() {
     );
 }
 
-/// A live annotation (e.g. the subagent model streamed while a task child
-/// runs) and the done annotation both land on the child, in order.
+/// A child can annotate more than once (a task child streams its model,
+/// then its completion note arrives on the same channel); batch joins
+/// them on the child header in order.
 #[test]
-fn live_and_done_annotations_append_on_child() {
+fn annotations_append_on_child_in_order() {
     let (reg, _host) = load_batch_host();
     let state = run_batch_state(&reg, json!([{ "tool": "annotated", "parameters": {} }]));
     assert_eq!(

@@ -1214,15 +1214,10 @@ impl LuaRuntime {
             }),
         );
 
-        let ctx_ud = self
-            .lua
-            .create_userdata(crate::api::util::ctx::RestoreCtx {
-                tool_output_lines: item.tool_output_lines,
-                state: item.state,
-            })
+        let ctx = crate::api::util::ctx::restore_ctx(&self.lua, item.tool_output_lines, item.state)
             .ok()?;
         let inner = thread
-            .into_async::<LuaValue>((input_lua, &*item.output, item.is_error, ctx_ud))
+            .into_async::<LuaValue>((input_lua, &*item.output, item.is_error, ctx))
             .ok()?;
         let scope = TaskScope::new(&self.lua, cell);
         let ret = scope

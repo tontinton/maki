@@ -21,11 +21,12 @@ use maki_agent::{
     TextOutput, ToolOutput,
 };
 use mlua::{
-    Function, Lua, LuaSerdeExt, RegistryKey, Result as LuaResult, Table, Value as LuaValue,
+    Function, Lua, LuaSerdeExt, MultiValue, RegistryKey, Result as LuaResult, Table,
+    Value as LuaValue,
 };
 use serde_json::{Value, json};
 
-use crate::api::ui::buf::BufHandle;
+use crate::api::ui::buf::{BufHandle, line_to_lua};
 use crate::api::util::command::{
     CommandEntry, CommandHandlerMap, LuaCommandWriter, publish_command_snapshot,
 };
@@ -39,6 +40,7 @@ const TOOL_HANDLER_RETURN_ERR: &str =
 const TIMEOUT_PARSE_ERR: &str = "register_tool: 'timeout' must be a positive number, 0, or false";
 const MAX_HINT_CONTENT_SIZE: usize = 1024 * 1024;
 const DESCRIBE_TIMEOUT: Duration = Duration::from_secs(3);
+const PLAIN_HEADER_STYLE: &str = "tool";
 
 type DescribeFn = Box<dyn Fn(&str, &str, &Value) -> Option<String>>;
 
@@ -698,9 +700,10 @@ fn tool_entry_to_lua(lua: &Lua, entry: &RegisteredTool) -> LuaResult<Table> {
     Ok(t)
 }
 
-/// Single-tool lookup that also hands out `header`/`restore` function
-/// handles for Lua tools (nil for MCP or missing tools). Kept apart from
-/// `get_tools` so the listing stays a cheap data-only snapshot.
+/// Single-tool lookup that also hands out `header`/`restore` handles for
+/// Lua tools (nil for MCP or missing tools), wrapped so one broken tool
+/// cannot break a composing caller. Kept apart from `get_tools` so the
+/// listing stays a cheap data-only snapshot.
 fn get_tool_from_lua(lua: &Lua, name: String) -> LuaResult<LuaValue> {
     let registry = lua
         .app_data_ref::<Arc<ToolRegistry>>()
@@ -712,13 +715,76 @@ fn get_tool_from_lua(lua: &Lua, name: String) -> LuaResult<LuaValue> {
     let t = tool_entry_to_lua(lua, &entry)?;
     if let Some((header, restore)) = local_tool_handles(&name) {
         if let Some(f) = header {
-            t.set("header", f)?;
+            t.set("header", wrap_header(lua, name.clone(), f)?)?;
         }
         if let Some(f) = restore {
-            t.set("restore", f)?;
+            t.set("restore", wrap_restore(lua, name, f)?)?;
         }
     }
     Ok(LuaValue::Table(t))
+}
+
+/// The one contract every `get_tool` handle obeys: it never throws; an
+/// error from the wrapped fn is logged and becomes nil.
+fn wrap_nothrow(
+    lua: &Lua,
+    tool: String,
+    handle: &'static str,
+    f: Function,
+    norm: impl Fn(&Lua, LuaValue) -> LuaResult<LuaValue> + Send + 'static,
+) -> LuaResult<Function> {
+    lua.create_function(
+        move |lua, args: MultiValue| match f.call::<LuaValue>(args) {
+            Ok(v) => norm(lua, v),
+            Err(e) => {
+                tracing::warn!(tool, handle, error = %e, "get_tool handle failed");
+                Ok(LuaValue::Nil)
+            }
+        },
+    )
+}
+
+/// Normalizes a header fn to one spans line or nil: a plain string gets
+/// the standalone header style, a buf return contributes its first line.
+fn wrap_header(lua: &Lua, tool: String, f: Function) -> LuaResult<Function> {
+    wrap_nothrow(lua, tool, "header", f, |lua, v| match v {
+        LuaValue::String(s) => {
+            let span = lua.create_table()?;
+            span.raw_set(1, s)?;
+            span.raw_set(2, PLAIN_HEADER_STYLE)?;
+            let line = lua.create_table()?;
+            line.raw_set(1, span)?;
+            Ok(LuaValue::Table(line))
+        }
+        LuaValue::UserData(ud) => {
+            let Ok(h) = ud.borrow::<BufHandle>() else {
+                return Ok(LuaValue::Nil);
+            };
+            match h.buf.read().first() {
+                Some(line) => Ok(LuaValue::Table(line_to_lua(lua, line)?)),
+                None => Ok(LuaValue::Nil),
+            }
+        }
+        _ => Ok(LuaValue::Nil),
+    })
+}
+
+/// Normalizes a restore fn to its body buf or nil (whether it returned
+/// the buf directly or a `{ body = buf }` reply), so callers composing
+/// another tool's rendering need no pcall of their own.
+fn wrap_restore(lua: &Lua, tool: String, f: Function) -> LuaResult<Function> {
+    wrap_nothrow(lua, tool, "restore", f, |_lua, v| {
+        Ok(match &v {
+            LuaValue::UserData(ud) if ud.is::<BufHandle>() => v,
+            LuaValue::Table(t) => t
+                .get::<mlua::AnyUserData>("body")
+                .ok()
+                .filter(|ud| ud.is::<BufHandle>())
+                .map(LuaValue::UserData)
+                .unwrap_or(LuaValue::Nil),
+            _ => LuaValue::Nil,
+        })
+    })
 }
 
 fn is_valid_tool_name(name: &str) -> bool {

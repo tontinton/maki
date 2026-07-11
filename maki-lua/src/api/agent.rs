@@ -189,61 +189,70 @@ async fn tools(lua: Lua, (ctx, opts): (mlua::UserDataRef<LuaCtx>, Table)) -> Lua
     json_to_lua(&lua, &defs)
 }
 
-/// Returns `(text, err, annotation)`. While the child runs,
-/// `opts.on_live_buf` receives each buf it publishes (as a foreign
-/// `BufHandle`) and `opts.on_annotation` each live annotation (e.g. a
-/// subagent's model). Both run synchronously on the Lua thread and must
+/// Returns `(text, err)`. While the child runs, `opts.on_live_buf`
+/// receives each buf it publishes (as a foreign `BufHandle`) and
+/// `opts.on_annotation` every annotation, live ones and the completion
+/// annotation alike. Both run synchronously on the Lua thread and must
 /// not yield.
 async fn call_tool(
     _lua: Lua,
     (ctx, name, input, opts): (mlua::UserDataRef<LuaCtx>, String, LuaValue, Option<Table>),
-) -> LuaResult<(Option<String>, Option<String>, Option<String>)> {
+) -> LuaResult<(Option<String>, Option<String>)> {
     let input_json = lua_to_json(&input)?;
     let mut tctx = ctx.agent.to_tool_context();
-    let mut on_live = None;
+    let (mut on_buf, mut on_ann, mut rx) = (None, None, None);
     if let Some(o) = opts {
         if let Some(secs) = o.get::<Option<u64>>("timeout")? {
             tctx.deadline = Deadline::after(Duration::from_secs(secs));
         }
-        let on_buf = o.get::<Option<Function>>("on_live_buf")?;
-        let on_ann = o.get::<Option<Function>>("on_annotation")?;
+        on_buf = o.get::<Option<Function>>("on_live_buf")?;
+        on_ann = o.get::<Option<Function>>("on_annotation")?;
         if on_buf.is_some() || on_ann.is_some() {
-            let (tx, rx) = flume::unbounded();
+            let (tx, r) = flume::unbounded();
             tctx.live_sink = Some(tx);
-            on_live = Some((rx, on_buf, on_ann));
+            rx = Some(r);
         }
     }
     drop(ctx);
     if let Err(e) = tctx.deadline.check() {
-        return Ok((None, Some(e), None));
+        return Ok((None, Some(e)));
     }
-    let done = dispatch_racing_live(&tctx, &name, &input_json, on_live).await;
+    let deliver = |ev: ToolLive| {
+        let res = match ev {
+            ToolLive::Buf(buf) => on_buf
+                .as_ref()
+                .map(|f| f.call::<()>(BufHandle::foreign(buf))),
+            ToolLive::Annotation(ann) => on_ann.as_ref().map(|f| f.call::<()>(ann)),
+        };
+        if let Some(Err(e)) = res {
+            tracing::warn!(tool = name, error = %e, "call_tool callback failed");
+        }
+    };
+    let done = dispatch_racing_live(&tctx, &name, &input_json, rx, &deliver).await;
     // Same fallback the UI applies on tool completion, so a batch child's
     // header carries the annotation its standalone run would get.
     let annotation = done
         .annotation
         .clone()
         .or_else(|| (!done.is_error).then(|| done.output.annotation()).flatten());
+    if let Some(a) = annotation {
+        deliver(ToolLive::Annotation(a));
+    }
     match interpreter_bridge::flatten(&done) {
-        Ok(text) => Ok((Some(text), None, annotation)),
-        Err(err) => Ok((None, Some(err), annotation)),
+        Ok(text) => Ok((Some(text), None)),
+        Err(err) => Ok((None, Some(err))),
     }
 }
 
-type OnLive = (
-    flume::Receiver<ToolLive>,
-    Option<Function>,
-    Option<Function>,
-);
-
 /// Like `interpreter_bridge::dispatch`, but keeps the full `ToolDoneEvent`
-/// (the annotation lives there) and delivers live bufs and annotations
-/// while the child runs.
+/// (the annotation lives there) and feeds live events to `deliver` while
+/// the child runs.
 async fn dispatch_racing_live(
     tctx: &ToolContext,
     name: &str,
     input: &JsonValue,
-    on_live: Option<OnLive>,
+    rx: Option<flume::Receiver<ToolLive>>,
+    deliver: &impl Fn(ToolLive),
 ) -> ToolDoneEvent {
     let run = tool_dispatch::run(
         &tctx.registry,
@@ -254,19 +263,8 @@ async fn dispatch_racing_live(
         tctx,
         Emit::Silent,
     );
-    let Some((rx, on_buf, on_ann)) = on_live else {
+    let Some(rx) = rx else {
         return run.await;
-    };
-    let deliver = |ev: ToolLive| {
-        let res = match ev {
-            ToolLive::Buf(buf) => on_buf
-                .as_ref()
-                .map(|f| f.call::<()>(BufHandle::foreign(buf))),
-            ToolLive::Annotation(ann) => on_ann.as_ref().map(|f| f.call::<()>(ann)),
-        };
-        if let Some(Err(e)) = res {
-            tracing::warn!(tool = name, error = %e, "live callback failed");
-        }
     };
     let mut run = pin!(run);
     loop {

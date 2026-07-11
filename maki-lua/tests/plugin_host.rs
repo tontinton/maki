@@ -275,8 +275,11 @@ fn tool_kind_flows_to_trait() {
     assert_eq!(entry.tool.tool_kind(), Some("fetch"));
 }
 
+/// `get_tool` handles are the boundary between plugins: they never throw
+/// (errors become nil) and their returns are normalized, so a composing
+/// caller like batch needs no pcall of its own.
 #[test]
-fn get_tool_returns_header_and_restore_handles() {
+fn get_tool_returns_normalized_header_and_restore_handles() {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
 
@@ -288,7 +291,22 @@ fn get_tool_returns_header_and_restore_handles() {
             schema = {STRING_FIELD_SCHEMA},
             handler = function() return "ok" end,
             header = function(input) return "H:" .. input.url end,
-            restore = function() return {{}} end,
+            restore = function(input)
+                if input.with_body then
+                    local b = maki.ui.buf()
+                    b:line("body")
+                    return {{ body = b }}
+                end
+                return {{}}
+            end,
+        }})
+        maki.api.register_tool({{
+            name = "throwing_tool",
+            description = "t",
+            schema = {MINIMAL_SCHEMA},
+            handler = function() return "ok" end,
+            header = function() error("kaboom") end,
+            restore = function() error("kaboom") end,
         }})
         maki.api.register_tool({{
             name = "handle_probe",
@@ -297,15 +315,17 @@ fn get_tool_returns_header_and_restore_handles() {
             handler = function()
                 local t = maki.api.get_tool("styled_tool")
                 if not t then return nil, "not found" end
-                local missing = maki.api.get_tool("nope_tool")
-                local plain = maki.api.get_tool("handle_probe")
+                local thrower = maki.api.get_tool("throwing_tool")
+                local h = t.header({{ url = "abc" }})
                 return table.concat({{
                     t.name,
-                    type(t.header),
-                    type(t.restore),
-                    t.header({{ url = "abc" }}),
-                    tostring(missing == nil),
-                    type(plain.header),
+                    h[1][1] .. "/" .. h[1][2],
+                    type(t.restore({{}}, "", false, nil)),
+                    type(t.restore({{ with_body = true }}, "", false, nil)),
+                    tostring(thrower.header({{}}) == nil),
+                    tostring(thrower.restore({{}}, "", false, nil) == nil),
+                    tostring(maki.api.get_tool("nope_tool") == nil),
+                    type(maki.api.get_tool("handle_probe").header),
                 }}, "|")
             end
         }})
@@ -314,7 +334,10 @@ fn get_tool_returns_header_and_restore_handles() {
     host.load_source("get_tool_plugin", &src).unwrap();
 
     let out = exec_tool(&reg, "handle_probe", serde_json::json!({})).unwrap();
-    assert_eq!(out, "styled_tool|function|function|H:abc|true|nil");
+    assert_eq!(
+        out,
+        "styled_tool|H:abc/tool|nil|userdata|true|true|true|nil"
+    );
 }
 
 #[test]
@@ -1071,10 +1094,10 @@ fn live_click_routes_to_root_buf_among_many() {
     );
 }
 
-/// `maki.agent.call_tool` returns `(text, err, annotation)` and delivers the
-/// child's live buf through `on_live_buf`.
+/// `maki.agent.call_tool` returns `(text, err)` and delivers live bufs and
+/// annotations (live and completion alike) through the callbacks.
 #[test]
-fn call_tool_returns_annotation_and_streams_live_buf() {
+fn call_tool_streams_live_buf_and_annotations() {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let src = format!(
@@ -1115,18 +1138,26 @@ maki.api.register_tool({{
     schema = {MINIMAL_SCHEMA},
     audiences = {{ "main" }},
     handler = function(input, ctx)
-        local text, err, ann = maki.agent.call_tool(ctx, "annotated_child", {{}})
+        local ann = "nil"
+        local text, err = maki.agent.call_tool(ctx, "annotated_child", {{}}, {{
+            on_annotation = function(a) ann = a end,
+        }})
         local live_text = "none"
-        local text2, _, ann2 = maki.agent.call_tool(ctx, "streaming_child", {{}}, {{
+        local ann2 = "nil"
+        local text2 = maki.agent.call_tool(ctx, "streaming_child", {{}}, {{
             on_live_buf = function(b)
                 local lines = b:get_lines()
                 live_text = lines[1] and lines[1][1] and lines[1][1][1] or "empty"
             end,
+            on_annotation = function(a) ann2 = a end,
         }})
-        local _, err3, ann3 = maki.agent.call_tool(ctx, "failing_child", {{}})
-        return tostring(text) .. "/" .. tostring(ann)
-            .. " " .. tostring(text2) .. "/" .. live_text .. "/" .. tostring(ann2)
-            .. " " .. tostring(err3) .. "/" .. tostring(ann3)
+        local ann3 = "nil"
+        local _, err3 = maki.agent.call_tool(ctx, "failing_child", {{}}, {{
+            on_annotation = function(a) ann3 = a end,
+        }})
+        return tostring(text) .. "/" .. ann
+            .. " " .. tostring(text2) .. "/" .. live_text .. "/" .. ann2
+            .. " " .. tostring(err3) .. "/" .. ann3
     end
 }})
 "#,

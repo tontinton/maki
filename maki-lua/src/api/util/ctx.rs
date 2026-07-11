@@ -7,7 +7,7 @@ use maki_agent::agent::LoadedInstructions;
 use maki_agent::cancel::CancelToken;
 use maki_agent::tools::{Deadline, FileReadTracker, LocalTools, ToolContext, ToolLive};
 use maki_config::{AgentConfig, ToolOutputLines};
-use mlua::{LuaSerdeExt, UserData, UserDataMethods, Value as LuaValue};
+use mlua::{Lua, LuaSerdeExt, MultiValue, Table, UserData, UserDataMethods, Value as LuaValue};
 
 use crate::api::tool::ToolCallReply;
 use crate::api::ui::buf::BufHandle;
@@ -15,21 +15,27 @@ use crate::runtime::{active_task, lock_cell};
 
 const DEADLINE_ALREADY_SET_MSG: &str = "ctx:set_deadline() already called";
 
-pub(crate) struct RestoreCtx {
-    pub(crate) tool_output_lines: ToolOutputLines,
-    pub(crate) state: Option<serde_json::Value>,
-}
-
-impl UserData for RestoreCtx {
-    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
-        methods.add_method("tool_output_lines", |lua, this, ()| {
-            lua.to_value(&this.tool_output_lines)
-        });
-        methods.add_method("state", |lua, this, ()| match &this.state {
+/// The restore ctx is a plain table, not a userdata, so a plugin that
+/// drives another tool's restore (batch composes children this way) can
+/// build the same shape itself.
+pub(crate) fn restore_ctx(
+    lua: &Lua,
+    tool_output_lines: ToolOutputLines,
+    state: Option<serde_json::Value>,
+) -> mlua::Result<Table> {
+    let t = lua.create_table()?;
+    t.set(
+        "tool_output_lines",
+        lua.create_function(move |lua, _: MultiValue| lua.to_value(&tool_output_lines))?,
+    )?;
+    t.set(
+        "state",
+        lua.create_function(move |lua, _: MultiValue| match &state {
             Some(v) => crate::api::util::convert::json_to_lua(lua, v),
             None => Ok(LuaValue::Nil),
-        });
-    }
+        })?,
+    )?;
+    Ok(t)
 }
 
 /// The `start` hook runs before permission checks, so its ctx only lets a
