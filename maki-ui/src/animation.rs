@@ -90,6 +90,14 @@ impl Typewriter {
         self.buffer.is_empty()
     }
 
+    pub fn buffer_line_count(&self) -> usize {
+        if self.buffer.is_empty() {
+            0
+        } else {
+            self.buffer.bytes().filter(|&b| b == b'\n').count() + 1
+        }
+    }
+
     pub fn clear(&mut self) {
         self.buffer.clear();
         self.reset_anim();

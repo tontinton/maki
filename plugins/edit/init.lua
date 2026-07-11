@@ -32,8 +32,53 @@ local function edit_header(input)
   return buf
 end
 
-local function edit_restore(_input, output, _is_error, _ctx)
-  return ToolView.restore(output, { max_lines = 0 })
+local function split_lines(text)
+  local lines = {}
+  for line in (text .. "\n"):gmatch("([^\n]*)\n") do
+    lines[#lines + 1] = line
+  end
+  if lines[#lines] == "" then
+    lines[#lines] = nil
+  end
+  return lines
+end
+
+local function edit_view_opts(ctx)
+  local tol = ctx:tool_output_lines()
+  return { max_lines = (tol and tol.write) or FALLBACK_VIEW_LINES, keep = "head" }
+end
+
+-- Old lines red, new lines green, one block per edit. Rebuilt purely from
+-- the input, so a batch child can render the change without the file
+-- snapshots (those live in ToolOutput::Diff, which Rust renders standalone).
+local function diff_view(blocks, ctx)
+  local buf = maki.ui.buf()
+  local view = ToolView.new(buf, edit_view_opts(ctx))
+  for i, block in ipairs(blocks) do
+    if i > 1 then
+      view:append({})
+    end
+    for _, line in ipairs(split_lines(block.old or "")) do
+      view:append({ { line, "diff_old" } })
+    end
+    for _, line in ipairs(split_lines(block.new or "")) do
+      view:append({ { line, "diff_new" } })
+    end
+  end
+  view:finish()
+  buf:on("click", function()
+    view:toggle()
+  end)
+  return buf
+end
+
+local function diff_restore(blocks_from)
+  return function(input, output, is_error, ctx)
+    if is_error then
+      return ToolView.restore(output, edit_view_opts(ctx))
+    end
+    return diff_view(blocks_from(input), ctx)
+  end
 end
 
 local function apply_edit(path, ctx, transform)
@@ -113,7 +158,9 @@ maki.api.register_tool({
   },
 
   header = edit_header,
-  restore = edit_restore,
+  restore = diff_restore(function(input)
+    return { { old = input.old_string, new = input.new_string } }
+  end),
 
   handler = function(input, ctx)
     local result, err = apply_edit(input.path, ctx, function(content)
@@ -173,7 +220,13 @@ maki.api.register_tool({
   },
 
   header = edit_header,
-  restore = edit_restore,
+  restore = diff_restore(function(input)
+    local blocks = {}
+    for _, edit in ipairs(input.edits or {}) do
+      blocks[#blocks + 1] = { old = edit.old_string, new = edit.new_string }
+    end
+    return blocks
+  end),
 
   handler = function(input, ctx)
     local edits = input.edits
@@ -237,7 +290,9 @@ maki.api.register_tool({
   },
 
   header = edit_header,
-  restore = edit_restore,
+  restore = diff_restore(function(input)
+    return { { new = input.new_string } }
+  end),
 
   handler = function(input, ctx)
     local end_line = input["end"]

@@ -35,7 +35,7 @@ use ratatui::layout::Rect;
 use ratatui::style::Modifier;
 use ratatui::text::Line;
 
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::theme;
 use maki_markdown::render::{CODE_BAR, CODE_BAR_WRAP};
@@ -549,8 +549,21 @@ pub(crate) fn append_rows(
 
         let (col_start, col_end) = col_range(ss, area.x, right, row);
         let line_start = out.len();
+        // Wide chars (CJK, emoji) leave continuation cells with " "; skip them.
+        let mut skip_next: usize = if col_start > area.x {
+            UnicodeWidthStr::width(buf[(col_start - 1, row)].symbol()).saturating_sub(1)
+        } else {
+            0
+        };
         for col in col_start..=col_end {
-            out.push_str(buf[(col, row)].symbol());
+            if skip_next > 0 {
+                skip_next -= 1;
+                continue;
+            }
+            let sym = buf[(col, row)].symbol();
+            let w = UnicodeWidthStr::width(sym);
+            out.push_str(sym);
+            skip_next = w.saturating_sub(1);
         }
 
         let stripped = if col_start == area.x {
@@ -1120,6 +1133,9 @@ mod tests {
     #[test_case("abcde fghij", 5, "abcde fghij" ; "word_fills_row_exactly")]
     #[test_case("ab cd ef",    3, "ab cd ef"    ; "three_short_words")]
     #[test_case("a    b",      4, "a b"         ; "many_spaces_between_words")]
+    #[test_case("你好世界",    4, "你好世界"   ; "cjk_wraps_no_extra_spaces")]
+    #[test_case("你好world",  10, "你好world"  ; "cjk_mixed_ascii")]
+    #[test_case("a你b好",     10, "a你b好"     ; "mixed_single_double_width")]
     fn wrap_copy(input: &str, width: u16, expected: &str) {
         assert_eq!(wrap_extract(input, width), expected);
     }
@@ -1262,5 +1278,28 @@ mod tests {
         };
         let text = extract_selected_text(&buf, &ss(0, 0, height - 1, 5), &[region]);
         assert_eq!(text, "hello world\nok");
+    }
+
+    #[test]
+    fn append_rows_partial_from_wide_continuation() {
+        use ratatui::widgets::{Paragraph, Widget, Wrap};
+        let lines = vec![Line::from("你好")];
+        let area = Rect::new(0, 0, 4, 1);
+        let mut buf = Buffer::empty(area);
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .render(area, &mut buf);
+        let mut out = String::new();
+        // selection starts on the continuation cell of 你 (col 1)
+        append_rows(
+            &buf,
+            area,
+            &ss(0, 1, 0, 3),
+            0,
+            1,
+            &mut out,
+            &LineBreaks::EveryRow,
+        );
+        assert_eq!(out, "好");
     }
 }

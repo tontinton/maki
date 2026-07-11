@@ -72,7 +72,7 @@ pub fn run(cli: Cli) -> Result<()> {
     let mut plugin_host = if cli.no_plugins {
         PluginHost::disabled()
     } else {
-        PluginHost::new(Arc::clone(ToolRegistry::native_arc()))
+        PluginHost::new(Arc::clone(ToolRegistry::global_arc()))
             .context("initialize lua plugin host")?
     };
 
@@ -148,6 +148,7 @@ pub fn run(cli: Cli) -> Result<()> {
             timeouts,
             prompt_slots,
             fast,
+            workflow: config.always_workflow,
         })
         .context("run sdk mode")?;
     } else if cli.print {
@@ -155,6 +156,7 @@ pub fn run(cli: Cli) -> Result<()> {
         crate::print::run(
             &model,
             cli.initial_prompt,
+            cli.images,
             cli.output_format,
             cli.verbose,
             config.agent,
@@ -162,6 +164,7 @@ pub fn run(cli: Cli) -> Result<()> {
             timeouts,
             plugin_host.event_handle(),
             fast,
+            config.always_workflow,
         )
         .context("run print mode")?;
     } else {
@@ -175,6 +178,7 @@ pub fn run(cli: Cli) -> Result<()> {
         )?;
         if session.messages.is_empty() {
             session.meta.fast |= config.always_fast;
+            session.meta.workflow |= config.always_workflow;
             if let Some(thinking) = config.always_thinking {
                 session.meta.thinking = Some(thinking);
             }

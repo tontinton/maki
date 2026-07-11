@@ -13,7 +13,7 @@ use include_dir::Dir;
 use maki_agent::cancel::CancelToken;
 use maki_agent::prompt::{PromptId, ResolvedSlots, Slot, SlotEntry};
 use maki_agent::tools::{
-    HeaderResult, PermissionScopes, RegistryError, Tool, ToolRegistry, ToolSource,
+    HeaderResult, PermissionScopes, RegistryError, Tool, ToolLive, ToolRegistry, ToolSource,
 };
 use maki_agent::{BufferSnapshot, SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle};
 use mlua::{Function, Lua, RegistryKey, Value as LuaValue, VmState};
@@ -130,9 +130,29 @@ pub enum Request {
     },
     ClickTool {
         tool_use_id: String,
+        /// 1-based line in the tool's live buffer; 0 means the click landed
+        /// outside the buffer (e.g. on the header line).
+        row: usize,
     },
     RunKeybindCallback {
         id: u64,
+    },
+    Describe {
+        plugin: Arc<str>,
+        tool: Arc<str>,
+        dctx: Value,
+        reply: flume::Sender<Option<String>>,
+    },
+    /// Runs the tool's `start` fn so it can publish a live buf before the
+    /// permission prompt paints. Best-effort: Lua errors are logged, never
+    /// propagated.
+    StartTool {
+        plugin: Arc<str>,
+        tool: Arc<str>,
+        input: Value,
+        live: LiveCtx,
+        tool_output_lines: maki_config::ToolOutputLines,
+        reply: flume::Sender<()>,
     },
 }
 
@@ -145,7 +165,13 @@ pub struct RestoreItem {
     pub tool_output_lines: maki_config::ToolOutputLines,
     /// Lets the UI discard snapshots from a stale theme.
     pub theme_gen: Option<u64>,
-    pub expanded: bool,
+    /// Buf rows the user clicked since the tool completed, replayed in
+    /// order after restore so the tool's own toggle logic reproduces the
+    /// expansion state (each row was measured against the layout the
+    /// previous replays produce).
+    pub clicks: Vec<usize>,
+    /// Structured state the tool persisted alongside its output.
+    pub state: Option<Value>,
 }
 
 pub(crate) struct RestoreReply {
@@ -192,7 +218,13 @@ pub(crate) struct TaskCell {
     pub(crate) jobs: JobStore,
     pub(crate) bufs: BufferStore,
     pub(crate) live: Option<LiveCtx>,
-    pub(crate) click: Option<RegistryKey>,
+    /// The buf that owns click routing for this task: the last one passed
+    /// to `ctx:live_buf` or returned as a reply/restore `body`. Fallback is
+    /// the first buf the task created (`bufs.live_buf()`).
+    pub(crate) root_buf: Option<Arc<SharedBuf>>,
+    /// Forwards live bufs and annotations to a parent
+    /// `maki.agent.call_tool(on_live_buf/on_annotation)`.
+    pub(crate) live_sink: Option<flume::Sender<ToolLive>>,
 }
 
 impl TaskCell {
@@ -204,7 +236,8 @@ impl TaskCell {
             jobs: JobStore::new(),
             bufs: BufferStore::new(),
             live,
-            click: None,
+            root_buf: None,
+            live_sink: None,
         }
     }
 }
@@ -215,6 +248,15 @@ type LiveTasks = Rc<RefCell<HashMap<String, TaskHandle>>>;
 
 pub(crate) fn lock_cell(handle: &TaskHandle) -> std::sync::MutexGuard<'_, TaskCell> {
     handle.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The buf whose click handler owns this task's clicks: the explicit root
+/// (live_buf / reply body / restore body), else the first created buf.
+fn resolve_root_buf(handle: &TaskHandle) -> Option<Arc<SharedBuf>> {
+    let cell = lock_cell(handle);
+    cell.root_buf
+        .clone()
+        .or_else(|| cell.bufs.live_buf().cloned())
 }
 
 /// Fires on every Lua VM instruction. Checking the mutex on each tick
@@ -307,9 +349,6 @@ impl Drop for TaskScope {
             cell.jobs.kill_all();
             cell.jobs.clear(&self.lua);
             cell.bufs.clear();
-            if let Some(k) = cell.click.take() {
-                let _ = self.lua.remove_registry_value(k);
-            }
         }
         match self.prev.take() {
             Some(p) => {
@@ -555,7 +594,9 @@ struct ToolKeys {
     handler: RegistryKey,
     header: Option<RegistryKey>,
     restore: Option<RegistryKey>,
+    start: Option<RegistryKey>,
     permission_scopes: Option<RegistryKey>,
+    describe: Option<RegistryKey>,
 }
 
 type PluginMap = Rc<RefCell<HashMap<Arc<str>, HashMap<Arc<str>, ToolKeys>>>>;
@@ -618,11 +659,33 @@ impl LuaRuntime {
         lua.set_app_data(keymap_writer);
         lua.set_app_data(HintStore::new());
         lua.set_app_data(hint_writer);
+        lua.set_app_data(Arc::clone(&registry));
+
+        let plugins: PluginMap = Rc::new(RefCell::new(HashMap::new()));
+        {
+            let lua = lua.clone();
+            let plugins = Rc::clone(&plugins);
+            crate::api::tool::set_local_describe(move |plugin, tool, dctx| {
+                run_describe(&lua, &plugins, plugin, tool, dctx)
+            });
+        }
+        {
+            let lua = lua.clone();
+            let plugins = Rc::clone(&plugins);
+            crate::api::tool::set_local_tool_handles(move |tool| {
+                let plugins = plugins.borrow();
+                let tk = plugins.values().find_map(|tools| tools.get(tool))?;
+                let to_fn = |key: Option<&RegistryKey>| {
+                    key.and_then(|k| lua.registry_value::<Function>(k).ok())
+                };
+                Some((to_fn(tk.header.as_ref()), to_fn(tk.restore.as_ref())))
+            });
+        }
 
         Ok(Self {
             lua,
             pending,
-            plugins: Rc::new(RefCell::new(HashMap::new())) as PluginMap,
+            plugins,
             live_tasks: Rc::new(RefCell::new(HashMap::new())),
             registry,
             tx,
@@ -647,6 +710,16 @@ impl LuaRuntime {
                     && let Err(e) = self.lua.remove_registry_value(sk)
                 {
                     tracing::warn!(plugin = name, error = %e, "failed to drop lua permission_scopes key");
+                }
+                if let Some(sk) = tk.start
+                    && let Err(e) = self.lua.remove_registry_value(sk)
+                {
+                    tracing::warn!(plugin = name, error = %e, "failed to drop lua start key");
+                }
+                if let Some(sk) = tk.describe
+                    && let Err(e) = self.lua.remove_registry_value(sk)
+                {
+                    tracing::warn!(plugin = name, error = %e, "failed to drop lua describe key");
                 }
             }
         }
@@ -794,6 +867,11 @@ impl LuaRuntime {
                 && let Err(e) = self.lua.remove_registry_value(sk)
             {
                 tracing::warn!(error = %e, "failed to drop lua permission_scopes key on rollback");
+            }
+            if let Some(sk) = t.describe_key
+                && let Err(e) = self.lua.remove_registry_value(sk)
+            {
+                tracing::warn!(error = %e, "failed to drop lua describe key on rollback");
             }
         }
     }
@@ -984,13 +1062,13 @@ impl LuaRuntime {
                     tx: self.tx.clone(),
                     plugin: Arc::clone(&name),
                     has_header_fn: t.header_key.is_some(),
+                    has_start_fn: t.start_key.is_some(),
                     permission_scope_kind: t.permission_scope_kind.clone(),
                     mutable_path_field: t.mutable_path_field.clone(),
                     timeout: t.timeout,
                     start_annotation: t.start_annotation.clone(),
-                    start_input: t.start_input.clone(),
                     examples: t.examples.clone(),
-                    augment: t.augment,
+                    has_describe_fn: t.describe_key.is_some(),
                 });
                 (
                     tool,
@@ -1020,7 +1098,9 @@ impl LuaRuntime {
                         handler: t.handler_key,
                         header: t.header_key,
                         restore: t.restore_key,
+                        start: t.start_key,
                         permission_scopes: t.permission_scopes_key,
+                        describe: t.describe_key,
                     },
                 )
             })
@@ -1138,6 +1218,7 @@ impl LuaRuntime {
             .lua
             .create_userdata(crate::api::util::ctx::RestoreCtx {
                 tool_output_lines: item.tool_output_lines,
+                state: item.state,
             })
             .ok()?;
         let inner = thread
@@ -1152,17 +1233,23 @@ impl LuaRuntime {
             )
             .ok()?;
 
-        if item.expanded {
-            let click_key = lock_cell(scope.handle()).click.take();
-            if let Some(key) = click_key
-                && let Ok(func) = self.lua.registry_value::<Function>(&key)
-                && let Ok(data) = self.lua.create_table()
-            {
-                let _ = data.set("row", 0);
+        if let Some(buf) = crate::api::ui::buf::buf_from_reply(&ret) {
+            lock_cell(scope.handle()).root_buf = Some(buf);
+        }
+
+        if !item.clicks.is_empty()
+            && let Some(root) = resolve_root_buf(scope.handle())
+            && let Some(func) = crate::api::ui::buf::click_fn(&root)
+        {
+            for &row in &item.clicks {
+                let Ok(data) = self.lua.create_table() else {
+                    break;
+                };
+                let _ = data.set("row", row);
                 if let Err(e) = scope.scope_future(func.call_async::<()>(data)).await {
-                    tracing::warn!(tool = &*item.tool, error = %e, "click expand failed");
+                    tracing::warn!(tool = &*item.tool, error = %e, "click replay failed");
+                    break;
                 }
-                let _ = self.lua.remove_registry_value(key);
             }
         }
 
@@ -1407,6 +1494,56 @@ fn timeout_reply(handle: &TaskHandle, plugin: &str, tool: &str) -> ToolCallReply
     reply
 }
 
+fn run_describe(
+    lua: &Lua,
+    plugins: &PluginMap,
+    plugin: &str,
+    tool: &str,
+    dctx: &Value,
+) -> Option<String> {
+    let func: Function = {
+        let plugins_ref = plugins.borrow();
+        let key = plugins_ref.get(plugin)?.get(tool)?.describe.as_ref()?;
+        lua.registry_value(key).ok()?
+    };
+    let arg = match json_to_lua(lua, dctx) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(plugin, tool, error = %e, "describe dctx conversion failed");
+            return None;
+        }
+    };
+    match func.call::<String>(arg) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            tracing::warn!(plugin, tool, error = %e, "describe callback failed");
+            None
+        }
+    }
+}
+
+/// Sends no `ToolSnapshot` on completion: the preview buf must stay live so
+/// the UI keeps polling it until the handler's own `LiveToolBuf` takes over.
+async fn run_tool_start(
+    lua: &Lua,
+    func: Function,
+    tool: &str,
+    input: Value,
+    live: LiveCtx,
+    tool_output_lines: maki_config::ToolOutputLines,
+) {
+    let scope = TaskScope::new(lua, TaskCell::new(CancelToken::none(), None, Some(live)));
+    let run = async {
+        let input_lua = json_to_lua(lua, &input)?;
+        let ctx_ud = lua.create_userdata(crate::api::util::ctx::StartCtx { tool_output_lines })?;
+        let thread = lua.create_thread(func)?;
+        thread.into_async::<LuaValue>((input_lua, ctx_ud))?.await
+    };
+    if let Err(e) = scope.scope_future(run).await {
+        tracing::warn!(tool, error = %e, "start callback failed");
+    }
+}
+
 /// Two layers of deadline enforcement: the interrupt hook catches
 /// tight CPU loops, the dispatch loop catches I/O waits.
 #[allow(clippy::too_many_arguments)]
@@ -1447,6 +1584,7 @@ async fn run_tool_call(
         Ok(v) => v,
         Err(e) => return ToolCallReply::err(strip_traceback(&e)),
     };
+    let live_sink = ctx.agent.live_sink.clone();
     let ctx_ud = match lua.create_userdata(*ctx) {
         Ok(u) => u,
         Err(e) => return ToolCallReply::err(strip_traceback(&e)),
@@ -1457,7 +1595,9 @@ async fn run_tool_call(
         Err(e) => return ToolCallReply::err(strip_traceback(&e)),
     };
     let live_id = live.as_ref().map(|l| l.tool_use_id.clone());
-    let scope = TaskScope::new(&lua, TaskCell::new(cancel, deadline, live));
+    let mut cell = TaskCell::new(cancel, deadline, live);
+    cell.live_sink = live_sink;
+    let scope = TaskScope::new(&lua, cell);
     let handle = Arc::clone(scope.handle());
 
     let async_thread = match thread.into_async::<LuaValue>((input_lua, ctx_ud)) {
@@ -1486,26 +1626,33 @@ async fn run_tool_call(
         };
         match handler_result {
             Ok(LuaValue::Nil) => {
-                let live_shared = {
+                let (live, sink, buf) = {
                     let cell = lock_cell(&handle);
-                    cell.live.as_ref().and_then(|live| {
-                        let shared = cell.bufs.live_buf()?;
-                        Some((
-                            live.event_tx.clone(),
-                            live.tool_use_id.clone(),
-                            Arc::clone(shared),
-                        ))
-                    })
+                    (
+                        cell.live.clone(),
+                        cell.live_sink.clone(),
+                        cell.bufs.live_buf().cloned(),
+                    )
                 };
-                if let Some((event_tx, tool_use_id, shared)) = live_shared {
-                    let _ = event_tx.send(maki_agent::AgentEvent::LiveToolBuf {
-                        id: tool_use_id,
-                        body: shared,
-                    });
+                if let Some(buf) = buf {
+                    if let Some(live) = live {
+                        let _ = live.event_tx.send(maki_agent::AgentEvent::LiveToolBuf {
+                            id: live.tool_use_id.clone(),
+                            body: Arc::clone(&buf),
+                        });
+                    }
+                    if let Some(sink) = sink {
+                        let _ = sink.send(ToolLive::Buf(buf));
+                    }
                 }
                 dispatch_async(&lua, Arc::clone(&handle), &plugin, &tool, finish_rx).await
             }
-            Ok(val) => ToolCallReply::from_lua_value(&val),
+            Ok(val) => {
+                if let Some(buf) = crate::api::ui::buf::buf_from_reply(&val) {
+                    lock_cell(&handle).root_buf = Some(buf);
+                }
+                ToolCallReply::from_lua_value(&val)
+            }
             Err(e) => ToolCallReply::err(strip_traceback(&e)),
         }
     });
@@ -1704,22 +1851,28 @@ pub fn spawn(
                         Request::RestoreComplete { flag } => {
                             flag.store(false, Ordering::Relaxed);
                         }
-                        Request::ClickTool { tool_use_id } => {
+                        Request::ClickTool { tool_use_id, row } => {
                             let handle = rt.live_tasks.borrow().get(&tool_use_id).map(Arc::clone);
-                            let func = handle.as_ref().and_then(|h| {
-                                let cell = lock_cell(h);
-                                let key = cell.click.as_ref()?;
-                                rt.lua.registry_value::<Function>(key).ok()
-                            });
+                            let func = handle
+                                .as_ref()
+                                .and_then(resolve_root_buf)
+                                .and_then(|root| crate::api::ui::buf::click_fn(&root));
                             if let (Some(handle), Some(func)) = (handle, func) {
                                 let lua = rt.lua.clone();
                                 let g = Rc::clone(&gate);
                                 let ex_ref = Rc::clone(&ex);
+                                let arg = match rt.lua.create_table() {
+                                    Ok(t) => {
+                                        let _ = t.set("row", row);
+                                        LuaValue::Table(t)
+                                    }
+                                    Err(_) => LuaValue::Nil,
+                                };
                                 ex.spawn(async move {
                                     let call = ScopedFuture {
                                         lua: lua.clone(),
                                         handle,
-                                        inner: func.call_async::<()>(()),
+                                        inner: func.call_async::<()>(arg),
                                     };
                                     if let Err(e) = call.await {
                                         tracing::warn!(tool_use_id, error = %e, "live click failed");
@@ -1769,6 +1922,48 @@ pub fn spawn(
                                 rt.lua.gc_collect().ok();
                             }
                         }
+                        Request::Describe {
+                            plugin,
+                            tool,
+                            dctx,
+                            reply,
+                        } => {
+                            let _ = reply
+                                .send(run_describe(&rt.lua, &rt.plugins, &plugin, &tool, &dctx));
+                        }
+                        Request::StartTool {
+                            plugin,
+                            tool,
+                            input,
+                            live,
+                            tool_output_lines,
+                            reply,
+                        } => {
+                            let func = {
+                                let plugins = rt.plugins.borrow();
+                                plugins
+                                    .get(&*plugin)
+                                    .and_then(|p| p.get(&*tool))
+                                    .and_then(|tk| tk.start.as_ref())
+                                    .and_then(|key| rt.lua.registry_value::<Function>(key).ok())
+                            };
+                            let Some(func) = func else {
+                                let _ = reply.send(());
+                                continue;
+                            };
+                            gate.wait_below(MAX_INFLIGHT_TOOLS).await;
+                            let lua = rt.lua.clone();
+                            let g = Rc::clone(&gate);
+                            let ex_ref = Rc::clone(&ex);
+                            ex.spawn(async move {
+                                let _gate_guard = GateGuard::new(&g);
+                                run_tool_start(&lua, func, &tool, input, live, tool_output_lines)
+                                    .await;
+                                drain_spawn_queue(&lua, &ex_ref, &g);
+                                let _ = reply.send(());
+                            })
+                            .detach();
+                        }
                         Request::RunKeybindCallback { id } => {
                             let func = rt.lua.app_data_ref::<KeymapStore>().and_then(|store| {
                                 let key = store.callback_for_id(id)?;
@@ -1812,21 +2007,6 @@ pub fn spawn(
 }
 
 #[cfg(test)]
-pub(crate) fn install_live_ctx(lua: &Lua, tool_use_id: &str) {
-    let (tx, _rx) = flume::unbounded();
-    let cell = TaskCell::new(
-        CancelToken::none(),
-        None,
-        Some(LiveCtx {
-            event_tx: maki_agent::EventSender::new(tx, 0),
-            tool_use_id: tool_use_id.to_owned(),
-        }),
-    );
-    let handle: TaskHandle = Arc::new(Mutex::new(cell));
-    lua.set_app_data::<TaskHandle>(handle);
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use crate::api::tool::ToolCallReply;
@@ -1839,7 +2019,7 @@ mod tests {
                 style: SpanStyle::Default,
             }],
         });
-        BufHandle { id: 0, buf }
+        BufHandle::foreign(buf)
     }
 
     fn test_lua() -> Lua {
@@ -1893,6 +2073,28 @@ mod tests {
         assert!(lock_cell(&handle).bufs.live_buf().is_some());
         drop(scope);
         assert!(lock_cell(&handle).bufs.live_buf().is_none());
+    }
+
+    #[test]
+    fn task_scope_drop_clears_buf_handler_slots() {
+        let lua = Lua::new();
+        let scope = TaskScope::new(&lua, task_cell(None));
+        let handle = with_task_bufs(&lua, |store| store.create());
+        let shared = Arc::clone(&handle.buf);
+        lua.globals()
+            .set("buf", lua.create_userdata(handle.clone()).unwrap())
+            .unwrap();
+        lua.load(r#"buf:on("click", function() end); buf:on("change", function() hit = true end)"#)
+            .exec()
+            .unwrap();
+        shared.append(SnapshotLine { spans: vec![] });
+        assert!(lua.globals().get::<bool>("hit").unwrap());
+        assert!(handle.click_fn().is_some());
+        drop(scope);
+        lua.globals().set("hit", false).unwrap();
+        shared.append(SnapshotLine { spans: vec![] });
+        assert!(!lua.globals().get::<bool>("hit").unwrap());
+        assert!(handle.click_fn().is_none());
     }
 
     fn task_cell(live: Option<LiveCtx>) -> TaskCell {

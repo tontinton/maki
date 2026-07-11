@@ -2,13 +2,17 @@ use std::sync::{Arc, Mutex};
 
 use flume::Sender;
 use maki_config::providers::{BuiltInProvider, Protocol, ProviderPlan};
+use serde::Deserialize;
 use serde_json::Value;
 use tracing::warn;
 
 use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier};
 use crate::provider::{BoxFuture, Provider};
 use crate::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
-use crate::{AgentError, EffortScale, Message, ProviderEvent, RequestOptions, StreamResponse};
+use crate::{
+    AgentError, EffortScale, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse,
+    UsageLimit,
+};
 
 use super::{KeyPool, ResolvedAuth};
 
@@ -19,6 +23,59 @@ static CONFIG_STANDARD: OpenAiCompatConfig = OpenAiCompatConfig {
     include_stream_usage: false,
     provider_name: "Z.AI",
 };
+
+const QUOTA_LIMIT_URL: &str = "https://api.z.ai/api/monitor/usage/quota/limit";
+
+#[derive(Deserialize)]
+struct QuotaResponse {
+    data: QuotaData,
+}
+
+#[derive(Deserialize, Default)]
+struct QuotaData {
+    #[serde(default)]
+    limits: Vec<QuotaLimit>,
+    #[serde(default)]
+    level: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct QuotaLimit {
+    #[serde(rename = "type")]
+    kind: String,
+    unit: u32,
+    percentage: u32,
+    #[serde(default, rename = "nextResetTime")]
+    next_reset_time: Option<u64>,
+}
+
+fn quota_label(kind: &str, unit: u32) -> String {
+    match (kind, unit) {
+        ("TOKENS_LIMIT", 3) => "5-hour tokens".into(),
+        ("TOKENS_LIMIT", 6) => "Weekly tokens".into(),
+        ("TIME_LIMIT", _) => "Subscription time".into(),
+        _ => format!("{kind} #{unit}"),
+    }
+}
+
+impl From<QuotaResponse> for ProviderUsage {
+    fn from(resp: QuotaResponse) -> Self {
+        ProviderUsage {
+            plan: resp.data.level,
+            limits: resp
+                .data
+                .limits
+                .into_iter()
+                .map(|l| UsageLimit {
+                    label: quota_label(&l.kind, l.unit),
+                    percentage: l.percentage,
+                    reset_at: l.next_reset_time,
+                    detail: None,
+                })
+                .collect(),
+        }
+    }
+}
 
 inventory::submit!(BuiltInProvider {
     slug: "zai",
@@ -57,6 +114,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             prefixes: &["glm-5-code"],
             tier: ModelTier::Strong,
             family: ModelFamily::Glm,
+            vision: false,
             default: true,
             pricing: ModelPricing {
                 input: 1.20,
@@ -72,6 +130,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             prefixes: &["glm-5.2"],
             tier: ModelTier::Strong,
             family: ModelFamily::Glm,
+            vision: false,
             default: false,
             pricing: ModelPricing {
                 input: 1.00,
@@ -87,6 +146,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             prefixes: &["glm-5.1", "glm-5"],
             tier: ModelTier::Strong,
             family: ModelFamily::Glm,
+            vision: false,
             default: false,
             pricing: ModelPricing {
                 input: 1.00,
@@ -102,6 +162,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             prefixes: &["glm-4.7-flash"],
             tier: ModelTier::Weak,
             family: ModelFamily::Glm,
+            vision: false,
             default: true,
             pricing: ModelPricing {
                 input: 0.00,
@@ -117,6 +178,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             prefixes: &["glm-4.7", "glm-4.6"],
             tier: ModelTier::Medium,
             family: ModelFamily::Glm,
+            vision: false,
             default: true,
             pricing: ModelPricing {
                 input: 0.60,
@@ -132,6 +194,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             prefixes: &["glm-4.5-flash"],
             tier: ModelTier::Weak,
             family: ModelFamily::Glm,
+            vision: false,
             default: false,
             pricing: ModelPricing {
                 input: 0.00,
@@ -147,6 +210,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             prefixes: &["glm-4.5-air"],
             tier: ModelTier::Weak,
             family: ModelFamily::Glm,
+            vision: false,
             default: false,
             pricing: ModelPricing {
                 input: 0.20,
@@ -162,6 +226,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             prefixes: &["glm-4.5"],
             tier: ModelTier::Medium,
             family: ModelFamily::Glm,
+            vision: false,
             default: false,
             pricing: ModelPricing {
                 input: 0.60,
@@ -263,6 +328,15 @@ impl Provider for Zai {
         })
     }
 
+    fn fetch_usage(&self) -> BoxFuture<'_, Result<Option<ProviderUsage>, AgentError>> {
+        Box::pin(async move {
+            let auth = self.auth.lock().unwrap().clone();
+            let body = self.compat.get_text(&auth, QUOTA_LIMIT_URL).await?;
+            let parsed: QuotaResponse = serde_json::from_str(&body)?;
+            Ok(Some(parsed.into()))
+        })
+    }
+
     fn rotate_key(&self) -> BoxFuture<'_, Result<bool, AgentError>> {
         Box::pin(async {
             Ok(self
@@ -288,6 +362,12 @@ mod tests {
     use super::*;
     use test_case::test_case;
 
+    const SAMPLE_BODY: &str = r#"{"code":200,"data":{"limits":[
+        {"type":"TOKENS_LIMIT","unit":3,"percentage":16,"nextResetTime":1777819631597},
+        {"type":"TOKENS_LIMIT","unit":6,"percentage":4,"nextResetTime":1778262784969},
+        {"type":"TIME_LIMIT","unit":5,"percentage":0,"nextResetTime":1780336384978}
+    ],"level":"lite"}}"#;
+
     #[test_case("zai/glm-5.2", true ; "glm_5_2_supports_thinking")]
     #[test_case("zai/glm-5.1", false ; "glm_5_1_no_thinking")]
     #[test_case("zai/glm-4.7", false ; "glm_4_7_no_thinking")]
@@ -295,5 +375,32 @@ mod tests {
         let mut model = Model::from_spec(spec).unwrap();
         adjust_model(&mut model);
         assert_eq!(model.supports_thinking(), expected);
+    }
+
+    #[test]
+    fn parse_quota_response() {
+        let parsed: QuotaResponse = serde_json::from_str(SAMPLE_BODY).unwrap();
+        let usage: ProviderUsage = parsed.into();
+        assert_eq!(usage.plan.as_deref(), Some("lite"));
+        assert_eq!(usage.limits.len(), 3);
+        assert_eq!(usage.limits[0].label, "5-hour tokens");
+        assert_eq!(usage.limits[0].percentage, 16);
+        assert_eq!(usage.limits[0].reset_at, Some(1777819631597));
+        assert_eq!(usage.limits[1].label, "Weekly tokens");
+        assert_eq!(usage.limits[2].label, "Subscription time");
+        assert_eq!(usage.limits[2].reset_at, Some(1780336384978));
+    }
+
+    #[test]
+    fn parse_quota_unknown_unit_falls_back() {
+        let body = r#"{"code":200,"data":{"limits":[
+            {"type":"TOKENS_LIMIT","unit":9,"percentage":50}
+        ]}}"#;
+        let parsed: QuotaResponse = serde_json::from_str(body).unwrap();
+        let usage: ProviderUsage = parsed.into();
+        assert!(usage.plan.is_none());
+        assert_eq!(usage.limits[0].label, "TOKENS_LIMIT #9");
+        assert_eq!(usage.limits[0].percentage, 50);
+        assert_eq!(usage.limits[0].reset_at, None);
     }
 }

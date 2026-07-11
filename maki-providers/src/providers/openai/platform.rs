@@ -21,13 +21,41 @@ static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
     provider_name: "OpenAI",
 };
 
-// NOTE: OpenAI also offers these models for subscription usage via the Coding Plan
-pub(crate) const PLAN_MODELS: &[&str] = &["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.2"];
+// Non-codex models OpenAI offers for subscription usage via the Coding Plan.
+// Codex models are matched by their `-codex` substring in
+// `coding_plan_context_window`, so they never need listing here.
+pub(crate) const PLAN_MODELS: &[&str] = &[
+    "gpt-5.6-luna",
+    "gpt-5.6-terra",
+    "gpt-5.6-sol",
+    "gpt-5.5",
+    "gpt-5.4",
+    "gpt-5.4-mini",
+    "gpt-5.2",
+];
 
 const CODEX_PLAN_CONTEXT_WINDOW: u32 = 272_000;
+const GPT_5_6_PLAN_CONTEXT_WINDOW: u32 = 372_000;
 
 fn is_codex_model(model_id: &str) -> bool {
-    model_id.contains("-codex") || PLAN_MODELS.contains(&model_id)
+    coding_plan_context_window(model_id).is_some()
+}
+
+// Codex models match by substring so future releases route without a registry
+// edit; the named non-codex plans match exactly to avoid catching near-misses
+// like `gpt-5.6-terra-preview`.
+fn coding_plan_context_window(model_id: &str) -> Option<u32> {
+    if model_id.contains("-codex") {
+        return Some(CODEX_PLAN_CONTEXT_WINDOW);
+    }
+    if !PLAN_MODELS.contains(&model_id) {
+        return None;
+    }
+    Some(if model_id.starts_with("gpt-5.6-") {
+        GPT_5_6_PLAN_CONTEXT_WINDOW
+    } else {
+        CODEX_PLAN_CONTEXT_WINDOW
+    })
 }
 
 pub struct OpenAi {
@@ -225,8 +253,36 @@ impl Provider for OpenAi {
     }
 
     fn adjust_model(&self, model: &mut Model) {
-        if self.is_oauth() && PLAN_MODELS.iter().any(|p| model.id.starts_with(p)) {
-            model.context_window = model.context_window.min(CODEX_PLAN_CONTEXT_WINDOW);
+        if self.is_oauth()
+            && let Some(context_window) = coding_plan_context_window(&model.id)
+        {
+            model.context_window = model.context_window.min(context_window);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use test_case::test_case;
+
+    use super::*;
+
+    #[test_case("gpt-5.6-luna")]
+    #[test_case("gpt-5.6-terra")]
+    #[test_case("gpt-5.6-sol")]
+    fn gpt_5_6_models_use_coding_plan(model_id: &str) {
+        assert!(is_codex_model(model_id));
+    }
+
+    #[test_case("gpt-5.6-luna", Some(372_000))]
+    #[test_case("gpt-5.6-terra", Some(372_000))]
+    #[test_case("gpt-5.6-sol", Some(372_000))]
+    #[test_case("gpt-5.5", Some(272_000))]
+    #[test_case("gpt-5.3-codex", Some(272_000))]
+    #[test_case("gpt-5.7-codex", Some(272_000) ; "unlisted codex model still routes")]
+    #[test_case("gpt-5.6-terra-preview", None ; "non-codex near-match is rejected")]
+    #[test_case("gpt-5.4-nano", None)]
+    fn coding_plan_context_window_resolves_plan_models(model_id: &str, expected: Option<u32>) {
+        assert_eq!(coding_plan_context_window(model_id), expected);
     }
 }

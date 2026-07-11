@@ -1,87 +1,39 @@
-use std::collections::HashMap;
-
-use maki_interpreter::runner::ToolFn;
-use maki_interpreter::{AsyncResolver, PendingCall};
 use serde_json::Value;
-use smol::future::block_on;
 
 use crate::agent::tool_dispatch::{self, Emit};
-use crate::task_set::TaskSet;
 
-use super::{ToolAudience, ToolContext, ToolRegistry};
+use super::ToolContext;
 
-async fn call(
-    ctx: &ToolContext,
-    name: &str,
-    args: &[Value],
-    kwargs: &[(String, Value)],
-) -> Result<Value, String> {
+pub const IMAGE_NOT_VISIBLE_NOTE: &str =
+    "image pixels are not visible from here; call the view_image tool directly";
+
+pub async fn dispatch(ctx: &ToolContext, name: &str, input: &Value) -> Result<String, String> {
     ctx.deadline.check()?;
-    let input = build_tool_input(args, kwargs)?;
     let done = tool_dispatch::run(
-        ToolRegistry::native(),
+        &ctx.registry,
         ctx.mcp.as_ref(),
         String::new(),
         name,
-        &input,
+        input,
         ctx,
         Emit::Silent,
     )
     .await;
-    if done.is_error {
-        Err(done.output.as_text())
-    } else {
-        Ok(Value::String(done.output.as_text()))
-    }
+    flatten(&done)
 }
 
-pub fn build_tool_fns(ctx: &ToolContext) -> HashMap<String, ToolFn> {
-    ToolRegistry::native()
-        .iter()
-        .iter()
-        .filter(|entry| entry.tool.audience().contains(ToolAudience::INTERPRETER))
-        .filter(|entry| super::is_tool_enabled(&ctx.config, entry.name()))
-        .map(|entry| {
-            let ctx = ctx.clone();
-            let f: ToolFn = Box::new(
-                move |fn_name: &str, args: Vec<Value>, kwargs: Vec<(String, Value)>| {
-                    block_on(call(&ctx, fn_name, &args, &kwargs))
-                },
-            );
-            (entry.name().to_string(), f)
-        })
-        .collect()
-}
-
-pub fn build_async_resolver(ctx: &ToolContext) -> AsyncResolver {
-    let ctx = ctx.clone();
-    Box::new(move |pending_calls: Vec<PendingCall>| {
-        block_on(async {
-            let call_ids: Vec<u32> = pending_calls.iter().map(|pc| pc.call_id).collect();
-            let mut set = TaskSet::new();
-            for pc in pending_calls {
-                let ctx = ctx.clone();
-                set.spawn(
-                    async move { (pc.call_id, call(&ctx, &pc.name, &pc.args, &pc.kwargs).await) },
-                );
-            }
-
-            let results: Vec<_> = set
-                .join_all()
-                .await
-                .into_iter()
-                .zip(&call_ids)
-                .map(|(r, &call_id)| {
-                    r.unwrap_or_else(|msg| {
-                        tracing::error!(error = %msg, "code_execution inner tool panicked");
-                        (call_id, Err(format!("tool panicked: {msg}")))
-                    })
-                })
-                .collect();
-
-            Ok(results)
-        })
-    })
+/// The one place a `ToolDoneEvent` becomes text a caller can read.
+/// Both the interpreter and `maki.agent.call_tool` come through here,
+/// so the two can never drift apart.
+pub fn flatten(done: &crate::ToolDoneEvent) -> Result<String, String> {
+    let text = match &done.output {
+        // The pixels are dropped here; say so instead of implying they were seen.
+        crate::ToolOutput::Image { text, .. } if !done.is_error => {
+            format!("{text} ({IMAGE_NOT_VISIBLE_NOTE})")
+        }
+        out => out.as_text(),
+    };
+    if done.is_error { Err(text) } else { Ok(text) }
 }
 
 pub fn build_tool_input(args: &[Value], kwargs: &[(String, Value)]) -> Result<Value, String> {

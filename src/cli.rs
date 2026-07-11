@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use clap::{Parser, Subcommand, ValueEnum};
 use color_eyre::Result;
 use color_eyre::eyre::bail;
@@ -30,6 +32,10 @@ pub struct Cli {
     /// Non-interactive mode. Runs the prompt and exits. Compatible with Claude Code's --print flag
     #[arg(short, long)]
     pub print: bool,
+
+    /// Attach an image to the prompt in --print mode as vision content (repeatable)
+    #[arg(long = "image", value_name = "PATH")]
+    pub images: Vec<PathBuf>,
 
     /// Model spec (provider/model-id). Defaults to last used model, or claude-opus-4-6
     #[arg(short, long)]

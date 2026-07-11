@@ -16,7 +16,6 @@ pub(crate) mod model_picker;
 pub(crate) mod permission_prompt;
 pub(crate) mod plan_form;
 pub mod queue_panel;
-pub(crate) mod render_hints;
 pub(crate) mod rewind_picker;
 pub(crate) mod scrollbar;
 pub(crate) mod search_modal;
@@ -26,6 +25,7 @@ pub mod status_bar;
 pub(crate) mod streaming_content;
 pub(crate) mod theme_picker;
 pub(crate) mod tool_display;
+pub(crate) mod usage_modal;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -201,6 +201,7 @@ pub enum Action {
     AssignTier(String, ModelTier),
     UnassignTier(String, ModelTier),
     RefreshModels,
+    RefreshUsage,
     Compact,
     ToggleMcp(String, bool),
     OpenEditor(PathBuf),
@@ -289,6 +290,7 @@ pub struct DisplayMessage {
     pub render_snapshot: Option<BufferSnapshot>,
     pub render_header: Option<BufferSnapshot>,
     pub snapshot_theme_gen: u64,
+    pub thinking_collapsed: bool,
 }
 
 impl DisplayMessage {
@@ -308,6 +310,7 @@ impl DisplayMessage {
             render_snapshot: None,
             render_header: None,
             snapshot_theme_gen: 0,
+            thinking_collapsed: false,
         }
     }
 
@@ -327,6 +330,7 @@ impl DisplayMessage {
             render_snapshot: None,
             render_header: None,
             snapshot_theme_gen: 0,
+            thinking_collapsed: false,
         }
     }
 
@@ -389,6 +393,7 @@ pub(crate) fn test_model() -> maki_providers::Model {
         family: maki_providers::ModelFamily::Claude,
         supports_tool_examples_override: None,
         supports_thinking_override: None,
+        vision: true,
         pricing: test_pricing(),
         max_output_tokens: 8192,
         context_window: TEST_CONTEXT_WINDOW,

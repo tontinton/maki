@@ -55,14 +55,13 @@ members = [
   "maki-markdown",
   "maki-providers",
   "maki-storage",
-  "maki-tool-macro",
   "maki-config-macro",
   "maki-ui",
 ]
 resolver = "3"
 
 [workspace.package]
-version = "0.3.25"
+version = "0.3.27"
 edition = "2024"
 authors = ["Tony Solomonik <tony.solomonik@gmail.com>"]
 license = "MIT"
@@ -78,7 +77,6 @@ maki-providers = { path = "maki-providers" }
 maki-storage = { path = "maki-storage" }
 maki-ui = { path = "maki-ui" }
 maki-lua = { path = "maki-lua" }
-maki-tool-macro = { path = "maki-tool-macro" }
 maki-config-macro = { path = "maki-config-macro" }
 maki-highlight = { path = "maki-highlight" }
 maki-markdown = { path = "maki-markdown" }
@@ -111,7 +109,8 @@ two-face = { version = "0.5", default-features = false, features = ["syntect-def
 unicode-width = "0.2"
 similar = { version = "2", features = ["inline", "unicode"] }
 jsonrepair = { version = "0.1", default-features = false, features = ["serde"] }
-jiff = { version = "0.2", default-features = false, features = ["std"] }
+jsonschema = { version = "0.33", default-features = false }
+jiff = { version = "0.2", default-features = false, features = ["std", "tz-system"] }
 arboard = { version = "3", default-features = false, features = ["image-data", "wayland-data-control"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 flume = { version = "0.11", default-features = false, features = ["async"] }

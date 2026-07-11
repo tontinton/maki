@@ -18,6 +18,14 @@ const IMAGE_EXTENSIONS: &[(&str, ImageMediaType)] = &[
     ("webp", ImageMediaType::Webp),
 ];
 
+pub fn media_type_for(path: &Path) -> Option<ImageMediaType> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    IMAGE_EXTENSIONS
+        .iter()
+        .find(|(e, _)| *e == ext)
+        .map(|&(_, mt)| mt)
+}
+
 pub(crate) fn try_parse_image_path(text: &str) -> Option<(PathBuf, ImageMediaType)> {
     let trimmed = text.trim().trim_matches('\'');
     let (path_str, was_file_uri) = match trimmed.strip_prefix("file://") {
@@ -37,18 +45,11 @@ pub(crate) fn try_parse_image_path(text: &str) -> Option<(PathBuf, ImageMediaTyp
     } else {
         PathBuf::from(&path_str)
     };
-    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
-    let media_type = IMAGE_EXTENSIONS
-        .iter()
-        .find(|(e, _)| *e == ext)
-        .map(|(_, mt)| *mt)?;
+    let media_type = media_type_for(&path)?;
     Some((path, media_type))
 }
 
-pub(crate) fn load_file_image(
-    path: &Path,
-    media_type: ImageMediaType,
-) -> Result<ImageSource, String> {
+pub fn load_file_image(path: &Path, media_type: ImageMediaType) -> Result<ImageSource, String> {
     let bytes = fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
     if bytes.len() > MAX_IMAGE_BYTES {
         return Err("Image file exceeds 20MB limit".into());

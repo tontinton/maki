@@ -1,3 +1,12 @@
+-- The shared truncate/expand body that tool plugins render through.
+--
+-- Click handlers get `ev.row`, a 1-based line in this buf; 0 means the
+-- click landed outside it (the header). The handler lives on the buf
+-- itself, so any wrapper of the same buf (a batch child's foreign handle)
+-- reaches the same toggle. Expansion is never stored: the UI records
+-- clicked rows and replays them through `restore` in order, so `toggle`
+-- must stay deterministic or the replayed view drifts from what the user
+-- last saw.
 local ToolView = {}
 ToolView.__index = ToolView
 

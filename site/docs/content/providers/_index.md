@@ -57,11 +57,11 @@ You can override the model with `ANTHROPIC_MODEL` and the endpoint with `ANTHROP
 
 | Tier | Models | Pricing (in/out per 1M tokens) | Context |
 |------|--------|-------------------------------|---------|
-| Weak | **gpt-5.4-nano** (default), gpt-5.4-mini, gpt-4.1-nano | $0.20 / $1.25 | 400K ctx / 128K out |
-| Medium | gpt-4.1-mini, **gpt-4.1** (default), o4-mini, gpt-5.1-codex-mini | $0.40 / $1.60 | 1047K ctx / 32K out |
-| Strong | **gpt-5.5** (default), gpt-5.4, o3, gpt-5.3-codex, gpt-5.2-codex, gpt-5.1-codex-max, gpt-5.1-codex | $5.00 / $30.00 | 1050K ctx / 128K out |
+| Weak | **gpt-5.6-luna** (default), gpt-5.4-nano, gpt-5.4-mini, gpt-4.1-nano | $1.00 / $6.00 | 372K ctx / 128K out |
+| Medium | **gpt-5.6-terra** (default), gpt-4.1-mini, gpt-4.1, o4-mini, gpt-5.1-codex-mini | $2.50 / $15.00 | 372K ctx / 128K out |
+| Strong | **gpt-5.6-sol** (default), gpt-5.5, gpt-5.4, o3, gpt-5.3-codex, gpt-5.2-codex, gpt-5.1-codex-max, gpt-5.1-codex | $5.00 / $30.00 | 372K ctx / 128K out |
 
-Defaults: gpt-5.4-nano (weak), gpt-4.1 (medium), gpt-5.5 (strong)
+Defaults: gpt-5.6-luna (weak), gpt-5.6-terra (medium), gpt-5.6-sol (strong)
 
 ### Google
 
@@ -186,6 +186,15 @@ No hardcoded model catalog. Use any model ID supported by this provider.
 
 No hardcoded model catalog. Use any model ID supported by this provider.
 
+By default Maki hides free models from the Opencode catalog. To list free models (they use a public fallback, no API key needed), add this to `~/.config/maki/providers.toml`:
+
+```toml
+[opencode]
+enable_free_models = true
+```
+
+The default is `false`.
+
 ## Model Identifiers
 
 Models are referenced as `provider/model_id`:
@@ -221,7 +230,7 @@ If your provider serves models not in the base catalog, add a `models` subcomman
 [{"id": "my-model-v2", "tier": "strong", "context_window": 200000, "max_output_tokens": 16384}]
 ```
 
-Only `id` is required. Optional fields: `tier` (default `medium`), `context_window` (128K), `max_output_tokens` (16K), `pricing` (`{input, output, cache_write, cache_read}`, all per 1M tokens), `supports_tool_examples` (defaults to the base provider's setting), `supports_thinking` (defaults to the base provider's setting). The first model listed per tier is used for sub-agents. Without this subcommand, the base provider's models are used.
+Only `id` is required. Optional fields: `tier` (default `medium`), `context_window` (128K), `max_output_tokens` (16K), `pricing` (`{input, output, cache_write, cache_read}`, all per 1M tokens), `supports_tool_examples` (defaults to the base provider's setting), `supports_thinking` (defaults to the base provider's setting), `supports_vision` (defaults to the base provider's setting; when false, image input and the `view_image` tool are disabled). The first model listed per tier is used for sub-agents. Without this subcommand, the base provider's models are used.
 
 Dynamic provider models are namespaced as `{slug}/{model_id}` (e.g. `myproxy/claude-sonnet-4-6`).
 

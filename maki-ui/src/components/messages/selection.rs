@@ -5,12 +5,6 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::widgets::{Paragraph, Widget, Wrap};
 
-pub(super) fn parse_batch_inner_id(tool_id: &str) -> Option<(&str, usize)> {
-    let (batch_id, idx_str) = tool_id.rsplit_once("__")?;
-    let idx = idx_str.parse().ok()?;
-    Some((batch_id, idx))
-}
-
 pub(super) fn extract_selection_text(
     cache: &SegmentCache,
     viewport_width: u16,

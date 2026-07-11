@@ -1,3 +1,6 @@
+# Ayu Dark -- palette sourced from ayu-colors/themes/dark.yaml
+# Each palette entry is commented with its official Ayu YAML path.
+
 "comment"                         = { fg = "comment" }
 "comment.block"                   = { fg = "comment" }
 "comment.block.documentation"     = { fg = "comment" }
@@ -83,25 +86,39 @@
 "variable.parameter"              = { fg = "pink", modifiers = ["italic"] }
 
 [palette]
-background   = "#0b0e14"
+# surface.base
+background   = "#0d1017"
+# editor.fg
 foreground   = "#bfbdb6"
-comment      = "#626a73"
+# syntax.comment  (palette.gray.l4)
+comment      = "#5a6673"
+# syntax.entity  (palette.blue.l3)
 blue         = "#59c2ff"
-cyan         = "#73b8ff"
+# syntax.regexp  (palette.teal.l5)
+cyan         = "#95e6cb"
+# syntax.string  (palette.green.l4)
 green        = "#aad94c"
+# syntax.keyword  (palette.orange.l3)
 orange       = "#ff8f40"
-pink         = "#f07178"
+# palette.pink.l3
+pink         = "#f29668"
+# syntax.constant  (palette.purple.l3)
 purple       = "#d2a6ff"
+# vcs.removed
 red          = "#f26d78"
-yellow       = "#e6b450"
-current_line = "#131721"
-selection    = "#1a1f29"
+# syntax.func  (palette.yellow.l4)
+yellow       = "#ffb454"
+# editor.line
+current_line = "#161a24"
+# ui.line
+selection    = "#1b1f29"
 
 [ui]
 user               = { fg = "blue" }
 assistant          = { fg = "foreground" }
 assistant_prefix   = { fg = "orange" }
 thinking           = { fg = "comment", modifiers = ["italic"] }
+# surface.base
 tool_bg            = { bg = "#0d1017" }
 tool               = { fg = "foreground" }
 tool_path          = { fg = "yellow" }

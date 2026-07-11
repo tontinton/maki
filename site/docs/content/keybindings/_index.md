@@ -72,6 +72,8 @@ On macOS, some bindings use Option or Fn keys instead (run `/help` for exact key
 | `Enter` | Select |
 | `Esc` | Close |
 | `Type` | Filter |
+| `PageUp` / `PageDown` | Scroll page up / down |
+| `Ctrl+U` / `Ctrl+D` | Scroll page up / down |
 
 ## Context-Specific
 

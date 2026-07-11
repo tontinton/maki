@@ -641,6 +641,49 @@ fn turn_complete_tracks_usage_and_context_per_chat() {
 }
 
 #[test]
+fn turn_complete_accumulates_usage_by_model() {
+    let mut app = app_with_subagent();
+
+    app.update(agent_msg(AgentEvent::TurnComplete(Box::new(
+        TurnCompleteEvent {
+            message: Default::default(),
+            usage: TokenUsage {
+                input: 100,
+                output: 50,
+                cache_read: 10,
+                ..Default::default()
+            },
+            model: "main-model".into(),
+            context_size: None,
+        },
+    ))));
+    app.update(subagent_msg(
+        AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
+            message: Default::default(),
+            usage: TokenUsage {
+                input: 200,
+                output: 75,
+                ..Default::default()
+            },
+            model: "sub-model".into(),
+            context_size: None,
+        })),
+        "task1",
+        None,
+    ));
+
+    let by_model = &app.state.session.meta.usage_by_model;
+    assert_eq!(by_model.len(), 2);
+    let main = &by_model["main-model"];
+    assert_eq!(main.input, 100);
+    assert_eq!(main.output, 50);
+    assert_eq!(main.cache_read, 10);
+    let sub = &by_model["sub-model"];
+    assert_eq!(sub.input, 200);
+    assert_eq!(sub.output, 75);
+}
+
+#[test]
 fn cancel_resets_all_chats_and_indices() {
     let mut app = app_with_subagent();
     app.update(subagent_msg(
@@ -1482,6 +1525,42 @@ fn yolo_toggle() {
 }
 
 #[test]
+fn usage_command_toggles_modal() {
+    let mut app = test_app();
+    assert!(!app.usage_modal.is_open());
+    let open_actions = app.execute_command(cmd("/usage"));
+    assert!(app.usage_modal.is_open());
+    assert!(
+        open_actions
+            .iter()
+            .any(|a| matches!(a, Action::RefreshUsage)),
+        "opening should request a quota refresh"
+    );
+    let close_actions = app.execute_command(cmd("/usage"));
+    assert!(!app.usage_modal.is_open());
+    assert!(
+        !close_actions
+            .iter()
+            .any(|a| matches!(a, Action::RefreshUsage)),
+        "closing should not trigger a refresh"
+    );
+}
+
+#[test]
+fn ctrl_r_refreshes_usage_while_modal_open() {
+    let mut app = test_app();
+    app.execute_command(cmd("/usage"));
+    assert!(app.usage_modal.is_open());
+
+    let actions = app.update(Msg::Key(kb::REFRESH.to_key_event()));
+    assert!(
+        actions.iter().any(|a| matches!(a, Action::RefreshUsage)),
+        "Ctrl+R should emit RefreshUsage"
+    );
+    assert!(app.usage_modal.is_open(), "modal should stay open");
+}
+
+#[test]
 fn cd_command_behavior() {
     let mut app = test_app();
     app.execute_command(ParsedCommand {
@@ -2304,6 +2383,50 @@ fn fast_toggle_on_off_on_opus() {
     app.execute_command(cmd("/fast"));
     assert!(!app.state.fast);
     assert_eq!(app.status_bar.flash_text(), Some(FAST_OFF_MSG));
+}
+
+#[test]
+fn workflow_toggle_flows_into_agent_input() {
+    let mut app = test_app();
+    let msg = QueuedMessage {
+        text: "hi".into(),
+        images: Vec::new(),
+    };
+    assert!(!app.build_agent_input(&msg).workflow);
+
+    app.execute_command(cmd("/workflow"));
+    assert!(app.build_agent_input(&msg).workflow);
+    assert_eq!(app.status_bar.flash_text(), Some(WORKFLOW_ON_MSG));
+
+    app.execute_command(cmd("/workflow"));
+    assert!(!app.build_agent_input(&msg).workflow);
+    assert_eq!(app.status_bar.flash_text(), Some(WORKFLOW_OFF_MSG));
+}
+
+/// Workflow sessions have synthetic ids that no ToolDone matches, so
+/// SubagentHistory is what finishes their chat.
+#[test]
+fn subagent_history_finishes_workflow_chat() {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    app.update(subagent_msg(
+        AgentEvent::TextDelta { text: "sub".into() },
+        "session-abc",
+        Some("researcher"),
+    ));
+    assert_eq!(app.chats.len(), 2);
+    assert!(!app.chats[1].is_finished());
+
+    app.update(agent_msg_with_run_id(
+        AgentEvent::SubagentHistory {
+            tool_use_id: "session-abc".into(),
+            messages: vec![],
+        },
+        1,
+    ));
+    assert!(app.chats[1].is_finished());
+    assert_eq!(app.chats[1].last_message_text(), DONE_TEXT);
 }
 
 #[test_case("anthropic/claude-sonnet-4-5" ; "non_opus_anthropic")]

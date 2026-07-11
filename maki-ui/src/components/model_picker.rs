@@ -16,6 +16,7 @@ use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 use crate::theme;
 
 const TITLE: &str = " Models ";
+const RECENT_SECTION: &str = "Recent";
 
 fn footer_line() -> Line<'static> {
     let t = theme::current();
@@ -65,6 +66,7 @@ struct ModelEntry {
     spec: String,
     id: String,
     provider_display: String,
+    suffix: Option<String>,
     tier: String,
     override_tiers: Vec<ModelTier>,
 }
@@ -74,12 +76,16 @@ impl PickerItem for ModelEntry {
         &self.id
     }
 
+    fn suffix(&self) -> Option<&str> {
+        self.suffix.as_deref()
+    }
+
     fn detail(&self) -> Option<&str> {
         Some(&self.tier)
     }
 
     fn section(&self) -> Option<&str> {
-        Some(&self.provider_display)
+        Some(self.provider_display.as_str())
     }
 
     fn is_highlighted(&self) -> bool {
@@ -90,6 +96,7 @@ impl PickerItem for ModelEntry {
 pub struct ModelPicker {
     picker: ListPicker<ModelEntry>,
     models: Arc<ArcSwapOption<Vec<String>>>,
+    recents: Vec<String>,
     current_spec: String,
     last_spec_count: usize,
     dirty: bool,
@@ -100,10 +107,16 @@ impl ModelPicker {
         Self {
             picker: ListPicker::new().with_footer_builder(footer_line),
             models,
+            recents: Vec::new(),
             current_spec: String::new(),
             last_spec_count: 0,
             dirty: false,
         }
+    }
+
+    pub fn set_recents(&mut self, recents: Vec<String>) {
+        self.recents = recents;
+        self.dirty = true;
     }
 
     pub fn open(&mut self, current_spec: &str) {
@@ -133,9 +146,19 @@ impl ModelPicker {
         let guard = self.models.load();
         let specs = guard.as_deref();
         self.last_spec_count = specs.map_or(0, Vec::len);
-        let entries: Vec<ModelEntry> = specs
+        let mut entries: Vec<ModelEntry> = Vec::new();
+        let recent_specs = self.recents.clone();
+        for spec in &recent_specs {
+            if let Some(mut e) = parse_model_entry(spec) {
+                e.suffix = Some(std::mem::take(&mut e.provider_display));
+                e.provider_display = RECENT_SECTION.to_string();
+                entries.push(e);
+            }
+        }
+        let full: Vec<ModelEntry> = specs
             .map(|s| s.iter().filter_map(|s| parse_model_entry(s)).collect())
             .unwrap_or_default();
+        entries.extend(full);
         let idx = entries
             .iter()
             .position(|e| e.spec == self.current_spec)
@@ -231,6 +254,7 @@ fn parse_model_entry(spec: &str) -> Option<ModelEntry> {
         spec: spec.to_string(),
         id: model_id.to_string(),
         provider_display,
+        suffix: None,
         tier,
         override_tiers,
     })
@@ -346,6 +370,35 @@ mod tests {
         assert!(
             matches!(action, ModelPickerAction::Select(ref s) if s == "anthropic/claude-opus-4-6-20260101"),
             "after async model arrival, current model should still be selected"
+        );
+    }
+
+    #[test]
+    fn recents_include_current_model_preselected() {
+        let models = test_models();
+        let mut p = ModelPicker::new(models);
+        p.set_recents(vec![
+            "zai/glm-5".into(),
+            "anthropic/claude-sonnet-4-20250514".into(),
+        ]);
+        p.open("anthropic/claude-opus-4-6-20260101");
+
+        p.picker.select(0);
+        let action = p.handle_key(key(KeyCode::Enter));
+        assert!(
+            matches!(action, ModelPickerAction::Select(ref s) if s == "zai/glm-5"),
+            "first entry should be the most recent model",
+        );
+
+        p.set_recents(vec![
+            "zai/glm-5".into(),
+            "anthropic/claude-sonnet-4-20250514".into(),
+        ]);
+        p.open("zai/glm-5");
+        let action = p.handle_key(key(KeyCode::Enter));
+        assert!(
+            matches!(action, ModelPickerAction::Select(ref s) if s == "zai/glm-5"),
+            "current model should be preselected within Recent",
         );
     }
 }

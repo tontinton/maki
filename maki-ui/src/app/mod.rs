@@ -44,6 +44,7 @@ use crate::components::session_picker::{SessionPicker, SessionPickerAction};
 use crate::components::status_bar::StatusBar;
 use crate::components::theme_picker::{ThemePicker, ThemePickerAction};
 use crate::components::tool_display::format_turn_usage;
+use crate::components::usage_modal::{UsageFetchState, UsageModal};
 use crate::components::{
     Action, DisplayMessage, DisplayRole, ExitRequest, Overlay, RetryInfo, Status, is_ctrl,
 };
@@ -85,6 +86,8 @@ const FLASH_NO_PLAN: &str = "No plan file";
 const FAST_UNSUPPORTED_MSG: &str = "Fast mode requires an Anthropic Opus 4.6+ model (API only)";
 const FAST_ON_MSG: &str = "Fast mode: on";
 const FAST_OFF_MSG: &str = "Fast mode: off";
+const WORKFLOW_ON_MSG: &str = "Workflow mode: on";
+const WORKFLOW_OFF_MSG: &str = "Workflow mode: off";
 const IMPLEMENT_MSG_PREFIX: &str = "Implement the plan";
 const IMPLEMENT_PARALLEL_HINT: &str = "Use batch+task to parallelize, assign each subagent a separate module and restrict its tests to that module to avoid interference.";
 
@@ -140,6 +143,7 @@ pub struct App {
     pub(super) session_picker: SessionPicker,
     pub(super) rewind_picker: RewindPicker,
     pub(super) help_modal: HelpModal,
+    pub(super) usage_modal: UsageModal,
     pub(super) btw_modal: BtwModal,
     pub(super) float_mgr: FloatManager,
     pub(super) search_modal: SearchModal,
@@ -163,6 +167,7 @@ pub struct App {
     pub(super) last_esc: Option<Instant>,
 
     pub(crate) storage: StateDir,
+    pub(crate) usage_slot: Arc<ArcSwapOption<UsageFetchState>>,
     pub(crate) shared_history: Option<Arc<ArcSwap<Vec<Message>>>>,
     pub(crate) btw_system: Option<Arc<ArcSwap<String>>>,
     pub(crate) shared_tool_outputs: Option<Arc<Mutex<HashMap<String, ToolOutput>>>>,
@@ -199,7 +204,7 @@ impl App {
     ) -> Self {
         scrollbar::set_enabled(ui_config.scrollbar);
         let state = SessionState::from_session(session, model, &storage);
-        Self {
+        let mut app = Self {
             chats: vec![Chat::new("Main".into(), ui_config)],
             active_chat: 0,
             chat_index: HashMap::new(),
@@ -218,6 +223,7 @@ impl App {
             session_picker: SessionPicker::new(),
             rewind_picker: RewindPicker::new(),
             help_modal: HelpModal::new(),
+            usage_modal: UsageModal::new(),
             btw_modal: BtwModal::new(ui_config.typewriter_ms_per_char),
             float_mgr: FloatManager::new(),
             search_modal: SearchModal::new(),
@@ -240,6 +246,7 @@ impl App {
             clipboard: ClipboardState::new(),
             last_esc: None,
             storage,
+            usage_slot: Arc::new(ArcSwapOption::empty()),
             shared_history: None,
             btw_system: None,
             shared_tool_outputs: None,
@@ -254,7 +261,10 @@ impl App {
             restore_event_tx: None,
             restoring: Arc::new(AtomicBool::new(false)),
             subagent_answers: HashMap::new(),
-        }
+        };
+        app.model_picker
+            .set_recents(maki_storage::model::read_recents(&app.storage));
+        app
     }
 
     pub(crate) fn main_chat(&mut self) -> &mut Chat {
@@ -272,6 +282,11 @@ impl App {
     pub(crate) fn update_model(&mut self, model: &Model) {
         self.state.update_model(model);
         persist_model(&self.storage, &self.state.session.model);
+    }
+
+    pub(crate) fn record_recent_model(&mut self, spec: &str) {
+        let recents = maki_storage::model::push_recent(&self.storage, spec);
+        self.model_picker.set_recents(recents);
     }
 
     pub(crate) fn flash(&mut self, msg: String) {
@@ -358,6 +373,10 @@ impl App {
         }
         if self.help_modal.is_open() {
             self.help_modal.scroll(delta);
+            return;
+        }
+        if self.usage_modal.is_open() {
+            self.usage_modal.scroll(delta);
             return;
         }
         let pos = Position::new(column, row);
@@ -481,6 +500,14 @@ impl App {
 
         if self.help_modal.is_open() {
             self.help_modal.handle_key(key);
+            return Some(vec![]);
+        }
+
+        if self.usage_modal.is_open() {
+            if key::REFRESH.matches(key) {
+                return Some(vec![Action::RefreshUsage]);
+            }
+            self.usage_modal.handle_key(key);
             return Some(vec![]);
         }
 
@@ -933,6 +960,11 @@ impl App {
             messages,
         } = envelope.event
         {
+            // Workflow sessions use synthetic ids that no ToolDone will match,
+            // so we finish them here on SubagentHistory.
+            if let Some(&sub_idx) = self.chat_index.get(tool_use_id.as_str()) {
+                self.chats[sub_idx].mark_finished(DisplayRole::Done, DONE_TEXT);
+            }
             self.state
                 .session
                 .subagent_messages
@@ -1000,6 +1032,13 @@ impl App {
         if let AgentEvent::TurnComplete(ref tc) = envelope.event {
             self.state.token_usage += tc.usage;
             self.chats[chat_idx].token_usage += tc.usage;
+            *self
+                .state
+                .session
+                .meta
+                .usage_by_model
+                .entry(tc.model.clone())
+                .or_default() += tc.usage.into();
             let ctx_size = tc.context_size.unwrap_or_else(|| tc.usage.context_tokens());
             self.chats[chat_idx].context_size = ctx_size;
             if chat_idx == 0 {
@@ -1123,6 +1162,14 @@ impl App {
                 self.help_modal.toggle();
                 vec![]
             }
+            "/usage" => {
+                self.usage_modal.toggle();
+                if self.usage_modal.is_open() {
+                    vec![Action::RefreshUsage]
+                } else {
+                    vec![]
+                }
+            }
             "/btw" => {
                 let question = cmd.args.trim().to_string();
                 if question.is_empty() {
@@ -1190,6 +1237,18 @@ impl App {
                         FAST_ON_MSG
                     } else {
                         FAST_OFF_MSG
+                    }
+                    .into(),
+                );
+                vec![]
+            }
+            "/workflow" => {
+                self.state.workflow = !self.state.workflow;
+                self.flash(
+                    if self.state.workflow {
+                        WORKFLOW_ON_MSG
+                    } else {
+                        WORKFLOW_OFF_MSG
                     }
                     .into(),
                 );
@@ -1333,9 +1392,10 @@ impl App {
         vec![]
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 13] {
+    fn overlays(&self) -> [&dyn Overlay; 14] {
         [
             &self.help_modal,
+            &self.usage_modal,
             &self.btw_modal,
             &self.float_mgr,
             &self.search_modal,
@@ -1351,9 +1411,10 @@ impl App {
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 13] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 14] {
         [
             &mut self.help_modal,
+            &mut self.usage_modal,
             &mut self.btw_modal,
             &mut self.float_mgr,
             &mut self.search_modal,

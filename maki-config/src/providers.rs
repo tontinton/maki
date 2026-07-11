@@ -39,6 +39,8 @@ pub struct ModelDef {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_thinking: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_vision: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pricing_input: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pricing_output: Option<f64>,
@@ -81,9 +83,10 @@ pub fn slugify(name: &str) -> String {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "kebab-case")]
 pub enum Protocol {
     Openai,
+    OpenaiResponses,
     Anthropic,
     Google,
 }
@@ -94,6 +97,7 @@ impl FromStr for Protocol {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "openai" => Ok(Self::Openai),
+            "openai-responses" => Ok(Self::OpenaiResponses),
             "anthropic" => Ok(Self::Anthropic),
             "google" => Ok(Self::Google),
             _ => Err(format!("unknown protocol: {s}")),
@@ -143,6 +147,10 @@ pub struct ProviderDef {
     pub default_model: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub discover_models: bool,
+    /// Opencode-only: when `Some(false)`, free catalog models are hidden
+    /// entirely. Defaults to `false` when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enable_free_models: Option<bool>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<ModelDef>,
 }
@@ -325,6 +333,7 @@ mod tests {
                 base_url: Some("https://api.example.com/v1".into()),
                 api_key_env: Some("MY_API_KEY".into()),
                 discover_models: true,
+                enable_free_models: Some(false),
                 ..Default::default()
             },
         );
@@ -338,6 +347,18 @@ mod tests {
             parsed.get("my-provider").unwrap().base_url,
             Some("https://api.example.com/v1".into())
         );
+        assert_eq!(
+            parsed.get("my-provider").unwrap().enable_free_models,
+            Some(false)
+        );
+    }
+
+    const EMPTY_PROVIDER_DEF_TOML: &str = "";
+
+    #[test]
+    fn provider_def_enable_free_models_defaults_none() {
+        let def: ProviderDef = toml::from_str(EMPTY_PROVIDER_DEF_TOML).unwrap();
+        assert_eq!(def.enable_free_models, None);
     }
 
     const UNKNOWN_TIER_TOML: &str = r#"id = "x"

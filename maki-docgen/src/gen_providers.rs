@@ -35,6 +35,15 @@ You will need `AWS_REGION` and one of the following for auth:
 
 You can override the model with `ANTHROPIC_MODEL` and the endpoint with `ANTHROPIC_BEDROCK_BASE_URL`. These env var names match Claude Code, so if you were already using Bedrock there, the same setup works here."#;
 
+const OPENCODE_FREE_MODELS_NOTE: &str = r#"By default Maki hides free models from the Opencode catalog. To list free models (they use a public fallback, no API key needed), add this to `~/.config/maki/providers.toml`:
+
+```toml
+[opencode]
+enable_free_models = true
+```
+
+The default is `false`."#;
+
 const MODEL_IDENTIFIERS: &str = r#"## Model Identifiers
 
 Models are referenced as `provider/model_id`:
@@ -74,7 +83,7 @@ If your provider serves models not in the base catalog, add a `models` subcomman
 [{{"id": "my-model-v2", "tier": "strong", "context_window": 200000, "max_output_tokens": 16384}}]
 ```
 
-Only `id` is required. Optional fields: `tier` (default `medium`), `context_window` (128K), `max_output_tokens` (16K), `pricing` (`{{input, output, cache_write, cache_read}}`, all per 1M tokens), `supports_tool_examples` (defaults to the base provider's setting), `supports_thinking` (defaults to the base provider's setting). The first model listed per tier is used for sub-agents. Without this subcommand, the base provider's models are used.
+Only `id` is required. Optional fields: `tier` (default `medium`), `context_window` (128K), `max_output_tokens` (16K), `pricing` (`{{input, output, cache_write, cache_read}}`, all per 1M tokens), `supports_tool_examples` (defaults to the base provider's setting), `supports_thinking` (defaults to the base provider's setting), `supports_vision` (defaults to the base provider's setting; when false, image input and the `view_image` tool are disabled). The first model listed per tier is used for sub-agents. Without this subcommand, the base provider's models are used.
 
 Dynamic provider models are namespaced as `{{slug}}/{{model_id}}` (e.g. `myproxy/claude-sonnet-4-6`).
 
@@ -299,6 +308,10 @@ fn write_section(out: &mut String, section: &ProviderSection) {
     if section.name == "Anthropic" {
         let _ = writeln!(out, "\n{LONG_CONTEXT_NOTE}");
         let _ = writeln!(out, "\n{BEDROCK_NOTE}");
+    }
+
+    if section.kind == ProviderKind::Opencode {
+        let _ = writeln!(out, "\n{OPENCODE_FREE_MODELS_NOTE}");
     }
 }
 

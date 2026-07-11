@@ -59,6 +59,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             ],
             tier: ModelTier::Strong,
             family: ModelFamily::Generic,
+            vision: true,
             default: true,
             pricing: ModelPricing {
                 input: 1.5,
@@ -74,6 +75,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             prefixes: &["mistral-small-latest", "mistral-small-2603"],
             tier: ModelTier::Medium,
             family: ModelFamily::Generic,
+            vision: true,
             default: true,
             pricing: ModelPricing {
                 input: 0.15,
@@ -89,6 +91,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             prefixes: &["ministral-14b-latest", "ministral-14b-2512"],
             tier: ModelTier::Weak,
             family: ModelFamily::Generic,
+            vision: false,
             default: true,
             pricing: ModelPricing {
                 input: 0.20,

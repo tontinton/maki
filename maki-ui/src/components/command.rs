@@ -43,6 +43,11 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         max_args: 0,
     },
     BuiltinCommand {
+        name: "/usage",
+        description: "Show token usage breakdown",
+        max_args: 0,
+    },
+    BuiltinCommand {
         name: "/queue",
         description: "Remove items from queue",
         max_args: 0,
@@ -95,6 +100,11 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     BuiltinCommand {
         name: "/fast",
         description: "Toggle Anthropic fast mode (Opus only)",
+        max_args: 0,
+    },
+    BuiltinCommand {
+        name: "/workflow",
+        description: "Toggle workflow mode (task callable inside code_execution)",
         max_args: 0,
     },
     BuiltinCommand {

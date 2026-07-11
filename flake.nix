@@ -34,12 +34,12 @@
               # rebuild to get the correct value.
               outputHashes = {
                 "monty-0.0.18" = "sha256-p9mDjS9FTvsITU98B8AeyUCk4wQhgk71HoyOsNPpB0Y=";
-                "ruff_python_ast-0.0.0" = "sha256-nVQC4ZaLWiZBUEReLqzpXKxXVxCdUW6b+mda9J8JSA0=";
-                "ruff_python_parser-0.0.0" = "sha256-nVQC4ZaLWiZBUEReLqzpXKxXVxCdUW6b+mda9J8JSA0=";
-                "ruff_python_stdlib-0.0.0" = "sha256-nVQC4ZaLWiZBUEReLqzpXKxXVxCdUW6b+mda9J8JSA0=";
-                "ruff_python_trivia-0.0.0" = "sha256-nVQC4ZaLWiZBUEReLqzpXKxXVxCdUW6b+mda9J8JSA0=";
-                "ruff_source_file-0.0.0" = "sha256-nVQC4ZaLWiZBUEReLqzpXKxXVxCdUW6b+mda9J8JSA0=";
-                "ruff_text_size-0.0.0" = "sha256-nVQC4ZaLWiZBUEReLqzpXKxXVxCdUW6b+mda9J8JSA0=";
+                "ruff_python_ast-0.0.0" = "sha256-m5U5OVUvhn5t3yTSSbT/JA+xmydEDQq+zKFNMN7K/MI=";
+                "ruff_python_parser-0.0.0" = "sha256-m5U5OVUvhn5t3yTSSbT/JA+xmydEDQq+zKFNMN7K/MI=";
+                "ruff_python_stdlib-0.0.0" = "sha256-m5U5OVUvhn5t3yTSSbT/JA+xmydEDQq+zKFNMN7K/MI=";
+                "ruff_python_trivia-0.0.0" = "sha256-m5U5OVUvhn5t3yTSSbT/JA+xmydEDQq+zKFNMN7K/MI=";
+                "ruff_source_file-0.0.0" = "sha256-m5U5OVUvhn5t3yTSSbT/JA+xmydEDQq+zKFNMN7K/MI=";
+                "ruff_text_size-0.0.0" = "sha256-m5U5OVUvhn5t3yTSSbT/JA+xmydEDQq+zKFNMN7K/MI=";
               };
             };
             cargoBuildFlags = [
@@ -56,9 +56,12 @@
             # the relative path
             postPatch = ''
               for f in "$cargoDepsCopy"/monty-*/src/lib.rs; do
+              # monty-macros doesn't include the readme
+              if [[ "$f" != *"monty-macros"* ]]; then
                 substituteInPlace "$f" \
                   --replace-fail '#![doc = include_str!("../../../README.md")]' \
                                  '#![doc = "Monty Python bridge."]'
+              fi
               done
             '';
             buildInputs = with pkgs; [ openssl ];

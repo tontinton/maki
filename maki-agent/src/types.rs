@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::fmt::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -5,7 +6,6 @@ use std::sync::{Arc, Mutex};
 
 use flume::Sender;
 use maki_providers::{AgentError, ContentBlock, Message, Role, StopReason, TokenUsage};
-use maki_tool_macro::{ArgEnum, Args};
 use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
 
@@ -65,16 +65,15 @@ impl GrepFileEntry {
     }
 }
 
-#[derive(Args, Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TodoItem {
-    #[param(description = "Task description")]
     pub content: String,
     pub status: TodoStatus,
     #[serde(default)]
     pub priority: TodoPriority,
 }
 
-#[derive(ArgEnum, Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum TodoStatus {
     Pending,
@@ -94,9 +93,7 @@ impl TodoStatus {
     }
 }
 
-#[derive(
-    ArgEnum, Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, strum::Display,
-)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, strum::Display)]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum TodoPriority {
@@ -108,31 +105,16 @@ pub enum TodoPriority {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ToolInput {
-    Code { language: String, code: String },
-    Script { language: String, code: String },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub enum BatchToolStatus {
-    Pending,
-    InProgress,
-    Success,
-    Error,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BatchToolEntry {
-    pub tool: String,
-    pub summary: String,
-    pub status: BatchToolStatus,
-    pub input: Option<ToolInput>,
-    /// Lua plugins need the full JSON to re-run their snapshot on theme switch.
-    /// `input` only covers code_execution, so this stores the original call.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub raw_input: Option<serde_json::Value>,
-    pub output: Option<ToolOutput>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub annotation: Option<String>,
+    Code {
+        language: String,
+        code: String,
+    },
+    /// Nothing produces this anymore (script rendering moved to Lua), but
+    /// old persisted sessions still contain it and must keep loading.
+    Script {
+        language: String,
+        code: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -155,6 +137,10 @@ pub struct TextOutput {
     pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instructions: Option<Vec<InstructionBlock>>,
+    /// Structured plugin state saved with the session, so `restore` never
+    /// has to re-parse its own llm output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<serde_json::Value>,
 }
 
 impl From<String> for TextOutput {
@@ -162,6 +148,7 @@ impl From<String> for TextOutput {
         Self {
             text,
             instructions: None,
+            state: None,
         }
     }
 }
@@ -171,6 +158,7 @@ impl From<&str> for TextOutput {
         Self {
             text: text.to_owned(),
             instructions: None,
+            state: None,
         }
     }
 }
@@ -185,14 +173,21 @@ impl<'de> Deserialize<'de> for TextOutput {
                 text: String,
                 #[serde(default)]
                 instructions: Option<Vec<InstructionBlock>>,
+                #[serde(default)]
+                state: Option<serde_json::Value>,
             },
         }
         match Raw::deserialize(deserializer)? {
-            Raw::Legacy(text) => Ok(Self {
+            Raw::Legacy(text) => Ok(text.into()),
+            Raw::Full {
                 text,
-                instructions: None,
+                instructions,
+                state,
+            } => Ok(Self {
+                text,
+                instructions,
+                state,
             }),
-            Raw::Full { text, instructions } => Ok(Self { text, instructions }),
         }
     }
 }
@@ -227,12 +222,20 @@ pub enum ToolOutput {
     GrepResult {
         entries: Vec<GrepFileEntry>,
     },
+    /// Only here so legacy sessions still deserialize. Batch is a Lua
+    /// plugin now and stores plain text plus a `state` payload, so the old
+    /// per-child `entries` are dropped on load: nothing can render them.
     Batch {
-        entries: Vec<BatchToolEntry>,
         text: String,
     },
     Instructions {
         blocks: Vec<InstructionBlock>,
+    },
+    Image {
+        source: maki_providers::ImageSource,
+        /// Caption for the tool_result block, e.g. "[image: slack.jpeg 222KB]";
+        /// the pixels ride separately as a `ContentBlock::Image`.
+        text: String,
     },
 }
 
@@ -243,6 +246,46 @@ fn lines_remaining_after(total: usize, start_line: usize, shown: usize) -> usize
 }
 
 impl ToolOutput {
+    /// Short header suffix summarizing the output, e.g. `12 lines`.
+    /// The UI uses it on tool completion, and `maki.agent.call_tool` falls
+    /// back to it when the tool's reply has no annotation of its own.
+    pub fn annotation(&self) -> Option<String> {
+        match self {
+            Self::ReadCode {
+                lines, total_lines, ..
+            } => {
+                let shown = lines.len();
+                if *total_lines > shown {
+                    Some(format!("{shown} of {total_lines} lines"))
+                } else {
+                    Some(format!("{shown} lines"))
+                }
+            }
+            Self::WriteCode { byte_count, .. } => Some(format!("{byte_count} bytes")),
+            Self::GrepResult { entries } => {
+                let matches: usize = entries.iter().map(|e| e.match_count()).sum();
+                let files = entries.len();
+                let f = if files == 1 { "file" } else { "files" };
+                Some(format!("{matches} matches in {files} {f}"))
+            }
+            Self::ReadDir(t) => {
+                let n = t.text.lines().count();
+                Some(format!("{n} entries"))
+            }
+            Self::Plain(text) | Self::Markdown(text) if !text.text.is_empty() => {
+                let n = text.text.lines().count();
+                Some(format!("{n} lines"))
+            }
+            Self::Image { text, .. } => Some(
+                text.strip_prefix("[image: ")
+                    .and_then(|t| t.strip_suffix(']'))
+                    .unwrap_or(text)
+                    .to_string(),
+            ),
+            _ => None,
+        }
+    }
+
     /// Only here for old persisted sessions that still have `WriteCode`/`Diff` variants.
     /// New code should use `ToolDoneEvent::written_path` instead.
     pub fn written_path(&self) -> Option<&str> {
@@ -268,6 +311,13 @@ impl ToolOutput {
 
     pub fn is_markdown(&self) -> bool {
         matches!(self, Self::Markdown(_))
+    }
+
+    pub fn state(&self) -> Option<&serde_json::Value> {
+        match self {
+            Self::Plain(t) | Self::Markdown(t) | Self::ReadDir(t) => t.state.as_ref(),
+            _ => None,
+        }
     }
 
     pub fn structured_display_text(&self) -> Option<String> {
@@ -386,7 +436,7 @@ impl ToolOutput {
                 }
                 out
             }
-            Self::Batch { text, .. } => text.clone(),
+            Self::Batch { text } | Self::Image { text, .. } => text.clone(),
             Self::Instructions { blocks } => {
                 let mut out = String::new();
                 append_instructions(&mut out, blocks);
@@ -449,16 +499,26 @@ impl ToolDoneEvent {
 }
 
 pub fn tool_results(results: Vec<ToolDoneEvent>) -> Message {
+    let mut content = Vec::with_capacity(results.len());
+    let mut images = Vec::new();
+    for r in results {
+        content.push(ContentBlock::ToolResult {
+            tool_use_id: r.id,
+            content: r.output.as_text(),
+            is_error: r.is_error,
+        });
+        if let ToolOutput::Image { source, .. } = &r.output {
+            images.push(ContentBlock::Image {
+                source: source.clone(),
+            });
+        }
+    }
+    // Anthropic wants every tool_result before other content in the user
+    // message, so images go after all results.
+    content.extend(images);
     Message {
         role: Role::User,
-        content: results
-            .into_iter()
-            .map(|r| ContentBlock::ToolResult {
-                tool_use_id: r.id,
-                content: r.output.as_text(),
-                is_error: r.is_error,
-            })
-            .collect(),
+        content,
         ..Default::default()
     }
 }
@@ -484,7 +544,6 @@ pub enum AgentEvent {
         content: String,
     },
     ToolDone(Box<ToolDoneEvent>),
-    BatchProgress(Box<BatchProgressEvent>),
     TurnComplete(Box<TurnCompleteEvent>),
     ToolResultsSubmitted {
         message: Box<Message>,
@@ -542,6 +601,12 @@ pub enum AgentEvent {
 pub struct SharedBuf {
     committed: Mutex<Arc<Vec<SnapshotLine>>>,
     dirty: AtomicBool,
+    on_change: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Opaque click handler owned by the Lua layer. It lives on the buffer
+    /// itself, not on any one handle, so every handle wrapping this buf,
+    /// even a foreign wrapper in another task, reaches the same handler.
+    click: Mutex<Option<Arc<dyn Any + Send + Sync>>>,
+    notifying: AtomicBool,
 }
 
 impl SharedBuf {
@@ -549,7 +614,51 @@ impl SharedBuf {
         Self {
             committed: Mutex::new(Arc::new(Vec::new())),
             dirty: AtomicBool::new(false),
+            on_change: Mutex::new(None),
+            click: Mutex::new(None),
+            notifying: AtomicBool::new(false),
         }
+    }
+
+    pub fn set_click(&self, f: Arc<dyn Any + Send + Sync>) {
+        *self.click.lock().unwrap_or_else(|e| e.into_inner()) = Some(f);
+    }
+
+    pub fn click(&self) -> Option<Arc<dyn Any + Send + Sync>> {
+        self.click.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub fn clear_click(&self) {
+        *self.click.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// Fires synchronously after every `append`/`set_lines`, on the
+    /// mutating thread. The callback must not mutate this buffer; recursive
+    /// notifications are silently dropped. One slot only: a second call
+    /// replaces the previous watcher.
+    pub fn set_on_change(&self, f: impl Fn() + Send + Sync + 'static) {
+        *self.on_change.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(f));
+    }
+
+    /// A watcher keeps everything it captured alive for as long as it is
+    /// installed, so owners must clear it once the watching task retires.
+    pub fn clear_on_change(&self) {
+        *self.on_change.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    fn notify_change(&self) {
+        if self.notifying.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let cb = self
+            .on_change
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(cb) = cb {
+            cb();
+        }
+        self.notifying.store(false, Ordering::Release);
     }
 
     pub fn append(&self, line: SnapshotLine) {
@@ -557,6 +666,7 @@ impl SharedBuf {
         Arc::make_mut(&mut guard).push(line);
         drop(guard);
         self.dirty.store(true, Ordering::Release);
+        self.notify_change();
     }
 
     pub fn set_lines(&self, lines: Vec<SnapshotLine>) {
@@ -564,6 +674,7 @@ impl SharedBuf {
         *guard = Arc::new(lines);
         drop(guard);
         self.dirty.store(true, Ordering::Release);
+        self.notify_change();
     }
 
     pub fn len(&self) -> usize {
@@ -575,6 +686,11 @@ impl SharedBuf {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    pub fn read(&self) -> Arc<Vec<SnapshotLine>> {
+        let guard = self.committed.lock().unwrap_or_else(|e| e.into_inner());
+        Arc::clone(&guard)
     }
 
     pub fn read_if_dirty(&self) -> Option<Arc<Vec<SnapshotLine>>> {
@@ -630,6 +746,21 @@ impl BufferSnapshot {
             .map(|l| l.spans.iter().map(|s| s.text.as_str()).collect())
             .unwrap_or_default()
     }
+
+    /// Search matches against this, so it must mirror exactly what the UI
+    /// renders.
+    pub fn text(&self) -> String {
+        let mut out = String::new();
+        for (i, line) in self.lines.iter().enumerate() {
+            if i > 0 {
+                out.push('\n');
+            }
+            for span in &line.spans {
+                out.push_str(&span.text);
+            }
+        }
+        out
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -681,16 +812,6 @@ pub struct TurnCompleteEvent {
     pub model: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_size: Option<u32>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct BatchProgressEvent {
-    pub batch_id: String,
-    pub index: usize,
-    pub tool: String,
-    pub status: BatchToolStatus,
-    pub output: Option<ToolOutput>,
-    pub summary: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -761,6 +882,66 @@ pub struct Envelope {
 mod tests {
     use super::*;
     use test_case::test_case;
+
+    #[test_case(ToolOutput::Plain("ok".into()),                      Some("1 lines")     ; "plain_short_annotates")]
+    #[test_case(ToolOutput::Plain((0..20).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n").into()), Some("20 lines") ; "plain_long_annotates")]
+    #[test_case(ToolOutput::Plain(String::new().into()),             None                ; "plain_empty_no_annotation")]
+    #[test_case(ToolOutput::ReadCode { path: "a.rs".into(), start_line: 1, lines: vec!["x".into(); 5], total_lines: 5, instructions: None }, Some("5 lines") ; "read_code_full_file")]
+    #[test_case(ToolOutput::ReadCode { path: "a.rs".into(), start_line: 10, lines: vec!["x".into(); 5], total_lines: 100, instructions: None }, Some("5 of 100 lines") ; "read_code_partial")]
+    #[test_case(ToolOutput::WriteCode { path: "a.rs".into(), byte_count: 99, lines: vec![] }, Some("99 bytes") ; "write_code_bytes")]
+    #[test_case(ToolOutput::GrepResult { entries: vec![GrepFileEntry { path: "a.rs".into(), groups: vec![GrepMatchGroup::single(1, "hit")] }] }, Some("1 matches in 1 file") ; "grep_file_count")]
+    #[test_case(ToolOutput::Diff { path: "a.rs".into(), before: String::new(), after: String::new(), summary: "ok".into() }, None ; "diff_no_annotation")]
+    fn annotation_cases(output: ToolOutput, expected: Option<&str>) {
+        assert_eq!(output.annotation().as_deref(), expected);
+    }
+
+    #[test]
+    fn clear_on_change_stops_notifications() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let buf = SharedBuf::new();
+        let fired = Arc::new(AtomicUsize::new(0));
+        let f = Arc::clone(&fired);
+        buf.set_on_change(move || {
+            f.fetch_add(1, Ordering::SeqCst);
+        });
+        buf.append(SnapshotLine { spans: vec![] });
+        assert_eq!(fired.load(Ordering::SeqCst), 1);
+        buf.clear_on_change();
+        buf.append(SnapshotLine { spans: vec![] });
+        assert_eq!(fired.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn legacy_batch_output_with_entries_still_deserializes() {
+        let json = r#"{"Batch":{"entries":[{"tool":"read","summary":"s","status":"Success","input":null,"output":null}],"text":"stored"}}"#;
+        let out: ToolOutput =
+            serde_json::from_str(json).expect("old persisted session JSON must load");
+        assert_eq!(out.as_text(), "stored");
+    }
+
+    /// Search and the UI's error-dedup guard depend on this exact shape:
+    /// spans join bare, lines join with one newline, no trailing newline.
+    #[test]
+    fn buffer_snapshot_text_joins_spans_and_lines() {
+        let snap = BufferSnapshot::from_arc(Arc::new(vec![
+            SnapshotLine {
+                spans: vec![
+                    SnapshotSpan {
+                        text: "1 ".into(),
+                        style: SpanStyle::Named("line_nr".into()),
+                    },
+                    SnapshotSpan {
+                        text: "print('hi')".into(),
+                        style: SpanStyle::Default,
+                    },
+                ],
+            },
+            SnapshotLine { spans: vec![] },
+            SnapshotLine::plain("out".into()),
+        ]));
+        assert_eq!(snap.text(), "1 print('hi')\n\nout");
+        assert_eq!(BufferSnapshot::from_arc(Arc::new(vec![])).text(), "");
+    }
 
     #[test]
     fn as_display_text_diff_renders_unified_text() {
@@ -864,6 +1045,47 @@ mod tests {
         );
         assert!(
             matches!(&msg.content[1], ContentBlock::ToolResult { tool_use_id, is_error, .. } if tool_use_id == "t2" && *is_error)
+        );
+    }
+
+    #[test]
+    fn tool_results_appends_images_after_all_results() {
+        let image = |data: &str| ToolOutput::Image {
+            source: maki_providers::ImageSource::new(
+                maki_providers::ImageMediaType::Png,
+                Arc::from(data),
+            ),
+            text: "[image: pic.png 1KB]".into(),
+        };
+        let done = |id: &str, output: ToolOutput| ToolDoneEvent {
+            id: id.into(),
+            tool: Arc::from("t"),
+            output,
+            is_error: false,
+            annotation: None,
+            written_path: None,
+        };
+
+        let msg = tool_results(vec![
+            done("t1", image("aGVsbG8=")),
+            done("t2", ToolOutput::Plain("ok".into())),
+            done("t3", image("aW1n")),
+        ]);
+        assert_eq!(msg.content.len(), 5);
+        assert!(
+            matches!(&msg.content[0], ContentBlock::ToolResult { tool_use_id, content, .. } if tool_use_id == "t1" && content == "[image: pic.png 1KB]")
+        );
+        assert!(
+            matches!(&msg.content[1], ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "t2")
+        );
+        assert!(
+            matches!(&msg.content[2], ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "t3")
+        );
+        assert!(
+            matches!(&msg.content[3], ContentBlock::Image { source } if &*source.data == "aGVsbG8=")
+        );
+        assert!(
+            matches!(&msg.content[4], ContentBlock::Image { source } if &*source.data == "aW1n")
         );
     }
 
@@ -1071,52 +1293,6 @@ mod tests {
     }
 
     #[test]
-    fn batch_tool_entry_raw_input_serde_round_trip() {
-        const MSG: &str = "raw_input should survive serde round-trip";
-        let entry = BatchToolEntry {
-            tool: "read".into(),
-            summary: "read a file".into(),
-            status: BatchToolStatus::Success,
-            input: None,
-            raw_input: Some(serde_json::json!({"path": "/a.rs"})),
-            output: None,
-            annotation: None,
-        };
-        let json = serde_json::to_string(&entry).unwrap();
-        let parsed: BatchToolEntry = serde_json::from_str(&json).unwrap();
-        assert_eq!(
-            parsed.raw_input,
-            Some(serde_json::json!({"path": "/a.rs"})),
-            "{MSG}"
-        );
-    }
-
-    #[test]
-    fn batch_tool_entry_raw_input_none_omitted_in_json() {
-        const MSG: &str = "raw_input: None must not appear in serialized JSON";
-        let entry = BatchToolEntry {
-            tool: "bash".into(),
-            summary: "run cmd".into(),
-            status: BatchToolStatus::Pending,
-            input: None,
-            raw_input: None,
-            output: None,
-            annotation: None,
-        };
-        let json = serde_json::to_string(&entry).unwrap();
-        assert!(!json.contains("raw_input"), "{MSG}");
-    }
-
-    #[test]
-    fn batch_tool_entry_missing_raw_input_deserializes_as_none() {
-        const MSG: &str = "missing raw_input field must deserialize as None (backwards compat)";
-        let json =
-            r#"{"tool":"grep","summary":"search","status":"Pending","input":null,"output":null}"#;
-        let entry: BatchToolEntry = serde_json::from_str(json).unwrap();
-        assert_eq!(entry.raw_input, None, "{MSG}");
-    }
-
-    #[test]
     fn agent_event_tool_snapshot_theme_gen_backwards_compat() {
         const OMIT_MSG: &str = "theme_gen: None must not appear in serialized JSON";
         const COMPAT_MSG: &str = "missing theme_gen must deserialize as None (backwards compat)";
@@ -1167,6 +1343,7 @@ mod tests {
         let output = ToolOutput::Plain(TextOutput {
             text: "file contents".into(),
             instructions: Some(blocks),
+            state: None,
         });
         let json = serde_json::to_string(&output).unwrap();
         let parsed: ToolOutput = serde_json::from_str(&json).unwrap();
@@ -1223,6 +1400,7 @@ mod tests {
                 path: "AGENTS.md".into(),
                 content: "do stuff".into(),
             }]),
+            state: None,
         });
         let text = output.as_text();
         assert!(text.contains("fn main()"), "{INCLUDES_MSG}");

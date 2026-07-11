@@ -4,7 +4,7 @@ use agent_client_protocol_schema::{
     ToolCallUpdateFields, ToolKind,
 };
 use maki_agent::tools::ToolRegistry;
-use maki_agent::types::{BatchProgressEvent, ToolDoneEvent, ToolOutput, ToolStartEvent};
+use maki_agent::types::{ToolDoneEvent, ToolOutput, ToolStartEvent};
 use maki_providers::{ContentBlock as MsgBlock, ImageMediaType, Message, Role as MsgRole};
 
 const MIN_FENCE_LEN: usize = 3;
@@ -23,7 +23,7 @@ fn fenced(text: &str) -> String {
 }
 
 pub fn tool_kind(name: &str) -> ToolKind {
-    let entry = match ToolRegistry::native().get(name) {
+    let entry = match ToolRegistry::global().get(name) {
         Some(e) => e,
         None => return ToolKind::Other,
     };
@@ -100,18 +100,6 @@ fn input_path(raw_input: Option<&serde_json::Value>) -> Option<std::path::PathBu
         .and_then(|v| v.get("path"))
         .and_then(|v| v.as_str())
         .map(std::path::PathBuf::from)
-}
-
-pub fn batch_inner_start(event: &BatchProgressEvent) -> SessionUpdate {
-    let title = event.summary.clone().unwrap_or_else(|| event.tool.clone());
-    SessionUpdate::ToolCall(
-        ToolCall::new(
-            ToolCallId::from(format!("{}__{}", event.batch_id, event.index)),
-            title,
-        )
-        .kind(tool_kind(&event.tool))
-        .status(ToolCallStatus::InProgress),
-    )
 }
 
 pub fn tool_output(id: &str, content: &str) -> SessionUpdate {
@@ -282,22 +270,6 @@ mod tests {
     #[test_case("has ```rust\ncode\n``` inside", "````\nhas ```rust\ncode\n``` inside\n````" ; "fence_longer_than_inner_backticks")]
     fn fenced_wraps_in_code_block(input: &str, expected: &str) {
         assert_eq!(fenced(input), expected);
-    }
-
-    #[test_case(Some("import"), "import"; "summary_becomes_title")]
-    #[test_case(None, "grep"; "title_falls_back_to_tool_name")]
-    fn batch_inner_start_composite_id_and_title(summary: Option<&str>, title: &str) {
-        let event = BatchProgressEvent {
-            batch_id: "b1".into(),
-            index: 2,
-            tool: "grep".into(),
-            status: maki_agent::BatchToolStatus::InProgress,
-            output: None,
-            summary: summary.map(Into::into),
-        };
-        let json = serde_json::to_value(batch_inner_start(&event)).unwrap();
-        assert_eq!(json["toolCallId"], "b1__2");
-        assert_eq!(json["title"], title);
     }
 
     #[test_case(None; "missing_stop_reason")]

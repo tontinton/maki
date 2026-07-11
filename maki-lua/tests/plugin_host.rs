@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use maki_agent::ToolInput as ToolInputEvent;
 use maki_agent::tools::{ToolRegistry, ToolSource, timeout_annotation};
 use maki_config::{AlwaysThinking, PluginsConfig, ToolOutputLines};
 use maki_lua::{PluginError, PluginHost};
@@ -20,17 +19,44 @@ fn builtins_host() -> (Arc<ToolRegistry>, PluginHost) {
 }
 
 fn exec_tool(reg: &ToolRegistry, name: &str, input: serde_json::Value) -> Result<String, String> {
+    exec_tool_in(reg, name, input, None)
+}
+
+fn exec_tool_in(
+    reg: &ToolRegistry,
+    name: &str,
+    input: serde_json::Value,
+    registry_override: Option<Arc<ToolRegistry>>,
+) -> Result<String, String> {
+    exec_output_in(reg, name, input, registry_override).map(|out| match out {
+        maki_agent::ToolOutput::Plain(s) => s.text,
+        other => panic!("unexpected output: {other:?}"),
+    })
+}
+
+fn exec_tool_output(
+    reg: &ToolRegistry,
+    name: &str,
+    input: serde_json::Value,
+) -> Result<maki_agent::ToolOutput, String> {
+    exec_output_in(reg, name, input, None)
+}
+
+fn exec_output_in(
+    reg: &ToolRegistry,
+    name: &str,
+    input: serde_json::Value,
+    registry_override: Option<Arc<ToolRegistry>>,
+) -> Result<maki_agent::ToolOutput, String> {
     let entry = reg
         .get(name)
         .unwrap_or_else(|| panic!("tool {name} not registered"));
     let inv = entry.tool.parse(&input).expect("parse failed");
-    let ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
-    smol::block_on(async { inv.execute(&ctx).await })
-        .output
-        .map(|out| match out {
-            maki_agent::ToolOutput::Plain(s) => s.text,
-            other => panic!("unexpected output: {other:?}"),
-        })
+    let mut ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
+    if let Some(r) = registry_override {
+        ctx.registry = r;
+    }
+    smol::block_on(async { inv.execute(&ctx).await }).output
 }
 
 const ECHO_PLUGIN: &str = r#"
@@ -62,7 +88,8 @@ const INVALID_PERMISSION_SCOPE_ERR: &str = "not in schema properties or not type
 const BAD_NAME_SRC: &str = r#"name = "bad name!", description = "test""#;
 const EMPTY_DESC_SRC: &str = r#"name = "valid_name", description = """#;
 const EMPTY_AUD_SRC: &str = r#"name = "no_aud", description = "test", audiences = {}"#;
-const UNKNOWN_AUGMENT_SRC: &str = r#"name = "aug_bad", description = "test", augment = "nope""#;
+const UNKNOWN_AUD_SRC: &str =
+    r#"name = "bad_aud", description = "test", audiences = { "wurkflow" }"#;
 const STRING_EXAMPLES_SRC: &str = r#"name = "ex_bad", description = "test", examples = "[]""#;
 const TIMEOUT_FIELD_NOT_IN_SCHEMA_SRC: &str = r#"name = "to_bad", description = "test", start_annotation = { field = "timeout", kind = "timeout" }"#;
 const NON_STRING_FIELD_SCHEMA: &str = r#"{
@@ -89,8 +116,6 @@ const ARRAY_SCHEMA: &str = r#"{
     required = { "edits" },
 }"#;
 
-const START_INPUT_MISSING_FIELD_SRC: &str = r#"name = "si_bad", description = "test", start_input = { field = "code", language = "python" }"#;
-const START_INPUT_WRONG_TYPE_SRC: &str = r#"name = "si_bad2", description = "test", start_input = { field = "count", language = "python" }"#;
 const START_ANNOTATION_COUNT_NON_ARRAY_SRC: &str =
     r#"name = "sa_bad", description = "test", start_annotation = "name""#;
 const STRING_NAME_SCHEMA: &str = r#"{
@@ -167,7 +192,7 @@ fn unload_round_trip() {
 #[test_case::test_case(BAD_NAME_SRC, "invalid name" ; "invalid_tool_name")]
 #[test_case::test_case(EMPTY_DESC_SRC, "description must be non-empty" ; "empty_description")]
 #[test_case::test_case(EMPTY_AUD_SRC, "audiences" ; "empty_audiences")]
-#[test_case::test_case(UNKNOWN_AUGMENT_SRC, "unknown augment" ; "unknown_augment")]
+#[test_case::test_case(UNKNOWN_AUD_SRC, "unknown audience" ; "unknown_audience")]
 #[test_case::test_case(STRING_EXAMPLES_SRC, "'examples' must be a table" ; "string_examples")]
 #[test_case::test_case(TIMEOUT_FIELD_NOT_IN_SCHEMA_SRC, "not type 'integer'" ; "timeout_field_not_in_schema")]
 fn registration_validation_rejects(fields: &str, expected_err: &str) {
@@ -248,6 +273,135 @@ fn tool_kind_flows_to_trait() {
     host.load_source("kind_plugin", &src).unwrap();
     let entry = reg.get("my_fetcher").expect("tool not registered");
     assert_eq!(entry.tool.tool_kind(), Some("fetch"));
+}
+
+#[test]
+fn get_tool_returns_header_and_restore_handles() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+
+    let src = format!(
+        r#"
+        maki.api.register_tool({{
+            name = "styled_tool",
+            description = "t",
+            schema = {STRING_FIELD_SCHEMA},
+            handler = function() return "ok" end,
+            header = function(input) return "H:" .. input.url end,
+            restore = function() return {{}} end,
+        }})
+        maki.api.register_tool({{
+            name = "handle_probe",
+            description = "p",
+            schema = {MINIMAL_SCHEMA},
+            handler = function()
+                local t = maki.api.get_tool("styled_tool")
+                if not t then return nil, "not found" end
+                local missing = maki.api.get_tool("nope_tool")
+                local plain = maki.api.get_tool("handle_probe")
+                return table.concat({{
+                    t.name,
+                    type(t.header),
+                    type(t.restore),
+                    t.header({{ url = "abc" }}),
+                    tostring(missing == nil),
+                    type(plain.header),
+                }}, "|")
+            end
+        }})
+        "#,
+    );
+    host.load_source("get_tool_plugin", &src).unwrap();
+
+    let out = exec_tool(&reg, "handle_probe", serde_json::json!({})).unwrap();
+    assert_eq!(out, "styled_tool|function|function|H:abc|true|nil");
+}
+
+#[test]
+fn handler_state_flows_to_tool_output_and_serde() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let src = format!(
+        r#"maki.api.register_tool({{
+            name = "stateful",
+            description = "t",
+            schema = {MINIMAL_SCHEMA},
+            handler = function()
+                return {{ llm_output = "done", state = {{ n = 3, tag = "hi" }} }}
+            end
+        }})"#,
+    );
+    host.load_source("state_plugin", &src).unwrap();
+
+    let entry = reg.get("stateful").unwrap();
+    let inv = entry.tool.parse(&serde_json::json!({})).unwrap();
+    let ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
+    let out = smol::block_on(async { inv.execute(&ctx).await })
+        .output
+        .unwrap();
+    let expected = serde_json::json!({ "n": 3, "tag": "hi" });
+    assert_eq!(out.state(), Some(&expected));
+
+    let json = serde_json::to_string(&out).unwrap();
+    let parsed: maki_agent::ToolOutput = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed.state(), Some(&expected), "state must survive serde");
+}
+
+#[test_case::test_case(true, "n=3 tag=hi" ; "state_present")]
+#[test_case::test_case(false, "no state" ; "state_absent_falls_back")]
+fn restore_reads_persisted_state(with_state: bool, expected: &str) {
+    let state = with_state.then(|| serde_json::json!({ "n": 3, "tag": "hi" }));
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let src = format!(
+        r#"maki.api.register_tool({{
+            name = "state_restore",
+            description = "t",
+            schema = {MINIMAL_SCHEMA},
+            handler = function() return "ok" end,
+            restore = function(input, output, is_error, rctx)
+                local buf = maki.ui.buf()
+                local s = rctx:state()
+                if s == nil then
+                    buf:line("no state")
+                else
+                    buf:line("n=" .. tostring(s.n) .. " tag=" .. s.tag)
+                end
+                return buf
+            end
+        }})"#,
+    );
+    host.load_source("state_restore_plugin", &src).unwrap();
+    let handle = host.event_handle().expect("event handle available");
+    let (tx, rx) = flume::unbounded();
+
+    handle.request_restore(
+        maki_lua::RestoreItem {
+            tool: Arc::from("state_restore"),
+            tool_use_id: "restore_id".to_owned(),
+            output: "ok".to_owned(),
+            input: serde_json::json!({}),
+            is_error: false,
+            tool_output_lines: ToolOutputLines::default(),
+            theme_gen: None,
+            clicks: Vec::new(),
+            state,
+        },
+        maki_agent::EventSender::new(tx, 0),
+    );
+    let _ = handle.collect_prompt_slots();
+
+    let mut text = String::new();
+    for env in rx.drain() {
+        if let maki_agent::AgentEvent::ToolSnapshot { snapshot, .. } = env.event {
+            for line in snapshot.lines.iter() {
+                for span in &line.spans {
+                    text.push_str(&span.text);
+                }
+            }
+        }
+    }
+    assert!(text.contains(expected), "expected {expected:?} in: {text}");
 }
 
 #[test]
@@ -822,6 +976,41 @@ fn async_job_callback_error_surfaces() {
     assert!(err.contains("callback exploded"), "got: {err}");
 }
 
+/// Runs `tool`, whose handler parks on `jobstart("sleep 30")` until a
+/// click lands, while this thread keeps re-sending clicks until it
+/// finishes. Clicks are fire-and-forget, so the loop self-corrects: only a
+/// click delivered while the handler is registered can finish the tool.
+fn click_until_finished(
+    host: &PluginHost,
+    reg: &ToolRegistry,
+    tool: &str,
+    click_id: &'static str,
+) -> String {
+    let eh = host.event_handle().expect("event handle available");
+    let entry = reg.get(tool).expect("tool registered");
+    let inv = entry.tool.parse(&serde_json::json!({})).expect("parse");
+    let worker = std::thread::spawn(move || {
+        let ctx = maki_agent::tools::test_support::stub_ctx_with(
+            &maki_agent::AgentMode::Build,
+            None,
+            Some(click_id),
+        );
+        smol::block_on(inv.execute(&ctx)).output
+    });
+    for _ in 0..500 {
+        if worker.is_finished() {
+            break;
+        }
+        eh.request_click(click_id.to_owned(), 0);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let out = worker.join().expect("worker thread").expect("tool output");
+    match out {
+        maki_agent::ToolOutput::Plain(s) => s.text,
+        other => panic!("unexpected output: {other:?}"),
+    }
+}
+
 #[test]
 fn live_click_reaches_running_tool() {
     const LIVE_CLICK_ID: &str = "live-click-1";
@@ -844,29 +1033,116 @@ fn live_click_reaches_running_tool() {
         }})"#,
     );
     host.load_source("live_click", &src).unwrap();
-    let eh = host.event_handle().expect("event handle available");
-    let entry = reg.get("live_click").expect("tool registered");
-    let inv = entry.tool.parse(&serde_json::json!({})).expect("parse");
-    let worker = std::thread::spawn(move || {
-        let ctx = maki_agent::tools::test_support::stub_ctx_with(
-            &maki_agent::AgentMode::Build,
-            None,
-            Some(LIVE_CLICK_ID),
-        );
-        smol::block_on(inv.execute(&ctx)).output
-    });
-    for _ in 0..500 {
-        if worker.is_finished() {
-            break;
-        }
-        eh.request_click(LIVE_CLICK_ID.to_owned());
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    let out = worker.join().expect("worker thread").expect("tool output");
-    match out {
-        maki_agent::ToolOutput::Plain(s) => assert_eq!(s.text, CLICKED_MSG),
-        other => panic!("unexpected output: {other:?}"),
-    }
+    assert_eq!(
+        click_until_finished(&host, &reg, "live_click", LIVE_CLICK_ID),
+        CLICKED_MSG
+    );
+}
+
+/// With several bufs holding click handlers, `request_click` must reach
+/// the buf passed to `ctx:live_buf` (the root), not the first-created
+/// fallback.
+#[test]
+fn live_click_routes_to_root_buf_among_many() {
+    const ROOT_CLICK_ID: &str = "root-click-1";
+    const ROOT_MSG: &str = "root_clicked";
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let src = format!(
+        r#"maki.api.register_tool({{
+            name = "root_click",
+            description = "decoy buf registers a click first",
+            schema = {MINIMAL_SCHEMA},
+            audiences = {{ "main" }},
+            handler = function(input, ctx)
+                local decoy = maki.ui.buf()
+                decoy:on("click", function() ctx:finish("decoy_clicked") end)
+                local root = maki.ui.buf()
+                root:on("click", function() ctx:finish("{ROOT_MSG}") end)
+                ctx:live_buf(root)
+                maki.fn.jobstart("sleep 30", {{}})
+            end
+        }})"#,
+    );
+    host.load_source("root_click", &src).unwrap();
+    assert_eq!(
+        click_until_finished(&host, &reg, "root_click", ROOT_CLICK_ID),
+        ROOT_MSG
+    );
+}
+
+/// `maki.agent.call_tool` returns `(text, err, annotation)` and delivers the
+/// child's live buf through `on_live_buf`.
+#[test]
+fn call_tool_returns_annotation_and_streams_live_buf() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let src = format!(
+        r#"
+maki.api.register_tool({{
+    name = "annotated_child",
+    description = "returns an annotation",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function(input, ctx)
+        return {{ llm_output = "child_done", annotation = "5 items" }}
+    end
+}})
+maki.api.register_tool({{
+    name = "streaming_child",
+    description = "publishes a live buf then finishes",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function(input, ctx)
+        local buf = maki.ui.buf()
+        buf:line("streamed line")
+        ctx:live_buf(buf)
+        return "stream_done"
+    end
+}})
+maki.api.register_tool({{
+    name = "failing_child",
+    description = "always errors",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function(input, ctx)
+        return {{ llm_output = "boom", is_error = true }}
+    end
+}})
+maki.api.register_tool({{
+    name = "driver",
+    description = "dispatches children via maki.agent.call_tool",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function(input, ctx)
+        local text, err, ann = maki.agent.call_tool(ctx, "annotated_child", {{}})
+        local live_text = "none"
+        local text2, _, ann2 = maki.agent.call_tool(ctx, "streaming_child", {{}}, {{
+            on_live_buf = function(b)
+                local lines = b:get_lines()
+                live_text = lines[1] and lines[1][1] and lines[1][1][1] or "empty"
+            end,
+        }})
+        local _, err3, ann3 = maki.agent.call_tool(ctx, "failing_child", {{}})
+        return tostring(text) .. "/" .. tostring(ann)
+            .. " " .. tostring(text2) .. "/" .. live_text .. "/" .. tostring(ann2)
+            .. " " .. tostring(err3) .. "/" .. tostring(ann3)
+    end
+}})
+"#,
+    );
+    host.load_source("call_tool_live", &src).unwrap();
+    let out = exec_tool_in(
+        &reg,
+        "driver",
+        serde_json::json!({}),
+        Some(Arc::clone(&reg)),
+    )
+    .expect("driver ok");
+    assert_eq!(
+        out,
+        "child_done/5 items stream_done/streamed line/1 lines boom/nil"
+    );
 }
 
 #[test]
@@ -1240,7 +1516,8 @@ fn restore_tool_async_ordering_and_delivery() {
         is_error: true,
         tool_output_lines: ToolOutputLines::default(),
         theme_gen: None,
-        expanded: false,
+        clicks: Vec::new(),
+        state: None,
     };
     let unknown_item = maki_lua::RestoreItem {
         tool: Arc::from("definitely_not_a_tool"),
@@ -1250,7 +1527,8 @@ fn restore_tool_async_ordering_and_delivery() {
         is_error: false,
         tool_output_lines: ToolOutputLines::default(),
         theme_gen: None,
-        expanded: false,
+        clicks: Vec::new(),
+        state: None,
     };
 
     handle.request_restore(unknown_item, event_tx.clone());
@@ -1316,7 +1594,8 @@ fn restore_rebuilds_body_from_input_content(
             is_error: false,
             tool_output_lines: ToolOutputLines::default(),
             theme_gen: None,
-            expanded: true,
+            clicks: vec![0],
+            state: None,
         },
         maki_agent::EventSender::new(tx, 0),
     );
@@ -1584,30 +1863,132 @@ fn runaway_allocation_hits_memory_limit_instead_of_oom() {
 }
 
 #[test]
-fn start_input_happy_path() {
+fn start_hook_publishes_live_buf_for_tool_use_id() {
+    let (reg, _host) = start_hook_fixture();
+    let rx = run_start(&reg, "st_tool", serde_json::json!({"code": "line1\nline2"}));
+    let body = recv_live_buf(&rx, START_TOOL_USE_ID).expect("start must publish a LiveToolBuf");
+    let text = body.take().text();
+    assert!(text.contains("line1"), "preview must render input: {text}");
+}
+
+#[test]
+fn start_hook_error_does_not_fail_tool() {
+    let (reg, _host) = start_hook_fixture();
+    let _rx = run_start(&reg, "st_boom", serde_json::json!({"code": "x"}));
+    let out = exec_tool(&reg, "st_boom", serde_json::json!({"code": "x"})).expect("handler ok");
+    assert_eq!(out, "handled");
+}
+
+#[test]
+fn start_skipped_for_tool_without_start_fn() {
+    let (reg, _host) = start_hook_fixture();
+    let rx = run_start(&reg, "st_plain", serde_json::json!({"code": "x"}));
+    assert!(
+        recv_live_buf(&rx, START_TOOL_USE_ID).is_none(),
+        "no start fn must mean no preview"
+    );
+}
+
+/// `start` runs before permission checks, so its ctx is not a `LuaCtx` and
+/// `maki.agent.call_tool` (which borrows `LuaCtx`) rejects it outright.
+#[test]
+fn start_ctx_cannot_dispatch_tools() {
+    let (reg, _host) = start_hook_fixture();
+    let rx = run_start(&reg, "st_probe", serde_json::json!({"code": "x"}));
+    let body = recv_live_buf(&rx, START_TOOL_USE_ID).expect("probe publishes a buf");
+    let text = body.take().text();
+    assert_eq!(
+        text, "call_tool_rejected finish_missing set_deadline_missing",
+        "StartCtx must expose no dispatch/finish/deadline capability"
+    );
+}
+
+const START_TOOL_USE_ID: &str = "start-tu-1";
+
+fn start_hook_fixture() -> (Arc<ToolRegistry>, PluginHost) {
+    let src = format!(
+        r#"
+local function preview(input, ctx)
+    local buf = maki.ui.buf()
+    buf:set_lines({{ input.code }})
+    ctx:live_buf(buf)
+end
+maki.api.register_tool({{
+    name = "st_tool",
+    description = "test",
+    schema = {CODE_SCHEMA},
+    start = preview,
+    handler = function(input, ctx) return "handled" end,
+}})
+maki.api.register_tool({{
+    name = "st_boom",
+    description = "test",
+    schema = {CODE_SCHEMA},
+    start = function(input, ctx) error("boom") end,
+    handler = function(input, ctx) return "handled" end,
+}})
+maki.api.register_tool({{
+    name = "st_plain",
+    description = "test",
+    schema = {CODE_SCHEMA},
+    handler = function(input, ctx) return "handled" end,
+}})
+maki.api.register_tool({{
+    name = "st_probe",
+    description = "test",
+    schema = {CODE_SCHEMA},
+    start = function(input, ctx)
+        local parts = {{}}
+        local ok = pcall(function() return maki.agent.call_tool(ctx, "st_plain", {{ code = "x" }}) end)
+        parts[1] = ok and "call_tool_allowed" or "call_tool_rejected"
+        parts[2] = ctx.finish == nil and "finish_missing" or "finish_present"
+        parts[3] = ctx.set_deadline == nil and "set_deadline_missing" or "set_deadline_present"
+        local buf = maki.ui.buf()
+        buf:set_lines({{ table.concat(parts, " ") }})
+        ctx:live_buf(buf)
+    end,
+    handler = function(input, ctx) return "handled" end,
+}})
+"#
+    );
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    let src = format!(
-        r#"maki.api.register_tool({{
-            name = "si_ok",
-            description = "test",
-            schema = {CODE_SCHEMA},
-            start_input = {{ field = "code", language = "python" }},
-            handler = function(input, ctx) return "" end
-        }})"#,
+    host.load_source("start_hooks", &src).unwrap();
+    (reg, host)
+}
+
+/// `start` is awaited to completion, so the returned receiver already holds
+/// everything the hook emitted.
+fn run_start(
+    reg: &ToolRegistry,
+    name: &str,
+    input: serde_json::Value,
+) -> flume::Receiver<maki_agent::Envelope> {
+    let (tx, rx) = flume::unbounded::<maki_agent::Envelope>();
+    let event_tx = maki_agent::EventSender::new(tx, 0);
+    let ctx = maki_agent::tools::test_support::stub_ctx_with(
+        &maki_agent::AgentMode::Build,
+        Some(&event_tx),
+        Some(START_TOOL_USE_ID),
     );
-    host.load_source("si_ok_plugin", &src).unwrap();
-    let entry = reg.get("si_ok").expect("tool not registered");
-    let inv = entry
+    let inv = reg
+        .get(name)
+        .unwrap_or_else(|| panic!("tool {name} not registered"))
         .tool
-        .parse(&serde_json::json!({"code": "print('hi')"}))
+        .parse(&input)
         .expect("parse failed");
-    let result = inv.start_input().expect("expected Some");
-    assert!(matches!(
-        result,
-        ToolInputEvent::Script { language, code }
-            if language == "python" && code == "print('hi')"
-    ));
+    smol::block_on(inv.start(&ctx));
+    rx
+}
+
+fn recv_live_buf(
+    rx: &flume::Receiver<maki_agent::Envelope>,
+    id: &str,
+) -> Option<Arc<maki_agent::SharedBuf>> {
+    rx.drain().find_map(|env| match env.event {
+        maki_agent::AgentEvent::LiveToolBuf { id: got, body } if got == id => Some(body),
+        _ => None,
+    })
 }
 
 #[test]
@@ -1654,8 +2035,6 @@ fn start_annotation_count_happy_path() {
     assert_eq!(inv.start_annotation(), Some("3 edits".to_owned()));
 }
 
-#[test_case::test_case(START_INPUT_MISSING_FIELD_SRC, MINIMAL_SCHEMA, "not in schema properties or not type 'string'" ; "start_input_validation_missing_field")]
-#[test_case::test_case(START_INPUT_WRONG_TYPE_SRC, NON_STRING_FIELD_SCHEMA, "not in schema properties or not type 'string'" ; "start_input_validation_wrong_type")]
 #[test_case::test_case(START_ANNOTATION_COUNT_NON_ARRAY_SRC, STRING_NAME_SCHEMA, "not in schema properties or not type 'array'" ; "start_annotation_count_non_array")]
 fn registration_with_schema_rejects(fields: &str, schema: &str, expected_err: &str) {
     let reg = fresh_registry();
@@ -1689,8 +2068,6 @@ fn interpreter_on_output_streams_lines() {
                 local result, err = maki.interpreter.run("print('a')\nprint('b')", {{
                     timeout = 10,
                     max_memory_mb = 50,
-                    buf = maki.ui.buf(),
-                    agent_ctx = ctx:agent_context(),
                     on_output = function(line)
                         table.insert(lines, line)
                     end,
@@ -1703,4 +2080,390 @@ fn interpreter_on_output_streams_lines() {
     host.load_source("interp_stream_plugin", &src).unwrap();
     let out = exec_tool(&reg, "interp_stream", serde_json::json!({})).unwrap();
     assert_eq!(out, "a|b;stdout=a\nb");
+}
+
+const SESSION_CLOSED_ERR: &str = "session closed";
+
+fn interp_tool_plugin(name: &str, python: &str, tools_lua: &str) -> String {
+    format!(
+        r#"maki.api.register_tool({{
+            name = "{name}",
+            description = "test",
+            schema = {MINIMAL_SCHEMA},
+            audiences = {{ "main" }},
+            handler = function(input, ctx)
+                local lines = {{}}
+                local result, err = maki.interpreter.run("{python}", {{
+                    timeout = 10,
+                    max_memory_mb = 50,
+                    on_output = function(line) table.insert(lines, line) end,
+                    tools = {tools_lua},
+                }})
+                if err then return "err: " .. err end
+                return table.concat(lines, "|")
+            end
+        }})"#
+    )
+}
+
+#[test]
+fn interpreter_tools_fn_map_kwargs_reach_lua_tool() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let src = interp_tool_plugin(
+        "interp_tools",
+        r"r = await greet(name='bob')\nprint(r)",
+        "{ greet = function(input) return 'hi:' .. input.name end }",
+    );
+    host.load_source("interp_tools_plugin", &src).unwrap();
+    let out = exec_tool(&reg, "interp_tools", serde_json::json!({})).unwrap();
+    assert_eq!(out, "hi:bob");
+}
+
+#[test]
+fn interpreter_tools_nil_err_pair_fails_call() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let src = interp_tool_plugin(
+        "interp_err",
+        r"await bad()",
+        "{ bad = function(input) return nil, 'boom' end }",
+    );
+    host.load_source("interp_err_plugin", &src).unwrap();
+    let out = exec_tool(&reg, "interp_err", serde_json::json!({})).unwrap();
+    assert!(out.starts_with("err: "), "got: {out}");
+    assert!(out.contains("boom"), "got: {out}");
+}
+
+#[test]
+fn interpreter_tools_gather_resolves_parallel_batch() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let src = interp_tool_plugin(
+        "interp_gather",
+        r"import asyncio\nasync def main():\n    a, b = await asyncio.gather(t_a(), t_b())\n    print(a + '|' + b)\nawait main()",
+        "{ t_a = function(input) return 'A' end, t_b = function(input) return 'B' end }",
+    );
+    host.load_source("interp_gather_plugin", &src).unwrap();
+    let out = exec_tool(&reg, "interp_gather", serde_json::json!({})).unwrap();
+    assert_eq!(out, "A|B");
+}
+
+#[test]
+fn call_tool_resolves_lua_tool_and_reports_unknown() {
+    let reg = Arc::clone(ToolRegistry::global_arc());
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source("echo_plugin", ECHO_PLUGIN).unwrap();
+    let src = format!(
+        r#"maki.api.register_tool({{
+            name = "call_tool_probe",
+            description = "test",
+            schema = {MINIMAL_SCHEMA},
+            audiences = {{ "main" }},
+            handler = function(input, ctx)
+                local out, err = maki.agent.call_tool(ctx, "echo_", {{ msg = "hello" }})
+                if err ~= nil then return "unexpected err: " .. err end
+                local out2, err2 = maki.agent.call_tool(ctx, "no_such_tool_xyz", {{}})
+                if out2 ~= nil then return "unexpected output: " .. out2 end
+                if err2 == nil then return "expected err for unknown tool" end
+                return out
+            end
+        }})"#
+    );
+    host.load_source("call_tool_plugin", &src).unwrap();
+    let out = exec_tool_in(
+        &reg,
+        "call_tool_probe",
+        serde_json::json!({}),
+        Some(Arc::clone(&reg)),
+    )
+    .unwrap();
+    assert_eq!(out, "hello");
+    host.unload("call_tool_plugin").unwrap();
+    host.unload("echo_plugin").unwrap();
+}
+
+#[test]
+fn session_close_idempotent_and_prompt_after_close_errors() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let src = format!(
+        r#"maki.api.register_tool({{
+            name = "session_probe",
+            description = "test",
+            schema = {MINIMAL_SCHEMA},
+            audiences = {{ "main" }},
+            handler = function(input, ctx)
+                local sess = maki.agent.session(ctx, {{}})
+                sess:close()
+                sess:close()
+                local result, err = sess:prompt("x")
+                if result ~= nil then return "unexpected result" end
+                return err or "no error"
+            end
+        }})"#
+    );
+    host.load_source("session_plugin", &src).unwrap();
+    let out = exec_tool(&reg, "session_probe", serde_json::json!({})).unwrap();
+    assert_eq!(out, SESSION_CLOSED_ERR);
+}
+
+#[test_case::test_case("{ audience = 'wurkflow' }", "unknown audience: wurkflow" ; "unknown_audience")]
+#[test_case::test_case("{ local_tools = { foo = { handler = function() return '' end } } }", "local_tools.foo: 'description' is required" ; "local_tool_missing_description")]
+#[test_case::test_case("{ local_tools = { foo = { description = 'd' } } }", "local_tools.foo: 'handler' is required" ; "local_tool_missing_handler")]
+fn session_opts_validation_rejects(opts: &str, expected: &str) {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let src = format!(
+        r#"maki.api.register_tool({{
+            name = "session_opts_probe",
+            description = "test",
+            schema = {MINIMAL_SCHEMA},
+            audiences = {{ "main" }},
+            handler = function(input, ctx)
+                maki.agent.session(ctx, {opts})
+                return "no error"
+            end
+        }})"#
+    );
+    host.load_source("session_opts_plugin", &src).unwrap();
+    let err = exec_tool(&reg, "session_opts_probe", serde_json::json!({})).unwrap_err();
+    assert!(err.contains(expected), "got: {err}");
+}
+
+fn load_img_tool(host: &PluginHost) {
+    let src = format!(
+        r#"maki.api.register_tool({{
+            name = "img_probe",
+            description = "test",
+            schema = {MINIMAL_SCHEMA},
+            audiences = {{ "main" }},
+            handler = function(input, ctx)
+                return {{
+                    llm_output = "[image: test 1x1]",
+                    image = {{ media_type = "image/png", data = "aGVsbG8=" }},
+                }}
+            end
+        }})"#
+    );
+    host.load_source("img_plugin", &src).unwrap();
+}
+
+#[test]
+fn lua_tool_image_reply_maps_to_image_output() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    load_img_tool(&host);
+    let out = exec_tool_output(&reg, "img_probe", serde_json::json!({})).unwrap();
+    let maki_agent::ToolOutput::Image { source, text } = out else {
+        panic!("expected Image output, got {out:?}");
+    };
+    assert_eq!(source.media_type, maki_agent::ImageMediaType::Png);
+    assert_eq!(&*source.data, "aGVsbG8=");
+    assert_eq!(text, "[image: test 1x1]");
+}
+
+#[test]
+fn call_tool_flattens_image_output_with_not_visible_note() {
+    use maki_agent::tools::interpreter_bridge::IMAGE_NOT_VISIBLE_NOTE;
+
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    load_img_tool(&host);
+    let src = format!(
+        r#"maki.api.register_tool({{
+            name = "img_caller",
+            description = "test",
+            schema = {MINIMAL_SCHEMA},
+            audiences = {{ "main" }},
+            handler = function(input, ctx)
+                local out, err = maki.agent.call_tool(ctx, "img_probe", {{}})
+                return err or out
+            end
+        }})"#
+    );
+    host.load_source("img_caller_plugin", &src).unwrap();
+    let out = exec_tool_in(
+        &reg,
+        "img_caller",
+        serde_json::json!({}),
+        Some(Arc::clone(&reg)),
+    )
+    .unwrap();
+    assert_eq!(out, format!("[image: test 1x1] ({IMAGE_NOT_VISIBLE_NOTE})"));
+}
+
+#[test]
+fn view_image_tool_returns_image_output() {
+    use base64::Engine as _;
+
+    let (reg, _host) = builtins_host();
+
+    // The code_execution bridge flattens output to text, so view_image is
+    // pointless from the interpreter.
+    let audience = reg.get("view_image").unwrap().tool.audience();
+    assert!(audience.contains(maki_agent::tools::ToolAudience::MAIN));
+    assert!(!audience.contains(maki_agent::tools::ToolAudience::INTERPRETER));
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tiny.png");
+    let img = image::DynamicImage::new_rgb8(4, 2);
+    img.save_with_format(&path, image::ImageFormat::Png)
+        .unwrap();
+
+    let out = exec_tool_output(
+        &reg,
+        "view_image",
+        serde_json::json!({"path": path.to_str().unwrap()}),
+    )
+    .unwrap();
+    let maki_agent::ToolOutput::Image { source, text } = out else {
+        panic!("expected Image output, got {out:?}");
+    };
+    assert_eq!(source.media_type, maki_agent::ImageMediaType::Png);
+    assert!(text.contains("tiny.png"), "caption: {text}");
+    assert!(text.contains("4x2"), "caption: {text}");
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(&*source.data)
+        .unwrap();
+    assert_eq!(decoded, std::fs::read(&path).unwrap());
+}
+
+#[test]
+fn view_image_tool_rejects_non_image() {
+    let (reg, _host) = builtins_host();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("notes.txt");
+    std::fs::write(&path, "plain text").unwrap();
+    let err = exec_tool_output(
+        &reg,
+        "view_image",
+        serde_json::json!({"path": path.to_str().unwrap()}),
+    )
+    .unwrap_err();
+    assert!(err.contains("not an image"), "got: {err}");
+}
+
+fn probe_output(data: &str) -> (image::ImageFormat, u32, u32) {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .unwrap();
+    let reader = image::ImageReader::new(std::io::Cursor::new(&bytes))
+        .with_guessed_format()
+        .unwrap();
+    let format = reader.format().unwrap();
+    let (w, h) = reader.into_dimensions().unwrap();
+    (format, w, h)
+}
+
+#[test]
+fn view_image_downscales_oversized_png_with_honest_caption() {
+    let (reg, _host) = builtins_host();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("wide.png");
+    image::DynamicImage::new_rgb8(2000, 100)
+        .save_with_format(&path, image::ImageFormat::Png)
+        .unwrap();
+
+    let out = exec_tool_output(
+        &reg,
+        "view_image",
+        serde_json::json!({"path": path.to_str().unwrap()}),
+    )
+    .unwrap();
+    let maki_agent::ToolOutput::Image { source, text } = out else {
+        panic!("expected Image output, got {out:?}");
+    };
+    assert_eq!(source.media_type, maki_agent::ImageMediaType::Png);
+    assert!(text.contains("downscaled from 2000x100"), "caption: {text}");
+
+    let (format, w, h) = probe_output(&source.data);
+    assert_eq!(format, image::ImageFormat::Png);
+    assert_eq!(w, 1568, "long edge must land exactly on the API limit");
+    assert!(h <= 79, "aspect ratio broken: {w}x{h}");
+    // Caption must report the dimensions actually shipped, not the original.
+    assert!(text.contains(&format!("{w}x{h}")), "caption: {text}");
+}
+
+#[test]
+fn view_image_oversized_gif_reencodes_to_png_first_frame() {
+    let (reg, _host) = builtins_host();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("banner.gif");
+    image::DynamicImage::new_rgb8(2000, 8)
+        .save_with_format(&path, image::ImageFormat::Gif)
+        .unwrap();
+
+    let out = exec_tool_output(
+        &reg,
+        "view_image",
+        serde_json::json!({"path": path.to_str().unwrap()}),
+    )
+    .unwrap();
+    let maki_agent::ToolOutput::Image { source, text } = out else {
+        panic!("expected Image output, got {out:?}");
+    };
+    // gif encoding is unsupported, so downscaling forces png; the caption
+    // must confess the downscale and the lost animation.
+    assert_eq!(source.media_type, maki_agent::ImageMediaType::Png);
+    assert!(text.contains("downscaled from 2000x8"), "caption: {text}");
+    assert!(text.contains("first frame only"), "caption: {text}");
+    assert_eq!(probe_output(&source.data).0, image::ImageFormat::Png);
+}
+
+#[test]
+fn view_image_small_gif_passes_through_unchanged() {
+    use base64::Engine as _;
+
+    let (reg, _host) = builtins_host();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tiny.gif");
+    image::DynamicImage::new_rgb8(4, 2)
+        .save_with_format(&path, image::ImageFormat::Gif)
+        .unwrap();
+
+    let out = exec_tool_output(
+        &reg,
+        "view_image",
+        serde_json::json!({"path": path.to_str().unwrap()}),
+    )
+    .unwrap();
+    let maki_agent::ToolOutput::Image { source, text } = out else {
+        panic!("expected Image output, got {out:?}");
+    };
+    assert_eq!(source.media_type, maki_agent::ImageMediaType::Gif);
+    assert!(
+        !text.contains("first frame only"),
+        "pass-through keeps animation, caption must not claim otherwise: {text}"
+    );
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(&*source.data)
+        .unwrap();
+    assert_eq!(
+        decoded,
+        std::fs::read(&path).unwrap(),
+        "under-limit gif must ship byte-identical, not re-encoded"
+    );
+}
+
+#[test]
+fn interpreter_bridge_flattens_image_with_visibility_note() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    load_img_tool(&host);
+
+    let mut ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
+    ctx.registry = Arc::clone(&reg);
+    let out = smol::block_on(maki_agent::tools::interpreter_bridge::dispatch(
+        &ctx,
+        "img_probe",
+        &serde_json::json!({}),
+    ))
+    .unwrap();
+    assert!(out.starts_with("[image: test 1x1]"), "got: {out}");
+    assert!(
+        out.contains(maki_agent::tools::interpreter_bridge::IMAGE_NOT_VISIBLE_NOTE),
+        "got: {out}"
+    );
 }

@@ -29,6 +29,7 @@ pub const DEFAULT_MAX_CONTINUATION_TURNS: u32 = 3;
 pub const DEFAULT_COMPACTION_BUFFER: u32 = 40_000;
 pub const DEFAULT_SEARCH_RESULT_LIMIT: usize = 100;
 pub const DEFAULT_INTERPRETER_MAX_MEMORY_MB: usize = 50;
+pub const DEFAULT_TASK_MAX_CONCURRENT: usize = 8;
 
 pub const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
 pub const DEFAULT_LOW_SPEED_TIMEOUT_SECS: u64 = 120;
@@ -50,6 +51,7 @@ pub const MIN_MAX_CONTINUATION_TURNS: u32 = 1;
 pub const MIN_COMPACTION_BUFFER: u32 = 1_000;
 pub const MIN_SEARCH_RESULT_LIMIT: usize = 10;
 pub const MIN_INTERPRETER_MAX_MEMORY_MB: usize = 10;
+pub const MIN_TASK_MAX_CONCURRENT: usize = 1;
 pub const MIN_MOUSE_SCROLL_LINES: u32 = 1;
 pub const MIN_TOOL_OUTPUT_LINES: usize = 1;
 pub const MIN_MAX_LOG_BYTES_MB: u64 = 1;
@@ -62,6 +64,7 @@ pub const MIN_STREAM_TIMEOUT_SECS: u64 = 10;
 
 pub const DEFAULT_BUILTINS: &[&str] = &[
     "bash",
+    "batch",
     "code_execution",
     "edit",
     "glob",
@@ -74,6 +77,7 @@ pub const DEFAULT_BUILTINS: &[&str] = &[
     "skill",
     "task",
     "todo_write",
+    "view_image",
     "webfetch",
     "websearch",
     "write",
@@ -127,6 +131,13 @@ pub const TOP_LEVEL_FIELDS: &[ConfigField] = &[
         default: ConfigValue::Bool(false),
         min: None,
         description: "Start every session with Anthropic fast mode (Opus only; ignored otherwise)",
+    },
+    ConfigField {
+        name: "always_workflow",
+        ty: "bool",
+        default: ConfigValue::Bool(false),
+        min: None,
+        description: "Start every session with workflow mode (task callable inside code_execution)",
     },
     ConfigField {
         name: "always_thinking",
@@ -205,6 +216,7 @@ impl AlwaysThinking {
 pub struct RawConfig {
     pub always_yolo: Option<bool>,
     pub always_fast: Option<bool>,
+    pub always_workflow: Option<bool>,
     pub always_thinking: Option<AlwaysThinking>,
     #[serde(default)]
     pub ui: UiFileConfig,
@@ -217,7 +229,14 @@ pub struct RawConfig {
 
 impl RawConfig {
     pub fn merge(&mut self, overlay: RawConfig) {
-        merge_option!(self, overlay, always_yolo, always_fast, always_thinking);
+        merge_option!(
+            self,
+            overlay,
+            always_yolo,
+            always_fast,
+            always_workflow,
+            always_thinking
+        );
         self.ui.merge(overlay.ui);
         self.agent.merge(overlay.agent);
         self.provider.merge(overlay.provider);
@@ -241,6 +260,7 @@ impl RawConfig {
         Ok(Config {
             always_yolo: self.always_yolo.unwrap_or(false),
             always_fast: self.always_fast.unwrap_or(false),
+            always_workflow: self.always_workflow.unwrap_or(false),
             always_thinking: self
                 .always_thinking
                 .map(AlwaysThinking::resolve)
@@ -269,6 +289,7 @@ pub struct UiFileConfig {
     pub flash_duration_ms: Option<u64>,
     pub typewriter_ms_per_char: Option<u64>,
     pub mouse_scroll_lines: Option<u32>,
+    pub show_thinking: Option<bool>,
     pub tool_output_lines: Option<ToolOutputLinesFile>,
 }
 
@@ -281,7 +302,8 @@ impl UiFileConfig {
             scrollbar,
             flash_duration_ms,
             typewriter_ms_per_char,
-            mouse_scroll_lines
+            mouse_scroll_lines,
+            show_thinking
         );
         match (self.tool_output_lines.as_mut(), overlay.tool_output_lines) {
             (Some(base), Some(over)) => base.merge(over),
@@ -336,6 +358,7 @@ pub struct AgentFileConfig {
     pub compaction_buffer: Option<u32>,
     pub search_result_limit: Option<usize>,
     pub interpreter_max_memory_mb: Option<usize>,
+    pub task_max_concurrent: Option<usize>,
 }
 
 impl AgentFileConfig {
@@ -352,7 +375,8 @@ impl AgentFileConfig {
             max_continuation_turns,
             compaction_buffer,
             search_result_limit,
-            interpreter_max_memory_mb
+            interpreter_max_memory_mb,
+            task_max_concurrent
         );
     }
 }
@@ -491,6 +515,7 @@ pub struct PermissionsConfig {
 pub struct Config {
     pub always_yolo: bool,
     pub always_fast: bool,
+    pub always_workflow: bool,
     pub always_thinking: Option<StoredThinking>,
     pub ui: UiConfig,
     pub agent: AgentConfig,
@@ -518,6 +543,12 @@ pub struct UiConfig {
     #[config(default = DEFAULT_MOUSE_SCROLL_LINES, min = MIN_MOUSE_SCROLL_LINES, desc = "Lines per mouse wheel scroll")]
     pub mouse_scroll_lines: u32,
 
+    #[config(
+        default = true,
+        desc = "When true (default), show full model reasoning live and persisted. When false, hide reasoning behind an indicator (thinking> ...) with a click-to-expand hint, both while thinking and after it completes"
+    )]
+    pub show_thinking: bool,
+
     #[config(skip, default = "ToolOutputLines::default()")]
     pub tool_output_lines: ToolOutputLines,
 }
@@ -536,6 +567,7 @@ impl UiConfig {
                 .typewriter_ms_per_char
                 .unwrap_or(DEFAULT_TYPEWRITER_MS_PER_CHAR),
             mouse_scroll_lines: f.mouse_scroll_lines.unwrap_or(DEFAULT_MOUSE_SCROLL_LINES),
+            show_thinking: f.show_thinking.unwrap_or(true),
             tool_output_lines: ToolOutputLines::from_file(f.tool_output_lines),
         }
     }
@@ -682,6 +714,9 @@ pub struct AgentConfig {
     #[config(default = DEFAULT_INTERPRETER_MAX_MEMORY_MB, min = MIN_INTERPRETER_MAX_MEMORY_MB, desc = "Memory limit for code interpreter (MB)")]
     pub interpreter_max_memory_mb: usize,
 
+    #[config(default = DEFAULT_TASK_MAX_CONCURRENT, min = MIN_TASK_MAX_CONCURRENT, desc = "Max concurrently running subagents (task tool)")]
+    pub task_max_concurrent: usize,
+
     #[config(skip, default = false)]
     pub no_rtk: bool,
 
@@ -727,6 +762,9 @@ impl AgentConfig {
             interpreter_max_memory_mb: file
                 .interpreter_max_memory_mb
                 .unwrap_or(DEFAULT_INTERPRETER_MAX_MEMORY_MB),
+            task_max_concurrent: file
+                .task_max_concurrent
+                .unwrap_or(DEFAULT_TASK_MAX_CONCURRENT),
             index_max_file_size: index_file_config
                 .max_file_size_mb
                 .unwrap_or(DEFAULT_MAX_FILE_SIZE_MB)
@@ -1255,25 +1293,58 @@ mod tests {
     }
 
     #[test]
-    fn merge_always_fast_and_thinking_overlay_wins() {
+    fn merge_always_flags_overlay_wins() {
         let mut base = RawConfig {
             always_fast: Some(false),
+            always_workflow: Some(false),
             always_thinking: Some(AlwaysThinking::Mode("off".into())),
             ..Default::default()
         };
         let overlay = RawConfig {
             always_fast: Some(true),
+            always_workflow: Some(true),
             always_thinking: Some(AlwaysThinking::Toggle(true)),
             ..Default::default()
         };
         base.merge(overlay);
 
         assert_eq!(base.always_fast, Some(true), "overlay wins");
+        assert_eq!(base.always_workflow, Some(true), "overlay wins");
         assert_eq!(
             base.always_thinking,
             Some(AlwaysThinking::Toggle(true)),
             "overlay wins"
         );
+    }
+
+    #[test]
+    fn always_workflow_resolves_default_and_set() {
+        let defaults = RawConfig::default().into_config(false).unwrap();
+        assert!(!defaults.always_workflow, "absent resolves to false");
+
+        let raw = RawConfig {
+            always_workflow: Some(true),
+            ..Default::default()
+        };
+        assert!(raw.into_config(false).unwrap().always_workflow);
+    }
+
+    #[test]
+    fn task_max_concurrent_resolves_default_and_set() {
+        let defaults = RawConfig::default().into_config(false).unwrap();
+        assert_eq!(
+            defaults.agent.task_max_concurrent,
+            DEFAULT_TASK_MAX_CONCURRENT
+        );
+
+        let raw = RawConfig {
+            agent: AgentFileConfig {
+                task_max_concurrent: Some(3),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(raw.into_config(false).unwrap().agent.task_max_concurrent, 3);
     }
 
     #[test_case(AlwaysThinking::Toggle(true), StoredThinking::Adaptive ; "toggle_true")]
@@ -1312,6 +1383,7 @@ mod tests {
     #[test_case("max_line_bytes",    0 ; "zero_line_bytes")]
     #[test_case("max_output_bytes",  500 ; "below_min_output_bytes")]
     #[test_case("max_line_bytes",    10 ; "below_min_line_bytes")]
+    #[test_case("task_max_concurrent", 0 ; "zero_task_max_concurrent")]
     fn validate_rejects_invalid_agent(field: &str, value: usize) {
         let mut config = AgentConfig::default();
         match field {
@@ -1319,6 +1391,7 @@ mod tests {
             "max_output_lines" => config.max_output_lines = value,
             "max_response_bytes" => config.max_response_bytes = value,
             "max_line_bytes" => config.max_line_bytes = value,
+            "task_max_concurrent" => config.task_max_concurrent = value,
             _ => unreachable!(),
         }
         let err = config.validate().unwrap_err();
@@ -1356,6 +1429,7 @@ mod tests {
         let mut config = Config {
             always_yolo: false,
             always_fast: false,
+            always_workflow: false,
             always_thinking: None,
             ui: UiConfig::default(),
             agent: AgentConfig::default(),
@@ -1730,6 +1804,25 @@ mod tests {
             Some(true),
             "overlay-only key added"
         );
+    }
+
+    #[test]
+    fn show_thinking_deserializes_true() {
+        let raw: RawConfig = toml::from_str("[ui]\nshow_thinking = true\n").unwrap();
+        assert!(raw.ui.show_thinking.unwrap());
+    }
+
+    #[test]
+    fn show_thinking_deserializes_false() {
+        let raw: RawConfig = toml::from_str("[ui]\nshow_thinking = false\n").unwrap();
+        assert!(!raw.ui.show_thinking.unwrap());
+    }
+
+    #[test]
+    fn show_thinking_missing_defaults_true() {
+        let raw: RawConfig = toml::from_str("").unwrap();
+        let config = raw.into_config(false).unwrap();
+        assert!(config.ui.show_thinking);
     }
 
     #[test_case("[ui]\nsplash_animaton = true\n" ; "top_level_typo")]

@@ -144,6 +144,7 @@ pub mod key {
     pub const OPEN_EDITOR: Bind = ctrl_bind!('o');
     pub const PLAN_TOGGLE: Bind = ctrl_bind!('t');
     pub const TASKS: Bind = ctrl_bind!('x');
+    pub const REFRESH: Bind = ctrl_bind!('r');
     pub const SUSPEND: Bind = ctrl_bind!('z');
     pub const DELETE: Bind = ctrl_bind!('d');
     pub const KILL_LINE: Bind = ctrl_bind!('k');
@@ -512,6 +513,18 @@ pub const KEYBINDS: &[Keybind] = &[
     Keybind {
         label: KeyLabel::Single("Type"),
         description: "Filter",
+        context: KeybindContext::Picker,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Alt("PageUp", "PageDown"),
+        description: "Scroll page up / down",
+        context: KeybindContext::Picker,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Alt(key::SCROLL_HALF_UP.label, key::SCROLL_HALF_DOWN.label),
+        description: "Scroll page up / down",
         context: KeybindContext::Picker,
         platform: Platform::All,
     },

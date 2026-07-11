@@ -9,7 +9,6 @@
 use std::fmt::{self, Display, Formatter, Write};
 
 use jsonrepair::{Options as RepairOpts, loads as repair_loads};
-use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use tracing::{debug, warn};
 
@@ -147,7 +146,7 @@ pub fn to_json_schema(s: &ParamSchema) -> Value {
     }
 }
 
-/// Leaks everything to get `&'static` lifetimes matching native tool schemas.
+/// Leaks everything to get `&'static` lifetimes for `ParamSchema`.
 /// The leaked set is small and fixed per session, so this is fine.
 pub fn try_from_json(v: &Value) -> Result<&'static ParamSchema, String> {
     let description: &'static str = v
@@ -659,23 +658,6 @@ fn log_coercion(
         coerced = %preview(&coerced.to_string()),
         "coerced tool param type"
     );
-}
-
-/// Validate first so the LLM gets our structured errors, then hand off to
-/// serde for defaults, renames, and tagged enums. If serde fails after
-/// validation passed, the schema is out of sync with the Rust type, not
-/// the model's fault, so we report `InternalBug`.
-pub(crate) fn validate_and_deserialize<T: DeserializeOwned>(
-    schema: &ParamSchema,
-    input: Value,
-) -> Result<T, ToolInputError> {
-    let validated = validate(schema, input)?;
-    serde_json::from_value(validated).map_err(|e| ToolInputError {
-        path: JsonPath::default(),
-        kind: ToolInputErrorKind::InternalBug {
-            detail: e.to_string(),
-        },
-    })
 }
 
 #[cfg(test)]

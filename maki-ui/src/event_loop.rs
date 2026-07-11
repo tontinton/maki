@@ -24,6 +24,7 @@ use crate::agent::{AgentCommand, AgentHandles, ModelSlot, shared_queue::QueueIte
 use crate::app::shell::{ShellEvent, spawn_shell};
 use crate::app::{App, Msg};
 use crate::components::input::Submission;
+use crate::components::usage_modal::UsageFetchState;
 use crate::components::{Action, ExitRequest, Status};
 
 use crate::storage_writer::StorageWriter;
@@ -474,6 +475,7 @@ impl<'t> EventLoop<'t> {
                     && let Ok(mut new_model) = Model::from_spec(&loaded.model_spec)
                     && let Ok(new_provider) = from_model(&mut new_model, self.timeouts)
                 {
+                    self.app.usage_slot.store(None);
                     self.model_slot.store(Arc::new(ModelSlot {
                         model: new_model,
                         provider: Arc::from(new_provider),
@@ -540,6 +542,7 @@ impl<'t> EventLoop<'t> {
             }
             Action::Suspend => terminal::suspend(self.terminal),
             Action::RefreshModels => self.refresh_models(),
+            Action::RefreshUsage => self.refresh_usage(),
             Action::Quit => {}
         }
     }
@@ -549,6 +552,8 @@ impl<'t> EventLoop<'t> {
             Ok(mut new_model) => match from_model(&mut new_model, self.timeouts) {
                 Ok(new_provider) => {
                     self.app.update_model(&new_model);
+                    self.app.record_recent_model(&spec);
+                    self.app.usage_slot.store(None);
                     self.model_slot.store(Arc::new(ModelSlot {
                         model: new_model,
                         provider: Arc::from(new_provider),
@@ -570,6 +575,21 @@ impl<'t> EventLoop<'t> {
         .detach();
     }
 
+    fn refresh_usage(&self) {
+        let provider = Arc::clone(&self.model_slot.load().provider);
+        let slot = Arc::clone(&self.app.usage_slot);
+        slot.store(Some(Arc::new(UsageFetchState::Loading)));
+        smol::spawn(async move {
+            let state = match provider.fetch_usage().await {
+                Ok(Some(usage)) => UsageFetchState::Ready(usage),
+                Ok(None) => UsageFetchState::Unsupported,
+                Err(e) => UsageFetchState::Error(e.user_message()),
+            };
+            slot.store(Some(Arc::new(state)));
+        })
+        .detach();
+    }
+
     fn refresh_provider(&mut self, slug: String) {
         let current = self.model_slot.load();
         let current_model = &current.model;
@@ -577,6 +597,7 @@ impl<'t> EventLoop<'t> {
         if current_model.provider.to_string() == slug {
             let mut m = current_model.clone();
             if let Ok(provider) = maki_providers::provider::from_model(&mut m, self.timeouts) {
+                self.app.usage_slot.store(None);
                 self.model_slot.store(Arc::new(ModelSlot {
                     model: m,
                     provider: Arc::from(provider),

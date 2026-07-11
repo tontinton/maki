@@ -1,30 +1,35 @@
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use flume::Sender;
 use maki_agent::prompt::{PromptId, Slot, SlotKind, ValidNames};
 use maki_agent::tools::Tool;
+use maki_agent::tools::registry::{RegisteredTool, ToolRegistry};
 use maki_agent::tools::schema::{ParamSchema, to_json_schema, try_from_json, validate};
 use maki_agent::tools::{
     BoxFuture, Deadline, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError,
-    PermissionScopes, ToolAudience, ToolContext, ToolExecResult, ToolInvocation,
-    build_interpreter_tools_description, timeout_annotation,
+    PermissionScopes, ToolAudience, ToolContext, ToolExecResult, ToolFilter, ToolInvocation,
+    is_tool_enabled, timeout_annotation,
 };
 use maki_agent::{
-    AgentEvent, BufferSnapshot, InstructionBlock, SharedBuf, TextOutput,
-    ToolInput as ToolInputEvent, ToolOutput,
+    AgentEvent, BufferSnapshot, ImageMediaType, ImageSource, InstructionBlock, SharedBuf,
+    TextOutput, ToolOutput,
 };
 use mlua::{
     Function, Lua, LuaSerdeExt, RegistryKey, Result as LuaResult, Table, Value as LuaValue,
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::api::ui::buf::BufHandle;
 use crate::api::util::command::{
     CommandEntry, CommandHandlerMap, LuaCommandWriter, publish_command_snapshot,
 };
+use crate::api::util::convert::json_to_lua;
 use crate::api::util::ctx::LuaCtx;
 use crate::runtime::{HintContent, LiveCtx, PromptHintCallbacks, PromptHintRegistration, Request};
 
@@ -33,16 +38,50 @@ const TOOL_HANDLER_RETURN_ERR: &str =
     "tool handler must return string or {output=string, is_error?=bool}";
 const TIMEOUT_PARSE_ERR: &str = "register_tool: 'timeout' must be a positive number, 0, or false";
 const MAX_HINT_CONTENT_SIZE: usize = 1024 * 1024;
+const DESCRIBE_TIMEOUT: Duration = Duration::from_secs(3);
 
-#[derive(Clone, Copy)]
-pub(crate) enum DescriptionAugment {
-    InterpreterTools,
+type DescribeFn = Box<dyn Fn(&str, &str, &Value) -> Option<String>>;
+
+thread_local! {
+    /// Lives on the Lua runtime thread only. Calling `Request::Describe` from
+    /// that same thread would self-deadlock, so we resolve in-thread instead.
+    static LOCAL_DESCRIBE: RefCell<Option<DescribeFn>> = const { RefCell::new(None) };
 }
 
-#[derive(Clone)]
-pub(crate) struct StartInputConfig {
-    field: Arc<str>,
-    language: Arc<str>,
+pub(crate) fn set_local_describe(f: impl Fn(&str, &str, &Value) -> Option<String> + 'static) {
+    LOCAL_DESCRIBE.with(|c| *c.borrow_mut() = Some(Box::new(f)));
+}
+
+fn local_describe(plugin: &str, tool: &str, dctx: &Value) -> Option<Option<String>> {
+    LOCAL_DESCRIBE.with(|c| c.borrow().as_ref().map(|f| f(plugin, tool, dctx)))
+}
+
+type ToolHandles = (Option<Function>, Option<Function>);
+type ToolHandlesFn = Box<dyn Fn(&str) -> Option<ToolHandles>>;
+
+thread_local! {
+    static LOCAL_TOOL_HANDLES: RefCell<Option<ToolHandlesFn>> = const { RefCell::new(None) };
+}
+
+pub(crate) fn set_local_tool_handles(f: impl Fn(&str) -> Option<ToolHandles> + 'static) {
+    LOCAL_TOOL_HANDLES.with(|c| *c.borrow_mut() = Some(Box::new(f)));
+}
+
+fn local_tool_handles(tool: &str) -> Option<ToolHandles> {
+    LOCAL_TOOL_HANDLES.with(|c| c.borrow().as_ref().and_then(|f| f(tool)))
+}
+
+fn dctx_json(ctx: &DescriptionContext) -> Value {
+    let mut obj = json!({
+        "audience": ctx.audience.name().unwrap_or("main"),
+        "workflow": ctx.workflow,
+    });
+    match ctx.filter {
+        ToolFilter::All => {}
+        ToolFilter::Only(names) => obj["only"] = json!(names),
+        ToolFilter::AllExcept(names) => obj["except"] = json!(names),
+    }
+    obj
 }
 
 #[derive(Clone)]
@@ -66,14 +105,14 @@ pub(crate) struct PendingTool {
     pub(crate) handler_key: RegistryKey,
     pub(crate) header_key: Option<RegistryKey>,
     pub(crate) restore_key: Option<RegistryKey>,
+    pub(crate) start_key: Option<RegistryKey>,
     pub(crate) permission_scope_kind: Option<PermissionScopeKind>,
     pub(crate) permission_scopes_key: Option<RegistryKey>,
     pub(crate) mutable_path_field: Option<Arc<str>>,
     pub(crate) timeout: Option<Duration>,
     pub(crate) start_annotation: Option<StartAnnotation>,
-    pub(crate) start_input: Option<StartInputConfig>,
     pub(crate) examples: Option<Value>,
-    pub(crate) augment: Option<DescriptionAugment>,
+    pub(crate) describe_key: Option<RegistryKey>,
 }
 
 pub(crate) type PendingTools = Arc<Mutex<Vec<PendingTool>>>;
@@ -87,13 +126,13 @@ pub(crate) struct LuaTool {
     pub(crate) tx: Sender<Request>,
     pub(crate) plugin: Arc<str>,
     pub(crate) has_header_fn: bool,
+    pub(crate) has_start_fn: bool,
     pub(crate) permission_scope_kind: Option<PermissionScopeKind>,
     pub(crate) mutable_path_field: Option<Arc<str>>,
     pub(crate) timeout: Option<Duration>,
     pub(crate) start_annotation: Option<StartAnnotation>,
-    pub(crate) start_input: Option<StartInputConfig>,
     pub(crate) examples: Option<Value>,
-    pub(crate) augment: Option<DescriptionAugment>,
+    pub(crate) has_describe_fn: bool,
 }
 
 impl Tool for LuaTool {
@@ -102,14 +141,38 @@ impl Tool for LuaTool {
     }
 
     fn description(&self, ctx: &DescriptionContext) -> Cow<'_, str> {
-        match self.augment {
-            Some(DescriptionAugment::InterpreterTools) => Cow::Owned(format!(
-                "{}{}",
-                self.description,
-                build_interpreter_tools_description(ctx.filter)
-            )),
-            None => Cow::Borrowed(&self.description),
+        if !self.has_describe_fn {
+            return Cow::Borrowed(&self.description);
         }
+        let dctx = dctx_json(ctx);
+        if let Some(result) = local_describe(&self.plugin, &self.name, &dctx) {
+            return match result {
+                Some(s) => Cow::Owned(s),
+                None => Cow::Borrowed(&self.description),
+            };
+        }
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        let sent = self
+            .tx
+            .send(Request::Describe {
+                plugin: Arc::clone(&self.plugin),
+                tool: Arc::clone(&self.name),
+                dctx,
+                reply: reply_tx,
+            })
+            .is_ok();
+        if sent {
+            match reply_rx.recv_timeout(DESCRIBE_TIMEOUT) {
+                Ok(Some(s)) => return Cow::Owned(s),
+                Ok(None) => {}
+                Err(e) => tracing::warn!(
+                    tool = %self.name,
+                    error = %e,
+                    "describe round trip failed; falling back to static description"
+                ),
+            }
+        }
+        Cow::Borrowed(&self.description)
     }
 
     fn schema(&self) -> Value {
@@ -145,13 +208,13 @@ impl Tool for LuaTool {
             tool: Arc::clone(&self.name),
             plugin: Arc::clone(&self.plugin),
             has_header_fn: self.has_header_fn,
+            has_start_fn: self.has_start_fn,
             input: validated,
             tx: self.tx.clone(),
             permission_state,
             mutable_path_field: self.mutable_path_field.clone(),
             timeout: self.timeout,
             start_annotation: self.start_annotation.clone(),
-            start_input: self.start_input.clone(),
         }))
     }
 }
@@ -165,13 +228,13 @@ struct LuaToolInvocation {
     tool: Arc<str>,
     plugin: Arc<str>,
     has_header_fn: bool,
+    has_start_fn: bool,
     input: Value,
     tx: Sender<Request>,
     permission_state: PermissionState,
     mutable_path_field: Option<Arc<str>>,
     timeout: Option<Duration>,
     start_annotation: Option<StartAnnotation>,
-    start_input: Option<StartInputConfig>,
 }
 
 impl ToolInvocation for LuaToolInvocation {
@@ -227,12 +290,28 @@ impl ToolInvocation for LuaToolInvocation {
         }
     }
 
-    fn start_input(&self) -> Option<ToolInputEvent> {
-        let cfg = self.start_input.as_ref()?;
-        let code = self.input.get(cfg.field.as_ref())?.as_str()?.to_owned();
-        Some(ToolInputEvent::Script {
-            language: cfg.language.to_string(),
-            code,
+    fn start<'a>(&'a self, ctx: &'a ToolContext) -> BoxFuture<'a, ()> {
+        let id = ctx.tool_use_id.as_ref().filter(|_| self.has_start_fn);
+        let Some(id) = id else {
+            return Box::pin(std::future::ready(()));
+        };
+        let (reply_tx, reply_rx) = flume::bounded::<()>(1);
+        let req = Request::StartTool {
+            plugin: Arc::clone(&self.plugin),
+            tool: Arc::clone(&self.tool),
+            input: self.input.clone(),
+            live: LiveCtx {
+                event_tx: ctx.event_tx.clone(),
+                tool_use_id: id.clone(),
+            },
+            tool_output_lines: ctx.tool_output_lines,
+            reply: reply_tx,
+        };
+        let tx = self.tx.clone();
+        Box::pin(async move {
+            if tx.send_async(req).await.is_ok() {
+                let _ = reply_rx.recv_async().await;
+            }
         })
     }
 
@@ -309,7 +388,7 @@ impl ToolInvocation for LuaToolInvocation {
                 finish_tx: None,
                 file_tracker: ctx.file_tracker.clone(),
                 loaded_instructions: ctx.loaded_instructions.clone(),
-                agent: Some(crate::api::util::ctx::AgentContext::from(ctx)),
+                agent: crate::api::util::ctx::AgentContext::from(ctx),
             };
 
             if tx
@@ -368,9 +447,13 @@ impl ToolInvocation for LuaToolInvocation {
                     }
                     let format = reply.format;
                     let instructions = reply.instructions;
+                    let image = reply.image;
+                    let state = reply.state;
                     ToolExecResult {
                         output: reply.result.map(|s| {
-                            if let Some(diff) = reply.diff {
+                            if let Some(source) = image {
+                                ToolOutput::Image { source, text: s }
+                            } else if let Some(diff) = reply.diff {
                                 ToolOutput::Diff {
                                     summary: s,
                                     path: diff.path,
@@ -378,12 +461,10 @@ impl ToolInvocation for LuaToolInvocation {
                                     after: diff.after,
                                 }
                             } else {
-                                let inner = match instructions {
-                                    Some(blocks) if !blocks.is_empty() => TextOutput {
-                                        text: s,
-                                        instructions: Some(blocks),
-                                    },
-                                    _ => s.into(),
+                                let inner = TextOutput {
+                                    text: s,
+                                    instructions: instructions.filter(|b| !b.is_empty()),
+                                    state,
                                 };
                                 match format {
                                     LuaOutputFormat::Markdown => ToolOutput::Markdown(inner),
@@ -569,7 +650,75 @@ pub(crate) fn create_api_table(
         })?,
     )?;
 
+    t.set("get_tools", lua.create_function(get_tools_from_lua)?)?;
+    t.set("get_tool", lua.create_function(get_tool_from_lua)?)?;
+
     Ok(t)
+}
+
+/// Registry snapshot without descriptions (avoids recursion from describe callbacks).
+fn get_tools_from_lua(lua: &Lua, opts: Option<Table>) -> LuaResult<Table> {
+    let registry = lua
+        .app_data_ref::<Arc<ToolRegistry>>()
+        .map(|r| Arc::clone(&r))
+        .ok_or_else(|| mlua::Error::runtime("get_tools: tool registry not available"))?;
+    let mut disabled: Vec<String> = Vec::new();
+    if let Some(o) = opts
+        && let Some(config) = o.get::<Option<Table>>("config")?
+    {
+        disabled = config
+            .get::<Option<Vec<String>>>("disabled_tools")?
+            .unwrap_or_default();
+    }
+
+    let out = lua.create_table()?;
+    for (i, entry) in registry.iter().iter().enumerate() {
+        let t = tool_entry_to_lua(lua, entry)?;
+        t.set("enabled", is_tool_enabled(&disabled, entry.name()))?;
+        out.set(i + 1, t)?;
+    }
+    Ok(out)
+}
+
+fn tool_entry_to_lua(lua: &Lua, entry: &RegisteredTool) -> LuaResult<Table> {
+    let audience = entry.tool.audience();
+    let audiences = lua.create_table()?;
+    for (flag, name) in maki_agent::tools::registry::AUDIENCE_NAMES {
+        if audience.contains(*flag) {
+            audiences.push(*name)?;
+        }
+    }
+    let t = lua.create_table()?;
+    t.set("name", entry.name())?;
+    t.set("schema", json_to_lua(lua, &entry.tool.schema())?)?;
+    t.set("audiences", audiences)?;
+    if let Some(kind) = entry.tool.tool_kind() {
+        t.set("kind", kind)?;
+    }
+    Ok(t)
+}
+
+/// Single-tool lookup that also hands out `header`/`restore` function
+/// handles for Lua tools (nil for MCP or missing tools). Kept apart from
+/// `get_tools` so the listing stays a cheap data-only snapshot.
+fn get_tool_from_lua(lua: &Lua, name: String) -> LuaResult<LuaValue> {
+    let registry = lua
+        .app_data_ref::<Arc<ToolRegistry>>()
+        .map(|r| Arc::clone(&r))
+        .ok_or_else(|| mlua::Error::runtime("get_tool: tool registry not available"))?;
+    let Some(entry) = registry.get(&name) else {
+        return Ok(LuaValue::Nil);
+    };
+    let t = tool_entry_to_lua(lua, &entry)?;
+    if let Some((header, restore)) = local_tool_handles(&name) {
+        if let Some(f) = header {
+            t.set("header", f)?;
+        }
+        if let Some(f) = restore {
+            t.set("restore", f)?;
+        }
+    }
+    Ok(LuaValue::Table(t))
 }
 
 fn is_valid_tool_name(name: &str) -> bool {
@@ -595,13 +744,8 @@ fn parse_audience(audiences: Option<mlua::Table>) -> LuaResult<ToolAudience> {
         count += 1;
         flags |= match s.as_str() {
             "all" => ToolAudience::all(),
-            "main" => ToolAudience::MAIN,
-            "research_sub" => ToolAudience::RESEARCH_SUB,
-            "general_sub" => ToolAudience::GENERAL_SUB,
-            "interpreter" => ToolAudience::INTERPRETER,
-            _ => {
-                return Err(mlua::Error::runtime(format!("unknown audience: {s}")));
-            }
+            other => ToolAudience::parse_name(other)
+                .ok_or_else(|| mlua::Error::runtime(format!("unknown audience: {other}")))?,
         };
     }
     if count == 0 {
@@ -679,35 +823,6 @@ fn parse_start_annotation(spec: &Table, schema: &Value) -> LuaResult<Option<Star
     }
 }
 
-fn parse_start_input(spec: &Table, schema: &Value) -> LuaResult<Option<StartInputConfig>> {
-    let Some(tbl) = spec_opt::<Table>(spec, "start_input", "a table")? else {
-        return Ok(None);
-    };
-
-    let field: String = tbl
-        .get("field")
-        .map_err(|_| mlua::Error::runtime("register_tool: start_input.field required"))?;
-    let language: String = tbl
-        .get("language")
-        .map_err(|_| mlua::Error::runtime("register_tool: start_input.language required"))?;
-    check_schema_field(schema, "start_input", &field, "string")?;
-
-    Ok(Some(StartInputConfig {
-        field: Arc::from(field.as_str()),
-        language: Arc::from(language.as_str()),
-    }))
-}
-
-fn parse_augment(spec: &Table) -> LuaResult<Option<DescriptionAugment>> {
-    match spec_opt::<String>(spec, "augment", "a string")?.as_deref() {
-        None => Ok(None),
-        Some("interpreter_tools") => Ok(Some(DescriptionAugment::InterpreterTools)),
-        Some(other) => Err(mlua::Error::runtime(format!(
-            "register_tool: unknown augment '{other}' (expected 'interpreter_tools')"
-        ))),
-    }
-}
-
 fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> LuaResult<()> {
     let name: String = spec
         .get("name")
@@ -754,6 +869,7 @@ fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> Lua
 
     let header_fn: Option<Function> = spec.get("header").ok();
     let restore_fn: Option<Function> = spec.get("restore").ok();
+    let start_fn: Option<Function> = spec.get("start").ok();
     let kind: Option<Arc<str>> = spec
         .get::<String>("kind")
         .ok()
@@ -768,9 +884,12 @@ fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> Lua
     let restore_key = restore_fn
         .map(|f| lua.create_registry_value(f))
         .transpose()?;
+    let start_key = start_fn.map(|f| lua.create_registry_value(f)).transpose()?;
 
-    let start_input = parse_start_input(spec, &schema_val)?;
-    let augment = parse_augment(spec)?;
+    let describe_fn: Option<Function> = spec.get("describe").ok();
+    let describe_key = describe_fn
+        .map(|f| lua.create_registry_value(f))
+        .transpose()?;
 
     let examples: Option<Value> =
         spec_opt::<Table>(spec, "examples", "a table (array of example inputs)")?
@@ -792,14 +911,14 @@ fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> Lua
             handler_key,
             header_key,
             restore_key,
+            start_key,
             permission_scope_kind,
             permission_scopes_key,
             mutable_path_field,
             timeout,
             start_annotation,
-            start_input,
             examples,
-            augment,
+            describe_key,
         });
 
     Ok(())
@@ -875,11 +994,15 @@ pub(crate) struct ToolCallReply {
     pub instructions: Option<Vec<InstructionBlock>>,
     pub written_path: Option<String>,
     pub diff: Option<DiffPayload>,
+    /// Set via `image = { media_type = "image/png", data = <base64> }` in the
+    /// handler return; becomes `ToolOutput::Image` with `llm_output` as caption.
+    pub image: Option<ImageSource>,
+    pub state: Option<Value>,
 }
 
 impl ToolCallReply {
     pub fn from_lua_value(val: &LuaValue) -> Self {
-        let result = coerce_tool_result(val);
+        let mut result = coerce_tool_result(val);
         let LuaValue::Table(t) = val else {
             return Self::plain(result);
         };
@@ -897,6 +1020,21 @@ impl ToolCallReply {
             before: t.get::<String>("diff_before").ok().unwrap_or_default(),
             after: t.get::<String>("diff_after").ok().unwrap_or_default(),
         });
+        // A malformed image fails the call; dropping it silently would leave
+        // a caption claiming pixels the model never receives.
+        let image = match extract_image(t) {
+            Ok(image) => image,
+            Err(e) => {
+                result = Err(e);
+                None
+            }
+        };
+        let state = match t.get::<LuaValue>("state") {
+            Ok(LuaValue::Nil) | Err(_) => None,
+            Ok(v) => crate::api::util::convert::lua_to_json(&v)
+                .inspect_err(|e| tracing::warn!(error = %e, "tool state is not JSON-serializable, dropping it"))
+                .ok(),
+        };
         Self {
             result,
             snapshot,
@@ -907,6 +1045,8 @@ impl ToolCallReply {
             instructions,
             written_path,
             diff,
+            image,
+            state,
         }
     }
 
@@ -938,6 +1078,8 @@ impl ToolCallReply {
             instructions: None,
             written_path: None,
             diff: None,
+            image: None,
+            state: None,
         }
     }
 
@@ -958,6 +1100,41 @@ fn extract_format(t: &mlua::Table) -> LuaOutputFormat {
         LUA_FORMAT_PLAIN => LuaOutputFormat::Plain,
         _ => LuaOutputFormat::default(),
     }
+}
+
+fn extract_image(t: &mlua::Table) -> Result<Option<ImageSource>, String> {
+    let entry = match t.get::<LuaValue>("image") {
+        Ok(LuaValue::Table(entry)) => entry,
+        Ok(LuaValue::Nil) | Err(_) => return Ok(None),
+        Ok(other) => {
+            return Err(format!(
+                "tool 'image' field must be a table {{ media_type, data }}, got {}",
+                other.type_name()
+            ));
+        }
+    };
+    let media_type = entry
+        .get::<String>("media_type")
+        .map_err(|_| "tool image is missing 'media_type'".to_owned())?;
+    let media_type = ImageMediaType::from_mime(&media_type).ok_or_else(|| {
+        let supported: Vec<&str> = ImageMediaType::ALL.iter().map(|m| m.mime()).collect();
+        format!(
+            "unsupported tool image media_type '{media_type}' ({})",
+            supported.join(", ")
+        )
+    })?;
+    let data = entry
+        .get::<String>("data")
+        .map_err(|_| "tool image is missing base64 'data'".to_owned())?;
+    // Bad base64 would land in history and fail every later request;
+    // validate once at the boundary.
+    if data.is_empty() {
+        return Err("tool image 'data' is empty".to_owned());
+    }
+    BASE64
+        .decode(data.as_bytes())
+        .map_err(|e| format!("tool image 'data' is not valid base64: {e}"))?;
+    Ok(Some(ImageSource::new(media_type, Arc::from(data))))
 }
 
 fn extract_instructions(t: &mlua::Table) -> Option<Vec<InstructionBlock>> {
@@ -1030,6 +1207,33 @@ mod tests {
         assert_eq!(is_valid_tool_name(name), expected);
     }
 
+    #[test_case::test_case(
+        r#"{ llm_output = "c", image = { data = "aGVsbG8=" } }"#,
+        "missing 'media_type'" ; "missing_media_type")]
+    #[test_case::test_case(
+        r#"{ llm_output = "c", image = { media_type = "image/png" } }"#,
+        "missing base64 'data'" ; "missing_data")]
+    #[test_case::test_case(
+        r#"{ llm_output = "c", image = { media_type = "image/png", data = "" } }"#,
+        "'data' is empty" ; "empty_data")]
+    #[test_case::test_case(
+        r#"{ llm_output = "c", image = "nope" }"#,
+        "must be a table" ; "image_not_a_table")]
+    #[test_case::test_case(
+        r#"{ llm_output = "c", image = { media_type = "image/bmp", data = "aGVsbG8=" } }"#,
+        "unsupported tool image media_type" ; "unsupported_media_type")]
+    #[test_case::test_case(
+        r#"{ llm_output = "c", image = { media_type = "image/png", data = "!!!not base64!!!" } }"#,
+        "not valid base64" ; "data_not_base64")]
+    fn malformed_image_reply_fails_the_call(src: &str, expected: &str) {
+        let lua = Lua::new();
+        let val: LuaValue = lua.load(format!("return {src}")).eval().unwrap();
+        let reply = ToolCallReply::from_lua_value(&val);
+        assert!(reply.image.is_none());
+        let err = reply.result.expect_err("malformed image must error");
+        assert!(err.contains(expected), "got: {err}");
+    }
+
     fn invocation(input: Value) -> LuaToolInvocation {
         let (tx, _rx) = flume::unbounded();
         LuaToolInvocation {
@@ -1042,7 +1246,7 @@ mod tests {
             mutable_path_field: None,
             timeout: Some(Duration::from_secs(60)),
             start_annotation: None,
-            start_input: None,
+            has_start_fn: false,
         }
     }
 
@@ -1057,20 +1261,17 @@ mod tests {
     }
 
     #[test]
-    fn augment_appends_interpreter_signatures_at_description_time() {
+    fn describe_falls_back_to_static_description_when_runtime_unavailable() {
         use maki_agent::tools::ToolFilter;
 
         let mut tool = make_lua_tool(None);
-        tool.augment = Some(DescriptionAugment::InterpreterTools);
+        tool.has_describe_fn = true;
         let ctx = DescriptionContext {
             filter: &ToolFilter::All,
+            audience: ToolAudience::MAIN,
+            workflow: false,
         };
-        let desc = tool.description(&ctx);
-        assert!(desc.starts_with("test"), "base description kept: {desc}");
-        assert!(
-            desc.contains("Available tools (called as Python functions"),
-            "signatures appended: {desc}"
-        );
+        assert_eq!(tool.description(&ctx), "test");
     }
 
     fn make_lua_tool(permission_scope_kind: Option<PermissionScopeKind>) -> LuaTool {
@@ -1097,9 +1298,9 @@ mod tests {
             mutable_path_field: None,
             timeout: Some(Duration::from_secs(60)),
             start_annotation: None,
-            start_input: None,
+            has_start_fn: false,
             examples: None,
-            augment: None,
+            has_describe_fn: false,
         }
     }
 
@@ -1194,7 +1395,7 @@ mod tests {
             mutable_path_field: None,
             timeout: None,
             start_annotation: None,
-            start_input: None,
+            has_start_fn: false,
         };
         let scopes = smol::block_on(inv.permission_scopes()).expect("should fallback");
         assert!(scopes.force_prompt);
@@ -1212,7 +1413,7 @@ mod tests {
             mutable_path_field: None,
             timeout: None,
             start_annotation: None,
-            start_input: None,
+            has_start_fn: false,
         };
         std::thread::spawn(move || {
             if let Ok(Request::ComputePermissionScopes { reply, .. }) = rx2.recv() {
@@ -1236,7 +1437,7 @@ mod tests {
             mutable_path_field: None,
             timeout: None,
             start_annotation: None,
-            start_input: None,
+            has_start_fn: false,
         };
         std::thread::spawn(move || {
             if let Ok(Request::ComputePermissionScopes { reply, .. }) = rx.recv() {
@@ -1276,9 +1477,9 @@ mod tests {
             mutable_path_field: None,
             timeout: Some(Duration::from_secs(60)),
             start_annotation: None,
-            start_input: None,
+            has_start_fn: false,
             examples: None,
-            augment: None,
+            has_describe_fn: false,
         };
         let inv = tool.parse(&serde_json::json!({"count": 42})).unwrap();
         assert!(smol::block_on(inv.permission_scopes()).is_none());
@@ -1475,32 +1676,12 @@ mod tests {
     }
 
     #[test]
-    fn start_input_returns_script_when_field_present() {
+    fn start_without_tool_use_id_is_noop() {
         let inv = LuaToolInvocation {
-            start_input: Some(StartInputConfig {
-                field: Arc::from("code"),
-                language: Arc::from("python"),
-            }),
-            ..invocation(serde_json::json!({"code": "print('hello')"}))
+            has_start_fn: true,
+            ..invocation(serde_json::json!({"code": "x"}))
         };
-        let result = inv.start_input().unwrap();
-        assert!(matches!(
-            result,
-            ToolInputEvent::Script { language, code }
-                if language == "python" && code == "print('hello')"
-        ));
-    }
-
-    #[test_case::test_case(serde_json::json!({"other": "value"}) ; "field_missing")]
-    #[test_case::test_case(serde_json::json!({"code": 42})       ; "field_not_string")]
-    fn start_input_returns_none_on_bad_input(input: Value) {
-        let inv = LuaToolInvocation {
-            start_input: Some(StartInputConfig {
-                field: Arc::from("code"),
-                language: Arc::from("python"),
-            }),
-            ..invocation(input)
-        };
-        assert_eq!(inv.start_input(), None);
+        let ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
+        smol::block_on(inv.start(&ctx));
     }
 }

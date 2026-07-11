@@ -1,9 +1,59 @@
-use mlua::{Lua, LuaSerdeExt, Result as LuaResult, Table, Value};
+use mlua::{Lua, LuaSerdeExt, Result as LuaResult, Table, UserData, UserDataMethods, Value};
 
-use super::util::convert::{err_pair, json_to_lua};
+use super::util::convert::{err_pair, json_to_lua, lua_to_json};
+
+/// Schema compile errors surface at creation time, before spending any tokens.
+struct LuaSchemaValidator {
+    validator: jsonschema::Validator,
+}
+
+impl UserData for LuaSchemaValidator {
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method("validate", |lua, this, value: Value| {
+            let json = lua_to_json(&value)?;
+            let errors: Vec<String> = this
+                .validator
+                .iter_errors(&json)
+                .map(|e| {
+                    let path = e.instance_path.to_string();
+                    if path.is_empty() {
+                        e.to_string()
+                    } else {
+                        format!("at {path}: {e}")
+                    }
+                })
+                .collect();
+            if errors.is_empty() {
+                return Ok(Value::Nil);
+            }
+            let tbl = lua.create_table()?;
+            for (i, err) in errors.into_iter().enumerate() {
+                tbl.set(i + 1, err)?;
+            }
+            Ok(Value::Table(tbl))
+        });
+    }
+}
 
 pub(crate) fn create_json_table(lua: &Lua) -> LuaResult<Table> {
     let json = lua.create_table()?;
+
+    json.set(
+        "schema_validator",
+        lua.create_function(|lua, schema: Value| {
+            let schema_json = match lua_to_json(&schema) {
+                Ok(v) => v,
+                Err(e) => return err_pair(lua, e),
+            };
+            match jsonschema::validator_for(&schema_json) {
+                Ok(validator) => Ok((
+                    Value::UserData(lua.create_userdata(LuaSchemaValidator { validator })?),
+                    Value::Nil,
+                )),
+                Err(e) => err_pair(lua, e),
+            }
+        })?,
+    )?;
 
     json.set(
         "encode",

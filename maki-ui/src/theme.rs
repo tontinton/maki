@@ -133,6 +133,14 @@ pub static BUNDLED_THEMES: &[ThemeEntry] = &[
         toml: include_str!("themes/ayu_dark.toml"),
     },
     ThemeEntry {
+        name: "ayu_light",
+        toml: include_str!("themes/ayu_light.toml"),
+    },
+    ThemeEntry {
+        name: "ayu_mirage",
+        toml: include_str!("themes/ayu_mirage.toml"),
+    },
+    ThemeEntry {
         name: "carbonfox",
         toml: include_str!("themes/carbonfox.toml"),
     },
@@ -288,6 +296,11 @@ pub fn style_by_name(name: &str) -> Style {
         "dim" | "tool_dim" => t.tool_dim,
         "path" | "tool_path" => t.tool_path,
         "tool" => t.tool,
+        "tool_prefix" => t.tool_prefix,
+        "tool_success" => t.tool_success,
+        "tool_error" => t.tool_error,
+        "tool_annotation" => t.tool_annotation,
+        "spinner" => t.spinner,
         "error" => t.error,
         "bold" => t.bold,
         "italic" => t.italic,

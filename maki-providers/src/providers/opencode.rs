@@ -274,20 +274,20 @@ impl Opencode {
         body["model"] = json!(model.id);
         body["stream"] = json!(true);
         let json_body = serde_json::to_vec(&body)?;
-        let mut rb = Request::builder()
-            .method("POST")
-            .uri(format!(
-                "{}{}",
-                auth.base_url.as_deref().unwrap_or(""),
-                MESSAGES_PATH
-            ))
-            .header("user-agent", super::user_agent())
-            .header("content-type", "application/json")
-            .header("anthropic-version", "2023-06-01");
-        for (key, value) in &auth.headers {
-            rb = rb.header(key.as_str(), value.as_str());
-        }
-        let request = rb.body(json_body)?;
+        let request = auth
+            .configure_request(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "{}{}",
+                        auth.base_url.as_deref().unwrap_or(""),
+                        MESSAGES_PATH
+                    ))
+                    .header("user-agent", super::user_agent())
+                    .header("content-type", "application/json")
+                    .header("anthropic-version", "2023-06-01"),
+            )
+            .body(json_body)?;
 
         debug!(model = %model.id, "sending Anthropic-format request via catalog");
 
@@ -463,7 +463,7 @@ fn determine_catalog_format(npm: &str) -> EndpointType {
 
 const ALLOWED_NPM: &[&str] = &["@ai-sdk/openai-compatible", "@ai-sdk/anthropic"];
 
-fn catalog_to_data(index: CatalogIndex) -> CatalogData {
+fn catalog_to_data(index: CatalogIndex, enable_free_models: bool) -> CatalogData {
     let mut entries: HashMap<ModelWithProvider, CatalogMeta> = HashMap::new();
     let mut auths = HashMap::new();
 
@@ -494,6 +494,10 @@ fn catalog_to_data(index: CatalogIndex) -> CatalogData {
                 .and_then(|c| c.output)
                 .unwrap_or(0.0);
             let is_free = input_price == 0.0 && output_price == 0.0;
+
+            if is_free && !enable_free_models {
+                continue;
+            }
 
             if !(has_key || provider_id == "opencode" && is_free) {
                 continue;
@@ -555,10 +559,14 @@ fn catalog_to_data(index: CatalogIndex) -> CatalogData {
 }
 
 fn init_catalog_blocking() -> CatalogData {
+    let enable_free_models = maki_config::providers::ProvidersConfig::load()
+        .get("opencode")
+        .and_then(|d| d.enable_free_models)
+        .unwrap_or(false);
     // Try cache first (fast, no network)
     if let Some(index) = smol::block_on(load_cached_catalog_async()) {
         debug!("using cached catalog");
-        return catalog_to_data(index);
+        return catalog_to_data(index, enable_free_models);
     }
 
     // Fetch from remote (blocks the current thread)
@@ -571,7 +579,7 @@ fn init_catalog_blocking() -> CatalogData {
     match smol::block_on(fetch_remote_catalog_async(&client)) {
         Ok(index) => {
             smol::block_on(save_cached_catalog_async(&index));
-            catalog_to_data(index)
+            catalog_to_data(index, enable_free_models)
         }
         Err(e) => {
             warn!(error = %e, "catalog fetch failed, using empty catalog");
@@ -798,7 +806,7 @@ mod tests {
             },
         );
 
-        let result = catalog_to_data(providers);
+        let result = catalog_to_data(providers, true);
         // Without env var, NO models should pass (not even free ones for non-opencode)
         assert!(
             result.entries.is_empty(),
@@ -849,7 +857,7 @@ mod tests {
             },
         );
 
-        let result = catalog_to_data(providers);
+        let result = catalog_to_data(providers, true);
         // Without key set, has_api_key is false, so only free models pass
         // but has_api_key is false, so only free models pass
         assert!(
@@ -909,7 +917,7 @@ mod tests {
         );
 
         unsafe { std::env::set_var("MAKI_TEST_OPENCODE_ALL_81274", "real-key") };
-        let result = catalog_to_data(providers);
+        let result = catalog_to_data(providers, true);
         unsafe { std::env::remove_var("MAKI_TEST_OPENCODE_ALL_81274") };
 
         // With key set, has_api_key is true, so all models pass
@@ -924,6 +932,85 @@ mod tests {
                 .contains_key(&("opencode".into(), "paid-model".into()))
         );
         assert!(result.auths.contains_key("opencode"));
+    }
+
+    fn opencode_catalog_with_free_and_paid(env_var: &str) -> CatalogIndex {
+        let mut models = HashMap::new();
+        models.insert(
+            "paid-model".into(),
+            CatalogModel {
+                limit: None,
+                cost: Some(CatalogCost {
+                    input: Some(5.0),
+                    output: Some(25.0),
+                    cache_read: None,
+                    cache_write: None,
+                }),
+                provider: None,
+            },
+        );
+        models.insert(
+            "free-model".into(),
+            CatalogModel {
+                limit: None,
+                cost: Some(CatalogCost {
+                    input: Some(0.0),
+                    output: Some(0.0),
+                    cache_read: None,
+                    cache_write: None,
+                }),
+                provider: None,
+            },
+        );
+        let mut providers = HashMap::new();
+        providers.insert(
+            "opencode".into(),
+            CatalogProvider {
+                name: "Opencode".into(),
+                env: vec![env_var.into()],
+                npm: "@ai-sdk/openai-compatible".into(),
+                api: Some("https://opencode.ai/zen/v1".into()),
+                models,
+            },
+        );
+        providers
+    }
+
+    const DISABLE_FREE_TEST_KEY: &str = "MAKI_TEST_OPENCODE_DISABLE_FREE_94421";
+
+    #[test]
+    fn catalog_to_data_opencode_hides_free_models_when_disabled() {
+        unsafe { std::env::set_var(DISABLE_FREE_TEST_KEY, "real-key") };
+        let index = opencode_catalog_with_free_and_paid(DISABLE_FREE_TEST_KEY);
+        let result = catalog_to_data(index, false);
+        unsafe { std::env::remove_var(DISABLE_FREE_TEST_KEY) };
+
+        assert!(
+            !result
+                .entries
+                .contains_key(&("opencode".into(), "free-model".into())),
+            "free model should be hidden when enable_free_models=false: {:?}",
+            result.entries.keys()
+        );
+        assert!(
+            result
+                .entries
+                .contains_key(&("opencode".into(), "paid-model".into()))
+        );
+        assert!(result.auths.contains_key("opencode"));
+    }
+
+    #[test]
+    fn catalog_to_data_opencode_no_models_without_key_when_disabled() {
+        let index = opencode_catalog_with_free_and_paid(DISABLE_FREE_TEST_KEY);
+        let result = catalog_to_data(index, false);
+
+        assert!(
+            result.entries.is_empty(),
+            "no models should be listed without a key when enable_free_models=false: {:?}",
+            result.entries.keys()
+        );
+        assert!(!result.auths.contains_key("opencode"));
     }
 
     #[test]
@@ -970,7 +1057,7 @@ mod tests {
 
         // Set the env var so has_key = true
         unsafe { std::env::set_var("MAKI_TEST_VENDOR_KEY_81274", "test-key") };
-        let result = catalog_to_data(providers);
+        let result = catalog_to_data(providers, true);
         unsafe { std::env::remove_var("MAKI_TEST_VENDOR_KEY_81274") };
 
         assert!(
@@ -999,7 +1086,7 @@ mod tests {
             },
         );
 
-        let result = catalog_to_data(providers);
+        let result = catalog_to_data(providers, true);
         assert!(result.entries.is_empty());
         assert!(result.auths.is_empty());
     }
@@ -1052,7 +1139,7 @@ mod tests {
         );
 
         unsafe { std::env::set_var("MAKI_TEST_OTHER_KEY_COLLISION", "key") };
-        let result = catalog_to_data(providers);
+        let result = catalog_to_data(providers, true);
         unsafe { std::env::remove_var("MAKI_TEST_OTHER_KEY_COLLISION") };
 
         // Both providers' entries are preserved
@@ -1102,7 +1189,7 @@ mod tests {
             },
         );
 
-        let data = catalog_to_data(providers);
+        let data = catalog_to_data(providers, true);
         let (meta, _) = data.lookup("opencode/opus").unwrap();
         assert_eq!(meta.provider_id, "opencode");
     }
@@ -1136,7 +1223,7 @@ mod tests {
         );
 
         unsafe { std::env::set_var("MAKI_TEST_NVIDIA_KEY_LOOKUP", "key") };
-        let data = catalog_to_data(providers);
+        let data = catalog_to_data(providers, true);
         unsafe { std::env::remove_var("MAKI_TEST_NVIDIA_KEY_LOOKUP") };
 
         // Entry is stored as ("nvidia", "openai/gpt-oss-120b")
@@ -1176,7 +1263,7 @@ mod tests {
         );
 
         unsafe { std::env::set_var("MAKI_TEST_NVIDIA_DIRECT", "key") };
-        let data = catalog_to_data(providers);
+        let data = catalog_to_data(providers, true);
         unsafe { std::env::remove_var("MAKI_TEST_NVIDIA_DIRECT") };
 
         // The lookup key constructed by stream_message:
@@ -1216,7 +1303,7 @@ mod tests {
         );
 
         unsafe { std::env::set_var("MAKI_TEST_FIREWORKS_DEEP", "key") };
-        let data = catalog_to_data(providers);
+        let data = catalog_to_data(providers, true);
         unsafe { std::env::remove_var("MAKI_TEST_FIREWORKS_DEEP") };
 
         // stream_message constructs key as "{sub_provider}/{model.id}"

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -40,6 +41,10 @@ static BUNDLED_PLUGINS: &[BundledPlugin] = &[
     BundledPlugin {
         name: "bash",
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/bash"),
+    },
+    BundledPlugin {
+        name: "batch",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/batch"),
     },
     BundledPlugin {
         name: "grep",
@@ -86,6 +91,10 @@ static BUNDLED_PLUGINS: &[BundledPlugin] = &[
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/code_execution"),
     },
     BundledPlugin {
+        name: "view_image",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/view_image"),
+    },
+    BundledPlugin {
         name: "lib",
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/lib"),
     },
@@ -130,6 +139,16 @@ impl PluginHost {
 
     pub fn disabled() -> Self {
         Self { inner: None }
+    }
+
+    /// Boots the runtime and loads every default bundled plugin into `registry`.
+    /// A convenience over `new` + `load_builtins(PluginsConfig::from_tools(defaults))`
+    /// for callers (tests, docgen, headless runs) that want the full builtin set
+    /// without permuting a config.
+    pub fn with_all_builtins(registry: Arc<ToolRegistry>) -> Result<Self, PluginError> {
+        let mut host = Self::new(registry)?;
+        host.load_builtins(&PluginsConfig::from_tools(HashMap::new()))?;
+        Ok(host)
     }
 
     pub fn load_init_files(&self, cwd: &Path) -> Result<Option<RawConfig>, PluginError> {
@@ -347,8 +366,10 @@ impl EventHandle {
         let _ = self.tx.send(Request::RestoreToolAsync { item, event_tx });
     }
 
-    pub fn request_click(&self, tool_use_id: String) {
-        let _ = self.tx.send(Request::ClickTool { tool_use_id });
+    /// `row` is the 1-based line in the tool's live buffer, 0 for clicks
+    /// outside it (header line etc.).
+    pub fn request_click(&self, tool_use_id: String, row: usize) {
+        let _ = self.tx.send(Request::ClickTool { tool_use_id, row });
     }
 
     pub fn send_restore_complete(&self, flag: Arc<AtomicBool>) {
@@ -411,9 +432,7 @@ mod tests {
     #[test]
     fn memory_builtin_registers_command() {
         let reg = Arc::new(ToolRegistry::new());
-        let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
-        host.load_builtins(&PluginsConfig::from_tools(std::collections::HashMap::new()))
-            .unwrap();
+        let host = PluginHost::with_all_builtins(Arc::clone(&reg)).unwrap();
         let reader = host.command_reader();
         let snap = reader.load();
         let found = snap.commands.iter().any(|c| c.name.as_ref() == "/memory");

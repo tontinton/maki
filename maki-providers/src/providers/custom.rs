@@ -9,6 +9,7 @@ use maki_config::providers::{
 };
 
 use super::ResolvedAuth;
+use super::openai::responses;
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use crate::model::{FastPricing, Model, ModelPricing, ModelTier};
 use crate::provider::{BoxFuture, Provider, ProviderKind};
@@ -28,7 +29,7 @@ fn resolve_provider_kind(slug: &str) -> Option<ProviderKind> {
     let config = ProvidersConfig::load();
     let def = config.get(slug)?;
     match def.protocol? {
-        Protocol::Openai => Some(ProviderKind::OpenAi),
+        Protocol::Openai | Protocol::OpenaiResponses => Some(ProviderKind::OpenAi),
         Protocol::Anthropic => Some(ProviderKind::Anthropic),
         Protocol::Google => Some(ProviderKind::Google),
     }
@@ -57,6 +58,9 @@ pub fn create(slug: &str, timeouts: Timeouts) -> Result<Box<dyn Provider>, Agent
     let resolved = resolve_custom_auth(slug)?;
     let auth = Arc::new(Mutex::new(resolved));
 
+    let config = ProvidersConfig::load();
+    let protocol = resolve_protocol(slug, config.get(slug)).unwrap_or(Protocol::Openai);
+
     match kind {
         ProviderKind::Anthropic => Ok(Box::new(super::anthropic::Anthropic::with_auth(
             auth, timeouts,
@@ -64,6 +68,7 @@ pub fn create(slug: &str, timeouts: Timeouts) -> Result<Box<dyn Provider>, Agent
         ProviderKind::OpenAi => Ok(Box::new(CustomOpenAiProvider {
             compat: OpenAiCompatProvider::new(&CUSTOM_OPENAI_CONFIG, timeouts),
             auth,
+            protocol,
         })),
         ProviderKind::Google => Ok(Box::new(super::google::Google::with_auth(auth, timeouts))),
         _ => Err(AgentError::Config {
@@ -78,7 +83,7 @@ pub fn lookup_model(slug: &str, model_id: &str) -> Option<Model> {
     let config = ProvidersConfig::load();
     let def = config.get(slug)?;
     let kind = match def.protocol? {
-        Protocol::Openai => ProviderKind::OpenAi,
+        Protocol::Openai | Protocol::OpenaiResponses => ProviderKind::OpenAi,
         Protocol::Anthropic => ProviderKind::Anthropic,
         Protocol::Google => ProviderKind::Google,
     };
@@ -94,6 +99,9 @@ pub fn lookup_model(slug: &str, model_id: &str) -> Option<Model> {
         .unwrap_or_else(|| kind.fallback_context_window());
     let supports_tool_examples_override = declared.and_then(|m| m.supports_tool_examples);
     let supports_thinking_override = declared.and_then(|m| m.supports_thinking);
+    let vision = declared
+        .and_then(|m| m.supports_vision)
+        .unwrap_or_else(|| kind.family().supports_vision());
     let pricing = declared
         .filter(|m| m.has_pricing())
         .map(|m| ModelPricing {
@@ -117,6 +125,7 @@ pub fn lookup_model(slug: &str, model_id: &str) -> Option<Model> {
         family: kind.family(),
         supports_tool_examples_override,
         supports_thinking_override,
+        vision,
         pricing,
         max_output_tokens,
         context_window,
@@ -194,6 +203,7 @@ pub fn discover_models(timeouts: Timeouts) -> Vec<String> {
 struct CustomOpenAiProvider {
     compat: OpenAiCompatProvider,
     auth: Arc<Mutex<ResolvedAuth>>,
+    protocol: Protocol,
 }
 
 impl Provider for CustomOpenAiProvider {
@@ -207,12 +217,27 @@ impl Provider for CustomOpenAiProvider {
         opts: RequestOptions,
         _session_id: Option<&'a str>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
-        let auth = self.auth.lock().unwrap().clone();
-        let mut body = self.compat.build_body(model, messages, system, tools);
-        if matches!(opts.thinking, ThinkingConfig::Off) {
-            body["thinking"] = serde_json::json!({"type": "disabled"});
-        }
         Box::pin(async move {
+            let auth = self.auth.lock().unwrap().clone();
+
+            if self.protocol == Protocol::OpenaiResponses {
+                let body = responses::build_body(model, messages, system, tools);
+                // TODO: wire thinking budget into responses API when llama.cpp supports it
+                return responses::do_stream(
+                    self.compat.client(),
+                    model,
+                    &body,
+                    event_tx,
+                    &auth,
+                    self.compat.stream_timeout(),
+                )
+                .await;
+            }
+
+            let mut body = self.compat.build_body(model, messages, system, tools);
+            if matches!(opts.thinking, ThinkingConfig::Off) {
+                body["thinking"] = serde_json::json!({"type": "disabled"});
+            }
             self.compat
                 .do_stream(model, &[], &body, event_tx, &auth)
                 .await

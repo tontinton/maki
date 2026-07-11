@@ -18,10 +18,10 @@ use crate::cancel::{CancelMap, CancelToken};
 use crate::permissions::PermissionManager;
 use crate::prompt::ResolvedSlots;
 use crate::template;
-use crate::tools::{DescriptionContext, FileReadTracker, ToolFilter, ToolRegistry};
+use crate::tools::{DescriptionContext, FileReadTracker, ToolAudience, ToolFilter, ToolRegistry};
 use crate::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, Envelope,
-    EventSender, McpHandle, PermissionsConfig, ToolOutput, ToolOutputLines,
+    EventSender, ImageSource, McpHandle, PermissionsConfig, ToolOutput, ToolOutputLines,
 };
 
 type StoredSession = Session<Message, TokenUsage, ToolOutput>;
@@ -72,11 +72,13 @@ pub struct HeadlessParams {
     pub permissions_config: PermissionsConfig,
     pub timeouts: Timeouts,
     pub prompt: String,
+    pub images: Vec<ImageSource>,
     pub prompt_slots: ResolvedSlots,
     pub excluded_tools: Vec<&'static str>,
     pub mcp_handle: Option<McpHandle>,
     pub initial_wd: PathBuf,
     pub fast: bool,
+    pub workflow: bool,
 }
 
 pub struct HeadlessHandle {
@@ -98,10 +100,19 @@ fn setup(
     config: &AgentConfig,
     excluded_tools: &[&'static str],
     mcp_handle: Option<&McpHandle>,
+    workflow: bool,
 ) -> AgentSetup {
     let vars = template::env_vars();
     let instructions = agent::load_instructions(&vars.apply("{cwd}"));
-    let tools = tool_definitions(&vars, model, config, excluded_tools, mcp_handle);
+    let tools = tool_definitions(
+        &vars,
+        model,
+        config,
+        excluded_tools,
+        mcp_handle,
+        workflow,
+        ToolRegistry::global(),
+    );
 
     AgentSetup {
         vars,
@@ -116,10 +127,16 @@ fn tool_definitions(
     config: &AgentConfig,
     excluded_tools: &[&'static str],
     mcp_handle: Option<&McpHandle>,
+    workflow: bool,
+    registry: &ToolRegistry,
 ) -> Value {
-    let filter = ToolFilter::from_config(config, excluded_tools);
-    let ctx = DescriptionContext { filter: &filter };
-    let mut tools = ToolRegistry::native().definitions(vars, &ctx, model.supports_tool_examples());
+    let filter = ToolFilter::from_config(config, model, excluded_tools);
+    let ctx = DescriptionContext {
+        filter: &filter,
+        audience: ToolAudience::MAIN,
+        workflow,
+    };
+    let mut tools = registry.definitions(vars, &ctx, model.supports_tool_examples());
 
     if let Some(handle) = mcp_handle {
         handle.extend_tools(&mut tools);
@@ -140,6 +157,7 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
         &params.config,
         &params.excluded_tools,
         params.mcp_handle.as_ref(),
+        params.workflow,
     );
 
     let system = agent::build_system_prompt(
@@ -157,6 +175,7 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
     let session_id = uuid::Uuid::new_v4().to_string();
 
     let fast = params.fast;
+    let workflow = params.workflow;
     let task = smol::spawn({
         let session_id = session_id.clone();
         let mcp_shutdown = params.mcp_handle.clone();
@@ -192,6 +211,8 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
                     file_tracker: FileReadTracker::fresh(),
                     prompt_slots: Arc::new(params.prompt_slots),
                     subagent_cancels: Arc::new(CancelMap::new()),
+                    registry: Arc::clone(ToolRegistry::global_arc()),
+                    audience: ToolAudience::MAIN,
                 },
                 AgentRunParams {
                     history: &mut history,
@@ -207,8 +228,12 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
                 .run(AgentInput {
                     message: params.prompt,
                     mode,
+                    images: params.images,
+                    preamble: Vec::new(),
+                    thinking: Default::default(),
                     fast,
-                    ..Default::default()
+                    workflow,
+                    prompt: None,
                 })
                 .await;
             drop(agent);
@@ -249,6 +274,7 @@ pub struct InteractiveParams {
     pub yolo: bool,
     pub system_prompt_override: Option<String>,
     pub append_system_prompt: Option<String>,
+    pub workflow: bool,
 }
 
 pub struct InteractiveHandle {
@@ -273,6 +299,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
         &params.config,
         &params.excluded_tools,
         params.mcp_handle.as_ref(),
+        params.workflow,
     );
 
     let tool_names = extract_tool_names(&tools);
@@ -336,6 +363,8 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                                 &params.config,
                                 &params.excluded_tools,
                                 params.mcp_handle.as_ref(),
+                                params.workflow,
+                                ToolRegistry::global(),
                             );
                             model = new_model;
                         }
@@ -388,6 +417,8 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                         file_tracker: Arc::clone(&file_tracker),
                         prompt_slots: Arc::clone(&params.prompt_slots),
                         subagent_cancels: Arc::new(CancelMap::new()),
+                        registry: Arc::clone(ToolRegistry::global_arc()),
+                        audience: ToolAudience::MAIN,
                     },
                     AgentRunParams {
                         history: &mut history,

@@ -1,9 +1,11 @@
 mod agent;
 mod r#async;
 pub(crate) mod autocmd;
+pub(crate) mod base64;
 pub(crate) mod env;
 pub(crate) mod r#fn;
 pub(crate) mod fs;
+pub(crate) mod image;
 mod interpreter;
 pub(crate) mod json;
 pub(crate) mod keymap;
@@ -42,6 +44,8 @@ pub(crate) fn create_maki_global(
     maki.set("log", log::create_log_table(lua, Arc::clone(&plugin))?)?;
     maki.set("treesitter", treesitter::create_treesitter_table(lua)?)?;
     maki.set("uv", uv::create_uv_table(lua, permissions)?)?;
+    maki.set("base64", base64::create_base64_table(lua)?)?;
+    maki.set("image", image::create_image_table(lua)?)?;
     maki.set("json", json::create_json_table(lua)?)?;
     maki.set("yaml", yaml::create_yaml_table(lua)?)?;
     maki.set("net", net::create_net_table(lua, permissions)?)?;

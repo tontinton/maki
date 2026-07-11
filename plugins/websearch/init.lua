@@ -30,7 +30,9 @@ maki.api.register_tool({
     },
   },
   permission_scope = "query",
-  audiences = { "main", "interpreter" },
+  -- research/general included so subagents keep web search now that the
+  -- interpreter only exposes tools the host audience could see itself.
+  audiences = { "main", "research_sub", "general_sub", "interpreter" },
 
   header = function(input)
     return input.query

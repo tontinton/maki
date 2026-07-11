@@ -1,24 +1,43 @@
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::Instant;
+//! `maki.agent` exposes subagent primitives to Lua plugins. Policy (retries,
+//! validation, concurrency) lives in the task plugin, not here.
 
+use std::collections::HashMap;
+use std::pin::pin;
+use std::sync::Arc;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{Duration, Instant};
+
+use async_lock::Mutex as AsyncMutex;
+use futures::future::{Either, select};
+use maki_agent::agent::tool_dispatch::{self, Emit};
 use maki_agent::cancel::CancelMap;
+use maki_agent::tools::interpreter_bridge;
 use maki_agent::tools::registry::ToolRegistry;
-use maki_agent::tools::{DescriptionContext, FileReadTracker, ToolAudience, ToolFilter};
+use maki_agent::tools::{
+    Deadline, DescriptionContext, FileReadTracker, LocalToolFn, LocalTools, ToolAudience,
+    ToolContext, ToolFilter, ToolLive,
+};
 use maki_agent::{
     Agent, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, Envelope, EventSender,
-    History, SubagentInfo,
+    History, SubagentInfo, ToolDoneEvent,
 };
 use maki_providers::model::ModelTier;
 use maki_providers::provider;
 use maki_providers::{ContentBlock, Model, ModelError, Role, ThinkingConfig};
-use mlua::{Lua, Result as LuaResult, Table, Value as LuaValue};
+use mlua::{
+    Function, Lua, Result as LuaResult, Table, UserData, UserDataMethods, Value as LuaValue,
+};
 use serde_json::Value as JsonValue;
 use tracing::info;
 use uuid::Uuid;
 
-use crate::api::util::convert::{json_to_lua, lua_to_json};
-use crate::api::util::ctx::AgentContext;
+use crate::api::ui::buf::BufHandle;
+use crate::api::util::convert::{json_to_lua, lua_to_json, lua_tool_result};
+use crate::api::util::ctx::{AgentContext, LuaCtx};
+
+const SESSION_CLOSED_ERR: &str = "session closed";
+const DEFAULT_SESSION_AUDIENCE: ToolAudience = ToolAudience::GENERAL_SUB;
 
 pub(crate) fn register(lua: &Lua, maki: &Table) -> LuaResult<()> {
     let agent = lua.create_table()?;
@@ -26,7 +45,8 @@ pub(crate) fn register(lua: &Lua, maki: &Table) -> LuaResult<()> {
     agent.set("resolve_model", lua.create_async_function(resolve_model)?)?;
     agent.set("system_prompt", lua.create_async_function(system_prompt)?)?;
     agent.set("tools", lua.create_async_function(tools)?)?;
-    agent.set("run", lua.create_async_function(run)?)?;
+    agent.set("call_tool", lua.create_async_function(call_tool)?)?;
+    agent.set("session", lua.create_async_function(session)?)?;
 
     maki.set("agent", agent)?;
     Ok(())
@@ -46,7 +66,11 @@ fn resolve_model_from_ctx(ctx: &AgentContext, tier: Option<&str>) -> Result<Mode
     let map = maki_providers::model_registry::model_registry()
         .read()
         .unwrap();
-    map.spec_for_tier(ctx.model.provider, effective)
+    ctx.model
+        .dynamic_slug
+        .is_none()
+        .then(|| map.spec_for_tier(ctx.model.provider, effective))
+        .flatten()
         .or_else(|| map.spec_for_tier_any(effective))
         .and_then(|s| Model::from_spec(&s).ok())
         .map(Ok)
@@ -71,7 +95,7 @@ fn model_to_lua_table(lua: &Lua, model: &Model) -> LuaResult<Table> {
 
 async fn resolve_model(
     lua: Lua,
-    (agent_ctx, opts): (mlua::UserDataRef<AgentContext>, Option<Table>),
+    (ctx, opts): (mlua::UserDataRef<LuaCtx>, Option<Table>),
 ) -> LuaResult<Table> {
     let tier_str = opts
         .as_ref()
@@ -83,7 +107,7 @@ async fn resolve_model(
     let model = if let Some(ref spec) = spec_str {
         Model::from_spec(spec).map_err(mlua::Error::runtime)?
     } else {
-        resolve_model_from_ctx(&agent_ctx, tier_str.as_deref())?
+        resolve_model_from_ctx(&ctx.agent, tier_str.as_deref())?
     };
 
     model_to_lua_table(&lua, &model)
@@ -91,7 +115,7 @@ async fn resolve_model(
 
 async fn system_prompt(
     _lua: Lua,
-    (agent_ctx, opts): (mlua::UserDataRef<AgentContext>, Table),
+    (ctx, opts): (mlua::UserDataRef<LuaCtx>, Table),
 ) -> LuaResult<String> {
     let prompt_id_str: String = opts.get("prompt_id")?;
     let prompt_id = match prompt_id_str.as_str() {
@@ -113,76 +137,332 @@ async fn system_prompt(
         _ => return Err(mlua::Error::runtime("instructions must be bool or string")),
     };
 
-    let assembled = maki_agent::prompt::assemble(prompt_id, &agent_ctx.prompt_slots, &instructions);
+    let assembled = maki_agent::prompt::assemble(prompt_id, &ctx.agent.prompt_slots, &instructions);
     Ok(vars.apply(&assembled).into_owned())
 }
 
-async fn tools(
-    lua: Lua,
-    (agent_ctx, opts): (mlua::UserDataRef<AgentContext>, Table),
-) -> LuaResult<LuaValue> {
+async fn tools(lua: Lua, (ctx, opts): (mlua::UserDataRef<LuaCtx>, Table)) -> LuaResult<LuaValue> {
     let audience_str: String = opts.get("audience")?;
-    let audience = match audience_str.as_str() {
-        "main" => ToolAudience::MAIN,
-        "research_sub" => ToolAudience::RESEARCH_SUB,
-        "general_sub" => ToolAudience::GENERAL_SUB,
-        other => return Err(mlua::Error::runtime(format!("unknown audience: {other}"))),
-    };
+    let audience = ToolAudience::parse_name(&audience_str)
+        .ok_or_else(|| mlua::Error::runtime(format!("unknown audience: {audience_str}")))?;
 
     let only: Option<Vec<String>> = opts.get("only")?;
     let except: Option<Vec<String>> = opts.get("except")?;
     let include_mcp: bool = opts.get::<Option<bool>>("include_mcp")?.unwrap_or(true);
+    let workflow: bool = opts.get::<Option<bool>>("workflow")?.unwrap_or(false);
     let spec_str: Option<String> = opts.get("spec")?;
 
-    let supports_examples = if let Some(ref spec) = spec_str {
-        Model::from_spec(spec)
-            .map(|m| m.supports_tool_examples())
-            .unwrap_or(false)
-    } else {
-        agent_ctx.model.supports_tool_examples()
-    };
+    let parsed = spec_str
+        .as_deref()
+        .and_then(|spec| Model::from_spec(spec).ok());
+    let model = parsed.as_ref().unwrap_or(&ctx.agent.model);
 
-    let snapshot = ToolRegistry::native().iter();
-    let allowed: Vec<String> = snapshot
+    let base = match (only, except) {
+        (Some(o), _) => ToolFilter::Only(o),
+        (_, Some(e)) => ToolFilter::AllExcept(e),
+        _ => ToolFilter::All,
+    };
+    let disabled: Vec<&str> = ctx
+        .agent
+        .config
+        .disabled_tools
         .iter()
-        .filter(|e| {
-            e.tool.audience().contains(audience)
-                && maki_agent::tools::is_tool_enabled(&agent_ctx.config, e.name())
-        })
-        .map(|e| e.name().to_owned())
+        .map(String::as_str)
         .collect();
-
-    let filter = match (only, except) {
-        (Some(o), _) => {
-            let intersected: Vec<String> = o.into_iter().filter(|n| allowed.contains(n)).collect();
-            ToolFilter::Only(intersected)
-        }
-        (_, Some(e)) => {
-            let filtered: Vec<String> = allowed.into_iter().filter(|n| !e.contains(n)).collect();
-            ToolFilter::Only(filtered)
-        }
-        _ => ToolFilter::Only(allowed),
-    };
+    let filter = base
+        .excluding(&disabled)
+        .excluding(maki_agent::tools::capability_exclusions(model));
 
     let vars = maki_agent::template::env_vars();
-    let ctx_desc = DescriptionContext { filter: &filter };
-    let mut defs = ToolRegistry::native().definitions(&vars, &ctx_desc, supports_examples);
+    let ctx_desc = DescriptionContext {
+        filter: &filter,
+        audience,
+        workflow,
+    };
+    let mut defs =
+        ToolRegistry::global().definitions(&vars, &ctx_desc, model.supports_tool_examples());
 
-    if include_mcp && let Some(ref mcp) = agent_ctx.mcp {
+    if include_mcp && let Some(ref mcp) = ctx.agent.mcp {
         mcp.extend_tools(&mut defs);
     }
 
     json_to_lua(&lua, &defs)
 }
 
-async fn run(lua: Lua, (agent_ctx_ud, opts): (mlua::AnyUserData, Table)) -> LuaResult<Table> {
-    let agent_ctx: AgentContext = agent_ctx_ud.take()?;
-    let prompt: String = opts.get("prompt")?;
+/// Returns `(text, err, annotation)`. While the child runs,
+/// `opts.on_live_buf` receives each buf it publishes (as a foreign
+/// `BufHandle`) and `opts.on_annotation` each live annotation (e.g. a
+/// subagent's model). Both run synchronously on the Lua thread and must
+/// not yield.
+async fn call_tool(
+    _lua: Lua,
+    (ctx, name, input, opts): (mlua::UserDataRef<LuaCtx>, String, LuaValue, Option<Table>),
+) -> LuaResult<(Option<String>, Option<String>, Option<String>)> {
+    let input_json = lua_to_json(&input)?;
+    let mut tctx = ctx.agent.to_tool_context();
+    let mut on_live = None;
+    if let Some(o) = opts {
+        if let Some(secs) = o.get::<Option<u64>>("timeout")? {
+            tctx.deadline = Deadline::after(Duration::from_secs(secs));
+        }
+        let on_buf = o.get::<Option<Function>>("on_live_buf")?;
+        let on_ann = o.get::<Option<Function>>("on_annotation")?;
+        if on_buf.is_some() || on_ann.is_some() {
+            let (tx, rx) = flume::unbounded();
+            tctx.live_sink = Some(tx);
+            on_live = Some((rx, on_buf, on_ann));
+        }
+    }
+    drop(ctx);
+    if let Err(e) = tctx.deadline.check() {
+        return Ok((None, Some(e), None));
+    }
+    let done = dispatch_racing_live(&tctx, &name, &input_json, on_live).await;
+    // Same fallback the UI applies on tool completion, so a batch child's
+    // header carries the annotation its standalone run would get.
+    let annotation = done
+        .annotation
+        .clone()
+        .or_else(|| (!done.is_error).then(|| done.output.annotation()).flatten());
+    match interpreter_bridge::flatten(&done) {
+        Ok(text) => Ok((Some(text), None, annotation)),
+        Err(err) => Ok((None, Some(err), annotation)),
+    }
+}
+
+type OnLive = (
+    flume::Receiver<ToolLive>,
+    Option<Function>,
+    Option<Function>,
+);
+
+/// Like `interpreter_bridge::dispatch`, but keeps the full `ToolDoneEvent`
+/// (the annotation lives there) and delivers live bufs and annotations
+/// while the child runs.
+async fn dispatch_racing_live(
+    tctx: &ToolContext,
+    name: &str,
+    input: &JsonValue,
+    on_live: Option<OnLive>,
+) -> ToolDoneEvent {
+    let run = tool_dispatch::run(
+        &tctx.registry,
+        tctx.mcp.as_ref(),
+        String::new(),
+        name,
+        input,
+        tctx,
+        Emit::Silent,
+    );
+    let Some((rx, on_buf, on_ann)) = on_live else {
+        return run.await;
+    };
+    let deliver = |ev: ToolLive| {
+        let res = match ev {
+            ToolLive::Buf(buf) => on_buf
+                .as_ref()
+                .map(|f| f.call::<()>(BufHandle::foreign(buf))),
+            ToolLive::Annotation(ann) => on_ann.as_ref().map(|f| f.call::<()>(ann)),
+        };
+        if let Some(Err(e)) = res {
+            tracing::warn!(tool = name, error = %e, "live callback failed");
+        }
+    };
+    let mut run = pin!(run);
+    loop {
+        match select(run.as_mut(), pin!(rx.recv_async())).await {
+            Either::Left((done, _)) => {
+                while let Ok(ev) = rx.try_recv() {
+                    deliver(ev);
+                }
+                return done;
+            }
+            Either::Right((Ok(ev), _)) => deliver(ev),
+            // The sender is gone but no result arrived: just wait for the run.
+            Either::Right((Err(_), _)) => return run.await,
+        }
+    }
+}
+
+struct SessionState {
+    params: AgentParams,
+    system: String,
+    tools: JsonValue,
+    thinking: ThinkingConfig,
+    fast: bool,
+    mcp: Option<maki_agent::mcp::McpHandle>,
+    history: History,
+    sub_event_tx: EventSender,
+    child_cancel: maki_agent::cancel::CancelToken,
+    answer_rx: Arc<AsyncMutex<flume::Receiver<String>>>,
+    answer_tx: Option<flume::Sender<String>>,
+    parent_cancels: Arc<CancelMap<String>>,
+    /// Stable identity for UI, cancel, and history. Falls back to a synthetic
+    /// id for workflow-mode sessions (no model-issued tool call exists).
+    ui_id: String,
+    parent_event_tx: EventSender,
+    subagent_info: Arc<OnceLock<SubagentInfo>>,
+    local_tools: LocalTools,
+    name: String,
+    total_input: Arc<AtomicU32>,
+    total_output: Arc<AtomicU32>,
+    start: Instant,
+    closed: bool,
+}
+
+impl SessionState {
+    fn close(&mut self) {
+        if self.closed {
+            return;
+        }
+        self.closed = true;
+        self.parent_cancels.remove(&self.ui_id);
+        let messages = std::mem::replace(&mut self.history, History::new(Vec::new())).into_vec();
+        let _ = self.parent_event_tx.send(AgentEvent::SubagentHistory {
+            tool_use_id: self.ui_id.clone(),
+            messages,
+        });
+        info!(
+            name = %self.name,
+            duration_ms = self.start.elapsed().as_millis() as u64,
+            input_tokens = self.total_input.load(Ordering::Relaxed),
+            output_tokens = self.total_output.load(Ordering::Relaxed),
+            "subagent session closed",
+        );
+    }
+}
+
+struct LuaSession {
+    inner: Arc<AsyncMutex<SessionState>>,
+}
+
+impl Drop for LuaSession {
+    fn drop(&mut self) {
+        match self.inner.try_lock() {
+            Some(mut s) => s.close(),
+            // Prompt still in flight: close asynchronously so history
+            // and cancel entry are never silently leaked.
+            None => {
+                let inner = Arc::clone(&self.inner);
+                smol::spawn(async move { inner.lock().await.close() }).detach();
+            }
+        }
+    }
+}
+
+impl UserData for LuaSession {
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_async_method("prompt", |lua, this, message: String| async move {
+            let inner = Arc::clone(&this.inner);
+            drop(this);
+            let mut guard = inner.lock().await;
+            let s = &mut *guard;
+            if s.closed {
+                return Ok((LuaValue::Nil, Some(SESSION_CLOSED_ERR.to_owned())));
+            }
+            if s.subagent_info.get().is_none() {
+                let _ = s.subagent_info.set(SubagentInfo {
+                    parent_tool_use_id: s.ui_id.clone(),
+                    name: s.name.clone(),
+                    prompt: Some(message.clone()),
+                    model: Some(s.params.model.spec()),
+                    answer_tx: s.answer_tx.take(),
+                });
+            }
+
+            let mut agent = Agent::new(
+                s.params.clone(),
+                AgentRunParams {
+                    history: &mut s.history,
+                    system: s.system.clone(),
+                    event_tx: s.sub_event_tx.clone(),
+                    tools: s.tools.clone(),
+                },
+            )
+            .with_user_response_rx(Arc::clone(&s.answer_rx))
+            .with_cancel(s.child_cancel.clone())
+            .with_mcp(s.mcp.clone())
+            .with_local_tools(Arc::clone(&s.local_tools));
+
+            let input = AgentInput {
+                message,
+                mode: AgentMode::Build,
+                images: Vec::new(),
+                preamble: Vec::new(),
+                thinking: s.thinking,
+                fast: s.fast,
+                workflow: false,
+                prompt: None,
+            };
+            let result = agent.run(input).await;
+            drop(agent);
+            if let Err(e) = result {
+                return Ok((LuaValue::Nil, Some(e.to_string())));
+            }
+
+            let text = s
+                .history
+                .as_slice()
+                .iter()
+                .rev()
+                .filter(|m| matches!(m.role, Role::Assistant))
+                .flat_map(|m| m.content.iter())
+                .find_map(|b| match b {
+                    ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .unwrap_or("(no response)")
+                .to_owned();
+
+            let tbl = lua.create_table()?;
+            tbl.set("text", text)?;
+            tbl.set("duration_ms", s.start.elapsed().as_millis() as u64)?;
+            tbl.set("input_tokens", s.total_input.load(Ordering::Relaxed))?;
+            tbl.set("output_tokens", s.total_output.load(Ordering::Relaxed))?;
+            Ok((LuaValue::Table(tbl), None))
+        });
+
+        methods.add_async_method("close", |_lua, this, ()| async move {
+            let inner = Arc::clone(&this.inner);
+            drop(this);
+            let mut s = inner.lock().await;
+            s.close();
+            Ok(())
+        });
+    }
+}
+
+/// Weak Lua ref avoids a reference cycle when the session is stored in userdata.
+fn call_local_tool(
+    weak: &mlua::WeakLua,
+    f: &Function,
+    input: &JsonValue,
+) -> Result<String, String> {
+    let lua = weak.try_upgrade().ok_or("Lua runtime shut down")?;
+    let arg = json_to_lua(&lua, input).map_err(|e| e.to_string())?;
+    let values = f.call::<mlua::MultiValue>(arg).map_err(|e| e.to_string())?;
+    lua_tool_result(values)
+}
+
+/// `opts.local_tools` both advertises definitions to the model and dispatches
+/// to the Lua handler, so they cannot drift apart.
+async fn session(
+    lua: Lua,
+    (ctx, opts): (mlua::UserDataRef<LuaCtx>, Table),
+) -> LuaResult<mlua::AnyUserData> {
+    let agent_ctx = ctx.agent.clone();
+    drop(ctx);
     let model_spec: Option<String> = opts.get("model_spec")?;
     let system: Option<String> = opts.get("system")?;
     let tools_val: Option<LuaValue> = opts.get("tools")?;
+    let local_tools_tbl: Option<Table> = opts.get("local_tools")?;
     let name: Option<String> = opts.get("name")?;
     let thinking_val: Option<LuaValue> = opts.get("thinking")?;
+    let audience = match opts.get::<Option<String>>("audience")? {
+        Some(s) => ToolAudience::parse_name(&s)
+            .ok_or_else(|| mlua::Error::runtime(format!("unknown audience: {s}")))?,
+        None => DEFAULT_SESSION_AUDIENCE,
+    };
     let fast: bool = opts
         .get::<Option<bool>>("fast")?
         .unwrap_or(agent_ctx.opts.fast);
@@ -200,14 +480,48 @@ async fn run(lua: Lua, (agent_ctx_ud, opts): (mlua::AnyUserData, Table)) -> LuaR
             Arc::clone(&agent_ctx.provider),
         )
     };
+    // A standalone task shows its model via SubagentInfo on the header;
+    // a dispatching caller (batch) gets the same thing as a live annotation.
+    if let Some(sink) = &agent_ctx.live_sink {
+        let _ = sink.send(ToolLive::Annotation(model.spec()));
+    }
 
-    let tools_json: JsonValue = if let Some(val) = tools_val {
-        lua_to_json(&val)?
-    } else {
-        JsonValue::Array(vec![])
+    let mut tools_json: JsonValue = match tools_val {
+        Some(val) => {
+            let tools = lua_to_json(&val)?;
+            if !tools.is_array() {
+                return Err(mlua::Error::runtime("tools must be an array"));
+            }
+            tools
+        }
+        None => JsonValue::Array(vec![]),
     };
 
-    let system_prompt = system.unwrap_or_default();
+    let mut local_map: HashMap<String, LocalToolFn> = HashMap::new();
+    if let Some(tbl) = local_tools_tbl {
+        let defs = tools_json.as_array_mut().expect("checked above");
+        for pair in tbl.pairs::<String, Table>() {
+            let (name, spec) = pair?;
+            let description: String = spec.get("description").map_err(|_| {
+                mlua::Error::runtime(format!("local_tools.{name}: 'description' is required"))
+            })?;
+            let input_schema = lua_to_json(&spec.get::<LuaValue>("input_schema")?)?;
+            let handler: Function = spec.get("handler").map_err(|_| {
+                mlua::Error::runtime(format!("local_tools.{name}: 'handler' is required"))
+            })?;
+            defs.push(serde_json::json!({
+                "name": name,
+                "description": description,
+                "input_schema": input_schema,
+            }));
+            let weak = lua.weak();
+            local_map.insert(
+                name,
+                Arc::new(move |input: &JsonValue| call_local_tool(&weak, &handler, input))
+                    as LocalToolFn,
+            );
+        }
+    }
 
     let thinking = match thinking_val {
         Some(LuaValue::String(s)) => match s.to_str()?.as_ref() {
@@ -221,72 +535,58 @@ async fn run(lua: Lua, (agent_ctx_ud, opts): (mlua::AnyUserData, Table)) -> LuaR
         None => agent_ctx.opts.thinking,
     };
 
-    let description = name.as_deref().unwrap_or_default();
-
     let session_id = Uuid::new_v4().to_string();
     let (sub_tx, sub_rx) = flume::unbounded::<Envelope>();
     let sub_event_tx = EventSender::new(sub_tx, agent_ctx.event_tx.run_id());
     let parent_tx = agent_ctx.event_tx.clone();
     let (answer_tx, answer_rx) = flume::unbounded::<String>();
-    let answer_rx = Arc::new(async_lock::Mutex::new(answer_rx));
 
-    let subagent_info = agent_ctx.tool_use_id.as_ref().map(|id| SubagentInfo {
-        parent_tool_use_id: id.clone(),
-        name: description.to_owned(),
-        prompt: Some(prompt.clone()),
-        model: Some(model.spec()),
-        answer_tx: Some(answer_tx),
-    });
-
+    let subagent_info: Arc<OnceLock<SubagentInfo>> = Arc::new(OnceLock::new());
     let total_input = Arc::new(AtomicU32::new(0));
     let total_output = Arc::new(AtomicU32::new(0));
-    let ti = Arc::clone(&total_input);
-    let to = Arc::clone(&total_output);
 
-    smol::spawn(async move {
-        while let Ok(mut envelope) = sub_rx.recv_async().await {
-            match &envelope.event {
-                AgentEvent::Done { usage, .. } => {
-                    ti.fetch_add(usage.total_input(), Ordering::Relaxed);
-                    to.fetch_add(usage.output, Ordering::Relaxed);
-                    continue;
+    {
+        let info = Arc::clone(&subagent_info);
+        let ti = Arc::clone(&total_input);
+        let to = Arc::clone(&total_output);
+        let parent_tx = parent_tx.clone();
+        smol::spawn(async move {
+            while let Ok(mut envelope) = sub_rx.recv_async().await {
+                match &envelope.event {
+                    AgentEvent::Done { usage, .. } => {
+                        ti.fetch_add(usage.total_input(), Ordering::Relaxed);
+                        to.fetch_add(usage.output, Ordering::Relaxed);
+                        continue;
+                    }
+                    AgentEvent::Error { .. }
+                    | AgentEvent::ToolOutput { .. }
+                    | AgentEvent::ToolPending { .. }
+                    | AgentEvent::SubagentHistory { .. } => continue,
+                    _ => {}
                 }
-                AgentEvent::Error { .. }
-                | AgentEvent::ToolOutput { .. }
-                | AgentEvent::ToolPending { .. }
-                | AgentEvent::SubagentHistory { .. } => continue,
-                _ => {}
+                envelope.subagent = info.get().cloned();
+                let _ = parent_tx.send_envelope(envelope);
             }
-            envelope.subagent = subagent_info.clone();
-            let _ = parent_tx.send_envelope(envelope);
-        }
-    })
-    .detach();
-
-    let (child_trigger, child_cancel) = agent_ctx.cancel.child();
-    if let Some(ref id) = agent_ctx.tool_use_id {
-        agent_ctx.subagent_cancels.insert(id.clone(), child_trigger);
-    } else {
-        drop(child_trigger);
+        })
+        .detach();
     }
 
-    let input = AgentInput {
-        message: prompt.clone(),
-        mode: AgentMode::Build,
-        thinking,
-        fast,
-        ..Default::default()
-    };
+    // Register a cancel trigger so the child token does not fire on drop
+    // and kill the subagent at birth.
+    let ui_id = agent_ctx
+        .tool_use_id
+        .clone()
+        .unwrap_or_else(|| format!("session-{session_id}"));
+    let (child_trigger, child_cancel) = agent_ctx.cancel.child();
+    agent_ctx
+        .subagent_cancels
+        .insert(ui_id.clone(), child_trigger);
 
-    info!(
-        description = %description,
-        model = %model.id,
-        "subagent spawning",
-    );
+    let name = name.unwrap_or_default();
+    info!(name = %name, model = %model.id, "subagent session opened");
 
-    let mut history = History::new(Vec::new());
-    let mut agent = Agent::new(
-        AgentParams {
+    let state = SessionState {
+        params: AgentParams {
             provider,
             model,
             config: agent_ctx.config.clone(),
@@ -297,55 +597,66 @@ async fn run(lua: Lua, (agent_ctx_ud, opts): (mlua::AnyUserData, Table)) -> LuaR
             file_tracker: FileReadTracker::fresh(),
             prompt_slots: Arc::clone(&agent_ctx.prompt_slots),
             subagent_cancels: Arc::new(CancelMap::new()),
+            registry: Arc::clone(maki_agent::tools::ToolRegistry::global_arc()),
+            audience,
         },
-        AgentRunParams {
-            history: &mut history,
-            system: system_prompt,
-            event_tx: sub_event_tx,
-            tools: tools_json,
-        },
-    )
-    .with_user_response_rx(answer_rx)
-    .with_cancel(child_cancel)
-    .with_mcp(agent_ctx.mcp.clone());
+        system: system.unwrap_or_default(),
+        tools: tools_json,
+        thinking,
+        fast,
+        mcp: agent_ctx.mcp.clone(),
+        history: History::new(Vec::new()),
+        sub_event_tx,
+        child_cancel,
+        answer_rx: Arc::new(AsyncMutex::new(answer_rx)),
+        answer_tx: Some(answer_tx),
+        parent_cancels: Arc::clone(&agent_ctx.subagent_cancels),
+        ui_id,
+        parent_event_tx: parent_tx,
+        subagent_info,
+        local_tools: Arc::new(local_map),
+        name,
+        total_input,
+        total_output,
+        start: Instant::now(),
+        closed: false,
+    };
 
-    let start = Instant::now();
-    let result = agent.run(input).await;
-    let duration_ms = start.elapsed().as_millis() as u64;
-    drop(agent);
+    lua.create_userdata(LuaSession {
+        inner: Arc::new(AsyncMutex::new(state)),
+    })
+}
 
-    if let Some(ref id) = agent_ctx.tool_use_id {
-        agent_ctx.subagent_cancels.remove(id);
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    fn call(src: &str, input: JsonValue) -> Result<String, String> {
+        let lua = Lua::new();
+        let f: Function = lua.load(src).eval().unwrap();
+        call_local_tool(&lua.weak(), &f, &input)
     }
 
-    let success = result.is_ok();
-    info!(description = %description, duration_ms, success, "subagent completed");
-    result.map_err(|e| mlua::Error::runtime(format!("sub-agent error: {e}")))?;
-
-    let messages = history.into_vec();
-    let text = messages
-        .iter()
-        .rev()
-        .filter(|m| matches!(m.role, Role::Assistant))
-        .flat_map(|m| m.content.iter())
-        .find_map(|b| match b {
-            ContentBlock::Text { text } => Some(text.as_str()),
-            _ => None,
-        })
-        .unwrap_or("(no response)")
-        .to_string();
-
-    if let Some(tool_use_id) = agent_ctx.tool_use_id.clone() {
-        let _ = agent_ctx.event_tx.send(AgentEvent::SubagentHistory {
-            tool_use_id,
-            messages,
-        });
+    #[test]
+    fn local_tool_handler_result_conventions() {
+        let input = json!({"x": "1"});
+        assert_eq!(
+            call("function(v) return 'ok:' .. v.x end", input.clone()),
+            Ok("ok:1".into())
+        );
+        assert_eq!(
+            call("function() return nil, 'bad' end", input.clone()),
+            Err("bad".into())
+        );
+        assert_eq!(
+            call("function() end", input.clone()),
+            Err(crate::api::util::convert::NIL_TOOL_RESULT_ERR.into())
+        );
+        let raised = call("function() error('boom') end", input.clone()).unwrap_err();
+        assert!(raised.contains("boom"), "got: {raised}");
+        let wrong = call("function() return 42 end", input).unwrap_err();
+        assert!(wrong.contains("expected string"), "got: {wrong}");
     }
-
-    let tbl = lua.create_table()?;
-    tbl.set("text", text)?;
-    tbl.set("duration_ms", duration_ms)?;
-    tbl.set("input_tokens", total_input.load(Ordering::Relaxed))?;
-    tbl.set("output_tokens", total_output.load(Ordering::Relaxed))?;
-    Ok(tbl)
 }

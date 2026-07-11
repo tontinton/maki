@@ -72,7 +72,12 @@ pub fn build_system_prompt(
     out
 }
 
-fn append_instruction_files(out: &mut String, cwd: &str, home: Option<&Path>) {
+fn append_instruction_files(
+    out: &mut String,
+    cwd: &str,
+    home: Option<&Path>,
+    xdg_config: Option<&Path>,
+) {
     let root = Path::new(cwd);
 
     for filename in INSTRUCTION_FILES {
@@ -90,7 +95,7 @@ fn append_instruction_files(out: &mut String, cwd: &str, home: Option<&Path>) {
         ));
     }
 
-    for path in maki_storage::paths::user_config_dirs(home, "AGENTS.md") {
+    for path in maki_storage::paths::user_config_dirs(home, xdg_config, "AGENTS.md") {
         if let Ok(content) = fs::read_to_string(&path) {
             let display = path.display();
             out.push_str(&format!("\n\nGlobal instructions ({display}):\n{content}"));
@@ -100,23 +105,39 @@ fn append_instruction_files(out: &mut String, cwd: &str, home: Option<&Path>) {
 }
 
 pub fn load_instruction_text(cwd: &str) -> String {
-    load_instruction_text_with_home(cwd, maki_storage::paths::home().as_deref())
+    load_instruction_text_with_home(
+        cwd,
+        maki_storage::paths::home().as_deref(),
+        maki_storage::paths::config_dir().ok().as_deref(),
+    )
 }
 
-fn load_instruction_text_with_home(cwd: &str, home: Option<&Path>) -> String {
+pub(crate) fn load_instruction_text_with_home(
+    cwd: &str,
+    home: Option<&Path>,
+    xdg_config: Option<&Path>,
+) -> String {
     let mut text = String::new();
-    append_instruction_files(&mut text, cwd, home);
+    append_instruction_files(&mut text, cwd, home, xdg_config);
     text
 }
 
 pub fn load_instructions(cwd: &str) -> Instructions {
-    load_instructions_with_home(cwd, maki_storage::paths::home().as_deref())
+    load_instructions_with_home(
+        cwd,
+        maki_storage::paths::home().as_deref(),
+        maki_storage::paths::config_dir().ok().as_deref(),
+    )
 }
 
-fn load_instructions_with_home(cwd: &str, home: Option<&Path>) -> Instructions {
+pub(crate) fn load_instructions_with_home(
+    cwd: &str,
+    home: Option<&Path>,
+    xdg_config: Option<&Path>,
+) -> Instructions {
     let root = Path::new(cwd);
     let mut instr = Instructions::default();
-    append_instruction_files(&mut instr.text, cwd, home);
+    append_instruction_files(&mut instr.text, cwd, home, xdg_config);
 
     for filename in INSTRUCTION_FILES {
         let path = root.join(filename);
@@ -239,7 +260,7 @@ mod tests {
         fs::write(dir.path().join("AGENTS.md"), "team rules").unwrap();
         fs::write(dir.path().join("AGENTS.local.md"), "my preferences").unwrap();
 
-        let text = &load_instructions_with_home(dir.path().to_str().unwrap(), None).text;
+        let text = &load_instructions_with_home(dir.path().to_str().unwrap(), None, None).text;
         assert!(text.contains("team rules"));
         assert!(text.contains("my preferences"));
         assert!(
@@ -253,7 +274,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("AGENTS.local.md"), "solo preferences").unwrap();
         assert!(
-            load_instructions_with_home(dir.path().to_str().unwrap(), None)
+            load_instructions_with_home(dir.path().to_str().unwrap(), None, None)
                 .text
                 .contains("solo preferences")
         );
@@ -263,7 +284,7 @@ mod tests {
     fn load_instructions_empty_when_no_files() {
         let dir = tempfile::tempdir().unwrap();
         assert!(
-            load_instructions_with_home(dir.path().to_str().unwrap(), None)
+            load_instructions_with_home(dir.path().to_str().unwrap(), None, None)
                 .text
                 .is_empty()
         );
@@ -274,7 +295,7 @@ mod tests {
         let cwd = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
         assert!(
-            load_instructions_with_home(cwd.path().to_str().unwrap(), Some(home.path()))
+            load_instructions_with_home(cwd.path().to_str().unwrap(), Some(home.path()), None)
                 .text
                 .is_empty()
         );
@@ -288,7 +309,7 @@ mod tests {
         fs::write(home.path().join(".maki").join("AGENTS.md"), "global rules").unwrap();
 
         let text =
-            load_instructions_with_home(cwd.path().to_str().unwrap(), Some(home.path())).text;
+            load_instructions_with_home(cwd.path().to_str().unwrap(), Some(home.path()), None).text;
         assert!(text.contains("global rules"));
     }
 
@@ -347,7 +368,7 @@ mod tests {
         let agents_path = dir.path().join("AGENTS.md");
         fs::write(&agents_path, "content").unwrap();
 
-        let instr = load_instructions_with_home(dir.path().to_str().unwrap(), None);
+        let instr = load_instructions_with_home(dir.path().to_str().unwrap(), None, None);
         assert!(
             instr
                 .loaded

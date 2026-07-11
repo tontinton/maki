@@ -6,6 +6,7 @@ use crate::components::keybindings::KeybindContext;
 use crate::components::queue_panel;
 use crate::components::split_layout::{MIN_CHAT_ROWS, SplitLayout, carve};
 use crate::components::status_bar::{StatusBarContext, UsageStats};
+use crate::components::usage_modal::UsageModalContext;
 use crate::selection::{self, SelectableZone, SelectionZone, ZoneRegistry};
 use crate::theme;
 use maki_lua::Split;
@@ -273,6 +274,20 @@ impl App {
         if r.width > 0 {
             overlay_rect = r;
         }
+        if self.usage_modal.is_open() {
+            let quota = self.usage_slot.load();
+            let ctx = UsageModalContext {
+                total: &self.state.token_usage,
+                by_model: &self.state.session.meta.usage_by_model,
+                model: &self.state.model,
+                fast: self.state.fast,
+                quota: quota.as_deref(),
+            };
+            let r = self.usage_modal.view(frame, full, &ctx);
+            if r.width > 0 {
+                overlay_rect = r;
+            }
+        }
         let r = self.float_mgr.view(frame, full);
         if r.width > 0 {
             overlay_rect = r;
@@ -305,6 +320,7 @@ impl App {
             retry_info: self.retry_info.as_ref(),
             thinking_label: self.state.thinking.status_label(),
             fast: self.state.fast,
+            workflow: self.state.workflow,
             restoring: self.restoring.load(Ordering::Relaxed),
         };
         self.status_bar.view(frame, status_area, &ctx);
