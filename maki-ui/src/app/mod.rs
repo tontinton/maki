@@ -46,7 +46,7 @@ use crate::components::theme_picker::{ThemePicker, ThemePickerAction};
 use crate::components::tool_display::format_turn_usage;
 use crate::components::usage_modal::{UsageFetchState, UsageModal};
 use crate::components::{
-    Action, DisplayMessage, DisplayRole, ExitRequest, Overlay, RetryInfo, Status, is_ctrl,
+    Action, DisplayMessage, DisplayRole, ExitRequest, Overlay, Renders, RetryInfo, Status, is_ctrl,
 };
 use crate::image;
 use crate::selection::{SelectionState, ZoneRegistry};
@@ -171,6 +171,7 @@ pub struct App {
     pub(crate) shared_history: Option<Arc<ArcSwap<Vec<Message>>>>,
     pub(crate) btw_system: Option<Arc<ArcSwap<String>>>,
     pub(crate) shared_tool_outputs: Option<Arc<Mutex<HashMap<String, ToolOutput>>>>,
+    pub(crate) renders: Renders,
     pub(crate) image_paste_rx: Vec<flume::Receiver<Result<ImageSource, String>>>,
     storage_writer: Arc<StorageWriter>,
     pub(crate) shell: shell::ShellState,
@@ -250,6 +251,7 @@ impl App {
             shared_history: None,
             btw_system: None,
             shared_tool_outputs: None,
+            renders: Renders::empty(),
             image_paste_rx: vec![],
             storage_writer,
             shell: shell::ShellState::default(),
@@ -1135,6 +1137,7 @@ impl App {
         }
         let mut chat = Chat::new(subagent.name.clone(), self.ui_config);
         chat.set_restore_channel(self.lua_event_handle.clone(), self.restore_event_tx.clone());
+        chat.set_renders(self.renders.clone());
         chat.model_id = subagent.model.clone();
         if let Some(ref prompt) = subagent.prompt {
             chat.push_user_message(prompt);

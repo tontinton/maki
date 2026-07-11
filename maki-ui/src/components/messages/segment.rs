@@ -51,6 +51,11 @@ pub(super) struct Segment {
     pub msg_index: Option<usize>,
     pub truncation: SectionFlags,
     cached_height: Cell<Option<CachedHeight>>,
+    /// §11: stub height used before the segment is actually built (viewport-
+    /// bounded restore). `Some` while this is an out-of-viewport placeholder
+    /// whose real `Line`s have not been materialized; `None` once built, at
+    /// which point `cached_height` is authoritative.
+    estimated_height: Cell<Option<u16>>,
     pending_highlight: Option<u64>,
     highlight_range: Option<(usize, usize)>,
     highlight_key: HighlightKey,
@@ -72,6 +77,22 @@ impl Segment {
             lines: vec![Line::default()],
             ..Self::default()
         }
+    }
+
+    /// §11: a cheap placeholder standing in for an out-of-viewport message.
+    /// Carries only the estimated height (gap-inclusive) so `total_height` and
+    /// row mapping stay correct; the real `Line`s are built on scroll-in.
+    pub fn stub(msg_index: usize, estimated_height: u16) -> Self {
+        let s = Self {
+            msg_index: Some(msg_index),
+            ..Self::default()
+        };
+        s.estimated_height.set(Some(estimated_height));
+        s
+    }
+
+    pub fn is_stub(&self) -> bool {
+        self.estimated_height.get().is_some()
     }
 
     pub fn with_lines(
@@ -97,6 +118,9 @@ impl Segment {
     }
 
     pub fn height(&self, width: u16) -> u16 {
+        if let Some(h) = self.estimated_height.get() {
+            return h;
+        }
         if let Some(c) = self.cached_height.get()
             && c.at_width == width
         {
@@ -339,6 +363,32 @@ impl SegmentCache {
     pub fn invalidate_from_msg_count(&mut self) {
         self.msg_count = 0;
         self.segments.clear();
+    }
+
+    /// §11: detach every segment from `pos` onward, returning them in order.
+    /// Used to peel off a stubbed message's tail so its real segments can be
+    /// built in place without disturbing earlier messages.
+    pub fn split_off(&mut self, pos: usize) -> Vec<Segment> {
+        self.segments.split_off(pos)
+    }
+
+    pub fn extend(&mut self, tail: Vec<Segment>) {
+        self.segments.extend(tail);
+    }
+
+    /// §11: position of the first segment carrying `msg_index`, if any.
+    pub fn position_of_msg(&self, msg_index: usize) -> Option<usize> {
+        self.segments
+            .iter()
+            .position(|s| s.msg_index == Some(msg_index))
+    }
+
+    /// §11: drop every segment carrying `msg_index`, returning the position
+    /// the first one occupied (where replacement segments should be inserted).
+    pub fn remove_msg_segments(&mut self, msg_index: usize) -> Option<usize> {
+        let first = self.position_of_msg(msg_index)?;
+        self.segments.retain(|s| s.msg_index != Some(msg_index));
+        Some(first)
     }
 }
 

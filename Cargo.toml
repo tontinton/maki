@@ -84,9 +84,11 @@ maki-highlight = { path = "maki-highlight" }
 maki-markdown = { path = "maki-markdown" }
 maki-util = { path = "maki-util" }
 serde = { version = "1", features = ["derive", "rc"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 base58 = "0.2"
 uuid = { version = "1", default-features = false, features = ["std", "v7"] }
+structured-zstd = "0.0.48"
+fs4 = "0.13"
 ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 crossterm = { version = "0.29", features = ["osc52"] }
 color-eyre = { version = "0.6", default-features = false, features = ["track-caller"] }

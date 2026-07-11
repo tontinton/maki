@@ -13,7 +13,8 @@ use super::tool_display::{
     thinking_style, truncate_to_header, user_style,
 };
 use super::{
-    DisplayMessage, DisplayRole, ToolRole, ToolStatus, apply_scroll_delta, code_view::SectionFlags,
+    DisplayMessage, DisplayRole, Renders, ToolOutputHandle, ToolRole, ToolStatus,
+    apply_scroll_delta, code_view::SectionFlags,
 };
 use crate::animation::spinner_str;
 use crate::components::keybindings::key;
@@ -63,8 +64,11 @@ pub struct MessagesPanel {
     lua_clicks: HashMap<String, Vec<usize>>,
     live_bufs: HashMap<String, Arc<SharedBuf>>,
     tool_output_lines: ToolOutputLines,
+    renders: Renders,
     lua_event_handle: Option<EventHandle>,
     restore_event_tx: Option<EventSender>,
+    pending_restore: HashMap<String, maki_lua::RestoreItem>,
+    unbuilt_count: usize,
     show_thinking: bool,
     thinking_collapsed: bool,
     /// One re-bake per tool per generation; `snapshot_theme_gen`
@@ -107,8 +111,11 @@ impl MessagesPanel {
             lua_clicks: HashMap::new(),
             live_bufs: HashMap::new(),
             tool_output_lines: ui_config.tool_output_lines,
+            renders: Renders::empty(),
             lua_event_handle: None,
             restore_event_tx: None,
+            pending_restore: HashMap::new(),
+            unbuilt_count: 0,
             show_thinking: ui_config.show_thinking,
             thinking_collapsed: !ui_config.show_thinking,
             rebake_requested: HashMap::new(),
@@ -122,6 +129,28 @@ impl MessagesPanel {
     ) {
         self.lua_event_handle = event_handle;
         self.restore_event_tx = event_tx;
+    }
+
+    pub fn set_renders(&mut self, renders: Renders) {
+        self.renders = renders;
+    }
+
+    pub fn queue_restore_items(&mut self, items: Vec<maki_lua::RestoreItem>) {
+        for item in items {
+            self.pending_restore.insert(item.tool_use_id.clone(), item);
+        }
+    }
+
+    fn drain_pending_restore(&mut self, tool_id: &str) -> Option<maki_lua::RestoreItem> {
+        self.pending_restore.remove(tool_id)
+    }
+
+    fn fire_restore_item(&self, mut item: maki_lua::RestoreItem) {
+        let (Some(eh), Some(tx)) = (&self.lua_event_handle, &self.restore_event_tx) else {
+            return;
+        };
+        item.theme_gen = Some(self.theme_generation);
+        eh.request_restore(item, tx.clone());
     }
 
     pub fn push(&mut self, msg: DisplayMessage) {
@@ -142,6 +171,8 @@ impl MessagesPanel {
         self.lua_clicks.clear();
         self.live_bufs.clear();
         self.rebake_requested.clear();
+        self.pending_restore.clear();
+        self.unbuilt_count = 0;
         self.highlight_segment = None;
         self.thinking_collapsed = !self.show_thinking;
     }
@@ -175,7 +206,7 @@ impl MessagesPanel {
             msg.text = event.summary;
             msg.tool_input = event.input.map(Arc::new);
             msg.tool_raw_input = event.raw_input.map(Arc::new);
-            msg.tool_output = event.output.map(Arc::new);
+            msg.tool_output = event.output.map(ToolOutputHandle::ready);
             msg.annotation = event.annotation;
             msg.render_header = event.render_header;
             self.rebuild_tool_segment(&event.id);
@@ -192,7 +223,7 @@ impl MessagesPanel {
         );
         msg.tool_input = event.input.map(Arc::new);
         msg.tool_raw_input = event.raw_input.map(Arc::new);
-        msg.tool_output = event.output.map(Arc::new);
+        msg.tool_output = event.output.map(ToolOutputHandle::ready);
         msg.annotation = event.annotation;
         msg.render_header = event.render_header;
         msg.timestamp = Some(format_timestamp_now());
@@ -262,7 +293,7 @@ impl MessagesPanel {
             }
             _ => {}
         }
-        msg.tool_output = Some(Arc::new(event.output));
+        msg.tool_output = Some(ToolOutputHandle::ready(event.output));
         msg.live_output = None;
         self.rebuild_tool_segment(&event.id);
     }
@@ -466,6 +497,20 @@ impl MessagesPanel {
         self.current_snapshot_gen(tool_id)
     }
 
+    #[cfg(test)]
+    pub fn unbuilt_count(&self) -> usize {
+        self.unbuilt_count
+    }
+
+    #[cfg(test)]
+    pub fn built_segment_count(&self) -> usize {
+        self.cache
+            .segments()
+            .iter()
+            .filter(|s| !s.is_stub())
+            .count()
+    }
+
     pub fn flush(&mut self) {
         self.flush_thinking();
         if !self.streaming_text.is_empty() {
@@ -610,7 +655,7 @@ impl MessagesPanel {
             .messages
             .iter()
             .rfind(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == tool_id))?;
-        msg.tool_output.as_deref()?.owned_instructions()
+        msg.output_ref()?.owned_instructions()
     }
 
     pub fn is_animating(&self) -> bool {
@@ -655,6 +700,7 @@ impl MessagesPanel {
 
         if width_changed {
             self.cache.invalidate_from_msg_count();
+            self.unbuilt_count = 0;
             let thinking = thinking_style();
             let assistant = assistant_style();
             self.streaming_thinking.set_style(
@@ -720,6 +766,17 @@ impl MessagesPanel {
             if self.auto_scroll {
                 self.scroll_top = max_scroll;
             }
+        }
+
+        self.build_visible_segments();
+        let cached_height = self.cache.total_height(width);
+        let streaming_sum: u32 = streaming_heights.iter().map(|&h| h as u32).sum();
+        let total_lines: u16 = (cached_height + streaming_sum).min(u16::MAX as u32) as u16;
+        self.last_total_lines = total_lines;
+        let max_scroll = total_lines.saturating_sub(self.viewport_height);
+        self.scroll_top = self.scroll_top.min(max_scroll);
+        if !has_selection && self.auto_scroll {
+            self.scroll_top = max_scroll;
         }
 
         let viewport = Rect::new(area.x, area.y, width, area.height);
@@ -1073,10 +1130,7 @@ impl MessagesPanel {
         let rctx = self.rctx();
         let tl = Self::build_tool_segment_lines(msg, status, &rctx, exp);
 
-        let instructions = msg
-            .tool_output
-            .as_deref()
-            .and_then(|o| o.owned_instructions());
+        let instructions = msg.output_ref().and_then(|o| o.owned_instructions());
 
         let seg = self.cache.get_mut(seg_idx).unwrap();
         seg.search_text = tl.search_text.clone();
@@ -1091,95 +1145,146 @@ impl MessagesPanel {
         if !self.cache.needs_rebuild(self.messages.len()) {
             return;
         }
+        let width = self.viewport_width;
         for i in self.cache.msg_count()..self.messages.len() {
-            let msg = &self.messages[i];
+            let est = self.messages[i].estimate_segment_height(width);
+            self.cache.push(Segment::stub(i, est));
+            self.unbuilt_count += 1;
+        }
+        self.cache.mark_built(self.messages.len());
+    }
 
-            if let DisplayRole::Tool(t) = &msg.role {
-                let exp = self.expanded_tools.get(&t.id).copied().unwrap_or_default();
-                let status = t.status;
-                let tl = Self::build_tool_segment_lines(msg, status, &self.rctx(), exp);
-                let id = t.id.clone();
-                let search_text = tl.search_text.clone();
-                self.cache.push_spacer_if_needed();
-                let mut seg = Segment::with_tool(id.clone());
-                seg.search_text = search_text;
-                seg.apply_highlight(tl, &self.hl_worker);
-                self.cache.push(seg);
+    fn build_visible_segments(&mut self) {
+        if self.unbuilt_count == 0 {
+            return;
+        }
+        let width = self.viewport_width;
+        let view_top = self.scroll_top;
+        let view_bot = self.scroll_top.saturating_add(self.viewport_height);
+        let margin = self.viewport_height;
+        let win_top = view_top.saturating_sub(margin);
+        let win_bot = view_bot.saturating_add(margin);
 
-                let blocks = msg
-                    .tool_output
-                    .as_deref()
-                    .and_then(|o| o.owned_instructions());
-                if let Some(blocks) = blocks {
-                    let last_idx = self.cache.len().saturating_sub(1);
-                    self.upsert_instruction_segment(&id, &blocks, last_idx);
-                }
-            } else {
-                if matches!(&msg.role, DisplayRole::Thinking) && msg.thinking_collapsed {
-                    let text = msg.text.clone();
-                    let lines = self.build_cached_thinking_indicator(&text);
-                    let search_text = format!("thinking> {text}");
-                    self.cache.push_spacer_if_needed();
-                    self.cache
-                        .push(Segment::with_lines(lines, search_text, Some(i)));
-                    continue;
-                }
-                let style = match &msg.role {
-                    DisplayRole::User => user_style(),
-                    DisplayRole::Assistant => assistant_style(),
-                    DisplayRole::Thinking => thinking_style(),
-                    DisplayRole::Error => error_style(),
-                    DisplayRole::Done => done_style(),
-                    DisplayRole::Tool(_) => unreachable!(),
-                };
-                let prefix = if msg.plan_path.is_some() {
-                    ""
-                } else {
-                    style.prefix
-                };
-                let mut lines = if style.use_markdown {
-                    text_to_lines(
-                        &msg.text,
-                        prefix,
-                        style.text_style,
-                        style.prefix_style,
-                        self.viewport_width,
-                        style.max_line_bytes,
-                    )
-                } else {
-                    plain_lines(&msg.text, prefix, style.text_style, style.prefix_style)
-                };
-                if let Some(pp) = &msg.plan_path {
-                    if !msg.text.is_empty() {
-                        let rule = hr_line(self.viewport_width, theme::current().plan_rule);
-                        lines.insert(0, rule.clone());
-                        lines.push(rule);
-                    } else {
-                        lines.clear();
-                    }
-                    if !msg.text.is_empty() {
-                        lines.push(Line::from(""));
-                    }
-                    lines.push(Line::from(Span::styled(
-                        pp.to_owned(),
-                        theme::current().plan_path,
-                    )));
-                    lines.push(Line::from(Span::styled(
-                        format!(
-                            "{} to open in editor ($VISUAL / $EDITOR)",
-                            key::OPEN_EDITOR.label
-                        ),
-                        theme::current().tool_dim,
-                    )));
-                }
+        let mut to_build: Vec<usize> = Vec::new();
+        let mut cum: u32 = 0;
+        for seg in self.cache.segments() {
+            let h = seg.height(width) as u32;
+            let start = cum;
+            cum = cum.saturating_add(h);
+            if cum > win_top.into()
+                && start < win_bot.into()
+                && let Some(i) = seg.msg_index
+                && seg.is_stub()
+                && !to_build.contains(&i)
+            {
+                to_build.push(i);
+            }
+        }
+        for i in to_build {
+            self.build_msg_segments(i);
+            self.unbuilt_count = self.unbuilt_count.saturating_sub(1);
+        }
+    }
 
-                let search_text = format!("{prefix}{}", msg.text);
+    fn build_msg_segments(&mut self, i: usize) {
+        let Some(pos) = self.cache.remove_msg_segments(i) else {
+            return;
+        };
+        let tail = self.cache.split_off(pos);
+        self.build_one_message(i);
+        self.cache.extend(tail);
+    }
+
+    fn build_one_message(&mut self, i: usize) {
+        let renders = self.renders.clone();
+        let msg = &mut self.messages[i];
+        msg.resolve_tool_output(&renders);
+        let msg = &self.messages[i];
+
+        if let DisplayRole::Tool(t) = &msg.role {
+            let exp = self.expanded_tools.get(&t.id).copied().unwrap_or_default();
+            let status = t.status;
+            let tl = Self::build_tool_segment_lines(msg, status, &self.rctx(), exp);
+            let id = t.id.clone();
+            let search_text = tl.search_text.clone();
+            self.cache.push_spacer_if_needed();
+            let mut seg = Segment::with_tool(id.clone());
+            seg.search_text = search_text;
+            seg.apply_highlight(tl, &self.hl_worker);
+            self.cache.push(seg);
+
+            let blocks = msg.output_ref().and_then(|o| o.owned_instructions());
+            if let Some(blocks) = blocks {
+                let last_idx = self.cache.len().saturating_sub(1);
+                self.upsert_instruction_segment(&id, &blocks, last_idx);
+            }
+            if let Some(item) = self.drain_pending_restore(&id) {
+                self.fire_restore_item(item);
+            }
+        } else {
+            if matches!(&msg.role, DisplayRole::Thinking) && msg.thinking_collapsed {
+                let text = msg.text.clone();
+                let lines = self.build_cached_thinking_indicator(&text);
+                let search_text = format!("thinking> {text}");
                 self.cache.push_spacer_if_needed();
                 self.cache
                     .push(Segment::with_lines(lines, search_text, Some(i)));
+                return;
             }
+            let style = match &msg.role {
+                DisplayRole::User => user_style(),
+                DisplayRole::Assistant => assistant_style(),
+                DisplayRole::Thinking => thinking_style(),
+                DisplayRole::Error => error_style(),
+                DisplayRole::Done => done_style(),
+                DisplayRole::Tool(_) => unreachable!(),
+            };
+            let prefix = if msg.plan_path.is_some() {
+                ""
+            } else {
+                style.prefix
+            };
+            let mut lines = if style.use_markdown {
+                text_to_lines(
+                    &msg.text,
+                    prefix,
+                    style.text_style,
+                    style.prefix_style,
+                    self.viewport_width,
+                    style.max_line_bytes,
+                )
+            } else {
+                plain_lines(&msg.text, prefix, style.text_style, style.prefix_style)
+            };
+            if let Some(pp) = &msg.plan_path {
+                if !msg.text.is_empty() {
+                    let rule = hr_line(self.viewport_width, theme::current().plan_rule);
+                    lines.insert(0, rule.clone());
+                    lines.push(rule);
+                } else {
+                    lines.clear();
+                }
+                if !msg.text.is_empty() {
+                    lines.push(Line::from(""));
+                }
+                lines.push(Line::from(Span::styled(
+                    pp.to_owned(),
+                    theme::current().plan_path,
+                )));
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "{} to open in editor ($VISUAL / $EDITOR)",
+                        key::OPEN_EDITOR.label
+                    ),
+                    theme::current().tool_dim,
+                )));
+            }
+
+            let search_text = format!("{prefix}{}", msg.text);
+            self.cache.push_spacer_if_needed();
+            self.cache
+                .push(Segment::with_lines(lines, search_text, Some(i)));
         }
-        self.cache.mark_built(self.messages.len());
     }
 }
 

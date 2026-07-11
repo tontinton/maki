@@ -27,6 +27,8 @@ pub const SESSIONS_DIR: &str = "sessions";
 const CWD_INDEX_FILE: &str = "cwd_latest.json";
 const DEFAULT_TITLE: &str = "New session";
 const MAX_TITLE_LEN: usize = 60;
+const RETENTION_COUNT_CAP: usize = 200;
+const RETENTION_SIZE_CAP_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
@@ -196,12 +198,12 @@ pub struct StoredSubagent {
 }
 
 #[derive(Deserialize)]
-struct LegacyHeader {
-    version: u32,
-    id: MakiId,
-    title: String,
-    cwd: String,
-    updated_at: u64,
+pub(crate) struct LegacyHeader {
+    pub(crate) version: u32,
+    pub(crate) id: MakiId,
+    pub(crate) title: String,
+    pub(crate) cwd: String,
+    pub(crate) updated_at: u64,
 }
 
 pub trait TitleSource {
@@ -724,7 +726,7 @@ enum ScanRecord {
     Other,
 }
 
-fn scan_headers(cwd: &str, dir: &Path) -> Result<Vec<SessionSummary>, StorageError> {
+pub(crate) fn scan_headers(cwd: &str, dir: &Path) -> Result<Vec<SessionSummary>, StorageError> {
     let mut out = Vec::new();
     for path in session_entries(dir)? {
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
@@ -742,12 +744,54 @@ fn scan_headers(cwd: &str, dir: &Path) -> Result<Vec<SessionSummary>, StorageErr
             _ => {}
         }
     }
+    scan_folders(cwd, dir, &mut out)?;
     Ok(out)
+}
+
+/// §16: folder-format sessions listed via `meta.json` (carries `cwd` for the
+/// per-cwd filter). Upgrading never makes a session vanish — folder + flat
+/// coexist in the list until the flat is migrated on open.
+fn scan_folders(cwd: &str, dir: &Path, out: &mut Vec<SessionSummary>) -> Result<(), StorageError> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let meta_path = path.join("meta.json");
+        if !meta_path.exists() {
+            continue;
+        }
+        let data = match fs::read(&meta_path) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        let meta: crate::tree::MetaRecord = match serde_json::from_slice(&data) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if meta.cwd != cwd {
+            continue;
+        }
+        let Some(id): Option<MakiId> = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|s| s.parse().ok())
+        else {
+            continue;
+        };
+        out.push(SessionSummary {
+            id,
+            title: meta.title,
+            updated_at: meta.updated_at,
+        });
+    }
+    Ok(())
 }
 
 const TAIL_BUF: u64 = 4096;
 
-fn scan_jsonl_header(cwd: &str, path: &Path) -> Option<SessionSummary> {
+pub(crate) fn scan_jsonl_header(cwd: &str, path: &Path) -> Option<SessionSummary> {
     let mut file = File::open(path).ok()?;
     let header: JsonlHeader = {
         let mut reader = BufReader::new(&file);
@@ -769,7 +813,7 @@ fn scan_jsonl_header(cwd: &str, path: &Path) -> Option<SessionSummary> {
     })
 }
 
-fn read_last_meta(file: &mut File) -> Option<(String, u64)> {
+pub(crate) fn read_last_meta(file: &mut File) -> Option<(String, u64)> {
     let len = file.seek(SeekFrom::End(0)).ok()?;
     let mut tail = TAIL_BUF.min(len);
     loop {
@@ -793,7 +837,7 @@ fn read_last_meta(file: &mut File) -> Option<(String, u64)> {
     }
 }
 
-fn scan_legacy_header(cwd: &str, path: &Path) -> Option<SessionSummary> {
+pub(crate) fn scan_legacy_header(cwd: &str, path: &Path) -> Option<SessionSummary> {
     let data = fs::read(path).ok()?;
     let h: LegacyHeader = serde_json::from_slice(&data).ok()?;
     if h.version != SESSION_VERSION || h.cwd != cwd {
@@ -806,7 +850,7 @@ fn scan_legacy_header(cwd: &str, path: &Path) -> Option<SessionSummary> {
     })
 }
 
-fn session_entries(dir: &Path) -> Result<Vec<PathBuf>, StorageError> {
+pub(crate) fn session_entries(dir: &Path) -> Result<Vec<PathBuf>, StorageError> {
     let mut entries = Vec::new();
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
@@ -825,6 +869,81 @@ fn session_entries(dir: &Path) -> Result<Vec<PathBuf>, StorageError> {
         }
     }
     Ok(entries)
+}
+
+// -- Retention (§15): session-count + total-size caps, oldest-first deletion
+// only when exceeded, always with a startup notice naming what was deleted.
+
+pub fn apply_retention(dir: &Path) -> Result<Vec<String>, StorageError> {
+    let mut entries: Vec<(PathBuf, u64, u64)> = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let id = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
+        if id == CWD_INDEX_FILE {
+            continue;
+        }
+        let size = dir_size(&path).unwrap_or(0);
+        let mtime = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        entries.push((path, size, mtime));
+    }
+
+    let total: u64 = entries.iter().map(|(_, s, _)| *s).sum();
+    let count = entries.len();
+    if count <= RETENTION_COUNT_CAP && total <= RETENTION_SIZE_CAP_BYTES {
+        return Ok(Vec::new());
+    }
+
+    entries.sort_unstable_by_key(|(_, _, mtime)| *mtime);
+    let mut deleted = Vec::new();
+    let mut current_count = count;
+    let mut current_size = total;
+    for (path, size, _mtime) in &entries {
+        if current_count <= RETENTION_COUNT_CAP && current_size <= RETENTION_SIZE_CAP_BYTES {
+            break;
+        }
+        let removed = if path.is_dir() {
+            fs::remove_dir_all(path).is_ok()
+        } else {
+            fs::remove_file(path).is_ok()
+        };
+        if removed {
+            let _ = fs::remove_file(path.with_extension("jsonl.bak"));
+            current_count -= 1;
+            current_size = current_size.saturating_sub(*size);
+            if let Some(id) = path.file_name().and_then(|n| n.to_str()) {
+                deleted.push(id.to_string());
+            }
+        }
+    }
+    if !deleted.is_empty() {
+        warn!(deleted = ?deleted, "retention cap exceeded; deleted oldest sessions");
+    }
+    Ok(deleted)
+}
+
+fn dir_size(path: &Path) -> Result<u64, std::io::Error> {
+    let meta = fs::metadata(path)?;
+    if meta.is_file() {
+        return Ok(meta.len());
+    }
+    let mut total = 0u64;
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let p = entry.path();
+        total += dir_size(&p).unwrap_or(0);
+    }
+    Ok(total)
 }
 
 fn find_legacy_file(dir: &Path, id: MakiId) -> Option<PathBuf> {
@@ -1010,13 +1129,17 @@ mod tests {
         CWD_INDEX_FILE, DEFAULT_TITLE, MAX_TITLE_LEN, SESSION_VERSION, TAIL_BUF, generate_title,
         load_cwd_index, update_cwd_index, write_full_session,
     };
-    use super::{Session, SessionError, SessionLog, StorageError, TitleSource};
+    use super::{
+        RETENTION_COUNT_CAP, RETENTION_SIZE_CAP_BYTES, Session, SessionError, SessionLog,
+        StorageError, TitleSource, apply_retention,
+    };
     use maki_util::MakiId;
     use serde_json::Value;
     use std::collections::HashMap;
-    use std::fs::{self, OpenOptions};
+    use std::fs::{self, FileTimes, OpenOptions};
     use std::io::Write;
     use std::path::Path;
+    use std::time::UNIX_EPOCH;
     use tempfile::TempDir;
     use test_case::test_case;
 
@@ -1763,5 +1886,120 @@ mod tests {
         let list = TestSession::list_in("/project", dir).unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].title, "big-meta");
+    }
+
+    fn set_mtime(path: &Path, secs: u64) {
+        let times =
+            FileTimes::new().set_modified(UNIX_EPOCH + std::time::Duration::from_secs(secs));
+        let f = OpenOptions::new().write(true).open(path).unwrap();
+        f.set_times(times).unwrap();
+    }
+
+    #[test]
+    fn retention_deletes_oldest_first_over_count_cap() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let extra = 5;
+        let total = RETENTION_COUNT_CAP + extra;
+
+        let mut all_ids = Vec::new();
+        for i in 0..total {
+            let mut session: TestSession = Session::new("m", "/project");
+            session.messages.push(user_message(&format!("msg-{i}")));
+            session.save_to(dir).unwrap();
+            all_ids.push(session.id);
+            // Give each session a distinct, increasing mtime so the oldest are
+            // the earliest-created (i=0 is oldest).
+            set_mtime(&dir.join(format!("{}.jsonl", session.id)), 1000 + i as u64);
+        }
+
+        let deleted = apply_retention(dir).unwrap();
+        assert_eq!(deleted.len(), extra, "expected exactly {extra} deleted");
+
+        // The oldest `extra` sessions are gone.
+        for id in &all_ids[..extra] {
+            assert!(
+                !dir.join(format!("{id}.jsonl")).exists(),
+                "{id} should have been deleted"
+            );
+        }
+        // The newest RETENTION_COUNT_CAP survive.
+        assert_eq!(deleted.len(), extra);
+        for id in &all_ids[extra..] {
+            assert!(
+                dir.join(format!("{id}.jsonl")).exists(),
+                "{id} should survive retention"
+            );
+        }
+        // Deleted list contains the oldest session filenames.
+        for id in &all_ids[..extra] {
+            let fname = format!("{id}.jsonl");
+            assert!(
+                deleted.contains(&fname),
+                "{fname} should be in deleted list"
+            );
+        }
+    }
+
+    #[test]
+    fn retention_noop_under_caps() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let count = RETENTION_COUNT_CAP.min(10);
+        for i in 0..count {
+            let mut session: TestSession = Session::new("m", "/project");
+            session.messages.push(user_message(&format!("msg-{i}")));
+            session.save_to(dir).unwrap();
+        }
+
+        let deleted = apply_retention(dir).unwrap();
+        assert!(deleted.is_empty(), "nothing should be deleted under caps");
+    }
+
+    #[test]
+    fn retention_deletes_oldest_first_over_size_cap() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        // Create sessions each large enough that a few exceed the size cap.
+        let big = RETENTION_SIZE_CAP_BYTES / 4 + 1;
+        let num = 6;
+        let mut all_ids = Vec::new();
+        for i in 0..num {
+            let mut session: TestSession = Session::new("m", "/project");
+            session.messages.push(user_message(&format!("msg-{i}")));
+            session.save_to(dir).unwrap();
+            let path = dir.join(format!("{}.jsonl", session.id));
+            // Pad the session file past the cap by appending filler; size cap
+            // is on total dir bytes.
+            {
+                let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+                f.write_all(&vec![b'.'; big as usize]).unwrap();
+            }
+            // Update the file's mtime AFTER growing it so dir_size sees the
+            // filled file (apply_retention reads metadata len, which is fine,
+            // but mtime must reflect our ordering).
+            set_mtime(&path, 1000 + i as u64);
+            all_ids.push(session.id);
+        }
+        // Total bytes = num * big ≈ 1.5 * size cap, so retention must fire.
+        let deleted = apply_retention(dir).unwrap();
+        assert!(!deleted.is_empty(), "expected size-cap to trigger deletion");
+        // Oldest (i=0) should be among the first deleted; newest (i=num-1) survives.
+        let oldest_fname = format!("{}.jsonl", all_ids[0]);
+        let newest_fname = format!("{}.jsonl", all_ids[num - 1]);
+        assert!(deleted.contains(&oldest_fname), "oldest should be deleted");
+        assert!(!deleted.contains(&newest_fname), "newest should survive");
+        // Verify the remaining total is under the size cap.
+        let mut remaining_size: u64 = 0;
+        for id in &all_ids {
+            let p = dir.join(format!("{id}.jsonl"));
+            if p.exists() {
+                remaining_size += fs::metadata(&p).unwrap().len();
+            }
+        }
+        assert!(
+            remaining_size <= RETENTION_SIZE_CAP_BYTES,
+            "remaining {remaining_size} exceeds size cap {RETENTION_SIZE_CAP_BYTES}"
+        );
     }
 }

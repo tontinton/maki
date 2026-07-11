@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use crate::components::messages::MessagesPanel;
 use crate::components::tool_display::append_annotation;
-use crate::components::{DisplayMessage, DisplayRole, ToolRole, ToolStatus};
+use crate::components::{DisplayMessage, DisplayRole, ToolOutputHandle, ToolRole, ToolStatus};
 use crate::markdown::truncate_output;
 
 use crate::selection::Selection;
@@ -73,6 +73,14 @@ impl Chat {
     ) {
         self.messages_panel
             .set_restore_channel(event_handle, event_tx);
+    }
+
+    pub(crate) fn set_renders(&mut self, renders: crate::components::Renders) {
+        self.messages_panel.set_renders(renders);
+    }
+
+    pub(crate) fn queue_restore_items(&mut self, items: Vec<maki_lua::RestoreItem>) {
+        self.messages_panel.queue_restore_items(items);
     }
 
     pub fn handle_event(&mut self, event: AgentEvent, plan_path: Option<&Path>) -> ChatEventResult {
@@ -382,31 +390,32 @@ pub fn history_to_display(
                                     (s, Some(&**text))
                                 })
                                 .unwrap_or((ToolStatus::Success, None));
-                            let stored = tool_outputs.get(id.as_str());
-                            let (text, truncated_lines, tool_output, mut annotation) =
-                                build_loaded_tool(
-                                    static_name,
-                                    &summary,
-                                    stored.cloned(),
-                                    result_text,
-                                    tool_output_lines,
-                                );
+                            let stored = tool_outputs.get(id.as_str()).cloned();
+                            let (text, truncated_lines, mut annotation) = build_loaded_tool(
+                                static_name,
+                                &summary,
+                                stored.clone(),
+                                result_text,
+                                tool_output_lines,
+                            );
                             if let Some(ta) =
                                 tool_call.as_deref().and_then(|tc| tc.start_annotation())
                             {
                                 append_annotation(&mut annotation, &ta);
                             }
                             let output = stored
+                                .as_ref()
                                 .map(|o| o.as_text())
                                 .or_else(|| result_text.map(str::to_owned))
                                 .unwrap_or_default();
-                            let state = stored.and_then(|o| o.state().cloned());
+                            let state = stored.as_ref().and_then(|o| o.state().cloned());
                             // Structured outputs (e.g. Diff) render natively
                             // in Rust with full fidelity; a Lua restore
                             // snapshot would replace that with a poorer text
                             // view.
-                            let rust_rendered =
-                                stored.is_some_and(|o| o.structured_display_text().is_some());
+                            let rust_rendered = stored
+                                .as_ref()
+                                .is_some_and(|o| o.structured_display_text().is_some());
                             if !rust_rendered {
                                 restore_items.push(maki_lua::RestoreItem {
                                     tool: Arc::from(static_name),
@@ -429,7 +438,9 @@ pub fn history_to_display(
                                 text,
                                 tool_input: None,
                                 tool_raw_input: Some(Arc::new(input.clone())),
-                                tool_output,
+                                tool_output: stored
+                                    .is_some()
+                                    .then(|| ToolOutputHandle::Deferred(id.clone())),
                                 live_output: None,
                                 annotation,
                                 plan_path: None,
@@ -462,16 +473,16 @@ pub(crate) fn restore_item_for(
         return None;
     };
     let input = msg.tool_raw_input.as_deref()?;
-    let stored = msg.tool_output.as_deref()?;
-    if stored.structured_display_text().is_some() {
+    let output = msg.output_ref()?;
+    if output.structured_display_text().is_some() {
         return None;
     }
-    let output = stored.as_text();
-    let state = stored.state().cloned();
+    let output_text = output.as_text();
+    let state = output.state().cloned();
     Some(maki_lua::RestoreItem {
         tool: role.name.clone(),
         tool_use_id: role.id.clone(),
-        output,
+        output: output_text,
         input: input.clone(),
         is_error: role.status == ToolStatus::Error,
         tool_output_lines,
@@ -489,11 +500,11 @@ fn build_loaded_tool(
     reconstructed: Option<ToolOutput>,
     result_text: Option<&str>,
     tool_output_lines: &ToolOutputLines,
-) -> (String, usize, Option<Arc<ToolOutput>>, Option<String>) {
+) -> (String, usize, Option<String>) {
     match reconstructed {
         Some(output) => {
             let annotation = output.annotation();
-            (summary.to_owned(), 0, Some(Arc::new(output)), annotation)
+            (summary.to_owned(), 0, annotation)
         }
         None => {
             let result = result_text.unwrap_or("");
@@ -503,15 +514,10 @@ fn build_loaded_tool(
                 None
             };
             if result.is_empty() {
-                (summary.to_owned(), 0, None, annotation)
+                (summary.to_owned(), 0, annotation)
             } else {
                 let tr = truncate_output(result, tool_output_lines.get(tool));
-                (
-                    format!("{}\n{}", summary, tr.kept),
-                    tr.skipped,
-                    None,
-                    annotation,
-                )
+                (format!("{}\n{}", summary, tr.kept), tr.skipped, annotation)
             }
         }
     }
@@ -540,8 +546,10 @@ fn build_tool_results_map(messages: &[Message]) -> HashMap<&str, (bool, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::components::Renders;
     use maki_agent::{AgentEvent, ToolDoneEvent, ToolOutput, ToolStartEvent};
     use maki_config::UiConfig;
+    use std::sync::Mutex;
     use test_case::test_case;
 
     fn tool_start(id: &str, tool: &str) -> AgentEvent {
@@ -802,9 +810,11 @@ mod tests {
             let discriminant = std::mem::discriminant(&output);
             let msgs = tool_use_pair(tool_name, input_json, "ok", false);
             let outputs = HashMap::from([("t1".into(), output)]);
-            let display = history_to_display(&msgs, &outputs, &ToolOutputLines::default()).0;
+            let renders = Renders::from_memo(Arc::new(Mutex::new(outputs.clone())));
+            let mut display = history_to_display(&msgs, &outputs, &ToolOutputLines::default()).0;
+            display[0].resolve_tool_output(&renders);
             assert_eq!(
-                std::mem::discriminant(display[0].tool_output.as_deref().unwrap()),
+                std::mem::discriminant(display[0].output_ref().unwrap()),
                 discriminant,
                 "stored {tool_name} output should pass through"
             );
@@ -893,7 +903,9 @@ mod tests {
             name: tool.into(),
         }));
         msg.tool_raw_input = Some(Arc::new(serde_json::json!({ "q": tool })));
-        msg.tool_output = Some(Arc::new(ToolOutput::Plain(RESTORE_OUTPUT.into())));
+        msg.tool_output = Some(ToolOutputHandle::Ready(Arc::new(ToolOutput::Plain(
+            RESTORE_OUTPUT.into(),
+        ))));
         msg
     }
 
@@ -915,7 +927,9 @@ mod tests {
     #[test]
     fn restore_item_for_skips_structured_outputs_rust_renders() {
         let mut msg = tool_msg_with_input("edit");
-        msg.tool_output = Some(Arc::new(edit_output("/src/main.rs")));
+        msg.tool_output = Some(ToolOutputHandle::Ready(Arc::new(edit_output(
+            "/src/main.rs",
+        ))));
         assert!(restore_item_for(&msg, ToolOutputLines::default(), RESTORE_THEME_GEN).is_none());
     }
 

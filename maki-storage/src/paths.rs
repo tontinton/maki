@@ -241,6 +241,34 @@ pub fn cache_dir() -> Result<PathBuf, std::io::Error> {
     ensure(&p.cache)
 }
 
+/// `<base>/sessions/<id>/` — the per-session folder (§A.10). Folder creation
+/// is deferred to first append (§1); this is pure path computation.
+pub fn session_dir(base: &Path, id: &str) -> PathBuf {
+    base.join(SESSIONS_DIR).join(id)
+}
+
+pub fn log_path(dir: &Path) -> PathBuf {
+    dir.join(LOG_FILE)
+}
+
+pub fn meta_path(dir: &Path) -> PathBuf {
+    dir.join(META_FILE)
+}
+
+pub fn renders_path(dir: &Path) -> PathBuf {
+    dir.join(RENDERS_FILE)
+}
+
+pub fn lock_path(dir: &Path) -> PathBuf {
+    dir.join(LOCK_FILE)
+}
+
+const SESSIONS_DIR: &str = "sessions";
+const LOG_FILE: &str = "log.jsonl";
+const META_FILE: &str = "meta.json";
+const RENDERS_FILE: &str = "renders.bin";
+const LOCK_FILE: &str = "lock";
+
 pub struct XdgPaths {
     pub config: PathBuf,
     pub state: PathBuf,

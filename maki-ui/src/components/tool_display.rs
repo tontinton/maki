@@ -1,5 +1,5 @@
 use super::status_bar::format_tokens;
-use super::{DisplayMessage, ToolStatus};
+use super::{DisplayMessage, ToolOutputHandle, ToolStatus};
 
 use super::code_view;
 use crate::animation::{spinner_frame, spinner_str};
@@ -623,7 +623,7 @@ pub fn build_tool_lines(
     };
 
     let mut b = ToolLineBuilder::new(rctx.width, expanded, rctx.tool_output_lines.get(tool_name));
-    b.apply_output_format(msg.tool_output.as_deref());
+    b.apply_output_format(msg.output_ref());
     b.push_header(
         tool_name,
         header,
@@ -634,17 +634,12 @@ pub fn build_tool_lines(
     let has_snapshot = msg.render_snapshot.is_some();
     b.push_code_content(
         msg.tool_input.as_deref(),
-        if has_snapshot {
-            None
-        } else {
-            msg.tool_output.as_deref()
-        },
+        if has_snapshot { None } else { msg.output_ref() },
     );
     if let Some(ref snapshot) = msg.render_snapshot {
         let search_text = msg
-            .tool_output
-            .as_ref()
-            .and_then(|o| match o.as_ref() {
+            .output_ref()
+            .and_then(|o| match o {
                 ToolOutput::Plain(t) | ToolOutput::Markdown(t) | ToolOutput::ReadDir(t) => {
                     Some(t.text.as_str())
                 }
@@ -656,11 +651,11 @@ pub fn build_tool_lines(
         // while only the script snapshot is on screen. Show the error below
         // it, unless the handler already drew it into the body.
         if matches!(status, ToolStatus::Error) {
-            let err_text = msg.tool_output.as_deref().map(|o| o.as_text());
+            let err_text = msg.output_ref().map(|o| o.as_text());
             let shown = err_text.as_deref().or(body).map_or("", str::trim);
             if !shown.is_empty() && !snapshot.text().contains(shown) {
                 let resolved = resolve_output(
-                    msg.tool_output.as_deref(),
+                    msg.output_ref(),
                     body,
                     msg.live_output.as_deref(),
                     msg.truncated_lines,
@@ -671,7 +666,7 @@ pub fn build_tool_lines(
         }
     } else {
         let resolved = resolve_output(
-            msg.tool_output.as_deref(),
+            msg.output_ref(),
             body,
             msg.live_output.as_deref(),
             msg.truncated_lines,
@@ -681,7 +676,9 @@ pub fn build_tool_lines(
     }
     b.finish(
         msg.tool_input.clone(),
-        msg.tool_output.clone(),
+        msg.tool_output
+            .as_ref()
+            .and_then(ToolOutputHandle::ready_arc),
         TOOL_BODY_INDENT,
     )
 }
@@ -803,7 +800,7 @@ mod tests {
             text: text.into(),
             tool_input: input.map(Arc::new),
             tool_raw_input: None,
-            tool_output: output.map(Arc::new),
+            tool_output: output.map(|o| ToolOutputHandle::Ready(Arc::new(o))),
             live_output: None,
             annotation: None,
             plan_path: None,
@@ -941,7 +938,9 @@ mod tests {
             text: "Find auth".into(),
             tool_input: None,
             tool_raw_input: None,
-            tool_output: Some(Arc::new(ToolOutput::Markdown(output.into()))),
+            tool_output: Some(ToolOutputHandle::Ready(Arc::new(ToolOutput::Markdown(
+                output.into(),
+            )))),
             live_output: None,
             annotation: None,
             plan_path: None,
@@ -1036,7 +1035,9 @@ mod tests {
             text: format!("src/lib.rs\n{body}"),
             tool_input: None,
             tool_raw_input: None,
-            tool_output: Some(Arc::new(ToolOutput::Plain(body.to_owned().into()))),
+            tool_output: Some(ToolOutputHandle::Ready(Arc::new(ToolOutput::Plain(
+                body.to_owned().into(),
+            )))),
             live_output: None,
             annotation: None,
             plan_path: None,
@@ -1076,7 +1077,9 @@ mod tests {
             text: "src/lib.rs\nplain fallback".into(),
             tool_input: None,
             tool_raw_input: None,
-            tool_output: Some(Arc::new(ToolOutput::Plain("plain fallback".into()))),
+            tool_output: Some(ToolOutputHandle::Ready(Arc::new(ToolOutput::Plain(
+                "plain fallback".into(),
+            )))),
             live_output: None,
             annotation: None,
             plan_path: None,
@@ -1202,7 +1205,9 @@ mod tests {
                 name: "code_execution".into(),
             })),
             text: "2 lines".into(),
-            tool_output: Some(Arc::new(ToolOutput::Plain(DENIAL_MSG.into()))),
+            tool_output: Some(ToolOutputHandle::Ready(Arc::new(ToolOutput::Plain(
+                DENIAL_MSG.into(),
+            )))),
             ..snapshot_msg(make_snapshot(vec![vec![SnapshotSpan {
                 text: snapshot_text.into(),
                 style: SpanStyle::Default,
@@ -1356,7 +1361,9 @@ mod tests {
         } else {
             (
                 ToolStatus::Success,
-                Some(Arc::new(ToolOutput::Plain(full_body.into()))),
+                Some(ToolOutputHandle::Ready(Arc::new(ToolOutput::Plain(
+                    full_body.into(),
+                )))),
                 None,
             )
         };
@@ -1464,13 +1471,13 @@ mod tests {
             text: "read /src/main.rs".into(),
             tool_input: None,
             tool_raw_input: None,
-            tool_output: Some(Arc::new(ToolOutput::ReadCode {
+            tool_output: Some(ToolOutputHandle::Ready(Arc::new(ToolOutput::ReadCode {
                 path: "main.rs".into(),
                 start_line: 1,
                 lines,
                 total_lines: line_count,
                 instructions,
-            })),
+            }))),
             live_output: None,
             annotation: None,
             plan_path: None,
@@ -1488,7 +1495,7 @@ mod tests {
     #[test_case(true,  false, true  ; "expanded_shows_all_instructions")]
     fn instructions_segment(expanded: bool, expect_truncation: bool, expect_all_visible: bool) {
         let msg = read_msg_with_instructions(3, 30);
-        let output = msg.tool_output.as_deref().unwrap();
+        let output = msg.output_ref().unwrap();
         let blocks = output.instructions().unwrap();
         let tl = build_instructions_lines(blocks, 80, expanded);
         assert_eq!(tl.truncation.any(), expect_truncation);
@@ -1580,7 +1587,9 @@ mod tests {
             text: "src/lib.rs\nbody_text_here".into(),
             tool_input: None,
             tool_raw_input: None,
-            tool_output: Some(Arc::new(ToolOutput::Plain("llm_output_here".into()))),
+            tool_output: Some(ToolOutputHandle::Ready(Arc::new(ToolOutput::Plain(
+                "llm_output_here".into(),
+            )))),
             live_output: None,
             annotation: None,
             plan_path: None,
