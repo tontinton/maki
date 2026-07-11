@@ -27,14 +27,27 @@ local function fuzzy_match(item, query)
     return nil
   end
   local label = label_of(item)
-  local positions = maki.text.fuzzy_match(query, search_text(item))
-  if not positions then
-    return nil
-  end
+  local hay = search_text(item):lower()
+  local q = query:lower()
+  local label_len = #label
+  local hpos = 1
   local label_indices = {}
-  for _, pos in ipairs(positions) do
-    if pos <= #label then
-      label_indices[#label_indices + 1] = pos
+  for qi = 1, #q do
+    local needle = q:byte(qi)
+    local found = false
+    while hpos <= #hay do
+      local ch = hay:byte(hpos)
+      hpos = hpos + 1
+      if ch == needle then
+        if hpos - 1 <= label_len then
+          label_indices[#label_indices + 1] = hpos - 1
+        end
+        found = true
+        break
+      end
+    end
+    if not found then
+      return nil
     end
   end
   return label_indices

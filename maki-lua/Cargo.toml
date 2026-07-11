@@ -20,7 +20,6 @@ maki-interpreter = { workspace = true }
 maki-markdown = { workspace = true }
 maki-providers = { workspace = true }
 mlua = { workspace = true }
-nucleo-matcher = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 thiserror = { workspace = true }
