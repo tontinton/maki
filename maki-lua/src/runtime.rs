@@ -156,7 +156,7 @@ pub enum Request {
         tool: Arc<str>,
         input: Value,
         live: LiveCtx,
-        tool_output_lines: maki_config::ToolOutputLines,
+        ctx: Box<LuaCtx>,
         reply: flume::Sender<()>,
     },
 }
@@ -1237,7 +1237,9 @@ impl LuaRuntime {
             }),
         );
 
-        let ctx = crate::api::util::ctx::restore_ctx(&self.lua, item.tool_output_lines, item.state)
+        let ctx = self
+            .lua
+            .create_userdata(LuaCtx::restore(item.tool_output_lines, item.state))
             .ok()?;
         let inner = thread
             .into_async::<LuaValue>((input_lua, &*item.output, item.is_error, ctx))
@@ -1578,12 +1580,12 @@ async fn run_tool_start(
     tool: &str,
     input: Value,
     live: LiveCtx,
-    tool_output_lines: maki_config::ToolOutputLines,
+    ctx: Box<LuaCtx>,
 ) {
-    let scope = TaskScope::new(lua, TaskCell::new(CancelToken::none(), None, Some(live)));
+    let scope = TaskScope::new(lua, TaskCell::new(ctx.cancel.clone(), None, Some(live)));
     let run = async {
         let input_lua = json_to_lua(lua, &input)?;
-        let ctx_ud = lua.create_userdata(crate::api::util::ctx::StartCtx { tool_output_lines })?;
+        let ctx_ud = lua.create_userdata(*ctx)?;
         let thread = lua.create_thread(func)?;
         thread.into_async::<LuaValue>((input_lua, ctx_ud))?.await
     };
@@ -1632,7 +1634,7 @@ async fn run_tool_call(
         Ok(v) => v,
         Err(e) => return ToolCallReply::err(strip_traceback(&e)),
     };
-    let live_sink = ctx.agent.live_sink.clone();
+    let live_sink = ctx.agent().and_then(|a| a.live_sink.clone());
     let ctx_ud = match lua.create_userdata(*ctx) {
         Ok(u) => u,
         Err(e) => return ToolCallReply::err(strip_traceback(&e)),
@@ -1952,7 +1954,7 @@ pub fn spawn(
                             tool,
                             input,
                             live,
-                            tool_output_lines,
+                            ctx,
                             reply,
                         } => {
                             let func = {
@@ -1973,8 +1975,7 @@ pub fn spawn(
                             let ex_ref = Rc::clone(&ex);
                             ex.spawn(async move {
                                 let _gate_guard = GateGuard::new(&g);
-                                run_tool_start(&lua, func, &tool, input, live, tool_output_lines)
-                                    .await;
+                                run_tool_start(&lua, func, &tool, input, live, ctx).await;
                                 drain_spawn_queue(&lua, &ex_ref, &g);
                                 let _ = reply.send(());
                             })

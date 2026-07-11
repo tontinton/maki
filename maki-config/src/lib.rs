@@ -579,7 +579,8 @@ impl UiConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ToolOutputLines {
     pub bash: usize,
     pub code_execution: usize,

@@ -136,16 +136,7 @@ end
 local function child_body_buf(c, tol)
   local output = c.output or ""
   local t = maki.api.get_tool(c.tool)
-  local buf = t
-    and t.restore
-    and t.restore(c.params, output, c.status == STATUS.ERROR, {
-      tool_output_lines = function()
-        return tol
-      end,
-      state = function()
-        return nil
-      end,
-    })
+  local buf = t and t.restore and t.restore(c.params, output, c.status == STATUS.ERROR, { tool_output_lines = tol })
   return buf or ToolView.restore(output, { max_lines = tol[c.tool] or tol.other, keep = "head" })
 end
 

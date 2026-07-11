@@ -93,22 +93,31 @@ local function handler(input, ctx)
     end
   end
 
-  local model = maki.agent.resolve_model(ctx, {
+  local model, model_err = maki.agent.resolve_model(ctx, {
     tier = input.model_tier,
   })
+  if model_err then
+    return { llm_output = model_err, is_error = true }
+  end
 
   local audience = subagent_type == "research" and "research_sub" or "general_sub"
   local prompt_id = subagent_type == "research" and "research" or "general"
-  local system = maki.agent.system_prompt(ctx, {
+  local system, system_err = maki.agent.system_prompt(ctx, {
     prompt_id = prompt_id,
     instructions = true,
   })
+  if system_err then
+    return { llm_output = system_err, is_error = true }
+  end
 
-  local tool_defs = maki.agent.tools(ctx, {
+  local tool_defs, tools_err = maki.agent.tools(ctx, {
     audience = audience,
     spec = model.spec,
     include_mcp = true,
   })
+  if tools_err then
+    return { llm_output = tools_err, is_error = true }
+  end
 
   local captured, last_errors
   local local_tools
@@ -138,7 +147,7 @@ local function handler(input, ctx)
 
   -- pcall so a raised error cannot leak the permit.
   local ok, out = pcall(function()
-    local sess = maki.agent.session(ctx, {
+    local sess, sess_err = maki.agent.session(ctx, {
       model_spec = model.spec,
       system = system,
       tools = tool_defs,
@@ -146,6 +155,9 @@ local function handler(input, ctx)
       audience = audience,
       name = input.description,
     })
+    if sess_err then
+      return { llm_output = sess_err, is_error = true }
+    end
 
     local message = input.prompt
     if validator then

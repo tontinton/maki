@@ -439,6 +439,120 @@ fn restore_reads_persisted_state(with_state: bool, expected: &str) {
     assert!(text.contains(expected), "expected {expected:?} in: {text}");
 }
 
+#[test]
+fn restore_ctx_is_userdata_with_gated_capabilities() {
+    let src = format!(
+        r#"maki.api.register_tool({{
+            name = "ctx_restore",
+            description = "t",
+            schema = {MINIMAL_SCHEMA},
+            handler = function() return "ok" end,
+            restore = function(input, output, is_error, rctx)
+                local cfg, cfg_err = rctx:config()
+                local _, fin_err = rctx:finish("x")
+                local _, dl_err = rctx:set_deadline(5)
+                local parts = {{
+                    rctx:state().tag,
+                    type(rctx:tool_output_lines()) == "table" and "tol_ok" or "tol_bad",
+                    (cfg == nil and cfg_err ~= nil) and "config_err" or "config_ok",
+                    fin_err ~= nil and "finish_err" or "finish_ok",
+                    dl_err ~= nil and "deadline_err" or "deadline_ok",
+                    rctx:cancelled() == false and "cancelled_ok" or "cancelled_bad",
+                }}
+                local buf = maki.ui.buf()
+                buf:line(table.concat(parts, " "))
+                return buf
+            end
+        }})"#
+    );
+    let text = restore_snapshot_text(
+        &src,
+        "ctx_restore",
+        Vec::new(),
+        Some(serde_json::json!({ "tag": "hi" })),
+    );
+    assert!(
+        text.contains("hi tol_ok config_err finish_err deadline_err cancelled_ok"),
+        "restore ctx capability matrix mismatch: {text}"
+    );
+}
+
+#[test]
+fn get_tool_restore_accepts_table_or_userdata_ctx() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let src = format!(
+        r#"local probe
+maki.api.register_tool({{
+    name = "child_r",
+    description = "t",
+    schema = {MINIMAL_SCHEMA},
+    handler = function() return "ok" end,
+    restore = function(input, output, is_error, rctx)
+        probe = {{ state = rctx:state(), tol = rctx:tool_output_lines() }}
+        local buf = maki.ui.buf()
+        buf:line("body")
+        return buf
+    end
+}})
+maki.api.register_tool({{
+    name = "restore_driver",
+    description = "t",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function(input, ctx)
+        local t = maki.api.get_tool("child_r")
+        local parts = {{}}
+        local buf = t.restore({{}}, "out", false, {{ tool_output_lines = {{ bash = 42 }}, state = {{ tag = "T" }} }})
+        parts[1] = buf ~= nil and "buf_ok" or "buf_nil"
+        parts[2] = (probe.state and probe.state.tag == "T") and "state_ok" or "state_bad"
+        parts[3] = probe.tol.bash == 42 and "tol_ok" or "tol_bad"
+        probe = nil
+        local buf2 = t.restore({{}}, "out", false, ctx)
+        parts[4] = buf2 ~= nil and "buf2_ok" or "buf2_nil"
+        parts[5] = (probe.state == nil and type(probe.tol) == "table") and "ud_ok" or "ud_bad"
+        probe = nil
+        local buf3 = t.restore({{}}, "out", false)
+        parts[6] = (buf3 ~= nil and type(probe.tol) == "table") and "default_ok" or "default_bad"
+        return table.concat(parts, " ")
+    end
+}})"#
+    );
+    host.load_source("restore_compose_plugin", &src).unwrap();
+    let out = exec_tool(&reg, "restore_driver", serde_json::json!({})).unwrap();
+    assert_eq!(
+        out, "buf_ok state_ok tol_ok buf2_ok ud_ok default_ok",
+        "wrap_restore ctx normalization mismatch"
+    );
+}
+
+#[test]
+fn agent_api_value_failures_return_err_pairs() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let src = format!(
+        r#"maki.api.register_tool({{
+            name = "agent_pairs_probe",
+            description = "t",
+            schema = {MINIMAL_SCHEMA},
+            audiences = {{ "main" }},
+            handler = function(input, ctx)
+                local function pair_err(v, e)
+                    return v == nil and type(e) == "string"
+                end
+                local parts = {{}}
+                parts[1] = pair_err(maki.agent.system_prompt(ctx, {{ prompt_id = "nope" }})) and "prompt_err" or "prompt_ok"
+                parts[2] = pair_err(maki.agent.tools(ctx, {{ audience = "nope" }})) and "tools_err" or "tools_ok"
+                parts[3] = pair_err(maki.agent.resolve_model(ctx, {{ spec = "not-a-spec" }})) and "model_err" or "model_ok"
+                return table.concat(parts, " ")
+            end
+        }})"#
+    );
+    host.load_source("agent_pairs_plugin", &src).unwrap();
+    let out = exec_tool(&reg, "agent_pairs_probe", serde_json::json!({})).unwrap();
+    assert_eq!(out, "prompt_err tools_err model_err");
+}
+
 /// Restore used to lose anything drawn via `maki.async.run`: those tasks
 /// landed in the global spawn queue, which runs after the snapshot is
 /// taken. The runtime must run them inline, after the restore fn and after
@@ -1968,17 +2082,18 @@ fn start_skipped_for_tool_without_start_fn() {
     );
 }
 
-/// `start` runs before permission checks, so its ctx is not a `LuaCtx` and
-/// `maki.agent.call_tool` (which borrows `LuaCtx`) rejects it outright.
+/// `start` runs before permission checks, so its ctx can read and preview
+/// but dispatch/finish/deadline must come back as `(nil, err)`.
 #[test]
-fn start_ctx_cannot_dispatch_tools() {
+fn start_ctx_capabilities() {
     let (reg, _host) = start_hook_fixture();
     let rx = run_start(&reg, "st_probe", serde_json::json!({"code": "x"}));
     let body = recv_live_buf(&rx, START_TOOL_USE_ID).expect("probe publishes a buf");
     let text = body.take().text();
     assert_eq!(
-        text, "call_tool_rejected finish_missing set_deadline_missing",
-        "StartCtx must expose no dispatch/finish/deadline capability"
+        text,
+        "call_tool_err finish_err deadline_err config_ok cancelled_ok workflow_ok audience_ok tol_ok",
+        "start ctx capability matrix mismatch"
     );
 }
 
@@ -2018,10 +2133,18 @@ maki.api.register_tool({{
     schema = {CODE_SCHEMA},
     start = function(input, ctx)
         local parts = {{}}
-        local ok = pcall(function() return maki.agent.call_tool(ctx, "st_plain", {{ code = "x" }}) end)
-        parts[1] = ok and "call_tool_allowed" or "call_tool_rejected"
-        parts[2] = ctx.finish == nil and "finish_missing" or "finish_present"
-        parts[3] = ctx.set_deadline == nil and "set_deadline_missing" or "set_deadline_present"
+        local function pair_err(v, e)
+            return v == nil and type(e) == "string"
+        end
+        parts[1] = pair_err(maki.agent.call_tool(ctx, "st_plain", {{ code = "x" }})) and "call_tool_err"
+            or "call_tool_ok"
+        parts[2] = pair_err(ctx:finish("x")) and "finish_err" or "finish_ok"
+        parts[3] = pair_err(ctx:set_deadline(5)) and "deadline_err" or "deadline_ok"
+        parts[4] = type(ctx:config()) == "table" and "config_ok" or "config_bad"
+        parts[5] = ctx:cancelled() == false and "cancelled_ok" or "cancelled_bad"
+        parts[6] = type(ctx:workflow()) == "boolean" and "workflow_ok" or "workflow_bad"
+        parts[7] = type(ctx:audience()) == "string" and "audience_ok" or "audience_bad"
+        parts[8] = type(ctx:tool_output_lines()) == "table" and "tol_ok" or "tol_bad"
         local buf = maki.ui.buf()
         buf:set_lines({{ table.concat(parts, " ") }})
         ctx:live_buf(buf)
@@ -2300,14 +2423,15 @@ fn session_opts_validation_rejects(opts: &str, expected: &str) {
             schema = {MINIMAL_SCHEMA},
             audiences = {{ "main" }},
             handler = function(input, ctx)
-                maki.agent.session(ctx, {opts})
-                return "no error"
+                local sess, err = maki.agent.session(ctx, {opts})
+                if sess ~= nil then return "unexpected session" end
+                return err or "no error"
             end
         }})"#
     );
     host.load_source("session_opts_plugin", &src).unwrap();
-    let err = exec_tool(&reg, "session_opts_probe", serde_json::json!({})).unwrap_err();
-    assert!(err.contains(expected), "got: {err}");
+    let out = exec_tool(&reg, "session_opts_probe", serde_json::json!({})).unwrap();
+    assert!(out.contains(expected), "got: {out}");
 }
 
 fn load_img_tool(host: &PluginHost) {

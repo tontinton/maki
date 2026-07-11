@@ -20,6 +20,7 @@ use maki_agent::{
     AgentEvent, BufferSnapshot, ImageMediaType, ImageSource, InstructionBlock, SharedBuf,
     TextOutput, ToolOutput,
 };
+use maki_config::ToolOutputLines;
 use mlua::{
     Function, Lua, LuaSerdeExt, MultiValue, RegistryKey, Result as LuaResult, Table,
     Value as LuaValue,
@@ -30,7 +31,7 @@ use crate::api::ui::buf::{BufHandle, line_to_lua};
 use crate::api::util::command::{
     CommandEntry, CommandHandlerMap, LuaCommandWriter, publish_command_snapshot,
 };
-use crate::api::util::convert::json_to_lua;
+use crate::api::util::convert::{json_to_lua, lua_to_json};
 use crate::api::util::ctx::LuaCtx;
 use crate::runtime::{HintContent, LiveCtx, PromptHintCallbacks, PromptHintRegistration, Request};
 
@@ -306,7 +307,7 @@ impl ToolInvocation for LuaToolInvocation {
                 event_tx: ctx.event_tx.clone(),
                 tool_use_id: id.clone(),
             },
-            tool_output_lines: ctx.tool_output_lines,
+            ctx: Box::new(LuaCtx::start(ctx)),
             reply: reply_tx,
         };
         let tx = self.tx.clone();
@@ -383,15 +384,7 @@ impl ToolInvocation for LuaToolInvocation {
                 event_tx: ctx.event_tx.clone(),
                 tool_use_id: id,
             });
-            let lua_ctx = LuaCtx {
-                cancel: ctx.cancel.clone(),
-                config: ctx.config.clone(),
-                tool_output_lines: ctx.tool_output_lines,
-                finish_tx: None,
-                file_tracker: ctx.file_tracker.clone(),
-                loaded_instructions: ctx.loaded_instructions.clone(),
-                agent: crate::api::util::ctx::AgentContext::from(ctx),
-            };
+            let lua_ctx = LuaCtx::handler(ctx);
 
             if tx
                 .send_async(Request::CallTool {
@@ -771,9 +764,19 @@ fn wrap_header(lua: &Lua, tool: String, f: Function) -> LuaResult<Function> {
 
 /// Normalizes a restore fn to its body buf or nil (whether it returned
 /// the buf directly or a `{ body = buf }` reply), so callers composing
-/// another tool's rendering need no pcall of their own.
+/// another tool's rendering need no pcall of their own. The ctx arg may be
+/// a real `LuaCtx` or a plain `{ tool_output_lines =, state = }` table (how
+/// batch drives child restores); either way the fn sees a restore `LuaCtx`.
 fn wrap_restore(lua: &Lua, tool: String, f: Function) -> LuaResult<Function> {
-    wrap_nothrow(lua, tool, "restore", f, |_lua, v| {
+    let prepped = lua.create_function(move |lua, mut args: MultiValue| {
+        let ctx = normalize_restore_ctx(lua, args.get(3))?;
+        while args.len() < 4 {
+            args.push_back(LuaValue::Nil);
+        }
+        args[3] = ctx;
+        f.call::<MultiValue>(args)
+    })?;
+    wrap_nothrow(lua, tool, "restore", prepped, |_lua, v| {
         Ok(match &v {
             LuaValue::UserData(ud) if ud.is::<BufHandle>() => v,
             LuaValue::Table(t) => t
@@ -785,6 +788,29 @@ fn wrap_restore(lua: &Lua, tool: String, f: Function) -> LuaResult<Function> {
             _ => LuaValue::Nil,
         })
     })
+}
+
+fn normalize_restore_ctx(lua: &Lua, v: Option<&LuaValue>) -> LuaResult<LuaValue> {
+    if let Some(LuaValue::UserData(ud)) = v
+        && ud.is::<LuaCtx>()
+    {
+        return Ok(LuaValue::UserData(ud.clone()));
+    }
+    let (tol, state) = match v {
+        Some(LuaValue::Table(t)) => (
+            t.get::<LuaValue>("tool_output_lines")
+                .ok()
+                .and_then(|v| lua.from_value::<ToolOutputLines>(v).ok())
+                .unwrap_or_default(),
+            t.get::<LuaValue>("state")
+                .ok()
+                .and_then(|v| lua_to_json(&v).ok())
+                .filter(|v| !v.is_null()),
+        ),
+        _ => (ToolOutputLines::default(), None),
+    };
+    let ud = lua.create_userdata(LuaCtx::restore(tol, state))?;
+    Ok(LuaValue::UserData(ud))
 }
 
 fn is_valid_tool_name(name: &str) -> bool {
