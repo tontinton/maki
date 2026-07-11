@@ -178,7 +178,7 @@ Defaults: hf:moonshotai/Kimi-K2.5 (strong), hf:deepseek-ai/DeepSeek-V3.2 (medium
 
 No hardcoded model catalog. Use any model ID supported by this provider.
 
-### Opencode
+### OpencodeZen
 
 - **Env var**: `OPENCODE_API_KEY`
 - **API**: `https://opencode.ai/zen/v1`
@@ -189,11 +189,19 @@ No hardcoded model catalog. Use any model ID supported by this provider.
 By default Maki hides free models from the Opencode catalog. To list free models (they use a public fallback, no API key needed), add this to `~/.config/maki/providers.toml`:
 
 ```toml
-[opencode]
+[opencode-zen]
 enable_free_models = true
 ```
 
 The default is `false`.
+
+### OpencodeGo
+
+- **Env var**: `OPENCODE_API_KEY`
+- **API**: `https://opencode.ai/zen/go/v1`
+- **Features**: Dynamically discovered models via [models.dev](https://models.dev/)
+
+No hardcoded model catalog. Use any model ID supported by this provider.
 
 ## Model Identifiers
 
@@ -222,7 +230,7 @@ To add a custom provider or proxy, drop an executable script into `~/.config/mak
 
 `resolve` is called each time a new agent spawns, so scripts should read tokens from disk instead of caching them in memory. That way auth changes from other processes get picked up.
 
-The `base` field specifies which built-in provider to inherit the model catalog from. Valid values: `anthropic`, `openai`, `google`, `copilot`, `ollama`, `llama-cpp`, `mistral`, `zai`, `deepseek`, `openrouter`, `synthetic`, `tensorx`, `opencode`.
+The `base` field specifies which built-in provider to inherit the model catalog from. Valid values: `anthropic`, `openai`, `google`, `copilot`, `ollama`, `llama-cpp`, `mistral`, `zai`, `deepseek`, `openrouter`, `synthetic`, `tensorx`, `opencode-zen`, `opencode-go`.
 
 If your provider serves models not in the base catalog, add a `models` subcommand returning:
 

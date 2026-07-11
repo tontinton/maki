@@ -23,7 +23,7 @@ use super::google::Google;
 use super::local::{LLAMACPP, LocalEndpoint, OLLAMA};
 use super::mistral::Mistral;
 use super::openai::OpenAi;
-use super::opencode::Opencode;
+use super::opencode::{Backend, Opencode};
 use super::openrouter::OpenRouter;
 use super::synthetic::Synthetic;
 use super::tensorx::TensorX;
@@ -419,8 +419,12 @@ pub fn create(slug: &str, timeouts: super::Timeouts) -> Result<Box<dyn Provider>
             TensorX::with_auth(auth.clone(), timeouts)
                 .with_system_prefix(meta.system_prefix.clone()),
         ),
-        ProviderKind::Opencode => Box::new(
-            Opencode::with_auth(auth.clone(), timeouts)
+        ProviderKind::OpencodeZen => Box::new(
+            Opencode::with_auth(Backend::Zen, auth.clone(), timeouts)
+                .with_system_prefix(meta.system_prefix.clone()),
+        ),
+        ProviderKind::OpencodeGo => Box::new(
+            Opencode::with_auth(Backend::Go, auth.clone(), timeouts)
                 .with_system_prefix(meta.system_prefix.clone()),
         ),
     };
@@ -719,7 +723,8 @@ esac
     #[test_case("zai", ProviderKind::Zai ; "base_zai")]
     #[test_case("synthetic", ProviderKind::Synthetic ; "base_synthetic")]
     #[test_case("deepseek", ProviderKind::DeepSeek ; "base_deepseek")]
-    #[test_case("opencode", ProviderKind::Opencode ; "base_opencode")]
+    #[test_case("opencode-zen", ProviderKind::OpencodeZen ; "base_opencode_zen")]
+    #[test_case("opencode-go", ProviderKind::OpencodeGo ; "base_opencode_go")]
     fn discover_accepts_all_bases(base: &str, expected: ProviderKind) {
         let tmp = TempDir::new().unwrap();
         let info = format!(r#"{{"display_name": "Test", "base": "{base}", "has_auth": false}}"#);

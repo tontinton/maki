@@ -45,6 +45,7 @@ An AI coding agent optimized for minimal use of context tokens, while providing 
 * Z.AI - `ZHIPU_API_KEY`.
 * DeepSeek - `DEEPSEEK_API_KEY`.
 * OpenRouter - `OPENROUTER_API_KEY`.
+* OpenCode Zen/Go - `OPENCODE_API_KEY`.
 * Synthetic - `SYNTHETIC_API_KEY`.
 
 **Dynamic providers** - drop an executable script into `~/.config/maki/providers/` to add custom providers or proxies. See [docs](https://maki.sh/docs/providers/#dynamic-providers) for details.

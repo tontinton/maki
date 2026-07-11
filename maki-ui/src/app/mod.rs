@@ -655,8 +655,12 @@ impl App {
             return Some(match self.login_picker.handle_key(key) {
                 LoginPickerAction::Consumed => vec![],
                 LoginPickerAction::Close => vec![],
-                LoginPickerAction::Authenticated { model_spec } => {
-                    vec![Action::ChangeModel(model_spec), Action::RefreshModels]
+                LoginPickerAction::Authenticated { model_spec, slug } => {
+                    vec![
+                        Action::ChangeModel(model_spec),
+                        Action::RefreshProvider { slug },
+                        Action::RefreshModels,
+                    ]
                 }
                 LoginPickerAction::Configured { slug } => {
                     vec![Action::RefreshProvider { slug }, Action::RefreshModels]

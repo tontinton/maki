@@ -38,7 +38,7 @@ You can override the model with `ANTHROPIC_MODEL` and the endpoint with `ANTHROP
 const OPENCODE_FREE_MODELS_NOTE: &str = r#"By default Maki hides free models from the Opencode catalog. To list free models (they use a public fallback, no API key needed), add this to `~/.config/maki/providers.toml`:
 
 ```toml
-[opencode]
+[opencode-zen]
 enable_free_models = true
 ```
 
@@ -310,7 +310,7 @@ fn write_section(out: &mut String, section: &ProviderSection) {
         let _ = writeln!(out, "\n{BEDROCK_NOTE}");
     }
 
-    if section.kind == ProviderKind::Opencode {
+    if section.kind == ProviderKind::OpencodeZen {
         let _ = writeln!(out, "\n{OPENCODE_FREE_MODELS_NOTE}");
     }
 }

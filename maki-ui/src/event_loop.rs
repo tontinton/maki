@@ -597,6 +597,9 @@ impl<'t> EventLoop<'t> {
         if current_model.provider.to_string() == slug {
             let mut m = current_model.clone();
             if let Ok(provider) = maki_providers::provider::from_model(&mut m, self.timeouts) {
+                if let Err(e) = smol::block_on(provider.reload_auth()) {
+                    warn!("reload_auth failed: {e}");
+                }
                 self.app.usage_slot.store(None);
                 self.model_slot.store(Arc::new(ModelSlot {
                     model: m,

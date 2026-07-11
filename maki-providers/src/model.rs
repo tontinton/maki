@@ -195,7 +195,8 @@ pub fn models_for_provider(provider: ProviderKind) -> &'static [ModelEntry] {
         ProviderKind::TensorX => tensorx::models(),
         ProviderKind::DeepSeek => deepseek::models(),
         ProviderKind::OpenRouter => openrouter::models(),
-        ProviderKind::Opencode => &[],
+        ProviderKind::OpencodeZen => &[],
+        ProviderKind::OpencodeGo => &[],
     }
 }
 
@@ -578,19 +579,28 @@ mod tests {
 
     #[test]
     fn opencode_from_spec_parses_four_levels() {
-        let spec = "opencode/nvidia/openai/gpt-oss-120b";
+        let spec = "opencode-zen/nvidia/openai/gpt-oss-120b";
         let model = Model::from_spec(spec).unwrap();
-        assert_eq!(model.provider, ProviderKind::Opencode);
+        assert_eq!(model.provider, ProviderKind::OpencodeZen);
         assert_eq!(model.id, "nvidia/openai/gpt-oss-120b");
         assert_eq!(model.spec(), spec);
     }
 
     #[test]
     fn opencode_from_spec_parses_three_levels() {
-        let spec = "opencode/opencode/big-pickle";
+        let spec = "opencode-zen/opencode/big-pickle";
         let model = Model::from_spec(spec).unwrap();
-        assert_eq!(model.provider, ProviderKind::Opencode);
+        assert_eq!(model.provider, ProviderKind::OpencodeZen);
         assert_eq!(model.id, "opencode/big-pickle");
+        assert_eq!(model.spec(), spec);
+    }
+
+    #[test]
+    fn opencode_go_from_spec_parses_two_levels() {
+        let spec = "opencode-go/llama-4-maverick";
+        let model = Model::from_spec(spec).unwrap();
+        assert_eq!(model.provider, ProviderKind::OpencodeGo);
+        assert_eq!(model.id, "llama-4-maverick");
         assert_eq!(model.spec(), spec);
     }
 
