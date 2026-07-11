@@ -55,27 +55,20 @@ local function filter_items(items, query)
   while i <= #items do
     if is_header(items[i]) then
       local header_idx = i
-      local children = {}
+      local matching = {}
       i = i + 1
       while i <= #items and not is_header(items[i]) do
-        children[#children + 1] = i
+        if fuzzy_match(items[i], query) then
+          matching[#matching + 1] = i
+        end
         i = i + 1
       end
-      local any_child = false
-      for _, ci in ipairs(children) do
-        if fuzzy_match(items[ci], query) then
-          any_child = true
-          break
-        end
-      end
-      if any_child then
+      if #matching > 0 then
         filtered[#filtered + 1] = items[header_idx]
         indices[#indices + 1] = header_idx
-        for _, ci in ipairs(children) do
-          if fuzzy_match(items[ci], query) then
-            filtered[#filtered + 1] = items[ci]
-            indices[#indices + 1] = ci
-          end
+        for _, ci in ipairs(matching) do
+          filtered[#filtered + 1] = items[ci]
+          indices[#indices + 1] = ci
         end
       end
     else
@@ -132,7 +125,6 @@ local function render_lines(items, selected, width, query)
     if is_hdr then
       style = "dim"
       detail_style = "dim"
-      match_style = "dim"
     elseif is_sel then
       style = "selected"
       detail_style = "selected"
