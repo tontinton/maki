@@ -1,5 +1,6 @@
 mod compaction;
 mod history;
+pub mod hooks;
 mod instructions;
 mod run;
 mod streaming;

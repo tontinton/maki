@@ -383,6 +383,10 @@ impl EventHandle {
         });
     }
 
+    pub fn hooks(&self) -> runtime::LuaHooks {
+        runtime::LuaHooks::new(self.tx.clone())
+    }
+
     pub fn run_keybind_callback(&self, id: u64) {
         let _ = self.tx.try_send(Request::RunKeybindCallback { id });
     }

@@ -10,6 +10,7 @@ use maki_providers::{
 
 use super::compaction::{self, CONTINUE_AFTER_COMPACT};
 use super::history::{History, sanitize_cancelled_history};
+use super::hooks::Hooks;
 use super::instructions::LoadedInstructions;
 use super::streaming::stream_with_retry;
 use super::tool_dispatch::{self, RecentCalls};
@@ -118,6 +119,7 @@ pub struct Agent<'h> {
     audience: ToolAudience,
     workflow: bool,
     local_tools: LocalTools,
+    hooks: Option<Arc<dyn Hooks>>,
 }
 
 impl<'h> Agent<'h> {
@@ -155,6 +157,7 @@ impl<'h> Agent<'h> {
             audience: params.audience,
             workflow: false,
             local_tools: LocalTools::default(),
+            hooks: None,
         }
     }
 
@@ -188,6 +191,11 @@ impl<'h> Agent<'h> {
 
     pub fn with_loaded_instructions(mut self, loaded: LoadedInstructions) -> Self {
         self.loaded_instructions = loaded;
+        self
+    }
+
+    pub fn with_hooks(mut self, hooks: Arc<dyn Hooks>) -> Self {
+        self.hooks = Some(hooks);
         self
     }
 

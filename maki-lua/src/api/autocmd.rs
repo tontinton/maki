@@ -6,11 +6,14 @@ use mlua::{Lua, RegistryKey, Result as LuaResult, Table, Value};
 
 static NEXT_AUTOCMD_ID: AtomicU64 = AtomicU64::new(1);
 
+pub(crate) const DEFAULT_PRIORITY: i32 = 100;
+
 pub(crate) struct AutocmdEntry {
     pub id: u64,
     pub callback: RegistryKey,
     pub plugin: Arc<str>,
     pub once: bool,
+    pub priority: i32,
 }
 
 #[derive(Default)]
@@ -26,12 +29,14 @@ impl AutocmdStore {
         callback: RegistryKey,
         plugin: Arc<str>,
         once: bool,
+        priority: i32,
     ) {
         self.listeners.entry(event).or_default().push(AutocmdEntry {
             id,
             callback,
             plugin,
             once,
+            priority,
         });
     }
 
@@ -74,13 +79,14 @@ pub(crate) fn add_autocmd_methods(api_table: &Table, lua: &Lua, plugin: Arc<str>
             };
             let callback: mlua::Function = opts.get("callback")?;
             let once: bool = opts.get("once").unwrap_or(false);
+            let priority: i32 = opts.get("priority").unwrap_or(DEFAULT_PRIORITY);
             let id = NEXT_AUTOCMD_ID.fetch_add(1, Ordering::Relaxed);
             let mut store = lua
                 .app_data_mut::<AutocmdStore>()
                 .ok_or_else(|| mlua::Error::runtime("autocmd store not initialized"))?;
             for event in events {
                 let key = lua.create_registry_value(callback.clone())?;
-                store.register(id, event, key, Arc::clone(&p), once);
+                store.register(id, event, key, Arc::clone(&p), once, priority);
             }
             Ok(id)
         })?,
@@ -113,7 +119,14 @@ mod tests {
         let mut store = AutocmdStore::default();
         let f = lua.create_function(|_, ()| Ok(())).unwrap();
         let key = lua.create_registry_value(f).unwrap();
-        store.register(1, "TurnEnd".into(), key, Arc::from("test"), false);
+        store.register(
+            1,
+            "TurnEnd".into(),
+            key,
+            Arc::from("test"),
+            false,
+            DEFAULT_PRIORITY,
+        );
         assert!(store.listeners["TurnEnd"].len() == 1);
         let removed = store.remove(1);
         assert_eq!(removed.len(), 1);
@@ -130,8 +143,22 @@ mod tests {
         let k1 = lua.create_registry_value(f1).unwrap();
         let k2 = lua.create_registry_value(f2).unwrap();
 
-        store.register(1, "TurnEnd".into(), k1, Arc::from("plugA"), false);
-        store.register(2, "TurnEnd".into(), k2, Arc::from("plugB"), false);
+        store.register(
+            1,
+            "TurnEnd".into(),
+            k1,
+            Arc::from("plugA"),
+            false,
+            DEFAULT_PRIORITY,
+        );
+        store.register(
+            2,
+            "TurnEnd".into(),
+            k2,
+            Arc::from("plugB"),
+            false,
+            DEFAULT_PRIORITY,
+        );
 
         let removed = store.clear_plugin("plugA");
         assert_eq!(removed.len(), 1);
@@ -151,7 +178,14 @@ mod tests {
         let mut store = AutocmdStore::default();
         let f = lua.create_function(|_, ()| Ok(())).unwrap();
         let key = lua.create_registry_value(f).unwrap();
-        store.register(1, "TurnEnd".into(), key, Arc::from("test"), true);
+        store.register(
+            1,
+            "TurnEnd".into(),
+            key,
+            Arc::from("test"),
+            true,
+            DEFAULT_PRIORITY,
+        );
         assert!(store.listeners["TurnEnd"][0].once);
     }
 }

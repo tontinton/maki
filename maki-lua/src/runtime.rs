@@ -16,7 +16,9 @@ use maki_agent::tools::{
     HeaderResult, PermissionScopes, RegistryError, Tool, ToolLive, ToolRegistry, ToolSource,
 };
 use maki_agent::{BufferSnapshot, SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle};
-use mlua::{Function, Lua, RegistryKey, Value as LuaValue, VmState};
+use maki_providers::AgentError;
+use maki_providers::provider::BoxFuture;
+use mlua::{Function, Lua, RegistryKey, Result as LuaResult, Value as LuaValue, VmState};
 use serde_json::Value;
 
 use maki_config::RawConfig;
@@ -31,7 +33,7 @@ use crate::api::ui::HintStore;
 use crate::api::ui::buf::{BufHandle, BufferStore};
 use crate::api::util::command::{CommandHandlerMap, HintWriter, publish_command_snapshot};
 use crate::api::util::command::{LuaCommandReader, LuaCommandWriter, UiAction};
-use crate::api::util::convert::json_to_lua;
+use crate::api::util::convert::{json_to_lua, lua_to_json};
 use crate::api::util::ctx::LuaCtx;
 use crate::api::util::setup::ConfigStore;
 use crate::error::PluginError;
@@ -69,6 +71,7 @@ pub(crate) type PromptHintCallbacks = BTreeMap<Arc<str>, Vec<PromptHintRegistrat
 
 /// Load/clear drain in-flight tools first so we never mutate a
 /// plugin environment while a tool call is still running.
+#[non_exhaustive]
 pub enum Request {
     LoadSource {
         name: Arc<str>,
@@ -128,6 +131,11 @@ pub enum Request {
         event: String,
         data: Value,
     },
+    RunHook {
+        event: String,
+        payload: Value,
+        reply: flume::Sender<Result<Value, String>>,
+    },
     ClickTool {
         tool_use_id: String,
         /// 1-based line in the tool's live buffer; 0 means the click landed
@@ -154,6 +162,46 @@ pub enum Request {
         tool_output_lines: maki_config::ToolOutputLines,
         reply: flume::Sender<()>,
     },
+}
+
+pub struct LuaHooks {
+    tx: flume::Sender<Request>,
+}
+
+impl LuaHooks {
+    pub(crate) fn new(tx: flume::Sender<Request>) -> Self {
+        Self { tx }
+    }
+}
+
+impl maki_agent::agent::hooks::Hooks for LuaHooks {
+    fn fire<'a>(
+        &'a self,
+        event: &'a str,
+        payload: Value,
+    ) -> BoxFuture<'a, Result<Value, AgentError>> {
+        Box::pin(async move {
+            let (reply_tx, reply_rx) = flume::bounded(1);
+            self.tx
+                .send_async(Request::RunHook {
+                    event: event.to_owned(),
+                    payload,
+                    reply: reply_tx,
+                })
+                .await
+                .map_err(|_| AgentError::Channel)?;
+            reply_rx
+                .recv_async()
+                .await
+                .map_err(|_| AgentError::Channel)
+                .and_then(|r| {
+                    r.map_err(|e| AgentError::Tool {
+                        tool: event.to_string(),
+                        message: e,
+                    })
+                })
+        })
+    }
 }
 
 pub struct RestoreItem {
@@ -1358,6 +1406,85 @@ fn extract_restore_reply(ret: &LuaValue) -> Option<RestoreReply> {
     Some(RestoreReply { body, header })
 }
 
+fn run_hook(rt: &LuaRuntime, event: &str, payload: Value) -> Result<Value, String> {
+    let mut entries = {
+        let Some(mut store) = rt.lua.app_data_mut::<AutocmdStore>() else {
+            return Ok(Value::Null);
+        };
+        match store.listeners.get_mut(event) {
+            Some(list) if !list.is_empty() => std::mem::take(list),
+            _ => return Ok(Value::Null),
+        }
+    };
+
+    entries.sort_by_key(|e| e.priority);
+    let mut keep = Vec::with_capacity(entries.len());
+    let mut current = payload;
+
+    for entry in entries {
+        let once = entry.once;
+        let plugin = Arc::clone(&entry.plugin);
+        let func = match rt.lua.registry_value::<Function>(&entry.callback) {
+            Ok(f) => f,
+            Err(e) => {
+                return Err(format!("{}: {e}", plugin));
+            }
+        };
+
+        let arg = match build_hook_arg(&rt.lua, &current) {
+            Ok(v) => v,
+            Err(e) => {
+                return Err(format!("{}: {e}", plugin));
+            }
+        };
+
+        match rt.call_sync_detached::<LuaValue>(&func, arg) {
+            Ok(ret) => match lua_to_json(&ret) {
+                Ok(v) => current = v,
+                Err(e) => {
+                    return Err(format!("{}: {e}", plugin));
+                }
+            },
+            Err(e) => {
+                return Err(strip_traceback(&e));
+            }
+        }
+
+        if once {
+            let _ = rt.lua.remove_registry_value(entry.callback);
+        } else {
+            keep.push(entry);
+        }
+    }
+
+    if !keep.is_empty()
+        && let Some(mut store) = rt.lua.app_data_mut::<AutocmdStore>()
+    {
+        store
+            .listeners
+            .entry(event.to_owned())
+            .or_default()
+            .extend(keep);
+    }
+
+    Ok(current)
+}
+
+fn build_hook_arg(lua: &Lua, payload: &Value) -> LuaResult<LuaValue> {
+    match payload {
+        Value::Null => Ok(LuaValue::Nil),
+        _ => {
+            let tbl = lua.create_table()?;
+            if let Some(obj) = payload.as_object() {
+                for (k, v) in obj {
+                    tbl.set(k.as_str(), json_to_lua(lua, v).unwrap_or(LuaValue::Nil))?;
+                }
+            }
+            Ok(LuaValue::Table(tbl))
+        }
+    }
+}
+
 /// Handler returned nil, meaning it went async. Polls job events
 /// until `ctx:finish()`, all jobs die, or the deadline expires.
 async fn dispatch_async(
@@ -1886,6 +2013,7 @@ pub fn spawn(
                             if let Some(mut store) = rt.lua.app_data_mut::<AutocmdStore>()
                                 && let Some(list) = store.listeners.get_mut(&event)
                             {
+                                list.sort_by_key(|e| e.priority);
                                 let entries = std::mem::take(list);
                                 drop(store);
                                 let ctx_table = rt.lua.create_table().ok();
@@ -1921,6 +2049,10 @@ pub fn spawn(
                             if event == TURN_END_EVENT {
                                 rt.lua.gc_collect().ok();
                             }
+                        }
+                        Request::RunHook { event, payload, reply } => {
+                            let result = run_hook(&rt, &event, payload);
+                            let _ = reply.send(result);
                         }
                         Request::Describe {
                             plugin,
