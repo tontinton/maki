@@ -1,7 +1,19 @@
 local M = {}
 
--- Lua's bit32 is 32-bit only, so we split the 64-bit FNV-1a state into
--- hi/lo halves and propagate carries by hand during multiplication.
+-- Counts lines the way editors do: empty string is 1 line,
+-- and a trailing newline does not start a new line.
+function M.count_lines(s)
+  if s == "" then
+    return 1
+  end
+  local _, newlines = s:gsub("\n", "")
+  if s:sub(-1) == "\n" then
+    return math.max(newlines, 1)
+  end
+  return newlines + 1
+end
+
+-- Lua's bit32 is 32-bit only, so we split the 64-bit FNV-1a state into hi/lo halves.
 function M.fnv1a_64(data)
   local lo = 0x84222325
   local hi = 0xcbf29ce4

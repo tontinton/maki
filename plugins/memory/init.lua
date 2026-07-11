@@ -147,7 +147,8 @@ local function cmd_write(input, dir, ctx)
   if not ok then
     return nil, "write error: " .. tostring(write_err)
   end
-  local msg = "wrote " .. input.path
+  local lc = helpers.count_lines(input.content)
+  local msg = "wrote " .. input.path .. " (" .. lc .. " lines)"
   return {
     llm_output = msg,
     body = render_content(new_content, input.path, ctx),
