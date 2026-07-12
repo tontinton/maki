@@ -807,6 +807,29 @@ where
         }
     }
 
+    /// After `messages` is truncated (rewind), state keyed by tool_use_id can
+    /// point at calls that no longer exist. On restore that shows up as ghost
+    /// subagent tabs and leaked tool outputs, so this drops everything not
+    /// reachable from `messages`.
+    ///
+    /// If you add another field keyed by tool_use_id, prune it here too.
+    pub fn prune_orphans(&mut self, tool_ids: impl Fn(&M) -> Vec<String>) {
+        let main_ids: HashSet<String> = self.messages.iter().flat_map(&tool_ids).collect();
+        self.subagent_messages.retain(|id, _| main_ids.contains(id));
+        self.meta
+            .subagents
+            .retain(|sa| main_ids.contains(&sa.tool_use_id));
+
+        let live: HashSet<String> = self
+            .subagent_messages
+            .values()
+            .flatten()
+            .flat_map(&tool_ids)
+            .chain(main_ids)
+            .collect();
+        self.tool_outputs.retain(|id, _| live.contains(id));
+    }
+
     pub fn save(&mut self, dir: &StateDir) -> Result<(), SessionError> {
         let sessions_dir = dir.ensure_subdir(SESSIONS_DIR)?;
         self.save_to(&sessions_dir)
@@ -910,8 +933,8 @@ mod tests {
     use super::StoredThinking;
     use super::ThinkingParseError;
     use super::{
-        CWD_INDEX_FILE, DEFAULT_TITLE, MAX_TITLE_LEN, SESSION_VERSION, TAIL_BUF, generate_title,
-        load_cwd_index, update_cwd_index,
+        CWD_INDEX_FILE, DEFAULT_TITLE, MAX_TITLE_LEN, SESSION_VERSION, StoredSubagent, TAIL_BUF,
+        generate_title, load_cwd_index, update_cwd_index,
     };
     use super::{Session, SessionError, SessionLog, StorageError, TitleSource};
     use serde_json::Value;
@@ -952,6 +975,51 @@ mod tests {
             "role": "assistant",
             "content": [{"type": "text", "text": text}]
         })
+    }
+
+    #[test]
+    fn prune_orphans_drops_unreachable_tool_state() {
+        fn ids(m: &Value) -> Vec<String> {
+            vec![m.as_str().unwrap().to_owned()]
+        }
+        fn subagent(id: &str) -> StoredSubagent {
+            StoredSubagent {
+                tool_use_id: id.into(),
+                name: "sub".into(),
+                prompt: None,
+                model: None,
+            }
+        }
+
+        let mut session: TestSession = Session::new("model", "/p");
+        session.messages.push("task-live".into());
+        session
+            .subagent_messages
+            .insert("task-live".into(), vec!["sub-tool".into()]);
+        session
+            .subagent_messages
+            .insert("task-stale".into(), vec!["stale-sub-tool".into()]);
+        session.meta.subagents = vec![subagent("task-live"), subagent("task-stale")];
+        for id in ["task-live", "sub-tool", "stale-sub-tool", "orphan"] {
+            session.tool_outputs.insert(id.into(), Value::Null);
+        }
+
+        session.prune_orphans(ids);
+
+        assert_eq!(
+            session.subagent_messages.keys().collect::<Vec<_>>(),
+            ["task-live"]
+        );
+        let subagent_ids: Vec<_> = session
+            .meta
+            .subagents
+            .iter()
+            .map(|sa| sa.tool_use_id.as_str())
+            .collect();
+        assert_eq!(subagent_ids, ["task-live"]);
+        let mut outputs: Vec<_> = session.tool_outputs.keys().cloned().collect();
+        outputs.sort();
+        assert_eq!(outputs, ["sub-tool", "task-live"]);
     }
 
     #[test]

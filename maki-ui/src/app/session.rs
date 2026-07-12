@@ -193,16 +193,10 @@ impl App {
     pub(super) fn rewind_to(&mut self, entry: RewindEntry) -> Vec<Action> {
         self.run_id += 1;
 
-        let stale_ids: Vec<String> = self.state.session.messages[entry.turn_index..]
-            .iter()
-            .flat_map(|m| m.tool_uses())
-            .map(|(id, _, _)| id.to_owned())
-            .collect();
         self.state.session.messages.truncate(entry.turn_index);
-        for id in &stale_ids {
-            self.state.session.tool_outputs.remove(id);
-            self.state.session.subagent_messages.remove(id);
-        }
+        self.state
+            .session
+            .prune_orphans(|m| m.tool_uses().map(|(id, _, _)| id.to_owned()).collect());
         self.state.context_size =
             maki_agent::agent::estimate_message_tokens(&self.state.session.messages);
 
