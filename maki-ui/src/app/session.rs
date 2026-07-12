@@ -203,6 +203,8 @@ impl App {
             self.state.session.tool_outputs.remove(id);
             self.state.session.subagent_messages.remove(id);
         }
+        self.state.context_size =
+            maki_agent::agent::estimate_message_tokens(&self.state.session.messages);
 
         self.reset_ui_chrome();
         self.restore_display();

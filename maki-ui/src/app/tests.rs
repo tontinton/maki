@@ -1639,6 +1639,7 @@ fn build_rewind_app() -> App {
 #[test]
 fn rewind_to_middle_truncates_and_populates_input() {
     let mut app = build_rewind_app();
+    app.state.context_size = 100_000;
     let old_run_id = app.run_id;
     let entry = crate::components::rewind_picker::RewindEntry {
         turn_index: 2,
@@ -1651,6 +1652,9 @@ fn rewind_to_middle_truncates_and_populates_input() {
     assert!(app.state.session.tool_outputs.contains_key("tool-1"));
     assert_eq!(app.input_box.buffer.value(), "second prompt");
     assert_eq!(app.run_id, old_run_id + 1);
+    let expected_ctx = maki_agent::agent::estimate_message_tokens(&app.state.session.messages);
+    assert_eq!(app.state.context_size, expected_ctx);
+    assert_eq!(app.chats[0].context_size, expected_ctx);
 
     let Action::LoadSession(ref loaded) = actions[0] else {
         panic!("expected LoadSession");
@@ -1662,6 +1666,7 @@ fn rewind_to_middle_truncates_and_populates_input() {
 #[test]
 fn rewind_to_first_turn_clears_everything() {
     let mut app = build_rewind_app();
+    app.state.context_size = 100_000;
     app.state.token_usage.input = 500;
     app.state.token_usage.output = 200;
     let entry = crate::components::rewind_picker::RewindEntry {
@@ -1675,6 +1680,8 @@ fn rewind_to_first_turn_clears_everything() {
     assert!(!app.state.session.tool_outputs.contains_key("tool-1"));
     assert_eq!(app.state.token_usage.input, 500);
     assert_eq!(app.state.token_usage.output, 200);
+    assert_eq!(app.state.context_size, 0);
+    assert_eq!(app.chats[0].context_size, 0);
     assert!(matches!(&actions[0], Action::LoadSession(_)));
 }
 

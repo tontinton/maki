@@ -484,7 +484,10 @@ impl<'h> Agent<'h> {
 
 const CHARS_PER_TOKEN: usize = 4;
 
-fn estimate_message_tokens(messages: &[Message]) -> u32 {
+pub fn estimate_message_tokens(messages: &[Message]) -> u32 {
+    if messages.is_empty() {
+        return 0;
+    }
     let total_bytes: usize = messages
         .iter()
         .flat_map(|m| &m.content)
