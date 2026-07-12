@@ -167,9 +167,6 @@ impl App {
 
     pub(super) fn reset_session(&mut self) -> Vec<Action> {
         self.reset_ui_chrome();
-        if let Some(ref handle) = self.lua_event_handle {
-            handle.fire_autocmd("SessionReset", serde_json::json!({}));
-        }
         self.state.token_usage = TokenUsage::default();
         self.state.context_size = 0;
         self.state.plan = PlanState::None;
@@ -177,6 +174,7 @@ impl App {
             self.enter_plan();
         }
         self.state.session = AppSession::new(&self.state.session.model, &self.state.session.cwd);
+        self.fire_session_autocmd("SessionReset", serde_json::json!({}));
         vec![Action::NewSession]
     }
 
@@ -215,15 +213,6 @@ impl App {
         ))]
     }
 
-    pub(super) fn open_session_picker(&mut self) -> Vec<Action> {
-        self.session_picker.open(
-            &self.state.session.cwd,
-            self.state.session.id,
-            &self.storage,
-        );
-        vec![]
-    }
-
     pub(crate) fn apply_loaded_session(
         &mut self,
         session: AppSession,
@@ -242,7 +231,7 @@ impl App {
         self.loaded_session_snapshot()
     }
 
-    pub(super) fn load_session(&mut self, session_id: MakiId) -> Vec<Action> {
+    pub(crate) fn load_session(&mut self, session_id: MakiId) -> Vec<Action> {
         let session = match AppSession::load(session_id, &self.storage) {
             Ok(s) => s,
             Err(e) => {
@@ -254,16 +243,5 @@ impl App {
         self.save_session();
         let loaded = self.apply_loaded_session(session, &self.state.model.clone());
         vec![Action::LoadSession(Box::new(loaded))]
-    }
-
-    pub(super) fn delete_session(&mut self, session_id: MakiId) -> Vec<Action> {
-        if let Err(e) = AppSession::delete(session_id, &self.storage) {
-            self.status_bar
-                .flash(format!("Failed to delete session: {e}"));
-            return vec![];
-        }
-        self.session_picker.remove_entry(session_id);
-        self.status_bar.flash("Session deleted".into());
-        vec![]
     }
 }

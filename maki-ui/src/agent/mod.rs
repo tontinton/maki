@@ -5,12 +5,10 @@ pub(crate) mod shared_queue;
 
 use std::collections::HashMap;
 use std::mem;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
-use maki_agent::mcp;
 use maki_agent::permissions::PermissionManager;
 use maki_agent::{
     AgentConfig, CancelMap, CancelToken, Envelope, McpCommand, McpConfigErrors, McpHandle,
@@ -57,8 +55,8 @@ pub(crate) struct AgentHandles {
 }
 
 impl AgentHandles {
-    /// MCP is started once up front. The handle lives across agent respawns, only the agent
-    /// loop task gets replaced.
+    /// MCP is shared across sessions and agent respawns; the event loop starts it
+    /// once and shuts it down at exit. Only the agent loop task lives here.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn spawn(
         model_slot: &Arc<ArcSwap<ModelSlot>>,
@@ -66,12 +64,12 @@ impl AgentHandles {
         config: AgentConfig,
         tool_output_lines: ToolOutputLines,
         permissions: &Arc<PermissionManager>,
-        cwd: PathBuf,
         session_id: Option<SessionRef>,
         timeouts: maki_providers::Timeouts,
         lua_handle: Option<EventHandle>,
+        mcp_handle: Option<McpHandle>,
+        mcp_config_errors: McpConfigErrors,
     ) -> Self {
-        let (mcp_handle, mcp_config_errors) = smol::block_on(mcp::start(&cwd));
         spawn_agent_internal(
             model_slot,
             initial_history,
@@ -154,7 +152,6 @@ impl AgentHandles {
 
     pub(crate) fn shutdown(self, timeout: Duration) {
         let _ = self.cmd_tx.try_send(AgentCommand::CancelAll);
-        let mcp_handle = self.mcp_handle;
         let task = self.task;
         drop((self.cmd_tx, self.agent_rx, self.answer_tx, self.queue));
         info!("waiting for agent to finish (timeout {timeout:?})");
@@ -172,10 +169,6 @@ impl AgentHandles {
             .await;
             if !finished {
                 warn!("agent did not finish within {timeout:?}, forcing shutdown");
-            }
-
-            if let Some(ref handle) = mcp_handle {
-                handle.shutdown().await;
             }
         });
     }

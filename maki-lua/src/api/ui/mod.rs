@@ -334,8 +334,12 @@ fn open_win(
         .resolve(term_rows)
         .saturating_sub(border_chrome);
 
-    let (event_tx, event_rx) = flume::bounded::<WinEvent>(8);
-    let (cmd_tx, cmd_rx) = flume::bounded::<WinCommand>(8);
+    // Unbounded on both sides: a full channel would silently drop keys or,
+    // worse, a Close command, leaving a zombie modal. Producers are human- or
+    // plugin-rate and both ends are drained every tick, so growth is bounded
+    // in practice.
+    let (event_tx, event_rx) = flume::unbounded::<WinEvent>();
+    let (cmd_tx, cmd_rx) = flume::unbounded::<WinCommand>();
 
     let _ = tx.try_send(UiAction::OpenWin {
         buf: buf_handle.buf.clone(),

@@ -20,7 +20,6 @@ pub mod queue_panel;
 pub(crate) mod rewind_picker;
 pub(crate) mod scrollbar;
 pub(crate) mod search_modal;
-pub(crate) mod session_picker;
 pub(crate) mod split_layout;
 pub mod status_bar;
 pub(crate) mod streaming_content;
@@ -209,7 +208,6 @@ pub enum Action {
     EditInputInEditor,
     Btw(String),
     Suspend,
-    Quit,
 }
 
 const ERROR_DISPLAY: Duration = Duration::from_secs(5);

@@ -75,7 +75,9 @@ fn restore(
         },
         maki_agent::EventSender::new(tx, 0),
     );
-    // Drains the async gate so highlight tasks finish before we inspect.
+    handle.wait_restore_complete_for_test();
+    // The empty LoadSource drains the async gate, so spawned highlight tasks
+    // finish before we inspect the buffers.
     host.load_source("barrier", "").unwrap();
     let mut out = Restored {
         body: String::new(),

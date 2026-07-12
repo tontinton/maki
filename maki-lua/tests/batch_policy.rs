@@ -351,8 +351,9 @@ fn restore_snapshot_lines_opts(
         },
         EventSender::new(tx, 0),
     );
-    // Strong barrier: LoadSource drains the async gate, so spawned tasks
-    // (highlight rewrites etc.) have finished before we read snapshots.
+    handle.wait_restore_complete_for_test();
+    // The empty LoadSource drains the async gate, so spawned follow-ups
+    // (highlight rewrites etc.) finish before we read snapshots.
     host.load_source("barrier", "").unwrap();
 
     let mut lines = Vec::new();

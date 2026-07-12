@@ -1,17 +1,20 @@
 use std::sync::Arc;
 
 use crossterm::event::KeyEvent;
-use maki_agent::{SharedBuf, SnapshotLine};
+use maki_agent::{SharedBuf, SnapshotLine, SpanStyle};
 use maki_lua::{Anchor, Axis, Border, FloatConfig, Split, TitlePos, WinCommand, WinEvent};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 
+use crate::animation::{animation_elapsed_ms, spinner_str};
 use crate::components::split_layout::SplitReq;
 use crate::components::{
-    Overlay, keybindings::key_event_to_string, scrollbar::render_vertical_scrollbar,
-    tool_display::resolve_span_style,
+    Overlay,
+    keybindings::key_event_to_string,
+    scrollbar::render_vertical_scrollbar,
+    tool_display::{SPINNER_STYLE_NAME, resolve_span_style},
 };
 use crate::theme;
 
@@ -579,12 +582,21 @@ fn adjust_scroll(
     offset
 }
 
+/// Same convention as tool snapshots: `"spinner"`-styled spans bake to the
+/// live frame, so plugins get an animated spinner without redrawing (floats
+/// already repaint every animation tick while open).
 fn snapshot_to_line(sline: &SnapshotLine) -> Line<'_> {
     Line::from(
         sline
             .spans
             .iter()
-            .map(|span| Span::styled(span.text.clone(), resolve_span_style(&span.style)))
+            .map(|span| match &span.style {
+                SpanStyle::Named(n) if n == SPINNER_STYLE_NAME => Span::styled(
+                    spinner_str(animation_elapsed_ms()),
+                    theme::current().spinner,
+                ),
+                style => Span::styled(span.text.clone(), resolve_span_style(style)),
+            })
             .collect::<Vec<_>>(),
     )
 }
@@ -622,7 +634,7 @@ impl Overlay for FloatManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use maki_agent::{SnapshotSpan, SpanStyle};
+    use maki_agent::SnapshotSpan;
     use maki_lua::{Dimension, FloatConfigPatch};
     use test_case::test_case;
 
@@ -666,6 +678,19 @@ mod tests {
             buf.append(make_line(l));
         }
         buf
+    }
+
+    #[test]
+    fn spinner_named_span_bakes_to_live_glyph() {
+        let placeholder = "· ";
+        let line = SnapshotLine {
+            spans: vec![SnapshotSpan {
+                text: placeholder.to_string(),
+                style: SpanStyle::Named(SPINNER_STYLE_NAME.into()),
+            }],
+        };
+        let baked = snapshot_to_line(&line);
+        assert_ne!(baked.spans[0].content, placeholder);
     }
 
     fn open_with_lines(
