@@ -77,6 +77,7 @@ pub const DEFAULT_BUILTINS: &[&str] = &[
     "multiedit",
     "question",
     "read",
+    "sessions",
     "skill",
     "task",
     "todo_write",

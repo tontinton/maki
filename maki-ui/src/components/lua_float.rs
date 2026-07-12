@@ -1,17 +1,20 @@
 use std::sync::Arc;
 
 use crossterm::event::KeyEvent;
-use maki_agent::{SharedBuf, SnapshotLine};
+use maki_agent::{SharedBuf, SnapshotLine, SpanStyle};
 use maki_lua::{Anchor, Axis, Border, FloatConfig, Split, TitlePos, WinCommand, WinEvent};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 
+use crate::animation::{animation_elapsed_ms, spinner_str};
 use crate::components::split_layout::SplitReq;
 use crate::components::{
-    Overlay, keybindings::key_event_to_string, scrollbar::render_vertical_scrollbar,
-    tool_display::resolve_span_style,
+    Overlay,
+    keybindings::key_event_to_string,
+    scrollbar::render_vertical_scrollbar,
+    tool_display::{SPINNER_STYLE_NAME, SPINNER_STYLE_PREFIX, resolve_span_style},
 };
 use crate::theme;
 
@@ -579,12 +582,26 @@ fn adjust_scroll(
     offset
 }
 
+/// Same convention as tool snapshots: spinner-named spans bake to the live
+/// animation frame, so plugins animate without redrawing (floats already
+/// repaint every tick while open). `"spinner:<style>"` takes `<style>`, so
+/// rows can keep the glyph on e.g. their selection background.
 fn snapshot_to_line(sline: &SnapshotLine) -> Line<'_> {
     Line::from(
         sline
             .spans
             .iter()
-            .map(|span| Span::styled(span.text.clone(), resolve_span_style(&span.style)))
+            .map(|span| match &span.style {
+                SpanStyle::Named(n)
+                    if n == SPINNER_STYLE_NAME || n.starts_with(SPINNER_STYLE_PREFIX) =>
+                {
+                    Span::styled(
+                        spinner_str(animation_elapsed_ms()),
+                        theme::style_by_name(n.strip_prefix(SPINNER_STYLE_PREFIX).unwrap_or(n)),
+                    )
+                }
+                style => Span::styled(span.text.clone(), resolve_span_style(style)),
+            })
             .collect::<Vec<_>>(),
     )
 }
@@ -622,7 +639,7 @@ impl Overlay for FloatManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use maki_agent::{SnapshotSpan, SpanStyle};
+    use maki_agent::SnapshotSpan;
     use maki_lua::{Dimension, FloatConfigPatch};
     use test_case::test_case;
 
@@ -666,6 +683,21 @@ mod tests {
             buf.append(make_line(l));
         }
         buf
+    }
+
+    #[test_case("spinner", "spinner" ; "bare_name_takes_spinner_style")]
+    #[test_case("spinner:match_selected", "match_selected" ; "prefixed_name_takes_suffix_style")]
+    fn spinner_span_bakes_to_live_glyph(span_style: &str, expected_style: &str) {
+        let placeholder = "· ";
+        let line = SnapshotLine {
+            spans: vec![SnapshotSpan {
+                text: placeholder.to_string(),
+                style: SpanStyle::Named(span_style.into()),
+            }],
+        };
+        let baked = snapshot_to_line(&line);
+        assert_ne!(baked.spans[0].content, placeholder);
+        assert_eq!(baked.spans[0].style, theme::style_by_name(expected_style));
     }
 
     fn open_with_lines(

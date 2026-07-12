@@ -12,6 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
 use tracing::warn;
 
@@ -26,6 +27,9 @@ const LOG_FORMAT_VERSION: u32 = 2;
 pub const SESSIONS_DIR: &str = "sessions";
 const CWD_INDEX_FILE: &str = "cwd_latest.json";
 const CWD_INDEX_STEM: &str = "cwd_latest";
+const SCAN_CACHE_FILE: &str = "scan_cache.json";
+const SCAN_CACHE_STEM: &str = "scan_cache";
+const NON_SESSION_STEMS: [&str; 2] = [CWD_INDEX_STEM, SCAN_CACHE_STEM];
 const DEFAULT_TITLE: &str = "New session";
 const MAX_TITLE_LEN: usize = 60;
 
@@ -128,6 +132,7 @@ pub struct Session<M, U, T> {
     pub updated_at: u64,
 }
 
+#[derive(Serialize)]
 pub struct SessionSummary {
     pub id: MakiId,
     pub title: String,
@@ -265,6 +270,9 @@ pub struct SessionLog {
     saved_msg_count: usize,
     saved_tool_ids: HashSet<String>,
     saved_sub_msg_counts: HashMap<String, usize>,
+    /// Serialized trailing meta record; lets `append` persist meta-only
+    /// changes (title, draft, updated_at) instead of dropping them.
+    saved_meta: Vec<u8>,
 }
 
 fn sub_msg_snapshot<M>(map: &HashMap<String, Vec<M>>) -> HashMap<String, usize> {
@@ -278,14 +286,11 @@ impl SessionLog {
         U: Serialize,
         T: Serialize,
     {
-        let log = Self::write_canonical(dir, session)?;
+        let file = write_session_file(dir, session)?;
         update_cwd_index(dir, &session.cwd, session.id)?;
-        Ok(log)
+        Ok(Self::cursor_from(session, file))
     }
 
-    /// Writes the canonical `{id}.jsonl` without touching the cwd→latest index.
-    /// Used by read-path migration, where merely opening an old session must not
-    /// repoint "latest" at it.
     fn write_canonical<M, U, T>(
         dir: &Path,
         session: &Session<M, U, T>,
@@ -295,12 +300,7 @@ impl SessionLog {
         U: Serialize,
         T: Serialize,
     {
-        fs::create_dir_all(dir).map_err(StorageError::from)?;
-        let path = jsonl_path(dir, session.id);
-        let mut file = File::create(&path).map_err(StorageError::from)?;
-        write_full_session(&mut file, session)?;
-        file.sync_data().map_err(StorageError::from)?;
-
+        let file = write_session_file(dir, session)?;
         Ok(Self::cursor_from(session, file))
     }
 
@@ -314,7 +314,25 @@ impl SessionLog {
         T: Serialize + DeserializeOwned,
     {
         let path = jsonl_path(dir, session_id);
-        let session = load_jsonl::<M, U, T>(&path)?;
+        let bytes = fs::read(&path).map_err(StorageError::from)?;
+        let valid = bytes.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+
+        if valid < bytes.len() {
+            warn!(
+                path = %path.display(),
+                bytes = bytes.len() - valid,
+                "truncating torn session log tail",
+            );
+            OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .map_err(StorageError::from)?
+                .set_len(valid as u64)
+                .map_err(StorageError::from)?;
+        }
+
+        let display = path.display().to_string();
+        let session = load_jsonl::<M, U, T>(&bytes[..valid], &display)?;
 
         let file = OpenOptions::new()
             .append(true)
@@ -383,28 +401,31 @@ impl SessionLog {
             }
         }
 
-        if buf.is_empty() {
+        let meta = meta_record(session)?;
+        if buf.is_empty() && meta == self.saved_meta {
             return Ok(());
         }
+        buf.extend_from_slice(&meta);
 
-        append_record(
-            &mut buf,
-            &LogRecord::<&M, &U, &T>::Meta {
-                title: session.title.clone(),
-                token_usage: &session.token_usage,
-                updated_at: session.updated_at,
-                meta: session.meta.clone(),
-            },
-        )?;
-
-        self.file.write_all(&buf).map_err(StorageError::from)?;
-        self.file.sync_data().map_err(StorageError::from)?;
+        let start = self.file.metadata().map_err(StorageError::from)?.len();
+        if let Err(e) = self
+            .file
+            .write_all(&buf)
+            .and_then(|()| self.file.sync_data())
+        {
+            // A failed write can leave partial bytes; roll back to the last
+            // record boundary so the file matches the unadvanced cursors and
+            // a retry appends cleanly instead of duplicating records.
+            let _ = self.file.set_len(start);
+            return Err(StorageError::from(e).into());
+        }
 
         self.saved_msg_count = new_msg_count;
         self.saved_tool_ids.extend(new_tool_ids);
         for (sub_id, count) in new_sub_counts {
             self.saved_sub_msg_counts.insert(sub_id, count);
         }
+        self.saved_meta = meta;
 
         Ok(())
     }
@@ -430,25 +451,29 @@ impl SessionLog {
 
         fs::rename(&tmp, &path).map_err(StorageError::from)?;
 
-        self.file = OpenOptions::new()
+        let file = OpenOptions::new()
             .append(true)
             .open(&path)
             .map_err(StorageError::from)?;
-        self.sync_cursors(session);
+        *self = Self::cursor_from(session, file);
 
         Ok(())
     }
 
-    fn cursor_from<M, U, T>(session: &Session<M, U, T>, file: File) -> Self {
-        let mut log = Self {
+    fn cursor_from<M, U, T>(session: &Session<M, U, T>, file: File) -> Self
+    where
+        M: Serialize,
+        U: Serialize,
+        T: Serialize,
+    {
+        Self {
             session_id: session.id,
             file,
-            saved_msg_count: 0,
-            saved_tool_ids: HashSet::new(),
-            saved_sub_msg_counts: HashMap::new(),
-        };
-        log.sync_cursors(session);
-        log
+            saved_msg_count: session.messages.len(),
+            saved_tool_ids: session.tool_outputs.keys().cloned().collect(),
+            saved_sub_msg_counts: sub_msg_snapshot(&session.subagent_messages),
+            saved_meta: meta_record(session).unwrap_or_default(),
+        }
     }
 
     fn require_same_id<M, U, T>(&self, session: &Session<M, U, T>) -> Result<(), SessionError> {
@@ -474,23 +499,39 @@ impl SessionLog {
                     .is_none_or(|msgs| count > msgs.len())
             })
     }
-
-    fn sync_cursors<M, U, T>(&mut self, session: &Session<M, U, T>) {
-        self.saved_msg_count = session.messages.len();
-        self.saved_tool_ids = session.tool_outputs.keys().cloned().collect();
-        self.saved_sub_msg_counts = sub_msg_snapshot(&session.subagent_messages);
-    }
 }
 
-fn write_record<R: Serialize>(
-    file: &mut File,
-    buf: &mut Vec<u8>,
-    record: &R,
-) -> Result<(), SessionError> {
-    buf.clear();
-    append_record(buf, record)?;
-    file.write_all(buf).map_err(StorageError::from)?;
-    Ok(())
+fn meta_record<M, U, T>(session: &Session<M, U, T>) -> Result<Vec<u8>, SessionError>
+where
+    M: Serialize,
+    U: Serialize,
+    T: Serialize,
+{
+    let mut buf = Vec::new();
+    append_record(
+        &mut buf,
+        &LogRecord::<&M, &U, &T>::Meta {
+            title: session.title.clone(),
+            token_usage: &session.token_usage,
+            updated_at: session.updated_at,
+            meta: session.meta.clone(),
+        },
+    )?;
+    Ok(buf)
+}
+
+fn write_session_file<M, U, T>(dir: &Path, session: &Session<M, U, T>) -> Result<File, SessionError>
+where
+    M: Serialize,
+    U: Serialize,
+    T: Serialize,
+{
+    fs::create_dir_all(dir).map_err(StorageError::from)?;
+    let path = jsonl_path(dir, session.id);
+    let mut file = File::create(&path).map_err(StorageError::from)?;
+    write_full_session(&mut file, session)?;
+    file.sync_data().map_err(StorageError::from)?;
+    Ok(file)
 }
 
 fn write_full_session<M, U, T>(
@@ -503,8 +544,7 @@ where
     T: Serialize,
 {
     let mut buf = Vec::new();
-    write_record(
-        file,
+    append_record(
         &mut buf,
         &LogRecord::<&M, &U, &T>::Header {
             v: LOG_FORMAT_VERSION,
@@ -515,11 +555,10 @@ where
         },
     )?;
     for msg in &session.messages {
-        write_record(file, &mut buf, &LogRecord::<&M, &U, &T>::Msg { d: msg })?;
+        append_record(&mut buf, &LogRecord::<&M, &U, &T>::Msg { d: msg })?;
     }
     for (id, output) in &session.tool_outputs {
-        write_record(
-            file,
+        append_record(
             &mut buf,
             &LogRecord::<&M, &U, &T>::Out {
                 id: id.clone(),
@@ -529,8 +568,7 @@ where
     }
     for (sub_id, msgs) in &session.subagent_messages {
         for msg in msgs {
-            write_record(
-                file,
+            append_record(
                 &mut buf,
                 &LogRecord::<&M, &U, &T>::SubMsg {
                     sub: sub_id.clone(),
@@ -539,16 +577,9 @@ where
             )?;
         }
     }
-    write_record(
-        file,
-        &mut buf,
-        &LogRecord::<&M, &U, &T>::Meta {
-            title: session.title.clone(),
-            token_usage: &session.token_usage,
-            updated_at: session.updated_at,
-            meta: session.meta.clone(),
-        },
-    )
+    buf.extend_from_slice(&meta_record(session)?);
+    file.write_all(&buf).map_err(StorageError::from)?;
+    Ok(())
 }
 
 fn append_record<R: Serialize>(buf: &mut Vec<u8>, record: &R) -> Result<(), SessionError> {
@@ -569,13 +600,12 @@ enum RawTag {
     Other,
 }
 
-fn load_jsonl<M, U, T>(path: &Path) -> Result<Session<M, U, T>, SessionError>
+fn load_jsonl<M, U, T>(data: &[u8], display_path: &str) -> Result<Session<M, U, T>, SessionError>
 where
     M: DeserializeOwned,
     U: DeserializeOwned + Default,
     T: DeserializeOwned,
 {
-    let reader = BufReader::new(File::open(path).map_err(StorageError::from)?);
     let mut line_count = 0usize;
 
     let mut id: Option<MakiId> = None;
@@ -591,31 +621,26 @@ where
     let mut meta = SessionMeta::default();
     let mut got_header = false;
 
-    for line_result in reader.lines() {
-        let line = line_result.map_err(StorageError::from)?;
+    for line in data.split(|&b| b == b'\n') {
         line_count += 1;
         if line.is_empty() {
             continue;
         }
-        let record: LogRecord<M, U, T> = match serde_json::from_str(&line) {
+        let record: LogRecord<M, U, T> = match serde_json::from_slice(line) {
             Ok(r) => r,
             Err(e) => {
-                // A header whose only defect is an unparseable id fails the
-                // strict LogRecord parse; surface that precisely instead of
-                // silently skipping to a misleading NotFound. The header is
-                // always the first line, so only probe until we have one.
                 if !got_header
-                    && let Ok(RawTag::Header { id: raw_id }) = serde_json::from_str::<RawTag>(&line)
+                    && let Ok(RawTag::Header { id: raw_id }) = serde_json::from_slice(line)
                     && let Err(source) = raw_id.parse::<MakiId>()
                 {
                     return Err(SessionError::CorruptHeaderId {
-                        path: path.display().to_string(),
+                        path: display_path.to_string(),
                         raw_id,
                         source,
                     });
                 }
                 warn!(
-                    path = %path.display(),
+                    path = display_path,
                     error = %e,
                     line = line_count,
                     "skipping unrecognized JSONL record",
@@ -664,7 +689,7 @@ where
         }
     }
 
-    let id = id.ok_or(StorageError::NotFound(path.display().to_string()))?;
+    let id = id.ok_or(StorageError::NotFound(display_path.to_string()))?;
 
     Ok(Session {
         version: SESSION_VERSION,
@@ -693,7 +718,11 @@ fn load_cwd_index(dir: &Path) -> HashMap<String, String> {
 
 fn update_cwd_index(dir: &Path, cwd: &str, session_id: MakiId) -> Result<(), StorageError> {
     let mut index = load_cwd_index(dir);
-    index.insert(cwd.to_string(), session_id.to_string());
+    let id_str = session_id.to_string();
+    if index.get(cwd).is_some_and(|v| *v == id_str) {
+        return Ok(());
+    }
+    index.insert(cwd.to_string(), id_str);
     atomic_write(&dir.join(CWD_INDEX_FILE), &serde_json::to_vec(&index)?)
 }
 
@@ -755,22 +784,96 @@ enum ScanRecord {
     Other,
 }
 
+/// Cached scan result for one session file, keyed by file name and validated
+/// by (size, mtime): stale entries are rescanned, deleted files pruned.
+/// `header: None` marks files that failed to scan (wrong version, foreign
+/// format), so they are not re-read on every list either.
+#[derive(Serialize, Deserialize)]
+struct ScanCacheEntry {
+    size: u64,
+    mtime_ms: u64,
+    header: Option<ScannedHeader>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ScannedHeader {
+    id: MakiId,
+    cwd: String,
+    title: String,
+    updated_at: u64,
+}
+
+type ScanCache = HashMap<String, ScanCacheEntry>;
+
+fn load_scan_cache(dir: &Path) -> ScanCache {
+    fs::read(dir.join(SCAN_CACHE_FILE))
+        .ok()
+        .and_then(|data| serde_json::from_slice(&data).ok())
+        .unwrap_or_default()
+}
+
+fn file_signature(path: &Path) -> Option<(u64, u64)> {
+    let meta = fs::metadata(path).ok()?;
+    let mtime_ms = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)?;
+    Some((meta.len(), mtime_ms))
+}
+
 fn scan_headers(cwd: &str, dir: &Path) -> Result<Vec<SessionSummary>, StorageError> {
-    Ok(session_entries(dir)?
-        .into_iter()
-        .filter_map(|p| {
-            if is_jsonl(&p) {
-                scan_jsonl_header(cwd, &p)
-            } else {
-                scan_legacy_header(cwd, &p)
+    let mut cache = load_scan_cache(dir);
+    let mut fresh = ScanCache::new();
+    let mut dirty = false;
+    let mut out = Vec::new();
+    for path in session_entries(dir)? {
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Some((size, mtime_ms)) = file_signature(&path) else {
+            continue;
+        };
+        let entry = match cache.remove(name) {
+            Some(e) if e.size == size && e.mtime_ms == mtime_ms => e,
+            _ => {
+                dirty = true;
+                let header = if is_jsonl(&path) {
+                    scan_jsonl_header(&path)
+                } else {
+                    scan_legacy_header(&path)
+                };
+                ScanCacheEntry {
+                    size,
+                    mtime_ms,
+                    header,
+                }
             }
-        })
-        .collect())
+        };
+        if let Some(h) = &entry.header
+            && h.cwd == cwd
+        {
+            out.push(SessionSummary {
+                id: h.id,
+                title: h.title.clone(),
+                updated_at: h.updated_at,
+            });
+        }
+        fresh.insert(name.to_owned(), entry);
+    }
+    // Leftover cache entries belong to deleted files; rewriting prunes them.
+    if (dirty || !cache.is_empty())
+        && let Ok(data) = serde_json::to_vec(&fresh)
+        && let Err(e) = atomic_write(&dir.join(SCAN_CACHE_FILE), &data)
+    {
+        warn!(error = %e, "failed to write session scan cache");
+    }
+    Ok(out)
 }
 
 const TAIL_BUF: u64 = 4096;
 
-fn scan_jsonl_header(cwd: &str, path: &Path) -> Option<SessionSummary> {
+fn scan_jsonl_header(path: &Path) -> Option<ScannedHeader> {
     let mut file = File::open(path).ok()?;
     let header: JsonlHeader = {
         let mut reader = BufReader::new(&file);
@@ -778,15 +881,16 @@ fn scan_jsonl_header(cwd: &str, path: &Path) -> Option<SessionSummary> {
         reader.read_line(&mut line).ok()?;
         serde_json::from_str(line.trim_end()).ok()?
     };
-    if header.v != LOG_FORMAT_VERSION || header.cwd != cwd {
+    if header.v != LOG_FORMAT_VERSION {
         return None;
     }
 
     let (title, updated_at) =
         read_last_meta(&mut file).unwrap_or_else(|| (DEFAULT_TITLE.to_string(), 0));
 
-    Some(SessionSummary {
+    Some(ScannedHeader {
         id: header.id,
+        cwd: header.cwd,
         title,
         updated_at,
     })
@@ -816,14 +920,15 @@ fn read_last_meta(file: &mut File) -> Option<(String, u64)> {
     }
 }
 
-fn scan_legacy_header(cwd: &str, path: &Path) -> Option<SessionSummary> {
+fn scan_legacy_header(path: &Path) -> Option<ScannedHeader> {
     let data = fs::read(path).ok()?;
     let h: LegacyHeader = serde_json::from_slice(&data).ok()?;
-    if h.version != SESSION_VERSION || h.cwd != cwd {
+    if h.version != SESSION_VERSION {
         return None;
     }
-    Some(SessionSummary {
+    Some(ScannedHeader {
         id: h.id,
+        cwd: h.cwd,
         title: h.title,
         updated_at: h.updated_at,
     })
@@ -839,7 +944,9 @@ fn session_entries(dir: &Path) -> Result<Vec<PathBuf>, StorageError> {
 }
 
 fn is_session_file(p: &Path) -> bool {
-    p.file_stem().and_then(|s| s.to_str()) != Some(CWD_INDEX_STEM)
+    p.file_stem()
+        .and_then(|s| s.to_str())
+        .is_some_and(|s| !NON_SESSION_STEMS.contains(&s))
         && p.extension().is_some_and(|e| e == "json" || e == "jsonl")
 }
 
@@ -878,7 +985,8 @@ where
     T: DeserializeOwned,
 {
     if path.extension().is_some_and(|e| e == "jsonl") {
-        return load_jsonl(path);
+        let data = fs::read(path).map_err(StorageError::from)?;
+        return load_jsonl(&data, &path.display().to_string());
     }
     let data = fs::read(path).map_err(StorageError::from)?;
     let session: Session<M, U, T> = serde_json::from_slice(&data).map_err(StorageError::from)?;
@@ -950,7 +1058,8 @@ where
 
     pub fn save_to(&mut self, dir: &Path) -> Result<(), SessionError> {
         self.updated_at = now_epoch();
-        let _log = SessionLog::create(dir, self)?;
+        write_session_file(dir, self)?;
+        update_cwd_index(dir, &self.cwd, self.id)?;
         Ok(())
     }
 
@@ -992,17 +1101,22 @@ where
     }
 
     pub fn latest_in(cwd: &str, dir: &Path) -> Result<Option<Self>, SessionError> {
-        if let Some(id) = load_cwd_index(dir).get(cwd).map(|s| s.parse::<MakiId>()) {
-            match id {
-                Ok(id) => match Self::load_from(id, dir) {
-                    Ok(s) => return Ok(Some(s)),
-                    Err(e) => warn!(error = %e, cwd, "indexed session missing on disk; rescanning"),
-                },
-                Err(e) => warn!(error = %e, cwd, "indexed session id unparseable; rescanning"),
+        let cached = load_cwd_index(dir)
+            .remove(cwd)
+            .and_then(|s| match s.parse::<MakiId>() {
+                Ok(id) => Some(id),
+                Err(e) => {
+                    warn!(error = %e, cwd, "indexed session id unparseable; rescanning");
+                    None
+                }
+            });
+        if let Some(id) = cached {
+            match Self::load_from(id, dir) {
+                Ok(s) => return Ok(Some(s)),
+                Err(e) => warn!(error = %e, cwd, "indexed session missing on disk; rescanning"),
             }
         }
 
-        // The indexed entry is stale or corrupt; fall back to scanning disk.
         scan_headers(cwd, dir)?
             .into_iter()
             .max_by_key(|s| s.updated_at)
@@ -1047,7 +1161,7 @@ mod tests {
         generate_title, json_path, jsonl_path, load_cwd_index, update_cwd_index,
         write_full_session,
     };
-    use super::{Session, SessionError, SessionLog, StorageError, TitleSource};
+    use super::{SCAN_CACHE_FILE, Session, SessionError, SessionLog, StorageError, TitleSource};
     use crate::id::MakiId;
     use serde_json::Value;
     use std::collections::HashMap;
@@ -1060,6 +1174,7 @@ mod tests {
     type TestSession = Session<Value, Value, Value>;
 
     const LEGACY_HEX_ID: &str = "550e8400-e29b-41d4-a716-446655440000";
+    const TAMPERED_TITLE: &str = "tampered cached title";
 
     impl TitleSource for Value {
         fn first_user_text(&self) -> Option<&str> {
@@ -1312,6 +1427,30 @@ mod tests {
         assert!(loaded.subagent_messages.is_empty());
     }
 
+    /// A rename with no new messages must survive restart, while a no-op
+    /// append must not grow the file.
+    #[test]
+    fn append_writes_meta_only_when_it_changed() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut session: TestSession = Session::new("m", "/project");
+        session.messages.push(user_message("hi"));
+        let mut log = SessionLog::create(dir, &session).unwrap();
+
+        let path = jsonl_path(dir, session.id);
+        let size_before = fs::metadata(&path).unwrap().len();
+        log.append(&session).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().len(), size_before);
+
+        session.title = "renamed".into();
+        session.updated_at = 42;
+        log.append(&session).unwrap();
+
+        let loaded = TestSession::load_from(session.id, dir).unwrap();
+        assert_eq!(loaded.title, "renamed");
+        assert_eq!(loaded.updated_at, 42);
+    }
+
     #[test]
     fn migration_json_to_jsonl() {
         let tmp = TempDir::new().unwrap();
@@ -1383,6 +1522,80 @@ mod tests {
         let list = TestSession::list_in("/project-a", dir).unwrap();
         assert_eq!(list.len(), 2);
         assert!(list.iter().all(|s| s.id != s2.id));
+    }
+
+    /// Rewrites the scan-cache title of `id` without touching the session
+    /// file, so a later list showing [`TAMPERED_TITLE`] proves it was served
+    /// from the cache instead of re-reading the file.
+    fn tamper_cached_title(dir: &Path, id: MakiId) {
+        let cache_path = dir.join(SCAN_CACHE_FILE);
+        let mut cache: Value = serde_json::from_slice(&fs::read(&cache_path).unwrap()).unwrap();
+        let entry = cache
+            .as_object_mut()
+            .unwrap()
+            .get_mut(&format!("{id}.jsonl"))
+            .expect("session missing from scan cache");
+        entry["header"]["title"] = TAMPERED_TITLE.into();
+        fs::write(&cache_path, serde_json::to_vec(&cache).unwrap()).unwrap();
+    }
+
+    /// One scan must cache headers of every cwd, so reopening the picker
+    /// here or in another project never re-reads unchanged files.
+    #[test]
+    fn list_serves_all_cwds_from_cache_after_one_scan() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut a: TestSession = Session::new("m", "/project-a");
+        a.save_to(dir).unwrap();
+        let mut b: TestSession = Session::new("m", "/project-b");
+        b.save_to(dir).unwrap();
+        TestSession::list_in("/project-a", dir).unwrap();
+
+        tamper_cached_title(dir, a.id);
+        tamper_cached_title(dir, b.id);
+        let list_a = TestSession::list_in("/project-a", dir).unwrap();
+        assert_eq!(list_a[0].title, TAMPERED_TITLE);
+        let list_b = TestSession::list_in("/project-b", dir).unwrap();
+        assert_eq!(list_b[0].title, TAMPERED_TITLE);
+    }
+
+    #[test]
+    fn list_rescans_changed_file_and_prunes_deleted() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut s1: TestSession = Session::new("m", "/project");
+        s1.messages.push(user_message("hi"));
+        let mut log = SessionLog::create(dir, &s1).unwrap();
+        let s2: TestSession = Session::new("m", "/project");
+        SessionLog::create(dir, &s2).unwrap();
+        TestSession::list_in("/project", dir).unwrap();
+
+        s1.title = "renamed".into();
+        log.append(&s1).unwrap();
+        TestSession::delete_from(s2.id, dir).unwrap();
+
+        let list = TestSession::list_in("/project", dir).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].title, "renamed");
+        let cache: Value =
+            serde_json::from_slice(&fs::read(dir.join(SCAN_CACHE_FILE)).unwrap()).unwrap();
+        assert_eq!(cache.as_object().unwrap().len(), 1, "deleted entry pruned");
+    }
+
+    #[test_case(Some(b"{ not json".as_slice()) ; "corrupt_cache")]
+    #[test_case(None ; "missing_cache")]
+    fn list_survives_bad_scan_cache(content: Option<&[u8]>) {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut s: TestSession = Session::new("m", "/project");
+        s.save_to(dir).unwrap();
+        if let Some(content) = content {
+            fs::write(dir.join(SCAN_CACHE_FILE), content).unwrap();
+        }
+
+        let list = TestSession::list_in("/project", dir).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].id, s.id);
     }
 
     fn save_with_time(session: &mut TestSession, dir: &Path, time: u64) {
@@ -1733,6 +1946,30 @@ mod tests {
 
         let reloaded = TestSession::load_from(session.id, dir).unwrap();
         assert_eq!(reloaded.messages.len(), 3);
+    }
+
+    #[test]
+    fn open_repairs_torn_tail_so_next_append_survives_reload() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut session: TestSession = Session::new("m", "/project");
+        session.messages.push(user_message("first"));
+        drop(SessionLog::create(dir, &session).unwrap());
+
+        let path = jsonl_path(dir, session.id);
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(b"{\"t\":\"msg\",\"d\":{\"trun").unwrap();
+        drop(file);
+
+        let (mut loaded, mut log) =
+            SessionLog::open::<Value, Value, Value>(dir, session.id).unwrap();
+        assert_eq!(loaded.messages.len(), 1);
+        loaded.messages.push(user_message("second"));
+        log.append(&loaded).unwrap();
+        drop(log);
+
+        let reloaded = TestSession::load_from(session.id, dir).unwrap();
+        assert_eq!(reloaded.messages.len(), 2);
     }
 
     #[test]

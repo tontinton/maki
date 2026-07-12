@@ -97,13 +97,10 @@ impl App {
             self.float_mgr.panel_reqs()
         };
 
-        let (queue_height, _input_height) = if bottom_takeover {
-            (0, 0)
+        let queue_height = if bottom_takeover {
+            0
         } else {
-            let queue_height = queue_panel::height(self.queue.panel_len());
-            let panel_h: u16 = panel_reqs.iter().map(|(_, h)| *h).sum();
-            let input_height = bottom_area.height.saturating_sub(queue_height + panel_h);
-            (queue_height, input_height)
+            queue_panel::height(self.queue.panel_len())
         };
 
         let mut constraints = vec![Constraint::Length(queue_height)];
@@ -237,14 +234,6 @@ impl App {
                 self.status_bar.flash(flash);
             }
             overlay_rect = self.file_picker.view(frame, full);
-        }
-
-        if self.session_picker.is_open() {
-            self.session_picker.tick();
-            overlay_rect = self.session_picker.view(frame, full);
-            if let Some(flash) = self.session_picker.take_flash() {
-                self.status_bar.flash(flash);
-            }
         }
 
         macro_rules! render_if_open {
@@ -439,8 +428,6 @@ impl App {
             contexts.push(KeybindContext::FormInput);
         } else if self.queue.focus().is_some() {
             contexts.push(KeybindContext::QueueFocus);
-        } else if self.session_picker.is_open() {
-            contexts.push(KeybindContext::SessionPicker);
         } else if self.rewind_picker.is_open() {
             contexts.push(KeybindContext::RewindPicker);
         } else if self.task_picker.is_open() {

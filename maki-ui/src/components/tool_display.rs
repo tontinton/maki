@@ -38,6 +38,7 @@ pub struct RenderCtx<'a> {
 pub const TOOL_INDICATOR: &str = "● ";
 pub const TOOL_BODY_INDENT: &str = "  ";
 pub(crate) const SPINNER_STYLE_NAME: &str = "spinner";
+pub(crate) const SPINNER_STYLE_PREFIX: &str = "spinner:";
 
 const CODE_OUTPUT_DIVIDER: &str = "  ────────────";
 

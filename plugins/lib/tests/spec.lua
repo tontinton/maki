@@ -1217,6 +1217,43 @@ case("filter_items_table_items_uses_label", function()
   eq(indices[2], 3)
 end)
 
+case("filter_items_every_word_must_match", function()
+  local items = { "review gh pr 441", "review gh pr 461", "new session" }
+  local filtered = filter_items(items, "441 review")
+  eq(#filtered, 1)
+  eq(filtered[1], "review gh pr 441")
+end)
+
+case("highlight_spans_overlapping_words_merge", function()
+  local spans = ListPicker.highlight_spans("alphabet", { "alpha", "phab" }, "item", "match")
+  eq(#spans, 2)
+  eq(spans[1][1], "alphab", "alpha(1-5) + phab(3-6) merge into one span")
+  eq(spans[1][2], "match")
+  eq(spans[2][1], "et")
+  eq(spans[2][2], "item")
+end)
+
+case("highlight_spans_multi_word", function()
+  local spans = ListPicker.highlight_spans("review pr 441", { "pr", "441" }, "item", "match")
+  eq(#spans, 4)
+  eq(spans[1][1], "review ")
+  eq(spans[1][2], "item")
+  eq(spans[2][1], "pr")
+  eq(spans[2][2], "match")
+  eq(spans[3][1], " ")
+  eq(spans[3][2], "item")
+  eq(spans[4][1], "441")
+  eq(spans[4][2], "match")
+end)
+
+case("render_lines_match_at_start_keeps_indent", function()
+  local lines = render_lines({ "alpha" }, 1, 40, "al")
+  eq(lines[1][1][1], "  ")
+  eq(lines[1][1][2], "selected")
+  eq(lines[1][2][1], "al")
+  eq(lines[1][2][2], "match_selected")
+end)
+
 if #failures > 0 then
   error(#failures .. " case(s) failed:\n\n" .. table.concat(failures, "\n\n"))
 end

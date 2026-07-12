@@ -200,6 +200,21 @@ impl PermissionManager {
         }
     }
 
+    /// Fresh manager for a new session runtime: shares config and builtin
+    /// rules plus the current yolo state, but owns empty session rules so
+    /// restoring one session never clobbers another's grants.
+    pub fn fork(&self) -> Self {
+        Self {
+            session_rules: Mutex::new(Vec::new()),
+            config_rules: self.config_rules.clone(),
+            builtin_rules: self.builtin_rules.clone(),
+            yolo: AtomicBool::new(self.is_yolo()),
+            default: self.default,
+            tool_defaults: self.tool_defaults.clone(),
+            cwd: self.cwd.clone(),
+        }
+    }
+
     fn session_rules(&self) -> std::sync::MutexGuard<'_, Vec<PermissionRule>> {
         self.session_rules.lock().unwrap_or_else(|e| {
             warn!("permission mutex was poisoned, recovering");

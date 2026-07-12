@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use maki_agent::tools::{ToolRegistry, ToolSource, timeout_annotation};
 use maki_config::{AlwaysThinking, PluginsConfig, ToolOutputLines};
@@ -357,8 +358,6 @@ fn handler_state_flows_to_tool_output_and_serde() {
 }
 
 /// Restores `tool` from `src` and returns the snapshot's concatenated text.
-/// `collect_prompt_slots` blocks on the same request channel, so once it
-/// returns the restore has finished; no sleeps needed.
 fn restore_snapshot_text(
     src: &str,
     tool: &str,
@@ -384,7 +383,7 @@ fn restore_snapshot_text(
         },
         maki_agent::EventSender::new(tx, 0),
     );
-    let _ = handle.collect_prompt_slots();
+    handle.wait_restore_complete_for_test();
 
     let mut text = String::new();
     for env in rx.drain() {
@@ -1968,6 +1967,18 @@ fn unload_clears_commands() {
 }
 
 #[test]
+fn sessions_plugin_registers_commands() {
+    let (_reg, host) = builtins_host();
+    let snap = host.command_reader().load();
+    let names: Vec<&str> = snap.commands.iter().map(|c| c.name.as_ref()).collect();
+    assert!(
+        names.contains(&"/sessions"),
+        "missing /sessions in {names:?}"
+    );
+    assert!(names.contains(&"/rename"), "missing /rename in {names:?}");
+}
+
+#[test]
 fn job_callback_finishes_after_handler_returns_nil() {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
@@ -2074,7 +2085,7 @@ fn restore_tool_async_ordering_and_delivery() {
     handle.request_restore(bash_item("a"), event_tx.clone());
     handle.request_restore(bash_item("b"), event_tx.clone());
 
-    let _ = handle.collect_prompt_slots();
+    handle.wait_restore_complete_for_test();
 
     let snapshots: Vec<maki_agent::Envelope> = rx.drain().collect();
 
@@ -2138,7 +2149,7 @@ fn restore_rebuilds_body_from_input_content(
         },
         maki_agent::EventSender::new(tx, 0),
     );
-    let _ = handle.collect_prompt_slots();
+    handle.wait_restore_complete_for_test();
 
     let mut text = String::new();
     for env in rx.drain() {
@@ -3015,4 +3026,37 @@ fn interpreter_bridge_flattens_image_with_visibility_note() {
         out.contains(maki_agent::tools::interpreter_bridge::IMAGE_NOT_VISIBLE_NOTE),
         "got: {out}"
     );
+}
+
+/// The sessions picker parks its command handler in a `win:recv` loop while a
+/// `maki.async.run` task fetches the stored-session list. Queued async tasks
+/// must run while the spawning handler is still parked, not wait for the next
+/// unrelated lua-thread event.
+#[test]
+fn async_run_from_parked_command_handler_runs_promptly() {
+    let host = PluginHost::new(fresh_registry()).unwrap();
+    host.load_source(
+        "p",
+        r#"
+        maki.api.register_command({
+            name = "/park",
+            description = "parks forever",
+            handler = function()
+                maki.async.run(function()
+                    maki.ui.flash("task-ran")
+                end)
+                maki.async.await(1, function(_cb) end)
+            end,
+        })
+        "#,
+    )
+    .unwrap();
+    let rx = host.ui_action_rx().unwrap();
+    let handle = host.event_handle().unwrap();
+    handle.run_command(Arc::from("p"), Arc::from("/park"), String::new());
+
+    let action = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("async.run task starved while its command handler was parked");
+    assert!(matches!(action, maki_lua::UiAction::Flash(msg) if msg == "task-ran"));
 }

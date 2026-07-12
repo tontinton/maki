@@ -19,7 +19,6 @@ Type `/` in the input box to open the command palette.
 | `/help` | Show keybindings |
 | `/usage` | Show token usage breakdown |
 | `/queue` | Remove items from queue |
-| `/sessions` | Browse and switch sessions |
 | `/model` | Switch model |
 | `/theme` | Switch color theme |
 | `/mcp` | Configure MCP servers |
@@ -32,6 +31,8 @@ Type `/` in the input box to open the command palette.
 | `/workflow` | Toggle workflow mode (task callable inside code_execution) |
 | `/exit` | Exit the application |
 | `/memory` | View, edit, and delete memory files |
+| `/rename` | Rename the current session |
+| `/sessions` | Browse and switch sessions |
 
 ## Custom commands
 

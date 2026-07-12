@@ -24,6 +24,7 @@ pub mod update;
 
 mod agent;
 mod event_loop;
+mod input;
 mod terminal;
 
 use color_eyre::Result;

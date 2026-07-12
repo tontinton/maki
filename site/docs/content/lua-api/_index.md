@@ -69,6 +69,7 @@ a string belongs.
 | [`maki.keymap`](#maki-keymap) | Key mappings, modeled after `vim.keymap`. |
 | [`maki.log`](#maki-log) | Structured logging for plugins. |
 | [`maki.net`](#maki-net) | HTTP client for fetching web content. |
+| [`maki.session`](#maki-session) | Host session primitives. |
 | [`maki.text`](#maki-text) | Text transformation utilities. |
 | [`maki.treesitter`](#maki-treesitter) | Tree-sitter parsing and query API. |
 | [`maki.treesitter.language`](#maki-treesitter-language) | Language registry for tree-sitter grammars. |
@@ -2272,6 +2273,164 @@ end
 ```
 
 
+## maki.session {#maki-session}
+
+Host session primitives. The interactive UI can run several sessions
+at once; these functions let plugins list, create, focus, rename, and
+delete them. Every call round-trips to the UI event loop and returns
+the pair `(value, err)`. Without an interactive UI attached, every
+call returns `nil, "no interactive UI attached"`.
+
+---
+
+### `maki.session.list()` {#maki-session-list}
+
+```lua
+maki.session.list()
+```
+
+Lists sessions stored for the current project. Answered from a
+background scan, so a slow disk never blocks the UI.
+
+**Returns:** (`table|nil`, `string|nil`) Array of `{id, title, updated_at}`, or nil and an error.
+
+**Example:**
+
+```lua
+local stored, err = maki.session.list()
+```
+
+---
+
+### `maki.session.live()` {#maki-session-live}
+
+```lua
+maki.session.live()
+```
+
+Lists the sessions currently running in this UI. Status is "working",
+"needs_input", or "idle".
+
+**Returns:** (`table|nil`, `string|nil`) Array of `{id, title, status, updated_at, focused}`, or nil and an error.
+
+**Example:**
+
+```lua
+local live, err = maki.session.live()
+```
+
+---
+
+### `maki.session.current()` {#maki-session-current}
+
+```lua
+maki.session.current()
+```
+
+Returns the id of the currently focused session.
+
+**Returns:** (`string|nil`, `string|nil`) Session id, or nil and an error.
+
+**Example:**
+
+```lua
+local id = maki.session.current()
+```
+
+---
+
+### `maki.session.focus()` {#maki-session-focus}
+
+```lua
+maki.session.focus({id})
+```
+
+Switches the UI to the session with {id}. The session must be live.
+
+**Parameters:**
+
+- `{id}` (`string`) Session id, as returned by `list()` or `live()`.
+
+**Returns:** (`boolean|nil`, `string|nil`) true on success, or nil and an error.
+
+**Example:**
+
+```lua
+local _, err = maki.session.focus(id)
+```
+
+---
+
+### `maki.session.delete()` {#maki-session-delete}
+
+```lua
+maki.session.delete({id})
+```
+
+Deletes a session and its stored history, cancelling it first if it
+is running. The focused session cannot be deleted.
+
+**Parameters:**
+
+- `{id}` (`string`) Session id to delete.
+
+**Returns:** (`boolean|nil`, `string|nil`) true on success, or nil and an error.
+
+**Example:**
+
+```lua
+local _, err = maki.session.delete(id)
+```
+
+---
+
+### `maki.session.new()` {#maki-session-new}
+
+```lua
+maki.session.new({opts?})
+```
+
+Starts a new session in the current project.
+
+**Parameters:**
+
+- `{opts?}` (`table?`) Optional fields: prompt (string) first user message
+
+  to submit right away; focus (boolean) switch the UI to the new session.
+
+
+**Returns:** (`string|nil`, `string|nil`) New session id, or nil and an error.
+
+**Example:**
+
+```lua
+local id, err = maki.session.new({ prompt = "fix the tests", focus = true })
+```
+
+---
+
+### `maki.session.set_title()` {#maki-session-set_title}
+
+```lua
+maki.session.set_title({opts})
+```
+
+Renames a session, live or stored.
+
+**Parameters:**
+
+- `{opts}` (`table`) Required fields: id (string) session to rename;
+  - `title` (`string`) the new title.
+
+**Returns:** (`boolean|nil`, `string|nil`) true on success, or nil and an error.
+
+**Example:**
+
+```lua
+local _, err = maki.session.set_title({ id = id, title = "refactor" })
+```
+
+
 ## maki.text {#maki-text}
 
 Text transformation utilities.
@@ -3765,18 +3924,21 @@ win:close()
 ### `Win:recv()` {#Win-recv}
 
 ```lua
-Win:recv()
+Win:recv({timeout_ms?})
 ```
 
-Waits for the next event from this window. Call this in a loop to
-build an interactive UI. Returns nil once the window is closed or
-the channel disconnects.
+Waits for the next event from this window. Call this in a loop to build an interactive UI. Returns nil once the window is closed or the channel disconnects. Pass {timeout_ms} to also get `{type="timeout"}` events so your plugin can animate while idle.
 
 Event tables by type:
 - `{type="key", key}` -- keypress. Key is a string like "q", "j", or "<Esc>".
 - `{type="resize", width, height}` -- terminal was resized.
 - `{type="paste", text}` -- bracketed paste.
 - `{type="close"}` -- window was closed externally.
+- `{type="timeout"}` -- no event arrived within {timeout_ms}.
+
+**Parameters:**
+
+- `{timeout_ms?}` (`integer`) Max milliseconds to wait before a timeout event is returned.
 
 **Returns:** (`table|nil`) Event table, or nil if the window has closed.
 

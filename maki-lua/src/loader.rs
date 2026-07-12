@@ -27,6 +27,10 @@ struct BundledPlugin {
 /// `require()` shared modules across boundaries.
 static BUNDLED_PLUGINS: &[BundledPlugin] = &[
     BundledPlugin {
+        name: "sessions",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/sessions"),
+    },
+    BundledPlugin {
         name: "index",
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/index"),
     },
@@ -299,9 +303,10 @@ impl PluginHost {
     }
 
     pub fn event_handle(&self) -> Option<EventHandle> {
-        self.inner
-            .as_ref()
-            .map(|t| EventHandle { tx: t.tx.clone() })
+        self.inner.as_ref().map(|t| EventHandle {
+            tx: t.tx.clone(),
+            prio_tx: t.prio_tx.clone(),
+        })
     }
 
     pub fn command_reader(&self) -> LuaCommandReader {
@@ -333,11 +338,16 @@ impl PluginHost {
 #[derive(Clone)]
 pub struct EventHandle {
     tx: flume::Sender<Request>,
+    /// User-initiated requests bypass queued bulk work (session restores).
+    prio_tx: flume::Sender<Request>,
 }
 
 impl EventHandle {
     pub(crate) fn from_tx(tx: flume::Sender<Request>) -> Self {
-        Self { tx }
+        Self {
+            tx,
+            prio_tx: flume::unbounded().0,
+        }
     }
 
     #[doc(hidden)]
@@ -346,7 +356,7 @@ impl EventHandle {
     }
 
     pub fn run_command(&self, plugin: Arc<str>, command: Arc<str>, args: String) {
-        let _ = self.tx.try_send(Request::RunCommand {
+        let _ = self.prio_tx.try_send(Request::RunCommand {
             plugin,
             command,
             args,
@@ -401,6 +411,21 @@ impl EventHandle {
         let _ = self.tx.send(Request::RestoreComplete { flag });
     }
 
+    /// Blocks until every restore item queued so far has finished; restores
+    /// run as spawned tasks, and the `RestoreComplete` flag flips only once
+    /// the whole batch has landed, making it the batch barrier.
+    #[doc(hidden)]
+    pub fn wait_restore_complete_for_test(&self) {
+        const DEADLINE: Duration = Duration::from_secs(30);
+        let flag = Arc::new(AtomicBool::new(true));
+        self.send_restore_complete(Arc::clone(&flag));
+        let start = std::time::Instant::now();
+        while flag.load(Ordering::Relaxed) {
+            assert!(start.elapsed() < DEADLINE, "restore batch never completed");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     pub fn fire_autocmd(&self, event: &str, data: serde_json::Value) {
         let _ = self.tx.try_send(Request::FireAutocmd {
             event: event.to_owned(),
@@ -409,7 +434,7 @@ impl EventHandle {
     }
 
     pub fn run_keybind_callback(&self, id: u64) {
-        let _ = self.tx.try_send(Request::RunKeybindCallback { id });
+        let _ = self.prio_tx.try_send(Request::RunKeybindCallback { id });
     }
 }
 
@@ -473,10 +498,11 @@ mod tests {
 
     #[test]
     fn run_command_sends_correct_request() {
-        let (tx, rx) = flume::bounded(8);
-        let handle = EventHandle { tx };
+        let (prio_tx, prio_rx) = flume::bounded(8);
+        let (tx, _rx) = flume::bounded(8);
+        let handle = EventHandle { tx, prio_tx };
         handle.run_command(Arc::from("myplugin"), Arc::from("/greet"), "world".into());
-        let req = rx.try_recv().unwrap();
+        let req = prio_rx.try_recv().unwrap();
         match req {
             Request::RunCommand {
                 plugin,
