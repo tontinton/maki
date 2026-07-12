@@ -461,7 +461,7 @@ impl<'de> Deserialize<'de> for PermissionsFileConfig {
         let mut mcp_defaults = HashMap::new();
 
         for (k, v) in table.iter() {
-            if k == "allow_all" || k == "default" {
+            if k.is_empty() || k == "allow_all" || k == "default" {
                 continue;
             }
             if k == "mcp" {
@@ -1122,10 +1122,6 @@ fn push_rules(
     effect: Effect,
 ) {
     for (tool, perms) in tools {
-        if tool.is_empty() {
-            tracing::warn!("skipping permission rule for empty tool name");
-            continue;
-        }
         let scope_set = match effect {
             Effect::Deny => &perms.deny,
             Effect::Allow => &perms.allow,
@@ -1192,24 +1188,32 @@ fn push_mcp_tool_rule(
     }
 }
 
-fn insert_or_create_array(table: &mut toml_edit::Table, key: &str, value: &str) {
-    match table
+fn child_table<'a>(
+    table: &'a mut toml_edit::Table,
+    key: &str,
+) -> Result<&'a mut toml_edit::Table, String> {
+    table
+        .entry(key)
+        .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()))
+        .as_table_mut()
+        .ok_or_else(|| format!("[{key}] is not a table"))
+}
+
+fn push_unique(table: &mut toml_edit::Table, key: &str, value: &str) -> Result<(), String> {
+    let arr = table
         .entry(key)
         .or_insert_with(|| toml_edit::Item::Value(toml_edit::Value::Array(toml_edit::Array::new())))
-    {
-        toml_edit::Item::Value(toml_edit::Value::Array(arr)) => {
-            if !arr.iter().any(|v| v.as_str() == Some(value)) {
-                arr.push(value);
-            }
-        }
-        slot => {
-            *slot = toml_edit::Item::Value(toml_edit::Value::Array({
-                let mut arr = toml_edit::Array::new();
-                arr.push(value);
-                arr
-            }));
+        .as_array_mut()
+        .ok_or_else(|| format!("{key} is not an array"))?;
+    if !arr.iter().any(|v| v.as_str() == Some(value)) {
+        arr.push(value);
+        arr.set_trailing("\n");
+        arr.set_trailing_comma(true);
+        for item in arr.iter_mut() {
+            item.decor_mut().set_prefix("\n    ");
         }
     }
+    Ok(())
 }
 
 fn parse_mcp_server_table(
@@ -1472,16 +1476,13 @@ pub fn load_permissions(cwd: &Path) -> PermissionsConfig {
 fn load_permissions_inner(cwd: &Path, global_dirs: &[PathBuf]) -> PermissionsConfig {
     let mut global_perms = PermissionsFileConfig::default();
     for dir in global_dirs {
-        let path = dir.join(PERMISSIONS_FILE);
-        migrate_permissions_file(&path);
-        if let Some(p) = read_permissions_file(&path) {
+        if let Some(p) = read_permissions_file(&dir.join(PERMISSIONS_FILE)) {
             global_perms = p;
         }
     }
 
-    let project_path = cwd.join(PROJECT_DIR).join(PERMISSIONS_FILE);
-    migrate_permissions_file(&project_path);
-    let project_perms = read_permissions_file(&project_path).unwrap_or_default();
+    let project_perms = read_permissions_file(&cwd.join(PROJECT_DIR).join(PERMISSIONS_FILE))
+        .unwrap_or_default();
 
     build_permissions(global_perms, project_perms)
 }
@@ -1492,88 +1493,46 @@ fn migrate_mcp_entry(
     tool_name: &str,
     item: &toml_edit::Item,
 ) {
-    // Old format: ["mcp:server__tool"] allow = ["scope_strings"]
-    // New format: [mcp.server] allow = ["tool_names"]
-    // Old array values were scope strings, but MCP scopes are always
-    // generalized to "*" at check time (see generalize_scope), so those
-    // scope strings were dead code. We replace them with the tool name
-    // extracted from the key, which is the correct semantic for the new format.
-
-    // Create [mcp.server] as nested table: mcp → server → {allow/deny}
-    let mcp_item = doc
-        .entry("mcp")
-        .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
-    let Some(mcp_table) = mcp_item.as_table_mut() else {
-        tracing::warn!(
-            server = server_name,
-            "[mcp] is not a table — skipping migration"
-        );
-        return;
-    };
-    let server_item = mcp_table
-        .entry(server_name)
-        .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
-    let Some(server_table) = server_item.as_table_mut() else {
-        tracing::warn!(
-            server = server_name,
-            "[mcp.{server_name}] is not a table — skipping migration"
-        );
-        return;
+    // Old format: ["mcp:server__tool"] with booleans or scope-string arrays.
+    // New format: [mcp.server] allow = ["tool_name"]. Old scope strings were
+    // dead code (MCP scopes are always wildcarded), so only the effect survives.
+    let mut push = |effect_key: &str| {
+        let res = child_table(doc.as_table_mut(), "mcp")
+            .and_then(|mcp| child_table(mcp, server_name))
+            .and_then(|server| push_unique(server, effect_key, tool_name));
+        if let Err(e) = res {
+            warn!(
+                server = server_name,
+                tool = tool_name,
+                error = %e,
+                "skipping MCP entry migration"
+            );
+        }
     };
 
     // Bare boolean: old format like [mcp]\ndeepwiki__search = true
-    // means "allow this tool" — treat as allow = [tool_name].
-    if let Some(toml_edit::Value::Boolean(b)) = item.as_value() {
-        if *b.value() {
-            insert_or_create_array(server_table, "allow", tool_name);
+    // means "allow this tool".
+    if let Some(b) = item.as_bool() {
+        if b {
+            push("allow");
         }
         return;
     }
 
     if let Some(old_table) = item.as_table() {
-        for (effect_key, effect_value) in old_table {
-            let key_str: &str = effect_key;
-            match key_str {
+        for (key, value) in old_table.iter() {
+            match key {
                 "allow" | "deny" => {
-                    match effect_value {
-                        toml_edit::Item::Value(toml_edit::Value::Boolean(b)) if *b.value() => {
-                            insert_or_create_array(server_table, key_str, tool_name);
-                        }
-                        toml_edit::Item::Value(toml_edit::Value::Array(old_arr)) => {
-                            if !old_arr.is_empty() {
-                                tracing::warn!(
-                                    server = server_name,
-                                    tool = tool_name,
-                                    "old MCP scope strings dropped during migration \
-                                     (MCP scopes are always wildcarded)"
-                                );
-                            }
-                            insert_or_create_array(server_table, key_str, tool_name);
-                        }
-                        toml_edit::Item::Value(toml_edit::Value::Boolean(b)) if !b.value() => {
-                            // allow = false / deny = false → no rule, but log for transparency.
-                            tracing::info!(
-                                key = key_str,
-                                tool = tool_name,
-                                "{key_str} = false — no rule generated"
-                            );
-                        }
-                        _ => {
-                            tracing::warn!(
-                                key = key_str,
-                                tool = tool_name,
-                                value = format!("{:?}", effect_value),
-                                "unexpected value type for {key_str} in migration — skipping"
-                            );
-                        }
+                    if value.as_bool() == Some(true) || value.as_array().is_some() {
+                        push(key);
                     }
                 }
                 _ => {
-                    tracing::warn!(
-                        key = key_str,
+                    warn!(
+                        key,
                         server = server_name,
                         tool = tool_name,
-                        "unknown key \"{key_str}\" in old MCP entry during migration — dropping"
+                        "dropping unknown key in old MCP entry during migration"
                     );
                 }
             }
@@ -1581,12 +1540,13 @@ fn migrate_mcp_entry(
     }
 }
 
-fn migrate_permissions_file(path: &Path) {
-    let Ok(content) = fs::read_to_string(path) else {
-        return;
-    };
+/// Migrates old permission formats and returns the (possibly rewritten)
+/// file content. The rewrite to disk is best-effort: loading uses the
+/// migrated content even when the write fails.
+fn migrate_permissions_file(path: &Path) -> Option<String> {
+    let content = fs::read_to_string(path).ok()?;
     let Ok(mut doc) = content.parse::<toml_edit::DocumentMut>() else {
-        return;
+        return Some(content);
     };
     let mut migrated = false;
 
@@ -1673,13 +1633,18 @@ fn migrate_permissions_file(path: &Path) {
         doc.remove("mcp");
     }
 
-    if migrated && let Err(e) = maki_storage::atomic_write(path, doc.to_string().as_bytes()) {
-        warn!(path = %path.display(), error = %e, "failed to migrate permissions file");
+    if !migrated {
+        return Some(content);
     }
+    let new_content = doc.to_string();
+    if let Err(e) = maki_storage::atomic_write(path, new_content.as_bytes()) {
+        warn!(path = %path.display(), error = %e, "failed to persist migrated permissions file");
+    }
+    Some(new_content)
 }
 
 fn read_permissions_file(path: &Path) -> Option<PermissionsFileConfig> {
-    let content = fs::read_to_string(path).ok()?;
+    let content = migrate_permissions_file(path)?;
     match toml::from_str(&content) {
         Ok(p) => Some(p),
         Err(e) => {
@@ -1780,109 +1745,23 @@ fn insert_permission_entry(
     };
 
     match tool_key {
-        ToolKey::McpTool {
-            server,
-            tool: tool_name,
-        } => {
-            // MCP scopes are always wildcarded — scope parameter is intentionally ignored.
-            if scope.is_some() {
-                tracing::debug!(
-                    tool = %tool_name,
-                    scope = ?scope,
-                    "MCP tool scope ignored (always wildcarded)"
-                );
-            }
-            let mcp_item = doc
-                .entry("mcp")
-                .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
-            let mcp_table = mcp_item
-                .as_table_mut()
-                .ok_or_else(|| "[mcp] is not a table".to_string())?;
-            let server_item = mcp_table
-                .entry(server)
-                .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
-            let server_table = server_item
-                .as_table_mut()
-                .ok_or_else(|| format!("[mcp.{server}] is not a table"))?;
-
-            let arr = server_table.entry(key).or_insert_with(|| {
-                toml_edit::Item::Value(toml_edit::Value::Array(toml_edit::Array::new()))
-            });
-            let arr = arr
-                .as_array_mut()
-                .ok_or_else(|| format!("[mcp.{server}].{key} is not an array"))?;
-            let already_exists = arr
-                .iter()
-                .any(|v| v.as_str().is_some_and(|existing| existing == &**tool_name));
-            if !already_exists {
-                arr.push(&**tool_name);
-                arr.set_trailing("\n");
-                arr.set_trailing_comma(true);
-                for item in arr.iter_mut() {
-                    item.decor_mut().set_prefix("\n    ");
-                }
-            }
+        // MCP scopes are always wildcarded, so `scope` is ignored for MCP keys.
+        ToolKey::McpTool { server, tool } => {
+            let server_table = child_table(child_table(doc.as_table_mut(), "mcp")?, server)?;
+            push_unique(server_table, key, tool)?;
         }
         ToolKey::McpServer { server } => {
-            // Server-wide default: write default = "allow" / "deny"
-            if scope.is_some() {
-                tracing::debug!(
-                    server = %server,
-                    scope = ?scope,
-                    "MCP server scope ignored (always wildcarded)"
-                );
-            }
-            let default_str = match effect {
-                Effect::Allow => "allow",
-                Effect::Deny => "deny",
-            };
-            let mcp_item = doc
-                .entry("mcp")
-                .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
-            let mcp_table = mcp_item
-                .as_table_mut()
-                .ok_or_else(|| "[mcp] is not a table".to_string())?;
-            let server_item = mcp_table
-                .entry(server)
-                .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
-            let server_table = server_item
-                .as_table_mut()
-                .ok_or_else(|| format!("[mcp.{server}] is not a table"))?;
-            server_table.insert("default", toml_edit::value(default_str));
+            let server_table = child_table(child_table(doc.as_table_mut(), "mcp")?, server)?;
+            server_table.insert("default", toml_edit::value(key));
         }
         ToolKey::Wildcard => {
             // Wildcard rules are config-only; runtime never writes them.
-            // A bare `*` key is invalid TOML, so we reject the write.
             return Err("cannot write wildcard permission rule to config".to_string());
         }
         ToolKey::Native(name) => {
-            let tool_table = doc
-                .entry(name.as_ref())
-                .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
-            let tool_table = tool_table
-                .as_table_mut()
-                .ok_or_else(|| format!("[{name}] is not a table"))?;
-
+            let tool_table = child_table(doc.as_table_mut(), name)?;
             match scope {
-                Some(s) => {
-                    let arr = tool_table.entry(key).or_insert_with(|| {
-                        toml_edit::Item::Value(toml_edit::Value::Array(toml_edit::Array::new()))
-                    });
-                    let arr = arr
-                        .as_array_mut()
-                        .ok_or_else(|| format!("[{name}].{key} is not an array"))?;
-                    let already_exists = arr
-                        .iter()
-                        .any(|v| v.as_str().is_some_and(|existing| existing == s));
-                    if !already_exists {
-                        arr.push(s);
-                        arr.set_trailing("\n");
-                        arr.set_trailing_comma(true);
-                        for item in arr.iter_mut() {
-                            item.decor_mut().set_prefix("\n    ");
-                        }
-                    }
-                }
+                Some(s) => push_unique(tool_table, key, s)?,
                 None => {
                     tool_table.insert(key, toml_edit::value(true));
                 }
@@ -2927,5 +2806,40 @@ mod tests {
         assert!(content.contains("\"search\""), "tool name migrated");
         assert!(content.contains("\"issue\""), "tool name migrated");
         assert!(!content.contains("__"), "no old __ separator remains");
+    }
+
+    #[test]
+    fn empty_tool_key_sections_ignored() {
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        write_global_permissions(dir.path(), "[\"\"]\ndefault = \"allow\"\nallow = [\"x\"]\n");
+        let perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
+        assert!(perms.rules.is_empty());
+        assert!(perms.tool_defaults.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn migration_applies_in_memory_when_write_fails() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        fs::create_dir_all(&global).unwrap();
+        fs::write(
+            global.join("permissions.toml"),
+            "[\"mcp:github__delete\"]\ndeny = true\n",
+        )
+        .unwrap();
+        fs::set_permissions(&global, fs::Permissions::from_mode(0o555)).unwrap();
+        if fs::write(global.join("probe"), b"x").is_ok() {
+            return; // running as root, cannot simulate a read-only dir
+        }
+
+        let perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
+        fs::set_permissions(&global, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(perms.rules.len(), 1);
+        assert_eq!(perms.rules[0].effect, Effect::Deny);
+        assert_eq!(perms.rules[0].tool, ToolKey::parse("github.delete").unwrap());
     }
 }
