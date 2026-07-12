@@ -227,6 +227,25 @@ impl App {
         vec![]
     }
 
+    pub(super) fn rename_current_session(&mut self, args: &str) -> Vec<Action> {
+        let title = args.trim();
+        if title.is_empty() {
+            self.flash("Usage: /rename <new title>".into());
+            return vec![];
+        }
+        self.state.session.title = title.to_string();
+        // Bypass save_session: it skips "no content" sessions, but a rename
+        // must persist even when the session is otherwise empty.
+        self.state.sync_session(
+            &self.shared_history,
+            &self.shared_tool_outputs,
+            &self.permissions,
+        );
+        self.enqueue_save();
+        self.flash(format!("Renamed to \"{title}\""));
+        vec![]
+    }
+
     pub(crate) fn apply_loaded_session(
         &mut self,
         session: AppSession,

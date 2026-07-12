@@ -1185,6 +1185,7 @@ impl App {
                 vec![]
             }
             "/sessions" => self.open_session_picker(),
+            "/rename" => self.rename_current_session(&cmd.args),
             "/model" => {
                 self.model_picker.open(&self.state.model.spec());
                 vec![Action::RefreshModels]

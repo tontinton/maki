@@ -156,6 +156,28 @@ fn typing_and_submit() {
     assert_eq!(app.main_chat().last_message_text(), "hi");
 }
 
+#[test]
+fn rename_command_sets_trimmed_title() {
+    let mut app = test_app();
+    let actions = app.execute_command(ParsedCommand {
+        name: "/rename".into(),
+        args: "  my cool session  ".into(),
+    });
+    assert!(actions.is_empty());
+    assert_eq!(app.state.session.title, "my cool session");
+}
+
+#[test]
+fn rename_command_rejects_empty() {
+    let mut app = test_app();
+    let before = app.state.session.title.clone();
+    app.execute_command(ParsedCommand {
+        name: "/rename".into(),
+        args: "   ".into(),
+    });
+    assert_eq!(app.state.session.title, before);
+}
+
 fn with_text(app: &mut App) {
     app.update(Msg::Key(key(KeyCode::Char('h'))));
     app.update(Msg::Key(key(KeyCode::Char('i'))));

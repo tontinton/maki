@@ -20,6 +20,7 @@ Type `/` in the input box to open the command palette.
 | `/usage` | Show token usage breakdown |
 | `/queue` | Remove items from queue |
 | `/sessions` | Browse and switch sessions |
+| `/rename` | Rename the current session |
 | `/model` | Switch model |
 | `/theme` | Switch color theme |
 | `/mcp` | Configure MCP servers |

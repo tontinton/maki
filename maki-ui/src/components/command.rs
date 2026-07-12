@@ -58,6 +58,11 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         max_args: 0,
     },
     BuiltinCommand {
+        name: "/rename",
+        description: "Rename the current session",
+        max_args: usize::MAX,
+    },
+    BuiltinCommand {
         name: "/model",
         description: "Switch model",
         max_args: 0,

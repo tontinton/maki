@@ -257,6 +257,7 @@ pub struct SessionLog {
     saved_msg_count: usize,
     saved_tool_ids: HashSet<String>,
     saved_sub_msg_counts: HashMap<String, usize>,
+    saved_title: String,
 }
 
 fn sub_msg_snapshot<M>(map: &HashMap<String, Vec<M>>) -> HashMap<String, usize> {
@@ -376,7 +377,8 @@ impl SessionLog {
             }
         }
 
-        if buf.is_empty() {
+        // A title-only change (e.g. `/rename`) still needs a fresh meta record.
+        if buf.is_empty() && session.title == self.saved_title {
             return Ok(());
         }
 
@@ -398,6 +400,7 @@ impl SessionLog {
         for (sub_id, count) in new_sub_counts {
             self.saved_sub_msg_counts.insert(sub_id, count);
         }
+        self.saved_title = session.title.clone();
 
         Ok(())
     }
@@ -428,13 +431,11 @@ impl SessionLog {
 
         fs::rename(&tmp, &path).map_err(StorageError::from)?;
 
-        self.file = OpenOptions::new()
+        let file = OpenOptions::new()
             .append(true)
             .open(&path)
             .map_err(StorageError::from)?;
-        self.saved_msg_count = session.messages.len();
-        self.saved_tool_ids = session.tool_outputs.keys().cloned().collect();
-        self.saved_sub_msg_counts = sub_msg_snapshot(&session.subagent_messages);
+        *self = Self::cursor_from(session, file);
 
         Ok(())
     }
@@ -446,6 +447,7 @@ impl SessionLog {
             saved_msg_count: session.messages.len(),
             saved_tool_ids: session.tool_outputs.keys().cloned().collect(),
             saved_sub_msg_counts: sub_msg_snapshot(&session.subagent_messages),
+            saved_title: session.title.clone(),
         }
     }
 }
@@ -1490,6 +1492,22 @@ mod tests {
         let list = TestSession::list_in("/project", dir).unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].title, "v2");
+    }
+
+    #[test]
+    fn append_persists_title_only_change_without_new_messages() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut session: TestSession = Session::new("m", "/project");
+        session.messages.push(user_message("first"));
+        let mut log = SessionLog::create(dir, &session).unwrap();
+
+        session.title = "renamed".into();
+        log.append(&session).unwrap();
+
+        let list = TestSession::list_in("/project", dir).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].title, "renamed");
     }
 
     #[test]
