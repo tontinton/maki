@@ -1481,8 +1481,8 @@ fn load_permissions_inner(cwd: &Path, global_dirs: &[PathBuf]) -> PermissionsCon
         }
     }
 
-    let project_perms = read_permissions_file(&cwd.join(PROJECT_DIR).join(PERMISSIONS_FILE))
-        .unwrap_or_default();
+    let project_perms =
+        read_permissions_file(&cwd.join(PROJECT_DIR).join(PERMISSIONS_FILE)).unwrap_or_default();
 
     build_permissions(global_perms, project_perms)
 }
@@ -2840,6 +2840,9 @@ mod tests {
 
         assert_eq!(perms.rules.len(), 1);
         assert_eq!(perms.rules[0].effect, Effect::Deny);
-        assert_eq!(perms.rules[0].tool, ToolKey::parse("github.delete").unwrap());
+        assert_eq!(
+            perms.rules[0].tool,
+            ToolKey::parse("github.delete").unwrap()
+        );
     }
 }
