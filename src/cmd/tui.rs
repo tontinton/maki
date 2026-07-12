@@ -61,6 +61,15 @@ fn read_initial_prompt(cli_prompt: Option<String>) -> Result<Option<String>> {
 }
 
 pub fn run(cli: Cli) -> Result<()> {
+    run_inner(cli, false)
+}
+
+/// Launch the TUI directly on the multi-session agents dashboard (`maki agents`).
+pub fn run_dashboard(cli: Cli) -> Result<()> {
+    run_inner(cli, true)
+}
+
+fn run_inner(cli: Cli, dashboard: bool) -> Result<()> {
     let storage = StateDir::resolve().context("resolve data directory")?;
     maki_providers::model_registry::load_from_storage(&storage);
 
@@ -210,6 +219,7 @@ pub fn run(cli: Cli) -> Result<()> {
                 hint_reader: plugin_host.hint_reader(),
                 ui_action_rx,
                 lua_event_handle: plugin_host.event_handle(),
+                dashboard,
             },
             initial_prompt,
         )

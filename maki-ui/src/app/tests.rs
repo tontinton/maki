@@ -156,6 +156,62 @@ fn typing_and_submit() {
     assert_eq!(app.main_chat().last_message_text(), "hi");
 }
 
+#[test]
+fn submit_marks_session_working_then_completed() {
+    use maki_storage::sessions::SessionStatus;
+
+    let mut app = test_app();
+    app.update(Msg::Key(key(KeyCode::Char('h'))));
+    app.update(Msg::Key(key(KeyCode::Char('i'))));
+    app.update(Msg::Key(key(KeyCode::Enter)));
+
+    // Streaming submit persists the session as Working.
+    assert_eq!(app.status, Status::Streaming);
+    assert_eq!(app.state.session.meta.status, SessionStatus::Working);
+
+    // Returning to Idle with content on screen marks it Completed.
+    app.state
+        .session
+        .messages
+        .push(maki_providers::Message::user("hi".into()));
+    app.status = Status::Idle;
+    app.save_session();
+    assert_eq!(app.state.session.meta.status, SessionStatus::Completed);
+}
+
+#[test]
+fn rename_command_sets_and_persists_title() {
+    let mut app = test_app();
+    app.state
+        .session
+        .messages
+        .push(maki_providers::Message::user("hello".into()));
+
+    let actions = app.execute_command(ParsedCommand {
+        name: "/rename".into(),
+        args: "my cool session".into(),
+    });
+    assert!(actions.is_empty());
+    assert_eq!(app.state.session.title, "my cool session");
+
+    // The renamed title survives a synchronous save/load round-trip.
+    let dir = app.storage.clone();
+    app.state.session.save(&dir).unwrap();
+    let loaded = AppSession::load(&app.state.session.id, &dir).unwrap();
+    assert_eq!(loaded.title, "my cool session");
+}
+
+#[test]
+fn rename_command_rejects_empty() {
+    let mut app = test_app();
+    let before = app.state.session.title.clone();
+    app.execute_command(ParsedCommand {
+        name: "/rename".into(),
+        args: "   ".into(),
+    });
+    assert_eq!(app.state.session.title, before);
+}
+
 fn with_text(app: &mut App) {
     app.update(Msg::Key(key(KeyCode::Char('h'))));
     app.update(Msg::Key(key(KeyCode::Char('i'))));

@@ -147,6 +147,7 @@ impl App {
         }
         self.main_chat()
             .show_user_message(format_with_images(&msg.text, msg.images.len()));
+        self.save_session();
         vec![super::Action::SendMessage(Box::new(
             self.build_agent_input(msg),
         ))]

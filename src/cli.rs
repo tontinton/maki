@@ -225,6 +225,12 @@ pub enum Command {
         #[arg(long)]
         yolo: bool,
     },
+    /// Open the multi-session agents dashboard
+    Agents {
+        /// Model spec (provider/model-id)
+        #[arg(short, long)]
+        model: Option<String>,
+    },
     /// Show the rendered system prompt or tool definitions
     Prompt {
         /// Prompt variant: system (default), research, general

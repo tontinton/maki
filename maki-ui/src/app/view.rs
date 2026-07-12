@@ -156,6 +156,11 @@ impl App {
     }
 
     fn render_bottom_panel(&mut self, frame: &mut Frame, layout: &ViewLayout) {
+        // The dashboard renders the shared input box inside its own panel, so
+        // skip the normal bottom-panel input to avoid a duplicate.
+        if self.session_dashboard.is_open() {
+            return;
+        }
         if self.permission_prompt.is_open() {
             self.permission_prompt.view(frame, layout.bottom_area);
         } else if !self.is_main_chat() {
@@ -212,6 +217,8 @@ impl App {
         }
     }
 
+    /// Single-line new-session prompt for the dashboard, backed by the shared
+    /// input box state (so `/` commands, file picker, and image paste all work).
     fn render_splits(&mut self, frame: &mut Frame, layout: &ViewLayout) {
         for dir in Split::ALL {
             if let Some(rect) = layout.splits.rect(dir) {
@@ -237,6 +244,48 @@ impl App {
                 self.status_bar.flash(flash);
             }
             overlay_rect = self.file_picker.view(frame, full);
+        }
+
+        if self.session_dashboard.is_open() {
+            self.session_dashboard.tick();
+            // The picker centers a modal at 65% width with a 1-col border each
+            // side; size the input box to that inner width so it wraps at the
+            // right place and grows to multiple rows.
+            let popup_width = full.width.saturating_mul(65) / 100;
+            let input_inner_width = popup_width.saturating_sub(2).max(1);
+            let max_input = (full.height / 2).max(3);
+            let input_height = self.input_box.height(input_inner_width).clamp(3, max_input);
+            let dash = self.session_dashboard.view(frame, full, input_height);
+            overlay_rect = dash.popup;
+
+            // Render maki's real input box inside the panel: full editing,
+            // horizontal scroll, multiline, image display.
+            self.input_box.view(
+                frame,
+                dash.input_area,
+                false,
+                self.separator_style(),
+                true,
+                None,
+            );
+            // Left-aligned "New session" label on the input's top border row.
+            let label_area = Rect {
+                x: dash.input_area.x + 1,
+                y: dash.input_area.y,
+                width: dash.input_area.width.saturating_sub(2),
+                height: 1,
+            };
+            frame.render_widget(
+                ratatui::widgets::Paragraph::new(Line::from(Span::styled(
+                    " New session ",
+                    crate::theme::current().panel_title,
+                ))),
+                label_area,
+            );
+            self.command_palette.view(frame, dash.input_area);
+            if let Some(flash) = self.session_dashboard.take_flash() {
+                self.status_bar.flash(flash);
+            }
         }
 
         if self.session_picker.is_open() {

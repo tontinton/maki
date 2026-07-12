@@ -2,11 +2,11 @@ use std::thread;
 
 use crate::AppSession;
 use crate::components::Overlay;
+use crate::components::format_relative_time;
 use crate::components::keybindings::key;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use jiff::Timestamp;
 use maki_storage::StateDir;
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
@@ -189,48 +189,5 @@ impl Overlay for SessionPicker {
 
     fn close(&mut self) {
         self.close()
-    }
-}
-
-fn format_relative_time(epoch_secs: u64) -> String {
-    let ts = Timestamp::from_second(epoch_secs as i64).unwrap_or(Timestamp::UNIX_EPOCH);
-    let now = Timestamp::now();
-    let secs = now.as_second().saturating_sub(ts.as_second()).max(0) as u64;
-    humanize_secs(secs)
-}
-
-fn humanize_secs(secs: u64) -> String {
-    const MINUTE: u64 = 60;
-    const HOUR: u64 = 3600;
-    const DAY: u64 = 86400;
-    const WEEK: u64 = 604800;
-    const MONTH: u64 = 2592000;
-    const YEAR: u64 = 31536000;
-
-    match secs {
-        0..MINUTE => "just now".into(),
-        MINUTE..HOUR => format!("{}m ago", secs / MINUTE),
-        HOUR..DAY => format!("{}h ago", secs / HOUR),
-        DAY..WEEK => format!("{}d ago", secs / DAY),
-        WEEK..MONTH => format!("{}w ago", secs / WEEK),
-        MONTH..YEAR => format!("{}mo ago", secs / MONTH),
-        _ => format!("{}y ago", secs / YEAR),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use test_case::test_case;
-
-    #[test_case(0, "just now" ; "below_minute")]
-    #[test_case(60, "1m ago" ; "minute_boundary")]
-    #[test_case(3600, "1h ago" ; "hour_boundary")]
-    #[test_case(86400, "1d ago" ; "day_boundary")]
-    #[test_case(604800, "1w ago" ; "week_boundary")]
-    #[test_case(2592000, "1mo ago" ; "month_boundary")]
-    #[test_case(31536000, "1y ago" ; "year_boundary")]
-    fn relative_time_formatting(secs: u64, expected: &str) {
-        assert_eq!(humanize_secs(secs), expected);
     }
 }

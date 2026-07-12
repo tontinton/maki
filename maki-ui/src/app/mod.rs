@@ -40,6 +40,7 @@ use crate::components::plan_form::{PlanForm, PlanFormAction};
 use crate::components::rewind_picker::{RewindPicker, RewindPickerAction};
 use crate::components::scrollbar;
 use crate::components::search_modal::{SearchAction, SearchModal};
+use crate::components::session_dashboard::{DashboardAction, SessionDashboard};
 use crate::components::session_picker::{SessionPicker, SessionPickerAction};
 use crate::components::status_bar::StatusBar;
 use crate::components::theme_picker::{ThemePicker, ThemePickerAction};
@@ -51,7 +52,7 @@ use crate::components::{
 use crate::image;
 use crate::selection::{SelectionState, ZoneRegistry};
 use arc_swap::{ArcSwap, ArcSwapOption};
-use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use maki_agent::permissions::PermissionManager;
 use maki_agent::{
     AgentEvent, Envelope, ImageSource, McpConfigErrors, McpPromptInfo, McpSnapshotReader,
@@ -141,6 +142,7 @@ pub struct App {
     pub(super) login_picker: LoginPicker,
     pub(super) mcp_picker: McpPicker,
     pub(super) session_picker: SessionPicker,
+    pub(super) session_dashboard: SessionDashboard,
     pub(super) rewind_picker: RewindPicker,
     pub(super) help_modal: HelpModal,
     pub(super) usage_modal: UsageModal,
@@ -182,6 +184,9 @@ pub struct App {
     pub(crate) restore_event_tx: Option<maki_agent::EventSender>,
     pub(super) restoring: Arc<AtomicBool>,
     subagent_answers: HashMap<String, flume::Sender<String>>,
+    /// When true, the UI launched via `maki agents` and should present the
+    /// multi-session dashboard as its landing screen.
+    pub(crate) dashboard: bool,
 }
 
 impl App {
@@ -221,6 +226,7 @@ impl App {
             login_picker: LoginPicker::new(),
             mcp_picker: McpPicker::new(mcp_reader, mcp_config_errors),
             session_picker: SessionPicker::new(),
+            session_dashboard: SessionDashboard::new(),
             rewind_picker: RewindPicker::new(),
             help_modal: HelpModal::new(),
             usage_modal: UsageModal::new(),
@@ -261,6 +267,7 @@ impl App {
             restore_event_tx: None,
             restoring: Arc::new(AtomicBool::new(false)),
             subagent_answers: HashMap::new(),
+            dashboard: false,
         };
         app.model_picker
             .set_recents(maki_storage::model::read_recents(&app.storage));
@@ -318,13 +325,14 @@ impl App {
             Msg::Key(key) => self.handle_key(key),
             Msg::Paste(text) => {
                 let text = text.replace("\r\n", "\n").replace('\r', "\n");
+                let input_active = self.is_main_chat() || self.session_dashboard.is_open();
                 if text.is_empty() {
-                    if self.is_main_chat() && self.image_paste_rx.is_empty() {
+                    if input_active && self.image_paste_rx.is_empty() {
                         self.start_image_paste();
                     }
                 } else {
                     let mut any_image = false;
-                    if self.is_main_chat() {
+                    if input_active {
                         for line in text.lines() {
                             if let Some((path, mt)) = image::try_parse_image_path(line) {
                                 self.start_file_image_paste(path, mt);
@@ -395,6 +403,7 @@ impl App {
             };
         }
         try_picker!(self.session_picker);
+        try_picker!(self.session_dashboard);
         try_picker!(self.rewind_picker);
         try_picker!(self.task_picker);
         try_picker!(self.model_picker);
@@ -604,6 +613,36 @@ impl App {
             });
         }
 
+        if self.session_dashboard.is_open() {
+            let action = self.session_dashboard.handle_key(key);
+            return Some(match action {
+                DashboardAction::Consumed => vec![],
+                DashboardAction::None => {
+                    // Esc closed the dashboard; nothing else to do.
+                    vec![]
+                }
+                DashboardAction::Open(id) => {
+                    self.session_dashboard.close();
+                    self.input_box.discard();
+                    vec![Action::FocusSession(id)]
+                }
+                DashboardAction::NewSession => {
+                    self.session_dashboard.close();
+                    self.input_box.discard();
+                    vec![Action::SpawnSession(None)]
+                }
+                DashboardAction::ConfirmDelete => {
+                    self.status_bar.flash(format!(
+                        "Press {} again to confirm delete",
+                        key::DELETE.label
+                    ));
+                    vec![]
+                }
+                DashboardAction::Delete(id) => self.delete_session(id),
+                DashboardAction::Passthrough(key) => self.dashboard_input_key(key),
+            });
+        }
+
         if self.session_picker.is_open() {
             return Some(match self.session_picker.handle_key(key) {
                 SessionPickerAction::Consumed => vec![],
@@ -778,6 +817,24 @@ impl App {
         }
 
         let streaming = self.status == Status::Streaming;
+
+        // Arrow keys navigate between sessions whenever the input box is empty,
+        // even while the current session is still streaming (its agent keeps
+        // running in the background). When the input has text, arrows move the
+        // cursor as usual. Left returns to the agents dashboard; Up/Down cycle
+        // to the previous/next session (Claude Code parity).
+        if self.is_main_chat() && self.input_box.is_empty() && key.modifiers.is_empty() {
+            match key.code {
+                KeyCode::Left => {
+                    self.open_dashboard();
+                    return vec![];
+                }
+                KeyCode::Up => return vec![Action::FocusPrevSession],
+                KeyCode::Down => return vec![Action::FocusNextSession],
+                _ => {}
+            }
+        }
+
         match self.input_box.handle_key(key) {
             InputAction::Submit(sub) => self.handle_submit(sub),
             InputAction::PaletteSync(val) => {
@@ -875,6 +932,58 @@ impl App {
         } else {
             self.run_id += 1;
             self.start_from_queue(&msg)
+        }
+    }
+
+    /// Handle a key routed from the dashboard to the shared input box. Mirrors
+    /// the normal input flow (command palette, file picker, image paste), but a
+    /// submit spawns a new session seeded with the text instead of sending to
+    /// the current session. Enter on an empty box opens the selected session.
+    fn dashboard_input_key(&mut self, key: KeyEvent) -> Vec<Action> {
+        if key::FILE_PICKER.matches(key) {
+            self.file_picker.open(&self.state.session.cwd);
+            return vec![];
+        }
+        if key.code == KeyCode::Char('v')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && self.image_paste_rx.is_empty()
+        {
+            self.start_image_paste();
+            return vec![];
+        }
+
+        match self
+            .command_palette
+            .handle_key(key, &self.input_box.buffer.value())
+        {
+            CommandAction::Consumed => return vec![],
+            CommandAction::Execute(cmd) => return self.execute_command(cmd),
+            CommandAction::Complete(text) => {
+                self.command_palette.sync(&text);
+                self.input_box.set_input(text);
+                self.input_box.buffer.move_to_end();
+                return vec![];
+            }
+            CommandAction::Passthrough => {}
+        }
+
+        match self.input_box.handle_key(key) {
+            InputAction::Submit(sub) => {
+                if sub.is_empty() {
+                    if let Some(id) = self.session_dashboard.selected_id() {
+                        self.session_dashboard.close();
+                        return vec![Action::FocusSession(id)];
+                    }
+                    return vec![];
+                }
+                self.session_dashboard.close();
+                vec![Action::SpawnSession(Some(Box::new(sub)))]
+            }
+            InputAction::PaletteSync(val) => {
+                self.command_palette.sync(&val);
+                vec![]
+            }
+            _ => vec![],
         }
     }
 
@@ -1060,6 +1169,7 @@ impl App {
 
         if let ChatEventResult::PermissionRequest { id, tool, scopes } = result {
             self.permission_prompt.open(id, tool, scopes, subagent_id);
+            self.save_session();
             return vec![];
         }
 
@@ -1185,6 +1295,7 @@ impl App {
                 vec![]
             }
             "/sessions" => self.open_session_picker(),
+            "/rename" => self.rename_current_session(&cmd.args),
             "/model" => {
                 self.model_picker.open(&self.state.model.spec());
                 vec![Action::RefreshModels]
@@ -1392,7 +1503,7 @@ impl App {
         vec![]
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 14] {
+    fn overlays(&self) -> [&dyn Overlay; 15] {
         [
             &self.help_modal,
             &self.usage_modal,
@@ -1402,6 +1513,7 @@ impl App {
             &self.file_picker,
             &self.task_picker,
             &self.session_picker,
+            &self.session_dashboard,
             &self.rewind_picker,
             &self.theme_picker,
             &self.model_picker,
@@ -1411,7 +1523,7 @@ impl App {
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 14] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 15] {
         [
             &mut self.help_modal,
             &mut self.usage_modal,
@@ -1421,6 +1533,7 @@ impl App {
             &mut self.file_picker,
             &mut self.task_picker,
             &mut self.session_picker,
+            &mut self.session_dashboard,
             &mut self.rewind_picker,
             &mut self.theme_picker,
             &mut self.model_picker,
@@ -1502,6 +1615,14 @@ impl App {
         try_picker!(self.model_picker);
         try_picker!(self.mcp_picker);
         try_picker!(self.login_picker);
+        // When the dashboard is open, pasted text / dropped file paths belong in
+        // the shared new-session input box, not the picker's filter.
+        if self.session_dashboard.is_open() {
+            if let InputAction::PaletteSync(val) = self.input_box.handle_paste(text) {
+                self.command_palette.sync(&val);
+            }
+            return;
+        }
         if !self.is_main_chat() {
             return;
         }

@@ -11,8 +11,8 @@ use maki_storage::StateDir;
 use crate::cli::{AuthAction, Cli, Command, McpAction, MigrateAction};
 use crate::update;
 
-pub fn dispatch(cli: Cli) -> Result<()> {
-    match cli.command {
+pub fn dispatch(mut cli: Cli) -> Result<()> {
+    match cli.command.take() {
         Some(Command::Auth { action }) => {
             let storage = StateDir::resolve().context("resolve data directory")?;
             match action {
@@ -44,6 +44,12 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         }
         Some(Command::Acp { model, yolo }) => {
             acp::run(model, yolo)?;
+        }
+        Some(Command::Agents { model }) => {
+            if model.is_some() {
+                cli.model = model;
+            }
+            tui::run_dashboard(cli)?;
         }
         Some(Command::Migrate { action }) => match action {
             MigrateAction::Xdg => migrate::xdg()?,
