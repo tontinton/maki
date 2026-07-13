@@ -257,6 +257,9 @@ case("replace_lines_insert_mode", function()
   has(e1, "out of range")
   local _, e2 = replace_lines(content, 5, nil, "x")
   has(e2, "out of range")
+
+  local r4 = replace_lines(content, 2, nil, "")
+  eq(r4, "aaa\n\nbbb\nccc\n")
 end)
 
 if #failures > 0 then

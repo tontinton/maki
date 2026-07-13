@@ -21,6 +21,7 @@ const SECTIONS: &[(&str, &[&str])] = &[
             "edit",
             "multiedit",
             "edit_lines",
+            "insert_lines",
             "glob",
             "grep",
             "index",

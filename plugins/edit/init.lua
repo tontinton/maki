@@ -6,7 +6,10 @@ local replace_lines = require("edit_helpers").replace_lines
 local SNIPPET_MAX_CHARS = 32
 
 local EDIT_LINES_DESCRIPTION =
-  [[Edit lines by number. Omit `end` to insert before `start` without removing lines. Set `end` to replace or delete (empty `new_string`) a range.]]
+  [[Edit lines by number. Replaces lines from `start` to `end` (inclusive) with `new_string`. Use empty `new_string` to delete a range.]]
+
+local INSERT_LINES_DESCRIPTION =
+  [[Insert lines before a given line number. Lines at `line` and below shift down. Existing lines are preserved.]]
 
 local EDIT_DESCRIPTION = [[Replace an exact string match in a file.
 
@@ -286,7 +289,8 @@ maki.api.register_tool({
       },
       ["end"] = {
         type = "integer",
-        description = "Last line, inclusive. Omit to insert before start without removing lines.",
+        description = "Last line, inclusive",
+        required = true,
       },
       new_string = {
         type = "string",
@@ -302,16 +306,61 @@ maki.api.register_tool({
   end),
 
   handler = function(input, ctx)
-    local end_line = input["end"]
     local result, err = apply_edit(input.path, ctx, function(content)
-      return replace_lines(content, input.start, end_line, input.new_string)
+      return replace_lines(content, input.start, input["end"], input.new_string)
     end)
     if not result then
       return { llm_output = err, is_error = true }
     end
-    local summary = end_line
-        and string.format("replaced lines %d-%d in %s", input.start, end_line, shorten_path(result.path))
-      or string.format("inserted at line %d in %s", input.start, shorten_path(result.path))
-    return diff_result(result, summary)
+    return diff_result(
+      result,
+      string.format("replaced lines %d-%d in %s", input.start, input["end"], shorten_path(result.path))
+    )
+  end,
+})
+
+maki.api.register_tool({
+  name = "insert_lines",
+  kind = "edit",
+  mutable_path = "path",
+  permission_scopes = "path",
+  audiences = { "main", "general_sub", "interpreter" },
+  description = INSERT_LINES_DESCRIPTION,
+
+  schema = {
+    type = "object",
+    properties = {
+      path = {
+        type = "string",
+        description = "Absolute path to the file",
+        required = true,
+        alias = "file_path",
+      },
+      line = {
+        type = "integer",
+        description = "Line number to insert before (1-indexed). Use 1 to insert at the top.",
+        required = true,
+      },
+      new_string = {
+        type = "string",
+        description = "Text to insert",
+        required = true,
+      },
+    },
+  },
+
+  header = edit_header,
+  restore = diff_restore(function(input)
+    return { { new = input.new_string } }
+  end),
+
+  handler = function(input, ctx)
+    local result, err = apply_edit(input.path, ctx, function(content)
+      return replace_lines(content, input.line, nil, input.new_string)
+    end)
+    if not result then
+      return { llm_output = err, is_error = true }
+    end
+    return diff_result(result, string.format("inserted at line %d in %s", input.line, shorten_path(result.path)))
   end,
 })

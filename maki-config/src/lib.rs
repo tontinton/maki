@@ -83,9 +83,9 @@ pub const DEFAULT_BUILTINS: &[&str] = &[
     "write",
 ];
 
-pub const OPT_IN_TOOLS: &[&str] = &["edit_lines"];
+pub const OPT_IN_TOOLS: &[&str] = &["edit_lines", "insert_lines"];
 
-pub const FILE_WRITE_TOOLS: &[&str] = &["write", "edit", "multiedit", "edit_lines"];
+pub const FILE_WRITE_TOOLS: &[&str] = &["write", "edit", "multiedit", "edit_lines", "insert_lines"];
 
 #[derive(Debug, Clone, Copy)]
 pub enum ConfigValue {
