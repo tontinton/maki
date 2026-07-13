@@ -1,11 +1,13 @@
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use crate::{GrepFileEntry, GrepLine, GrepMatchGroup};
 use grep_regex::RegexMatcher;
 use grep_searcher::Searcher;
 use grep_searcher::SearcherBuilder;
 use grep_searcher::{Sink, SinkContext, SinkFinish, SinkMatch};
+use ignore::WalkState;
 use tracing::debug;
 
 use super::{mtime, resolve_search_path, truncate_bytes, walk_builder};
@@ -80,8 +82,6 @@ pub fn grep_search(params: GrepParams) -> Result<(PathBuf, Vec<GrepFileEntry>), 
         builder.heap_limit(Some(MULTILINE_HEAP_LIMIT));
     }
 
-    let mut searcher = builder.build();
-
     let search = Path::new(&search_path);
     let base = if search.is_file() {
         search.parent().unwrap_or(search)
@@ -89,42 +89,58 @@ pub fn grep_search(params: GrepParams) -> Result<(PathBuf, Vec<GrepFileEntry>), 
         search
     };
     let has_context = params.context_before > 0 || params.context_after > 0;
-    let mut entries: Vec<GrepFileEntry> = Vec::new();
+    let max_line_bytes = params.max_line_bytes;
+    let results: Arc<Mutex<Vec<GrepFileEntry>>> = Arc::new(Mutex::new(Vec::new()));
+    let base: Arc<Path> = Arc::from(base);
 
-    for entry in walker.build().flatten() {
-        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
-            continue;
+    walker.build_parallel().run({
+        let results = Arc::clone(&results);
+        let matcher = Arc::new(matcher);
+        let base = Arc::clone(&base);
+        move || {
+            let mut searcher = builder.build();
+            let matcher = Arc::clone(&matcher);
+            let results = Arc::clone(&results);
+            let base = Arc::clone(&base);
+            Box::new(move |entry| {
+                let entry = match entry {
+                    Ok(e) => e,
+                    Err(_) => return WalkState::Continue,
+                };
+                if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+                    return WalkState::Continue;
+                }
+                let path = entry.into_path();
+                let mut groups = Vec::new();
+                let mut sink = GrepSink {
+                    groups: &mut groups,
+                    current_group: Vec::new(),
+                    max_line_bytes,
+                    has_context,
+                };
+                let _ = searcher.search_path(&*matcher, &path, &mut sink);
+
+                if !groups.is_empty() {
+                    let rel = path
+                        .strip_prefix(&*base)
+                        .unwrap_or(&path)
+                        .to_string_lossy()
+                        .into_owned();
+                    let mut guard = results.lock().unwrap_or_else(|e| e.into_inner());
+                    guard.push(GrepFileEntry { path: rel, groups });
+                }
+                WalkState::Continue
+            })
         }
-        let path = entry.into_path();
-        let mut groups = Vec::new();
+    });
 
-        let mut sink = GrepSink {
-            groups: &mut groups,
-            current_group: Vec::new(),
-            max_line_bytes: params.max_line_bytes,
-            has_context,
-        };
-        let _ = searcher.search_path(&matcher, &path, &mut sink);
-
-        if !groups.is_empty() {
-            let rel = path
-                .strip_prefix(base)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .into_owned();
-            entries.push(GrepFileEntry { path: rel, groups });
-        }
-    }
+    let mut entries = std::mem::take(&mut *results.lock().unwrap_or_else(|e| e.into_inner()));
 
     if entries.is_empty() {
         return Ok((base.to_path_buf(), entries));
     }
 
-    entries.sort_by(|a, b| {
-        let a_abs = base.join(&a.path);
-        let b_abs = base.join(&b.path);
-        mtime(&b_abs).cmp(&mtime(&a_abs))
-    });
+    entries.sort_by_cached_key(|e| std::cmp::Reverse(mtime(&base.join(&e.path))));
 
     let mut total_groups = 0;
     for entry in &mut entries {

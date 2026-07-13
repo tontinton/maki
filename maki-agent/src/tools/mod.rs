@@ -696,6 +696,95 @@ mod tests {
     }
 
     #[test]
+    fn grep_search_multiline_groups_spanning_lines() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("span.rs"), "fn foo() {\n    bar\n}\n").unwrap();
+
+        let mut params = grep::GrepParams::new("(?s)foo.*\\n}".into());
+        params.path = Some(dir.path().to_string_lossy().into());
+        let (_, entries) = grep::grep_search(params).unwrap();
+        assert_eq!(entries.len(), 1);
+        let lines = &entries[0].groups[0].lines;
+        assert!(lines.iter().any(|l| l.text.contains("foo") && l.is_match));
+    }
+
+    #[test]
+    fn grep_search_context_lines_surround_matches() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("ctx.rs"),
+            "l1\nl2\nA\nl4\nl5\nl6\nl7\nl8\nB\nl10\n",
+        )
+        .unwrap();
+
+        let mut params = grep::GrepParams::new("A|B".into());
+        params.path = Some(dir.path().to_string_lossy().into());
+        params.context_before = 1;
+        params.context_after = 1;
+        let (_, entries) = grep::grep_search(params).unwrap();
+        assert_eq!(entries[0].groups.len(), 2);
+
+        let g0 = &entries[0].groups[0].lines;
+        assert!(g0.iter().any(|l| l.text == "l2" && !l.is_match));
+        assert!(g0.iter().any(|l| l.text == "A" && l.is_match));
+
+        let g1 = &entries[0].groups[1].lines;
+        assert!(g1.iter().any(|l| l.text == "B" && l.is_match));
+        assert!(g1.iter().any(|l| l.text == "l10" && !l.is_match));
+    }
+
+    #[test]
+    fn grep_search_parallel_stable_under_repeated_calls() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        for i in 0..20u32 {
+            fs::write(root.join(format!("f{i:03}.rs")), format!("needle {i}\n")).unwrap();
+        }
+        let path_str = root.to_string_lossy().to_string();
+
+        let mut reference: Option<Vec<(String, usize, bool)>> = None;
+        for _ in 0..20 {
+            let mut params = grep::GrepParams::new("needle".into());
+            params.path = Some(path_str.clone());
+            params.limit = 1000;
+            let (_, entries) = grep::grep_search(params).unwrap();
+
+            let mut flat: Vec<(String, usize, bool)> = entries
+                .iter()
+                .flat_map(|e| {
+                    e.groups.iter().flat_map(|g| {
+                        g.lines
+                            .iter()
+                            .map(|l| (e.path.clone(), l.line_nr, l.is_match))
+                    })
+                })
+                .collect();
+            flat.sort();
+            match &reference {
+                None => reference = Some(flat),
+                Some(prev) => assert_eq!(flat, *prev),
+            }
+        }
+    }
+
+    #[test]
+    fn grep_search_limit_truncates_groups_after_sort() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        for i in 0..10u32 {
+            fs::write(root.join(format!("m_{i}.rs")), "hit\n").unwrap();
+        }
+
+        let mut params = grep::GrepParams::new("hit".into());
+        params.path = Some(root.to_string_lossy().into());
+        params.limit = 3;
+        let (_, entries) = grep::grep_search(params).unwrap();
+
+        let total_groups: usize = entries.iter().map(|e| e.groups.len()).sum();
+        assert_eq!(total_groups, 3);
+    }
+
+    #[test]
     fn walk_builder_excludes_dot_git_shows_dotfiles_and_filters_globs() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
