@@ -446,6 +446,7 @@ impl<'h> Agent<'h> {
         )
         .await?;
         self.rollback_len = self.history.len();
+        self.event_tx.send(AgentEvent::CompactionDone)?;
         self.history
             .push(Message::synthetic(CONTINUE_AFTER_COMPACT.into()));
         Ok(())

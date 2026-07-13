@@ -907,6 +907,7 @@ impl EventPump {
             | AgentEvent::ToolDone(_)
             | AgentEvent::QueueItemConsumed { .. }
             | AgentEvent::AutoCompacting
+            | AgentEvent::CompactionDone
             | AgentEvent::AuthRequired
             | AgentEvent::SubagentHistory { .. }
             | AgentEvent::ToolSnapshot { .. }

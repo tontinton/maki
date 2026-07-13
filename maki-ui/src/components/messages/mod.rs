@@ -466,6 +466,16 @@ impl MessagesPanel {
         self.current_snapshot_gen(tool_id)
     }
 
+    #[cfg(test)]
+    pub fn streaming_text_is_empty(&self) -> bool {
+        self.streaming_text.is_empty()
+    }
+
+    #[cfg(test)]
+    pub fn streaming_thinking_is_empty(&self) -> bool {
+        self.streaming_thinking.is_empty()
+    }
+
     pub fn flush(&mut self) {
         self.flush_thinking();
         if !self.streaming_text.is_empty() {
