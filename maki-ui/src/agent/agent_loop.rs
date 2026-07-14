@@ -121,12 +121,16 @@ impl AgentLoop {
                 displayed,
                 ..
             } => {
+                let _ = event_tx.send(AgentEvent::RunStarted);
                 if !displayed {
                     let _ = event_tx.send(AgentEvent::QueueItemConsumed { text, image_count });
                 }
                 self.do_agent_run(input, event_tx, run_id).await
             }
-            QueueItem::Compact { .. } => self.do_compact(&event_tx).await,
+            QueueItem::Compact { .. } => {
+                let _ = event_tx.send(AgentEvent::RunStarted);
+                self.do_compact(&event_tx).await
+            }
         };
 
         if let Err(e) = result {

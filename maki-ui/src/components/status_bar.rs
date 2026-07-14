@@ -3,7 +3,7 @@ use std::env;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use super::{RetryInfo, Status};
+use super::{RetryInfo, StatusView};
 
 use crate::animation::spinner_frame;
 use crate::theme;
@@ -36,7 +36,7 @@ pub struct UsageStats<'a> {
 }
 
 pub struct StatusBarContext<'a> {
-    pub status: &'a Status,
+    pub status: &'a StatusView,
     pub mode_label: Cow<'static, str>,
     pub mode_style: Style,
     pub model_id: &'a str,
@@ -108,7 +108,7 @@ impl StatusBar {
     pub fn view(&self, frame: &mut Frame, area: Rect, ctx: &StatusBarContext) {
         let mut left_spans = Vec::new();
 
-        if *ctx.status == Status::Streaming {
+        if *ctx.status == StatusView::Streaming {
             let ch = spinner_frame(self.started_at.elapsed().as_millis());
             left_spans.push(Span::styled(format!(" {ch}"), theme::current().spinner));
         }
@@ -155,7 +155,7 @@ impl StatusBar {
         let mut right_spans = Vec::new();
 
         match ctx.status {
-            Status::Error { message: e, .. } => {
+            StatusView::Error { message: e } => {
                 left_spans.push(Span::styled(format!(" {e}"), theme::current().error));
             }
             _ => {

@@ -27,12 +27,12 @@ impl MessageQueue {
         self.shared.as_ref().map_or(0, |s| s.len())
     }
 
-    pub(crate) fn remove(&mut self, index: usize) {
-        if let Some(ref shared) = self.shared
-            && shared.remove(index).is_some()
-        {
+    pub(crate) fn remove(&mut self, index: usize) -> Option<QueueItem> {
+        let removed = self.shared.as_ref().and_then(|s| s.remove(index));
+        if removed.is_some() {
             self.clamp_focus();
         }
+        removed
     }
 
     pub(crate) fn clear(&mut self) {
@@ -71,10 +71,8 @@ impl MessageQueue {
         }
     }
 
-    pub(crate) fn remove_focused(&mut self) {
-        if let Some(sel) = self.focus {
-            self.remove(sel);
-        }
+    pub(crate) fn remove_focused(&mut self) -> Option<QueueItem> {
+        self.focus.and_then(|sel| self.remove(sel))
     }
 
     pub(crate) fn panel_len(&self) -> usize {
@@ -120,6 +118,21 @@ impl App {
             run_id: self.run_id,
             displayed: false,
         });
+        self.queued_count += 1;
+    }
+
+    /// Drop a queued item by index, keeping `queued_count` in lockstep so the
+    /// spinner and submit gate don't count a message the user just removed.
+    pub(super) fn remove_queued(&mut self, index: usize) {
+        if matches!(self.queue.remove(index), Some(QueueItem::Message { .. })) {
+            self.queued_count = self.queued_count.saturating_sub(1);
+        }
+    }
+
+    pub(super) fn remove_focused_queued(&mut self) {
+        if matches!(self.queue.remove_focused(), Some(QueueItem::Message { .. })) {
+            self.queued_count = self.queued_count.saturating_sub(1);
+        }
     }
 
     pub(super) fn queue_compact(&mut self) {
@@ -131,9 +144,10 @@ impl App {
         });
     }
 
-    /// Agent reached a deferred message: time to draw the bubble.
-    /// Immediate-dispatch items skip this event, so no dedup needed.
+    /// Agent reached a deferred message: draw the bubble and mark one fewer
+    /// message pending, so the spinner and submit gate stay honest.
     pub(super) fn on_queue_item_consumed(&mut self, text: &str, image_count: usize) {
+        self.queued_count = self.queued_count.saturating_sub(1);
         self.main_chat()
             .show_user_message(format_with_images(text, image_count));
     }
@@ -141,7 +155,7 @@ impl App {
     /// Immediate path: kick off the agent and draw the bubble in the same
     /// frame, so the user sees their message land where it will stay.
     pub(super) fn start_from_queue(&mut self, msg: &QueuedMessage) -> Vec<super::Action> {
-        self.status = super::Status::Streaming;
+        self.start_run();
         if let Some(ref handle) = self.lua_event_handle {
             handle.fire_autocmd("TurnStart", serde_json::json!({}));
         }

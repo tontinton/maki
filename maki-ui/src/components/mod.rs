@@ -211,7 +211,7 @@ pub enum Action {
     Quit,
 }
 
-const ERROR_DISPLAY: Duration = Duration::from_secs(5);
+pub(crate) const ERROR_DISPLAY: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ExitRequest {
@@ -230,35 +230,44 @@ impl ExitRequest {
     }
 }
 
+/// A latched agent error, held for [`ERROR_DISPLAY`] then treated as gone.
+/// Separate from the run lifecycle so an error can never coexist with a
+/// live run — starting a run clears it.
 #[derive(Debug, Clone)]
-pub enum Status {
-    Idle,
-    Streaming,
-    Error { message: String, since: Instant },
+pub struct ErrorState {
+    pub message: String,
+    since: Instant,
 }
 
-impl Status {
-    pub fn error(message: String) -> Self {
-        Self::Error {
+impl ErrorState {
+    pub fn new(message: String) -> Self {
+        Self {
             message,
             since: Instant::now(),
         }
     }
 
-    pub fn is_error_expired(&self) -> bool {
-        matches!(self, Self::Error { since, .. } if since.elapsed() >= ERROR_DISPLAY)
+    pub fn is_expired(&self) -> bool {
+        self.since.elapsed() >= ERROR_DISPLAY
+    }
+
+    #[cfg(test)]
+    pub fn with_age(message: impl Into<String>, age: Duration) -> Self {
+        Self {
+            message: message.into(),
+            since: Instant::now() - age,
+        }
     }
 }
 
-impl PartialEq for Status {
-    fn eq(&self, other: &Self) -> bool {
-        matches!(
-            (self, other),
-            (Self::Idle, Self::Idle)
-                | (Self::Streaming, Self::Streaming)
-                | (Self::Error { .. }, Self::Error { .. })
-        )
-    }
+/// What the status bar should show, projected from the run lifecycle plus
+/// the (possibly expired) error latch. A stale error is already collapsed
+/// to `Idle` here, so renderers never see an expired error.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StatusView {
+    Idle,
+    Streaming,
+    Error { message: String },
 }
 
 pub struct RetryInfo {

@@ -46,7 +46,8 @@ use crate::components::theme_picker::{ThemePicker, ThemePickerAction};
 use crate::components::tool_display::format_turn_usage;
 use crate::components::usage_modal::{UsageFetchState, UsageModal};
 use crate::components::{
-    Action, DisplayMessage, DisplayRole, ExitRequest, Overlay, RetryInfo, Status, is_ctrl,
+    Action, DisplayMessage, DisplayRole, ErrorState, ExitRequest, Overlay, RetryInfo, StatusView,
+    is_ctrl,
 };
 use crate::image;
 use crate::selection::{SelectionState, ZoneRegistry};
@@ -151,7 +152,15 @@ pub struct App {
     pub(super) permission_prompt: PermissionPrompt,
     pub(super) plan_form: PlanForm,
     pub(super) status_bar: StatusBar,
-    pub status: Status,
+    /// `true` while a run is executing (bracketed by `RunStarted`..`Done`/
+    /// `Error`, plus an optimistic set on immediate dispatch to close the
+    /// submit-vs-queue race before `RunStarted` round-trips).
+    pub(crate) run_active: bool,
+    /// Messages the UI has queued but not yet seen consumed. Bridges the
+    /// `Done`->`RunStarted` handoff so the spinner and the submit gate stay
+    /// true while a queued follow-up is still pending.
+    pub(crate) queued_count: usize,
+    pub(crate) error: Option<ErrorState>,
     pub(crate) state: session_state::SessionState,
     pub exit_request: ExitRequest,
     pub(crate) exit_on_done: bool,
@@ -231,7 +240,9 @@ impl App {
             permission_prompt: PermissionPrompt::new(),
             plan_form: PlanForm::new(),
             status_bar: StatusBar::new(ui_config.flash_duration()),
-            status: Status::Idle,
+            run_active: false,
+            queued_count: 0,
+            error: None,
             state,
             exit_request: ExitRequest::None,
             exit_on_done: false,
@@ -293,10 +304,49 @@ impl App {
         self.status_bar.flash(msg);
     }
 
-    pub fn tick_error_expiry(&mut self) {
-        if self.status.is_error_expired() {
-            self.status = Status::Idle;
+    /// Single source of truth for "is the agent working": a live run, or a
+    /// queued message the UI hasn't seen consumed yet. Derived, never poked.
+    pub(crate) fn is_busy(&self) -> bool {
+        self.run_active || self.queued_count > 0
+    }
+
+    /// Projection for the status bar. A live run wins over a latched error,
+    /// and an expired error collapses to `Idle`.
+    pub(crate) fn status_view(&self) -> StatusView {
+        if self.is_busy() {
+            return StatusView::Streaming;
         }
+        match &self.error {
+            Some(e) if !e.is_expired() => StatusView::Error {
+                message: e.message.clone(),
+            },
+            _ => StatusView::Idle,
+        }
+    }
+
+    /// A run began: arm the spinner and drop any stale error.
+    fn start_run(&mut self) {
+        self.run_active = true;
+        self.error = None;
+    }
+
+    /// A run ended cleanly.
+    fn finish_ok(&mut self) {
+        self.run_active = false;
+    }
+
+    /// A run ended in error: latch it and drop any pending work.
+    pub(crate) fn finish_err(&mut self, message: String) {
+        self.run_active = false;
+        self.queued_count = 0;
+        self.error = Some(ErrorState::new(message));
+    }
+
+    /// Cancel/reset: back to a clean idle with nothing pending.
+    fn reset_run_state(&mut self) {
+        self.run_active = false;
+        self.queued_count = 0;
+        self.error = None;
     }
 
     fn active_chat(&mut self) -> &mut Chat {
@@ -426,7 +476,7 @@ impl App {
         if key::QUIT.matches(key) {
             self.command_palette.close();
             return Some(if !self.is_main_chat() || self.input_box.is_empty() {
-                if self.status == Status::Streaming {
+                if self.is_busy() {
                     return Some(self.handle_cancel());
                 }
                 self.quit()
@@ -573,12 +623,12 @@ impl App {
                 KeyCode::Up => self.queue.move_focus_up(),
                 KeyCode::Down => self.queue.move_focus_down(),
                 KeyCode::Enter => {
-                    self.queue.remove_focused();
+                    self.remove_focused_queued();
                 }
                 KeyCode::Esc => self.queue.unfocus(),
                 _ if key::QUIT.matches(key) => self.queue.unfocus(),
                 _ if key::POP_QUEUE.matches(key) => {
-                    self.queue.remove(0);
+                    self.remove_queued(0);
                 }
                 _ => {}
             }
@@ -739,7 +789,7 @@ impl App {
         }
         if is_ctrl(&key) {
             if key::POP_QUEUE.matches(key) {
-                self.queue.remove(0);
+                self.remove_queued(0);
             } else if key::OPEN_EDITOR.matches(key) {
                 return match self.state.plan.path() {
                     Some(p) => vec![Action::OpenEditor(p.to_path_buf())],
@@ -777,7 +827,7 @@ impl App {
             CommandAction::Passthrough => {}
         }
 
-        let streaming = self.status == Status::Streaming;
+        let streaming = self.is_busy();
         match self.input_box.handle_key(key) {
             InputAction::Submit(sub) => self.handle_submit(sub),
             InputAction::PaletteSync(val) => {
@@ -869,7 +919,7 @@ impl App {
             }];
         }
         let msg: QueuedMessage = sub.into();
-        if self.status == Status::Streaming {
+        if self.is_busy() {
             self.queue_and_notify(msg);
             vec![]
         } else {
@@ -894,7 +944,7 @@ impl App {
         self.main_chat()
             .push(DisplayMessage::new(DisplayRole::Error, CANCEL_MSG.into()));
         self.queue.clear();
-        self.status = Status::Idle;
+        self.reset_run_state();
         vec![Action::CancelAgent {
             run_id: cancelled_run,
         }]
@@ -1021,6 +1071,13 @@ impl App {
             return vec![];
         }
 
+        if matches!(envelope.event, AgentEvent::RunStarted) {
+            if chat_idx == 0 {
+                self.start_run();
+            }
+            return vec![];
+        }
+
         self.retry_info = None;
 
         let plan_path = if self.state.mode == Mode::Plan {
@@ -1086,7 +1143,7 @@ impl App {
                     self.save_session();
                     self.chat_index.clear();
                     self.subagent_answers.clear();
-                    self.status = Status::Idle;
+                    self.finish_ok();
                     if let Some(ref handle) = self.lua_event_handle {
                         handle.fire_autocmd("TurnEnd", serde_json::json!({}));
                     }
@@ -1095,7 +1152,7 @@ impl App {
                     }
                 }
                 ChatEventResult::Error(message) => {
-                    self.status = Status::error(message.clone());
+                    self.finish_err(message.clone());
                     self.status_bar.clear_flash();
                     self.save_session();
                     self.queue.clear();
@@ -1152,11 +1209,11 @@ impl App {
                 vec![]
             }
             "/compact" => {
-                if self.status == Status::Streaming {
+                if self.is_busy() {
                     self.queue_compact();
                     return vec![];
                 }
-                self.status = Status::Streaming;
+                self.start_run();
                 vec![Action::Compact]
             }
             "/help" => {
@@ -1310,12 +1367,12 @@ impl App {
         });
         input.prompt = Some(Box::new(prompt_ref));
 
-        if self.status == Status::Streaming {
+        if self.is_busy() {
             self.flash("Agent is busy, try again later".into());
             vec![]
         } else {
             self.run_id += 1;
-            self.status = Status::Streaming;
+            self.start_run();
             self.main_chat().show_user_message(display_text);
             vec![Action::SendMessage(Box::new(input))]
         }
@@ -1355,7 +1412,7 @@ impl App {
             text: rendered,
             images: Vec::new(),
         };
-        if self.status == Status::Streaming {
+        if self.is_busy() {
             self.queue_and_notify(msg);
             vec![]
         } else {

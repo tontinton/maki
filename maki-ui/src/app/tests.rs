@@ -146,7 +146,7 @@ fn typing_and_submit() {
 
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
     assert!(matches!(&actions[0], Action::SendMessage(s) if s.message == "hi"));
-    assert_eq!(app.status, Status::Streaming);
+    assert!(app.is_busy());
     // Regression check: the bubble has to be on screen the same frame we
     // submit, otherwise it briefly sits one row too high before snapping down.
     assert_eq!(
@@ -180,7 +180,7 @@ fn ctrl_c_clears_nonempty_input(setup: fn(&mut App)) {
 #[test]
 fn ctrl_c_quits_when_input_empty() {
     let mut app = test_app();
-    app.status = Status::Idle;
+    app.run_active = false;
     let actions = app.update(Msg::Key(kb::QUIT.to_key_event()));
     assert_eq!(app.exit_request, ExitRequest::Success);
     assert!(matches!(&actions[0], Action::Quit));
@@ -191,7 +191,7 @@ fn ctrl_c_quits_when_input_empty() {
 fn exit_on_done_flag_triggers_exit(event: AgentEvent, expected: ExitRequest) {
     let mut app = test_app();
     app.exit_on_done = true;
-    app.status = Status::Streaming;
+    app.run_active = true;
     app.run_id = 1;
     app.update(agent_msg(event));
     assert_eq!(app.exit_request, expected);
@@ -224,7 +224,7 @@ fn toggle_mode_state_machine() {
     assert_eq!(app.state.plan.path().unwrap(), first_path);
 
     app.state.mode = Mode::Build;
-    app.status = Status::Streaming;
+    app.run_active = true;
     app.run_id = 1;
     tab(&mut app);
     assert_eq!(app.state.mode, Mode::Plan);
@@ -242,7 +242,7 @@ fn tool_done_transitions_plan_to_ready(
     let mut app = test_app();
     app.state.mode = Mode::Plan;
     app.state.plan = PlanState::Drafting(PathBuf::from("/tmp/plans/test.md"));
-    app.status = Status::Streaming;
+    app.run_active = true;
     app.run_id = 1;
 
     app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
@@ -272,11 +272,11 @@ fn altgr_chars_not_swallowed_by_ctrl_handler() {
     assert_eq!(app.input_box.buffer.value(), "hi\\");
 }
 
-#[test_case(Status::Idle      ; "idle")]
-#[test_case(Status::Streaming ; "streaming")]
-fn paste_works_regardless_of_status(status: Status) {
+#[test_case(false ; "idle")]
+#[test_case(true  ; "streaming")]
+fn paste_works_regardless_of_status(busy: bool) {
     let mut app = test_app();
-    app.status = status;
+    app.run_active = busy;
     app.update(Msg::Paste("pasted".into()));
     assert_eq!(app.input_box.buffer.value(), "pasted");
 }
@@ -304,7 +304,7 @@ fn submit_during_streaming_queues_message() {
     app.update(Msg::Key(key(KeyCode::Char('a'))));
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
     assert!(matches!(&actions[0], Action::SendMessage(_)));
-    assert_eq!(app.status, Status::Streaming);
+    assert!(app.is_busy());
 
     app.update(Msg::Key(key(KeyCode::Char('b'))));
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
@@ -341,6 +341,83 @@ fn queue_item_consumed_pushes_deferred_user_message() {
     );
 }
 
+#[test]
+fn queued_follow_up_keeps_spinner_across_run_handoff() {
+    let mut app = test_app();
+    app.run_active = true;
+    app.run_id = 1;
+    app.queue_and_notify(queued_msg("next"));
+    assert_eq!(app.queued_count, 1);
+
+    app.update(agent_msg_with_run_id(
+        AgentEvent::Done {
+            usage: TokenUsage::default(),
+            num_turns: 1,
+            stop_reason: None,
+        },
+        1,
+    ));
+    assert!(
+        app.is_busy(),
+        "a queued follow-up must keep the spinner on after the prior run's Done",
+    );
+
+    app.update(agent_msg_with_run_id(AgentEvent::RunStarted, 1));
+    app.update(agent_msg_with_run_id(
+        AgentEvent::QueueItemConsumed {
+            text: "next".into(),
+            image_count: 0,
+        },
+        1,
+    ));
+    assert!(app.is_busy());
+    assert_eq!(app.queued_count, 0);
+    assert_eq!(app.main_chat().last_message_text(), "next");
+}
+
+#[test]
+fn interrupt_consume_mid_run_keeps_busy() {
+    let mut app = test_app();
+    app.run_active = true;
+    app.run_id = 1;
+    app.queue_and_notify(queued_msg("mid"));
+    assert_eq!(app.queued_count, 1);
+
+    // Folded into the live run as an interrupt: QueueItemConsumed with no
+    // Done in between, run still active.
+    app.update(agent_msg_with_run_id(
+        AgentEvent::QueueItemConsumed {
+            text: "mid".into(),
+            image_count: 0,
+        },
+        1,
+    ));
+    assert!(app.is_busy());
+    assert_eq!(app.queued_count, 0);
+}
+
+#[test]
+fn removing_queued_message_from_panel_keeps_count_in_lockstep() {
+    let mut app = test_app();
+    app.run_active = true;
+    app.run_id = 1;
+    app.queue_and_notify(queued_msg("a"));
+    app.queue_and_notify(queued_msg("b"));
+    assert_eq!(app.queued_count, 2);
+
+    app.remove_queued(0);
+    assert_eq!(app.queued_count, 1);
+    assert_eq!(app.queue.len(), 1);
+
+    // Even with no live run, the remaining queued message keeps us busy.
+    app.finish_ok();
+    assert!(app.is_busy());
+
+    app.remove_queued(0);
+    assert_eq!(app.queued_count, 0);
+    assert!(!app.is_busy());
+}
+
 #[test_case(error_app as fn(&mut App) ; "error")]
 #[test_case(cancel_app as fn(&mut App) ; "cancel")]
 fn clears_queue(terminate: fn(&mut App)) {
@@ -358,7 +435,7 @@ fn queued_msg(text: &str) -> QueuedMessage {
 
 fn app_with_queued_message() -> App {
     let mut app = test_app();
-    app.status = Status::Streaming;
+    app.run_active = true;
     app.run_id = 1;
     app.queue_and_notify(queued_msg("queued"));
     app
@@ -438,7 +515,7 @@ fn reset_session_clears_plan() {
     app.btw_modal.open("q", rx);
     let actions = app.reset_session();
     assert!(matches!(&actions[0], Action::NewSession));
-    assert_eq!(app.status, Status::Idle);
+    assert!(!app.is_busy());
     assert_eq!(app.state.token_usage.input, 0);
     assert_eq!(app.chats[0].context_size, 0);
     assert_eq!(app.state.mode, Mode::Build);
@@ -531,7 +608,7 @@ fn tab_in_palette_completes_command() {
 #[test]
 fn ctrl_p_n_navigation() {
     let mut app = test_app();
-    app.status = Status::Streaming;
+    app.run_active = true;
     app.run_id = 1;
     app.update(subagent_msg(
         AgentEvent::TextDelta { text: "sub".into() },
@@ -557,7 +634,7 @@ fn ctrl_p_n_navigation() {
 #[test]
 fn subagents_get_descriptive_names() {
     let mut app = test_app();
-    app.status = Status::Streaming;
+    app.run_active = true;
     app.run_id = 1;
     app.update(subagent_msg(
         AgentEvent::TextDelta { text: "a".into() },
@@ -577,7 +654,7 @@ fn subagents_get_descriptive_names() {
 #[test]
 fn subagent_prompt_shown_once_and_not_duplicated() {
     let mut app = test_app();
-    app.status = Status::Streaming;
+    app.run_active = true;
     app.run_id = 1;
     app.update(subagent_msg_with_prompt(
         AgentEvent::TextDelta { text: "a".into() },
@@ -782,7 +859,7 @@ fn ctrl_x_toggles_tasks_picker() {
 
 fn app_with_subagent_id(id: &str) -> App {
     let mut app = test_app();
-    app.status = Status::Streaming;
+    app.run_active = true;
     app.run_id = 1;
     app.update(subagent_msg(
         AgentEvent::TextDelta { text: "x".into() },
@@ -838,7 +915,7 @@ fn open_search(app: &mut App) {
 }
 
 fn focus_queue(app: &mut App) {
-    app.status = Status::Streaming;
+    app.run_active = true;
     app.run_id = 1;
     app.queue_and_notify(queued_msg("q"));
     app.queue.set_focus_at(0);
@@ -874,13 +951,13 @@ fn compact_command_sets_streaming() {
     let mut app = test_app();
     let actions = app.execute_command(cmd("/compact"));
     assert!(matches!(&actions[0], Action::Compact));
-    assert_eq!(app.status, Status::Streaming);
+    assert!(app.is_busy());
 }
 
 #[test]
 fn compact_during_streaming_queues_item() {
     let mut app = test_app();
-    app.status = Status::Streaming;
+    app.run_active = true;
     app.run_id = 1;
 
     let actions = app.execute_command(cmd("/compact"));
@@ -892,7 +969,7 @@ fn compact_during_streaming_queues_item() {
 #[test]
 fn cancel_clears_pending_input() {
     let mut app = test_app();
-    app.status = Status::Streaming;
+    app.run_active = true;
     app.run_id = 1;
     app.pending_input = PendingInput::AuthRetry { subagent_id: None };
     cancel_app(&mut app);
@@ -1020,7 +1097,7 @@ fn mouse_up_clears_edge_scroll() {
 #[test]
 fn double_esc_cancels_flushes_and_fails_tools() {
     let mut app = test_app();
-    app.status = Status::Streaming;
+    app.run_active = true;
     app.run_id = 1;
     app.update(agent_msg(AgentEvent::TextDelta {
         text: "partial".into(),
@@ -1042,7 +1119,7 @@ fn double_esc_cancels_flushes_and_fails_tools() {
     app.last_esc = Some(Instant::now());
     let actions = app.update(Msg::Key(key(KeyCode::Esc)));
     assert!(matches!(&actions[0], Action::CancelAgent { .. }));
-    assert_eq!(app.status, Status::Idle);
+    assert!(!app.is_busy());
     assert_eq!(app.chats[0].in_progress_count(), 0);
 }
 
@@ -1050,7 +1127,7 @@ fn double_esc_cancels_flushes_and_fails_tools() {
 fn double_esc_idle_opens_rewind_picker() {
     let mut app = test_app();
     type_and_submit(&mut app, "hello");
-    app.status = Status::Idle;
+    app.run_active = false;
     app.run_id = 1;
     app.state
         .session
@@ -1073,19 +1150,19 @@ fn double_esc_idle_no_user_turns_flashes_error() {
 #[test]
 fn ctrl_c_while_streaming_cancels_instead_of_quitting() {
     let mut app = test_app();
-    app.status = Status::Streaming;
+    app.run_active = true;
     app.run_id = 1;
 
     let actions = app.update(Msg::Key(kb::QUIT.to_key_event()));
     assert!(matches!(&actions[0], Action::CancelAgent { .. }));
-    assert_eq!(app.status, Status::Idle);
+    assert!(!app.is_busy());
     assert_ne!(app.exit_request, ExitRequest::Success);
 }
 
 #[test]
 fn edge_scroll_makes_app_animating() {
     let mut app = test_app();
-    app.status = Status::Streaming;
+    app.run_active = true;
     app.run_id = 1;
     app.update(agent_msg(AgentEvent::TextDelta { text: "x".into() }));
     app.update(agent_msg(AgentEvent::Done {
@@ -1175,7 +1252,7 @@ fn pending_copy_ignores_drag_and_tick() {
 #[test]
 fn pending_copy_not_animating() {
     let mut app = test_app();
-    app.status = Status::Streaming;
+    app.run_active = true;
     app.run_id = 1;
     app.update(agent_msg(AgentEvent::TextDelta { text: "x".into() }));
     app.update(agent_msg(AgentEvent::Done {
@@ -1334,7 +1411,7 @@ fn clears_queue_focus_on_terminate(terminate: fn(&mut App)) {
 #[test]
 fn stale_events_ignored_after_run_id_increment() {
     let mut app = test_app();
-    app.status = Status::Streaming;
+    app.run_active = true;
     app.run_id = 1;
 
     cancel_app(&mut app);
@@ -1364,7 +1441,7 @@ fn stale_events_ignored_after_run_id_increment() {
 #[test]
 fn stale_done_does_not_drain_queue() {
     let mut app = test_app();
-    app.status = Status::Streaming;
+    app.run_active = true;
     app.run_id = 1;
 
     cancel_app(&mut app);
@@ -1379,7 +1456,9 @@ fn stale_done_does_not_drain_queue() {
         1,
     ));
     assert_eq!(app.queue.len(), 1);
-    assert_eq!(app.status, Status::Idle);
+    // The queued follow-up is pending work, so we stay busy regardless of the
+    // stale Done — which the run_id guard drops without touching the queue.
+    assert!(app.is_busy());
 }
 
 #[test]
@@ -1398,7 +1477,7 @@ fn mouse_down_in_input_creates_input_zone_selection() {
 #[test]
 fn resolve_or_create_chat_sets_model_id_and_annotation() {
     let mut app = test_app();
-    app.status = Status::Streaming;
+    app.run_active = true;
     app.run_id = 1;
     app.update(agent_msg(AgentEvent::ToolStart(Box::new(ToolStartEvent {
         id: "task1".into(),
@@ -1455,7 +1534,7 @@ fn help_modal_consumes_keys_and_esc_closes() {
     ; "idle"
 )]
 #[test_case(
-    |app: &mut App| { app.status = Status::Streaming; },
+    |app: &mut App| { app.run_active = true; },
     &[KeybindContext::General, KeybindContext::Streaming, KeybindContext::Editing],
     &[]
     ; "streaming"
@@ -1467,7 +1546,7 @@ fn help_modal_consumes_keys_and_esc_closes() {
     ; "plan_form"
 )]
 #[test_case(
-    |app: &mut App| { app.status = Status::Streaming; app.run_id = 1; app.queue_and_notify(queued_msg("q")); app.queue.set_focus_at(0); },
+    |app: &mut App| { app.run_active = true; app.run_id = 1; app.queue_and_notify(queued_msg("q")); app.queue.set_focus_at(0); },
     &[KeybindContext::QueueFocus],
     &[KeybindContext::Editing]
     ; "queue_focus"
@@ -1687,20 +1766,19 @@ fn rewind_to_first_turn_clears_everything() {
 
 #[test_case(Duration::ZERO,          true  ; "keeps_fresh_error")]
 #[test_case(Duration::from_secs(60), false ; "clears_stale_error")]
-fn tick_error_expiry(age: Duration, expect_error: bool) {
+fn error_expiry_is_declarative(age: Duration, expect_error: bool) {
     let mut app = test_app();
-    app.status = Status::Error {
-        message: "fail".into(),
-        since: Instant::now() - age,
-    };
-    app.tick_error_expiry();
-    assert_eq!(matches!(app.status, Status::Error { .. }), expect_error);
+    app.error = Some(ErrorState::with_age("fail", age));
+    assert_eq!(
+        matches!(app.status_view(), StatusView::Error { .. }),
+        expect_error
+    );
 }
 
 #[test]
 fn retry_clears_in_progress_tools() {
     let mut app = test_app();
-    app.status = Status::Streaming;
+    app.run_active = true;
     app.run_id = 1;
     app.update(agent_msg(AgentEvent::ToolPending {
         id: "t1".into(),
@@ -1720,7 +1798,7 @@ fn retry_clears_in_progress_tools() {
 #[test]
 fn retry_clears_subagent_in_progress_tools() {
     let mut app = test_app();
-    app.status = Status::Streaming;
+    app.run_active = true;
     app.run_id = 1;
     app.update(subagent_msg(
         AgentEvent::ToolPending {
@@ -1758,7 +1836,7 @@ fn auth_retry_type_then_enter(app: &mut App) -> Vec<Action> {
 #[test_case(auth_retry_type_then_enter ; "typed_text_then_enter")]
 fn auth_retry_sends_empty_answer(submit: fn(&mut App) -> Vec<Action>) {
     let mut app = test_app();
-    app.status = Status::Streaming;
+    app.run_active = true;
     app.run_id = 1;
     let (tx, rx) = flume::unbounded();
     app.answer_tx = Some(tx);
@@ -1779,7 +1857,7 @@ fn app_with_subagent_tx(id: &str) -> (App, flume::Receiver<String>, flume::Recei
     let (sub_tx, sub_rx) = flume::unbounded();
     let (main_tx, main_rx) = flume::unbounded();
     let mut app = test_app();
-    app.status = Status::Streaming;
+    app.run_active = true;
     app.run_id = 1;
     app.answer_tx = Some(main_tx);
     app.update(Msg::Agent(Box::new(Envelope {
@@ -1841,7 +1919,7 @@ fn cancel_clears_subagent_auth_retry() {
 #[test]
 fn stale_auth_required_after_cancel_is_dropped() {
     let mut app = test_app();
-    app.status = Status::Streaming;
+    app.run_active = true;
     app.run_id = 2;
     let count_before = app.chats[0].message_count();
     app.update(Msg::Agent(Box::new(Envelope {
@@ -1857,7 +1935,7 @@ fn stale_auth_required_after_cancel_is_dropped() {
 fn send_to_agent_unknown_subagent_falls_back_to_main() {
     let (main_tx, main_rx) = flume::unbounded();
     let mut app = test_app();
-    app.status = Status::Streaming;
+    app.run_active = true;
     app.run_id = 1;
     app.answer_tx = Some(main_tx);
 
@@ -2036,7 +2114,7 @@ fn overlay_zone_click_gating() {
 
 fn streaming_app_with_history() -> App {
     let mut app = test_app();
-    app.status = Status::Streaming;
+    app.run_active = true;
     app.run_id = 1;
     let history = vec![
         Message::user("hello".into()),
@@ -2116,7 +2194,7 @@ fn implement_msg(parallel: bool) -> String {
 
 fn plan_app() -> App {
     let mut app = test_app();
-    app.status = Status::Streaming;
+    app.run_active = true;
     app.run_id = 1;
     app.state.mode = Mode::Plan;
     app.state.plan = PlanState::Drafting(PathBuf::from("test-plan.md"));
@@ -2135,7 +2213,7 @@ fn plan_app() -> App {
 #[test_case(Mode::Build, false ; "build_mode_tooldone_no_form")]
 fn tool_done_write_opens_plan_form(mode: Mode, expect_form: bool) {
     let mut app = test_app();
-    app.status = Status::Streaming;
+    app.run_active = true;
     app.run_id = 1;
     app.state.mode = mode;
     app.state.plan = PlanState::Drafting(PathBuf::from("/tmp/plans/test.md"));
@@ -2156,7 +2234,7 @@ fn tool_done_write_opens_plan_form(mode: Mode, expect_form: bool) {
 #[test]
 fn done_event_does_not_open_plan_form() {
     let mut app = test_app();
-    app.status = Status::Streaming;
+    app.run_active = true;
     app.run_id = 1;
     app.state.mode = Mode::Plan;
     app.state.plan = PlanState::Ready(PathBuf::from("test-plan.md"));
@@ -2415,7 +2493,7 @@ fn workflow_toggle_flows_into_agent_input() {
 #[test]
 fn subagent_history_finishes_workflow_chat() {
     let mut app = test_app();
-    app.status = Status::Streaming;
+    app.run_active = true;
     app.run_id = 1;
     app.update(subagent_msg(
         AgentEvent::TextDelta { text: "sub".into() },
@@ -2485,7 +2563,7 @@ fn update_model_to_ineligible_resets_fast() {
 #[test]
 fn agent_error_creates_synthetic_tool_done_with_message() {
     let mut app = test_app();
-    app.status = Status::Streaming;
+    app.run_active = true;
     app.run_id = 1;
 
     app.update(agent_msg(AgentEvent::ToolStart(Box::new(ToolStartEvent {
@@ -2744,6 +2822,6 @@ fn subagent_cancel_then_navigate_back_main_unaffected() {
 
     app.update(Msg::Key(kb::PREV_CHAT.to_key_event()));
     assert_eq!(app.active_chat, 0);
-    assert_eq!(app.status, Status::Streaming);
+    assert!(app.is_busy());
     assert!(!app.chats[0].is_finished());
 }

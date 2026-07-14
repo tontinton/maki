@@ -2,7 +2,6 @@ use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
 use crate::agent::QueuedMessage;
-use crate::components::Status;
 use crate::theme;
 use maki_agent::{AgentInput, AgentMode};
 use maki_storage::StateDir;
@@ -165,7 +164,7 @@ impl App {
     }
 
     pub(super) fn separator_style(&self) -> Style {
-        if self.status == Status::Streaming {
+        if self.is_busy() {
             theme::current().input_border
         } else {
             Style::new().fg(self.effective_mode_color())

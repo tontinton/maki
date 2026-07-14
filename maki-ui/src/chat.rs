@@ -111,6 +111,7 @@ impl Chat {
                     "Auto-compacting conversation...".into(),
                 ));
             }
+            AgentEvent::RunStarted => {}
             AgentEvent::QueueItemConsumed { text, image_count } => {
                 return ChatEventResult::QueueItemConsumed { text, image_count };
             }

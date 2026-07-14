@@ -15,7 +15,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Widget};
 
-use super::{App, Mode, Status};
+use super::{App, Mode};
 
 struct ViewLayout {
     msg_area: Rect,
@@ -195,7 +195,7 @@ impl App {
             for &(idx, rect) in &layout.panel_windows {
                 self.float_mgr.view_panel(frame, idx, rect);
             }
-            let streaming = self.status == Status::Streaming;
+            let streaming = self.is_busy();
             let panel_hint = (self.state.mode == Mode::Plan)
                 .then(|| self.plan_form.hint_line())
                 .flatten()
@@ -299,8 +299,9 @@ impl App {
         let chat = &self.chats[render_chat];
         let chat_name = (self.chats.len() > 1).then_some(chat.name.as_str());
         let (mode_label, mode_style) = self.mode_label();
+        let status = self.status_view();
         let ctx = StatusBarContext {
-            status: &self.status,
+            status: &status,
             mode_label,
             mode_style,
             model_id: chat
@@ -456,7 +457,7 @@ impl App {
         } else if self.file_picker.is_open() {
             contexts.push(KeybindContext::FilePicker);
         } else {
-            if self.status == Status::Streaming {
+            if self.is_busy() {
                 contexts.push(KeybindContext::Streaming);
             }
             contexts.push(KeybindContext::Editing);

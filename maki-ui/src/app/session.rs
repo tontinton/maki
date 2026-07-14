@@ -80,7 +80,7 @@ impl App {
         self.chats.push(main);
         self.active_chat = 0;
         self.chat_index.clear();
-        self.status = super::Status::Idle;
+        self.reset_run_state();
         self.queue.clear();
         self.close_all_overlays();
         self.pending_input = PendingInput::None;

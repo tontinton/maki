@@ -25,7 +25,7 @@ use crate::app::shell::{ShellEvent, spawn_shell};
 use crate::app::{App, Msg};
 use crate::components::input::Submission;
 use crate::components::usage_modal::UsageFetchState;
-use crate::components::{Action, ExitRequest, Status};
+use crate::components::{Action, ExitRequest};
 
 use crate::storage_writer::StorageWriter;
 use crate::terminal;
@@ -286,7 +286,6 @@ impl<'t> EventLoop<'t> {
 
     fn tick(&mut self) {
         self.app.tick_edge_scroll();
-        self.app.tick_error_expiry();
         self.app.poll_image_paste();
         self.app.btw_modal.poll();
         self.app.status_bar.poll_branch_update();
@@ -307,8 +306,8 @@ impl<'t> EventLoop<'t> {
                     let actions = self.app.update(Msg::Agent(Box::new(envelope)));
                     self.dispatch(actions);
                 }
-                Err(flume::TryRecvError::Disconnected) if self.app.status == Status::Streaming => {
-                    self.app.status = Status::error("agent stopped unexpectedly".into());
+                Err(flume::TryRecvError::Disconnected) if self.app.is_busy() => {
+                    self.app.finish_err("agent stopped unexpectedly".into());
                     break;
                 }
                 Err(_) => break,

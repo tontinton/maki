@@ -549,6 +549,10 @@ pub enum AgentEvent {
     ToolResultsSubmitted {
         message: Box<Message>,
     },
+    /// A logical run (message turn or compact) began in the loop. Bookends
+    /// the lifecycle with `Done` / `Error` so the UI can derive "is the agent
+    /// working" instead of hand-poking a flag at every entry point.
+    RunStarted,
     QueueItemConsumed {
         text: String,
         image_count: usize,

@@ -905,6 +905,7 @@ impl EventPump {
             AgentEvent::ToolPending { .. }
             | AgentEvent::ToolOutput { .. }
             | AgentEvent::ToolDone(_)
+            | AgentEvent::RunStarted
             | AgentEvent::QueueItemConsumed { .. }
             | AgentEvent::AutoCompacting
             | AgentEvent::AuthRequired
