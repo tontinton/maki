@@ -38,6 +38,7 @@ use maki_config::ToolOutputLines;
 use maki_providers::Model;
 use maki_providers::RequestOptions;
 use maki_providers::provider::Provider;
+use maki_storage::id::SessionRef;
 
 pub struct DescriptionContext<'a> {
     pub filter: &'a ToolFilter,
@@ -384,7 +385,7 @@ impl Provider for NullProvider {
         _: &'a Value,
         _: &'a flume::Sender<ProviderEvent>,
         _: RequestOptions,
-        _: Option<&str>,
+        _: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, crate::AgentError>> {
         Box::pin(async { unimplemented!() })
     }

@@ -19,6 +19,7 @@ use maki_agent::{AgentInput, AgentMode, Envelope, ImageMediaType, ImageSource};
 use maki_providers::Message;
 use maki_providers::model::Model;
 use maki_providers::provider::available_model_specs;
+use maki_storage::id::{MakiId, SessionRef};
 use serde::Serialize;
 use serde_json::Value;
 use smol::io::AsyncBufReadExt;
@@ -125,19 +126,22 @@ fn handle_request(srv: &mut Server, method: &str, id: RequestId, raw: &Value, pa
         "session/new" => parse_params::<NewSessionRequest>(raw).map(|req| {
             let handle = spawn_session(params, req.cwd, None, Vec::new());
             let spec = params.model.spec();
-            let resp = methods::new_session_response(&handle.session_id)
+            let resp = methods::new_session_response(handle.session_id.as_str())
                 .config_options(vec![methods::model_config_option(&spec, &srv.model_specs)]);
             install_session(srv, handle, spec);
             AgentResponse::NewSessionResponse(resp)
         }),
         "session/load" => parse_params::<LoadSessionRequest>(raw).and_then(|req| {
-            let session_id = req.session_id.0.to_string();
-            let history = load_history(&session_id)?;
-            let sid = SessionId::from(session_id.clone());
+            let session_ref: SessionRef =
+                req.session_id.0.parse().map_err(|_| {
+                    AcpError::resource_not_found(Some(req.session_id.0.to_string()))
+                })?;
+            let history = load_history(session_ref.id())?;
+            let sid = SessionId::from(session_ref.to_string());
             for update in translate::replay_history(&history) {
                 session_update(&srv.out_tx, &sid, update);
             }
-            let handle = spawn_session(params, req.cwd, Some(session_id), history);
+            let handle = spawn_session(params, req.cwd, Some(session_ref), history);
             let spec = params.model.spec();
             let resp = methods::load_session_response()
                 .config_options(vec![methods::model_config_option(&spec, &srv.model_specs)]);
@@ -158,7 +162,7 @@ fn handle_request(srv: &mut Server, method: &str, id: RequestId, raw: &Value, pa
 fn spawn_session(
     params: &AcpParams,
     cwd: PathBuf,
-    session_id: Option<String>,
+    session_id: Option<SessionRef>,
     history: Vec<Message>,
 ) -> InteractiveHandle {
     headless::spawn_interactive(InteractiveParams {
@@ -195,7 +199,7 @@ fn install_session(srv: &mut Server, handle: InteractiveHandle, current_model: S
     });
 }
 
-fn load_history(session_id: &str) -> Result<Vec<Message>, AcpError> {
+fn load_history(session_id: MakiId) -> Result<Vec<Message>, AcpError> {
     let storage = maki_storage::StateDir::resolve()
         .map_err(|e| AcpError::internal_error().data(json_str(&e)))?;
     load_history_from(&storage, session_id)
@@ -203,7 +207,7 @@ fn load_history(session_id: &str) -> Result<Vec<Message>, AcpError> {
 
 fn load_history_from(
     storage: &maki_storage::StateDir,
-    session_id: &str,
+    session_id: MakiId,
 ) -> Result<Vec<Message>, AcpError> {
     let session: maki_storage::sessions::Session<
         Message,
@@ -249,7 +253,7 @@ fn handle_set_mode(srv: &mut Server, raw: &Value) -> Result<AgentResponse, AcpEr
     let session = srv.session.as_mut().ok_or_else(no_session)?;
     session.current_mode = new_mode;
 
-    let sid = SessionId::from(session.handle.session_id.clone());
+    let sid = SessionId::from(session.handle.session_id.to_string());
     session_update(
         &srv.out_tx,
         &sid,
@@ -353,12 +357,12 @@ fn image_media_type(mime: &str) -> ImageMediaType {
 
 fn start_event_pump(
     event_rx: Receiver<Envelope>,
-    session_id: String,
+    session_id: SessionRef,
     out_tx: Sender<Value>,
     pending: PendingPrompt,
 ) {
     smol::spawn(async move {
-        let sid = SessionId::from(session_id);
+        let sid = SessionId::from(session_id.to_string());
         let mut next_request_id = FIRST_OUTGOING_REQUEST_ID;
 
         while let Ok(Envelope {
@@ -480,7 +484,8 @@ mod tests {
         session.messages = messages.clone();
         session.save(&dir).unwrap();
 
-        let history = load_history_from(&dir, &session.id).unwrap();
+        let id: MakiId = session.id;
+        let history = load_history_from(&dir, id).unwrap();
         assert_eq!(
             serde_json::to_value(&history).unwrap(),
             serde_json::to_value(&messages).unwrap()
@@ -491,7 +496,7 @@ mod tests {
     fn load_missing_session_is_resource_not_found() {
         let tmp = TempDir::new().unwrap();
         let dir = StateDir::from_path(tmp.path().to_path_buf());
-        let err = load_history_from(&dir, "missing-id").unwrap_err();
+        let err = load_history_from(&dir, MakiId::generate()).unwrap_err();
         assert_eq!(err.code, AcpError::resource_not_found(None).code);
     }
 }

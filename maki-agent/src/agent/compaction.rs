@@ -224,6 +224,7 @@ mod tests {
         ContentBlock, Message, Model, ProviderEvent, RequestOptions, Role, StopReason,
         StreamResponse, TokenUsage,
     };
+    use maki_storage::id::SessionRef;
     use serde_json::Value;
     use test_case::test_case;
 
@@ -251,7 +252,7 @@ mod tests {
             _: &'a Value,
             _: &'a flume::Sender<ProviderEvent>,
             _: RequestOptions,
-            _: Option<&str>,
+            _: Option<&'a SessionRef>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async {
                 let mut responses = self.responses.lock().unwrap();

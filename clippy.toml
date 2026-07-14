@@ -1,0 +1,5 @@
+disallowed-methods = [
+  { path = "uuid::Uuid::new_v4", reason = "use maki_storage::id::MakiId::generate (base58-encoded UUIDv7)", allow-invalid = true },
+  { path = "uuid::Uuid::new_v7", reason = "use maki_storage::id::MakiId::generate (base58-encoded UUIDv7)", allow-invalid = true },
+  { path = "uuid::Uuid::now_v7", reason = "use maki_storage::id::MakiId::generate (base58-encoded UUIDv7)", allow-invalid = true },
+]

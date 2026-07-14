@@ -17,6 +17,7 @@ use maki_providers::Timeouts;
 use maki_providers::provider::{Provider, fetch_all_models, from_model};
 use maki_providers::{Message, Model};
 use maki_storage::StateDir;
+use maki_storage::id::{MakiId, SessionRef};
 use tracing::warn;
 
 use crate::AppSession;
@@ -204,7 +205,7 @@ impl<'t> EventLoop<'t> {
             ui_config.tool_output_lines,
             &permissions,
             cwd,
-            Some(session.id.clone()),
+            Some(SessionRef::from(session.id)),
             timeouts,
             lua_event_handle.clone(),
         );
@@ -262,7 +263,7 @@ impl<'t> EventLoop<'t> {
         })
     }
 
-    pub(crate) fn run(mut self, initial_prompt: Option<String>) -> Result<(Option<String>, i32)> {
+    pub(crate) fn run(mut self, initial_prompt: Option<String>) -> Result<(Option<MakiId>, i32)> {
         if let Some(prompt) = initial_prompt {
             let sub = Submission {
                 text: prompt,
@@ -609,12 +610,9 @@ impl<'t> EventLoop<'t> {
         }
     }
 
-    fn shutdown(mut self) -> (Option<String>, i32) {
+    fn shutdown(mut self) -> (Option<MakiId>, i32) {
         let exit_code = self.app.exit_request.code();
-        let session_id = self
-            .app
-            .has_content()
-            .then(|| self.app.state.session.id.clone());
+        let session_id = self.app.has_content().then_some(self.app.state.session.id);
         maki_agent::mcp::kill_process_groups(&self.handles.mcp_reader().load().pids);
         self.app.cmd_tx = None;
         self.app.answer_tx = None;

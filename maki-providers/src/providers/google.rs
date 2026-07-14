@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 use flume::Sender;
 use futures_lite::io::{AsyncBufReadExt, BufReader};
 use isahc::{AsyncReadResponseExt, HttpClient, Request};
+use maki_storage::id::SessionRef;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::warn;
@@ -228,7 +229,7 @@ impl Provider for Google {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        _session_id: Option<&'a str>,
+        _session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(self.do_stream(model, messages, system, tools, event_tx, opts.thinking))
     }

@@ -2,6 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use flume::Sender;
 use maki_config::providers::{BuiltInProvider, Protocol, ProviderPlan};
+use maki_storage::id::SessionRef;
 use serde::Deserialize;
 use serde_json::Value;
 use tracing::warn;
@@ -290,7 +291,7 @@ impl Provider for Zai {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        _session_id: Option<&str>,
+        _session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let auth = self.auth.lock().unwrap().clone();

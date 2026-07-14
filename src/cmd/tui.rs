@@ -11,6 +11,7 @@ use maki_config::{load_env_files, load_permissions};
 use maki_lua::PluginHost;
 use maki_providers::model::Model;
 use maki_storage::StateDir;
+use maki_storage::id::MakiId;
 use maki_ui::AppSession;
 
 use crate::cli::{Cli, normalize_tool_name};
@@ -26,13 +27,16 @@ fn discover_commands(disable: bool) -> Vec<CustomCommand> {
 
 fn resolve_session(
     continue_session: bool,
-    session_id: Option<String>,
+    session_id: Option<&str>,
     model: &str,
     cwd: &str,
     storage: &StateDir,
 ) -> Result<AppSession> {
-    if let Some(id) = session_id {
-        return AppSession::load(&id, storage).map_err(|e| color_eyre::eyre::eyre!("{e}"));
+    if let Some(raw) = session_id {
+        let id: MakiId = raw
+            .parse()
+            .map_err(|e| color_eyre::eyre::eyre!("invalid session id {raw:?}: {e}"))?;
+        return AppSession::load(id, storage).map_err(|e| color_eyre::eyre::eyre!("{e}"));
     }
     if continue_session {
         match AppSession::latest(cwd, storage) {
@@ -171,7 +175,7 @@ pub fn run(cli: Cli) -> Result<()> {
         let cwd_str = cwd.to_string_lossy().into_owned();
         let mut session = resolve_session(
             cli.continue_session,
-            cli.session,
+            cli.session.as_deref(),
             &model.spec(),
             &cwd_str,
             &storage,

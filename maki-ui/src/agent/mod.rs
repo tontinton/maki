@@ -17,6 +17,7 @@ use maki_agent::{
     McpSnapshotReader, ToolOutput, ToolOutputLines,
 };
 use maki_lua::EventHandle;
+use maki_storage::id::SessionRef;
 
 use self::cancel_map::new_run_cancel_map;
 use maki_providers::provider::Provider;
@@ -66,7 +67,7 @@ impl AgentHandles {
         tool_output_lines: ToolOutputLines,
         permissions: &Arc<PermissionManager>,
         cwd: PathBuf,
-        session_id: Option<String>,
+        session_id: Option<SessionRef>,
         timeouts: maki_providers::Timeouts,
         lua_handle: Option<EventHandle>,
     ) -> Self {
@@ -140,7 +141,7 @@ impl AgentHandles {
             permissions,
             self.mcp_handle.clone(),
             self.mcp_config_errors.clone(),
-            Some(app.state.session.id.clone()),
+            Some(SessionRef::from(app.state.session.id)),
             self.timeouts,
             lua_handle,
         );
@@ -189,7 +190,7 @@ fn spawn_agent_internal(
     permissions: &Arc<PermissionManager>,
     mcp_handle: Option<McpHandle>,
     mcp_config_errors: McpConfigErrors,
-    session_id: Option<String>,
+    session_id: Option<SessionRef>,
     timeouts: maki_providers::Timeouts,
     lua_handle: Option<EventHandle>,
 ) -> AgentHandles {

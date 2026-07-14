@@ -12,9 +12,11 @@ tempfile = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 etcetera = { workspace = true }
+bs58 = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
 test-case = { workspace = true }
 tempfile = { workspace = true }
 isahc = { workspace = true }
+serde_json = { workspace = true }

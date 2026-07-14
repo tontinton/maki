@@ -30,6 +30,7 @@ use color_eyre::Result;
 use maki_agent::ToolOutput;
 use maki_providers::Message;
 use maki_providers::TokenUsage;
+use maki_storage::id::MakiId;
 
 pub type AppSession = maki_storage::sessions::Session<Message, TokenUsage, ToolOutput>;
 
@@ -39,7 +40,7 @@ pub use event_loop::EventLoopParams;
 pub fn run(
     params: EventLoopParams,
     initial_prompt: Option<String>,
-) -> Result<(Option<String>, i32)> {
+) -> Result<(Option<MakiId>, i32)> {
     let (_guard, mut terminal) = terminal::TerminalGuard::init()?;
     let el = event_loop::EventLoop::new(&mut terminal, params)?;
     el.run(initial_prompt)

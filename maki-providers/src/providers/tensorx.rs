@@ -1,6 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use flume::Sender;
+use maki_storage::id::SessionRef;
 use serde_json::{Value, json};
 
 use crate::model::{Model, ModelEntry, ModelInfo, ModelPricing};
@@ -82,7 +83,7 @@ impl Provider for TensorX {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        _session_id: Option<&str>,
+        _session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let auth = self.auth.lock().unwrap().clone();

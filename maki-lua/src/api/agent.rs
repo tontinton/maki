@@ -25,12 +25,12 @@ use maki_agent::{
 use maki_providers::model::ModelTier;
 use maki_providers::provider;
 use maki_providers::{ContentBlock, Model, ModelError, Role, ThinkingConfig};
+use maki_storage::id::MakiId;
 use mlua::{
     Function, Lua, Result as LuaResult, Table, UserData, UserDataMethods, Value as LuaValue,
 };
 use serde_json::Value as JsonValue;
 use tracing::info;
-use uuid::Uuid;
 
 use crate::api::ui::buf::BufHandle;
 use crate::api::util::convert::{json_to_lua, lua_to_json, lua_tool_result};
@@ -561,7 +561,7 @@ async fn session(
         None => agent_ctx.opts.thinking,
     };
 
-    let session_id = Uuid::new_v4().to_string();
+    let session_id = MakiId::generate();
     let (sub_tx, sub_rx) = flume::unbounded::<Envelope>();
     let sub_event_tx = EventSender::new(sub_tx, agent_ctx.event_tx.run_id());
     let parent_tx = agent_ctx.event_tx.clone();
@@ -618,7 +618,7 @@ async fn session(
             config: agent_ctx.config.clone(),
             tool_output_lines: maki_config::ToolOutputLines::default(),
             permissions: Arc::clone(&agent_ctx.permissions),
-            session_id: Some(session_id),
+            session_id: Some(session_id.into()),
             timeouts: agent_ctx.timeouts,
             file_tracker: FileReadTracker::fresh(),
             prompt_slots: Arc::clone(&agent_ctx.prompt_slots),

@@ -2,6 +2,10 @@
 //!
 //! Wire protocol matches Claude Code's SDK interface so tools like Conductor, Windsurf, and custom
 //! orchestrators work without adaptation.
+//!
+//! Per-message wire ids (`uuid`, assistant `message.id`) use `uuid::Uuid::now_v7()` to emit the
+//! hyphenated-hex UUIDv7 shape that Claude Code SDK consumers expect, rather than maki's base58
+//! `MakiId` canonical form.
 
 use std::collections::{HashMap, HashSet};
 use std::io::{self, BufRead, Write};
@@ -24,6 +28,7 @@ use maki_agent::{
 use maki_providers::model::Model;
 use maki_providers::{ImageSource, Message, StopReason, Timeouts, TokenUsage};
 use maki_storage::StateDir;
+use maki_storage::id::SessionRef;
 use maki_storage::sessions::Session;
 use serde::Serialize;
 use serde_json::Value;
@@ -49,6 +54,13 @@ const TOOL_NAME_MAP: &[(&str, &str)] = &[
     ("question", "Question"),
     ("skill", "Skill"),
 ];
+
+/// Emits a hyphenated-hex UUIDv7 string for Claude Code SDK wire ids
+/// (message.id, assistant message.id).
+#[allow(clippy::disallowed_methods)]
+fn wire_uuid() -> String {
+    uuid::Uuid::now_v7().to_string()
+}
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum PermissionMode {
@@ -101,7 +113,7 @@ impl PermissionMode {
 struct WireMessage {
     #[serde(flatten)]
     inner: WireInner,
-    session_id: String,
+    session_id: SessionRef,
     uuid: String,
 }
 
@@ -336,7 +348,7 @@ impl StreamSynth {
         vec![serde_json::json!({
             "type": "message_start",
             "message": {
-                "id": uuid::Uuid::new_v4().to_string(),
+                "id": wire_uuid(),
                 "type": "message",
                 "role": "assistant",
                 "content": [],
@@ -389,7 +401,7 @@ fn maki_to_claude_tool_name(name: &str) -> &str {
 
 #[derive(Clone)]
 struct SdkWriter {
-    session_id: String,
+    session_id: SessionRef,
     out_tx: Sender<String>,
 }
 
@@ -398,7 +410,7 @@ impl SdkWriter {
         let msg = WireMessage {
             inner,
             session_id: self.session_id.clone(),
-            uuid: uuid::Uuid::new_v4().to_string(),
+            uuid: wire_uuid(),
         };
         self.out_tx
             .send(serde_json::to_string(&msg)?)
@@ -633,24 +645,37 @@ pub fn run(params: SdkParams) -> Result<()> {
 
 type StoredSession = Session<Message, TokenUsage, ToolOutput>;
 
-fn resolve_session(cli: &Cli, cwd: &str) -> Result<(Option<String>, Vec<Message>)> {
+fn resolve_session(cli: &Cli, cwd: &str) -> Result<(Option<SessionRef>, Vec<Message>)> {
     let (resumed_id, history) = if let Some(id) = &cli.session {
         let storage = StateDir::resolve().context("resolve state dir")?;
-        let session =
-            StoredSession::load(id, &storage).map_err(|e| eyre!("load session {id}: {e}"))?;
-        let resumed = (!cli.fork_session).then_some(session.id);
+        let session_ref: SessionRef = id
+            .parse()
+            .map_err(|e| eyre!("invalid session id {id}: {e}"))?;
+        let session = StoredSession::load(session_ref.id(), &storage)
+            .map_err(|e| eyre!("load session {id}: {e}"))?;
+        let resumed = (!cli.fork_session).then_some(session_ref);
         (resumed, session.messages)
     } else if cli.continue_session {
         let storage = StateDir::resolve().context("resolve state dir")?;
         match StoredSession::latest(cwd, &storage) {
-            Ok(Some(session)) => (Some(session.id), session.messages),
+            Ok(Some(session)) => (Some(SessionRef::from(session.id)), session.messages),
             _ => (None, Vec::new()),
         }
     } else {
         (None, Vec::new())
     };
 
-    Ok((cli.session_id.clone().or(resumed_id), history))
+    let cli_session_id = cli.session_id.as_deref().map(|s| {
+        s.parse::<SessionRef>()
+            .map_err(|e| eyre!("invalid session id {s:?}: {e}"))
+    });
+    let cli_session_id = match cli_session_id {
+        Some(Ok(id)) => Some(id),
+        Some(Err(e)) => return Err(e),
+        None => None,
+    };
+
+    Ok((cli_session_id.or(resumed_id), history))
 }
 
 fn parse_or_warn<T: serde::de::DeserializeOwned>(payload: Value, what: &str) -> Option<T> {
@@ -939,7 +964,7 @@ impl EventPump {
                 }
                 self.writer.emit(WireInner::Assistant(AssistantPayload {
                     message: AssistantMessage {
-                        id: uuid::Uuid::new_v4().to_string(),
+                        id: wire_uuid(),
                         model: tc.model.clone(),
                         role: "assistant",
                         content: map_tool_names_in_content(&content_value),
@@ -1260,7 +1285,7 @@ mod tests {
                 usage: TokenUsage::default(),
                 permission_denials: Vec::new(),
             }),
-            session_id: "s".into(),
+            session_id: SessionRef::generate(),
             uuid: "u".into(),
         };
         let json: Value = serde_json::to_value(&msg).unwrap();
@@ -1282,7 +1307,7 @@ mod tests {
                     "permissionMode": "default",
                 }),
             }),
-            session_id: "s".into(),
+            session_id: SessionRef::generate(),
             uuid: "u".into(),
         };
         let json: Value = serde_json::to_value(&msg).unwrap();
@@ -1302,7 +1327,7 @@ mod tests {
                     error: None,
                 },
             }),
-            session_id: "s".into(),
+            session_id: SessionRef::generate(),
             uuid: "u".into(),
         };
         let json: Value = serde_json::to_value(&msg).unwrap();
@@ -1322,7 +1347,7 @@ mod tests {
                     tool_use_id: Some("tool_123".into()),
                 },
             }),
-            session_id: "s".into(),
+            session_id: SessionRef::generate(),
             uuid: "u".into(),
         };
         let json: Value = serde_json::to_value(&msg).unwrap();

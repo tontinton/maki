@@ -9,6 +9,7 @@ use flume::Sender;
 use hmac::{Hmac, Mac};
 use isahc::config::Configurable;
 use isahc::{HttpClient, ReadResponseExt, Request};
+use maki_storage::id::SessionRef;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
@@ -524,7 +525,7 @@ impl Provider for Bedrock {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        _session_id: Option<&'a str>,
+        _session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             if self.needs_refresh() {
