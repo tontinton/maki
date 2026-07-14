@@ -6,10 +6,10 @@ local replace_lines = require("edit_helpers").replace_lines
 local SNIPPET_MAX_CHARS = 32
 
 local EDIT_LINES_DESCRIPTION =
-  [[Edit lines by number. Replaces lines from `start` to `end` (inclusive) with `new_string`. Use empty `new_string` to delete a range.]]
+  [[Edit lines by number. Replaces lines from `start` to `end` (inclusive) with `new_string`. Use empty `new_string` to delete a range. Do not use with the batch tool.]]
 
 local INSERT_LINES_DESCRIPTION =
-  [[Insert lines before a given line number. Lines at `line` and below shift down. Existing lines are preserved.]]
+  [[Insert lines before a given line number. Lines at `line` and below shift down. Existing lines are preserved. Do not use with the batch tool.]]
 
 local EDIT_DESCRIPTION = [[Replace an exact string match in a file.
 
