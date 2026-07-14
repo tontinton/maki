@@ -1109,6 +1109,9 @@ impl App {
                     self.status_bar.clear_flash();
                     self.save_session();
                     self.subagent_answers.clear();
+                    // The agent dropped the queue on failure; drop the now-orphaned
+                    // panel cursor too so it can't resurface over later messages.
+                    self.queue.unfocus();
                     self.finish_subagents(DisplayRole::Error, ERROR_TEXT);
                     for chat in &mut self.chats {
                         chat.fail_in_progress_with_message(message.clone());

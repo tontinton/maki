@@ -1433,6 +1433,22 @@ fn clears_queue_focus_on_terminate(terminate: fn(&mut App)) {
 }
 
 #[test]
+fn error_does_not_let_queue_focus_resurface() {
+    let mut app = app_with_queued_message();
+    app.queue.set_focus_at(0);
+    assert_eq!(app.queue.focus(), Some(0));
+
+    error_app(&mut app);
+    assert!(app.queue.focus().is_none());
+
+    // Re-grow the panel past the old index: the orphaned cursor must stay gone,
+    // not reappear over a message the user never selected.
+    app.queue_and_notify(queued_msg("a"));
+    app.queue_and_notify(queued_msg("b"));
+    assert!(app.queue.focus().is_none());
+}
+
+#[test]
 fn stale_events_ignored_after_run_id_increment() {
     let mut app = test_app();
     app.queue.set_running();
@@ -1463,8 +1479,9 @@ fn stale_events_ignored_after_run_id_increment() {
 }
 
 #[test]
-fn stale_done_does_not_drain_queue() {
+fn stale_done_is_dropped_by_run_id_guard() {
     let mut app = test_app();
+    app.exit_on_done = true;
     app.queue.set_running();
     app.run_id = 1;
 
@@ -1479,9 +1496,11 @@ fn stale_done_does_not_drain_queue() {
         },
         1,
     ));
+    // The Done belongs to the cancelled run, so the run_id guard drops it
+    // before any of the Done side effects fire: no exit despite exit_on_done,
+    // and the queued follow-up survives.
+    assert_eq!(app.exit_request, ExitRequest::None);
     assert_eq!(app.queue.len(), 1);
-    // The queued follow-up is pending work, so we stay busy regardless of the
-    // stale Done — which the run_id guard drops without touching the queue.
     assert!(app.is_busy());
 }
 

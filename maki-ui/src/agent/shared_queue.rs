@@ -155,6 +155,28 @@ fn begin_next(activity: &Shared) -> Option<QueueItem> {
     Some(item)
 }
 
+/// Collapse to `Idle` only if still `Running` — a concurrent cancel may have
+/// already moved us on. Leaves `pending` alone so queued follow-ups still run.
+fn finish_ok(activity: &Shared) {
+    let mut a = lock(activity);
+    if matches!(a.phase, Phase::Running) {
+        a.phase = Phase::Idle;
+    }
+}
+
+/// Latch the error and drop queued follow-ups so they can't run after a
+/// failure. Guarded on `Running` like `finish_ok`.
+fn finish_err(activity: &Shared, message: String) {
+    let mut a = lock(activity);
+    if matches!(a.phase, Phase::Running) {
+        a.pending.clear();
+        a.phase = Phase::Failed {
+            message,
+            since: Instant::now(),
+        };
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct QueueSender {
     activity: Shared,
@@ -281,26 +303,16 @@ impl QueueSender {
         lock(&self.activity).phase = Phase::Running;
     }
 
-    /// Simulate a clean run end (Running → Idle).
+    /// Simulate a clean run end (shares the prod path).
     #[cfg(test)]
     pub(crate) fn finish_ok(&self) {
-        let mut a = lock(&self.activity);
-        if matches!(a.phase, Phase::Running) {
-            a.phase = Phase::Idle;
-        }
+        finish_ok(&self.activity);
     }
 
-    /// Simulate the agent failing a run (Running → Failed, pending dropped).
+    /// Simulate the agent failing a run (shares the prod path).
     #[cfg(test)]
     pub(crate) fn finish_err(&self, message: impl Into<String>) {
-        let mut a = lock(&self.activity);
-        if matches!(a.phase, Phase::Running) {
-            a.pending.clear();
-            a.phase = Phase::Failed {
-                message: message.into(),
-                since: Instant::now(),
-            };
-        }
+        finish_err(&self.activity, message.into());
     }
 
     /// Land in a failed phase with a back-dated timestamp so error expiry can
@@ -322,27 +334,14 @@ impl QueueReceiver {
         begin_next(&self.activity)
     }
 
-    /// The run ended cleanly. Collapses to `Idle` only if still `Running` — a
-    /// concurrent cancel may have already moved us on. Does not touch
-    /// `pending`, so queued follow-ups still run.
+    /// The run ended cleanly.
     pub(crate) fn finish_ok(&self) {
-        let mut a = lock(&self.activity);
-        if matches!(a.phase, Phase::Running) {
-            a.phase = Phase::Idle;
-        }
+        finish_ok(&self.activity);
     }
 
-    /// The run failed. Latch the error and drop any queued follow-ups so they
-    /// don't run after an error. Guarded on `Running` like `finish_ok`.
+    /// The run failed.
     pub(crate) fn finish_err(&self, message: String) {
-        let mut a = lock(&self.activity);
-        if matches!(a.phase, Phase::Running) {
-            a.pending.clear();
-            a.phase = Phase::Failed {
-                message,
-                since: Instant::now(),
-            };
-        }
+        finish_err(&self.activity, message);
     }
 
     pub(crate) async fn recv_notify(&self) -> Result<(), flume::RecvError> {
