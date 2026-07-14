@@ -1,24 +1,31 @@
-//! Queue of work handed from the UI to the agent loop.
+//! Work handed from the UI to the agent loop, and the run phase it drives.
+//!
+//! [`Activity`] is the single source of truth for "what is the agent doing":
+//! the pending queue and the current run phase live behind one mutex, co-owned
+//! by the UI (which enqueues, removes, and cancels) and the agent loop (which
+//! runs the work). Everything the UI shows — spinner, transient error, queue
+//! panel — is a pure projection of this value (`is_busy`, `status_view`,
+//! `panel_entries`); nothing is mirrored in the UI or hand-poked.
 //!
 //! Shutdown rides on `Drop`: when the last [`QueueSender`] goes away, flume
-//! closes the notify channel, so the receiver's `recv_notify` wakes with an
-//! `Err` and the agent loop falls out of its main loop on its own. That way
-//! nobody needs a separate "please stop" flag, and callers can't forget to
-//! set it.
+//! closes the notify channel, and the receiver's `recv_notify` wakes with an
+//! `Err` and the agent loop falls out of its main loop on its own.
 
 use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Instant;
 
 use maki_agent::{AgentInput, ExtractedCommand, ImageSource, InterruptSource};
 
 use crate::components::input::Submission;
 use crate::components::queue_panel::QueueEntry;
+use crate::components::{ERROR_DISPLAY, StatusView};
 use crate::theme;
 
 const COMPACT_LABEL: &str = "/compact";
 
-type Items = Arc<Mutex<VecDeque<QueueItem>>>;
+type Shared = Arc<Mutex<Activity>>;
 
 pub(crate) struct QueuedMessage {
     pub(crate) text: String,
@@ -92,46 +99,138 @@ impl QueueItem {
     }
 }
 
+/// The single source of truth for run status. Co-owned by the UI and the agent
+/// loop under one mutex. `phase` being an enum makes "running *and* errored"
+/// unrepresentable; "queued but idle" is impossible because the same `pending`
+/// list feeds both the panel and `is_busy`.
+struct Activity {
+    pending: VecDeque<QueueItem>,
+    phase: Phase,
+}
+
+enum Phase {
+    Idle,
+    Running,
+    Failed { message: String, since: Instant },
+}
+
+impl Activity {
+    fn new() -> Self {
+        Self {
+            pending: VecDeque::new(),
+            phase: Phase::Idle,
+        }
+    }
+
+    fn is_busy(&self) -> bool {
+        matches!(self.phase, Phase::Running) || !self.pending.is_empty()
+    }
+
+    fn status_view(&self) -> StatusView {
+        if let Phase::Failed { message, since } = &self.phase
+            && since.elapsed() < ERROR_DISPLAY
+        {
+            return StatusView::Error {
+                message: message.clone(),
+            };
+        }
+        if self.is_busy() {
+            StatusView::Streaming
+        } else {
+            StatusView::Idle
+        }
+    }
+}
+
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Pop the front item and mark the run active in one locked step, so the UI
+/// can never observe the gap between "queue emptied" and "run started".
+fn begin_next(activity: &Shared) -> Option<QueueItem> {
+    let mut a = lock(activity);
+    let item = a.pending.pop_front()?;
+    a.phase = Phase::Running;
+    Some(item)
+}
+
 #[derive(Clone)]
 pub(crate) struct QueueSender {
-    items: Items,
+    activity: Shared,
     notify_tx: flume::Sender<()>,
 }
 
 pub(crate) struct QueueReceiver {
-    items: Items,
+    activity: Shared,
     notify_rx: flume::Receiver<()>,
 }
 
 pub(crate) fn queue() -> (QueueSender, QueueReceiver) {
     let (notify_tx, notify_rx) = flume::bounded(1);
-    let items: Items = Arc::new(Mutex::new(VecDeque::new()));
+    let activity: Shared = Arc::new(Mutex::new(Activity::new()));
     (
         QueueSender {
-            items: Arc::clone(&items),
+            activity: Arc::clone(&activity),
             notify_tx,
         },
-        QueueReceiver { items, notify_rx },
+        QueueReceiver {
+            activity,
+            notify_rx,
+        },
     )
 }
 
 impl QueueSender {
-    pub(crate) fn push(&self, entry: QueueItem) {
-        lock(&self.items).push_back(entry);
+    /// Enqueue work. Any lingering error display is cleared: once the user
+    /// submits again, the run is what matters.
+    pub(crate) fn push(&self, item: QueueItem) {
+        {
+            let mut a = lock(&self.activity);
+            if matches!(a.phase, Phase::Failed { .. }) {
+                a.phase = Phase::Idle;
+            }
+            a.pending.push_back(item);
+        }
         let _ = self.notify_tx.try_send(());
     }
 
     pub(crate) fn remove(&self, index: usize) -> Option<QueueItem> {
-        let mut items = lock(&self.items);
-        (index < items.len()).then(|| items.remove(index)).flatten()
+        let mut a = lock(&self.activity);
+        (index < a.pending.len())
+            .then(|| a.pending.remove(index))
+            .flatten()
+    }
+
+    /// Cancel / session reset: forget queued work and any running or failed
+    /// phase. Instant, so the spinner drops the moment the user hits Ctrl-C.
+    pub(crate) fn reset(&self) {
+        let mut a = lock(&self.activity);
+        a.pending.clear();
+        a.phase = Phase::Idle;
+    }
+
+    /// The agent channel died mid-run: record the failure it can no longer
+    /// report itself.
+    pub(crate) fn fail(&self, message: String) {
+        let mut a = lock(&self.activity);
+        a.pending.clear();
+        a.phase = Phase::Failed {
+            message,
+            since: Instant::now(),
+        };
+    }
+
+    pub(crate) fn is_busy(&self) -> bool {
+        lock(&self.activity).is_busy()
+    }
+
+    pub(crate) fn status_view(&self) -> StatusView {
+        lock(&self.activity).status_view()
     }
 
     pub(crate) fn len(&self) -> usize {
-        lock(&self.items).len()
+        lock(&self.activity).pending.len()
     }
 
     #[cfg(test)]
@@ -139,12 +238,9 @@ impl QueueSender {
         self.len() == 0
     }
 
-    pub(crate) fn clear(&self) {
-        lock(&self.items).clear();
-    }
-
     pub(crate) fn text_messages(&self) -> Vec<String> {
-        lock(&self.items)
+        lock(&self.activity)
+            .pending
             .iter()
             .filter(|item| item.visible_in_panel())
             .filter_map(|item| match item {
@@ -155,24 +251,98 @@ impl QueueSender {
     }
 
     pub(crate) fn panel_len(&self) -> usize {
-        lock(&self.items)
+        lock(&self.activity)
+            .pending
             .iter()
             .filter(|item| item.visible_in_panel())
             .count()
     }
 
     pub(crate) fn panel_entries(&self) -> Vec<QueueEntry<'static>> {
-        lock(&self.items)
+        lock(&self.activity)
+            .pending
             .iter()
             .filter(|item| item.visible_in_panel())
             .map(QueueItem::as_queue_entry)
             .collect()
     }
+
+    // ---- test seams: simulate the agent side without a live loop ----
+
+    /// Simulate the agent picking up the front item (pop + mark running).
+    #[cfg(test)]
+    pub(crate) fn begin_next(&self) -> Option<QueueItem> {
+        begin_next(&self.activity)
+    }
+
+    /// Simulate a run beginning with nothing else to pop.
+    #[cfg(test)]
+    pub(crate) fn set_running(&self) {
+        lock(&self.activity).phase = Phase::Running;
+    }
+
+    /// Simulate a clean run end (Running → Idle).
+    #[cfg(test)]
+    pub(crate) fn finish_ok(&self) {
+        let mut a = lock(&self.activity);
+        if matches!(a.phase, Phase::Running) {
+            a.phase = Phase::Idle;
+        }
+    }
+
+    /// Simulate the agent failing a run (Running → Failed, pending dropped).
+    #[cfg(test)]
+    pub(crate) fn finish_err(&self, message: impl Into<String>) {
+        let mut a = lock(&self.activity);
+        if matches!(a.phase, Phase::Running) {
+            a.pending.clear();
+            a.phase = Phase::Failed {
+                message: message.into(),
+                since: Instant::now(),
+            };
+        }
+    }
+
+    /// Land in a failed phase with a back-dated timestamp so error expiry can
+    /// be exercised deterministically.
+    #[cfg(test)]
+    pub(crate) fn fail_with_age(&self, message: impl Into<String>, age: std::time::Duration) {
+        let mut a = lock(&self.activity);
+        a.pending.clear();
+        a.phase = Phase::Failed {
+            message: message.into(),
+            since: Instant::now() - age,
+        };
+    }
 }
 
 impl QueueReceiver {
-    pub(crate) fn pop(&self) -> Option<QueueItem> {
-        lock(&self.items).pop_front()
+    /// Pop the front item and mark the run active in one locked step.
+    pub(crate) fn begin_next(&self) -> Option<QueueItem> {
+        begin_next(&self.activity)
+    }
+
+    /// The run ended cleanly. Collapses to `Idle` only if still `Running` — a
+    /// concurrent cancel may have already moved us on. Does not touch
+    /// `pending`, so queued follow-ups still run.
+    pub(crate) fn finish_ok(&self) {
+        let mut a = lock(&self.activity);
+        if matches!(a.phase, Phase::Running) {
+            a.phase = Phase::Idle;
+        }
+    }
+
+    /// The run failed. Latch the error and drop any queued follow-ups so they
+    /// don't run after an error. Guarded on `Running` like `finish_ok`.
+    pub(crate) fn finish_err(&self, message: String) {
+        let mut a = lock(&self.activity);
+        if matches!(a.phase, Phase::Running) {
+            a.pending.clear();
+            a.phase = Phase::Failed {
+                message,
+                since: Instant::now(),
+            };
+        }
     }
 
     pub(crate) async fn recv_notify(&self) -> Result<(), flume::RecvError> {
@@ -181,8 +351,13 @@ impl QueueReceiver {
 }
 
 impl InterruptSource for QueueReceiver {
+    /// Mid-run fold: hand the current run the next queued item. Shrinks
+    /// `pending` but leaves `phase` alone — the same run keeps going.
     fn poll(&self) -> Option<ExtractedCommand> {
-        self.pop().map(QueueItem::into_extracted_command)
+        lock(&self.activity)
+            .pending
+            .pop_front()
+            .map(QueueItem::into_extracted_command)
     }
 }
 

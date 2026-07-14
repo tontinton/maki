@@ -38,7 +38,6 @@ pub(super) struct AgentLoop {
     init_cancel: CancelToken,
     permissions: Arc<PermissionManager>,
     file_tracker: Arc<FileReadTracker>,
-    min_run_id: u64,
     agent_tx: flume::Sender<Envelope>,
     answer_rx: Arc<async_lock::Mutex<flume::Receiver<String>>>,
     queue: Arc<QueueReceiver>,
@@ -83,7 +82,6 @@ impl AgentLoop {
             init_cancel,
             permissions,
             file_tracker: FileReadTracker::fresh(),
-            min_run_id: 0,
             agent_tx,
             answer_rx: Arc::new(async_lock::Mutex::new(answer_rx)),
             queue,
@@ -100,20 +98,27 @@ impl AgentLoop {
         }
 
         while let Ok(()) = self.queue.recv_notify().await {
-            while let Some(entry) = self.queue.pop() {
-                if entry.run_id() < self.min_run_id {
-                    continue;
+            while let Some(item) = self.queue.begin_next() {
+                let run_id = item.run_id();
+                match self.process_entry(item).await {
+                    Ok(()) => self.queue.finish_ok(),
+                    Err(err) => {
+                        match &err {
+                            AgentError::Cancelled => self.queue.finish_ok(),
+                            other => self.queue.finish_err(other.user_message()),
+                        }
+                        self.emit_error(run_id, err);
+                    }
                 }
-                self.process_entry(entry).await;
             }
         }
     }
 
-    async fn process_entry(&mut self, entry: QueueItem) {
+    async fn process_entry(&mut self, entry: QueueItem) -> Result<(), AgentError> {
         let run_id = entry.run_id();
         let event_tx = EventSender::new(self.agent_tx.clone(), run_id);
 
-        let result = match entry {
+        match entry {
             QueueItem::Message {
                 text,
                 image_count,
@@ -121,20 +126,12 @@ impl AgentLoop {
                 displayed,
                 ..
             } => {
-                let _ = event_tx.send(AgentEvent::RunStarted);
                 if !displayed {
                     let _ = event_tx.send(AgentEvent::QueueItemConsumed { text, image_count });
                 }
                 self.do_agent_run(input, event_tx, run_id).await
             }
-            QueueItem::Compact { .. } => {
-                let _ = event_tx.send(AgentEvent::RunStarted);
-                self.do_compact(&event_tx).await
-            }
-        };
-
-        if let Err(e) = result {
-            self.emit_error(run_id, e);
+            QueueItem::Compact { .. } => self.do_compact(&event_tx).await,
         }
     }
 
@@ -258,11 +255,6 @@ impl AgentLoop {
         drop(agent);
 
         self.clear_cancel_trigger(run_id);
-
-        if matches!(result, Err(AgentError::Cancelled)) {
-            self.min_run_id = run_id + 1;
-        }
-
         result
     }
 

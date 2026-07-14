@@ -3,6 +3,7 @@
 use super::{App, format_with_images};
 
 use crate::agent::shared_queue::{QueueItem, QueueSender};
+use crate::components::StatusView;
 use crate::components::queue_panel::QueueEntry;
 
 pub(crate) use crate::agent::shared_queue::QueuedMessage;
@@ -35,15 +36,68 @@ impl MessageQueue {
         removed
     }
 
-    pub(crate) fn clear(&mut self) {
-        if let Some(ref shared) = self.shared {
-            shared.clear();
+    pub(crate) fn is_busy(&self) -> bool {
+        self.shared.as_ref().is_some_and(|s| s.is_busy())
+    }
+
+    pub(crate) fn status_view(&self) -> StatusView {
+        self.shared
+            .as_ref()
+            .map_or(StatusView::Idle, |s| s.status_view())
+    }
+
+    pub(crate) fn reset(&mut self) {
+        if let Some(ref s) = self.shared {
+            s.reset();
         }
         self.focus = None;
     }
 
+    pub(crate) fn fail(&mut self, message: String) {
+        if let Some(ref s) = self.shared {
+            s.fail(message);
+        }
+        self.focus = None;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn begin_next(&self) -> Option<QueueItem> {
+        self.shared.as_ref().and_then(|s| s.begin_next())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_running(&self) {
+        if let Some(ref s) = self.shared {
+            s.set_running();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn finish_ok(&self) {
+        if let Some(ref s) = self.shared {
+            s.finish_ok();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn finish_err(&self, message: impl Into<String>) {
+        if let Some(ref s) = self.shared {
+            s.finish_err(message);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_with_age(&self, message: impl Into<String>, age: std::time::Duration) {
+        if let Some(ref s) = self.shared {
+            s.fail_with_age(message, age);
+        }
+    }
+
+    /// Focus is a cursor into the panel; the panel is derived from the shared
+    /// queue, which the agent can empty (e.g. on error) without going through
+    /// the UI. Filtering here keeps focus from dangling past a vanished row.
     pub(crate) fn focus(&self) -> Option<usize> {
-        self.focus
+        self.focus.filter(|&i| i < self.panel_len())
     }
 
     pub(crate) fn set_focus(&mut self) {
@@ -118,21 +172,15 @@ impl App {
             run_id: self.run_id,
             displayed: false,
         });
-        self.queued_count += 1;
     }
 
-    /// Drop a queued item by index, keeping `queued_count` in lockstep so the
-    /// spinner and submit gate don't count a message the user just removed.
+    /// Drop a queued item by index.
     pub(super) fn remove_queued(&mut self, index: usize) {
-        if matches!(self.queue.remove(index), Some(QueueItem::Message { .. })) {
-            self.queued_count = self.queued_count.saturating_sub(1);
-        }
+        self.queue.remove(index);
     }
 
     pub(super) fn remove_focused_queued(&mut self) {
-        if matches!(self.queue.remove_focused(), Some(QueueItem::Message { .. })) {
-            self.queued_count = self.queued_count.saturating_sub(1);
-        }
+        self.queue.remove_focused();
     }
 
     pub(super) fn queue_compact(&mut self) {
@@ -144,10 +192,9 @@ impl App {
         });
     }
 
-    /// Agent reached a deferred message: draw the bubble and mark one fewer
-    /// message pending, so the spinner and submit gate stay honest.
+    /// Agent reached a deferred message: draw the bubble now that it's
+    /// actually running, instead of when the user merely typed it.
     pub(super) fn on_queue_item_consumed(&mut self, text: &str, image_count: usize) {
-        self.queued_count = self.queued_count.saturating_sub(1);
         self.main_chat()
             .show_user_message(format_with_images(text, image_count));
     }
@@ -155,7 +202,6 @@ impl App {
     /// Immediate path: kick off the agent and draw the bubble in the same
     /// frame, so the user sees their message land where it will stay.
     pub(super) fn start_from_queue(&mut self, msg: &QueuedMessage) -> Vec<super::Action> {
-        self.start_run();
         if let Some(ref handle) = self.lua_event_handle {
             handle.fire_autocmd("TurnStart", serde_json::json!({}));
         }

@@ -230,36 +230,6 @@ impl ExitRequest {
     }
 }
 
-/// A latched agent error, held for [`ERROR_DISPLAY`] then treated as gone.
-/// Separate from the run lifecycle so an error can never coexist with a
-/// live run — starting a run clears it.
-#[derive(Debug, Clone)]
-pub struct ErrorState {
-    pub message: String,
-    since: Instant,
-}
-
-impl ErrorState {
-    pub fn new(message: String) -> Self {
-        Self {
-            message,
-            since: Instant::now(),
-        }
-    }
-
-    pub fn is_expired(&self) -> bool {
-        self.since.elapsed() >= ERROR_DISPLAY
-    }
-
-    #[cfg(test)]
-    pub fn with_age(message: impl Into<String>, age: Duration) -> Self {
-        Self {
-            message: message.into(),
-            since: Instant::now() - age,
-        }
-    }
-}
-
 /// What the status bar should show, projected from the run lifecycle plus
 /// the (possibly expired) error latch. A stale error is already collapsed
 /// to `Idle` here, so renderers never see an expired error.

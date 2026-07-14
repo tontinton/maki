@@ -307,7 +307,7 @@ impl<'t> EventLoop<'t> {
                     self.dispatch(actions);
                 }
                 Err(flume::TryRecvError::Disconnected) if self.app.is_busy() => {
-                    self.app.finish_err("agent stopped unexpectedly".into());
+                    self.app.fail("agent stopped unexpectedly".into());
                     break;
                 }
                 Err(_) => break,

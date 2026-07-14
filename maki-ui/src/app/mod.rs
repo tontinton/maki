@@ -46,8 +46,7 @@ use crate::components::theme_picker::{ThemePicker, ThemePickerAction};
 use crate::components::tool_display::format_turn_usage;
 use crate::components::usage_modal::{UsageFetchState, UsageModal};
 use crate::components::{
-    Action, DisplayMessage, DisplayRole, ErrorState, ExitRequest, Overlay, RetryInfo, StatusView,
-    is_ctrl,
+    Action, DisplayMessage, DisplayRole, ExitRequest, Overlay, RetryInfo, StatusView, is_ctrl,
 };
 use crate::image;
 use crate::selection::{SelectionState, ZoneRegistry};
@@ -152,15 +151,6 @@ pub struct App {
     pub(super) permission_prompt: PermissionPrompt,
     pub(super) plan_form: PlanForm,
     pub(super) status_bar: StatusBar,
-    /// `true` while a run is executing (bracketed by `RunStarted`..`Done`/
-    /// `Error`, plus an optimistic set on immediate dispatch to close the
-    /// submit-vs-queue race before `RunStarted` round-trips).
-    pub(crate) run_active: bool,
-    /// Messages the UI has queued but not yet seen consumed. Bridges the
-    /// `Done`->`RunStarted` handoff so the spinner and the submit gate stay
-    /// true while a queued follow-up is still pending.
-    pub(crate) queued_count: usize,
-    pub(crate) error: Option<ErrorState>,
     pub(crate) state: session_state::SessionState,
     pub exit_request: ExitRequest,
     pub(crate) exit_on_done: bool,
@@ -240,9 +230,6 @@ impl App {
             permission_prompt: PermissionPrompt::new(),
             plan_form: PlanForm::new(),
             status_bar: StatusBar::new(ui_config.flash_duration()),
-            run_active: false,
-            queued_count: 0,
-            error: None,
             state,
             exit_request: ExitRequest::None,
             exit_on_done: false,
@@ -304,49 +291,25 @@ impl App {
         self.status_bar.flash(msg);
     }
 
-    /// Single source of truth for "is the agent working": a live run, or a
-    /// queued message the UI hasn't seen consumed yet. Derived, never poked.
+    /// Single source of truth for "is the agent working", read straight from
+    /// the shared activity: a live run or queued work. Derived, never poked.
     pub(crate) fn is_busy(&self) -> bool {
-        self.run_active || self.queued_count > 0
+        self.queue.is_busy()
     }
 
-    /// Projection for the status bar. A live run wins over a latched error,
-    /// and an expired error collapses to `Idle`.
+    /// Projection for the status bar.
     pub(crate) fn status_view(&self) -> StatusView {
-        if self.is_busy() {
-            return StatusView::Streaming;
-        }
-        match &self.error {
-            Some(e) if !e.is_expired() => StatusView::Error {
-                message: e.message.clone(),
-            },
-            _ => StatusView::Idle,
-        }
+        self.queue.status_view()
     }
 
-    /// A run began: arm the spinner and drop any stale error.
-    fn start_run(&mut self) {
-        self.run_active = true;
-        self.error = None;
-    }
-
-    /// A run ended cleanly.
-    fn finish_ok(&mut self) {
-        self.run_active = false;
-    }
-
-    /// A run ended in error: latch it and drop any pending work.
-    pub(crate) fn finish_err(&mut self, message: String) {
-        self.run_active = false;
-        self.queued_count = 0;
-        self.error = Some(ErrorState::new(message));
+    /// The agent channel died mid-run: record the failure it can't report.
+    pub(crate) fn fail(&mut self, message: String) {
+        self.queue.fail(message);
     }
 
     /// Cancel/reset: back to a clean idle with nothing pending.
     fn reset_run_state(&mut self) {
-        self.run_active = false;
-        self.queued_count = 0;
-        self.error = None;
+        self.queue.reset();
     }
 
     fn active_chat(&mut self) -> &mut Chat {
@@ -943,7 +906,6 @@ impl App {
         }
         self.main_chat()
             .push(DisplayMessage::new(DisplayRole::Error, CANCEL_MSG.into()));
-        self.queue.clear();
         self.reset_run_state();
         vec![Action::CancelAgent {
             run_id: cancelled_run,
@@ -1071,13 +1033,6 @@ impl App {
             return vec![];
         }
 
-        if matches!(envelope.event, AgentEvent::RunStarted) {
-            if chat_idx == 0 {
-                self.start_run();
-            }
-            return vec![];
-        }
-
         self.retry_info = None;
 
         let plan_path = if self.state.mode == Mode::Plan {
@@ -1143,7 +1098,6 @@ impl App {
                     self.save_session();
                     self.chat_index.clear();
                     self.subagent_answers.clear();
-                    self.finish_ok();
                     if let Some(ref handle) = self.lua_event_handle {
                         handle.fire_autocmd("TurnEnd", serde_json::json!({}));
                     }
@@ -1152,10 +1106,8 @@ impl App {
                     }
                 }
                 ChatEventResult::Error(message) => {
-                    self.finish_err(message.clone());
                     self.status_bar.clear_flash();
                     self.save_session();
-                    self.queue.clear();
                     self.subagent_answers.clear();
                     self.finish_subagents(DisplayRole::Error, ERROR_TEXT);
                     for chat in &mut self.chats {
@@ -1213,7 +1165,6 @@ impl App {
                     self.queue_compact();
                     return vec![];
                 }
-                self.start_run();
                 vec![Action::Compact]
             }
             "/help" => {
@@ -1372,7 +1323,6 @@ impl App {
             vec![]
         } else {
             self.run_id += 1;
-            self.start_run();
             self.main_chat().show_user_message(display_text);
             vec![Action::SendMessage(Box::new(input))]
         }
