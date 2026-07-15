@@ -27,6 +27,13 @@ is_windows() {
     esac
 }
 
+# Works for both pretty-printed and single-line GitHub API JSON.
+latest_tag() {
+    github_curl "https://api.github.com/repos/${REPO}/releases/latest" \
+        | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+        | head -n 1
+}
+
 default_install_dir() {
     if is_windows; then
         if [ -n "${LOCALAPPDATA:-}" ]; then
@@ -90,8 +97,7 @@ main() {
 
     INSTALL_DIR="${MAKI_INSTALL_DIR:-$(default_install_dir)}"
 
-    tag="${1:-$(github_curl "https://api.github.com/repos/${REPO}/releases/latest" \
-        | grep '"tag_name"' | cut -d'"' -f4)}"
+    tag="${1:-$(latest_tag)}"
     [ -n "${tag}" ] || err "failed to determine latest release tag"
 
     url="https://github.com/${REPO}/releases/download/${tag}/${BINARY}-${tag}-${target}.${archive_ext}"
