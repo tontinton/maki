@@ -140,7 +140,12 @@ pub fn grep_search(params: GrepParams) -> Result<(PathBuf, Vec<GrepFileEntry>), 
         return Ok((base.to_path_buf(), entries));
     }
 
-    entries.sort_by_cached_key(|e| std::cmp::Reverse(mtime(&base.join(&e.path))));
+    entries.sort_by_cached_key(|e| {
+        (
+            std::cmp::Reverse(mtime(&base.join(&e.path))),
+            e.path.clone(),
+        )
+    });
 
     let mut total_groups = 0;
     for entry in &mut entries {

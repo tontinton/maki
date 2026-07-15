@@ -569,7 +569,7 @@ pub mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::fs::{self, File};
 
     use tempfile::TempDir;
     use test_case::test_case;
@@ -737,8 +737,12 @@ mod tests {
     fn grep_search_parallel_stable_under_repeated_calls() {
         let dir = TempDir::new().unwrap();
         let root = dir.path();
+        let tied_mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(1_600_000_000);
         for i in 0..20u32 {
-            fs::write(root.join(format!("f{i:03}.rs")), format!("needle {i}\n")).unwrap();
+            let path = root.join(format!("f{i:03}.rs"));
+            fs::write(&path, format!("needle {i}\n")).unwrap();
+            let f = File::options().write(true).open(&path).unwrap();
+            f.set_modified(tied_mtime).unwrap();
         }
         let path_str = root.to_string_lossy().to_string();
 
@@ -749,7 +753,7 @@ mod tests {
             params.limit = 1000;
             let (_, entries) = grep::grep_search(params).unwrap();
 
-            let mut flat: Vec<(String, usize, bool)> = entries
+            let flat: Vec<(String, usize, bool)> = entries
                 .iter()
                 .flat_map(|e| {
                     e.groups.iter().flat_map(|g| {
@@ -759,7 +763,6 @@ mod tests {
                     })
                 })
                 .collect();
-            flat.sort();
             match &reference {
                 None => reference = Some(flat),
                 Some(prev) => assert_eq!(flat, *prev),
