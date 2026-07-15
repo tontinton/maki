@@ -79,6 +79,10 @@ maki mcp auth <server-name>     # manually trigger auth
 maki mcp logout <server-name>   # remove stored tokens
 ```
 
+### Headless machines
+
+On a machine without a browser (say, a dev server over SSH), run `maki mcp auth <server-name>`. Maki prints the login URL. Open it on your laptop and log in. The browser lands on a `http://127.0.0.1:19876/...` page that fails to load. Copy that full URL from the address bar and paste it into the terminal to finish the login.
+
 ## Prompts
 
 MCP servers can expose prompts (reusable message templates). Maki shows them as slash commands in the command palette: `/server:prompt-name`. Type `/` to filter.

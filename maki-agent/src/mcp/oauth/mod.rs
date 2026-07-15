@@ -1,8 +1,26 @@
 pub mod callback;
 pub mod discovery;
+pub mod manual;
 pub mod pkce;
 pub mod registration;
 pub mod token;
+
+use std::time::Duration;
+
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use futures_lite::future;
+use isahc::HttpClient;
+use isahc::config::{Configurable, RedirectPolicy};
+use maki_storage::StateDir;
+use maki_storage::auth::{McpAuthData, load_mcp_auth, save_mcp_auth};
+use tracing::{info, warn};
+
+use self::callback::{CallbackResult, CallbackServer};
+use self::discovery::parse_www_authenticate;
+use super::error::McpError;
+
+const AUTH_TIMEOUT: Duration = Duration::from_secs(600);
 
 #[derive(Debug, thiserror::Error)]
 pub enum OAuthError {
@@ -16,23 +34,18 @@ pub enum OAuthError {
     Other(String),
 }
 
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use isahc::HttpClient;
-use isahc::config::{Configurable, RedirectPolicy};
-use maki_storage::StateDir;
-use maki_storage::auth::{McpAuthData, load_mcp_auth, save_mcp_auth};
-use tracing::{info, warn};
-
-use self::callback::CallbackServer;
-use self::discovery::parse_www_authenticate;
-use super::error::McpError;
+#[derive(Clone, Copy)]
+pub enum Interaction {
+    Cli,
+    Background,
+}
 
 pub async fn authenticate(
     server_name: &str,
     server_url: &str,
     www_authenticate: Option<&str>,
     storage: &StateDir,
+    interaction: Interaction,
 ) -> Result<McpAuthData, McpError> {
     let wrap = |e: OAuthError| McpError::OAuthFailed {
         server: server_name.into(),
@@ -149,15 +162,46 @@ pub async fn authenticate(
         server_url,
     );
 
-    info!(server = server_name, endpoint = %auth_server.authorization_endpoint, "opening browser for OAuth");
-    if let Err(e) = open::that(&auth_url) {
-        warn!(server = server_name, error = %e, "failed to open browser - manually visit the auth URL in logs");
-    }
+    info!(server = server_name, endpoint = %auth_server.authorization_endpoint, "starting OAuth authorization");
+    let result = match interaction {
+        Interaction::Cli => {
+            eprintln!("\nOpen this URL in your browser:\n\n  {auth_url}\n");
 
-    let result = callback
-        .wait_for_callback(&state)
-        .await
-        .map_err(|e| wrap(OAuthError::Other(e)))?;
+            if is_headless() {
+                info!(
+                    server = server_name,
+                    "no display detected, skipping browser open"
+                );
+            } else if let Err(e) = open::that(&auth_url) {
+                warn!(server = server_name, error = %e, "failed to open browser");
+            }
+
+            eprintln!("Waiting for callback on 127.0.0.1:{}...", callback.port);
+            eprintln!("If this machine has no browser, log in on another device and paste");
+            eprintln!("the full redirect URL ({redirect_uri}?...) here:");
+
+            let callback_or_paste = future::race(
+                callback.wait_for_callback(&state),
+                manual::wait_for_paste(&state),
+            );
+
+            future::race(callback_or_paste, auth_timeout()).await
+        }
+        Interaction::Background => {
+            let cause = if is_headless() {
+                Some("no display to open a browser".to_string())
+            } else {
+                open::that(&auth_url)
+                    .err()
+                    .map(|e| format!("failed to open browser: {e}"))
+            };
+            match cause {
+                Some(cause) => Err(format!("{cause}; run 'maki mcp auth {server_name}'")),
+                None => future::race(callback.wait_for_callback(&state), auth_timeout()).await,
+            }
+        }
+    }
+    .map_err(|e| wrap(OAuthError::Other(e)))?;
 
     let tokens = token::exchange_code(
         &client,
@@ -199,6 +243,20 @@ async fn discover_auth_server_for(
         .cloned()
         .unwrap_or_else(|| discovery::server_origin(server_url));
     discovery::discover_auth_server(client, &auth_server_url).await
+}
+
+async fn auth_timeout() -> Result<CallbackResult, String> {
+    smol::Timer::after(AUTH_TIMEOUT).await;
+    Err(format!(
+        "OAuth flow timed out after {} minutes",
+        AUTH_TIMEOUT.as_secs() / 60
+    ))
+}
+
+fn is_headless() -> bool {
+    cfg!(target_os = "linux")
+        && std::env::var_os("DISPLAY").is_none()
+        && std::env::var_os("WAYLAND_DISPLAY").is_none()
 }
 
 fn build_http_client() -> Result<HttpClient, isahc::Error> {
