@@ -9,7 +9,7 @@ group = "Getting Started"
 
 ## Install
 
-Recommended way to install:
+### Linux / macOS
 
 ```sh
 # Download and read the script first (don't blindly trust shell scripts).
@@ -26,13 +26,32 @@ One-liner:
 curl -fsSL https://maki.sh/install.sh | sh
 ```
 
-Living on the edge (main branch):
+### Windows
+
+```powershell
+# Download and read the script first (don't blindly trust remote scripts).
+irm https://maki.sh/install.ps1 -OutFile install.ps1
+Get-Content install.ps1
+
+# Then run.
+.\install.ps1
+```
+
+One-liner:
+
+```powershell
+irm https://maki.sh/install.ps1 | iex
+```
+
+Installs to `%LOCALAPPDATA%\maki` and adds it to your user PATH. Override with `$env:MAKI_INSTALL_DIR`.
+
+### Living on the edge (main branch)
 
 ```sh
 cargo install --locked --git https://github.com/tontinton/maki.git maki
 ```
 
-With Nix:
+### With Nix
 
 ```sh
 nix run github:tontinton/maki

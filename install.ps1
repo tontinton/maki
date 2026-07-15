@@ -16,6 +16,21 @@ function Write-Err([string]$Message) {
     exit 1
 }
 
+function Get-GitHubHeaders {
+    $headers = @{
+        "User-Agent" = "maki-install"
+        "Accept"     = "application/vnd.github+json"
+    }
+    $token = $env:GITHUB_TOKEN
+    if (-not $token) {
+        $token = $env:GH_TOKEN
+    }
+    if ($token) {
+        $headers["Authorization"] = "Bearer $token"
+    }
+    return $headers
+}
+
 function Get-Target {
     $arch = $env:PROCESSOR_ARCHITECTURE
     switch -Regex ($arch) {
@@ -29,8 +44,9 @@ function Get-Target {
 }
 
 function Get-LatestTag {
+    $headers = Get-GitHubHeaders
     try {
-        $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest"
+        $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest" -Headers $headers
     } catch {
         Write-Err "failed to determine latest release tag: $_"
     }
@@ -55,7 +71,7 @@ function Install-Maki([string]$Tag) {
     try {
         $zipPath = Join-Path $tmp $archiveName
         Write-Host "downloading $Binary $Tag for $target..."
-        Invoke-WebRequest -Uri $url -OutFile $zipPath
+        Invoke-WebRequest -Uri $url -OutFile $zipPath -Headers (Get-GitHubHeaders)
 
         Expand-Archive -Path $zipPath -DestinationPath $tmp -Force
 

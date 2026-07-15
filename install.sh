@@ -5,6 +5,22 @@ REPO="tontinton/maki"
 BINARY="maki"
 INSTALL_DIR="${MAKI_INSTALL_DIR:-/usr/local/bin}"
 
+github_curl() {
+    token="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
+    if [ -n "${token}" ]; then
+        curl -fsSL \
+            -H "Authorization: Bearer ${token}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "User-Agent: maki-install" \
+            "$@"
+    else
+        curl -fsSL \
+            -H "Accept: application/vnd.github+json" \
+            -H "User-Agent: maki-install" \
+            "$@"
+    fi
+}
+
 main() {
     need_cmd curl
 
@@ -22,7 +38,7 @@ main() {
 
     target="${arch}-${os}"
 
-    tag="${1:-$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
+    tag="${1:-$(github_curl "https://api.github.com/repos/${REPO}/releases/latest" \
         | grep '"tag_name"' | cut -d'"' -f4)}"
     [ -n "${tag}" ] || err "failed to determine latest release tag"
 
@@ -31,7 +47,7 @@ main() {
     trap 'rm -rf "${tmp}"' EXIT
 
     echo "downloading ${BINARY} ${tag} for ${target}..."
-    curl -fsSL "${url}" | tar xz -C "${tmp}"
+    github_curl "${url}" | tar xz -C "${tmp}"
 
     if [ -w "${INSTALL_DIR}" ]; then
         mv "${tmp}/${BINARY}" "${INSTALL_DIR}/${BINARY}"
