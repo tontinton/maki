@@ -3,6 +3,8 @@ local ToolView = require("maki.tool_view")
 local fuzzy_replace = require("maki.fuzzy_replace")
 local replace_lines = require("edit_helpers").replace_lines
 
+local FALLBACK_VIEW_LINES = 10
+
 local EDIT_LINES_DESCRIPTION =
   [[Edit lines by number. Omit `end` to insert before `start` without removing lines. Set `end` to replace or delete (empty `new_string`) a range.]]
 
@@ -48,27 +50,61 @@ local function edit_view_opts(ctx)
   return { max_lines = (tol and tol.write) or FALLBACK_VIEW_LINES, keep = "head" }
 end
 
--- Old lines red, new lines green, one block per edit. Rebuilt purely from
--- the input, so a batch child can render the change without the file
--- snapshots (those live in ToolOutput::Diff, which Rust renders standalone).
-local function diff_view(blocks, ctx)
+-- Builds the diff view from input alone (batch children don't have file
+-- snapshots). Syntax highlighting is layered async on top of diff backgrounds.
+local function append_diff_lines(view, text, style, jobs)
+  local lines = split_lines(text or "")
+  if #lines == 0 then
+    return
+  end
+  jobs[#jobs + 1] = { first = #view.all_lines + 1, text = table.concat(lines, "\n"), style = style }
+  for _, line in ipairs(lines) do
+    view:append({ { line, style } })
+  end
+end
+
+local function apply_highlights(view, jobs, ext)
+  maki.async.run(function()
+    for _, job in ipairs(jobs) do
+      local bg = maki.ui.theme_color(job.style)
+      local highlighted = bg and maki.ui.highlight(job.text, ext)
+      for i, hl_line in ipairs(highlighted or {}) do
+        local idx = job.first + i - 1
+        if not view.all_lines[idx] then
+          break
+        end
+        local spans = {}
+        for _, seg in ipairs(hl_line) do
+          local style = type(seg[2]) == "table" and seg[2] or {}
+          style.bg = bg
+          spans[#spans + 1] = { seg[1], style }
+        end
+        view:update_line(idx, spans)
+      end
+    end
+    view:flush()
+  end)
+end
+
+local function diff_view(blocks, path, ctx)
   local buf = maki.ui.buf()
   local view = ToolView.new(buf, edit_view_opts(ctx))
+  local jobs = {}
   for i, block in ipairs(blocks) do
     if i > 1 then
       view:append({})
     end
-    for _, line in ipairs(split_lines(block.old or "")) do
-      view:append({ { line, "diff_old" } })
-    end
-    for _, line in ipairs(split_lines(block.new or "")) do
-      view:append({ { line, "diff_new" } })
-    end
+    append_diff_lines(view, block.old, "diff_old", jobs)
+    append_diff_lines(view, block.new, "diff_new", jobs)
   end
   view:finish()
   buf:on("click", function()
     view:toggle()
   end)
+  local ext = (path or ""):match("%.([^%.]+)$")
+  if #jobs > 0 and ext then
+    apply_highlights(view, jobs, ext)
+  end
   return buf
 end
 
@@ -77,7 +113,7 @@ local function diff_restore(blocks_from)
     if is_error then
       return ToolView.restore(output, edit_view_opts(ctx))
     end
-    return diff_view(blocks_from(input), ctx)
+    return diff_view(blocks_from(input), input.path, ctx)
   end
 end
 

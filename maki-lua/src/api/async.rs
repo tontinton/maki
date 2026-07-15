@@ -227,7 +227,6 @@ pub(crate) fn create_async_table(lua: &Lua) -> LuaResult<Table> {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
     use std::pin::pin;
     use std::sync::Mutex;
 
@@ -236,8 +235,6 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
-    use crate::api::r#fn::JobStore;
-    use crate::api::ui::buf::BufferStore;
     use crate::runtime::{CANCELLED_MSG, TaskCell};
 
     const ERR_TOO_FEW_ARGS: &str = "maki.async.await requires at least 2 arguments: argc, fun, ...";
@@ -459,17 +456,7 @@ mod tests {
     fn cancelled_task_handle() -> TaskHandle {
         let (trigger, token) = CancelToken::new();
         trigger.cancel();
-        Arc::new(Mutex::new(TaskCell {
-            cancel: token,
-            deadline: Cell::new(None),
-            deadline_secs: Cell::new(None),
-            jobs: JobStore::new(),
-            bufs: BufferStore::new(),
-            live: None,
-            root_buf: None,
-            live_sink: None,
-            inline_spawn: None,
-        }))
+        Arc::new(Mutex::new(TaskCell::new(token, None, None)))
     }
 
     #[test_case(0 ; "zero_clamps_to_capacity_one")]

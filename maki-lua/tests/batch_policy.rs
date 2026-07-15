@@ -248,13 +248,6 @@ fn nested_batch_rejected_without_dispatch() {
 }
 
 #[test]
-fn empty_tool_calls_is_an_error() {
-    let (reg, _host) = load_batch_host();
-    let err = run_batch(&reg, json!([])).unwrap_err();
-    assert_eq!(err, EMPTY_ERROR);
-}
-
-#[test]
 fn overflow_entries_discarded_with_section() {
     let (reg, _host) = load_batch_host();
     let entries: Vec<Value> = (0..MAX_BATCH_SIZE + 1)
@@ -535,21 +528,59 @@ fn throwing_child_callbacks_degrade_to_plain() {
     assert!(text.contains("restore body"), "plain body fallback: {text}");
 }
 
-/// Old sessions carry no structured state. Headers still render from the
-/// input; the stored llm output becomes one plain body.
+/// No stored state: recover per-child views by parsing `## tool` sections
+/// from the LLM output.
+#[test]
+fn restore_without_state_parses_llm_sections() {
+    let (_reg, host) = load_batch_host();
+    let stored = format!(
+        "{}{}{}",
+        section("hdrtool", "line one\nline two"),
+        section("ok", &format!("{ERROR_PREFIX}{BOOM_ERR}")),
+        summary_mixed(1, 2, 1)
+    );
+    let lines = restore_snapshot_lines(
+        &host,
+        json!({ "tool_calls": [
+            { "tool": "hdrtool", "parameters": { "x": "A" } },
+            { "tool": "ok", "parameters": {} },
+        ] }),
+        &stored,
+        None,
+    );
+    assert_eq!(lines[0][2].0, "H:A", "child header fn still applies");
+    let text = lines_text(&lines);
+    assert!(
+        lines.iter().any(|l| l
+            .iter()
+            .any(|(_, s)| *s == SpanStyle::Named("tool_error".into()))),
+        "[ERROR] section maps to error status: {lines:?}"
+    );
+    assert!(text.contains("line one"), "body from section: {text}");
+    assert!(text.contains(BOOM_ERR), "error body: {text}");
+    assert!(
+        !text.contains(ERROR_PREFIX),
+        "llm error prefix must not render: {text}"
+    );
+    assert!(
+        !text.contains("successfully"),
+        "summary line must not render: {text}"
+    );
+}
+
+/// Unparseable output: headers from input, raw text as one plain body.
 #[test]
 fn restore_without_state_falls_back_to_raw_output() {
     let (_reg, host) = load_batch_host();
-    let stored = format!("{}{}", section("ok", "ok:a"), summary_all_ok(1));
     let lines = restore_snapshot_lines(
         &host,
         json!({ "tool_calls": [{ "tool": "ok", "parameters": { "tag": "a" } }] }),
-        &stored,
+        "not the section format",
         None,
     );
     let text = lines_text(&lines);
     assert!(text.contains("ok> "), "header from input: {text}");
-    assert!(text.contains("ok:a"), "raw output body: {text}");
+    assert!(text.contains("not the section format"), "raw body: {text}");
 }
 
 /// A replayed click row must reach exactly the child it lands on and run

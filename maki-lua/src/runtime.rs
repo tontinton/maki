@@ -233,10 +233,19 @@ pub(crate) struct TaskCell {
     /// When `Some`, `maki.async.run` tasks queue here instead of the global
     /// `SpawnQueue` so restore can run them inline before snapshotting.
     pub(crate) inline_spawn: Option<Vec<PendingAsyncTask>>,
+    /// Claims on `bufs`: one for the live `TaskScope`, plus one per queued
+    /// `maki.async.run` task (a batch recomposes its body through buf
+    /// watchers after its scope drops). Whoever drops the last claim runs
+    /// `bufs.clear()`, breaking the watcher/click cycles.
+    pub(crate) buf_claims: usize,
 }
 
 impl TaskCell {
-    fn new(cancel: CancelToken, deadline: Option<Instant>, live: Option<LiveCtx>) -> Self {
+    pub(crate) fn new(
+        cancel: CancelToken,
+        deadline: Option<Instant>,
+        live: Option<LiveCtx>,
+    ) -> Self {
         Self {
             cancel,
             deadline: Cell::new(deadline),
@@ -247,6 +256,7 @@ impl TaskCell {
             root_buf: None,
             live_sink: None,
             inline_spawn: None,
+            buf_claims: 1,
         }
     }
 }
@@ -357,8 +367,8 @@ impl Drop for TaskScope {
             let mut cell = lock_cell(&self.handle);
             cell.jobs.kill_all();
             cell.jobs.clear(&self.lua);
-            cell.bufs.clear();
         }
+        release_claim(&self.handle);
         match self.prev.take() {
             Some(p) => {
                 self.lua.set_app_data(p);
@@ -425,32 +435,28 @@ pub(crate) fn with_live_ctx<R>(lua: &Lua, f: impl FnOnce(&LiveCtx) -> R) -> Opti
 
 pub(crate) fn enqueue_async_task(lua: &Lua, work_fn: RegistryKey) -> Result<(), mlua::Error> {
     let handle = lua.app_data_ref::<TaskHandle>();
-    let (cancel, live_ctx, live_buf) = match &handle {
+    let (cancel, live_ctx) = match &handle {
         Some(h) => {
             let cell = lock_cell(h);
-            (
-                cell.cancel.clone(),
-                cell.live.clone(),
-                cell.bufs.live_buf().cloned(),
-            )
+            (cell.cancel.clone(), cell.live.clone())
         }
-        None => (CancelToken::none(), None, None),
+        None => (CancelToken::none(), None),
     };
 
-    let task = PendingAsyncTask {
+    let mut task = PendingAsyncTask {
         work_fn,
         cancel,
         deadline: Some(Instant::now() + ASYNC_RUN_DEFAULT_DEADLINE),
         live_ctx,
-        live_buf,
+        owner: None,
     };
 
     if let Some(h) = &handle {
-        let mut cell = lock_cell(h);
-        if let Some(inline) = cell.inline_spawn.as_mut() {
+        if let Some(inline) = lock_cell(h).inline_spawn.as_mut() {
             inline.push(task);
             return Ok(());
         }
+        task.owner = Some(OwnerClaim::new(Arc::clone(h)));
     }
 
     let queue = lua
@@ -535,7 +541,28 @@ pub(crate) struct PendingAsyncTask {
     pub cancel: CancelToken,
     pub deadline: Option<Instant>,
     pub live_ctx: Option<LiveCtx>,
-    pub live_buf: Option<Arc<SharedBuf>>,
+    pub owner: Option<OwnerClaim>,
+}
+
+/// Keeps the owner's bufs alive while this task is queued. Root buf is
+/// resolved at snapshot time because it does not exist yet at enqueue time.
+pub(crate) struct OwnerClaim(TaskHandle);
+
+impl OwnerClaim {
+    fn new(handle: TaskHandle) -> Self {
+        lock_cell(&handle).buf_claims += 1;
+        Self(handle)
+    }
+
+    fn root_buf(&self) -> Option<Arc<SharedBuf>> {
+        resolve_root_buf(&self.0)
+    }
+}
+
+impl Drop for OwnerClaim {
+    fn drop(&mut self) {
+        release_claim(&self.0);
+    }
 }
 
 pub(crate) type SpawnQueue = RefCell<Vec<PendingAsyncTask>>;
@@ -556,6 +583,14 @@ async fn run_work_fn(
             .await
         }
         None => fut.await,
+    }
+}
+
+fn release_claim(handle: &TaskHandle) {
+    let mut cell = lock_cell(handle);
+    cell.buf_claims = cell.buf_claims.saturating_sub(1);
+    if cell.buf_claims == 0 {
+        cell.bufs.clear();
     }
 }
 
@@ -596,11 +631,12 @@ fn drain_spawn_queue(lua: &Lua, ex: &Rc<smol::LocalExecutor<'_>>, gate: &Rc<Infl
             }
 
             if let Some(ref live) = task.live_ctx
-                && let Some(ref buf) = task.live_buf
+                && let Some(buf) = task.owner.as_ref().and_then(OwnerClaim::root_buf)
+                && let Some(lines) = buf.read_if_dirty()
             {
                 let _ = live.event_tx.send(maki_agent::AgentEvent::ToolSnapshot {
                     id: live.tool_use_id.clone(),
-                    snapshot: buf.take(),
+                    snapshot: maki_agent::BufferSnapshot::from_arc(lines),
                     theme_gen: None,
                 });
             }
@@ -1523,13 +1559,8 @@ fn strip_traceback(err: &mlua::Error) -> String {
 /// The error message format is load-bearing: the bash plugin's `restore`
 /// parses it to re-render the timeout sentinel on session reload.
 fn timeout_reply(handle: &TaskHandle, plugin: &str, tool: &str) -> ToolCallReply {
-    let (secs, live_buf) = {
-        let cell = lock_cell(handle);
-        (
-            cell.deadline_secs.get().unwrap_or(0),
-            cell.bufs.live_buf().cloned(),
-        )
-    };
+    let secs = lock_cell(handle).deadline_secs.get().unwrap_or(0);
+    let live_buf = resolve_root_buf(handle);
     let qualified = if plugin == tool || plugin.is_empty() {
         tool.to_owned()
     } else {
@@ -1682,15 +1713,11 @@ async fn run_tool_call(
         };
         match handler_result {
             Ok(LuaValue::Nil) => {
-                let (live, sink, buf) = {
+                let (live, sink) = {
                     let cell = lock_cell(&handle);
-                    (
-                        cell.live.clone(),
-                        cell.live_sink.clone(),
-                        cell.bufs.live_buf().cloned(),
-                    )
+                    (cell.live.clone(), cell.live_sink.clone())
                 };
-                if let Some(buf) = buf {
+                if let Some(buf) = resolve_root_buf(&handle) {
                     if let Some(live) = live {
                         let _ = live.event_tx.send(maki_agent::AgentEvent::LiveToolBuf {
                             id: live.tool_use_id.clone(),
@@ -2276,7 +2303,7 @@ mod tests {
         let queue = lua.app_data_ref::<SpawnQueue>().unwrap();
         let queued = &queue.borrow()[0];
         assert!(queued.live_ctx.is_none());
-        assert!(queued.live_buf.is_none());
+        assert!(queued.owner.is_none());
     }
 
     #[test]
@@ -2316,6 +2343,46 @@ mod tests {
         );
     }
 
+    #[test]
+    fn scope_drop_defers_watcher_clear_until_owned_tasks_release() {
+        use crate::api::ui::buf::HandlerSlot;
+
+        let lua = enqueue_test_lua();
+        let scope = set_active(&lua, TaskCell::new(CancelToken::none(), None, None));
+        let handle = Arc::clone(scope.handle());
+
+        let buf = Arc::new(SharedBuf::new());
+        let fired = Arc::new(AtomicBool::new(false));
+        let f = Arc::clone(&fired);
+        buf.set_on_change(move || f.store(true, Ordering::Release));
+        lock_cell(&handle)
+            .bufs
+            .track(HandlerSlot::Change(Arc::clone(&buf)));
+
+        enqueue_async_task(&lua, enqueue_dummy(&lua)).unwrap();
+        drop(scope);
+
+        buf.set_lines(Vec::new());
+        assert!(
+            fired.load(Ordering::Acquire),
+            "watcher must survive scope drop while an owned async task is pending"
+        );
+
+        let task = lua
+            .app_data_ref::<SpawnQueue>()
+            .unwrap()
+            .borrow_mut()
+            .pop()
+            .unwrap();
+        drop(task);
+        fired.store(false, Ordering::Release);
+        buf.set_lines(Vec::new());
+        assert!(
+            !fired.load(Ordering::Acquire),
+            "dropping the last owned task must clear the deferred watcher"
+        );
+    }
+
     fn push_pending_task(lua: &Lua, cancel: CancelToken, deadline: Option<Instant>) {
         let work_fn = enqueue_dummy(lua);
         lua.app_data_ref::<SpawnQueue>()
@@ -2326,7 +2393,7 @@ mod tests {
                 cancel,
                 deadline,
                 live_ctx: None,
-                live_buf: None,
+                owner: None,
             });
     }
 

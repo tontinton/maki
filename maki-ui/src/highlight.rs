@@ -18,6 +18,18 @@ pub(crate) fn is_ready() -> bool {
 pub(crate) fn refresh_syntax_theme() {
     let theme = theme::current();
     maki_highlight::set_theme(theme.syntax.clone());
+    maki_highlight::set_ui_colors(
+        [
+            ("diff_old", theme.diff_old.bg),
+            ("diff_new", theme.diff_new.bg),
+        ]
+        .into_iter()
+        .filter_map(|(name, color)| match color {
+            Some(Color::Rgb(r, g, b)) => Some((name.to_owned(), (r, g, b))),
+            _ => None,
+        })
+        .collect(),
+    );
 }
 
 pub fn highlight_line(hl: &mut maki_highlight::Highlighter, text: &str) -> Vec<Span<'static>> {
