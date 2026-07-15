@@ -51,7 +51,7 @@ An AI coding agent optimized for minimal use of context tokens, while providing 
 
 ## Installation
 
-### Recommended
+### Linux / macOS
 
 ```sh
 # Download and read the script first (don't blindly trust shell scripts).
@@ -62,11 +62,30 @@ cat install.sh
 chmod +x install.sh && sh install.sh
 ```
 
-### One-liner
+One-liner:
 
 ```sh
 curl -fsSL https://maki.sh/install.sh | sh
 ```
+
+### Windows
+
+```powershell
+# Download and read the script first (don't blindly trust remote scripts).
+irm https://maki.sh/install.ps1 -OutFile install.ps1
+Get-Content install.ps1
+
+# Then run.
+.\install.ps1
+```
+
+One-liner:
+
+```powershell
+irm https://maki.sh/install.ps1 | iex
+```
+
+Installs to `%LOCALAPPDATA%\maki` and adds it to your user PATH. Override with `$env:MAKI_INSTALL_DIR`.
 
 ### Living on the edge (main branch)
 
