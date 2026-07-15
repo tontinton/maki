@@ -3,7 +3,6 @@ set -eu
 
 REPO="tontinton/maki"
 BINARY="maki"
-INSTALL_DIR="${MAKI_INSTALL_DIR:-/usr/local/bin}"
 
 github_curl() {
     token="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
@@ -21,43 +20,110 @@ github_curl() {
     fi
 }
 
+is_windows() {
+    case "$(uname -s)" in
+        MINGW*|MSYS*|CYGWIN*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+default_install_dir() {
+    if is_windows; then
+        if [ -n "${LOCALAPPDATA:-}" ]; then
+            printf '%s\n' "${LOCALAPPDATA}/maki"
+        else
+            printf '%s\n' "${HOME}/.local/bin"
+        fi
+    else
+        printf '%s\n' "/usr/local/bin"
+    fi
+}
+
+add_windows_user_path() {
+    dir="$1"
+    # Convert to Windows path when possible so PATH works outside Git Bash.
+    if command -v cygpath > /dev/null 2>&1; then
+        win_dir="$(cygpath -w "${dir}")"
+    else
+        win_dir="${dir}"
+    fi
+    powershell.exe -NoProfile -Command "
+\$dir = '${win_dir}' -replace '/', '\\'
+\$sep = [IO.Path]::PathSeparator
+\$userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+if (\$null -eq \$userPath) { \$userPath = '' }
+\$entries = \$userPath -split [regex]::Escape(\$sep) | Where-Object { \$_ -ne '' }
+\$already = \$entries | Where-Object { \$_.TrimEnd('\\') -ieq \$dir.TrimEnd('\\') }
+if (\$already) { exit 0 }
+\$newPath = if (\$userPath.Trim()) { \"\$userPath\$sep\$dir\" } else { \$dir }
+[Environment]::SetEnvironmentVariable('Path', \$newPath, 'User')
+Write-Host \"added \$dir to user PATH (restart terminal if maki is not found)\"
+" || true
+}
+
 main() {
     need_cmd curl
 
-    case "$(uname -s)" in
-        Linux)  os="unknown-linux-musl" ;;
-        Darwin) os="apple-darwin" ;;
-        *) err "unsupported OS: $(uname -s)" ;;
-    esac
+    if is_windows; then
+        # Only x86_64 Windows builds are published; ARM64 runs them under emulation.
+        target="x86_64-pc-windows-msvc"
+        archive_ext="zip"
+        bin_name="${BINARY}.exe"
+        need_cmd unzip
+    else
+        case "$(uname -s)" in
+            Linux)  os="unknown-linux-musl" ;;
+            Darwin) os="apple-darwin" ;;
+            *) err "unsupported OS: $(uname -s)" ;;
+        esac
 
-    case "$(uname -m)" in
-        x86_64|amd64)   arch="x86_64" ;;
-        aarch64|arm64)  arch="aarch64" ;;
-        *) err "unsupported architecture: $(uname -m)" ;;
-    esac
+        case "$(uname -m)" in
+            x86_64|amd64)   arch="x86_64" ;;
+            aarch64|arm64)  arch="aarch64" ;;
+            *) err "unsupported architecture: $(uname -m)" ;;
+        esac
 
-    target="${arch}-${os}"
+        target="${arch}-${os}"
+        archive_ext="tar.gz"
+        bin_name="${BINARY}"
+    fi
+
+    INSTALL_DIR="${MAKI_INSTALL_DIR:-$(default_install_dir)}"
 
     tag="${1:-$(github_curl "https://api.github.com/repos/${REPO}/releases/latest" \
         | grep '"tag_name"' | cut -d'"' -f4)}"
     [ -n "${tag}" ] || err "failed to determine latest release tag"
 
-    url="https://github.com/${REPO}/releases/download/${tag}/${BINARY}-${tag}-${target}.tar.gz"
+    url="https://github.com/${REPO}/releases/download/${tag}/${BINARY}-${tag}-${target}.${archive_ext}"
     tmp="$(mktemp -d)"
     trap 'rm -rf "${tmp}"' EXIT
 
     echo "downloading ${BINARY} ${tag} for ${target}..."
-    github_curl "${url}" | tar xz -C "${tmp}"
-
-    if [ -w "${INSTALL_DIR}" ]; then
-        mv "${tmp}/${BINARY}" "${INSTALL_DIR}/${BINARY}"
+    if [ "${archive_ext}" = "zip" ]; then
+        github_curl "${url}" -o "${tmp}/maki.zip"
+        unzip -qo "${tmp}/maki.zip" -d "${tmp}"
     else
-        echo "installing to ${INSTALL_DIR} (requires sudo)..."
-        sudo mv "${tmp}/${BINARY}" "${INSTALL_DIR}/${BINARY}"
+        github_curl "${url}" | tar xz -C "${tmp}"
     fi
 
-    chmod +x "${INSTALL_DIR}/${BINARY}"
-    echo "${BINARY} ${tag} installed to ${INSTALL_DIR}/${BINARY}"
+    [ -f "${tmp}/${bin_name}" ] || err "archive did not contain ${bin_name}"
+
+    mkdir -p "${INSTALL_DIR}"
+    dest="${INSTALL_DIR}/${bin_name}"
+
+    if [ -w "${INSTALL_DIR}" ]; then
+        mv "${tmp}/${bin_name}" "${dest}"
+    else
+        echo "installing to ${INSTALL_DIR} (requires sudo)..."
+        sudo mv "${tmp}/${bin_name}" "${dest}"
+    fi
+
+    chmod +x "${dest}"
+    echo "${BINARY} ${tag} installed to ${dest}"
+
+    if is_windows; then
+        add_windows_user_path "${INSTALL_DIR}"
+    fi
     echo ""
 }
 

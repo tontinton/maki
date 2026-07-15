@@ -68,7 +68,7 @@ One-liner:
 curl -fsSL https://maki.sh/install.sh | sh
 ```
 
-### Windows
+### Windows (PowerShell)
 
 ```powershell
 # Download and read the script first (don't blindly trust remote scripts).
@@ -85,7 +85,13 @@ One-liner:
 irm https://maki.sh/install.ps1 | iex
 ```
 
-Installs to `%LOCALAPPDATA%\maki` and adds it to your user PATH. Override with `$env:MAKI_INSTALL_DIR`.
+### Windows (Git Bash)
+
+```sh
+curl -fsSL https://maki.sh/install.sh | sh
+```
+
+Both install to `%LOCALAPPDATA%\maki` and add it to your user PATH. Override with `MAKI_INSTALL_DIR` / `$env:MAKI_INSTALL_DIR`.
 
 ### Living on the edge (main branch)
 
