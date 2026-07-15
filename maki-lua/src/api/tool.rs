@@ -730,24 +730,26 @@ fn get_tool_from_lua(lua: &Lua, name: String) -> LuaResult<LuaValue> {
     Ok(LuaValue::Table(t))
 }
 
-/// The one contract every `get_tool` handle obeys: it never throws; an
-/// error from the wrapped fn is logged and becomes nil.
+/// Async so wrapped fns can yield (e.g. bash restore highlights inline).
 fn wrap_nothrow(
     lua: &Lua,
     tool: String,
     handle: &'static str,
     f: Function,
-    norm: impl Fn(&Lua, LuaValue) -> LuaResult<LuaValue> + Send + 'static,
+    norm: fn(&Lua, LuaValue) -> LuaResult<LuaValue>,
 ) -> LuaResult<Function> {
-    lua.create_function(
-        move |lua, args: MultiValue| match f.call::<LuaValue>(args) {
-            Ok(v) => norm(lua, v),
-            Err(e) => {
-                tracing::warn!(tool, handle, error = %e, "get_tool handle failed");
-                Ok(LuaValue::Nil)
+    lua.create_async_function(move |lua, args: MultiValue| {
+        let (f, tool) = (f.clone(), tool.clone());
+        async move {
+            match f.call_async::<LuaValue>(args).await {
+                Ok(v) => norm(&lua, v),
+                Err(e) => {
+                    tracing::warn!(tool, handle, error = %e, "get_tool handle failed");
+                    Ok(LuaValue::Nil)
+                }
             }
-        },
-    )
+        }
+    })
 }
 
 /// Normalizes a header fn to one spans line or nil: a plain string gets
@@ -781,13 +783,16 @@ fn wrap_header(lua: &Lua, tool: String, f: Function) -> LuaResult<Function> {
 /// a real `LuaCtx` or a plain `{ tool_output_lines =, state = }` table (how
 /// batch drives child restores); either way the fn sees a restore `LuaCtx`.
 fn wrap_restore(lua: &Lua, tool: String, f: Function) -> LuaResult<Function> {
-    let prepped = lua.create_function(move |lua, mut args: MultiValue| {
-        let ctx = normalize_restore_ctx(lua, args.get(3))?;
-        while args.len() < 4 {
-            args.push_back(LuaValue::Nil);
+    let prepped = lua.create_async_function(move |lua, mut args: MultiValue| {
+        let f = f.clone();
+        async move {
+            let ctx = normalize_restore_ctx(&lua, args.get(3))?;
+            while args.len() < 4 {
+                args.push_back(LuaValue::Nil);
+            }
+            args[3] = ctx;
+            f.call_async::<MultiValue>(args).await
         }
-        args[3] = ctx;
-        f.call::<MultiValue>(args)
     })?;
     wrap_nothrow(lua, tool, "restore", prepped, |_lua, v| {
         Ok(match &v {

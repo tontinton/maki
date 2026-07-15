@@ -27,7 +27,8 @@ use maki_providers::provider;
 use maki_providers::{ContentBlock, Model, ModelError, Role, ThinkingConfig};
 use maki_storage::id::MakiId;
 use mlua::{
-    Function, Lua, Result as LuaResult, Table, UserData, UserDataMethods, Value as LuaValue,
+    Function, IntoLuaMulti, Lua, Result as LuaResult, Table, UserData, UserDataMethods,
+    Value as LuaValue,
 };
 use serde_json::Value as JsonValue;
 use tracing::info;
@@ -218,8 +219,7 @@ async fn tools(
 /// Returns `(text, err)`. While the child runs, `opts.on_live_buf`
 /// receives each buf it publishes (as a foreign `BufHandle`) and
 /// `opts.on_annotation` every annotation, live ones and the completion
-/// annotation alike. Both run synchronously on the Lua thread and must
-/// not yield.
+/// annotation alike. Both run on the Lua thread and may yield.
 async fn call_tool(
     lua: Lua,
     (ctx, name, input, opts): (mlua::UserDataRef<LuaCtx>, String, LuaValue, Option<Table>),
@@ -244,18 +244,12 @@ async fn call_tool(
     if let Err(e) = tctx.deadline.check() {
         return Ok(err_pair(e));
     }
-    let deliver = |ev: ToolLive| {
-        let res = match ev {
-            ToolLive::Buf(buf) => on_buf
-                .as_ref()
-                .map(|f| f.call::<()>(BufHandle::foreign(buf))),
-            ToolLive::Annotation(ann) => on_ann.as_ref().map(|f| f.call::<()>(ann)),
-        };
-        if let Some(Err(e)) = res {
-            tracing::warn!(tool = name, error = %e, "call_tool callback failed");
-        }
+    let cbs = LiveCallbacks {
+        tool: &name,
+        on_buf,
+        on_ann,
     };
-    let done = dispatch_racing_live(&tctx, &name, &input_json, rx, &deliver).await;
+    let done = dispatch_racing_live(&tctx, &name, &input_json, rx, &cbs).await;
     // Same fallback the UI applies on tool completion, so a batch child's
     // header carries the annotation its standalone run would get.
     let annotation = done
@@ -263,7 +257,7 @@ async fn call_tool(
         .clone()
         .or_else(|| (!done.is_error).then(|| done.output.annotation()).flatten());
     if let Some(a) = annotation {
-        deliver(ToolLive::Annotation(a));
+        cbs.deliver(ToolLive::Annotation(a)).await;
     }
     match interpreter_bridge::flatten(&done) {
         Ok(text) => Ok((Some(text), None)),
@@ -271,15 +265,42 @@ async fn call_tool(
     }
 }
 
+/// Must use `call_async`, not `call`: callbacks that yield (highlight,
+/// markdown) hit the C-call boundary otherwise.
+struct LiveCallbacks<'a> {
+    tool: &'a str,
+    on_buf: Option<Function>,
+    on_ann: Option<Function>,
+}
+
+impl LiveCallbacks<'_> {
+    async fn deliver(&self, ev: ToolLive) {
+        let res = match ev {
+            ToolLive::Buf(buf) => call_opt(&self.on_buf, BufHandle::foreign(buf)).await,
+            ToolLive::Annotation(ann) => call_opt(&self.on_ann, ann).await,
+        };
+        if let Some(Err(e)) = res {
+            tracing::warn!(tool = self.tool, error = %e, "call_tool callback failed");
+        }
+    }
+}
+
+async fn call_opt(f: &Option<Function>, arg: impl IntoLuaMulti) -> Option<LuaResult<()>> {
+    match f {
+        Some(f) => Some(f.call_async::<()>(arg).await),
+        None => None,
+    }
+}
+
 /// Like `interpreter_bridge::dispatch`, but keeps the full `ToolDoneEvent`
-/// (the annotation lives there) and feeds live events to `deliver` while
-/// the child runs.
+/// (the annotation lives there) and feeds live events to `cbs` while the
+/// child runs.
 async fn dispatch_racing_live(
     tctx: &ToolContext,
     name: &str,
     input: &JsonValue,
     rx: Option<flume::Receiver<ToolLive>>,
-    deliver: &impl Fn(ToolLive),
+    cbs: &LiveCallbacks<'_>,
 ) -> ToolDoneEvent {
     let run = tool_dispatch::run(
         &tctx.registry,
@@ -298,11 +319,11 @@ async fn dispatch_racing_live(
         match select(run.as_mut(), pin!(rx.recv_async())).await {
             Either::Left((done, _)) => {
                 while let Ok(ev) = rx.try_recv() {
-                    deliver(ev);
+                    cbs.deliver(ev).await;
                 }
                 return done;
             }
-            Either::Right((Ok(ev), _)) => deliver(ev),
+            Either::Right((Ok(ev), _)) => cbs.deliver(ev).await,
             // The sender is gone but no result arrived: just wait for the run.
             Either::Right((Err(_), _)) => return run.await,
         }

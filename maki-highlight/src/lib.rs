@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt::Write;
 use std::sync::{Arc, OnceLock, RwLock};
 
@@ -11,8 +12,11 @@ use syntect::util::LinesWithEndings;
 const TOKEN_ALIASES: &[(&str, &str)] = &[("jsx", "js")];
 pub const TAB_SPACES: &str = "  ";
 
+type Rgb = (u8, u8, u8);
+
 static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
 static THEME: OnceLock<RwLock<Arc<Theme>>> = OnceLock::new();
+static UI_COLORS: OnceLock<RwLock<HashMap<String, Rgb>>> = OnceLock::new();
 
 fn theme_lock() -> &'static RwLock<Arc<Theme>> {
     THEME.get_or_init(|| RwLock::new(Arc::new(Theme::default())))
@@ -40,7 +44,22 @@ pub fn theme() -> Arc<Theme> {
         .clone()
 }
 
-pub fn theme_color(name: &str) -> Option<(u8, u8, u8)> {
+fn ui_colors_lock() -> &'static RwLock<HashMap<String, Rgb>> {
+    UI_COLORS.get_or_init(RwLock::default)
+}
+
+pub fn set_ui_colors(colors: HashMap<String, Rgb>) {
+    *ui_colors_lock().write().unwrap_or_else(|e| e.into_inner()) = colors;
+}
+
+pub fn theme_color(name: &str) -> Option<Rgb> {
+    if let Some(&c) = ui_colors_lock()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(name)
+    {
+        return Some(c);
+    }
     let settings = &theme().settings;
     let map = serde_json::to_value(settings).ok()?;
     let obj = map.as_object()?;

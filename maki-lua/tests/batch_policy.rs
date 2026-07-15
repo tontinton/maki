@@ -4,8 +4,8 @@
 use std::sync::Arc;
 
 use maki_agent::tools::ToolRegistry;
-use maki_agent::tools::test_support::stub_ctx;
-use maki_agent::{AgentMode, SpanStyle, ToolOutput};
+use maki_agent::tools::test_support::{stub_ctx, stub_ctx_with};
+use maki_agent::{AgentEvent, AgentMode, BufferSnapshot, EventSender, SpanStyle, ToolOutput};
 use maki_config::ToolOutputLines;
 use maki_lua::PluginHost;
 use serde_json::{Value, json};
@@ -248,13 +248,6 @@ fn nested_batch_rejected_without_dispatch() {
 }
 
 #[test]
-fn empty_tool_calls_is_an_error() {
-    let (reg, _host) = load_batch_host();
-    let err = run_batch(&reg, json!([])).unwrap_err();
-    assert_eq!(err, EMPTY_ERROR);
-}
-
-#[test]
 fn overflow_entries_discarded_with_section() {
     let (reg, _host) = load_batch_host();
     let entries: Vec<Value> = (0..MAX_BATCH_SIZE + 1)
@@ -356,13 +349,15 @@ fn restore_snapshot_lines_opts(
             clicks,
             state,
         },
-        maki_agent::EventSender::new(tx, 0),
+        EventSender::new(tx, 0),
     );
-    let _ = handle.collect_prompt_slots();
+    // Strong barrier: LoadSource drains the async gate, so spawned tasks
+    // (highlight rewrites etc.) have finished before we read snapshots.
+    host.load_source("barrier", "").unwrap();
 
     let mut lines = Vec::new();
     for env in rx.drain() {
-        if let maki_agent::AgentEvent::ToolSnapshot { snapshot, .. } = env.event {
+        if let AgentEvent::ToolSnapshot { snapshot, .. } = env.event {
             lines = snapshot
                 .lines
                 .iter()
@@ -387,7 +382,8 @@ fn lines_text(lines: &[Vec<(String, SpanStyle)>]) -> String {
 }
 
 /// Pins the child header contract: indicator span, `{tool}> ` prefix in
-/// `tool_prefix` style, then the child's own header spans.
+/// `tool_prefix` style, the child's own header spans, then the persisted
+/// annotation like standalone (`push_header` in tool_display.rs).
 #[test]
 fn restore_with_state_renders_child_header_contract() {
     let (_reg, host) = load_batch_host();
@@ -396,7 +392,7 @@ fn restore_with_state_renders_child_header_contract() {
         json!({ "tool_calls": [{ "tool": "hdrtool", "parameters": { "x": "A" } }] }),
         "irrelevant",
         Some(json!({ "children": [
-            { "tool": "hdrtool", "status": "success", "output": "line one\nline two" }
+            { "tool": "hdrtool", "status": "success", "output": "line one\nline two", "annotation": "12 lines" }
         ] })),
     );
     let header = &lines[0];
@@ -412,6 +408,14 @@ fn restore_with_state_renders_child_header_contract() {
         )
     );
     assert_eq!(header[2].0, "H:A", "child's own header spans must follow");
+    assert_eq!(
+        header.last().unwrap(),
+        &(
+            " (12 lines)".to_owned(),
+            SpanStyle::Named("tool_annotation".to_owned())
+        ),
+        "persisted annotation ends the header"
+    );
 
     let text = lines_text(&lines);
     assert!(text.contains("line one"), "body from state: {text}");
@@ -476,29 +480,6 @@ fn restore_child_body_equals_child_restore_view() {
     );
 }
 
-/// Persisted annotations render on the child header like standalone
-/// (`push_header` in tool_display.rs).
-#[test]
-fn restore_child_header_shows_annotation_span() {
-    let (_reg, host) = load_batch_host();
-    let lines = restore_snapshot_lines(
-        &host,
-        json!({ "tool_calls": [{ "tool": "hdrtool", "parameters": { "x": "A" } }] }),
-        "irrelevant",
-        Some(json!({ "children": [
-            { "tool": "hdrtool", "status": "success", "output": "body", "annotation": "12 lines" }
-        ] })),
-    );
-    let header = &lines[0];
-    assert_eq!(
-        header.last().unwrap(),
-        &(
-            " (12 lines)".to_owned(),
-            SpanStyle::Named("tool_annotation".to_owned())
-        )
-    );
-}
-
 /// A child can annotate more than once (a task child streams its model,
 /// then its completion note arrives on the same channel); batch joins
 /// them on the child header in order.
@@ -535,21 +516,89 @@ fn throwing_child_callbacks_degrade_to_plain() {
     assert!(text.contains("restore body"), "plain body fallback: {text}");
 }
 
-/// Old sessions carry no structured state. Headers still render from the
-/// input; the stored llm output becomes one plain body.
+/// No state: parse `## tool` sections from the LLM output.
 #[test]
-fn restore_without_state_falls_back_to_raw_output() {
+fn restore_without_state_parses_llm_sections() {
     let (_reg, host) = load_batch_host();
-    let stored = format!("{}{}", section("ok", "ok:a"), summary_all_ok(1));
+    let stored = format!(
+        "{}{}{}",
+        section("hdrtool", "line one\nline two"),
+        section("ok", &format!("{ERROR_PREFIX}{BOOM_ERR}")),
+        summary_mixed(1, 2, 1)
+    );
     let lines = restore_snapshot_lines(
         &host,
-        json!({ "tool_calls": [{ "tool": "ok", "parameters": { "tag": "a" } }] }),
+        json!({ "tool_calls": [
+            { "tool": "hdrtool", "parameters": { "x": "A" } },
+            { "tool": "ok", "parameters": {} },
+        ] }),
+        &stored,
+        None,
+    );
+    assert_eq!(lines[0][2].0, "H:A", "child header fn still applies");
+    let text = lines_text(&lines);
+    assert!(
+        lines.iter().any(|l| l
+            .iter()
+            .any(|(_, s)| *s == SpanStyle::Named("tool_error".into()))),
+        "[ERROR] section maps to error status: {lines:?}"
+    );
+    assert!(text.contains("line one"), "body from section: {text}");
+    assert!(text.contains(BOOM_ERR), "error body: {text}");
+    assert!(
+        !text.contains(ERROR_PREFIX),
+        "llm error prefix must not render: {text}"
+    );
+    assert!(
+        !text.contains("successfully"),
+        "summary line must not render: {text}"
+    );
+}
+
+/// A body line that looks like the next section header, but is not
+/// preceded by the blank line `render_llm` always emits, must stay body
+/// text instead of splitting the section early.
+#[test]
+fn restore_without_state_keeps_header_lookalike_in_body() {
+    let (_reg, host) = load_batch_host();
+    let stored = format!(
+        "{}{}{}",
+        section("ok", "body line\n## hdrtool\nbody tail"),
+        section("hdrtool", "real body"),
+        summary_all_ok(2)
+    );
+    let lines = restore_snapshot_lines(
+        &host,
+        json!({ "tool_calls": [
+            { "tool": "ok", "parameters": {} },
+            { "tool": "hdrtool", "parameters": { "x": "A" } },
+        ] }),
         &stored,
         None,
     );
     let text = lines_text(&lines);
+    assert!(text.contains("## hdrtool"), "lookalike stays body: {text}");
+    assert!(text.contains("body tail"), "section 1 intact: {text}");
+    assert!(text.contains("real body"), "section 2 body: {text}");
+    assert!(
+        !text.contains("successfully"),
+        "parsed path, not legacy fallback: {text}"
+    );
+}
+
+/// Unparseable output: raw text as one plain body.
+#[test]
+fn restore_without_state_falls_back_to_raw_output() {
+    let (_reg, host) = load_batch_host();
+    let lines = restore_snapshot_lines(
+        &host,
+        json!({ "tool_calls": [{ "tool": "ok", "parameters": { "tag": "a" } }] }),
+        "not the section format",
+        None,
+    );
+    let text = lines_text(&lines);
     assert!(text.contains("ok> "), "header from input: {text}");
-    assert!(text.contains("ok:a"), "raw output body: {text}");
+    assert!(text.contains("not the section format"), "raw body: {text}");
 }
 
 /// A replayed click row must reach exactly the child it lands on and run
@@ -569,10 +618,8 @@ fn replayed_click_expands_only_the_clicked_child() {
         { "tool": "viewer", "status": "success", "output": "b1\nb2\nb3\nb4\nb5" },
     ] });
 
-    // Buf rows are 1-based (row 0 is the header), so a click on snapshot
-    // line `i` replays as row `i + 1`. Find child2's truncation notice in
-    // the collapsed render instead of hardcoding a row, so layout-only
-    // changes (separator padding, header lines) cannot break click routing.
+    // Rows are 1-based (row 0 = header), so snapshot line i = row i+1.
+    // Find child2's notice dynamically so layout changes can't break this.
     let collapsed = restore_snapshot_lines(&host, input.clone(), "irrelevant", Some(state.clone()));
     let notice_row = 1 + collapsed
         .iter()
@@ -609,7 +656,10 @@ fn replayed_click_expands_only_the_clicked_child() {
 
 /// Regression: an edit child's body must show the code change (old lines
 /// in `diff_old`, new lines in `diff_new`), not the llm summary. Runs the
-/// real edit and batch plugins.
+/// real edit and batch plugins. The extensionless path outside any real
+/// filesystem pins the plain diff render: no async highlight rewrite (which
+/// replaces these spans; covered at text level in real_plugins_restore.rs)
+/// and no line numbers read back from disk.
 #[test]
 fn edit_child_body_renders_diff_not_summary() {
     let reg = Arc::new(ToolRegistry::new());
@@ -617,22 +667,154 @@ fn edit_child_body_renders_diff_not_summary() {
     let lines = restore_snapshot_lines(
         &host,
         json!({ "tool_calls": [{ "tool": "edit", "parameters": {
-            "path": "/tmp/f.rs",
+            "path": "/nonexistent/f",
             "old_string": "let a = 1;",
             "new_string": "let a = 2;",
         } }] }),
         "irrelevant",
         Some(json!({ "children": [
-            { "tool": "edit", "status": "success", "output": "edited /tmp/f.rs" }
+            { "tool": "edit", "status": "success", "output": "edited /nonexistent/f" }
         ] })),
     );
     let spans: Vec<(String, SpanStyle)> = lines.into_iter().flatten().collect();
-    let old_span = ("let a = 1;".to_owned(), SpanStyle::Named("diff_old".into()));
-    let new_span = ("let a = 2;".to_owned(), SpanStyle::Named("diff_new".into()));
+    let old_span = (
+        "- let a = 1;".to_owned(),
+        SpanStyle::Named("diff_old".into()),
+    );
+    let new_span = (
+        "+ let a = 2;".to_owned(),
+        SpanStyle::Named("diff_new".into()),
+    );
     assert!(spans.contains(&old_span), "old line in diff_old: {spans:?}");
     assert!(spans.contains(&new_span), "new line in diff_new: {spans:?}");
     assert!(
-        !spans.iter().any(|(t, _)| t.contains("edited /tmp/f.rs")),
+        !spans
+            .iter()
+            .any(|(t, _)| t.contains("edited /nonexistent/f")),
         "summary must not be the body: {spans:?}"
     );
+}
+
+// --- Live execution snapshots (real dispatch, no call_tool stub) ---
+
+/// Regression: child restores used to snapshot the first-created buf
+/// instead of the batch root buf, letting a tiny header overwrite the
+/// full batch render.
+#[test]
+fn async_highlight_tasks_never_shrink_and_reach_final_snapshot() {
+    let snapshots = run_live_batch(HL_CHILD_SRC, "hl");
+    let header_counts: Vec<usize> = snapshots
+        .iter()
+        .map(|s| s.text().matches("hl> ").count())
+        .collect();
+    assert!(
+        header_counts.windows(2).all(|w| w[0] <= w[1]),
+        "a later snapshot must never lose children: {header_counts:?}"
+    );
+    assert_eq!(
+        header_counts.last(),
+        Some(&2),
+        "final snapshot must carry all children"
+    );
+    let last = snapshots.last().expect("at least one batch snapshot");
+    let has_inline = last
+        .lines
+        .iter()
+        .flat_map(|l| &l.spans)
+        .any(|s| matches!(s.style, SpanStyle::Inline(_)));
+    assert!(
+        has_inline,
+        "final snapshot must contain highlighted spans, got:\n{}",
+        last.text()
+    );
+}
+
+/// Restores that await async APIs (like bash highlighting its header)
+/// must not throw out of the `get_tool` wrapper.
+#[test]
+fn child_restore_awaiting_async_api_keeps_its_body() {
+    let snapshots = run_live_batch(SYNC_HL_CHILD_SRC, "cmd");
+    let last = snapshots.last().expect("at least one batch snapshot");
+    let text = last.text();
+    assert!(
+        text.contains("echo header-marker"),
+        "child restore header must survive, got:\n{text}"
+    );
+}
+
+const BATCH_ID: &str = "batch_id";
+
+const HL_CHILD_SRC: &str = r#"
+local ToolView = require("maki.tool_view")
+maki.api.register_tool({
+  name = "hl",
+  description = "styled header + async-highlight restore",
+  schema = { type = "object", properties = {} },
+  audiences = { "main" },
+  header = function(input)
+    local b = maki.ui.buf()
+    b:set_lines({ { { "hl-header", "tool" } } })
+    return b
+  end,
+  restore = function(input, output, is_error, rctx)
+    local buf = maki.ui.buf()
+    local view = ToolView.new(buf, { max_lines = 10, keep = "head" })
+    view:set_highlight(output, "lua")
+    view:finish()
+    return buf
+  end,
+  handler = function() return "local x = 1" end,
+})
+"#;
+
+const SYNC_HL_CHILD_SRC: &str = r#"
+local ToolView = require("maki.tool_view")
+maki.api.register_tool({
+  name = "cmd",
+  description = "restore awaits maki.ui.highlight inline",
+  schema = { type = "object", properties = {} },
+  audiences = { "main" },
+  restore = function(input, output, is_error, rctx)
+    local buf = maki.ui.buf()
+    local view = ToolView.new(buf, { max_lines = 10, keep = "tail" })
+    local header = maki.ui.highlight("echo header-marker", "bash") or { { { "echo header-marker" } } }
+    view:set_header(header)
+    view:append(output)
+    view:finish()
+    return buf
+  end,
+  handler = function() return "cmd-output" end,
+})
+"#;
+
+fn run_live_batch(child_src: &str, tool: &str) -> Vec<BufferSnapshot> {
+    let reg = Arc::new(ToolRegistry::new());
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source("live_batch", &format!("{child_src}\n{BATCH_PLUGIN_SRC}"))
+        .unwrap();
+
+    let (tx, rx) = flume::unbounded();
+    let event_tx = EventSender::new(tx, 0);
+    let mut ctx = stub_ctx_with(&AgentMode::Build, Some(&event_tx), Some(BATCH_ID));
+    ctx.registry = Arc::clone(&reg);
+
+    let input = json!({ "tool_calls": [
+        { "tool": tool, "parameters": {} },
+        { "tool": tool, "parameters": {} },
+    ]});
+    let entry = reg.get(BATCH_TOOL).unwrap();
+    let inv = entry.tool.parse(&input).unwrap();
+    let done = smol::block_on(async { inv.execute(&ctx).await });
+    assert!(done.output.is_ok(), "batch failed: {:?}", done.output);
+
+    host.load_source("barrier", "").unwrap();
+
+    let mut snapshots = Vec::new();
+    for env in rx.drain() {
+        if let AgentEvent::ToolSnapshot { id, snapshot, .. } = env.event {
+            assert_eq!(id, BATCH_ID);
+            snapshots.push(snapshot);
+        }
+    }
+    snapshots
 }

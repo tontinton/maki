@@ -162,7 +162,9 @@ function ToolView:flush()
     end
 
     for i = 0, self.ring_count - 1 do
-      local idx = ((self.ring_start - 1 + i) % self.max) + 1
+      -- Modulo only after the ring wrapped: `x % math.huge` is NaN in Luau,
+      -- and uncapped views (max_lines = math.huge) never wrap.
+      local idx = self.ring_start == 1 and (i + 1) or (((self.ring_start - 1 + i) % self.max) + 1)
       lines[#lines + 1] = self.ring[idx]
     end
 

@@ -23,8 +23,18 @@ local NESTED_ERROR = "cannot nest batch inside batch"
 local CANCELLED_ERROR = "cancelled"
 local DISCARDED_ERROR = string.format("maximum of %d tools per batch", MAX_BATCH_SIZE)
 local SECTION_FMT = "## %s\n"
+local SECTION_PAT = "^## (.+)$"
+
+-- Anchored pattern matching exactly what a `%d`-only format produces, so
+-- the no-state parser can never drift from the render formats below.
+local function fmt_to_pat(fmt)
+  local pat = fmt:gsub("%%d", "\1"):gsub("[%^%$%(%)%.%[%]%*%+%-%?%%]", "%%%0"):gsub("\1", "%%d+")
+  return "^" .. pat .. "$"
+end
+
 local SUMMARY_MIXED_FMT = "Executed %d/%d successfully. %d failed."
 local SUMMARY_ALL_OK_FMT = "All %d tools executed successfully."
+local SUMMARY_PATS = { fmt_to_pat(SUMMARY_ALL_OK_FMT), fmt_to_pat(SUMMARY_MIXED_FMT) }
 local RESETTLE_FMT = "batch: child %s settled twice (%s -> %s)"
 
 local STATUS = { PENDING = "pending", RUNNING = "running", SUCCESS = "success", ERROR = "error" }
@@ -246,6 +256,55 @@ local function to_state(children)
   return { children = out }
 end
 
+-- Try to recover per-child results from `## tool` sections in the LLM
+-- output. Returns nil when the format doesn't match.
+local function children_from_llm(children, output)
+  if #children == 0 then
+    return nil
+  end
+  local sections = {}
+  local body, prev
+  for line in (output .. "\n"):gmatch("([^\n]*)\n") do
+    local tool = line:match(SECTION_PAT)
+    local nxt = children[#sections + 1]
+    -- render_llm puts a blank line before every header except the first;
+    -- demand the same, so a body line that merely looks like the next
+    -- header stays body text.
+    if tool and nxt and tool == nxt.tool and (prev == nil or prev == "") then
+      body = {}
+      sections[#sections + 1] = body
+    elseif body then
+      body[#body + 1] = line
+    else
+      return nil
+    end
+    prev = line
+  end
+  if #sections ~= #children then
+    return nil
+  end
+  local last = sections[#sections]
+  for _, pat in ipairs(SUMMARY_PATS) do
+    if last[#last] and last[#last]:match(pat) then
+      last[#last] = nil
+      break
+    end
+  end
+  local out = {}
+  for i, lines in ipairs(sections) do
+    while #lines > 0 and lines[#lines] == "" do
+      lines[#lines] = nil
+    end
+    local text = table.concat(lines, "\n")
+    local failed = text:sub(1, #ERROR_PREFIX) == ERROR_PREFIX
+    out[i] = {
+      status = failed and STATUS.ERROR or STATUS.SUCCESS,
+      output = failed and text:sub(#ERROR_PREFIX + 1) or text,
+    }
+  end
+  return out
+end
+
 --- Batch view-model ---------------------------------------------------------
 
 local Batch = {}
@@ -389,9 +448,7 @@ local function handler(input, ctx)
   }
 end
 
--- Old or foreign session with no structured state: headers are still a
--- pure function of the input, and the stored llm output becomes one
--- plain collapsible body.
+-- Last resort: no state, output isn't section-formatted.
 local function legacy_restore(children, output, tol)
   local buf = maki.ui.buf()
   local view = ToolView.new(buf, { max_lines = tol.other, keep = "head" })
@@ -416,11 +473,11 @@ local function restore(input, output, _is_error, rctx)
   end
 
   local st = rctx:state()
-  if st and type(st.children) == "table" and #st.children == #children then
-    -- Rehydrate before a Batch owns the children, and do not trust
-    -- storage: anything non-terminal there (corrupt or foreign) becomes
-    -- an error. Batch.new attaches the terminal bodies itself.
-    for i, sc in ipairs(st.children) do
+  local kids = st and type(st.children) == "table" and #st.children == #children and st.children
+    or children_from_llm(children, output)
+  if kids then
+    -- Non-terminal statuses are treated as errors (corrupt data).
+    for i, sc in ipairs(kids) do
       local c = children[i]
       c.status = TERMINAL[sc.status] and sc.status or STATUS.ERROR
       c.output, c.annotation = sc.output, sc.annotation
