@@ -968,8 +968,8 @@ where
         if path != canonical {
             if let Err(e) = SessionLog::write_canonical(dir, &session) {
                 warn!(error = %e, "failed migrate to canonical jsonl; keeping legacy file");
-            } else if let Err(e) = fs::remove_file(&path) {
-                warn!(error = %e, path = %path.display(), "legacy file remains after migration");
+            } else if let Err(e) = remove_legacy_files(dir, id) {
+                warn!(error = %e, "legacy files remain after migration");
             }
         }
         Ok(session)
@@ -1526,6 +1526,35 @@ mod tests {
         let loaded = TestSession::load_from(id, dir).unwrap();
         assert_eq!(loaded.messages.len(), 1);
         assert_eq!(loaded.messages[0], user_message("newer"));
+    }
+
+    #[test]
+    fn load_dual_legacy_files_does_not_leave_duplicate_in_list() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        let id: MakiId = LEGACY_HEX_ID.parse().unwrap();
+        let mut jsonl_session: TestSession = Session::new("m", "/project");
+        jsonl_session.id = id;
+        jsonl_session.messages.push(user_message("newer"));
+        let legacy_jsonl = dir.join(format!("{LEGACY_HEX_ID}.jsonl"));
+        write_legacy_jsonl(&legacy_jsonl, &jsonl_session);
+
+        let mut json_session: TestSession = Session::new("m", "/project");
+        json_session.id = id;
+        json_session.messages.push(user_message("older"));
+        let legacy_json = dir.join(format!("{LEGACY_HEX_ID}.json"));
+        fs::write(&legacy_json, serde_json::to_vec(&json_session).unwrap()).unwrap();
+
+        TestSession::load_from(id, dir).unwrap();
+
+        assert!(!legacy_json.exists(), "legacy .json sibling left behind");
+        let list = TestSession::list_in("/project", dir).unwrap();
+        assert_eq!(
+            list.len(),
+            1,
+            "session shows up more than once in the picker"
+        );
     }
 
     #[test]
