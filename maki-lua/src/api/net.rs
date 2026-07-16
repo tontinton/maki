@@ -4,9 +4,10 @@ use std::time::Duration;
 use futures_lite::io::AsyncReadExt;
 use isahc::config::{Configurable, RedirectPolicy};
 use isahc::{AsyncBody, HttpClient, Request};
+use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Lua, Result as LuaResult, Table, Value};
 
-use crate::plugin_permissions::{Permission::Net, PluginPermissions};
+use crate::plugin_permissions::PluginPermissions;
 
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 const MAX_TIMEOUT_SECS: u64 = 120;
@@ -33,37 +34,62 @@ struct ResponseData {
     content_type: String,
 }
 
-pub(crate) fn create_net_table(lua: &Lua, perms: &PluginPermissions) -> LuaResult<Table> {
-    let net = lua.create_table()?;
+/// Make an HTTP request and return the response body. Plain `http://`
+/// URLs are automatically upgraded to `https://`. Requests to private
+/// or metadata IP addresses are blocked for safety.
+///
+/// {opts} fields:
+///   `method` (string) HTTP verb (default `"GET"`).
+///   `headers` (table) Header name/value pairs.
+///   `body` (string) Request body.
+///   `timeout` (integer) Timeout in seconds, max 120 (default 30).
+///   `max_bytes` (integer) Max response size in bytes (default 5 MB).
+///   `retry` (integer) Retries on 5xx errors (default 3).
+///
+/// The response table has three fields: `body` (string), `status`
+/// (integer), and `content_type` (string).
+///
+/// @param url string URL starting with `http://` or `https://`.
+/// @param opts table? Request options (see above).
+/// @return (table?, string?) Response table, or nil plus an error string.
+/// @example
+/// local res, err = maki.net.request("https://httpbin.org/get")
+/// if err then
+///   print("failed: " .. err)
+/// else
+///   print(res.status, res.body)
+/// end
+#[lua_fn(guard = Net)]
+async fn request(lua: Lua, url: String, opts: Option<Table>) -> LuaResult<(Value, Value)> {
+    let params = match extract_request_params(&url, opts.as_ref()) {
+        Ok(p) => p,
+        Err(e) => return Ok((Value::Nil, Value::String(lua.create_string(&e)?))),
+    };
+    match do_request(params).await {
+        Ok(resp) => {
+            let tbl = lua.create_table()?;
+            tbl.set("body", resp.body)?;
+            tbl.set("status", resp.status)?;
+            tbl.set("content_type", resp.content_type)?;
+            Ok((Value::Table(tbl), Value::Nil))
+        }
+        Err(e) => Ok((Value::Nil, Value::String(lua.create_string(&e)?))),
+    }
+}
 
-    // Supports both Neovim's current vim.net.request(url, opts, on_response) signature
-    // and the proposed multi-method API: vim.net.request(url, opts) with opts.method.
-    // See: https://github.com/neovim/neovim/issues/38946
-    net.set(
-        "request",
-        perms.guard_async(
-            Net,
-            lua,
-            |lua, (url, opts): (String, Option<Table>)| async move {
-                let params = match extract_request_params(&url, opts.as_ref()) {
-                    Ok(p) => p,
-                    Err(e) => return Ok((Value::Nil, Value::String(lua.create_string(&e)?))),
-                };
-                match do_request(params).await {
-                    Ok(resp) => {
-                        let tbl = lua.create_table()?;
-                        tbl.set("body", resp.body)?;
-                        tbl.set("status", resp.status)?;
-                        tbl.set("content_type", resp.content_type)?;
-                        Ok((Value::Table(tbl), Value::Nil))
-                    }
-                    Err(e) => Ok((Value::Nil, Value::String(lua.create_string(&e)?))),
-                }
-            },
-        )?,
-    )?;
-
-    Ok(net)
+lua_table! {
+    /// HTTP client for fetching web content. All traffic goes over HTTPS
+    /// (plain HTTP is upgraded). Private and metadata IP addresses are
+    /// blocked to prevent SSRF. Failed requests (5xx) are retried
+    /// automatically.
+    ///
+    /// ```lua
+    /// local res, err = maki.net.request("https://example.com")
+    /// if res then print(res.body) end
+    /// ```
+    "maki.net" => pub(crate) fn create_net_table(perms: &PluginPermissions), DOCS [
+        request(perms),
+    ]
 }
 
 fn extract_request_params(url: &str, opts: Option<&Table>) -> Result<RequestParams, String> {

@@ -59,6 +59,7 @@
       --code-block-bg: #1E1E2E;
       --code-block-fg: oklch(86% 0.02 270);
       --sidebar-w: 240px;
+      --toc-w: 250px;
       --content-max: 740px;
       --nav-h: 54px;
       --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
@@ -352,7 +353,7 @@
     h2 {
       font-family: 'Fraunces', 'Georgia', serif;
       font-weight: 700;
-      font-size: clamp(1.25rem, 2.5vw, 1.5rem);
+      font-size: clamp(1.5rem, 3vw, 1.85rem);
       letter-spacing: -0.02em;
       line-height: 1.25;
       color: var(--deep-navy);
@@ -363,9 +364,10 @@
       content: '';
       display: block;
       width: 100%;
-      height: 1px;
-      background: linear-gradient(90deg, var(--h2-rule), transparent 80%);
-      margin-bottom: 1rem;
+      height: 3px;
+      border-radius: 2px;
+      background: linear-gradient(90deg, var(--accent), var(--periwinkle) 45%, transparent 85%);
+      margin-bottom: 1.25rem;
     }
 
     h3 {
@@ -497,6 +499,70 @@
       font-size: 0.94rem;
     }
     blockquote p:last-child { margin-bottom: 0; }
+
+    /* ── RIGHT TOC ── */
+    .toc {
+      display: none;
+      position: fixed;
+      top: var(--nav-h);
+      right: 0;
+      bottom: 0;
+      width: var(--toc-w);
+      overflow-y: auto;
+      padding: 1.75rem 1.25rem 2.5rem 0.5rem;
+      scrollbar-width: thin;
+    }
+    .toc::-webkit-scrollbar { width: 3px; }
+    .toc::-webkit-scrollbar-thumb { background: var(--sidebar-scrollbar); border-radius: 3px; }
+    .toc-label {
+      font-size: 0.68rem;
+      font-weight: 800;
+      text-transform: uppercase;
+      letter-spacing: 0.13em;
+      color: var(--sidebar-label-color);
+      margin-bottom: 0.5rem;
+      padding-left: 0.75rem;
+    }
+    .toc a {
+      display: block;
+      padding: 0.22rem 0.75rem;
+      font-size: 0.8rem;
+      font-weight: 700;
+      color: var(--text-muted);
+      text-decoration: none;
+      border-left: 2px solid transparent;
+      border-radius: 0 6px 6px 0;
+      line-height: 1.45;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      transition: color 0.15s, background 0.15s, border-color 0.15s;
+    }
+    .toc a:hover { color: var(--accent); background: var(--sidebar-hover-bg); }
+    .toc a.active {
+      color: var(--accent);
+      border-left-color: var(--accent);
+      background: var(--sidebar-active-bg);
+    }
+    .toc .toc-h3 {
+      padding-left: 1.6rem;
+      font-weight: 400;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.72rem;
+    }
+    .toc .toc-sub {
+      display: none;
+      margin-bottom: 0.2rem;
+    }
+    .toc .toc-group.open .toc-sub { display: block; }
+    @media (min-width: 1400px) {
+      .toc { display: block; }
+      body.has-toc .main-content {
+        margin-right: var(--toc-w);
+        max-width: none;
+      }
+      body.has-toc .content-inner { margin: 0 auto; }
+    }
 
     /* ── SEARCH ── */
     .search-box {
@@ -757,6 +823,8 @@
       {% block content %}{% endblock %}
     </div>
   </main>
+
+  {% block toc %}{% endblock %}
 </div>
 
 <script>
@@ -914,6 +982,49 @@
       firstMark.scrollIntoView({ behavior: 'smooth', block: 'center' });
     }
     history.replaceState(null, '', window.location.pathname);
+  }
+
+  // right-hand toc: shorten labels, scrollspy, accordion
+  const toc = document.getElementById('toc');
+  if (toc) {
+    document.body.classList.add('has-toc');
+    toc.querySelectorAll('.toc-group').forEach(group => {
+      const h2Text = group.querySelector('.toc-h2').textContent.trim();
+      group.querySelectorAll('.toc-h3').forEach(a => {
+        const t = a.textContent.trim();
+        if (t.startsWith(h2Text + '.')) a.textContent = t.slice(h2Text.length + 1);
+        else a.textContent = t;
+      });
+    });
+    const tocLinks = new Map();
+    toc.querySelectorAll('a').forEach(a => tocLinks.set(decodeURIComponent(a.hash.slice(1)), a));
+    const headings = [...document.querySelectorAll('.content-inner h2[id], .content-inner h3[id]')]
+      .filter(h => tocLinks.has(h.id));
+    let activeLink = null;
+    function updateToc() {
+      const offset = window.scrollY + 100;
+      let current = null;
+      for (const h of headings) {
+        if (h.offsetTop <= offset) current = h;
+        else break;
+      }
+      const link = current ? tocLinks.get(current.id) : null;
+      if (link === activeLink) return;
+      if (activeLink) activeLink.classList.remove('active');
+      toc.querySelectorAll('.toc-group.open').forEach(g => g.classList.remove('open'));
+      activeLink = link;
+      if (!link) return;
+      link.classList.add('active');
+      link.closest('.toc-group').classList.add('open');
+      const r = link.getBoundingClientRect();
+      const tr = toc.getBoundingClientRect();
+      if (r.top < tr.top + 40 || r.bottom > tr.bottom - 40) {
+        link.scrollIntoView({ block: 'center' });
+      }
+    }
+    window.addEventListener('scroll', updateToc, { passive: true });
+    window.addEventListener('hashchange', updateToc);
+    updateToc();
   }
 
   // "/" keyboard shortcut for search

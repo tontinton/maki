@@ -4,13 +4,11 @@ use std::fs::FileType;
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 
-use mlua::{IntoLua, Lua, Result as LuaResult, Table};
+use maki_lua_macro::{lua_fn, lua_table};
+use mlua::{IntoLua, Lua, Result as LuaResult, Table, Value};
 
 use crate::api::util::convert::err_pair;
-use crate::plugin_permissions::{
-    Permission::{FsRead, FsWrite},
-    PluginPermissions,
-};
+use crate::plugin_permissions::PluginPermissions;
 
 pub(crate) fn expand_tilde(path: &str) -> PathBuf {
     if let Some(rest) = path.strip_prefix("~/") {
@@ -106,451 +104,550 @@ fn result_pair<T: mlua::IntoLua, E: std::fmt::Display>(
     }
 }
 
-pub(crate) fn create_fs_table(lua: &Lua, perms: &PluginPermissions) -> LuaResult<Table> {
-    let t = lua.create_table()?;
+/// Read the entire file at {path} as a UTF-8 string.
+/// If the file contains bytes that are not valid UTF-8, this function throws.
+/// Use `read_bytes` for binary files.
+///
+/// @param path string Absolute or relative file path. `~/` is expanded to the home directory.
+/// @return (string?, string?) File contents, or nil plus an error message.
+/// @example
+/// local text, err = maki.fs.read("config.toml")
+/// if err then
+///   maki.log.warn("could not read config: " .. err)
+///   return
+/// end
+#[lua_fn(guard = FsRead)]
+async fn read(lua: Lua, path: String) -> LuaResult<(Value, Value)> {
+    let abs = make_absolute(&path)?;
+    match smol::fs::read_to_string(&abs).await {
+        Ok(s) => Ok((s.into_lua(&lua)?, Value::Nil)),
+        Err(e) if e.kind() == ErrorKind::InvalidData => {
+            Err(mlua::Error::runtime("non-utf8 content; use read_bytes"))
+        }
+        Err(e) => Ok((Value::Nil, Value::String(lua.create_string(e.to_string())?))),
+    }
+}
 
-    t.set(
-        "read",
-        perms.guard_async(FsRead, lua, |lua, path: String| async move {
-            let abs = make_absolute(&path)?;
-            match smol::fs::read_to_string(&abs).await {
-                Ok(s) => Ok((s.into_lua(&lua)?, mlua::Value::Nil)),
-                Err(e) if e.kind() == ErrorKind::InvalidData => {
-                    Err(mlua::Error::runtime("non-utf8 content; use read_bytes"))
-                }
-                Err(e) => Ok((
-                    mlua::Value::Nil,
-                    mlua::Value::String(lua.create_string(e.to_string())?),
-                )),
-            }
-        })?,
-    )?;
+/// Read the entire file at {path} as raw bytes, returned as a Luau buffer.
+/// Useful for binary files or when you need to pass the data to `maki.base64.encode`.
+///
+/// @param path string Absolute or relative file path. `~/` is expanded to the home directory.
+/// @return (buffer?, string?) File bytes as a Luau buffer, or nil plus an error message.
+/// @example
+/// local buf, err = maki.fs.read_bytes("image.png")
+/// if err then return end
+/// local encoded = maki.base64.encode(buf)
+#[lua_fn(guard = FsRead)]
+async fn read_bytes(lua: Lua, path: String) -> LuaResult<(Value, Value)> {
+    let abs = make_absolute(&path)?;
+    match smol::fs::read(&abs).await {
+        Ok(bytes) => Ok((lua.create_buffer(bytes)?.into_lua(&lua)?, Value::Nil)),
+        Err(e) => Ok((Value::Nil, Value::String(lua.create_string(e.to_string())?))),
+    }
+}
 
-    t.set(
-        "read_bytes",
-        perms.guard_async(FsRead, lua, |lua, path: String| async move {
-            let abs = make_absolute(&path)?;
-            match smol::fs::read(&abs).await {
-                Ok(bytes) => Ok((lua.create_buffer(bytes)?.into_lua(&lua)?, mlua::Value::Nil)),
-                Err(e) => Ok((
-                    mlua::Value::Nil,
-                    mlua::Value::String(lua.create_string(e.to_string())?),
-                )),
-            }
-        })?,
-    )?;
-
-    t.set(
-        "metadata",
-        perms.guard_async(FsRead, lua, |lua, path: String| async move {
-            let abs = make_absolute(&path)?;
-            match smol::fs::metadata(&abs).await {
-                Ok(meta) => {
-                    let tbl = lua.create_table()?;
-                    tbl.set("size", meta.len())?;
-                    tbl.set("is_file", meta.is_file())?;
-                    tbl.set("is_dir", meta.is_dir())?;
-                    Ok((mlua::Value::Table(tbl), mlua::Value::Nil))
-                }
-                Err(e) if e.kind() == ErrorKind::NotFound => {
-                    Ok((mlua::Value::Nil, mlua::Value::Nil))
-                }
-                Err(e) => Ok((
-                    mlua::Value::Nil,
-                    mlua::Value::String(lua.create_string(e.to_string())?),
-                )),
-            }
-        })?,
-    )?;
-
-    // vim.fs-compatible path utilities
-
-    t.set(
-        "dirname",
-        lua.create_function(|_, file: String| {
-            Ok(Path::new(&file)
-                .parent()
-                .and_then(|p| p.to_str())
-                .map(|s| s.to_owned()))
-        })?,
-    )?;
-
-    t.set(
-        "basename",
-        lua.create_function(|_, file: String| {
-            Ok(Path::new(&file)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .map(|s| s.to_owned()))
-        })?,
-    )?;
-
-    t.set(
-        "joinpath",
-        lua.create_function(|_, parts: mlua::Variadic<String>| {
-            let mut buf = PathBuf::new();
-            for part in parts.iter() {
-                buf.push(part);
-            }
-            path_to_string(&buf)
-        })?,
-    )?;
-
-    t.set(
-        "normalize",
-        lua.create_function(|_, path: String| {
-            let abs = make_absolute(&path)?;
-            let mut components = Vec::new();
-            for comp in abs.components() {
-                match comp {
-                    Component::ParentDir => {
-                        components.pop();
-                    }
-                    Component::CurDir => {}
-                    _ => components.push(comp),
-                }
-            }
-            let result: PathBuf = components.iter().collect();
-            path_to_string(&result)
-        })?,
-    )?;
-
-    t.set(
-        "abspath",
-        lua.create_function(|_, path: String| path_to_string(&make_absolute(&path)?))?,
-    )?;
-
-    t.set(
-        "parents",
-        lua.create_function(|lua, start: String| {
-            let p = Path::new(&start);
+/// Get metadata for the file or directory at {path}.
+/// Returns a table with `size` (integer), `is_file` (boolean), and `is_dir` (boolean).
+/// If {path} does not exist, returns nil with no error.
+///
+/// @param path string Absolute or relative path.
+/// @return (table?, string?) Metadata table, nil if missing, or nil plus an error message.
+/// @example
+/// local meta = maki.fs.metadata("src/main.rs")
+/// if meta and meta.is_file then
+///   print("size: " .. meta.size)
+/// end
+#[lua_fn(guard = FsRead)]
+async fn metadata(lua: Lua, path: String) -> LuaResult<(Value, Value)> {
+    let abs = make_absolute(&path)?;
+    match smol::fs::metadata(&abs).await {
+        Ok(meta) => {
             let tbl = lua.create_table()?;
-            let mut i = 1;
-            let mut current = p.parent();
-            while let Some(parent) = current {
-                if let Some(s) = parent.to_str() {
-                    tbl.set(i, s)?;
-                    i += 1;
-                }
-                current = parent.parent();
+            tbl.set("size", meta.len())?;
+            tbl.set("is_file", meta.is_file())?;
+            tbl.set("is_dir", meta.is_dir())?;
+            Ok((Value::Table(tbl), Value::Nil))
+        }
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok((Value::Nil, Value::Nil)),
+        Err(e) => Ok((Value::Nil, Value::String(lua.create_string(e.to_string())?))),
+    }
+}
+
+/// Return the parent directory of {path}. Like `vim.fs.dirname`.
+///
+/// @param path string File path.
+/// @return (string?) Parent directory, or nil if {path} has no parent.
+/// @example
+/// maki.fs.dirname("/home/user/init.lua") -- "/home/user"
+#[lua_fn]
+fn dirname(_lua: &Lua, path: String) -> LuaResult<Option<String>> {
+    Ok(Path::new(&path)
+        .parent()
+        .and_then(|p| p.to_str())
+        .map(|s| s.to_owned()))
+}
+
+/// Return the final component (the file name) of {path}. Like `vim.fs.basename`.
+///
+/// @param path string File path.
+/// @return (string?) File name, or nil for paths like `/`.
+/// @example
+/// maki.fs.basename("/home/user/init.lua") -- "init.lua"
+#[lua_fn]
+fn basename(_lua: &Lua, path: String) -> LuaResult<Option<String>> {
+    Ok(Path::new(&path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|s| s.to_owned()))
+}
+
+/// Join one or more path segments into a single path. Like `vim.fs.joinpath`.
+///
+/// @param parts string One or more path segments to join.
+/// @return (string) The joined path.
+/// @example
+/// maki.fs.joinpath("src", "api", "fs.rs") -- "src/api/fs.rs"
+#[lua_fn]
+fn joinpath(_lua: &Lua, parts: mlua::Variadic<String>) -> LuaResult<String> {
+    let mut buf = PathBuf::new();
+    for part in parts.iter() {
+        buf.push(part);
+    }
+    path_to_string(&buf)
+}
+
+/// Clean up `.` and `..` segments and make {path} absolute. Like `vim.fs.normalize`.
+/// This is purely string-based and does not touch the filesystem.
+///
+/// @param path string Path to normalize. `~/` is expanded.
+/// @return (string) Normalized absolute path.
+/// @example
+/// maki.fs.normalize("src/../src/api") -- "/home/user/project/src/api"
+#[lua_fn]
+fn normalize(_lua: &Lua, path: String) -> LuaResult<String> {
+    let abs = make_absolute(&path)?;
+    let mut components = Vec::new();
+    for comp in abs.components() {
+        match comp {
+            Component::ParentDir => {
+                components.pop();
             }
-            Ok(tbl)
-        })?,
-    )?;
+            Component::CurDir => {}
+            _ => components.push(comp),
+        }
+    }
+    let result: PathBuf = components.iter().collect();
+    path_to_string(&result)
+}
 
-    t.set(
-        "root",
-        perms.guard_async(
-            FsRead,
-            lua,
-            |_, (source, marker): (String, mlua::Value)| async move {
-                let markers: Vec<String> = match marker {
-                    mlua::Value::String(s) => vec![s.to_str()?.to_owned()],
-                    mlua::Value::Table(t) => {
-                        let mut v = Vec::new();
-                        for pair in t.sequence_values::<String>() {
-                            v.push(pair?);
-                        }
-                        v
-                    }
-                    _ => {
-                        return Err(mlua::Error::runtime(
-                            "fs.root: marker must be a string or list of strings",
-                        ));
-                    }
-                };
+/// Make {path} absolute by prepending the current working directory when needed.
+/// Unlike `normalize`, this does not resolve `.` or `..` segments.
+///
+/// @param path string Relative or absolute path. `~/` is expanded.
+/// @return (string) Absolute path.
+/// @example
+/// maki.fs.abspath("src/main.rs") -- "/home/user/project/src/main.rs"
+#[lua_fn]
+fn abspath(_lua: &Lua, path: String) -> LuaResult<String> {
+    path_to_string(&make_absolute(&path)?)
+}
 
-                smol::unblock(move || {
-                    let start = Path::new(&source);
-                    let start = if start.is_file() || !start.exists() {
-                        start.parent().unwrap_or(start)
-                    } else {
-                        start
-                    };
+/// Return all ancestor directories of {path}, from the immediate parent up to the root.
+/// Handy for walking up a directory tree.
+///
+/// @param path string File or directory path.
+/// @return (string[]) Array of ancestor directory paths.
+/// @example
+/// local dirs = maki.fs.parents("/home/user/project/src")
+/// -- { "/home/user/project", "/home/user", "/home", "/" }
+#[lua_fn]
+fn parents(lua: &Lua, path: String) -> LuaResult<Table> {
+    let p = Path::new(&path);
+    let tbl = lua.create_table()?;
+    let mut i = 1;
+    let mut current = p.parent();
+    while let Some(parent) = current {
+        if let Some(s) = parent.to_str() {
+            tbl.set(i, s)?;
+            i += 1;
+        }
+        current = parent.parent();
+    }
+    Ok(tbl)
+}
 
-                    let mut dir = make_absolute(start.to_str().unwrap_or_default())?;
+/// Walk upward from {source} looking for a directory that contains one of the
+/// {marker} files or directories. Like `vim.fs.root`. Useful for finding the
+/// project root.
+///
+/// @param source string Starting file or directory path.
+/// @param marker string|string[] Marker filename(s) to look for, e.g. `".git"` or `{"package.json", ".git"}`.
+/// @return (string?, string?) Root directory path, or nil when not found.
+/// @example
+/// local root = maki.fs.root("src/main.rs", { ".git", "Cargo.toml" })
+/// if root then print("project root: " .. root) end
+#[lua_fn(guard = FsRead)]
+async fn root(_lua: Lua, source: String, marker: Value) -> LuaResult<Option<String>> {
+    let markers: Vec<String> = match marker {
+        Value::String(s) => vec![s.to_str()?.to_owned()],
+        Value::Table(t) => {
+            let mut v = Vec::new();
+            for pair in t.sequence_values::<String>() {
+                v.push(pair?);
+            }
+            v
+        }
+        _ => {
+            return Err(mlua::Error::runtime(
+                "fs.root: marker must be a string or list of strings",
+            ));
+        }
+    };
 
-                    loop {
-                        for m in &markers {
-                            if dir.join(m).exists() {
-                                return Ok(Some(path_to_string(&dir)?));
-                            }
-                        }
-                        if !dir.pop() {
-                            return Ok(None);
-                        }
-                    }
+    smol::unblock(move || {
+        let start = Path::new(&source);
+        let start = if start.is_file() || !start.exists() {
+            start.parent().unwrap_or(start)
+        } else {
+            start
+        };
+
+        let mut dir = make_absolute(start.to_str().unwrap_or_default())?;
+
+        loop {
+            for m in &markers {
+                if dir.join(m).exists() {
+                    return Ok(Some(path_to_string(&dir)?));
+                }
+            }
+            if !dir.pop() {
+                return Ok(None);
+            }
+        }
+    })
+    .await
+}
+
+/// Compute a relative path from {base} to {target}.
+///
+/// @param base string Base directory path.
+/// @param target string Target path.
+/// @return (string) Relative path from {base} to {target}.
+/// @example
+/// maki.fs.relpath("/home/user", "/home/user/project/src") -- "project/src"
+#[lua_fn]
+fn relpath(_lua: &Lua, base: String, target: String) -> LuaResult<String> {
+    let base_comps: Vec<_> = Path::new(&base).components().collect();
+    let target_comps: Vec<_> = Path::new(&target).components().collect();
+
+    let common = base_comps
+        .iter()
+        .zip(target_comps.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+
+    let mut result = PathBuf::new();
+    for _ in common..base_comps.len() {
+        result.push("..");
+    }
+    for comp in &target_comps[common..] {
+        result.push(comp);
+    }
+    path_to_string(&result)
+}
+
+/// Return the file extension of {path}, without the leading dot.
+///
+/// @param path string File path.
+/// @return (string?) Extension, or nil if the path has no extension.
+/// @example
+/// maki.fs.ext("main.rs")   -- "rs"
+/// maki.fs.ext("Makefile")  -- nil
+#[lua_fn]
+fn ext(_lua: &Lua, path: String) -> LuaResult<Option<String>> {
+    Ok(Path::new(&path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_owned()))
+}
+
+/// List the contents of the directory at {path}.
+/// Each entry is a two-element array `{name, type}` where type is one of
+/// `"file"`, `"directory"`, `"link"`, or `"unknown"`. Follows symlinks.
+///
+/// @param path string Directory path.
+/// @param opts table? `depth` (integer, default 1): how many levels deep to recurse.
+/// @return (table?, string?) Array of `{name, type}` entries, or nil plus an error message.
+/// @example
+/// local entries, err = maki.fs.dir("src", { depth = 2 })
+/// if err then return end
+/// for _, e in ipairs(entries) do
+///   print(e[1], e[2]) -- "main.rs"  "file"
+/// end
+#[lua_fn(guard = FsRead)]
+async fn dir(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<(Value, Value)> {
+    let abs = make_absolute(&path)?;
+    let max_depth: u32 = match &opts {
+        Some(t) => t.get::<u32>("depth").unwrap_or(1),
+        None => 1,
+    };
+
+    let result = smol::unblock(move || -> Result<Vec<(String, &'static str)>, String> {
+        if !abs.exists() {
+            return Err(format!("dir: path does not exist: {}", abs.display()));
+        }
+        if !abs.is_dir() {
+            return Err(format!("dir: not a directory: {}", abs.display()));
+        }
+        let mut out = Vec::new();
+        let mut visited = HashSet::new();
+        collect_dir_entries(&abs, &abs, 1, max_depth, &mut visited, &mut out);
+        Ok(out)
+    })
+    .await;
+
+    match result {
+        Ok(entries) => {
+            let tbl = lua.create_table()?;
+            for (i, (name, typ)) in entries.iter().enumerate() {
+                let entry = lua.create_table()?;
+                entry.set(1, name.as_str())?;
+                entry.set(2, *typ)?;
+                tbl.set(i + 1, entry)?;
+            }
+            Ok((Value::Table(tbl), Value::Nil))
+        }
+        Err(e) => err_pair(&lua, e),
+    }
+}
+
+/// Write {content} to the file at {path}, creating it if it does not exist
+/// or overwriting it if it does.
+///
+/// @param path string Destination file path. `~/` is expanded.
+/// @param content string Text to write.
+/// @return (true?, string?) `true` on success, or nil plus an error message.
+/// @example
+/// local ok, err = maki.fs.write("out.txt", "hello world")
+/// if err then print("write failed: " .. err) end
+#[lua_fn(guard = FsWrite)]
+async fn write(lua: Lua, path: String, content: String) -> LuaResult<(Value, Value)> {
+    let abs = make_absolute(&path)?;
+    result_pair(&lua, smol::fs::write(&abs, content).await.map(|()| true))
+}
+
+/// Delete the file at {path}. Does not remove directories.
+///
+/// @param path string Path to the file to remove.
+/// @return (true?, string?) `true` on success, or nil plus an error message.
+/// @example
+/// local ok, err = maki.fs.rm("temp.txt")
+/// if err then print("rm failed: " .. err) end
+#[lua_fn(guard = FsWrite)]
+async fn rm(lua: Lua, path: String) -> LuaResult<(Value, Value)> {
+    let abs = make_absolute(&path)?;
+    result_pair(&lua, smol::fs::remove_file(&abs).await.map(|()| true))
+}
+
+/// Create the directory at {path}. Set `parents = true` to create
+/// intermediate directories, like `mkdir -p`.
+///
+/// @param path string Directory path to create.
+/// @param opts table? `parents` (boolean, default false): create intermediate parent directories.
+/// @return (true?, string?) `true` on success, or nil plus an error message.
+/// @example
+/// maki.fs.mkdir("a/b/c", { parents = true })
+#[lua_fn(guard = FsWrite)]
+async fn mkdir(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<(Value, Value)> {
+    let abs = make_absolute(&path)?;
+    let parents = opts
+        .as_ref()
+        .and_then(|t| t.get::<bool>("parents").ok())
+        .unwrap_or(false);
+    let result = if parents {
+        smol::fs::create_dir_all(&abs).await
+    } else {
+        smol::fs::create_dir(&abs).await
+    };
+    result_pair(&lua, result.map(|()| true))
+}
+
+/// Find files matching one or more glob patterns.
+/// Respects `.gitignore` by default. Pass `sort = "mtime"` to get the most
+/// recently modified files first.
+///
+/// @param pattern string|string[] Glob pattern or array of patterns.
+/// @param opts table? `path` (string): search root. `limit` (integer): max results. `gitignore` (boolean, default true): respect .gitignore. `sort` (string): `"mtime"` sorts newest first.
+/// @return (string[]?, string?) Array of absolute file paths, or nil plus an error message.
+/// @example
+/// local files, err = maki.fs.glob("**/*.lua", { path = "plugins", limit = 10 })
+/// if err then return end
+/// for _, f in ipairs(files) do print(f) end
+#[lua_fn(guard = FsRead)]
+async fn glob(lua: Lua, pattern: Value, opts: Option<Table>) -> LuaResult<(Value, Value)> {
+    let patterns: Vec<String> = match pattern {
+        Value::String(s) => vec![s.to_str()?.to_owned()],
+        Value::Table(t) => {
+            let mut v = Vec::new();
+            for val in t.sequence_values::<String>() {
+                v.push(val?);
+            }
+            v
+        }
+        _ => {
+            return Err(mlua::Error::runtime(
+                "glob: patterns must be a string or array of strings",
+            ));
+        }
+    };
+
+    let path = opts.as_ref().and_then(|t| t.get::<String>("path").ok());
+    let limit = opts.as_ref().and_then(|t| t.get::<usize>("limit").ok());
+    let gitignore = opts
+        .as_ref()
+        .and_then(|t| t.get::<bool>("gitignore").ok())
+        .unwrap_or(true);
+    let sort = opts.as_ref().and_then(|t| t.get::<String>("sort").ok());
+    let sort_mtime = sort.as_deref() == Some("mtime");
+
+    let result: Result<Vec<String>, String> = smol::unblock(move || {
+        let root = maki_agent::tools::resolve_search_path(path.as_deref())?;
+        let pattern_refs: Vec<&str> = patterns.iter().map(|s| s.as_str()).collect();
+
+        let walker = maki_agent::tools::walk_builder_opts(&root, &pattern_refs, gitignore)?.build();
+
+        let iter = walker
+            .flatten()
+            .filter(|e| e.file_type().is_some_and(|ft| ft.is_file()));
+
+        let paths: Vec<String> = if sort_mtime {
+            let mut entries: Vec<_> = iter
+                .filter_map(|e| {
+                    let p = e.into_path();
+                    let mt = maki_agent::tools::mtime(&p);
+                    p.to_str().map(|s| (mt, s.to_owned()))
                 })
-                .await
-            },
-        )?,
-    )?;
-
-    t.set(
-        "relpath",
-        lua.create_function(|_, (base, target): (String, String)| {
-            let base_comps: Vec<_> = Path::new(&base).components().collect();
-            let target_comps: Vec<_> = Path::new(&target).components().collect();
-
-            let common = base_comps
-                .iter()
-                .zip(target_comps.iter())
-                .take_while(|(a, b)| a == b)
-                .count();
-
-            let mut result = PathBuf::new();
-            for _ in common..base_comps.len() {
-                result.push("..");
+                .collect();
+            entries.sort_unstable_by_key(|e| Reverse(e.0));
+            if let Some(lim) = limit {
+                entries.truncate(lim);
             }
-            for comp in &target_comps[common..] {
-                result.push(comp);
+            entries.into_iter().map(|(_, s)| s).collect()
+        } else {
+            let bounded: Box<dyn Iterator<Item = _>> = match limit {
+                Some(lim) => Box::new(iter.take(lim)),
+                None => Box::new(iter),
+            };
+            bounded
+                .filter_map(|e| e.into_path().to_str().map(|s| s.to_owned()))
+                .collect()
+        };
+
+        Ok(paths)
+    })
+    .await;
+
+    match result {
+        Ok(paths) => {
+            let tbl = lua.create_table()?;
+            for (i, path) in paths.iter().enumerate() {
+                tbl.set(i + 1, path.as_str())?;
             }
-            path_to_string(&result)
-        })?,
-    )?;
+            Ok((Value::Table(tbl), Value::Nil))
+        }
+        Err(e) => err_pair(&lua, format_args!("glob: {e}")),
+    }
+}
 
-    t.set(
-        "ext",
-        lua.create_function(|_, file: String| {
-            Ok(Path::new(&file)
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(|s| s.to_owned()))
-        })?,
-    )?;
+/// Search file contents for a regex {pattern}. Returns structured matches
+/// grouped by file, similar to ripgrep output.
+///
+/// Each result entry has a `path` and a list of `groups`. Each group contains
+/// `lines`, where every line has `line_nr`, `text`, and `is_match`.
+///
+/// @param pattern string Regular expression to search for.
+/// @param opts table? `path` (string): search root. `include` (string): file glob filter (e.g. `"*.rs"`). `context_before` / `context_after` (integer): context lines around matches. `limit` (integer): max match groups. `max_line_bytes` (integer): skip lines longer than this.
+/// @return (table?, string?) Array of `{path, groups}` tables, or nil plus an error message.
+/// @example
+/// local hits, err = maki.fs.grep("TODO", { path = "src", include = "*.rs", limit = 5 })
+/// if err then return end
+/// for _, file in ipairs(hits) do
+///   for _, g in ipairs(file.groups) do
+///     for _, line in ipairs(g.lines) do
+///       if line.is_match then print(file.path .. ":" .. line.line_nr) end
+///     end
+///   end
+/// end
+#[lua_fn(guard = FsRead)]
+async fn grep(lua: Lua, pattern: String, opts: Option<Table>) -> LuaResult<(Value, Value)> {
+    let mut params = maki_agent::tools::grep::GrepParams::new(pattern);
+    if let Some(ref opts) = opts {
+        if let Ok(v) = opts.get::<String>("path") {
+            params.path = Some(v);
+        }
+        if let Ok(v) = opts.get::<String>("include") {
+            params.include = Some(v);
+        }
+        if let Ok(v) = opts.get::<usize>("context_before") {
+            params.context_before = v;
+        }
+        if let Ok(v) = opts.get::<usize>("context_after") {
+            params.context_after = v;
+        }
+        if let Ok(v) = opts.get::<usize>("limit") {
+            params.limit = v;
+        }
+        if let Ok(v) = opts.get::<usize>("max_line_bytes") {
+            params.max_line_bytes = v;
+        }
+    }
 
-    t.set(
-        "dir",
-        perms.guard_async(
-            FsRead,
-            lua,
-            |lua, (path, opts): (String, Option<Table>)| async move {
-                let abs = make_absolute(&path)?;
-                let max_depth: u32 = match &opts {
-                    Some(t) => t.get::<u32>("depth").unwrap_or(1),
-                    None => 1,
-                };
+    let result = smol::unblock(move || maki_agent::tools::grep::grep_search(params)).await;
 
-                let result =
-                    smol::unblock(move || -> Result<Vec<(String, &'static str)>, String> {
-                        if !abs.exists() {
-                            return Err(format!("dir: path does not exist: {}", abs.display()));
-                        }
-                        if !abs.is_dir() {
-                            return Err(format!("dir: not a directory: {}", abs.display()));
-                        }
-                        let mut out = Vec::new();
-                        let mut visited = HashSet::new();
-                        collect_dir_entries(&abs, &abs, 1, max_depth, &mut visited, &mut out);
-                        Ok(out)
-                    })
-                    .await;
-
-                match result {
-                    Ok(entries) => {
-                        let tbl = lua.create_table()?;
-                        for (i, (name, typ)) in entries.iter().enumerate() {
-                            let entry = lua.create_table()?;
-                            entry.set(1, name.as_str())?;
-                            entry.set(2, *typ)?;
-                            tbl.set(i + 1, entry)?;
-                        }
-                        Ok((mlua::Value::Table(tbl), mlua::Value::Nil))
+    match result {
+        Ok((base, entries)) => {
+            let arr = lua.create_table()?;
+            for (i, entry) in entries.iter().enumerate() {
+                let etbl = lua.create_table()?;
+                etbl.set("path", base.join(&entry.path).to_string_lossy().as_ref())?;
+                let groups_tbl = lua.create_table()?;
+                for (gi, group) in entry.groups.iter().enumerate() {
+                    let gtbl = lua.create_table()?;
+                    let lines_tbl = lua.create_table()?;
+                    for (li, line) in group.lines.iter().enumerate() {
+                        let ltbl = lua.create_table()?;
+                        ltbl.set("line_nr", line.line_nr)?;
+                        ltbl.set("text", line.text.as_str())?;
+                        ltbl.set("is_match", line.is_match)?;
+                        lines_tbl.set(li + 1, ltbl)?;
                     }
-                    Err(e) => err_pair(&lua, e),
+                    gtbl.set("lines", lines_tbl)?;
+                    groups_tbl.set(gi + 1, gtbl)?;
                 }
-            },
-        )?,
-    )?;
+                etbl.set("groups", groups_tbl)?;
+                arr.set(i + 1, etbl)?;
+            }
+            Ok((Value::Table(arr), Value::Nil))
+        }
+        Err(e) => Ok((Value::Nil, Value::String(lua.create_string(e)?))),
+    }
+}
 
-    t.set(
-        "write",
-        perms.guard_async(
-            FsWrite,
-            lua,
-            |lua, (path, content): (String, String)| async move {
-                let abs = make_absolute(&path)?;
-                result_pair(&lua, smol::fs::write(&abs, content).await.map(|()| true))
-            },
-        )?,
-    )?;
-
-    t.set(
-        "rm",
-        perms.guard_async(FsWrite, lua, |lua, path: String| async move {
-            let abs = make_absolute(&path)?;
-            result_pair(&lua, smol::fs::remove_file(&abs).await.map(|()| true))
-        })?,
-    )?;
-
-    t.set(
-        "mkdir",
-        perms.guard_async(
-            FsWrite,
-            lua,
-            |lua, (path, opts): (String, Option<Table>)| async move {
-                let abs = make_absolute(&path)?;
-                let parents = opts
-                    .as_ref()
-                    .and_then(|t| t.get::<bool>("parents").ok())
-                    .unwrap_or(false);
-                let result = if parents {
-                    smol::fs::create_dir_all(&abs).await
-                } else {
-                    smol::fs::create_dir(&abs).await
-                };
-                result_pair(&lua, result.map(|()| true))
-            },
-        )?,
-    )?;
-
-    t.set(
-        "glob",
-        perms.guard_async(
-            FsRead,
-            lua,
-            |lua, (patterns, opts): (mlua::Value, Option<Table>)| async move {
-                let patterns: Vec<String> = match patterns {
-                    mlua::Value::String(s) => vec![s.to_str()?.to_owned()],
-                    mlua::Value::Table(t) => {
-                        let mut v = Vec::new();
-                        for val in t.sequence_values::<String>() {
-                            v.push(val?);
-                        }
-                        v
-                    }
-                    _ => {
-                        return Err(mlua::Error::runtime(
-                            "glob: patterns must be a string or array of strings",
-                        ));
-                    }
-                };
-
-                let path = opts.as_ref().and_then(|t| t.get::<String>("path").ok());
-                let limit = opts.as_ref().and_then(|t| t.get::<usize>("limit").ok());
-                let gitignore = opts
-                    .as_ref()
-                    .and_then(|t| t.get::<bool>("gitignore").ok())
-                    .unwrap_or(true);
-                let sort = opts.as_ref().and_then(|t| t.get::<String>("sort").ok());
-                let sort_mtime = sort.as_deref() == Some("mtime");
-
-                let result: Result<Vec<String>, String> = smol::unblock(move || {
-                    let root = maki_agent::tools::resolve_search_path(path.as_deref())?;
-                    let pattern_refs: Vec<&str> = patterns.iter().map(|s| s.as_str()).collect();
-
-                    let walker =
-                        maki_agent::tools::walk_builder_opts(&root, &pattern_refs, gitignore)?
-                            .build();
-
-                    let iter = walker
-                        .flatten()
-                        .filter(|e| e.file_type().is_some_and(|ft| ft.is_file()));
-
-                    let paths: Vec<String> = if sort_mtime {
-                        let mut entries: Vec<_> = iter
-                            .filter_map(|e| {
-                                let p = e.into_path();
-                                let mt = maki_agent::tools::mtime(&p);
-                                p.to_str().map(|s| (mt, s.to_owned()))
-                            })
-                            .collect();
-                        entries.sort_unstable_by_key(|e| Reverse(e.0));
-                        if let Some(lim) = limit {
-                            entries.truncate(lim);
-                        }
-                        entries.into_iter().map(|(_, s)| s).collect()
-                    } else {
-                        let bounded: Box<dyn Iterator<Item = _>> = match limit {
-                            Some(lim) => Box::new(iter.take(lim)),
-                            None => Box::new(iter),
-                        };
-                        bounded
-                            .filter_map(|e| e.into_path().to_str().map(|s| s.to_owned()))
-                            .collect()
-                    };
-
-                    Ok(paths)
-                })
-                .await;
-
-                match result {
-                    Ok(paths) => {
-                        let tbl = lua.create_table()?;
-                        for (i, path) in paths.iter().enumerate() {
-                            tbl.set(i + 1, path.as_str())?;
-                        }
-                        Ok((mlua::Value::Table(tbl), mlua::Value::Nil))
-                    }
-                    Err(e) => err_pair(&lua, format_args!("glob: {e}")),
-                }
-            },
-        )?,
-    )?;
-
-    t.set(
-        "grep",
-        perms.guard_async(
-            FsRead,
-            lua,
-            |lua, (pattern, opts): (String, Option<Table>)| async move {
-                let mut params = maki_agent::tools::grep::GrepParams::new(pattern);
-                if let Some(ref opts) = opts {
-                    if let Ok(v) = opts.get::<String>("path") {
-                        params.path = Some(v);
-                    }
-                    if let Ok(v) = opts.get::<String>("include") {
-                        params.include = Some(v);
-                    }
-                    if let Ok(v) = opts.get::<usize>("context_before") {
-                        params.context_before = v;
-                    }
-                    if let Ok(v) = opts.get::<usize>("context_after") {
-                        params.context_after = v;
-                    }
-                    if let Ok(v) = opts.get::<usize>("limit") {
-                        params.limit = v;
-                    }
-                    if let Ok(v) = opts.get::<usize>("max_line_bytes") {
-                        params.max_line_bytes = v;
-                    }
-                }
-
-                let result =
-                    smol::unblock(move || maki_agent::tools::grep::grep_search(params)).await;
-
-                match result {
-                    Ok((base, entries)) => {
-                        let arr = lua.create_table()?;
-                        for (i, entry) in entries.iter().enumerate() {
-                            let etbl = lua.create_table()?;
-                            etbl.set("path", base.join(&entry.path).to_string_lossy().as_ref())?;
-                            let groups_tbl = lua.create_table()?;
-                            for (gi, group) in entry.groups.iter().enumerate() {
-                                let gtbl = lua.create_table()?;
-                                let lines_tbl = lua.create_table()?;
-                                for (li, line) in group.lines.iter().enumerate() {
-                                    let ltbl = lua.create_table()?;
-                                    ltbl.set("line_nr", line.line_nr)?;
-                                    ltbl.set("text", line.text.as_str())?;
-                                    ltbl.set("is_match", line.is_match)?;
-                                    lines_tbl.set(li + 1, ltbl)?;
-                                }
-                                gtbl.set("lines", lines_tbl)?;
-                                groups_tbl.set(gi + 1, gtbl)?;
-                            }
-                            etbl.set("groups", groups_tbl)?;
-                            arr.set(i + 1, etbl)?;
-                        }
-                        Ok((mlua::Value::Table(arr), mlua::Value::Nil))
-                    }
-                    Err(e) => Ok((mlua::Value::Nil, mlua::Value::String(lua.create_string(e)?))),
-                }
-            },
-        )?,
-    )?;
-
-    Ok(t)
+lua_table! {
+    /// File-system utilities, modelled after `vim.fs` and `vim.uv`.
+    ///
+    /// Fallible operations return `(value, err)` pairs and never throw.
+    /// Paths support `~/` expansion. Relative paths resolve from the current working directory.
+    ///
+    /// ```lua
+    /// local text, err = maki.fs.read("init.lua")
+    /// if err then return end
+    /// ```
+    "maki.fs" => pub(crate) fn create_fs_table(perms: &PluginPermissions), DOCS [
+        read(perms), read_bytes(perms), metadata(perms), dirname, basename,
+        joinpath, normalize, abspath, parents, root(perms), relpath, ext,
+        dir(perms), write(perms), rm(perms), mkdir(perms), glob(perms), grep(perms),
+    ]
 }
 
 #[cfg(test)]

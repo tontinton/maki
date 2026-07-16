@@ -1,10 +1,11 @@
-//! Mirrors Neovim's `vim.base64`: `encode(str)` / `decode(str)`.
-//! Accepts Luau buffers as well as strings so `maki.fs.read_bytes` output
-//! feeds straight in.
+//! Base64 encoding and decoding, modelled after `vim.base64`.
+//! Accepts both strings and Luau buffers, so you can pipe
+//! `maki.fs.read_bytes` output straight into `encode`.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use mlua::{Lua, Result as LuaResult, Table, Value as LuaValue};
+use maki_lua_macro::{lua_fn, lua_table};
+use mlua::{Lua, Result as LuaResult, Value as LuaValue};
 
 pub(crate) fn bytes_arg(val: &LuaValue, what: &str) -> LuaResult<Vec<u8>> {
     match val {
@@ -17,29 +18,48 @@ pub(crate) fn bytes_arg(val: &LuaValue, what: &str) -> LuaResult<Vec<u8>> {
     }
 }
 
-pub(crate) fn create_base64_table(lua: &Lua) -> LuaResult<Table> {
-    let t = lua.create_table()?;
+/// Encode {data} to standard Base64. Like `vim.base64.encode`.
+/// Accepts both strings and Luau buffers.
+///
+/// @param data string|buffer Data to encode.
+/// @return (string) Base64-encoded string.
+/// @example
+/// maki.base64.encode("hello") -- "aGVsbG8="
+#[lua_fn]
+fn encode(_lua: &Lua, data: LuaValue) -> LuaResult<String> {
+    let bytes = bytes_arg(&data, "base64.encode")?;
+    Ok(BASE64.encode(bytes))
+}
 
-    t.set(
-        "encode",
-        lua.create_function(|_, val: LuaValue| {
-            let bytes = bytes_arg(&val, "base64.encode")?;
-            Ok(BASE64.encode(bytes))
-        })?,
-    )?;
+/// Decode a Base64-encoded {str} back to its original bytes. Like `vim.base64.decode`.
+/// Throws if {str} is not valid Base64.
+///
+/// @param str string|buffer Base64-encoded text.
+/// @return (string) Decoded bytes as a string.
+/// @example
+/// maki.base64.decode("aGVsbG8=") -- "hello"
+#[lua_fn]
+fn decode(lua: &Lua, str: LuaValue) -> LuaResult<mlua::String> {
+    let encoded = bytes_arg(&str, "base64.decode")?;
+    let decoded = BASE64
+        .decode(encoded)
+        .map_err(|e| mlua::Error::runtime(format!("base64.decode: {e}")))?;
+    lua.create_string(decoded)
+}
 
-    t.set(
-        "decode",
-        lua.create_function(|lua, val: LuaValue| {
-            let encoded = bytes_arg(&val, "base64.decode")?;
-            let decoded = BASE64
-                .decode(encoded)
-                .map_err(|e| mlua::Error::runtime(format!("base64.decode: {e}")))?;
-            lua.create_string(decoded)
-        })?,
-    )?;
-
-    Ok(t)
+lua_table! {
+    /// Base64 encoding and decoding, modelled after `vim.base64`.
+    ///
+    /// Both functions accept strings and Luau buffers, so you can round-trip
+    /// binary data read with `maki.fs.read_bytes`.
+    ///
+    /// ```lua
+    /// local encoded = maki.base64.encode("hello")
+    /// local decoded = maki.base64.decode(encoded)
+    /// ```
+    "maki.base64" => pub(crate) fn create_base64_table(), DOCS [
+        encode, decode,
+    ]
 }
 
 #[cfg(test)]

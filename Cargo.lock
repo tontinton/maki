@@ -2602,6 +2602,7 @@ dependencies = [
  "maki-config",
  "maki-highlight",
  "maki-interpreter",
+ "maki-lua-macro",
  "maki-markdown",
  "maki-providers",
  "maki-storage",
@@ -2640,6 +2641,15 @@ dependencies = [
  "tree-sitter-swift",
  "tree-sitter-typescript",
  "tree-sitter-zig",
+]
+
+[[package]]
+name = "maki-lua-macro"
+version = "0.3.27"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]

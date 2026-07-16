@@ -1,12 +1,12 @@
-mod agent;
-mod r#async;
+pub(crate) mod agent;
+pub(crate) mod r#async;
 pub(crate) mod autocmd;
 pub(crate) mod base64;
 pub(crate) mod env;
 pub(crate) mod r#fn;
 pub(crate) mod fs;
 pub(crate) mod image;
-mod interpreter;
+pub(crate) mod interpreter;
 pub(crate) mod json;
 pub(crate) mod keymap;
 pub(crate) mod log;
@@ -62,7 +62,7 @@ pub(crate) fn create_maki_global(
         "interpreter",
         interpreter::create_interpreter_table(lua, permissions)?,
     )?;
-    agent::register(lua, &maki)?;
+    maki.set("agent", agent::create_agent_table(lua)?)?;
     maki.set(
         "keymap",
         keymap::create_keymap_table(lua, Arc::clone(&plugin))?,

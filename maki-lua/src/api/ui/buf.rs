@@ -3,9 +3,8 @@ use std::sync::Arc;
 
 use maki_agent::types::InlineStyle;
 use maki_agent::{SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle};
-use mlua::{
-    Function, Lua, Result as LuaResult, Table, UserData, UserDataMethods, Value as LuaValue,
-};
+use maki_lua_macro::{lua_class, lua_fn};
+use mlua::{Function, Lua, Result as LuaResult, Table, Value as LuaValue};
 
 use crate::runtime::{TaskHandle, lock_cell};
 
@@ -146,82 +145,170 @@ pub(crate) fn buf_from_reply(val: &LuaValue) -> Option<Arc<SharedBuf>> {
     Some(Arc::clone(&h.buf))
 }
 
-impl UserData for BufHandle {
-    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
-        methods.add_method("line", |_lua, this, arg: LuaValue| {
-            let line = parse_line(&arg)?;
-            this.buf.append(line);
-            Ok(())
-        });
+/// Appends a single line to the end of the buffer. You can pass a
+/// plain string for unstyled text, or a table of `{text, style?}` spans
+/// for rich content. Style can be a named string like "bold" or
+/// "keyword", or an inline table `{fg?, bg?, bold?, italic?, underline?, dim?, strikethrough?, reversed?}`
+/// with "#rrggbb" color strings.
+///
+/// @param line string|table Plain string, or a sequence of spans: `{ {text, style?}, ... }`.
+/// @return
+/// @example
+/// buf:line("plain text")
+/// buf:line({ { "ERROR", { fg = "#ff0000", bold = true } }, { " something broke" } })
+#[lua_fn]
+fn line(_lua: &Lua, this: &BufHandle, line: LuaValue) -> LuaResult<()> {
+    let l = parse_line(&line)?;
+    this.buf.append(l);
+    Ok(())
+}
 
-        methods.add_method("lines", |_lua, this, tbl: Table| {
-            let mut parsed = Vec::with_capacity(tbl.raw_len());
-            for i in 1..=tbl.raw_len() {
-                let val: LuaValue = tbl.raw_get(i)?;
-                parsed.push(parse_line(&val)?);
-            }
-            for line in parsed {
-                this.buf.append(line);
-            }
-            Ok(())
-        });
-
-        methods.add_method("set_lines", |_lua, this, tbl: Table| {
-            let mut parsed = Vec::with_capacity(tbl.raw_len());
-            for i in 1..=tbl.raw_len() {
-                let val: LuaValue = tbl.raw_get(i)?;
-                parsed.push(parse_line(&val)?);
-            }
-            this.buf.set_lines(parsed);
-            Ok(())
-        });
-
-        methods.add_method("len", |_lua, this, ()| Ok(this.buf.len()));
-
-        methods.add_method("get_lines", |lua, this, ()| {
-            let lines = this.buf.read();
-            let out = lua.create_table_with_capacity(lines.len(), 0)?;
-            for (i, line) in lines.iter().enumerate() {
-                out.raw_set(i + 1, line_to_lua(lua, line)?)?;
-            }
-            Ok(out)
-        });
-
-        methods.add_method("on", |lua, this, (event, callback): (String, Function)| {
-            match event.as_str() {
-                "click" => {
-                    this.set_click(callback);
-                    track_slot(lua, HandlerSlot::Click(Arc::clone(&this.buf)));
-                    Ok(())
-                }
-                // Change callbacks fire inline from buf mutations, so they
-                // must not yield or mutate this buffer.
-                "change" => {
-                    this.buf.set_on_change(move || {
-                        if let Err(e) = callback.call::<()>(()) {
-                            tracing::warn!(error = %e, "buf change callback failed");
-                        }
-                    });
-                    track_slot(lua, HandlerSlot::Change(Arc::clone(&this.buf)));
-                    Ok(())
-                }
-                _ => Err(mlua::Error::runtime(format!("unsupported event: {event}"))),
-            }
-        });
-
-        // Extract the handler before the await: holding the UserDataRef
-        // across it would block the handler's own calls back into this buf
-        // (mlua `send` borrows are exclusive).
-        methods.add_async_method("click", |_lua, this, ev: LuaValue| {
-            let f = this.click_fn();
-            async move {
-                match f {
-                    Some(f) => f.call_async::<()>(ev).await,
-                    None => Ok(()),
-                }
-            }
-        });
+/// Appends several lines at once. Each entry uses the same format as
+/// `buf:line()`, so you can mix plain strings and styled spans.
+///
+/// @param lines table Sequence of line values, each the same format accepted by `buf:line`.
+/// @return
+/// @example
+/// buf:lines({
+///   "first line",
+///   { { "styled ", "bold" }, { "second line" } },
+///   "third line",
+/// })
+#[lua_fn]
+fn lines(_lua: &Lua, this: &BufHandle, lines: Table) -> LuaResult<()> {
+    let mut parsed = Vec::with_capacity(lines.raw_len());
+    for i in 1..=lines.raw_len() {
+        let val: LuaValue = lines.raw_get(i)?;
+        parsed.push(parse_line(&val)?);
     }
+    for l in parsed {
+        this.buf.append(l);
+    }
+    Ok(())
+}
+
+/// Replaces every line in the buffer with {lines}. Use this when you
+/// want to redraw the whole buffer, for example after the user toggles
+/// a view.
+///
+/// @param lines table Sequence of line values, each the same format accepted by `buf:line`.
+/// @return
+/// @example
+/// buf:set_lines({ "new content", "replaces everything" })
+#[lua_fn]
+fn set_lines(_lua: &Lua, this: &BufHandle, lines: Table) -> LuaResult<()> {
+    let mut parsed = Vec::with_capacity(lines.raw_len());
+    for i in 1..=lines.raw_len() {
+        let val: LuaValue = lines.raw_get(i)?;
+        parsed.push(parse_line(&val)?);
+    }
+    this.buf.set_lines(parsed);
+    Ok(())
+}
+
+/// Returns how many lines the buffer currently holds.
+///
+/// @return (integer) Line count.
+/// @example
+/// if buf:len() == 0 then
+///   buf:line("(empty)")
+/// end
+#[lua_fn]
+fn len(_lua: &Lua, this: &BufHandle) -> LuaResult<usize> {
+    Ok(this.buf.len())
+}
+
+/// Returns all lines in the buffer as a Lua table. Each line is a
+/// sequence of `{text, style?}` spans, the same format `buf:line()`
+/// accepts. Useful for reading back content, copying it to another
+/// buffer, or round-tripping through `set_lines()`.
+///
+/// @return (table) Sequence of lines.
+/// @example
+/// local lines = buf:get_lines()
+/// buf:set_lines(lines) -- round-trip
+#[lua_fn]
+fn get_lines(lua: &Lua, this: &BufHandle) -> LuaResult<Table> {
+    let ls = this.buf.read();
+    let out = lua.create_table_with_capacity(ls.len(), 0)?;
+    for (i, l) in ls.iter().enumerate() {
+        out.raw_set(i + 1, line_to_lua(lua, l)?)?;
+    }
+    Ok(out)
+}
+
+/// Registers an event handler on the buffer.
+///
+/// Supported events:
+/// - "click": fires when the user clicks a line. The handler receives
+///   a click-event table and may yield or mutate the buffer.
+/// - "change": fires synchronously after every mutation (`line`,
+///   `lines`, `set_lines`). Must not yield.
+///
+/// Calling `on()` again for the same event replaces the previous handler.
+///
+/// @param event string Event name: "click" or "change".
+/// @param callback function Handler function. For "click", receives a click-event table. For "change", receives no arguments.
+/// @return
+/// @example
+/// buf:on("click", function(ev)
+///   maki.ui.flash("Clicked row " .. ev.row)
+/// end)
+#[lua_fn]
+fn on(lua: &Lua, this: &BufHandle, event: String, callback: Function) -> LuaResult<()> {
+    match event.as_str() {
+        "click" => {
+            this.set_click(callback);
+            track_slot(lua, HandlerSlot::Click(Arc::clone(&this.buf)));
+            Ok(())
+        }
+        // Change callbacks fire inline from buf mutations, so they
+        // must not yield or mutate this buffer.
+        "change" => {
+            this.buf.set_on_change(move || {
+                if let Err(e) = callback.call::<()>(()) {
+                    tracing::warn!(error = %e, "buf change callback failed");
+                }
+            });
+            track_slot(lua, HandlerSlot::Change(Arc::clone(&this.buf)));
+            Ok(())
+        }
+        _ => Err(mlua::Error::runtime(format!("unsupported event: {event}"))),
+    }
+}
+
+/// Programmatically fires the buffer's click handler with event {ev}.
+/// Does nothing if no click handler is registered. Useful for testing
+/// or simulating user interaction from code.
+///
+/// @param ev table Click event table passed to the handler.
+/// @return
+/// @example
+/// buf:click({ row = 1 })
+#[lua_fn]
+async fn click(_lua: Lua, this: mlua::UserDataRef<BufHandle>, ev: LuaValue) -> LuaResult<()> {
+    // Extract the handler before the await: holding the UserDataRef
+    // across it would block the handler's own calls back into this buf
+    // (mlua `send` borrows are exclusive).
+    let f = this.click_fn();
+    drop(this);
+    match f {
+        Some(f) => f.call_async::<()>(ev).await,
+        None => Ok(()),
+    }
+}
+
+lua_class! {
+    /// A content buffer that holds styled lines of text. Create one with
+    /// `maki.ui.buf()` and pass it to `maki.ui.open_win()` to show it in
+    /// a floating or split window.
+    ///
+    /// ```lua
+    /// local buf = maki.ui.buf()
+    /// buf:line("hello")
+    /// buf:line({ { "world", "bold" } })
+    /// ```
+    "maki.ui.Buf" => BufHandle, DOCS [line, lines, set_lines, len, get_lines, on, click]
 }
 
 pub(crate) fn parse_line(arg: &LuaValue) -> LuaResult<SnapshotLine> {

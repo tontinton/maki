@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::mem;
 use std::sync::{Arc, Mutex};
 
+use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Function, Lua, MultiValue, Result as LuaResult, Table, Value};
 
 use crate::api::util::dispatch::{DepthGuard, call_isolated};
@@ -162,66 +163,103 @@ fn make_callable(lua: &Lua, name: String) -> LuaResult<Function> {
     })
 }
 
-pub(crate) fn add_slot_methods(api_table: &Table, lua: &Lua, plugin: Arc<str>) -> LuaResult<()> {
-    let p = Arc::clone(&plugin);
-    api_table.set(
-        "declare_slot",
-        lua.create_function(move |lua, (name, default): (String, Function)| {
-            {
-                let mut store = slot_store_mut(lua)?;
-                let entry = store.slots.entry(name.clone()).or_default();
-                if let Some(owner) = &entry.owner {
-                    return Err(mlua::Error::runtime(format!(
-                        "slot '{name}' already declared by '{owner}'"
-                    )));
-                }
-                entry.owner = Some(Arc::clone(&p));
-                entry.default = Some(default);
-            }
-            make_callable(lua, name)
-        })?,
-    )?;
+/// Create a named extension point owned by your plugin. You provide a
+/// {default} function, and other plugins can wrap it with layers using
+/// `set_slot`. The returned callable runs the full chain: outermost
+/// layer first, then inward, ending at {default}.
+///
+/// Throws if another plugin already owns a slot with the same {name}.
+///
+/// @param name string Unique slot name, e.g. `"myplugin.render"`.
+/// @param default function Default implementation, called when no layers wrap it.
+/// @return (function) Callable that dispatches through all layers.
+/// @example
+/// local render = maki.api.declare_slot("myplugin.render", function(text)
+///   return text:upper()
+/// end)
+/// print(render("hello")) -- HELLO
+#[lua_fn]
+fn declare_slot(
+    lua: &Lua,
+    #[ctx] plugin: Arc<str>,
+    name: String,
+    default: Function,
+) -> LuaResult<Function> {
+    {
+        let mut store = slot_store_mut(lua)?;
+        let entry = store.slots.entry(name.clone()).or_default();
+        if let Some(owner) = &entry.owner {
+            return Err(mlua::Error::runtime(format!(
+                "slot '{name}' already declared by '{owner}'"
+            )));
+        }
+        entry.owner = Some(Arc::clone(&plugin));
+        entry.default = Some(default);
+    }
+    make_callable(lua, name)
+}
 
-    let p = Arc::clone(&plugin);
-    api_table.set(
-        "set_slot",
-        lua.create_function(move |lua, (name, wrapper): (String, Function)| {
-            slot_store_mut(lua)?
-                .slots
-                .entry(name)
-                .or_default()
-                .layers
-                .push(SlotLayer {
-                    plugin: Arc::clone(&p),
-                    func: wrapper,
-                });
-            Ok(())
-        })?,
-    )?;
-
-    api_table.set(
-        "get_slots",
-        lua.create_function(|lua, ()| {
-            let out = lua.create_table()?;
-            let Some(store) = lua.app_data_ref::<SlotStore>() else {
-                return Ok(out);
-            };
-            for (name, entry) in &store.slots {
-                let info = lua.create_table()?;
-                info.set("owner", entry.owner.as_deref())?;
-                info.set("declared", entry.default.is_some())?;
-                let fillers = lua.create_table()?;
-                for layer in &entry.layers {
-                    fillers.push(layer.plugin.as_ref())?;
-                }
-                info.set("fillers", fillers)?;
-                out.set(name.as_str(), info)?;
-            }
-            Ok(out)
-        })?,
-    )?;
-
+/// Add a layer around an existing (or future) slot. Layers wrap the
+/// default from the outside in. Each layer receives `prev` as its
+/// first argument. Call `prev(...)` to continue down the chain.
+/// Calling `prev` more than once throws.
+///
+/// You can call this before the owner runs `declare_slot`. The layer
+/// is queued and attached when the slot is declared.
+///
+/// @param name string Slot name to wrap.
+/// @param wrapper function Layer: `function(prev, ...)`. Call `prev(...)` to continue.
+/// @return
+/// @example
+/// maki.api.set_slot("myplugin.render", function(prev, text)
+///   return prev("[" .. text .. "]")
+/// end)
+#[lua_fn]
+fn set_slot(lua: &Lua, #[ctx] plugin: Arc<str>, name: String, wrapper: Function) -> LuaResult<()> {
+    slot_store_mut(lua)?
+        .slots
+        .entry(name)
+        .or_default()
+        .layers
+        .push(SlotLayer {
+            plugin: Arc::clone(&plugin),
+            func: wrapper,
+        });
     Ok(())
+}
+
+/// List all known slots and their current state. Useful for debugging
+/// which plugins own or wrap each slot.
+///
+/// @return (table) Map of slot name to `{ owner, declared, fillers }`.
+/// @example
+/// for name, info in pairs(maki.api.get_slots()) do
+///   print(name, info.owner, info.declared)
+/// end
+#[lua_fn]
+fn get_slots(lua: &Lua) -> LuaResult<Table> {
+    let out = lua.create_table()?;
+    let Some(store) = lua.app_data_ref::<SlotStore>() else {
+        return Ok(out);
+    };
+    for (name, entry) in &store.slots {
+        let info = lua.create_table()?;
+        info.set("owner", entry.owner.as_deref())?;
+        info.set("declared", entry.default.is_some())?;
+        let fillers = lua.create_table()?;
+        for layer in &entry.layers {
+            fillers.push(layer.plugin.as_ref())?;
+        }
+        info.set("fillers", fillers)?;
+        out.set(name.as_str(), info)?;
+    }
+    Ok(out)
+}
+
+lua_table! {
+    extend "maki.api" => pub(crate) fn add_slot_methods(plugin: Arc<str>), DOCS [
+        declare_slot(plugin), set_slot(plugin), get_slots,
+    ]
 }
 
 #[cfg(test)]

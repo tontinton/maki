@@ -56,6 +56,7 @@ members = [
   "maki-providers",
   "maki-storage",
   "maki-config-macro",
+  "maki-lua-macro",
   "maki-ui",
 ]
 resolver = "3"
@@ -78,6 +79,7 @@ maki-storage = { path = "maki-storage" }
 maki-ui = { path = "maki-ui" }
 maki-lua = { path = "maki-lua" }
 maki-config-macro = { path = "maki-config-macro" }
+maki-lua-macro = { path = "maki-lua-macro" }
 maki-highlight = { path = "maki-highlight" }
 maki-markdown = { path = "maki-markdown" }
 serde = { version = "1", features = ["derive", "rc"] }

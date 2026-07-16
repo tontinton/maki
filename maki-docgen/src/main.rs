@@ -1,6 +1,7 @@
 mod gen_commands;
 mod gen_config;
 mod gen_keybindings;
+mod gen_lua_api;
 mod gen_providers;
 mod gen_tools;
 mod lua_util;
@@ -44,27 +45,32 @@ fn check_page(section: &str, expected: &str) -> bool {
 fn main() -> ExitCode {
     let check = std::env::args().any(|a| a == "--check");
 
-    let ((tools, providers), (config, (keybindings, commands))) = smol::block_on(async {
-        smol::future::zip(
+    let ((tools, providers), ((config, lua_api), (keybindings, commands))) =
+        smol::block_on(async {
             smol::future::zip(
-                smol::unblock(gen_tools::generate),
-                smol::unblock(gen_providers::generate),
-            ),
-            smol::future::zip(
-                smol::unblock(gen_config::generate),
                 smol::future::zip(
-                    smol::unblock(gen_keybindings::generate),
-                    smol::unblock(gen_commands::generate),
+                    smol::unblock(gen_tools::generate),
+                    smol::unblock(gen_providers::generate),
                 ),
-            ),
-        )
-        .await
-    });
+                smol::future::zip(
+                    smol::future::zip(
+                        smol::unblock(gen_config::generate),
+                        smol::unblock(gen_lua_api::generate),
+                    ),
+                    smol::future::zip(
+                        smol::unblock(gen_keybindings::generate),
+                        smol::unblock(gen_commands::generate),
+                    ),
+                ),
+            )
+            .await
+        });
 
     let pages = [
         ("tools", tools),
         ("providers", providers),
         ("configuration", config),
+        ("lua-api", lua_api),
         ("keybindings", keybindings),
         ("commands", commands),
     ];

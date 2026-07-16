@@ -6,15 +6,12 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
-use mlua::{Function, Lua, RegistryKey, Result as LuaResult, Table};
+use maki_lua_macro::{lua_fn, lua_table};
+use mlua::{Function, Lua, RegistryKey, Result as LuaResult, Table, Value};
 
 use crate::api::fs::expand_tilde;
+use crate::plugin_permissions::PluginPermissions;
 use crate::runtime::with_task_jobs;
-
-use crate::plugin_permissions::{
-    Permission::{Env, Run},
-    PluginPermissions,
-};
 
 const READER_BUF_SIZE: usize = 8 * 1024;
 
@@ -256,109 +253,156 @@ fn kill_job(meta: &mut JobMeta) {
     }
 }
 
-pub(crate) fn create_fn_table(lua: &Lua, perms: &PluginPermissions) -> LuaResult<Table> {
-    let t = lua.create_table()?;
+/// Run a shell command in the background. The command runs through
+/// `bash -c` on Unix or `cmd /C` on Windows. You get back a job id
+/// that you can pass to `jobstop` or `jobwait` to control the process.
+///
+/// @param cmd string Shell command to run.
+/// @param opts table? Optional settings:
+///   `cwd` (string?) working directory (tilde is expanded).
+///   `env` (table?) extra environment variables, `{ VAR = "value" }`.
+///   `on_stdout` (function?) called with each stdout line.
+///   `on_stderr` (function?) called with each stderr line.
+///   `on_exit` (function?) called with the exit code when the process finishes.
+/// @return (integer) Job id.
+/// @example
+/// local id = maki.fn.jobstart("ls -la", {
+///   cwd = "~/projects",
+///   on_stdout = function(line) print(line) end,
+///   on_exit = function(code) print("exit: " .. code) end,
+/// })
+#[lua_fn(guard = Run)]
+fn jobstart(lua: &Lua, cmd: String, opts: Option<Table>) -> LuaResult<u32> {
+    let (cwd, env, on_stdout, on_stderr, on_exit) = match opts {
+        Some(ref opts) => {
+            let cwd: Option<String> = opts.get("cwd").ok();
+            let env: Option<HashMap<String, String>> = opts
+                .get::<Table>("env")
+                .ok()
+                .map(|t| t.pairs::<String, String>().filter_map(Result::ok).collect());
+            let on_stdout = opts
+                .get::<Function>("on_stdout")
+                .ok()
+                .map(|f| lua.create_registry_value(f))
+                .transpose()?;
+            let on_stderr = opts
+                .get::<Function>("on_stderr")
+                .ok()
+                .map(|f| lua.create_registry_value(f))
+                .transpose()?;
+            let on_exit = opts
+                .get::<Function>("on_exit")
+                .ok()
+                .map(|f| lua.create_registry_value(f))
+                .transpose()?;
+            (cwd, env, on_stdout, on_stderr, on_exit)
+        }
+        None => (None, None, None, None, None),
+    };
 
-    t.set(
-        "jobstart",
-        perms.guard(Run, lua, |lua, (cmd, opts): (String, Option<Table>)| {
-            let (cwd, env, on_stdout, on_stderr, on_exit) = match opts {
-                Some(ref opts) => {
-                    let cwd: Option<String> = opts.get("cwd").ok();
-                    let env: Option<HashMap<String, String>> = opts
-                        .get::<Table>("env")
-                        .ok()
-                        .map(|t| t.pairs::<String, String>().filter_map(Result::ok).collect());
-                    let on_stdout = opts
-                        .get::<Function>("on_stdout")
-                        .ok()
-                        .map(|f| lua.create_registry_value(f))
-                        .transpose()?;
-                    let on_stderr = opts
-                        .get::<Function>("on_stderr")
-                        .ok()
-                        .map(|f| lua.create_registry_value(f))
-                        .transpose()?;
-                    let on_exit = opts
-                        .get::<Function>("on_exit")
-                        .ok()
-                        .map(|f| lua.create_registry_value(f))
-                        .transpose()?;
-                    (cwd, env, on_stdout, on_stderr, on_exit)
-                }
-                None => (None, None, None, None, None),
-            };
+    with_task_jobs(lua, |store| {
+        store.start(&cmd, cwd, env, on_stdout, on_stderr, on_exit)
+    })
+    .map_err(mlua::Error::runtime)
+}
 
-            with_task_jobs(lua, |store| {
-                store.start(&cmd, cwd, env, on_stdout, on_stderr, on_exit)
-            })
-            .map_err(mlua::Error::runtime)
-        })?,
-    )?;
+/// Kill a running job immediately (SIGKILL on Unix). Safe to call on
+/// jobs that already exited or on unknown ids.
+///
+/// @param job_id integer Job id returned by `jobstart`.
+/// @return
+/// @example
+/// maki.fn.jobstop(id)
+#[lua_fn(guard = Run)]
+fn jobstop(lua: &Lua, job_id: u32) -> LuaResult<()> {
+    with_task_jobs(lua, |store| store.kill(job_id));
+    Ok(())
+}
 
-    t.set(
-        "jobstop",
-        perms.guard(Run, lua, |lua, job_id: u32| {
-            with_task_jobs(lua, |store| store.kill(job_id));
-            Ok(())
-        })?,
-    )?;
+/// Wait for a job to finish and collect its output. Returns a result
+/// table with `stdout`, `stderr`, and `exit_code`. Returns `nil` if the
+/// job does not finish before the timeout.
+///
+/// @param job_id integer Job id returned by `jobstart`.
+/// @param timeout_ms integer? Maximum wait in milliseconds (default 30000).
+/// @return (table?) `{ stdout, stderr, exit_code }`, or nil on timeout.
+/// @example
+/// local id = maki.fn.jobstart("echo hello")
+/// local result = maki.fn.jobwait(id, 5000)
+/// if result then
+///   print(result.stdout)
+/// end
+#[lua_fn(guard = Run)]
+async fn jobwait(lua: Lua, job_id: u32, timeout_ms: Option<u64>) -> LuaResult<Value> {
+    let rx = with_task_jobs(&lua, |store| store.take_receiver(job_id))
+        .ok_or_else(|| mlua::Error::runtime("unknown job id or already waited"))?;
 
-    t.set(
-        "jobwait",
-        perms.guard_async(
-            Run,
-            lua,
-            |lua, (job_id, timeout_ms): (u32, Option<u64>)| async move {
-                let rx = with_task_jobs(&lua, |store| store.take_receiver(job_id))
-                    .ok_or_else(|| mlua::Error::runtime("unknown job id or already waited"))?;
+    let timeout = Duration::from_millis(timeout_ms.unwrap_or(30_000));
+    let deadline = smol::Timer::after(timeout);
+    futures_lite::pin!(deadline);
 
-                let timeout = Duration::from_millis(timeout_ms.unwrap_or(30_000));
-                let deadline = smol::Timer::after(timeout);
-                futures_lite::pin!(deadline);
+    let mut stdout_lines = Vec::new();
+    let mut stderr_lines = Vec::new();
 
-                let mut stdout_lines = Vec::new();
-                let mut stderr_lines = Vec::new();
+    let exit_code = loop {
+        let event = futures_lite::future::or(async { rx.recv_async().await.ok() }, async {
+            (&mut deadline).await;
+            None
+        })
+        .await;
 
-                let exit_code = loop {
-                    let event =
-                        futures_lite::future::or(async { rx.recv_async().await.ok() }, async {
-                            (&mut deadline).await;
-                            None
-                        })
-                        .await;
+        match event {
+            None => return Ok(mlua::Value::Nil),
+            Some(JobEvent::Stdout(line)) => stdout_lines.push(line),
+            Some(JobEvent::Stderr(line)) => stderr_lines.push(line),
+            Some(JobEvent::Exit(code)) => {
+                break code;
+            }
+        }
+    };
 
-                    match event {
-                        None => return Ok(mlua::Value::Nil),
-                        Some(JobEvent::Stdout(line)) => stdout_lines.push(line),
-                        Some(JobEvent::Stderr(line)) => stderr_lines.push(line),
-                        Some(JobEvent::Exit(code)) => {
-                            break code;
-                        }
-                    }
-                };
+    let result = lua.create_table()?;
+    result.set("stdout", stdout_lines.join("\n"))?;
+    result.set("stderr", stderr_lines.join("\n"))?;
+    result.set("exit_code", exit_code)?;
+    Ok(mlua::Value::Table(result))
+}
 
-                let result = lua.create_table()?;
-                result.set("stdout", stdout_lines.join("\n"))?;
-                result.set("stderr", stderr_lines.join("\n"))?;
-                result.set("exit_code", exit_code)?;
-                Ok(mlua::Value::Table(result))
-            },
-        )?,
-    )?;
+/// Check whether {name} can be found on `$PATH` or is an absolute path
+/// to a file. Returns 1 when found, 0 otherwise (matches Neovim's
+/// `vim.fn.executable`).
+///
+/// @param name string Program name (e.g. `"git"`) or absolute path.
+/// @return (integer) `1` if found, `0` otherwise.
+/// @example
+/// if maki.fn.executable("rg") == 1 then
+///   -- use ripgrep
+/// end
+#[lua_fn(guard = Env)]
+fn executable(_lua: &Lua, name: String) -> LuaResult<i32> {
+    let found = env::var_os("PATH")
+        .map(|paths| env::split_paths(&paths).any(|dir| dir.join(&name).is_file()))
+        .unwrap_or(false)
+        || Path::new(&name).is_file();
+    Ok(if found { 1 } else { 0 })
+}
 
-    t.set(
-        "executable",
-        perms.guard(Env, lua, |_, name: String| {
-            let found = env::var_os("PATH")
-                .map(|paths| env::split_paths(&paths).any(|dir| dir.join(&name).is_file()))
-                .unwrap_or(false)
-                || Path::new(&name).is_file();
-            Ok(if found { 1 } else { 0 })
-        })?,
-    )?;
-
-    Ok(t)
+lua_table! {
+    /// Process and environment helpers, modeled after Neovim's `vim.fn` job
+    /// control. Use these to run shell commands, wait for output, and check
+    /// whether programs are installed.
+    ///
+    /// Job functions need the `run` permission. `executable` needs the `env`
+    /// permission.
+    ///
+    /// ```lua
+    /// local id = maki.fn.jobstart("git status", {
+    ///   on_exit = function(code) print("done: " .. code) end,
+    /// })
+    /// ```
+    "maki.fn" => pub(crate) fn create_fn_table(perms: &PluginPermissions), DOCS [
+        jobstart(perms), jobstop(perms), jobwait(perms), executable(perms),
+    ]
 }
 
 #[cfg(test)]

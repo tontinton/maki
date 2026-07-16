@@ -1,35 +1,55 @@
-use mlua::{Lua, LuaSerdeExt, Result as LuaResult, Table, Value};
+use maki_lua_macro::{lua_fn, lua_table};
+use mlua::{Lua, LuaSerdeExt, Result as LuaResult, Value};
 
 use super::util::convert::err_pair;
 
-pub(crate) fn create_yaml_table(lua: &Lua) -> LuaResult<Table> {
-    let yaml = lua.create_table()?;
+/// Turn a Lua value into a YAML string. Most Lua types work, but
+/// circular references will return an error.
+///
+/// @param value any Lua value to encode.
+/// @return (string?, string?) YAML string, or nil plus an error.
+/// @example
+/// local s, err = maki.yaml.encode({ name = "maki", tags = { "ai", "agent" } })
+/// print(s)
+#[lua_fn]
+fn encode(lua: &Lua, value: Value) -> LuaResult<(Value, Value)> {
+    let serde_val: serde_yaml::Value = match lua.from_value(value) {
+        Ok(v) => v,
+        Err(e) => return err_pair(lua, e),
+    };
+    match serde_yaml::to_string(&serde_val) {
+        Ok(s) => Ok((Value::String(lua.create_string(&s)?), Value::Nil)),
+        Err(e) => err_pair(lua, e),
+    }
+}
 
-    yaml.set(
-        "encode",
-        lua.create_function(|lua, value: Value| {
-            let serde_val: serde_yaml::Value = match lua.from_value(value) {
-                Ok(v) => v,
-                Err(e) => return err_pair(lua, e),
-            };
-            match serde_yaml::to_string(&serde_val) {
-                Ok(s) => Ok((Value::String(lua.create_string(&s)?), Value::Nil)),
-                Err(e) => err_pair(lua, e),
-            }
-        })?,
-    )?;
+/// Parse a YAML string into a Lua value. Mappings become tables and
+/// sequences become 1-indexed arrays.
+///
+/// @param str string YAML string to decode.
+/// @return (any?, string?) Decoded value, or nil plus an error.
+/// @example
+/// local t, err = maki.yaml.decode("name: maki\nversion: 1")
+/// print(t.name) -- maki
+#[lua_fn]
+fn decode(lua: &Lua, str: String) -> LuaResult<(Value, Value)> {
+    match serde_yaml::from_str::<serde_yaml::Value>(&str) {
+        Ok(v) => Ok((lua.to_value(&v)?, Value::Nil)),
+        Err(e) => err_pair(lua, e),
+    }
+}
 
-    yaml.set(
-        "decode",
-        lua.create_function(|lua, s: String| {
-            match serde_yaml::from_str::<serde_yaml::Value>(&s) {
-                Ok(v) => Ok((lua.to_value(&v)?, Value::Nil)),
-                Err(e) => err_pair(lua, e),
-            }
-        })?,
-    )?;
-
-    Ok(yaml)
+lua_table! {
+    /// YAML encoding and decoding. Works the same way as `maki.json`,
+    /// but for YAML formatted strings.
+    ///
+    /// ```lua
+    /// local t = maki.yaml.decode("greeting: hello")
+    /// print(t.greeting)
+    /// ```
+    "maki.yaml" => pub(crate) fn create_yaml_table(), DOCS [
+        encode, decode,
+    ]
 }
 
 #[cfg(test)]

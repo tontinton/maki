@@ -5,3 +5,29 @@
 {% block content %}
 {{ section.content | safe }}
 {% endblock %}
+
+{% block toc %}
+{%- set top = section.toc -%}
+{%- if top | length == 1 -%}
+  {%- set top = top[0].children -%}
+{%- endif -%}
+{%- if top | length > 1 -%}
+<aside class="toc" id="toc" aria-label="Table of contents">
+  <div class="toc-label">On this page</div>
+  <nav>
+  {%- for h2 in top -%}
+    <div class="toc-group">
+      <a class="toc-h2" href="#{{ h2.id }}">{{ h2.title | striptags | safe }}</a>
+      {%- if h2.children -%}
+      <div class="toc-sub">
+        {%- for h3 in h2.children -%}
+        <a class="toc-h3" href="#{{ h3.id }}">{{ h3.title | striptags | safe }}</a>
+        {%- endfor -%}
+      </div>
+      {%- endif -%}
+    </div>
+  {%- endfor -%}
+  </nav>
+</aside>
+{%- endif -%}
+{% endblock %}

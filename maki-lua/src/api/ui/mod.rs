@@ -4,12 +4,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use humantime::format_duration;
+use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Lua, Result as LuaResult, Table};
 
 use crate::api::util::command::{
     Anchor, Border, Dimension, FloatConfig, HintEntries, HintWriter, Split, TitlePos, UiAction,
     WinCommand, WinEvent,
 };
+use crate::docs::{FnDoc, ParamDoc};
 pub(crate) mod buf;
 pub(crate) mod win;
 
@@ -70,193 +72,324 @@ pub(crate) fn parse_footer(tbl: &Table) -> LuaResult<Vec<(String, String)>> {
         .collect()
 }
 
+/// Creates a new buffer for building UI content. The first buffer you
+/// create in a task becomes the "live" buffer, streamed to the UI while
+/// your tool runs. Create more buffers for secondary content like
+/// floating windows.
+///
+/// @return (Buf) Buffer handle.
+/// @example
+/// local buf = maki.ui.buf()
+/// buf:line("hello world")
+#[lua_fn]
+fn buf(lua: &Lua) -> LuaResult<buf::BufHandle> {
+    Ok(with_task_bufs(lua, |store| store.create_live()))
+}
+
+/// Looks up a semantic color from the current theme. Use this to keep
+/// your plugin's colors consistent with the rest of the UI.
+///
+/// @param name string Semantic color name, e.g. "accent" or "background".
+/// @return (string|nil) "#rrggbb" hex color, or nil if the name is unknown.
+/// @example
+/// local accent = maki.ui.theme_color("accent")
+/// if accent then
+///   buf:line({ { "note", { fg = accent, bold = true } } })
+/// end
+#[lua_fn]
+fn theme_color(lua: &Lua, name: String) -> LuaResult<mlua::Value> {
+    let Some((r, g, b)) = maki_highlight::theme_color(&name) else {
+        return Ok(mlua::Value::Nil);
+    };
+    Ok(mlua::Value::String(
+        lua.create_string(format!("#{r:02x}{g:02x}{b:02x}"))?,
+    ))
+}
+
+/// Syntax-highlights a chunk of source code. Returns a table of styled
+/// lines that you can feed into a buffer. Each line is a list of
+/// `{text, style}` spans where style is a `{fg, bold?, italic?, underline?}` table.
+///
+/// @param code string Source text to highlight.
+/// @param lang string Language identifier, e.g. "rust", "python".
+/// @param opts table? Options. Fields:
+///   - independent (boolean): highlight each line without cross-line context. Default false.
+///   - prefix (string): prepend to the source before highlighting (affects token context). Default "".
+/// @return (table) Lines: `{ { {text, style}, ... }, ... }`. Each style is `{fg, bold?, italic?, underline?}`.
+/// @example
+/// local lines = maki.ui.highlight("fn main() {}", "rust")
+/// for _, spans in ipairs(lines) do
+///   buf:line(spans)
+/// end
+#[lua_fn]
+async fn highlight(lua: Lua, code: String, lang: String, opts: Option<Table>) -> LuaResult<Table> {
+    let independent = opts
+        .as_ref()
+        .and_then(|t| t.get::<bool>("independent").ok())
+        .unwrap_or(false);
+    let prefix = opts
+        .and_then(|t| t.get::<String>("prefix").ok())
+        .unwrap_or_default();
+    let segments = smol::unblock(move || {
+        if independent {
+            maki_highlight::highlight_lines_independent(&lang, &code)
+        } else {
+            maki_highlight::highlight_code(&lang, &code, &prefix)
+        }
+    })
+    .await;
+    segments_to_lua_lines(&lua, &segments)
+}
+
+/// Renders Markdown into styled lines ready to display in a buffer.
+/// Each span's style is either a named string ("bold", "heading",
+/// "inline_code", etc.) or a `{fg, bold?, italic?, underline?}` table
+/// for syntax-highlighted code blocks.
+///
+/// @param text string Markdown source.
+/// @param width integer Wrap width in columns.
+/// @return (table) Lines: `{ { {text, style}, ... }, ... }`.
+/// @example
+/// local size = maki.ui.terminal_size()
+/// local lines = maki.ui.markdown("# Hello\n\nSome **bold** text.", size.cols)
+/// for _, spans in ipairs(lines) do
+///   buf:line(spans)
+/// end
+#[lua_fn]
+async fn markdown(lua: Lua, text: String, width: u16) -> LuaResult<Table> {
+    let lines = smol::unblock(move || maki_markdown::render::render(&text, width)).await;
+    markdown_lines_to_lua(&lua, &lines)
+}
+
+/// Formats a number of seconds into a short, human-friendly string.
+/// Useful for displaying elapsed time in status messages.
+///
+/// @param secs integer Duration in seconds.
+/// @return (string) Human-readable duration, e.g. "1m30s".
+/// @example
+/// maki.ui.humantime(90)   -- "1m30s"
+/// maki.ui.humantime(3661) -- "1h1m1s"
+#[lua_fn]
+fn humantime(_lua: &Lua, secs: u64) -> LuaResult<String> {
+    Ok(format_duration(Duration::from_secs(secs))
+        .to_string()
+        .replace(' ', ""))
+}
+
+/// Returns the current terminal size. Handy for sizing floating windows
+/// or wrapping text to fit the screen.
+///
+/// @return (table) `{cols, rows}`, terminal width and height in characters.
+/// @example
+/// local size = maki.ui.terminal_size()
+/// local half_width = math.floor(size.cols / 2)
+#[lua_fn]
+fn terminal_size(lua: &Lua) -> LuaResult<Table> {
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    let tbl = lua.create_table()?;
+    tbl.set("cols", cols)?;
+    tbl.set("rows", rows)?;
+    Ok(tbl)
+}
+
+/// Shows a brief message in the status bar. The message disappears
+/// after a short time. Good for confirming an action like "copied!"
+/// or showing a transient warning.
+///
+/// @param msg string Message text.
+/// @return
+/// @example
+/// maki.ui.flash("Copied to clipboard!")
+#[lua_fn]
+fn flash(_lua: &Lua, #[ctx] tx: flume::Sender<UiAction>, msg: String) -> LuaResult<()> {
+    let _ = tx.try_send(UiAction::Flash(msg));
+    Ok(())
+}
+
+/// Opens {path} in the user's `$EDITOR` (e.g. vim, nano) and waits for
+/// it to close. This suspends the TUI while the editor is running.
+/// Returns the editor's exit code so you can check if the user saved.
+///
+/// @param path string File to open.
+/// @return (integer) Editor exit code, or -1 if the action could not be dispatched.
+/// @example
+/// local code = maki.ui.open_editor("/tmp/scratch.lua")
+/// if code == 0 then
+///   maki.ui.flash("File saved")
+/// end
+#[lua_fn]
+async fn open_editor(
+    _lua: Lua,
+    #[ctx] tx: flume::Sender<UiAction>,
+    path: String,
+) -> LuaResult<i32> {
+    let (reply_tx, reply_rx) = flume::bounded::<i32>(1);
+    if tx
+        .try_send(UiAction::OpenEditor {
+            path: PathBuf::from(path),
+            reply_tx,
+        })
+        .is_err()
+    {
+        return Ok(-1);
+    }
+    Ok(reply_rx.recv_async().await.unwrap_or(-1))
+}
+
+/// Opens a floating or split window that displays the contents of {buf}.
+/// Returns a Win handle you can use to receive events, update layout,
+/// and close the window when you are done.
+///
+/// @param buf Buf Buffer to display.
+/// @param opts table Float configuration. Fields:
+///   - width (integer|string): window width. Integer for absolute columns; "N%" for percent of terminal width. Default "60%".
+///   - height (integer|string): window height. Integer for absolute rows; "N%" for percent of terminal height. Default "70%".
+///   - row (integer?): row offset from the anchor corner. Negative values move up.
+///   - col (integer?): column offset from the anchor corner.
+///   - anchor (string): corner the (row, col) offset is relative to. One of "NW" (default), "NE", "SW", "SE".
+///   - border (string): border style. One of "rounded" (default), "single", "double", "none".
+///   - title (string): text shown in the top border. Default "".
+///   - title_pos (string): title alignment. One of "left" (default), "center", "right".
+///   - footer (table): key-hint pairs shown in the bottom border. Each entry is {key, label}.
+///   - zindex (integer): stacking order. Default 50.
+///   - cursor_line (boolean): highlight the focused row. Default false.
+///   - reserved_top (integer): rows reserved at the top of the content area. Default 0.
+///   - reserved_bottom (integer): rows reserved at the bottom of the content area. Default 0.
+///   - split (string): dock the window to an edge instead of floating. One of "above", "below", "left", "right", "panel", or "" (floating, default).
+///   - order (integer): paint order among split windows at the same edge. Default 50.
+///   - focus (boolean): whether the window takes keyboard focus on open. Default true.
+///   - visible (boolean): whether the window is initially visible. Default true.
+/// @return (Win) Window handle.
+/// @example
+/// local buf = maki.ui.buf()
+/// buf:line("Pick an option:")
+/// local win = maki.ui.open_win(buf, {
+///   title = "Menu",
+///   width = "50%",
+///   height = 10,
+///   cursor_line = true,
+///   footer = { { "q", "quit" }, { "Enter", "select" } },
+/// })
+#[lua_fn]
+fn open_win(
+    _lua: &Lua,
+    #[ctx] tx: flume::Sender<UiAction>,
+    buf: mlua::AnyUserData,
+    opts: Table,
+) -> LuaResult<WinHandle> {
+    let buf_handle = buf.borrow::<buf::BufHandle>()?;
+    let title: String = opts.get("title").unwrap_or_default();
+    let cursor_line: bool = opts.get("cursor_line").unwrap_or(false);
+    let footer = parse_footer(&opts)?;
+    let reserved_bottom: usize = opts.get("reserved_bottom").unwrap_or(0);
+    let reserved_top: usize = opts.get("reserved_top").unwrap_or(0);
+    let focus: bool = opts
+        .get::<Option<bool>>("focus")
+        .ok()
+        .flatten()
+        .unwrap_or(true);
+    let zindex: u16 = opts.get("zindex").unwrap_or(50);
+
+    let width = parse_dimension(&opts, "width", Dimension::Percent(60));
+    let height = parse_dimension(&opts, "height", Dimension::Percent(70));
+    let row: Option<i16> = opts.get("row").ok();
+    let col: Option<i16> = opts.get("col").ok();
+    let anchor = parse_anchor(&opts);
+    let border = parse_border(&opts);
+    let title_pos = parse_title_pos(&opts);
+    let split = parse_split(&opts);
+    let order: u16 = opts.get("order").unwrap_or(50);
+    let visible: bool = opts.get("visible").unwrap_or(true);
+
+    let config = FloatConfig {
+        width,
+        height,
+        row,
+        col,
+        anchor,
+        border,
+        title,
+        title_pos,
+        footer,
+        zindex,
+        cursor_line,
+        reserved_bottom,
+        reserved_top,
+        split,
+        order,
+        visible,
+    };
+
+    let (term_cols, term_rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    let border_chrome = match config.border {
+        Border::None => 0,
+        _ => 2,
+    };
+    let est_w = config
+        .width
+        .resolve(term_cols)
+        .saturating_sub(border_chrome);
+    let est_h = config
+        .height
+        .resolve(term_rows)
+        .saturating_sub(border_chrome);
+
+    let (event_tx, event_rx) = flume::bounded::<WinEvent>(8);
+    let (cmd_tx, cmd_rx) = flume::bounded::<WinCommand>(8);
+
+    let _ = tx.try_send(UiAction::OpenWin {
+        buf: buf_handle.buf.clone(),
+        config,
+        focus,
+        event_tx,
+        cmd_rx,
+    });
+
+    Ok(WinHandle::new(event_rx, cmd_tx, est_w, est_h, visible))
+}
+
+#[allow(non_upper_case_globals)]
+pub(crate) const set_status_hint__doc: FnDoc = FnDoc {
+    name: "set_status_hint",
+    args: "{spans}",
+    desc: "Shows key hints in the status bar for your plugin. Each hint is a {key, label} pair. Pass nil to clear your plugin's hints. Only your own hints are affected, other plugins keep theirs.",
+    params: &[ParamDoc {
+        name: "{spans}",
+        ty: "table|nil",
+        desc: "Sequence of {key, label} pairs, e.g. `{{\"q\", \"quit\"}, {\"j\", \"down\"}}`. Pass nil to remove the plugin's hints.",
+    }],
+    returns: "",
+    example: "maki.ui.set_status_hint({ {\"q\", \"quit\"}, {\"j\", \"down\"} })\n-- later, clear them:\nmaki.ui.set_status_hint(nil)",
+};
+
+lua_table! {
+    /// Functions for building interactive UI. Create buffers to hold
+    /// content, open floating or split windows to display them, highlight
+    /// code, render markdown, and show status hints.
+    ///
+    /// ```lua
+    /// local buf = maki.ui.buf()
+    /// buf:line("hello from my plugin!")
+    /// local win = maki.ui.open_win(buf, { title = "Greeting", width = "50%", height = 5 })
+    /// ```
+    extend "maki.ui" => pub(crate) fn add_ui_fns(), DOCS [
+        buf, theme_color, highlight, markdown, humantime, terminal_size,
+        manual flash, manual open_editor, manual open_win, manual set_status_hint,
+    ]
+}
+
 pub(crate) fn create_ui_table(
     lua: &Lua,
     ui_action_tx: Option<flume::Sender<UiAction>>,
     plugin: Arc<str>,
 ) -> LuaResult<Table> {
     let t = lua.create_table()?;
-    t.set(
-        "buf",
-        lua.create_function(|lua, ()| Ok(with_task_bufs(lua, |store| store.create_live())))?,
-    )?;
-    t.set(
-        "theme_color",
-        lua.create_function(|lua, name: String| {
-            let Some((r, g, b)) = maki_highlight::theme_color(&name) else {
-                return Ok(mlua::Value::Nil);
-            };
-            Ok(mlua::Value::String(
-                lua.create_string(format!("#{r:02x}{g:02x}{b:02x}"))?,
-            ))
-        })?,
-    )?;
-    t.set(
-        "highlight",
-        lua.create_async_function(
-            |lua, (code, lang, opts): (String, String, Option<mlua::Table>)| async move {
-                let independent = opts
-                    .as_ref()
-                    .and_then(|t| t.get::<bool>("independent").ok())
-                    .unwrap_or(false);
-                let prefix = opts
-                    .and_then(|t| t.get::<String>("prefix").ok())
-                    .unwrap_or_default();
-                let segments = smol::unblock(move || {
-                    if independent {
-                        maki_highlight::highlight_lines_independent(&lang, &code)
-                    } else {
-                        maki_highlight::highlight_code(&lang, &code, &prefix)
-                    }
-                })
-                .await;
-                segments_to_lua_lines(&lua, &segments)
-            },
-        )?,
-    )?;
-    // maki.ui.markdown(text, width) -> lines, each `{ {text, style}, ... }`.
-    // Async so the expensive code-block highlighting never blocks the UI.
-    //
-    // A style is a named string, resolved late at paint time so a theme
-    // switch repaints without re-rendering. Plugins should lean on the
-    // semantic palette ("accent", "active", "selected", "success", ...) since
-    // those names stay stable; see `theme::style_by_name` for the full set.
-    // Syntax tokens instead carry a `{fg, bold, italic, underline}` table.
-    t.set(
-        "markdown",
-        lua.create_async_function(|lua, (text, width): (String, u16)| async move {
-            let lines = smol::unblock(move || maki_markdown::render::render(&text, width)).await;
-            markdown_lines_to_lua(&lua, &lines)
-        })?,
-    )?;
-    t.set(
-        "humantime",
-        lua.create_function(|_, secs: u64| {
-            Ok(format_duration(Duration::from_secs(secs))
-                .to_string()
-                .replace(' ', ""))
-        })?,
-    )?;
-
-    t.set(
-        "terminal_size",
-        lua.create_function(|lua, ()| {
-            let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-            let tbl = lua.create_table()?;
-            tbl.set("cols", cols)?;
-            tbl.set("rows", rows)?;
-            Ok(tbl)
-        })?,
-    )?;
+    add_ui_fns(&t, lua)?;
 
     if let Some(tx) = ui_action_tx {
-        let flash_tx = tx.clone();
-        t.set(
-            "flash",
-            lua.create_function(move |_, msg: String| {
-                let _ = flash_tx.try_send(UiAction::Flash(msg));
-                Ok(())
-            })?,
-        )?;
-
-        let editor_tx = tx.clone();
-        t.set(
-            "open_editor",
-            lua.create_async_function(move |_, path: String| {
-                let tx = editor_tx.clone();
-                async move {
-                    let (reply_tx, reply_rx) = flume::bounded::<i32>(1);
-                    if tx
-                        .try_send(UiAction::OpenEditor {
-                            path: PathBuf::from(path),
-                            reply_tx,
-                        })
-                        .is_err()
-                    {
-                        return Ok(-1);
-                    }
-                    Ok(reply_rx.recv_async().await.unwrap_or(-1))
-                }
-            })?,
-        )?;
-
-        let open_win_tx = tx;
-        t.set(
-            "open_win",
-            lua.create_function(
-                move |_lua, (buf_ud, opts_tbl): (mlua::AnyUserData, Table)| {
-                    let buf_handle = buf_ud.borrow::<buf::BufHandle>()?;
-                    let title: String = opts_tbl.get("title").unwrap_or_default();
-                    let cursor_line: bool = opts_tbl.get("cursor_line").unwrap_or(false);
-                    let footer = parse_footer(&opts_tbl)?;
-                    let reserved_bottom: usize = opts_tbl.get("reserved_bottom").unwrap_or(0);
-                    let reserved_top: usize = opts_tbl.get("reserved_top").unwrap_or(0);
-                    let focus: bool = opts_tbl
-                        .get::<Option<bool>>("focus")
-                        .ok()
-                        .flatten()
-                        .unwrap_or(true);
-                    let zindex: u16 = opts_tbl.get("zindex").unwrap_or(50);
-
-                    let width = parse_dimension(&opts_tbl, "width", Dimension::Percent(60));
-                    let height = parse_dimension(&opts_tbl, "height", Dimension::Percent(70));
-                    let row: Option<i16> = opts_tbl.get("row").ok();
-                    let col: Option<i16> = opts_tbl.get("col").ok();
-                    let anchor = parse_anchor(&opts_tbl);
-                    let border = parse_border(&opts_tbl);
-                    let title_pos = parse_title_pos(&opts_tbl);
-                    let split = parse_split(&opts_tbl);
-                    let order: u16 = opts_tbl.get("order").unwrap_or(50);
-                    let visible: bool = opts_tbl.get("visible").unwrap_or(true);
-
-                    let config = FloatConfig {
-                        width,
-                        height,
-                        row,
-                        col,
-                        anchor,
-                        border,
-                        title,
-                        title_pos,
-                        footer,
-                        zindex,
-                        cursor_line,
-                        reserved_bottom,
-                        reserved_top,
-                        split,
-                        order,
-                        visible,
-                    };
-
-                    let (term_cols, term_rows) = crossterm::terminal::size().unwrap_or((80, 24));
-                    let border_chrome = match config.border {
-                        Border::None => 0,
-                        _ => 2,
-                    };
-                    let est_w = config
-                        .width
-                        .resolve(term_cols)
-                        .saturating_sub(border_chrome);
-                    let est_h = config
-                        .height
-                        .resolve(term_rows)
-                        .saturating_sub(border_chrome);
-
-                    let (event_tx, event_rx) = flume::bounded::<WinEvent>(8);
-                    let (cmd_tx, cmd_rx) = flume::bounded::<WinCommand>(8);
-
-                    let _ = open_win_tx.try_send(UiAction::OpenWin {
-                        buf: buf_handle.buf.clone(),
-                        config,
-                        focus,
-                        event_tx,
-                        cmd_rx,
-                    });
-
-                    Ok(WinHandle::new(event_rx, cmd_tx, est_w, est_h, visible))
-                },
-            )?,
-        )?;
+        flash__register(&t, lua, tx.clone())?;
+        open_editor__register(&t, lua, tx.clone())?;
+        open_win__register(&t, lua, tx)?;
     }
 
     let p = Arc::clone(&plugin);
@@ -797,8 +930,6 @@ mod tests {
         let lua = Lua::new();
         let result = render_markdown(&lua, "**`code`**");
         let line: Table = result.get(1).unwrap();
-        // Lua only sees one style name per span, so code wins over bold.
-        // Rust renderers see both axes through the typed model.
         assert_eq!(span_style(&line, 1), STYLE_CODE);
     }
 

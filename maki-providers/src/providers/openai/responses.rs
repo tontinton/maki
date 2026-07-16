@@ -416,10 +416,8 @@ pub(crate) async fn parse_sse(
                 }
             }
 
-            "response.reasoning_summary_part.added" => {
-                if !reasoning_text.is_empty() {
-                    reasoning_text.push_str("\n\n");
-                }
+            "response.reasoning_summary_part.added" if !reasoning_text.is_empty() => {
+                reasoning_text.push_str("\n\n");
             }
 
             "response.completed" => {

@@ -21,6 +21,7 @@ use maki_agent::{
     TextOutput, ToolOutput,
 };
 use maki_config::ToolOutputLines;
+use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{
     Function, Lua, LuaSerdeExt, MultiValue, RegistryKey, Result as LuaResult, Table,
     Value as LuaValue,
@@ -572,100 +573,200 @@ fn parse_hint_content(lua: &Lua, spec: &Table) -> LuaResult<HintContent> {
     }
 }
 
-pub(crate) fn create_api_table(
-    lua: &Lua,
-    pending: PendingTools,
-    plugin: Arc<str>,
-) -> LuaResult<Table> {
-    let t = lua.create_table()?;
-
-    t.set(
-        "register_tool",
-        lua.create_function(move |lua, spec: Table| {
-            register_tool_from_lua(lua, &spec, pending.clone())
-        })?,
-    )?;
-
-    {
-        let plugin = Arc::clone(&plugin);
-        t.set(
-            "register_prompt_hint",
-            lua.create_function(move |lua, spec: Table| {
-                let slot: Slot = parse_slot(&spec)?;
-                if slot.kind() == SlotKind::Singleton {
-                    return Err(mlua::Error::runtime(format!(
-                        "register_prompt_hint is for aggregate slots ({}); \
-                         use set_prompt for singleton slots ({})",
-                        Slot::names_for_kind(SlotKind::Aggregate),
-                        Slot::names_for_kind(SlotKind::Singleton),
-                    )));
-                }
-                let prompts = parse_prompt_field(&spec)?;
-                validate_slot_prompt_compatibility(slot, &prompts)?;
-
-                let content = parse_hint_content(lua, &spec)?;
-                let reg = PromptHintRegistration {
-                    prompts,
-                    slot,
-                    content,
-                };
-                let mut map = lua
-                    .app_data_mut::<PromptHintCallbacks>()
-                    .ok_or_else(|| mlua::Error::runtime("not initialized"))?;
-                map.entry(Arc::clone(&plugin)).or_default().push(reg);
-                Ok(())
-            })?,
-        )?;
-    }
-
-    {
-        let plugin = Arc::clone(&plugin);
-        t.set(
-            "set_prompt",
-            lua.create_function(move |lua, spec: Table| {
-                let slot: Slot = parse_slot(&spec)?;
-                if slot.kind() == SlotKind::Aggregate {
-                    return Err(mlua::Error::runtime(format!(
-                        "set_prompt is for singleton slots ({}); \
-                         use register_prompt_hint for aggregate slots ({})",
-                        Slot::names_for_kind(SlotKind::Singleton),
-                        Slot::names_for_kind(SlotKind::Aggregate),
-                    )));
-                }
-
-                let prompts = parse_prompt_field(&spec)?;
-                validate_slot_prompt_compatibility(slot, &prompts)?;
-
-                let content = parse_hint_content(lua, &spec)?;
-                let reg = PromptHintRegistration {
-                    prompts,
-                    slot,
-                    content,
-                };
-                let mut map = lua
-                    .app_data_mut::<PromptHintCallbacks>()
-                    .ok_or_else(|| mlua::Error::runtime("not initialized"))?;
-                map.entry(Arc::clone(&plugin)).or_default().push(reg);
-                Ok(())
-            })?,
-        )?
-    }
-
-    t.set(
-        "register_command",
-        lua.create_function(move |lua, spec: Table| {
-            register_command_from_lua(lua, &spec, Arc::clone(&plugin))
-        })?,
-    )?;
-
-    t.set("get_tools", lua.create_function(get_tools_from_lua)?)?;
-    t.set("get_tool", lua.create_function(get_tool_from_lua)?)?;
-
-    Ok(t)
+/// Register a new tool the agent can call. This is the main way plugins add
+/// capabilities to the agent. The tool is queued during plugin load and
+/// committed to the registry once the plugin finishes loading.
+///
+/// Your {spec} table must include a name, a description (the model reads it
+/// to decide when to use the tool), a JSON Schema for the input, and a handler
+/// function. The handler receives `(input, ctx)` and returns either a plain
+/// string or a table with richer output fields.
+///
+/// @param spec table Tool specification:
+///   name            (string)   Required. ASCII identifier, up to 64 chars ([a-zA-Z_][a-zA-Z0-9_]*).
+///   description     (string)   Required. Non-empty description shown to the model.
+///   schema          (table)    Required. JSON Schema object describing the tool's input parameters.
+///   handler         (function) Required. Called with `(input, ctx)` when the tool is invoked.
+///                              Must return a string or a table with any of these fields:
+///                                llm_output  (string)  Text sent to the model.
+///                                is_error    (boolean) When true, the result is treated as an error.
+///                                content     (string)  Alias for llm_output (legacy).
+///                                body        (BufHandle) Rich rendered body shown in the UI.
+///                                header      (BufHandle) One-line header shown before the body.
+///                                format      (string)  "plain" (default) or "markdown".
+///                                annotation  (string)  Short label shown next to the tool call.
+///                                written_path (string) Path of a file written by the tool.
+///                                diff_path   (string)  Path for a diff output block.
+///                                diff_before (string)  Before text of the diff.
+///                                diff_after  (string)  After text of the diff.
+///                                image       (table)   { media_type: string, data: string } base64 image.
+///                                instructions (table)  Array of { path, content } blocks injected as context.
+///                                state       (any)     Serializable state forwarded to restore.
+///   audiences       (string[]) Which model audiences see the tool. Values: "main", "sub", "all". Default: all audiences.
+///   kind            (string)   Optional grouping label (e.g. "filesystem").
+///   timeout         (number)   Execution timeout in seconds. 0 or false disables. Default: inherits agent deadline.
+///   header          (function) Optional. Called before execution, returns a string or BufHandle for the one-line header.
+///   restore         (function) Optional. Called to re-render a previous tool result. Receives `(tool_name, input, output, ctx)`.
+///   start           (function) Optional. Called when the tool call starts, before the handler runs.
+///   describe        (function) Optional. Returns a custom description string for the current context.
+///   examples        (table)    Optional. Array of example input objects for documentation.
+///   permission_scopes (string|function) Field name in schema (string) or `function(input)` returning a list of path scopes that need write permission.
+///   mutable_path    (string)   Schema field name (type: string) for the primary path the tool writes.
+///   start_annotation (string|table) Schema field used to annotate the start header with a count (string) or timeout (`{ field, kind="timeout" }`).
+/// @return
+/// @example
+/// maki.api.register_tool({
+///   name = "word_count",
+///   description = "Count words in a file.",
+///   kind = "read",
+///   schema = {
+///     properties = { path = { type = "string", description = "File path" } },
+///     required = { "path" },
+///   },
+///   handler = function(input)
+///     local f = io.open(input.path, "r")
+///     if not f then return { llm_output = "file not found", is_error = true } end
+///     local n = 0
+///     for _ in f:read("*a"):gmatch("%S+") do n = n + 1 end
+///     f:close()
+///     return tostring(n) .. " words"
+///   end,
+/// })
+#[lua_fn]
+fn register_tool(lua: &Lua, #[ctx] pending: PendingTools, spec: Table) -> LuaResult<()> {
+    register_tool_from_lua(lua, &spec, pending)
 }
 
-/// Registry snapshot without descriptions (avoids recursion from describe callbacks).
-fn get_tools_from_lua(lua: &Lua, opts: Option<Table>) -> LuaResult<Table> {
+/// Register a slash-command that appears in the user input bar.
+///
+/// Slash commands let the user trigger plugin actions by typing `/name` in the
+/// input. Use them for interactive workflows that do not need the model, like
+/// browsing memory files or toggling settings.
+///
+/// @param spec table Command specification:
+///   name        (string)   Required. The command name (without the leading slash).
+///   description (string)   Optional. Short description shown in the command palette.
+///   handler     (function) Required. Called when the user runs the command.
+/// @return
+/// @example
+/// maki.api.register_command({
+///   name = "/hello",
+///   description = "Say hello",
+///   handler = function()
+///     maki.ui.flash("Hello from my plugin!")
+///   end,
+/// })
+#[lua_fn]
+fn register_command(lua: &Lua, #[ctx] plugin: Arc<str>, spec: Table) -> LuaResult<()> {
+    register_command_from_lua(lua, &spec, plugin)
+}
+
+/// Add a piece of text to an aggregate prompt slot. Multiple plugins can each
+/// contribute to the same slot, and all contributions are concatenated.
+///
+/// Good for things like tool usage guidelines or extra context that should
+/// appear alongside other plugins' hints. If you need to own the whole slot
+/// (e.g. identity or tone), use `set_prompt` instead.
+///
+/// Throws if you pass a singleton slot name.
+///
+/// @param spec table Hint specification:
+///   slot    (string)         Required. Aggregate slot name (e.g. "tool_usage", "general").
+///   content (string|function) Required. Static text, or a `function()` that returns a string. Max 1 MiB.
+///   prompt  (string|string[]) Optional. Restrict to specific prompt ids (e.g. "system").
+/// @return
+/// @example
+/// maki.api.register_prompt_hint({
+///   slot = "tool_usage",
+///   content = "- Prefer **grep** over reading entire files.",
+/// })
+#[lua_fn]
+fn register_prompt_hint(lua: &Lua, #[ctx] plugin: Arc<str>, spec: Table) -> LuaResult<()> {
+    let slot: Slot = parse_slot(&spec)?;
+    if slot.kind() == SlotKind::Singleton {
+        return Err(mlua::Error::runtime(format!(
+            "register_prompt_hint is for aggregate slots ({}); \
+             use set_prompt for singleton slots ({})",
+            Slot::names_for_kind(SlotKind::Aggregate),
+            Slot::names_for_kind(SlotKind::Singleton),
+        )));
+    }
+    let prompts = parse_prompt_field(&spec)?;
+    validate_slot_prompt_compatibility(slot, &prompts)?;
+    let content = parse_hint_content(lua, &spec)?;
+    let reg = PromptHintRegistration {
+        prompts,
+        slot,
+        content,
+    };
+    let mut map = lua
+        .app_data_mut::<PromptHintCallbacks>()
+        .ok_or_else(|| mlua::Error::runtime("not initialized"))?;
+    map.entry(Arc::clone(&plugin)).or_default().push(reg);
+    Ok(())
+}
+
+/// Set a singleton prompt slot. Only one plugin owns each singleton slot at a
+/// time, so calling this replaces any previous value from your plugin.
+///
+/// Use this for slots like "identity" or "tone" where a single coherent value
+/// makes more sense than combining fragments. For aggregate slots like
+/// "tool_usage", use `register_prompt_hint` instead.
+///
+/// Throws if you pass an aggregate slot name.
+///
+/// @param spec table Spec fields mirror `register_prompt_hint`:
+///   slot    (string)         Required. Singleton slot name (e.g. "identity", "tone").
+///   content (string|function) Required. Static text or a `function()` returning a string. Max 1 MiB.
+///   prompt  (string|string[]) Optional. Restrict to specific prompt ids.
+/// @return
+/// @example
+/// maki.api.set_prompt({
+///   slot = "tone",
+///   content = "Be concise. No filler words.",
+/// })
+#[lua_fn]
+fn set_prompt(lua: &Lua, #[ctx] plugin: Arc<str>, spec: Table) -> LuaResult<()> {
+    let slot: Slot = parse_slot(&spec)?;
+    if slot.kind() == SlotKind::Aggregate {
+        return Err(mlua::Error::runtime(format!(
+            "set_prompt is for singleton slots ({}); \
+             use register_prompt_hint for aggregate slots ({})",
+            Slot::names_for_kind(SlotKind::Singleton),
+            Slot::names_for_kind(SlotKind::Aggregate),
+        )));
+    }
+    let prompts = parse_prompt_field(&spec)?;
+    validate_slot_prompt_compatibility(slot, &prompts)?;
+    let content = parse_hint_content(lua, &spec)?;
+    let reg = PromptHintRegistration {
+        prompts,
+        slot,
+        content,
+    };
+    let mut map = lua
+        .app_data_mut::<PromptHintCallbacks>()
+        .ok_or_else(|| mlua::Error::runtime("not initialized"))?;
+    map.entry(Arc::clone(&plugin)).or_default().push(reg);
+    Ok(())
+}
+
+/// Return a list of all registered tools. Useful for building UI that shows
+/// available tools or for checking which tools are enabled.
+///
+/// Each entry has the tool's name, schema, audiences, and an `enabled` flag.
+/// Describe callbacks are not invoked (the static description is used).
+///
+/// @param opts table? Options:
+///   config (table) Optional config table with a `disabled_tools` string[] field used to compute the `enabled` flag on each entry.
+/// @return (table[]) Array of tool entries: { name, schema, audiences, kind?, enabled }.
+/// @example
+/// local tools = maki.api.get_tools()
+/// for _, t in ipairs(tools) do
+///   print(t.name, t.enabled)
+/// end
+#[lua_fn]
+fn get_tools(lua: &Lua, opts: Option<Table>) -> LuaResult<Table> {
     let registry = lua
         .app_data_ref::<Arc<ToolRegistry>>()
         .map(|r| Arc::clone(&r))
@@ -688,29 +789,20 @@ fn get_tools_from_lua(lua: &Lua, opts: Option<Table>) -> LuaResult<Table> {
     Ok(out)
 }
 
-fn tool_entry_to_lua(lua: &Lua, entry: &RegisteredTool) -> LuaResult<Table> {
-    let audience = entry.tool.audience();
-    let audiences = lua.create_table()?;
-    for (flag, name) in maki_agent::tools::registry::AUDIENCE_NAMES {
-        if audience.contains(*flag) {
-            audiences.push(*name)?;
-        }
-    }
-    let t = lua.create_table()?;
-    t.set("name", entry.name())?;
-    t.set("schema", json_to_lua(lua, &entry.tool.schema())?)?;
-    t.set("audiences", audiences)?;
-    if let Some(kind) = entry.tool.tool_kind() {
-        t.set("kind", kind)?;
-    }
-    Ok(t)
-}
-
-/// Single-tool lookup that also hands out `header`/`restore` handles for
-/// Lua tools (nil for MCP or missing tools), wrapped so one broken tool
-/// cannot break a composing caller. Kept apart from `get_tools` so the
-/// listing stays a cheap data-only snapshot.
-fn get_tool_from_lua(lua: &Lua, name: String) -> LuaResult<LuaValue> {
+/// Look up a single tool by name. Returns its metadata table or nil if the
+/// tool does not exist. For Lua-registered tools the returned table also
+/// includes `header` and `restore` handle functions (wrapped so they never
+/// throw).
+///
+/// @param name string Exact tool name.
+/// @return (table|nil) Tool entry with fields { name, schema, audiences, kind?, header?, restore? }, or nil if not found.
+/// @example
+/// local t = maki.api.get_tool("bash")
+/// if t then
+///   print("bash audiences:", table.concat(t.audiences, ", "))
+/// end
+#[lua_fn]
+fn get_tool(lua: &Lua, name: String) -> LuaResult<LuaValue> {
     let registry = lua
         .app_data_ref::<Arc<ToolRegistry>>()
         .map(|r| Arc::clone(&r))
@@ -728,6 +820,51 @@ fn get_tool_from_lua(lua: &Lua, name: String) -> LuaResult<LuaValue> {
         }
     }
     Ok(LuaValue::Table(t))
+}
+
+lua_table! {
+    /// Plugin registration. This is where you tell maki about your tools,
+    /// slash commands, and prompt contributions.
+    ///
+    /// Most plugins only need `register_tool` and maybe `register_prompt_hint`.
+    /// Call these at the top level of your plugin file (during load).
+    ///
+    /// ```lua
+    /// maki.api.register_tool({ name = "greet", ... })
+    /// maki.api.register_prompt_hint({ slot = "tool_usage", content = "..." })
+    /// ```
+    extend "maki.api" => pub(crate) fn add_tool_fns(pending: PendingTools, plugin: Arc<str>), DOCS [
+        register_tool(pending), register_command(plugin), register_prompt_hint(plugin),
+        set_prompt(plugin), get_tools, get_tool,
+    ]
+}
+
+pub(crate) fn create_api_table(
+    lua: &Lua,
+    pending: PendingTools,
+    plugin: Arc<str>,
+) -> LuaResult<Table> {
+    let t = lua.create_table()?;
+    add_tool_fns(&t, lua, pending, plugin)?;
+    Ok(t)
+}
+
+fn tool_entry_to_lua(lua: &Lua, entry: &RegisteredTool) -> LuaResult<Table> {
+    let audience = entry.tool.audience();
+    let audiences = lua.create_table()?;
+    for (flag, name) in maki_agent::tools::registry::AUDIENCE_NAMES {
+        if audience.contains(*flag) {
+            audiences.push(*name)?;
+        }
+    }
+    let t = lua.create_table()?;
+    t.set("name", entry.name())?;
+    t.set("schema", json_to_lua(lua, &entry.tool.schema())?)?;
+    t.set("audiences", audiences)?;
+    if let Some(kind) = entry.tool.tool_kind() {
+        t.set("kind", kind)?;
+    }
+    Ok(t)
 }
 
 /// Async so wrapped fns can yield (e.g. bash restore highlights inline).

@@ -2,67 +2,164 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::language::Language;
-use mlua::{MultiValue, Table, UserData, UserDataFields, UserDataMethods, Value as LuaValue};
+use maki_lua_macro::{lua_class, lua_fn, lua_table};
+use mlua::{Lua, MultiValue, Value as LuaValue};
 use regex::Regex;
 use tree_sitter::{Node, Query, QueryCursor, QueryPredicateArg, StreamingIterator, Tree};
 
+use crate::docs::{FnDoc, ParamDoc};
+use crate::language::Language;
+
 use super::node::LuaNode;
+
+#[allow(non_upper_case_globals)]
+const iter_captures__doc: FnDoc = FnDoc {
+    name: "iter_captures",
+    args: "{node}, {source}, {start_row?}, {stop_row?}",
+    desc: "Iterates over every capture matched by this query. Each call to the returned iterator yields `(capture_index, node, metadata, match, active)`. Use this when you care about individual captures rather than whole pattern matches.",
+    params: &[
+        ParamDoc {
+            name: "{node}",
+            ty: "Node",
+            desc: "Root node to search within.",
+        },
+        ParamDoc {
+            name: "{source}",
+            ty: "string",
+            desc: "Source text the tree was parsed from.",
+        },
+        ParamDoc {
+            name: "{start_row?}",
+            ty: "integer",
+            desc: "Only match rows >= this value (0-based).",
+        },
+        ParamDoc {
+            name: "{stop_row?}",
+            ty: "integer",
+            desc: "Only match rows < this value (0-based).",
+        },
+    ],
+    returns: "(function) Iterator yielding (integer, Node, table, table, integer).",
+    example: "local q = maki.treesitter.query.parse(\"lua\", \"(identifier) @id\")\nfor idx, node, meta in q:iter_captures(root, source) do\n  print(idx, node:type())\nend",
+};
+
+#[allow(non_upper_case_globals)]
+const iter_matches__doc: FnDoc = FnDoc {
+    name: "iter_matches",
+    args: "{node}, {source}, {start_row?}, {stop_row?}",
+    desc: "Iterates over every full pattern match in this query. Each call to the returned iterator yields `(pattern_index, captures, metadata, active)` where captures is a table keyed by capture index. Use this when you need all captures for a pattern together.",
+    params: &[
+        ParamDoc {
+            name: "{node}",
+            ty: "Node",
+            desc: "Root node to search within.",
+        },
+        ParamDoc {
+            name: "{source}",
+            ty: "string",
+            desc: "Source text the tree was parsed from.",
+        },
+        ParamDoc {
+            name: "{start_row?}",
+            ty: "integer",
+            desc: "Only match rows >= this value (0-based).",
+        },
+        ParamDoc {
+            name: "{stop_row?}",
+            ty: "integer",
+            desc: "Only match rows < this value (0-based).",
+        },
+    ],
+    returns: "(function) Iterator yielding (integer, table, table, integer).",
+    example: "local q = maki.treesitter.query.parse(\"lua\", \"(function_declaration name: (identifier) @name)\"\n)\nfor pat, captures, meta in q:iter_matches(root, source) do\n  for cap_idx, nodes in pairs(captures) do\n    print(nodes[1]:type())\n  end\nend",
+};
 
 pub(crate) struct LuaQuery {
     pub(crate) inner: Arc<Query>,
 }
 
-impl UserData for LuaQuery {
-    fn add_fields<F: UserDataFields<Self>>(fields: &mut F) {
-        fields.add_field_method_get("captures", |lua, this| {
-            let tbl = lua.create_table()?;
-            for (i, name) in this.inner.capture_names().iter().enumerate() {
-                tbl.raw_set(i + 1, *name)?;
-            }
-            Ok(tbl)
-        });
+fn query_fields<F: mlua::UserDataFields<LuaQuery>>(fields: &mut F) {
+    fields.add_field_method_get("captures", |lua, this| {
+        let tbl = lua.create_table()?;
+        for (i, name) in this.inner.capture_names().iter().enumerate() {
+            tbl.raw_set(i + 1, *name)?;
+        }
+        Ok(tbl)
+    });
 
-        fields.add_field_method_get("info", |lua, _| lua.create_table());
-    }
-
-    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
-        methods.add_method("iter_captures", |lua, this, args: MultiValue| {
-            let parsed = IterArgs::parse(args, "iter_captures")?;
-            let results = collect_captures(&this.inner, &parsed);
-            stateful_iter(lua, results)
-        });
-
-        methods.add_method("iter_matches", |lua, this, args: MultiValue| {
-            let parsed = IterArgs::parse(args, "iter_matches")?;
-            let results = collect_matches(&this.inner, &parsed);
-            stateful_iter(lua, results)
-        });
-    }
+    fields.add_field_method_get("info", |lua, _| lua.create_table());
 }
 
-pub(crate) fn create_query_module(lua: &mlua::Lua) -> mlua::Result<Table> {
-    let query_table = lua.create_table()?;
+fn query_methods<M: mlua::UserDataMethods<LuaQuery>>(methods: &mut M) {
+    methods.add_method("iter_captures", |lua, this, args: MultiValue| {
+        let parsed = IterArgs::parse(args, "iter_captures")?;
+        let results = collect_captures(&this.inner, &parsed);
+        stateful_iter(lua, results)
+    });
 
-    query_table.set(
-        "parse",
-        lua.create_function(move |_, (lang_name, query_str): (String, String)| {
-            let lang = Language::from_name(&lang_name)
-                .ok_or_else(|| mlua::Error::runtime(format!("unknown language: {lang_name}")))?;
-            let query = Query::new(&lang.ts_language(), &query_str)
-                .map_err(|e| mlua::Error::runtime(format!("query parse error: {e}")))?;
-            Ok(LuaQuery {
-                inner: Arc::new(query),
-            })
-        })?,
-    )?;
+    methods.add_method("iter_matches", |lua, this, args: MultiValue| {
+        let parsed = IterArgs::parse(args, "iter_matches")?;
+        let results = collect_matches(&this.inner, &parsed);
+        stateful_iter(lua, results)
+    });
+}
 
-    query_table.set(
-        "get",
-        lua.create_function(|_, (_lang, _name): (String, String)| Ok(LuaValue::Nil))?,
-    )?;
+lua_class! {
+    /// A compiled tree-sitter query.
+    ///
+    /// Get one by calling `maki.treesitter.query.parse(lang, query_string)`.
+    /// Then use `:iter_captures()` or `:iter_matches()` to run it against a syntax tree.
+    ///
+    /// ```lua
+    /// local q = maki.treesitter.query.parse("lua", "(identifier) @id")
+    /// for idx, node, meta in q:iter_captures(root, source) do
+    ///   print(node:type())
+    /// end
+    /// ```
+    "maki.treesitter.Query" => LuaQuery, QUERY_DOCS [manual iter_captures, manual iter_matches] fields query_fields, extra query_methods
+}
 
-    Ok(query_table)
+/// Compiles a tree-sitter query string for {lang}.
+/// Throws if the language is unknown or the query has a syntax error.
+///
+/// @param lang string Language name, e.g. `"lua"`.
+/// @param query string Tree-sitter S-expression query.
+/// @return (Query) Compiled query object.
+/// @example
+/// local q = maki.treesitter.query.parse("lua", "(identifier) @id")
+#[lua_fn]
+fn parse(_lua: &Lua, lang: String, query: String) -> mlua::Result<LuaQuery> {
+    let ts_lang = Language::from_name(&lang)
+        .ok_or_else(|| mlua::Error::runtime(format!("unknown language: {lang}")))?
+        .ts_language();
+    let q = Query::new(&ts_lang, &query)
+        .map_err(|e| mlua::Error::runtime(format!("query parse error: {e}")))?;
+    Ok(LuaQuery { inner: Arc::new(q) })
+}
+
+/// Looks up a named built-in query for {lang} (not yet implemented, always returns nil).
+///
+/// @param lang string Language name.
+/// @param name string Query name, e.g. `"highlights"`.
+/// @return (Query|nil) Query object, or nil if not found.
+#[lua_fn]
+fn get(_lua: &Lua, lang: String, name: String) -> mlua::Result<Option<LuaQuery>> {
+    let _ = (lang, name);
+    Ok(None)
+}
+
+lua_table! {
+    /// Query compilation and lookup.
+    ///
+    /// Mirrors `vim.treesitter.query`. Use `parse()` to compile a tree-sitter
+    /// query string into a `Query` object you can run against parsed trees.
+    ///
+    /// ```lua
+    /// local q = maki.treesitter.query.parse("lua", "(string) @str")
+    /// ```
+    "maki.treesitter.query" => pub(crate) fn create_query_module(), DOCS [
+        parse, get,
+    ]
 }
 
 struct IterArgs {

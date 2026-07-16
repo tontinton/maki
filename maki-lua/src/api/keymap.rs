@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use arc_swap::ArcSwap;
 use crossterm::event::{KeyCode, KeyModifiers};
+use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Lua, RegistryKey, Result as LuaResult, Table};
 
 static NEXT_KEYMAP_ID: AtomicU64 = AtomicU64::new(1);
@@ -243,64 +244,6 @@ fn parse_key_name(name: &str) -> Result<KeyCode, String> {
     }
 }
 
-pub(crate) fn create_keymap_table(lua: &Lua, plugin: Arc<str>) -> LuaResult<Table> {
-    let t = lua.create_table()?;
-
-    let p = Arc::clone(&plugin);
-    t.set(
-        "set",
-        lua.create_function(
-            move |lua,
-                  (mode, key_str, callback, opts): (
-                String,
-                String,
-                mlua::Function,
-                Option<Table>,
-            )| {
-                if mode != "n" {
-                    return Err(mlua::Error::runtime(format!(
-                        "unsupported keymap mode: {mode}"
-                    )));
-                }
-                let (key, modifiers) =
-                    parse_key_notation(&key_str).map_err(mlua::Error::runtime)?;
-                let desc = opts
-                    .as_ref()
-                    .and_then(|o| o.get::<String>("desc").ok())
-                    .unwrap_or_default();
-                let registry_key = lua.create_registry_value(callback)?;
-                let (_, old) = lua
-                    .app_data_mut::<KeymapStore>()
-                    .ok_or_else(|| mlua::Error::runtime("keymap store not initialized"))?
-                    .set(key, modifiers, registry_key, Arc::clone(&p), desc);
-                if let Some(old_key) = old {
-                    tracing::warn!(key = %key_str, plugin = %p, "keymap shadowed by plugin");
-                    let _ = lua.remove_registry_value(old_key);
-                }
-                publish_keymap_snapshot(lua);
-                Ok(())
-            },
-        )?,
-    )?;
-
-    t.set(
-        "del",
-        lua.create_function(|lua, (_mode, key_str): (String, String)| {
-            let (key, modifiers) = parse_key_notation(&key_str).map_err(mlua::Error::runtime)?;
-            let old = lua
-                .app_data_mut::<KeymapStore>()
-                .and_then(|mut store| store.del(key, modifiers));
-            if let Some(old_key) = old {
-                let _ = lua.remove_registry_value(old_key);
-            }
-            publish_keymap_snapshot(lua);
-            Ok(())
-        })?,
-    )?;
-
-    Ok(t)
-}
-
 fn publish_keymap_snapshot(lua: &Lua) {
     if let Some(store) = lua.app_data_ref::<KeymapStore>() {
         let entries = store.snapshot_entries();
@@ -308,6 +251,86 @@ fn publish_keymap_snapshot(lua: &Lua) {
             writer.publish(entries);
         }
     }
+}
+
+/// Bind a key to a Lua function, just like `vim.keymap.set`. Only
+/// normal mode (`"n"`) is supported right now. If {lhs} is already
+/// mapped, the old binding is replaced and a warning is logged.
+///
+/// @param mode string Mode letter. Currently only `"n"` is accepted.
+/// @param lhs string Key in Vim notation, e.g. `"<C-t>"`, `"<Space>"`, `"a"`.
+/// @param rhs function Called when the key is pressed.
+/// @param opts table? Options:
+///   `desc` (string) short description shown in the keymap list.
+/// @example
+/// maki.keymap.set("n", "<C-t>", function()
+///   print("toggle!")
+/// end, { desc = "Toggle panel" })
+#[lua_fn]
+fn set(
+    lua: &Lua,
+    #[ctx] plugin: Arc<str>,
+    mode: String,
+    lhs: String,
+    rhs: mlua::Function,
+    opts: Option<Table>,
+) -> LuaResult<()> {
+    if mode != "n" {
+        return Err(mlua::Error::runtime(format!(
+            "unsupported keymap mode: {mode}"
+        )));
+    }
+    let (key, modifiers) = parse_key_notation(&lhs).map_err(mlua::Error::runtime)?;
+    let desc = opts
+        .as_ref()
+        .and_then(|o| o.get::<String>("desc").ok())
+        .unwrap_or_default();
+    let registry_key = lua.create_registry_value(rhs)?;
+    let (_, old) = lua
+        .app_data_mut::<KeymapStore>()
+        .ok_or_else(|| mlua::Error::runtime("keymap store not initialized"))?
+        .set(key, modifiers, registry_key, Arc::clone(&plugin), desc);
+    if let Some(old_key) = old {
+        tracing::warn!(key = %lhs, plugin = %plugin, "keymap shadowed by plugin");
+        let _ = lua.remove_registry_value(old_key);
+    }
+    publish_keymap_snapshot(lua);
+    Ok(())
+}
+
+/// Remove the mapping for {lhs} in {mode}. Does nothing if no mapping
+/// exists for that key.
+///
+/// @param mode string Mode letter (reserved for future modes).
+/// @param lhs string Key to unmap, in Vim notation.
+/// @example
+/// maki.keymap.del("n", "<C-t>")
+#[lua_fn]
+fn del(lua: &Lua, #[ctx] plugin: Arc<str>, mode: String, lhs: String) -> LuaResult<()> {
+    let _ = (mode, &plugin);
+    let (key, modifiers) = parse_key_notation(&lhs).map_err(mlua::Error::runtime)?;
+    let old = lua
+        .app_data_mut::<KeymapStore>()
+        .and_then(|mut store| store.del(key, modifiers));
+    if let Some(old_key) = old {
+        let _ = lua.remove_registry_value(old_key);
+    }
+    publish_keymap_snapshot(lua);
+    Ok(())
+}
+
+lua_table! {
+    /// Key mappings, modeled after `vim.keymap`. If you have written a
+    /// Neovim keymap plugin before, this will feel familiar.
+    ///
+    /// ```lua
+    /// maki.keymap.set("n", "<C-t>", function()
+    ///   print("hello")
+    /// end, { desc = "Say hello" })
+    /// ```
+    "maki.keymap" => pub(crate) fn create_keymap_table(plugin: Arc<str>), DOCS [
+        set(plugin), del(plugin),
+    ]
 }
 
 #[cfg(test)]

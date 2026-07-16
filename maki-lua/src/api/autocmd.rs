@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Function, Lua, Result as LuaResult, Table, Value};
 
 use crate::api::util::dispatch::{DepthGuard, call_isolated};
@@ -123,71 +124,105 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
     }
 }
 
-pub(crate) fn add_autocmd_methods(api_table: &Table, lua: &Lua, plugin: Arc<str>) -> LuaResult<()> {
-    let p = Arc::clone(&plugin);
-    api_table.set(
-        "create_autocmd",
-        lua.create_function(move |lua, (event, opts): (Value, Table)| {
-            let events = parse_string_or_seq(event, "event")?;
-            let callback: Function = opts.get("callback")?;
-            let once: bool = opts.get("once").unwrap_or(false);
-            let patterns = match opts.get::<Value>("pattern")? {
-                Value::Nil => None,
-                v => Some(parse_string_or_seq(v, "pattern")?),
-            };
-            let id = NEXT_AUTOCMD_ID.fetch_add(1, Ordering::Relaxed);
-            let mut store = lua
-                .app_data_mut::<AutocmdStore>()
-                .ok_or_else(|| mlua::Error::runtime("autocmd store not initialized"))?;
-            for event in events {
-                store.register(
-                    event,
-                    AutocmdEntry {
-                        id,
-                        callback: callback.clone(),
-                        plugin: Arc::clone(&p),
-                        once,
-                        patterns: patterns.clone(),
-                    },
-                );
-            }
-            Ok(id)
-        })?,
-    )?;
+/// Listen for one or more events. Returns an id you can pass to
+/// `del_autocmd` later to remove the listener.
+///
+/// Built-in events fired by the host: `"TurnStart"`, `"TurnEnd"`,
+/// `"TurnError"`, `"SessionReset"`. Plugins can also fire their own
+/// events with `exec_autocmds`.
+///
+/// @param event string|string[] Event name or list of names.
+/// @param opts table Options:
+///   `callback` (function) called with an ev table `{ id, event, match, data }`.
+///   `once` (boolean) remove the handler after it fires once (default false).
+///   `pattern` (string|string[]) only fire when the pattern matches. `"*"` matches everything. Omit to match all.
+/// @return (integer) Autocmd id.
+/// @example
+/// local id = maki.api.create_autocmd("TurnEnd", {
+///   callback = function(ev)
+///     print("turn ended: " .. ev.event)
+///   end,
+/// })
+#[lua_fn]
+fn create_autocmd(lua: &Lua, #[ctx] plugin: Arc<str>, event: Value, opts: Table) -> LuaResult<u64> {
+    let events = parse_string_or_seq(event, "event")?;
+    let callback: Function = opts.get("callback")?;
+    let once: bool = opts.get("once").unwrap_or(false);
+    let patterns = match opts.get::<Value>("pattern")? {
+        Value::Nil => None,
+        v => Some(parse_string_or_seq(v, "pattern")?),
+    };
+    let id = NEXT_AUTOCMD_ID.fetch_add(1, Ordering::Relaxed);
+    let mut store = lua
+        .app_data_mut::<AutocmdStore>()
+        .ok_or_else(|| mlua::Error::runtime("autocmd store not initialized"))?;
+    for event in events {
+        store.register(
+            event,
+            AutocmdEntry {
+                id,
+                callback: callback.clone(),
+                plugin: Arc::clone(&plugin),
+                once,
+                patterns: patterns.clone(),
+            },
+        );
+    }
+    Ok(id)
+}
 
-    api_table.set(
-        "del_autocmd",
-        lua.create_function(|lua, id: u64| {
-            if let Some(mut store) = lua.app_data_mut::<AutocmdStore>() {
-                store.remove(id);
-            }
-            Ok(())
-        })?,
-    )?;
-
-    api_table.set(
-        "exec_autocmds",
-        lua.create_function(|lua, (event, opts): (Value, Option<Table>)| {
-            let events = parse_string_or_seq(event, "event")?;
-            let (pattern, data) = match opts {
-                Some(opts) => {
-                    let pattern = match opts.get::<Value>("pattern")? {
-                        Value::Nil => None,
-                        Value::String(s) => Some(s.to_str()?.to_owned()),
-                        _ => return Err(mlua::Error::runtime("pattern must be a string")),
-                    };
-                    (pattern, opts.get::<Value>("data")?)
-                }
-                None => (None, Value::Nil),
-            };
-            for event in events {
-                dispatch(lua, &event, pattern.as_deref(), data.clone());
-            }
-            Ok(())
-        })?,
-    )?;
-
+/// Remove a previously registered autocmd. Does nothing if the {id}
+/// does not exist.
+///
+/// @param id integer Id returned by `create_autocmd`.
+/// @return
+/// @example
+/// maki.api.del_autocmd(id)
+#[lua_fn]
+fn del_autocmd(lua: &Lua, id: u64) -> LuaResult<()> {
+    if let Some(mut store) = lua.app_data_mut::<AutocmdStore>() {
+        store.remove(id);
+    }
     Ok(())
+}
+
+/// Fire one or more events manually. Every matching autocmd callback
+/// runs synchronously before this function returns.
+///
+/// @param event string|string[] Event name or list of names to fire.
+/// @param opts table? Options:
+///   `pattern` (string) passed to callbacks as `ev.match`.
+///   `data` (any) arbitrary value passed as `ev.data`.
+/// @return
+/// @example
+/// maki.api.exec_autocmds("MyEvent", {
+///   pattern = "init",
+///   data = { msg = "hello" },
+/// })
+#[lua_fn]
+fn exec_autocmds(lua: &Lua, event: Value, opts: Option<Table>) -> LuaResult<()> {
+    let events = parse_string_or_seq(event, "event")?;
+    let (pattern, data) = match opts {
+        Some(opts) => {
+            let pattern = match opts.get::<Value>("pattern")? {
+                Value::Nil => None,
+                Value::String(s) => Some(s.to_str()?.to_owned()),
+                _ => return Err(mlua::Error::runtime("pattern must be a string")),
+            };
+            (pattern, opts.get::<Value>("data")?)
+        }
+        None => (None, Value::Nil),
+    };
+    for event in events {
+        dispatch(lua, &event, pattern.as_deref(), data.clone());
+    }
+    Ok(())
+}
+
+lua_table! {
+    extend "maki.api" => pub(crate) fn add_autocmd_methods(plugin: Arc<str>), DOCS [
+        create_autocmd(plugin), del_autocmd, exec_autocmds,
+    ]
 }
 
 #[cfg(test)]

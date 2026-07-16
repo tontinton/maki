@@ -12,11 +12,12 @@ use maki_agent::tools::interpreter_bridge::build_tool_input;
 use maki_interpreter::error::InterpreterError;
 use maki_interpreter::runner::{self, ToolFn};
 use maki_interpreter::{AsyncResolver, PendingCall};
+use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Function, Lua, Result as LuaResult, Table};
 use serde_json::Value;
 
 use crate::api::util::convert::{json_to_lua, lua_tool_result};
-use crate::plugin_permissions::{Permission, PluginPermissions};
+use crate::plugin_permissions::PluginPermissions;
 use crate::runtime::{TaskHandle, lock_cell};
 
 const BRIDGE_CLOSED: &str = "tool bridge closed (cancelled)";
@@ -26,15 +27,6 @@ type CallResults = Vec<(u32, Result<Value, String>)>;
 enum BridgeMsg {
     Line(String),
     Calls(Vec<PendingCall>, flume::Sender<CallResults>),
-}
-
-pub(crate) fn create_interpreter_table(lua: &Lua, perms: &PluginPermissions) -> LuaResult<Table> {
-    let t = lua.create_table()?;
-    t.set(
-        "run",
-        perms.guard_async(Permission::Run, lua, interpreter_run)?,
-    )?;
-    Ok(t)
 }
 
 fn required<T: mlua::FromLua>(opts: &Table, key: &str) -> LuaResult<T> {
@@ -69,9 +61,39 @@ async fn call_lua_tool(lua: Lua, f: Option<Function>, pc: &PendingCall) -> Resul
         .map_err(|e| format!("{}: {e}", pc.name))
 }
 
+/// Run Python code in a sandboxed interpreter with memory and time limits.
+/// Stdout lines are streamed to your {on_output} callback as they are produced.
+/// If the Python code calls tools, those calls are dispatched to the Lua
+/// functions you provide in {opts}.tools.
+///
+/// The result table has optional fields: `stdout` (string, trimmed combined
+/// output) and `output` (string, the final expression value). On error, the
+/// table is empty and the second return value is the error message.
+///
+/// @param code string Python source code to execute.
+/// @param opts table Required fields:
+///   `timeout` (integer) - execution time limit in seconds.
+///   `max_memory_mb` (integer) - memory limit in megabytes.
+///   `on_output` (function) - called with each stdout line (string) as it is
+///     produced. Must not yield.
+/// Optional fields:
+///   `tools` (table?) - map of `name -> function` for tools the sandbox may call.
+///     Each function receives the tool input table and must return `(string)` or
+///     `(nil, err)`. Tool calls are batched and dispatched concurrently.
+/// @return (table, string?) Result table, plus an error string on failure.
+/// @example
+/// local result, err = maki.interpreter.run("print(2 + 2)", {
+///   timeout = 30,
+///   max_memory_mb = 256,
+///   on_output = function(line) print("py: " .. line) end,
+/// })
+/// if err then error(err) end
+/// if result.stdout then print(result.stdout) end
+#[lua_fn(guard = Run, name = "run")]
 async fn interpreter_run(
     lua: Lua,
-    (code, opts): (String, Table),
+    code: String,
+    opts: Table,
 ) -> LuaResult<(Table, Option<String>)> {
     let timeout_secs: u64 = required(&opts, "timeout")?;
     let max_memory_mb: usize = required(&opts, "max_memory_mb")?;
@@ -176,4 +198,23 @@ async fn interpreter_run(
         }
         Err(e) => Ok((tbl, Some(e))),
     }
+}
+
+lua_table! {
+    /// Run Python code in a memory-safe, time-limited sandbox.
+    ///
+    /// The sandbox uses the monty interpreter. Python code can call back into
+    /// Lua-defined tools, and stdout is streamed line by line. Requires the
+    /// `run` permission.
+    ///
+    /// ```lua
+    /// local r, err = maki.interpreter.run("print('hello')", {
+    ///   timeout = 10,
+    ///   max_memory_mb = 128,
+    ///   on_output = function(line) print(line) end,
+    /// })
+    /// ```
+    "maki.interpreter" => pub(crate) fn create_interpreter_table(perms: &PluginPermissions), DOCS [
+        interpreter_run(perms),
+    ]
 }
