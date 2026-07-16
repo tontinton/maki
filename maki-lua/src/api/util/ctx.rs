@@ -348,7 +348,7 @@ impl UserData for LuaCtx {
             if let Some(buf) = crate::api::ui::buf::buf_from_reply(&val) {
                 lock_cell(&active_task(lua)).root_buf = Some(buf);
             }
-            let _ = tx.send(ToolCallReply::from_lua_value(&val));
+            let _ = tx.send(ToolCallReply::from_lua_value(lua, &val));
             Ok((LuaValue::Nil, None))
         });
     }

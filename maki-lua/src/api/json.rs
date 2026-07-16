@@ -10,7 +10,7 @@ struct LuaSchemaValidator {
 impl UserData for LuaSchemaValidator {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_method("validate", |lua, this, value: Value| {
-            let json = lua_to_json(&value)?;
+            let json = lua_to_json(lua, &value)?;
             let errors: Vec<String> = this
                 .validator
                 .iter_errors(&json)
@@ -41,7 +41,7 @@ pub(crate) fn create_json_table(lua: &Lua) -> LuaResult<Table> {
     json.set(
         "schema_validator",
         lua.create_function(|lua, schema: Value| {
-            let schema_json = match lua_to_json(&schema) {
+            let schema_json = match lua_to_json(lua, &schema) {
                 Ok(v) => v,
                 Err(e) => return err_pair(lua, e),
             };
@@ -161,6 +161,16 @@ mod tests {
             .eval()
             .unwrap();
         assert_eq!(result, 3);
+    }
+
+    #[test]
+    fn encode_decode_empty_array_roundtrips() {
+        let lua = lua_with_json();
+        let result: String = lua
+            .load(r#"local s = json.encode(json.decode('[]')); return s"#)
+            .eval()
+            .unwrap();
+        assert_eq!(result, "[]");
     }
 
     #[test]

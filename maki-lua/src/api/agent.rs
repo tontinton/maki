@@ -221,10 +221,10 @@ async fn tools(
 /// annotation alike. Both run synchronously on the Lua thread and must
 /// not yield.
 async fn call_tool(
-    _lua: Lua,
+    lua: Lua,
     (ctx, name, input, opts): (mlua::UserDataRef<LuaCtx>, String, LuaValue, Option<Table>),
 ) -> LuaResult<Pair<String>> {
-    let input_json = lua_to_json(&input)?;
+    let input_json = lua_to_json(&lua, &input)?;
     let agent = try_pair!(dispatch_ctx(&ctx, "call_tool"));
     let mut tctx = agent.to_tool_context();
     let (mut on_buf, mut on_ann, mut rx) = (None, None, None);
@@ -512,7 +512,7 @@ async fn session(
 
     let mut tools_json: JsonValue = match tools_val {
         Some(val) => {
-            let tools = lua_to_json(&val)?;
+            let tools = lua_to_json(&lua, &val)?;
             if !tools.is_array() {
                 return Err(mlua::Error::runtime("tools must be an array"));
             }
@@ -530,7 +530,7 @@ async fn session(
                 spec.get::<String>("description")
                     .map_err(|_| format!("local_tools.{name}: 'description' is required"))
             );
-            let input_schema = lua_to_json(&spec.get::<LuaValue>("input_schema")?)?;
+            let input_schema = lua_to_json(&lua, &spec.get::<LuaValue>("input_schema")?)?;
             let handler = try_pair!(
                 spec.get::<Function>("handler")
                     .map_err(|_| format!("local_tools.{name}: 'handler' is required"))

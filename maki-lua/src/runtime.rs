@@ -1707,7 +1707,7 @@ async fn run_tool_call(
                 if let Some(buf) = crate::api::ui::buf::buf_from_reply(&val) {
                     lock_cell(&handle).root_buf = Some(buf);
                 }
-                ToolCallReply::from_lua_value(&val)
+                ToolCallReply::from_lua_value(&lua, &val)
             }
             Err(e) => ToolCallReply::err(strip_traceback(&e)),
         }
@@ -2055,7 +2055,7 @@ mod tests {
     fn from_lua_value_plain_string() {
         let lua = test_lua();
         let val = LuaValue::String(lua.create_string("ok").unwrap());
-        let reply = ToolCallReply::from_lua_value(&val);
+        let reply = ToolCallReply::from_lua_value(&lua, &val);
         assert_eq!(reply.result, Ok("ok".to_string()));
         assert!(reply.snapshot.is_none());
         assert!(reply.header.is_none());
@@ -2070,7 +2070,7 @@ mod tests {
         t.set("llm_output", "text").unwrap();
         t.set("body", body_handle).unwrap();
         t.set("header", hdr_handle).unwrap();
-        let reply = ToolCallReply::from_lua_value(&LuaValue::Table(t));
+        let reply = ToolCallReply::from_lua_value(&lua, &LuaValue::Table(t));
         assert_eq!(reply.result, Ok("text".to_string()));
         assert_eq!(reply.snapshot.unwrap().first_line_text(), "body line");
         assert_eq!(reply.header.unwrap().first_line_text(), "hdr line");
@@ -2082,7 +2082,7 @@ mod tests {
         let t = lua.create_table().unwrap();
         t.set("body", lua.create_userdata(make_buf_handle("x")).unwrap())
             .unwrap();
-        let reply = ToolCallReply::from_lua_value(&LuaValue::Table(t));
+        let reply = ToolCallReply::from_lua_value(&lua, &LuaValue::Table(t));
         assert!(reply.result.is_err());
         assert!(reply.snapshot.is_some());
     }

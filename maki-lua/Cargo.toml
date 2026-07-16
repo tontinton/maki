@@ -61,6 +61,7 @@ tree-sitter-starlark = { workspace = true }
 tree-sitter-swift = { workspace = true }
 tree-sitter-typescript = { workspace = true }
 tree-sitter-zig = { workspace = true }
+tree-sitter-dart = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
 

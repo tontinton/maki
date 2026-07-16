@@ -25,6 +25,7 @@ pub enum Language {
     Starlark,
     Zig,
     Nix,
+    Dart,
 }
 
 impl Language {
@@ -53,6 +54,7 @@ impl Language {
             "starlark" => Some(Self::Starlark),
             "zig" => Some(Self::Zig),
             "nix" => Some(Self::Nix),
+            "dart" => Some(Self::Dart),
             _ => None,
         }
     }
@@ -82,6 +84,7 @@ impl Language {
             "bzl" => Some(Self::Starlark),
             "zig" => Some(Self::Zig),
             "nix" => Some(Self::Nix),
+            "dart" => Some(Self::Dart),
             _ => None,
         }
     }
@@ -111,6 +114,7 @@ impl Language {
             Self::Starlark => tree_sitter_starlark::LANGUAGE.into(),
             Self::Zig => tree_sitter_zig::LANGUAGE.into(),
             Self::Nix => tree_sitter_nix::LANGUAGE.into(),
+            Self::Dart => tree_sitter_dart::LANGUAGE.into(),
         }
     }
 }

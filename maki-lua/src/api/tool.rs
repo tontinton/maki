@@ -817,7 +817,7 @@ fn normalize_restore_ctx(lua: &Lua, v: Option<&LuaValue>) -> LuaResult<LuaValue>
                 .unwrap_or_default(),
             t.get::<LuaValue>("state")
                 .ok()
-                .and_then(|v| lua_to_json(&v).ok())
+                .and_then(|v| lua_to_json(lua, &v).ok())
                 .filter(|v| !v.is_null()),
         ),
         _ => (ToolOutputLines::default(), None),
@@ -1109,7 +1109,7 @@ pub(crate) struct ToolCallReply {
 }
 
 impl ToolCallReply {
-    pub fn from_lua_value(val: &LuaValue) -> Self {
+    pub fn from_lua_value(lua: &Lua, val: &LuaValue) -> Self {
         let mut result = coerce_tool_result(val);
         let LuaValue::Table(t) = val else {
             return Self::plain(result);
@@ -1139,7 +1139,7 @@ impl ToolCallReply {
         };
         let state = match t.get::<LuaValue>("state") {
             Ok(LuaValue::Nil) | Err(_) => None,
-            Ok(v) => crate::api::util::convert::lua_to_json(&v)
+            Ok(v) => crate::api::util::convert::lua_to_json(lua, &v)
                 .inspect_err(|e| tracing::warn!(error = %e, "tool state is not JSON-serializable, dropping it"))
                 .ok(),
         };
@@ -1336,7 +1336,7 @@ mod tests {
     fn malformed_image_reply_fails_the_call(src: &str, expected: &str) {
         let lua = Lua::new();
         let val: LuaValue = lua.load(format!("return {src}")).eval().unwrap();
-        let reply = ToolCallReply::from_lua_value(&val);
+        let reply = ToolCallReply::from_lua_value(&lua, &val);
         assert!(reply.image.is_none());
         let err = reply.result.expect_err("malformed image must error");
         assert!(err.contains(expected), "got: {err}");
@@ -1642,7 +1642,7 @@ mod tests {
     fn from_lua_value_table_with_markdown_format_ok() {
         let lua = Lua::new();
         let val = reply_table(&lua, "hi", Some(LUA_FORMAT_MARKDOWN), false);
-        let reply = ToolCallReply::from_lua_value(&val);
+        let reply = ToolCallReply::from_lua_value(&lua, &val);
         assert_eq!(reply.result, Ok("hi".to_string()));
         assert_eq!(reply.format, LuaOutputFormat::Markdown);
     }
@@ -1654,7 +1654,7 @@ mod tests {
         // as markdown.
         let lua = Lua::new();
         let val = reply_table(&lua, "boom", Some(LUA_FORMAT_MARKDOWN), true);
-        let reply = ToolCallReply::from_lua_value(&val);
+        let reply = ToolCallReply::from_lua_value(&lua, &val);
         assert_eq!(reply.result, Err("boom".to_string()));
         assert_eq!(reply.format, LuaOutputFormat::Markdown);
     }
@@ -1663,7 +1663,7 @@ mod tests {
     fn from_lua_value_table_without_format_defaults_to_plain() {
         let lua = Lua::new();
         let val = reply_table(&lua, "hi", None, false);
-        let reply = ToolCallReply::from_lua_value(&val);
+        let reply = ToolCallReply::from_lua_value(&lua, &val);
         assert_eq!(reply.result, Ok("hi".to_string()));
         assert_eq!(reply.format, LuaOutputFormat::Plain);
     }
@@ -1672,11 +1672,11 @@ mod tests {
     fn from_lua_value_non_table_defaults_to_plain() {
         let lua = Lua::new();
         let string_val = LuaValue::String(lua.create_string("hello").unwrap());
-        let reply = ToolCallReply::from_lua_value(&string_val);
+        let reply = ToolCallReply::from_lua_value(&lua, &string_val);
         assert_eq!(reply.result, Ok("hello".to_string()));
         assert_eq!(reply.format, LuaOutputFormat::Plain);
 
-        let bool_reply = ToolCallReply::from_lua_value(&LuaValue::Boolean(true));
+        let bool_reply = ToolCallReply::from_lua_value(&lua, &LuaValue::Boolean(true));
         assert_eq!(bool_reply.result, Err(TOOL_HANDLER_RETURN_ERR.to_string()));
         assert_eq!(bool_reply.format, LuaOutputFormat::Plain);
     }
@@ -1695,7 +1695,7 @@ mod tests {
         instructions.set(1, inst1).unwrap();
         t.set("instructions", instructions).unwrap();
 
-        let reply = ToolCallReply::from_lua_value(&LuaValue::Table(t));
+        let reply = ToolCallReply::from_lua_value(&lua, &LuaValue::Table(t));
         assert_eq!(reply.result, Ok("file contents".to_string()));
         let blocks = reply.instructions.expect("instructions should be Some");
         assert_eq!(blocks.len(), 1);
@@ -1712,7 +1712,7 @@ mod tests {
         t.set("diff_path", "/tmp/file.rs").unwrap();
         t.set("diff_before", "old content").unwrap();
         t.set("diff_after", "new content").unwrap();
-        let diff = ToolCallReply::from_lua_value(&LuaValue::Table(t))
+        let diff = ToolCallReply::from_lua_value(&lua, &LuaValue::Table(t))
             .diff
             .expect("diff should be Some");
         assert_eq!(diff.path, "/tmp/file.rs");
@@ -1722,7 +1722,7 @@ mod tests {
         let partial = lua.create_table().unwrap();
         partial.set("llm_output", "patched").unwrap();
         partial.set("diff_path", "/tmp/file.rs").unwrap();
-        let d = ToolCallReply::from_lua_value(&LuaValue::Table(partial))
+        let d = ToolCallReply::from_lua_value(&lua, &LuaValue::Table(partial))
             .diff
             .unwrap();
         assert_eq!(d.before, "");
