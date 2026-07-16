@@ -82,12 +82,11 @@ fn execute_script(script: &str, install_dir: &Path) -> Result<(), UpdateError> {
         .map_err(UpdateError::WriteScript)?;
     tmp.flush().map_err(UpdateError::WriteScript)?;
 
-    let mut cmd = std::process::Command::new("sh");
-    cmd.arg(tmp.path());
-    if std::env::var_os(INSTALL_DIR_ENV).is_none() {
-        cmd.env(INSTALL_DIR_ENV, install_dir);
-    }
-    let status = cmd.status().map_err(UpdateError::ExecScript)?;
+    let status = std::process::Command::new("sh")
+        .arg(tmp.path())
+        .env(INSTALL_DIR_ENV, install_dir)
+        .status()
+        .map_err(UpdateError::ExecScript)?;
 
     if !status.success() {
         return Err(UpdateError::InstallFailed(status.code()));
@@ -151,8 +150,11 @@ fn restore_backup(backup_path: &Path, exe_path: &Path) -> Result<(), UpdateError
     Ok(())
 }
 
-fn prompt_yes() -> bool {
-    eprint!("Run this script? [y/N] ");
+fn prompt_yes(install_dir: &Path) -> bool {
+    eprint!(
+        "Install to {} and run this script? [y/N] ",
+        install_dir.display()
+    );
     let _ = std::io::stderr().flush();
     let mut input = String::new();
     std::io::stdin().read_line(&mut input).is_ok() && input.trim().eq_ignore_ascii_case("y")
@@ -170,9 +172,17 @@ pub fn update(skip_confirm: bool, no_color: bool) -> Result<(), UpdateError> {
     println!();
 
     let exe_path = current_exe_resolved()?;
-    let install_dir = exe_path.parent().ok_or_else(|| {
-        UpdateError::CurrentExe(std::io::Error::other("binary path has no parent directory"))
-    })?;
+    let install_dir = match std::env::var_os(INSTALL_DIR_ENV).filter(|d| !d.is_empty()) {
+        Some(dir) => PathBuf::from(dir),
+        None => exe_path
+            .parent()
+            .ok_or_else(|| {
+                UpdateError::CurrentExe(std::io::Error::other(
+                    "binary path has no parent directory",
+                ))
+            })?
+            .to_path_buf(),
+    };
     let storage = StateDir::resolve()?;
 
     let script = fetch_script()?;
@@ -183,14 +193,14 @@ pub fn update(skip_confirm: bool, no_color: bool) -> Result<(), UpdateError> {
         println!("{}", maki_ui::highlight_ansi("bash", &script));
     }
 
-    if !skip_confirm && !prompt_yes() {
+    if !skip_confirm && !prompt_yes(&install_dir) {
         println!("Aborted.");
         return Ok(());
     }
 
     let backup_path = backup_binary(&exe_path, &storage)?;
 
-    execute_script(&script, install_dir)?;
+    execute_script(&script, &install_dir)?;
 
     println!();
     println!("Updated successfully.");
