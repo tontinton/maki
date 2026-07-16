@@ -100,8 +100,19 @@ impl ModelRegistry {
         provider: ProviderKind,
         static_tier: Option<ModelTier>,
     ) -> ModelTier {
-        if let Some((&t, _)) = self.overrides.iter().find(|(_, s)| s.as_str() == spec) {
-            return t;
+        // A spec may hold several tiers; prefer the strongest agent tier,
+        // falling back to Compaction only when it is the sole assignment.
+        let mut tiers = self
+            .overrides
+            .iter()
+            .rev()
+            .filter(|(_, s)| s.as_str() == spec)
+            .map(|(&t, _)| t);
+        if let Some(first) = tiers.next() {
+            return match first {
+                ModelTier::Compaction => tiers.next().unwrap_or(first),
+                t => t,
+            };
         }
         if let Some(t) = static_tier {
             return t;
@@ -183,8 +194,10 @@ fn tier_for_position(pos: usize) -> ModelTier {
     [ModelTier::Strong, ModelTier::Medium, ModelTier::Weak][pos.min(2)]
 }
 
-// On-disk format: { "provider/model": "tier", ... } for human readability.
-// Inverted to/from the in-memory BTreeMap<ModelTier, String>.
+// On-disk format: { "tier": "spec", ... } keyed by tier, matching the in-memory
+// `BTreeMap<ModelTier, String>`. Tier-keyed storage preserves a model assigned
+// to multiple tiers; a spec-keyed file would collapse them to a single entry.
+// Legacy files were spec-keyed and are inverted on read.
 
 fn read_overrides(path: &Path) -> BTreeMap<ModelTier, String> {
     let Ok(raw) = std::fs::read_to_string(path) else {
@@ -207,10 +220,7 @@ fn read_overrides(path: &Path) -> BTreeMap<ModelTier, String> {
 }
 
 fn write_overrides(path: &Path, overrides: &BTreeMap<ModelTier, String>) {
-    // Invert to human-readable { "spec": "tier" } format on disk.
-    let disk: BTreeMap<String, ModelTier> =
-        overrides.iter().map(|(t, s)| (s.clone(), *t)).collect();
-    let json = match serde_json::to_vec_pretty(&disk) {
+    let json = match serde_json::to_vec_pretty(overrides) {
         Ok(v) => v,
         Err(e) => {
             warn!(error = %e, "failed to serialize tier overrides");
@@ -255,6 +265,20 @@ mod tests {
         assert_eq!(t("ollama/pos1", None), ModelTier::Weak);
         assert_eq!(t("ollama/pos2", None), ModelTier::Weak);
         assert_eq!(t("ollama/unknown", None), ModelTier::Medium);
+    }
+
+    #[test]
+    fn tier_for_prefers_strongest_over_multi_tier_spec() {
+        let mut reg = make_map(&[], &[]);
+        reg.set("ollama/multi".into(), ModelTier::Medium);
+        reg.set("ollama/multi".into(), ModelTier::Strong);
+        reg.set("ollama/multi".into(), ModelTier::Compaction);
+        reg.set("ollama/compact-only".into(), ModelTier::Compaction);
+
+        let t = |spec| reg.tier_for(spec, ProviderKind::Ollama, None);
+
+        assert_eq!(t("ollama/multi"), ModelTier::Strong);
+        assert_eq!(t("ollama/compact-only"), ModelTier::Compaction);
     }
 
     #[test]
@@ -409,5 +433,22 @@ mod tests {
         let loaded = read_overrides(&path);
         assert_eq!(loaded.get(&ModelTier::Strong).unwrap(), "ollama/b");
         assert_eq!(loaded.get(&ModelTier::Weak).unwrap(), "ollama/c");
+    }
+
+    #[test]
+    fn write_then_read_preserves_multi_tier_assignment() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(TIERS_FILE);
+
+        let mut m = BTreeMap::new();
+        m.insert(ModelTier::Strong, "ollama/qwen3".into());
+        m.insert(ModelTier::Medium, "ollama/qwen3".into());
+        m.insert(ModelTier::Weak, "ollama/qwen3:8b".into());
+        write_overrides(&path, &m);
+
+        let loaded = read_overrides(&path);
+        assert_eq!(loaded.get(&ModelTier::Strong).unwrap(), "ollama/qwen3");
+        assert_eq!(loaded.get(&ModelTier::Medium).unwrap(), "ollama/qwen3");
+        assert_eq!(loaded.get(&ModelTier::Weak).unwrap(), "ollama/qwen3:8b");
     }
 }
