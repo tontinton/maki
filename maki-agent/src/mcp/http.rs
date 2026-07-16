@@ -113,15 +113,29 @@ impl HttpTransport {
         .await
     }
 
-    fn parse_rpc_response(&self, body_str: &str, content_type: &str) -> Result<Value, McpError> {
+    fn parse_rpc_response(&self, body_str: &str, content_type: &str, request_id: u64) -> Result<Value, McpError> {
         let rpc_value: Value = if content_type.contains(CT_SSE) {
-            parse_sse_events(body_str)
-                .into_iter()
-                .next()
-                .ok_or_else(|| McpError::InvalidResponse {
-                    server: self.server(),
-                    reason: "no SSE events in response".into(),
-                })?
+            let events = parse_sse_events(body_str);
+            match events
+                .iter()
+                .find(|v| v.get("id").and_then(|i| i.as_u64()) == Some(request_id))
+            {
+                Some(v) => v.clone(),
+                None => {
+                    let mut reason = format!("no SSE event matching request id {request_id}");
+                    if let Some(msg) = events
+                        .iter()
+                        .find_map(|v| v.get("error").and_then(|e| e.get("message")))
+                        .and_then(|m| m.as_str())
+                    {
+                        reason.push_str(&format!(" (server error: {msg})"));
+                    }
+                    return Err(McpError::InvalidResponse {
+                        server: self.server(),
+                        reason,
+                    });
+                }
+            }
         } else {
             serde_json::from_str(body_str).map_err(|e| McpError::InvalidResponse {
                 server: self.server(),
@@ -200,7 +214,7 @@ impl McpTransport for HttpTransport {
                 .and_then(|v| v.to_str().ok())
                 .is_some_and(|ct| ct.contains(CT_SSE));
 
-            let result = self.parse_rpc_response(&body_str, if is_sse { CT_SSE } else { CT_JSON });
+            let result = self.parse_rpc_response(&body_str, if is_sse { CT_SSE } else { CT_JSON }, id);
             info!(server = %self.server(), method, status = %status, duration_ms = start.elapsed().as_millis() as u64, "MCP HTTP request");
             result
         })
@@ -318,5 +332,33 @@ mod tests {
     fn parse_sse(input: &str, expected: &[Value]) {
         let events = parse_sse_events(input);
         assert_eq!(events, expected);
+    }
+
+    #[test]
+    fn parse_rpc_response_skips_notification_before_matching_id() {
+        let transport = HttpTransport::new("test", "http://localhost", &HashMap::new(), Duration::ZERO).unwrap();
+        let body = "event: message\ndata: {\"method\":\"notifications/message\",\"jsonrpc\":\"2.0\"}\n\nevent: message\ndata: {\"id\":3,\"result\":{\"tools\":[]}}\n\n";
+        let result = transport.parse_rpc_response(body, CT_SSE, 3).unwrap();
+        assert_eq!(result, json!({"tools":[]}));
+    }
+
+    #[test]
+    fn parse_rpc_response_includes_error_event_message_when_no_id_matches() {
+        let transport = HttpTransport::new("test", "http://localhost", &HashMap::new(), Duration::ZERO).unwrap();
+        let body = "data: {\"id\":null,\"error\":{\"code\":-32600,\"message\":\"bad request\"}}\n\n";
+        let err = transport.parse_rpc_response(body, CT_SSE, 5).unwrap_err();
+        let McpError::InvalidResponse { reason, .. } = err else {
+            panic!("expected InvalidResponse, got {err:?}");
+        };
+        let expected = "no SSE event matching request id 5 (server error: bad request)";
+        assert_eq!(reason, expected);
+    }
+
+    #[test]
+    fn parse_rpc_response_no_match_returns_invalid_response() {
+        let transport = HttpTransport::new("test", "http://localhost", &HashMap::new(), Duration::ZERO).unwrap();
+        let body = "data: {\"id\":1,\"result\":{}}\n\n";
+        let err = transport.parse_rpc_response(body, CT_SSE, 99).unwrap_err();
+        assert!(matches!(err, McpError::InvalidResponse { .. }));
     }
 }
