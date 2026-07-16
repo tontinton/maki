@@ -45,6 +45,8 @@ pub struct McpAuthData {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderCredentials {
     pub api_key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
 }
 
 pub fn now_millis() -> u64 {

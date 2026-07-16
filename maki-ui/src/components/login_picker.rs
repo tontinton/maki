@@ -372,7 +372,10 @@ impl LoginPicker {
 
                     let has_key = !api_key.is_empty();
                     if has_key {
-                        let creds = ProviderCredentials { api_key };
+                        let creds = ProviderCredentials {
+                            api_key,
+                            host: None,
+                        };
                         if let Err(e) = save_provider_credentials(&storage, &slug_c, &creds) {
                             return self.transition(StepAction::GoDone {
                                 message: format!("Error: {e}"),
