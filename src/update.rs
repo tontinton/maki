@@ -8,6 +8,7 @@ use maki_storage::{StateDir, StorageError};
 
 const INSTALL_SCRIPT_URL: &str = "https://maki.sh/install.sh";
 const BACKUP_FILENAME: &str = "maki_backup";
+const INSTALL_DIR_ENV: &str = "MAKI_INSTALL_DIR";
 
 #[derive(Debug, thiserror::Error)]
 pub enum UpdateError {
@@ -75,21 +76,29 @@ fn backup_binary(exe_path: &Path, storage: &StateDir) -> Result<PathBuf, UpdateE
     Ok(backup_path)
 }
 
-fn execute_script(script: &str) -> Result<(), UpdateError> {
+fn execute_script(script: &str, install_dir: &Path) -> Result<(), UpdateError> {
     let mut tmp = tempfile::NamedTempFile::new().map_err(UpdateError::WriteScript)?;
     tmp.write_all(script.as_bytes())
         .map_err(UpdateError::WriteScript)?;
     tmp.flush().map_err(UpdateError::WriteScript)?;
 
-    let status = std::process::Command::new("sh")
-        .arg(tmp.path())
-        .status()
-        .map_err(UpdateError::ExecScript)?;
+    let mut cmd = std::process::Command::new("sh");
+    cmd.arg(tmp.path());
+    if std::env::var_os(INSTALL_DIR_ENV).is_none() {
+        cmd.env(INSTALL_DIR_ENV, install_dir);
+    }
+    let status = cmd.status().map_err(UpdateError::ExecScript)?;
 
     if !status.success() {
         return Err(UpdateError::InstallFailed(status.code()));
     }
     Ok(())
+}
+
+fn current_exe_resolved() -> Result<PathBuf, UpdateError> {
+    std::env::current_exe()
+        .and_then(|p| p.canonicalize())
+        .map_err(UpdateError::CurrentExe)
 }
 
 #[cfg(unix)]
@@ -160,7 +169,10 @@ pub fn update(skip_confirm: bool, no_color: bool) -> Result<(), UpdateError> {
     println!("Latest version:  v{latest}");
     println!();
 
-    let exe_path = std::env::current_exe().map_err(UpdateError::CurrentExe)?;
+    let exe_path = current_exe_resolved()?;
+    let install_dir = exe_path.parent().ok_or_else(|| {
+        UpdateError::CurrentExe(std::io::Error::other("binary path has no parent directory"))
+    })?;
     let storage = StateDir::resolve()?;
 
     let script = fetch_script()?;
@@ -178,7 +190,7 @@ pub fn update(skip_confirm: bool, no_color: bool) -> Result<(), UpdateError> {
 
     let backup_path = backup_binary(&exe_path, &storage)?;
 
-    execute_script(&script)?;
+    execute_script(&script, install_dir)?;
 
     println!();
     println!("Updated successfully.");
@@ -189,7 +201,7 @@ pub fn update(skip_confirm: bool, no_color: bool) -> Result<(), UpdateError> {
 }
 
 pub fn rollback() -> Result<(), UpdateError> {
-    let exe_path = std::env::current_exe().map_err(UpdateError::CurrentExe)?;
+    let exe_path = current_exe_resolved()?;
     let storage = StateDir::resolve()?;
     let backup_path = storage.path().join(BACKUP_FILENAME);
 
