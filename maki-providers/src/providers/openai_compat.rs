@@ -378,6 +378,7 @@ struct FunctionDelta {
 #[derive(Deserialize)]
 struct ChunkDelta {
     content: Option<ContentDelta>,
+    #[serde(alias = "reasoning")]
     reasoning_content: Option<String>,
     tool_calls: Option<Vec<ToolCallDelta>>,
 }
