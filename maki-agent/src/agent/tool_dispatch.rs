@@ -68,6 +68,8 @@ pub async fn run(
     ctx: &ToolContext,
     emit: Emit,
 ) -> ToolDoneEvent {
+    // GPT-5.6 was likely trained on Codex sessions where tools are `functions.<name>`
+    let name = name.strip_prefix("functions.").unwrap_or(name);
     if let Some(local) = ctx.local_tools.get(name) {
         return run_local_tool(local, id, name, input, ctx, emit);
     }
