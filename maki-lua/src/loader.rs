@@ -13,7 +13,7 @@ use crate::api::keymap::KeymapReader;
 use crate::api::util::command::{HintReader, LuaCommandReader, UiAction};
 use crate::error::PluginError;
 use crate::plugin_permissions::{PluginPermissions, load_plugin_permissions};
-use crate::runtime::{self, LuaThread, Request, RestoreItem};
+use crate::runtime::{self, ClickFallback, LuaThread, Request, RestoreItem};
 use maki_agent::prompt::ResolvedSlots;
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -336,10 +336,13 @@ pub struct EventHandle {
 }
 
 impl EventHandle {
+    pub(crate) fn from_tx(tx: flume::Sender<Request>) -> Self {
+        Self { tx }
+    }
+
     #[doc(hidden)]
     pub fn disconnected_for_test() -> Self {
-        let (tx, _rx) = flume::unbounded();
-        Self { tx }
+        Self::from_tx(flume::unbounded().0)
     }
 
     pub fn run_command(&self, plugin: Arc<str>, command: Arc<str>, args: String) {
@@ -369,7 +372,29 @@ impl EventHandle {
     /// `row` is the 1-based line in the tool's live buffer, 0 for clicks
     /// outside it (header line etc.).
     pub fn request_click(&self, tool_use_id: String, row: usize) {
-        let _ = self.tx.send(Request::ClickTool { tool_use_id, row });
+        let _ = self.tx.send(Request::ClickTool {
+            tool_use_id,
+            row,
+            fallback: None,
+        });
+    }
+
+    /// Like [`Self::request_click`], but when the runtime no longer holds
+    /// a live or warm handle for the tool it restores from `item` (whose
+    /// `clicks` must already include `row`) and emits fresh snapshots on
+    /// `event_tx`. Callers need no knowledge of the runtime's warm cache.
+    pub fn request_click_with_fallback(
+        &self,
+        tool_use_id: String,
+        row: usize,
+        item: RestoreItem,
+        event_tx: maki_agent::EventSender,
+    ) {
+        let _ = self.tx.send(Request::ClickTool {
+            tool_use_id,
+            row,
+            fallback: Some(Box::new(ClickFallback { item, event_tx })),
+        });
     }
 
     pub fn send_restore_complete(&self, flag: Arc<AtomicBool>) {

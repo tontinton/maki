@@ -1,5 +1,6 @@
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::future::Future;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -46,6 +47,11 @@ const NIL_WITHOUT_FINISH_MSG: &str =
     "handler returned nil without calling ctx:finish() or starting jobs";
 pub(crate) const CANCELLED_MSG: &str = "cancelled";
 const MAX_INFLIGHT_TOOLS: usize = 64;
+/// Finished tools kept clickable without a restore round-trip. Purely a
+/// cache: a click that misses it falls back to the restore item carried
+/// by the request, so eviction only costs latency, never correctness.
+/// The UI reuses this cap for how many finished bufs it keeps watching.
+pub const WARM_TOOL_CAP: usize = 32;
 const GC_STEP_INTERVAL: usize = 4;
 const INTERRUPT_CANCEL_CHECK_INTERVAL: u32 = 128;
 const ASYNC_RUN_DEFAULT_DEADLINE: Duration = Duration::from_secs(60);
@@ -138,6 +144,10 @@ pub enum Request {
         /// 1-based line in the tool's live buffer; 0 means the click landed
         /// outside the buffer (e.g. on the header line).
         row: usize,
+        /// Cold path for finished tools: when no live or warm handle
+        /// exists, restore from this item (its `clicks` already include
+        /// `row`) instead of dropping the click.
+        fallback: Option<Box<ClickFallback>>,
     },
     RunKeybindCallback {
         id: u64,
@@ -177,6 +187,11 @@ pub struct RestoreItem {
     pub clicks: Vec<usize>,
     /// Structured state the tool persisted alongside its output.
     pub state: Option<Value>,
+}
+
+pub(crate) struct ClickFallback {
+    pub item: RestoreItem,
+    pub event_tx: maki_agent::EventSender,
 }
 
 pub(crate) struct RestoreReply {
@@ -262,6 +277,16 @@ impl TaskCell {
 pub(crate) type TaskHandle = Arc<Mutex<TaskCell>>;
 
 type LiveTasks = Rc<RefCell<HashMap<String, TaskHandle>>>;
+type WarmTools = Rc<RefCell<VecDeque<WarmTool>>>;
+
+/// A finished tool that still answers clicks. `handle` is a fresh cell
+/// holding only the root buf; `_claim` keeps the buf handler slots alive
+/// (they normally clear at scope drop) until this entry is evicted.
+struct WarmTool {
+    id: String,
+    handle: TaskHandle,
+    _claim: Arc<BufsClaim>,
+}
 
 pub(crate) fn lock_cell(handle: &TaskHandle) -> std::sync::MutexGuard<'_, TaskCell> {
     handle.lock().unwrap_or_else(|e| e.into_inner())
@@ -315,7 +340,8 @@ pub(crate) struct TaskScope {
     handle: TaskHandle,
     prev: Option<TaskHandle>,
     /// Dropped after `Drop::drop` runs, so jobs die before bufs can clear.
-    _bufs_claim: Arc<BufsClaim>,
+    /// Warm entries clone it to keep buf handlers alive past completion.
+    bufs_claim: Arc<BufsClaim>,
 }
 
 impl TaskScope {
@@ -328,7 +354,7 @@ impl TaskScope {
             lua: lua.clone(),
             handle,
             prev,
-            _bufs_claim: claim,
+            bufs_claim: claim,
         }
     }
 
@@ -342,6 +368,10 @@ impl TaskScope {
 
     pub(crate) fn handle(&self) -> &TaskHandle {
         &self.handle
+    }
+
+    pub(crate) fn bufs_claim(&self) -> Arc<BufsClaim> {
+        Arc::clone(&self.bufs_claim)
     }
 
     pub(crate) fn scope_future<F>(&self, inner: F) -> ScopedFuture<F> {
@@ -524,21 +554,35 @@ impl InflightGate {
     }
 }
 
-struct GateGuard<'a> {
-    gate: &'a InflightGate,
-}
+struct GateGuard(Rc<InflightGate>);
 
-impl<'a> GateGuard<'a> {
-    fn new(gate: &'a InflightGate) -> Self {
+impl GateGuard {
+    fn new(gate: &Rc<InflightGate>) -> Self {
         gate.increment();
-        Self { gate }
+        Self(Rc::clone(gate))
     }
 }
 
-impl Drop for GateGuard<'_> {
+impl Drop for GateGuard {
     fn drop(&mut self) {
-        self.gate.decrement();
+        self.0.decrement();
     }
+}
+
+/// Spawns `fut` holding the inflight gate. The guard is taken here,
+/// before the executor can poll the task, so a `gate.drain()` queued
+/// right behind the spawn cannot slip past it.
+fn spawn_gated<'a>(
+    ex: &Rc<smol::LocalExecutor<'a>>,
+    gate: &Rc<InflightGate>,
+    fut: impl Future<Output = ()> + 'a,
+) {
+    let guard = GateGuard::new(gate);
+    ex.spawn(async move {
+        let _guard = guard;
+        fut.await;
+    })
+    .detach();
 }
 
 pub(crate) struct PendingAsyncTask {
@@ -610,10 +654,7 @@ fn drain_spawn_queue(lua: &Lua, ex: &Rc<smol::LocalExecutor<'_>>, gate: &Rc<Infl
         let lua = lua.clone();
         let g = Rc::clone(gate);
         let ex2 = Rc::clone(ex);
-
-        ex.spawn(async move {
-            let _gate_guard = GateGuard::new(&g);
-
+        spawn_gated(ex, gate, async move {
             let scope = TaskScope::new(
                 &lua,
                 TaskCell::new(task.cancel.clone(), task.deadline, task.live_ctx.clone()),
@@ -641,8 +682,7 @@ fn drain_spawn_queue(lua: &Lua, ex: &Rc<smol::LocalExecutor<'_>>, gate: &Rc<Infl
             drop(scope);
             lua.remove_registry_value(task.work_fn).ok();
             drain_spawn_queue(&lua, &ex2, &g);
-        })
-        .detach();
+        });
     }
 }
 
@@ -662,6 +702,7 @@ struct LuaRuntime {
     pending: PendingTools,
     plugins: PluginMap,
     live_tasks: LiveTasks,
+    warm_tools: WarmTools,
     registry: Arc<ToolRegistry>,
     tx: flume::Sender<Request>,
     shutdown: Arc<AtomicBool>,
@@ -744,6 +785,7 @@ impl LuaRuntime {
             pending,
             plugins,
             live_tasks: Rc::new(RefCell::new(HashMap::new())),
+            warm_tools: Rc::new(RefCell::new(VecDeque::new())),
             registry,
             tx,
             shutdown,
@@ -753,6 +795,7 @@ impl LuaRuntime {
     }
 
     fn drop_plugin_keys(&mut self, name: &str) {
+        self.warm_tools.borrow_mut().clear();
         if let Some(mut store) = self.lua.app_data_mut::<AutocmdStore>() {
             store.clear_plugin(name);
         }
@@ -1335,6 +1378,30 @@ impl LuaRuntime {
         Some(reply)
     }
 
+    /// Restores a finished tool and emits fresh snapshots. The restore
+    /// supersedes any warm handle, so evict it first: a later click must
+    /// not resurface the stale view.
+    async fn restore_and_emit(
+        &self,
+        item: RestoreItem,
+        event_tx: &maki_agent::EventSender,
+        ex: &Rc<smol::LocalExecutor<'_>>,
+        gate: &Rc<InflightGate>,
+    ) {
+        self.evict_warm(&item.tool_use_id);
+        let id = item.tool_use_id.clone();
+        let theme_gen = item.theme_gen;
+        let res = self.restore_item(item).await;
+        drain_spawn_queue(&self.lua, ex, gate);
+        if let Some(reply) = res {
+            reply.emit(&id, theme_gen, event_tx);
+        }
+    }
+
+    fn evict_warm(&self, tool_use_id: &str) {
+        self.warm_tools.borrow_mut().retain(|w| w.id != tool_use_id);
+    }
+
     /// Runs `maki.async.run` tasks queued during restore inline, so their
     /// buf mutations land before the snapshot is extracted. Tasks may queue
     /// more tasks, hence the rounds.
@@ -1638,6 +1705,7 @@ async fn run_tool_call(
     deadline: Option<Instant>,
     live: Option<LiveCtx>,
     live_tasks: LiveTasks,
+    warm_tools: WarmTools,
     plugins: PluginMap,
     shutdown: Arc<AtomicBool>,
 ) -> ToolCallReply {
@@ -1740,6 +1808,25 @@ async fn run_tool_call(
     let reply = call_future.await;
     if let Some(id) = &live_id {
         live_tasks.borrow_mut().remove(id);
+        // Best-effort cache: any tool with a root buf can serve clicks.
+        // Warming a tool the UI never watches is harmless because its
+        // clicks arrive as restore requests, which evict the entry.
+        if let Some(root) = resolve_root_buf(&handle) {
+            // A fresh cell, because the original's cancel token and
+            // deadline are stale: the interrupt hook would use them to
+            // kill warm clicks.
+            let mut cell = TaskCell::new(CancelToken::none(), None, None);
+            cell.root_buf = Some(root);
+            let mut warm = warm_tools.borrow_mut();
+            warm.push_back(WarmTool {
+                id: id.clone(),
+                handle: Arc::new(Mutex::new(cell)),
+                _claim: scope.bufs_claim(),
+            });
+            if warm.len() > WARM_TOOL_CAP {
+                warm.pop_front();
+            }
+        }
     }
     drop(scope);
     reply
@@ -1829,12 +1916,11 @@ pub fn spawn(
                             let lua = rt.lua.clone();
                             let plugins = Rc::clone(&rt.plugins);
                             let live_tasks = Rc::clone(&rt.live_tasks);
+                            let warm_tools = Rc::clone(&rt.warm_tools);
                             let shutdown_ref = Arc::clone(&rt.shutdown);
                             let g = Rc::clone(&gate);
                             let ex_ref = Rc::clone(&ex);
-
-                            ex.spawn(async move {
-                                let _gate_guard = GateGuard::new(&g);
+                            spawn_gated(&ex, &gate, async move {
                                 let res = run_tool_call(
                                     lua.clone(),
                                     plugin,
@@ -1844,14 +1930,14 @@ pub fn spawn(
                                     deadline,
                                     live,
                                     live_tasks,
+                                    warm_tools,
                                     plugins,
                                     shutdown_ref,
                                 )
                                 .await;
                                 drain_spawn_queue(&lua, &ex_ref, &g);
                                 let _ = reply.send(res);
-                            })
-                            .detach();
+                            });
                         }
                         Request::ClearPlugin { plugin, reply } => {
                             gate.drain().await;
@@ -1918,47 +2004,64 @@ pub fn spawn(
                             let _ = reply.send(slots);
                         }
                         Request::RestoreToolAsync { item, event_tx } => {
-                            let id = item.tool_use_id.clone();
-                            let theme_gen = item.theme_gen;
-                            let res = rt.restore_item(item).await;
-                            drain_spawn_queue(&rt.lua, &ex, &gate);
-                            if let Some(reply) = res {
-                                reply.emit(&id, theme_gen, &event_tx);
-                            }
+                            rt.restore_and_emit(item, &event_tx, &ex, &gate).await;
                         }
                         Request::RestoreComplete { flag } => {
                             flag.store(false, Ordering::Relaxed);
                         }
-                        Request::ClickTool { tool_use_id, row } => {
-                            let handle = rt.live_tasks.borrow().get(&tool_use_id).map(Arc::clone);
+                        Request::ClickTool {
+                            tool_use_id,
+                            row,
+                            fallback,
+                        } => {
+                            let handle = rt
+                                .live_tasks
+                                .borrow()
+                                .get(&tool_use_id)
+                                .map(Arc::clone)
+                                .or_else(|| {
+                                    rt.warm_tools
+                                        .borrow()
+                                        .iter()
+                                        .find(|w| w.id == tool_use_id)
+                                        .map(|w| Arc::clone(&w.handle))
+                                });
                             let func = handle
                                 .as_ref()
                                 .and_then(resolve_root_buf)
                                 .and_then(|root| crate::api::ui::buf::click_fn(&root));
-                            if let (Some(handle), Some(func)) = (handle, func) {
-                                let lua = rt.lua.clone();
-                                let g = Rc::clone(&gate);
-                                let ex_ref = Rc::clone(&ex);
-                                let arg = match rt.lua.create_table() {
-                                    Ok(t) => {
-                                        let _ = t.set("row", row);
-                                        LuaValue::Table(t)
-                                    }
-                                    Err(_) => LuaValue::Nil,
+                            let (Some(handle), Some(func)) = (handle, func) else {
+                                // No handle, or a buf without a click handler
+                                // (some plugins wire clicks only in restore):
+                                // either way the fallback restore serves it.
+                                if let Some(fb) = fallback {
+                                    rt.restore_and_emit(fb.item, &fb.event_tx, &ex, &gate).await;
+                                } else {
+                                    tracing::debug!(tool_use_id, "unhandled click ignored");
+                                }
+                                continue;
+                            };
+                            let lua = rt.lua.clone();
+                            let g = Rc::clone(&gate);
+                            let ex_ref = Rc::clone(&ex);
+                            let arg = match rt.lua.create_table() {
+                                Ok(t) => {
+                                    let _ = t.set("row", row);
+                                    LuaValue::Table(t)
+                                }
+                                Err(_) => LuaValue::Nil,
+                            };
+                            spawn_gated(&ex, &gate, async move {
+                                let call = ScopedFuture {
+                                    lua: lua.clone(),
+                                    handle,
+                                    inner: func.call_async::<()>(arg),
                                 };
-                                ex.spawn(async move {
-                                    let call = ScopedFuture {
-                                        lua: lua.clone(),
-                                        handle,
-                                        inner: func.call_async::<()>(arg),
-                                    };
-                                    if let Err(e) = call.await {
-                                        tracing::warn!(tool_use_id, error = %e, "live click failed");
-                                    }
-                                    drain_spawn_queue(&lua, &ex_ref, &g);
-                                })
-                                .detach();
-                            }
+                                if let Err(e) = call.await {
+                                    tracing::warn!(tool_use_id, error = %e, "live click failed");
+                                }
+                                drain_spawn_queue(&lua, &ex_ref, &g);
+                            });
                         }
                         Request::FireAutocmd { event, data } => {
                             let data = json_to_lua(&rt.lua, &data).unwrap_or(LuaValue::Nil);
@@ -2001,13 +2104,11 @@ pub fn spawn(
                             let lua = rt.lua.clone();
                             let g = Rc::clone(&gate);
                             let ex_ref = Rc::clone(&ex);
-                            ex.spawn(async move {
-                                let _gate_guard = GateGuard::new(&g);
+                            spawn_gated(&ex, &gate, async move {
                                 run_tool_start(&lua, func, &tool, input, live, ctx).await;
                                 drain_spawn_queue(&lua, &ex_ref, &g);
                                 let _ = reply.send(());
-                            })
-                            .detach();
+                            });
                         }
                         Request::RunKeybindCallback { id } => {
                             let func = rt.lua.app_data_ref::<KeymapStore>().and_then(|store| {
@@ -2251,7 +2352,7 @@ mod tests {
 
     #[test]
     fn gate_guard_tracks_count_via_raii() {
-        let g = gate();
+        let g = Rc::new(gate());
         let g1 = GateGuard::new(&g);
         let g2 = GateGuard::new(&g);
         assert_eq!(g.count.get(), 2);

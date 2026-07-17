@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use maki_agent::tools::{ToolRegistry, ToolSource, timeout_annotation};
 use maki_config::{AlwaysThinking, PluginsConfig, ToolOutputLines};
-use maki_lua::{PluginError, PluginHost};
+use maki_lua::{PluginError, PluginHost, WARM_TOOL_CAP};
 use std::path::Path;
 
 fn fresh_registry() -> Arc<ToolRegistry> {
@@ -1240,6 +1240,346 @@ fn live_click_routes_to_root_buf_among_many() {
         click_until_finished(&host, &reg, "root_click", ROOT_CLICK_ID),
         ROOT_MSG
     );
+}
+
+const WARM_TOOL_NAME: &str = "warm_probe";
+const WARM_INITIAL_LINE: &str = "initial";
+const WARM_CLICK_LINE: &str = "warm_clicked";
+const WARM_ERROR_OUTPUT: &str = "boom";
+const WARM_RESTORED_LINE: &str = "restored";
+const WARM_RESTORE_CLICK_LINE: &str = "restore_clicked";
+
+/// `live_click` wires the handler-side click; restore always wires its own.
+fn warm_host(is_error: bool, live_click: bool) -> (Arc<ToolRegistry>, PluginHost) {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let ret = if is_error {
+        format!(r#"{{ llm_output = "{WARM_ERROR_OUTPUT}", is_error = true }}"#)
+    } else {
+        r#""done""#.to_owned()
+    };
+    let on_click = if live_click {
+        format!(
+            r#"buf:on("click", function()
+                    buf:set_lines({{ "{WARM_CLICK_LINE}" }})
+                end)"#
+        )
+    } else {
+        String::new()
+    };
+    let src = format!(
+        r#"maki.api.register_tool({{
+            name = "{WARM_TOOL_NAME}",
+            description = "warm click probe",
+            schema = {MINIMAL_SCHEMA},
+            audiences = {{ "main" }},
+            handler = function(input, ctx)
+                local buf = maki.ui.buf()
+                buf:set_lines({{ "{WARM_INITIAL_LINE}" }})
+                {on_click}
+                ctx:live_buf(buf)
+                return {ret}
+            end,
+            restore = function(input, output, is_error, rctx)
+                local buf = maki.ui.buf()
+                buf:set_lines({{ "{WARM_RESTORED_LINE}" }})
+                buf:on("click", function()
+                    buf:set_lines({{ "{WARM_RESTORE_CLICK_LINE}" }})
+                end)
+                return {{ body = buf }}
+            end
+        }})"#,
+    );
+    host.load_source("warm_probe_plugin", &src).unwrap();
+    (reg, host)
+}
+
+/// `load_source` waits for the request channel and the inflight gate, so
+/// once it returns every click sent before it has fully run, async jobs
+/// included. No sleeps needed. It also clears the warm map, so click
+/// before the barrier, never after.
+fn barrier(host: &PluginHost) {
+    host.load_source("barrier", "").unwrap();
+}
+
+fn warm_restore_item(id: &str, clicks: Vec<usize>) -> maki_lua::RestoreItem {
+    maki_lua::RestoreItem {
+        tool: Arc::from(WARM_TOOL_NAME),
+        tool_use_id: id.to_owned(),
+        output: "done".to_owned(),
+        input: serde_json::json!({}),
+        is_error: false,
+        tool_output_lines: ToolOutputLines::default(),
+        theme_gen: None,
+        clicks,
+        state: None,
+    }
+}
+
+fn snapshot_texts(rx: &flume::Receiver<maki_agent::Envelope>, id: &str) -> Vec<String> {
+    rx.drain()
+        .filter_map(|env| match env.event {
+            maki_agent::AgentEvent::ToolSnapshot {
+                id: got, snapshot, ..
+            } if got == id => Some(
+                snapshot
+                    .lines
+                    .iter()
+                    .flat_map(|l| l.spans.iter().map(|s| s.text.clone()))
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .collect()
+}
+
+fn warm_ctx(
+    id: &str,
+) -> (
+    maki_agent::tools::ToolContext,
+    flume::Receiver<maki_agent::Envelope>,
+) {
+    let (tx, rx) = flume::unbounded::<maki_agent::Envelope>();
+    let event_tx = maki_agent::EventSender::new(tx, 0);
+    let ctx = maki_agent::tools::test_support::stub_ctx_with(
+        &maki_agent::AgentMode::Build,
+        Some(&event_tx),
+        Some(id),
+    );
+    (ctx, rx)
+}
+
+fn exec_warm_tool(
+    reg: &ToolRegistry,
+    tool: &str,
+    ctx: &maki_agent::tools::ToolContext,
+) -> Result<maki_agent::ToolOutput, String> {
+    let inv = reg
+        .get(tool)
+        .expect("tool registered")
+        .tool
+        .parse(&serde_json::json!({}))
+        .expect("parse failed");
+    smol::block_on(inv.execute(ctx)).output
+}
+
+/// A click on a finished tool takes the warm path: it mutates the live
+/// root buf and the fallback restore stays unused. Failed tools stay
+/// warm too, since people click them to see what went wrong.
+#[test_case::test_case(false ; "success")]
+#[test_case::test_case(true ; "error_finish")]
+fn warm_click_reaches_finished_tool(is_error: bool) {
+    const WARM_ID: &str = "warm-click-1";
+    let (reg, host) = warm_host(is_error, true);
+    let (ctx, rx) = warm_ctx(WARM_ID);
+    let res = exec_warm_tool(&reg, WARM_TOOL_NAME, &ctx);
+    assert_eq!(res.err(), is_error.then(|| WARM_ERROR_OUTPUT.to_owned()));
+    let body = recv_live_buf(&rx, WARM_ID).expect("live buf published");
+
+    let (fb_tx, fb_rx) = flume::unbounded();
+    let eh = host.event_handle().expect("event handle available");
+    eh.request_click_with_fallback(
+        WARM_ID.to_owned(),
+        0,
+        warm_restore_item(WARM_ID, vec![0]),
+        maki_agent::EventSender::new(fb_tx, 0),
+    );
+    barrier(&host);
+
+    assert_eq!(body.read()[0].spans[0].text, WARM_CLICK_LINE);
+    assert!(
+        snapshot_texts(&fb_rx, WARM_ID).is_empty(),
+        "warm hit must not trigger the fallback restore"
+    );
+}
+
+/// A click that misses both the live and warm maps restores from the
+/// fallback item (replaying its recorded clicks), so an evicted or
+/// desynced warm cache costs latency, never a dropped click.
+#[test]
+fn click_fallback_restores_when_warm_missing() {
+    const GONE_ID: &str = "warm-gone-1";
+    let (_reg, host) = warm_host(false, true);
+    let (tx, rx) = flume::unbounded();
+
+    let eh = host.event_handle().expect("event handle available");
+    eh.request_click_with_fallback(
+        GONE_ID.to_owned(),
+        0,
+        warm_restore_item(GONE_ID, vec![0]),
+        maki_agent::EventSender::new(tx, 0),
+    );
+    barrier(&host);
+
+    assert_eq!(
+        snapshot_texts(&rx, GONE_ID),
+        vec![WARM_RESTORE_CLICK_LINE.to_owned()],
+        "fallback restore must replay the recorded clicks"
+    );
+}
+
+/// A warm hit whose root buf has no click handler must still consume
+/// the fallback: some plugins wire clicks only in `restore`.
+#[test]
+fn click_fallback_restores_when_warm_buf_has_no_handler() {
+    const WARM_ID: &str = "warm-nohandler-1";
+    let (reg, host) = warm_host(false, false);
+    let (ctx, rx) = warm_ctx(WARM_ID);
+    exec_warm_tool(&reg, WARM_TOOL_NAME, &ctx).expect("tool output");
+    recv_live_buf(&rx, WARM_ID).expect("live buf published");
+
+    let (fb_tx, fb_rx) = flume::unbounded();
+    let eh = host.event_handle().expect("event handle available");
+    eh.request_click_with_fallback(
+        WARM_ID.to_owned(),
+        0,
+        warm_restore_item(WARM_ID, vec![0]),
+        maki_agent::EventSender::new(fb_tx, 0),
+    );
+    barrier(&host);
+
+    assert_eq!(
+        snapshot_texts(&fb_rx, WARM_ID),
+        vec![WARM_RESTORE_CLICK_LINE.to_owned()],
+        "warm hit without a click handler must fall back to restore"
+    );
+}
+
+/// Any restore of a tool supersedes its warm handle: the entry is
+/// evicted so the stale view can never serve later clicks (e.g. with
+/// old-theme content after a rebake).
+#[test]
+fn restore_evicts_warm_handle() {
+    const WARM_ID: &str = "warm-rebaked-1";
+    let (reg, host) = warm_host(false, true);
+    let (ctx, rx) = warm_ctx(WARM_ID);
+    exec_warm_tool(&reg, WARM_TOOL_NAME, &ctx).expect("tool output");
+    let body = recv_live_buf(&rx, WARM_ID).expect("live buf published");
+
+    let (tx, _rx) = flume::unbounded();
+    let eh = host.event_handle().expect("event handle available");
+    eh.request_restore(
+        warm_restore_item(WARM_ID, Vec::new()),
+        maki_agent::EventSender::new(tx, 0),
+    );
+    eh.request_click(WARM_ID.to_owned(), 0);
+    barrier(&host);
+
+    assert_eq!(
+        body.read()[0].spans[0].text,
+        WARM_INITIAL_LINE,
+        "bare click after restore must be a no-op on the evicted warm buf"
+    );
+}
+
+/// Overfilling the cache evicts the oldest entry. Bare clicks (no
+/// fallback) make eviction observable: the evicted tool's click is
+/// dropped while a still-warm one lands.
+#[test]
+fn warm_fifo_evicts_oldest_runtime_side() {
+    let (reg, host) = warm_host(false, true);
+    let mut bufs = Vec::with_capacity(WARM_TOOL_CAP + 1);
+    for i in 0..=WARM_TOOL_CAP {
+        let id = format!("t{i}");
+        let (ctx, rx) = warm_ctx(&id);
+        exec_warm_tool(&reg, WARM_TOOL_NAME, &ctx).expect("tool output");
+        bufs.push(recv_live_buf(&rx, &id).expect("live buf published"));
+    }
+
+    let eh = host.event_handle().expect("event handle available");
+    eh.request_click("t1".to_owned(), 0);
+    eh.request_click("t0".to_owned(), 0);
+    barrier(&host);
+
+    assert_eq!(
+        bufs[1].read()[0].spans[0].text,
+        WARM_CLICK_LINE,
+        "still-warm tool must take the warm click path"
+    );
+    assert_eq!(
+        bufs[0].read()[0].spans[0].text,
+        WARM_INITIAL_LINE,
+        "evicted tool's click must be ignored"
+    );
+}
+
+/// After a plugin (re)load the old handlers are gone, so stale warm
+/// clicks must be dropped, never run.
+#[test]
+fn warm_map_cleared_by_load_source() {
+    const WARM_ID: &str = "warm-cleared-1";
+    let (reg, host) = warm_host(false, true);
+    let (ctx, rx) = warm_ctx(WARM_ID);
+    exec_warm_tool(&reg, WARM_TOOL_NAME, &ctx).expect("tool output");
+    let body = recv_live_buf(&rx, WARM_ID).expect("live buf published");
+
+    barrier(&host);
+    let eh = host.event_handle().expect("event handle available");
+    eh.request_click(WARM_ID.to_owned(), 0);
+    barrier(&host);
+
+    assert_eq!(body.read()[0].spans[0].text, WARM_INITIAL_LINE);
+}
+
+/// The gate guard is taken at spawn time, so LoadSource's drain barrier
+/// also covers async jobs a warm click enqueues.
+#[test]
+fn warm_click_runs_async_jobs() {
+    const WARM_ID: &str = "warm-async-1";
+    const ASYNC_LINE: &str = "async_appended";
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let src = format!(
+        r#"maki.api.register_tool({{
+            name = "warm_async",
+            description = "appends a line from an async job on click",
+            schema = {MINIMAL_SCHEMA},
+            audiences = {{ "main" }},
+            handler = function(input, ctx)
+                local buf = maki.ui.buf()
+                buf:set_lines({{ "{WARM_INITIAL_LINE}" }})
+                buf:on("click", function()
+                    maki.async.run(function()
+                        buf:line("{ASYNC_LINE}")
+                    end)
+                end)
+                ctx:live_buf(buf)
+                return "done"
+            end
+        }})"#,
+    );
+    host.load_source("warm_async_plugin", &src).unwrap();
+
+    let (ctx, rx) = warm_ctx(WARM_ID);
+    exec_warm_tool(&reg, "warm_async", &ctx).expect("tool output");
+    let body = recv_live_buf(&rx, WARM_ID).expect("live buf published");
+
+    let eh = host.event_handle().expect("event handle available");
+    eh.request_click(WARM_ID.to_owned(), 0);
+    barrier(&host);
+
+    let text = body.take().text();
+    assert!(text.contains(ASYNC_LINE), "async job line missing: {text}");
+}
+
+/// The warm cell gets a fresh `CancelToken::none()`: cancelling the
+/// original run after it finished must not kill warm clicks.
+#[test]
+fn warm_click_survives_post_completion_cancel() {
+    const WARM_ID: &str = "warm-cancel-1";
+    let (reg, host) = warm_host(false, true);
+    let (mut ctx, rx) = warm_ctx(WARM_ID);
+    let (trigger, token) = maki_agent::CancelToken::new();
+    ctx.cancel = token;
+    exec_warm_tool(&reg, WARM_TOOL_NAME, &ctx).expect("tool output");
+    let body = recv_live_buf(&rx, WARM_ID).expect("live buf published");
+    trigger.cancel();
+
+    let eh = host.event_handle().expect("event handle available");
+    eh.request_click(WARM_ID.to_owned(), 0);
+    barrier(&host);
+
+    assert_eq!(body.read()[0].spans[0].text, WARM_CLICK_LINE);
 }
 
 /// `maki.agent.call_tool` returns `(text, err)` and delivers live bufs and

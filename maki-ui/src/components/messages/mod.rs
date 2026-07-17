@@ -24,7 +24,7 @@ use crate::splash::{ColorTransition, Splash};
 use crate::theme;
 use maki_config::{ToolOutputLines, UiConfig};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -34,7 +34,7 @@ use maki_agent::{
     BufferSnapshot, EventSender, InstructionBlock, NO_FILES_FOUND, SharedBuf, ToolDoneEvent,
     ToolOutput, ToolStartEvent,
 };
-use maki_lua::EventHandle;
+use maki_lua::{EventHandle, WARM_TOOL_CAP};
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -70,6 +70,11 @@ pub struct MessagesPanel {
     /// Per-tool log of post-completion click rows, replayed on restore.
     lua_clicks: HashMap<String, Vec<usize>>,
     live_bufs: HashMap<String, Arc<SharedBuf>>,
+    /// Bufs of finished tools we keep polling so runtime-side warm
+    /// clicks stay visible. Purely local: every finished-tool click
+    /// carries a restore fallback, so we never track the runtime's
+    /// warm cache.
+    watched_bufs: VecDeque<(String, Arc<SharedBuf>)>,
     tool_output_lines: ToolOutputLines,
     lua_event_handle: Option<EventHandle>,
     restore_event_tx: Option<EventSender>,
@@ -115,6 +120,7 @@ impl MessagesPanel {
             expanded_tools: HashMap::new(),
             lua_clicks: HashMap::new(),
             live_bufs: HashMap::new(),
+            watched_bufs: VecDeque::new(),
             tool_output_lines: ui_config.tool_output_lines,
             lua_event_handle: None,
             restore_event_tx: None,
@@ -151,6 +157,7 @@ impl MessagesPanel {
         self.expanded_tools.clear();
         self.lua_clicks.clear();
         self.live_bufs.clear();
+        self.watched_bufs.clear();
         self.rebake_requested.clear();
         self.highlight_segment = None;
         self.thinking_collapsed = !self.show_thinking;
@@ -228,11 +235,7 @@ impl MessagesPanel {
     }
 
     pub fn tool_done(&mut self, event: ToolDoneEvent) {
-        if let Some(buf) = self.live_bufs.remove(&event.id)
-            && let Some(lines) = buf.read_if_dirty()
-        {
-            self.store_snapshot(&event.id, BufferSnapshot::from_arc(lines), false, None);
-        }
+        self.retire_live_buf(&event.id);
         let Some(msg) = self
             .messages
             .iter_mut()
@@ -407,6 +410,10 @@ impl MessagesPanel {
             .collect();
 
         for id in &affected_ids {
+            // The stale-run_id filter drops these tools' ToolDone events,
+            // so retire their live bufs here: keeps them clickable via
+            // the warm path and stops them pinning `is_animating`.
+            self.retire_live_buf(id);
             self.rebuild_tool_segment(id);
         }
     }
@@ -580,17 +587,32 @@ impl MessagesPanel {
                 }
                 return true;
             }
+            // Recorded even when the warm path serves the click: theme
+            // rebake and session restore replay the full sequence.
             self.lua_clicks
                 .entry(tool_id.to_owned())
                 .or_default()
                 .push(buf_row);
-            if let Some(mut item) = self.lua_restore_item(tool_id) {
+            let item = self.lua_restore_item(tool_id).map(|mut item| {
                 item.clicks = self.lua_clicks[tool_id].clone();
-                if let (Some(eh), Some(tx)) =
-                    (self.lua_event_handle.clone(), self.restore_event_tx.clone())
-                {
-                    eh.request_restore(item, tx);
+                item
+            });
+            let (Some(eh), Some(tx)) =
+                (self.lua_event_handle.clone(), self.restore_event_tx.clone())
+            else {
+                return true;
+            };
+            // Watching the buf means a runtime-side warm click would be
+            // visible here, so try the fast path; the fallback item lets
+            // the runtime degrade to restore+replay if its cache is cold.
+            // Without the buf only a fresh restore can show the result.
+            match (self.watching(tool_id), item) {
+                (true, Some(item)) => {
+                    eh.request_click_with_fallback(tool_id.to_owned(), buf_row, item, tx);
                 }
+                (true, None) => eh.request_click(tool_id.to_owned(), buf_row),
+                (false, Some(item)) => eh.request_restore(item, tx),
+                (false, None) => {}
             }
             return true;
         }
@@ -856,6 +878,30 @@ impl MessagesPanel {
             .is_some_and(|s| s == ToolStatus::InProgress)
     }
 
+    fn watching(&self, tool_id: &str) -> bool {
+        self.watched_bufs.iter().any(|(id, _)| id == tool_id)
+    }
+
+    fn stop_watching(&mut self, tool_id: &str) {
+        self.watched_bufs.retain(|(id, _)| id != tool_id);
+    }
+
+    /// Moves a finished tool's live buf to the watched set, flushing any
+    /// last dirty lines. Called on completion and on cancellation, so
+    /// `live_bufs` never leaks entries that keep `is_animating` true.
+    fn retire_live_buf(&mut self, id: &str) {
+        let Some(buf) = self.live_bufs.remove(id) else {
+            return;
+        };
+        if let Some(lines) = buf.read_if_dirty() {
+            self.store_snapshot(id, BufferSnapshot::from_arc(lines), false, None);
+        }
+        self.watched_bufs.push_back((id.to_owned(), buf));
+        if self.watched_bufs.len() > WARM_TOOL_CAP {
+            self.watched_bufs.pop_front();
+        }
+    }
+
     fn has_snapshot(&self, tool_id: &str) -> bool {
         self.messages
             .iter()
@@ -899,6 +945,9 @@ impl MessagesPanel {
             }
         }
         for id in requested {
+            // The watched buf still carries old-theme lines; clicks in
+            // the rebake window must go through restore, not warm.
+            self.stop_watching(&id);
             self.rebake_requested.insert(id, current_gen);
         }
     }
@@ -933,6 +982,12 @@ impl MessagesPanel {
         is_header: bool,
         theme_gen: Option<u64>,
     ) {
+        if theme_gen.is_some() {
+            // A generation only comes with restore replies. The restore
+            // superseded the old live view (and evicted the runtime's
+            // warm handle), so its buf must not overwrite this snapshot.
+            self.stop_watching(tool_id);
+        }
         let Some(applied_gen) = self.resolve_snapshot_gen(tool_id, theme_gen) else {
             return;
         };
@@ -970,6 +1025,7 @@ impl MessagesPanel {
         let dirty: Vec<_> = self
             .live_bufs
             .iter()
+            .chain(self.watched_bufs.iter().map(|(id, buf)| (id, buf)))
             .filter_map(|(id, buf)| buf.read_if_dirty().map(|lines| (id.clone(), lines)))
             .collect();
         for (tool_id, lines) in dirty {

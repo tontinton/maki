@@ -39,6 +39,36 @@ fn panel_with_tools(ids: &[(&str, &'static str)]) -> MessagesPanel {
     panel
 }
 
+fn done(id: &str) -> ToolDoneEvent {
+    ToolDoneEvent {
+        id: id.into(),
+        tool: BASH_TOOL_NAME.into(),
+        output: ToolOutput::Plain("output".into()),
+        is_error: false,
+        annotation: None,
+        written_path: None,
+    }
+}
+
+fn finish_with_live_buf(
+    panel: &mut MessagesPanel,
+    id: &str,
+    text: &str,
+    is_error: bool,
+) -> Arc<maki_agent::SharedBuf> {
+    let buf = Arc::new(maki_agent::SharedBuf::new());
+    buf.set_lines(vec![snap_line(text)]);
+    panel.register_live_buf(id.into(), Arc::clone(&buf));
+    let mut ev = start(id, BASH_TOOL_NAME);
+    ev.raw_input = Some(serde_json::json!({ "command": "true" }));
+    panel.tool_start(ev);
+    panel.tool_done(ToolDoneEvent {
+        is_error,
+        ..done(id)
+    });
+    buf
+}
+
 #[test_case(false, ToolStatus::Success ; "success_updates_start_to_success")]
 #[test_case(true,  ToolStatus::Error   ; "error_updates_start_to_error")]
 fn tool_done_updates_start_status(is_error: bool, expected: ToolStatus) {
@@ -1084,6 +1114,211 @@ fn second_register_live_buf_replaces_first() {
         msg.render_snapshot.as_ref().unwrap().first_line_text(),
         "handler"
     );
+}
+
+/// Every finished-tool click on a watched buf carries the full recorded
+/// click list as a restore fallback: the runtime serves it warm when it
+/// can and restores otherwise, so the UI never guesses runtime state.
+#[test_case(false ; "success")]
+#[test_case(true ; "error_finish")]
+fn handle_click_on_watched_tool_sends_click_with_fallback(is_error: bool) {
+    let (eh, probe) = maki_lua::test_support::probed_event_handle();
+    let (tx, _rx) = flume::unbounded();
+    let mut panel = MessagesPanel::new(UiConfig::default());
+    panel.set_restore_channel(Some(eh), Some(EventSender::new(tx, 0)));
+    finish_with_live_buf(&mut panel, "t1", "body", is_error);
+    assert!(panel.watching("t1"));
+
+    render(&mut panel, 80, 24);
+    let area = Rect::new(0, 0, 80, 24);
+    assert!(panel.handle_click(area.y, area));
+    let recorded = panel.lua_clicks["t1"].clone();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(probe.try_recv(), Some(("click_fallback", recorded)));
+    assert_eq!(probe.try_recv(), None);
+}
+
+#[test]
+fn tool_done_moves_live_buf_to_watched_polled_but_not_animating() {
+    let mut panel = MessagesPanel::new(UiConfig::default());
+    let buf = finish_with_live_buf(&mut panel, "t1", "before", false);
+    assert!(panel.watching("t1"));
+    assert!(
+        !panel.is_animating(),
+        "watched bufs must not keep the UI animating"
+    );
+
+    buf.set_lines(vec![snap_line("after")]);
+    panel.poll_live_bufs();
+    let msg = panel.find_tool_msg_mut("t1").unwrap();
+    assert_eq!(
+        msg.render_snapshot.as_ref().unwrap().first_line_text(),
+        "after"
+    );
+}
+
+#[test]
+fn watched_fifo_evicts_oldest_which_stops_polling_and_restores_with_recorded_clicks() {
+    let (eh, probe) = maki_lua::test_support::probed_event_handle();
+    let (tx, _rx) = flume::unbounded();
+    let mut panel = MessagesPanel::new(UiConfig::default());
+    panel.set_restore_channel(Some(eh), Some(EventSender::new(tx, 0)));
+    let buf = finish_with_live_buf(&mut panel, "t0", "before", false);
+
+    render(&mut panel, 80, 24);
+    let area = Rect::new(0, 0, 80, 24);
+    assert!(panel.handle_click(area.y, area));
+    assert_eq!(panel.lua_clicks.get("t0").map(Vec::len), Some(1));
+    assert_eq!(
+        probe.try_recv(),
+        Some(("click_fallback", panel.lua_clicks["t0"].clone()))
+    );
+
+    for i in 1..=WARM_TOOL_CAP {
+        finish_with_live_buf(&mut panel, &format!("t{i}"), "body", false);
+    }
+    assert_eq!(panel.watched_bufs.len(), WARM_TOOL_CAP);
+    assert!(!panel.watching("t0"));
+
+    buf.set_lines(vec![snap_line("after-eviction")]);
+    panel.poll_live_bufs();
+    let msg = panel.find_tool_msg_mut("t0").unwrap();
+    assert_eq!(
+        msg.render_snapshot.as_ref().unwrap().first_line_text(),
+        "before",
+        "evicted buf must no longer be polled"
+    );
+
+    render(&mut panel, 80, 24);
+    panel.scroll_to_top();
+    assert!(panel.handle_click(area.y, area));
+    let recorded = panel.lua_clicks["t0"].clone();
+    assert_eq!(recorded.len(), 2);
+    assert_eq!(probe.try_recv(), Some(("restore", recorded)));
+    assert_eq!(probe.try_recv(), None);
+}
+
+#[test]
+fn tool_done_without_live_buf_is_not_watched_and_click_restores() {
+    let (eh, probe) = maki_lua::test_support::probed_event_handle();
+    let (tx, _rx) = flume::unbounded();
+    let mut panel = MessagesPanel::new(UiConfig::default());
+    panel.set_restore_channel(Some(eh), Some(EventSender::new(tx, 0)));
+    let mut ev = start("t1", BASH_TOOL_NAME);
+    ev.raw_input = Some(serde_json::json!({ "command": "true" }));
+    panel.tool_start(ev);
+    panel.tool_snapshot(
+        "t1",
+        BufferSnapshot::from_arc(Arc::new(vec![snap_line("body")])),
+        None,
+    );
+    panel.tool_done(done("t1"));
+    assert!(!panel.watching("t1"));
+
+    render(&mut panel, 80, 24);
+    let area = Rect::new(0, 0, 80, 24);
+    assert!(panel.handle_click(area.y, area));
+    assert_eq!(
+        probe.try_recv(),
+        Some(("restore", panel.lua_clicks["t1"].clone()))
+    );
+    assert_eq!(probe.try_recv(), None);
+}
+
+/// The stale-run_id filter drops ToolDone events after a cancel, so the
+/// cancel path itself must retire live bufs: no `is_animating` pin, and
+/// the tool stays clickable through the warm path.
+#[test]
+fn cancel_in_progress_retires_live_buf_to_watched() {
+    let (eh, probe) = maki_lua::test_support::probed_event_handle();
+    let (tx, _rx) = flume::unbounded();
+    let mut panel = MessagesPanel::new(UiConfig::default());
+    panel.set_restore_channel(Some(eh), Some(EventSender::new(tx, 0)));
+    let buf = Arc::new(maki_agent::SharedBuf::new());
+    buf.set_lines(vec![snap_line("body")]);
+    let mut ev = start("t1", BASH_TOOL_NAME);
+    ev.raw_input = Some(serde_json::json!({ "command": "true" }));
+    panel.tool_start(ev);
+    panel.register_live_buf("t1".into(), Arc::clone(&buf));
+
+    panel.cancel_in_progress();
+    assert!(
+        !panel.is_animating(),
+        "cancel must not leak live bufs that pin animation"
+    );
+    assert!(panel.watching("t1"));
+
+    buf.set_lines(vec![snap_line("after-cancel")]);
+    panel.poll_live_bufs();
+    let msg = panel.find_tool_msg_mut("t1").unwrap();
+    assert_eq!(
+        msg.render_snapshot.as_ref().unwrap().first_line_text(),
+        "after-cancel"
+    );
+
+    render(&mut panel, 80, 24);
+    let area = Rect::new(0, 0, 80, 24);
+    assert!(panel.handle_click(area.y, area));
+    assert_eq!(probe.try_recv(), Some(("click", vec![])));
+    assert_eq!(probe.try_recv(), None);
+}
+
+/// A restore reply supersedes the old live view: the buf must stop
+/// being watched so its stale content can't overwrite the fresh
+/// snapshot, and later clicks must go through restore.
+#[test]
+fn restore_reply_stops_watching_buf() {
+    let (eh, probe) = maki_lua::test_support::probed_event_handle();
+    let (tx, _rx) = flume::unbounded();
+    let mut panel = MessagesPanel::new(UiConfig::default());
+    panel.set_restore_channel(Some(eh), Some(EventSender::new(tx, 0)));
+    let buf = finish_with_live_buf(&mut panel, "t1", "old-theme", false);
+    assert!(panel.watching("t1"));
+
+    let baked_gen = panel.snapshot_gen_of("t1").unwrap();
+    panel.tool_snapshot(
+        "t1",
+        BufferSnapshot::from_arc(Arc::new(vec![snap_line("rebaked")])),
+        Some(baked_gen),
+    );
+    assert!(!panel.watching("t1"));
+
+    buf.set_lines(vec![snap_line("stale-mutation")]);
+    panel.poll_live_bufs();
+    let msg = panel.find_tool_msg_mut("t1").unwrap();
+    assert_eq!(
+        msg.render_snapshot.as_ref().unwrap().first_line_text(),
+        "rebaked",
+        "unwatched buf must not overwrite the restored snapshot"
+    );
+
+    render(&mut panel, 80, 24);
+    let area = Rect::new(0, 0, 80, 24);
+    assert!(panel.handle_click(area.y, area));
+    assert_eq!(
+        probe.try_recv(),
+        Some(("restore", panel.lua_clicks["t1"].clone()))
+    );
+    assert_eq!(probe.try_recv(), None);
+}
+
+/// Requesting a rebake already stops watching: clicks inside the
+/// request/reply window must restore (with the new theme) instead of
+/// mutating the old-theme buf.
+#[test]
+fn rebake_request_stops_watching_buf() {
+    let (eh, probe) = maki_lua::test_support::probed_event_handle();
+    let (tx, _rx) = flume::unbounded();
+    let mut panel = MessagesPanel::new(UiConfig::default());
+    panel.set_restore_channel(Some(eh), Some(EventSender::new(tx, 0)));
+    finish_with_live_buf(&mut panel, "t1", "old-theme", false);
+    assert!(panel.watching("t1"));
+
+    let next_gen = panel.snapshot_gen_of("t1").unwrap() + 1;
+    panel.rebake_stale_snapshots(next_gen);
+    assert!(!panel.watching("t1"));
+    assert_eq!(probe.try_recv(), Some(("restore", vec![])));
+    assert_eq!(probe.try_recv(), None);
 }
 
 #[test]
