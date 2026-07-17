@@ -601,14 +601,9 @@ fn restore_without_state_falls_back_to_raw_output() {
     assert!(text.contains("not the section format"), "raw body: {text}");
 }
 
-/// A replayed click row must reach exactly the child it lands on and run
-/// its real toggle. Two regressions pinned here: the async `buf:click`
-/// held the child userdata borrow across the handler, silently dropping
-/// the click, and the `{row=0}` replay toggled every child instead of the
-/// clicked one.
-#[test]
-fn replayed_click_expands_only_the_clicked_child() {
-    let (_reg, host) = load_batch_host();
+/// Two viewer children, five lines each, long enough that both start
+/// truncated with a "(click to expand)" notice.
+fn two_truncated_viewers() -> (Value, Value) {
     let input = json!({ "tool_calls": [
         { "tool": "viewer", "parameters": {} },
         { "tool": "viewer", "parameters": {} },
@@ -617,6 +612,18 @@ fn replayed_click_expands_only_the_clicked_child() {
         { "tool": "viewer", "status": "success", "output": "a1\na2\na3\na4\na5" },
         { "tool": "viewer", "status": "success", "output": "b1\nb2\nb3\nb4\nb5" },
     ] });
+    (input, state)
+}
+
+/// A replayed click row must reach exactly the child it lands on and run
+/// its real toggle. Two regressions pinned here: the async `buf:click`
+/// held the child userdata borrow across the handler, silently dropping
+/// the click, and the `{row=0}` replay toggled every child instead of the
+/// clicked one.
+#[test]
+fn replayed_click_expands_only_the_clicked_child() {
+    let (_reg, host) = load_batch_host();
+    let (input, state) = two_truncated_viewers();
 
     // Rows are 1-based (row 0 = header), so snapshot line i = row i+1.
     // Find child2's notice dynamically so layout changes can't break this.
@@ -652,6 +659,39 @@ fn replayed_click_expands_only_the_clicked_child() {
         vec![notice_row, notice_row],
     ));
     assert!(!text.contains("b3"), "second click collapses: {text}");
+}
+
+/// Row 0 is the batch header: a click there fans out to every child.
+/// The second click must collapse again, pinning the broadcast as a real
+/// toggle rather than an expand-all.
+#[test]
+fn header_click_toggles_all_children() {
+    let (_reg, host) = load_batch_host();
+    let (input, state) = two_truncated_viewers();
+
+    let text = lines_text(&restore_snapshot_lines_opts(
+        &host,
+        input.clone(),
+        "irrelevant",
+        Some(state.clone()),
+        vec![0],
+    ));
+    assert!(
+        text.contains("a5") && text.contains("b5"),
+        "header click expands every child: {text}"
+    );
+
+    let text = lines_text(&restore_snapshot_lines_opts(
+        &host,
+        input,
+        "irrelevant",
+        Some(state),
+        vec![0, 0],
+    ));
+    assert!(
+        !text.contains("a3") && !text.contains("b3"),
+        "second header click collapses every child: {text}"
+    );
 }
 
 /// Regression: an edit child's body must show the code change (old lines

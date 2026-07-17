@@ -204,9 +204,23 @@ local function child_header_line(c)
   return spans
 end
 
+-- nil doubles as the dirty flag: watch() sets it on buf swap and on
+-- every change event, so there is no second flag to keep in sync.
+local function child_body_lines(c)
+  if not c.body_lines then
+    local out = {}
+    for _, bl in ipairs(c.buf:get_lines()) do
+      out[#out + 1] = indented(bl)
+    end
+    c.body_lines = out
+  end
+  return c.body_lines
+end
+
 -- Lines and click ranges come out of the same pass, so the row -> child
--- map can never drift from what is on screen. Bodies are read fresh from
--- each child's own buf, never cached.
+-- map can never drift from what is on screen. Bodies come from each
+-- child's cache; headers are one line each, cheaper to rebuild than to
+-- track.
 local function render_children(children)
   local lines, ranges = {}, {}
   for i, c in ipairs(children) do
@@ -216,8 +230,8 @@ local function render_children(children)
     local first = #lines + 1
     lines[#lines + 1] = child_header_line(c)
     if c.buf then
-      for _, bl in ipairs(c.buf:get_lines()) do
-        lines[#lines + 1] = indented(bl)
+      for _, l in ipairs(child_body_lines(c)) do
+        lines[#lines + 1] = l
       end
     end
     ranges[i] = { first = first, last = #lines }
@@ -313,9 +327,18 @@ Batch.__index = Batch
 function Batch.new(children, tol)
   local self = setmetatable({ children = children, tol = tol }, Batch)
   self.buf = maki.ui.buf()
+  -- A click fans out to child bufs, and every child change event would
+  -- recompose the whole batch; mute them and recompose once at the end.
+  -- pcall keeps a child handler error from leaking the mute, which would
+  -- silently drop every rerender after it.
   self.buf:on("click", function(ev)
-    self:route_click(ev and ev.row or 0)
+    self.muted = true
+    local ok, err = pcall(self.route_click, self, ev and ev.row or 0)
+    self.muted = false
     self:rerender()
+    if not ok then
+      error(err)
+    end
   end)
   for _, c in ipairs(children) do
     if TERMINAL[c.status] then
@@ -336,8 +359,12 @@ end
 -- later), so watch it and recompose the batch on every change.
 function Batch:watch(c, buf)
   c.buf = buf
+  c.body_lines = nil
   buf:on("change", function()
-    self:rerender()
+    c.body_lines = nil
+    if not self.muted then
+      self:rerender()
+    end
   end)
 end
 
