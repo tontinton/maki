@@ -114,17 +114,18 @@ main() {
 
     [ -f "${tmp}/${bin_name}" ] || err "archive did not contain ${bin_name}"
 
-    mkdir -p "${INSTALL_DIR}"
     dest="${INSTALL_DIR}/${bin_name}"
 
-    if [ -w "${INSTALL_DIR}" ]; then
+    if mkdir -p "${INSTALL_DIR}" 2>/dev/null && [ -w "${INSTALL_DIR}" ]; then
         mv "${tmp}/${bin_name}" "${dest}"
+        chmod +x "${dest}"
     else
         echo "installing to ${INSTALL_DIR} (requires sudo)..."
+        sudo mkdir -p "${INSTALL_DIR}"
         sudo mv "${tmp}/${bin_name}" "${dest}"
+        sudo chmod +x "${dest}"
     fi
 
-    chmod +x "${dest}"
     echo "${BINARY} ${tag} installed to ${dest}"
 
     if is_windows; then
