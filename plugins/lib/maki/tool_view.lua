@@ -192,10 +192,10 @@ function ToolView:finish()
   end
 end
 
-function ToolView.restore(output, opts)
+function ToolView.restore_lines(lines, opts)
   local buf = maki.ui.buf()
   local view = ToolView.new(buf, opts)
-  for line in (output .. "\n"):gmatch("([^\n]*)\n") do
+  for _, line in ipairs(lines) do
     view:append(line)
   end
   view:finish()
@@ -203,6 +203,14 @@ function ToolView.restore(output, opts)
     view:toggle()
   end)
   return buf
+end
+
+function ToolView.restore(output, opts)
+  local lines = {}
+  for line in (output .. "\n"):gmatch("([^\n]*)\n") do
+    lines[#lines + 1] = line
+  end
+  return ToolView.restore_lines(lines, opts)
 end
 
 return ToolView

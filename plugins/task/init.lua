@@ -5,6 +5,8 @@
 -- primitives only (`maki.agent.session`, `maki.json.schema_validator`,
 -- `maki.async.semaphore`).
 
+local ToolView = require("maki.tool_view")
+
 local STRUCTURED_OUTPUT_NAME = "structured_output"
 local STRUCTURED_OUTPUT_DESCRIPTION = "Report your final result. Call it exactly once when your task is complete."
 local STRUCTURED_OUTPUT_ACK = "Output recorded."
@@ -18,6 +20,9 @@ local NUDGE_MISSING =
   "You did not call the structured_output tool. Call it now with your final result matching its input schema."
 local INVALID_INPUT_PREFIX =
   "Input does not match the required schema. Fix the errors and call structured_output again:\n"
+local BODY_INDENT_COLS = 4
+local MIN_MD_WIDTH = 20
+local DEFAULT_OUTPUT_LINES = 5
 
 local description = [[Launch an autonomous subagent to perform tasks independently. Best combined with batch.
 
@@ -194,6 +199,21 @@ local function header(input)
   return input.description
 end
 
+-- Standalone runs render markdown on the Rust side (format = "markdown");
+-- this mirrors that for restore and batch children, which build the body here.
+local function restore(_input, output, is_error, ctx)
+  local tol = ctx:tool_output_lines()
+  local opts = { max_lines = (tol and tol.task) or DEFAULT_OUTPUT_LINES, keep = "head" }
+  if not is_error then
+    local width = math.max(maki.ui.terminal_size().cols - BODY_INDENT_COLS, MIN_MD_WIDTH)
+    local ok, md_lines = pcall(maki.ui.markdown, output, width)
+    if ok then
+      return ToolView.restore_lines(md_lines, opts)
+    end
+  end
+  return ToolView.restore(output, opts)
+end
+
 maki.api.register_tool({
   name = "task",
   description = description,
@@ -203,4 +223,5 @@ maki.api.register_tool({
   schema = schema,
   handler = handler,
   header = header,
+  restore = restore,
 })
