@@ -48,7 +48,11 @@ pub async fn refresh_token(
     if let Some(secret) = client_secret {
         params.push(("client_secret", secret));
     }
-    token_request(client, token_endpoint, &params).await
+    let mut tokens = token_request(client, token_endpoint, &params).await?;
+    if tokens.refresh.is_empty() {
+        tokens.refresh = refresh_token.to_string();
+    }
+    Ok(tokens)
 }
 
 async fn token_request(
@@ -92,8 +96,12 @@ async fn token_request(
         .read_to_string(&mut body_str)
         .map_err(|e| OAuthError::Network(e.to_string()))?;
 
+    parse_token_response(&body_str)
+}
+
+fn parse_token_response(body: &str) -> Result<OAuthTokens, OAuthError> {
     let resp: serde_json::Value =
-        serde_json::from_str(&body_str).map_err(|e| OAuthError::InvalidResponse(e.to_string()))?;
+        serde_json::from_str(body).map_err(|e| OAuthError::InvalidResponse(e.to_string()))?;
 
     let access = resp["access_token"]
         .as_str()
@@ -131,11 +139,25 @@ pub(super) fn url_encode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use test_case::test_case;
 
     #[test]
     fn url_encode_basic() {
         assert_eq!(url_encode("hello world"), "hello%20world");
         assert_eq!(url_encode("foo=bar&baz"), "foo%3Dbar%26baz");
         assert_eq!(url_encode("abc-def_ghi.jkl~mno"), "abc-def_ghi.jkl~mno");
+    }
+
+    #[test_case(r#"{"access_token":"a1","refresh_token":"r1","expires_in":60}"#, "a1", "r1" ; "rotated_refresh")]
+    #[test_case(r#"{"access_token":"a1","expires_in":60}"#, "a1", "" ; "missing_refresh_is_empty")]
+    fn parse_token_response_fields(body: &str, access: &str, refresh: &str) {
+        let tokens = parse_token_response(body).unwrap();
+        assert_eq!(tokens.access, access);
+        assert_eq!(tokens.refresh, refresh);
+    }
+
+    #[test]
+    fn parse_token_response_missing_access_is_error() {
+        assert!(parse_token_response(r#"{"refresh_token":"r1"}"#).is_err());
     }
 }

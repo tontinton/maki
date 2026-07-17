@@ -236,8 +236,6 @@ pub enum McpCommand {
     },
     Reconnect {
         server: String,
-        url: String,
-        token: String,
     },
     /// Drain every running transport and stop the loop. The loop sends `()` on `ack` once
     /// every shutdown has finished, so callers can wait with a timeout.
@@ -388,8 +386,8 @@ async fn run(
             McpCommand::Toggle { server, enabled } => {
                 handle_toggle(&mut inner, &server, enabled).await;
             }
-            McpCommand::Reconnect { server, url, token } => {
-                handle_reconnect(&mut inner, &server, &url, &token).await;
+            McpCommand::Reconnect { server } => {
+                handle_reconnect(&mut inner, &server).await;
             }
             McpCommand::Shutdown { ack: tx } => {
                 ack = Some(tx);
@@ -418,7 +416,7 @@ async fn handle_toggle(inner: &mut McpManagerInner, server_name: &str, enabled: 
     }
 
     if enabled {
-        if let Err(e) = refresh_server(inner, server_name, None).await {
+        if let Err(e) = refresh_server(inner, server_name).await {
             warn!(server = %server_name, error = %e, "MCP server refresh failed");
         }
     } else if let Some(entry) = inner.entries.iter_mut().find(|e| e.name == server_name) {
@@ -429,12 +427,9 @@ async fn handle_toggle(inner: &mut McpManagerInner, server_name: &str, enabled: 
     info!(server = server_name, enabled, "MCP toggle complete");
 }
 
-async fn handle_reconnect(
-    inner: &mut McpManagerInner,
-    server_name: &str,
-    server_url: &str,
-    access_token: &str,
-) {
+/// Restart the server with its stored config. Fresh OAuth tokens are picked up
+/// from storage by the transport, so no credentials travel through the command.
+async fn handle_reconnect(inner: &mut McpManagerInner, server_name: &str) {
     let Some(entry) = inner.entries.iter().find(|e| e.name == server_name) else {
         warn!(server = server_name, "reconnect for unknown server");
         return;
@@ -446,21 +441,7 @@ async fn handle_reconnect(
         );
         return;
     }
-    let timeout = entry.config.as_ref().map(|c| c.timeout).unwrap_or_default();
-    let mut headers = HashMap::new();
-    headers.insert(
-        "Authorization".to_string(),
-        format!("Bearer {access_token}"),
-    );
-    let cfg = ServerConfig {
-        name: server_name.to_string(),
-        timeout,
-        transport: Transport::Http {
-            url: server_url.to_string(),
-            headers,
-        },
-    };
-    if let Err(e) = refresh_server(inner, server_name, Some(cfg)).await {
+    if let Err(e) = refresh_server(inner, server_name).await {
         warn!(server = %server_name, error = %e, "reconnect failed");
     }
     info!(server = server_name, "MCP reconnect complete");
@@ -479,25 +460,15 @@ async fn shutdown_all(inner: &mut McpManagerInner) {
 /// Tear the old transport down and wipe tools/prompts *before* starting the new one. That way
 /// a failed start leaves the entry empty instead of holding zombie tool references into a dead
 /// transport.
-async fn refresh_server(
-    inner: &mut McpManagerInner,
-    server_name: &str,
-    config_override: Option<ServerConfig>,
-) -> Result<(), McpError> {
+async fn refresh_server(inner: &mut McpManagerInner, server_name: &str) -> Result<(), McpError> {
     let Some(idx) = inner.entries.iter().position(|e| e.name == server_name) else {
         return Err(McpError::Config(format!("unknown server '{server_name}'")));
     };
 
-    let config = match config_override {
-        Some(c) => {
-            inner.entries[idx].config = Some(c.clone());
-            c
-        }
-        None => inner.entries[idx]
-            .config
-            .clone()
-            .ok_or_else(|| McpError::Config(format!("server '{server_name}' has no config")))?,
-    };
+    let config = inner.entries[idx]
+        .config
+        .clone()
+        .ok_or_else(|| McpError::Config(format!("server '{server_name}' has no config")))?;
 
     {
         let entry = &mut inner.entries[idx];
@@ -554,6 +525,7 @@ async fn start_server(config: &ServerConfig) -> Result<StartResult, McpError> {
             url,
             headers,
             config.timeout,
+            maki_storage::StateDir::resolve().ok(),
         )?),
     };
     transport::initialize(transport.as_ref()).await?;
@@ -934,7 +906,7 @@ mod tests {
             let (mut inner, _) = setup(vec![fake_entry("srv", Arc::clone(&t) as _)]);
             inner.entries[0].config = Some(bad_stdio_config("srv"));
 
-            assert!(refresh_server(&mut inner, "srv", None).await.is_err());
+            assert!(refresh_server(&mut inner, "srv").await.is_err());
 
             let entry = &inner.entries[0];
             assert_eq!(t.shutdowns(), 1);
