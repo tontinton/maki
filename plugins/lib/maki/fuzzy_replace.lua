@@ -484,6 +484,9 @@ local function replace_all_occurrences(content, matched, replacement)
   return table.concat(result)
 end
 
+-- Replace {old_string} with {new_string} in {content}, tolerating small
+-- whitespace and indentation drift. Returns the new content, or nil plus
+-- one of the error constants above.
 function M.replace(content, old_string, new_string, replace_all)
   if old_string == "" then
     return nil, M.EMPTY_OLD_STRING

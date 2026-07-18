@@ -394,6 +394,8 @@ function TextInput:handle_key(key)
   return result
 end
 
+-- Wrap lines to {width} with {prefix} before the first row. Returns
+-- { lines = styled lines, cursor_row = 1-based row holding the cursor }.
 function TextInput:render(prefix, prefix_width, width)
   local result = {}
   local pw = prefix_width or #prefix

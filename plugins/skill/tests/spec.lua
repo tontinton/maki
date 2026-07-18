@@ -102,6 +102,44 @@ case("build_skill_list_sorted_alphabetically", function()
   assert(middle_pos < zebra_pos, "middle should come before zebra")
 end)
 
+-- ── builtin plugin_dev skill ──
+
+case("builtin_plugin_dev_skill_loads", function()
+  local builtin = require("plugin_dev")
+  eq(builtin.name, "maki-plugin-dev")
+  assert(#builtin.description > 0, "description should not be empty")
+  assert(builtin.content:find("# Writing maki plugins", 1, true), "content should contain the authoring guide")
+  assert(#builtin.reference_placeholder > 0, "reference_placeholder should not be empty")
+  assert(
+    builtin.content:find(builtin.reference_placeholder, 1, true),
+    "content should contain the reference path placeholder"
+  )
+  assert(builtin.content:find("maki.api.register_tool", 1, true), "index should list register_tool")
+end)
+
+case("builtin_plugin_dev_reference_loads", function()
+  local ref = require("plugin_dev_reference")
+  assert(ref.content:find("### `maki.api.register_tool", 1, true), "reference should document register_tool")
+  assert(ref.content:find("Shared helper modules", 1, true), "reference should include helper modules")
+end)
+
+case("builtin_index_line_numbers_match_reference", function()
+  local builtin = require("plugin_dev")
+  local ref = require("plugin_dev_reference")
+  local lines = maki.split(ref.content, "\n")
+  local checked = 0
+  for ln, sig in builtin.content:gmatch("\n%- L(%d+) `([^`]+)`") do
+    local target = lines[tonumber(ln)]
+    local heading = "### `" .. sig .. "`"
+    assert(
+      target and target:find(heading, 1, true) == 1,
+      "index L" .. ln .. " should point at " .. heading .. ", got: " .. tostring(target)
+    )
+    checked = checked + 1
+  end
+  assert(checked > 100, "expected the index to cover the reference, checked " .. checked)
+end)
+
 if #failures > 0 then
   error(#failures .. " case(s) failed:\n\n" .. table.concat(failures, "\n\n"))
 end

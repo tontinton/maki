@@ -184,6 +184,12 @@ maki.setup({
 | `max_line_bytes` | integer | `500` | 80 | Truncate lines longer than this many bytes. |
 | `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool. |
 
+### `plugins.skill`
+
+| Field | Type | Default | Min | Description |
+|-------|------|---------|-----|-------------|
+| `plugin_dev` | boolean | `true` | - | Offer the builtin maki-plugin-dev skill for writing maki plugins. |
+
 ### `plugins.task`
 
 | Field | Type | Default | Min | Description |

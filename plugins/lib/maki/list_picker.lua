@@ -129,6 +129,11 @@ local function render_lines(items, selected, width, query)
   return lines
 end
 
+-- Open a fuzzy-filter picker in a floating window and block until the user
+-- decides. {items} is a list of strings or { label, detail? } tables. {opts}:
+-- title, footer, cursor (initial index), submit_keys (extra submit keys
+-- besides enter). Returns { type = "choice"|"delete", index } or
+-- { type = "close" }.
 function ListPicker.open(items, opts)
   opts = opts or {}
   local submit_keys = { enter = true }
