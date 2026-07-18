@@ -159,8 +159,8 @@ fn screen_to_doc(screen_row: u16, area: Rect, scroll_offset: u32) -> u32 {
 
 fn clamp_col(col: u16, area: Rect, zone: SelectionZone) -> u16 {
     let reserve = match zone {
-        SelectionZone::Messages | SelectionZone::Input => 2,
-        SelectionZone::Overlay => 1,
+        SelectionZone::Messages => 2,
+        SelectionZone::Input | SelectionZone::Overlay => 1,
     };
     col.clamp(area.x, area.x + area.width.saturating_sub(reserve))
 }
@@ -191,8 +191,8 @@ impl Selection {
 
     pub fn highlight_area(&self) -> Rect {
         let width = match self.zone {
-            SelectionZone::Messages | SelectionZone::Input => self.area.width.saturating_sub(1),
-            SelectionZone::Overlay => self.area.width,
+            SelectionZone::Messages => self.area.width.saturating_sub(1),
+            SelectionZone::Input | SelectionZone::Overlay => self.area.width,
         };
         Rect::new(self.area.x, self.area.y, width, self.area.height)
     }
