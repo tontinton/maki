@@ -148,8 +148,15 @@ impl App {
 
     fn render_messages(&mut self, frame: &mut Frame, layout: &ViewLayout, render_chat: usize) {
         let accent = self.effective_mode_color();
+        let is_working = (self.status == Status::Streaming && render_chat == 0)
+            || self.chats[render_chat].is_working();
         self.chats[render_chat].set_accent(accent);
-        self.chats[render_chat].view(frame, layout.msg_area, self.selection_state.is_some());
+        self.chats[render_chat].view(
+            frame,
+            layout.msg_area,
+            self.selection_state.is_some(),
+            is_working,
+        );
     }
 
     fn render_bottom_panel(&mut self, frame: &mut Frame, layout: &ViewLayout) {

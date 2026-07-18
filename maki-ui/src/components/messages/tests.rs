@@ -214,7 +214,7 @@ fn render_sel(
     let mut terminal = ratatui::Terminal::new(backend).unwrap();
     terminal
         .draw(|f| {
-            panel.view(f, f.area(), has_selection);
+            panel.view(f, f.area(), has_selection, false);
         })
         .unwrap();
     terminal
@@ -224,8 +224,39 @@ fn render(panel: &mut MessagesPanel, width: u16, height: u16) -> ratatui::Termin
     render_sel(panel, width, height, false)
 }
 
+fn render_working(
+    panel: &mut MessagesPanel,
+    width: u16,
+    height: u16,
+) -> ratatui::Terminal<TestBackend> {
+    let backend = TestBackend::new(width, height);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal
+        .draw(|f| {
+            panel.view(f, f.area(), false, true);
+        })
+        .unwrap();
+    terminal
+}
+
 fn rebuild(panel: &mut MessagesPanel) {
     render(panel, 80, 24);
+}
+
+#[test]
+fn working_indicator_renders_when_streaming() {
+    let mut panel = MessagesPanel::new(UiConfig::default());
+    panel.text_delta("hello");
+    let terminal = render_working(&mut panel, 80, 10);
+    let buf = terminal.backend().buffer();
+    let last_row = buf.area.height - 1;
+    let row_text: String = (0..buf.area.width)
+        .filter_map(|x| buf.cell((x, last_row)).map(|c| c.symbol().to_string()))
+        .collect();
+    assert!(
+        row_text.contains("thinking..."),
+        "working indicator should render in last row: {row_text:?}"
+    );
 }
 
 #[test]

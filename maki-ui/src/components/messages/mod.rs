@@ -37,9 +37,10 @@ use maki_agent::{
 use maki_lua::{EventHandle, WARM_TOOL_CAP};
 
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
+use ratatui::widgets::{Paragraph, Widget};
 
 const THINKING_HIDDEN_HEADER: &str = "thinking> ...";
 
@@ -84,6 +85,8 @@ pub struct MessagesPanel {
     /// only bumps when colors actually land.
     rebake_requested: HashMap<String, u64>,
     prompt_progress: Option<PromptProgress>,
+    working_start: Instant,
+    was_working: bool,
 }
 
 impl MessagesPanel {
@@ -128,6 +131,8 @@ impl MessagesPanel {
             thinking_collapsed: !ui_config.show_thinking,
             rebake_requested: HashMap::new(),
             prompt_progress: None,
+            working_start: Instant::now(),
+            was_working: false,
         }
     }
 
@@ -427,6 +432,13 @@ impl MessagesPanel {
             .count()
     }
 
+    pub fn is_working(&self) -> bool {
+        self.in_progress_count() > 0
+            || self.streaming_thinking.is_animating()
+            || self.streaming_text.is_animating()
+            || !self.live_bufs.is_empty()
+    }
+
     #[cfg(test)]
     pub fn toggle_expansion(&mut self, tool_id: &str) -> bool {
         let Some(seg) = self
@@ -684,7 +696,12 @@ impl MessagesPanel {
             && self.streaming_text.is_empty()
     }
 
-    pub fn view(&mut self, frame: &mut Frame, area: Rect, has_selection: bool) {
+    pub fn view(&mut self, frame: &mut Frame, area: Rect, has_selection: bool, is_working: bool) {
+        if is_working && !self.was_working {
+            self.working_start = Instant::now();
+        }
+        self.was_working = is_working;
+
         self.viewport_height = area.height;
         let width = area.width.saturating_sub(1);
         let theme_gen = theme::generation();
@@ -840,6 +857,30 @@ impl MessagesPanel {
         if total_lines > area.height {
             render_vertical_scrollbar(frame, area, total_lines, self.scroll_top);
         }
+
+        if is_working {
+            self.render_working_indicator(frame, viewport);
+        }
+    }
+
+    fn render_working_indicator(&self, frame: &mut Frame, area: Rect) {
+        let elapsed = self.working_start.elapsed().as_millis();
+        let spinner = spinner_str(elapsed);
+        let style = theme::current().spinner;
+        let line = Line::from(vec![
+            Span::styled(spinner, style),
+            Span::styled(" thinking...", style),
+        ]);
+        let width = line.width() as u16;
+        if width == 0 || width > area.width || area.height == 0 {
+            return;
+        }
+        let x = area.right().saturating_sub(width);
+        let y = area.bottom().saturating_sub(1);
+        let pill_area = Rect::new(x, y, width, 1);
+        Paragraph::new(line)
+            .alignment(Alignment::Right)
+            .render(pill_area, frame.buffer_mut());
     }
 
     fn max_scroll(&self) -> u16 {

@@ -220,8 +220,13 @@ impl Chat {
         self.messages_panel.is_animating()
     }
 
-    pub fn view(&mut self, frame: &mut Frame, area: Rect, has_selection: bool) {
-        self.messages_panel.view(frame, area, has_selection);
+    pub fn is_working(&self) -> bool {
+        self.messages_panel.is_working()
+    }
+
+    pub fn view(&mut self, frame: &mut Frame, area: Rect, has_selection: bool, is_working: bool) {
+        self.messages_panel
+            .view(frame, area, has_selection, is_working);
     }
 
     pub fn scroll_top(&self) -> u16 {
