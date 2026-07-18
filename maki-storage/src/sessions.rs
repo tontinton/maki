@@ -333,9 +333,10 @@ pub fn generate_title<M: TitleSource>(messages: &[M]) -> String {
     let Some(text) = first_user_text.map(str::trim).filter(|t| !t.is_empty()) else {
         return DEFAULT_TITLE.into();
     };
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
 
     if text.len() <= MAX_TITLE_LEN {
-        return text.to_string();
+        return text;
     }
 
     let boundary = text.floor_char_boundary(MAX_TITLE_LEN);
@@ -1758,6 +1759,11 @@ mod tests {
         "This is a very long title that exceeds the sixty character limit and should be truncated at a word boundary",
         "This is a very long title that exceeds the sixty character…"
         ; "long_truncates_at_word"
+    )]
+    #[test_case(
+        "added:\n\n```\nmaki.api.register_command({\n  name = \"/standup\"",
+        "added: ``` maki.api.register_command({ name = \"/standup\""
+        ; "newlines_collapse_to_spaces"
     )]
     fn title_extraction(input: &str, expected: &str) {
         let messages: Vec<Value> = if input.is_empty() {

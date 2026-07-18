@@ -240,6 +240,7 @@ local function refresh()
   end
   board.counts = { needs_input = 0, working = 0 }
   for _, s in ipairs(all) do
+    s.title = s.title:gsub("%s+", " ")
     if board.counts[s.status] then
       board.counts[s.status] = board.counts[s.status] + 1
     end
