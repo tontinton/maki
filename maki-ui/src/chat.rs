@@ -44,6 +44,8 @@ pub struct Chat {
     pub token_usage: TokenUsage,
     pub context_size: u32,
     pub model_id: Option<String>,
+    pub tool_use_id: Option<String>,
+    pub failed: bool,
     pending_turn_usage: Option<String>,
     messages_panel: MessagesPanel,
     finished: bool,
@@ -56,6 +58,8 @@ impl Chat {
             token_usage: TokenUsage::default(),
             context_size: 0,
             model_id: None,
+            tool_use_id: None,
+            failed: false,
             pending_turn_usage: None,
             messages_panel: MessagesPanel::new(ui_config),
             finished: false,
@@ -289,6 +293,7 @@ impl Chat {
             return;
         }
         self.finished = true;
+        self.failed = role == DisplayRole::Error;
         self.messages_panel.flush();
         self.messages_panel
             .push(DisplayMessage::new(role, text.into()));
@@ -296,6 +301,10 @@ impl Chat {
 
     pub fn is_finished(&self) -> bool {
         self.finished
+    }
+
+    pub fn is_failed(&self) -> bool {
+        self.failed
     }
 
     pub fn update_tool_summary(&mut self, tool_id: &str, summary: &str) {

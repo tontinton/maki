@@ -91,23 +91,46 @@ const WORKFLOW_OFF_MSG: &str = "Workflow mode: off";
 const IMPLEMENT_MSG_PREFIX: &str = "Implement the plan";
 const IMPLEMENT_PARALLEL_HINT: &str = "Use batch+task to parallelize, assign each subagent a separate module and restrict its tests to that module to avoid interference.";
 
-const TASK_DONE_DETAIL: &str = "✓ ";
+const TASK_DONE_DETAIL: &str = "✓ done";
+const TASK_ERROR_DETAIL: &str = "✗ error";
+const TASK_RUNNING_DETAIL: &str = "◈ running";
+const TASK_PANEL_FOOTER: &[(&str, &str)] = &[
+    ("enter", "attach"),
+    ("esc", "close"),
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TaskStatus {
+    Main,
+    Running,
+    Done,
+    Error,
+}
 
 #[derive(Clone)]
 pub(super) struct TaskEntry {
     name: String,
-    finished: Option<bool>,
+    status: TaskStatus,
+    usage: Option<String>,
 }
 
 impl PickerItem for TaskEntry {
     fn label(&self) -> &str {
         &self.name
     }
+    fn suffix(&self) -> Option<&str> {
+        self.usage.as_deref()
+    }
     fn detail(&self) -> Option<&str> {
-        matches!(self.finished, Some(true)).then_some(TASK_DONE_DETAIL)
+        match self.status {
+            TaskStatus::Done => Some(TASK_DONE_DETAIL),
+            TaskStatus::Error => Some(TASK_ERROR_DETAIL),
+            TaskStatus::Running => Some(TASK_RUNNING_DETAIL),
+            TaskStatus::Main => None,
+        }
     }
     fn is_spinning(&self) -> bool {
-        matches!(self.finished, Some(false))
+        self.status == TaskStatus::Running
     }
 }
 
@@ -409,12 +432,28 @@ impl App {
             .chats
             .iter()
             .enumerate()
-            .map(|(i, c)| TaskEntry {
-                name: c.name.clone(),
-                finished: (i > 0).then_some(c.is_finished()),
+            .map(|(i, c)| {
+                let status = if i == 0 {
+                    TaskStatus::Main
+                } else if c.is_failed() {
+                    TaskStatus::Error
+                } else if c.is_finished() {
+                    TaskStatus::Done
+                } else {
+                    TaskStatus::Running
+                };
+                let usage = (c.token_usage.total_input() + c.token_usage.output > 0).then(|| {
+                    format!("{} in / {} out", c.token_usage.total_input(), c.token_usage.output)
+                });
+                TaskEntry {
+                    name: c.name.clone(),
+                    status,
+                    usage,
+                }
             })
             .collect();
         self.task_picker_original = Some(self.active_chat);
+        self.task_picker.set_footer(TASK_PANEL_FOOTER);
         self.task_picker.open(entries, " Tasks ");
         self.task_picker.select(self.active_chat);
     }
@@ -700,9 +739,14 @@ impl App {
         }
 
         if !self.is_main_chat() {
+            let finished = self.chats[self.active_chat].is_finished();
             return match key.code {
-                KeyCode::Tab if !self.is_bash_input() => self.toggle_mode(),
-                KeyCode::Esc if !self.chats[self.active_chat].is_finished() => {
+                KeyCode::Esc if finished => {
+                    self.active_chat = 0;
+                    vec![]
+                }
+                KeyCode::Char('x') if !finished => self.handle_subagent_cancel(),
+                KeyCode::Esc if !finished => {
                     if let Some(t) = self.last_esc.take()
                         && t.elapsed() < self.status_bar.flash_duration
                     {
@@ -1136,6 +1180,7 @@ impl App {
         }
         let mut chat = Chat::new(subagent.name.clone(), self.ui_config);
         chat.set_restore_channel(self.lua_event_handle.clone(), self.restore_event_tx.clone());
+        chat.tool_use_id = Some(id.clone());
         chat.model_id = subagent.model.clone();
         if let Some(ref prompt) = subagent.prompt {
             chat.push_user_message(prompt);

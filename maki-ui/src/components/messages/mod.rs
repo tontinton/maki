@@ -34,6 +34,7 @@ use maki_agent::{
     BufferSnapshot, EventSender, InstructionBlock, NO_FILES_FOUND, SharedBuf, ToolDoneEvent,
     ToolOutput, ToolStartEvent,
 };
+use maki_agent::tools::TASK_TOOL_NAME;
 use maki_lua::{EventHandle, WARM_TOOL_CAP};
 
 use ratatui::Frame;
@@ -258,6 +259,9 @@ impl MessagesPanel {
             .or_else(|| event.output.annotation());
         if let Some(suffix) = &done_annotation {
             append_annotation(&mut msg.annotation, suffix);
+        }
+        if event.tool.as_ref() == TASK_TOOL_NAME {
+            append_annotation(&mut msg.annotation, "ctrl+t to view session");
         }
 
         match &event.output {

@@ -301,6 +301,10 @@ impl<T: PickerItem> ListPicker<T> {
         self
     }
 
+    pub fn set_footer(&mut self, hints: &'static [(&'static str, &'static str)]) {
+        self.footer = Some(FooterSpec::Pairs(hints));
+    }
+
     pub fn open_toggleable(&mut self, items: Vec<T>, enabled: Vec<bool>, title: impl Into<String>) {
         assert_eq!(
             items.len(),
