@@ -32,7 +32,7 @@ Answers to the "how do I..." questions once Maki is running:
 
 ## Extending and embedding
 
-- [Lua API](/docs/lua-api/): write plugins in Lua with an API that mirrors Neovim. Generated straight from the source, so it never drifts.
+- [Lua API](/docs/lua-api/): write plugins in Lua with an API that mirrors Neovim.
 - [Headless Mode](/docs/headless/): run Maki with `--print` in scripts and CI. Output is Claude Code compatible.
 - [ACP](/docs/acp/): drive Maki from your editor, like [Zed](https://zed.dev/), over the Agent Client Protocol.
 

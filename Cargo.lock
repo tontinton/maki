@@ -2586,6 +2586,7 @@ dependencies = [
  "arc-swap",
  "async-lock",
  "base64",
+ "criterion",
  "crossterm",
  "event-listener",
  "flume 0.11.1",

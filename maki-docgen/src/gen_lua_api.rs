@@ -17,6 +17,10 @@ The API tries to mirror Neovim as much as possible (`maki.fs`, `maki.uv`,
 `maki.treesitter`, `maki.keymap`, `maki.base64`), signatures are kept identical
 so code can be copy-pasted between the two without too many modifications.
 
+Plugins run compiled to native code (Luau JIT). If you are debugging a
+plugin and want full backtraces, start maki with `--no-jit`: it runs your
+Lua on the interpreter with complete debug info instead.
+
 A small plugin looks like this:
 
 ```lua

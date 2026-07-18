@@ -24,7 +24,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             }
         }
         Some(Command::Index { path }) => {
-            subcmd::index(&path, cli.no_plugins)?;
+            subcmd::index(&path, cli.no_plugins, cli.no_jit)?;
         }
         Some(Command::Models) => {
             subcmd::models();
@@ -43,7 +43,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             update::rollback().map_err(|e| color_eyre::eyre::eyre!("{e}"))?;
         }
         Some(Command::Acp { model, yolo }) => {
-            acp::run(model, yolo)?;
+            acp::run(model, yolo, cli.no_jit)?;
         }
         Some(Command::Migrate { action }) => match action {
             MigrateAction::Xdg => migrate::xdg()?,
@@ -54,7 +54,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             tools,
             names,
         }) => {
-            subcmd::prompt(&variant, plan, tools, names)?;
+            subcmd::prompt(&variant, plan, tools, names, cli.no_jit)?;
         }
         None => {
             tui::run(cli)?;

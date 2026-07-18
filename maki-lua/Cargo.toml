@@ -68,7 +68,12 @@ libc = { workspace = true }
 
 [dev-dependencies]
 base64 = { workspace = true }
+criterion = { workspace = true }
 image = { workspace = true }
 maki-agent = { workspace = true }
 tempfile = { workspace = true }
 test-case = { workspace = true }
+
+[[bench]]
+name = "luau_perf"
+harness = false

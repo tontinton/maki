@@ -73,6 +73,10 @@ pub struct Cli {
     #[arg(long)]
     pub no_plugins: bool,
 
+    /// Run plugin Lua on the interpreter with full debug info (no native codegen)
+    #[arg(long)]
+    pub no_jit: bool,
+
     /// Skip all permission prompts (allow everything)
     #[arg(long, alias = "dangerously-skip-permissions")]
     pub yolo: bool,
