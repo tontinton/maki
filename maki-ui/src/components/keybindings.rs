@@ -385,6 +385,12 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
+        label: KeyLabel::Single("@"),
+        description: "Mention a file (Esc leaves a literal @)",
+        context: KeybindContext::Editing,
+        platform: Platform::All,
+    },
+    Keybind {
         label: KeyLabel::MacAlt(key::DELETE_WORD.label, "⌥⌫"),
         description: "Delete word backward",
         context: KeybindContext::Editing,

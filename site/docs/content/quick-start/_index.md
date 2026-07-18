@@ -87,6 +87,7 @@ Type a prompt, press **Enter**, and the agent starts working.
 - **Scroll output**: Ctrl+U / Ctrl+D (half page)
 - **Cancel streaming**: Esc Esc
 - **Rewind (when idle)**: Esc Esc
+- **Insert file path**: type `@` after whitespace to open the file picker (Esc leaves a literal `@`)
 - **Quit**: Ctrl+C
 - **All keybindings**: Ctrl+H
 

@@ -562,7 +562,12 @@ impl App {
                     vec![]
                 }
                 FilePickerModalAction::Close => {
+                    let was_at = self.file_picker.take_at_mention();
                     self.file_picker.close();
+                    if was_at {
+                        self.input_box.buffer.push_char('@');
+                        self.command_palette.sync(&self.input_box.buffer.value());
+                    }
                     vec![]
                 }
             });
@@ -780,6 +785,10 @@ impl App {
         let streaming = self.status == Status::Streaming;
         match self.input_box.handle_key(key) {
             InputAction::Submit(sub) => self.handle_submit(sub),
+            InputAction::OpenFilePicker => {
+                self.file_picker.open_via_at(&self.state.session.cwd);
+                vec![]
+            }
             InputAction::PaletteSync(val) => {
                 self.command_palette.sync(&val);
                 vec![]

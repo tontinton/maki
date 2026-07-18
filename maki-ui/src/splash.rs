@@ -21,6 +21,7 @@ const TIPS: &[(&str, &str)] = &[
         key::FILE_PICKER.label,
         "to grab file paths with fuzzy search",
     ),
+    ("@", "to mention a file in your prompt"),
     (key::TASKS.label, "to see what your subagents are up to"),
     (key::SEARCH.label, "to find things in the conversation"),
     ("/btw", "to ask something without interrupting the session"),

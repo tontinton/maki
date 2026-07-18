@@ -870,6 +870,38 @@ fn overlay_blocks_ctrl_shortcuts(setup: fn(&mut App)) {
 }
 
 #[test]
+fn at_mention_opens_file_picker_and_esc_leaves_literal() {
+    let mut app = test_app();
+    app.update(Msg::Key(key(KeyCode::Char('@'))));
+    assert!(app.file_picker.is_open());
+    assert_eq!(app.input_box.buffer.value(), "");
+
+    app.update(Msg::Key(key(KeyCode::Esc)));
+    assert!(!app.file_picker.is_open());
+    assert_eq!(app.input_box.buffer.value(), "@");
+}
+
+#[test]
+fn at_mention_does_not_open_mid_word() {
+    let mut app = test_app();
+    for c in "em".chars() {
+        app.update(Msg::Key(key(KeyCode::Char(c))));
+    }
+    app.update(Msg::Key(key(KeyCode::Char('@'))));
+    assert!(!app.file_picker.is_open());
+    assert_eq!(app.input_box.buffer.value(), "em@");
+}
+
+#[test]
+fn ctrl_s_file_picker_unaffected_by_at_mention_flag() {
+    let mut app = test_app();
+    app.update(Msg::Key(key(KeyCode::Char('x'))));
+    app.update(Msg::Key(kb::FILE_PICKER.to_key_event()));
+    assert!(app.file_picker.is_open());
+    assert_eq!(app.input_box.buffer.value(), "x");
+}
+
+#[test]
 fn compact_command_sets_streaming() {
     let mut app = test_app();
     let actions = app.execute_command(cmd("/compact"));
