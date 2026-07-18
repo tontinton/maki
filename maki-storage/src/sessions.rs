@@ -139,7 +139,9 @@ pub struct SessionSummary {
     pub id: MakiId,
     pub title: String,
     pub updated_at: u64,
+    #[serde(default)]
     pub cwd: String,
+    #[serde(default)]
     pub model: String,
 }
 
@@ -366,6 +368,7 @@ enum LogRecord<M, U, T> {
     Header {
         v: u32,
         id: MakiId,
+        #[serde(default)]
         model: String,
         cwd: String,
         created_at: u64,
