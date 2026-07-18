@@ -101,6 +101,10 @@
 
             SSL_CERT_FILE = certs;
             NIX_SSL_CERT_FILE = certs;
+            LD_LIBRARY_PATH = lib.makeLibraryPath [
+              pkgs.openssl
+              pkgs.stdenv.cc.cc.lib
+            ];
           };
         }
       );
