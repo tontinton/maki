@@ -1101,6 +1101,10 @@ impl App {
                     self.queue.clear();
                     self.subagent_answers.clear();
                     self.finish_subagents(DisplayRole::Error, ERROR_TEXT);
+                    self.chats[chat_idx].push(DisplayMessage::new(
+                        DisplayRole::Error,
+                        message.clone(),
+                    ));
                     for chat in &mut self.chats {
                         chat.fail_in_progress_with_message(message.clone());
                     }

@@ -26,7 +26,7 @@ use crate::app::shell::{ShellEvent, spawn_shell};
 use crate::app::{App, Msg};
 use crate::components::input::Submission;
 use crate::components::usage_modal::UsageFetchState;
-use crate::components::{Action, ExitRequest, Status};
+use crate::components::{Action, DisplayMessage, DisplayRole, ExitRequest, Status};
 
 use crate::storage_writer::StorageWriter;
 use crate::terminal;
@@ -560,9 +560,23 @@ impl<'t> EventLoop<'t> {
                         provider: Arc::from(new_provider),
                     }));
                 }
-                Err(e) => self.app.flash(format!("Failed to create provider: {e}")),
+                Err(e) => {
+                    let msg = format!("Failed to create provider: {e}");
+                    self.app.main_chat().push(DisplayMessage::new(
+                        DisplayRole::Error,
+                        msg.clone(),
+                    ));
+                    self.app.flash(msg);
+                }
             },
-            Err(e) => self.app.flash(format!("Invalid model: {e}")),
+            Err(e) => {
+                let msg = format!("Invalid model: {e}");
+                self.app.main_chat().push(DisplayMessage::new(
+                    DisplayRole::Error,
+                    msg.clone(),
+                ));
+                self.app.flash(msg);
+            }
         }
     }
 

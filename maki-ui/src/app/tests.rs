@@ -2514,6 +2514,24 @@ fn agent_error_creates_synthetic_tool_done_with_message() {
 }
 
 #[test]
+fn error_event_adds_copyable_message_to_main_chat() {
+    let mut app = test_app();
+    app.run_id = 1;
+    app.status = Status::Streaming;
+
+    let error_msg = "Provider is overloaded";
+    app.update(agent_msg(AgentEvent::Error {
+        message: error_msg.into(),
+    }));
+
+    assert_eq!(
+        app.main_chat().last_message_role(),
+        Some(&DisplayRole::Error)
+    );
+    assert!(app.main_chat().last_message_text().contains(error_msg));
+}
+
+#[test]
 fn ctrl_c_denies_permission_prompt() {
     let mut app = test_app();
     app.permission_prompt.open(
