@@ -300,7 +300,7 @@ impl PermissionPrompt {
             };
             let (before, after) = display_text.split_at(cursor_pos);
             let mut chars = after.chars();
-            let cursor_ch = chars.next().map_or(' ', |c| c);
+            let cursor_ch = chars.next().unwrap_or(' ');
             let rest: String = chars.collect();
 
             let mut spans = vec![Span::raw("  "), Span::styled("guide ", label_style)];

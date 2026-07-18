@@ -1131,8 +1131,7 @@ fn send_scroll(app: &mut App) {
     });
 }
 
-#[test_case(send_key as fn(&mut App)    ; "key")]
-#[test_case(send_scroll as fn(&mut App) ; "scroll")]
+#[test_case(send_key as fn(&mut App) ; "key")]
 fn interrupt_clears_dragging_but_preserves_pending_copy(interrupt: fn(&mut App)) {
     let mut app = test_app();
     set_zone(&mut app, SelectionZone::Messages, Rect::new(0, 0, 80, 20));
@@ -1145,6 +1144,27 @@ fn interrupt_clears_dragging_but_preserves_pending_copy(interrupt: fn(&mut App))
     assert!(
         app.selection_state.as_ref().unwrap().is_pending_copy(),
         "preserves pending copy"
+    );
+}
+
+#[test]
+fn scroll_preserves_dragging_and_updates_cursor() {
+    let mut app = test_app();
+    set_zone(&mut app, SelectionZone::Messages, Rect::new(0, 0, 80, 20));
+    app.update(mouse_event(MouseEventKind::Down(MouseButton::Left), 5, 5));
+
+    send_scroll(&mut app);
+
+    assert!(
+        matches!(app.selection_state.as_ref().unwrap(), SelectionState::Dragging { .. }),
+        "scroll keeps dragging"
+    );
+
+    make_pending_copy(&mut app);
+    send_scroll(&mut app);
+    assert!(
+        app.selection_state.as_ref().unwrap().is_pending_copy(),
+        "scroll preserves pending copy"
     );
 }
 

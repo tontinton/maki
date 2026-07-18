@@ -49,7 +49,7 @@ use crate::components::{
     Action, DisplayMessage, DisplayRole, ExitRequest, Overlay, RetryInfo, Status, is_ctrl,
 };
 use crate::image;
-use crate::selection::{SelectionState, ZoneRegistry};
+use crate::selection::{SelectionState, SelectionZone, ZoneRegistry};
 use arc_swap::{ArcSwap, ArcSwapOption};
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use maki_agent::permissions::PermissionManager;
@@ -343,8 +343,26 @@ impl App {
                 vec![]
             }
             Msg::Scroll { column, row, delta } => {
-                self.clear_selection_unless_pending_copy();
+                let drag_zone = self.selection_state.as_ref().and_then(|s| match s {
+                    SelectionState::Dragging { sel, .. } => Some(sel.zone),
+                    _ => None,
+                });
                 self.handle_scroll(column, row, delta);
+                if let Some(zone) = self.zone_at(row, column) {
+                    if drag_zone == Some(zone.zone)
+                        && matches!(zone.zone, SelectionZone::Messages | SelectionZone::Input)
+                    {
+                        let scroll = self.scroll_offset(zone.zone);
+                        if let Some(SelectionState::Dragging { sel, .. }) = &mut self.selection_state
+                        {
+                            sel.update(row, column, scroll);
+                        }
+                    } else {
+                        self.clear_selection_unless_pending_copy();
+                    }
+                } else {
+                    self.clear_selection_unless_pending_copy();
+                }
                 vec![]
             }
             Msg::Agent(envelope) => self.handle_agent_event(*envelope),
