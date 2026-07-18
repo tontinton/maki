@@ -43,6 +43,10 @@ impl HighlightKey {
 pub(super) struct Segment {
     lines: Vec<Line<'static>>,
     pub search_text: String,
+    pub raw_text: Option<String>,
+    /// Visual width of the prefix added to every rendered line (e.g. "maki> ").
+    /// Used when copying a selection back to the original source text.
+    pub prefix_width: u16,
     pub tool_id: Option<String>,
     /// Backlink to `self.messages`, set only by `with_lines`. A click on a
     /// collapsed thinking indicator has no tool_id to route by, so this is
@@ -77,11 +81,15 @@ impl Segment {
     pub fn with_lines(
         lines: Vec<Line<'static>>,
         search_text: String,
+        raw_text: Option<String>,
+        prefix_width: u16,
         msg_index: Option<usize>,
     ) -> Self {
         Self {
             lines,
             search_text,
+            raw_text,
+            prefix_width,
             msg_index,
             ..Self::default()
         }

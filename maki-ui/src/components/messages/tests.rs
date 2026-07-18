@@ -747,6 +747,53 @@ fn extract_wrapped_no_soft_breaks(template: &str, anchor: (u32, u16)) {
 }
 
 #[test]
+fn extract_fully_selected_message_copies_raw_text() {
+    let mut panel = MessagesPanel::new(UiConfig::default());
+    panel.push(DisplayMessage::new(
+        DisplayRole::Assistant,
+        "some **markdown** text".into(),
+    ));
+    render(&mut panel, 80, 24);
+
+    let total: u16 = panel.segment_heights().iter().sum();
+    let area = Rect::new(0, 0, 80, 24);
+    let sel = make_sel(area, (0, 0), ((total - 1) as u32, 79));
+    let text = panel.extract_selection_text(&sel, area);
+
+    assert_eq!(text, "some **markdown** text");
+}
+
+#[test]
+fn extract_fully_selected_tool_copies_raw_output() {
+    let mut panel = MessagesPanel::new(UiConfig::default());
+    let table = "| a | b |\n|---|---|\n| 1 | 2 |";
+    panel.tool_start(start("t1", BASH_TOOL_NAME));
+    panel.tool_done(ToolDoneEvent {
+        id: "t1".into(),
+        tool: BASH_TOOL_NAME.into(),
+        output: ToolOutput::Markdown(table.into()),
+        is_error: false,
+        annotation: None,
+        written_path: None,
+    });
+    rebuild(&mut panel);
+
+    let total: u16 = panel.segment_heights().iter().sum();
+    let area = Rect::new(0, 0, 80, 24);
+    let sel = make_sel(area, (0, 0), ((total - 1) as u32, 79));
+    let text = panel.extract_selection_text(&sel, area);
+
+    assert!(
+        text.contains("| a | b |"),
+        "expected raw markdown table, got: {text:?}"
+    );
+    assert!(
+        !text.contains('─'),
+        "copied text should not contain rendered table borders: {text:?}"
+    );
+}
+
+#[test]
 fn extract_partial_last_line_truncated() {
     let mut panel = MessagesPanel::new(UiConfig::default());
     panel.push(DisplayMessage::new(

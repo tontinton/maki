@@ -38,14 +38,8 @@ pub(super) fn extract_selection_text(
             continue;
         }
 
-        let tmp_area = Rect::new(0, 0, width, h);
-        let mut tmp = Buffer::empty(tmp_area);
-        Paragraph::new(seg.lines().to_vec())
-            .wrap(Wrap { trim: false })
-            .render(tmp_area, &mut tmp);
-
-        let rel_start = doc_start.row.saturating_sub(seg_start) as u16;
-        let rel_end = ((doc_end.row + 1).saturating_sub(seg_start) as u16).min(h);
+        let rel_start = doc_start.row.saturating_sub(seg_start) as usize;
+        let rel_end = ((doc_end.row + 1).saturating_sub(seg_start) as usize).min(h as usize);
 
         let start_col = if seg_start > doc_start.row {
             0
@@ -58,15 +52,31 @@ pub(super) fn extract_selection_text(
             doc_end.col.saturating_sub(msg_area.x)
         };
 
+        let content_start = msg_area.x + seg.prefix_width;
+        let seg_fully_selected = seg_start >= doc_start.row
+            && seg_end <= doc_end.row + 1
+            && doc_start.col <= content_start
+            && doc_end.col >= msg_area.x + width - 1;
+        if seg_fully_selected && let Some(raw) = &seg.raw_text {
+            out.push_str(raw);
+            continue;
+        }
+
+        let tmp_area = Rect::new(0, 0, width, h);
+        let mut tmp = Buffer::empty(tmp_area);
+        Paragraph::new(seg.lines().to_vec())
+            .wrap(Wrap { trim: false })
+            .render(tmp_area, &mut tmp);
+
         let ss = ScreenSelection {
-            start_row: rel_start,
+            start_row: rel_start as u16,
             start_col,
-            end_row: rel_end.saturating_sub(1),
+            end_row: rel_end.saturating_sub(1) as u16,
             end_col,
         };
 
         let breaks = LineBreaks::from_lines(seg.lines(), width);
-        selection::append_rows(&tmp, tmp_area, &ss, rel_start, rel_end, &mut out, &breaks);
+        selection::append_rows(&tmp, tmp_area, &ss, rel_start as u16, rel_end as u16, &mut out, &breaks);
     }
     out
 }
