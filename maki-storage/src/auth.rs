@@ -49,6 +49,20 @@ pub struct ProviderCredentials {
     pub host: Option<String>,
 }
 
+impl ProviderCredentials {
+    pub fn masked_api_key(&self) -> String {
+        if self.api_key.len() > 8 {
+            format!(
+                "{}...{}",
+                &self.api_key[..4],
+                &self.api_key[self.api_key.len() - 4..]
+            )
+        } else {
+            "****".to_string()
+        }
+    }
+}
+
 pub fn now_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

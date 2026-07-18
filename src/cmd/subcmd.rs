@@ -15,6 +15,7 @@ use maki_config::providers::{
 use maki_config::{load_env_files, load_permissions};
 use maki_lua::PluginHost;
 use maki_providers::provider::fetch_all_models;
+use maki_providers::{ProviderData, catalog_providers};
 use maki_providers::{copilot_auth, dynamic, openai_auth};
 use maki_storage::StateDir;
 use maki_storage::auth::ProviderCredentials;
@@ -27,7 +28,18 @@ pub fn auth_login(provider: Option<&str>, storage: &StateDir) -> Result<()> {
     match provider {
         Some("openai") => openai_auth::login(storage)?,
         Some("copilot") => copilot_auth::login(storage)?,
-        Some(slug) => login_provider(&slugify(slug), storage)?,
+        Some(slug) => {
+            let slug = slugify(slug);
+            if builtin_provider(&slug).is_none()
+                && dynamic::display_name(&slug).is_none()
+                && ProvidersConfig::load().get(&slug).is_none()
+                && let Some(provider_data) = maki_providers::catalog_provider(&slug)
+            {
+                login_catalog_provider(&provider_data, storage)?;
+            } else {
+                login_provider(&slug, storage)?;
+            }
+        }
         None => login_interactive(storage)?,
     }
     Ok(())
@@ -122,7 +134,7 @@ fn login_interactive(storage: &StateDir) -> Result<()> {
     let custom_slugs: Vec<&String> = config
         .providers
         .keys()
-        .filter(|s| builtin_provider(s).is_none())
+        .filter(|s| builtin_provider(s).is_none() && *s != "opencode")
         .collect();
 
     println!();
@@ -152,6 +164,20 @@ fn login_interactive(storage: &StateDir) -> Result<()> {
             .unwrap_or(slug);
         println!("  {} {}. {:<14} {}", status, idx, slug, display);
     }
+
+    let catalog_entries = catalog_providers();
+    for cat in &catalog_entries {
+        idx += 1;
+        let status = if load_provider_credentials(storage, &cat.slug).is_some() {
+            "\x1b[32m✓\x1b[0m"
+        } else {
+            " "
+        };
+        println!(
+            "  {} {}. {:<14} {}",
+            status, idx, cat.slug, cat.display_name
+        );
+    }
     idx += 1;
     let custom_idx = idx;
     println!("    {}. Custom provider...", custom_idx);
@@ -172,11 +198,51 @@ fn login_interactive(storage: &StateDir) -> Result<()> {
     } else if choice <= builtins.len() {
         let slug = builtins[choice - 1].slug;
         login_provider(slug, storage)?;
-    } else {
+    } else if choice <= builtins.len() + custom_slugs.len() {
         let slug = custom_slugs[choice - builtins.len() - 1];
         login_provider(slug, storage)?;
+    } else {
+        let provider = &catalog_entries[choice - builtins.len() - custom_slugs.len() - 1];
+        login_catalog_provider(provider, storage)?;
     }
 
+    Ok(())
+}
+
+fn login_catalog_provider(provider: &ProviderData, storage: &StateDir) -> Result<()> {
+    println!();
+    if let Some(ref var) = provider.env_keys.first() {
+        println!("  Provider: {} (env: {var})", provider.slug);
+    } else {
+        println!("  Provider: {}", provider.slug);
+    }
+    print!("  API key: ");
+    io::stdout().flush()?;
+    let mut key = String::new();
+    io::stdin().read_line(&mut key)?;
+    let key = key.trim().to_string();
+    if key.is_empty() {
+        println!("  Skipped (no key entered)");
+        return Ok(());
+    }
+    let creds = ProviderCredentials {
+        api_key: key,
+        host: None,
+    };
+    save_provider_credentials(storage, &provider.slug, &creds).context("save credentials")?;
+    println!("  \x1b[32m✓\x1b[0m Saved credentials for {}", provider.slug);
+    println!(
+        "  Credentials: ~/.local/state/maki/auth/{}.json",
+        provider.slug
+    );
+    println!(
+        "  You can also set via: {}",
+        provider
+            .env_keys
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "API key environment variable".to_string())
+    );
     Ok(())
 }
 
@@ -401,23 +467,19 @@ pub fn auth_status(storage: &StateDir) -> Result<()> {
     }
 
     for (slug, def) in &config.providers {
-        if builtin_provider(slug).is_some() {
+        // 'opencode' could show up here, when the user configured free models on that provider.
+        if builtin_provider(slug).is_some()
+            || (slug == "opencode" && def.enable_free_models.is_some())
+        {
             continue;
         }
         let display = def.display_name.as_deref().unwrap_or(slug);
         if let Some(creds) = load_provider_credentials(storage, slug) {
-            let masked = if creds.api_key.len() > 8 {
-                format!(
-                    "{}...{}",
-                    &creds.api_key[..4],
-                    &creds.api_key[creds.api_key.len() - 4..]
-                )
-            } else {
-                "****".to_string()
-            };
             println!(
                 "  \x1b[32m✓\x1b[0m {:<14} {} (key: {})",
-                slug, display, masked
+                slug,
+                display,
+                creds.masked_api_key()
             );
         } else {
             let default_env = format!("{}_API_KEY", slug.to_uppercase().replace('-', "_"));
@@ -435,7 +497,32 @@ pub fn auth_status(storage: &StateDir) -> Result<()> {
             }
         }
     }
-    println!();
+    // Catalog providers from models.dev
+    let catalog_entries = catalog_providers();
+    if !catalog_entries.is_empty() {
+        println!("  \x1b[1mCatalog Providers (models.dev):\x1b[0m");
+        for entry in &catalog_entries {
+            if let Some(creds) = load_provider_credentials(storage, &entry.slug) {
+                println!(
+                    "  \x1b[32m✓\x1b[0m {:<14} {} (key: {})",
+                    entry.slug,
+                    entry.display_name,
+                    creds.masked_api_key()
+                );
+            } else if let Some(env) = entry.env_key_set() {
+                println!(
+                    "  \x1b[33m~\x1b[0m {:<14} {} (via {})",
+                    entry.slug, entry.display_name, env
+                );
+            } else {
+                println!(
+                    "  \x1b[31m✗\x1b[0m {:<14} {} (run: maki auth login {})",
+                    entry.slug, entry.display_name, entry.slug
+                );
+            }
+        }
+        println!();
+    }
 
     Ok(())
 }
