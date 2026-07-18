@@ -161,6 +161,22 @@ impl PluginHost {
         Self { inner: None }
     }
 
+    /// Stop the Lua thread from taking new work without joining it, so the
+    /// caller can rebuild shared state (like the tool registry) while the
+    /// old VM winds down on its own. The flag makes the watchdog abort
+    /// in-flight callbacks, `Shutdown` on the priority lane skips ahead of
+    /// queued bulk work, and swapping the senders for disconnected ones
+    /// makes every later host call fail right at the send; `&mut self`
+    /// rules out a call racing the swap. `Drop` still joins the thread.
+    pub fn begin_shutdown(&mut self) {
+        if let Some(ref mut inner) = self.inner {
+            inner.shutdown.store(true, Ordering::Release);
+            let _ = inner.prio_tx.send(Request::Shutdown);
+            inner.tx = flume::unbounded().0;
+            inner.prio_tx = flume::unbounded().0;
+        }
+    }
+
     /// Boots the runtime and loads every default bundled plugin into `registry`.
     /// For callers like tests and docgen that want the full builtin set
     /// without building a config.
@@ -563,6 +579,50 @@ mod tests {
         let mut host = PluginHost::disabled();
         host.load_builtins(&PluginsConfig::from_plugins(HashMap::new()))
             .unwrap();
+    }
+
+    /// The second call sends `Shutdown` on a sender that is already
+    /// disconnected; it must swallow that error and keep rejecting work.
+    #[test]
+    fn begin_shutdown_rejects_later_loads_and_is_idempotent() {
+        let mut host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.begin_shutdown();
+        assert!(host.load_source("late", "return {}").is_err());
+        host.begin_shutdown();
+        assert!(host.load_source("later", "return {}").is_err());
+    }
+
+    #[test]
+    fn begin_shutdown_on_disabled_host_is_noop() {
+        PluginHost::disabled().begin_shutdown();
+    }
+
+    /// Regression for the exit drain in `runtime::spawn`. An `EventHandle`
+    /// clone keeps queued requests alive after the Lua thread exits, and
+    /// dispatch prefers the priority lane, so a bulk request queued behind
+    /// `Shutdown` is never served. Without the drain its reply sender lives
+    /// forever and `collect_prompt_slots` blocks; with it, the call falls
+    /// back to defaults right away.
+    #[test]
+    fn live_event_handle_does_not_hang_after_begin_shutdown() {
+        let mut host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(
+            "hinted",
+            r#"maki.api.register_prompt_hint({ slot = "tool_usage", content = "live" })"#,
+        )
+        .unwrap();
+        let handle = host.event_handle().unwrap();
+        host.begin_shutdown();
+
+        let slots = handle.collect_prompt_slots();
+        assert!(
+            contents(&slots, PromptId::System, Slot::ToolUsage).is_empty(),
+            "dead host must yield defaults, not real slots"
+        );
+
+        drop(host);
+        let slots = handle.collect_prompt_slots();
+        assert!(contents(&slots, PromptId::System, Slot::ToolUsage).is_empty());
     }
 
     /// Load `src` as one plugin, collect resolved slots.

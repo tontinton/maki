@@ -71,6 +71,7 @@ pub(crate) use mode::{Mode, PlanState, PlanTrigger};
 #[cfg(test)]
 use mouse::EDGE_SCROLL_LINES;
 pub(crate) use queue::{MessageQueue, SubmitOutcome};
+pub(crate) use session::session_has_content;
 use session_state::SessionState;
 
 const CANCEL_MSG: &str = "Cancelled.";

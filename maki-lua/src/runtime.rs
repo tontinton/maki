@@ -2414,6 +2414,12 @@ pub fn spawn(
                     }
                 }
             }));
+            // Clones of the host (`EventHandle`, `LuaTool`) can still hold
+            // a live sender, so dropping the receivers alone does not free
+            // queued requests. Drain them so their reply channels drop and
+            // no caller blocks on a dead host.
+            for _ in rx.drain() {}
+            for _ in prio_rx.drain() {}
         })
         .map_err(|e| PluginError::Io {
             path: PathBuf::from("lua-thread"),

@@ -2,6 +2,7 @@ use std::env;
 use std::io::{self, IsTerminal, Read};
 use std::path::Path;
 use std::sync::Arc;
+use std::thread::{self, JoinHandle};
 
 use color_eyre::Result;
 use color_eyre::eyre::Context;
@@ -21,8 +22,6 @@ use crate::setup;
 const FALLBACK_MODEL_SPEC: &str = "anthropic/claude-sonnet-4-20250514";
 const CONFIG_FALLBACK_WARNING: &str = "config reload failed, using previous config";
 const MODEL_FALLBACK_WARNING: &str = "model resolution failed, keeping previous model";
-const RELOAD_TAB_WARNING: &str = "failed to reopen session";
-const RESUME_HINT: &str = "maki -s";
 
 /// One generation of the app: everything torn down and rebuilt on `/reload`.
 /// Dropping it joins the Lua thread via `PluginHost::drop`.
@@ -41,6 +40,35 @@ impl Stack {
             low_speed: self.config.provider.low_speed_timeout,
             stream: self.config.provider.stream_timeout,
         }
+    }
+}
+
+/// Background teardown of the previous generation. `defer` keeps the slow
+/// drop (a Lua thread join, capped at 2s in `PluginHost::drop`) off the
+/// `/reload` hot path. Joining on replace and on drop covers every exit
+/// path, including `?` unwinds, so no VM is abandoned mid-shutdown and at
+/// most one teardown is ever in flight.
+#[derive(Default)]
+struct Teardown(Option<JoinHandle<()>>);
+
+impl Teardown {
+    fn defer(&mut self, work: impl FnOnce() + Send + 'static) {
+        self.join();
+        self.0 = Some(thread::spawn(work));
+    }
+
+    fn join(&mut self) {
+        if let Some(handle) = self.0.take()
+            && handle.join().is_err()
+        {
+            tracing::warn!("background teardown panicked");
+        }
+    }
+}
+
+impl Drop for Teardown {
+    fn drop(&mut self) {
+        self.join();
     }
 }
 
@@ -189,34 +217,6 @@ fn resolve_session(
     Ok(AppSession::new(model, cwd))
 }
 
-/// Reopen every tab from disk after a reload. A saved tab that fails to load
-/// flashes a warning and comes back fresh; a `None` slot was empty and starts
-/// as a new session.
-fn resolve_reload_tabs(
-    ids: &[Option<MakiId>],
-    model: &str,
-    cwd: &str,
-    storage: &StateDir,
-    warnings: &mut Vec<String>,
-) -> Vec<AppSession> {
-    let mut tabs: Vec<AppSession> = ids
-        .iter()
-        .map(|slot| match slot {
-            Some(id) => AppSession::load(*id, storage).unwrap_or_else(|e| {
-                warnings.push(format!(
-                    "{RELOAD_TAB_WARNING} {id}: {e}; it is still on disk, try `{RESUME_HINT} {id}`"
-                ));
-                AppSession::new(model, cwd)
-            }),
-            None => AppSession::new(model, cwd),
-        })
-        .collect();
-    if tabs.is_empty() {
-        tabs.push(AppSession::new(model, cwd));
-    }
-    tabs
-}
-
 fn read_initial_prompt(cli_prompt: Option<String>) -> Result<Option<String>> {
     match cli_prompt {
         Some(p) => Ok(Some(p)),
@@ -295,6 +295,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
     let mut focused = 0;
     let mut warnings: Vec<String> = Vec::new();
     let mut initial_prompt = read_initial_prompt(cli.initial_prompt.take())?;
+    let mut teardown = Teardown::default();
 
     loop {
         for session in &mut tabs {
@@ -347,29 +348,39 @@ pub fn run(mut cli: Cli) -> Result<()> {
                     eprintln!("Resume session:\n\n  maki -s {session_id}");
                 }
                 if code != 0 {
+                    teardown.join();
                     std::process::exit(code);
                 }
                 return Ok(());
             }
             RunOutcome::Reload {
-                tabs: ids,
+                tabs: reloaded,
                 focused: f,
             } => {
+                let started = std::time::Instant::now();
                 let last_good = (stack.config.clone(), stack.model.clone());
-                drop(stack);
+                // Shut the old host down first so nothing can repopulate
+                // the registry after the clear: its senders disconnect, the
+                // watchdog aborts in-flight callbacks, and only this thread
+                // issues loads. The old VM then shares nothing with the new
+                // stack, so its slow join (up to 2s) can run on a
+                // background thread.
+                stack.plugin_host.begin_shutdown();
                 ToolRegistry::global().clear_lua();
-                let (new_stack, mut new_warnings) =
-                    build_stack(&cli, &cwd, &storage, Some(last_good))?;
-                tabs = resolve_reload_tabs(
-                    &ids,
-                    &new_stack.model.spec(),
-                    &cwd_str,
-                    &storage,
-                    &mut new_warnings,
-                );
+                teardown.defer(move || drop(stack));
+                let (new_stack, new_warnings) = build_stack(&cli, &cwd, &storage, Some(last_good))?;
+                tabs = reloaded;
+                if tabs.is_empty() {
+                    tabs.push(AppSession::new(&new_stack.model.spec(), &cwd_str));
+                }
                 stack = new_stack;
                 warnings = new_warnings;
                 focused = f.min(tabs.len() - 1);
+                tracing::info!(
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    tabs = tabs.len(),
+                    "reload: rebuilt plugins and config"
+                );
             }
         }
     }
@@ -395,10 +406,43 @@ mod tests {
     use super::*;
     use color_eyre::eyre::eyre;
     use maki_config::RawConfig;
-    use tempfile::TempDir;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
-    const TEST_MODEL: &str = "test/model";
-    const TEST_CWD: &str = "/tmp/reload-test";
+    /// `second_saw_first` requires both joins: `defer` joining the first
+    /// closure before spawning the second, and `Drop` joining the second
+    /// before the assert reads the flag.
+    #[test]
+    fn teardown_defer_joins_previous_and_drop_joins_last() {
+        let first_done = Arc::new(AtomicBool::new(false));
+        let second_saw_first = Arc::new(AtomicBool::new(false));
+        let mut teardown = Teardown::default();
+
+        let set = Arc::clone(&first_done);
+        teardown.defer(move || set.store(true, Ordering::Release));
+
+        let read = Arc::clone(&first_done);
+        let record = Arc::clone(&second_saw_first);
+        teardown.defer(move || record.store(read.load(Ordering::Acquire), Ordering::Release));
+
+        drop(teardown);
+        assert!(second_saw_first.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn teardown_swallows_panic_and_keeps_working() {
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+
+        let after_panic_ran = Arc::new(AtomicBool::new(false));
+        let mut teardown = Teardown::default();
+        teardown.defer(|| panic!("intentional"));
+        let set = Arc::clone(&after_panic_ran);
+        teardown.defer(move || set.store(true, Ordering::Release));
+        drop(teardown);
+
+        std::panic::set_hook(prev_hook);
+        assert!(after_panic_ran.load(Ordering::Acquire));
+    }
 
     fn test_config() -> Config {
         RawConfig::default()
@@ -433,100 +477,5 @@ mod tests {
         };
         assert!(err.to_string().contains("boom"));
         assert!(warnings.is_empty());
-    }
-
-    fn temp_storage() -> (TempDir, StateDir) {
-        let dir = TempDir::new().expect("tempdir");
-        let storage = StateDir::from_path(dir.path().to_path_buf());
-        (dir, storage)
-    }
-
-    #[test]
-    fn resolve_reload_roundtrips_saved_session() {
-        let (_dir, storage) = temp_storage();
-        let mut session = AppSession::new(TEST_MODEL, TEST_CWD);
-        session.title = "persisted title".into();
-        session.save(&storage).expect("save");
-        let id = session.id;
-        let mut warnings = Vec::new();
-
-        let tabs = resolve_reload_tabs(&[Some(id)], TEST_MODEL, TEST_CWD, &storage, &mut warnings);
-
-        assert_eq!(tabs.len(), 1);
-        assert_eq!(tabs[0].id, id);
-        assert_eq!(tabs[0].title, "persisted title");
-        assert!(warnings.is_empty(), "{warnings:?}");
-    }
-
-    #[test]
-    fn resolve_reload_missing_id_warns_and_falls_back_fresh() {
-        let (_dir, storage) = temp_storage();
-        let missing = MakiId::generate();
-        let mut warnings = Vec::new();
-
-        let tabs = resolve_reload_tabs(
-            &[Some(missing)],
-            TEST_MODEL,
-            TEST_CWD,
-            &storage,
-            &mut warnings,
-        );
-
-        assert_eq!(tabs.len(), 1);
-        assert_ne!(tabs[0].id, missing);
-        assert_eq!(warnings.len(), 1, "{warnings:?}");
-        assert!(warnings[0].starts_with(RELOAD_TAB_WARNING), "{warnings:?}");
-        assert!(warnings[0].contains(&missing.to_string()), "{warnings:?}");
-        assert!(warnings[0].contains(RESUME_HINT), "{warnings:?}");
-    }
-
-    #[test]
-    fn resolve_reload_none_slot_becomes_fresh_session() {
-        let (_dir, storage) = temp_storage();
-        let mut warnings = Vec::new();
-
-        let tabs = resolve_reload_tabs(&[None], TEST_MODEL, TEST_CWD, &storage, &mut warnings);
-
-        assert_eq!(tabs.len(), 1);
-        assert_eq!(tabs[0].model, TEST_MODEL);
-        assert_eq!(tabs[0].cwd, TEST_CWD);
-        assert!(warnings.is_empty(), "{warnings:?}");
-    }
-
-    #[test]
-    fn resolve_reload_empty_ids_yields_one_fresh_tab() {
-        let (_dir, storage) = temp_storage();
-        let mut warnings = Vec::new();
-
-        let tabs = resolve_reload_tabs(&[], TEST_MODEL, TEST_CWD, &storage, &mut warnings);
-
-        assert_eq!(tabs.len(), 1);
-        assert_eq!(tabs[0].model, TEST_MODEL);
-        assert!(warnings.is_empty(), "{warnings:?}");
-    }
-
-    #[test]
-    fn resolve_reload_preserves_tab_order_with_mixed_slots() {
-        let (_dir, storage) = temp_storage();
-        let mut saved = AppSession::new(TEST_MODEL, TEST_CWD);
-        saved.save(&storage).expect("save");
-        let saved_id = saved.id;
-        let missing = MakiId::generate();
-        let mut warnings = Vec::new();
-
-        let tabs = resolve_reload_tabs(
-            &[Some(saved_id), None, Some(missing)],
-            TEST_MODEL,
-            TEST_CWD,
-            &storage,
-            &mut warnings,
-        );
-
-        assert_eq!(tabs.len(), 3);
-        assert_eq!(tabs[0].id, saved_id);
-        assert_ne!(tabs[1].id, saved_id);
-        assert_ne!(tabs[2].id, missing);
-        assert_eq!(warnings.len(), 1, "{warnings:?}");
-        assert!(warnings[0].contains(&missing.to_string()), "{warnings:?}");
     }
 }

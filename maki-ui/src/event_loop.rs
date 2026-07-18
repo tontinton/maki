@@ -54,11 +54,11 @@ const AGENT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 const DELETE_FOCUSED_ERR: &str = "cannot delete the focused session";
 const NOT_LIVE_ERR: &str = "session not live";
 
-/// Per-tab persistence outcome after `shutdown`: `Some` iff the tab had
-/// content and was saved; `None` means a deliberately unpersisted empty tab.
+/// Tabs carry their in-memory sessions so `/reload` reopens them without a
+/// disk round-trip; `session_has_content` tells which ones were saved.
 pub(crate) struct ShutdownReport {
     pub exit: ExitRequest,
-    pub tabs: Vec<Option<MakiId>>,
+    pub tabs: Vec<AppSession>,
     pub focused: usize,
 }
 
@@ -1094,15 +1094,18 @@ impl<'t> EventLoop<'t> {
             let _ = rt.handles.cmd_tx.try_send(AgentCommand::CancelAll);
         }
         let mut tabs = Vec::with_capacity(self.sessions.len());
+        let mut agent_tasks = Vec::with_capacity(self.sessions.len());
         for rt in self.sessions.drain(..) {
             let SessionRuntime {
                 mut app, handles, ..
             } = rt;
             app.save_session();
-            tabs.push(persisted_tab(&app));
-            drop(app);
-            handles.shutdown(AGENT_SHUTDOWN_TIMEOUT);
+            // `app` drops at the end of this iteration, closing the
+            // channels the agent loop waits on, so `join_all` can finish.
+            tabs.push(app.state.session);
+            agent_tasks.push(handles.into_task());
         }
+        crate::agent::join_all(agent_tasks, AGENT_SHUTDOWN_TIMEOUT);
         if let Some(ref h) = self.ctx.mcp_handle {
             smol::block_on(h.shutdown());
         }
@@ -1118,12 +1121,6 @@ impl<'t> EventLoop<'t> {
             focused: self.focused,
         }
     }
-}
-
-/// Uses the same `has_content` check as `App::save_session`, so the report
-/// and the disk can never disagree about which tabs were saved.
-pub(crate) fn persisted_tab(app: &App) -> Option<MakiId> {
-    app.has_content().then_some(app.state.session.id)
 }
 
 fn scroll_delta(kind: MouseEventKind, lines: u32) -> i32 {

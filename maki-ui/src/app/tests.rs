@@ -15,7 +15,7 @@ use maki_agent::{
 use maki_config::{PermissionsConfig, UiConfig};
 use maki_lua::{HintReader, KeymapReader, LuaCommandReader};
 use maki_providers::{ContentBlock, Effort, Role, TokenUsage};
-use maki_storage::sessions::StoredThinking;
+use maki_storage::sessions::{StoredMode, StoredThinking};
 use ratatui::layout::Rect;
 use std::env;
 use std::path::{Path, PathBuf};
@@ -1539,17 +1539,54 @@ fn submit_exit_quits() {
 }
 
 #[test]
-fn persisted_tab_none_for_empty_some_for_content() {
+fn session_has_content_covers_each_branch() {
+    let mut session = AppSession::new("test-model", "/tmp/test");
+    assert!(!session_has_content(&session));
+
+    session.meta.input_draft = Some("draft".into());
+    assert!(session_has_content(&session));
+    session.meta.input_draft = None;
+
+    session.meta.queued_messages = vec!["queued".into()];
+    assert!(session_has_content(&session));
+    session.meta.queued_messages.clear();
+
+    session.meta.mode = Some(StoredMode::Plan);
+    assert!(session_has_content(&session));
+    session.meta.mode = Some(StoredMode::Build);
+
+    session.messages.push(Message::user("hello".into()));
+    assert!(session_has_content(&session));
+}
+
+#[test]
+fn save_session_syncs_ephemeral_content_into_meta() {
     let mut app = test_app();
     app.save_session();
-    assert_eq!(crate::event_loop::persisted_tab(&app), None);
+    assert!(!session_has_content(&app.state.session));
 
     app.update(Msg::Key(key(KeyCode::Char('x'))));
     app.save_session();
-    assert_eq!(
-        crate::event_loop::persisted_tab(&app),
-        Some(app.state.session.id)
-    );
+    assert!(session_has_content(&app.state.session));
+
+    app.update(Msg::Key(key(KeyCode::Backspace)));
+    app.save_session();
+    assert!(app.state.session.meta.input_draft.is_none());
+    assert!(!session_has_content(&app.state.session));
+
+    app.update(Msg::Key(key(KeyCode::Tab)));
+    app.save_session();
+    assert_eq!(app.state.session.meta.mode, Some(StoredMode::Plan));
+    assert!(session_has_content(&app.state.session));
+
+    let mut queued = app_with_queued_message();
+    queued.save_session();
+    let session = &queued.state.session;
+    assert!(session.messages.is_empty());
+    assert!(session.meta.input_draft.is_none());
+    assert_eq!(session.meta.mode, Some(StoredMode::Build));
+    assert_eq!(session.meta.queued_messages, vec!["queued".to_string()]);
+    assert!(session_has_content(session));
 }
 
 fn drain_writer(app: App, writer: Arc<StorageWriter>) {
