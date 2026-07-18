@@ -16,6 +16,39 @@ local function eq(actual, expected, msg)
   end
 end
 
+local function with_mock_ui(fn)
+  local original = {
+    buf = maki.ui.buf,
+    markdown = maki.ui.markdown,
+    terminal_size = maki.ui.terminal_size,
+  }
+  local captured = { _lines = {} }
+  local buf = {
+    line = function(_, l)
+      table.insert(captured._lines, l)
+    end,
+    get_lines = function()
+      return captured._lines
+    end,
+  }
+  maki.ui.buf = function()
+    return buf
+  end
+  maki.ui.markdown = function(text, _width)
+    return { { { text, "" } } }
+  end
+  maki.ui.terminal_size = function()
+    return { rows = 40, cols = 100 }
+  end
+  local ok, err = pcall(fn, buf)
+  maki.ui.buf = original.buf
+  maki.ui.markdown = original.markdown
+  maki.ui.terminal_size = original.terminal_size
+  if not ok then
+    error(err)
+  end
+end
+
 local MODE = QuestionForm.MODE
 
 local function single_question(overrides)
@@ -551,6 +584,62 @@ case("open_requests_bottom_split", function()
   assert(ok, "open must not error: " .. tostring(err))
   assert(captured, "open_win must be called")
   eq(captured.split, "below", "form must request a bottom split")
+end)
+
+local function find_span(lines, text)
+  for _, line in ipairs(lines) do
+    for _, span in ipairs(line) do
+      if span[1]:find(text, 1, true) then
+        return span
+      end
+    end
+  end
+  return nil
+end
+
+case("render_card_colors_selected_answers_and_dims_unselected", function()
+  with_mock_ui(function(buf)
+    local questions = {
+      { question = "Pick one", options = { { label = "Yes" }, { label = "No" } } },
+    }
+    QuestionHelpers.render_card(questions, { { "Yes" } })
+    local yes = find_span(buf.get_lines(), "Yes")
+    local no = find_span(buf.get_lines(), "No")
+    assert(yes, "selected answer must be present")
+    assert(no, "unselected answer must be present")
+    eq(yes[2], "success", "selected answer must use success style")
+    eq(no[2], "dim", "unselected answer must use dim style")
+  end)
+end)
+
+case("render_card_shows_no_answer_when_answers_empty", function()
+  with_mock_ui(function(buf)
+    local questions = { { question = "Pick one", options = { { label = "A" } } } }
+    QuestionHelpers.render_card(questions, { {} })
+    local placeholder = find_span(buf.get_lines(), "(no answer)")
+    assert(placeholder, "empty answer must show placeholder")
+    eq(placeholder[2], "dim", "placeholder must be dim")
+  end)
+end)
+
+case("render_card_shows_custom_answer", function()
+  with_mock_ui(function(buf)
+    local questions = { { question = "Pick one", options = { { label = "A" } } } }
+    QuestionHelpers.render_card(questions, { { "my custom" } })
+    local custom = find_span(buf.get_lines(), "my custom")
+    assert(custom, "custom answer must be present")
+    eq(custom[2], "success", "custom answer must use success style")
+  end)
+end)
+
+case("render_card_shows_dismissed_banner", function()
+  with_mock_ui(function(buf)
+    local questions = { { question = "Pick one", options = { { label = "A" } } } }
+    QuestionHelpers.render_card(questions, {}, { dismissed = true })
+    local dismissed = find_span(buf.get_lines(), "Dismissed by user")
+    assert(dismissed, "dismissed banner must be present")
+    eq(dismissed[2], "dim", "dismissed banner must be dim")
+  end)
 end)
 
 if #failures > 0 then
