@@ -779,6 +779,7 @@ pub struct PermissionsConfig {
     pub yolo: bool,
 }
 
+#[derive(Clone)]
 pub struct Config {
     pub always_yolo: bool,
     pub always_fast: bool,

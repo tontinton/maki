@@ -19,27 +19,22 @@ use maki_storage::sessions::StoredThinking;
 use ratatui::layout::Rect;
 use std::env;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tempfile::TempDir;
 use test_case::test_case;
+
+const WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn set_zone(app: &mut App, zone: SelectionZone, area: Rect) {
     app.zones.push(SelectableZone { area, zone });
 }
 
-fn test_app() -> App {
-    let writer = Arc::new(StorageWriter::new(StateDir::from_path(env::temp_dir())));
-    let permissions = Arc::new(PermissionManager::new(
-        PermissionsConfig {
-            rules: vec![],
-            ..Default::default()
-        },
-        PathBuf::from("/tmp"),
-    ));
+fn build_app(dir: StateDir, writer: Arc<StorageWriter>) -> App {
     let model = test_model();
-    let mut app = App::new(
+    App::new(
         &model,
         AppSession::new("test-model", "/tmp/test"),
-        StateDir::from_path(env::temp_dir()),
+        dir,
         Arc::new(ArcSwapOption::empty()),
         McpSnapshotReader::empty(),
         McpConfigErrors::new(PathBuf::new()),
@@ -49,12 +44,31 @@ fn test_app() -> App {
         writer,
         UiConfig::default(),
         100,
-        permissions,
+        Arc::new(PermissionManager::new(
+            PermissionsConfig {
+                rules: vec![],
+                ..Default::default()
+            },
+            PathBuf::from("/tmp"),
+        )),
         Arc::from([]),
-    );
+    )
+}
+
+fn test_app() -> App {
+    let dir = StateDir::from_path(env::temp_dir());
+    let mut app = build_app(dir.clone(), Arc::new(StorageWriter::new(dir)));
     let (shared_queue, _rx) = shared_queue::queue();
     app.queue.set_shared(shared_queue);
     app
+}
+
+fn tempdir_app() -> (TempDir, StateDir, Arc<StorageWriter>, App) {
+    let tmp = TempDir::new().unwrap();
+    let dir = StateDir::from_path(tmp.path().to_path_buf());
+    let writer = Arc::new(StorageWriter::new(dir.clone()));
+    let app = build_app(dir.clone(), Arc::clone(&writer));
+    (tmp, dir, writer, app)
 }
 
 fn mouse_event(kind: MouseEventKind, column: u16, row: u16) -> Msg {
@@ -476,34 +490,7 @@ fn reset_session_clears_drafting_plan_in_build_mode() {
 
 #[test]
 fn load_session_clears_plan() {
-    let tmp = TempDir::new().unwrap();
-    let dir = StateDir::from_path(tmp.path().to_path_buf());
-    let writer = Arc::new(StorageWriter::new(StateDir::from_path(
-        tmp.path().to_path_buf(),
-    )));
-    let model = test_model();
-    let mut app = App::new(
-        &model,
-        AppSession::new("test-model", "/tmp/test"),
-        dir,
-        Arc::new(ArcSwapOption::empty()),
-        McpSnapshotReader::empty(),
-        McpConfigErrors::new(PathBuf::new()),
-        LuaCommandReader::empty(),
-        KeymapReader::empty(),
-        HintReader::empty(),
-        writer,
-        UiConfig::default(),
-        100,
-        Arc::new(PermissionManager::new(
-            PermissionsConfig {
-                rules: vec![],
-                ..Default::default()
-            },
-            PathBuf::from("/tmp"),
-        )),
-        Arc::from([]),
-    );
+    let (_tmp, _dir, _writer, mut app) = tempdir_app();
     app.state
         .session
         .messages
@@ -1508,6 +1495,57 @@ fn submit_exit_quits() {
     });
     assert_eq!(app.exit_request, ExitRequest::Success);
     assert!(actions.is_empty());
+}
+
+#[test]
+fn persisted_tab_none_for_empty_some_for_content() {
+    let mut app = test_app();
+    app.save_session();
+    assert_eq!(crate::event_loop::persisted_tab(&app), None);
+
+    app.update(Msg::Key(key(KeyCode::Char('x'))));
+    app.save_session();
+    assert_eq!(
+        crate::event_loop::persisted_tab(&app),
+        Some(app.state.session.id)
+    );
+}
+
+fn drain_writer(app: App, writer: Arc<StorageWriter>) {
+    drop(app);
+    Arc::try_unwrap(writer)
+        .ok()
+        .expect("app must hold the only other writer reference")
+        .shutdown(WRITER_DRAIN_TIMEOUT);
+}
+
+#[test]
+fn reload_persists_session_with_content_to_disk() {
+    let (_tmp, dir, writer, mut app) = tempdir_app();
+    app.state
+        .session
+        .messages
+        .push(Message::user("hello".into()));
+    let actions = app.execute_command(cmd("/reload"));
+    assert_eq!(app.exit_request, ExitRequest::Reload);
+    assert!(actions.is_empty());
+    let id = app.state.session.id;
+    drain_writer(app, writer);
+
+    assert_eq!(AppSession::load(id, &dir).unwrap().messages.len(), 1);
+}
+
+#[test]
+fn reload_leaves_empty_session_unpersisted_on_disk() {
+    let (tmp, _dir, writer, mut app) = tempdir_app();
+    app.execute_command(cmd("/reload"));
+    drain_writer(app, writer);
+
+    let sessions_dir = tmp.path().join(maki_storage::sessions::SESSIONS_DIR);
+    let entries = std::fs::read_dir(&sessions_dir)
+        .map(|d| d.count())
+        .unwrap_or(0);
+    assert_eq!(entries, 0);
 }
 
 #[test]

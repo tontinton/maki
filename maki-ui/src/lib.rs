@@ -38,11 +38,33 @@ pub type AppSession = maki_storage::sessions::Session<Message, TokenUsage, ToolO
 pub(crate) use agent::AgentCommand;
 pub use event_loop::EventLoopParams;
 
-pub fn run(
-    params: EventLoopParams,
-    initial_prompt: Option<String>,
-) -> Result<(Option<MakiId>, i32)> {
-    let (_guard, mut terminal) = terminal::TerminalGuard::init()?;
-    let el = event_loop::EventLoop::new(&mut terminal, params)?;
-    el.run(initial_prompt)
+/// How a UI generation ended. On `Reload`, each tab is its saved session id,
+/// or `None` for an empty tab, so the caller can reopen everything from disk.
+pub enum RunOutcome {
+    Exit {
+        session_id: Option<MakiId>,
+        code: i32,
+    },
+    Reload {
+        tabs: Vec<Option<MakiId>>,
+        focused: usize,
+    },
+}
+
+pub fn run(params: EventLoopParams, initial_prompt: Option<String>) -> Result<RunOutcome> {
+    let report = {
+        let (_guard, mut terminal) = terminal::TerminalGuard::init()?;
+        let el = event_loop::EventLoop::new(&mut terminal, params)?;
+        el.run(initial_prompt)?
+    };
+    Ok(match report.exit {
+        components::ExitRequest::Reload => RunOutcome::Reload {
+            tabs: report.tabs,
+            focused: report.focused,
+        },
+        _ => RunOutcome::Exit {
+            session_id: report.tabs.get(report.focused).copied().flatten(),
+            code: report.exit.code(),
+        },
+    })
 }

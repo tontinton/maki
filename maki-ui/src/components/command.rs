@@ -107,6 +107,11 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         description: "Exit the application",
         max_args: 0,
     },
+    BuiltinCommand {
+        name: "/reload",
+        description: "Reload plugins and config",
+        max_args: 0,
+    },
 ];
 
 pub struct ParsedCommand {

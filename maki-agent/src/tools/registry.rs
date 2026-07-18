@@ -395,6 +395,16 @@ impl ToolRegistry {
         Ok(())
     }
 
+    pub fn clear_lua(&self) {
+        self.tools.rcu(|current| {
+            current
+                .iter()
+                .filter(|t| !matches!(t.source, ToolSource::Lua { .. }))
+                .cloned()
+                .collect::<Vec<_>>()
+        });
+    }
+
     pub fn clear_plugin(&self, plugin: &str) {
         self.tools.rcu(|current| {
             current
@@ -590,6 +600,34 @@ mod tests {
                 .any(|d| d["name"].as_str() == Some("late_server.probe")),
             "mid-session tool missing from definitions"
         );
+    }
+
+    /// `/reload` re-registers the same lua tool names, so anything
+    /// `clear_lua` leaves behind becomes a `NameConflict` that breaks every
+    /// later reload.
+    #[test]
+    fn clear_lua_removes_lua_keeps_mcp_and_allows_reregistration() {
+        let reg = ToolRegistry::new();
+        reg.register(mock("lua_a"), lua_source("p1")).unwrap();
+        reg.register(mock("lua_b"), lua_source("p2")).unwrap();
+        reg.register(
+            mock("srv.tool"),
+            ToolSource::Mcp {
+                server: "srv".into(),
+            },
+        )
+        .unwrap();
+
+        reg.clear_lua();
+
+        assert!(!reg.has("lua_a"));
+        assert!(!reg.has("lua_b"));
+        assert!(reg.has("srv.tool"));
+
+        reg.register(mock("lua_a"), lua_source("p1")).unwrap();
+        reg.register(mock("lua_b"), lua_source("p2")).unwrap();
+        assert!(reg.has("lua_a"));
+        assert!(reg.has("lua_b"));
     }
 
     #[test]

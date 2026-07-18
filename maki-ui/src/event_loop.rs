@@ -53,11 +53,21 @@ const DRAIN_BUDGET: usize = 256;
 const AGENT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 const DELETE_FOCUSED_ERR: &str = "cannot delete the focused session";
 
+/// Per-tab persistence outcome after `shutdown`: `Some` iff the tab had
+/// content and was saved; `None` means a deliberately unpersisted empty tab.
+pub(crate) struct ShutdownReport {
+    pub exit: ExitRequest,
+    pub tabs: Vec<Option<MakiId>>,
+    pub focused: usize,
+}
+
 pub struct EventLoopParams {
     pub model: Model,
     pub needs_login: bool,
     pub commands: Vec<CustomCommand>,
-    pub session: AppSession,
+    pub sessions: Vec<AppSession>,
+    pub focused: usize,
+    pub startup_warnings: Vec<String>,
     pub storage: StateDir,
     pub config: AgentConfig,
     pub ui_config: UiConfig,
@@ -300,7 +310,9 @@ impl<'t> EventLoop<'t> {
             mut model,
             needs_login,
             commands,
-            session,
+            sessions,
+            focused,
+            startup_warnings,
             storage,
             config,
             ui_config,
@@ -315,8 +327,11 @@ impl<'t> EventLoop<'t> {
             lua_event_handle,
         } = params;
 
-        std::thread::spawn(crate::highlight::warmup);
-        crate::update::spawn_check();
+        static PROCESS_WARMUP: std::sync::Once = std::sync::Once::new();
+        PROCESS_WARMUP.call_once(|| {
+            std::thread::spawn(crate::highlight::warmup);
+            crate::update::spawn_check();
+        });
 
         let storage_writer = Arc::new(StorageWriter::new(storage.clone()));
         let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
@@ -354,20 +369,31 @@ impl<'t> EventLoop<'t> {
             storage_writer,
         };
 
-        let mut rt = ctx.spawn_runtime(session);
-        rt.app.exit_on_done = exit_on_done;
+        let mut runtimes: Vec<SessionRuntime> = sessions
+            .into_iter()
+            .map(|session| ctx.spawn_runtime(session))
+            .collect();
+        if runtimes.is_empty() {
+            return Err(eyre!("event loop needs at least one session"));
+        }
+        let focused = focused.min(runtimes.len() - 1);
+        let app = &mut runtimes[focused].app;
+        app.exit_on_done = exit_on_done;
         if needs_login {
-            rt.app.login_picker.open(rt.app.storage.clone());
+            app.login_picker.open(app.storage.clone());
         }
         if !ctx.mcp_config_errors.is_empty() {
-            rt.app
-                .flash(format!("MCP config error: {}", ctx.mcp_config_errors));
+            let msg = format!("MCP config error: {}", ctx.mcp_config_errors);
+            app.flash(msg);
+        }
+        for w in startup_warnings {
+            app.flash(w);
         }
 
         Ok(Self {
             terminal,
-            sessions: vec![rt],
-            focused: 0,
+            sessions: runtimes,
+            focused,
             ctx,
             input: InputReader::spawn(),
             warn_rx: bg.warn_rx,
@@ -381,7 +407,7 @@ impl<'t> EventLoop<'t> {
         &mut self.sessions[self.focused].app
     }
 
-    pub(crate) fn run(mut self, initial_prompt: Option<String>) -> Result<(Option<MakiId>, i32)> {
+    pub(crate) fn run(mut self, initial_prompt: Option<String>) -> Result<ShutdownReport> {
         if let Some(prompt) = initial_prompt {
             let sub = Submission {
                 text: prompt,
@@ -424,8 +450,8 @@ impl<'t> EventLoop<'t> {
         };
         // Fatal errors still save every session, kill MCP process groups,
         // and drain the storage writer before the process exits.
-        let (session_id, exit_code) = self.shutdown();
-        result.map(|()| (session_id, exit_code))
+        let report = self.shutdown();
+        result.map(|()| report)
     }
 
     /// Wait for the next event from any source, or time out so animations
@@ -1037,21 +1063,21 @@ impl<'t> EventLoop<'t> {
         }
     }
 
-    fn shutdown(mut self) -> (Option<MakiId>, i32) {
-        let focused = &self.sessions[self.focused].app;
-        let exit_code = focused.exit_request.code();
-        let session_id = focused.has_content().then_some(focused.state.session.id);
+    fn shutdown(mut self) -> ShutdownReport {
+        let exit = self.sessions[self.focused].app.exit_request;
         if let Some(ref h) = self.ctx.mcp_handle {
             mcp::kill_process_groups(&h.reader().load().pids);
         }
         for rt in &self.sessions {
             let _ = rt.handles.cmd_tx.try_send(AgentCommand::CancelAll);
         }
+        let mut tabs = Vec::with_capacity(self.sessions.len());
         for rt in self.sessions.drain(..) {
             let SessionRuntime {
                 mut app, handles, ..
             } = rt;
             app.save_session();
+            tabs.push(persisted_tab(&app));
             drop(app);
             handles.shutdown(AGENT_SHUTDOWN_TIMEOUT);
         }
@@ -1064,8 +1090,18 @@ impl<'t> EventLoop<'t> {
                 warn!("storage writer has outstanding references, skipping graceful shutdown")
             }
         }
-        (session_id, exit_code)
+        ShutdownReport {
+            exit,
+            tabs,
+            focused: self.focused,
+        }
     }
+}
+
+/// Uses the same `has_content` check as `App::save_session`, so the report
+/// and the disk can never disagree about which tabs were saved.
+pub(crate) fn persisted_tab(app: &App) -> Option<MakiId> {
+    app.has_content().then_some(app.state.session.id)
 }
 
 fn scroll_delta(kind: MouseEventKind, lines: u32) -> i32 {

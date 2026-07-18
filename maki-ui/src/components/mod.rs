@@ -218,12 +218,13 @@ pub enum ExitRequest {
     None,
     Success,
     Error,
+    Reload,
 }
 
 impl ExitRequest {
     pub fn code(&self) -> i32 {
         match self {
-            Self::None | Self::Success => 0,
+            Self::None | Self::Success | Self::Reload => 0,
             Self::Error => 1,
         }
     }
