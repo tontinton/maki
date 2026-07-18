@@ -1,5 +1,6 @@
 mod api;
 pub mod docs;
+pub mod docs_render;
 mod error;
 pub mod language;
 mod loader;

@@ -105,6 +105,14 @@ static BUNDLED_PLUGINS: &[BundledPlugin] = &[
     },
 ];
 
+pub(crate) fn lib_dir() -> &'static Dir<'static> {
+    &BUNDLED_PLUGINS
+        .iter()
+        .find(|p| p.name == "lib")
+        .expect("lib plugin bundled")
+        .dir
+}
+
 static BUNDLED_DIRS: LazyLock<&'static [&'static Dir<'static>]> = LazyLock::new(|| {
     let dirs: Vec<&'static Dir<'static>> = BUNDLED_PLUGINS.iter().map(|p| &p.dir).collect();
     Vec::leak(dirs)

@@ -39,6 +39,7 @@ use crate::api::util::command::{LuaCommandReader, LuaCommandWriter, UiAction};
 use crate::api::util::convert::json_to_lua;
 use crate::api::util::ctx::LuaCtx;
 use crate::api::util::setup::ConfigStore;
+use crate::docs_render;
 use crate::error::PluginError;
 use crate::plugin_permissions::{PluginPermissions, load_plugin_permissions};
 
@@ -1241,6 +1242,12 @@ impl LuaRuntime {
 
             if loading.get::<bool>(modname.as_str()).unwrap_or(false) {
                 return Ok(LuaValue::Boolean(true));
+            }
+
+            if let Some(module) = docs_render::virtual_module(lua, &modname) {
+                let module = module?;
+                loaded.set(modname.as_str(), module.clone())?;
+                return Ok(LuaValue::Table(module));
             }
 
             loading.set(modname.as_str(), true)?;

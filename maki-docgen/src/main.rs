@@ -2,7 +2,6 @@ mod gen_commands;
 mod gen_config;
 mod gen_keybindings;
 mod gen_lua_api;
-mod gen_plugin_dev_skill;
 mod gen_providers;
 mod gen_tools;
 mod lua_util;
@@ -12,8 +11,6 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 const CONTENT_DIR: &str = "site/docs/content";
-const PLUGIN_DEV_SKILL_PATH: &str = "plugins/skill/plugin_dev.lua";
-const PLUGIN_DEV_REFERENCE_PATH: &str = "plugins/skill/plugin_dev_reference.lua";
 
 fn page_path(section: &str) -> PathBuf {
     Path::new(CONTENT_DIR).join(section).join("_index.md")
@@ -67,7 +64,6 @@ fn main() -> ExitCode {
             )
             .await
         });
-    let (plugin_dev_skill, plugin_dev_reference) = gen_plugin_dev_skill::generate();
     let outputs = [
         (page_path("tools"), tools),
         (page_path("providers"), providers),
@@ -75,11 +71,6 @@ fn main() -> ExitCode {
         (page_path("lua-api"), lua_api),
         (page_path("keybindings"), keybindings),
         (page_path("commands"), commands),
-        (PathBuf::from(PLUGIN_DEV_SKILL_PATH), plugin_dev_skill),
-        (
-            PathBuf::from(PLUGIN_DEV_REFERENCE_PATH),
-            plugin_dev_reference,
-        ),
     ];
 
     if check {
