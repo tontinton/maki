@@ -683,7 +683,9 @@ impl App {
             return actions;
         }
 
-        if self.dispatch_override(key) {
+        if !(self.status == Status::Streaming && is_streaming_stop_key(key))
+            && self.dispatch_override(key)
+        {
             return vec![];
         }
 
@@ -715,10 +717,11 @@ impl App {
     fn dispatch_override(&self, key: KeyEvent) -> bool {
         let snap = self.keymap_reader.load();
         for entry in &snap.entries {
-            if entry.key == key.code && entry.modifiers == key.modifiers {
-                if let Some(ref handle) = self.lua_event_handle {
-                    handle.run_keybind_callback(entry.id);
-                }
+            if entry.key == key.code
+                && entry.modifiers == key.modifiers
+                && let Some(ref handle) = self.lua_event_handle
+                && handle.run_keybind_callback(entry.id)
+            {
                 return true;
             }
         }
@@ -1562,6 +1565,10 @@ impl App {
         actions.extend(self.start_from_queue(&msg));
         actions
     }
+}
+
+fn is_streaming_stop_key(key: KeyEvent) -> bool {
+    key::QUIT.matches(key) || key.code == KeyCode::Esc
 }
 
 fn sync_search_highlight(modal: &SearchModal, chat: &mut Chat) {

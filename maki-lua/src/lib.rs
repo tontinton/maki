@@ -59,7 +59,7 @@ pub mod test_support {
 
     pub fn probed_event_handle() -> (crate::EventHandle, RequestProbe) {
         let (tx, rx) = flume::unbounded();
-        (crate::EventHandle::from_tx(tx), RequestProbe(rx))
+        (crate::EventHandle::probed_for_test(tx), RequestProbe(rx))
     }
 
     pub fn keymap_reader_with(entries: Vec<KeymapEntry>) -> KeymapReader {

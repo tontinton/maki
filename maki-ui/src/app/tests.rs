@@ -2339,6 +2339,8 @@ fn override_shadows_builtin_ctrl_when_no_overlay_open() {
     };
     let reader = maki_lua::test_support::keymap_reader_with(vec![entry]);
     let mut app = test_app();
+    let (handle, _probe) = maki_lua::test_support::probed_event_handle();
+    app.lua_event_handle = Some(handle);
     app.keymap_reader = reader;
     assert!(!app.help_modal.is_open());
 
@@ -2362,6 +2364,8 @@ fn override_shadows_quit_builtin() {
     };
     let reader = maki_lua::test_support::keymap_reader_with(vec![entry]);
     let mut app = test_app();
+    let (handle, _probe) = maki_lua::test_support::probed_event_handle();
+    app.lua_event_handle = Some(handle);
     app.status = Status::Idle;
     app.keymap_reader = reader;
 
@@ -2386,6 +2390,8 @@ fn override_shadows_tab_mode_toggle() {
     };
     let reader = maki_lua::test_support::keymap_reader_with(vec![entry]);
     let mut app = test_app();
+    let (handle, _probe) = maki_lua::test_support::probed_event_handle();
+    app.lua_event_handle = Some(handle);
     let initial_mode = app.state.mode;
     app.keymap_reader = reader;
 
@@ -2409,6 +2415,8 @@ fn override_shadows_esc_builtin() {
     };
     let reader = maki_lua::test_support::keymap_reader_with(vec![entry]);
     let mut app = test_app();
+    let (handle, _probe) = maki_lua::test_support::probed_event_handle();
+    app.lua_event_handle = Some(handle);
     app.keymap_reader = reader;
 
     let actions = app.update(Msg::Key(key(KeyCode::Esc)));
@@ -2470,6 +2478,83 @@ fn overlay_wins_over_override_when_plan_form_open() {
     app.update(Msg::Key(kb::PLAN_TOGGLE.to_key_event()));
 
     assert!(!app.plan_form.is_visible());
+}
+
+#[test]
+fn streaming_cancel_wins_over_quit_override() {
+    let entry = maki_lua::KeymapEntry {
+        key: kb::QUIT.code,
+        modifiers: kb::QUIT.modifiers,
+        desc: "plugin quit override".into(),
+        plugin: std::sync::Arc::from("test-plugin"),
+        id: 7,
+    };
+    let reader = maki_lua::test_support::keymap_reader_with(vec![entry]);
+    let mut app = test_app();
+    let (handle, _probe) = maki_lua::test_support::probed_event_handle();
+    app.lua_event_handle = Some(handle);
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    app.keymap_reader = reader;
+
+    let actions = app.update(Msg::Key(kb::QUIT.to_key_event()));
+
+    assert!(
+        matches!(&actions[0], Action::CancelAgent { .. }),
+        "built-in cancel must win while streaming even when Ctrl+C is overridden"
+    );
+    assert_eq!(app.status, Status::Idle);
+    assert_eq!(app.exit_request, ExitRequest::None);
+}
+
+#[test]
+fn dead_host_override_falls_back_to_builtin() {
+    let entry = maki_lua::KeymapEntry {
+        key: kb::HELP.code,
+        modifiers: kb::HELP.modifiers,
+        desc: "plugin help override".into(),
+        plugin: std::sync::Arc::from("test-plugin"),
+        id: 8,
+    };
+    let reader = maki_lua::test_support::keymap_reader_with(vec![entry]);
+    let mut app = test_app();
+    app.lua_event_handle = Some(maki_lua::EventHandle::disconnected_for_test());
+    app.keymap_reader = reader;
+    assert!(!app.help_modal.is_open());
+
+    app.update(Msg::Key(kb::HELP.to_key_event()));
+
+    assert!(
+        app.help_modal.is_open(),
+        "dead lua host must fall back to the built-in HELP handler"
+    );
+}
+
+#[test]
+fn streaming_cancel_wins_over_esc_override() {
+    let entry = maki_lua::KeymapEntry {
+        key: KeyCode::Esc,
+        modifiers: KeyModifiers::NONE,
+        desc: "plugin esc override".into(),
+        plugin: std::sync::Arc::from("test-plugin"),
+        id: 9,
+    };
+    let reader = maki_lua::test_support::keymap_reader_with(vec![entry]);
+    let mut app = test_app();
+    let (handle, _probe) = maki_lua::test_support::probed_event_handle();
+    app.lua_event_handle = Some(handle);
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    app.last_esc = Some(Instant::now());
+    app.keymap_reader = reader;
+
+    let actions = app.update(Msg::Key(key(KeyCode::Esc)));
+
+    assert!(
+        matches!(&actions[0], Action::CancelAgent { .. }),
+        "built-in cancel must win while streaming even when Esc is overridden"
+    );
+    assert_eq!(app.status, Status::Idle);
 }
 
 #[test]

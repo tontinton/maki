@@ -206,6 +206,23 @@ impl PluginHost {
         if self.inner.is_none() {
             return Ok(());
         }
+        for (plugin, opts) in &config.opts {
+            let keys: Vec<&str> = opts.keys().map(String::as_str).collect();
+            if !BUNDLED_PLUGINS.iter().any(|p| p.name == plugin.as_str()) {
+                return Err(PluginError::UnknownPluginOptions {
+                    plugin: plugin.clone(),
+                    keys: keys.join(", "),
+                });
+            }
+            if !config.names.contains(plugin) {
+                tracing::warn!(
+                    plugin = plugin.as_str(),
+                    keys = keys.join(", "),
+                    "plugin is disabled; its plugins.{} options are ignored until re-enabled",
+                    plugin
+                );
+            }
+        }
         for builtin in &config.names {
             let dir = match BUNDLED_PLUGINS.iter().find(|p| p.name == builtin.as_str()) {
                 Some(p) => &p.dir,
@@ -416,6 +433,17 @@ impl EventHandle {
         Self::from_tx(flume::unbounded().0)
     }
 
+    /// Test probe sibling of `from_tx`: collapses both senders onto one
+    /// channel so a `RequestProbe` sees every request, including the
+    /// `prio_tx`-routed commands and keybind callbacks that `from_tx`
+    /// would route to a disconnected channel.
+    pub(crate) fn probed_for_test(shared: flume::Sender<Request>) -> Self {
+        Self {
+            tx: shared.clone(),
+            prio_tx: shared,
+        }
+    }
+
     pub fn run_command(&self, plugin: Arc<str>, command: Arc<str>, args: String) {
         let _ = self.prio_tx.try_send(Request::RunCommand {
             plugin,
@@ -494,8 +522,10 @@ impl EventHandle {
         });
     }
 
-    pub fn run_keybind_callback(&self, id: u64) {
-        let _ = self.prio_tx.try_send(Request::RunKeybindCallback { id });
+    pub fn run_keybind_callback(&self, id: u64) -> bool {
+        self.prio_tx
+            .try_send(Request::RunKeybindCallback { id })
+            .is_ok()
     }
 }
 
@@ -644,8 +674,8 @@ mod tests {
     /// to the snapshot, EventHandle::run_keybind_callback dispatches the request,
     /// the runtime resolves the Function by id from the registry, and the callback
     /// executes with an observable side effect. This is the load-bearing path the
-    /// dispatch reorder and the store hardening rest on; unit tests only cover the
-    /// layers in isolation.
+    /// dispatch reorder and the dead-host fallback rest on; unit tests only cover
+    /// the layers in isolation.
     #[test]
     fn keybind_callback_runs_end_to_end() {
         let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
@@ -716,9 +746,9 @@ mod tests {
     #[test]
     fn disabled_host_skips_load_builtins() {
         let mut host = PluginHost::disabled();
-        let config = PluginsConfig::from_tools(HashMap::new());
+        let config = PluginsConfig::from_plugins(HashMap::new());
         assert!(
-            !config.tools.is_empty(),
+            !config.names.is_empty(),
             "default config enables builtin plugins"
         );
         host.load_builtins(&config)
