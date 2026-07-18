@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use maki_providers::model::Model;
 
 use crate::AgentMode;
+use crate::command::find_project_ancestor_dirs;
 use crate::template::Vars;
 
 const INSTRUCTION_FILES: &[&str] = &[
@@ -72,36 +73,45 @@ pub fn build_system_prompt(
     out
 }
 
-fn append_instruction_files(
-    out: &mut String,
+fn read_instruction(path: &Path, loaded: &LoadedInstructions) -> Option<(PathBuf, String)> {
+    let canonical = path.canonicalize().ok()?;
+    if loaded.contains_or_insert(canonical.clone()) {
+        return None;
+    }
+    let content = fs::read_to_string(&canonical).ok()?;
+    Some((canonical, content))
+}
+
+fn collect_instruction_files(
     cwd: &str,
     home: Option<&Path>,
     xdg_config: Option<&Path>,
-) {
-    let root = Path::new(cwd);
+    loaded: &LoadedInstructions,
+) -> Vec<(String, String)> {
+    let mut out = Vec::new();
 
-    for filename in INSTRUCTION_FILES {
-        if let Ok(content) = fs::read_to_string(root.join(filename)) {
-            out.push_str(&format!(
-                "\n\nProject instructions ({filename}):\n{content}"
-            ));
-            break;
+    for dir in find_project_ancestor_dirs(Path::new(cwd)) {
+        for filename in INSTRUCTION_FILES {
+            if let Some((_, content)) = read_instruction(&dir.join(filename), loaded) {
+                out.push((format!("Project instructions ({filename})"), content));
+                break;
+            }
         }
-    }
 
-    if let Ok(content) = fs::read_to_string(root.join(LOCAL_INSTRUCTION_FILE)) {
-        out.push_str(&format!(
-            "\n\nLocal instructions ({LOCAL_INSTRUCTION_FILE}):\n{content}"
-        ));
+        if let Some((_, content)) = read_instruction(&dir.join(LOCAL_INSTRUCTION_FILE), loaded) {
+            out.push((format!("Local instructions ({LOCAL_INSTRUCTION_FILE})"), content));
+        }
     }
 
     for path in maki_storage::paths::user_config_dirs(home, xdg_config, "AGENTS.md") {
-        if let Ok(content) = fs::read_to_string(&path) {
-            let display = path.display();
-            out.push_str(&format!("\n\nGlobal instructions ({display}):\n{content}"));
+        if let Some((canonical, content)) = read_instruction(&path, loaded) {
+            let label = format!("Global instructions ({})", canonical.display());
+            out.push((label, content));
             break;
         }
     }
+
+    out
 }
 
 pub fn load_instruction_text(cwd: &str) -> String {
@@ -117,8 +127,13 @@ pub(crate) fn load_instruction_text_with_home(
     home: Option<&Path>,
     xdg_config: Option<&Path>,
 ) -> String {
+    let loaded = LoadedInstructions::new();
+    let files = collect_instruction_files(cwd, home, xdg_config, &loaded);
+
     let mut text = String::new();
-    append_instruction_files(&mut text, cwd, home, xdg_config);
+    for (label, content) in files {
+        text.push_str(&format!("\n\n{label}:\n{content}"));
+    }
     text
 }
 
@@ -135,16 +150,11 @@ pub(crate) fn load_instructions_with_home(
     home: Option<&Path>,
     xdg_config: Option<&Path>,
 ) -> Instructions {
-    let root = Path::new(cwd);
     let mut instr = Instructions::default();
-    append_instruction_files(&mut instr.text, cwd, home, xdg_config);
+    let files = collect_instruction_files(cwd, home, xdg_config, &instr.loaded);
 
-    for filename in INSTRUCTION_FILES {
-        let path = root.join(filename);
-        if let Ok(canonical) = path.canonicalize() {
-            instr.loaded.contains_or_insert(canonical);
-            break;
-        }
+    for (label, content) in files {
+        instr.text.push_str(&format!("\n\n{label}:\n{content}"));
     }
 
     instr
@@ -170,15 +180,8 @@ pub fn find_subdirectory_instructions(
     let mut current = dir.as_path();
     while current != cwd {
         for filename in INSTRUCTION_FILES {
-            let Ok(canonical) = current.join(filename).canonicalize() else {
-                continue;
-            };
-            if loaded.contains_or_insert(canonical.clone()) {
-                continue;
-            }
-            if let Ok(content) = fs::read_to_string(&canonical) {
-                let display = canonical.display().to_string();
-                results.push((display, content));
+            if let Some((canonical, content)) = read_instruction(&current.join(filename), loaded) {
+                results.push((canonical.display().to_string(), content));
                 break;
             }
         }
@@ -311,6 +314,26 @@ mod tests {
         let text =
             load_instructions_with_home(cwd.path().to_str().unwrap(), Some(home.path()), None).text;
         assert!(text.contains("global rules"));
+    }
+
+    #[test]
+    fn load_instructions_includes_parent_directory_instructions() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".git")).unwrap();
+
+        let sub = dir.path().join("crates").join("a");
+        fs::create_dir_all(&sub).unwrap();
+
+        fs::write(dir.path().join("AGENTS.md"), "root rules").unwrap();
+        fs::write(sub.join("AGENTS.md"), "crate rules").unwrap();
+
+        let text = load_instructions_with_home(sub.to_str().unwrap(), None, None).text;
+        assert!(text.contains("crate rules"), "should load instructions from cwd");
+        assert!(text.contains("root rules"), "should load instructions from project root");
+        assert!(
+            text.find("crate rules").unwrap() < text.find("root rules").unwrap(),
+            "closer instructions should come before root instructions"
+        );
     }
 
     #[test]

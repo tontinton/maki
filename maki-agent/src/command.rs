@@ -17,16 +17,17 @@ struct Frontmatter {
     argument_hint: Option<String>,
 }
 
-fn find_project_ancestor_dirs(cwd: &Path) -> Vec<PathBuf> {
+pub(crate) fn find_project_ancestor_dirs(cwd: &Path) -> Vec<PathBuf> {
     let mut dirs = vec![cwd.to_path_buf()];
     let mut current = cwd;
 
-    while let Some(parent) = current.parent() {
-        dirs.push(parent.to_path_buf());
-        if parent.join(".git").exists() {
+    while !current.join(".git").exists() {
+        if let Some(parent) = current.parent() {
+            dirs.push(parent.to_path_buf());
+            current = parent;
+        } else {
             break;
         }
-        current = parent;
     }
 
     dirs
