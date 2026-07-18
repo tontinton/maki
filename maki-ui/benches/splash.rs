@@ -2,6 +2,9 @@ use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use maki_ui::splash::Splash;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
+use ratatui::style::Color;
+
+const ACCENT: Color = Color::Cyan;
 
 fn bench_splash_render(c: &mut Criterion) {
     let splash = Splash::new(true);
@@ -11,7 +14,7 @@ fn bench_splash_render(c: &mut Criterion) {
     c.bench_function("splash_render_120x40", |b| {
         b.iter(|| {
             buf.reset();
-            splash.render(black_box(area), &mut buf);
+            splash.render(black_box(area), &mut buf, ACCENT);
         })
     });
 
@@ -21,7 +24,7 @@ fn bench_splash_render(c: &mut Criterion) {
     c.bench_function("splash_render_200x60", |b| {
         b.iter(|| {
             large_buf.reset();
-            splash.render(black_box(large_area), &mut large_buf);
+            splash.render(black_box(large_area), &mut large_buf, ACCENT);
         })
     });
 }
