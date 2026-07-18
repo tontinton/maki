@@ -474,6 +474,15 @@ impl ToolRegistry {
     pub fn iter(&self) -> RegistrySnapshot {
         RegistrySnapshot(self.tools.load_full())
     }
+
+    /// Pins the current tool snapshot as a cloned `Arc`. Any later
+    /// `register`/`replace`/`clear` swaps in a fresh allocation, so
+    /// `Arc::ptr_eq` against a previously returned `Arc` detects the change.
+    /// Holding the old `Arc` keeps its allocation alive, so its address can't
+    /// be recycled by a future registration (ABA-safe).
+    pub fn snapshot_arc(&self) -> Arc<Vec<RegisteredTool>> {
+        self.tools.load_full()
+    }
 }
 
 pub struct RegistrySnapshot(Arc<Vec<RegisteredTool>>);
@@ -571,6 +580,23 @@ mod tests {
         reg.register(mock("dupe"), lua_source("p")).unwrap();
         let err = reg.register(mock("dupe"), lua_source("p")).unwrap_err();
         assert!(matches!(err, RegistryError::NameConflict { .. }));
+    }
+
+    #[test]
+    fn snapshot_arc_detects_registration() {
+        let reg = ToolRegistry::new();
+        let before = reg.snapshot_arc();
+        reg.register(mock("solo"), lua_source("p")).unwrap();
+        let after = reg.snapshot_arc();
+        assert!(
+            !Arc::ptr_eq(&before, &after),
+            "registering a tool must swap the snapshot Arc"
+        );
+        let again = reg.snapshot_arc();
+        assert!(
+            Arc::ptr_eq(&after, &again),
+            "snapshot is stable when nothing changes"
+        );
     }
 
     /// Tools added mid-session must show up in the next `definitions()` call.

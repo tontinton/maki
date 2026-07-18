@@ -8,7 +8,7 @@ use maki_agent::permissions::PermissionManager;
 use maki_agent::template;
 use maki_agent::template::Vars;
 use maki_agent::tools::{
-    DescriptionContext, FileReadTracker, ToolAudience, ToolFilter, ToolRegistry,
+    DescriptionContext, FileReadTracker, RegisteredTool, ToolAudience, ToolFilter, ToolRegistry,
 };
 use maki_agent::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentParams, AgentRunParams, CancelMap,
@@ -47,6 +47,15 @@ pub(super) struct AgentLoop {
     timeouts: maki_providers::Timeouts,
     lua_handle: Option<EventHandle>,
     subagent_cancels: Arc<CancelMap<String>>,
+    tools_cache: Option<ToolsCache>,
+}
+
+struct ToolsCache {
+    snap: Arc<Vec<RegisteredTool>>,
+    mcp_gen: Option<u64>,
+    model_id: String,
+    workflow: bool,
+    vars_hash: u64,
 }
 
 impl AgentLoop {
@@ -92,6 +101,7 @@ impl AgentLoop {
             timeouts,
             lua_handle,
             subagent_cancels,
+            tools_cache: None,
         }
     }
 
@@ -144,9 +154,8 @@ impl AgentLoop {
         self.publish_btw_system(&maki_agent::prompt::ResolvedSlots::default());
 
         let slot = self.model_slot.load();
-        self.tools = self.build_tools(&slot.model, false);
+        self.rebuild_tools(&slot.model, false);
         if let Some(ref mcp) = self.mcp_handle {
-            mcp.extend_tools(&mut self.tools);
             spawn_oauth_for_needs_auth(mcp);
         }
         !self.init_cancel.is_cancelled()
@@ -264,11 +273,33 @@ impl AgentLoop {
     }
 
     fn rebuild_tools(&mut self, model: &Model, workflow: bool) {
+        let snap = ToolRegistry::global().snapshot_arc();
+        let mcp_gen = self
+            .mcp_handle
+            .as_ref()
+            .map(|m| m.reader().load().generation);
+        let vars_hash = self.vars.content_hash();
+        if let Some(ref cache) = self.tools_cache
+            && Arc::ptr_eq(&cache.snap, &snap)
+            && cache.mcp_gen == mcp_gen
+            && cache.model_id == model.id
+            && cache.workflow == workflow
+            && cache.vars_hash == vars_hash
+        {
+            return;
+        }
         let mut tools = self.build_tools(model, workflow);
         if let Some(ref mcp) = self.mcp_handle {
             mcp.extend_tools(&mut tools);
         }
         self.tools = tools;
+        self.tools_cache = Some(ToolsCache {
+            snap,
+            mcp_gen,
+            model_id: model.id.clone(),
+            workflow,
+            vars_hash,
+        });
     }
 
     fn build_tools(&self, model: &Model, workflow: bool) -> Value {

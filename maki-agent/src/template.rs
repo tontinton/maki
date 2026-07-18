@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::env;
+use std::hash::{DefaultHasher, Hash, Hasher};
 
 use jiff::Timestamp;
 
@@ -37,6 +38,17 @@ impl Vars {
         }
         Cow::Owned(out)
     }
+
+    /// Cheap, order-sensitive digest of every (key, value) pair. Used as a
+    /// cache key so cached templated output is invalidated when any var changes.
+    pub fn content_hash(&self) -> u64 {
+        let mut h = DefaultHasher::new();
+        for (k, v) in &self.0 {
+            k.hash(&mut h);
+            v.hash(&mut h);
+        }
+        h.finish()
+    }
 }
 
 #[cfg(test)]
@@ -73,5 +85,22 @@ mod tests {
         let vars = env_vars();
         let result = vars.apply("{date}");
         assert_ne!(result.as_ref(), "{date}");
+    }
+
+    #[test]
+    fn content_hash_stable_until_a_var_changes() {
+        let a = Vars::new().set("{cwd}", "/x").set("{platform}", "linux");
+        let b = Vars::new().set("{cwd}", "/x").set("{platform}", "linux");
+        assert_eq!(a.content_hash(), b.content_hash());
+
+        let reordered = Vars::new().set("{platform}", "linux").set("{cwd}", "/x");
+        assert_ne!(
+            a.content_hash(),
+            reordered.content_hash(),
+            "hash is order-dependent"
+        );
+
+        let changed = Vars::new().set("{cwd}", "/y").set("{platform}", "linux");
+        assert_ne!(a.content_hash(), changed.content_hash());
     }
 }
