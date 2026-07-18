@@ -139,6 +139,52 @@ pub fn generate() -> String {
 
     write_context_specific(&mut out);
     write_inheritance(&mut out);
+    write_overrides(&mut out);
 
     out
+}
+
+fn write_overrides(out: &mut String) {
+    out.push_str("\n## Overriding Keybindings\n\n");
+    out.push_str(
+        "Plugins and `init.lua` can rebind keys at runtime with \
+         `maki.keymap.set` and `maki.keymap.del`. The tables above are the \
+         built-in defaults. An override on the same key wins, unless a \
+         modal or overlay is open (help, plan form, permission prompt).\n\n",
+    );
+    out.push_str("Precedence, high to low:\n\n");
+    out.push_str(
+        "1. **Suspend** (`Ctrl+Z`, Unix). Always wins, non-remappable.\n\
+         2. **Modal and overlay keys.** An open modal or picker consumes \
+         its keys first, so they cannot be shadowed while open.\n\
+         3. **Lua overrides** from `maki.keymap.set`. Last set wins; \
+         binding the same key twice warns.\n\
+         4. **Built-in defaults.** An override on the same key shadows \
+         them; `maki.keymap.del` lifts the override so the default returns. \
+         Suspend is the only binding outside this layer, so every key is \
+         remappable except `Ctrl+Z`.\n\n",
+    );
+    out.push_str(
+        "Only single-key bindings can be overridden. Multi-key combinations \
+         and non-key rows (like `Type` to filter) cannot.\n\n",
+    );
+    out.push_str(
+        "The `/help` modal and the splash show default labels, not live \
+         overrides, but pressing the key still runs the override.\n\n",
+    );
+    out.push_str("### Recovering from a bad keymap\n\n");
+    out.push_str(
+        "If an override leaves Maki stuck (a rebound `Ctrl+C`, a modal \
+         that won't close, a plugin that throws on load), boot without \
+         plugins:\n\n",
+    );
+    out.push_str("```bash\nmaki --no-plugins\n```\n\n");
+    out.push_str(
+        "This skips the Lua host and runs the full default keymap from \
+         Rust, so quit, Esc, scroll, and suspend always work.\n\n",
+    );
+    out.push_str(
+        "The defaults live in Rust, not Lua, so `--no-plugins` never \
+         drops them.\n",
+    );
 }

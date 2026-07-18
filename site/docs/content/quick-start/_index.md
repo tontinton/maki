@@ -85,6 +85,8 @@ Type a prompt, press **Enter**, and the agent starts working.
 
 ## Keybindings
 
+These are the defaults. Plugins and `init.lua` can rebind most of them with `maki.keymap.set`; see [Keybindings](../keybindings/) for precedence and caveats.
+
 - **Newline in input**: \\+Enter, Ctrl+J, or Alt+Enter
 - **Scroll output**: Ctrl+U / Ctrl+D (half page)
 - **Cancel streaming**: Esc Esc

@@ -20,6 +20,8 @@ pub use plugin_permissions::{Permission, PluginPermissions};
 pub use runtime::{RestoreItem, WARM_TOOL_CAP};
 
 pub mod test_support {
+    use crate::KeymapReader;
+    use crate::api::keymap::{KeymapEntry, KeymapWriter};
     use crate::api::util::command::{LuaCommandInfo, LuaCommandReader, LuaCommandWriter};
 
     pub struct LuaCommandWriterHandle(LuaCommandWriter);
@@ -58,5 +60,11 @@ pub mod test_support {
     pub fn probed_event_handle() -> (crate::EventHandle, RequestProbe) {
         let (tx, rx) = flume::unbounded();
         (crate::EventHandle::from_tx(tx), RequestProbe(rx))
+    }
+
+    pub fn keymap_reader_with(entries: Vec<KeymapEntry>) -> KeymapReader {
+        let (writer, reader) = KeymapWriter::new();
+        writer.publish(entries);
+        reader
     }
 }

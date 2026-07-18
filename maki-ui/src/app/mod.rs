@@ -683,12 +683,12 @@ impl App {
             return actions;
         }
 
-        if let Some(actions) = self.handle_ctrl(key) {
-            return actions;
+        if self.dispatch_override(key) {
+            return vec![];
         }
 
-        if self.dispatch_plugin_keymap(key) {
-            return vec![];
+        if let Some(actions) = self.handle_ctrl(key) {
+            return actions;
         }
 
         if !self.is_main_chat() {
@@ -712,7 +712,7 @@ impl App {
         self.handle_main_chat_key(key)
     }
 
-    fn dispatch_plugin_keymap(&self, key: KeyEvent) -> bool {
+    fn dispatch_override(&self, key: KeyEvent) -> bool {
         let snap = self.keymap_reader.load();
         for entry in &snap.entries {
             if entry.key == key.code && entry.modifiers == key.modifiers {
