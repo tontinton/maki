@@ -101,9 +101,7 @@ end
 local function build_dir_view(text, ctx)
   local buf = maki.ui.buf()
   local view = ToolView.new(buf, read_view_opts(ctx))
-  for line in (text .. "\n"):gmatch("([^\n]*)\n") do
-    view:append(line)
-  end
+  view:append_text(text)
   view:finish()
   buf:on("click", function()
     view:toggle()
@@ -268,7 +266,7 @@ maki.api.register_tool({
 
   restore = function(input, output, _is_error, ctx)
     local lines, start_line, total_lines = {}, nil, nil
-    for raw in (output .. "\n"):gmatch("([^\n]*)\n") do
+    for _, raw in ipairs(maki.split(output, "\n")) do
       local nr, text = raw:match("^%s*(%d+): (.*)$")
       if nr then
         start_line = start_line or tonumber(nr)

@@ -67,9 +67,7 @@ local function render_content(content, path, ctx)
 
   local ext = path:match("%.([^%.]+)$") or "md"
   if not view:set_highlight(content, ext) then
-    for line in (content .. "\n"):gmatch("([^\n]*)\n") do
-      view:append(line)
-    end
+    view:append_text(content)
   end
   view:finish()
   return buf

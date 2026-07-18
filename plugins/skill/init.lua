@@ -124,10 +124,8 @@ maki.api.register_tool({
     end
 
     local lines = {}
-    local i = 1
-    for line in (skill.content .. "\n"):gmatch("([^\n]*)\n") do
+    for i, line in ipairs(maki.split(skill.content, "\n")) do
       lines[#lines + 1] = string.format("%4d | %s", i, line)
-      i = i + 1
     end
     local formatted = skill.location .. "\n" .. table.concat(lines, "\n")
 

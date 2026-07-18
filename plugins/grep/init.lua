@@ -161,7 +161,7 @@ end
 local function parse_llm_output(text)
   local entries = {}
   local current
-  for line in (text .. "\n"):gmatch("([^\n]*)\n") do
+  for _, line in ipairs(maki.split(text, "\n")) do
     local path = line:match("^(%S.+):$")
     if path then
       current = { path = path, groups = { { lines = {} } } }

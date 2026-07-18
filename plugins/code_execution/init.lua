@@ -31,12 +31,6 @@ local function new_view(ctx, buf)
   return ToolView.new(buf, { max_lines = ctx:tool_output_lines().code_execution or 30 })
 end
 
-local function append_lines(view, text)
-  for line in (text .. "\n"):gmatch("([^\n]*)\n") do
-    view:append(line)
-  end
-end
-
 local function line_nr_fmt(count)
   local w = math.max(1, math.floor(math.log(count, 10)) + 1)
   return "%" .. w .. "d "
@@ -46,10 +40,7 @@ end
 -- script renders the same no matter which lifecycle callbacks ran. The
 -- header is always rebuilt from scratch; nothing mutates existing lines.
 local function build_body(ctx, code)
-  local lines = {}
-  for line in (code:gsub("\n+$", "") .. "\n"):gmatch("([^\n]*)\n") do
-    lines[#lines + 1] = line
-  end
+  local lines = maki.split(code:gsub("\n+$", ""), "\n")
   local hl
   local buf = maki.ui.buf()
   local view = new_view(ctx, buf)
@@ -264,7 +255,7 @@ local function handler(input, ctx)
     if waiting then
       view:clear()
     end
-    append_lines(view, err)
+    view:append_text(err)
     view:finish()
     return { llm_output = err, is_error = true, body = buf }
   end
@@ -299,7 +290,7 @@ local function restore(input, output, is_error, ctx)
   elseif output == NO_OUTPUT then
     view:append({ { "No output", "dim" } })
   else
-    append_lines(view, output)
+    view:append_text(output)
   end
   view:finish()
   highlight()

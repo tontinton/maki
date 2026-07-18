@@ -54,11 +54,8 @@ local function infer_line_meta(line)
 end
 
 local function render_skeleton(view, text, meta)
-  text = text:gsub("\n+$", "") .. "\n"
   local hl_entries = {}
-  local line_nr = 0
-  for line in text:gmatch("([^\n]*)\n") do
-    line_nr = line_nr + 1
+  for line_nr, line in ipairs(maki.split(text:gsub("\n+$", ""), "\n")) do
     local m = (meta and meta[line_nr]) or infer_line_meta(line)
     if line == "" then
       view:append("")

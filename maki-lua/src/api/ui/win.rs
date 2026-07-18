@@ -98,7 +98,7 @@ const recv__doc: FnDoc = FnDoc {
         channel disconnects. Pass {timeout_ms} to also get `{type=\"timeout\"}` \
         events so your plugin can animate while idle.\n\n\
         Event tables by type:\n\
-        - `{type=\"key\", key}` -- keypress. Key is a string like \"q\", \"j\", or \"<Esc>\".\n\
+        - `{type=\"key\", key}` -- keypress. Key is a string like \"q\", \"j\", or \"esc\".\n\
         - `{type=\"resize\", width, height}` -- terminal was resized.\n\
         - `{type=\"paste\", text}` -- bracketed paste.\n\
         - `{type=\"close\"}` -- window was closed externally.\n\

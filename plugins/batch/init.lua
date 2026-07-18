@@ -278,7 +278,7 @@ local function children_from_llm(children, output)
   end
   local sections = {}
   local body, prev
-  for line in (output .. "\n"):gmatch("([^\n]*)\n") do
+  for _, line in ipairs(maki.split(output, "\n")) do
     local tool = line:match(SECTION_PAT)
     local nxt = children[#sections + 1]
     -- render_llm puts a blank line before every header except the first;
@@ -482,7 +482,7 @@ local function legacy_restore(children, output, tol)
   local header = render_children(children)
   append_separator(header)
   view:set_header(header)
-  for line in (output .. "\n"):gmatch("([^\n]*)\n") do
+  for _, line in ipairs(maki.split(output, "\n")) do
     view:append(BODY_INDENT .. line)
   end
   view:finish()

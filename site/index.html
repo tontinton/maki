@@ -1519,17 +1519,19 @@ imports = <span class="fn">set</span>()
         <div class="exec-pane">
           <div class="exec-pane-label">add /standup: show yesterday's commits</div>
           <pre><span class="fn">maki.api.register_command</span>({
-  name = <span class="st">"standup"</span>,
+  name = <span class="st">"/standup"</span>,
   description = <span class="st">"Yesterday's commits"</span>,
   handler = <span class="kw">function</span>()
     <span class="kw">local</span> buf = <span class="fn">maki.ui.buf</span>()
+    <span class="kw">local</span> win = <span class="fn">maki.ui.open_win</span>(buf, { title = <span class="st">"standup"</span> })
     <span class="fn">maki.fn.jobstart</span>(
       <span class="st">"git log --since=yesterday --oneline"</span>, {
-        on_stdout = <span class="kw">function</span>(l) <span class="fn">buf:line</span>(l) <span class="kw">end</span>,
-        on_exit = <span class="kw">function</span>()
-          <span class="fn">maki.ui.open_win</span>(buf, { title = <span class="st">"standup"</span> })
-        <span class="kw">end</span>,
+        on_stdout = <span class="kw">function</span>(_, line) <span class="fn">buf:line</span>(line) <span class="kw">end</span>,
       })
+    <span class="kw">repeat</span>
+      <span class="kw">local</span> ev = <span class="fn">win:recv</span>()
+    <span class="kw">until</span> <span class="kw">not</span> ev <span class="kw">or</span> ev.key == <span class="st">"esc"</span>
+    <span class="fn">win:close</span>()
   <span class="kw">end</span>,
 })</pre>
         </div>

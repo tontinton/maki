@@ -39,10 +39,7 @@ local function edit_header(input)
 end
 
 local function split_lines(text)
-  local lines = {}
-  for line in (text .. "\n"):gmatch("([^\n]*)\n") do
-    lines[#lines + 1] = line
-  end
+  local lines = maki.split(text, "\n")
   if lines[#lines] == "" then
     lines[#lines] = nil
   end

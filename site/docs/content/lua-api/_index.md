@@ -115,6 +115,37 @@ keymaps = false,
 })
 ```
 
+---
+
+### `maki.split()` {#maki-split}
+
+```lua
+maki.split({s}, {sep}, {opts?})
+```
+
+Split {s} at each occurrence of {sep} and return the pieces as a
+list. Mirrors Neovim's `vim.split`, so code using it can be copied
+between Neovim and maki. {sep} is a Lua pattern unless `plain` is
+set; an empty {sep} splits into single characters.
+
+**Parameters:**
+
+- `{s}` (`string`) String to split.
+- `{sep}` (`string`) Separator: a Lua pattern, or literal text with `plain`.
+- `{opts?}` (`table?`) Optional settings:
+  - `plain` (`boolean?`) treat {sep} as literal text instead of a pattern.
+  - `trimempty` (`boolean?`) drop empty pieces from the start and end of the result.
+
+**Returns:** (`table`) List of split pieces.
+
+**Example:**
+
+```lua
+maki.split("a,b,c", ",")                   -- { "a", "b", "c" }
+maki.split("x*y*z", "*", { plain = true }) -- { "x", "y", "z" }
+maki.split("\nhello\nworld\n", "\n", { trimempty = true }) -- { "hello", "world" }
+```
+
 
 ## maki.api {#maki-api}
 
@@ -1211,9 +1242,9 @@ that you can pass to `jobstop` or `jobwait` to control the process.
 - `{opts?}` (`table?`) Optional settings:
   - `cwd` (`string?`) working directory (tilde is expanded).
   - `env` (`table?`) extra environment variables, `{ VAR = "value" }`.
-  - `on_stdout` (`function?`) called with each stdout line.
-  - `on_stderr` (`function?`) called with each stderr line.
-  - `on_exit` (`function?`) called with the exit code when the process finishes.
+  - `on_stdout` (`function?`) called with `(job_id, line)` for each stdout line.
+  - `on_stderr` (`function?`) called with `(job_id, line)` for each stderr line.
+  - `on_exit` (`function?`) called with `(job_id, code)` when the process finishes.
 
 **Returns:** (`integer`) Job id.
 
@@ -1222,8 +1253,8 @@ that you can pass to `jobstop` or `jobwait` to control the process.
 ```lua
 local id = maki.fn.jobstart("ls -la", {
   cwd = "~/projects",
-  on_stdout = function(line) print(line) end,
-  on_exit = function(code) print("exit: " .. code) end,
+  on_stdout = function(_, line) print(line) end,
+  on_exit = function(_, code) print("exit: " .. code) end,
 })
 ```
 
@@ -1259,6 +1290,10 @@ maki.fn.jobwait({job_id}, {timeout_ms?})
 Wait for a job to finish and collect its output. Returns a result
 table with `stdout`, `stderr`, and `exit_code`. Returns `nil` if the
 job does not finish before the timeout.
+
+While waiting, the job's `on_stdout`, `on_stderr`, and `on_exit`
+callbacks fire as events arrive (like Neovim), so you can stream
+output into a buffer while parked here.
 
 **Parameters:**
 
@@ -3969,7 +4004,7 @@ Win:recv({timeout_ms?})
 Waits for the next event from this window. Call this in a loop to build an interactive UI. Returns nil once the window is closed or the channel disconnects. Pass {timeout_ms} to also get `{type="timeout"}` events so your plugin can animate while idle.
 
 Event tables by type:
-- `{type="key", key}` -- keypress. Key is a string like "q", "j", or "<Esc>".
+- `{type="key", key}` -- keypress. Key is a string like "q", "j", or "esc".
 - `{type="resize", width, height}` -- terminal was resized.
 - `{type="paste", text}` -- bracketed paste.
 - `{type="close"}` -- window was closed externally.

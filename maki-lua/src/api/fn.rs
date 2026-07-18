@@ -261,15 +261,15 @@ fn kill_job(meta: &mut JobMeta) {
 /// @param opts table? Optional settings:
 ///   `cwd` (string?) working directory (tilde is expanded).
 ///   `env` (table?) extra environment variables, `{ VAR = "value" }`.
-///   `on_stdout` (function?) called with each stdout line.
-///   `on_stderr` (function?) called with each stderr line.
-///   `on_exit` (function?) called with the exit code when the process finishes.
+///   `on_stdout` (function?) called with `(job_id, line)` for each stdout line.
+///   `on_stderr` (function?) called with `(job_id, line)` for each stderr line.
+///   `on_exit` (function?) called with `(job_id, code)` when the process finishes.
 /// @return (integer) Job id.
 /// @example
 /// local id = maki.fn.jobstart("ls -la", {
 ///   cwd = "~/projects",
-///   on_stdout = function(line) print(line) end,
-///   on_exit = function(code) print("exit: " .. code) end,
+///   on_stdout = function(_, line) print(line) end,
+///   on_exit = function(_, code) print("exit: " .. code) end,
 /// })
 #[lua_fn(guard = Run)]
 fn jobstart(lua: &Lua, cmd: String, opts: Option<Table>) -> LuaResult<u32> {
@@ -323,6 +323,10 @@ fn jobstop(lua: &Lua, job_id: u32) -> LuaResult<()> {
 /// table with `stdout`, `stderr`, and `exit_code`. Returns `nil` if the
 /// job does not finish before the timeout.
 ///
+/// While waiting, the job's `on_stdout`, `on_stderr`, and `on_exit`
+/// callbacks fire as events arrive (like Neovim), so you can stream
+/// output into a buffer while parked here.
+///
 /// @param job_id integer Job id returned by `jobstart`.
 /// @param timeout_ms integer? Maximum wait in milliseconds (default 30000).
 /// @return (table?) `{ stdout, stderr, exit_code }`, or nil on timeout.
@@ -351,13 +355,14 @@ async fn jobwait(lua: Lua, job_id: u32, timeout_ms: Option<u64>) -> LuaResult<Va
         })
         .await;
 
+        let Some(event) = event else {
+            return Ok(mlua::Value::Nil);
+        };
+        deliver_job_event(&lua, job_id, &event)?;
         match event {
-            None => return Ok(mlua::Value::Nil),
-            Some(JobEvent::Stdout(line)) => stdout_lines.push(line),
-            Some(JobEvent::Stderr(line)) => stderr_lines.push(line),
-            Some(JobEvent::Exit(code)) => {
-                break code;
-            }
+            JobEvent::Stdout(line) => stdout_lines.push(line),
+            JobEvent::Stderr(line) => stderr_lines.push(line),
+            JobEvent::Exit(code) => break code,
         }
     };
 
@@ -366,6 +371,30 @@ async fn jobwait(lua: Lua, job_id: u32, timeout_ms: Option<u64>) -> LuaResult<Va
     result.set("stderr", stderr_lines.join("\n"))?;
     result.set("exit_code", exit_code)?;
     Ok(mlua::Value::Table(result))
+}
+
+/// Fire the job's Lua callback for {event} (if any) and mark the job
+/// dead on exit. Shared by `jobwait` and the async dispatch loop so
+/// both deliver events identically.
+pub(crate) fn deliver_job_event(lua: &Lua, job_id: u32, event: &JobEvent) -> LuaResult<()> {
+    let callback = with_task_jobs(lua, |store| {
+        store
+            .callback_key(job_id, event)
+            .and_then(|key| lua.registry_value::<Function>(key).ok())
+    });
+    if let Some(callback) = callback {
+        let arg = match event {
+            JobEvent::Stdout(line) | JobEvent::Stderr(line) => {
+                Value::String(lua.create_string(line)?)
+            }
+            JobEvent::Exit(code) => Value::Integer(*code as i64),
+        };
+        callback.call::<()>((job_id, arg))?;
+    }
+    if let JobEvent::Exit(_) = event {
+        with_task_jobs(lua, |store| store.mark_dead(job_id));
+    }
+    Ok(())
 }
 
 /// Check whether {name} can be found on `$PATH` or is an absolute path

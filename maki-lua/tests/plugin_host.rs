@@ -1076,6 +1076,35 @@ fn async_job_on_exit_receives_exit_code() {
 }
 
 #[test]
+fn jobwait_fires_callbacks_while_waiting() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let src = format!(
+        r#"maki.api.register_tool({{
+            name = "job_stream",
+            description = "streams lines during jobwait",
+            schema = {MINIMAL_SCHEMA},
+            audiences = {{ "main" }},
+            handler = function(input, ctx)
+                local seen = {{}}
+                local exit_code
+                local id = maki.fn.jobstart("echo a; echo b; exit 7", {{
+                    on_stdout = function(_, line) seen[#seen + 1] = line end,
+                    on_exit = function(_, code) exit_code = code end,
+                }})
+                local res = maki.fn.jobwait(id)
+                return table.concat(seen, ",")
+                    .. " exit=" .. tostring(exit_code)
+                    .. " stdout=" .. (res.stdout:gsub("\n", ","))
+            end
+        }})"#,
+    );
+    host.load_source("job_stream", &src).unwrap();
+    let out = exec_tool(&reg, "job_stream", serde_json::json!({})).unwrap();
+    assert_eq!(out, "a,b exit=7 stdout=a,b");
+}
+
+#[test]
 fn jobstart_invalid_cwd_errors_with_expanded_path() {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
@@ -3319,4 +3348,35 @@ fn async_run_from_parked_command_handler_runs_promptly() {
         .recv_timeout(Duration::from_secs(5))
         .expect("async.run task starved while its command handler was parked");
     assert!(matches!(action, maki_lua::UiAction::Flash(msg) if msg == "task-ran"));
+}
+
+/// Job callbacks must fire while a detached command handler is parked
+/// (the homepage `/standup` example: jobstart, then a `win:recv` loop).
+#[test]
+fn job_callbacks_fire_while_command_handler_parked() {
+    let host = PluginHost::new(fresh_registry()).unwrap();
+    host.load_source(
+        "p",
+        r#"
+        maki.api.register_command({
+            name = "/stream",
+            description = "streams job output while parked",
+            handler = function()
+                maki.fn.jobstart("echo hi", {
+                    on_stdout = function(_, line) maki.ui.flash("job:" .. line) end,
+                })
+                maki.async.await(1, function(_cb) end)
+            end,
+        })
+        "#,
+    )
+    .unwrap();
+    let rx = host.ui_action_rx().unwrap();
+    let handle = host.event_handle().unwrap();
+    handle.run_command(Arc::from("p"), Arc::from("/stream"), String::new());
+
+    let action = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("job callbacks starved while command handler was parked");
+    assert!(matches!(action, maki_lua::UiAction::Flash(msg) if msg == "job:hi"));
 }

@@ -542,10 +542,7 @@ end
 local function emit_body_with_range(body, range, out, meta)
   if body:find("\n", 1, true) then
     local leading = body:match("^(%s*)") or ""
-    local lines = {}
-    for line in (body .. "\n"):gmatch("([^\n]*)\n") do
-      lines[#lines + 1] = line
-    end
+    local lines = maki.split(body, "\n")
     for i, line in ipairs(lines) do
       if i == 1 then
         out[#out + 1] = line .. " " .. range
