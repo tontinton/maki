@@ -23,12 +23,25 @@ local function with_mock_ui(fn)
     terminal_size = maki.ui.terminal_size,
   }
   local captured = { _lines = {} }
+  local handlers = {}
   local buf = {
     line = function(_, l)
       table.insert(captured._lines, l)
     end,
+    set_lines = function(_, lines)
+      captured._lines = lines
+    end,
     get_lines = function()
       return captured._lines
+    end,
+    on = function(_, event, fn)
+      handlers[event] = fn
+    end,
+    emit = function(_, event, ev)
+      local h = handlers[event]
+      if h then
+        h(ev)
+      end
     end,
   }
   maki.ui.buf = function()
@@ -639,6 +652,38 @@ case("render_card_shows_dismissed_banner", function()
     local dismissed = find_span(buf.get_lines(), "Dismissed by user")
     assert(dismissed, "dismissed banner must be present")
     eq(dismissed[2], "dim", "dismissed banner must be dim")
+  end)
+end)
+
+case("render_card_click_expands_description", function()
+  with_mock_ui(function(buf)
+    local desc = "Expanded reasoning for why this choice is correct."
+    local questions = {
+      { question = "Pick one", options = { { label = "A", description = desc } } },
+    }
+    QuestionHelpers.render_card(questions, { { "A" } })
+    local before = buf.get_lines()
+    assert(find_span(before, " (+)"), "collapsed option must show expand hint")
+    assert(not find_span(before, "Expanded reasoning"), "description must be hidden by default")
+
+    local row = nil
+    for i, line in ipairs(before) do
+      if find_span({ line }, "A") then
+        row = i
+        break
+      end
+    end
+    assert(row, "option row must exist")
+
+    buf:emit("click", { row = row })
+    local after = buf.get_lines()
+    assert(find_span(after, " (−)"), "expanded option must show collapse hint")
+    assert(find_span(after, "Expanded reasoning"), "description must appear after click")
+
+    buf:emit("click", { row = row })
+    local again = buf.get_lines()
+    assert(find_span(again, " (+)"), "second click must collapse back")
+    assert(not find_span(again, "Expanded reasoning"), "description must hide after second click")
   end)
 end)
 
