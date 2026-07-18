@@ -69,7 +69,7 @@ impl From<QuotaResponse> for ProviderUsage {
                 .into_iter()
                 .map(|l| UsageLimit {
                     label: quota_label(&l.kind, l.unit),
-                    percentage: l.percentage,
+                    percentage: Some(l.percentage),
                     reset_at: l.next_reset_time,
                     detail: None,
                 })
@@ -385,7 +385,7 @@ mod tests {
         assert_eq!(usage.plan.as_deref(), Some("lite"));
         assert_eq!(usage.limits.len(), 3);
         assert_eq!(usage.limits[0].label, "5-hour tokens");
-        assert_eq!(usage.limits[0].percentage, 16);
+        assert_eq!(usage.limits[0].percentage, Some(16));
         assert_eq!(usage.limits[0].reset_at, Some(1777819631597));
         assert_eq!(usage.limits[1].label, "Weekly tokens");
         assert_eq!(usage.limits[2].label, "Subscription time");
@@ -401,7 +401,7 @@ mod tests {
         let usage: ProviderUsage = parsed.into();
         assert!(usage.plan.is_none());
         assert_eq!(usage.limits[0].label, "TOKENS_LIMIT #9");
-        assert_eq!(usage.limits[0].percentage, 50);
+        assert_eq!(usage.limits[0].percentage, Some(50));
         assert_eq!(usage.limits[0].reset_at, None);
     }
 }

@@ -163,7 +163,7 @@ fn credits_limit(u: &OauthUsage) -> Option<UsageLimit> {
     };
     Some(UsageLimit {
         label: "Usage credits".into(),
-        percentage: percent.round() as u32,
+        percentage: Some(percent.round() as u32),
         reset_at: None,
         detail,
     })
@@ -177,7 +177,7 @@ impl From<OauthUsage> for ProviderUsage {
             .filter_map(|l| {
                 Some(UsageLimit {
                     label: limit_label(l),
-                    percentage: l.percent?.round() as u32,
+                    percentage: Some(l.percent?.round() as u32),
                     reset_at: l.resets_at.as_deref().and_then(parse_reset),
                     detail: None,
                 })
@@ -194,7 +194,7 @@ impl From<OauthUsage> for ProviderUsage {
                 let w = w.as_ref()?;
                 Some(UsageLimit {
                     label: label.into(),
-                    percentage: w.utilization?.round() as u32,
+                    percentage: Some(w.utilization?.round() as u32),
                     reset_at: w.resets_at.as_deref().and_then(parse_reset),
                     detail: None,
                 })
@@ -528,14 +528,14 @@ mod tests {
         assert!(usage.plan.is_none());
         assert_eq!(usage.limits.len(), 4);
         assert_eq!(usage.limits[0].label, "Current session");
-        assert_eq!(usage.limits[0].percentage, 14);
+        assert_eq!(usage.limits[0].percentage, Some(14));
         assert_eq!(usage.limits[0].reset_at, Some(1770415200000));
         assert_eq!(usage.limits[1].label, "Current week (all models)");
-        assert_eq!(usage.limits[1].percentage, 2);
+        assert_eq!(usage.limits[1].percentage, Some(2));
         assert_eq!(usage.limits[2].label, "Current week (Fable)");
-        assert_eq!(usage.limits[2].percentage, 3);
+        assert_eq!(usage.limits[2].percentage, Some(3));
         assert_eq!(usage.limits[3].label, "Usage credits");
-        assert_eq!(usage.limits[3].percentage, 2);
+        assert_eq!(usage.limits[3].percentage, Some(2));
         assert_eq!(usage.limits[3].reset_at, None);
         assert_eq!(usage.limits[3].detail.as_deref(), Some("$2.33 spent"));
     }
@@ -553,14 +553,14 @@ mod tests {
         let usage: ProviderUsage = parsed.into();
         assert_eq!(usage.limits.len(), 5);
         assert_eq!(usage.limits[0].label, "Current session");
-        assert_eq!(usage.limits[0].percentage, 35);
+        assert_eq!(usage.limits[0].percentage, Some(35));
         assert_eq!(usage.limits[0].reset_at, Some(1770415200000));
         assert_eq!(usage.limits[1].label, "Current week (all models)");
         assert_eq!(usage.limits[2].label, "Current week (Sonnet)");
         assert_eq!(usage.limits[3].label, "Current week (Opus)");
-        assert_eq!(usage.limits[3].percentage, 3);
+        assert_eq!(usage.limits[3].percentage, Some(3));
         assert_eq!(usage.limits[4].label, "Usage credits");
-        assert_eq!(usage.limits[4].percentage, 2);
+        assert_eq!(usage.limits[4].percentage, Some(2));
         assert_eq!(usage.limits[4].detail.as_deref(), Some("$2.33 spent"));
     }
 
