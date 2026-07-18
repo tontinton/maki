@@ -9,9 +9,11 @@
 
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::time::UNIX_EPOCH;
 
 use tracing::warn;
@@ -163,10 +165,113 @@ pub struct StoredRule {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ThinkingParseError {
-    #[error("unknown thinking value {0:?} (use off, adaptive, or a token budget)")]
+    #[error(
+        "unknown thinking value {0:?} (use off, adaptive, minimal, low, medium, high, xhigh, max, or a token budget)"
+    )]
     Unknown(String),
     #[error("thinking budget must be greater than zero")]
     BudgetZero,
+}
+
+/// Floor for every token budget sent to a provider; some APIs reject smaller values.
+pub const MIN_THINKING_BUDGET: u32 = 1024;
+
+/// Thinking effort level. Declaration order is intensity order: the `Ord`
+/// derive and [`Effort::ALL`] rely on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Effort {
+    Minimal,
+    Low,
+    Medium,
+    High,
+    XHigh,
+    Max,
+}
+
+impl Effort {
+    pub const ALL: [Self; 6] = [
+        Self::Minimal,
+        Self::Low,
+        Self::Medium,
+        Self::High,
+        Self::XHigh,
+        Self::Max,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::XHigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+
+    /// Percentage of the model's max thinking budget this level spends.
+    pub const fn percent(self) -> u32 {
+        match self {
+            Self::Minimal => 10,
+            Self::Low => 20,
+            Self::Medium => 40,
+            Self::High => 60,
+            Self::XHigh => 80,
+            Self::Max => 100,
+        }
+    }
+
+    /// `percent` of `max`, clamped to `[MIN_THINKING_BUDGET, max]`.
+    /// A `max` below the floor is raised to it.
+    pub fn budget(self, max: u32) -> u32 {
+        let max = max.max(MIN_THINKING_BUDGET);
+        let tokens = (u64::from(max) * u64::from(self.percent()) / 100) as u32;
+        tokens.clamp(MIN_THINKING_BUDGET, max)
+    }
+
+    /// Inverse of [`Self::budget`]: the lowest level whose percentage covers
+    /// `n` tokens out of `max`. Budgets at or above `max` map to `Max`.
+    pub fn from_budget(n: u32, max: u32) -> Self {
+        let pct = u64::from(n).saturating_mul(100) / u64::from(max.max(1));
+        Self::ALL
+            .into_iter()
+            .find(|e| u64::from(e.percent()) >= pct)
+            .unwrap_or(Self::Max)
+    }
+
+    /// Nearest level a provider accepts: exact match keeps `self`, otherwise
+    /// the closest lower supported level, otherwise the lowest supported.
+    /// An empty `supported` list returns `self` unchanged (dynamic model
+    /// listings may not declare supported efforts).
+    pub fn snap(self, supported: &[Self]) -> Self {
+        if supported.is_empty() || supported.contains(&self) {
+            return self;
+        }
+        supported
+            .iter()
+            .rev()
+            .find(|&&e| e < self)
+            .copied()
+            .unwrap_or(supported[0])
+    }
+}
+
+impl fmt::Display for Effort {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for Effort {
+    type Err = ThinkingParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|e| e.as_str() == s)
+            .ok_or_else(|| ThinkingParseError::Unknown(s.to_string()))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -174,19 +279,27 @@ pub enum ThinkingParseError {
 pub enum StoredThinking {
     Off,
     Adaptive,
+    Effort { level: Effort },
     Budget { tokens: u32 },
 }
 
 impl StoredThinking {
+    /// The one string-to-thinking parser: `/thinking`, `always_thinking`
+    /// config, and the Lua agent API all delegate here.
     pub fn parse_setting(input: &str) -> Result<Self, ThinkingParseError> {
         match input.trim() {
             "off" => Ok(Self::Off),
             "adaptive" => Ok(Self::Adaptive),
-            other => match other.parse::<u32>() {
-                Ok(0) => Err(ThinkingParseError::BudgetZero),
-                Ok(n) => Ok(Self::Budget { tokens: n }),
-                Err(_) => Err(ThinkingParseError::Unknown(other.to_string())),
-            },
+            other => {
+                if let Ok(level) = other.parse::<Effort>() {
+                    return Ok(Self::Effort { level });
+                }
+                match other.parse::<u32>() {
+                    Ok(0) => Err(ThinkingParseError::BudgetZero),
+                    Ok(n) => Ok(Self::Budget { tokens: n }),
+                    Err(_) => Err(ThinkingParseError::Unknown(other.to_string())),
+                }
+            }
         }
     }
 }
@@ -1154,6 +1267,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use super::Effort;
     use super::StoredThinking;
     use super::ThinkingParseError;
     use super::{
@@ -1997,6 +2111,7 @@ mod tests {
 
     #[test_case(StoredThinking::Off ; "off")]
     #[test_case(StoredThinking::Adaptive ; "adaptive")]
+    #[test_case(StoredThinking::Effort { level: Effort::XHigh } ; "effort")]
     #[test_case(StoredThinking::Budget { tokens: 4096 } ; "budget")]
     fn stored_thinking_serde_round_trip(variant: StoredThinking) {
         let json = serde_json::to_string(&variant).unwrap();
@@ -2011,8 +2126,65 @@ mod tests {
     #[test_case("1", Ok(StoredThinking::Budget { tokens: 1 }) ; "minimum_budget")]
     #[test_case("0", Err(ThinkingParseError::BudgetZero) ; "budget_zero")]
     #[test_case("fast", Err(ThinkingParseError::Unknown("fast".into())) ; "garbage")]
+    #[test_case("high", Ok(StoredThinking::Effort { level: Effort::High }) ; "effort_level")]
     fn parse_setting(input: &str, expected: Result<StoredThinking, ThinkingParseError>) {
         assert_eq!(StoredThinking::parse_setting(input), expected);
+    }
+
+    // Six ascending values in a six-variant enum also proves ALL is complete.
+    #[test]
+    fn effort_all_ascending_with_increasing_percent() {
+        for pair in Effort::ALL.windows(2) {
+            assert!(pair[0] < pair[1], "ALL must be ascending");
+            assert!(
+                pair[0].percent() < pair[1].percent(),
+                "percent must be strictly increasing"
+            );
+        }
+    }
+
+    #[test]
+    fn effort_wire_strings_round_trip() {
+        let expected = ["minimal", "low", "medium", "high", "xhigh", "max"];
+        for (e, s) in Effort::ALL.into_iter().zip(expected) {
+            assert_eq!(e.as_str(), s);
+            assert_eq!(s.parse::<Effort>(), Ok(e));
+        }
+    }
+
+    #[test_case(Effort::High, &[Effort::Low, Effort::Medium, Effort::High], Effort::High ; "exact_match")]
+    #[test_case(Effort::Max, &[Effort::Low, Effort::Medium, Effort::High], Effort::High ; "downgrade_to_nearest_lower")]
+    #[test_case(Effort::Minimal, &[Effort::Low, Effort::Medium], Effort::Low ; "below_lowest_takes_lowest")]
+    #[test_case(Effort::Medium, &[], Effort::Medium ; "empty_supported_keeps_self")]
+    #[test_case(Effort::Max, &[Effort::High, Effort::XHigh], Effort::XHigh ; "glm_max_snaps_to_xhigh")]
+    fn effort_snap(level: Effort, supported: &[Effort], expected: Effort) {
+        assert_eq!(level.snap(supported), expected);
+    }
+
+    #[test_case(Effort::Minimal, 32_768, 3_276 ; "minimal_ten_percent")]
+    #[test_case(Effort::Medium, 32_768, 13_107 ; "medium_forty_percent")]
+    #[test_case(Effort::Max, 32_768, 32_768 ; "max_full_budget")]
+    #[test_case(Effort::Minimal, 4_096, 1_024 ; "small_max_floors_at_min")]
+    #[test_case(Effort::Max, 512, 1_024 ; "tiny_max_raised_to_floor")]
+    fn effort_budget(level: Effort, max: u32, expected: u32) {
+        assert_eq!(level.budget(max), expected);
+    }
+
+    #[test_case(32_768, 32_768, Effort::Max ; "full_budget_is_max")]
+    #[test_case(64_000, 32_768, Effort::Max ; "above_max_is_max")]
+    #[test_case(0, 32_768, Effort::Minimal ; "zero_is_minimal")]
+    #[test_case(13_107, 32_768, Effort::Medium ; "forty_percent_is_medium")]
+    #[test_case(1_024, 0, Effort::Max ; "zero_max_saturates")]
+    fn effort_from_budget(n: u32, max: u32, expected: Effort) {
+        assert_eq!(Effort::from_budget(n, max), expected);
+    }
+
+    #[test]
+    fn effort_budget_round_trips_at_realistic_max() {
+        const MAX: u32 = 32_768;
+        for e in Effort::ALL {
+            assert_eq!(Effort::from_budget(e.budget(MAX), MAX), e);
+        }
     }
 
     #[test]

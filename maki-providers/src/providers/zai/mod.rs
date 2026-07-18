@@ -11,8 +11,8 @@ use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier};
 use crate::provider::{BoxFuture, Provider};
 use crate::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use crate::{
-    AgentError, EffortScale, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse,
-    UsageLimit,
+    AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse, UsageLimit,
+    dialect,
 };
 
 use super::{KeyPool, ResolvedAuth};
@@ -300,7 +300,7 @@ impl Provider for Zai {
             let mut body = self.compat.build_body(model, messages, system, tools);
             if model.supports_thinking() {
                 opts.thinking
-                    .apply_reasoning_effort(&mut body, EffortScale::Glm);
+                    .apply_reasoning_effort(&mut body, &dialect::GLM, model);
             }
             match self
                 .compat

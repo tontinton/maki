@@ -27,6 +27,7 @@ use maki_providers::model::ModelTier;
 use maki_providers::provider;
 use maki_providers::{ContentBlock, Model, ModelError, Role, ThinkingConfig};
 use maki_storage::id::MakiId;
+use maki_storage::sessions::StoredThinking;
 use mlua::{Function, IntoLuaMulti, Lua, Result as LuaResult, Table, Value as LuaValue};
 use serde_json::Value as JsonValue;
 use tracing::info;
@@ -351,8 +352,10 @@ async fn call_tool(
 ///     `(string)` or `(nil, err)`.
 ///   `name` (string?) - display name for logs and UI.
 ///   `audience` (string?) - tool audience for capability gating. Default: `"general_sub"`.
-///   `thinking` (string|integer?) - thinking mode: `"off"`, `"adaptive"`, or a
-///     budget integer (token count). Inherits parent setting if omitted.
+///   `thinking` (string|integer?) - thinking mode: `"off"`, `"adaptive"`, an
+///     effort level (`"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`,
+///     `"max"`), or a budget integer (token count). Inherits parent setting
+///     if omitted.
 ///   `fast` (boolean?) - use fast mode. Inherits parent setting if omitted.
 /// @return (Session?, string?) Session handle, or `(nil, err)` on failure.
 /// @example
@@ -446,13 +449,20 @@ async fn session(
     }
 
     let thinking = match thinking_val {
-        Some(LuaValue::String(s)) => match s.to_str()?.as_ref() {
-            "off" => ThinkingConfig::Off,
-            "adaptive" => ThinkingConfig::Adaptive,
-            other => return Ok(err_pair(format!("invalid thinking: {other}"))),
+        Some(LuaValue::String(s)) => match StoredThinking::parse_setting(&s.to_str()?) {
+            Ok(stored) => ThinkingConfig::from(stored),
+            Err(e) => return Ok(err_pair(format!("invalid thinking: {e}"))),
         },
-        Some(LuaValue::Integer(n)) => ThinkingConfig::Budget(n as u32),
-        Some(LuaValue::Number(n)) => ThinkingConfig::Budget(n as u32),
+        Some(LuaValue::Integer(n)) => match u32::try_from(n) {
+            Ok(tokens) if tokens > 0 => ThinkingConfig::Budget(tokens),
+            _ => return Ok(err_pair(format!("invalid thinking budget: {n}"))),
+        },
+        Some(LuaValue::Number(n)) if n >= 1.0 && n <= f64::from(u32::MAX) => {
+            ThinkingConfig::Budget(n as u32)
+        }
+        Some(LuaValue::Number(n)) => {
+            return Ok(err_pair(format!("invalid thinking budget: {n}")));
+        }
         Some(_) => return Err(mlua::Error::runtime("thinking must be string or number")),
         None => agent_ctx.opts.thinking,
     };

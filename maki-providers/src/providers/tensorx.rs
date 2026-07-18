@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 
 use crate::model::{Model, ModelEntry, ModelInfo, ModelPricing};
 use crate::provider::{BoxFuture, Provider};
-use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig};
+use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, dialect};
 
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use super::{KeyPool, ResolvedAuth};
@@ -107,19 +107,15 @@ impl Provider for TensorX {
             };
 
             if has_thinking {
-                body["thinking"] = json!(!matches!(opts.thinking, ThinkingConfig::Off));
+                body["thinking"] = json!(opts.thinking.is_enabled());
             }
             if has_reasoning_effort {
-                let effort = match opts.thinking {
-                    ThinkingConfig::Adaptive => "high",
-                    ThinkingConfig::Budget(n) => ThinkingConfig::budget_to_effort(n),
-                    ThinkingConfig::Off => "none",
-                };
-                body["reasoning_effort"] = json!(effort);
+                opts.thinking
+                    .apply_reasoning_effort(&mut body, &dialect::TENSORX, model);
             }
             // Fallback for deepseek models that use chat_template_kwargs
             else if !has_thinking
-                && !matches!(opts.thinking, ThinkingConfig::Off)
+                && opts.thinking.is_enabled()
                 && model.id.starts_with("deepseek/deepseek-v4")
             {
                 body["chat_template_kwargs"] = json!({"thinking": true});

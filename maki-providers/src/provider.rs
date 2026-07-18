@@ -182,22 +182,26 @@ impl ProviderKind {
         )
     }
 
-    pub const fn fallback_max_output(self) -> u32 {
+    /// `None` when we honestly don't know the output window: llama.cpp
+    /// serves whatever model the user loaded, and TensorX rejects explicit
+    /// max_tokens (see tensorx.rs). Unknown means "don't limit", never
+    /// "assume small"; a `0` sentinel here once silently capped llama.cpp
+    /// thinking budgets at the floor.
+    pub const fn fallback_max_output(self) -> Option<u32> {
         match self {
-            Self::Anthropic => 128_000,
-            Self::OpenAi => 100_000,
-            Self::Google => 65_536,
-            Self::Copilot => 100_000,
-            Self::Ollama => 16_384,
-            Self::LlamaCpp => 0,
-            Self::Mistral => 32_000,
-            Self::Zai => 16_000,
-            Self::DeepSeek => 384_000,
-            Self::OpenRouter => 128_000,
-            Self::Synthetic => 32_000,
-            // FIXME: See comment in tensorx.rs
-            Self::TensorX => 0,
-            Self::Opencode => 128_000,
+            Self::Anthropic => Some(128_000),
+            Self::OpenAi => Some(100_000),
+            Self::Google => Some(65_536),
+            Self::Copilot => Some(100_000),
+            Self::Ollama => Some(16_384),
+            Self::LlamaCpp => None,
+            Self::Mistral => Some(32_000),
+            Self::Zai => Some(16_000),
+            Self::DeepSeek => Some(384_000),
+            Self::OpenRouter => Some(128_000),
+            Self::Synthetic => Some(32_000),
+            Self::TensorX => None,
+            Self::Opencode => Some(128_000),
         }
     }
 

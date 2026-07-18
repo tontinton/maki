@@ -162,7 +162,7 @@ impl Provider for LocalEndpoint {
             let mut body = self.compat.build_body(model, messages, system, tools);
 
             if self.thinking_budget_field {
-                opts.thinking.apply_local_thinking(&mut body);
+                opts.thinking.apply_local_thinking(&mut body, model);
             }
 
             self.compat

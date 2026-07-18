@@ -94,7 +94,7 @@ pub fn lookup_model(slug: &str, model_id: &str) -> Option<Model> {
         .unwrap_or(ModelTier::Medium);
     let max_output_tokens = declared
         .and_then(|m| m.max_output_tokens)
-        .unwrap_or_else(|| kind.fallback_max_output());
+        .or_else(|| kind.fallback_max_output());
     let context_window = declared
         .and_then(|m| m.context_window)
         .unwrap_or_else(|| kind.fallback_context_window());

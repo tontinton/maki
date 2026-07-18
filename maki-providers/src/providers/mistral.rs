@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 
 use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier};
 use crate::provider::{BoxFuture, Provider};
-use crate::{AgentError, EffortScale, Message, ProviderEvent, RequestOptions, StreamResponse};
+use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, dialect};
 
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use super::{KeyPool, ResolvedAuth};
@@ -199,7 +199,7 @@ impl Provider for Mistral {
             let system = super::with_prefix(&self.system_prefix, system, &mut buf);
             let mut body = self.compat.build_body(model, messages, system, tools);
             opts.thinking
-                .apply_reasoning_effort(&mut body, EffortScale::HighOnly);
+                .apply_reasoning_effort(&mut body, &dialect::HIGH_ONLY, model);
             // Convert assistant messages to Mistral's expected format with thinking content
             convert_assistant_messages_in_place(body.get_mut("messages").unwrap());
 

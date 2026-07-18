@@ -130,7 +130,7 @@ pub const TOP_LEVEL_FIELDS: &[ConfigField] = &[
         ty: "bool | string",
         default: ConfigValue::Bool(false),
         min: None,
-        description: "Start every session with extended thinking (true/\"adaptive\", \"off\", or a token budget)",
+        description: "Start every session with extended thinking (true/\"adaptive\", \"off\", an effort level (\"minimal\" to \"max\"), or a token budget)",
     },
 ];
 
@@ -1796,6 +1796,7 @@ fn insert_permission_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use maki_storage::sessions::Effort;
     use std::fs;
     use tempfile::TempDir;
     use test_case::test_case;
@@ -1954,6 +1955,8 @@ mod tests {
     #[test_case(AlwaysThinking::Toggle(true), StoredThinking::Adaptive ; "toggle_true")]
     #[test_case(AlwaysThinking::Toggle(false), StoredThinking::Off ; "toggle_false")]
     #[test_case(AlwaysThinking::Budget(8192), StoredThinking::Budget { tokens: 8192 } ; "budget_number")]
+    #[test_case(AlwaysThinking::Mode("xhigh".into()), StoredThinking::Effort { level: Effort::XHigh } ; "effort_xhigh")]
+    #[test_case(AlwaysThinking::Mode("minimal".into()), StoredThinking::Effort { level: Effort::Minimal } ; "effort_minimal")]
     fn always_thinking_toggle_resolve(input: AlwaysThinking, expected: StoredThinking) {
         assert_eq!(input.resolve(), Ok(expected));
     }

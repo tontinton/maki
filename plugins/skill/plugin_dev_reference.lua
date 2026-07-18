@@ -594,8 +594,10 @@ and tool set.
     `(string)` or `(nil, err)`.
   - `name` (`string?`) display name for logs and UI.
   - `audience` (`string?`) tool audience for capability gating. Default: `"general_sub"`.
-  - `thinking` (`string|integer?`) thinking mode: `"off"`, `"adaptive"`, or a
-    budget integer (token count). Inherits parent setting if omitted.
+  - `thinking` (`string|integer?`) thinking mode: `"off"`, `"adaptive"`, an
+    effort level (`"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`,
+    `"max"`), or a budget integer (token count). Inherits parent setting
+    if omitted.
   - `fast` (`boolean?`) use fast mode. Inherits parent setting if omitted.
 
 **Returns:** (`Session?`, `string?`) Session handle, or `(nil, err)` on failure.

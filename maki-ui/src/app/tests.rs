@@ -14,7 +14,7 @@ use maki_agent::{
 };
 use maki_config::{PermissionsConfig, UiConfig};
 use maki_lua::{HintReader, KeymapReader, LuaCommandReader};
-use maki_providers::{ContentBlock, Role, TokenUsage};
+use maki_providers::{ContentBlock, Effort, Role, TokenUsage};
 use maki_storage::sessions::StoredThinking;
 use ratatui::layout::Rect;
 use std::env;
@@ -2617,6 +2617,12 @@ fn thinking_explicit_args() {
         args: "8192".into(),
     });
     assert_eq!(app.state.thinking, ThinkingConfig::Budget(8192));
+
+    app.execute_command(ParsedCommand {
+        name: "/thinking".into(),
+        args: "high".into(),
+    });
+    assert_eq!(app.state.thinking, ThinkingConfig::Effort(Effort::High));
 }
 
 #[test]

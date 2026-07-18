@@ -13,6 +13,11 @@ use crate::{
 
 pub(super) const BETA_TOOL_EXAMPLES_BEDROCK: &str = "tool-examples-2025-10-29";
 
+/// The messages API refuses requests without max_tokens. Anthropic-kind
+/// models always get a window from the fallback table, so this only fires if
+/// an unknown-window model is ever routed here; 32k is safe for every Claude.
+pub(crate) const FALLBACK_MAX_TOKENS: u32 = 32_000;
+
 /// A `-1m` suffix is our own convention for asking Anthropic for the 1M context
 /// window. We strip it from the id before sending and add [`LONG_CONTEXT_BETA`]
 /// to the request instead.
@@ -199,13 +204,13 @@ pub(crate) fn build_request_body_with_system(
     let wire_tools = build_wire_tools(tools);
 
     let mut body = json!({
-        "max_tokens": model.max_output_tokens,
+        "max_tokens": model.max_output_tokens.unwrap_or(FALLBACK_MAX_TOKENS),
         "system": system_blocks,
         "messages": wire_messages,
         "tools": wire_tools,
     });
 
-    thinking.apply_to_body(&mut body, &model.id);
+    thinking.apply_to_body(&mut body, model);
     body
 }
 

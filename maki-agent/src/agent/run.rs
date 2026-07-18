@@ -709,7 +709,7 @@ mod tests {
     fn small_context_model(context_window: u32, max_output_tokens: u32) -> Model {
         let mut model = default_model();
         model.context_window = context_window;
-        model.max_output_tokens = max_output_tokens;
+        model.max_output_tokens = Some(max_output_tokens);
         model
     }
 

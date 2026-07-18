@@ -7,7 +7,9 @@ use tracing::warn;
 
 use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier};
 use crate::provider::{BoxFuture, Provider};
-use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig};
+use crate::{
+    AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig, dialect,
+};
 
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use super::{KeyPool, ResolvedAuth};
@@ -122,22 +124,16 @@ impl Provider for DeepSeek {
             let system = super::with_prefix(&self.system_prefix, system, &mut buf);
             let mut body = self.compat.build_body(model, messages, system, tools);
 
-            // DeepSeek enables reasoning by default; Adaptive and Budget
-            // use the model's default reasoning behavior.
-            match opts.thinking {
-                ThinkingConfig::Off => {
-                    body["thinking"] = serde_json::json!({"type": "disabled"});
-                }
-                ThinkingConfig::Adaptive => {
-                    body["thinking"] = serde_json::json!({"type": "enabled"});
-                    pad_reasoning_content(&model.id, &mut body);
-                }
-                ThinkingConfig::Budget(_) => {
-                    body["thinking"] = serde_json::json!({"type": "enabled"});
-                    body["reasoning_effort"] = serde_json::json!("max");
+            if opts.thinking.is_enabled() {
+                body["thinking"] = serde_json::json!({"type": "enabled"});
+                opts.thinking
+                    .apply_reasoning_effort(&mut body, &dialect::DEEPSEEK, model);
+                if matches!(opts.thinking, ThinkingConfig::Budget(_)) {
                     warn!("DeepSeek reasoning does not support token budgets");
-                    pad_reasoning_content(&model.id, &mut body);
                 }
+                pad_reasoning_content(&model.id, &mut body);
+            } else {
+                body["thinking"] = serde_json::json!({"type": "disabled"});
             }
 
             self.compat

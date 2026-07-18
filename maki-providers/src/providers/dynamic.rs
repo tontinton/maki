@@ -84,7 +84,7 @@ impl ScriptModel {
             supports_thinking_override: self.supports_thinking,
             supports_vision_override: self.supports_vision,
             pricing: self.pricing.clone().unwrap_or_default(),
-            max_output_tokens: self.max_output_tokens,
+            max_output_tokens: Some(self.max_output_tokens),
             context_window: self.context_window,
         }
     }
