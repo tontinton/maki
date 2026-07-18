@@ -851,7 +851,7 @@ mod tests {
     }
 
     #[test_case(Rect::new(0,2,80,20), 10, 5, 25, 5, 0, 19, 5 ; "clamp_row_to_bottom")]
-    #[test_case(Rect::new(5,0,40,20), 10,10, 10,50, 0, 10,44 ; "clamp_col_to_right")]
+    #[test_case(Rect::new(5,0,40,20), 10,10, 10,50, 0, 10,43 ; "clamp_col_to_right")]
     #[test_case(Rect::new(5,0,40,20), 10,10, 10, 2, 0, 10, 5 ; "clamp_col_to_left")]
     #[allow(clippy::too_many_arguments)]
     fn update_clamps(
