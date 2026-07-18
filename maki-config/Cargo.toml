@@ -7,6 +7,7 @@ edition.workspace = true
 maki-config-macro = { workspace = true }
 maki-storage = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 toml = { workspace = true }
 toml_edit = { workspace = true }
@@ -17,4 +18,3 @@ inventory = { workspace = true }
 [dev-dependencies]
 test-case = { workspace = true }
 tempfile = { workspace = true }
-serde_json = { workspace = true }

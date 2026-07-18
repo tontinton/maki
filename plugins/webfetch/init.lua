@@ -62,6 +62,15 @@ end
 
 local truncate = require("maki.truncate")
 local ToolView = require("maki.tool_view")
+local output_limits = require("maki.output_limits")
+
+local opts = maki.api.register_options(output_limits.extend({
+  max_response_bytes = {
+    default = 5 * 1024 * 1024,
+    min = 1024,
+    desc = "Stop reading a response after this many bytes.",
+  },
+}))
 
 local function web_view_opts(ctx)
   local tol = ctx:tool_output_lines()
@@ -111,14 +120,11 @@ maki.api.register_tool({
       return { llm_output = "error: unknown format: " .. tostring(fmt), is_error = true }
     end
 
-    local config = ctx:config()
-    local max_response = (config and config.max_response_bytes) or (5 * 1024 * 1024)
-    local max_lines = (config and config.max_output_lines) or 2000
-    local max_bytes = (config and config.max_output_bytes) or (50 * 1024)
+    local max_lines, max_bytes = output_limits.resolve(opts, ctx)
 
     local resp, err = maki.net.request(url, {
       timeout = input.timeout or 30,
-      max_bytes = max_response,
+      max_bytes = opts.max_response_bytes,
       headers = {
         ["Accept"] = ACCEPT_HEADERS[fmt],
       },

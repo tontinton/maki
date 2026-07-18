@@ -5,9 +5,8 @@
 
 local truncate = require("maki.truncate")
 local ToolView = require("maki.tool_view")
+local output_limits = require("maki.output_limits")
 
-local DEFAULT_TIMEOUT = 30
-local DEFAULT_MAX_MEMORY_MB = 50
 local DEFAULT_MAX_OUTPUT_LINES = 2000
 local DEFAULT_MAX_OUTPUT_BYTES = 50 * 1024
 local MAX_SCRIPT_LINES = 2000
@@ -18,6 +17,15 @@ local TOOLS_HEADER = "\n\nAvailable tools (called as Python functions with keywo
 local WORKFLOW_TOOLS_NOTE =
   "\nWorkflow mode: orchestrate subagents from this script. Await every `task(...)` call and use `asyncio.gather` for parallel fan-out. Pass `output_schema` to task for machine-readable results (a JSON string, parse with `json.loads`). Raise this tool's `timeout` param: subagents outlive the default code_execution timeout.\n"
 local PY_TYPES = { string = "str", integer = "int", boolean = "bool", array = "list" }
+
+local opts = maki.api.register_options(output_limits.extend({
+  timeout_secs = {
+    default = 30,
+    min = 5,
+    desc = "Stop the script after this many seconds. A call's `timeout` param overrides it.",
+  },
+  max_memory_mb = { default = 50, min = 10, desc = "Memory limit for the Python sandbox (MB)." },
+}))
 
 local function new_view(ctx, buf)
   return ToolView.new(buf, { max_lines = ctx:tool_output_lines().code_execution or 30 })
@@ -218,7 +226,7 @@ end
 
 local function handler(input, ctx)
   local config = ctx:config()
-  local timeout = input.timeout or config.code_execution_timeout_secs or DEFAULT_TIMEOUT
+  local timeout = input.timeout or opts.timeout_secs
 
   local buf, view, highlight = build_body(ctx, input.code)
   ctx:live_buf(buf)
@@ -247,7 +255,7 @@ local function handler(input, ctx)
 
   local result, err = maki.interpreter.run(PREAMBLE .. input.code, {
     timeout = timeout,
-    max_memory_mb = config.interpreter_max_memory_mb or DEFAULT_MAX_MEMORY_MB,
+    max_memory_mb = opts.max_memory_mb,
     on_output = show,
     tools = tools,
   })
@@ -272,11 +280,8 @@ local function handler(input, ctx)
     view:append({ { "No output", "dim" } })
   end
 
-  local llm_output = truncate(
-    output,
-    config.max_output_lines or DEFAULT_MAX_OUTPUT_LINES,
-    config.max_output_bytes or DEFAULT_MAX_OUTPUT_BYTES
-  )
+  local max_lines, max_bytes = output_limits.resolve(opts, ctx)
+  local llm_output = truncate(output, max_lines, max_bytes)
   view:finish()
 
   return { llm_output = llm_output, body = buf }

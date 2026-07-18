@@ -1,5 +1,6 @@
 local ToolView = require("maki.tool_view")
 local shorten_path = require("maki.shorten_path")
+local output_limits = require("maki.output_limits")
 
 local DESCRIPTION = [[Read a file or directory. Returns contents with line numbers (1-indexed).
 
@@ -15,7 +16,11 @@ local DESCRIPTION = [[Read a file or directory. Returns contents with line numbe
 - Avoid tiny repeated slices - read a larger window if you need more context.]]
 
 local DEFAULT_MAX_OUTPUT_LINES = 2000
-local DEFAULT_MAX_LINE_BYTES = 3000
+
+local opts = maki.api.register_options({
+  max_line_bytes = { default = 500, min = 80, desc = "Truncate lines longer than this many bytes." },
+  max_output_lines = output_limits.specs.max_output_lines,
+})
 
 local function line_nr_fmt(count)
   local w = math.max(1, math.floor(math.log(count + 1, 10)) + 1)
@@ -123,8 +128,8 @@ local function read_file(path, offset, limit, ctx)
   local total_lines = #all_lines
 
   local start = math.max(offset or 1, 1)
-  local max_lines = limit or ctx:config("max_output_lines", DEFAULT_MAX_OUTPUT_LINES)
-  local max_line_bytes = ctx:config("max_line_bytes", DEFAULT_MAX_LINE_BYTES)
+  local max_lines = limit or opts.max_output_lines or ctx:config("max_output_lines", DEFAULT_MAX_OUTPUT_LINES)
+  local max_line_bytes = opts.max_line_bytes
 
   local lines = {}
   for i = start, math.min(start + max_lines - 1, total_lines) do

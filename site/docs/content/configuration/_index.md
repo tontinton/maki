@@ -29,7 +29,6 @@ maki.setup({
         },
     },
     agent = {
-        bash_timeout_secs = 180,
         max_output_lines = 3000,
     },
     provider = {
@@ -38,8 +37,9 @@ maki.setup({
     storage = {
         max_log_files = 5,
     },
-    index = {
-        max_file_size_mb = 4,
+    plugins = {
+        bash = { timeout_secs = 180 },
+        index = { max_file_size_mb = 4 },
     },
 })
 ```
@@ -92,15 +92,8 @@ How many lines of output to show per tool in the UI. All values are `usize` with
 |-------|------|---------|-----|-------------|
 | `max_output_bytes` | usize | `51200` | 1024 | Max tool output size (bytes) |
 | `max_output_lines` | usize | `2000` | 10 | Max tool output lines |
-| `max_response_bytes` | usize | `5242880` | 1024 | Max LLM response size (bytes) |
-| `max_line_bytes` | usize | `500` | 80 | Max bytes per line before truncation |
-| `bash_timeout_secs` | u64 | `120` | 5 | Bash command timeout (seconds) |
-| `code_execution_timeout_secs` | u64 | `30` | 5 | Code execution timeout (seconds) |
 | `max_continuation_turns` | u32 | `3` | 1 | Max automatic continuation turns |
 | `compaction_buffer` | u32 \| string | `20%` | - | Context reserved for compaction: token count or percent of the context window (e.g. "20%") |
-| `search_result_limit` | usize | `100` | 10 | Max results from grep/glob searches |
-| `interpreter_max_memory_mb` | usize | `50` | 10 | Memory limit for code interpreter (MB) |
-| `task_max_concurrent` | usize | `8` | 1 | Max concurrently running subagents (task tool) |
 
 ### `provider`
 
@@ -119,24 +112,99 @@ How many lines of output to show per tool in the UI. All values are `usize` with
 | `max_log_files` | u32 | `10` | 1 | Max number of log files to keep |
 | `input_history_size` | usize | `100` | 10 | Number of input history entries to retain |
 
-### `index`
+## Plugins
 
-| Field | Type | Default | Min | Description |
-|-------|------|---------|-----|-------------|
-| `max_file_size_mb` | u64 | `2` | 1 | Max file size for indexing (MB) |
+The `plugins` table turns plugins on or off and passes options to them. All bundled plugins are on by default. Set `enabled = false` to turn one off.
 
-## Tools
+Each plugin checks its own options at startup. A typo, a wrong type, or an unknown plugin name gives you a clear error right away.
 
-The `tools` table lets you turn tools on or off. By default `index`, `webfetch`, and `websearch` are on. `bash` is off by default.
+The edit plugin's extra tools are options too: `plugins.edit = { multiedit = false, edit_lines = true }`. The old `tools` table is gone. If your config still uses it, Maki stops at startup and shows you the new form.
 
 ```lua
 maki.setup({
-    tools = {
-        bash = { enabled = true },
+    plugins = {
+        bash = { timeout_secs = 180 },
         websearch = { enabled = false },
     },
 })
 ```
+
+### `plugins.bash`
+
+| Field | Type | Default | Min | Description |
+|-------|------|---------|-----|-------------|
+| `max_output_bytes` | integer | - | - | Override `agent.max_output_bytes` for this tool. |
+| `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool. |
+| `timeout_secs` | integer | `120` | 5 | Kill the command after this many seconds. A call's `timeout` param overrides it. |
+
+### `plugins.code_execution`
+
+| Field | Type | Default | Min | Description |
+|-------|------|---------|-----|-------------|
+| `max_memory_mb` | integer | `50` | 10 | Memory limit for the Python sandbox (MB). |
+| `max_output_bytes` | integer | - | - | Override `agent.max_output_bytes` for this tool. |
+| `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool. |
+| `timeout_secs` | integer | `30` | 5 | Stop the script after this many seconds. A call's `timeout` param overrides it. |
+
+### `plugins.edit`
+
+| Field | Type | Default | Min | Description |
+|-------|------|---------|-----|-------------|
+| `edit_lines` | boolean | `false` | - | Provide the opt-in `edit_lines` tool. |
+| `insert_lines` | boolean | `false` | - | Provide the opt-in `insert_lines` tool. |
+| `multiedit` | boolean | `true` | - | Provide the `multiedit` tool. |
+
+### `plugins.glob`
+
+| Field | Type | Default | Min | Description |
+|-------|------|---------|-----|-------------|
+| `max_output_bytes` | integer | - | - | Override `agent.max_output_bytes` for this tool. |
+| `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool. |
+| `search_result_limit` | integer | `100` | 10 | Max files returned per search. |
+
+### `plugins.grep`
+
+| Field | Type | Default | Min | Description |
+|-------|------|---------|-----|-------------|
+| `max_line_bytes` | integer | `500` | 80 | Skip lines longer than this many bytes. |
+| `max_output_bytes` | integer | - | - | Override `agent.max_output_bytes` for this tool. |
+| `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool. |
+| `search_result_limit` | integer | `100` | 10 | Max match groups per search. A call's `limit` param overrides it. |
+
+### `plugins.index`
+
+| Field | Type | Default | Min | Description |
+|-------|------|---------|-----|-------------|
+| `max_file_size_mb` | integer | `2` | 1 | Refuse to index files larger than this many MB. |
+
+### `plugins.read`
+
+| Field | Type | Default | Min | Description |
+|-------|------|---------|-----|-------------|
+| `max_line_bytes` | integer | `500` | 80 | Truncate lines longer than this many bytes. |
+| `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool. |
+
+### `plugins.task`
+
+| Field | Type | Default | Min | Description |
+|-------|------|---------|-----|-------------|
+| `max_concurrent` | integer | `8` | 1 | Max concurrently running subagents. |
+
+### `plugins.webfetch`
+
+| Field | Type | Default | Min | Description |
+|-------|------|---------|-----|-------------|
+| `max_output_bytes` | integer | - | - | Override `agent.max_output_bytes` for this tool. |
+| `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool. |
+| `max_response_bytes` | integer | `5242880` | 1024 | Stop reading a response after this many bytes. |
+
+### `plugins.websearch`
+
+| Field | Type | Default | Min | Description |
+|-------|------|---------|-----|-------------|
+| `max_output_bytes` | integer | - | - | Override `agent.max_output_bytes` for this tool. |
+| `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool. |
+| `max_response_bytes` | integer | `5242880` | 1024 | Stop reading a response after this many bytes. |
 
 ## Validation
 
@@ -179,42 +247,3 @@ On top of `AGENTS.md`, you can add your own instructions in two places:
 - `~/.config/maki/AGENTS.md` for preferences that apply to all projects
 
 Both are added to the system prompt at the start of every session.
-
-## Migrating from config.toml
-
-Still have a `config.toml`? Here is how to switch over.
-
-**Rename your config files:**
-
-```
-~/.config/maki/config.toml  ->  ~/.config/maki/init.lua
-.maki/config.toml           ->  .maki/init.lua
-```
-
-**Wrap the content in `maki.setup()`:**
-
-Before:
-
-```toml
-[agent]
-bash_timeout_secs = 180
-```
-
-After:
-
-```lua
-maki.setup({
-    agent = { bash_timeout_secs = 180 },
-})
-```
-
-Same field names, just Lua syntax instead of TOML.
-
-**Move MCP sections to `mcp.toml`.**
-
-- `~/.config/maki/mcp.toml` (global)
-- `.maki/mcp.toml` (per-project)
-
-Same format, just a different file. See [MCP](/docs/mcp/).
-
-**Permissions stay in `permissions.toml`.**

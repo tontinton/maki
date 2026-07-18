@@ -235,6 +235,18 @@ local function diff_result(edit_result, summary)
   }
 end
 
+local opts = maki.api.register_options({
+  multiedit = { default = true, desc = "Provide the `multiedit` tool." },
+  edit_lines = { default = false, desc = "Provide the opt-in `edit_lines` tool." },
+  insert_lines = { default = false, desc = "Provide the opt-in `insert_lines` tool." },
+})
+
+local function register_tool_if(enabled, tool)
+  if enabled then
+    maki.api.register_tool(tool)
+  end
+end
+
 maki.api.register_tool({
   name = "edit",
   kind = "edit",
@@ -286,7 +298,7 @@ maki.api.register_tool({
   end,
 })
 
-maki.api.register_tool({
+register_tool_if(opts.multiedit, {
   name = "multiedit",
   kind = "edit",
   mutable_path = "path",
@@ -372,7 +384,7 @@ maki.api.register_tool({
   end,
 })
 
-maki.api.register_tool({
+register_tool_if(opts.edit_lines, {
   name = "edit_lines",
   kind = "edit",
   mutable_path = "path",
@@ -426,7 +438,7 @@ maki.api.register_tool({
   end,
 })
 
-maki.api.register_tool({
+register_tool_if(opts.insert_lines, {
   name = "insert_lines",
   kind = "edit",
   mutable_path = "path",

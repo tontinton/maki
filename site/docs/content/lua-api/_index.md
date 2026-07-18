@@ -270,6 +270,41 @@ maki.api.register_prompt_hint({
 
 ---
 
+### `maki.api.register_options()` {#maki-api-register_options}
+
+```lua
+maki.api.register_options({spec})
+```
+
+Declare the options your plugin accepts under `plugins.<name>` in
+`maki.setup`, and get back what the user set merged with your defaults.
+Call it once, at the top level of your plugin file.
+
+An unknown key, a wrong type, or a value below `min` fails the plugin
+load with a clear message, so users catch typos right away. Bad specs
+fail the load too. The specs also feed the generated configuration docs.
+
+**Parameters:**
+
+- `{spec}` (`table`) Map of option name to a spec table:
+  - `default` (`boolean|number|string`) Optional. Used when the user sets nothing. Its Lua type becomes the option type.
+  - `type` (`string`) Required when there is no default: "boolean", "integer", "number", or "string".
+  - `min` (`number`) Optional. Minimum accepted value, numeric options only.
+  - `desc` (`string`) Required. One line shown in the configuration docs.
+
+**Returns:** (`table`) Merged options: the user's value where set, otherwise the default, or nil when neither exists.
+
+**Example:**
+
+```lua
+local opts = maki.api.register_options({
+  timeout_secs = { default = 120, min = 5, desc = "Kill the command after this many seconds." },
+  max_output_lines = { type = "integer", desc = "Override agent.max_output_lines for this tool." },
+})
+```
+
+---
+
 ### `maki.api.set_prompt()` {#maki-api-set_prompt}
 
 ```lua

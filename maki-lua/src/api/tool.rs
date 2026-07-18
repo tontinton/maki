@@ -28,6 +28,7 @@ use mlua::{
 };
 use serde_json::{Value, json};
 
+use crate::api::options::{PluginOpts, register_options__doc, register_options__register};
 use crate::api::ui::buf::{BufHandle, line_to_lua};
 use crate::api::util::command::{
     CommandEntry, CommandHandlerMap, LuaCommandWriter, publish_command_snapshot,
@@ -833,9 +834,9 @@ lua_table! {
     /// maki.api.register_tool({ name = "greet", ... })
     /// maki.api.register_prompt_hint({ slot = "tool_usage", content = "..." })
     /// ```
-    extend "maki.api" => pub(crate) fn add_tool_fns(pending: PendingTools, plugin: Arc<str>), DOCS [
+    extend "maki.api" => pub(crate) fn add_tool_fns(pending: PendingTools, plugin: Arc<str>, opts: PluginOpts), DOCS [
         register_tool(pending), register_command(plugin), register_prompt_hint(plugin),
-        set_prompt(plugin), get_tools, get_tool,
+        register_options(plugin, opts), set_prompt(plugin), get_tools, get_tool,
     ]
 }
 
@@ -843,9 +844,10 @@ pub(crate) fn create_api_table(
     lua: &Lua,
     pending: PendingTools,
     plugin: Arc<str>,
+    opts: PluginOpts,
 ) -> LuaResult<Table> {
     let t = lua.create_table()?;
-    add_tool_fns(&t, lua, pending, plugin)?;
+    add_tool_fns(&t, lua, pending, plugin, opts)?;
     Ok(t)
 }
 

@@ -2,10 +2,20 @@ local truncate = require("maki.truncate")
 local ToolView = require("maki.tool_view")
 local shorten_path = require("maki.shorten_path")
 local color = require("maki.color")
+local output_limits = require("maki.output_limits")
 
 local NO_MATCHES = "No files found"
 local MAX_PER_CALL_LIMIT = 1000
 local DIM_FACTOR = 0.3
+
+local opts = maki.api.register_options(output_limits.extend({
+  search_result_limit = {
+    default = 100,
+    min = 10,
+    desc = "Max match groups per search. A call's `limit` param overrides it.",
+  },
+  max_line_bytes = { default = 500, min = 80, desc = "Skip lines longer than this many bytes." },
+}))
 
 local function has_context(groups)
   for _, group in ipairs(groups) do
@@ -239,14 +249,11 @@ maki.api.register_tool({
     end
     pattern = pattern:gsub('"$', "")
 
-    local config = ctx:config()
-    local search_limit = (config and config.search_result_limit) or 100
-    local max_lines = (config and config.max_output_lines) or 2000
-    local max_bytes = (config and config.max_output_bytes) or (50 * 1024)
+    local max_lines, max_bytes = output_limits.resolve(opts, ctx)
 
-    local limit = math.min(input.limit or search_limit, MAX_PER_CALL_LIMIT)
+    local limit = math.min(input.limit or opts.search_result_limit, MAX_PER_CALL_LIMIT)
 
-    local max_line_bytes = config and config.max_line_bytes
+    local max_line_bytes = opts.max_line_bytes
 
     local entries, err = maki.fs.grep(pattern, {
       path = input.path,

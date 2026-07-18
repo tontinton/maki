@@ -5,6 +5,10 @@ local shorten_path = require("maki.shorten_path")
 local TRUNCATED_SUFFIX = indexer.TRUNCATED_SUFFIX
 local TRUNCATED_INFIX = " more truncated]"
 
+local opts = maki.api.register_options({
+  max_file_size_mb = { default = 2, min = 1, desc = "Refuse to index files larger than this many MB." },
+})
+
 local function split_trailing_range(line)
   local pos = line:find(" %[%d[%d%-,]*%]$")
   if not pos then
@@ -202,7 +206,7 @@ Return a compact overview of a source file: imports, type definitions, function 
       end
     end
 
-    local max_file_size = ctx:config("index_max_file_size", (2 * 1024 * 1024))
+    local max_file_size = opts.max_file_size_mb * 1024 * 1024
     if meta and meta.size > max_file_size then
       return {
         llm_output = "error: File too large ("

@@ -1,9 +1,13 @@
 local truncate = require("maki.truncate")
 local ToolView = require("maki.tool_view")
 local shorten_path = require("maki.shorten_path")
+local output_limits = require("maki.output_limits")
 
-local DEFAULT_SEARCH_LIMIT = 100
 local NO_FILES_FOUND = "No files found"
+
+local opts = maki.api.register_options(output_limits.extend({
+  search_result_limit = { default = 100, min = 10, desc = "Max files returned per search." },
+}))
 
 local function glob_view_opts(ctx)
   local tol = ctx:tool_output_lines()
@@ -48,9 +52,8 @@ maki.api.register_tool({
       return { llm_output = "error: pattern is required", is_error = true }
     end
 
-    local limit = ctx:config("search_result_limit", DEFAULT_SEARCH_LIMIT)
-    local max_lines = ctx:config("max_output_lines", 2000)
-    local max_bytes = ctx:config("max_output_bytes", (50 * 1024))
+    local limit = opts.search_result_limit
+    local max_lines, max_bytes = output_limits.resolve(opts, ctx)
 
     local files, err = maki.fs.glob(pattern, {
       path = input.path,

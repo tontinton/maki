@@ -126,6 +126,7 @@ mod tests {
             Arc::from("docs-test"),
             Some(ui_tx),
             &PluginPermissions::trusted(),
+            Arc::default(),
         )
         .unwrap();
 

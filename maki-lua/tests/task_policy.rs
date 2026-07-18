@@ -28,6 +28,8 @@ const TASK_PROMPT: &str = "do the thing";
 const PLAIN_TEXT: &str = "plain text result";
 const PROMPT_ERR_MSG: &str = "model exploded";
 const RAISE_MSG: &str = "stub prompt kaboom";
+/// Mirrors the task plugin's `max_concurrent` default.
+const TASK_DEFAULT_MAX_CONCURRENT: u64 = 8;
 
 const SCENARIO_PLAIN: &str = "plain";
 const SCENARIO_HAPPY: &str = "happy";
@@ -140,7 +142,6 @@ maki.api.register_tool({
       first_err = recorder.first_err,
       second_ack = recorder.second_ack,
       second_err = recorder.second_err,
-      task_cap = ctx:config().task_max_concurrent,
       acquired = recorder.acquired,
       released = recorder.released,
       sem_size = recorder.sem_size,
@@ -355,11 +356,10 @@ fn raising_prompt_does_not_leak_semaphore_permit() {
     assert!(err.contains(RAISE_MSG), "got: {err}");
 
     let snap = probe(&reg);
-    let cap = snap["task_cap"].as_u64().expect("task_cap missing");
     assert_eq!(
         snap["sem_size"],
-        json!(cap),
-        "semaphore not sized from config"
+        json!(TASK_DEFAULT_MAX_CONCURRENT),
+        "semaphore not sized from the default max_concurrent option"
     );
     assert_eq!(snap["acquired"], json!(1));
     assert_eq!(snap["released"], json!(1), "permit not explicitly released");

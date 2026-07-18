@@ -72,7 +72,12 @@ local examples = {
   },
 }
 
-local semaphore
+local opts = maki.api.register_options({
+  max_concurrent = { default = 8, min = 1, desc = "Max concurrently running subagents." },
+})
+
+-- Process-wide cap on concurrent subagents.
+local semaphore = maki.async.semaphore(opts.max_concurrent)
 
 local function bounded_errors(errors)
   local out = {}
@@ -144,10 +149,6 @@ local function handler(input, ctx)
     }
   end
 
-  -- Process-wide cap on concurrent subagents, sized from config on first use.
-  if not semaphore then
-    semaphore = maki.async.semaphore(math.max(ctx:config("task_max_concurrent", 1), 1))
-  end
   local permit = semaphore:acquire()
 
   -- pcall so a raised error cannot leak the permit.

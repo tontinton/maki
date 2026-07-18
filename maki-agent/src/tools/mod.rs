@@ -361,13 +361,13 @@ pub fn truncate_output(text: String, max_lines: usize, max_bytes: usize) -> Stri
 }
 
 pub fn is_builtin_tool(name: &str) -> bool {
-    maki_config::DEFAULT_BUILTINS.contains(&name) || maki_config::OPT_IN_TOOLS.contains(&name)
+    maki_config::DEFAULT_BUILTINS.contains(&name) || maki_config::EDIT_SUB_TOOLS.contains(&name)
 }
 
 pub fn all_builtin_tool_names() -> Vec<&'static str> {
     maki_config::DEFAULT_BUILTINS
         .iter()
-        .chain(maki_config::OPT_IN_TOOLS.iter())
+        .chain(maki_config::EDIT_SUB_TOOLS.iter())
         .copied()
         .collect()
 }

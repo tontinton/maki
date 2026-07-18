@@ -1,11 +1,13 @@
 use std::fmt::Write;
+use std::sync::Arc;
 
+use maki_agent::tools::ToolRegistry;
 use maki_config::{
-    AgentConfig, ConfigField, DEFAULT_BASH_TIMEOUT_SECS, DEFAULT_MAX_FILE_SIZE_MB,
-    DEFAULT_MAX_LOG_FILES, DEFAULT_MAX_OUTPUT_LINES, DEFAULT_MOUSE_SCROLL_LINES, INDEX_FIELDS,
-    MIN_TOOL_OUTPUT_LINES, ProviderConfig, StorageConfig, TOP_LEVEL_FIELDS, ToolOutputLines,
-    UiConfig,
+    AgentConfig, ConfigField, DEFAULT_MAX_LOG_FILES, DEFAULT_MAX_OUTPUT_LINES,
+    DEFAULT_MOUSE_SCROLL_LINES, MIN_TOOL_OUTPUT_LINES, ProviderConfig, StorageConfig,
+    TOP_LEVEL_FIELDS, ToolOutputLines, UiConfig,
 };
+use maki_lua::{PluginHost, PluginOptionSpecs};
 
 fn write_table_with_min(out: &mut String, fields: &[ConfigField]) {
     writeln!(out, "| Field | Type | Default | Min | Description |").unwrap();
@@ -66,6 +68,41 @@ fn write_section(out: &mut String, heading: &str, fields: &[ConfigField]) {
     writeln!(out).unwrap();
 }
 
+fn write_plugin_options(out: &mut String, specs: &PluginOptionSpecs) {
+    for (plugin, options) in specs {
+        writeln!(out, "### `plugins.{plugin}`\n").unwrap();
+        writeln!(out, "| Field | Type | Default | Min | Description |").unwrap();
+        writeln!(out, "|-------|------|---------|-----|-------------|").unwrap();
+        for o in options {
+            let default = o
+                .default
+                .as_ref()
+                .map_or("-".to_string(), |d| format!("`{d}`"));
+            let min = o.min.map_or("-".to_string(), |m| m.to_string());
+            writeln!(
+                out,
+                "| `{name}` | {ty} | {default} | {min} | {desc} |",
+                name = o.name,
+                ty = o.ty,
+                desc = o.desc,
+            )
+            .unwrap();
+        }
+        writeln!(out).unwrap();
+    }
+}
+
+fn collect_plugin_options() -> PluginOptionSpecs {
+    let host =
+        PluginHost::with_all_builtins(Arc::new(ToolRegistry::new())).expect("loading builtins");
+    let specs = host.plugin_options().expect("collecting plugin options");
+    assert!(
+        !specs.is_empty(),
+        "no plugin declared options; the plugins reference would be empty"
+    );
+    specs
+}
+
 fn write_tool_output_section(out: &mut String) {
     writeln!(out, "### `ui.tool_output_lines`\n").unwrap();
     writeln!(
@@ -119,7 +156,6 @@ maki.setup({{
         }},
     }},
     agent = {{
-        bash_timeout_secs = {bash_timeout},
         max_output_lines = {max_output_lines},
     }},
     provider = {{
@@ -128,8 +164,9 @@ maki.setup({{
     storage = {{
         max_log_files = {max_log_files},
     }},
-    index = {{
-        max_file_size_mb = {max_file_size},
+    plugins = {{
+        bash = {{ timeout_secs = 180 }},
+        index = {{ max_file_size_mb = 4 }},
     }},
 }})
 ```
@@ -143,10 +180,8 @@ All fields are optional. Typos in field names cause an error right away.
         mouse_scroll = DEFAULT_MOUSE_SCROLL_LINES + 2,
         tol_bash = ToolOutputLines::DEFAULT.bash + 3,
         tol_read = ToolOutputLines::DEFAULT.read + 2,
-        bash_timeout = DEFAULT_BASH_TIMEOUT_SECS + 60,
         max_output_lines = DEFAULT_MAX_OUTPUT_LINES + 1000,
         max_log_files = DEFAULT_MAX_LOG_FILES / 2,
-        max_file_size = DEFAULT_MAX_FILE_SIZE_MB + 2,
     )
     .unwrap();
 
@@ -159,14 +194,20 @@ All fields are optional. Typos in field names cause an error right away.
     write_section(&mut out, "[agent]", AgentConfig::FIELDS);
     write_section(&mut out, "[provider]", ProviderConfig::FIELDS);
     write_section(&mut out, "[storage]", StorageConfig::FIELDS);
-    write_section(&mut out, "[index]", INDEX_FIELDS);
 
-    writeln!(out, "## Tools\n").unwrap();
+    writeln!(out, "## Plugins\n").unwrap();
     writeln!(
         out,
-        "The `tools` table lets you turn tools on or off. \
-         By default `index`, `webfetch`, and `websearch` are on. \
-         `bash` is off by default.\n"
+        "The `plugins` table turns plugins on or off and passes options to \
+         them. All bundled plugins are on by default. Set \
+         `enabled = false` to turn one off.\n\n\
+         Each plugin checks its own options at startup. A typo, a wrong \
+         type, or an unknown plugin name gives you a clear error right \
+         away.\n\n\
+         The edit plugin's extra tools are options too: \
+         `plugins.edit = {{ multiedit = false, edit_lines = true }}`. \
+         The old `tools` table is gone. If your config still uses it, \
+         Maki stops at startup and shows you the new form.\n"
     )
     .unwrap();
     writeln!(
@@ -174,14 +215,16 @@ All fields are optional. Typos in field names cause an error right away.
         "\
 ```lua
 maki.setup({{
-    tools = {{
-        bash = {{ enabled = true }},
+    plugins = {{
+        bash = {{ timeout_secs = 180 }},
         websearch = {{ enabled = false }},
     }},
 }})
 ```\n"
     )
     .unwrap();
+
+    write_plugin_options(&mut out, &collect_plugin_options());
 
     writeln!(out, "## Validation\n").unwrap();
     writeln!(
@@ -230,46 +273,7 @@ On top of `AGENTS.md`, you can add your own instructions in two places:
 - `AGENTS.local.md` at project root for per-project preferences (gitignored)
 - `~/.config/maki/AGENTS.md` for preferences that apply to all projects
 
-Both are added to the system prompt at the start of every session.
-
-## Migrating from config.toml
-
-Still have a `config.toml`? Here is how to switch over.
-
-**Rename your config files:**
-
-```
-~/.config/maki/config.toml  ->  ~/.config/maki/init.lua
-.maki/config.toml           ->  .maki/init.lua
-```
-
-**Wrap the content in `maki.setup()`:**
-
-Before:
-
-```toml
-[agent]
-bash_timeout_secs = 180
-```
-
-After:
-
-```lua
-maki.setup({{
-    agent = {{ bash_timeout_secs = 180 }},
-}})
-```
-
-Same field names, just Lua syntax instead of TOML.
-
-**Move MCP sections to `mcp.toml`.**
-
-- `~/.config/maki/mcp.toml` (global)
-- `.maki/mcp.toml` (per-project)
-
-Same format, just a different file. See [MCP](/docs/mcp/).
-
-**Permissions stay in `permissions.toml`.**"
+Both are added to the system prompt at the start of every session."
     )
     .unwrap();
 
