@@ -21,6 +21,9 @@ use tracing::{info, warn};
 
 pub(super) const MAX_REDIRECTS: u32 = 10;
 const SESSION_HEADER: &str = "mcp-session-id";
+const PROTOCOL_HEADER: &str = "mcp-protocol-version";
+const INITIALIZE_METHOD: &str = "initialize";
+const PROTOCOL_VERSION_KEY: &str = "protocolVersion";
 const CT_JSON: &str = "application/json";
 const CT_SSE: &str = "text/event-stream";
 const ACCEPT_VALUE: &str = "application/json, text/event-stream";
@@ -32,8 +35,16 @@ pub struct HttpTransport {
     headers: HashMap<String, String>,
     auth: Mutex<Option<String>>,
     storage: Option<StateDir>,
-    session_id: Mutex<Option<String>>,
+    negotiated: Mutex<Negotiated>,
     next_id: AtomicU64,
+}
+
+/// The server picks both during initialize and the spec wants them echoed as
+/// headers on every later request, so one lock keeps them in sync.
+#[derive(Clone, Default)]
+struct Negotiated {
+    session_id: Option<String>,
+    protocol_version: Option<String>,
 }
 
 impl HttpTransport {
@@ -71,7 +82,7 @@ impl HttpTransport {
             headers,
             auth: Mutex::new(auth),
             storage,
-            session_id: Mutex::new(None),
+            negotiated: Mutex::new(Negotiated::default()),
             next_id: AtomicU64::new(1),
         })
     }
@@ -82,18 +93,23 @@ impl HttpTransport {
 
     fn build_request(
         &self,
+        method: Method,
         body: Vec<u8>,
-        session_id: Option<&str>,
+        negotiated: &Negotiated,
         auth: Option<&str>,
     ) -> Result<Request<Vec<u8>>, McpError> {
         let mut builder = Request::builder()
-            .method(Method::POST)
+            .method(method)
             .uri(&self.url)
             .header(CONTENT_TYPE, CT_JSON)
             .header(ACCEPT, ACCEPT_VALUE);
 
-        if let Some(sid) = session_id {
+        if let Some(sid) = &negotiated.session_id {
             builder = builder.header(SESSION_HEADER, sid);
+        }
+
+        if let Some(version) = &negotiated.protocol_version {
+            builder = builder.header(PROTOCOL_HEADER, version);
         }
 
         if let Some(auth) = auth {
@@ -137,21 +153,25 @@ impl HttpTransport {
         .await
     }
 
-    fn parse_rpc_response(&self, body_str: &str, content_type: &str) -> Result<Value, McpError> {
-        let rpc_value: Value = if content_type.contains(CT_SSE) {
+    fn parse_rpc_response(&self, body_str: &str, is_sse: bool, id: u64) -> Result<Value, McpError> {
+        let events = if is_sse {
             parse_sse_events(body_str)
-                .into_iter()
-                .next()
-                .ok_or_else(|| McpError::InvalidResponse {
-                    server: self.server(),
-                    reason: "no SSE events in response".into(),
-                })?
         } else {
-            serde_json::from_str(body_str).map_err(|e| McpError::InvalidResponse {
-                server: self.server(),
-                reason: e.to_string(),
-            })?
+            vec![
+                serde_json::from_str(body_str).map_err(|e| McpError::InvalidResponse {
+                    server: self.server(),
+                    reason: e.to_string(),
+                })?,
+            ]
         };
+
+        let rpc_value = events
+            .into_iter()
+            .find(|e| is_response_to(e, id))
+            .ok_or_else(|| McpError::InvalidResponse {
+                server: self.server(),
+                reason: format!("no response matching request id {id}"),
+            })?;
 
         let resp: JsonRpcResponse =
             serde_json::from_value(rpc_value).map_err(|e| McpError::InvalidResponse {
@@ -168,14 +188,6 @@ impl HttpTransport {
         }
 
         Ok(resp.result.unwrap_or(Value::Null))
-    }
-
-    async fn capture_session_id(&self, headers: &HeaderMap) {
-        if let Some(sid) = headers.get(SESSION_HEADER)
-            && let Ok(sid_str) = sid.to_str()
-        {
-            *self.session_id.lock().await = Some(sid_str.to_string());
-        }
     }
 
     /// Single-flight token refresh after a 401. Holds the `auth` lock across the
@@ -230,10 +242,9 @@ impl McpTransport for HttpTransport {
             let mut refreshed = false;
 
             loop {
-                let session_id = self.session_id.lock().await.clone();
-
+                let negotiated = self.negotiated.lock().await.clone();
                 let http_req =
-                    self.build_request(encode()?, session_id.as_deref(), auth.as_deref())?;
+                    self.build_request(Method::POST, encode()?, &negotiated, auth.as_deref())?;
 
                 let (status, headers, body_str) = self.send_http(http_req).await?;
 
@@ -265,15 +276,25 @@ impl McpTransport for HttpTransport {
                     });
                 }
 
-                self.capture_session_id(&headers).await;
-
                 let is_sse = headers
                     .get(CONTENT_TYPE)
                     .and_then(|v| v.to_str().ok())
                     .is_some_and(|ct| ct.contains(CT_SSE));
 
-                let result =
-                    self.parse_rpc_response(&body_str, if is_sse { CT_SSE } else { CT_JSON });
+                let result = self.parse_rpc_response(&body_str, is_sse, id);
+
+                {
+                    let mut negotiated = self.negotiated.lock().await;
+                    if let Some(sid) = headers.get(SESSION_HEADER).and_then(|v| v.to_str().ok()) {
+                        negotiated.session_id = Some(sid.to_string());
+                    }
+                    if method == INITIALIZE_METHOD
+                        && let Ok(val) = &result
+                        && let Some(version) = val.get(PROTOCOL_VERSION_KEY).and_then(Value::as_str)
+                    {
+                        negotiated.protocol_version = Some(version.to_string());
+                    }
+                }
 
                 info!(server = %self.server(), method, status = %status, refreshed, duration_ms = start.elapsed().as_millis() as u64, "MCP HTTP request");
 
@@ -294,9 +315,9 @@ impl McpTransport for HttpTransport {
                 reason: e.to_string(),
             })?;
 
-            let session_id = self.session_id.lock().await.clone();
+            let negotiated = self.negotiated.lock().await.clone();
             let auth = self.auth.lock().await.clone();
-            let http_req = self.build_request(body, session_id.as_deref(), auth.as_deref())?;
+            let http_req = self.build_request(Method::POST, body, &negotiated, auth.as_deref())?;
 
             let (status, _, _) = self.send_http(http_req).await?;
 
@@ -314,16 +335,17 @@ impl McpTransport for HttpTransport {
 
     fn shutdown<'a>(&'a self) -> BoxFuture<'a, ()> {
         Box::pin(async move {
-            let session_id = self.session_id.lock().await.clone();
-            let Some(sid) = session_id else { return };
+            let negotiated = self.negotiated.lock().await.clone();
+            if negotiated.session_id.is_none() {
+                return;
+            }
 
-            let req = Request::builder()
-                .method(Method::DELETE)
-                .uri(&self.url)
-                .header(SESSION_HEADER, &sid)
-                .body(Vec::new());
-
-            let Ok(req) = req else { return };
+            let auth = self.auth.lock().await.clone();
+            let Ok(req) =
+                self.build_request(Method::DELETE, Vec::new(), &negotiated, auth.as_deref())
+            else {
+                return;
+            };
 
             let client = self.client.clone();
             let _ = smol::unblock(move || client.send(req)).await;
@@ -336,6 +358,17 @@ impl McpTransport for HttpTransport {
 
     fn transport_kind(&self) -> &'static str {
         "http"
+    }
+}
+
+/// A null or missing id only counts for errors: that is what JSON-RPC sends
+/// back when it could not parse the request itself.
+fn is_response_to(event: &Value, id: u64) -> bool {
+    match event.get("id").and_then(Value::as_u64) {
+        Some(event_id) => {
+            event_id == id && (event.get("result").is_some() || event.get("error").is_some())
+        }
+        None => event.get("error").is_some(),
     }
 }
 
@@ -386,13 +419,26 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::atomic::AtomicUsize;
 
-    const RPC_OK: &str = r#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#;
+    const NOTIFICATION: &str =
+        "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{}}\n\n";
+    const REQUEST_ID: u64 = 7;
+    const RESPONSE_EVENT: &str =
+        "data: {\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"ok\":true}}\n\n";
+    const STALE_RESPONSE_EVENT: &str =
+        "data: {\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"stale\":true}}\n\n";
+    const NULL_ID_ERROR_EVENT: &str = "data: {\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32700,\"message\":\"parse error\"}}\n\n";
+    const NEGOTIATED_VERSION: &str = "2025-03-26";
     const OLD_BEARER: &str = "Bearer old-token";
     const NEW_BEARER: &str = "Bearer new-token";
+
+    fn rpc_ok(id: u64) -> String {
+        format!(r#"{{"jsonrpc":"2.0","id":{id},"result":{{"ok":true}}}}"#)
+    }
 
     struct Req {
         path: String,
         auth: Option<String>,
+        protocol: Option<String>,
     }
 
     fn spawn_server<F>(make_handler: impl FnOnce(String) -> F) -> String
@@ -415,6 +461,7 @@ mod tests {
 
                 let path = line.split_whitespace().nth(1).unwrap_or("/").to_string();
                 let mut auth = None;
+                let mut protocol = None;
                 let mut content_length = 0usize;
 
                 loop {
@@ -431,13 +478,19 @@ mod tests {
                         auth = Some(header[start..].trim().to_string());
                     } else if let Some(v) = lower.strip_prefix("content-length:") {
                         content_length = v.trim().parse().unwrap_or(0);
+                    } else if let Some(v) = lower.strip_prefix("mcp-protocol-version:") {
+                        protocol = Some(v.trim().to_string());
                     }
                 }
 
                 let mut body = vec![0u8; content_length];
                 let _ = std::io::Read::read_exact(&mut reader, &mut body);
 
-                let (status, resp_body) = handler(&Req { path, auth });
+                let (status, resp_body) = handler(&Req {
+                    path,
+                    auth,
+                    protocol,
+                });
 
                 let response = format!(
                     "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp_body}",
@@ -518,6 +571,73 @@ mod tests {
         assert_eq!(events, expected);
     }
 
+    #[test_case(&format!("{NOTIFICATION}{RESPONSE_EVENT}"),         true,  Some(json!({"ok": true})) ; "sse_skips_interleaved_notifications")]
+    #[test_case(&format!("{STALE_RESPONSE_EVENT}{RESPONSE_EVENT}"), true,  Some(json!({"ok": true})) ; "sse_skips_stale_response_ids")]
+    #[test_case(NOTIFICATION,                                       true,  None                      ; "sse_notification_only_rejected")]
+    #[test_case(&rpc_ok(3),                                         false, None                      ; "json_wrong_id_rejected")]
+    fn response_id_matching(body: &str, is_sse: bool, expected: Option<Value>) {
+        let transport = transport_with("http://127.0.0.1:1/mcp", HashMap::new(), None);
+        let result = transport.parse_rpc_response(body, is_sse, REQUEST_ID);
+        match expected {
+            Some(value) => assert_eq!(result.unwrap(), value),
+            None => assert!(matches!(
+                result.unwrap_err(),
+                McpError::InvalidResponse { .. }
+            )),
+        }
+    }
+
+    #[test]
+    fn null_id_error_event_maps_to_rpc_error() {
+        let transport = transport_with("http://127.0.0.1:1/mcp", HashMap::new(), None);
+        let err = transport
+            .parse_rpc_response(NULL_ID_ERROR_EVENT, true, REQUEST_ID)
+            .unwrap_err();
+        assert!(matches!(err, McpError::RpcError { code: -32700, .. }));
+    }
+
+    #[test]
+    fn build_request_applies_all_headers() {
+        let headers = HashMap::from([("x-custom".to_string(), "yes".to_string())]);
+        let transport = transport_with("http://127.0.0.1:1/mcp", headers, None);
+        let negotiated = Negotiated {
+            session_id: Some("sid".to_string()),
+            protocol_version: Some(NEGOTIATED_VERSION.to_string()),
+        };
+
+        let req = transport
+            .build_request(Method::POST, Vec::new(), &negotiated, Some(OLD_BEARER))
+            .unwrap();
+
+        let headers = req.headers();
+        assert_eq!(headers.get(SESSION_HEADER).unwrap(), "sid");
+        assert_eq!(headers.get(PROTOCOL_HEADER).unwrap(), NEGOTIATED_VERSION);
+        assert_eq!(headers.get(AUTHORIZATION).unwrap(), OLD_BEARER);
+        assert_eq!(headers.get("x-custom").unwrap(), "yes");
+    }
+
+    #[test]
+    fn server_negotiated_protocol_version_echoed_after_initialize() {
+        let base = spawn_server(|_| {
+            move |req: &Req| match req.protocol.as_deref() {
+                None => (
+                    200,
+                    format!(
+                        r#"{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":"{NEGOTIATED_VERSION}"}}}}"#
+                    ),
+                ),
+                Some(NEGOTIATED_VERSION) => (200, rpc_ok(2)),
+                Some(_) => (400, String::new()),
+            }
+        });
+
+        let transport = transport_with(&format!("{base}/mcp"), HashMap::new(), None);
+        smol::block_on(transport.send_request("initialize", None)).unwrap();
+
+        let result = smol::block_on(transport.send_request("tools/list", None)).unwrap();
+        assert_eq!(result, json!({"ok": true}));
+    }
+
     #[test]
     fn refreshes_token_and_retries_on_401() {
         let tmp = tempfile::tempdir().unwrap();
@@ -529,7 +649,7 @@ mod tests {
                     return resp;
                 }
                 if req.auth.as_deref() == Some(NEW_BEARER) {
-                    (200, RPC_OK.into())
+                    (200, rpc_ok(1))
                 } else {
                     (401, String::new())
                 }
@@ -571,7 +691,7 @@ mod tests {
         let base = spawn_server(|_| {
             move |req: &Req| {
                 if req.auth.as_deref() == Some(OLD_BEARER) {
-                    (200, RPC_OK.into())
+                    (200, rpc_ok(1))
                 } else {
                     (401, String::new())
                 }
@@ -592,7 +712,7 @@ mod tests {
         let base = spawn_server(|_| {
             move |req: &Req| {
                 if req.auth.as_deref() == Some(OLD_BEARER) {
-                    (200, RPC_OK.into())
+                    (200, rpc_ok(1))
                 } else {
                     (401, String::new())
                 }
