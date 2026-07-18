@@ -31,6 +31,7 @@ flume = { workspace = true }
 futures = { workspace = true }
 futures-lite = { workspace = true }
 tree-sitter = { workspace = true }
+unicode-width = { workspace = true }
 regex = { workspace = true }
 include_dir = { workspace = true }
 maki-storage = { workspace = true }

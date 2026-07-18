@@ -4314,6 +4314,52 @@ or simulating user interaction from code.
 buf:click({ row = 1 })
 ```
 
+---
+
+### `Buf:blit()` {#Buf-blit}
+
+```lua
+Buf:blit({fb}, {width}, {height}, {opts?})
+```
+
+Replaces the whole buffer with a pixel frame drawn as `"▀"` cells.
+Each cell's foreground is the top pixel and its background the
+bottom one, so one text line fits two pixel rows. When {height} is
+odd the last line leaves its background unset and the terminal
+default shows through.
+
+{fb} is a Luau `buffer` of raw pixel bytes in row-major order,
+top-left origin. Its size must be exactly
+`width * height * bytes_per_pixel` for the chosen format, otherwise
+the call throws. A mismatch usually means a wrong width or format,
+and an early error beats hunting down a garbled frame.
+
+Formats: "rgb" is the default at 3 bytes per pixel. "rgba" and
+"bgra" take 4 bytes per pixel and ignore the 4th byte. "bgra" is
+what a little-endian `uint32` holding `0xRRGGBB` looks like in
+memory, the layout doomgeneric uses for its framebuffer.
+
+`char` swaps the `"▀"` glyph for another one column wide string,
+e.g. `"█"` when only the foreground color should show. The
+foreground still comes from the top pixel and the background from
+the bottom one, whatever the glyph.
+
+**Parameters:**
+
+- `{fb}` (`buffer`) Raw pixel bytes.
+- `{width}` (`integer`) Frame width in pixels, > 0.
+- `{height}` (`integer`) Frame height in pixels, > 0.
+- `{opts?}` (`table|nil`) Options: `format` = "rgb"|"rgba"|"bgra", `char` = one column wide string.
+
+**Example:**
+
+```lua
+local fb = buffer.create(160 * 100 * 3)
+buffer.writeu8(fb, (y * 160 + x) * 3, 255) -- red channel
+buf:blit(fb, 160, 100)
+buf:blit(fb32, 160, 100, { format = "bgra", char = "█" })
+```
+
 
 ## maki.uv {#maki-uv}
 

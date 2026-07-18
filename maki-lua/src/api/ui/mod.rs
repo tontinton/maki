@@ -12,6 +12,7 @@ use crate::api::util::command::{
     WinCommand, WinEvent,
 };
 use crate::docs::{FnDoc, ParamDoc};
+pub(crate) mod blit;
 pub(crate) mod buf;
 pub(crate) mod win;
 

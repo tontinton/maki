@@ -6,6 +6,7 @@ use maki_agent::{SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle};
 use maki_lua_macro::{lua_class, lua_fn};
 use mlua::{Function, Lua, Result as LuaResult, Table, Value as LuaValue};
 
+use super::blit;
 use crate::runtime::{TaskHandle, lock_cell};
 
 /// `live_buf` tracks the first buffer a handler creates, the one
@@ -298,6 +299,69 @@ async fn click(_lua: Lua, this: mlua::UserDataRef<BufHandle>, ev: LuaValue) -> L
     }
 }
 
+/// Replaces the whole buffer with a pixel frame drawn as `"▀"` cells.
+/// Each cell's foreground is the top pixel and its background the
+/// bottom one, so one text line fits two pixel rows. When {height} is
+/// odd the last line leaves its background unset and the terminal
+/// default shows through.
+///
+/// {fb} is a Luau `buffer` of raw pixel bytes in row-major order,
+/// top-left origin. Its size must be exactly
+/// `width * height * bytes_per_pixel` for the chosen format, otherwise
+/// the call throws. A mismatch usually means a wrong width or format,
+/// and an early error beats hunting down a garbled frame.
+///
+/// Formats: "rgb" is the default at 3 bytes per pixel. "rgba" and
+/// "bgra" take 4 bytes per pixel and ignore the 4th byte. "bgra" is
+/// what a little-endian `uint32` holding `0xRRGGBB` looks like in
+/// memory, the layout doomgeneric uses for its framebuffer.
+///
+/// `char` swaps the `"▀"` glyph for another one column wide string,
+/// e.g. `"█"` when only the foreground color should show. The
+/// foreground still comes from the top pixel and the background from
+/// the bottom one, whatever the glyph.
+///
+/// @param fb buffer Raw pixel bytes.
+/// @param width integer Frame width in pixels, > 0.
+/// @param height integer Frame height in pixels, > 0.
+/// @param opts table|nil Options: `format` = "rgb"|"rgba"|"bgra", `char` = one column wide string.
+/// @return
+/// @example
+/// local fb = buffer.create(160 * 100 * 3)
+/// buffer.writeu8(fb, (y * 160 + x) * 3, 255) -- red channel
+/// buf:blit(fb, 160, 100)
+/// buf:blit(fb32, 160, 100, { format = "bgra", char = "█" })
+#[lua_fn]
+fn blit(
+    _lua: &Lua,
+    this: &BufHandle,
+    fb: mlua::Buffer,
+    width: u32,
+    height: u32,
+    opts: Option<Table>,
+) -> LuaResult<()> {
+    let mut format = blit::DEFAULT_FORMAT.to_owned();
+    let mut cell = blit::DEFAULT_CELL.to_owned();
+    if let Some(opts) = opts {
+        for pair in opts.pairs::<String, String>() {
+            match pair? {
+                (key, val) if key == "format" => format = val,
+                (key, val) if key == "char" => cell = val,
+                (key, _) => {
+                    return Err(mlua::Error::runtime(format!(
+                        "blit: unknown opts key {key:?}"
+                    )));
+                }
+            }
+        }
+    }
+    let fmt = blit::parse_format(&format).map_err(mlua::Error::external)?;
+    let lines = blit::render(&fb.to_vec(), width as usize, height as usize, fmt, &cell)
+        .map_err(mlua::Error::external)?;
+    this.buf.set_lines(lines);
+    Ok(())
+}
+
 lua_class! {
     /// A content buffer that holds styled lines of text. Create one with
     /// `maki.ui.buf()` and pass it to `maki.ui.open_win()` to show it in
@@ -308,7 +372,7 @@ lua_class! {
     /// buf:line("hello")
     /// buf:line({ { "world", "bold" } })
     /// ```
-    "maki.ui.Buf" => BufHandle, DOCS [line, lines, set_lines, len, get_lines, on, click]
+    "maki.ui.Buf" => BufHandle, DOCS [line, lines, set_lines, len, get_lines, on, click, blit]
 }
 
 pub(crate) fn parse_line(arg: &LuaValue) -> LuaResult<SnapshotLine> {
@@ -924,6 +988,43 @@ mod tests {
             .eval()
             .unwrap();
         assert_eq!(text, "toggled");
+    }
+
+    #[test]
+    fn blit_replaces_content_with_rendered_frame() {
+        let lua = test_lua();
+        set_buf_global(&lua);
+
+        lua.load(
+            r#"
+            buf:set_lines({ "a", "b", "c" })
+            local fb = buffer.create(2 * 2 * 3)
+            buffer.writeu8(fb, 0, 255)
+            buffer.writeu8(fb, 4, 255)
+            buffer.writeu8(fb, 8, 255)
+            buf:blit(fb, 2, 2)
+            "#,
+        )
+        .exec()
+        .unwrap();
+
+        let mut bytes = [0u8; 12];
+        (bytes[0], bytes[4], bytes[8]) = (255, 255, 255);
+        let fmt = blit::parse_format(blit::DEFAULT_FORMAT).unwrap();
+        let expected = blit::render(&bytes, 2, 2, fmt, blit::DEFAULT_CELL).unwrap();
+        let ud: mlua::AnyUserData = lua.globals().get("buf").unwrap();
+        assert_eq!(*ud.borrow::<BufHandle>().unwrap().buf.read(), expected);
+    }
+
+    #[test_case(r#"buf:blit(buffer.create(3), 1, 1, { fromat = "bgra" })"#, "unknown opts key" ; "opts_key_typo")]
+    #[test_case(r#"buf:blit(buffer.create(3), 1, 1, { format = "argb" })"#, "unknown format" ; "unknown_format")]
+    #[test_case(r#"buf:blit(buffer.create(5), 1, 1)"#, "needs exactly 3" ; "wrong_size")]
+    fn blit_throws(code: &str, expected: &str) {
+        let lua = test_lua();
+        set_buf_global(&lua);
+
+        let err = lua.load(code).exec().unwrap_err().to_string();
+        assert!(err.contains(expected), "expected {expected:?} in: {err}");
     }
 
     #[test]
