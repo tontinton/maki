@@ -67,6 +67,14 @@ impl App {
     }
 
     fn handle_scrollbar_mouse(&mut self, event: &MouseEvent) -> bool {
+        if !scrollbar::is_enabled() {
+            return false;
+        }
+        if self.has_modal_overlay() {
+            self.scrollbar_drag = None;
+            return false;
+        }
+
         match event.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 let Some(zone) = self.zone_at(event.row, event.column) else {
@@ -122,7 +130,7 @@ impl App {
                 let max_thumb_start = (viewport_height as i32 - thumb_len as i32).max(0);
                 let new_thumb_start = (row_rel - grab_offset).clamp(0, max_thumb_start) as u16;
                 let position =
-                    scrollbar::position_for_thumb_row(content_len, viewport_height, new_thumb_start);
+                    scrollbar::position_for_thumb_row(content_len, viewport_height, thumb_len, new_thumb_start);
                 self.set_scroll_zone(zone, position);
                 true
             }
