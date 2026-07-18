@@ -133,7 +133,7 @@ pub fn run(cli: Cli) -> Result<()> {
         Err(e) => return Err(e),
     };
 
-    setup::init_logging(&storage, &config.storage);
+    setup::init_logging(&config.storage);
     setup::install_panic_log_hook();
 
     let commands = discover_commands(cli.no_commands);

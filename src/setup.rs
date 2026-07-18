@@ -77,12 +77,10 @@ pub fn install_panic_log_hook() {
     }));
 }
 
-pub fn init_logging(storage: &StateDir, storage_config: &maki_config::StorageConfig) {
-    let Ok(writer) = RotatingFileWriter::new(
-        storage,
-        storage_config.max_log_bytes,
-        storage_config.max_log_files,
-    ) else {
+pub fn init_logging(storage_config: &maki_config::StorageConfig) {
+    let Ok(writer) =
+        RotatingFileWriter::new(storage_config.max_log_bytes, storage_config.max_log_files)
+    else {
         return;
     };
     let writer = Mutex::new(writer);
