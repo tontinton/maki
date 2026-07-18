@@ -392,6 +392,7 @@ pub enum SessionRequest {
     Live,
     Current,
     New { prompt: Option<String>, focus: bool },
+    Prompt { id: Option<String>, text: String },
     Focus { id: String },
     Delete { id: String },
     SetTitle { id: String, title: String },

@@ -1,11 +1,20 @@
 //! Queue for messages typed while the agent is busy.
 
-use super::{App, format_with_images};
+use super::{Action, App, Status, format_with_images};
 
 use crate::agent::shared_queue::{QueueItem, QueueSender};
 use crate::components::queue_panel::QueueEntry;
 
 pub(crate) use crate::agent::shared_queue::QueuedMessage;
+
+pub(crate) const EMPTY_PROMPT_ERR: &str = "prompt is empty";
+pub(crate) const NO_QUEUE_ERR: &str = "session cannot queue messages";
+
+pub(crate) enum SubmitOutcome {
+    Started(Vec<Action>),
+    Queued,
+    Rejected(&'static str),
+}
 
 #[derive(Default)]
 pub(crate) struct MessageQueue {
@@ -106,11 +115,44 @@ impl MessageQueue {
 }
 
 impl App {
+    /// The one queue-or-start decision, shared by the keyboard and Lua
+    /// paths so they cannot drift. Expects raw text: interpretation (slash
+    /// commands, `exit`, `!`) is the caller's job, or skipped on purpose.
+    pub(crate) fn submit_prompt(&mut self, msg: QueuedMessage) -> SubmitOutcome {
+        if msg.text.trim().is_empty() && msg.images.is_empty() {
+            return SubmitOutcome::Rejected(EMPTY_PROMPT_ERR);
+        }
+        if self.status == Status::Streaming {
+            if self.queue_and_notify(msg) {
+                SubmitOutcome::Queued
+            } else {
+                SubmitOutcome::Rejected(NO_QUEUE_ERR)
+            }
+        } else {
+            self.run_id += 1;
+            SubmitOutcome::Started(self.start_from_queue(&msg))
+        }
+    }
+
+    /// Keyboard path: nobody is around to receive an `Err`, so
+    /// rejections flash on screen instead.
+    pub(super) fn submit_or_queue(&mut self, msg: QueuedMessage) -> Vec<Action> {
+        match self.submit_prompt(msg) {
+            SubmitOutcome::Started(actions) => actions,
+            SubmitOutcome::Queued => vec![],
+            SubmitOutcome::Rejected(e) => {
+                self.flash(e.into());
+                vec![]
+            }
+        }
+    }
+
     /// Deferred path: the agent is busy, so park the message and let
-    /// `QueueItemConsumed` draw it once the agent picks it up.
-    pub(super) fn queue_and_notify(&mut self, msg: QueuedMessage) {
+    /// `QueueItemConsumed` draw it once the agent picks it up. Returns
+    /// false when there is no shared queue, meaning the message was dropped.
+    pub(super) fn queue_and_notify(&mut self, msg: QueuedMessage) -> bool {
         let Some(ref shared) = self.queue.shared else {
-            return;
+            return false;
         };
         let input = self.build_agent_input(&msg);
         shared.push(QueueItem::Message {
@@ -120,6 +162,7 @@ impl App {
             run_id: self.run_id,
             displayed: false,
         });
+        true
     }
 
     pub(super) fn queue_compact(&mut self) {
@@ -140,13 +183,11 @@ impl App {
 
     /// Immediate path: kick off the agent and draw the bubble in the same
     /// frame, so the user sees their message land where it will stay.
-    pub(super) fn start_from_queue(&mut self, msg: &QueuedMessage) -> Vec<super::Action> {
-        self.status = super::Status::Streaming;
+    pub(super) fn start_from_queue(&mut self, msg: &QueuedMessage) -> Vec<Action> {
+        self.status = Status::Streaming;
         self.fire_session_autocmd("TurnStart", serde_json::json!({}));
         self.main_chat()
             .show_user_message(format_with_images(&msg.text, msg.images.len()));
-        vec![super::Action::SendMessage(Box::new(
-            self.build_agent_input(msg),
-        ))]
+        vec![Action::SendMessage(Box::new(self.build_agent_input(msg)))]
     }
 }

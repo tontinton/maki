@@ -37,7 +37,7 @@ use tracing::warn;
 use crate::AppSession;
 use crate::agent::{AgentCommand, AgentHandles, ModelSlot, shared_queue::QueueItem};
 use crate::app::shell::{ShellEvent, spawn_shell};
-use crate::app::{App, Msg};
+use crate::app::{App, Msg, QueuedMessage, SubmitOutcome};
 use crate::components::input::Submission;
 use crate::components::usage_modal::UsageFetchState;
 use crate::components::{Action, ExitRequest, Status};
@@ -52,6 +52,7 @@ const IDLE_POLL_INTERVAL_MS: u64 = 100;
 const DRAIN_BUDGET: usize = 256;
 const AGENT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 const DELETE_FOCUSED_ERR: &str = "cannot delete the focused session";
+const NOT_LIVE_ERR: &str = "session not live";
 
 /// Per-tab persistence outcome after `shutdown`: `Some` iff the tab had
 /// content and was saved; `None` means a deliberately unpersisted empty tab.
@@ -687,16 +688,22 @@ impl<'t> EventLoop<'t> {
                 let idx = self.push_runtime(self.ctx.spawn_runtime(session));
                 let id = self.sessions[idx].id();
                 if let Some(prompt) = prompt {
-                    let actions = self.sessions[idx].app.handle_submit(Submission {
-                        text: prompt,
-                        images: Vec::new(),
-                    });
-                    self.dispatch(idx, actions);
+                    let _ = self.submit_text(idx, prompt);
                 }
                 if focus {
                     self.set_focus(idx);
                 }
                 let _ = reply_tx.send(Ok(json!(id)));
+            }
+            SessionRequest::Prompt { id, text } => {
+                let idx = match id {
+                    None => Ok(self.focused),
+                    Some(id) => parse_session_id(&id).and_then(|id| {
+                        self.position(id)
+                            .ok_or_else(|| format!("{NOT_LIVE_ERR}: {id}"))
+                    }),
+                };
+                let _ = reply_tx.send(idx.and_then(|idx| self.submit_text(idx, text)));
             }
             SessionRequest::Focus { id } => {
                 let reply = parse_session_id(&id)
@@ -722,6 +729,21 @@ impl<'t> EventLoop<'t> {
                 })();
                 let _ = reply_tx.send(reply);
             }
+        }
+    }
+
+    fn submit_text(&mut self, idx: usize, text: String) -> SessionReply {
+        let msg = QueuedMessage {
+            text,
+            images: Vec::new(),
+        };
+        match self.sessions[idx].app.submit_prompt(msg) {
+            SubmitOutcome::Started(actions) => {
+                self.dispatch(idx, actions);
+                Ok(json!("started"))
+            }
+            SubmitOutcome::Queued => Ok(json!("queued")),
+            SubmitOutcome::Rejected(e) => Err(e.into()),
         }
     }
 

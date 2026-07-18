@@ -276,135 +276,136 @@ optional, `{...}` is variadic.
 - L1883 `maki.session.focus({id})` - Switches the UI to the session with {id}.
 - L1899 `maki.session.delete({id})` - Deletes a session and its stored history, cancelling it first if it
 - L1916 `maki.session.new({opts?})` - Starts a new session in the current project.
-- L1935 `maki.session.set_title({opts})` - Renames a session, live or stored.
+- L1935 `maki.session.prompt({text}, {opts?})` - Sends {text} as a regular user prompt to a live session.
+- L1958 `maki.session.set_title({opts})` - Renames a session, live or stored.
 
-## maki.text - L1953
-- L1963 `maki.text.html_to_markdown({html})` - Convert an HTML string to Markdown.
+## maki.text - L1976
+- L1986 `maki.text.html_to_markdown({html})` - Convert an HTML string to Markdown.
 
-## maki.treesitter - L1983
-- L1997 `maki.treesitter.get_parser({source}, {lang})` - Creates a `LanguageTree` for {source} using the grammar named {lang}.
-- L2017 `maki.treesitter.get_string_parser({source}, {lang})` - Alias for `get_parser`.
-- L2028 `maki.treesitter.get_node_text({node}, {source})` - Gets the text that {node} covers in {source}.
-- L2047 `maki.treesitter.get_node_range({node})` - Returns the range of {node} as four 0-based integers: start_row, start_col, end_row, end_col.
-- L2063 `maki.treesitter.get_range({node})` - Returns a six-element table for {node}: `{start_row, start_col, start_byte, end_row, end_col, end_byte}`.
-- L2081 `maki.treesitter.is_ancestor({dest}, {source})` - Checks whether {dest} is an ancestor of {source} (or the same node).
-- L2093 `maki.treesitter.is_in_node_range({node}, {line}, {col})` - Checks whether the 0-based position ({line}, {col}) falls inside {node}.
-- L2106 `maki.treesitter.node_contains({node}, {range})` - Checks whether {node} fully contains the given {range}.
-- L2117 `maki.treesitter.get_node({opts?})` - Placeholder for cursor-based node lookup (not yet implemented, always returns nil).
+## maki.treesitter - L2006
+- L2020 `maki.treesitter.get_parser({source}, {lang})` - Creates a `LanguageTree` for {source} using the grammar named {lang}.
+- L2040 `maki.treesitter.get_string_parser({source}, {lang})` - Alias for `get_parser`.
+- L2051 `maki.treesitter.get_node_text({node}, {source})` - Gets the text that {node} covers in {source}.
+- L2070 `maki.treesitter.get_node_range({node})` - Returns the range of {node} as four 0-based integers: start_row, start_col, end_row, end_col.
+- L2086 `maki.treesitter.get_range({node})` - Returns a six-element table for {node}: `{start_row, start_col, start_byte, end_row, end_col, end_byte}`.
+- L2104 `maki.treesitter.is_ancestor({dest}, {source})` - Checks whether {dest} is an ancestor of {source} (or the same node).
+- L2116 `maki.treesitter.is_in_node_range({node}, {line}, {col})` - Checks whether the 0-based position ({line}, {col}) falls inside {node}.
+- L2129 `maki.treesitter.node_contains({node}, {range})` - Checks whether {node} fully contains the given {range}.
+- L2140 `maki.treesitter.get_node({opts?})` - Placeholder for cursor-based node lookup (not yet implemented, always returns nil).
 
-## maki.treesitter.language - L2128
-- L2140 `maki.treesitter.language.add({lang}, {opts?})` - Registers {lang} for use with tree-sitter.
-- L2157 `maki.treesitter.language.register({lang}, {filetype})` - Associates {lang} with one or more filetypes, so you can look up the right
-- L2173 `maki.treesitter.language.get_lang({filetype})` - Looks up the tree-sitter language name for {filetype}.
-- L2192 `maki.treesitter.language.get_filetypes({lang})` - Returns all filetypes that have been registered for {lang}.
-- L2209 `maki.treesitter.language.inspect({lang})` - Returns metadata about the grammar for {lang}.
+## maki.treesitter.language - L2151
+- L2163 `maki.treesitter.language.add({lang}, {opts?})` - Registers {lang} for use with tree-sitter.
+- L2180 `maki.treesitter.language.register({lang}, {filetype})` - Associates {lang} with one or more filetypes, so you can look up the right
+- L2196 `maki.treesitter.language.get_lang({filetype})` - Looks up the tree-sitter language name for {filetype}.
+- L2215 `maki.treesitter.language.get_filetypes({lang})` - Returns all filetypes that have been registered for {lang}.
+- L2232 `maki.treesitter.language.inspect({lang})` - Returns metadata about the grammar for {lang}.
 
-## maki.treesitter.query - L2229
-- L2240 `maki.treesitter.query.parse({lang}, {query})` - Compiles a tree-sitter query string for {lang}.
-- L2258 `maki.treesitter.query.get({lang}, {name})` - Looks up a named built-in query for {lang} (not yet implemented, always returns nil).
+## maki.treesitter.query - L2252
+- L2263 `maki.treesitter.query.parse({lang}, {query})` - Compiles a tree-sitter query string for {lang}.
+- L2281 `maki.treesitter.query.get({lang}, {name})` - Looks up a named built-in query for {lang} (not yet implemented, always returns nil).
 
-## maki.treesitter.Query - L2270
-- L2284 `Query:iter_captures({node}, {source}, {start_row?}, {stop_row?})` - Iterates over every capture matched by this query.
-- L2306 `Query:iter_matches({node}, {source}, {start_row?}, {stop_row?})` - Iterates over every full pattern match in this query.
+## maki.treesitter.Query - L2293
+- L2307 `Query:iter_captures({node}, {source}, {start_row?}, {stop_row?})` - Iterates over every capture matched by this query.
+- L2329 `Query:iter_matches({node}, {source}, {start_row?}, {stop_row?})` - Iterates over every full pattern match in this query.
 
-## maki.treesitter.Tree - L2332
-- L2344 `Tree:root()` - Returns the root node of this tree.
-- L2358 `Tree:copy()` - Returns an independent copy of this tree.
+## maki.treesitter.Tree - L2355
+- L2367 `Tree:root()` - Returns the root node of this tree.
+- L2381 `Tree:copy()` - Returns an independent copy of this tree.
 
-## maki.treesitter.Node - L2366
-- L2381 `Node:type()` - Returns the grammar type name for this node, like `"function_definition"` or `"identifier"`.
-- L2387 `Node:symbol()` - Returns the numeric symbol id for this node's grammar type.
-- L2394 `Node:id()` - Returns a unique string identifier for this specific node in the tree.
-- L2401 `Node:range({include_bytes?})` - Returns the range of this node as multiple return values.
-- L2420 `Node:start()` - Returns the start position of this node: row, column, and byte offset (all 0-based).
-- L2426 `Node:end_()` - Returns the end position of this node: row, column, and byte offset (all 0-based).
-- L2432 `Node:byte_length()` - Returns how many bytes this node spans in the source text.
-- L2438 `Node:child({index})` - Returns the child at position {index} (0-based), including anonymous nodes like punctuation.
-- L2449 `Node:named_child({index})` - Returns the named child at position {index} (0-based), skipping anonymous nodes.
-- L2460 `Node:child_count()` - Returns the total number of children, including anonymous nodes.
-- L2466 `Node:named_child_count()` - Returns the number of named children (skipping anonymous punctuation nodes).
-- L2472 `Node:children()` - Returns all children (named and anonymous) as a Lua table.
-- L2486 `Node:named_children()` - Returns all named children as a Lua table, skipping anonymous nodes.
-- L2492 `Node:iter_children()` - Returns an iterator function that yields `(child, field_name)` for every child.
-- L2507 `Node:field({name})` - Returns all children assigned to the grammar field {name} as a table.
-- L2524 `Node:parent()` - Returns the parent of this node, or nil if this is the root.
-- L2530 `Node:next_sibling()` - Returns the next sibling (named or anonymous), or nil if this is the last child.
-- L2536 `Node:prev_sibling()` - Returns the previous sibling (named or anonymous), or nil if this is the first child.
-- L2542 `Node:next_named_sibling()` - Returns the next named sibling, skipping anonymous nodes.
-- L2548 `Node:prev_named_sibling()` - Returns the previous named sibling, skipping anonymous nodes.
-- L2554 `Node:child_with_descendant({descendant})` - Finds the direct child of this node that contains {descendant}.
-- L2565 `Node:descendant_for_range({start_row}, {start_col}, {end_row}, {end_col})` - Finds the smallest node inside this node that spans the given point range.
-- L2579 `Node:named_descendant_for_range({start_row}, {start_col}, {end_row}, {end_col})` - Like `descendant_for_range`, but only considers named nodes.
-- L2592 `Node:named()` - Returns true if this is a named node (not anonymous punctuation like `,` or `(`).
-- L2598 `Node:extra()` - Returns true if this node is an "extra" (like a comment) that can appear anywhere in the grammar.
-- L2604 `Node:missing()` - Returns true if this node is "missing", meaning it was inserted by the parser during error recovery.
-- L2610 `Node:has_error()` - Returns true if this node or any of its descendants contain a syntax error.
-- L2616 `Node:has_changes()` - Returns true if this node has been marked as changed since the last parse.
-- L2622 `Node:equal({other})` - Returns true if this node and {other} are the same node in the tree.
-- L2632 `Node:sexpr()` - Returns the S-expression (lisp-like) string for this node and its children.
-- L2645 `Node:tree()` - Returns the Tree that this node belongs to.
+## maki.treesitter.Node - L2389
+- L2404 `Node:type()` - Returns the grammar type name for this node, like `"function_definition"` or `"identifier"`.
+- L2410 `Node:symbol()` - Returns the numeric symbol id for this node's grammar type.
+- L2417 `Node:id()` - Returns a unique string identifier for this specific node in the tree.
+- L2424 `Node:range({include_bytes?})` - Returns the range of this node as multiple return values.
+- L2443 `Node:start()` - Returns the start position of this node: row, column, and byte offset (all 0-based).
+- L2449 `Node:end_()` - Returns the end position of this node: row, column, and byte offset (all 0-based).
+- L2455 `Node:byte_length()` - Returns how many bytes this node spans in the source text.
+- L2461 `Node:child({index})` - Returns the child at position {index} (0-based), including anonymous nodes like punctuation.
+- L2472 `Node:named_child({index})` - Returns the named child at position {index} (0-based), skipping anonymous nodes.
+- L2483 `Node:child_count()` - Returns the total number of children, including anonymous nodes.
+- L2489 `Node:named_child_count()` - Returns the number of named children (skipping anonymous punctuation nodes).
+- L2495 `Node:children()` - Returns all children (named and anonymous) as a Lua table.
+- L2509 `Node:named_children()` - Returns all named children as a Lua table, skipping anonymous nodes.
+- L2515 `Node:iter_children()` - Returns an iterator function that yields `(child, field_name)` for every child.
+- L2530 `Node:field({name})` - Returns all children assigned to the grammar field {name} as a table.
+- L2547 `Node:parent()` - Returns the parent of this node, or nil if this is the root.
+- L2553 `Node:next_sibling()` - Returns the next sibling (named or anonymous), or nil if this is the last child.
+- L2559 `Node:prev_sibling()` - Returns the previous sibling (named or anonymous), or nil if this is the first child.
+- L2565 `Node:next_named_sibling()` - Returns the next named sibling, skipping anonymous nodes.
+- L2571 `Node:prev_named_sibling()` - Returns the previous named sibling, skipping anonymous nodes.
+- L2577 `Node:child_with_descendant({descendant})` - Finds the direct child of this node that contains {descendant}.
+- L2588 `Node:descendant_for_range({start_row}, {start_col}, {end_row}, {end_col})` - Finds the smallest node inside this node that spans the given point range.
+- L2602 `Node:named_descendant_for_range({start_row}, {start_col}, {end_row}, {end_col})` - Like `descendant_for_range`, but only considers named nodes.
+- L2615 `Node:named()` - Returns true if this is a named node (not anonymous punctuation like `,` or `(`).
+- L2621 `Node:extra()` - Returns true if this node is an "extra" (like a comment) that can appear anywhere in the grammar.
+- L2627 `Node:missing()` - Returns true if this node is "missing", meaning it was inserted by the parser during error recovery.
+- L2633 `Node:has_error()` - Returns true if this node or any of its descendants contain a syntax error.
+- L2639 `Node:has_changes()` - Returns true if this node has been marked as changed since the last parse.
+- L2645 `Node:equal({other})` - Returns true if this node and {other} are the same node in the tree.
+- L2655 `Node:sexpr()` - Returns the S-expression (lisp-like) string for this node and its children.
+- L2668 `Node:tree()` - Returns the Tree that this node belongs to.
 
-## maki.treesitter.LanguageTree - L2652
-- L2667 `LanguageTree:parse({range?})` - Parses the source and returns a table containing the resulting Tree.
-- L2685 `LanguageTree:lang()` - Returns the language name this parser was created with.
-- L2691 `LanguageTree:children()` - Returns child LanguageTrees for injected languages.
-- L2698 `LanguageTree:trees()` - Returns all parsed trees as a table (at most one for now).
-- L2705 `LanguageTree:source()` - Returns the source string this parser was created with.
-- L2711 `LanguageTree:is_valid({exclude_children?}, {range?})` - Checks whether the parse tree is still valid.
-- L2723 `LanguageTree:for_each_tree({fn})` - Calls {fn} with `(tree, nil)` for the parsed tree.
-- L2740 `LanguageTree:included_regions()` - Returns the regions this parser covers.
-- L2747 `LanguageTree:contains({range})` - Checks whether this parser covers the given {range}.
-- L2758 `LanguageTree:destroy()` - Drops the cached parse tree and frees its memory.
+## maki.treesitter.LanguageTree - L2675
+- L2690 `LanguageTree:parse({range?})` - Parses the source and returns a table containing the resulting Tree.
+- L2708 `LanguageTree:lang()` - Returns the language name this parser was created with.
+- L2714 `LanguageTree:children()` - Returns child LanguageTrees for injected languages.
+- L2721 `LanguageTree:trees()` - Returns all parsed trees as a table (at most one for now).
+- L2728 `LanguageTree:source()` - Returns the source string this parser was created with.
+- L2734 `LanguageTree:is_valid({exclude_children?}, {range?})` - Checks whether the parse tree is still valid.
+- L2746 `LanguageTree:for_each_tree({fn})` - Calls {fn} with `(tree, nil)` for the parsed tree.
+- L2763 `LanguageTree:included_regions()` - Returns the regions this parser covers.
+- L2770 `LanguageTree:contains({range})` - Checks whether this parser covers the given {range}.
+- L2781 `LanguageTree:destroy()` - Drops the cached parse tree and frees its memory.
 
-## maki.ui - L2764
-- L2776 `maki.ui.buf()` - Creates a new buffer for building UI content.
-- L2792 `maki.ui.theme_color({name})` - Looks up a semantic color from the current theme.
-- L2812 `maki.ui.highlight({code}, {lang}, {opts?})` - Syntax-highlights a chunk of source code.
-- L2837 `maki.ui.markdown({text}, {width})` - Renders Markdown into styled lines ready to display in a buffer.
-- L2861 `maki.ui.humantime({secs})` - Formats a number of seconds into a short, human-friendly string.
-- L2879 `maki.ui.terminal_size()` - Returns the current terminal size.
-- L2893 `maki.ui.flash({msg})` - Shows a brief message in the status bar.
-- L2909 `maki.ui.open_editor({path})` - Opens {path} in the user's `$EDITOR` (e.g.
-- L2930 `maki.ui.open_win({buf}, {opts})` - Opens a floating or split window that displays the contents of {buf}.
-- L2974 `maki.ui.set_status_hint({spans})` - Shows key hints in the status bar for your plugin.
+## maki.ui - L2787
+- L2799 `maki.ui.buf()` - Creates a new buffer for building UI content.
+- L2815 `maki.ui.theme_color({name})` - Looks up a semantic color from the current theme.
+- L2835 `maki.ui.highlight({code}, {lang}, {opts?})` - Syntax-highlights a chunk of source code.
+- L2860 `maki.ui.markdown({text}, {width})` - Renders Markdown into styled lines ready to display in a buffer.
+- L2884 `maki.ui.humantime({secs})` - Formats a number of seconds into a short, human-friendly string.
+- L2902 `maki.ui.terminal_size()` - Returns the current terminal size.
+- L2916 `maki.ui.flash({msg})` - Shows a brief message in the status bar.
+- L2932 `maki.ui.open_editor({path})` - Opens {path} in the user's `$EDITOR` (e.g.
+- L2953 `maki.ui.open_win({buf}, {opts})` - Opens a floating or split window that displays the contents of {buf}.
+- L2997 `maki.ui.set_status_hint({spans})` - Shows key hints in the status bar for your plugin.
 
-## maki.ui.Win - L2991
-- L3009 `Win:recv({timeout_ms?})` - Waits for the next event from this window.
-- L3039 `Win:set_config({opts})` - Updates the window layout on the fly.
-- L3066 `Win:set_cursor({row})` - Moves the highlighted cursor line to {row} (1-indexed).
-- L3081 `Win:close()` - Closes the window and frees its resources.
-- L3093 `Win:is_open()` - Returns true if the window is still alive (not closed).
-- L3108 `Win:show()` - Makes the window visible again after it was hidden with `hide()`.
-- L3118 `Win:hide()` - Hides the window without closing it.
-- L3131 `Win:is_visible()` - Returns true if the window is both open and visible (not hidden).
+## maki.ui.Win - L3014
+- L3032 `Win:recv({timeout_ms?})` - Waits for the next event from this window.
+- L3062 `Win:set_config({opts})` - Updates the window layout on the fly.
+- L3089 `Win:set_cursor({row})` - Moves the highlighted cursor line to {row} (1-indexed).
+- L3104 `Win:close()` - Closes the window and frees its resources.
+- L3116 `Win:is_open()` - Returns true if the window is still alive (not closed).
+- L3131 `Win:show()` - Makes the window visible again after it was hidden with `hide()`.
+- L3141 `Win:hide()` - Hides the window without closing it.
+- L3154 `Win:is_visible()` - Returns true if the window is both open and visible (not hidden).
 
-## maki.ui.Buf - L3138
-- L3150 `Buf:line({line})` - Appends a single line to the end of the buffer.
-- L3169 `Buf:lines({lines})` - Appends several lines at once.
-- L3188 `Buf:set_lines({lines})` - Replaces every line in the buffer with {lines}.
-- L3204 `Buf:len()` - Returns how many lines the buffer currently holds.
-- L3218 `Buf:get_lines()` - Returns all lines in the buffer as a Lua table.
-- L3234 `Buf:on({event}, {callback})` - Registers an event handler on the buffer.
-- L3259 `Buf:click({ev})` - Programmatically fires the buffer's click handler with event {ev}.
-- L3275 `Buf:blit({fb}, {width}, {height}, {opts?})` - Replaces the whole buffer with a pixel frame drawn as `"▀"` cells.
+## maki.ui.Buf - L3161
+- L3173 `Buf:line({line})` - Appends a single line to the end of the buffer.
+- L3192 `Buf:lines({lines})` - Appends several lines at once.
+- L3211 `Buf:set_lines({lines})` - Replaces every line in the buffer with {lines}.
+- L3227 `Buf:len()` - Returns how many lines the buffer currently holds.
+- L3241 `Buf:get_lines()` - Returns all lines in the buffer as a Lua table.
+- L3257 `Buf:on({event}, {callback})` - Registers an event handler on the buffer.
+- L3282 `Buf:click({ev})` - Programmatically fires the buffer's click handler with event {ev}.
+- L3298 `Buf:blit({fb}, {width}, {height}, {opts?})` - Replaces the whole buffer with a pixel frame drawn as `"▀"` cells.
 
-## maki.uv - L3316
-- L3327 `maki.uv.cwd()` - Return the current working directory as an absolute path.
-- L3340 `maki.uv.os_homedir()` - Return the current user's home directory.
-- L3352 `maki.uv.os_getenv({name})` - Look up the environment variable {name}.
+## maki.uv - L3339
+- L3350 `maki.uv.cwd()` - Return the current working directory as an absolute path.
+- L3363 `maki.uv.os_homedir()` - Return the current user's home directory.
+- L3375 `maki.uv.os_getenv({name})` - Look up the environment variable {name}.
 
-## maki.yaml - L3370
-- L3380 `maki.yaml.encode({value})` - Turn a Lua value into a YAML string.
-- L3398 `maki.yaml.decode({str})` - Parse a YAML string into a Lua value.
+## maki.yaml - L3393
+- L3403 `maki.yaml.encode({value})` - Turn a Lua value into a YAML string.
+- L3421 `maki.yaml.decode({str})` - Parse a YAML string into a Lua value.
 
-## Shared helper modules - L3419
-- L3424 `require("maki.color")`
-- L3451 `require("maki.fuzzy_replace")`
-- L3464 `require("maki.list_picker")` - Open a fuzzy-filter picker in a floating window and block until the user
-- L3478 `require("maki.output_limits")` - Shared per-tool output limit options, so the tools that support them
-- L3510 `require("maki.shorten_path")`
-- L3541 `require("maki.text_input")` - TextInput: multi-line editable buffer with a byte-offset cursor.
-- L3599 `require("maki.tool_view")` - The shared truncate/expand body that tool plugins render through.
-- L3637 `require("maki.truncate")`
+## Shared helper modules - L3442
+- L3447 `require("maki.color")`
+- L3474 `require("maki.fuzzy_replace")`
+- L3487 `require("maki.list_picker")` - Open a fuzzy-filter picker in a floating window and block until the user
+- L3501 `require("maki.output_limits")` - Shared per-tool output limit options, so the tools that support them
+- L3533 `require("maki.shorten_path")`
+- L3564 `require("maki.text_input")` - TextInput: multi-line editable buffer with a byte-offset cursor.
+- L3622 `require("maki.tool_view")` - The shared truncate/expand body that tool plugins render through.
+- L3660 `require("maki.truncate")`
 ]=],
 }

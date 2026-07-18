@@ -363,6 +363,47 @@ fn clears_queue(terminate: fn(&mut App)) {
     assert!(app.queue.is_empty());
 }
 
+#[test_case("/compact" ; "slash_command")]
+#[test_case("exit" ; "exit_keyword")]
+#[test_case("!ls" ; "shell_prefix")]
+fn submit_prompt_never_interprets_text(text: &str) {
+    let mut app = test_app();
+    match app.submit_prompt(queued_msg(text)) {
+        SubmitOutcome::Started(actions) => {
+            assert!(matches!(&actions[0], Action::SendMessage(_)))
+        }
+        _ => panic!("raw prompt must start the agent"),
+    }
+}
+
+#[test]
+fn submit_prompt_queues_while_streaming() {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    assert!(matches!(
+        app.submit_prompt(queued_msg("hi")),
+        SubmitOutcome::Queued
+    ));
+    assert_eq!(app.queue.len(), 1);
+}
+
+#[test_case(test_app as fn() -> App, "   ", queue::EMPTY_PROMPT_ERR ; "blank_text")]
+#[test_case(streaming_app_without_queue, "hi", queue::NO_QUEUE_ERR ; "streaming_without_shared_queue")]
+fn submit_prompt_rejects(mk: fn() -> App, text: &str, expected: &str) {
+    let mut app = mk();
+    match app.submit_prompt(queued_msg(text)) {
+        SubmitOutcome::Rejected(e) => assert_eq!(e, expected),
+        _ => panic!("expected rejection"),
+    }
+}
+
+fn streaming_app_without_queue() -> App {
+    let dir = StateDir::from_path(env::temp_dir());
+    let mut app = build_app(dir.clone(), Arc::new(StorageWriter::new(dir)));
+    app.status = Status::Streaming;
+    app
+}
+
 fn queued_msg(text: &str) -> QueuedMessage {
     QueuedMessage {
         text: text.into(),

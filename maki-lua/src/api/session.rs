@@ -118,6 +118,31 @@ async fn new(
     roundtrip(lua, tx, SessionRequest::New { prompt, focus }).await
 }
 
+/// Sends {text} as a regular user prompt to a live session. The text is
+/// never interpreted: slash commands, `exit`, and `!` shell prefixes are
+/// all sent to the model verbatim. If the session is currently streaming,
+/// the prompt is queued and picked up when the agent reaches it.
+///
+/// @param text string The prompt to send. Must not be blank.
+/// @param opts table? Optional fields: session (string) id of a live
+///   session; defaults to the focused one.
+/// @return (string|nil, string|nil) "started" or "queued", or nil and an error.
+/// @example
+/// local state, err = maki.session.prompt("run the tests", { session = id })
+#[lua_fn]
+async fn prompt(
+    lua: Lua,
+    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    text: String,
+    opts: Option<Table>,
+) -> LuaResult<Pair> {
+    let id = match opts {
+        Some(opts) => opts.get("session")?,
+        None => None,
+    };
+    roundtrip(lua, tx, SessionRequest::Prompt { id, text }).await
+}
+
 /// Renames a session, live or stored.
 ///
 /// @param opts table Required fields: id (string) session to rename;
@@ -145,13 +170,14 @@ lua_table! {
     /// the pair `(value, err)`. Without an interactive UI attached, every
     /// call returns `nil, "no interactive UI attached"`.
     "maki.session" => pub(crate) fn create_session_table(tx: Option<flume::Sender<UiAction>>),
-    DOCS [list(tx), live(tx), current(tx), focus(tx), delete(tx), new(tx), set_title(tx)]
+    DOCS [list(tx), live(tx), current(tx), focus(tx), delete(tx), new(tx), prompt(tx), set_title(tx)]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+    use test_case::test_case;
 
     fn lua_with_session(tx: Option<flume::Sender<UiAction>>) -> Lua {
         let lua = Lua::new();
@@ -187,6 +213,31 @@ mod tests {
             smol::block_on(lua.load("return session.focus('abc')").eval_async()).unwrap();
         assert_eq!(err, None);
         assert_eq!(val.get::<String>("focused").unwrap(), "abc");
+    }
+
+    #[test_case("return session.prompt('hi', { session = 'abc' })", Some("abc") ; "explicit_session_id")]
+    #[test_case("return session.prompt('hi')", None ; "defaults_to_focused")]
+    fn prompt_forwards_text_and_session_id(code: &str, expected_id: Option<&str>) {
+        let (tx, rx) = flume::unbounded::<UiAction>();
+        let lua = lua_with_session(Some(tx));
+        let expected_id = expected_id.map(str::to_owned);
+        let checker = std::thread::spawn(move || {
+            let Ok(UiAction::Session {
+                req: SessionRequest::Prompt { id, text },
+                reply_tx,
+            }) = rx.recv()
+            else {
+                panic!("expected prompt request");
+            };
+            assert_eq!(id, expected_id);
+            assert_eq!(text, "hi");
+            reply_tx.send(Ok(json!("queued"))).unwrap();
+        });
+        let (val, err): (String, Option<String>) =
+            smol::block_on(lua.load(code).eval_async()).unwrap();
+        checker.join().unwrap();
+        assert_eq!(err, None);
+        assert_eq!(val, "queued");
     }
 
     #[test]

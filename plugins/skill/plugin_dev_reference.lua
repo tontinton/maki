@@ -1935,6 +1935,29 @@ Starts a new session in the current project.
 local id, err = maki.session.new({ prompt = "fix the tests", focus = true })
 ```
 
+### `maki.session.prompt({text}, {opts?})`
+
+Sends {text} as a regular user prompt to a live session. The text is
+never interpreted: slash commands, `exit`, and `!` shell prefixes are
+all sent to the model verbatim. If the session is currently streaming,
+the prompt is queued and picked up when the agent reaches it.
+
+**Parameters:**
+
+- `{text}` (`string`) The prompt to send. Must not be blank.
+- `{opts?}` (`table?`) Optional fields: session (string) id of a live
+
+  session; defaults to the focused one.
+
+
+**Returns:** (`string|nil`, `string|nil`) "started" or "queued", or nil and an error.
+
+**Example:**
+
+```lua
+local state, err = maki.session.prompt("run the tests", { session = id })
+```
+
 ### `maki.session.set_title({opts})`
 
 Renames a session, live or stored.
