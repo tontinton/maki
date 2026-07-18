@@ -18,7 +18,7 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 
-use super::scrollbar::render_vertical_scrollbar;
+use super::scrollbar::{ScrollInfo, render_vertical_scrollbar};
 use super::{apply_scroll_delta, visual_line_count};
 use crate::selection::LineBreaks;
 
@@ -77,6 +77,7 @@ pub struct InputBox {
     follow_cursor: bool,
     placeholder_hint: &'static str,
     pending_images: Vec<ImageSource>,
+    last_total_vl: u16,
 }
 
 impl InputBox {
@@ -166,6 +167,7 @@ impl InputBox {
             follow_cursor: true,
             placeholder_hint: random_placeholder_hint(),
             pending_images: Vec::new(),
+            last_total_vl: 1,
         }
     }
 
@@ -337,6 +339,7 @@ impl InputBox {
         }
         let max_scroll = total_vl.saturating_sub(content_height);
         self.scroll_y = self.scroll_y.min(max_scroll);
+        self.last_total_vl = total_vl;
 
         let is_empty = self.buffer.value().is_empty();
         let mut styled_lines: Vec<Line> = if is_empty && self.pending_images.is_empty() {
@@ -427,6 +430,23 @@ impl InputBox {
 
     pub fn scroll_y(&self) -> u16 {
         self.scroll_y
+    }
+
+    pub fn scroll_info(&self, area: Rect) -> Option<ScrollInfo> {
+        if self.last_total_vl > area.height {
+            let max_scroll = self.last_total_vl.saturating_sub(area.height);
+            Some(ScrollInfo {
+                content_len: self.last_total_vl,
+                position: self.scroll_y.min(max_scroll),
+            })
+        } else {
+            None
+        }
+    }
+
+    pub fn set_scroll_y(&mut self, y: u16) {
+        self.scroll_y = y;
+        self.follow_cursor = false;
     }
 
     pub fn history(&self) -> &InputHistory {

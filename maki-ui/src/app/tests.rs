@@ -23,7 +23,11 @@ use tempfile::TempDir;
 use test_case::test_case;
 
 fn set_zone(app: &mut App, zone: SelectionZone, area: Rect) {
-    app.zones.push(SelectableZone { area, zone });
+    app.zones.push(SelectableZone {
+        area,
+        zone,
+        scroll_info: None,
+    });
 }
 
 fn test_app() -> App {

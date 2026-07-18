@@ -330,9 +330,12 @@ impl App {
         // Push order = z-order. zone_at() walks in reverse, so later entries win.
         self.zones = ZoneRegistry::new();
 
+        let render_chat = self.resolve_render_chat();
+        let msg_scroll = self.chats[render_chat].scroll_info(layout.msg_area.height);
         self.zones.push(SelectableZone {
             area: layout.msg_area,
             zone: SelectionZone::Messages,
+            scroll_info: msg_scroll,
         });
 
         if layout.input_area.height > 0 && !layout.bottom_takeover && self.is_main_chat() {
@@ -342,9 +345,11 @@ impl App {
                 layout.input_area.width,
                 layout.input_area.height.saturating_sub(2),
             );
+            let input_scroll = self.input_box.scroll_info(input_inner);
             self.zones.push(SelectableZone {
                 area: input_inner,
                 zone: SelectionZone::Input,
+                scroll_info: input_scroll,
             });
         }
 

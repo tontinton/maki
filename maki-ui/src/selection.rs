@@ -37,6 +37,7 @@ use ratatui::text::Line;
 
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::components::scrollbar::ScrollInfo;
 use crate::theme;
 use maki_markdown::render::{CODE_BAR, CODE_BAR_WRAP};
 
@@ -78,6 +79,7 @@ pub enum SelectionZone {
 pub struct SelectableZone {
     pub area: Rect,
     pub zone: SelectionZone,
+    pub scroll_info: Option<ScrollInfo>,
 }
 
 const ZONE_CAP: usize = 12;
@@ -85,6 +87,7 @@ const ZONE_CAP: usize = 12;
 const EMPTY_ZONE: SelectableZone = SelectableZone {
     area: Rect::new(0, 0, 0, 0),
     zone: SelectionZone::Messages,
+    scroll_info: None,
 };
 
 pub struct ZoneRegistry {
@@ -113,6 +116,7 @@ impl ZoneRegistry {
         self.push(SelectableZone {
             area,
             zone: SelectionZone::Overlay,
+            scroll_info: None,
         });
     }
 
@@ -153,14 +157,18 @@ fn screen_to_doc(screen_row: u16, area: Rect, scroll_offset: u32) -> u32 {
     scroll_offset + (clamped - area.y) as u32
 }
 
-fn clamp_col(col: u16, area: Rect) -> u16 {
-    col.clamp(area.x, area.x + area.width.saturating_sub(1))
+fn clamp_col(col: u16, area: Rect, zone: SelectionZone) -> u16 {
+    let reserve = match zone {
+        SelectionZone::Messages | SelectionZone::Input => 2,
+        SelectionZone::Overlay => 1,
+    };
+    col.clamp(area.x, area.x + area.width.saturating_sub(reserve))
 }
 
 impl Selection {
     pub fn start(row: u16, col: u16, area: Rect, zone: SelectionZone, scroll_offset: u32) -> Self {
         let doc_row = screen_to_doc(row, area, scroll_offset);
-        let doc_col = clamp_col(col, area);
+        let doc_col = clamp_col(col, area, zone);
         let pos = DocPos::new(doc_row, doc_col);
         Self {
             anchor: pos,
@@ -173,7 +181,7 @@ impl Selection {
     pub fn update(&mut self, row: u16, col: u16, scroll_offset: u32) {
         self.cursor = DocPos::new(
             screen_to_doc(row, self.area, scroll_offset),
-            clamp_col(col, self.area),
+            clamp_col(col, self.area, self.zone),
         );
     }
 
@@ -182,15 +190,11 @@ impl Selection {
     }
 
     pub fn highlight_area(&self) -> Rect {
-        match self.zone {
-            SelectionZone::Messages => Rect::new(
-                self.area.x,
-                self.area.y,
-                self.area.width.saturating_sub(1),
-                self.area.height,
-            ),
-            _ => self.area,
-        }
+        let width = match self.zone {
+            SelectionZone::Messages | SelectionZone::Input => self.area.width.saturating_sub(1),
+            SelectionZone::Overlay => self.area.width,
+        };
+        Rect::new(self.area.x, self.area.y, width, self.area.height)
     }
 
     pub fn normalized(&self) -> (DocPos, DocPos) {
@@ -960,10 +964,12 @@ mod tests {
         zones.push(SelectableZone {
             area: msg_area,
             zone: SelectionZone::Messages,
+            scroll_info: None,
         });
         zones.push(SelectableZone {
             area: overlay_area,
             zone: SelectionZone::Overlay,
+            scroll_info: None,
         });
 
         assert_eq!(zones.zone_at(7, 20).unwrap().zone, SelectionZone::Overlay);
@@ -1029,7 +1035,7 @@ mod tests {
     fn selection_start_col_clamped() {
         let area = Rect::new(10, 5, 40, 20);
         let right = Selection::start(8, 200, area, SelectionZone::Messages, 0);
-        assert_eq!(right.normalized().0.col, 49, "clamped to area right edge");
+        assert_eq!(right.normalized().0.col, 48, "clamped to content right edge");
         let left = Selection::start(8, 0, area, SelectionZone::Messages, 0);
         assert_eq!(left.normalized().0.col, 10, "clamped to area left edge");
     }
@@ -1100,6 +1106,7 @@ mod tests {
         zones.push(SelectableZone {
             area: Rect::new(0, 0, 80, 20),
             zone: SelectionZone::Messages,
+            scroll_info: None,
         });
         assert!(zones.zone_at(25, 10).is_none(), "outside all zones");
     }

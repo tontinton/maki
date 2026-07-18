@@ -4,8 +4,8 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-
 use crate::components::messages::{MessagesPanel, PromptProgress};
+use crate::components::scrollbar::ScrollInfo;
 use crate::components::tool_display::append_annotation;
 use crate::components::{DisplayMessage, DisplayRole, ToolRole, ToolStatus};
 use crate::markdown::truncate_output;
@@ -226,6 +226,18 @@ impl Chat {
 
     pub fn scroll_top(&self) -> u16 {
         self.messages_panel.scroll_top()
+    }
+
+    pub fn total_lines(&self) -> u16 {
+        self.messages_panel.total_lines()
+    }
+
+    pub fn scroll_info(&self, viewport_height: u16) -> Option<ScrollInfo> {
+        self.messages_panel.scroll_info(viewport_height)
+    }
+
+    pub fn set_scroll_top(&mut self, y: u16) {
+        self.messages_panel.set_scroll_top(y);
     }
 
     pub fn segment_heights(&self) -> Vec<u16> {

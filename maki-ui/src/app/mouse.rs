@@ -1,6 +1,7 @@
 use std::time::{Duration, Instant};
 
 use crate::clipboard::CopyResult;
+use crate::components::scrollbar;
 use crate::selection::{self, ContentRegion, EdgeScroll, Selection, SelectionState, SelectionZone};
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
@@ -10,8 +11,20 @@ use super::App;
 pub(super) const EDGE_SCROLL_LINES: i32 = 1;
 pub(super) const EDGE_SCROLL_INTERVAL: Duration = Duration::from_millis(25);
 
+pub(crate) struct ScrollbarDrag {
+    zone: SelectionZone,
+    content_len: u16,
+    viewport_height: u16,
+    thumb_len: u16,
+    grab_offset: i32,
+    track_y_start: u16,
+}
+
 impl App {
     pub(super) fn handle_mouse(&mut self, event: MouseEvent) {
+        if self.handle_scrollbar_mouse(&event) {
+            return;
+        }
         match event.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 if let Some(zone) = self.zone_at(event.row, event.column) {
@@ -50,6 +63,83 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+
+    fn handle_scrollbar_mouse(&mut self, event: &MouseEvent) -> bool {
+        match event.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                let Some(zone) = self.zone_at(event.row, event.column) else {
+                    return false;
+                };
+                let Some(info) = zone.scroll_info else {
+                    return false;
+                };
+                if event.column != zone.area.right().saturating_sub(1) {
+                    return false;
+                }
+                let Some((thumb_start, thumb_end)) =
+                    scrollbar::vertical_thumb_bounds(info.content_len, zone.area.height, info.position)
+                else {
+                    return false;
+                };
+
+                let row_rel = event.row.saturating_sub(zone.area.y);
+                let thumb_len = thumb_end.saturating_sub(thumb_start);
+                self.selection_state = None;
+
+                if row_rel >= thumb_start && row_rel < thumb_end {
+                    self.scrollbar_drag = Some(ScrollbarDrag {
+                        zone: zone.zone,
+                        content_len: info.content_len,
+                        viewport_height: zone.area.height,
+                        thumb_len,
+                        grab_offset: row_rel as i32 - thumb_start as i32,
+                        track_y_start: zone.area.y,
+                    });
+                } else {
+                    let page = zone.area.height as i32;
+                    let delta = if row_rel < thumb_start { page } else { -page };
+                    self.scroll_zone(zone.zone, delta);
+                }
+                true
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                let (zone, content_len, viewport_height, thumb_len, grab_offset, track_y_start) = {
+                    let Some(ref drag) = self.scrollbar_drag else {
+                        return false;
+                    };
+                    (
+                        drag.zone,
+                        drag.content_len,
+                        drag.viewport_height,
+                        drag.thumb_len,
+                        drag.grab_offset,
+                        drag.track_y_start,
+                    )
+                };
+                let row_rel = event.row.saturating_sub(track_y_start) as i32;
+                let max_thumb_start = (viewport_height as i32 - thumb_len as i32).max(0);
+                let new_thumb_start = (row_rel - grab_offset).clamp(0, max_thumb_start) as u16;
+                let position =
+                    scrollbar::position_for_thumb_row(content_len, viewport_height, new_thumb_start);
+                self.set_scroll_zone(zone, position);
+                true
+            }
+            MouseEventKind::Up(MouseButton::Left) if self.scrollbar_drag.is_some() => {
+                self.scrollbar_drag = None;
+                true
+            }
+            MouseEventKind::Up(MouseButton::Left) => false,
+            _ => false,
+        }
+    }
+
+    fn set_scroll_zone(&mut self, zone: SelectionZone, position: u16) {
+        match zone {
+            SelectionZone::Messages => self.chats[self.active_chat].set_scroll_top(position),
+            SelectionZone::Input => self.input_box.set_scroll_y(position),
+            SelectionZone::Overlay => {}
         }
     }
 

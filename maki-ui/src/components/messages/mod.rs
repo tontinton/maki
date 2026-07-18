@@ -28,7 +28,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
 
-use super::scrollbar::render_vertical_scrollbar;
+use super::scrollbar::{ScrollInfo, render_vertical_scrollbar};
 use super::streaming_content::StreamingContent;
 use maki_agent::{
     BufferSnapshot, EventSender, InstructionBlock, NO_FILES_FOUND, SharedBuf, ToolDoneEvent,
@@ -848,6 +848,28 @@ impl MessagesPanel {
 
     pub fn scroll_top(&self) -> u16 {
         self.scroll_top
+    }
+
+    pub fn total_lines(&self) -> u16 {
+        self.last_total_lines
+    }
+
+    pub fn scroll_info(&self, viewport_height: u16) -> Option<ScrollInfo> {
+        let content_len = self.last_total_lines;
+        if content_len > viewport_height {
+            let max_scroll = content_len.saturating_sub(viewport_height);
+            Some(ScrollInfo {
+                content_len,
+                position: self.scroll_top.min(max_scroll),
+            })
+        } else {
+            None
+        }
+    }
+
+    pub fn set_scroll_top(&mut self, y: u16) {
+        self.scroll_top = y;
+        self.auto_scroll = false;
     }
 
     pub fn segment_heights(&self) -> Vec<u16> {
