@@ -13,16 +13,19 @@ pub enum Permission {
     Net,
     Run,
     Env,
+    Keymap,
 }
 
 impl Permission {
-    const ALL: [Permission; 5] = [
+    const ALL: [Permission; Self::LEN] = [
         Permission::FsRead,
         Permission::FsWrite,
         Permission::Net,
         Permission::Run,
         Permission::Env,
+        Permission::Keymap,
     ];
+    pub(crate) const LEN: usize = 6;
 
     fn manifest_key(self) -> &'static str {
         match self {
@@ -31,6 +34,7 @@ impl Permission {
             Permission::Net => "net",
             Permission::Run => "run",
             Permission::Env => "env",
+            Permission::Keymap => "keymap",
         }
     }
 }
@@ -43,17 +47,19 @@ impl fmt::Display for Permission {
 
 #[derive(Debug, Clone)]
 pub struct PluginPermissions {
-    allowed: [bool; 5],
+    allowed: [bool; Permission::LEN],
 }
 
 impl PluginPermissions {
     pub fn trusted() -> Self {
-        Self { allowed: [true; 5] }
+        Self {
+            allowed: [true; Permission::LEN],
+        }
     }
 
     pub fn denied() -> Self {
         Self {
-            allowed: [false; 5],
+            allowed: [false; Permission::LEN],
         }
     }
 
@@ -63,7 +69,7 @@ impl PluginPermissions {
 
     pub fn from_manifest(manifest: &toml::Value) -> Self {
         let perms = manifest.get("permissions");
-        let mut allowed = [true; 5];
+        let mut allowed = [true; Permission::LEN];
         for perm in Permission::ALL {
             allowed[perm as usize] = perms
                 .and_then(|p| p.get(perm.manifest_key()))
@@ -169,6 +175,7 @@ mod tests {
             [permissions]
             fs_read = false
             net = false
+            keymap = false
             "#,
         )
         .unwrap();
@@ -178,6 +185,7 @@ mod tests {
         assert!(!p.is_allowed(Permission::Net));
         assert!(p.is_allowed(Permission::Run));
         assert!(p.is_allowed(Permission::Env));
+        assert!(!p.is_allowed(Permission::Keymap));
     }
 
     #[test]
@@ -191,14 +199,18 @@ mod tests {
 
     #[test]
     fn set_modifies_single_permission() {
-        let mut p = PluginPermissions::trusted();
-        p.set(Permission::Net, false);
-        p.set(Permission::Run, false);
-        assert!(p.is_allowed(Permission::FsRead));
-        assert!(p.is_allowed(Permission::FsWrite));
-        assert!(!p.is_allowed(Permission::Net));
-        assert!(!p.is_allowed(Permission::Run));
-        assert!(p.is_allowed(Permission::Env));
+        for toggled in Permission::ALL {
+            let mut p = PluginPermissions::trusted();
+            p.set(toggled, false);
+            for other in Permission::ALL {
+                let want = other != toggled;
+                assert_eq!(
+                    p.is_allowed(other),
+                    want,
+                    "toggling {toggled} should leave {other} as {want}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -210,6 +222,42 @@ mod tests {
             .unwrap();
         let result: i32 = func.call(()).unwrap();
         assert_eq!(result, 42);
+    }
+
+    #[test]
+    fn load_plugin_permissions_no_dir_denies_all() {
+        let p = load_plugin_permissions(None);
+        for perm in Permission::ALL {
+            assert!(
+                !p.is_allowed(perm),
+                "{perm} should be denied without a plugin dir"
+            );
+        }
+    }
+
+    #[test]
+    fn load_plugin_permissions_missing_manifest_denies_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = load_plugin_permissions(Some(dir.path()));
+        for perm in Permission::ALL {
+            assert!(
+                !p.is_allowed(perm),
+                "{perm} should be denied without a plugin.toml"
+            );
+        }
+    }
+
+    #[test]
+    fn load_plugin_permissions_invalid_manifest_denies_all() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(MANIFEST_FILE), "not = valid = toml").unwrap();
+        let p = load_plugin_permissions(Some(dir.path()));
+        for perm in Permission::ALL {
+            assert!(
+                !p.is_allowed(perm),
+                "{perm} should be denied on invalid manifest"
+            );
+        }
     }
 
     #[test]

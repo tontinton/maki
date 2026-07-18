@@ -2206,11 +2206,11 @@ maki.keymap.del({mode}, {lhs})
 ```
 
 Remove the mapping for {lhs} in {mode}. Does nothing if no mapping
-exists for that key.
+exists for that key. Only normal mode (`"n"`) is supported today.
 
 **Parameters:**
 
-- `{mode}` (`string`) Mode letter (reserved for future modes).
+- `{mode}` (`string`) Mode letter. Currently only `"n"` is accepted.
 - `{lhs}` (`string`) Key to unmap, in Vim notation.
 
 **Example:**

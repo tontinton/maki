@@ -6,6 +6,8 @@ use crossterm::event::{KeyCode, KeyModifiers};
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Lua, RegistryKey, Result as LuaResult, Table};
 
+use crate::plugin_permissions::PluginPermissions;
+
 static NEXT_KEYMAP_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug)]
@@ -107,10 +109,15 @@ impl KeymapStore {
         (id, old)
     }
 
-    pub fn del(&mut self, key: KeyCode, modifiers: KeyModifiers) -> Option<RegistryKey> {
+    pub fn del(
+        &mut self,
+        key: KeyCode,
+        modifiers: KeyModifiers,
+        plugin: &Arc<str>,
+    ) -> Option<RegistryKey> {
         self.bindings
             .iter()
-            .position(|b| b.key == key && b.modifiers == modifiers)
+            .position(|b| b.key == key && b.modifiers == modifiers && &b.plugin == plugin)
             .map(|pos| self.bindings.remove(pos).callback)
     }
 
@@ -266,7 +273,7 @@ fn publish_keymap_snapshot(lua: &Lua) {
 /// maki.keymap.set("n", "<C-t>", function()
 ///   print("toggle!")
 /// end, { desc = "Toggle panel" })
-#[lua_fn]
+#[lua_fn(guard = Keymap)]
 fn set(
     lua: &Lua,
     #[ctx] plugin: Arc<str>,
@@ -292,28 +299,35 @@ fn set(
         .set(key, modifiers, registry_key, Arc::clone(&plugin), desc);
     if let Some(old_key) = old {
         tracing::warn!(key = %lhs, plugin = %plugin, "keymap shadowed by plugin");
-        let _ = lua.remove_registry_value(old_key);
+        if let Err(e) = lua.remove_registry_value(old_key) {
+            tracing::warn!(key = %lhs, plugin = %plugin, error = %e, "leaked keymap registry value");
+        }
     }
     publish_keymap_snapshot(lua);
     Ok(())
 }
 
 /// Remove the mapping for {lhs} in {mode}. Does nothing if no mapping
-/// exists for that key.
+/// exists for that key. Only normal mode (`"n"`) is supported today.
 ///
-/// @param mode string Mode letter (reserved for future modes).
+/// @param mode string Mode letter. Currently only `"n"` is accepted.
 /// @param lhs string Key to unmap, in Vim notation.
 /// @example
 /// maki.keymap.del("n", "<C-t>")
-#[lua_fn]
+#[lua_fn(guard = Keymap)]
 fn del(lua: &Lua, #[ctx] plugin: Arc<str>, mode: String, lhs: String) -> LuaResult<()> {
-    let _ = (mode, &plugin);
+    if mode != "n" {
+        return Err(mlua::Error::runtime(format!(
+            "unsupported keymap mode: {mode}"
+        )));
+    }
     let (key, modifiers) = parse_key_notation(&lhs).map_err(mlua::Error::runtime)?;
     let old = lua
         .app_data_mut::<KeymapStore>()
-        .and_then(|mut store| store.del(key, modifiers));
-    if let Some(old_key) = old {
-        let _ = lua.remove_registry_value(old_key);
+        .ok_or_else(|| mlua::Error::runtime("keymap store not initialized"))?
+        .del(key, modifiers, &plugin);
+    if let Err(e) = old.map_or(Ok(()), |k| lua.remove_registry_value(k)) {
+        tracing::warn!(key = %lhs, plugin = %plugin, error = %e, "leaked keymap registry value");
     }
     publish_keymap_snapshot(lua);
     Ok(())
@@ -328,8 +342,8 @@ lua_table! {
     ///   print("hello")
     /// end, { desc = "Say hello" })
     /// ```
-    "maki.keymap" => pub(crate) fn create_keymap_table(plugin: Arc<str>), DOCS [
-        set(plugin), del(plugin),
+    "maki.keymap" => pub(crate) fn create_keymap_table(plugin: Arc<str>, perms: &PluginPermissions), DOCS [
+        set(perms, plugin), del(perms, plugin),
     ]
 }
 
@@ -433,11 +447,19 @@ mod tests {
         );
         assert_eq!(store.bindings.len(), 1);
 
-        let removed = store.del(KeyCode::Char('x'), KeyModifiers::ALT);
+        let wrong = store.del(KeyCode::Char('x'), KeyModifiers::ALT, &Arc::from("other"));
+        assert!(wrong.is_none());
+        assert_eq!(
+            store.bindings.len(),
+            1,
+            "del by another plugin must not remove an existing binding"
+        );
+
+        let removed = store.del(KeyCode::Char('x'), KeyModifiers::ALT, &Arc::from("p"));
         assert!(removed.is_some());
         assert!(store.bindings.is_empty());
 
-        let missing = store.del(KeyCode::Char('x'), KeyModifiers::ALT);
+        let missing = store.del(KeyCode::Char('x'), KeyModifiers::ALT, &Arc::from("p"));
         assert!(missing.is_none());
     }
 

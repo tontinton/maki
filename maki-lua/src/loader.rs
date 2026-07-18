@@ -787,6 +787,81 @@ mod tests {
         }
     }
 
+    /// End-to-end permission gate: a plugin loaded with denied permissions cannot
+    /// call maki.keymap.set. The guard returns a runtime error that surfaces
+    /// through load_source. The guard helper is unit-tested elsewhere; this
+    /// test confirms the wiring through create_maki_global.
+    #[test]
+    fn keymap_permission_denied_blocks_set() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let err = host
+            .load_source_with_permissions(
+                "untrusted",
+                r#"maki.keymap.set("n", "<C-x>", function() end)"#,
+                PluginPermissions::denied(),
+            )
+            .expect_err("denied permissions must block keymap.set");
+        let msg = err.to_string();
+        assert!(msg.contains("permission denied"), "got: {msg}");
+        assert!(msg.contains("keymap"), "got: {msg}");
+        assert!(
+            host.keymap_reader().load().entries.is_empty(),
+            "no binding should be stored when denied"
+        );
+    }
+
+    /// Trusted posture allows keymap.set: confirms the default init posture
+    /// matches the security model, where init files run fully trusted.
+    #[test]
+    fn keymap_permission_trusted_allows_set() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source_with_permissions(
+            "init",
+            r#"maki.keymap.set("n", "<C-y>", function() end, { desc = "trusted" })"#,
+            PluginPermissions::trusted(),
+        )
+        .expect("trusted permissions must allow keymap.set");
+        let snap = host.keymap_reader().load();
+        assert_eq!(snap.entries.len(), 1);
+        assert_eq!(snap.entries[0].desc, "trusted");
+    }
+
+    /// Plugin-scoped del through the real load wiring: a plugin can remove
+    /// its own binding, and cannot remove another plugin's binding for the
+    /// same key. Drives the guard + scoping through create_maki_global, not
+    /// just the store unit.
+    #[test]
+    fn keymap_del_scoped_to_owning_plugin() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source_with_permissions(
+            "owner",
+            r#"maki.keymap.set("n", "<C-x>", function() end, { desc = "owned" })"#,
+            PluginPermissions::trusted(),
+        )
+        .expect("owner must be able to set");
+        host.load_source_with_permissions(
+            "intruder",
+            r#"maki.keymap.del("n", "<C-x>")"#,
+            PluginPermissions::trusted(),
+        )
+        .expect("del returns Ok even when the binding is not mine to remove");
+        let snap = host.keymap_reader().load();
+        assert_eq!(
+            snap.entries.len(),
+            1,
+            "intruder must not remove owner's binding"
+        );
+        assert_eq!(snap.entries[0].desc, "owned");
+
+        host.load_source_with_permissions(
+            "owner",
+            r#"maki.keymap.del("n", "<C-x>")"#,
+            PluginPermissions::trusted(),
+        )
+        .expect("owner must be able to del its own binding");
+        assert!(host.keymap_reader().load().entries.is_empty());
+    }
+
     #[test]
     fn disabled_host_returns_defaults() {
         let host = PluginHost::disabled();

@@ -145,6 +145,36 @@ When you pick "always allow", the saved scope is generalized so it stays useful 
 
 For MCP tools, both allow and deny decisions generalize to `*` (the entire tool). This is because MCP tool inputs are opaque JSON with no meaningful scope pattern to differentiate. Denying a single MCP invocation denies the tool entirely until you revoke the rule.
 
+## Plugin Permissions
+
+Plugins (bundled or third-party) run Lua inside Maki and can touch the filesystem, network, shell, environment, and keymap. Each plugin carries a permission set that gates these capabilities, separate from the tool-call rules above.
+
+| Permission | Gates |
+|------------|-------|
+| `fs_read` | `maki.fs.read`, `read_bytes`, `metadata`, `dir`, `glob`, `grep`, `root` |
+| `fs_write` | `maki.fs.write`, `rm`, `mkdir` |
+| `net` | `maki.net.*` |
+| `run` | `maki.fn.job*`, `maki.interpreter.run`, and shell spawning |
+| `env` | `maki.env.*`, `maki.uv.*`, and `maki.fn.executable` |
+| `keymap` | `maki.keymap.set` and `maki.keymap.del` |
+
+**Bundled plugins** (shipped with Maki) always run fully trusted. **Init files** (`~/.config/maki/init.lua`, `.maki/init.lua`) and third-party plugins loaded from a plugin directory derive their permissions from a `plugin.toml` beside their `init.lua`:
+
+```toml
+[permissions]
+fs_read = true
+net = false
+keymap = false
+```
+
+All six default to `true` when the `[permissions]` table omits a key. A plugin that omits `[permissions]` entirely is granted everything. If no `plugin.toml` is found next to the init file or plugin, all permissions are denied. To grant an init file access to a gated API, ship an empty `plugin.toml` (or one with the relevant key set to `true`) beside the init.lua.
+
+Third-party plugins are not loadable yet; bundled plugins and init files are the only plugin sources loaded today.
+
+Of the gated APIs, only `maki.keymap.del` is plugin-scoped: a plugin can only remove a binding it owns. `maki.keymap.set` is not scoped, so a keymap-authorized plugin can still shadow another plugin's binding for the same key by setting its own callback. The previous callback is dropped.
+
+To boot without loading any plugins or init files, use `--no-plugins`.
+
 ## YOLO Mode
 
 To skip all prompts, toggle YOLO with the `/yolo` command, or run with `--yolo`. Explicit deny rules still apply.
