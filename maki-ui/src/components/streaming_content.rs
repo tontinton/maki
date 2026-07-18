@@ -5,23 +5,20 @@ use crate::theme;
 use maki_markdown::render::Renderer;
 use ratatui::style::Style;
 use ratatui::text::Line;
-use std::hash::{DefaultHasher, Hash, Hasher};
 
 const STREAMING_MAX_LINE_BYTES: usize = 5_000;
 
-/// Block-level streaming markdown cache.
-///
-/// Memoizes the rendered line tree under a content-addressed key so
-/// repaints during streaming are free when nothing changed. The key
-/// combines a 64-bit hash of the visible text, its byte length, the
-/// render width, and the theme generation. Length is part of the key
-/// alongside the hash because hashing alone could in principle collide;
-/// requiring both makes accidental reuse on different buffers
-/// astronomically unlikely.
-#[derive(Default)]
-struct StreamingCache {
-    key: Option<CacheKey>,
-    lines: Vec<Line<'static>>,
+/// FNV-1a offset basis; chosen so an empty string hashes to a non-zero value.
+const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+/// FNV-1a 64-bit prime.
+const FNV_PRIME: u64 = 0x100000001b3;
+
+/// Fold one byte into a running FNV-1a hash. Order-dependent, so extending a
+/// prefix with more bytes yields the same result as hashing the whole string
+/// from scratch — which is what lets the cache key be computed incrementally.
+#[inline]
+fn fnv_fold(hash: u64, byte: u8) -> u64 {
+    hash.wrapping_mul(FNV_PRIME).wrapping_add(byte as u64)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -32,23 +29,64 @@ struct CacheKey {
     theme_gen: u64,
 }
 
-impl CacheKey {
-    fn for_text(text: &str, width: u16, theme_gen: u64) -> Self {
-        let mut hasher = DefaultHasher::new();
-        text.hash(&mut hasher);
+/// Block-level streaming markdown cache.
+///
+/// Memoizes the rendered line tree under a content-addressed key so
+/// repaints during streaming are free when nothing changed. The key
+/// combines a 64-bit hash of the visible text, its byte length, the
+/// render width, and the theme generation. Length is part of the key
+/// alongside the hash because hashing alone could in principle collide;
+/// requiring both makes accidental reuse on different buffers
+/// astronomically unlikely.
+///
+/// The hash is maintained incrementally: as streamed text only ever grows,
+/// each frame folds in only the newly revealed tail instead of re-hashing
+/// the whole visible buffer. This keeps the per-frame cost proportional to
+/// the bytes that actually arrived, not the total message size.
+struct StreamingCache {
+    key: Option<CacheKey>,
+    lines: Vec<Line<'static>>,
+    /// Running FNV-1a hash of the bytes folded so far.
+    hash: u64,
+    /// Bytes already folded into `hash`; a shrink (after invalidate) resets it.
+    hashed_len: usize,
+}
+
+impl Default for StreamingCache {
+    fn default() -> Self {
         Self {
-            hash: hasher.finish(),
-            byte_len: text.len(),
-            width,
-            theme_gen,
+            key: None,
+            lines: Vec::new(),
+            hash: FNV_OFFSET,
+            hashed_len: 0,
         }
     }
 }
 
 impl StreamingCache {
+    /// Hash `visible` incrementally, reusing the fold state from the previous
+    /// call. Streamed text grows monotonically within a message, so only the
+    /// appended tail is processed; a shorter string (post-invalidate) restarts.
+    fn hash_visible(&mut self, visible: &str) -> u64 {
+        // Strict growth is the streaming common case: fold only the new tail.
+        // A shrink (post-invalidate) or equal-length different content
+        // (rare, e.g. tests) restarts from scratch so the key stays accurate.
+        if visible.len() <= self.hashed_len {
+            self.hash = FNV_OFFSET;
+            self.hashed_len = 0;
+        }
+        for &b in visible.as_bytes()[self.hashed_len..].iter() {
+            self.hash = fnv_fold(self.hash, b);
+        }
+        self.hashed_len = visible.len();
+        self.hash
+    }
+
     fn invalidate(&mut self) {
         self.key = None;
         self.lines.clear();
+        self.hash = FNV_OFFSET;
+        self.hashed_len = 0;
     }
 
     /// Returns `true` when the cache was repopulated. The caller passes a
@@ -64,7 +102,12 @@ impl StreamingCache {
         width: u16,
     ) -> bool {
         let theme_gen = theme::generation();
-        let key = CacheKey::for_text(visible, width, theme_gen);
+        let key = CacheKey {
+            hash: self.hash_visible(visible),
+            byte_len: visible.len(),
+            width,
+            theme_gen,
+        };
         if self.key == Some(key) {
             return false;
         }
