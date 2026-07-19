@@ -87,6 +87,41 @@ local function bounded_errors(errors)
   return table.concat(out, "\n")
 end
 
+local function make_preview(ctx, description)
+  local tol = ctx:tool_output_lines()
+  local max_preview = (tol and tol.task) or DEFAULT_OUTPUT_LINES
+  local view = ToolView.new(maki.ui.buf(), { max_lines = max_preview, keep = "tail" })
+  local last_completed = 0
+
+  local function update(progress)
+    if progress.completed_count > last_completed then
+      local new_count = progress.completed_count - last_completed
+      local recent = progress.recent_tools
+      local start = new_count <= #recent and (#recent - new_count + 1) or 1
+      for i = start, #recent do
+        view:append({ { "✓ " .. recent[i], "dim" } })
+      end
+      last_completed = progress.completed_count
+    end
+
+    local elapsed = math.floor(progress.elapsed_ms / 1000)
+    local elapsed_str = maki.ui.humantime(elapsed)
+    local header = { { description .. " · " .. elapsed_str, "bold" } }
+    if progress.current_tool then
+      header[#header + 1] = { { "▸ " .. progress.current_tool, "bold" } }
+    elseif not progress.done then
+      header[#header + 1] = { { "Starting...", "dim" } }
+    end
+    view:set_header(header)
+  end
+
+  view.buf:on("click", function()
+    view:toggle()
+  end)
+
+  return { buf = view.buf, update = update }
+end
+
 local function handler(input, ctx)
   local subagent_type = input.subagent_type or "research"
   if subagent_type ~= "research" and subagent_type ~= "general" then
@@ -149,51 +184,86 @@ local function handler(input, ctx)
     }
   end
 
-  local permit = semaphore:acquire()
+  local preview = make_preview(ctx, input.description or "task")
 
-  -- pcall so a raised error cannot leak the permit.
-  local ok, out = pcall(function()
-    local sess, sess_err = maki.agent.session(ctx, {
-      model_spec = model.spec,
-      system = system,
-      tools = tool_defs,
-      local_tools = local_tools,
-      audience = audience,
-      name = input.description,
-    })
-    if sess_err then
-      return { llm_output = sess_err, is_error = true }
-    end
-
-    local message = input.prompt
-    if validator then
-      message = message .. STRUCTURED_OUTPUT_PROMPT_SUFFIX
-    end
-
-    local result, err = sess:prompt(message)
-    local retries = 0
-    while not err and validator and not captured and retries < MAX_STRUCTURED_RETRIES do
-      retries = retries + 1
-      result, err = sess:prompt(NUDGE_MISSING)
-    end
-
-    sess:close()
-
+  local function on_finish(err, result)
     if err then
-      return { llm_output = "sub-agent error: " .. err, is_error = true }
+      ctx:finish({ llm_output = "task failed: " .. tostring(err), is_error = true, body = preview.buf })
+    else
+      ctx:finish({
+        llm_output = result.llm_output,
+        body = preview.buf,
+        is_error = result.is_error,
+        format = result.format,
+      })
     end
-    if validator and not captured then
-      local msg = last_errors and (STRUCTURED_INVALID_ERROR .. ":\n" .. last_errors) or STRUCTURED_MISSING_ERROR
-      return { llm_output = msg, is_error = true }
-    end
-    return { llm_output = captured and maki.json.encode(captured) or result.text, format = "markdown" }
-  end)
-
-  permit:release()
-  if not ok then
-    error(out, 0)
   end
-  return out
+
+  maki.async.run(function()
+    local permit = semaphore:acquire()
+    local ok, out = pcall(function()
+      local sess, sess_err = maki.agent.session(ctx, {
+        model_spec = model.spec,
+        system = system,
+        tools = tool_defs,
+        local_tools = local_tools,
+        audience = audience,
+        name = input.description,
+      })
+      if sess_err then
+        return { llm_output = sess_err, is_error = true }
+      end
+
+      local function do_prompt()
+        local message = input.prompt
+        if validator then
+          message = message .. STRUCTURED_OUTPUT_PROMPT_SUFFIX
+        end
+        local result, err = sess:prompt(message)
+        local retries = 0
+        while not err and validator and not captured and retries < MAX_STRUCTURED_RETRIES do
+          retries = retries + 1
+          result, err = sess:prompt(NUDGE_MISSING)
+        end
+        if err then
+          return { llm_output = "sub-agent error: " .. err, is_error = true }
+        end
+        if validator and not captured then
+          local msg = last_errors and (STRUCTURED_INVALID_ERROR .. ":\n" .. last_errors) or STRUCTURED_MISSING_ERROR
+          return { llm_output = msg, is_error = true }
+        end
+        return { llm_output = captured and maki.json.encode(captured) or result.text, format = "markdown" }
+      end
+
+      local function do_poll()
+        while true do
+          local progress, err = sess:get_progress()
+          if not progress then
+            return
+          end
+          preview:update(progress)
+          if progress.done then
+            return
+          end
+        end
+      end
+
+      local results = maki.async.gather({ do_prompt, do_poll })
+      sess:close()
+      local prompt_res = results[1]
+      if not prompt_res.ok then
+        error(prompt_res.err, 0)
+      end
+      return prompt_res.value
+    end)
+    permit:release()
+    if not ok then
+      error(out, 0)
+    end
+    return out
+  end, on_finish)
+
+  return nil
 end
 
 local function header(input)

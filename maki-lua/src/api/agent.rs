@@ -1,9 +1,10 @@
 //! `maki.agent` exposes subagent primitives to Lua plugins. Policy (retries,
 //! validation, concurrency) lives in the task plugin, not here.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::pin::pin;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
@@ -38,6 +39,8 @@ use crate::api::util::ctx::{AgentContext, LuaCtx};
 
 const SESSION_CLOSED_ERR: &str = "session closed";
 const DEFAULT_SESSION_AUDIENCE: ToolAudience = ToolAudience::GENERAL_SUB;
+const PROGRESS_MAX_RECENT: usize = 5;
+const PROGRESS_TIMEOUT_MS: u64 = 500;
 
 fn resolve_model_from_ctx(ctx: &AgentContext, tier: Option<&str>) -> Result<Model, String> {
     let Some(tier_str) = tier else {
@@ -468,10 +471,12 @@ async fn session(
     };
 
     let session_id = MakiId::generate();
+    let start = Instant::now();
     let (sub_tx, sub_rx) = flume::unbounded::<Envelope>();
     let sub_event_tx = EventSender::new(sub_tx, agent_ctx.event_tx.run_id());
     let parent_tx = agent_ctx.event_tx.clone();
     let (answer_tx, answer_rx) = flume::unbounded::<String>();
+    let progress = Arc::new(Progress::new(start));
 
     let subagent_info: Arc<OnceLock<SubagentInfo>> = Arc::new(OnceLock::new());
     let total_input = Arc::new(AtomicU32::new(0));
@@ -481,6 +486,7 @@ async fn session(
         let info = Arc::clone(&subagent_info);
         let ti = Arc::clone(&total_input);
         let to = Arc::clone(&total_output);
+        let progress = Arc::clone(&progress);
         let parent_tx = parent_tx.clone();
         smol::spawn(async move {
             while let Ok(mut envelope) = sub_rx.recv_async().await {
@@ -489,6 +495,12 @@ async fn session(
                         ti.fetch_add(usage.total_input(), Ordering::Relaxed);
                         to.fetch_add(usage.output, Ordering::Relaxed);
                         continue;
+                    }
+                    AgentEvent::ToolStart(e) => {
+                        progress.set_current(&e.tool);
+                    }
+                    AgentEvent::ToolDone(e) => {
+                        progress.add_recent(&e.tool);
                     }
                     AgentEvent::Error { .. }
                     | AgentEvent::ToolOutput { .. }
@@ -550,12 +562,14 @@ async fn session(
         name,
         total_input,
         total_output,
-        start: Instant::now(),
+        start,
         closed: false,
+        progress: Arc::clone(&progress),
     };
 
     let sess = lua.create_userdata(LuaSession {
         inner: Arc::new(AsyncMutex::new(state)),
+        progress,
     })?;
     Ok((Some(sess), None))
 }
@@ -650,6 +664,68 @@ async fn dispatch_racing_live(
     }
 }
 
+struct ProgressState {
+    current: Option<String>,
+    recent: VecDeque<String>,
+    done: bool,
+    completed_count: u64,
+}
+
+struct Progress {
+    start: Instant,
+    state: Mutex<ProgressState>,
+    tx: flume::Sender<()>,
+    rx: flume::Receiver<()>,
+}
+
+impl Progress {
+    fn new(start: Instant) -> Self {
+        let (tx, rx) = flume::unbounded();
+        Self {
+            start,
+            state: Mutex::new(ProgressState {
+                current: None,
+                recent: VecDeque::new(),
+                done: false,
+                completed_count: 0,
+            }),
+            tx,
+            rx,
+        }
+    }
+
+    fn notify(&self) {
+        let _ = self.tx.send(());
+    }
+
+    fn set_current(&self, tool: &str) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.current = Some(tool.to_owned());
+        drop(state);
+        self.notify();
+    }
+
+    fn add_recent(&self, tool: &str) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.current = None;
+        state.completed_count += 1;
+        if state.recent.len() >= PROGRESS_MAX_RECENT {
+            state.recent.pop_front();
+        }
+        state.recent.push_back(tool.to_owned());
+        drop(state);
+        self.notify();
+    }
+
+    fn set_done(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.done = true;
+        state.current = None;
+        drop(state);
+        self.notify();
+    }
+}
+
 struct SessionState {
     params: AgentParams,
     system: String,
@@ -674,6 +750,7 @@ struct SessionState {
     total_output: Arc<AtomicU32>,
     start: Instant,
     closed: bool,
+    progress: Arc<Progress>,
 }
 
 impl SessionState {
@@ -682,6 +759,7 @@ impl SessionState {
             return;
         }
         self.closed = true;
+        self.progress.set_done();
         self.parent_cancels.remove(&self.ui_id);
         let messages = std::mem::replace(&mut self.history, History::new(Vec::new())).into_vec();
         let _ = self.parent_event_tx.send(AgentEvent::SubagentHistory {
@@ -700,6 +778,7 @@ impl SessionState {
 
 struct LuaSession {
     inner: Arc<AsyncMutex<SessionState>>,
+    progress: Arc<Progress>,
 }
 
 impl Drop for LuaSession {
@@ -779,6 +858,7 @@ async fn prompt(
     };
     let result = agent.run(input).await;
     drop(agent);
+    s.progress.set_done();
     if let Err(e) = result {
         return Ok((None, Some(e.to_string())));
     }
@@ -805,6 +885,42 @@ async fn prompt(
     Ok((Some(tbl), None))
 }
 
+/// Poll the session for a progress snapshot while a prompt is running.
+///
+/// Returns a table with:
+///   `elapsed_ms` (integer): time since the session was created.
+///   `current_tool` (string?): name of the tool currently running, if any.
+///   `recent_tools` (table): names of the last few finished tools, oldest first.
+///   `completed_count` (integer): total number of finished tools so far.
+///   `done` (bool): true once the prompt has completed.
+///
+/// The call returns at most every `PROGRESS_TIMEOUT_MS` milliseconds, or
+/// immediately when a tool starts or finishes.
+#[lua_fn]
+async fn get_progress(lua: Lua, this: mlua::UserDataRef<LuaSession>) -> LuaResult<Pair<Table>> {
+    let progress = Arc::clone(&this.progress);
+    let notify = pin!(progress.rx.recv_async());
+    let timeout = pin!(smol::Timer::after(Duration::from_millis(
+        PROGRESS_TIMEOUT_MS
+    )));
+    let _ = select(notify, timeout).await;
+
+    let state = progress.state.lock().unwrap_or_else(|e| e.into_inner());
+    let elapsed = progress.start.elapsed().as_millis() as u64;
+    let tbl = lua.create_table()?;
+    tbl.set("elapsed_ms", elapsed)?;
+    tbl.set("current_tool", state.current.as_deref())?;
+    tbl.set("done", state.done)?;
+    tbl.set("completed_count", state.completed_count)?;
+
+    let recent = lua.create_table()?;
+    for (i, tool) in state.recent.iter().enumerate() {
+        recent.set(i + 1, tool.as_str())?;
+    }
+    tbl.set("recent_tools", recent)?;
+    Ok((Some(tbl), None))
+}
+
 /// Close the session and flush its history back to the parent agent. You can
 /// call this multiple times safely. If you forget, it runs automatically when
 /// the session is garbage collected.
@@ -826,7 +942,7 @@ lua_class! {
     /// `:prompt()`. The session remembers previous turns, so you can have
     /// a multi-step conversation. Call `:close()` when you are done, or let
     /// garbage collection handle it.
-    "maki.agent.Session" => LuaSession, SESSION_DOCS [prompt, close]
+    "maki.agent.Session" => LuaSession, SESSION_DOCS [prompt, close, get_progress]
 }
 
 /// Weak Lua ref avoids a reference cycle when the session is stored in userdata.
