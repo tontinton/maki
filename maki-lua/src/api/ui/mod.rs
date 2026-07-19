@@ -193,6 +193,46 @@ fn terminal_size(lua: &Lua) -> LuaResult<Table> {
     Ok(tbl)
 }
 
+/// Returns the display width of a string in terminal cells, matching
+/// how `ratatui` measures text.
+///
+/// @param text string The text to measure.
+/// @return (integer) Number of display cells the text occupies.
+/// @example
+/// local w = maki.ui.display_width("hello")
+#[lua_fn]
+fn display_width(_lua: &Lua, text: String) -> LuaResult<usize> {
+    use unicode_width::UnicodeWidthStr;
+    Ok(text.width())
+}
+
+/// Splits a string at a display-cell boundary.
+///
+/// @param text string The text to split.
+/// @param max_width integer Maximum display cells for the head.
+/// @return (table) `{head = string, tail = string}`.
+/// @example
+/// local t = maki.ui.truncate_text("hello world", 5)
+/// -- t.head == "hello", t.tail == " world"
+#[lua_fn]
+fn truncate_text(lua: &Lua, text: String, max_width: usize) -> LuaResult<Table> {
+    use unicode_width::UnicodeWidthChar;
+    let mut width = 0;
+    let mut idx = 0;
+    for (i, c) in text.char_indices() {
+        let w = UnicodeWidthChar::width(c).unwrap_or(0);
+        if width + w > max_width {
+            break;
+        }
+        width += w;
+        idx = i + c.len_utf8();
+    }
+    let tbl = lua.create_table()?;
+    tbl.set("head", &text[..idx])?;
+    tbl.set("tail", &text[idx..])?;
+    Ok(tbl)
+}
+
 /// Shows a brief message in the status bar. The message disappears
 /// after a short time. Good for confirming an action like "copied!"
 /// or showing a transient warning.
@@ -379,6 +419,7 @@ lua_table! {
     /// ```
     extend "maki.ui" => pub(crate) fn add_ui_fns(), DOCS [
         buf, theme_color, highlight, markdown, humantime, terminal_size,
+        display_width, truncate_text,
         manual flash, manual open_editor, manual open_win, manual set_status_hint,
     ]
 }
