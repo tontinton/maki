@@ -13,6 +13,9 @@ use syntect::highlighting::{
 const DEFAULT_THEME: &str = "dracula";
 const RESERVED_KEYS: &[&str] = &["palette", "ui", "inherits"];
 
+#[cfg(test)]
+pub(crate) static THEME_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 const HELIX_TO_TEXTMATE: &[(&str, &str)] = &[
     ("comment", "comment, comment punctuation.definition.comment"),
     (
@@ -1077,6 +1080,7 @@ mode_build = "#112233"
 
     #[test]
     fn style_by_name_resolves() {
+        let _guard = THEME_TEST_LOCK.lock().unwrap();
         set(dracula());
         let t = current();
         assert_eq!(style_by_name("dim"), t.tool_dim);
@@ -1128,6 +1132,7 @@ mode_build = "#112233"
 
     #[test]
     fn set_advances_generation() {
+        let _guard = THEME_TEST_LOCK.lock().unwrap();
         let before = generation();
         set(dracula());
         assert!(generation() > before);
@@ -1135,6 +1140,7 @@ mode_build = "#112233"
 
     #[test]
     fn set_installs_theme_before_generation_observed() {
+        let _guard = THEME_TEST_LOCK.lock().unwrap();
         let theme = tokyonight();
         let expected_syntax_bg = theme.syntax.settings.background;
         let before = generation();
@@ -1153,6 +1159,7 @@ mode_build = "#112233"
 
     #[test]
     fn set_generation_is_monotonic_across_switches() {
+        let _guard = THEME_TEST_LOCK.lock().unwrap();
         let g0 = generation();
         set(dracula());
         let g1 = generation();
