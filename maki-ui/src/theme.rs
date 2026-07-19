@@ -1080,7 +1080,7 @@ mode_build = "#112233"
 
     #[test]
     fn style_by_name_resolves() {
-        let _guard = THEME_TEST_LOCK.lock().unwrap();
+        let _guard = THEME_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         set(dracula());
         let t = current();
         assert_eq!(style_by_name("dim"), t.tool_dim);
@@ -1132,7 +1132,7 @@ mode_build = "#112233"
 
     #[test]
     fn set_advances_generation() {
-        let _guard = THEME_TEST_LOCK.lock().unwrap();
+        let _guard = THEME_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let before = generation();
         set(dracula());
         assert!(generation() > before);
@@ -1140,7 +1140,7 @@ mode_build = "#112233"
 
     #[test]
     fn set_installs_theme_before_generation_observed() {
-        let _guard = THEME_TEST_LOCK.lock().unwrap();
+        let _guard = THEME_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let theme = tokyonight();
         let expected_syntax_bg = theme.syntax.settings.background;
         let before = generation();
@@ -1159,7 +1159,7 @@ mode_build = "#112233"
 
     #[test]
     fn set_generation_is_monotonic_across_switches() {
-        let _guard = THEME_TEST_LOCK.lock().unwrap();
+        let _guard = THEME_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let g0 = generation();
         set(dracula());
         let g1 = generation();
