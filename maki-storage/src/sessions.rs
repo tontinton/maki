@@ -956,6 +956,8 @@ fn file_signature(path: &Path) -> Option<(u64, u64)> {
 }
 
 fn scan_headers(cwd: &str, dir: &Path) -> Result<Vec<SessionSummary>, StorageError> {
+    // Header scanners below drop sessions whose cwd does not match, so the
+    // returned list is scoped to the current working directory.
     let mut cache = load_scan_cache(dir);
     let mut fresh = ScanCache::new();
     let mut dirty = false;
