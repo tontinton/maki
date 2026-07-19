@@ -582,6 +582,7 @@ impl MessagesPanel {
         };
 
         if self.has_snapshot(tool_id) {
+            self.auto_scroll = false;
             let rel = u16::try_from(doc_row - seg_start).unwrap_or(u16::MAX);
             let buf_row = seg.source_line_at(rel, width).map_or(0, |l| seg.buf_row(l));
             if self.tool_in_progress(tool_id) {

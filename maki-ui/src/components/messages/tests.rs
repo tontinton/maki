@@ -1106,6 +1106,31 @@ fn handle_click_on_running_tool_forwards_live_without_recording() {
     let area = Rect::new(0, 0, 80, 24);
     assert!(panel.handle_click(area.y, area));
     assert!(panel.lua_clicks.is_empty());
+    assert!(!panel.auto_scroll, "clicking a running tool should pause auto-scroll");
+}
+
+#[test]
+fn handle_click_on_done_tool_pauses_auto_scroll() {
+    let mut panel = MessagesPanel::new(UiConfig::default());
+    panel.tool_start(start("t1", BASH_TOOL_NAME));
+    panel.tool_done(ToolDoneEvent {
+        id: "t1".into(),
+        tool: BASH_TOOL_NAME.into(),
+        output: ToolOutput::Plain("output".into()),
+        is_error: false,
+        annotation: None,
+        written_path: None,
+    });
+    panel.tool_snapshot(
+        "t1",
+        BufferSnapshot::from_arc(Arc::new(vec![snap_line("rendered")])),
+        None,
+    );
+    render(&mut panel, 80, 24);
+    let area = Rect::new(0, 0, 80, 24);
+    assert!(panel.auto_scroll, "auto_scroll should be on before click");
+    assert!(panel.handle_click(area.y, area));
+    assert!(!panel.auto_scroll, "clicking a finished tool should pause auto-scroll");
 }
 
 #[test]
