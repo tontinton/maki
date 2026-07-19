@@ -749,16 +749,15 @@ where
         let record: LogRecord<M, U, T> = match serde_json::from_slice(line) {
             Ok(r) => r,
             Err(e) => {
-                if !got_header {
-                    if let Ok(RawTag::Header { id: raw_id }) = serde_json::from_slice(line) {
-                        if let Err(source) = raw_id.parse::<MakiId>() {
-                            return Err(SessionError::CorruptHeaderId {
-                                path: display_path.to_string(),
-                                raw_id,
-                                source,
-                            });
-                        }
-                    }
+                if !got_header
+                    && let Ok(RawTag::Header { id: raw_id }) = serde_json::from_slice(line)
+                    && let Err(source) = raw_id.parse::<MakiId>()
+                {
+                    return Err(SessionError::CorruptHeaderId {
+                        path: display_path.to_string(),
+                        raw_id,
+                        source,
+                    });
                 }
                 warn!(
                     path = display_path,

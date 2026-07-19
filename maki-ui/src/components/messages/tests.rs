@@ -255,10 +255,28 @@ fn jump_to_bottom_popup_appears_when_scrolled_up() {
 
     panel.scroll(panel.half_page());
     let terminal = render(&mut panel, 80, 10);
-    assert!(panel.jump_to_bottom_popup().is_some());
+    let popup = panel.jump_to_bottom_popup().unwrap();
+    assert_eq!(popup.height, JUMP_TO_BOTTOM_POPUP_HEIGHT);
     let text = buffer_text(&terminal);
     assert!(text.contains(JUMP_TO_BOTTOM_TEXT));
     assert!(text.contains(key::SCROLL_BOTTOM.label));
+    let buffer = terminal.backend().buffer();
+    assert_eq!(buffer.cell((popup.x, popup.y)).unwrap().symbol(), "╭");
+    assert_eq!(
+        buffer.cell((popup.right() - 1, popup.y)).unwrap().symbol(),
+        "╮"
+    );
+    assert_eq!(
+        buffer.cell((popup.x, popup.bottom() - 1)).unwrap().symbol(),
+        "╰"
+    );
+    assert_eq!(
+        buffer
+            .cell((popup.right() - 1, popup.bottom() - 1))
+            .unwrap()
+            .symbol(),
+        "╯"
+    );
 
     panel.jump_to_bottom();
     assert!(panel.auto_scroll);

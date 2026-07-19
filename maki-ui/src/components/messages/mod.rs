@@ -43,9 +43,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph};
 
 const THINKING_HIDDEN_HEADER: &str = "thinking> ...";
-pub(crate) const JUMP_TO_BOTTOM_TEXT: &str = "↓ bottom";
+pub(crate) const JUMP_TO_BOTTOM_TEXT: &str = "↓ Bottom";
+const JUMP_TO_BOTTOM_KEY_GAP: &str = "  ";
 const JUMP_TO_BOTTOM_THRESHOLD: u16 = 1;
-const JUMP_TO_BOTTOM_POPUP_HEIGHT: u16 = 1;
+const JUMP_TO_BOTTOM_POPUP_HEIGHT: u16 = 3;
 const JUMP_TO_BOTTOM_POPUP_BOTTOM_MARGIN: u16 = 1;
 
 #[derive(Clone, Copy)]
@@ -870,12 +871,13 @@ impl MessagesPanel {
         let keybind_style = theme::current().keybind_key;
         let line = Line::from(vec![
             Span::styled(JUMP_TO_BOTTOM_TEXT, text_style),
+            Span::raw(JUMP_TO_BOTTOM_KEY_GAP),
             Span::styled(key::SCROLL_BOTTOM.label, keybind_style),
         ]);
         let text_width = line.width() as u16;
 
         let block = Block::default()
-            .borders(Borders::LEFT | Borders::RIGHT)
+            .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(theme::current().panel_border)
             .padding(Padding::horizontal(1))
