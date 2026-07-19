@@ -242,14 +242,20 @@ impl RawConfig {
             }
             entry.opts.extend(plugin.opts);
         }
-        self.tools.extend(overlay.tools);
+        for (name, plugin) in overlay.tools {
+            let entry = self.tools.entry(name).or_default();
+            if plugin.enabled.is_some() {
+                entry.enabled = plugin.enabled;
+            }
+            entry.opts.extend(plugin.opts);
+        }
     }
 
     pub fn into_config(self, no_rtk: bool) -> Result<Config, ConfigError> {
         let mut plugins = self.plugins;
-        let mut migration_warnings = self.agent.migrate_removed(&mut plugins);
+        let mut migration_warnings = migrate_tools_to_plugins(&self.tools, &mut plugins);
+        migration_warnings.extend(self.agent.migrate_removed(&mut plugins));
         migration_warnings.extend(self.index.migrate_removed(&mut plugins));
-        migration_warnings.extend(migrate_tools_to_plugins(&self.tools, &mut plugins));
 
         validate_plugin_tables(&plugins)?;
 
@@ -321,13 +327,20 @@ fn migrate_tools_to_plugins(
         }
 
         let plugin = plugins.entry(name.clone()).or_default();
-        if plugin.enabled.is_none() {
+        let mut changed = false;
+        if plugin.enabled.is_none() && cfg.enabled.is_some() {
             plugin.enabled = cfg.enabled;
+            changed = true;
         }
         for (k, v) in &cfg.opts {
-            plugin.opts.entry(k.clone()).or_insert_with(|| v.clone());
+            plugin.opts.entry(k.clone()).or_insert_with(|| {
+                changed = true;
+                v.clone()
+            });
         }
-        warnings.push(format!("tools.{name} migrated to plugins.{name}"));
+        if changed {
+            warnings.push(format!("tools.{name} migrated to plugins.{name}"));
+        }
     }
 
     warnings
@@ -2084,6 +2097,23 @@ mod tests {
     }
 
     #[test]
+    fn merge_tools_preserves_enabled_when_overlay_omits_it() {
+        let mut base: RawConfig = toml::from_str("[tools.bash]\nenabled = false\n").unwrap();
+        let overlay: RawConfig = toml::from_str("[tools.bash]\ntimeout_secs = 30\n").unwrap();
+        base.merge(overlay);
+        let config = base.into_config(false).unwrap();
+        assert!(
+            !config.plugins.names.contains(&"bash".to_string()),
+            "base enabled=false preserved"
+        );
+        assert_eq!(
+            config.plugins.opts["bash"]["timeout_secs"],
+            serde_json::json!(30),
+            "overlay opts merged"
+        );
+    }
+
+    #[test]
     fn merge_always_flags_overlay_wins() {
         let mut base = RawConfig {
             always_fast: Some(false),
@@ -2893,6 +2923,34 @@ mod tests {
                 .iter()
                 .any(|w| w.contains("bash_timeout")),
             "should not warn when plugin already has the option"
+        );
+    }
+
+    #[test]
+    fn removed_tools_table_does_not_warn_when_plugin_unchanged() {
+        let raw: RawConfig =
+            toml::from_str("[tools.bash]\nenabled = true\n[plugins.bash]\nenabled = true\n")
+                .unwrap();
+        let config = raw.into_config(false).unwrap();
+        assert!(
+            !config
+                .migration_warnings
+                .iter()
+                .any(|w| w.contains("tools.bash")),
+            "should not warn when plugins.bash already matches"
+        );
+    }
+
+    #[test]
+    fn tools_plugin_options_win_over_agent_removed_fields() {
+        let raw: RawConfig =
+            toml::from_str("agent = { bash_timeout_secs = 60 }\n[tools.bash]\ntimeout_secs = 30\n")
+                .unwrap();
+        let config = raw.into_config(false).unwrap();
+        assert_eq!(
+            config.plugins.opts["bash"]["timeout_secs"],
+            serde_json::json!(30),
+            "tools.bash.timeout_secs should win over agent.bash_timeout_secs"
         );
     }
 
