@@ -1795,11 +1795,6 @@ fn setup_compaction_buffer(lua_src: &str, expected: maki_config::CompactionBuffe
     ""
     ; "wrong_type"
 )]
-#[test_case::test_case(
-    "maki.setup({ agent = { bash_timeout_secs = 120 } })",
-    UNKNOWN_FIELD_ERR
-    ; "moved_plugin_option"
-)]
 fn setup_rejects_bad_input(lua_src: &str, expected_substr: &str) {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
@@ -1810,6 +1805,21 @@ fn setup_rejects_bad_input(lua_src: &str, expected_substr: &str) {
     if !expected_substr.is_empty() {
         assert!(err.to_string().contains(expected_substr), "got: {err}");
     }
+}
+
+#[test]
+fn setup_moved_plugin_option_is_preserved_for_migration() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let raw = host
+        .send_run_init_lua(
+            "maki.setup({ agent = { bash_timeout_secs = 120 } })".to_owned(),
+            "test_init.lua".to_owned(),
+            None,
+        )
+        .unwrap()
+        .expect("expected setup config");
+    assert_eq!(raw.agent.bash_timeout_secs, Some(120));
 }
 
 #[test]

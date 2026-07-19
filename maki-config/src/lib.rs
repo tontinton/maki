@@ -277,9 +277,7 @@ impl RawConfig {
     }
 }
 
-fn validate_plugin_tables(
-    plugins: &HashMap<String, PluginFileConfig>,
-) -> Result<(), ConfigError> {
+fn validate_plugin_tables(plugins: &HashMap<String, PluginFileConfig>) -> Result<(), ConfigError> {
     for &name in EDIT_SUB_TOOLS {
         if plugins.contains_key(name) {
             return Err(ConfigError::RemovedEditSubTool { tool: name });
@@ -515,17 +513,18 @@ impl AgentFileConfig {
         );
     }
 
-    fn migrate_removed(
-        &self,
-        plugins: &mut HashMap<String, PluginFileConfig>,
-    ) -> Vec<String> {
+    fn migrate_removed(&self, plugins: &mut HashMap<String, PluginFileConfig>) -> Vec<String> {
         let mut warnings = Vec::new();
 
         if let Some(v) = self.bash_timeout_secs {
             let plugin = plugins.entry("bash".to_string()).or_default();
             if plugin.opts.get("timeout_secs").is_none() {
-                plugin.opts.insert("timeout_secs".to_string(), JsonValue::from(v));
-                warnings.push(format!("agent.bash_timeout_secs = {v} migrated to plugins.bash.timeout_secs"));
+                plugin
+                    .opts
+                    .insert("timeout_secs".to_string(), JsonValue::from(v));
+                warnings.push(format!(
+                    "agent.bash_timeout_secs = {v} migrated to plugins.bash.timeout_secs"
+                ));
             }
         }
 
@@ -558,7 +557,9 @@ impl AgentFileConfig {
                     plugin
                         .opts
                         .insert("max_line_bytes".to_string(), JsonValue::from(v));
-                    warnings.push(format!("agent.max_line_bytes = {v} migrated to plugins.{name}.max_line_bytes"));
+                    warnings.push(format!(
+                        "agent.max_line_bytes = {v} migrated to plugins.{name}.max_line_bytes"
+                    ));
                 }
             }
         }
@@ -591,7 +592,9 @@ impl AgentFileConfig {
                 plugin
                     .opts
                     .insert("max_concurrent".to_string(), JsonValue::from(v));
-                warnings.push(format!("agent.task_max_concurrent = {v} migrated to plugins.task.max_concurrent"));
+                warnings.push(format!(
+                    "agent.task_max_concurrent = {v} migrated to plugins.task.max_concurrent"
+                ));
             }
         }
 
@@ -610,10 +613,7 @@ impl IndexFileConfig {
         merge_option!(self, overlay, max_file_size_mb);
     }
 
-    fn migrate_removed(
-        &self,
-        plugins: &mut HashMap<String, PluginFileConfig>,
-    ) -> Vec<String> {
+    fn migrate_removed(&self, plugins: &mut HashMap<String, PluginFileConfig>) -> Vec<String> {
         let mut warnings = Vec::new();
         let Some(v) = self.max_file_size_mb else {
             return warnings;
@@ -623,7 +623,9 @@ impl IndexFileConfig {
             plugin
                 .opts
                 .insert("max_file_size_mb".to_string(), JsonValue::from(v));
-            warnings.push(format!("index.max_file_size_mb = {v} migrated to plugins.index.max_file_size_mb"));
+            warnings.push(format!(
+                "index.max_file_size_mb = {v} migrated to plugins.index.max_file_size_mb"
+            ));
         }
         warnings
     }
@@ -2621,12 +2623,7 @@ mod tests {
     #[test_case("agent = { max_response_bytes = 1000000 }\n", "webfetch", "max_response_bytes", 1000000; "max_response_bytes")]
     #[test_case("agent = { interpreter_max_memory_mb = 50 }\n", "code_execution", "max_memory_mb", 50; "interpreter_max_memory_mb")]
     #[test_case("agent = { task_max_concurrent = 4 }\n", "task", "max_concurrent", 4; "task_max_concurrent")]
-    fn removed_agent_fields_migrated(
-        toml_str: &str,
-        plugin: &str,
-        opt: &str,
-        value: u64,
-    ) {
+    fn removed_agent_fields_migrated(toml_str: &str, plugin: &str, opt: &str, value: u64) {
         let raw: RawConfig = toml::from_str(toml_str).unwrap();
         let config = raw.into_config(false).unwrap();
         assert!(
@@ -2639,7 +2636,10 @@ mod tests {
             "{plugin}.{opt} should be migrated"
         );
         assert!(
-            config.migration_warnings.iter().any(|w| w.contains(&format!("{plugin}.{opt}"))),
+            config
+                .migration_warnings
+                .iter()
+                .any(|w| w.contains(&format!("{plugin}.{opt}"))),
             "migration warning should mention {plugin}.{opt}"
         );
     }
@@ -2654,7 +2654,8 @@ mod tests {
             "index.max_file_size_mb should be migrated"
         );
         assert!(
-            config.migration_warnings
+            config
+                .migration_warnings
                 .iter()
                 .any(|w| w.contains("index.max_file_size_mb")),
             "migration warning should mention index.max_file_size_mb"
@@ -2847,7 +2848,10 @@ mod tests {
             "tools.bash should be migrated to plugins.bash"
         );
         assert!(
-            config.migration_warnings.iter().any(|w| w.contains("tools.bash")),
+            config
+                .migration_warnings
+                .iter()
+                .any(|w| w.contains("tools.bash")),
             "migration warning should mention tools.bash"
         );
     }
