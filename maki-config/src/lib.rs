@@ -164,6 +164,17 @@ pub enum ConfigError {
          A .bak backup is left next to the file."
     )]
     RenamedToolsTable,
+    #[error(
+        "invalid config: the following agent settings were removed in v0.4.0 \
+         and moved to plugin options:\n{0}\n\n\
+         Update your init.lua to move each setting under `plugins.<plugin>`."
+    )]
+    RemovedAgentSettings(String),
+    #[error(
+        "invalid config: the `index` table was removed in v0.4.0; \
+         move its settings to `plugins.index`:\n{0}"
+    )]
+    RemovedIndexSettings(String),
 }
 
 fn check(
@@ -220,6 +231,9 @@ pub struct RawConfig {
     pub agent: AgentFileConfig,
     pub provider: ProviderFileConfig,
     pub storage: StorageFileConfig,
+    /// Removed in v0.4.0; kept so old configs fail with a migration pointer
+    /// instead of a generic serde unknown-field error.
+    pub index: IndexFileConfig,
     pub plugins: HashMap<String, PluginFileConfig>,
     /// Renamed to `plugins`; kept so old configs fail with a pointer to the
     /// new name instead of a generic unknown-field error.
@@ -240,6 +254,7 @@ impl RawConfig {
         self.agent.merge(overlay.agent);
         self.provider.merge(overlay.provider);
         self.storage.merge(overlay.storage);
+        self.index.merge(overlay.index);
         for (name, plugin) in overlay.plugins {
             let entry = self.plugins.entry(name).or_default();
             if plugin.enabled.is_some() {
@@ -251,6 +266,8 @@ impl RawConfig {
     }
 
     pub fn into_config(self, no_rtk: bool) -> Result<Config, ConfigError> {
+        self.agent.check_removed()?;
+        self.index.check_removed()?;
         self.validate_plugin_tables()?;
         let disabled_tools: Vec<String> = self
             .plugins
@@ -451,6 +468,16 @@ pub struct AgentFileConfig {
     pub max_output_lines: Option<usize>,
     pub max_continuation_turns: Option<u32>,
     pub compaction_buffer: Option<CompactionBuffer>,
+
+    // Removed in v0.4.0; kept so old configs fail with a migration pointer
+    // instead of a generic serde unknown-field error.
+    pub bash_timeout_secs: Option<u64>,
+    pub code_execution_timeout_secs: Option<u64>,
+    pub max_response_bytes: Option<usize>,
+    pub max_line_bytes: Option<usize>,
+    pub search_result_limit: Option<usize>,
+    pub interpreter_max_memory_mb: Option<usize>,
+    pub task_max_concurrent: Option<usize>,
 }
 
 impl AgentFileConfig {
@@ -461,8 +488,78 @@ impl AgentFileConfig {
             max_output_bytes,
             max_output_lines,
             max_continuation_turns,
-            compaction_buffer
+            compaction_buffer,
+            bash_timeout_secs,
+            code_execution_timeout_secs,
+            max_response_bytes,
+            max_line_bytes,
+            search_result_limit,
+            interpreter_max_memory_mb,
+            task_max_concurrent
         );
+    }
+
+    fn check_removed(&self) -> Result<(), ConfigError> {
+        let mut removed = Vec::new();
+        if self.bash_timeout_secs.is_some() {
+            removed.push("  agent.bash_timeout_secs -> plugins.bash.timeout_secs");
+        }
+        if self.code_execution_timeout_secs.is_some() {
+            removed.push(
+                "  agent.code_execution_timeout_secs -> plugins.code_execution.timeout_secs",
+            );
+        }
+        if self.max_response_bytes.is_some() {
+            removed.push(
+                "  agent.max_response_bytes -> plugins.webfetch.max_response_bytes \
+                 or plugins.websearch.max_response_bytes",
+            );
+        }
+        if self.max_line_bytes.is_some() {
+            removed.push(
+                "  agent.max_line_bytes -> plugins.read.max_line_bytes \
+                 or plugins.grep.max_line_bytes",
+            );
+        }
+        if self.search_result_limit.is_some() {
+            removed.push(
+                "  agent.search_result_limit -> plugins.grep.search_result_limit \
+                 or plugins.glob.search_result_limit",
+            );
+        }
+        if self.interpreter_max_memory_mb.is_some() {
+            removed.push(
+                "  agent.interpreter_max_memory_mb -> plugins.code_execution.max_memory_mb",
+            );
+        }
+        if self.task_max_concurrent.is_some() {
+            removed.push("  agent.task_max_concurrent -> plugins.task.max_concurrent");
+        }
+        if removed.is_empty() {
+            return Ok(());
+        }
+        Err(ConfigError::RemovedAgentSettings(removed.join("\n")))
+    }
+}
+
+#[derive(Deserialize, Default, Debug)]
+#[serde(default, deny_unknown_fields)]
+pub struct IndexFileConfig {
+    pub max_file_size_mb: Option<u64>,
+}
+
+impl IndexFileConfig {
+    fn merge(&mut self, overlay: IndexFileConfig) {
+        merge_option!(self, overlay, max_file_size_mb);
+    }
+
+    fn check_removed(&self) -> Result<(), ConfigError> {
+        let Some(value) = self.max_file_size_mb else {
+            return Ok(());
+        };
+        Err(ConfigError::RemovedIndexSettings(format!(
+            "  index.max_file_size_mb = {value} -> plugins.index.max_file_size_mb = {value}"
+        )))
     }
 }
 
@@ -2438,14 +2535,42 @@ mod tests {
     }
 
     #[test_case("[ui]\nsplash_animaton = true\n" ; "top_level_typo")]
-    #[test_case("agent = { bash_timeout_secs = 60 }\n" ; "moved_bash_timeout")]
-    #[test_case("agent = { search_result_limit = 50 }\n" ; "moved_search_limit")]
-    #[test_case("[index]\nmax_file_size_mb = 4\n" ; "removed_index_section")]
+    #[test_case("agent = { unknown_field = 1 }\n" ; "agent_unknown_field")]
     fn deny_unknown_fields_rejects(toml_str: &str) {
         let result: Result<RawConfig, _> = toml::from_str(toml_str);
         assert!(
             result.is_err(),
             "unknown field should be rejected: {toml_str}"
+        );
+    }
+
+    #[test_case("agent = { bash_timeout_secs = 60 }\n", "bash_timeout", "plugins.bash.timeout_secs"; "bash_timeout")]
+    #[test_case("agent = { code_execution_timeout_secs = 45 }\n", "code_execution_timeout", "plugins.code_execution.timeout_secs"; "code_execution_timeout")]
+    #[test_case("agent = { search_result_limit = 50 }\n", "search_result_limit", "plugins.grep.search_result_limit"; "search_result_limit")]
+    #[test_case("agent = { max_line_bytes = 700 }\n", "max_line_bytes", "plugins.read.max_line_bytes"; "max_line_bytes")]
+    #[test_case("agent = { max_response_bytes = 1000000 }\n", "max_response_bytes", "plugins.webfetch.max_response_bytes"; "max_response_bytes")]
+    #[test_case("agent = { interpreter_max_memory_mb = 50 }\n", "interpreter_max_memory_mb", "plugins.code_execution.max_memory_mb"; "interpreter_max_memory_mb")]
+    #[test_case("agent = { task_max_concurrent = 4 }\n", "task_max_concurrent", "plugins.task.max_concurrent"; "task_max_concurrent")]
+    fn removed_agent_field_errors(toml_str: &str, field: &str, new_location: &str) {
+        let raw: RawConfig = toml::from_str(toml_str).unwrap();
+        let err = raw.into_config(false).err().unwrap().to_string();
+        assert!(
+            err.contains(&format!("agent.{field}")),
+            "error should mention removed agent.{field}, got: {err}"
+        );
+        assert!(
+            err.contains(new_location),
+            "error should point to {new_location}, got: {err}"
+        );
+    }
+
+    #[test]
+    fn removed_index_section_errors() {
+        let raw: RawConfig = toml::from_str("[index]\nmax_file_size_mb = 4\n").unwrap();
+        let err = raw.into_config(false).err().unwrap().to_string();
+        assert!(
+            err.contains("plugins.index.max_file_size_mb"),
+            "error should point to plugins.index.max_file_size_mb, got: {err}"
         );
     }
 
