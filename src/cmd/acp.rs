@@ -31,6 +31,11 @@ pub fn run(model_arg: Option<String>, yolo: bool, no_jit: bool) -> Result<()> {
         .context("invalid config")?;
     config.permissions = load_permissions(&cwd);
 
+    setup::init_logging(&config.storage);
+    for warning in &config.migration_warnings {
+        tracing::warn!(%warning, "deprecated config setting was migrated");
+    }
+
     if yolo || config.always_yolo {
         config.permissions.yolo = true;
     }
@@ -47,8 +52,6 @@ pub fn run(model_arg: Option<String>, yolo: bool, no_jit: bool) -> Result<()> {
     };
 
     let model = setup::resolve_model(model_arg.as_deref(), &config.provider, &storage)?;
-
-    setup::init_logging(&config.storage);
     setup::install_panic_log_hook();
 
     let (mcp_handle, _mcp_config_errors) = smol::block_on(maki_agent::mcp::start(&cwd));

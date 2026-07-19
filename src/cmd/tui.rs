@@ -152,6 +152,7 @@ fn build_stack(
         fallback_config,
         &mut warnings,
     )?;
+    warnings.extend(config.migration_warnings.clone());
 
     if let Err(e) = plugin_host.load_builtins(&config.plugins) {
         let e = color_eyre::eyre::Report::from(e).wrap_err("load builtin plugins");

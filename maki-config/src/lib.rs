@@ -155,15 +155,6 @@ pub enum ConfigError {
          (bundled plugins: {valid})"
     )]
     UnknownPlugin { plugin: String, valid: String },
-    #[error(
-        "invalid config: the `tools` table in maki.setup was renamed to `plugins` \
-         (plugins can provide more than tools).\n\n\
-         Fix your config with:\n\n    \
-         sed -i.bak 's/^\\( *\\)tools *=/\\1plugins =/' ~/.config/maki/init.lua\n\n\
-         Run it on .maki/init.lua too if you keep a project config. \
-         A .bak backup is left next to the file."
-    )]
-    RenamedToolsTable,
 }
 
 fn check(
@@ -218,6 +209,9 @@ pub struct RawConfig {
     #[serde(default)]
     pub ui: UiFileConfig,
     pub agent: AgentFileConfig,
+    /// Removed in v0.4.0; kept so old configs fail with a migration pointer
+    /// instead of a generic unknown-field error.
+    pub index: IndexFileConfig,
     pub provider: ProviderFileConfig,
     pub storage: StorageFileConfig,
     pub plugins: HashMap<String, PluginFileConfig>,
@@ -238,6 +232,7 @@ impl RawConfig {
         );
         self.ui.merge(overlay.ui);
         self.agent.merge(overlay.agent);
+        self.index.merge(overlay.index);
         self.provider.merge(overlay.provider);
         self.storage.merge(overlay.storage);
         for (name, plugin) in overlay.plugins {
@@ -251,9 +246,14 @@ impl RawConfig {
     }
 
     pub fn into_config(self, no_rtk: bool) -> Result<Config, ConfigError> {
-        self.validate_plugin_tables()?;
-        let disabled_tools: Vec<String> = self
-            .plugins
+        let mut plugins = self.plugins;
+        let mut migration_warnings = self.agent.migrate_removed(&mut plugins);
+        migration_warnings.extend(self.index.migrate_removed(&mut plugins));
+        migration_warnings.extend(migrate_tools_to_plugins(&self.tools, &mut plugins));
+
+        validate_plugin_tables(&plugins)?;
+
+        let disabled_tools: Vec<String> = plugins
             .iter()
             .filter(|(_, cfg)| cfg.enabled == Some(false))
             .map(|(name, _)| name.clone())
@@ -271,35 +271,68 @@ impl RawConfig {
             provider: ProviderConfig::from_file(self.provider),
             storage: StorageConfig::from_file(self.storage),
             permissions: PermissionsConfig::default(),
-            plugins: PluginsConfig::from_plugins(self.plugins),
+            plugins: PluginsConfig::from_plugins(plugins),
+            migration_warnings,
         })
     }
+}
 
-    /// A `plugins.<name>` key that matches no bundled plugin is a typo or an
-    /// old config, so fail loudly instead of letting it silently drift.
-    fn validate_plugin_tables(&self) -> Result<(), ConfigError> {
-        if !self.tools.is_empty() {
-            return Err(ConfigError::RenamedToolsTable);
+fn validate_plugin_tables(
+    plugins: &HashMap<String, PluginFileConfig>,
+) -> Result<(), ConfigError> {
+    for &name in EDIT_SUB_TOOLS {
+        if plugins.contains_key(name) {
+            return Err(ConfigError::RemovedEditSubTool { tool: name });
         }
-        for &name in EDIT_SUB_TOOLS {
-            if self.plugins.contains_key(name) {
-                return Err(ConfigError::RemovedEditSubTool { tool: name });
-            }
-        }
-        let mut unknown: Vec<&String> = self
-            .plugins
-            .keys()
-            .filter(|name| !DEFAULT_BUILTINS.contains(&name.as_str()))
-            .collect();
-        unknown.sort();
-        if let Some(&plugin) = unknown.first() {
-            return Err(ConfigError::UnknownPlugin {
-                plugin: plugin.clone(),
-                valid: DEFAULT_BUILTINS.join(", "),
-            });
-        }
-        Ok(())
     }
+    let mut unknown: Vec<&String> = plugins
+        .keys()
+        .filter(|name| !DEFAULT_BUILTINS.contains(&name.as_str()))
+        .collect();
+    unknown.sort();
+    if let Some(&plugin) = unknown.first() {
+        return Err(ConfigError::UnknownPlugin {
+            plugin: plugin.clone(),
+            valid: DEFAULT_BUILTINS.join(", "),
+        });
+    }
+    Ok(())
+}
+
+fn migrate_tools_to_plugins(
+    tools: &HashMap<String, PluginFileConfig>,
+    plugins: &mut HashMap<String, PluginFileConfig>,
+) -> Vec<String> {
+    if tools.is_empty() {
+        return Vec::new();
+    }
+
+    let mut warnings = Vec::new();
+    for (name, cfg) in tools {
+        if EDIT_SUB_TOOLS.contains(&name.as_str()) {
+            let edit = plugins.entry("edit".to_string()).or_default();
+            if let Some(enabled) = cfg.enabled
+                && edit.opts.get(name).is_none()
+            {
+                edit.opts.insert(name.clone(), JsonValue::Bool(enabled));
+                warnings.push(format!(
+                    "tools.{name}.enabled = {enabled} migrated to plugins.edit.{name} = {enabled}"
+                ));
+            }
+            continue;
+        }
+
+        let plugin = plugins.entry(name.clone()).or_default();
+        if plugin.enabled.is_none() {
+            plugin.enabled = cfg.enabled;
+        }
+        for (k, v) in &cfg.opts {
+            plugin.opts.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+        warnings.push(format!("tools.{name} migrated to plugins.{name}"));
+    }
+
+    warnings
 }
 
 #[derive(Deserialize, Default, Debug)]
@@ -451,6 +484,16 @@ pub struct AgentFileConfig {
     pub max_output_lines: Option<usize>,
     pub max_continuation_turns: Option<u32>,
     pub compaction_buffer: Option<CompactionBuffer>,
+
+    // Removed in v0.4.0; kept so old configs fail with a migration pointer
+    // instead of a generic serde unknown-field error.
+    pub bash_timeout_secs: Option<u64>,
+    pub code_execution_timeout_secs: Option<u64>,
+    pub max_response_bytes: Option<usize>,
+    pub max_line_bytes: Option<usize>,
+    pub search_result_limit: Option<usize>,
+    pub interpreter_max_memory_mb: Option<usize>,
+    pub task_max_concurrent: Option<usize>,
 }
 
 impl AgentFileConfig {
@@ -461,8 +504,128 @@ impl AgentFileConfig {
             max_output_bytes,
             max_output_lines,
             max_continuation_turns,
-            compaction_buffer
+            compaction_buffer,
+            bash_timeout_secs,
+            code_execution_timeout_secs,
+            max_response_bytes,
+            max_line_bytes,
+            search_result_limit,
+            interpreter_max_memory_mb,
+            task_max_concurrent
         );
+    }
+
+    fn migrate_removed(
+        &self,
+        plugins: &mut HashMap<String, PluginFileConfig>,
+    ) -> Vec<String> {
+        let mut warnings = Vec::new();
+
+        if let Some(v) = self.bash_timeout_secs {
+            let plugin = plugins.entry("bash".to_string()).or_default();
+            if plugin.opts.get("timeout_secs").is_none() {
+                plugin.opts.insert("timeout_secs".to_string(), JsonValue::from(v));
+                warnings.push(format!("agent.bash_timeout_secs = {v} migrated to plugins.bash.timeout_secs"));
+            }
+        }
+
+        if let Some(v) = self.code_execution_timeout_secs {
+            let plugin = plugins.entry("code_execution".to_string()).or_default();
+            if plugin.opts.get("timeout_secs").is_none() {
+                plugin
+                    .opts
+                    .insert("timeout_secs".to_string(), JsonValue::from(v));
+                warnings.push(format!("agent.code_execution_timeout_secs = {v} migrated to plugins.code_execution.timeout_secs"));
+            }
+        }
+
+        if let Some(v) = self.max_response_bytes {
+            for name in ["webfetch", "websearch"] {
+                let plugin = plugins.entry(name.to_string()).or_default();
+                if plugin.opts.get("max_response_bytes").is_none() {
+                    plugin
+                        .opts
+                        .insert("max_response_bytes".to_string(), JsonValue::from(v));
+                    warnings.push(format!("agent.max_response_bytes = {v} migrated to plugins.{name}.max_response_bytes"));
+                }
+            }
+        }
+
+        if let Some(v) = self.max_line_bytes {
+            for name in ["read", "grep"] {
+                let plugin = plugins.entry(name.to_string()).or_default();
+                if plugin.opts.get("max_line_bytes").is_none() {
+                    plugin
+                        .opts
+                        .insert("max_line_bytes".to_string(), JsonValue::from(v));
+                    warnings.push(format!("agent.max_line_bytes = {v} migrated to plugins.{name}.max_line_bytes"));
+                }
+            }
+        }
+
+        if let Some(v) = self.search_result_limit {
+            for name in ["grep", "glob"] {
+                let plugin = plugins.entry(name.to_string()).or_default();
+                if plugin.opts.get("search_result_limit").is_none() {
+                    plugin
+                        .opts
+                        .insert("search_result_limit".to_string(), JsonValue::from(v));
+                    warnings.push(format!("agent.search_result_limit = {v} migrated to plugins.{name}.search_result_limit"));
+                }
+            }
+        }
+
+        if let Some(v) = self.interpreter_max_memory_mb {
+            let plugin = plugins.entry("code_execution".to_string()).or_default();
+            if plugin.opts.get("max_memory_mb").is_none() {
+                plugin
+                    .opts
+                    .insert("max_memory_mb".to_string(), JsonValue::from(v));
+                warnings.push(format!("agent.interpreter_max_memory_mb = {v} migrated to plugins.code_execution.max_memory_mb"));
+            }
+        }
+
+        if let Some(v) = self.task_max_concurrent {
+            let plugin = plugins.entry("task".to_string()).or_default();
+            if plugin.opts.get("max_concurrent").is_none() {
+                plugin
+                    .opts
+                    .insert("max_concurrent".to_string(), JsonValue::from(v));
+                warnings.push(format!("agent.task_max_concurrent = {v} migrated to plugins.task.max_concurrent"));
+            }
+        }
+
+        warnings
+    }
+}
+
+#[derive(Deserialize, Default, Debug)]
+#[serde(default, deny_unknown_fields)]
+pub struct IndexFileConfig {
+    pub max_file_size_mb: Option<u64>,
+}
+
+impl IndexFileConfig {
+    fn merge(&mut self, overlay: IndexFileConfig) {
+        merge_option!(self, overlay, max_file_size_mb);
+    }
+
+    fn migrate_removed(
+        &self,
+        plugins: &mut HashMap<String, PluginFileConfig>,
+    ) -> Vec<String> {
+        let mut warnings = Vec::new();
+        let Some(v) = self.max_file_size_mb else {
+            return warnings;
+        };
+        let plugin = plugins.entry("index".to_string()).or_default();
+        if plugin.opts.get("max_file_size_mb").is_none() {
+            plugin
+                .opts
+                .insert("max_file_size_mb".to_string(), JsonValue::from(v));
+            warnings.push(format!("index.max_file_size_mb = {v} migrated to plugins.index.max_file_size_mb"));
+        }
+        warnings
     }
 }
 
@@ -791,6 +954,9 @@ pub struct Config {
     pub storage: StorageConfig,
     pub permissions: PermissionsConfig,
     pub plugins: PluginsConfig,
+    /// Warnings emitted when deprecated config settings were migrated to
+    /// plugin options at startup. Callers should surface these to the user.
+    pub migration_warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, ConfigSection)]
@@ -2036,6 +2202,7 @@ mod tests {
             storage: StorageConfig::default(),
             permissions: PermissionsConfig::default(),
             plugins: PluginsConfig::default(),
+            migration_warnings: Vec::new(),
         };
         match (section, field) {
             ("provider", "connect_timeout_secs") => {
@@ -2438,14 +2605,59 @@ mod tests {
     }
 
     #[test_case("[ui]\nsplash_animaton = true\n" ; "top_level_typo")]
-    #[test_case("agent = { bash_timeout_secs = 60 }\n" ; "moved_bash_timeout")]
-    #[test_case("agent = { search_result_limit = 50 }\n" ; "moved_search_limit")]
-    #[test_case("[index]\nmax_file_size_mb = 4\n" ; "removed_index_section")]
+    #[test_case("agent = { unknown_field = 1 }\n" ; "agent_unknown_field")]
     fn deny_unknown_fields_rejects(toml_str: &str) {
         let result: Result<RawConfig, _> = toml::from_str(toml_str);
         assert!(
             result.is_err(),
             "unknown field should be rejected: {toml_str}"
+        );
+    }
+
+    #[test_case("agent = { bash_timeout_secs = 60 }\n", "bash", "timeout_secs", 60; "bash_timeout")]
+    #[test_case("agent = { code_execution_timeout_secs = 45 }\n", "code_execution", "timeout_secs", 45; "code_execution_timeout")]
+    #[test_case("agent = { search_result_limit = 50 }\n", "grep", "search_result_limit", 50; "search_result_limit")]
+    #[test_case("agent = { max_line_bytes = 700 }\n", "read", "max_line_bytes", 700; "max_line_bytes")]
+    #[test_case("agent = { max_response_bytes = 1000000 }\n", "webfetch", "max_response_bytes", 1000000; "max_response_bytes")]
+    #[test_case("agent = { interpreter_max_memory_mb = 50 }\n", "code_execution", "max_memory_mb", 50; "interpreter_max_memory_mb")]
+    #[test_case("agent = { task_max_concurrent = 4 }\n", "task", "max_concurrent", 4; "task_max_concurrent")]
+    fn removed_agent_fields_migrated(
+        toml_str: &str,
+        plugin: &str,
+        opt: &str,
+        value: u64,
+    ) {
+        let raw: RawConfig = toml::from_str(toml_str).unwrap();
+        let config = raw.into_config(false).unwrap();
+        assert!(
+            config.plugins.opts.contains_key(plugin),
+            "{plugin} plugin should be created during migration"
+        );
+        assert_eq!(
+            config.plugins.opts[plugin][opt],
+            serde_json::json!(value),
+            "{plugin}.{opt} should be migrated"
+        );
+        assert!(
+            config.migration_warnings.iter().any(|w| w.contains(&format!("{plugin}.{opt}"))),
+            "migration warning should mention {plugin}.{opt}"
+        );
+    }
+
+    #[test]
+    fn removed_index_section_migrated() {
+        let raw: RawConfig = toml::from_str("[index]\nmax_file_size_mb = 4\n").unwrap();
+        let config = raw.into_config(false).unwrap();
+        assert_eq!(
+            config.plugins.opts["index"]["max_file_size_mb"],
+            serde_json::json!(4),
+            "index.max_file_size_mb should be migrated"
+        );
+        assert!(
+            config.migration_warnings
+                .iter()
+                .any(|w| w.contains("index.max_file_size_mb")),
+            "migration warning should mention index.max_file_size_mb"
         );
     }
 
@@ -2627,14 +2839,56 @@ mod tests {
     }
 
     #[test]
-    fn renamed_tools_table_errors() {
+    fn renamed_tools_table_migrated() {
         let raw: RawConfig = toml::from_str("[tools.bash]\nenabled = true\n").unwrap();
-        let Err(err) = raw.into_config(false) else {
-            panic!("old tools table should be rejected");
-        };
+        let config = raw.into_config(false).unwrap();
         assert!(
-            err.to_string().contains("renamed to `plugins`"),
-            "got: {err}"
+            config.plugins.names.contains(&"bash".to_string()),
+            "tools.bash should be migrated to plugins.bash"
+        );
+        assert!(
+            config.migration_warnings.iter().any(|w| w.contains("tools.bash")),
+            "migration warning should mention tools.bash"
+        );
+    }
+
+    #[test]
+    fn removed_edit_sub_tools_migrated() {
+        let raw: RawConfig = toml::from_str(
+            "[tools.edit_lines]\nenabled = true\n[tools.insert_lines]\nenabled = true\n",
+        )
+        .unwrap();
+        let config = raw.into_config(false).unwrap();
+        assert_eq!(
+            config.plugins.opts["edit"]["edit_lines"],
+            serde_json::json!(true),
+            "tools.edit_lines should become plugins.edit.edit_lines"
+        );
+        assert_eq!(
+            config.plugins.opts["edit"]["insert_lines"],
+            serde_json::json!(true),
+            "tools.insert_lines should become plugins.edit.insert_lines"
+        );
+    }
+
+    #[test]
+    fn removed_agent_fields_do_not_override_plugins() {
+        let raw: RawConfig = toml::from_str(
+            "agent = { bash_timeout_secs = 60 }\n[plugins.bash]\ntimeout_secs = 30\n",
+        )
+        .unwrap();
+        let config = raw.into_config(false).unwrap();
+        assert_eq!(
+            config.plugins.opts["bash"]["timeout_secs"],
+            serde_json::json!(30),
+            "existing plugins.bash.timeout_secs should win"
+        );
+        assert!(
+            !config
+                .migration_warnings
+                .iter()
+                .any(|w| w.contains("bash_timeout")),
+            "should not warn when plugin already has the option"
         );
     }
 
