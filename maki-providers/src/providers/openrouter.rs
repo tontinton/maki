@@ -26,7 +26,7 @@ static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
     provider_name: "OpenRouter",
 };
 
-pub(crate) fn models() -> &'static [ModelEntry] {
+pub(crate) const fn models() -> &'static [ModelEntry] {
     &[]
 }
 
@@ -185,8 +185,10 @@ impl Provider for OpenRouter {
 
             let reasoning_info: Option<Arc<OpenRouterModelInfo>> = {
                 let guard = crate::model_registry::model_registry().read().unwrap();
+                // Discovery keys by the builtin slug; a dynamic wrap's model
+                // carries its own slug, so don't key by model.provider.
                 guard
-                    .discovered(model.provider, &model.id)
+                    .discovered("openrouter", &model.id)
                     .and_then(|d| d.provider_info.clone())
                     .map(|arc| {
                         Arc::downcast::<OpenRouterModelInfo>(arc).expect("wrong provider info type")
@@ -301,8 +303,7 @@ mod tests {
     fn openrouter_model(info: Option<&OpenRouterModelInfo>) -> (EffortDialect<'_>, Model) {
         let model = Model {
             id: "test-model".into(),
-            provider: crate::provider::ProviderKind::OpenRouter,
-            dynamic_slug: None,
+            provider: "openrouter".into(),
             tier: crate::model::ModelTier::Medium,
             family: crate::model::ModelFamily::Generic,
             supports_tool_examples_override: None,

@@ -157,7 +157,7 @@ fn build_lines(ctx: &UsageModalContext, theme: &crate::theme::Theme) -> Vec<Line
     if let Some(state) = ctx.quota {
         lines.push(Line::default());
         lines.push(Line::from(Span::styled(
-            format!("{PREFIX}{} quota", ctx.model.provider.display_name()),
+            format!("{PREFIX}{} quota", ctx.model.provider_display_name()),
             theme.keybind_section,
         )));
         lines.extend(quota_lines(state, theme));

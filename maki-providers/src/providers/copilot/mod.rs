@@ -40,7 +40,7 @@ const RESPONSES_PATH: &str = "/responses";
 const MESSAGES_PATH: &str = "/v1/messages";
 const MODELS_PATH: &str = "/models";
 
-pub(crate) fn models() -> &'static [ModelEntry] {
+pub(crate) const fn models() -> &'static [ModelEntry] {
     &[
         ModelEntry {
             prefixes: &["gpt-5-mini", "gpt-5 mini", "claude-haiku-4.5"],

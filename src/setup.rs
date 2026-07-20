@@ -4,19 +4,18 @@ use color_eyre::Result;
 use color_eyre::eyre::Context;
 
 use maki_providers::model::{Model, ModelTier};
-use maki_providers::provider::ProviderKind;
 use maki_storage::StateDir;
 use maki_storage::log::RotatingFileWriter;
 use maki_storage::model::read_model;
 use tracing_subscriber::EnvFilter;
 
-const PROVIDER_PRIORITY: &[ProviderKind] = &[
-    ProviderKind::Anthropic,
-    ProviderKind::OpenAi,
-    ProviderKind::Copilot,
-    ProviderKind::Zai,
-    ProviderKind::Synthetic,
-    ProviderKind::DeepSeek,
+const PROVIDER_PRIORITY: &[&str] = &[
+    "anthropic",
+    "openai",
+    "copilot",
+    "zai",
+    "synthetic",
+    "deepseek",
 ];
 
 pub fn resolve_model(
@@ -46,9 +45,9 @@ pub fn resolve_model(
 
 fn auto_detect_model() -> Option<Model> {
     for tier in [ModelTier::Strong, ModelTier::Medium] {
-        for &provider in PROVIDER_PRIORITY {
-            if provider.is_available()
-                && let Ok(model) = Model::from_tier(provider, tier)
+        for &slug in PROVIDER_PRIORITY {
+            if maki_providers::provider::provider_available(slug)
+                && let Ok(model) = Model::from_tier(slug, tier)
             {
                 return Some(model);
             }

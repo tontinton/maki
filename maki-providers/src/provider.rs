@@ -1,14 +1,16 @@
 use std::future::Future;
 use std::pin::Pin;
+use std::str::FromStr;
+use std::sync::Arc;
 
 use flume::Sender;
 use serde_json::Value;
-use strum::{Display, EnumIter, EnumString, IntoEnumIterator};
+use strum::{Display, EnumIter, EnumString};
 use tracing::{debug, warn};
 
 use maki_storage::id::SessionRef;
 
-use crate::model::{Model, ModelFamily, ModelInfo, models_for_provider};
+use crate::model::{Model, ModelFamily, ModelInfo};
 use crate::providers::Timeouts;
 use crate::providers::anthropic::Anthropic;
 use crate::providers::anthropic::bedrock;
@@ -106,22 +108,6 @@ impl ProviderKind {
         }
     }
 
-    pub const fn supports_thinking(self) -> bool {
-        matches!(
-            self,
-            Self::Anthropic
-                | Self::Google
-                | Self::Mistral
-                | Self::DeepSeek
-                | Self::Synthetic
-                | Self::OpenAi
-                | Self::OpenRouter
-                | Self::LlamaCpp
-                | Self::TensorX
-                | Self::Opencode
-        )
-    }
-
     pub const fn features(self) -> Option<&'static str> {
         match self {
             Self::Anthropic => {
@@ -166,20 +152,6 @@ impl ProviderKind {
             Self::TensorX => ModelFamily::Generic,
             Self::Opencode => ModelFamily::Generic,
         }
-    }
-
-    pub const fn accepts_arbitrary_models(self) -> bool {
-        matches!(
-            self,
-            Self::Ollama
-                | Self::LlamaCpp
-                | Self::Google
-                | Self::Copilot
-                | Self::OpenRouter
-                | Self::TensorX
-                | Self::Mistral
-                | Self::Opencode
-        )
     }
 
     /// `None` when we honestly don't know the output window: llama.cpp
@@ -246,10 +218,6 @@ impl ProviderKind {
             Self::Opencode => Ok(Box::new(Opencode::new(timeouts)?)),
         }
     }
-
-    pub fn is_available(self) -> bool {
-        self.create(Timeouts::default()).is_ok()
-    }
 }
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -290,7 +258,10 @@ pub trait Provider: Send + Sync {
     fn adjust_model(&self, _model: &mut Model) {}
 }
 
-fn provider_for_slug(slug: &str, timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
+pub fn provider_for_slug(slug: &str, timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
+    if let Ok(kind) = ProviderKind::from_str(slug) {
+        return kind.create(timeouts);
+    }
     if dynamic::display_name(slug).is_some() {
         dynamic::create(slug, timeouts)
     } else {
@@ -298,12 +269,12 @@ fn provider_for_slug(slug: &str, timeouts: Timeouts) -> Result<Box<dyn Provider>
     }
 }
 
+pub fn provider_available(slug: &str) -> bool {
+    provider_for_slug(slug, Timeouts::default()).is_ok()
+}
+
 pub fn from_model(model: &mut Model, timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
-    if let Some(slug) = &model.dynamic_slug {
-        debug!(slug, model = %model.id, "slug provider created");
-        return provider_for_slug(slug, timeouts);
-    }
-    let provider = model.provider.create(timeouts)?;
+    let provider = provider_for_slug(&model.provider, timeouts)?;
     provider.adjust_model(model);
     debug!(provider = %model.provider, model = %model.id, "provider created");
     Ok(provider)
@@ -354,21 +325,11 @@ pub async fn from_model_async(
     model: &mut Model,
     timeouts: Timeouts,
 ) -> Result<Box<dyn Provider>, AgentError> {
-    let slug = model.dynamic_slug.clone();
-    let kind = model.provider;
+    let slug = Arc::clone(&model.provider);
     let id = model.id.clone();
-    let provider = smol::unblock(move || {
-        if let Some(slug) = &slug {
-            provider_for_slug(slug, timeouts)
-        } else {
-            kind.create(timeouts)
-        }
-    })
-    .await?;
-    if model.dynamic_slug.is_none() {
-        provider.adjust_model(model);
-    }
-    debug!(provider = %kind, model = %id, "provider created");
+    let provider = smol::unblock(move || provider_for_slug(&slug, timeouts)).await?;
+    provider.adjust_model(model);
+    debug!(provider = %model.provider, model = %id, "provider created");
     Ok(provider)
 }
 
@@ -380,13 +341,14 @@ pub struct ModelBatch {
 /// Offline version of model discovery: returns specs from static tables
 /// and configured dynamic providers. See [`fetch_all_models`] for live lookups.
 pub fn available_model_specs() -> Vec<String> {
-    let mut specs: Vec<String> = ProviderKind::iter()
-        .filter(|kind| kind.is_available())
-        .flat_map(|kind| {
-            models_for_provider(kind)
+    let mut specs: Vec<String> = crate::manifest::ManifestRegistry::builtins()
+        .iter()
+        .filter(|m| provider_available(m.slug))
+        .flat_map(|m| {
+            m.models
                 .iter()
                 .flat_map(|entry| entry.prefixes.iter())
-                .map(move |p| format!("{kind}/{p}"))
+                .map(move |p| format!("{}/{}", m.slug, p))
         })
         .collect();
     for slug in dynamic::discovered_slugs() {
@@ -407,26 +369,29 @@ pub async fn fetch_all_models(
     let (tx, rx) = flume::unbounded();
     let timeouts = Timeouts::default();
 
-    for kind in ProviderKind::iter() {
-        let Ok(provider) = smol::unblock(move || kind.create(timeouts)).await else {
-            warn!(provider = %kind, "failed to create provider, skipping");
+    for manifest in crate::manifest::ManifestRegistry::builtins() {
+        let slug = manifest.slug;
+        let Ok(provider) = smol::unblock(move || provider_for_slug(slug, timeouts)).await else {
+            warn!(provider = slug, "failed to create provider, skipping");
             continue;
         };
+        let display_name = manifest.display_name;
         let tx = tx.clone();
         smol::spawn(async move {
             let batch = match provider.list_models().await {
                 Ok(models) => {
-                    if kind.accepts_arbitrary_models() {
+                    if manifest.accepts_arbitrary_models {
+                        let slug: Arc<str> = Arc::from(slug);
                         crate::model_registry::model_registry()
                             .write()
                             .unwrap()
-                            .set_known_models(kind, models.clone());
+                            .set_known_models(&slug, models.clone());
                     }
                     let mut specs: Vec<String> =
-                        models.iter().map(|m| format!("{kind}/{}", m.id)).collect();
-                    for entry in models_for_provider(kind) {
+                        models.iter().map(|m| format!("{slug}/{}", m.id)).collect();
+                    for entry in manifest.models {
                         for prefix in entry.prefixes {
-                            let spec = format!("{kind}/{prefix}");
+                            let spec = format!("{slug}/{prefix}");
                             if !specs.contains(&spec) {
                                 specs.push(spec);
                             }
@@ -438,17 +403,17 @@ pub async fn fetch_all_models(
                     }
                 }
                 Err(e) => {
-                    warn!(provider = %kind, error = %e, "failed to list models, using static fallback");
-                    let fallback: Vec<String> = models_for_provider(kind)
+                    warn!(provider = slug, error = %e, "failed to list models, using static fallback");
+                    let fallback: Vec<String> = manifest
+                        .models
                         .iter()
                         .flat_map(|entry| entry.prefixes.iter())
-                        .map(|p| format!("{kind}/{p}"))
+                        .map(|p| format!("{slug}/{p}"))
                         .collect();
                     ModelBatch {
                         models: fallback,
                         warnings: vec![format!(
-                            "{}: {e} (using static fallback)",
-                            kind.display_name()
+                            "{display_name}: {e} (using static fallback)"
                         )],
                     }
                 }

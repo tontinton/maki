@@ -109,7 +109,7 @@ inventory::submit!(BuiltInProvider {
     needs_url: false,
 });
 
-pub(crate) fn models() -> &'static [ModelEntry] {
+pub(crate) const fn models() -> &'static [ModelEntry] {
     &[
         ModelEntry {
             prefixes: &["glm-5-code"],

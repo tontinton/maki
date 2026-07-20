@@ -382,7 +382,7 @@ impl EventParser {
     }
 }
 
-pub(crate) fn models() -> &'static [ModelEntry] {
+pub(crate) const fn models() -> &'static [ModelEntry] {
     const MODELS: &[ModelEntry] = &[
         ModelEntry {
             prefixes: &["claude-haiku-4-5"],

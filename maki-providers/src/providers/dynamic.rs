@@ -6,13 +6,15 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use flume::Sender;
+use maki_config::providers::ProvidersConfig;
 use maki_storage::id::SessionRef;
 use serde::Deserialize;
 use serde_json::Value;
 use strum::IntoEnumIterator;
 use tracing::{debug, warn};
 
-use crate::model::{Model, ModelPricing, ModelTier, models_for_provider};
+use crate::manifest::ManifestRegistry;
+use crate::model::{Model, ModelPricing, ModelTier};
 use crate::provider::{BoxFuture, Provider, ProviderKind};
 use crate::{AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse};
 
@@ -76,8 +78,7 @@ impl ScriptModel {
     fn to_model(&self, slug: &str, base: ProviderKind, id: String, tier: ModelTier) -> Model {
         Model {
             id,
-            provider: base,
-            dynamic_slug: Some(slug.to_string()),
+            provider: Arc::from(slug),
             tier,
             family: base.family(),
             supports_tool_examples_override: self.supports_tool_examples,
@@ -327,7 +328,27 @@ fn discover_in(dir: &Path) -> Vec<DynamicProviderMeta> {
 static DISCOVERED: OnceLock<Vec<DynamicProviderMeta>> = OnceLock::new();
 
 fn discover() -> &'static [DynamicProviderMeta] {
-    DISCOVERED.get_or_init(|| providers_dir().map(|d| discover_in(&d)).unwrap_or_default())
+    DISCOVERED.get_or_init(|| {
+        // Load config first: it hard-exits on malformed providers.toml, so fail
+        // before spawning every provider script.
+        let custom = ProvidersConfig::load();
+        let mut metas = providers_dir().map(|d| discover_in(&d)).unwrap_or_default();
+        // A script and a providers.toml entry must not share a slug. The script
+        // loses, the same way it already loses to a builtin, and we say so
+        // instead of silently picking a winner.
+        metas.retain(|m| {
+            if custom.get(&m.slug).is_some() {
+                warn!(
+                    slug = %m.slug,
+                    "provider slug also defined in providers.toml, skipping script"
+                );
+                false
+            } else {
+                true
+            }
+        });
+        metas
+    })
 }
 
 fn find_meta(slug: &str) -> Option<&'static DynamicProviderMeta> {
@@ -441,7 +462,10 @@ pub fn dynamic_model_specs_for(slug: &str) -> Vec<String> {
         return Vec::new();
     };
     if meta.models.is_empty() {
-        models_for_provider(meta.base)
+        let base_slug = meta.base.to_string();
+        ManifestRegistry::get(&base_slug)
+            .map(|m| m.models)
+            .unwrap_or(&[])
             .iter()
             .flat_map(|entry| entry.prefixes.iter())
             .map(|prefix| format!("{slug}/{prefix}"))

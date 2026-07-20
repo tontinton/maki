@@ -48,25 +48,15 @@ fn resolve_model_from_ctx(ctx: &AgentContext, tier: Option<&str>) -> Result<Mode
     if effective == ctx.model.tier {
         return Ok(Model::clone(&ctx.model));
     }
+    let slug = &ctx.model.provider;
     let map = maki_providers::model_registry::model_registry()
         .read()
         .unwrap();
-    ctx.model
-        .dynamic_slug
-        .is_none()
-        .then(|| map.spec_for_tier(ctx.model.provider, effective))
-        .flatten()
+    map.spec_for_tier(slug, effective)
         .or_else(|| map.spec_for_tier_any(effective))
         .and_then(|s| Model::from_spec(&s).ok())
         .map(Ok)
-        .unwrap_or_else(|| {
-            Model::from_tier_dynamic(
-                ctx.model.provider,
-                effective,
-                ctx.model.dynamic_slug.as_deref(),
-            )
-            .map_err(|e| e.to_string())
-        })
+        .unwrap_or_else(|| Model::from_tier_dynamic(slug, effective).map_err(|e| e.to_string()))
 }
 
 fn model_to_lua_table(lua: &Lua, model: &Model) -> LuaResult<Table> {
