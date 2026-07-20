@@ -207,7 +207,7 @@ impl KeyPool {
             debug!(slug, "resolved API key from saved credentials");
             return Ok(Self::from_keys(vec![key]));
         }
-        if let Some(key) = Self::key_from_config(slug) {
+        if let Some(key) = Self::key_from_config(slug)? {
             debug!(slug, "resolved API key from providers.toml");
             return Ok(Self::from_keys(vec![key]));
         }
@@ -223,10 +223,15 @@ impl KeyPool {
         maki_storage::auth::load_provider_credentials(&dir, slug).map(|c| c.api_key)
     }
 
-    fn key_from_config(slug: &str) -> Option<String> {
-        maki_config::providers::ProvidersConfig::load()
+    fn key_from_config(slug: &str) -> Result<Option<String>, AgentError> {
+        let config = maki_config::providers::ProvidersConfig::try_load().map_err(|error| {
+            AgentError::Config {
+                message: format!("failed to load provider config for '{slug}': {error}"),
+            }
+        })?;
+        Ok(config
             .get(slug)
-            .and_then(|d| d.api_key.clone())
+            .and_then(|definition| definition.api_key.clone()))
     }
 
     pub(crate) fn from_keys(keys: Vec<String>) -> Self {
@@ -245,18 +250,6 @@ impl KeyPool {
             return false;
         }
         self.index.fetch_add(1, Ordering::Relaxed);
-        true
-    }
-
-    pub fn rotate_auth(
-        &self,
-        auth: &Mutex<ResolvedAuth>,
-        build: impl FnOnce(&str) -> ResolvedAuth,
-    ) -> bool {
-        if !self.rotate() {
-            return false;
-        }
-        *auth.lock().unwrap() = build(self.current());
         true
     }
 

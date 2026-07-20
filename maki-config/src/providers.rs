@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
+use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
-use std::str::FromStr;
+use thiserror::Error;
 use tracing::debug;
 
 use maki_storage::paths;
@@ -161,32 +162,67 @@ pub struct ProvidersConfig {
     pub providers: HashMap<String, ProviderDef>,
 }
 
+#[derive(Debug, Error)]
+pub enum ProvidersConfigError {
+    #[error("cannot read {path}: {source}")]
+    Read {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("invalid {path}: {message}")]
+    Parse {
+        path: PathBuf,
+        message: String,
+        #[source]
+        source: Box<toml::de::Error>,
+    },
+}
+
 impl ProvidersConfig {
-    /// Read and parse `providers.toml`. Hard-exits on parse errors so a typo
-    /// in tier or pricing surfaces immediately instead of silently dropping
-    /// every provider and starting maki with an empty registry.
+    /// Read and parse `providers.toml`. Hard-exits on any error so a typo
+    /// in tier or pricing (or an unreadable file) surfaces immediately
+    /// instead of silently dropping every provider and starting maki with an
+    /// empty registry. Missing files are treated as an empty registry (see
+    /// `load_from`) and never reach this path.
     pub fn load() -> Self {
-        let path = providers_file_path();
-        if !path.exists() {
-            return Self::default();
-        }
-        let content = match fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(path = %path.display(), error = %e, "cannot read providers.toml");
-                return Self::default();
+        Self::try_load().unwrap_or_else(|error| {
+            eprintln!("error: {error}");
+            process::exit(BAD_CONFIG_EXIT_CODE);
+        })
+    }
+
+    /// Read and parse `providers.toml`, returning a typed error instead of
+    /// hard-exiting. Use for runtime callers that must not kill the process
+    /// (e.g. refreshing the key pool on demand).
+    pub fn try_load() -> Result<Self, ProvidersConfigError> {
+        Self::load_from(&providers_file_path())
+    }
+
+    fn load_from(path: &Path) -> Result<Self, ProvidersConfigError> {
+        let content = match fs::read_to_string(path) {
+            Ok(content) => content,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default());
+            }
+            Err(source) => {
+                return Err(ProvidersConfigError::Read {
+                    path: path.to_path_buf(),
+                    source,
+                });
             }
         };
-        match toml::from_str(&content) {
-            Ok(config) => {
-                debug!(path = %path.display(), "loaded providers config");
-                config
+        // `toml::de::Error`'s `Display` leaks the raw offending line (which
+        // may contain a secret api_key embedded in malformed TOML); `message`
+        // surfaces only the parse error and position.
+        let config = toml::from_str(&content).map_err(|source: toml::de::Error| {
+            ProvidersConfigError::Parse {
+                path: path.to_path_buf(),
+                message: source.message().to_owned(),
+                source: Box::new(source),
             }
-            Err(e) => {
-                eprintln!("error: invalid {}: {e}", path.display());
-                process::exit(BAD_CONFIG_EXIT_CODE);
-            }
-        }
+        })?;
+        debug!(path = %path.display(), "loaded providers config");
+        Ok(config)
     }
 
     pub fn save(&self) -> Result<(), std::io::Error> {
@@ -321,7 +357,26 @@ pub fn resolve_login_url(slug: &str, plan: Option<&str>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::NamedTempFile;
     use test_case::test_case;
+
+    #[test]
+    fn load_from_returns_parse_error_for_invalid_toml() {
+        // Malformed TOML whose error message would otherwise leak the literal
+        // api_key line (containing a secret) — assert the typed error message
+        // suppresses it via `toml::de::Error::message()`.
+        const SECRET: &str = "secret-api-key";
+        let file = NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), format!("[deepseek]\napi_key = \"{SECRET}\n")).unwrap();
+
+        let error = ProvidersConfig::load_from(file.path()).unwrap_err();
+
+        assert!(matches!(error, ProvidersConfigError::Parse { .. }));
+        assert!(
+            !error.to_string().contains(SECRET),
+            "parse error message leaked secret: {error}"
+        );
+    }
 
     #[test]
     fn provider_def_roundtrip() {

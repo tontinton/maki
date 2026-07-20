@@ -16,10 +16,10 @@ use crate::{
     StreamResponse, ThinkingConfig, TokenUsage,
 };
 
-use super::{KeyPool, ResolvedAuth, http_client, next_sse_line};
+use super::{ResolvedAuth, http_client, next_sse_line};
 
 const BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
-const ENV_VAR: &str = "GEMINI_API_KEY";
+pub(crate) const ENV_VAR: &str = "GEMINI_API_KEY";
 const FLASH_MAX_THINKING: u32 = 24_576;
 const PRO_MAX_THINKING: u32 = 32_768;
 
@@ -99,7 +99,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
     ]
 }
 
-fn resolve_auth_from_key(key: &str) -> ResolvedAuth {
+pub(crate) fn resolve_auth_from_key(key: &str) -> ResolvedAuth {
     ResolvedAuth {
         base_url: None,
         headers: vec![("x-goog-api-key".into(), key.to_string())],
@@ -109,22 +109,10 @@ fn resolve_auth_from_key(key: &str) -> ResolvedAuth {
 pub struct Google {
     client: HttpClient,
     auth: Arc<Mutex<ResolvedAuth>>,
-    key_pool: Option<KeyPool>,
     stream_timeout: Duration,
 }
 
 impl Google {
-    pub fn new(timeouts: super::Timeouts) -> Result<Self, AgentError> {
-        let pool = KeyPool::resolve("google", ENV_VAR)?;
-        let resolved = resolve_auth_from_key(pool.current());
-        Ok(Self {
-            client: http_client(timeouts),
-            auth: Arc::new(Mutex::new(resolved)),
-            key_pool: Some(pool),
-            stream_timeout: timeouts.stream,
-        })
-    }
-
     pub(crate) fn with_auth(
         auth: Arc<Mutex<super::ResolvedAuth>>,
         timeouts: super::Timeouts,
@@ -132,7 +120,6 @@ impl Google {
         Self {
             client: http_client(timeouts),
             auth,
-            key_pool: None,
             stream_timeout: timeouts.stream,
         }
     }
@@ -277,23 +264,6 @@ impl Provider for Google {
                 .collect();
             infos.sort_by(|a, b| a.id.cmp(&b.id));
             Ok(infos)
-        })
-    }
-
-    fn reload_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
-        Box::pin(async {
-            let pool = KeyPool::resolve("google", ENV_VAR)?;
-            *self.auth.lock().unwrap() = resolve_auth_from_key(pool.current());
-            Ok(())
-        })
-    }
-
-    fn rotate_key(&self) -> BoxFuture<'_, Result<bool, AgentError>> {
-        Box::pin(async {
-            Ok(self
-                .key_pool
-                .as_ref()
-                .is_some_and(|p| p.rotate_auth(&self.auth, resolve_auth_from_key)))
         })
     }
 }

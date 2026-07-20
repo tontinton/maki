@@ -8,10 +8,10 @@ use crate::model::{Model, ModelEntry, ModelInfo, ModelPricing};
 use crate::provider::{BoxFuture, Provider};
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, dialect};
 
+use super::ResolvedAuth;
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
-use super::{KeyPool, ResolvedAuth};
 
-static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
+pub(crate) static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
     api_key_env: "TENSORX_API_KEY",
     base_url: "https://api.tensorx.ai/v1",
     max_tokens_field: "max_tokens",
@@ -44,26 +44,14 @@ struct TensorXModelInfo {
 pub struct TensorX {
     compat: OpenAiCompatProvider,
     auth: Arc<Mutex<ResolvedAuth>>,
-    key_pool: Option<KeyPool>,
     system_prefix: Option<String>,
 }
 
 impl TensorX {
-    pub fn new(timeouts: super::Timeouts) -> Result<Self, AgentError> {
-        let pool = KeyPool::resolve("tensorx", CONFIG.api_key_env)?;
-        Ok(Self {
-            compat: OpenAiCompatProvider::new(&CONFIG, timeouts),
-            auth: Arc::new(Mutex::new(ResolvedAuth::bearer(pool.current()))),
-            key_pool: Some(pool),
-            system_prefix: None,
-        })
-    }
-
     pub(crate) fn with_auth(auth: Arc<Mutex<ResolvedAuth>>, timeouts: super::Timeouts) -> Self {
         Self {
             compat: OpenAiCompatProvider::new(&CONFIG, timeouts),
             auth,
-            key_pool: None,
             system_prefix: None,
         }
     }
@@ -224,15 +212,6 @@ impl Provider for TensorX {
                 .unwrap_or_default();
             models.sort_by(|a, b| a.id.cmp(&b.id));
             Ok(models)
-        })
-    }
-
-    fn rotate_key(&self) -> BoxFuture<'_, Result<bool, AgentError>> {
-        Box::pin(async {
-            Ok(self
-                .key_pool
-                .as_ref()
-                .is_some_and(|p| p.rotate_auth(&self.auth, ResolvedAuth::bearer)))
         })
     }
 }

@@ -1,5 +1,7 @@
+pub(crate) mod auth_source;
 pub(crate) mod error;
 pub mod manifest;
+pub(crate) mod manifest_provider;
 pub mod model;
 pub mod model_registry;
 pub mod provider;

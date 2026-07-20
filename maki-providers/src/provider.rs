@@ -12,20 +12,12 @@ use maki_storage::id::SessionRef;
 
 use crate::model::{Model, ModelFamily, ModelInfo};
 use crate::providers::Timeouts;
-use crate::providers::anthropic::Anthropic;
-use crate::providers::anthropic::bedrock;
+use crate::providers::anthropic::bedrock::{self, Bedrock};
 use crate::providers::copilot::Copilot;
-use crate::providers::deepseek::DeepSeek;
 use crate::providers::dynamic;
-use crate::providers::google::Google;
 use crate::providers::local::{LLAMACPP, LocalEndpoint, OLLAMA};
-use crate::providers::mistral::Mistral;
 use crate::providers::openai::OpenAi;
 use crate::providers::opencode::Opencode;
-use crate::providers::openrouter::OpenRouter;
-use crate::providers::synthetic::Synthetic;
-use crate::providers::tensorx::TensorX;
-use crate::providers::zai::Zai;
 use crate::{AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Display, EnumString, EnumIter)]
@@ -197,26 +189,34 @@ impl ProviderKind {
 
     pub fn create(self, timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
         match self {
-            Self::Anthropic => {
-                if bedrock::is_enabled() {
-                    Ok(Box::new(bedrock::Bedrock::new(timeouts)?))
-                } else {
-                    Ok(Box::new(Anthropic::new(timeouts)?))
-                }
-            }
+            Self::Anthropic if bedrock::is_enabled() => Ok(Box::new(Bedrock::new(timeouts)?)),
             Self::OpenAi => Ok(Box::new(OpenAi::new(timeouts)?)),
-            Self::Google => Ok(Box::new(Google::new(timeouts)?)),
             Self::Copilot => Ok(Box::new(Copilot::new(timeouts)?)),
             Self::Ollama => Ok(Box::new(LocalEndpoint::new(&OLLAMA, timeouts)?)),
             Self::LlamaCpp => Ok(Box::new(LocalEndpoint::new(&LLAMACPP, timeouts)?)),
-            Self::Mistral => Ok(Box::new(Mistral::new(timeouts)?)),
-            Self::Zai => Ok(Box::new(Zai::new(timeouts)?)),
-            Self::DeepSeek => Ok(Box::new(DeepSeek::new(timeouts)?)),
-            Self::OpenRouter => Ok(Box::new(OpenRouter::new(timeouts)?)),
-            Self::Synthetic => Ok(Box::new(Synthetic::new(timeouts)?)),
-            Self::TensorX => Ok(Box::new(TensorX::new(timeouts)?)),
             Self::Opencode => Ok(Box::new(Opencode::new(timeouts)?)),
+            Self::Anthropic
+            | Self::Google
+            | Self::Mistral
+            | Self::Zai
+            | Self::DeepSeek
+            | Self::OpenRouter
+            | Self::Synthetic
+            | Self::TensorX => self.create_enveloped(timeouts),
         }
+    }
+
+    fn create_enveloped(self, timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
+        // `provider_for_slug` already routes enveloped slugs through
+        // ManifestProvider. Reaching here means a caller invoked create()
+        // directly without provider_for_slug — still surface the same routing
+        // so direct callers don't see a misleading error.
+        let slug = self.to_string();
+        crate::manifest_provider::ManifestProvider::try_for_slug(&slug, timeouts)?.ok_or_else(
+            || AgentError::Config {
+                message: format!("provider '{slug}' has no env manifest route"),
+            },
+        )
     }
 }
 
@@ -259,6 +259,14 @@ pub trait Provider: Send + Sync {
 }
 
 pub fn provider_for_slug(slug: &str, timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
+    if slug == "anthropic" && bedrock::is_enabled() {
+        return Ok(Box::new(Bedrock::new(timeouts)?));
+    }
+    if let Some(provider) =
+        crate::manifest_provider::ManifestProvider::try_for_slug(slug, timeouts)?
+    {
+        return Ok(provider);
+    }
     if let Ok(kind) = ProviderKind::from_str(slug) {
         return kind.create(timeouts);
     }
@@ -485,5 +493,42 @@ pub async fn fetch_all_models(
     }
     if let Some(done) = on_done {
         done();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct EnvGuard {
+        name: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(name: &'static str, value: &str) -> Self {
+            let previous = std::env::var(name).ok();
+            unsafe { std::env::set_var(name, value) };
+            Self { name, previous }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => unsafe { std::env::set_var(self.name, value) },
+                None => unsafe { std::env::remove_var(self.name) },
+            }
+        }
+    }
+
+    #[test]
+    fn provider_kind_create_preserves_enveloped_provider_factory() {
+        let _env = EnvGuard::set("DEEPSEEK_API_KEY", "sk-test");
+        let result = ProviderKind::DeepSeek.create(Timeouts::default());
+
+        if let Err(error) = result {
+            panic!("DeepSeek factory failed: {error}");
+        }
     }
 }
