@@ -50,6 +50,7 @@ local EXT_TO_LANG = {
   dart = "dart",
   yaml = "yaml",
   yml = "yaml",
+  sql = "sql",
 }
 
 local FILENAME_TO_LANG = {

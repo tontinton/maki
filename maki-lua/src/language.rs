@@ -26,6 +26,7 @@ pub enum Language {
     Zig,
     Nix,
     Dart,
+    Sql,
     Yaml,
 }
 
@@ -56,6 +57,7 @@ impl Language {
             "zig" => Some(Self::Zig),
             "nix" => Some(Self::Nix),
             "dart" => Some(Self::Dart),
+            "sql" => Some(Self::Sql),
             "yaml" => Some(Self::Yaml),
             _ => None,
         }
@@ -87,6 +89,7 @@ impl Language {
             "zig" => Some(Self::Zig),
             "nix" => Some(Self::Nix),
             "dart" => Some(Self::Dart),
+            "sql" => Some(Self::Sql),
             "yaml" | "yml" => Some(Self::Yaml),
             _ => None,
         }
@@ -118,6 +121,7 @@ impl Language {
             Self::Zig => tree_sitter_zig::LANGUAGE.into(),
             Self::Nix => tree_sitter_nix::LANGUAGE.into(),
             Self::Dart => tree_sitter_dart::LANGUAGE.into(),
+            Self::Sql => tree_sitter_sequel::LANGUAGE.into(),
             Self::Yaml => tree_sitter_yaml::LANGUAGE.into(),
         }
     }
