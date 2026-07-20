@@ -863,6 +863,26 @@ Close the session and flush its history back to the parent agent. You can
 call this multiple times safely. If you forget, it runs automatically when
 the session is garbage collected.
 
+---
+
+### `Session:get_progress()` {#Session-get_progress}
+
+```lua
+Session:get_progress()
+```
+
+Poll the session for a progress snapshot while a prompt is running.
+
+Returns a table with:
+  `elapsed_ms` (integer): time since the session was created.
+  `current_tool` (string?): name of the tool currently running, if any.
+  `recent_tools` (table): names of the last few finished tools, oldest first.
+  `completed_count` (integer): total number of finished tools so far.
+  `done` (bool): true once the prompt has completed.
+
+The call returns at most every `PROGRESS_TIMEOUT_MS` milliseconds, or
+immediately when a tool starts or finishes.
+
 
 ## maki.async {#maki-async}
 
