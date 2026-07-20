@@ -430,6 +430,9 @@ struct ChunkUsage {
     #[serde(default)]
     completion_tokens: u32,
     prompt_tokens_details: Option<PromptTokensDetails>,
+    /// DeepSeek reports cache hits here instead of `prompt_tokens_details`.
+    #[serde(default)]
+    prompt_cache_hit_tokens: u32,
 }
 
 #[derive(Deserialize)]
@@ -488,8 +491,8 @@ pub async fn parse_sse(
         if let Some(u) = chunk.usage {
             let cached = u
                 .prompt_tokens_details
-                .map(|d| d.cached_tokens)
-                .unwrap_or(0);
+                .map_or(0, |d| d.cached_tokens)
+                .max(u.prompt_cache_hit_tokens);
             usage = TokenUsage {
                 input: u.prompt_tokens.saturating_sub(cached),
                 output: u.completion_tokens,
@@ -702,6 +705,25 @@ data: [DONE]\n";
                 }
             }
             assert_eq!(deltas, vec!["Hello", " world"]);
+        })
+    }
+
+    #[test]
+    fn parse_sse_deepseek_cache_hit_tokens() {
+        smol::block_on(async {
+            let sse = "\
+data: {\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":10,\"prompt_cache_hit_tokens\":80,\"prompt_cache_miss_tokens\":20}}\n\
+\n\
+data: [DONE]\n";
+
+            let (tx, _rx) = flume::unbounded();
+            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+                .await
+                .unwrap();
+
+            assert_eq!(resp.usage.input, 20);
+            assert_eq!(resp.usage.cache_read, 80);
+            assert_eq!(resp.usage.output, 10);
         })
     }
 
