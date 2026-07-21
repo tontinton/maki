@@ -22,7 +22,7 @@ use maki_storage::id::SessionRef;
 
 const DOOM_LOOP_THRESHOLD: usize = 3;
 const DOOM_LOOP_MESSAGE: &str = "You have called this tool with identical input 3 times in a row. You are stuck in a loop. Break out and try a different approach.";
-const UNKNOWN_TOOL_PREFIX: &str = "unknown tool";
+pub const UNKNOWN_TOOL_PREFIX: &str = "unknown tool";
 const MCP_PERM_SCOPE_MAX_BYTES: usize = 200;
 
 const SOURCE_NATIVE: &str = "native";

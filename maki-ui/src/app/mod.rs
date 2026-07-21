@@ -42,6 +42,8 @@ use crate::components::pack_review::{PackReview, PackReviewAction};
 use crate::components::permission_prompt::PermissionPrompt;
 use crate::components::plan_form::{PlanForm, PlanFormAction};
 use crate::components::rewind_picker::{RewindPicker, RewindPickerAction};
+#[cfg(all(feature = "sandbox", target_os = "linux"))]
+use crate::components::sandbox_modal::SandboxModal;
 use crate::components::scrollbar;
 use crate::components::search_modal::{SearchAction, SearchModal};
 use crate::components::status_bar::StatusBar;
@@ -211,6 +213,8 @@ pub struct App {
     pub(super) btw_modal: BtwModal,
     pub(super) float_mgr: FloatManager,
     pub(super) search_modal: SearchModal,
+    #[cfg(all(feature = "sandbox", target_os = "linux"))]
+    pub(super) sandbox_modal: SandboxModal,
     pub(super) file_picker: FilePickerModal,
     pub(super) pack_review: PackReview,
     pub(super) permission_prompt: PermissionPrompt,
@@ -308,6 +312,20 @@ impl App {
             btw_modal: BtwModal::new(typewriter, ui_config.show_thinking),
             float_mgr: FloatManager::new(),
             search_modal: SearchModal::new(),
+            #[cfg(all(feature = "sandbox", target_os = "linux"))]
+            sandbox_modal: SandboxModal::new(
+                crate::components::sandbox_modal::SandboxInfo {
+                    enabled: false,
+                    env_entries: vec![],
+                    allowed_env: vec![],
+                    workspace_dir: String::new(),
+                    workspace_name: String::new(),
+                    home_mounts: vec![],
+                    profiles: vec![],
+                    extra_workspace_dirs: vec![],
+                },
+                None,
+            ),
             file_picker: FilePickerModal::new(),
             pack_review: PackReview::new(),
             permission_prompt: PermissionPrompt::new(),
@@ -546,6 +564,11 @@ impl App {
             self.usage_modal.scroll(delta);
             return None;
         }
+        #[cfg(all(feature = "sandbox", target_os = "linux"))]
+        if self.sandbox_modal.is_open() {
+            self.sandbox_modal.scroll(delta);
+            return None;
+        }
         let pos = Position::new(column, row);
         if self.float_mgr.is_open() && self.float_mgr.contains(pos) {
             self.float_mgr.scroll(delta);
@@ -587,6 +610,14 @@ impl App {
         }
         if key::HELP.matches(key) {
             return Some(self.run_builtin(BuiltinAction::Help));
+        }
+        #[cfg(all(feature = "sandbox", target_os = "linux"))]
+        if key::SANDBOX.matches(key) {
+            self.sandbox_modal.toggle();
+            if self.sandbox_modal.is_open() {
+                self.sandbox_modal.set_yolo(self.permissions.is_yolo());
+            }
+            return Some(vec![]);
         }
         if key::SCROLL_HALF_UP.matches(key) {
             let half = self.chats[self.active_chat].half_page();
@@ -709,6 +740,36 @@ impl App {
                     vec![]
                 }
             });
+        }
+
+        #[cfg(all(feature = "sandbox", target_os = "linux"))]
+        if self.sandbox_modal.is_open() {
+            self.sandbox_modal.handle_key(key);
+            if self.sandbox_modal.take_enabled_changed() {
+                let enabled = self.sandbox_modal.is_enabled();
+                let cwd = std::env::current_dir().unwrap_or_else(|_| "..".into());
+                if let Err(e) = maki_config::save_sandbox_enabled(&cwd, enabled) {
+                    self.status_bar
+                        .flash(format!("failed to save sandbox setting: {e}"));
+                }
+            }
+            if self.sandbox_modal.take_profiles_changed() {
+                let names = self.sandbox_modal.enabled_profile_names();
+                let cwd = std::env::current_dir().unwrap_or_else(|_| "..".into());
+                if let Err(e) = maki_config::save_sandbox_profiles(&cwd, &names) {
+                    self.status_bar
+                        .flash(format!("failed to save sandbox profiles: {e}"));
+                }
+            }
+            if self.sandbox_modal.take_yolo_changed() {
+                let enabled = self.permissions.toggle_yolo();
+                self.flash(if enabled {
+                    "YOLO mode enabled".into()
+                } else {
+                    "YOLO mode disabled".into()
+                });
+            }
+            return Some(vec![]);
         }
 
         if self.queue.focus().is_some() {
@@ -1388,6 +1449,10 @@ impl App {
             "/cd" => self.cmd_cd(&cmd.args),
             "/yolo" => {
                 let enabled = self.permissions.toggle_yolo();
+                #[cfg(all(feature = "sandbox", target_os = "linux"))]
+                if self.sandbox_modal.is_open() {
+                    self.sandbox_modal.set_yolo(enabled);
+                }
                 let msg = if enabled {
                     "YOLO mode enabled"
                 } else {
@@ -1437,6 +1502,11 @@ impl App {
                         vec![]
                     }
                 }
+            }
+            #[cfg(all(feature = "sandbox", target_os = "linux"))]
+            "/sandbox" => {
+                self.sandbox_modal.toggle();
+                vec![]
             }
             name if name.starts_with("/project:") || name.starts_with("/user:") => {
                 self.execute_custom_command(name, &cmd.args)
@@ -1582,13 +1652,21 @@ impl App {
         vec![]
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 13] {
+    const OVERLAY_COUNT: usize = if cfg!(all(feature = "sandbox", target_os = "linux")) {
+        14
+    } else {
+        13
+    };
+
+    fn overlays(&self) -> [&dyn Overlay; Self::OVERLAY_COUNT] {
         [
             &self.help_modal,
             &self.usage_modal,
             &self.btw_modal,
             &self.float_mgr,
             &self.search_modal,
+            #[cfg(all(feature = "sandbox", target_os = "linux"))]
+            &self.sandbox_modal,
             &self.file_picker,
             &self.rewind_picker,
             &self.theme_picker,
@@ -1600,13 +1678,15 @@ impl App {
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 13] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; Self::OVERLAY_COUNT] {
         [
             &mut self.help_modal,
             &mut self.usage_modal,
             &mut self.btw_modal,
             &mut self.float_mgr,
             &mut self.search_modal,
+            #[cfg(all(feature = "sandbox", target_os = "linux"))]
+            &mut self.sandbox_modal,
             &mut self.file_picker,
             &mut self.rewind_picker,
             &mut self.theme_picker,
@@ -1751,6 +1831,10 @@ impl App {
             return;
         }
         if self.float_mgr.handle_paste(text) {
+            return;
+        }
+        #[cfg(all(feature = "sandbox", target_os = "linux"))]
+        if self.sandbox_modal.is_open() && self.sandbox_modal.handle_paste(text) {
             return;
         }
         if self.search_modal.is_open() {

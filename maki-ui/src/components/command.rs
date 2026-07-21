@@ -141,6 +141,12 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         max_args: 1,
         bang: true,
     },
+    BuiltinCommand {
+        name: "/sandbox",
+        description: "Open sandbox environment info, file browser, and shell",
+        max_args: 0,
+        bang: false,
+    },
 ];
 
 pub struct ParsedCommand {

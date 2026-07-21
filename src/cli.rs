@@ -85,6 +85,14 @@ pub struct Cli {
     #[arg(long)]
     pub exit_on_done: bool,
 
+    /// Enable sandbox mode for code execution (isolated child process)
+    #[arg(long)]
+    pub sandbox: bool,
+
+    /// Internal: sandbox child inner instance after pivot_root+exec
+    #[arg(long, hide = true)]
+    pub sandbox_inner: bool,
+
     /// Pre-approve tools (comma-separated). Accepts PascalCase (Claude Code) or snake_case.
     #[arg(long, value_delimiter = ',', visible_alias = "allowedTools")]
     pub allowed_tools: Vec<String>,

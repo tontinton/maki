@@ -4,6 +4,7 @@
 //! the blocked thread unwind instead of leaking.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures::future::join_all;
@@ -65,9 +66,10 @@ async fn call_lua_tool(lua: Lua, f: Option<Function>, pc: &PendingCall) -> Resul
 /// If the Python code calls tools, those calls are dispatched to the Lua
 /// functions you provide in {opts}.tools.
 ///
-/// The result table has optional fields: `stdout` (string, trimmed combined
-/// output) and `output` (string, the final expression value). On error, the
-/// table is empty and the second return value is the error message.
+/// When a [`SandboxRunner`] callback is stored in the Lua state's app_data, the code
+/// runs inside an OS-level sandboxed child process (user+mount namespaces)
+/// instead of the in-process monty interpreter. Tool calls are transparently
+/// forwarded back to the parent where the Lua plugins handle them.
 ///
 /// @param code string Python source code to execute.
 /// @param opts table Required fields:
@@ -113,89 +115,97 @@ async fn interpreter_run(lua: Lua, code: String, opts: Table) -> LuaResult<Pair<
         .unwrap_or_else(CancelToken::none);
 
     let timeout = Duration::from_secs(timeout_secs);
-    let limits = runner::limits(timeout, max_memory_mb * 1024 * 1024);
 
-    let (tx, rx) = flume::unbounded::<BridgeMsg>();
-    let run = smol::unblock(move || {
-        let tools: HashMap<String, ToolFn> = names
-            .into_iter()
-            .map(|name| {
+    let sandbox_runner = lua
+        .app_data_ref::<Arc<crate::runtime::SandboxRunner>>()
+        .map(|r| Arc::clone(&r));
+
+    let result = if let Some(runner) = sandbox_runner {
+        runner(lua.clone(), code, timeout, fns).await?
+    } else {
+        let limits = runner::limits(timeout, max_memory_mb * 1024 * 1024);
+        let (tx, rx) = flume::unbounded::<BridgeMsg>();
+        let run = smol::unblock(move || {
+            let tools: HashMap<String, ToolFn> = names
+                .into_iter()
+                .map(|name| {
+                    let tx = tx.clone();
+                    let f: ToolFn = Box::new(
+                        move |fn_name: &str, args: Vec<Value>, kwargs: Vec<(String, Value)>| {
+                            let call = PendingCall {
+                                call_id: 0,
+                                name: fn_name.to_owned(),
+                                args,
+                                kwargs,
+                            };
+                            forward_calls(&tx, vec![call])
+                                .map_err(|e| e.to_string())?
+                                .pop()
+                                .map(|(_, r)| r)
+                                .unwrap_or_else(|| Err(BRIDGE_CLOSED.into()))
+                        },
+                    );
+                    (name, f)
+                })
+                .collect();
+            let resolver: AsyncResolver = {
                 let tx = tx.clone();
-                let f: ToolFn = Box::new(
-                    move |fn_name: &str, args: Vec<Value>, kwargs: Vec<(String, Value)>| {
-                        let call = PendingCall {
-                            call_id: 0,
-                            name: fn_name.to_owned(),
-                            args,
-                            kwargs,
-                        };
-                        forward_calls(&tx, vec![call])
-                            .map_err(|e| e.to_string())?
-                            .pop()
-                            .map(|(_, r)| r)
-                            .unwrap_or_else(|| Err(BRIDGE_CLOSED.into()))
-                    },
-                );
-                (name, f)
-            })
-            .collect();
-        let resolver: AsyncResolver = {
-            let tx = tx.clone();
-            Box::new(move |pending| forward_calls(&tx, pending))
-        };
+                Box::new(move |pending| forward_calls(&tx, pending))
+            };
 
-        let mut flushed = 0usize;
-        let result = runner::run(
-            &code,
-            &preamble,
-            &tools,
-            Some(&resolver),
-            limits,
-            &mut |chunk| {
-                flushed += chunk.len();
-                for line in chunk.lines() {
+            let mut flushed = 0usize;
+            let result = runner::run(
+                &code,
+                &preamble,
+                &tools,
+                Some(&resolver),
+                limits,
+                &mut |chunk| {
+                    flushed += chunk.len();
+                    for line in chunk.lines() {
+                        let _ = tx.send(BridgeMsg::Line(line.to_owned()));
+                    }
+                },
+            )
+            .map_err(|e| e.to_string());
+            if let Ok(ir) = &result {
+                for line in ir.stdout[flushed..].lines() {
                     let _ = tx.send(BridgeMsg::Line(line.to_owned()));
                 }
-            },
-        )
-        .map_err(|e| e.to_string());
-        if let Ok(ir) = &result {
-            for line in ir.stdout[flushed..].lines() {
-                let _ = tx.send(BridgeMsg::Line(line.to_owned()));
             }
-        }
-        result
-    });
+            result
+        });
 
-    let recv_loop = async {
-        while let Ok(msg) = rx.recv_async().await {
-            match msg {
-                BridgeMsg::Line(line) => on_output.call::<()>(line)?,
-                BridgeMsg::Calls(batch, reply) => {
-                    let futs = batch.into_iter().map(|pc| {
-                        let f = fns.get(&pc.name).cloned();
-                        let lua = lua.clone();
-                        // Name the tool on every failure: neither a traceback nor a
-                        // list of gathered results says which call broke.
-                        async move {
-                            let result = call_lua_tool(lua, f, &pc).await;
-                            (pc.call_id, result.map_err(|e| format!("{}: {e}", pc.name)))
-                        }
-                    });
-                    let _ = reply.send(join_all(futs).await);
+        let recv_loop = async {
+            while let Ok(msg) = rx.recv_async().await {
+                match msg {
+                    BridgeMsg::Line(line) => on_output.call::<()>(line)?,
+                    BridgeMsg::Calls(batch, reply) => {
+                        let futs = batch.into_iter().map(|pc| {
+                            let f = fns.get(&pc.name).cloned();
+                            let lua = lua.clone();
+                            // Name the tool on every failure: neither a traceback nor a
+                            // list of gathered results says which call broke.
+                            async move {
+                                let result = call_lua_tool(lua, f, &pc).await;
+                                (pc.call_id, result.map_err(|e| format!("{}: {e}", pc.name)))
+                            }
+                        });
+                        let _ = reply.send(join_all(futs).await);
+                    }
                 }
             }
-        }
-        Ok::<(), mlua::Error>(())
+            Ok::<(), mlua::Error>(())
+        };
+        // A cancel comes back as a pair error, not a raise, so the caller can
+        // still report the lines it streamed before the cut.
+        let (result, cb) = match cancel.race(futures_lite::future::zip(run, recv_loop)).await {
+            Ok(v) => v,
+            Err(e) => return Ok((None, Some(e))),
+        };
+        cb?;
+        result
     };
-
-    // A cancel comes back as a pair error, not a raise, so the caller can
-    // still report the lines it streamed before the cut.
-    let (result, cb) = match cancel.race(futures_lite::future::zip(run, recv_loop)).await {
-        Ok(v) => v,
-        Err(e) => return Ok((None, Some(e))),
-    };
-    cb?;
 
     let tbl = lua.create_table()?;
     match result {

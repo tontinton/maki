@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use event_listener::Event;
 
 use include_dir::Dir;
+use maki_agent::agent::UNKNOWN_TOOL_PREFIX;
 use maki_agent::cancel::CancelToken;
 use maki_agent::permissions::PluginRuleStore;
 use maki_agent::prompt::{PromptId, ResolvedSlots, Slot, SlotEntry};
@@ -32,6 +33,7 @@ use mlua::{
 use serde_json::Value;
 
 use maki_config::RawConfig;
+use maki_interpreter::runner::InterpreterResult;
 use maki_storage::id::MakiId;
 
 use crate::api::autocmd::AutocmdStore;
@@ -56,6 +58,21 @@ use crate::api::util::setup::ConfigStore;
 use crate::docs_render;
 use crate::error::PluginError;
 use crate::plugin_permissions::{PluginPermissions, load_plugin_permissions};
+
+/// Callback for running Python code inside an OS-level sandbox.
+///
+/// The binary crate provides this callback, which orchestrates the sandbox
+/// lifecycle (setup, IPC, tool dispatch). The Lua crate calls it from
+/// `interpreter_run` when a sandbox is configured.
+pub type SandboxRunner = dyn Fn(
+        Lua,
+        String,
+        Duration,
+        HashMap<String, Function>,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<Result<InterpreterResult, String>, mlua::Error>> + Send>,
+    > + Send
+    + Sync;
 
 const INTERRUPT_SHUTDOWN_MSG: &str = "plugin interrupted: host shutting down";
 const INTERRUPT_CANCELLED_MSG: &str = "plugin interrupted: task cancelled";
@@ -94,6 +111,70 @@ const OPT_LEVEL_JIT: u8 = 2;
 const OPT_LEVEL_DEBUGGABLE: u8 = 1;
 const DEBUG_INFO_FULL: u8 = 2;
 const ASYNC_RUN_DEFAULT_DEADLINE: Duration = Duration::from_secs(60);
+/// Executes a tool call outside the plugin host. The binary wires this to
+/// the sandbox child; an Err marks the tool result as an error.
+pub type SandboxRouter =
+    dyn Fn(&str, Vec<Value>, Vec<(String, Value)>) -> Result<String, String> + Send + Sync;
+
+/// Tools that always run on the host even when sandbox mode is on: they
+/// need session state, TUI interaction, or machinery the sandbox child
+/// cannot provide. This is an allowlist on purpose — any tool not listed
+/// here (including tools added later) defaults to running inside the
+/// sandbox child. If the child cannot run a routed tool it answers with
+/// [`UNKNOWN_TOOL_PREFIX`](maki_agent::agent::UNKNOWN_TOOL_PREFIX) and we
+/// transparently fall back to the host plugin.
+const SANDBOX_HOST_TOOLS: &[&str] = &[
+    "batch",
+    "code_execution",
+    "index",
+    "memory",
+    "question",
+    "skill",
+    "task",
+    "todo_write",
+    "webfetch",
+    "websearch",
+];
+
+/// Splits a JSON input value into the (args, kwargs) form expected by the
+/// sandbox child's native tool handlers. Objects are flattened into kwargs;
+/// non-object values are passed as a single positional arg.
+fn split_input(input: &Value) -> (Vec<Value>, Vec<(String, Value)>) {
+    if let Value::Object(map) = input {
+        let kwargs: Vec<(String, Value)> =
+            map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        (Vec::new(), kwargs)
+    } else {
+        (vec![input.clone()], Vec::new())
+    }
+}
+
+async fn sandbox_routed_reply(
+    lua: &Lua,
+    tool: &str,
+    input: &Value,
+    cancel: &CancelToken,
+) -> Option<ToolCallReply> {
+    let router = lua
+        .app_data_ref::<Arc<SandboxRouter>>()
+        .map(|r| Arc::clone(&r))?;
+    let (args, kwargs) = split_input(input);
+    let tool = tool.to_string();
+    // Dropping the unblock future on cancel detaches the blocking call: the
+    // child keeps running to completion, but the reply reports cancellation
+    // instead of waiting for it.
+    let result = cancel
+        .race(smol::unblock(move || router(&tool, args, kwargs)))
+        .await;
+    Some(match result {
+        Ok(Ok(output)) => ToolCallReply::plain(Ok(output)),
+        // The child has no native handler for this tool and it is not
+        // trusted-forwardable: let the caller run the host plugin instead.
+        Ok(Err(e)) if e.starts_with(UNKNOWN_TOOL_PREFIX) => return None,
+        Ok(Err(e)) => ToolCallReply::err(e),
+        Err(message) => ToolCallReply::err(message),
+    })
+}
 /// Async tasks spawned during restore may spawn further tasks; cap the rounds.
 const RESTORE_SPAWN_ROUNDS: usize = 8;
 /// Keeps a buggy plugin's restore task from freezing the lua loop.
@@ -345,6 +426,8 @@ pub enum Request {
         /// `row`) instead of dropping the click.
         fallback: Option<Box<ClickFallback>>,
     },
+    SetSandboxConfig(Arc<SandboxRunner>),
+    SetSandboxRouter(Arc<SandboxRouter>),
     RunKeybindCallback {
         id: u64,
     },
@@ -3129,6 +3212,15 @@ async fn run_tool_call(
     plugins: PluginMap,
     shutdown: Arc<AtomicBool>,
 ) -> ToolCallReply {
+    if shutdown.load(Ordering::Acquire) {
+        return ToolCallReply::err("plugin host shutting down");
+    }
+    if !SANDBOX_HOST_TOOLS.contains(&tool.as_ref()) && ctx.sandbox_enabled() {
+        if let Some(reply) = sandbox_routed_reply(&lua, &tool, &input, &ctx.cancel).await {
+            return reply;
+        }
+        tracing::warn!(%tool, "sandbox routing failed; running tool on host");
+    }
     let handler: Function = {
         let plugins_ref = plugins.borrow();
         let Some(owner) = plugins_ref.get(&*plugin) else {
@@ -3142,9 +3234,6 @@ async fn run_tool_call(
             Err(e) => return ToolCallReply::err(strip_traceback(&e)),
         }
     };
-    if shutdown.load(Ordering::Acquire) {
-        return ToolCallReply::err("plugin host shutting down");
-    }
 
     let (finish_tx, finish_rx) = flume::bounded::<ToolCallReply>(1);
     ctx.finish_tx = Some(finish_tx);
@@ -3771,6 +3860,12 @@ pub fn spawn(
                             })
                             .detach();
                         }
+                        Request::SetSandboxConfig(runner) => {
+                            rt.lua.set_app_data(runner);
+                        }
+                        Request::SetSandboxRouter(router) => {
+                            rt.lua.set_app_data(router);
+                        }
                         Request::RunKeybindCallback { id } => {
                             let func = rt.lua.app_data_ref::<KeymapStore>().and_then(|store| {
                                 let key = store.callback_for_id(id)?;
@@ -3828,6 +3923,29 @@ mod tests {
     use std::future::poll_fn;
     use std::task::Poll;
     use test_case::test_case;
+
+    /// The routing default is "inside the sandbox": the host list must never
+    /// contain a filesystem tool, or cargo-style fs work would silently
+    /// escape the namespace.
+    #[test]
+    fn sandbox_host_tools_exclude_filesystem_tools() {
+        for tool in [
+            "bash",
+            "read",
+            "write",
+            "edit",
+            "multiedit",
+            "glob",
+            "grep",
+            "list",
+        ] {
+            assert!(
+                !SANDBOX_HOST_TOOLS.contains(&tool),
+                "{tool} must route into the sandbox"
+            );
+        }
+        assert_eq!(SANDBOX_HOST_TOOLS.len(), 10);
+    }
 
     fn make_buf_handle(text: &str) -> BufHandle {
         let buf = Arc::new(maki_agent::SharedBuf::new());
@@ -5079,5 +5197,39 @@ mod tests {
             }
             panic!("gate count never reached 0 after draining");
         }));
+    }
+
+    mod split_input_tests {
+        use super::*;
+        use serde_json::json;
+        use test_case::test_case;
+
+        #[test_case(json!({"command": "ls -la", "description": "list files"}); "object_flattens_to_kwargs")]
+        #[test_case(json!({"a": 1, "b": "x"}); "object_two_fields")]
+        #[test_case(json!({}); "empty_object_no_args_no_kwargs")]
+        #[test_case(json!("plain string"); "non_object_goes_to_args")]
+        #[test_case(json!(42); "number_goes_to_args")]
+        #[test_case(json!(null); "null_goes_to_args")]
+        fn split_input_cases(input: Value) {
+            let (args, kwargs) = split_input(&input);
+            match input {
+                Value::Object(map) => {
+                    assert!(args.is_empty());
+                    assert_eq!(kwargs.len(), map.len());
+                    for (k, v) in &map {
+                        let found = kwargs.iter().find(|(kk, _)| kk == k);
+                        assert_eq!(
+                            found.map(|(_, vv)| vv),
+                            Some(v),
+                            "field {k} missing or mismatched"
+                        );
+                    }
+                }
+                _ => {
+                    assert_eq!(args, vec![input]);
+                    assert!(kwargs.is_empty());
+                }
+            }
+        }
     }
 }
