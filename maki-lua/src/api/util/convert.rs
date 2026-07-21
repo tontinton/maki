@@ -71,24 +71,51 @@ pub(crate) fn lua_to_json(lua: &Lua, val: &Value) -> LuaResult<JsonValue> {
             .unwrap_or(JsonValue::Null),
         Value::String(s) => JsonValue::String(s.to_str()?.to_owned()),
         Value::Table(tbl) => {
-            let len = tbl.raw_len();
-            let is_array = len > 0 || tbl.metatable().as_ref() == Some(&lua.array_metatable());
-
-            if is_array {
-                let mut arr = Vec::with_capacity(len);
-                for i in 1..=len {
-                    let v: Value = tbl.raw_get(i)?;
-                    arr.push(lua_to_json(lua, &v)?);
+            // A table serializes as a JSON array only when every key is a
+            // positive integer and they are dense from 1 (count == max), so no
+            // string key silently disappears and sparse tables like
+            // `{ [1] = "a", [3] = "c" }` deterministically become objects
+            // (`lua_rawlen` borders are implementation-defined for those).
+            let mut has_non_int = false;
+            let mut int_count = 0;
+            let mut max_int = 0;
+            let mut entries = Vec::new();
+            for pair in tbl.pairs::<Value, Value>() {
+                let (k, v) = pair?;
+                match k {
+                    Value::Integer(i) if i > 0 => {
+                        int_count += 1;
+                        max_int = max_int.max(i as usize);
+                    }
+                    _ => has_non_int = true,
                 }
-                JsonValue::Array(arr)
-            } else {
-                let mut map = serde_json::Map::new();
-                for pair in tbl.pairs::<String, Value>() {
-                    let (k, v) = pair?;
-                    map.insert(k, lua_to_json(lua, &v)?);
-                }
-                JsonValue::Object(map)
+                entries.push((k, v));
             }
+
+            let is_array = !has_non_int
+                && int_count == max_int
+                && (int_count > 0 || tbl.metatable().as_ref() == Some(&lua.array_metatable()));
+            if is_array {
+                let mut arr = vec![JsonValue::Null; int_count];
+                for (k, v) in entries {
+                    let Value::Integer(i) = k else { unreachable!() };
+                    arr[i as usize - 1] = lua_to_json(lua, &v)?;
+                }
+                return Ok(JsonValue::Array(arr));
+            }
+
+            let mut map = serde_json::Map::new();
+            for (k, v) in entries {
+                let key = match k {
+                    Value::String(s) => s.to_str()?.to_owned(),
+                    Value::Integer(i) => i.to_string(),
+                    Value::Number(n) => n.to_string(),
+                    Value::Boolean(b) => b.to_string(),
+                    _ => continue,
+                };
+                map.insert(key, lua_to_json(lua, &v)?);
+            }
+            JsonValue::Object(map)
         }
         _ => JsonValue::Null,
     })
@@ -189,17 +216,36 @@ mod tests {
     }
 
     #[test]
-    fn lua_to_json_array_with_hole_reads_up_to_raw_len() {
+    fn lua_to_json_sparse_table_becomes_object() {
         let lua = Lua::new();
         let tbl = lua.create_table().unwrap();
         tbl.raw_set(1, "a").unwrap();
-        tbl.raw_set(2, Value::Nil).unwrap();
         tbl.raw_set(3, "c").unwrap();
 
-        let len = tbl.raw_len();
         let result = lua_to_json(&lua, &Value::Table(tbl)).unwrap();
-        let arr = result.as_array().unwrap();
-        assert_eq!(arr.len(), len);
+        assert_eq!(result, serde_json::json!({"1": "a", "3": "c"}));
+    }
+
+    #[test]
+    fn lua_to_json_array_metatable_with_string_key_becomes_object() {
+        let lua = Lua::new();
+        let arr = json_to_lua(&lua, &serde_json::json!([10, 20])).unwrap();
+        let tbl = arr.as_table().unwrap();
+        tbl.set("total", 5).unwrap();
+
+        let result = lua_to_json(&lua, &arr).unwrap();
+        assert_eq!(result, serde_json::json!({"1": 10, "2": 20, "total": 5}));
+    }
+
+    #[test]
+    fn lua_to_json_mixed_table_becomes_object() {
+        let lua = Lua::new();
+        let tbl = lua.create_table().unwrap();
+        tbl.raw_set(1, "first").unwrap();
+        tbl.set("pattern", "grep").unwrap();
+
+        let result = lua_to_json(&lua, &Value::Table(tbl)).unwrap();
+        assert_eq!(result, serde_json::json!({"1": "first", "pattern": "grep"}));
     }
 
     #[test]

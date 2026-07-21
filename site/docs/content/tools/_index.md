@@ -91,7 +91,7 @@ Find files by glob pattern.
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | `path` | string | no | cwd | Directory to search in |
-| `pattern` | string | no |  | Glob pattern (e.g. **/*.rs, src/**/*.ts) |
+| `pattern` | string | yes |  | Glob pattern (e.g. **/*.rs, src/**/*.ts) |
 
 ### `grep` *(lua plugin)*
 
