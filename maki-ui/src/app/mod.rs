@@ -176,7 +176,7 @@ pub struct App {
     pub(crate) shell: shell::ShellState,
     pub(crate) ui_config: UiConfig,
     pub(crate) permissions: Arc<PermissionManager>,
-    pub(crate) lua_event_handle: Option<EventHandle>,
+    pub(crate) lua_event_handle: EventHandle,
     pub(super) keymap_reader: KeymapReader,
     pub(super) hint_reader: HintReader,
     pub(crate) restore_event_tx: Option<maki_agent::EventSender>,
@@ -201,6 +201,7 @@ impl App {
         input_history_size: usize,
         permissions: Arc<PermissionManager>,
         custom_commands: Arc<[maki_agent::command::CustomCommand]>,
+        lua_event_handle: EventHandle,
     ) -> Self {
         scrollbar::set_enabled(ui_config.scrollbar);
         let state = SessionState::from_session(session, model, &storage);
@@ -211,7 +212,11 @@ impl App {
             ui_config.max_input_lines,
         );
         let mut app = Self {
-            chats: vec![Chat::new("Main".into(), ui_config.clone())],
+            chats: vec![Chat::new(
+                "Main".into(),
+                ui_config.clone(),
+                lua_event_handle.clone(),
+            )],
             active_chat: 0,
             chat_index: HashMap::new(),
             input_box,
@@ -259,7 +264,7 @@ impl App {
             shell: shell::ShellState::default(),
             ui_config,
             permissions,
-            lua_event_handle: None,
+            lua_event_handle,
             keymap_reader,
             hint_reader,
             restore_event_tx: None,
@@ -298,15 +303,13 @@ impl App {
     }
 
     pub(crate) fn fire_session_autocmd(&self, event: &str, mut data: serde_json::Value) {
-        if let Some(ref handle) = self.lua_event_handle {
-            if let Some(map) = data.as_object_mut() {
-                map.insert(
-                    "session_id".into(),
-                    serde_json::Value::String(self.state.session.id.to_string()),
-                );
-            }
-            handle.fire_autocmd(event, data);
+        if let Some(map) = data.as_object_mut() {
+            map.insert(
+                "session_id".into(),
+                serde_json::Value::String(self.state.session.id.to_string()),
+            );
         }
+        self.lua_event_handle.fire_autocmd(event, data);
     }
 
     pub fn tick_error_expiry(&mut self) {
@@ -727,8 +730,7 @@ impl App {
         for entry in &snap.entries {
             if entry.key == key.code
                 && entry.modifiers == key.modifiers
-                && let Some(ref handle) = self.lua_event_handle
-                && handle.run_keybind_callback(entry.id)
+                && self.lua_event_handle.run_keybind_callback(entry.id)
             {
                 return true;
             }
@@ -1139,8 +1141,12 @@ impl App {
         if let Some(ref model) = subagent.model {
             self.chats[0].update_tool_model(id, model);
         }
-        let mut chat = Chat::new(subagent.name.clone(), self.ui_config.clone());
-        chat.set_restore_channel(self.lua_event_handle.clone(), self.restore_event_tx.clone());
+        let mut chat = Chat::new(
+            subagent.name.clone(),
+            self.ui_config.clone(),
+            self.lua_event_handle.clone(),
+        );
+        chat.set_restore_channel(self.restore_event_tx.clone());
         chat.model_id = subagent.model.clone();
         if let Some(ref prompt) = subagent.prompt {
             chat.push_user_message(prompt);
@@ -1279,10 +1285,11 @@ impl App {
         let Some(lua_cmd) = self.command_palette.find_lua_command(name) else {
             return;
         };
-        let Some(handle) = &self.lua_event_handle else {
-            return;
-        };
-        handle.run_command(Arc::clone(&lua_cmd.plugin), Arc::clone(&lua_cmd.name), args);
+        self.lua_event_handle.run_command(
+            Arc::clone(&lua_cmd.plugin),
+            Arc::clone(&lua_cmd.name),
+            args,
+        );
     }
 
     fn execute_mcp_prompt(&mut self, name: &str, args: &str) -> Vec<Action> {

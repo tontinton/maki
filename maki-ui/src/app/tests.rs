@@ -60,6 +60,7 @@ fn build_app_with_lua(
             PathBuf::from("/tmp"),
         )),
         Arc::from([]),
+        maki_lua::EventHandle::disconnected_for_test(),
     )
 }
 
@@ -1814,7 +1815,7 @@ fn typed_lua_command_with_args_executes() {
         }]),
     );
     let (handle, probe) = maki_lua::test_support::probed_event_handle();
-    app.lua_event_handle = Some(handle);
+    app.lua_event_handle = handle;
 
     let actions = type_and_submit(&mut app, "/rename my title");
 
@@ -2532,7 +2533,7 @@ fn install_override(
         id: 1,
     }]);
     let (handle, probe) = maki_lua::test_support::probed_event_handle();
-    app.lua_event_handle = Some(handle);
+    app.lua_event_handle = handle;
     probe
 }
 
@@ -2668,7 +2669,7 @@ fn streaming_cancel_wins_over_quit_override() {
 fn dead_host_override_falls_back_to_builtin() {
     let mut app = test_app();
     let _probe = install_override(&mut app, kb::HELP.code, kb::HELP.modifiers);
-    app.lua_event_handle = Some(maki_lua::EventHandle::disconnected_for_test());
+    app.lua_event_handle = maki_lua::EventHandle::disconnected_for_test();
 
     app.update(Msg::Key(kb::HELP.to_key_event()));
 

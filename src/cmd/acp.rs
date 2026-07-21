@@ -11,7 +11,7 @@ use maki_storage::StateDir;
 
 use crate::setup;
 
-pub fn run(model_arg: Option<String>, yolo: bool, no_jit: bool) -> Result<()> {
+pub fn run(model_arg: Option<String>, yolo: bool, no_plugins: bool, no_jit: bool) -> Result<()> {
     let storage = StateDir::resolve().context("resolve data directory")?;
     maki_providers::model_registry::load_from_storage(&storage);
 
@@ -22,7 +22,7 @@ pub fn run(model_arg: Option<String>, yolo: bool, no_jit: bool) -> Result<()> {
         .context("initialize lua plugin host")?;
 
     let raw_config = plugin_host
-        .load_init_files(&cwd)
+        .load_init_files_or_skip(no_plugins, &cwd)
         .context("load init.lua files")?;
 
     let mut config = raw_config
@@ -53,10 +53,7 @@ pub fn run(model_arg: Option<String>, yolo: bool, no_jit: bool) -> Result<()> {
 
     let (mcp_handle, _mcp_config_errors) = smol::block_on(maki_agent::mcp::start(&cwd));
 
-    let prompt_slots = plugin_host
-        .event_handle()
-        .map(|h| h.collect_prompt_slots())
-        .unwrap_or_default();
+    let prompt_slots = plugin_host.event_handle().collect_prompt_slots();
 
     maki_acp::run(maki_acp::AcpParams {
         model,

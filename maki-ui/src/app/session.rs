@@ -73,8 +73,12 @@ impl App {
 
     pub(super) fn reset_ui_chrome(&mut self) {
         self.chats.clear();
-        let mut main = Chat::new("Main".into(), self.ui_config.clone());
-        main.set_restore_channel(self.lua_event_handle.clone(), self.restore_event_tx.clone());
+        let mut main = Chat::new(
+            "Main".into(),
+            self.ui_config.clone(),
+            self.lua_event_handle.clone(),
+        );
+        main.set_restore_channel(self.restore_event_tx.clone());
         self.chats.push(main);
         self.active_chat = 0;
         self.chat_index.clear();
@@ -111,8 +115,12 @@ impl App {
         for sa in std::mem::take(&mut self.state.session.meta.subagents) {
             let idx = self.chats.len();
             self.chat_index.insert(sa.tool_use_id.clone(), idx);
-            let mut chat = Chat::new(sa.name, self.ui_config.clone());
-            chat.set_restore_channel(self.lua_event_handle.clone(), self.restore_event_tx.clone());
+            let mut chat = Chat::new(
+                sa.name,
+                self.ui_config.clone(),
+                self.lua_event_handle.clone(),
+            );
+            chat.set_restore_channel(self.restore_event_tx.clone());
             chat.model_id = sa.model;
             if let Some(messages) = self.state.session.subagent_messages.get(&sa.tool_use_id) {
                 let (display, items) = history_to_display(
@@ -127,18 +135,20 @@ impl App {
             self.chats.push(chat);
         }
 
-        if let Some(eh) = &self.lua_event_handle {
-            eh.send_restore_complete(restoring);
-        } else {
+        let eh = &self.lua_event_handle;
+        if eh.is_disconnected() {
             self.restoring
                 .store(false, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            eh.send_restore_complete(restoring);
         }
     }
 
     fn fire_restore_items(&self, items: Vec<maki_lua::RestoreItem>) {
-        let (Some(eh), Some(tx)) = (&self.lua_event_handle, &self.restore_event_tx) else {
+        let Some(tx) = &self.restore_event_tx else {
             return;
         };
+        let eh = &self.lua_event_handle;
         let theme_gen = crate::theme::generation();
         for mut item in items {
             item.theme_gen = Some(theme_gen);

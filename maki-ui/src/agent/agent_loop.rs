@@ -45,7 +45,7 @@ pub(super) struct AgentLoop {
     queue: Arc<QueueReceiver>,
     session_id: Option<SessionRef>,
     timeouts: maki_providers::Timeouts,
-    lua_handle: Option<EventHandle>,
+    lua_handle: EventHandle,
     subagent_cancels: Arc<CancelMap<String>>,
 }
 
@@ -67,7 +67,7 @@ impl AgentLoop {
         init_cancel: CancelToken,
         session_id: Option<SessionRef>,
         timeouts: maki_providers::Timeouts,
-        lua_handle: Option<EventHandle>,
+        lua_handle: EventHandle,
         subagent_cancels: Arc<CancelMap<String>>,
     ) -> Self {
         let mcp = mcp_handle.map(|h| McpSession::new(h, &initial_history));
@@ -206,10 +206,7 @@ impl AgentLoop {
             }
         }
 
-        let prompt_slots = match self.lua_handle.as_ref() {
-            Some(h) => h.collect_prompt_slots_async().await,
-            None => maki_agent::prompt::ResolvedSlots::default(),
-        };
+        let prompt_slots = self.lua_handle.collect_prompt_slots_async().await;
         let system = agent::build_system_prompt(
             &self.vars,
             &input.mode,

@@ -335,7 +335,7 @@ fn restore_snapshot_lines_opts(
     state: Option<Value>,
     clicks: Vec<usize>,
 ) -> Vec<Vec<(String, SpanStyle)>> {
-    let handle = host.event_handle().expect("event handle available");
+    let handle = host.event_handle();
     let (tx, rx) = flume::unbounded();
     handle.request_restore(
         maki_lua::RestoreItem {

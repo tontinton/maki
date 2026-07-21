@@ -77,7 +77,7 @@ pub struct MessagesPanel {
     /// warm cache.
     watched_bufs: VecDeque<(String, Arc<SharedBuf>)>,
     tool_output_lines: ToolOutputLines,
-    lua_event_handle: Option<EventHandle>,
+    lua_event_handle: EventHandle,
     restore_event_tx: Option<EventSender>,
     show_thinking: bool,
     thinking_collapsed: bool,
@@ -88,7 +88,7 @@ pub struct MessagesPanel {
 }
 
 impl MessagesPanel {
-    pub fn new(ui_config: UiConfig) -> Self {
+    pub fn new(ui_config: UiConfig, lua_event_handle: EventHandle) -> Self {
         let thinking = thinking_style();
         let assistant = assistant_style();
         let ms = ui_config.typewriter_ms_per_char;
@@ -123,7 +123,7 @@ impl MessagesPanel {
             live_bufs: HashMap::new(),
             watched_bufs: VecDeque::new(),
             tool_output_lines: ui_config.tool_output_lines,
-            lua_event_handle: None,
+            lua_event_handle,
             restore_event_tx: None,
             show_thinking: ui_config.show_thinking,
             thinking_collapsed: !ui_config.show_thinking,
@@ -132,12 +132,7 @@ impl MessagesPanel {
         }
     }
 
-    pub fn set_restore_channel(
-        &mut self,
-        event_handle: Option<EventHandle>,
-        event_tx: Option<EventSender>,
-    ) {
-        self.lua_event_handle = event_handle;
+    pub fn set_restore_channel(&mut self, event_tx: Option<EventSender>) {
         self.restore_event_tx = event_tx;
     }
 
@@ -593,9 +588,8 @@ impl MessagesPanel {
             let rel = u16::try_from(doc_row - seg_start).unwrap_or(u16::MAX);
             let buf_row = seg.source_line_at(rel, width).map_or(0, |l| seg.buf_row(l));
             if self.tool_in_progress(tool_id) {
-                if let Some(eh) = &self.lua_event_handle {
-                    eh.request_click(tool_id.to_owned(), buf_row);
-                }
+                self.lua_event_handle
+                    .request_click(tool_id.to_owned(), buf_row);
                 return true;
             }
             // Recorded even when the warm path serves the click: theme
@@ -608,11 +602,10 @@ impl MessagesPanel {
                 item.clicks = self.lua_clicks[tool_id].clone();
                 item
             });
-            let (Some(eh), Some(tx)) =
-                (self.lua_event_handle.clone(), self.restore_event_tx.clone())
-            else {
+            let Some(tx) = self.restore_event_tx.clone() else {
                 return true;
             };
+            let eh = &self.lua_event_handle;
             // Watching the buf means a runtime-side warm click would be
             // visible here, so try the fast path; the fallback item lets
             // the runtime degrade to restore+replay if its cache is cold.
@@ -933,10 +926,10 @@ impl MessagesPanel {
     /// Re-restores every snapshot still painted with old-theme colors.
     /// Replies carry a generation so stale ones can't overwrite fresher colors.
     fn rebake_stale_snapshots(&mut self, current_gen: u64) {
-        let (Some(eh), Some(tx)) = (self.lua_event_handle.clone(), self.restore_event_tx.clone())
-        else {
+        let Some(tx) = self.restore_event_tx.clone() else {
             return;
         };
+        let eh = &self.lua_event_handle;
         self.rebake_requested.retain(|_, g| *g >= current_gen);
         let tol = self.tool_output_lines;
         let mut requested = Vec::new();

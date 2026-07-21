@@ -368,7 +368,7 @@ fn restore_snapshot_text(
 ) -> String {
     let host = PluginHost::new(fresh_registry()).unwrap();
     host.load_source("restore_plugin", src).unwrap();
-    let handle = host.event_handle().expect("event handle available");
+    let handle = host.event_handle();
     let (tx, rx) = flume::unbounded();
 
     handle.request_restore(
@@ -1187,7 +1187,7 @@ fn click_until_finished(
     tool: &str,
     click_id: &'static str,
 ) -> String {
-    let eh = host.event_handle().expect("event handle available");
+    let eh = host.event_handle();
     let entry = reg.get(tool).expect("tool registered");
     let inv = entry.tool.parse(&serde_json::json!({})).expect("parse");
     let worker = std::thread::spawn(move || {
@@ -1407,7 +1407,7 @@ fn warm_click_reaches_finished_tool(is_error: bool) {
     let body = recv_live_buf(&rx, WARM_ID).expect("live buf published");
 
     let (fb_tx, fb_rx) = flume::unbounded();
-    let eh = host.event_handle().expect("event handle available");
+    let eh = host.event_handle();
     eh.request_click_with_fallback(
         WARM_ID.to_owned(),
         0,
@@ -1432,7 +1432,7 @@ fn click_fallback_restores_when_warm_missing() {
     let (_reg, host) = warm_host(false, true);
     let (tx, rx) = flume::unbounded();
 
-    let eh = host.event_handle().expect("event handle available");
+    let eh = host.event_handle();
     eh.request_click_with_fallback(
         GONE_ID.to_owned(),
         0,
@@ -1459,7 +1459,7 @@ fn click_fallback_restores_when_warm_buf_has_no_handler() {
     recv_live_buf(&rx, WARM_ID).expect("live buf published");
 
     let (fb_tx, fb_rx) = flume::unbounded();
-    let eh = host.event_handle().expect("event handle available");
+    let eh = host.event_handle();
     eh.request_click_with_fallback(
         WARM_ID.to_owned(),
         0,
@@ -1487,7 +1487,7 @@ fn restore_evicts_warm_handle() {
     let body = recv_live_buf(&rx, WARM_ID).expect("live buf published");
 
     let (tx, _rx) = flume::unbounded();
-    let eh = host.event_handle().expect("event handle available");
+    let eh = host.event_handle();
     eh.request_restore(
         warm_restore_item(WARM_ID, Vec::new()),
         maki_agent::EventSender::new(tx, 0),
@@ -1516,7 +1516,7 @@ fn warm_fifo_evicts_oldest_runtime_side() {
         bufs.push(recv_live_buf(&rx, &id).expect("live buf published"));
     }
 
-    let eh = host.event_handle().expect("event handle available");
+    let eh = host.event_handle();
     eh.request_click("t1".to_owned(), 0);
     eh.request_click("t0".to_owned(), 0);
     barrier(&host);
@@ -1544,7 +1544,7 @@ fn warm_map_cleared_by_load_source() {
     let body = recv_live_buf(&rx, WARM_ID).expect("live buf published");
 
     barrier(&host);
-    let eh = host.event_handle().expect("event handle available");
+    let eh = host.event_handle();
     eh.request_click(WARM_ID.to_owned(), 0);
     barrier(&host);
 
@@ -1584,7 +1584,7 @@ fn warm_click_runs_async_jobs() {
     exec_warm_tool(&reg, "warm_async", &ctx).expect("tool output");
     let body = recv_live_buf(&rx, WARM_ID).expect("live buf published");
 
-    let eh = host.event_handle().expect("event handle available");
+    let eh = host.event_handle();
     eh.request_click(WARM_ID.to_owned(), 0);
     barrier(&host);
 
@@ -1605,7 +1605,7 @@ fn warm_click_survives_post_completion_cancel() {
     let body = recv_live_buf(&rx, WARM_ID).expect("live buf published");
     trigger.cancel();
 
-    let eh = host.event_handle().expect("event handle available");
+    let eh = host.event_handle();
     eh.request_click(WARM_ID.to_owned(), 0);
     barrier(&host);
 
@@ -2241,9 +2241,8 @@ fn command_handler_receives_args_and_fargs(args: &str, expected_flash: &str) {
         "#,
     )
     .unwrap();
-    let rx = host.ui_action_rx().unwrap();
+    let rx = host.ui_action_rx();
     host.event_handle()
-        .unwrap()
         .run_command(Arc::from("p"), Arc::from("/echo"), args.into());
 
     let action = rx
@@ -2405,7 +2404,7 @@ fn restore_tool_async_ordering_and_delivery() {
 
     let input = serde_json::json!({"command": "echo ok", "timeout": 1});
 
-    let handle = host.event_handle().expect("event handle available");
+    let handle = host.event_handle();
     let (tx, rx) = flume::unbounded();
     let event_tx = maki_agent::EventSender::new(tx, 0);
 
@@ -2483,7 +2482,7 @@ fn restore_rebuilds_body_from_input_content(
     expected: &[&str],
 ) {
     let (_reg, host) = builtins_host();
-    let handle = host.event_handle().expect("event handle available");
+    let handle = host.event_handle();
     let (tx, rx) = flume::unbounded();
 
     handle.request_restore(
@@ -3402,8 +3401,8 @@ fn async_run_from_parked_command_handler_runs_promptly() {
         "#,
     )
     .unwrap();
-    let rx = host.ui_action_rx().unwrap();
-    let handle = host.event_handle().unwrap();
+    let rx = host.ui_action_rx();
+    let handle = host.event_handle();
     handle.run_command(Arc::from("p"), Arc::from("/park"), String::new());
 
     let action = rx
@@ -3433,8 +3432,8 @@ fn job_callbacks_fire_while_command_handler_parked() {
         "#,
     )
     .unwrap();
-    let rx = host.ui_action_rx().unwrap();
-    let handle = host.event_handle().unwrap();
+    let rx = host.ui_action_rx();
+    let handle = host.event_handle();
     handle.run_command(Arc::from("p"), Arc::from("/stream"), String::new());
 
     let action = rx

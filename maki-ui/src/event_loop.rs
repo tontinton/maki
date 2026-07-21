@@ -80,8 +80,8 @@ pub struct EventLoopParams {
     pub lua_command_reader: LuaCommandReader,
     pub keymap_reader: KeymapReader,
     pub hint_reader: HintReader,
-    pub ui_action_rx: Option<flume::Receiver<UiAction>>,
-    pub lua_event_handle: Option<EventHandle>,
+    pub ui_action_rx: flume::Receiver<UiAction>,
+    pub lua_event_handle: EventHandle,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -143,7 +143,7 @@ struct SpawnCtx {
     lua_command_reader: LuaCommandReader,
     keymap_reader: KeymapReader,
     hint_reader: HintReader,
-    lua_event_handle: Option<EventHandle>,
+    lua_event_handle: EventHandle,
     mcp_handle: Option<McpHandle>,
     mcp_config_errors: McpConfigErrors,
     model_slot: Arc<ArcSwap<ModelSlot>>,
@@ -182,8 +182,8 @@ impl SpawnCtx {
             self.input_history_size,
             permissions,
             Arc::clone(&self.custom_commands),
+            self.lua_event_handle.clone(),
         );
-        app.lua_event_handle = self.lua_event_handle.clone();
         handles.apply_to_app(&mut app);
         if resumed {
             app.restore_resumed_session();
@@ -207,7 +207,7 @@ pub(crate) struct EventLoop<'t> {
     input: InputReader,
     warn_rx: flume::Receiver<String>,
     warn_tx: flume::Sender<String>,
-    ui_action_rx: Option<flume::Receiver<UiAction>>,
+    ui_action_rx: flume::Receiver<UiAction>,
     _model_fetch_task: smol::Task<()>,
 }
 
@@ -465,12 +465,8 @@ impl<'t> EventLoop<'t> {
             Ok(ev) => Some(Wake::Input(ev)),
             Err(_) => Some(Wake::InputGone),
         });
-        if let Some(rx) = self
-            .ui_action_rx
-            .as_ref()
-            .filter(|rx| !rx.is_disconnected())
-        {
-            sel = sel.recv(rx, |res| res.ok().map(Wake::Ui));
+        if !self.ui_action_rx.is_disconnected() {
+            sel = sel.recv(&self.ui_action_rx, |res| res.ok().map(Wake::Ui));
         }
         sel = sel.recv(&self.warn_rx, |res| res.ok().map(Wake::Warn));
         for (i, rt) in self.sessions.iter().enumerate() {
@@ -587,9 +583,7 @@ impl<'t> EventLoop<'t> {
     }
 
     fn emit_status_changes(&mut self) {
-        let Some(handle) = self.ctx.lua_event_handle.as_ref() else {
-            return;
-        };
+        let handle = &self.ctx.lua_event_handle;
         for (i, rt) in self.sessions.iter_mut().enumerate() {
             let status = SessionStatus::of(&rt.app);
             if status == rt.last_status {

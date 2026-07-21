@@ -69,7 +69,7 @@ impl AgentHandles {
         permissions: &Arc<PermissionManager>,
         session_id: Option<SessionRef>,
         timeouts: maki_providers::Timeouts,
-        lua_handle: Option<EventHandle>,
+        lua_handle: EventHandle,
         mcp_handle: Option<McpHandle>,
         mcp_config_errors: McpConfigErrors,
     ) -> Self {
@@ -105,7 +105,7 @@ impl AgentHandles {
             maki_agent::EventSender::new(self.agent_tx.clone(), crate::app::RESTORE_RUN_ID);
         app.restore_event_tx = Some(restore_tx.clone());
         for chat in &mut app.chats {
-            chat.set_restore_channel(app.lua_event_handle.clone(), Some(restore_tx.clone()));
+            chat.set_restore_channel(Some(restore_tx.clone()));
         }
     }
 
@@ -128,7 +128,7 @@ impl AgentHandles {
         tool_output_lines: ToolOutputLines,
         permissions: &Arc<PermissionManager>,
         app: &mut App,
-        lua_handle: Option<EventHandle>,
+        lua_handle: EventHandle,
     ) {
         // The output channel survives the respawn, so this bump is the only
         // thing that makes the old loop's in-flight envelopes stale. It lives
@@ -206,7 +206,7 @@ fn spawn_agent_internal(
     mcp_config_errors: McpConfigErrors,
     session_id: Option<SessionRef>,
     timeouts: maki_providers::Timeouts,
-    lua_handle: Option<EventHandle>,
+    lua_handle: EventHandle,
 ) -> AgentHandles {
     let (cmd_tx, cmd_rx) = flume::unbounded::<AgentCommand>();
     let (answer_tx, answer_rx) = flume::unbounded::<String>();
@@ -321,7 +321,7 @@ mod tests {
             &permissions,
             None,
             maki_providers::Timeouts::default(),
-            None,
+            EventHandle::disconnected_for_test(),
             None,
             McpConfigErrors::new(PathBuf::new()),
         );
@@ -341,7 +341,7 @@ mod tests {
             ToolOutputLines::default(),
             permissions,
             app,
-            None,
+            EventHandle::disconnected_for_test(),
         );
     }
 
