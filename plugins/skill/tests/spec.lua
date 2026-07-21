@@ -1,6 +1,7 @@
 local helpers = require("skill_helpers")
 local parse_frontmatter = helpers.parse_frontmatter
 local build_skill_list = helpers.build_skill_list
+local build_skill_names = helpers.build_skill_names
 
 local failures = {}
 
@@ -95,6 +96,29 @@ case("build_skill_list_sorted_alphabetically", function()
     m = { name = "middle", description = "M skill" },
   }
   local result = build_skill_list(skills)
+  local alpha_pos = result:find("alpha")
+  local middle_pos = result:find("middle")
+  local zebra_pos = result:find("zebra")
+  assert(alpha_pos < middle_pos, "alpha should come before middle")
+  assert(middle_pos < zebra_pos, "middle should come before zebra")
+end)
+
+-- ── build_skill_names ──
+
+case("build_skill_names_empty", function()
+  eq(build_skill_names({}), "")
+end)
+
+case("build_skill_names_sorted", function()
+  local skills = {
+    z = { name = "zebra" },
+    a = { name = "alpha" },
+    m = { name = "middle" },
+  }
+  local result = build_skill_names(skills)
+  assert(result:find("alpha"), "should contain alpha")
+  assert(result:find("middle"), "should contain middle")
+  assert(result:find("zebra"), "should contain zebra")
   local alpha_pos = result:find("alpha")
   local middle_pos = result:find("middle")
   local zebra_pos = result:find("zebra")

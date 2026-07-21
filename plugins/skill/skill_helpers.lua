@@ -38,4 +38,17 @@ function M.build_skill_list(skills)
   return "\n\n<available_skills>\n" .. table.concat(lines, "\n") .. "\n</available_skills>"
 end
 
+function M.build_skill_names(skills)
+  local names = {}
+  for _, s in pairs(skills) do
+    names[#names + 1] = s.name
+  end
+  table.sort(names)
+
+  if #names == 0 then
+    return ""
+  end
+  return "\n\nAvailable skills: " .. table.concat(names, ", ")
+end
+
 return M

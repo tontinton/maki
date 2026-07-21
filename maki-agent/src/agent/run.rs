@@ -25,8 +25,11 @@ use crate::{
 use maki_config::ToolOutputLines;
 use maki_storage::id::SessionRef;
 
+use crate::tokenize::{count_json, count_tokens};
+
 const MAX_REAUTH_ATTEMPTS: u32 = 2;
 const NUDGE_PROMPT: &str = "You just executed tool calls but returned an empty response. Please process the tool results above and continue with the task.";
+const IMAGE_TOKEN_ESTIMATE: usize = 2_048;
 
 pub fn resolve_compaction_model(
     provider: &Arc<dyn Provider>,
@@ -185,6 +188,8 @@ impl<'h> Agent<'h> {
         self.rollback_len = self.history.len();
         let msg = Message::user_with_images(input.message.clone(), input.images);
         self.history.push(msg);
+        self.context_size =
+            estimate_message_tokens(self.history.as_slice()) + estimate_tool_tokens(&self.tools);
         self.mode = input.mode;
         self.workflow = input.workflow;
         self.opts = RequestOptions {
@@ -199,7 +204,11 @@ impl<'h> Agent<'h> {
             "agent run started"
         );
 
-        let result = self.run_loop().await;
+        let result = async {
+            self.try_auto_compact().await?;
+            self.run_loop().await
+        }
+        .await;
 
         if matches!(result, Err(AgentError::Cancelled)) {
             sanitize_cancelled_history(self.history, self.rollback_len);
@@ -466,6 +475,8 @@ impl<'h> Agent<'h> {
         self.event_tx.send(AgentEvent::CompactionDone)?;
         self.history
             .push(Message::synthetic(CONTINUE_AFTER_COMPACT.into()));
+        self.context_size =
+            estimate_message_tokens(self.history.as_slice()) + estimate_tool_tokens(&self.tools);
         Ok(())
     }
 
@@ -500,23 +511,37 @@ impl<'h> Agent<'h> {
     }
 }
 
-const CHARS_PER_TOKEN: usize = 4;
+#[must_use]
+fn u32_from_usize(value: usize) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
+}
 
+#[must_use]
 pub fn estimate_message_tokens(messages: &[Message]) -> u32 {
     if messages.is_empty() {
         return 0;
     }
-    let total_bytes: usize = messages
+    let total: usize = messages
         .iter()
         .flat_map(|m| &m.content)
-        .filter_map(|b| match b {
-            ContentBlock::Text { text } => Some(text.len()),
-            ContentBlock::ToolResult { content, .. } => Some(content.len()),
-            ContentBlock::ToolUse { input, .. } => Some(input.to_string().len()),
-            _ => None,
+        .map(|b| match b {
+            ContentBlock::Text { text } => count_tokens(text),
+            ContentBlock::Thinking {
+                thinking,
+                signature,
+            } => count_tokens(thinking) + signature.as_ref().map_or(0, |s| count_tokens(s)),
+            ContentBlock::RedactedThinking { data } => count_tokens(data),
+            ContentBlock::ToolResult { content, .. } => count_tokens(content),
+            ContentBlock::ToolUse { input, .. } => count_json(input),
+            ContentBlock::Image { .. } => IMAGE_TOKEN_ESTIMATE,
         })
         .sum();
-    (total_bytes.max(CHARS_PER_TOKEN) / CHARS_PER_TOKEN) as u32
+    u32_from_usize(total)
+}
+
+#[must_use]
+pub fn estimate_tool_tokens(tools: &Value) -> u32 {
+    u32_from_usize(count_json(tools))
 }
 
 #[cfg(test)]
@@ -536,6 +561,20 @@ mod tests {
     use crate::Envelope;
     use crate::mcp::tool_names;
     use crate::permissions::PermissionManager;
+
+    #[test]
+    fn estimate_message_tokens_counts_content_blocks() {
+        let messages = vec![Message::user("hello world".into())];
+        let tokens = estimate_message_tokens(&messages);
+        assert!(tokens > 0, "expected positive token count for messages");
+    }
+
+    #[test]
+    fn estimate_tool_tokens_counts_json() {
+        let tools = serde_json::json!([{"name": "skill", "description": "A tool"}]);
+        let tokens = estimate_tool_tokens(&tools);
+        assert!(tokens > 0, "expected positive token count for tools");
+    }
 
     struct MockInterruptSource {
         commands: Mutex<VecDeque<ExtractedCommand>>,

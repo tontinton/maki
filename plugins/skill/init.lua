@@ -7,6 +7,7 @@ local ToolView = require("maki.tool_view")
 local helpers = require("skill_helpers")
 local parse_frontmatter = helpers.parse_frontmatter
 local build_skill_list = helpers.build_skill_list
+local build_skill_names = helpers.build_skill_names
 
 local PROJECT_SKILL_DIRS = {
   ".maki/skills",
@@ -127,24 +128,28 @@ local function discover_skills()
   return skills
 end
 
-local boot_skills = discover_skills()
-local description = "Load a skill that provides instructions and workflows for specific tasks."
-  .. build_skill_list(boot_skills)
+local DESCRIPTION =
+  "Load a skill that provides instructions and workflows for specific tasks. Use `list=true` to enumerate available skills; then call with the exact skill `name`."
 
 maki.api.register_tool({
   name = "skill",
   kind = "read",
-  description = description,
+  description = DESCRIPTION,
 
   schema = {
     type = "object",
     properties = {
-      name = { type = "string", description = "Name of the skill to load", required = true },
+      list = {
+        type = "boolean",
+        default = false,
+        description = "Return the list of available skills with their descriptions instead of loading one.",
+      },
+      name = { type = "string", description = "Name of the skill to load." },
     },
   },
 
   header = function(input)
-    return input.name
+    return input.list and "skill list" or input.name
   end,
 
   restore = function(_input, output, _is_error, ctx)
@@ -156,15 +161,19 @@ maki.api.register_tool({
   end,
 
   handler = function(input, ctx)
-    if not input.name then
-      return { llm_output = "error: name is required", is_error = true }
+    local skills = discover_skills()
+
+    if input.list then
+      return { llm_output = build_skill_list(skills) }
     end
 
-    local skills = discover_skills()
+    if not input.name or #input.name == 0 then
+      return { llm_output = "error: name is required" .. build_skill_names(skills), is_error = true }
+    end
+
     local skill = skills[input.name]
     if not skill then
-      local available = build_skill_list(skills)
-      return { llm_output = NOT_FOUND .. input.name .. available, is_error = true }
+      return { llm_output = NOT_FOUND .. input.name .. build_skill_names(skills), is_error = true }
     end
     if skill.resolve then
       skill.content = skill.resolve()
