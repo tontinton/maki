@@ -17,7 +17,8 @@ pub use providers::copilot::auth as copilot_auth;
 pub use providers::dynamic;
 pub use providers::openai::auth as openai_auth;
 pub use providers::opencode::{
-    ProviderData, catalog_provider, catalog_providers, catalog_providers_if_available,
+    ProviderData, catalog_provider, catalog_provider_if_available, catalog_providers,
+    catalog_providers_if_available,
 };
 pub use types::{
     ContentBlock, Effort, EffortDialect, IMAGE_OMITTED_NOTE, ImageMediaType, ImageSource, Message,

@@ -7,6 +7,7 @@ use ratatui::layout::{Position, Rect};
 use ratatui::text::{Line, Span};
 
 use maki_providers::ModelTier;
+use maki_providers::catalog_provider_if_available;
 use maki_providers::dynamic;
 use maki_providers::model_registry;
 use maki_providers::provider::ProviderKind;
@@ -221,11 +222,24 @@ impl Overlay for ModelPicker {
     }
 }
 
+/// For an opencode model id like `nvidia/openai/gpt-oss-120b`, extract the
+/// sub-provider (`nvidia`) and look up its display name from the catalog.
+fn catalog_sub_provider_display_name(model_id: &str) -> Option<String> {
+    let sub = model_id.split_once('/')?.0;
+    catalog_provider_if_available(sub).map(|p| p.display_name)
+}
+
 fn parse_model_entry(spec: &str) -> Option<ModelEntry> {
     let (provider_str, model_id) = spec.split_once('/')?;
 
     let provider_display = if let Ok(kind) = provider_str.parse::<ProviderKind>() {
-        kind.display_name().to_string()
+        if kind == ProviderKind::Opencode
+            && let Some(provider_display_name) = catalog_sub_provider_display_name(model_id)
+        {
+            provider_display_name
+        } else {
+            kind.display_name().to_string()
+        }
     } else if let Some(name) = dynamic::display_name(provider_str) {
         name.to_string()
     } else {

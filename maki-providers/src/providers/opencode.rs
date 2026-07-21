@@ -642,6 +642,12 @@ pub fn catalog_provider(provider_id: &str) -> Option<ProviderData> {
     guard.providers.get(provider_id).cloned()
 }
 
+/// Like [`catalog_provider`], but does NOT trigger downloading the catalog.
+pub fn catalog_provider_if_available(provider_id: &str) -> Option<ProviderData> {
+    let guard = CATALOG.get()?.lock().ok()?;
+    guard.providers.get(provider_id).cloned()
+}
+
 // --- Catalog helpers ---
 
 fn catalog_cache_path() -> Option<PathBuf> {
