@@ -1490,6 +1490,38 @@ pub fn load_env_files(cwd: &Path) {
     load_env_files_with_global(cwd, global_dir().as_deref());
 }
 
+/// Search PATH and common install paths for a Bash executable.
+/// Probes PATH first (catches Git Bash, Cygwin, MSYS2, Scoop, etc.),
+/// then falls back to known install locations.
+/// Used on Windows where bash may not be discoverable through PATH alone.
+#[cfg(windows)]
+pub fn find_bash_on_path() -> Option<PathBuf> {
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths).find_map(|dir| {
+            let bash = dir.join("bash.exe");
+            if bash.is_file() { Some(bash) } else { None }
+        })
+    })
+    .or_else(|| {
+        let candidates = [
+            // Git for Windows
+            r"C:\Program Files\Git\bin\bash.exe",
+            r"C:\Program Files\Git\usr\bin\bash.exe",
+            r"C:\Program Files (x86)\Git\bin\bash.exe",
+            // Cygwin
+            r"C:\cygwin64\bin\bash.exe",
+            r"C:\cygwin\bin\bash.exe",
+            // MSYS2
+            r"C:\msys64\usr\bin\bash.exe",
+            r"C:\msys32\usr\bin\bash.exe",
+        ];
+        candidates.iter().find_map(|p| {
+            let path = PathBuf::from(p);
+            path.is_file().then_some(path)
+        })
+    })
+}
+
 pub fn load_permissions(cwd: &Path) -> PermissionsConfig {
     let global_dirs = config_search_dirs(global_dir().as_deref());
     load_permissions_inner(cwd, &global_dirs)

@@ -1254,8 +1254,9 @@ maki.fn.jobstart({cmd}, {opts?})
 ```
 
 Run a shell command in the background. The command runs through
-`bash -c` on Unix or `cmd /C` on Windows. You get back a job id
-that you can pass to `jobstop` or `jobwait` to control the process.
+`bash -c` on all platforms. On Windows, you need Git Bash or WSL
+installed. You get back a job id that you can pass to `jobstop`
+or `jobwait` to control the process.
 
 **Parameters:**
 

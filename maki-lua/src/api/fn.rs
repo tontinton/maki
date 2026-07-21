@@ -53,7 +53,7 @@ impl JobStore {
         on_stderr: Option<RegistryKey>,
         on_exit: Option<RegistryKey>,
     ) -> Result<u32, String> {
-        let mut command = shell_command(cmd);
+        let mut command = shell_command(cmd)?;
         command
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -214,18 +214,24 @@ impl JobStore {
     }
 }
 
-fn shell_command(cmd: &str) -> Command {
+fn shell_command(cmd: &str) -> Result<Command, String> {
     #[cfg(unix)]
     {
         let mut c = Command::new("bash");
         c.arg("-c").arg(cmd);
-        c
+        Ok(c)
     }
     #[cfg(windows)]
     {
-        let mut c = Command::new("cmd.exe");
-        c.arg("/C").arg(cmd);
-        c
+        let bash = maki_config::find_bash_on_path().ok_or_else(|| {
+            "bash not found on Windows. Install Git for Windows \
+             (https://git-scm.com) or enable WSL \
+             (https://learn.microsoft.com/en-us/windows/wsl/install)."
+                .to_string()
+        })?;
+        let mut c = Command::new(bash);
+        c.arg("-c").arg(cmd);
+        Ok(c)
     }
 }
 
@@ -254,8 +260,9 @@ fn kill_job(meta: &mut JobMeta) {
 }
 
 /// Run a shell command in the background. The command runs through
-/// `bash -c` on Unix or `cmd /C` on Windows. You get back a job id
-/// that you can pass to `jobstop` or `jobwait` to control the process.
+/// `bash -c` on all platforms. On Windows, you need Git Bash or WSL
+/// installed. You get back a job id that you can pass to `jobstop`
+/// or `jobwait` to control the process.
 ///
 /// @param cmd string Shell command to run.
 /// @param opts table? Optional settings:
