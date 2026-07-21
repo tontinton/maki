@@ -62,4 +62,40 @@ mod tests {
             "large json should produce positive token count"
         );
     }
+
+    #[test]
+    fn counts_empty_text() {
+        let tokens = count_tokens("");
+        assert_eq!(tokens, 0, "empty string should have zero tokens");
+    }
+
+    #[test]
+    fn counts_non_ascii_text() {
+        let text = "héllo wörld 世界";
+        let tokens = count_tokens(text);
+        assert!(tokens > 0, "non-ascii text should have positive tokens");
+    }
+
+    #[test]
+    fn uses_tiktoken_up_to_threshold_and_fallback_after() {
+        let at_threshold = "x".repeat(TIKTOKEN_MAX_CHARS);
+        let over_threshold = "x".repeat(TIKTOKEN_MAX_CHARS + 1);
+
+        let at_tokens = count_tokens(&at_threshold);
+        let over_tokens = count_tokens(&over_threshold);
+
+        assert!(at_tokens > 0, "text at threshold should be counted");
+        assert_eq!(
+            over_tokens,
+            over_threshold.len() / BYTES_PER_TOKEN_ESTIMATE,
+            "text over threshold should use bytes/4 fallback"
+        );
+    }
+
+    #[test]
+    fn count_json_falls_back_for_non_serializable() {
+        let value = Value::Null;
+        let tokens = count_json(&value);
+        assert_eq!(tokens, 1, "null serializes to one token-ish string");
+    }
 }

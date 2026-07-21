@@ -551,8 +551,8 @@ mod tests {
 
     use maki_providers::provider::{BoxFuture, Provider};
     use maki_providers::{
-        ContentBlock, Message, Model, ProviderEvent, RequestOptions, Role, StopReason,
-        StreamResponse, TokenUsage,
+        ContentBlock, ImageMediaType, ImageSource, Message, Model, ProviderEvent, RequestOptions,
+        Role, StopReason, StreamResponse, TokenUsage,
     };
     use serde_json::Value;
     use test_case::test_case;
@@ -574,6 +574,60 @@ mod tests {
         let tools = serde_json::json!([{"name": "skill", "description": "A tool"}]);
         let tokens = estimate_tool_tokens(&tools);
         assert!(tokens > 0, "expected positive token count for tools");
+    }
+
+    #[test]
+    fn estimate_message_tokens_empty_is_zero() {
+        assert_eq!(estimate_message_tokens(&[]), 0);
+    }
+
+    #[test]
+    fn estimate_message_tokens_counts_each_content_block() {
+        let messages = vec![Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::Text { text: "hi".into() },
+                ContentBlock::Image {
+                    source: ImageSource {
+                        media_type: ImageMediaType::Png,
+                        data: Arc::from("data"),
+                    },
+                },
+            ],
+            ..Default::default()
+        }];
+        let tokens = estimate_message_tokens(&messages);
+        assert!(
+            tokens >= u32_from_usize(IMAGE_TOKEN_ESTIMATE),
+            "image blocks should add {IMAGE_TOKEN_ESTIMATE} tokens"
+        );
+    }
+
+    #[test]
+    fn estimate_message_tokens_counts_thinking_and_signature() {
+        let messages = vec![Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Thinking {
+                    thinking: "thinking text".into(),
+                    signature: Some("sig".into()),
+                },
+                ContentBlock::RedactedThinking {
+                    data: "redacted".into(),
+                },
+            ],
+            ..Default::default()
+        }];
+        let tokens = estimate_message_tokens(&messages);
+        assert!(
+            tokens > 0,
+            "thinking and redacted blocks should contribute tokens"
+        );
+    }
+
+    #[test]
+    fn estimate_tool_tokens_empty_array_costs_one() {
+        assert_eq!(estimate_tool_tokens(&serde_json::json!([])), 1);
     }
 
     struct MockInterruptSource {
@@ -909,6 +963,29 @@ mod tests {
                 .await;
 
             assert!(result.is_ok());
+        });
+    }
+
+    #[test]
+    fn oversized_initial_context_compacts_before_normal_request() {
+        smol::block_on(async {
+            let prior = vec![Message::user("x".repeat(680_000))];
+            let mut history = History::new(prior);
+            let (mut agent, event_rx) = make_agent(
+                MockProvider::new(vec![
+                    text_response(StopReason::EndTurn),
+                    text_response(StopReason::EndTurn),
+                ]),
+                &mut history,
+            );
+            agent.model = Arc::new(small_context_model(200_000, 8_192));
+
+            agent.run(default_input()).await.unwrap();
+
+            assert!(has_event(&drain_events(&event_rx), |event| matches!(
+                event,
+                AgentEvent::AutoCompacting
+            )));
         });
     }
 

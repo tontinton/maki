@@ -3380,3 +3380,43 @@ fn job_callbacks_fire_while_command_handler_parked() {
         .expect("job callbacks starved while command handler was parked");
     assert!(matches!(action, maki_lua::UiAction::Flash(msg) if msg == "job:hi"));
 }
+
+#[test]
+fn skill_tool_list_returns_catalog() {
+    let (reg, _host) = builtins_host();
+    let out = exec_tool(&reg, "skill", serde_json::json!({"list": true})).unwrap();
+    assert!(
+        out.contains("<available_skills>"),
+        "list=true should return skill catalog"
+    );
+}
+
+#[test]
+fn skill_tool_missing_name_returns_available_names() {
+    let (reg, _host) = builtins_host();
+    let out = exec_tool(&reg, "skill", serde_json::json!({})).unwrap_err();
+    assert!(out.contains("error:"), "missing name should be an error");
+    assert!(
+        out.contains("Available skills"),
+        "missing name should list available skills"
+    );
+}
+
+#[test]
+fn skill_tool_unknown_name_returns_available_names() {
+    let (reg, _host) = builtins_host();
+    let out = exec_tool(
+        &reg,
+        "skill",
+        serde_json::json!({"name": "nonexistent-skill"}),
+    )
+    .unwrap_err();
+    assert!(
+        out.contains("skill not found"),
+        "unknown skill should be reported"
+    );
+    assert!(
+        out.contains("Available skills"),
+        "unknown skill should list available skills"
+    );
+}
