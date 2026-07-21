@@ -284,6 +284,15 @@ case("truncate_text_force_takes_first_char_when_narrower_than_glyph", function()
   eq(t2.tail, "a")
 end)
 
+case("truncate_text_zero_width_returns_empty", function()
+  local t = maki.ui.truncate_text("abc", 0)
+  eq(t.head, "")
+  eq(t.tail, "abc")
+  local empty = maki.ui.truncate_text("", 5)
+  eq(empty.head, "")
+  eq(empty.tail, "")
+end)
+
 case("wrap_spans_splits_cjk_and_ascii_mix_without_hang", function()
   local cases = {
     { text = "a你b", width = 2 },

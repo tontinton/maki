@@ -230,7 +230,8 @@ fn truncate_text(lua: &Lua, text: String, max_width: usize) -> LuaResult<Table> 
     // If max_width is smaller than the first character's display width
     // (e.g. a wide CJK glyph in a 1-cell column), force taking that
     // character so callers always make forward progress.
-    if idx == 0
+    if max_width > 0
+        && idx == 0
         && let Some((_, first)) = text.char_indices().next()
     {
         idx = first.len_utf8();
