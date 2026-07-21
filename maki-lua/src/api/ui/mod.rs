@@ -227,6 +227,14 @@ fn truncate_text(lua: &Lua, text: String, max_width: usize) -> LuaResult<Table> 
         width += w;
         idx = i + c.len_utf8();
     }
+    // If max_width is smaller than the first character's display width
+    // (e.g. a wide CJK glyph in a 1-cell column), force taking that
+    // character so callers always make forward progress.
+    if idx == 0
+        && let Some((_, first)) = text.char_indices().next()
+    {
+        idx = first.len_utf8();
+    }
     let tbl = lua.create_table()?;
     tbl.set("head", &text[..idx])?;
     tbl.set("tail", &text[idx..])?;

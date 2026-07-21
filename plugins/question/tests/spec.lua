@@ -194,7 +194,7 @@ end)
 local function line_width(line)
   local w = 0
   for _, span in ipairs(line) do
-    w = w + (utf8.len(span[1]) or #span[1])
+    w = w + maki.ui.display_width(span[1])
   end
   return w
 end
@@ -273,6 +273,63 @@ case("wrap_spans_hard_splits_oversize_word_on_valid_utf8_boundaries", function()
     end
     eq(rebuilt, c.word, c.word .. ": reassembled output must equal input")
   end
+end)
+
+case("truncate_text_force_takes_first_char_when_narrower_than_glyph", function()
+  local t = maki.ui.truncate_text("你好", 1)
+  eq(t.head, "你")
+  eq(t.tail, "好")
+  local t2 = maki.ui.truncate_text("你a", 1)
+  eq(t2.head, "你")
+  eq(t2.tail, "a")
+end)
+
+case("wrap_spans_splits_cjk_and_ascii_mix_without_hang", function()
+  local cases = {
+    { text = "a你b", width = 2 },
+    { text = "你好世界", width = 4 },
+  }
+  for _, c in ipairs(cases) do
+    local lines = QuestionForm._wrap_spans({ { c.text, "" } }, c.width)
+    local rebuilt = ""
+    for _, line in ipairs(lines) do
+      assert(line_width(line) <= c.width, c.text .. ": line exceeds width")
+      for _, span in ipairs(line) do
+        assert(utf8.len(span[1]), c.text .. ": span is not valid utf8")
+        rebuilt = rebuilt .. span[1]
+      end
+    end
+    eq(rebuilt, c.text, c.text .. ": reassembled output must equal input")
+  end
+end)
+
+case("wrap_spans_wraps_mixed_cjk_ascii_with_spaces", function()
+  -- Spaces are consumed at line boundaries, so just verify no hang,
+  -- valid UTF-8, and that the original text appears in order.
+  local lines = QuestionForm._wrap_spans({ { "foo 你 bar", "" } }, 3)
+  local found = ""
+  for _, line in ipairs(lines) do
+    for _, span in ipairs(line) do
+      assert(utf8.len(span[1]), "span is not valid utf8")
+      found = found .. span[1]
+    end
+  end
+  -- Rebuild ignoring spaces; the space between words is the wrap point.
+  eq(found:gsub("%s", ""), "foo你bar")
+end)
+
+case("wrap_spans_force_takes_wide_char_when_one_cell_left", function()
+  -- A wide CJK glyph in a 1-cell column cannot fit, but the splitter must
+  -- still make progress and emit it rather than hanging on an empty head.
+  local lines = QuestionForm._wrap_spans({ { "你", "" } }, 1)
+  assert(#lines >= 1, "expected at least one line")
+  local rebuilt = ""
+  for _, line in ipairs(lines) do
+    for _, span in ipairs(line) do
+      rebuilt = rebuilt .. span[1]
+    end
+  end
+  eq(rebuilt, "你")
 end)
 
 local function find_span_with_text(lines, text)

@@ -95,8 +95,15 @@ local function wrap_spans(spans, max_width)
             if current_w >= max_width then
               flush()
             end
-            local head, tail = split_at(word, max_width - current_w)
-            push(head, style, display_width(head))
+            local remaining = max_width - current_w
+            local head, tail = split_at(word, remaining)
+            local head_w = display_width(head)
+            if head_w > remaining and current_w > 0 then
+              flush()
+              head, tail = split_at(word, max_width)
+              head_w = display_width(head)
+            end
+            push(head, style, head_w)
             word = tail
           end
         end
