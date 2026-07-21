@@ -705,7 +705,6 @@ available.
 
   - `only` (`string[]?`) include only these tool names.
   - `except` (`string[]?`) exclude these tool names.
-  - `include_mcp` (`boolean?`) include MCP tools. Default: `true`.
   - `workflow` (`boolean?`) use workflow-mode descriptions. Default: `false`.
   - `spec` (`string?`) evaluate capability exclusions against this model spec.
 
@@ -789,6 +788,10 @@ and tool set.
     `(string)` or `(nil, err)`.
   - `name` (`string?`) display name for logs and UI.
   - `audience` (`string?`) tool audience for capability gating. Default: `"general_sub"`.
+  - `mcp` (`boolean?`) give the session access to MCP tools. Their
+    definitions are injected automatically each turn (deferred behind
+    `tool_search`), so don't put MCP definitions in `tools`. The session
+    starts with no loaded tools of its own. Default: `true`.
   - `thinking` (`string|integer?`) thinking mode: `"off"`, `"adaptive"`, an
     effort level (`"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`,
     `"max"`), or a budget integer (token count). Inherits parent setting

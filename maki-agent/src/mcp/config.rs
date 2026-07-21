@@ -125,6 +125,11 @@ pub struct McpServerInfo {
 
 #[derive(Deserialize, Default)]
 pub struct McpConfig {
+    /// Defer tools behind `tool_search` only when more than this many
+    /// non-`always_load` tools exist. `None` means the built-in default;
+    /// 0 always defers, a large value disables deferral.
+    #[serde(default)]
+    pub defer_tools: Option<usize>,
     #[serde(default)]
     pub mcp: HashMap<String, RawServerConfig>,
     #[serde(skip)]
@@ -137,6 +142,8 @@ pub struct RawServerConfig {
     pub enabled: bool,
     #[serde(default = "default_timeout")]
     pub timeout: u64,
+    #[serde(default)]
+    pub always_load: bool,
     #[serde(flatten)]
     pub transport: RawTransport,
 }
@@ -166,6 +173,9 @@ pub struct RawHttpFields {
 pub struct ServerConfig {
     pub name: String,
     pub timeout: Duration,
+    /// Skip deferral: every tool from this server enters the context upfront
+    /// instead of being discoverable through `tool_search`.
+    pub always_load: bool,
     pub transport: Transport,
 }
 
@@ -258,6 +268,7 @@ pub fn parse_server(name: String, server: RawServerConfig) -> Result<ServerConfi
     Ok(ServerConfig {
         name,
         timeout: Duration::from_millis(server.timeout),
+        always_load: server.always_load,
         transport,
     })
 }
@@ -269,47 +280,37 @@ pub fn transport_kind(raw: &RawTransport) -> &'static str {
     }
 }
 
+/// Call order is precedence: the caller merges global first, project last,
+/// so a project's servers and `defer_tools` beat the global ones.
+fn merge_config(merged: &mut McpConfig, errors: &mut McpConfigErrors, path: &Path) {
+    match read_config(path) {
+        Ok(None) => {}
+        Ok(Some(cfg)) => {
+            tracing::info!(
+                path = %path.display(),
+                servers = cfg.mcp.len(),
+                "loaded mcp config"
+            );
+            for name in cfg.mcp.keys() {
+                merged.origins.insert(name.clone(), path.to_path_buf());
+            }
+            merged.defer_tools = cfg.defer_tools.or(merged.defer_tools);
+            merged.mcp.extend(cfg.mcp);
+        }
+        Err(e) => errors.add_error(e),
+    }
+}
+
 pub fn load_config(cwd: &Path) -> (McpConfig, McpConfigErrors) {
     let mut merged = McpConfig::default();
     let mut errors = McpConfigErrors::new(cwd.to_path_buf());
 
     if let Some(global_dir) = global_config_dir() {
         let global_path = global_dir.join(MCP_CONFIG_FILE);
-        match read_config(&global_path) {
-            Ok(None) => {}
-            Ok(Some(cfg)) => {
-                tracing::info!(
-                    path = %global_path.display(),
-                    servers = cfg.mcp.len(),
-                    "loaded mcp config"
-                );
-                for name in cfg.mcp.keys() {
-                    merged.origins.insert(name.clone(), global_path.clone());
-                }
-                merged.mcp.extend(cfg.mcp);
-            }
-            Err(e) => errors.add_error(e),
-        }
+        merge_config(&mut merged, &mut errors, &global_path);
     }
-
     let project_path = cwd.join(".maki").join(MCP_CONFIG_FILE);
-    match read_config(&project_path) {
-        Ok(None) => {}
-        Ok(Some(cfg)) => {
-            tracing::info!(
-                path = %project_path.display(),
-                servers = cfg.mcp.len(),
-                "loaded mcp config"
-            );
-            for name in cfg.mcp.keys() {
-                merged.origins.insert(name.clone(), project_path.clone());
-            }
-            merged.mcp.extend(cfg.mcp);
-        }
-        Err(e) => {
-            errors.add_error(e);
-        }
-    }
+    merge_config(&mut merged, &mut errors, &project_path);
     (merged, errors)
 }
 
@@ -390,6 +391,7 @@ mod tests {
         RawServerConfig {
             enabled: true,
             timeout: DEFAULT_TIMEOUT_MS,
+            always_load: false,
             transport: RawTransport::Stdio(RawStdioFields {
                 command: cmd.iter().map(|s| s.to_string()).collect(),
                 environment: HashMap::new(),
@@ -401,6 +403,7 @@ mod tests {
         RawServerConfig {
             enabled: true,
             timeout: DEFAULT_TIMEOUT_MS,
+            always_load: false,
             transport: RawTransport::Http(RawHttpFields {
                 url: url.to_string(),
                 headers: HashMap::new(),
@@ -424,6 +427,31 @@ mod tests {
         cfg.timeout = timeout;
         let err = parse_server("srv".into(), cfg).unwrap_err();
         assert!(err.to_string().contains("timeout"));
+    }
+
+    #[test]
+    fn toml_deferral_fields_deserialize_and_default() {
+        let config: McpConfig = toml::from_str(
+            r#"
+defer_tools = 30
+
+[mcp.github]
+command = ["gh", "mcp-server"]
+always_load = true
+
+[mcp.other]
+command = ["other"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.defer_tools, Some(30));
+        assert!(config.mcp["github"].always_load);
+        assert!(!config.mcp["other"].always_load);
+        let parsed = parse_server("github".into(), config.mcp["github"].clone()).unwrap();
+        assert!(parsed.always_load);
+
+        let bare: McpConfig = toml::from_str("[mcp.srv]\ncommand = [\"x\"]").unwrap();
+        assert_eq!(bare.defer_tools, None);
     }
 
     #[test]
@@ -565,6 +593,7 @@ enabled = true
             ]
             .into(),
             origins: [("enabled".into(), PathBuf::from("/test.toml"))].into(),
+            ..Default::default()
         };
         let mut infos = config.preliminary_infos(&["disabled-runtime".into()]);
         infos.sort_by(|a, b| a.name.cmp(&b.name));
@@ -573,6 +602,29 @@ enabled = true
         assert_eq!(infos[1].status, McpServerStatus::Disabled);
         assert_eq!(infos[2].status, McpServerStatus::Connecting);
         assert_eq!(infos[2].config_path, PathBuf::from("/test.toml"));
+    }
+
+    #[test_case("defer_tools = 7\n", Some(7) ; "project_overrides_global")]
+    #[test_case("", Some(5) ; "global_survives_unset_project")]
+    fn merge_config_defer_tools_precedence(project_toml: &str, expected: Option<usize>) {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("global.toml");
+        let project = dir.path().join("project.toml");
+        fs::write(&global, "defer_tools = 5\n[mcp.srv]\ncommand = [\"a\"]").unwrap();
+        fs::write(
+            &project,
+            format!("{project_toml}[mcp.srv]\ncommand = [\"b\"]"),
+        )
+        .unwrap();
+
+        let mut merged = McpConfig::default();
+        let mut errors = McpConfigErrors::new(dir.path().to_path_buf());
+        merge_config(&mut merged, &mut errors, &global);
+        merge_config(&mut merged, &mut errors, &project);
+
+        assert!(errors.is_empty());
+        assert_eq!(merged.defer_tools, expected);
+        assert_eq!(merged.origins["srv"], project, "later config must win");
     }
 
     #[test]

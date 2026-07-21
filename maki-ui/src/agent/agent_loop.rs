@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use maki_agent::agent;
-use maki_agent::mcp::McpHandle;
 use maki_agent::mcp::config::McpServerStatus;
+use maki_agent::mcp::{McpHandle, McpSession};
 use maki_agent::permissions::PermissionManager;
 use maki_agent::template;
 use maki_agent::template::Vars;
@@ -32,7 +32,7 @@ pub(super) struct AgentLoop {
     vars: Vars,
     instructions: Instructions,
     tools: Value,
-    mcp_handle: Option<McpHandle>,
+    mcp: Option<McpSession>,
     history: History,
     btw_system: Arc<ArcSwap<String>>,
     cancel_map: Arc<RunCancelMap>,
@@ -70,6 +70,7 @@ impl AgentLoop {
         lua_handle: Option<EventHandle>,
         subagent_cancels: Arc<CancelMap<String>>,
     ) -> Self {
+        let mcp = mcp_handle.map(|h| McpSession::new(h, &initial_history));
         Self {
             model_slot,
             config,
@@ -77,7 +78,7 @@ impl AgentLoop {
             vars: Vars::default(),
             instructions: Instructions::default(),
             tools: Value::Null,
-            mcp_handle,
+            mcp,
             history: History::restored(initial_history).with_mirror(shared_history),
             btw_system,
             cancel_map,
@@ -145,8 +146,7 @@ impl AgentLoop {
 
         let slot = self.model_slot.load();
         self.tools = self.build_tools(&slot.model, false);
-        if let Some(ref mcp) = self.mcp_handle {
-            mcp.extend_tools(&mut self.tools);
+        if let Some(ref mcp) = self.mcp {
             spawn_oauth_for_needs_auth(mcp);
         }
         !self.init_cancel.is_cancelled()
@@ -179,7 +179,7 @@ impl AgentLoop {
         }
 
         if let Some(ref prompt_ref) = input.prompt {
-            let Some(ref mcp) = self.mcp_handle else {
+            let Some(ref mcp) = self.mcp else {
                 return Err(AgentError::Tool {
                     tool: "mcp_prompt".into(),
                     message: "MCP not available".into(),
@@ -249,7 +249,7 @@ impl AgentLoop {
         .with_user_response_rx(Arc::clone(&self.answer_rx))
         .with_interrupt_source(Arc::clone(&self.queue) as Arc<dyn maki_agent::InterruptSource>)
         .with_cancel(cancel)
-        .with_mcp(self.mcp_handle.clone());
+        .with_mcp(self.mcp.clone());
 
         let result = agent.run(input).await;
         drop(agent);
@@ -263,12 +263,10 @@ impl AgentLoop {
         result
     }
 
+    /// Base tools only. MCP definitions are injected per request by
+    /// `Agent::request_tools`; baking them here would freeze the catalog.
     fn rebuild_tools(&mut self, model: &Model, workflow: bool) {
-        let mut tools = self.build_tools(model, workflow);
-        if let Some(ref mcp) = self.mcp_handle {
-            mcp.extend_tools(&mut tools);
-        }
-        self.tools = tools;
+        self.tools = self.build_tools(model, workflow);
     }
 
     fn build_tools(&self, model: &Model, workflow: bool) -> Value {

@@ -31,7 +31,7 @@ use serde_json::Value;
 
 use crate::agent::LoadedInstructions;
 use crate::cancel::{CancelMap, CancelToken};
-use crate::mcp::McpHandle;
+use crate::mcp::McpSession;
 use crate::permissions::PermissionManager;
 use crate::{AgentConfig, AgentMode, EventSender, SharedBuf};
 use maki_config::ToolOutputLines;
@@ -198,7 +198,7 @@ pub struct ToolContext {
     pub user_response_rx: Option<Arc<async_lock::Mutex<flume::Receiver<String>>>>,
     pub loaded_instructions: LoadedInstructions,
     pub cancel: CancelToken,
-    pub mcp: Option<McpHandle>,
+    pub mcp: Option<McpSession>,
     pub deadline: Deadline,
     pub config: AgentConfig,
     pub tool_output_lines: ToolOutputLines,

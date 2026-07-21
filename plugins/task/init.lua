@@ -123,7 +123,6 @@ local function handler(input, ctx)
   local tool_defs, tools_err = maki.agent.tools(ctx, {
     audience = audience,
     spec = model.spec,
-    include_mcp = true,
   })
   if tools_err then
     return { llm_output = tools_err, is_error = true }

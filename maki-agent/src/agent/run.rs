@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -14,7 +15,7 @@ use super::instructions::LoadedInstructions;
 use super::streaming::stream_with_retry;
 use super::tool_dispatch::{self, RecentCalls};
 use crate::cancel::{CancelMap, CancelToken};
-use crate::mcp::McpHandle;
+use crate::mcp::McpSession;
 use crate::permissions::PermissionManager;
 use crate::tools::{Deadline, FileReadTracker, LocalTools, ToolAudience, ToolContext};
 use crate::{
@@ -90,7 +91,7 @@ pub struct Agent<'h> {
     auto_compact: bool,
     loaded_instructions: LoadedInstructions,
     rollback_len: usize,
-    mcp: Option<McpHandle>,
+    mcp: Option<McpSession>,
     config: AgentConfig,
     tool_output_lines: ToolOutputLines,
     reauth_attempts: u32,
@@ -147,7 +148,7 @@ impl<'h> Agent<'h> {
         }
     }
 
-    pub fn with_mcp(mut self, mcp: Option<McpHandle>) -> Self {
+    pub fn with_mcp(mut self, mcp: Option<McpSession>) -> Self {
         self.mcp = mcp;
         self
     }
@@ -225,16 +226,31 @@ impl<'h> Agent<'h> {
         }
     }
 
+    /// `self.tools` holds base tools only; the MCP part is recomputed here
+    /// every turn so `tool_search` loads and late-connecting servers take
+    /// effect on the next request.
+    fn request_tools(&self) -> Cow<'_, Value> {
+        match &self.mcp {
+            Some(mcp) => {
+                let mut tools = self.tools.clone();
+                mcp.extend_tools(&mut tools);
+                Cow::Owned(tools)
+            }
+            None => Cow::Borrowed(&self.tools),
+        }
+    }
+
     async fn turn(&mut self) -> Result<TurnOutcome, AgentError> {
         if self.cancel.is_cancelled() {
             return Err(AgentError::Cancelled);
         }
+        let tools = self.request_tools();
         let response = match stream_with_retry(
             &*self.provider,
             &self.model,
             self.history.as_slice(),
             &self.system,
-            &self.tools,
+            tools.as_ref(),
             &self.event_tx,
             &self.cancel,
             self.opts,
@@ -518,6 +534,7 @@ mod tests {
 
     use super::*;
     use crate::Envelope;
+    use crate::mcp::tool_names;
     use crate::permissions::PermissionManager;
 
     struct MockInterruptSource {
@@ -540,12 +557,14 @@ mod tests {
 
     struct MockProvider {
         responses: Mutex<Vec<StreamResponse>>,
+        captured_tools: Arc<Mutex<Vec<Value>>>,
     }
 
     impl MockProvider {
         fn new(responses: Vec<StreamResponse>) -> Self {
             Self {
                 responses: Mutex::new(responses),
+                captured_tools: Arc::default(),
             }
         }
     }
@@ -556,12 +575,13 @@ mod tests {
             _: &'a Model,
             _: &'a [Message],
             _: &'a str,
-            _: &'a Value,
+            tools: &'a Value,
             _: &'a flume::Sender<ProviderEvent>,
             _: RequestOptions,
             _: Option<&'a SessionRef>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async {
+                self.captured_tools.lock().unwrap().push(tools.clone());
                 let mut responses = self.responses.lock().unwrap();
                 assert!(!responses.is_empty(), "MockProvider: no more responses");
                 Ok(responses.remove(0))
@@ -704,6 +724,50 @@ mod tests {
             usage: TokenUsage::default(),
             stop_reason: Some(StopReason::ToolUse),
         }
+    }
+
+    fn tool_use_response(tool_name: &str, input: Value) -> StreamResponse {
+        StreamResponse {
+            message: Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: "t1".into(),
+                    name: tool_name.into(),
+                    input,
+                }],
+                ..Default::default()
+            },
+            usage: TokenUsage::default(),
+            stop_reason: Some(StopReason::ToolUse),
+        }
+    }
+
+    #[test]
+    fn mcp_definitions_refresh_per_request() {
+        smol::block_on(async {
+            let provider = MockProvider::new(vec![
+                tool_use_response(
+                    crate::mcp::TOOL_SEARCH_TOOL_NAME,
+                    serde_json::json!({"query": "fetch issue"}),
+                ),
+                text_response(StopReason::EndTurn),
+            ]);
+            let captured = Arc::clone(&provider.captured_tools);
+            let mut history = History::new(Vec::new());
+            let (agent, _event_rx) = make_agent(provider, &mut history);
+            let mut agent = agent.with_mcp(Some(crate::mcp::stub_session(&[(
+                "srv.fetch_issue",
+                "Fetch a GitHub issue",
+            )])));
+            agent.run(default_input()).await.unwrap();
+
+            let captured = captured.lock().unwrap();
+            assert_eq!(captured.len(), 2);
+            let first = tool_names(&captured[0]);
+            assert!(first.contains(&crate::mcp::TOOL_SEARCH_TOOL_NAME));
+            assert!(!first.contains(&"srv__fetch_issue"));
+            assert!(tool_names(&captured[1]).contains(&"srv__fetch_issue"));
+        });
     }
 
     fn small_context_model(context_window: u32, max_output_tokens: u32) -> Model {
