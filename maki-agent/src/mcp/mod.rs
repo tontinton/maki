@@ -57,6 +57,7 @@ pub fn internal_tool_name(wire: &str) -> String {
     wire.replacen(WIRE_SEPARATOR, SEPARATOR, 1)
 }
 const MCP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+const PROMPT_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(2);
 
 struct McpToolDef {
     qualified_name: Arc<str>,
@@ -508,13 +509,29 @@ struct StartResult {
 }
 
 async fn discover_prompts(transport: &dyn McpTransport) -> Vec<protocol::PromptInfo> {
-    match transport::list_prompts(transport).await {
-        Ok(prompts) => prompts,
-        Err(error) => {
+    let result = futures_lite::future::or(
+        async { Some(transport::list_prompts(transport).await) },
+        async {
+            smol::Timer::after(PROMPT_DISCOVERY_TIMEOUT).await;
+            None
+        },
+    )
+    .await;
+    match result {
+        Some(Ok(prompts)) => prompts,
+        Some(Err(error)) => {
             warn!(
                 server = %transport.server_name(),
                 error = %error,
                 "MCP prompt discovery failed, continuing without prompts"
+            );
+            Vec::new()
+        }
+        None => {
+            warn!(
+                server = %transport.server_name(),
+                timeout_ms = PROMPT_DISCOVERY_TIMEOUT.as_millis() as u64,
+                "MCP prompt discovery timed out, continuing without prompts"
             );
             Vec::new()
         }
@@ -746,7 +763,7 @@ mod tests {
     use super::*;
     use async_lock::Mutex as AsyncMutex;
     use config::{RawServerConfig, RawStdioFields, RawTransport};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 
@@ -783,6 +800,7 @@ mod tests {
         call_entered: flume::Sender<()>,
         call_entered_rx: flume::Receiver<()>,
         call_gate: AsyncMutex<()>,
+        prompts_hang: AtomicBool,
     }
 
     impl FakeTransport {
@@ -794,6 +812,7 @@ mod tests {
                 call_entered,
                 call_entered_rx,
                 call_gate: AsyncMutex::new(()),
+                prompts_hang: AtomicBool::new(false),
             })
         }
 
@@ -814,10 +833,15 @@ mod tests {
                     let _g = self.call_gate.lock().await;
                     Ok(json!({ "content": [{ "type": "text", "text": "ok" }] }))
                 } else if method == "prompts/list" {
-                    Err(McpError::Timeout {
-                        server: self.name.to_string(),
-                        timeout_ms: DEFAULT_TIMEOUT_MS,
-                    })
+                    if self.prompts_hang.load(Ordering::SeqCst) {
+                        let _g = self.call_gate.lock().await;
+                        Ok(json!({ "prompts": [] }))
+                    } else {
+                        Err(McpError::Timeout {
+                            server: self.name.to_string(),
+                            timeout_ms: DEFAULT_TIMEOUT_MS,
+                        })
+                    }
                 } else {
                     Ok(Value::Null)
                 }
@@ -847,6 +871,20 @@ mod tests {
         smol::block_on(async {
             let transport = FakeTransport::new();
             assert!(discover_prompts(transport.as_ref()).await.is_empty());
+        });
+    }
+
+    #[test]
+    fn prompt_discovery_timeout_is_non_fatal() {
+        smol::block_on(async {
+            let transport = FakeTransport::new();
+            transport.prompts_hang.store(true, Ordering::SeqCst);
+            let held = transport.call_gate.lock().await;
+            let start = std::time::Instant::now();
+
+            assert!(discover_prompts(transport.as_ref()).await.is_empty());
+            assert!(start.elapsed() < Duration::from_secs(3));
+            drop(held);
         });
     }
 
