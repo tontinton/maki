@@ -13,7 +13,8 @@ local MAX_SCRIPT_LINES = 2000
 local NO_OUTPUT = "(no output)"
 local SEPARATOR = "──────"
 local PREAMBLE = "import re\nimport asyncio\nimport sys\nimport os\nimport json\n"
-local TOOLS_HEADER = "\n\nAvailable tools (called as Python functions with keyword arguments). Optional params are marked with '?'.\n"
+local TOOLS_HEADER =
+  "\n\nAvailable tools (called as Python functions with keyword arguments). Optional params are marked with '?'.\n"
 local WORKFLOW_TOOLS_NOTE =
   "\nWorkflow mode: orchestrate subagents from this script. Await every `task(...)` call and use `asyncio.gather` for parallel fan-out. Pass `output_schema` to task for machine-readable results (a JSON string, parse with `json.loads`).\n"
 local PY_TYPES = { string = "str", integer = "int", boolean = "bool", array = "list" }
