@@ -162,7 +162,7 @@ Launch an autonomous subagent to perform tasks independently. Best combined with
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `description` | string | yes | Short (3-5 words) description of the task |
-| `model_tier` | string | no | Model tier (optional, omit to use current model, capped at current tier):<br>- "strong" (e.g. Opus): Deep reasoning, complex architecture, subtle bugs, most critical sections. ~5x cost of medium.<br>- "medium" (e.g. Sonnet): Balanced. Refactors, features, multi-file changes.<br>- "weak" (e.g. Haiku): Fast/cheap. Search, summarize, boilerplate, simple edits. |
+| `model_tier` | string | no | Optional capped tier: "weak" for simple work, "medium" for normal changes, or "strong" for complex/critical work. |
 | `output_schema` | string | no | JSON Schema (object) the subagent's final result must match. When set, the result is returned as a validated JSON string. |
 | `prompt` | string | yes | Detailed task prompt for the agent |
 | `subagent_type` | string | no | Subagent type: "research" (read-only, default) or "general" (can modify files) |
@@ -187,11 +187,12 @@ Persistent, project-scoped scratchpad for learnings, patterns, decisions, and go
 
 ### `skill` *(lua plugin)*
 
-Load a skill that provides instructions and workflows for specific tasks.
+Load a skill that provides instructions and workflows for specific tasks. Use `list=true` to enumerate available skills; then call with the exact skill `name`.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `name` | string | yes | Name of the skill to load |
+| `list` | boolean | no | Return the list of available skills with their descriptions instead of loading one. |
+| `name` | string | no | Name of the skill to load. |
 
 ## Web
 
