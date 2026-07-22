@@ -550,14 +550,18 @@ pub fn scope_matches(pattern: &str, value: &str) -> bool {
         return true;
     }
     if let Some(prefix) = pattern.strip_suffix("/**") {
-        let norm_prefix = maki_storage::paths::canonicalize_clean(Path::new(prefix));
-        // Use incremental canonicalization for the value so symlinks in
-        // existing path components are resolved before any `..` traversal.
-        // `canonicalize_clean` falls back to lexical normalization when the
-        // file doesn't exist, which breaks scope matching when the project
-        // dir itself is a symlink.
-        let norm_value = maki_storage::paths::incremental_canonicalize(Path::new(value))
-            .unwrap_or_else(|| maki_storage::paths::normalize_path(Path::new(value)));
+        // Normalize both sides the same way: absolutize, then resolve symlinks
+        // in existing leading components before appending the lexical tail.
+        // Absolutizing first keeps a relative rule like `dist/**` matching
+        // before the dir exists, since `incremental_canonicalize` leaves a
+        // relative path relative when the leading component is missing.
+        let norm = |p: &str| {
+            let abs = std::path::absolute(p).unwrap_or_else(|_| PathBuf::from(p));
+            maki_storage::paths::incremental_canonicalize(&abs)
+                .unwrap_or_else(|| maki_storage::paths::normalize_path(&abs))
+        };
+        let norm_prefix = norm(prefix);
+        let norm_value = norm(value);
         return norm_value == norm_prefix || norm_value.starts_with(&norm_prefix);
     }
     if let Some(prefix) = pattern.strip_suffix(" *") {
@@ -748,6 +752,46 @@ mod tests {
         assert!(
             scope_matches(&pattern, &value),
             "symlinked parent should resolve: pattern={pattern}, value={value}"
+        );
+
+        let _ = std::fs::remove_dir_all(&real);
+        let _ = std::fs::remove_file(&link);
+    }
+
+    #[test]
+    fn scope_matches_relative_pattern_before_dir_exists() {
+        // A relative rule like `dist/**` must match an absolute value even
+        // before the directory exists.
+        let cwd = std::env::current_dir().unwrap();
+        let value = cwd.join("__maki_nonexistent_dist/file.txt");
+        assert!(!value.exists(), "test dir must not exist");
+        assert!(
+            scope_matches("__maki_nonexistent_dist/**", &value.to_string_lossy()),
+            "relative pattern should match absolute value: value={}",
+            value.display()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn scope_matches_symlinked_parent_with_nonexistent_tail() {
+        // Regression: symlinked leading component plus a non-existent tail
+        // (`proj`). Both sides must resolve the symlink before appending the
+        // lexical tail, else the prefix stays lexical and this returns false.
+        let tmp = std::env::temp_dir();
+        let real = tmp.join("__maki_test_scope_symlink_tail_real");
+        let link = tmp.join("__maki_test_scope_symlink_tail_link");
+        let _ = std::fs::remove_dir_all(&real);
+        let _ = std::fs::remove_file(&link);
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        // `proj` under the symlink does not exist.
+        let pattern = format!("{}/proj/**", link.display());
+        let value = format!("{}/proj/file.txt", link.display());
+        assert!(
+            scope_matches(&pattern, &value),
+            "symlinked parent with non-existent tail should match: pattern={pattern}, value={value}"
         );
 
         let _ = std::fs::remove_dir_all(&real);
