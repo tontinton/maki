@@ -14,9 +14,10 @@ const CODE_EXECUTION_SRC: &str = include_str!("../../plugins/code_execution/init
 const ECHO_PREFIX: &str = "echo:";
 const TASK_PREFIX: &str = "task:";
 const WORKFLOW_NOTE_SUBSTR: &str = "Workflow mode: orchestrate subagents";
-const INTERP_ECHO_SIG: &str = "- interp_echo(msg: str, count: int = None, flag: bool = None, items: list = None, raw: any = None) -> str";
-const WF_TASK_SIG: &str = "- wf_task(prompt: str, model_tier: str = None) -> str";
-const SUB_TOOL_SIG: &str = "- sub_tool() -> str";
+const INTERP_ECHO_SIG: &str =
+    "- interp_echo(msg: str, count?: int, flag?: bool, items?: list, raw?: any)";
+const WF_TASK_SIG: &str = "- wf_task(prompt: str, model_tier?: str)";
+const SUB_TOOL_SIG: &str = "- sub_tool()";
 
 fn fixture_plugin() -> String {
     format!(

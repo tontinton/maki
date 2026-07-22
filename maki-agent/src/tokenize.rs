@@ -98,4 +98,69 @@ mod tests {
         let tokens = count_json(&value);
         assert_eq!(tokens, 1, "null serializes to one token-ish string");
     }
+
+    #[test]
+    fn tokenize_fuzz_smoke() {
+        fn xorshift64(state: &mut u64) -> u64 {
+            *state ^= *state << 13;
+            *state ^= *state >> 7;
+            *state ^= *state << 17;
+            *state
+        }
+
+        fn gen_text(state: &mut u64, max_len: usize) -> String {
+            const ALPHABET: &[u8] =
+                b"abcdefghijklmnopqrstuvwxyz0123456789 \n\t!@#$%^&*()_+-=[]{}|;':\",./<>?";
+            let len = (xorshift64(state) as usize) % max_len;
+            let mut out = String::with_capacity(len);
+            for _ in 0..len {
+                let idx = (xorshift64(state) as usize) % ALPHABET.len();
+                out.push(ALPHABET[idx] as char);
+            }
+            out
+        }
+
+        fn gen_value(state: &mut u64, depth: usize) -> Value {
+            let kind = xorshift64(state) % 6;
+            match kind {
+                0 => Value::Null,
+                1 => Value::Bool((xorshift64(state) & 1) == 1),
+                2 => Value::Number(((xorshift64(state) % 1000) as i64).into()),
+                3 => Value::String(gen_text(state, 50)),
+                4 if depth > 0 => {
+                    let len = (xorshift64(state) as usize) % 4;
+                    Value::Array((0..len).map(|_| gen_value(state, depth - 1)).collect())
+                }
+                5 if depth > 0 => {
+                    let len = (xorshift64(state) as usize) % 4;
+                    let mut m = serde_json::Map::new();
+                    for i in 0..len {
+                        m.insert(format!("k{i}"), gen_value(state, depth - 1));
+                    }
+                    Value::Object(m)
+                }
+                _ => Value::String(gen_text(state, 10)),
+            }
+        }
+
+        let mut state = 0x1234_5678_9ABC_DEF0u64;
+        for _ in 0..500 {
+            let text = gen_text(&mut state, 6_000);
+            let tokens = count_tokens(&text);
+            assert!(
+                tokens <= text.len().max(1),
+                "token count {tokens} exceeds text length {}",
+                text.len()
+            );
+
+            let value = gen_value(&mut state, 4);
+            let tokens = count_json(&value);
+            let json_text = serde_json::to_string(&value).unwrap();
+            assert!(
+                tokens <= json_text.len().max(1),
+                "json token count {tokens} exceeds json length {}",
+                json_text.len()
+            );
+        }
+    }
 }
