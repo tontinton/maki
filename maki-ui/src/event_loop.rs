@@ -38,6 +38,7 @@ use crate::AppSession;
 use crate::agent::{AgentCommand, AgentHandles, ModelSlot, shared_queue::QueueItem};
 use crate::app::shell::{ShellEvent, spawn_shell};
 use crate::app::{App, Msg, QueuedMessage, SubmitOutcome};
+use crate::color_compat;
 use crate::components::input::Submission;
 use crate::components::usage_modal::UsageFetchState;
 use crate::components::{Action, ExitRequest, Status};
@@ -436,7 +437,10 @@ impl<'t> EventLoop<'t> {
                 break Err(e);
             }
             let app = &mut self.sessions[self.focused].app;
-            if let Err(e) = self.terminal.draw(|f| app.view(f)) {
+            if let Err(e) = self.terminal.draw(|f| {
+                app.view(f);
+                color_compat::downgrade_if_needed(f.buffer_mut());
+            }) {
                 break Err(e.into());
             }
 
