@@ -18,6 +18,7 @@ use maki_providers::{ContentBlock, Message, Role, TokenUsage};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Color;
+use ratatui_image::picker::Picker;
 
 pub(crate) const DONE_TEXT: &str = "Done!";
 pub(crate) const ERROR_TEXT: &str = "Error";
@@ -50,16 +51,30 @@ pub struct Chat {
 }
 
 impl Chat {
-    pub fn new(name: String, ui_config: UiConfig) -> Self {
+    pub fn new(name: String, ui_config: UiConfig, picker: Arc<Picker>) -> Self {
         Self {
             name,
             token_usage: TokenUsage::default(),
             context_size: 0,
             model_id: None,
             pending_turn_usage: None,
-            messages_panel: MessagesPanel::new(ui_config),
+            messages_panel: MessagesPanel::new(ui_config, picker),
             finished: false,
         }
+    }
+
+    pub fn restore(
+        name: String,
+        ui_config: UiConfig,
+        picker: Arc<Picker>,
+        messages: Vec<Message>,
+        tool_outputs: &HashMap<String, ToolOutput>,
+        tool_output_lines: &ToolOutputLines,
+    ) -> Self {
+        let (display, _) = history_to_display(&messages, tool_outputs, tool_output_lines);
+        let mut chat = Self::new(name, ui_config, picker);
+        chat.messages_panel.load_messages(display);
+        chat
     }
 
     pub fn set_pending_turn_usage(&mut self, usage: String) {
@@ -382,8 +397,32 @@ pub fn history_to_display(
     for msg in messages {
         match msg.role {
             Role::User => {
+                if msg
+                    .content
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
+                {
+                    continue;
+                }
+                let images: Vec<_> = msg
+                    .content
+                    .iter()
+                    .filter_map(|block| {
+                        if let ContentBlock::Image { source } = block {
+                            Some(source.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
                 if let Some(text) = msg.user_text() {
-                    display.push(DisplayMessage::new(DisplayRole::User, text.to_owned()));
+                    let mut display_msg = DisplayMessage::new(DisplayRole::User, text.to_owned());
+                    display_msg.images = images;
+                    display.push(display_msg);
+                } else if !images.is_empty() {
+                    let mut display_msg = DisplayMessage::new(DisplayRole::User, String::new());
+                    display_msg.images = images;
+                    display.push(display_msg);
                 }
             }
             Role::Assistant => {
@@ -391,6 +430,12 @@ pub fn history_to_display(
                     match block {
                         ContentBlock::Text { text } if !text.is_empty() => {
                             display.push(DisplayMessage::new(DisplayRole::Assistant, text.clone()));
+                        }
+                        ContentBlock::Image { source } => {
+                            let mut display_msg =
+                                DisplayMessage::new(DisplayRole::Assistant, String::new());
+                            display_msg.images = vec![source.clone()];
+                            display.push(display_msg);
                         }
                         ContentBlock::Thinking { thinking, .. } if !thinking.is_empty() => {
                             display
@@ -471,6 +516,7 @@ pub fn history_to_display(
                                 render_header: None,
                                 snapshot_theme_gen: 0,
                                 thinking_collapsed: false,
+                                images: Vec::new(),
                             });
                         }
                         _ => {}
@@ -630,7 +676,11 @@ mod tests {
 
     #[test]
     fn tool_lifecycle() {
-        let mut chat = Chat::new("Main".into(), UiConfig::default());
+        let mut chat = Chat::new(
+            "Main".into(),
+            UiConfig::default(),
+            Arc::new(ratatui_image::picker::Picker::halfblocks()),
+        );
         chat.handle_event(tool_start("t1", "bash"), None);
         assert_eq!(chat.in_progress_count(), 1);
 
@@ -643,7 +693,11 @@ mod tests {
 
     #[test]
     fn plan_write_renders_file_content() {
-        let mut chat = Chat::new("Main".into(), UiConfig::default());
+        let mut chat = Chat::new(
+            "Main".into(),
+            UiConfig::default(),
+            Arc::new(ratatui_image::picker::Picker::halfblocks()),
+        );
         let dir = tempfile::tempdir().unwrap();
         let plan_path = dir.path().join("plan.md");
         std::fs::write(&plan_path, "# My Plan\n\n- Step 1").unwrap();
@@ -663,7 +717,11 @@ mod tests {
 
     #[test]
     fn plan_write_ignores_different_path() {
-        let mut chat = Chat::new("Main".into(), UiConfig::default());
+        let mut chat = Chat::new(
+            "Main".into(),
+            UiConfig::default(),
+            Arc::new(ratatui_image::picker::Picker::halfblocks()),
+        );
         let plan_path = Path::new("/plans/123.md");
         chat.handle_event(tool_start("w1", "write"), Some(plan_path));
         let (output, wp) = write_output("src/main.rs");
@@ -676,7 +734,11 @@ mod tests {
 
     #[test]
     fn plan_edit_shows_path_only() {
-        let mut chat = Chat::new("Main".into(), UiConfig::default());
+        let mut chat = Chat::new(
+            "Main".into(),
+            UiConfig::default(),
+            Arc::new(ratatui_image::picker::Picker::halfblocks()),
+        );
         let dir = tempfile::tempdir().unwrap();
         let plan_path = dir.path().join("plan.md");
         std::fs::write(&plan_path, "# My Plan\n\n- Step 1").unwrap();
@@ -984,7 +1046,11 @@ mod tests {
 
     #[test]
     fn compaction_done_flushes_streaming_buffers() {
-        let mut chat = Chat::new("Main".into(), UiConfig::default());
+        let mut chat = Chat::new(
+            "Main".into(),
+            UiConfig::default(),
+            Arc::new(ratatui_image::picker::Picker::halfblocks()),
+        );
 
         chat.handle_event(AgentEvent::AutoCompacting, None);
         assert_eq!(chat.message_count(), 1);

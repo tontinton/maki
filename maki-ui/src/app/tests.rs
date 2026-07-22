@@ -52,6 +52,7 @@ fn build_app(dir: StateDir, writer: Arc<StorageWriter>) -> App {
             PathBuf::from("/tmp"),
         )),
         Arc::from([]),
+        Arc::new(ratatui_image::picker::Picker::halfblocks()),
     )
 }
 

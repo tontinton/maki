@@ -5,7 +5,7 @@ mod selection;
 mod tests;
 
 use self::render::RenderCursor;
-use self::segment::{Segment, SegmentCache, wrapped_line_count};
+use self::segment::{Segment, SegmentCache, Surface, wrapped_line_count};
 
 use super::tool_display::{
     RenderCtx, ToolLines, append_annotation, append_right_info, assistant_style,
@@ -21,12 +21,14 @@ use crate::markdown::{hr_line, plain_lines, text_to_lines, truncate_output};
 use crate::render_worker::RenderWorker;
 use crate::selection::Selection;
 use crate::splash::{ColorTransition, Splash};
+use crate::terminal_image;
 use crate::theme;
 use maki_config::{ToolOutputLines, UiConfig};
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
+use unicode_width::UnicodeWidthStr;
 
 use super::scrollbar::render_vertical_scrollbar;
 use super::streaming_content::StreamingContent;
@@ -40,8 +42,10 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
+use ratatui_image::picker::Picker;
 
 const THINKING_HIDDEN_HEADER: &str = "thinking> ...";
+pub(super) const COPY_LABEL_WIDTH: u16 = 6;
 
 #[derive(Clone, Copy)]
 pub struct PromptProgress {
@@ -84,10 +88,11 @@ pub struct MessagesPanel {
     /// only bumps when colors actually land.
     rebake_requested: HashMap<String, u64>,
     prompt_progress: Option<PromptProgress>,
+    picker: Arc<Picker>,
 }
 
 impl MessagesPanel {
-    pub fn new(ui_config: UiConfig) -> Self {
+    pub fn new(ui_config: UiConfig, picker: Arc<Picker>) -> Self {
         let thinking = thinking_style();
         let assistant = assistant_style();
         let ms = ui_config.typewriter_ms_per_char;
@@ -128,6 +133,7 @@ impl MessagesPanel {
             thinking_collapsed: !ui_config.show_thinking,
             rebake_requested: HashMap::new(),
             prompt_progress: None,
+            picker,
         }
     }
 
@@ -782,8 +788,12 @@ impl MessagesPanel {
             }
             let h = seg.height(width);
             let highlight = self.highlight_segment == Some(i);
-            let style = seg.tool_id.as_ref().map(|_| theme::current().tool_bg);
-            cursor.render(seg.lines(), h, style, highlight, frame);
+            if let Some(term_img) = seg.image() {
+                cursor.render_image(&term_img.protocol, h, seg.surface(), frame);
+            } else {
+                let style = seg.tool_id.as_ref().map(|_| theme::current().tool_bg);
+                cursor.render(seg.lines(), h, style, seg.surface(), highlight, frame);
+            }
         }
 
         let mut height_idx = 0usize;
@@ -798,15 +808,22 @@ impl MessagesPanel {
             if cached_count > 0 || height_idx > 0 {
                 let h = streaming_heights[height_idx];
                 height_idx += 1;
-                cursor.render(&spacer_lines, h, None, false, frame);
+                cursor.render(&spacer_lines, h, None, Surface::Plain, false, frame);
             }
             if height_idx < streaming_heights.len() {
                 let h = streaming_heights[height_idx];
                 height_idx += 1;
                 if collapsed {
-                    cursor.render(&collapsed_thinking_lines, h, None, false, frame);
+                    cursor.render(
+                        &collapsed_thinking_lines,
+                        h,
+                        None,
+                        Surface::Plain,
+                        false,
+                        frame,
+                    );
                 } else {
-                    cursor.render(sc.cached_lines(), h, None, false, frame);
+                    cursor.render(sc.cached_lines(), h, None, Surface::Plain, false, frame);
                 }
             }
         }
@@ -1231,8 +1248,13 @@ impl MessagesPanel {
                     let lines = self.build_cached_thinking_indicator(&text);
                     let search_text = format!("thinking> {text}");
                     self.cache.push_spacer_if_needed();
-                    self.cache
-                        .push(Segment::with_lines(lines, search_text, Some(i)));
+                    self.cache.push(Segment::with_lines(
+                        lines,
+                        search_text,
+                        Some(text),
+                        0,
+                        Some(i),
+                    ));
                     continue;
                 }
                 let style = match &msg.role {
@@ -1248,13 +1270,21 @@ impl MessagesPanel {
                 } else {
                     style.prefix
                 };
+                let surface = match msg.role {
+                    DisplayRole::User => Surface::User,
+                    DisplayRole::Assistant => Surface::Assistant,
+                    _ => Surface::Plain,
+                };
+                let base_width = surface.content_width(self.viewport_width).max(1);
+                let content_width = base_width.saturating_sub(prefix.width() as u16).max(1);
+                let image_width = base_width;
                 let mut lines = if style.use_markdown {
                     text_to_lines(
                         &msg.text,
                         prefix,
                         style.text_style,
                         style.prefix_style,
-                        self.viewport_width,
+                        content_width,
                         style.max_line_bytes,
                     )
                 } else {
@@ -1284,10 +1314,35 @@ impl MessagesPanel {
                     )));
                 }
 
-                let search_text = format!("{prefix}{}", msg.text);
+                let prefix_width = prefix.width() as u16;
+                let search_text = format!("{}> {}", role_name(&msg.role), msg.text);
+                let mut segment = Segment::with_lines(
+                    lines,
+                    search_text,
+                    Some(msg.text.clone()),
+                    prefix_width,
+                    Some(i),
+                );
+                segment.set_surface(surface);
                 self.cache.push_spacer_if_needed();
-                self.cache
-                    .push(Segment::with_lines(lines, search_text, Some(i)));
+                if !msg.text.is_empty() || msg.plan_path.is_some() {
+                    self.cache.push(segment);
+                }
+                for (idx, source) in msg.images.iter().enumerate() {
+                    if !terminal_image::supports_images() {
+                        break;
+                    }
+                    if idx > 0 || !msg.text.is_empty() || msg.plan_path.is_some() {
+                        self.cache.push(Segment::spacer());
+                    }
+                    self.cache.push(Segment::with_image(
+                        source,
+                        Arc::clone(&self.picker),
+                        image_width,
+                        surface,
+                        Some(i),
+                    ));
+                }
             }
         }
         self.cache.mark_built(self.messages.len());
@@ -1313,5 +1368,16 @@ fn logical_line_count(text: &str) -> usize {
         0
     } else {
         text.bytes().filter(|&b| b == b'\n').count() + 1
+    }
+}
+
+fn role_name(role: &DisplayRole) -> &'static str {
+    match role {
+        DisplayRole::User => "you",
+        DisplayRole::Assistant => "maki",
+        DisplayRole::Thinking => "thinking",
+        DisplayRole::Error => "error",
+        DisplayRole::Done => "done",
+        DisplayRole::Tool(_) => "tool",
     }
 }

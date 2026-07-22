@@ -1,12 +1,25 @@
 use crate::render_worker::RenderWorker;
+use crate::terminal_image::{LazyImage, TerminalImage};
+use std::sync::Arc;
 
 use super::super::code_view::SectionFlags;
 use super::super::tool_display::{HighlightRequest, ToolLines};
+use maki_agent::{ImageMediaType, ImageSource};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
+use ratatui_image::picker::Picker;
 use std::cell::Cell;
 
 const INST_SUFFIX: &str = "__inst";
+
+fn media_type_label(media_type: ImageMediaType) -> &'static str {
+    match media_type {
+        ImageMediaType::Png => "png",
+        ImageMediaType::Jpeg => "jpeg",
+        ImageMediaType::Gif => "gif",
+        ImageMediaType::Webp => "webp",
+    }
+}
 
 pub fn is_instruction_segment(id: &str) -> bool {
     id.ends_with(INST_SUFFIX)
@@ -39,10 +52,23 @@ impl HighlightKey {
     }
 }
 
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(super) enum Surface {
+    #[default]
+    Plain,
+    User,
+    Assistant,
+    Tool,
+}
+
 #[derive(Default)]
 pub(super) struct Segment {
     lines: Vec<Line<'static>>,
     pub search_text: String,
+    pub raw_text: Option<String>,
+    /// Visual width of the prefix added to every rendered line (e.g. "maki> ").
+    /// Used when copying a selection back to the original source text.
+    pub prefix_width: u16,
     pub tool_id: Option<String>,
     /// Backlink to `self.messages`, set only by `with_lines`. A click on a
     /// collapsed thinking indicator has no tool_id to route by, so this is
@@ -57,12 +83,15 @@ pub(super) struct Segment {
     pub spinner_lines: Vec<(usize, usize)>,
     snapshot_base: Option<usize>,
     pub content_indent: &'static str,
+    surface: Surface,
+    image: Option<LazyImage>,
 }
 
 impl Segment {
     pub fn with_tool(tool_id: String) -> Self {
         Self {
             tool_id: Some(tool_id),
+            surface: Surface::Tool,
             ..Self::default()
         }
     }
@@ -77,18 +106,80 @@ impl Segment {
     pub fn with_lines(
         lines: Vec<Line<'static>>,
         search_text: String,
+        raw_text: Option<String>,
+        prefix_width: u16,
         msg_index: Option<usize>,
     ) -> Self {
         Self {
             lines,
             search_text,
+            raw_text,
+            prefix_width,
             msg_index,
             ..Self::default()
         }
     }
 
+    pub fn with_image(
+        source: &ImageSource,
+        picker: Arc<Picker>,
+        width: u16,
+        surface: Surface,
+        msg_index: Option<usize>,
+    ) -> Self {
+        let search_text = format!("[image: {}]", media_type_label(source.media_type));
+        let fallback = Line::from(Span::raw(search_text.clone()));
+        let mut seg = Self {
+            lines: vec![fallback],
+            search_text: search_text.clone(),
+            raw_text: Some(search_text),
+            msg_index,
+            image: Some(LazyImage::new(source.clone(), picker, width)),
+            ..Self::default()
+        };
+        seg.set_surface(surface);
+        seg
+    }
+
     pub fn lines(&self) -> &[Line<'static>] {
         &self.lines
+    }
+
+    pub fn image(&self) -> Option<&TerminalImage> {
+        self.image
+            .as_ref()
+            .and_then(|lazy| lazy.get_or_decode().ok())
+    }
+
+    pub fn set_surface(&mut self, surface: Surface) {
+        self.surface = surface;
+        self.invalidate_height();
+    }
+
+    pub fn surface(&self) -> Surface {
+        self.surface
+    }
+}
+
+impl Surface {
+    pub fn is_framed(self) -> bool {
+        matches!(self, Self::User | Self::Tool)
+    }
+
+    pub fn content_width(self, width: u16) -> u16 {
+        width
+            .saturating_sub(if self.is_framed() { 4 } else { 0 })
+            .max(1)
+    }
+}
+
+impl Segment {
+    pub fn content_inset(&self) -> u16 {
+        if self.surface.is_framed() { 2 } else { 0 }
+    }
+
+    fn content_width(&self, width: u16) -> u16 {
+        self.surface.content_width(width)
     }
 
     pub fn set_lines(&mut self, lines: Vec<Line<'static>>) {
@@ -97,12 +188,17 @@ impl Segment {
     }
 
     pub fn height(&self, width: u16) -> u16 {
+        if let Some(img) = &self.image {
+            if let Ok(size) = img.size() {
+                return size.height;
+            }
+        }
         if let Some(c) = self.cached_height.get()
             && c.at_width == width
         {
             return c.height;
         }
-        let h = wrapped_line_count(&self.lines, width);
+        let h = wrapped_line_count(&self.lines, self.content_width(width));
         self.cached_height.set(Some(CachedHeight {
             at_width: width,
             height: h,
@@ -112,6 +208,10 @@ impl Segment {
 
     /// Maps a display row (after wrapping) back to the source line index.
     pub fn source_line_at(&self, rel_row: u16, width: u16) -> Option<usize> {
+        if self.image.is_some() {
+            return None;
+        }
+        let width = self.content_width(width);
         let mut acc = 0u16;
         for (i, line) in self.lines.iter().enumerate() {
             acc = acc.saturating_add(wrapped_line_count(std::slice::from_ref(line), width));

@@ -278,6 +278,7 @@ pub enum ToolStatus {
 pub struct DisplayMessage {
     pub role: DisplayRole,
     pub text: String,
+    pub images: Vec<maki_agent::ImageSource>,
     pub tool_input: Option<Arc<ToolInput>>,
     pub tool_raw_input: Option<Arc<serde_json::Value>>,
     pub tool_output: Option<Arc<ToolOutput>>,
@@ -298,6 +299,7 @@ impl DisplayMessage {
         Self {
             role,
             text,
+            images: Vec::new(),
             tool_input: None,
             tool_raw_input: None,
             tool_output: None,
@@ -318,6 +320,7 @@ impl DisplayMessage {
         Self {
             role: DisplayRole::Assistant,
             text,
+            images: Vec::new(),
             tool_input: None,
             tool_raw_input: None,
             tool_output: None,
