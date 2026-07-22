@@ -741,9 +741,25 @@ async fn start_server(config: &ServerConfig) -> Result<StartResult, McpError> {
             maki_storage::StateDir::resolve().ok(),
         )?),
     };
-    transport::initialize(transport.as_ref()).await?;
-    let tool_infos = transport::list_tools(transport.as_ref()).await?;
-    let prompt_infos = transport::list_prompts(transport.as_ref()).await?;
+    let capabilities = transport::initialize(transport.as_ref()).await?;
+    // Sloppy servers omit `capabilities` yet serve tools/list fine, so
+    // always ask; failure is only fatal when the server declared tools.
+    let tool_infos = match transport::list_tools(transport.as_ref()).await {
+        Ok(tools) => tools,
+        Err(e) if !capabilities.tools => {
+            warn!(server = config.name, error = %e, "tools/list failed; server declared no tools");
+            Vec::new()
+        }
+        Err(e) => return Err(e),
+    };
+    // Prompts are the opposite: ask only when declared. Servers without
+    // prompt support may answer with junk, and junk must not take down
+    // their tools.
+    let prompt_infos = if capabilities.prompts {
+        transport::list_prompts(transport.as_ref()).await?
+    } else {
+        Vec::new()
+    };
     info!(
         server = config.name,
         tool_count = tool_infos.len(),

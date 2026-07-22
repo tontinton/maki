@@ -42,12 +42,21 @@ fn invalid_response(name: &Arc<str>, e: impl std::fmt::Display) -> McpError {
     }
 }
 
-pub async fn initialize(transport: &dyn McpTransport) -> Result<(), McpError> {
+pub struct ServerCapabilities {
+    pub tools: bool,
+    pub prompts: bool,
+}
+
+pub async fn initialize(transport: &dyn McpTransport) -> Result<ServerCapabilities, McpError> {
     let params = initialize_params();
-    transport.send_request("initialize", Some(params)).await?;
+    let result = transport.send_request("initialize", Some(params)).await?;
     transport
         .send_notification("notifications/initialized", None)
-        .await
+        .await?;
+    Ok(ServerCapabilities {
+        tools: result["capabilities"]["tools"].is_object(),
+        prompts: result["capabilities"]["prompts"].is_object(),
+    })
 }
 
 pub async fn list_tools(transport: &dyn McpTransport) -> Result<Vec<ToolInfo>, McpError> {
@@ -116,4 +125,49 @@ pub async fn call_tool(
         "MCP tools/call response"
     );
     Ok(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use test_case::test_case;
+
+    struct InitTransport(Value, Arc<str>);
+
+    impl McpTransport for InitTransport {
+        fn send_request<'a>(
+            &'a self,
+            _method: &'a str,
+            _params: Option<Value>,
+        ) -> BoxFuture<'a, Result<Value, McpError>> {
+            Box::pin(async { Ok(self.0.clone()) })
+        }
+        fn send_notification<'a>(
+            &'a self,
+            _method: &'a str,
+            _params: Option<Value>,
+        ) -> BoxFuture<'a, Result<(), McpError>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn shutdown<'a>(&'a self) -> BoxFuture<'a, ()> {
+            Box::pin(async {})
+        }
+        fn server_name(&self) -> &Arc<str> {
+            &self.1
+        }
+        fn transport_kind(&self) -> &'static str {
+            "stub"
+        }
+    }
+
+    #[test_case(json!({"capabilities": {"tools": {}, "prompts": {}}}), true, true ; "both")]
+    #[test_case(json!({"capabilities": {"tools": {"listChanged": false}}}), true, false ; "tools_only")]
+    #[test_case(json!({"capabilities": {"prompts": {}}}), false, true ; "prompts_only")]
+    #[test_case(json!({}), false, false ; "no_capabilities")]
+    fn initialize_parses_capabilities(result: Value, tools: bool, prompts: bool) {
+        let transport = InitTransport(result, Arc::from("srv"));
+        let caps = smol::block_on(initialize(&transport)).unwrap();
+        assert_eq!((caps.tools, caps.prompts), (tools, prompts));
+    }
 }
