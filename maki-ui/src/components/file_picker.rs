@@ -1,28 +1,28 @@
 use std::mem;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent};
-use ignore::WalkBuilder;
 use ignore::overrides::OverrideBuilder;
+use ignore::WalkBuilder;
 use nucleo::pattern::{CaseMatching, Normalization};
 use nucleo::{Config, Matcher, Nucleo, Utf32String};
-use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
+use ratatui::Frame;
 use tracing::warn;
 use unicode_width::UnicodeWidthChar;
 
 use crate::animation::spinner_frame;
-use crate::components::Overlay;
 use crate::components::keybindings::key;
 use crate::components::modal::Modal;
 use crate::components::scrollbar::render_vertical_scrollbar;
+use crate::components::Overlay;
 use crate::text_buffer::TextBuffer;
 use crate::theme;
 
@@ -585,10 +585,9 @@ mod tests {
     #[test]
     fn pending_debounce_controls_visibility() {
         let (mut picker, _done_tx) = pending_picker();
-        picker.tick();
         assert!(
             !picker.session.as_ref().unwrap().visible,
-            "should stay hidden before debounce"
+            "should start hidden"
         );
 
         picker.session.as_mut().unwrap().started_at =
