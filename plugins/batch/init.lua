@@ -519,6 +519,7 @@ maki.api.register_tool({
   description = description,
   kind = "execute",
   audiences = { "main", "research_sub", "general_sub" },
+  defer_loading = true,
   schema = schema,
   examples = examples,
   header = function(input)

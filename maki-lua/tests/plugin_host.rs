@@ -817,7 +817,9 @@ greet.setup()
     host.load_plugin_file(&init_path).unwrap();
 
     assert!(reg.has("greet"));
-    assert_eq!(reg.names().len(), 1);
+    assert!(reg.has("tool_search"));
+    assert!(reg.has("load_namespace"));
+    assert_eq!(reg.names().len(), 3);
 }
 
 #[test]
@@ -2265,6 +2267,51 @@ fn sessions_plugin_registers_commands() {
         "missing /sessions in {names:?}"
     );
     assert!(names.contains(&"/rename"), "missing /rename in {names:?}");
+}
+
+#[test]
+fn register_tool_accepts_defer_loading_and_namespace() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source(
+        "deferred",
+        r#"maki.api.register_tool({
+            name = "deferred_test",
+            description = "A deferred tool",
+            defer_loading = true,
+            namespace = "test_ns",
+            schema = {MINIMAL_SCHEMA},
+            audiences = { "main" },
+            handler = function(input) return "ok" end
+        })"#,
+    )
+    .unwrap();
+
+    let entry = reg.get("deferred_test").expect("tool should be registered");
+    assert!(entry.defer_loading, "defer_loading should be true");
+    assert_eq!(entry.namespace.as_deref(), Some("test_ns"));
+}
+
+#[test]
+fn tool_search_builtin_works_end_to_end() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source(
+        "deferred",
+        r#"maki.api.register_tool({
+            name = "searchable_tool",
+            description = "A tool that can be searched",
+            defer_loading = true,
+            schema = {MINIMAL_SCHEMA},
+            audiences = { "main" },
+            handler = function(input) return "ok" end
+        })"#,
+    )
+    .unwrap();
+
+    let results = reg.search("searchable");
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].name, "searchable_tool");
 }
 
 #[test]

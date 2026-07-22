@@ -121,6 +121,7 @@ maki.api.register_tool({
   -- No interpreter audience: the code_execution bridge flattens tool output
   -- to text, so the pixels could never reach the model from there.
   audiences = { "main", "research_sub", "general_sub" },
+  defer_loading = true,
 
   schema = {
     type = "object",

@@ -15,6 +15,7 @@ use event_listener::Event;
 use include_dir::Dir;
 use maki_agent::cancel::CancelToken;
 use maki_agent::prompt::{PromptId, ResolvedSlots, Slot, SlotEntry};
+use maki_agent::tools::tool_search::{LoadNamespace, ToolSearch};
 use maki_agent::tools::{
     HeaderResult, PermissionScopes, RegistryError, Tool, ToolLive, ToolRegistry, ToolSource,
 };
@@ -42,6 +43,31 @@ use crate::api::util::setup::ConfigStore;
 use crate::docs_render;
 use crate::error::PluginError;
 use crate::plugin_permissions::{PluginPermissions, load_plugin_permissions};
+
+fn register_builtin_tools(registry: &Arc<ToolRegistry>) -> Result<(), PluginError> {
+    let tool_search: Arc<dyn Tool> = Arc::new(ToolSearch::new());
+    let load_namespace: Arc<dyn Tool> = Arc::new(LoadNamespace::new());
+    registry
+        .register_many([
+            (
+                tool_search,
+                ToolSource::Lua {
+                    plugin: "builtin".into(),
+                },
+            ),
+            (
+                load_namespace,
+                ToolSource::Lua {
+                    plugin: "builtin".into(),
+                },
+            ),
+        ])
+        .map_err(|e| PluginError::Lua {
+            plugin: "builtin".to_owned(),
+            source: mlua::Error::runtime(format!("failed to register builtin tools: {e}")),
+        })?;
+    Ok(())
+}
 
 const INTERRUPT_SHUTDOWN_MSG: &str = "plugin interrupted: host shutting down";
 const INTERRUPT_CANCELLED_MSG: &str = "plugin interrupted: task cancelled";
@@ -968,6 +994,8 @@ impl LuaRuntime {
         lua.set_app_data(hint_writer);
         lua.set_app_data(Arc::clone(&registry));
 
+        register_builtin_tools(&registry)?;
+
         let plugins: PluginMap = Rc::new(RefCell::new(HashMap::new()));
         {
             let lua = lua.clone();
@@ -1419,6 +1447,8 @@ impl LuaRuntime {
                     start_annotation: t.start_annotation.clone(),
                     examples: t.examples.clone(),
                     has_describe_fn: t.describe_key.is_some(),
+                    defer_loading: t.defer_loading,
+                    namespace: t.namespace.clone(),
                 });
                 (
                     tool,

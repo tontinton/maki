@@ -226,6 +226,12 @@ pub trait Tool: Send + Sync + 'static {
     fn tool_kind(&self) -> Option<&str> {
         None
     }
+    fn defer_loading(&self) -> bool {
+        false
+    }
+    fn namespace(&self) -> Option<&str> {
+        None
+    }
     fn parse(&self, input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError>;
 }
 
@@ -233,6 +239,8 @@ pub trait Tool: Send + Sync + 'static {
 pub struct RegisteredTool {
     pub tool: Arc<dyn Tool>,
     pub source: ToolSource,
+    pub defer_loading: bool,
+    pub namespace: Option<Arc<str>>,
 }
 
 impl RegisteredTool {
@@ -292,6 +300,8 @@ impl ToolRegistry {
 
     pub fn register(&self, tool: Arc<dyn Tool>, source: ToolSource) -> Result<(), RegistryError> {
         let name = tool.name().to_owned();
+        let defer_loading = tool.defer_loading();
+        let namespace = tool.namespace().map(Arc::from);
         let mut conflict = None;
         self.tools.rcu(|current| {
             conflict = None;
@@ -304,6 +314,8 @@ impl ToolRegistry {
             next.push(RegisteredTool {
                 tool: Arc::clone(&tool),
                 source: source.clone(),
+                defer_loading,
+                namespace: namespace.clone(),
             });
             next
         });
@@ -336,6 +348,8 @@ impl ToolRegistry {
                 next.push(RegisteredTool {
                     tool: Arc::clone(tool),
                     source: source.clone(),
+                    defer_loading: tool.defer_loading(),
+                    namespace: tool.namespace().map(Arc::from).clone(),
                 });
             }
             next
@@ -385,6 +399,8 @@ impl ToolRegistry {
                 next.push(RegisteredTool {
                     tool: Arc::clone(tool),
                     source: source.clone(),
+                    defer_loading: tool.defer_loading(),
+                    namespace: tool.namespace().map(Arc::from).clone(),
                 });
             }
             next
@@ -474,6 +490,101 @@ impl ToolRegistry {
     pub fn iter(&self) -> RegistrySnapshot {
         RegistrySnapshot(self.tools.load_full())
     }
+
+    pub fn search(&self, query: &str) -> Vec<ToolSearchResult> {
+        let query_lower = query.to_lowercase();
+        let snapshot = self.tools.load();
+        let mut results = Vec::new();
+        for entry in snapshot.iter() {
+            if !entry.defer_loading {
+                continue;
+            }
+            let name = entry.name();
+            let description = entry.tool.description(&DescriptionContext {
+                filter: &crate::tools::ToolFilter::All,
+                audience: ToolAudience::MAIN,
+                workflow: false,
+            });
+            let name_matches = name.to_lowercase().contains(&query_lower);
+            let desc_matches = description.to_lowercase().contains(&query_lower);
+            if name_matches || desc_matches {
+                let truncated = if description.len() > 120 {
+                    format!(
+                        "{}...",
+                        &description[..description.floor_char_boundary(120)]
+                    )
+                } else {
+                    description.into_owned()
+                };
+                results.push(ToolSearchResult {
+                    name: name.to_owned(),
+                    namespace: entry.namespace.as_deref().map(String::from),
+                    description: truncated,
+                });
+            }
+        }
+        results
+    }
+
+    pub fn definitions_active(
+        &self,
+        vars: &Vars,
+        ctx: &DescriptionContext,
+        supports_examples: bool,
+        active: &ActiveTools,
+    ) -> Value {
+        let snapshot = self.tools.load();
+        let mut out = Vec::with_capacity(snapshot.len());
+        for entry in snapshot.iter() {
+            if !entry.tool.audience().contains(ctx.audience) {
+                continue;
+            }
+            if !ctx.filter.matches(entry.name()) {
+                continue;
+            }
+            if entry.defer_loading {
+                let name_matches = active.names.contains(entry.name());
+                let namespace_matches = entry
+                    .namespace
+                    .as_ref()
+                    .map(|ns| active.namespaces.contains(ns.as_ref()))
+                    .unwrap_or(false);
+                if !name_matches && !namespace_matches {
+                    continue;
+                }
+            }
+            let description = vars.apply(&entry.tool.description(ctx)).into_owned();
+            let mut def = json!({
+                "name": entry.name(),
+                "description": description,
+                "input_schema": entry.tool.schema(),
+            });
+            if let Some(examples) = entry.tool.examples() {
+                if supports_examples {
+                    def["input_examples"] = examples;
+                } else if let Some(text) = format_examples_as_text(&examples) {
+                    let merged =
+                        format!("{}\n\n{}", def["description"].as_str().unwrap_or(""), text);
+                    def["description"] = Value::String(merged);
+                }
+            }
+            out.push(def);
+        }
+        Value::Array(out)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolSearchResult {
+    pub name: String,
+    pub namespace: Option<String>,
+    pub description: String,
+}
+
+#[derive(Clone, Default)]
+pub struct ActiveTools {
+    pub names: std::collections::HashSet<String>,
+    pub namespaces: std::collections::HashSet<String>,
 }
 
 pub struct RegistrySnapshot(Arc<Vec<RegisteredTool>>);
@@ -517,6 +628,8 @@ mod tests {
     struct MockTool {
         name: String,
         audience: ToolAudience,
+        defer_loading: bool,
+        namespace: Option<String>,
     }
 
     struct MockInvocation;
@@ -543,6 +656,12 @@ mod tests {
         fn audience(&self) -> ToolAudience {
             self.audience
         }
+        fn defer_loading(&self) -> bool {
+            self.defer_loading
+        }
+        fn namespace(&self) -> Option<&str> {
+            self.namespace.as_deref()
+        }
         fn parse(&self, _input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
             Ok(Box::new(MockInvocation))
         }
@@ -556,6 +675,8 @@ mod tests {
         Arc::new(MockTool {
             name: name.to_owned(),
             audience,
+            defer_loading: false,
+            namespace: None,
         })
     }
 
@@ -782,5 +903,97 @@ mod tests {
         let result: ToolExecResult = base.into();
         let result = result.with_written_path(path);
         assert_eq!(result.written_path.as_deref(), expected);
+    }
+
+    #[test]
+    fn search_returns_deferred_tools_matching_query() {
+        let reg = ToolRegistry::new();
+        let deferred = Arc::new(MockTool {
+            name: "deferred_tool".to_owned(),
+            audience: ToolAudience::all(),
+            defer_loading: true,
+            namespace: None,
+        });
+        reg.register(deferred, lua_source("p")).unwrap();
+        reg.register(mock("active_tool"), lua_source("p")).unwrap();
+
+        let results = reg.search("deferred");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "deferred_tool");
+    }
+
+    #[test]
+    fn search_excludes_non_deferred_tools() {
+        let reg = ToolRegistry::new();
+        reg.register(mock("active_tool"), lua_source("p")).unwrap();
+
+        let results = reg.search("active");
+        assert_eq!(results.len(), 0);
+    }
+
+    #[test]
+    fn definitions_active_excludes_deferred_tools_unless_in_active_set() {
+        let reg = ToolRegistry::new();
+        let deferred = Arc::new(MockTool {
+            name: "deferred_tool".to_owned(),
+            audience: ToolAudience::all(),
+            defer_loading: true,
+            namespace: None,
+        });
+        reg.register(deferred, lua_source("p")).unwrap();
+        reg.register(mock("active_tool"), lua_source("p")).unwrap();
+
+        let filter = crate::tools::ToolFilter::All;
+        let ctx = DescriptionContext {
+            filter: &filter,
+            audience: ToolAudience::MAIN,
+            workflow: false,
+        };
+        let vars = Vars::new();
+        let active = ActiveTools::default();
+
+        let defs = reg.definitions_active(&vars, &ctx, false, &active);
+        let arr = defs.as_array().expect("definitions returns array");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["name"].as_str(), Some("active_tool"));
+
+        let mut active_with_deferred = ActiveTools::default();
+        active_with_deferred
+            .names
+            .insert("deferred_tool".to_string());
+        let defs = reg.definitions_active(&vars, &ctx, false, &active_with_deferred);
+        let arr = defs.as_array().expect("definitions returns array");
+        assert_eq!(arr.len(), 2);
+    }
+
+    #[test]
+    fn definitions_active_includes_namespace_tools() {
+        let reg = ToolRegistry::new();
+        let deferred = Arc::new(MockTool {
+            name: "deferred_tool".to_owned(),
+            audience: ToolAudience::all(),
+            defer_loading: true,
+            namespace: Some("test_ns".to_string()),
+        });
+        reg.register(deferred, ToolSource::Lua { plugin: "p".into() })
+            .unwrap();
+        let entry = reg.get("deferred_tool").unwrap();
+        assert!(entry.defer_loading);
+        assert_eq!(entry.namespace.as_deref(), Some("test_ns"));
+
+        let filter = crate::tools::ToolFilter::All;
+        let ctx = DescriptionContext {
+            filter: &filter,
+            audience: ToolAudience::MAIN,
+            workflow: false,
+        };
+        let vars = Vars::new();
+        let mut active = ActiveTools::default();
+        active.namespaces.insert("test_ns".to_string());
+
+        let defs = reg.definitions_active(&vars, &ctx, false, &active);
+        let arr = defs.as_array().expect("definitions returns array");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["name"].as_str(), Some("deferred_tool"));
     }
 }

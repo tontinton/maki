@@ -10,12 +10,13 @@ pub mod grep;
 pub mod interpreter_bridge;
 pub mod registry;
 pub mod schema;
+pub mod tool_search;
 
 pub use file_tracker::FileReadTracker;
 pub use registry::{
-    BoxFuture, ExecFuture, HeaderFuture, HeaderResult, ParseError, PermissionScopes,
+    ActiveTools, BoxFuture, ExecFuture, HeaderFuture, HeaderResult, ParseError, PermissionScopes,
     RegisteredTool, RegistryError, Tool, ToolAudience, ToolExecResult, ToolInvocation,
-    ToolRegistry, ToolSource,
+    ToolRegistry, ToolSearchResult, ToolSource,
 };
 
 use std::collections::HashMap;
