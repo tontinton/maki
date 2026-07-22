@@ -1,7 +1,8 @@
 local shorten_path = require("maki.shorten_path")
 local ToolView = require("maki.tool_view")
 
-local DESCRIPTION = [[Write content to a file, replacing existing content. Creates parent directories if needed. Read the file first; prefer editing existing files. Only create documentation files when explicitly requested.]]
+local DESCRIPTION =
+  [[Write content to a file, replacing existing content. Creates parent directories if needed. Read the file first; prefer editing existing files. Only create documentation files when explicitly requested.]]
 
 local function write_view_opts(ctx)
   local tol = ctx:tool_output_lines()

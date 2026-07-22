@@ -12,9 +12,11 @@ local EDIT_LINES_DESCRIPTION =
 local INSERT_LINES_DESCRIPTION =
   [[Insert `new_string` before the given 1-indexed line number. Existing lines shift down.]]
 
-local EDIT_DESCRIPTION = [[Replace an exact string match in a file. The old_string must appear exactly once unless replace_all is true. Read the file first; do NOT include line-number prefixes from read output. Prefer this over write for targeted changes; use replace_all for renaming.]]
+local EDIT_DESCRIPTION =
+  [[Replace an exact string match in a file. The old_string must appear exactly once unless replace_all is true. Read the file first; do NOT include line-number prefixes from read output. Prefer this over write for targeted changes; use replace_all for renaming.]]
 
-local MULTIEDIT_DESCRIPTION = [[Apply multiple find-and-replace edits to a single file atomically. Read the file first; each old_string must match exactly once unless replace_all is true. Edits apply in sequence; if any fails, none are written. Ensure earlier edits do not alter text later edits need.]]
+local MULTIEDIT_DESCRIPTION =
+  [[Apply multiple find-and-replace edits to a single file atomically. Read the file first; each old_string must match exactly once unless replace_all is true. Edits apply in sequence; if any fails, none are written. Ensure earlier edits do not alter text later edits need.]]
 
 local function edit_header(input)
   local buf = maki.ui.buf()

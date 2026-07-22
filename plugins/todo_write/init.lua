@@ -10,7 +10,8 @@ local STATUS_MARKERS = {
   cancelled = { "[x]", "todo_cancelled" },
 }
 
-local DESCRIPTION = [[Create or update a structured todo list for multi-step work (3+ steps). Send the complete list each time (replace-all) and update after each completed step. Skip for trivial tasks.]]
+local DESCRIPTION =
+  [[Create or update a structured todo list for multi-step work (3+ steps). Send the complete list each time (replace-all) and update after each completed step. Skip for trivial tasks.]]
 
 local function count_done()
   local n = 0

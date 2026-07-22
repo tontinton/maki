@@ -1,7 +1,8 @@
 local QuestionForm = require("question_form")
 local QuestionHelpers = require("question_helpers")
 
-local DESCRIPTION = [[Ask the user questions during execution to gather preferences, clarify instructions, or get decisions. `custom` is enabled by default; don't add catch-all options. Answers are arrays of labels; use `multiSelect` for multi-select. Put the recommended option first.]]
+local DESCRIPTION =
+  [[Ask the user questions during execution to gather preferences, clarify instructions, or get decisions. `custom` is enabled by default; don't add catch-all options. Answers are arrays of labels; use `multiSelect` for multi-select. Put the recommended option first.]]
 
 maki.api.register_tool({
   name = "question",

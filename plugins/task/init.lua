@@ -24,7 +24,8 @@ local BODY_INDENT_COLS = 4
 local MIN_MD_WIDTH = 20
 local DEFAULT_OUTPUT_LINES = 5
 
-local description = [[Launch an autonomous subagent for independent tasks. Use `subagent_type` "research" for read-only exploration or "general" for implementation work. Launch multiple tasks concurrently when possible; inline needed context and ask for concise, file:line summaries.]]
+local description =
+  [[Launch an autonomous subagent for independent tasks. Use `subagent_type` "research" for read-only exploration or "general" for implementation work. Launch multiple tasks concurrently when possible; inline needed context and ask for concise, file:line summaries.]]
 
 local schema = {
   type = "object",

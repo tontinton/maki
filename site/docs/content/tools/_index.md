@@ -7,14 +7,13 @@ group = "Reference"
 
 # Tools
 
-Maki ships with 20 built-in tools. This is the full reference.
+Maki ships with 22 built-in tools. This is the full reference.
 
 ## File Operations
 
 ### `bash` *(lua plugin)*
 
-Execute a bash command.
-Commands run in <cwd> by default.
+Execute a bash command (runs in <cwd> by default). Use only for git, builds, tests, and system commands; do not use for file operations. Use `workdir` instead of `cd`. Chain dependent commands with `&&` and batch for independent ones. Output truncated beyond 2000 lines or 50KB. Interactive commands fail immediately.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
@@ -25,7 +24,7 @@ Commands run in <cwd> by default.
 
 ### `read` *(lua plugin)*
 
-Read a file or directory. Returns contents with line numbers (1-indexed).
+Read a file or directory with line numbers (1-indexed).
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -35,7 +34,7 @@ Read a file or directory. Returns contents with line numbers (1-indexed).
 
 ### `write` *(lua plugin)*
 
-Write content to a file, replacing existing content.
+Write content to a file, replacing existing content. Creates parent directories if needed. Read the file first; prefer editing existing files. Only create documentation files when explicitly requested.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -44,7 +43,7 @@ Write content to a file, replacing existing content.
 
 ### `edit` *(lua plugin)*
 
-Replace an exact string match in a file.
+Replace an exact string match in a file. The old_string must appear exactly once unless replace_all is true. Read the file first; do NOT include line-number prefixes from read output. Prefer this over write for targeted changes; use replace_all for renaming.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
@@ -55,8 +54,7 @@ Replace an exact string match in a file.
 
 ### `multiedit` *(lua plugin)*
 
-Make multiple find-and-replace edits to a single file atomically.
-Prefer this over edit when making multiple changes to the same file.
+Apply multiple find-and-replace edits to a single file atomically. Read the file first; each old_string must match exactly once unless replace_all is true. Edits apply in sequence; if any fails, none are written. Ensure earlier edits do not alter text later edits need.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -65,7 +63,7 @@ Prefer this over edit when making multiple changes to the same file.
 
 ### `edit_lines` *(lua plugin, opt-in)*
 
-Edit lines by number. Replaces lines from `start` to `end` (inclusive) with `new_string`. Use empty `new_string` to delete a range. Do not use with the batch tool.
+Replace a line range (start to end, inclusive) with `new_string`; empty `new_string` deletes the range.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -76,7 +74,7 @@ Edit lines by number. Replaces lines from `start` to `end` (inclusive) with `new
 
 ### `insert_lines` *(lua plugin, opt-in)*
 
-Insert lines before a given line number. Lines at `line` and below shift down. Existing lines are preserved. Do not use with the batch tool.
+Insert `new_string` before the given 1-indexed line number. Existing lines shift down.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -86,7 +84,7 @@ Insert lines before a given line number. Lines at `line` and below shift down. E
 
 ### `glob` *(lua plugin)*
 
-Find files by glob pattern.
+Find files by glob pattern. Respects .gitignore and returns absolute paths sorted by modification time (newest first). Prefer parallel searches.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
@@ -95,7 +93,7 @@ Find files by glob pattern.
 
 ### `grep` *(lua plugin)*
 
-Search file contents using regex.
+Search file contents with regex. Respects .gitignore, returns results grouped by file. Prefer parallel searches. Do not quote or double-escape the pattern. Multi-line matching auto-enables for `\n`, `(?s)`, or `(?m)`.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
@@ -108,7 +106,7 @@ Search file contents using regex.
 
 ### `index` *(lua plugin)*
 
-Return a compact overview of a source file: imports, type definitions, function signatures, and structure with their line numbers surrounded by []. ~70-90% more efficient than reading the full file.
+Return a compact overview of a source file: imports, types, function signatures, and structure with line numbers. Use before read to understand file structure; falls back with an error on unsupported languages.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -138,38 +136,51 @@ Execute Python code in a sandboxed interpreter with tools as callable functions.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
-| `code` | string | yes |  | Python code to execute. Tools are async functions that return strings (not objects). You MUST await every call: `result = await read(path='/file')`. Use `await asyncio.gather(...)` for concurrency. |
+| `code` | string | yes |  | Python code to execute. Tools are async functions that return strings. You MUST await every call: `result = await read(path='/file')`. Use `await asyncio.gather(...)` for concurrency. |
 | `timeout` | integer | no | 30, max 300 | Timeout in seconds |
 
 ### `question` *(lua plugin)*
 
-Use this tool when you need to ask the user questions during execution. This allows you to:
-- Gather user preferences or requirements
-- Clarify ambiguous instructions
-- Get decisions on implementation choices as you work
-- Offer choices to the user about what direction to take
+Ask the user questions during execution to gather preferences, clarify instructions, or get decisions. `custom` is enabled by default; don't add catch-all options. Answers are arrays of labels; use `multiSelect` for multi-select. Put the recommended option first.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `questions` | array | yes | List of questions to ask the user |
 
+### `tool_search` *(lua plugin)*
+
+Search for deferred tools by name or description. Returns a list of tools that can be loaded on demand.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `namespace` | string | no | Optional namespace filter |
+| `query` | string | yes | Search query to match tool names or descriptions |
+
+### `load_namespace` *(lua plugin)*
+
+Load all tools from a namespace. Returns the list of tools that were loaded.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `namespace` | string | yes | Namespace to load |
+
 ## Agent & Knowledge
 
 ### `task` *(lua plugin)*
 
-Launch an autonomous subagent to perform tasks independently. Best combined with batch.
+Launch an autonomous subagent for independent tasks. Use `subagent_type` "research" for read-only exploration or "general" for implementation work. Launch multiple tasks concurrently when possible; inline needed context and ask for concise, file:line summaries.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `description` | string | yes | Short (3-5 words) description of the task |
-| `model_tier` | string | no | Model tier (optional, omit to use current model, capped at current tier):<br>- "strong" (e.g. Opus): Deep reasoning, complex architecture, subtle bugs, most critical sections. ~5x cost of medium.<br>- "medium" (e.g. Sonnet): Balanced. Refactors, features, multi-file changes.<br>- "weak" (e.g. Haiku): Fast/cheap. Search, summarize, boilerplate, simple edits. |
-| `output_schema` | string | no | JSON Schema (object) the subagent's final result must match. When set, the result is returned as a validated JSON string. |
+| `model_tier` | string | no | Optional capped model tier: "weak", "medium", or "strong". |
+| `output_schema` | string | no | JSON Schema the subagent's final result must match. Returned as a validated JSON string. |
 | `prompt` | string | yes | Detailed task prompt for the agent |
 | `subagent_type` | string | no | Subagent type: "research" (read-only, default) or "general" (can modify files) |
 
 ### `todo_write` *(lua plugin)*
 
-Create or update a structured todo list to track tasks.
+Create or update a structured todo list for multi-step work (3+ steps). Send the complete list each time (replace-all) and update after each completed step. Skip for trivial tasks.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -197,7 +208,7 @@ Load a skill that provides instructions and workflows for specific tasks.
 
 ### `webfetch` *(lua plugin)*
 
-Fetch a URL and return its contents.
+Fetch a URL and return its contents. Supports markdown (default), text, and html. HTTP auto-upgrades to HTTPS. Max 5MB response, 120s timeout. Use inside code_execution with truncation to avoid bloat.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
@@ -207,7 +218,7 @@ Fetch a URL and return its contents.
 
 ### `websearch` *(lua plugin)*
 
-Search the web for real-time information using Exa AI.
+Search the web using Exa AI (today is YYYY-MM-DD). Use for current events, docs, APIs, or anything not in local files. Prefer targeted queries.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|

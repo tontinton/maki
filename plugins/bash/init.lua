@@ -232,7 +232,9 @@ local function collect_commands(node, source)
   return out
 end
 
-local description = [[Execute a bash command (runs in ]] .. cwd .. [[ by default). Use only for git, builds, tests, and system commands; do not use for file operations. Use `workdir` instead of `cd`. Chain dependent commands with `&&` and batch for independent ones. Output truncated beyond 2000 lines or 50KB. Interactive commands fail immediately.]]
+local description = [[Execute a bash command (runs in ]]
+  .. cwd
+  .. [[ by default). Use only for git, builds, tests, and system commands; do not use for file operations. Use `workdir` instead of `cd`. Chain dependent commands with `&&` and batch for independent ones. Output truncated beyond 2000 lines or 50KB. Interactive commands fail immediately.]]
 
 maki.api.register_prompt_hint({
   slot = "tool_usage",
