@@ -77,7 +77,7 @@ impl App {
 
     pub(super) fn reset_ui_chrome(&mut self) {
         self.chats.clear();
-        let mut main = Chat::new("Main".into(), self.ui_config);
+        let mut main = Chat::new("Main".into(), self.ui_config.clone());
         main.set_restore_channel(self.lua_event_handle.clone(), self.restore_event_tx.clone());
         self.chats.push(main);
         self.active_chat = 0;
@@ -123,7 +123,7 @@ impl App {
         for sa in std::mem::take(&mut self.state.session.meta.subagents) {
             let idx = self.chats.len();
             self.chat_index.insert(sa.tool_use_id.clone(), idx);
-            let mut chat = Chat::new(sa.name, self.ui_config);
+            let mut chat = Chat::new(sa.name, self.ui_config.clone());
             chat.set_restore_channel(self.lua_event_handle.clone(), self.restore_event_tx.clone());
             chat.model_id = sa.model;
             if let Some(messages) = self.state.session.subagent_messages.get(&sa.tool_use_id) {

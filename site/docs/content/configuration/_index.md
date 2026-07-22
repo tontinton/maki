@@ -23,6 +23,7 @@ maki.setup({
     ui = {
         splash_animation = true,
         mouse_scroll_lines = 5,
+        theme = "tokyonight",
         tool_output_lines = {
             bash = 8,
             read = 5,
@@ -69,6 +70,12 @@ All fields are optional. Typos in field names cause an error right away.
 | `typewriter_ms_per_char` | u64 | `4` | - | Typewriter effect speed (ms/char) |
 | `mouse_scroll_lines` | u32 | `3` | 1 | Lines per mouse wheel scroll |
 | `show_thinking` | bool | `true` | - | When true (default), show full model reasoning live and persisted. When false, hide reasoning behind an indicator (thinking> ...) with a click-to-expand hint, both while thinking and after it completes |
+
+### `ui.theme`
+
+Name of the color theme to load at startup, overriding the theme you last picked interactively. If unset, Maki keeps your last selection (the built-in default on first run). An unknown name is ignored with a warning.
+
+Available themes: `ayu_dark`, `ayu_light`, `ayu_mirage`, `carbonfox`, `catppuccin_frappe`, `catppuccin_latte`, `catppuccin_macchiato`, `catppuccin_mocha`, `dracula`, `everforest_dark`, `fleet_dark`, `github_dark`, `gruvbox`, `gruvbox_light`, `kanagawa`, `material_darker`, `monokai_pro`, `night_owl`, `nightfox`, `nord`, `onedark`, `rose_pine`, `rose_pine_dawn`, `rose_pine_moon`, `solarized_dark`, `solarized_light`, `tokyonight`, `vscode_dark_plus`, `zenburn`.
 
 ### `ui.tool_output_lines`
 

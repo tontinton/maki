@@ -177,7 +177,7 @@ impl SpawnCtx {
             self.keymap_reader.clone(),
             self.hint_reader.clone(),
             Arc::clone(&self.storage_writer),
-            self.ui_config,
+            self.ui_config.clone(),
             self.input_history_size,
             permissions,
             Arc::clone(&self.custom_commands),
@@ -313,7 +313,7 @@ impl<'t> EventLoop<'t> {
             commands,
             sessions,
             focused,
-            startup_warnings,
+            mut startup_warnings,
             storage,
             config,
             ui_config,
@@ -327,6 +327,19 @@ impl<'t> EventLoop<'t> {
             ui_action_rx,
             lua_event_handle,
         } = params;
+
+        // Apply the config theme before the warmup thread spawns, or warmup
+        // could bake the syntax palette from the old theme. Only the
+        // in-memory name is set, so the user's saved pick survives.
+        if let Some(ref name) = ui_config.theme {
+            match crate::theme::load_by_name(name) {
+                Ok(theme) => {
+                    crate::theme::set_current_name(name);
+                    crate::theme::set(theme);
+                }
+                Err(e) => startup_warnings.push(format!("config ui.theme: {e}")),
+            }
+        }
 
         static PROCESS_WARMUP: std::sync::Once = std::sync::Once::new();
         PROCESS_WARMUP.call_once(|| {

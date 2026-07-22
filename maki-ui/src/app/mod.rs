@@ -203,8 +203,10 @@ impl App {
     ) -> Self {
         scrollbar::set_enabled(ui_config.scrollbar);
         let state = SessionState::from_session(session, model, &storage);
+        let typewriter = ui_config.typewriter_ms_per_char;
+        let flash = ui_config.flash_duration();
         let mut app = Self {
-            chats: vec![Chat::new("Main".into(), ui_config)],
+            chats: vec![Chat::new("Main".into(), ui_config.clone())],
             active_chat: 0,
             chat_index: HashMap::new(),
             input_box: InputBox::new(InputHistory::load(&storage, input_history_size)),
@@ -222,13 +224,13 @@ impl App {
             rewind_picker: RewindPicker::new(),
             help_modal: HelpModal::new(),
             usage_modal: UsageModal::new(),
-            btw_modal: BtwModal::new(ui_config.typewriter_ms_per_char),
+            btw_modal: BtwModal::new(typewriter),
             float_mgr: FloatManager::new(),
             search_modal: SearchModal::new(),
             file_picker: FilePickerModal::new(),
             permission_prompt: PermissionPrompt::new(),
             plan_form: PlanForm::new(),
-            status_bar: StatusBar::new(ui_config.flash_duration()),
+            status_bar: StatusBar::new(flash),
             status: Status::Idle,
             state,
             exit_request: ExitRequest::None,
@@ -1122,7 +1124,7 @@ impl App {
         if let Some(ref model) = subagent.model {
             self.chats[0].update_tool_model(id, model);
         }
-        let mut chat = Chat::new(subagent.name.clone(), self.ui_config);
+        let mut chat = Chat::new(subagent.name.clone(), self.ui_config.clone());
         chat.set_restore_channel(self.lua_event_handle.clone(), self.restore_event_tx.clone());
         chat.model_id = subagent.model.clone();
         if let Some(ref prompt) = subagent.prompt {
