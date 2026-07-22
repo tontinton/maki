@@ -45,27 +45,33 @@ use crate::error::PluginError;
 use crate::plugin_permissions::{PluginPermissions, load_plugin_permissions};
 
 fn register_builtin_tools(registry: &Arc<ToolRegistry>) -> Result<(), PluginError> {
-    let tool_search: Arc<dyn Tool> = Arc::new(ToolSearch::new());
-    let load_namespace: Arc<dyn Tool> = Arc::new(LoadNamespace::new());
-    registry
-        .register_many([
-            (
-                tool_search,
-                ToolSource::Lua {
-                    plugin: "builtin".into(),
-                },
-            ),
-            (
-                load_namespace,
-                ToolSource::Lua {
-                    plugin: "builtin".into(),
-                },
-            ),
-        ])
-        .map_err(|e| PluginError::Lua {
-            plugin: "builtin".to_owned(),
-            source: mlua::Error::runtime(format!("failed to register builtin tools: {e}")),
-        })?;
+    let tools: [(Arc<dyn Tool>, ToolSource); 2] = [
+        (
+            Arc::new(ToolSearch::new()),
+            ToolSource::Lua {
+                plugin: "builtin".into(),
+            },
+        ),
+        (
+            Arc::new(LoadNamespace::new()),
+            ToolSource::Lua {
+                plugin: "builtin".into(),
+            },
+        ),
+    ];
+    for (tool, source) in tools {
+        match registry.register(tool, source) {
+            Ok(()) => {}
+            Err(RegistryError::NameConflict { name, .. })
+                if name == "tool_search" || name == "load_namespace" => {}
+            Err(e) => {
+                return Err(PluginError::Lua {
+                    plugin: "builtin".to_owned(),
+                    source: mlua::Error::runtime(format!("failed to register builtin tools: {e}")),
+                });
+            }
+        }
+    }
     Ok(())
 }
 
