@@ -54,7 +54,7 @@ use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use maki_agent::permissions::PermissionManager;
 use maki_agent::{
     AgentEvent, Envelope, ImageSource, McpConfigErrors, McpPromptInfo, McpSnapshotReader,
-    SubagentInfo, ToolOutput,
+    SubagentInfo, SubagentPrompt, ToolOutput,
 };
 use maki_config::UiConfig;
 use maki_lua::{EventHandle, HintReader, KeymapReader, LuaCommandReader};
@@ -93,6 +93,14 @@ const IMPLEMENT_MSG_PREFIX: &str = "Implement the plan";
 const IMPLEMENT_PARALLEL_HINT: &str = "Use batch+task to parallelize, assign each subagent a separate module and restrict its tests to that module to avoid interference.";
 
 const TASK_DONE_DETAIL: &str = "✓ ";
+const STEERING_UNAVAILABLE_MSG: &str = "This agent is no longer accepting messages";
+const STEERING_BUSY_MSG: &str = "This agent is busy; try again in a moment";
+
+enum SubagentPromptError {
+    Finished,
+    Disconnected,
+    Full(Submission),
+}
 
 #[derive(Clone)]
 pub(super) struct TaskEntry {
@@ -118,6 +126,10 @@ pub(super) enum PendingInput {
     None,
     AuthRetry {
         subagent_id: Option<String>,
+    },
+    #[allow(dead_code)]
+    SubagentFollowUp {
+        subagent_id: String,
     },
 }
 
@@ -183,6 +195,7 @@ pub struct App {
     pub(crate) restore_event_tx: Option<maki_agent::EventSender>,
     pub(super) restoring: Arc<AtomicBool>,
     subagent_answers: HashMap<String, flume::Sender<String>>,
+    subagent_prompts: HashMap<String, flume::Sender<SubagentPrompt>>,
 }
 
 impl App {
@@ -263,6 +276,7 @@ impl App {
             restore_event_tx: None,
             restoring: Arc::new(AtomicBool::new(false)),
             subagent_answers: HashMap::new(),
+            subagent_prompts: HashMap::new(),
         };
         app.model_picker
             .set_recents(maki_storage::model::read_recents(&app.storage));
@@ -275,6 +289,16 @@ impl App {
 
     fn is_main_chat(&self) -> bool {
         self.active_chat == 0
+    }
+
+    fn resolve_render_chat(&self) -> usize {
+        if self.task_picker.is_open() {
+            self.task_picker
+                .selected_index()
+                .unwrap_or(self.active_chat)
+        } else {
+            self.active_chat
+        }
     }
 
     fn plan_form_active(&self) -> bool {
@@ -377,6 +401,51 @@ impl App {
             let _ = tx.try_send(answer);
         } else {
             self.send_answer(answer);
+        }
+    }
+
+    fn send_subagent_prompt(
+        &mut self,
+        subagent_id: &str,
+        sub: Submission,
+    ) -> Result<(), SubagentPromptError> {
+        let Some(&idx) = self.chat_index.get(subagent_id) else {
+            return Err(SubagentPromptError::Disconnected);
+        };
+        if self.chats[idx].is_finished() {
+            self.subagent_prompts.remove(subagent_id);
+            return Err(SubagentPromptError::Finished);
+        }
+        let Some(tx) = self.subagent_prompts.get(subagent_id) else {
+            return Err(SubagentPromptError::Disconnected);
+        };
+        let prompt = SubagentPrompt {
+            text: sub.text.clone(),
+            images: sub.images.clone(),
+        };
+        match tx.try_send(prompt) {
+            Ok(()) => {
+                self.chats[idx].show_user_message(format_with_images(&sub.text, sub.images.len()));
+                Ok(())
+            }
+            Err(flume::TrySendError::Full(_)) => Err(SubagentPromptError::Full(sub)),
+            Err(flume::TrySendError::Disconnected(_)) => {
+                self.subagent_prompts.remove(subagent_id);
+                Err(SubagentPromptError::Disconnected)
+            }
+        }
+    }
+
+    fn handle_subagent_prompt_result(&mut self, subagent_id: String, sub: Submission) {
+        match self.send_subagent_prompt(&subagent_id, sub) {
+            Ok(()) => {}
+            Err(SubagentPromptError::Full(sub)) => {
+                self.flash(STEERING_BUSY_MSG.into());
+                self.input_box.set_submission(sub);
+            }
+            Err(SubagentPromptError::Finished) | Err(SubagentPromptError::Disconnected) => {
+                self.flash(STEERING_UNAVAILABLE_MSG.into());
+            }
         }
     }
 
@@ -699,24 +768,48 @@ impl App {
         }
 
         if !self.is_main_chat() {
-            return match key.code {
-                KeyCode::Tab if !self.is_bash_input() => self.toggle_mode(),
-                KeyCode::Esc if !self.chats[self.active_chat].is_finished() => {
-                    if let Some(t) = self.last_esc.take()
-                        && t.elapsed() < self.status_bar.flash_duration
-                    {
-                        self.handle_subagent_cancel()
-                    } else {
-                        self.last_esc = Some(Instant::now());
-                        self.status_bar.flash(FLASH_CANCEL.into());
-                        vec![]
-                    }
-                }
-                _ => vec![],
-            };
+            return self.handle_subagent_chat_key(key);
         }
 
         self.handle_main_chat_key(key)
+    }
+
+    fn handle_subagent_chat_key(&mut self, key: KeyEvent) -> Vec<Action> {
+        if key.code == KeyCode::Tab && !self.is_bash_input() {
+            return self.toggle_mode();
+        }
+        if key.code == KeyCode::Esc && self.chats[self.active_chat].is_finished() {
+            self.active_chat = 0;
+            self.last_esc = None;
+            return vec![];
+        }
+        if key.code == KeyCode::Left {
+            self.active_chat = 0;
+            self.last_esc = None;
+            return vec![];
+        }
+        if key.code != KeyCode::Esc {
+            self.last_esc = None;
+        }
+
+        match self.input_box.handle_key(key) {
+            InputAction::Submit(sub) => self.handle_submit(sub),
+            InputAction::Passthrough(key) if key.code == KeyCode::Esc => {
+                if let Some(t) = self.last_esc.take()
+                    && t.elapsed() < self.status_bar.flash_duration
+                {
+                    self.handle_subagent_cancel()
+                } else {
+                    self.last_esc = Some(Instant::now());
+                    self.status_bar.flash(FLASH_CANCEL.into());
+                    vec![]
+                }
+            }
+            InputAction::Passthrough(_)
+            | InputAction::ContinueLine
+            | InputAction::PaletteSync(_)
+            | InputAction::None => vec![],
+        }
     }
 
     fn dispatch_override(&self, key: KeyEvent) -> bool {
@@ -844,7 +937,21 @@ impl App {
                 self.send_to_agent(subagent_id.as_deref(), String::new());
                 return vec![];
             }
+            PendingInput::SubagentFollowUp { subagent_id } => {
+                self.handle_subagent_prompt_result(subagent_id, sub);
+                return vec![];
+            }
             PendingInput::None => {}
+        }
+        if !self.is_main_chat() {
+            if sub.is_empty() {
+                return vec![];
+            }
+            let Some(tool_use_id) = self.chats[self.active_chat].tool_use_id.clone() else {
+                return vec![];
+            };
+            self.handle_subagent_prompt_result(tool_use_id, sub);
+            return vec![];
         }
         if sub.is_empty() {
             return vec![];
@@ -879,6 +986,7 @@ impl App {
         self.pending_input = PendingInput::None;
         self.finish_subagents(DisplayRole::Error, CANCELLED_TEXT);
         self.subagent_answers.clear();
+        self.subagent_prompts.clear();
         self.shell.cancel_all();
         for chat in &mut self.chats {
             chat.flush();
@@ -908,6 +1016,7 @@ impl App {
         self.chats[self.active_chat].cancel_in_progress();
         self.chats[self.active_chat].mark_finished(DisplayRole::Error, CANCELLED_TEXT);
         self.subagent_answers.remove(&tool_use_id);
+        self.subagent_prompts.remove(&tool_use_id);
 
         vec![Action::CancelSubagent { tool_use_id }]
     }
@@ -958,6 +1067,8 @@ impl App {
             if let Some(&sub_idx) = self.chat_index.get(tool_use_id.as_str()) {
                 self.chats[sub_idx].mark_finished(DisplayRole::Done, DONE_TEXT);
             }
+            self.subagent_answers.remove(&tool_use_id);
+            self.subagent_prompts.remove(&tool_use_id);
             self.state
                 .session
                 .subagent_messages
@@ -994,6 +1105,8 @@ impl App {
                     (DisplayRole::Done, DONE_TEXT)
                 };
                 self.chats[sub_idx].mark_finished(role, text);
+                self.subagent_answers.remove(&e.id);
+                self.subagent_prompts.remove(&e.id);
             }
         }
 
@@ -1079,6 +1192,7 @@ impl App {
                     self.save_session();
                     self.chat_index.clear();
                     self.subagent_answers.clear();
+                    self.subagent_prompts.clear();
                     self.status = Status::Idle;
                     self.fire_session_autocmd("TurnEnd", serde_json::json!({}));
                     if self.exit_on_done {
@@ -1122,6 +1236,9 @@ impl App {
         if let Some(ref tx) = subagent.answer_tx {
             self.subagent_answers.insert(id.clone(), tx.clone());
         }
+        if let Some(ref tx) = subagent.prompt_tx {
+            self.subagent_prompts.insert(id.clone(), tx.clone());
+        }
         self.chats[0].update_tool_summary(id, &subagent.name);
         if let Some(ref model) = subagent.model {
             self.chats[0].update_tool_model(id, model);
@@ -1136,6 +1253,10 @@ impl App {
         if let Some(ref prompt) = subagent.prompt {
             chat.push_user_message(prompt);
         }
+        if let Some(messages) = self.state.session.subagent_messages.get(id.as_str()) {
+            chat.load_history(messages);
+        }
+        chat.tool_use_id = Some(id.clone());
         self.chats.push(chat);
         idx
     }
@@ -1453,6 +1574,8 @@ impl App {
             self.chats[sub_idx].mark_finished(role.clone(), text);
         }
         self.chat_index.clear();
+        self.subagent_answers.clear();
+        self.subagent_prompts.clear();
     }
 
     pub fn flush_all_chats(&mut self) {

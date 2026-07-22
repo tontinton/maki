@@ -644,6 +644,16 @@ impl MessagesPanel {
         true
     }
 
+    pub fn tool_id_at(&self, row: u16, area: Rect) -> Option<&str> {
+        if area.height == 0 {
+            return None;
+        }
+        let doc_row = (row.saturating_sub(area.y)) as u32 + self.scroll_top as u32;
+        let width = self.viewport_width;
+        let (_, seg, _) = self.cache.segment_at_row(doc_row, width)?;
+        seg.tool_id.as_deref()
+    }
+
     #[cfg(test)]
     pub fn toggle_expansion_at(&mut self, row: u16, area: Rect) -> bool {
         self.handle_click(row, area)

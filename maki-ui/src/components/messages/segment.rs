@@ -188,10 +188,10 @@ impl Segment {
     }
 
     pub fn height(&self, width: u16) -> u16 {
-        if let Some(img) = &self.image {
-            if let Ok(size) = img.size() {
-                return size.height;
-            }
+        if let Some(img) = &self.image
+            && let Ok(size) = img.size()
+        {
+            return size.height;
         }
         if let Some(c) = self.cached_height.get()
             && c.at_width == width

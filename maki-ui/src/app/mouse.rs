@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 
 use crate::clipboard::CopyResult;
 use crate::selection::{self, ContentRegion, EdgeScroll, Selection, SelectionState, SelectionZone};
-use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
 use super::App;
@@ -44,7 +44,16 @@ impl App {
                         self.selection_state = None;
                         if zone == SelectionZone::Messages {
                             let area = self.msg_area();
-                            self.chats[self.active_chat].handle_click(event.row, area);
+                            let render_chat = self.resolve_render_chat();
+                            if event.modifiers.contains(KeyModifiers::CONTROL)
+                                && let Some(tool_id) =
+                                    self.chats[render_chat].tool_id_at(event.row, area)
+                                && let Some(&idx) = self.chat_index.get(tool_id)
+                            {
+                                self.active_chat = idx;
+                                return;
+                            }
+                            self.chats[render_chat].handle_click(event.row, area);
                         }
                     }
                 }

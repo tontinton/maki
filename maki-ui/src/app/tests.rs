@@ -9,8 +9,9 @@ use arc_swap::ArcSwap;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use maki_agent::permissions::PermissionManager;
 use maki_agent::{
-    ImageMediaType, McpConfigErrors, McpServerInfo, McpServerStatus, McpSnapshot,
-    McpSnapshotReader, ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent,
+    Envelope, ImageMediaType, ImageSource, McpConfigErrors, McpServerInfo, McpServerStatus,
+    McpSnapshot, McpSnapshotReader, SubagentInfo, SubagentPrompt, ToolDoneEvent, ToolOutput,
+    ToolStartEvent, TurnCompleteEvent,
 };
 use maki_config::{PermissionsConfig, UiConfig};
 use maki_lua::{HintReader, KeymapReader, LuaCommandReader};
@@ -19,6 +20,7 @@ use maki_storage::sessions::{StoredMode, StoredThinking};
 use ratatui::layout::Rect;
 use std::env;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
 use test_case::test_case;
@@ -108,6 +110,7 @@ fn subagent_info_with_tx(
         prompt: None,
         model: None,
         answer_tx,
+        prompt_tx: None,
     }
 }
 
@@ -3098,4 +3101,98 @@ fn subagent_cancel_then_navigate_back_main_unaffected() {
     assert_eq!(app.active_chat, 0);
     assert_eq!(app.status, Status::Streaming);
     assert!(!app.chats[0].is_finished());
+}
+
+fn subagent_info_with_channels(
+    id: &str,
+    name: &str,
+    prompt: &str,
+    model: Option<&str>,
+    prompt_tx: Option<flume::Sender<SubagentPrompt>>,
+) -> SubagentInfo {
+    SubagentInfo {
+        parent_tool_use_id: id.into(),
+        name: name.into(),
+        prompt: Some(prompt.into()),
+        model: model.map(|m| m.to_string()),
+        answer_tx: None,
+        prompt_tx,
+    }
+}
+
+#[test]
+fn subagent_prompt_queue_full_restores_input_and_flashes_busy() {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    let (prompt_tx, prompt_rx) = flume::bounded::<SubagentPrompt>(1);
+    let fill_tx = prompt_tx.clone();
+    let info = subagent_info_with_channels("task1", "task1", "research", None, Some(prompt_tx));
+    app.handle_agent_event(Envelope {
+        event: AgentEvent::TextDelta { text: "x".into() },
+        subagent: Some(info),
+        run_id: 1,
+    });
+    app.active_chat = 1;
+    fill_tx
+        .try_send(SubagentPrompt {
+            text: "fill".into(),
+            images: Vec::new(),
+        })
+        .unwrap();
+
+    app.input_box.set_input("hi".into());
+    app.update(Msg::Key(key(KeyCode::Enter)));
+
+    assert_eq!(app.status_bar.flash_text(), Some(STEERING_BUSY_MSG));
+    assert_eq!(app.input_box.buffer.value(), "hi");
+    assert_eq!(prompt_rx.try_recv().unwrap().text, "fill");
+    assert!(prompt_rx.try_recv().is_err());
+}
+
+#[test]
+fn subagent_prompt_disconnected_removes_sender_and_flashes_unavailable() {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    let (prompt_tx, _prompt_rx) = flume::bounded::<SubagentPrompt>(1);
+    drop(_prompt_rx);
+    let info = subagent_info_with_channels("task1", "task1", "research", None, Some(prompt_tx));
+    app.handle_agent_event(Envelope {
+        event: AgentEvent::TextDelta { text: "x".into() },
+        subagent: Some(info),
+        run_id: 1,
+    });
+    app.active_chat = 1;
+
+    app.input_box.set_input("hi".into());
+    app.update(Msg::Key(key(KeyCode::Enter)));
+
+    assert_eq!(app.status_bar.flash_text(), Some(STEERING_UNAVAILABLE_MSG));
+    assert!(!app.subagent_prompts.contains_key("task1"));
+}
+
+#[test]
+fn subagent_prompt_carries_images() {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    let (prompt_tx, prompt_rx) = flume::bounded::<SubagentPrompt>(1);
+    let info = subagent_info_with_channels("task1", "task1", "research", None, Some(prompt_tx));
+    app.handle_agent_event(Envelope {
+        event: AgentEvent::TextDelta { text: "x".into() },
+        subagent: Some(info),
+        run_id: 1,
+    });
+    app.active_chat = 1;
+
+    let img = ImageSource::new(ImageMediaType::Png, Arc::from("dGVzdA=="));
+    app.input_box.attach_image(img.clone());
+    app.input_box.set_input("describe this".into());
+    app.update(Msg::Key(key(KeyCode::Enter)));
+
+    let received = prompt_rx.try_recv().unwrap();
+    assert_eq!(received.text, "describe this");
+    assert_eq!(received.images.len(), 1);
+    assert_eq!(app.chats[1].last_message_text(), "describe this [1 image]");
 }

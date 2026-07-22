@@ -45,6 +45,7 @@ pub struct Chat {
     pub token_usage: TokenUsage,
     pub context_size: u32,
     pub model_id: Option<String>,
+    pub tool_use_id: Option<String>,
     pending_turn_usage: Option<String>,
     messages_panel: MessagesPanel,
     finished: bool,
@@ -57,6 +58,7 @@ impl Chat {
             token_usage: TokenUsage::default(),
             context_size: 0,
             model_id: None,
+            tool_use_id: None,
             pending_turn_usage: None,
             messages_panel: MessagesPanel::new(ui_config, picker),
             finished: false,
@@ -259,6 +261,10 @@ impl Chat {
         self.messages_panel.handle_click(row, area);
     }
 
+    pub fn tool_id_at(&self, row: u16, area: Rect) -> Option<&str> {
+        self.messages_panel.tool_id_at(row, area)
+    }
+
     pub fn tool_snapshot(
         &mut self,
         tool_id: &str,
@@ -323,6 +329,12 @@ impl Chat {
 
     pub fn load_messages(&mut self, msgs: Vec<DisplayMessage>) {
         self.messages_panel.load_messages(msgs);
+    }
+
+    pub fn load_history(&mut self, messages: &[Message]) {
+        let (display, _restore) =
+            history_to_display(messages, &HashMap::new(), &ToolOutputLines::default());
+        self.load_messages(display);
     }
 
     pub fn push_user_message(&mut self, text: impl Into<String>) {
