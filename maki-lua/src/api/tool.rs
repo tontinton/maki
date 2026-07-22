@@ -645,7 +645,8 @@ fn register_tool(lua: &Lua, #[ctx] pending: PendingTools, spec: Table) -> LuaRes
 /// browsing memory files or toggling settings.
 ///
 /// @param spec table Command specification:
-///   name        (string)   Required. The command name (without the leading slash).
+///   name        (string)   Required. The command name (e.g. "/hello"; a leading
+///                            slash is added when missing).
 ///   description (string)   Optional. Short description shown in the command palette.
 ///   handler     (function) Required. Called when the user runs the command.
 /// @return
@@ -1177,13 +1178,16 @@ fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> Lua
 }
 
 fn register_command_from_lua(lua: &Lua, spec: &Table, plugin: Arc<str>) -> LuaResult<()> {
-    let name: String = spec
+    let mut name: String = spec
         .get("name")
         .map_err(|_| mlua::Error::runtime("register_command: missing 'name'"))?;
     if name.is_empty() {
         return Err(mlua::Error::runtime(
             "register_command: name must be non-empty",
         ));
+    }
+    if !name.starts_with('/') {
+        name.insert(0, '/');
     }
     let description: String = spec.get("description").unwrap_or_default();
     let handler: Function = spec

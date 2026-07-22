@@ -250,7 +250,8 @@ browsing memory files or toggling settings.
 **Parameters:**
 
 - `{spec}` (`table`) Command specification:
-  - `name` (`string`) Required. The command name (without the leading slash).
+  - `name` (`string`) Required. The command name (e.g. "/hello"; a leading
+    slash is added when missing).
   - `description` (`string`) Optional. Short description shown in the command palette.
   - `handler` (`function`) Required. Called when the user runs the command.
 
