@@ -433,10 +433,24 @@ impl SessionLog {
         U: Serialize + DeserializeOwned + Default,
         T: Serialize + DeserializeOwned,
     {
-        let path = jsonl_path(dir, session_id);
+        let path = locate_session_file(dir, session_id)
+            .ok_or_else(|| SessionError::from(StorageError::NotFound(session_id.to_string())))?;
+        let session = load_session_at::<M, U, T>(&path)?;
+
+        // Migrate legacy .json files to canonical .jsonl so subsequent opens
+        // skip the legacy path and the file is cleaned up.
+        let canonical = jsonl_path(dir, session_id);
+        if path != canonical {
+            let _ = remove_legacy_files(dir, session_id);
+            let file = write_session_file(dir, &session)?;
+            update_cwd_index(dir, &session.cwd, session.id)?;
+            let log = Self::cursor_from(&session, file);
+            return Ok((session, log));
+        }
+
+        // Truncate any torn tail on the canonical .jsonl file.
         let bytes = fs::read(&path).map_err(StorageError::from)?;
         let valid = bytes.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
-
         if valid < bytes.len() {
             warn!(
                 path = %path.display(),
@@ -450,9 +464,6 @@ impl SessionLog {
                 .set_len(valid as u64)
                 .map_err(StorageError::from)?;
         }
-
-        let display = path.display().to_string();
-        let session = load_jsonl::<M, U, T>(&bytes[..valid], &display)?;
 
         let file = OpenOptions::new()
             .append(true)
@@ -946,8 +957,11 @@ fn scan_headers(cwd: &str, dir: &Path) -> Result<Vec<SessionSummary>, StorageErr
     let mut cache = load_scan_cache(dir);
     let mut fresh = ScanCache::new();
     let mut dirty = false;
-    let mut out = Vec::new();
+    // Deduplicate by session id, preferring .jsonl over legacy .json so a
+    // session that exists in both formats appears once.
+    let mut selected: HashMap<MakiId, (bool, SessionSummary)> = HashMap::new();
     for path in session_entries(dir)? {
+        let from_jsonl = is_jsonl(&path);
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
@@ -958,7 +972,7 @@ fn scan_headers(cwd: &str, dir: &Path) -> Result<Vec<SessionSummary>, StorageErr
             Some(e) if e.size == size && e.mtime_ms == mtime_ms => e,
             _ => {
                 dirty = true;
-                let header = if is_jsonl(&path) {
+                let header = if from_jsonl {
                     scan_jsonl_header(&path)
                 } else {
                     scan_legacy_header(&path)
@@ -972,12 +986,21 @@ fn scan_headers(cwd: &str, dir: &Path) -> Result<Vec<SessionSummary>, StorageErr
         };
         if let Some(h) = &entry.header
             && h.cwd == cwd
+            && selected
+                .get(&h.id)
+                .is_none_or(|(jsonl, _)| from_jsonl && !*jsonl)
         {
-            out.push(SessionSummary {
-                id: h.id,
-                title: normalize_title(&h.title),
-                updated_at: h.updated_at,
-            });
+            selected.insert(
+                h.id,
+                (
+                    from_jsonl,
+                    SessionSummary {
+                        id: h.id,
+                        title: normalize_title(&h.title),
+                        updated_at: h.updated_at,
+                    },
+                ),
+            );
         }
         fresh.insert(name.to_owned(), entry);
     }
@@ -988,7 +1011,7 @@ fn scan_headers(cwd: &str, dir: &Path) -> Result<Vec<SessionSummary>, StorageErr
     {
         warn!(error = %e, "failed to write session scan cache");
     }
-    Ok(out)
+    Ok(selected.into_values().map(|(_, s)| s).collect())
 }
 
 const TAIL_BUF: u64 = 4096;

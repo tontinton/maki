@@ -11,6 +11,9 @@ local STRUCTURED_OUTPUT_NAME = "structured_output"
 local STRUCTURED_OUTPUT_DESCRIPTION = "Report your final result. Call it exactly once when your task is complete."
 local STRUCTURED_OUTPUT_ACK = "Output recorded."
 local STRUCTURED_OUTPUT_PROMPT_SUFFIX = "\n\nWhen finished, call the structured_output tool with your final result."
+local DONE_NAME = "done"
+local DONE_DESCRIPTION = "Call when the task is complete with your final answer."
+local DONE_PROMPT_SUFFIX = "\n\nWhen finished, call the done tool with your final answer."
 local MAX_STRUCTURED_RETRIES = 2
 local MAX_SCHEMA_ERRORS = 3
 local SCHEMA_COMPILE_ERROR = "invalid output_schema"
@@ -147,6 +150,23 @@ local function handler(input, ctx)
         end,
       },
     }
+  else
+    local_tools = {
+      [DONE_NAME] = {
+        description = DONE_DESCRIPTION,
+        input_schema = {
+          type = "object",
+          properties = {
+            answer = { type = "string", description = "Final answer to return to the parent agent." },
+          },
+          required = { "answer" },
+        },
+        handler = function(value)
+          captured = value.answer
+          return "Done."
+        end,
+      },
+    }
   end
 
   local permit = semaphore:acquire()
@@ -168,6 +188,8 @@ local function handler(input, ctx)
     local message = input.prompt
     if validator then
       message = message .. STRUCTURED_OUTPUT_PROMPT_SUFFIX
+    else
+      message = message .. DONE_PROMPT_SUFFIX
     end
 
     local result, err = sess:prompt(message)
@@ -186,7 +208,13 @@ local function handler(input, ctx)
       local msg = last_errors and (STRUCTURED_INVALID_ERROR .. ":\n" .. last_errors) or STRUCTURED_MISSING_ERROR
       return { llm_output = msg, is_error = true }
     end
-    return { llm_output = captured and maki.json.encode(captured) or result.text, format = "markdown" }
+    if captured then
+      if type(captured) == "string" then
+        return { llm_output = captured, format = "markdown" }
+      end
+      return { llm_output = maki.json.encode(captured), format = "markdown" }
+    end
+    return { llm_output = result.text, format = "markdown" }
   end)
 
   permit:release()

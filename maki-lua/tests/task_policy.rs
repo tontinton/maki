@@ -14,6 +14,7 @@ const TASK_PLUGIN_SRC: &str = include_str!("../../plugins/task/init.lua");
 
 // Mirrors of the plugin's error contracts and policy numbers.
 const STRUCTURED_OUTPUT_TOOL: &str = "structured_output";
+const DONE_PROMPT_SUFFIX: &str = "\n\nWhen finished, call the done tool with your final answer.";
 const MAX_STRUCTURED_RETRIES: usize = 2;
 const MAX_SCHEMA_ERRORS: usize = 3;
 const SCHEMA_COMPILE_ERROR: &str = "invalid output_schema";
@@ -342,9 +343,10 @@ fn plain_path_returns_text_without_local_tools() {
     assert_eq!(out, PLAIN_TEXT);
 
     let snap = probe(&reg);
-    assert_eq!(snap["has_local_tools"], json!(false));
+    assert_eq!(snap["has_local_tools"], json!(true));
     assert_eq!(snap["prompt_count"], json!(1));
-    assert_eq!(snap["prompts"][0], json!(TASK_PROMPT));
+    let expected_prompt = format!("{TASK_PROMPT}{DONE_PROMPT_SUFFIX}");
+    assert_eq!(snap["prompts"][0], json!(expected_prompt));
     assert_eq!(snap["closed"], json!(1));
 }
 

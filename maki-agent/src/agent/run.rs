@@ -278,8 +278,9 @@ impl<'h> Agent<'h> {
         if has_tools {
             let history_len_before = self.history.len();
             self.process_tool_calls(response).await?;
-            self.context_size +=
-                estimate_message_tokens(&self.history.as_slice()[history_len_before..]);
+            self.context_size = self.context_size.saturating_add(estimate_message_tokens(
+                &self.history.as_slice()[history_len_before..],
+            ));
         } else {
             let has_text = response.message.first_text_content().is_some();
 
@@ -500,7 +501,17 @@ pub fn estimate_message_tokens(messages: &[Message]) -> u32 {
             _ => None,
         })
         .sum();
-    (total_bytes.max(CHARS_PER_TOKEN) / CHARS_PER_TOKEN) as u32
+    let count = total_bytes.max(CHARS_PER_TOKEN) / CHARS_PER_TOKEN;
+    match u32::try_from(count) {
+        Ok(n) => n,
+        Err(_) => {
+            warn!(
+                count,
+                "estimated token count exceeded u32 range; saturating"
+            );
+            u32::MAX
+        }
+    }
 }
 
 #[cfg(test)]
@@ -980,5 +991,34 @@ mod tests {
                 .expect("expected Done event");
             assert_eq!(done, expected_turns);
         });
+    }
+
+    #[test]
+    fn estimate_message_tokens_empty_is_zero() {
+        assert_eq!(estimate_message_tokens(&[]), 0);
+    }
+
+    #[test]
+    fn estimate_message_tokens_counts_bytes_per_four() {
+        let messages = vec![
+            Message::user("hello world".into()),
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "response".into(),
+                }],
+                ..Default::default()
+            },
+        ];
+        let count = estimate_message_tokens(&messages);
+        assert_eq!(count, 4, "expected 4 tokens for 19 bytes at 4 bytes/token");
+    }
+
+    #[test]
+    fn context_size_addition_uses_saturating_add() {
+        let context_size: u32 = u32::MAX - 100;
+        let addition: u32 = 200;
+        let result = context_size.saturating_add(addition);
+        assert_eq!(result, u32::MAX);
     }
 }

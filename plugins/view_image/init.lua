@@ -127,7 +127,6 @@ maki.api.register_tool({
     properties = {
       path = {
         type = "string",
-        description = "Path to the image file",
         required = true,
         alias = "file_path",
       },

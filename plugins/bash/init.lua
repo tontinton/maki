@@ -263,10 +263,10 @@ maki.api.register_tool({
   schema = {
     type = "object",
     properties = {
-      command = { type = "string", description = "The bash command to execute", required = true },
-      timeout = { type = "integer", description = "Timeout in seconds (default 120)" },
-      workdir = { type = "string", description = "Working directory (default: cwd)" },
-      description = { type = "string", description = "Short description (3-5 words) of what the command does" },
+      command = { type = "string", required = true },
+      timeout = { type = "integer" },
+      workdir = { type = "string" },
+      description = { type = "string" },
     },
   },
   permission_scopes = function(input)

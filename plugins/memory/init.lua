@@ -38,14 +38,7 @@ maki.api.register_prompt_hint({
     if #entries == 0 then
       return nil
     end
-    table.sort(entries, function(a, b)
-      return a[1] < b[1]
-    end)
-    local out = "\n\nMemory files (use the memory tool to view/update):\n"
-    for _, e in ipairs(entries) do
-      out = out .. "- " .. e[1] .. " (" .. e[2] .. " bytes)\n"
-    end
-    return out
+    return "\n\nMemory files: " .. #entries .. " entries (use memory tool to view/update)\n"
   end,
 })
 

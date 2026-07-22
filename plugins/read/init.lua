@@ -2,18 +2,7 @@ local ToolView = require("maki.tool_view")
 local shorten_path = require("maki.shorten_path")
 local output_limits = require("maki.output_limits")
 
-local DESCRIPTION = [[Read a file or directory. Returns contents with line numbers (1-indexed).
-
-- Supports absolute, relative, and ~/ paths.
-- **Always include offset and limit** if possible. Defaults: no offset = start at 1; no limit = up to 2000 lines.
-- Use the **index** tool or **grep** tool first to find the offset and limit.
-- Only read the sections you actually need.
-- Use `wc -l` to check total number of lines before reading to decide a reasonable limit unless known already.
-- Use truncation hints (e.g. "truncated lines X-Y") to continue with the correct offset.
-- Do not reread the same range (same file and same offset).
-- Prefer grep to locate content instead of scanning full files.
-- Call in parallel when reading multiple files.
-- Avoid tiny repeated slices - read a larger window if you need more context.]]
+local DESCRIPTION = "Read a file or directory. Returns contents with line numbers (1-indexed)."
 
 local DEFAULT_MAX_OUTPUT_LINES = 2000
 
@@ -224,9 +213,10 @@ end
 
 maki.api.register_prompt_hint({
   slot = "tool_usage",
-  content = [[
-- When using the **read** tool, only read the sections you actually need.
-- Use `wc -l` to check total number of lines before reading to decide a reasonable **read** tool limit unless known already.]],
+  content = [[- When using the **read** tool, only read the sections you actually need.
+- Use `wc -l` to check total number of lines before reading to decide a reasonable **read** tool limit unless known already.
+- Supports absolute, relative, and ~/ paths. No offset = start at 1; no limit = up to 2000 lines.
+- Use truncation hints (e.g. "truncated lines X-Y") to continue with the correct offset.]],
 })
 
 maki.api.register_tool({
@@ -239,15 +229,11 @@ maki.api.register_tool({
     properties = {
       path = {
         type = "string",
-        description = "Absolute path to the file or directory",
         required = true,
         alias = "file_path",
       },
-      offset = { type = "integer", description = "Line number to start from (1-indexed)" },
-      limit = {
-        type = "integer",
-        description = "Max number of lines to read. Omitting the limit reads up to 2000 lines.",
-      },
+      offset = { type = "integer" },
+      limit = { type = "integer" },
     },
   },
 

@@ -51,6 +51,7 @@ pub enum SlotKind {
 pub enum Slot {
     Identity,
     Tone,
+    Environment,
     ToolUsage,
     EfficientTools,
     Conventions,
@@ -62,6 +63,7 @@ impl Slot {
         match self {
             Slot::Identity => "{{identity}}",
             Slot::Tone => "{{tone}}",
+            Slot::Environment => "{{environment}}",
             Slot::ToolUsage => "{{tool_usage}}",
             Slot::EfficientTools => "{{efficient_tools}}",
             Slot::Conventions => "{{conventions}}",
@@ -71,7 +73,7 @@ impl Slot {
 
     pub fn kind(self) -> SlotKind {
         match self {
-            Slot::Identity | Slot::Tone => SlotKind::Singleton,
+            Slot::Identity | Slot::Tone | Slot::Environment => SlotKind::Singleton,
             Slot::ToolUsage
             | Slot::EfficientTools
             | Slot::Conventions
@@ -465,5 +467,56 @@ mod tests {
         let out = assemble(PromptId::System, &s, "");
         assert!(out.contains("Never assume a library is available"));
         assert!(out.contains("- Extra rule"));
+    }
+
+    #[test]
+    fn assemble_system_without_environment_has_no_heading_or_marker() {
+        let out = assemble(PromptId::System, &ResolvedSlots::default(), "");
+        assert!(!out.contains("# Environment"));
+        assert!(!out.contains("{{environment}}"));
+    }
+
+    #[test]
+    fn assemble_system_with_environment_shows_heading_and_content() {
+        const ENV_CONTENT: &str = "# Environment\nCurrent date: 2026-07-21";
+        let mut s = ResolvedSlots::default();
+        s.insert(
+            PromptId::System,
+            Slot::Environment,
+            SlotEntry {
+                plugin: Arc::from("test"),
+                content: ENV_CONTENT.into(),
+            },
+        );
+        let out = assemble(PromptId::System, &s, "");
+        assert!(out.contains("# Environment"));
+        assert!(out.contains("Current date: 2026-07-21"));
+        assert!(!out.contains("{{environment}}"));
+    }
+
+    #[test]
+    fn environment_section_placed_between_objectivity_and_tool_usage() {
+        const ENV_CONTENT: &str = "# Environment\nCurrent date: 2026-07-21";
+        let mut s = ResolvedSlots::default();
+        s.insert(
+            PromptId::System,
+            Slot::Environment,
+            SlotEntry {
+                plugin: Arc::from("test"),
+                content: ENV_CONTENT.into(),
+            },
+        );
+        let out = assemble(PromptId::System, &s, "");
+        let obj_idx = out.find("# Professional objectivity").unwrap();
+        let env_idx = out.find("# Environment").unwrap();
+        let tool_idx = out.find("# Tool usage").unwrap();
+        assert!(
+            obj_idx < env_idx,
+            "Environment should be after Professional objectivity"
+        );
+        assert!(
+            env_idx < tool_idx,
+            "Environment should be before Tool usage"
+        );
     }
 }

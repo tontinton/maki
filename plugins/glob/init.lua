@@ -26,8 +26,8 @@ maki.api.register_tool({
   schema = {
     type = "object",
     properties = {
-      pattern = { type = "string", description = "Glob pattern (e.g. **/*.rs, src/**/*.ts)", required = true },
-      path = { type = "string", description = "Directory to search in (default: cwd)" },
+      pattern = { type = "string", required = true },
+      path = { type = "string" },
     },
   },
 

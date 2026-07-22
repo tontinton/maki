@@ -257,23 +257,19 @@ maki.api.register_tool({
     properties = {
       path = {
         type = "string",
-        description = "Absolute path to the file",
         required = true,
         alias = "file_path",
       },
       old_string = {
         type = "string",
-        description = "Exact string to find (must match uniquely unless replace_all is true)",
         required = true,
       },
       new_string = {
         type = "string",
-        description = "Replacement string",
         required = true,
       },
       replace_all = {
         type = "boolean",
-        description = "Replace all occurrences (default false)",
       },
     },
   },
@@ -309,30 +305,25 @@ register_tool_if(opts.multiedit, {
     properties = {
       path = {
         type = "string",
-        description = "Absolute path to the file",
         required = true,
         alias = "file_path",
       },
       edits = {
         type = "array",
-        description = "Array of edit operations to apply sequentially",
         required = true,
         items = {
           type = "object",
           properties = {
             old_string = {
               type = "string",
-              description = "Exact string to find",
               required = true,
             },
             new_string = {
               type = "string",
-              description = "Replacement string",
               required = true,
             },
             replace_all = {
               type = "boolean",
-              description = "Replace all occurrences (default false)",
             },
           },
         },
@@ -394,23 +385,19 @@ register_tool_if(opts.edit_lines, {
     properties = {
       path = {
         type = "string",
-        description = "Absolute path to the file",
         required = true,
         alias = "file_path",
       },
       start = {
         type = "integer",
-        description = "First line (1-indexed)",
         required = true,
       },
       ["end"] = {
         type = "integer",
-        description = "Last line, inclusive",
         required = true,
       },
       new_string = {
         type = "string",
-        description = "Replacement text",
         required = true,
       },
     },
@@ -448,18 +435,15 @@ register_tool_if(opts.insert_lines, {
     properties = {
       path = {
         type = "string",
-        description = "Absolute path to the file",
         required = true,
         alias = "file_path",
       },
       line = {
         type = "integer",
-        description = "Line number to insert before (1-indexed). Use 1 to insert at the top.",
         required = true,
       },
       new_string = {
         type = "string",
-        description = "Text to insert",
         required = true,
       },
     },
