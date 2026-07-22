@@ -6,6 +6,7 @@
 -- `maki.async.semaphore`).
 
 local ToolView = require("maki.tool_view")
+local output_limits = require("maki.output_limits")
 
 local STRUCTURED_OUTPUT_NAME = "structured_output"
 local STRUCTURED_OUTPUT_DESCRIPTION = "Report your final result. Call it exactly once when your task is complete."
@@ -204,7 +205,11 @@ end
 -- this mirrors that for restore and batch children, which build the body here.
 local function restore(_input, output, is_error, ctx)
   local tol = ctx:tool_output_lines()
-  local opts = { max_lines = (tol and tol.task) or DEFAULT_OUTPUT_LINES, keep = "head" }
+  local opts = {
+    max_lines = (tol and tol.task) or DEFAULT_OUTPUT_LINES,
+    keep = "head",
+    max_line_bytes = output_limits.DEFAULT_MAX_LINE_BYTES,
+  }
   if not is_error then
     local width = math.max(maki.ui.terminal_size().cols - BODY_INDENT_COLS, MIN_MD_WIDTH)
     local ok, md_lines = pcall(maki.ui.markdown, output, width)

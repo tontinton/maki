@@ -161,6 +161,7 @@ local function create_bash_view(command, ctx)
   local view = ToolView.new(buf, {
     max_lines = (tol and tol.bash) or 5,
     keep = "tail",
+    max_line_bytes = output_limits.DEFAULT_MAX_LINE_BYTES,
   })
   view:set_header(build_header_lines(command))
   buf:on("click", function()
