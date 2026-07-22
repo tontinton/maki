@@ -1146,7 +1146,9 @@ impl App {
                     self.queue.clear();
                     self.subagent_answers.clear();
                     self.finish_unresolved_subagents(DisplayRole::Error, ERROR_TEXT);
-                    for chat in &mut self.chats {
+                    let shell_ids = self.shell.active_ids().clone();
+                    self.chats[0].fail_in_progress_except(message.clone(), &shell_ids);
+                    for chat in self.chats.iter_mut().skip(1) {
                         chat.fail_in_progress_with_message(message.clone());
                     }
                     self.sync_task_picker();

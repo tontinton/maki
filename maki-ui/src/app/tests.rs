@@ -2563,6 +2563,58 @@ fn reserved_shell_survives_parent_done_until_shell_done() {
 }
 
 #[test]
+fn active_shell_survives_agent_error_while_agent_and_child_tools_fail() {
+    let mut app = streaming_app_with_history();
+    let shell_id = app.shell.reserve_id();
+    app.handle_shell_event(shell::ShellEvent::Start {
+        id: shell_id.clone(),
+        command: "true".into(),
+    });
+    app.update(agent_msg(AgentEvent::ToolStart(Box::new(ToolStartEvent {
+        id: "agent-tool".into(),
+        tool: "read".into(),
+        summary: "reading".into(),
+        annotation: None,
+        input: None,
+        raw_input: None,
+        output: None,
+        render_header: None,
+    }))));
+    app.update(subagent_msg(
+        AgentEvent::ToolStart(Box::new(ToolStartEvent {
+            id: "child-tool".into(),
+            tool: "read".into(),
+            summary: "reading".into(),
+            annotation: None,
+            input: None,
+            raw_input: None,
+            output: None,
+            render_header: None,
+        })),
+        "task1",
+        Some("research"),
+    ));
+
+    app.update(agent_msg(AgentEvent::Error {
+        message: "provider overloaded".into(),
+    }));
+
+    assert_eq!(app.chats[0].in_progress_count(), 1);
+    assert_eq!(app.chats[1].in_progress_count(), 0);
+    assert!(app.chats[1].is_finished());
+
+    app.handle_shell_event(shell::ShellEvent::Done {
+        id: shell_id.clone(),
+        command: "true".into(),
+        output: String::new(),
+        is_error: false,
+        visible: false,
+    });
+    assert_eq!(app.chats[0].in_progress_count(), 0);
+    assert!(!app.shell.active_ids().contains(&shell_id));
+}
+
+#[test]
 fn main_shell_exclusion_does_not_protect_same_id_in_child_chat() {
     let mut app = streaming_app_with_history();
     let id = app.shell.reserve_id();
