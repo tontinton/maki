@@ -67,7 +67,7 @@ impl ThemePicker {
                 self.apply_preview();
                 ThemePickerAction::Consumed
             }
-            PickerAction::Select(_, entry) => {
+            PickerAction::Select(entry) => {
                 theme::persist_theme(entry.name);
                 self.original_theme_name = None;
                 ThemePickerAction::Closed

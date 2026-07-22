@@ -94,11 +94,13 @@ const IMPLEMENT_MSG_PREFIX: &str = "Implement the plan";
 const IMPLEMENT_PARALLEL_HINT: &str = "Use batch+task to parallelize, assign each subagent a separate module and restrict its tests to that module to avoid interference.";
 
 const TASK_DONE_DETAIL: &str = "✓ ";
+const MISSING_TOOL_COMPLETION: &str = "Tool did not report completion before the turn ended";
 
 #[derive(Clone)]
 pub(super) struct TaskEntry {
     name: String,
     finished: Option<bool>,
+    chat_index: usize,
 }
 
 impl PickerItem for TaskEntry {
@@ -422,19 +424,37 @@ impl App {
         }
     }
 
-    fn open_tasks(&mut self) {
-        let entries: Vec<TaskEntry> = self
-            .chats
+    fn task_entries(&self) -> Vec<TaskEntry> {
+        self.chats
             .iter()
             .enumerate()
-            .map(|(i, c)| TaskEntry {
-                name: c.name.clone(),
-                finished: (i > 0).then_some(c.is_finished()),
+            .map(|(chat_index, chat)| TaskEntry {
+                name: chat.name.clone(),
+                finished: (chat_index > 0).then_some(chat.is_finished()),
+                chat_index,
             })
-            .collect();
+            .collect()
+    }
+
+    fn open_tasks(&mut self) {
         self.task_picker_original = Some(self.active_chat);
-        self.task_picker.open(entries, " Tasks ");
+        self.task_picker.open(self.task_entries(), " Tasks ");
         self.task_picker.select(self.active_chat);
+    }
+
+    fn sync_task_picker(&mut self) {
+        if !self.task_picker.is_open() {
+            return;
+        }
+        let selected = self
+            .task_picker
+            .selected_item()
+            .map(|entry| entry.chat_index);
+        self.task_picker.replace_items(self.task_entries());
+        if let Some(chat_index) = selected {
+            self.task_picker
+                .select_item_by(|entry| entry.chat_index == chat_index);
+        }
     }
 
     fn handle_ctrl(&mut self, key: KeyEvent) -> Option<Vec<Action>> {
@@ -603,9 +623,9 @@ impl App {
             }
             return Some(match self.task_picker.handle_key(key) {
                 PickerAction::Consumed | PickerAction::Toggle(..) => vec![],
-                PickerAction::Select(idx, _) => {
+                PickerAction::Select(entry) => {
                     self.task_picker_original = None;
-                    self.active_chat = idx;
+                    self.active_chat = entry.chat_index;
                     vec![]
                 }
                 PickerAction::Close => {
@@ -863,7 +883,7 @@ impl App {
             if cmd == "cd" || cmd.starts_with("cd ") {
                 self.flash("Only /cd can change the working directory".into());
             }
-            let id = self.shell.next_id();
+            let id = self.shell.reserve_id();
             let sigil = if prefix.visible { "!" } else { "!!" };
             let display = format!("{sigil} {}", prefix.command);
             self.main_chat().show_user_message(display);
@@ -975,6 +995,7 @@ impl App {
             if let Some(&sub_idx) = self.chat_index.get(tool_use_id.as_str()) {
                 self.chats[sub_idx].mark_finished(DisplayRole::Done, DONE_TEXT);
             }
+            self.sync_task_picker();
             self.state
                 .session
                 .subagent_messages
@@ -1010,6 +1031,7 @@ impl App {
                 };
                 self.chats[sub_idx].mark_finished(role, text);
             }
+            self.sync_task_picker();
         }
 
         if let AgentEvent::Retry {
@@ -1091,6 +1113,24 @@ impl App {
             match result {
                 ChatEventResult::Done => {
                     self.status_bar.clear_flash();
+                    let unresolved: Vec<String> = self
+                        .chat_index
+                        .iter()
+                        .filter(|&(_, &idx)| !self.chats[idx].is_finished())
+                        .map(|(id, _)| id.clone())
+                        .collect();
+                    for id in &unresolved {
+                        if let Some(idx) = self.chat_index.remove(id) {
+                            self.chats[idx].mark_finished(DisplayRole::Error, ERROR_TEXT);
+                        }
+                    }
+                    let shell_ids = self.shell.active_ids().clone();
+                    self.chats[0]
+                        .fail_in_progress_except(MISSING_TOOL_COMPLETION.into(), &shell_ids);
+                    for chat in self.chats.iter_mut().skip(1) {
+                        chat.fail_in_progress_with_message(MISSING_TOOL_COMPLETION.into());
+                    }
+                    self.sync_task_picker();
                     self.save_session();
                     self.chat_index.clear();
                     self.subagent_answers.clear();
@@ -1103,13 +1143,15 @@ impl App {
                 ChatEventResult::Error(message) => {
                     self.status = Status::error(message.clone());
                     self.status_bar.clear_flash();
-                    self.save_session();
                     self.queue.clear();
                     self.subagent_answers.clear();
-                    self.finish_subagents(DisplayRole::Error, ERROR_TEXT);
+                    self.finish_unresolved_subagents(DisplayRole::Error, ERROR_TEXT);
                     for chat in &mut self.chats {
                         chat.fail_in_progress_with_message(message.clone());
                     }
+                    self.sync_task_picker();
+                    self.save_session();
+                    self.chat_index.clear();
                     self.fire_session_autocmd(
                         "TurnError",
                         serde_json::json!({ "message": message }),
@@ -1152,6 +1194,7 @@ impl App {
             chat.push_user_message(prompt);
         }
         self.chats.push(chat);
+        self.sync_task_picker();
         idx
     }
 
@@ -1462,10 +1505,19 @@ impl App {
     }
 
     fn finish_subagents(&mut self, role: DisplayRole, text: &str) {
-        for &sub_idx in self.chat_index.values() {
-            self.chats[sub_idx].mark_finished(role.clone(), text);
-        }
+        self.finish_unresolved_subagents(role, text);
         self.chat_index.clear();
+    }
+
+    fn finish_unresolved_subagents(&mut self, role: DisplayRole, text: &str) {
+        self.chat_index.retain(|_, &mut sub_idx| {
+            if self.chats[sub_idx].is_finished() {
+                true
+            } else {
+                self.chats[sub_idx].mark_finished(role.clone(), text);
+                false
+            }
+        });
     }
 
     pub fn flush_all_chats(&mut self) {

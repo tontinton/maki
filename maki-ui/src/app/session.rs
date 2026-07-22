@@ -46,16 +46,18 @@ impl App {
 
         self.state.session.meta.queued_messages = self.queue.text_messages();
 
-        self.state.session.meta.subagents = self
-            .chats
-            .iter()
-            .skip(1)
-            .zip(self.chat_index.iter())
-            .map(|(chat, (tool_id, _))| StoredSubagent {
-                tool_use_id: tool_id.clone(),
-                name: chat.name.clone(),
-                prompt: None,
-                model: chat.model_id.clone(),
+        let mut subagents: Vec<_> = self.chat_index.iter().collect();
+        subagents.sort_by_key(|&(_, chat_index)| chat_index);
+        self.state.session.meta.subagents = subagents
+            .into_iter()
+            .map(|(tool_id, &chat_index)| {
+                let chat = &self.chats[chat_index];
+                StoredSubagent {
+                    tool_use_id: tool_id.clone(),
+                    name: chat.name.clone(),
+                    prompt: None,
+                    model: chat.model_id.clone(),
+                }
             })
             .collect();
     }

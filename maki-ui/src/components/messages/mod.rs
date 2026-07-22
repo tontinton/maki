@@ -24,7 +24,7 @@ use crate::splash::{ColorTransition, Splash};
 use crate::theme;
 use maki_config::{ToolOutputLines, UiConfig};
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -374,12 +374,17 @@ impl MessagesPanel {
     }
 
     pub fn fail_in_progress_with_message(&mut self, message: String) {
+        self.fail_in_progress_except(message, &HashSet::new());
+    }
+
+    pub fn fail_in_progress_except(&mut self, message: String, excluded: &HashSet<String>) {
         let ids: Vec<(String, Arc<str>)> = self
             .messages
             .iter()
             .filter_map(|m| {
                 if let DisplayRole::Tool(t) = &m.role
                     && t.status == ToolStatus::InProgress
+                    && !excluded.contains(&t.id)
                 {
                     Some((t.id.clone(), Arc::clone(&t.name)))
                 } else {

@@ -7,6 +7,7 @@ use maki_agent::{
     GrepFileEntry, GrepMatchGroup, SnapshotLine, SnapshotSpan, SpanStyle, ToolInput, ToolOutput,
 };
 use ratatui::backend::TestBackend;
+use std::collections::HashSet;
 use test_case::test_case;
 
 fn snap_line(text: &str) -> SnapshotLine {
@@ -258,6 +259,19 @@ fn unknown_tool_id_is_noop() {
         written_path: None,
     });
     assert!(panel.messages.is_empty());
+}
+
+#[test]
+fn fail_in_progress_except_preserves_excluded_tool() {
+    let mut panel = panel_with_tools(&[("agent", "task"), ("shell", "bash")]);
+    let excluded = HashSet::from(["shell".to_string()]);
+
+    panel.fail_in_progress_except("missing completion".into(), &excluded);
+
+    assert_eq!(panel.in_progress_count(), 1);
+    assert_eq!(msg_status(&panel, "agent"), ToolStatus::Error);
+    assert_eq!(msg_status(&panel, "shell"), ToolStatus::InProgress);
+    assert!(panel.messages[0].text.contains("missing completion"));
 }
 
 #[test]
