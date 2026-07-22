@@ -2406,25 +2406,35 @@ fn ctrl_t_noop_when_plan_not_ready() {
     assert!(!app.plan_form.is_visible());
 }
 
+fn install_override(
+    app: &mut App,
+    key: KeyCode,
+    modifiers: KeyModifiers,
+) -> maki_lua::test_support::RequestProbe {
+    app.keymap_reader = maki_lua::test_support::keymap_reader_with(vec![maki_lua::KeymapEntry {
+        key,
+        modifiers,
+        desc: "plugin override".into(),
+        plugin: Arc::from("test-plugin"),
+        id: 1,
+    }]);
+    let (handle, probe) = maki_lua::test_support::probed_event_handle();
+    app.lua_event_handle = Some(handle);
+    probe
+}
+
+const OVERRIDE_DISPATCHED: &str = "override callback must be dispatched";
+const OVERRIDE_NOT_DISPATCHED: &str = "override callback must not be dispatched";
+
 #[test]
 fn override_shadows_builtin_ctrl_when_no_overlay_open() {
-    let entry = maki_lua::KeymapEntry {
-        key: kb::HELP.code,
-        modifiers: kb::HELP.modifiers,
-        desc: "plugin help override".into(),
-        plugin: std::sync::Arc::from("test-plugin"),
-        id: 1,
-    };
-    let reader = maki_lua::test_support::keymap_reader_with(vec![entry]);
     let mut app = test_app();
-    let (handle, _probe) = maki_lua::test_support::probed_event_handle();
-    app.lua_event_handle = Some(handle);
-    app.keymap_reader = reader;
-    assert!(!app.help_modal.is_open());
+    let probe = install_override(&mut app, kb::HELP.code, kb::HELP.modifiers);
 
     let actions = app.update(Msg::Key(kb::HELP.to_key_event()));
 
     assert!(actions.is_empty());
+    assert!(probe.try_recv().is_some(), "{OVERRIDE_DISPATCHED}");
     assert!(
         !app.help_modal.is_open(),
         "override must consume the key before the built-in HELP handler runs"
@@ -2433,23 +2443,14 @@ fn override_shadows_builtin_ctrl_when_no_overlay_open() {
 
 #[test]
 fn override_shadows_quit_builtin() {
-    let entry = maki_lua::KeymapEntry {
-        key: kb::QUIT.code,
-        modifiers: kb::QUIT.modifiers,
-        desc: "plugin quit override".into(),
-        plugin: std::sync::Arc::from("test-plugin"),
-        id: 3,
-    };
-    let reader = maki_lua::test_support::keymap_reader_with(vec![entry]);
     let mut app = test_app();
-    let (handle, _probe) = maki_lua::test_support::probed_event_handle();
-    app.lua_event_handle = Some(handle);
     app.status = Status::Idle;
-    app.keymap_reader = reader;
+    let probe = install_override(&mut app, kb::QUIT.code, kb::QUIT.modifiers);
 
     let actions = app.update(Msg::Key(kb::QUIT.to_key_event()));
 
     assert!(actions.is_empty());
+    assert!(probe.try_recv().is_some(), "{OVERRIDE_DISPATCHED}");
     assert_eq!(
         app.exit_request,
         ExitRequest::None,
@@ -2459,23 +2460,14 @@ fn override_shadows_quit_builtin() {
 
 #[test]
 fn override_shadows_tab_mode_toggle() {
-    let entry = maki_lua::KeymapEntry {
-        key: KeyCode::Tab,
-        modifiers: KeyModifiers::NONE,
-        desc: "plugin tab override".into(),
-        plugin: std::sync::Arc::from("test-plugin"),
-        id: 4,
-    };
-    let reader = maki_lua::test_support::keymap_reader_with(vec![entry]);
     let mut app = test_app();
-    let (handle, _probe) = maki_lua::test_support::probed_event_handle();
-    app.lua_event_handle = Some(handle);
     let initial_mode = app.state.mode;
-    app.keymap_reader = reader;
+    let probe = install_override(&mut app, KeyCode::Tab, KeyModifiers::NONE);
 
     let actions = app.update(Msg::Key(key(KeyCode::Tab)));
 
     assert!(actions.is_empty());
+    assert!(probe.try_recv().is_some(), "{OVERRIDE_DISPATCHED}");
     assert_eq!(
         app.state.mode, initial_mode,
         "override must consume Tab before the built-in mode toggle runs"
@@ -2484,22 +2476,13 @@ fn override_shadows_tab_mode_toggle() {
 
 #[test]
 fn override_shadows_esc_builtin() {
-    let entry = maki_lua::KeymapEntry {
-        key: KeyCode::Esc,
-        modifiers: KeyModifiers::NONE,
-        desc: "plugin esc override".into(),
-        plugin: std::sync::Arc::from("test-plugin"),
-        id: 5,
-    };
-    let reader = maki_lua::test_support::keymap_reader_with(vec![entry]);
     let mut app = test_app();
-    let (handle, _probe) = maki_lua::test_support::probed_event_handle();
-    app.lua_event_handle = Some(handle);
-    app.keymap_reader = reader;
+    let probe = install_override(&mut app, KeyCode::Esc, KeyModifiers::NONE);
 
     let actions = app.update(Msg::Key(key(KeyCode::Esc)));
 
     assert!(actions.is_empty());
+    assert!(probe.try_recv().is_some(), "{OVERRIDE_DISPATCHED}");
     assert!(
         app.last_esc.is_none(),
         "override must consume Esc before the built-in esc handler runs"
@@ -2509,16 +2492,8 @@ fn override_shadows_esc_builtin() {
 #[cfg(unix)]
 #[test]
 fn override_does_not_shadow_suspend() {
-    let entry = maki_lua::KeymapEntry {
-        key: kb::SUSPEND.code,
-        modifiers: kb::SUSPEND.modifiers,
-        desc: "plugin suspend override".into(),
-        plugin: std::sync::Arc::from("test-plugin"),
-        id: 6,
-    };
-    let reader = maki_lua::test_support::keymap_reader_with(vec![entry]);
     let mut app = test_app();
-    app.keymap_reader = reader;
+    let probe = install_override(&mut app, kb::SUSPEND.code, kb::SUSPEND.modifiers);
 
     let actions = app.update(Msg::Key(kb::SUSPEND.to_key_event()));
 
@@ -2526,12 +2501,12 @@ fn override_does_not_shadow_suspend() {
         actions.iter().any(|a| matches!(a, Action::Suspend)),
         "suspend is non-remappable: override must not shadow Ctrl+Z"
     );
+    assert!(probe.try_recv().is_none(), "{OVERRIDE_NOT_DISPATCHED}");
 }
 
 #[test]
 fn builtin_runs_when_no_override() {
     let mut app = test_app();
-    assert!(!app.help_modal.is_open());
 
     app.update(Msg::Key(kb::HELP.to_key_event()));
 
@@ -2539,41 +2514,31 @@ fn builtin_runs_when_no_override() {
 }
 
 #[test]
-fn overlay_wins_over_override_when_plan_form_open() {
-    let entry = maki_lua::KeymapEntry {
-        key: kb::PLAN_TOGGLE.code,
-        modifiers: kb::PLAN_TOGGLE.modifiers,
-        desc: "plugin plan override".into(),
-        plugin: std::sync::Arc::from("test-plugin"),
-        id: 2,
-    };
-    let reader = maki_lua::test_support::keymap_reader_with(vec![entry]);
+fn plan_toggle_beats_override_when_open_and_after_dismiss() {
     let mut app = plan_app();
-    app.keymap_reader = reader;
+    let probe = install_override(&mut app, kb::PLAN_TOGGLE.code, kb::PLAN_TOGGLE.modifiers);
     assert!(app.plan_form.is_visible());
-    assert!(app.lua_event_handle.is_none());
 
     app.update(Msg::Key(kb::PLAN_TOGGLE.to_key_event()));
+    assert!(
+        !app.plan_form.is_visible(),
+        "open plan form must consume Ctrl+T before the override"
+    );
 
-    assert!(!app.plan_form.is_visible());
+    app.update(Msg::Key(kb::PLAN_TOGGLE.to_key_event()));
+    assert!(
+        app.plan_form.is_visible(),
+        "Ctrl+T must reopen the dismissed plan form despite the override"
+    );
+    assert!(probe.try_recv().is_none(), "{OVERRIDE_NOT_DISPATCHED}");
 }
 
 #[test]
 fn streaming_cancel_wins_over_quit_override() {
-    let entry = maki_lua::KeymapEntry {
-        key: kb::QUIT.code,
-        modifiers: kb::QUIT.modifiers,
-        desc: "plugin quit override".into(),
-        plugin: std::sync::Arc::from("test-plugin"),
-        id: 7,
-    };
-    let reader = maki_lua::test_support::keymap_reader_with(vec![entry]);
     let mut app = test_app();
-    let (handle, _probe) = maki_lua::test_support::probed_event_handle();
-    app.lua_event_handle = Some(handle);
     app.status = Status::Streaming;
     app.run_id = 1;
-    app.keymap_reader = reader;
+    let probe = install_override(&mut app, kb::QUIT.code, kb::QUIT.modifiers);
 
     let actions = app.update(Msg::Key(kb::QUIT.to_key_event()));
 
@@ -2583,22 +2548,14 @@ fn streaming_cancel_wins_over_quit_override() {
     );
     assert_eq!(app.status, Status::Idle);
     assert_eq!(app.exit_request, ExitRequest::None);
+    assert!(probe.try_recv().is_none(), "{OVERRIDE_NOT_DISPATCHED}");
 }
 
 #[test]
 fn dead_host_override_falls_back_to_builtin() {
-    let entry = maki_lua::KeymapEntry {
-        key: kb::HELP.code,
-        modifiers: kb::HELP.modifiers,
-        desc: "plugin help override".into(),
-        plugin: std::sync::Arc::from("test-plugin"),
-        id: 8,
-    };
-    let reader = maki_lua::test_support::keymap_reader_with(vec![entry]);
     let mut app = test_app();
+    let _probe = install_override(&mut app, kb::HELP.code, kb::HELP.modifiers);
     app.lua_event_handle = Some(maki_lua::EventHandle::disconnected_for_test());
-    app.keymap_reader = reader;
-    assert!(!app.help_modal.is_open());
 
     app.update(Msg::Key(kb::HELP.to_key_event()));
 
@@ -2610,21 +2567,12 @@ fn dead_host_override_falls_back_to_builtin() {
 
 #[test]
 fn streaming_cancel_wins_over_esc_override() {
-    let entry = maki_lua::KeymapEntry {
-        key: KeyCode::Esc,
-        modifiers: KeyModifiers::NONE,
-        desc: "plugin esc override".into(),
-        plugin: std::sync::Arc::from("test-plugin"),
-        id: 9,
-    };
-    let reader = maki_lua::test_support::keymap_reader_with(vec![entry]);
     let mut app = test_app();
-    let (handle, _probe) = maki_lua::test_support::probed_event_handle();
-    app.lua_event_handle = Some(handle);
     app.status = Status::Streaming;
     app.run_id = 1;
+    app.status_bar.flash_duration = Duration::from_secs(3600);
     app.last_esc = Some(Instant::now());
-    app.keymap_reader = reader;
+    let probe = install_override(&mut app, KeyCode::Esc, KeyModifiers::NONE);
 
     let actions = app.update(Msg::Key(key(KeyCode::Esc)));
 
@@ -2633,6 +2581,7 @@ fn streaming_cancel_wins_over_esc_override() {
         "built-in cancel must win while streaming even when Esc is overridden"
     );
     assert_eq!(app.status, Status::Idle);
+    assert!(probe.try_recv().is_none(), "{OVERRIDE_NOT_DISPATCHED}");
 }
 
 #[test]
