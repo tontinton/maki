@@ -16,12 +16,12 @@ Maki ships with 20 built-in tools. This is the full reference.
 Execute a bash command.
 Commands run in <cwd> by default.
 
-| Parameter | Type | Required | Default | Description |
-|-----------|------|----------|---------|-------------|
-| `command` | string | yes |  | The bash command to execute |
-| `description` | string | no |  | Short description (3-5 words) of what the command does |
-| `timeout` | integer | no | 120 | Timeout in seconds |
-| `workdir` | string | no | cwd | Working directory |
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `command` | string | yes |  |
+| `description` | string | no |  |
+| `timeout` | integer | no |  |
+| `workdir` | string | no |  |
 
 ### `read` *(lua plugin)*
 
@@ -29,9 +29,9 @@ Read a file or directory. Returns contents with line numbers (1-indexed).
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `limit` | integer | no | Max number of lines to read. Omitting the limit reads up to 2000 lines. |
-| `offset` | integer | no | Line number to start from (1-indexed) |
-| `path` | string | yes | Absolute path to the file or directory |
+| `limit` | integer | no |  |
+| `offset` | integer | no |  |
+| `path` | string | yes |  |
 
 ### `write` *(lua plugin)*
 
@@ -39,19 +39,19 @@ Write content to a file, replacing existing content.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `content` | string | yes | The complete file content to write |
-| `path` | string | yes | Absolute path to the file |
+| `content` | string | yes |  |
+| `path` | string | yes |  |
 
 ### `edit` *(lua plugin)*
 
 Replace an exact string match in a file.
 
-| Parameter | Type | Required | Default | Description |
-|-----------|------|----------|---------|-------------|
-| `new_string` | string | yes |  | Replacement string |
-| `old_string` | string | yes |  | Exact string to find (must match uniquely unless replace_all is true) |
-| `path` | string | yes |  | Absolute path to the file |
-| `replace_all` | boolean | no | false | Replace all occurrences |
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `new_string` | string | yes |  |
+| `old_string` | string | yes |  |
+| `path` | string | yes |  |
+| `replace_all` | boolean | no |  |
 
 ### `multiedit` *(lua plugin)*
 
@@ -60,8 +60,8 @@ Prefer this over edit when making multiple changes to the same file.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `edits` | array | yes | Array of edit operations to apply sequentially |
-| `path` | string | yes | Absolute path to the file |
+| `edits` | array | yes |  |
+| `path` | string | yes |  |
 
 ### `edit_lines` *(lua plugin, opt-in)*
 
@@ -69,10 +69,10 @@ Edit lines by number. Replaces lines from `start` to `end` (inclusive) with `new
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `end` | integer | yes | Last line, inclusive |
-| `new_string` | string | yes | Replacement text |
-| `path` | string | yes | Absolute path to the file |
-| `start` | integer | yes | First line (1-indexed) |
+| `end` | integer | yes |  |
+| `new_string` | string | yes |  |
+| `path` | string | yes |  |
+| `start` | integer | yes |  |
 
 ### `insert_lines` *(lua plugin, opt-in)*
 
@@ -80,31 +80,31 @@ Insert lines before a given line number. Lines at `line` and below shift down. E
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `line` | integer | yes | Line number to insert before (1-indexed). Use 1 to insert at the top. |
-| `new_string` | string | yes | Text to insert |
-| `path` | string | yes | Absolute path to the file |
+| `line` | integer | yes |  |
+| `new_string` | string | yes |  |
+| `path` | string | yes |  |
 
 ### `glob` *(lua plugin)*
 
 Find files by glob pattern.
 
-| Parameter | Type | Required | Default | Description |
-|-----------|------|----------|---------|-------------|
-| `path` | string | no | cwd | Directory to search in |
-| `pattern` | string | yes |  | Glob pattern (e.g. **/*.rs, src/**/*.ts) |
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `path` | string | no |  |
+| `pattern` | string | yes |  |
 
 ### `grep` *(lua plugin)*
 
 Search file contents using regex.
 
-| Parameter | Type | Required | Default | Description |
-|-----------|------|----------|---------|-------------|
-| `context_after` | integer | no |  | Context lines after match |
-| `context_before` | integer | no |  | Context lines before match |
-| `include` | string | no |  | File glob filter (e.g. *.c) |
-| `limit` | integer | no |  | Max match groups to return |
-| `path` | string | no | cwd | Directory to search in |
-| `pattern` | string | yes |  | Regex pattern |
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `context_after` | integer | no |  |
+| `context_before` | integer | no |  |
+| `include` | string | no |  |
+| `limit` | integer | no |  |
+| `path` | string | no |  |
+| `pattern` | string | yes |  |
 
 ### `index` *(lua plugin)*
 
@@ -112,7 +112,7 @@ Return a compact overview of a source file: imports, type definitions, function 
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `path` | string | yes | Absolute path to the file |
+| `path` | string | yes |  |
 
 ### `view_image` *(lua plugin)*
 
@@ -120,7 +120,7 @@ View an image file (png, jpeg, gif, webp) so you can actually see it; it is retu
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `path` | string | yes | Path to the image file |
+| `path` | string | yes |  |
 
 ## Execution & Control
 
