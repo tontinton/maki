@@ -188,8 +188,8 @@ impl<'h> Agent<'h> {
         self.rollback_len = self.history.len();
         let msg = Message::user_with_images(input.message.clone(), input.images);
         self.history.push(msg);
-        self.context_size =
-            estimate_message_tokens(self.history.as_slice()) + estimate_tool_tokens(&self.tools);
+        self.context_size = estimate_message_tokens(self.history.as_slice())
+            .saturating_add(estimate_tool_tokens(&self.tools));
         self.mode = input.mode;
         self.workflow = input.workflow;
         self.opts = RequestOptions {
@@ -303,8 +303,9 @@ impl<'h> Agent<'h> {
         if has_tools {
             let history_len_before = self.history.len();
             self.process_tool_calls(response).await?;
-            self.context_size +=
-                estimate_message_tokens(&self.history.as_slice()[history_len_before..]);
+            self.context_size = self.context_size.saturating_add(estimate_message_tokens(
+                &self.history.as_slice()[history_len_before..],
+            ));
         } else {
             let has_text = response.message.first_text_content().is_some();
 
@@ -475,8 +476,8 @@ impl<'h> Agent<'h> {
         self.event_tx.send(AgentEvent::CompactionDone)?;
         self.history
             .push(Message::synthetic(CONTINUE_AFTER_COMPACT.into()));
-        self.context_size =
-            estimate_message_tokens(self.history.as_slice()) + estimate_tool_tokens(&self.tools);
+        self.context_size = estimate_message_tokens(self.history.as_slice())
+            .saturating_add(estimate_tool_tokens(&self.tools));
         Ok(())
     }
 
@@ -512,8 +513,13 @@ impl<'h> Agent<'h> {
 }
 
 #[must_use]
-fn u32_from_usize(value: usize) -> u32 {
-    u32::try_from(value).unwrap_or(u32::MAX)
+fn u32_from_usize_saturating(value: usize) -> u32 {
+    if let Ok(n) = u32::try_from(value) {
+        n
+    } else {
+        warn!(value, "token count exceeded u32 range; saturating");
+        u32::MAX
+    }
 }
 
 #[must_use]
@@ -536,12 +542,12 @@ pub fn estimate_message_tokens(messages: &[Message]) -> u32 {
             ContentBlock::Image { .. } => IMAGE_TOKEN_ESTIMATE,
         })
         .sum();
-    u32_from_usize(total)
+    u32_from_usize_saturating(total)
 }
 
 #[must_use]
 pub fn estimate_tool_tokens(tools: &Value) -> u32 {
-    u32_from_usize(count_json(tools))
+    u32_from_usize_saturating(count_json(tools))
 }
 
 #[cfg(test)]
@@ -598,7 +604,7 @@ mod tests {
         }];
         let tokens = estimate_message_tokens(&messages);
         assert!(
-            tokens >= u32_from_usize(IMAGE_TOKEN_ESTIMATE),
+            tokens >= u32_from_usize_saturating(IMAGE_TOKEN_ESTIMATE),
             "image blocks should add {IMAGE_TOKEN_ESTIMATE} tokens"
         );
     }
@@ -628,6 +634,11 @@ mod tests {
     #[test]
     fn estimate_tool_tokens_empty_array_costs_one() {
         assert_eq!(estimate_tool_tokens(&serde_json::json!([])), 1);
+    }
+
+    #[test]
+    fn u32_from_usize_saturating_overflows_to_max() {
+        assert_eq!(u32_from_usize_saturating(usize::MAX), u32::MAX);
     }
 
     struct MockInterruptSource {
