@@ -18,6 +18,7 @@ const PAD: &str = "";
 const V4_MARKER: &str = "deepseek-v4";
 
 static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
+    slug: "deepseek",
     api_key_env: "DEEPSEEK_API_KEY",
     base_url: "https://api.deepseek.com",
     max_tokens_field: "max_tokens",

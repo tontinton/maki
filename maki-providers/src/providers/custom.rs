@@ -19,6 +19,9 @@ use crate::types::ThinkingConfig;
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
 
 static CUSTOM_OPENAI_CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
+    // Custom providers resolve their own base URL (including any override) from
+    // config, so the compat-layer fallback slug is unused here.
+    slug: "",
     api_key_env: "",
     base_url: "",
     max_tokens_field: "max_tokens",

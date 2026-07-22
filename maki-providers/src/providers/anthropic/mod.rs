@@ -24,10 +24,11 @@ use crate::{
 use super::KeyPool;
 
 const API_VERSION: &str = "2023-06-01";
-const MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
-const MODELS_URL: &str = "https://api.anthropic.com/v1/models?limit=1000";
+const API_ORIGIN: &str = "https://api.anthropic.com";
+const MESSAGES_PATH: &str = "/v1/messages";
+const MODELS_PATH: &str = "/v1/models?limit=1000";
+const USAGE_PATH: &str = "/api/oauth/usage";
 const FAST_MODE_BETA: &str = "fast-mode-2026-02-01";
-const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const OAUTH_BETA: &str = "oauth-2025-04-20";
 const MONEY_EXPONENT: u32 = 2;
 const LABEL_SESSION: &str = "Current session";
@@ -39,7 +40,7 @@ inventory::submit!(maki_config::providers::BuiltInProvider {
     slug: "anthropic",
     display_name: "Anthropic",
     protocol: maki_config::providers::Protocol::Anthropic,
-    default_base_url: "https://api.anthropic.com/v1/messages",
+    default_base_url: API_ORIGIN,
     default_api_key_env: ENV_VAR,
     default_model: "anthropic/claude-sonnet-4-6",
     plans: None,
@@ -205,21 +206,34 @@ impl From<OauthUsage> for ProviderUsage {
     }
 }
 
+/// Reduce a `base_url` to a bare origin, tolerating a trailing `/v1/messages`
+/// (which Anthropic base URLs historically included).
+fn origin(base_url: &str) -> &str {
+    let trimmed = base_url.trim_end_matches('/');
+    trimmed.strip_suffix(MESSAGES_PATH).unwrap_or(trimmed)
+}
+
+/// True when `base_url` targets the real Anthropic API, directly or via the
+/// configured base-URL override (so quota stays visible behind a proxy).
+fn first_party(base_url: &str) -> bool {
+    let target = origin(base_url);
+    target.contains("api.anthropic.com")
+        || maki_config::providers::base_url_override("anthropic")
+            .is_some_and(|configured| origin(&configured) == target)
+}
+
 /// Subscription quota only exists for OAuth tokens against the real Anthropic
 /// API; API keys and anthropic-protocol third-party endpoints have none.
 fn usage_eligible(auth: &super::ResolvedAuth) -> bool {
     auth.headers
         .iter()
         .any(|(k, _)| k.eq_ignore_ascii_case("authorization"))
-        && auth
-            .base_url
-            .as_deref()
-            .is_none_or(|u| u.contains("api.anthropic.com"))
+        && auth.base_url.as_deref().is_none_or(first_party)
 }
 
 fn resolve_auth_from_key(key: &str) -> super::ResolvedAuth {
     super::ResolvedAuth {
-        base_url: Some("https://api.anthropic.com/v1/messages".into()),
+        base_url: maki_config::providers::resolve_base_url("anthropic", None),
         headers: vec![("x-api-key".into(), key.to_string())],
     }
 }
@@ -264,9 +278,10 @@ impl Anthropic {
         self
     }
 
-    fn build_request(&self, method: &str, url: Option<&str>) -> isahc::http::request::Builder {
+    fn build_request(&self, method: &str, path: &str) -> isahc::http::request::Builder {
         let auth = self.auth.lock().unwrap();
-        let url = url.unwrap_or_else(|| auth.base_url.as_deref().unwrap_or(MESSAGES_URL));
+        let base = auth.base_url.as_deref().unwrap_or(API_ORIGIN);
+        let url = format!("{}{path}", origin(base));
         auth.configure_request(
             Request::builder()
                 .method(method)
@@ -285,7 +300,7 @@ impl Anthropic {
     ) -> Result<StreamResponse, AgentError> {
         let json_body = serde_json::to_vec(body)?;
         let mut builder = self
-            .build_request("POST", None)
+            .build_request("POST", MESSAGES_PATH)
             .header("content-type", "application/json");
         let mut betas = Vec::new();
         if fast {
@@ -313,12 +328,12 @@ impl Anthropic {
         let mut after_id: Option<String> = None;
 
         loop {
-            let mut url = MODELS_URL.to_string();
+            let mut path = MODELS_PATH.to_string();
             if let Some(cursor) = &after_id {
-                url.push_str(&format!("&after_id={cursor}"));
+                path.push_str(&format!("&after_id={cursor}"));
             }
 
-            let request = self.build_request("GET", Some(&url)).body(())?;
+            let request = self.build_request("GET", &path).body(())?;
             let mut response = self.client.send_async(request).await?;
             if response.status().as_u16() != 200 {
                 return Err(AgentError::from_response(response).await);
@@ -427,7 +442,7 @@ impl Provider for Anthropic {
                 return Ok(None);
             }
             let request = self
-                .build_request("GET", Some(USAGE_URL))
+                .build_request("GET", USAGE_PATH)
                 .header("anthropic-beta", OAUTH_BETA)
                 .body(())?;
             let mut response = self.client.send_async(request).await?;
@@ -580,6 +595,7 @@ mod tests {
 
     #[test_case("Authorization", None, true ; "bearer_default_url_eligible")]
     #[test_case("authorization", Some("https://api.anthropic.com/v1/messages"), true ; "bearer_anthropic_url_eligible")]
+    #[test_case("authorization", Some("https://api.anthropic.com"), true ; "bearer_anthropic_origin_eligible")]
     #[test_case("x-api-key", None, false ; "api_key_not_eligible")]
     #[test_case("Authorization", Some("https://proxy.example.com/v1/messages"), false ; "foreign_base_url_not_eligible")]
     fn usage_eligibility(header: &str, base_url: Option<&str>, expected: bool) {
@@ -588,6 +604,14 @@ mod tests {
             headers: vec![(header.into(), "token".into())],
         };
         assert_eq!(usage_eligible(&auth), expected);
+    }
+
+    #[test_case("https://api.anthropic.com/v1/messages", "https://api.anthropic.com" ; "strips_messages_path")]
+    #[test_case("https://proxy.example.com/v1/messages/", "https://proxy.example.com" ; "strips_messages_path_with_trailing_slash")]
+    #[test_case("https://api.anthropic.com", "https://api.anthropic.com" ; "origin_unchanged")]
+    #[test_case("http://localhost:8080/", "http://localhost:8080" ; "trims_trailing_slash")]
+    fn origin_normalizes(input: &str, expected: &str) {
+        assert_eq!(origin(input), expected);
     }
 
     fn mock_response(data: &'static [u8]) -> isahc::Response<isahc::AsyncBody> {

@@ -18,6 +18,7 @@ use crate::{
 use super::{KeyPool, ResolvedAuth};
 
 static CONFIG_STANDARD: OpenAiCompatConfig = OpenAiCompatConfig {
+    slug: "zai",
     api_key_env: "ZHIPU_API_KEY",
     base_url: "https://api.z.ai/api/paas/v4",
     max_tokens_field: "max_tokens",

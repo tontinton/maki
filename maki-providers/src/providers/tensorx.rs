@@ -12,6 +12,7 @@ use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use super::{KeyPool, ResolvedAuth};
 
 static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
+    slug: "tensorx",
     api_key_env: "TENSORX_API_KEY",
     base_url: "https://api.tensorx.ai/v1",
     max_tokens_field: "max_tokens",
