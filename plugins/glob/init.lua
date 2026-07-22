@@ -17,11 +17,7 @@ end
 maki.api.register_tool({
   name = "glob",
   kind = "search",
-  description = [[Find files by glob pattern.
-
-- Respects .gitignore.
-- Returns absolute paths sorted by modification time (newest first).
-- Prefer speculative parallel searches over sequential rounds of glob+grep.]],
+  description = [[Find files by glob pattern. Respects .gitignore and returns absolute paths sorted by modification time (newest first). Prefer parallel searches.]],
 
   schema = {
     type = "object",

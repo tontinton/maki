@@ -82,14 +82,14 @@ end
 
 local description = [[Execute Python code in a sandboxed interpreter with tools as callable functions.
 
-Use for chained/dependent tool calls and filtering/processing results, e.g. filtering web tool output. **DRAMATICALLY** faster than sequential tool calls!
+Use for chained/dependent tool calls and filtering/processing results. Much faster than sequential tool calls!
 
-- All tools are async and return strings: `result = await read(path='file.txt')`. Parse output yourself.
-- Use `asyncio.gather()` for concurrency within one execution.
+- Tools are async and return strings: `result = await read(path='file.txt')`. Parse output yourself.
+- Use `asyncio.gather()` for concurrency.
 - Available libs: re, asyncio, sys, os, json. No other imports, no classes, no filesystem/network access.
-- Fresh sandbox each run: no state persists between executions.
+- Fresh sandbox each run: no state persists.
 - 30 second timeout (configurable via `timeout` parameter).
-- Skip it when a single tool call needs no transformation.
+- Skip when a single tool call needs no transformation.
 - NOT a thinking scratchpad. Reason in your response text.
 ]]
 
@@ -100,7 +100,7 @@ local schema = {
   properties = {
     code = {
       type = "string",
-      description = "Python code to execute. Tools are async functions that return strings (not objects). You MUST await every call: `result = await read(path='/file')`. Use `await asyncio.gather(...)` for concurrency.",
+      description = "Python code to execute. Tools are async functions that return strings. You MUST await every call: `result = await read(path='/file')`. Use `await asyncio.gather(...)` for concurrency.",
     },
     timeout = {
       type = "integer",

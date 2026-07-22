@@ -23,13 +23,9 @@ end
 maki.api.register_tool({
   name = "websearch",
   kind = "fetch",
-  description = "Search the web for real-time information using Exa AI.\n\n"
-    .. "Today's date is "
+  description = "Search the web using Exa AI (today is "
     .. os.date("%Y-%m-%d")
-    .. ".\n\n"
-    .. "- Use for current events, documentation, APIs, or anything not in local files.\n"
-    .. "- Prefer specific, targeted queries over broad ones.\n"
-    .. "- Results include page titles, URLs, and content snippets.",
+    .. "). Use for current events, docs, APIs, or anything not in local files. Prefer targeted queries.",
 
   schema = {
     type = "object",

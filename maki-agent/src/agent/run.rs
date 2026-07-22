@@ -461,7 +461,9 @@ impl<'h> Agent<'h> {
             let Some(name) = def.get("name").and_then(|v| v.as_str()) else {
                 continue;
             };
-            if let Some(entry) = self.registry.get(name) && entry.defer_loading {
+            if let Some(entry) = self.registry.get(name)
+                && entry.defer_loading
+            {
                 self.active_tools.names.insert(name.to_owned());
             }
         }

@@ -24,18 +24,7 @@ local BODY_INDENT_COLS = 4
 local MIN_MD_WIDTH = 20
 local DEFAULT_OUTPUT_LINES = 5
 
-local description = [[Launch an autonomous subagent to perform tasks independently. Best combined with batch.
-
-Subagent types (set via `subagent_type`):
-- `research` (default): Read-only tools. For codebase exploration or gathering context.
-- `general`: Full tool access. For delegating implementation work.
-
-Notes:
-1. Launch multiple tasks concurrently when possible.
-2. The agent's result is not visible to the user. Summarize it in your response.
-3. Each invocation starts fresh - inline any needed context into the prompt.
-4. Tell it to return concise summaries with file:line refs, not full file contents.
-]]
+local description = [[Launch an autonomous subagent for independent tasks. Use `subagent_type` "research" for read-only exploration or "general" for implementation work. Launch multiple tasks concurrently when possible; inline needed context and ask for concise, file:line summaries.]]
 
 local schema = {
   type = "object",
@@ -56,10 +45,10 @@ local schema = {
     },
     model_tier = {
       type = "string",
-      description = 'Model tier (optional, omit to use current model, capped at current tier):\n- "strong" (e.g. Opus): Deep reasoning, complex architecture, subtle bugs, most critical sections. ~5x cost of medium.\n- "medium" (e.g. Sonnet): Balanced. Refactors, features, multi-file changes.\n- "weak" (e.g. Haiku): Fast/cheap. Search, summarize, boilerplate, simple edits.',
+      description = 'Optional capped model tier: "weak", "medium", or "strong".',
     },
     output_schema = {
-      description = "JSON Schema (object) the subagent's final result must match. When set, the result is returned as a validated JSON string.",
+      description = "JSON Schema the subagent's final result must match. Returned as a validated JSON string.",
     },
   },
 }

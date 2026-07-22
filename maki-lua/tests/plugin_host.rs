@@ -2,10 +2,16 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use maki_agent::tools::{ToolRegistry, ToolSource, timeout_annotation};
+use maki_agent::template::env_vars;
+use maki_agent::tools::{
+    ActiveTools, DescriptionContext, ToolAudience, ToolFilter, ToolRegistry, ToolSource,
+    timeout_annotation,
+};
 use maki_config::{AlwaysThinking, PluginsConfig, ToolOutputLines};
 use maki_lua::{PluginError, PluginHost, WARM_TOOL_CAP};
 use std::path::Path;
+
+const TOOL_DEFINITIONS_BYTE_BUDGET: usize = 25_000;
 
 fn fresh_registry() -> Arc<ToolRegistry> {
     Arc::new(ToolRegistry::new())
@@ -17,6 +23,28 @@ fn builtins_host() -> (Arc<ToolRegistry>, PluginHost) {
     host.load_builtins(&PluginsConfig::from_plugins(HashMap::new()))
         .unwrap();
     (reg, host)
+}
+
+#[test]
+fn builtin_main_tool_definitions_stay_within_prompt_budget() {
+    let (registry, _host) = builtins_host();
+    let definitions = registry.definitions_active(
+        &env_vars(),
+        &DescriptionContext {
+            filter: &ToolFilter::All,
+            audience: ToolAudience::MAIN,
+            workflow: false,
+        },
+        true,
+        &ActiveTools::default(),
+    );
+    let bytes = serde_json::to_vec_pretty(&definitions).unwrap().len() + 1;
+
+    assert!(registry.has("task"), "required tool disappeared: task");
+    assert!(
+        bytes <= TOOL_DEFINITIONS_BYTE_BUDGET,
+        "builtin main tool definitions use {bytes} bytes; budget is {TOOL_DEFINITIONS_BYTE_BUDGET}"
+    );
 }
 
 fn exec_tool(reg: &ToolRegistry, name: &str, input: serde_json::Value) -> Result<String, String> {
