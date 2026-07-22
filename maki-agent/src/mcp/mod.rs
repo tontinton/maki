@@ -507,6 +507,20 @@ struct StartResult {
     prompt_infos: Vec<protocol::PromptInfo>,
 }
 
+async fn discover_prompts(transport: &dyn McpTransport) -> Vec<protocol::PromptInfo> {
+    match transport::list_prompts(transport).await {
+        Ok(prompts) => prompts,
+        Err(error) => {
+            warn!(
+                server = %transport.server_name(),
+                error = %error,
+                "MCP prompt discovery failed, continuing without prompts"
+            );
+            Vec::new()
+        }
+    }
+}
+
 async fn start_server(config: &ServerConfig) -> Result<StartResult, McpError> {
     let transport: Arc<dyn McpTransport> = match &config.transport {
         Transport::Stdio {
@@ -530,7 +544,7 @@ async fn start_server(config: &ServerConfig) -> Result<StartResult, McpError> {
     };
     transport::initialize(transport.as_ref()).await?;
     let tool_infos = transport::list_tools(transport.as_ref()).await?;
-    let prompt_infos = transport::list_prompts(transport.as_ref()).await?;
+    let prompt_infos = discover_prompts(transport.as_ref()).await;
     info!(
         server = config.name,
         tool_count = tool_infos.len(),
@@ -799,6 +813,11 @@ mod tests {
                     let _ = self.call_entered.try_send(());
                     let _g = self.call_gate.lock().await;
                     Ok(json!({ "content": [{ "type": "text", "text": "ok" }] }))
+                } else if method == "prompts/list" {
+                    Err(McpError::Timeout {
+                        server: self.name.to_string(),
+                        timeout_ms: DEFAULT_TIMEOUT_MS,
+                    })
                 } else {
                     Ok(Value::Null)
                 }
@@ -821,6 +840,14 @@ mod tests {
         fn transport_kind(&self) -> &'static str {
             "fake"
         }
+    }
+
+    #[test]
+    fn prompt_discovery_failure_is_non_fatal() {
+        smol::block_on(async {
+            let transport = FakeTransport::new();
+            assert!(discover_prompts(transport.as_ref()).await.is_empty());
+        });
     }
 
     fn fake_entry(name: &str, transport: Arc<dyn McpTransport>) -> ServerEntry {
