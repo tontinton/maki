@@ -8,7 +8,7 @@ use maki_agent::permissions::PermissionManager;
 use maki_agent::template;
 use maki_agent::template::Vars;
 use maki_agent::tools::{
-    DescriptionContext, FileReadTracker, ToolAudience, ToolFilter, ToolRegistry,
+    ActiveTools, DescriptionContext, FileReadTracker, ToolAudience, ToolFilter, ToolRegistry,
 };
 use maki_agent::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentParams, AgentRunParams, CancelMap,
@@ -47,6 +47,7 @@ pub(super) struct AgentLoop {
     timeouts: maki_providers::Timeouts,
     lua_handle: Option<EventHandle>,
     subagent_cancels: Arc<CancelMap<String>>,
+    tool_filter: ToolFilter,
 }
 
 impl AgentLoop {
@@ -92,6 +93,7 @@ impl AgentLoop {
             timeouts,
             lua_handle,
             subagent_cancels,
+            tool_filter: ToolFilter::default(),
         }
     }
 
@@ -144,7 +146,8 @@ impl AgentLoop {
         self.publish_btw_system(&maki_agent::prompt::ResolvedSlots::default());
 
         let slot = self.model_slot.load();
-        self.tools = self.build_tools(&slot.model, false);
+        self.tool_filter = ToolFilter::from_config(&self.config, &slot.model, &[]);
+        self.tools = self.build_tools(&slot.model, false, &self.tool_filter);
         if let Some(ref mcp) = self.mcp_handle {
             mcp.extend_tools(&mut self.tools);
             spawn_oauth_for_needs_auth(mcp);
@@ -243,6 +246,7 @@ impl AgentLoop {
                 system,
                 event_tx,
                 tools: self.tools.clone(),
+                tool_filter: self.tool_filter.clone(),
             },
         )
         .with_loaded_instructions(self.instructions.loaded.clone())
@@ -264,22 +268,27 @@ impl AgentLoop {
     }
 
     fn rebuild_tools(&mut self, model: &Model, workflow: bool) {
-        let mut tools = self.build_tools(model, workflow);
+        self.tool_filter = ToolFilter::from_config(&self.config, model, &[]);
+        let mut tools = self.build_tools(model, workflow, &self.tool_filter);
         if let Some(ref mcp) = self.mcp_handle {
             mcp.extend_tools(&mut tools);
         }
         self.tools = tools;
     }
 
-    fn build_tools(&self, model: &Model, workflow: bool) -> Value {
+    fn build_tools(&self, model: &Model, workflow: bool, filter: &ToolFilter) -> Value {
         let examples = model.supports_tool_examples();
-        let filter = ToolFilter::from_config(&self.config, model, &[]);
         let ctx = DescriptionContext {
-            filter: &filter,
+            filter,
             audience: ToolAudience::MAIN,
             workflow,
         };
-        ToolRegistry::global().definitions(&self.vars, &ctx, examples)
+        ToolRegistry::global().definitions_active(
+            &self.vars,
+            &ctx,
+            examples,
+            &ActiveTools::default(),
+        )
     }
 
     async fn reload_instructions(&mut self) {

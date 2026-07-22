@@ -1,11 +1,11 @@
 use std::borrow::Cow;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
+use crate::ToolOutput;
 use crate::tools::registry::{HeaderFuture, HeaderResult, ParseError, ToolInvocation};
 use crate::tools::schema::ToolInputErrorKind;
 use crate::tools::{DescriptionContext, ToolContext, ToolExecResult};
-use crate::ToolOutput;
 
 pub struct ToolSearch;
 
@@ -42,16 +42,22 @@ impl ToolInvocation for ToolSearchInvocation {
             } else {
                 results
             };
-            let output = format!("[{}]", filtered
-                .iter()
-                .map(|r| format!(
-                    r#"{{"name":"{}","namespace":{},"description":"{}"}}"#,
-                    r.name,
-                    r.namespace.as_ref().map(|s| format!(r#""{}""#, s)).unwrap_or("null".to_string()),
-                    r.description.replace('"', r#"\""#)
-                ))
-                .collect::<Vec<_>>()
-                .join(","));
+            let output = format!(
+                "[{}]",
+                filtered
+                    .iter()
+                    .map(|r| format!(
+                        r#"{{"name":"{}","namespace":{},"description":"{}"}}"#,
+                        r.name,
+                        r.namespace
+                            .as_ref()
+                            .map(|s| format!(r#""{}""#, s))
+                            .unwrap_or("null".to_string()),
+                        r.description.replace('"', r#"\""#)
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
             ToolExecResult::from(Ok(ToolOutput::Plain(output.into())))
         })
     }
@@ -141,7 +147,11 @@ impl ToolInvocation for LoadNamespaceInvocation {
             let output = format!(
                 r#"{{"namespace":"{}","tools":[{}]}}"#,
                 self.namespace,
-                tools.iter().map(|t| format!(r#""{}""#, t)).collect::<Vec<_>>().join(",")
+                tools
+                    .iter()
+                    .map(|t| format!(r#""{}""#, t))
+                    .collect::<Vec<_>>()
+                    .join(",")
             );
             ToolExecResult::from(Ok(ToolOutput::Plain(output.into())))
         })

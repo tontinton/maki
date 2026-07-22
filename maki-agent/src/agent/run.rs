@@ -16,10 +16,12 @@ use super::tool_dispatch::{self, RecentCalls};
 use crate::cancel::{CancelMap, CancelToken};
 use crate::mcp::McpHandle;
 use crate::permissions::PermissionManager;
-use crate::tools::{Deadline, FileReadTracker, LocalTools, ToolAudience, ToolContext};
+use crate::tools::{
+    ActiveTools, Deadline, FileReadTracker, LocalTools, ToolAudience, ToolContext, ToolFilter,
+};
 use crate::{
     AgentConfig, AgentError, AgentEvent, AgentInput, AgentMode, EventSender, ExtractedCommand,
-    InterruptSource, TurnCompleteEvent,
+    InterruptSource, ToolDoneEvent, TurnCompleteEvent,
 };
 use maki_config::ToolOutputLines;
 use maki_storage::id::SessionRef;
@@ -70,6 +72,7 @@ pub struct AgentRunParams<'h> {
     pub system: String,
     pub event_tx: EventSender,
     pub tools: Value,
+    pub tool_filter: ToolFilter,
 }
 
 pub struct Agent<'h> {
@@ -106,11 +109,15 @@ pub struct Agent<'h> {
     audience: ToolAudience,
     workflow: bool,
     local_tools: LocalTools,
+    tool_filter: ToolFilter,
+    active_tools: ActiveTools,
+    supports_tool_examples: bool,
 }
 
 impl<'h> Agent<'h> {
     pub fn new(params: AgentParams, run: AgentRunParams<'h>) -> Self {
-        Self {
+        let supports_tool_examples = params.model.supports_tool_examples();
+        let mut agent = Self {
             provider: params.provider,
             model: Arc::new(params.model),
             config: params.config,
@@ -144,7 +151,12 @@ impl<'h> Agent<'h> {
             audience: params.audience,
             workflow: false,
             local_tools: LocalTools::default(),
-        }
+            tool_filter: run.tool_filter,
+            active_tools: ActiveTools::default(),
+            supports_tool_examples,
+        };
+        agent.warm_active_tools();
+        agent
     }
 
     pub fn with_mcp(mut self, mcp: Option<McpHandle>) -> Self {
@@ -277,7 +289,10 @@ impl<'h> Agent<'h> {
 
         if has_tools {
             let history_len_before = self.history.len();
-            self.process_tool_calls(response).await?;
+            let tool_results = self.process_tool_calls(response).await?;
+            if self.apply_tool_search_results(&tool_results) {
+                self.rebuild_tools();
+            }
             self.context_size +=
                 estimate_message_tokens(&self.history.as_slice()[history_len_before..]);
         } else {
@@ -374,7 +389,10 @@ impl<'h> Agent<'h> {
         })
     }
 
-    async fn process_tool_calls(&mut self, response: StreamResponse) -> Result<(), AgentError> {
+    async fn process_tool_calls(
+        &mut self,
+        response: StreamResponse,
+    ) -> Result<Vec<ToolDoneEvent>, AgentError> {
         self.post_tool_empty_retried = false;
         let ctx = self.tool_context();
         tool_dispatch::process_tool_calls(
@@ -414,6 +432,69 @@ impl<'h> Agent<'h> {
             local_tools: Arc::clone(&self.local_tools),
             live_sink: None,
         }
+    }
+
+    fn rebuild_tools(&mut self) {
+        let vars = crate::template::env_vars();
+        let ctx = crate::tools::DescriptionContext {
+            filter: &self.tool_filter,
+            audience: self.audience,
+            workflow: self.workflow,
+        };
+        let mut tools = self.registry.definitions_active(
+            &vars,
+            &ctx,
+            self.supports_tool_examples,
+            &self.active_tools,
+        );
+        if let Some(mcp) = &self.mcp {
+            mcp.extend_tools(&mut tools);
+        }
+        self.tools = tools;
+    }
+
+    fn warm_active_tools(&mut self) {
+        let Some(arr) = self.tools.as_array() else {
+            return;
+        };
+        for def in arr {
+            let Some(name) = def.get("name").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            if let Some(entry) = self.registry.get(name) && entry.defer_loading {
+                self.active_tools.names.insert(name.to_owned());
+            }
+        }
+    }
+
+    fn apply_tool_search_results(&mut self, results: &[ToolDoneEvent]) -> bool {
+        let mut dirty = false;
+        for done in results {
+            match done.tool.as_ref() {
+                "tool_search" => {
+                    let text = done.output.as_text();
+                    if let Ok(Value::Array(items)) = serde_json::from_str::<Value>(&text) {
+                        for item in items {
+                            if let Some(name) = item.get("name").and_then(|v| v.as_str()) {
+                                self.active_tools.names.insert(name.to_owned());
+                                dirty = true;
+                            }
+                        }
+                    }
+                }
+                "load_namespace" => {
+                    let text = done.output.as_text();
+                    if let Ok(Value::Object(obj)) = serde_json::from_str::<Value>(&text)
+                        && let Some(ns) = obj.get("namespace").and_then(|v| v.as_str())
+                    {
+                        self.active_tools.namespaces.insert(ns.to_owned());
+                        dirty = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        dirty
     }
 
     async fn try_auto_compact(&mut self) -> Result<bool, AgentError> {
@@ -635,6 +716,7 @@ mod tests {
                 system: "system".into(),
                 event_tx: EventSender::new(raw_tx, 0),
                 tools: serde_json::json!([]),
+                tool_filter: ToolFilter::All,
             },
         );
         (agent, event_rx)
@@ -898,6 +980,7 @@ mod tests {
                     system: "system".into(),
                     event_tx: EventSender::new(raw_tx, 0),
                     tools: serde_json::json!([]),
+                    tool_filter: ToolFilter::All,
                 },
             )
             .with_cancel(cancel);

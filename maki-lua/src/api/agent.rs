@@ -15,8 +15,8 @@ use maki_agent::cancel::CancelMap;
 use maki_agent::tools::interpreter_bridge;
 use maki_agent::tools::registry::ToolRegistry;
 use maki_agent::tools::{
-    Deadline, DescriptionContext, FileReadTracker, LocalToolFn, LocalTools, ToolAudience,
-    ToolContext, ToolFilter, ToolLive,
+    ActiveTools, Deadline, DescriptionContext, FileReadTracker, LocalToolFn, LocalTools,
+    ToolAudience, ToolContext, ToolFilter, ToolLive,
 };
 use maki_agent::{
     Agent, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, Envelope, EventSender,
@@ -399,6 +399,12 @@ async fn session(
         let _ = sink.send(ToolLive::Annotation(model.spec()));
     }
 
+    let tool_filter = if tools_val.is_some() {
+        ToolFilter::All
+    } else {
+        ToolFilter::from_config(&agent_ctx.config, &model, &[])
+    };
+
     let mut tools_json: JsonValue = match tools_val {
         Some(val) => {
             let tools = lua_to_json(&lua, &val)?;
@@ -407,7 +413,24 @@ async fn session(
             }
             tools
         }
-        None => JsonValue::Array(vec![]),
+        None => {
+            let vars = maki_agent::template::env_vars();
+            let ctx = DescriptionContext {
+                filter: &tool_filter,
+                audience,
+                workflow: false,
+            };
+            let mut defs = ToolRegistry::global().definitions_active(
+                &vars,
+                &ctx,
+                model.supports_tool_examples(),
+                &ActiveTools::default(),
+            );
+            if let Some(ref mcp) = agent_ctx.mcp {
+                mcp.extend_tools(&mut defs);
+            }
+            defs
+        }
     };
 
     let mut local_map: HashMap<String, LocalToolFn> = HashMap::new();
@@ -524,6 +547,7 @@ async fn session(
         },
         system: system.unwrap_or_default(),
         tools: tools_json,
+        tool_filter,
         thinking,
         fast,
         mcp: agent_ctx.mcp.clone(),
@@ -644,6 +668,7 @@ struct SessionState {
     params: AgentParams,
     system: String,
     tools: JsonValue,
+    tool_filter: ToolFilter,
     thinking: ThinkingConfig,
     fast: bool,
     mcp: Option<maki_agent::mcp::McpHandle>,
@@ -750,6 +775,7 @@ async fn prompt(
             system: s.system.clone(),
             event_tx: s.sub_event_tx.clone(),
             tools: s.tools.clone(),
+            tool_filter: s.tool_filter.clone(),
         },
     )
     .with_user_response_rx(Arc::clone(&s.answer_rx))

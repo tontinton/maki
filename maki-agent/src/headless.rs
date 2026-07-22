@@ -19,7 +19,9 @@ use crate::cancel::{CancelMap, CancelToken};
 use crate::permissions::PermissionManager;
 use crate::prompt::ResolvedSlots;
 use crate::template;
-use crate::tools::{DescriptionContext, FileReadTracker, ToolAudience, ToolFilter, ToolRegistry};
+use crate::tools::{
+    ActiveTools, DescriptionContext, FileReadTracker, ToolAudience, ToolFilter, ToolRegistry,
+};
 use crate::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, Envelope,
     EventSender, ImageSource, McpHandle, PermissionsConfig, ToolOutput, ToolOutputLines,
@@ -94,6 +96,7 @@ struct AgentSetup {
     vars: template::Vars,
     instructions: agent::Instructions,
     tools: Value,
+    tool_filter: ToolFilter,
 }
 
 fn setup(
@@ -105,13 +108,13 @@ fn setup(
 ) -> AgentSetup {
     let vars = template::env_vars();
     let instructions = agent::load_instructions(&vars.apply("{cwd}"));
+    let tool_filter = ToolFilter::from_config(config, model, excluded_tools);
     let tools = tool_definitions(
         &vars,
-        model,
-        config,
-        excluded_tools,
+        &tool_filter,
         mcp_handle,
         workflow,
+        model,
         ToolRegistry::global(),
     );
 
@@ -119,25 +122,29 @@ fn setup(
         vars,
         instructions,
         tools,
+        tool_filter,
     }
 }
 
 fn tool_definitions(
     vars: &template::Vars,
-    model: &Model,
-    config: &AgentConfig,
-    excluded_tools: &[&'static str],
+    tool_filter: &ToolFilter,
     mcp_handle: Option<&McpHandle>,
     workflow: bool,
+    model: &Model,
     registry: &ToolRegistry,
 ) -> Value {
-    let filter = ToolFilter::from_config(config, model, excluded_tools);
     let ctx = DescriptionContext {
-        filter: &filter,
+        filter: tool_filter,
         audience: ToolAudience::MAIN,
         workflow,
     };
-    let mut tools = registry.definitions(vars, &ctx, model.supports_tool_examples());
+    let mut tools = registry.definitions_active(
+        vars,
+        &ctx,
+        model.supports_tool_examples(),
+        &ActiveTools::default(),
+    );
 
     if let Some(handle) = mcp_handle {
         handle.extend_tools(&mut tools);
@@ -153,6 +160,7 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
         vars,
         instructions,
         tools,
+        tool_filter,
     } = setup(
         &params.model,
         &params.config,
@@ -220,6 +228,7 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
                     system,
                     event_tx,
                     tools,
+                    tool_filter: tool_filter.clone(),
                 },
             )
             .with_loaded_instructions(instructions.loaded)
@@ -295,6 +304,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
         vars,
         instructions,
         mut tools,
+        mut tool_filter,
     } = setup(
         &params.model,
         &params.config,
@@ -362,13 +372,17 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                     match provider::from_model_async(&mut new_model, params.timeouts).await {
                         Ok(p) => {
                             provider = Arc::from(p);
+                            tool_filter = ToolFilter::from_config(
+                                &params.config,
+                                &new_model,
+                                &params.excluded_tools,
+                            );
                             tools = tool_definitions(
                                 &vars,
-                                &new_model,
-                                &params.config,
-                                &params.excluded_tools,
+                                &tool_filter,
                                 params.mcp_handle.as_ref(),
                                 params.workflow,
+                                &new_model,
                                 ToolRegistry::global(),
                             );
                             model = new_model;
@@ -430,6 +444,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                         system,
                         event_tx,
                         tools: tools.clone(),
+                        tool_filter: tool_filter.clone(),
                     },
                 )
                 .with_loaded_instructions(instructions.loaded.clone())

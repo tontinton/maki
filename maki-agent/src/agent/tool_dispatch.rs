@@ -349,7 +349,7 @@ pub(super) async fn process_tool_calls(
     history: &mut super::history::History,
     event_tx: &crate::EventSender,
     ctx: &ToolContext,
-) -> Result<(), AgentError> {
+) -> Result<Vec<crate::ToolDoneEvent>, AgentError> {
     let tool_uses: Vec<(String, String, Value)> = response
         .message
         .tool_uses()
@@ -423,12 +423,12 @@ pub(super) async fn process_tool_calls(
 
     let mut all_results = results;
     all_results.extend(immediate_errors);
-    let tool_msg = crate::types::tool_results(all_results);
+    let tool_msg = crate::types::tool_results(all_results.clone());
     event_tx.send(AgentEvent::ToolResultsSubmitted {
         message: Box::new(tool_msg.clone()),
     })?;
     history.push(tool_msg);
-    Ok(())
+    Ok(all_results)
 }
 
 /// Test-only entry that skips native lookup, letting plan-mode and MCP tests
