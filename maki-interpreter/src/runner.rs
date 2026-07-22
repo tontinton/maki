@@ -9,7 +9,8 @@ use std::time::Duration;
 
 use monty::{
     ExcType, ExtFunctionResult, LimitedTracker, MontyException, MontyObject, MontyRun,
-    NameLookupResult, PrintWriter, PrintWriterCallback, ResourceLimits, RunProgress,
+    NameLookupResult, PrintWriter, PrintWriterCallback, ResolveFutures, ResourceLimits,
+    RunProgress,
 };
 use serde_json::Value;
 use tracing::debug;
@@ -17,8 +18,6 @@ use tracing::debug;
 use crate::convert::{json_to_monty, monty_to_json};
 use crate::error::InterpreterError;
 
-const DEFAULT_TIMEOUT_SECS: u64 = 30;
-const DEFAULT_MAX_MEMORY: usize = 50 * 1024 * 1024;
 const DEFAULT_MAX_RECURSION: usize = 100;
 const SCRIPT_NAME: &str = "agent.py";
 
@@ -199,6 +198,7 @@ fn run_inner(
                     .collect();
 
                 let resolved = resolver(batch)?;
+                let state = reset_clock(state)?;
 
                 let results: Vec<(u32, ExtFunctionResult)> = resolved
                     .into_iter()
@@ -222,15 +222,23 @@ fn run_inner(
     }
 }
 
-pub fn default_limits() -> ResourceLimits {
-    limits_with_timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
-}
-
-pub fn limits_with_timeout(timeout: Duration) -> ResourceLimits {
-    ResourceLimits::new()
-        .max_duration(timeout)
-        .max_memory(DEFAULT_MAX_MEMORY)
-        .max_recursion_depth(Some(DEFAULT_MAX_RECURSION))
+/// A script blocked on a tool call (a subagent can run for minutes) must not
+/// burn its own time budget, so every await refreshes it. Monty gives no way
+/// to touch the tracker clock on `ResolveFutures`, but loading a dumped run
+/// starts a fresh clock, so a dump/load round-trip resets it. The copy is
+/// cheap next to any real tool call.
+fn reset_clock(
+    state: ResolveFutures<LimitedTracker>,
+) -> Result<ResolveFutures<LimitedTracker>, InterpreterError> {
+    let bytes = RunProgress::ResolveFutures(state)
+        .dump()
+        .map_err(|e| InterpreterError::Runtime(e.to_string()))?;
+    match RunProgress::load(&bytes).map_err(|e| InterpreterError::Runtime(e.to_string()))? {
+        RunProgress::ResolveFutures(s) => Ok(s),
+        _ => Err(InterpreterError::Runtime(
+            "clock reset produced unexpected state".into(),
+        )),
+    }
 }
 
 pub fn limits(timeout: Duration, max_memory: usize) -> ResourceLimits {
@@ -246,6 +254,12 @@ mod tests {
     use serde_json::json;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const DEFAULT_MAX_MEMORY: usize = 50 * 1024 * 1024;
+
+    fn default_limits() -> ResourceLimits {
+        limits(Duration::from_secs(30), DEFAULT_MAX_MEMORY)
+    }
 
     fn empty_tools() -> HashMap<String, ToolFn> {
         HashMap::new()
@@ -410,6 +424,33 @@ await main()
             call_count.load(Ordering::SeqCst) >= 2,
             "resolver should be called at least twice for sequential awaits"
         );
+    }
+
+    #[test]
+    fn resolver_wait_does_not_count_against_timeout() {
+        const TIMEOUT: Duration = Duration::from_millis(500);
+        const WAIT: Duration = Duration::from_millis(700);
+        // Two awaits: an implementation that resets the clock only once would
+        // still time out on the second wait.
+        let code = r#"
+async def main():
+    a = await slow()
+    b = await slow()
+    return a + b
+await main()
+"#;
+        let tools = stub_tools(&["slow"]);
+        let resolver: AsyncResolver = Box::new(|pending: Vec<PendingCall>| {
+            std::thread::sleep(WAIT);
+            Ok(pending
+                .into_iter()
+                .map(|pc| (pc.call_id, Ok(json!("done"))))
+                .collect())
+        });
+
+        let lims = limits(TIMEOUT, DEFAULT_MAX_MEMORY);
+        let result = run(code, &tools, Some(&resolver), lims).unwrap();
+        assert_eq!(result.output, Some(json!("donedone")));
     }
 
     #[test]

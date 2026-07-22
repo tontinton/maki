@@ -139,7 +139,7 @@ Execute Python code in a sandboxed interpreter with tools as callable functions.
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | `code` | string | yes |  | Python code to execute. Tools are async functions that return strings (not objects). You MUST await every call: `result = await read(path='/file')`. Use `await asyncio.gather(...)` for concurrency. |
-| `timeout` | integer | no | 30, max 300 | Timeout in seconds |
+| `timeout` | integer | no | 30 | Script execution timeout in seconds |
 
 ### `question` *(lua plugin)*
 

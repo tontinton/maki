@@ -151,7 +151,7 @@ maki.setup({
 | `max_memory_mb` | integer | `50` | 10 | Memory limit for the Python sandbox (MB). |
 | `max_output_bytes` | integer | - | - | Override `agent.max_output_bytes` for this tool. |
 | `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool. |
-| `timeout_secs` | integer | `30` | 5 | Stop the script after this many seconds. A call's `timeout` param overrides it. |
+| `timeout_secs` | integer | `30` | 5 | Script execution time budget in seconds; waiting on tool calls does not count. A call's `timeout` param overrides it. |
 
 ### `plugins.edit`
 
