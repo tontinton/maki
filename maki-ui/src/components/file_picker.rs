@@ -14,22 +14,19 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use tracing::warn;
 use unicode_width::UnicodeWidthChar;
 
 use crate::animation::spinner_frame;
 use crate::components::Overlay;
 use crate::components::keybindings::key;
-use crate::components::modal::Modal;
 use crate::components::scrollbar::render_vertical_scrollbar;
 use crate::text_buffer::TextBuffer;
 use crate::theme;
 
 const TITLE: &str = " Files ";
 const TITLE_WALKING: &str = " Files (scanning…) ";
-const WIDTH_PERCENT: u16 = 60;
-const MAX_HEIGHT_PERCENT: u16 = 80;
 const SEARCH_ROW: u16 = 1;
 const NO_MATCHES: &str = "  No matches";
 const LABEL_INDENT: &str = "  ";
@@ -37,6 +34,7 @@ const EMPTY_DIR_MSG: &str = "Current directory is empty";
 const WALKER_CRASHED_MSG: &str = "File scanner crashed";
 const PENDING_DEBOUNCE_MS: u128 = 100;
 const MAX_MATERIALIZED: u32 = 640;
+const FOOTER_HINTS: &str = "↑↓ select · ← parent · → enter · esc close";
 
 pub enum FilePickerModalAction {
     Consumed,
@@ -55,6 +53,7 @@ struct Session {
     matches: Vec<Match>,
     total_matches: u32,
 
+    cwd: String,
     search: TextBuffer,
     selected: usize,
     scroll_offset: usize,
@@ -148,6 +147,7 @@ impl FilePickerModal {
             matcher: Matcher::new(Config::DEFAULT.match_paths()),
             matches: Vec::new(),
             total_matches: 0,
+            cwd: String::new(),
             search: TextBuffer::new(String::new()),
             selected: 0,
             scroll_offset: 0,
@@ -212,18 +212,50 @@ impl FilePickerModal {
                     return FilePickerModalAction::Consumed;
                 }
                 if let Some(m) = s.matches.get(s.selected) {
-                    return FilePickerModalAction::Select(m.path.clone());
+                    if m.path.ends_with('/') {
+                        let new_cwd = format!("{}{}", s.cwd, m.path);
+                        s.cwd = new_cwd;
+                        s.search.clear();
+                        reparse_pattern(s);
+                        return FilePickerModalAction::Consumed;
+                    }
+                    let full_path = format!("{}{}", s.cwd, m.path);
+                    return FilePickerModalAction::Select(full_path);
                 }
                 return FilePickerModalAction::Close;
             }
             KeyCode::Up => move_selection(s, -1),
             KeyCode::Down => move_selection(s, 1),
             KeyCode::Backspace => {
-                s.search.remove_char();
-                reparse_pattern(s);
+                if s.search.value().is_empty() && !s.cwd.is_empty() {
+                    s.cwd = Self::parent_cwd(&s.cwd);
+                    reparse_pattern(s);
+                } else {
+                    s.search.remove_char();
+                    reparse_pattern(s);
+                }
             }
-            KeyCode::Left => s.search.move_left(),
-            KeyCode::Right => s.search.move_right(),
+            KeyCode::Left => {
+                if s.search.value().is_empty() && !s.cwd.is_empty() {
+                    s.cwd = Self::parent_cwd(&s.cwd);
+                    reparse_pattern(s);
+                } else {
+                    s.search.move_left();
+                }
+            }
+            KeyCode::Right => {
+                if s.visible
+                    && let Some(m) = s.matches.get(s.selected)
+                    && m.path.ends_with('/')
+                {
+                    let new_cwd = format!("{}{}", s.cwd, m.path);
+                    s.cwd = new_cwd;
+                    s.search.clear();
+                    reparse_pattern(s);
+                    return FilePickerModalAction::Consumed;
+                }
+                s.search.move_right();
+            }
             KeyCode::Home => s.search.move_home(),
             KeyCode::End => s.search.move_end(),
             _ if key::DELETE_WORD.matches(key) => {
@@ -238,7 +270,13 @@ impl FilePickerModal {
             }
             _ if key::SCROLL_LINE_UP.matches(key) => move_selection(s, -1),
             _ if key::SCROLL_LINE_DOWN.matches(key) => move_selection(s, 1),
-            _ if super::is_ctrl(&key) => {}
+            _ if super::is_ctrl(&key) => {
+                if key.code == KeyCode::Char('n') {
+                    move_selection(s, 1);
+                } else if key.code == KeyCode::Char('p') {
+                    move_selection(s, -1);
+                }
+            }
             KeyCode::Char(c) => {
                 s.search.push_char(c);
                 reparse_pattern(s);
@@ -246,6 +284,18 @@ impl FilePickerModal {
             _ => {}
         }
         FilePickerModalAction::Consumed
+    }
+
+    pub fn parent_cwd(cwd: &str) -> String {
+        if cwd.is_empty() {
+            return String::new();
+        }
+        let trimmed = cwd.trim_end_matches('/');
+        if let Some(last_slash) = trimmed.rfind('/') {
+            format!("{}/", &trimmed[..last_slash])
+        } else {
+            String::new()
+        }
     }
 
     pub fn tick(&mut self) -> Option<String> {
@@ -287,38 +337,57 @@ impl FilePickerModal {
         None
     }
 
-    pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
+    pub fn view(&mut self, frame: &mut Frame, anchor: Rect) -> Rect {
         let s = match &mut self.session {
             Some(s) if s.visible => s,
             _ => return Rect::default(),
         };
 
         let match_count = s.matches.len() as u16;
-        let title = if s.walking { TITLE_WALKING } else { TITLE };
+        let title = if s.walking {
+            TITLE_WALKING.to_string()
+        } else {
+            format!("{}{} ", TITLE, s.cwd)
+        };
 
         let has_query_without_matches = s.matches.is_empty() && !s.search.value().is_empty();
-        let max_visible = area.height.saturating_sub(SEARCH_ROW + 2);
-        let content_rows = if has_query_without_matches {
-            1
+        let has_content = match_count > 0 || has_query_without_matches;
+        let max_content = anchor.y.saturating_sub(SEARCH_ROW + 3).max(1);
+        let content_rows = if has_content {
+            match_count.min(max_content).max(1)
         } else {
-            match_count.min(max_visible)
+            0
         };
+        let height = content_rows + SEARCH_ROW + 3;
+        let width = anchor.width.clamp(20, 60);
 
-        let modal = Modal {
-            title,
-            width_percent: WIDTH_PERCENT,
-            max_height_percent: MAX_HEIGHT_PERCENT,
-        };
-        let (popup, inner) = modal.render(frame, area, content_rows + SEARCH_ROW);
+        let x = anchor.x + (anchor.width.saturating_sub(width)) / 2;
+        let y = anchor.y.saturating_sub(height);
+
+        let popup = Rect::new(x, y, width, height);
+        frame.render_widget(Clear, popup);
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(title)
+            .border_style(theme::current().tool_dim);
+        frame.render_widget(block, popup);
+
+        let inner = popup.inner(ratatui::layout::Margin::new(1, 1));
         s.inner_area = inner;
-        s.viewport_height = inner.height.saturating_sub(SEARCH_ROW) as usize;
+        s.viewport_height = inner.height.saturating_sub(SEARCH_ROW + 1) as usize;
         ensure_visible(s);
 
-        let [list_area, search_area] =
-            Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
+        let [list_area, search_area, footer_area] = Layout::vertical([
+            Constraint::Min(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .areas(inner);
 
         render_list(frame, list_area, s);
         render_search(frame, search_area, s);
+        render_footer(frame, footer_area, s);
 
         if match_count > s.viewport_height as u16 {
             render_vertical_scrollbar(frame, list_area, match_count, s.scroll_offset as u16);
@@ -339,7 +408,16 @@ impl Overlay for FilePickerModal {
 }
 
 fn reparse_pattern(s: &mut Session) {
-    let query = s.search.value();
+    let search = s.search.value();
+    let last_slash = search.rfind('/');
+    let (cwd, query) = if let Some(slash_pos) = last_slash {
+        let cwd = &search[..=slash_pos];
+        let query = &search[slash_pos + 1..];
+        (cwd.to_string(), query.to_string())
+    } else {
+        (String::new(), search.to_string())
+    };
+    s.cwd = cwd;
     s.nucleo
         .pattern
         .reparse(0, &query, CaseMatching::Smart, Normalization::Smart, false);
@@ -360,19 +438,32 @@ fn refresh_matches(s: &mut Session) {
 
     for item in snapshot.matched_items(0..count) {
         let col = &item.matcher_columns[0];
-        let path = col.to_string();
+        let full_path = col.to_string();
+
+        if !full_path.starts_with(&s.cwd) {
+            continue;
+        }
+
+        let display_path = full_path[s.cwd.len()..].to_string();
 
         let indices = if has_pattern {
             indices_buf.clear();
             pattern
                 .column_pattern(0)
                 .indices(col.slice(..), &mut s.matcher, &mut indices_buf);
-            mem::take(&mut indices_buf)
+            let offset = s.cwd.chars().count() as u32;
+            indices_buf
+                .iter()
+                .map(|&i| i.saturating_sub(offset))
+                .collect()
         } else {
             Vec::new()
         };
 
-        s.matches.push(Match { path, indices });
+        s.matches.push(Match {
+            path: display_path,
+            indices,
+        });
     }
 }
 
@@ -476,6 +567,16 @@ fn render_search(frame: &mut Frame, area: Rect, s: &Session) {
     frame.render_widget(Paragraph::new(vec![Line::from(spans)]), area);
 }
 
+fn render_footer(frame: &mut Frame, area: Rect, s: &Session) {
+    let t = theme::current();
+    let match_count = s.total_matches;
+    let footer_text = format!("{}   {} matches", FOOTER_HINTS, match_count);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(footer_text, t.item_desc))),
+        area,
+    );
+}
+
 fn build_highlighted_line<'a>(
     text: &str,
     indices: &[u32],
@@ -543,6 +644,7 @@ mod tests {
             matcher: Matcher::new(Config::DEFAULT.match_paths()),
             matches: Vec::new(),
             total_matches: 0,
+            cwd: String::new(),
             search: TextBuffer::new(String::new()),
             selected: 0,
             scroll_offset: 0,
@@ -823,5 +925,73 @@ mod tests {
     fn contains_returns_false_when_not_visible() {
         let (picker, _done_tx) = pending_picker();
         assert!(!picker.contains(Position::new(0, 0)));
+    }
+
+    #[test]
+    fn parent_cwd_empty_returns_empty() {
+        assert_eq!(FilePickerModal::parent_cwd(""), "");
+    }
+
+    #[test]
+    fn parent_cwd_single_segment_returns_empty() {
+        assert_eq!(FilePickerModal::parent_cwd("src/"), "");
+    }
+
+    #[test]
+    fn parent_cwd_nested_returns_parent() {
+        assert_eq!(FilePickerModal::parent_cwd("src/comp/"), "src/");
+    }
+
+    #[test]
+    fn parent_cwd_deep_nested_returns_parent() {
+        assert_eq!(FilePickerModal::parent_cwd("src/comp/mod/"), "src/comp/");
+    }
+
+    #[test]
+    fn left_when_search_empty_and_cwd_nonempty_navigates_parent() {
+        let (mut picker, _done_tx) = pending_picker();
+        picker.session.as_mut().unwrap().cwd = "src/".to_string();
+        picker.session.as_mut().unwrap().visible = true;
+        picker.handle_key(key(KeyCode::Left));
+        assert_eq!(picker.session.as_ref().unwrap().cwd, "");
+    }
+
+    #[test]
+    fn backspace_when_search_empty_and_cwd_nonempty_navigates_parent() {
+        let (mut picker, _done_tx) = pending_picker();
+        picker.session.as_mut().unwrap().cwd = "src/".to_string();
+        picker.session.as_mut().unwrap().visible = true;
+        picker.handle_key(key(KeyCode::Backspace));
+        assert_eq!(picker.session.as_ref().unwrap().cwd, "");
+    }
+
+    #[test]
+    fn ctrl_n_moves_down() {
+        let (mut picker, _done_tx) = pending_picker();
+        let ctrl_n = KeyEvent {
+            code: KeyCode::Char('n'),
+            modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+        assert!(matches!(
+            picker.handle_key(ctrl_n),
+            FilePickerModalAction::Consumed
+        ));
+    }
+
+    #[test]
+    fn ctrl_p_moves_up() {
+        let (mut picker, _done_tx) = pending_picker();
+        let ctrl_p = KeyEvent {
+            code: KeyCode::Char('p'),
+            modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+        assert!(matches!(
+            picker.handle_key(ctrl_p),
+            FilePickerModalAction::Consumed
+        ));
     }
 }

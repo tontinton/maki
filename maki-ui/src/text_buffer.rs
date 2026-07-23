@@ -43,6 +43,15 @@ impl TextBuffer {
         &self.lines
     }
 
+    pub fn lines_mut(&mut self) -> &mut [String] {
+        &mut self.lines
+    }
+
+    pub fn set_cursor(&mut self, y: usize, x: usize) {
+        self.cursor_y = y.min(self.lines.len().saturating_sub(1));
+        self.raw_x = x;
+    }
+
     pub fn x(&self) -> usize {
         self.raw_x.min(self.current_line_len())
     }

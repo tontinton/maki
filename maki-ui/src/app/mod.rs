@@ -34,6 +34,7 @@ use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 use crate::components::login_picker::{LoginPicker, LoginPickerAction};
 use crate::components::lua_float::FloatManager;
 use crate::components::mcp_picker::{McpPicker, McpPickerAction};
+use crate::components::mention_flyout::{MentionAction, MentionFlyout};
 use crate::components::model_picker::{ModelPicker, ModelPickerAction};
 use crate::components::permission_prompt::PermissionPrompt;
 use crate::components::plan_form::{PlanForm, PlanFormAction};
@@ -147,6 +148,7 @@ pub struct App {
     pub(super) float_mgr: FloatManager,
     pub(super) search_modal: SearchModal,
     pub(super) file_picker: FilePickerModal,
+    pub(super) mention_flyout: MentionFlyout,
     pub(super) permission_prompt: PermissionPrompt,
     pub(super) plan_form: PlanForm,
     pub(super) status_bar: StatusBar,
@@ -228,6 +230,7 @@ impl App {
             float_mgr: FloatManager::new(),
             search_modal: SearchModal::new(),
             file_picker: FilePickerModal::new(),
+            mention_flyout: MentionFlyout::new(),
             permission_prompt: PermissionPrompt::new(),
             plan_form: PlanForm::new(),
             status_bar: StatusBar::new(flash),
@@ -327,7 +330,11 @@ impl App {
 
     pub fn update(&mut self, msg: Msg) -> Vec<Action> {
         match msg {
-            Msg::Key(key) => self.handle_key(key),
+            Msg::Key(key) => {
+                let actions = self.handle_key(key);
+                self.close_mention_flyout_if_invalid();
+                actions
+            }
             Msg::Paste(text) => {
                 let text = text.replace("\r\n", "\n").replace('\r', "\n");
                 if text.is_empty() {
@@ -348,6 +355,7 @@ impl App {
                         self.route_text_paste(&text);
                     }
                 }
+                self.close_mention_flyout_if_invalid();
                 vec![]
             }
             Msg::Mouse(event) => {
@@ -480,6 +488,13 @@ impl App {
             self.active_chat().enable_auto_scroll();
             return Some(vec![]);
         }
+        if key::PLAN_TOGGLE.matches(key)
+            && self.state.mode == Mode::Plan
+            && self.state.plan.is_ready()
+        {
+            self.plan_form.toggle();
+            return Some(vec![]);
+        }
         None
     }
 
@@ -551,6 +566,47 @@ impl App {
                 }
             }
             return Some(vec![]);
+        }
+
+        if self.mention_flyout.is_open() {
+            let is_navigation_key = matches!(
+                key.code,
+                KeyCode::Up
+                    | KeyCode::Down
+                    | KeyCode::Enter
+                    | KeyCode::Esc
+                    | KeyCode::Left
+                    | KeyCode::Right
+                    | KeyCode::Backspace
+            );
+            if is_navigation_key || is_ctrl(&key) {
+                let actions: Option<Vec<Action>> = match self.mention_flyout.handle_key(key) {
+                    MentionAction::Consumed => Some(vec![]),
+                    MentionAction::Select(path) => {
+                        self.mention_flyout.close();
+                        self.input_box.replace_mention(&path);
+                        self.command_palette.sync(&self.input_box.buffer.value());
+                        Some(vec![])
+                    }
+                    MentionAction::Navigate(new_cwd) => {
+                        let mention_text = format!("@{}", new_cwd);
+                        self.input_box.replace_mention(&mention_text);
+                        self.command_palette.sync(&self.input_box.buffer.value());
+                        if let Some((cwd, query)) = self.input_box.mention_query() {
+                            self.mention_flyout.set_query(cwd, query);
+                        }
+                        Some(vec![])
+                    }
+                    MentionAction::Close => {
+                        self.mention_flyout.close();
+                        Some(vec![])
+                    }
+                    MentionAction::Passthrough => None,
+                };
+                if let Some(actions) = actions {
+                    return Some(actions);
+                }
+            }
         }
 
         if self.file_picker.is_open() {
@@ -665,14 +721,6 @@ impl App {
             });
         }
 
-        if key::PLAN_TOGGLE.matches(key)
-            && self.state.mode == Mode::Plan
-            && self.state.plan.is_ready()
-        {
-            self.plan_form.toggle();
-            return Some(vec![]);
-        }
-
         None
     }
 
@@ -732,6 +780,12 @@ impl App {
         false
     }
 
+    fn close_mention_flyout_if_invalid(&mut self) {
+        if self.mention_flyout.is_open() && self.input_box.mention_query().is_none() {
+            self.mention_flyout.close();
+        }
+    }
+
     fn handle_main_chat_key(&mut self, key: KeyEvent) -> Vec<Action> {
         if key::EDIT_INPUT.matches(key) {
             return vec![Action::EditInputInEditor];
@@ -779,8 +833,22 @@ impl App {
         let streaming = self.status == Status::Streaming;
         match self.input_box.handle_key(key) {
             InputAction::Submit(sub) => self.handle_submit(sub),
+            InputAction::OpenMention => {
+                if let Some((cwd, query)) = self.input_box.mention_query() {
+                    self.mention_flyout
+                        .open(&self.state.session.cwd, cwd, query);
+                }
+                vec![]
+            }
             InputAction::PaletteSync(val) => {
                 self.command_palette.sync(&val);
+                if self.mention_flyout.is_open() {
+                    if let Some((cwd, query)) = self.input_box.mention_query() {
+                        self.mention_flyout.set_query(cwd, query);
+                    } else {
+                        self.mention_flyout.close();
+                    }
+                }
                 vec![]
             }
             InputAction::Passthrough(key) => {

@@ -10,6 +10,7 @@ pub(crate) mod list_picker;
 pub(crate) mod login_picker;
 pub(crate) mod lua_float;
 pub(crate) mod mcp_picker;
+pub(crate) mod mention_flyout;
 pub mod messages;
 pub(crate) mod modal;
 pub(crate) mod model_picker;
