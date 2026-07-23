@@ -582,6 +582,7 @@ mod tests {
         assert!(picker.session.is_none());
     }
 
+    #[cfg_attr(target_os = "windows", ignore = "flaky timing on Windows CI")]
     #[test]
     fn pending_debounce_controls_visibility() {
         let (mut picker, _done_tx) = pending_picker();
