@@ -132,7 +132,7 @@ Execute multiple independent tool calls concurrently. ALWAYS use batch for multi
 
 ### `code_execution` *(lua plugin)*
 
-Execute Python code in a sandboxed interpreter with tools as callable functions. Use for chained/dependent tool calls and filtering/processing results. Faster than sequential tool calls. Tools are async: `result = await read(path='file.txt')`. Use `asyncio.gather()` for concurrency. Available libs: re, asyncio, sys, os, json. Fresh sandbox each run. 30s timeout (configurable).
+Execute Python code in a sandboxed interpreter with tools as callable functions. Use for chained/dependent tool calls and filtering/processing results. Faster than sequential tool calls. Tools are async: `result = await read(path='file.txt')`. Use `asyncio.gather()` for concurrency. Available libs: re, asyncio, sys, os, json. Fresh sandbox each run. 30s script timeout (`timeout` param); time awaiting tool calls doesn't count.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
