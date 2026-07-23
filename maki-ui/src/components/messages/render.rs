@@ -144,7 +144,8 @@ impl RenderCursor {
             seg_area
         };
         if content_area.width > 0 && content_area.height > 0 {
-            let position = SignedPosition::from((0, -(segment_skip as i16)));
+            let y_offset = i16::try_from(segment_skip).map_or(i16::MIN, |v| -v);
+            let position = SignedPosition::from((0, y_offset));
             let image = SlicedImage::new(protocol, position);
             frame.render_widget(image, content_area);
         }
