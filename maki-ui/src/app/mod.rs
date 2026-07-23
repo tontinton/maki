@@ -756,7 +756,9 @@ impl App {
             } else if key.code == KeyCode::Char('v') && self.image_paste_rx.is_empty() {
                 self.start_image_paste();
             } else if key::COPY.matches(key) {
-                if let Some(SelectionState::Dragging { sel, .. }) = self.selection_state.take() {
+                if let Some(SelectionState::Dragging { sel, .. }) = self.selection_state.take()
+                    && !sel.is_empty()
+                {
                     self.selection_state = Some(SelectionState::PendingCopy { sel });
                 }
             } else if let InputAction::PaletteSync(val) = self.input_box.handle_key(key) {
