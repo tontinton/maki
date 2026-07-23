@@ -1367,7 +1367,7 @@ impl MessagesPanel {
                 if !msg.text.is_empty() || msg.plan_path.is_some() {
                     self.cache.push(segment);
                 }
-                for (_idx, source) in msg.images.iter().enumerate() {
+                for source in msg.images.iter() {
                     if !terminal_image::supports_images() {
                         break;
                     }

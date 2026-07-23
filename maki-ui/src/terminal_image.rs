@@ -448,4 +448,12 @@ mod tests {
             "expected {term} with KITTY_WINDOW_ID to use Kitty"
         );
     }
+
+    #[test]
+    fn supports_images_true_for_normal_terminal() {
+        assert!(
+            supports_images(),
+            "should support images when TERM is not dumb"
+        );
+    }
 }

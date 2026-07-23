@@ -188,10 +188,10 @@ impl Segment {
     }
 
     pub fn height(&self, width: u16) -> u16 {
-        if let Some(img) = &self.image {
-            if let Ok(size) = img.size() {
-                return size.height;
-            }
+        if let Some(img) = &self.image
+            && let Ok(size) = img.size()
+        {
+            return size.height;
         }
         if let Some(c) = self.cached_height.get()
             && c.at_width == width
@@ -502,5 +502,59 @@ mod tests {
             vec![(0, 0), (5usize.saturating_add_signed(delta), 1)],
             "positions before the splice stay, after it shift by the delta"
         );
+    }
+
+    fn invalid_image_source() -> ImageSource {
+        ImageSource {
+            media_type: ImageMediaType::Png,
+            data: Arc::from("not-valid-base64-data"),
+        }
+    }
+
+    #[test]
+    fn with_image_sets_fallback_lines() {
+        let source = invalid_image_source();
+        let seg = Segment::with_image(
+            &source,
+            Arc::new(ratatui_image::picker::Picker::halfblocks()),
+            40,
+            Surface::Assistant,
+            None,
+        );
+        assert_eq!(seg.lines().len(), 1);
+        let text: String = seg.lines()[0]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(text, "[image: png]");
+        assert_eq!(seg.raw_text.as_deref(), Some("[image: png]"));
+    }
+
+    #[test]
+    fn image_decode_failure_uses_fallback_height() {
+        let source = invalid_image_source();
+        let seg = Segment::with_image(
+            &source,
+            Arc::new(ratatui_image::picker::Picker::halfblocks()),
+            40,
+            Surface::Assistant,
+            None,
+        );
+        assert!(seg.image().is_none(), "decode should fail for invalid data");
+        assert_eq!(seg.height(80), 1, "height should fall back to lines count");
+    }
+
+    #[test]
+    fn image_segments_have_search_text() {
+        let source = invalid_image_source();
+        let seg = Segment::with_image(
+            &source,
+            Arc::new(ratatui_image::picker::Picker::halfblocks()),
+            40,
+            Surface::Assistant,
+            None,
+        );
+        assert_eq!(seg.search_text, "[image: png]");
     }
 }
