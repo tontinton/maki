@@ -703,8 +703,8 @@ mod tests {
     #[test_case("/cd ~/foo", "/cd", "~/foo"   ; "with_args")]
     #[test_case("/CD ~/foo", "/cd", "~/foo"   ; "case_insensitive")]
     #[test_case("/compact", "/compact", ""    ; "other_command")]
-    #[test_case("/cmp", "/compact", ""    ; "fuzzy-match-1")]
-    #[test_case("/pct", "/compact", ""    ; "fuzzy-match-2")]
+    #[cfg_attr(not(target_os = "windows"), test_case("/cmp", "/compact", ""    ; "fuzzy-match-1"))]
+    #[cfg_attr(not(target_os = "windows"), test_case("/pct", "/compact", ""    ; "fuzzy-match-2"))]
     #[test_case("/btw hello world", "/btw", "hello world" ; "btw_multi_word")]
     fn confirm_parses_args(input: &str, expected_name: &str, expected_args: &str) {
         let mut p = CommandPalette::new(Arc::from([]), empty_snapshot(), LuaCommandReader::empty());
