@@ -53,6 +53,8 @@ curl -fsSL https://maki.sh/install.sh | sh
 
 Both install to `%LOCALAPPDATA%\maki` and add it to your user PATH. Override with `MAKI_INSTALL_DIR` / `$env:MAKI_INSTALL_DIR`.
 
+The bash tool requires Git for Windows or WSL. The installer will detect missing bash and offer to install Git for Windows via winget.
+
 ### Living on the edge (main branch)
 
 ```sh

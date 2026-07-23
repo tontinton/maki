@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::env;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::thread;
 use std::time::Duration;
 
@@ -55,7 +55,7 @@ impl JobStore {
         on_stderr: Option<RegistryKey>,
         on_exit: Option<RegistryKey>,
     ) -> Result<u32, String> {
-        let mut command = shell_command(cmd);
+        let mut command = maki_config::bash_command(cmd)?;
         command
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -224,21 +224,6 @@ impl JobStore {
 impl Drop for JobStore {
     fn drop(&mut self) {
         self.kill_all();
-    }
-}
-
-fn shell_command(cmd: &str) -> Command {
-    #[cfg(unix)]
-    {
-        let mut c = Command::new("bash");
-        c.arg("-c").arg(cmd);
-        c
-    }
-    #[cfg(windows)]
-    {
-        let mut c = Command::new("cmd.exe");
-        c.arg("/C").arg(cmd);
-        c
     }
 }
 
