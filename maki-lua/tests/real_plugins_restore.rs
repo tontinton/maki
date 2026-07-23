@@ -19,13 +19,23 @@ const EXPAND_HINT: &str = "click to expand";
 /// Fixed cap so truncation tests don't depend on the product default.
 const VIEW_CAP: usize = 3;
 
+#[cfg(not(target_os = "macos"))]
 const GREP_OUT: &str =
     "src/a.rs:\n  1: fn main() {}\n  2: fn helper() {}\n\nsrc/b.rs:\n  10: fn other() {}";
 
+#[cfg(not(target_os = "macos"))]
 const BATCH_INPUT_GREP_BASH: &str = r#"{ "tool_calls": [
     { "tool": "grep", "parameters": { "pattern": "fn" } },
     { "tool": "bash", "parameters": { "command": "echo hello-from-bash" } }
 ]}"#;
+
+#[cfg(not(target_os = "macos"))]
+fn batch_state() -> Value {
+    json!({ "children": [
+        { "tool": "grep", "status": "success", "output": GREP_OUT },
+        { "tool": "bash", "status": "success", "output": "hello-from-bash" },
+    ]})
+}
 
 fn load_host() -> PluginHost {
     let reg = Arc::new(ToolRegistry::new());
@@ -34,13 +44,6 @@ fn load_host() -> PluginHost {
     host.load_source("grep", GREP_SRC).unwrap();
     host.load_source("batch", BATCH_SRC).unwrap();
     host
-}
-
-fn batch_state() -> Value {
-    json!({ "children": [
-        { "tool": "grep", "status": "success", "output": GREP_OUT },
-        { "tool": "bash", "status": "success", "output": "hello-from-bash" },
-    ]})
 }
 
 struct Restored {
