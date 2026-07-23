@@ -39,6 +39,14 @@ Notes:
 4. Tell it to return concise summaries with file:line refs, not full file contents.
 ]]
 
+local opts = maki.api.register_options({
+  max_concurrent = { default = 8, min = 1, desc = "Max concurrently running subagents." },
+  allow_model = {
+    default = false,
+    desc = "Expose a `model` input that overrides the subagent model. Only enable if you trust callers to pick an exact model themselves.",
+  },
+})
+
 local schema = {
   type = "object",
   required = { "description", "prompt" },
@@ -66,6 +74,15 @@ local schema = {
   },
 }
 
+-- Only advertise `model` when the plugin opts in: it costs tokens in every
+-- task schema, and an off-by-default flag keeps the common path lean.
+if opts.allow_model then
+  schema.properties.model = {
+    type = "string",
+    description = 'Exact model spec, e.g. "ollama/glm-5.2". You tell maki the model; maki will not guess. Overrides model_tier.',
+  }
+end
+
 local examples = {
   {
     description = "Find auth middleware",
@@ -73,10 +90,6 @@ local examples = {
     model_tier = "weak",
   },
 }
-
-local opts = maki.api.register_options({
-  max_concurrent = { default = 8, min = 1, desc = "Max concurrently running subagents." },
-})
 
 -- Process-wide cap on concurrent subagents.
 local semaphore = maki.async.semaphore(opts.max_concurrent)
@@ -110,6 +123,7 @@ local function handler(input, ctx)
 
   local model, model_err = maki.agent.resolve_model(ctx, {
     tier = input.model_tier,
+    spec = opts.allow_model and input.model or nil,
   })
   if model_err then
     return { llm_output = model_err, is_error = true }

@@ -660,6 +660,36 @@ fn agent_api_value_failures_return_err_pairs() {
     assert_eq!(out, "prompt_err tools_err model_err");
 }
 
+/// `spec` must win over `tier` when both are given, proving the task plugin's
+/// `model` field (forwarded as `spec`) takes precedence over `model_tier`.
+#[test]
+fn resolve_model_spec_takes_precedence_over_tier() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let src = format!(
+        r#"maki.api.register_tool({{
+            name = "spec_precedence_probe",
+            description = "t",
+            schema = {MINIMAL_SCHEMA},
+            audiences = {{ "main" }},
+            handler = function(input, ctx)
+                local m, err = maki.agent.resolve_model(ctx, {{
+                    tier = "weak",
+                    spec = "anthropic/claude-opus-4-8",
+                }})
+                if err then return "err:" .. err end
+                return m.spec
+            end
+        }})"#
+    );
+    host.load_source("spec_precedence_probe", &src).unwrap();
+    let out = exec_tool(&reg, "spec_precedence_probe", serde_json::json!({})).unwrap();
+    assert_eq!(
+        out, "anthropic/claude-opus-4-8",
+        "spec must override tier when both are set"
+    );
+}
+
 /// Restore used to lose anything drawn via `maki.async.run`: those tasks
 /// landed in the global spawn queue, which runs after the snapshot is
 /// taken. The runtime must run them inline, after the restore fn and after

@@ -66,6 +66,7 @@ maki.async.semaphore = function(n)
 end
 
 maki.agent.resolve_model = function(ctx, opts)
+  recorder.resolve_opts = opts
   return { spec = "test/model" }
 end
 
@@ -147,6 +148,9 @@ maki.api.register_tool({
       released = recorder.released,
       sem_size = recorder.sem_size,
     }
+    if recorder.resolve_opts then
+      snap.resolve_opts = recorder.resolve_opts
+    end
     if #recorder.prompts > 0 then
       snap.prompts = recorder.prompts
     end
@@ -156,14 +160,24 @@ maki.api.register_tool({
 "#;
 
 fn load_task_host() -> (Arc<ToolRegistry>, PluginHost) {
+    load_task_host_with_opts(serde_json::Map::new())
+}
+
+fn load_task_host_with_opts(
+    opts: serde_json::Map<String, serde_json::Value>,
+) -> (Arc<ToolRegistry>, PluginHost) {
     let reg = Arc::new(ToolRegistry::new());
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let prelude = STUB_PRELUDE
         .replace("@PLAIN_TEXT@", PLAIN_TEXT)
         .replace("@PROMPT_ERR@", PROMPT_ERR_MSG)
         .replace("@RAISE_MSG@", RAISE_MSG);
-    host.load_source("task_policy", &format!("{prelude}\n{TASK_PLUGIN_SRC}"))
-        .unwrap();
+    host.load_source_with_opts(
+        "task_policy",
+        &format!("{prelude}\n{TASK_PLUGIN_SRC}"),
+        opts,
+    )
+    .unwrap();
     (reg, host)
 }
 
@@ -192,6 +206,47 @@ fn task_input(scenario: &str, output_schema: Option<Value>) -> Value {
         input["output_schema"] = schema;
     }
     input
+}
+
+const FULL_MODEL_SPEC: &str = "aperture/ollama/glm-5.2";
+
+#[test]
+fn model_spec_forwards_full_spec_to_resolve_model() {
+    let mut opts = serde_json::Map::new();
+    opts.insert("allow_model".into(), json!(true));
+    let (reg, _host) = load_task_host_with_opts(opts);
+    let mut input = task_input(SCENARIO_PLAIN, None);
+    input["model"] = json!(FULL_MODEL_SPEC);
+    let out = exec_tool(&reg, TASK_TOOL, input).expect("task with model spec failed");
+    assert_eq!(out, PLAIN_TEXT);
+
+    let snap = probe(&reg);
+    let opts = snap["resolve_opts"]
+        .as_object()
+        .expect("resolve_opts missing");
+    assert_eq!(opts["spec"], json!(FULL_MODEL_SPEC));
+    assert!(
+        opts.get("tier").is_none_or(Value::is_null),
+        "tier should be unset when only model spec is given"
+    );
+}
+
+#[test]
+fn model_spec_ignored_when_allow_model_off() {
+    let (reg, _host) = load_task_host();
+    let mut input = task_input(SCENARIO_PLAIN, None);
+    input["model"] = json!(FULL_MODEL_SPEC);
+    let out = exec_tool(&reg, TASK_TOOL, input).expect("task with model spec failed");
+    assert_eq!(out, PLAIN_TEXT);
+
+    let snap = probe(&reg);
+    let opts = snap["resolve_opts"]
+        .as_object()
+        .expect("resolve_opts missing");
+    assert!(
+        opts.get("spec").is_none_or(Value::is_null),
+        "spec should not be forwarded when allow_model is off"
+    );
 }
 
 fn answer_schema() -> Value {
