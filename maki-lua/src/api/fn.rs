@@ -6,6 +6,7 @@ use std::process::Stdio;
 use std::thread;
 use std::time::Duration;
 
+use maki_config::bash_command;
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Function, Lua, RegistryKey, Result as LuaResult, Table, Value};
 
@@ -53,7 +54,7 @@ impl JobStore {
         on_stderr: Option<RegistryKey>,
         on_exit: Option<RegistryKey>,
     ) -> Result<u32, String> {
-        let mut command = maki_config::bash_command(cmd)?;
+        let mut command = bash_command(cmd)?;
         command
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
