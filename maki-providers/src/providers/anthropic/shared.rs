@@ -38,8 +38,6 @@ pub(crate) fn long_context_window(model_id: &str) -> Option<u32> {
         .then_some(LONG_CONTEXT_WINDOW)
 }
 
-pub(super) const MESSAGE_CACHE_BREAKPOINTS: usize = 2;
-
 #[derive(Serialize)]
 pub(crate) struct CacheControl {
     pub r#type: &'static str,
@@ -153,14 +151,31 @@ pub(super) struct WireMessage<'a> {
     pub content: Vec<WireContentBlock<'a>>,
 }
 
-pub(super) fn build_wire_messages(messages: &[Message]) -> Vec<WireMessage<'_>> {
+pub(super) fn build_wire_messages(
+    messages: &[Message],
+    message_cache_breakpoints: usize,
+) -> Vec<WireMessage<'_>> {
     let len = messages.len();
+
+    debug!(
+        message_cache_breakpoints,
+        num_messages = len,
+        "building wire messages with cache breakpoints"
+    );
 
     messages
         .iter()
         .enumerate()
         .map(|(msg_idx, msg)| {
-            let cache_last_block = msg_idx + MESSAGE_CACHE_BREAKPOINTS >= len;
+            let cache_last_block = msg_idx + message_cache_breakpoints >= len;
+
+            if cache_last_block {
+                debug!(
+                    msg_idx,
+                    total_blocks = msg.content.len(),
+                    "marking last block with cache_control"
+                );
+            }
 
             WireMessage {
                 role: &msg.role,
@@ -199,8 +214,9 @@ pub(crate) fn build_request_body_with_system(
     system_blocks: &[SystemBlock<'_>],
     tools: &Value,
     thinking: ThinkingConfig,
+    message_cache_breakpoints: usize,
 ) -> Value {
-    let wire_messages = build_wire_messages(messages);
+    let wire_messages = build_wire_messages(messages, message_cache_breakpoints);
     let wire_tools = build_wire_tools(tools);
 
     let mut body = json!({
@@ -562,8 +578,10 @@ mod tests {
     use test_case::test_case;
 
     use super::{
-        LONG_CONTEXT_SUFFIX, LONG_CONTEXT_WINDOW, long_context_window, strip_long_context,
+        LONG_CONTEXT_SUFFIX, LONG_CONTEXT_WINDOW, build_wire_messages, long_context_window,
+        strip_long_context,
     };
+    use crate::{ContentBlock, Message, Role};
 
     #[test_case("claude-opus-4-8-1m", "claude-opus-4-8" ; "strips_suffix")]
     #[test_case("claude-opus-4-8", "claude-opus-4-8" ; "leaves_plain_id")]
@@ -576,5 +594,87 @@ mod tests {
     fn long_context_window_follows_suffix(model_id: &str, expected: Option<u32>) {
         assert_eq!(long_context_window(model_id), expected);
         assert!(LONG_CONTEXT_SUFFIX.ends_with("1m"));
+    }
+
+    #[test_case(0 ; "breakpoints_0")]
+    #[test_case(1 ; "breakpoints_1")]
+    #[test_case(2 ; "breakpoints_2")]
+    #[test_case(3 ; "breakpoints_3")]
+    fn build_wire_messages_marks_cache_control(breakpoints: usize) {
+        let messages = vec![
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text {
+                    text: "first message".to_string(),
+                }],
+                display_text: None,
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "first response".to_string(),
+                }],
+                display_text: None,
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text {
+                    text: "second message".to_string(),
+                }],
+                display_text: None,
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "second response".to_string(),
+                }],
+                display_text: None,
+            },
+        ];
+
+        let wire = build_wire_messages(&messages, breakpoints);
+        let len = messages.len();
+
+        for (msg_idx, wire_msg) in wire.iter().enumerate() {
+            let should_cache = msg_idx + breakpoints >= len;
+            let last_block_has_cache = wire_msg
+                .content
+                .last()
+                .is_some_and(|b| b.cache_control.is_some());
+
+            assert_eq!(
+                should_cache, last_block_has_cache,
+                "message {msg_idx}: expected cache={should_cache}, got cache={last_block_has_cache}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_wire_messages_marks_only_last_block() {
+        let messages = vec![Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::Text {
+                    text: "first block".to_string(),
+                },
+                ContentBlock::Text {
+                    text: "second block".to_string(),
+                },
+                ContentBlock::Text {
+                    text: "third block".to_string(),
+                },
+            ],
+            display_text: None,
+        }];
+
+        let wire = build_wire_messages(&messages, 1);
+        assert_eq!(wire.len(), 1);
+
+        let wire_msg = &wire[0];
+        assert_eq!(wire_msg.content.len(), 3);
+
+        assert!(wire_msg.content[0].cache_control.is_none());
+        assert!(wire_msg.content[1].cache_control.is_none());
+        assert!(wire_msg.content[2].cache_control.is_some());
     }
 }

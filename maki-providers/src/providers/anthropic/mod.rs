@@ -402,6 +402,7 @@ impl Provider for Anthropic {
                 &system_blocks,
                 tools,
                 opts.thinking,
+                opts.message_cache_breakpoints,
             );
             body["model"] = json!(shared::strip_long_context(&model.id));
             body["stream"] = json!(true);
@@ -752,7 +753,7 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
     #[test]
     fn cache_control_placement() {
         let single = vec![Message::user("only".into())];
-        let wire = build_wire_messages(&single);
+        let wire = build_wire_messages(&single, 2);
         let json: Value = serde_json::to_value(&wire).unwrap();
         assert_eq!(
             json[0]["content"][0]["cache_control"],
@@ -783,7 +784,7 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
                 ..Default::default()
             },
         ];
-        let wire = build_wire_messages(&multi);
+        let wire = build_wire_messages(&multi, 2);
         let json: Value = serde_json::to_value(&wire).unwrap();
 
         assert!(json[0]["content"][0].get("cache_control").is_none());
@@ -817,7 +818,7 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
             ],
             ..Default::default()
         }];
-        let wire = build_wire_messages(&messages);
+        let wire = build_wire_messages(&messages, 2);
         let json: Value = serde_json::to_value(&wire).unwrap();
 
         assert_eq!(json[0]["content"][0]["type"], "tool_result");

@@ -7,6 +7,12 @@ local truncate = require("maki.truncate")
 local ToolView = require("maki.tool_view")
 local output_limits = require("maki.output_limits")
 
+maki.api.set_prompt({
+  prompt = "system",
+  slot = "environment",
+  content = "# Environment\nCurrent date: " .. os.date("%Y-%m-%d") .. "\n",
+})
+
 local opts = maki.api.register_options(output_limits.extend({
   max_response_bytes = {
     default = 5 * 1024 * 1024,
@@ -23,13 +29,11 @@ end
 maki.api.register_tool({
   name = "websearch",
   kind = "fetch",
-  description = "Search the web for real-time information using Exa AI.\n\n"
-    .. "Today's date is "
-    .. os.date("%Y-%m-%d")
-    .. ".\n\n"
-    .. "- Use for current events, documentation, APIs, or anything not in local files.\n"
-    .. "- Prefer specific, targeted queries over broad ones.\n"
-    .. "- Results include page titles, URLs, and content snippets.",
+  description = [[Search the web for real-time information using Exa AI.
+
+- Use for current events, documentation, APIs, or anything not in local files.
+- Prefer specific, targeted queries over broad ones.
+- Results include page titles, URLs, and content snippets.]],
 
   schema = {
     type = "object",

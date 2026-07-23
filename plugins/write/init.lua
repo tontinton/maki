@@ -1,12 +1,8 @@
 local shorten_path = require("maki.shorten_path")
 local ToolView = require("maki.tool_view")
 
-local DESCRIPTION = [[Write content to a file, replacing existing content.
-
-- Creates parent directories if needed.
-- Always read the file first before writing.
-- NEVER create files unless absolutely necessary - prefer editing existing files.
-- NEVER proactively create documentation files (*.md) or README files. Only create documentation files if explicitly requested by the User.]]
+local DESCRIPTION =
+  [[Write content to a file, replacing existing content. Creates parent directories. Always read first. Never create files unless necessary. Never proactively create docs (*.md, README) unless requested.]]
 
 local function write_view_opts(ctx)
   local tol = ctx:tool_output_lines()
@@ -30,6 +26,7 @@ maki.api.register_tool({
   mutable_path = "path",
   permission_scopes = "path",
   audiences = { "main", "general_sub", "interpreter" },
+  modes = { "default", "build" },
   description = DESCRIPTION,
 
   schema = {
@@ -37,13 +34,11 @@ maki.api.register_tool({
     properties = {
       path = {
         type = "string",
-        description = "Absolute path to the file",
         required = true,
         alias = "file_path",
       },
       content = {
         type = "string",
-        description = "The complete file content to write",
         required = true,
       },
     },

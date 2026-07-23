@@ -226,6 +226,9 @@ pub trait Tool: Send + Sync + 'static {
     fn tool_kind(&self) -> Option<&str> {
         None
     }
+    fn modes(&self) -> &[&str] {
+        &["default"]
+    }
     fn parse(&self, input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError>;
 }
 
@@ -261,6 +264,29 @@ impl Default for ToolRegistry {
 pub enum RegistryError {
     #[error("tool '{name}' is already registered (existing source: {existing})")]
     NameConflict { name: String, existing: String },
+}
+
+fn build_tool_definition(
+    entry: &RegisteredTool,
+    vars: &Vars,
+    ctx: &DescriptionContext,
+    supports_examples: bool,
+) -> Value {
+    let description = vars.apply(&entry.tool.description(ctx)).into_owned();
+    let mut def = json!({
+        "name": entry.name(),
+        "description": description,
+        "input_schema": entry.tool.schema(),
+    });
+    if let Some(examples) = entry.tool.examples() {
+        if supports_examples {
+            def["input_examples"] = examples;
+        } else if let Some(text) = format_examples_as_text(&examples) {
+            let merged = format!("{}\n\n{}", def["description"].as_str().unwrap_or(""), text);
+            def["description"] = Value::String(merged);
+        }
+    }
+    def
 }
 
 impl ToolRegistry {
@@ -451,28 +477,52 @@ impl ToolRegistry {
             if !ctx.filter.matches(entry.name()) {
                 continue;
             }
-            let description = vars.apply(&entry.tool.description(ctx)).into_owned();
-            let mut def = json!({
-                "name": entry.name(),
-                "description": description,
-                "input_schema": entry.tool.schema(),
-            });
-            if let Some(examples) = entry.tool.examples() {
-                if supports_examples {
-                    def["input_examples"] = examples;
-                } else if let Some(text) = format_examples_as_text(&examples) {
-                    let merged =
-                        format!("{}\n\n{}", def["description"].as_str().unwrap_or(""), text);
-                    def["description"] = Value::String(merged);
-                }
-            }
-            out.push(def);
+            out.push(build_tool_definition(entry, vars, ctx, supports_examples));
         }
         Value::Array(out)
     }
 
     pub fn iter(&self) -> RegistrySnapshot {
         RegistrySnapshot(self.tools.load_full())
+    }
+
+    pub fn active_tools_for_mode(&self, mode: &str, additional: &[Arc<str>]) -> Vec<Arc<str>> {
+        let snapshot = self.tools.load();
+        let mut active: std::collections::HashSet<Arc<str>> = snapshot
+            .iter()
+            .filter(|t| t.tool.modes().contains(&mode))
+            .map(|t| Arc::from(t.name()))
+            .collect();
+        for name in additional {
+            active.insert(name.clone());
+        }
+        active.into_iter().collect()
+    }
+
+    pub fn definitions_filtered(
+        &self,
+        vars: &Vars,
+        ctx: &DescriptionContext,
+        supports_examples: bool,
+        allowed: &[Arc<str>],
+    ) -> Value {
+        let snapshot = self.tools.load();
+        let allowed_set: std::collections::HashSet<&str> =
+            allowed.iter().map(|s| s.as_ref()).collect();
+        let mut out = Vec::with_capacity(snapshot.len());
+        for entry in snapshot.iter() {
+            if !entry.tool.audience().contains(ctx.audience) {
+                continue;
+            }
+            if !ctx.filter.matches(entry.name()) {
+                continue;
+            }
+            if !allowed_set.contains(entry.name()) {
+                continue;
+            }
+            out.push(build_tool_definition(entry, vars, ctx, supports_examples));
+        }
+        Value::Array(out)
     }
 }
 
@@ -517,6 +567,7 @@ mod tests {
     struct MockTool {
         name: String,
         audience: ToolAudience,
+        modes: Vec<&'static str>,
     }
 
     struct MockInvocation;
@@ -543,19 +594,27 @@ mod tests {
         fn audience(&self) -> ToolAudience {
             self.audience
         }
+        fn modes(&self) -> &[&str] {
+            if self.modes.is_empty() {
+                &["default"]
+            } else {
+                &self.modes
+            }
+        }
         fn parse(&self, _input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
             Ok(Box::new(MockInvocation))
         }
     }
 
     fn mock(name: &str) -> Arc<dyn Tool> {
-        mock_scoped(name, ToolAudience::all())
+        mock_scoped(name, ToolAudience::all(), vec!["default"])
     }
 
-    fn mock_scoped(name: &str, audience: ToolAudience) -> Arc<dyn Tool> {
+    fn mock_scoped(name: &str, audience: ToolAudience, modes: Vec<&'static str>) -> Arc<dyn Tool> {
         Arc::new(MockTool {
             name: name.to_owned(),
             audience,
+            modes,
         })
     }
 
@@ -739,10 +798,72 @@ mod tests {
     }
 
     #[test]
+    fn active_tools_for_mode_filters_by_mode() {
+        let reg = ToolRegistry::new();
+        reg.register(
+            mock_scoped(
+                "read_tool",
+                ToolAudience::all(),
+                vec!["default", "research"],
+            ),
+            lua_source("p"),
+        )
+        .unwrap();
+        reg.register(
+            mock_scoped("write_tool", ToolAudience::all(), vec!["default", "build"]),
+            lua_source("p"),
+        )
+        .unwrap();
+        reg.register(
+            mock_scoped(
+                "bash_tool",
+                ToolAudience::all(),
+                vec!["default", "research", "build", "compact"],
+            ),
+            lua_source("p"),
+        )
+        .unwrap();
+
+        let research_tools = reg.active_tools_for_mode("research", &[]);
+        assert!(research_tools.iter().any(|n| n.as_ref() == "read_tool"));
+        assert!(research_tools.iter().any(|n| n.as_ref() == "bash_tool"));
+        assert!(!research_tools.iter().any(|n| n.as_ref() == "write_tool"));
+
+        let build_tools = reg.active_tools_for_mode("build", &[]);
+        assert!(build_tools.iter().any(|n| n.as_ref() == "write_tool"));
+        assert!(build_tools.iter().any(|n| n.as_ref() == "bash_tool"));
+        assert!(!build_tools.iter().any(|n| n.as_ref() == "read_tool"));
+
+        let default_tools = reg.active_tools_for_mode("default", &[]);
+        assert!(default_tools.iter().any(|n| n.as_ref() == "read_tool"));
+        assert!(default_tools.iter().any(|n| n.as_ref() == "write_tool"));
+        assert!(default_tools.iter().any(|n| n.as_ref() == "bash_tool"));
+    }
+
+    #[test]
+    fn active_tools_for_mode_includes_additional() {
+        let reg = ToolRegistry::new();
+        reg.register(
+            mock_scoped("read_tool", ToolAudience::all(), vec!["research"]),
+            lua_source("p"),
+        )
+        .unwrap();
+        reg.register(
+            mock_scoped("write_tool", ToolAudience::all(), vec!["build"]),
+            lua_source("p"),
+        )
+        .unwrap();
+
+        let tools = reg.active_tools_for_mode("research", &[Arc::from("write_tool")]);
+        assert!(tools.iter().any(|n| n.as_ref() == "read_tool"));
+        assert!(tools.iter().any(|n| n.as_ref() == "write_tool"));
+    }
+
+    #[test]
     fn definitions_excludes_wrong_audience() {
         let reg = ToolRegistry::new();
         reg.register(
-            mock_scoped("main_only_tool", ToolAudience::MAIN),
+            mock_scoped("main_only_tool", ToolAudience::MAIN, vec!["default"]),
             lua_source("p"),
         )
         .unwrap();

@@ -47,16 +47,7 @@ local INDICATOR = {
 }
 
 local description = string.format(
-  [[Executes multiple independent tool calls concurrently to reduce round-trips.
-
-ALWAYS USE THE BATCH TOOL WHEN YOU HAVE MULTIPLE INDEPENDENT TOOL CALLS. This dramatically improves performance.
-
-Rules:
-- 1-%d tool calls per batch
-- All calls run in parallel; order NOT guaranteed
-- Partial failures do not stop other calls
-- Do NOT nest batch inside batch
-- Do NOT use for dependent operations or when filtering results (use code_execution)]],
+  [[Execute multiple independent tool calls concurrently. ALWAYS use batch for multiple independent calls. 1-%d tools per batch. Parallel execution, order not guaranteed. Partial failures don't stop others. Do NOT nest batch. Use code_execution for dependent operations.]],
   MAX_BATCH_SIZE
 )
 
@@ -70,16 +61,6 @@ local schema = {
       items = {
         description = "Tool invocation: { tool: string, parameters: object } or flat { tool: string, ...params }",
       },
-    },
-  },
-}
-
-local examples = {
-  {
-    tool_calls = {
-      { tool = "glob", parameters = { pattern = "src/**/*.ts" } },
-      { tool = "grep", parameters = { pattern = "import", include = "*.ts" } },
-      { tool = "index", parameters = { path = "/project/index.ts" } },
     },
   },
 }
@@ -520,7 +501,6 @@ maki.api.register_tool({
   kind = "execute",
   audiences = { "main", "research_sub", "general_sub" },
   schema = schema,
-  examples = examples,
   header = function(input)
     return #(input.tool_calls or {}) .. " tools"
   end,

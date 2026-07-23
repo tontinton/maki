@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -10,7 +11,7 @@ use maki_providers::model::Model;
 use maki_providers::provider::{self, Provider};
 use maki_storage::StateDir;
 use maki_storage::id::{MakiId, SessionRef};
-use maki_storage::sessions::Session;
+use maki_storage::sessions::{Session, compact_tool_outputs};
 use serde_json::Value;
 use tracing::{error, warn};
 
@@ -64,6 +65,18 @@ impl SessionStore {
         self.session.messages = messages.to_vec();
         self.session.model = model_spec;
         self.session.update_title_if_default();
+
+        const RECENT_TURNS: usize = 3;
+        let recent_turn_start = messages.len().saturating_sub(RECENT_TURNS);
+        let mut recent_tool_ids = HashSet::new();
+
+        for msg in &messages[recent_turn_start..] {
+            for (id, _, _) in msg.tool_uses() {
+                recent_tool_ids.insert(id.to_string());
+            }
+        }
+
+        compact_tool_outputs(&mut self.session, &recent_tool_ids);
         self.save();
     }
 }
@@ -97,6 +110,16 @@ struct AgentSetup {
     tools: Value,
 }
 
+struct ToolDefinitionsParams<'a> {
+    vars: &'a template::Vars,
+    model: &'a Model,
+    config: &'a AgentConfig,
+    excluded_tools: &'a [&'static str],
+    workflow: bool,
+    registry: &'a ToolRegistry,
+    additional_active: &'a [Arc<str>],
+}
+
 fn setup(
     model: &Model,
     config: &AgentConfig,
@@ -105,14 +128,16 @@ fn setup(
 ) -> AgentSetup {
     let vars = template::env_vars();
     let instructions = agent::load_instructions(&vars.apply("{cwd}"));
-    let tools = tool_definitions(
-        &vars,
+    let params = ToolDefinitionsParams {
+        vars: &vars,
         model,
         config,
         excluded_tools,
         workflow,
-        ToolRegistry::global(),
-    );
+        registry: ToolRegistry::global(),
+        additional_active: &[],
+    };
+    let tools = tool_definitions(&params);
 
     AgentSetup {
         vars,
@@ -121,23 +146,29 @@ fn setup(
     }
 }
 
-/// Base definitions only. MCP definitions are injected per request by
-/// `Agent::request_tools`; storing them here would freeze the catalog.
-fn tool_definitions(
-    vars: &template::Vars,
-    model: &Model,
-    config: &AgentConfig,
-    excluded_tools: &[&'static str],
-    workflow: bool,
-    registry: &ToolRegistry,
-) -> Value {
-    let filter = ToolFilter::from_config(config, model, excluded_tools);
+fn tool_definitions(params: &ToolDefinitionsParams) -> Value {
+    let filter = ToolFilter::from_config(params.config, params.model, params.excluded_tools);
     let ctx = DescriptionContext {
         filter: &filter,
         audience: ToolAudience::MAIN,
-        workflow,
+        workflow: params.workflow,
     };
-    registry.definitions(vars, &ctx, model.supports_tool_examples())
+    if params.config.dynamic_tools.enabled {
+        let mode = &params.config.dynamic_tools.default_mode;
+        let allowed = params
+            .registry
+            .active_tools_for_mode(mode, params.additional_active);
+        params.registry.definitions_filtered(
+            params.vars,
+            &ctx,
+            params.model.supports_tool_examples(),
+            &allowed,
+        )
+    } else {
+        params
+            .registry
+            .definitions(params.vars, &ctx, params.model.supports_tool_examples())
+    }
 }
 
 /// Names advertised to SDK clients: base tools plus what the first request
@@ -227,7 +258,8 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
                 },
             )
             .with_loaded_instructions(instructions.loaded)
-            .with_mcp(mcp);
+            .with_mcp(mcp)
+            .with_excluded_tools(&params.excluded_tools);
 
             let result = agent
                 .run(AgentInput {
@@ -369,14 +401,16 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                     match provider::from_model_async(&mut new_model, params.timeouts).await {
                         Ok(p) => {
                             provider = Arc::from(p);
-                            tools = tool_definitions(
-                                &vars,
-                                &new_model,
-                                &params.config,
-                                &params.excluded_tools,
-                                params.workflow,
-                                ToolRegistry::global(),
-                            );
+                            let tool_params = ToolDefinitionsParams {
+                                vars: &vars,
+                                model: &new_model,
+                                config: &params.config,
+                                excluded_tools: params.excluded_tools.as_slice(),
+                                workflow: params.workflow,
+                                registry: ToolRegistry::global(),
+                                additional_active: &[],
+                            };
+                            tools = tool_definitions(&tool_params);
                             model = new_model;
                         }
                         Err(e) => {
@@ -441,7 +475,8 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                 .with_loaded_instructions(instructions.loaded.clone())
                 .with_user_response_rx(Arc::clone(&answer_rx))
                 .with_cancel(cancel)
-                .with_mcp(mcp.clone());
+                .with_mcp(mcp.clone())
+                .with_excluded_tools(&params.excluded_tools);
 
                 let result = agent.run(input).await;
                 drop(agent);

@@ -349,7 +349,8 @@ impl<'t> EventLoop<'t> {
 
         let storage_writer = Arc::new(StorageWriter::new(storage.clone()));
         let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
-        let (mcp_handle, mcp_config_errors) = smol::block_on(mcp::start(&cwd));
+        let (mcp_handle, mcp_config_errors) =
+            smol::block_on(mcp::start(&cwd, config.mcp_tool_desc_max_chars));
 
         let provider: Arc<dyn Provider> = if needs_login {
             Arc::from(maki_providers::provider::from_model_fallback(

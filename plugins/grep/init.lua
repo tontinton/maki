@@ -196,27 +196,21 @@ maki.api.register_prompt_hint({
 maki.api.register_tool({
   name = "grep",
   kind = "search",
-  description = [[Search file contents using regex.
-
-- Respects .gitignore.
-- Results grouped by file, sorted by modification time.
-- Prefer speculative parallel searches over sequential rounds of glob+grep.
-- Do NOT wrap the pattern in quotes. Do NOT double-escape (e.g. `\[` not `\\[`).
-- Multi-line matching is auto-enabled when the pattern contains `\n`, `(?s)`, or `(?m)`.]],
+  modes = { "default", "research", "build", "compact" },
+  description = [[Search file contents using regex. Respects .gitignore. Results grouped by file, sorted by modification time. Prefer speculative parallel searches over sequential glob+grep. Do NOT wrap pattern in quotes or double-escape (e.g. `\[` not `\\[`). Multi-line matching auto-enabled when pattern contains `\n`, `(?s)`, or `(?m)`.]],
 
   schema = {
     type = "object",
     properties = {
-      pattern = { type = "string", description = "Regex pattern", required = true },
-      path = { type = "string", description = "Directory to search in (default: cwd)" },
+      pattern = { type = "string", required = true },
+      path = { type = "string" },
       include = {
         type = "string",
-        description = "File glob filter (e.g. *.c)",
         alias = "glob",
       },
-      context_before = { type = "integer", description = "Context lines before match" },
-      context_after = { type = "integer", description = "Context lines after match" },
-      limit = { type = "integer", description = "Max match groups to return" },
+      context_before = { type = "integer" },
+      context_after = { type = "integer" },
+      limit = { type = "integer" },
     },
   },
 

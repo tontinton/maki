@@ -101,6 +101,7 @@ How many lines of output to show per tool in the UI. All values are `usize` with
 | `max_output_lines` | usize | `2000` | 10 | Max tool output lines |
 | `max_continuation_turns` | u32 | `3` | 1 | Max automatic continuation turns |
 | `compaction_buffer` | u32 \| string | `20%` | - | Context reserved for compaction: token count or percent of the context window (e.g. "20%") |
+| `mcp_tool_desc_max_chars` | usize | `300` | 10 | Max MCP tool description length (characters) |
 
 ### `provider`
 

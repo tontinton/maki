@@ -440,11 +440,16 @@ impl From<TokenUsage> for StoredTokenUsage {
 
 impl TokenUsage {
     pub fn total_input(&self) -> u32 {
-        self.input + self.cache_read + self.cache_creation
+        self.input
+            .saturating_add(self.cache_read)
+            .saturating_add(self.cache_creation)
     }
 
     pub fn context_tokens(&self) -> u32 {
-        self.input + self.output + self.cache_creation + self.cache_read
+        self.input
+            .saturating_add(self.output)
+            .saturating_add(self.cache_creation)
+            .saturating_add(self.cache_read)
     }
 
     pub fn cost(&self, pricing: &ModelPricing, fast: bool) -> f64 {
@@ -471,10 +476,10 @@ impl TokenUsage {
 
 impl AddAssign for TokenUsage {
     fn add_assign(&mut self, rhs: Self) {
-        self.input += rhs.input;
-        self.output += rhs.output;
-        self.cache_creation += rhs.cache_creation;
-        self.cache_read += rhs.cache_read;
+        self.input = self.input.saturating_add(rhs.input);
+        self.output = self.output.saturating_add(rhs.output);
+        self.cache_creation = self.cache_creation.saturating_add(rhs.cache_creation);
+        self.cache_read = self.cache_read.saturating_add(rhs.cache_read);
     }
 }
 
@@ -509,6 +514,70 @@ mod tests {
             cache_read: 150_000,
         };
         assert_eq!(usage.total_input(), 165_000);
+    }
+
+    #[test]
+    fn total_input_saturates_at_u32_max() {
+        let usage = TokenUsage {
+            input: u32::MAX - 100,
+            output: 0,
+            cache_creation: 200,
+            cache_read: 0,
+        };
+        assert_eq!(usage.total_input(), u32::MAX);
+    }
+
+    #[test]
+    fn context_tokens_saturates_at_u32_max() {
+        let usage = TokenUsage {
+            input: u32::MAX - 50,
+            output: 100,
+            cache_creation: 0,
+            cache_read: 0,
+        };
+        assert_eq!(usage.context_tokens(), u32::MAX);
+    }
+
+    #[test]
+    fn add_assign_saturates_at_u32_max() {
+        let mut usage = TokenUsage {
+            input: u32::MAX - 10,
+            output: 5,
+            cache_creation: 0,
+            cache_read: 0,
+        };
+        let other = TokenUsage {
+            input: 20,
+            output: 10,
+            cache_creation: 5,
+            cache_read: 5,
+        };
+        usage += other;
+        assert_eq!(usage.input, u32::MAX);
+        assert_eq!(usage.output, 15);
+        assert_eq!(usage.cache_creation, 5);
+        assert_eq!(usage.cache_read, 5);
+    }
+
+    #[test]
+    fn add_assign_normal_values_sum_correctly() {
+        let mut usage = TokenUsage {
+            input: 1000,
+            output: 500,
+            cache_creation: 200,
+            cache_read: 300,
+        };
+        let other = TokenUsage {
+            input: 500,
+            output: 250,
+            cache_creation: 100,
+            cache_read: 150,
+        };
+        usage += other;
+        assert_eq!(usage.input, 1500);
+        assert_eq!(usage.output, 750);
+        assert_eq!(usage.cache_creation, 300);
+        assert_eq!(usage.cache_read, 450);
     }
 
     #[test]

@@ -38,14 +38,7 @@ maki.api.register_prompt_hint({
     if #entries == 0 then
       return nil
     end
-    table.sort(entries, function(a, b)
-      return a[1] < b[1]
-    end)
-    local out = "\n\nMemory files (use the memory tool to view/update):\n"
-    for _, e in ipairs(entries) do
-      out = out .. "- " .. e[1] .. " (" .. e[2] .. " bytes)\n"
-    end
-    return out
+    return "\n\nMemory files: " .. #entries .. " entries (use memory tool to view/update)\n"
   end,
 })
 
@@ -133,9 +126,7 @@ end
 
 maki.api.register_tool({
   name = "memory",
-  description = "Persistent, project-scoped scratchpad for learnings, patterns, decisions, and gotchas across sessions.\n\n"
-    .. "- Save important context before compaction or to build up project knowledge.\n"
-    .. "- Keep entries concise and current. Delete outdated information.",
+  description = "Persistent, project-scoped scratchpad for learnings, patterns, decisions, and gotchas across sessions. Save important context before compaction or to build project knowledge. Keep entries concise and current. Delete outdated information.",
 
   schema = {
     type = "object",

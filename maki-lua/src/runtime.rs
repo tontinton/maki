@@ -1406,6 +1406,8 @@ impl LuaRuntime {
                     schema: t.schema,
                     audience: t.audience,
                     kind: t.kind.clone(),
+                    modes: Arc::new(t.modes.clone()),
+                    mode_cache: std::sync::OnceLock::new(),
                     tx: self.tx.clone(),
                     plugin: Arc::clone(&name),
                     has_header_fn: t.header_key.is_some(),

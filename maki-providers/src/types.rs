@@ -569,11 +569,25 @@ impl From<ThinkingConfig> for StoredThinking {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RequestOptions {
     pub thinking: ThinkingConfig,
     /// Raw user preference, reconciled by [`RequestOptions::clamped`] before use.
     pub fast: bool,
+    /// Number of recent messages whose last content block should be marked with
+    /// cache_control. Default is 2. Higher values increase cache write cost but
+    /// may improve cache hit rates in long conversations.
+    pub message_cache_breakpoints: usize,
+}
+
+impl Default for RequestOptions {
+    fn default() -> Self {
+        Self {
+            thinking: Default::default(),
+            fast: false,
+            message_cache_breakpoints: 2,
+        }
+    }
 }
 
 impl RequestOptions {
@@ -588,6 +602,7 @@ impl RequestOptions {
                 ThinkingConfig::Off
             },
             fast: self.fast && model.supports_fast(),
+            message_cache_breakpoints: self.message_cache_breakpoints,
         }
     }
 }
@@ -901,6 +916,7 @@ mod tests {
         let opts = RequestOptions {
             thinking,
             fast: false,
+            message_cache_breakpoints: 2,
         };
         assert_eq!(opts.clamped(&model).thinking, expected);
     }
@@ -911,6 +927,7 @@ mod tests {
         let opts = RequestOptions {
             thinking: ThinkingConfig::Off,
             fast: true,
+            message_cache_breakpoints: 2,
         };
         assert!(!opts.clamped(&model).fast);
     }

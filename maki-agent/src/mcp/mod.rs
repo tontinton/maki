@@ -29,6 +29,8 @@ use maki_providers::{ContentBlock, Message};
 use serde_json::{Value, json};
 use tracing::{info, warn};
 
+use crate::tools::schema::{sanitize_tool_input_schema, truncate_on_word_boundary};
+
 use self::config::{
     McpConfig, McpConfigErrors, McpServerInfo, McpServerStatus, ServerConfig, Transport,
     load_config, parse_server, transport_kind,
@@ -183,6 +185,7 @@ impl ServerEntry {
 struct McpManagerInner {
     entries: Vec<ServerEntry>,
     generation: u64,
+    max_desc_chars: usize,
 }
 
 #[derive(Default)]
@@ -542,15 +545,15 @@ impl McpHandle {
     }
 }
 
-pub async fn start(cwd: &Path) -> (Option<McpHandle>, McpConfigErrors) {
+pub async fn start(cwd: &Path, max_desc_chars: usize) -> (Option<McpHandle>, McpConfigErrors) {
     tracing::info!(cwd = %cwd.display(), "starting MCP");
     let cwd = cwd.to_owned();
     let (config, config_errors) = smol::unblock(move || load_config(&cwd)).await;
-    let handle = start_with_config(config).await;
+    let handle = start_with_config(config, max_desc_chars).await;
     (handle, config_errors)
 }
 
-pub async fn start_with_config(config: McpConfig) -> Option<McpHandle> {
+pub async fn start_with_config(config: McpConfig, max_desc_chars: usize) -> Option<McpHandle> {
     if config.is_empty() {
         tracing::info!("no MCP servers configured, skipping");
         return None;
@@ -558,12 +561,13 @@ pub async fn start_with_config(config: McpConfig) -> Option<McpHandle> {
 
     let defer_tools = config.defer_tools.unwrap_or(DEFAULT_DEFER_TOOLS);
     let mut inner = parse_entries(config);
+    inner.max_desc_chars = max_desc_chars;
     start_enabled(&mut inner).await;
     inner.generation += 1;
 
     let snapshot = Arc::new(ArcSwap::from_pointee(McpSnapshot::default()));
     let index: Arc<ArcSwap<ToolIndex>> = Arc::new(ArcSwap::from_pointee(ToolIndex::default()));
-    publish(&inner, &index, &snapshot);
+    publish(&inner, &index, &snapshot, max_desc_chars);
 
     let (cmd_tx, cmd_rx) = flume::unbounded();
     let handle = McpHandle {
@@ -608,11 +612,11 @@ async fn run(
             }
         }
         inner.generation += 1;
-        publish(&inner, &index, &snapshot);
+        publish(&inner, &index, &snapshot, inner.max_desc_chars);
     }
     shutdown_all(&mut inner).await;
     inner.generation += 1;
-    publish(&inner, &index, &snapshot);
+    publish(&inner, &index, &snapshot, inner.max_desc_chars);
     if let Some(tx) = ack {
         let _ = tx.try_send(());
     }
@@ -807,6 +811,7 @@ fn parse_entries(config: McpConfig) -> McpManagerInner {
     McpManagerInner {
         entries,
         generation: 0,
+        max_desc_chars: maki_config::DEFAULT_MCP_TOOL_DESC_MAX_CHARS,
     }
 }
 
@@ -847,7 +852,12 @@ fn apply_start_result(
 }
 
 /// The only place read-side state is updated. Every mutation in the command loop ends here.
-fn publish(inner: &McpManagerInner, index: &ArcSwap<ToolIndex>, snapshot: &ArcSwap<McpSnapshot>) {
+fn publish(
+    inner: &McpManagerInner,
+    index: &ArcSwap<ToolIndex>,
+    snapshot: &ArcSwap<McpSnapshot>,
+    max_desc_chars: usize,
+) {
     let mut tools = HashMap::new();
     let mut prompts = HashMap::new();
     let mut descriptors: Vec<ToolDescriptor> = Vec::new();
@@ -873,13 +883,31 @@ fn publish(inner: &McpManagerInner, index: &ArcSwap<ToolIndex>, snapshot: &ArcSw
                         transport: Arc::clone(transport),
                     },
                 );
+
+                let description_chars = t.description.chars().count();
+                let description = if description_chars > max_desc_chars {
+                    let truncated = truncate_on_word_boundary(&t.description, max_desc_chars);
+                    warn!(
+                        tool = %t.qualified_name,
+                        original_len = description_chars,
+                        truncated_len = truncated.chars().count(),
+                        max_len = max_desc_chars,
+                        "truncated MCP tool description"
+                    );
+                    truncated
+                } else {
+                    t.description.clone()
+                };
+
+                let input_schema = sanitize_tool_input_schema(t.input_schema.clone());
+
                 descriptors.push(ToolDescriptor {
                     qualified_name: Arc::clone(&t.qualified_name),
                     always_load,
                     definition: json!({
                         "name": wire_tool_name(&t.qualified_name),
-                        "description": t.description,
-                        "input_schema": t.input_schema,
+                        "description": description,
+                        "input_schema": input_schema,
                     }),
                 });
             }
@@ -948,10 +976,11 @@ pub(crate) fn stub_session(tools: &[(&str, &str)]) -> McpSession {
     let inner = McpManagerInner {
         entries: vec![entry],
         generation: 0,
+        max_desc_chars: maki_config::DEFAULT_MCP_TOOL_DESC_MAX_CHARS,
     };
     let index = Arc::new(ArcSwap::from_pointee(ToolIndex::default()));
     let snapshot = Arc::new(ArcSwap::from_pointee(McpSnapshot::default()));
-    publish(&inner, &index, &snapshot);
+    publish(&inner, &index, &snapshot, inner.max_desc_chars);
     McpSession::new(
         McpHandle {
             cmd_tx: flume::unbounded().0,
@@ -1257,10 +1286,11 @@ mod tests {
         let inner = McpManagerInner {
             entries,
             generation: 0,
+            max_desc_chars: maki_config::DEFAULT_MCP_TOOL_DESC_MAX_CHARS,
         };
         let index = Arc::new(ArcSwap::from_pointee(ToolIndex::default()));
         let snapshot = Arc::new(ArcSwap::from_pointee(McpSnapshot::default()));
-        publish(&inner, &index, &snapshot);
+        publish(&inner, &index, &snapshot, inner.max_desc_chars);
         let handle = McpHandle {
             cmd_tx: flume::unbounded().0,
             index,
@@ -1612,7 +1642,7 @@ mod tests {
     #[test]
     fn start_with_config_produces_terminal_statuses() {
         smol::block_on(async {
-            let handle = start_with_config(McpConfig::default()).await;
+            let handle = start_with_config(McpConfig::default(), 300).await;
             assert!(handle.is_none());
 
             let mut disabled = stdio_raw(&["unused-disabled-cmd"]);
@@ -1621,7 +1651,7 @@ mod tests {
                 ("disabled-srv", disabled),
                 ("bad-srv", stdio_raw(&[])),
             ]);
-            let handle = start_with_config(config).await;
+            let handle = start_with_config(config, 300).await;
             let handle = handle.unwrap();
             let infos = handle.reader().load().infos.clone();
 
@@ -1666,7 +1696,12 @@ mod tests {
             assert_eq!(tools[0]["name"], TOOL_SEARCH_TOOL_NAME);
 
             handle_toggle(&mut inner, "srv", false).await;
-            publish(&inner, &handle.index, &handle.snapshot);
+            publish(
+                &inner,
+                &handle.index,
+                &handle.snapshot,
+                inner.max_desc_chars,
+            );
 
             let entry = &inner.entries[0];
             assert_eq!(t.shutdowns(), 1);
@@ -1699,7 +1734,12 @@ mod tests {
 
             entered.recv_async().await.unwrap();
             inner.generation += 1;
-            publish(&inner, &handle.index, &handle.snapshot);
+            publish(
+                &inner,
+                &handle.index,
+                &handle.snapshot,
+                inner.max_desc_chars,
+            );
             assert_eq!(handle.snapshot.load().generation, 1);
 
             drop(held);
@@ -1717,6 +1757,7 @@ mod tests {
                     fake_entry("b", Arc::clone(&t2) as _),
                 ],
                 generation: 0,
+                max_desc_chars: maki_config::DEFAULT_MCP_TOOL_DESC_MAX_CHARS,
             };
             let index = Arc::new(ArcSwap::from_pointee(ToolIndex::default()));
             let snapshot = Arc::new(ArcSwap::from_pointee(McpSnapshot::default()));
@@ -1745,6 +1786,57 @@ mod tests {
         // Valid: alphanumeric, underscore, hyphen, 1-64 chars
         assert!(is_valid_tool_name("search"));
         assert!(is_valid_tool_name("web_search"));
+    }
+
+    #[test]
+    fn publish_truncates_long_descriptions() {
+        let t = FakeTransport::new();
+        let mut entry = fake_entry("srv", Arc::clone(&t) as _);
+        entry.tools[0].description = "a".repeat(500);
+        let inner = McpManagerInner {
+            entries: vec![entry],
+            generation: 0,
+            max_desc_chars: 100,
+        };
+        let index = Arc::new(ArcSwap::from_pointee(ToolIndex::default()));
+        let snapshot = Arc::new(ArcSwap::from_pointee(McpSnapshot::default()));
+        publish(&inner, &index, &snapshot, 100);
+
+        let descriptors = &index.load().descriptors;
+        assert_eq!(descriptors.len(), 1);
+        let desc = descriptors[0].definition["description"].as_str().unwrap();
+        assert!(desc.len() <= 103);
+        assert!(desc.ends_with("..."));
+    }
+
+    #[test]
+    fn publish_sanitizes_tool_schemas() {
+        let t = FakeTransport::new();
+        let mut entry = fake_entry("srv", Arc::clone(&t) as _);
+        entry.tools[0].input_schema = json!({
+            "properties": {
+                "path": {"type": "string"}
+            }
+        });
+        let inner = McpManagerInner {
+            entries: vec![entry],
+            generation: 0,
+            max_desc_chars: 300,
+        };
+        let index = Arc::new(ArcSwap::from_pointee(ToolIndex::default()));
+        let snapshot = Arc::new(ArcSwap::from_pointee(McpSnapshot::default()));
+        publish(&inner, &index, &snapshot, 300);
+
+        let descriptors = &index.load().descriptors;
+        assert_eq!(descriptors.len(), 1);
+        let schema = &descriptors[0].definition["input_schema"];
+        assert_eq!(schema["type"], "object");
+        assert!(schema["properties"].is_object());
+    }
+
+    #[test]
+    fn is_valid_tool_name_enforces_wire_format_full() {
+        use config::is_valid_tool_name;
         assert!(is_valid_tool_name("my-tool"));
         assert!(is_valid_tool_name(&"a".repeat(64)));
         // Invalid: empty, dots, special chars, too long

@@ -35,6 +35,10 @@ const NON_SESSION_STEMS: [&str; 2] = [CWD_INDEX_STEM, SCAN_CACHE_STEM];
 const DEFAULT_TITLE: &str = "New session";
 const MAX_TITLE_LEN: usize = 60;
 
+pub trait Summarizable {
+    fn summarize(&self) -> Self;
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
     #[error(transparent)]
@@ -850,6 +854,19 @@ fn jsonl_path(dir: &Path, id: MakiId) -> PathBuf {
     dir.join(format!("{id}.jsonl"))
 }
 
+pub fn compact_tool_outputs<M, U, T>(
+    session: &mut Session<M, U, T>,
+    recent_tool_ids: &HashSet<String>,
+) where
+    T: Summarizable + Clone,
+{
+    for (id, output) in session.tool_outputs.iter_mut() {
+        if !recent_tool_ids.contains(id) {
+            *output = output.summarize();
+        }
+    }
+}
+
 fn json_path(dir: &Path, id: MakiId) -> PathBuf {
     dir.join(format!("{id}.json"))
 }
@@ -1281,14 +1298,15 @@ mod tests {
     use super::StoredThinking;
     use super::ThinkingParseError;
     use super::{
-        CWD_INDEX_FILE, DEFAULT_TITLE, MAX_TITLE_LEN, SESSION_VERSION, StoredSubagent, TAIL_BUF,
-        generate_title, json_path, jsonl_path, load_cwd_index, update_cwd_index,
-        write_full_session,
+        CWD_INDEX_FILE, DEFAULT_TITLE, MAX_TITLE_LEN, SESSION_VERSION, StoredSubagent,
+        StoredTokenUsage, Summarizable, TAIL_BUF, compact_tool_outputs, generate_title, json_path,
+        jsonl_path, load_cwd_index, update_cwd_index, write_full_session,
     };
     use super::{SCAN_CACHE_FILE, Session, SessionError, SessionLog, StorageError, TitleSource};
     use crate::id::MakiId;
+    use serde::{Deserialize, Serialize};
     use serde_json::Value;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::fs::{self, OpenOptions};
     use std::io::Write;
     use std::path::Path;
@@ -2368,5 +2386,76 @@ mod tests {
         let list = TestSession::list_in("/project", dir).unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].title, "big-meta");
+    }
+
+    #[test]
+    fn compact_tool_outputs_summarizes_old_outputs() {
+        #[derive(Clone, Serialize, Deserialize)]
+        struct MockOutput {
+            data: String,
+        }
+
+        impl Summarizable for MockOutput {
+            fn summarize(&self) -> Self {
+                Self {
+                    data: format!("summary of {}", self.data),
+                }
+            }
+        }
+
+        let mut session: Session<Value, StoredTokenUsage, MockOutput> = Session::new("model", "/p");
+
+        session.tool_outputs.insert(
+            "old-tool".into(),
+            MockOutput {
+                data: "large data".into(),
+            },
+        );
+
+        session.tool_outputs.insert(
+            "recent-tool".into(),
+            MockOutput {
+                data: "recent data".into(),
+            },
+        );
+
+        let mut recent_tool_ids = HashSet::new();
+        recent_tool_ids.insert("recent-tool".into());
+
+        compact_tool_outputs(&mut session, &recent_tool_ids);
+
+        let old = session.tool_outputs.get("old-tool").unwrap();
+        assert_eq!(old.data, "summary of large data");
+
+        let recent = session.tool_outputs.get("recent-tool").unwrap();
+        assert_eq!(recent.data, "recent data");
+    }
+
+    #[test]
+    fn compact_tool_outputs_preserves_all_recent_tool_ids() {
+        #[derive(Clone, Serialize, Deserialize)]
+        struct MockOutput;
+
+        impl Summarizable for MockOutput {
+            fn summarize(&self) -> Self {
+                Self
+            }
+        }
+
+        let mut session: Session<Value, StoredTokenUsage, MockOutput> = Session::new("model", "/p");
+
+        session.tool_outputs.insert("tool-1".into(), MockOutput);
+        session.tool_outputs.insert("tool-2".into(), MockOutput);
+        session.tool_outputs.insert("old-tool".into(), MockOutput);
+
+        let mut recent_tool_ids = HashSet::new();
+        recent_tool_ids.insert("tool-1".into());
+        recent_tool_ids.insert("tool-2".into());
+
+        compact_tool_outputs(&mut session, &recent_tool_ids);
+
+        assert!(session.tool_outputs.contains_key("tool-1"));
+        assert!(session.tool_outputs.contains_key("tool-2"));
+        assert!(session.tool_outputs.contains_key("old-tool"));
     }
 }

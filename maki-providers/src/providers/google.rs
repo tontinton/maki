@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::Hasher;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -22,6 +25,8 @@ const BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 const ENV_VAR: &str = "GEMINI_API_KEY";
 const FLASH_MAX_THINKING: u32 = 24_576;
 const PRO_MAX_THINKING: u32 = 32_768;
+const CACHE_PREFIX_LEN: usize = 3;
+const CACHE_TTL: Duration = Duration::from_secs(8 * 60 * 60);
 
 /// The generic per-model max, capped by Google's documented `thinkingBudget`
 /// hard limits per family.
@@ -32,6 +37,40 @@ fn max_thinking(model: &Model) -> u32 {
         PRO_MAX_THINKING
     };
     model.max_thinking_budget().map_or(cap, |m| m.min(cap))
+}
+
+fn tools_hash(tools: &Value) -> Result<u64, AgentError> {
+    let mut hasher = DefaultHasher::new();
+    let json_str = serde_json::to_string(tools).map_err(|e| AgentError::Config {
+        message: format!("failed to serialize tools for hashing: {e}"),
+    })?;
+    hasher.write(json_str.as_bytes());
+    Ok(hasher.finish())
+}
+
+#[derive(Clone, Debug)]
+struct CachedContentState {
+    name: String,
+    tools_hash: u64,
+    message_count: usize,
+    expires_at: Instant,
+}
+
+impl CachedContentState {
+    fn new(name: String, tools_hash: u64, message_count: usize, expires_at: Instant) -> Self {
+        Self {
+            name,
+            tools_hash,
+            message_count,
+            expires_at,
+        }
+    }
+
+    fn is_valid(&self, tools_hash: u64, message_count: usize) -> bool {
+        self.tools_hash == tools_hash
+            && message_count >= self.message_count
+            && Instant::now() < self.expires_at
+    }
 }
 
 inventory::submit!(maki_config::providers::BuiltInProvider {
@@ -111,6 +150,7 @@ pub struct Google {
     auth: Arc<Mutex<ResolvedAuth>>,
     key_pool: Option<KeyPool>,
     stream_timeout: Duration,
+    cache_state: Arc<Mutex<HashMap<SessionRef, CachedContentState>>>,
 }
 
 impl Google {
@@ -122,6 +162,7 @@ impl Google {
             auth: Arc::new(Mutex::new(resolved)),
             key_pool: Some(pool),
             stream_timeout: timeouts.stream,
+            cache_state: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -134,11 +175,12 @@ impl Google {
             auth,
             key_pool: None,
             stream_timeout: timeouts.stream,
+            cache_state: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     fn build_request(&self, method: &str, url: &str) -> isahc::http::request::Builder {
-        let auth = self.auth.lock().unwrap();
+        let auth = self.auth.lock().expect("auth lock poisoned");
         auth.configure_request(
             Request::builder()
                 .method(method)
@@ -148,17 +190,17 @@ impl Google {
     }
 
     fn api_key(&self) -> String {
-        let auth = self.auth.lock().unwrap();
+        let auth = self.auth.lock().expect("auth lock poisoned");
         auth.headers
             .iter()
             .find(|(k, _)| k == "x-goog-api-key")
             .map(|(_, v)| v.clone())
-            .unwrap_or_default()
+            .unwrap_or_else(String::new)
     }
 
     fn stream_url(&self, model_id: &str) -> String {
         let base = {
-            let auth = self.auth.lock().unwrap();
+            let auth = self.auth.lock().expect("auth lock poisoned");
             auth.base_url.as_deref().unwrap_or(BASE_URL).to_string()
         };
         let encoded = super::urlenc(model_id);
@@ -167,11 +209,85 @@ impl Google {
 
     fn models_url(&self) -> String {
         let base = {
-            let auth = self.auth.lock().unwrap();
+            let auth = self.auth.lock().expect("auth lock poisoned");
             auth.base_url.as_deref().unwrap_or(BASE_URL).to_string()
         };
         let key = self.api_key();
         format!("{base}/models?key={key}&pageSize=1000")
+    }
+
+    fn cached_contents_url(&self) -> String {
+        let base = {
+            let auth = self.auth.lock().expect("auth lock poisoned");
+            auth.base_url.as_deref().unwrap_or(BASE_URL).to_string()
+        };
+        let key = self.api_key();
+        format!("{base}/cachedContents?key={key}")
+    }
+
+    async fn create_cached_content(
+        &self,
+        model_id: &str,
+        system: &str,
+        tools: &Value,
+        messages: &[Message],
+    ) -> Result<String, AgentError> {
+        let url = self.cached_contents_url();
+        let prefix_len = messages.len().min(CACHE_PREFIX_LEN);
+
+        let mut body = json!({
+            "model": format!("models/{}", model_id),
+            "contents": convert_messages(&messages[..prefix_len]),
+        });
+
+        if !system.is_empty() {
+            body["systemInstruction"] = json!({"parts": [{"text": system}]});
+        }
+
+        let tool_decls = convert_tools(tools);
+        if !tool_defs_empty(&tool_decls) {
+            body["tools"] = json!([{"functionDeclarations": tool_decls}]);
+        }
+
+        body["expiration"] = json!({
+            "ttl": format!("{}s", CACHE_TTL.as_secs()),
+        });
+
+        let json_body = serde_json::to_vec(&body)?;
+        let request = self
+            .build_request("POST", &url)
+            .header("content-type", "application/json")
+            .body(json_body)?;
+
+        let mut response = self.client.send_async(request).await?;
+        if response.status().as_u16() != 200 {
+            return Err(AgentError::from_response(response).await);
+        }
+
+        let response_text = response.text().await?;
+        let cached: serde_json::Value = serde_json::from_str(&response_text)?;
+        let name = cached["name"].as_str().ok_or_else(|| AgentError::Config {
+            message: "missing cached content name in response".into(),
+        })?;
+        Ok(name.to_string())
+    }
+
+    async fn delete_cached_content(&self, name: &str) -> Result<(), AgentError> {
+        let base = {
+            let auth = self.auth.lock().expect("auth lock poisoned");
+            auth.base_url.as_deref().unwrap_or(BASE_URL).to_string()
+        };
+        let key = self.api_key();
+        let url = format!("{base}/{}?key={key}", name.trim_start_matches('/'));
+
+        let request = self.build_request("DELETE", &url).body(())?;
+        let response = self.client.send_async(request).await?;
+
+        if response.status().as_u16() == 200 || response.status().as_u16() == 404 {
+            Ok(())
+        } else {
+            Err(AgentError::from_response(response).await)
+        }
     }
 
     fn build_body(
@@ -242,14 +358,127 @@ impl Provider for Google {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        _session_id: Option<&'a SessionRef>,
+        session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
-        Box::pin(self.do_stream(model, messages, system, tools, event_tx, opts.thinking))
+        Box::pin(async move {
+            let current_tools_hash = match tools_hash(tools) {
+                Ok(h) => h,
+                Err(e) => {
+                    warn!(error = %e, "failed to hash tools, falling back to uncached request");
+                    return self
+                        .do_stream(model, messages, system, tools, event_tx, opts.thinking)
+                        .await;
+                }
+            };
+            let current_message_count = messages.len();
+
+            let Some(sid) = session_id else {
+                return self
+                    .do_stream(model, messages, system, tools, event_tx, opts.thinking)
+                    .await;
+            };
+            if current_message_count <= CACHE_PREFIX_LEN {
+                return self
+                    .do_stream(model, messages, system, tools, event_tx, opts.thinking)
+                    .await;
+            }
+
+            let (cached_content_name, old_name_to_delete) = {
+                let mut cache_state = self.cache_state.lock().map_err(|e| AgentError::Config {
+                    message: format!("cache state lock failed: {e}"),
+                })?;
+                if let Some(state) = cache_state.get(sid) {
+                    if state.is_valid(current_tools_hash, current_message_count) {
+                        (Some(state.name.clone()), None)
+                    } else {
+                        let old_name = state.name.clone();
+                        cache_state.remove(sid);
+                        (None, Some(old_name))
+                    }
+                } else {
+                    (None, None)
+                }
+            };
+
+            if let Some(ref name) = old_name_to_delete {
+                let _ = self.delete_cached_content(name).await;
+            }
+
+            let cached_content_name = if let Some(name) = cached_content_name {
+                name
+            } else {
+                match self
+                    .create_cached_content(&model.id, system, tools, messages)
+                    .await
+                {
+                    Ok(name) => {
+                        let mut cache_state =
+                            self.cache_state.lock().map_err(|e| AgentError::Config {
+                                message: format!("cache state lock failed: {e}"),
+                            })?;
+                        cache_state.insert(
+                            sid.clone(),
+                            CachedContentState::new(
+                                name.clone(),
+                                current_tools_hash,
+                                current_message_count,
+                                Instant::now() + CACHE_TTL,
+                            ),
+                        );
+                        name
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "failed to create cached content, falling back to uncached request");
+                        return self
+                            .do_stream(model, messages, system, tools, event_tx, opts.thinking)
+                            .await;
+                    }
+                }
+            };
+
+            if cached_content_name.is_empty() {
+                return self
+                    .do_stream(model, messages, system, tools, event_tx, opts.thinking)
+                    .await;
+            }
+
+            let no_tools = json!([]);
+            let mut body = self.build_body(
+                model,
+                &messages[CACHE_PREFIX_LEN..],
+                "",
+                &no_tools,
+                opts.thinking,
+            );
+            body["cachedContent"] = json!(cached_content_name);
+
+            let url = self.stream_url(&model.id);
+            let json_body = serde_json::to_vec(&body)?;
+
+            let request = self
+                .build_request("POST", &url)
+                .header("content-type", "application/json")
+                .body(json_body)?;
+
+            let response = self.client.send_async(request).await?;
+            let status = response.status().as_u16();
+
+            if status == 200 {
+                parse_sse(response, event_tx, self.stream_timeout).await
+            } else {
+                Err(AgentError::from_response(response).await)
+            }
+        })
     }
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
         let url = self.models_url();
-        let request = self.build_request("GET", &url).body(()).unwrap();
+        let request = self
+            .build_request("GET", &url)
+            .body(())
+            .unwrap_or_else(|e| {
+                panic!("request build failed: {e}");
+            });
         let client = self.client.clone();
         Box::pin(async move {
             let mut response = client.send_async(request).await?;
@@ -271,7 +500,7 @@ impl Provider for Google {
                         .name
                         .strip_prefix("models/")
                         .map(String::from)
-                        .unwrap_or(m.name);
+                        .unwrap_or_else(|| m.name.clone());
                     crate::model::ModelInfo::id_only(id)
                 })
                 .collect();
@@ -282,8 +511,13 @@ impl Provider for Google {
 
     fn reload_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
         Box::pin(async {
-            let pool = KeyPool::resolve("google", ENV_VAR)?;
-            *self.auth.lock().unwrap() = resolve_auth_from_key(pool.current());
+            let pool = KeyPool::resolve("google", ENV_VAR).map_err(|e| AgentError::Config {
+                message: format!("key pool resolve failed: {e}"),
+            })?;
+            let mut auth = self.auth.lock().map_err(|e| AgentError::Config {
+                message: format!("auth lock failed: {e}"),
+            })?;
+            *auth = resolve_auth_from_key(pool.current());
             Ok(())
         })
     }
@@ -406,7 +640,7 @@ fn convert_tools(tools: &Value) -> Vec<Value> {
     arr.iter()
         .filter_map(|t| {
             let name = t.get("name")?.as_str()?;
-            let description = t.get("description")?.as_str().unwrap_or("");
+            let description = t.get("description").and_then(|d| d.as_str()).unwrap_or("");
             let parameters = t
                 .get("input_schema")
                 .cloned()
@@ -414,25 +648,10 @@ fn convert_tools(tools: &Value) -> Vec<Value> {
             Some(json!({
                 "name": name,
                 "description": description,
-                "parameters": strip_additional_properties(parameters),
+                "parameters": parameters,
             }))
         })
         .collect()
-}
-
-fn strip_additional_properties(value: Value) -> Value {
-    match value {
-        Value::Object(mut map) => {
-            map.remove("additionalProperties");
-            map.values_mut()
-                .for_each(|v| *v = strip_additional_properties(std::mem::take(v)));
-            Value::Object(map)
-        }
-        Value::Array(items) => {
-            Value::Array(items.into_iter().map(strip_additional_properties).collect())
-        }
-        other => other,
-    }
 }
 
 fn tool_defs_empty(tool_decls: &[Value]) -> bool {
@@ -832,14 +1051,12 @@ mod tests {
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "cmd": {"type": "string", "additionalProperties": false},
+                    "cmd": {"type": "string"},
                     "opts": {
                         "type": "object",
-                        "additionalProperties": false,
                         "properties": {"verbose": {"type": "boolean"}}
                     }
-                },
-                "additionalProperties": false
+                }
             }
         }]);
         let result = convert_tools(&tools);
@@ -847,57 +1064,6 @@ mod tests {
         assert_eq!(result[0]["name"], "bash");
         assert_eq!(result[0]["description"], "run a command");
         assert!(result[0]["parameters"]["properties"]["cmd"].is_object());
-        assert!(
-            result[0]["parameters"]
-                .get("additionalProperties")
-                .is_none()
-        );
-        assert!(
-            result[0]["parameters"]["properties"]["cmd"]
-                .get("additionalProperties")
-                .is_none()
-        );
-        assert!(
-            result[0]["parameters"]["properties"]["opts"]
-                .get("additionalProperties")
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn strip_additional_properties_recursive() {
-        let schema = json!({
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-                "inner": {
-                    "type": "object",
-                    "additionalProperties": false,
-                    "properties": {"x": {"type": "number", "additionalProperties": false}}
-                },
-                "list": {
-                    "type": "array",
-                    "items": {"type": "string", "additionalProperties": false}
-                }
-            }
-        });
-        let cleaned = strip_additional_properties(schema);
-        assert!(cleaned.get("additionalProperties").is_none());
-        assert!(
-            cleaned["properties"]["inner"]
-                .get("additionalProperties")
-                .is_none()
-        );
-        assert!(
-            cleaned["properties"]["inner"]["properties"]["x"]
-                .get("additionalProperties")
-                .is_none()
-        );
-        assert!(
-            cleaned["properties"]["list"]["items"]
-                .get("additionalProperties")
-                .is_none()
-        );
     }
 
     #[test]
@@ -969,5 +1135,48 @@ mod tests {
         assert_eq!(result.usage.input, 100);
         assert_eq!(result.usage.output, 10);
         assert_eq!(result.usage.cache_read, 50);
+    }
+
+    #[test]
+    fn cached_contents_url_includes_api_key() {
+        let google = Google::with_auth(test_auth(), test_timeouts());
+        let url = google.cached_contents_url();
+        assert!(url.contains("cachedContents"));
+        assert!(url.contains("key=test-key"));
+    }
+
+    #[test]
+    fn cached_content_state_valid_when_tools_and_count_match() {
+        let future = Instant::now() + Duration::from_secs(3600);
+        let state = CachedContentState::new("cache1".to_string(), 123, 5, future);
+        assert!(state.is_valid(123, 5));
+        assert!(state.is_valid(123, 6));
+        assert!(!state.is_valid(124, 5));
+        assert!(!state.is_valid(123, 4));
+    }
+
+    #[test]
+    fn cached_content_state_invalid_after_expiry() {
+        let past = Instant::now() - Duration::from_secs(1);
+        let state = CachedContentState::new("cache1".to_string(), 123, 5, past);
+        assert!(!state.is_valid(123, 5));
+    }
+
+    #[test]
+    fn tools_hash_is_deterministic() {
+        let tools = json!([{"name": "bash", "input_schema": {"type": "object"}}]);
+        let hash1 = tools_hash(&tools).expect("tools hash must succeed");
+        let hash2 = tools_hash(&tools).expect("tools hash must succeed");
+        assert_eq!(hash1, hash2);
+    }
+
+    #[test]
+    fn tools_hash_differs_for_different_tools() {
+        let tools1 = json!([{"name": "bash", "input_schema": {"type": "object"}}]);
+        let tools2 = json!([{"name": "read", "input_schema": {"type": "object"}}]);
+        assert_ne!(
+            tools_hash(&tools1).expect("tools hash must succeed"),
+            tools_hash(&tools2).expect("tools hash must succeed")
+        );
     }
 }

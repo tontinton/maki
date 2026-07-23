@@ -477,7 +477,8 @@ pub fn run(params: SdkParams) -> Result<()> {
     let working_dir = cwd.to_string_lossy().into_owned();
     let (session_id, initial_history) = resolve_session(&cli, &working_dir)?;
 
-    let (mcp_handle, mcp_config_errors) = smol::block_on(mcp::start(&cwd));
+    let (mcp_handle, mcp_config_errors) =
+        smol::block_on(mcp::start(&cwd, config.mcp_tool_desc_max_chars));
     if !mcp_config_errors.is_empty() {
         eprintln!("MCP config error: {mcp_config_errors}");
     }

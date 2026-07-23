@@ -1,16 +1,8 @@
 local QuestionForm = require("question_form")
 local QuestionHelpers = require("question_helpers")
 
-local DESCRIPTION = [[Use this tool when you need to ask the user questions during execution. This allows you to:
-- Gather user preferences or requirements
-- Clarify ambiguous instructions
-- Get decisions on implementation choices as you work
-- Offer choices to the user about what direction to take
-
-Rules:
-- `custom` enabled by default adds "Type your own answer" - don't include catch-all options.
-- Answers returned as arrays of labels. Set `multiSelect: true` for multi-select.
-- Put recommended option first with "(Recommended)" suffix.]]
+local DESCRIPTION =
+  [[Ask the user questions during execution. Supports single/multi-select, custom answers, and tabbed multi-question forms. Put recommended options first with "(Recommended)" suffix.]]
 
 maki.api.register_tool({
   name = "question",

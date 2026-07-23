@@ -17,7 +17,11 @@ use super::tool_dispatch::{self, RecentCalls};
 use crate::cancel::{CancelMap, CancelToken};
 use crate::mcp::McpSession;
 use crate::permissions::PermissionManager;
-use crate::tools::{Deadline, FileReadTracker, LocalTools, ToolAudience, ToolContext};
+use crate::template;
+use crate::tools::{
+    Deadline, DescriptionContext, FileReadTracker, LocalTools, ToolAudience, ToolContext,
+    ToolFilter,
+};
 use crate::{
     AgentConfig, AgentError, AgentEvent, AgentInput, AgentMode, EventSender, ExtractedCommand,
     InterruptSource, TurnCompleteEvent,
@@ -107,6 +111,8 @@ pub struct Agent<'h> {
     audience: ToolAudience,
     workflow: bool,
     local_tools: LocalTools,
+    activated_tools: std::collections::HashSet<Arc<str>>,
+    excluded_tools: Vec<&'static str>,
 }
 
 impl<'h> Agent<'h> {
@@ -145,6 +151,8 @@ impl<'h> Agent<'h> {
             audience: params.audience,
             workflow: false,
             local_tools: LocalTools::default(),
+            activated_tools: std::collections::HashSet::new(),
+            excluded_tools: Vec::new(),
         }
     }
 
@@ -176,9 +184,37 @@ impl<'h> Agent<'h> {
         self
     }
 
+    pub fn with_excluded_tools(mut self, excluded: &[&'static str]) -> Self {
+        self.excluded_tools = excluded.to_vec();
+        self
+    }
+
     pub fn with_loaded_instructions(mut self, loaded: LoadedInstructions) -> Self {
         self.loaded_instructions = loaded;
         self
+    }
+
+    fn rebuild_tools(&self) -> Value {
+        let vars = template::env_vars();
+        let filter = ToolFilter::from_config(&self.config, &self.model, &self.excluded_tools);
+        let ctx = DescriptionContext {
+            filter: &filter,
+            audience: self.audience,
+            workflow: self.workflow,
+        };
+        let mode = &self.config.dynamic_tools.default_mode;
+        let additional: Vec<Arc<str>> = self.activated_tools.iter().cloned().collect();
+        let allowed = self.registry.active_tools_for_mode(mode, &additional);
+        let mut tools = self.registry.definitions_filtered(
+            &vars,
+            &ctx,
+            self.model.supports_tool_examples(),
+            &allowed,
+        );
+        if let Some(ref mcp) = self.mcp {
+            mcp.extend_tools(&mut tools);
+        }
+        tools
     }
 
     pub async fn run(&mut self, input: AgentInput) -> Result<(), AgentError> {
@@ -190,6 +226,7 @@ impl<'h> Agent<'h> {
         self.opts = RequestOptions {
             thinking: input.thinking,
             fast: input.fast,
+            message_cache_breakpoints: 2,
         };
 
         info!(
@@ -244,6 +281,9 @@ impl<'h> Agent<'h> {
         if self.cancel.is_cancelled() {
             return Err(AgentError::Cancelled);
         }
+        if self.config.dynamic_tools.enabled {
+            self.tools = self.rebuild_tools();
+        }
         let tools = self.request_tools();
         let response = match stream_with_retry(
             &*self.provider,
@@ -294,8 +334,9 @@ impl<'h> Agent<'h> {
         if has_tools {
             let history_len_before = self.history.len();
             self.process_tool_calls(response).await?;
-            self.context_size +=
-                estimate_message_tokens(&self.history.as_slice()[history_len_before..]);
+            self.context_size = self.context_size.saturating_add(estimate_message_tokens(
+                &self.history.as_slice()[history_len_before..],
+            ));
         } else {
             let has_text = response.message.first_text_content().is_some();
 
@@ -393,6 +434,18 @@ impl<'h> Agent<'h> {
     async fn process_tool_calls(&mut self, response: StreamResponse) -> Result<(), AgentError> {
         self.post_tool_empty_retried = false;
         let ctx = self.tool_context();
+
+        if self.config.dynamic_tools.enabled {
+            for call in &response.message.content {
+                if let maki_providers::ContentBlock::ToolUse { name, input, .. } = call
+                    && name == "activate_tool"
+                    && let Some(tool_name) = input.get("tool_name").and_then(|v| v.as_str())
+                {
+                    self.activated_tools.insert(Arc::from(tool_name));
+                }
+            }
+        }
+
         tool_dispatch::process_tool_calls(
             response,
             &mut self.recent_calls,
@@ -516,7 +569,17 @@ pub fn estimate_message_tokens(messages: &[Message]) -> u32 {
             _ => None,
         })
         .sum();
-    (total_bytes.max(CHARS_PER_TOKEN) / CHARS_PER_TOKEN) as u32
+    let count = total_bytes.max(CHARS_PER_TOKEN) / CHARS_PER_TOKEN;
+    match u32::try_from(count) {
+        Ok(n) => n,
+        Err(_) => {
+            warn!(
+                count,
+                "estimated token count exceeded u32 range; saturating"
+            );
+            u32::MAX
+        }
+    }
 }
 
 #[cfg(test)]
@@ -627,12 +690,20 @@ mod tests {
         provider: MockProvider,
         history: &mut History,
     ) -> (Agent<'_>, flume::Receiver<Envelope>) {
+        make_agent_with_config(provider, history, AgentConfig::default())
+    }
+
+    fn make_agent_with_config(
+        provider: MockProvider,
+        history: &mut History,
+        config: AgentConfig,
+    ) -> (Agent<'_>, flume::Receiver<Envelope>) {
         let (raw_tx, event_rx) = flume::unbounded();
         let agent = Agent::new(
             AgentParams {
                 provider: Arc::new(provider),
                 model: default_model(),
-                config: AgentConfig::default(),
+                config,
                 tool_output_lines: ToolOutputLines::default(),
                 permissions: Arc::new(PermissionManager::new(
                     maki_config::PermissionsConfig {
@@ -1044,5 +1115,76 @@ mod tests {
                 .expect("expected Done event");
             assert_eq!(done, expected_turns);
         });
+    }
+
+    #[test]
+    fn activate_tool_adds_to_activated_set() {
+        smol::block_on(async {
+            let mut config = AgentConfig::default();
+            config.dynamic_tools.enabled = true;
+
+            let activate_response = StreamResponse {
+                message: Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::ToolUse {
+                        id: "t1".into(),
+                        name: "activate_tool".into(),
+                        input: serde_json::json!({"tool_name": "write_tool"}),
+                    }],
+                    ..Default::default()
+                },
+                usage: TokenUsage::default(),
+                stop_reason: Some(StopReason::EndTurn),
+            };
+
+            let responses = vec![activate_response, text_response(StopReason::EndTurn)];
+
+            let mut history = History::new(Vec::new());
+            let (mut agent, _event_rx) =
+                make_agent_with_config(MockProvider::new(responses), &mut history, config);
+
+            let input = AgentInput {
+                message: "activate write_tool".into(),
+                images: vec![],
+                mode: AgentMode::default(),
+                workflow: false,
+                thinking: maki_providers::ThinkingConfig::Off,
+                fast: false,
+                preamble: vec![],
+                prompt: None,
+            };
+
+            let _ = agent.run(input).await;
+            assert!(agent.activated_tools.contains(&Arc::from("write_tool")));
+        });
+    }
+
+    #[test]
+    fn estimate_message_tokens_empty_is_zero() {
+        assert_eq!(estimate_message_tokens(&[]), 0);
+    }
+
+    #[test]
+    fn estimate_message_tokens_counts_bytes_per_four() {
+        let messages = vec![
+            Message::user("hello world".into()),
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "response".into(),
+                }],
+                ..Default::default()
+            },
+        ];
+        let count = estimate_message_tokens(&messages);
+        assert_eq!(count, 4, "expected 4 tokens for 19 bytes at 4 bytes/token");
+    }
+
+    #[test]
+    fn context_size_addition_uses_saturating_add() {
+        let context_size: u32 = u32::MAX - 100;
+        let addition: u32 = 200;
+        let result = context_size.saturating_add(addition);
+        assert_eq!(result, u32::MAX);
     }
 }

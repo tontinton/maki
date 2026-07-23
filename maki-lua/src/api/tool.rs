@@ -121,6 +121,7 @@ pub(crate) struct PendingTool {
     pub(crate) schema: &'static ParamSchema,
     pub(crate) audience: ToolAudience,
     pub(crate) kind: Option<Arc<str>>,
+    pub(crate) modes: Vec<String>,
     pub(crate) handler_key: RegistryKey,
     pub(crate) header_key: Option<RegistryKey>,
     pub(crate) restore_key: Option<RegistryKey>,
@@ -141,6 +142,8 @@ pub(crate) struct LuaTool {
     pub(crate) schema: &'static ParamSchema,
     pub(crate) audience: ToolAudience,
     pub(crate) kind: Option<Arc<str>>,
+    pub(crate) modes: Arc<Vec<String>>,
+    pub(crate) mode_cache: std::sync::OnceLock<Vec<&'static str>>,
     pub(crate) tx: Sender<Request>,
     pub(crate) plugin: Arc<str>,
     pub(crate) has_header_fn: bool,
@@ -203,6 +206,23 @@ impl Tool for LuaTool {
 
     fn tool_kind(&self) -> Option<&str> {
         self.kind.as_deref()
+    }
+
+    fn modes(&self) -> &[&str] {
+        static DEFAULT: [&str; 1] = ["default"];
+        if self.modes.is_empty() {
+            &DEFAULT
+        } else {
+            self.mode_cache.get_or_init(|| {
+                self.modes
+                    .iter()
+                    .map(|s| {
+                        let leaked: &'static str = Box::leak(s.clone().into_boxed_str());
+                        leaked
+                    })
+                    .collect()
+            })
+        }
     }
 
     fn examples(&self) -> Option<Value> {
@@ -1096,6 +1116,32 @@ fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> Lua
         .map_err(|_| mlua::Error::runtime("register_tool: missing 'schema'"))?;
     let audiences: Option<mlua::Table> = spec.get("audiences").ok();
 
+    let modes: Vec<String> = match spec.get::<LuaValue>("modes")? {
+        LuaValue::Nil => vec!["default".to_string()],
+        LuaValue::Table(t) => {
+            let mut modes = Vec::new();
+            for pair in t.pairs::<LuaValue, LuaValue>() {
+                let (_, v) = pair.map_err(|e| {
+                    mlua::Error::runtime(format!("register_tool: invalid modes: {e}"))
+                })?;
+                if let LuaValue::String(s) = v {
+                    modes.push(s.to_str()?.to_string());
+                }
+            }
+            if modes.is_empty() {
+                return Err(mlua::Error::runtime(
+                    "register_tool: 'modes' must be non-empty",
+                ));
+            }
+            modes
+        }
+        _ => {
+            return Err(mlua::Error::runtime(
+                "register_tool: 'modes' must be a table or omitted",
+            ));
+        }
+    };
+
     let schema_val: Value = lua.from_value(schema_table)?;
     let param_schema = try_from_json(&schema_val).map_err(mlua::Error::runtime)?;
 
@@ -1162,6 +1208,7 @@ fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> Lua
             schema: param_schema,
             audience,
             kind,
+            modes,
             handler_key,
             header_key,
             restore_key,
@@ -1548,6 +1595,8 @@ mod tests {
             schema,
             audience: ToolAudience::default(),
             kind: None,
+            modes: Arc::new(Vec::new()),
+            mode_cache: std::sync::OnceLock::new(),
             tx,
             plugin: Arc::from("test"),
             has_header_fn: false,

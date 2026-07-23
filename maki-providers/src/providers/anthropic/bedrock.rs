@@ -547,6 +547,7 @@ impl Provider for Bedrock {
                 }],
                 tools,
                 opts.thinking,
+                opts.message_cache_breakpoints,
             );
             // Fast mode lives only on the direct API, so Bedrock skips `opts.fast`
             // and never sends the `speed` param.

@@ -80,18 +80,8 @@ local function build_body(ctx, code)
   return buf, view, highlight
 end
 
-local description = [[Execute Python code in a sandboxed interpreter with tools as callable functions.
-
-Use for chained/dependent tool calls and filtering/processing results, e.g. filtering web tool output. **DRAMATICALLY** faster than sequential tool calls!
-
-- All tools are async and return strings: `result = await read(path='file.txt')`. Parse output yourself.
-- Use `asyncio.gather()` for concurrency within one execution.
-- Available libs: re, asyncio, sys, os, json. No other imports, no classes, no filesystem/network access.
-- Fresh sandbox each run: no state persists between executions.
-- 30s script timeout (`timeout` param); time awaiting tool calls doesn't count.
-- Skip it when a single tool call needs no transformation.
-- NOT a thinking scratchpad. Reason in your response text.
-]]
+local description =
+  [[Execute Python code in a sandboxed interpreter with tools as callable functions. Use for chained/dependent tool calls and filtering/processing results. Faster than sequential tool calls. Tools are async: `result = await read(path='file.txt')`. Use `asyncio.gather()` for concurrency. Available libs: re, asyncio, sys, os, json. Fresh sandbox each run. 30s script timeout (`timeout` param); time awaiting tool calls doesn't count.]]
 
 local schema = {
   type = "object",
@@ -106,24 +96,6 @@ local schema = {
       type = "integer",
       description = "Script execution timeout in seconds (default 30)",
     },
-  },
-}
-
-local examples = {
-  {
-    code = [[files = (await glob(pattern='**/*.rs')).strip().split('\n')
-results = await asyncio.gather(*[read(path=f) for f in files if f.strip()])
-for f, c in zip(files, results):
-    if 'fn main' in c: print(f)]],
-  },
-  {
-    code = [[result = await grep(pattern='TODO', include='*.rs')
-print(f"{len(result.strip().splitlines())} TODOs found")]],
-  },
-  {
-    code = [[content = await webfetch(url='https://example.com/docs')
-for line in content.splitlines():
-    if 'auth' in line.lower(): print(line)]],
   },
 }
 
@@ -301,7 +273,6 @@ maki.api.register_tool({
   description = description,
   describe = describe,
   schema = schema,
-  examples = examples,
   kind = "execute",
   audiences = { "main", "research_sub", "general_sub" },
   start_annotation = { field = "timeout", kind = "timeout" },

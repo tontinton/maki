@@ -505,6 +505,7 @@ impl Opencode {
             &system_blocks,
             tools,
             opts.thinking,
+            opts.message_cache_breakpoints,
         );
         body["model"] = json!(model.id);
         body["stream"] = json!(true);
