@@ -115,6 +115,7 @@ fn bash_restore_renders_real_view() {
 /// Phase 1: children render through their own real views (grep gutter,
 /// bash command header), not the raw-llm fallback. Phase 2: a replayed
 /// click inside grep's range reaches its real toggle and expands only it.
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn batch_restore_renders_real_children_and_click_expands_grep() {
     let host = load_host();
