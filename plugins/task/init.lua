@@ -150,6 +150,9 @@ local function handler(input, ctx)
   end
 
   local permit = semaphore:acquire()
+  if not permit then
+    return { llm_output = "failed to acquire subagent permit", is_error = true }
+  end
 
   -- pcall so a raised error cannot leak the permit.
   local ok, out = pcall(function()
@@ -186,7 +189,7 @@ local function handler(input, ctx)
       local msg = last_errors and (STRUCTURED_INVALID_ERROR .. ":\n" .. last_errors) or STRUCTURED_MISSING_ERROR
       return { llm_output = msg, is_error = true }
     end
-    return { llm_output = captured and maki.json.encode(captured) or result.text, format = "markdown" }
+    return { llm_output = captured and maki.json.encode(captured) or (result and result.text or ""), format = "markdown" }
   end)
 
   permit:release()

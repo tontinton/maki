@@ -1,7 +1,7 @@
 local M = {}
 
 function M.parse_frontmatter(content)
-  local rest = content:match("^%s*%-%-%-\n(.*)")
+  local rest = content:match("^%s*%-%-%-[ \t]*\n(.*)")
   if not rest then
     return {}, content
   end
@@ -9,7 +9,7 @@ function M.parse_frontmatter(content)
   if not end_pos then
     return {}, content
   end
-  local yaml_str = rest:sub(1, end_pos)
+  local yaml_str = rest:sub(1, end_pos - 1)
   local body = rest:sub(end_pos + 4):match("^%s*(.-)%s*$")
   local fm, _ = maki.yaml.decode(yaml_str)
   if not fm then
