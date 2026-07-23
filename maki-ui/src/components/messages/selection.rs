@@ -34,39 +34,56 @@ pub(super) fn extract_selection_text(
 
         let Some(seg) = cache.get(i) else { continue };
 
-        if seg.lines().is_empty() {
+        let inset = seg.content_inset();
+        let content_x = msg_area.x.saturating_add(inset);
+        let start_col = if seg_start > doc_start.row {
+            0
+        } else {
+            doc_start.col.saturating_sub(content_x)
+        };
+        let end_col = if seg_end < doc_end.row + 1 {
+            width
+                .saturating_sub(inset.saturating_mul(2))
+                .saturating_sub(1)
+        } else {
+            doc_end.col.saturating_sub(content_x)
+        };
+
+        let content_start = content_x + seg.prefix_width;
+        let seg_fully_selected = seg_start >= doc_start.row
+            && seg_end <= doc_end.row + 1
+            && doc_start.col <= content_start
+            && doc_end.col >= msg_area.x + width - 1;
+        if seg_fully_selected && let Some(raw) = &seg.raw_text {
+            out.push_str(raw);
             continue;
         }
 
-        let tmp_area = Rect::new(0, 0, width, h);
+        if seg.lines().is_empty() {
+            if let Some(raw) = &seg.raw_text {
+                out.push_str(raw);
+            }
+            continue;
+        }
+
+        let content_width = width.saturating_sub(inset.saturating_mul(2)).max(1);
+        let tmp_area = Rect::new(0, 0, content_width, h);
         let mut tmp = Buffer::empty(tmp_area);
         Paragraph::new(seg.lines().to_vec())
             .wrap(Wrap { trim: false })
             .render(tmp_area, &mut tmp);
 
-        let rel_start = doc_start.row.saturating_sub(seg_start) as u16;
-        let rel_end = ((doc_end.row + 1).saturating_sub(seg_start) as u16).min(h);
-
-        let start_col = if seg_start > doc_start.row {
-            0
-        } else {
-            doc_start.col.saturating_sub(msg_area.x)
-        };
-        let end_col = if seg_end < doc_end.row + 1 {
-            width.saturating_sub(1)
-        } else {
-            doc_end.col.saturating_sub(msg_area.x)
-        };
-
+        let start_rel = doc_start.row.saturating_sub(seg_start) as u16;
+        let end_rel = (doc_end.row + 1).saturating_sub(seg_start) as u16;
         let ss = ScreenSelection {
-            start_row: rel_start,
+            start_row: start_rel,
             start_col,
-            end_row: rel_end.saturating_sub(1),
+            end_row: end_rel.saturating_sub(1),
             end_col,
         };
 
-        let breaks = LineBreaks::from_lines(seg.lines(), width);
-        selection::append_rows(&tmp, tmp_area, &ss, rel_start, rel_end, &mut out, &breaks);
+        let breaks = LineBreaks::from_lines(seg.lines(), content_width);
+        selection::append_rows(&tmp, tmp_area, &ss, start_rel, end_rel, &mut out, &breaks);
     }
     out
 }

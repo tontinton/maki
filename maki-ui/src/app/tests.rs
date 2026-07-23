@@ -61,6 +61,7 @@ fn build_app_with_lua(
             PathBuf::from("/tmp"),
         )),
         Arc::from([]),
+        Arc::new(ratatui_image::picker::Picker::halfblocks()),
         maki_lua::EventHandle::disconnected_for_test(),
     )
 }

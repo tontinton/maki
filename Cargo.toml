@@ -120,6 +120,7 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 flume = { version = "0.11", default-features = false, features = ["async", "select"] }
 pin-project-lite = "0.2"
 rustix = { version = "1", default-features = false, features = ["process"] }
+ratatui-image = { version = "11.0.6", default-features = false, features = ["crossterm"] }
 humantime = "2"
 toml = "0.8"
 toml_edit = "0.22"

@@ -19,6 +19,7 @@ mod render_worker;
 mod selection;
 pub mod splash;
 mod storage_writer;
+mod terminal_image;
 mod text_buffer;
 mod theme;
 pub use theme::BUNDLED_THEMES;

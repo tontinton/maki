@@ -46,6 +46,7 @@ use crate::input::InputReader;
 
 use crate::storage_writer::StorageWriter;
 use crate::terminal;
+use crate::terminal_image;
 
 const ANIMATION_INTERVAL_MS: u64 = 16;
 const IDLE_POLL_INTERVAL_MS: u64 = 100;
@@ -165,6 +166,7 @@ struct SpawnCtx {
     model_slot: Arc<ArcSwap<ModelSlot>>,
     available_models: Arc<ArcSwapOption<Vec<String>>>,
     storage_writer: Arc<StorageWriter>,
+    picker: Arc<ratatui_image::picker::Picker>,
 }
 
 impl SpawnCtx {
@@ -198,6 +200,7 @@ impl SpawnCtx {
             self.input_history_size,
             permissions,
             Arc::clone(&self.custom_commands),
+            Arc::clone(&self.picker),
             self.lua_event_handle.clone(),
         );
         handles.apply_to_app(&mut app);
@@ -366,6 +369,7 @@ impl<'t> EventLoop<'t> {
         }));
         let bg = spawn_model_fetch(&model_slot, timeouts);
         let storage_writer = Arc::new(StorageWriter::new(storage.clone(), bg.warn_tx.clone()));
+        let picker = Arc::new(terminal_image::picker());
 
         let ctx = SpawnCtx {
             storage,
@@ -384,6 +388,7 @@ impl<'t> EventLoop<'t> {
             model_slot,
             available_models: bg.available,
             storage_writer,
+            picker,
         };
 
         let mut runtimes: Vec<SessionRuntime> = sessions

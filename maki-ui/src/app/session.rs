@@ -164,6 +164,7 @@ impl App {
         let mut main = Chat::new(
             "Main".into(),
             self.ui_config.clone(),
+            Arc::clone(&self.picker),
             self.lua_event_handle.clone(),
         );
         main.set_restore_channel(self.restore_event_tx.clone());
@@ -218,6 +219,7 @@ impl App {
             let mut chat = Chat::new(
                 sa.name,
                 self.ui_config.clone(),
+                Arc::clone(&self.picker),
                 self.lua_event_handle.clone(),
             );
             chat.set_restore_channel(self.restore_event_tx.clone());

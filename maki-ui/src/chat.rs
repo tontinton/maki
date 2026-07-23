@@ -19,6 +19,7 @@ use maki_providers::{ContentBlock, Message, Role};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Color;
+use ratatui_image::picker::Picker;
 
 pub(crate) const DONE_TEXT: &str = "Done!";
 pub(crate) const ERROR_TEXT: &str = "Error";
@@ -51,14 +52,14 @@ pub struct Chat {
 }
 
 impl Chat {
-    pub fn new(name: String, ui_config: UiConfig, lua_event_handle: maki_lua::EventHandle) -> Self {
+    pub fn new(name: String, ui_config: UiConfig, picker: Arc<Picker>, lua_event_handle: maki_lua::EventHandle) -> Self {
         Self {
             name,
             cost: None,
             context_size: 0,
             model_id: None,
             pending_turn_usage: None,
-            messages_panel: MessagesPanel::new(ui_config, lua_event_handle),
+            messages_panel: MessagesPanel::new(ui_config, picker, lua_event_handle),
             finished: false,
         }
     }
@@ -481,6 +482,7 @@ pub fn history_to_display(
                                     name: static_name.into(),
                                 })),
                                 text,
+                                images: Vec::new(),
                                 tool_input: None,
                                 tool_raw_input: Some(Arc::new(input.clone())),
                                 tool_output,
@@ -656,6 +658,7 @@ mod tests {
         let mut chat = Chat::new(
             "Main".into(),
             UiConfig::default(),
+            Arc::new(ratatui_image::picker::Picker::halfblocks()),
             maki_lua::EventHandle::disconnected_for_test(),
         );
         chat.handle_event(tool_start("t1", "bash"), None);
@@ -673,6 +676,7 @@ mod tests {
         let mut chat = Chat::new(
             "Main".into(),
             UiConfig::default(),
+            Arc::new(ratatui_image::picker::Picker::halfblocks()),
             maki_lua::EventHandle::disconnected_for_test(),
         );
         let dir = tempfile::tempdir().unwrap();
@@ -697,6 +701,7 @@ mod tests {
         let mut chat = Chat::new(
             "Main".into(),
             UiConfig::default(),
+            Arc::new(ratatui_image::picker::Picker::halfblocks()),
             maki_lua::EventHandle::disconnected_for_test(),
         );
         let plan_path = Path::new("/plans/123.md");
@@ -714,6 +719,7 @@ mod tests {
         let mut chat = Chat::new(
             "Main".into(),
             UiConfig::default(),
+            Arc::new(ratatui_image::picker::Picker::halfblocks()),
             maki_lua::EventHandle::disconnected_for_test(),
         );
         let dir = tempfile::tempdir().unwrap();
@@ -1036,6 +1042,7 @@ mod tests {
         let mut chat = Chat::new(
             "Main".into(),
             UiConfig::default(),
+            Arc::new(ratatui_image::picker::Picker::halfblocks()),
             maki_lua::EventHandle::disconnected_for_test(),
         );
 

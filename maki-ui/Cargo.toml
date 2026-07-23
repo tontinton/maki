@@ -30,6 +30,8 @@ getrandom = { workspace = true }
 futures-lite = { workspace = true }
 image = { workspace = true }
 base64 = { workspace = true }
+ratatui-image = { workspace = true }
+thiserror = { workspace = true }
 nucleo = { workspace = true }
 nucleo-matcher = { workspace = true }
 ignore = { workspace = true }

@@ -66,6 +66,7 @@ use maki_storage::model::persist_model;
 
 use crate::storage_writer::StorageWriter;
 use ratatui::layout::Position;
+use ratatui_image::picker::Picker;
 
 pub(crate) use crate::agent::QueuedMessage;
 pub(crate) use mode::{Mode, PlanState, PlanTrigger};
@@ -180,6 +181,7 @@ pub struct App {
     pub(crate) shell: shell::ShellState,
     pub(crate) ui_config: UiConfig,
     pub(crate) permissions: Arc<PermissionManager>,
+    pub(crate) picker: Arc<Picker>,
     pub(crate) lua_event_handle: EventHandle,
     pub(super) keymap_reader: KeymapReader,
     pub(super) hint_reader: HintReader,
@@ -205,6 +207,7 @@ impl App {
         input_history_size: usize,
         permissions: Arc<PermissionManager>,
         custom_commands: Arc<[maki_agent::command::CustomCommand]>,
+        picker: Arc<Picker>,
         lua_event_handle: EventHandle,
     ) -> Self {
         scrollbar::set_enabled(ui_config.scrollbar);
@@ -219,6 +222,7 @@ impl App {
             chats: vec![Chat::new(
                 "Main".into(),
                 ui_config.clone(),
+                Arc::clone(&picker),
                 lua_event_handle.clone(),
             )],
             active_chat: 0,
@@ -270,6 +274,7 @@ impl App {
             shell: shell::ShellState::default(),
             ui_config,
             permissions,
+            picker,
             lua_event_handle,
             keymap_reader,
             hint_reader,
@@ -1162,6 +1167,7 @@ impl App {
         let mut chat = Chat::new(
             subagent.name.clone(),
             self.ui_config.clone(),
+            Arc::clone(&self.picker),
             self.lua_event_handle.clone(),
         );
         chat.set_restore_channel(self.restore_event_tx.clone());
