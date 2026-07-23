@@ -189,7 +189,10 @@ local function handler(input, ctx)
       local msg = last_errors and (STRUCTURED_INVALID_ERROR .. ":\n" .. last_errors) or STRUCTURED_MISSING_ERROR
       return { llm_output = msg, is_error = true }
     end
-    return { llm_output = captured and maki.json.encode(captured) or (result and result.text or ""), format = "markdown" }
+    return {
+      llm_output = captured and maki.json.encode(captured) or (result and result.text or ""),
+      format = "markdown",
+    }
   end)
 
   permit:release()
