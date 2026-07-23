@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::env;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
-use std::process::Stdio;
+use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
@@ -16,6 +16,12 @@ use crate::plugin_permissions::PluginPermissions;
 use crate::runtime::with_task_jobs;
 
 const READER_BUF_SIZE: usize = 8 * 1024;
+
+#[derive(Clone)]
+pub(crate) enum JobSpec {
+    Shell(String),
+    Program { program: String, args: Vec<String> },
+}
 
 #[derive(Clone)]
 pub(crate) enum JobEvent {
@@ -48,14 +54,21 @@ impl JobStore {
 
     pub fn start(
         &mut self,
-        cmd: &str,
+        spec: JobSpec,
         cwd: Option<String>,
         env: Option<HashMap<String, String>>,
         on_stdout: Option<RegistryKey>,
         on_stderr: Option<RegistryKey>,
         on_exit: Option<RegistryKey>,
     ) -> Result<u32, String> {
-        let mut command = maki_config::bash_command(cmd, env.as_ref())?;
+        let mut command = match spec {
+            JobSpec::Shell(cmd) => maki_config::bash_command(&cmd, env.as_ref())?,
+            JobSpec::Program { program, args } => {
+                let mut c = Command::new(&program);
+                c.args(&args);
+                c
+            }
+        };
         command
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -255,7 +268,11 @@ fn kill_job(meta: &mut JobMeta) {
 /// `bash -c` on Unix or `cmd /C` on Windows. You get back a job id
 /// that you can pass to `jobstop` or `jobwait` to control the process.
 ///
-/// @param cmd string Shell command to run.
+/// For commands that don't need shell features (pipes, redirection, globs),
+/// pass an array to run the program directly with preserved argument quoting:
+/// `maki.fn.jobstart({ "git", "commit", "-m", "feat: msg" })`
+///
+/// @param cmd string|table Shell command string, or array of program + args.
 /// @param opts table? Optional settings:
 ///   `cwd` (string?) working directory (tilde is expanded).
 ///   `env` (table?) extra environment variables, `{ VAR = "value" }`.
@@ -270,7 +287,39 @@ fn kill_job(meta: &mut JobMeta) {
 ///   on_exit = function(_, code) print("exit: " .. code) end,
 /// })
 #[lua_fn(guard = Run)]
-fn jobstart(lua: &Lua, cmd: String, opts: Option<Table>) -> LuaResult<u32> {
+fn jobstart(lua: &Lua, cmd: Value, opts: Option<Table>) -> LuaResult<u32> {
+    let spec = match cmd {
+        Value::String(s) => JobSpec::Shell(s.to_str()?.to_owned()),
+        Value::Table(tbl) => {
+            // Treat tables as arrays (list mode): first element is program, rest are args
+            let len = tbl.len().unwrap_or(0);
+            if len == 0 {
+                return Err(mlua::Error::runtime(
+                    "jobstart array must have at least a program",
+                ));
+            }
+            let program: String = tbl
+                .get::<String>(1)
+                .map_err(|e| mlua::Error::runtime(format!("jobstart program must be a string: {e}")))?;
+            if program.is_empty() {
+                return Err(mlua::Error::runtime(
+                    "jobstart program cannot be empty string",
+                ));
+            }
+            // Collect remaining args, filtering out empty strings
+            let args: Vec<String> = (2..=len)
+                .filter_map(|i| tbl.get::<String>(i).ok())
+                .filter(|s| !s.is_empty())
+                .collect();
+            JobSpec::Program { program, args }
+        }
+        _ => {
+            return Err(mlua::Error::runtime(
+                "jobstart expects a string or array",
+            ))
+        }
+    };
+
     let (cwd, env, on_stdout, on_stderr, on_exit) = match opts {
         Some(ref opts) => {
             let cwd: Option<String> = opts.get("cwd").ok();
@@ -299,7 +348,7 @@ fn jobstart(lua: &Lua, cmd: String, opts: Option<Table>) -> LuaResult<u32> {
     };
 
     with_task_jobs(lua, |store| {
-        store.start(&cmd, cwd, env, on_stdout, on_stderr, on_exit)
+        store.start(spec, cwd, env, on_stdout, on_stderr, on_exit)
     })
     .map_err(mlua::Error::runtime)
 }
@@ -499,7 +548,7 @@ mod tests {
 
     fn start_echo(store: &mut JobStore) -> u32 {
         store
-            .start("echo hello", None, None, None, None, None)
+            .start(JobSpec::Shell("echo hello".into()), None, None, None, None, None)
             .unwrap()
     }
 
@@ -537,7 +586,7 @@ mod tests {
     fn start_invalid_cwd_returns_error() {
         let mut store = make_store();
         let result = store.start(
-            "echo hello",
+            JobSpec::Shell("echo hello".into()),
             Some("/nonexistent_dir_abc_xyz_123".into()),
             None,
             None,

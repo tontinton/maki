@@ -1308,13 +1308,17 @@ local id = maki.fn.jobstart("git status", {
 maki.fn.jobstart({cmd}, {opts?})
 ```
 
-Run a shell command in the background. The command runs through
-`bash -c` on Unix or `cmd /C` on Windows. You get back a job id
-that you can pass to `jobstop` or `jobwait` to control the process.
+Run a command in the background.
+
+**String mode** runs through `bash -c` on all platforms. On Windows, you need Git Bash or WSL installed. Use this when you need shell features like pipes, redirection, or variable expansion.
+
+**List mode** runs the program directly with preserved argument quoting. Pass an array where the first element is the program and the rest are arguments. This is the safer choice for commands with spaces or special characters in arguments.
+
+You get back a job id that you can pass to `jobstop` or `jobwait` to control the process.
 
 **Parameters:**
 
-- `{cmd}` (`string`) Shell command to run.
+- `{cmd}` (`string|table`) Shell command string, or array of `[program, arg1, arg2, ...]`.
 - `{opts?}` (`table?`) Optional settings:
   - `cwd` (`string?`) working directory (tilde is expanded).
   - `env` (`table?`) extra environment variables, `{ VAR = "value" }`.
@@ -1324,12 +1328,18 @@ that you can pass to `jobstop` or `jobwait` to control the process.
 
 **Returns:** (`integer`) Job id.
 
-**Example:**
+**Examples:**
 
 ```lua
+-- String mode (shell features available)
 local id = maki.fn.jobstart("ls -la", {
   cwd = "~/projects",
   on_stdout = function(_, line) print(line) end,
+  on_exit = function(_, code) print("exit: " .. code) end,
+})
+
+-- List mode (preserves argument quoting)
+local id = maki.fn.jobstart({ "git", "commit", "-m", "feat: preserve spaces" }, {
   on_exit = function(_, code) print("exit: " .. code) end,
 })
 ```
