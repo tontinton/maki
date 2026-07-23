@@ -126,22 +126,19 @@ fn restore_backup(backup_path: &Path, exe_path: &Path) -> Result<(), UpdateError
     if needs_sudo(exe_path) {
         println!("Restoring to {} (requires sudo)...", exe_path.display());
         let status = std::process::Command::new("sudo")
-            .args(["cp", "--"])
+            .args([
+                "sh",
+                "-c",
+                r#"cp -- "$1" "$2" && mv -- "$2" "$3""#,
+                "maki-restore",
+            ])
             .arg(backup_path)
-            .arg(&tmp)
-            .status()
-            .map_err(err)?;
-        if !status.success() {
-            return Err(err(std::io::Error::other("sudo cp failed")));
-        }
-        let status = std::process::Command::new("sudo")
-            .args(["mv", "--"])
             .arg(&tmp)
             .arg(exe_path)
             .status()
             .map_err(err)?;
         if !status.success() {
-            return Err(err(std::io::Error::other("sudo mv failed")));
+            return Err(err(std::io::Error::other("sudo restore failed")));
         }
     } else {
         std::fs::copy(backup_path, &tmp).map_err(err)?;

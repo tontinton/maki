@@ -121,9 +121,12 @@ main() {
         chmod +x "${dest}"
     else
         echo "installing to ${INSTALL_DIR} (requires sudo)..."
-        sudo mkdir -p "${INSTALL_DIR}"
-        sudo mv "${tmp}/${bin_name}" "${dest}"
-        sudo chmod +x "${dest}"
+        sudo sh -c '
+            set -e
+            mkdir -p "$1"
+            mv "$2" "$3"
+            chmod +x "$3"
+        ' maki-install "${INSTALL_DIR}" "${tmp}/${bin_name}" "${dest}"
     fi
 
     echo "${BINARY} ${tag} installed to ${dest}"
