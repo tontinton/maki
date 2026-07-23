@@ -6,6 +6,7 @@ use maki_providers::{
 };
 use tracing::info;
 
+use super::estimate_message_tokens;
 use super::history::History;
 use super::streaming::stream_with_retry;
 use crate::cancel::CancelToken;
@@ -79,18 +80,18 @@ fn finish_compact(
     compact_start: std::time::Instant,
     model: &Model,
 ) -> TokenUsage {
-    let _ = event_tx.send(AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
-        message: response.message.clone(),
-        usage: response.usage,
-        model: model.id.clone(),
-        context_size: Some(response.usage.output),
-    })));
-
+    let message = response.message.clone();
     let new_history = vec![
         Message::user("What did we do so far?".into()),
         response.message,
     ];
     history.replace(new_history);
+    let _ = event_tx.send(AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
+        message,
+        usage: response.usage,
+        model: model.id.clone(),
+        context_size: Some(estimate_message_tokens(history.as_slice())),
+    })));
     info!(
         model = %model.id,
         duration_ms = compact_start.elapsed().as_millis() as u64,
