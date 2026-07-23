@@ -550,12 +550,10 @@ pub fn scope_matches(pattern: &str, value: &str) -> bool {
         return true;
     }
     if let Some(prefix) = pattern.strip_suffix("/**") {
-        let norm_prefix = maki_storage::paths::canonicalize_clean(Path::new(prefix));
-        // Use incremental canonicalization for the value so symlinks in
+        // Use incremental canonicalization for both sides so symlinks in
         // existing path components are resolved before any `..` traversal.
-        // `canonicalize_clean` falls back to lexical normalization when the
-        // file doesn't exist, which breaks scope matching when the project
-        // dir itself is a symlink.
+        let norm_prefix = maki_storage::paths::incremental_canonicalize(Path::new(prefix))
+            .unwrap_or_else(|| maki_storage::paths::normalize_path(Path::new(prefix)));
         let norm_value = maki_storage::paths::incremental_canonicalize(Path::new(value))
             .unwrap_or_else(|| maki_storage::paths::normalize_path(Path::new(value)));
         return norm_value == norm_prefix || norm_value.starts_with(&norm_prefix);
