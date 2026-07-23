@@ -103,6 +103,10 @@ impl JobStore {
                                     .lines()
                                     .map_while(Result::ok)
                                 {
+                                    let line = line
+                                        .strip_suffix('\r')
+                                        .map(|s| s.to_string())
+                                        .unwrap_or(line);
                                     if tx.send(JobEvent::$variant(line)).is_err() {
                                         break;
                                     }
