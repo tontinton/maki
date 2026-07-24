@@ -57,14 +57,17 @@ pub enum UpdateError {
 
 fn fetch_script() -> Result<String, UpdateError> {
     use isahc::ReadResponseExt;
-    let mut response = isahc::get(INSTALL_SCRIPT_URL).map_err(|e| UpdateError::Fetch {
-        url: INSTALL_SCRIPT_URL,
-        source: e,
-    })?;
-    response.text().map_err(|e| UpdateError::Fetch {
-        url: INSTALL_SCRIPT_URL,
-        source: e.into(),
-    })
+    isahc::get(INSTALL_SCRIPT_URL)
+        .and_then(|mut r| r.text().map_err(Into::into))
+        .map_err(|source| UpdateError::Fetch {
+            url: INSTALL_SCRIPT_URL,
+            source,
+        })
+        .or_else(|e| {
+            version::curl_fetch(INSTALL_SCRIPT_URL)
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                .map_err(|_| e)
+        })
 }
 
 fn backup_binary(exe_path: &Path, storage: &StateDir) -> Result<PathBuf, UpdateError> {
