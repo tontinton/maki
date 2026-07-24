@@ -205,11 +205,15 @@ impl App {
         let state = SessionState::from_session(session, model, &storage);
         let typewriter = ui_config.typewriter_ms_per_char;
         let flash = ui_config.flash_duration();
+        let input_box = InputBox::new(
+            InputHistory::load(&storage, input_history_size),
+            ui_config.max_input_lines,
+        );
         let mut app = Self {
             chats: vec![Chat::new("Main".into(), ui_config.clone())],
             active_chat: 0,
             chat_index: HashMap::new(),
-            input_box: InputBox::new(InputHistory::load(&storage, input_history_size)),
+            input_box,
             command_palette: CommandPalette::new(
                 custom_commands,
                 mcp_reader.clone(),

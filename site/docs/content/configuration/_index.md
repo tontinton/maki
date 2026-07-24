@@ -69,6 +69,7 @@ All fields are optional. Typos in field names cause an error right away.
 | `flash_duration_ms` | u64 | `1500` | - | Duration of flash messages (ms) |
 | `typewriter_ms_per_char` | u64 | `4` | - | Typewriter effect speed (ms/char) |
 | `mouse_scroll_lines` | u32 | `3` | 1 | Lines per mouse wheel scroll |
+| `max_input_lines` | u32 | `20` | 1 | Maximum visible input lines |
 | `show_thinking` | bool | `true` | - | When true (default), show full model reasoning live and persisted. When false, hide reasoning behind an indicator (thinking> ...) with a click-to-expand hint, both while thinking and after it completes |
 
 ### `ui.theme`

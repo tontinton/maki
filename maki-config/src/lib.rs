@@ -21,6 +21,9 @@ pub const DEFAULT_MAX_OUTPUT_LINES: usize = 2000;
 pub const DEFAULT_FLASH_DURATION_MS: u64 = 1500;
 pub const DEFAULT_TYPEWRITER_MS_PER_CHAR: u64 = 4;
 pub const DEFAULT_MOUSE_SCROLL_LINES: u32 = 3;
+pub const DEFAULT_MAX_INPUT_LINES: u32 = 20;
+
+pub const MIN_MAX_INPUT_LINES: u32 = 1;
 
 pub const DEFAULT_MAX_CONTINUATION_TURNS: u32 = 3;
 pub const DEFAULT_COMPACTION_BUFFER: CompactionBuffer = CompactionBuffer::Percent(20);
@@ -323,6 +326,7 @@ pub struct UiFileConfig {
     pub show_thinking: Option<bool>,
     pub theme: Option<String>,
     pub tool_output_lines: Option<ToolOutputLinesFile>,
+    pub max_input_lines: Option<u32>,
 }
 
 impl UiFileConfig {
@@ -336,7 +340,8 @@ impl UiFileConfig {
             typewriter_ms_per_char,
             mouse_scroll_lines,
             show_thinking,
-            theme
+            theme,
+            max_input_lines
         );
         match (self.tool_output_lines.as_mut(), overlay.tool_output_lines) {
             (Some(base), Some(over)) => base.merge(over),
@@ -813,6 +818,9 @@ pub struct UiConfig {
     #[config(default = DEFAULT_MOUSE_SCROLL_LINES, min = MIN_MOUSE_SCROLL_LINES, desc = "Lines per mouse wheel scroll")]
     pub mouse_scroll_lines: u32,
 
+    #[config(default = DEFAULT_MAX_INPUT_LINES, min = MIN_MAX_INPUT_LINES, desc = "Maximum visible input lines")]
+    pub max_input_lines: u32,
+
     #[config(
         default = true,
         desc = "When true (default), show full model reasoning live and persisted. When false, hide reasoning behind an indicator (thinking> ...) with a click-to-expand hint, both while thinking and after it completes"
@@ -840,6 +848,7 @@ impl UiConfig {
                 .typewriter_ms_per_char
                 .unwrap_or(DEFAULT_TYPEWRITER_MS_PER_CHAR),
             mouse_scroll_lines: f.mouse_scroll_lines.unwrap_or(DEFAULT_MOUSE_SCROLL_LINES),
+            max_input_lines: f.max_input_lines.unwrap_or(DEFAULT_MAX_INPUT_LINES),
             show_thinking: f.show_thinking.unwrap_or(true),
             theme: f.theme,
             tool_output_lines: ToolOutputLines::from_file(f.tool_output_lines),
@@ -2029,6 +2038,7 @@ mod tests {
     #[test_case("provider", "connect_timeout_secs", 0 ; "provider_zero_connect_timeout")]
     #[test_case("storage",  "max_log_files",        0 ; "storage_zero_log_files")]
     #[test_case("ui",       "mouse_scroll_lines",   0 ; "ui_zero_scroll_lines")]
+    #[test_case("ui",       "max_input_lines",      0 ; "ui_zero_max_input_lines")]
     #[test_case("agent",    "max_output_lines",     1 ; "agent_output_lines_too_low")]
     fn validate_rejects_invalid_sections(section: &str, field: &str, value: u64) {
         let mut config = Config {
@@ -2049,6 +2059,7 @@ mod tests {
             }
             ("storage", "max_log_files") => config.storage.max_log_files = value as u32,
             ("ui", "mouse_scroll_lines") => config.ui.mouse_scroll_lines = value as u32,
+            ("ui", "max_input_lines") => config.ui.max_input_lines = value as u32,
             ("agent", "max_output_lines") => config.agent.max_output_lines = value as usize,
             _ => unreachable!(),
         }
@@ -2441,6 +2452,16 @@ mod tests {
         let raw: RawConfig = toml::from_str("").unwrap();
         let config = raw.into_config(false).unwrap();
         assert!(config.ui.show_thinking);
+    }
+
+    #[test]
+    fn max_input_lines_defaults_and_deserializes() {
+        let raw: RawConfig = toml::from_str("").unwrap();
+        let config = raw.into_config(false).unwrap();
+        assert_eq!(config.ui.max_input_lines, DEFAULT_MAX_INPUT_LINES);
+
+        let raw: RawConfig = toml::from_str("[ui]\nmax_input_lines = 5\n").unwrap();
+        assert_eq!(raw.ui.max_input_lines.unwrap(), 5);
     }
 
     #[test_case("[ui]\nsplash_animaton = true\n" ; "top_level_typo")]
