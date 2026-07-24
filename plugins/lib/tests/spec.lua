@@ -1267,6 +1267,29 @@ case("filter_items_every_word_must_match", function()
   eq(filtered[1], "review gh pr 441")
 end)
 
+case("filter_items_matches_section", function()
+  local items = {
+    { label = "a.md", section = "auth (2)" },
+    { label = "b.md", section = "auth (2)" },
+    { label = "c.md", section = "storage (1)" },
+  }
+  local filtered, indices = filter_items(items, "auth")
+  eq(#filtered, 2, "typing a section name keeps its items")
+  eq(filtered[1].label, "a.md")
+  eq(filtered[2].label, "b.md")
+  eq(indices[2], 2)
+end)
+
+case("filter_items_words_split_across_label_and_section", function()
+  local items = {
+    { label = "gotchas.md", section = "auth (2)" },
+    { label = "notes.md", section = "auth (2)" },
+  }
+  local filtered = filter_items(items, "auth gotchas")
+  eq(#filtered, 1)
+  eq(filtered[1].label, "gotchas.md")
+end)
+
 case("highlight_spans_overlapping_words_merge", function()
   local spans = ListPicker.highlight_spans("alphabet", { "alpha", "phab" }, "item", "match")
   eq(#spans, 2)
@@ -1295,6 +1318,57 @@ case("render_lines_match_at_start_keeps_indent", function()
   eq(lines[1][1][2], "selected")
   eq(lines[1][2][1], "al")
   eq(lines[1][2][2], "match_selected")
+end)
+
+case("render_lines_sections_headers_and_item_lines", function()
+  local items = {
+    { label = "a", section = "auth", section_detail = "(2)" },
+    { label = "b", section = "auth", section_detail = "(2)" },
+    { label = "c", section = "storage" },
+  }
+  local lines, item_lines = render_lines(items, 1, 40)
+  eq(#lines, 6, "two headers + blank gap + three items, header never repeats within a section")
+  eq(lines[1][1][1], "  auth")
+  eq(lines[1][1][2], "keybind_section")
+  eq(lines[1][2][1], " (2)", "section detail rendered after the header")
+  eq(lines[1][2][2], "dim")
+  eq(lines[2][1][1], "  a")
+  eq(lines[3][1][1], "  b")
+  eq(#lines[4], 0, "blank line between sections")
+  eq(lines[5][1][1], "  storage")
+  eq(#lines[5], 1, "no detail span without section_detail")
+  eq(lines[6][1][1], "  c")
+  eq(item_lines[1], 2, "cursor mapping skips the header")
+  eq(item_lines[2], 3)
+  eq(item_lines[3], 6)
+end)
+
+case("render_lines_item_lines_identity_without_sections", function()
+  local lines, item_lines = render_lines({ "a", "b", "c" }, 1, 40)
+  eq(#lines, 3)
+  for i = 1, 3 do
+    eq(item_lines[i], i, "plain list maps item " .. i .. " straight to its line")
+  end
+end)
+
+case("section_rows_counts_headers_and_gaps", function()
+  local section_rows = ListPicker._section_rows
+  eq(section_rows({ "a", "b" }), 0)
+  eq(section_rows({ { label = "a", section = "s" }, "b" }), 1, "header on line one needs no gap")
+  eq(section_rows({ "a", { label = "b", section = "s" } }), 2, "gap precedes a header that follows items")
+  eq(section_rows({ { label = "a", section = "s" }, { label = "b", section = "t" } }), 3)
+end)
+
+case("render_lines_nil_sections_mix_with_grouped", function()
+  local lines = render_lines({ "plain", { label = "x", section = "grp" } }, 1, 40)
+  eq(lines[1][1][1], "  plain", "no header for a nil-section first item")
+  eq(#lines[2], 0, "blank line before a header that follows items")
+  eq(lines[3][1][1], "  grp")
+  eq(lines[4][1][1], "  x")
+
+  local _, item_lines = render_lines({ { label = "a", section = "grp" }, "b" }, 1, 40)
+  eq(item_lines[1], 2, "grouped item sits under its header")
+  eq(item_lines[2], 3, "nil-section item follows without a new header")
 end)
 
 if #failures > 0 then

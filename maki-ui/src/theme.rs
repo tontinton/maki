@@ -338,6 +338,7 @@ pub fn style_by_name(name: &str) -> Style {
         "active" => t.active,
         "keybind_key" => t.keybind_key,
         "keybind_desc" => t.keybind_desc,
+        "keybind_section" => t.keybind_section,
         "success" | "todo_completed" => t.todo_completed,
         "warning" | "todo_in_progress" => t.todo_in_progress,
         "todo_pending" | "pending" => t.todo_pending,
@@ -1121,6 +1122,7 @@ mode_build = "#112233"
         assert_eq!(style_by_name("foreground"), Style::new().fg(t.foreground));
         assert_eq!(style_by_name("keybind_key"), t.keybind_key);
         assert_eq!(style_by_name("keybind_desc"), t.keybind_desc);
+        assert_eq!(style_by_name("keybind_section"), t.keybind_section);
         assert_eq!(style_by_name("selected"), t.item_selected);
         assert_eq!(style_by_name("success"), t.todo_completed);
         assert_eq!(style_by_name("warning"), t.todo_in_progress);

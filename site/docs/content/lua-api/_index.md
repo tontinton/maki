@@ -1446,7 +1446,9 @@ maki.fs.metadata({path})
 ```
 
 Get metadata for the file or directory at {path}.
-Returns a table with `size` (integer), `is_file` (boolean), and `is_dir` (boolean).
+Returns a table with `size` (integer), `is_file` (boolean), `is_dir` (boolean),
+and `mtime` (number, fractional seconds since the Unix epoch; absent when the
+filesystem does not report a modification time).
 If {path} does not exist, returns nil with no error.
 
 **Parameters:**

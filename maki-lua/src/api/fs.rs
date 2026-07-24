@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use std::fs::FileType;
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{IntoLua, Lua, Result as LuaResult, Table, Value};
@@ -147,7 +148,9 @@ async fn read_bytes(lua: Lua, path: String) -> LuaResult<(Value, Value)> {
 }
 
 /// Get metadata for the file or directory at {path}.
-/// Returns a table with `size` (integer), `is_file` (boolean), and `is_dir` (boolean).
+/// Returns a table with `size` (integer), `is_file` (boolean), `is_dir` (boolean),
+/// and `mtime` (number, fractional seconds since the Unix epoch; absent when the
+/// filesystem does not report a modification time).
 /// If {path} does not exist, returns nil with no error.
 ///
 /// @param path string Absolute or relative path.
@@ -166,6 +169,11 @@ async fn metadata(lua: Lua, path: String) -> LuaResult<(Value, Value)> {
             tbl.set("size", meta.len())?;
             tbl.set("is_file", meta.is_file())?;
             tbl.set("is_dir", meta.is_dir())?;
+            if let Ok(modified) = meta.modified()
+                && let Ok(dur) = modified.duration_since(UNIX_EPOCH)
+            {
+                tbl.set("mtime", dur.as_secs_f64())?;
+            }
             Ok((Value::Table(tbl), Value::Nil))
         }
         Err(e) if e.kind() == ErrorKind::NotFound => Ok((Value::Nil, Value::Nil)),
@@ -816,6 +824,7 @@ mod tests {
         assert!(f.get::<bool>("is_file").unwrap());
         assert!(!f.get::<bool>("is_dir").unwrap());
         assert_eq!(f.get::<u64>("size").unwrap(), 5);
+        assert!(f.get::<f64>("mtime").unwrap() > 0.0);
 
         let d: Table =
             smol::block_on(metadata.call_async::<Table>(tmp.path().to_str().unwrap())).unwrap();
