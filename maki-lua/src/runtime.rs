@@ -217,6 +217,19 @@ pub(crate) struct RestoreReply {
     pub header: Option<BufferSnapshot>,
 }
 
+/// The UI restores tool bodies from these events; a send can only fail when
+/// the receiver is gone, but that still loses the snapshot, so it gets a log.
+pub(crate) fn send_render_event(
+    event_tx: &maki_agent::EventSender,
+    tool_id: &str,
+    what: &str,
+    event: maki_agent::AgentEvent,
+) {
+    if event_tx.send(event).is_err() {
+        tracing::warn!(tool_id, what, "tool render event dropped: channel closed");
+    }
+}
+
 impl RestoreReply {
     pub(crate) fn emit(
         self,
@@ -225,18 +238,28 @@ impl RestoreReply {
         event_tx: &maki_agent::EventSender,
     ) {
         if let Some(snapshot) = self.body {
-            let _ = event_tx.send(maki_agent::AgentEvent::ToolSnapshot {
-                id: tool_use_id.to_owned(),
-                snapshot,
-                theme_gen,
-            });
+            send_render_event(
+                event_tx,
+                tool_use_id,
+                "body_snapshot",
+                maki_agent::AgentEvent::ToolSnapshot {
+                    id: tool_use_id.to_owned(),
+                    snapshot,
+                    theme_gen,
+                },
+            );
         }
         if let Some(snapshot) = self.header {
-            let _ = event_tx.send(maki_agent::AgentEvent::ToolHeaderSnapshot {
-                id: tool_use_id.to_owned(),
-                snapshot,
-                theme_gen,
-            });
+            send_render_event(
+                event_tx,
+                tool_use_id,
+                "header_snapshot",
+                maki_agent::AgentEvent::ToolHeaderSnapshot {
+                    id: tool_use_id.to_owned(),
+                    snapshot,
+                    theme_gen,
+                },
+            );
         }
     }
 }
@@ -827,6 +850,10 @@ fn spawn_async_task(
     task: PendingAsyncTask,
 ) {
     if task.cancel.is_cancelled() {
+        tracing::debug!(
+            tool_id = task.live_ctx.as_ref().map(|l| l.tool_use_id.as_str()),
+            "async.run: cancelled before spawn"
+        );
         lua.remove_registry_value(task.work_fn).ok();
         return;
     }
@@ -845,7 +872,8 @@ fn spawn_async_task(
             .scope_future(run_work_fn(&lua, &task.work_fn, task.deadline))
             .await;
         if let Err(e) = &result {
-            tracing::debug!(error = %e, "async.run: task failed");
+            let tool_id = task.live_ctx.as_ref().map(|l| l.tool_use_id.as_str());
+            tracing::debug!(error = %e, tool_id, "async.run: task failed");
         }
 
         if let Some(ref live) = task.live_ctx
@@ -854,11 +882,16 @@ fn spawn_async_task(
             // Always `read`, not `read_if_dirty`: the dirty flag is
             // consume-once and the UI polls each frame, so the flag
             // races. Re-emitting identical content is harmless.
-            let _ = live.event_tx.send(maki_agent::AgentEvent::ToolSnapshot {
-                id: live.tool_use_id.clone(),
-                snapshot: maki_agent::BufferSnapshot::from_arc(buf.read()),
-                theme_gen: None,
-            });
+            send_render_event(
+                &live.event_tx,
+                &live.tool_use_id,
+                "async_snapshot",
+                maki_agent::AgentEvent::ToolSnapshot {
+                    id: live.tool_use_id.clone(),
+                    snapshot: maki_agent::BufferSnapshot::from_arc(buf.read()),
+                    theme_gen: None,
+                },
+            );
         }
 
         drop(scope);

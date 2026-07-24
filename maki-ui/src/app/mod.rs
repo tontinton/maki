@@ -948,6 +948,18 @@ impl App {
             ) {
                 self.save_session();
             }
+            // A snapshot dropped here degrades the tool body to llm_output.
+            if let AgentEvent::ToolSnapshot { id, .. }
+            | AgentEvent::ToolHeaderSnapshot { id, .. }
+            | AgentEvent::LiveToolBuf { id, .. } = &envelope.event
+            {
+                tracing::debug!(
+                    tool_id = %id,
+                    event_run_id = envelope.run_id,
+                    current_run_id = self.run_id,
+                    "tool render event dropped: stale run_id"
+                );
+            }
             return vec![];
         }
 

@@ -444,10 +444,15 @@ impl ToolInvocation for LuaToolInvocation {
                 Some(Ok(reply)) => {
                     if let Some(ref id) = ctx.tool_use_id {
                         if let Some(live_buf) = reply.live_buf {
-                            let _ = ctx.event_tx.send(AgentEvent::LiveToolBuf {
-                                id: id.clone(),
-                                body: live_buf,
-                            });
+                            crate::runtime::send_render_event(
+                                &ctx.event_tx,
+                                id,
+                                "live_buf",
+                                AgentEvent::LiveToolBuf {
+                                    id: id.clone(),
+                                    body: live_buf,
+                                },
+                            );
                         }
                         crate::runtime::RestoreReply {
                             body: reply.snapshot,

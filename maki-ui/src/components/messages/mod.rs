@@ -40,6 +40,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
+use tracing::warn;
 
 const THINKING_HIDDEN_HEADER: &str = "thinking> ...";
 
@@ -235,7 +236,7 @@ impl MessagesPanel {
     }
 
     pub fn tool_done(&mut self, event: ToolDoneEvent) {
-        self.retire_live_buf(&event.id);
+        let had_live_buf = self.retire_live_buf(&event.id);
         let Some(msg) = self
             .messages
             .iter_mut()
@@ -264,6 +265,16 @@ impl MessagesPanel {
             ToolOutput::Plain(text) | ToolOutput::Markdown(text) | ToolOutput::ReadDir(text)
                 if msg.render_snapshot.is_none() =>
             {
+                if had_live_buf {
+                    // The plugin streamed a body buf but no snapshot ever
+                    // landed: this is the raw llm_output glitch users report.
+                    warn!(
+                        tool_id = %event.id,
+                        tool = %event.tool,
+                        is_error = event.is_error,
+                        "live buf had no snapshot at tool_done; falling back to llm_output"
+                    );
+                }
                 let tr = truncate_output(&text.text, self.tool_output_lines.get(&event.tool));
                 msg.truncated_lines = tr.skipped;
                 if !tr.kept.is_empty() {
@@ -889,9 +900,10 @@ impl MessagesPanel {
     /// Moves a finished tool's live buf to the watched set, flushing any
     /// last dirty lines. Called on completion and on cancellation, so
     /// `live_bufs` never leaks entries that keep `is_animating` true.
-    fn retire_live_buf(&mut self, id: &str) {
+    /// Returns whether a live buf existed for this id.
+    fn retire_live_buf(&mut self, id: &str) -> bool {
         let Some(buf) = self.live_bufs.remove(id) else {
-            return;
+            return false;
         };
         if let Some(lines) = buf.read_if_dirty() {
             self.store_snapshot(id, BufferSnapshot::from_arc(lines), false, None);
@@ -900,6 +912,7 @@ impl MessagesPanel {
         if self.watched_bufs.len() > WARM_TOOL_CAP {
             self.watched_bufs.pop_front();
         }
+        true
     }
 
     fn has_snapshot(&self, tool_id: &str) -> bool {
@@ -1000,6 +1013,11 @@ impl MessagesPanel {
             }
             msg.snapshot_theme_gen = applied_gen;
             self.rebuild_tool_segment(tool_id);
+        } else {
+            warn!(
+                tool_id,
+                is_header, "snapshot dropped: no tool message with this id"
+            );
         }
     }
 
