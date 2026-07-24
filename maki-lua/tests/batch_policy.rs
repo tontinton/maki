@@ -3,13 +3,14 @@
 
 use std::sync::Arc;
 
-use maki_agent::tools::ToolRegistry;
+use maki_agent::cancel::CancelToken;
 use maki_agent::tools::test_support::{stub_ctx, stub_ctx_with};
+use maki_agent::tools::{ToolContext, ToolRegistry};
 use maki_agent::{
     AgentEvent, AgentMode, BufferSnapshot, Envelope, EventSender, SpanStyle, ToolOutput,
 };
 use maki_config::ToolOutputLines;
-use maki_lua::PluginHost;
+use maki_lua::{KILL_GRACE, PluginHost};
 use serde_json::{Value, json};
 
 const BATCH_PLUGIN_SRC: &str = include_str!("../../plugins/batch/init.lua");
@@ -20,6 +21,7 @@ const ERROR_PREFIX: &str = "[ERROR] ";
 const EMPTY_ERROR: &str = "provide at least one tool call";
 const NESTED_ERROR: &str = "cannot nest batch inside batch";
 const DISCARDED_ERROR: &str = "maximum of 25 tools per batch";
+const CANCELLED_ERROR: &str = "cancelled";
 const SUMMARY_ALL_OK_FMT: &str = "All {} tools executed successfully.";
 const SUMMARY_MIXED_FMT: &str = "Executed {}/{} successfully. {} failed.";
 
@@ -27,6 +29,15 @@ const BATCH_TOOL: &str = "batch";
 const PROBE_TOOL: &str = "probe";
 const BOOM_ERR: &str = "stub tool exploded";
 const CHILD_USAGE: &str = "12.3k↑ 456↓ $0.123";
+/// How long the `slow` stub parks, in graces: past a whole one, so a
+/// cancelled batch only survives if yielding renews the grace.
+const SLOW_PARK_GRACES: f32 = 1.5;
+/// CPU the `slow` stub burns before it yields, well past the 10ms watchdog
+/// poll so a poke lands while the token is already tripped.
+const BURN_SECS: f32 = 0.02;
+/// Wildly generous vs the expected kill (one poll plus one
+/// [`KILL_GRACE`]); only a watchdog that never fires gets here.
+const RUNAWAY_BUDGET_GRACES: u32 = 20;
 
 /// `maki.agent.call_tool` is stubbed; `maki.async.gather` and the semaphore
 /// stay real, so the park/release pair proves children genuinely overlap.
@@ -63,6 +74,14 @@ maki.agent.call_tool = function(ctx, name, input, opts)
     return "released_done"
   elseif name == "boom" then
     return nil, "@BOOM_ERR@"
+  elseif name == "slow" then
+    local t = os.clock()
+    while os.clock() - t < @BURN_SECS@ do end
+    maki.fn.jobwait(maki.fn.jobstart("sleep @SLOW_SECS@"))
+    return "slow_done"
+  elseif name == "spin" then
+    -- Never yields, so nothing but the watchdog can end it.
+    while true do end
   end
   return nil, "unknown tool: " .. name
 end
@@ -124,43 +143,73 @@ maki.api.register_tool({
 fn load_batch_host() -> (Arc<ToolRegistry>, PluginHost) {
     let reg = Arc::new(ToolRegistry::new());
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let park = KILL_GRACE
+        .mul_f32(SLOW_PARK_GRACES)
+        .as_secs_f32()
+        .to_string();
     let prelude = STUB_PRELUDE
         .replace("@BOOM_ERR@", BOOM_ERR)
-        .replace("@CHILD_USAGE@", CHILD_USAGE);
+        .replace("@CHILD_USAGE@", CHILD_USAGE)
+        .replace("@SLOW_SECS@", &park)
+        .replace("@BURN_SECS@", &BURN_SECS.to_string());
     host.load_source("batch_policy", &format!("{prelude}\n{BATCH_PLUGIN_SRC}"))
         .unwrap();
     (reg, host)
 }
 
-fn exec_tool(reg: &ToolRegistry, name: &str, input: Value) -> Result<String, String> {
+fn output_text(out: ToolOutput) -> String {
+    match out {
+        ToolOutput::Plain(s) | ToolOutput::Markdown(s) => s.text,
+        other => panic!("unexpected output: {other:?}"),
+    }
+}
+
+fn exec_with_ctx(
+    reg: &ToolRegistry,
+    name: &str,
+    input: Value,
+    ctx: &ToolContext,
+) -> Result<ToolOutput, String> {
     let entry = reg
         .get(name)
         .unwrap_or_else(|| panic!("tool {name} not registered"));
     let inv = entry.tool.parse(&input).expect("parse failed");
-    let ctx = stub_ctx(&AgentMode::Build);
-    smol::block_on(async { inv.execute(&ctx).await })
-        .output
-        .map(|out| match out {
-            ToolOutput::Plain(s) | ToolOutput::Markdown(s) => s.text,
-            other => panic!("unexpected output: {other:?}"),
-        })
+    smol::block_on(async { inv.execute(ctx).await }).output
+}
+
+fn exec_tool(reg: &ToolRegistry, name: &str, input: Value) -> Result<String, String> {
+    exec_with_ctx(reg, name, input, &stub_ctx(&AgentMode::Build)).map(output_text)
+}
+
+fn batch_input(tool_calls: Value) -> Value {
+    json!({ "tool_calls": tool_calls })
+}
+
+/// Same as [`run_batch`], but the run's token is tripped before a single
+/// child starts, standing in for esc pressed while the batch is in flight.
+fn run_cancelled_batch(reg: &ToolRegistry, tool_calls: Value) -> Result<String, String> {
+    let mut ctx = stub_ctx(&AgentMode::Build);
+    let (trigger, token) = CancelToken::new();
+    trigger.cancel();
+    ctx.cancel = token;
+    exec_with_ctx(reg, BATCH_TOOL, batch_input(tool_calls), &ctx).map(output_text)
 }
 
 fn run_batch(reg: &ToolRegistry, tool_calls: Value) -> Result<String, String> {
-    exec_tool(reg, BATCH_TOOL, json!({ "tool_calls": tool_calls }))
+    exec_tool(reg, BATCH_TOOL, batch_input(tool_calls))
 }
 
 fn run_batch_state(reg: &ToolRegistry, tool_calls: Value) -> Value {
-    let entry = reg.get(BATCH_TOOL).expect("batch registered");
-    let input = json!({ "tool_calls": tool_calls });
-    let inv = entry.tool.parse(&input).expect("parse failed");
-    let ctx = stub_ctx(&AgentMode::Build);
-    smol::block_on(async { inv.execute(&ctx).await })
-        .output
-        .expect("batch failed")
-        .state()
-        .cloned()
-        .expect("no state on batch output")
+    exec_with_ctx(
+        reg,
+        BATCH_TOOL,
+        batch_input(tool_calls),
+        &stub_ctx(&AgentMode::Build),
+    )
+    .expect("batch failed")
+    .state()
+    .cloned()
+    .expect("no state on batch output")
 }
 
 fn recorded_calls(reg: &ToolRegistry) -> Vec<Value> {
@@ -200,6 +249,58 @@ fn all_success_exact_llm_output() {
         section("ok", "ok:a"),
         section("ok", "ok:b"),
         summary_all_ok(2)
+    );
+    assert_eq!(out, expected);
+}
+
+/// The grace is a budget, not a licence to hang: a child that never yields
+/// still gets shot, so esc hands the session back instead of wedging it
+/// until the outer backstop timeout. The kill lands inside the child, so
+/// the batch survives and reports it cancelled like any other child.
+#[test]
+fn runaway_child_under_cancel_still_terminates() {
+    let (tx, rx) = flume::bounded(1);
+    std::thread::spawn(move || {
+        let (reg, _host) = load_batch_host();
+        tx.send(run_cancelled_batch(
+            &reg,
+            json!([{ "tool": "spin", "parameters": {} }]),
+        ))
+        .ok();
+    });
+    let outcome = rx
+        .recv_timeout(KILL_GRACE * RUNAWAY_BUDGET_GRACES)
+        .expect("a never-yielding child must be killed, not run forever");
+    let expected = format!(
+        "{}{}",
+        section("spin", &format!("{ERROR_PREFIX}{CANCELLED_ERROR}")),
+        summary_mixed(0, 1, 1)
+    );
+    assert_eq!(outcome, Ok(expected));
+}
+
+/// The bug this guards: after esc, inner tools froze as in-progress
+/// forever because the batch handler died at its first armed safepoint.
+/// Here `slow` parks past a whole [`KILL_GRACE`] and still reports its
+/// real output, which only works if resuming from the await renews the
+/// grace, while `park` loses its race with the tripped token and must be
+/// the only child the end-of-run sweep marks cancelled.
+#[test]
+fn cancelled_sweep_keeps_a_finished_childs_output() {
+    let (reg, _host) = load_batch_host();
+    let out = run_cancelled_batch(
+        &reg,
+        json!([
+            { "tool": "slow", "parameters": {} },
+            { "tool": "park", "parameters": {} },
+        ]),
+    )
+    .expect("cancelled batch must settle, not die to the interrupt");
+    let expected = format!(
+        "{}{}{}",
+        section("slow", "slow_done"),
+        section("park", &format!("{ERROR_PREFIX}{CANCELLED_ERROR}")),
+        summary_mixed(1, 2, 1)
     );
     assert_eq!(out, expected);
 }
