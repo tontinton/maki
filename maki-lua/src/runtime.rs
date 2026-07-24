@@ -19,7 +19,7 @@ use maki_agent::tools::{
     HeaderResult, PermissionScopes, RegistryError, Tool, ToolLive, ToolRegistry, ToolSource,
 };
 use maki_agent::{BufferSnapshot, SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle};
-use mlua::{Compiler, Function, Lua, RegistryKey, Value as LuaValue, ffi};
+use mlua::{Chunk, ChunkMode, Compiler, Function, Lua, RegistryKey, Table, Value as LuaValue, ffi};
 use serde_json::Value;
 
 use maki_config::RawConfig;
@@ -95,6 +95,9 @@ pub(crate) type PromptHintCallbacks = BTreeMap<Arc<str>, Vec<PromptHintRegistrat
 /// Load/clear drain in-flight tools first so we never mutate a
 /// plugin environment while a tool call is still running.
 pub enum Request {
+    /// Plugins are loaded, so native codegen may start using idle time. Sent
+    /// last so it never interleaves with the loads themselves.
+    WarmJit,
     LoadSource {
         name: Arc<str>,
         source: String,
@@ -343,19 +346,174 @@ fn resolve_root_buf(handle: &TaskHandle) -> Option<Arc<SharedBuf>> {
 }
 
 /// Sole place the `--no-jit` flag touches VM state. Called once at VM
-/// creation, before any chunk (init.lua included) is compiled. Jit off
-/// drops to the O1 interpreter with full debug info: that combination
-/// keeps the most usable backtraces.
-fn apply_jit(lua: &Lua, enabled: bool) {
-    lua.enable_jit(enabled);
-    let compiler = if enabled {
+/// creation, before any chunk (init.lua included) is compiled, and hands back
+/// the compiler so bundled modules compile the same way. Jit off drops to the
+/// O1 interpreter with full debug info, the combination that keeps the most
+/// usable backtraces.
+///
+/// Native codegen stays off at load time either way: mlua runs it inline from
+/// `Lua::load`, and doing that for every plugin was the single largest cost of
+/// startup. Loaded chunks go to a [`CodegenQueue`] instead.
+fn install_compiler(lua: &Lua, jit: bool) -> Compiler {
+    lua.enable_jit(false);
+    let compiler = if jit {
         Compiler::new().set_optimization_level(OPT_LEVEL_JIT)
     } else {
         Compiler::new()
             .set_optimization_level(OPT_LEVEL_DEBUGGABLE)
             .set_debug_level(DEBUG_INFO_FULL)
     };
-    lua.set_compiler(compiler);
+    lua.set_compiler(compiler.clone());
+    compiler
+}
+
+/// Many plugins require the same bundled module, and each one needs a separate
+/// instance because the module closes over the plugin's `maki`. Only the
+/// instantiation has to repeat, so the source is compiled to bytecode once per
+/// VM rather than once per plugin.
+#[derive(Clone)]
+struct BundledModules {
+    dirs: &'static [&'static Dir<'static>],
+    compiler: Compiler,
+    bytecode: Arc<Mutex<HashMap<String, Arc<Vec<u8>>>>>,
+}
+
+impl BundledModules {
+    fn bytecode(&self, rel_path: &str) -> Result<Option<Arc<Vec<u8>>>, mlua::Error> {
+        let mut cache = self.bytecode.lock().expect("bytecode cache");
+        if let Some(cached) = cache.get(rel_path) {
+            return Ok(Some(Arc::clone(cached)));
+        }
+        let Some(source) = self
+            .dirs
+            .iter()
+            .find_map(|dir| dir.get_file(rel_path).and_then(|f| f.contents_utf8()))
+        else {
+            return Ok(None);
+        };
+        let compiled = Arc::new(self.compiler.compile(source)?);
+        cache.insert(rel_path.to_owned(), Arc::clone(&compiled));
+        Ok(Some(compiled))
+    }
+}
+
+/// Chunks awaiting native codegen, `None` when jit is off. Compiling a chunk's
+/// main function also compiles every function nested in it, and the native code
+/// lives on the shared proto, so closures already handed to the tool registry
+/// get faster too.
+type CodegenQueue = Option<Arc<Mutex<Vec<Function>>>>;
+
+fn queue_codegen(queue: &CodegenQueue, func: &Function) {
+    if let Some(queue) = queue {
+        queue.lock().expect("codegen queue").push(func.clone());
+    }
+}
+
+struct ModuleLoader {
+    bundled: BundledModules,
+    lua_dir: Option<PathBuf>,
+    env: Table,
+    codegen: CodegenQueue,
+    loaded: Table,
+    loading: Table,
+}
+
+impl ModuleLoader {
+    /// Bundled modules are tried first, so a plugin cannot shadow
+    /// `maki.truncate` and friends with a file of its own.
+    fn plugin_source(&self, rel_path: &str, modname: &str) -> Result<Option<String>, mlua::Error> {
+        let Some(dir) = self.lua_dir.as_ref() else {
+            return Ok(None);
+        };
+        let normalized = dir
+            .join(rel_path)
+            .components()
+            .fold(PathBuf::new(), |mut acc, c| {
+                match c {
+                    std::path::Component::ParentDir => {
+                        acc.pop();
+                    }
+                    std::path::Component::CurDir => {}
+                    _ => acc.push(c),
+                }
+                acc
+            });
+        if !normalized.starts_with(dir) {
+            return Err(mlua::Error::runtime(format!(
+                "require: '{modname}' outside sandbox"
+            )));
+        }
+        Ok(std::fs::read_to_string(&normalized).ok())
+    }
+
+    fn bind(&self, chunk: Chunk<'_>, modname: &str) -> Result<Function, mlua::Error> {
+        chunk
+            .set_name(modname)
+            .set_environment(self.env.clone())
+            .into_function()
+    }
+
+    /// Bundled modules load as bytecode from the shared cache. Plugin files
+    /// load as source, so Luau reports syntax errors against the file the user
+    /// wrote.
+    fn load(&self, lua: &Lua, modname: &str) -> Result<LuaValue, mlua::Error> {
+        let rel_path = modname.replace('.', "/") + ".lua";
+        let func = match self.bundled.bytecode(&rel_path)? {
+            Some(bytecode) => self.bind(
+                lua.load(bytecode.as_slice()).set_mode(ChunkMode::Binary),
+                modname,
+            )?,
+            None => {
+                let Some(source) = self.plugin_source(&rel_path, modname)? else {
+                    return Err(mlua::Error::runtime(format!(
+                        "require '{modname}': module not found"
+                    )));
+                };
+                self.bind(lua.load(source.as_str()), modname)?
+            }
+        };
+        queue_codegen(&self.codegen, &func);
+        func.call(())
+    }
+
+    fn require(&self, lua: &Lua, modname: &str) -> Result<LuaValue, mlua::Error> {
+        if modname.is_empty() {
+            return Err(mlua::Error::runtime(
+                "require: module name must be non-empty",
+            ));
+        }
+
+        if let Ok(cached) = self.loaded.get::<LuaValue>(modname)
+            && cached != LuaValue::Nil
+        {
+            return Ok(cached);
+        }
+
+        if self.loading.get::<bool>(modname).unwrap_or(false) {
+            return Ok(LuaValue::Boolean(true));
+        }
+
+        if let Some(module) = docs_render::virtual_module(lua, modname) {
+            let module = module?;
+            self.loaded.set(modname, module.clone())?;
+            return Ok(LuaValue::Table(module));
+        }
+
+        // Cleared on every path, so a failed require never leaves the module
+        // wedged as "in progress".
+        self.loading.set(modname, true)?;
+        let result = self.load(lua, modname);
+        self.loading.set(modname, LuaValue::Nil)?;
+        let result = result?;
+
+        let stored = if result == LuaValue::Nil {
+            LuaValue::Boolean(true)
+        } else {
+            result.clone()
+        };
+        self.loaded.set(modname, stored)?;
+        Ok(result)
+    }
 }
 
 type InterruptFn = unsafe extern "C-unwind" fn(*mut ffi::lua_State, c_int);
@@ -945,7 +1103,8 @@ struct LuaRuntime {
     registry: Arc<ToolRegistry>,
     tx: flume::Sender<Request>,
     shutdown: Arc<AtomicBool>,
-    bundled_dirs: &'static [&'static Dir<'static>],
+    bundled: BundledModules,
+    codegen_queue: CodegenQueue,
     ui_action_tx: Option<flume::Sender<UiAction>>,
 }
 
@@ -963,7 +1122,7 @@ impl LuaRuntime {
         jit: bool,
     ) -> Result<Self, PluginError> {
         let lua = Lua::new();
-        apply_jit(&lua, jit);
+        let compiler = install_compiler(&lua, jit);
         lua.set_memory_limit(LUA_MEMORY_LIMIT)
             .map_err(|e| PluginError::Lua {
                 plugin: "<init>".to_owned(),
@@ -1032,9 +1191,33 @@ impl LuaRuntime {
             registry,
             tx,
             shutdown,
-            bundled_dirs,
+            bundled: BundledModules {
+                dirs: bundled_dirs,
+                compiler,
+                bytecode: Arc::default(),
+            },
+            codegen_queue: jit.then(Arc::default),
             ui_action_tx,
         })
+    }
+
+    /// Returns false when there is nothing left to compile, so the caller can
+    /// stop polling.
+    fn codegen_step(&self) -> bool {
+        let Some(queue) = self.codegen_queue.as_ref() else {
+            return false;
+        };
+        let Some(func) = queue.lock().expect("codegen queue").pop() else {
+            return false;
+        };
+        let compiled = unsafe {
+            self.lua
+                .exec_raw::<()>(func, |state| ffi::luau_codegen_compile(state, -1))
+        };
+        if let Err(e) = compiled {
+            tracing::debug!(error = %e, "native codegen failed");
+        }
+        true
     }
 
     fn drop_plugin_keys(&mut self, name: &str) {
@@ -1236,7 +1419,7 @@ impl LuaRuntime {
         let env = self.lua.create_table()?;
         env.set("maki", maki)?;
 
-        if require_root.is_some() || !self.bundled_dirs.is_empty() {
+        if require_root.is_some() || !self.bundled.dirs.is_empty() {
             let require_fn = self.create_require_fn(&env, require_root)?;
             env.set("require", require_fn)?;
         }
@@ -1254,101 +1437,17 @@ impl LuaRuntime {
         env: &mlua::Table,
         require_root: Option<PathBuf>,
     ) -> Result<Function, mlua::Error> {
-        let lua_dir = require_root.map(|r| r.canonicalize().unwrap_or(r));
-        let loaded = self.lua.create_table()?;
-        let loading = self.lua.create_table()?;
-        let env_clone = env.clone();
-        let bundled_dirs = self.bundled_dirs;
+        let loader = ModuleLoader {
+            bundled: self.bundled.clone(),
+            lua_dir: require_root.map(|r| r.canonicalize().unwrap_or(r)),
+            env: env.clone(),
+            codegen: self.codegen_queue.clone(),
+            loaded: self.lua.create_table()?,
+            loading: self.lua.create_table()?,
+        };
 
-        self.lua.create_function(move |lua, modname: String| {
-            if modname.is_empty() {
-                return Err(mlua::Error::runtime(
-                    "require: module name must be non-empty",
-                ));
-            }
-
-            if let Ok(cached) = loaded.get::<LuaValue>(modname.as_str())
-                && cached != LuaValue::Nil
-            {
-                return Ok(cached);
-            }
-
-            if loading.get::<bool>(modname.as_str()).unwrap_or(false) {
-                return Ok(LuaValue::Boolean(true));
-            }
-
-            if let Some(module) = docs_render::virtual_module(lua, &modname) {
-                let module = module?;
-                loaded.set(modname.as_str(), module.clone())?;
-                return Ok(LuaValue::Table(module));
-            }
-
-            loading.set(modname.as_str(), true)?;
-
-            let rel_path = modname.replace('.', "/") + ".lua";
-
-            let source_str: Result<Option<String>, mlua::Error> = (|| {
-                for dir in bundled_dirs {
-                    if let Some(file) = dir.get_file(&rel_path)
-                        && let Some(contents) = file.contents_utf8()
-                    {
-                        return Ok(Some(contents.to_owned()));
-                    }
-                }
-                let Some(dir) = lua_dir.as_ref() else {
-                    return Ok(None);
-                };
-                let abs_path = dir.join(&rel_path);
-                let normalized = abs_path.components().fold(PathBuf::new(), |mut acc, c| {
-                    match c {
-                        std::path::Component::ParentDir => {
-                            acc.pop();
-                        }
-                        std::path::Component::CurDir => {}
-                        _ => acc.push(c),
-                    }
-                    acc
-                });
-                if !normalized.starts_with(dir) {
-                    return Err(mlua::Error::runtime(format!(
-                        "require: '{modname}' outside sandbox"
-                    )));
-                }
-                Ok(std::fs::read_to_string(&normalized).ok())
-            })();
-
-            let source_str = source_str?;
-
-            let Some(source) = source_str else {
-                let _ = loading.set(modname.as_str(), LuaValue::Nil);
-                return Err(mlua::Error::runtime(format!(
-                    "require '{modname}': module not found"
-                )));
-            };
-
-            let result: LuaValue = match lua
-                .load(&source)
-                .set_name(&modname)
-                .set_environment(env_clone.clone())
-                .eval()
-            {
-                Ok(v) => v,
-                Err(e) => {
-                    let _ = loading.set(modname.as_str(), LuaValue::Nil);
-                    return Err(e);
-                }
-            };
-
-            loading.set(modname.as_str(), LuaValue::Nil)?;
-            let stored = if result == LuaValue::Nil {
-                LuaValue::Boolean(true)
-            } else {
-                result.clone()
-            };
-            loaded.set(modname.as_str(), stored)?;
-
-            Ok(result)
-        })
+        self.lua
+            .create_function(move |lua, modname: String| loader.require(lua, &modname))
     }
 
     /// `plugins.<name>` options only reach a plugin through
@@ -1412,13 +1511,19 @@ impl LuaRuntime {
 
         self.drop_plugin_keys(&name);
 
-        let exec_result = self
+        let main_fn = self
             .lua
             .load(source)
             .set_name(name.as_ref())
             .set_environment(env)
-            .exec_async()
-            .await;
+            .into_function();
+        let exec_result = match main_fn {
+            Ok(func) => {
+                queue_codegen(&self.codegen_queue, &func);
+                func.call_async::<()>(()).await
+            }
+            Err(e) => Err(e),
+        };
 
         let exec_result = exec_result.and_then(|()| self.check_opts_consumed(&name, &opts));
         if let Err(e) = exec_result {
@@ -2180,10 +2285,24 @@ pub fn spawn(
                 .rx
                 .clone();
 
+            let mut codegen_armed = false;
+
             smol::block_on(ex.run(async {
                 loop {
                     while let Ok(task) = spawn_rx.try_recv() {
                         spawn_async_task(&rt.lua, &ex, &gate, task);
+                    }
+                    // Nothing to serve, so spend the lull on native codegen.
+                    // One chunk per pass with a yield in between, so no request
+                    // or spawned task ever waits for more than a single chunk.
+                    if codegen_armed
+                        && prio_rx.is_empty()
+                        && rx.is_empty()
+                        && spawn_rx.is_empty()
+                        && rt.codegen_step()
+                    {
+                        smol::future::yield_now().await;
+                        continue;
                     }
                     // Biased: user-initiated requests (commands, keybinds) jump
                     // ahead of bulk work like session restores so the UI stays
@@ -2211,6 +2330,7 @@ pub fn spawn(
                     };
                     match msg {
                         Request::Shutdown => break,
+                        Request::WarmJit => codegen_armed = true,
                         Request::LoadSource {
                             name,
                             source,
@@ -2928,7 +3048,7 @@ mod tests {
     #[test]
     fn jit_busy_loop_killed_at_deadline() {
         let (lua, _watchdog) = watchdog_lua(false);
-        apply_jit(&lua, true);
+        install_compiler(&lua, true);
 
         let deadline = Instant::now() + Duration::from_millis(20);
         let cell = TaskCell::new(CancelToken::none(), Some(deadline), None);

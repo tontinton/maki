@@ -229,6 +229,14 @@ impl PluginHost {
     }
 
     pub fn load_builtins(&mut self, config: &PluginsConfig) -> Result<(), PluginError> {
+        let result = self.send_builtin_loads(config);
+        // Armed even when a load failed, so a caller that only warns about the
+        // error is not left interpreting for the rest of the session.
+        let _ = self.inner.tx.send(Request::WarmJit);
+        result
+    }
+
+    fn send_builtin_loads(&self, config: &PluginsConfig) -> Result<(), PluginError> {
         for (plugin, opts) in &config.opts {
             let keys: Vec<&str> = opts.keys().map(String::as_str).collect();
             if !BUNDLED_PLUGINS.iter().any(|p| p.name == plugin.as_str()) {
