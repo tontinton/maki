@@ -17,19 +17,16 @@ struct Frontmatter {
     argument_hint: Option<String>,
 }
 
-fn find_project_ancestor_dirs(cwd: &Path) -> Vec<PathBuf> {
-    let mut dirs = vec![cwd.to_path_buf()];
-    let mut current = cwd;
+pub(crate) fn find_project_ancestor_dirs(cwd: &Path) -> impl Iterator<Item = PathBuf> {
+    let mut current = Some(cwd.to_path_buf());
 
-    while let Some(parent) = current.parent() {
-        dirs.push(parent.to_path_buf());
-        if parent.join(".git").exists() {
-            break;
+    std::iter::from_fn(move || {
+        let dir = current.take()?;
+        if !dir.join(".git").exists() {
+            current = dir.parent().map(Path::to_path_buf);
         }
-        current = parent;
-    }
-
-    dirs
+        Some(dir)
+    })
 }
 
 fn parse_frontmatter(content: &str) -> (Frontmatter, &str) {
@@ -316,7 +313,7 @@ mod tests {
         fs::create_dir_all(&deep).unwrap();
         fs::create_dir_all(tmp.path().join("a/.git")).unwrap();
 
-        let dirs = find_project_ancestor_dirs(&deep);
+        let dirs: Vec<_> = find_project_ancestor_dirs(&deep).collect();
         let dir_strs: Vec<_> = dirs
             .iter()
             .map(|d| d.to_string_lossy().into_owned())
