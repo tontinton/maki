@@ -4855,6 +4855,12 @@ function ToolView:append_text(text)
 -- Append {content} with line numbers, then syntax-highlight it for {ext}
 -- asynchronously. Returns false when {content} is empty.
 function ToolView:set_highlight(content, ext)
+
+-- Content rows on screen, for callers with their own per-row click targets. A
+-- single hidden line is drawn as itself instead of a notice, so it counts as
+-- content too. Rows line up with `all_lines` under keep = "head"; keep = "tail"
+-- prints its notice first and shifts them.
+function ToolView:visible_count()
 function ToolView:toggle()
 function ToolView:flush()
 function ToolView:update_line(all_idx, line)
@@ -4866,6 +4872,11 @@ function ToolView.restore_lines(lines, opts)
 -- Rebuild a collapsed view from a tool's saved llm_output, click-to-toggle
 -- wired. For `restore` hooks.
 function ToolView.restore(output, opts)
+
+-- Same, for tools whose live output goes through markdown (`format =
+-- "markdown"`); {opts.width} is the wrap width. Errors stay plain, as they do
+-- live.
+function ToolView.restore_markdown(output, is_error, opts)
 ```
 
 ### `require("maki.truncate")`

@@ -208,19 +208,12 @@ end
 -- this mirrors that for restore and batch children, which build the body here.
 local function restore(_input, output, is_error, ctx)
   local tol = ctx:tool_output_lines()
-  local opts = {
+  return ToolView.restore_markdown(output, is_error, {
     max_lines = (tol and tol.task) or DEFAULT_OUTPUT_LINES,
     keep = "head",
     max_line_bytes = output_limits.DEFAULT_MAX_LINE_BYTES,
-  }
-  if not is_error then
-    local width = math.max(maki.ui.terminal_size().cols - BODY_INDENT_COLS, MIN_MD_WIDTH)
-    local ok, md_lines = pcall(maki.ui.markdown, output, width)
-    if ok then
-      return ToolView.restore_lines(md_lines, opts)
-    end
-  end
-  return ToolView.restore(output, opts)
+    width = math.max(maki.ui.terminal_size().cols - BODY_INDENT_COLS, MIN_MD_WIDTH),
+  })
 end
 
 maki.api.register_tool({

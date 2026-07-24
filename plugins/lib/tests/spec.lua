@@ -23,6 +23,7 @@ local function mock_buf()
     self.lines = lines
     self.call_count = self.call_count + 1
   end
+  function b:on() end
   return b
 end
 
@@ -289,6 +290,66 @@ case("tool_view_max_line_bytes_default_off", function()
   local long = string.rep("a", 100)
   view:append(long)
   eq(buf.lines[1], long)
+end)
+
+local RESTORE_OPTS = { max_lines = 10, keep = "head", width = 80 }
+local RESTORE_OUTPUT = "**bold** line\nsecond line"
+local RENDERED = "rendered by markdown"
+
+local function all_text(lines)
+  local out = {}
+  for _, line in ipairs(lines) do
+    if type(line) == "string" then
+      out[#out + 1] = line
+    else
+      for _, span in ipairs(line) do
+        out[#out + 1] = span[1]
+      end
+    end
+  end
+  return table.concat(out, "\n")
+end
+
+-- Restores {output} with {markdown} standing in for the real renderer; returns
+-- the text that reached the buf and how many times the renderer ran.
+local function restore_markdown(output, is_error, markdown)
+  local buf = mock_buf()
+  local original = { buf = maki.ui.buf, markdown = maki.ui.markdown }
+  local calls = 0
+  maki.ui.buf = function()
+    return buf
+  end
+  maki.ui.markdown = function(...)
+    calls = calls + 1
+    return markdown(...)
+  end
+  local ok, err = pcall(ToolView.restore_markdown, output, is_error, RESTORE_OPTS)
+  maki.ui.buf, maki.ui.markdown = original.buf, original.markdown
+  assert(ok, tostring(err))
+  return all_text(buf.lines), calls
+end
+
+local function markdown_marker()
+  return { { { RENDERED, "md" } } }
+end
+
+case("tool_view_restore_markdown_renders_markdown", function()
+  local text, calls = restore_markdown(RESTORE_OUTPUT, false, markdown_marker)
+  eq(calls, 1, "output must go through markdown rendering")
+  eq(text, RENDERED, "the rendered lines are what reaches the buf")
+end)
+
+case("tool_view_restore_markdown_keeps_errors_plain", function()
+  local text, calls = restore_markdown(RESTORE_OUTPUT, true, markdown_marker)
+  eq(calls, 0, "error output must never reach the markdown renderer")
+  eq(text, RESTORE_OUTPUT, "error output must render verbatim")
+end)
+
+case("tool_view_restore_markdown_falls_back_when_rendering_fails", function()
+  local text = restore_markdown(RESTORE_OUTPUT, false, function()
+    error("renderer blew up")
+  end)
+  eq(text, RESTORE_OUTPUT, "a failing renderer must not swallow the output")
 end)
 
 local TextInput = require("maki.text_input")
