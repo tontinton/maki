@@ -229,6 +229,7 @@ impl OpenAiCompatProvider {
             pricing: Some(pricing),
             supports_thinking: None,
             supports_vision: None,
+            tier: None,
             provider_info: None,
         })
     }

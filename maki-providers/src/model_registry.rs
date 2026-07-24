@@ -113,14 +113,21 @@ impl ModelRegistry {
                 t => t,
             };
         }
-        if let Some(t) = static_tier {
-            return t;
-        }
         if let Some((_, model_id)) = spec.split_once('/')
             && let Some(models) = self.known_models.get(provider)
-            && let Some(pos) = models.iter().position(|m| m.id == model_id)
+            && let Some(model) = models.iter().find(|model| model.id == model_id)
         {
-            return tier_for_position(pos);
+            if let Some(tier) = model.tier {
+                return tier;
+            }
+            if static_tier.is_none()
+                && let Some(pos) = models.iter().position(|candidate| candidate.id == model_id)
+            {
+                return tier_for_position(pos);
+            }
+        }
+        if let Some(t) = static_tier {
+            return t;
         }
         ModelTier::Medium
     }
@@ -134,19 +141,31 @@ impl ModelRegistry {
         }
 
         let candidate = self
-            .static_candidate(provider, tier)
+            .discovered_static_candidate(provider, tier)
+            .or_else(|| self.metadata_candidate(provider, tier))
+            .or_else(|| static_candidate(provider, tier))
             .or_else(|| self.positional_candidate(provider, tier))?;
 
         (!self.claimed_elsewhere(&candidate, tier)).then_some(candidate)
     }
 
-    fn static_candidate(&self, provider: &str, tier: ModelTier) -> Option<String> {
-        let manifest = crate::manifest::ManifestRegistry::get(provider)?;
-        manifest
-            .models
+    /// The curated default the provider actually offers, so discovery cannot
+    /// replace a still available default with whatever it lists first.
+    fn discovered_static_candidate(&self, provider: &str, tier: ModelTier) -> Option<String> {
+        static_prefixes(provider, tier)
+            .find(|prefix| self.discovered(provider, prefix).is_some())
+            .map(|prefix| format!("{provider}/{prefix}"))
+    }
+
+    /// Lowest ID wins, so the tier default survives provider list reordering.
+    fn metadata_candidate(&self, provider: &str, tier: ModelTier) -> Option<String> {
+        self.known_models
+            .get(provider)?
             .iter()
-            .find(|e| e.default && e.tier == tier)
-            .map(|e| format!("{provider}/{}", e.prefixes[0]))
+            .filter(|model| model.tier == Some(tier))
+            .map(|model| model.id.as_str())
+            .min()
+            .map(|id| format!("{provider}/{id}"))
     }
 
     fn positional_candidate(&self, provider: &str, tier: ModelTier) -> Option<String> {
@@ -189,6 +208,20 @@ impl ModelRegistry {
             .collect();
         (!tiers.is_empty()).then(|| tiers.join("/"))
     }
+}
+
+fn static_candidate(provider: &str, tier: ModelTier) -> Option<String> {
+    static_prefixes(provider, tier)
+        .next()
+        .map(|prefix| format!("{provider}/{prefix}"))
+}
+
+fn static_prefixes(provider: &str, tier: ModelTier) -> impl Iterator<Item = &'static str> {
+    crate::manifest::ManifestRegistry::get(provider)
+        .into_iter()
+        .flat_map(|manifest| manifest.models)
+        .filter(move |entry| entry.default && entry.tier == tier)
+        .flat_map(|entry| entry.prefixes.iter().copied())
 }
 
 fn tier_for_position(pos: usize) -> ModelTier {
@@ -237,6 +270,7 @@ fn write_overrides(path: &Path, overrides: &BTreeMap<ModelTier, String>) {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+    use test_case::test_case;
 
     fn make_map(overrides: &[(ModelTier, &str)], models: &[&str]) -> ModelRegistry {
         let mut reg = ModelRegistry::default();
@@ -266,6 +300,77 @@ mod tests {
         assert_eq!(t("ollama/pos1", None), ModelTier::Weak);
         assert_eq!(t("ollama/pos2", None), ModelTier::Weak);
         assert_eq!(t("ollama/unknown", None), ModelTier::Medium);
+    }
+
+    fn make_tiered(models: &[(&str, ModelTier)]) -> ModelRegistry {
+        let mut reg = ModelRegistry::default();
+        reg.set_known_models(
+            &Arc::<str>::from("copilot"),
+            models
+                .iter()
+                .map(|&(id, tier)| ModelInfo {
+                    tier: Some(tier),
+                    ..ModelInfo::id_only(id.into())
+                })
+                .collect(),
+        );
+        reg
+    }
+
+    #[test]
+    fn discovered_category_tier_beats_position_and_static_fallback() {
+        let reg = make_tiered(&[
+            ("terra", ModelTier::Medium),
+            ("luna", ModelTier::Weak),
+            ("gpt-5.6-sol", ModelTier::Strong),
+        ]);
+
+        assert_eq!(
+            reg.tier_for("copilot/gpt-5.6-sol", "copilot", Some(ModelTier::Medium)),
+            ModelTier::Strong
+        );
+        assert_eq!(
+            reg.tier_for("copilot/terra", "copilot", None),
+            ModelTier::Medium
+        );
+        assert_eq!(
+            reg.tier_for("copilot/luna", "copilot", None),
+            ModelTier::Weak
+        );
+        assert_eq!(
+            reg.spec_for_tier("copilot", ModelTier::Strong),
+            Some("copilot/gpt-5.6-sol".into())
+        );
+    }
+
+    #[test_case(&[("gpt-5.4", ModelTier::Strong), ("claude-opus-4.7", ModelTier::Strong)], "copilot/gpt-5.4"; "curated default beats discovered tier")]
+    #[test_case(&[("claude-opus-4.6", ModelTier::Strong), ("alpha", ModelTier::Strong)], "copilot/claude-opus-4.6"; "later curated prefix when first is unavailable")]
+    #[test_case(&[("zeta", ModelTier::Strong), ("alpha", ModelTier::Strong)], "copilot/alpha"; "lowest id when no curated default is entitled")]
+    fn spec_for_tier_prefers_entitled_curated_default(
+        models: &[(&str, ModelTier)],
+        expected: &str,
+    ) {
+        let reg = make_tiered(models);
+        assert_eq!(
+            reg.spec_for_tier("copilot", ModelTier::Strong),
+            Some(expected.into())
+        );
+    }
+
+    #[test]
+    fn spec_for_tier_ignores_discovery_list_order() {
+        let models = [
+            ("zeta", ModelTier::Strong),
+            ("alpha", ModelTier::Strong),
+            ("mid", ModelTier::Medium),
+        ];
+        let mut reversed = models;
+        reversed.reverse();
+
+        assert_eq!(
+            make_tiered(&models).spec_for_tier("copilot", ModelTier::Strong),
+            make_tiered(&reversed).spec_for_tier("copilot", ModelTier::Strong)
+        );
     }
 
     #[test]
@@ -337,6 +442,7 @@ mod tests {
                     pricing: None,
                     supports_thinking: None,
                     supports_vision: None,
+                    tier: None,
                     provider_info: None,
                 },
                 ModelInfo {
@@ -346,6 +452,7 @@ mod tests {
                     pricing: None,
                     supports_thinking: None,
                     supports_vision: None,
+                    tier: None,
                     provider_info: None,
                 },
             ],
