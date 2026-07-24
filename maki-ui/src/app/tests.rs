@@ -55,7 +55,7 @@ fn build_app(dir: StateDir, writer: Arc<StorageWriter>) -> App {
     )
 }
 
-fn test_app() -> App {
+pub(crate) fn test_app() -> App {
     let dir = StateDir::from_path(env::temp_dir());
     let mut app = build_app(dir.clone(), Arc::new(StorageWriter::new(dir)));
     let (shared_queue, _rx) = shared_queue::queue();
@@ -353,6 +353,25 @@ fn queue_item_consumed_pushes_deferred_user_message() {
         app.main_chat().last_message_role(),
         Some(&DisplayRole::User),
     );
+}
+
+/// Restored queue items start runs without `start_run`, so the consumed
+/// event is the only signal that the agent went busy: it must flip status
+/// or the busy-guard and esc-to-cancel stay off during the whole run.
+#[test]
+fn queue_item_consumed_marks_agent_streaming() {
+    let mut app = test_app();
+    assert_eq!(app.status, Status::Idle);
+
+    app.update(agent_msg_with_run_id(
+        AgentEvent::QueueItemConsumed {
+            text: "restored".into(),
+            image_count: 0,
+        },
+        app.run_id,
+    ));
+
+    assert_eq!(app.status, Status::Streaming);
 }
 
 #[test_case(error_app as fn(&mut App) ; "error")]
@@ -1626,6 +1645,65 @@ fn reload_leaves_empty_session_unpersisted_on_disk() {
     assert_eq!(entries, 0);
 }
 
+/// `state.session.tool_outputs` is the only store, so a `ToolDone` write
+/// must reach disk or restored sessions lose their tool call widgets.
+#[test]
+fn tool_done_output_persists_to_disk() {
+    let (_tmp, dir, writer, mut app) = tempdir_app();
+    app.state
+        .session
+        .messages
+        .push(Message::user("prompt".into()));
+    app.status = Status::Streaming;
+    app.run_id = 1;
+
+    app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+        id: "tool-live".into(),
+        tool: "bash".into(),
+        output: ToolOutput::Plain("live output".into()),
+        is_error: false,
+        annotation: None,
+        written_path: None,
+    }))));
+
+    app.save_session();
+    let id = app.state.session.id;
+    drain_writer(app, writer);
+
+    let loaded = AppSession::load(id, &dir).unwrap();
+    assert!(matches!(
+        loaded.tool_outputs.get("tool-live"),
+        Some(ToolOutput::Plain(s)) if s.text == "live output"
+    ));
+}
+
+#[test]
+fn restore_resumed_session_flushes_queued_messages_and_round_trips() {
+    let mut app = test_app();
+    app.state.session.meta.queued_messages = vec!["q1".into(), "q2".into()];
+
+    app.restore_resumed_session();
+    assert!(app.state.session.meta.queued_messages.is_empty());
+    assert_eq!(app.queue.text_messages(), ["q1", "q2"]);
+
+    app.save_session();
+    assert_eq!(app.state.session.meta.queued_messages, ["q1", "q2"]);
+}
+
+#[test]
+fn apply_loaded_session_defers_queued_messages_until_respawn() {
+    let mut app = test_app();
+    let mut session = AppSession::new("test-model", "/tmp/test");
+    session.meta.queued_messages = vec!["deferred".into()];
+    session.messages.push(Message::user("hello".into()));
+
+    let model = app.state.model.clone();
+    app.apply_loaded_session(session, &model);
+
+    assert!(app.queue.is_empty());
+    assert_eq!(app.state.session.meta.queued_messages, ["deferred"]);
+}
+
 #[test]
 fn yolo_toggle() {
     let mut app = test_app();
@@ -1767,7 +1845,7 @@ fn rewind_to_middle_truncates_and_populates_input() {
     assert_eq!(app.state.session.messages.len(), 2);
     assert!(app.state.session.tool_outputs.contains_key("tool-1"));
     assert_eq!(app.input_box.buffer.value(), "second prompt");
-    assert_eq!(app.run_id, old_run_id + 1);
+    assert_eq!(app.run_id, old_run_id);
     let expected_ctx = maki_agent::agent::estimate_message_tokens(&app.state.session.messages);
     assert_eq!(app.state.context_size, expected_ctx);
     assert_eq!(app.chats[0].context_size, expected_ctx);
@@ -1776,7 +1854,6 @@ fn rewind_to_middle_truncates_and_populates_input() {
         panic!("expected LoadSession");
     };
     assert_eq!(loaded.messages.len(), 2);
-    assert!(loaded.tool_outputs.contains_key("tool-1"));
 }
 
 #[test]

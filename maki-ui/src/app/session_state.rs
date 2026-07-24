@@ -1,9 +1,7 @@
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use maki_agent::ToolOutput;
 use maki_agent::permissions::PermissionManager;
 use maki_config::Effect;
 use maki_providers::{Message, Model, ThinkingConfig, TokenUsage};
@@ -93,14 +91,10 @@ impl SessionState {
     pub fn sync_session(
         &mut self,
         shared_history: &Option<Arc<ArcSwap<Vec<Message>>>>,
-        shared_tool_outputs: &Option<Arc<Mutex<HashMap<String, ToolOutput>>>>,
         permissions: &Arc<PermissionManager>,
     ) {
         if let Some(history) = shared_history {
             self.session.messages = Vec::clone(&history.load());
-        }
-        if let Some(outputs) = shared_tool_outputs {
-            self.session.tool_outputs = outputs.lock().unwrap_or_else(|e| e.into_inner()).clone();
         }
         self.session.token_usage = self.token_usage;
         self.session.meta.context_size = self.context_size;

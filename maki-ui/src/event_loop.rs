@@ -186,7 +186,7 @@ impl SpawnCtx {
         app.lua_event_handle = self.lua_event_handle.clone();
         handles.apply_to_app(&mut app);
         if resumed {
-            restore_session(&mut app, &handles);
+            app.restore_resumed_session();
         }
         let (shell_tx, shell_rx) = flume::unbounded::<ShellEvent>();
         SessionRuntime {
@@ -285,21 +285,6 @@ fn spawn_model_fetch(model_slot: &Arc<ArcSwap<ModelSlot>>, timeouts: Timeouts) -
         warn_rx,
         warn_tx,
         task,
-    }
-}
-
-fn restore_session(app: &mut App, handles: &AgentHandles) {
-    app.permissions
-        .load_session_rules(crate::app::session_state::stored_to_rules(
-            &app.state.session.meta.session_rules,
-        ));
-    *handles
-        .tool_outputs
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()) = app.state.session.tool_outputs.clone();
-    app.restore_display();
-    for w in app.state.warnings.drain(..) {
-        app.status_bar.flash(w);
     }
 }
 
@@ -539,12 +524,6 @@ impl<'t> EventLoop<'t> {
             match self.next_wake(Duration::ZERO) {
                 Some(wake) => self.handle_wake(wake)?,
                 None => break,
-            }
-        }
-
-        for rt in &mut self.sessions {
-            if rt.app.status == Status::Streaming && rt.handles.agent_rx.is_disconnected() {
-                rt.app.status = Status::error("agent stopped unexpectedly".into());
             }
         }
 
@@ -969,11 +948,6 @@ impl<'t> EventLoop<'t> {
                     }));
                 }
                 self.respawn_agent(idx, loaded.messages);
-                *self.sessions[idx]
-                    .handles
-                    .tool_outputs
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner()) = loaded.tool_outputs;
             }
             Action::ChangeModel(spec) => self.change_model(spec),
             Action::RefreshProvider { slug } => self.refresh_provider(slug),

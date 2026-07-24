@@ -1,6 +1,8 @@
 //! Elm-style `update(Msg) -> Vec<Action>`; side effects are dispatched by the caller.
 //! Double-esc: first esc flashes a hint, second within `flash_duration` cancels/rewinds.
-//! `run_id` increments each run so stale events from previous agent runs are ignored.
+//! `run_id` invalidates in-flight agent events. It bumps in exactly three
+//! places, one per transition: `start_run`, `handle_cancel`, and
+//! `AgentHandles::respawn`. Everything else only reads it.
 
 mod btw;
 mod image_paste;
@@ -11,13 +13,13 @@ mod session;
 pub(crate) mod session_state;
 pub(crate) mod shell;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 pub(crate) mod view;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::AppSession;
@@ -54,7 +56,7 @@ use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use maki_agent::permissions::PermissionManager;
 use maki_agent::{
     AgentEvent, Envelope, ImageSource, McpConfigErrors, McpPromptInfo, McpSnapshotReader,
-    SubagentInfo, ToolOutput,
+    SubagentInfo,
 };
 use maki_config::UiConfig;
 use maki_lua::{EventHandle, HintReader, KeymapReader, LuaCommandReader};
@@ -169,7 +171,6 @@ pub struct App {
     pub(crate) usage_slot: Arc<ArcSwapOption<UsageFetchState>>,
     pub(crate) shared_history: Option<Arc<ArcSwap<Vec<Message>>>>,
     pub(crate) btw_system: Option<Arc<ArcSwap<String>>>,
-    pub(crate) shared_tool_outputs: Option<Arc<Mutex<HashMap<String, ToolOutput>>>>,
     pub(crate) image_paste_rx: Vec<flume::Receiver<Result<ImageSource, String>>>,
     storage_writer: Arc<StorageWriter>,
     pub(crate) shell: shell::ShellState,
@@ -253,7 +254,6 @@ impl App {
             usage_slot: Arc::new(ArcSwapOption::empty()),
             shared_history: None,
             btw_system: None,
-            shared_tool_outputs: None,
             image_paste_rx: vec![],
             storage_writer,
             shell: shell::ShellState::default(),
@@ -996,12 +996,10 @@ impl App {
             {
                 self.transition_plan(PlanTrigger::WriteDone);
             }
-            if let Some(ref outputs) = self.shared_tool_outputs {
-                outputs
-                    .lock()
-                    .unwrap()
-                    .insert(e.id.clone(), e.output.clone());
-            }
+            self.state
+                .session
+                .tool_outputs
+                .insert(e.id.clone(), e.output.clone());
             if let Some(&sub_idx) = self.chat_index.get(&e.id) {
                 let (role, text) = if e.is_error {
                     (DisplayRole::Error, ERROR_TEXT)
@@ -1321,10 +1319,7 @@ impl App {
             self.flash("Agent is busy, try again later".into());
             vec![]
         } else {
-            self.run_id += 1;
-            self.status = Status::Streaming;
-            self.main_chat().show_user_message(display_text);
-            vec![Action::SendMessage(Box::new(input))]
+            self.start_run(input, display_text)
         }
     }
 
@@ -1562,7 +1557,6 @@ impl App {
         } else {
             format!("{}.", IMPLEMENT_MSG_PREFIX)
         };
-        self.run_id += 1;
         let msg = QueuedMessage {
             text,
             images: vec![],

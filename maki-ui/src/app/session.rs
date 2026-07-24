@@ -13,7 +13,6 @@ use crate::AppSession;
 
 use super::session_state::{SessionState, stored_to_rules};
 use super::{App, Mode, PendingInput, PlanState};
-use crate::agent::QueuedMessage;
 
 /// The single content predicate: `App::save_session` persists a session
 /// iff this holds, and the shutdown path reuses it to tell which tabs were
@@ -32,11 +31,8 @@ impl App {
     }
 
     pub(crate) fn save_session(&mut self) {
-        self.state.sync_session(
-            &self.shared_history,
-            &self.shared_tool_outputs,
-            &self.permissions,
-        );
+        self.state
+            .sync_session(&self.shared_history, &self.permissions);
         self.sync_ephemeral_state();
         if !self.has_content() {
             return;
@@ -110,14 +106,6 @@ impl App {
             self.input_box.buffer.move_to_end();
         }
 
-        for text in std::mem::take(&mut self.state.session.meta.queued_messages) {
-            let msg = QueuedMessage {
-                text,
-                images: Vec::new(),
-            };
-            self.queue_and_notify(msg);
-        }
-
         self.fire_restore_items(restore_items);
 
         for sa in std::mem::take(&mut self.state.session.meta.subagents) {
@@ -158,10 +146,22 @@ impl App {
         }
     }
 
+    /// Resume at process start: the agent was already spawned with this
+    /// history, so no respawn follows and the restored queue must be
+    /// flushed here.
+    pub(crate) fn restore_resumed_session(&mut self) {
+        self.permissions
+            .load_session_rules(stored_to_rules(&self.state.session.meta.session_rules));
+        self.restore_display();
+        self.flush_restored_queue();
+        for w in self.state.warnings.drain(..) {
+            self.status_bar.flash(w);
+        }
+    }
+
     fn loaded_session_snapshot(&self) -> LoadedSession {
         LoadedSession {
             messages: self.state.session.messages.clone(),
-            tool_outputs: self.state.session.tool_outputs.clone(),
             model_spec: self.state.session.model.clone(),
         }
     }
@@ -191,8 +191,6 @@ impl App {
     }
 
     pub(super) fn rewind_to(&mut self, entry: RewindEntry) -> Vec<Action> {
-        self.run_id += 1;
-
         self.state.session.messages.truncate(entry.turn_index);
         self.state
             .session
