@@ -159,6 +159,7 @@ pub struct App {
     pub exit_request: ExitRequest,
     pub(crate) exit_on_done: bool,
     pub(crate) queue: MessageQueue,
+    recoverable_queue: Vec<String>,
     pub answer_tx: Option<flume::Sender<String>>,
     pub(crate) cmd_tx: Option<flume::Sender<super::AgentCommand>>,
     pub(super) pending_input: PendingInput,
@@ -248,6 +249,7 @@ impl App {
             exit_request: ExitRequest::None,
             exit_on_done: false,
             queue: MessageQueue::default(),
+            recoverable_queue: Vec::new(),
             answer_tx: None,
             cmd_tx: None,
             pending_input: PendingInput::None,
@@ -912,6 +914,7 @@ impl App {
         self.main_chat()
             .push(DisplayMessage::new(DisplayRole::Error, CANCEL_MSG.into()));
         self.queue.clear();
+        self.recoverable_queue.clear();
         self.status = Status::Idle;
         vec![Action::CancelAgent {
             run_id: cancelled_run,
@@ -1141,6 +1144,7 @@ impl App {
                         chat.fail_in_progress_with_message(message.clone());
                     }
                     self.sync_task_picker();
+                    self.recoverable_queue = self.queue.text_messages();
                     self.save_session();
                     self.queue.clear();
                     self.chat_index.clear();

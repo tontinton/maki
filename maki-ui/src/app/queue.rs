@@ -210,6 +210,8 @@ impl App {
     /// once per run.
     pub(super) fn start_run(&mut self, input: AgentInput, display: String) -> Vec<Action> {
         self.run_id += 1;
+        // New work supersedes text held for recovery after an agent error.
+        self.recoverable_queue.clear();
         self.status = Status::Streaming;
         self.fire_session_autocmd("TurnStart", serde_json::json!({}));
         self.main_chat().show_user_message(display);

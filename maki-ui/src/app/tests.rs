@@ -527,6 +527,7 @@ fn reset_session_clears_plan() {
     assert_eq!(app.state.mode, Mode::Build);
     assert_eq!(app.state.plan, PlanState::None);
     assert!(app.queue.is_empty());
+    assert!(app.recoverable_queue.is_empty());
     assert_eq!(app.chats.len(), 1);
     assert_eq!(app.chats[0].name, "Main");
     assert_eq!(app.active_chat, 0);
@@ -2656,6 +2657,13 @@ fn error_event_matching_run_id_saves_session_and_queued_messages() {
     assert_eq!(app.state.session.messages.len(), 2);
     assert_eq!(app.state.session.meta.queued_messages, ["next"]);
     assert!(app.queue.is_empty());
+
+    app.save_session();
+    assert_eq!(app.state.session.meta.queued_messages, ["next"]);
+
+    type_and_submit(&mut app, "replacement");
+    app.save_session();
+    assert!(app.state.session.meta.queued_messages.is_empty());
 }
 
 // --- Plan form integration tests ---

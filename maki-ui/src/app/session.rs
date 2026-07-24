@@ -44,7 +44,11 @@ impl App {
         let draft = self.input_box.buffer.value();
         self.state.session.meta.input_draft = if draft.is_empty() { None } else { Some(draft) };
 
-        self.state.session.meta.queued_messages = self.queue.text_messages();
+        self.state.session.meta.queued_messages = if self.recoverable_queue.is_empty() {
+            self.queue.text_messages()
+        } else {
+            self.recoverable_queue.clone()
+        };
 
         let mut subagents: Vec<_> = self.chat_index.iter().collect();
         subagents.sort_by_key(|&(_, chat_index)| chat_index);
@@ -86,6 +90,7 @@ impl App {
         self.chat_index.clear();
         self.status = super::Status::Idle;
         self.queue.clear();
+        self.recoverable_queue.clear();
         self.close_all_overlays();
         self.pending_input = PendingInput::None;
         self.status_bar.clear_flash();
