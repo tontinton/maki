@@ -14,6 +14,7 @@ use maki_agent::agent::tool_dispatch::{self, Emit};
 use maki_agent::cancel::CancelMap;
 use maki_agent::tools::interpreter_bridge;
 use maki_agent::tools::registry::ToolRegistry;
+use maki_agent::tools::schema::sanitize_tool_input_schema;
 use maki_agent::tools::{
     Deadline, DescriptionContext, FileReadTracker, LocalToolFn, LocalTools, ToolAudience,
     ToolContext, ToolFilter, ToolLive,
@@ -420,6 +421,7 @@ async fn session(
                     .map_err(|_| format!("local_tools.{name}: 'description' is required"))
             );
             let input_schema = lua_to_json(&lua, &spec.get::<LuaValue>("input_schema")?)?;
+            let sanitized_schema = sanitize_tool_input_schema(input_schema);
             let handler = try_pair!(
                 spec.get::<Function>("handler")
                     .map_err(|_| format!("local_tools.{name}: 'handler' is required"))
@@ -427,7 +429,7 @@ async fn session(
             defs.push(serde_json::json!({
                 "name": name,
                 "description": description,
-                "input_schema": input_schema,
+                "input_schema": sanitized_schema,
             }));
             let weak = lua.weak();
             local_map.insert(

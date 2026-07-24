@@ -15,6 +15,7 @@ local STRUCTURED_OUTPUT_PROMPT_SUFFIX = "\n\nWhen finished, call the structured_
 local MAX_STRUCTURED_RETRIES = 2
 local MAX_SCHEMA_ERRORS = 3
 local SCHEMA_COMPILE_ERROR = "invalid output_schema"
+local SCHEMA_ROOT_ERROR = "output_schema must have type object"
 local STRUCTURED_MISSING_ERROR = "subagent finished without calling structured_output"
 local STRUCTURED_INVALID_ERROR = "subagent result does not match output_schema"
 local NUDGE_MISSING =
@@ -97,6 +98,9 @@ local function handler(input, ctx)
   -- Compile early: a bad schema costs zero tokens.
   local validator
   if input.output_schema then
+    if type(input.output_schema) ~= "table" or input.output_schema.type ~= "object" then
+      return { llm_output = SCHEMA_ROOT_ERROR, is_error = true }
+    end
     local compile_err
     validator, compile_err = maki.json.schema_validator(input.output_schema)
     if compile_err then

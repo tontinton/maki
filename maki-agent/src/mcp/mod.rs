@@ -37,6 +37,7 @@ use self::error::McpError;
 use self::http::HttpTransport;
 use self::stdio::StdioTransport;
 use self::transport::McpTransport;
+use crate::tools::schema::sanitize_tool_input_schema;
 
 const SEPARATOR: &str = ".";
 const WIRE_SEPARATOR: &str = "__";
@@ -873,13 +874,14 @@ fn publish(inner: &McpManagerInner, index: &ArcSwap<ToolIndex>, snapshot: &ArcSw
                         transport: Arc::clone(transport),
                     },
                 );
+                let sanitized_schema = sanitize_tool_input_schema(t.input_schema.clone());
                 descriptors.push(ToolDescriptor {
                     qualified_name: Arc::clone(&t.qualified_name),
                     always_load,
                     definition: json!({
                         "name": wire_tool_name(&t.qualified_name),
                         "description": t.description,
-                        "input_schema": t.input_schema,
+                        "input_schema": sanitized_schema,
                     }),
                 });
             }
