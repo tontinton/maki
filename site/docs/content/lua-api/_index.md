@@ -3909,6 +3909,53 @@ local half_width = math.floor(size.cols / 2)
 
 ---
 
+### `maki.ui.display_width()` {#maki-ui-display_width}
+
+```lua
+maki.ui.display_width({text})
+```
+
+Returns the display width of a string in terminal cells, matching
+how `ratatui` measures text.
+
+**Parameters:**
+
+- `{text}` (`string`) The text to measure.
+
+**Returns:** (`integer`) Number of display cells the text occupies.
+
+**Example:**
+
+```lua
+local w = maki.ui.display_width("hello")
+```
+
+---
+
+### `maki.ui.truncate_text()` {#maki-ui-truncate_text}
+
+```lua
+maki.ui.truncate_text({text}, {max_width})
+```
+
+Splits a string at a display-cell boundary.
+
+**Parameters:**
+
+- `{text}` (`string`) The text to split.
+- `{max_width}` (`integer`) Maximum display cells for the head.
+
+**Returns:** (`table`) `{head = string, tail = string}`.
+
+**Example:**
+
+```lua
+local t = maki.ui.truncate_text("hello world", 5)
+-- t.head == "hello", t.tail == " world"
+```
+
+---
+
 ### `maki.ui.flash()` {#maki-ui-flash}
 
 ```lua

@@ -5,7 +5,6 @@ local QuestionForm = {}
 local MAX_HEIGHT_RATIO = 0.75
 local CUSTOM_OPTION = "Type your own answer"
 local CHROME = 3
-local LABEL_INDENT = 4
 local DESC_SEP = " — "
 local DESC_SEP_WIDTH = 3
 local ARROW_PREFIX = "    → "
@@ -27,16 +26,26 @@ local NEWLINE_KEYS = {
 }
 
 local function display_width(s)
-  return utf8.len(s) or #s
+  return maki.ui.display_width(s)
 end
 
 local function split_at(s, max_cols)
-  local total = utf8.len(s) or #s
+  local total = display_width(s)
   if total <= max_cols then
     return s, ""
   end
-  local byte_end = utf8.offset(s, max_cols + 1)
-  return s:sub(1, byte_end - 1), s:sub(byte_end)
+  local t = maki.ui.truncate_text(s, max_cols)
+  local head, tail = t.head, t.tail
+  -- truncate_text never returns a head wider than max_cols, so a wide glyph
+  -- in a too-narrow column yields an empty head. Force-take the first char
+  -- here so wrap_spans always makes forward progress.
+  if max_cols > 0 and head == "" then
+    local next_pos = utf8.offset(s, 2)
+    local len = next_pos and next_pos - 1 or #s
+    head = s:sub(1, len)
+    tail = s:sub(len + 1)
+  end
+  return head, tail
 end
 
 local function wrap_spans(spans, max_width)
@@ -96,8 +105,15 @@ local function wrap_spans(spans, max_width)
             if current_w >= max_width then
               flush()
             end
-            local head, tail = split_at(word, max_width - current_w)
-            push(head, style, display_width(head))
+            local avail = max_width - current_w
+            local head, tail = split_at(word, avail)
+            local head_w = display_width(head)
+            if head_w > avail and current_w > 0 then
+              flush()
+              head, tail = split_at(word, max_width)
+              head_w = display_width(head)
+            end
+            push(head, style, head_w)
             word = tail
           end
         end
@@ -363,7 +379,8 @@ end
 
 local function render_option_rows(pointer, chk, chk_style, label, lbl_style, desc, usable)
   local label_col_max = math.floor(usable * LABEL_MAX_RATIO)
-  local label_text_max = label_col_max - LABEL_INDENT
+  local prefix_w = display_width(pointer) + display_width(chk)
+  local label_text_max = label_col_max - prefix_w
   local rows = {}
   local label_w = display_width(label)
   local has_desc = desc and desc ~= ""
@@ -379,7 +396,7 @@ local function render_option_rows(pointer, chk, chk_style, label, lbl_style, des
       first[#first + 1] = sp
       first_label_w = first_label_w + display_width(sp[1])
     end
-    local gap = label_col_max - LABEL_INDENT - first_label_w
+    local gap = label_col_max - prefix_w - first_label_w
     if gap > 0 then
       first[#first + 1] = { string.rep(" ", gap), "" }
     end
@@ -390,7 +407,7 @@ local function render_option_rows(pointer, chk, chk_style, label, lbl_style, des
     rows[#rows + 1] = first
 
     local n = math.max(#label_lines, #desc_lines)
-    local indent = string.rep(" ", LABEL_INDENT)
+    local indent = string.rep(" ", prefix_w)
     for j = 2, n do
       local row = { { indent, "" } }
       local lw = 0
@@ -401,7 +418,7 @@ local function render_option_rows(pointer, chk, chk_style, label, lbl_style, des
         end
       end
       if desc_lines[j] then
-        local col_gap = label_col_max - LABEL_INDENT - lw + DESC_SEP_WIDTH
+        local col_gap = label_col_max - prefix_w - lw + DESC_SEP_WIDTH
         if col_gap > 0 then
           row[#row + 1] = { string.rep(" ", col_gap), "" }
         end
@@ -414,14 +431,14 @@ local function render_option_rows(pointer, chk, chk_style, label, lbl_style, des
   else
     local first = { { pointer, "dim" }, { chk, chk_style }, { label, lbl_style } }
     if has_desc then
-      local prefix_w = LABEL_INDENT + label_w + DESC_SEP_WIDTH
-      local desc_lines = wrap_spans({ { desc, "dim" } }, usable - prefix_w)
+      local desc_prefix_w = prefix_w + label_w + DESC_SEP_WIDTH
+      local desc_lines = wrap_spans({ { desc, "dim" } }, usable - desc_prefix_w)
       first[#first + 1] = { DESC_SEP, "dim" }
       for _, sp in ipairs(desc_lines[1]) do
         first[#first + 1] = sp
       end
       rows[#rows + 1] = first
-      local pad = string.rep(" ", prefix_w)
+      local pad = string.rep(" ", desc_prefix_w)
       for j = 2, #desc_lines do
         local row = { { pad, "" } }
         for _, sp in ipairs(desc_lines[j]) do
@@ -453,6 +470,7 @@ local function render_selecting(state, width)
   for _, md_line in ipairs(question_md(state, state.tab, usable)) do
     append_wrapped(lines, md_line, usable, " ", "", " ")
   end
+  lines[#lines + 1] = { { q.multiple and "  (multiple answers)" or "  (single answer)", "dim" } }
   lines[#lines + 1] = {}
 
   local opts = q.options or {}
@@ -460,7 +478,7 @@ local function render_selecting(state, width)
     local is_cur = (i == state.cursor)
     local checked = is_selected(state, opt.label)
     local pointer = is_cur and "▸ " or "  "
-    local chk = checked and "✓ " or "  "
+    local chk = checked and (q.multiple and "✓ " or "● ") or (q.multiple and "  " or "○ ")
     local opt_rows = render_option_rows(
       pointer,
       chk,
@@ -498,7 +516,7 @@ local function render_selecting(state, width)
     end
   else
     local cptr = custom_cur and "▸ " or "  "
-    local cchk = custom_checked and "✓ " or "  "
+    local cchk = custom_checked and (q.multiple and "✓ " or "● ") or (q.multiple and "  " or "○ ")
     local custom_desc = custom_checked and custom_text or nil
     local custom_rows = render_option_rows(
       cptr,
