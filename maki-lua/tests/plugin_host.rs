@@ -7,6 +7,8 @@ use maki_config::{AlwaysThinking, PluginsConfig, ToolOutputLines};
 use maki_lua::{PluginError, PluginHost, WARM_TOOL_CAP};
 use std::path::Path;
 
+const NARGS_ERR: &str = r#"'nargs' must be 0, 1, "?", "*", or "+""#;
+
 fn fresh_registry() -> Arc<ToolRegistry> {
     Arc::new(ToolRegistry::new())
 }
@@ -2188,7 +2190,7 @@ fn register_command_happy_path() {
         maki.api.register_command({
             name = "/hello",
             description = "says hello",
-            handler = function(args) end,
+            handler = function(opts) end,
         })
         "#,
     )
@@ -2200,68 +2202,54 @@ fn register_command_happy_path() {
     assert_eq!(snap.commands[0].name.as_ref(), "/hello");
     assert_eq!(snap.commands[0].description.as_ref(), "says hello");
     assert_eq!(snap.commands[0].plugin.as_ref(), "cmd_plugin");
-    assert_eq!(snap.commands[0].max_args, 0);
 }
 
-#[test]
-fn register_command_max_args_custom() {
+#[test_case::test_case("" => 0 ; "default_zero")]
+#[test_case::test_case("nargs = 0," => 0 ; "zero")]
+#[test_case::test_case("nargs = 1," => 1 ; "one")]
+#[test_case::test_case(r#"nargs = "?","# => 1 ; "zero_or_one")]
+#[test_case::test_case(r#"nargs = "*","# => usize::MAX ; "any")]
+#[test_case::test_case(r#"nargs = "+","# => usize::MAX ; "one_or_more")]
+fn register_command_nargs_values(nargs_field: &str) -> usize {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     host.load_source(
-        "cmd_max",
+        "cmd_nargs",
+        &format!(
+            r#"maki.api.register_command({{ name = "/test", {nargs_field} handler = function() end }})"#
+        ),
+    )
+    .unwrap();
+
+    host.command_reader().load().commands[0].max_args
+}
+
+#[test_case::test_case("a  b c", "a  b c|a,b,c" ; "raw_text_and_split_list")]
+#[test_case::test_case("", "|" ; "empty_args")]
+fn command_handler_receives_args_and_fargs(args: &str, expected_flash: &str) {
+    let host = PluginHost::new(fresh_registry()).unwrap();
+    host.load_source(
+        "p",
         r#"
         maki.api.register_command({
-            name = "/onearg",
-            description = "takes one arg",
-            max_args = 1,
-            handler = function(args) end,
-        })
-        maki.api.register_command({
-            name = "/noargs",
-            description = "takes no args",
-            max_args = 0,
-            handler = function() end,
+            name = "/echo",
+            nargs = "*",
+            handler = function(opts)
+                maki.ui.flash(opts.args .. "|" .. table.concat(opts.fargs, ","))
+            end,
         })
         "#,
     )
     .unwrap();
+    let rx = host.ui_action_rx().unwrap();
+    host.event_handle()
+        .unwrap()
+        .run_command(Arc::from("p"), Arc::from("/echo"), args.into());
 
-    let snap = host.command_reader().load();
-    assert_eq!(snap.commands.len(), 2);
-    let one_arg = snap
-        .commands
-        .iter()
-        .find(|c| c.name.as_ref() == "/onearg")
-        .unwrap();
-    assert_eq!(one_arg.max_args, 1);
-    let no_args = snap
-        .commands
-        .iter()
-        .find(|c| c.name.as_ref() == "/noargs")
-        .unwrap();
-    assert_eq!(no_args.max_args, 0);
-}
-
-#[test]
-fn register_command_max_args_unlimited() {
-    let reg = fresh_registry();
-    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    host.load_source(
-        "cmd_unlimited",
-        r#"
-        maki.api.register_command({
-            name = "/unlimited",
-            description = "takes unlimited args",
-            max_args = -1,
-            handler = function(args) end,
-        })
-        "#,
-    )
-    .unwrap();
-
-    let snap = host.command_reader().load();
-    assert_eq!(snap.commands.len(), 1);
-    assert_eq!(snap.commands[0].max_args, usize::MAX);
+    let action = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("command handler did not run");
+    assert!(matches!(action, maki_lua::UiAction::Flash(msg) if msg == expected_flash));
 }
 
 #[test_case::test_case(
@@ -2273,16 +2261,16 @@ fn register_command_max_args_unlimited() {
     "handler" ; "missing_handler"
 )]
 #[test_case::test_case(
-    r#"maki.api.register_command({ name = "/test", max_args = -2, handler = function() end })"#,
-    "non-negative or -1" ; "negative_max_args"
+    r#"maki.api.register_command({ name = "/test", nargs = -1, handler = function() end })"#,
+    NARGS_ERR ; "negative_nargs"
 )]
 #[test_case::test_case(
-    r#"maki.api.register_command({ name = "/test", max_args = "one", handler = function() end })"#,
-    "must be an integer" ; "string_max_args"
+    r#"maki.api.register_command({ name = "/test", nargs = 2, handler = function() end })"#,
+    NARGS_ERR ; "nargs_two"
 )]
 #[test_case::test_case(
-    r#"maki.api.register_command({ name = "/test", max_args = math.huge, handler = function() end })"#,
-    "must be an integer" ; "infinite_max_args"
+    r#"maki.api.register_command({ name = "/test", nargs = "!", handler = function() end })"#,
+    NARGS_ERR ; "unknown_string_nargs"
 )]
 fn register_command_validation_rejects(src: &str, expected_err: &str) {
     let reg = fresh_registry();

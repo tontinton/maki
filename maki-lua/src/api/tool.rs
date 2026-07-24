@@ -41,6 +41,7 @@ const TOOL_NAME_MAX: usize = 64;
 const TOOL_HANDLER_RETURN_ERR: &str =
     "tool handler must return string or {output=string, is_error?=bool}";
 const TIMEOUT_PARSE_ERR: &str = "register_tool: 'timeout' must be a positive number, 0, or false";
+const NARGS_ERR: &str = r#"register_command: 'nargs' must be 0, 1, "?", "*", or "+""#;
 const MAX_HINT_CONTENT_SIZE: usize = 1024 * 1024;
 const DESCRIBE_TIMEOUT: Duration = Duration::from_secs(3);
 const PLAIN_HEADER_STYLE: &str = "tool";
@@ -653,15 +654,19 @@ fn register_tool(lua: &Lua, #[ctx] pending: PendingTools, spec: Table) -> LuaRes
 ///   name        (string)   Required. The command name (e.g. "/hello"; a leading
 ///                            slash is added when missing).
 ///   description (string)   Optional. Short description shown in the command palette.
-///   max_args    (integer)  Optional. Maximum number of arguments accepted.
-///                          Defaults to 0 (no arguments). Set to -1 for
-///                          unlimited. An "argument" is a whitespace-separated
-///                          word, so max_args = 1 breaks on the first space.
-///                          Handler receives the raw arg string, not a list.
-///                          If the user types more arguments than max_args, the
-///                          command silently stops matching and the input is sent
-///                          to the model as a normal message instead.
-///   handler     (function) Required. Called when the user runs the command.
+///   nargs       (integer|string) Optional. How many arguments the command
+///                          takes, spelled like nvim's nargs: 0 (default),
+///                          1, "?" (zero or one), "*" (any number), or "+"
+///                          (one or more). An argument is a whitespace
+///                          separated word. Type more than allowed and the
+///                          command quietly stops matching: the input goes
+///                          to the model as a normal message. Only the upper
+///                          bound is checked, so with "+" you still need to
+///                          handle an empty `opts.args` yourself.
+///   handler     (function) Required. Called when the user runs the command,
+///                          with one opts table: `opts.args` is the raw
+///                          argument string (whitespace kept, may be empty)
+///                          and `opts.fargs` is the same split into words.
 /// @return
 /// @example
 /// maki.api.register_command({
@@ -1190,6 +1195,21 @@ fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> Lua
     Ok(())
 }
 
+/// Matching only needs an upper bound, so "+" and "*" both become MAX;
+/// minimums ("+" vs "*") are left for handlers to enforce.
+fn parse_nargs(spec: &Table) -> LuaResult<usize> {
+    match spec.get::<LuaValue>("nargs")? {
+        LuaValue::Nil | LuaValue::Integer(0) | LuaValue::Number(0.0) => Ok(0),
+        LuaValue::Integer(1) | LuaValue::Number(1.0) => Ok(1),
+        LuaValue::String(s) => match s.to_string_lossy().as_ref() {
+            "?" => Ok(1),
+            "*" | "+" => Ok(usize::MAX),
+            _ => Err(mlua::Error::runtime(NARGS_ERR)),
+        },
+        _ => Err(mlua::Error::runtime(NARGS_ERR)),
+    }
+}
+
 fn register_command_from_lua(lua: &Lua, spec: &Table, plugin: Arc<str>) -> LuaResult<()> {
     let mut name: String = spec
         .get("name")
@@ -1203,21 +1223,7 @@ fn register_command_from_lua(lua: &Lua, spec: &Table, plugin: Arc<str>) -> LuaRe
         name.insert(0, '/');
     }
     let description: String = spec.get("description").unwrap_or_default();
-    let max_args: i64 = spec
-        .get::<Option<i64>>("max_args")
-        .map_err(|_| mlua::Error::runtime("register_command: 'max_args' must be an integer"))?
-        .unwrap_or(0);
-    let max_args: usize = match max_args {
-        -1 => usize::MAX,
-        n if n >= 0 => n
-            .try_into()
-            .map_err(|_| mlua::Error::runtime("register_command: 'max_args' is too large"))?,
-        _ => {
-            return Err(mlua::Error::runtime(
-                "register_command: 'max_args' must be non-negative or -1 for unlimited",
-            ));
-        }
-    };
+    let max_args = parse_nargs(spec)?;
     let handler: Function = spec
         .get("handler")
         .map_err(|_| mlua::Error::runtime("register_command: missing 'handler'"))?;

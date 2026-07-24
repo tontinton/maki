@@ -253,15 +253,19 @@ browsing memory files or toggling settings.
   - `name` (`string`) Required. The command name (e.g. "/hello"; a leading
     slash is added when missing).
   - `description` (`string`) Optional. Short description shown in the command palette.
-  - `max_args` (`integer`) Optional. Maximum number of arguments accepted.
-    Defaults to 0 (no arguments). Set to -1 for
-    unlimited. An "argument" is a whitespace-separated
-    word, so max_args = 1 breaks on the first space.
-    Handler receives the raw arg string, not a list.
-    If the user types more arguments than max_args, the
-    command silently stops matching and the input is sent
-    to the model as a normal message instead.
-  - `handler` (`function`) Required. Called when the user runs the command.
+  - `nargs` (`integer|string`) Optional. How many arguments the command
+    takes, spelled like nvim's nargs: 0 (default),
+    1, "?" (zero or one), "*" (any number), or "+"
+    (one or more). An argument is a whitespace
+    separated word. Type more than allowed and the
+    command quietly stops matching: the input goes
+    to the model as a normal message. Only the upper
+    bound is checked, so with "+" you still need to
+    handle an empty `opts.args` yourself.
+  - `handler` (`function`) Required. Called when the user runs the command,
+    with one opts table: `opts.args` is the raw
+    argument string (whitespace kept, may be empty)
+    and `opts.fargs` is the same split into words.
 
 **Example:**
 
