@@ -2645,12 +2645,17 @@ fn main_shell_exclusion_does_not_protect_same_id_in_child_chat() {
 }
 
 #[test]
-fn error_event_matching_run_id_saves_session() {
+fn error_event_matching_run_id_saves_session_and_queued_messages() {
     let mut app = streaming_app_with_history();
+    app.queue_and_notify(queued_msg("next"));
+
     app.update(agent_msg(AgentEvent::Error {
         message: "boom".into(),
     }));
+
     assert_eq!(app.state.session.messages.len(), 2);
+    assert_eq!(app.state.session.meta.queued_messages, ["next"]);
+    assert!(app.queue.is_empty());
 }
 
 // --- Plan form integration tests ---

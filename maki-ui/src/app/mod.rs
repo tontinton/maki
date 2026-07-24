@@ -1113,17 +1113,7 @@ impl App {
             match result {
                 ChatEventResult::Done => {
                     self.status_bar.clear_flash();
-                    let unresolved: Vec<String> = self
-                        .chat_index
-                        .iter()
-                        .filter(|&(_, &idx)| !self.chats[idx].is_finished())
-                        .map(|(id, _)| id.clone())
-                        .collect();
-                    for id in &unresolved {
-                        if let Some(idx) = self.chat_index.remove(id) {
-                            self.chats[idx].mark_finished(DisplayRole::Error, ERROR_TEXT);
-                        }
-                    }
+                    self.finish_unresolved_subagents(DisplayRole::Error, ERROR_TEXT);
                     let shell_ids = self.shell.active_ids().clone();
                     self.chats[0]
                         .fail_in_progress_except(MISSING_TOOL_COMPLETION.into(), &shell_ids);
@@ -1143,7 +1133,6 @@ impl App {
                 ChatEventResult::Error(message) => {
                     self.status = Status::error(message.clone());
                     self.status_bar.clear_flash();
-                    self.queue.clear();
                     self.subagent_answers.clear();
                     self.finish_unresolved_subagents(DisplayRole::Error, ERROR_TEXT);
                     let shell_ids = self.shell.active_ids().clone();
@@ -1153,6 +1142,7 @@ impl App {
                     }
                     self.sync_task_picker();
                     self.save_session();
+                    self.queue.clear();
                     self.chat_index.clear();
                     self.fire_session_autocmd(
                         "TurnError",
