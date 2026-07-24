@@ -15,6 +15,8 @@ use ratatui::widgets::{Clear, Paragraph};
 
 use crate::theme;
 
+const TICK_TIMEOUT_MS: u64 = 10;
+
 pub struct BuiltinCommand {
     pub name: &'static str,
     pub description: &'static str,
@@ -330,14 +332,18 @@ impl CommandPalette {
             false,
         );
 
-        // Tick to get matches
         self.tick();
     }
 
     fn tick(&mut self) {
-        let status = self.nucleo.tick(100);
-        if status.changed {
-            self.refresh_matches();
+        loop {
+            let status = self.nucleo.tick(TICK_TIMEOUT_MS);
+            if status.changed {
+                self.refresh_matches();
+            }
+            if !status.running {
+                break;
+            }
         }
     }
 
