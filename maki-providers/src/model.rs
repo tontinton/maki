@@ -38,9 +38,9 @@ pub struct ModelPricing {
     pub output: f64,
     pub cache_write: f64,
     pub cache_read: f64,
-    /// Anthropic fast mode charges a premium that differs per model (6x on Opus
-    /// 4.6/4.7, 2x on Opus 4.8). `None` means the model has no fast tier, so asking
-    /// for fast mode quietly falls back to standard rates instead of overcharging.
+    /// Anthropic fast mode charges a premium that differs per model. `None`
+    /// means the model has no fast tier, so asking for fast mode quietly falls
+    /// back to standard rates instead of overcharging.
     #[serde(default)]
     pub fast: Option<FastPricing>,
 }
@@ -736,38 +736,18 @@ mod tests {
         assert_eq!(Model::from_spec(spec).unwrap().supports_vision(), expected);
     }
 
-    #[test_case("claude-opus-4-6" ; "opus_4_6")]
-    #[test_case("claude-opus-4-7" ; "opus_4_7")]
-    #[test_case("claude-opus-4-8" ; "opus_4_8")]
-    fn supports_fast_true_for_anthropic_opus(model_id: &str) {
+    #[test_case("claude-opus-5",    true  ; "entry_with_fast_pricing")]
+    #[test_case("claude-opus-5-1m", true  ; "long_context_suffix_still_matches_prefix")]
+    #[test_case("claude-opus-4-7",  false ; "fast_withdrawn_from_the_table")]
+    #[test_case("claude-sonnet-5",  false ; "entry_without_fast_pricing")]
+    #[test_case("claude-opus-99",   false ; "no_entry_at_all")]
+    fn supports_fast_follows_anthropic_table(model_id: &str, expected: bool) {
         let model = Model::from_base(
             ManifestRegistry::get("anthropic").unwrap(),
             "anthropic",
             model_id,
         );
-        assert!(model.supports_fast());
-    }
-
-    #[test_case("claude-sonnet-4-5" ; "sonnet")]
-    #[test_case("claude-haiku-4-5" ; "haiku")]
-    #[test_case("claude-opus-4-5" ; "opus_4_5")]
-    fn supports_fast_false_for_other_anthropic_models(model_id: &str) {
-        let model = Model::from_base(
-            ManifestRegistry::get("anthropic").unwrap(),
-            "anthropic",
-            model_id,
-        );
-        assert!(!model.supports_fast());
-    }
-
-    #[test]
-    fn supports_fast_false_for_unknown_anthropic_model() {
-        let model = Model::from_base(
-            ManifestRegistry::get("anthropic").unwrap(),
-            "anthropic",
-            "claude-opus-99",
-        );
-        assert!(!model.supports_fast());
+        assert_eq!(model.supports_fast(), expected);
     }
 
     #[test]

@@ -215,41 +215,24 @@ fn write_model_table(out: &mut String, entries: &[ModelEntry]) {
         "|------|--------|-------------------------------|---------|"
     );
 
+    // A row per model, not per tier: prices and context sizes differ inside a
+    // tier, so one merged row would quote a single model's numbers for all.
     for tier in [ModelTier::Weak, ModelTier::Medium, ModelTier::Strong] {
-        let tier_entries: Vec<_> = entries.iter().filter(|e| e.tier == tier).collect();
-        if tier_entries.is_empty() {
-            continue;
-        }
-
-        let models: Vec<String> = tier_entries
-            .iter()
-            .map(|e| {
-                let names = e.prefixes.join(", ");
-                if e.default {
+        for entry in entries.iter().filter(|e| e.tier == tier) {
+            let names = entry.prefixes.join(", ");
+            let _ = writeln!(
+                out,
+                "| {} | {} | {} | {} |",
+                tier_label(tier),
+                if entry.default {
                     format!("**{names}** (default)")
                 } else {
                     names
-                }
-            })
-            .collect();
-
-        let pricing = tier_entries
-            .first()
-            .map(|e| format_pricing(e))
-            .unwrap_or_default();
-        let context = tier_entries
-            .first()
-            .map(|e| format_context(e))
-            .unwrap_or_default();
-
-        let _ = writeln!(
-            out,
-            "| {} | {} | {} | {} |",
-            tier_label(tier),
-            models.join(", "),
-            pricing,
-            context,
-        );
+                },
+                format_pricing(entry),
+                format_context(entry),
+            );
+        }
     }
 
     let defaults: Vec<String> = entries

@@ -38,10 +38,19 @@ It wins over `providers.toml` and built-in defaults. `ANTHROPIC_BASE_URL` and `O
 | Tier | Models | Pricing (in/out per 1M tokens) | Context |
 |------|--------|-------------------------------|---------|
 | Weak | **claude-haiku-4-5** (default) | $1.00 / $5.00 | 200K ctx / 64K out |
-| Medium | claude-sonnet-4-5, **claude-sonnet-4-6** (default), claude-sonnet-4 | $3.00 / $15.00 | 200K ctx / 64K out |
-| Strong | claude-opus-4-5, claude-opus-4-6, claude-opus-4-7, **claude-opus-4-8** (default), claude-fable-5, claude-opus-4-0, claude-opus-4-1 | $5.00 / $25.00 | 200K ctx / 64K out |
+| Medium | claude-sonnet-4-5 | $3.00 / $15.00 | 200K ctx / 64K out |
+| Medium | claude-sonnet-4-6 | $3.00 / $15.00 | 200K ctx / 64K out |
+| Medium | **claude-sonnet-5** (default) | $2.00 / $10.00 | 200K ctx / 128K out |
+| Medium | claude-sonnet-4 | $3.00 / $15.00 | 200K ctx / 64K out |
+| Strong | claude-opus-4-5 | $5.00 / $25.00 | 200K ctx / 64K out |
+| Strong | claude-opus-4-6 | $5.00 / $25.00 | 200K ctx / 128K out |
+| Strong | claude-opus-4-7 | $5.00 / $25.00 | 200K ctx / 128K out |
+| Strong | claude-opus-4-8 | $5.00 / $25.00 | 200K ctx / 128K out |
+| Strong | **claude-opus-5** (default) | $5.00 / $25.00 | 200K ctx / 128K out |
+| Strong | claude-fable-5 | $10.00 / $50.00 | 200K ctx / 128K out |
+| Strong | claude-opus-4-0, claude-opus-4-1 | $15.00 / $75.00 | 200K ctx / 32K out |
 
-Defaults: claude-haiku-4-5 (weak), claude-sonnet-4-6 (medium), claude-opus-4-8 (strong)
+Defaults: claude-haiku-4-5 (weak), claude-sonnet-5 (medium), claude-opus-5 (strong)
 
 Add `-1m` to any Claude model, like `claude-sonnet-4-6-1m`, to use the 1M token context window.
 
@@ -67,9 +76,23 @@ You can override the model with `ANTHROPIC_MODEL` and the endpoint with `ANTHROP
 
 | Tier | Models | Pricing (in/out per 1M tokens) | Context |
 |------|--------|-------------------------------|---------|
-| Weak | **gpt-5.6-luna** (default), gpt-5.4-nano, gpt-5.4-mini, gpt-4.1-nano | $1.00 / $6.00 | 372K ctx / 128K out |
-| Medium | **gpt-5.6-terra** (default), gpt-4.1-mini, gpt-4.1, o4-mini, gpt-5.1-codex-mini | $2.50 / $15.00 | 372K ctx / 128K out |
-| Strong | **gpt-5.6-sol** (default), gpt-5.5, gpt-5.4, o3, gpt-5.3-codex, gpt-5.2-codex, gpt-5.1-codex-max, gpt-5.1-codex | $5.00 / $30.00 | 372K ctx / 128K out |
+| Weak | **gpt-5.6-luna** (default) | $1.00 / $6.00 | 372K ctx / 128K out |
+| Weak | gpt-5.4-nano | $0.20 / $1.25 | 400K ctx / 128K out |
+| Weak | gpt-5.4-mini | $0.75 / $4.50 | 400K ctx / 128K out |
+| Weak | gpt-4.1-nano | $0.10 / $0.40 | 1047K ctx / 32K out |
+| Medium | **gpt-5.6-terra** (default) | $2.50 / $15.00 | 372K ctx / 128K out |
+| Medium | gpt-4.1-mini | $0.40 / $1.60 | 1047K ctx / 32K out |
+| Medium | gpt-4.1 | $2.00 / $8.00 | 1047K ctx / 32K out |
+| Medium | o4-mini | $1.10 / $4.40 | 200K ctx / 100K out |
+| Medium | gpt-5.1-codex-mini | $0.25 / $2.00 | 400K ctx / 128K out |
+| Strong | **gpt-5.6-sol** (default) | $5.00 / $30.00 | 372K ctx / 128K out |
+| Strong | gpt-5.5 | $5.00 / $30.00 | 1050K ctx / 128K out |
+| Strong | gpt-5.4 | $2.50 / $15.00 | 1050K ctx / 128K out |
+| Strong | o3 | $2.00 / $8.00 | 200K ctx / 100K out |
+| Strong | gpt-5.3-codex | $1.75 / $14.00 | 400K ctx / 128K out |
+| Strong | gpt-5.2-codex | $1.75 / $14.00 | 400K ctx / 128K out |
+| Strong | gpt-5.1-codex-max | $1.25 / $10.00 | 400K ctx / 128K out |
+| Strong | gpt-5.1-codex | $1.25 / $10.00 | 400K ctx / 128K out |
 
 Defaults: gpt-5.6-luna (weak), gpt-5.6-terra (medium), gpt-5.6-sol (strong)
 
@@ -97,7 +120,8 @@ Defaults: gemini-2.5-pro (strong), gemini-2.5-flash (medium), gemini-2.0-flash-l
 |------|--------|-------------------------------|---------|
 | Weak | **gpt-5-mini, gpt-5 mini, claude-haiku-4.5** (default) | $0.00 / $0.00 | 200K ctx / 100K out |
 | Medium | **gpt-5.2, gpt-4.1, claude-sonnet-4.5** (default) | $0.00 / $0.00 | 200K ctx / 100K out |
-| Strong | **gpt-5.4, gpt-5.3-codex, claude-opus-4.6, grok-code-fast-1** (default), claude-opus-4.7 | $0.00 / $0.00 | 200K ctx / 100K out |
+| Strong | **gpt-5.4, gpt-5.3-codex, claude-opus-4.6, grok-code-fast-1** (default) | $0.00 / $0.00 | 200K ctx / 100K out |
+| Strong | claude-opus-4.7 | $0.00 / $0.00 | 264K ctx / 64K out |
 
 Defaults: gpt-5-mini (weak), gpt-5.2 (medium), gpt-5.4 (strong)
 
@@ -139,9 +163,14 @@ Defaults: mistral-medium-latest (strong), mistral-small-latest (medium), ministr
 
 | Tier | Models | Pricing (in/out per 1M tokens) | Context |
 |------|--------|-------------------------------|---------|
-| Weak | **glm-4.7-flash** (default), glm-4.5-flash, glm-4.5-air | $0.00 / $0.00 | 200K ctx / 131K out |
-| Medium | **glm-4.7, glm-4.6** (default), glm-4.5 | $0.60 / $2.20 | 200K ctx / 131K out |
-| Strong | **glm-5-code** (default), glm-5.2, glm-5.1, glm-5 | $1.20 / $5.00 | 200K ctx / 131K out |
+| Weak | **glm-4.7-flash** (default) | $0.00 / $0.00 | 200K ctx / 131K out |
+| Weak | glm-4.5-flash | $0.00 / $0.00 | 131K ctx / 98K out |
+| Weak | glm-4.5-air | $0.20 / $1.10 | 131K ctx / 98K out |
+| Medium | **glm-4.7, glm-4.6** (default) | $0.60 / $2.20 | 200K ctx / 131K out |
+| Medium | glm-4.5 | $0.60 / $2.20 | 131K ctx / 98K out |
+| Strong | **glm-5-code** (default) | $1.20 / $5.00 | 200K ctx / 131K out |
+| Strong | glm-5.2 | $1.00 / $3.20 | 1000K ctx / 131K out |
+| Strong | glm-5.1, glm-5 | $1.00 / $3.20 | 200K ctx / 131K out |
 
 Defaults: glm-5-code (strong), glm-4.7-flash (weak), glm-4.7 (medium)
 
