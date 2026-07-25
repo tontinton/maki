@@ -5,7 +5,10 @@ use std::sync::Arc;
 
 use maki_agent::tools::ToolRegistry;
 use maki_agent::tools::test_support::{stub_ctx, stub_ctx_with};
-use maki_agent::{AgentEvent, AgentMode, BufferSnapshot, EventSender, SpanStyle, ToolOutput};
+use maki_agent::{
+    AgentEvent, AgentMode, BufferSnapshot, EventSender, RIGHT_TIMESTAMP_STYLE, RIGHT_USAGE_STYLE,
+    SpanStyle, ToolOutput,
+};
 use maki_config::ToolOutputLines;
 use maki_lua::PluginHost;
 use serde_json::{Value, json};
@@ -42,6 +45,14 @@ maki.agent.call_tool = function(ctx, name, input, opts)
       opts.on_annotation("5 lines")
     end
     return "annotated_done"
+  elseif name == "used" then
+    if opts and opts.on_annotation then
+      opts.on_annotation("model-x")
+    end
+    if opts and opts.on_usage then
+      opts.on_usage("12.3k↑ 456↓ $0.123")
+    end
+    return "used_done"
   elseif name == "park" then
     -- Deadlocks unless a sibling runs concurrently and releases.
     local p = sem:acquire()
@@ -484,6 +495,80 @@ fn restore_child_body_equals_child_restore_view() {
 /// A child can annotate more than once (a task child streams its model,
 /// then its completion note arrives on the same channel); batch joins
 /// them on the child header in order.
+#[test]
+fn usage_and_timestamp_markers_are_on_matching_child() {
+    let (reg, host) = load_batch_host();
+    let input = json!({ "tool_calls": [
+        { "tool": "used", "parameters": {} },
+        { "tool": "ok", "parameters": { "tag": "b" } }
+    ] });
+    let (tx, rx) = flume::unbounded();
+    let event_tx = EventSender::new(tx, 0);
+    let mut ctx = stub_ctx_with(&AgentMode::Build, Some(&event_tx), Some(BATCH_ID));
+    ctx.registry = Arc::clone(&reg);
+    let entry = reg.get(BATCH_TOOL).unwrap();
+    let inv = entry.tool.parse(&input).unwrap();
+    let done = smol::block_on(async { inv.execute(&ctx).await });
+    assert!(done.output.is_ok(), "batch failed: {:?}", done.output);
+    let state = done.output.as_ref().unwrap().state().cloned().unwrap();
+    assert_eq!(state["children"][0]["usage"], "12.3k↑ 456↓ $0.123");
+    assert!(state["children"][0]["usage_timestamp"].is_string());
+    host.load_source("usage_barrier", "").unwrap();
+    let lines = rx
+        .drain()
+        .filter_map(|env| match env.event {
+            AgentEvent::ToolSnapshot { snapshot, .. } => Some(snapshot),
+            _ => None,
+        })
+        .last()
+        .expect("usage snapshot")
+        .lines
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| (span.text.clone(), span.style.clone()))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let first = lines[0]
+        .iter()
+        .map(|(text, _)| text.as_str())
+        .collect::<String>();
+    assert!(
+        first.contains("model-x"),
+        "model annotation missing: {first}"
+    );
+    let usage = lines[0]
+        .iter()
+        .find(|(_, style)| *style == SpanStyle::Named(RIGHT_USAGE_STYLE.to_owned()));
+    assert_eq!(
+        usage.map(|(text, _)| text.as_str()),
+        Some("12.3k↑ 456↓ $0.123")
+    );
+    let timestamp = lines[0]
+        .iter()
+        .find(|(_, style)| *style == SpanStyle::Named(RIGHT_TIMESTAMP_STYLE.to_owned()))
+        .map(|(text, _)| text.as_str());
+    assert!(
+        timestamp.is_some_and(|timestamp| {
+            timestamp.len() == 8
+                && timestamp.chars().enumerate().all(|(i, c)| {
+                    matches!(i, 2 | 5) && c == ':' || !matches!(i, 2 | 5) && c.is_ascii_digit()
+                })
+        }),
+        "timestamp must be HH:MM:SS and rightmost: {first}"
+    );
+    let second = lines[4]
+        .iter()
+        .map(|(text, _)| text.as_str())
+        .collect::<String>();
+    assert!(
+        !second.contains("12.3k↑"),
+        "usage leaked to sibling: {second}"
+    );
+}
+
 #[test]
 fn annotations_append_on_child_in_order() {
     let (reg, _host) = load_batch_host();

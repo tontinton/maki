@@ -11,6 +11,10 @@ use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
 
 pub const NO_FILES_FOUND: &str = "No files found";
+/// Span styles a plugin puts on the last two spans of a snapshot line to have
+/// the UI strip them off and re-render them flush right on that line.
+pub const RIGHT_USAGE_STYLE: &str = "__maki_right_usage";
+pub const RIGHT_TIMESTAMP_STYLE: &str = "__maki_right_timestamp";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GrepFileEntry {
@@ -818,6 +822,8 @@ pub struct TurnCompleteEvent {
     pub usage: TokenUsage,
     pub model: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub context_size: Option<u32>,
 }
 
@@ -888,6 +894,7 @@ pub struct Envelope {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
     use test_case::test_case;
 
     #[test_case(ToolOutput::Plain("ok".into()),                      Some("1 lines")     ; "plain_short_annotates")]
@@ -1324,6 +1331,29 @@ mod tests {
         let json_without = r#"{"id":"t1"}"#;
         let parsed: ToolSnapshotFields = serde_json::from_str(json_without).unwrap();
         assert_eq!(parsed.theme_gen, None, "{COMPAT_MSG}");
+    }
+
+    #[test_case(Some(1.25), Some(1.25) ; "cost_present")]
+    #[test_case(None, None ; "cost_absent")]
+    fn turn_complete_event_serializes_cost(cost: Option<f64>, expected: Option<f64>) {
+        const COST_FIELD: &str = "cost";
+        const MODEL: &str = "test-model";
+        const MSG: &str = "serialized turn cost must survive session persistence";
+
+        let event = AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
+            message: Message::default(),
+            usage: TokenUsage::default(),
+            model: MODEL.into(),
+            cost,
+            context_size: None,
+        }));
+
+        let value = serde_json::to_value(event).unwrap();
+        assert_eq!(
+            value.get(COST_FIELD).and_then(Value::as_f64),
+            expected,
+            "{MSG}"
+        );
     }
 
     #[test]

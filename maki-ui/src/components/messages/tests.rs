@@ -579,6 +579,25 @@ fn update_tool_model_sets_annotation() {
 }
 
 #[test]
+fn set_tool_turn_usage_updates_exact_tool_and_preserves_annotation() {
+    let mut panel = panel_with_tools(&[("t1", "task"), ("t2", "task")]);
+    panel.update_tool_model("t1", "anthropic/claude-sonnet-4-20250514");
+    panel.set_tool_timestamp("t1", "invalid");
+    panel.set_tool_timestamp("t2", "sibling");
+
+    panel.set_tool_turn_usage("t1", "1.2k↑ 345↓ $0.010".into());
+
+    assert_eq!(panel.tool_turn_usage("t1"), Some("1.2k↑ 345↓ $0.010"));
+    assert_ne!(panel.messages[0].timestamp.as_deref(), Some("invalid"));
+    assert_eq!(panel.tool_turn_usage("t2"), None);
+    assert_eq!(panel.messages[1].timestamp.as_deref(), Some("sibling"));
+    assert_eq!(
+        panel.messages[0].annotation.as_deref(),
+        Some("anthropic/claude-sonnet-4-20250514")
+    );
+}
+
+#[test]
 fn scroll_clamps_to_max_scroll() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     panel.streaming_text.set_buffer(&"a\n".repeat(15));

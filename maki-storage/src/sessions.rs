@@ -70,20 +70,22 @@ pub struct StoredTokenUsage {
 
 impl StoredTokenUsage {
     pub fn total_input(&self) -> u32 {
-        self.input + self.cache_read + self.cache_creation
+        self.input
+            .saturating_add(self.cache_read)
+            .saturating_add(self.cache_creation)
     }
 
     pub fn total(&self) -> u32 {
-        self.input + self.output + self.cache_creation + self.cache_read
+        self.total_input().saturating_add(self.output)
     }
 }
 
 impl std::ops::AddAssign for StoredTokenUsage {
     fn add_assign(&mut self, rhs: Self) {
-        self.input += rhs.input;
-        self.output += rhs.output;
-        self.cache_creation += rhs.cache_creation;
-        self.cache_read += rhs.cache_read;
+        self.input = self.input.saturating_add(rhs.input);
+        self.output = self.output.saturating_add(rhs.output);
+        self.cache_creation = self.cache_creation.saturating_add(rhs.cache_creation);
+        self.cache_read = self.cache_read.saturating_add(rhs.cache_read);
     }
 }
 
@@ -1281,9 +1283,9 @@ mod tests {
     use super::StoredThinking;
     use super::ThinkingParseError;
     use super::{
-        CWD_INDEX_FILE, DEFAULT_TITLE, MAX_TITLE_LEN, SESSION_VERSION, StoredSubagent, TAIL_BUF,
-        generate_title, json_path, jsonl_path, load_cwd_index, update_cwd_index,
-        write_full_session,
+        CWD_INDEX_FILE, DEFAULT_TITLE, MAX_TITLE_LEN, SESSION_VERSION, StoredSubagent,
+        StoredTokenUsage, TAIL_BUF, generate_title, json_path, jsonl_path, load_cwd_index,
+        update_cwd_index, write_full_session,
     };
     use super::{SCAN_CACHE_FILE, Session, SessionError, SessionLog, StorageError, TitleSource};
     use crate::id::MakiId;
@@ -1294,6 +1296,29 @@ mod tests {
     use std::path::Path;
     use tempfile::TempDir;
     use test_case::test_case;
+
+    #[test]
+    fn stored_token_usage_saturates() {
+        let mut usage = StoredTokenUsage {
+            input: u32::MAX,
+            output: u32::MAX,
+            cache_creation: 1,
+            cache_read: 1,
+        };
+        usage += StoredTokenUsage {
+            input: 1,
+            output: 1,
+            cache_creation: u32::MAX,
+            cache_read: u32::MAX,
+        };
+
+        assert_eq!(usage.total_input(), u32::MAX);
+        assert_eq!(usage.total(), u32::MAX);
+        assert_eq!(usage.input, u32::MAX);
+        assert_eq!(usage.output, u32::MAX);
+        assert_eq!(usage.cache_creation, u32::MAX);
+        assert_eq!(usage.cache_read, u32::MAX);
+    }
 
     type TestSession = Session<Value, Value, Value>;
 

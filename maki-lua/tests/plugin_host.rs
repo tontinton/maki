@@ -1,13 +1,58 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use maki_agent::tools::{ToolRegistry, ToolSource, timeout_annotation};
+use maki_agent::ToolOutput;
+use maki_agent::tools::{
+    DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool, ToolContext,
+    ToolExecResult, ToolInvocation, ToolLive, ToolRegistry, ToolSource, timeout_annotation,
+};
 use maki_config::{AlwaysThinking, PluginsConfig, ToolOutputLines};
 use maki_lua::{PluginError, PluginHost, WARM_TOOL_CAP};
-use std::path::Path;
+use serde_json::{Value, json};
 
 const NARGS_ERR: &str = r#"'nargs' must be 0, 1, "?", "*", or "+""#;
+const USAGE_TOOL_NAME: &str = "usage_child";
+const USAGE_VALUE: &str = "12.3k↑ 456↓ $0.123";
+
+struct UsageTool;
+
+struct UsageInvocation;
+
+impl ToolInvocation for UsageInvocation {
+    fn start_header(&self) -> HeaderFuture {
+        HeaderFuture::Ready(HeaderResult::plain(USAGE_TOOL_NAME.into()))
+    }
+
+    fn execute<'a>(self: Box<Self>, ctx: &'a ToolContext) -> ExecFuture<'a> {
+        Box::pin(async move {
+            if let Some(sink) = &ctx.live_sink {
+                let _ = sink.send(ToolLive::Usage(USAGE_VALUE.into()));
+            }
+            ToolExecResult::from(Ok::<_, String>(ToolOutput::Plain("usage_done".into())))
+        })
+    }
+}
+
+impl Tool for UsageTool {
+    fn name(&self) -> &str {
+        USAGE_TOOL_NAME
+    }
+
+    fn description(&self, _ctx: &DescriptionContext) -> Cow<'_, str> {
+        "emits usage".into()
+    }
+
+    fn schema(&self) -> Value {
+        json!({"type": "object", "properties": {}, "additionalProperties": false})
+    }
+
+    fn parse(&self, _input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
+        Ok(Box::new(UsageInvocation))
+    }
+}
 
 fn fresh_registry() -> Arc<ToolRegistry> {
     Arc::new(ToolRegistry::new())
@@ -1617,6 +1662,13 @@ fn warm_click_survives_post_completion_cancel() {
 #[test]
 fn call_tool_streams_live_buf_and_annotations() {
     let reg = fresh_registry();
+    reg.register(
+        Arc::new(UsageTool),
+        ToolSource::Lua {
+            plugin: Arc::from("usage_fixture"),
+        },
+    )
+    .unwrap();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let src = format!(
         r#"
@@ -1661,20 +1713,23 @@ maki.api.register_tool({{
             on_annotation = function(a) ann = a end,
         }})
         local live_text = "none"
-        local ann2 = "nil"
         local text2 = maki.agent.call_tool(ctx, "streaming_child", {{}}, {{
             on_live_buf = function(b)
                 local lines = b:get_lines()
                 live_text = lines[1] and lines[1][1] and lines[1][1][1] or "empty"
             end,
-            on_annotation = function(a) ann2 = a end,
+        }})
+        local usage = "nil"
+        local text3 = maki.agent.call_tool(ctx, "{USAGE_TOOL_NAME}", {{}}, {{
+            on_usage = function(value) usage = value end,
         }})
         local ann3 = "nil"
         local _, err3 = maki.agent.call_tool(ctx, "failing_child", {{}}, {{
             on_annotation = function(a) ann3 = a end,
         }})
         return tostring(text) .. "/" .. ann
-            .. " " .. tostring(text2) .. "/" .. live_text .. "/" .. ann2
+            .. " " .. tostring(text2) .. "/" .. live_text
+            .. " " .. tostring(text3) .. "/" .. usage
             .. " " .. tostring(err3) .. "/" .. ann3
     end
 }})
@@ -1690,7 +1745,8 @@ maki.api.register_tool({{
     .expect("driver ok");
     assert_eq!(
         out,
-        "child_done/5 items stream_done/streamed line/1 lines boom/nil"
+        "child_done/5 items stream_done/streamed line \
+         usage_done/12.3k↑ 456↓ $0.123 boom/nil"
     );
 }
 

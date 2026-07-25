@@ -44,7 +44,6 @@ use crate::components::scrollbar;
 use crate::components::search_modal::{SearchAction, SearchModal};
 use crate::components::status_bar::StatusBar;
 use crate::components::theme_picker::{ThemePicker, ThemePickerAction};
-use crate::components::tool_display::format_turn_usage;
 use crate::components::usage_modal::{UsageFetchState, UsageModal};
 use crate::components::{
     Action, DisplayMessage, DisplayRole, ExitRequest, Overlay, RetryInfo, Status, is_ctrl,
@@ -986,7 +985,6 @@ impl App {
             .subagent
             .as_ref()
             .map(|s| s.parent_tool_use_id.clone());
-
         let chat_idx = match envelope.subagent {
             Some(ref subagent) => self.resolve_or_create_chat(subagent),
             None => 0,
@@ -1040,6 +1038,10 @@ impl App {
         if let AgentEvent::TurnComplete(ref tc) = envelope.event {
             self.state.token_usage += tc.usage;
             self.chats[chat_idx].token_usage += tc.usage;
+            if let Some(turn_cost) = tc.cost {
+                let cost = &mut self.chats[chat_idx].cost;
+                *cost = Some(cost.unwrap_or_default() + turn_cost);
+            }
             *self
                 .state
                 .session
@@ -1052,9 +1054,13 @@ impl App {
             if chat_idx == 0 {
                 self.state.context_size = ctx_size;
             }
-            let formatted =
-                format_turn_usage(&tc.usage, &self.state.model.pricing, self.state.fast);
-            self.chats[chat_idx].set_pending_turn_usage(formatted);
+            if let Some(tool_id) = &subagent_id {
+                let chat = &self.chats[chat_idx];
+                let formatted = chat.token_usage.format(chat.cost);
+                self.chats[0].set_tool_turn_usage(tool_id, formatted);
+            } else {
+                self.chats[chat_idx].set_pending_turn_usage(tc.usage.format(tc.cost));
+            }
         }
 
         let result = self.chats[chat_idx].handle_event(envelope.event, plan_path);

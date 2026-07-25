@@ -8,7 +8,7 @@ use super::{RetryInfo, Status};
 use crate::animation::spinner_frame;
 use crate::theme;
 
-use maki_providers::{ModelPricing, TokenUsage};
+use maki_providers::{ModelPricing, TokenUsage, format_tokens};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::Style;
@@ -17,14 +17,6 @@ use ratatui::widgets::Paragraph;
 
 const FAST_LABEL: &str = " [fast]";
 const WORKFLOW_LABEL: &str = " [workflow]";
-
-pub(crate) fn format_tokens(n: u32) -> String {
-    match n {
-        0..1_000 => n.to_string(),
-        1_000..1_000_000 => format!("{:.1}k", n as f64 / 1_000.0),
-        _ => format!("{:.1}m", n as f64 / 1_000_000.0),
-    }
-}
 
 pub struct UsageStats<'a> {
     pub usage: &'a TokenUsage,
@@ -315,16 +307,6 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
     use test_case::test_case;
-
-    #[test_case(999, "999")]
-    #[test_case(1_000, "1.0k")]
-    #[test_case(12_345, "12.3k")]
-    #[test_case(999_999, "1000.0k")]
-    #[test_case(1_000_000, "1.0m")]
-    #[test_case(1_500_000, "1.5m")]
-    fn format_tokens_display(input: u32, expected: &str) {
-        assert_eq!(format_tokens(input), expected);
-    }
 
     #[test_case("/home/user/projects/app", "/home/user", "~/projects/app" ; "inside_home")]
     #[test_case("/tmp/other", "/home/user", "/tmp/other"                  ; "outside_home")]

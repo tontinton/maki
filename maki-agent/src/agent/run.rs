@@ -372,6 +372,11 @@ impl<'h> Agent<'h> {
                 message: response.message.clone(),
                 usage: response.usage,
                 model: self.model.id.clone(),
+                cost: (!self.model.pricing.is_zero()).then(|| {
+                    response
+                        .usage
+                        .cost(&self.model.pricing, self.opts.clamped(&self.model).fast)
+                }),
                 context_size: Some(response.usage.context_tokens()),
             })))
     }

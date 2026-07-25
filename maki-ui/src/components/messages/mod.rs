@@ -313,19 +313,21 @@ impl MessagesPanel {
     }
 
     pub fn set_turn_usage_on_last_tool(&mut self, usage: String) {
-        let Some(idx) = self
-            .messages
-            .iter()
-            .rposition(|m| matches!(m.role, DisplayRole::Tool(_)))
-        else {
+        let Some(id) = self.messages.iter().rev().find_map(|msg| match &msg.role {
+            DisplayRole::Tool(tool) => Some(tool.id.clone()),
+            _ => None,
+        }) else {
             return;
         };
-        self.messages[idx].turn_usage = Some(usage);
-        let DisplayRole::Tool(t) = &self.messages[idx].role else {
-            unreachable!()
-        };
-        let id = t.id.clone();
-        self.rebuild_tool_segment(&id);
+        self.set_tool_turn_usage(&id, usage);
+    }
+
+    pub fn set_tool_turn_usage(&mut self, tool_id: &str, usage: String) {
+        let timestamp = format_timestamp_now();
+        self.update_tool(tool_id, |msg| {
+            msg.turn_usage = Some(usage);
+            msg.timestamp = Some(timestamp);
+        });
     }
 
     fn upsert_instruction_segment(
@@ -497,6 +499,19 @@ impl MessagesPanel {
     #[cfg(test)]
     pub fn streaming_thinking_is_empty(&self) -> bool {
         self.streaming_thinking.is_empty()
+    }
+
+    #[cfg(test)]
+    pub fn tool_turn_usage(&self, tool_id: &str) -> Option<&str> {
+        self.messages.iter().rev().find_map(|msg| match &msg.role {
+            DisplayRole::Tool(tool) if tool.id == tool_id => msg.turn_usage.as_deref(),
+            _ => None,
+        })
+    }
+
+    #[cfg(test)]
+    pub fn set_tool_timestamp(&mut self, tool_id: &str, timestamp: &str) {
+        self.update_tool(tool_id, |msg| msg.timestamp = Some(timestamp.to_owned()));
     }
 
     pub fn set_prompt_progress(&mut self, progress: Option<PromptProgress>) {

@@ -201,6 +201,11 @@ local function child_header_line(c)
   if c.annotation then
     spans[#spans + 1] = { " (" .. c.annotation .. ")", "tool_annotation" }
   end
+  if c.usage then
+    local usage, timestamp = maki.ui.right_info(c.usage, c.usage_timestamp)
+    spans[#spans + 1] = usage
+    spans[#spans + 1] = timestamp
+  end
   return spans
 end
 
@@ -265,7 +270,14 @@ end
 local function to_state(children)
   local out = {}
   for i, c in ipairs(children) do
-    out[i] = { tool = c.tool, status = c.status, output = c.output, annotation = c.annotation }
+    out[i] = {
+      tool = c.tool,
+      status = c.status,
+      output = c.output,
+      annotation = c.annotation,
+      usage = c.usage,
+      usage_timestamp = c.usage_timestamp,
+    }
   end
   return { children = out }
 end
@@ -403,6 +415,12 @@ function Batch:annotate(c, ann)
   self:rerender()
 end
 
+function Batch:set_usage(c, usage)
+  c.usage = usage
+  c.usage_timestamp = os.date("%H:%M:%S")
+  self:rerender()
+end
+
 function Batch:settle(c, status, output)
   if TERMINAL[c.status] then
     error(string.format(RESETTLE_FMT, c.tool, c.status, status))
@@ -425,6 +443,9 @@ function Batch:run_child(c, ctx)
     end,
     on_annotation = function(a)
       self:annotate(c, a)
+    end,
+    on_usage = function(usage)
+      self:set_usage(c, usage)
     end,
   })
   if err then
@@ -508,6 +529,7 @@ local function restore(input, output, _is_error, rctx)
       local c = children[i]
       c.status = TERMINAL[sc.status] and sc.status or STATUS.ERROR
       c.output, c.annotation = sc.output, sc.annotation
+      c.usage, c.usage_timestamp = sc.usage, sc.usage_timestamp
     end
     return Batch.new(children, tol).buf
   end

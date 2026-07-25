@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use humantime::format_duration;
+use maki_agent::{RIGHT_TIMESTAMP_STYLE, RIGHT_USAGE_STYLE};
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Lua, Result as LuaResult, Table};
 
@@ -233,6 +234,25 @@ fn truncate_text(lua: &Lua, text: String, max_width: usize) -> LuaResult<Table> 
     Ok(tbl)
 }
 
+/// Builds the two trailing spans of a tool header line: token usage and a
+/// timestamp. Append them, in this order, as the last spans of the line and
+/// the UI re-renders them flush right instead of inline.
+///
+/// @param usage string Formatted token usage, e.g. `"12.3k↑ 456↓ $0.123"`.
+/// @param timestamp string Wall-clock time, e.g. `"12:34:56"`.
+/// @return (table, table) Usage span and timestamp span.
+/// @example
+/// local usage, timestamp = maki.ui.right_info("12.3k↑ 456↓", os.date("%H:%M:%S"))
+/// spans[#spans + 1] = usage
+/// spans[#spans + 1] = timestamp
+#[lua_fn]
+fn right_info(lua: &Lua, usage: String, timestamp: String) -> LuaResult<(Table, Table)> {
+    Ok((
+        lua.create_sequence_from([usage, RIGHT_USAGE_STYLE.to_owned()])?,
+        lua.create_sequence_from([timestamp, RIGHT_TIMESTAMP_STYLE.to_owned()])?,
+    ))
+}
+
 /// Shows a brief message in the status bar. The message disappears
 /// after a short time. Good for confirming an action like "copied!"
 /// or showing a transient warning.
@@ -419,7 +439,7 @@ lua_table! {
     /// ```
     extend "maki.ui" => pub(crate) fn add_ui_fns(), DOCS [
         buf, theme_color, highlight, markdown, humantime, terminal_size,
-        display_width, truncate_text,
+        display_width, truncate_text, right_info,
         manual flash, manual open_editor, manual open_win, manual set_status_hint,
     ]
 }

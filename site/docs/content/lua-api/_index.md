@@ -745,8 +745,8 @@ maki.agent.call_tool({ctx}, {name}, {input}, {opts?})
 Run a tool by name and wait for the result. This is how you call built-in
 tools (like `read`, `bash`, `glob`) from Lua without going through the LLM.
 
-Live events (streaming output, annotations) are delivered through optional
-callbacks while the tool runs.
+Live events (streaming output, annotations, cumulative usage) are delivered
+through optional callbacks while the tool runs.
 
 **Parameters:**
 
@@ -759,6 +759,8 @@ callbacks while the tool runs.
     the tool publishes. Must not yield.
   - `on_annotation` (`function?`) called with an annotation string for each
     annotation event. Must not yield.
+  - `on_usage` (`function?`) called with a formatted cumulative token usage
+    string. Must not yield.
 
 **Returns:** (`string?`, `string?`) Tool output text, or `(nil, err)` on failure.
 
@@ -3971,6 +3973,33 @@ Splits a string at a display-cell boundary.
 ```lua
 local t = maki.ui.truncate_text("hello world", 5)
 -- t.head == "hello", t.tail == " world"
+```
+
+---
+
+### `maki.ui.right_info()` {#maki-ui-right_info}
+
+```lua
+maki.ui.right_info({usage}, {timestamp})
+```
+
+Builds the two trailing spans of a tool header line: token usage and a
+timestamp. Append them, in this order, as the last spans of the line and
+the UI re-renders them flush right instead of inline.
+
+**Parameters:**
+
+- `{usage}` (`string`) Formatted token usage, e.g. `"12.3k↑ 456↓ $0.123"`.
+- `{timestamp}` (`string`) Wall-clock time, e.g. `"12:34:56"`.
+
+**Returns:** (`table`, `table`) Usage span and timestamp span.
+
+**Example:**
+
+```lua
+local usage, timestamp = maki.ui.right_info("12.3k↑ 456↓", os.date("%H:%M:%S"))
+spans[#spans + 1] = usage
+spans[#spans + 1] = timestamp
 ```
 
 ---

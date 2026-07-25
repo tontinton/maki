@@ -668,6 +668,7 @@ fn turn_complete_tracks_usage_and_context_per_chat() {
             message: Default::default(),
             usage: main_usage,
             model: "test".into(),
+            cost: None,
             context_size: None,
         },
     ))));
@@ -682,6 +683,7 @@ fn turn_complete_tracks_usage_and_context_per_chat() {
             message: Default::default(),
             usage: sub_usage,
             model: "test".into(),
+            cost: None,
             context_size: None,
         })),
         "task1",
@@ -694,6 +696,51 @@ fn turn_complete_tracks_usage_and_context_per_chat() {
     assert_eq!(app.chats[1].token_usage.input, 200);
     assert_eq!(app.chats[0].context_size, main_usage.context_tokens());
     assert_eq!(app.chats[1].context_size, sub_usage.context_tokens());
+}
+
+#[test]
+fn subagent_turn_complete_updates_matching_parent_header_cumulatively() {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    for id in ["task1", "task2"] {
+        app.update(agent_msg(AgentEvent::ToolStart(Box::new(ToolStartEvent {
+            id: id.into(),
+            tool: "task".into(),
+            summary: id.into(),
+            annotation: None,
+            input: None,
+            raw_input: None,
+            output: None,
+            render_header: None,
+        }))));
+    }
+
+    let usage = TokenUsage {
+        input: 1_000,
+        output: 200,
+        cache_creation: 300,
+        cache_read: 400,
+    };
+    for _ in 0..2 {
+        app.update(subagent_msg(
+            AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
+                message: Default::default(),
+                usage,
+                model: "child-model".into(),
+                cost: Some(0.007),
+                context_size: None,
+            })),
+            "task1",
+            Some("research"),
+        ));
+    }
+
+    assert_eq!(
+        app.chats[0].tool_turn_usage("task1"),
+        Some("3.4k↑ 400↓ $0.014")
+    );
+    assert_eq!(app.chats[0].tool_turn_usage("task2"), None);
 }
 
 #[test]
@@ -710,6 +757,7 @@ fn turn_complete_accumulates_usage_by_model() {
                 ..Default::default()
             },
             model: "main-model".into(),
+            cost: None,
             context_size: None,
         },
     ))));
@@ -722,6 +770,7 @@ fn turn_complete_accumulates_usage_by_model() {
                 ..Default::default()
             },
             model: "sub-model".into(),
+            cost: None,
             context_size: None,
         })),
         "task1",
@@ -2310,6 +2359,7 @@ fn stale_non_terminal_event_does_not_save_session() {
             message: Message::user(String::new()),
             usage: TokenUsage::default(),
             model: "mock".into(),
+            cost: None,
             context_size: None,
         })),
         old_run_id,
