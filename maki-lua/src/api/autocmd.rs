@@ -131,6 +131,10 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 /// `"TurnError"`, `"SessionReset"`. Plugins can also fire their own
 /// events with `exec_autocmds`.
 ///
+/// Each host event carries `data.session_id`. For `"SessionReset"` that
+/// is the session being left behind, so a handler can drop what belonged
+/// to it; the other three name the session still running.
+///
 /// @param event string|string[] Event name or list of names.
 /// @param opts table Options:
 ///   `callback` (function) called with an ev table `{ id, event, match, data }`.

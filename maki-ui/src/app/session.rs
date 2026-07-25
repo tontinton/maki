@@ -197,8 +197,11 @@ impl App {
         if self.state.mode == Mode::Plan {
             self.enter_plan();
         }
-        self.state.session = AppSession::new(&self.state.session.model, &self.state.session.cwd);
+        // Fire before the swap. A handler cleaning up after the session
+        // that just ended needs its id, and the stamp always reads
+        // whichever session is current.
         self.fire_session_autocmd("SessionReset", serde_json::json!({}));
+        self.state.session = AppSession::new(&self.state.session.model, &self.state.session.cwd);
         vec![Action::NewSession]
     }
 

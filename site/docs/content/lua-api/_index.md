@@ -453,6 +453,10 @@ Built-in events fired by the host: `"TurnStart"`, `"TurnEnd"`,
 `"TurnError"`, `"SessionReset"`. Plugins can also fire their own
 events with `exec_autocmds`.
 
+Each host event carries `data.session_id`. For `"SessionReset"` that
+is the session being left behind, so a handler can drop what belonged
+to it; the other three name the session still running.
+
 **Parameters:**
 
 - `{event}` (`string|string[]`) Event name or list of names.

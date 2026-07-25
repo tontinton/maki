@@ -537,6 +537,27 @@ fn ctrl_c_closes_palette() {
     assert!(!app.command_palette.is_active());
 }
 
+/// The event exists so plugins can drop what belonged to the session that
+/// ended. Naming its replacement makes every such handler a no-op.
+#[test]
+fn session_reset_names_the_session_that_ended() {
+    let mut app = test_app();
+    let (handle, probe) = maki_lua::test_support::probed_event_handle();
+    app.lua_event_handle = handle;
+    let ended = app.state.session.id.to_string();
+
+    app.reset_session();
+
+    let (event, data) = probe.try_recv_autocmd().expect("SessionReset fired");
+    assert_eq!(event, "SessionReset");
+    assert_eq!(data["session_id"], serde_json::json!(ended));
+    assert_ne!(
+        app.state.session.id.to_string(),
+        ended,
+        "reset must have installed a different session, or this proves nothing"
+    );
+}
+
 #[test]
 fn reset_session_clears_plan() {
     let mut app = test_app();

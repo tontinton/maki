@@ -56,6 +56,17 @@ pub mod test_support {
                 _ => ("other", Vec::new()),
             })
         }
+
+        /// Next fired autocmd as `(event, data)`, skipping other requests.
+        pub fn try_recv_autocmd(&self) -> Option<(String, serde_json::Value)> {
+            use crate::runtime::Request;
+            while let Ok(req) = self.0.try_recv() {
+                if let Request::FireAutocmd { event, data } = req {
+                    return Some((event, data));
+                }
+            }
+            None
+        }
     }
 
     pub fn probed_event_handle() -> (crate::EventHandle, RequestProbe) {
