@@ -67,6 +67,15 @@ tree-sitter-typescript = { workspace = true }
 tree-sitter-zig = { workspace = true }
 tree-sitter-dart = { workspace = true }
 tree-sitter-yaml = { workspace = true }
+tree-sitter-astro-next = { workspace = true }
+tree-sitter-containerfile = { workspace = true }
+tree-sitter-css = { workspace = true }
+tree-sitter-hcl = { workspace = true }
+tree-sitter-json = { workspace = true }
+tree-sitter-make = { workspace = true }
+cortexkit-tree-sitter-scss = { workspace = true }
+tree-sitter-svelte-ng = { workspace = true }
+tree-sitter-vue-next = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
 
@@ -81,3 +90,6 @@ test-case = { workspace = true }
 [[bench]]
 name = "luau_perf"
 harness = false
+
+[package.metadata.cargo-machete]
+ignored = ["cortexkit-tree-sitter-scss"]
