@@ -828,7 +828,7 @@ local function validate_lang(name, lang)
   end
 end
 
- local LANG_ALIASES = {
+local LANG_ALIASES = {
   javascript = "typescript",
   astro = "html",
   svelte = "html",
