@@ -497,7 +497,6 @@ async fn session(
         None => agent_ctx.opts.thinking,
     };
 
-    let session_id = MakiId::generate();
     let (sub_tx, sub_rx) = flume::unbounded::<Envelope>();
     let sub_event_tx = EventSender::new(sub_tx, agent_ctx.event_tx.run_id());
     let parent_tx = agent_ctx.event_tx.clone();
@@ -516,11 +515,13 @@ async fn session(
     .detach();
 
     // Register a cancel trigger so the child token does not fire on drop
-    // and kill the subagent at birth.
+    // and kill the subagent at birth. The fallback key gets its own id:
+    // it keys `subagent_cancels`, so sharing the session id would make two
+    // subagents running at once collide.
     let ui_id = agent_ctx
         .tool_use_id
         .clone()
-        .unwrap_or_else(|| format!("session-{session_id}"));
+        .unwrap_or_else(|| format!("session-{}", MakiId::generate()));
     let (child_trigger, child_cancel) = agent_ctx.cancel.child();
     agent_ctx
         .subagent_cancels
@@ -536,7 +537,7 @@ async fn session(
             config: agent_ctx.config.clone(),
             tool_output_lines: maki_config::ToolOutputLines::default(),
             permissions: Arc::clone(&agent_ctx.permissions),
-            session_id: Some(session_id.into()),
+            session_id: agent_ctx.session_id.clone(),
             timeouts: agent_ctx.timeouts,
             file_tracker: FileReadTracker::fresh(),
             prompt_slots: Arc::clone(&agent_ctx.prompt_slots),

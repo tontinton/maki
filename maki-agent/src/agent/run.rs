@@ -413,6 +413,7 @@ impl<'h> Agent<'h> {
             model: Arc::clone(&self.model),
             event_tx: self.event_tx.clone(),
             mode: self.mode.clone(),
+            session_id: self.session_id.clone(),
             tool_use_id: None,
             user_response_rx: self.user_response_rx.clone(),
             loaded_instructions: self.loaded_instructions.clone(),
@@ -1047,5 +1048,20 @@ mod tests {
                 .expect("expected Done event");
             assert_eq!(done, expected_turns);
         });
+    }
+
+    /// Wiring this to `None` to make the struct literal compile would
+    /// silently reintroduce the bug the field exists to fix.
+    #[test]
+    fn tool_context_carries_the_session() {
+        let mut history = History::new(Vec::new());
+        let (mut agent, _event_rx) = make_agent(MockProvider::new(Vec::new()), &mut history);
+        assert_eq!(agent.tool_context().session_id, None);
+
+        let session: SessionRef = "01965087-4c71-7f00-8000-000000000000"
+            .parse()
+            .expect("valid session id");
+        agent.session_id = Some(session.clone());
+        assert_eq!(agent.tool_context().session_id, Some(session));
     }
 }

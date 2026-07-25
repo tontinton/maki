@@ -11,6 +11,7 @@ use maki_agent::tools::{
 };
 use maki_config::{AlwaysThinking, PluginsConfig, ToolOutputLines};
 use maki_lua::{PluginError, PluginHost, WARM_TOOL_CAP};
+use maki_storage::id::SessionRef;
 use serde_json::{Value, json};
 
 const NARGS_ERR: &str = r#"'nargs' must be 0, 1, "?", "*", or "+""#;
@@ -232,6 +233,79 @@ fn register_echo_tool() {
 
     let out = exec_tool(&reg, "echo_", serde_json::json!({"msg": "hello"})).unwrap();
     assert_eq!(out, "hello");
+}
+
+const SESSION_PLUGIN: &str = r#"
+maki.api.register_tool({
+    name = "whoami",
+    description = "reports the calling session",
+    schema = { type = "object", properties = {}, additionalProperties = false },
+    handler = function(_, ctx)
+        local id, err = ctx:session_id()
+        if err then
+            return "err:" .. err
+        end
+        return "id:" .. tostring(id)
+    end,
+})
+"#;
+
+fn exec_with_ctx(
+    reg: &ToolRegistry,
+    name: &str,
+    input: serde_json::Value,
+    ctx: &ToolContext,
+) -> Result<String, String> {
+    let entry = reg
+        .get(name)
+        .unwrap_or_else(|| panic!("tool {name} not registered"));
+    let inv = entry.tool.parse(&input).expect("parse failed");
+    smol::block_on(async { inv.execute(ctx).await })
+        .output
+        .map(|out| match out {
+            maki_agent::ToolOutput::Plain(s) => s.text,
+            other => panic!("unexpected output: {other:?}"),
+        })
+}
+
+/// The point of the whole thing: a handler learns who called it without
+/// asking `maki.session.current()`, which answers with whoever is focused.
+#[test]
+fn handler_reads_the_calling_session() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source("session_plugin", SESSION_PLUGIN).unwrap();
+
+    let session: SessionRef = "01965087-4c71-7f00-8000-000000000000"
+        .parse()
+        .expect("valid session id");
+    let mut ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
+    ctx.session_id = Some(session.clone());
+
+    let out = exec_with_ctx(&reg, "whoami", json!({}), &ctx).unwrap();
+    assert_eq!(
+        out,
+        format!("id:{}", session.id()),
+        "lua sees the canonical form, so it compares equal to maki.session.current()"
+    );
+    assert_ne!(
+        out,
+        format!("id:{}", session.as_str()),
+        "the verbatim form would not match ids from maki.session.live()"
+    );
+}
+
+#[test]
+fn handler_without_a_session_gets_nil_and_no_error() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source("session_plugin", SESSION_PLUGIN).unwrap();
+
+    let ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
+    assert_eq!(
+        exec_with_ctx(&reg, "whoami", json!({}), &ctx).unwrap(),
+        "id:nil"
+    );
 }
 
 #[test]

@@ -9,6 +9,7 @@ use maki_agent::tools::{
     Deadline, FileReadTracker, LocalTools, ToolAudience, ToolContext, ToolLive,
 };
 use maki_config::{AgentConfig, ToolOutputLines};
+use maki_storage::id::SessionRef;
 use mlua::{LuaSerdeExt, MultiValue, UserData, UserDataMethods, Value as LuaValue};
 
 use crate::api::tool::ToolCallReply;
@@ -97,6 +98,7 @@ enum Caps {
         config: AgentConfig,
         workflow: bool,
         audience: ToolAudience,
+        session_id: Option<SessionRef>,
     },
     Restore {
         state: Option<serde_json::Value>,
@@ -130,6 +132,7 @@ impl LuaCtx {
                 config: ctx.config.clone(),
                 workflow: ctx.workflow,
                 audience: ctx.audience,
+                session_id: ctx.session_id.clone(),
             },
         )
     }
@@ -174,6 +177,16 @@ impl LuaCtx {
         match &self.caps {
             Caps::Handler { agent, .. } => Some(agent.audience),
             Caps::Start { audience, .. } => Some(*audience),
+            Caps::Restore { .. } => None,
+        }
+    }
+
+    /// Outer `None` means the kind has no session at all, inner `None`
+    /// means this run has one but it is not tied to a session.
+    fn session_id(&self) -> Option<Option<&SessionRef>> {
+        match &self.caps {
+            Caps::Handler { agent, .. } => Some(agent.session_id.as_ref()),
+            Caps::Start { session_id, .. } => Some(session_id.as_ref()),
             Caps::Restore { .. } => None,
         }
     }
@@ -233,6 +246,21 @@ impl UserData for LuaCtx {
             };
             let name = lua.create_string(audience.name().unwrap_or("main"))?;
             Ok((LuaValue::String(name), None))
+        });
+
+        // The session that called this tool, which under concurrent
+        // sessions is not always the focused one `maki.session.current()`
+        // reports. Nil without an error when the run has no session, as in
+        // the `maki index` one-shot.
+        methods.add_method("session_id", |lua, this, ()| {
+            let Some(session_id) = this.session_id() else {
+                return Ok(this.cap_err_pair("session_id"));
+            };
+            let Some(session_id) = session_id else {
+                return Ok((LuaValue::Nil, None));
+            };
+            let id = lua.create_string(session_id.id().to_string())?;
+            Ok((LuaValue::String(id), None))
         });
 
         methods.add_method("live_buf", |lua, this, buf: mlua::AnyUserData| {
@@ -378,9 +406,16 @@ mod tests {
     const TOOL_USE_ID: &str = "tu-1";
     const INSTRUCTION_PATH: &str = "/tmp/nested/AGENTS.md";
     const LOCAL_TOOL_NAME: &str = "sess_tool";
+    /// Arbitrary ids are rejected: `SessionRef` parses base58 or a uuid.
+    const SESSION_ID: &str = "01965087-4c71-7f00-8000-000000000000";
+
+    fn session_ref() -> SessionRef {
+        SESSION_ID.parse().expect("valid session id")
+    }
 
     fn populated_ctx() -> ToolContext {
         let mut ctx = stub_ctx_with(&AgentMode::Build, None, Some(TOOL_USE_ID));
+        ctx.session_id = Some(session_ref());
         ctx.deadline = Deadline::after(Duration::from_secs(60));
         ctx.tool_output_lines = ToolOutputLines {
             bash: 999,
@@ -404,6 +439,11 @@ mod tests {
     fn agent_context_keeps_tool_use_id_and_resets_per_call_state() {
         let agent = AgentContext::from(&populated_ctx());
         assert_eq!(agent.tool_use_id.as_deref(), Some(TOOL_USE_ID));
+        assert_eq!(
+            agent.session_id,
+            Some(session_ref()),
+            "the session owns the whole run, so it is not per-call state"
+        );
         assert!(matches!(agent.deadline, Deadline::None));
         assert_eq!(agent.tool_output_lines, ToolOutputLines::default());
         assert!(agent.local_tools.is_empty());
@@ -426,6 +466,37 @@ mod tests {
         assert_eq!(inner.tool_use_id, None);
         assert!(inner.live_sink.is_none(), "sink must not be inherited");
         assert_eq!(agent.tool_use_id.as_deref(), Some(TOOL_USE_ID));
+        assert_eq!(
+            inner.session_id,
+            Some(session_ref()),
+            "a dispatched child runs in the same session, unlike tool_use_id"
+        );
+    }
+
+    #[test]
+    fn session_id_reaches_handler_and_start_but_not_restore() {
+        let ctx = populated_ctx();
+        assert_eq!(
+            LuaCtx::handler(&ctx).session_id(),
+            Some(Some(&session_ref()))
+        );
+        assert_eq!(LuaCtx::start(&ctx).session_id(), Some(Some(&session_ref())));
+        assert_eq!(
+            LuaCtx::restore(ToolOutputLines::default(), None).session_id(),
+            None,
+            "restore has no ToolContext to take a session from"
+        );
+    }
+
+    #[test]
+    fn session_id_absent_is_distinct_from_kind_lacking_it() {
+        let mut ctx = populated_ctx();
+        ctx.session_id = None;
+        assert_eq!(
+            LuaCtx::handler(&ctx).session_id(),
+            Some(None),
+            "a sessionless run still has the capability, so lua sees nil without an error"
+        );
     }
 
     #[test]
