@@ -55,7 +55,7 @@ impl JobStore {
         on_stderr: Option<RegistryKey>,
         on_exit: Option<RegistryKey>,
     ) -> Result<u32, String> {
-        let mut command = maki_config::bash_command(cmd)?;
+        let mut command = maki_config::bash_command(cmd, env.as_ref())?;
         command
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

@@ -1523,50 +1523,67 @@ const BASH_NOT_FOUND_ERROR: &str = "bash not found on Windows. Install Git for W
      Alternatively, enable WSL: \
      https://learn.microsoft.com/en-us/windows/wsl/install";
 
-/// Search PATH and common install paths for a Bash executable.
+/// Search common install paths for a Bash executable, then scan PATH.
+///
+/// Known install locations (Git for Windows, Cygwin, MSYS2) are checked
+/// first so that `C:\Windows\System32\bash.exe` (the legacy WSL launcher
+/// that appears on any machine with WSL enabled) is never preferred over
+/// a real Git Bash. PATH entries under `%SystemRoot%` are skipped for the
+/// same reason.
 #[cfg(windows)]
 fn find_bash_on_path() -> Option<PathBuf> {
-    std::env::var_os("PATH")
-        .and_then(|paths| {
-            std::env::split_paths(&paths).find_map(|dir| {
-                let bash = dir.join("bash.exe");
-                if bash.is_file() { Some(bash) } else { None }
-            })
+    let candidates = [
+        r"C:\Program Files\Git\bin\bash.exe",
+        r"C:\Program Files\Git\usr\bin\bash.exe",
+        r"C:\Program Files (x86)\Git\bin\bash.exe",
+        r"C:\cygwin64\bin\bash.exe",
+        r"C:\cygwin\bin\bash.exe",
+        r"C:\msys64\usr\bin\bash.exe",
+        r"C:\msys32\usr\bin\bash.exe",
+    ];
+    for p in &candidates {
+        let path = PathBuf::from(p);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    let system_root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths).find_map(|dir| {
+            if dir.as_os_str() == system_root {
+                return None;
+            }
+            let bash = dir.join("bash.exe");
+            bash.is_file().then_some(bash)
         })
-        .or_else(|| {
-            let candidates = [
-                // Git for Windows
-                r"C:\Program Files\Git\bin\bash.exe",
-                r"C:\Program Files\Git\usr\bin\bash.exe",
-                r"C:\Program Files (x86)\Git\bin\bash.exe",
-                // Cygwin
-                r"C:\cygwin64\bin\bash.exe",
-                r"C:\cygwin\bin\bash.exe",
-                // MSYS2
-                r"C:\msys64\usr\bin\bash.exe",
-                r"C:\msys32\usr\bin\bash.exe",
-            ];
-            candidates.iter().find_map(|p| {
-                let path = PathBuf::from(p);
-                path.is_file().then_some(path)
-            })
-        })
+    })
 }
 
-/// Search PATH and System32 for `wsl.exe`.
+/// Search PATH and System32 for `wsl.exe`, then verify a distro is
+/// actually installed by running `wsl.exe -e true`. `wsl.exe` ships in
+/// System32 on stock Windows 10/11 even when no distro is installed, so
+/// blindly trusting its presence leads to garbled UTF-16 "no installed
+/// distributions" output instead of our nice error message.
 #[cfg(windows)]
 fn find_wsl() -> Option<PathBuf> {
-    std::env::var_os("PATH")
-        .and_then(|paths| {
-            std::env::split_paths(&paths).find_map(|dir| {
-                let wsl = dir.join("wsl.exe");
-                if wsl.is_file() { Some(wsl) } else { None }
-            })
+    let wsl = std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths).find_map(|dir| {
+            let wsl = dir.join("wsl.exe");
+            wsl.is_file().then_some(wsl)
         })
-        .or_else(|| {
-            let path = PathBuf::from(r"C:\Windows\System32\wsl.exe");
-            path.is_file().then_some(path)
-        })
+    })
+    .or_else(|| {
+        let path = PathBuf::from(r"C:\Windows\System32\wsl.exe");
+        path.is_file().then_some(path)
+    })?;
+    let ok = std::process::Command::new(&wsl)
+        .arg("-e")
+        .arg("true")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if ok { Some(wsl) } else { None }
 }
 
 /// Build a `bash -c` command for the given shell string.
@@ -1576,7 +1593,13 @@ fn find_wsl() -> Option<PathBuf> {
 /// C runtime / libuv argument parser instead of being reinterpreted by
 /// cmd.exe. On Windows, searches PATH and known install locations for Git
 /// Bash, Cygwin, MSYS2 and falls back to WSL's `wsl.exe -e bash -c`.
-pub fn bash_command(cmd: &str) -> Result<Command, String> {
+///
+/// When `env` is provided and the WSL fallback is used, the variable names are
+/// appended to `WSLENV` so they cross the Windows/Linux boundary (otherwise
+/// `.env(...)` only sets them on the `wsl.exe` process and they are silently
+/// dropped inside the Linux shell).
+#[cfg_attr(unix, allow(unused_variables))]
+pub fn bash_command(cmd: &str, env: Option<&HashMap<String, String>>) -> Result<Command, String> {
     #[cfg(unix)]
     {
         let mut c = Command::new("bash");
@@ -1593,6 +1616,15 @@ pub fn bash_command(cmd: &str) -> Result<Command, String> {
         if let Some(wsl) = find_wsl() {
             let mut c = Command::new(wsl);
             c.arg("-e").arg("bash").arg("-c").arg(cmd);
+            if let Some(env_map) = env {
+                let wsl_env: Vec<String> = env_map
+                    .keys()
+                    .map(|k| format!("{k}/p"))
+                    .collect();
+                if !wsl_env.is_empty() {
+                    c.env("WSLENV", wsl_env.join(":"));
+                }
+            }
             return Ok(c);
         }
         Err(BASH_NOT_FOUND_ERROR.to_string())
