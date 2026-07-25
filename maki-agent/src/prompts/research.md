@@ -17,8 +17,10 @@ You must NEVER generate or guess URLs unless they are for helping the user with 
 
 # Tool usage
 - Every tool result grows your context. Minimize use of verbose tool calls, prefer compact results.
+- **Use index** before read to get a compact file skeleton and line numbers, then read only the specific section with offset/limit.
 - **Use batch** for 2+ independent reads, greps, or globs. Never call them one at a time sequentially.
 - **Use code_execution** for dependent/chained calls (e.g. glob then read matches) or filtering large tool outputs.
+- Prefer `maki.json.tooned` (lossless JSON/TOON passthrough) over plain JSON when passing structured data between tools or scripts.
 {{tool_usage}}
 
 {{efficient_tools}}

@@ -14,10 +14,12 @@ You must NEVER generate or guess URLs unless they are for helping the user with 
 
 # Tool usage
 - Every tool result grows your context. Minimize use of verbose tool calls, prefer compact results.
+- **Use index** before read to get a compact file skeleton and line numbers, then read only the section you need with offset/limit.
 - **Use batch** for 2+ independent parallel calls, **code_execution** for dependent/chained calls or filtering/processing results.
 - Read files before editing them. Look at surrounding context and imports to match conventions.
 - Prefer edit/multiedit over write; targeted edits use far fewer tokens.
 - NEVER create files unless absolutely necessary. Prefer editing existing files.
+- Prefer `maki.json.tooned` (lossless JSON/TOON passthrough) over plain JSON when passing structured data between tools or scripts.
 {{tool_usage}}
 
 {{efficient_tools}}

@@ -1,5 +1,9 @@
+use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
+
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Lua, LuaSerdeExt, Result as LuaResult, UserData, UserDataMethods, Value};
+use serde::{Deserialize, Serialize};
 
 use super::util::convert::{err_pair, json_to_lua, lua_to_json};
 
@@ -127,17 +131,148 @@ fn schema_validator(lua: &Lua, schema: Value) -> LuaResult<(Value, Value)> {
     }
 }
 
+/// Encode a Lua value as TOON (Token-Oriented Object Notation), a token-efficient
+/// alternative to JSON for LLM context (~30-60% fewer tokens on uniform arrays of
+/// objects). Opt-in: pair with `from_toon` only when the consumer is a model.
+///
+/// @param value any Lua value to encode.
+/// @return (string?, string?) TOON string, or nil plus an error.
+/// @example
+/// local s, err = maki.json.to_toon({ users = { { id = 1, name = "Alice" } } })
+#[lua_fn]
+fn to_toon(lua: &Lua, value: Value) -> LuaResult<(Value, Value)> {
+    let serde_val: serde_json::Value = match lua.from_value(value) {
+        Ok(v) => v,
+        Err(e) => return err_pair(lua, e),
+    };
+    match toon_format::encode_default(&serde_val) {
+        Ok(s) => Ok((Value::String(lua.create_string(&s)?), Value::Nil)),
+        Err(e) => err_pair(lua, e),
+    }
+}
+
+/// Decode a TOON string back into a Lua value. Inverse of `to_toon`.
+///
+/// @param str string TOON string to decode.
+/// @return (any?, string?) Decoded value, or nil plus an error.
+/// @example
+/// local t, err = maki.json.from_toon(s)
+#[lua_fn]
+fn from_toon(lua: &Lua, str: String) -> LuaResult<(Value, Value)> {
+    match toon_format::decode_default::<serde_json::Value>(&str) {
+        Ok(v) => Ok((json_to_lua(lua, &v)?, Value::Nil)),
+        Err(e) => err_pair(lua, e),
+    }
+}
+
+#[derive(Default, Serialize, Deserialize, Debug, Clone)]
+struct ToonStats {
+    calls: u64,
+    json_bytes: u64,
+    toon_bytes: u64,
+    toon_wins: u64,
+    saved_bytes: u64,
+}
+
+fn toon_stats_path() -> Option<PathBuf> {
+    maki_storage::paths::data_dir()
+        .ok()
+        .map(|dir| dir.join("toon_stats.json"))
+}
+
+fn load_toon_stats() -> ToonStats {
+    if let Some(path) = toon_stats_path()
+        && let Ok(text) = std::fs::read_to_string(&path)
+        && let Ok(stats) = serde_json::from_str::<ToonStats>(&text)
+    {
+        return stats;
+    }
+    ToonStats::default()
+}
+
+fn record_toon_stats(json_len: usize, toon_len: usize, used_toon: bool) {
+    static STATS: OnceLock<Mutex<ToonStats>> = OnceLock::new();
+    let guard = STATS.get_or_init(|| Mutex::new(load_toon_stats()));
+    if let Ok(mut stats) = guard.lock() {
+        stats.calls += 1;
+        stats.json_bytes += json_len as u64;
+        stats.toon_bytes += toon_len as u64;
+        if used_toon {
+            stats.toon_wins += 1;
+            stats.saved_bytes += json_len.saturating_sub(toon_len) as u64;
+        }
+        if let Some(path) = toon_stats_path()
+            && let Ok(bytes) = serde_json::to_vec(&*stats)
+        {
+            let _ = maki_storage::atomic_write(&path, &bytes);
+        }
+    }
+}
+
+/// Lossless JSON/TOON passthrough. Encodes the value as JSON and TOON and
+/// returns whichever representation is smaller. If TOON does not shrink the
+/// payload, the original JSON string is returned unchanged.
+///
+/// @param value any Lua value to encode.
+/// @return (string?, string?) Encoded string (JSON or TOON) and its format ("json" or "toon"), or nil plus an error.
+/// @example
+/// local s, fmt = maki.json.tooned({ users = { { id = 1, name = "Alice" } } })
+#[lua_fn]
+fn tooned(lua: &Lua, value: Value) -> LuaResult<(Value, Value)> {
+    let serde_val: serde_json::Value = match lua.from_value(value) {
+        Ok(v) => v,
+        Err(e) => return err_pair(lua, e),
+    };
+    let json = match serde_json::to_string(&serde_val) {
+        Ok(s) => s,
+        Err(e) => return err_pair(lua, e),
+    };
+    let toon = match toon_format::encode_default(&serde_val) {
+        Ok(s) => s,
+        Err(e) => return err_pair(lua, e),
+    };
+    let use_toon = toon.len() < json.len()
+        && toon_format::decode_default::<serde_json::Value>(&toon)
+            .ok()
+            .and_then(|decoded| serde_json::to_value(&decoded).ok())
+            .is_some_and(|decoded| decoded == serde_val);
+    record_toon_stats(json.len(), toon.len(), use_toon);
+    if use_toon {
+        Ok((Value::String(lua.create_string(&toon)?), Value::String(lua.create_string("toon")?)))
+    } else {
+        Ok((Value::String(lua.create_string(&json)?), Value::String(lua.create_string("json")?)))
+    }
+}
+
+/// Return historical TOON passthrough statistics.
+///
+/// @return (table?, string?) Stats table with calls, json_bytes, toon_bytes, toon_wins, saved_bytes, or nil plus an error.
+/// @example
+/// local stats, err = maki.json.toon_stats()
+#[lua_fn]
+fn toon_stats(lua: &Lua) -> LuaResult<(Value, Value)> {
+    let stats = load_toon_stats();
+    let tbl = lua.create_table()?;
+    tbl.set("calls", stats.calls)?;
+    tbl.set("json_bytes", stats.json_bytes)?;
+    tbl.set("toon_bytes", stats.toon_bytes)?;
+    tbl.set("toon_wins", stats.toon_wins)?;
+    tbl.set("saved_bytes", stats.saved_bytes)?;
+    Ok((Value::Table(tbl), Value::Nil))
+}
+
 lua_table! {
-    /// JSON encoding, decoding, and schema validation. Encode Lua
-    /// tables to JSON strings, decode JSON back into tables, and
-    /// optionally validate data against a JSON Schema.
+    /// JSON encoding, decoding, schema validation, and TOON round-trip.
+    /// Encode Lua tables to JSON strings, decode JSON back into tables,
+    /// validate against a JSON Schema, or convert to/from TOON for
+    /// token-efficient context blocks.
     ///
     /// ```lua
     /// local s = maki.json.encode({ ok = true })
     /// local t = maki.json.decode(s)
     /// ```
     "maki.json" => pub(crate) fn create_json_table(), DOCS [
-        encode, decode, schema_validator,
+        encode, decode, schema_validator, to_toon, from_toon, tooned, toon_stats,
     ]
 }
 

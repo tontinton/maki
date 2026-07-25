@@ -28,6 +28,7 @@ clap = { workspace = true }
 color-eyre = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+toon-format = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 smol = { workspace = true }
@@ -117,6 +118,7 @@ jiff = { version = "0.2", default-features = false, features = ["std", "tz-syste
 arboard = { version = "3", default-features = false, features = ["image-data", "wayland-data-control"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 flume = { version = "0.11", default-features = false, features = ["async", "select"] }
+toon-format = "0.5"
 humantime = "2"
 toml = "0.8"
 toml_edit = "0.22"

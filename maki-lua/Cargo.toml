@@ -21,8 +21,10 @@ maki-lua-macro = { workspace = true }
 maki-markdown = { workspace = true }
 maki-providers = { workspace = true }
 mlua = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
+toon-format = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 smol = { workspace = true }
