@@ -214,6 +214,16 @@ impl JobStore {
     }
 }
 
+/// Every job is its own process group, so one we forget keeps running
+/// after maki is gone. `TaskScope::drop` handles the usual path; this
+/// catches the rest, like the warm click cell that is dropped without a
+/// scope, and a panic unwinding past the cleanup.
+impl Drop for JobStore {
+    fn drop(&mut self) {
+        self.kill_all();
+    }
+}
+
 fn shell_command(cmd: &str) -> Command {
     #[cfg(unix)]
     {
@@ -446,6 +456,32 @@ mod tests {
         store
             .start("echo hello", None, None, None, None, None)
             .unwrap()
+    }
+
+    #[cfg(unix)]
+    fn group_alive(pid: u32) -> bool {
+        unsafe { libc::killpg(pid as libc::pid_t, 0) == 0 }
+    }
+
+    /// The warm click cell is dropped without ever going through
+    /// `TaskScope`, so without this the process outlives maki.
+    #[cfg(unix)]
+    #[test]
+    fn dropping_the_store_kills_its_jobs() {
+        let mut store = make_store();
+        let id = store
+            .start("sleep 30", None, None, None, None, None)
+            .expect("job started");
+        let pid = store.jobs[&id].pid;
+        assert!(group_alive(pid), "job should be running before the drop");
+
+        drop(store);
+
+        let gone = (0..500).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            !group_alive(pid)
+        });
+        assert!(gone, "dropping the store must not orphan the process group");
     }
 
     #[test]
