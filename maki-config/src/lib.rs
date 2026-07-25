@@ -53,6 +53,7 @@ pub const DEFAULT_BUILTINS: &[&str] = &[
     "bash",
     "batch",
     "code_execution",
+    "codegraph",
     "edit",
     "glob",
     "grep",
@@ -351,6 +352,7 @@ pub struct ToolOutputLinesFile {
     pub code_execution: Option<usize>,
     pub task: Option<usize>,
     pub index: Option<usize>,
+    pub explore: Option<usize>,
     pub grep: Option<usize>,
     pub read: Option<usize>,
     pub write: Option<usize>,
@@ -367,6 +369,7 @@ impl ToolOutputLinesFile {
             code_execution,
             task,
             index,
+            explore,
             grep,
             read,
             write,
@@ -854,6 +857,7 @@ pub struct ToolOutputLines {
     pub code_execution: usize,
     pub task: usize,
     pub index: usize,
+    pub explore: usize,
     pub grep: usize,
     pub read: usize,
     pub write: usize,
@@ -867,6 +871,7 @@ impl ToolOutputLines {
         code_execution: 5,
         task: 5,
         index: 3,
+        explore: 3,
         grep: 3,
         read: 3,
         write: 7,
@@ -879,6 +884,7 @@ impl ToolOutputLines {
         ("code_execution", Self::DEFAULT.code_execution),
         ("task", Self::DEFAULT.task),
         ("index", Self::DEFAULT.index),
+        ("explore", Self::DEFAULT.explore),
         ("grep", Self::DEFAULT.grep),
         ("read", Self::DEFAULT.read),
         ("write", Self::DEFAULT.write),
@@ -894,6 +900,7 @@ impl ToolOutputLines {
             code_execution: f.code_execution.unwrap_or(d.code_execution),
             task: f.task.unwrap_or(d.task),
             index: f.index.unwrap_or(d.index),
+            explore: f.explore.unwrap_or(d.explore),
             grep: f.grep.unwrap_or(d.grep),
             read: f.read.unwrap_or(d.read),
             write: f.write.unwrap_or(d.write),
@@ -902,12 +909,13 @@ impl ToolOutputLines {
         }
     }
 
-    fn fields(&self) -> [(&'static str, usize); 9] {
+    fn fields(&self) -> [(&'static str, usize); 10] {
         [
             ("bash", self.bash),
             ("code_execution", self.code_execution),
             ("task", self.task),
             ("index", self.index),
+            ("explore", self.explore),
             ("grep", self.grep),
             ("read", self.read),
             ("write", self.write),
@@ -934,6 +942,7 @@ impl ToolOutputLines {
             "code_execution" => self.code_execution,
             "task" => self.task,
             "index" => self.index,
+            "codegraph" | "explore" => self.explore,
             "grep" | "glob" => self.grep,
             "read" => self.read,
             "memory" => self.write,
