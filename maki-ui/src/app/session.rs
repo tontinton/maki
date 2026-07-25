@@ -103,8 +103,14 @@ impl App {
             &self.ui_config.tool_output_lines,
         );
         self.main_chat().load_messages(display_msgs);
-        self.main_chat().token_usage = self.state.token_usage;
-        self.main_chat().context_size = self.state.context_size;
+        // The restored total predates any per-turn cost, so price it once with the
+        // selected model. Later turns add their own exact cost.
+        let (usage, context_size) = (self.state.token_usage, self.state.context_size);
+        let cost = self.state.model.cost_of(&usage, self.state.fast);
+        let main = self.main_chat();
+        main.token_usage = usage;
+        main.cost = cost;
+        main.context_size = context_size;
         if let Some(draft) = self.state.session.meta.input_draft.take() {
             self.input_box.set_input(draft);
             self.input_box.buffer.move_to_end();

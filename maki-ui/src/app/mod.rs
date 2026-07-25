@@ -44,7 +44,6 @@ use crate::components::scrollbar;
 use crate::components::search_modal::{SearchAction, SearchModal};
 use crate::components::status_bar::StatusBar;
 use crate::components::theme_picker::{ThemePicker, ThemePickerAction};
-use crate::components::tool_display::format_turn_usage;
 use crate::components::usage_modal::{UsageFetchState, UsageModal};
 use crate::components::{
     Action, DisplayMessage, DisplayRole, ExitRequest, Overlay, RetryInfo, Status, is_ctrl,
@@ -60,7 +59,7 @@ use maki_agent::{
 };
 use maki_config::UiConfig;
 use maki_lua::{EventHandle, HintReader, KeymapReader, LuaCommandReader};
-use maki_providers::{Message, Model, ThinkingConfig};
+use maki_providers::{Message, Model, ThinkingConfig, add_cost};
 use maki_storage::StateDir;
 use maki_storage::input_history::InputHistory;
 use maki_storage::model::persist_model;
@@ -1040,6 +1039,7 @@ impl App {
         if let AgentEvent::TurnComplete(ref tc) = envelope.event {
             self.state.token_usage += tc.usage;
             self.chats[chat_idx].token_usage += tc.usage;
+            add_cost(&mut self.chats[chat_idx].cost, tc.cost);
             *self
                 .state
                 .session
@@ -1052,9 +1052,12 @@ impl App {
             if chat_idx == 0 {
                 self.state.context_size = ctx_size;
             }
-            let formatted =
-                format_turn_usage(&tc.usage, &self.state.model.pricing, self.state.fast);
-            self.chats[chat_idx].set_pending_turn_usage(formatted);
+            self.chats[chat_idx].set_pending_turn_usage(tc.usage.format(tc.cost));
+            if let Some(tool_id) = &subagent_id {
+                let chat = &self.chats[chat_idx];
+                let formatted = chat.token_usage.format(chat.cost);
+                self.chats[0].set_tool_turn_usage(tool_id, formatted);
+            }
         }
 
         let result = self.chats[chat_idx].handle_event(envelope.event, plan_path);

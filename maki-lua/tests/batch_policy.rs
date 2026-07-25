@@ -5,7 +5,9 @@ use std::sync::Arc;
 
 use maki_agent::tools::ToolRegistry;
 use maki_agent::tools::test_support::{stub_ctx, stub_ctx_with};
-use maki_agent::{AgentEvent, AgentMode, BufferSnapshot, EventSender, SpanStyle, ToolOutput};
+use maki_agent::{
+    AgentEvent, AgentMode, BufferSnapshot, Envelope, EventSender, SpanStyle, ToolOutput,
+};
 use maki_config::ToolOutputLines;
 use maki_lua::PluginHost;
 use serde_json::{Value, json};
@@ -24,6 +26,7 @@ const SUMMARY_MIXED_FMT: &str = "Executed {}/{} successfully. {} failed.";
 const BATCH_TOOL: &str = "batch";
 const PROBE_TOOL: &str = "probe";
 const BOOM_ERR: &str = "stub tool exploded";
+const CHILD_USAGE: &str = "12.3k↑ 456↓ $0.123";
 
 /// `maki.agent.call_tool` is stubbed; `maki.async.gather` and the semaphore
 /// stay real, so the park/release pair proves children genuinely overlap.
@@ -42,6 +45,14 @@ maki.agent.call_tool = function(ctx, name, input, opts)
       opts.on_annotation("5 lines")
     end
     return "annotated_done"
+  elseif name == "used" then
+    if opts and opts.on_annotation then
+      opts.on_annotation("model-x")
+    end
+    if opts and opts.on_usage then
+      opts.on_usage("@CHILD_USAGE@")
+    end
+    return "used_done"
   elseif name == "park" then
     -- Deadlocks unless a sibling runs concurrently and releases.
     local p = sem:acquire()
@@ -113,7 +124,9 @@ maki.api.register_tool({
 fn load_batch_host() -> (Arc<ToolRegistry>, PluginHost) {
     let reg = Arc::new(ToolRegistry::new());
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    let prelude = STUB_PRELUDE.replace("@BOOM_ERR@", BOOM_ERR);
+    let prelude = STUB_PRELUDE
+        .replace("@BOOM_ERR@", BOOM_ERR)
+        .replace("@CHILD_USAGE@", CHILD_USAGE);
     host.load_source("batch_policy", &format!("{prelude}\n{BATCH_PLUGIN_SRC}"))
         .unwrap();
     (reg, host)
@@ -340,7 +353,7 @@ fn restore_snapshot_lines_opts(
     handle.request_restore(
         maki_lua::RestoreItem {
             tool: Arc::from(BATCH_TOOL),
-            tool_use_id: "restore_id".to_owned(),
+            tool_use_id: BATCH_ID.to_owned(),
             output: output.to_owned(),
             input,
             is_error: false,
@@ -352,26 +365,39 @@ fn restore_snapshot_lines_opts(
         EventSender::new(tx, 0),
     );
     handle.wait_restore_complete_for_test();
-    // The empty LoadSource drains the async gate, so spawned follow-ups
-    // (highlight rewrites etc.) finish before we read snapshots.
-    host.load_source("barrier", "").unwrap();
+    barrier(host);
+    snapshot_lines(drain_snapshots(&rx).last().expect("no snapshot emitted"))
+}
 
-    let mut lines = Vec::new();
-    for env in rx.drain() {
-        if let AgentEvent::ToolSnapshot { snapshot, .. } = env.event {
-            lines = snapshot
-                .lines
+/// The empty LoadSource drains the async gate, so spawned follow-ups
+/// (highlight rewrites etc.) finish before we read snapshots.
+fn barrier(host: &PluginHost) {
+    host.load_source("barrier", "").unwrap();
+}
+
+fn drain_snapshots(rx: &flume::Receiver<Envelope>) -> Vec<BufferSnapshot> {
+    rx.drain()
+        .filter_map(|env| match env.event {
+            AgentEvent::ToolSnapshot { id, snapshot, .. } => {
+                assert_eq!(id, BATCH_ID);
+                Some(snapshot)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn snapshot_lines(snapshot: &BufferSnapshot) -> Vec<Vec<(String, SpanStyle)>> {
+    snapshot
+        .lines
+        .iter()
+        .map(|l| {
+            l.spans
                 .iter()
-                .map(|l| {
-                    l.spans
-                        .iter()
-                        .map(|s| (s.text.clone(), s.style.clone()))
-                        .collect()
-                })
-                .collect();
-        }
-    }
-    lines
+                .map(|s| (s.text.clone(), s.style.clone()))
+                .collect()
+        })
+        .collect()
 }
 
 fn lines_text(lines: &[Vec<(String, SpanStyle)>]) -> String {
@@ -478,6 +504,43 @@ fn restore_child_body_equals_child_restore_view() {
     assert!(
         text.contains("... (3 lines) (click to expand)"),
         "the child's own ToolView notice must render: {text}"
+    );
+}
+
+#[test]
+fn usage_renders_inline_on_matching_child() {
+    let (reg, host) = load_batch_host();
+    let (state, snapshots) = exec_batch_live(
+        &host,
+        &reg,
+        json!([
+            { "tool": "used", "parameters": {} },
+            { "tool": "ok", "parameters": { "tag": "b" } }
+        ]),
+    );
+    assert_eq!(state["children"][0]["usage"], CHILD_USAGE);
+
+    let lines = snapshot_lines(snapshots.last().expect("no snapshot emitted"));
+    let header = &lines[0];
+    assert_eq!(
+        &header[header.len() - 2..],
+        [
+            (
+                " (model-x)".to_owned(),
+                SpanStyle::Named("tool_annotation".to_owned())
+            ),
+            (
+                format!("  {CHILD_USAGE}"),
+                SpanStyle::Named("dim".to_owned())
+            ),
+        ],
+        "usage closes the child header, after the annotation"
+    );
+    let text = lines_text(&lines);
+    assert_eq!(
+        text.matches(CHILD_USAGE).count(),
+        1,
+        "usage belongs to one child only: {text}"
     );
 }
 
@@ -828,34 +891,48 @@ maki.api.register_tool({
 })
 "#;
 
+/// Real dispatch, no `call_tool` stub, so children stream their snapshots the
+/// way they do in a session.
+fn exec_batch_live(
+    host: &PluginHost,
+    reg: &Arc<ToolRegistry>,
+    tool_calls: Value,
+) -> (Value, Vec<BufferSnapshot>) {
+    let (tx, rx) = flume::unbounded();
+    let event_tx = EventSender::new(tx, 0);
+    let mut ctx = stub_ctx_with(&AgentMode::Build, Some(&event_tx), Some(BATCH_ID));
+    ctx.registry = Arc::clone(reg);
+
+    let input = json!({ "tool_calls": tool_calls });
+    let inv = reg
+        .get(BATCH_TOOL)
+        .expect("batch registered")
+        .tool
+        .parse(&input)
+        .expect("parse failed");
+    let state = smol::block_on(async { inv.execute(&ctx).await })
+        .output
+        .expect("batch failed")
+        .state()
+        .cloned()
+        .expect("no state on batch output");
+
+    barrier(host);
+    (state, drain_snapshots(&rx))
+}
+
 fn run_live_batch(child_src: &str, tool: &str) -> Vec<BufferSnapshot> {
     let reg = Arc::new(ToolRegistry::new());
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     host.load_source("live_batch", &format!("{child_src}\n{BATCH_PLUGIN_SRC}"))
         .unwrap();
-
-    let (tx, rx) = flume::unbounded();
-    let event_tx = EventSender::new(tx, 0);
-    let mut ctx = stub_ctx_with(&AgentMode::Build, Some(&event_tx), Some(BATCH_ID));
-    ctx.registry = Arc::clone(&reg);
-
-    let input = json!({ "tool_calls": [
-        { "tool": tool, "parameters": {} },
-        { "tool": tool, "parameters": {} },
-    ]});
-    let entry = reg.get(BATCH_TOOL).unwrap();
-    let inv = entry.tool.parse(&input).unwrap();
-    let done = smol::block_on(async { inv.execute(&ctx).await });
-    assert!(done.output.is_ok(), "batch failed: {:?}", done.output);
-
-    host.load_source("barrier", "").unwrap();
-
-    let mut snapshots = Vec::new();
-    for env in rx.drain() {
-        if let AgentEvent::ToolSnapshot { id, snapshot, .. } = env.event {
-            assert_eq!(id, BATCH_ID);
-            snapshots.push(snapshot);
-        }
-    }
+    let (_state, snapshots) = exec_batch_live(
+        &host,
+        &reg,
+        json!([
+            { "tool": tool, "parameters": {} },
+            { "tool": tool, "parameters": {} },
+        ]),
+    );
     snapshots
 }

@@ -579,6 +579,21 @@ fn update_tool_model_sets_annotation() {
 }
 
 #[test]
+fn set_tool_turn_usage_updates_exact_tool_and_keeps_annotation() {
+    const MODEL: &str = "anthropic/claude-sonnet-4-20250514";
+    const USAGE: &str = "1.2k↑ 345↓ $0.010";
+
+    let mut panel = panel_with_tools(&[("t1", "task"), ("t2", "task")]);
+    panel.update_tool_model("t1", MODEL);
+
+    panel.set_tool_turn_usage("t1", USAGE.into());
+
+    assert_eq!(panel.tool_turn_usage("t1"), Some(USAGE));
+    assert_eq!(panel.tool_turn_usage("t2"), None);
+    assert_eq!(panel.messages[0].annotation.as_deref(), Some(MODEL));
+}
+
+#[test]
 fn scroll_clamps_to_max_scroll() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     panel.streaming_text.set_buffer(&"a\n".repeat(15));

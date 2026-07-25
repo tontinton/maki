@@ -322,6 +322,12 @@ impl Model {
         format!("{}/{}", self.provider, self.id)
     }
 
+    /// `None` on an unpriced model (oauth, local), so callers can hide the cost
+    /// instead of showing a misleading "$0.000".
+    pub fn cost_of(&self, usage: &TokenUsage, fast: bool) -> Option<f64> {
+        (!self.pricing.is_zero()).then(|| usage.cost(&self.pricing, fast))
+    }
+
     pub fn provider_display_name(&self) -> &'static str {
         ManifestRegistry::for_slug(&self.provider).map_or("Unknown", |m| m.display_name)
     }
@@ -431,11 +437,25 @@ impl From<TokenUsage> for StoredTokenUsage {
 
 impl TokenUsage {
     pub fn total_input(&self) -> u32 {
-        self.input + self.cache_read + self.cache_creation
+        self.input
+            .saturating_add(self.cache_read)
+            .saturating_add(self.cache_creation)
     }
 
     pub fn context_tokens(&self) -> u32 {
-        self.input + self.output + self.cache_creation + self.cache_read
+        self.total_input().saturating_add(self.output)
+    }
+
+    pub fn format(&self, cost: Option<f64>) -> String {
+        let tokens = format!(
+            "{}↑ {}↓",
+            format_tokens(self.total_input()),
+            format_tokens(self.output)
+        );
+        match cost {
+            Some(cost) => format!("{tokens} ${cost:.3}"),
+            None => tokens,
+        }
     }
 
     pub fn cost(&self, pricing: &ModelPricing, fast: bool) -> f64 {
@@ -460,12 +480,27 @@ impl TokenUsage {
     }
 }
 
+/// A total stays `None` (unpriced) until the first priced turn shows up.
+pub fn add_cost(total: &mut Option<f64>, turn: Option<f64>) {
+    if let Some(turn) = turn {
+        *total = Some(total.unwrap_or_default() + turn);
+    }
+}
+
+pub fn format_tokens(tokens: u32) -> String {
+    match tokens {
+        0..1_000 => tokens.to_string(),
+        1_000..1_000_000 => format!("{:.1}k", f64::from(tokens) / 1_000.0),
+        _ => format!("{:.1}m", f64::from(tokens) / 1_000_000.0),
+    }
+}
+
 impl AddAssign for TokenUsage {
     fn add_assign(&mut self, rhs: Self) {
-        self.input += rhs.input;
-        self.output += rhs.output;
-        self.cache_creation += rhs.cache_creation;
-        self.cache_read += rhs.cache_read;
+        self.input = self.input.saturating_add(rhs.input);
+        self.output = self.output.saturating_add(rhs.output);
+        self.cache_creation = self.cache_creation.saturating_add(rhs.cache_creation);
+        self.cache_read = self.cache_read.saturating_add(rhs.cache_read);
     }
 }
 
@@ -480,6 +515,21 @@ mod tests {
         ModelTier::Strong,
         ModelTier::Compaction,
     ];
+
+    #[test_case(999, "999"         ; "under_thousand")]
+    #[test_case(1_000, "1.0k"      ; "thousand")]
+    #[test_case(999_999, "1000.0k" ; "just_under_million")]
+    #[test_case(1_000_000, "1.0m"  ; "million")]
+    fn format_tokens_display(tokens: u32, expected: &str) {
+        assert_eq!(format_tokens(tokens), expected);
+    }
+
+    #[test_case(TokenUsage { input: 12_000, output: 456, cache_creation: 200, cache_read: 100 }, None, "12.3k↑ 456↓" ; "without_cost")]
+    #[test_case(TokenUsage { input: 1_000_000, output: 100_000, cache_creation: 200_000, cache_read: 500_000 }, Some(5.4), "1.7m↑ 100.0k↓ $5.400" ; "with_cost")]
+    #[test_case(TokenUsage { input: u32::MAX, output: 1, cache_creation: 1, cache_read: 1 }, None, "4295.0m↑ 1↓" ; "input_saturates")]
+    fn usage_formatting(usage: TokenUsage, cost: Option<f64>, expected: &str) {
+        assert_eq!(usage.format(cost), expected);
+    }
 
     #[test_case("no-slash-here", ModelError::InvalidFormat ; "invalid_format")]
     #[test_case("foobar/gpt-4", ModelError::UnsupportedProvider("foobar".into()) ; "unsupported_provider")]

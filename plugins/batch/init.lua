@@ -201,6 +201,9 @@ local function child_header_line(c)
   if c.annotation then
     spans[#spans + 1] = { " (" .. c.annotation .. ")", "tool_annotation" }
   end
+  if c.usage then
+    spans[#spans + 1] = { "  " .. c.usage, "dim" }
+  end
   return spans
 end
 
@@ -265,7 +268,13 @@ end
 local function to_state(children)
   local out = {}
   for i, c in ipairs(children) do
-    out[i] = { tool = c.tool, status = c.status, output = c.output, annotation = c.annotation }
+    out[i] = {
+      tool = c.tool,
+      status = c.status,
+      output = c.output,
+      annotation = c.annotation,
+      usage = c.usage,
+    }
   end
   return { children = out }
 end
@@ -426,6 +435,10 @@ function Batch:run_child(c, ctx)
     on_annotation = function(a)
       self:annotate(c, a)
     end,
+    on_usage = function(usage)
+      c.usage = usage
+      self:rerender()
+    end,
   })
   if err then
     self:settle(c, STATUS.ERROR, err)
@@ -508,6 +521,7 @@ local function restore(input, output, _is_error, rctx)
       local c = children[i]
       c.status = TERMINAL[sc.status] and sc.status or STATUS.ERROR
       c.output, c.annotation = sc.output, sc.annotation
+      c.usage = sc.usage
     end
     return Batch.new(children, tol).buf
   end

@@ -817,6 +817,8 @@ pub struct TurnCompleteEvent {
     pub message: Message,
     pub usage: TokenUsage,
     pub model: String,
+    #[serde(skip)]
+    pub cost: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_size: Option<u32>,
 }

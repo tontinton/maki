@@ -24,6 +24,7 @@ use tempfile::TempDir;
 use test_case::test_case;
 
 const WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+const TASK_ID: &str = "task1";
 
 fn set_zone(app: &mut App, zone: SelectionZone, area: Rect) {
     app.zones.push(SelectableZone { area, zone });
@@ -159,6 +160,35 @@ fn subagent_msg_with_model(event: AgentEvent, parent_id: &str, name: &str, model
         subagent: Some(info),
         run_id: 1,
     }))
+}
+
+fn tool_start(id: &str, tool: &str) -> AgentEvent {
+    AgentEvent::ToolStart(Box::new(ToolStartEvent {
+        id: id.into(),
+        tool: tool.into(),
+        summary: id.into(),
+        annotation: None,
+        input: None,
+        raw_input: None,
+        output: None,
+        render_header: None,
+    }))
+}
+
+fn turn_complete(usage: TokenUsage, model: &str, cost: Option<f64>) -> AgentEvent {
+    AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
+        message: Default::default(),
+        usage,
+        model: model.into(),
+        cost,
+        context_size: None,
+    }))
+}
+
+fn tool_results_submitted() -> AgentEvent {
+    AgentEvent::ToolResultsSubmitted {
+        message: Box::new(Message::user(String::new())),
+    }
 }
 
 #[test]
@@ -591,7 +621,7 @@ fn ctrl_p_n_navigation() {
     app.run_id = 1;
     app.update(subagent_msg(
         AgentEvent::TextDelta { text: "sub".into() },
-        "task1",
+        TASK_ID,
         Some("research"),
     ));
     assert_eq!(app.chats.len(), 2);
@@ -617,7 +647,7 @@ fn subagents_get_descriptive_names() {
     app.run_id = 1;
     app.update(subagent_msg(
         AgentEvent::TextDelta { text: "a".into() },
-        "task1",
+        TASK_ID,
         Some("first"),
     ));
     app.update(subagent_msg(
@@ -637,7 +667,7 @@ fn subagent_prompt_shown_once_and_not_duplicated() {
     app.run_id = 1;
     app.update(subagent_msg_with_prompt(
         AgentEvent::TextDelta { text: "a".into() },
-        "task1",
+        TASK_ID,
         Some("research"),
         Some("Find all TODO comments"),
     ));
@@ -646,7 +676,7 @@ fn subagent_prompt_shown_once_and_not_duplicated() {
 
     app.update(subagent_msg(
         AgentEvent::TextDelta { text: "b".into() },
-        "task1",
+        TASK_ID,
         Some("research"),
     ));
     app.chats[1].flush();
@@ -663,14 +693,7 @@ fn turn_complete_tracks_usage_and_context_per_chat() {
         output: 50,
         ..Default::default()
     };
-    app.update(agent_msg(AgentEvent::TurnComplete(Box::new(
-        TurnCompleteEvent {
-            message: Default::default(),
-            usage: main_usage,
-            model: "test".into(),
-            context_size: None,
-        },
-    ))));
+    app.update(agent_msg(turn_complete(main_usage, "test", None)));
 
     let sub_usage = TokenUsage {
         input: 200,
@@ -678,13 +701,8 @@ fn turn_complete_tracks_usage_and_context_per_chat() {
         ..Default::default()
     };
     app.update(subagent_msg(
-        AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
-            message: Default::default(),
-            usage: sub_usage,
-            model: "test".into(),
-            context_size: None,
-        })),
-        "task1",
+        turn_complete(sub_usage, "test", None),
+        TASK_ID,
         None,
     ));
 
@@ -696,35 +714,132 @@ fn turn_complete_tracks_usage_and_context_per_chat() {
     assert_eq!(app.chats[1].context_size, sub_usage.context_tokens());
 }
 
+const SUBAGENT_NAME: &str = "research";
+const SUB_TOKENS: TokenUsage = TokenUsage {
+    input: 1_000,
+    output: 200,
+    cache_creation: 300,
+    cache_read: 400,
+};
+const SUB_COST: Option<f64> = Some(0.007);
+const MAIN_TOKENS: TokenUsage = TokenUsage {
+    input: 500,
+    output: 100,
+    cache_creation: 0,
+    cache_read: 0,
+};
+const MAIN_COST: Option<f64> = Some(0.002);
+
+fn sub_turn_complete() -> Msg {
+    subagent_msg(
+        turn_complete(SUB_TOKENS, "child-model", SUB_COST),
+        TASK_ID,
+        Some(SUBAGENT_NAME),
+    )
+}
+
+/// Uses the same formatter as the header: these tests pin which tool gets the
+/// usage, not how it is spelled (maki-providers covers the spelling).
+fn sub_usage_text(turns: u32) -> String {
+    let mut total = TokenUsage::default();
+    for _ in 0..turns {
+        total += SUB_TOKENS;
+    }
+    total.format(SUB_COST.map(|cost| cost * f64::from(turns)))
+}
+
+#[test]
+fn subagent_turn_complete_updates_matching_parent_header_cumulatively() {
+    let mut app = streaming_app();
+    app.update(agent_msg(tool_start(TASK_ID, "task")));
+    app.update(agent_msg(tool_start("task2", "task")));
+
+    app.update(sub_turn_complete());
+    app.update(sub_turn_complete());
+
+    assert_eq!(
+        app.chats[0].tool_turn_usage(TASK_ID),
+        Some(sub_usage_text(2).as_str())
+    );
+    assert_eq!(app.chats[0].tool_turn_usage("task2"), None);
+}
+
+#[test_case(false ; "plain_tool_takes_the_parent_turn")]
+#[test_case(true  ; "subagent_stamp_is_not_overwritten")]
+fn parent_turn_flush_stamps_the_last_unstamped_tool(subagent_ran: bool) {
+    let mut app = streaming_app();
+    app.update(agent_msg(turn_complete(
+        MAIN_TOKENS,
+        "main-model",
+        MAIN_COST,
+    )));
+    app.update(agent_msg(tool_start(TASK_ID, "task")));
+    if subagent_ran {
+        app.update(sub_turn_complete());
+    }
+
+    app.update(agent_msg(tool_results_submitted()));
+
+    let expected = if subagent_ran {
+        sub_usage_text(1)
+    } else {
+        MAIN_TOKENS.format(MAIN_COST)
+    };
+    assert_eq!(
+        app.chats[0].tool_turn_usage(TASK_ID),
+        Some(expected.as_str())
+    );
+}
+
+#[test]
+fn tool_inside_subagent_chat_gets_its_turn_usage() {
+    const TOOL_ID: &str = "sub_bash";
+    let mut app = streaming_app();
+    app.update(agent_msg(tool_start(TASK_ID, "task")));
+    app.update(subagent_msg(
+        tool_start(TOOL_ID, "bash"),
+        TASK_ID,
+        Some(SUBAGENT_NAME),
+    ));
+    app.update(sub_turn_complete());
+
+    app.update(subagent_msg(
+        tool_results_submitted(),
+        TASK_ID,
+        Some(SUBAGENT_NAME),
+    ));
+
+    assert_eq!(
+        app.chats[1].tool_turn_usage(TOOL_ID),
+        Some(sub_usage_text(1).as_str())
+    );
+}
+
 #[test]
 fn turn_complete_accumulates_usage_by_model() {
     let mut app = app_with_subagent();
 
-    app.update(agent_msg(AgentEvent::TurnComplete(Box::new(
-        TurnCompleteEvent {
-            message: Default::default(),
-            usage: TokenUsage {
-                input: 100,
-                output: 50,
-                cache_read: 10,
-                ..Default::default()
-            },
-            model: "main-model".into(),
-            context_size: None,
+    app.update(agent_msg(turn_complete(
+        TokenUsage {
+            input: 100,
+            output: 50,
+            cache_read: 10,
+            ..Default::default()
         },
-    ))));
+        "main-model",
+        None,
+    )));
     app.update(subagent_msg(
-        AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
-            message: Default::default(),
-            usage: TokenUsage {
+        turn_complete(
+            TokenUsage {
                 input: 200,
                 output: 75,
                 ..Default::default()
             },
-            model: "sub-model".into(),
-            context_size: None,
-        })),
-        "task1",
+            "sub-model",
+            None,
+        ),
+        TASK_ID,
         None,
     ));
 
@@ -753,7 +868,7 @@ fn cancel_resets_all_chats_and_indices() {
             output: None,
             render_header: None,
         })),
-        "task1",
+        TASK_ID,
         None,
     ));
 
@@ -775,7 +890,7 @@ fn finish_subagent(app: &mut App, id: &str, is_error: bool) {
 }
 
 fn finish_subagent_task(app: &mut App, is_error: bool) {
-    finish_subagent(app, "task1", is_error);
+    finish_subagent(app, TASK_ID, is_error);
 }
 
 #[test]
@@ -836,10 +951,15 @@ fn ctrl_x_toggles_tasks_picker() {
     assert!(!app.task_picker.is_open());
 }
 
-fn app_with_subagent_id(id: &str) -> App {
+fn streaming_app() -> App {
     let mut app = test_app();
     app.status = Status::Streaming;
     app.run_id = 1;
+    app
+}
+
+fn app_with_subagent_id(id: &str) -> App {
+    let mut app = streaming_app();
     app.update(subagent_msg(
         AgentEvent::TextDelta { text: "x".into() },
         id,
@@ -849,7 +969,7 @@ fn app_with_subagent_id(id: &str) -> App {
 }
 
 fn app_with_subagent() -> App {
-    app_with_subagent_id("task1")
+    app_with_subagent_id(TASK_ID)
 }
 
 #[test]
@@ -1457,7 +1577,7 @@ fn resolve_or_create_chat_sets_model_id_and_annotation() {
     app.status = Status::Streaming;
     app.run_id = 1;
     app.update(agent_msg(AgentEvent::ToolStart(Box::new(ToolStartEvent {
-        id: "task1".into(),
+        id: TASK_ID.into(),
         tool: "task".into(),
         summary: "research".into(),
         annotation: None,
@@ -1469,7 +1589,7 @@ fn resolve_or_create_chat_sets_model_id_and_annotation() {
 
     app.update(subagent_msg_with_model(
         AgentEvent::TextDelta { text: "hi".into() },
-        "task1",
+        TASK_ID,
         "research",
         "anthropic/claude-sonnet-4-20250514",
     ));
@@ -1957,7 +2077,7 @@ fn retry_clears_subagent_in_progress_tools() {
             id: "st1".into(),
             name: "bash".into(),
         },
-        "task1",
+        TASK_ID,
         Some("research"),
     ));
     assert_eq!(app.chats.len(), 2);
@@ -1969,7 +2089,7 @@ fn retry_clears_subagent_in_progress_tools() {
             message: "overloaded".into(),
             delay_ms: 1000,
         },
-        "task1",
+        TASK_ID,
         Some("research"),
     ));
     assert_eq!(app.chats[1].in_progress_count(), 0);
@@ -2306,12 +2426,7 @@ fn stale_non_terminal_event_does_not_save_session() {
     cancel_app(&mut app);
 
     app.update(agent_msg_with_run_id(
-        AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
-            message: Message::user(String::new()),
-            usage: TokenUsage::default(),
-            model: "mock".into(),
-            context_size: None,
-        })),
+        turn_complete(TokenUsage::default(), "mock", None),
         old_run_id,
     ));
     assert!(app.state.session.messages.is_empty());
@@ -3075,7 +3190,7 @@ fn double_esc_in_subagent_cancels_subagent() {
     assert_eq!(actions.len(), 1);
     assert!(matches!(
         &actions[0],
-        Action::CancelSubagent { tool_use_id } if tool_use_id == "task1"
+        Action::CancelSubagent { tool_use_id } if tool_use_id == TASK_ID
     ));
     assert!(app.chats[1].is_finished());
     assert_eq!(app.chats[1].last_message_text(), CANCELLED_TEXT);
@@ -3107,18 +3222,18 @@ fn esc_in_main_chat_with_active_subagent_no_cancel() {
 
 #[test]
 fn cancel_subagent_removes_answer_sender() {
-    let (mut app, _sub_rx, _main_rx) = app_with_subagent_tx("task1");
+    let (mut app, _sub_rx, _main_rx) = app_with_subagent_tx(TASK_ID);
     assert!(!app.subagent_answers.is_empty());
     app.update(Msg::Key(kb::NEXT_CHAT.to_key_event()));
     assert_eq!(app.active_chat, 1);
     app.last_esc = Some(Instant::now());
     app.update(Msg::Key(key(KeyCode::Esc)));
-    assert!(!app.subagent_answers.contains_key("task1"));
+    assert!(!app.subagent_answers.contains_key(TASK_ID));
 }
 
 #[test]
 fn multiple_subagents_cancel_one_other_unaffected() {
-    let mut app = app_with_subagent_id("task1");
+    let mut app = app_with_subagent_id(TASK_ID);
     app.update(subagent_msg(
         AgentEvent::TextDelta { text: "y".into() },
         "task2",
@@ -3135,7 +3250,7 @@ fn multiple_subagents_cancel_one_other_unaffected() {
         &actions[0],
         Action::CancelSubagent { tool_use_id } if tool_use_id == "task2"
     ));
-    let task1_idx = *app.chat_index.get("task1").unwrap();
+    let task1_idx = *app.chat_index.get(TASK_ID).unwrap();
     assert!(!app.chats[task1_idx].is_finished());
     assert!(app.chats[app.active_chat].is_finished());
 }

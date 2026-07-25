@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use crossterm::event::{KeyCode, KeyEvent};
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
-use maki_providers::{Model, ModelPricing, ProviderUsage, TokenUsage};
+use maki_providers::{Model, ModelPricing, ProviderUsage, TokenUsage, format_tokens};
 use maki_storage::sessions::StoredTokenUsage;
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -16,7 +16,6 @@ use crate::components::ModalScroll;
 use crate::components::keybindings::key;
 use crate::components::modal::Modal;
 use crate::components::scrollbar::render_vertical_scrollbar;
-use crate::components::status_bar::format_tokens;
 use crate::theme;
 
 const TITLE: &str = " Token usage ";

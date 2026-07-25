@@ -312,20 +312,22 @@ impl MessagesPanel {
         self.store_snapshot(tool_id, snapshot, true, theme_gen);
     }
 
+    /// A subagent stamps its own cumulative usage on the task header, and that
+    /// header is usually the last tool of the turn, so an existing stamp wins.
     pub fn set_turn_usage_on_last_tool(&mut self, usage: String) {
-        let Some(idx) = self
-            .messages
-            .iter()
-            .rposition(|m| matches!(m.role, DisplayRole::Tool(_)))
-        else {
-            return;
-        };
-        self.messages[idx].turn_usage = Some(usage);
-        let DisplayRole::Tool(t) = &self.messages[idx].role else {
-            unreachable!()
-        };
-        let id = t.id.clone();
-        self.rebuild_tool_segment(&id);
+        let last_tool = self.messages.iter().rev().find_map(|msg| match &msg.role {
+            DisplayRole::Tool(tool) => Some((tool.id.clone(), msg.turn_usage.is_none())),
+            _ => None,
+        });
+        if let Some((id, unstamped)) = last_tool
+            && unstamped
+        {
+            self.set_tool_turn_usage(&id, usage);
+        }
+    }
+
+    pub fn set_tool_turn_usage(&mut self, tool_id: &str, usage: String) {
+        self.update_tool(tool_id, |msg| msg.turn_usage = Some(usage));
     }
 
     fn upsert_instruction_segment(
@@ -497,6 +499,14 @@ impl MessagesPanel {
     #[cfg(test)]
     pub fn streaming_thinking_is_empty(&self) -> bool {
         self.streaming_thinking.is_empty()
+    }
+
+    #[cfg(test)]
+    pub fn tool_turn_usage(&self, tool_id: &str) -> Option<&str> {
+        self.messages.iter().rev().find_map(|msg| match &msg.role {
+            DisplayRole::Tool(tool) if tool.id == tool_id => msg.turn_usage.as_deref(),
+            _ => None,
+        })
     }
 
     pub fn set_prompt_progress(&mut self, progress: Option<PromptProgress>) {

@@ -1,13 +1,59 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use maki_agent::tools::{ToolRegistry, ToolSource, timeout_annotation};
+use maki_agent::ToolOutput;
+use maki_agent::tools::{
+    DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool, ToolContext,
+    ToolExecResult, ToolInvocation, ToolLive, ToolRegistry, ToolSource, timeout_annotation,
+};
 use maki_config::{AlwaysThinking, PluginsConfig, ToolOutputLines};
 use maki_lua::{PluginError, PluginHost, WARM_TOOL_CAP};
-use std::path::Path;
+use serde_json::{Value, json};
 
 const NARGS_ERR: &str = r#"'nargs' must be 0, 1, "?", "*", or "+""#;
+const USAGE_TOOL_NAME: &str = "usage_child";
+const USAGE_VALUE: &str = "12.3k↑ 456↓ $0.123";
+const USAGE_OUTPUT: &str = "usage_done";
+
+/// Lua tools cannot publish `ToolLive::Usage` (only the subagent relay does), so
+/// a native stub stands in for one.
+struct UsageTool;
+
+impl ToolInvocation for UsageTool {
+    fn start_header(&self) -> HeaderFuture {
+        HeaderFuture::Ready(HeaderResult::plain(USAGE_TOOL_NAME.into()))
+    }
+
+    fn execute<'a>(self: Box<Self>, ctx: &'a ToolContext) -> ExecFuture<'a> {
+        Box::pin(async move {
+            if let Some(sink) = &ctx.live_sink {
+                let _ = sink.send(ToolLive::Usage(USAGE_VALUE.into()));
+            }
+            ToolExecResult::from(Ok::<_, String>(ToolOutput::Plain(USAGE_OUTPUT.into())))
+        })
+    }
+}
+
+impl Tool for UsageTool {
+    fn name(&self) -> &str {
+        USAGE_TOOL_NAME
+    }
+
+    fn description(&self, _ctx: &DescriptionContext) -> Cow<'_, str> {
+        "emits usage".into()
+    }
+
+    fn schema(&self) -> Value {
+        json!({"type": "object", "properties": {}, "additionalProperties": false})
+    }
+
+    fn parse(&self, _input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
+        Ok(Box::new(UsageTool))
+    }
+}
 
 fn fresh_registry() -> Arc<ToolRegistry> {
     Arc::new(ToolRegistry::new())
@@ -1612,11 +1658,18 @@ fn warm_click_survives_post_completion_cancel() {
     assert_eq!(body.read()[0].spans[0].text, WARM_CLICK_LINE);
 }
 
-/// `maki.agent.call_tool` returns `(text, err)` and delivers live bufs and
-/// annotations (live and completion alike) through the callbacks.
+/// `maki.agent.call_tool` returns `(text, err)` and delivers live bufs,
+/// annotations (live and completion alike) and usage through the callbacks.
 #[test]
 fn call_tool_streams_live_buf_and_annotations() {
     let reg = fresh_registry();
+    reg.register(
+        Arc::new(UsageTool),
+        ToolSource::Lua {
+            plugin: Arc::from("usage_fixture"),
+        },
+    )
+    .unwrap();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let src = format!(
         r#"
@@ -1669,12 +1722,17 @@ maki.api.register_tool({{
             end,
             on_annotation = function(a) ann2 = a end,
         }})
+        local usage = "nil"
+        local text3 = maki.agent.call_tool(ctx, "{USAGE_TOOL_NAME}", {{}}, {{
+            on_usage = function(value) usage = value end,
+        }})
         local ann3 = "nil"
         local _, err3 = maki.agent.call_tool(ctx, "failing_child", {{}}, {{
             on_annotation = function(a) ann3 = a end,
         }})
         return tostring(text) .. "/" .. ann
             .. " " .. tostring(text2) .. "/" .. live_text .. "/" .. ann2
+            .. " " .. tostring(text3) .. "/" .. usage
             .. " " .. tostring(err3) .. "/" .. ann3
     end
 }})
@@ -1690,7 +1748,10 @@ maki.api.register_tool({{
     .expect("driver ok");
     assert_eq!(
         out,
-        "child_done/5 items stream_done/streamed line/1 lines boom/nil"
+        format!(
+            "child_done/5 items stream_done/streamed line/1 lines \
+             {USAGE_OUTPUT}/{USAGE_VALUE} boom/nil"
+        )
     );
 }
 

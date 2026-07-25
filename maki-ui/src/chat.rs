@@ -42,6 +42,7 @@ pub enum ChatEventResult {
 pub struct Chat {
     pub name: String,
     pub token_usage: TokenUsage,
+    pub cost: Option<f64>,
     pub context_size: u32,
     pub model_id: Option<String>,
     pending_turn_usage: Option<String>,
@@ -54,6 +55,7 @@ impl Chat {
         Self {
             name,
             token_usage: TokenUsage::default(),
+            cost: None,
             context_size: 0,
             model_id: None,
             pending_turn_usage: None,
@@ -301,6 +303,10 @@ impl Chat {
         self.messages_panel.update_tool_model(tool_id, model);
     }
 
+    pub fn set_tool_turn_usage(&mut self, tool_id: &str, usage: String) {
+        self.messages_panel.set_tool_turn_usage(tool_id, usage);
+    }
+
     pub fn load_messages(&mut self, msgs: Vec<DisplayMessage>) {
         self.messages_panel.load_messages(msgs);
     }
@@ -363,6 +369,11 @@ impl Chat {
     #[cfg(test)]
     pub fn streaming_thinking_is_empty(&self) -> bool {
         self.messages_panel.streaming_thinking_is_empty()
+    }
+
+    #[cfg(test)]
+    pub fn tool_turn_usage(&self, tool_id: &str) -> Option<&str> {
+        self.messages_panel.tool_turn_usage(tool_id)
     }
 }
 
