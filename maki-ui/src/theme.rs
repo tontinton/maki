@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use arc_swap::{ArcSwap, Guard};
 use maki_storage::StateDir;
@@ -251,6 +251,8 @@ static THEME: LazyLock<ArcSwap<Theme>> =
 
 static GENERATION: AtomicU64 = AtomicU64::new(0);
 
+static CURRENT_NAME: Mutex<Option<String>> = Mutex::new(None);
+
 pub fn current() -> Guard<Arc<Theme>> {
     THEME.load()
 }
@@ -275,7 +277,12 @@ pub fn load_by_name(name: &str) -> Result<Theme, String> {
         .unwrap_or_else(|| Err(format!("unknown theme: {name}")))
 }
 
+pub fn set_current_name(name: &str) {
+    *CURRENT_NAME.lock().unwrap() = Some(name.to_owned());
+}
+
 pub fn persist_theme(name: &str) {
+    set_current_name(name);
     if let Ok(dir) = StateDir::resolve() {
         maki_storage::theme::persist_theme_name(&dir, name);
     }
@@ -287,6 +294,9 @@ fn read_theme_name() -> Option<String> {
 }
 
 pub fn current_theme_name() -> String {
+    if let Some(name) = CURRENT_NAME.lock().unwrap().clone() {
+        return name;
+    }
     read_theme_name().unwrap_or_else(|| DEFAULT_THEME.to_owned())
 }
 
@@ -994,6 +1004,12 @@ mod tests {
     #[test]
     fn load_by_name_unknown() {
         assert!(load_by_name("nonexistent").is_err());
+    }
+
+    #[test]
+    fn current_theme_name_prefers_in_memory_name() {
+        set_current_name("zenburn");
+        assert_eq!(current_theme_name(), "zenburn");
     }
 
     #[test]

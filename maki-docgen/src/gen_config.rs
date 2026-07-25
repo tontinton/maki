@@ -103,6 +103,24 @@ fn collect_plugin_options() -> PluginOptionSpecs {
     specs
 }
 
+fn write_theme_section(out: &mut String) {
+    writeln!(out, "### `ui.theme`\n").unwrap();
+    writeln!(
+        out,
+        "Name of the color theme to load at startup, overriding the theme you \
+         last picked interactively. If unset, Maki keeps your last selection \
+         (the built-in default on first run). An unknown name is ignored with \
+         a warning.\n"
+    )
+    .unwrap();
+    let names = maki_ui::BUNDLED_THEMES
+        .iter()
+        .map(|t| format!("`{}`", t.name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    writeln!(out, "Available themes: {names}.\n").unwrap();
+}
+
 fn write_tool_output_section(out: &mut String) {
     writeln!(out, "### `ui.tool_output_lines`\n").unwrap();
     writeln!(
@@ -150,6 +168,7 @@ maki.setup({{
     ui = {{
         splash_animation = true,
         mouse_scroll_lines = {mouse_scroll},
+        theme = \"tokyonight\",
         tool_output_lines = {{
             bash = {tol_bash},
             read = {tol_read},
@@ -190,6 +209,7 @@ All fields are optional. Typos in field names cause an error right away.
     writeln!(out).unwrap();
 
     write_section(&mut out, "[ui]", UiConfig::FIELDS);
+    write_theme_section(&mut out);
     write_tool_output_section(&mut out);
     write_section(&mut out, "[agent]", AgentConfig::FIELDS);
     write_section(&mut out, "[provider]", ProviderConfig::FIELDS);

@@ -8,7 +8,9 @@ pub mod headless;
 pub mod mcp;
 pub use mcp::config::{McpConfigError, McpConfigErrors, McpServerInfo, McpServerStatus};
 pub use mcp::protocol::PromptRole;
-pub use mcp::{McpCommand, McpHandle, McpPromptArg, McpPromptInfo, McpSnapshot, McpSnapshotReader};
+pub use mcp::{
+    McpCommand, McpHandle, McpPromptArg, McpPromptInfo, McpSession, McpSnapshot, McpSnapshotReader,
+};
 pub(crate) mod task_set;
 pub use agent::{
     Agent, AgentParams, AgentRunParams, History, Instructions, LoadedInstructions, SharedMessages,

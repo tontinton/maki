@@ -3,9 +3,11 @@
 
 local DEFAULT_MAX_OUTPUT_LINES = 2000
 local DEFAULT_MAX_OUTPUT_BYTES = 50 * 1024
+local DEFAULT_MAX_LINE_BYTES = 500
 
 local M = {}
 
+M.DEFAULT_MAX_LINE_BYTES = DEFAULT_MAX_LINE_BYTES
 M.specs = {
   max_output_lines = { type = "integer", desc = "Override `agent.max_output_lines` for this tool." },
   max_output_bytes = { type = "integer", desc = "Override `agent.max_output_bytes` for this tool." },

@@ -615,7 +615,8 @@ pub struct UsageLimit {
     /// Human-readable label for the window, provided by the provider.
     pub label: String,
     /// Usage percentage within the window, 0-100.
-    pub percentage: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub percentage: Option<u32>,
     /// When the window resets, as epoch milliseconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reset_at: Option<u64>,

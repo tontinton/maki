@@ -19,6 +19,16 @@ Maki re-reads auth from storage and environment variables each time a new agent 
 
 You can set multiple API keys in one env var (`ANTHROPIC_API_KEY=sk-1,sk-2,sk-3`) and they rotate automatically on rate-limit or auth errors."#;
 
+const BASE_URL_OVERRIDES: &str = r#"## Base URL Overrides
+
+Every provider honors a `<SLUG>_BASE_URL` env var (`anthropic` -> `ANTHROPIC_BASE_URL`, `llama-cpp` -> `LLAMA_CPP_BASE_URL`). Set it to the origin of a proxy or a compatible endpoint and Maki appends the API paths itself:
+
+```sh
+ANTHROPIC_BASE_URL=https://my-proxy.internal maki
+```
+
+It wins over `providers.toml` and built-in defaults. `ANTHROPIC_BASE_URL` and `OPENAI_BASE_URL` are the same names the official SDKs use, so an existing proxy setup carries over as is. One exception: `OPENAI_BASE_URL` only redirects the platform API, never the ChatGPT Coding Plan backend."#;
+
 const LONG_CONTEXT_NOTE: &str = r#"Add `-1m` to any Claude model, like `claude-sonnet-4-6-1m`, to use the 1M token context window."#;
 
 const BEDROCK_NOTE: &str = r#"#### Amazon Bedrock
@@ -330,6 +340,7 @@ pub fn generate() -> String {
     );
     let _ = writeln!(out, "{TIER_PICKER_NOTE}\n");
     let _ = writeln!(out, "{AUTH_RELOADING}\n");
+    let _ = writeln!(out, "{BASE_URL_OVERRIDES}\n");
     let _ = writeln!(out, "## Built-in Providers\n");
 
     for section in &build_sections() {

@@ -15,6 +15,7 @@ use crate::providers::ResolvedAuth;
 use crate::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 
 static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
+    slug: "openai",
     api_key_env: "OPENAI_API_KEY",
     base_url: "https://api.openai.com/v1",
     max_tokens_field: "max_completion_tokens",
@@ -156,10 +157,12 @@ impl OpenAi {
         {
             return Ok(auth::build_coding_plan_resolved(&tokens));
         }
-        // Fall back to standard API key via the Responses API.
+        // Fall back to standard API key via the Responses API. `OPENAI_BASE_URL`
+        // overrides the platform API only, never the ChatGPT backend above.
         let mut auth = self.current_auth();
         if auth.base_url.is_none() {
-            auth.base_url = Some(CONFIG.base_url.into());
+            auth.base_url = maki_config::providers::base_url_override("openai")
+                .or_else(|| Some(CONFIG.base_url.into()));
         }
         Ok(auth)
     }

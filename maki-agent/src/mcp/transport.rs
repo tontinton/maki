@@ -42,12 +42,27 @@ fn invalid_response(name: &Arc<str>, e: impl std::fmt::Display) -> McpError {
     }
 }
 
-pub async fn initialize(transport: &dyn McpTransport) -> Result<(), McpError> {
+pub struct ServerCapabilities {
+    pub tools: bool,
+    pub prompts: bool,
+}
+
+impl ServerCapabilities {
+    fn parse(result: &Value) -> Self {
+        Self {
+            tools: result["capabilities"]["tools"].is_object(),
+            prompts: result["capabilities"]["prompts"].is_object(),
+        }
+    }
+}
+
+pub async fn initialize(transport: &dyn McpTransport) -> Result<ServerCapabilities, McpError> {
     let params = initialize_params();
-    transport.send_request("initialize", Some(params)).await?;
+    let result = transport.send_request("initialize", Some(params)).await?;
     transport
         .send_notification("notifications/initialized", None)
-        .await
+        .await?;
+    Ok(ServerCapabilities::parse(&result))
 }
 
 pub async fn list_tools(transport: &dyn McpTransport) -> Result<Vec<ToolInfo>, McpError> {
@@ -116,4 +131,20 @@ pub async fn call_tool(
         "MCP tools/call response"
     );
     Ok(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use test_case::test_case;
+
+    #[test_case(json!({"capabilities": {"tools": {}, "prompts": {}}}), true, true ; "both")]
+    #[test_case(json!({"capabilities": {"tools": {"listChanged": false}}}), true, false ; "tools_only")]
+    #[test_case(json!({"capabilities": {"prompts": {}}}), false, true ; "prompts_only")]
+    #[test_case(json!({}), false, false ; "no_capabilities")]
+    fn parses_capabilities(result: Value, tools: bool, prompts: bool) {
+        let caps = ServerCapabilities::parse(&result);
+        assert_eq!((caps.tools, caps.prompts), (tools, prompts));
+    }
 }

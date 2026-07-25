@@ -324,7 +324,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 startup_warnings: std::mem::take(&mut warnings),
                 storage: storage.clone(),
                 config: stack.config.agent.clone(),
-                ui_config: stack.config.ui,
+                ui_config: stack.config.ui.clone(),
                 input_history_size: stack.config.storage.input_history_size,
                 permissions: Arc::new(maki_agent::permissions::PermissionManager::new(
                     stack.config.permissions.clone(),

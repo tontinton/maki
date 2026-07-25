@@ -250,7 +250,8 @@ browsing memory files or toggling settings.
 **Parameters:**
 
 - `{spec}` (`table`) Command specification:
-  - `name` (`string`) Required. The command name (without the leading slash).
+  - `name` (`string`) Required. The command name (e.g. "/hello"; a leading
+    slash is added when missing).
   - `description` (`string`) Optional. Short description shown in the command palette.
   - `handler` (`function`) Required. Called when the user runs the command.
 
@@ -705,7 +706,6 @@ available.
 
   - `only` (`string[]?`) include only these tool names.
   - `except` (`string[]?`) exclude these tool names.
-  - `include_mcp` (`boolean?`) include MCP tools. Default: `true`.
   - `workflow` (`boolean?`) use workflow-mode descriptions. Default: `false`.
   - `spec` (`string?`) evaluate capability exclusions against this model spec.
 
@@ -789,6 +789,10 @@ and tool set.
     `(string)` or `(nil, err)`.
   - `name` (`string?`) display name for logs and UI.
   - `audience` (`string?`) tool audience for capability gating. Default: `"general_sub"`.
+  - `mcp` (`boolean?`) give the session access to MCP tools. Their
+    definitions are injected automatically each turn (deferred behind
+    `tool_search`), so don't put MCP definitions in `tools`. The session
+    starts with no loaded tools of its own. Default: `true`.
   - `thinking` (`string|integer?`) thinking mode: `"off"`, `"adaptive"`, an
     effort level (`"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`,
     `"max"`), or a budget integer (token count). Inherits parent setting
@@ -4644,9 +4648,11 @@ ListPicker.highlight_spans = highlight_spans
 
 local DEFAULT_MAX_OUTPUT_LINES = 2000
 local DEFAULT_MAX_OUTPUT_BYTES = 50 * 1024
+local DEFAULT_MAX_LINE_BYTES = 500
 
 local M = {}
 
+M.DEFAULT_MAX_LINE_BYTES = DEFAULT_MAX_LINE_BYTES
 M.specs = {
   max_output_lines = { type = "integer", desc = "Override `agent.max_output_lines` for this tool." },
   max_output_bytes = { type = "integer", desc = "Override `agent.max_output_bytes` for this tool." },
@@ -4772,7 +4778,8 @@ function TextInput:render(prefix, prefix_width, width)
 -- runtime runs those tasks inline before snapshotting.
 
 -- opts: max_lines (default 80) shown while collapsed, keep "head"|"tail"
--- (default "tail"), max_expand_lines (default 2000) kept for expansion.
+-- (default "tail"), max_expand_lines (default 2000) kept for expansion,
+-- max_line_bytes (optional) per-line byte cap applied at render time.
 function ToolView.new(buf, opts)
 function ToolView:set_header(lines)
 function ToolView:clear()

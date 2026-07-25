@@ -242,7 +242,24 @@ pub fn resolve_api_key_env(slug: &str, def: Option<&ProviderDef>) -> String {
     format!("{}_API_KEY", slug.to_uppercase().replace('-', "_"))
 }
 
+/// The `<SLUG>_BASE_URL` env var name (e.g. `anthropic` -> `ANTHROPIC_BASE_URL`,
+/// `llama-cpp` -> `LLAMA_CPP_BASE_URL`).
+pub fn base_url_env_var(slug: &str) -> String {
+    format!("{}_BASE_URL", slug.to_uppercase().replace('-', "_"))
+}
+
+/// The `<SLUG>_BASE_URL` override, or `None` when unset or empty.
+pub fn base_url_override(slug: &str) -> Option<String> {
+    std::env::var(base_url_env_var(slug))
+        .ok()
+        .filter(|url| !url.is_empty())
+}
+
 pub fn resolve_base_url(slug: &str, def: Option<&ProviderDef>) -> Option<String> {
+    // Env override wins over config and built-in defaults.
+    if let Some(url) = base_url_override(slug) {
+        return Some(url);
+    }
     if let Some(d) = def {
         if let Some(url) = &d.base_url {
             return Some(url.clone());
