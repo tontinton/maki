@@ -81,14 +81,14 @@ return function(U)
       local entries = {}
       for _, child in ipairs(root:children()) do
         if child:type() == "document" then
-      for _, doc_child in ipairs(child:children()) do
-        for_each_pair(doc_child, source, function(pair)
-          local e = pair_entry(pair, source, true)
-          if e then
-            entries[#entries + 1] = e
+          for _, doc_child in ipairs(child:children()) do
+            for_each_pair(doc_child, source, function(pair)
+              local e = pair_entry(pair, source, true)
+              if e then
+                entries[#entries + 1] = e
+              end
+            end)
           end
-        end)
-      end
         else
           for_each_pair(child, source, function(pair)
             local e = pair_entry(pair, source, true)
