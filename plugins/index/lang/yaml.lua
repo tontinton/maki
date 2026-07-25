@@ -82,12 +82,24 @@ return function(U)
       for _, child in ipairs(root:children()) do
         if child:type() == "document" then
           for _, doc_child in ipairs(child:children()) do
-            for_each_pair(doc_child, source, function(pair)
-              local e = pair_entry(pair, source, true)
-              if e then
-                entries[#entries + 1] = e
+            local kind = doc_child:type()
+            if kind == "block_node" or kind == "flow_node" then
+              for _, nested in ipairs(doc_child:children()) do
+                for_each_pair(nested, source, function(pair)
+                  local e = pair_entry(pair, source, true)
+                  if e then
+                    entries[#entries + 1] = e
+                  end
+                end)
               end
-            end)
+            else
+              for_each_pair(doc_child, source, function(pair)
+                local e = pair_entry(pair, source, true)
+                if e then
+                  entries[#entries + 1] = e
+                end
+              end)
+            end
           end
         else
           for_each_pair(child, source, function(pair)
