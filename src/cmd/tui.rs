@@ -238,6 +238,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
 
     setup::init_logging(&stack.config.storage);
     setup::install_panic_log_hook();
+    setup::warn_ignored_provider_fields();
 
     if cli.is_sdk_mode() {
         let fast = stack.config.always_fast && stack.model.supports_fast();

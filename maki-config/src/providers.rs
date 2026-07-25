@@ -11,6 +11,8 @@ use maki_storage::paths;
 
 const PROVIDERS_FILE: &str = "providers.toml";
 const BAD_CONFIG_EXIT_CODE: i32 = 2;
+/// The only built-in that reads `enable_free_models`.
+const OPENCODE_SLUG: &str = "opencode";
 
 /// Coarse capability classification used by maki-providers to dispatch tiered
 /// requests. Mirrors `maki_providers::ModelTier` shape but lives here so the
@@ -177,7 +179,7 @@ impl ProvidersConfig {
                 return Self::default();
             }
         };
-        match toml::from_str(&content) {
+        match toml::from_str::<ProvidersConfig>(&content) {
             Ok(config) => {
                 debug!(path = %path.display(), "loaded providers config");
                 config
@@ -255,27 +257,52 @@ pub fn base_url_override(slug: &str) -> Option<String> {
         .filter(|url| !url.is_empty())
 }
 
-pub fn resolve_base_url(slug: &str, def: Option<&ProviderDef>) -> Option<String> {
-    // Env override wins over config and built-in defaults.
+/// Env override then `providers.toml`, without the built-in default. Callers
+/// that already carry a default (the openai-compat layer, whose static default
+/// can be more specific than the inventory one) use this.
+pub fn configured_base_url(slug: &str, def: Option<&ProviderDef>) -> Option<String> {
     if let Some(url) = base_url_override(slug) {
         return Some(url);
     }
-    if let Some(d) = def {
-        if let Some(url) = &d.base_url {
-            return Some(url.clone());
-        }
-        if let Some(plan_name) = &d.plan
-            && let Some(builtin) = builtin_provider(slug)
-            && let Some(plans) = builtin.plans
-        {
-            for (key, plan) in plans {
-                if key == plan_name {
-                    return Some(plan.base_url.to_string());
-                }
-            }
-        }
+    let def = def?;
+    if let Some(url) = &def.base_url {
+        return Some(url.clone());
     }
-    builtin_provider(slug).map(|b| b.default_base_url.to_string())
+    let plan_name = def.plan.as_ref()?;
+    builtin_provider(slug)?
+        .plans?
+        .iter()
+        .find(|(key, _)| key == plan_name)
+        .map(|(_, plan)| plan.base_url.to_string())
+}
+
+pub fn resolve_base_url(slug: &str, def: Option<&ProviderDef>) -> Option<String> {
+    configured_base_url(slug, def)
+        .or_else(|| builtin_provider(slug).map(|b| b.default_base_url.to_string()))
+}
+
+/// Fields a `providers.toml` entry sets that a built-in slug ignores, because
+/// built-ins keep their compiled protocol, model catalog and auth wiring.
+/// Callers decide what counts as built-in (the inventory misses `openrouter`
+/// and `opencode`) and when to report it.
+pub fn ignored_builtin_fields(slug: &str, def: &ProviderDef) -> Vec<&'static str> {
+    let mut ignored = Vec::new();
+    if def.protocol.is_some() {
+        ignored.push("protocol");
+    }
+    if def.api_key_env.is_some() {
+        ignored.push("api_key_env");
+    }
+    if def.discover_models {
+        ignored.push("discover_models");
+    }
+    if !def.models.is_empty() {
+        ignored.push("models");
+    }
+    if def.enable_free_models.is_some() && slug != OPENCODE_SLUG {
+        ignored.push("enable_free_models");
+    }
+    ignored
 }
 
 pub fn resolve_protocol(slug: &str, def: Option<&ProviderDef>) -> Option<Protocol> {
@@ -413,6 +440,95 @@ tier = "{input}"
     #[test_case("my-custom", None => "MY_CUSTOM_API_KEY".to_string(); "custom_default")]
     fn resolve_api_key_env_tests(slug: &str, def: Option<&ProviderDef>) -> String {
         resolve_api_key_env(slug, def)
+    }
+
+    #[test]
+    fn resolve_base_url_prefers_def_over_none() {
+        // Unique slug: `openai` would pick up a real OPENAI_BASE_URL from the shell.
+        let slug = "maki-test-def-over-none-slug";
+        let def = ProviderDef {
+            base_url: Some("http://proxy.local/v1".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_base_url(slug, Some(&def)).as_deref(),
+            Some("http://proxy.local/v1")
+        );
+        assert_ne!(
+            resolve_base_url(slug, Some(&def)),
+            resolve_base_url(slug, None)
+        );
+    }
+
+    #[test]
+    fn resolve_base_url_empty_def_matches_none() {
+        let slug = "maki-test-empty-def-slug";
+        let def = ProviderDef::default();
+        assert_eq!(
+            resolve_base_url(slug, Some(&def)),
+            resolve_base_url(slug, None)
+        );
+    }
+
+    #[test]
+    fn resolve_base_url_custom_slug_uses_def() {
+        let slug = "maki-test-custom-base-url-slug";
+        let def = ProviderDef {
+            base_url: Some("http://xxxx:1234/v1".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_base_url(slug, Some(&def)).as_deref(),
+            Some("http://xxxx:1234/v1")
+        );
+        assert_eq!(resolve_base_url(slug, None), None);
+    }
+
+    #[test]
+    fn resolve_base_url_env_beats_def() {
+        let slug = "maki-test-env-base-url-slug";
+        let env_var = base_url_env_var(slug);
+        // SAFETY: unique test-only var; removed before the test returns.
+        unsafe {
+            std::env::set_var(&env_var, "http://env.local/v1");
+        }
+        let def = ProviderDef {
+            base_url: Some("http://toml.local/v1".into()),
+            ..Default::default()
+        };
+        let got = resolve_base_url(slug, Some(&def));
+        unsafe {
+            std::env::remove_var(&env_var);
+        }
+        assert_eq!(got.as_deref(), Some("http://env.local/v1"));
+    }
+
+    #[test]
+    fn ignored_builtin_fields_lists_custom_only_fields() {
+        let def = ProviderDef {
+            base_url: Some("http://proxy.local/v1".into()),
+            protocol: Some(Protocol::Openai),
+            api_key_env: Some("MY_KEY".into()),
+            discover_models: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            ignored_builtin_fields("anthropic", &def),
+            ["protocol", "api_key_env", "discover_models"]
+        );
+    }
+
+    #[test]
+    fn ignored_builtin_fields_keeps_opencode_free_models() {
+        let def = ProviderDef {
+            enable_free_models: Some(false),
+            ..Default::default()
+        };
+        assert!(ignored_builtin_fields(OPENCODE_SLUG, &def).is_empty());
+        assert_eq!(
+            ignored_builtin_fields("openrouter", &def),
+            ["enable_free_models"]
+        );
     }
 
     #[test_case("MyProvider", "myprovider"; "mixed_case")]

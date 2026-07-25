@@ -50,6 +50,7 @@ pub fn run(model_arg: Option<String>, yolo: bool, no_plugins: bool, no_jit: bool
 
     setup::init_logging(&config.storage);
     setup::install_panic_log_hook();
+    setup::warn_ignored_provider_fields();
 
     let (mcp_handle, _mcp_config_errors) = smol::block_on(maki_agent::mcp::start(&cwd));
 

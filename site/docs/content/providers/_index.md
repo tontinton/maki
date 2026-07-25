@@ -27,6 +27,15 @@ ANTHROPIC_BASE_URL=https://my-proxy.internal maki
 
 It wins over `providers.toml` and built-in defaults. `ANTHROPIC_BASE_URL` and `OPENAI_BASE_URL` are the same names the official SDKs use, so an existing proxy setup carries over as is. One exception: `OPENAI_BASE_URL` only redirects the platform API, never the ChatGPT Coding Plan backend.
 
+You can also set `base_url` for a built-in provider in `~/.config/maki/providers.toml`. It overrides the built-in default and loses to the env var above:
+
+```toml
+[openai]
+base_url = "http://xxxx:1234/v1"
+```
+
+The built-in provider still owns the slug, so `protocol`, `api_key_env`, `discover_models` and `models` are ignored with a warning. Use a custom slug if you need those.
+
 ## Built-in Providers
 
 ### Anthropic
