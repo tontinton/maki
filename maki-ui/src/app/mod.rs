@@ -1117,9 +1117,10 @@ impl App {
                 ChatEventResult::Done => {
                     self.status_bar.clear_flash();
                     self.finish_unresolved_subagents(DisplayRole::Error, ERROR_TEXT);
-                    let shell_ids = self.shell.active_ids().clone();
-                    self.chats[0]
-                        .fail_in_progress_except(MISSING_TOOL_COMPLETION.into(), &shell_ids);
+                    self.chats[0].fail_in_progress_except(
+                        MISSING_TOOL_COMPLETION.into(),
+                        self.shell.active_ids(),
+                    );
                     for chat in self.chats.iter_mut().skip(1) {
                         chat.fail_in_progress_with_message(MISSING_TOOL_COMPLETION.into());
                     }
@@ -1138,8 +1139,7 @@ impl App {
                     self.status_bar.clear_flash();
                     self.subagent_answers.clear();
                     self.finish_unresolved_subagents(DisplayRole::Error, ERROR_TEXT);
-                    let shell_ids = self.shell.active_ids().clone();
-                    self.chats[0].fail_in_progress_except(message.clone(), &shell_ids);
+                    self.chats[0].fail_in_progress_except(message.clone(), self.shell.active_ids());
                     for chat in self.chats.iter_mut().skip(1) {
                         chat.fail_in_progress_with_message(message.clone());
                     }
