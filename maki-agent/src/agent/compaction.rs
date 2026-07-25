@@ -23,6 +23,9 @@ pub(super) async fn compact_history(
 ) -> Result<TokenUsage, AgentError> {
     let compact_start = std::time::Instant::now();
     let mut compaction_history: Vec<Message> = history.as_slice().to_vec();
+    // Nobody said these, and summarising a moment that has passed
+    // buys nothing, so they go before anything else is touched.
+    compaction_history = maki_providers::drop_observations(&compaction_history);
     remove_orphaned_tool_results(&mut compaction_history);
     strip_images(&mut compaction_history);
     strip_thinking(&mut compaction_history);
@@ -599,6 +602,38 @@ mod tests {
                     .flat_map(|message| &message.content)
                     .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
             );
+        });
+    }
+
+    #[test]
+    fn compaction_drops_observations_and_keeps_turns() {
+        smol::block_on(async {
+            let provider = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
+            let mut history = History::new(vec![
+                Message::user("fix the tests".into()),
+                Message::observation("[monitor] build failed".into()),
+                Message::observation("[monitor] build ok".into()),
+            ]);
+            let (raw_tx, _rx) = flume::unbounded();
+
+            compact_history(
+                &provider,
+                &default_model(),
+                &mut history,
+                &EventSender::new(raw_tx, 0),
+                &CancelToken::none(),
+            )
+            .await
+            .unwrap();
+
+            let requests = provider.requests.lock().unwrap();
+            let request = &requests[0];
+            assert!(request.iter().any(|message| {
+                message
+                    .user_text()
+                    .is_some_and(|text| text == "fix the tests")
+            }));
+            assert!(!request.iter().any(Message::is_observation));
         });
     }
 

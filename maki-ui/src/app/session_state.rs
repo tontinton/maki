@@ -94,7 +94,7 @@ impl SessionState {
         permissions: &Arc<PermissionManager>,
     ) {
         if let Some(history) = shared_history {
-            self.session.messages = Vec::clone(&history.load());
+            self.session.messages = maki_providers::drop_observations(&history.load());
         }
         self.session.token_usage = self.token_usage;
         self.session.meta.context_size = self.context_size;
@@ -250,6 +250,27 @@ mod tests {
         let state = SessionState::from_session(session, &test_model(), &storage);
         assert_eq!(state.mode, Mode::Plan);
         assert_eq!(state.plan.path(), Some(plan_file.as_path()));
+    }
+
+    #[test]
+    fn sync_session_does_not_persist_observations() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = StateDir::from_path(tmp.path().to_path_buf());
+        let session = AppSession::new("test-model", "/tmp");
+        let mut state = SessionState::from_session(session, &test_model(), &storage);
+        let history = Some(Arc::new(ArcSwap::from_pointee(vec![
+            Message::user("fix the login bug".into()),
+            Message::observation("build failed".into()),
+        ])));
+        let permissions = Arc::new(PermissionManager::new(
+            maki_config::PermissionsConfig::default(),
+            PathBuf::from("/tmp"),
+        ));
+
+        state.sync_session(&history, &permissions);
+
+        assert_eq!(state.session.messages.len(), 1);
+        assert!(!state.session.messages[0].is_observation());
     }
 
     #[test]

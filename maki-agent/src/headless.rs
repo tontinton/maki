@@ -61,7 +61,7 @@ impl SessionStore {
     }
 
     fn record_turn(&mut self, messages: &[Message], model_spec: String) {
-        self.session.messages = messages.to_vec();
+        self.session.messages = maki_providers::drop_observations(messages);
         self.session.model = model_spec;
         self.session.update_title_if_default();
         self.save();
@@ -539,6 +539,23 @@ mod tests {
         let loaded = load(&tmp);
         assert_eq!(loaded.messages.len(), 1);
         assert_eq!(loaded.title, generate_title(&messages));
+    }
+
+    #[test]
+    fn record_turn_does_not_persist_observations() {
+        let tmp = TempDir::new().unwrap();
+        let mut store = store_in(&tmp);
+        store.record_turn(
+            &[
+                Message::user("fix the login bug".into()),
+                Message::observation("build failed".into()),
+            ],
+            MODEL_SPEC.into(),
+        );
+
+        let loaded = load(&tmp);
+        assert_eq!(loaded.messages.len(), 1);
+        assert!(!loaded.messages[0].is_observation());
     }
 
     #[test]
