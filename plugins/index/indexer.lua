@@ -52,9 +52,9 @@ local EXT_TO_LANG = {
   yaml = "yaml",
   yml = "yaml",
   sql = "sql",
-  astro = "astro",
-  svelte = "svelte",
-  vue = "vue",
+  astro = "html",
+  svelte = "html",
+  vue = "html",
 }
 
 local FILENAME_TO_LANG = {
@@ -828,8 +828,11 @@ local function validate_lang(name, lang)
   end
 end
 
-local LANG_ALIASES = {
+ local LANG_ALIASES = {
   javascript = "typescript",
+  astro = "html",
+  svelte = "html",
+  vue = "html",
 }
 
 local function unique_langs()
