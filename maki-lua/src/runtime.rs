@@ -4,6 +4,7 @@ use std::ffi::c_int;
 use std::future::Future;
 use std::panic::catch_unwind;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::ptr;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
@@ -317,6 +318,10 @@ pub(crate) struct TaskCell {
     /// When `Some`, `maki.async.run` tasks queue here instead of the global
     /// `SpawnQueue` so restore can run them inline before snapshotting.
     pub(crate) inline_spawn: Option<Vec<PendingAsyncTask>>,
+    /// `maki.async.on_cancel` callbacks, fired once by [`ScopedFuture::poll`]
+    /// and dropped, so a handler parked in an await still gets to paint the
+    /// cancelled state before the host stops waiting for it.
+    cancel_hooks: Vec<RegistryKey>,
     /// Set by [`TaskScope::new`]; `enqueue_async_task` upgrades it so queued
     /// tasks share ownership of `bufs`. See [`BufsClaim`].
     bufs_claim: Weak<BufsClaim>,
@@ -339,6 +344,7 @@ impl TaskCell {
             root_buf: None,
             live_sink: None,
             inline_spawn: None,
+            cancel_hooks: Vec::new(),
             bufs_claim: Weak::new(),
         }
     }
@@ -380,6 +386,14 @@ impl TaskCell {
     fn renew_kill_grace(&self) {
         self.kill_at.set(None);
     }
+
+    /// Hooks of a task that ended without a cancel never fire, so this is
+    /// the only thing that unpins their closures and captures.
+    fn clear_cancel_hooks(&mut self, lua: &Lua) {
+        for key in self.cancel_hooks.drain(..) {
+            lua.remove_registry_value(key).ok();
+        }
+    }
 }
 
 pub(crate) type TaskHandle = Arc<Mutex<TaskCell>>;
@@ -398,6 +412,37 @@ struct WarmTool {
 
 pub(crate) fn lock_cell(handle: &TaskHandle) -> std::sync::MutexGuard<'_, TaskCell> {
     handle.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Backs `maki.async.on_cancel`. An already cancelled task has no
+/// transition left for [`ScopedFuture::poll`] to ride, so it fires inline,
+/// and only after registering, so a raising hook is contained either way
+/// instead of blowing up whoever armed it.
+pub(crate) fn register_cancel_hook(lua: &Lua, callback: Function) -> Result<(), mlua::Error> {
+    let handle = active_task(lua);
+    let key = lua.create_registry_value(callback)?;
+    let cancelled = {
+        let mut cell = lock_cell(&handle);
+        cell.cancel_hooks.push(key);
+        cell.cancel.is_cancelled()
+    };
+    if cancelled {
+        fire_cancel_hooks(lua, &handle);
+    }
+    Ok(())
+}
+
+fn fire_cancel_hooks(lua: &Lua, handle: &TaskHandle) {
+    let hooks = std::mem::take(&mut lock_cell(handle).cancel_hooks);
+    for key in hooks {
+        if let Err(e) = lua
+            .registry_value::<Function>(&key)
+            .and_then(|f| f.call::<()>(()))
+        {
+            tracing::warn!(error = %strip_traceback(&e), "cancel hook failed");
+        }
+        lua.remove_registry_value(key).ok();
+    }
 }
 
 /// The buf whose click handler owns this task's clicks: the explicit root
@@ -729,11 +774,7 @@ impl TaskScope {
     }
 
     pub(crate) fn scope_future<F>(&self, inner: F) -> ScopedFuture<F> {
-        ScopedFuture {
-            lua: self.lua.clone(),
-            handle: Arc::clone(&self.handle),
-            inner,
-        }
+        ScopedFuture::new(self.lua.clone(), Arc::clone(&self.handle), inner)
     }
 }
 
@@ -771,6 +812,7 @@ impl Drop for TaskScope {
             let mut cell = lock_cell(&self.handle);
             cell.jobs.kill_all();
             cell.jobs.clear(&self.lua);
+            cell.clear_cancel_hooks(&self.lua);
         }
         match self.prev.take() {
             Some(p) => {
@@ -788,13 +830,30 @@ impl Drop for TaskScope {
 pub(crate) struct ScopedFuture<F> {
     lua: Lua,
     handle: TaskHandle,
+    /// Waker registration on the task's token, dropped once the hooks have
+    /// fired. Without it nothing would poll us while the handler sits parked
+    /// in an await, and the hooks would wait on a child event that may
+    /// never come.
+    cancel_wait: Option<Pin<Box<dyn Future<Output = ()>>>>,
     inner: F,
+}
+
+impl<F> ScopedFuture<F> {
+    fn new(lua: Lua, handle: TaskHandle, inner: F) -> Self {
+        let cancel = lock_cell(&handle).cancel.clone();
+        Self {
+            lua,
+            handle,
+            cancel_wait: Some(Box::pin(async move { cancel.cancelled().await })),
+            inner,
+        }
+    }
 }
 
 impl<F: Future> Future for ScopedFuture<F> {
     type Output = F::Output;
     fn poll(
-        self: std::pin::Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
         // SAFETY: `inner` is structurally pinned; `lua`/`handle` are
@@ -805,7 +864,13 @@ impl<F: Future> Future for ScopedFuture<F> {
         let prev = this
             .lua
             .set_app_data::<TaskHandle>(Arc::clone(&this.handle));
-        let result = unsafe { std::pin::Pin::new_unchecked(&mut this.inner) }.poll(cx);
+        if let Some(wait) = this.cancel_wait.as_mut()
+            && wait.as_mut().poll(cx).is_ready()
+        {
+            this.cancel_wait = None;
+            fire_cancel_hooks(&this.lua, &this.handle);
+        }
+        let result = unsafe { Pin::new_unchecked(&mut this.inner) }.poll(cx);
         match prev {
             Some(p) => {
                 this.lua.set_app_data(p);
@@ -830,6 +895,21 @@ pub(crate) fn with_task_jobs<R>(lua: &Lua, f: impl FnOnce(&mut JobStore) -> R) -
 
 pub(crate) fn with_task_bufs<R>(lua: &Lua, f: impl FnOnce(&mut BufferStore) -> R) -> R {
     f(&mut lock_cell(&active_task(lua)).bufs)
+}
+
+/// A working wake lands in microseconds, so this is only about failing in
+/// seconds instead of parking until nextest gives up on the suite.
+#[cfg(test)]
+const TEST_WAKE_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const TEST_WAKE_TIMEOUT_MSG: &str = "timed out waiting for a cancelled task to wake";
+
+#[cfg(test)]
+pub(crate) fn block_on_or_fail<T>(fut: impl Future<Output = T>) -> T {
+    smol::block_on(futures_lite::future::or(fut, async {
+        smol::Timer::after(TEST_WAKE_TIMEOUT).await;
+        panic!("{TEST_WAKE_TIMEOUT_MSG}");
+    }))
 }
 
 #[cfg(test)]
@@ -2568,11 +2648,8 @@ pub fn spawn(
                             };
                             ex.spawn(async move {
                                 let _gate_guard = g.acquire().await;
-                                let call = ScopedFuture {
-                                    lua: lua.clone(),
-                                    handle,
-                                    inner: func.call_async::<()>(arg),
-                                };
+                                let call =
+                                    ScopedFuture::new(lua.clone(), handle, func.call_async::<()>(arg));
                                 if let Err(e) = call.await {
                                     tracing::warn!(tool_use_id, error = %e, "live click failed");
                                 }
@@ -2674,6 +2751,11 @@ pub fn spawn(
 mod tests {
     use super::*;
     use crate::api::tool::ToolCallReply;
+    use futures_lite::future::poll_once;
+    use maki_agent::cancel::CancelTrigger;
+    use std::future::poll_fn;
+    use std::task::Poll;
+    use test_case::test_case;
 
     fn make_buf_handle(text: &str) -> BufHandle {
         let buf = Arc::new(maki_agent::SharedBuf::new());
@@ -3205,6 +3287,351 @@ mod tests {
         smol::block_on(scope.scope_future(std::future::ready(())));
 
         assert!(lock_cell(&handle).kill_at.get().is_none());
+    }
+
+    const HOOK_MARKS: [&str; 3] = ["first", "second", "third"];
+    const HOOK_GOOD_MARK: &str = "good";
+    const HOOK_NESTED_MARK: &str = "nested";
+    const HOOK_RAISES: &str = "error('hook blew up')";
+    const HOOK_YIELDS: &str = "coroutine.yield()";
+    const HOOK_POLL_ROUNDS: usize = 3;
+    const HOOK_INNER_OUTPUT: u8 = 7;
+    const HOOK_NEVER_FIRED: &str = "cancel hook never fired";
+    const HOOK_SKIPPED_MSG: &str = "a hook registered after the bad one never fired";
+
+    fn recording_hook(lua: &Lua, tx: &flume::Sender<&'static str>, mark: &'static str) {
+        let tx = tx.clone();
+        let hook = lua
+            .create_function(move |_, ()| {
+                tx.send(mark).ok();
+                Ok(())
+            })
+            .unwrap();
+        register_cancel_hook(lua, hook).unwrap();
+    }
+
+    fn live_scope(lua: &Lua) -> (CancelTrigger, TaskScope) {
+        let (trigger, token) = CancelToken::new();
+        (
+            trigger,
+            TaskScope::new(lua, TaskCell::new(token, None, None)),
+        )
+    }
+
+    /// The token is already tripped, so the cancel branch is ready on the
+    /// first poll and no waker round trip is needed.
+    fn poll_cancelled_scope_once(scope: &TaskScope) {
+        let mut fut = scope.scope_future(std::future::pending::<()>());
+        assert!(smol::block_on(poll_once(&mut fut)).is_none());
+    }
+
+    /// A hook armed after the token tripped has no transition left to ride, so
+    /// it fires inline, whether a plugin or another hook armed it. The nested
+    /// case also pins the lock discipline: `fire_cancel_hooks` must not hold
+    /// the cell across a hook.
+    #[test]
+    fn cancel_hook_registered_after_the_cancel_fires_inline() {
+        let lua = Lua::new();
+        let scope = TaskScope::new(&lua, TaskCell::new(cancelled_token(), None, None));
+        let (tx, fired_rx) = flume::unbounded();
+        let outer = lua
+            .create_function(move |lua, ()| {
+                tx.send(HOOK_GOOD_MARK).ok();
+                let tx = tx.clone();
+                let nested = lua.create_function(move |_, ()| {
+                    tx.send(HOOK_NESTED_MARK).ok();
+                    Ok(())
+                })?;
+                register_cancel_hook(lua, nested)
+            })
+            .unwrap();
+
+        register_cancel_hook(&lua, outer).unwrap();
+
+        assert_eq!(
+            fired_rx.try_iter().collect::<Vec<_>>(),
+            [HOOK_GOOD_MARK, HOOK_NESTED_MARK],
+            "{HOOK_NEVER_FIRED}"
+        );
+        assert!(
+            lock_cell(scope.handle()).cancel_hooks.is_empty(),
+            "a hook that already fired must not be kept for the next poll"
+        );
+    }
+
+    /// Hooks are cleanup steps stacked as the handler nests deeper, so every
+    /// one runs, in registration order. A hook that raises, or yields from
+    /// outside its coroutine, is one plugin's bug and must not cost the later
+    /// plugins their cleanup.
+    #[test_case(HOOK_RAISES ; "raising")]
+    #[test_case(HOOK_YIELDS ; "yielding")]
+    fn cancel_hooks_all_fire_in_order_despite_a_bad_one(bad_body: &str) {
+        let lua = Lua::new();
+        let (trigger, scope) = live_scope(&lua);
+        let bad = lua.load(bad_body).into_function().unwrap();
+        register_cancel_hook(&lua, bad).unwrap();
+        let (fired_tx, fired_rx) = flume::unbounded();
+        for mark in HOOK_MARKS {
+            recording_hook(&lua, &fired_tx, mark);
+        }
+        trigger.cancel();
+
+        poll_cancelled_scope_once(&scope);
+
+        assert_eq!(
+            fired_rx.try_iter().collect::<Vec<_>>(),
+            HOOK_MARKS,
+            "{HOOK_SKIPPED_MSG}"
+        );
+    }
+
+    /// `scope_future` nests, a handler's scope wrapping the `gather` that
+    /// parks it, so several levels see the token go ready in one poll and
+    /// every later poll sees it ready again. Cleanup that runs twice repaints
+    /// over what the abandon path already put on screen.
+    #[test]
+    fn cancel_hook_fires_once_across_nested_scopes_and_repeated_polls() {
+        let lua = Lua::new();
+        let (trigger, scope) = live_scope(&lua);
+        let (fired_tx, fired_rx) = flume::unbounded();
+        recording_hook(&lua, &fired_tx, HOOK_GOOD_MARK);
+        trigger.cancel();
+
+        let mut nested = scope.scope_future(scope.scope_future(std::future::pending::<()>()));
+        for _ in 0..HOOK_POLL_ROUNDS {
+            assert!(smol::block_on(poll_once(&mut nested)).is_none());
+        }
+
+        assert_eq!(fired_rx.try_iter().count(), 1);
+    }
+
+    /// The `RegistryKey` is the last reference to a hook, so holding it pins
+    /// the closure and its captures for the VM's whole life. Both endings must
+    /// let go: fired, or dropped with a task that was never cancelled, which
+    /// mlua only reclaims on some later registry op.
+    #[test_case(true ; "after firing")]
+    #[test_case(false ; "when an uncancelled scope ends")]
+    fn cancel_hook_registry_value_is_released(cancel: bool) {
+        let lua = Lua::new();
+        let captured = Arc::new(());
+        let held = Arc::clone(&captured);
+        let (trigger, scope) = live_scope(&lua);
+        let hook = lua
+            .create_function(move |_, ()| {
+                let _ = &held;
+                Ok(())
+            })
+            .unwrap();
+        register_cancel_hook(&lua, hook).unwrap();
+
+        if cancel {
+            trigger.cancel();
+            poll_cancelled_scope_once(&scope);
+        } else {
+            drop(scope);
+        }
+        lua.gc_collect().unwrap();
+        lua.gc_collect().unwrap();
+
+        assert_eq!(Arc::strong_count(&captured), 1);
+    }
+
+    /// With a sibling's handle in app_data the hook would repaint the
+    /// sibling's bufs. The sibling has to get app_data back once the poll is
+    /// over, and its own hooks must not ride someone else's cancel.
+    #[test]
+    fn cancel_hook_runs_under_its_own_task_handle() {
+        let lua = Lua::new();
+        let (trigger, scope) = live_scope(&lua);
+        let (seen_tx, seen_rx) = flume::bounded(1);
+        let hook = lua
+            .create_function(move |lua, ()| {
+                seen_tx.send(active_task(lua)).ok();
+                Ok(())
+            })
+            .unwrap();
+        register_cancel_hook(&lua, hook).unwrap();
+        let (_sibling_trigger, sibling) = live_scope(&lua);
+        let (sibling_tx, sibling_rx) = flume::bounded(1);
+        recording_hook(&lua, &sibling_tx, HOOK_GOOD_MARK);
+        trigger.cancel();
+
+        poll_cancelled_scope_once(&scope);
+
+        let seen = seen_rx.try_recv().expect(HOOK_NEVER_FIRED);
+        assert!(Arc::ptr_eq(&seen, scope.handle()));
+        assert!(Arc::ptr_eq(&active_task(&lua), sibling.handle()));
+        assert!(
+            sibling_rx.try_recv().is_err(),
+            "an uncancelled task's hook must not fire with a sibling's cancel"
+        );
+    }
+
+    /// The whole point of the hook: a handler parked in an await runs no Lua
+    /// of its own, so only the token's waker can get its cleanup on screen
+    /// before the abandon window. The cancel branch and the inner future share
+    /// that one waker, so if firing swallowed the poll, a handler finishing
+    /// right after the cancel would hang instead of returning its output.
+    #[test]
+    fn cancel_hook_fires_on_a_parked_task_and_leaves_it_wakeable() {
+        let lua = Lua::new();
+        let (trigger, scope) = live_scope(&lua);
+        let (fired_tx, fired_rx) = flume::bounded(1);
+        recording_hook(&lua, &fired_tx, HOOK_GOOD_MARK);
+        let (item_tx, item_rx) = flume::bounded(1);
+
+        let out = block_on_or_fail(futures_lite::future::or(
+            scope.scope_future(async move { item_rx.recv_async().await.unwrap() }),
+            async move {
+                trigger.cancel();
+                assert_eq!(fired_rx.recv_async().await.ok(), Some(HOOK_GOOD_MARK));
+                item_tx.send(HOOK_INNER_OUTPUT).unwrap();
+                std::future::pending().await
+            },
+        ));
+
+        assert_eq!(out, HOOK_INNER_OUTPUT);
+        assert!(
+            lock_cell(scope.handle()).cancel_hooks.is_empty(),
+            "a fired hook must not be kept for a second cancel"
+        );
+    }
+
+    /// Order is the whole guarantee: a handler whose last await resolves on
+    /// the very poll the cancel lands returns straight away, and the scope
+    /// dropping behind it clears its hooks unfired. Firing after the inner
+    /// poll would skip the cleanup silently, with nothing on screen.
+    #[test]
+    fn cancel_hooks_fire_before_an_inner_future_that_is_ready_at_once() {
+        let lua = Lua::new();
+        let (trigger, scope) = live_scope(&lua);
+        let inner_ran = Arc::new(AtomicBool::new(false));
+        let seen_by_hook = Arc::clone(&inner_ran);
+        let (fired_tx, fired_rx) = flume::bounded(1);
+        let hook = lua
+            .create_function(move |_, ()| {
+                fired_tx.send(seen_by_hook.load(Ordering::SeqCst)).ok();
+                Ok(())
+            })
+            .unwrap();
+        register_cancel_hook(&lua, hook).unwrap();
+        trigger.cancel();
+
+        let out = smol::block_on(scope.scope_future(poll_fn(move |_| {
+            inner_ran.store(true, Ordering::SeqCst);
+            Poll::Ready(HOOK_INNER_OUTPUT)
+        })));
+
+        assert_eq!(
+            out, HOOK_INNER_OUTPUT,
+            "the scope must still yield the handler's result"
+        );
+        assert!(
+            !fired_rx.try_recv().expect(HOOK_NEVER_FIRED),
+            "the hook must run before the inner future gets its poll"
+        );
+    }
+
+    /// The fire takes the whole list first, so a hook that arms another one
+    /// re-enters `fire_cancel_hooks` from inside itself. That must terminate
+    /// and leave nothing unfired; where the new hook lands among the queued
+    /// ones is not a promise anyone can lean on.
+    #[test]
+    fn cancel_hook_registered_mid_fire_still_fires_every_hook_once() {
+        let lua = Lua::new();
+        let (trigger, scope) = live_scope(&lua);
+        let (fired_tx, fired_rx) = flume::unbounded();
+        let tx = fired_tx.clone();
+        let arming = lua
+            .create_function(move |lua, ()| {
+                tx.send(HOOK_MARKS[0]).ok();
+                recording_hook(lua, &tx, HOOK_NESTED_MARK);
+                Ok(())
+            })
+            .unwrap();
+        register_cancel_hook(&lua, arming).unwrap();
+        for mark in HOOK_MARKS.into_iter().skip(1) {
+            recording_hook(&lua, &fired_tx, mark);
+        }
+        trigger.cancel();
+
+        poll_cancelled_scope_once(&scope);
+
+        let mut fired = fired_rx.try_iter().collect::<Vec<_>>();
+        fired.sort_unstable();
+        let mut expected = HOOK_MARKS.to_vec();
+        expected.push(HOOK_NESTED_MARK);
+        expected.sort_unstable();
+        assert_eq!(fired, expected, "{HOOK_SKIPPED_MSG}");
+        assert!(
+            lock_cell(scope.handle()).cancel_hooks.is_empty(),
+            "a re-entrant fire must not leave a hook behind"
+        );
+    }
+
+    const HOOK_PARENT_MARK: &str = "parent";
+    const HOOK_CHILD_MARK: &str = "child";
+    const HOOK_CHILD_WORK: &str = "arm(); park()";
+    const HOOK_ARM_FN: &str = "arm";
+    const HOOK_PARK_FN: &str = "park";
+
+    /// A `maki.async.run` task gets its own cell but inherits the parent's
+    /// token, so a hook armed inside it fires on the parent's cancel even
+    /// though nothing else polls that task. Only its own hooks: parent and
+    /// siblings share that token, and reading the wrong cell would clean up
+    /// bufs it never owned.
+    #[test]
+    fn cancel_hook_in_a_spawned_task_fires_on_the_inherited_cancel() {
+        let lua = Lua::new();
+        let (trigger, parent) = live_scope(&lua);
+        let (fired_tx, fired_rx) = flume::unbounded();
+        recording_hook(&lua, &fired_tx, HOOK_PARENT_MARK);
+
+        let (armed_tx, armed_rx) = flume::bounded(1);
+        let tx = fired_tx.clone();
+        let arm = lua
+            .create_function(move |lua, ()| {
+                recording_hook(lua, &tx, HOOK_CHILD_MARK);
+                armed_tx.send(()).ok();
+                Ok(())
+            })
+            .unwrap();
+        let park = lua
+            .create_async_function(|_, ()| std::future::pending::<Result<(), mlua::Error>>())
+            .unwrap();
+        lua.globals().set(HOOK_ARM_FN, arm).unwrap();
+        lua.globals().set(HOOK_PARK_FN, park).unwrap();
+        let work_fn = lua
+            .create_registry_value(lua.load(HOOK_CHILD_WORK).into_function().unwrap())
+            .unwrap();
+        let task = PendingAsyncTask {
+            work_fn,
+            cancel: lock_cell(parent.handle()).cancel.clone(),
+            deadline: None,
+            live_ctx: None,
+            owner: None,
+        };
+
+        let ex = Rc::new(smol::LocalExecutor::new());
+        block_on_or_fail(ex.run(async {
+            spawn_async_task(&lua, &ex, &Rc::new(gate()), task);
+            armed_rx.recv_async().await.unwrap();
+            trigger.cancel();
+            assert_eq!(fired_rx.recv_async().await.ok(), Some(HOOK_CHILD_MARK));
+        }));
+
+        assert!(
+            fired_rx.is_empty(),
+            "the parent's hook must not ride the child's fire"
+        );
+
+        poll_cancelled_scope_once(&parent);
+
+        assert_eq!(
+            fired_rx.try_iter().collect::<Vec<_>>(),
+            [HOOK_PARENT_MARK],
+            "the parent must fire its own hook, once, and not the child's"
+        );
     }
 
     const DISPATCH_TEST_JOB: &str = "sleep 1";

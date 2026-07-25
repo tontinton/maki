@@ -2,6 +2,7 @@
 //! `maki.async.gather`, with tool dispatch replaced by a scriptable Lua stub.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use maki_agent::cancel::CancelToken;
 use maki_agent::tools::test_support::{stub_ctx, stub_ctx_with};
@@ -27,17 +28,30 @@ const SUMMARY_MIXED_FMT: &str = "Executed {}/{} successfully. {} failed.";
 
 const BATCH_TOOL: &str = "batch";
 const PROBE_TOOL: &str = "probe";
+const OK_TOOL: &str = "ok";
+const PARKJOB_TOOL: &str = "parkjob";
+/// A second parked child, so one of the two can carry its own restore.
+const PARKJOB_HL_TOOL: &str = "parkjob_hl";
+const CMD_TOOL: &str = "cmd";
+const BOOM_TOOL: &str = "boom";
 const BOOM_ERR: &str = "stub tool exploded";
 const CHILD_USAGE: &str = "12.3k↑ 456↓ $0.123";
-/// How long the `slow` stub parks, in graces: past a whole one, so a
-/// cancelled batch only survives if yielding renews the grace.
-const SLOW_PARK_GRACES: f32 = 1.5;
-/// CPU the `slow` stub burns before it yields, well past the 10ms watchdog
-/// poll so a poke lands while the token is already tripped.
-const BURN_SECS: f32 = 0.02;
 /// Wildly generous vs the expected kill (one poll plus one
 /// [`KILL_GRACE`]); only a watchdog that never fires gets here.
 const RUNAWAY_BUDGET_GRACES: u32 = 20;
+/// How long a `parkjob` child sits in an await that ignores the token, like a
+/// child tool mid-request. It only has to outlast the cancel that follows the
+/// first paint, and stay well inside the host's 5s abandon window.
+const PARK_SECS: f32 = 2.0;
+const PAINT_POLL_INTERVAL: Duration = Duration::from_millis(5);
+/// Deliberately generous: no assertion here is a race against the clock,
+/// so a slow machine costs time only when a test is already failing.
+const PAINT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Only a batch that never settles waits this long.
+const BATCH_RESULT_TIMEOUT: Duration = Duration::from_secs(10);
+const SPINNER_STYLE: &str = "spinner";
+const ERROR_STYLE: &str = "tool_error";
+const SUCCESS_STYLE: &str = "tool_success";
 
 /// `maki.agent.call_tool` is stubbed; `maki.async.gather` and the semaphore
 /// stay real, so the park/release pair proves children genuinely overlap.
@@ -74,11 +88,12 @@ maki.agent.call_tool = function(ctx, name, input, opts)
     return "released_done"
   elseif name == "boom" then
     return nil, "@BOOM_ERR@"
-  elseif name == "slow" then
-    local t = os.clock()
-    while os.clock() - t < @BURN_SECS@ do end
-    maki.fn.jobwait(maki.fn.jobstart("sleep @SLOW_SECS@"))
-    return "slow_done"
+  elseif name:find("^parkjob") then
+    -- Parks in an await that ignores the token, like a real child tool
+    -- waiting on a request. Any `parkjob*` name parks, so a test can give
+    -- one of them its own restore.
+    maki.fn.jobwait(maki.fn.jobstart("sleep @PARK_SECS@"))
+    return "parkjob_done"
   elseif name == "spin" then
     -- Never yields, so nothing but the watchdog can end it.
     while true do end
@@ -141,19 +156,23 @@ maki.api.register_tool({
 "#;
 
 fn load_batch_host() -> (Arc<ToolRegistry>, PluginHost) {
+    load_batch_host_with("")
+}
+
+/// `child_src` registers extra child tools next to the stub ones, so a
+/// test can give a child its own header/restore behaviour.
+fn load_batch_host_with(child_src: &str) -> (Arc<ToolRegistry>, PluginHost) {
     let reg = Arc::new(ToolRegistry::new());
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    let park = KILL_GRACE
-        .mul_f32(SLOW_PARK_GRACES)
-        .as_secs_f32()
-        .to_string();
     let prelude = STUB_PRELUDE
         .replace("@BOOM_ERR@", BOOM_ERR)
         .replace("@CHILD_USAGE@", CHILD_USAGE)
-        .replace("@SLOW_SECS@", &park)
-        .replace("@BURN_SECS@", &BURN_SECS.to_string());
-    host.load_source("batch_policy", &format!("{prelude}\n{BATCH_PLUGIN_SRC}"))
-        .unwrap();
+        .replace("@PARK_SECS@", &PARK_SECS.to_string());
+    host.load_source(
+        "batch_policy",
+        &format!("{prelude}\n{child_src}\n{BATCH_PLUGIN_SRC}"),
+    )
+    .unwrap();
     (reg, host)
 }
 
@@ -259,16 +278,13 @@ fn all_success_exact_llm_output() {
 /// the batch survives and reports it cancelled like any other child.
 #[test]
 fn runaway_child_under_cancel_still_terminates() {
-    let (tx, rx) = flume::bounded(1);
-    std::thread::spawn(move || {
-        let (reg, _host) = load_batch_host();
-        tx.send(run_cancelled_batch(
-            &reg,
-            json!([{ "tool": "spin", "parameters": {} }]),
-        ))
-        .ok();
-    });
-    let outcome = rx
+    let batch = start_batch(json!([{ "tool": "spin", "parameters": {} }]));
+    assert_indicators(&batch.body, SPINNER_STYLE, 1, PAINT_TIMEOUT);
+
+    batch.trigger.cancel();
+
+    let outcome = batch
+        .result
         .recv_timeout(KILL_GRACE * RUNAWAY_BUDGET_GRACES)
         .expect("a never-yielding child must be killed, not run forever");
     let expected = format!(
@@ -279,30 +295,162 @@ fn runaway_child_under_cancel_still_terminates() {
     assert_eq!(outcome, Ok(expected));
 }
 
-/// The bug this guards: after esc, inner tools froze as in-progress
-/// forever because the batch handler died at its first armed safepoint.
-/// Here `slow` parks past a whole [`KILL_GRACE`] and still reports its
-/// real output, which only works if resuming from the await renews the
-/// grace, while `park` loses its race with the tripped token and must be
-/// the only child the end-of-run sweep marks cancelled.
+/// A batch running on its own thread, with what a cancel test needs to press
+/// esc at a chosen moment: the buf it paints into, the trigger, and where its
+/// result lands.
+struct RunningBatch {
+    trigger: maki_agent::cancel::CancelTrigger,
+    body: Arc<maki_agent::SharedBuf>,
+    result: flume::Receiver<Result<String, String>>,
+    /// Kept alive so the handler's later events still have a receiver.
+    _events: flume::Receiver<maki_agent::Envelope>,
+}
+
+fn start_batch(tool_calls: Value) -> RunningBatch {
+    start_batch_with(String::new(), tool_calls)
+}
+
+fn start_batch_with(child_src: String, tool_calls: Value) -> RunningBatch {
+    let (event_tx, events) = flume::unbounded();
+    let event_tx = EventSender::new(event_tx, 0);
+    let (trigger, token) = CancelToken::new();
+    let (result_tx, result) = flume::bounded(1);
+    std::thread::spawn(move || {
+        let (reg, _host) = load_batch_host_with(&child_src);
+        let mut ctx = stub_ctx_with(&AgentMode::Build, Some(&event_tx), Some(BATCH_ID));
+        ctx.cancel = token;
+        let input = batch_input(tool_calls);
+        result_tx
+            .send(exec_with_ctx(&reg, BATCH_TOOL, input, &ctx).map(output_text))
+            .ok();
+    });
+    RunningBatch {
+        trigger,
+        body: recv_live_buf(&events),
+        result,
+        _events: events,
+    }
+}
+
+fn recv_live_buf(rx: &flume::Receiver<maki_agent::Envelope>) -> Arc<maki_agent::SharedBuf> {
+    let deadline = Instant::now() + PAINT_TIMEOUT;
+    while let Ok(env) = rx.recv_deadline(deadline) {
+        if let AgentEvent::LiveToolBuf { id, body } = env.event
+            && id == BATCH_ID
+        {
+            return body;
+        }
+    }
+    panic!("batch must publish its live buf");
+}
+
+/// A child header opens with the indicator span the batch draws for its
+/// status, so counting one style counts the children in that state.
+fn wait_for_indicators(
+    buf: &maki_agent::SharedBuf,
+    style: &str,
+    want: usize,
+    budget: Duration,
+) -> bool {
+    let wanted = SpanStyle::Named(style.to_owned());
+    let deadline = Instant::now() + budget;
+    loop {
+        let got = buf
+            .take()
+            .lines
+            .iter()
+            .filter(|l| l.spans.first().is_some_and(|s| s.style == wanted))
+            .count();
+        if got == want {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(PAINT_POLL_INTERVAL);
+    }
+}
+
+fn assert_indicators(buf: &maki_agent::SharedBuf, style: &str, want: usize, budget: Duration) {
+    assert!(
+        wait_for_indicators(buf, style, want, budget),
+        "expected {want} {style} children"
+    );
+}
+
+/// The bug esc still had: the token reaches neither `call_tool` nor `gather`,
+/// so a child parked in a request stayed drawn as running until the host
+/// abandoned the handler seconds later. Only the cancel hook can repaint one,
+/// so no budget here has to be tight: a sweep that waits for `gather` finds
+/// both parked children back as plain successes, however long we wait.
+///
+/// That sweep runs outside the coroutine, where a child restore that awaits
+/// raises, and one such body must not swallow the rest of the sweep. Children
+/// that already finished keep their own status and output.
 #[test]
-fn cancelled_sweep_keeps_a_finished_childs_output() {
+fn cancel_mid_flight_repaints_parked_children_and_spares_finished_ones() {
+    let batch = start_batch_with(
+        hl_child_src(PARKJOB_HL_TOOL),
+        json!([
+            { "tool": OK_TOOL, "parameters": { "tag": "a" } },
+            { "tool": PARKJOB_TOOL, "parameters": {} },
+            { "tool": PARKJOB_HL_TOOL, "parameters": {} },
+            { "tool": BOOM_TOOL, "parameters": {} },
+        ]),
+    );
+    for (style, want) in [(SUCCESS_STYLE, 1), (ERROR_STYLE, 1), (SPINNER_STYLE, 2)] {
+        assert_indicators(&batch.body, style, want, PAINT_TIMEOUT);
+    }
+
+    batch.trigger.cancel();
+
+    assert_indicators(&batch.body, ERROR_STYLE, 3, PAINT_TIMEOUT);
+    assert_indicators(&batch.body, SPINNER_STYLE, 0, Duration::ZERO);
+    assert_indicators(&batch.body, SUCCESS_STYLE, 1, Duration::ZERO);
+
+    let cancelled = format!("{ERROR_PREFIX}{CANCELLED_ERROR}");
+    let expected = format!(
+        "{}{}{}{}{}",
+        section(OK_TOOL, "ok:a"),
+        section(PARKJOB_TOOL, &cancelled),
+        section(PARKJOB_HL_TOOL, &cancelled),
+        section(BOOM_TOOL, &format!("{ERROR_PREFIX}{BOOM_ERR}")),
+        summary_mixed(1, 4, 3)
+    );
+    let settled = batch
+        .result
+        .recv_timeout(BATCH_RESULT_TIMEOUT)
+        .expect("batch must settle instead of hanging on its cancelled children");
+    assert_eq!(settled, Ok(expected));
+}
+
+/// Esc pressed before the batch is even dispatched: the handler still runs
+/// (only `maki.async.run` spawns are skipped on a cancelled token) and
+/// `gather` runs every fun it was handed, so only the batch itself can stop a
+/// swept child from executing anyway. A child born terminal keeps its own
+/// error, so the two sweeps never settle the same child twice.
+#[test]
+fn cancelled_batch_dispatches_nothing_and_keeps_born_terminal_errors() {
     let (reg, _host) = load_batch_host();
     let out = run_cancelled_batch(
         &reg,
         json!([
-            { "tool": "slow", "parameters": {} },
-            { "tool": "park", "parameters": {} },
+            { "tool": BATCH_TOOL, "parameters": { "tool_calls": [] } },
+            { "tool": OK_TOOL, "parameters": { "tag": "a" } },
         ]),
     )
-    .expect("cancelled batch must settle, not die to the interrupt");
+    .expect("the second sweep must not resettle an already cancelled child");
     let expected = format!(
         "{}{}{}",
-        section("slow", "slow_done"),
-        section("park", &format!("{ERROR_PREFIX}{CANCELLED_ERROR}")),
-        summary_mixed(1, 2, 1)
+        section(BATCH_TOOL, &format!("{ERROR_PREFIX}{NESTED_ERROR}")),
+        section(OK_TOOL, &format!("{ERROR_PREFIX}{CANCELLED_ERROR}")),
+        summary_mixed(0, 2, 2)
     );
     assert_eq!(out, expected);
+    assert!(
+        recorded_calls(&reg).is_empty(),
+        "a batch cancelled before it starts must dispatch nothing"
+    );
 }
 
 #[test]
@@ -938,7 +1086,7 @@ fn async_highlight_tasks_never_shrink_and_reach_final_snapshot() {
 /// must not throw out of the `get_tool` wrapper.
 #[test]
 fn child_restore_awaiting_async_api_keeps_its_body() {
-    let snapshots = run_live_batch(SYNC_HL_CHILD_SRC, "cmd");
+    let snapshots = run_live_batch(&hl_child_src(CMD_TOOL), CMD_TOOL);
     let last = snapshots.last().expect("at least one batch snapshot");
     let text = last.text();
     assert!(
@@ -972,10 +1120,13 @@ maki.api.register_tool({
 })
 "#;
 
+/// A child whose restore awaits an async api inline, the way bash highlights
+/// its header. Registered under `@TOOL@` so the same source can stand in for
+/// whichever child a test needs.
 const SYNC_HL_CHILD_SRC: &str = r#"
 local ToolView = require("maki.tool_view")
 maki.api.register_tool({
-  name = "cmd",
+  name = "@TOOL@",
   description = "restore awaits maki.ui.highlight inline",
   schema = { type = "object", properties = {} },
   audiences = { "main" },
@@ -1020,6 +1171,10 @@ fn exec_batch_live(
 
     barrier(host);
     (state, drain_snapshots(&rx))
+}
+
+fn hl_child_src(tool: &str) -> String {
+    SYNC_HL_CHILD_SRC.replace("@TOOL@", tool)
 }
 
 fn run_live_batch(child_src: &str, tool: &str) -> Vec<BufferSnapshot> {

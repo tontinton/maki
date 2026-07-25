@@ -1057,6 +1057,38 @@ do_work()
 permit:release()
 ```
 
+---
+
+### `maki.async.on_cancel()` {#maki-async-on_cancel}
+
+```lua
+maki.async.on_cancel({fn})
+```
+
+Register {fn} to run as soon as the current task is cancelled, without
+waiting for whatever it is doing to finish. Use it to paint the
+cancelled state: a handler waiting on children (`gather`, `call_tool`)
+stays parked until they wind down, so anything after the wait is too
+late to reach the screen.
+
+The callback runs outside your coroutine, so it must not yield. It
+fires at most once, immediately if the task is already cancelled. An
+error inside it is logged and never reaches your handler, and the
+other hooks still run.
+
+**Parameters:**
+
+- `{fn}` (`function`) Zero-argument function to run on cancel.
+
+**Example:**
+
+```lua
+maki.async.on_cancel(function()
+  view:append({ { "cancelled", "tool_error" } })
+end)
+maki.async.gather(children)
+```
+
 
 ## maki.async.Semaphore {#maki-async-Semaphore}
 
