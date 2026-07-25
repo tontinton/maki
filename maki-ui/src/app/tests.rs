@@ -1175,24 +1175,45 @@ fn make_pending_copy(app: &mut App) {
     app.update(mouse_event(MouseEventKind::Up(MouseButton::Left), 10, 10));
 }
 
+const DRAG_ROW: u16 = 5;
+const DRAG_COL: u16 = 5;
+const SCROLL_LINES: i32 = 3;
+const DRAG_ZONE_AREA: Rect = Rect {
+    x: 0,
+    y: 0,
+    width: 80,
+    height: 10,
+};
+const OTHER_ZONE_AREA: Rect = Rect {
+    x: 0,
+    y: DRAG_ZONE_AREA.height,
+    width: 80,
+    height: 10,
+};
+
 fn send_key(app: &mut App) {
     app.update(Msg::Key(key(KeyCode::Char('a'))));
 }
 
-fn send_scroll(app: &mut App) {
+fn send_scroll_outside_drag_zone(app: &mut App) {
     app.update(Msg::Scroll {
-        column: 10,
-        row: 10,
-        delta: 3,
+        column: DRAG_COL,
+        row: OTHER_ZONE_AREA.y + 1,
+        delta: SCROLL_LINES,
     });
 }
 
-#[test_case(send_key as fn(&mut App)    ; "key")]
-#[test_case(send_scroll as fn(&mut App) ; "scroll")]
+#[test_case(send_key as fn(&mut App) ; "key")]
+#[test_case(send_scroll_outside_drag_zone as fn(&mut App) ; "scroll_outside_drag_zone")]
 fn interrupt_clears_dragging_but_preserves_pending_copy(interrupt: fn(&mut App)) {
     let mut app = test_app();
-    set_zone(&mut app, SelectionZone::Messages, Rect::new(0, 0, 80, 20));
-    app.update(mouse_event(MouseEventKind::Down(MouseButton::Left), 5, 5));
+    set_zone(&mut app, SelectionZone::Messages, DRAG_ZONE_AREA);
+    set_zone(&mut app, SelectionZone::Input, OTHER_ZONE_AREA);
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        DRAG_COL,
+        DRAG_ROW,
+    ));
     interrupt(&mut app);
     assert!(app.selection_state.is_none(), "clears dragging");
 
@@ -1201,6 +1222,85 @@ fn interrupt_clears_dragging_but_preserves_pending_copy(interrupt: fn(&mut App))
     assert!(
         app.selection_state.as_ref().unwrap().is_pending_copy(),
         "preserves pending copy"
+    );
+}
+
+#[test]
+fn scroll_preserves_dragging_and_updates_cursor() {
+    let mut app = test_app();
+    for i in 0..50 {
+        app.active_chat()
+            .push(DisplayMessage::new(DisplayRole::User, format!("line {i}")));
+    }
+
+    let area = Rect::new(0, 0, 80, 20);
+    set_zone(&mut app, SelectionZone::Messages, area);
+
+    let backend = ratatui::backend::TestBackend::new(area.width, area.height);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| {
+            app.active_chat().view(frame, area, false);
+        })
+        .unwrap();
+
+    let max_scroll = app.active_chat().scroll_top();
+    assert!(
+        max_scroll > 0,
+        "scroll_top should be non-zero after rendering scrollable content"
+    );
+
+    app.update(Msg::Scroll {
+        column: DRAG_COL,
+        row: DRAG_ROW,
+        delta: SCROLL_LINES,
+    });
+    let scroll_before = app.active_chat().scroll_top();
+    assert!(
+        scroll_before < max_scroll,
+        "scroll up should move scroll_top away from max_scroll"
+    );
+
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        DRAG_COL,
+        DRAG_ROW,
+    ));
+
+    app.update(Msg::Scroll {
+        column: DRAG_COL,
+        row: DRAG_ROW,
+        delta: -SCROLL_LINES,
+    });
+
+    assert!(
+        matches!(
+            app.selection_state.as_ref().unwrap(),
+            SelectionState::Dragging { .. }
+        ),
+        "scroll keeps dragging"
+    );
+
+    let (start, end) = app.selection_state.as_ref().unwrap().sel().normalized();
+    let anchor_row = scroll_before as u32 + DRAG_ROW as u32;
+    assert_eq!(start.row, anchor_row, "anchor keeps its doc row");
+    assert_eq!(
+        end.row,
+        anchor_row + SCROLL_LINES as u32,
+        "cursor re-projects by the scrolled lines"
+    );
+    assert_eq!(start.col, DRAG_COL, "anchor column is unchanged");
+    assert_eq!(end.col, DRAG_COL, "cursor column is unchanged");
+
+    make_pending_copy(&mut app);
+    app.update(Msg::Scroll {
+        column: DRAG_COL,
+        row: DRAG_ROW,
+        delta: -SCROLL_LINES,
+    });
+    assert!(
+        app.selection_state.as_ref().unwrap().is_pending_copy(),
+        "scroll preserves pending copy"
     );
 }
 

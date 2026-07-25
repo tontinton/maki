@@ -50,7 +50,7 @@ use crate::components::{
     Action, DisplayMessage, DisplayRole, ExitRequest, Overlay, RetryInfo, Status, is_ctrl,
 };
 use crate::image;
-use crate::selection::{SelectionState, ZoneRegistry};
+use crate::selection::{SelectionState, SelectionZone, ZoneRegistry};
 use arc_swap::{ArcSwap, ArcSwapOption};
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use maki_agent::permissions::PermissionManager;
@@ -362,7 +362,6 @@ impl App {
                 vec![]
             }
             Msg::Scroll { column, row, delta } => {
-                self.clear_selection_unless_pending_copy();
                 self.handle_scroll(column, row, delta);
                 vec![]
             }
@@ -385,23 +384,23 @@ impl App {
         }
     }
 
-    fn handle_scroll(&mut self, column: u16, row: u16, delta: i32) {
+    fn scroll_at(&mut self, column: u16, row: u16, delta: i32) -> Option<SelectionZone> {
         if self.btw_modal.is_open() {
             self.btw_modal.scroll(delta);
-            return;
+            return None;
         }
         if self.help_modal.is_open() {
             self.help_modal.scroll(delta);
-            return;
+            return None;
         }
         if self.usage_modal.is_open() {
             self.usage_modal.scroll(delta);
-            return;
+            return None;
         }
         let pos = Position::new(column, row);
         if self.float_mgr.is_open() && self.float_mgr.contains(pos) {
             self.float_mgr.scroll(delta);
-            return;
+            return None;
         }
         macro_rules! try_picker {
             ($picker:expr) => {
@@ -409,7 +408,7 @@ impl App {
                     if $picker.contains(pos) {
                         $picker.scroll(delta);
                     }
-                    return;
+                    return None;
                 }
             };
         }
@@ -417,9 +416,9 @@ impl App {
         try_picker!(self.task_picker);
         try_picker!(self.model_picker);
         try_picker!(self.file_picker);
-        if let Some(zone) = self.zone_at(row, column) {
-            self.scroll_zone(zone.zone, delta);
-        }
+        let zone = self.zone_at(row, column)?.zone;
+        self.scroll_zone(zone, delta);
+        Some(zone)
     }
 
     fn open_tasks(&mut self) {
