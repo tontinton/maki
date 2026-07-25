@@ -654,11 +654,11 @@ fn resolve_session(cli: &Cli, cwd: &str) -> Result<(Option<SessionRef>, Vec<Mess
         let session = StoredSession::load(session_ref.id(), &storage)
             .map_err(|e| eyre!("load session {id}: {e}"))?;
         let resumed = (!cli.fork_session).then_some(session_ref);
-        (resumed, session.messages)
+        (resumed, session.take_messages())
     } else if cli.continue_session {
         let storage = StateDir::resolve().context("resolve state dir")?;
         match StoredSession::latest(cwd, &storage) {
-            Ok(Some(session)) => (Some(SessionRef::from(session.id)), session.messages),
+            Ok(Some(session)) => (Some(SessionRef::from(session.id)), session.take_messages()),
             _ => (None, Vec::new()),
         }
     } else {

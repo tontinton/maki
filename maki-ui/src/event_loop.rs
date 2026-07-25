@@ -153,11 +153,11 @@ struct SpawnCtx {
 
 impl SpawnCtx {
     fn spawn_runtime(&self, session: AppSession) -> SessionRuntime {
-        let resumed = !session.messages.is_empty();
+        let resumed = !session.messages().is_empty();
         let permissions = Arc::new(self.permissions.fork());
         let handles = AgentHandles::spawn(
             &self.model_slot,
-            session.messages.clone(),
+            session.messages().to_vec(),
             self.config.clone(),
             self.ui_config.tool_output_lines,
             &permissions,
@@ -333,7 +333,6 @@ impl<'t> EventLoop<'t> {
             crate::update::spawn_check();
         });
 
-        let storage_writer = Arc::new(StorageWriter::new(storage.clone()));
         let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
         let (mcp_handle, mcp_config_errors) = smol::block_on(mcp::start(&cwd));
 
@@ -349,6 +348,7 @@ impl<'t> EventLoop<'t> {
             provider,
         }));
         let bg = spawn_model_fetch(&model_slot, timeouts);
+        let storage_writer = Arc::new(StorageWriter::new(storage.clone(), bg.warn_tx.clone()));
 
         let ctx = SpawnCtx {
             storage,
@@ -421,6 +421,7 @@ impl<'t> EventLoop<'t> {
             if let Err(e) = self.drain_channels() {
                 break Err(e);
             }
+            self.checkpoint_all();
             let app = &mut self.sessions[self.focused].app;
             if let Err(e) = self.terminal.draw(|f| {
                 app.view(f);
@@ -492,6 +493,15 @@ impl<'t> EventLoop<'t> {
             Wake::Warn(warning) => self.focused_app().flash(warning),
         }
         Ok(())
+    }
+
+    /// The one save trigger. A checkpoint writes only on a real change, so
+    /// every tool result reaches disk within a frame while an idle session
+    /// writes nothing.
+    fn checkpoint_all(&mut self) {
+        for rt in &mut self.sessions {
+            rt.app.checkpoint();
+        }
     }
 
     fn tick(&mut self) {
@@ -689,7 +699,7 @@ impl<'t> EventLoop<'t> {
                     let _ = self.submit_text(idx, prompt);
                 }
                 if focus {
-                    self.set_focus(idx);
+                    self.focused = idx;
                 }
                 let _ = reply_tx.send(Ok(json!(id)));
             }
@@ -714,15 +724,12 @@ impl<'t> EventLoop<'t> {
                 let reply = (|| {
                     let id = parse_session_id(&id)?;
                     if let Some(i) = self.position(id) {
-                        let app = &mut self.sessions[i].app;
-                        app.state.session.title = title;
-                        app.save_session();
+                        self.sessions[i].app.state.session_mut().set_title(title);
                     } else {
                         let mut session =
                             AppSession::load(id, &self.ctx.storage).map_err(|e| e.to_string())?;
-                        session.title = title;
-                        session.updated_at = maki_storage::now_epoch();
-                        self.ctx.storage_writer.send(Box::new(session));
+                        session.set_title(title);
+                        self.ctx.storage_writer.send(Arc::new(session));
                     }
                     Ok(json!(true))
                 })();
@@ -767,20 +774,12 @@ impl<'t> EventLoop<'t> {
         self.sessions.len() - 1
     }
 
-    fn set_focus(&mut self, idx: usize) {
-        if idx == self.focused {
-            return;
-        }
-        self.sessions[self.focused].app.save_session();
-        self.focused = idx;
-    }
-
     /// Focus a live session, or bring a stored one up: in place when the
     /// focused session is a blank idle one (nothing worth keeping), otherwise
     /// as a new runtime so the session you came from stays live.
     fn focus_session(&mut self, id: MakiId) -> Result<(), String> {
         if let Some(i) = self.position(id) {
-            self.set_focus(i);
+            self.focused = i;
             return Ok(());
         }
         let focused = &mut self.sessions[self.focused];
@@ -792,7 +791,7 @@ impl<'t> EventLoop<'t> {
         let session = AppSession::load(id, &self.ctx.storage)
             .map_err(|e| format!("Failed to load session: {e}"))?;
         let idx = self.push_runtime(self.ctx.spawn_runtime(session));
-        self.set_focus(idx);
+        self.focused = idx;
         Ok(())
     }
 
@@ -1101,10 +1100,10 @@ impl<'t> EventLoop<'t> {
             let SessionRuntime {
                 mut app, handles, ..
             } = rt;
-            app.save_session();
+            app.checkpoint_now();
             // `app` drops at the end of this iteration, closing the
             // channels the agent loop waits on, so `join_all` can finish.
-            tabs.push(app.state.session);
+            tabs.push(Arc::unwrap_or_clone(app.state.session));
             agent_tasks.push(handles.into_task());
         }
         let save_sessions_ms = lap();

@@ -32,11 +32,14 @@ impl App {
         provider: Arc<dyn Provider>,
         model: Model,
     ) {
+        // The mirror is verbatim, so mid-turn it can end on an open tool call.
+        // Providers reject that, so close them off on our own copy.
         let mut messages = self
             .shared_history
             .as_ref()
-            .map(|h| Vec::clone(&h.load()))
+            .map(|h| Vec::clone(&h.load().messages))
             .unwrap_or_default();
+        maki_agent::close_dangling_tool_calls(&mut messages, maki_agent::UNAVAILABLE_RESULT);
         let system = self
             .btw_system
             .as_ref()

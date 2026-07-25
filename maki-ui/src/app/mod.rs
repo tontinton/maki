@@ -55,11 +55,11 @@ use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use maki_agent::permissions::PermissionManager;
 use maki_agent::{
     AgentEvent, Envelope, ImageSource, McpConfigErrors, McpPromptInfo, McpSnapshotReader,
-    SubagentInfo,
+    SharedMessages, SubagentInfo,
 };
 use maki_config::UiConfig;
 use maki_lua::{EventHandle, HintReader, KeymapReader, LuaCommandReader, WinView};
-use maki_providers::{Message, Model, ThinkingConfig, add_cost};
+use maki_providers::{Model, ThinkingConfig, add_cost};
 use maki_storage::StateDir;
 use maki_storage::input_history::InputHistory;
 use maki_storage::model::persist_model;
@@ -72,6 +72,7 @@ pub(crate) use mode::{Mode, PlanState, PlanTrigger};
 #[cfg(test)]
 use mouse::EDGE_SCROLL_LINES;
 pub(crate) use queue::{MessageQueue, SubmitOutcome};
+use session::Sent;
 pub(crate) use session::session_has_content;
 use session_state::SessionState;
 
@@ -171,10 +172,11 @@ pub struct App {
 
     pub(crate) storage: StateDir,
     pub(crate) usage_slot: Arc<ArcSwapOption<UsageFetchState>>,
-    pub(crate) shared_history: Option<Arc<ArcSwap<Vec<Message>>>>,
+    pub(crate) shared_history: Option<SharedMessages>,
     pub(crate) btw_system: Option<Arc<ArcSwap<String>>>,
     pub(crate) image_paste_rx: Vec<flume::Receiver<Result<ImageSource, String>>>,
     storage_writer: Arc<StorageWriter>,
+    last_sent: Option<Sent>,
     pub(crate) shell: shell::ShellState,
     pub(crate) ui_config: UiConfig,
     pub(crate) permissions: Arc<PermissionManager>,
@@ -264,6 +266,7 @@ impl App {
             btw_system: None,
             image_paste_rx: vec![],
             storage_writer,
+            last_sent: None,
             shell: shell::ShellState::default(),
             ui_config,
             permissions,
@@ -865,7 +868,6 @@ impl App {
     }
 
     fn quit_with(&mut self, req: ExitRequest) -> Vec<Action> {
-        self.save_session();
         self.save_input_history();
         self.exit_request = req;
         vec![]
@@ -971,14 +973,6 @@ impl App {
             return vec![];
         }
         if envelope.run_id != self.run_id {
-            // Stale run_id after cancel: agent updates shared_history before sending
-            // Done/Error, so this is the first moment the full conversation is available.
-            if matches!(
-                envelope.event,
-                AgentEvent::Done { .. } | AgentEvent::Error { .. }
-            ) {
-                self.save_session();
-            }
             // A snapshot dropped here degrades the tool body to llm_output.
             if let AgentEvent::ToolSnapshot { id, .. }
             | AgentEvent::ToolHeaderSnapshot { id, .. }
@@ -1006,9 +1000,8 @@ impl App {
             }
             self.sync_task_picker();
             self.state
-                .session
-                .subagent_messages
-                .insert(tool_use_id, messages);
+                .session_mut()
+                .set_subagent_messages(tool_use_id, messages);
             return vec![];
         }
 
@@ -1029,9 +1022,8 @@ impl App {
                 self.transition_plan(PlanTrigger::WriteDone);
             }
             self.state
-                .session
-                .tool_outputs
-                .insert(e.id.clone(), e.output.clone());
+                .session_mut()
+                .insert_tool_output(e.id.clone(), e.output.clone());
             if let Some(&sub_idx) = self.chat_index.get(&e.id) {
                 let (role, text) = if e.is_error {
                     (DisplayRole::Error, ERROR_TEXT)
@@ -1062,23 +1054,13 @@ impl App {
 
         self.retry_info = None;
 
-        let plan_path = if self.state.mode == Mode::Plan {
-            self.state.plan.path()
-        } else {
-            None
-        };
-
         if let AgentEvent::TurnComplete(ref tc) = envelope.event {
             self.state.token_usage += tc.usage;
             self.chats[chat_idx].token_usage += tc.usage;
             add_cost(&mut self.chats[chat_idx].cost, tc.cost);
-            *self
-                .state
-                .session
-                .meta
-                .usage_by_model
-                .entry(tc.model.clone())
-                .or_default() += tc.usage.into();
+            self.state
+                .session_mut()
+                .add_model_usage(&tc.model, tc.usage.into());
             let ctx_size = tc.context_size.unwrap_or_else(|| tc.usage.context_tokens());
             self.chats[chat_idx].context_size = ctx_size;
             if chat_idx == 0 {
@@ -1092,6 +1074,11 @@ impl App {
             }
         }
 
+        let plan_path = if self.state.mode == Mode::Plan {
+            self.state.plan.path()
+        } else {
+            None
+        };
         let result = self.chats[chat_idx].handle_event(envelope.event, plan_path);
 
         if let ChatEventResult::QueueItemConsumed { text, image_count } = result {
@@ -1127,7 +1114,6 @@ impl App {
                 ChatEventResult::Done => {
                     self.status_bar.clear_flash();
                     self.terminalize_turn(MISSING_TOOL_COMPLETION);
-                    self.save_session();
                     self.chat_index.clear();
                     self.subagent_answers.clear();
                     self.status = Status::Idle;
@@ -1142,7 +1128,6 @@ impl App {
                     self.subagent_answers.clear();
                     self.terminalize_turn(&message);
                     self.recoverable_queue = self.queue.text_messages();
-                    self.save_session();
                     self.queue.clear();
                     self.chat_index.clear();
                     self.fire_session_autocmd(
@@ -1188,6 +1173,7 @@ impl App {
         }
         self.chats.push(chat);
         self.sync_task_picker();
+        self.sync_subagents();
         idx
     }
 
@@ -1420,7 +1406,9 @@ impl App {
         match std::env::set_current_dir(&path) {
             Ok(()) => {
                 if let Ok(canonical) = std::env::current_dir() {
-                    self.state.session.cwd = canonical.to_string_lossy().into_owned();
+                    self.state
+                        .session_mut()
+                        .set_cwd(canonical.to_string_lossy().into_owned());
                 }
                 self.status_bar.refresh_cwd();
                 self.flash(format!("cd {}", path.display()))
@@ -1514,8 +1502,8 @@ impl App {
     }
 
     /// Marks unfinished subagent chats as ended and drops them from
-    /// `chat_index`, which is what makes a `save_session` afterwards persist
-    /// only the children that really completed.
+    /// `chat_index`, so the session records only the children that really
+    /// completed.
     fn retain_resolved_subagents(&mut self, role: DisplayRole, text: &str) {
         self.chat_index.retain(|_, &mut sub_idx| {
             if self.chats[sub_idx].is_finished() {
@@ -1525,6 +1513,7 @@ impl App {
                 false
             }
         });
+        self.sync_subagents();
     }
 
     pub fn flush_all_chats(&mut self) {

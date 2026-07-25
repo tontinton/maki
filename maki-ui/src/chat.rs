@@ -393,7 +393,7 @@ impl Chat {
 
 pub fn history_to_display(
     messages: &[Message],
-    tool_outputs: &HashMap<String, ToolOutput>,
+    tool_outputs: &HashMap<String, Arc<ToolOutput>>,
     tool_output_lines: &ToolOutputLines,
 ) -> (Vec<DisplayMessage>, Vec<maki_lua::RestoreItem>) {
     let results = build_tool_results_map(messages);
@@ -433,7 +433,7 @@ pub fn history_to_display(
                                     (s, Some(&**text))
                                 })
                                 .unwrap_or((ToolStatus::Success, None));
-                            let stored = tool_outputs.get(id.as_str());
+                            let stored = tool_outputs.get(id.as_str()).map(Arc::as_ref);
                             let (text, truncated_lines, tool_output, mut annotation) =
                                 build_loaded_tool(
                                     static_name,
@@ -644,7 +644,7 @@ mod tests {
         }
     }
 
-    fn empty_outputs() -> HashMap<String, ToolOutput> {
+    fn empty_outputs() -> HashMap<String, Arc<ToolOutput>> {
         HashMap::new()
     }
 
@@ -868,7 +868,7 @@ mod tests {
         for (tool_name, input_json, output) in variants {
             let discriminant = std::mem::discriminant(&output);
             let msgs = tool_use_pair(tool_name, input_json, "ok", false);
-            let outputs = HashMap::from([("t1".into(), output)]);
+            let outputs = HashMap::from([("t1".into(), Arc::new(output))]);
             let display = history_to_display(&msgs, &outputs, &ToolOutputLines::default()).0;
             assert_eq!(
                 std::mem::discriminant(display[0].tool_output.as_deref().unwrap()),
@@ -891,7 +891,7 @@ mod tests {
             "wrote 12 bytes",
             false,
         );
-        let outputs = HashMap::from([("t1".into(), write_output)]);
+        let outputs = HashMap::from([("t1".into(), Arc::new(write_output))]);
         let display = history_to_display(&msgs, &outputs, &ToolOutputLines::default()).0;
         assert!(display[0].annotation.is_some());
     }
@@ -994,7 +994,7 @@ mod tests {
             "edited a",
             false,
         );
-        let outputs = HashMap::from([("t1".to_owned(), edit_output("a"))]);
+        let outputs = HashMap::from([("t1".to_owned(), Arc::new(edit_output("a")))]);
         let (_, items) = history_to_display(&msgs, &outputs, &ToolOutputLines::default());
         assert!(items.is_empty(), "Rust owns Diff rendering on restore");
 

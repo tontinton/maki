@@ -216,7 +216,7 @@ fn load_history_from(
     > = maki_storage::sessions::Session::load(session_id, storage).map_err(|e| {
         AcpError::resource_not_found(Some(format!("session/{session_id}"))).data(json_str(&e))
     })?;
-    Ok(session.messages)
+    Ok(session.take_messages())
 }
 
 fn handle_prompt(srv: &mut Server, raw: &Value, id: &RequestId) -> Result<(), AcpError> {
@@ -481,7 +481,7 @@ mod tests {
         ];
         let mut session: Session<Message, TokenUsage, maki_agent::ToolOutput> =
             Session::new("anthropic/test-model", "/project");
-        session.messages = messages.clone();
+        session.replace_messages(messages.clone());
         session.save(&dir).unwrap();
 
         let id: MakiId = session.id;
