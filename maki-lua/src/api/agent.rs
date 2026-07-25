@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use async_lock::Mutex as AsyncMutex;
 use futures::future::{Either, select};
 use maki_agent::agent::tool_dispatch::{self, Emit};
-use maki_agent::cancel::CancelMap;
+use maki_agent::cancel::{CancelMap, CancelSlot};
 use maki_agent::tools::interpreter_bridge;
 use maki_agent::tools::registry::ToolRegistry;
 use maki_agent::tools::schema::sanitize_tool_input_schema;
@@ -523,7 +523,9 @@ async fn session(
         .clone()
         .unwrap_or_else(|| format!("session-{}", MakiId::generate()));
     let (child_trigger, child_cancel) = agent_ctx.cancel.child();
-    agent_ctx
+    // Several sessions can share one `ui_id`, so keep the slot and retire
+    // only ours on close instead of clearing the whole key.
+    let cancel_slot = agent_ctx
         .subagent_cancels
         .insert(ui_id.clone(), child_trigger);
 
@@ -561,6 +563,7 @@ async fn session(
         answer_tx: Some(answer_tx),
         parent_cancels: Arc::clone(&agent_ctx.subagent_cancels),
         ui_id,
+        cancel_slot,
         parent_event_tx: parent_tx,
         subagent_info,
         local_tools: Arc::new(local_map),
@@ -686,7 +689,10 @@ struct SessionState {
     parent_cancels: Arc<CancelMap<String>>,
     /// Stable identity for UI, cancel, and history. Falls back to a synthetic
     /// id for workflow-mode sessions (no model-issued tool call exists).
+    /// Shared with any sibling session the same tool call opened.
     ui_id: String,
+    /// Which registration under [`ui_id`](Self::ui_id) is ours.
+    cancel_slot: CancelSlot,
     parent_event_tx: EventSender,
     subagent_info: Arc<OnceLock<SubagentInfo>>,
     local_tools: LocalTools,
@@ -703,7 +709,7 @@ impl SessionState {
             return;
         }
         self.closed = true;
-        self.parent_cancels.remove(&self.ui_id);
+        self.parent_cancels.retire(&self.ui_id, self.cancel_slot);
         let messages = std::mem::replace(&mut self.history, History::new(Vec::new())).into_vec();
         let _ = self.parent_event_tx.send(AgentEvent::SubagentHistory {
             tool_use_id: self.ui_id.clone(),
