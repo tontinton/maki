@@ -52,6 +52,9 @@ local EXT_TO_LANG = {
   yaml = "yaml",
   yml = "yaml",
   sql = "sql",
+  astro = "astro",
+  svelte = "svelte",
+  vue = "vue",
 }
 
 local FILENAME_TO_LANG = {
