@@ -302,7 +302,9 @@ impl AgentLoop {
     }
 
     fn set_cancel_trigger(&self, run_id: u64, trigger: CancelTrigger) {
-        self.cancel_map.insert(run_id, trigger);
+        // One trigger per run, and `clear_cancel_trigger` drops the whole
+        // key, so the slot is not worth carrying around.
+        let _ = self.cancel_map.insert(run_id, trigger);
     }
 
     fn clear_cancel_trigger(&self, run_id: u64) {
