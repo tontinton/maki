@@ -458,6 +458,7 @@ pub struct AgentFileConfig {
     pub max_output_lines: Option<usize>,
     pub max_continuation_turns: Option<u32>,
     pub compaction_buffer: Option<CompactionBuffer>,
+    pub stale_read_check: Option<bool>,
 }
 
 impl AgentFileConfig {
@@ -468,7 +469,8 @@ impl AgentFileConfig {
             max_output_bytes,
             max_output_lines,
             max_continuation_turns,
-            compaction_buffer
+            compaction_buffer,
+            stale_read_check
         );
     }
 }
@@ -980,6 +982,12 @@ pub struct AgentConfig {
     #[config(default = DEFAULT_COMPACTION_BUFFER, ty = "u32 | string", default_doc = "20%", desc = "Context reserved for compaction: token count or percent of the context window (e.g. \"20%\")")]
     pub compaction_buffer: CompactionBuffer,
 
+    #[config(
+        default = true,
+        desc = "Require re-reading a file that changed on disk before editing it"
+    )]
+    pub stale_read_check: bool,
+
     #[config(skip, default = false)]
     pub no_rtk: bool,
 
@@ -1003,6 +1011,7 @@ impl AgentConfig {
                 .max_continuation_turns
                 .unwrap_or(DEFAULT_MAX_CONTINUATION_TURNS),
             compaction_buffer: file.compaction_buffer.unwrap_or(DEFAULT_COMPACTION_BUFFER),
+            stale_read_check: file.stale_read_check.unwrap_or(true),
             max_turns: None,
             allowed_tools: Vec::new(),
             disabled_tools,
