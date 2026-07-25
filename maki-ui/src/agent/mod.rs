@@ -10,8 +10,8 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use maki_agent::permissions::PermissionManager;
 use maki_agent::{
-    AgentConfig, CancelMap, CancelToken, Envelope, McpCommand, McpConfigErrors, McpHandle,
-    McpSnapshotReader, ToolOutputLines,
+    AgentConfig, CancelMap, CancelToken, Envelope, HistorySnapshot, McpCommand, McpConfigErrors,
+    McpHandle, McpSnapshotReader, SharedMessages, ToolOutputLines,
 };
 use maki_lua::EventHandle;
 use maki_storage::id::SessionRef;
@@ -48,7 +48,7 @@ pub(crate) struct AgentHandles {
     pub(crate) agent_rx: flume::Receiver<Envelope>,
     pub(crate) agent_tx: flume::Sender<Envelope>,
     pub(crate) answer_tx: flume::Sender<String>,
-    pub(crate) history: Arc<ArcSwap<Vec<Message>>>,
+    pub(crate) history: SharedMessages,
     pub(crate) btw_system: Arc<ArcSwap<String>>,
     pub(crate) mcp_handle: Option<McpHandle>,
     pub(crate) mcp_config_errors: McpConfigErrors,
@@ -212,8 +212,10 @@ fn spawn_agent_internal(
     let (answer_tx, answer_rx) = flume::unbounded::<String>();
     let (queue_tx, queue_rx) = shared_queue::queue();
     let queue_rx = Arc::new(queue_rx);
-    let shared_history: Arc<ArcSwap<Vec<Message>>> =
-        Arc::new(ArcSwap::from_pointee(initial_history.clone()));
+    // Seeded empty because `AgentLoop::new` below publishes the real snapshot
+    // synchronously, before any handle escapes.
+    let shared_history: SharedMessages =
+        Arc::new(ArcSwap::from_pointee(HistorySnapshot::default()));
     let btw_system: Arc<ArcSwap<String>> = Arc::new(ArcSwap::from_pointee(String::new()));
     let (init_trigger, init_cancel) = CancelToken::new();
     let cancel_map = Arc::new(new_run_cancel_map(0, init_trigger));
@@ -278,6 +280,7 @@ mod tests {
     const SHORT_TIMEOUT: Duration = Duration::from_millis(50);
     const PROBE_TEXT: &str = "probe-through-old-sender";
     const RESTORED_TEXT: &str = "restored-queued-message";
+    const RESUMED_HISTORY_TEXT: &str = "resumed-conversation";
 
     struct StubProvider;
 
@@ -305,6 +308,16 @@ mod tests {
         Arc<ArcSwap<ModelSlot>>,
         Arc<PermissionManager>,
     ) {
+        stub_spawn_with(Vec::new())
+    }
+
+    fn stub_spawn_with(
+        initial_history: Vec<Message>,
+    ) -> (
+        AgentHandles,
+        Arc<ArcSwap<ModelSlot>>,
+        Arc<PermissionManager>,
+    ) {
         let model_slot = Arc::new(ArcSwap::from_pointee(ModelSlot {
             model: crate::components::test_model(),
             provider: Arc::new(StubProvider),
@@ -315,7 +328,7 @@ mod tests {
         ));
         let handles = AgentHandles::spawn(
             &model_slot,
-            Vec::new(),
+            initial_history,
             AgentConfig::default(),
             ToolOutputLines::default(),
             &permissions,
@@ -359,7 +372,7 @@ mod tests {
         respawn(&mut handles, &model_slot, &permissions, &mut app);
         assert_eq!(app.run_id, run_id_before + 1);
 
-        app.state.session.meta.queued_messages = vec![RESTORED_TEXT.into()];
+        app.state.session_mut().meta.queued_messages = vec![RESTORED_TEXT.into()];
         respawn(&mut handles, &model_slot, &permissions, &mut app);
         assert_eq!(
             app.run_id,
@@ -391,6 +404,48 @@ mod tests {
                 _ => {}
             }
         }
+    }
+
+    /// If the seeded empty snapshot ever outlived `spawn`, the next checkpoint
+    /// would adopt it and wipe a resumed conversation from disk.
+    #[test]
+    fn spawn_publishes_the_resumed_history_before_the_handles_escape() {
+        let (handles, _model_slot, _permissions) =
+            stub_spawn_with(vec![Message::user(RESUMED_HISTORY_TEXT.into())]);
+        let snapshot = handles.history.load();
+        assert_eq!(
+            snapshot.messages.len(),
+            1,
+            "the seeded empty snapshot must be replaced synchronously"
+        );
+        assert_eq!(snapshot.messages[0].user_text(), Some(RESUMED_HISTORY_TEXT));
+    }
+
+    #[test]
+    fn respawn_publishes_the_new_history_into_the_app_mirror() {
+        let (mut handles, model_slot, permissions) = stub_spawn();
+        let mut app = crate::app::tests::test_app();
+        handles.respawn(
+            vec![Message::user(RESUMED_HISTORY_TEXT.into())],
+            &model_slot,
+            AgentConfig::default(),
+            ToolOutputLines::default(),
+            &permissions,
+            &mut app,
+            EventHandle::disconnected_for_test(),
+        );
+
+        let mirror = app
+            .shared_history
+            .as_ref()
+            .expect("respawn wires the live mirror into the app");
+        let snapshot = mirror.load();
+        assert_eq!(
+            snapshot.messages.len(),
+            1,
+            "a checkpoint right after respawn must not see the seeded empty snapshot"
+        );
+        assert_eq!(snapshot.messages[0].user_text(), Some(RESUMED_HISTORY_TEXT));
     }
 
     #[test]

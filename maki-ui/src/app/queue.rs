@@ -173,7 +173,7 @@ impl App {
         // The live queue owns the text from here on, so the recovery
         // snapshot must stop overriding it on save.
         self.recoverable_queue.clear();
-        for text in std::mem::take(&mut self.state.session.meta.queued_messages) {
+        for text in std::mem::take(&mut self.state.session_mut().meta.queued_messages) {
             self.queue_and_notify(QueuedMessage {
                 text,
                 images: Vec::new(),

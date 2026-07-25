@@ -267,7 +267,7 @@ impl App {
             let quota = self.usage_slot.load();
             let ctx = UsageModalContext {
                 total: &self.state.token_usage,
-                by_model: &self.state.session.meta.usage_by_model,
+                by_model: self.state.session.usage_by_model(),
                 model: &self.state.model,
                 fast: self.state.fast,
                 quota: quota.as_deref(),

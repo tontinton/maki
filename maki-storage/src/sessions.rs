@@ -14,6 +14,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::UNIX_EPOCH;
 
 use tracing::warn;
@@ -34,6 +36,17 @@ const SCAN_CACHE_STEM: &str = "scan_cache";
 const NON_SESSION_STEMS: [&str; 2] = [CWD_INDEX_STEM, SCAN_CACHE_STEM];
 const DEFAULT_TITLE: &str = "New session";
 const MAX_TITLE_LEN: usize = 60;
+const EPOCH_CHANGED: &str = "messages were rewritten";
+const FILE_CHANGED_UNDERNEATH: &str = "file changed underneath";
+const CURSOR_AHEAD: &str = "cursor ahead of session";
+
+/// Hands out the token that tags one append-only run of a message list.
+/// Process wide, so two runs never pick the same number.
+static EPOCH: AtomicU64 = AtomicU64::new(1);
+
+pub fn next_epoch() -> u64 {
+    EPOCH.fetch_add(1, Ordering::Relaxed)
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
@@ -49,8 +62,8 @@ pub enum SessionError {
         raw_id: String,
         source: MakiIdParseError,
     },
-    #[error("cursor ahead of session (log has {saved}, session has {actual}); compact required")]
-    CursorAhead { saved: usize, actual: usize },
+    #[error("session log diverged ({reason}); rewrite required")]
+    LogDiverged { reason: &'static str },
 }
 
 /// Per-model token breakdown entry. Mirrors the four usage counters tracked by
@@ -89,7 +102,7 @@ impl std::ops::AddAssign for StoredTokenUsage {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SessionMeta {
     #[serde(default)]
     pub mode: Option<StoredMode>,
@@ -105,18 +118,46 @@ pub struct SessionMeta {
     pub input_draft: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub queued_messages: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub subagents: Vec<StoredSubagent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking: Option<StoredThinking>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub fast: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub workflow: bool,
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub usage_by_model: HashMap<String, StoredTokenUsage>,
 }
 
+/// Messages plus the token of the run they belong to. Comparing tokens tells
+/// an append from a rewrite, with no need to diff the lists.
+pub struct HistorySnapshot<M> {
+    pub epoch: u64,
+    pub messages: Arc<Vec<M>>,
+}
+
+impl<M> HistorySnapshot<M> {
+    pub fn new(messages: Vec<M>) -> Self {
+        Self {
+            epoch: next_epoch(),
+            messages: Arc::new(messages),
+        }
+    }
+}
+
+impl<M> Default for HistorySnapshot<M> {
+    fn default() -> Self {
+        Self::new(Vec::new())
+    }
+}
+
+/// The conversation collections are private so every change goes through a
+/// mutator that classifies itself: `revision` says "this needs writing",
+/// `epoch` says "append cursors into the log are void". The other fields stay
+/// public because the meta record is rewritten in full on every append, so
+/// they hold no cursor to spoil.
+///
+/// [`SessionMeta`] is what the owner mirrors from its own live state and hands
+/// over whole on every checkpoint. Anything the session writes itself lives
+/// here instead, so a checkpoint never copies it out and back in to compare it
+/// against itself.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session<M, U, T> {
     pub version: u32,
@@ -124,16 +165,29 @@ pub struct Session<M, U, T> {
     pub title: String,
     pub cwd: String,
     pub model: String,
-    pub messages: Vec<M>,
+    messages: Arc<Vec<M>>,
     pub token_usage: U,
     #[serde(default = "HashMap::new")]
-    pub tool_outputs: HashMap<String, T>,
+    tool_outputs: HashMap<String, T>,
     #[serde(default = "HashMap::new", skip_serializing_if = "HashMap::is_empty")]
-    pub subagent_messages: HashMap<String, Vec<M>>,
+    subagent_messages: HashMap<String, Vec<M>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    subagents: Vec<StoredSubagent>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    usage_by_model: HashMap<String, StoredTokenUsage>,
     #[serde(flatten)]
     pub meta: SessionMeta,
     pub created_at: u64,
     pub updated_at: u64,
+    /// Bumped by every mutation, so a checkpoint knows if there is anything
+    /// to write.
+    #[serde(skip)]
+    revision: u64,
+    /// The append-only run `messages` belongs to, adopted from the producer's
+    /// snapshot or minted fresh when this session rewrites them itself. Once
+    /// it changes, every append cursor into the log is void.
+    #[serde(skip, default = "next_epoch")]
+    epoch: u64,
 }
 
 #[derive(Serialize)]
@@ -157,7 +211,7 @@ pub enum StoredMode {
     Plan,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredRule {
     pub tool: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -306,7 +360,7 @@ impl StoredThinking {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredSubagent {
     pub tool_use_id: String,
     pub name: String,
@@ -379,6 +433,10 @@ enum LogRecord<M, U, T> {
         title: String,
         token_usage: U,
         updated_at: u64,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        subagents: Vec<StoredSubagent>,
+        #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+        usage_by_model: HashMap<String, StoredTokenUsage>,
         #[serde(flatten)]
         meta: SessionMeta,
     },
@@ -389,6 +447,12 @@ enum LogRecord<M, U, T> {
 pub struct SessionLog {
     session_id: MakiId,
     file: File,
+    /// The session's `epoch` at the last write. Appending is sound only while
+    /// it stays the same.
+    saved_epoch: u64,
+    /// Length of the file after the last write. Anything else means someone
+    /// truncated, deleted or wrote it, and an append would corrupt it.
+    saved_len: u64,
     saved_msg_count: usize,
     saved_tool_ids: HashSet<String>,
     saved_sub_msg_counts: HashMap<String, usize>,
@@ -476,13 +540,7 @@ impl SessionLog {
         T: Serialize,
     {
         self.require_same_id(session)?;
-
-        if self.cursor_ahead(session) {
-            return Err(SessionError::CursorAhead {
-                saved: self.saved_msg_count,
-                actual: session.messages.len(),
-            });
-        }
+        let on_disk = self.divergence_checked(session)?;
 
         let mut buf = Vec::new();
         let mut new_msg_count = self.saved_msg_count;
@@ -529,7 +587,6 @@ impl SessionLog {
         }
         buf.extend_from_slice(&meta);
 
-        let start = self.file.metadata().map_err(StorageError::from)?.len();
         if let Err(e) = self
             .file
             .write_all(&buf)
@@ -538,10 +595,11 @@ impl SessionLog {
             // A failed write can leave partial bytes; roll back to the last
             // record boundary so the file matches the unadvanced cursors and
             // a retry appends cleanly instead of duplicating records.
-            let _ = self.file.set_len(start);
+            let _ = self.file.set_len(on_disk);
             return Err(StorageError::from(e).into());
         }
 
+        self.saved_len = on_disk + buf.len() as u64;
         self.saved_msg_count = new_msg_count;
         self.saved_tool_ids.extend(new_tool_ids);
         for (sub_id, count) in new_sub_counts {
@@ -588,9 +646,12 @@ impl SessionLog {
         U: Serialize,
         T: Serialize,
     {
+        let saved_len = file.metadata().map(|m| m.len()).unwrap_or_default();
         Self {
             session_id: session.id,
             file,
+            saved_epoch: session.epoch,
+            saved_len,
             saved_msg_count: session.messages.len(),
             saved_tool_ids: session.tool_outputs.keys().cloned().collect(),
             saved_sub_msg_counts: sub_msg_snapshot(&session.subagent_messages),
@@ -606,6 +667,25 @@ impl SessionLog {
             });
         }
         Ok(())
+    }
+
+    /// Returns the on-disk length the append may build on, or the reason the
+    /// cursors no longer describe the file.
+    fn divergence_checked<M, U, T>(&self, session: &Session<M, U, T>) -> Result<u64, SessionError> {
+        let on_disk = self.file.metadata().map_err(StorageError::from)?.len();
+        let reason = if session.epoch != self.saved_epoch {
+            EPOCH_CHANGED
+        } else if on_disk != self.saved_len {
+            FILE_CHANGED_UNDERNEATH
+        } else if self.cursor_ahead(session) {
+            // Nothing shrinks a session without minting a new epoch, so this
+            // should never fire. It stays because the slices in `append` would
+            // panic instead of corrupting if it ever does.
+            CURSOR_AHEAD
+        } else {
+            return Ok(on_disk);
+        };
+        Err(SessionError::LogDiverged { reason })
     }
 
     fn cursor_ahead<M, U, T>(&self, session: &Session<M, U, T>) -> bool {
@@ -636,6 +716,8 @@ where
             title: session.title.clone(),
             token_usage: &session.token_usage,
             updated_at: session.updated_at,
+            subagents: session.subagents.clone(),
+            usage_by_model: session.usage_by_model.clone(),
             meta: session.meta.clone(),
         },
     )?;
@@ -676,7 +758,7 @@ where
             created_at: session.created_at,
         },
     )?;
-    for msg in &session.messages {
+    for msg in session.messages.iter() {
         append_record(&mut buf, &LogRecord::<&M, &U, &T>::Msg { d: msg })?;
     }
     for (id, output) in &session.tool_outputs {
@@ -734,12 +816,14 @@ where
     let mut model = String::new();
     let mut cwd = String::new();
     let mut created_at = 0u64;
-    let mut messages = Vec::new();
+    let mut messages: Vec<M> = Vec::new();
     let mut tool_outputs = HashMap::new();
     let mut subagent_messages: HashMap<String, Vec<M>> = HashMap::new();
     let mut title = DEFAULT_TITLE.to_string();
     let mut token_usage = U::default();
     let mut updated_at = 0u64;
+    let mut subagents = Vec::new();
+    let mut usage_by_model = HashMap::new();
     let mut meta = SessionMeta::default();
     let mut got_header = false;
 
@@ -801,11 +885,15 @@ where
                 title: m_title,
                 token_usage: m_usage,
                 updated_at: m_updated,
+                subagents: m_subagents,
+                usage_by_model: m_usage_by_model,
                 meta: m_meta,
             } => {
                 title = m_title;
                 token_usage = m_usage;
                 updated_at = m_updated;
+                subagents = m_subagents;
+                usage_by_model = m_usage_by_model;
                 meta = m_meta;
             }
         }
@@ -819,13 +907,17 @@ where
         title,
         cwd,
         model,
-        messages,
+        messages: Arc::new(messages),
         token_usage,
         tool_outputs,
         subagent_messages,
+        subagents,
+        usage_by_model,
         meta,
         created_at,
         updated_at,
+        revision: 0,
+        epoch: next_epoch(),
     })
 }
 
@@ -1128,7 +1220,7 @@ where
 
 impl<M, U, T> Session<M, U, T>
 where
-    M: Serialize + DeserializeOwned + TitleSource,
+    M: Serialize + DeserializeOwned + TitleSource + Clone,
     U: Serialize + DeserializeOwned + Default,
     T: Serialize + DeserializeOwned,
 {
@@ -1140,17 +1232,186 @@ where
             title: DEFAULT_TITLE.into(),
             cwd: cwd.into(),
             model: model.into(),
-            messages: Vec::new(),
+            messages: Arc::default(),
             token_usage: U::default(),
             tool_outputs: HashMap::new(),
             subagent_messages: HashMap::new(),
+            subagents: Vec::new(),
+            usage_by_model: HashMap::new(),
             meta: SessionMeta {
                 mode: Some(StoredMode::Build),
                 ..Default::default()
             },
             created_at: now,
             updated_at: now,
+            revision: 0,
+            epoch: next_epoch(),
         }
+    }
+
+    pub fn messages(&self) -> &[M] {
+        &self.messages
+    }
+
+    pub fn take_messages(self) -> Vec<M> {
+        Arc::unwrap_or_clone(self.messages)
+    }
+
+    pub fn tool_outputs(&self) -> &HashMap<String, T> {
+        &self.tool_outputs
+    }
+
+    pub fn subagent_messages(&self) -> &HashMap<String, Vec<M>> {
+        &self.subagent_messages
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    fn touch(&mut self) {
+        self.updated_at = now_epoch();
+        self.revision += 1;
+    }
+
+    /// Every append cursor into the log is void from here on.
+    fn rewrite(&mut self) {
+        self.epoch = next_epoch();
+        self.touch();
+    }
+
+    pub fn push_message(&mut self, msg: M) {
+        Arc::make_mut(&mut self.messages).push(msg);
+        self.touch();
+    }
+
+    pub fn replace_messages(&mut self, messages: Vec<M>) {
+        self.messages = Arc::new(messages);
+        self.rewrite();
+    }
+
+    pub fn truncate_messages(&mut self, len: usize) {
+        if len >= self.messages.len() {
+            return;
+        }
+        Arc::make_mut(&mut self.messages).truncate(len);
+        self.rewrite();
+    }
+
+    /// Adopting a producer's snapshot inherits its run token, so the log's
+    /// cursors survive exactly when the snapshot was an append.
+    fn set_history(&mut self, snapshot: &HistorySnapshot<M>) {
+        self.messages = Arc::clone(&snapshot.messages);
+        self.epoch = snapshot.epoch;
+        self.touch();
+    }
+
+    /// Applies everything the owner mirrors from live state. It takes an `Arc`
+    /// and checks for a real change first because `Arc::make_mut` deep-copies
+    /// the whole session while the writer still holds the last snapshot, and an
+    /// idle session should not pay for that every frame.
+    pub fn checkpoint(
+        this: &mut Arc<Self>,
+        history: Option<&HistorySnapshot<M>>,
+        meta: SessionMeta,
+        token_usage: U,
+    ) where
+        M: Clone,
+        U: PartialEq + Clone,
+        T: Clone,
+    {
+        let history = history.filter(|h| !Arc::ptr_eq(&this.messages, &h.messages));
+        if history.is_none() && this.meta == meta && this.token_usage == token_usage {
+            return;
+        }
+        let session = Arc::make_mut(this);
+        if let Some(snapshot) = history {
+            session.set_history(snapshot);
+            // The title comes from the messages, so it goes stale exactly when
+            // they move.
+            session.update_title_if_default();
+        }
+        session.set_meta(meta);
+        session.set_token_usage(token_usage);
+    }
+
+    /// A change under an existing id is not expressible as an append, so it
+    /// voids the cursors; a new id is a pure append.
+    pub fn insert_tool_output(&mut self, id: String, output: T) {
+        if self.tool_outputs.insert(id, output).is_some() {
+            self.rewrite();
+        } else {
+            self.touch();
+        }
+    }
+
+    pub fn set_subagent_messages(&mut self, id: String, msgs: Vec<M>) {
+        let shrank = self
+            .subagent_messages
+            .get(&id)
+            .is_some_and(|old| msgs.len() < old.len());
+        self.subagent_messages.insert(id, msgs);
+        if shrank {
+            self.rewrite();
+        } else {
+            self.touch();
+        }
+    }
+
+    pub fn set_token_usage(&mut self, usage: U)
+    where
+        U: PartialEq,
+    {
+        if self.token_usage == usage {
+            return;
+        }
+        self.token_usage = usage;
+        self.touch();
+    }
+
+    pub fn set_meta(&mut self, meta: SessionMeta) {
+        if self.meta == meta {
+            return;
+        }
+        self.meta = meta;
+        self.touch();
+    }
+
+    pub fn subagents(&self) -> &[StoredSubagent] {
+        &self.subagents
+    }
+
+    pub fn take_subagents(&mut self) -> Vec<StoredSubagent> {
+        if self.subagents.is_empty() {
+            return Vec::new();
+        }
+        self.touch();
+        std::mem::take(&mut self.subagents)
+    }
+
+    pub fn set_subagents(&mut self, subagents: Vec<StoredSubagent>) {
+        if self.subagents == subagents {
+            return;
+        }
+        self.subagents = subagents;
+        self.touch();
+    }
+
+    pub fn usage_by_model(&self) -> &HashMap<String, StoredTokenUsage> {
+        &self.usage_by_model
+    }
+
+    pub fn set_title(&mut self, title: String) {
+        if self.title == title {
+            return;
+        }
+        self.title = title;
+        self.touch();
+    }
+
+    pub fn add_model_usage(&mut self, model: &str, usage: StoredTokenUsage) {
+        *self.usage_by_model.entry(model.to_owned()).or_default() += usage;
+        self.touch();
     }
 
     /// After `messages` is truncated (rewind), state keyed by tool_use_id can
@@ -1162,8 +1423,7 @@ where
     pub fn prune_orphans(&mut self, tool_ids: impl Fn(&M) -> Vec<String>) {
         let main_ids: HashSet<String> = self.messages.iter().flat_map(&tool_ids).collect();
         self.subagent_messages.retain(|id, _| main_ids.contains(id));
-        self.meta
-            .subagents
+        self.subagents
             .retain(|sa| main_ids.contains(&sa.tool_use_id));
 
         let live: HashSet<String> = self
@@ -1174,6 +1434,7 @@ where
             .chain(main_ids)
             .collect();
         self.tool_outputs.retain(|id, _| live.contains(id));
+        self.rewrite();
     }
 
     pub fn save(&mut self, dir: &StateDir) -> Result<(), SessionError> {
@@ -1251,7 +1512,7 @@ where
 
     pub fn update_title_if_default(&mut self) {
         if self.title == DEFAULT_TITLE {
-            self.title = generate_title(&self.messages);
+            self.set_title(generate_title(&self.messages));
         }
     }
 
@@ -1287,13 +1548,17 @@ mod tests {
         generate_title, json_path, jsonl_path, load_cwd_index, update_cwd_index,
         write_full_session,
     };
-    use super::{SCAN_CACHE_FILE, Session, SessionError, SessionLog, StorageError, TitleSource};
+    use super::{
+        HistorySnapshot, SCAN_CACHE_FILE, Session, SessionError, SessionLog, SessionMeta,
+        StorageError, TitleSource,
+    };
     use crate::id::MakiId;
     use serde_json::Value;
     use std::collections::HashMap;
     use std::fs::{self, OpenOptions};
     use std::io::Write;
     use std::path::Path;
+    use std::sync::Arc;
     use tempfile::TempDir;
     use test_case::test_case;
 
@@ -1360,32 +1625,31 @@ mod tests {
         }
 
         let mut session: TestSession = Session::new("model", "/p");
-        session.messages.push("task-live".into());
+        session.push_message("task-live".into());
         session
             .subagent_messages
             .insert("task-live".into(), vec!["sub-tool".into()]);
         session
             .subagent_messages
             .insert("task-stale".into(), vec!["stale-sub-tool".into()]);
-        session.meta.subagents = vec![subagent("task-live"), subagent("task-stale")];
+        session.set_subagents(vec![subagent("task-live"), subagent("task-stale")]);
         for id in ["task-live", "sub-tool", "stale-sub-tool", "orphan"] {
-            session.tool_outputs.insert(id.into(), Value::Null);
+            session.insert_tool_output(id.into(), Value::Null);
         }
 
         session.prune_orphans(ids);
 
         assert_eq!(
-            session.subagent_messages.keys().collect::<Vec<_>>(),
+            session.subagent_messages().keys().collect::<Vec<_>>(),
             ["task-live"]
         );
         let subagent_ids: Vec<_> = session
-            .meta
-            .subagents
+            .subagents()
             .iter()
             .map(|sa| sa.tool_use_id.as_str())
             .collect();
         assert_eq!(subagent_ids, ["task-live"]);
-        let mut outputs: Vec<_> = session.tool_outputs.keys().cloned().collect();
+        let mut outputs: Vec<_> = session.tool_outputs().keys().cloned().collect();
         outputs.sort();
         assert_eq!(outputs, ["sub-tool", "task-live"]);
     }
@@ -1396,8 +1660,8 @@ mod tests {
         let dir = tmp.path();
         let mut session: TestSession =
             Session::new("anthropic/claude-sonnet-4", "/home/test/project");
-        session.messages.push(user_message("hello"));
-        session.subagent_messages.insert(
+        session.push_message(user_message("hello"));
+        session.set_subagent_messages(
             "tool-1".into(),
             vec![user_message("sub-prompt"), assistant_message("sub-reply")],
         );
@@ -1407,7 +1671,7 @@ mod tests {
         assert_eq!(loaded.id, session.id);
         assert_eq!(loaded.model, "anthropic/claude-sonnet-4");
         assert_eq!(loaded.cwd, "/home/test/project");
-        assert_eq!(loaded.messages.len(), 1);
+        assert_eq!(loaded.messages().len(), 1);
         assert_eq!(loaded.version, SESSION_VERSION);
         assert_eq!(loaded.subagent_messages["tool-1"].len(), 2);
     }
@@ -1417,8 +1681,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
         let mut session: TestSession = Session::new("anthropic/claude-sonnet-4", "/project");
-        session.meta.usage_by_model.insert(
-            "claude-sonnet-4".into(),
+        session.add_model_usage(
+            "claude-sonnet-4",
             super::StoredTokenUsage {
                 input: 100,
                 output: 20,
@@ -1426,8 +1690,8 @@ mod tests {
                 cache_read: 40,
             },
         );
-        session.meta.usage_by_model.insert(
-            "claude-haiku-4".into(),
+        session.add_model_usage(
+            "claude-haiku-4",
             super::StoredTokenUsage {
                 input: 30,
                 output: 10,
@@ -1437,12 +1701,12 @@ mod tests {
         session.save_to(dir).unwrap();
 
         let loaded = TestSession::load_from(session.id, dir).unwrap();
-        let sonnet = &loaded.meta.usage_by_model["claude-sonnet-4"];
+        let sonnet = &loaded.usage_by_model()["claude-sonnet-4"];
         assert_eq!(sonnet.input, 100);
         assert_eq!(sonnet.output, 20);
         assert_eq!(sonnet.cache_read, 40);
         assert_eq!(sonnet.total_input(), 145);
-        assert_eq!(loaded.meta.usage_by_model["claude-haiku-4"].total(), 40);
+        assert_eq!(loaded.usage_by_model()["claude-haiku-4"].total(), 40);
     }
 
     #[test]
@@ -1456,7 +1720,39 @@ mod tests {
         let path = tmp.path().join(format!("{LEGACY_HEX_ID}.jsonl"));
         fs::write(&path, json).unwrap();
         let loaded = TestSession::load_from(id, tmp.path()).unwrap();
-        assert!(loaded.meta.usage_by_model.is_empty());
+        assert!(loaded.usage_by_model().is_empty());
+    }
+
+    /// `subagents` and `usage_by_model` moved off `SessionMeta` onto the
+    /// session, which must not move them in the file: they were flattened into
+    /// the meta record and they still sit there.
+    #[test]
+    fn session_owned_fields_keep_their_place_in_the_meta_record() {
+        let id: MakiId = LEGACY_HEX_ID.parse().unwrap();
+        let meta_line = concat!(
+            r#"{"t":"meta","title":"t","token_usage":null,"updated_at":0,"fast":true,"#,
+            r#""subagents":[{"tool_use_id":"t1","name":"child"}],"#,
+            r#""usage_by_model":{"m":{"input":7,"output":3}}}"#,
+        );
+        let json = format!(
+            r#"{{"t":"header","v":2,"id":"{LEGACY_HEX_ID}","model":"m","cwd":"/","created_at":0}}
+{meta_line}"#
+        );
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join(format!("{LEGACY_HEX_ID}.jsonl")), json).unwrap();
+
+        let mut loaded = TestSession::load_from(id, tmp.path()).unwrap();
+        assert_eq!(loaded.subagents()[0].name, "child");
+        assert_eq!(loaded.usage_by_model()["m"].total(), 10);
+        assert!(loaded.meta.fast, "flattened meta still parses alongside");
+
+        let dir = tmp.path().join("rewritten");
+        fs::create_dir(&dir).unwrap();
+        loaded.save_to(&dir).unwrap();
+        let reloaded = TestSession::load_from(id, &dir).unwrap();
+        assert_same_session(&reloaded, &loaded);
+        assert_eq!(reloaded.subagents(), loaded.subagents());
+        assert_eq!(reloaded.usage_by_model(), loaded.usage_by_model());
     }
 
     #[test]
@@ -1464,12 +1760,12 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
         let mut session: TestSession = Session::new("m", "/project");
-        session.messages.push(user_message("first"));
+        session.push_message(user_message("first"));
 
         let mut log = SessionLog::create(dir, &session).unwrap();
 
-        session.messages.push(assistant_message("reply"));
-        session.messages.push(user_message("second"));
+        session.push_message(assistant_message("reply"));
+        session.push_message(user_message("second"));
         session
             .tool_outputs
             .insert("tool-1".into(), serde_json::json!({"result": "ok"}));
@@ -1489,9 +1785,9 @@ mod tests {
         log.append(&session).unwrap();
 
         let loaded = TestSession::load_from(session.id, dir).unwrap();
-        assert_eq!(loaded.messages.len(), 3);
-        assert_eq!(loaded.tool_outputs.len(), 1);
-        assert!(loaded.tool_outputs.contains_key("tool-1"));
+        assert_eq!(loaded.messages().len(), 3);
+        assert_eq!(loaded.tool_outputs().len(), 1);
+        assert!(loaded.tool_outputs().contains_key("tool-1"));
         assert_eq!(loaded.subagent_messages["sub-1"].len(), 2);
         assert_eq!(loaded.subagent_messages["sub-2"].len(), 1);
     }
@@ -1513,7 +1809,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
         let mut session: TestSession = Session::new("m", "/project");
-        session.messages.push(user_message("survives"));
+        session.push_message(user_message("survives"));
         session.save_to(dir).unwrap();
 
         let path = jsonl_path(dir, session.id);
@@ -1521,7 +1817,7 @@ mod tests {
         file.write_all(b"{\"t\":\"msg\",\"d\":{\"trun").unwrap();
 
         let loaded = TestSession::load_from(session.id, dir).unwrap();
-        assert_eq!(loaded.messages.len(), 1);
+        assert_eq!(loaded.messages().len(), 1);
     }
 
     #[test]
@@ -1530,27 +1826,27 @@ mod tests {
         let dir = tmp.path();
         let mut session: TestSession = Session::new("m", "/project");
         for i in 0..10 {
-            session.messages.push(user_message(&format!("msg-{i}")));
+            session.push_message(user_message(&format!("msg-{i}")));
         }
-        session.subagent_messages.insert(
+        session.set_subagent_messages(
             "sub-1".into(),
             vec![user_message("sub-prompt"), assistant_message("sub-reply")],
         );
         let mut log = SessionLog::create(dir, &session).unwrap();
 
-        session.messages.truncate(5);
+        session.truncate_messages(5);
         session.tool_outputs.clear();
         session.subagent_messages.remove("sub-1");
         log.compact(dir, &session).unwrap();
 
-        session.messages.push(user_message("after-compact-1"));
-        session.messages.push(user_message("after-compact-2"));
-        session.messages.push(user_message("after-compact-3"));
+        session.push_message(user_message("after-compact-1"));
+        session.push_message(user_message("after-compact-2"));
+        session.push_message(user_message("after-compact-3"));
         log.append(&session).unwrap();
 
         let loaded = TestSession::load_from(session.id, dir).unwrap();
-        assert_eq!(loaded.messages.len(), 8);
-        assert!(loaded.subagent_messages.is_empty());
+        assert_eq!(loaded.messages().len(), 8);
+        assert!(loaded.subagent_messages().is_empty());
     }
 
     /// A rename with no new messages must survive restart, while a no-op
@@ -1560,7 +1856,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
         let mut session: TestSession = Session::new("m", "/project");
-        session.messages.push(user_message("hi"));
+        session.push_message(user_message("hi"));
         let mut log = SessionLog::create(dir, &session).unwrap();
 
         let path = jsonl_path(dir, session.id);
@@ -1582,14 +1878,14 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
         let mut session: TestSession = Session::new("m", "/project");
-        session.messages.push(user_message("legacy"));
+        session.push_message(user_message("legacy"));
 
         let json_path = json_path(dir, session.id);
         fs::write(&json_path, serde_json::to_vec(&session).unwrap()).unwrap();
         update_cwd_index(dir, &session.cwd, session.id).unwrap();
 
         let loaded = TestSession::load_from(session.id, dir).unwrap();
-        assert_eq!(loaded.messages.len(), 1);
+        assert_eq!(loaded.messages().len(), 1);
 
         let _log = TestSession::migrate_to_jsonl(dir, &loaded).unwrap();
 
@@ -1597,7 +1893,7 @@ mod tests {
         assert!(jsonl_path(dir, session.id).exists());
 
         let reloaded = TestSession::load_from(session.id, dir).unwrap();
-        assert_eq!(reloaded.messages.len(), 1);
+        assert_eq!(reloaded.messages().len(), 1);
         assert_eq!(reloaded.model, "m");
     }
 
@@ -1621,13 +1917,13 @@ mod tests {
         let id: MakiId = legacy.parse().unwrap();
         let mut session: TestSession = Session::new("m", "/project");
         session.id = id;
-        session.messages.push(user_message("legacy"));
+        session.push_message(user_message("legacy"));
         let legacy_path = dir.join(format!("{legacy}.jsonl"));
         write_legacy_jsonl(&legacy_path, &session);
 
         let loaded = TestSession::load_from(id, dir).unwrap();
         assert_eq!(loaded.id, id);
-        assert_eq!(loaded.messages.len(), 1);
+        assert_eq!(loaded.messages().len(), 1);
 
         assert!(!legacy_path.exists());
         let canonical = jsonl_path(dir, id);
@@ -1690,7 +1986,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
         let mut s1: TestSession = Session::new("m", "/project");
-        s1.messages.push(user_message("hi"));
+        s1.push_message(user_message("hi"));
         let mut log = SessionLog::create(dir, &s1).unwrap();
         let s2: TestSession = Session::new("m", "/project");
         SessionLog::create(dir, &s2).unwrap();
@@ -1714,7 +2010,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
         let mut s: TestSession = Session::new("m", "/project");
-        s.messages.push(user_message("hi"));
+        s.push_message(user_message("hi"));
         let mut log = SessionLog::create(dir, &s).unwrap();
         s.title = "line one\n\n\tline two".into();
         log.append(&s).unwrap();
@@ -1833,7 +2129,7 @@ mod tests {
         let id: MakiId = legacy.parse().unwrap();
         let mut session: TestSession = Session::new("m", "/project");
         session.id = id;
-        session.messages.push(user_message("legacy"));
+        session.push_message(user_message("legacy"));
         let legacy_path = dir.join(format!("{legacy}.jsonl"));
         write_legacy_jsonl(&legacy_path, &session);
 
@@ -1848,7 +2144,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
         let mut session: TestSession = Session::new("m", "/project");
-        session.messages.push(user_message("hi"));
+        session.push_message(user_message("hi"));
 
         let jsonl_file = jsonl_path(dir, session.id);
         write_legacy_jsonl(&jsonl_file, &session);
@@ -1868,20 +2164,20 @@ mod tests {
         let id: MakiId = LEGACY_HEX_ID.parse().unwrap();
         let mut jsonl_session: TestSession = Session::new("m", "/project");
         jsonl_session.id = id;
-        jsonl_session.messages.push(user_message("newer"));
+        jsonl_session.push_message(user_message("newer"));
 
         let legacy_jsonl = dir.join(format!("{LEGACY_HEX_ID}.jsonl"));
         write_legacy_jsonl(&legacy_jsonl, &jsonl_session);
 
         let mut json_session: TestSession = Session::new("m", "/project");
         json_session.id = id;
-        json_session.messages.push(user_message("older"));
+        json_session.push_message(user_message("older"));
         let legacy_json = dir.join(format!("{LEGACY_HEX_ID}.json"));
         fs::write(&legacy_json, serde_json::to_vec(&json_session).unwrap()).unwrap();
 
         let loaded = TestSession::load_from(id, dir).unwrap();
-        assert_eq!(loaded.messages.len(), 1);
-        assert_eq!(loaded.messages[0], user_message("newer"));
+        assert_eq!(loaded.messages().len(), 1);
+        assert_eq!(loaded.messages()[0], user_message("newer"));
     }
 
     #[test]
@@ -1892,13 +2188,13 @@ mod tests {
         let id: MakiId = LEGACY_HEX_ID.parse().unwrap();
         let mut jsonl_session: TestSession = Session::new("m", "/project");
         jsonl_session.id = id;
-        jsonl_session.messages.push(user_message("newer"));
+        jsonl_session.push_message(user_message("newer"));
         let legacy_jsonl = dir.join(format!("{LEGACY_HEX_ID}.jsonl"));
         write_legacy_jsonl(&legacy_jsonl, &jsonl_session);
 
         let mut json_session: TestSession = Session::new("m", "/project");
         json_session.id = id;
-        json_session.messages.push(user_message("older"));
+        json_session.push_message(user_message("older"));
         let legacy_json = dir.join(format!("{LEGACY_HEX_ID}.json"));
         fs::write(&legacy_json, serde_json::to_vec(&json_session).unwrap()).unwrap();
 
@@ -1921,7 +2217,7 @@ mod tests {
         let id: MakiId = LEGACY_HEX_ID.parse().unwrap();
         let mut session: TestSession = Session::new("m", "/project");
         session.id = id;
-        session.messages.push(user_message("legacy"));
+        session.push_message(user_message("legacy"));
 
         let legacy_jsonl = dir.join(format!("{LEGACY_HEX_ID}.jsonl"));
         write_legacy_jsonl(&legacy_jsonl, &session);
@@ -1942,7 +2238,7 @@ mod tests {
         let id: MakiId = LEGACY_HEX_ID.parse().unwrap();
         let mut session: TestSession = Session::new("m", "/project");
         session.id = id;
-        session.messages.push(user_message("legacy"));
+        session.push_message(user_message("legacy"));
 
         let legacy_jsonl = dir.join(format!("{LEGACY_HEX_ID}.jsonl"));
         write_legacy_jsonl(&legacy_jsonl, &session);
@@ -2073,22 +2369,31 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
         let mut session: TestSession = Session::new("m", "/project");
-        session.messages.push(user_message("first"));
+        session.push_message(user_message("first"));
 
         let mut log = SessionLog::create(dir, &session).unwrap();
-        session.messages.push(assistant_message("reply"));
+        session.push_message(assistant_message("reply"));
         log.append(&session).unwrap();
         drop(log);
 
-        let (loaded, mut log) = SessionLog::open::<Value, Value, Value>(dir, session.id).unwrap();
-        assert_eq!(loaded.messages.len(), 2);
+        let (mut loaded, mut log) =
+            SessionLog::open::<Value, Value, Value>(dir, session.id).unwrap();
+        assert_eq!(loaded.messages().len(), 2);
 
-        session.messages.push(user_message("second"));
-        log.append(&session).unwrap();
+        // The cursors describe the session `open` handed back, not the caller's
+        // older object, so only the returned one may keep appending.
+        session.push_message(user_message("second"));
+        assert!(matches!(
+            log.append(&session),
+            Err(SessionError::LogDiverged { .. })
+        ));
+
+        loaded.push_message(user_message("second"));
+        log.append(&loaded).unwrap();
         drop(log);
 
         let reloaded = TestSession::load_from(session.id, dir).unwrap();
-        assert_eq!(reloaded.messages.len(), 3);
+        assert_eq!(reloaded.messages().len(), 3);
     }
 
     #[test]
@@ -2096,7 +2401,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
         let mut session: TestSession = Session::new("m", "/project");
-        session.messages.push(user_message("first"));
+        session.push_message(user_message("first"));
         drop(SessionLog::create(dir, &session).unwrap());
 
         let path = jsonl_path(dir, session.id);
@@ -2106,13 +2411,13 @@ mod tests {
 
         let (mut loaded, mut log) =
             SessionLog::open::<Value, Value, Value>(dir, session.id).unwrap();
-        assert_eq!(loaded.messages.len(), 1);
-        loaded.messages.push(user_message("second"));
+        assert_eq!(loaded.messages().len(), 1);
+        loaded.push_message(user_message("second"));
         log.append(&loaded).unwrap();
         drop(log);
 
         let reloaded = TestSession::load_from(session.id, dir).unwrap();
-        assert_eq!(reloaded.messages.len(), 2);
+        assert_eq!(reloaded.messages().len(), 2);
     }
 
     #[test]
@@ -2249,7 +2554,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
         let mut session: TestSession = Session::new("m", "/project");
-        session.messages.push(user_message("first"));
+        session.push_message(user_message("first"));
         session
             .tool_outputs
             .insert("t1".into(), serde_json::json!({"result": "ok"}));
@@ -2263,8 +2568,8 @@ mod tests {
         append_raw_msg(&path, user_message("second"));
 
         let loaded = TestSession::load_from(session.id, dir).unwrap();
-        assert_eq!(loaded.messages.len(), 2);
-        assert!(loaded.tool_outputs.contains_key("t1"));
+        assert_eq!(loaded.messages().len(), 2);
+        assert!(loaded.tool_outputs().contains_key("t1"));
     }
 
     #[test]
@@ -2287,7 +2592,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
         let mut session: TestSession = Session::new("m", "/project");
-        session.messages.push(user_message("msg"));
+        session.push_message(user_message("msg"));
         session.save_to(dir).unwrap();
 
         let path = jsonl_path(dir, session.id);
@@ -2297,7 +2602,7 @@ mod tests {
         append_raw_msg(&path, user_message("after"));
 
         let loaded = TestSession::load_from(session.id, dir).unwrap();
-        assert_eq!(loaded.messages.len(), 2);
+        assert_eq!(loaded.messages().len(), 2);
     }
 
     #[test]
@@ -2305,7 +2610,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
         let mut session: TestSession = Session::new("m", "/project");
-        session.messages.push(user_message("first"));
+        session.push_message(user_message("first"));
         session.save_to(dir).unwrap();
 
         let path = jsonl_path(dir, session.id);
@@ -2316,7 +2621,7 @@ mod tests {
         append_raw_msg(&path, user_message("second"));
 
         let loaded = TestSession::load_from(session.id, dir).unwrap();
-        assert_eq!(loaded.messages.len(), 2);
+        assert_eq!(loaded.messages().len(), 2);
     }
 
     #[test]
@@ -2324,15 +2629,15 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
         let mut session: TestSession = Session::new("m", "/project");
-        session.messages.push(user_message("first"));
+        session.push_message(user_message("first"));
         let mut log = SessionLog::create(dir, &session).unwrap();
 
         session.title = "v1".into();
-        session.messages.push(assistant_message("reply"));
+        session.push_message(assistant_message("reply"));
         log.append(&session).unwrap();
 
         session.title = "v2".into();
-        session.messages.push(user_message("second"));
+        session.push_message(user_message("second"));
         log.append(&session).unwrap();
 
         let list = TestSession::list_in("/project", dir).unwrap();
@@ -2359,16 +2664,407 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
         let mut session: TestSession = Session::new("m", "/project");
-        session.messages.push(user_message("msg"));
+        session.push_message(user_message("msg"));
         let mut log = SessionLog::create(dir, &session).unwrap();
 
         session.title = "big-meta".into();
         session.meta.input_draft = Some("x".repeat(TAIL_BUF as usize * 2));
-        session.messages.push(assistant_message("reply"));
+        session.push_message(assistant_message("reply"));
         log.append(&session).unwrap();
 
         let list = TestSession::list_in("/project", dir).unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].title, "big-meta");
+    }
+
+    // -- The log never guesses --
+
+    const PROPERTY_SEED: u64 = 0x2545_F491_4F6C_DD1D;
+    const PROPERTY_STEPS: usize = 500;
+    const MUTATION_KINDS: u64 = 8;
+    const EXTERNAL_TRUNCATION: u64 = 12;
+
+    /// Deterministic xorshift so a failure is always the same failure.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    fn tool_message(id: &str) -> Value {
+        serde_json::json!({ "role": "assistant", "tool": id })
+    }
+
+    fn tool_ids(m: &Value) -> Vec<String> {
+        m.get("tool")
+            .and_then(Value::as_str)
+            .map(|s| vec![s.to_owned()])
+            .unwrap_or_default()
+    }
+
+    /// What the storage writer does: append while the epoch holds, rewrite the
+    /// whole file otherwise.
+    fn write_through(log: &mut SessionLog, dir: &Path, session: &TestSession) {
+        match log.append(session) {
+            Err(SessionError::LogDiverged { .. }) => log.compact(dir, session).unwrap(),
+            other => other.unwrap(),
+        }
+    }
+
+    #[track_caller]
+    fn assert_same_session(loaded: &TestSession, expected: &TestSession) {
+        assert_eq!(loaded.messages(), expected.messages(), "messages");
+        assert_eq!(loaded.tool_outputs(), expected.tool_outputs(), "outputs");
+        assert_eq!(
+            loaded.subagent_messages(),
+            expected.subagent_messages(),
+            "subagent messages",
+        );
+        assert_eq!(loaded.title, expected.title, "title");
+        assert_eq!(loaded.meta, expected.meta, "meta");
+        assert_eq!(loaded.updated_at, expected.updated_at, "updated_at");
+    }
+
+    fn mutate(session: &mut TestSession, rng: &mut Rng, step: usize) {
+        let slot = format!("t{}", rng.below(4));
+        match rng.below(MUTATION_KINDS) {
+            0 => session.push_message(user_message(&format!("msg-{step}"))),
+            1 => {
+                session.push_message(tool_message(&slot));
+                session.push_message(assistant_message("reply"));
+            }
+            2 => session.insert_tool_output(slot, Value::from(format!("out-{step}"))),
+            3 => {
+                let len = rng.below(4) as usize;
+                let msgs = (0..len)
+                    .map(|i| user_message(&format!("sub-{i}")))
+                    .collect();
+                session.set_subagent_messages(slot, msgs);
+            }
+            4 => {
+                let len = session.messages().len();
+                session.truncate_messages(len.saturating_sub(1 + rng.below(3) as usize));
+            }
+            5 => session.replace_messages(vec![user_message(&format!("fresh-{step}"))]),
+            6 => session.prune_orphans(tool_ids),
+            _ => {
+                session.set_title(format!("title-{step}"));
+                session.set_meta(SessionMeta {
+                    input_draft: Some(format!("draft-{step}")),
+                    ..session.meta.clone()
+                });
+            }
+        }
+    }
+
+    /// Every mutation kind in random order, snapshots dropped here and there
+    /// like the writer coalescing them, and the file clobbered now and then.
+    /// Whatever the script, reloading must give back the live session.
+    #[test]
+    fn random_mutation_script_round_trips_through_the_log() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut session: TestSession = Session::new("m", "/project");
+        let mut log = SessionLog::create(dir, &session).unwrap();
+        let mut rng = Rng(PROPERTY_SEED);
+
+        for step in 0..PROPERTY_STEPS {
+            mutate(&mut session, &mut rng, step);
+            // Dropping a snapshot is what coalescing does, and the next write
+            // must still land on a file that matches.
+            if rng.below(3) == 0 {
+                continue;
+            }
+            if rng.below(EXTERNAL_TRUNCATION) == 0 {
+                let path = jsonl_path(dir, session.id);
+                let len = std::fs::metadata(&path).unwrap().len();
+                OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_len(len / 2)
+                    .unwrap();
+            }
+            write_through(&mut log, dir, &session);
+        }
+        write_through(&mut log, dir, &session);
+
+        let loaded = TestSession::load_from(session.id, dir).unwrap();
+        assert_same_session(&loaded, &session);
+    }
+
+    #[test]
+    fn tool_output_rewritten_under_same_id_reaches_disk() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut session: TestSession = Session::new("m", "/project");
+        session.insert_tool_output("t1".into(), Value::from("first"));
+        let mut log = SessionLog::create(dir, &session).unwrap();
+
+        session.insert_tool_output("t1".into(), Value::from("second"));
+        write_through(&mut log, dir, &session);
+
+        let loaded = TestSession::load_from(session.id, dir).unwrap();
+        assert_eq!(loaded.tool_outputs()["t1"], Value::from("second"));
+    }
+
+    #[test]
+    fn shrunk_subagent_history_reaches_disk() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut session: TestSession = Session::new("m", "/project");
+        session.set_subagent_messages("t1".into(), vec![user_message("a"), user_message("b")]);
+        let mut log = SessionLog::create(dir, &session).unwrap();
+
+        session.set_subagent_messages("t1".into(), vec![user_message("a")]);
+        write_through(&mut log, dir, &session);
+
+        let loaded = TestSession::load_from(session.id, dir).unwrap();
+        assert_eq!(loaded.subagent_messages()["t1"].len(), 1);
+    }
+
+    #[test]
+    fn externally_truncated_log_is_rewritten_not_appended() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut session: TestSession = Session::new("m", "/project");
+        session.push_message(user_message("hello"));
+        let mut log = SessionLog::create(dir, &session).unwrap();
+
+        let path = jsonl_path(dir, session.id);
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(0)
+            .unwrap();
+
+        session.push_message(assistant_message("reply"));
+        assert!(matches!(
+            log.append(&session),
+            Err(SessionError::LogDiverged { .. }),
+        ));
+        log.compact(dir, &session).unwrap();
+
+        let loaded = TestSession::load_from(session.id, dir).unwrap();
+        assert_same_session(&loaded, &session);
+    }
+
+    /// Another process grew the log past what this session holds. The reopened
+    /// cursors carry a different epoch, so the write turns into a rewrite
+    /// instead of slicing past the end of the live messages.
+    #[test]
+    fn log_reopened_ahead_of_the_session_diverges_instead_of_panicking() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut written: TestSession = Session::new("m", "/project");
+        for i in 0..3 {
+            written.push_message(user_message(&format!("msg-{i}")));
+        }
+        written.set_subagent_messages("sub-1".into(), vec![user_message("a"), user_message("b")]);
+        SessionLog::create(dir, &written).unwrap();
+
+        let mut behind: TestSession = Session::new("m", "/project");
+        behind.id = written.id;
+        behind.push_message(user_message("msg-0"));
+        let (_, mut log) = SessionLog::open::<Value, Value, Value>(dir, written.id).unwrap();
+
+        assert!(matches!(
+            log.append(&behind),
+            Err(SessionError::LogDiverged { .. }),
+        ));
+        log.compact(dir, &behind).unwrap();
+
+        let loaded = TestSession::load_from(behind.id, dir).unwrap();
+        assert_same_session(&loaded, &behind);
+    }
+
+    /// `Arc::make_mut` deep-copies the session while the writer holds the last
+    /// snapshot, and a checkpoint that changes nothing must not pay for it.
+    #[test]
+    fn unchanged_checkpoint_does_not_clone_the_session() {
+        let mut session: TestSession = Session::new("m", "/project");
+        session.push_message(user_message("hello"));
+        let snapshot = HistorySnapshot::new(session.messages().to_vec());
+        let mut session = Arc::new(session);
+        let meta = session.meta.clone();
+        Session::checkpoint(&mut session, Some(&snapshot), meta.clone(), Value::Null);
+
+        let held = Arc::clone(&session);
+        Session::checkpoint(&mut session, Some(&snapshot), meta.clone(), Value::Null);
+        assert!(Arc::ptr_eq(&held, &session), "no change, no clone");
+
+        Session::checkpoint(
+            &mut session,
+            Some(&snapshot),
+            SessionMeta {
+                input_draft: Some("draft".into()),
+                ..meta
+            },
+            Value::Null,
+        );
+        assert!(!Arc::ptr_eq(&held, &session));
+        assert_eq!(session.meta.input_draft.as_deref(), Some("draft"));
+        assert!(session.revision() > held.revision());
+    }
+
+    #[test]
+    fn unchanged_session_keeps_updated_at_and_revision_stable() {
+        let mut session: TestSession = Session::new("m", "/project");
+        session.push_message(user_message("hello"));
+        let (revision, updated_at) = (session.revision(), session.updated_at);
+
+        session.set_title(session.title.clone());
+        session.set_meta(session.meta.clone());
+        session.truncate_messages(session.messages().len());
+
+        assert_eq!(session.revision(), revision);
+        assert_eq!(session.updated_at, updated_at);
+    }
+
+    /// The corruption the epoch exists for: a snapshot from another run is
+    /// longer than what is on disk, yet shares nothing with it. Going by length
+    /// alone would append its tail and leave one run's head glued to another
+    /// run's tail.
+    #[test]
+    fn checkpoint_from_a_foreign_run_diverges_instead_of_appending_a_tail() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut base: TestSession = Session::new("m", "/project");
+        base.push_message(user_message("a"));
+        base.push_message(assistant_message("b"));
+        let mut log = SessionLog::create(dir, &base).unwrap();
+        let path = jsonl_path(dir, base.id);
+        let size_before = fs::metadata(&path).unwrap().len();
+
+        let mut session = Arc::new(base);
+        let meta = session.meta.clone();
+        let foreign = HistorySnapshot::new(vec![
+            user_message("x"),
+            assistant_message("y"),
+            user_message("z"),
+        ]);
+        Session::checkpoint(&mut session, Some(&foreign), meta, Value::Null);
+
+        assert!(matches!(
+            log.append(&session),
+            Err(SessionError::LogDiverged { .. }),
+        ));
+        assert_eq!(fs::metadata(&path).unwrap().len(), size_before);
+
+        log.compact(dir, &session).unwrap();
+        let loaded = TestSession::load_from(session.id, dir).unwrap();
+        assert_same_session(&loaded, &session);
+    }
+
+    /// Every frame checkpoints, so a checkpoint that only grew the message list
+    /// must stay a small append instead of rewriting the whole file.
+    #[test]
+    fn successive_checkpoints_from_one_run_stay_appendable() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut produced = HistorySnapshot::new(vec![user_message("a")]);
+        let mut session: Arc<TestSession> = Arc::new(Session::new("m", "/project"));
+        let meta = session.meta.clone();
+        Session::checkpoint(&mut session, Some(&produced), meta.clone(), Value::Null);
+
+        let mut log = SessionLog::create(dir, &session).unwrap();
+        for step in 0..3 {
+            Arc::make_mut(&mut produced.messages).push(assistant_message(&format!("reply-{step}")));
+            Session::checkpoint(&mut session, Some(&produced), meta.clone(), Value::Null);
+            log.append(&session).unwrap();
+        }
+
+        let loaded = TestSession::load_from(session.id, dir).unwrap();
+        assert_same_session(&loaded, &session);
+    }
+
+    /// The writer keeps the previous snapshot alive, so the UI ends up mutating
+    /// a deep copy from `Arc::make_mut`. The copy inherits the run token, so the
+    /// cursors the writer holds still describe it.
+    #[test]
+    fn append_cursor_survives_the_clone_arc_make_mut_hands_the_ui() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut base: TestSession = Session::new("m", "/project");
+        base.push_message(user_message("a"));
+        let mut log = SessionLog::create(dir, &base).unwrap();
+
+        let mut session = Arc::new(base);
+        let held = Arc::clone(&session);
+        let live = Arc::make_mut(&mut session);
+        live.push_message(assistant_message("b"));
+        live.insert_tool_output("t1".into(), Value::from("out"));
+        live.set_subagent_messages("s1".into(), vec![user_message("sub")]);
+
+        log.append(&session).unwrap();
+
+        assert_eq!(held.messages().len(), 1, "the writer's snapshot is frozen");
+        let loaded = TestSession::load_from(session.id, dir).unwrap();
+        assert_same_session(&loaded, &session);
+    }
+
+    #[test]
+    fn noop_truncate_keeps_the_log_appendable() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut session: TestSession = Session::new("m", "/project");
+        session.push_message(user_message("a"));
+        session.push_message(assistant_message("b"));
+        let mut log = SessionLog::create(dir, &session).unwrap();
+        let epoch = session.epoch;
+
+        session.truncate_messages(session.messages().len());
+        session.truncate_messages(session.messages().len() + 1);
+        assert_eq!(session.epoch, epoch, "a no-op must not void the cursors");
+
+        session.push_message(user_message("c"));
+        log.append(&session).unwrap();
+
+        let loaded = TestSession::load_from(session.id, dir).unwrap();
+        assert_same_session(&loaded, &session);
+    }
+
+    /// A rewind mints a new run, so a snapshot still in flight carries the
+    /// pre-rewind messages. It is longer than the rewritten log, and splicing
+    /// its tail on would mix the two runs: disk `[a, d]` plus `[c]` while the
+    /// session holds `[a, b, c]`.
+    #[test]
+    fn stale_snapshot_after_a_rewind_is_rewritten_not_spliced() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let produced = HistorySnapshot::new(vec![
+            user_message("a"),
+            assistant_message("b"),
+            user_message("c"),
+        ]);
+        let mut session: Arc<TestSession> = Arc::new(Session::new("m", "/project"));
+        let meta = session.meta.clone();
+        Session::checkpoint(&mut session, Some(&produced), meta.clone(), Value::Null);
+        let mut log = SessionLog::create(dir, &session).unwrap();
+
+        let live = Arc::make_mut(&mut session);
+        live.truncate_messages(1);
+        live.push_message(user_message("d"));
+        write_through(&mut log, dir, &session);
+
+        Session::checkpoint(&mut session, Some(&produced), meta, Value::Null);
+        assert!(matches!(
+            log.append(&session),
+            Err(SessionError::LogDiverged { .. }),
+        ));
+        log.compact(dir, &session).unwrap();
+
+        let loaded = TestSession::load_from(session.id, dir).unwrap();
+        assert_same_session(&loaded, &session);
     }
 }

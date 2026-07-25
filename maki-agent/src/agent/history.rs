@@ -2,32 +2,33 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use maki_providers::{ContentBlock, Message, Role};
+use maki_storage::sessions::next_epoch;
 use tracing::warn;
 
 const CANCEL_MARKER: &str = "[Cancelled by user]";
-const UNAVAILABLE_RESULT: &str = "[Tool result not available]";
+pub const UNAVAILABLE_RESULT: &str = "[Tool result not available]";
 
-pub type SharedMessages = Arc<ArcSwap<Vec<Message>>>;
+pub type HistorySnapshot = maki_storage::sessions::HistorySnapshot<Message>;
+pub type SharedMessages = Arc<ArcSwap<HistorySnapshot>>;
 
 pub struct History {
-    messages: Vec<Message>,
+    messages: Arc<Vec<Message>>,
+    epoch: u64,
     mirror: Option<SharedMessages>,
 }
 
 impl History {
     pub fn new(messages: Vec<Message>) -> Self {
         Self {
-            messages,
+            messages: Arc::new(messages),
+            epoch: next_epoch(),
             mirror: None,
         }
     }
 
     pub fn restored(mut messages: Vec<Message>) -> Self {
         sanitize_restored(&mut messages);
-        Self {
-            messages,
-            mirror: None,
-        }
+        Self::new(messages)
     }
 
     pub fn with_mirror(mut self, mirror: SharedMessages) -> Self {
@@ -63,27 +64,34 @@ impl History {
     }
 
     pub fn replace(&mut self, messages: Vec<Message>) {
+        self.epoch = next_epoch();
         self.edit(|msgs| *msgs = messages);
     }
 
     pub fn truncate(&mut self, len: usize) {
+        self.epoch = next_epoch();
         self.edit(|msgs| msgs.truncate(len));
     }
 
     pub fn into_vec(self) -> Vec<Message> {
-        self.messages
+        Arc::unwrap_or_clone(self.messages)
     }
 
     fn edit(&mut self, f: impl FnOnce(&mut Vec<Message>)) {
-        f(&mut self.messages);
+        f(Arc::make_mut(&mut self.messages));
         self.publish();
     }
 
+    /// The mirror gets the messages as they are. Closing dangling tool calls
+    /// here used to make the snapshot as long as the real results that came
+    /// next, so the log never saw them. Callers that need an API-valid list
+    /// close the dangling calls on their own copy.
     fn publish(&self) {
         let Some(mirror) = &self.mirror else { return };
-        let mut snapshot = self.messages.clone();
-        close_dangling_tool_calls(&mut snapshot, UNAVAILABLE_RESULT);
-        mirror.store(Arc::new(snapshot));
+        mirror.store(Arc::new(HistorySnapshot {
+            epoch: self.epoch,
+            messages: Arc::clone(&self.messages),
+        }));
     }
 }
 
@@ -151,7 +159,7 @@ fn sanitize_restored(messages: &mut Vec<Message>) {
     }
 }
 
-fn close_dangling_tool_calls(messages: &mut Vec<Message>, note: &str) {
+pub fn close_dangling_tool_calls(messages: &mut Vec<Message>, note: &str) {
     let Some(last) = messages.last() else { return };
     if !matches!(last.role, Role::Assistant) || !last.has_tool_calls() {
         return;
@@ -183,10 +191,16 @@ pub(crate) fn sanitize_cancelled_history(history: &mut History, rollback_len: us
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use maki_providers::{ContentBlock, Message, Role};
     use test_case::test_case;
 
     use super::*;
+
+    const FIRST: &str = "first";
+    const SECOND: &str = "second";
+    const GO: &str = "go";
 
     #[track_caller]
     fn assert_ends_with_cancel_marker(history: &History) {
@@ -226,7 +240,7 @@ mod tests {
     }
 
     fn make_mirror() -> SharedMessages {
-        Arc::new(ArcSwap::from_pointee(Vec::new()))
+        Arc::new(ArcSwap::from_pointee(HistorySnapshot::default()))
     }
 
     #[track_caller]
@@ -295,77 +309,66 @@ mod tests {
     }
 
     #[test]
-    fn mirror_sequential_mutations_always_consistent() {
+    fn mirror_is_verbatim_and_epoch_tracks_appends() {
         let mirror = make_mirror();
         let mut history = History::new(Vec::new()).with_mirror(Arc::clone(&mirror));
+        let append_epoch = mirror.load().epoch;
 
         for i in 0..10 {
             history.push(Message::user(format!("msg-{i}")));
-            assert_eq!(mirror.load().len(), i + 1);
+            assert_eq!(mirror.load().messages.len(), i + 1);
+            assert_eq!(mirror.load().epoch, append_epoch, "push is an append");
         }
 
         history.truncate(3);
-        assert_eq!(mirror.load().len(), 3);
+        assert_eq!(mirror.load().messages.len(), 3);
+        let truncate_epoch = mirror.load().epoch;
+        assert_ne!(truncate_epoch, append_epoch, "truncate is not an append");
 
         history.replace(vec![Message::user("fresh".into())]);
-        assert_eq!(mirror.load().len(), 1);
+        assert_eq!(mirror.load().messages.len(), 1);
+        assert_ne!(mirror.load().epoch, truncate_epoch);
 
         history.push(make_tool_use_msg(&["t_final"]));
-        assert_eq!(history.len(), 2, "history has 2");
-        assert_eq!(mirror.load().len(), 3, "mirror has 3 (dangling closed)");
+        assert_eq!(history.len(), 2);
+        assert_eq!(
+            mirror.load().messages.len(),
+            2,
+            "dangling tool_use is mirrored verbatim"
+        );
     }
 
     #[test]
-    fn snapshot_closes_dangling_tool_uses_without_mutating_history() {
-        let mirror = make_mirror();
-        let history = History::new(vec![
-            Message::user("go".into()),
-            make_tool_use_msg(&["t1", "t2"]),
-        ])
-        .with_mirror(Arc::clone(&mirror));
+    fn close_dangling_tool_uses_appends_error_results() {
+        let mut messages = vec![Message::user("go".into()), make_tool_use_msg(&["t1", "t2"])];
+        close_dangling_tool_calls(&mut messages, UNAVAILABLE_RESULT);
 
-        assert_eq!(history.len(), 2, "history itself unchanged");
-
-        let snap = mirror.load();
-        assert_eq!(snap.len(), 3, "snapshot has extra closing message");
-
-        let closing = &snap[2];
+        assert_eq!(messages.len(), 3);
+        let closing = &messages[2];
         assert!(matches!(closing.role, Role::User));
         assert_eq!(extract_error_ids(closing), ["t1", "t2"]);
         assert_eq!(closing.display_text.as_deref(), Some(""));
     }
 
     #[test]
-    fn snapshot_not_dangling_when_tool_result_already_present() {
-        let mirror = make_mirror();
-        let mut history =
-            History::new(vec![Message::user("go".into()), make_tool_use_msg(&["t1"])])
-                .with_mirror(Arc::clone(&mirror));
-
-        assert_eq!(mirror.load().len(), 3, "dangling before result");
-
-        history.push(Message {
-            role: Role::User,
-            content: vec![ContentBlock::ToolResult {
-                tool_use_id: "t1".into(),
-                content: "file contents".into(),
-                is_error: false,
-            }],
-            ..Default::default()
-        });
-
-        let snap = mirror.load();
-        assert_eq!(snap.len(), 3, "no extra closing after real result");
+    fn close_dangling_is_noop_when_tool_result_already_present() {
+        let mut messages = vec![
+            Message::user("go".into()),
+            make_tool_use_msg(&["t1"]),
+            make_tool_result_msg(&["t1"]),
+        ];
+        close_dangling_tool_calls(&mut messages, UNAVAILABLE_RESULT);
+        assert_eq!(messages.len(), 3, "no extra closing after real result");
     }
 
     #[test]
-    fn into_vec_returns_inner_not_snapshot() {
+    fn into_vec_returns_inner_messages() {
         let mirror = make_mirror();
         let history = History::new(vec![Message::user("go".into()), make_tool_use_msg(&["t1"])])
             .with_mirror(Arc::clone(&mirror));
 
-        assert_eq!(mirror.load().len(), 3, "snapshot has closing message");
-        assert_eq!(history.into_vec().len(), 2, "into_vec returns raw messages");
+        assert_eq!(mirror.load().messages.len(), 2);
+        assert_eq!(history.into_vec().len(), 2);
     }
 
     #[test]
@@ -378,12 +381,16 @@ mod tests {
         sanitize_cancelled_history(&mut history, 0);
 
         let snap = mirror.load();
-        assert_eq!(snap.len(), history.len(), "mirror matches history length");
+        assert_eq!(
+            snap.messages.len(),
+            history.len(),
+            "mirror matches history length"
+        );
 
-        let last = snap.last().unwrap();
+        let last = snap.messages.last().unwrap();
         assert!(matches!(&last.content[0], ContentBlock::Text { text } if text == CANCEL_MARKER));
 
-        let tool_result_msg = &snap[snap.len() - 2];
+        let tool_result_msg = &snap.messages[snap.messages.len() - 2];
         assert!(tool_result_msg.content.iter().any(|b| matches!(
             b,
             ContentBlock::ToolResult { content, is_error: true, .. } if content == CANCEL_MARKER
@@ -548,5 +555,139 @@ mod tests {
             history.has_recent_tool_results(depth)
         };
         assert_eq!(result, depth > 0);
+    }
+
+    /// The writer thread serializes a snapshot while the user keeps typing, so
+    /// a published snapshot must never move under it.
+    #[test]
+    fn published_snapshot_is_frozen_against_later_mutations() {
+        let mirror = make_mirror();
+        let mut history =
+            History::new(vec![Message::user(FIRST.into())]).with_mirror(Arc::clone(&mirror));
+
+        let after_new = mirror.load_full();
+        history.push(Message::user(SECOND.into()));
+        assert_eq!(after_new.messages.len(), 1);
+        assert_eq!(after_new.messages[0].user_text(), Some(FIRST));
+        assert!(!Arc::ptr_eq(&after_new.messages, &mirror.load().messages));
+
+        let after_push = mirror.load_full();
+        history.truncate(1);
+        assert_eq!(after_push.messages.len(), 2);
+        assert_eq!(after_push.messages[1].user_text(), Some(SECOND));
+        assert!(!Arc::ptr_eq(&after_push.messages, &mirror.load().messages));
+    }
+
+    /// After a respawn the old run's messages must be gone from the mirror
+    /// right away, not only once the new run pushes something.
+    #[test]
+    fn with_mirror_overwrites_previous_run_snapshot_immediately() {
+        let mirror = make_mirror();
+        let run1 = History::new(vec![Message::user(FIRST.into())]).with_mirror(Arc::clone(&mirror));
+        let run1_epoch = mirror.load().epoch;
+        drop(run1);
+
+        let _run2 = History::new(vec![Message::user(SECOND.into()), Message::user(GO.into())])
+            .with_mirror(Arc::clone(&mirror));
+
+        let snap = mirror.load();
+        assert_eq!(snap.messages.len(), 2);
+        assert_eq!(snap.messages[0].user_text(), Some(SECOND));
+        assert_ne!(snap.epoch, run1_epoch, "run 2 is not an append onto run 1");
+    }
+
+    /// A reused epoch would let a consumer append run 2's messages onto run 1's
+    /// log instead of rewriting it.
+    #[test]
+    fn successive_runs_over_one_mirror_never_reuse_an_epoch() {
+        const RUNS: usize = 3;
+        let mirror = make_mirror();
+        let mut epochs = HashSet::new();
+        epochs.insert(mirror.load().epoch);
+
+        for run in 0..RUNS {
+            let mut history = History::new(vec![Message::user(format!("run-{run}"))])
+                .with_mirror(Arc::clone(&mirror));
+            let epoch = mirror.load().epoch;
+            assert!(epochs.insert(epoch), "epoch {epoch} reused by run {run}");
+
+            history.push(Message::user(GO.into()));
+            assert_eq!(mirror.load().epoch, epoch, "push stays within the run");
+        }
+
+        assert_eq!(epochs.len(), RUNS + 1);
+    }
+
+    #[test]
+    fn restored_mints_fresh_epoch_and_mirrors_sanitized_messages() {
+        let mirror = make_mirror();
+        let seed_epoch = mirror.load().epoch;
+
+        let history = History::restored(vec![
+            Message::user(GO.into()),
+            make_tool_use_msg(&["t1"]),
+            make_tool_result_msg(&["orphan"]),
+        ])
+        .with_mirror(Arc::clone(&mirror));
+
+        let snap = mirror.load();
+        assert_ne!(snap.epoch, seed_epoch);
+        assert!(
+            Arc::ptr_eq(&snap.messages, &history.messages),
+            "mirror shares the sanitized buffer verbatim"
+        );
+        assert_eq!(snap.messages.len(), 3);
+        assert_eq!(extract_error_ids(&snap.messages[2]), ["t1"]);
+    }
+
+    #[test]
+    fn sanitize_cancelled_history_appends_without_minting_an_epoch() {
+        let mirror = make_mirror();
+        let mut history = History::new(vec![Message::user(GO.into()), make_tool_use_msg(&["t1"])])
+            .with_mirror(Arc::clone(&mirror));
+        let epoch = mirror.load().epoch;
+
+        sanitize_cancelled_history(&mut history, 0);
+
+        let snap = mirror.load();
+        assert_eq!(snap.epoch, epoch, "cancel cleanup is a pure append");
+        assert_eq!(snap.messages.len(), 4);
+        assert_eq!(extract_error_ids(&snap.messages[2]), ["t1"]);
+        assert!(matches!(
+            &snap.messages[3].content[0],
+            ContentBlock::Text { text } if text == CANCEL_MARKER
+        ));
+    }
+
+    #[test]
+    fn sanitize_cancelled_history_noop_publishes_nothing() {
+        let mirror = make_mirror();
+        let mut history =
+            History::new(vec![Message::user(GO.into())]).with_mirror(Arc::clone(&mirror));
+        let before = mirror.load_full();
+        let rollback_len = history.len();
+
+        sanitize_cancelled_history(&mut history, rollback_len);
+
+        let after = mirror.load_full();
+        assert_eq!(before.epoch, after.epoch);
+        assert!(Arc::ptr_eq(&before.messages, &after.messages));
+    }
+
+    /// Compaction can swap the whole list for one of the same length, which a
+    /// length-only check would miss and quietly corrupt the log.
+    #[test]
+    fn replace_mints_new_epoch_even_when_length_is_unchanged() {
+        let mirror = make_mirror();
+        let mut history =
+            History::new(vec![Message::user(FIRST.into())]).with_mirror(Arc::clone(&mirror));
+        let epoch = mirror.load().epoch;
+
+        history.replace(vec![Message::user(SECOND.into())]);
+
+        let snap = mirror.load();
+        assert_ne!(snap.epoch, epoch);
+        assert_eq!(snap.messages.len(), 1);
+        assert_eq!(snap.messages[0].user_text(), Some(SECOND));
     }
 }

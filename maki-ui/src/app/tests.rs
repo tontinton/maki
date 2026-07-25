@@ -14,7 +14,7 @@ use maki_agent::{
 };
 use maki_config::{PermissionsConfig, UiConfig};
 use maki_lua::{HintReader, KeymapReader, LuaCommandInfo, LuaCommandReader};
-use maki_providers::{ContentBlock, Effort, Role, TokenUsage};
+use maki_providers::{ContentBlock, Effort, Message, Role, TokenUsage};
 use maki_storage::sessions::{StoredMode, StoredThinking};
 use ratatui::layout::Rect;
 use std::env;
@@ -65,9 +65,13 @@ fn build_app_with_lua(
     )
 }
 
+fn test_writer(dir: StateDir) -> StorageWriter {
+    StorageWriter::new(dir, flume::unbounded().0)
+}
+
 pub(crate) fn test_app() -> App {
     let dir = StateDir::from_path(env::temp_dir());
-    let mut app = build_app(dir.clone(), Arc::new(StorageWriter::new(dir)));
+    let mut app = build_app(dir.clone(), Arc::new(test_writer(dir)));
     let (shared_queue, _rx) = shared_queue::queue();
     app.queue.set_shared(shared_queue);
     app
@@ -76,7 +80,7 @@ pub(crate) fn test_app() -> App {
 fn tempdir_app() -> (TempDir, StateDir, Arc<StorageWriter>, App) {
     let tmp = TempDir::new().unwrap();
     let dir = StateDir::from_path(tmp.path().to_path_buf());
-    let writer = Arc::new(StorageWriter::new(dir.clone()));
+    let writer = Arc::new(test_writer(dir.clone()));
     let app = build_app(dir.clone(), Arc::clone(&writer));
     (tmp, dir, writer, app)
 }
@@ -457,7 +461,7 @@ fn submit_prompt_rejects(mk: fn() -> App, text: &str, expected: &str) {
 
 fn streaming_app_without_queue() -> App {
     let dir = StateDir::from_path(env::temp_dir());
-    let mut app = build_app(dir.clone(), Arc::new(StorageWriter::new(dir)));
+    let mut app = build_app(dir.clone(), Arc::new(test_writer(dir)));
     app.status = Status::Streaming;
     app
 }
@@ -592,10 +596,9 @@ fn reset_session_clears_drafting_plan_in_build_mode() {
 fn load_session_clears_plan() {
     let (_tmp, _dir, _writer, mut app) = tempdir_app();
     app.state
-        .session
-        .messages
-        .push(Message::user("test".into()));
-    app.state.session.save(&app.storage).unwrap();
+        .session_mut()
+        .push_message(Message::user("test".into()));
+    app.state.session_mut().save(&app.storage).unwrap();
     let id = app.state.session.id;
     app.state.mode = Mode::Build;
     app.state.plan = PlanState::Ready(PathBuf::from("old-plan.md"));
@@ -844,7 +847,7 @@ fn turn_complete_accumulates_usage_by_model() {
         None,
     ));
 
-    let by_model = &app.state.session.meta.usage_by_model;
+    let by_model = app.state.session.usage_by_model();
     assert_eq!(by_model.len(), 2);
     let main = &by_model["main-model"];
     assert_eq!(main.input, 100);
@@ -1342,9 +1345,8 @@ fn double_esc_idle_opens_rewind_picker() {
     app.status = Status::Idle;
     app.run_id = 1;
     app.state
-        .session
-        .messages
-        .push(Message::user("hello".into()));
+        .session_mut()
+        .push_message(Message::user("hello".into()));
 
     app.last_esc = Some(Instant::now());
     app.update(Msg::Key(key(KeyCode::Esc)));
@@ -1869,7 +1871,7 @@ fn help_modal_consumes_keys_and_esc_closes() {
 )]
 #[test_case(
     |app: &mut App| {
-        app.state.session.messages.push(Message::user("test".into()));
+        app.state.session_mut().push_message(Message::user("test".into()));
         app.open_rewind_picker();
     },
     &[KeybindContext::RewindPicker],
@@ -1916,34 +1918,34 @@ fn session_has_content_covers_each_branch() {
     assert!(session_has_content(&session));
     session.meta.mode = Some(StoredMode::Build);
 
-    session.messages.push(Message::user("hello".into()));
+    session.push_message(Message::user("hello".into()));
     assert!(session_has_content(&session));
 }
 
 #[test]
 fn save_session_syncs_ephemeral_content_into_meta() {
     let mut app = test_app();
-    app.save_session();
+    app.checkpoint();
     assert!(!session_has_content(&app.state.session));
 
     app.update(Msg::Key(key(KeyCode::Char('x'))));
-    app.save_session();
+    app.checkpoint();
     assert!(session_has_content(&app.state.session));
 
     app.update(Msg::Key(key(KeyCode::Backspace)));
-    app.save_session();
+    app.checkpoint();
     assert!(app.state.session.meta.input_draft.is_none());
     assert!(!session_has_content(&app.state.session));
 
     app.update(Msg::Key(key(KeyCode::Tab)));
-    app.save_session();
+    app.checkpoint();
     assert_eq!(app.state.session.meta.mode, Some(StoredMode::Plan));
     assert!(session_has_content(&app.state.session));
 
     let mut queued = app_with_queued_message();
-    queued.save_session();
+    queued.checkpoint();
     let session = &queued.state.session;
-    assert!(session.messages.is_empty());
+    assert!(session.messages().is_empty());
     assert!(session.meta.input_draft.is_none());
     assert_eq!(session.meta.mode, Some(StoredMode::Build));
     assert_eq!(session.meta.queued_messages, vec!["queued".to_string()]);
@@ -1962,16 +1964,16 @@ fn drain_writer(app: App, writer: Arc<StorageWriter>) {
 fn reload_persists_session_with_content_to_disk() {
     let (_tmp, dir, writer, mut app) = tempdir_app();
     app.state
-        .session
-        .messages
-        .push(Message::user("hello".into()));
+        .session_mut()
+        .push_message(Message::user("hello".into()));
     let actions = app.execute_command(cmd("/reload"));
     assert_eq!(app.exit_request, ExitRequest::Reload);
     assert!(actions.is_empty());
+    app.checkpoint();
     let id = app.state.session.id;
     drain_writer(app, writer);
 
-    assert_eq!(AppSession::load(id, &dir).unwrap().messages.len(), 1);
+    assert_eq!(AppSession::load(id, &dir).unwrap().messages().len(), 1);
 }
 
 #[test]
@@ -1987,48 +1989,16 @@ fn reload_leaves_empty_session_unpersisted_on_disk() {
     assert_eq!(entries, 0);
 }
 
-/// `state.session.tool_outputs` is the only store, so a `ToolDone` write
-/// must reach disk or restored sessions lose their tool call widgets.
-#[test]
-fn tool_done_output_persists_to_disk() {
-    let (_tmp, dir, writer, mut app) = tempdir_app();
-    app.state
-        .session
-        .messages
-        .push(Message::user("prompt".into()));
-    app.status = Status::Streaming;
-    app.run_id = 1;
-
-    app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
-        id: "tool-live".into(),
-        tool: "bash".into(),
-        output: ToolOutput::Plain("live output".into()),
-        is_error: false,
-        annotation: None,
-        written_path: None,
-    }))));
-
-    app.save_session();
-    let id = app.state.session.id;
-    drain_writer(app, writer);
-
-    let loaded = AppSession::load(id, &dir).unwrap();
-    assert!(matches!(
-        loaded.tool_outputs.get("tool-live"),
-        Some(ToolOutput::Plain(s)) if s.text == "live output"
-    ));
-}
-
 #[test]
 fn restore_resumed_session_flushes_queued_messages_and_round_trips() {
     let mut app = test_app();
-    app.state.session.meta.queued_messages = vec!["q1".into(), "q2".into()];
+    app.state.session_mut().meta.queued_messages = vec!["q1".into(), "q2".into()];
 
     app.restore_resumed_session();
     assert!(app.state.session.meta.queued_messages.is_empty());
     assert_eq!(app.queue.text_messages(), ["q1", "q2"]);
 
-    app.save_session();
+    app.checkpoint();
     assert_eq!(app.state.session.meta.queued_messages, ["q1", "q2"]);
 }
 
@@ -2037,7 +2007,7 @@ fn apply_loaded_session_defers_queued_messages_until_respawn() {
     let mut app = test_app();
     let mut session = AppSession::new("test-model", "/tmp/test");
     session.meta.queued_messages = vec!["deferred".into()];
-    session.messages.push(Message::user("hello".into()));
+    session.push_message(Message::user("hello".into()));
 
     let model = app.state.model.clone();
     app.apply_loaded_session(session, &model);
@@ -2139,7 +2109,7 @@ fn typed_lua_command_with_args_executes() {
     let dir = StateDir::from_path(env::temp_dir());
     let mut app = build_app_with_lua(
         dir.clone(),
-        Arc::new(StorageWriter::new(dir)),
+        Arc::new(test_writer(dir)),
         LuaCommandReader::from_commands(vec![LuaCommandInfo {
             name: "/rename".into(),
             description: "Rename the current session".into(),
@@ -2167,7 +2137,7 @@ fn slash_noncommand_sends_as_prompt() {
 fn build_rewind_app() -> App {
     let mut app = test_app();
 
-    app.state.session.messages = vec![
+    app.state.session_mut().replace_messages(vec![
         Message::user("first prompt".into()),
         Message {
             role: Role::Assistant,
@@ -2192,11 +2162,10 @@ fn build_rewind_app() -> App {
             ..Default::default()
         },
         Message::user("third prompt".into()),
-    ];
+    ]);
     app.state
-        .session
-        .tool_outputs
-        .insert("tool-1".into(), ToolOutput::Plain("output".into()));
+        .session_mut()
+        .insert_tool_output("tool-1".into(), ToolOutput::Plain("output".into()));
     app
 }
 
@@ -2212,11 +2181,11 @@ fn rewind_to_middle_truncates_and_populates_input() {
     };
     let actions = app.rewind_to(entry);
 
-    assert_eq!(app.state.session.messages.len(), 2);
-    assert!(app.state.session.tool_outputs.contains_key("tool-1"));
+    assert_eq!(app.state.session.messages().len(), 2);
+    assert!(app.state.session.tool_outputs().contains_key("tool-1"));
     assert_eq!(app.input_box.buffer.value(), "second prompt");
     assert_eq!(app.run_id, old_run_id);
-    let expected_ctx = maki_agent::agent::estimate_message_tokens(&app.state.session.messages);
+    let expected_ctx = maki_agent::agent::estimate_message_tokens(app.state.session.messages());
     assert_eq!(app.state.context_size, expected_ctx);
     assert_eq!(app.chats[0].context_size, expected_ctx);
 
@@ -2239,8 +2208,8 @@ fn rewind_to_first_turn_clears_everything() {
     };
     let actions = app.rewind_to(entry);
 
-    assert!(app.state.session.messages.is_empty());
-    assert!(!app.state.session.tool_outputs.contains_key("tool-1"));
+    assert!(app.state.session.messages().is_empty());
+    assert!(!app.state.session.tool_outputs().contains_key("tool-1"));
     assert_eq!(app.state.token_usage.input, 500);
     assert_eq!(app.state.token_usage.output, 200);
     assert_eq!(app.state.context_size, 0);
@@ -2611,38 +2580,30 @@ fn streaming_app_with_history() -> App {
             ..Default::default()
         },
     ];
-    app.shared_history = Some(Arc::new(ArcSwap::from_pointee(history)));
+    app.shared_history = Some(Arc::new(ArcSwap::from_pointee(
+        maki_agent::HistorySnapshot::new(history),
+    )));
     app
 }
 
+/// The stale event is dropped, yet the cancelled turn still reaches disk: the
+/// next frame's checkpoint syncs the mirror whatever event arrived.
 #[test_case(
-    AgentEvent::Done { usage: TokenUsage::default(), num_turns: 1, stop_reason: None } ; "stale_done_saves_session"
+    AgentEvent::Done { usage: TokenUsage::default(), num_turns: 1, stop_reason: None } ; "stale_done"
 )]
 #[test_case(
-    AgentEvent::Error { message: "timeout".into() } ; "stale_error_saves_session"
+    AgentEvent::Error { message: "timeout".into() } ; "stale_error"
 )]
-fn stale_terminal_event_after_cancel_saves_session(event: AgentEvent) {
+fn checkpoint_after_cancel_persists_the_cancelled_turn(event: AgentEvent) {
     let mut app = streaming_app_with_history();
     let old_run_id = app.run_id;
     cancel_app(&mut app);
     assert_ne!(app.run_id, old_run_id);
-    assert!(app.state.session.messages.is_empty());
+    assert!(app.state.session.messages().is_empty());
 
     app.update(agent_msg_with_run_id(event, old_run_id));
-    assert_eq!(app.state.session.messages.len(), 2);
-}
-
-#[test]
-fn stale_non_terminal_event_does_not_save_session() {
-    let mut app = streaming_app_with_history();
-    let old_run_id = app.run_id;
-    cancel_app(&mut app);
-
-    app.update(agent_msg_with_run_id(
-        turn_complete(TokenUsage::default(), "mock", None),
-        old_run_id,
-    ));
-    assert!(app.state.session.messages.is_empty());
+    app.checkpoint();
+    assert_eq!(app.state.session.messages().len(), 2);
 }
 
 #[test]
@@ -2692,9 +2653,10 @@ fn parent_done_reconciles_unresolved_children_and_tools() {
             .last_message_text()
             .contains(MISSING_TOOL_COMPLETION)
     );
-    assert!(app.state.session.meta.subagents.is_empty());
-    assert_eq!(app.state.session.messages.len(), 2);
-    assert!(app.state.session.tool_outputs.is_empty());
+    app.checkpoint();
+    assert!(app.state.session.subagents().is_empty());
+    assert_eq!(app.state.session.messages().len(), 2);
+    assert!(app.state.session.tool_outputs().is_empty());
     assert!(!app.is_animating());
 }
 
@@ -2731,11 +2693,11 @@ fn parent_error_refreshes_picker_and_persists_only_completed_children() {
 
     assert!(app.task_picker.is_open());
     assert_eq!(app.task_picker.item(2).unwrap().finished, Some(true));
+    app.checkpoint();
     let saved: Vec<_> = app
         .state
         .session
-        .meta
-        .subagents
+        .subagents()
         .iter()
         .map(|subagent| {
             (
@@ -2868,16 +2830,16 @@ fn error_event_matching_run_id_saves_session_and_queued_messages() {
     app.update(agent_msg(AgentEvent::Error {
         message: "boom".into(),
     }));
+    app.checkpoint();
 
-    assert_eq!(app.state.session.messages.len(), 2);
+    assert_eq!(app.state.session.messages().len(), 2);
     assert_eq!(app.state.session.meta.queued_messages, ["next"]);
     assert!(app.queue.is_empty());
 
-    app.save_session();
     assert_eq!(app.state.session.meta.queued_messages, ["next"]);
 
     type_and_submit(&mut app, "replacement");
-    app.save_session();
+    app.checkpoint();
     assert!(app.state.session.meta.queued_messages.is_empty());
 }
 
@@ -2888,15 +2850,16 @@ fn flush_restored_queue_drops_recovery_snapshot() {
     app.update(agent_msg(AgentEvent::Error {
         message: "boom".into(),
     }));
+    app.checkpoint();
     assert_eq!(app.state.session.meta.queued_messages, ["next"]);
 
     app.flush_restored_queue();
-    app.save_session();
+    app.checkpoint();
     assert_eq!(app.state.session.meta.queued_messages, ["next"]);
     assert!(app.recoverable_queue.is_empty());
 
     app.queue.clear();
-    app.save_session();
+    app.checkpoint();
     assert!(app.state.session.meta.queued_messages.is_empty());
 }
 
@@ -3734,4 +3697,273 @@ fn subagent_cancel_then_navigate_back_main_unaffected() {
     assert_eq!(app.active_chat, 0);
     assert_eq!(app.status, Status::Streaming);
     assert!(!app.chats[0].is_finished());
+}
+
+// -- One funnel for handing over a history, one save trigger --
+
+const MID_BATCH_RESULT: &str = "file contents";
+
+fn tool_use_msg(id: &str) -> Message {
+    Message {
+        role: Role::Assistant,
+        content: vec![ContentBlock::ToolUse {
+            id: id.into(),
+            name: "read".into(),
+            input: serde_json::json!({}),
+        }],
+        ..Default::default()
+    }
+}
+
+fn tool_result_msg(id: &str, text: &str) -> Message {
+    Message {
+        role: Role::User,
+        content: vec![ContentBlock::ToolResult {
+            tool_use_id: id.into(),
+            content: text.into(),
+            is_error: false,
+        }],
+        display_text: Some(String::new()),
+    }
+}
+
+fn attach_live_history(app: &mut App, messages: Vec<Message>) -> maki_agent::History {
+    let mirror: maki_agent::SharedMessages =
+        Arc::new(ArcSwap::from_pointee(maki_agent::HistorySnapshot::default()));
+    let history = maki_agent::History::new(messages).with_mirror(Arc::clone(&mirror));
+    app.shared_history = Some(mirror);
+    history
+}
+
+/// Checkpointing mid-batch used to freeze the tools as failed forever. The
+/// synthetic closing message made the snapshot as long as the real results that
+/// followed, so the append cursor never saw them.
+#[test]
+fn mid_batch_checkpoint_does_not_shadow_the_real_tool_results() {
+    let (_tmp, dir, writer, mut app) = tempdir_app();
+    let mut history = attach_live_history(
+        &mut app,
+        vec![Message::user("go".into()), tool_use_msg("t1")],
+    );
+    app.checkpoint();
+
+    history.push(tool_result_msg("t1", MID_BATCH_RESULT));
+    app.checkpoint();
+
+    let id = app.state.session.id;
+    drain_writer(app, writer);
+
+    let loaded = AppSession::load(id, &dir).unwrap();
+    assert_eq!(loaded.messages().len(), 3);
+    let [
+        ContentBlock::ToolResult {
+            content, is_error, ..
+        },
+    ] = &loaded.messages()[2].content[..]
+    else {
+        panic!("expected one real tool result: {:?}", loaded.messages()[2]);
+    };
+    assert_eq!((content.as_str(), *is_error), (MID_BATCH_RESULT, false));
+}
+
+/// In the window between a rewind and the agent respawn, syncing from the
+/// mirror would bring back the messages that were just dropped.
+#[test]
+fn checkpoint_after_rewind_persists_the_truncated_history() {
+    let (_tmp, dir, writer, mut app) = tempdir_app();
+    let _live = attach_live_history(
+        &mut app,
+        vec![
+            Message::user("first prompt".into()),
+            Message::user("second prompt".into()),
+        ],
+    );
+    app.checkpoint();
+
+    let entry = crate::components::rewind_picker::RewindEntry {
+        turn_index: 1,
+        prompt_preview: "2: second".into(),
+        prompt_text: "second prompt".into(),
+    };
+    app.rewind_to(entry);
+    assert!(app.shared_history.is_none(), "mirror handle is dropped");
+    app.checkpoint();
+
+    let id = app.state.session.id;
+    drain_writer(app, writer);
+    assert_eq!(AppSession::load(id, &dir).unwrap().messages().len(), 1);
+}
+
+#[test]
+fn reset_session_never_writes_the_old_conversation_under_the_new_id() {
+    let (_tmp, dir, writer, mut app) = tempdir_app();
+    let _live = attach_live_history(&mut app, vec![Message::user("old talk".into())]);
+    app.checkpoint();
+    let old_id = app.state.session.id;
+
+    app.reset_session();
+    app.checkpoint();
+    let new_id = app.state.session.id;
+    assert_ne!(new_id, old_id);
+
+    drain_writer(app, writer);
+    assert_eq!(AppSession::load(old_id, &dir).unwrap().messages().len(), 1);
+    assert!(
+        AppSession::load(new_id, &dir).is_err(),
+        "an empty session has no content to persist",
+    );
+}
+
+#[test]
+fn idle_checkpoint_changes_nothing() {
+    let mut app = test_app();
+    app.state
+        .session_mut()
+        .push_message(Message::user("hello".into()));
+    app.checkpoint();
+    let (revision, updated_at) = (app.state.session.revision(), app.state.session.updated_at);
+
+    app.checkpoint();
+    app.checkpoint();
+
+    assert_eq!(app.state.session.revision(), revision);
+    assert_eq!(app.state.session.updated_at, updated_at);
+}
+
+const UNSENT_DRAFT: &str = "half typed thought";
+const FIRST_TOOL_ID: &str = "tool-a";
+const SECOND_TOOL_ID: &str = "tool-b";
+const FIRST_TOOL_TEXT: &str = "first output";
+const SECOND_TOOL_TEXT: &str = "second output";
+const LIVE_AGENT_TEXT: &str = "live agent turn";
+const STORED_SESSION_TEXT: &str = "other session talk";
+const SWITCHED_DRAFT: &str = "draft typed after switching";
+const FINISHED_TASK_ID: &str = "task-finished";
+const UNFINISHED_TASK_ID: &str = "task-unfinished";
+
+/// Issue #675: a crash between keystroke and submit threw the draft away,
+/// because nothing was persisted until the turn ended.
+#[test]
+fn unsent_input_draft_reaches_disk_within_a_frame() {
+    let (_tmp, dir, writer, mut app) = tempdir_app();
+    for c in UNSENT_DRAFT.chars() {
+        app.update(Msg::Key(key(KeyCode::Char(c))));
+    }
+    app.checkpoint();
+
+    let id = app.state.session.id;
+    drain_writer(app, writer);
+    let loaded = AppSession::load(id, &dir).unwrap();
+    assert_eq!(loaded.meta.input_draft.as_deref(), Some(UNSENT_DRAFT));
+    assert!(loaded.messages().is_empty());
+}
+
+/// The second result goes through the append cursor the first one opened, so a
+/// stale cursor would quietly drop or duplicate it.
+#[test]
+fn two_tool_results_checkpointed_separately_both_reach_disk() {
+    let (_tmp, dir, writer, mut app) = tempdir_app();
+    app.state
+        .session_mut()
+        .push_message(Message::user("prompt".into()));
+    app.status = Status::Streaming;
+    app.run_id = 1;
+
+    for (tool_id, text) in [
+        (FIRST_TOOL_ID, FIRST_TOOL_TEXT),
+        (SECOND_TOOL_ID, SECOND_TOOL_TEXT),
+    ] {
+        app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+            id: tool_id.into(),
+            tool: "bash".into(),
+            output: ToolOutput::Plain(text.into()),
+            is_error: false,
+            annotation: None,
+            written_path: None,
+        }))));
+        app.checkpoint();
+    }
+
+    let id = app.state.session.id;
+    drain_writer(app, writer);
+    let loaded = AppSession::load(id, &dir).unwrap();
+    let text_of = |tool_id: &str| match loaded.tool_outputs().get(tool_id) {
+        Some(ToolOutput::Plain(s)) => s.text.clone(),
+        other => panic!("missing plain output for {tool_id}: {other:?}"),
+    };
+    assert_eq!(text_of(FIRST_TOOL_ID), FIRST_TOOL_TEXT);
+    assert_eq!(text_of(SECOND_TOOL_ID), SECOND_TOOL_TEXT);
+}
+
+/// Two traps in one switch. `install_local_history` has to drop the mirror
+/// handle, or the old agent's messages land under the freshly loaded id. And
+/// `revision` is `#[serde(skip)]`, so the loaded session starts back at zero and
+/// collides with the revision already sent for the previous one, which only
+/// keying `last_sent` by id survives.
+#[test]
+fn load_session_persists_the_new_session_and_leaks_no_history_into_it() {
+    let (_tmp, dir, writer, mut app) = tempdir_app();
+    let mut stored = AppSession::new("test-model", "/tmp/test");
+    stored.push_message(Message::user(STORED_SESSION_TEXT.into()));
+    stored.save(&dir).unwrap();
+
+    let _live = attach_live_history(&mut app, vec![Message::user(LIVE_AGENT_TEXT.into())]);
+    for c in UNSENT_DRAFT.chars() {
+        app.update(Msg::Key(key(KeyCode::Char(c))));
+    }
+    app.checkpoint();
+    let (live_id, sent_revision) = (app.state.session.id, app.state.session.revision());
+
+    app.load_session(stored.id);
+    assert_eq!(app.state.session.id, stored.id);
+    app.input_box.set_input(SWITCHED_DRAFT.into());
+    app.checkpoint();
+    assert_eq!(
+        app.state.session.revision(),
+        sent_revision,
+        "both sessions must sit at the same revision for this to test anything"
+    );
+
+    drain_writer(app, writer);
+    let loaded = AppSession::load(stored.id, &dir).unwrap();
+    assert_eq!(loaded.meta.input_draft.as_deref(), Some(SWITCHED_DRAFT));
+    assert_eq!(loaded.messages().len(), 1);
+    assert_eq!(loaded.messages()[0].user_text(), Some(STORED_SESSION_TEXT));
+    let previous = AppSession::load(live_id, &dir).unwrap();
+    assert_eq!(previous.messages()[0].user_text(), Some(LIVE_AGENT_TEXT));
+}
+
+/// The `Done` path clears `chat_index` right after pruning it, so nothing can
+/// rebuild the tabs later. Only the `sync_subagents` call inside
+/// `retain_resolved_subagents` carries the survivors over.
+#[test]
+fn turn_end_keeps_only_the_subagents_that_finished() {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    for (task_id, name) in [
+        (FINISHED_TASK_ID, "finished child"),
+        (UNFINISHED_TASK_ID, "open child"),
+    ] {
+        app.update(subagent_msg(
+            AgentEvent::TextDelta { text: "x".into() },
+            task_id,
+            Some(name),
+        ));
+    }
+    finish_subagent(&mut app, FINISHED_TASK_ID, false);
+    assert_eq!(app.state.session.subagents().len(), 2);
+
+    app.update(done_event());
+    assert!(app.chat_index.is_empty());
+    app.checkpoint();
+
+    let ids: Vec<_> = app
+        .state
+        .session
+        .subagents()
+        .iter()
+        .map(|sa| sa.tool_use_id.as_str())
+        .collect();
+    assert_eq!(ids, [FINISHED_TASK_ID]);
 }

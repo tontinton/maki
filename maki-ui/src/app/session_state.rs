@@ -1,10 +1,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use arc_swap::ArcSwap;
-use maki_agent::permissions::PermissionManager;
 use maki_config::Effect;
-use maki_providers::{Message, Model, ThinkingConfig, TokenUsage};
+use maki_providers::{Model, ThinkingConfig, TokenUsage};
 use maki_storage::StateDir;
 use maki_storage::sessions::{StoredEffect, StoredMode, StoredRule};
 
@@ -13,7 +11,8 @@ use crate::AppSession;
 use super::mode::{Mode, PlanState};
 
 pub(crate) struct SessionState {
-    pub session: AppSession,
+    /// Shared with the writer thread, so a checkpoint is just a refcount bump.
+    pub session: Arc<AppSession>,
     pub model: Model,
     pub token_usage: TokenUsage,
     pub context_size: u32,
@@ -78,7 +77,7 @@ impl SessionState {
                 .unwrap_or_default(),
             fast: session.meta.fast && model.supports_fast(),
             workflow: session.meta.workflow,
-            session,
+            session: Arc::new(session),
             model,
             token_usage,
             context_size,
@@ -88,25 +87,8 @@ impl SessionState {
         }
     }
 
-    pub fn sync_session(
-        &mut self,
-        shared_history: &Option<Arc<ArcSwap<Vec<Message>>>>,
-        permissions: &Arc<PermissionManager>,
-    ) {
-        if let Some(history) = shared_history {
-            self.session.messages = Vec::clone(&history.load());
-        }
-        self.session.token_usage = self.token_usage;
-        self.session.meta.context_size = self.context_size;
-        self.session.meta.mode = Some(self.mode.into());
-        self.session.meta.plan_path = self.plan.path().map(|p| p.to_string_lossy().into_owned());
-        self.session.meta.plan_written = self.plan.is_ready();
-        self.session.meta.session_rules = rules_to_stored(&permissions.session_rules_snapshot());
-        self.session.meta.thinking = Some(self.thinking.into());
-        self.session.meta.fast = self.fast;
-        self.session.meta.workflow = self.workflow;
-        self.session.updated_at = maki_storage::now_epoch();
-        self.session.update_title_if_default();
+    pub fn session_mut(&mut self) -> &mut AppSession {
+        Arc::make_mut(&mut self.session)
     }
 
     pub fn update_model(&mut self, model: &Model) {
@@ -116,7 +98,8 @@ impl SessionState {
         if !model.supports_fast() {
             self.fast = false;
         }
-        self.session.model = model.spec();
+        let spec = model.spec();
+        self.session_mut().model = spec;
         self.model = model.clone();
     }
 }

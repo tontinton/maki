@@ -61,7 +61,7 @@ impl SessionStore {
     }
 
     fn record_turn(&mut self, messages: &[Message], model_spec: String) {
-        self.session.messages = messages.to_vec();
+        self.session.replace_messages(messages.to_vec());
         self.session.model = model_spec;
         self.session.update_title_if_default();
         self.save();
@@ -526,7 +526,7 @@ mod tests {
         assert_eq!(loaded.id, session_id());
         assert_eq!(loaded.cwd, CWD);
         assert_eq!(loaded.model, MODEL_SPEC);
-        assert!(loaded.messages.is_empty());
+        assert!(loaded.messages().is_empty());
     }
 
     #[test]
@@ -537,7 +537,7 @@ mod tests {
         store.record_turn(&messages, MODEL_SPEC.into());
 
         let loaded = load(&tmp);
-        assert_eq!(loaded.messages.len(), 1);
+        assert_eq!(loaded.messages().len(), 1);
         assert_eq!(loaded.title, generate_title(&messages));
     }
 
@@ -549,7 +549,7 @@ mod tests {
         drop(store);
 
         let mut store = store_in(&tmp);
-        assert_eq!(store.session.messages.len(), 1);
+        assert_eq!(store.session.messages().len(), 1);
 
         let messages = vec![
             Message::user("first prompt".into()),
@@ -558,7 +558,7 @@ mod tests {
         store.record_turn(&messages, "other/model".into());
 
         let loaded = load(&tmp);
-        assert_eq!(loaded.messages.len(), 2);
+        assert_eq!(loaded.messages().len(), 2);
         assert_eq!(loaded.model, "other/model");
     }
 
