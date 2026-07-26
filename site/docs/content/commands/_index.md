@@ -32,6 +32,7 @@ Type `/` in the input box to open the command palette.
 | `/exit` | Exit the application |
 | `/reload` | Reload plugins and config |
 | `/memory` | View, edit, and delete memory files |
+| `/monitors` | List running monitors |
 | `/rename` | Rename the current session |
 | `/sessions` | Browse and switch sessions |
 

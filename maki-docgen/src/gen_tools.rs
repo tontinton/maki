@@ -30,7 +30,14 @@ const SECTIONS: &[(&str, &[&str])] = &[
     ),
     (
         "Execution & Control",
-        &["batch", "code_execution", "question"],
+        &[
+            "batch",
+            "code_execution",
+            "question",
+            "monitor",
+            "monitor_stop",
+            "monitor_list",
+        ],
     ),
     (
         "Agent & Knowledge",
@@ -111,6 +118,11 @@ fn extract_params(schema: &Value) -> Vec<Param> {
 }
 
 fn write_param_table(out: &mut String, params: &[Param]) {
+    // A tool that takes nothing would otherwise get a header with no rows
+    // under it, which renders as an empty box.
+    if params.is_empty() {
+        return;
+    }
     let has_defaults = params.iter().any(|p| !p.default.is_empty());
     let header = if has_defaults {
         "| Parameter | Type | Required | Default | Description |\n|-----------|------|----------|---------|-------------|"

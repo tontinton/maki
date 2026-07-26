@@ -7,7 +7,7 @@ group = "Reference"
 
 # Tools
 
-Maki ships with 20 built-in tools. This is the full reference.
+Maki ships with 23 built-in tools. This is the full reference.
 
 ## File Operations
 
@@ -152,6 +152,30 @@ Use this tool when you need to ask the user questions during execution. This all
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `questions` | array | yes | List of questions to ask the user |
+
+### `monitor` *(lua plugin)*
+
+Watch a command in the background and report what it prints. Returns straight away; lines arrive later, with the next turn. Use it for a dev server, a test watcher, or a deploy, when you want to know what happened without asking again. Stop it with monitor_stop.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `command` | string | yes | Shell command that prints one line per event, e.g. `tail -f app.log \| grep --line-buffered ERROR`. |
+| `label` | string | no | Short name for this monitor, shown with every line it reports. |
+| `match` | string | no | Lua pattern. When set, only matching lines are reported. |
+| `wake` | boolean | no | Interrupt an idle agent instead of waiting for the next turn. Off by default; use it only for events worth stopping for. |
+
+### `monitor_stop` *(lua plugin)*
+
+Stop a monitor started with the monitor tool.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `id` | integer | yes | Monitor id. |
+
+### `monitor_list` *(lua plugin)*
+
+List the monitors running in this session, with their ids. Use it to find the id of a monitor you want to stop.
+
 
 ## Agent & Knowledge
 

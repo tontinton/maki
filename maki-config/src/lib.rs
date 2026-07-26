@@ -61,6 +61,7 @@ pub const DEFAULT_BUILTINS: &[&str] = &[
     "grep",
     "index",
     "memory",
+    "monitor",
     "question",
     "read",
     "sessions",
