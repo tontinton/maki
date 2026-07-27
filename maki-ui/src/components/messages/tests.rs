@@ -33,7 +33,11 @@ fn start(id: &str, tool: &str) -> ToolStartEvent {
 }
 
 fn panel_with_tools(ids: &[(&str, &'static str)]) -> MessagesPanel {
-    let mut panel = MessagesPanel::new(UiConfig::default(), Arc::new(ratatui_image::picker::Picker::halfblocks()), EventHandle::disconnected_for_test());
+    let mut panel = MessagesPanel::new(
+        UiConfig::default(),
+        Arc::new(ratatui_image::picker::Picker::halfblocks()),
+        EventHandle::disconnected_for_test(),
+    );
     for &(id, tool) in ids {
         panel.tool_start(start(id, tool));
     }
@@ -73,7 +77,11 @@ fn finish_with_live_buf(
 #[test_case(false, ToolStatus::Success ; "success_updates_start_to_success")]
 #[test_case(true,  ToolStatus::Error   ; "error_updates_start_to_error")]
 fn tool_done_updates_start_status(is_error: bool, expected: ToolStatus) {
-    let mut panel = MessagesPanel::new(UiConfig::default(), Arc::new(ratatui_image::picker::Picker::halfblocks()), EventHandle::disconnected_for_test());
+    let mut panel = MessagesPanel::new(
+        UiConfig::default(),
+        Arc::new(ratatui_image::picker::Picker::halfblocks()),
+        EventHandle::disconnected_for_test(),
+    );
     panel.tool_start(start("t1", "bash"));
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
@@ -102,7 +110,11 @@ fn tool_done_updates_start_status(is_error: bool, expected: ToolStatus) {
     ; "grep_files"
 )]
 fn tool_done_sets_annotation(tool: &'static str, output: ToolOutput, expected: Option<&str>) {
-    let mut panel = MessagesPanel::new(UiConfig::default(), Arc::new(ratatui_image::picker::Picker::halfblocks()), EventHandle::disconnected_for_test());
+    let mut panel = MessagesPanel::new(
+        UiConfig::default(),
+        Arc::new(ratatui_image::picker::Picker::halfblocks()),
+        EventHandle::disconnected_for_test(),
+    );
     panel.tool_start(start("t1", tool));
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
@@ -118,7 +130,11 @@ fn tool_done_sets_annotation(tool: &'static str, output: ToolOutput, expected: O
 #[test_case("line\n".repeat(200).as_str(), Some("2m timeout · 200 lines") ; "merges_start_and_output_annotations")]
 #[test_case("ok",                           Some("2m timeout · 1 lines") ; "merges_start_and_short_output")]
 fn tool_done_annotation_merge(output: &str, expected: Option<&str>) {
-    let mut panel = MessagesPanel::new(UiConfig::default(), Arc::new(ratatui_image::picker::Picker::halfblocks()), EventHandle::disconnected_for_test());
+    let mut panel = MessagesPanel::new(
+        UiConfig::default(),
+        Arc::new(ratatui_image::picker::Picker::halfblocks()),
+        EventHandle::disconnected_for_test(),
+    );
     let mut event = start("t1", BASH_TOOL_NAME);
     event.annotation = Some("2m timeout".into());
     panel.tool_start(event);
@@ -146,7 +162,11 @@ fn grep_output(n_files: usize) -> ToolOutput {
 
 #[test]
 fn tool_done_grep_shows_matches() {
-    let mut panel = MessagesPanel::new(UiConfig::default(), Arc::new(ratatui_image::picker::Picker::halfblocks()), EventHandle::disconnected_for_test());
+    let mut panel = MessagesPanel::new(
+        UiConfig::default(),
+        Arc::new(ratatui_image::picker::Picker::halfblocks()),
+        EventHandle::disconnected_for_test(),
+    );
     panel.tool_start(start("t1", GREP_TOOL_NAME));
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
@@ -163,7 +183,11 @@ fn tool_done_grep_shows_matches() {
 
 #[test]
 fn tool_start_flushes_streaming_text() {
-    let mut panel = MessagesPanel::new(UiConfig::default(), Arc::new(ratatui_image::picker::Picker::halfblocks()), EventHandle::disconnected_for_test());
+    let mut panel = MessagesPanel::new(
+        UiConfig::default(),
+        Arc::new(ratatui_image::picker::Picker::halfblocks()),
+        EventHandle::disconnected_for_test(),
+    );
     panel.streaming_text.set_buffer("partial response");
 
     panel.tool_start(start("t1", "read"));
@@ -175,7 +199,11 @@ fn tool_start_flushes_streaming_text() {
 
 #[test]
 fn thinking_delta_separate_from_text() {
-    let mut panel = MessagesPanel::new(UiConfig::default(), Arc::new(ratatui_image::picker::Picker::halfblocks()), EventHandle::disconnected_for_test());
+    let mut panel = MessagesPanel::new(
+        UiConfig::default(),
+        Arc::new(ratatui_image::picker::Picker::halfblocks()),
+        EventHandle::disconnected_for_test(),
+    );
     panel.thinking_delta("reasoning");
     assert_eq!(panel.streaming_thinking, "reasoning");
     assert!(panel.streaming_text.is_empty());
@@ -189,7 +217,11 @@ fn thinking_delta_separate_from_text() {
 
 #[test]
 fn scroll_up_pins_viewport_during_streaming() {
-    let mut panel = MessagesPanel::new(UiConfig::default(), Arc::new(ratatui_image::picker::Picker::halfblocks()), EventHandle::disconnected_for_test());
+    let mut panel = MessagesPanel::new(
+        UiConfig::default(),
+        Arc::new(ratatui_image::picker::Picker::halfblocks()),
+        EventHandle::disconnected_for_test(),
+    );
     panel.streaming_text.set_buffer(&"a\n".repeat(30));
     render(&mut panel, 80, 10);
 
@@ -231,7 +263,11 @@ fn rebuild(panel: &mut MessagesPanel) {
 
 #[test]
 fn ctrl_d_to_bottom_re_enables_auto_scroll() {
-    let mut panel = MessagesPanel::new(UiConfig::default(), Arc::new(ratatui_image::picker::Picker::halfblocks()), EventHandle::disconnected_for_test());
+    let mut panel = MessagesPanel::new(
+        UiConfig::default(),
+        Arc::new(ratatui_image::picker::Picker::halfblocks()),
+        EventHandle::disconnected_for_test(),
+    );
     panel.streaming_text.set_buffer(&"a\n".repeat(30));
     render(&mut panel, 80, 10);
     assert!(panel.auto_scroll);
@@ -248,7 +284,11 @@ fn ctrl_d_to_bottom_re_enables_auto_scroll() {
 
 #[test]
 fn unknown_tool_id_is_noop() {
-    let mut panel = MessagesPanel::new(UiConfig::default(), Arc::new(ratatui_image::picker::Picker::halfblocks()), EventHandle::disconnected_for_test());
+    let mut panel = MessagesPanel::new(
+        UiConfig::default(),
+        Arc::new(ratatui_image::picker::Picker::halfblocks()),
+        EventHandle::disconnected_for_test(),
+    );
     panel.tool_output("ghost", "data");
     panel.tool_done(ToolDoneEvent {
         id: "orphan".into(),
@@ -311,7 +351,11 @@ fn has_scrollbar_thumb(terminal: &ratatui::Terminal<TestBackend>) -> bool {
 #[test_case(40, true  ; "rendered_when_content_overflows")]
 #[test_case(1,  false ; "hidden_when_content_fits")]
 fn scrollbar_visibility(line_count: usize, expected: bool) {
-    let mut panel = MessagesPanel::new(UiConfig::default(), Arc::new(ratatui_image::picker::Picker::halfblocks()), EventHandle::disconnected_for_test());
+    let mut panel = MessagesPanel::new(
+        UiConfig::default(),
+        Arc::new(ratatui_image::picker::Picker::halfblocks()),
+        EventHandle::disconnected_for_test(),
+    );
     panel
         .streaming_text
         .set_buffer(&"line\n".repeat(line_count));
@@ -388,7 +432,11 @@ fn bash_code_start(panel: &mut MessagesPanel, id: &str, code: &str) {
 
 #[test]
 fn bash_live_output_with_code_input() {
-    let mut panel = MessagesPanel::new(UiConfig::default(), Arc::new(ratatui_image::picker::Picker::halfblocks()), EventHandle::disconnected_for_test());
+    let mut panel = MessagesPanel::new(
+        UiConfig::default(),
+        Arc::new(ratatui_image::picker::Picker::halfblocks()),
+        EventHandle::disconnected_for_test(),
+    );
     bash_code_start(&mut panel, "t1", "echo hello");
     rebuild(&mut panel);
 
@@ -465,7 +513,11 @@ fn tool_done_after_cancel_in_progress_does_not_underflow() {
 
 #[test]
 fn selection_freezes_viewport_during_auto_scroll() {
-    let mut panel = MessagesPanel::new(UiConfig::default(), Arc::new(ratatui_image::picker::Picker::halfblocks()), EventHandle::disconnected_for_test());
+    let mut panel = MessagesPanel::new(
+        UiConfig::default(),
+        Arc::new(ratatui_image::picker::Picker::halfblocks()),
+        EventHandle::disconnected_for_test(),
+    );
     panel.streaming_text.set_buffer(&"a\n".repeat(30));
     render(&mut panel, 80, 10);
     assert!(panel.auto_scroll);
@@ -495,7 +547,11 @@ fn seg_search(panel: &MessagesPanel, tool_id: &str) -> String {
 
 #[test]
 fn search_text_grep_result_includes_structured_output() {
-    let mut panel = MessagesPanel::new(UiConfig::default(), Arc::new(ratatui_image::picker::Picker::halfblocks()), EventHandle::disconnected_for_test());
+    let mut panel = MessagesPanel::new(
+        UiConfig::default(),
+        Arc::new(ratatui_image::picker::Picker::halfblocks()),
+        EventHandle::disconnected_for_test(),
+    );
     panel.tool_start(start("t1", "grep"));
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
@@ -512,7 +568,11 @@ fn search_text_grep_result_includes_structured_output() {
 
 #[test]
 fn search_text_diff_output_includes_hunks() {
-    let mut panel = MessagesPanel::new(UiConfig::default(), Arc::new(ratatui_image::picker::Picker::halfblocks()), EventHandle::disconnected_for_test());
+    let mut panel = MessagesPanel::new(
+        UiConfig::default(),
+        Arc::new(ratatui_image::picker::Picker::halfblocks()),
+        EventHandle::disconnected_for_test(),
+    );
     panel.tool_start(start("t1", "edit"));
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
@@ -534,7 +594,11 @@ fn search_text_diff_output_includes_hunks() {
 
 #[test]
 fn search_text_bash_with_code_input() {
-    let mut panel = MessagesPanel::new(UiConfig::default(), Arc::new(ratatui_image::picker::Picker::halfblocks()), EventHandle::disconnected_for_test());
+    let mut panel = MessagesPanel::new(
+        UiConfig::default(),
+        Arc::new(ratatui_image::picker::Picker::halfblocks()),
+        EventHandle::disconnected_for_test(),
+    );
     bash_code_start(&mut panel, "t1", "echo hello");
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
@@ -552,7 +616,11 @@ fn search_text_bash_with_code_input() {
 #[test]
 fn search_text_includes_role_prefix() {
     let md = "# Heading\n\nSome **bold** text";
-    let mut panel = MessagesPanel::new(UiConfig::default(), Arc::new(ratatui_image::picker::Picker::halfblocks()), EventHandle::disconnected_for_test());
+    let mut panel = MessagesPanel::new(
+        UiConfig::default(),
+        Arc::new(ratatui_image::picker::Picker::halfblocks()),
+        EventHandle::disconnected_for_test(),
+    );
     panel.push(DisplayMessage::new(DisplayRole::User, "hello".into()));
     panel.push(DisplayMessage::new(DisplayRole::Assistant, md.into()));
     panel.push(DisplayMessage::new(DisplayRole::Thinking, "hmm".into()));
@@ -612,7 +680,11 @@ fn win_view_clamps_a_restored_offset_past_the_end() {
     const LINES: u16 = 15;
     const HEIGHT: u16 = 10;
 
-    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    let mut panel = MessagesPanel::new(
+        UiConfig::default(),
+        Arc::new(ratatui_image::picker::Picker::halfblocks()),
+        EventHandle::disconnected_for_test(),
+    );
     panel
         .streaming_text
         .set_buffer(&"a\n".repeat(LINES as usize));
@@ -629,7 +701,11 @@ fn win_view_clamps_a_restored_offset_past_the_end() {
 
 #[test]
 fn scroll_clamps_to_max_scroll() {
-    let mut panel = MessagesPanel::new(UiConfig::default(), Arc::new(ratatui_image::picker::Picker::halfblocks()), EventHandle::disconnected_for_test());
+    let mut panel = MessagesPanel::new(
+        UiConfig::default(),
+        Arc::new(ratatui_image::picker::Picker::halfblocks()),
+        EventHandle::disconnected_for_test(),
+    );
     panel.streaming_text.set_buffer(&"a\n".repeat(15));
     render(&mut panel, 80, 10);
     let max = panel.max_scroll();
@@ -641,7 +717,11 @@ fn scroll_clamps_to_max_scroll() {
 #[test_case("bash", 1, 1 ; "known_tool_creates_message")]
 #[test_case("nonexistent_tool", 1, 1 ; "unknown_tool_accepted")]
 fn tool_pending(tool: &str, expected_msgs: usize, expected_in_progress: usize) {
-    let mut panel = MessagesPanel::new(UiConfig::default(), Arc::new(ratatui_image::picker::Picker::halfblocks()), EventHandle::disconnected_for_test());
+    let mut panel = MessagesPanel::new(
+        UiConfig::default(),
+        Arc::new(ratatui_image::picker::Picker::halfblocks()),
+        EventHandle::disconnected_for_test(),
+    );
     panel.tool_pending("t1".into(), tool);
     assert_eq!(panel.messages.len(), expected_msgs);
     assert_eq!(panel.in_progress_count(), expected_in_progress);
@@ -649,7 +729,11 @@ fn tool_pending(tool: &str, expected_msgs: usize, expected_in_progress: usize) {
 
 #[test]
 fn tool_start_upgrades_pending_in_place() {
-    let mut panel = MessagesPanel::new(UiConfig::default(), Arc::new(ratatui_image::picker::Picker::halfblocks()), EventHandle::disconnected_for_test());
+    let mut panel = MessagesPanel::new(
+        UiConfig::default(),
+        Arc::new(ratatui_image::picker::Picker::halfblocks()),
+        EventHandle::disconnected_for_test(),
+    );
     panel.tool_pending("t1".into(), "bash");
     assert_eq!(panel.messages.len(), 1);
     assert_eq!(panel.in_progress_count(), 1);
@@ -694,7 +778,11 @@ fn make_sel(area: Rect, anchor: (u32, u16), cursor: (u32, u16)) -> Selection {
 }
 
 fn panel_with_msgs(texts: &[&str], width: u16, height: u16) -> MessagesPanel {
-    let mut panel = MessagesPanel::new(UiConfig::default(), Arc::new(ratatui_image::picker::Picker::halfblocks()), EventHandle::disconnected_for_test());
+    let mut panel = MessagesPanel::new(
+        UiConfig::default(),
+        Arc::new(ratatui_image::picker::Picker::halfblocks()),
+        EventHandle::disconnected_for_test(),
+    );
     for &text in texts {
         panel.push(DisplayMessage::new(DisplayRole::Assistant, text.into()));
     }
@@ -728,7 +816,11 @@ fn extract_skips_out_of_range_segments() {
 
 #[test]
 fn extract_off_screen_rows_via_temp_buffer() {
-    let mut panel = MessagesPanel::new(UiConfig::default(), Arc::new(ratatui_image::picker::Picker::halfblocks()), EventHandle::disconnected_for_test());
+    let mut panel = MessagesPanel::new(
+        UiConfig::default(),
+        Arc::new(ratatui_image::picker::Picker::halfblocks()),
+        EventHandle::disconnected_for_test(),
+    );
     let text = (0..20)
         .map(|i| format!("line {i}"))
         .collect::<Vec<_>>()
@@ -761,7 +853,11 @@ fn extract_mixed_fully_enclosed_and_partial() {
 #[test_case(&["line-0\nline-1\nline-2\nline-3"], "line-0", "line-3" ; "single_segment")]
 #[test_case(&["seg-A-text", "seg-B-text"],      "seg-A-text", "seg-B-text" ; "across_segments")]
 fn extract_partial_col_symmetric(msgs: &[&str], expect_start: &str, expect_end: &str) {
-    let mut panel = MessagesPanel::new(UiConfig::default(), Arc::new(ratatui_image::picker::Picker::halfblocks()), EventHandle::disconnected_for_test());
+    let mut panel = MessagesPanel::new(
+        UiConfig::default(),
+        Arc::new(ratatui_image::picker::Picker::halfblocks()),
+        EventHandle::disconnected_for_test(),
+    );
     for &text in msgs {
         panel.push(DisplayMessage::new(DisplayRole::Assistant, text.into()));
     }
@@ -782,7 +878,11 @@ fn extract_partial_col_symmetric(msgs: &[&str], expect_start: &str, expect_end: 
 fn extract_wrapped_no_soft_breaks(template: &str, anchor: (u32, u16)) {
     let long = "x".repeat(200);
     let msg = template.replace("{L}", &long);
-    let mut panel = MessagesPanel::new(UiConfig::default(), Arc::new(ratatui_image::picker::Picker::halfblocks()), EventHandle::disconnected_for_test());
+    let mut panel = MessagesPanel::new(
+        UiConfig::default(),
+        Arc::new(ratatui_image::picker::Picker::halfblocks()),
+        EventHandle::disconnected_for_test(),
+    );
     panel.push(DisplayMessage::new(DisplayRole::Assistant, msg));
     render(&mut panel, 40, 30);
     let total: u16 = panel.segment_heights().iter().sum();
@@ -797,7 +897,11 @@ fn extract_wrapped_no_soft_breaks(template: &str, anchor: (u32, u16)) {
 
 #[test]
 fn extract_partial_last_line_truncated() {
-    let mut panel = MessagesPanel::new(UiConfig::default(), Arc::new(ratatui_image::picker::Picker::halfblocks()), EventHandle::disconnected_for_test());
+    let mut panel = MessagesPanel::new(
+        UiConfig::default(),
+        Arc::new(ratatui_image::picker::Picker::halfblocks()),
+        EventHandle::disconnected_for_test(),
+    );
     panel.push(DisplayMessage::new(
         DisplayRole::Assistant,
         "first\nABCDEFGHIJKLMNOP".into(),
@@ -816,7 +920,11 @@ fn panel_with_long_tool(line_count: usize) -> MessagesPanel {
         .map(|i| format!("line {i}"))
         .collect::<Vec<_>>()
         .join("\n");
-    let mut panel = MessagesPanel::new(UiConfig::default(), Arc::new(ratatui_image::picker::Picker::halfblocks()), EventHandle::disconnected_for_test());
+    let mut panel = MessagesPanel::new(
+        UiConfig::default(),
+        Arc::new(ratatui_image::picker::Picker::halfblocks()),
+        EventHandle::disconnected_for_test(),
+    );
     panel.tool_start(ToolStartEvent {
         id: "t1".into(),
         tool: BASH_TOOL_NAME.into(),
@@ -881,7 +989,11 @@ fn panel_with_grep_tool(match_count: usize) -> MessagesPanel {
             .map(|i| GrepMatchGroup::single(i, format!("match_{i}")))
             .collect(),
     }];
-    let mut panel = MessagesPanel::new(UiConfig::default(), Arc::new(ratatui_image::picker::Picker::halfblocks()), EventHandle::disconnected_for_test());
+    let mut panel = MessagesPanel::new(
+        UiConfig::default(),
+        Arc::new(ratatui_image::picker::Picker::halfblocks()),
+        EventHandle::disconnected_for_test(),
+    );
     panel.tool_start(ToolStartEvent {
         id: "t1".into(),
         tool: GREP_TOOL_NAME.into(),
@@ -935,7 +1047,11 @@ fn buffer_text(terminal: &ratatui::Terminal<TestBackend>) -> String {
 
 #[test]
 fn streaming_with_cached_segments_shows_end_on_auto_scroll() {
-    let mut panel = MessagesPanel::new(UiConfig::default(), Arc::new(ratatui_image::picker::Picker::halfblocks()), EventHandle::disconnected_for_test());
+    let mut panel = MessagesPanel::new(
+        UiConfig::default(),
+        Arc::new(ratatui_image::picker::Picker::halfblocks()),
+        EventHandle::disconnected_for_test(),
+    );
     panel.push(DisplayMessage::new(
         DisplayRole::User,
         "a\n".repeat(20).trim().into(),
@@ -961,7 +1077,11 @@ fn search_text_includes_truncated_bash_output() {
         .map(|i| format!("line {i}"))
         .collect::<Vec<_>>()
         .join("\n");
-    let mut panel = MessagesPanel::new(UiConfig::default(), Arc::new(ratatui_image::picker::Picker::halfblocks()), EventHandle::disconnected_for_test());
+    let mut panel = MessagesPanel::new(
+        UiConfig::default(),
+        Arc::new(ratatui_image::picker::Picker::halfblocks()),
+        EventHandle::disconnected_for_test(),
+    );
     bash_code_start(&mut panel, "t1", "echo lines");
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
@@ -999,7 +1119,11 @@ fn prev_segment_is_spacer(panel: &MessagesPanel, tool_id: &str) -> bool {
 
 #[test]
 fn instruction_segment_has_spacer_before_it() {
-    let mut panel = MessagesPanel::new(UiConfig::default(), Arc::new(ratatui_image::picker::Picker::halfblocks()), EventHandle::disconnected_for_test());
+    let mut panel = MessagesPanel::new(
+        UiConfig::default(),
+        Arc::new(ratatui_image::picker::Picker::halfblocks()),
+        EventHandle::disconnected_for_test(),
+    );
     panel.tool_start(start("t1", "read"));
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
@@ -1028,7 +1152,11 @@ fn seg_line_count(panel: &MessagesPanel, tool_id: &str) -> usize {
 
 #[test]
 fn toggle_instruction_segment_expands_and_collapses() {
-    let mut panel = MessagesPanel::new(UiConfig::default(), Arc::new(ratatui_image::picker::Picker::halfblocks()), EventHandle::disconnected_for_test());
+    let mut panel = MessagesPanel::new(
+        UiConfig::default(),
+        Arc::new(ratatui_image::picker::Picker::halfblocks()),
+        EventHandle::disconnected_for_test(),
+    );
     let blocks = vec![InstructionBlock {
         path: "agents.md".into(),
         content: "x\n".repeat(100),
@@ -1056,7 +1184,11 @@ fn toggle_instruction_segment_expands_and_collapses() {
 
 #[test]
 fn handle_click_returns_nothing_when_no_segment_at_row() {
-    let mut panel = MessagesPanel::new(UiConfig::default(), Arc::new(ratatui_image::picker::Picker::halfblocks()), EventHandle::disconnected_for_test());
+    let mut panel = MessagesPanel::new(
+        UiConfig::default(),
+        Arc::new(ratatui_image::picker::Picker::halfblocks()),
+        EventHandle::disconnected_for_test(),
+    );
     render(&mut panel, 80, 24);
     let area = Rect::new(0, 0, 80, 24);
     assert!(!panel.handle_click(23, area));
@@ -1064,7 +1196,11 @@ fn handle_click_returns_nothing_when_no_segment_at_row() {
 
 #[test]
 fn handle_click_on_done_tool_records_click_row() {
-    let mut panel = MessagesPanel::new(UiConfig::default(), Arc::new(ratatui_image::picker::Picker::halfblocks()), EventHandle::disconnected_for_test());
+    let mut panel = MessagesPanel::new(
+        UiConfig::default(),
+        Arc::new(ratatui_image::picker::Picker::halfblocks()),
+        EventHandle::disconnected_for_test(),
+    );
     panel.tool_start(start("t1", BASH_TOOL_NAME));
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
@@ -1087,7 +1223,11 @@ fn handle_click_on_done_tool_records_click_row() {
 
 #[test]
 fn handle_click_on_running_tool_forwards_live_without_recording() {
-    let mut panel = MessagesPanel::new(UiConfig::default(), Arc::new(ratatui_image::picker::Picker::halfblocks()), EventHandle::disconnected_for_test());
+    let mut panel = MessagesPanel::new(
+        UiConfig::default(),
+        Arc::new(ratatui_image::picker::Picker::halfblocks()),
+        EventHandle::disconnected_for_test(),
+    );
     panel.tool_start(start("t1", BASH_TOOL_NAME));
     panel.tool_snapshot(
         "t1",
@@ -1109,7 +1249,11 @@ fn handle_click_returns_toggled_for_truncated_tool_without_snapshot() {
 
 #[test]
 fn handle_click_non_tool_segment_returns_nothing() {
-    let mut panel = MessagesPanel::new(UiConfig::default(), Arc::new(ratatui_image::picker::Picker::halfblocks()), EventHandle::disconnected_for_test());
+    let mut panel = MessagesPanel::new(
+        UiConfig::default(),
+        Arc::new(ratatui_image::picker::Picker::halfblocks()),
+        EventHandle::disconnected_for_test(),
+    );
     panel.push(DisplayMessage::new(
         DisplayRole::User,
         "user message".into(),
@@ -1124,7 +1268,11 @@ fn tool_done_removes_live_buf_and_snapshots_dirty() {
     let buf = Arc::new(maki_agent::SharedBuf::new());
     buf.set_lines(vec![snap_line("dirty content")]);
 
-    let mut panel = MessagesPanel::new(UiConfig::default(), Arc::new(ratatui_image::picker::Picker::halfblocks()), EventHandle::disconnected_for_test());
+    let mut panel = MessagesPanel::new(
+        UiConfig::default(),
+        Arc::new(ratatui_image::picker::Picker::halfblocks()),
+        EventHandle::disconnected_for_test(),
+    );
     panel.register_live_buf("t1".into(), Arc::clone(&buf));
     panel.tool_start(start("t1", BASH_TOOL_NAME));
     panel.tool_done(ToolDoneEvent {
@@ -1152,7 +1300,11 @@ fn second_register_live_buf_replaces_first() {
     let handler = Arc::new(maki_agent::SharedBuf::new());
     handler.set_lines(vec![snap_line("handler")]);
 
-    let mut panel = MessagesPanel::new(UiConfig::default(), Arc::new(ratatui_image::picker::Picker::halfblocks()), EventHandle::disconnected_for_test());
+    let mut panel = MessagesPanel::new(
+        UiConfig::default(),
+        Arc::new(ratatui_image::picker::Picker::halfblocks()),
+        EventHandle::disconnected_for_test(),
+    );
     panel.tool_start(start("t1", BASH_TOOL_NAME));
     panel.register_live_buf("t1".into(), Arc::clone(&preview));
     panel.register_live_buf("t1".into(), Arc::clone(&handler));
@@ -1173,7 +1325,11 @@ fn second_register_live_buf_replaces_first() {
 fn handle_click_on_watched_tool_sends_click_with_fallback(is_error: bool) {
     let (eh, probe) = maki_lua::test_support::probed_event_handle();
     let (tx, _rx) = flume::unbounded();
-    let mut panel = MessagesPanel::new(UiConfig::default(), Arc::new(ratatui_image::picker::Picker::halfblocks()), eh);
+    let mut panel = MessagesPanel::new(
+        UiConfig::default(),
+        Arc::new(ratatui_image::picker::Picker::halfblocks()),
+        eh,
+    );
     panel.set_restore_channel(Some(EventSender::new(tx, 0)));
     finish_with_live_buf(&mut panel, "t1", "body", is_error);
     assert!(panel.watching("t1"));
@@ -1189,7 +1345,11 @@ fn handle_click_on_watched_tool_sends_click_with_fallback(is_error: bool) {
 
 #[test]
 fn tool_done_moves_live_buf_to_watched_polled_but_not_animating() {
-    let mut panel = MessagesPanel::new(UiConfig::default(), Arc::new(ratatui_image::picker::Picker::halfblocks()), EventHandle::disconnected_for_test());
+    let mut panel = MessagesPanel::new(
+        UiConfig::default(),
+        Arc::new(ratatui_image::picker::Picker::halfblocks()),
+        EventHandle::disconnected_for_test(),
+    );
     let buf = finish_with_live_buf(&mut panel, "t1", "before", false);
     assert!(panel.watching("t1"));
     assert!(
@@ -1210,7 +1370,11 @@ fn tool_done_moves_live_buf_to_watched_polled_but_not_animating() {
 fn watched_fifo_evicts_oldest_which_stops_polling_and_restores_with_recorded_clicks() {
     let (eh, probe) = maki_lua::test_support::probed_event_handle();
     let (tx, _rx) = flume::unbounded();
-    let mut panel = MessagesPanel::new(UiConfig::default(), Arc::new(ratatui_image::picker::Picker::halfblocks()), eh);
+    let mut panel = MessagesPanel::new(
+        UiConfig::default(),
+        Arc::new(ratatui_image::picker::Picker::halfblocks()),
+        eh,
+    );
     panel.set_restore_channel(Some(EventSender::new(tx, 0)));
     let buf = finish_with_live_buf(&mut panel, "t0", "before", false);
 
@@ -1251,7 +1415,11 @@ fn watched_fifo_evicts_oldest_which_stops_polling_and_restores_with_recorded_cli
 fn tool_done_without_live_buf_is_not_watched_and_click_restores() {
     let (eh, probe) = maki_lua::test_support::probed_event_handle();
     let (tx, _rx) = flume::unbounded();
-    let mut panel = MessagesPanel::new(UiConfig::default(), Arc::new(ratatui_image::picker::Picker::halfblocks()), eh);
+    let mut panel = MessagesPanel::new(
+        UiConfig::default(),
+        Arc::new(ratatui_image::picker::Picker::halfblocks()),
+        eh,
+    );
     panel.set_restore_channel(Some(EventSender::new(tx, 0)));
     let mut ev = start("t1", BASH_TOOL_NAME);
     ev.raw_input = Some(serde_json::json!({ "command": "true" }));
@@ -1281,7 +1449,11 @@ fn tool_done_without_live_buf_is_not_watched_and_click_restores() {
 fn cancel_in_progress_retires_live_buf_to_watched() {
     let (eh, probe) = maki_lua::test_support::probed_event_handle();
     let (tx, _rx) = flume::unbounded();
-    let mut panel = MessagesPanel::new(UiConfig::default(), Arc::new(ratatui_image::picker::Picker::halfblocks()), eh);
+    let mut panel = MessagesPanel::new(
+        UiConfig::default(),
+        Arc::new(ratatui_image::picker::Picker::halfblocks()),
+        eh,
+    );
     panel.set_restore_channel(Some(EventSender::new(tx, 0)));
     let buf = Arc::new(maki_agent::SharedBuf::new());
     buf.set_lines(vec![snap_line("body")]);
@@ -1319,7 +1491,11 @@ fn cancel_in_progress_retires_live_buf_to_watched() {
 fn restore_reply_stops_watching_buf() {
     let (eh, probe) = maki_lua::test_support::probed_event_handle();
     let (tx, _rx) = flume::unbounded();
-    let mut panel = MessagesPanel::new(UiConfig::default(), Arc::new(ratatui_image::picker::Picker::halfblocks()), eh);
+    let mut panel = MessagesPanel::new(
+        UiConfig::default(),
+        Arc::new(ratatui_image::picker::Picker::halfblocks()),
+        eh,
+    );
     panel.set_restore_channel(Some(EventSender::new(tx, 0)));
     let buf = finish_with_live_buf(&mut panel, "t1", "old-theme", false);
     assert!(panel.watching("t1"));
@@ -1358,7 +1534,11 @@ fn restore_reply_stops_watching_buf() {
 fn rebake_request_stops_watching_buf() {
     let (eh, probe) = maki_lua::test_support::probed_event_handle();
     let (tx, _rx) = flume::unbounded();
-    let mut panel = MessagesPanel::new(UiConfig::default(), Arc::new(ratatui_image::picker::Picker::halfblocks()), eh);
+    let mut panel = MessagesPanel::new(
+        UiConfig::default(),
+        Arc::new(ratatui_image::picker::Picker::halfblocks()),
+        eh,
+    );
     panel.set_restore_channel(Some(EventSender::new(tx, 0)));
     finish_with_live_buf(&mut panel, "t1", "old-theme", false);
     assert!(panel.watching("t1"));
@@ -1373,7 +1553,11 @@ fn rebake_request_stops_watching_buf() {
 #[test]
 fn live_buf_streams_across_clean_polls() {
     let buf = Arc::new(maki_agent::SharedBuf::new());
-    let mut panel = MessagesPanel::new(UiConfig::default(), Arc::new(ratatui_image::picker::Picker::halfblocks()), EventHandle::disconnected_for_test());
+    let mut panel = MessagesPanel::new(
+        UiConfig::default(),
+        Arc::new(ratatui_image::picker::Picker::halfblocks()),
+        EventHandle::disconnected_for_test(),
+    );
     panel.tool_start(start("t1", BASH_TOOL_NAME));
     panel.register_live_buf("t1".into(), Arc::clone(&buf));
 
@@ -1391,7 +1575,11 @@ fn live_buf_streams_across_clean_polls() {
 
 #[test]
 fn tool_done_without_live_buf_preserves_existing_snapshot() {
-    let mut panel = MessagesPanel::new(UiConfig::default(), Arc::new(ratatui_image::picker::Picker::halfblocks()), EventHandle::disconnected_for_test());
+    let mut panel = MessagesPanel::new(
+        UiConfig::default(),
+        Arc::new(ratatui_image::picker::Picker::halfblocks()),
+        EventHandle::disconnected_for_test(),
+    );
     panel.tool_start(start("t1", BASH_TOOL_NAME));
     panel.tool_snapshot(
         "t1",
@@ -1418,7 +1606,11 @@ fn tool_done_without_live_buf_preserves_existing_snapshot() {
 fn tool_done_clean_live_buf_does_not_snapshot() {
     let buf = Arc::new(maki_agent::SharedBuf::new());
 
-    let mut panel = MessagesPanel::new(UiConfig::default(), Arc::new(ratatui_image::picker::Picker::halfblocks()), EventHandle::disconnected_for_test());
+    let mut panel = MessagesPanel::new(
+        UiConfig::default(),
+        Arc::new(ratatui_image::picker::Picker::halfblocks()),
+        EventHandle::disconnected_for_test(),
+    );
     panel.register_live_buf("t1".into(), Arc::clone(&buf));
     panel.tool_start(start("t1", BASH_TOOL_NAME));
     panel.tool_done(ToolDoneEvent {
@@ -1445,7 +1637,11 @@ const SUPERSEDED_DROP_MSG: &str =
     "a re-bake reply older than the applied generation must be dropped (monotonic)";
 
 fn bash_tool_with_snapshot(id: &str) -> MessagesPanel {
-    let mut panel = MessagesPanel::new(UiConfig::default(), Arc::new(ratatui_image::picker::Picker::halfblocks()), EventHandle::disconnected_for_test());
+    let mut panel = MessagesPanel::new(
+        UiConfig::default(),
+        Arc::new(ratatui_image::picker::Picker::halfblocks()),
+        EventHandle::disconnected_for_test(),
+    );
     panel.tool_start(start(id, BASH_TOOL_NAME));
     panel.tool_done(ToolDoneEvent {
         id: id.into(),
@@ -1519,7 +1715,11 @@ const REBAKE_NOOP_MSG: &str = "rebake without channel must be a no-op (no reques
 #[test_case(false ; "fresh_start")]
 #[test_case(true  ; "upgrade_from_pending")]
 fn tool_start_propagates_raw_input(pre_pending: bool) {
-    let mut panel = MessagesPanel::new(UiConfig::default(), Arc::new(ratatui_image::picker::Picker::halfblocks()), EventHandle::disconnected_for_test());
+    let mut panel = MessagesPanel::new(
+        UiConfig::default(),
+        Arc::new(ratatui_image::picker::Picker::halfblocks()),
+        EventHandle::disconnected_for_test(),
+    );
     if pre_pending {
         panel.tool_pending("t1".into(), BASH_TOOL_NAME);
     }
@@ -1542,7 +1742,11 @@ fn tool_start_propagates_raw_input(pre_pending: bool) {
 
 #[test]
 fn header_snapshot_stamps_gen_on_top_level() {
-    let mut panel = MessagesPanel::new(UiConfig::default(), Arc::new(ratatui_image::picker::Picker::halfblocks()), EventHandle::disconnected_for_test());
+    let mut panel = MessagesPanel::new(
+        UiConfig::default(),
+        Arc::new(ratatui_image::picker::Picker::halfblocks()),
+        EventHandle::disconnected_for_test(),
+    );
     panel.tool_start(start("t1", BASH_TOOL_NAME));
     panel.tool_header_snapshot("t1", rendered_snapshot(), Some(5));
 
@@ -1553,7 +1757,11 @@ fn header_snapshot_stamps_gen_on_top_level() {
 
 #[test]
 fn live_snapshot_uses_panel_generation() {
-    let mut panel = MessagesPanel::new(UiConfig::default(), Arc::new(ratatui_image::picker::Picker::halfblocks()), EventHandle::disconnected_for_test());
+    let mut panel = MessagesPanel::new(
+        UiConfig::default(),
+        Arc::new(ratatui_image::picker::Picker::halfblocks()),
+        EventHandle::disconnected_for_test(),
+    );
     panel.tool_start(start("t1", BASH_TOOL_NAME));
     panel.tool_snapshot("t1", rendered_snapshot(), None);
 
@@ -1676,7 +1884,11 @@ fn hide_keeps_cached_thinking_as_indicator() {
 
 #[test]
 fn full_default_renders_streaming_thinking() {
-    let mut panel = MessagesPanel::new(UiConfig::default(), Arc::new(ratatui_image::picker::Picker::halfblocks()), EventHandle::disconnected_for_test());
+    let mut panel = MessagesPanel::new(
+        UiConfig::default(),
+        Arc::new(ratatui_image::picker::Picker::halfblocks()),
+        EventHandle::disconnected_for_test(),
+    );
     panel.streaming_thinking.set_buffer("visible reasoning");
     let terminal = render(&mut panel, 80, 10);
     let text = buffer_text(&terminal);

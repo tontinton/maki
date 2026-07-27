@@ -52,7 +52,12 @@ pub struct Chat {
 }
 
 impl Chat {
-    pub fn new(name: String, ui_config: UiConfig, picker: Arc<Picker>, lua_event_handle: maki_lua::EventHandle) -> Self {
+    pub fn new(
+        name: String,
+        ui_config: UiConfig,
+        picker: Arc<Picker>,
+        lua_event_handle: maki_lua::EventHandle,
+    ) -> Self {
         Self {
             name,
             cost: None,

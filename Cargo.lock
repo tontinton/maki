@@ -2658,7 +2658,7 @@ dependencies = [
  "mlua",
  "pin-project-lite",
  "regex",
- "rustix",
+ "rustix 1.1.4",
  "serde_json",
  "serde_yaml",
  "smol",
