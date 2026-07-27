@@ -167,7 +167,7 @@ impl ProviderKind {
             Self::Copilot => Some(100_000),
             Self::Ollama => Some(16_384),
             Self::LlamaCpp => None,
-            Self::Mistral => Some(32_000),
+            Self::Mistral => None,
             Self::Zai => Some(16_000),
             Self::DeepSeek => Some(384_000),
             Self::OpenRouter => Some(128_000),

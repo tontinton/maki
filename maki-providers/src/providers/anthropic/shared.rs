@@ -397,7 +397,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                 cache_read: 0.10,
                 fast: None,
             },
-            max_output_tokens: 64000,
+            max_output_tokens: Some(64000),
             context_window: 200_000,
         },
         ModelEntry {
@@ -413,7 +413,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                 cache_read: 0.30,
                 fast: None,
             },
-            max_output_tokens: 64000,
+            max_output_tokens: Some(64000),
             context_window: 200_000,
         },
         ModelEntry {
@@ -429,7 +429,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                 cache_read: 0.30,
                 fast: None,
             },
-            max_output_tokens: 64000,
+            max_output_tokens: Some(64000),
             context_window: 200_000,
         },
         ModelEntry {
@@ -446,7 +446,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                 cache_read: 0.20,
                 fast: None,
             },
-            max_output_tokens: 128000,
+            max_output_tokens: Some(128000),
             context_window: 200_000,
         },
         ModelEntry {
@@ -462,7 +462,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                 cache_read: 0.30,
                 fast: None,
             },
-            max_output_tokens: 64000,
+            max_output_tokens: Some(64000),
             context_window: 200_000,
         },
         ModelEntry {
@@ -478,7 +478,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                 cache_read: 0.50,
                 fast: None,
             },
-            max_output_tokens: 64000,
+            max_output_tokens: Some(64000),
             context_window: 200_000,
         },
         ModelEntry {
@@ -495,7 +495,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                 // Fast mode withdrawn on 2026-06-29.
                 fast: None,
             },
-            max_output_tokens: 128000,
+            max_output_tokens: Some(128000),
             context_window: 200_000,
         },
         ModelEntry {
@@ -512,7 +512,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                 // Fast mode withdrawn on 2026-07-24.
                 fast: None,
             },
-            max_output_tokens: 128000,
+            max_output_tokens: Some(128000),
             context_window: 200_000,
         },
         ModelEntry {
@@ -531,7 +531,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                     output: 50.00,
                 }),
             },
-            max_output_tokens: 128000,
+            max_output_tokens: Some(128000),
             context_window: 200_000,
         },
         ModelEntry {
@@ -550,7 +550,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                     output: 50.00,
                 }),
             },
-            max_output_tokens: 128000,
+            max_output_tokens: Some(128000),
             context_window: 200_000,
         },
         ModelEntry {
@@ -566,7 +566,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                 cache_read: 1.00,
                 fast: None,
             },
-            max_output_tokens: 128000,
+            max_output_tokens: Some(128000),
             context_window: 200_000,
         },
         ModelEntry {
@@ -582,7 +582,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                 cache_read: 1.50,
                 fast: None,
             },
-            max_output_tokens: 32000,
+            max_output_tokens: Some(32000),
             context_window: 200_000,
         },
     ];

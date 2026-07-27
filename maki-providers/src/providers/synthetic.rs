@@ -47,7 +47,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                 cache_read: 0.00,
                 fast: None,
             },
-            max_output_tokens: 131072,
+            max_output_tokens: Some(131072),
             context_window: 200_000,
         },
         ModelEntry {
@@ -63,7 +63,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                 cache_read: 0.00,
                 fast: None,
             },
-            max_output_tokens: 131072,
+            max_output_tokens: Some(131072),
             context_window: 200_000,
         },
         ModelEntry {
@@ -79,7 +79,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                 cache_read: 0.00,
                 fast: None,
             },
-            max_output_tokens: 131072,
+            max_output_tokens: Some(131072),
             context_window: 200_000,
         },
     ]

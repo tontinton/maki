@@ -52,7 +52,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             vision: true,
             default: true,
             pricing: ModelPricing::ZERO,
-            max_output_tokens: 100_000,
+            max_output_tokens: Some(100_000),
             context_window: 200_000,
         },
         ModelEntry {
@@ -62,7 +62,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             vision: true,
             default: true,
             pricing: ModelPricing::ZERO,
-            max_output_tokens: 100_000,
+            max_output_tokens: Some(100_000),
             context_window: 200_000,
         },
         ModelEntry {
@@ -77,7 +77,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             vision: true,
             default: true,
             pricing: ModelPricing::ZERO,
-            max_output_tokens: 100_000,
+            max_output_tokens: Some(100_000),
             context_window: 200_000,
         },
         ModelEntry {
@@ -87,7 +87,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             vision: true,
             default: false,
             pricing: ModelPricing::ZERO,
-            max_output_tokens: 64_000,
+            max_output_tokens: Some(64_000),
             context_window: 264_000,
         },
     ]

@@ -167,7 +167,7 @@ pub struct ModelEntry {
     pub vision: bool,
     pub default: bool,
     pub pricing: ModelPricing,
-    pub max_output_tokens: u32,
+    pub max_output_tokens: Option<u32>,
     pub context_window: u32,
 }
 
@@ -234,7 +234,7 @@ impl Model {
             .unwrap_or_default();
         let max_output_tokens = discovered
             .and_then(|info| info.max_output_tokens)
-            .or_else(|| static_entry.map(|entry| entry.max_output_tokens))
+            .or_else(|| static_entry.and_then(|entry| entry.max_output_tokens))
             .or(manifest.fallback_max_output);
         let context_window = discovered
             .and_then(|info| info.context_window)

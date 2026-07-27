@@ -88,7 +88,7 @@ const MISTRAL: ProviderManifest = ProviderManifest {
     family: ModelFamily::Generic,
     supports_thinking: true,
     accepts_arbitrary_models: true,
-    fallback_max_output: Some(32_000),
+    fallback_max_output: None,
     fallback_context_window: 128_000,
     models: mistral::models(),
 };

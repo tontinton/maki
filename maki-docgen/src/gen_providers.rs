@@ -132,8 +132,10 @@ fn format_pricing(entry: &ModelEntry) -> String {
 
 fn format_context(entry: &ModelEntry) -> String {
     let ctx_k = entry.context_window / 1_000;
-    let out_k = entry.max_output_tokens / 1_000;
-    format!("{ctx_k}K ctx / {out_k}K out")
+    match entry.max_output_tokens {
+        Some(out) => format!("{ctx_k}K ctx / {}K out", out / 1_000),
+        None => format!("{ctx_k}K ctx"),
+    }
 }
 
 struct ProviderSection {
