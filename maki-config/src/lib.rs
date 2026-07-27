@@ -1566,16 +1566,17 @@ fn find_bash_on_path() -> Option<PathBuf> {
 /// distributions" output instead of our nice error message.
 #[cfg(windows)]
 fn find_wsl() -> Option<PathBuf> {
-    let wsl = std::env::var_os("PATH").and_then(|paths| {
-        std::env::split_paths(&paths).find_map(|dir| {
-            let wsl = dir.join("wsl.exe");
-            wsl.is_file().then_some(wsl)
+    let wsl = std::env::var_os("PATH")
+        .and_then(|paths| {
+            std::env::split_paths(&paths).find_map(|dir| {
+                let wsl = dir.join("wsl.exe");
+                wsl.is_file().then_some(wsl)
+            })
         })
-    })
-    .or_else(|| {
-        let path = PathBuf::from(r"C:\Windows\System32\wsl.exe");
-        path.is_file().then_some(path)
-    })?;
+        .or_else(|| {
+            let path = PathBuf::from(r"C:\Windows\System32\wsl.exe");
+            path.is_file().then_some(path)
+        })?;
     let ok = std::process::Command::new(&wsl)
         .arg("-e")
         .arg("true")
@@ -1617,10 +1618,7 @@ pub fn bash_command(cmd: &str, env: Option<&HashMap<String, String>>) -> Result<
             let mut c = Command::new(wsl);
             c.arg("-e").arg("bash").arg("-c").arg(cmd);
             if let Some(env_map) = env {
-                let wsl_env: Vec<String> = env_map
-                    .keys()
-                    .map(|k| format!("{k}/p"))
-                    .collect();
+                let wsl_env: Vec<String> = env_map.keys().map(|k| format!("{k}/p")).collect();
                 if !wsl_env.is_empty() {
                     c.env("WSLENV", wsl_env.join(":"));
                 }
