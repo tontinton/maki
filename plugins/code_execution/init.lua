@@ -84,7 +84,7 @@ local description = [[Execute Python code in a sandboxed interpreter with tools 
 
 Use for chained/dependent tool calls and filtering/processing results, e.g. filtering web tool output. **DRAMATICALLY** faster than sequential tool calls!
 
-- All tools are async and return strings: `result = await read(path='file.txt')`. Parse output yourself.
+- All tools are async and return strings: `result = await read(path='file.txt', offset=1, limit=0)`. Parse output yourself.
 - Use `asyncio.gather()` for concurrency within one execution.
 - Available libs: re, asyncio, sys, os, json. No other imports, no classes, no filesystem/network access.
 - Fresh sandbox each run: no state persists between executions.
@@ -100,7 +100,7 @@ local schema = {
   properties = {
     code = {
       type = "string",
-      description = "Python code to execute. Tools are async functions that return strings (not objects). You MUST await every call: `result = await read(path='/file')`. Use `await asyncio.gather(...)` for concurrency.",
+      description = "Python code to execute. Tools are async functions that return strings (not objects). You MUST await every call: `result = await read(path='/file', offset=1, limit=0)`. Use `await asyncio.gather(...)` for concurrency.",
     },
     timeout = {
       type = "integer",
@@ -112,7 +112,7 @@ local schema = {
 local examples = {
   {
     code = [[files = (await glob(pattern='**/*.rs')).strip().split('\n')
-results = await asyncio.gather(*[read(path=f) for f in files if f.strip()])
+results = await asyncio.gather(*[read(path=f, offset=1, limit=0) for f in files if f.strip()])
 for f, c in zip(files, results):
     if 'fn main' in c: print(f)]],
   },

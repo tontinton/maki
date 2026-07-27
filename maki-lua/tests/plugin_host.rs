@@ -3576,3 +3576,179 @@ fn job_callbacks_fire_while_command_handler_parked() {
         .expect("job callbacks starved while command handler was parked");
     assert!(matches!(action, maki_lua::UiAction::Flash(msg) if msg == "job:hi"));
 }
+
+/// read tool requires offset and limit; missing fields should fail schema validation.
+mod read_tool_required_params {
+    use super::*;
+
+    const MISSING_OFFSET_ERR: &str = "invalid parameter 'offset': required";
+    const MISSING_LIMIT_ERR: &str = "invalid parameter 'limit': required";
+    const MAX_OUTPUT_LINES: i32 = 2000;
+
+    #[test]
+    fn missing_offset_fails_parse() {
+        let (reg, _host) = builtins_host();
+        let entry = reg.get("read").expect("read registered");
+        let err = entry
+            .tool
+            .parse(&serde_json::json!({ "path": "/tmp/foo.txt", "limit": 10 }))
+            .err()
+            .expect("missing offset should fail");
+        assert!(err.to_string().contains(MISSING_OFFSET_ERR), "got: {err}");
+    }
+
+    #[test]
+    fn missing_limit_fails_parse() {
+        let (reg, _host) = builtins_host();
+        let entry = reg.get("read").expect("read registered");
+        let err = entry
+            .tool
+            .parse(&serde_json::json!({ "path": "/tmp/foo.txt", "offset": 1 }))
+            .err()
+            .expect("missing limit should fail");
+        assert!(err.to_string().contains(MISSING_LIMIT_ERR), "got: {err}");
+    }
+
+    #[test]
+    fn both_offset_and_limit_present_parses() {
+        let (reg, _host) = builtins_host();
+        let entry = reg.get("read").expect("read registered");
+        let result = entry.tool.parse(&serde_json::json!({
+            "path": "/tmp/foo.txt",
+            "offset": 1,
+            "limit": 10
+        }));
+        assert!(result.is_ok(), "valid input should parse");
+    }
+
+    #[test]
+    fn limit_zero_parses_and_reads_to_cap() {
+        let (reg, _host) = builtins_host();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.txt");
+        // Write 100 lines
+        let content = (1..=100i32)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, &content).unwrap();
+
+        let out = exec_tool(
+            &reg,
+            "read",
+            serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "offset": 1,
+                "limit": 0
+            }),
+        );
+        let out = out.expect("read should succeed");
+        // limit=0 means read to end (capped at 2000). 100 lines < 2000, so all should be read.
+        assert!(
+            out.contains("1: line 1"),
+            "should start at line 1, got: {out}"
+        );
+        assert!(
+            out.contains("100: line 100"),
+            "should include last line, got: {out}"
+        );
+    }
+
+    #[test]
+    fn limit_zero_respects_2000_cap() {
+        let (reg, _host) = builtins_host();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge.txt");
+        // Write 2500 lines
+        let content = (1..=2500i32)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, &content).unwrap();
+
+        let out = exec_tool(
+            &reg,
+            "read",
+            serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "offset": 1,
+                "limit": 0
+            }),
+        );
+        let out = out.expect("read should succeed");
+        // limit=0 capped at 2000, so should have lines 1-2000
+        assert!(out.contains("1: line 1"), "should start at line 1");
+        assert!(
+            out.contains("2000: line 2000"),
+            "should include line 2000, got last lines: {}",
+            out.split('\n').rev().take(5).collect::<Vec<_>>().join("\n")
+        );
+        assert!(
+            !out.contains("2001: line 2001"),
+            "should not include line 2001"
+        );
+        // Should have truncation hint
+        assert!(
+            out.contains("Truncated"),
+            "should mention truncation, got: {out}"
+        );
+    }
+
+    #[test]
+    fn explicit_limit_above_cap_is_clamped() {
+        let (reg, _host) = builtins_host();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge.txt");
+        let content = (1..=MAX_OUTPUT_LINES + 500)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, &content).unwrap();
+
+        let out = exec_tool(
+            &reg,
+            "read",
+            serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "offset": 1,
+                "limit": MAX_OUTPUT_LINES + 500
+            }),
+        );
+        let out = out.expect("read should succeed");
+        assert!(
+            out.contains(&format!("{MAX_OUTPUT_LINES}: line {MAX_OUTPUT_LINES}")),
+            "should include the last line within the cap, got: {out}"
+        );
+        assert!(
+            !out.contains(&format!(
+                "{}: line {}",
+                MAX_OUTPUT_LINES + 1,
+                MAX_OUTPUT_LINES + 1
+            )),
+            "explicit limit must be clamped to the cap, got: {out}"
+        );
+    }
+
+    #[test]
+    fn offset_beyond_file_returns_empty() {
+        let (reg, _host) = builtins_host();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("small.txt");
+        std::fs::write(&path, "just one line\n").unwrap();
+
+        let out = exec_tool(
+            &reg,
+            "read",
+            serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "offset": 100,
+                "limit": 10
+            }),
+        );
+        let out = out.expect("read should succeed");
+        assert!(
+            out.is_empty(),
+            "offset beyond file should return empty, got: {out}"
+        );
+    }
+}

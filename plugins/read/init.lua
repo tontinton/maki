@@ -5,10 +5,11 @@ local output_limits = require("maki.output_limits")
 local DESCRIPTION = [[Read a file or directory. Returns contents with line numbers (1-indexed).
 
 - Supports absolute, relative, and ~/ paths.
-- **Always include offset and limit** if possible. Defaults: no offset = start at 1; no limit = up to 2000 lines.
+- **offset** and **limit** are required. Use offset=1 to read from the first line.
+- Use limit=0 to read until the end of file (capped at 2000 lines).
 - Use the **index** tool or **grep** tool first to find the offset and limit.
 - Only read the sections you actually need.
-- Use `wc -l` to check total number of lines before reading to decide a reasonable limit unless known already.
+- Use `wc -l` to check total number of lines before reading to decide a reasonable limit.
 - Use truncation hints (e.g. "truncated lines X-Y") to continue with the correct offset.
 - Do not reread the same range (same file and same offset).
 - Prefer grep to locate content instead of scanning full files.
@@ -125,8 +126,9 @@ local function read_file(path, offset, limit, ctx)
   end
   local total_lines = #all_lines
 
-  local start = math.max(offset or 1, 1)
-  local max_lines = limit or opts.max_output_lines or ctx:config("max_output_lines", DEFAULT_MAX_OUTPUT_LINES)
+  local start = math.max(offset, 1)
+  local default_max = opts.max_output_lines or ctx:config("max_output_lines", DEFAULT_MAX_OUTPUT_LINES)
+  local max_lines = limit == 0 and default_max or math.min(limit, default_max)
   local max_line_bytes = opts.max_line_bytes
 
   local lines = {}
@@ -226,7 +228,7 @@ maki.api.register_prompt_hint({
   slot = "tool_usage",
   content = [[
 - When using the **read** tool, only read the sections you actually need.
-- Use `wc -l` to check total number of lines before reading to decide a reasonable **read** tool limit unless known already.]],
+- Use `wc -l` to check total number of lines before reading to decide a reasonable **read** tool limit.]],
 })
 
 maki.api.register_tool({
@@ -243,10 +245,15 @@ maki.api.register_tool({
         required = true,
         alias = "file_path",
       },
-      offset = { type = "integer", description = "Line number to start from (1-indexed)" },
+      offset = {
+        type = "integer",
+        description = "Line number to start from (1-indexed). Use 1 for the first line.",
+        required = true,
+      },
       limit = {
         type = "integer",
-        description = "Max number of lines to read. Omitting the limit reads up to 2000 lines.",
+        description = "Max number of lines to read. Use 0 to read until end of file (capped at 2000 lines).",
+        required = true,
       },
     },
   },
@@ -255,9 +262,9 @@ maki.api.register_tool({
     local buf = maki.ui.buf()
     local s = shorten_path(input.path or "")
     local start = input.offset or 1
-    if input.limit then
+    if input.limit and input.limit > 0 then
       s = s .. ":" .. start .. "-" .. (start + input.limit - 1)
-    elseif input.offset then
+    else
       s = s .. ":" .. start
     end
     buf:line({ { s, "path" } })
