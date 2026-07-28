@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::ptr;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -28,7 +28,7 @@ use maki_config::RawConfig;
 
 use crate::api::autocmd::AutocmdStore;
 use crate::api::create_maki_global;
-use crate::api::r#fn::{JobStore, deliver_job_event};
+use crate::api::r#fn::{JobOwner, JobStore, deliver_job_event};
 use crate::api::keymap::KeymapReader;
 use crate::api::keymap::{KeymapStore, KeymapWriter};
 use crate::api::options::{PluginOptionSpecs, PluginOpts, collect_plugin_options};
@@ -83,6 +83,7 @@ const ASYNC_RUN_DEFAULT_DEADLINE: Duration = Duration::from_secs(60);
 const RESTORE_SPAWN_ROUNDS: usize = 8;
 /// Keeps a buggy plugin's restore task from freezing the lua loop.
 const RESTORE_ASYNC_DEADLINE: Duration = Duration::from_secs(10);
+static NEXT_TASK_ID: AtomicU64 = AtomicU64::new(1);
 /// Hard cap on one whole restore item. The watchdog interrupt only lands
 /// while Lua runs, so a restore parked on a never-resolving await would otherwise
 /// hold its gate slot forever and deadlock `gate.drain()` in the dispatcher.
@@ -299,13 +300,13 @@ enum KillReason {
 /// Lua is single-threaded so this Mutex never contends, but
 /// `Lua::app_data` requires `Send + Sync` with the `send` feature.
 pub(crate) struct TaskCell {
+    pub(crate) id: u64,
     pub(crate) cancel: CancelToken,
     /// End of the current [`KILL_GRACE`], armed by the first watchdog poke
     /// that sees a doomed task and cleared at every yield.
     kill_at: Cell<Option<Instant>>,
     pub(crate) deadline: Cell<Option<Instant>>,
     pub(crate) deadline_secs: Cell<Option<u64>>,
-    pub(crate) jobs: JobStore,
     pub(crate) bufs: BufferStore,
     pub(crate) live: Option<LiveCtx>,
     /// The buf that owns click routing for this task: the last one passed
@@ -334,11 +335,11 @@ impl TaskCell {
         live: Option<LiveCtx>,
     ) -> Self {
         Self {
+            id: NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed),
             cancel,
             kill_at: Cell::new(None),
             deadline: Cell::new(deadline),
             deadline_secs: Cell::new(None),
-            jobs: JobStore::new(),
             bufs: BufferStore::new(),
             live,
             root_buf: None,
@@ -792,7 +793,8 @@ pub(crate) async fn run_detached<F: Future>(lua: &Lua, fut: F) -> F::Output {
     let pump = async {
         let mut event_buf = Vec::new();
         loop {
-            lock_cell(&handle).jobs.drain_events(&mut event_buf);
+            let owner = JobOwner::Task(lock_cell(&handle).id);
+            with_jobs(lua, |store| store.drain_events(&owner, &mut event_buf));
             for (job_id, event) in event_buf.drain(..) {
                 if let Err(e) = deliver_job_event(lua, job_id, &event) {
                     tracing::warn!(error = %strip_traceback(&e), "detached job callback failed");
@@ -808,12 +810,14 @@ pub(crate) async fn run_detached<F: Future>(lua: &Lua, fut: F) -> F::Output {
 
 impl Drop for TaskScope {
     fn drop(&mut self) {
-        {
+        let task_id = {
             let mut cell = lock_cell(&self.handle);
-            cell.jobs.kill_all();
-            cell.jobs.clear(&self.lua);
             cell.clear_cancel_hooks(&self.lua);
-        }
+            cell.id
+        };
+        with_jobs(&self.lua, |store| {
+            store.kill_owner(&self.lua, &JobOwner::Task(task_id));
+        });
         match self.prev.take() {
             Some(p) => {
                 self.lua.set_app_data(p);
@@ -889,8 +893,19 @@ pub(crate) fn active_task(lua: &Lua) -> TaskHandle {
         .expect("task accessor called outside a task scope")
 }
 
-pub(crate) fn with_task_jobs<R>(lua: &Lua, f: impl FnOnce(&mut JobStore) -> R) -> R {
-    f(&mut lock_cell(&active_task(lua)).jobs)
+pub(crate) fn with_jobs<R>(lua: &Lua, f: impl FnOnce(&mut JobStore) -> R) -> R {
+    if lua.app_data_ref::<JobStore>().is_none() {
+        lua.set_app_data(JobStore::new());
+    }
+    let mut store = lua
+        .app_data_mut::<JobStore>()
+        .expect("job store was just installed");
+    f(&mut store)
+}
+
+pub(crate) fn active_task_id(lua: &Lua) -> Option<u64> {
+    let handle = lua.app_data_ref::<TaskHandle>()?;
+    Some(lock_cell(&handle).id)
 }
 
 pub(crate) fn with_task_bufs<R>(lua: &Lua, f: impl FnOnce(&mut BufferStore) -> R) -> R {
@@ -1317,6 +1332,7 @@ impl LuaRuntime {
         })?;
 
         lua.set_app_data(CommandHandlerMap::new());
+        lua.set_app_data(JobStore::new());
         lua.set_app_data(SpawnQueue::new());
         lua.set_app_data(command_writer);
         lua.set_app_data(PromptHintCallbacks::default());
@@ -1391,6 +1407,9 @@ impl LuaRuntime {
 
     fn drop_plugin_keys(&mut self, name: &str) {
         self.warm_tools.borrow_mut().clear();
+        with_jobs(&self.lua, |store| {
+            store.kill_owner(&self.lua, &JobOwner::Plugin(Arc::from(name)));
+        });
         if let Some(mut store) = self.lua.app_data_mut::<PluginOptionSpecs>() {
             store.remove(name);
         }
@@ -2099,7 +2118,8 @@ async fn dispatch_async(
     tool: &str,
     finish_rx: flume::Receiver<ToolCallReply>,
 ) -> ToolCallReply {
-    if lock_cell(&handle).jobs.is_empty() {
+    let owner = JobOwner::Task(lock_cell(&handle).id);
+    if with_jobs(lua, |store| store.is_empty(&owner)) {
         lua.gc_collect().ok();
         smol::Timer::after(DISPATCH_POLL_INTERVAL).await;
         return match finish_rx.try_recv() {
@@ -2129,11 +2149,10 @@ async fn dispatch_async(
             Err(flume::TryRecvError::Empty) => {}
         }
 
-        lock_cell(&handle).jobs.drain_events(&mut event_buf);
+        with_jobs(lua, |store| store.drain_events(&owner, &mut event_buf));
 
         if event_buf.is_empty() {
-            let has_alive = lock_cell(&handle).jobs.has_alive_jobs();
-            if !has_alive {
+            if with_jobs(lua, |store| store.is_empty(&owner)) {
                 smol::Timer::after(DISPATCH_POLL_INTERVAL).await;
                 return match finish_rx.try_recv() {
                     Ok(reply) => reply,
@@ -2424,6 +2443,31 @@ pub fn spawn(
             };
 
             let ex = Rc::new(smol::LocalExecutor::new());
+            {
+                let lua = rt.lua.clone();
+                ex.spawn(async move {
+                    let mut event_buf = Vec::new();
+                    loop {
+                        with_jobs(&lua, |store| {
+                            store.drain_plugin_events(&mut event_buf);
+                        });
+                        if !event_buf.is_empty() {
+                            let scope = TaskScope::detached(&lua);
+                            for (job_id, event) in event_buf.drain(..) {
+                                if let Err(e) = deliver_job_event(&lua, job_id, &event) {
+                                    tracing::warn!(
+                                        error = %strip_traceback(&e),
+                                        "plugin job callback failed"
+                                    );
+                                }
+                            }
+                            drop(scope);
+                        }
+                        smol::Timer::after(DISPATCH_POLL_INTERVAL).await;
+                    }
+                })
+                .detach();
+            }
             let gate = Rc::new(InflightGate::new(rt.lua.clone()));
             let restores = Rc::new(RestoreTracker::default());
             let spawn_rx = rt
@@ -2811,7 +2855,7 @@ mod tests {
     }
 
     #[test]
-    fn task_scope_clears_jobs_and_bufs_on_drop() {
+    fn task_scope_clears_bufs_on_drop() {
         let lua = Lua::new();
         let scope = TaskScope::new(&lua, task_cell(None));
         let handle = Arc::clone(scope.handle());
@@ -2819,6 +2863,30 @@ mod tests {
         assert!(lock_cell(&handle).bufs.live_buf().is_some());
         drop(scope);
         assert!(lock_cell(&handle).bufs.live_buf().is_none());
+    }
+
+    #[test]
+    fn task_scope_clears_only_its_jobs_on_drop() {
+        let lua = Lua::new();
+        let scope = TaskScope::new(&lua, task_cell(None));
+        let task_owner = JobOwner::Task(lock_cell(scope.handle()).id);
+        let plugin_owner = JobOwner::Plugin(Arc::from("test-plugin"));
+        with_jobs(&lua, |store| {
+            store
+                .start(task_owner.clone(), "exit 0", None, None, None, None, None)
+                .unwrap();
+            store
+                .start(plugin_owner.clone(), "exit 0", None, None, None, None, None)
+                .unwrap();
+        });
+
+        drop(scope);
+
+        with_jobs(&lua, |store| {
+            assert!(store.is_empty(&task_owner));
+            assert!(!store.is_empty(&plugin_owner));
+            store.kill_owner(&lua, &plugin_owner);
+        });
     }
 
     #[test]
@@ -3648,10 +3716,11 @@ mod tests {
         thread::spawn(move || {
             let lua = Lua::new();
             let scope = TaskScope::new(&lua, cell);
-            lock_cell(scope.handle())
-                .jobs
-                .start(DISPATCH_TEST_JOB, None, None, None, None, None)
-                .unwrap();
+            let owner = JobOwner::Task(lock_cell(scope.handle()).id);
+            with_jobs(&lua, |store| {
+                store.start(owner, DISPATCH_TEST_JOB, None, None, None, None, None)
+            })
+            .unwrap();
             let (_finish_tx, finish_rx) = flume::bounded(1);
 
             let start = Instant::now();
