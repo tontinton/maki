@@ -65,7 +65,10 @@ pub(crate) fn create_maki_global(
         "ui",
         ui::create_ui_table(lua, ui_action_tx.clone(), Arc::clone(&plugin))?,
     )?;
-    maki.set("fn", r#fn::create_fn_table(lua, permissions, ui_action_tx)?)?;
+    maki.set(
+        "fn",
+        r#fn::create_fn_table(lua, Arc::clone(&plugin), permissions, ui_action_tx)?,
+    )?;
     split::split__register(&maki, lua)?;
     maki.set("async", r#async::create_async_table(lua)?)?;
     maki.set(
