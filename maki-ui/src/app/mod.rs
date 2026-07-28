@@ -58,7 +58,7 @@ use maki_agent::{
     SubagentInfo,
 };
 use maki_config::UiConfig;
-use maki_lua::{EventHandle, HintReader, KeymapReader, LuaCommandReader};
+use maki_lua::{EventHandle, HintReader, KeymapReader, LuaCommandReader, WinView};
 use maki_providers::{Message, Model, ThinkingConfig, add_cost};
 use maki_storage::StateDir;
 use maki_storage::input_history::InputHistory;
@@ -323,6 +323,14 @@ impl App {
 
     fn active_chat(&mut self) -> &mut Chat {
         &mut self.chats[self.active_chat]
+    }
+
+    pub(crate) fn win_view(&self) -> WinView {
+        self.chats[self.active_chat].win_view()
+    }
+
+    pub(crate) fn set_scroll_top(&mut self, top: u16) {
+        self.active_chat().set_scroll_top(top);
     }
 
     fn clear_selection_unless_pending_copy(&mut self) {

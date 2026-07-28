@@ -1413,6 +1413,60 @@ if maki.fn.executable("rg") == 1 then
 end
 ```
 
+---
+
+### `maki.fn.winsaveview()` {#maki-fn-winsaveview}
+
+```lua
+maki.fn.winsaveview()
+```
+
+Read the viewport of the focused chat transcript, like Neovim's
+`vim.fn.winsaveview()`. The transcript is the only scrollable window
+maki has, so there is no window argument.
+
+`topline` is the 1-based transcript line at the top of the viewport, so
+the last visible one is `math.min(topline + height - 1, line_count)`.
+`auto_scroll` has no Vim counterpart: it is true while the transcript
+follows streaming output.
+
+**Returns:** (`table|nil`, `string|nil`) `{topline, line_count, height, auto_scroll}`, or nil and an error.
+
+**Example:**
+
+```lua
+local view = maki.fn.winsaveview()
+maki.fn.winrestview({ topline = view.topline + 1 })
+```
+
+---
+
+### `maki.fn.winrestview()` {#maki-fn-winrestview}
+
+```lua
+maki.fn.winrestview({view})
+```
+
+Scroll the focused chat transcript so that the `topline` field of
+{view} becomes the top visible line, like Neovim's
+`vim.fn.winrestview()`. Out of range values are clamped. Other keys are
+ignored, so a table straight from `winsaveview()` round-trips.
+
+Scrolling away from the bottom unpins the transcript; landing back at
+the bottom re-pins it so streaming output keeps following.
+
+**Parameters:**
+
+- `{view}` (`table`) View to restore. Only `topline` (1-based) is read.
+
+**Returns:** (`boolean|nil`, `string|nil`) true on success, or nil and an error.
+
+**Example:**
+
+```lua
+maki.fn.winrestview({ topline = 1 })
+```
+
 
 ## maki.fs {#maki-fs}
 
@@ -4776,6 +4830,22 @@ function M.resolve(opts, ctx)
 end
 
 return M
+```
+
+### `require("maki.scroll")`
+
+```lua
+-- Relative scrolling on top of maki.fn.winsaveview / winrestview.
+-- Positive {delta} scrolls down, negative up. Returns (true, nil) or (nil, err).
+local function scroll(delta)
+  local view, err = maki.fn.winsaveview()
+  if not view then
+    return nil, err
+  end
+  return maki.fn.winrestview({ topline = view.topline + delta })
+end
+
+return scroll
 ```
 
 ### `require("maki.shorten_path")`

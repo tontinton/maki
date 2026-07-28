@@ -5,7 +5,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use arc_swap::ArcSwap;
 use maki_agent::SharedBuf;
-use mlua::RegistryKey;
+use mlua::{RegistryKey, Value};
+
+pub(crate) const NO_UI_ERR: &str = "no interactive UI attached";
+const UI_DROPPED_ERR: &str = "ui event loop dropped the request";
 
 #[derive(Clone)]
 pub struct LuaCommandInfo {
@@ -403,6 +406,16 @@ pub enum SessionRequest {
 
 pub type SessionReply = Result<serde_json::Value, String>;
 
+/// Viewport of the focused chat transcript, zero-based like the rest of the
+/// UI; `maki.fn.winsaveview` is what puts it in Vim's 1-based shape.
+/// `auto_scroll` is true while the transcript follows streaming output.
+pub struct WinView {
+    pub scroll_top: u16,
+    pub line_count: u16,
+    pub height: u16,
+    pub auto_scroll: bool,
+}
+
 pub enum UiAction {
     OpenWin {
         buf: Arc<SharedBuf>,
@@ -420,6 +433,41 @@ pub enum UiAction {
         req: SessionRequest,
         reply_tx: flume::Sender<SessionReply>,
     },
+    WinSaveView {
+        reply_tx: flume::Sender<WinView>,
+    },
+    WinRestView {
+        scroll_top: u16,
+    },
+}
+
+/// Lua's `(value, err)` convention: a failed UI call answers with nil and a
+/// message instead of raising.
+pub(crate) type Pair = (Value, Option<String>);
+
+pub(crate) fn err_pair(err: impl ToString) -> Pair {
+    (Value::Nil, Some(err.to_string()))
+}
+
+/// Hand an action to the UI event loop. A full or closed channel means the
+/// same thing as a missing sender: nobody is there to run it.
+pub(crate) fn ui_send(
+    tx: Option<&flume::Sender<UiAction>>,
+    action: UiAction,
+) -> Result<(), &'static str> {
+    tx.ok_or(NO_UI_ERR)?.try_send(action).map_err(|_| NO_UI_ERR)
+}
+
+/// Send an action carrying a reply channel and await the answer. Only
+/// works from a callback: the loop drains `UiAction` between frames, so a
+/// call at config load time would wait forever.
+pub(crate) async fn ui_roundtrip<T>(
+    tx: Option<&flume::Sender<UiAction>>,
+    action: impl FnOnce(flume::Sender<T>) -> UiAction,
+) -> Result<T, &'static str> {
+    let (reply_tx, reply_rx) = flume::bounded(1);
+    ui_send(tx, action(reply_tx))?;
+    reply_rx.recv_async().await.map_err(|_| UI_DROPPED_ERR)
 }
 
 #[cfg(test)]

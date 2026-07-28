@@ -8,7 +8,7 @@
 //! agent event, or keypress arrives instead of sleeping in `event::poll`.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use color_eyre::Result;
@@ -32,7 +32,7 @@ use maki_storage::StorageError;
 use maki_storage::id::{MakiId, MakiIdParseError, SessionRef};
 use maki_storage::sessions::{SessionError, normalize_title};
 use serde_json::json;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::AppSession;
 use crate::agent::{AgentCommand, AgentHandles, ModelSlot, shared_queue::QueueItem};
@@ -563,6 +563,12 @@ impl<'t> EventLoop<'t> {
             UiAction::Session { req, reply_tx } => {
                 self.handle_session_request(req, reply_tx);
             }
+            UiAction::WinSaveView { reply_tx } => {
+                let _ = reply_tx.send(self.focused_app().win_view());
+            }
+            UiAction::WinRestView { scroll_top } => {
+                self.focused_app().set_scroll_top(scroll_top);
+            }
         }
     }
 
@@ -1074,6 +1080,13 @@ impl<'t> EventLoop<'t> {
     }
 
     fn shutdown(mut self) -> ShutdownReport {
+        let started = Instant::now();
+        let mut phase_start = started;
+        let mut lap = || {
+            let elapsed = phase_start.elapsed().as_millis() as u64;
+            phase_start = Instant::now();
+            elapsed
+        };
         let exit = self.sessions[self.focused].app.exit_request;
         if let Some(ref h) = self.ctx.mcp_handle {
             mcp::kill_process_groups(&h.reader().load().pids);
@@ -1081,6 +1094,7 @@ impl<'t> EventLoop<'t> {
         for rt in &self.sessions {
             let _ = rt.handles.cmd_tx.try_send(AgentCommand::CancelAll);
         }
+        let kill_mcp_ms = lap();
         let mut tabs = Vec::with_capacity(self.sessions.len());
         let mut agent_tasks = Vec::with_capacity(self.sessions.len());
         for rt in self.sessions.drain(..) {
@@ -1093,16 +1107,29 @@ impl<'t> EventLoop<'t> {
             tabs.push(app.state.session);
             agent_tasks.push(handles.into_task());
         }
+        let save_sessions_ms = lap();
         crate::agent::join_all(agent_tasks, AGENT_SHUTDOWN_TIMEOUT);
+        let join_agents_ms = lap();
         if let Some(ref h) = self.ctx.mcp_handle {
             smol::block_on(h.shutdown());
         }
+        let mcp_shutdown_ms = lap();
         match Arc::try_unwrap(self.ctx.storage_writer) {
             Ok(writer) => writer.shutdown(AGENT_SHUTDOWN_TIMEOUT),
             Err(_) => {
                 warn!("storage writer has outstanding references, skipping graceful shutdown")
             }
         }
+        let storage_drain_ms = lap();
+        info!(
+            kill_mcp_ms,
+            save_sessions_ms,
+            join_agents_ms,
+            mcp_shutdown_ms,
+            storage_drain_ms,
+            total_ms = started.elapsed().as_millis() as u64,
+            "ui shutdown phases"
+        );
         ShutdownReport {
             exit,
             tabs,
