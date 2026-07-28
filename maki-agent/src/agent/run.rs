@@ -20,7 +20,7 @@ use crate::permissions::PermissionManager;
 use crate::tools::{Deadline, FileReadTracker, LocalTools, ToolAudience, ToolContext};
 use crate::{
     AgentConfig, AgentError, AgentEvent, AgentInput, AgentMode, EventSender, ExtractedCommand,
-    InterruptSource, TurnCompleteEvent,
+    InterruptSource, SessionMailbox, TurnCompleteEvent,
 };
 use maki_config::ToolOutputLines;
 use maki_storage::id::SessionRef;
@@ -58,6 +58,7 @@ pub struct AgentParams {
     pub tool_output_lines: ToolOutputLines,
     pub permissions: Arc<PermissionManager>,
     pub session_id: Option<SessionRef>,
+    pub mailbox: Option<SessionMailbox>,
     pub timeouts: maki_providers::Timeouts,
     pub file_tracker: Arc<FileReadTracker>,
     pub prompt_slots: Arc<crate::prompt::ResolvedSlots>,
@@ -99,6 +100,7 @@ pub struct Agent<'h> {
     permissions: Arc<PermissionManager>,
     opts: RequestOptions,
     session_id: Option<SessionRef>,
+    mailbox: Option<SessionMailbox>,
     timeouts: maki_providers::Timeouts,
     file_tracker: Arc<FileReadTracker>,
     prompt_slots: Arc<crate::prompt::ResolvedSlots>,
@@ -138,6 +140,7 @@ impl<'h> Agent<'h> {
             post_tool_empty_retried: false,
             opts: RequestOptions::default(),
             session_id: params.session_id,
+            mailbox: params.mailbox,
             file_tracker: params.file_tracker,
             prompt_slots: params.prompt_slots,
             subagent_cancels: params.subagent_cancels,
@@ -182,20 +185,30 @@ impl<'h> Agent<'h> {
     }
 
     pub async fn run(&mut self, input: AgentInput) -> Result<(), AgentError> {
+        let AgentInput {
+            message,
+            mode,
+            images,
+            preamble,
+            thinking,
+            fast,
+            workflow,
+            prompt: _,
+        } = input;
         self.rollback_len = self.history.len();
-        let msg = Message::user_with_images(input.message.clone(), input.images);
-        self.history.push(msg);
-        self.mode = input.mode;
-        self.workflow = input.workflow;
-        self.opts = RequestOptions {
-            thinking: input.thinking,
-            fast: input.fast,
-        };
+        self.push_input_context(preamble);
+        if !message.trim().is_empty() || !images.is_empty() {
+            self.history
+                .push(Message::user_with_images(message.clone(), images));
+        }
+        self.mode = mode;
+        self.workflow = workflow;
+        self.opts = RequestOptions { thinking, fast };
 
         info!(
             model = %self.model.id,
             mode = ?self.mode,
-            message_len = input.message.len(),
+            message_len = message.len(),
             "agent run started"
         );
 
@@ -206,6 +219,17 @@ impl<'h> Agent<'h> {
         }
 
         result
+    }
+
+    fn push_input_context(&mut self, preamble: Vec<Message>) {
+        for message in preamble {
+            self.history.push(message);
+        }
+        if let Some(mailbox) = &self.mailbox {
+            for message in mailbox.drain() {
+                self.history.push(message);
+            }
+        }
     }
 
     async fn run_loop(&mut self) -> Result<(), AgentError> {
@@ -414,6 +438,7 @@ impl<'h> Agent<'h> {
             event_tx: self.event_tx.clone(),
             mode: self.mode.clone(),
             session_id: self.session_id.clone(),
+            mailbox: self.mailbox.clone(),
             tool_use_id: None,
             user_response_rx: self.user_response_rx.clone(),
             loaded_instructions: self.loaded_instructions.clone(),
@@ -486,9 +511,7 @@ impl<'h> Agent<'h> {
                     text: input.message.clone(),
                     image_count: input.images.len(),
                 })?;
-                for msg in std::mem::take(&mut input.preamble) {
-                    self.history.push(msg);
-                }
+                self.push_input_context(std::mem::take(&mut input.preamble));
                 self.mode = input.mode.clone();
                 let display = input.message.clone();
                 let wrapped = format!(
@@ -647,6 +670,7 @@ mod tests {
                     std::path::PathBuf::from("/tmp"),
                 )),
                 session_id: None,
+                mailbox: None,
                 timeouts: maki_providers::Timeouts::default(),
                 file_tracker: FileReadTracker::fresh(),
                 prompt_slots: Arc::new(crate::prompt::ResolvedSlots::default()),
@@ -675,6 +699,54 @@ mod tests {
             workflow: false,
             prompt: None,
         }
+    }
+
+    #[test]
+    fn run_ingests_preamble_then_mailbox_then_user_message() {
+        smol::block_on(async {
+            let id = maki_storage::id::MakiId::generate();
+            let mailbox = SessionMailbox::register(id);
+            SessionMailbox::notify(id, "mailbox".into(), false).unwrap();
+            let mut history = History::new(Vec::new());
+            let (mut agent, _event_rx) = make_agent(
+                MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+                &mut history,
+            );
+            agent.mailbox = Some(mailbox);
+            let mut input = default_input();
+            input.preamble = vec![Message::observation("preamble".into())];
+
+            agent.run(input).await.unwrap();
+            drop(agent);
+
+            assert_eq!(history.as_slice()[0].user_text(), Some("preamble"));
+            assert_eq!(history.as_slice()[1].user_text(), Some("mailbox"));
+            assert_eq!(history.as_slice()[2].user_text(), Some("hello"));
+        });
+    }
+
+    #[test]
+    fn wake_only_run_does_not_insert_an_empty_user_turn() {
+        smol::block_on(async {
+            let id = maki_storage::id::MakiId::generate();
+            let mailbox = SessionMailbox::register(id);
+            SessionMailbox::notify(id, "failed".into(), true).unwrap();
+            let mut history = History::new(Vec::new());
+            let (mut agent, _event_rx) = make_agent(
+                MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+                &mut history,
+            );
+            agent.mailbox = Some(mailbox);
+            let mut input = default_input();
+            input.message.clear();
+
+            agent.run(input).await.unwrap();
+            drop(agent);
+
+            assert_eq!(history.as_slice().len(), 2);
+            assert!(history.as_slice()[0].is_observation());
+            assert!(matches!(history.as_slice()[1].role, Role::Assistant));
+        });
     }
 
     fn drain_events(rx: &flume::Receiver<Envelope>) -> Vec<Envelope> {
@@ -954,6 +1026,7 @@ mod tests {
                         std::path::PathBuf::from("/tmp"),
                     )),
                     session_id: None,
+                    mailbox: None,
                     timeouts: maki_providers::Timeouts::default(),
                     file_tracker: FileReadTracker::fresh(),
                     prompt_slots: Arc::new(crate::prompt::ResolvedSlots::default()),

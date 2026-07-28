@@ -11,7 +11,7 @@ use arc_swap::ArcSwap;
 use maki_agent::permissions::PermissionManager;
 use maki_agent::{
     AgentConfig, CancelMap, CancelToken, Envelope, McpCommand, McpConfigErrors, McpHandle,
-    McpSnapshotReader, ToolOutputLines,
+    McpSnapshotReader, SessionMailbox, ToolOutputLines,
 };
 use maki_lua::EventHandle;
 use maki_storage::id::SessionRef;
@@ -54,6 +54,7 @@ pub(crate) struct AgentHandles {
     pub(crate) mcp_config_errors: McpConfigErrors,
     pub(crate) queue: QueueSender,
     pub(crate) timeouts: maki_providers::Timeouts,
+    mailbox: Option<SessionMailbox>,
     task: smol::Task<()>,
 }
 
@@ -117,6 +118,13 @@ impl AgentHandles {
         if let Some(ref h) = self.mcp_handle {
             h.send(cmd);
         }
+    }
+
+    pub(crate) fn claim_mailbox_wake(&self) -> Vec<Message> {
+        self.mailbox
+            .as_ref()
+            .map(SessionMailbox::claim_wake)
+            .unwrap_or_default()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -218,6 +226,9 @@ fn spawn_agent_internal(
     let (init_trigger, init_cancel) = CancelToken::new();
     let cancel_map = Arc::new(new_run_cancel_map(0, init_trigger));
     let subagent_cancels: Arc<CancelMap<String>> = Arc::new(CancelMap::new());
+    let mailbox = session_id
+        .as_ref()
+        .map(|session_id| SessionMailbox::register(session_id.id()));
 
     spawn_command_router(
         cmd_rx,
@@ -240,6 +251,7 @@ fn spawn_agent_internal(
         cancel_map,
         init_cancel,
         session_id,
+        mailbox.clone(),
         timeouts,
         lua_handle,
         subagent_cancels,
@@ -258,6 +270,7 @@ fn spawn_agent_internal(
         mcp_config_errors,
         queue: queue_tx,
         timeouts,
+        mailbox,
         task,
     }
 }

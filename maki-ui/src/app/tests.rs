@@ -209,6 +209,22 @@ fn typing_and_submit() {
     assert_eq!(app.main_chat().last_message_text(), "hi");
 }
 
+#[test]
+fn mailbox_wake_starts_without_an_empty_user_bubble() {
+    let mut app = test_app();
+    let actions = app.start_mailbox_run(vec![Message::observation("failed".into())]);
+
+    assert!(matches!(
+        &actions[..],
+        [Action::SendMessage(input)]
+            if input.message.is_empty()
+                && input.preamble.len() == 1
+                && input.preamble[0].is_observation()
+    ));
+    assert_eq!(app.status, Status::Streaming);
+    assert!(app.main_chat().segment_search_texts().is_empty());
+}
+
 fn with_text(app: &mut App) {
     app.update(Msg::Key(key(KeyCode::Char('h'))));
     app.update(Msg::Key(key(KeyCode::Char('i'))));

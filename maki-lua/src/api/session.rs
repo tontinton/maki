@@ -1,12 +1,17 @@
-//! `maki.session`: host session primitives. Every call round-trips to the UI
-//! event loop, which owns the live session runtimes and the session store;
-//! the loop answers `list` from a background task so slow scans never block.
+//! `maki.session`: host session primitives. Session management round-trips to
+//! the UI event loop, which owns live runtimes and storage. `notify` posts
+//! directly to the agent mailbox so synchronous callbacks can use it.
 
+use maki_agent::SessionMailbox;
 use maki_lua_macro::{lua_fn, lua_table};
-use mlua::{Lua, Result as LuaResult, Table};
+use maki_storage::id::MakiId;
+use mlua::{Lua, Result as LuaResult, Table, Value};
 
 use crate::api::util::command::{Pair, SessionRequest, UiAction, err_pair, ui_roundtrip};
 use crate::api::util::convert::json_to_lua;
+
+const BLANK_NOTIFY_ERR: &str = "text must not be blank";
+const SESSION_REQUIRED_ERR: &str = "session is required";
 
 async fn roundtrip(
     lua: Lua,
@@ -128,6 +133,38 @@ async fn prompt(
     roundtrip(lua, tx, SessionRequest::Prompt { id, text }).await
 }
 
+/// Reports {text} to a live session without creating a user turn. The
+/// observation waits for the session's next agent run.
+///
+/// @param text string What to report. Must not be blank.
+/// @param opts table Options:
+///   `session` (string) id of a live session.
+///   `wake` (boolean) start a TUI turn when it next becomes idle (default false).
+/// @return (boolean|nil, string|nil) true, or nil and an error.
+/// @example
+/// maki.session.notify("[monitor] deploy failed", { session = id, wake = true })
+#[lua_fn]
+fn notify(_lua: &Lua, text: String, opts: Option<Table>) -> LuaResult<Pair> {
+    if text.trim().is_empty() {
+        return Ok(err_pair(BLANK_NOTIFY_ERR));
+    }
+    let Some(opts) = opts else {
+        return Ok(err_pair(SESSION_REQUIRED_ERR));
+    };
+    let Some(raw_id) = opts.get::<Option<String>>("session")? else {
+        return Ok(err_pair(SESSION_REQUIRED_ERR));
+    };
+    let session_id: MakiId = match raw_id.parse() {
+        Ok(id) => id,
+        Err(error) => return Ok(err_pair(error)),
+    };
+    let wake = opts.get("wake").unwrap_or(false);
+    if let Err(error) = SessionMailbox::notify(session_id, text, wake) {
+        return Ok(err_pair(error));
+    }
+    Ok((Value::Boolean(true), None))
+}
+
 /// Renames a session, live or stored.
 ///
 /// @param opts table Required fields: id (string) session to rename;
@@ -151,11 +188,11 @@ async fn set_title(
 lua_table! {
     /// Host session primitives. The interactive UI can run several sessions
     /// at once; these functions let plugins list, create, focus, rename, and
-    /// delete them. Every call round-trips to the UI event loop and returns
-    /// the pair `(value, err)`. Without an interactive UI attached, every
-    /// call returns `nil, "no interactive UI attached"`.
+    /// delete them. Session management returns `nil, "no interactive UI
+    /// attached"` without a UI. `notify` instead targets a live agent mailbox
+    /// directly, so it also works under ACP and SDK frontends.
     "maki.session" => pub(crate) fn create_session_table(tx: Option<flume::Sender<UiAction>>),
-    DOCS [list(tx), live(tx), current(tx), focus(tx), delete(tx), new(tx), prompt(tx), set_title(tx)]
+    DOCS [list(tx), live(tx), current(tx), focus(tx), delete(tx), new(tx), prompt(tx), notify(), set_title(tx)]
 }
 
 #[cfg(test)]
@@ -225,6 +262,77 @@ mod tests {
         checker.join().unwrap();
         assert_eq!(err, None);
         assert_eq!(val, "queued");
+    }
+
+    #[test]
+    fn notify_is_synchronous_and_queues_an_observation() {
+        let id = MakiId::generate();
+        let mailbox = SessionMailbox::register(id);
+        let (tx, rx) = flume::unbounded::<UiAction>();
+        let lua = lua_with_session(Some(tx));
+        lua.globals().set("session_id", id.to_string()).unwrap();
+
+        let (value, error): (bool, Option<String>) = lua
+            .load("return session.notify('built', { session = session_id })")
+            .eval()
+            .unwrap();
+
+        assert!(value);
+        assert_eq!(error, None);
+        let messages = mailbox.drain();
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].is_observation());
+        assert_eq!(messages[0].user_text(), Some("built"));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn waking_notify_sets_the_mailbox_wake_flag() {
+        let id = MakiId::generate();
+        let mailbox = SessionMailbox::register(id);
+        let lua = lua_with_session(None);
+        lua.globals().set("session_id", id.to_string()).unwrap();
+
+        let (value, error): (bool, Option<String>) = lua
+            .load("return session.notify('failed', { session = session_id, wake = true })")
+            .eval()
+            .unwrap();
+
+        assert!(value);
+        assert_eq!(error, None);
+        assert_eq!(mailbox.claim_wake().len(), 1);
+    }
+
+    #[test]
+    fn notify_rejects_missing_and_non_live_sessions() {
+        let lua = lua_with_session(None);
+        let (_, missing): (Value, Option<String>) =
+            lua.load("return session.notify('built')").eval().unwrap();
+        assert_eq!(missing.as_deref(), Some(SESSION_REQUIRED_ERR));
+
+        let id = MakiId::generate();
+        lua.globals().set("session_id", id.to_string()).unwrap();
+        let (_, not_live): (Value, Option<String>) = lua
+            .load("return session.notify('built', { session = session_id })")
+            .eval()
+            .unwrap();
+        assert_eq!(not_live, Some(format!("session not live: {id}")));
+    }
+
+    #[test]
+    fn notify_rejects_blank_text_and_invalid_session_ids() {
+        let lua = lua_with_session(None);
+        let (_, blank): (Value, Option<String>) = lua
+            .load("return session.notify(' ', { session = 'invalid' })")
+            .eval()
+            .unwrap();
+        assert_eq!(blank.as_deref(), Some(BLANK_NOTIFY_ERR));
+
+        let (_, invalid): (Value, Option<String>) = lua
+            .load("return session.notify('built', { session = 'invalid' })")
+            .eval()
+            .unwrap();
+        assert!(invalid.is_some_and(|error| error.contains("invalid base58")));
     }
 
     #[test]

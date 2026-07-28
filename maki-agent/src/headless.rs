@@ -22,7 +22,7 @@ use crate::template;
 use crate::tools::{DescriptionContext, FileReadTracker, ToolAudience, ToolFilter, ToolRegistry};
 use crate::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, Envelope,
-    EventSender, ImageSource, McpHandle, McpSession, PermissionsConfig, ToolOutput,
+    EventSender, ImageSource, McpHandle, McpSession, PermissionsConfig, SessionMailbox, ToolOutput,
     ToolOutputLines,
 };
 
@@ -180,6 +180,7 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
     let session_id = MakiId::generate();
     let session_ref = SessionRef::from(session_id);
     let session_ref_clone = session_ref.clone();
+    let mailbox = SessionMailbox::register(session_id);
     let fast = params.fast;
     let workflow = params.workflow;
     let task = smol::spawn({
@@ -212,6 +213,7 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
                         working_dir_path,
                     )),
                     session_id: Some(session_ref_clone.clone()),
+                    mailbox: Some(mailbox.clone()),
                     timeouts: params.timeouts,
                     file_tracker: FileReadTracker::fresh(),
                     prompt_slots: Arc::new(params.prompt_slots),
@@ -325,6 +327,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
             (id, SessionRef::from(id))
         }
     };
+    let mailbox = SessionMailbox::register(session_id);
 
     let working_dir = params.initial_wd.to_string_lossy().into_owned();
     let permissions = Arc::new(PermissionManager::new(
@@ -424,6 +427,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                         tool_output_lines: ToolOutputLines::default(),
                         permissions: Arc::clone(&permissions),
                         session_id: Some(session_ref_clone.clone()),
+                        mailbox: Some(mailbox.clone()),
                         timeouts: params.timeouts,
                         file_tracker: Arc::clone(&file_tracker),
                         prompt_slots: Arc::clone(&params.prompt_slots),
