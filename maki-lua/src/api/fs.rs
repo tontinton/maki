@@ -425,6 +425,22 @@ async fn write(_lua: Lua, path: String, content: String) -> LuaResult<Pair<bool>
     Ok(pair(smol::fs::write(&abs, content).await.map(|()| true)))
 }
 
+/// Atomically replace {path} with {content}. The parent directory must exist.
+/// Readers observe either the old file or the complete new file.
+///
+/// @param path string Destination file path. `~/` is expanded.
+/// @param content string Text to write.
+/// @return (true?, string?) `true` on success, or nil plus an error message.
+/// @example
+/// local ok, err = maki.fs.atomic_write("state.json", encoded)
+/// if err then print("atomic write failed: " .. err) end
+#[lua_fn(guard = FsWrite)]
+async fn atomic_write(lua: Lua, path: String, content: String) -> LuaResult<(Value, Value)> {
+    let abs = make_absolute(&path)?;
+    let result = smol::unblock(move || maki_storage::atomic_write(&abs, content.as_bytes())).await;
+    result_pair(&lua, result.map(|()| true))
+}
+
 /// Delete the file, symlink, or directory at {path}.
 /// Pass `recursive = true` to remove a non-empty directory tree (like `rm -r`).
 /// Unlike `vim.fs.rm`, this also removes an empty directory without `recursive`.
@@ -661,7 +677,8 @@ lua_table! {
     "maki.fs" => pub(crate) fn create_fs_table(perms: &PluginPermissions), DOCS [
         read(perms), read_bytes(perms), metadata(perms), dirname, basename,
         joinpath, normalize, abspath, parents, root(perms), relpath, ext,
-        dir(perms), write(perms), rm(perms), mkdir(perms), glob(perms), grep(perms),
+        dir(perms), write(perms), atomic_write(perms), rm(perms), mkdir(perms),
+        glob(perms), grep(perms),
     ]
 }
 
@@ -674,6 +691,10 @@ mod tests {
     use crate::plugin_permissions::PluginPermissions;
     use mlua::Lua;
     use tempfile::TempDir;
+
+    const FIRST_CONTENT: &str = "first";
+    const REPLACEMENT_CONTENT: &str = "replacement";
+    const FS_WRITE_PERMISSION: &str = "fs_write";
 
     #[test]
     fn read_file_ok() {
@@ -921,6 +942,57 @@ mod tests {
         )
         .unwrap();
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "second");
+    }
+
+    #[test]
+    fn atomic_write_creates_and_replaces_file() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("state.json");
+        let lua = Lua::new();
+        let table = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
+        let atomic_write: mlua::Function = table.get("atomic_write").unwrap();
+
+        for content in [FIRST_CONTENT, REPLACEMENT_CONTENT] {
+            let (ok, err): (Value, Value) =
+                smol::block_on(atomic_write.call_async((file.to_str().unwrap(), content))).unwrap();
+            assert_eq!(ok, Value::Boolean(true));
+            assert_eq!(err, Value::Nil);
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), content);
+        }
+    }
+
+    #[test]
+    fn atomic_write_returns_error_when_parent_is_missing() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("missing/state.json");
+        let lua = Lua::new();
+        let table = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
+        let atomic_write: mlua::Function = table.get("atomic_write").unwrap();
+
+        let (ok, err): (Value, Value) =
+            smol::block_on(atomic_write.call_async((file.to_str().unwrap(), FIRST_CONTENT)))
+                .unwrap();
+
+        assert_eq!(ok, Value::Nil);
+        assert!(matches!(err, Value::String(_)));
+        assert!(!file.exists());
+    }
+
+    #[test]
+    fn atomic_write_requires_fs_write_permission() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("state.json");
+        let lua = Lua::new();
+        let table = create_fs_table(&lua, &PluginPermissions::denied()).unwrap();
+        let atomic_write: mlua::Function = table.get("atomic_write").unwrap();
+
+        let error = smol::block_on(
+            atomic_write.call_async::<(Value, Value)>((file.to_str().unwrap(), FIRST_CONTENT)),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains(FS_WRITE_PERMISSION));
+        assert!(!file.exists());
     }
 
     #[test]

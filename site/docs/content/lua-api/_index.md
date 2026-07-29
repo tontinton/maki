@@ -65,6 +65,7 @@ a string belongs.
 | [`maki.env`](#maki-env) | Paths to maki's own directories (config, state, logs, legacy). |
 | [`maki.fn`](#maki-fn) | Process and environment helpers, modeled after Neovim's `vim.fn` job |
 | [`maki.fs`](#maki-fs) | File-system utilities, modelled after `vim.fs` and `vim.uv`. |
+| [`maki.id`](#maki-id) | Identifier utilities. |
 | [`maki.image`](#maki-image) | Small building blocks for working with images: probe metadata, decode |
 | [`maki.image.Image`](#maki-image-Image) | A decoded image you can inspect, resize, and re-encode. |
 | [`maki.interpreter`](#maki-interpreter) | Run Python code in a memory-safe, time-limited sandbox. |
@@ -1826,6 +1827,31 @@ if err then print("write failed: " .. err) end
 
 ---
 
+### `maki.fs.atomic_write()` {#maki-fs-atomic_write}
+
+```lua
+maki.fs.atomic_write({path}, {content})
+```
+
+Atomically replace {path} with {content}. The parent directory must exist.
+Readers observe either the old file or the complete new file.
+
+**Parameters:**
+
+- `{path}` (`string`) Destination file path. `~/` is expanded.
+- `{content}` (`string`) Text to write.
+
+**Returns:** (`true?`, `string?`) `true` on success, or nil plus an error message.
+
+**Example:**
+
+```lua
+local ok, err = maki.fs.atomic_write("state.json", encoded)
+if err then print("atomic write failed: " .. err) end
+```
+
+---
+
 ### `maki.fs.rm()` {#maki-fs-rm}
 
 ```lua
@@ -1937,6 +1963,23 @@ for _, file in ipairs(hits) do
   end
 end
 ```
+
+
+## maki.id {#maki-id}
+
+Identifier utilities.
+
+---
+
+### `maki.id.new()` {#maki-id-new}
+
+```lua
+maki.id.new()
+```
+
+Generate a globally unique Maki identifier.
+
+**Returns:** string New identifier.
 
 
 ## maki.image {#maki-image}
