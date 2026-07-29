@@ -17,6 +17,7 @@ use mlua::{Function, Lua, Result as LuaResult, Table};
 use serde_json::Value;
 
 use crate::api::util::convert::{json_to_lua, lua_tool_result};
+use crate::api::util::pair::Pair;
 use crate::plugin_permissions::PluginPermissions;
 use crate::runtime::{TaskHandle, lock_cell};
 
@@ -90,11 +91,7 @@ async fn call_lua_tool(lua: Lua, f: Option<Function>, pc: &PendingCall) -> Resul
 /// if err then error(err) end
 /// if result.stdout then print(result.stdout) end
 #[lua_fn(guard = Run, name = "run")]
-async fn interpreter_run(
-    lua: Lua,
-    code: String,
-    opts: Table,
-) -> LuaResult<(Table, Option<String>)> {
+async fn interpreter_run(lua: Lua, code: String, opts: Table) -> LuaResult<Pair<Table>> {
     let timeout_secs: u64 = required(&opts, "timeout")?;
     let max_memory_mb: usize = required(&opts, "max_memory_mb")?;
     let on_output: Function = required(&opts, "on_output")?;
@@ -194,9 +191,9 @@ async fn interpreter_run(
             if let Some(val) = ir.output {
                 tbl.set("output", val.to_string())?;
             }
-            Ok((tbl, None))
+            Ok((Some(tbl), None))
         }
-        Err(e) => Ok((tbl, Some(e))),
+        Err(e) => Ok((Some(tbl), Some(e))),
     }
 }
 

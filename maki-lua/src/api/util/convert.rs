@@ -1,10 +1,6 @@
 use mlua::{Lua, LuaSerdeExt, Result as LuaResult, Value};
 use serde_json::Value as JsonValue;
 
-pub(crate) fn err_pair(lua: &Lua, e: impl std::fmt::Display) -> LuaResult<(Value, Value)> {
-    Ok((Value::Nil, Value::String(lua.create_string(e.to_string())?)))
-}
-
 pub(crate) const NIL_TOOL_RESULT_ERR: &str = "tool returned nil without an error message";
 
 pub(crate) fn lua_tool_result(values: mlua::MultiValue) -> Result<String, String> {

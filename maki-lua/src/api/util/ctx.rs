@@ -15,6 +15,7 @@ use mlua::{LuaSerdeExt, MultiValue, UserData, UserDataMethods, Value as LuaValue
 use crate::api::tool::ToolCallReply;
 use crate::api::ui::buf::BufHandle;
 use crate::api::util::convert::json_to_lua;
+use crate::api::util::pair::Pair;
 use crate::runtime::{active_task, lock_cell};
 
 const DEADLINE_ALREADY_SET_MSG: &str = "ctx:set_deadline() already called";
@@ -224,8 +225,8 @@ impl LuaCtx {
         format!("{method} not available in {} ctx", self.kind())
     }
 
-    fn cap_err_pair(&self, method: &str) -> (LuaValue, Option<String>) {
-        (LuaValue::Nil, Some(self.cap_err(method)))
+    fn cap_err_pair<T>(&self, method: &str) -> Pair<T> {
+        (None, Some(self.cap_err(method)))
     }
 }
 
@@ -237,30 +238,28 @@ impl UserData for LuaCtx {
             let Some(workflow) = this.workflow() else {
                 return Ok(this.cap_err_pair("workflow"));
             };
-            Ok((LuaValue::Boolean(workflow), None))
+            Ok((Some(workflow), None))
         });
 
-        methods.add_method("audience", |lua, this, ()| {
+        methods.add_method("audience", |_, this, ()| {
             let Some(audience) = this.audience() else {
                 return Ok(this.cap_err_pair("audience"));
             };
-            let name = lua.create_string(audience.name().unwrap_or("main"))?;
-            Ok((LuaValue::String(name), None))
+            Ok((Some(audience.name().unwrap_or("main").to_string()), None))
         });
 
         // The session that called this tool, which under concurrent
         // sessions is not always the focused one `maki.session.current()`
         // reports. Nil without an error when the run has no session, as in
         // the `maki index` one-shot.
-        methods.add_method("session_id", |lua, this, ()| {
+        methods.add_method("session_id", |_, this, ()| {
             let Some(session_id) = this.session_id() else {
                 return Ok(this.cap_err_pair("session_id"));
             };
             let Some(session_id) = session_id else {
-                return Ok((LuaValue::Nil, None));
+                return Ok((None, None));
             };
-            let id = lua.create_string(session_id.id().to_string())?;
-            Ok((LuaValue::String(id), None))
+            Ok((Some(session_id.id().to_string()), None))
         });
 
         methods.add_method("live_buf", |lua, this, buf: mlua::AnyUserData| {
@@ -268,7 +267,7 @@ impl UserData for LuaCtx {
                 return Ok(this.cap_err_pair("live_buf"));
             }
             send_live_buf(lua, &buf)?;
-            Ok((LuaValue::Nil, None))
+            Ok((Some(true), None))
         });
 
         methods.add_method("config", |lua, this, args: MultiValue| {
@@ -277,7 +276,7 @@ impl UserData for LuaCtx {
             };
             let config_val = lua.to_value(config)?;
             if args.is_empty() {
-                return Ok((config_val, None));
+                return Ok((Some(config_val), None));
             }
             let key: String = lua.from_value(args[0].clone())?;
             let default = args.get(1).cloned().unwrap_or(LuaValue::Nil);
@@ -292,7 +291,7 @@ impl UserData for LuaCtx {
                 }
                 _ => default,
             };
-            Ok((val, None))
+            Ok((Some(val), None))
         });
 
         methods.add_method("tool_output_lines", |lua, this, ()| {
@@ -316,7 +315,7 @@ impl UserData for LuaCtx {
             cell.deadline_secs.set(Some(secs));
             cell.deadline
                 .set(Some(Instant::now() + Duration::from_secs(secs)));
-            Ok((LuaValue::Nil, None))
+            Ok((Some(true), None))
         });
 
         methods.add_method("record_read", |_, this, path: String| {
@@ -324,7 +323,7 @@ impl UserData for LuaCtx {
                 return Ok(this.cap_err_pair("record_read"));
             };
             tracker.record_read(Path::new(&path));
-            Ok((LuaValue::Nil, None))
+            Ok((Some(true), None))
         });
 
         methods.add_method("check_before_edit", |_, this, path: String| {
@@ -332,11 +331,11 @@ impl UserData for LuaCtx {
                 return Ok(this.cap_err_pair("check_before_edit"));
             };
             if !agent.config.stale_read_check {
-                return Ok((LuaValue::Boolean(true), None));
+                return Ok((Some(true), None));
             }
             match agent.file_tracker.check_before_edit(Path::new(&path)) {
-                Ok(()) => Ok((LuaValue::Boolean(true), None)),
-                Err(msg) => Ok((LuaValue::Boolean(false), Some(msg))),
+                Ok(()) => Ok((Some(true), None)),
+                Err(msg) => Ok((Some(false), Some(msg))),
             }
         });
 
@@ -359,7 +358,7 @@ impl UserData for LuaCtx {
                     entry.set("content", content)?;
                     tbl.set(i + 1, entry)?;
                 }
-                Ok((LuaValue::Table(tbl), None))
+                Ok((Some(tbl), None))
             },
         );
 
@@ -380,7 +379,7 @@ impl UserData for LuaCtx {
                 lock_cell(&active_task(lua)).root_buf = Some(buf);
             }
             let _ = tx.send(ToolCallReply::from_lua_value(lua, &val));
-            Ok((LuaValue::Nil, None))
+            Ok((Some(true), None))
         });
     }
 }

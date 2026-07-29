@@ -34,6 +34,7 @@ use tracing::info;
 use crate::api::ui::buf::BufHandle;
 use crate::api::util::convert::{json_to_lua, lua_to_json, lua_tool_result};
 use crate::api::util::ctx::{AgentContext, LuaCtx};
+use crate::api::util::pair::{Pair, err_pair, try_pair};
 
 const SESSION_CLOSED_ERR: &str = "session closed";
 const DEFAULT_SESSION_AUDIENCE: ToolAudience = ToolAudience::GENERAL_SUB;
@@ -72,12 +73,6 @@ fn dispatch_ctx<'a>(ctx: &'a LuaCtx, method: &str) -> Result<&'a AgentContext, S
         .ok_or_else(|| ctx.cap_err(&format!("maki.agent.{method}")))
 }
 
-type Pair<T> = (Option<T>, Option<String>);
-
-fn err_pair<T>(err: impl ToString) -> Pair<T> {
-    (None, Some(err.to_string()))
-}
-
 /// Forwards subagent events to the parent, stamped with the subagent identity.
 /// Usage takes two paths: live on the tool header while the run goes on, and one
 /// total per run on `usage_tx`, which `prompt` waits for.
@@ -112,18 +107,6 @@ async fn relay_session_events(
         envelope.subagent = subagent_info.get().cloned();
         let _ = parent_tx.send_envelope(envelope);
     }
-}
-
-/// `maki.agent.*` convention: wrong argument types throw; every value or
-/// runtime failure (including a ctx without dispatch capability) returns
-/// `(nil, err)`.
-macro_rules! try_pair {
-    ($e:expr) => {
-        match $e {
-            Ok(v) => v,
-            Err(e) => return Ok(err_pair(e)),
-        }
-    };
 }
 
 /// Look up the model that the current agent is using, or pick a cheaper one.

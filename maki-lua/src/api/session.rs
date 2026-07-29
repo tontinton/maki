@@ -3,21 +3,21 @@
 //! the loop answers `list` from a background task so slow scans never block.
 
 use maki_lua_macro::{lua_fn, lua_table};
-use mlua::{Lua, Result as LuaResult, Table};
+use mlua::{Lua, Result as LuaResult, Table, Value};
 
-use crate::api::util::command::{Pair, SessionRequest, UiAction, err_pair, ui_roundtrip};
+use crate::api::util::command::{SessionRequest, UiAction, ui_roundtrip};
 use crate::api::util::convert::json_to_lua;
+use crate::api::util::pair::{Pair, try_pair};
 
 async fn roundtrip(
     lua: Lua,
     tx: Option<flume::Sender<UiAction>>,
     req: SessionRequest,
-) -> LuaResult<Pair> {
-    match ui_roundtrip(tx.as_ref(), |reply_tx| UiAction::Session { req, reply_tx }).await {
-        Ok(Ok(value)) => Ok((json_to_lua(&lua, &value)?, None)),
-        Ok(Err(e)) => Ok(err_pair(e)),
-        Err(e) => Ok(err_pair(e)),
-    }
+) -> LuaResult<Pair<Value>> {
+    let reply =
+        try_pair!(ui_roundtrip(tx.as_ref(), |reply_tx| UiAction::Session { req, reply_tx }).await);
+    let value = try_pair!(reply);
+    Ok((Some(json_to_lua(&lua, &value)?), None))
 }
 
 /// Lists sessions stored for the current project. Answered from a
@@ -27,7 +27,7 @@ async fn roundtrip(
 /// @example
 /// local stored, err = maki.session.list()
 #[lua_fn]
-async fn list(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult<Pair> {
+async fn list(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult<Pair<Value>> {
     roundtrip(lua, tx, SessionRequest::List).await
 }
 
@@ -38,7 +38,7 @@ async fn list(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult
 /// @example
 /// local live, err = maki.session.live()
 #[lua_fn]
-async fn live(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult<Pair> {
+async fn live(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult<Pair<Value>> {
     roundtrip(lua, tx, SessionRequest::Live).await
 }
 
@@ -48,7 +48,7 @@ async fn live(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult
 /// @example
 /// local id = maki.session.current()
 #[lua_fn]
-async fn current(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult<Pair> {
+async fn current(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult<Pair<Value>> {
     roundtrip(lua, tx, SessionRequest::Current).await
 }
 
@@ -63,7 +63,7 @@ async fn focus(
     lua: Lua,
     #[ctx] tx: Option<flume::Sender<UiAction>>,
     id: String,
-) -> LuaResult<Pair> {
+) -> LuaResult<Pair<Value>> {
     roundtrip(lua, tx, SessionRequest::Focus { id }).await
 }
 
@@ -79,7 +79,7 @@ async fn delete(
     lua: Lua,
     #[ctx] tx: Option<flume::Sender<UiAction>>,
     id: String,
-) -> LuaResult<Pair> {
+) -> LuaResult<Pair<Value>> {
     roundtrip(lua, tx, SessionRequest::Delete { id }).await
 }
 
@@ -95,7 +95,7 @@ async fn new(
     lua: Lua,
     #[ctx] tx: Option<flume::Sender<UiAction>>,
     opts: Option<Table>,
-) -> LuaResult<Pair> {
+) -> LuaResult<Pair<Value>> {
     let (prompt, focus) = match opts {
         Some(opts) => (opts.get("prompt")?, opts.get("focus").unwrap_or(false)),
         None => (None, false),
@@ -120,7 +120,7 @@ async fn prompt(
     #[ctx] tx: Option<flume::Sender<UiAction>>,
     text: String,
     opts: Option<Table>,
-) -> LuaResult<Pair> {
+) -> LuaResult<Pair<Value>> {
     let id = match opts {
         Some(opts) => opts.get("session")?,
         None => None,
@@ -140,7 +140,7 @@ async fn set_title(
     lua: Lua,
     #[ctx] tx: Option<flume::Sender<UiAction>>,
     opts: Table,
-) -> LuaResult<Pair> {
+) -> LuaResult<Pair<Value>> {
     let req = SessionRequest::SetTitle {
         id: opts.get("id")?,
         title: opts.get("title")?,

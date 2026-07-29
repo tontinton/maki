@@ -8,9 +8,10 @@ use std::sync::Arc;
 
 use image::{DynamicImage, ImageFormat, ImageReader};
 use maki_lua_macro::{lua_class, lua_fn, lua_table};
-use mlua::{Lua, Result as LuaResult, Value as LuaValue};
+use mlua::{AnyUserData, Lua, Result as LuaResult, Table, Value as LuaValue};
 
 use super::base64::bytes_arg;
+use super::util::pair::{Pair, try_pair};
 
 /// Decode-bomb guard: a tiny file can declare huge dimensions and balloon
 /// into gigabytes of RGBA. Host-fixed so no plugin can disable it; 50MP
@@ -152,18 +153,14 @@ lua_class! {
 /// if err then error(err) end
 /// print(info.format, info.width, info.height)
 #[lua_fn]
-fn probe(lua: &Lua, data: LuaValue) -> LuaResult<(LuaValue, LuaValue)> {
+fn probe(lua: &Lua, data: LuaValue) -> LuaResult<Pair<Table>> {
     let bytes = bytes_arg(&data, "image.probe")?;
-    match probe_bytes(&bytes) {
-        Ok((format, width, height)) => {
-            let info = lua.create_table()?;
-            info.set("format", format_name(format))?;
-            info.set("width", width)?;
-            info.set("height", height)?;
-            Ok((LuaValue::Table(info), LuaValue::Nil))
-        }
-        Err(e) => Ok((LuaValue::Nil, LuaValue::String(lua.create_string(e)?))),
-    }
+    let (format, width, height) = try_pair!(probe_bytes(&bytes));
+    let info = lua.create_table()?;
+    info.set("format", format_name(format))?;
+    info.set("width", width)?;
+    info.set("height", height)?;
+    Ok((Some(info), None))
 }
 
 /// Decode raw image bytes into an Image handle you can resize and re-encode.
@@ -176,15 +173,10 @@ fn probe(lua: &Lua, data: LuaValue) -> LuaResult<(LuaValue, LuaValue)> {
 /// if err then error(err) end
 /// print(img:width() .. "x" .. img:height())
 #[lua_fn]
-async fn decode(lua: Lua, data: LuaValue) -> LuaResult<(LuaValue, LuaValue)> {
+async fn decode(lua: Lua, data: LuaValue) -> LuaResult<Pair<AnyUserData>> {
     let bytes = bytes_arg(&data, "image.decode")?;
-    match smol::unblock(move || decode_bytes(&bytes)).await {
-        Ok(img) => Ok((
-            LuaValue::UserData(lua.create_userdata(LuaImage(Arc::new(img)))?),
-            LuaValue::Nil,
-        )),
-        Err(e) => Ok((LuaValue::Nil, LuaValue::String(lua.create_string(e)?))),
-    }
+    let img = try_pair!(smol::unblock(move || decode_bytes(&bytes)).await);
+    Ok((Some(lua.create_userdata(LuaImage(Arc::new(img)))?), None))
 }
 
 lua_table! {

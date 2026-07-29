@@ -873,9 +873,9 @@ impl MessagesPanel {
         self.scroll_top
     }
 
-    /// Backs `maki.fn.winsaveview`. The clamp earns its keep: a pinned or
-    /// restored `scroll_top` can sit past the end until the next `view`
-    /// resolves it against the current line count.
+    /// Backs `maki.fn.winsaveview`. The clamp matters: a pinned or restored
+    /// `scroll_top` can sit past the end until the next `view` resolves it
+    /// against the current line count.
     pub fn win_view(&self) -> WinView {
         WinView {
             scroll_top: self.scroll_top.min(self.max_scroll()),

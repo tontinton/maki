@@ -1,7 +1,7 @@
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Lua, LuaSerdeExt, Result as LuaResult, Value};
 
-use super::util::convert::err_pair;
+use super::util::pair::{Pair, pair, try_pair};
 
 /// Turn a Lua value into a YAML string. Most Lua types work, but
 /// circular references will return an error.
@@ -12,15 +12,9 @@ use super::util::convert::err_pair;
 /// local s, err = maki.yaml.encode({ name = "maki", tags = { "ai", "agent" } })
 /// print(s)
 #[lua_fn]
-fn encode(lua: &Lua, value: Value) -> LuaResult<(Value, Value)> {
-    let serde_val: serde_yaml::Value = match lua.from_value(value) {
-        Ok(v) => v,
-        Err(e) => return err_pair(lua, e),
-    };
-    match serde_yaml::to_string(&serde_val) {
-        Ok(s) => Ok((Value::String(lua.create_string(&s)?), Value::Nil)),
-        Err(e) => err_pair(lua, e),
-    }
+fn encode(lua: &Lua, value: Value) -> LuaResult<Pair<String>> {
+    let serde_val: serde_yaml::Value = try_pair!(lua.from_value(value));
+    Ok(pair(serde_yaml::to_string(&serde_val)))
 }
 
 /// Parse a YAML string into a Lua value. Mappings become tables and
@@ -32,11 +26,9 @@ fn encode(lua: &Lua, value: Value) -> LuaResult<(Value, Value)> {
 /// local t, err = maki.yaml.decode("name: maki\nversion: 1")
 /// print(t.name) -- maki
 #[lua_fn]
-fn decode(lua: &Lua, str: String) -> LuaResult<(Value, Value)> {
-    match serde_yaml::from_str::<serde_yaml::Value>(&str) {
-        Ok(v) => Ok((lua.to_value(&v)?, Value::Nil)),
-        Err(e) => err_pair(lua, e),
-    }
+fn decode(lua: &Lua, str: String) -> LuaResult<Pair<Value>> {
+    let value = try_pair!(serde_yaml::from_str::<serde_yaml::Value>(&str));
+    Ok((Some(lua.to_value(&value)?), None))
 }
 
 lua_table! {

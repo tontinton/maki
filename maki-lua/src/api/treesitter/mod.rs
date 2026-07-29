@@ -7,29 +7,17 @@ pub(crate) mod tree;
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{AnyUserData, Lua, Result as LuaResult, Table};
 
+use crate::api::util::pair::{Pair, err_pair};
 use crate::language::Language;
 use language_tree::LuaLanguageTree;
 use node::LuaNode;
 
-fn parse_impl(
-    lua: &Lua,
-    source: String,
-    lang_name: String,
-) -> LuaResult<(mlua::Value, mlua::Value)> {
+fn parse_impl(lua: &Lua, source: String, lang_name: String) -> LuaResult<Pair<AnyUserData>> {
     let Some(lang) = Language::from_name(&lang_name) else {
-        return Ok((
-            mlua::Value::Nil,
-            mlua::Value::String(lua.create_string(format!("no language registered: {lang_name}"))?),
-        ));
+        return Ok(err_pair(format!("no language registered: {lang_name}")));
     };
-    Ok((
-        mlua::Value::UserData(lua.create_userdata(LuaLanguageTree::new(
-            source.into(),
-            lang_name.into(),
-            lang,
-        ))?),
-        mlua::Value::Nil,
-    ))
+    let tree = LuaLanguageTree::new(source.into(), lang_name.into(), lang);
+    Ok((Some(lua.create_userdata(tree)?), None))
 }
 
 /// Creates a `LanguageTree` for {source} using the grammar named {lang}.
@@ -43,7 +31,7 @@ fn parse_impl(
 /// local parser, err = maki.treesitter.get_parser(src, "lua")
 /// if err then print("error: " .. err) end
 #[lua_fn]
-fn get_parser(lua: &Lua, source: String, lang: String) -> LuaResult<(mlua::Value, mlua::Value)> {
+fn get_parser(lua: &Lua, source: String, lang: String) -> LuaResult<Pair<AnyUserData>> {
     parse_impl(lua, source, lang)
 }
 
@@ -53,11 +41,7 @@ fn get_parser(lua: &Lua, source: String, lang: String) -> LuaResult<(mlua::Value
 /// @param lang string Language name.
 /// @return (LanguageTree|nil, string|nil) Parser, or nil and an error message.
 #[lua_fn]
-fn get_string_parser(
-    lua: &Lua,
-    source: String,
-    lang: String,
-) -> LuaResult<(mlua::Value, mlua::Value)> {
+fn get_string_parser(lua: &Lua, source: String, lang: String) -> LuaResult<Pair<AnyUserData>> {
     parse_impl(lua, source, lang)
 }
 

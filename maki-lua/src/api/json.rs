@@ -1,7 +1,8 @@
 use maki_lua_macro::{lua_fn, lua_table};
-use mlua::{Lua, LuaSerdeExt, Result as LuaResult, UserData, UserDataMethods, Value};
+use mlua::{AnyUserData, Lua, LuaSerdeExt, Result as LuaResult, UserData, UserDataMethods, Value};
 
-use super::util::convert::{err_pair, json_to_lua, lua_to_json};
+use super::util::convert::{json_to_lua, lua_to_json};
+use super::util::pair::{Pair, pair, try_pair};
 
 pub(crate) const VALIDATOR_DOCS: crate::docs::ModuleDoc = crate::docs::ModuleDoc {
     name: "maki.json.SchemaValidator",
@@ -71,15 +72,9 @@ impl UserData for LuaSchemaValidator {
 /// local s, err = maki.json.encode({ name = "maki", version = 1 })
 /// print(s) -- {"name":"maki","version":1}
 #[lua_fn]
-fn encode(lua: &Lua, value: Value) -> LuaResult<(Value, Value)> {
-    let serde_val: serde_json::Value = match lua.from_value(value) {
-        Ok(v) => v,
-        Err(e) => return err_pair(lua, e),
-    };
-    match serde_json::to_string(&serde_val) {
-        Ok(s) => Ok((Value::String(lua.create_string(&s)?), Value::Nil)),
-        Err(e) => err_pair(lua, e),
-    }
+fn encode(lua: &Lua, value: Value) -> LuaResult<Pair<String>> {
+    let serde_val: serde_json::Value = try_pair!(lua.from_value(value));
+    Ok(pair(serde_json::to_string(&serde_val)))
 }
 
 /// Parse a JSON string into a Lua value. Objects become tables and
@@ -91,11 +86,9 @@ fn encode(lua: &Lua, value: Value) -> LuaResult<(Value, Value)> {
 /// local t, err = maki.json.decode('{"x": 42}')
 /// print(t.x) -- 42
 #[lua_fn]
-fn decode(lua: &Lua, str: String) -> LuaResult<(Value, Value)> {
-    match serde_json::from_str::<serde_json::Value>(&str) {
-        Ok(v) => Ok((json_to_lua(lua, &v)?, Value::Nil)),
-        Err(e) => err_pair(lua, e),
-    }
+fn decode(lua: &Lua, str: String) -> LuaResult<Pair<Value>> {
+    let value = try_pair!(serde_json::from_str::<serde_json::Value>(&str));
+    Ok((Some(json_to_lua(lua, &value)?), None))
 }
 
 /// Compile a JSON Schema into a reusable validator object. Supports
@@ -113,18 +106,13 @@ fn decode(lua: &Lua, str: String) -> LuaResult<(Value, Value)> {
 /// local errs = v:validate({ name = "maki" })
 /// assert(errs == nil)
 #[lua_fn]
-fn schema_validator(lua: &Lua, schema: Value) -> LuaResult<(Value, Value)> {
-    let schema_json = match lua_to_json(lua, &schema) {
-        Ok(v) => v,
-        Err(e) => return err_pair(lua, e),
-    };
-    match jsonschema::validator_for(&schema_json) {
-        Ok(validator) => Ok((
-            Value::UserData(lua.create_userdata(LuaSchemaValidator { validator })?),
-            Value::Nil,
-        )),
-        Err(e) => err_pair(lua, e),
-    }
+fn schema_validator(lua: &Lua, schema: Value) -> LuaResult<Pair<AnyUserData>> {
+    let schema_json = try_pair!(lua_to_json(lua, &schema));
+    let validator = try_pair!(jsonschema::validator_for(&schema_json));
+    Ok((
+        Some(lua.create_userdata(LuaSchemaValidator { validator })?),
+        None,
+    ))
 }
 
 lua_table! {

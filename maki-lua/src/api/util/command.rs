@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use arc_swap::ArcSwap;
 use maki_agent::SharedBuf;
-use mlua::{RegistryKey, Value};
+use mlua::RegistryKey;
 
 pub(crate) const NO_UI_ERR: &str = "no interactive UI attached";
 const UI_DROPPED_ERR: &str = "ui event loop dropped the request";
@@ -439,14 +439,6 @@ pub enum UiAction {
     WinRestView {
         scroll_top: u16,
     },
-}
-
-/// Lua's `(value, err)` convention: a failed UI call answers with nil and a
-/// message instead of raising.
-pub(crate) type Pair = (Value, Option<String>);
-
-pub(crate) fn err_pair(err: impl ToString) -> Pair {
-    (Value::Nil, Some(err.to_string()))
 }
 
 /// Hand an action to the UI event loop. A full or closed channel means the
