@@ -1,6 +1,6 @@
 -- Watch a long-running command and let the agent hear about it later.
 --
--- The job outlives the tool call that started it (owner = "session"), and
+-- The job outlives the tool call that started it (owner = "plugin"), and
 -- each interesting line goes to the session mailbox instead of being sent
 -- as its own prompt, so a chatty watcher costs nothing until the agent
 -- runs again.
@@ -35,9 +35,22 @@ local SCHEMA = {
   additionalProperties = false,
 }
 
-local function report(entry, line)
-  if entry.match and not line:match(entry.match) then
-    return
+local function report(entry, line, prefix)
+  if entry.match then
+    local ok, matched = pcall(string.match, line, entry.match)
+    if not ok then
+      if not entry.match_error then
+        entry.match_error = true
+        maki.session.notify(
+          string.format("[%s] invalid match pattern: %s", entry.label, tostring(matched)),
+          { session = entry.session }
+        )
+      end
+      return
+    end
+    if not matched then
+      return
+    end
   end
   entry.seen = entry.seen + 1
   if entry.seen > MAX_LINES then
@@ -50,7 +63,10 @@ local function report(entry, line)
     end
     return
   end
-  maki.session.notify(string.format("[%s] %s", entry.label, line), { session = entry.session, wake = entry.wake })
+  maki.session.notify(
+    string.format("[%s] %s%s", entry.label, prefix or "", line),
+    { session = entry.session, wake = entry.wake }
+  )
 end
 
 -- Labels and commands are whatever the model sent, newlines and all,
@@ -148,6 +164,16 @@ maki.api.register_tool({
       return no_session
     end
 
+    if input.match then
+      local ok, match_err = pcall(string.match, "", input.match)
+      if not ok then
+        return {
+          llm_output = "error: invalid match pattern: " .. tostring(match_err),
+          is_error = true,
+        }
+      end
+    end
+
     local entry = {
       command = command,
       label = input.label,
@@ -158,11 +184,17 @@ maki.api.register_tool({
     }
 
     local id, start_err = maki.fn.jobstart(command, {
-      owner = "session",
+      owner = "plugin",
       on_stdout = function(job_id, line)
         local e = monitors[job_id]
         if e then
           report(e, line)
+        end
+      end,
+      on_stderr = function(job_id, line)
+        local e = monitors[job_id]
+        if e then
+          report(e, line, "stderr: ")
         end
       end,
       on_exit = function(job_id, code)
@@ -254,15 +286,17 @@ maki.api.register_command({
   end,
 })
 
--- Unlike `stop`, this cannot tell whose monitors these are: SessionReset
--- does not yet name the session that ended, so one session resetting
--- takes down every session's watchers. Right with one session open and
--- wrong with several; it wants the event to carry the id.
-local function stop_all()
-  for id in pairs(monitors) do
-    maki.fn.jobstop(id)
+local function stop_session(ev)
+  local session = ev.data and ev.data.session_id
+  if not session then
+    return
   end
-  monitors = {}
+  for id, entry in pairs(monitors) do
+    if entry.session == session then
+      maki.fn.jobstop(id)
+      monitors[id] = nil
+    end
+  end
 end
 
-maki.api.create_autocmd({ "SessionReset" }, { callback = stop_all })
+maki.api.create_autocmd({ "SessionReset" }, { callback = stop_session })

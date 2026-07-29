@@ -4,14 +4,14 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use maki_agent::ToolOutput;
 use maki_agent::tools::{
     DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool, ToolContext,
     ToolExecResult, ToolInvocation, ToolLive, ToolRegistry, ToolSource, timeout_annotation,
 };
+use maki_agent::{SessionMailbox, ToolOutput};
 use maki_config::{AlwaysThinking, PluginsConfig, ToolOutputLines};
 use maki_lua::{PluginError, PluginHost, WARM_TOOL_CAP};
-use maki_storage::id::SessionRef;
+use maki_storage::id::{MakiId, SessionRef};
 use serde_json::{Value, json};
 
 const NARGS_ERR: &str = r#"'nargs' must be 0, 1, "?", "*", or "+""#;
@@ -480,6 +480,106 @@ fn a_monitor_cannot_forge_rows_in_the_listing() {
     assert!(
         rest.starts_with("real "),
         "the label stayed inside its own row: {listed}"
+    );
+}
+
+#[test]
+fn monitor_rejects_an_invalid_match_pattern() {
+    const SESSION_ID: &str = "01965087-4c71-7f00-8000-00000000000d";
+    const INVALID_PATTERN: &str = "[";
+    const EXPECTED_ERROR: &str = "invalid match pattern";
+
+    let (reg, _host) = builtins_host();
+    let ctx = ctx_for_session(SESSION_ID);
+
+    let error = exec_with_ctx(
+        &reg,
+        "monitor",
+        json!({ "command": "sleep 5", "match": INVALID_PATTERN }),
+        &ctx,
+    )
+    .expect_err("invalid match patterns must be rejected");
+    assert!(error.contains(EXPECTED_ERROR), "got: {error}");
+    assert_eq!(
+        exec_with_ctx(&reg, "monitor_list", json!({}), &ctx).expect("list failed"),
+        "no monitors running"
+    );
+}
+
+#[test]
+fn monitor_reports_stderr_to_the_session_mailbox() {
+    const SESSION_ID: &str = "01965087-4c71-7f00-8000-00000000000e";
+    const STDERR_LINE: &str = "stderr: broken";
+
+    let (reg, host) = builtins_host();
+    let ctx = ctx_for_session(SESSION_ID);
+    let mailbox = SessionMailbox::register(SESSION_ID.parse::<MakiId>().unwrap());
+
+    exec_with_ctx(
+        &reg,
+        "monitor",
+        json!({ "command": "printf 'broken\\n' >&2", "label": "build" }),
+        &ctx,
+    )
+    .expect("monitor failed to start");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let observations = mailbox.drain();
+        if observations
+            .iter()
+            .filter_map(|message| message.user_text())
+            .any(|text| text.contains(STDERR_LINE))
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "stderr observation missing"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    barrier(&host);
+}
+
+#[test]
+fn session_reset_stops_only_that_sessions_monitors() {
+    const SESSION_A: &str = "01965087-4c71-7f00-8000-00000000000f";
+    const SESSION_B: &str = "01965087-4c71-7f00-8000-000000000010";
+
+    let (reg, host) = builtins_host();
+    let ctx_a = ctx_for_session(SESSION_A);
+    let ctx_b = ctx_for_session(SESSION_B);
+    let reset_session = SESSION_A.parse::<MakiId>().unwrap().to_string();
+
+    exec_with_ctx(
+        &reg,
+        "monitor",
+        json!({ "command": "sleep 30", "label": "reset" }),
+        &ctx_a,
+    )
+    .expect("first monitor failed to start");
+    exec_with_ctx(
+        &reg,
+        "monitor",
+        json!({ "command": "sleep 30", "label": "kept" }),
+        &ctx_b,
+    )
+    .expect("second monitor failed to start");
+
+    host.event_handle()
+        .fire_autocmd("SessionReset", json!({ "session_id": reset_session }));
+    barrier(&host);
+
+    assert_eq!(
+        exec_with_ctx(&reg, "monitor_list", json!({}), &ctx_a).expect("list failed"),
+        "no monitors running"
+    );
+    assert!(
+        exec_with_ctx(&reg, "monitor_list", json!({}), &ctx_b)
+            .expect("list failed")
+            .contains("kept"),
+        "another session's monitor must survive reset"
     );
 }
 
