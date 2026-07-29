@@ -99,6 +99,7 @@ hmac = { version = "0.12", default-features = false }
 base64 = "0.22"
 getrandom = "0.3"
 fastrand = "2"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 test-case = "3"
 ignore = "0.4"
 memchr = "2"
