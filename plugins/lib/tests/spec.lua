@@ -23,6 +23,7 @@ local function mock_buf()
     self.lines = lines
     self.call_count = self.call_count + 1
   end
+  function b:on() end
   return b
 end
 
@@ -291,6 +292,66 @@ case("tool_view_max_line_bytes_default_off", function()
   eq(buf.lines[1], long)
 end)
 
+local RESTORE_OPTS = { max_lines = 10, keep = "head", width = 80 }
+local RESTORE_OUTPUT = "**bold** line\nsecond line"
+local RENDERED = "rendered by markdown"
+
+local function all_text(lines)
+  local out = {}
+  for _, line in ipairs(lines) do
+    if type(line) == "string" then
+      out[#out + 1] = line
+    else
+      for _, span in ipairs(line) do
+        out[#out + 1] = span[1]
+      end
+    end
+  end
+  return table.concat(out, "\n")
+end
+
+-- Restores {output} with {markdown} standing in for the real renderer; returns
+-- the text that reached the buf and how many times the renderer ran.
+local function restore_markdown(output, is_error, markdown)
+  local buf = mock_buf()
+  local original = { buf = maki.ui.buf, markdown = maki.ui.markdown }
+  local calls = 0
+  maki.ui.buf = function()
+    return buf
+  end
+  maki.ui.markdown = function(...)
+    calls = calls + 1
+    return markdown(...)
+  end
+  local ok, err = pcall(ToolView.restore_markdown, output, is_error, RESTORE_OPTS)
+  maki.ui.buf, maki.ui.markdown = original.buf, original.markdown
+  assert(ok, tostring(err))
+  return all_text(buf.lines), calls
+end
+
+local function markdown_marker()
+  return { { { RENDERED, "md" } } }
+end
+
+case("tool_view_restore_markdown_renders_markdown", function()
+  local text, calls = restore_markdown(RESTORE_OUTPUT, false, markdown_marker)
+  eq(calls, 1, "output must go through markdown rendering")
+  eq(text, RENDERED, "the rendered lines are what reaches the buf")
+end)
+
+case("tool_view_restore_markdown_keeps_errors_plain", function()
+  local text, calls = restore_markdown(RESTORE_OUTPUT, true, markdown_marker)
+  eq(calls, 0, "error output must never reach the markdown renderer")
+  eq(text, RESTORE_OUTPUT, "error output must render verbatim")
+end)
+
+case("tool_view_restore_markdown_falls_back_when_rendering_fails", function()
+  local text = restore_markdown(RESTORE_OUTPUT, false, function()
+    error("renderer blew up")
+  end)
+  eq(text, RESTORE_OUTPUT, "a failing renderer must not swallow the output")
+end)
+
 local TextInput = require("maki.text_input")
 
 case("text_input_insert_and_value", function()
@@ -316,6 +377,15 @@ case("text_input_backspace_deletes", function()
   input:handle_key("backspace")
   eq(input:value(), "ab")
   eq(input.col, 2)
+end)
+
+case("text_input_shift_backspace_deletes", function()
+  local input = TextInput.new()
+  input:handle_key("a")
+  input:handle_key("b")
+  input:handle_key("shift+backspace")
+  eq(input:value(), "a")
+  eq(input.col, 1)
 end)
 
 case("text_input_cursor_movement", function()
@@ -1258,6 +1328,29 @@ case("filter_items_every_word_must_match", function()
   eq(filtered[1], "review gh pr 441")
 end)
 
+case("filter_items_matches_section", function()
+  local items = {
+    { label = "a.md", section = "auth (2)" },
+    { label = "b.md", section = "auth (2)" },
+    { label = "c.md", section = "storage (1)" },
+  }
+  local filtered, indices = filter_items(items, "auth")
+  eq(#filtered, 2, "typing a section name keeps its items")
+  eq(filtered[1].label, "a.md")
+  eq(filtered[2].label, "b.md")
+  eq(indices[2], 2)
+end)
+
+case("filter_items_words_split_across_label_and_section", function()
+  local items = {
+    { label = "gotchas.md", section = "auth (2)" },
+    { label = "notes.md", section = "auth (2)" },
+  }
+  local filtered = filter_items(items, "auth gotchas")
+  eq(#filtered, 1)
+  eq(filtered[1].label, "gotchas.md")
+end)
+
 case("highlight_spans_overlapping_words_merge", function()
   local spans = ListPicker.highlight_spans("alphabet", { "alpha", "phab" }, "item", "match")
   eq(#spans, 2)
@@ -1286,6 +1379,57 @@ case("render_lines_match_at_start_keeps_indent", function()
   eq(lines[1][1][2], "selected")
   eq(lines[1][2][1], "al")
   eq(lines[1][2][2], "match_selected")
+end)
+
+case("render_lines_sections_headers_and_item_lines", function()
+  local items = {
+    { label = "a", section = "auth", section_detail = "(2)" },
+    { label = "b", section = "auth", section_detail = "(2)" },
+    { label = "c", section = "storage" },
+  }
+  local lines, item_lines = render_lines(items, 1, 40)
+  eq(#lines, 6, "two headers + blank gap + three items, header never repeats within a section")
+  eq(lines[1][1][1], "  auth")
+  eq(lines[1][1][2], "keybind_section")
+  eq(lines[1][2][1], " (2)", "section detail rendered after the header")
+  eq(lines[1][2][2], "dim")
+  eq(lines[2][1][1], "  a")
+  eq(lines[3][1][1], "  b")
+  eq(#lines[4], 0, "blank line between sections")
+  eq(lines[5][1][1], "  storage")
+  eq(#lines[5], 1, "no detail span without section_detail")
+  eq(lines[6][1][1], "  c")
+  eq(item_lines[1], 2, "cursor mapping skips the header")
+  eq(item_lines[2], 3)
+  eq(item_lines[3], 6)
+end)
+
+case("render_lines_item_lines_identity_without_sections", function()
+  local lines, item_lines = render_lines({ "a", "b", "c" }, 1, 40)
+  eq(#lines, 3)
+  for i = 1, 3 do
+    eq(item_lines[i], i, "plain list maps item " .. i .. " straight to its line")
+  end
+end)
+
+case("section_rows_counts_headers_and_gaps", function()
+  local section_rows = ListPicker._section_rows
+  eq(section_rows({ "a", "b" }), 0)
+  eq(section_rows({ { label = "a", section = "s" }, "b" }), 1, "header on line one needs no gap")
+  eq(section_rows({ "a", { label = "b", section = "s" } }), 2, "gap precedes a header that follows items")
+  eq(section_rows({ { label = "a", section = "s" }, { label = "b", section = "t" } }), 3)
+end)
+
+case("render_lines_nil_sections_mix_with_grouped", function()
+  local lines = render_lines({ "plain", { label = "x", section = "grp" } }, 1, 40)
+  eq(lines[1][1][1], "  plain", "no header for a nil-section first item")
+  eq(#lines[2], 0, "blank line before a header that follows items")
+  eq(lines[3][1][1], "  grp")
+  eq(lines[4][1][1], "  x")
+
+  local _, item_lines = render_lines({ { label = "a", section = "grp" }, "b" }, 1, 40)
+  eq(item_lines[1], 2, "grouped item sits under its header")
+  eq(item_lines[2], 3, "nil-section item follows without a new header")
 end)
 
 if #failures > 0 then

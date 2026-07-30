@@ -199,7 +199,7 @@ impl ModelPicker {
         }
         match self.picker.handle_key(key) {
             PickerAction::Consumed => ModelPickerAction::Consumed,
-            PickerAction::Select(_, entry) => ModelPickerAction::Select(entry.spec),
+            PickerAction::Select(entry) => ModelPickerAction::Select(entry.spec),
             PickerAction::Close => ModelPickerAction::Close,
             PickerAction::Toggle(..) => ModelPickerAction::Consumed,
         }

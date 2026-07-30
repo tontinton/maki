@@ -32,7 +32,7 @@ end
 
 function M.has(output, needles)
   for _, n in ipairs(needles) do
-    assert(output:find(n, 1, true), "missing '" .. n .. "'")
+    assert(output:find(n, 1, true), "missing '" .. n .. "' in output:\n" .. output)
   end
 end
 

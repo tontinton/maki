@@ -228,7 +228,6 @@ end }})
     );
     load(&host, "listener", &listener);
     host.event_handle()
-        .unwrap()
         .fire_autocmd("TurnEnd", serde_json::json!({ "k": "v" }));
     assert_eq!(exec_tool(&reg, "probe_turn_end"), "TurnEnd|nil|v");
 }

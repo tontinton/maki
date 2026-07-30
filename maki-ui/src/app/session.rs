@@ -13,7 +13,6 @@ use crate::AppSession;
 
 use super::session_state::{SessionState, stored_to_rules};
 use super::{App, Mode, PendingInput, PlanState};
-use crate::agent::QueuedMessage;
 
 /// The single content predicate: `App::save_session` persists a session
 /// iff this holds, and the shutdown path reuses it to tell which tabs were
@@ -32,11 +31,8 @@ impl App {
     }
 
     pub(crate) fn save_session(&mut self) {
-        self.state.sync_session(
-            &self.shared_history,
-            &self.shared_tool_outputs,
-            &self.permissions,
-        );
+        self.state
+            .sync_session(&self.shared_history, &self.permissions);
         self.sync_ephemeral_state();
         if !self.has_content() {
             return;
@@ -48,18 +44,24 @@ impl App {
         let draft = self.input_box.buffer.value();
         self.state.session.meta.input_draft = if draft.is_empty() { None } else { Some(draft) };
 
-        self.state.session.meta.queued_messages = self.queue.text_messages();
+        self.state.session.meta.queued_messages = if self.recoverable_queue.is_empty() {
+            self.queue.text_messages()
+        } else {
+            self.recoverable_queue.clone()
+        };
 
-        self.state.session.meta.subagents = self
-            .chats
-            .iter()
-            .skip(1)
-            .zip(self.chat_index.iter())
-            .map(|(chat, (tool_id, _))| StoredSubagent {
-                tool_use_id: tool_id.clone(),
-                name: chat.name.clone(),
-                prompt: None,
-                model: chat.model_id.clone(),
+        let mut subagents: Vec<_> = self.chat_index.iter().collect();
+        subagents.sort_by_key(|&(_, chat_index)| chat_index);
+        self.state.session.meta.subagents = subagents
+            .into_iter()
+            .map(|(tool_id, &chat_index)| {
+                let chat = &self.chats[chat_index];
+                StoredSubagent {
+                    tool_use_id: tool_id.clone(),
+                    name: chat.name.clone(),
+                    prompt: None,
+                    model: chat.model_id.clone(),
+                }
             })
             .collect();
     }
@@ -77,13 +79,18 @@ impl App {
 
     pub(super) fn reset_ui_chrome(&mut self) {
         self.chats.clear();
-        let mut main = Chat::new("Main".into(), self.ui_config.clone());
-        main.set_restore_channel(self.lua_event_handle.clone(), self.restore_event_tx.clone());
+        let mut main = Chat::new(
+            "Main".into(),
+            self.ui_config.clone(),
+            self.lua_event_handle.clone(),
+        );
+        main.set_restore_channel(self.restore_event_tx.clone());
         self.chats.push(main);
         self.active_chat = 0;
         self.chat_index.clear();
         self.status = super::Status::Idle;
         self.queue.clear();
+        self.recoverable_queue.clear();
         self.close_all_overlays();
         self.pending_input = PendingInput::None;
         self.status_bar.clear_flash();
@@ -103,19 +110,17 @@ impl App {
             &self.ui_config.tool_output_lines,
         );
         self.main_chat().load_messages(display_msgs);
-        self.main_chat().token_usage = self.state.token_usage;
-        self.main_chat().context_size = self.state.context_size;
+        // The restored total predates any per-turn cost, so price it once with the
+        // selected model. Later turns add their own exact cost.
+        let (usage, context_size) = (self.state.token_usage, self.state.context_size);
+        let cost = self.state.model.cost_of(&usage, self.state.fast);
+        let main = self.main_chat();
+        main.token_usage = usage;
+        main.cost = cost;
+        main.context_size = context_size;
         if let Some(draft) = self.state.session.meta.input_draft.take() {
             self.input_box.set_input(draft);
             self.input_box.buffer.move_to_end();
-        }
-
-        for text in std::mem::take(&mut self.state.session.meta.queued_messages) {
-            let msg = QueuedMessage {
-                text,
-                images: Vec::new(),
-            };
-            self.queue_and_notify(msg);
         }
 
         self.fire_restore_items(restore_items);
@@ -123,8 +128,12 @@ impl App {
         for sa in std::mem::take(&mut self.state.session.meta.subagents) {
             let idx = self.chats.len();
             self.chat_index.insert(sa.tool_use_id.clone(), idx);
-            let mut chat = Chat::new(sa.name, self.ui_config.clone());
-            chat.set_restore_channel(self.lua_event_handle.clone(), self.restore_event_tx.clone());
+            let mut chat = Chat::new(
+                sa.name,
+                self.ui_config.clone(),
+                self.lua_event_handle.clone(),
+            );
+            chat.set_restore_channel(self.restore_event_tx.clone());
             chat.model_id = sa.model;
             if let Some(messages) = self.state.session.subagent_messages.get(&sa.tool_use_id) {
                 let (display, items) = history_to_display(
@@ -139,18 +148,20 @@ impl App {
             self.chats.push(chat);
         }
 
-        if let Some(eh) = &self.lua_event_handle {
-            eh.send_restore_complete(restoring);
-        } else {
+        let eh = &self.lua_event_handle;
+        if eh.is_disconnected() {
             self.restoring
                 .store(false, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            eh.send_restore_complete(restoring);
         }
     }
 
     fn fire_restore_items(&self, items: Vec<maki_lua::RestoreItem>) {
-        let (Some(eh), Some(tx)) = (&self.lua_event_handle, &self.restore_event_tx) else {
+        let Some(tx) = &self.restore_event_tx else {
             return;
         };
+        let eh = &self.lua_event_handle;
         let theme_gen = crate::theme::generation();
         for mut item in items {
             item.theme_gen = Some(theme_gen);
@@ -158,10 +169,22 @@ impl App {
         }
     }
 
+    /// Resume at process start: the agent was already spawned with this
+    /// history, so no respawn follows and the restored queue must be
+    /// flushed here.
+    pub(crate) fn restore_resumed_session(&mut self) {
+        self.permissions
+            .load_session_rules(stored_to_rules(&self.state.session.meta.session_rules));
+        self.restore_display();
+        self.flush_restored_queue();
+        for w in self.state.warnings.drain(..) {
+            self.status_bar.flash(w);
+        }
+    }
+
     fn loaded_session_snapshot(&self) -> LoadedSession {
         LoadedSession {
             messages: self.state.session.messages.clone(),
-            tool_outputs: self.state.session.tool_outputs.clone(),
             model_spec: self.state.session.model.clone(),
         }
     }
@@ -191,8 +214,6 @@ impl App {
     }
 
     pub(super) fn rewind_to(&mut self, entry: RewindEntry) -> Vec<Action> {
-        self.run_id += 1;
-
         self.state.session.messages.truncate(entry.turn_index);
         self.state
             .session

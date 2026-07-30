@@ -13,9 +13,12 @@ use tracing::{debug, warn};
 use super::anthropic::shared;
 use super::openai::responses;
 use super::openai_compat;
-use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier};
+use crate::model::{Model, ModelEntry, ModelFamily, ModelInfo, ModelPricing, ModelTier};
 use crate::provider::{BoxFuture, Provider};
-use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig};
+use crate::{
+    AgentError, Effort, EffortDialect, Message, ProviderEvent, RequestOptions, StreamResponse,
+    ThinkingConfig, dialect,
+};
 
 pub mod auth;
 
@@ -256,9 +259,27 @@ impl Copilot {
         system: &str,
         tools: &Value,
         event_tx: &Sender<ProviderEvent>,
+        thinking: ThinkingConfig,
     ) -> Result<StreamResponse, AgentError> {
         let auth = self.auth().await?;
-        let body = responses::build_body(model, messages, system, tools);
+        let mut body = responses::build_body(model, messages, system, tools);
+        let reasoning_info = crate::model_registry::model_registry()
+            .read()
+            .unwrap()
+            .discovered("copilot", &model.id)
+            .and_then(|info| info.provider_info.clone())
+            .and_then(|info| Arc::downcast::<CopilotModelInfo>(info).ok())
+            .or_else(|| {
+                self.models
+                    .lock()
+                    .unwrap()
+                    .get(&model.id)
+                    .map(CopilotModel::reasoning_info)
+                    .map(Arc::new)
+            });
+        if let Some(info) = reasoning_info {
+            apply_responses_reasoning(&mut body, thinking, model, &effort_dialect(&info));
+        }
         let resolved = super::ResolvedAuth {
             base_url: Some(auth.endpoint.clone()),
             headers: copilot_headers(&auth, Some("conversation-agent")),
@@ -353,6 +374,8 @@ struct CopilotModel {
     #[serde(default)]
     model_picker_enabled: bool,
     #[serde(default)]
+    model_picker_category: Option<CopilotModelCategory>,
+    #[serde(default)]
     supported_endpoints: Vec<String>,
 }
 
@@ -364,6 +387,55 @@ impl CopilotModel {
                 .policy
                 .as_ref()
                 .is_none_or(|policy| policy.state == "enabled")
+    }
+
+    fn model_info(&self) -> ModelInfo {
+        let reasoning = self.reasoning_info();
+        ModelInfo {
+            id: self.id.clone(),
+            context_window: self.capabilities.limits.max_context_window_tokens,
+            max_output_tokens: self.capabilities.limits.max_output_tokens,
+            pricing: None,
+            supports_thinking: Some(self.supports_thinking()),
+            supports_vision: Some(self.capabilities.supports.vision),
+            tier: self
+                .model_picker_category
+                .and_then(CopilotModelCategory::tier),
+            provider_info: Some(Arc::new(reasoning)),
+        }
+    }
+
+    /// The chat completions body carries no reasoning field, so declaring
+    /// thinking there would offer the user a setting the request drops.
+    fn supports_thinking(&self) -> bool {
+        let supports = &self.capabilities.supports;
+        self.endpoint() != Endpoint::ChatCompletions
+            && (!supports.reasoning_effort.is_empty()
+                || supports.adaptive_thinking
+                || supports.max_thinking_budget.is_some()
+                || supports.min_thinking_budget.is_some())
+    }
+
+    fn reasoning_info(&self) -> CopilotModelInfo {
+        let mut reasoning_efforts = self
+            .capabilities
+            .supports
+            .reasoning_effort
+            .iter()
+            .filter_map(|effort| effort.parse().ok())
+            .collect::<Vec<_>>();
+        reasoning_efforts.sort_unstable();
+        reasoning_efforts.dedup();
+        CopilotModelInfo {
+            reasoning_off: self
+                .capabilities
+                .supports
+                .reasoning_effort
+                .iter()
+                .any(|effort| effort == dialect::OFF),
+            reasoning_efforts,
+            adaptive_thinking: self.capabilities.supports.adaptive_thinking,
+        }
     }
 
     fn endpoint(&self) -> Endpoint {
@@ -385,6 +457,27 @@ impl CopilotModel {
     }
 }
 
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum CopilotModelCategory {
+    Lightweight,
+    Versatile,
+    Powerful,
+    #[serde(other)]
+    Unknown,
+}
+
+impl CopilotModelCategory {
+    const fn tier(self) -> Option<ModelTier> {
+        match self {
+            Self::Lightweight => Some(ModelTier::Weak),
+            Self::Versatile => Some(ModelTier::Medium),
+            Self::Powerful => Some(ModelTier::Strong),
+            Self::Unknown => None,
+        }
+    }
+}
+
 #[derive(Clone, Default, Deserialize)]
 struct CopilotModelPolicy {
     #[serde(default)]
@@ -395,6 +488,35 @@ struct CopilotModelPolicy {
 struct CopilotModelCapabilities {
     #[serde(default, rename = "type")]
     model_type: String,
+    #[serde(default)]
+    limits: CopilotModelLimits,
+    #[serde(default)]
+    supports: CopilotModelSupports,
+}
+
+#[derive(Clone, Default, Deserialize)]
+struct CopilotModelLimits {
+    max_context_window_tokens: Option<u32>,
+    max_output_tokens: Option<u32>,
+}
+
+#[derive(Clone, Default, Deserialize)]
+struct CopilotModelSupports {
+    #[serde(default)]
+    reasoning_effort: Vec<String>,
+    #[serde(default)]
+    adaptive_thinking: bool,
+    max_thinking_budget: Option<u32>,
+    min_thinking_budget: Option<u32>,
+    #[serde(default)]
+    vision: bool,
+}
+
+#[derive(Debug)]
+struct CopilotModelInfo {
+    reasoning_efforts: Vec<Effort>,
+    reasoning_off: bool,
+    adaptive_thinking: bool,
 }
 
 #[derive(Deserialize)]
@@ -535,6 +657,29 @@ fn anthropic_messages(messages: &[Message]) -> Value {
     )
 }
 
+fn effort_dialect(info: &CopilotModelInfo) -> EffortDialect<'_> {
+    EffortDialect {
+        supported: if info.reasoning_efforts.is_empty() {
+            dialect::PREFER_HIGH.supported
+        } else {
+            &info.reasoning_efforts
+        },
+        adaptive: (!info.adaptive_thinking).then_some(Effort::High),
+        off: info.reasoning_off.then_some(dialect::OFF),
+    }
+}
+
+fn apply_responses_reasoning(
+    body: &mut Value,
+    thinking: ThinkingConfig,
+    model: &Model,
+    dialect: &EffortDialect,
+) {
+    if let Some(effort) = thinking.effort_str(dialect, model) {
+        body["reasoning"] = json!({"effort": effort});
+    }
+}
+
 fn guess_endpoint(model_id: &str) -> Endpoint {
     if model_id.starts_with("claude-") {
         Endpoint::Messages
@@ -567,7 +712,7 @@ impl Provider for Copilot {
                         .await
                 }
                 Endpoint::Responses => {
-                    self.stream_responses(model, messages, system, tools, event_tx)
+                    self.stream_responses(model, messages, system, tools, event_tx, opts.thinking)
                         .await
                 }
                 Endpoint::Messages => {
@@ -583,7 +728,7 @@ impl Provider for Copilot {
             let models = self.fetch_models().await?;
             let infos = models
                 .iter()
-                .map(|model| crate::model::ModelInfo::id_only(model.id.clone()))
+                .map(CopilotModel::model_info)
                 .collect::<Vec<_>>();
             let mut guard = self.models.lock().unwrap();
             guard.clear();
@@ -604,6 +749,7 @@ impl Provider for Copilot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use test_case::test_case;
 
     #[test]
     fn endpoint_prefers_messages_then_responses_then_chat() {
@@ -612,9 +758,11 @@ mod tests {
             policy: None,
             capabilities: CopilotModelCapabilities {
                 model_type: "chat".into(),
+                ..Default::default()
             },
             is_chat_default: false,
             model_picker_enabled: true,
+            model_picker_category: None,
             supported_endpoints: vec![CHAT_COMPLETIONS_PATH.into(), MESSAGES_PATH.into()],
         };
         assert_eq!(model.endpoint(), Endpoint::Messages);
@@ -627,6 +775,105 @@ mod tests {
     }
 
     #[test]
+    fn parses_discovered_capabilities_and_category() {
+        let model: CopilotModel = serde_json::from_value(json!({
+            "id": "gpt-5.6-sol",
+            "model_picker_enabled": true,
+            "model_picker_category": "powerful",
+            "supported_endpoints": ["/responses"],
+            "capabilities": {
+                "type": "chat",
+                "limits": {
+                    "max_context_window_tokens": 1_050_000,
+                    "max_output_tokens": 128_000
+                },
+                "supports": {
+                    "reasoning_effort": ["none", "low", "medium", "high"],
+                    "adaptive_thinking": true,
+                    "max_thinking_budget": 64_000,
+                    "min_thinking_budget": 1_024,
+                    "vision": true
+                }
+            }
+        }))
+        .unwrap();
+
+        let info = model.model_info();
+        assert_eq!(info.context_window, Some(1_050_000));
+        assert_eq!(info.max_output_tokens, Some(128_000));
+        assert_eq!(info.supports_thinking, Some(true));
+        assert_eq!(info.supports_vision, Some(true));
+        assert_eq!(info.tier, Some(ModelTier::Strong));
+        let provider_info = info
+            .provider_info
+            .unwrap()
+            .downcast::<CopilotModelInfo>()
+            .unwrap();
+        assert_eq!(
+            provider_info.reasoning_efforts,
+            vec![Effort::Low, Effort::Medium, Effort::High]
+        );
+        assert!(provider_info.reasoning_off);
+        assert!(provider_info.adaptive_thinking);
+    }
+
+    #[test]
+    fn unknown_category_keeps_model_without_tier() {
+        let model: CopilotModel = serde_json::from_value(json!({
+            "id": "gpt-6",
+            "model_picker_enabled": true,
+            "model_picker_category": "reasoning",
+            "capabilities": { "type": "chat" }
+        }))
+        .unwrap();
+
+        assert!(model.is_enabled_chat_model());
+        assert_eq!(model.model_info().tier, None);
+    }
+
+    #[test_case(RESPONSES_PATH, true; "responses honors reasoning")]
+    #[test_case(MESSAGES_PATH, true; "messages honors thinking")]
+    #[test_case(CHAT_COMPLETIONS_PATH, false; "chat completions drops reasoning")]
+    fn thinking_support_follows_endpoint(endpoint: &str, expected: bool) {
+        let model: CopilotModel = serde_json::from_value(json!({
+            "id": "reasoner",
+            "supported_endpoints": [endpoint],
+            "capabilities": {
+                "type": "chat",
+                "supports": {"reasoning_effort": ["low", "high"], "adaptive_thinking": true}
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(model.model_info().supports_thinking, Some(expected));
+    }
+
+    #[test]
+    fn responses_reasoning_uses_effort_object_and_explicit_none() {
+        let model = Model::from_spec("copilot/gpt-5.4").unwrap();
+        let info = CopilotModelInfo {
+            reasoning_efforts: vec![Effort::Low, Effort::Medium, Effort::High],
+            reasoning_off: true,
+            adaptive_thinking: false,
+        };
+        let dialect = effort_dialect(&info);
+
+        let mut body = json!({});
+        apply_responses_reasoning(&mut body, ThinkingConfig::Off, &model, &dialect);
+        assert_eq!(body, json!({"reasoning": {"effort": "none"}}));
+
+        let mut body = json!({});
+        apply_responses_reasoning(
+            &mut body,
+            ThinkingConfig::Effort(Effort::Medium),
+            &model,
+            &dialect,
+        );
+        assert_eq!(body, json!({"reasoning": {"effort": "medium"}}));
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
     fn filters_enabled_chat_models() {
         let enabled = CopilotModel {
             id: "gpt-5.4".into(),
@@ -635,9 +882,11 @@ mod tests {
             }),
             capabilities: CopilotModelCapabilities {
                 model_type: "chat".into(),
+                ..Default::default()
             },
             is_chat_default: false,
             model_picker_enabled: true,
+            model_picker_category: None,
             supported_endpoints: vec![],
         };
         assert!(enabled.is_enabled_chat_model());

@@ -421,7 +421,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             tier: ModelTier::Medium,
             family: ModelFamily::Claude,
             vision: true,
-            default: true,
+            default: false,
             pricing: ModelPricing {
                 input: 3.00,
                 output: 15.00,
@@ -430,6 +430,23 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                 fast: None,
             },
             max_output_tokens: 64000,
+            context_window: 200_000,
+        },
+        ModelEntry {
+            prefixes: &["claude-sonnet-5"],
+            tier: ModelTier::Medium,
+            family: ModelFamily::Claude,
+            vision: true,
+            default: true,
+            // Introductory rates until 2026-09-01, then 3.00 / 15.00 / 3.75 / 0.30.
+            pricing: ModelPricing {
+                input: 2.00,
+                output: 10.00,
+                cache_write: 2.50,
+                cache_read: 0.20,
+                fast: None,
+            },
+            max_output_tokens: 128000,
             context_window: 200_000,
         },
         ModelEntry {
@@ -475,10 +492,8 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                 output: 25.00,
                 cache_write: 6.25,
                 cache_read: 0.50,
-                fast: Some(FastPricing {
-                    input: 30.00,
-                    output: 150.00,
-                }),
+                // Fast mode withdrawn on 2026-06-29.
+                fast: None,
             },
             max_output_tokens: 128000,
             context_window: 200_000,
@@ -494,16 +509,33 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                 output: 25.00,
                 cache_write: 6.25,
                 cache_read: 0.50,
-                fast: Some(FastPricing {
-                    input: 30.00,
-                    output: 150.00,
-                }),
+                // Fast mode withdrawn on 2026-07-24.
+                fast: None,
             },
             max_output_tokens: 128000,
             context_window: 200_000,
         },
         ModelEntry {
             prefixes: &["claude-opus-4-8"],
+            tier: ModelTier::Strong,
+            family: ModelFamily::Claude,
+            vision: true,
+            default: false,
+            pricing: ModelPricing {
+                input: 5.00,
+                output: 25.00,
+                cache_write: 6.25,
+                cache_read: 0.50,
+                fast: Some(FastPricing {
+                    input: 10.00,
+                    output: 50.00,
+                }),
+            },
+            max_output_tokens: 128000,
+            context_window: 200_000,
+        },
+        ModelEntry {
+            prefixes: &["claude-opus-5"],
             tier: ModelTier::Strong,
             family: ModelFamily::Claude,
             vision: true,

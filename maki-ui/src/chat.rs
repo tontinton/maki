@@ -1,7 +1,7 @@
 //! Rebuilds display messages from stored sessions. Tool outputs get syntax
 //! highlighted, missing outputs fall back to plain text from `ToolResult`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -42,6 +42,7 @@ pub enum ChatEventResult {
 pub struct Chat {
     pub name: String,
     pub token_usage: TokenUsage,
+    pub cost: Option<f64>,
     pub context_size: u32,
     pub model_id: Option<String>,
     pending_turn_usage: Option<String>,
@@ -50,14 +51,15 @@ pub struct Chat {
 }
 
 impl Chat {
-    pub fn new(name: String, ui_config: UiConfig) -> Self {
+    pub fn new(name: String, ui_config: UiConfig, lua_event_handle: maki_lua::EventHandle) -> Self {
         Self {
             name,
             token_usage: TokenUsage::default(),
+            cost: None,
             context_size: 0,
             model_id: None,
             pending_turn_usage: None,
-            messages_panel: MessagesPanel::new(ui_config),
+            messages_panel: MessagesPanel::new(ui_config, lua_event_handle),
             finished: false,
         }
     }
@@ -66,13 +68,8 @@ impl Chat {
         self.pending_turn_usage = Some(usage);
     }
 
-    pub(crate) fn set_restore_channel(
-        &mut self,
-        event_handle: Option<maki_lua::EventHandle>,
-        event_tx: Option<maki_agent::EventSender>,
-    ) {
-        self.messages_panel
-            .set_restore_channel(event_handle, event_tx);
+    pub(crate) fn set_restore_channel(&mut self, event_tx: Option<maki_agent::EventSender>) {
+        self.messages_panel.set_restore_channel(event_tx);
     }
 
     pub fn handle_event(&mut self, event: AgentEvent, plan_path: Option<&Path>) -> ChatEventResult {
@@ -280,6 +277,11 @@ impl Chat {
         self.messages_panel.fail_in_progress_with_message(message);
     }
 
+    pub fn fail_in_progress_except(&mut self, message: String, excluded: &HashSet<String>) {
+        self.messages_panel
+            .fail_in_progress_except(message, excluded);
+    }
+
     pub fn push(&mut self, msg: DisplayMessage) {
         self.messages_panel.push(msg);
     }
@@ -304,6 +306,10 @@ impl Chat {
 
     pub fn update_tool_model(&mut self, tool_id: &str, model: &str) {
         self.messages_panel.update_tool_model(tool_id, model);
+    }
+
+    pub fn set_tool_turn_usage(&mut self, tool_id: &str, usage: String) {
+        self.messages_panel.set_tool_turn_usage(tool_id, usage);
     }
 
     pub fn load_messages(&mut self, msgs: Vec<DisplayMessage>) {
@@ -368,6 +374,11 @@ impl Chat {
     #[cfg(test)]
     pub fn streaming_thinking_is_empty(&self) -> bool {
         self.messages_panel.streaming_thinking_is_empty()
+    }
+
+    #[cfg(test)]
+    pub fn tool_turn_usage(&self, tool_id: &str) -> Option<&str> {
+        self.messages_panel.tool_turn_usage(tool_id)
     }
 }
 
@@ -630,7 +641,11 @@ mod tests {
 
     #[test]
     fn tool_lifecycle() {
-        let mut chat = Chat::new("Main".into(), UiConfig::default());
+        let mut chat = Chat::new(
+            "Main".into(),
+            UiConfig::default(),
+            maki_lua::EventHandle::disconnected_for_test(),
+        );
         chat.handle_event(tool_start("t1", "bash"), None);
         assert_eq!(chat.in_progress_count(), 1);
 
@@ -643,7 +658,11 @@ mod tests {
 
     #[test]
     fn plan_write_renders_file_content() {
-        let mut chat = Chat::new("Main".into(), UiConfig::default());
+        let mut chat = Chat::new(
+            "Main".into(),
+            UiConfig::default(),
+            maki_lua::EventHandle::disconnected_for_test(),
+        );
         let dir = tempfile::tempdir().unwrap();
         let plan_path = dir.path().join("plan.md");
         std::fs::write(&plan_path, "# My Plan\n\n- Step 1").unwrap();
@@ -663,7 +682,11 @@ mod tests {
 
     #[test]
     fn plan_write_ignores_different_path() {
-        let mut chat = Chat::new("Main".into(), UiConfig::default());
+        let mut chat = Chat::new(
+            "Main".into(),
+            UiConfig::default(),
+            maki_lua::EventHandle::disconnected_for_test(),
+        );
         let plan_path = Path::new("/plans/123.md");
         chat.handle_event(tool_start("w1", "write"), Some(plan_path));
         let (output, wp) = write_output("src/main.rs");
@@ -676,7 +699,11 @@ mod tests {
 
     #[test]
     fn plan_edit_shows_path_only() {
-        let mut chat = Chat::new("Main".into(), UiConfig::default());
+        let mut chat = Chat::new(
+            "Main".into(),
+            UiConfig::default(),
+            maki_lua::EventHandle::disconnected_for_test(),
+        );
         let dir = tempfile::tempdir().unwrap();
         let plan_path = dir.path().join("plan.md");
         std::fs::write(&plan_path, "# My Plan\n\n- Step 1").unwrap();
@@ -984,7 +1011,11 @@ mod tests {
 
     #[test]
     fn compaction_done_flushes_streaming_buffers() {
-        let mut chat = Chat::new("Main".into(), UiConfig::default());
+        let mut chat = Chat::new(
+            "Main".into(),
+            UiConfig::default(),
+            maki_lua::EventHandle::disconnected_for_test(),
+        );
 
         chat.handle_event(AgentEvent::AutoCompacting, None);
         assert_eq!(chat.message_count(), 1);

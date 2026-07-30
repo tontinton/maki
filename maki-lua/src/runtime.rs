@@ -1,8 +1,10 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::c_int;
+use std::future::Future;
 use std::panic::catch_unwind;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::ptr;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
@@ -19,7 +21,7 @@ use maki_agent::tools::{
     HeaderResult, PermissionScopes, RegistryError, Tool, ToolLive, ToolRegistry, ToolSource,
 };
 use maki_agent::{BufferSnapshot, SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle};
-use mlua::{Compiler, Function, Lua, RegistryKey, Value as LuaValue, ffi};
+use mlua::{Chunk, ChunkMode, Compiler, Function, Lua, RegistryKey, Table, Value as LuaValue, ffi};
 use serde_json::Value;
 
 use maki_config::RawConfig;
@@ -50,6 +52,7 @@ const DISPATCH_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const NIL_WITHOUT_FINISH_MSG: &str =
     "handler returned nil without calling ctx:finish() or starting jobs";
 pub(crate) const CANCELLED_MSG: &str = "cancelled";
+const HANDLER_TIMEOUT_MSG: &str = "timeout";
 const MAX_INFLIGHT_TOOLS: usize = 64;
 /// Finished tools kept clickable without a restore round-trip. Purely a
 /// cache: a click that misses it falls back to the restore item carried
@@ -58,6 +61,20 @@ const MAX_INFLIGHT_TOOLS: usize = 64;
 pub const WARM_TOOL_CAP: usize = 32;
 const GC_STEP_INTERVAL: usize = 4;
 const WATCHDOG_POLL_INTERVAL: Duration = Duration::from_millis(10);
+/// How long a doomed task may run without yielding before the watchdog
+/// shoots it. Cleanup after a cancel or a timeout (batch marking its
+/// children cancelled, rerendering its buf) is plain Lua running with the
+/// interrupt already armed, so killing at the first safepoint strands the
+/// UI mid-flight. Every yield hands back a fresh budget, so cleanup may
+/// take as long as it needs, while a loop that never yields dies within
+/// one grace.
+pub const KILL_GRACE: Duration = Duration::from_millis(500);
+/// Wall clock a cancelled handler gets before the host stops waiting for
+/// it. The watchdog alone never ends a task that parks in an await: it
+/// runs no Lua to interrupt and renews its grace at every yield. Long
+/// enough for cleanup that waits on children, short enough that the next
+/// prompt is not stuck behind abandoned work.
+const CANCEL_ABANDON_AFTER: Duration = Duration::from_secs(5);
 const OPT_LEVEL_JIT: u8 = 2;
 const OPT_LEVEL_DEBUGGABLE: u8 = 1;
 const DEBUG_INFO_FULL: u8 = 2;
@@ -95,6 +112,9 @@ pub(crate) type PromptHintCallbacks = BTreeMap<Arc<str>, Vec<PromptHintRegistrat
 /// Load/clear drain in-flight tools first so we never mutate a
 /// plugin environment while a tool call is still running.
 pub enum Request {
+    /// Plugins are loaded, so native codegen may start using idle time. Sent
+    /// last so it never interleaves with the loads themselves.
+    WarmJit,
     LoadSource {
         name: Arc<str>,
         source: String,
@@ -217,6 +237,19 @@ pub(crate) struct RestoreReply {
     pub header: Option<BufferSnapshot>,
 }
 
+/// The UI restores tool bodies from these events; a send can only fail when
+/// the receiver is gone, but that still loses the snapshot, so it gets a log.
+pub(crate) fn send_render_event(
+    event_tx: &maki_agent::EventSender,
+    tool_id: &str,
+    what: &str,
+    event: maki_agent::AgentEvent,
+) {
+    if event_tx.send(event).is_err() {
+        tracing::warn!(tool_id, what, "tool render event dropped: channel closed");
+    }
+}
+
 impl RestoreReply {
     pub(crate) fn emit(
         self,
@@ -225,18 +258,28 @@ impl RestoreReply {
         event_tx: &maki_agent::EventSender,
     ) {
         if let Some(snapshot) = self.body {
-            let _ = event_tx.send(maki_agent::AgentEvent::ToolSnapshot {
-                id: tool_use_id.to_owned(),
-                snapshot,
-                theme_gen,
-            });
+            send_render_event(
+                event_tx,
+                tool_use_id,
+                "body_snapshot",
+                maki_agent::AgentEvent::ToolSnapshot {
+                    id: tool_use_id.to_owned(),
+                    snapshot,
+                    theme_gen,
+                },
+            );
         }
         if let Some(snapshot) = self.header {
-            let _ = event_tx.send(maki_agent::AgentEvent::ToolHeaderSnapshot {
-                id: tool_use_id.to_owned(),
-                snapshot,
-                theme_gen,
-            });
+            send_render_event(
+                event_tx,
+                tool_use_id,
+                "header_snapshot",
+                maki_agent::AgentEvent::ToolHeaderSnapshot {
+                    id: tool_use_id.to_owned(),
+                    snapshot,
+                    theme_gen,
+                },
+            );
         }
     }
 }
@@ -247,10 +290,19 @@ pub struct LiveCtx {
     pub tool_use_id: String,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum KillReason {
+    Cancelled,
+    Deadline,
+}
+
 /// Lua is single-threaded so this Mutex never contends, but
 /// `Lua::app_data` requires `Send + Sync` with the `send` feature.
 pub(crate) struct TaskCell {
     pub(crate) cancel: CancelToken,
+    /// End of the current [`KILL_GRACE`], armed by the first watchdog poke
+    /// that sees a doomed task and cleared at every yield.
+    kill_at: Cell<Option<Instant>>,
     pub(crate) deadline: Cell<Option<Instant>>,
     pub(crate) deadline_secs: Cell<Option<u64>>,
     pub(crate) jobs: JobStore,
@@ -266,6 +318,10 @@ pub(crate) struct TaskCell {
     /// When `Some`, `maki.async.run` tasks queue here instead of the global
     /// `SpawnQueue` so restore can run them inline before snapshotting.
     pub(crate) inline_spawn: Option<Vec<PendingAsyncTask>>,
+    /// `maki.async.on_cancel` callbacks, fired once by [`ScopedFuture::poll`]
+    /// and dropped, so a handler parked in an await still gets to paint the
+    /// cancelled state before the host stops waiting for it.
+    cancel_hooks: Vec<RegistryKey>,
     /// Set by [`TaskScope::new`]; `enqueue_async_task` upgrades it so queued
     /// tasks share ownership of `bufs`. See [`BufsClaim`].
     bufs_claim: Weak<BufsClaim>,
@@ -279,6 +335,7 @@ impl TaskCell {
     ) -> Self {
         Self {
             cancel,
+            kill_at: Cell::new(None),
             deadline: Cell::new(deadline),
             deadline_secs: Cell::new(None),
             jobs: JobStore::new(),
@@ -287,7 +344,54 @@ impl TaskCell {
             root_buf: None,
             live_sink: None,
             inline_spawn: None,
+            cancel_hooks: Vec::new(),
             bufs_claim: Weak::new(),
+        }
+    }
+
+    /// Cancel outranks the deadline: once nobody waits for the reply,
+    /// reporting a timeout would only mislead.
+    fn doomed(&self, now: Instant) -> Option<KillReason> {
+        if self.cancel.is_cancelled() {
+            Some(KillReason::Cancelled)
+        } else if self.deadline.get().is_some_and(|d| now > d) {
+            Some(KillReason::Deadline)
+        } else {
+            None
+        }
+    }
+
+    /// [`Self::doomed`] gated by [`KILL_GRACE`]: the task is only shot
+    /// once it has burned a whole grace inside one execution slice.
+    fn kill_due(&self, now: Instant) -> Option<KillReason> {
+        let Some(reason) = self.doomed(now) else {
+            self.renew_kill_grace();
+            return None;
+        };
+        match self.kill_at.get() {
+            Some(kill_at) if now <= kill_at => None,
+            // No stamp yet, or the grace just ran out. Either way a slice
+            // starts now: a raise is usually caught (a `pcall`, or a
+            // `gather` child dying inside its parent's slice) and what
+            // runs next is the cleanup the grace exists for.
+            stamp => {
+                self.kill_at.set(Some(now + KILL_GRACE));
+                stamp.is_some().then_some(reason)
+            }
+        }
+    }
+
+    /// The task yielded, so its grace starts over: a task parked in an await
+    /// would otherwise burn the whole budget before it gets to clean up.
+    fn renew_kill_grace(&self) {
+        self.kill_at.set(None);
+    }
+
+    /// Hooks of a task that ended without a cancel never fire, so this is
+    /// the only thing that unpins their closures and captures.
+    fn clear_cancel_hooks(&mut self, lua: &Lua) {
+        for key in self.cancel_hooks.drain(..) {
+            lua.remove_registry_value(key).ok();
         }
     }
 }
@@ -310,6 +414,37 @@ pub(crate) fn lock_cell(handle: &TaskHandle) -> std::sync::MutexGuard<'_, TaskCe
     handle.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Backs `maki.async.on_cancel`. An already cancelled task has no
+/// transition left for [`ScopedFuture::poll`] to ride, so it fires inline,
+/// and only after registering, so a raising hook is contained either way
+/// instead of blowing up whoever armed it.
+pub(crate) fn register_cancel_hook(lua: &Lua, callback: Function) -> Result<(), mlua::Error> {
+    let handle = active_task(lua);
+    let key = lua.create_registry_value(callback)?;
+    let cancelled = {
+        let mut cell = lock_cell(&handle);
+        cell.cancel_hooks.push(key);
+        cell.cancel.is_cancelled()
+    };
+    if cancelled {
+        fire_cancel_hooks(lua, &handle);
+    }
+    Ok(())
+}
+
+fn fire_cancel_hooks(lua: &Lua, handle: &TaskHandle) {
+    let hooks = std::mem::take(&mut lock_cell(handle).cancel_hooks);
+    for key in hooks {
+        if let Err(e) = lua
+            .registry_value::<Function>(&key)
+            .and_then(|f| f.call::<()>(()))
+        {
+            tracing::warn!(error = %strip_traceback(&e), "cancel hook failed");
+        }
+        lua.remove_registry_value(key).ok();
+    }
+}
+
 /// The buf whose click handler owns this task's clicks: the explicit root
 /// (live_buf / reply body / restore body), else the first created buf.
 fn resolve_root_buf(handle: &TaskHandle) -> Option<Arc<SharedBuf>> {
@@ -320,19 +455,174 @@ fn resolve_root_buf(handle: &TaskHandle) -> Option<Arc<SharedBuf>> {
 }
 
 /// Sole place the `--no-jit` flag touches VM state. Called once at VM
-/// creation, before any chunk (init.lua included) is compiled. Jit off
-/// drops to the O1 interpreter with full debug info: that combination
-/// keeps the most usable backtraces.
-fn apply_jit(lua: &Lua, enabled: bool) {
-    lua.enable_jit(enabled);
-    let compiler = if enabled {
+/// creation, before any chunk (init.lua included) is compiled, and hands back
+/// the compiler so bundled modules compile the same way. Jit off drops to the
+/// O1 interpreter with full debug info, the combination that keeps the most
+/// usable backtraces.
+///
+/// Native codegen stays off at load time either way: mlua runs it inline from
+/// `Lua::load`, and doing that for every plugin was the single largest cost of
+/// startup. Loaded chunks go to a [`CodegenQueue`] instead.
+fn install_compiler(lua: &Lua, jit: bool) -> Compiler {
+    lua.enable_jit(false);
+    let compiler = if jit {
         Compiler::new().set_optimization_level(OPT_LEVEL_JIT)
     } else {
         Compiler::new()
             .set_optimization_level(OPT_LEVEL_DEBUGGABLE)
             .set_debug_level(DEBUG_INFO_FULL)
     };
-    lua.set_compiler(compiler);
+    lua.set_compiler(compiler.clone());
+    compiler
+}
+
+/// Many plugins require the same bundled module, and each one needs a separate
+/// instance because the module closes over the plugin's `maki`. Only the
+/// instantiation has to repeat, so the source is compiled to bytecode once per
+/// VM rather than once per plugin.
+#[derive(Clone)]
+struct BundledModules {
+    dirs: &'static [&'static Dir<'static>],
+    compiler: Compiler,
+    bytecode: Arc<Mutex<HashMap<String, Arc<Vec<u8>>>>>,
+}
+
+impl BundledModules {
+    fn bytecode(&self, rel_path: &str) -> Result<Option<Arc<Vec<u8>>>, mlua::Error> {
+        let mut cache = self.bytecode.lock().expect("bytecode cache");
+        if let Some(cached) = cache.get(rel_path) {
+            return Ok(Some(Arc::clone(cached)));
+        }
+        let Some(source) = self
+            .dirs
+            .iter()
+            .find_map(|dir| dir.get_file(rel_path).and_then(|f| f.contents_utf8()))
+        else {
+            return Ok(None);
+        };
+        let compiled = Arc::new(self.compiler.compile(source)?);
+        cache.insert(rel_path.to_owned(), Arc::clone(&compiled));
+        Ok(Some(compiled))
+    }
+}
+
+/// Chunks awaiting native codegen, `None` when jit is off. Compiling a chunk's
+/// main function also compiles every function nested in it, and the native code
+/// lives on the shared proto, so closures already handed to the tool registry
+/// get faster too.
+type CodegenQueue = Option<Arc<Mutex<Vec<Function>>>>;
+
+fn queue_codegen(queue: &CodegenQueue, func: &Function) {
+    if let Some(queue) = queue {
+        queue.lock().expect("codegen queue").push(func.clone());
+    }
+}
+
+struct ModuleLoader {
+    bundled: BundledModules,
+    lua_dir: Option<PathBuf>,
+    env: Table,
+    codegen: CodegenQueue,
+    loaded: Table,
+    loading: Table,
+}
+
+impl ModuleLoader {
+    /// Bundled modules are tried first, so a plugin cannot shadow
+    /// `maki.truncate` and friends with a file of its own.
+    fn plugin_source(&self, rel_path: &str, modname: &str) -> Result<Option<String>, mlua::Error> {
+        let Some(dir) = self.lua_dir.as_ref() else {
+            return Ok(None);
+        };
+        let normalized = dir
+            .join(rel_path)
+            .components()
+            .fold(PathBuf::new(), |mut acc, c| {
+                match c {
+                    std::path::Component::ParentDir => {
+                        acc.pop();
+                    }
+                    std::path::Component::CurDir => {}
+                    _ => acc.push(c),
+                }
+                acc
+            });
+        if !normalized.starts_with(dir) {
+            return Err(mlua::Error::runtime(format!(
+                "require: '{modname}' outside sandbox"
+            )));
+        }
+        Ok(std::fs::read_to_string(&normalized).ok())
+    }
+
+    fn bind(&self, chunk: Chunk<'_>, modname: &str) -> Result<Function, mlua::Error> {
+        chunk
+            .set_name(modname)
+            .set_environment(self.env.clone())
+            .into_function()
+    }
+
+    /// Bundled modules load as bytecode from the shared cache. Plugin files
+    /// load as source, so Luau reports syntax errors against the file the user
+    /// wrote.
+    fn load(&self, lua: &Lua, modname: &str) -> Result<LuaValue, mlua::Error> {
+        let rel_path = modname.replace('.', "/") + ".lua";
+        let func = match self.bundled.bytecode(&rel_path)? {
+            Some(bytecode) => self.bind(
+                lua.load(bytecode.as_slice()).set_mode(ChunkMode::Binary),
+                modname,
+            )?,
+            None => {
+                let Some(source) = self.plugin_source(&rel_path, modname)? else {
+                    return Err(mlua::Error::runtime(format!(
+                        "require '{modname}': module not found"
+                    )));
+                };
+                self.bind(lua.load(source.as_str()), modname)?
+            }
+        };
+        queue_codegen(&self.codegen, &func);
+        func.call(())
+    }
+
+    fn require(&self, lua: &Lua, modname: &str) -> Result<LuaValue, mlua::Error> {
+        if modname.is_empty() {
+            return Err(mlua::Error::runtime(
+                "require: module name must be non-empty",
+            ));
+        }
+
+        if let Ok(cached) = self.loaded.get::<LuaValue>(modname)
+            && cached != LuaValue::Nil
+        {
+            return Ok(cached);
+        }
+
+        if self.loading.get::<bool>(modname).unwrap_or(false) {
+            return Ok(LuaValue::Boolean(true));
+        }
+
+        if let Some(module) = docs_render::virtual_module(lua, modname) {
+            let module = module?;
+            self.loaded.set(modname, module.clone())?;
+            return Ok(LuaValue::Table(module));
+        }
+
+        // Cleared on every path, so a failed require never leaves the module
+        // wedged as "in progress".
+        self.loading.set(modname, true)?;
+        let result = self.load(lua, modname);
+        self.loading.set(modname, LuaValue::Nil)?;
+        let result = result?;
+
+        let stored = if result == LuaValue::Nil {
+            LuaValue::Boolean(true)
+        } else {
+            result.clone()
+        };
+        self.loaded.set(modname, stored)?;
+        Ok(result)
+    }
 }
 
 type InterruptFn = unsafe extern "C-unwind" fn(*mut ffi::lua_State, c_int);
@@ -435,14 +725,10 @@ fn interrupt_reason(state: *mut ffi::lua_State) -> Option<&'static str> {
         return Some(INTERRUPT_SHUTDOWN_MSG);
     }
     let handle = lua.app_data_ref::<TaskHandle>()?;
-    let cell = lock_cell(&handle);
-    if cell.cancel.is_cancelled() {
-        Some(INTERRUPT_CANCELLED_MSG)
-    } else if cell.deadline.get().is_some_and(|d| Instant::now() > d) {
-        Some(INTERRUPT_DEADLINE_MSG)
-    } else {
-        None
-    }
+    Some(match lock_cell(&handle).kill_due(Instant::now())? {
+        KillReason::Cancelled => INTERRUPT_CANCELLED_MSG,
+        KillReason::Deadline => INTERRUPT_DEADLINE_MSG,
+    })
 }
 
 /// Scopes a `TaskCell` into `Lua::app_data` for one task, restoring
@@ -488,11 +774,7 @@ impl TaskScope {
     }
 
     pub(crate) fn scope_future<F>(&self, inner: F) -> ScopedFuture<F> {
-        ScopedFuture {
-            lua: self.lua.clone(),
-            handle: Arc::clone(&self.handle),
-            inner,
-        }
+        ScopedFuture::new(self.lua.clone(), Arc::clone(&self.handle), inner)
     }
 }
 
@@ -504,7 +786,7 @@ impl TaskScope {
 /// job output, like Neovim firing callbacks from its idle event loop.
 ///
 /// [detached]: TaskScope::detached
-pub(crate) async fn run_detached<F: std::future::Future>(lua: &Lua, fut: F) -> F::Output {
+pub(crate) async fn run_detached<F: Future>(lua: &Lua, fut: F) -> F::Output {
     let scope = TaskScope::detached(lua);
     let handle = Arc::clone(scope.handle());
     let pump = async {
@@ -530,6 +812,7 @@ impl Drop for TaskScope {
             let mut cell = lock_cell(&self.handle);
             cell.jobs.kill_all();
             cell.jobs.clear(&self.lua);
+            cell.clear_cancel_hooks(&self.lua);
         }
         match self.prev.take() {
             Some(p) => {
@@ -547,22 +830,47 @@ impl Drop for TaskScope {
 pub(crate) struct ScopedFuture<F> {
     lua: Lua,
     handle: TaskHandle,
+    /// Waker registration on the task's token, dropped once the hooks have
+    /// fired. Without it nothing would poll us while the handler sits parked
+    /// in an await, and the hooks would wait on a child event that may
+    /// never come.
+    cancel_wait: Option<Pin<Box<dyn Future<Output = ()>>>>,
     inner: F,
 }
 
-impl<F: std::future::Future> std::future::Future for ScopedFuture<F> {
+impl<F> ScopedFuture<F> {
+    fn new(lua: Lua, handle: TaskHandle, inner: F) -> Self {
+        let cancel = lock_cell(&handle).cancel.clone();
+        Self {
+            lua,
+            handle,
+            cancel_wait: Some(Box::pin(async move { cancel.cancelled().await })),
+            inner,
+        }
+    }
+}
+
+impl<F: Future> Future for ScopedFuture<F> {
     type Output = F::Output;
     fn poll(
-        self: std::pin::Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
         // SAFETY: `inner` is structurally pinned; `lua`/`handle` are
         // never moved out.
         let this = unsafe { self.get_unchecked_mut() };
+        // A poll means the task yielded, the cooperation the grace rewards.
+        lock_cell(&this.handle).renew_kill_grace();
         let prev = this
             .lua
             .set_app_data::<TaskHandle>(Arc::clone(&this.handle));
-        let result = unsafe { std::pin::Pin::new_unchecked(&mut this.inner) }.poll(cx);
+        if let Some(wait) = this.cancel_wait.as_mut()
+            && wait.as_mut().poll(cx).is_ready()
+        {
+            this.cancel_wait = None;
+            fire_cancel_hooks(&this.lua, &this.handle);
+        }
+        let result = unsafe { Pin::new_unchecked(&mut this.inner) }.poll(cx);
         match prev {
             Some(p) => {
                 this.lua.set_app_data(p);
@@ -587,6 +895,21 @@ pub(crate) fn with_task_jobs<R>(lua: &Lua, f: impl FnOnce(&mut JobStore) -> R) -
 
 pub(crate) fn with_task_bufs<R>(lua: &Lua, f: impl FnOnce(&mut BufferStore) -> R) -> R {
     f(&mut lock_cell(&active_task(lua)).bufs)
+}
+
+/// A working wake lands in microseconds, so this is only about failing in
+/// seconds instead of parking until nextest gives up on the suite.
+#[cfg(test)]
+const TEST_WAKE_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const TEST_WAKE_TIMEOUT_MSG: &str = "timed out waiting for a cancelled task to wake";
+
+#[cfg(test)]
+pub(crate) fn block_on_or_fail<T>(fut: impl Future<Output = T>) -> T {
+    smol::block_on(futures_lite::future::or(fut, async {
+        smol::Timer::after(TEST_WAKE_TIMEOUT).await;
+        panic!("{TEST_WAKE_TIMEOUT_MSG}");
+    }))
 }
 
 #[cfg(test)]
@@ -801,23 +1124,45 @@ impl SpawnQueue {
     }
 }
 
+/// Ends `fut` once nobody waits for its reply any more: at `deadline`, or
+/// [`CANCEL_ABANDON_AFTER`] past a cancel. The watchdog cannot do this on
+/// its own, because a task parked in an await runs no Lua to interrupt and
+/// renews its grace at every yield. `or`, not `race`: a handler that
+/// finished in the same slice deserves to have its result reported.
+async fn until_abandoned(
+    fut: impl Future<Output = Result<LuaValue, mlua::Error>>,
+    deadline: Option<Instant>,
+    cancel: &CancelToken,
+) -> Result<LuaValue, mlua::Error> {
+    let timed_out = async {
+        match deadline {
+            Some(dl) => smol::Timer::at(dl).await,
+            None => std::future::pending().await,
+        };
+        HANDLER_TIMEOUT_MSG
+    };
+    let cancelled = async {
+        cancel.cancelled().await;
+        smol::Timer::after(CANCEL_ABANDON_AFTER).await;
+        CANCELLED_MSG
+    };
+    futures_lite::future::or(fut, async {
+        Err(mlua::Error::runtime(
+            futures_lite::future::or(timed_out, cancelled).await,
+        ))
+    })
+    .await
+}
+
 async fn run_work_fn(
     lua: &Lua,
     work_fn: &RegistryKey,
     deadline: Option<Instant>,
+    cancel: &CancelToken,
 ) -> Result<LuaValue, mlua::Error> {
     let func: Function = lua.registry_value(work_fn)?;
     let fut = lua.create_thread(func)?.into_async::<LuaValue>(())?;
-    match deadline {
-        Some(dl) => {
-            futures_lite::future::race(fut, async {
-                smol::Timer::at(dl).await;
-                Err(mlua::Error::runtime("timeout"))
-            })
-            .await
-        }
-        None => fut.await,
-    }
+    until_abandoned(fut, deadline, cancel).await
 }
 
 fn spawn_async_task(
@@ -827,6 +1172,10 @@ fn spawn_async_task(
     task: PendingAsyncTask,
 ) {
     if task.cancel.is_cancelled() {
+        tracing::debug!(
+            tool_id = task.live_ctx.as_ref().map(|l| l.tool_use_id.as_str()),
+            "async.run: cancelled before spawn"
+        );
         lua.remove_registry_value(task.work_fn).ok();
         return;
     }
@@ -842,10 +1191,16 @@ fn spawn_async_task(
             TaskCell::new(task.cancel.clone(), task.deadline, task.live_ctx.clone()),
         );
         let result = scope
-            .scope_future(run_work_fn(&lua, &task.work_fn, task.deadline))
+            .scope_future(run_work_fn(
+                &lua,
+                &task.work_fn,
+                task.deadline,
+                &task.cancel,
+            ))
             .await;
         if let Err(e) = &result {
-            tracing::debug!(error = %e, "async.run: task failed");
+            let tool_id = task.live_ctx.as_ref().map(|l| l.tool_use_id.as_str());
+            tracing::debug!(error = %e, tool_id, "async.run: task failed");
         }
 
         if let Some(ref live) = task.live_ctx
@@ -854,11 +1209,16 @@ fn spawn_async_task(
             // Always `read`, not `read_if_dirty`: the dirty flag is
             // consume-once and the UI polls each frame, so the flag
             // races. Re-emitting identical content is harmless.
-            let _ = live.event_tx.send(maki_agent::AgentEvent::ToolSnapshot {
-                id: live.tool_use_id.clone(),
-                snapshot: maki_agent::BufferSnapshot::from_arc(buf.read()),
-                theme_gen: None,
-            });
+            send_render_event(
+                &live.event_tx,
+                &live.tool_use_id,
+                "async_snapshot",
+                maki_agent::AgentEvent::ToolSnapshot {
+                    id: live.tool_use_id.clone(),
+                    snapshot: maki_agent::BufferSnapshot::from_arc(buf.read()),
+                    theme_gen: None,
+                },
+            );
         }
 
         drop(scope);
@@ -912,7 +1272,8 @@ struct LuaRuntime {
     registry: Arc<ToolRegistry>,
     tx: flume::Sender<Request>,
     shutdown: Arc<AtomicBool>,
-    bundled_dirs: &'static [&'static Dir<'static>],
+    bundled: BundledModules,
+    codegen_queue: CodegenQueue,
     ui_action_tx: Option<flume::Sender<UiAction>>,
 }
 
@@ -930,7 +1291,7 @@ impl LuaRuntime {
         jit: bool,
     ) -> Result<Self, PluginError> {
         let lua = Lua::new();
-        apply_jit(&lua, jit);
+        let compiler = install_compiler(&lua, jit);
         lua.set_memory_limit(LUA_MEMORY_LIMIT)
             .map_err(|e| PluginError::Lua {
                 plugin: "<init>".to_owned(),
@@ -999,9 +1360,33 @@ impl LuaRuntime {
             registry,
             tx,
             shutdown,
-            bundled_dirs,
+            bundled: BundledModules {
+                dirs: bundled_dirs,
+                compiler,
+                bytecode: Arc::default(),
+            },
+            codegen_queue: jit.then(Arc::default),
             ui_action_tx,
         })
+    }
+
+    /// Returns false when there is nothing left to compile, so the caller can
+    /// stop polling.
+    fn codegen_step(&self) -> bool {
+        let Some(queue) = self.codegen_queue.as_ref() else {
+            return false;
+        };
+        let Some(func) = queue.lock().expect("codegen queue").pop() else {
+            return false;
+        };
+        let compiled = unsafe {
+            self.lua
+                .exec_raw::<()>(func, |state| ffi::luau_codegen_compile(state, -1))
+        };
+        if let Err(e) = compiled {
+            tracing::debug!(error = %e, "native codegen failed");
+        }
+        true
     }
 
     fn drop_plugin_keys(&mut self, name: &str) {
@@ -1203,7 +1588,7 @@ impl LuaRuntime {
         let env = self.lua.create_table()?;
         env.set("maki", maki)?;
 
-        if require_root.is_some() || !self.bundled_dirs.is_empty() {
+        if require_root.is_some() || !self.bundled.dirs.is_empty() {
             let require_fn = self.create_require_fn(&env, require_root)?;
             env.set("require", require_fn)?;
         }
@@ -1221,101 +1606,17 @@ impl LuaRuntime {
         env: &mlua::Table,
         require_root: Option<PathBuf>,
     ) -> Result<Function, mlua::Error> {
-        let lua_dir = require_root.map(|r| r.canonicalize().unwrap_or(r));
-        let loaded = self.lua.create_table()?;
-        let loading = self.lua.create_table()?;
-        let env_clone = env.clone();
-        let bundled_dirs = self.bundled_dirs;
+        let loader = ModuleLoader {
+            bundled: self.bundled.clone(),
+            lua_dir: require_root.map(|r| r.canonicalize().unwrap_or(r)),
+            env: env.clone(),
+            codegen: self.codegen_queue.clone(),
+            loaded: self.lua.create_table()?,
+            loading: self.lua.create_table()?,
+        };
 
-        self.lua.create_function(move |lua, modname: String| {
-            if modname.is_empty() {
-                return Err(mlua::Error::runtime(
-                    "require: module name must be non-empty",
-                ));
-            }
-
-            if let Ok(cached) = loaded.get::<LuaValue>(modname.as_str())
-                && cached != LuaValue::Nil
-            {
-                return Ok(cached);
-            }
-
-            if loading.get::<bool>(modname.as_str()).unwrap_or(false) {
-                return Ok(LuaValue::Boolean(true));
-            }
-
-            if let Some(module) = docs_render::virtual_module(lua, &modname) {
-                let module = module?;
-                loaded.set(modname.as_str(), module.clone())?;
-                return Ok(LuaValue::Table(module));
-            }
-
-            loading.set(modname.as_str(), true)?;
-
-            let rel_path = modname.replace('.', "/") + ".lua";
-
-            let source_str: Result<Option<String>, mlua::Error> = (|| {
-                for dir in bundled_dirs {
-                    if let Some(file) = dir.get_file(&rel_path)
-                        && let Some(contents) = file.contents_utf8()
-                    {
-                        return Ok(Some(contents.to_owned()));
-                    }
-                }
-                let Some(dir) = lua_dir.as_ref() else {
-                    return Ok(None);
-                };
-                let abs_path = dir.join(&rel_path);
-                let normalized = abs_path.components().fold(PathBuf::new(), |mut acc, c| {
-                    match c {
-                        std::path::Component::ParentDir => {
-                            acc.pop();
-                        }
-                        std::path::Component::CurDir => {}
-                        _ => acc.push(c),
-                    }
-                    acc
-                });
-                if !normalized.starts_with(dir) {
-                    return Err(mlua::Error::runtime(format!(
-                        "require: '{modname}' outside sandbox"
-                    )));
-                }
-                Ok(std::fs::read_to_string(&normalized).ok())
-            })();
-
-            let source_str = source_str?;
-
-            let Some(source) = source_str else {
-                let _ = loading.set(modname.as_str(), LuaValue::Nil);
-                return Err(mlua::Error::runtime(format!(
-                    "require '{modname}': module not found"
-                )));
-            };
-
-            let result: LuaValue = match lua
-                .load(&source)
-                .set_name(&modname)
-                .set_environment(env_clone.clone())
-                .eval()
-            {
-                Ok(v) => v,
-                Err(e) => {
-                    let _ = loading.set(modname.as_str(), LuaValue::Nil);
-                    return Err(e);
-                }
-            };
-
-            loading.set(modname.as_str(), LuaValue::Nil)?;
-            let stored = if result == LuaValue::Nil {
-                LuaValue::Boolean(true)
-            } else {
-                result.clone()
-            };
-            loaded.set(modname.as_str(), stored)?;
-
-            Ok(result)
-        })
+        self.lua
+            .create_function(move |lua, modname: String| loader.require(lua, &modname))
     }
 
     /// `plugins.<name>` options only reach a plugin through
@@ -1379,13 +1680,19 @@ impl LuaRuntime {
 
         self.drop_plugin_keys(&name);
 
-        let exec_result = self
+        let main_fn = self
             .lua
             .load(source)
             .set_name(name.as_ref())
             .set_environment(env)
-            .exec_async()
-            .await;
+            .into_function();
+        let exec_result = match main_fn {
+            Ok(func) => {
+                queue_codegen(&self.codegen_queue, &func);
+                func.call_async::<()>(()).await
+            }
+            Err(e) => Err(e),
+        };
 
         let exec_result = exec_result.and_then(|()| self.check_opts_consumed(&name, &opts));
         if let Err(e) = exec_result {
@@ -1711,7 +2018,7 @@ async fn run_inline_tasks(lua: &Lua, scope: &TaskScope) {
             if !task.cancel.is_cancelled() {
                 let deadline = Some(Instant::now() + RESTORE_ASYNC_DEADLINE);
                 if let Err(e) = scope
-                    .scope_future(run_work_fn(lua, &task.work_fn, deadline))
+                    .scope_future(run_work_fn(lua, &task.work_fn, deadline, &task.cancel))
                     .await
                 {
                     tracing::debug!(error = %e, "restore inline async task failed");
@@ -1792,12 +2099,7 @@ async fn dispatch_async(
     tool: &str,
     finish_rx: flume::Receiver<ToolCallReply>,
 ) -> ToolCallReply {
-    let (cancel, has_jobs) = {
-        let cell = lock_cell(&handle);
-        (cell.cancel.clone(), !cell.jobs.is_empty())
-    };
-
-    if !has_jobs {
+    if lock_cell(&handle).jobs.is_empty() {
         lua.gc_collect().ok();
         smol::Timer::after(DISPATCH_POLL_INTERVAL).await;
         return match finish_rx.try_recv() {
@@ -1806,20 +2108,17 @@ async fn dispatch_async(
         };
     }
 
-    let timed_out = || {
-        lock_cell(&handle)
-            .deadline
-            .get()
-            .is_some_and(|d| Instant::now() > d)
-    };
     let mut event_buf = Vec::new();
 
     loop {
-        if cancel.is_cancelled() {
-            return ToolCallReply::err(CANCELLED_MSG);
-        }
-        if timed_out() {
-            return timeout_reply(&handle, plugin, tool);
+        // No grace here: the handler already returned, so there is no Lua
+        // frame left to unwind. Bound before the match so the guard drops
+        // before `timeout_reply`, which locks the same cell.
+        let kill = lock_cell(&handle).doomed(Instant::now());
+        match kill {
+            Some(KillReason::Cancelled) => return ToolCallReply::err(CANCELLED_MSG),
+            Some(KillReason::Deadline) => return timeout_reply(&handle, plugin, tool),
+            None => {}
         }
 
         match finish_rx.try_recv() {
@@ -1997,7 +2296,7 @@ async fn run_tool_call(
         Err(e) => return ToolCallReply::err(strip_traceback(&e)),
     };
     let live_id = live.as_ref().map(|l| l.tool_use_id.clone());
-    let mut cell = TaskCell::new(cancel, deadline, live);
+    let mut cell = TaskCell::new(cancel.clone(), deadline, live);
     cell.live_sink = live_sink;
     let scope = TaskScope::new(&lua, cell);
     let handle = Arc::clone(scope.handle());
@@ -2013,20 +2312,7 @@ async fn run_tool_call(
     }
 
     let call_future = scope.scope_future(async {
-        let handler_result = {
-            let deadline = lock_cell(&handle).deadline.get();
-            match deadline {
-                Some(dl) => {
-                    futures_lite::future::race(async_thread, async {
-                        smol::Timer::at(dl).await;
-                        Err(mlua::Error::runtime("timeout"))
-                    })
-                    .await
-                }
-                None => async_thread.await,
-            }
-        };
-        match handler_result {
+        match until_abandoned(async_thread, deadline, &cancel).await {
             Ok(LuaValue::Nil) => {
                 let (live, sink) = {
                     let cell = lock_cell(&handle);
@@ -2147,10 +2433,24 @@ pub fn spawn(
                 .rx
                 .clone();
 
+            let mut codegen_armed = false;
+
             smol::block_on(ex.run(async {
                 loop {
                     while let Ok(task) = spawn_rx.try_recv() {
                         spawn_async_task(&rt.lua, &ex, &gate, task);
+                    }
+                    // Nothing to serve, so spend the lull on native codegen.
+                    // One chunk per pass with a yield in between, so no request
+                    // or spawned task ever waits for more than a single chunk.
+                    if codegen_armed
+                        && prio_rx.is_empty()
+                        && rx.is_empty()
+                        && spawn_rx.is_empty()
+                        && rt.codegen_step()
+                    {
+                        smol::future::yield_now().await;
+                        continue;
                     }
                     // Biased: user-initiated requests (commands, keybinds) jump
                     // ahead of bulk work like session restores so the UI stays
@@ -2178,6 +2478,7 @@ pub fn spawn(
                     };
                     match msg {
                         Request::Shutdown => break,
+                        Request::WarmJit => codegen_armed = true,
                         Request::LoadSource {
                             name,
                             source,
@@ -2244,8 +2545,14 @@ pub fn spawn(
                                 let lua = rt.lua.clone();
                                 ex.spawn(async move {
                                     let run = async {
+                                        let opts = lua.create_table()?;
+                                        opts.set(
+                                            "fargs",
+                                            lua.create_sequence_from(args.split_whitespace())?,
+                                        )?;
+                                        opts.set("args", args)?;
                                         let thread = lua.create_thread(func)?;
-                                        thread.into_async::<()>(args)?.await
+                                        thread.into_async::<()>(opts)?.await
                                     };
                                     if let Err(e) = run_detached(&lua, run).await {
                                         tracing::warn!(plugin = %plugin, command = %command, error = %e, "command handler failed");
@@ -2341,11 +2648,8 @@ pub fn spawn(
                             };
                             ex.spawn(async move {
                                 let _gate_guard = g.acquire().await;
-                                let call = ScopedFuture {
-                                    lua: lua.clone(),
-                                    handle,
-                                    inner: func.call_async::<()>(arg),
-                                };
+                                let call =
+                                    ScopedFuture::new(lua.clone(), handle, func.call_async::<()>(arg));
                                 if let Err(e) = call.await {
                                     tracing::warn!(tool_use_id, error = %e, "live click failed");
                                 }
@@ -2447,6 +2751,11 @@ pub fn spawn(
 mod tests {
     use super::*;
     use crate::api::tool::ToolCallReply;
+    use futures_lite::future::poll_once;
+    use maki_agent::cancel::CancelTrigger;
+    use std::future::poll_fn;
+    use std::task::Poll;
+    use test_case::test_case;
 
     fn make_buf_handle(text: &str) -> BufHandle {
         let buf = Arc::new(maki_agent::SharedBuf::new());
@@ -2826,20 +3135,26 @@ mod tests {
         (lua, watchdog)
     }
 
-    /// Generous vs the ~10ms expected kill; only a broken watchdog gets here.
+    /// Generous vs the expected kill (one poll plus [`KILL_GRACE`]); only a
+    /// broken watchdog gets here.
     const WATCHDOG_TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
-    /// `while true do end` only stops if the watchdog kills it, so run it
-    /// on a helper thread: a broken watchdog fails the test fast under any
-    /// harness (not just nextest's terminate-after) instead of hanging it.
-    /// The leaked thread then spins until the test process exits.
-    fn hot_loop_expecting_kill(lua: &Lua) -> mlua::Error {
+    const JIT_DEADLINE: Duration = Duration::from_millis(20);
+
+    /// `while true do end` only stops if the watchdog kills it, so run it on
+    /// a helper thread with a bounded wait: a broken watchdog then fails the
+    /// test with a reason instead of hanging the harness. The clock starts
+    /// before the loop can, so the reported time is a lower bound.
+    fn hot_loop_expecting_kill(lua: &Lua) -> (mlua::Error, Duration) {
         let f = lua.load("while true do end").into_function().unwrap();
         let (tx, rx) = flume::bounded(1);
+        let start = Instant::now();
         thread::spawn(move || drop(tx.send(f.call::<bool>(()))));
-        rx.recv_timeout(WATCHDOG_TEST_TIMEOUT)
+        let err = rx
+            .recv_timeout(WATCHDOG_TEST_TIMEOUT)
             .expect("watchdog never killed the hot loop")
-            .unwrap_err()
+            .unwrap_err();
+        (err, start.elapsed())
     }
 
     /// Runs long enough (50ms) to guarantee several watchdog pokes.
@@ -2849,18 +3164,542 @@ mod tests {
             .unwrap()
     }
 
-    fn cancelled_handle() -> TaskHandle {
+    fn cancelled_token() -> CancelToken {
         let (trigger, token) = CancelToken::new();
         trigger.cancel();
-        Arc::new(Mutex::new(TaskCell::new(token, None, None)))
+        token
     }
 
+    fn cancelled_handle() -> TaskHandle {
+        Arc::new(Mutex::new(TaskCell::new(cancelled_token(), None, None)))
+    }
+
+    /// Killing at the first armed safepoint is what froze batch's children
+    /// as in-progress after esc; never killing at all would leave a core
+    /// spinning, which [`WATCHDOG_TEST_TIMEOUT`] catches.
     #[test]
-    fn stale_cancelled_handle_aborts_callback_without_fresh_scope() {
+    fn stale_cancelled_handle_aborts_callback_after_the_grace() {
         let (lua, _watchdog) = watchdog_lua(false);
         lua.set_app_data::<TaskHandle>(cancelled_handle());
-        let err = hot_loop_expecting_kill(&lua);
+
+        let (err, elapsed) = hot_loop_expecting_kill(&lua);
+
         assert!(err.to_string().contains(INTERRUPT_CANCELLED_MSG));
+        assert!(elapsed >= KILL_GRACE, "kill skipped the cleanup grace");
+    }
+
+    /// A healthy poke must leave nothing armed, or the first poke after esc
+    /// kills instantly instead of granting the grace.
+    #[test]
+    fn kill_grace_is_armed_once_then_renewed_per_execution_slice() {
+        let (trigger, token) = CancelToken::new();
+        let cell = TaskCell::new(token, None, None);
+        let start = Instant::now();
+        assert_eq!(cell.kill_due(start), None);
+        assert!(cell.kill_at.get().is_none(), "healthy poke must not arm");
+
+        trigger.cancel();
+        assert_eq!(cell.kill_due(start), None, "first doomed poke only arms");
+        assert_eq!(
+            cell.kill_due(start + KILL_GRACE),
+            None,
+            "cleanup must get a full grace counted from the cancel"
+        );
+        assert_eq!(
+            cell.kill_due(start + KILL_GRACE * 2),
+            Some(KillReason::Cancelled)
+        );
+        assert_eq!(
+            cell.kill_due(start + KILL_GRACE * 2),
+            None,
+            "a raise must refill the grace for whoever catches it"
+        );
+
+        cell.renew_kill_grace();
+        assert_eq!(
+            cell.kill_due(start + KILL_GRACE * 2),
+            None,
+            "yielding must hand the task a fresh budget"
+        );
+    }
+
+    /// A doom that lifts (a handler extending its own deadline) must take
+    /// its stamp with it, or the next cancel kills with no grace at all.
+    #[test]
+    fn a_lifted_doom_disarms_the_grace() {
+        let start = Instant::now();
+        let cell = TaskCell::new(CancelToken::none(), Some(start), None);
+        assert_eq!(
+            cell.kill_due(start + KILL_GRACE),
+            None,
+            "first doomed poke only arms"
+        );
+
+        cell.deadline.set(Some(start + KILL_GRACE * 4));
+
+        assert_eq!(cell.kill_due(start + KILL_GRACE * 2), None);
+        assert!(cell.kill_at.get().is_none(), "healthy poke must disarm");
+    }
+
+    /// The watchdog never reaches a handler parked in an await, so this
+    /// race is what ends it - but not before its cleanup window, and never
+    /// ahead of a result the handler already produced.
+    #[test]
+    fn until_abandoned_ends_a_parked_handler_only_after_its_window() {
+        let parked = || std::future::pending::<Result<LuaValue, mlua::Error>>();
+        smol::block_on(async {
+            let early = futures_lite::future::poll_once(until_abandoned(
+                parked(),
+                None,
+                &cancelled_token(),
+            ))
+            .await;
+            assert!(
+                early.is_none(),
+                "a cancel must not abandon the handler before its window"
+            );
+
+            let err = until_abandoned(parked(), Some(Instant::now()), &CancelToken::none())
+                .await
+                .expect_err("a lapsed deadline must end a parked handler");
+            assert!(err.to_string().contains(HANDLER_TIMEOUT_MSG));
+
+            until_abandoned(
+                std::future::ready(Ok(LuaValue::Boolean(true))),
+                Some(Instant::now()),
+                &cancelled_token(),
+            )
+            .await
+            .expect("a finished handler outranks a doom in the same slice");
+        });
+    }
+
+    /// [`ScopedFuture`] is the one place that observes a task yielding, so
+    /// it is what renews the grace.
+    #[test]
+    fn scoped_future_poll_renews_kill_grace() {
+        let lua = Lua::new();
+        let scope = TaskScope::new(&lua, TaskCell::new(cancelled_token(), None, None));
+        let handle = Arc::clone(scope.handle());
+        lock_cell(&handle).kill_due(Instant::now());
+        assert!(lock_cell(&handle).kill_at.get().is_some());
+
+        smol::block_on(scope.scope_future(std::future::ready(())));
+
+        assert!(lock_cell(&handle).kill_at.get().is_none());
+    }
+
+    const HOOK_MARKS: [&str; 3] = ["first", "second", "third"];
+    const HOOK_GOOD_MARK: &str = "good";
+    const HOOK_NESTED_MARK: &str = "nested";
+    const HOOK_RAISES: &str = "error('hook blew up')";
+    const HOOK_YIELDS: &str = "coroutine.yield()";
+    const HOOK_POLL_ROUNDS: usize = 3;
+    const HOOK_INNER_OUTPUT: u8 = 7;
+    const HOOK_NEVER_FIRED: &str = "cancel hook never fired";
+    const HOOK_SKIPPED_MSG: &str = "a hook registered after the bad one never fired";
+
+    fn recording_hook(lua: &Lua, tx: &flume::Sender<&'static str>, mark: &'static str) {
+        let tx = tx.clone();
+        let hook = lua
+            .create_function(move |_, ()| {
+                tx.send(mark).ok();
+                Ok(())
+            })
+            .unwrap();
+        register_cancel_hook(lua, hook).unwrap();
+    }
+
+    fn live_scope(lua: &Lua) -> (CancelTrigger, TaskScope) {
+        let (trigger, token) = CancelToken::new();
+        (
+            trigger,
+            TaskScope::new(lua, TaskCell::new(token, None, None)),
+        )
+    }
+
+    /// The token is already tripped, so the cancel branch is ready on the
+    /// first poll and no waker round trip is needed.
+    fn poll_cancelled_scope_once(scope: &TaskScope) {
+        let mut fut = scope.scope_future(std::future::pending::<()>());
+        assert!(smol::block_on(poll_once(&mut fut)).is_none());
+    }
+
+    /// A hook armed after the token tripped has no transition left to ride, so
+    /// it fires inline, whether a plugin or another hook armed it. The nested
+    /// case also pins the lock discipline: `fire_cancel_hooks` must not hold
+    /// the cell across a hook.
+    #[test]
+    fn cancel_hook_registered_after_the_cancel_fires_inline() {
+        let lua = Lua::new();
+        let scope = TaskScope::new(&lua, TaskCell::new(cancelled_token(), None, None));
+        let (tx, fired_rx) = flume::unbounded();
+        let outer = lua
+            .create_function(move |lua, ()| {
+                tx.send(HOOK_GOOD_MARK).ok();
+                let tx = tx.clone();
+                let nested = lua.create_function(move |_, ()| {
+                    tx.send(HOOK_NESTED_MARK).ok();
+                    Ok(())
+                })?;
+                register_cancel_hook(lua, nested)
+            })
+            .unwrap();
+
+        register_cancel_hook(&lua, outer).unwrap();
+
+        assert_eq!(
+            fired_rx.try_iter().collect::<Vec<_>>(),
+            [HOOK_GOOD_MARK, HOOK_NESTED_MARK],
+            "{HOOK_NEVER_FIRED}"
+        );
+        assert!(
+            lock_cell(scope.handle()).cancel_hooks.is_empty(),
+            "a hook that already fired must not be kept for the next poll"
+        );
+    }
+
+    /// Hooks are cleanup steps stacked as the handler nests deeper, so every
+    /// one runs, in registration order. A hook that raises, or yields from
+    /// outside its coroutine, is one plugin's bug and must not cost the later
+    /// plugins their cleanup.
+    #[test_case(HOOK_RAISES ; "raising")]
+    #[test_case(HOOK_YIELDS ; "yielding")]
+    fn cancel_hooks_all_fire_in_order_despite_a_bad_one(bad_body: &str) {
+        let lua = Lua::new();
+        let (trigger, scope) = live_scope(&lua);
+        let bad = lua.load(bad_body).into_function().unwrap();
+        register_cancel_hook(&lua, bad).unwrap();
+        let (fired_tx, fired_rx) = flume::unbounded();
+        for mark in HOOK_MARKS {
+            recording_hook(&lua, &fired_tx, mark);
+        }
+        trigger.cancel();
+
+        poll_cancelled_scope_once(&scope);
+
+        assert_eq!(
+            fired_rx.try_iter().collect::<Vec<_>>(),
+            HOOK_MARKS,
+            "{HOOK_SKIPPED_MSG}"
+        );
+    }
+
+    /// `scope_future` nests, a handler's scope wrapping the `gather` that
+    /// parks it, so several levels see the token go ready in one poll and
+    /// every later poll sees it ready again. Cleanup that runs twice repaints
+    /// over what the abandon path already put on screen.
+    #[test]
+    fn cancel_hook_fires_once_across_nested_scopes_and_repeated_polls() {
+        let lua = Lua::new();
+        let (trigger, scope) = live_scope(&lua);
+        let (fired_tx, fired_rx) = flume::unbounded();
+        recording_hook(&lua, &fired_tx, HOOK_GOOD_MARK);
+        trigger.cancel();
+
+        let mut nested = scope.scope_future(scope.scope_future(std::future::pending::<()>()));
+        for _ in 0..HOOK_POLL_ROUNDS {
+            assert!(smol::block_on(poll_once(&mut nested)).is_none());
+        }
+
+        assert_eq!(fired_rx.try_iter().count(), 1);
+    }
+
+    /// The `RegistryKey` is the last reference to a hook, so holding it pins
+    /// the closure and its captures for the VM's whole life. Both endings must
+    /// let go: fired, or dropped with a task that was never cancelled, which
+    /// mlua only reclaims on some later registry op.
+    #[test_case(true ; "after firing")]
+    #[test_case(false ; "when an uncancelled scope ends")]
+    fn cancel_hook_registry_value_is_released(cancel: bool) {
+        let lua = Lua::new();
+        let captured = Arc::new(());
+        let held = Arc::clone(&captured);
+        let (trigger, scope) = live_scope(&lua);
+        let hook = lua
+            .create_function(move |_, ()| {
+                let _ = &held;
+                Ok(())
+            })
+            .unwrap();
+        register_cancel_hook(&lua, hook).unwrap();
+
+        if cancel {
+            trigger.cancel();
+            poll_cancelled_scope_once(&scope);
+        } else {
+            drop(scope);
+        }
+        lua.gc_collect().unwrap();
+        lua.gc_collect().unwrap();
+
+        assert_eq!(Arc::strong_count(&captured), 1);
+    }
+
+    /// With a sibling's handle in app_data the hook would repaint the
+    /// sibling's bufs. The sibling has to get app_data back once the poll is
+    /// over, and its own hooks must not ride someone else's cancel.
+    #[test]
+    fn cancel_hook_runs_under_its_own_task_handle() {
+        let lua = Lua::new();
+        let (trigger, scope) = live_scope(&lua);
+        let (seen_tx, seen_rx) = flume::bounded(1);
+        let hook = lua
+            .create_function(move |lua, ()| {
+                seen_tx.send(active_task(lua)).ok();
+                Ok(())
+            })
+            .unwrap();
+        register_cancel_hook(&lua, hook).unwrap();
+        let (_sibling_trigger, sibling) = live_scope(&lua);
+        let (sibling_tx, sibling_rx) = flume::bounded(1);
+        recording_hook(&lua, &sibling_tx, HOOK_GOOD_MARK);
+        trigger.cancel();
+
+        poll_cancelled_scope_once(&scope);
+
+        let seen = seen_rx.try_recv().expect(HOOK_NEVER_FIRED);
+        assert!(Arc::ptr_eq(&seen, scope.handle()));
+        assert!(Arc::ptr_eq(&active_task(&lua), sibling.handle()));
+        assert!(
+            sibling_rx.try_recv().is_err(),
+            "an uncancelled task's hook must not fire with a sibling's cancel"
+        );
+    }
+
+    /// The whole point of the hook: a handler parked in an await runs no Lua
+    /// of its own, so only the token's waker can get its cleanup on screen
+    /// before the abandon window. The cancel branch and the inner future share
+    /// that one waker, so if firing swallowed the poll, a handler finishing
+    /// right after the cancel would hang instead of returning its output.
+    #[test]
+    fn cancel_hook_fires_on_a_parked_task_and_leaves_it_wakeable() {
+        let lua = Lua::new();
+        let (trigger, scope) = live_scope(&lua);
+        let (fired_tx, fired_rx) = flume::bounded(1);
+        recording_hook(&lua, &fired_tx, HOOK_GOOD_MARK);
+        let (item_tx, item_rx) = flume::bounded(1);
+
+        let out = block_on_or_fail(futures_lite::future::or(
+            scope.scope_future(async move { item_rx.recv_async().await.unwrap() }),
+            async move {
+                trigger.cancel();
+                assert_eq!(fired_rx.recv_async().await.ok(), Some(HOOK_GOOD_MARK));
+                item_tx.send(HOOK_INNER_OUTPUT).unwrap();
+                std::future::pending().await
+            },
+        ));
+
+        assert_eq!(out, HOOK_INNER_OUTPUT);
+        assert!(
+            lock_cell(scope.handle()).cancel_hooks.is_empty(),
+            "a fired hook must not be kept for a second cancel"
+        );
+    }
+
+    /// Order is the whole guarantee: a handler whose last await resolves on
+    /// the very poll the cancel lands returns straight away, and the scope
+    /// dropping behind it clears its hooks unfired. Firing after the inner
+    /// poll would skip the cleanup silently, with nothing on screen.
+    #[test]
+    fn cancel_hooks_fire_before_an_inner_future_that_is_ready_at_once() {
+        let lua = Lua::new();
+        let (trigger, scope) = live_scope(&lua);
+        let inner_ran = Arc::new(AtomicBool::new(false));
+        let seen_by_hook = Arc::clone(&inner_ran);
+        let (fired_tx, fired_rx) = flume::bounded(1);
+        let hook = lua
+            .create_function(move |_, ()| {
+                fired_tx.send(seen_by_hook.load(Ordering::SeqCst)).ok();
+                Ok(())
+            })
+            .unwrap();
+        register_cancel_hook(&lua, hook).unwrap();
+        trigger.cancel();
+
+        let out = smol::block_on(scope.scope_future(poll_fn(move |_| {
+            inner_ran.store(true, Ordering::SeqCst);
+            Poll::Ready(HOOK_INNER_OUTPUT)
+        })));
+
+        assert_eq!(
+            out, HOOK_INNER_OUTPUT,
+            "the scope must still yield the handler's result"
+        );
+        assert!(
+            !fired_rx.try_recv().expect(HOOK_NEVER_FIRED),
+            "the hook must run before the inner future gets its poll"
+        );
+    }
+
+    /// The fire takes the whole list first, so a hook that arms another one
+    /// re-enters `fire_cancel_hooks` from inside itself. That must terminate
+    /// and leave nothing unfired; where the new hook lands among the queued
+    /// ones is not a promise anyone can lean on.
+    #[test]
+    fn cancel_hook_registered_mid_fire_still_fires_every_hook_once() {
+        let lua = Lua::new();
+        let (trigger, scope) = live_scope(&lua);
+        let (fired_tx, fired_rx) = flume::unbounded();
+        let tx = fired_tx.clone();
+        let arming = lua
+            .create_function(move |lua, ()| {
+                tx.send(HOOK_MARKS[0]).ok();
+                recording_hook(lua, &tx, HOOK_NESTED_MARK);
+                Ok(())
+            })
+            .unwrap();
+        register_cancel_hook(&lua, arming).unwrap();
+        for mark in HOOK_MARKS.into_iter().skip(1) {
+            recording_hook(&lua, &fired_tx, mark);
+        }
+        trigger.cancel();
+
+        poll_cancelled_scope_once(&scope);
+
+        let mut fired = fired_rx.try_iter().collect::<Vec<_>>();
+        fired.sort_unstable();
+        let mut expected = HOOK_MARKS.to_vec();
+        expected.push(HOOK_NESTED_MARK);
+        expected.sort_unstable();
+        assert_eq!(fired, expected, "{HOOK_SKIPPED_MSG}");
+        assert!(
+            lock_cell(scope.handle()).cancel_hooks.is_empty(),
+            "a re-entrant fire must not leave a hook behind"
+        );
+    }
+
+    const HOOK_PARENT_MARK: &str = "parent";
+    const HOOK_CHILD_MARK: &str = "child";
+    const HOOK_CHILD_WORK: &str = "arm(); park()";
+    const HOOK_ARM_FN: &str = "arm";
+    const HOOK_PARK_FN: &str = "park";
+
+    /// A `maki.async.run` task gets its own cell but inherits the parent's
+    /// token, so a hook armed inside it fires on the parent's cancel even
+    /// though nothing else polls that task. Only its own hooks: parent and
+    /// siblings share that token, and reading the wrong cell would clean up
+    /// bufs it never owned.
+    #[test]
+    fn cancel_hook_in_a_spawned_task_fires_on_the_inherited_cancel() {
+        let lua = Lua::new();
+        let (trigger, parent) = live_scope(&lua);
+        let (fired_tx, fired_rx) = flume::unbounded();
+        recording_hook(&lua, &fired_tx, HOOK_PARENT_MARK);
+
+        let (armed_tx, armed_rx) = flume::bounded(1);
+        let tx = fired_tx.clone();
+        let arm = lua
+            .create_function(move |lua, ()| {
+                recording_hook(lua, &tx, HOOK_CHILD_MARK);
+                armed_tx.send(()).ok();
+                Ok(())
+            })
+            .unwrap();
+        let park = lua
+            .create_async_function(|_, ()| std::future::pending::<Result<(), mlua::Error>>())
+            .unwrap();
+        lua.globals().set(HOOK_ARM_FN, arm).unwrap();
+        lua.globals().set(HOOK_PARK_FN, park).unwrap();
+        let work_fn = lua
+            .create_registry_value(lua.load(HOOK_CHILD_WORK).into_function().unwrap())
+            .unwrap();
+        let task = PendingAsyncTask {
+            work_fn,
+            cancel: lock_cell(parent.handle()).cancel.clone(),
+            deadline: None,
+            live_ctx: None,
+            owner: None,
+        };
+
+        let ex = Rc::new(smol::LocalExecutor::new());
+        block_on_or_fail(ex.run(async {
+            spawn_async_task(&lua, &ex, &Rc::new(gate()), task);
+            armed_rx.recv_async().await.unwrap();
+            trigger.cancel();
+            assert_eq!(fired_rx.recv_async().await.ok(), Some(HOOK_CHILD_MARK));
+        }));
+
+        assert!(
+            fired_rx.is_empty(),
+            "the parent's hook must not ride the child's fire"
+        );
+
+        poll_cancelled_scope_once(&parent);
+
+        assert_eq!(
+            fired_rx.try_iter().collect::<Vec<_>>(),
+            [HOOK_PARENT_MARK],
+            "the parent must fire its own hook, once, and not the child's"
+        );
+    }
+
+    const DISPATCH_TEST_JOB: &str = "sleep 1";
+    const DISPATCH_TEST_PLUGIN: &str = "shell";
+    const DISPATCH_TEST_TOOL: &str = "run";
+    const DISPATCH_TEST_DEADLINE_SECS: u64 = 7;
+
+    /// Drives the job-polling loop of [`dispatch_async`] to its reply. The
+    /// cell needs a live job or the loop is never entered. Helper thread
+    /// again: `timeout_reply` locks the very cell the loop inspects, so a
+    /// regression there deadlocks and must fail rather than hang the suite.
+    fn drive_dispatch(cell: TaskCell) -> (Result<String, String>, Duration) {
+        let (tx, rx) = flume::bounded(1);
+        thread::spawn(move || {
+            let lua = Lua::new();
+            let scope = TaskScope::new(&lua, cell);
+            lock_cell(scope.handle())
+                .jobs
+                .start(DISPATCH_TEST_JOB, None, None, None, None, None)
+                .unwrap();
+            let (_finish_tx, finish_rx) = flume::bounded(1);
+
+            let start = Instant::now();
+            let reply = smol::block_on(dispatch_async(
+                &lua,
+                Arc::clone(scope.handle()),
+                DISPATCH_TEST_PLUGIN,
+                DISPATCH_TEST_TOOL,
+                finish_rx,
+            ));
+            drop(tx.send((reply.result, start.elapsed())));
+        });
+        rx.recv_timeout(WATCHDOG_TEST_TIMEOUT)
+            .expect("dispatch_async never replied: the cell lock is likely held across the reply")
+    }
+
+    /// A timed-out async tool must report the timeout the bash plugin's
+    /// `restore` parses, and must not wedge the whole Lua thread on the
+    /// non-reentrant cell mutex while doing it.
+    #[test]
+    fn dispatch_async_replies_with_timeout_without_deadlocking() {
+        let cell = TaskCell::new(CancelToken::none(), Some(Instant::now()), None);
+        cell.deadline_secs.set(Some(DISPATCH_TEST_DEADLINE_SECS));
+
+        let (result, _) = drive_dispatch(cell);
+
+        assert_eq!(
+            result,
+            Err(format!(
+                "tool {DISPATCH_TEST_PLUGIN}.{DISPATCH_TEST_TOOL} timed out after {DISPATCH_TEST_DEADLINE_SECS}s"
+            ))
+        );
+    }
+
+    /// Esc on an async tool whose deadline also lapsed must say "cancelled",
+    /// not "timed out after 0s", and must reply at once: the handler already
+    /// returned, so there is nothing left to clean up.
+    #[test]
+    fn dispatch_async_cancel_outranks_deadline_with_no_grace() {
+        let cell = TaskCell::new(cancelled_token(), Some(Instant::now()), None);
+
+        let (result, elapsed) = drive_dispatch(cell);
+
+        assert_eq!(result, Err(CANCELLED_MSG.to_owned()));
+        assert!(
+            elapsed < KILL_GRACE,
+            "dispatch loop must not wait out a grace"
+        );
     }
 
     #[test]
@@ -2880,23 +3719,47 @@ mod tests {
         let (lua, _watchdog) = watchdog_lua(true);
 
         let scope = TaskScope::detached(&lua);
-        let err = hot_loop_expecting_kill(&lua);
+        let (err, _) = hot_loop_expecting_kill(&lua);
         drop(scope);
 
         assert!(err.to_string().contains(INTERRUPT_SHUTDOWN_MSG));
     }
 
+    /// Shutdown is checked before the task cell, so a reload or a quit
+    /// never queues behind the cleanup grace of every cancelled runaway.
     #[test]
-    fn jit_busy_loop_killed_at_deadline() {
-        let (lua, _watchdog) = watchdog_lua(false);
-        apply_jit(&lua, true);
+    fn shutdown_outranks_the_cleanup_grace() {
+        let (lua, _watchdog) = watchdog_lua(true);
+        lua.set_app_data::<TaskHandle>(cancelled_handle());
 
-        let deadline = Instant::now() + Duration::from_millis(20);
+        let (err, elapsed) = hot_loop_expecting_kill(&lua);
+
+        assert!(err.to_string().contains(INTERRUPT_SHUTDOWN_MSG));
+        assert!(
+            elapsed < KILL_GRACE,
+            "shutdown waited out the cleanup grace"
+        );
+    }
+
+    /// JIT-compiled code must still hit the interrupt, and the timeout
+    /// path gets the same cleanup grace as the cancel path: a timed-out
+    /// handler also has children to settle and a buf to rerender.
+    #[test]
+    fn jit_busy_loop_killed_a_grace_after_the_deadline() {
+        let (lua, _watchdog) = watchdog_lua(false);
+        install_compiler(&lua, true);
+
+        let deadline = Instant::now() + JIT_DEADLINE;
         let cell = TaskCell::new(CancelToken::none(), Some(deadline), None);
         lua.set_app_data::<TaskHandle>(Arc::new(Mutex::new(cell)));
 
-        let err = hot_loop_expecting_kill(&lua);
+        let (err, elapsed) = hot_loop_expecting_kill(&lua);
+
         assert!(err.to_string().contains(INTERRUPT_DEADLINE_MSG));
+        assert!(
+            elapsed >= JIT_DEADLINE + KILL_GRACE,
+            "kill skipped the cleanup grace"
+        );
     }
 
     #[test]

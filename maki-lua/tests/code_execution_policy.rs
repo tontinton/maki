@@ -347,7 +347,7 @@ fn handler_error_keeps_script_and_drops_waiting_notice() {
 
 fn restore_lines_with(code: &str, output: &str, is_error: bool, clicks: Vec<usize>) -> Vec<String> {
     let (_reg, host) = setup();
-    let eh = host.event_handle().expect("event handle");
+    let eh = host.event_handle();
     let (tx, rx) = flume::unbounded::<maki_agent::Envelope>();
     eh.request_restore(
         maki_lua::RestoreItem {

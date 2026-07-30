@@ -216,6 +216,17 @@ function ToolView:set_highlight(content, ext)
   return true
 end
 
+-- Content rows on screen, for callers with their own per-row click targets. A
+-- single hidden line is drawn as itself instead of a notice, so it counts as
+-- content too. Rows line up with `all_lines` under keep = "head"; keep = "tail"
+-- prints its notice first and shifts them.
+function ToolView:visible_count()
+  if self.expanded then
+    return #self.all_lines
+  end
+  return self.ring_count + (self.skipped == 1 and 1 or 0)
+end
+
 function ToolView:toggle()
   self.expanded = not self.expanded
   self:flush()
@@ -294,6 +305,19 @@ end
 -- wired. For `restore` hooks.
 function ToolView.restore(output, opts)
   return ToolView.restore_lines(maki.split(output, "\n"), opts)
+end
+
+-- Same, for tools whose live output goes through markdown (`format =
+-- "markdown"`); {opts.width} is the wrap width. Errors stay plain, as they do
+-- live.
+function ToolView.restore_markdown(output, is_error, opts)
+  if not is_error then
+    local ok, md_lines = pcall(maki.ui.markdown, output, opts.width)
+    if ok then
+      return ToolView.restore_lines(md_lines, opts)
+    end
+  end
+  return ToolView.restore(output, opts)
 end
 
 return ToolView

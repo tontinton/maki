@@ -13,7 +13,7 @@ use maki_agent::{
     McpSnapshotReader, ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent,
 };
 use maki_config::{PermissionsConfig, UiConfig};
-use maki_lua::{HintReader, KeymapReader, LuaCommandReader};
+use maki_lua::{HintReader, KeymapReader, LuaCommandInfo, LuaCommandReader};
 use maki_providers::{ContentBlock, Effort, Role, TokenUsage};
 use maki_storage::sessions::{StoredMode, StoredThinking};
 use ratatui::layout::Rect;
@@ -24,12 +24,21 @@ use tempfile::TempDir;
 use test_case::test_case;
 
 const WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+const TASK_ID: &str = "task1";
 
 fn set_zone(app: &mut App, zone: SelectionZone, area: Rect) {
     app.zones.push(SelectableZone { area, zone });
 }
 
 fn build_app(dir: StateDir, writer: Arc<StorageWriter>) -> App {
+    build_app_with_lua(dir, writer, LuaCommandReader::empty())
+}
+
+fn build_app_with_lua(
+    dir: StateDir,
+    writer: Arc<StorageWriter>,
+    lua_commands: LuaCommandReader,
+) -> App {
     let model = test_model();
     App::new(
         &model,
@@ -38,7 +47,7 @@ fn build_app(dir: StateDir, writer: Arc<StorageWriter>) -> App {
         Arc::new(ArcSwapOption::empty()),
         McpSnapshotReader::empty(),
         McpConfigErrors::new(PathBuf::new()),
-        LuaCommandReader::empty(),
+        lua_commands,
         KeymapReader::empty(),
         HintReader::empty(),
         writer,
@@ -52,10 +61,11 @@ fn build_app(dir: StateDir, writer: Arc<StorageWriter>) -> App {
             PathBuf::from("/tmp"),
         )),
         Arc::from([]),
+        maki_lua::EventHandle::disconnected_for_test(),
     )
 }
 
-fn test_app() -> App {
+pub(crate) fn test_app() -> App {
     let dir = StateDir::from_path(env::temp_dir());
     let mut app = build_app(dir.clone(), Arc::new(StorageWriter::new(dir)));
     let (shared_queue, _rx) = shared_queue::queue();
@@ -150,6 +160,35 @@ fn subagent_msg_with_model(event: AgentEvent, parent_id: &str, name: &str, model
         subagent: Some(info),
         run_id: 1,
     }))
+}
+
+fn tool_start(id: &str, tool: &str) -> AgentEvent {
+    AgentEvent::ToolStart(Box::new(ToolStartEvent {
+        id: id.into(),
+        tool: tool.into(),
+        summary: id.into(),
+        annotation: None,
+        input: None,
+        raw_input: None,
+        output: None,
+        render_header: None,
+    }))
+}
+
+fn turn_complete(usage: TokenUsage, model: &str, cost: Option<f64>) -> AgentEvent {
+    AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
+        message: Default::default(),
+        usage,
+        model: model.into(),
+        cost,
+        context_size: None,
+    }))
+}
+
+fn tool_results_submitted() -> AgentEvent {
+    AgentEvent::ToolResultsSubmitted {
+        message: Box::new(Message::user(String::new())),
+    }
 }
 
 #[test]
@@ -355,6 +394,25 @@ fn queue_item_consumed_pushes_deferred_user_message() {
     );
 }
 
+/// Restored queue items start runs without `start_run`, so the consumed
+/// event is the only signal that the agent went busy: it must flip status
+/// or the busy-guard and esc-to-cancel stay off during the whole run.
+#[test]
+fn queue_item_consumed_marks_agent_streaming() {
+    let mut app = test_app();
+    assert_eq!(app.status, Status::Idle);
+
+    app.update(agent_msg_with_run_id(
+        AgentEvent::QueueItemConsumed {
+            text: "restored".into(),
+            image_count: 0,
+        },
+        app.run_id,
+    ));
+
+    assert_eq!(app.status, Status::Streaming);
+}
+
 #[test_case(error_app as fn(&mut App) ; "error")]
 #[test_case(cancel_app as fn(&mut App) ; "cancel")]
 fn clears_queue(terminate: fn(&mut App)) {
@@ -499,6 +557,7 @@ fn reset_session_clears_plan() {
     assert_eq!(app.state.mode, Mode::Build);
     assert_eq!(app.state.plan, PlanState::None);
     assert!(app.queue.is_empty());
+    assert!(app.recoverable_queue.is_empty());
     assert_eq!(app.chats.len(), 1);
     assert_eq!(app.chats[0].name, "Main");
     assert_eq!(app.active_chat, 0);
@@ -563,7 +622,7 @@ fn ctrl_p_n_navigation() {
     app.run_id = 1;
     app.update(subagent_msg(
         AgentEvent::TextDelta { text: "sub".into() },
-        "task1",
+        TASK_ID,
         Some("research"),
     ));
     assert_eq!(app.chats.len(), 2);
@@ -589,7 +648,7 @@ fn subagents_get_descriptive_names() {
     app.run_id = 1;
     app.update(subagent_msg(
         AgentEvent::TextDelta { text: "a".into() },
-        "task1",
+        TASK_ID,
         Some("first"),
     ));
     app.update(subagent_msg(
@@ -609,7 +668,7 @@ fn subagent_prompt_shown_once_and_not_duplicated() {
     app.run_id = 1;
     app.update(subagent_msg_with_prompt(
         AgentEvent::TextDelta { text: "a".into() },
-        "task1",
+        TASK_ID,
         Some("research"),
         Some("Find all TODO comments"),
     ));
@@ -618,7 +677,7 @@ fn subagent_prompt_shown_once_and_not_duplicated() {
 
     app.update(subagent_msg(
         AgentEvent::TextDelta { text: "b".into() },
-        "task1",
+        TASK_ID,
         Some("research"),
     ));
     app.chats[1].flush();
@@ -635,14 +694,7 @@ fn turn_complete_tracks_usage_and_context_per_chat() {
         output: 50,
         ..Default::default()
     };
-    app.update(agent_msg(AgentEvent::TurnComplete(Box::new(
-        TurnCompleteEvent {
-            message: Default::default(),
-            usage: main_usage,
-            model: "test".into(),
-            context_size: None,
-        },
-    ))));
+    app.update(agent_msg(turn_complete(main_usage, "test", None)));
 
     let sub_usage = TokenUsage {
         input: 200,
@@ -650,13 +702,8 @@ fn turn_complete_tracks_usage_and_context_per_chat() {
         ..Default::default()
     };
     app.update(subagent_msg(
-        AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
-            message: Default::default(),
-            usage: sub_usage,
-            model: "test".into(),
-            context_size: None,
-        })),
-        "task1",
+        turn_complete(sub_usage, "test", None),
+        TASK_ID,
         None,
     ));
 
@@ -668,35 +715,132 @@ fn turn_complete_tracks_usage_and_context_per_chat() {
     assert_eq!(app.chats[1].context_size, sub_usage.context_tokens());
 }
 
+const SUBAGENT_NAME: &str = "research";
+const SUB_TOKENS: TokenUsage = TokenUsage {
+    input: 1_000,
+    output: 200,
+    cache_creation: 300,
+    cache_read: 400,
+};
+const SUB_COST: Option<f64> = Some(0.007);
+const MAIN_TOKENS: TokenUsage = TokenUsage {
+    input: 500,
+    output: 100,
+    cache_creation: 0,
+    cache_read: 0,
+};
+const MAIN_COST: Option<f64> = Some(0.002);
+
+fn sub_turn_complete() -> Msg {
+    subagent_msg(
+        turn_complete(SUB_TOKENS, "child-model", SUB_COST),
+        TASK_ID,
+        Some(SUBAGENT_NAME),
+    )
+}
+
+/// Uses the same formatter as the header: these tests pin which tool gets the
+/// usage, not how it is spelled (maki-providers covers the spelling).
+fn sub_usage_text(turns: u32) -> String {
+    let mut total = TokenUsage::default();
+    for _ in 0..turns {
+        total += SUB_TOKENS;
+    }
+    total.format(SUB_COST.map(|cost| cost * f64::from(turns)))
+}
+
+#[test]
+fn subagent_turn_complete_updates_matching_parent_header_cumulatively() {
+    let mut app = streaming_app();
+    app.update(agent_msg(tool_start(TASK_ID, "task")));
+    app.update(agent_msg(tool_start("task2", "task")));
+
+    app.update(sub_turn_complete());
+    app.update(sub_turn_complete());
+
+    assert_eq!(
+        app.chats[0].tool_turn_usage(TASK_ID),
+        Some(sub_usage_text(2).as_str())
+    );
+    assert_eq!(app.chats[0].tool_turn_usage("task2"), None);
+}
+
+#[test_case(false ; "plain_tool_takes_the_parent_turn")]
+#[test_case(true  ; "subagent_stamp_is_not_overwritten")]
+fn parent_turn_flush_stamps_the_last_unstamped_tool(subagent_ran: bool) {
+    let mut app = streaming_app();
+    app.update(agent_msg(turn_complete(
+        MAIN_TOKENS,
+        "main-model",
+        MAIN_COST,
+    )));
+    app.update(agent_msg(tool_start(TASK_ID, "task")));
+    if subagent_ran {
+        app.update(sub_turn_complete());
+    }
+
+    app.update(agent_msg(tool_results_submitted()));
+
+    let expected = if subagent_ran {
+        sub_usage_text(1)
+    } else {
+        MAIN_TOKENS.format(MAIN_COST)
+    };
+    assert_eq!(
+        app.chats[0].tool_turn_usage(TASK_ID),
+        Some(expected.as_str())
+    );
+}
+
+#[test]
+fn tool_inside_subagent_chat_gets_its_turn_usage() {
+    const TOOL_ID: &str = "sub_bash";
+    let mut app = streaming_app();
+    app.update(agent_msg(tool_start(TASK_ID, "task")));
+    app.update(subagent_msg(
+        tool_start(TOOL_ID, "bash"),
+        TASK_ID,
+        Some(SUBAGENT_NAME),
+    ));
+    app.update(sub_turn_complete());
+
+    app.update(subagent_msg(
+        tool_results_submitted(),
+        TASK_ID,
+        Some(SUBAGENT_NAME),
+    ));
+
+    assert_eq!(
+        app.chats[1].tool_turn_usage(TOOL_ID),
+        Some(sub_usage_text(1).as_str())
+    );
+}
+
 #[test]
 fn turn_complete_accumulates_usage_by_model() {
     let mut app = app_with_subagent();
 
-    app.update(agent_msg(AgentEvent::TurnComplete(Box::new(
-        TurnCompleteEvent {
-            message: Default::default(),
-            usage: TokenUsage {
-                input: 100,
-                output: 50,
-                cache_read: 10,
-                ..Default::default()
-            },
-            model: "main-model".into(),
-            context_size: None,
+    app.update(agent_msg(turn_complete(
+        TokenUsage {
+            input: 100,
+            output: 50,
+            cache_read: 10,
+            ..Default::default()
         },
-    ))));
+        "main-model",
+        None,
+    )));
     app.update(subagent_msg(
-        AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
-            message: Default::default(),
-            usage: TokenUsage {
+        turn_complete(
+            TokenUsage {
                 input: 200,
                 output: 75,
                 ..Default::default()
             },
-            model: "sub-model".into(),
-            context_size: None,
-        })),
-        "task1",
+            "sub-model",
+            None,
+        ),
+        TASK_ID,
         None,
     ));
 
@@ -714,6 +858,7 @@ fn turn_complete_accumulates_usage_by_model() {
 #[test]
 fn cancel_resets_all_chats_and_indices() {
     let mut app = app_with_subagent();
+    open_tasks_picker(&mut app);
     app.update(subagent_msg(
         AgentEvent::ToolStart(Box::new(ToolStartEvent {
             id: "sub_t1".into(),
@@ -725,14 +870,27 @@ fn cancel_resets_all_chats_and_indices() {
             output: None,
             render_header: None,
         })),
+        TASK_ID,
+        None,
+    ));
+    let buf = Arc::new(maki_agent::SharedBuf::new());
+    app.update(subagent_msg(
+        AgentEvent::LiveToolBuf {
+            id: "sub_t1".into(),
+            body: buf,
+        },
         "task1",
         None,
     ));
 
-    cancel_app(&mut app);
+    let actions = app.handle_cancel();
+    assert!(matches!(actions.as_slice(), [Action::CancelAgent { .. }]));
+    assert!(!app.task_picker.is_open());
     assert_eq!(app.chats[0].in_progress_count(), 0);
     assert_eq!(app.chats[1].in_progress_count(), 0);
+    assert!(app.chats[1].is_finished());
     assert!(app.chat_index.is_empty());
+    assert!(!app.is_animating());
 }
 
 fn finish_subagent(app: &mut App, id: &str, is_error: bool) {
@@ -747,7 +905,7 @@ fn finish_subagent(app: &mut App, id: &str, is_error: bool) {
 }
 
 fn finish_subagent_task(app: &mut App, is_error: bool) {
-    finish_subagent(app, "task1", is_error);
+    finish_subagent(app, TASK_ID, is_error);
 }
 
 #[test]
@@ -808,10 +966,15 @@ fn ctrl_x_toggles_tasks_picker() {
     assert!(!app.task_picker.is_open());
 }
 
-fn app_with_subagent_id(id: &str) -> App {
+fn streaming_app() -> App {
     let mut app = test_app();
     app.status = Status::Streaming;
     app.run_id = 1;
+    app
+}
+
+fn app_with_subagent_id(id: &str) -> App {
+    let mut app = streaming_app();
     app.update(subagent_msg(
         AgentEvent::TextDelta { text: "x".into() },
         id,
@@ -821,7 +984,105 @@ fn app_with_subagent_id(id: &str) -> App {
 }
 
 fn app_with_subagent() -> App {
-    app_with_subagent_id("task1")
+    app_with_subagent_id(TASK_ID)
+}
+
+#[test]
+fn open_task_picker_refreshes_after_tool_done() {
+    let mut app = app_with_subagent();
+    open_tasks_picker(&mut app);
+    assert!(
+        app.task_picker
+            .selected_item()
+            .is_some_and(|entry| entry.chat_index == 0)
+    );
+
+    finish_subagent_task(&mut app, false);
+
+    assert!(app.task_picker.is_open());
+    assert_eq!(app.task_picker.item(1).unwrap().finished, Some(true));
+}
+
+#[test]
+fn open_task_picker_inserts_new_child_without_changing_selection() {
+    let mut app = app_with_subagent();
+    open_tasks_picker(&mut app);
+    app.update(Msg::Key(key(KeyCode::Down)));
+
+    app.update(subagent_msg(
+        AgentEvent::TextDelta { text: "new".into() },
+        "task2",
+        Some("build"),
+    ));
+
+    assert_eq!(app.task_picker.item(2).unwrap().name, "build");
+    assert_eq!(app.task_picker.selected_item().unwrap().chat_index, 1);
+}
+
+#[test]
+fn filtered_task_picker_enter_selects_entry_chat() {
+    let mut app = app_with_subagent_id("task1");
+    app.update(subagent_msg(
+        AgentEvent::TextDelta { text: "y".into() },
+        "task2",
+        Some("build"),
+    ));
+    open_tasks_picker(&mut app);
+    app.update(Msg::Key(key(KeyCode::Char('b'))));
+
+    assert_eq!(app.task_picker.selected_item().unwrap().chat_index, 2);
+    app.update(Msg::Key(key(KeyCode::Enter)));
+
+    assert!(!app.task_picker.is_open());
+    assert_eq!(app.active_chat, 2);
+}
+
+#[test]
+fn filtered_task_picker_refresh_preserves_selected_chat_identity() {
+    let mut app = app_with_subagent_id("task1");
+    app.update(subagent_msg(
+        AgentEvent::TextDelta { text: "y".into() },
+        "task2",
+        Some("build"),
+    ));
+    open_tasks_picker(&mut app);
+    app.update(Msg::Key(key(KeyCode::Char('b'))));
+    assert_eq!(app.task_picker.selected_item().unwrap().chat_index, 2);
+
+    app.update(subagent_msg(
+        AgentEvent::TextDelta { text: "z".into() },
+        "task3",
+        Some("benchmark"),
+    ));
+
+    assert!(app.task_picker.is_open());
+    assert_eq!(app.task_picker.selected_item().unwrap().chat_index, 2);
+}
+
+#[test]
+fn open_task_picker_refreshes_after_subagent_history() {
+    let mut app = app_with_subagent_id("session-abc");
+    open_tasks_picker(&mut app);
+
+    app.update(agent_msg(AgentEvent::SubagentHistory {
+        tool_use_id: "session-abc".into(),
+        messages: vec![],
+    }));
+
+    assert!(app.task_picker.is_open());
+    assert_eq!(app.task_picker.item(1).unwrap().finished, Some(true));
+}
+
+#[test]
+fn closed_task_picker_stays_closed_after_lifecycle_events() {
+    let mut app = app_with_subagent();
+    finish_subagent_task(&mut app, false);
+    app.update(subagent_msg(
+        AgentEvent::TextDelta { text: "new".into() },
+        "task2",
+        Some("build"),
+    ));
+    assert!(!app.task_picker.is_open());
 }
 
 #[test]
@@ -1147,24 +1408,45 @@ fn make_pending_copy(app: &mut App) {
     app.update(mouse_event(MouseEventKind::Up(MouseButton::Left), 10, 10));
 }
 
+const DRAG_ROW: u16 = 5;
+const DRAG_COL: u16 = 5;
+const SCROLL_LINES: i32 = 3;
+const DRAG_ZONE_AREA: Rect = Rect {
+    x: 0,
+    y: 0,
+    width: 80,
+    height: 10,
+};
+const OTHER_ZONE_AREA: Rect = Rect {
+    x: 0,
+    y: DRAG_ZONE_AREA.height,
+    width: 80,
+    height: 10,
+};
+
 fn send_key(app: &mut App) {
     app.update(Msg::Key(key(KeyCode::Char('a'))));
 }
 
-fn send_scroll(app: &mut App) {
+fn send_scroll_outside_drag_zone(app: &mut App) {
     app.update(Msg::Scroll {
-        column: 10,
-        row: 10,
-        delta: 3,
+        column: DRAG_COL,
+        row: OTHER_ZONE_AREA.y + 1,
+        delta: SCROLL_LINES,
     });
 }
 
-#[test_case(send_key as fn(&mut App)    ; "key")]
-#[test_case(send_scroll as fn(&mut App) ; "scroll")]
+#[test_case(send_key as fn(&mut App) ; "key")]
+#[test_case(send_scroll_outside_drag_zone as fn(&mut App) ; "scroll_outside_drag_zone")]
 fn interrupt_clears_dragging_but_preserves_pending_copy(interrupt: fn(&mut App)) {
     let mut app = test_app();
-    set_zone(&mut app, SelectionZone::Messages, Rect::new(0, 0, 80, 20));
-    app.update(mouse_event(MouseEventKind::Down(MouseButton::Left), 5, 5));
+    set_zone(&mut app, SelectionZone::Messages, DRAG_ZONE_AREA);
+    set_zone(&mut app, SelectionZone::Input, OTHER_ZONE_AREA);
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        DRAG_COL,
+        DRAG_ROW,
+    ));
     interrupt(&mut app);
     assert!(app.selection_state.is_none(), "clears dragging");
 
@@ -1173,6 +1455,85 @@ fn interrupt_clears_dragging_but_preserves_pending_copy(interrupt: fn(&mut App))
     assert!(
         app.selection_state.as_ref().unwrap().is_pending_copy(),
         "preserves pending copy"
+    );
+}
+
+#[test]
+fn scroll_preserves_dragging_and_updates_cursor() {
+    let mut app = test_app();
+    for i in 0..50 {
+        app.active_chat()
+            .push(DisplayMessage::new(DisplayRole::User, format!("line {i}")));
+    }
+
+    let area = Rect::new(0, 0, 80, 20);
+    set_zone(&mut app, SelectionZone::Messages, area);
+
+    let backend = ratatui::backend::TestBackend::new(area.width, area.height);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| {
+            app.active_chat().view(frame, area, false);
+        })
+        .unwrap();
+
+    let max_scroll = app.active_chat().scroll_top();
+    assert!(
+        max_scroll > 0,
+        "scroll_top should be non-zero after rendering scrollable content"
+    );
+
+    app.update(Msg::Scroll {
+        column: DRAG_COL,
+        row: DRAG_ROW,
+        delta: SCROLL_LINES,
+    });
+    let scroll_before = app.active_chat().scroll_top();
+    assert!(
+        scroll_before < max_scroll,
+        "scroll up should move scroll_top away from max_scroll"
+    );
+
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        DRAG_COL,
+        DRAG_ROW,
+    ));
+
+    app.update(Msg::Scroll {
+        column: DRAG_COL,
+        row: DRAG_ROW,
+        delta: -SCROLL_LINES,
+    });
+
+    assert!(
+        matches!(
+            app.selection_state.as_ref().unwrap(),
+            SelectionState::Dragging { .. }
+        ),
+        "scroll keeps dragging"
+    );
+
+    let (start, end) = app.selection_state.as_ref().unwrap().sel().normalized();
+    let anchor_row = scroll_before as u32 + DRAG_ROW as u32;
+    assert_eq!(start.row, anchor_row, "anchor keeps its doc row");
+    assert_eq!(
+        end.row,
+        anchor_row + SCROLL_LINES as u32,
+        "cursor re-projects by the scrolled lines"
+    );
+    assert_eq!(start.col, DRAG_COL, "anchor column is unchanged");
+    assert_eq!(end.col, DRAG_COL, "cursor column is unchanged");
+
+    make_pending_copy(&mut app);
+    app.update(Msg::Scroll {
+        column: DRAG_COL,
+        row: DRAG_ROW,
+        delta: -SCROLL_LINES,
+    });
+    assert!(
+        app.selection_state.as_ref().unwrap().is_pending_copy(),
+        "scroll preserves pending copy"
     );
 }
 
@@ -1429,7 +1790,7 @@ fn resolve_or_create_chat_sets_model_id_and_annotation() {
     app.status = Status::Streaming;
     app.run_id = 1;
     app.update(agent_msg(AgentEvent::ToolStart(Box::new(ToolStartEvent {
-        id: "task1".into(),
+        id: TASK_ID.into(),
         tool: "task".into(),
         summary: "research".into(),
         annotation: None,
@@ -1441,7 +1802,7 @@ fn resolve_or_create_chat_sets_model_id_and_annotation() {
 
     app.update(subagent_msg_with_model(
         AgentEvent::TextDelta { text: "hi".into() },
-        "task1",
+        TASK_ID,
         "research",
         "anthropic/claude-sonnet-4-20250514",
     ));
@@ -1626,6 +1987,65 @@ fn reload_leaves_empty_session_unpersisted_on_disk() {
     assert_eq!(entries, 0);
 }
 
+/// `state.session.tool_outputs` is the only store, so a `ToolDone` write
+/// must reach disk or restored sessions lose their tool call widgets.
+#[test]
+fn tool_done_output_persists_to_disk() {
+    let (_tmp, dir, writer, mut app) = tempdir_app();
+    app.state
+        .session
+        .messages
+        .push(Message::user("prompt".into()));
+    app.status = Status::Streaming;
+    app.run_id = 1;
+
+    app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+        id: "tool-live".into(),
+        tool: "bash".into(),
+        output: ToolOutput::Plain("live output".into()),
+        is_error: false,
+        annotation: None,
+        written_path: None,
+    }))));
+
+    app.save_session();
+    let id = app.state.session.id;
+    drain_writer(app, writer);
+
+    let loaded = AppSession::load(id, &dir).unwrap();
+    assert!(matches!(
+        loaded.tool_outputs.get("tool-live"),
+        Some(ToolOutput::Plain(s)) if s.text == "live output"
+    ));
+}
+
+#[test]
+fn restore_resumed_session_flushes_queued_messages_and_round_trips() {
+    let mut app = test_app();
+    app.state.session.meta.queued_messages = vec!["q1".into(), "q2".into()];
+
+    app.restore_resumed_session();
+    assert!(app.state.session.meta.queued_messages.is_empty());
+    assert_eq!(app.queue.text_messages(), ["q1", "q2"]);
+
+    app.save_session();
+    assert_eq!(app.state.session.meta.queued_messages, ["q1", "q2"]);
+}
+
+#[test]
+fn apply_loaded_session_defers_queued_messages_until_respawn() {
+    let mut app = test_app();
+    let mut session = AppSession::new("test-model", "/tmp/test");
+    session.meta.queued_messages = vec!["deferred".into()];
+    session.messages.push(Message::user("hello".into()));
+
+    let model = app.state.model.clone();
+    app.apply_loaded_session(session, &model);
+
+    assert!(app.queue.is_empty());
+    assert_eq!(app.state.session.meta.queued_messages, ["deferred"]);
+}
+
 #[test]
 fn yolo_toggle() {
     let mut app = test_app();
@@ -1708,6 +2128,34 @@ fn typed_slash_command_executes() {
     assert!(app.help_modal.is_open());
 }
 
+const LUA_COMMAND_RAN: &str = "lua command with args must reach the plugin";
+const LUA_COMMAND_NOT_SENT: &str = "lua command with args must not reach the model";
+
+/// The palette hides a lua command once the typed words pass its `max_args`,
+/// and a hidden command falls through to `handle_submit`, so a multi word
+/// `nargs` command must still be routed to its plugin.
+#[test]
+fn typed_lua_command_with_args_executes() {
+    let dir = StateDir::from_path(env::temp_dir());
+    let mut app = build_app_with_lua(
+        dir.clone(),
+        Arc::new(StorageWriter::new(dir)),
+        LuaCommandReader::from_commands(vec![LuaCommandInfo {
+            name: "/rename".into(),
+            description: "Rename the current session".into(),
+            plugin: "sessions".into(),
+            max_args: usize::MAX,
+        }]),
+    );
+    let (handle, probe) = maki_lua::test_support::probed_event_handle();
+    app.lua_event_handle = handle;
+
+    let actions = type_and_submit(&mut app, "/rename my title");
+
+    assert!(actions.is_empty(), "{LUA_COMMAND_NOT_SENT}");
+    assert!(probe.try_recv().is_some(), "{LUA_COMMAND_RAN}");
+}
+
 #[test]
 fn slash_noncommand_sends_as_prompt() {
     let mut app = test_app();
@@ -1767,7 +2215,7 @@ fn rewind_to_middle_truncates_and_populates_input() {
     assert_eq!(app.state.session.messages.len(), 2);
     assert!(app.state.session.tool_outputs.contains_key("tool-1"));
     assert_eq!(app.input_box.buffer.value(), "second prompt");
-    assert_eq!(app.run_id, old_run_id + 1);
+    assert_eq!(app.run_id, old_run_id);
     let expected_ctx = maki_agent::agent::estimate_message_tokens(&app.state.session.messages);
     assert_eq!(app.state.context_size, expected_ctx);
     assert_eq!(app.chats[0].context_size, expected_ctx);
@@ -1776,7 +2224,6 @@ fn rewind_to_middle_truncates_and_populates_input() {
         panic!("expected LoadSession");
     };
     assert_eq!(loaded.messages.len(), 2);
-    assert!(loaded.tool_outputs.contains_key("tool-1"));
 }
 
 #[test]
@@ -1843,7 +2290,7 @@ fn retry_clears_subagent_in_progress_tools() {
             id: "st1".into(),
             name: "bash".into(),
         },
-        "task1",
+        TASK_ID,
         Some("research"),
     ));
     assert_eq!(app.chats.len(), 2);
@@ -1855,7 +2302,7 @@ fn retry_clears_subagent_in_progress_tools() {
             message: "overloaded".into(),
             delay_ms: 1000,
         },
-        "task1",
+        TASK_ID,
         Some("research"),
     ));
     assert_eq!(app.chats[1].in_progress_count(), 0);
@@ -2192,24 +2639,265 @@ fn stale_non_terminal_event_does_not_save_session() {
     cancel_app(&mut app);
 
     app.update(agent_msg_with_run_id(
-        AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
-            message: Message::user(String::new()),
-            usage: TokenUsage::default(),
-            model: "mock".into(),
-            context_size: None,
-        })),
+        turn_complete(TokenUsage::default(), "mock", None),
         old_run_id,
     ));
     assert!(app.state.session.messages.is_empty());
 }
 
 #[test]
-fn error_event_matching_run_id_saves_session() {
+fn parent_done_reconciles_unresolved_children_and_tools() {
     let mut app = streaming_app_with_history();
+    app.update(agent_msg(AgentEvent::ToolStart(Box::new(ToolStartEvent {
+        id: "task1".into(),
+        tool: "task".into(),
+        summary: "research".into(),
+        annotation: None,
+        input: None,
+        raw_input: None,
+        output: None,
+        render_header: None,
+    }))));
+    app.update(subagent_msg(
+        AgentEvent::ToolStart(Box::new(ToolStartEvent {
+            id: "child-tool".into(),
+            tool: "read".into(),
+            summary: "reading".into(),
+            annotation: None,
+            input: None,
+            raw_input: None,
+            output: None,
+            render_header: None,
+        })),
+        "task1",
+        Some("research"),
+    ));
+    let buf = Arc::new(maki_agent::SharedBuf::new());
+    app.update(subagent_msg(
+        AgentEvent::LiveToolBuf {
+            id: "child-tool".into(),
+            body: buf,
+        },
+        "task1",
+        None,
+    ));
+
+    app.update(done_event());
+
+    assert!(app.chats[1].is_finished());
+    assert_eq!(app.chats[0].in_progress_count(), 0);
+    assert_eq!(app.chats[1].in_progress_count(), 0);
+    assert!(
+        app.chats[0]
+            .last_message_text()
+            .contains(MISSING_TOOL_COMPLETION)
+    );
+    assert!(app.state.session.meta.subagents.is_empty());
+    assert_eq!(app.state.session.messages.len(), 2);
+    assert!(app.state.session.tool_outputs.is_empty());
+    assert!(!app.is_animating());
+}
+
+#[test]
+fn parent_error_refreshes_picker_and_persists_only_completed_children() {
+    let mut app = streaming_app_with_history();
+    app.update(subagent_msg_with_model(
+        AgentEvent::TextDelta { text: "one".into() },
+        "task1",
+        "first",
+        "model-a",
+    ));
+    finish_subagent(&mut app, "task1", false);
+    app.update(subagent_msg_with_model(
+        AgentEvent::TextDelta { text: "two".into() },
+        "task2",
+        "second",
+        "model-b",
+    ));
+    app.update(subagent_msg_with_model(
+        AgentEvent::TextDelta {
+            text: "three".into(),
+        },
+        "task3",
+        "third",
+        "model-c",
+    ));
+    finish_subagent(&mut app, "task3", false);
+    open_tasks_picker(&mut app);
+
     app.update(agent_msg(AgentEvent::Error {
         message: "boom".into(),
     }));
+
+    assert!(app.task_picker.is_open());
+    assert_eq!(app.task_picker.item(2).unwrap().finished, Some(true));
+    let saved: Vec<_> = app
+        .state
+        .session
+        .meta
+        .subagents
+        .iter()
+        .map(|subagent| {
+            (
+                subagent.tool_use_id.as_str(),
+                subagent.name.as_str(),
+                subagent.model.as_deref(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        saved,
+        vec![
+            ("task1", "first", Some("model-a")),
+            ("task3", "third", Some("model-c")),
+        ]
+    );
+}
+
+#[test]
+fn reserved_shell_survives_parent_done_until_shell_done() {
+    let mut app = streaming_app_with_history();
+    let id = app.shell.reserve_id();
+
+    app.update(done_event());
+    assert!(app.shell.active_ids().contains(&id));
+
+    app.handle_shell_event(shell::ShellEvent::Start {
+        id: id.clone(),
+        command: "true".into(),
+    });
+    assert_eq!(app.chats[0].in_progress_count(), 1);
+    app.handle_shell_event(shell::ShellEvent::Done {
+        id: id.clone(),
+        command: "true".into(),
+        output: String::new(),
+        is_error: false,
+        visible: false,
+    });
+    assert_eq!(app.chats[0].in_progress_count(), 0);
+    assert!(!app.shell.active_ids().contains(&id));
+}
+
+#[test]
+fn active_shell_survives_agent_error_while_agent_and_child_tools_fail() {
+    let mut app = streaming_app_with_history();
+    let shell_id = app.shell.reserve_id();
+    app.handle_shell_event(shell::ShellEvent::Start {
+        id: shell_id.clone(),
+        command: "true".into(),
+    });
+    app.update(agent_msg(AgentEvent::ToolStart(Box::new(ToolStartEvent {
+        id: "agent-tool".into(),
+        tool: "read".into(),
+        summary: "reading".into(),
+        annotation: None,
+        input: None,
+        raw_input: None,
+        output: None,
+        render_header: None,
+    }))));
+    app.update(subagent_msg(
+        AgentEvent::ToolStart(Box::new(ToolStartEvent {
+            id: "child-tool".into(),
+            tool: "read".into(),
+            summary: "reading".into(),
+            annotation: None,
+            input: None,
+            raw_input: None,
+            output: None,
+            render_header: None,
+        })),
+        "task1",
+        Some("research"),
+    ));
+
+    app.update(agent_msg(AgentEvent::Error {
+        message: "provider overloaded".into(),
+    }));
+
+    assert_eq!(app.chats[0].in_progress_count(), 1);
+    assert_eq!(app.chats[1].in_progress_count(), 0);
+    assert!(app.chats[1].is_finished());
+
+    app.handle_shell_event(shell::ShellEvent::Done {
+        id: shell_id.clone(),
+        command: "true".into(),
+        output: String::new(),
+        is_error: false,
+        visible: false,
+    });
+    assert_eq!(app.chats[0].in_progress_count(), 0);
+    assert!(!app.shell.active_ids().contains(&shell_id));
+}
+
+#[test]
+fn main_shell_exclusion_does_not_protect_same_id_in_child_chat() {
+    let mut app = streaming_app_with_history();
+    let id = app.shell.reserve_id();
+    app.handle_shell_event(shell::ShellEvent::Start {
+        id: id.clone(),
+        command: "true".into(),
+    });
+    app.update(subagent_msg(
+        AgentEvent::ToolStart(Box::new(ToolStartEvent {
+            id: id.clone(),
+            tool: "read".into(),
+            summary: "reading".into(),
+            annotation: None,
+            input: None,
+            raw_input: None,
+            output: None,
+            render_header: None,
+        })),
+        "task1",
+        Some("research"),
+    ));
+
+    app.update(done_event());
+
+    assert_eq!(app.chats[0].in_progress_count(), 1);
+    assert_eq!(app.chats[1].in_progress_count(), 0);
+    assert!(app.chats[1].is_finished());
+}
+
+#[test]
+fn error_event_matching_run_id_saves_session_and_queued_messages() {
+    let mut app = streaming_app_with_history();
+    app.queue_and_notify(queued_msg("next"));
+
+    app.update(agent_msg(AgentEvent::Error {
+        message: "boom".into(),
+    }));
+
     assert_eq!(app.state.session.messages.len(), 2);
+    assert_eq!(app.state.session.meta.queued_messages, ["next"]);
+    assert!(app.queue.is_empty());
+
+    app.save_session();
+    assert_eq!(app.state.session.meta.queued_messages, ["next"]);
+
+    type_and_submit(&mut app, "replacement");
+    app.save_session();
+    assert!(app.state.session.meta.queued_messages.is_empty());
+}
+
+#[test]
+fn flush_restored_queue_drops_recovery_snapshot() {
+    let mut app = streaming_app_with_history();
+    app.queue_and_notify(queued_msg("next"));
+    app.update(agent_msg(AgentEvent::Error {
+        message: "boom".into(),
+    }));
+    assert_eq!(app.state.session.meta.queued_messages, ["next"]);
+
+    app.flush_restored_queue();
+    app.save_session();
+    assert_eq!(app.state.session.meta.queued_messages, ["next"]);
+    assert!(app.recoverable_queue.is_empty());
+
+    app.queue.clear();
+    app.save_session();
+    assert!(app.state.session.meta.queued_messages.is_empty());
 }
 
 // --- Plan form integration tests ---
@@ -2419,7 +3107,7 @@ fn install_override(
         id: 1,
     }]);
     let (handle, probe) = maki_lua::test_support::probed_event_handle();
-    app.lua_event_handle = Some(handle);
+    app.lua_event_handle = handle;
     probe
 }
 
@@ -2555,7 +3243,7 @@ fn streaming_cancel_wins_over_quit_override() {
 fn dead_host_override_falls_back_to_builtin() {
     let mut app = test_app();
     let _probe = install_override(&mut app, kb::HELP.code, kb::HELP.modifiers);
-    app.lua_event_handle = Some(maki_lua::EventHandle::disconnected_for_test());
+    app.lua_event_handle = maki_lua::EventHandle::disconnected_for_test();
 
     app.update(Msg::Key(kb::HELP.to_key_event()));
 
@@ -2961,7 +3649,7 @@ fn double_esc_in_subagent_cancels_subagent() {
     assert_eq!(actions.len(), 1);
     assert!(matches!(
         &actions[0],
-        Action::CancelSubagent { tool_use_id } if tool_use_id == "task1"
+        Action::CancelSubagent { tool_use_id } if tool_use_id == TASK_ID
     ));
     assert!(app.chats[1].is_finished());
     assert_eq!(app.chats[1].last_message_text(), CANCELLED_TEXT);
@@ -2993,18 +3681,18 @@ fn esc_in_main_chat_with_active_subagent_no_cancel() {
 
 #[test]
 fn cancel_subagent_removes_answer_sender() {
-    let (mut app, _sub_rx, _main_rx) = app_with_subagent_tx("task1");
+    let (mut app, _sub_rx, _main_rx) = app_with_subagent_tx(TASK_ID);
     assert!(!app.subagent_answers.is_empty());
     app.update(Msg::Key(kb::NEXT_CHAT.to_key_event()));
     assert_eq!(app.active_chat, 1);
     app.last_esc = Some(Instant::now());
     app.update(Msg::Key(key(KeyCode::Esc)));
-    assert!(!app.subagent_answers.contains_key("task1"));
+    assert!(!app.subagent_answers.contains_key(TASK_ID));
 }
 
 #[test]
 fn multiple_subagents_cancel_one_other_unaffected() {
-    let mut app = app_with_subagent_id("task1");
+    let mut app = app_with_subagent_id(TASK_ID);
     app.update(subagent_msg(
         AgentEvent::TextDelta { text: "y".into() },
         "task2",
@@ -3021,7 +3709,7 @@ fn multiple_subagents_cancel_one_other_unaffected() {
         &actions[0],
         Action::CancelSubagent { tool_use_id } if tool_use_id == "task2"
     ));
-    let task1_idx = *app.chat_index.get("task1").unwrap();
+    let task1_idx = *app.chat_index.get(TASK_ID).unwrap();
     assert!(!app.chats[task1_idx].is_finished());
     assert!(app.chats[app.active_chat].is_finished());
 }

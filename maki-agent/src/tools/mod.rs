@@ -223,6 +223,7 @@ pub struct ToolContext {
 pub enum ToolLive {
     Buf(Arc<SharedBuf>),
     Annotation(String),
+    Usage(String),
 }
 
 pub(crate) fn resolve_path(path: &str) -> Result<String, String> {

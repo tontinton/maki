@@ -143,10 +143,17 @@ end
 -- a failed child looks exactly like the same tool run standalone. When
 -- restore is missing, throws, or returns no buf, the ToolView fallback
 -- matches the standalone plain rendering too.
+-- The pcall is for the cancel sweep, which runs outside the coroutine,
+-- where a restore that awaits raises instead of yielding. One child's
+-- body must not stop the sweep from repainting the rest.
 local function child_body_buf(c, tol)
   local output = c.output or ""
   local t = maki.api.get_tool(c.tool)
-  local buf = t and t.restore and t.restore(c.params, output, c.status == STATUS.ERROR, { tool_output_lines = tol })
+  local buf
+  if t and t.restore then
+    local ok, res = pcall(t.restore, c.params, output, c.status == STATUS.ERROR, { tool_output_lines = tol })
+    buf = ok and res or nil
+  end
   return buf or ToolView.restore(output, { max_lines = tol[c.tool] or tol.other, keep = "head" })
 end
 
@@ -200,6 +207,9 @@ local function child_header_line(c)
   end
   if c.annotation then
     spans[#spans + 1] = { " (" .. c.annotation .. ")", "tool_annotation" }
+  end
+  if c.usage then
+    spans[#spans + 1] = { "  " .. c.usage, "dim" }
   end
   return spans
 end
@@ -265,7 +275,13 @@ end
 local function to_state(children)
   local out = {}
   for i, c in ipairs(children) do
-    out[i] = { tool = c.tool, status = c.status, output = c.output, annotation = c.annotation }
+    out[i] = {
+      tool = c.tool,
+      status = c.status,
+      output = c.output,
+      annotation = c.annotation,
+      usage = c.usage,
+    }
   end
   return { children = out }
 end
@@ -414,6 +430,11 @@ function Batch:settle(c, status, output)
 end
 
 function Batch:run_child(c, ctx)
+  -- `gather` runs every fun it was handed, cancel or not, so a child the
+  -- sweep already settled would go back to running and dispatch anyway.
+  if TERMINAL[c.status] then
+    return
+  end
   c.status = STATUS.RUNNING
   self:rerender()
   local text, err = maki.agent.call_tool(ctx, c.tool, c.params, {
@@ -426,7 +447,16 @@ function Batch:run_child(c, ctx)
     on_annotation = function(a)
       self:annotate(c, a)
     end,
+    on_usage = function(usage)
+      c.usage = usage
+      self:rerender()
+    end,
   })
+  -- The sweep may have settled this child mid-call, and the call knows
+  -- nothing about that, so its result is moot.
+  if TERMINAL[c.status] then
+    return
+  end
   if err then
     self:settle(c, STATUS.ERROR, err)
   else
@@ -434,8 +464,16 @@ function Batch:run_child(c, ctx)
   end
 end
 
--- gather returns early when the user cancels, so sweep whatever is
--- still non-terminal into an error; no child is left dangling.
+-- Whatever is still non-terminal becomes a cancelled child, so none is
+-- left dangling, on screen or in the output.
+function Batch:sweep_cancelled()
+  for _, c in ipairs(self.children) do
+    if not TERMINAL[c.status] then
+      self:settle(c, STATUS.ERROR, CANCELLED_ERROR)
+    end
+  end
+end
+
 function Batch:run(ctx)
   local funs = {}
   for _, c in ipairs(self.children) do
@@ -445,12 +483,14 @@ function Batch:run(ctx)
       end
     end
   end
+  -- The cancel reaches neither `call_tool` nor `gather`, so a child parked
+  -- in a request would stay drawn as running until the host gives up on
+  -- the whole handler, seconds later.
+  maki.async.on_cancel(function()
+    self:sweep_cancelled()
+  end)
   maki.async.gather(funs)
-  for _, c in ipairs(self.children) do
-    if not TERMINAL[c.status] then
-      self:settle(c, STATUS.ERROR, CANCELLED_ERROR)
-    end
-  end
+  self:sweep_cancelled()
 end
 
 --- Tool entry points --------------------------------------------------------
@@ -508,6 +548,7 @@ local function restore(input, output, _is_error, rctx)
       local c = children[i]
       c.status = TERMINAL[sc.status] and sc.status or STATUS.ERROR
       c.output, c.annotation = sc.output, sc.annotation
+      c.usage = sc.usage
     end
     return Batch.new(children, tol).buf
   end

@@ -87,10 +87,8 @@ impl History {
     }
 }
 
-/// Restored sessions can have orphaned tool_results or unclosed tool_uses
-/// (e.g. the process was killed mid-turn). The API returns 400 if it sees those.
-fn sanitize_restored(messages: &mut Vec<Message>) {
-    let len_before = messages.len();
+pub(super) fn remove_orphaned_tool_results(messages: &mut Vec<Message>) -> bool {
+    let mut changed = false;
     let mut i = 0;
     while i < messages.len() {
         if !matches!(messages[i].role, Role::User) {
@@ -107,6 +105,7 @@ fn sanitize_restored(messages: &mut Vec<Message>) {
             Vec::new()
         };
 
+        let content_len = messages[i].content.len();
         let (mut had_results, mut kept_results) = (false, false);
         messages[i].content.retain(|b| match b {
             ContentBlock::ToolResult { tool_use_id, .. } => {
@@ -117,25 +116,33 @@ fn sanitize_restored(messages: &mut Vec<Message>) {
             }
             _ => true,
         });
-        // A tool-returned image whose results were all orphaned would float
-        // with no context, so it goes too. Chat-pasted images live in
-        // messages without tool results and stay untouched.
         if had_results && !kept_results {
             messages[i]
                 .content
                 .retain(|b| !matches!(b, ContentBlock::Image { .. }));
         }
+        changed |= messages[i].content.len() != content_len;
 
         if messages[i].content.is_empty() {
             messages.remove(i);
+            changed = true;
         } else {
             i += 1;
         }
     }
 
-    close_dangling_tool_calls(messages, UNAVAILABLE_RESULT);
+    changed
+}
 
-    if messages.len() != len_before {
+/// Restored sessions can have orphaned tool_results or unclosed tool_uses
+/// (e.g. the process was killed mid-turn). The API returns 400 if it sees those.
+fn sanitize_restored(messages: &mut Vec<Message>) {
+    let len_before = messages.len();
+    let mut changed = remove_orphaned_tool_results(messages);
+    close_dangling_tool_calls(messages, UNAVAILABLE_RESULT);
+    changed |= messages.len() != len_before;
+
+    if changed {
         warn!(
             before = len_before,
             after = messages.len(),
@@ -471,6 +478,23 @@ mod tests {
             ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "t1"
         ));
         assert!(matches!(content[1], ContentBlock::Image { .. }));
+    }
+
+    #[test]
+    fn remove_orphaned_tool_results_reports_content_change() {
+        let mut result = make_tool_result_msg(&["orphan"]);
+        result.content.push(ContentBlock::Text {
+            text: "keep me".into(),
+        });
+        let mut messages = vec![result];
+
+        assert!(remove_orphaned_tool_results(&mut messages));
+        assert_eq!(messages.len(), 1);
+        assert!(matches!(
+            &messages[0].content[..],
+            [ContentBlock::Text { text }] if text == "keep me"
+        ));
+        assert!(!remove_orphaned_tool_results(&mut messages));
     }
 
     #[test]

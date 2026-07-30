@@ -176,15 +176,17 @@ fn write_overrides(out: &mut String) {
     out.push_str(
         "If an override leaves Maki stuck (a rebound `Ctrl+C`, a modal \
          that won't close, a plugin that throws on load), boot without \
-         plugins:\n\n",
+         user `init.lua`:\n\n",
     );
     out.push_str("```bash\nmaki --no-plugins\n```\n\n");
     out.push_str(
-        "This skips the Lua host and runs the full default keymap from \
-         Rust, so quit, Esc, scroll, and suspend always work.\n\n",
+        "Skips user `init.lua` files (global and project) but keeps the \
+         Lua host and builtin plugins running, so tools still work. \
+         `permissions.toml`, custom commands, and env files load as \
+         usual.\n\n",
     );
     out.push_str(
-        "The defaults live in Rust, not Lua, so `--no-plugins` never \
-         drops them.\n",
+        "The default keymap lives in Rust, not Lua, so `--no-plugins` \
+         never drops it.\n",
     );
 }

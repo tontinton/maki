@@ -119,7 +119,7 @@ fn write_param_table(out: &mut String, params: &[Param]) {
     };
     writeln!(out, "{header}").unwrap();
     for p in params {
-        let desc = p.description.replace('\n', "<br>");
+        let desc = p.description.replace('|', "\\|").replace('\n', "<br>");
         let required = if p.required { "yes" } else { "no" };
         if has_defaults {
             writeln!(

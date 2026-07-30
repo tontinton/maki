@@ -37,6 +37,13 @@ Maki is an AI coding agent (like Claude Code and opencode), that is built bottom
 
 Read `justfile` for more.
 
+## Nix
+
+- `nix build` — build the project in a sandboxed environment
+- `nix develop` — enter the dev shell (Rust toolchain, formatters, CLI tools)
+- `nix fmt` — format all `.nix` files with `nixfmt`
+- `nix flake check` — run all flake checks (including git-dep-hashes drift detection)
+
 ## Architecture
 
 Rust workspace, key crates in root dir:

@@ -82,7 +82,7 @@ fn discover_commands(disable: bool) -> Vec<CustomCommand> {
 
 fn load_config(plugin_host: &PluginHost, cli: &Cli, cwd: &Path) -> Result<Config> {
     let raw_config = plugin_host
-        .load_init_files(cwd)
+        .load_init_files_or_skip(cli.no_plugins, cwd)
         .context("load init.lua files")?;
 
     let mut config = raw_config
@@ -138,12 +138,8 @@ fn build_stack(
 ) -> Result<(Stack, Vec<String>)> {
     let mut warnings = Vec::new();
 
-    let mut plugin_host = if cli.no_plugins {
-        PluginHost::disabled()
-    } else {
-        PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !cli.no_jit)
-            .context("initialize lua plugin host")?
-    };
+    let mut plugin_host = PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !cli.no_jit)
+        .context("initialize lua plugin host")?;
 
     let (fallback_config, fallback_model) = fallback.unzip();
     let reloading = fallback_model.is_some();
@@ -242,14 +238,11 @@ pub fn run(mut cli: Cli) -> Result<()> {
 
     setup::init_logging(&stack.config.storage);
     setup::install_panic_log_hook();
+    setup::warn_ignored_provider_fields();
 
     if cli.is_sdk_mode() {
         let fast = stack.config.always_fast && stack.model.supports_fast();
-        let prompt_slots = stack
-            .plugin_host
-            .event_handle()
-            .map(|h| h.collect_prompt_slots())
-            .unwrap_or_default();
+        let prompt_slots = stack.plugin_host.event_handle().collect_prompt_slots();
         let timeouts = stack.timeouts();
         crate::sdk_mode::run(crate::sdk_mode::SdkParams {
             cli,
@@ -406,6 +399,8 @@ mod tests {
     use super::*;
     use color_eyre::eyre::eyre;
     use maki_config::RawConfig;
+    use std::fs;
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     /// `second_saw_first` requires both joins: `defer` joining the first
@@ -477,5 +472,75 @@ mod tests {
         };
         assert!(err.to_string().contains("boom"));
         assert!(warnings.is_empty());
+    }
+
+    /// `--no-plugins` keeps the Lua host live (tools + default keymap
+    /// still load) but skips user `init.lua`, so a broken project
+    /// `init.lua` must not be executed in that mode.
+    #[test]
+    fn no_plugins_skips_broken_init_lua_but_keeps_host_alive() {
+        use clap::Parser;
+        use maki_agent::tools::ToolRegistry;
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir");
+        let maki_dir: PathBuf = dir.path().join(".maki");
+        fs::create_dir_all(&maki_dir).expect("mkdir .maki");
+        fs::write(
+            maki_dir.join("init.lua"),
+            "error('broken init lua must not run')",
+        )
+        .expect("write init.lua");
+
+        let cli = Cli::parse_from(["maki", "--no-plugins"]);
+        assert!(cli.no_plugins);
+
+        let mut plugin_host = PluginHost::with_jit(Arc::new(ToolRegistry::new()), true)
+            .expect("live host boots under --no-plugins");
+
+        let config = load_config(&plugin_host, &cli, dir.path())
+            .expect("no-plugins must skip the broken init.lua and still load defaults");
+        assert!(
+            !config.plugins.names.is_empty(),
+            "default builtin plugins must still be enabled under --no-plugins"
+        );
+
+        plugin_host
+            .load_builtins(&config.plugins)
+            .expect("builtins load on the live host under --no-plugins");
+
+        plugin_host.begin_shutdown();
+    }
+
+    /// Negative control for the test above: without `--no-plugins`, the
+    /// same broken `init.lua` must surface as an error so the skip path
+    /// cannot silently regress into a tautology.
+    #[test]
+    fn broken_init_lua_errors_without_no_plugins() {
+        use clap::Parser;
+        use maki_agent::tools::ToolRegistry;
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir");
+        let maki_dir: PathBuf = dir.path().join(".maki");
+        fs::create_dir_all(&maki_dir).expect("mkdir .maki");
+        fs::write(
+            maki_dir.join("init.lua"),
+            "error('broken init lua must not run')",
+        )
+        .expect("write init.lua");
+
+        let cli = Cli::parse_from(["maki"]);
+        assert!(!cli.no_plugins);
+
+        let mut plugin_host =
+            PluginHost::with_jit(Arc::new(ToolRegistry::new()), true).expect("live host boots");
+
+        match load_config(&plugin_host, &cli, dir.path()) {
+            Err(_) => {}
+            Ok(_) => panic!("broken init.lua must error without --no-plugins"),
+        }
+
+        plugin_host.begin_shutdown();
     }
 }

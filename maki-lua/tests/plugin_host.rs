@@ -1,11 +1,59 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use maki_agent::tools::{ToolRegistry, ToolSource, timeout_annotation};
+use maki_agent::ToolOutput;
+use maki_agent::tools::{
+    DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool, ToolContext,
+    ToolExecResult, ToolInvocation, ToolLive, ToolRegistry, ToolSource, timeout_annotation,
+};
 use maki_config::{AlwaysThinking, PluginsConfig, ToolOutputLines};
 use maki_lua::{PluginError, PluginHost, WARM_TOOL_CAP};
-use std::path::Path;
+use serde_json::{Value, json};
+
+const NARGS_ERR: &str = r#"'nargs' must be 0, 1, "?", "*", or "+""#;
+const USAGE_TOOL_NAME: &str = "usage_child";
+const USAGE_VALUE: &str = "12.3k↑ 456↓ $0.123";
+const USAGE_OUTPUT: &str = "usage_done";
+
+/// Lua tools cannot publish `ToolLive::Usage` (only the subagent relay does), so
+/// a native stub stands in for one.
+struct UsageTool;
+
+impl ToolInvocation for UsageTool {
+    fn start_header(&self) -> HeaderFuture {
+        HeaderFuture::Ready(HeaderResult::plain(USAGE_TOOL_NAME.into()))
+    }
+
+    fn execute<'a>(self: Box<Self>, ctx: &'a ToolContext) -> ExecFuture<'a> {
+        Box::pin(async move {
+            if let Some(sink) = &ctx.live_sink {
+                let _ = sink.send(ToolLive::Usage(USAGE_VALUE.into()));
+            }
+            ToolExecResult::from(Ok::<_, String>(ToolOutput::Plain(USAGE_OUTPUT.into())))
+        })
+    }
+}
+
+impl Tool for UsageTool {
+    fn name(&self) -> &str {
+        USAGE_TOOL_NAME
+    }
+
+    fn description(&self, _ctx: &DescriptionContext) -> Cow<'_, str> {
+        "emits usage".into()
+    }
+
+    fn schema(&self) -> Value {
+        json!({"type": "object", "properties": {}, "additionalProperties": false})
+    }
+
+    fn parse(&self, _input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
+        Ok(Box::new(UsageTool))
+    }
+}
 
 fn fresh_registry() -> Arc<ToolRegistry> {
     Arc::new(ToolRegistry::new())
@@ -366,7 +414,7 @@ fn restore_snapshot_text(
 ) -> String {
     let host = PluginHost::new(fresh_registry()).unwrap();
     host.load_source("restore_plugin", src).unwrap();
-    let handle = host.event_handle().expect("event handle available");
+    let handle = host.event_handle();
     let (tx, rx) = flume::unbounded();
 
     handle.request_restore(
@@ -1185,7 +1233,7 @@ fn click_until_finished(
     tool: &str,
     click_id: &'static str,
 ) -> String {
-    let eh = host.event_handle().expect("event handle available");
+    let eh = host.event_handle();
     let entry = reg.get(tool).expect("tool registered");
     let inv = entry.tool.parse(&serde_json::json!({})).expect("parse");
     let worker = std::thread::spawn(move || {
@@ -1405,7 +1453,7 @@ fn warm_click_reaches_finished_tool(is_error: bool) {
     let body = recv_live_buf(&rx, WARM_ID).expect("live buf published");
 
     let (fb_tx, fb_rx) = flume::unbounded();
-    let eh = host.event_handle().expect("event handle available");
+    let eh = host.event_handle();
     eh.request_click_with_fallback(
         WARM_ID.to_owned(),
         0,
@@ -1430,7 +1478,7 @@ fn click_fallback_restores_when_warm_missing() {
     let (_reg, host) = warm_host(false, true);
     let (tx, rx) = flume::unbounded();
 
-    let eh = host.event_handle().expect("event handle available");
+    let eh = host.event_handle();
     eh.request_click_with_fallback(
         GONE_ID.to_owned(),
         0,
@@ -1457,7 +1505,7 @@ fn click_fallback_restores_when_warm_buf_has_no_handler() {
     recv_live_buf(&rx, WARM_ID).expect("live buf published");
 
     let (fb_tx, fb_rx) = flume::unbounded();
-    let eh = host.event_handle().expect("event handle available");
+    let eh = host.event_handle();
     eh.request_click_with_fallback(
         WARM_ID.to_owned(),
         0,
@@ -1485,7 +1533,7 @@ fn restore_evicts_warm_handle() {
     let body = recv_live_buf(&rx, WARM_ID).expect("live buf published");
 
     let (tx, _rx) = flume::unbounded();
-    let eh = host.event_handle().expect("event handle available");
+    let eh = host.event_handle();
     eh.request_restore(
         warm_restore_item(WARM_ID, Vec::new()),
         maki_agent::EventSender::new(tx, 0),
@@ -1514,7 +1562,7 @@ fn warm_fifo_evicts_oldest_runtime_side() {
         bufs.push(recv_live_buf(&rx, &id).expect("live buf published"));
     }
 
-    let eh = host.event_handle().expect("event handle available");
+    let eh = host.event_handle();
     eh.request_click("t1".to_owned(), 0);
     eh.request_click("t0".to_owned(), 0);
     barrier(&host);
@@ -1542,7 +1590,7 @@ fn warm_map_cleared_by_load_source() {
     let body = recv_live_buf(&rx, WARM_ID).expect("live buf published");
 
     barrier(&host);
-    let eh = host.event_handle().expect("event handle available");
+    let eh = host.event_handle();
     eh.request_click(WARM_ID.to_owned(), 0);
     barrier(&host);
 
@@ -1582,7 +1630,7 @@ fn warm_click_runs_async_jobs() {
     exec_warm_tool(&reg, "warm_async", &ctx).expect("tool output");
     let body = recv_live_buf(&rx, WARM_ID).expect("live buf published");
 
-    let eh = host.event_handle().expect("event handle available");
+    let eh = host.event_handle();
     eh.request_click(WARM_ID.to_owned(), 0);
     barrier(&host);
 
@@ -1603,18 +1651,25 @@ fn warm_click_survives_post_completion_cancel() {
     let body = recv_live_buf(&rx, WARM_ID).expect("live buf published");
     trigger.cancel();
 
-    let eh = host.event_handle().expect("event handle available");
+    let eh = host.event_handle();
     eh.request_click(WARM_ID.to_owned(), 0);
     barrier(&host);
 
     assert_eq!(body.read()[0].spans[0].text, WARM_CLICK_LINE);
 }
 
-/// `maki.agent.call_tool` returns `(text, err)` and delivers live bufs and
-/// annotations (live and completion alike) through the callbacks.
+/// `maki.agent.call_tool` returns `(text, err)` and delivers live bufs,
+/// annotations (live and completion alike) and usage through the callbacks.
 #[test]
 fn call_tool_streams_live_buf_and_annotations() {
     let reg = fresh_registry();
+    reg.register(
+        Arc::new(UsageTool),
+        ToolSource::Lua {
+            plugin: Arc::from("usage_fixture"),
+        },
+    )
+    .unwrap();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let src = format!(
         r#"
@@ -1667,12 +1722,17 @@ maki.api.register_tool({{
             end,
             on_annotation = function(a) ann2 = a end,
         }})
+        local usage = "nil"
+        local text3 = maki.agent.call_tool(ctx, "{USAGE_TOOL_NAME}", {{}}, {{
+            on_usage = function(value) usage = value end,
+        }})
         local ann3 = "nil"
         local _, err3 = maki.agent.call_tool(ctx, "failing_child", {{}}, {{
             on_annotation = function(a) ann3 = a end,
         }})
         return tostring(text) .. "/" .. ann
             .. " " .. tostring(text2) .. "/" .. live_text .. "/" .. ann2
+            .. " " .. tostring(text3) .. "/" .. usage
             .. " " .. tostring(err3) .. "/" .. ann3
     end
 }})
@@ -1688,7 +1748,10 @@ maki.api.register_tool({{
     .expect("driver ok");
     assert_eq!(
         out,
-        "child_done/5 items stream_done/streamed line/1 lines boom/nil"
+        format!(
+            "child_done/5 items stream_done/streamed line/1 lines \
+             {USAGE_OUTPUT}/{USAGE_VALUE} boom/nil"
+        )
     );
 }
 
@@ -2188,7 +2251,7 @@ fn register_command_happy_path() {
         maki.api.register_command({
             name = "/hello",
             description = "says hello",
-            handler = function(args) end,
+            handler = function(opts) end,
         })
         "#,
     )
@@ -2202,6 +2265,53 @@ fn register_command_happy_path() {
     assert_eq!(snap.commands[0].plugin.as_ref(), "cmd_plugin");
 }
 
+#[test_case::test_case("" => 0 ; "default_zero")]
+#[test_case::test_case("nargs = 0," => 0 ; "zero")]
+#[test_case::test_case("nargs = 1," => 1 ; "one")]
+#[test_case::test_case(r#"nargs = "?","# => 1 ; "zero_or_one")]
+#[test_case::test_case(r#"nargs = "*","# => usize::MAX ; "any")]
+#[test_case::test_case(r#"nargs = "+","# => usize::MAX ; "one_or_more")]
+fn register_command_nargs_values(nargs_field: &str) -> usize {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source(
+        "cmd_nargs",
+        &format!(
+            r#"maki.api.register_command({{ name = "/test", {nargs_field} handler = function() end }})"#
+        ),
+    )
+    .unwrap();
+
+    host.command_reader().load().commands[0].max_args
+}
+
+#[test_case::test_case("a  b c", "a  b c|a,b,c" ; "raw_text_and_split_list")]
+#[test_case::test_case("", "|" ; "empty_args")]
+fn command_handler_receives_args_and_fargs(args: &str, expected_flash: &str) {
+    let host = PluginHost::new(fresh_registry()).unwrap();
+    host.load_source(
+        "p",
+        r#"
+        maki.api.register_command({
+            name = "/echo",
+            nargs = "*",
+            handler = function(opts)
+                maki.ui.flash(opts.args .. "|" .. table.concat(opts.fargs, ","))
+            end,
+        })
+        "#,
+    )
+    .unwrap();
+    let rx = host.ui_action_rx();
+    host.event_handle()
+        .run_command(Arc::from("p"), Arc::from("/echo"), args.into());
+
+    let action = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("command handler did not run");
+    assert!(matches!(action, maki_lua::UiAction::Flash(msg) if msg == expected_flash));
+}
+
 #[test_case::test_case(
     r#"maki.api.register_command({ name = "", handler = function() end })"#,
     "non-empty" ; "empty_name"
@@ -2209,6 +2319,18 @@ fn register_command_happy_path() {
 #[test_case::test_case(
     r#"maki.api.register_command({ name = "/test", description = "no handler" })"#,
     "handler" ; "missing_handler"
+)]
+#[test_case::test_case(
+    r#"maki.api.register_command({ name = "/test", nargs = -1, handler = function() end })"#,
+    NARGS_ERR ; "negative_nargs"
+)]
+#[test_case::test_case(
+    r#"maki.api.register_command({ name = "/test", nargs = 2, handler = function() end })"#,
+    NARGS_ERR ; "nargs_two"
+)]
+#[test_case::test_case(
+    r#"maki.api.register_command({ name = "/test", nargs = "!", handler = function() end })"#,
+    NARGS_ERR ; "unknown_string_nargs"
 )]
 fn register_command_validation_rejects(src: &str, expected_err: &str) {
     let reg = fresh_registry();
@@ -2343,7 +2465,7 @@ fn restore_tool_async_ordering_and_delivery() {
 
     let input = serde_json::json!({"command": "echo ok", "timeout": 1});
 
-    let handle = host.event_handle().expect("event handle available");
+    let handle = host.event_handle();
     let (tx, rx) = flume::unbounded();
     let event_tx = maki_agent::EventSender::new(tx, 0);
 
@@ -2421,7 +2543,7 @@ fn restore_rebuilds_body_from_input_content(
     expected: &[&str],
 ) {
     let (_reg, host) = builtins_host();
-    let handle = host.event_handle().expect("event handle available");
+    let handle = host.event_handle();
     let (tx, rx) = flume::unbounded();
 
     handle.request_restore(
@@ -3340,8 +3462,8 @@ fn async_run_from_parked_command_handler_runs_promptly() {
         "#,
     )
     .unwrap();
-    let rx = host.ui_action_rx().unwrap();
-    let handle = host.event_handle().unwrap();
+    let rx = host.ui_action_rx();
+    let handle = host.event_handle();
     handle.run_command(Arc::from("p"), Arc::from("/park"), String::new());
 
     let action = rx
@@ -3371,8 +3493,8 @@ fn job_callbacks_fire_while_command_handler_parked() {
         "#,
     )
     .unwrap();
-    let rx = host.ui_action_rx().unwrap();
-    let handle = host.event_handle().unwrap();
+    let rx = host.ui_action_rx();
+    let handle = host.event_handle();
     handle.run_command(Arc::from("p"), Arc::from("/stream"), String::new());
 
     let action = rx

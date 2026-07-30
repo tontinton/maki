@@ -8,6 +8,10 @@
 //! two lock-free `ArcSwap`s: a `ToolIndex` for tool calls and an `McpSnapshot` for the UI.
 //! This way a slow tool call never blocks a toggle and vice versa.
 //!
+//! Servers connect inside `run`, not in `start`, so a slow `initialize` never delays the
+//! caller's first frame. Whoever needs the tools waits on `McpHandle::ready`. Connects
+//! land alongside commands, so one slow server holds up neither a fast one nor a shutdown.
+//!
 //! `McpSnapshotReader` is a read-only handle. Outside code physically cannot publish a
 //! snapshot, so the "only `run` publishes" invariant is enforced by the type system.
 
@@ -20,6 +24,7 @@ pub mod stdio;
 pub mod transport;
 
 use std::collections::{HashMap, HashSet};
+use std::convert::Infallible;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -37,6 +42,7 @@ use self::error::McpError;
 use self::http::HttpTransport;
 use self::stdio::StdioTransport;
 use self::transport::McpTransport;
+use crate::tools::schema::sanitize_tool_input_schema;
 
 const SEPARATOR: &str = ".";
 const WIRE_SEPARATOR: &str = "__";
@@ -282,6 +288,9 @@ pub struct McpHandle {
     /// Never changes after startup, so it lives here instead of being
     /// copied into every republished `ToolIndex`.
     defer_tools: usize,
+    /// Nothing is ever sent on it. `run` drops the sender once the first
+    /// connect pass has published, and that disconnect is the signal.
+    ready_rx: flume::Receiver<Infallible>,
 }
 
 /// One session's view of MCP: the shared handle plus the deferred tools
@@ -475,6 +484,13 @@ impl McpHandle {
         }
     }
 
+    /// Resolves once every enabled server has connected or failed. Await it
+    /// before building a request's tool list, or an early prompt ships without
+    /// the MCP tools.
+    pub async fn ready(&self) {
+        let _ = self.ready_rx.recv_async().await;
+    }
+
     pub fn reader(&self) -> McpSnapshotReader {
         McpSnapshotReader(Arc::clone(&self.snapshot))
     }
@@ -542,37 +558,140 @@ impl McpHandle {
     }
 }
 
+/// Returns as soon as the config is read, so nothing with a screen waits on a
+/// slow `initialize`. Await `McpHandle::ready` before touching the tool index.
 pub async fn start(cwd: &Path) -> (Option<McpHandle>, McpConfigErrors) {
     tracing::info!(cwd = %cwd.display(), "starting MCP");
     let cwd = cwd.to_owned();
     let (config, config_errors) = smol::unblock(move || load_config(&cwd)).await;
-    let handle = start_with_config(config).await;
+    (start_with_config(config), config_errors)
+}
+
+/// `start` for callers with no frame to protect, who want the tools up front.
+pub async fn start_connected(cwd: &Path) -> (Option<McpHandle>, McpConfigErrors) {
+    let (handle, config_errors) = start(cwd).await;
+    if let Some(handle) = &handle {
+        handle.ready().await;
+    }
     (handle, config_errors)
 }
 
-pub async fn start_with_config(config: McpConfig) -> Option<McpHandle> {
+pub fn start_with_config(config: McpConfig) -> Option<McpHandle> {
     if config.is_empty() {
         tracing::info!("no MCP servers configured, skipping");
         return None;
     }
 
     let defer_tools = config.defer_tools.unwrap_or(DEFAULT_DEFER_TOOLS);
-    let mut inner = parse_entries(config);
-    start_enabled(&mut inner).await;
-    inner.generation += 1;
+    let inner = parse_entries(config);
 
     let snapshot = Arc::new(ArcSwap::from_pointee(McpSnapshot::default()));
     let index: Arc<ArcSwap<ToolIndex>> = Arc::new(ArcSwap::from_pointee(ToolIndex::default()));
     publish(&inner, &index, &snapshot);
 
     let (cmd_tx, cmd_rx) = flume::unbounded();
+    let (ready_tx, ready_rx) = flume::bounded(0);
     let handle = McpHandle {
         cmd_tx,
         index: Arc::clone(&index),
         snapshot: Arc::clone(&snapshot),
         defer_tools,
+        ready_rx,
     };
 
+    info!(total = inner.entries.len(), "MCP servers connecting");
+
+    smol::spawn(run(inner, index, snapshot, cmd_rx, ready_tx)).detach();
+    Some(handle)
+}
+
+/// Connect results ride the same loop as commands, so a `Shutdown` arriving
+/// mid-connect never waits for a slow `initialize`.
+enum Step {
+    Connected(usize, Result<StartResult, McpError>),
+    Command(McpCommand),
+    /// Every handle is gone.
+    Closed,
+}
+
+async fn run(
+    mut inner: McpManagerInner,
+    index: Arc<ArcSwap<ToolIndex>>,
+    snapshot: Arc<ArcSwap<McpSnapshot>>,
+    cmd_rx: flume::Receiver<McpCommand>,
+    ready_tx: flume::Sender<Infallible>,
+) {
+    let (connected_tx, connected_rx) = flume::unbounded();
+    // Held, not detached: dropping a pending connect drops the transport it
+    // owns, which kills the child process group it just spawned.
+    let connects = spawn_connects(&inner, connected_tx);
+    let mut ready = Some(ready_tx);
+
+    let mut ack: Option<flume::Sender<()>> = None;
+    loop {
+        release_ready(&inner, &mut ready);
+        let step = futures_lite::future::or(
+            async {
+                match connected_rx.recv_async().await {
+                    Ok((i, result)) => Step::Connected(i, result),
+                    // Every connect landed, so only commands wake us now.
+                    Err(_) => futures_lite::future::pending().await,
+                }
+            },
+            async {
+                match cmd_rx.recv_async().await {
+                    Ok(cmd) => Step::Command(cmd),
+                    Err(_) => Step::Closed,
+                }
+            },
+        )
+        .await;
+
+        match step {
+            Step::Connected(i, result) => {
+                // A toggle or reconnect that ran mid-connect owns the entry
+                // now, so a late result must not resurrect it. Dropping it
+                // kills the transport it carries.
+                if inner.entries[i].status == McpServerStatus::Connecting {
+                    let _ = apply_start_result(&mut inner.entries[i], result, "start");
+                }
+            }
+            Step::Command(McpCommand::Toggle { server, enabled }) => {
+                handle_toggle(&mut inner, &server, enabled).await;
+            }
+            Step::Command(McpCommand::Reconnect { server }) => {
+                handle_reconnect(&mut inner, &server).await;
+            }
+            Step::Command(McpCommand::Shutdown { ack: tx }) => {
+                ack = Some(tx);
+                break;
+            }
+            Step::Closed => break,
+        }
+        inner.generation += 1;
+        publish(&inner, &index, &snapshot);
+    }
+    drop(connects);
+    shutdown_all(&mut inner).await;
+    inner.generation += 1;
+    publish(&inner, &index, &snapshot);
+    if let Some(tx) = ack {
+        let _ = tx.try_send(());
+    }
+}
+
+/// Nothing left in `Connecting` means every server landed and the last publish
+/// already carried its tools, so waiters can go.
+fn release_ready(inner: &McpManagerInner, ready: &mut Option<flume::Sender<Infallible>>) {
+    if ready.is_none()
+        || inner
+            .entries
+            .iter()
+            .any(|e| e.status == McpServerStatus::Connecting)
+    {
+        return;
+    }
+    drop(ready.take());
     info!(
         running = inner
             .entries
@@ -582,40 +701,6 @@ pub async fn start_with_config(config: McpConfig) -> Option<McpHandle> {
         total = inner.entries.len(),
         "MCP servers initialized"
     );
-
-    smol::spawn(run(inner, index, snapshot, cmd_rx)).detach();
-    Some(handle)
-}
-
-async fn run(
-    mut inner: McpManagerInner,
-    index: Arc<ArcSwap<ToolIndex>>,
-    snapshot: Arc<ArcSwap<McpSnapshot>>,
-    cmd_rx: flume::Receiver<McpCommand>,
-) {
-    let mut ack: Option<flume::Sender<()>> = None;
-    while let Ok(cmd) = cmd_rx.recv_async().await {
-        match cmd {
-            McpCommand::Toggle { server, enabled } => {
-                handle_toggle(&mut inner, &server, enabled).await;
-            }
-            McpCommand::Reconnect { server } => {
-                handle_reconnect(&mut inner, &server).await;
-            }
-            McpCommand::Shutdown { ack: tx } => {
-                ack = Some(tx);
-                break;
-            }
-        }
-        inner.generation += 1;
-        publish(&inner, &index, &snapshot);
-    }
-    shutdown_all(&mut inner).await;
-    inner.generation += 1;
-    publish(&inner, &index, &snapshot);
-    if let Some(tx) = ack {
-        let _ = tx.try_send(());
-    }
 }
 
 async fn handle_toggle(inner: &mut McpManagerInner, server_name: &str, enabled: bool) {
@@ -810,20 +895,25 @@ fn parse_entries(config: McpConfig) -> McpManagerInner {
     }
 }
 
-async fn start_enabled(inner: &mut McpManagerInner) {
-    let tasks: Vec<_> = inner
+/// One task per enabled server, each reporting back as it lands, so `run`
+/// publishes a fast server's tools without waiting for the slowest.
+fn spawn_connects(
+    inner: &McpManagerInner,
+    tx: flume::Sender<(usize, Result<StartResult, McpError>)>,
+) -> Vec<smol::Task<()>> {
+    inner
         .entries
         .iter()
         .enumerate()
         .filter(|(_, e)| e.status == McpServerStatus::Connecting)
         .filter_map(|(i, e)| e.config.clone().map(|c| (i, c)))
-        .map(|(i, cfg)| smol::spawn(async move { (i, start_server(&cfg).await) }))
-        .collect();
-
-    for task in tasks {
-        let (i, result) = task.await;
-        let _ = apply_start_result(&mut inner.entries[i], result, "start");
-    }
+        .map(|(i, config)| {
+            let tx = tx.clone();
+            smol::spawn(async move {
+                let _ = tx.send_async((i, start_server(&config).await)).await;
+            })
+        })
+        .collect()
 }
 
 fn apply_start_result(
@@ -873,13 +963,14 @@ fn publish(inner: &McpManagerInner, index: &ArcSwap<ToolIndex>, snapshot: &ArcSw
                         transport: Arc::clone(transport),
                     },
                 );
+                let sanitized_schema = sanitize_tool_input_schema(t.input_schema.clone());
                 descriptors.push(ToolDescriptor {
                     qualified_name: Arc::clone(&t.qualified_name),
                     always_load,
                     definition: json!({
                         "name": wire_tool_name(&t.qualified_name),
                         "description": t.description,
-                        "input_schema": t.input_schema,
+                        "input_schema": sanitized_schema,
                     }),
                 });
             }
@@ -958,6 +1049,7 @@ pub(crate) fn stub_session(tools: &[(&str, &str)]) -> McpSession {
             index,
             snapshot,
             defer_tools: 0,
+            ready_rx: flume::bounded(0).1,
         },
         &[],
     )
@@ -1116,9 +1208,12 @@ mod tests {
     use config::{RawServerConfig, RawStdioFields, RawTransport};
     use maki_providers::Role;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    #[cfg(unix)]
+    use std::time::Instant;
     use test_case::test_case;
 
     const DEFAULT_TIMEOUT_MS: u64 = 30_000;
+    const MISSING_PROGRAM: &str = "/nonexistent/definitely-not-here";
 
     fn stdio_raw(cmd: &[&str]) -> RawServerConfig {
         RawServerConfig {
@@ -1234,10 +1329,10 @@ mod tests {
     fn bad_stdio_config(name: &str) -> ServerConfig {
         ServerConfig {
             name: name.into(),
-            timeout: std::time::Duration::from_secs(1),
+            timeout: Duration::from_secs(1),
             always_load: false,
             transport: Transport::Stdio {
-                program: "/nonexistent/definitely-not-here".into(),
+                program: MISSING_PROGRAM.into(),
                 args: vec![],
                 environment: HashMap::new(),
             },
@@ -1266,6 +1361,7 @@ mod tests {
             index,
             snapshot,
             defer_tools,
+            ready_rx: flume::bounded(0).1,
         };
         (inner, McpSession::new(handle, &[]))
     }
@@ -1609,28 +1705,51 @@ mod tests {
         assert_eq!(tool_names(&tools_b), vec![TOOL_SEARCH_TOOL_NAME]);
     }
 
+    /// `ready` carries the correctness of connecting in the background: a prompt
+    /// typed during startup must not ship before the servers settle.
     #[test]
-    fn start_with_config_produces_terminal_statuses() {
+    fn ready_settles_every_server_status() {
         smol::block_on(async {
-            let handle = start_with_config(McpConfig::default()).await;
-            assert!(handle.is_none());
+            assert!(start_with_config(McpConfig::default()).is_none());
 
             let mut disabled = stdio_raw(&["unused-disabled-cmd"]);
             disabled.enabled = false;
             let config = make_config(vec![
                 ("disabled-srv", disabled),
-                ("bad-srv", stdio_raw(&[])),
+                ("unparseable-srv", stdio_raw(&[])),
+                ("unspawnable-srv", stdio_raw(&[MISSING_PROGRAM])),
             ]);
-            let handle = start_with_config(config).await;
-            let handle = handle.unwrap();
+            let handle = start_with_config(config).unwrap();
+            handle.ready().await;
+
             let infos = handle.reader().load().infos.clone();
+            let status = |name: &str| {
+                &infos
+                    .iter()
+                    .find(|i| i.name == name)
+                    .unwrap_or_else(|| panic!("{name} must be published"))
+                    .status
+            };
+            let failed = |name: &str| matches!(status(name), McpServerStatus::Failed(_));
+            assert!(failed("unparseable-srv"));
+            assert!(failed("unspawnable-srv"));
+            assert_eq!(*status("disabled-srv"), McpServerStatus::Disabled);
+        });
+    }
 
-            let bad = infos.iter().find(|i| i.name == "bad-srv").unwrap();
-            assert!(matches!(bad.status, McpServerStatus::Failed(_)));
-            assert_eq!(bad.tool_count, 0);
-
-            let disabled = infos.iter().find(|i| i.name == "disabled-srv").unwrap();
-            assert_eq!(disabled.status, McpServerStatus::Disabled);
+    /// `sleep` spawns fine and never answers `initialize`, so its connect only
+    /// ends on the request timeout, far past the shutdown one. Shutdown has to
+    /// preempt it, or quitting during startup hangs.
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_preempts_an_in_flight_connect() {
+        const BLOCKED: &str = "shutdown must not wait for an in-flight connect";
+        smol::block_on(async {
+            let config = make_config(vec![("slow-srv", stdio_raw(&["sleep", "60"]))]);
+            let handle = start_with_config(config).unwrap();
+            let started = Instant::now();
+            handle.shutdown().await;
+            assert!(started.elapsed() < MCP_SHUTDOWN_TIMEOUT, "{BLOCKED}");
         });
     }
 
@@ -1726,6 +1845,7 @@ mod tests {
                 Arc::clone(&index),
                 Arc::clone(&snapshot),
                 cmd_rx,
+                flume::bounded(0).0,
             ));
 
             let (ack_tx, ack_rx) = flume::bounded(1);

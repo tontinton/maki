@@ -16,6 +16,38 @@ local function eq(actual, expected, msg)
   end
 end
 
+-- Runs {fn} against a buf that records the rendered lines and replays clicks.
+local function with_mock_ui(fn)
+  local original = { buf = maki.ui.buf, markdown = maki.ui.markdown }
+  local lines, handlers = {}, {}
+  local buf = {
+    set_lines = function(_, new_lines)
+      lines = new_lines
+    end,
+    get_lines = function()
+      return lines
+    end,
+    on = function(_, event, handler)
+      handlers[event] = handler
+    end,
+    emit = function(_, event, ev)
+      handlers[event](ev)
+    end,
+  }
+  maki.ui.buf = function()
+    return buf
+  end
+  maki.ui.markdown = function(text, _width)
+    return { { { text, "" } } }
+  end
+  local ok, err = pcall(fn, buf)
+  maki.ui.buf = original.buf
+  maki.ui.markdown = original.markdown
+  if not ok then
+    error(err)
+  end
+end
+
 local MODE = QuestionForm.MODE
 
 local function single_question(overrides)
@@ -164,26 +196,28 @@ case("editing_custom_newline_shortcuts_insert_not_submit", function()
   eq(s.custom_input:value(), "a\nb", "backslash+enter inserts newline, consumes backslash")
 end)
 
-case("format_answer_list_renders_questions_answers_pipes_newlines_and_missing", function()
-  local questions = {
-    { question = "Has | pipe\nand newline" },
-    { question = "Q2" },
-  }
-  local out = QuestionHelpers.format_answer_list(questions, { { "a", "ans|with|pipes" } })
-  assert(out:find("**Q1.** Has | pipe\nand newline", 1, true), "Q1 header + verbatim pipes/newlines")
-  assert(out:find("**A1.**\n- a\n", 1, true), "A1 label before answer bullets")
-  assert(out:find("**Q2.** Q2", 1, true), "Q2 header present")
-  assert(out:find("**A2.**\n- (no answer)", 1, true), "A2 label before no-answer bullet")
-  assert(out:find("\n- ans|with|pipes", 1, true), "answer pipes preserved verbatim on bullet")
-end)
-
-case("format_answer_list_indents_multiline_answer_continuation", function()
-  local out = QuestionHelpers.format_answer_list({ { question = "Q" } }, { { "a\nb" } })
-  assert(out:find("**A1.**\n- a\n  b", 1, true), "A1 label before multi-line answer continuation")
-end)
-
-case("format_answer_list_with_no_questions_returns_empty_string", function()
-  eq(QuestionHelpers.format_answer_list({}, {}), "")
+-- The questions sit in the tool input right above the result, so the output
+-- labels the picks by header instead of echoing the question text back.
+case("format_answers_labels_picks_by_header", function()
+  for _, c in ipairs({
+    {
+      questions = {
+        { question = "Which breakfast items?", header = "Breakfast" },
+        { question = "Sweet or savory?", header = "Taste" },
+        { question = "Anything else?", header = "" },
+      },
+      answers = { { "Eggs", "Coffee" }, { "Savory" } },
+      want = "Breakfast: Eggs, Coffee\nTaste: Savory\nQ3: (no answer)",
+    },
+    {
+      questions = { { question = "Q", header = "" } },
+      answers = { { "a\nb" } },
+      want = "Q1: a\nb",
+    },
+    { questions = {}, answers = {}, want = "" },
+  }) do
+    eq(QuestionHelpers.format_answers(c.questions, c.answers), c.want)
+  end
 end)
 
 case("render_reserves_tab_bar_only_when_confirm_present", function()
@@ -194,7 +228,7 @@ end)
 local function line_width(line)
   local w = 0
   for _, span in ipairs(line) do
-    w = w + (utf8.len(span[1]) or #span[1])
+    w = w + maki.ui.display_width(span[1])
   end
   return w
 end
@@ -209,6 +243,37 @@ case("render_selecting_wraps_long_question_within_width", function()
   local long = string.rep("foo bar ", 20)
   local s = QuestionForm._initial_state(single_question({ question = long }))
   assert_all_within(QuestionForm._render(s, 40).lines, 40, "selecting")
+end)
+
+case("render_selecting_uses_radio_for_single_and_check_for_multiple", function()
+  local function line_text(line)
+    local parts = {}
+    for _, span in ipairs(line) do
+      parts[#parts + 1] = span[1]
+    end
+    return table.concat(parts)
+  end
+
+  local function contains(lines, text)
+    for _, line in ipairs(lines) do
+      if line_text(line):find(text, 1, true) then
+        return true
+      end
+    end
+    return false
+  end
+
+  local single = QuestionForm._initial_state(single_question())
+  press(single, "enter")
+  local single_lines = QuestionForm._render(single, 80).lines
+  assert(contains(single_lines, "(single answer)"), "single answer hint missing")
+  assert(contains(single_lines, "● Yes"), "single selected must use bullet")
+
+  local multi = QuestionForm._initial_state(single_question({ multiple = true }))
+  press(multi, "enter")
+  local multi_lines = QuestionForm._render(multi, 80).lines
+  assert(contains(multi_lines, "(multiple answers)"), "multiple answer hint missing")
+  assert(contains(multi_lines, "✓ Yes"), "multiple selected must use check")
 end)
 
 case("render_confirming_wraps_long_question_and_answer_within_width", function()
@@ -242,6 +307,72 @@ case("wrap_spans_hard_splits_oversize_word_on_valid_utf8_boundaries", function()
     end
     eq(rebuilt, c.word, c.word .. ": reassembled output must equal input")
   end
+end)
+
+case("truncate_text_returns_empty_head_when_narrower_than_glyph", function()
+  local t = maki.ui.truncate_text("你好", 1)
+  eq(t.head, "")
+  eq(t.tail, "你好")
+  local t2 = maki.ui.truncate_text("你a", 1)
+  eq(t2.head, "")
+  eq(t2.tail, "你a")
+end)
+
+case("truncate_text_zero_width_returns_empty", function()
+  local t = maki.ui.truncate_text("abc", 0)
+  eq(t.head, "")
+  eq(t.tail, "abc")
+  local empty = maki.ui.truncate_text("", 5)
+  eq(empty.head, "")
+  eq(empty.tail, "")
+end)
+
+case("wrap_spans_splits_cjk_and_ascii_mix_without_hang", function()
+  local cases = {
+    { text = "a你b", width = 2 },
+    { text = "你好世界", width = 4 },
+  }
+  for _, c in ipairs(cases) do
+    local lines = QuestionForm._wrap_spans({ { c.text, "" } }, c.width)
+    local rebuilt = ""
+    for _, line in ipairs(lines) do
+      assert(line_width(line) <= c.width, c.text .. ": line exceeds width")
+      for _, span in ipairs(line) do
+        assert(utf8.len(span[1]), c.text .. ": span is not valid utf8")
+        rebuilt = rebuilt .. span[1]
+      end
+    end
+    eq(rebuilt, c.text, c.text .. ": reassembled output must equal input")
+  end
+end)
+
+case("wrap_spans_wraps_mixed_cjk_ascii_with_spaces", function()
+  -- Spaces are consumed at line boundaries, so just verify no hang,
+  -- valid UTF-8, and that the original text appears in order.
+  local lines = QuestionForm._wrap_spans({ { "foo 你 bar", "" } }, 3)
+  local found = ""
+  for _, line in ipairs(lines) do
+    for _, span in ipairs(line) do
+      assert(utf8.len(span[1]), "span is not valid utf8")
+      found = found .. span[1]
+    end
+  end
+  -- Rebuild ignoring spaces; the space between words is the wrap point.
+  eq(found:gsub("%s", ""), "foo你bar")
+end)
+
+case("wrap_spans_force_takes_wide_char_when_one_cell_left", function()
+  -- A wide CJK glyph in a 1-cell column cannot fit, but the splitter must
+  -- still make progress and emit it rather than hanging on an empty head.
+  local lines = QuestionForm._wrap_spans({ { "你", "" } }, 1)
+  assert(#lines >= 1, "expected at least one line")
+  local rebuilt = ""
+  for _, line in ipairs(lines) do
+    for _, span in ipairs(line) do
+      rebuilt = rebuilt .. span[1]
+    end
+  end
+  eq(rebuilt, "你")
 end)
 
 local function find_span_with_text(lines, text)
@@ -551,6 +682,146 @@ case("open_requests_bottom_split", function()
   assert(ok, "open must not error: " .. tostring(err))
   assert(captured, "open_win must be called")
   eq(captured.split, "below", "form must request a bottom split")
+end)
+
+local function find_span_containing(lines, text)
+  for _, line in ipairs(lines) do
+    for _, span in ipairs(line) do
+      if span[1]:find(text, 1, true) then
+        return span
+      end
+    end
+  end
+end
+
+-- Line index of the first line holding {text}. It doubles as the click row,
+-- since the card never leaves a raw newline inside a span.
+local function find_row(lines, text)
+  for i, line in ipairs(lines) do
+    if find_span_containing({ line }, text) then
+      return i
+    end
+  end
+end
+
+local MULTILINE_CUSTOM = "first custom line\nsecond custom line"
+local EXPAND_DESC = "Expanded reasoning."
+local PICKED_STYLE = "success"
+local CARD_LINES = 100
+local TIGHT_LINES = 2
+local ONE_OVER_LINES = 3
+local EXPAND_NOTICE = "click to expand"
+
+local function card_opts(max_lines)
+  return { width = 80, max_lines = max_lines or CARD_LINES, keep = "head" }
+end
+
+local function two_option_question()
+  return { { question = "Pick one", options = { { label = "Yes" }, { label = "No" } } } }
+end
+
+-- Every row is permanent scrollback, so only what the user picked earns one.
+case("render_card_shows_only_the_picked_answers", function()
+  for _, c in ipairs({
+    { name = "picked option", answers = { { "Yes" } }, shown = "Yes", hidden = "No", style = PICKED_STYLE },
+    { name = "custom answer", answers = { { "typed by hand" } }, shown = "typed by hand", style = PICKED_STYLE },
+    { name = "skipped question", answers = { {} }, shown = "(no answer)", hidden = "Yes" },
+    { name = "dismissed form", answers = nil, shown = "Dismissed by user", hidden = "Yes" },
+  }) do
+    with_mock_ui(function(buf)
+      QuestionHelpers.render_card(two_option_question(), c.answers, card_opts())
+      local lines = buf.get_lines()
+      local span = find_span_containing(lines, c.shown)
+      assert(span, c.name .. ": " .. c.shown .. " must be present")
+      if c.style then
+        eq(span[2], c.style, c.name .. ": picked answers must stand out")
+      end
+      if c.hidden then
+        assert(not find_span_containing(lines, c.hidden), c.name .. ": " .. c.hidden .. " must not take a row")
+      end
+    end)
+  end
+end)
+
+case("render_card_click_toggles_the_option_description", function()
+  with_mock_ui(function(buf)
+    local questions = {
+      { question = "Pick one", options = { { label = "Yes", description = EXPAND_DESC } } },
+    }
+    QuestionHelpers.render_card(questions, { { "Yes" } }, card_opts())
+    assert(not find_span_containing(buf.get_lines(), EXPAND_DESC), "description must be hidden by default")
+    local row = find_row(buf.get_lines(), "Yes")
+    assert(row, "answer row must exist")
+    buf:emit("click", { row = row })
+    assert(find_span_containing(buf.get_lines(), EXPAND_DESC), "click must expand the description")
+    buf:emit("click", { row = row })
+    assert(not find_span_containing(buf.get_lines(), EXPAND_DESC), "second click must collapse it back")
+  end)
+end)
+
+case("render_card_splits_a_multiline_answer_into_one_row_each", function()
+  with_mock_ui(function(buf)
+    local questions = {
+      { question = "Question one", options = { { label = "Alpha" } } },
+      { question = "Question two", options = { { label = "Gamma", description = EXPAND_DESC } } },
+    }
+    QuestionHelpers.render_card(questions, { { "Alpha", MULTILINE_CUSTOM }, { "Gamma" } }, card_opts())
+    for _, line in ipairs(buf.get_lines()) do
+      for _, span in ipairs(line) do
+        assert(not span[1]:find("\n", 1, true), "a raw newline would shift every click row below it")
+      end
+    end
+    assert(find_span_containing(buf.get_lines(), "second custom line"), "every line of the answer must show")
+    local row = find_row(buf.get_lines(), "Gamma")
+    assert(row, "the answer below the multiline one must exist")
+    buf:emit("click", { row = row })
+    assert(find_span_containing(buf.get_lines(), EXPAND_DESC), "rows below a multiline answer stay clickable")
+  end)
+end)
+
+case("render_card_truncates_to_max_lines_and_the_notice_expands_it", function()
+  with_mock_ui(function(buf)
+    local questions = {
+      { question = "Question one", options = { { label = "Alpha" } } },
+      { question = "Question two", options = { { label = "Gamma" } } },
+    }
+    QuestionHelpers.render_card(questions, { { "Alpha" }, { "Gamma" } }, card_opts(TIGHT_LINES))
+    local collapsed = buf.get_lines()
+    eq(#collapsed, TIGHT_LINES + 1, "collapsed card keeps max_lines rows plus the notice")
+    assert(not find_span_containing(collapsed, "Question two"), "rows past the cap must be hidden")
+    buf:emit("click", { row = #collapsed })
+    assert(find_span_containing(buf.get_lines(), "Question two"), "clicking the notice must reveal the rest")
+  end)
+end)
+
+-- One row over the cap is drawn as itself rather than as a notice, so it stays
+-- the answer's own click target instead of silently toggling nothing.
+case("render_card_keeps_a_lone_hidden_row_clickable", function()
+  with_mock_ui(function(buf)
+    local questions = {
+      { question = "Pick one", options = { { label = "Gamma", description = EXPAND_DESC } } },
+    }
+    QuestionHelpers.render_card(questions, { { "Alpha", "Beta", "Gamma" } }, card_opts(ONE_OVER_LINES))
+    eq(#buf.get_lines(), ONE_OVER_LINES + 1, "the single hidden row takes the notice's place")
+    buf:emit("click", { row = ONE_OVER_LINES + 1 })
+    assert(find_span_containing(buf.get_lines(), EXPAND_NOTICE), "opening the description grew the card past the cap")
+    buf:emit("click", { row = #buf.get_lines() })
+    assert(find_span_containing(buf.get_lines(), EXPAND_DESC), "expanding the card shows the opened description")
+  end)
+end)
+
+case("view_opts_honors_a_generous_line_limit_and_floors_a_tight_one", function()
+  local function ctx(tool_output_lines)
+    return {
+      tool_output_lines = function()
+        return tool_output_lines
+      end,
+    }
+  end
+  local floor = QuestionHelpers.view_opts(ctx(nil)).max_lines
+  assert(type(floor) == "number" and floor > 1, "unset limit must fall back to a usable default")
+  eq(QuestionHelpers.view_opts(ctx({ other = floor + 5 })).max_lines, floor + 5, "a generous limit is honored")
+  eq(QuestionHelpers.view_opts(ctx({ other = 1 })).max_lines, floor, "a limit too tight for a card is floored")
 end)
 
 if #failures > 0 then

@@ -1,3 +1,5 @@
+use std::io;
+use std::process::Command;
 use std::time::Duration;
 
 use isahc::config::Configurable;
@@ -59,12 +61,37 @@ fn parse_tag(bytes: &[u8]) -> Result<String, VersionError> {
     Ok(tag.strip_prefix('v').unwrap_or(tag).to_owned())
 }
 
+/// Fallback for TLS-inspecting proxies (e.g. Cloudflare WARP): system `curl`
+/// trusts the OS certificate store, which our statically linked OpenSSL
+/// cannot read. Callers keep their original error when this also fails,
+/// since the TLS error is the useful one to show.
+pub fn curl_fetch(url: &str) -> io::Result<Vec<u8>> {
+    let max_time = CONNECT_TIMEOUT + REQUEST_TIMEOUT;
+    let out = Command::new("curl")
+        .args(["-fsSL", "-A", "maki", "--max-time"])
+        .arg(max_time.as_secs().to_string())
+        .arg(url)
+        .output()?;
+    if !out.status.success() {
+        return Err(io::Error::other(format!(
+            "curl failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(out.stdout)
+}
+
 pub fn fetch_latest() -> Result<String, VersionError> {
+    let bytes = fetch_bytes().or_else(|e| curl_fetch(RELEASES_URL).map_err(|_| e))?;
+    parse_tag(&bytes)
+}
+
+fn fetch_bytes() -> Result<Vec<u8>, VersionError> {
     let mut resp = client()?.send(request()?)?;
     if !resp.status().is_success() {
         return Err(VersionError::Status(resp.status().as_u16()));
     }
-    parse_tag(&resp.bytes()?)
+    Ok(resp.bytes()?)
 }
 
 pub async fn fetch_latest_async() -> Result<String, VersionError> {

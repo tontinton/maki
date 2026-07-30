@@ -53,6 +53,22 @@ impl App {
         }
     }
 
+    pub(super) fn handle_scroll(&mut self, column: u16, row: u16, delta: i32) {
+        let drag_zone = match self.selection_state {
+            Some(SelectionState::Dragging { ref sel, .. }) => Some(sel.zone),
+            _ => None,
+        };
+        match self.scroll_at(column, row, delta) {
+            Some(zone) if drag_zone == Some(zone) => {
+                let scroll = self.scroll_offset(zone);
+                if let Some(SelectionState::Dragging { sel, .. }) = &mut self.selection_state {
+                    sel.update(row, column, scroll);
+                }
+            }
+            _ => self.clear_selection_unless_pending_copy(),
+        }
+    }
+
     fn handle_drag(&mut self, row: u16, col: u16) {
         let (zone, area) = match self.selection_state {
             Some(SelectionState::Dragging {
