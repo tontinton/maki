@@ -3781,6 +3781,8 @@ mod read_tool_required_params {
             "offset beyond file should return empty, got: {out}"
         );
     }
+}
+
 /// List mode runs the program directly without shell interpretation.
 /// This preserves argument quoting (the core fix for #602).
 #[test]

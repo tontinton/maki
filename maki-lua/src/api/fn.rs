@@ -568,7 +568,7 @@ mod tests {
     fn dropping_the_store_kills_its_jobs() {
         let mut store = make_store();
         let id = store
-            .start("sleep 30", None, None, None, None, None)
+            .start(JobSpec::Shell("sleep 30".into()), None, None, None, None, None)
             .expect("job started");
         let pid = store.jobs[&id].pid;
         assert!(group_alive(pid), "job should be running before the drop");

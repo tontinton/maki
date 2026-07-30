@@ -2749,6 +2749,7 @@ pub fn spawn(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::r#fn::JobSpec;
     use crate::api::tool::ToolCallReply;
     use futures_lite::future::poll_once;
     use maki_agent::cancel::CancelTrigger;
@@ -3649,7 +3650,7 @@ mod tests {
             let scope = TaskScope::new(&lua, cell);
             lock_cell(scope.handle())
                 .jobs
-                .start(DISPATCH_TEST_JOB, None, None, None, None, None)
+                .start(JobSpec::Shell(DISPATCH_TEST_JOB.into()), None, None, None, None, None)
                 .unwrap();
             let (_finish_tx, finish_rx) = flume::bounded(1);
 
