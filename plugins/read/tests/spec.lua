@@ -35,7 +35,6 @@ local function split_lines(content)
   return lines
 end
 
-local dir_listing = require("maki.dir_listing")
 local th = require("maki.test_helpers")
 
 local case = th.case
@@ -119,41 +118,6 @@ case("split_lines", function()
       eq(lines[i], expected, "line " .. i .. " for " .. ("%q"):format(v[1]))
     end
   end
-end)
-
--- integration: directory listing via real filesystem
-
-case("dir_listing_sort_and_filter", function()
-  local tmpdir = mktmpdir()
-  maki.fs.write(maki.fs.joinpath(tmpdir, "c.txt"), "")
-  maki.fs.write(maki.fs.joinpath(tmpdir, "a.txt"), "")
-  maki.fs.write(maki.fs.joinpath(tmpdir, "AGENTS.md"), "instructions")
-  maki.fs.write(maki.fs.joinpath(tmpdir, "b.txt"), "")
-  maki.fs.write(maki.fs.joinpath(tmpdir, "m.txt"), "")
-  maki.fs.mkdir(maki.fs.joinpath(tmpdir, "zdir"))
-  maki.fs.mkdir(maki.fs.joinpath(tmpdir, "adir"))
-  maki.fs.mkdir(maki.fs.joinpath(tmpdir, "idir"))
-
-  local ctx = {
-    is_instruction_file = function(self, name)
-      local set = { ["AGENTS.md"] = true, ["CLAUDE.md"] = true, ["COPILOT.md"] = true }
-      return set[name] or false
-    end,
-    find_instructions = function()
-      return {}
-    end,
-  }
-  local listing, err = dir_listing.list(tmpdir, ctx)
-  assert(err == nil, "dir listing should succeed: " .. tostring(err))
-  eq(#listing.names, 7)
-  eq(listing.names[1], "adir/")
-  eq(listing.names[2], "idir/")
-  eq(listing.names[3], "zdir/")
-  eq(listing.names[4], "a.txt")
-  eq(listing.names[5], "b.txt")
-  eq(listing.names[6], "c.txt")
-  eq(listing.names[7], "m.txt")
-  rmtree(tmpdir)
 end)
 
 th.report()

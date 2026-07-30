@@ -7,7 +7,7 @@ group = "Reference"
 
 # Tools
 
-Maki ships with 20 built-in tools in this reference (18 on by default, 2 opt-in via plugin options). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
+Maki ships with 21 built-in tools in this reference (19 on by default, 2 opt-in via plugin options). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
 
 ## File Operations
 
@@ -23,15 +23,23 @@ Commands run in <cwd> by default.
 | `timeout` | integer | no | 120 | Timeout in seconds |
 | `workdir` | string | no | cwd | Working directory |
 
+### `list` *(lua plugin)*
+
+List directory contents. Returns entry names sorted alphabetically, directories first with a trailing /.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `path` | string | yes | Absolute path to the directory |
+
 ### `read` *(lua plugin)*
 
-Read a file or directory. Returns contents with line numbers (1-indexed).
+Read a file. Returns contents with line numbers (1-indexed).
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `limit` | integer | yes | Max number of lines to read. Use 0 to read until end of file (capped at 2000 lines). |
 | `offset` | integer | yes | Line number to start from (1-indexed). Use 1 for the first line. |
-| `path` | string | yes | Absolute path to the file or directory |
+| `path` | string | yes | Absolute path to the file |
 
 ### `write` *(lua plugin)*
 

@@ -325,7 +325,7 @@ fn index_dir_renders_identically_live_and_restored() {
     assert_eq!(
         live.annotation.as_deref(),
         Some(expected_annotation.as_str()),
-        "live dir listing is annotated like read's"
+        "live dir listing is annotated with entry count"
     );
     for name in DIR_ENTRIES {
         assert!(

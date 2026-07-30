@@ -1,9 +1,8 @@
-local dir_listing = require("maki.dir_listing")
 local ToolView = require("maki.tool_view")
 local shorten_path = require("maki.shorten_path")
 local output_limits = require("maki.output_limits")
 
-local DESCRIPTION = [[Read a file or directory. Returns contents with line numbers (1-indexed).
+local DESCRIPTION = [[Read a file. Returns contents with line numbers (1-indexed).
 
 - Supports absolute, relative, and ~/ paths.
 - **offset** and **limit** are required. Use offset=1 to read from the first line.
@@ -174,23 +173,6 @@ local function read_file(path, offset, limit, ctx)
   }
 end
 
-local function list_dir(path, ctx)
-  local listing, err = dir_listing.list(path, ctx)
-  if not listing then
-    return { llm_output = "read error: " .. tostring(err), is_error = true }
-  end
-
-  local result = {
-    llm_output = listing.text,
-    body = dir_listing.view(listing.text, ctx),
-    annotation = listing.count .. " entries",
-  }
-  if listing.instructions then
-    result.instructions = listing.instructions
-  end
-  return result
-end
-
 maki.api.register_prompt_hint({
   slot = "tool_usage",
   content = [[
@@ -208,7 +190,7 @@ maki.api.register_tool({
     properties = {
       path = {
         type = "string",
-        description = "Absolute path to the file or directory",
+        description = "Absolute path to the file",
         required = true,
         alias = "file_path",
       },
@@ -271,7 +253,7 @@ maki.api.register_tool({
       return { llm_output = "error: path not found: " .. path, is_error = true }
     end
     if meta.is_dir then
-      return list_dir(path, ctx)
+      return { llm_output = "error: path is a directory, use the list tool instead", is_error = true }
     end
     return read_file(path, input.offset, input.limit, ctx)
   end,

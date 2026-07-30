@@ -103,6 +103,10 @@ static BUNDLED_PLUGINS: &[BundledPlugin] = &[
         name: "lib",
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/lib"),
     },
+    BundledPlugin {
+        name: "list",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/list"),
+    },
 ];
 
 pub(crate) fn lib_dir() -> &'static Dir<'static> {

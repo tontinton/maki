@@ -1,4 +1,4 @@
--- Shared directory listing for index and read plugins.
+-- Shared directory listing for index and list plugins.
 -- Lists entries, filters instruction files, sorts dirs before files, and
 -- renders the listing so every caller shows a directory the same way.
 
