@@ -59,11 +59,18 @@ One option lives at the top level of `mcp.toml`, outside any server:
 
 ## Tool search
 
-Every tool definition a server exposes costs context window space, on every request. Big servers like GitHub's ship dozens of tools when a task often needs three.
+Every tool definition a server exposes costs context window space, on every request. Take Datadog's MCP server: with all toolsets on it ships over 100 tools, when a task often needs three.
 
 So Maki, like Claude Code, defers MCP tools by default. The model sees one small `tool_search` tool that lists the deferred names, searches when it actually needs something, and the matches stay loaded for the rest of the session. Resume a session and the tools it was using come back. Subagents keep their own loads, so their searches don't bloat your main conversation.
 
-You don't configure anything for this. Add servers, and only the tools the model actually uses take up context.
+You don't configure anything for this. Add the server as usual:
+
+```toml
+[mcp.datadog]
+url = "https://mcp.datadoghq.com/api/unstable/mcp-server/mcp?toolsets=all"
+```
+
+Ask about an incident, and the model searches for something like `datadog logs`, gets back the few matching tools, and the other hundred definitions never enter the conversation.
 
 With 10 or fewer tools across all your servers there is no search step: at that size, searching costs more than it saves, so everything loads upfront. The top-level `defer_tools` key moves that line:
 

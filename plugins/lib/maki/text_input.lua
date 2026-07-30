@@ -368,6 +368,7 @@ local KEYMAP = {
   ["alt+f"] = "move_word_right",
   ["ctrl+a"] = "move_home",
   ["backspace"] = "remove_char",
+  ["shift+backspace"] = "remove_char",
   ["delete"] = "delete_char",
   ["ctrl+w"] = "remove_word_before",
   ["ctrl+backspace"] = "remove_word_before",

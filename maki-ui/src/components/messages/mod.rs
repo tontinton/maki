@@ -24,7 +24,7 @@ use crate::splash::{ColorTransition, Splash};
 use crate::theme;
 use maki_config::{ToolOutputLines, UiConfig};
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -40,6 +40,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
+use tracing::warn;
 
 const THINKING_HIDDEN_HEADER: &str = "thinking> ...";
 
@@ -76,7 +77,7 @@ pub struct MessagesPanel {
     /// warm cache.
     watched_bufs: VecDeque<(String, Arc<SharedBuf>)>,
     tool_output_lines: ToolOutputLines,
-    lua_event_handle: Option<EventHandle>,
+    lua_event_handle: EventHandle,
     restore_event_tx: Option<EventSender>,
     show_thinking: bool,
     thinking_collapsed: bool,
@@ -87,7 +88,7 @@ pub struct MessagesPanel {
 }
 
 impl MessagesPanel {
-    pub fn new(ui_config: UiConfig) -> Self {
+    pub fn new(ui_config: UiConfig, lua_event_handle: EventHandle) -> Self {
         let thinking = thinking_style();
         let assistant = assistant_style();
         let ms = ui_config.typewriter_ms_per_char;
@@ -122,7 +123,7 @@ impl MessagesPanel {
             live_bufs: HashMap::new(),
             watched_bufs: VecDeque::new(),
             tool_output_lines: ui_config.tool_output_lines,
-            lua_event_handle: None,
+            lua_event_handle,
             restore_event_tx: None,
             show_thinking: ui_config.show_thinking,
             thinking_collapsed: !ui_config.show_thinking,
@@ -131,12 +132,7 @@ impl MessagesPanel {
         }
     }
 
-    pub fn set_restore_channel(
-        &mut self,
-        event_handle: Option<EventHandle>,
-        event_tx: Option<EventSender>,
-    ) {
-        self.lua_event_handle = event_handle;
+    pub fn set_restore_channel(&mut self, event_tx: Option<EventSender>) {
         self.restore_event_tx = event_tx;
     }
 
@@ -235,7 +231,7 @@ impl MessagesPanel {
     }
 
     pub fn tool_done(&mut self, event: ToolDoneEvent) {
-        self.retire_live_buf(&event.id);
+        let had_live_buf = self.retire_live_buf(&event.id);
         let Some(msg) = self
             .messages
             .iter_mut()
@@ -264,6 +260,16 @@ impl MessagesPanel {
             ToolOutput::Plain(text) | ToolOutput::Markdown(text) | ToolOutput::ReadDir(text)
                 if msg.render_snapshot.is_none() =>
             {
+                if had_live_buf {
+                    // The plugin streamed a body buf but no snapshot ever
+                    // landed: this is the raw llm_output glitch users report.
+                    warn!(
+                        tool_id = %event.id,
+                        tool = %event.tool,
+                        is_error = event.is_error,
+                        "live buf had no snapshot at tool_done; falling back to llm_output"
+                    );
+                }
                 let tr = truncate_output(&text.text, self.tool_output_lines.get(&event.tool));
                 msg.truncated_lines = tr.skipped;
                 if !tr.kept.is_empty() {
@@ -306,20 +312,22 @@ impl MessagesPanel {
         self.store_snapshot(tool_id, snapshot, true, theme_gen);
     }
 
+    /// A subagent stamps its own cumulative usage on the task header, and that
+    /// header is usually the last tool of the turn, so an existing stamp wins.
     pub fn set_turn_usage_on_last_tool(&mut self, usage: String) {
-        let Some(idx) = self
-            .messages
-            .iter()
-            .rposition(|m| matches!(m.role, DisplayRole::Tool(_)))
-        else {
-            return;
-        };
-        self.messages[idx].turn_usage = Some(usage);
-        let DisplayRole::Tool(t) = &self.messages[idx].role else {
-            unreachable!()
-        };
-        let id = t.id.clone();
-        self.rebuild_tool_segment(&id);
+        let last_tool = self.messages.iter().rev().find_map(|msg| match &msg.role {
+            DisplayRole::Tool(tool) => Some((tool.id.clone(), msg.turn_usage.is_none())),
+            _ => None,
+        });
+        if let Some((id, unstamped)) = last_tool
+            && unstamped
+        {
+            self.set_tool_turn_usage(&id, usage);
+        }
+    }
+
+    pub fn set_tool_turn_usage(&mut self, tool_id: &str, usage: String) {
+        self.update_tool(tool_id, |msg| msg.turn_usage = Some(usage));
     }
 
     fn upsert_instruction_segment(
@@ -368,12 +376,17 @@ impl MessagesPanel {
     }
 
     pub fn fail_in_progress_with_message(&mut self, message: String) {
+        self.fail_in_progress_except(message, &HashSet::new());
+    }
+
+    pub fn fail_in_progress_except(&mut self, message: String, excluded: &HashSet<String>) {
         let ids: Vec<(String, Arc<str>)> = self
             .messages
             .iter()
             .filter_map(|m| {
                 if let DisplayRole::Tool(t) = &m.role
                     && t.status == ToolStatus::InProgress
+                    && !excluded.contains(&t.id)
                 {
                     Some((t.id.clone(), Arc::clone(&t.name)))
                 } else {
@@ -493,6 +506,14 @@ impl MessagesPanel {
         self.streaming_thinking.is_empty()
     }
 
+    #[cfg(test)]
+    pub fn tool_turn_usage(&self, tool_id: &str) -> Option<&str> {
+        self.messages.iter().rev().find_map(|msg| match &msg.role {
+            DisplayRole::Tool(tool) if tool.id == tool_id => msg.turn_usage.as_deref(),
+            _ => None,
+        })
+    }
+
     pub fn set_prompt_progress(&mut self, progress: Option<PromptProgress>) {
         self.prompt_progress = progress;
     }
@@ -582,9 +603,8 @@ impl MessagesPanel {
             let rel = u16::try_from(doc_row - seg_start).unwrap_or(u16::MAX);
             let buf_row = seg.source_line_at(rel, width).map_or(0, |l| seg.buf_row(l));
             if self.tool_in_progress(tool_id) {
-                if let Some(eh) = &self.lua_event_handle {
-                    eh.request_click(tool_id.to_owned(), buf_row);
-                }
+                self.lua_event_handle
+                    .request_click(tool_id.to_owned(), buf_row);
                 return true;
             }
             // Recorded even when the warm path serves the click: theme
@@ -597,11 +617,10 @@ impl MessagesPanel {
                 item.clicks = self.lua_clicks[tool_id].clone();
                 item
             });
-            let (Some(eh), Some(tx)) =
-                (self.lua_event_handle.clone(), self.restore_event_tx.clone())
-            else {
+            let Some(tx) = self.restore_event_tx.clone() else {
                 return true;
             };
+            let eh = &self.lua_event_handle;
             // Watching the buf means a runtime-side warm click would be
             // visible here, so try the fast path; the fallback item lets
             // the runtime degrade to restore+replay if its cache is cold.
@@ -889,9 +908,10 @@ impl MessagesPanel {
     /// Moves a finished tool's live buf to the watched set, flushing any
     /// last dirty lines. Called on completion and on cancellation, so
     /// `live_bufs` never leaks entries that keep `is_animating` true.
-    fn retire_live_buf(&mut self, id: &str) {
+    /// Returns whether a live buf existed for this id.
+    fn retire_live_buf(&mut self, id: &str) -> bool {
         let Some(buf) = self.live_bufs.remove(id) else {
-            return;
+            return false;
         };
         if let Some(lines) = buf.read_if_dirty() {
             self.store_snapshot(id, BufferSnapshot::from_arc(lines), false, None);
@@ -900,6 +920,7 @@ impl MessagesPanel {
         if self.watched_bufs.len() > WARM_TOOL_CAP {
             self.watched_bufs.pop_front();
         }
+        true
     }
 
     fn has_snapshot(&self, tool_id: &str) -> bool {
@@ -920,10 +941,10 @@ impl MessagesPanel {
     /// Re-restores every snapshot still painted with old-theme colors.
     /// Replies carry a generation so stale ones can't overwrite fresher colors.
     fn rebake_stale_snapshots(&mut self, current_gen: u64) {
-        let (Some(eh), Some(tx)) = (self.lua_event_handle.clone(), self.restore_event_tx.clone())
-        else {
+        let Some(tx) = self.restore_event_tx.clone() else {
             return;
         };
+        let eh = &self.lua_event_handle;
         self.rebake_requested.retain(|_, g| *g >= current_gen);
         let tol = self.tool_output_lines;
         let mut requested = Vec::new();
@@ -1000,6 +1021,11 @@ impl MessagesPanel {
             }
             msg.snapshot_theme_gen = applied_gen;
             self.rebuild_tool_segment(tool_id);
+        } else {
+            warn!(
+                tool_id,
+                is_header, "snapshot dropped: no tool message with this id"
+            );
         }
     }
 

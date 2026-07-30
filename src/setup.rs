@@ -3,6 +3,7 @@ use std::sync::Mutex;
 use color_eyre::Result;
 use color_eyre::eyre::Context;
 
+use maki_providers::manifest::ManifestRegistry;
 use maki_providers::model::{Model, ModelTier};
 use maki_storage::StateDir;
 use maki_storage::log::RotatingFileWriter;
@@ -54,6 +55,29 @@ fn auto_detect_model() -> Option<Model> {
         }
     }
     None
+}
+
+/// Built-in slugs keep their compiled protocol, model catalog and auth wiring,
+/// so a `providers.toml` entry setting those fields is only partly honored
+/// (#597). Call this after `init_logging`, otherwise the warning has no
+/// subscriber to reach.
+pub fn warn_ignored_provider_fields() {
+    for (slug, def) in &maki_config::providers::ProvidersConfig::load().providers {
+        if ManifestRegistry::get(slug).is_none() {
+            continue;
+        }
+        let ignored = maki_config::providers::ignored_builtin_fields(slug, def);
+        if ignored.is_empty() {
+            continue;
+        }
+        tracing::warn!(
+            slug,
+            fields = %ignored.join(", "),
+            "providers.toml entry for built-in provider ignores these fields \
+             (base_url/plan/api_key still apply), use a custom slug to set \
+             protocol or models"
+        );
+    }
 }
 
 pub fn install_panic_log_hook() {

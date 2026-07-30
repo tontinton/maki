@@ -253,7 +253,19 @@ browsing memory files or toggling settings.
   - `name` (`string`) Required. The command name (e.g. "/hello"; a leading
     slash is added when missing).
   - `description` (`string`) Optional. Short description shown in the command palette.
-  - `handler` (`function`) Required. Called when the user runs the command.
+  - `nargs` (`integer|string`) Optional. How many arguments the command
+    takes, spelled like nvim's nargs: 0 (default),
+    1, "?" (zero or one), "*" (any number), or "+"
+    (one or more). An argument is a whitespace
+    separated word. Type more than allowed and the
+    command quietly stops matching: the input goes
+    to the model as a normal message. Only the upper
+    bound is checked, so with "+" you still need to
+    handle an empty `opts.args` yourself.
+  - `handler` (`function`) Required. Called when the user runs the command,
+    with one opts table: `opts.args` is the raw
+    argument string (whitespace kept, may be empty)
+    and `opts.fargs` is the same split into words.
 
 **Example:**
 
@@ -733,8 +745,8 @@ maki.agent.call_tool({ctx}, {name}, {input}, {opts?})
 Run a tool by name and wait for the result. This is how you call built-in
 tools (like `read`, `bash`, `glob`) from Lua without going through the LLM.
 
-Live events (streaming output, annotations) are delivered through optional
-callbacks while the tool runs.
+Live events (streaming output, annotations, cumulative usage) are delivered
+through optional callbacks while the tool runs.
 
 **Parameters:**
 
@@ -747,6 +759,8 @@ callbacks while the tool runs.
     the tool publishes. Must not yield.
   - `on_annotation` (`function?`) called with an annotation string for each
     annotation event. Must not yield.
+  - `on_usage` (`function?`) called with a formatted cumulative token usage
+    string. Must not yield.
 
 **Returns:** (`string?`, `string?`) Tool output text, or `(nil, err)` on failure.
 
@@ -1041,6 +1055,38 @@ local sem = maki.async.semaphore(5)
 local permit = sem:acquire()
 do_work()
 permit:release()
+```
+
+---
+
+### `maki.async.on_cancel()` {#maki-async-on_cancel}
+
+```lua
+maki.async.on_cancel({fn})
+```
+
+Register {fn} to run as soon as the current task is cancelled, without
+waiting for whatever it is doing to finish. Use it to paint the
+cancelled state: a handler waiting on children (`gather`, `call_tool`)
+stays parked until they wind down, so anything after the wait is too
+late to reach the screen.
+
+The callback runs outside your coroutine, so it must not yield. It
+fires at most once, immediately if the task is already cancelled. An
+error inside it is logged and never reaches your handler, and the
+other hooks still run.
+
+**Parameters:**
+
+- `{fn}` (`function`) Zero-argument function to run on cancel.
+
+**Example:**
+
+```lua
+maki.async.on_cancel(function()
+  view:append({ { "cancelled", "tool_error" } })
+end)
+maki.async.gather(children)
 ```
 
 
@@ -1438,7 +1484,9 @@ maki.fs.metadata({path})
 ```
 
 Get metadata for the file or directory at {path}.
-Returns a table with `size` (integer), `is_file` (boolean), and `is_dir` (boolean).
+Returns a table with `size` (integer), `is_file` (boolean), `is_dir` (boolean),
+and `mtime` (number, fractional seconds since the Unix epoch; absent when the
+filesystem does not report a modification time).
 If {path} does not exist, returns nil with no error.
 
 **Parameters:**
@@ -1723,14 +1771,18 @@ if err then print("write failed: " .. err) end
 ### `maki.fs.rm()` {#maki-fs-rm}
 
 ```lua
-maki.fs.rm({path})
+maki.fs.rm({path}, {opts?})
 ```
 
-Delete the file at {path}. Does not remove directories.
+Delete the file, symlink, or directory at {path}.
+Pass `recursive = true` to remove a non-empty directory tree (like `rm -r`).
+Unlike `vim.fs.rm`, this also removes an empty directory without `recursive`.
+Symlinks are removed themselves, never followed.
 
 **Parameters:**
 
-- `{path}` (`string`) Path to the file to remove.
+- `{path}` (`string`) Path to the file or directory to remove.
+- `{opts?}` (`table?`) `recursive` (boolean, default false): remove a directory and its contents recursively. `force` (boolean, default false): silently ignore a missing path.
 
 **Returns:** (`true?`, `string?`) `true` on success, or nil plus an error message.
 
@@ -1739,6 +1791,7 @@ Delete the file at {path}. Does not remove directories.
 ```lua
 local ok, err = maki.fs.rm("temp.txt")
 if err then print("rm failed: " .. err) end
+maki.fs.rm("stale_dir", { recursive = true, force = true })
 ```
 
 ---
@@ -3909,6 +3962,53 @@ local half_width = math.floor(size.cols / 2)
 
 ---
 
+### `maki.ui.display_width()` {#maki-ui-display_width}
+
+```lua
+maki.ui.display_width({text})
+```
+
+Returns the display width of a string in terminal cells, matching
+how `ratatui` measures text.
+
+**Parameters:**
+
+- `{text}` (`string`) The text to measure.
+
+**Returns:** (`integer`) Number of display cells the text occupies.
+
+**Example:**
+
+```lua
+local w = maki.ui.display_width("hello")
+```
+
+---
+
+### `maki.ui.truncate_text()` {#maki-ui-truncate_text}
+
+```lua
+maki.ui.truncate_text({text}, {max_width})
+```
+
+Splits a string at a display-cell boundary.
+
+**Parameters:**
+
+- `{text}` (`string`) The text to split.
+- `{max_width}` (`integer`) Maximum display cells for the head.
+
+**Returns:** (`table`) `{head = string, tail = string}`.
+
+**Example:**
+
+```lua
+local t = maki.ui.truncate_text("hello world", 5)
+-- t.head == "hello", t.tail == " world"
+```
+
+---
+
 ### `maki.ui.flash()` {#maki-ui-flash}
 
 ```lua
@@ -4789,6 +4889,12 @@ function ToolView:append_text(text)
 -- Append {content} with line numbers, then syntax-highlight it for {ext}
 -- asynchronously. Returns false when {content} is empty.
 function ToolView:set_highlight(content, ext)
+
+-- Content rows on screen, for callers with their own per-row click targets. A
+-- single hidden line is drawn as itself instead of a notice, so it counts as
+-- content too. Rows line up with `all_lines` under keep = "head"; keep = "tail"
+-- prints its notice first and shifts them.
+function ToolView:visible_count()
 function ToolView:toggle()
 function ToolView:flush()
 function ToolView:update_line(all_idx, line)
@@ -4800,6 +4906,11 @@ function ToolView.restore_lines(lines, opts)
 -- Rebuild a collapsed view from a tool's saved llm_output, click-to-toggle
 -- wired. For `restore` hooks.
 function ToolView.restore(output, opts)
+
+-- Same, for tools whose live output goes through markdown (`format =
+-- "markdown"`); {opts.width} is the wrap width. Errors stay plain, as they do
+-- live.
+function ToolView.restore_markdown(output, is_error, opts)
 ```
 
 ### `require("maki.truncate")`

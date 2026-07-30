@@ -119,6 +119,16 @@ fn write_theme_section(out: &mut String) {
         .collect::<Vec<_>>()
         .join(", ");
     writeln!(out, "Available themes: {names}.\n").unwrap();
+    writeln!(
+        out,
+        "Themes use 24-bit colors, but not every terminal can show them. Maki \
+         checks the environment, terminfo, and the terminal itself, and when \
+         truecolor is missing it quietly falls back to the closest of the 256 \
+         classic terminal colors. If detection gets it wrong, set \
+         `MAKI_TRUECOLOR=1` to force truecolor or `MAKI_TRUECOLOR=0` to force \
+         the fallback.\n"
+    )
+    .unwrap();
 }
 
 fn write_tool_output_section(out: &mut String) {

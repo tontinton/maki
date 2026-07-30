@@ -82,18 +82,7 @@ local function mktmpdir()
 end
 
 local function rmtree(dir)
-  local entries = maki.fs.dir(dir)
-  if entries then
-    for _, e in ipairs(entries) do
-      local p = maki.fs.joinpath(dir, e[1])
-      if e[2] == "directory" then
-        rmtree(p)
-      else
-        maki.fs.rm(p)
-      end
-    end
-  end
-  maki.fs.rm(dir)
+  maki.fs.rm(dir, { recursive = true })
 end
 
 -- line_nr_fmt: table-driven across all boundaries + alignment

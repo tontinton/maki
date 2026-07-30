@@ -7,7 +7,7 @@ use maki_lua_macro::{lua_class, lua_fn, lua_table};
 use mlua::{Function, Lua, MultiValue, Result as LuaResult, Table, Value};
 
 use crate::docs::{FnDoc, ParamDoc};
-use crate::runtime::{TaskHandle, enqueue_async_task, lock_cell};
+use crate::runtime::{TaskHandle, enqueue_async_task, lock_cell, register_cancel_hook};
 
 const AWAIT_MIN_ARGS: usize = 2;
 const PERMIT_RELEASED_ERR: &str = "permit already released";
@@ -114,6 +114,28 @@ fn run(lua: &Lua, r#fn: Function, on_finish: Option<Function>) -> LuaResult<()> 
     let work_key = lua.create_registry_value(actual_work)?;
     enqueue_async_task(lua, work_key)?;
     Ok(())
+}
+
+/// Register {fn} to run as soon as the current task is cancelled, without
+/// waiting for whatever it is doing to finish. Use it to paint the
+/// cancelled state: a handler waiting on children (`gather`, `call_tool`)
+/// stays parked until they wind down, so anything after the wait is too
+/// late to reach the screen.
+///
+/// The callback runs outside your coroutine, so it must not yield. It
+/// fires at most once, immediately if the task is already cancelled. An
+/// error inside it is logged and never reaches your handler, and the
+/// other hooks still run.
+///
+/// @param fn function Zero-argument function to run on cancel.
+/// @example
+/// maki.async.on_cancel(function()
+///   view:append({ { "cancelled", "tool_error" } })
+/// end)
+/// maki.async.gather(children)
+#[lua_fn]
+fn on_cancel(lua: &Lua, r#fn: Function) -> LuaResult<()> {
+    register_cancel_hook(lua, r#fn)
 }
 
 /// Run all functions in {fns} at the same time and collect their results.
@@ -271,7 +293,7 @@ lua_table! {
     /// })
     /// ```
     extend "maki.async" => pub(crate) fn add_async_fns(), DOCS [
-        run, manual r#await, manual wrap, manual join, gather, semaphore,
+        run, manual r#await, manual wrap, manual join, gather, semaphore, on_cancel,
     ]
 }
 
@@ -376,12 +398,13 @@ mod tests {
     use std::pin::pin;
     use std::sync::Mutex;
 
-    use futures_lite::future::poll_once;
+    use futures_lite::future::{or, poll_once};
+    use maki_agent::cancel::CancelTrigger;
     use mlua::Lua;
     use test_case::test_case;
 
     use super::*;
-    use crate::runtime::{CANCELLED_MSG, TaskCell};
+    use crate::runtime::{CANCELLED_MSG, TaskCell, TaskScope, block_on_or_fail};
 
     const ERR_TOO_FEW_ARGS: &str = "maki.async.await requires at least 2 arguments: argc, fun, ...";
     const ERR_ARGC_GE_1: &str = "argc must be >= 1";
@@ -681,5 +704,135 @@ mod tests {
                 "expected error containing {CANCELLED_MSG:?}, got: {msg}"
             );
         });
+    }
+
+    const HOOK_NEVER_FIRED: &str = "cancel hook never fired";
+    const PARKED_CHILD: &str = r#"
+        function()
+            return async_tbl.await(1, function(cb) parked_cb = cb end)
+        end
+    "#;
+    const RELEASE_PARKED_CHILD: &str = r#"parked_cb("done")"#;
+    const CHILD_VALUE: &str = "done";
+    const HOOK_RAW_YIELD: &str = "coroutine.yield()";
+    const HOOK_AWAIT: &str = "async_tbl.await(1, function() end)";
+    const HOOK_LATE_MSG: &str = "the hook must fire while the wait is still parked, not after it";
+    const HOOK_SURVIVED_MSG: &str = "a hook that waits from outside its coroutine must fail there";
+    const TASK_SURVIVED_MSG: &str = "the task must keep working after a hook blew up";
+
+    fn install_notify(lua: &Lua) -> flume::Receiver<()> {
+        let (fired_tx, fired_rx) = flume::bounded(1);
+        let notify = lua
+            .create_function(move |_, ()| {
+                fired_tx.send(()).ok();
+                Ok(())
+            })
+            .unwrap();
+        lua.globals().set("notify", notify).unwrap();
+        fired_rx
+    }
+
+    fn live_scope(lua: &Lua) -> (CancelTrigger, TaskScope) {
+        let (trigger, token) = CancelToken::new();
+        (
+            trigger,
+            TaskScope::new(lua, TaskCell::new(token, None, None)),
+        )
+    }
+
+    /// The composition `plugins/batch` leans on, and the one thing the
+    /// runtime's own hook tests cannot show: the handler is parked deep inside
+    /// a real `gather` whose child never finishes, so the hook runs on a VM
+    /// whose coroutine is suspended. Waiting from there is a plugin bug, raw
+    /// or through `maki.async`, and neither may cost the hooks behind it nor
+    /// the task's own result.
+    #[test_case(HOOK_RAW_YIELD ; "raw_yield")]
+    #[test_case(HOOK_AWAIT ; "awaiting")]
+    fn on_cancel_hook_fires_while_gather_is_still_parked(bad_hook_body: &str) {
+        let (lua, _tbl) = setup();
+        let (trigger, scope) = live_scope(&lua);
+        let fired_rx = install_notify(&lua);
+
+        let code = format!(
+            r#"
+            gather_returned = false
+            bad_hook_finished = false
+            async_tbl.on_cancel(function()
+                {bad_hook_body}
+                bad_hook_finished = true
+            end)
+            async_tbl.on_cancel(notify)
+            local r = async_tbl.gather({{ {PARKED_CHILD} }})
+            gather_returned = true
+            return r[1].ok, r[1].value
+            "#
+        );
+
+        let vals: Vec<Value> = block_on_or_fail(or(
+            scope.scope_future(lua.load(&code).eval_async::<MultiValue>()),
+            async {
+                trigger.cancel();
+                fired_rx.recv_async().await.expect(HOOK_NEVER_FIRED);
+                assert!(
+                    !lua.globals().get::<bool>("gather_returned").unwrap(),
+                    "{HOOK_LATE_MSG}"
+                );
+                assert!(
+                    !lua.globals().get::<bool>("bad_hook_finished").unwrap(),
+                    "{HOOK_SURVIVED_MSG}"
+                );
+                lua.load(RELEASE_PARKED_CHILD).exec().unwrap();
+                std::future::pending().await
+            },
+        ))
+        .unwrap()
+        .into_vec();
+
+        assert!(vals[0].as_boolean().unwrap(), "gather child must succeed");
+        assert_eq!(
+            vals[1].as_string().unwrap().to_string_lossy(),
+            CHILD_VALUE,
+            "{TASK_SURVIVED_MSG}"
+        );
+    }
+
+    /// A handler queued on a full semaphore waits on an `Event` that knows
+    /// nothing about the token, so the hook is the only cleanup that can run
+    /// before the acquire gives up. The Lua-side flag pins the order: the hook
+    /// ran while the acquire was still parked.
+    #[test]
+    fn on_cancel_hook_fires_while_a_semaphore_acquire_is_still_parked() {
+        let (lua, _tbl) = setup();
+        let (trigger, scope) = live_scope(&lua);
+
+        let code = r#"
+            hook_fired = false
+            local sem = async_tbl.semaphore(1)
+            held_permit = sem:acquire()
+            async_tbl.on_cancel(function() hook_fired = true end)
+            local ok, err = pcall(function() return sem:acquire() end)
+            return hook_fired, ok, tostring(err)
+        "#;
+
+        let vals: Vec<Value> = block_on_or_fail(or(
+            scope.scope_future(lua.load(code).eval_async::<MultiValue>()),
+            async {
+                trigger.cancel();
+                std::future::pending().await
+            },
+        ))
+        .unwrap()
+        .into_vec();
+
+        assert!(vals[0].as_boolean().unwrap(), "{HOOK_LATE_MSG}");
+        assert!(
+            !vals[1].as_boolean().unwrap(),
+            "a cancelled acquire must not hand out a permit"
+        );
+        let err = vals[2].as_string().unwrap().to_string_lossy();
+        assert!(
+            err.contains(CANCELLED_MSG),
+            "expected error containing {CANCELLED_MSG:?}, got: {err}"
+        );
     }
 }

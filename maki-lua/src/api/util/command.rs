@@ -12,6 +12,7 @@ pub struct LuaCommandInfo {
     pub name: Arc<str>,
     pub description: Arc<str>,
     pub plugin: Arc<str>,
+    pub max_args: usize,
 }
 
 #[derive(Clone, Default)]
@@ -118,6 +119,7 @@ impl HintWriter {
 pub(crate) struct CommandEntry {
     pub handler: RegistryKey,
     pub description: Arc<str>,
+    pub max_args: usize,
 }
 
 pub(crate) type CommandHandlerMap = HashMap<Arc<str>, HashMap<Arc<str>, CommandEntry>>;
@@ -130,6 +132,7 @@ pub(crate) fn publish_command_snapshot(map: &CommandHandlerMap, writer: &LuaComm
                 name: Arc::clone(name),
                 description: Arc::clone(&entry.description),
                 plugin: Arc::clone(plugin),
+                max_args: entry.max_args,
             })
         })
         .collect();
@@ -431,6 +434,7 @@ mod tests {
         CommandEntry {
             handler: key,
             description: Arc::from(desc),
+            max_args: 0,
         }
     }
 

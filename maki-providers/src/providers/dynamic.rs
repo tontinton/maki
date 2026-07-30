@@ -3,12 +3,13 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, UNIX_EPOCH};
 
 use flume::Sender;
 use maki_config::providers::ProvidersConfig;
+use maki_storage::StateDir;
 use maki_storage::id::SessionRef;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use strum::IntoEnumIterator;
 use tracing::{debug, warn};
@@ -35,6 +36,7 @@ use super::zai::Zai;
 const INFO_TIMEOUT: Duration = Duration::from_secs(5);
 const SCRIPT_TIMEOUT: Duration = Duration::from_secs(30);
 const PROVIDERS_DIR: &str = "providers";
+const SCRIPT_CACHE_FILE: &str = "provider-scripts.json";
 
 struct DynamicProviderMeta {
     slug: String,
@@ -219,6 +221,123 @@ fn resolve_auth(meta: &DynamicProviderMeta) -> Result<ResolvedAuth, AgentError> 
     Ok(parsed.into())
 }
 
+/// `info` and `models` describe the script, not the world, so their output only
+/// changes when the script does. Caching them keeps two process spawns per
+/// provider off every startup.
+#[derive(Serialize, Deserialize, PartialEq, Eq, Clone)]
+struct ScriptDescription {
+    modified_ns: u128,
+    size: u64,
+    info: String,
+    /// `None` when the script has no `models` subcommand, or its run failed.
+    models: Option<String>,
+}
+
+type ScriptCache = HashMap<String, ScriptDescription>;
+
+fn cache_path() -> Option<PathBuf> {
+    Some(StateDir::resolve().ok()?.path().join(SCRIPT_CACHE_FILE))
+}
+
+fn read_cache() -> ScriptCache {
+    cache_path()
+        .and_then(|p| std::fs::read(p).ok())
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+fn script_stamp(path: &Path) -> Option<(u128, u64)> {
+    let meta = path.metadata().ok()?;
+    let modified = meta.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
+    Some((modified.as_nanos(), meta.len()))
+}
+
+/// Reuses `cached` for as long as the file stays untouched. A failing `info`
+/// is fatal for the provider, while `models` is optional and a failure there
+/// is cached as `None`. A script we cannot stat gets a zero stamp, which never
+/// matches, so it is described again on every run.
+fn describe_script(
+    slug: &str,
+    path: &Path,
+    cached: Option<&ScriptDescription>,
+) -> Option<ScriptDescription> {
+    let stamp = script_stamp(path);
+    if let Some(hit) = cached
+        && stamp == Some((hit.modified_ns, hit.size))
+    {
+        return Some(hit.clone());
+    }
+
+    let info = match run_script(path, "info", INFO_TIMEOUT) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(slug, error = %e, "failed to get provider info, skipping");
+            return None;
+        }
+    };
+    let (modified_ns, size) = stamp.unwrap_or_default();
+    Some(ScriptDescription {
+        modified_ns,
+        size,
+        info,
+        models: run_script(path, "models", INFO_TIMEOUT).ok(),
+    })
+}
+
+/// Bad `models` output is survivable, the base provider's model list takes
+/// over. Anything else the script gets wrong drops it, with a line in the log.
+fn build_meta(
+    slug: String,
+    script_path: PathBuf,
+    described: &ScriptDescription,
+) -> Option<DynamicProviderMeta> {
+    let info: ScriptInfo = match serde_json::from_str(&described.info) {
+        Ok(i) => i,
+        Err(e) => {
+            warn!(slug, error = %e, "invalid info JSON, skipping");
+            return None;
+        }
+    };
+
+    let base = match ProviderKind::from_str(&info.base) {
+        Ok(k) => k,
+        Err(_) => {
+            warn!(slug, base = info.base, "unknown base provider, skipping");
+            return None;
+        }
+    };
+
+    let models = match &described.models {
+        Some(json) => serde_json::from_str(json).unwrap_or_else(|e| {
+            warn!(slug, error = %e, "invalid models JSON, falling back to base models");
+            Vec::new()
+        }),
+        None => Vec::new(),
+    };
+
+    Some(DynamicProviderMeta {
+        slug,
+        display_name: info.display_name,
+        base,
+        system_prefix: info.system_prefix.filter(|s| !s.is_empty()),
+        has_auth: info.has_auth,
+        script_path,
+        models,
+    })
+}
+
+fn write_cache(cache: &ScriptCache) {
+    let Some(path) = cache_path() else {
+        return;
+    };
+    let Ok(bytes) = serde_json::to_vec(cache) else {
+        return;
+    };
+    if let Err(e) = maki_storage::atomic_write(&path, &bytes) {
+        debug!(error = %e, "failed to write provider script cache");
+    }
+}
+
 fn discover_in(dir: &Path) -> Vec<DynamicProviderMeta> {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
@@ -226,6 +345,8 @@ fn discover_in(dir: &Path) -> Vec<DynamicProviderMeta> {
     };
 
     let builtins = builtin_slugs();
+    let cache = read_cache();
+    let mut next = ScriptCache::new();
     let mut result = Vec::new();
 
     for entry in entries.flatten() {
@@ -279,49 +400,18 @@ fn discover_in(dir: &Path) -> Vec<DynamicProviderMeta> {
             continue;
         }
 
-        let stdout = match run_script(&path, "info", INFO_TIMEOUT) {
-            Ok(s) => s,
-            Err(e) => {
-                warn!(slug, error = %e, "failed to get provider info, skipping");
-                continue;
-            }
+        let Some(described) = describe_script(&slug, &path, cache.get(&slug)) else {
+            continue;
         };
-
-        let info: ScriptInfo = match serde_json::from_str(&stdout) {
-            Ok(i) => i,
-            Err(e) => {
-                warn!(slug, error = %e, "invalid info JSON, skipping");
-                continue;
-            }
-        };
-
-        let base = match ProviderKind::from_str(&info.base) {
-            Ok(k) => k,
-            Err(_) => {
-                warn!(slug, base = info.base, "unknown base provider, skipping");
-                continue;
-            }
-        };
-
-        let models = match run_script(&path, "models", INFO_TIMEOUT) {
-            Ok(s) => serde_json::from_str::<Vec<ScriptModel>>(&s).unwrap_or_else(|e| {
-                warn!(slug, error = %e, "invalid models JSON, falling back to base models");
-                Vec::new()
-            }),
-            Err(_) => Vec::new(),
-        };
-
-        result.push(DynamicProviderMeta {
-            slug,
-            display_name: info.display_name,
-            base,
-            system_prefix: info.system_prefix.filter(|s| !s.is_empty()),
-            has_auth: info.has_auth,
-            script_path: path,
-            models,
-        });
+        result.extend(build_meta(slug.clone(), path, &described));
+        // Cached even when the description was rejected, so a script we refuse
+        // is not re-run on the next startup either.
+        next.insert(slug, described);
     }
 
+    if next != cache {
+        write_cache(&next);
+    }
     result
 }
 
@@ -561,6 +651,7 @@ impl Provider for DynamicProvider {
                     pricing: m.pricing.clone(),
                     supports_thinking: None,
                     supports_vision: m.supports_vision,
+                    tier: None,
                     provider_info: None,
                 })
                 .collect())

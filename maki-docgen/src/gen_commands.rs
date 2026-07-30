@@ -4,6 +4,10 @@ use maki_ui::BUILTIN_COMMANDS;
 
 use crate::lua_util;
 
+fn write_row(out: &mut String, name: &str, description: &str) {
+    writeln!(out, "| `{name}` | {} |", description.replace('|', "\\|")).unwrap();
+}
+
 pub fn generate() -> String {
     let mut out = String::new();
     writeln!(out, "+++").unwrap();
@@ -27,10 +31,10 @@ pub fn generate() -> String {
     writeln!(out, "| Command | Description |").unwrap();
     writeln!(out, "|---------|-------------|").unwrap();
     for cmd in BUILTIN_COMMANDS {
-        writeln!(out, "| `{}` | {} |", cmd.name, cmd.description).unwrap();
+        write_row(&mut out, cmd.name, cmd.description);
     }
     for cmd in &lua_util::load_builtin_plugin_commands() {
-        writeln!(out, "| `{}` | {} |", cmd.name, cmd.description).unwrap();
+        write_row(&mut out, &cmd.name, &cmd.description);
     }
 
     writeln!(out).unwrap();

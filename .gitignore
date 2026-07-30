@@ -4,3 +4,4 @@ runs.csv
 /.direnv/
 /site/_build/
 /site/.bin/
+/result

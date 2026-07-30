@@ -425,6 +425,7 @@
 
     /* ── CODE BLOCKS ── */
     pre {
+      position: relative;
       background: var(--code-block-bg) !important;
       color: var(--code-block-fg) !important;
       color-scheme: dark !important;
@@ -434,6 +435,28 @@
       margin-bottom: 1.5rem;
       border: 1px solid var(--code-block-border);
     }
+    .copy-btn {
+      position: absolute;
+      top: 0.5rem;
+      right: 0.5rem;
+      display: grid;
+      place-items: center;
+      width: 2rem;
+      height: 2rem;
+      padding: 0;
+      border: 1px solid oklch(40% 0.03 275 / 0.6);
+      border-radius: 6px;
+      background: oklch(25% 0.03 275 / 0.85);
+      color: oklch(72% 0.02 270);
+      cursor: pointer;
+      opacity: 0;
+      transition: 0.15s;
+    }
+    pre:hover .copy-btn, .copy-btn:focus-visible { opacity: 1; }
+    .copy-btn:hover { background: oklch(32% 0.03 275); color: oklch(90% 0.02 270); }
+    .copy-btn.copied { color: oklch(78% 0.14 150); opacity: 1; }
+    .copy-btn.copied svg:first-child, .copy-btn:not(.copied) svg:last-child { display: none; }
+    @media (hover: none) { .copy-btn { opacity: 0.7; } }
     pre code {
       background: none;
       border: none;
@@ -863,6 +886,25 @@
   overlay.addEventListener('click', () => {
     sidebar.classList.remove('open');
     overlay.classList.remove('open');
+  });
+
+  // copy buttons
+  document.querySelectorAll('main pre').forEach(pre => {
+    const code = pre.querySelector('code') || pre;
+    const btn = document.createElement('button');
+    btn.className = 'copy-btn';
+    btn.type = 'button';
+    btn.setAttribute('aria-label', 'Copy code');
+    btn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>'
+      + '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>';
+    let timer;
+    btn.addEventListener('click', async () => {
+      await navigator.clipboard.writeText(code.innerText.replace(/\n$/, ''));
+      btn.classList.add('copied');
+      clearTimeout(timer);
+      timer = setTimeout(() => btn.classList.remove('copied'), 1500);
+    });
+    pre.appendChild(btn);
   });
 
   const path = window.location.pathname.replace(/\/$/, '');

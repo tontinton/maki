@@ -56,7 +56,7 @@ fn restore(
     state: Option<Value>,
     clicks: Vec<usize>,
 ) -> Restored {
-    let handle = host.event_handle().unwrap();
+    let handle = host.event_handle();
     let (tx, rx) = flume::unbounded();
     handle.request_restore(
         maki_lua::RestoreItem {

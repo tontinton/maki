@@ -181,9 +181,10 @@ Persistent, project-scoped scratchpad for learnings, patterns, decisions, and go
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `command` | string | yes | Command: view, write, delete |
-| `content` | string | no | File content for 'write' |
-| `path` | string | no | Relative path (e.g. 'architecture.md'). Omit to list all. |
+| `command` | string | yes | - `list [tags]`: tag-grouped index, no bodies.<br>- `read path\|tags`: one body (path) or collated bodies (tags).<br>- `write path tags content`: create or overwrite a note.<br>- `delete path` |
+| `content` | string | no | Body for write (frontmatter added automatically). |
+| `path` | string | no | Relative path, e.g. 'architecture.md'. |
+| `tags` | array | no | snake_case tags. Filter for list/read; assigned on write (defaults to filename stem). |
 
 ### `skill` *(lua plugin)*
 

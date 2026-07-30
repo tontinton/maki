@@ -300,10 +300,13 @@ impl UserData for LuaCtx {
         });
 
         methods.add_method("check_before_edit", |_, this, path: String| {
-            let Some(tracker) = this.file_tracker() else {
+            let Some(agent) = this.agent() else {
                 return Ok(this.cap_err_pair("check_before_edit"));
             };
-            match tracker.check_before_edit(Path::new(&path)) {
+            if !agent.config.stale_read_check {
+                return Ok((LuaValue::Boolean(true), None));
+            }
+            match agent.file_tracker.check_before_edit(Path::new(&path)) {
                 Ok(()) => Ok((LuaValue::Boolean(true), None)),
                 Err(msg) => Ok((LuaValue::Boolean(false), Some(msg))),
             }

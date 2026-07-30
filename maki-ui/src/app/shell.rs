@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::process::Command as StdCommand;
 use std::time::{Duration, Instant};
 
@@ -72,12 +73,23 @@ pub(crate) struct ShellState {
     cancel_triggers: Vec<CancelTrigger>,
     pending_results: Vec<Message>,
     id_counter: u64,
+    active_ids: HashSet<String>,
 }
 
 impl ShellState {
-    pub fn next_id(&mut self) -> String {
+    pub fn reserve_id(&mut self) -> String {
         self.id_counter += 1;
-        format!("shell-{}", self.id_counter)
+        let id = format!("shell-{}", self.id_counter);
+        self.active_ids.insert(id.clone());
+        id
+    }
+
+    pub fn active_ids(&self) -> &HashSet<String> {
+        &self.active_ids
+    }
+
+    pub fn release_id(&mut self, id: &str) {
+        self.active_ids.remove(id);
     }
 
     pub fn add_trigger(&mut self, trigger: CancelTrigger) {
@@ -136,7 +148,7 @@ impl App {
                     None
                 };
                 self.main_chat().shell_tool_done(ToolDoneEvent {
-                    id,
+                    id: id.clone(),
                     tool: "bash".into(),
                     output: ToolOutput::Plain(output.into()),
                     is_error,
@@ -146,6 +158,7 @@ impl App {
                 if let Some(msg) = result_msg {
                     self.shell.push_result(msg);
                 }
+                self.shell.release_id(&id);
             }
         }
     }

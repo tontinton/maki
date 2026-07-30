@@ -15,6 +15,8 @@ use ratatui::widgets::{Clear, Paragraph};
 
 use crate::theme;
 
+const TICK_TIMEOUT_MS: u64 = 10;
+
 pub struct BuiltinCommand {
     pub name: &'static str,
     pub description: &'static str,
@@ -239,7 +241,7 @@ impl CommandPalette {
         for (i, cmd) in lua_commands.iter().enumerate() {
             let item = CommandItem {
                 name: cmd.name.to_string(),
-                max_args: 0,
+                max_args: cmd.max_args,
                 command_type: CommandType::Lua(i),
             };
             injector.push(item, |item, cols| {
@@ -330,14 +332,18 @@ impl CommandPalette {
             false,
         );
 
-        // Tick to get matches
         self.tick();
     }
 
     fn tick(&mut self) {
-        let status = self.nucleo.tick(100);
-        if status.changed {
-            self.refresh_matches();
+        loop {
+            let status = self.nucleo.tick(TICK_TIMEOUT_MS);
+            if status.changed {
+                self.refresh_matches();
+            }
+            if !status.running {
+                break;
+            }
         }
     }
 
@@ -418,7 +424,7 @@ impl CommandPalette {
             CommandType::Builtin(cmd) => cmd.max_args > 0,
             CommandType::Custom(i) => self.custom[*i].has_args(),
             CommandType::McpPrompt(i) => !self.mcp_prompts[*i].arguments.is_empty(),
-            CommandType::Lua(_) => false,
+            CommandType::Lua(i) => self.lua_commands[*i].max_args > 0,
         }
     }
 
@@ -682,7 +688,7 @@ mod tests {
     #[test_case("/cd  ~/foo", true  ; "one_arg_cmd_double_space")]
     #[test_case("/cd ~/foo ", false ; "one_arg_cmd_second_space")]
     #[test_case("/btw hello world", true ; "btw_stays_active_with_many_args")]
-    fn sync_respects_max_args(input: &str, expect_active: bool) {
+    fn sync_respects_nargs(input: &str, expect_active: bool) {
         let p = synced(input);
         assert_eq!(p.is_active(), expect_active);
     }
@@ -894,13 +900,49 @@ mod tests {
                 name: Arc::from("/memory"),
                 description: Arc::from("View memory files"),
                 plugin: Arc::from("memory"),
+                max_args: 0,
             },
             LuaCommandInfo {
                 name: Arc::from("/deploy"),
                 description: Arc::from("Deploy the project"),
                 plugin: Arc::from("deploy_plugin"),
+                max_args: 0,
             },
         ])
+    }
+
+    fn synced_with_nargs(input: &str, max_args: usize) -> CommandPalette {
+        let reader = LuaCommandReader::from_commands(vec![LuaCommandInfo {
+            name: Arc::from("/rename"),
+            description: Arc::from("Rename the current session"),
+            plugin: Arc::from("sessions"),
+            max_args,
+        }]);
+        let mut p = CommandPalette::new(Arc::from([]), empty_snapshot(), reader);
+        p.sync(input);
+        p
+    }
+
+    #[test_case("/rename", usize::MAX, true           ; "nargs_plus_no_args")]
+    #[test_case("/rename ", usize::MAX, true          ; "nargs_plus_trailing_space")]
+    #[test_case("/rename my title", usize::MAX, true  ; "nargs_plus_multi_word")]
+    #[test_case("/rename title", 1, true              ; "nargs_one_single_word")]
+    #[test_case("/rename my title", 1, false          ; "nargs_one_too_many")]
+    #[test_case("/rename", 0, true                    ; "nargs_zero_no_args")]
+    #[test_case("/rename title", 0, false             ; "nargs_zero_with_arg")]
+    fn lua_command_respects_nargs(input: &str, max_args: usize, expect_active: bool) {
+        assert_eq!(
+            synced_with_nargs(input, max_args).is_active(),
+            expect_active
+        );
+    }
+
+    #[test]
+    fn confirm_lua_command_keeps_multi_word_args() {
+        let input = "/rename my new title";
+        let cmd = synced_with_nargs(input, usize::MAX).confirm(input).unwrap();
+        assert_eq!(cmd.name, "/rename");
+        assert_eq!(cmd.args, "my new title");
     }
 
     fn synced_with_lua(input: &str) -> CommandPalette {
@@ -956,6 +998,7 @@ mod tests {
             name: Arc::from("/old"),
             description: Arc::from("old command"),
             plugin: Arc::from("p"),
+            max_args: 0,
         }]);
         let mut p = CommandPalette::new(Arc::from([]), empty_snapshot(), reader);
         p.sync("/");
@@ -971,11 +1014,13 @@ mod tests {
                 name: Arc::from("/new1"),
                 description: Arc::from("new"),
                 plugin: Arc::from("p"),
+                max_args: 0,
             },
             LuaCommandInfo {
                 name: Arc::from("/new2"),
                 description: Arc::from("new2"),
                 plugin: Arc::from("p"),
+                max_args: 0,
             },
         ]);
         p.sync("/");

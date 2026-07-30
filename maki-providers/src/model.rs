@@ -38,9 +38,9 @@ pub struct ModelPricing {
     pub output: f64,
     pub cache_write: f64,
     pub cache_read: f64,
-    /// Anthropic fast mode charges a premium that differs per model (6x on Opus
-    /// 4.6/4.7, 2x on Opus 4.8). `None` means the model has no fast tier, so asking
-    /// for fast mode quietly falls back to standard rates instead of overcharging.
+    /// Anthropic fast mode charges a premium that differs per model. `None`
+    /// means the model has no fast tier, so asking for fast mode quietly falls
+    /// back to standard rates instead of overcharging.
     #[serde(default)]
     pub fast: Option<FastPricing>,
 }
@@ -55,6 +55,7 @@ pub struct ModelInfo {
     pub pricing: Option<ModelPricing>,
     pub supports_thinking: Option<bool>,
     pub supports_vision: Option<bool>,
+    pub tier: Option<ModelTier>,
     /// Store of additional metadata from the provider.
     pub provider_info: Option<Arc<dyn Any + Send + Sync>>,
 }
@@ -68,6 +69,7 @@ impl ModelInfo {
             pricing: None,
             supports_thinking: None,
             supports_vision: None,
+            tier: None,
             provider_info: None,
         }
     }
@@ -222,35 +224,24 @@ impl Model {
         let spec = format!("{slug}/{model_id}");
         // Discovery keys `known_models` by the builtin slug, so a dynamic or
         // custom slug reads positional tiers and metadata through its base.
-        let tier = model_registry().read().unwrap().tier_for(
-            &spec,
-            manifest.slug,
-            static_entry.map(|e| e.tier),
-        );
-        let (family, pricing, max_output_tokens, context_window) = match static_entry {
-            Some(e) => (
-                e.family,
-                e.pricing.clone(),
-                Some(e.max_output_tokens),
-                anthropic::shared::long_context_window(model_id).unwrap_or(e.context_window),
-            ),
-            None => {
-                let guard = model_registry().read().unwrap();
-                let discovered = guard.discovered(manifest.slug, model_id);
-                (
-                    manifest.family,
-                    discovered
-                        .and_then(|d| d.pricing.clone())
-                        .unwrap_or_default(),
-                    discovered
-                        .and_then(|d| d.max_output_tokens)
-                        .or(manifest.fallback_max_output),
-                    discovered
-                        .and_then(|d| d.context_window)
-                        .unwrap_or(manifest.fallback_context_window),
-                )
-            }
-        };
+        let guard = model_registry().read().unwrap();
+        let discovered = guard.discovered(manifest.slug, model_id);
+        let tier = guard.tier_for(&spec, manifest.slug, static_entry.map(|e| e.tier));
+        let family = static_entry.map_or(manifest.family, |entry| entry.family);
+        let pricing = discovered
+            .and_then(|info| info.pricing.clone())
+            .or_else(|| static_entry.map(|entry| entry.pricing.clone()))
+            .unwrap_or_default();
+        let max_output_tokens = discovered
+            .and_then(|info| info.max_output_tokens)
+            .or_else(|| static_entry.map(|entry| entry.max_output_tokens))
+            .or(manifest.fallback_max_output);
+        let context_window = discovered
+            .and_then(|info| info.context_window)
+            .or_else(|| anthropic::shared::long_context_window(model_id))
+            .or_else(|| static_entry.map(|entry| entry.context_window))
+            .unwrap_or(manifest.fallback_context_window);
+        drop(guard);
         Self {
             id: model_id.to_string(),
             provider: Arc::from(slug),
@@ -329,6 +320,12 @@ impl Model {
 
     pub fn spec(&self) -> String {
         format!("{}/{}", self.provider, self.id)
+    }
+
+    /// `None` on an unpriced model (oauth, local), so callers can hide the cost
+    /// instead of showing a misleading "$0.000".
+    pub fn cost_of(&self, usage: &TokenUsage, fast: bool) -> Option<f64> {
+        (!self.pricing.is_zero()).then(|| usage.cost(&self.pricing, fast))
     }
 
     pub fn provider_display_name(&self) -> &'static str {
@@ -440,11 +437,25 @@ impl From<TokenUsage> for StoredTokenUsage {
 
 impl TokenUsage {
     pub fn total_input(&self) -> u32 {
-        self.input + self.cache_read + self.cache_creation
+        self.input
+            .saturating_add(self.cache_read)
+            .saturating_add(self.cache_creation)
     }
 
     pub fn context_tokens(&self) -> u32 {
-        self.input + self.output + self.cache_creation + self.cache_read
+        self.total_input().saturating_add(self.output)
+    }
+
+    pub fn format(&self, cost: Option<f64>) -> String {
+        let tokens = format!(
+            "{}↑ {}↓",
+            format_tokens(self.total_input()),
+            format_tokens(self.output)
+        );
+        match cost {
+            Some(cost) => format!("{tokens} ${cost:.3}"),
+            None => tokens,
+        }
     }
 
     pub fn cost(&self, pricing: &ModelPricing, fast: bool) -> f64 {
@@ -469,12 +480,27 @@ impl TokenUsage {
     }
 }
 
+/// A total stays `None` (unpriced) until the first priced turn shows up.
+pub fn add_cost(total: &mut Option<f64>, turn: Option<f64>) {
+    if let Some(turn) = turn {
+        *total = Some(total.unwrap_or_default() + turn);
+    }
+}
+
+pub fn format_tokens(tokens: u32) -> String {
+    match tokens {
+        0..1_000 => tokens.to_string(),
+        1_000..1_000_000 => format!("{:.1}k", f64::from(tokens) / 1_000.0),
+        _ => format!("{:.1}m", f64::from(tokens) / 1_000_000.0),
+    }
+}
+
 impl AddAssign for TokenUsage {
     fn add_assign(&mut self, rhs: Self) {
-        self.input += rhs.input;
-        self.output += rhs.output;
-        self.cache_creation += rhs.cache_creation;
-        self.cache_read += rhs.cache_read;
+        self.input = self.input.saturating_add(rhs.input);
+        self.output = self.output.saturating_add(rhs.output);
+        self.cache_creation = self.cache_creation.saturating_add(rhs.cache_creation);
+        self.cache_read = self.cache_read.saturating_add(rhs.cache_read);
     }
 }
 
@@ -489,6 +515,21 @@ mod tests {
         ModelTier::Strong,
         ModelTier::Compaction,
     ];
+
+    #[test_case(999, "999"         ; "under_thousand")]
+    #[test_case(1_000, "1.0k"      ; "thousand")]
+    #[test_case(999_999, "1000.0k" ; "just_under_million")]
+    #[test_case(1_000_000, "1.0m"  ; "million")]
+    fn format_tokens_display(tokens: u32, expected: &str) {
+        assert_eq!(format_tokens(tokens), expected);
+    }
+
+    #[test_case(TokenUsage { input: 12_000, output: 456, cache_creation: 200, cache_read: 100 }, None, "12.3k↑ 456↓" ; "without_cost")]
+    #[test_case(TokenUsage { input: 1_000_000, output: 100_000, cache_creation: 200_000, cache_read: 500_000 }, Some(5.4), "1.7m↑ 100.0k↓ $5.400" ; "with_cost")]
+    #[test_case(TokenUsage { input: u32::MAX, output: 1, cache_creation: 1, cache_read: 1 }, None, "4295.0m↑ 1↓" ; "input_saturates")]
+    fn usage_formatting(usage: TokenUsage, cost: Option<f64>, expected: &str) {
+        assert_eq!(usage.format(cost), expected);
+    }
 
     #[test_case("no-slash-here", ModelError::InvalidFormat ; "invalid_format")]
     #[test_case("foobar/gpt-4", ModelError::UnsupportedProvider("foobar".into()) ; "unsupported_provider")]
@@ -736,38 +777,18 @@ mod tests {
         assert_eq!(Model::from_spec(spec).unwrap().supports_vision(), expected);
     }
 
-    #[test_case("claude-opus-4-6" ; "opus_4_6")]
-    #[test_case("claude-opus-4-7" ; "opus_4_7")]
-    #[test_case("claude-opus-4-8" ; "opus_4_8")]
-    fn supports_fast_true_for_anthropic_opus(model_id: &str) {
+    #[test_case("claude-opus-5",    true  ; "entry_with_fast_pricing")]
+    #[test_case("claude-opus-5-1m", true  ; "long_context_suffix_still_matches_prefix")]
+    #[test_case("claude-opus-4-7",  false ; "fast_withdrawn_from_the_table")]
+    #[test_case("claude-sonnet-5",  false ; "entry_without_fast_pricing")]
+    #[test_case("claude-opus-99",   false ; "no_entry_at_all")]
+    fn supports_fast_follows_anthropic_table(model_id: &str, expected: bool) {
         let model = Model::from_base(
             ManifestRegistry::get("anthropic").unwrap(),
             "anthropic",
             model_id,
         );
-        assert!(model.supports_fast());
-    }
-
-    #[test_case("claude-sonnet-4-5" ; "sonnet")]
-    #[test_case("claude-haiku-4-5" ; "haiku")]
-    #[test_case("claude-opus-4-5" ; "opus_4_5")]
-    fn supports_fast_false_for_other_anthropic_models(model_id: &str) {
-        let model = Model::from_base(
-            ManifestRegistry::get("anthropic").unwrap(),
-            "anthropic",
-            model_id,
-        );
-        assert!(!model.supports_fast());
-    }
-
-    #[test]
-    fn supports_fast_false_for_unknown_anthropic_model() {
-        let model = Model::from_base(
-            ManifestRegistry::get("anthropic").unwrap(),
-            "anthropic",
-            "claude-opus-99",
-        );
-        assert!(!model.supports_fast());
+        assert_eq!(model.supports_fast(), expected);
     }
 
     #[test]
@@ -804,6 +825,7 @@ mod tests {
                     pricing: None,
                     supports_thinking: None,
                     supports_vision: None,
+                    tier: None,
                     provider_info: None,
                 }],
             );

@@ -111,12 +111,12 @@ The `/help` modal and the splash show default labels, not live overrides, but pr
 
 ### Recovering from a bad keymap
 
-If an override leaves Maki stuck (a rebound `Ctrl+C`, a modal that won't close, a plugin that throws on load), boot without plugins:
+If an override leaves Maki stuck (a rebound `Ctrl+C`, a modal that won't close, a plugin that throws on load), boot without user `init.lua`:
 
 ```bash
 maki --no-plugins
 ```
 
-This skips the Lua host and runs the full default keymap from Rust, so quit, Esc, scroll, and suspend always work.
+Skips user `init.lua` files (global and project) but keeps the Lua host and builtin plugins running, so tools still work. `permissions.toml`, custom commands, and env files load as usual.
 
-The defaults live in Rust, not Lua, so `--no-plugins` never drops them.
+The default keymap lives in Rust, not Lua, so `--no-plugins` never drops it.

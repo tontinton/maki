@@ -17,6 +17,7 @@ const STRUCTURED_OUTPUT_TOOL: &str = "structured_output";
 const MAX_STRUCTURED_RETRIES: usize = 2;
 const MAX_SCHEMA_ERRORS: usize = 3;
 const SCHEMA_COMPILE_ERROR: &str = "invalid output_schema";
+const SCHEMA_ROOT_ERROR: &str = "output_schema must have type object";
 const STRUCTURED_MISSING_ERROR: &str = "subagent finished without calling structured_output";
 const STRUCTURED_INVALID_ERROR: &str = "subagent result does not match output_schema";
 const UNKNOWN_SUBAGENT_ERR: &str = "unknown subagent type: bogus";
@@ -218,7 +219,10 @@ fn multi_error_schema() -> Value {
 }
 
 #[test_case::test_case(json!({"subagent_type": "bogus"}), UNKNOWN_SUBAGENT_ERR ; "unknown_subagent_type")]
-#[test_case::test_case(json!({"output_schema": {"type": 42}}), SCHEMA_COMPILE_ERROR ; "invalid_output_schema")]
+#[test_case::test_case(json!({"output_schema": {"type": "object", "properties": {"x": {"type": 42}}}}), SCHEMA_COMPILE_ERROR ; "invalid_output_schema")]
+#[test_case::test_case(json!({"output_schema": {"type": "array"}}), SCHEMA_ROOT_ERROR ; "non_object_output_schema")]
+#[test_case::test_case(json!({"output_schema": "not an object"}), SCHEMA_ROOT_ERROR ; "non_table_output_schema")]
+#[test_case::test_case(json!({"output_schema": {"description": "missing type"}}), SCHEMA_ROOT_ERROR ; "output_schema_missing_type")]
 fn bad_input_errors_before_any_session(extra: Value, expected_prefix: &str) {
     let (reg, _host) = load_task_host();
     let mut input = task_input(SCENARIO_PLAIN, None);

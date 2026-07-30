@@ -57,14 +57,17 @@ pub enum UpdateError {
 
 fn fetch_script() -> Result<String, UpdateError> {
     use isahc::ReadResponseExt;
-    let mut response = isahc::get(INSTALL_SCRIPT_URL).map_err(|e| UpdateError::Fetch {
-        url: INSTALL_SCRIPT_URL,
-        source: e,
-    })?;
-    response.text().map_err(|e| UpdateError::Fetch {
-        url: INSTALL_SCRIPT_URL,
-        source: e.into(),
-    })
+    isahc::get(INSTALL_SCRIPT_URL)
+        .and_then(|mut r| r.text().map_err(Into::into))
+        .map_err(|source| UpdateError::Fetch {
+            url: INSTALL_SCRIPT_URL,
+            source,
+        })
+        .or_else(|e| {
+            version::curl_fetch(INSTALL_SCRIPT_URL)
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                .map_err(|_| e)
+        })
 }
 
 fn backup_binary(exe_path: &Path, storage: &StateDir) -> Result<PathBuf, UpdateError> {
@@ -126,22 +129,19 @@ fn restore_backup(backup_path: &Path, exe_path: &Path) -> Result<(), UpdateError
     if needs_sudo(exe_path) {
         println!("Restoring to {} (requires sudo)...", exe_path.display());
         let status = std::process::Command::new("sudo")
-            .args(["cp", "--"])
+            .args([
+                "sh",
+                "-c",
+                r#"cp -- "$1" "$2" && mv -- "$2" "$3""#,
+                "maki-restore",
+            ])
             .arg(backup_path)
-            .arg(&tmp)
-            .status()
-            .map_err(err)?;
-        if !status.success() {
-            return Err(err(std::io::Error::other("sudo cp failed")));
-        }
-        let status = std::process::Command::new("sudo")
-            .args(["mv", "--"])
             .arg(&tmp)
             .arg(exe_path)
             .status()
             .map_err(err)?;
         if !status.success() {
-            return Err(err(std::io::Error::other("sudo mv failed")));
+            return Err(err(std::io::Error::other("sudo restore failed")));
         }
     } else {
         std::fs::copy(backup_path, &tmp).map_err(err)?;

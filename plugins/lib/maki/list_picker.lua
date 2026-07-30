@@ -70,6 +70,38 @@ local function highlight_spans(label, words, base, match_style)
   return spans
 end
 
+local function item_label(item)
+  return type(item) == "string" and item or item.label
+end
+
+local function item_section(item)
+  return type(item) == "table" and item.section or nil
+end
+
+local function next_section(item, prev)
+  local s = item_section(item)
+  if s and s ~= prev then
+    return s
+  end
+  return nil
+end
+
+local function section_rows(items)
+  local n = 0
+  local prev = nil
+  for _, item in ipairs(items) do
+    local s = next_section(item, prev)
+    if s then
+      n = n + 1
+      prev = s
+    end
+  end
+  if n == 0 then
+    return 0
+  end
+  return item_section(items[1]) and 2 * n - 1 or 2 * n
+end
+
 local function filter_items(items, query)
   local words = split_words(query)
   if #words == 0 then
@@ -81,8 +113,9 @@ local function filter_items(items, query)
   end
   local filtered, indices = {}, {}
   for i, item in ipairs(items) do
-    local label = type(item) == "string" and item or item.label
-    if matches(label, words) then
+    local section = item_section(item)
+    local hay = section and (item_label(item) .. " " .. section) or item_label(item)
+    if matches(hay, words) then
       filtered[#filtered + 1] = item
       indices[#indices + 1] = i
     end
@@ -94,13 +127,31 @@ local function render_lines(items, selected, width, query)
   width = width or 80
   local words = split_words(query)
   local lines = {}
+  local item_lines = {}
+  local prev_section = nil
   for i, item in ipairs(items) do
-    local label = type(item) == "string" and item or item.label
+    local label = item_label(item)
     local detail = type(item) == "table" and item.detail or nil
+    local section = next_section(item, prev_section)
     local is_sel = (i == selected)
     local style = is_sel and "selected" or "item"
     local detail_style = is_sel and "selected" or "dim"
     local match_style = is_sel and "match_selected" or "match"
+
+    if section then
+      if #lines > 0 then
+        lines[#lines + 1] = {}
+      end
+      local header = { { "  " .. section, "keybind_section" } }
+      local section_detail = type(item) == "table" and item.section_detail or nil
+      if section_detail then
+        header[#header + 1] = { " " .. section_detail, "dim" }
+      end
+      lines[#lines + 1] = header
+      prev_section = section
+    end
+
+    item_lines[i] = #lines + 1
 
     local spans = highlight_spans(label, words, style, match_style)
     if spans[1][2] == style then
@@ -126,7 +177,7 @@ local function render_lines(items, selected, width, query)
 
     lines[#lines + 1] = spans
   end
-  return lines
+  return lines, item_lines
 end
 
 -- Open a fuzzy-filter picker in a floating window and block until the user
@@ -147,13 +198,15 @@ function ListPicker.open(items, opts)
   local filtered, original_indices = filter_items(items, "")
 
   local cursor = math.max(math.min(opts.cursor or 1, #filtered), 1)
+  local item_lines = {}
 
   local function build_lines()
     local content
     if #filtered == 0 then
       content = { { { NO_MATCHES_LABEL, "dim" } } }
+      item_lines = {}
     else
-      content = render_lines(filtered, cursor, width, input:value())
+      content, item_lines = render_lines(filtered, cursor, width, input:value())
     end
     local r = input:render("\xe2\x9d\xaf ")
     for _, ln in ipairs(r.lines) do
@@ -165,7 +218,7 @@ function ListPicker.open(items, opts)
   local buf = maki.ui.buf()
 
   local border_chrome = 2
-  local content_h = #items + 1
+  local content_h = #items + section_rows(items) + 1
   local total_h = content_h + border_chrome
 
   local win = maki.ui.open_win(buf, {
@@ -180,12 +233,13 @@ function ListPicker.open(items, opts)
   local confirming = nil
 
   local function move_cursor(to)
-    if #filtered == 0 then
-      return
+    if #filtered > 0 then
+      cursor = math.max(math.min(to, #filtered), 1)
     end
-    cursor = math.max(math.min(to, #filtered), 1)
     buf:set_lines(build_lines())
-    win:set_cursor(cursor)
+    if item_lines[cursor] then
+      win:set_cursor(item_lines[cursor])
+    end
     confirming = nil
   end
 
@@ -254,5 +308,6 @@ ListPicker.highlight_spans = highlight_spans
 
 ListPicker._render_lines = render_lines
 ListPicker._filter_items = filter_items
+ListPicker._section_rows = section_rows
 
 return ListPicker

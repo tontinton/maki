@@ -53,7 +53,7 @@ impl PickerItem for String {
 
 pub enum PickerAction<T> {
     Consumed,
-    Select(usize, T),
+    Select(T),
     Toggle(usize, bool),
     Close,
 }
@@ -269,6 +269,22 @@ impl<T: PickerItem> ListPicker<T> {
         }
     }
 
+    pub fn select_item_by(&mut self, predicate: impl Fn(&T) -> bool) -> bool {
+        let Some(s) = self.state.as_mut() else {
+            return false;
+        };
+        let Some(selected) = s
+            .filtered
+            .iter()
+            .position(|&item_idx| predicate(&s.items[item_idx]))
+        else {
+            return false;
+        };
+        s.selected = selected;
+        s.ensure_visible();
+        true
+    }
+
     pub fn set_error_text(&mut self, text: Option<String>) {
         self.error_text = text;
     }
@@ -362,7 +378,7 @@ impl<T: PickerItem> ListPicker<T> {
                 match idx {
                     Some(idx) => {
                         let mut state = self.state.take().unwrap();
-                        PickerAction::Select(idx, state.items.swap_remove(idx))
+                        PickerAction::Select(state.items.swap_remove(idx))
                     }
                     None => PickerAction::Consumed,
                 }
@@ -821,6 +837,20 @@ mod tests {
     }
 
     #[test]
+    fn select_item_by_uses_visible_row_and_preserves_filter() {
+        let mut p = ListPicker::new();
+        p.open(entries(&["Alpha", "Beta", "Alpine"]), " Test ");
+        p.handle_key(key(KeyCode::Char('a')));
+        p.handle_key(key(KeyCode::Char('l')));
+
+        assert!(p.select_item_by(|entry| entry.label == "Alpine"));
+        assert_eq!(p.selected_item().unwrap().label, "Alpine");
+        assert_eq!(ready_state(&p).search.value(), "al");
+        assert!(!p.select_item_by(|entry| entry.label == "Beta"));
+        assert_eq!(p.selected_item().unwrap().label, "Alpine");
+    }
+
+    #[test]
     fn navigation_wraps_around() {
         let mut p = ListPicker::new();
         p.open(entries(&["A", "B", "C"]), " Test ");
@@ -926,7 +956,7 @@ mod tests {
         p.handle_key(key(KeyCode::Down));
 
         let action = p.handle_key(key(KeyCode::Enter));
-        assert!(matches!(action, PickerAction::Select(1, ref e) if e.label == "B"));
+        assert!(matches!(action, PickerAction::Select(ref e) if e.label == "B"));
         assert!(!p.is_open());
     }
 

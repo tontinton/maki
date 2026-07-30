@@ -80,7 +80,7 @@ impl App {
             let panel_h: u16 = self.float_mgr.panel_reqs().iter().map(|(_, h)| *h).sum();
             queue_panel::height(self.queue.panel_len())
                 + panel_h
-                + self.input_box.height(inner.width)
+                + self.input_box.height(inner.width).min(max_bottom)
         } else {
             let panel_h: u16 = self.float_mgr.panel_reqs().iter().map(|(_, h)| *h).sum();
             if panel_h > 0 { panel_h + 1 } else { 1 }
@@ -297,9 +297,9 @@ impl App {
                 .as_deref()
                 .unwrap_or(&self.state.session.model),
             stats: UsageStats {
-                usage: &chat.token_usage,
                 global_usage: &self.state.token_usage,
                 context_size: chat.context_size,
+                cost: chat.cost,
                 pricing: &self.state.model.pricing,
                 context_window: self.state.model.context_window,
                 show_global: self.chats.len() > 1,

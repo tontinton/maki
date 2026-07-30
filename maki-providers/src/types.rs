@@ -314,6 +314,24 @@ const THINKING_USAGE: &str =
 /// caps. Explicit user budgets never go through this.
 const FALLBACK_MAX_THINKING_BUDGET: u32 = 32_768;
 
+/// First Claude version that speaks adaptive thinking. Opus got there a
+/// generation early, at 4.7; the other families joined at 5.
+const ADAPTIVE_SINCE: (u32, u32) = (5, 0);
+const ADAPTIVE_SINCE_OPUS: (u32, u32) = (4, 7);
+const OPUS: &str = "opus";
+
+/// `claude-opus-4.7` -> `("opus", (4, 7))`, `claude-opus-5-1m` -> `("opus", (5, 0))`.
+/// Copilot writes the version with a dot, hence the two separators. Legacy ids
+/// put the version first (`claude-3-5-sonnet-20241022`), so a numeric family
+/// tells us there is no modern version to read here.
+fn claude_version(model_id: &str) -> Option<(&str, (u32, u32))> {
+    let mut parts = model_id.strip_prefix("claude-")?.split(['-', '.']);
+    let family = parts.next().filter(|f| f.parse::<u32>().is_err())?;
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+    Some((family, (major, minor)))
+}
+
 /// How a provider's effort knob speaks: which levels its API accepts, what
 /// `adaptive` means there, and whether "off" needs an explicit string.
 /// New providers add a const in [`dialect`]; providers with dynamic model
@@ -469,21 +487,18 @@ impl ThinkingConfig {
         }
     }
 
-    /// Version check, not an allowlist, so future Opus releases work
-    /// automatically. Splits on `-` and `.` since Copilot uses dotted ids
-    /// (`claude-opus-4.7`).
+    /// Models from [`ADAPTIVE_SINCE`] on reject `type: "enabled"` with a 400. A
+    /// version check, not an allowlist, so future releases and new families
+    /// work automatically.
     fn requires_adaptive(model_id: &str) -> bool {
-        let Some(version) = model_id.strip_prefix("claude-opus-") else {
-            return false;
-        };
-        let mut parts = version.split(['-', '.']);
-        let (Some(Ok(major)), Some(Ok(minor))) = (
-            parts.next().map(str::parse::<u32>),
-            parts.next().map(str::parse::<u32>),
-        ) else {
-            return false;
-        };
-        (major, minor) >= (4, 7)
+        claude_version(model_id).is_some_and(|(family, version)| {
+            version
+                >= if family == OPUS {
+                    ADAPTIVE_SINCE_OPUS
+                } else {
+                    ADAPTIVE_SINCE
+                }
+        })
     }
 
     pub fn apply_reasoning_effort(self, body: &mut Value, dialect: &EffortDialect, model: &Model) {
@@ -790,9 +805,10 @@ mod tests {
     #[test_case(ThinkingConfig::Budget(10000), "claude-opus-4-7", json!({"thinking": {"type": "adaptive"}, "output_config": {"effort": "high"}}) ; "budget_adaptive_opus_4_7")]
     #[test_case(ThinkingConfig::Effort(Low), "claude-opus-4-7", json!({"thinking": {"type": "adaptive"}, "output_config": {"effort": "low"}}) ; "effort_low_passthrough")]
     #[test_case(ThinkingConfig::Budget(10000), "claude-opus-4-8-1m", json!({"thinking": {"type": "adaptive"}, "output_config": {"effort": "high"}}) ; "budget_adaptive_opus_4_8_long_context")]
-    #[test_case(ThinkingConfig::Budget(10000), "claude-opus-5-0", json!({"thinking": {"type": "adaptive"}, "output_config": {"effort": "high"}}) ; "budget_adaptive_future_opus_5")]
+    #[test_case(ThinkingConfig::Budget(10000), "claude-opus-5-1m", json!({"thinking": {"type": "adaptive"}, "output_config": {"effort": "high"}}) ; "budget_adaptive_opus_5_unparsable_minor")]
     #[test_case(ThinkingConfig::Budget(10000), "claude-opus-4.7", json!({"thinking": {"type": "adaptive"}, "output_config": {"effort": "high"}}) ; "budget_adaptive_copilot_dotted_id")]
-    #[test_case(ThinkingConfig::Budget(10000), "claude-opus-4.6", json!({"thinking": {"type": "enabled", "budget_tokens": 4096}}) ; "budget_legacy_copilot_dotted_4_6")]
+    #[test_case(ThinkingConfig::Budget(10000), "claude-sonnet-5", json!({"thinking": {"type": "adaptive"}, "output_config": {"effort": "high"}}) ; "budget_adaptive_sonnet_5")]
+    #[test_case(ThinkingConfig::Budget(10000), "claude-3-5-sonnet-20241022", json!({"thinking": {"type": "enabled", "budget_tokens": 4096}}) ; "budget_legacy_dated_id")]
     fn thinking_apply_to_body(config: ThinkingConfig, model_id: &str, expected: Value) {
         let mut body = json!({});
         config.apply_to_body(&mut body, &thinking_model(model_id));

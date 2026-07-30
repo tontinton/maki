@@ -1751,6 +1751,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "home"
+version = "0.5.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cc627f471c528ff0c4a49e1d5e60450c8f6461dd6d10ba9dcd3a61d3dff7728d"
+dependencies = [
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "htmd"
 version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2439,7 +2448,7 @@ dependencies = [
 
 [[package]]
 name = "maki"
-version = "0.4.2"
+version = "0.4.4"
 dependencies = [
  "clap",
  "color-eyre",
@@ -2468,7 +2477,7 @@ dependencies = [
 
 [[package]]
 name = "maki-acp"
-version = "0.4.2"
+version = "0.4.4"
 dependencies = [
  "agent-client-protocol-schema",
  "color-eyre",
@@ -2486,7 +2495,7 @@ dependencies = [
 
 [[package]]
 name = "maki-agent"
-version = "0.4.2"
+version = "0.4.4"
 dependencies = [
  "arc-swap",
  "async-io",
@@ -2527,7 +2536,7 @@ dependencies = [
 
 [[package]]
 name = "maki-config"
-version = "0.4.2"
+version = "0.4.4"
 dependencies = [
  "dotenvy",
  "inventory",
@@ -2545,7 +2554,7 @@ dependencies = [
 
 [[package]]
 name = "maki-config-macro"
-version = "0.4.2"
+version = "0.4.4"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2554,7 +2563,7 @@ dependencies = [
 
 [[package]]
 name = "maki-docgen"
-version = "0.4.2"
+version = "0.4.4"
 dependencies = [
  "maki-agent",
  "maki-config",
@@ -2570,7 +2579,7 @@ dependencies = [
 
 [[package]]
 name = "maki-highlight"
-version = "0.4.2"
+version = "0.4.4"
 dependencies = [
  "serde_json",
  "syntect",
@@ -2580,7 +2589,7 @@ dependencies = [
 
 [[package]]
 name = "maki-interpreter"
-version = "0.4.2"
+version = "0.4.4"
 dependencies = [
  "monty",
  "serde_json",
@@ -2591,7 +2600,7 @@ dependencies = [
 
 [[package]]
 name = "maki-lua"
-version = "0.4.2"
+version = "0.4.4"
 dependencies = [
  "arc-swap",
  "async-lock",
@@ -2666,7 +2675,7 @@ dependencies = [
 
 [[package]]
 name = "maki-lua-macro"
-version = "0.4.2"
+version = "0.4.4"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2675,7 +2684,7 @@ dependencies = [
 
 [[package]]
 name = "maki-markdown"
-version = "0.4.2"
+version = "0.4.4"
 dependencies = [
  "fastrand",
  "maki-highlight",
@@ -2685,7 +2694,7 @@ dependencies = [
 
 [[package]]
 name = "maki-providers"
-version = "0.4.2"
+version = "0.4.4"
 dependencies = [
  "base64",
  "fastrand",
@@ -2713,7 +2722,7 @@ dependencies = [
 
 [[package]]
 name = "maki-storage"
-version = "0.4.2"
+version = "0.4.4"
 dependencies = [
  "bs58",
  "etcetera",
@@ -2730,7 +2739,7 @@ dependencies = [
 
 [[package]]
 name = "maki-ui"
-version = "0.4.2"
+version = "0.4.4"
 dependencies = [
  "arboard",
  "arc-swap",
@@ -2766,6 +2775,7 @@ dependencies = [
  "strum 0.27.2",
  "syntect",
  "tempfile",
+ "termini",
  "test-case",
  "toml",
  "tracing",
@@ -4845,6 +4855,15 @@ dependencies = [
  "nom 7.1.3",
  "phf 0.11.3",
  "phf_codegen 0.11.3",
+]
+
+[[package]]
+name = "termini"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2ad441d87dd98bc5eeb31cf2fb7e4839968763006b478efb38668a3bf9da0d59"
+dependencies = [
+ "home",
 ]
 
 [[package]]

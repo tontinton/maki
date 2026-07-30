@@ -38,6 +38,7 @@ use crate::AppSession;
 use crate::agent::{AgentCommand, AgentHandles, ModelSlot, shared_queue::QueueItem};
 use crate::app::shell::{ShellEvent, spawn_shell};
 use crate::app::{App, Msg, QueuedMessage, SubmitOutcome};
+use crate::color_compat;
 use crate::components::input::Submission;
 use crate::components::usage_modal::UsageFetchState;
 use crate::components::{Action, ExitRequest, Status};
@@ -79,8 +80,8 @@ pub struct EventLoopParams {
     pub lua_command_reader: LuaCommandReader,
     pub keymap_reader: KeymapReader,
     pub hint_reader: HintReader,
-    pub ui_action_rx: Option<flume::Receiver<UiAction>>,
-    pub lua_event_handle: Option<EventHandle>,
+    pub ui_action_rx: flume::Receiver<UiAction>,
+    pub lua_event_handle: EventHandle,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -142,7 +143,7 @@ struct SpawnCtx {
     lua_command_reader: LuaCommandReader,
     keymap_reader: KeymapReader,
     hint_reader: HintReader,
-    lua_event_handle: Option<EventHandle>,
+    lua_event_handle: EventHandle,
     mcp_handle: Option<McpHandle>,
     mcp_config_errors: McpConfigErrors,
     model_slot: Arc<ArcSwap<ModelSlot>>,
@@ -181,11 +182,11 @@ impl SpawnCtx {
             self.input_history_size,
             permissions,
             Arc::clone(&self.custom_commands),
+            self.lua_event_handle.clone(),
         );
-        app.lua_event_handle = self.lua_event_handle.clone();
         handles.apply_to_app(&mut app);
         if resumed {
-            restore_session(&mut app, &handles);
+            app.restore_resumed_session();
         }
         let (shell_tx, shell_rx) = flume::unbounded::<ShellEvent>();
         SessionRuntime {
@@ -206,7 +207,7 @@ pub(crate) struct EventLoop<'t> {
     input: InputReader,
     warn_rx: flume::Receiver<String>,
     warn_tx: flume::Sender<String>,
-    ui_action_rx: Option<flume::Receiver<UiAction>>,
+    ui_action_rx: flume::Receiver<UiAction>,
     _model_fetch_task: smol::Task<()>,
 }
 
@@ -284,21 +285,6 @@ fn spawn_model_fetch(model_slot: &Arc<ArcSwap<ModelSlot>>, timeouts: Timeouts) -
         warn_rx,
         warn_tx,
         task,
-    }
-}
-
-fn restore_session(app: &mut App, handles: &AgentHandles) {
-    app.permissions
-        .load_session_rules(crate::app::session_state::stored_to_rules(
-            &app.state.session.meta.session_rules,
-        ));
-    *handles
-        .tool_outputs
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()) = app.state.session.tool_outputs.clone();
-    app.restore_display();
-    for w in app.state.warnings.drain(..) {
-        app.status_bar.flash(w);
     }
 }
 
@@ -436,7 +422,10 @@ impl<'t> EventLoop<'t> {
                 break Err(e);
             }
             let app = &mut self.sessions[self.focused].app;
-            if let Err(e) = self.terminal.draw(|f| app.view(f)) {
+            if let Err(e) = self.terminal.draw(|f| {
+                app.view(f);
+                color_compat::downgrade_if_needed(f.buffer_mut());
+            }) {
                 break Err(e.into());
             }
 
@@ -476,12 +465,8 @@ impl<'t> EventLoop<'t> {
             Ok(ev) => Some(Wake::Input(ev)),
             Err(_) => Some(Wake::InputGone),
         });
-        if let Some(rx) = self
-            .ui_action_rx
-            .as_ref()
-            .filter(|rx| !rx.is_disconnected())
-        {
-            sel = sel.recv(rx, |res| res.ok().map(Wake::Ui));
+        if !self.ui_action_rx.is_disconnected() {
+            sel = sel.recv(&self.ui_action_rx, |res| res.ok().map(Wake::Ui));
         }
         sel = sel.recv(&self.warn_rx, |res| res.ok().map(Wake::Warn));
         for (i, rt) in self.sessions.iter().enumerate() {
@@ -535,12 +520,6 @@ impl<'t> EventLoop<'t> {
             match self.next_wake(Duration::ZERO) {
                 Some(wake) => self.handle_wake(wake)?,
                 None => break,
-            }
-        }
-
-        for rt in &mut self.sessions {
-            if rt.app.status == Status::Streaming && rt.handles.agent_rx.is_disconnected() {
-                rt.app.status = Status::error("agent stopped unexpectedly".into());
             }
         }
 
@@ -604,9 +583,7 @@ impl<'t> EventLoop<'t> {
     }
 
     fn emit_status_changes(&mut self) {
-        let Some(handle) = self.ctx.lua_event_handle.as_ref() else {
-            return;
-        };
+        let handle = &self.ctx.lua_event_handle;
         for (i, rt) in self.sessions.iter_mut().enumerate() {
             let status = SessionStatus::of(&rt.app);
             if status == rt.last_status {
@@ -965,11 +942,6 @@ impl<'t> EventLoop<'t> {
                     }));
                 }
                 self.respawn_agent(idx, loaded.messages);
-                *self.sessions[idx]
-                    .handles
-                    .tool_outputs
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner()) = loaded.tool_outputs;
             }
             Action::ChangeModel(spec) => self.change_model(spec),
             Action::RefreshProvider { slug } => self.refresh_provider(slug),

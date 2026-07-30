@@ -27,7 +27,16 @@ Every provider honors a `<SLUG>_BASE_URL` env var (`anthropic` -> `ANTHROPIC_BAS
 ANTHROPIC_BASE_URL=https://my-proxy.internal maki
 ```
 
-It wins over `providers.toml` and built-in defaults. `ANTHROPIC_BASE_URL` and `OPENAI_BASE_URL` are the same names the official SDKs use, so an existing proxy setup carries over as is. One exception: `OPENAI_BASE_URL` only redirects the platform API, never the ChatGPT Coding Plan backend."#;
+It wins over `providers.toml` and built-in defaults. `ANTHROPIC_BASE_URL` and `OPENAI_BASE_URL` are the same names the official SDKs use, so an existing proxy setup carries over as is. One exception: `OPENAI_BASE_URL` only redirects the platform API, never the ChatGPT Coding Plan backend.
+
+You can also set `base_url` for a built-in provider in `~/.config/maki/providers.toml`. It overrides the built-in default and loses to the env var above:
+
+```toml
+[openai]
+base_url = "http://xxxx:1234/v1"
+```
+
+The built-in provider still owns the slug, so `protocol`, `api_key_env`, `discover_models` and `models` are ignored with a warning. Use a custom slug if you need those."#;
 
 const LONG_CONTEXT_NOTE: &str = r#"Add `-1m` to any Claude model, like `claude-sonnet-4-6-1m`, to use the 1M token context window."#;
 
@@ -215,41 +224,24 @@ fn write_model_table(out: &mut String, entries: &[ModelEntry]) {
         "|------|--------|-------------------------------|---------|"
     );
 
+    // A row per model, not per tier: prices and context sizes differ inside a
+    // tier, so one merged row would quote a single model's numbers for all.
     for tier in [ModelTier::Weak, ModelTier::Medium, ModelTier::Strong] {
-        let tier_entries: Vec<_> = entries.iter().filter(|e| e.tier == tier).collect();
-        if tier_entries.is_empty() {
-            continue;
-        }
-
-        let models: Vec<String> = tier_entries
-            .iter()
-            .map(|e| {
-                let names = e.prefixes.join(", ");
-                if e.default {
+        for entry in entries.iter().filter(|e| e.tier == tier) {
+            let names = entry.prefixes.join(", ");
+            let _ = writeln!(
+                out,
+                "| {} | {} | {} | {} |",
+                tier_label(tier),
+                if entry.default {
                     format!("**{names}** (default)")
                 } else {
                     names
-                }
-            })
-            .collect();
-
-        let pricing = tier_entries
-            .first()
-            .map(|e| format_pricing(e))
-            .unwrap_or_default();
-        let context = tier_entries
-            .first()
-            .map(|e| format_context(e))
-            .unwrap_or_default();
-
-        let _ = writeln!(
-            out,
-            "| {} | {} | {} | {} |",
-            tier_label(tier),
-            models.join(", "),
-            pricing,
-            context,
-        );
+                },
+                format_pricing(entry),
+                format_context(entry),
+            );
+        }
     }
 
     let defaults: Vec<String> = entries

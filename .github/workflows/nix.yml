@@ -1,0 +1,50 @@
+name: Nix
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  changes:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            code:
+              - "flake.*"
+              - "**.nix"
+              - "Cargo.toml"
+              - "Cargo.lock"
+              - "**.rs"
+              - "**.toml"
+              - "**.lua"
+              - "plugins/**"
+              - "prompts/**"
+              - "themes/**"
+              - "words/**"
+              - ".github/workflows/nix.yml"
+
+  build:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@v22
+      - uses: DeterminateSystems/magic-nix-cache-action@v14
+        with:
+          use-flakehub: false
+      - name: Check hash drift
+        run: nix build .#checks.x86_64-linux.git-dep-hashes
+      - name: Check Nix formatting
+        run: nix build .#checks.x86_64-linux.fmt
+      - name: Build
+        run: nix build

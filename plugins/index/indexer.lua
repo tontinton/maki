@@ -829,60 +829,47 @@ local LANG_ALIASES = {
   javascript = "typescript",
 }
 
-local function unique_langs()
-  local seen = {}
-  local langs = {}
-  for _, lang in pairs(EXT_TO_LANG) do
-    local resolved = LANG_ALIASES[lang] or lang
-    if not seen[resolved] then
-      seen[resolved] = true
-      langs[#langs + 1] = resolved
-    end
+local KNOWN_LANGS = {}
+for _, map in ipairs({ EXT_TO_LANG, FILENAME_TO_LANG }) do
+  for _, lang in pairs(map) do
+    KNOWN_LANGS[LANG_ALIASES[lang] or lang] = true
   end
-  table.sort(langs)
-  return langs
 end
 
+-- One index call needs one language, and requiring all ~34 extractors up front
+-- costs most of the plugin's load time, so they load on first use.
 local EXTRACTORS = {}
 
--- Bazel file-kind extractors live in lang/bazel/ and are pre-registered
--- because BUILD.bazel and MODULE.bazel are detected by filename (not by
--- extension), and all three share the "starlark" tree-sitter parser.
-for _, sub in ipairs({ "build", "module", "bzl" }) do
-  local lang_name = "bazel_" .. sub
-  local factory = require("lang.bazel." .. sub)
-  local lang = factory(U)
-  validate_lang(lang_name, lang)
-  EXTRACTORS[lang_name] = lang.extract
-end
-
-for _, name in ipairs(unique_langs()) do
-  if not EXTRACTORS[name] then
-    local factory = require("lang." .. name)
-    local lang = factory(U)
-    validate_lang(name, lang)
-
-    if lang.extract then
-      EXTRACTORS[name] = lang.extract
-    else
-      EXTRACTORS[name] = function(source, root)
-        return default_extract(lang, source, root)
-      end
-    end
+local function extractor_for(name)
+  if EXTRACTORS[name] then
+    return EXTRACTORS[name]
   end
-end
+  -- Guards the require below: only a name we map an extension or filename to
+  -- may turn into a module path.
+  if not KNOWN_LANGS[name] then
+    return nil
+  end
 
-for alias, target in pairs(LANG_ALIASES) do
-  EXTRACTORS[alias] = EXTRACTORS[target]
+  -- Bazel file-kind extractors live in lang/bazel/ because BUILD.bazel and
+  -- MODULE.bazel are detected by filename (not by extension), and all three
+  -- share the "starlark" tree-sitter parser.
+  local bazel_kind = name:match("^bazel_(.+)$")
+  local lang = require(bazel_kind and ("lang.bazel." .. bazel_kind) or ("lang." .. name))(U)
+  validate_lang(name, lang)
+
+  local extract = lang.extract or function(source, root)
+    return default_extract(lang, source, root)
+  end
+  EXTRACTORS[name] = extract
+  return extract
 end
 
 local function index_source(source, lang_name)
-  local extractor = EXTRACTORS[lang_name]
+  local extractor = extractor_for(LANG_ALIASES[lang_name] or lang_name)
   if not extractor then
     return nil, "unsupported language: " .. tostring(lang_name)
   end
-  local pname = parser_name(lang_name)
-  local parser = maki.treesitter.get_parser(source, pname)
+  local parser = maki.treesitter.get_parser(source, parser_name(lang_name))
   local root = parser:parse()[1]:root()
   return extractor(source, root)
 end
