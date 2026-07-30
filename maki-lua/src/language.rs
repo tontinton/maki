@@ -29,15 +29,12 @@ pub enum Language {
     Sql,
     Toml,
     Yaml,
-    Astro,
     Containerfile,
     Css,
     Hcl,
     Json,
     Make,
     Scss,
-    Svelte,
-    Vue,
 }
 
 impl Language {
@@ -70,15 +67,12 @@ impl Language {
             "sql" => Some(Self::Sql),
             "toml" => Some(Self::Toml),
             "yaml" => Some(Self::Yaml),
-            "astro" => Some(Self::Astro),
             "containerfile" => Some(Self::Containerfile),
             "css" => Some(Self::Css),
             "hcl" => Some(Self::Hcl),
             "json" => Some(Self::Json),
             "make" => Some(Self::Make),
             "scss" => Some(Self::Scss),
-            "svelte" => Some(Self::Svelte),
-            "vue" => Some(Self::Vue),
             _ => None,
         }
     }
@@ -112,15 +106,12 @@ impl Language {
             "sql" => Some(Self::Sql),
             "toml" => Some(Self::Toml),
             "yaml" | "yml" => Some(Self::Yaml),
-            "astro" => Some(Self::Astro),
             "dockerfile" => Some(Self::Containerfile),
             "css" => Some(Self::Css),
             "hcl" | "tf" | "tfvars" => Some(Self::Hcl),
             "json" => Some(Self::Json),
             "mk" => Some(Self::Make),
             "scss" => Some(Self::Scss),
-            "svelte" => Some(Self::Svelte),
-            "vue" => Some(Self::Vue),
             _ => None,
         }
     }
@@ -154,15 +145,12 @@ impl Language {
             Self::Sql => tree_sitter_sequel::LANGUAGE.into(),
             Self::Toml => tree_sitter_toml_ng::LANGUAGE.into(),
             Self::Yaml => tree_sitter_yaml::LANGUAGE.into(),
-            Self::Astro => tree_sitter_astro_next::LANGUAGE.into(),
             Self::Containerfile => tree_sitter_containerfile::LANGUAGE.into(),
             Self::Css => tree_sitter_css::LANGUAGE.into(),
             Self::Hcl => tree_sitter_hcl::LANGUAGE.into(),
             Self::Json => tree_sitter_json::LANGUAGE.into(),
             Self::Make => tree_sitter_make::LANGUAGE.into(),
             Self::Scss => tree_sitter_scss::language(),
-            Self::Svelte => tree_sitter_svelte_ng::LANGUAGE.into(),
-            Self::Vue => tree_sitter_vue_next::LANGUAGE.into(),
         }
     }
 }
@@ -174,13 +162,10 @@ mod tests {
     #[test]
     fn recognizes_new_index_languages_by_name_and_extension() {
         let cases = [
-            ("astro", "astro", Language::Astro),
             ("css", "css", Language::Css),
             ("scss", "scss", Language::Scss),
             ("json", "json", Language::Json),
             ("hcl", "tf", Language::Hcl),
-            ("svelte", "svelte", Language::Svelte),
-            ("vue", "vue", Language::Vue),
             ("containerfile", "dockerfile", Language::Containerfile),
             ("make", "mk", Language::Make),
         ];
@@ -194,19 +179,19 @@ mod tests {
     #[test]
     fn new_index_languages_load_tree_sitter_grammars() {
         let languages = [
-            Language::Astro,
             Language::Css,
             Language::Scss,
             Language::Json,
             Language::Hcl,
-            Language::Svelte,
-            Language::Vue,
             Language::Containerfile,
             Language::Make,
         ];
 
+        let mut parser = tree_sitter::Parser::new();
         for language in languages {
-            assert!(language.ts_language().node_kind_count() > 0);
+            parser
+                .set_language(&language.ts_language())
+                .expect("grammar should load");
         }
     }
 
