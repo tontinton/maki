@@ -825,17 +825,20 @@ impl Drop for TaskScope {
     }
 }
 
-/// Re-publishes the task handle on every `poll` so concurrent tasks
-/// on the shared Lua each see their own `TaskCell`.
-pub(crate) struct ScopedFuture<F> {
-    lua: Lua,
-    handle: TaskHandle,
-    /// Waker registration on the task's token, dropped once the hooks have
-    /// fired. Without it nothing would poll us while the handler sits parked
-    /// in an await, and the hooks would wait on a child event that may
-    /// never come.
-    cancel_wait: Option<Pin<Box<dyn Future<Output = ()>>>>,
-    inner: F,
+pin_project_lite::pin_project! {
+    /// Re-publishes the task handle on every `poll` so concurrent tasks
+    /// on the shared Lua each see their own `TaskCell`.
+    pub(crate) struct ScopedFuture<F> {
+        lua: Lua,
+        handle: TaskHandle,
+        // Waker registration on the task's token, dropped once the hooks have
+        // fired. Without it nothing would poll us while the handler sits parked
+        // in an await, and the hooks would wait on a child event that may
+        // never come. Already `Box::pin`ned, so no structural pinning needed.
+        cancel_wait: Option<Pin<Box<dyn Future<Output = ()>>>>,
+        #[pin]
+        inner: F,
+    }
 }
 
 impl<F> ScopedFuture<F> {
@@ -856,21 +859,17 @@ impl<F: Future> Future for ScopedFuture<F> {
         self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        // SAFETY: `inner` is structurally pinned; `lua`/`handle` are
-        // never moved out.
-        let this = unsafe { self.get_unchecked_mut() };
+        let this = self.project();
         // A poll means the task yielded, the cooperation the grace rewards.
-        lock_cell(&this.handle).renew_kill_grace();
-        let prev = this
-            .lua
-            .set_app_data::<TaskHandle>(Arc::clone(&this.handle));
+        lock_cell(this.handle).renew_kill_grace();
+        let prev = this.lua.set_app_data::<TaskHandle>(Arc::clone(this.handle));
         if let Some(wait) = this.cancel_wait.as_mut()
             && wait.as_mut().poll(cx).is_ready()
         {
-            this.cancel_wait = None;
-            fire_cancel_hooks(&this.lua, &this.handle);
+            *this.cancel_wait = None;
+            fire_cancel_hooks(this.lua, this.handle);
         }
-        let result = unsafe { Pin::new_unchecked(&mut this.inner) }.poll(cx);
+        let result = this.inner.poll(cx);
         match prev {
             Some(p) => {
                 this.lua.set_app_data(p);

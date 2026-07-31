@@ -63,9 +63,10 @@ impl JobStore {
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
+            // SAFETY: setsid is async-signal-safe, so it is sound to call in pre_exec.
             unsafe {
                 command.pre_exec(|| {
-                    libc::setsid();
+                    rustix::process::setsid()?;
                     Ok(())
                 });
             }
@@ -243,24 +244,24 @@ fn shell_command(cmd: &str) -> Command {
 fn kill_job(meta: &mut JobMeta) {
     let pid = meta.pid;
     #[cfg(unix)]
-    unsafe {
-        libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+    {
+        use rustix::process::{Pid, Signal, kill_process_group};
+        let raw = match i32::try_from(pid) {
+            Ok(raw) => raw,
+            Err(_) => return,
+        };
+        if let Some(pid) = Pid::from_raw(raw) {
+            let _ = kill_process_group(pid, Signal::KILL);
+        }
     }
     #[cfg(windows)]
     {
-        const PROCESS_TERMINATE: u32 = 0x0001;
-        unsafe extern "system" {
-            fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut std::ffi::c_void;
-            fn TerminateProcess(handle: *mut std::ffi::c_void, exit_code: u32) -> i32;
-            fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
-        }
-        unsafe {
-            let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
-            if !handle.is_null() {
-                TerminateProcess(handle, 1);
-                CloseHandle(handle);
-            }
-        }
+        let _ = Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &pid.to_string()])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
     }
 }
 
@@ -520,7 +521,11 @@ mod tests {
 
     #[cfg(unix)]
     fn group_alive(pid: u32) -> bool {
-        unsafe { libc::killpg(pid as libc::pid_t, 0) == 0 }
+        use rustix::process::{Pid, test_kill_process_group};
+        i32::try_from(pid)
+            .ok()
+            .and_then(Pid::from_raw)
+            .is_some_and(|pid| test_kill_process_group(pid).is_ok())
     }
 
     /// The warm click cell is dropped without ever going through

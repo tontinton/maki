@@ -30,6 +30,7 @@ event-listener = { workspace = true }
 flume = { workspace = true }
 futures = { workspace = true }
 futures-lite = { workspace = true }
+pin-project-lite = { workspace = true }
 tree-sitter = { workspace = true }
 unicode-width = { workspace = true }
 regex = { workspace = true }
@@ -67,8 +68,9 @@ tree-sitter-typescript = { workspace = true }
 tree-sitter-zig = { workspace = true }
 tree-sitter-dart = { workspace = true }
 tree-sitter-yaml = { workspace = true }
+
 [target.'cfg(unix)'.dependencies]
-libc = { workspace = true }
+rustix = { workspace = true }
 
 [dev-dependencies]
 base64 = { workspace = true }

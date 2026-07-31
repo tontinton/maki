@@ -118,6 +118,8 @@ jiff = { version = "0.2", default-features = false, features = ["std", "tz-syste
 arboard = { version = "3", default-features = false, features = ["image-data", "wayland-data-control"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 flume = { version = "0.11", default-features = false, features = ["async", "select"] }
+pin-project-lite = "0.2"
+rustix = { version = "1", default-features = false, features = ["process"] }
 humantime = "2"
 toml = "0.8"
 toml_edit = "0.22"

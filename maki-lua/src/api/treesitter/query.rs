@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use maki_lua_macro::{lua_class, lua_fn, lua_table};
 use mlua::{Lua, MultiValue, Value as LuaValue};
 use regex::Regex;
-use tree_sitter::{Node, Query, QueryCursor, QueryPredicateArg, StreamingIterator, Tree};
+use tree_sitter::{Query, QueryCursor, QueryPredicateArg, StreamingIterator};
 
 use crate::docs::{FnDoc, ParamDoc};
 use crate::language::Language;
@@ -93,13 +93,13 @@ fn query_fields<F: mlua::UserDataFields<LuaQuery>>(fields: &mut F) {
 fn query_methods<M: mlua::UserDataMethods<LuaQuery>>(methods: &mut M) {
     methods.add_method("iter_captures", |lua, this, args: MultiValue| {
         let parsed = IterArgs::parse(args, "iter_captures")?;
-        let results = collect_captures(&this.inner, &parsed);
+        let results = collect_captures(&this.inner, &parsed)?;
         stateful_iter(lua, results)
     });
 
     methods.add_method("iter_matches", |lua, this, args: MultiValue| {
         let parsed = IterArgs::parse(args, "iter_matches")?;
-        let results = collect_matches(&this.inner, &parsed);
+        let results = collect_matches(&this.inner, &parsed)?;
         stateful_iter(lua, results)
     });
 }
@@ -163,8 +163,7 @@ lua_table! {
 }
 
 struct IterArgs {
-    node: Node<'static>,
-    tree: Arc<Tree>,
+    lua_node: LuaNode,
     source: String,
     start_row: Option<usize>,
     stop_row: Option<usize>,
@@ -192,8 +191,7 @@ impl IterArgs {
         let stop_row = args_iter.next().and_then(lua_to_usize);
 
         Ok(Self {
-            node: lua_node.node,
-            tree: Arc::clone(&lua_node.tree),
+            lua_node: lua_node.clone(),
             source,
             start_row,
             stop_row,
@@ -277,13 +275,14 @@ fn new_cursor(start_row: Option<usize>, stop_row: Option<usize>) -> QueryCursor 
     cursor
 }
 
-fn collect_captures(query: &Query, args: &IterArgs) -> Vec<CaptureEntry> {
+fn collect_captures(query: &Query, args: &IterArgs) -> mlua::Result<Vec<CaptureEntry>> {
     let source_bytes = args.source.as_bytes();
     let mut cursor = new_cursor(args.start_row, args.stop_row);
     let mut regex_cache = HashMap::new();
     let mut results = Vec::new();
 
-    let mut captures = cursor.captures(query, args.node, source_bytes);
+    let node = args.lua_node.ts_node()?;
+    let mut captures = cursor.captures(query, node, source_bytes);
     while let Some((m, capture_idx)) = captures.next() {
         let mut metadata = HashMap::new();
         if !evaluate_predicates(
@@ -299,20 +298,21 @@ fn collect_captures(query: &Query, args: &IterArgs) -> Vec<CaptureEntry> {
         let capture = &m.captures[*capture_idx];
         results.push(CaptureEntry {
             capture_index: capture.index,
-            node: LuaNode::new(capture.node, Arc::clone(&args.tree)),
+            node: LuaNode::new(capture.node, Arc::clone(&args.lua_node.tree)),
             metadata,
         });
     }
-    results
+    Ok(results)
 }
 
-fn collect_matches(query: &Query, args: &IterArgs) -> Vec<MatchEntry> {
+fn collect_matches(query: &Query, args: &IterArgs) -> mlua::Result<Vec<MatchEntry>> {
     let source_bytes = args.source.as_bytes();
     let mut cursor = new_cursor(args.start_row, args.stop_row);
     let mut regex_cache = HashMap::new();
     let mut results = Vec::new();
 
-    let mut matches = cursor.matches(query, args.node, source_bytes);
+    let node = args.lua_node.ts_node()?;
+    let mut matches = cursor.matches(query, node, source_bytes);
     while let Some(m) = matches.next() {
         let mut metadata = HashMap::new();
         if !evaluate_predicates(
@@ -330,7 +330,7 @@ fn collect_matches(query: &Query, args: &IterArgs) -> Vec<MatchEntry> {
             captures_map
                 .entry(capture.index)
                 .or_default()
-                .push(LuaNode::new(capture.node, Arc::clone(&args.tree)));
+                .push(LuaNode::new(capture.node, Arc::clone(&args.lua_node.tree)));
         }
         results.push(MatchEntry {
             pattern_index: m.pattern_index,
@@ -338,7 +338,7 @@ fn collect_matches(query: &Query, args: &IterArgs) -> Vec<MatchEntry> {
             metadata,
         });
     }
-    results
+    Ok(results)
 }
 
 #[derive(Clone, Copy)]
