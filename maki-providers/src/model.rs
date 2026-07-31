@@ -447,13 +447,22 @@ impl TokenUsage {
     }
 
     pub fn format(&self, cost: Option<f64>) -> String {
+        self.format_cost(cost, "")
+    }
+
+    /// Like [`format`](Self::format), but marks the cost as a running total.
+    pub fn format_sum_cost(&self, cost: Option<f64>) -> String {
+        self.format_cost(cost, "Σ")
+    }
+
+    fn format_cost(&self, cost: Option<f64>, prefix: &str) -> String {
         let tokens = format!(
             "{}↑ {}↓",
             format_tokens(self.total_input()),
             format_tokens(self.output)
         );
         match cost {
-            Some(cost) => format!("{tokens} ${cost:.3}"),
+            Some(cost) => format!("{tokens} {prefix}${cost:.3}"),
             None => tokens,
         }
     }
@@ -529,6 +538,18 @@ mod tests {
     #[test_case(TokenUsage { input: u32::MAX, output: 1, cache_creation: 1, cache_read: 1 }, None, "4295.0m↑ 1↓" ; "input_saturates")]
     fn usage_formatting(usage: TokenUsage, cost: Option<f64>, expected: &str) {
         assert_eq!(usage.format(cost), expected);
+    }
+
+    #[test]
+    fn sum_marker_applies_only_to_the_cost() {
+        let usage = TokenUsage {
+            input: 12_000,
+            output: 456,
+            cache_creation: 200,
+            cache_read: 100,
+        };
+        assert_eq!(usage.format_sum_cost(Some(1.5)), "12.3k↑ 456↓ Σ$1.500");
+        assert_eq!(usage.format_sum_cost(None), usage.format(None));
     }
 
     #[test_case("no-slash-here", ModelError::InvalidFormat ; "invalid_format")]

@@ -74,8 +74,9 @@ fn dispatch_ctx<'a>(ctx: &'a LuaCtx, method: &str) -> Result<&'a AgentContext, S
 }
 
 /// Forwards subagent events to the parent, stamped with the subagent identity.
-/// Usage takes two paths: live on the tool header while the run goes on, and one
-/// total per run on `usage_tx`, which `prompt` waits for.
+/// Usage takes two paths: live on the tool header while the run goes on (last
+/// turn's tokens plus the run's summed cost), and one total per run on
+/// `usage_tx`, which `prompt` waits for.
 async fn relay_session_events(
     sub_rx: flume::Receiver<Envelope>,
     parent_tx: EventSender,
@@ -83,15 +84,13 @@ async fn relay_session_events(
     usage_tx: flume::Sender<TokenUsage>,
     live_sink: Option<flume::Sender<ToolLive>>,
 ) {
-    let mut cumulative = TokenUsage::default();
     let mut cost = None;
     while let Ok(mut envelope) = sub_rx.recv_async().await {
         match &envelope.event {
             AgentEvent::TurnComplete(turn) => {
-                cumulative += turn.usage;
                 add_cost(&mut cost, turn.cost);
                 if let Some(sink) = &live_sink {
-                    let _ = sink.send(ToolLive::Usage(cumulative.format(cost)));
+                    let _ = sink.send(ToolLive::Usage(turn.usage.format_sum_cost(cost)));
                 }
             }
             AgentEvent::Done { usage, .. } => {
@@ -899,7 +898,6 @@ mod tests {
     const RUN_ID: u64 = 7;
     const PARENT_ID: &str = "task-1";
     const IGNORED_ERROR: &str = "handled by the session caller";
-    const EXPECTED_LIVE: &[&str] = &["100↑ 20↓ $0.250", "150↑ 30↓ $0.750"];
     const DONE_USAGE: TokenUsage = tokens(150, 30);
 
     const fn tokens(input: u32, output: u32) -> TokenUsage {
@@ -977,11 +975,15 @@ mod tests {
                 _ => panic!("relay must only publish usage"),
             })
             .collect::<Vec<_>>();
-        assert_eq!(live, EXPECTED_LIVE);
+        let expected = [
+            tokens(100, 20).format_sum_cost(Some(0.25)),
+            tokens(50, 10).format_sum_cost(Some(0.75)),
+        ];
+        assert_eq!(live, expected);
         assert_eq!(usage_rx.try_recv(), Ok(DONE_USAGE));
 
         let forwarded = parent_rx.drain().collect::<Vec<_>>();
-        assert_eq!(forwarded.len(), EXPECTED_LIVE.len());
+        assert_eq!(forwarded.len(), expected.len());
         assert!(forwarded.iter().all(|envelope| {
             matches!(envelope.event, AgentEvent::TurnComplete(_))
                 && envelope

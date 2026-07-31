@@ -15,7 +15,7 @@ use maki_agent::tools::{ToolInvocation, ToolRegistry, WRITE_TOOL_NAME};
 use maki_agent::{AgentEvent, BufferSnapshot, ToolDoneEvent, ToolOutput, ToolStartEvent};
 use maki_config::{ToolKey, ToolOutputLines, UiConfig};
 use maki_lua::WinView;
-use maki_providers::{ContentBlock, Message, Role, TokenUsage};
+use maki_providers::{ContentBlock, Message, Role};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Color;
@@ -42,7 +42,6 @@ pub enum ChatEventResult {
 
 pub struct Chat {
     pub name: String,
-    pub token_usage: TokenUsage,
     pub cost: Option<f64>,
     pub context_size: u32,
     pub model_id: Option<String>,
@@ -55,7 +54,6 @@ impl Chat {
     pub fn new(name: String, ui_config: UiConfig, lua_event_handle: maki_lua::EventHandle) -> Self {
         Self {
             name,
-            token_usage: TokenUsage::default(),
             cost: None,
             context_size: 0,
             model_id: None,

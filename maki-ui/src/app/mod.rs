@@ -1056,7 +1056,6 @@ impl App {
 
         if let AgentEvent::TurnComplete(ref tc) = envelope.event {
             self.state.token_usage += tc.usage;
-            self.chats[chat_idx].token_usage += tc.usage;
             add_cost(&mut self.chats[chat_idx].cost, tc.cost);
             self.state
                 .session_mut()
@@ -1068,8 +1067,7 @@ impl App {
             }
             self.chats[chat_idx].set_pending_turn_usage(tc.usage.format(tc.cost));
             if let Some(tool_id) = &subagent_id {
-                let chat = &self.chats[chat_idx];
-                let formatted = chat.token_usage.format(chat.cost);
+                let formatted = tc.usage.format_sum_cost(self.chats[chat_idx].cost);
                 self.chats[0].set_tool_turn_usage(tool_id, formatted);
             }
         }

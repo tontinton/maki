@@ -733,8 +733,6 @@ fn turn_complete_tracks_usage_and_context_per_chat() {
 
     assert_eq!(app.state.token_usage.input, 300);
     assert_eq!(app.state.token_usage.output, 125);
-    assert_eq!(app.chats[0].token_usage.input, 100);
-    assert_eq!(app.chats[1].token_usage.input, 200);
     assert_eq!(app.chats[0].context_size, main_usage.context_tokens());
     assert_eq!(app.chats[1].context_size, sub_usage.context_tokens());
 }
@@ -763,28 +761,34 @@ fn sub_turn_complete() -> Msg {
     )
 }
 
-/// Uses the same formatter as the header: these tests pin which tool gets the
+/// Built with the header's own formatter: these tests pin which tool gets the
 /// usage, not how it is spelled (maki-providers covers the spelling).
-fn sub_usage_text(turns: u32) -> String {
-    let mut total = TokenUsage::default();
-    for _ in 0..turns {
-        total += SUB_TOKENS;
-    }
-    total.format(SUB_COST.map(|cost| cost * f64::from(turns)))
+fn sub_usage_text() -> String {
+    SUB_TOKENS.format_sum_cost(SUB_COST)
 }
 
 #[test]
-fn subagent_turn_complete_updates_matching_parent_header_cumulatively() {
+fn subagent_turn_complete_updates_matching_parent_header_with_last_turn() {
     let mut app = streaming_app();
     app.update(agent_msg(tool_start(TASK_ID, "task")));
     app.update(agent_msg(tool_start("task2", "task")));
 
     app.update(sub_turn_complete());
-    app.update(sub_turn_complete());
+    // The second turn's tokens differ, so a sum or a stale first turn would fail.
+    let last = TokenUsage {
+        input: 42,
+        ..SUB_TOKENS
+    };
+    app.update(subagent_msg(
+        turn_complete(last, "child-model", SUB_COST),
+        TASK_ID,
+        Some(SUBAGENT_NAME),
+    ));
 
+    let expected = last.format_sum_cost(SUB_COST.map(|cost| cost * 2.0));
     assert_eq!(
         app.chats[0].tool_turn_usage(TASK_ID),
-        Some(sub_usage_text(2).as_str())
+        Some(expected.as_str())
     );
     assert_eq!(app.chats[0].tool_turn_usage("task2"), None);
 }
@@ -806,7 +810,7 @@ fn parent_turn_flush_stamps_the_last_unstamped_tool(subagent_ran: bool) {
     app.update(agent_msg(tool_results_submitted()));
 
     let expected = if subagent_ran {
-        sub_usage_text(1)
+        sub_usage_text()
     } else {
         MAIN_TOKENS.format(MAIN_COST)
     };
@@ -836,7 +840,7 @@ fn tool_inside_subagent_chat_gets_its_turn_usage() {
 
     assert_eq!(
         app.chats[1].tool_turn_usage(TOOL_ID),
-        Some(sub_usage_text(1).as_str())
+        Some(SUB_TOKENS.format(SUB_COST).as_str())
     );
 }
 
