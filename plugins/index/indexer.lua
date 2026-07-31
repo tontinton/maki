@@ -52,12 +52,23 @@ local EXT_TO_LANG = {
   yaml = "yaml",
   yml = "yaml",
   sql = "sql",
+  css = "css",
+  json = "json",
+  hcl = "hcl",
+  tf = "hcl",
+  tfvars = "hcl",
+  dockerfile = "containerfile",
+  mk = "make",
 }
 
 local FILENAME_TO_LANG = {
   ["MODULE.bazel"] = "bazel_module",
   ["BUILD"] = "bazel_build",
   ["BUILD.bazel"] = "bazel_build",
+  ["Containerfile"] = "containerfile",
+  ["Dockerfile"] = "containerfile",
+  ["GNUmakefile"] = "make",
+  ["Makefile"] = "make",
 }
 
 local LANG_TO_PARSER = {
@@ -324,6 +335,10 @@ local SECTIONS = {
   { key = "Import", header = "imports:" },
   { key = "Module", header = "mod:" },
   { key = "Constant", header = "consts:" },
+  { key = "Rule", header = "rules:" },
+  { key = "Instruction", header = "instructions:" },
+  { key = "Target", header = "targets:" },
+  { key = "Block", header = "blocks:" },
   { key = "Type", header = "types:" },
   { key = "Trait", header = "traits:" },
   { key = "Impl", header = "impls:" },

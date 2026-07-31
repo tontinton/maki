@@ -29,6 +29,11 @@ pub enum Language {
     Sql,
     Toml,
     Yaml,
+    Containerfile,
+    Css,
+    Hcl,
+    Json,
+    Make,
 }
 
 impl Language {
@@ -61,6 +66,11 @@ impl Language {
             "sql" => Some(Self::Sql),
             "toml" => Some(Self::Toml),
             "yaml" => Some(Self::Yaml),
+            "containerfile" | "dockerfile" => Some(Self::Containerfile),
+            "css" => Some(Self::Css),
+            "hcl" => Some(Self::Hcl),
+            "json" => Some(Self::Json),
+            "make" => Some(Self::Make),
             _ => None,
         }
     }
@@ -94,6 +104,11 @@ impl Language {
             "sql" => Some(Self::Sql),
             "toml" => Some(Self::Toml),
             "yaml" | "yml" => Some(Self::Yaml),
+            "dockerfile" => Some(Self::Containerfile),
+            "css" => Some(Self::Css),
+            "hcl" | "tf" | "tfvars" => Some(Self::Hcl),
+            "json" => Some(Self::Json),
+            "mk" => Some(Self::Make),
             _ => None,
         }
     }
@@ -127,6 +142,11 @@ impl Language {
             Self::Sql => tree_sitter_sequel::LANGUAGE.into(),
             Self::Toml => tree_sitter_toml_ng::LANGUAGE.into(),
             Self::Yaml => tree_sitter_yaml::LANGUAGE.into(),
+            Self::Containerfile => tree_sitter_containerfile::LANGUAGE.into(),
+            Self::Css => tree_sitter_css::LANGUAGE.into(),
+            Self::Hcl => tree_sitter_hcl::LANGUAGE.into(),
+            Self::Json => tree_sitter_json::LANGUAGE.into(),
+            Self::Make => tree_sitter_make::LANGUAGE.into(),
         }
     }
 }

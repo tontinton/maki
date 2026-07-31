@@ -68,6 +68,11 @@ tree-sitter-typescript = { workspace = true }
 tree-sitter-zig = { workspace = true }
 tree-sitter-dart = { workspace = true }
 tree-sitter-yaml = { workspace = true }
+tree-sitter-containerfile = { workspace = true }
+tree-sitter-css = { workspace = true }
+tree-sitter-hcl = { workspace = true }
+tree-sitter-json = { workspace = true }
+tree-sitter-make = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true }
