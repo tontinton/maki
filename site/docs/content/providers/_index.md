@@ -1,6 +1,6 @@
 +++
 title = "Providers"
-weight = 5
+weight = 7
 [extra]
 group = "Reference"
 +++
@@ -255,9 +255,104 @@ zai/glm-4.7
 
 If the model name is unique across providers, the prefix can be omitted.
 
+## providers.toml
+
+`providers.toml` lives in the config directory (`~/.config/maki/providers.toml` on Linux/macOS, `%APPDATA%\maki\providers.toml` on Windows). It is the file for provider overrides and custom HTTP providers. Two jobs:
+
+1. Tweak a built-in (pick a plan, change its base URL, set `enable_free_models` for Opencode).
+2. Declare a custom provider that speaks OpenAI, Anthropic, or Google wire format.
+
+```toml
+# Point a built-in at a proxy. Env vars still win over this file.
+[anthropic]
+base_url = "https://my-proxy.internal"
+
+# Full custom provider. Slug becomes the `provider/` prefix in model specs.
+[my-proxy]
+display_name = "My Proxy"
+protocol = "openai"            # openai | openai-responses | anthropic | google
+base_url = "https://llm.example.com/v1"
+api_key_env = "MY_PROXY_API_KEY"
+default_model = "my-proxy/fast-v1"
+discover_models = true         # also list models via the provider's /models endpoint
+
+[[my-proxy.models]]
+id = "fast-v1"
+tier = "weak"
+context_window = 128000
+max_output_tokens = 16384
+pricing_input = 0.5
+pricing_output = 1.5
+
+[[my-proxy.models]]
+id = "smart-v1"
+tier = "strong"
+context_window = 200000
+max_output_tokens = 32000
+supports_thinking = true
+supports_vision = false
+```
+
+### Provider fields
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `display_name` | string | Shown in pickers and auth status |
+| `protocol` | string | `openai`, `openai-responses`, `anthropic`, or `google`. Required for custom slugs |
+| `base_url` | string | Origin of the API. Maki appends the protocol paths |
+| `plan` | string | Built-in plan key (see Plans below). Sets base URL and default model |
+| `api_key_env` | string | Env var that holds the key. Defaults to `<SLUG>_API_KEY` |
+| `api_key` | string | Inline key (prefer the env var or `maki auth login`) |
+| `default_model` | string | Used after login when no model is saved yet |
+| `discover_models` | bool | When true, also probe the provider's model list endpoint (default false) |
+| `enable_free_models` | bool | Opencode only. Show free catalog models (default false) |
+| `models` | array | Declared models for custom providers (see below) |
+
+### Model fields
+
+| Field | Type | Default | Notes |
+|-------|------|---------|-------|
+| `id` | string | required | Model id. Spec becomes `{slug}/{id}` |
+| `tier` | string | `medium` | `weak`, `medium`, `strong`, or `compaction` |
+| `context_window` | u32 | protocol default | Tokens of context |
+| `max_output_tokens` | u32 | protocol default | Max completion tokens |
+| `supports_tool_examples` | bool | protocol default | |
+| `supports_thinking` | bool | protocol default | |
+| `supports_vision` | bool | protocol default | When false, image input and `view_image` are off |
+| `pricing_input` / `pricing_output` | f64 | 0 | USD per 1M tokens |
+| `pricing_cache_write` / `pricing_cache_read` | f64 | 0 | USD per 1M tokens |
+| `pricing_fast_input` / `pricing_fast_output` | f64 | unset | Fast-mode pricing when the provider supports it |
+
+Custom slugs must not reuse a built-in provider name. A bad TOML parse exits with code 2 at startup so a typo cannot silently empty the registry.
+
+You can also create a custom provider interactively with `maki auth login` and choosing the custom option. That writes a starter entry to this file.
+
+### Plans
+
+Some built-ins ship multiple plans (different base URLs or default models). `maki auth login <provider>` asks which plan to use when more than one exists. You can also set it in TOML:
+
+```toml
+[mistral]
+plan = "coding"
+
+[zai]
+plan = "coding"
+```
+
+Current plans:
+
+| Provider | Plan | What it does |
+|----------|------|--------------|
+| Mistral | `standard` | Standard at `https://api.mistral.ai/v1`, default `mistral/mistral-medium-latest` |
+| Mistral | `coding` | Vibe / Coding at `https://api.mistral.ai/v1`, default `mistral/mistral-vibe-cli-latest` |
+| Z.AI | `standard` | Pay-as-you-go at `https://api.z.ai/api/paas/v4`, default `zai/glm-5.1` |
+| Z.AI | `coding` | Coding plan at `https://api.z.ai/api/coding/paas/v4`, default `zai/glm-5-code` |
+
+Env `<SLUG>_BASE_URL` still wins over both the plan and a `base_url` in this file.
+
 ## Dynamic Providers
 
-To add a custom provider or proxy, drop an executable script into `~/.config/maki/providers/`. The script must handle these subcommands:
+To add a custom provider or proxy, drop an executable script into the config `providers/` directory (`~/.config/maki/providers/` on Linux/macOS, `%APPDATA%\maki\providers\` on Windows). The script must handle these subcommands:
 
 | Subcommand | Timeout | What it does |
 |------------|---------|--------|

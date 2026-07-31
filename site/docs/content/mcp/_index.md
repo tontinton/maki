@@ -1,6 +1,6 @@
 +++
 title = "MCP"
-weight = 6
+weight = 10
 [extra]
 group = "Reference"
 +++
@@ -95,11 +95,13 @@ Good for small servers you rely on every turn. On a big server it defeats the po
 
 ## Naming and namespacing
 
-Server names are ASCII alphanumeric, hyphens ok. Tools get prefixed with their server name: a `read` tool on the `filesystem` server becomes `filesystem__read`. Because of this, `__` is reserved and names can't collide with built-in tools.
+Server names are ASCII alphanumeric, hyphens ok (no dots). Tools get prefixed with their server name: a `read` tool on the `filesystem` server becomes `filesystem__read`. Because of this, `__` is reserved and names can't collide with built-in tools.
+
+Permission rules for MCP tools use the same nested form under `[mcp.<server>]` in `permissions.toml`. See [Permissions](/docs/permissions/#mcp-tool-permissions).
 
 ## Runtime toggling
 
-Turn servers on/off from the MCP picker in the UI. Changes save back to your config.
+Open the MCP picker with `/mcp`. Turn servers on or off there; changes save back to your config (project or global, depending on which file defined the server).
 
 ## Status
 

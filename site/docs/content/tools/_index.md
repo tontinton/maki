@@ -1,13 +1,13 @@
 +++
 title = "Tools"
-weight = 3
+weight = 6
 [extra]
 group = "Reference"
 +++
 
 # Tools
 
-Maki ships with 20 built-in tools. This is the full reference.
+Maki ships with 20 built-in tools in this reference (18 on by default, 2 opt-in via plugin options). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
 
 ## File Operations
 

@@ -208,7 +208,7 @@ fn redact_def(def: &Value) -> Value {
 fn write_front_matter(out: &mut String) {
     writeln!(out, "+++").unwrap();
     writeln!(out, "title = \"Tools\"").unwrap();
-    writeln!(out, "weight = 3").unwrap();
+    writeln!(out, "weight = 6").unwrap();
     writeln!(out, "[extra]").unwrap();
     writeln!(out, "group = \"Reference\"").unwrap();
     writeln!(out, "+++").unwrap();
@@ -294,9 +294,14 @@ pub fn generate() -> String {
     writeln!(out).unwrap();
     writeln!(out, "# Tools").unwrap();
     writeln!(out).unwrap();
+    let opt_in_n = tools.keys().filter(|n| opt_in.contains(**n)).count();
+    let default_n = total - opt_in_n;
     writeln!(
         out,
-        "Maki ships with {total} built-in tools. This is the full reference."
+        "Maki ships with {total} built-in tools in this reference \
+         ({default_n} on by default, {opt_in_n} opt-in via plugin options). \
+         Tools marked **opt-in** are off until you enable them under `plugins` \
+         in [Configuration](/docs/configuration/)."
     )
     .unwrap();
 

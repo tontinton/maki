@@ -51,10 +51,12 @@ local function find_project_ancestors()
     return {}
   end
   local dirs = { cwd }
+  if maki.fs.metadata(maki.fs.joinpath(cwd, ".git")) then
+    return dirs
+  end
   for _, parent in ipairs(maki.fs.parents(cwd)) do
     dirs[#dirs + 1] = parent
-    local git = maki.fs.joinpath(parent, ".git")
-    if maki.fs.metadata(git) then
+    if maki.fs.metadata(maki.fs.joinpath(parent, ".git")) then
       break
     end
   end

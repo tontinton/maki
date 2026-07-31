@@ -6,7 +6,7 @@ use strum::IntoEnumIterator;
 
 const FRONT_MATTER: &str = r#"+++
 title = "Providers"
-weight = 5
+weight = 7
 [extra]
 group = "Reference"
 +++"#;
@@ -76,13 +76,149 @@ zai/glm-4.7
 
 If the model name is unique across providers, the prefix can be omitted."#;
 
+fn providers_toml_section() -> String {
+    let mut plan_rows = String::new();
+    let mut plan_examples = String::new();
+    let mut builtins: Vec<_> = maki_config::providers::all_builtins();
+    builtins.sort_by_key(|b| b.slug);
+    let mut wrote_example = false;
+    for b in builtins {
+        let Some(plans) = b.plans.filter(|p| p.len() > 1) else {
+            continue;
+        };
+        if !wrote_example {
+            let _ = writeln!(plan_examples, "```toml");
+            wrote_example = true;
+        } else {
+            let _ = writeln!(plan_examples);
+        }
+        // Prefer a non-default plan key in the example when one exists.
+        let example_key = plans
+            .iter()
+            .find(|(_, p)| {
+                p.base_url != b.default_base_url || p.default_model != Some(b.default_model)
+            })
+            .unwrap_or(&plans[0])
+            .0;
+        let _ = writeln!(plan_examples, "[{}]", b.slug);
+        let _ = writeln!(plan_examples, "plan = \"{example_key}\"");
+        for (key, plan) in plans {
+            let mut detail = plan.display_name.to_string();
+            if !plan.base_url.is_empty() {
+                detail = format!("{detail} at `{}`", plan.base_url);
+            }
+            if let Some(model) = plan.default_model {
+                detail = format!("{detail}, default `{model}`");
+            }
+            let _ = writeln!(plan_rows, "| {} | `{key}` | {detail} |", b.display_name);
+        }
+    }
+    if wrote_example {
+        let _ = writeln!(plan_examples, "```");
+    }
+
+    let plans_body = if plan_rows.is_empty() {
+        "No built-in currently ships more than one plan.".to_string()
+    } else {
+        format!(
+            "Some built-ins ship multiple plans (different base URLs or default models). \
+`maki auth login <provider>` asks which plan to use when more than one exists. \
+You can also set it in TOML:\n\n\
+{plan_examples}\n\
+Current plans:\n\n\
+| Provider | Plan | What it does |\n\
+|----------|------|--------------|\n\
+{plan_rows}\n\
+Env `<SLUG>_BASE_URL` still wins over both the plan and a `base_url` in this file."
+        )
+    };
+
+    format!(
+        r#"## providers.toml
+
+`providers.toml` lives in the config directory (`~/.config/maki/providers.toml` on Linux/macOS, `%APPDATA%\maki\providers.toml` on Windows). It is the file for provider overrides and custom HTTP providers. Two jobs:
+
+1. Tweak a built-in (pick a plan, change its base URL, set `enable_free_models` for Opencode).
+2. Declare a custom provider that speaks OpenAI, Anthropic, or Google wire format.
+
+```toml
+# Point a built-in at a proxy. Env vars still win over this file.
+[anthropic]
+base_url = "https://my-proxy.internal"
+
+# Full custom provider. Slug becomes the `provider/` prefix in model specs.
+[my-proxy]
+display_name = "My Proxy"
+protocol = "openai"            # openai | openai-responses | anthropic | google
+base_url = "https://llm.example.com/v1"
+api_key_env = "MY_PROXY_API_KEY"
+default_model = "my-proxy/fast-v1"
+discover_models = true         # also list models via the provider's /models endpoint
+
+[[my-proxy.models]]
+id = "fast-v1"
+tier = "weak"
+context_window = 128000
+max_output_tokens = 16384
+pricing_input = 0.5
+pricing_output = 1.5
+
+[[my-proxy.models]]
+id = "smart-v1"
+tier = "strong"
+context_window = 200000
+max_output_tokens = 32000
+supports_thinking = true
+supports_vision = false
+```
+
+### Provider fields
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `display_name` | string | Shown in pickers and auth status |
+| `protocol` | string | `openai`, `openai-responses`, `anthropic`, or `google`. Required for custom slugs |
+| `base_url` | string | Origin of the API. Maki appends the protocol paths |
+| `plan` | string | Built-in plan key (see Plans below). Sets base URL and default model |
+| `api_key_env` | string | Env var that holds the key. Defaults to `<SLUG>_API_KEY` |
+| `api_key` | string | Inline key (prefer the env var or `maki auth login`) |
+| `default_model` | string | Used after login when no model is saved yet |
+| `discover_models` | bool | When true, also probe the provider's model list endpoint (default false) |
+| `enable_free_models` | bool | Opencode only. Show free catalog models (default false) |
+| `models` | array | Declared models for custom providers (see below) |
+
+### Model fields
+
+| Field | Type | Default | Notes |
+|-------|------|---------|-------|
+| `id` | string | required | Model id. Spec becomes `{{slug}}/{{id}}` |
+| `tier` | string | `medium` | `weak`, `medium`, `strong`, or `compaction` |
+| `context_window` | u32 | protocol default | Tokens of context |
+| `max_output_tokens` | u32 | protocol default | Max completion tokens |
+| `supports_tool_examples` | bool | protocol default | |
+| `supports_thinking` | bool | protocol default | |
+| `supports_vision` | bool | protocol default | When false, image input and `view_image` are off |
+| `pricing_input` / `pricing_output` | f64 | 0 | USD per 1M tokens |
+| `pricing_cache_write` / `pricing_cache_read` | f64 | 0 | USD per 1M tokens |
+| `pricing_fast_input` / `pricing_fast_output` | f64 | unset | Fast-mode pricing when the provider supports it |
+
+Custom slugs must not reuse a built-in provider name. A bad TOML parse exits with code 2 at startup so a typo cannot silently empty the registry.
+
+You can also create a custom provider interactively with `maki auth login` and choosing the custom option. That writes a starter entry to this file.
+
+### Plans
+
+{plans_body}"#
+    )
+}
+
 fn dynamic_providers_section() -> String {
     let valid_values: Vec<String> = ProviderKind::iter().map(|k| format!("`{k}`")).collect();
 
     format!(
         r#"## Dynamic Providers
 
-To add a custom provider or proxy, drop an executable script into `~/.config/maki/providers/`. The script must handle these subcommands:
+To add a custom provider or proxy, drop an executable script into the config `providers/` directory (`~/.config/maki/providers/` on Linux/macOS, `%APPDATA%\maki\providers\` on Windows). The script must handle these subcommands:
 
 | Subcommand | Timeout | What it does |
 |------------|---------|--------|
@@ -341,6 +477,7 @@ pub fn generate() -> String {
     }
 
     let _ = writeln!(out, "{MODEL_IDENTIFIERS}\n");
+    let _ = writeln!(out, "{}\n", providers_toml_section());
     let _ = writeln!(out, "{}", dynamic_providers_section());
 
     out

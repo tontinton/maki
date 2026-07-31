@@ -269,41 +269,48 @@ maki.setup({{
         "
 ## Directory layout
 
-Maki uses XDG directories on Linux and macOS:
+Maki follows platform directory conventions. On Linux and macOS that is XDG. On Windows, config, data, state, and logs all live under Roaming AppData (Windows has no separate state dir in this layout).
 
-| Purpose | Path |
-|---------|------|
-| Config | `~/.config/maki/` (init.lua, permissions.toml, mcp.toml) |
-| Data | `~/.local/share/maki/` |
-| Logs | `~/.local/logs/maki/` |
-| State | `~/.local/state/maki/` |
+| Purpose | Linux / macOS | Windows |
+|---------|---------------|---------|
+| Config | `~/.config/maki/` | `%APPDATA%\\maki\\` |
+| Data | `~/.local/share/maki/` | `%APPDATA%\\maki\\` |
+| State | `~/.local/state/maki/` | `%APPDATA%\\maki\\` |
+| Logs | `~/.local/logs/maki/` | `%APPDATA%\\maki\\` |
+| Cache | `~/.cache/maki/` | `%LOCALAPPDATA%\\maki\\` |
 
-`~/.maki/` is checked as a legacy fallback.
+Config holds `init.lua`, `permissions.toml`, `mcp.toml`, `providers.toml`, and `commands/`. State holds sessions, auth tokens, memories, plans, and model-tier overrides. The install script puts the binary under `%LOCALAPPDATA%\\maki` on Windows; that is separate from these runtime dirs.
+
+`~/.maki/` (or `%USERPROFILE%\\.maki\\`) is checked as a legacy fallback. If that directory still exists, maki uses it for everything until you migrate.
 
 ### Migrating from ~/.maki/
-
-Older versions stored everything in `~/.maki/`. If that directory still exists, maki uses it
-as a fallback. To move to XDG directories, run:
 
 ```
 maki migrate xdg
 ```
 
-This safely moves sessions, auth, plans, memories, logs, and preferences to XDG locations.
-Where both old and new files exist, they are merged (input history, model tiers, etc.).
-Nothing is deleted until it has been copied. At the end you get a summary of where everything
-lives now.
+This safely moves sessions, auth, plans, memories, logs, and preferences to the platform locations above. Where both old and new files exist, they are merged (input history, model tiers, etc.). Nothing is deleted until it has been copied. At the end you get a summary of where everything lives now.
 
 Safe to run more than once.
 
 ## Personal Instructions
 
-On top of `AGENTS.md`, you can add your own instructions in two places:
+On top of the project instruction files Maki loads from the git root down to the cwd (`AGENTS.md`, `CLAUDE.md`, and friends; see [Quick Start](/docs/quick-start/#instruction-files)), you can add:
 
-- `AGENTS.local.md` at project root for per-project preferences (gitignored)
+- `AGENTS.local.md` in any of those project directories for per-directory preferences (gitignored)
 - `~/.config/maki/AGENTS.md` for preferences that apply to all projects
 
-Both are added to the system prompt at the start of every session."
+All of these are added to the system prompt at the start of every session.
+
+## Memory
+
+The `memory` tool and `/memory` command store small Markdown notes under the state directory, scoped per project:
+
+`…/state/maki/projects/<project-id>/memories/`
+
+(Linux/macOS: `~/.local/state/maki/…`; Windows: `%APPDATA%\\maki\\…`). Use them for non-obvious gotchas and decisions that should survive across sessions. They are separate from skills and from `AGENTS.md`.
+
+Related pages: [Skills](/docs/skills/), [CLI](/docs/cli/), [Providers](/docs/providers/#providerstoml)."
     )
     .unwrap();
 

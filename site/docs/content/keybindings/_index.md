@@ -1,6 +1,6 @@
 +++
 title = "Keybindings"
-weight = 7
+weight = 5
 [extra]
 group = "Reference"
 +++
@@ -27,7 +27,7 @@ On macOS, some bindings use Option or Fn keys instead (run `/help` for exact key
 | Key | Action |
 |-----|--------|
 | `Enter` | Submit prompt |
-| `\+Enter` / `Ctrl+J` / `Alt+Enter` | Newline |
+| `Shift+Enter` / `Ctrl+Enter` / `Ctrl+J` / `Alt+Enter` | Newline |
 | `Tab` | Toggle mode |
 | `/command` | Open command palette |
 | `Ctrl+W` | Delete word backward |
@@ -120,3 +120,10 @@ maki --no-plugins
 Skips user `init.lua` files (global and project) but keeps the Lua host and builtin plugins running, so tools still work. `permissions.toml`, custom commands, and env files load as usual.
 
 The default keymap lives in Rust, not Lua, so `--no-plugins` never drops it.
+
+## Shell and images
+
+These are input conventions, not remappable key rows:
+
+- Prefix a line with `!` to run a shell command yourself (5 minute timeout). Use `!!` to hide the command and its output from the agent.
+- `Ctrl+V` pastes an image from the clipboard into the prompt when the model supports vision. You can also paste image file paths.

@@ -20,19 +20,21 @@ New to Maki? Two pages get you going:
 
 Answers to the "how do I..." questions once Maki is running:
 
-- [Commands](/docs/commands/): everything behind the `/` palette, from `/model` to `/btw`.
-- [Keybindings](/docs/keybindings/): move around the TUI without touching the mouse.
-- [Tools](/docs/tools/): the full reference for the 20 built-in tools the agent works with.
-- [Permissions](/docs/permissions/): decide what the agent may do on its own and when it must ask you first.
+- [Commands](/docs/commands/): `/` palette, concurrent sessions (`/new`, `/sessions`), toggles, and custom commands.
+- [Keybindings](/docs/keybindings/): move around the TUI without touching the mouse. Prefix input with `!` to run a shell command yourself.
+- [Tools](/docs/tools/): the full reference for the built-in tools the agent works with (including `memory` and `skill`).
+- [Permissions](/docs/permissions/): which tools are gated, YOLO, and when Maki asks first.
+- [Skills](/docs/skills/): on-demand Markdown playbooks the agent can load for a workflow.
 
 ## Connecting things
 
-- [Providers](/docs/providers/): Anthropic, OpenAI, Ollama, and friends, plus the weak, medium, and strong model tiers.
+- [Providers](/docs/providers/): Anthropic, OpenAI, Ollama, and friends, plus `providers.toml` and model tiers.
 - [MCP](/docs/mcp/): plug in external tool servers over stdio or HTTP.
 
 ## Extending and embedding
 
 - [Lua API](/docs/lua-api/): write plugins in Lua with an API that mirrors Neovim.
+- [CLI](/docs/cli/): flags and subcommands (`auth`, `models`, `acp`, `prompt`, ...).
 - [Headless Mode](/docs/headless/): run Maki with `--print` in scripts and CI. Output is Claude Code compatible.
 - [ACP](/docs/acp/): drive Maki from your editor, like [Zed](https://zed.dev/), over the Agent Client Protocol.
 

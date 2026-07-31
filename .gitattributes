@@ -1,0 +1,4 @@
+# Keep docs and embedded plugin sources LF so maki-docgen output is
+# identical on Windows (core.autocrlf) and Unix.
+*.lua text eol=lf
+site/docs/content/** text eol=lf

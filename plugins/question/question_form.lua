@@ -540,7 +540,7 @@ local function render_selecting(state, width)
 
   local footer
   if state.mode == MODE.EDITING_CUSTOM then
-    footer = { { "Enter", "submit" }, { "Alt+Enter", "newline" }, { "Esc", "cancel" } }
+    footer = { { "Enter", "submit" }, { "Shift+Enter", "newline" }, { "Esc", "cancel" } }
   elseif q.multiple then
     footer = { { "Enter", "toggle" }, { "Tab", "next" }, { "Esc", "dismiss" } }
   else

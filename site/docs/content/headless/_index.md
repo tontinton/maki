@@ -1,6 +1,6 @@
 +++
 title = "Headless Mode"
-weight = 8
+weight = 13
 [extra]
 group = "Reference"
 +++
@@ -57,7 +57,7 @@ For tools like Conductor, Windsurf, or custom orchestrators that speak the Claud
 maki --print --input-format stream-json
 ```
 
-This enters a bidirectional NDJSON loop over stdio instead of the one-shot print path. Inbound messages (`user`, `control_request`, `control_response`) drive the agent; outbound messages (`system`, `assistant`, `result`, `stream_event`, `control_request`) match the Claude Code SDK shape.
+This enters a bidirectional NDJSON loop over stdio instead of the one-shot print path. Inbound messages (`user`, `control_request`, `control_response`, `control_cancel_request`) drive the agent; outbound messages (`system`, `assistant`, `user`, `result`, `stream_event`, `control_request`, `control_response`) match the Claude Code SDK shape.
 
 Under the hood it reuses the same `spawn_interactive` driver as the TUI and ACP server, so sessions, tools, and permissions all work the same way.
 
@@ -65,16 +65,23 @@ Under the hood it reuses the same `spawn_interactive` driver as the TUI and ACP 
 
 | Flag | Description |
 |------|-------------|
-| `--system-prompt` | Override the system prompt entirely |
-| `--append-system-prompt` | Append text to the built-in system prompt |
-| `--max-turns` | Cap the number of agent turns |
-| `--session-id <id>` | Set a specific session ID |
-| `--resume <id>` / `-s <id>` | Resume an existing session |
-| `--fork-session` | Load a session's history under a new ID |
-| `--continue` | Resume the most recent session in the current directory |
-| `--permission-mode <mode>` | `default`, `acceptEdits`, `plan`, or `bypassPermissions` |
-| `--include-partial-messages` | Stream Anthropic-shaped deltas (`message_start`, `content_block_delta`, ...) |
+| `--system-prompt` | Override the system prompt entirely (**SDK only**) |
+| `--append-system-prompt` | Append text to the built-in system prompt (**SDK only**) |
+| `--max-turns` | Cap the number of agent turns (**SDK only**) |
+| `--session-id <id>` | Set a specific session ID (**SDK only**) |
+| `--resume <id>` / `-s <id>` | Resume an existing session (**SDK / TUI**; not one-shot `--print`) |
+| `--fork-session` | Load a session's history under a new ID (**SDK only**) |
+| `--continue` | Resume the most recent session (**SDK / TUI**; not one-shot `--print`) |
+| `--permission-mode <mode>` | **SDK only**: `default`, `acceptEdits` (compat, same as default today), `plan` (plan file `./plan.md` under cwd), or `bypassPermissions` (YOLO) |
+| `--include-partial-messages` | Stream Anthropic-shaped deltas (**SDK only**) |
 | `--allowed-tools` / `--disallowed-tools` | Comma-separated tool allow/deny lists (PascalCase or snake_case) |
+| `--image <PATH>` | Attach an image as vision content (repeatable; one-shot `--print`) |
+| `--no-plugins` / `--no-commands` / `--no-rtk` / `--no-jit` | Same meaning as in the TUI; see [CLI](/docs/cli/) |
+| `--yolo` | Skip permission prompts on gated tools (deny rules still apply) |
+
+One-shot `--print` always starts a **new** session and always runs in **build** mode. Plan mode and session resume need the SDK path (or the TUI). The plan file for SDK `--permission-mode plan` is `./plan.md` under cwd, not the state-dir `plans/<slug>.md` files the TUI uses.
+
+The full flag matrix lives on the [CLI](/docs/cli/) page.
 
 ### Quick example
 

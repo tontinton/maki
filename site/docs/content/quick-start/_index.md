@@ -85,29 +85,47 @@ Type a prompt, press **Enter**, and the agent starts working.
 
 ## Keybindings
 
-These are the defaults. Plugins and `init.lua` can rebind most of them with `maki.keymap.set`; see [Keybindings](../keybindings/) for precedence and caveats.
+These are the defaults. Plugins and `init.lua` can rebind most of them with `maki.keymap.set`; see [Keybindings](/docs/keybindings/) for precedence and caveats.
 
-- **Newline in input**: \\+Enter, Ctrl+J, or Alt+Enter
+- **Newline in input**: Shift+Enter, Ctrl+Enter, Ctrl+J, or Alt+Enter
 - **Scroll output**: Ctrl+U / Ctrl+D (half page)
 - **Cancel streaming**: Esc Esc
 - **Rewind (when idle)**: Esc Esc
+- **Toggle plan / build**: Tab
+- **Paste image from clipboard**: Ctrl+V (needs a vision-capable model)
+- **Run a shell command yourself**: prefix the input with `!` (or `!!` to hide it from the agent). 5 minute timeout. This is your shell, not the agent `bash` tool.
 - **Quit**: Ctrl+C
 - **All keybindings**: Ctrl+H
 
+## Sessions
+
+`/new` starts another session while the previous one keeps working in the background. `/sessions` (or the session picker) jumps between them. See [Commands](/docs/commands/#sessions).
+
 ## Choosing a Model
 
-Set a default in your config:
+Connect a provider first:
+
+```bash
+maki auth login          # interactive picker
+# or export ANTHROPIC_API_KEY=...
+```
+
+Set a default in your config (optional; otherwise Maki remembers the last model you used):
 
 ```lua
 -- ~/.config/maki/init.lua
 maki.setup({
     provider = {
-        default_model = "anthropic/claude-sonnet-4-20250514",
+        default_model = "anthropic/claude-sonnet-4-6",
     },
 })
 ```
 
-Switch models mid-session with the `/model` command.
+Switch models mid-session with `/model`. See [Providers](/docs/providers/) for the full catalog and [CLI](/docs/cli/) for `maki auth` / `maki models`.
+
+## Plan before you edit
+
+Press `Tab` to enter plan mode. The agent may only write the plan file until you approve implementation. Press `Tab` again to return to build mode, or use the plan form when the draft is ready.
 
 ## Project Configuration
 
@@ -118,13 +136,31 @@ Add a `.maki/` directory to your project root for per-project settings:
 ├── init.lua           # Overrides global config
 ├── permissions.toml   # Permission rules
 ├── mcp.toml           # MCP server config
-└── commands/          # Custom slash commands (.md files)
+├── commands/          # Custom slash commands (.md files)
+└── skills/            # Project skills (each dir has a SKILL.md)
 AGENTS.md              # Loaded into agent context automatically
 AGENTS.local.md        # Personal per-project instructions (gitignored)
 ```
 
-Maki also recognizes `CLAUDE.md`, `COPILOT.md`, `.cursorrules`, `CONVENTIONS.md`, `GEMINI.md`, and others as instruction files (first match wins).
+### Instruction files
 
-`AGENTS.md` is loaded at the start of every session. Put coding conventions, repo quirks & gotchas, or off-limits directories in here. Maki will automatically load instruction files inside subdirs when doing a `read` in the subdir.
+At session start Maki walks from the project git root down to the working directory (if there is no `.git` root, only the cwd). In each directory it loads **one** project instruction file (first match wins), then always loads `AGENTS.local.md` if present. Closer directories win on conflicts. After that it loads one global `AGENTS.md` from your config dir:
+
+| Order | File |
+|------|------|
+| 1 | `AGENTS.md` |
+| 2 | `CLAUDE.md` |
+| 3 | `.github/copilot-instructions.md` |
+| 4 | `COPILOT.md` |
+| 5 | `.cursorrules` |
+| 6 | `.windsurfrules` |
+| 7 | `.clinerules` |
+| 8 | `CONVENTIONS.md` |
+| 9 | `GEMINI.md` |
+| 10 | `CODING_AGENT.md` |
+
+Put coding conventions, repo quirks, and off-limits directories in here. When the agent `read`s under a subdirectory, Maki can also pull in that subdir's instruction file if it has not been loaded yet.
+
+For reusable playbooks the agent loads on demand, add a skill under `.maki/skills/`. See [Skills](/docs/skills/).
 
 See [Configuration](/docs/configuration/) for all options.

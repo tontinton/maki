@@ -3,7 +3,7 @@ use maki_ui::keybindings::{ALT_SEP, KEYBINDS, KeyLabel, KeybindContext, Platform
 const FRONTMATTER: &str = "\
 +++
 title = \"Keybindings\"
-weight = 7
+weight = 5
 [extra]
 group = \"Reference\"
 +++";
@@ -187,6 +187,14 @@ fn write_overrides(out: &mut String) {
     );
     out.push_str(
         "The default keymap lives in Rust, not Lua, so `--no-plugins` \
-         never drops it.\n",
+         never drops it.\n\n",
+    );
+    out.push_str("## Shell and images\n\n");
+    out.push_str(
+        "These are input conventions, not remappable key rows:\n\n\
+         - Prefix a line with `!` to run a shell command yourself (5 minute \
+         timeout). Use `!!` to hide the command and its output from the agent.\n\
+         - `Ctrl+V` pastes an image from the clipboard into the prompt when the \
+         model supports vision. You can also paste image file paths.\n",
     );
 }

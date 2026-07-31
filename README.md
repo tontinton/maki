@@ -128,7 +128,7 @@ Run `maki acp` or configure your ACP supporting editor to use maki, e.g. in [Zed
 
 ## Documentation
 
-More info at the [official docs](http://maki.sh/docs).
+More info at the [official docs](https://maki.sh/docs).
 
 > DISCLAIMER: >90% of code in maki was written by maki, guided by humans. The code is not as good as what I would've made in the artisanal hand-made style. But it's also not slop / vibe coded. I just think people should be honest about their use of AI in projects in this era.
 
