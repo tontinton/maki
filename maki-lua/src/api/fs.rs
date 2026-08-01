@@ -427,6 +427,7 @@ async fn write(_lua: Lua, path: String, content: String) -> LuaResult<Pair<bool>
 
 /// Atomically replace {path} with {content}. The parent directory must exist.
 /// Readers observe either the old file or the complete new file.
+/// Existing file permissions are preserved. On Unix, new files use mode 0600.
 ///
 /// @param path string Destination file path. `~/` is expanded.
 /// @param content string Text to write.
@@ -435,10 +436,10 @@ async fn write(_lua: Lua, path: String, content: String) -> LuaResult<Pair<bool>
 /// local ok, err = maki.fs.atomic_write("state.json", encoded)
 /// if err then print("atomic write failed: " .. err) end
 #[lua_fn(guard = FsWrite)]
-async fn atomic_write(lua: Lua, path: String, content: String) -> LuaResult<(Value, Value)> {
+async fn atomic_write(_lua: Lua, path: String, content: String) -> LuaResult<Pair<bool>> {
     let abs = make_absolute(&path)?;
     let result = smol::unblock(move || maki_storage::atomic_write(&abs, content.as_bytes())).await;
-    result_pair(&lua, result.map(|()| true))
+    Ok(pair(result.map(|()| true)))
 }
 
 /// Delete the file, symlink, or directory at {path}.
