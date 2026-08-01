@@ -1317,12 +1317,7 @@ where
     }
 
     pub fn set_subagent_messages(&mut self, id: String, msgs: Vec<M>) {
-        let shrank = self
-            .subagent_messages
-            .get(&id)
-            .is_some_and(|old| msgs.len() < old.len());
-        self.subagent_messages.insert(id, Arc::new(msgs));
-        if shrank {
+        if self.subagent_messages.insert(id, Arc::new(msgs)).is_some() {
             self.rewrite();
         } else {
             self.touch();
@@ -1760,6 +1755,23 @@ mod tests {
         assert!(loaded.tool_outputs().contains_key("tool-1"));
         assert_eq!(loaded.subagent_messages["sub-1"].len(), 2);
         assert_eq!(loaded.subagent_messages["sub-2"].len(), 1);
+    }
+
+    #[test]
+    fn replacing_subagent_messages_rewrites_the_log() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut session: TestSession = Session::new("m", "/project");
+        let mut log = SessionLog::rewrite(dir, &session).unwrap();
+
+        session.set_subagent_messages("sub-1".into(), vec![user_message("old")]);
+        write_through(&mut log, dir, &session);
+
+        session.set_subagent_messages("sub-1".into(), vec![user_message("new")]);
+        write_through(&mut log, dir, &session);
+
+        let loaded = TestSession::load_from(session.id, dir).unwrap();
+        assert_same_session(&loaded, &session);
     }
 
     #[test]
