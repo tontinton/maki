@@ -213,6 +213,22 @@ fn typing_and_submit() {
     assert_eq!(app.main_chat().last_message_text(), "hi");
 }
 
+#[test]
+fn mailbox_wake_starts_without_an_empty_user_bubble() {
+    let mut app = test_app();
+    let actions = app.start_mailbox_run(vec![Message::observation("failed".into())]);
+
+    assert!(matches!(
+        &actions[..],
+        [Action::SendMessage(input)]
+            if input.message.is_empty()
+                && input.preamble.len() == 1
+                && input.preamble[0].is_observation()
+    ));
+    assert_eq!(app.status, Status::Streaming);
+    assert!(app.main_chat().segment_search_texts().is_empty());
+}
+
 fn with_text(app: &mut App) {
     app.update(Msg::Key(key(KeyCode::Char('h'))));
     app.update(Msg::Key(key(KeyCode::Char('i'))));
@@ -1975,6 +1991,31 @@ fn checkpoint_syncs_ephemeral_content_into_meta() {
     assert_eq!(session.meta.mode, Some(StoredMode::Build));
     assert_eq!(session.meta.queued_messages, vec!["queued".to_string()]);
     assert!(session_has_content(session));
+}
+
+#[test]
+fn checkpoint_persists_observations_without_using_them_as_title() {
+    let mut app = test_app();
+    let initial_title = app.state.session.title.clone();
+    let _history = attach_live_history(
+        &mut app,
+        vec![
+            Message::observation("build failed".into()),
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "I will fix it".into(),
+                }],
+                ..Default::default()
+            },
+        ],
+    );
+
+    app.checkpoint();
+
+    assert_eq!(app.state.session.messages().len(), 2);
+    assert!(app.state.session.messages()[0].is_observation());
+    assert_eq!(app.state.session.title, initial_title);
 }
 
 fn drain_writer(app: App, writer: Arc<StorageWriter>) {
@@ -3760,6 +3801,7 @@ fn tool_result_msg(id: &str, text: &str) -> Message {
             is_error: false,
         }],
         display_text: Some(String::new()),
+        ..Default::default()
     }
 }
 

@@ -185,6 +185,9 @@ pub fn replay_history(messages: &[Message]) -> Vec<SessionUpdate> {
 }
 
 fn replay_user(msg: &Message, updates: &mut Vec<SessionUpdate>) {
+    if msg.is_observation() {
+        return;
+    }
     if let Some(text) = msg.user_text() {
         updates.push(SessionUpdate::UserMessageChunk(ContentChunk::new(
             ContentBlock::Text(TextContent::new(text.to_string())),
@@ -286,6 +289,7 @@ mod tests {
             role: MsgRole::Assistant,
             content,
             display_text: None,
+            ..Default::default()
         }
     }
 
@@ -322,6 +326,7 @@ mod tests {
                     is_error: false,
                 }],
                 display_text: None,
+                ..Default::default()
             },
             assistant(vec![MsgBlock::Text {
                 text: "done".into(),
@@ -365,6 +370,12 @@ mod tests {
     }
 
     #[test]
+    fn replay_never_speaks_an_observation_as_the_user() {
+        let obs = Message::observation("[monitor] build failed".into());
+        assert!(updates_json(&[obs]).is_empty());
+    }
+
+    #[test]
     fn replay_failed_tool_result_maps_to_failed_status() {
         let msg = Message {
             role: MsgRole::User,
@@ -374,6 +385,7 @@ mod tests {
                 is_error: true,
             }],
             display_text: None,
+            ..Default::default()
         };
         let json = updates_json(&[msg]);
         assert_eq!(json[0]["sessionUpdate"], "tool_call_update");

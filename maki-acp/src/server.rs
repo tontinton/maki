@@ -477,6 +477,7 @@ mod tests {
                     text: "done".into(),
                 }],
                 display_text: None,
+                ..Default::default()
             },
         ];
         let mut session: Session<Message, TokenUsage, maki_agent::ToolOutput> =

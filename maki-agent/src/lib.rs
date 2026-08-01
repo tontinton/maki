@@ -5,6 +5,7 @@ pub mod cancel;
 pub mod child_guard;
 pub use child_guard::ChildGuard;
 pub mod headless;
+pub mod mailbox;
 pub mod mcp;
 pub use mcp::config::{McpConfigError, McpConfigErrors, McpServerInfo, McpServerStatus};
 pub use mcp::protocol::PromptRole;
@@ -18,6 +19,7 @@ pub use agent::{
     is_instruction_file,
 };
 pub use cancel::{CancelMap, CancelToken, CancelTrigger};
+pub use mailbox::{MailboxError, SessionMailbox};
 pub use maki_config::{AgentConfig, PermissionsConfig, ToolOutputLines};
 pub mod command;
 pub mod diff;

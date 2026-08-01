@@ -178,6 +178,7 @@ pub fn close_dangling_tool_calls(messages: &mut Vec<Message>, note: &str) {
         role: Role::User,
         content: error_results,
         display_text: Some(String::new()),
+        ..Default::default()
     });
 }
 
@@ -236,6 +237,7 @@ mod tests {
                 })
                 .collect(),
             display_text: Some(String::new()),
+            ..Default::default()
         }
     }
 

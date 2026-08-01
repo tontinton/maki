@@ -2514,9 +2514,9 @@ end
 
 Host session primitives. The interactive UI can run several sessions
 at once; these functions let plugins list, create, focus, rename, and
-delete them. Every call round-trips to the UI event loop and returns
-the pair `(value, err)`. Without an interactive UI attached, every
-call returns `nil, "no interactive UI attached"`.
+delete them. Session management returns `nil, "no interactive UI
+attached"` without a UI. `notify` instead targets a live agent mailbox
+directly, so it also works under ACP and SDK frontends.
 
 ---
 
@@ -2671,6 +2671,32 @@ the prompt is queued and picked up when the agent reaches it.
 
 ```lua
 local state, err = maki.session.prompt("run the tests", { session = id })
+```
+
+---
+
+### `maki.session.notify()` {#maki-session-notify}
+
+```lua
+maki.session.notify({text}, {opts?})
+```
+
+Reports {text} to a live session without creating a user turn. The
+observation waits for the session's next agent run.
+
+**Parameters:**
+
+- `{text}` (`string`) What to report. Must not be blank.
+- `{opts?}` (`table`) Options:
+  - `session` (`string`) id of a live session.
+  - `wake` (`boolean`) start a TUI turn when it next becomes idle (default false).
+
+**Returns:** (`boolean|nil`, `string|nil`) true, or nil and an error.
+
+**Example:**
+
+```lua
+maki.session.notify("[monitor] deploy failed", { session = id, wake = true })
 ```
 
 ---

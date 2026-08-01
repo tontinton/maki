@@ -111,6 +111,22 @@ impl SessionStatus {
     }
 }
 
+fn claim_idle_wake(
+    status: SessionStatus,
+    claim: impl FnOnce() -> Vec<Message>,
+) -> Option<Vec<Message>> {
+    if status != SessionStatus::Idle {
+        return None;
+    }
+    let preamble = claim();
+    (!preamble.is_empty()).then_some(preamble)
+}
+
+fn prepend_preamble(preamble: &mut Vec<Message>, mut leading: Vec<Message>) {
+    leading.append(preamble);
+    *preamble = leading;
+}
+
 fn parse_session_id(id: &str) -> Result<MakiId, String> {
     id.parse().map_err(|e: MakiIdParseError| e.to_string())
 }
@@ -548,6 +564,7 @@ impl<'t> EventLoop<'t> {
 
         self.emit_focus_change();
         self.emit_status_changes();
+        self.start_mailbox_runs();
         Ok(())
     }
 
@@ -634,6 +651,25 @@ impl<'t> EventLoop<'t> {
         self.ctx
             .lua_event_handle
             .fire_autocmd("SessionFocusChanged", data);
+    }
+
+    fn start_mailbox_runs(&mut self) {
+        let ready: Vec<_> = self
+            .sessions
+            .iter()
+            .enumerate()
+            .filter_map(|(index, runtime)| {
+                claim_idle_wake(SessionStatus::of(&runtime.app), || {
+                    runtime.handles.claim_mailbox_wake()
+                })
+                .map(|preamble| (index, preamble))
+            })
+            .collect();
+
+        for (index, preamble) in ready {
+            let actions = self.sessions[index].app.start_mailbox_run(preamble);
+            self.dispatch(index, actions);
+        }
     }
 
     /// `List` replies from a background task (the scan can be slow); every
@@ -927,7 +963,7 @@ impl<'t> EventLoop<'t> {
             Action::SendMessage(input) => {
                 let rt = &mut self.sessions[idx];
                 let mut input = *input;
-                input.preamble = rt.app.shell.drain_results();
+                prepend_preamble(&mut input.preamble, rt.app.shell.drain_results());
                 let run_id = rt.app.run_id;
                 rt.handles.queue.push(QueueItem::Message {
                     text: input.message.clone(),
@@ -1160,5 +1196,67 @@ fn scroll_delta(kind: MouseEventKind, lines: u32) -> i32 {
         lines as i32
     } else {
         -(lines as i32)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use super::*;
+
+    const OBSERVATION: &str = "failed";
+    const SHELL_RESULT: &str = "command finished";
+
+    #[test]
+    fn idle_wake_claims_a_non_empty_preamble() {
+        let preamble = claim_idle_wake(SessionStatus::Idle, || {
+            vec![Message::observation(OBSERVATION.into())]
+        })
+        .unwrap();
+
+        assert_eq!(preamble.len(), 1);
+        assert_eq!(preamble[0].user_text(), Some(OBSERVATION));
+    }
+
+    #[test]
+    fn idle_without_messages_and_non_idle_sessions_do_not_start() {
+        assert!(claim_idle_wake(SessionStatus::Idle, Vec::new).is_none());
+
+        for status in [SessionStatus::Working, SessionStatus::NeedsInput] {
+            let called = Cell::new(false);
+            let preamble = claim_idle_wake(status, || {
+                called.set(true);
+                vec![Message::observation(OBSERVATION.into())]
+            });
+
+            assert!(preamble.is_none());
+            assert!(!called.get());
+        }
+    }
+
+    #[test]
+    fn wake_arriving_while_working_runs_when_idle() {
+        let id = maki_storage::id::MakiId::generate();
+        let mailbox = maki_agent::SessionMailbox::register(id);
+        maki_agent::SessionMailbox::notify(id, OBSERVATION.into(), true).unwrap();
+
+        assert!(claim_idle_wake(SessionStatus::Working, || mailbox.claim_wake()).is_none());
+        let preamble = claim_idle_wake(SessionStatus::Idle, || mailbox.claim_wake()).unwrap();
+        assert_eq!(preamble.len(), 1);
+        assert_eq!(preamble[0].user_text(), Some(OBSERVATION));
+    }
+
+    #[test]
+    fn shell_results_do_not_replace_existing_preamble() {
+        let mut preamble = vec![Message::observation(OBSERVATION.into())];
+
+        prepend_preamble(
+            &mut preamble,
+            vec![Message::observation(SHELL_RESULT.into())],
+        );
+
+        let text = preamble.iter().map(Message::user_text).collect::<Vec<_>>();
+        assert_eq!(text, [Some(SHELL_RESULT), Some(OBSERVATION)]);
     }
 }

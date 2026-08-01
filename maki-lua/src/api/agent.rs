@@ -522,6 +522,7 @@ async fn session(
             tool_output_lines: maki_config::ToolOutputLines::default(),
             permissions: Arc::clone(&agent_ctx.permissions),
             session_id: agent_ctx.session_id.clone(),
+            mailbox: None,
             timeouts: agent_ctx.timeouts,
             file_tracker: FileReadTracker::fresh(),
             prompt_slots: Arc::clone(&agent_ctx.prompt_slots),

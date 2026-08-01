@@ -13,7 +13,7 @@ use maki_agent::tools::{
 use maki_agent::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentParams, AgentRunParams, CancelMap,
     CancelToken, CancelTrigger, Envelope, EventSender, History, Instructions, McpCommand,
-    PromptRole, SharedMessages, ToolOutputLines,
+    PromptRole, SessionMailbox, SharedMessages, ToolOutputLines,
 };
 use maki_lua::EventHandle;
 use maki_providers::{AgentError, Message, Model, TokenUsage};
@@ -44,6 +44,7 @@ pub(super) struct AgentLoop {
     answer_rx: Arc<async_lock::Mutex<flume::Receiver<String>>>,
     queue: Arc<QueueReceiver>,
     session_id: Option<SessionRef>,
+    mailbox: Option<SessionMailbox>,
     timeouts: maki_providers::Timeouts,
     lua_handle: EventHandle,
     subagent_cancels: Arc<CancelMap<String>>,
@@ -66,6 +67,7 @@ impl AgentLoop {
         cancel_map: Arc<RunCancelMap>,
         init_cancel: CancelToken,
         session_id: Option<SessionRef>,
+        mailbox: Option<SessionMailbox>,
         timeouts: maki_providers::Timeouts,
         lua_handle: EventHandle,
         subagent_cancels: Arc<CancelMap<String>>,
@@ -90,6 +92,7 @@ impl AgentLoop {
             answer_rx: Arc::new(async_lock::Mutex::new(answer_rx)),
             queue,
             session_id,
+            mailbox,
             timeouts,
             lua_handle,
             subagent_cancels,
@@ -179,10 +182,6 @@ impl AgentLoop {
         }
         self.rebuild_tools(&slot.model, input.workflow);
 
-        for msg in std::mem::take(&mut input.preamble) {
-            self.history.push(msg);
-        }
-
         if let Some(ref prompt_ref) = input.prompt {
             let Some(ref mcp) = self.mcp else {
                 return Err(AgentError::Tool {
@@ -207,7 +206,7 @@ impl AgentLoop {
                     },
                     PromptRole::User => Message::user(text),
                 };
-                self.history.push(msg);
+                input.preamble.push(msg);
             }
         }
 
@@ -233,6 +232,7 @@ impl AgentLoop {
                 tool_output_lines: self.tool_output_lines,
                 permissions: Arc::clone(&self.permissions),
                 session_id: self.session_id.clone(),
+                mailbox: self.mailbox.clone(),
                 timeouts: self.timeouts,
                 file_tracker: Arc::clone(&self.file_tracker),
                 prompt_slots: Arc::new(prompt_slots),

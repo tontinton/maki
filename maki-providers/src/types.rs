@@ -2,6 +2,9 @@
 //! `Message.display_text`: `Some("")` marks a message as synthetic (sent to the API but hidden
 //! from the UI). `user_text()` returns `None` for these, so system-injected messages
 //! (cancel markers, compaction prompts) stay invisible without a separate type.
+//! `Message.kind` answers a different question. Synthetic text is ours and
+//! trusted, it is just not worth showing. An observation comes from outside,
+//! belongs in model context, and must never be mistaken for the user talking.
 
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -160,15 +163,56 @@ pub enum ContentBlock {
     },
 }
 
+/// Who a message came from, which `role` cannot say. Providers only
+/// accept user and assistant, so anything the host wants to report has to
+/// travel as a user message, and without this there is no way to tell it
+/// apart from the user actually typing. A prefix in the text would not do:
+/// a log line can print one.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageKind {
+    /// Someone said this, the user or the model.
+    #[default]
+    Turn,
+    /// The host noticed it and passed it to the model. It stays in session
+    /// history for conversation order but is hidden from user-facing views.
+    Observation,
+}
+
+impl MessageKind {
+    fn is_turn(&self) -> bool {
+        matches!(self, Self::Turn)
+    }
+}
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub role: Role,
     pub content: Vec<ContentBlock>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_text: Option<String>,
+    /// Skipped when it is `Turn`, so sessions written before this existed
+    /// load unchanged.
+    #[serde(default, skip_serializing_if = "MessageKind::is_turn")]
+    pub kind: MessageKind,
 }
 
 impl Message {
+    /// Something the host saw, reported to the model without pretending
+    /// the user said it.
+    pub fn observation(text: String) -> Self {
+        Self {
+            role: Role::User,
+            content: vec![ContentBlock::Text { text }],
+            kind: MessageKind::Observation,
+            ..Default::default()
+        }
+    }
+
+    pub fn is_observation(&self) -> bool {
+        self.kind == MessageKind::Observation
+    }
+
     pub fn user(text: String) -> Self {
         Self {
             role: Role::User,
@@ -182,6 +226,7 @@ impl Message {
             role: Role::User,
             content: vec![ContentBlock::Text { text: ai_text }],
             display_text: Some(display),
+            ..Default::default()
         }
     }
 
@@ -205,6 +250,7 @@ impl Message {
             role: Role::User,
             content: vec![ContentBlock::Text { text }],
             display_text: Some(String::new()),
+            ..Default::default()
         }
     }
 
@@ -239,7 +285,7 @@ impl Message {
 
 impl TitleSource for Message {
     fn first_user_text(&self) -> Option<&str> {
-        if !self.role.is_user() {
+        if !self.role.is_user() || self.is_observation() {
             return None;
         }
         self.user_text()
@@ -679,6 +725,24 @@ mod tests {
         let msg = Message::user_with_images(String::new(), vec![source]);
         assert_eq!(msg.content.len(), 1);
         assert!(matches!(&msg.content[0], ContentBlock::Image { .. }));
+    }
+
+    #[test]
+    fn message_kind_is_backward_compatible() {
+        let old: Message = serde_json::from_value(json!({
+            "role": "user",
+            "content": [{ "type": "text", "text": "hello" }]
+        }))
+        .unwrap();
+        assert_eq!(old.kind, MessageKind::Turn);
+
+        let turn = serde_json::to_value(Message::user("hello".into())).unwrap();
+        assert!(turn.get("kind").is_none());
+
+        let observation = Message::observation("built".into());
+        assert_eq!(observation.first_user_text(), None);
+        let observation = serde_json::to_value(observation).unwrap();
+        assert_eq!(observation["kind"], "observation");
     }
 
     #[test_case(ImageMediaType::Png,  "image/png"  ; "png")]

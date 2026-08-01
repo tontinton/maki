@@ -603,6 +603,38 @@ mod tests {
     }
 
     #[test]
+    fn compaction_keeps_observation_before_dependent_reply() {
+        smol::block_on(async {
+            let provider = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
+            let mut history = History::new(vec![
+                Message::observation("[monitor] build failed".into()),
+                Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::Text {
+                        text: "I will fix it".into(),
+                    }],
+                    ..Default::default()
+                },
+            ]);
+            let (raw_tx, _rx) = flume::unbounded();
+
+            compact_history(
+                &provider,
+                &default_model(),
+                &mut history,
+                &EventSender::new(raw_tx, 0),
+                &CancelToken::none(),
+            )
+            .await
+            .unwrap();
+
+            let requests = provider.requests.lock().unwrap();
+            assert!(requests[0][0].is_observation());
+            assert!(matches!(requests[0][1].role, Role::Assistant));
+        });
+    }
+
+    #[test]
     fn truncate_oldest_round_preserves_text_beside_orphan() {
         let mut messages = vec![
             Message::user("request".into()),
