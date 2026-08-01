@@ -203,6 +203,7 @@ pub(crate) struct EventLoop<'t> {
     terminal: &'t mut ratatui::DefaultTerminal,
     sessions: Vec<SessionRuntime>,
     focused: usize,
+    last_focused: Option<MakiId>,
     ctx: SpawnCtx,
     input: InputReader,
     warn_rx: flume::Receiver<String>,
@@ -394,6 +395,7 @@ impl<'t> EventLoop<'t> {
             terminal,
             sessions: runtimes,
             focused,
+            last_focused: None,
             ctx,
             input: InputReader::spawn(),
             warn_rx: bg.warn_rx,
@@ -544,6 +546,7 @@ impl<'t> EventLoop<'t> {
         }
         drop(slot_model);
 
+        self.emit_focus_change();
         self.emit_status_changes();
         Ok(())
     }
@@ -616,6 +619,21 @@ impl<'t> EventLoop<'t> {
                 }),
             );
         }
+    }
+
+    fn emit_focus_change(&mut self) {
+        let id = self.sessions[self.focused].id();
+        if self.last_focused == Some(id) {
+            return;
+        }
+        let mut data = json!({ "session_id": id });
+        if let Some(previous) = self.last_focused {
+            data["previous_session_id"] = json!(previous.to_string());
+        }
+        self.last_focused = Some(id);
+        self.ctx
+            .lua_event_handle
+            .fire_autocmd("SessionFocusChanged", data);
     }
 
     /// `List` replies from a background task (the scan can be slow); every
