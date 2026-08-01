@@ -1005,6 +1005,24 @@ impl App {
             return vec![];
         }
 
+        match &envelope.event {
+            AgentEvent::ToolStart(event) => self.fire_session_autocmd(
+                "ToolStart",
+                serde_json::json!({
+                    "tool_id": event.id,
+                    "tool": event.tool,
+                }),
+            ),
+            AgentEvent::ToolDone(event) => self.fire_session_autocmd(
+                "ToolDone",
+                serde_json::json!({
+                    "tool_id": event.id,
+                    "tool": event.tool,
+                }),
+            ),
+            _ => {}
+        }
+
         let subagent_id = envelope
             .subagent
             .as_ref()

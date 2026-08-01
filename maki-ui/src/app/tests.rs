@@ -645,6 +645,41 @@ fn load_session_clears_plan() {
 }
 
 #[test]
+fn tool_lifecycle_events_name_the_session_and_tool() {
+    let mut app = streaming_app();
+    let (handle, probe) = maki_lua::test_support::probed_event_handle();
+    app.lua_event_handle = handle;
+    let session_id = app.state.session.id.to_string();
+
+    app.update(agent_msg(tool_start("tool-1", "bash")));
+
+    let (event, data) = probe.try_recv_autocmd().expect("ToolStart fired");
+    assert_eq!(event, "ToolStart");
+    assert_eq!(data["session_id"], serde_json::json!(session_id));
+    assert_eq!(data["tool_id"], "tool-1");
+    assert_eq!(data["tool"], "bash");
+
+    app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+        id: "tool-1".into(),
+        tool: "bash".into(),
+        output: ToolOutput::Plain("done".into()),
+        is_error: false,
+        annotation: None,
+        written_path: None,
+    }))));
+
+    let (event, data) = probe.try_recv_autocmd().expect("ToolDone fired");
+    assert_eq!(event, "ToolDone");
+    assert_eq!(data["session_id"], serde_json::json!(session_id));
+    assert_eq!(data["tool_id"], "tool-1");
+    assert_eq!(data["tool"], "bash");
+
+    app.run_id += 1;
+    app.update(agent_msg_with_run_id(tool_start("stale", "read"), 1));
+    assert!(probe.try_recv_autocmd().is_none());
+}
+
+#[test]
 fn tab_in_palette_completes_command() {
     let mut app = test_app();
     type_slash(&mut app);
