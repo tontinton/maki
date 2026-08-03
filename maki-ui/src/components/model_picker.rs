@@ -100,6 +100,8 @@ pub struct ModelPicker {
     current_spec: String,
     last_spec_count: usize,
     dirty: bool,
+    /// User-moved entry to restore on refresh: `(was_recent, spec)`.
+    anchor: Option<(bool, String)>,
 }
 
 impl ModelPicker {
@@ -111,6 +113,7 @@ impl ModelPicker {
             current_spec: String::new(),
             last_spec_count: 0,
             dirty: false,
+            anchor: None,
         }
     }
 
@@ -121,9 +124,11 @@ impl ModelPicker {
 
     pub fn open(&mut self, current_spec: &str) {
         self.current_spec = current_spec.to_owned();
-        let (entries, idx) = self.load_entries();
+        self.anchor = None;
+        self.dirty = false;
+        let entries = self.load_entries();
         self.picker.open(entries, TITLE);
-        self.picker.select(idx);
+        self.preselect_current_model();
     }
 
     fn try_refresh(&mut self) {
@@ -137,18 +142,22 @@ impl ModelPicker {
         }
         drop(guard);
         self.dirty = false;
-        let (entries, idx) = self.load_entries();
+        let entries = self.load_entries();
         self.picker.replace_items(entries);
-        self.picker.select(idx);
+        if let Some((was_recent, spec)) = &self.anchor {
+            self.picker
+                .select_item_by(|e| e.spec == *spec && e.suffix().is_some() == *was_recent);
+        } else {
+            self.preselect_current_model();
+        }
     }
 
-    fn load_entries(&mut self) -> (Vec<ModelEntry>, usize) {
+    fn load_entries(&mut self) -> Vec<ModelEntry> {
         let guard = self.models.load();
         let specs = guard.as_deref();
         self.last_spec_count = specs.map_or(0, Vec::len);
-        let mut entries: Vec<ModelEntry> = Vec::new();
-        let recent_specs = self.recents.clone();
-        for spec in &recent_specs {
+        let mut entries = Vec::new();
+        for spec in &self.recents {
             if let Some(mut e) = parse_model_entry(spec) {
                 e.suffix = Some(std::mem::take(&mut e.provider_display));
                 e.provider_display = RECENT_SECTION.to_string();
@@ -164,11 +173,16 @@ impl ModelPicker {
                 .then_with(|| a.id.cmp(&b.id))
         });
         entries.extend(full);
-        let idx = entries
-            .iter()
-            .position(|e| e.spec == self.current_spec)
-            .unwrap_or(0);
-        (entries, idx)
+        entries
+    }
+
+    fn preselect_current_model(&mut self) {
+        if !self
+            .picker
+            .select_item_by(|e| e.spec == self.current_spec && e.suffix().is_none())
+        {
+            self.picker.select_item_by(|e| e.spec == self.current_spec);
+        }
     }
 
     pub fn is_open(&self) -> bool {
@@ -187,26 +201,46 @@ impl ModelPicker {
         self.picker.scroll(delta);
     }
 
+    fn track_anchor<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        let before = self.picker.selected_index();
+        let result = f(self);
+        if let (Some(before), Some(after)) = (before, self.picker.selected_index())
+            && before != after
+        {
+            self.anchor = self
+                .picker
+                .selected_item()
+                .map(|e| (e.suffix().is_some(), e.spec.clone()));
+        }
+        result
+    }
+
     pub fn handle_paste(&mut self, text: &str) -> bool {
-        self.picker.handle_paste(text)
+        self.track_anchor(|p| p.picker.handle_paste(text))
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> ModelPickerAction {
+        self.track_anchor(|p| p.handle_key_inner(key))
+    }
+
+    fn handle_key_inner(&mut self, key: KeyEvent) -> ModelPickerAction {
         if let Some(tier) = tier_for_shortcut(key)
             && let Some(entry) = self.picker.selected_item()
         {
             let spec = entry.spec.clone();
             self.dirty = true;
             if entry.override_tiers.contains(&tier) {
-                return ModelPickerAction::UnassignTier(spec, tier);
+                ModelPickerAction::UnassignTier(spec, tier)
+            } else {
+                ModelPickerAction::AssignTier(spec, tier)
             }
-            return ModelPickerAction::AssignTier(spec, tier);
-        }
-        match self.picker.handle_key(key) {
-            PickerAction::Consumed => ModelPickerAction::Consumed,
-            PickerAction::Select(entry) => ModelPickerAction::Select(entry.spec),
-            PickerAction::Close => ModelPickerAction::Close,
-            PickerAction::Toggle(..) => ModelPickerAction::Consumed,
+        } else {
+            match self.picker.handle_key(key) {
+                PickerAction::Consumed => ModelPickerAction::Consumed,
+                PickerAction::Select(entry) => ModelPickerAction::Select(entry.spec),
+                PickerAction::Close => ModelPickerAction::Close,
+                PickerAction::Toggle(..) => ModelPickerAction::Consumed,
+            }
         }
     }
 
@@ -408,7 +442,145 @@ mod tests {
         let action = p.handle_key(key(KeyCode::Enter));
         assert!(
             matches!(action, ModelPickerAction::Select(ref s) if s == "zai/glm-5"),
-            "current model should be preselected within Recent",
+            "current model should be preselected in its provider section",
         );
+    }
+
+    #[test]
+    fn reopen_preselects_current_model_in_provider_section() {
+        let models = test_models();
+        let mut p = ModelPicker::new(models);
+        p.set_recents(vec![
+            "zai/glm-5".into(),
+            "anthropic/claude-sonnet-4-20250514".into(),
+        ]);
+        p.open("anthropic/claude-sonnet-4-20250514");
+        p.handle_key(key(KeyCode::Down));
+        let action = p.handle_key(key(KeyCode::Enter));
+        assert!(
+            matches!(action, ModelPickerAction::Select(ref s) if s == "zai/glm-5"),
+            "selecting the provider entry should return its spec",
+        );
+
+        p.open("zai/glm-5");
+
+        let entry = p.picker.selected_item().expect("selection on reopen");
+        assert_eq!(entry.spec, "zai/glm-5");
+        assert_eq!(
+            entry.section(),
+            Some("Z.AI"),
+            "selection should land on the provider entry, not the Recent copy",
+        );
+    }
+
+    #[test]
+    fn refresh_keeps_selection_on_provider_entry() {
+        let models = test_models();
+        let mut p = ModelPicker::new(models);
+        p.set_recents(vec![
+            "zai/glm-5".into(),
+            "anthropic/claude-sonnet-4-20250514".into(),
+        ]);
+        p.open("anthropic/claude-sonnet-4-20250514");
+        p.handle_key(key(KeyCode::Down));
+        p.handle_key(key(KeyCode::Char('!')));
+
+        p.try_refresh();
+
+        let entry = p.picker.selected_item().expect("selection after refresh");
+        assert_eq!(entry.spec, "zai/glm-5");
+        assert_eq!(
+            entry.section(),
+            Some("Z.AI"),
+            "selection should stay on the provider entry, not jump to Recent",
+        );
+    }
+
+    #[test]
+    fn refresh_after_collapse_anchors_to_provider_entry() {
+        let models = test_models();
+        let mut p = ModelPicker::new(models.clone());
+        p.set_recents(vec![
+            "zai/glm-5".into(),
+            "anthropic/claude-sonnet-4-20250514".into(),
+        ]);
+        p.open("anthropic/claude-sonnet-4-20250514");
+
+        models.store(None);
+        p.try_refresh();
+        let entry = p.picker.selected_item().expect("selection during collapse");
+        assert_eq!(entry.spec, "anthropic/claude-sonnet-4-20250514");
+        assert_eq!(entry.section(), Some("Recent"));
+
+        models.store(Some(Arc::new(vec![
+            "anthropic/claude-sonnet-4-20250514".into(),
+            "anthropic/claude-opus-4-6-20260101".into(),
+            "zai/glm-5".into(),
+        ])));
+        p.try_refresh();
+
+        let entry = p.picker.selected_item().expect("selection after arrival");
+        assert_eq!(entry.spec, "anthropic/claude-sonnet-4-20250514");
+        assert_eq!(
+            entry.section(),
+            Some("Anthropic"),
+            "cursor should migrate to the provider entry once it arrives",
+        );
+    }
+
+    #[test]
+    fn refresh_preserves_navigation_to_recent_entry() {
+        let models = test_models();
+        let mut p = ModelPicker::new(models.clone());
+        p.set_recents(vec![
+            "zai/glm-5".into(),
+            "anthropic/claude-sonnet-4-20250514".into(),
+        ]);
+        p.open("anthropic/claude-sonnet-4-20250514");
+        models.store(None);
+        p.try_refresh();
+        p.handle_key(key(KeyCode::Down));
+
+        models.store(Some(Arc::new(vec![
+            "anthropic/claude-sonnet-4-20250514".into(),
+            "anthropic/claude-opus-4-6-20260101".into(),
+            "zai/glm-5".into(),
+        ])));
+        p.try_refresh();
+
+        let entry = p.picker.selected_item().expect("selection after arrival");
+        assert_eq!(entry.spec, "zai/glm-5");
+        assert_eq!(
+            entry.section(),
+            Some("Recent"),
+            "user navigation to a Recent entry should survive refresh",
+        );
+    }
+
+    #[test]
+    fn refresh_preserves_selection_with_active_search() {
+        let models = test_models();
+        let mut p = ModelPicker::new(models.clone());
+        p.set_recents(vec![
+            "zai/glm-5".into(),
+            "anthropic/claude-sonnet-4-20250514".into(),
+        ]);
+        p.open("anthropic/claude-sonnet-4-20250514");
+        p.handle_key(key(KeyCode::Char('g')));
+        p.handle_key(key(KeyCode::Char('l')));
+        p.handle_key(key(KeyCode::Char('m')));
+
+        models.store(None);
+        p.try_refresh();
+        models.store(Some(Arc::new(vec![
+            "anthropic/claude-sonnet-4-20250514".into(),
+            "anthropic/claude-opus-4-6-20260101".into(),
+            "zai/glm-5".into(),
+        ])));
+        p.try_refresh();
+
+        let entry = p.picker.selected_item().expect("selection after refresh");
+        assert_eq!(entry.spec, "zai/glm-5");
+        assert_eq!(entry.section(), Some("Z.AI"));
     }
 }
