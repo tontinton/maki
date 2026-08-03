@@ -121,7 +121,7 @@ impl ProviderData {
     pub fn build_auth(&self, state_dir: &StateDir) -> Authentication {
         let api_key = match self.resolve_api_key(state_dir) {
             Some(key) => key,
-            None if self.slug == "opencode" => {
+            None if OPENCODE_FAMILY_SLUGS.contains(&self.slug.as_str()) => {
                 return Authentication::OpenCodeFreeKey(ResolvedAuth {
                     base_url: self.base_url.clone(),
                     headers: self.auth_headers("public"),
