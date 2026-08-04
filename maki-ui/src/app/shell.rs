@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::process::Command as StdCommand;
 use std::time::{Duration, Instant};
 
@@ -214,8 +214,10 @@ async fn run_command(
     max_output_lines: usize,
     max_output_bytes: usize,
 ) -> Result<String, String> {
-    let mut std_cmd: StdCommand = bash_command(command, None)?;
-    std_cmd.env("GIT_TERMINAL_PROMPT", "0");
+    let mut env = HashMap::new();
+    env.insert("GIT_TERMINAL_PROMPT".to_string(), "0".to_string());
+    let mut std_cmd: StdCommand = bash_command(command, Some(&env))?;
+    std_cmd.envs(&env);
     #[cfg(unix)]
     unsafe {
         std_cmd.pre_exec(|| {
