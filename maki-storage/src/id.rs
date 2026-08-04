@@ -169,6 +169,64 @@ impl Serialize for SessionRef {
     }
 }
 
+/// Tree node id: a [`MakiId`] with the branded `msg_` prefix, so an id from
+/// another family (a `sum_` summary, a provider `toolu_` tool call) is a
+/// parse error instead of a runtime bug.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MessageId(MakiId);
+
+pub const MSG_ID_PREFIX: &str = "msg_";
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum MessageIdParseError {
+    #[error("empty message id")]
+    Empty,
+    #[error("message id missing {MSG_ID_PREFIX:?} prefix")]
+    MissingPrefix,
+    #[error(transparent)]
+    InvalidMakiId(#[from] MakiIdParseError),
+}
+
+impl MessageId {
+    pub fn generate() -> Self {
+        Self(MakiId::generate())
+    }
+}
+
+impl fmt::Display for MessageId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(MSG_ID_PREFIX)?;
+        self.0.fmt(f)
+    }
+}
+
+impl FromStr for MessageId {
+    type Err = MessageIdParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.is_empty() {
+            return Err(MessageIdParseError::Empty);
+        }
+        let inner = s
+            .strip_prefix(MSG_ID_PREFIX)
+            .ok_or(MessageIdParseError::MissingPrefix)?;
+        Ok(Self(inner.parse()?))
+    }
+}
+
+impl Serialize for MessageId {
+    fn serialize<S: Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        ser.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for MessageId {
+    fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(de)?;
+        s.parse().map_err(serde::de::Error::custom)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,5 +297,30 @@ mod tests {
         let session_ref = SessionRef::from(id);
         assert_eq!(session_ref.as_str(), id.to_string());
         assert_eq!(session_ref.id(), id);
+    }
+
+    #[test]
+    fn message_id_roundtrips_with_prefix() {
+        let id = MessageId::generate();
+        let s = id.to_string();
+        assert!(s.starts_with(MSG_ID_PREFIX));
+        assert_eq!(s.parse::<MessageId>().unwrap(), id);
+    }
+
+    #[test]
+    fn message_id_serde_roundtrips() {
+        let id = MessageId::generate();
+        let s = serde_json::to_string(&id).unwrap();
+        assert!(s.contains(MSG_ID_PREFIX));
+        let back: MessageId = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, id);
+    }
+
+    #[test_case("" => matches Err(MessageIdParseError::Empty))]
+    #[test_case("toolu_123" => matches Err(MessageIdParseError::MissingPrefix))]
+    #[test_case("sum_abc" => matches Err(MessageIdParseError::MissingPrefix))]
+    #[test_case("msg_2j87v4grC" => matches Err(MessageIdParseError::InvalidMakiId(_)))]
+    fn message_id_rejects_foreign_families(s: &str) -> Result<MessageId, MessageIdParseError> {
+        s.parse()
     }
 }

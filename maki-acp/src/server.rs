@@ -460,7 +460,7 @@ fn json_str(e: &impl std::fmt::Display) -> Value {
 mod tests {
     use maki_providers::{ContentBlock as MsgBlock, Role, TokenUsage};
     use maki_storage::StateDir;
-    use maki_storage::sessions::Session;
+    use maki_storage::sessions::{SESSIONS_DIR, Session, SessionLog};
     use tempfile::TempDir;
 
     use super::*;
@@ -483,7 +483,7 @@ mod tests {
         let mut session: Session<Message, TokenUsage, maki_agent::ToolOutput> =
             Session::new("anthropic/test-model", "/project");
         session.replace_messages(messages.clone());
-        session.save(&dir).unwrap();
+        SessionLog::rewrite(&dir.ensure_subdir(SESSIONS_DIR).unwrap(), &session).unwrap();
 
         let id: MakiId = session.id;
         let history = load_history_from(&dir, id).unwrap();

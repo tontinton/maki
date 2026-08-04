@@ -4,7 +4,7 @@ use std::sync::Arc;
 use maki_config::Effect;
 use maki_providers::{Model, ThinkingConfig, TokenUsage};
 use maki_storage::StateDir;
-use maki_storage::sessions::{StoredEffect, StoredMode, StoredRule};
+use maki_storage::session_types::{StoredEffect, StoredMode, StoredRule};
 
 use crate::AppSession;
 

@@ -2715,11 +2715,13 @@ name = "maki-storage"
 version = "0.4.5"
 dependencies = [
  "bs58",
+ "crc32fast",
  "etcetera",
  "getrandom 0.3.4",
  "isahc",
  "serde",
  "serde_json",
+ "structured-zstd",
  "tempfile",
  "test-case",
  "thiserror 2.0.18",
@@ -4685,6 +4687,12 @@ name = "strsim"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
+
+[[package]]
+name = "structured-zstd"
+version = "0.0.49"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "392eea135985654a313cdfee001e93031bacd96a3693a5dc4b0d13793e40b27a"
 
 [[package]]
 name = "strum"

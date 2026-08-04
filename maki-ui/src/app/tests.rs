@@ -15,7 +15,8 @@ use maki_agent::{
 use maki_config::{PermissionsConfig, UiConfig};
 use maki_lua::{HintReader, KeymapReader, LuaCommandInfo, LuaCommandReader};
 use maki_providers::{ContentBlock, Effort, Message, Role, TokenUsage};
-use maki_storage::sessions::{StoredMode, StoredThinking};
+use maki_storage::session_types::{StoredMode, StoredThinking};
+use maki_storage::sessions::{SESSIONS_DIR, SessionLog};
 use ratatui::layout::Rect;
 use std::env;
 use std::path::{Path, PathBuf};
@@ -635,7 +636,11 @@ fn load_session_clears_plan() {
     app.state
         .session_mut()
         .push_message(Message::user("test".into()));
-    app.state.session_mut().save(&app.storage).unwrap();
+    SessionLog::rewrite(
+        &app.storage.ensure_subdir(SESSIONS_DIR).unwrap(),
+        app.state.session_mut(),
+    )
+    .unwrap();
     let id = app.state.session.id;
     app.state.mode = Mode::Build;
     app.state.plan = PlanState::Ready(PathBuf::from("old-plan.md"));
@@ -3952,7 +3957,7 @@ fn load_session_persists_the_new_session_and_leaks_no_history_into_it() {
     let (_tmp, dir, writer, mut app) = tempdir_app();
     let mut stored = AppSession::new("test-model", "/tmp/test");
     stored.push_message(Message::user(STORED_SESSION_TEXT.into()));
-    stored.save(&dir).unwrap();
+    SessionLog::rewrite(&dir.ensure_subdir(SESSIONS_DIR).unwrap(), &stored).unwrap();
 
     let _live = attach_live_history(&mut app, vec![Message::user(LIVE_AGENT_TEXT.into())]);
     app.input_box.set_input(UNSENT_DRAFT.into());

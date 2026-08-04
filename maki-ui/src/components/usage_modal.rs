@@ -5,7 +5,7 @@ use crossterm::event::{KeyCode, KeyEvent};
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use maki_providers::{Model, ModelPricing, ProviderUsage, TokenUsage, format_tokens};
-use maki_storage::sessions::StoredTokenUsage;
+use maki_storage::session_types::StoredTokenUsage;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
