@@ -3,12 +3,16 @@ use std::sync::{Arc, Mutex};
 use flume::Sender;
 use maki_storage::StateDir;
 use maki_storage::id::SessionRef;
+use serde::Deserialize;
 use serde_json::Value;
 use tracing::{debug, warn};
 
 use crate::model::Model;
 use crate::provider::{BoxFuture, Provider};
-use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, dialect};
+use crate::{
+    AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse, UsageLimit,
+    dialect,
+};
 
 use super::auth;
 use crate::providers::ResolvedAuth;
@@ -38,6 +42,13 @@ pub(crate) const PLAN_MODELS: &[&str] = &[
 
 const CODEX_PLAN_CONTEXT_WINDOW: u32 = 272_000;
 const GPT_5_6_PLAN_CONTEXT_WINDOW: u32 = 372_000;
+const USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
+const EMPTY_USAGE_ERROR: &str =
+    "OpenAI usage response contained no plan or rate limits; the endpoint schema likely changed";
+const MILLIS_PER_SECOND: u64 = 1_000;
+const SECONDS_PER_HOUR: u64 = 60 * 60;
+const SECONDS_PER_DAY: u64 = 24 * SECONDS_PER_HOUR;
+const SECONDS_PER_WEEK: u64 = 7 * SECONDS_PER_DAY;
 
 fn is_codex_model(model_id: &str) -> bool {
     coding_plan_context_window(model_id).is_some()
@@ -58,6 +69,28 @@ fn coding_plan_context_window(model_id: &str) -> Option<u32> {
     } else {
         CODEX_PLAN_CONTEXT_WINDOW
     })
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct CodexUsage {
+    plan_type: Option<String>,
+    rate_limit: CodexRateLimit,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct CodexRateLimit {
+    primary_window: Option<CodexUsageWindow>,
+    secondary_window: Option<CodexUsageWindow>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct CodexUsageWindow {
+    used_percent: Option<f64>,
+    limit_window_seconds: Option<u64>,
+    reset_at: Option<u64>,
 }
 
 pub struct OpenAi {
@@ -177,6 +210,66 @@ impl OpenAi {
     }
 }
 
+fn usage_percentage(percentage: f64) -> Option<u32> {
+    percentage
+        .is_finite()
+        .then(|| percentage.round().clamp(0.0, 100.0) as u32)
+}
+
+fn usage_label(seconds: u64) -> String {
+    if seconds == SECONDS_PER_WEEK {
+        return "Weekly usage".into();
+    }
+    if seconds == SECONDS_PER_DAY {
+        return "Daily usage".into();
+    }
+    if seconds.is_multiple_of(SECONDS_PER_DAY) {
+        return format!("{}-day usage", seconds / SECONDS_PER_DAY);
+    }
+    if seconds.is_multiple_of(SECONDS_PER_HOUR) {
+        return format!("{}-hour usage", seconds / SECONDS_PER_HOUR);
+    }
+    format!("{seconds}-second usage")
+}
+
+fn usage_limit(window: CodexUsageWindow) -> Option<UsageLimit> {
+    Some(UsageLimit {
+        label: usage_label(window.limit_window_seconds?),
+        percentage: usage_percentage(window.used_percent?),
+        reset_at: window
+            .reset_at
+            .and_then(|seconds| seconds.checked_mul(MILLIS_PER_SECOND)),
+        detail: None,
+    })
+}
+
+impl From<CodexUsage> for ProviderUsage {
+    fn from(usage: CodexUsage) -> Self {
+        let limits = [
+            usage.rate_limit.primary_window,
+            usage.rate_limit.secondary_window,
+        ]
+        .into_iter()
+        .flatten()
+        .filter_map(usage_limit)
+        .collect();
+        Self {
+            plan: usage.plan_type,
+            limits,
+        }
+    }
+}
+
+fn parse_usage(response: &str) -> Result<ProviderUsage, AgentError> {
+    let usage: ProviderUsage = serde_json::from_str::<CodexUsage>(response)?.into();
+    if usage.plan.is_none() && usage.limits.is_empty() {
+        return Err(AgentError::Config {
+            message: EMPTY_USAGE_ERROR.into(),
+        });
+    }
+    Ok(usage)
+}
+
 fn resolve_openai_base_url() -> Option<String> {
     let config = maki_config::providers::ProvidersConfig::load();
     maki_config::providers::configured_base_url("openai", config.get("openai"))
@@ -248,6 +341,20 @@ impl Provider for OpenAi {
         })
     }
 
+    fn fetch_usage(&self) -> BoxFuture<'_, Result<Option<ProviderUsage>, AgentError>> {
+        Box::pin(async {
+            if !self.is_oauth() {
+                return Ok(None);
+            }
+            self.with_oauth_retry(|| async {
+                let auth = self.codex_auth()?;
+                let response = self.compat.get_text(&auth, USAGE_URL).await?;
+                Ok(Some(parse_usage(&response)?))
+            })
+            .await
+        })
+    }
+
     fn refresh_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
         Box::pin(async {
             if self.is_oauth() {
@@ -302,5 +409,72 @@ mod tests {
     #[test_case("gpt-5.4-nano", None)]
     fn coding_plan_context_window_resolves_plan_models(model_id: &str, expected: Option<u32>) {
         assert_eq!(coding_plan_context_window(model_id), expected);
+    }
+
+    #[test]
+    fn codex_usage_parses_quota_windows() {
+        const RESPONSE: &str = r#"{
+            "plan_type": "pro",
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 12.6,
+                    "limit_window_seconds": 18000,
+                    "reset_at": 1760000000
+                },
+                "secondary_window": {
+                    "used_percent": 120,
+                    "limit_window_seconds": 604800,
+                    "reset_at": 1760100000
+                }
+            }
+        }"#;
+        let usage = parse_usage(RESPONSE).unwrap();
+        assert_eq!(usage.plan.as_deref(), Some("pro"));
+        assert_eq!(
+            usage.limits,
+            vec![
+                UsageLimit {
+                    label: "5-hour usage".into(),
+                    percentage: Some(13),
+                    reset_at: Some(1_760_000_000_000),
+                    detail: None,
+                },
+                UsageLimit {
+                    label: "Weekly usage".into(),
+                    percentage: Some(100),
+                    reset_at: Some(1_760_100_000_000),
+                    detail: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_usage_skips_incomplete_windows() {
+        const RESPONSE: &str = r#"{
+            "rate_limit": {
+                "primary_window": {"used_percent": 10},
+                "secondary_window": {"used_percent": -2, "limit_window_seconds": 86400}
+            }
+        }"#;
+        let usage = parse_usage(RESPONSE).unwrap();
+        assert_eq!(
+            usage.limits,
+            vec![UsageLimit {
+                label: "Daily usage".into(),
+                percentage: Some(0),
+                reset_at: None,
+                detail: None,
+            }]
+        );
+    }
+
+    #[test_case("{}")]
+    #[test_case(r#"{"rate_limit": {}}"#)]
+    fn codex_usage_rejects_empty_responses(response: &str) {
+        assert_eq!(
+            parse_usage(response).unwrap_err().to_string(),
+            EMPTY_USAGE_ERROR
+        );
     }
 }
