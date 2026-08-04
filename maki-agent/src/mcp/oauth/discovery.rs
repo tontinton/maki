@@ -116,6 +116,46 @@ pub fn validate_auth_server(meta: &AuthServerMetadata) -> Result<(), OAuthError>
     Ok(())
 }
 
+fn resource_metadata_urls(server_url: &str) -> Vec<String> {
+    let path_specific = well_known_url(server_url, "oauth-protected-resource");
+    let root = format!(
+        "{}/.well-known/oauth-protected-resource",
+        origin(server_url)
+    );
+    if path_specific == root {
+        vec![path_specific]
+    } else {
+        vec![path_specific, root]
+    }
+}
+
+fn normalize_resource(url: &str) -> String {
+    let parts = parse_url(url);
+    format!(
+        "{}{}{}",
+        parts.scheme.to_ascii_lowercase(),
+        parts.authority.to_ascii_lowercase(),
+        parts.path
+    )
+}
+
+fn validate_resource_metadata(
+    meta: ResourceMetadata,
+    server_url: &str,
+) -> Result<ResourceMetadata, OAuthError> {
+    let resource = normalize_resource(&meta.resource);
+    if resource == normalize_resource(server_url)
+        || resource == normalize_resource(&origin(server_url))
+    {
+        Ok(meta)
+    } else {
+        Err(OAuthError::Other(format!(
+            "resource metadata resource does not match server URL: {}",
+            meta.resource
+        )))
+    }
+}
+
 pub async fn discover_resource_metadata(
     client: &HttpClient,
     server_url: &str,
@@ -125,14 +165,24 @@ pub async fn discover_resource_metadata(
         && let Some(ref url) = info.resource_metadata
         && origin(url) == origin(server_url)
         && let Ok(meta) = fetch_json::<ResourceMetadata>(client, url).await
+        && let Ok(meta) = validate_resource_metadata(meta, server_url)
     {
         return Ok(meta);
     }
 
-    let url = well_known_url(server_url, "oauth-protected-resource");
-    fetch_json::<ResourceMetadata>(client, &url)
-        .await
-        .map_err(|e| OAuthError::Other(format!("resource metadata discovery failed: {e}")))
+    let mut last_err = OAuthError::Other("no candidates".into());
+    for url in resource_metadata_urls(server_url) {
+        match fetch_json::<ResourceMetadata>(client, &url).await {
+            Ok(meta) => match validate_resource_metadata(meta, server_url) {
+                Ok(meta) => return Ok(meta),
+                Err(e) => last_err = e,
+            },
+            Err(e) => last_err = e,
+        }
+    }
+    Err(OAuthError::Other(format!(
+        "resource metadata discovery failed: {last_err}"
+    )))
 }
 
 pub async fn discover_auth_server(
@@ -263,6 +313,39 @@ mod tests {
     )]
     fn well_known_url_construction(base: &str, name: &str, expected: &str) {
         assert_eq!(well_known_url(base, name), expected);
+    }
+
+    #[test_case(
+        "https://example.com/mcp",
+        &["https://example.com/.well-known/oauth-protected-resource/mcp", "https://example.com/.well-known/oauth-protected-resource"]
+        ; "path_specific_then_root"
+    )]
+    #[test_case(
+        "https://example.com",
+        &["https://example.com/.well-known/oauth-protected-resource"]
+        ; "root_only"
+    )]
+    fn resource_metadata_url_candidates(server_url: &str, expected: &[&str]) {
+        assert_eq!(resource_metadata_urls(server_url), expected);
+    }
+
+    #[test_case("https://example.com/mcp", "https://example.com/mcp", true ; "matching_resource")]
+    #[test_case("https://example.com/mcp/", "https://example.com/mcp", true ; "resource_trailing_slash")]
+    #[test_case("https://example.com/mcp", "https://example.com/mcp/", true ; "server_url_trailing_slash")]
+    #[test_case("HTTPS://EXAMPLE.com/mcp", "https://example.com/mcp", true ; "scheme_host_case_insensitive")]
+    #[test_case("https://example.com", "https://example.com/mcp", true ; "origin_resource_from_root_metadata")]
+    #[test_case("https://example.com/other", "https://example.com/mcp", false ; "different_resource")]
+    #[test_case("https://example.com/MCP", "https://example.com/mcp", false ; "path_case_sensitive")]
+    fn resource_metadata_validation(resource: &str, server_url: &str, should_pass: bool) {
+        let meta = ResourceMetadata {
+            authorization_servers: Vec::new(),
+            resource: resource.into(),
+            scopes_supported: None,
+        };
+        assert_eq!(
+            validate_resource_metadata(meta, server_url).is_ok(),
+            should_pass
+        );
     }
 
     #[test_case("https://example.com/token",   true  ; "https_valid")]
