@@ -39,7 +39,7 @@ pub use maki_providers::{ImageMediaType, ImageSource, ThinkingConfig};
 pub use types::{
     AgentEvent, BufferSnapshot, Envelope, EventSender, GrepFileEntry, GrepLine, GrepMatchGroup,
     InstructionBlock, NO_FILES_FOUND, SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle,
-    SubagentInfo, TextOutput, ToolDoneEvent, ToolInput, ToolOutput, ToolStartEvent,
+    SubagentInfo, SubagentPrompt, TextOutput, ToolDoneEvent, ToolInput, ToolOutput, ToolStartEvent,
     TurnCompleteEvent,
 };
 

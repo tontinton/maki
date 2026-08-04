@@ -19,7 +19,7 @@ use maki_agent::tools::{
 };
 use maki_agent::{
     Agent, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, Envelope, EventSender,
-    History, McpSession, SubagentInfo, ToolDoneEvent,
+    History, McpSession, SubagentInfo, SubagentPrompt, ToolDoneEvent,
 };
 use maki_lua_macro::{lua_class, lua_fn, lua_table};
 use maki_providers::model::ModelTier;
@@ -38,6 +38,7 @@ use crate::api::util::pair::{Pair, err_pair, try_pair};
 
 const SESSION_CLOSED_ERR: &str = "session closed";
 const DEFAULT_SESSION_AUDIENCE: ToolAudience = ToolAudience::GENERAL_SUB;
+const STEERING_QUEUE_CAPACITY: usize = 32;
 
 fn resolve_model_from_ctx(ctx: &AgentContext, tier: Option<&str>) -> Result<Model, String> {
     let Some(tier_str) = tier else {
@@ -483,6 +484,7 @@ async fn session(
     let sub_event_tx = EventSender::new(sub_tx, agent_ctx.event_tx.run_id());
     let parent_tx = agent_ctx.event_tx.clone();
     let (answer_tx, answer_rx) = flume::unbounded::<String>();
+    let (prompt_tx, prompt_rx) = flume::bounded::<SubagentPrompt>(STEERING_QUEUE_CAPACITY);
 
     let subagent_info: Arc<OnceLock<SubagentInfo>> = Arc::new(OnceLock::new());
     let (usage_tx, usage_rx) = flume::unbounded();
@@ -544,6 +546,8 @@ async fn session(
         child_cancel,
         answer_rx: Arc::new(AsyncMutex::new(answer_rx)),
         answer_tx: Some(answer_tx),
+        prompt_rx,
+        prompt_tx: Some(prompt_tx),
         parent_cancels: Arc::clone(&agent_ctx.subagent_cancels),
         ui_id,
         cancel_slot,
@@ -669,6 +673,8 @@ struct SessionState {
     child_cancel: maki_agent::cancel::CancelToken,
     answer_rx: Arc<AsyncMutex<flume::Receiver<String>>>,
     answer_tx: Option<flume::Sender<String>>,
+    prompt_rx: flume::Receiver<SubagentPrompt>,
+    prompt_tx: Option<flume::Sender<SubagentPrompt>>,
     parent_cancels: Arc<CancelMap<String>>,
     /// Stable identity for UI, cancel, and history. Falls back to a synthetic
     /// id for workflow-mode sessions (no model-issued tool call exists).
@@ -705,6 +711,32 @@ impl SessionState {
             output_tokens = self.usage.output,
             "subagent session closed",
         );
+    }
+}
+
+struct PromptInterruptSource {
+    rx: flume::Receiver<SubagentPrompt>,
+    thinking: ThinkingConfig,
+    fast: bool,
+}
+
+impl maki_agent::InterruptSource for PromptInterruptSource {
+    fn poll(&self) -> Option<maki_agent::ExtractedCommand> {
+        self.rx.try_recv().ok().map(|prompt| {
+            maki_agent::ExtractedCommand::Interrupt(
+                AgentInput {
+                    message: prompt.text,
+                    mode: AgentMode::Build,
+                    images: prompt.images,
+                    preamble: Vec::new(),
+                    thinking: self.thinking,
+                    fast: self.fast,
+                    workflow: false,
+                    prompt: None,
+                },
+                1,
+            )
+        })
     }
 }
 
@@ -760,37 +792,50 @@ async fn prompt(
             prompt: Some(message.clone()),
             model: Some(s.params.model.spec()),
             answer_tx: s.answer_tx.take(),
+            prompt_tx: s.prompt_tx.take(),
         });
     }
 
-    let mut agent = Agent::new(
-        s.params.clone(),
-        AgentRunParams {
-            history: &mut s.history,
-            system: s.system.clone(),
-            event_tx: s.sub_event_tx.clone(),
-            tools: s.tools.clone(),
-        },
-    )
-    .with_user_response_rx(Arc::clone(&s.answer_rx))
-    .with_cancel(s.child_cancel.clone())
-    .with_mcp(s.mcp.clone())
-    .with_local_tools(Arc::clone(&s.local_tools));
-
-    let input = AgentInput {
-        message,
-        mode: AgentMode::Build,
+    let mut next_message = Some(SubagentPrompt {
+        text: message,
         images: Vec::new(),
-        preamble: Vec::new(),
-        thinking: s.thinking,
-        fast: s.fast,
-        workflow: false,
-        prompt: None,
-    };
-    let result = agent.run(input).await;
-    drop(agent);
-    if let Err(e) = result {
-        return Ok((None, Some(e.to_string())));
+    });
+    while let Some(message) = next_message.take() {
+        let mut agent = Agent::new(
+            s.params.clone(),
+            AgentRunParams {
+                history: &mut s.history,
+                system: s.system.clone(),
+                event_tx: s.sub_event_tx.clone(),
+                tools: s.tools.clone(),
+            },
+        )
+        .with_user_response_rx(Arc::clone(&s.answer_rx))
+        .with_interrupt_source(Arc::new(PromptInterruptSource {
+            rx: s.prompt_rx.clone(),
+            thinking: s.thinking,
+            fast: s.fast,
+        }))
+        .with_cancel(s.child_cancel.clone())
+        .with_mcp(s.mcp.clone())
+        .with_local_tools(Arc::clone(&s.local_tools));
+
+        let input = AgentInput {
+            message: message.text,
+            mode: AgentMode::Build,
+            images: message.images,
+            preamble: Vec::new(),
+            thinking: s.thinking,
+            fast: s.fast,
+            workflow: false,
+            prompt: None,
+        };
+        let result = agent.run(input).await;
+        drop(agent);
+        if let Err(e) = result {
+            return Ok((None, Some(e.to_string())));
+        }
+        next_message = s.prompt_rx.try_recv().ok();
     }
     // Waiting here doubles as an ordering barrier: the relay reaches `Done` only
     // after every `TurnComplete`, so all our `ToolLive::Usage` messages sit in the
@@ -868,6 +913,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use maki_agent::{ExtractedCommand, InterruptSource};
 
     fn call(src: &str, input: JsonValue) -> Result<String, String> {
         let lua = Lua::new();
@@ -940,6 +986,7 @@ mod tests {
                 prompt: None,
                 model: None,
                 answer_tx: None,
+                prompt_tx: None,
             })
             .unwrap();
         let (usage_tx, usage_rx) = flume::unbounded();
@@ -992,5 +1039,29 @@ mod tests {
                     .as_ref()
                     .is_some_and(|info| info.parent_tool_use_id == PARENT_ID)
         }));
+    }
+
+    #[test]
+    fn prompt_interrupt_source_preserves_session_thinking_and_fast() {
+        let (tx, rx) = flume::unbounded();
+        let source = PromptInterruptSource {
+            rx,
+            thinking: ThinkingConfig::Budget(1234),
+            fast: true,
+        };
+        tx.send(SubagentPrompt {
+            text: "steer".into(),
+            images: Vec::new(),
+        })
+        .unwrap();
+
+        let Some(ExtractedCommand::Interrupt(input, _)) = source.poll() else {
+            panic!("expected an interrupt command");
+        };
+
+        assert_eq!(input.message, "steer");
+        assert!(input.images.is_empty());
+        assert!(matches!(input.thinking, ThinkingConfig::Budget(1234)));
+        assert!(input.fast);
     }
 }

@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 
 use crate::clipboard::CopyResult;
 use crate::selection::{self, ContentRegion, EdgeScroll, Selection, SelectionState, SelectionZone};
-use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
 use super::App;
@@ -44,28 +44,21 @@ impl App {
                         self.selection_state = None;
                         if zone == SelectionZone::Messages {
                             let area = self.msg_area();
-                            self.chats[self.active_chat].handle_click(event.row, area);
+                            let render_chat = self.resolve_render_chat();
+                            if event.modifiers.contains(KeyModifiers::CONTROL)
+                                && let Some(tool_id) =
+                                    self.chats[render_chat].tool_id_at(event.row, area)
+                                && let Some(&idx) = self.chat_index.get(tool_id)
+                            {
+                                self.active_chat = idx;
+                                return;
+                            }
+                            self.chats[render_chat].handle_click(event.row, area);
                         }
                     }
                 }
             }
             _ => {}
-        }
-    }
-
-    pub(super) fn handle_scroll(&mut self, column: u16, row: u16, delta: i32) {
-        let drag_zone = match self.selection_state {
-            Some(SelectionState::Dragging { ref sel, .. }) => Some(sel.zone),
-            _ => None,
-        };
-        match self.scroll_at(column, row, delta) {
-            Some(zone) if drag_zone == Some(zone) => {
-                let scroll = self.scroll_offset(zone);
-                if let Some(SelectionState::Dragging { sel, .. }) = &mut self.selection_state {
-                    sel.update(row, column, scroll);
-                }
-            }
-            _ => self.clear_selection_unless_pending_copy(),
         }
     }
 

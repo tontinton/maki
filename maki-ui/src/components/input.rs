@@ -262,6 +262,11 @@ impl InputBox {
         self.buffer = TextBuffer::new(s);
     }
 
+    pub fn set_submission(&mut self, sub: Submission) {
+        self.buffer = TextBuffer::new(sub.text);
+        self.pending_images = sub.images;
+    }
+
     pub fn history_up(&mut self) {
         if self.history.is_empty() {
             return;

@@ -314,6 +314,11 @@ impl DisplayMessage {
         }
     }
 
+    pub fn with_images(mut self, images: Vec<maki_agent::ImageSource>) -> Self {
+        self.images = images;
+        self
+    }
+
     pub fn plan(text: String, plan_path: String) -> Self {
         Self {
             role: DisplayRole::Assistant,
