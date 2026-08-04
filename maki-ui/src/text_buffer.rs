@@ -262,6 +262,11 @@ impl TextBuffer {
         self.cursor_y = 0;
     }
 
+    pub fn set_cursor(&mut self, y: usize, x: usize) {
+        self.cursor_y = y.min(self.lines.len().saturating_sub(1));
+        self.raw_x = x.min(self.current_line_len());
+    }
+
     pub fn move_to_end(&mut self) {
         self.cursor_y = self.lines.len().saturating_sub(1);
         self.raw_x = self.current_line_len();

@@ -18,6 +18,12 @@ impl App {
                     if self.has_modal_overlay() && zone.zone != SelectionZone::Overlay {
                         return;
                     }
+                    // Move the cursor to the click position in the input area.
+                    if zone.zone == SelectionZone::Input {
+                        let focused = !self.any_overlay_open();
+                        self.input_box
+                            .handle_click(zone.area, event.row, event.column, focused);
+                    }
                     let scroll = self.scroll_offset(zone.zone);
                     self.selection_state = Some(SelectionState::Dragging {
                         sel: Selection::start(

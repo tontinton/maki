@@ -451,6 +451,78 @@ impl InputBox {
         self.scroll_y = apply_scroll_delta(self.scroll_y, delta).min(self.max_scroll());
         self.follow_cursor = false;
     }
+
+    /// Move the text cursor to the position corresponding to a mouse click at
+    /// the terminal coordinates (row, col) within the input content area.
+    pub fn handle_click(&mut self, area: Rect, row: u16, col: u16, focused: bool) {
+        let Some((y, x)) = self.click_position(area, row, col, focused) else {
+            return;
+        };
+        self.buffer.set_cursor(y, x);
+        self.follow_cursor = true;
+    }
+
+    /// Convert a mouse click at terminal (row, col) within the input content
+    /// area into a (line_index, char_index) in the text buffer, accounting
+    /// for scroll offset, word-wrap, and the chevron/padding prefix.
+    fn click_position(
+        &self,
+        area: Rect,
+        row: u16,
+        col: u16,
+        focused: bool,
+    ) -> Option<(usize, usize)> {
+        let content_y = row.checked_sub(area.y)?;
+        let content_x = col.checked_sub(area.x)?;
+
+        let ew = effective_width(area.width as usize);
+        let visual_line = content_y as usize + self.scroll_y as usize;
+
+        let cursor_line = self.buffer.y();
+        let mut visual = 0usize;
+
+        for (buf_line_idx, line) in self.buffer.lines().iter().enumerate() {
+            let chars: Vec<char> = line.chars().collect();
+            let widths: Vec<usize> = chars.iter().map(|c| c.width().unwrap_or(1)).collect();
+
+            let is_cursor_line = buf_line_idx == cursor_line && focused;
+            let ranges = wrap_ranges(&widths, ew, is_cursor_line);
+
+            let n_visual_rows = ranges.len();
+
+            if visual_line < visual + n_visual_rows {
+                let wrap_row = visual_line - visual;
+                let (row_char_start, row_char_end) = ranges[wrap_row];
+
+                let row_display_width: usize = widths[row_char_start..row_char_end].iter().sum();
+
+                // The first visual row of each buffer line has a 2-cell prefix
+                // (chevron or continuation padding).  Wrapped rows have none.
+                let text_col = if wrap_row == 0 {
+                    (content_x as usize).saturating_sub(PREFIX_WIDTH as usize)
+                } else {
+                    content_x as usize
+                };
+                let text_col = text_col.min(row_display_width);
+
+                // Walk character widths to find which char the column hits.
+                let mut accum = 0;
+                let mut char_idx = row_char_start;
+                for &w in &widths[row_char_start..row_char_end] {
+                    if accum + w > text_col {
+                        break;
+                    }
+                    accum += w;
+                    char_idx += 1;
+                }
+
+                return Some((buf_line_idx, char_idx));
+            }
+            visual += n_visual_rows;
+        }
+
+        None
+    }
 }
 
 fn random_placeholder_hint() -> &'static str {
@@ -475,27 +547,8 @@ fn wrap_line(
 ) -> Vec<Line<'static>> {
     let chars: Vec<char> = line.chars().collect();
     let widths: Vec<usize> = chars.iter().map(|c| c.width().unwrap_or(1)).collect();
-    let row_width = ew.max(1);
 
-    let mut row_ranges: Vec<(usize, usize)> = Vec::new();
-    let mut row_start = 0;
-    let mut row_col = 0;
-    for (i, &w) in widths.iter().enumerate() {
-        if row_col + w > row_width && row_col > 0 {
-            row_ranges.push((row_start, i));
-            row_start = i;
-            row_col = 0;
-        }
-        row_col += w;
-    }
-    if row_start < chars.len() || row_ranges.is_empty() {
-        row_ranges.push((row_start, chars.len()));
-    }
-    if is_cursor_line && row_col + 1 > row_width {
-        row_ranges.push((chars.len(), chars.len()));
-    }
-
-    row_ranges
+    wrap_ranges(&widths, ew, is_cursor_line)
         .into_iter()
         .enumerate()
         .map(|(row, (start, end))| {
@@ -525,6 +578,31 @@ fn wrap_line(
             Line::from(spans)
         })
         .collect()
+}
+
+/// Split a line (given per-char display widths) into wrapped row ranges of
+/// char indices, exactly as it is rendered: an extra empty row is appended
+/// when the cursor sits past a completely full last row.
+fn wrap_ranges(widths: &[usize], ew: usize, is_cursor_line: bool) -> Vec<(usize, usize)> {
+    let row_width = ew.max(1);
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    let mut row_start = 0;
+    let mut row_col = 0;
+    for (i, &w) in widths.iter().enumerate() {
+        if row_col + w > row_width && row_col > 0 {
+            ranges.push((row_start, i));
+            row_start = i;
+            row_col = 0;
+        }
+        row_col += w;
+    }
+    if row_start < widths.len() || ranges.is_empty() {
+        ranges.push((row_start, widths.len()));
+    }
+    if is_cursor_line && row_col + 1 > row_width {
+        ranges.push((widths.len(), widths.len()));
+    }
+    ranges
 }
 
 fn shell_highlight_spans(line: &str) -> Option<Vec<Span<'static>>> {
@@ -622,6 +700,7 @@ fn total_visual_lines(buffer: &TextBuffer, ew: usize, cursor_visible: bool) -> u
 mod tests {
     use super::*;
     use crate::components::scrollbar::SCROLLBAR_THUMB;
+    use ratatui::layout::Rect;
     use test_case::test_case;
 
     fn type_text(input: &mut InputBox, text: &str) {
@@ -1064,5 +1143,61 @@ mod tests {
         type_text(&mut input, "read");
         input.handle_paste_with_spaces("file.rs");
         assert_eq!(input.buffer.value(), "read file.rs");
+    }
+
+    // ew = area.width - PREFIX_WIDTH (2); with width 10, row_width is 8.
+    fn area(width: u16) -> Rect {
+        Rect::new(0, 0, width, 10)
+    }
+
+    fn single_line(text: &str) -> InputBox {
+        let mut input = InputBox::new(InputHistory::default(), 20);
+        type_text(&mut input, text);
+        input
+    }
+
+    #[test_case("abc", (0, 0) => Some((0, 0)); "click in chevron prefix of first row")]
+    #[test_case("abc", (0, 1) => Some((0, 0)); "click on trailing part of prefix")]
+    #[test_case("abc", (0, 2) => Some((0, 0)); "click on first text column")]
+    #[test_case("abc", (0, 9) => Some((0, 3)); "click past end of line clamps to line end")]
+    #[test_case("abc", (1, 0) => None; "click below content returns None")]
+    fn click_position_prefix_and_clamp(
+        text: &str,
+        (row, col): (u16, u16),
+    ) -> Option<(usize, usize)> {
+        single_line(text).click_position(area(10), row, col, true)
+    }
+
+    #[test_case((1, 0) => Some((1, 0)); "second line col 0 is its start")]
+    #[test_case((1, 1) => Some((1, 0)); "second line prefix occupies its first two cols")]
+    #[test_case((1, 3) => Some((1, 1)); "second line text starts after the prefix")]
+    #[test_case((1, 4) => Some((1, 2)); "second line maps last column")]
+    fn click_position_second_line_prefix((row, col): (u16, u16)) -> Option<(usize, usize)> {
+        let mut input = InputBox::new(InputHistory::default(), 20);
+        type_text(&mut input, "abc");
+        input.buffer.add_line();
+        type_text(&mut input, "def");
+        input.click_position(area(10), row, col, true)
+    }
+
+    #[test_case((1, 0) => Some((0, 8)); "continuation row first col maps to wrapped chunk start")]
+    #[test_case((1, 1) => Some((0, 9)); "continuation row has no prefix offset")]
+    fn click_position_wrapped_line_has_no_prefix((row, col): (u16, u16)) -> Option<(usize, usize)> {
+        // width 10 -> ew 8 -> "abcdefghij" wraps as [0,8) then [8,10).
+        single_line("abcdefghij").click_position(area(10), row, col, true)
+    }
+
+    #[test_case(true, (1, 2) => Some((0, 8)); "focused full cursor line gets an extra row")]
+    #[test_case(false, (1, 2) => Some((1, 0)); "unfocused full cursor line has no extra row")]
+    fn click_position_cursor_extra_row(
+        focused: bool,
+        (row, col): (u16, u16),
+    ) -> Option<(usize, usize)> {
+        let mut input = InputBox::new(InputHistory::default(), 20);
+        type_text(&mut input, "abcdefgh");
+        input.buffer.add_line();
+        type_text(&mut input, "xy");
+        input.buffer.set_cursor(0, 8);
+        input.click_position(area(10), row, col, focused)
     }
 }
