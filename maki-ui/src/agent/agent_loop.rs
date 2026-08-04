@@ -344,6 +344,7 @@ fn spawn_oauth_for_needs_auth(handle: &McpHandle) {
         let server_name = info.name.clone();
         let server_url = server_url.clone();
         let www_auth = url.clone();
+        let oauth = info.oauth.clone();
         smol::spawn(async move {
             let storage = match maki_storage::StateDir::resolve() {
                 Ok(s) => s,
@@ -358,6 +359,7 @@ fn spawn_oauth_for_needs_auth(handle: &McpHandle) {
                 www_auth.as_deref(),
                 &storage,
                 maki_agent::mcp::oauth::Interaction::Background,
+                oauth,
             )
             .await
             {

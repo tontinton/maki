@@ -121,6 +121,7 @@ pub struct McpServerInfo {
     pub status: McpServerStatus,
     pub config_path: PathBuf,
     pub url: Option<String>,
+    pub oauth: Option<OauthClientConfig>,
 }
 
 #[derive(Deserialize, Default)]
@@ -167,6 +168,8 @@ pub struct RawHttpFields {
     pub url: String,
     #[serde(default)]
     pub headers: HashMap<String, String>,
+    #[serde(default)]
+    pub oauth: Option<OauthClientConfig>,
 }
 
 #[derive(Clone, Debug)]
@@ -179,6 +182,23 @@ pub struct ServerConfig {
     pub transport: Transport,
 }
 
+/// Static OAuth client used when the server has no registration endpoint.
+#[derive(Deserialize, Clone, Debug)]
+pub struct OauthClientConfig {
+    pub client_id: String,
+    #[serde(default)]
+    pub client_secret: Option<String>,
+    /// Fixed loopback port so the redirect URI can be pre-registered.
+    #[serde(default)]
+    pub callback_port: Option<u16>,
+    /// Loopback path of the redirect URI (defaults to `/mcp/oauth/callback`).
+    #[serde(default)]
+    pub callback_path: Option<String>,
+    /// Loopback hostname of the redirect URI (defaults to `127.0.0.1`).
+    #[serde(default)]
+    pub callback_hostname: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 pub enum Transport {
     Stdio {
@@ -189,6 +209,7 @@ pub enum Transport {
     Http {
         url: String,
         headers: HashMap<String, String>,
+        oauth: Option<OauthClientConfig>,
     },
 }
 
@@ -217,6 +238,10 @@ impl McpConfig {
                     config_path: self.origins.get(name).cloned().unwrap_or_default(),
                     url: match &raw.transport {
                         RawTransport::Http(h) => Some(h.url.clone()),
+                        _ => None,
+                    },
+                    oauth: match &raw.transport {
+                        RawTransport::Http(h) => h.oauth.clone(),
                         _ => None,
                     },
                 }
@@ -259,9 +284,17 @@ pub fn parse_server(name: String, server: RawServerConfig) -> Result<ServerConfi
                     "server '{name}' url must start with http:// or https://"
                 )));
             }
+            if let Some(path) = &cfg.oauth.as_ref().and_then(|o| o.callback_path.as_ref())
+                && (path.is_empty() || !path.starts_with('/'))
+            {
+                return Err(McpError::Config(format!(
+                    "server '{name}' oauth.callback_path must start with '/'"
+                )));
+            }
             Transport::Http {
                 url: cfg.url,
                 headers: cfg.headers,
+                oauth: cfg.oauth,
             }
         }
     };
@@ -407,6 +440,7 @@ mod tests {
             transport: RawTransport::Http(RawHttpFields {
                 url: url.to_string(),
                 headers: HashMap::new(),
+                oauth: None,
             }),
         }
     }
@@ -505,6 +539,56 @@ headers = { Authorization = "Bearer tok123" }
             }
             _ => panic!("expected Http"),
         }
+    }
+
+    #[test]
+    fn oauth_client_config_deserializes() {
+        let toml_str = r#"
+[mcp.acme]
+url = "https://mcp.acme.example.com/mcp"
+oauth = { client_id = "acme-client", client_secret = "s3cret", callback_port = 3118, callback_path = "/callback" }
+"#;
+        let config: McpConfig = toml::from_str(toml_str).unwrap();
+        let parsed = parse_server("acme".into(), config.mcp["acme"].clone()).unwrap();
+        match parsed.transport {
+            Transport::Http { url, oauth, .. } => {
+                assert_eq!(url, "https://mcp.acme.example.com/mcp");
+                let oauth = oauth.unwrap();
+                assert_eq!(oauth.client_id, "acme-client");
+                assert_eq!(oauth.client_secret.as_deref(), Some("s3cret"));
+                assert_eq!(oauth.callback_port, Some(3118));
+                assert_eq!(oauth.callback_path.as_deref(), Some("/callback"));
+            }
+            _ => panic!("expected Http"),
+        }
+    }
+
+    #[test]
+    fn oauth_client_secret_and_port_optional() {
+        let config: McpConfig = toml::from_str(
+            "[mcp.acme]\nurl = \"https://mcp.acme.example.com/mcp\"\noauth = { client_id = \"acme-client\" }\n",
+        )
+        .unwrap();
+        let parsed = parse_server("acme".into(), config.mcp["acme"].clone()).unwrap();
+        match parsed.transport {
+            Transport::Http { oauth, .. } => {
+                let oauth = oauth.unwrap();
+                assert_eq!(oauth.client_secret, None);
+                assert_eq!(oauth.callback_port, None);
+                assert_eq!(oauth.callback_path, None);
+            }
+            _ => panic!("expected Http"),
+        }
+    }
+
+    #[test]
+    fn oauth_callback_path_must_start_with_slash() {
+        let config: McpConfig = toml::from_str(
+            "[mcp.acme]\nurl = \"https://mcp.acme.example.com/mcp\"\noauth = { client_id = \"acme-client\", callback_path = \"callback\" }\n",
+        )
+        .unwrap();
+        let err = parse_server("acme".into(), config.mcp["acme"].clone()).unwrap_err();
+        assert!(err.to_string().contains("callback_path"));
     }
 
     #[test]

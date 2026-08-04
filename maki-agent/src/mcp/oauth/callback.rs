@@ -13,25 +13,47 @@ pub struct CallbackResult {
     pub code: String,
 }
 
+const DEFAULT_HOSTNAME: &str = "127.0.0.1";
+
 pub struct CallbackServer {
     pub port: u16,
+    hostname: String,
+    path: String,
     listener: TcpListener,
 }
 
 impl CallbackServer {
-    pub async fn bind() -> Result<Self, String> {
-        let listener = match TcpListener::bind(("127.0.0.1", PREFERRED_PORT)).await {
+    /// `port` pins the loopback listener so the redirect URI can be
+    /// pre-registered with the authorization server. Without it, fall back to
+    /// `PREFERRED_PORT`, then to any free port. `path`/`hostname` override the
+    /// advertised redirect URI; binding stays on 127.0.0.1, which `localhost`
+    /// (and 127.0.0.1 itself) resolves to.
+    pub async fn bind(
+        port: Option<u16>,
+        path: Option<&str>,
+        hostname: Option<&str>,
+    ) -> Result<Self, String> {
+        let requested = port.unwrap_or(PREFERRED_PORT);
+        let listener = match TcpListener::bind(("127.0.0.1", requested)).await {
             Ok(l) => l,
-            Err(_) => TcpListener::bind("127.0.0.1:0")
+            Err(_) if port.is_none() => TcpListener::bind("127.0.0.1:0")
                 .await
                 .map_err(|e| format!("failed to bind callback server: {e}"))?,
+            Err(e) => return Err(format!("failed to bind callback port {requested}: {e}")),
         };
         let port = listener.local_addr().map_err(|e| e.to_string())?.port();
-        Ok(Self { port, listener })
+        let path = path.unwrap_or(CALLBACK_PATH).to_string();
+        let hostname = hostname.unwrap_or(DEFAULT_HOSTNAME).to_string();
+        Ok(Self {
+            port,
+            hostname,
+            path,
+            listener,
+        })
     }
 
     pub fn redirect_uri(&self) -> String {
-        format!("http://127.0.0.1:{}{CALLBACK_PATH}", self.port)
+        format!("http://{}:{}{}", self.hostname, self.port, self.path)
     }
 
     pub async fn wait_for_callback(self, expected_state: &str) -> Result<CallbackResult, String> {
@@ -63,7 +85,7 @@ impl CallbackServer {
                 None => continue,
             };
 
-            if !path.starts_with(CALLBACK_PATH) {
+            if !path.starts_with(self.path.as_str()) {
                 let _ = respond(&mut stream, 404, "Not Found").await;
                 continue;
             }
@@ -184,7 +206,7 @@ mod tests {
     #[test]
     fn callback_receives_code() {
         smol::block_on(async {
-            let server = CallbackServer::bind().await.unwrap();
+            let server = CallbackServer::bind(None, None, None).await.unwrap();
             let port = server.port;
 
             let handle = smol::spawn(async move { server.wait_for_callback("test-state").await });
@@ -199,6 +221,88 @@ mod tests {
 
             let result = handle.await.unwrap();
             assert_eq!(result.code, "auth-code");
+        });
+    }
+
+    #[test]
+    fn callback_receives_code_on_custom_path() {
+        smol::block_on(async {
+            let server = CallbackServer::bind(None, Some("/callback"), None)
+                .await
+                .unwrap();
+            let port = server.port;
+
+            let handle = smol::spawn(async move { server.wait_for_callback("test-state").await });
+
+            let mut stream = smol::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+                .await
+                .unwrap();
+            let req =
+                "GET /callback?code=auth-code&state=test-state HTTP/1.1\r\nHost: localhost\r\n\r\n";
+            stream.write_all(req.as_bytes()).await.unwrap();
+
+            let result = handle.await.unwrap();
+            assert_eq!(result.code, "auth-code");
+        });
+    }
+
+    #[test]
+    fn bind_pins_requested_port() {
+        smol::block_on(async {
+            let probe = smol::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .unwrap();
+            let port = probe.local_addr().unwrap().port();
+            drop(probe);
+
+            let server = CallbackServer::bind(Some(port), Some("/callback"), None)
+                .await
+                .unwrap();
+            assert_eq!(server.port, port);
+            assert_eq!(
+                server.redirect_uri(),
+                format!("http://127.0.0.1:{port}/callback")
+            );
+        });
+    }
+
+    #[test]
+    fn bind_advertises_custom_hostname() {
+        smol::block_on(async {
+            let server = CallbackServer::bind(None, None, Some("localhost"))
+                .await
+                .unwrap();
+            assert_eq!(
+                server.redirect_uri(),
+                format!("http://localhost:{}{CALLBACK_PATH}", server.port)
+            );
+        });
+    }
+
+    #[test]
+    fn bind_defaults_to_stock_path() {
+        smol::block_on(async {
+            let server = CallbackServer::bind(None, None, None).await.unwrap();
+            assert_eq!(
+                server.redirect_uri(),
+                format!("http://127.0.0.1:{}{CALLBACK_PATH}", server.port)
+            );
+        });
+    }
+
+    #[test]
+    fn bind_pinned_port_in_use_is_error() {
+        smol::block_on(async {
+            let listener = smol::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .unwrap();
+            let port = listener.local_addr().unwrap().port();
+
+            let err = CallbackServer::bind(Some(port), None, None)
+                .await
+                .err()
+                .unwrap();
+            assert!(err.contains("failed to bind callback port"));
         });
     }
 }
