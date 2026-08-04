@@ -9,6 +9,7 @@
 
 use std::io::{self, Read};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use clap::ValueEnum;
@@ -17,6 +18,7 @@ use color_eyre::eyre::{Context, eyre};
 use maki_agent::headless::{HeadlessHandle, HeadlessParams};
 use maki_agent::tools::QUESTION_TOOL_NAME;
 use maki_agent::{AgentConfig, AgentEvent, Envelope, ImageSource, PermissionsConfig};
+use maki_config::ModelPolicy;
 use maki_lua::EventHandle;
 use maki_providers::model::Model;
 use maki_providers::{StopReason, TokenUsage};
@@ -146,6 +148,7 @@ pub fn run(
     lua_handle: EventHandle,
     fast: bool,
     workflow: bool,
+    model_policy: Arc<ModelPolicy>,
 ) -> Result<()> {
     let prompt = match prompt_arg {
         Some(p) => p,
@@ -179,6 +182,7 @@ pub fn run(
         initial_wd: cwd,
         fast,
         workflow,
+        model_policy,
     });
 
     let HeadlessHandle {

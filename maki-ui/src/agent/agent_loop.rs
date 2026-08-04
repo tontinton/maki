@@ -15,6 +15,7 @@ use maki_agent::{
     CancelToken, CancelTrigger, Envelope, EventSender, History, Instructions, McpCommand,
     PromptRole, SessionMailbox, SharedMessages, ToolOutputLines,
 };
+use maki_config::ModelPolicy;
 use maki_lua::EventHandle;
 use maki_providers::{AgentError, Message, Model, TokenUsage};
 use maki_storage::id::SessionRef;
@@ -48,6 +49,7 @@ pub(super) struct AgentLoop {
     timeouts: maki_providers::Timeouts,
     lua_handle: EventHandle,
     subagent_cancels: Arc<CancelMap<String>>,
+    model_policy: Arc<ModelPolicy>,
 }
 
 impl AgentLoop {
@@ -71,6 +73,7 @@ impl AgentLoop {
         timeouts: maki_providers::Timeouts,
         lua_handle: EventHandle,
         subagent_cancels: Arc<CancelMap<String>>,
+        model_policy: Arc<ModelPolicy>,
     ) -> Self {
         let mcp = mcp_handle.map(|h| McpSession::new(h, &initial_history));
         Self {
@@ -96,6 +99,7 @@ impl AgentLoop {
             timeouts,
             lua_handle,
             subagent_cancels,
+            model_policy,
         }
     }
 
@@ -162,8 +166,12 @@ impl AgentLoop {
 
     async fn do_compact(&mut self, event_tx: &EventSender) -> Result<(), AgentError> {
         let slot = self.model_slot.load();
-        let (provider, model) =
-            agent::resolve_compaction_model(&slot.provider, &slot.model, self.timeouts);
+        let (provider, model) = agent::resolve_compaction_model(
+            &slot.provider,
+            &slot.model,
+            self.timeouts,
+            &self.model_policy,
+        );
         agent::compact(
             &*provider,
             &model,
@@ -246,6 +254,7 @@ impl AgentLoop {
                 subagent_cancels: Arc::clone(&self.subagent_cancels),
                 registry: Arc::clone(maki_agent::tools::ToolRegistry::global_arc()),
                 audience: ToolAudience::MAIN,
+                model_policy: Arc::clone(&self.model_policy),
             },
             AgentRunParams {
                 history: &mut self.history,

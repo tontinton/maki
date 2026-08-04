@@ -2063,6 +2063,11 @@ fn setup_compaction_buffer(lua_src: &str, expected: maki_config::CompactionBuffe
     UNKNOWN_FIELD_ERR
     ; "moved_plugin_option"
 )]
+#[test_case::test_case(
+    r#"maki.setup({ provider = { allowed_models = "anthropic/*" } })"#,
+    ""
+    ; "model_policy_wrong_type"
+)]
 fn setup_rejects_bad_input(lua_src: &str, expected_substr: &str) {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
@@ -2073,6 +2078,32 @@ fn setup_rejects_bad_input(lua_src: &str, expected_substr: &str) {
     if !expected_substr.is_empty() {
         assert!(err.to_string().contains(expected_substr), "got: {err}");
     }
+}
+
+#[test]
+fn setup_model_policy_lists() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let raw = host
+        .send_run_init_lua(
+            r#"maki.setup({ provider = {
+                allowed_models = { "anthropic/*", "openai/gpt-5" },
+                excluded_models = { "*/*-preview" },
+            } })"#
+                .to_owned(),
+            "test_init.lua".to_owned(),
+            None,
+        )
+        .unwrap()
+        .expect("expected Some(RawConfig)");
+    assert_eq!(
+        raw.provider.allowed_models,
+        Some(vec!["anthropic/*".into(), "openai/gpt-5".into()])
+    );
+    assert_eq!(
+        raw.provider.excluded_models,
+        Some(vec!["*/*-preview".into()])
+    );
 }
 
 #[test]

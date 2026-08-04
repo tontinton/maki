@@ -54,9 +54,13 @@ fn resolve_model_from_ctx(ctx: &AgentContext, tier: Option<&str>) -> Result<Mode
         .unwrap();
     map.spec_for_tier(slug, effective)
         .or_else(|| map.spec_for_tier_any(effective))
+        .filter(|spec| ctx.model_policy.allows(spec))
         .and_then(|s| Model::from_spec(&s).ok())
         .map(Ok)
-        .unwrap_or_else(|| Model::from_tier_dynamic(slug, effective).map_err(|e| e.to_string()))
+        .unwrap_or_else(|| {
+            Model::from_tier_with_policy(slug, effective, &ctx.model_policy)
+                .map_err(|e| e.to_string())
+        })
 }
 
 fn model_to_lua_table(lua: &Lua, model: &Model) -> LuaResult<Table> {
@@ -141,7 +145,7 @@ async fn resolve_model(
         .and_then(|t| t.get::<Option<String>>("spec").ok().flatten());
 
     let model = match spec_str {
-        Some(ref spec) => try_pair!(Model::from_spec(spec)),
+        Some(ref spec) => try_pair!(Model::from_spec_with_policy(spec, &agent.model_policy)),
         None => try_pair!(resolve_model_from_ctx(agent, tier_str.as_deref())),
     };
     Ok((Some(model_to_lua_table(&lua, &model)?), None))
@@ -233,7 +237,7 @@ async fn tools(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>, opts: Table) -> LuaResu
 
     let parsed = spec_str
         .as_deref()
-        .and_then(|spec| Model::from_spec(spec).ok());
+        .and_then(|spec| Model::from_spec_with_policy(spec, &agent.model_policy).ok());
     let model = parsed.as_ref().unwrap_or(&agent.model);
 
     let base = match (only, except) {
@@ -405,7 +409,7 @@ async fn session(
 
     let (model, provider): (Model, Arc<dyn provider::Provider>) = if let Some(ref spec) = model_spec
     {
-        let mut m = try_pair!(Model::from_spec(spec));
+        let mut m = try_pair!(Model::from_spec_with_policy(spec, &agent_ctx.model_policy));
         let p = try_pair!(provider::from_model_async(&mut m, agent_ctx.timeouts).await);
         (m, Arc::from(p))
     } else {
@@ -529,6 +533,7 @@ async fn session(
             subagent_cancels: Arc::new(CancelMap::new()),
             registry: Arc::clone(maki_agent::tools::ToolRegistry::global_arc()),
             audience,
+            model_policy: Arc::clone(&agent_ctx.model_policy),
         },
         system: system.unwrap_or_default(),
         tools: tools_json,

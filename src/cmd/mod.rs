@@ -26,9 +26,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Some(Command::Index { path }) => {
             subcmd::index(&path, cli.no_plugins, cli.no_jit)?;
         }
-        Some(Command::Models) => {
-            subcmd::models();
-        }
+        Some(Command::Models) => subcmd::models(cli.no_plugins, cli.no_jit)?,
         Some(Command::Mcp { action }) => {
             let storage = StateDir::resolve().context("resolve data directory")?;
             match action {

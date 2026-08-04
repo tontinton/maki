@@ -41,6 +41,7 @@ struct SessionState {
 struct Server {
     out_tx: Sender<Value>,
     model_specs: Vec<String>,
+    model_policy: Arc<maki_config::ModelPolicy>,
     session: Option<SessionState>,
 }
 
@@ -66,7 +67,8 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
 
     let mut server = Server {
         out_tx,
-        model_specs: available_model_specs(),
+        model_specs: available_model_specs(&params.model_policy),
+        model_policy: Arc::clone(&params.model_policy),
         session: None,
     };
 
@@ -180,6 +182,7 @@ fn spawn_session(
         system_prompt_override: None,
         append_system_prompt: None,
         workflow: false,
+        model_policy: Arc::clone(&params.model_policy),
     })
 }
 
@@ -272,6 +275,9 @@ fn handle_set_config(srv: &mut Server, raw: &Value) -> Result<AgentResponse, Acp
     }
 
     let spec = req.value.0.to_string();
+    if !srv.model_policy.allows(&spec) {
+        return Err(AcpError::invalid_params().data(json_str(&"model is not allowed by policy")));
+    }
     let model =
         Model::from_spec(&spec).map_err(|e| AcpError::invalid_params().data(json_str(&e)))?;
 

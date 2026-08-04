@@ -20,7 +20,7 @@ use crossterm::event::{
 use maki_agent::command::CustomCommand;
 use maki_agent::permissions::PermissionManager;
 use maki_agent::{AgentConfig, CancelToken, McpCommand, McpConfigErrors, McpHandle, mcp};
-use maki_config::UiConfig;
+use maki_config::{ModelPolicy, UiConfig};
 use maki_lua::{
     EventHandle, HintReader, KeymapReader, LuaCommandReader, SessionReply, SessionRequest, UiAction,
 };
@@ -82,6 +82,7 @@ pub struct EventLoopParams {
     pub hint_reader: HintReader,
     pub ui_action_rx: flume::Receiver<UiAction>,
     pub lua_event_handle: EventHandle,
+    pub model_policy: Arc<ModelPolicy>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -165,6 +166,7 @@ struct SpawnCtx {
     model_slot: Arc<ArcSwap<ModelSlot>>,
     available_models: Arc<ArcSwapOption<Vec<String>>>,
     storage_writer: Arc<StorageWriter>,
+    model_policy: Arc<ModelPolicy>,
 }
 
 impl SpawnCtx {
@@ -182,6 +184,7 @@ impl SpawnCtx {
             self.lua_event_handle.clone(),
             self.mcp_handle.clone(),
             self.mcp_config_errors.clone(),
+            Arc::clone(&self.model_policy),
         );
         let mut app = App::new(
             &self.model_slot.load().model,
@@ -199,6 +202,7 @@ impl SpawnCtx {
             permissions,
             Arc::clone(&self.custom_commands),
             self.lua_event_handle.clone(),
+            Arc::clone(&self.model_policy),
         );
         handles.apply_to_app(&mut app);
         if resumed {
@@ -266,7 +270,11 @@ fn merge_batch(
     available.store(Some(Arc::new(merged)));
 }
 
-fn spawn_model_fetch(model_slot: &Arc<ArcSwap<ModelSlot>>, timeouts: Timeouts) -> BackgroundModels {
+fn spawn_model_fetch(
+    model_slot: &Arc<ArcSwap<ModelSlot>>,
+    timeouts: Timeouts,
+    policy: Arc<ModelPolicy>,
+) -> BackgroundModels {
     let available: Arc<ArcSwapOption<Vec<String>>> = Arc::new(ArcSwapOption::empty());
     let bg = Arc::clone(&available);
     let (warn_tx, warn_rx) = flume::unbounded::<String>();
@@ -295,7 +303,12 @@ fn spawn_model_fetch(model_slot: &Arc<ArcSwap<ModelSlot>>, timeouts: Timeouts) -
                 provider: Arc::from(provider),
             }));
         });
-        fetch_all_models(|batch| merge_batch(&bg, batch, &warn_tx), Some(done)).await;
+        fetch_all_models(
+            &policy,
+            |batch| merge_batch(&bg, batch, &warn_tx),
+            Some(done),
+        )
+        .await;
     });
     BackgroundModels {
         available,
@@ -329,6 +342,7 @@ impl<'t> EventLoop<'t> {
             hint_reader,
             ui_action_rx,
             lua_event_handle,
+            model_policy,
         } = params;
 
         // Apply the config theme before the warmup thread spawns, or warmup
@@ -364,7 +378,7 @@ impl<'t> EventLoop<'t> {
             model: model.clone(),
             provider,
         }));
-        let bg = spawn_model_fetch(&model_slot, timeouts);
+        let bg = spawn_model_fetch(&model_slot, timeouts, Arc::clone(&model_policy));
         let storage_writer = Arc::new(StorageWriter::new(storage.clone(), bg.warn_tx.clone()));
 
         let ctx = SpawnCtx {
@@ -384,6 +398,7 @@ impl<'t> EventLoop<'t> {
             model_slot,
             available_models: bg.available,
             storage_writer,
+            model_policy,
         };
 
         let mut runtimes: Vec<SessionRuntime> = sessions
@@ -991,6 +1006,7 @@ impl<'t> EventLoop<'t> {
             Action::LoadSession(loaded) => {
                 let loaded = *loaded;
                 if loaded.model_spec != self.ctx.model_slot.load().model.spec()
+                    && self.ctx.model_policy.allows(&loaded.model_spec)
                     && let Ok(mut new_model) = Model::from_spec(&loaded.model_spec)
                     && let Ok(new_provider) = from_model(&mut new_model, self.ctx.timeouts)
                 {
@@ -1070,6 +1086,11 @@ impl<'t> EventLoop<'t> {
     }
 
     fn change_model(&mut self, spec: String) {
+        if !self.ctx.model_policy.allows(&spec) {
+            self.focused_app()
+                .flash(format!("Model is not allowed by policy: {spec}"));
+            return;
+        }
         match Model::from_spec(&spec) {
             Ok(mut new_model) => match from_model(&mut new_model, self.ctx.timeouts) {
                 Ok(new_provider) => {
@@ -1093,9 +1114,15 @@ impl<'t> EventLoop<'t> {
     fn refresh_models(&self) {
         let available = Arc::clone(&self.ctx.available_models);
         let warn_tx = self.warn_tx.clone();
+        let policy = Arc::clone(&self.ctx.model_policy);
         available.store(None);
         smol::spawn(async move {
-            fetch_all_models(|batch| merge_batch(&available, batch, &warn_tx), None).await;
+            fetch_all_models(
+                &policy,
+                |batch| merge_batch(&available, batch, &warn_tx),
+                None,
+            )
+            .await;
         })
         .detach();
     }

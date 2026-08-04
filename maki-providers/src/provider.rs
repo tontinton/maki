@@ -8,6 +8,7 @@ use serde_json::Value;
 use strum::{Display, EnumIter, EnumString};
 use tracing::{debug, warn};
 
+use maki_config::ModelPolicy;
 use maki_storage::id::SessionRef;
 
 use crate::model::{Model, ModelFamily, ModelInfo};
@@ -365,7 +366,7 @@ pub struct ModelBatch {
 /// and configured dynamic providers. See [`fetch_all_models`] for live lookups.
 /// Never blocks on catalog download; catalog-backed providers appear only once
 /// the catalog has warmed in the background.
-pub fn available_model_specs() -> Vec<String> {
+pub fn available_model_specs(policy: &ModelPolicy) -> Vec<String> {
     let mut specs: Vec<String> = crate::manifest::ManifestRegistry::builtins()
         .iter()
         .filter(|m| provider_available_offline(m.slug))
@@ -404,10 +405,12 @@ pub fn available_model_specs() -> Vec<String> {
             }
         }
     }
+    specs.retain(|spec| policy.allows(spec));
     specs
 }
 
 pub async fn fetch_all_models(
+    policy: &ModelPolicy,
     mut on_ready: impl FnMut(ModelBatch),
     on_done: Option<Box<dyn FnOnce() + Send>>,
 ) {
@@ -550,7 +553,8 @@ pub async fn fetch_all_models(
 
     drop(tx);
 
-    while let Ok(batch) = rx.recv_async().await {
+    while let Ok(mut batch) = rx.recv_async().await {
+        batch.models.retain(|spec| policy.allows(spec));
         on_ready(batch);
     }
     if let Some(done) = on_done {
@@ -561,6 +565,33 @@ pub async fn fetch_all_models(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn policy(allowed: &[&str], excluded: &[&str]) -> ModelPolicy {
+        ModelPolicy::new(
+            &allowed
+                .iter()
+                .map(|pattern| (*pattern).into())
+                .collect::<Vec<_>>(),
+            &excluded
+                .iter()
+                .map(|pattern| (*pattern).into())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn available_specs_apply_model_policy() {
+        unsafe { std::env::set_var("OPENAI_API_KEY", "sk-test-model-policy") };
+        let policy = policy(&["openai/*"], &["*/gpt-5.6-terra"]);
+
+        let specs = available_model_specs(&policy);
+        unsafe { std::env::remove_var("OPENAI_API_KEY") };
+
+        assert!(!specs.is_empty());
+        assert!(specs.iter().all(|spec| spec.starts_with("openai/")));
+        assert!(!specs.iter().any(|spec| spec == "openai/gpt-5.6-terra"));
+    }
 
     #[test]
     fn provider_for_slug_unknown_returns_error() {

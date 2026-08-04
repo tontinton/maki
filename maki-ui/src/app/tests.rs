@@ -62,6 +62,7 @@ fn build_app_with_lua(
         )),
         Arc::from([]),
         maki_lua::EventHandle::disconnected_for_test(),
+        Arc::new(maki_config::ModelPolicy::default()),
     )
 }
 
@@ -3417,7 +3418,12 @@ fn thinking_restored_from_session_meta() {
     let mut session = AppSession::new("test-model", "/tmp/test");
     session.meta.thinking = Some(StoredThinking::Budget { tokens: 4096 });
 
-    let state = SessionState::from_session(session, &test_model(), &storage);
+    let state = SessionState::from_session(
+        session,
+        &test_model(),
+        &storage,
+        &maki_config::ModelPolicy::default(),
+    );
     assert_eq!(state.thinking, ThinkingConfig::Budget(4096));
 }
 
@@ -3502,7 +3508,12 @@ fn fast_restored_from_session_meta() {
     let mut session = AppSession::new("anthropic/claude-opus-4-8", "/tmp/test");
     session.meta.fast = true;
 
-    let state = SessionState::from_session(session, &test_model(), &storage);
+    let state = SessionState::from_session(
+        session,
+        &test_model(),
+        &storage,
+        &maki_config::ModelPolicy::default(),
+    );
     assert!(state.fast);
 }
 
@@ -3515,7 +3526,12 @@ fn fast_normalized_off_when_restored_onto_ineligible_model() {
     let mut session = AppSession::new("anthropic/claude-sonnet-4-5", "/tmp/test");
     session.meta.fast = true;
 
-    let state = SessionState::from_session(session, &test_model(), &storage);
+    let state = SessionState::from_session(
+        session,
+        &test_model(),
+        &storage,
+        &maki_config::ModelPolicy::default(),
+    );
     assert!(!state.fast);
 }
 

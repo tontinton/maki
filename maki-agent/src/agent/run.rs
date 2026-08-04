@@ -22,7 +22,7 @@ use crate::{
     AgentConfig, AgentError, AgentEvent, AgentInput, AgentMode, EventSender, ExtractedCommand,
     InterruptSource, SessionMailbox, TurnCompleteEvent,
 };
-use maki_config::ToolOutputLines;
+use maki_config::{ModelPolicy, ToolOutputLines};
 use maki_storage::id::SessionRef;
 
 const MAX_REAUTH_ATTEMPTS: u32 = 2;
@@ -32,11 +32,13 @@ pub fn resolve_compaction_model(
     provider: &Arc<dyn Provider>,
     model: &Model,
     timeouts: maki_providers::Timeouts,
+    model_policy: &ModelPolicy,
 ) -> (Arc<dyn Provider>, Model) {
     if let Some(spec) = maki_providers::model_registry::model_registry()
         .read()
         .unwrap()
         .spec_for_tier_any(maki_providers::ModelTier::Compaction)
+        && model_policy.allows(&spec)
         && let Ok(mut m) = Model::from_spec(&spec)
         && let Ok(p) = maki_providers::provider::from_model(&mut m, timeouts)
     {
@@ -65,6 +67,7 @@ pub struct AgentParams {
     pub subagent_cancels: Arc<CancelMap<String>>,
     pub registry: Arc<crate::tools::ToolRegistry>,
     pub audience: ToolAudience,
+    pub model_policy: Arc<ModelPolicy>,
 }
 
 pub struct AgentRunParams<'h> {
@@ -109,6 +112,7 @@ pub struct Agent<'h> {
     audience: ToolAudience,
     workflow: bool,
     local_tools: LocalTools,
+    model_policy: Arc<ModelPolicy>,
 }
 
 impl<'h> Agent<'h> {
@@ -148,6 +152,7 @@ impl<'h> Agent<'h> {
             audience: params.audience,
             workflow: false,
             local_tools: LocalTools::default(),
+            model_policy: params.model_policy,
         }
     }
 
@@ -457,6 +462,7 @@ impl<'h> Agent<'h> {
             audience: self.audience,
             local_tools: Arc::clone(&self.local_tools),
             live_sink: None,
+            model_policy: Arc::clone(&self.model_policy),
         }
     }
 
@@ -480,8 +486,12 @@ impl<'h> Agent<'h> {
     }
 
     async fn do_compact(&mut self) -> Result<(), AgentError> {
-        let (compact_provider, compact_model) =
-            resolve_compaction_model(&self.provider, &self.model, self.timeouts);
+        let (compact_provider, compact_model) = resolve_compaction_model(
+            &self.provider,
+            &self.model,
+            self.timeouts,
+            &self.model_policy,
+        );
         self.total_usage += compaction::compact_history(
             &*compact_provider,
             &compact_model,
@@ -679,6 +689,7 @@ mod tests {
                 subagent_cancels: Arc::new(crate::cancel::CancelMap::new()),
                 registry: Arc::new(crate::tools::ToolRegistry::new()),
                 audience: ToolAudience::MAIN,
+                model_policy: Arc::new(ModelPolicy::default()),
             },
             AgentRunParams {
                 history,
@@ -1080,6 +1091,7 @@ mod tests {
                     subagent_cancels: Arc::new(crate::cancel::CancelMap::new()),
                     registry: Arc::new(crate::tools::ToolRegistry::new()),
                     audience: ToolAudience::MAIN,
+                    model_policy: Arc::new(ModelPolicy::default()),
                 },
                 AgentRunParams {
                     history: &mut history,

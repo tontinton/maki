@@ -9,6 +9,7 @@ use std::ops::AddAssign;
 use std::str::FromStr;
 use std::sync::Arc;
 
+use maki_config::ModelPolicy;
 use maki_storage::sessions::{MIN_THINKING_BUDGET, StoredTokenUsage};
 use serde::{Deserialize, Serialize};
 
@@ -28,8 +29,12 @@ pub enum ModelError {
     UnknownModel(String),
     #[error("invalid model tier '{0}' (expected: strong, medium, weak)")]
     InvalidTier(String),
+    #[error("no allowed model for {0}/{1}")]
+    NoAllowedModel(String, ModelTier),
     #[error("no default model for {0}/{1}")]
     NoDefault(String, ModelTier),
+    #[error("model '{0}' is not allowed by provider model policy")]
+    NotAllowed(String),
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -372,6 +377,32 @@ impl Model {
         Self::from_spec(&format!("{slug}/{model_id}"))
     }
 
+    pub fn from_tier_with_policy(
+        slug: &str,
+        tier: ModelTier,
+        policy: &ModelPolicy,
+    ) -> Result<Self, ModelError> {
+        if let Ok(model) = Self::from_tier_dynamic(slug, tier)
+            && policy.allows(&model.spec())
+        {
+            return Ok(model);
+        }
+
+        let Some(manifest) = ManifestRegistry::for_slug(slug) else {
+            return Err(ModelError::NoAllowedModel(slug.to_string(), tier));
+        };
+        manifest
+            .models
+            .iter()
+            .filter(|entry| entry.tier == tier)
+            .flat_map(|entry| entry.prefixes)
+            .map(|model_id| format!("{slug}/{model_id}"))
+            .find(|spec| policy.allows(spec))
+            .map(|spec| Self::from_spec(&spec))
+            .transpose()?
+            .ok_or_else(|| ModelError::NoAllowedModel(slug.to_string(), tier))
+    }
+
     pub fn from_tier_dynamic(slug: &str, tier: ModelTier) -> Result<Self, ModelError> {
         if let Some(model) = dynamic::find_model_for_tier(slug, tier) {
             return Ok(model);
@@ -400,6 +431,13 @@ impl Model {
             return Self::from_tier(slug, tier);
         }
         Err(ModelError::UnsupportedProvider(slug.to_string()))
+    }
+
+    pub fn from_spec_with_policy(spec: &str, policy: &ModelPolicy) -> Result<Self, ModelError> {
+        if !policy.allows(spec) {
+            return Err(ModelError::NotAllowed(spec.to_string()));
+        }
+        Self::from_spec(spec)
     }
 
     pub fn from_spec(spec: &str) -> Result<Self, ModelError> {
@@ -563,6 +601,20 @@ mod tests {
     use super::*;
     use test_case::test_case;
 
+    fn policy(allowed: &[&str], excluded: &[&str]) -> ModelPolicy {
+        ModelPolicy::new(
+            &allowed
+                .iter()
+                .map(|pattern| (*pattern).into())
+                .collect::<Vec<_>>(),
+            &excluded
+                .iter()
+                .map(|pattern| (*pattern).into())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap()
+    }
+
     const TIERS: [ModelTier; 4] = [
         ModelTier::Weak,
         ModelTier::Medium,
@@ -605,6 +657,47 @@ mod tests {
             std::mem::discriminant(&err),
             std::mem::discriminant(&expected)
         );
+    }
+
+    #[test]
+    fn from_spec_with_policy_rejects_disallowed_exact_spec() {
+        let policy = policy(&["anthropic/*"], &[]);
+        let spec = "openai/gpt-5.6-sol";
+
+        let error = Model::from_spec_with_policy(spec, &policy).unwrap_err();
+
+        assert!(matches!(error, ModelError::NotAllowed(disallowed) if disallowed == spec));
+    }
+
+    #[test]
+    fn from_spec_with_policy_resolves_allowed_exact_spec() {
+        let policy = policy(&["openai/gpt-5.6-sol"], &[]);
+
+        let model = Model::from_spec_with_policy("openai/gpt-5.6-sol", &policy).unwrap();
+
+        assert_eq!(model.spec(), "openai/gpt-5.6-sol");
+    }
+
+    #[test]
+    fn tier_with_policy_uses_allowed_alternative() {
+        let policy = policy(&["openai/gpt-5.4-nano"], &[]);
+
+        let model = Model::from_tier_with_policy("openai", ModelTier::Weak, &policy).unwrap();
+
+        assert_eq!(model.spec(), "openai/gpt-5.4-nano");
+        assert_eq!(model.tier, ModelTier::Weak);
+    }
+
+    #[test]
+    fn tier_with_policy_errors_without_allowed_candidate() {
+        let policy = policy(&["anthropic/*"], &[]);
+
+        let error = Model::from_tier_with_policy("openai", ModelTier::Weak, &policy).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ModelError::NoAllowedModel(provider, ModelTier::Weak) if provider == "openai"
+        ));
     }
 
     #[test]

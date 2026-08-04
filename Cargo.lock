@@ -2473,6 +2473,7 @@ dependencies = [
  "color-eyre",
  "flume 0.11.1",
  "maki-agent",
+ "maki-config",
  "maki-providers",
  "maki-storage",
  "serde",
@@ -2529,6 +2530,7 @@ name = "maki-config"
 version = "0.4.5"
 dependencies = [
  "dotenvy",
+ "globset",
  "inventory",
  "maki-config-macro",
  "maki-storage",

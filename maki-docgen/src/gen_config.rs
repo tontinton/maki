@@ -196,7 +196,10 @@ maki.setup({{
     }},
     provider = {{
         default_model = \"anthropic/claude-sonnet-4-6\",
+        allowed_models = {{ \"anthropic/*\", \"openai/gpt-5\" }},
+        excluded_models = {{ \"*/*-preview\" }},
     }},
+
     storage = {{
         max_log_files = {max_log_files},
     }},
@@ -208,6 +211,8 @@ maki.setup({{
 ```
 
 All fields are optional. Typos in field names cause an error right away.
+
+`provider.allowed_models` is a list of glob patterns for qualified `provider/model-id` specs. `*` also matches `/`, so `opencode/*` includes nested model IDs. When the list is empty or omitted, every model is allowed. `provider.excluded_models` removes matching models after that, so exclusions always win. A project list replaces the matching global list; omit it to inherit or use `{{}}` to clear it. The policy applies to selectors, CLI and API model changes, delegation, and `maki models`.
 
 `maki.setup()` can only be called once per init.lua.
 

@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use maki_config::Effect;
+use maki_config::{Effect, ModelPolicy};
 use maki_providers::{Model, ThinkingConfig, TokenUsage};
 use maki_storage::StateDir;
 use maki_storage::sessions::{StoredEffect, StoredMode, StoredRule};
@@ -31,11 +31,18 @@ impl SessionState {
         mut session: AppSession,
         fallback_model: &Model,
         storage: &StateDir,
+        model_policy: &ModelPolicy,
     ) -> Self {
-        let model = Model::from_spec(&session.model).unwrap_or_else(|_| {
-            session.model = fallback_model.spec();
-            fallback_model.clone()
-        });
+        let model = model_policy
+            .allows(&session.model)
+            .then(|| Model::from_spec(&session.model))
+            .transpose()
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| {
+                session.model = fallback_model.spec();
+                fallback_model.clone()
+            });
 
         let mode = match session.meta.mode {
             Some(StoredMode::Plan) => Mode::Plan,
@@ -200,7 +207,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let storage = StateDir::from_path(tmp.path().to_path_buf());
         let session = make_plan_session(Some(StoredMode::Plan), None);
-        let state = SessionState::from_session(session, &test_model(), &storage);
+        let state =
+            SessionState::from_session(session, &test_model(), &storage, &ModelPolicy::default());
         assert_eq!(state.mode, Mode::Plan);
         assert!(state.plan.path().is_some(), "plan path should be allocated");
     }
@@ -211,7 +219,8 @@ mod tests {
         let storage = StateDir::from_path(tmp.path().to_path_buf());
         let session =
             make_plan_session(Some(StoredMode::Plan), Some("/nonexistent/plan.md".into()));
-        let state = SessionState::from_session(session, &test_model(), &storage);
+        let state =
+            SessionState::from_session(session, &test_model(), &storage, &ModelPolicy::default());
         assert_eq!(state.mode, Mode::Plan);
         let path = state.plan.path().expect("plan path should be allocated");
         assert_ne!(path, Path::new("/nonexistent/plan.md"));
@@ -229,9 +238,29 @@ mod tests {
             Some(StoredMode::Plan),
             Some(plan_file.to_string_lossy().into_owned()),
         );
-        let state = SessionState::from_session(session, &test_model(), &storage);
+        let state =
+            SessionState::from_session(session, &test_model(), &storage, &ModelPolicy::default());
         assert_eq!(state.mode, Mode::Plan);
         assert_eq!(state.plan.path(), Some(plan_file.as_path()));
+    }
+
+    #[test]
+    fn disallowed_restored_model_uses_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = StateDir::from_path(tmp.path().to_path_buf());
+        let fallback = test_model();
+        let mut session = make_plan_session(Some(StoredMode::Build), None);
+        session.model = "openai/gpt-5".into();
+        let raw: maki_config::RawConfig = serde_json::from_value(serde_json::json!({
+            "provider": {"allowed_models": [fallback.spec()]}
+        }))
+        .unwrap();
+        let policy = raw.into_config(false).unwrap().provider.model_policy;
+
+        let state = SessionState::from_session(session, &fallback, &storage, &policy);
+
+        assert_eq!(state.model.spec(), fallback.spec());
+        assert_eq!(state.session.model, fallback.spec());
     }
 
     #[test]
@@ -239,7 +268,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let storage = StateDir::from_path(tmp.path().to_path_buf());
         let session = make_plan_session(Some(StoredMode::Build), None);
-        let state = SessionState::from_session(session, &test_model(), &storage);
+        let state =
+            SessionState::from_session(session, &test_model(), &storage, &ModelPolicy::default());
         assert_eq!(state.mode, Mode::Build);
         assert!(state.plan.path().is_none());
     }

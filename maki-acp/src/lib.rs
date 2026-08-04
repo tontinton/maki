@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use maki_agent::prompt::ResolvedSlots;
 use maki_agent::{AgentConfig, PermissionsConfig};
+use maki_config::ModelPolicy;
 use maki_providers::Timeouts;
 use maki_providers::model::Model;
 
@@ -20,6 +21,7 @@ pub struct AcpParams {
     pub mcp_handle: Option<maki_agent::McpHandle>,
     pub prompt_slots: Arc<ResolvedSlots>,
     pub yolo: bool,
+    pub model_policy: Arc<ModelPolicy>,
 }
 
 pub fn run(params: AcpParams) -> color_eyre::Result<()> {

@@ -34,7 +34,7 @@ use crate::cancel::{CancelMap, CancelToken};
 use crate::mcp::McpSession;
 use crate::permissions::PermissionManager;
 use crate::{AgentConfig, AgentMode, EventSender, SharedBuf};
-use maki_config::ToolOutputLines;
+use maki_config::{ModelPolicy, ToolOutputLines};
 use maki_providers::Model;
 use maki_providers::RequestOptions;
 use maki_providers::provider::Provider;
@@ -221,6 +221,7 @@ pub struct ToolContext {
     /// Never inherited: `to_tool_context` clears it, and each caller sets
     /// it for its own call only.
     pub live_sink: Option<flume::Sender<ToolLive>>,
+    pub model_policy: Arc<ModelPolicy>,
 }
 
 /// Live progress of a dispatched child tool, streamed while it runs.
@@ -439,6 +440,7 @@ pub fn interpreter_ctx(
         audience: ToolAudience::MAIN,
         local_tools: LocalTools::default(),
         live_sink: None,
+        model_policy: Arc::new(ModelPolicy::default()),
     }
 }
 

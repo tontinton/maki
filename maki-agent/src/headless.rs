@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use async_lock::Mutex;
 use flume::Receiver;
+use maki_config::ModelPolicy;
 use maki_providers::Message;
 use maki_providers::Timeouts;
 use maki_providers::TokenUsage;
@@ -81,6 +82,7 @@ pub struct HeadlessParams {
     pub initial_wd: PathBuf,
     pub fast: bool,
     pub workflow: bool,
+    pub model_policy: Arc<ModelPolicy>,
 }
 
 pub struct HeadlessHandle {
@@ -220,6 +222,7 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
                     subagent_cancels: Arc::new(CancelMap::new()),
                     registry: Arc::clone(ToolRegistry::global_arc()),
                     audience: ToolAudience::MAIN,
+                    model_policy: Arc::clone(&params.model_policy),
                 },
                 AgentRunParams {
                     history: &mut history,
@@ -282,6 +285,7 @@ pub struct InteractiveParams {
     pub system_prompt_override: Option<String>,
     pub append_system_prompt: Option<String>,
     pub workflow: bool,
+    pub model_policy: Arc<ModelPolicy>,
 }
 
 pub struct InteractiveHandle {
@@ -366,7 +370,10 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                 let event_tx = EventSender::new(raw_tx.clone(), run_id);
                 let error_tx = event_tx.clone();
 
-                if let Some(mut new_model) = model_rx.try_iter().last()
+                if let Some(mut new_model) = model_rx
+                    .try_iter()
+                    .last()
+                    .filter(|candidate| params.model_policy.allows(&candidate.spec()))
                     && new_model.spec() != model.spec()
                 {
                     match provider::from_model_async(&mut new_model, params.timeouts).await {
@@ -434,6 +441,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                         subagent_cancels: Arc::new(CancelMap::new()),
                         registry: Arc::clone(ToolRegistry::global_arc()),
                         audience: ToolAudience::MAIN,
+                        model_policy: Arc::clone(&params.model_policy),
                     },
                     AgentRunParams {
                         history: &mut history,

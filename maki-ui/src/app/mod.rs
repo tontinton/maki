@@ -57,7 +57,7 @@ use maki_agent::{
     AgentEvent, Envelope, ImageSource, McpConfigErrors, McpPromptInfo, McpSnapshotReader,
     SharedMessages, SubagentInfo,
 };
-use maki_config::UiConfig;
+use maki_config::{ModelPolicy, UiConfig};
 use maki_lua::{EventHandle, HintReader, KeymapReader, LuaCommandReader, WinView};
 use maki_providers::{Model, ThinkingConfig, add_cost};
 use maki_storage::StateDir;
@@ -180,6 +180,7 @@ pub struct App {
     pub(crate) shell: shell::ShellState,
     pub(crate) ui_config: UiConfig,
     pub(crate) permissions: Arc<PermissionManager>,
+    pub(crate) model_policy: Arc<ModelPolicy>,
     pub(crate) lua_event_handle: EventHandle,
     pub(super) keymap_reader: KeymapReader,
     pub(super) hint_reader: HintReader,
@@ -206,9 +207,10 @@ impl App {
         permissions: Arc<PermissionManager>,
         custom_commands: Arc<[maki_agent::command::CustomCommand]>,
         lua_event_handle: EventHandle,
+        model_policy: Arc<ModelPolicy>,
     ) -> Self {
         scrollbar::set_enabled(ui_config.scrollbar);
-        let state = SessionState::from_session(session, model, &storage);
+        let state = SessionState::from_session(session, model, &storage, &model_policy);
         let typewriter = ui_config.typewriter_ms_per_char;
         let flash = ui_config.flash_duration();
         let input_box = InputBox::new(
@@ -270,6 +272,7 @@ impl App {
             shell: shell::ShellState::default(),
             ui_config,
             permissions,
+            model_policy: Arc::clone(&model_policy),
             lua_event_handle,
             keymap_reader,
             hint_reader,
@@ -277,8 +280,12 @@ impl App {
             restoring: Arc::new(AtomicBool::new(false)),
             subagent_answers: HashMap::new(),
         };
-        app.model_picker
-            .set_recents(maki_storage::model::read_recents(&app.storage));
+        app.model_picker.set_recents(
+            maki_storage::model::read_recents(&app.storage)
+                .into_iter()
+                .filter(|spec| model_policy.allows(spec))
+                .collect(),
+        );
         app
     }
 
@@ -300,7 +307,10 @@ impl App {
     }
 
     pub(crate) fn record_recent_model(&mut self, spec: &str) {
-        let recents = maki_storage::model::push_recent(&self.storage, spec);
+        let recents = maki_storage::model::push_recent(&self.storage, spec)
+            .into_iter()
+            .filter(|spec| self.model_policy.allows(spec))
+            .collect();
         self.model_picker.set_recents(recents);
     }
 

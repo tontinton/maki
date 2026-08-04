@@ -12,7 +12,7 @@ use maki_config::providers::{
     ProviderDef, ProvidersConfig, all_builtins, builtin_provider, resolve_api_key_env,
     resolve_base_url, resolve_default_model, resolve_display_name, resolve_login_url, slugify,
 };
-use maki_config::{load_env_files, load_permissions};
+use maki_config::{Config, load_env_files, load_permissions};
 use maki_lua::PluginHost;
 use maki_providers::provider::fetch_all_models;
 use maki_providers::{ProviderData, catalog_providers};
@@ -533,8 +533,16 @@ pub fn auth_status(storage: &StateDir) -> Result<()> {
     Ok(())
 }
 
-pub fn models() {
+pub fn models(no_plugins: bool, no_jit: bool) -> Result<()> {
+    let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
+    load_env_files(&cwd);
+
+    let host = PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !no_jit)
+        .context("initialize lua plugin host")?;
+    let config = load_effective_config(&host, no_plugins, &cwd)?;
+
     smol::block_on(fetch_all_models(
+        &config.provider.model_policy,
         |batch| {
             for model in batch.models {
                 println!("{model}");
@@ -545,6 +553,15 @@ pub fn models() {
         },
         None,
     ));
+    Ok(())
+}
+
+fn load_effective_config(host: &PluginHost, no_plugins: bool, cwd: &Path) -> Result<Config> {
+    host.load_init_files_or_skip(no_plugins, cwd)
+        .context("load init.lua files")?
+        .unwrap_or_default()
+        .into_config(false)
+        .context("invalid config")
 }
 
 pub fn index(path: &str, no_plugins: bool, no_jit: bool) -> Result<()> {

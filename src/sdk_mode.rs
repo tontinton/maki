@@ -25,6 +25,7 @@ use maki_agent::tools::QUESTION_TOOL_NAME;
 use maki_agent::{
     AgentConfig, AgentEvent, AgentInput, AgentMode, Envelope, PermissionsConfig, ToolOutput,
 };
+use maki_config::ModelPolicy;
 use maki_providers::model::Model;
 use maki_providers::{ImageSource, Message, StopReason, Timeouts, TokenUsage};
 use maki_storage::StateDir;
@@ -447,6 +448,7 @@ pub struct SdkParams {
     pub prompt_slots: ResolvedSlots,
     pub fast: bool,
     pub workflow: bool,
+    pub model_policy: Arc<ModelPolicy>,
 }
 
 struct Shared {
@@ -466,6 +468,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         prompt_slots,
         fast,
         workflow,
+        model_policy,
     } = params;
     cli.warn_ignored_flags();
     if let Some(max) = cli.max_turns {
@@ -498,6 +501,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         system_prompt_override: cli.system_prompt.clone().filter(|s| !s.is_empty()),
         append_system_prompt: cli.append_system_prompt.clone().filter(|s| !s.is_empty()),
         workflow,
+        model_policy: Arc::clone(&model_policy),
     });
 
     let (out_tx, out_rx) = flume::unbounded::<String>();
@@ -600,7 +604,14 @@ pub fn run(params: SdkParams) -> Result<()> {
                 else {
                     continue;
                 };
-                handle_control_request(&cr, &writer, &handle, &shared, &startup_model)?;
+                handle_control_request(
+                    &cr,
+                    &writer,
+                    &handle,
+                    &shared,
+                    &startup_model,
+                    &model_policy,
+                )?;
             }
             "control_response" => {
                 let Some(cr) =
@@ -726,6 +737,7 @@ fn handle_control_request(
     handle: &InteractiveHandle,
     shared: &Mutex<Shared>,
     startup_model: &Model,
+    model_policy: &ModelPolicy,
 ) -> Result<()> {
     let ok = Some(Value::Object(Default::default()));
     match cr.request.subtype.as_str() {
@@ -763,11 +775,18 @@ fn handle_control_request(
             }
         }
         "set_model" => {
-            if let Some(model) = resolve_set_model(cr.request.extra.get("model"), startup_model) {
-                let _ = handle.model_tx.send(model.clone());
-                shared.lock().unwrap().model = model;
+            match resolve_set_model(cr.request.extra.get("model"), startup_model, model_policy) {
+                Some(model) => {
+                    let _ = handle.model_tx.send(model.clone());
+                    shared.lock().unwrap().model = model;
+                    writer.emit_control_response(&cr.request_id, ok, None)
+                }
+                None => writer.emit_control_response(
+                    &cr.request_id,
+                    None,
+                    Some("invalid or disallowed model".into()),
+                ),
             }
-            writer.emit_control_response(&cr.request_id, ok, None)
         }
         other => writer.emit_control_response(
             &cr.request_id,
@@ -777,18 +796,27 @@ fn handle_control_request(
     }
 }
 
-fn resolve_set_model(model_val: Option<&Value>, startup_model: &Model) -> Option<Model> {
+fn resolve_set_model(
+    model_val: Option<&Value>,
+    startup_model: &Model,
+    model_policy: &ModelPolicy,
+) -> Option<Model> {
     match model_val? {
         Value::Null => Some(startup_model.clone()),
-        Value::String(model_str) => match Model::from_spec(&resolve_model_spec(model_str)) {
-            Ok(m) => Some(m),
-            Err(e) => {
-                eprintln!(
-                    "warning: failed to resolve model '{model_str}': {e}, keeping current model"
-                );
-                None
+        Value::String(model_str) => {
+            let spec = resolve_model_spec(model_str);
+            if !model_policy.allows(&spec) {
+                warn!(model = %spec, "ignoring model disallowed by policy");
+                return None;
             }
-        },
+            match Model::from_spec(&spec) {
+                Ok(m) => Some(m),
+                Err(e) => {
+                    warn!(model = %model_str, error = %e, "ignoring invalid model");
+                    None
+                }
+            }
+        }
         _ => None,
     }
 }
@@ -1396,8 +1424,32 @@ mod tests {
     #[test]
     fn resolve_set_model_null_returns_startup() {
         let startup = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
-        let result = resolve_set_model(Some(&Value::Null), &startup).unwrap();
+        let result = resolve_set_model(
+            Some(&Value::Null),
+            &startup,
+            &maki_config::ModelPolicy::default(),
+        )
+        .unwrap();
         assert_eq!(result.id, startup.id);
+    }
+
+    #[test]
+    fn resolve_set_model_rejects_disallowed_exact_spec() {
+        let startup = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
+        let raw: maki_config::RawConfig = serde_json::from_value(serde_json::json!({
+            "provider": {"allowed_models": [startup.spec()]}
+        }))
+        .unwrap();
+        let policy = raw.into_config(false).unwrap().provider.model_policy;
+
+        assert!(
+            resolve_set_model(
+                Some(&Value::String("openai/gpt-5".into())),
+                &startup,
+                &policy
+            )
+            .is_none()
+        );
     }
 
     #[test]

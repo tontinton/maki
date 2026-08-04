@@ -253,6 +253,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
             prompt_slots,
             fast,
             workflow: stack.config.always_workflow,
+            model_policy: Arc::new(stack.config.provider.model_policy.clone()),
         })
         .context("run sdk mode")?;
         return Ok(());
@@ -272,6 +273,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
             stack.plugin_host.event_handle(),
             fast,
             stack.config.always_workflow,
+            Arc::new(stack.config.provider.model_policy.clone()),
         )
         .context("run print mode")?;
         return Ok(());
@@ -301,7 +303,13 @@ pub fn run(mut cli: Cli) -> Result<()> {
             }
         }
         let focused_tab = &tabs[focused];
-        let model = if focused_tab.messages().is_empty() {
+        let model = if focused_tab.messages().is_empty()
+            || !stack
+                .config
+                .provider
+                .model_policy
+                .allows(&focused_tab.model)
+        {
             stack.model.clone()
         } else {
             Model::from_spec(&focused_tab.model).unwrap_or_else(|_| stack.model.clone())
@@ -330,6 +338,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 hint_reader: stack.plugin_host.hint_reader(),
                 ui_action_rx: stack.plugin_host.ui_action_rx(),
                 lua_event_handle: stack.plugin_host.event_handle(),
+                model_policy: Arc::new(stack.config.provider.model_policy.clone()),
             },
             initial_prompt.take(),
         )
