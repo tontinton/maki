@@ -94,9 +94,71 @@ function Install-Maki([string]$Tag) {
 
         Write-Host "$Binary $Tag installed to $dest"
         Add-ToUserPath -Dir $InstallDir
+
+        if (-not (Test-BashAvailable)) {
+            Write-Host ""
+            Write-Host "warning: bash not found on Windows. The bash tool requires Git for Windows or WSL."
+            if (Test-WinGetAvailable) {
+                $response = Read-Host "Install Git for Windows via winget? (y/N)"
+                if ($response -eq 'y' -or $response -eq 'Y') {
+                    Write-Host "Installing Git for Windows..."
+                    winget install --id Git.Git -e --source winget
+                    Write-Host "Git for Windows installed. Restart your terminal to use bash."
+                } else {
+                    Write-Host "To install manually:"
+                    Write-Host "  winget install --id Git.Git -e --source winget"
+                    Write-Host "  or download from https://git-scm.com/download/win"
+                    Write-Host ""
+                    Write-Host "Alternatively, enable WSL: https://learn.microsoft.com/en-us/windows/wsl/install"
+                }
+            } else {
+                Write-Host "To install Git for Windows:"
+                Write-Host "  Download from https://git-scm.com/download/win"
+                Write-Host ""
+                Write-Host "Alternatively, enable WSL: https://learn.microsoft.com/en-us/windows/wsl/install"
+            }
+        }
     } finally {
         Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
     }
+}
+
+function Test-BashAvailable {
+    $paths = $env:Path -split ';'
+    foreach ($dir in $paths) {
+        $bashPath = Join-Path $dir.Trim('"') "bash.exe"
+        if (Test-Path -LiteralPath $bashPath -PathType Leaf) {
+            return $true
+        }
+    }
+    $candidates = @(
+        "C:\Program Files\Git\bin\bash.exe",
+        "C:\Program Files\Git\usr\bin\bash.exe",
+        "C:\Program Files (x86)\Git\bin\bash.exe",
+        "C:\cygwin64\bin\bash.exe",
+        "C:\cygwin\bin\bash.exe",
+        "C:\msys64\usr\bin\bash.exe",
+        "C:\msys32\usr\bin\bash.exe"
+    )
+    foreach ($candidate in $candidates) {
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+            return $true
+        }
+    }
+    foreach ($dir in $paths) {
+        $wslPath = Join-Path $dir.Trim('"') "wsl.exe"
+        if (Test-Path -LiteralPath $wslPath -PathType Leaf) {
+            return $true
+        }
+    }
+    if (Test-Path -LiteralPath "C:\Windows\System32\wsl.exe" -PathType Leaf) {
+        return $true
+    }
+    return $false
+}
+
+function Test-WinGetAvailable {
+    return $null -ne (Get-Command winget -ErrorAction Ignore)
 }
 
 function Add-ToUserPath([string]$Dir) {

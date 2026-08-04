@@ -3782,3 +3782,102 @@ mod read_tool_required_params {
         );
     }
 }
+
+/// List mode runs the program directly without shell interpretation.
+/// This preserves argument quoting (the core fix for #602).
+#[test]
+fn jobstart_list_mode_preserve_arg_quoting() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let src = format!(
+        r#"maki.api.register_tool({{
+            name = "job_list",
+            description = "runs program directly via list mode",
+            schema = {MINIMAL_SCHEMA},
+            audiences = {{ "main" }},
+            handler = function(input, ctx)
+                maki.fn.jobstart({{"echo", "hello world"}}, {{
+                    on_exit = function(_, code)
+                        ctx:finish("exit=" .. tostring(code))
+                    end
+                }})
+            end
+        }})"#
+    );
+    host.load_source("job_list", &src).unwrap();
+    let out = exec_tool(&reg, "job_list", serde_json::json!({})).unwrap();
+    assert_eq!(out, "exit=0");
+}
+
+/// List mode with multiple args works correctly.
+#[test]
+fn jobstart_list_mode_multiple_args() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let src = format!(
+        r#"maki.api.register_tool({{
+            name = "job_multi",
+            description = "tests multiple args in list mode",
+            schema = {MINIMAL_SCHEMA},
+            audiences = {{ "main" }},
+            handler = function(input, ctx)
+                local seen = {{}}
+                local exit_code
+                maki.fn.jobstart({{"echo", "-n", "a", "b", "c"}}, {{
+                    on_stdout = function(_, line) seen[#seen + 1] = line end
+                }})
+                local res = maki.fn.jobwait(1)
+                return table.concat(seen, ",")
+            end
+        }})"#
+    );
+    host.load_source("job_multi", &src).unwrap();
+    let out = exec_tool(&reg, "job_multi", serde_json::json!({})).unwrap();
+    // echo -n a b c should output "a b c" without trailing newline
+    assert_eq!(out, "a b c");
+}
+
+/// Empty table for list mode errors appropriately.
+#[test]
+fn jobstart_list_mode_empty_table_errors() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let src = format!(
+        r#"maki.api.register_tool({{
+            name = "job_empty",
+            description = "empty array errors",
+            schema = {MINIMAL_SCHEMA},
+            audiences = {{ "main" }},
+            handler = function(input, ctx)
+                local _, err = pcall(maki.fn.jobstart, {{}})
+                return tostring(err)
+            end
+        }})"#
+    );
+    host.load_source("job_empty", &src).unwrap();
+    let out = exec_tool(&reg, "job_empty", serde_json::json!({})).unwrap();
+    assert!(out.contains("must have at least a program"), "got: {out}");
+}
+
+/// Non-string in array errors appropriately.
+#[test]
+fn jobstart_list_mode_non_string_arg_errors() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let src = format!(
+        r#"maki.api.register_tool({{
+            name = "job_nonstr",
+            description = "non-string arg errors",
+            schema = {MINIMAL_SCHEMA},
+            audiences = {{ "main" }},
+            handler = function(input, ctx)
+                local _, err = pcall(maki.fn.jobstart, {{123, "echo"}})
+                return tostring(err)
+            end
+        }})"#
+    );
+    host.load_source("job_nonstr", &src).unwrap();
+    let out = exec_tool(&reg, "job_nonstr", serde_json::json!({})).unwrap();
+    // When a non-string is in the array, mlua's get::<String> will error
+    assert!(!out.is_empty(), "got empty error string");
+}

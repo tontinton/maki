@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::process::Command as StdCommand;
 use std::time::{Duration, Instant};
 
@@ -12,6 +12,8 @@ use maki_agent::{
     AgentConfig, CancelToken, CancelTrigger, ToolDoneEvent, ToolInput, ToolOutput, ToolStartEvent,
 };
 use maki_providers::Message;
+
+use maki_config::bash_command;
 
 use super::App;
 
@@ -212,12 +214,10 @@ async fn run_command(
     max_output_lines: usize,
     max_output_bytes: usize,
 ) -> Result<String, String> {
-    let mut std_cmd = StdCommand::new("bash");
-    std_cmd
-        .arg("-c")
-        .arg(command)
-        .env("GIT_TERMINAL_PROMPT", "0");
-
+    let mut env = HashMap::new();
+    env.insert("GIT_TERMINAL_PROMPT".to_string(), "0".to_string());
+    let mut std_cmd: StdCommand = bash_command(command, Some(&env))?;
+    std_cmd.envs(&env);
     #[cfg(unix)]
     unsafe {
         std_cmd.pre_exec(|| {
