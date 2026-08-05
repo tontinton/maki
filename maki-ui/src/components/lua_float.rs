@@ -268,7 +268,9 @@ impl FloatManager {
     }
 
     pub fn needs_input(&self) -> bool {
-        self.windows.iter().any(|win| win.config.needs_input)
+        self.windows
+            .iter()
+            .any(|win| win.visible && win.config.needs_input)
     }
 
     pub fn handle_key(&mut self, key_event: KeyEvent) -> bool {
@@ -731,6 +733,20 @@ mod tests {
         let buf = make_buf(lines);
         mgr.open(buf, make_config(), true, event_tx, cmd_rx);
         (event_rx, cmd_tx)
+    }
+
+    #[test_case(true, true ; "visible")]
+    #[test_case(false, false ; "hidden")]
+    fn needs_input_requires_visibility(visible: bool, expected: bool) {
+        let mut mgr = FloatManager::new();
+        let (event_tx, cmd_rx, _, _) = make_channels();
+        let config = FloatConfig {
+            visible,
+            needs_input: true,
+            ..FloatConfig::default()
+        };
+        mgr.open(make_buf(&[]), config, false, event_tx, cmd_rx);
+        assert_eq!(mgr.needs_input(), expected);
     }
 
     #[test]

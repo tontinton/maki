@@ -315,7 +315,7 @@ fn ctrl_c_quits_when_input_empty() {
     app.status = Status::Idle;
     let actions = app.update(Msg::Key(kb::QUIT.to_key_event()));
     assert_eq!(app.exit_request, ExitRequest::Success);
-    assert!(actions.is_empty());
+    assert!(matches!(actions.as_slice(), [Action::ManualExit]));
 }
 
 #[test_case(done(), ExitRequest::Success ; "done_exits_success")]
@@ -325,8 +325,26 @@ fn exit_on_done_flag_triggers_exit(event: AgentEvent, expected: ExitRequest) {
     app.exit_on_done = true;
     app.status = Status::Streaming;
     app.run_id = 1;
-    app.update(agent_msg(event));
+    let actions = app.update(agent_msg(event));
     assert_eq!(app.exit_request, expected);
+    assert!(actions.is_empty());
+}
+
+#[test]
+fn reset_session_clears_exit_request_source() {
+    let mut app = test_app();
+    app.exit_on_done = true;
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    app.update(agent_msg(AgentEvent::Done {
+        usage: TokenUsage::default(),
+        num_turns: 1,
+        reason: DoneReason::EndTurn,
+    }));
+
+    app.reset_session();
+
+    assert_eq!(app.exit_request, ExitRequest::None);
 }
 
 #[test]
@@ -2205,7 +2223,7 @@ fn submit_exit_quits() {
         images: vec![],
     });
     assert_eq!(app.exit_request, ExitRequest::Success);
-    assert!(actions.is_empty());
+    assert!(matches!(actions.as_slice(), [Action::ManualExit]));
 }
 
 #[test]
@@ -2300,7 +2318,7 @@ fn reload_persists_session_with_content_to_disk() {
         .push_message(Message::user("hello".into()));
     let actions = app.execute_command(cmd("/reload"), 0);
     assert_eq!(app.exit_request, ExitRequest::Reload);
-    assert!(actions.is_empty());
+    assert!(matches!(actions.as_slice(), [Action::ManualExit]));
     app.checkpoint();
     let id = app.state.session.id;
     drain_writer(app, writer);
@@ -3965,10 +3983,23 @@ fn attention_float_marks_app_as_awaiting_input_until_close() {
 
     app.float_mgr.open(buf, config, true, event_tx, cmd_rx);
     assert!(app.awaiting_input());
+    assert_eq!(app.attention(), Some(Notification::QuestionRequested));
+
+    cmd_tx
+        .send(maki_lua::WinCommand::SetVisible(false))
+        .unwrap();
+    let _ = app.float_mgr.tick();
+    assert!(!app.awaiting_input());
+    assert_eq!(app.attention(), None);
+
+    cmd_tx.send(maki_lua::WinCommand::SetVisible(true)).unwrap();
+    let _ = app.float_mgr.tick();
+    assert_eq!(app.attention(), Some(Notification::QuestionRequested));
 
     cmd_tx.send(maki_lua::WinCommand::Close).unwrap();
     let _ = app.float_mgr.tick();
     assert!(!app.awaiting_input());
+    assert_eq!(app.attention(), None);
 }
 
 #[test]
@@ -4182,6 +4213,134 @@ const BUMP_TITLE: &str = "title bump ";
 const TOOL_IDS: [&str; 2] = ["tool-a", "tool-b"];
 const FINISHED_TASK_ID: &str = "task-finished";
 const UNFINISHED_TASK_ID: &str = "task-unfinished";
+
+#[test]
+fn turn_response_normalizes_text_and_truncates_unicode() {
+    let long = "界".repeat(201);
+    let message = Message {
+        role: Role::Assistant,
+        content: vec![
+            ContentBlock::Text {
+                text: "  first\n\tsecond ".into(),
+            },
+            ContentBlock::Thinking {
+                thinking: "ignored".into(),
+                signature: None,
+            },
+            ContentBlock::Text { text: long },
+        ],
+        ..Default::default()
+    };
+    let response = turn_response(&message).unwrap();
+    assert_eq!(response.chars().count(), 200);
+    assert!(response.starts_with("first second 界"));
+    assert_eq!(turn_response(&Message::default()), None);
+}
+
+#[test]
+fn turn_response_stops_after_bounded_large_input() {
+    let message = Message {
+        role: Role::Assistant,
+        content: vec![
+            ContentBlock::Text {
+                text: format!("first {}", "x".repeat(1_000_000)),
+            },
+            ContentBlock::Text {
+                text: "not reached".into(),
+            },
+        ],
+        ..Default::default()
+    };
+
+    let response = turn_response(&message).unwrap();
+
+    assert_eq!(response.chars().count(), 200);
+    assert!(response.starts_with("first "));
+    assert!(!response.contains("not reached"));
+}
+
+#[test]
+fn tool_call_is_not_a_turn_response() {
+    assert_eq!(turn_response(&tool_use_msg("tool")), None);
+}
+
+#[test_case(Notification::TurnComplete { response: Some("answer".into()) }, "answer", NotificationPriority::Low ; "turn_response")]
+#[test_case(Notification::TurnComplete { response: None }, "Agent turn complete", NotificationPriority::Low ; "turn_fallback")]
+#[test_case(Notification::PermissionRequested { tool: Some("bash".into()) }, "Permission requested: bash", NotificationPriority::High ; "permission_tool")]
+#[test_case(Notification::PermissionRequested { tool: None }, "Permission requested", NotificationPriority::High ; "permission_fallback")]
+#[test_case(Notification::AuthenticationRequired, "Authentication required", NotificationPriority::High ; "authentication")]
+#[test_case(Notification::QuestionRequested, "Question requested", NotificationPriority::High ; "question")]
+#[test_case(Notification::PlanReady, "Plan ready", NotificationPriority::High ; "plan")]
+fn notification_message_and_priority(
+    notification: Notification,
+    expected_message: &str,
+    expected_priority: NotificationPriority,
+) {
+    assert_eq!(notification.message(), expected_message);
+    assert_eq!(notification.priority(), expected_priority);
+}
+
+#[test]
+fn error_completion_has_safe_message() {
+    assert_eq!(
+        Notification::error_completion().message(),
+        "Agent stopped with an error"
+    );
+}
+
+#[test]
+fn attention_prioritizes_permission_and_normalizes_tool() {
+    let mut app = test_app();
+    app.pending_input = PendingInput::AuthRetry { subagent_id: None };
+    app.state.mode = Mode::Plan;
+    app.state.plan = PlanState::Ready(PathBuf::from("plan.md"));
+    app.plan_form.on_plan_ready();
+    app.permission_prompt.open(
+        "id".into(),
+        maki_config::ToolKey::native("bash"),
+        vec!["execute".into()],
+        None,
+    );
+    assert_eq!(
+        app.attention(),
+        Some(Notification::PermissionRequested {
+            tool: Some("bash".into())
+        })
+    );
+
+    app.permission_prompt
+        .open("id".into(), maki_config::ToolKey::Wildcard, vec![], None);
+    assert_eq!(
+        app.attention(),
+        Some(Notification::PermissionRequested { tool: None })
+    );
+}
+
+#[test]
+fn attention_classifies_auth_and_ready_plan() {
+    let mut app = test_app();
+    app.pending_input = PendingInput::AuthRetry { subagent_id: None };
+    assert_eq!(app.attention(), Some(Notification::AuthenticationRequired));
+
+    app.pending_input = PendingInput::None;
+    app.state.mode = Mode::Plan;
+    app.state.plan = PlanState::Ready(PathBuf::from("plan.md"));
+    app.plan_form.on_plan_ready();
+    app.status = Status::Streaming;
+    assert_eq!(app.attention(), None);
+    app.status = Status::Idle;
+    assert_eq!(app.attention(), Some(Notification::PlanReady));
+    assert!(!app.awaiting_input());
+
+    app.plan_form.hide();
+    assert_eq!(app.attention(), None);
+    app.plan_form.on_plan_ready();
+    app.state.plan = PlanState::Drafting(PathBuf::from("plan.md"));
+    assert_eq!(app.attention(), None);
+    app.state.plan = PlanState::Ready(PathBuf::from("plan.md"));
+    app.state.mode = Mode::Build;
+    assert_eq!(app.attention(), None);
+}
 
 fn tool_use_msg(id: &str) -> Message {
     Message {

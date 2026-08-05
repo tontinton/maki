@@ -62,7 +62,7 @@ use maki_config::{ModelPolicy, UiConfig};
 use maki_lua::{
     BuiltinAction, EventHandle, HintReader, HintSnapshot, KeymapReader, LuaCommandReader, WinView,
 };
-use maki_providers::{Model, ThinkingConfig, add_cost};
+use maki_providers::{ContentBlock, Message, Model, ThinkingConfig, add_cost};
 use maki_storage::StateDir;
 use maki_storage::input_history::InputHistory;
 use maki_storage::model::persist_model;
@@ -98,6 +98,7 @@ const IMPLEMENT_PARALLEL_HINT: &str = "Use batch+task to parallelize, assign eac
 
 const TASK_DONE_DETAIL: &str = "✓ ";
 const MISSING_TOOL_COMPLETION: &str = "Tool did not report completion before the turn ended";
+const NOTIFICATION_PREVIEW_CHARS: usize = 200;
 
 /// Depth budget for `maki.api.run_command` chains. Aliases nest a level or two
 /// in practice; the cap only exists so a command aliasing itself reports an
@@ -122,6 +123,99 @@ impl PickerItem for TaskEntry {
     fn is_spinning(&self) -> bool {
         matches!(self.finished, Some(false))
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Notification {
+    TurnComplete { response: Option<String> },
+    PermissionRequested { tool: Option<String> },
+    AuthenticationRequired,
+    QuestionRequested,
+    PlanReady,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd)]
+pub(crate) enum NotificationPriority {
+    Low,
+    High,
+}
+
+impl Notification {
+    pub(crate) fn priority(&self) -> NotificationPriority {
+        match self {
+            Self::TurnComplete { .. } => NotificationPriority::Low,
+            Self::PermissionRequested { .. }
+            | Self::AuthenticationRequired
+            | Self::QuestionRequested
+            | Self::PlanReady => NotificationPriority::High,
+        }
+    }
+
+    pub(crate) fn message(&self) -> String {
+        match self {
+            Self::TurnComplete { response } => response
+                .clone()
+                .unwrap_or_else(|| "Agent turn complete".into()),
+            Self::PermissionRequested { tool: Some(tool) } => {
+                format!("Permission requested: {tool}")
+            }
+            Self::PermissionRequested { tool: None } => "Permission requested".into(),
+            Self::AuthenticationRequired => "Authentication required".into(),
+            Self::QuestionRequested => "Question requested".into(),
+            Self::PlanReady => "Plan ready".into(),
+        }
+    }
+
+    pub(crate) fn error_completion() -> Self {
+        Self::TurnComplete {
+            response: Some("Agent stopped with an error".into()),
+        }
+    }
+}
+
+fn notification_preview<'a>(chunks: impl Iterator<Item = &'a str>) -> Option<String> {
+    let mut preview = String::new();
+    let mut characters = 0;
+    let mut pending_space = false;
+    for chunk in chunks {
+        pending_space |= !preview.is_empty();
+        for character in chunk.chars() {
+            if character.is_whitespace() {
+                pending_space = !preview.is_empty();
+                continue;
+            }
+            if pending_space {
+                preview.push(' ');
+                characters += 1;
+                if characters == NOTIFICATION_PREVIEW_CHARS {
+                    preview.pop();
+                    return Some(preview);
+                }
+            }
+            pending_space = false;
+            preview.push(character);
+            characters += 1;
+            if characters == NOTIFICATION_PREVIEW_CHARS {
+                return Some(preview);
+            }
+        }
+    }
+    (!preview.is_empty()).then_some(preview)
+}
+
+fn normalize_preview(text: &str) -> Option<String> {
+    notification_preview(std::iter::once(text))
+}
+
+pub(crate) fn turn_response(message: &Message) -> Option<String> {
+    if message.has_tool_calls() {
+        return None;
+    }
+
+    notification_preview(message.content.iter().filter_map(|block| match block {
+        ContentBlock::Text { text } => Some(text.as_str()),
+        _ => None,
+    }))
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -931,7 +1025,11 @@ impl App {
     fn quit_with(&mut self, req: ExitRequest) -> Vec<Action> {
         self.save_input_history();
         self.exit_request = req;
-        vec![]
+        vec![Action::ManualExit]
+    }
+
+    pub(crate) fn clear_exit_request(&mut self) {
+        self.exit_request = ExitRequest::None;
     }
 
     pub(crate) fn handle_submit(&mut self, sub: Submission) -> Vec<Action> {
@@ -1573,6 +1671,24 @@ impl App {
     /// error; a background run would wipe it (`start_run` clears the queue).
     pub(crate) fn holds_recovery_text(&self) -> bool {
         !self.recoverable_queue.is_empty()
+    }
+
+    pub(crate) fn attention(&self) -> Option<Notification> {
+        if let Some(tool) = self.permission_prompt.tool() {
+            let tool = (!matches!(tool, maki_config::ToolKey::Wildcard))
+                .then(|| normalize_preview(&tool.to_string()))
+                .flatten();
+            return Some(Notification::PermissionRequested { tool });
+        }
+        if matches!(self.pending_input, PendingInput::AuthRetry { .. }) {
+            return Some(Notification::AuthenticationRequired);
+        }
+        if self.status != Status::Streaming && self.plan_form_active() {
+            return Some(Notification::PlanReady);
+        }
+        self.float_mgr
+            .needs_input()
+            .then_some(Notification::QuestionRequested)
     }
 
     pub fn has_modal_overlay(&self) -> bool {

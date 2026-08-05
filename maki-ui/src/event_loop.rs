@@ -19,7 +19,9 @@ use crossterm::event::{
 };
 use maki_agent::command::CustomCommand;
 use maki_agent::permissions::PermissionManager;
-use maki_agent::{AgentConfig, CancelToken, McpCommand, McpConfigErrors, McpHandle, mcp};
+use maki_agent::{
+    AgentConfig, AgentEvent, CancelToken, Envelope, McpCommand, McpConfigErrors, McpHandle, mcp,
+};
 use maki_config::{ModelPolicy, UiConfig};
 use maki_lua::{
     EventHandle, HintReader, KeymapReader, LuaCommandReader, SessionReply, SessionRequest, UiAction,
@@ -37,7 +39,7 @@ use tracing::{info, warn};
 use crate::AppSession;
 use crate::agent::{AgentCommand, AgentHandles, ModelSlot, shared_queue::QueueItem};
 use crate::app::shell::{ShellEvent, spawn_shell};
-use crate::app::{App, Msg, QueuedMessage, SubmitOutcome};
+use crate::app::{App, Msg, Notification, QueuedMessage, SubmitOutcome, turn_response};
 use crate::color_compat;
 use crate::components::input::Submission;
 use crate::components::usage_modal::UsageFetchState;
@@ -91,6 +93,104 @@ enum SessionStatus {
     Idle,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PendingCompletion {
+    WaitingForQueueDrain(Notification),
+    Due(Notification),
+}
+
+#[derive(Default)]
+struct RunNotificationState {
+    response_candidate: Option<String>,
+    pending_completion: Option<PendingCompletion>,
+    last_attention: Option<Notification>,
+    exit_pending_drain: bool,
+}
+
+impl RunNotificationState {
+    fn on_run_start(&mut self) {
+        *self = Self::default();
+    }
+
+    fn on_cancel(&mut self) {
+        self.on_run_start();
+    }
+
+    fn on_queue_item_consumed(&mut self) {
+        self.response_candidate = None;
+        self.pending_completion = None;
+    }
+
+    fn on_turn_complete(&mut self, message: &Message) {
+        self.response_candidate = turn_response(message);
+    }
+
+    fn on_done(&mut self, event: &AgentEvent, exit_on_done: bool) {
+        let notification = match event {
+            AgentEvent::Done { .. } => Notification::TurnComplete {
+                response: self.response_candidate.take(),
+            },
+            AgentEvent::Error { .. } => {
+                self.response_candidate = None;
+                Notification::error_completion()
+            }
+            _ => return,
+        };
+        self.pending_completion = Some(PendingCompletion::WaitingForQueueDrain(notification));
+        self.exit_pending_drain = exit_on_done;
+    }
+
+    fn on_drain(&mut self) {
+        match self.pending_completion.take() {
+            Some(PendingCompletion::WaitingForQueueDrain(notification)) => {
+                self.pending_completion = Some(PendingCompletion::Due(notification));
+                self.exit_pending_drain = false;
+            }
+            pending => self.pending_completion = pending,
+        }
+    }
+
+    fn on_manual_exit(&mut self) {
+        self.exit_pending_drain = false;
+    }
+
+    fn reconcile(
+        &mut self,
+        attention: Option<Notification>,
+        status: SessionStatus,
+        queue_empty: bool,
+        terminal_focused: bool,
+    ) -> Option<Notification> {
+        let prompt = (attention != self.last_attention)
+            .then(|| attention.clone())
+            .flatten();
+        self.last_attention = attention.clone();
+
+        let completion = match self.pending_completion.take() {
+            Some(PendingCompletion::WaitingForQueueDrain(notification)) => {
+                self.pending_completion =
+                    Some(PendingCompletion::WaitingForQueueDrain(notification));
+                None
+            }
+            Some(PendingCompletion::Due(notification))
+                if attention.is_none() && status == SessionStatus::Idle && queue_empty =>
+            {
+                Some(notification)
+            }
+            _ => None,
+        };
+        (!terminal_focused).then(|| prompt.or(completion)).flatten()
+    }
+
+    fn waiting_for_exit_drain(&self) -> bool {
+        self.exit_pending_drain
+    }
+
+    fn agent_stopped_before_drain(&self, agent_finished: bool, agent_rx_empty: bool) -> bool {
+        self.exit_pending_drain && agent_finished && agent_rx_empty
+    }
+}
+
 impl SessionStatus {
     fn of(app: &App) -> Self {
         if app.awaiting_input() {
@@ -116,6 +216,65 @@ fn prepend_preamble(preamble: &mut Vec<Message>, mut leading: Vec<Message>) {
     *preamble = leading;
 }
 
+fn is_current_top_level(current_run_id: u64, envelope: &Envelope) -> bool {
+    envelope.run_id == current_run_id && envelope.subagent.is_none()
+}
+
+fn select_notification(
+    selected: Option<Notification>,
+    candidate: Option<Notification>,
+) -> Option<Notification> {
+    match (selected, candidate) {
+        (Some(current), Some(candidate)) if candidate.priority() > current.priority() => {
+            Some(candidate)
+        }
+        (selected @ Some(_), _) => selected,
+        (None, candidate) => candidate,
+    }
+}
+
+fn select_exit_runtime<'a>(
+    runtimes: impl IntoIterator<Item = (usize, &'a ExitRequest, &'a RunNotificationState)>,
+) -> Option<usize> {
+    runtimes.into_iter().find_map(|(index, request, state)| {
+        (*request != ExitRequest::None && !state.waiting_for_exit_drain()).then_some(index)
+    })
+}
+
+fn queue_drain_matches(current_run_id: u64, envelope: &Envelope) -> bool {
+    envelope.run_id == current_run_id
+        && envelope.subagent.is_none()
+        && matches!(envelope.event, AgentEvent::QueueDrained)
+}
+
+#[cfg(not(windows))]
+fn terminal_focus_event(event: &Event) -> Option<bool> {
+    match event {
+        Event::FocusGained => Some(true),
+        Event::FocusLost => Some(false),
+        _ => None,
+    }
+}
+
+#[cfg(windows)]
+fn terminal_focus_event(_event: &Event) -> Option<bool> {
+    None
+}
+
+#[cfg(not(windows))]
+fn terminal_input_proves_focus(event: &Event) -> bool {
+    match event {
+        Event::Key(key) => key.kind == KeyEventKind::Press,
+        Event::Paste(_) | Event::Mouse(_) => true,
+        _ => false,
+    }
+}
+
+#[cfg(windows)]
+fn terminal_input_proves_focus(_event: &Event) -> bool {
+    false
+}
+
 fn parse_session_id(id: &str) -> Result<MakiId, String> {
     id.parse().map_err(|e: MakiIdParseError| e.to_string())
 }
@@ -126,6 +285,7 @@ struct SessionRuntime {
     shell_tx: flume::Sender<ShellEvent>,
     shell_rx: flume::Receiver<ShellEvent>,
     last_status: SessionStatus,
+    notifications: RunNotificationState,
 }
 
 impl SessionRuntime {
@@ -214,6 +374,7 @@ impl SpawnCtx {
             shell_tx,
             shell_rx,
             last_status: SessionStatus::Idle,
+            notifications: RunNotificationState::default(),
         }
     }
 }
@@ -223,6 +384,8 @@ pub(crate) struct EventLoop<'t> {
     sessions: Vec<SessionRuntime>,
     focused: usize,
     last_focused: Option<MakiId>,
+    terminal_focused: bool,
+    notifier: Option<terminal::TerminalNotifier>,
     ctx: SpawnCtx,
     input: InputReader,
     warn_rx: flume::Receiver<String>,
@@ -380,6 +543,7 @@ impl<'t> EventLoop<'t> {
         let bg = spawn_model_fetch(&model_slot, timeouts, Arc::clone(&model_policy));
         let storage_writer = Arc::new(StorageWriter::new(storage.clone(), bg.warn_tx.clone()));
 
+        let notifier = terminal::TerminalNotifier::new(ui_config.notifications);
         let ctx = SpawnCtx {
             storage,
             config,
@@ -426,6 +590,8 @@ impl<'t> EventLoop<'t> {
             sessions: runtimes,
             focused,
             last_focused: None,
+            terminal_focused: false,
+            notifier,
             ctx,
             input: InputReader::spawn(),
             warn_rx: bg.warn_rx,
@@ -468,14 +634,13 @@ impl<'t> EventLoop<'t> {
                 }
             }
 
-            if let Some(i) = self
-                .sessions
-                .iter()
-                .position(|rt| rt.app.exit_request != ExitRequest::None)
+            if let Some(i) =
+                select_exit_runtime(self.sessions.iter().enumerate().map(|(index, runtime)| {
+                    (index, &runtime.app.exit_request, &runtime.notifications)
+                }))
             {
-                // A backgrounded session can finish an `exit_on_done` turn;
-                // focus it so shutdown reports its exit code and id.
                 self.focused = i;
+                self.emit_notifications();
                 break Ok(());
             }
 
@@ -567,6 +732,35 @@ impl<'t> EventLoop<'t> {
     }
 
     fn handle_agent(&mut self, idx: usize, envelope: Box<maki_agent::Envelope>) {
+        let notifications_enabled = self.notifier.is_some();
+        let current = is_current_top_level(self.sessions[idx].app.run_id, &envelope);
+        if matches!(&envelope.event, AgentEvent::QueueDrained) {
+            if queue_drain_matches(self.sessions[idx].app.run_id, &envelope) {
+                self.sessions[idx].notifications.on_drain();
+            }
+            return;
+        }
+
+        if current && matches!(&envelope.event, AgentEvent::QueueItemConsumed { .. }) {
+            let runtime = &mut self.sessions[idx];
+            runtime.notifications.on_queue_item_consumed();
+            if runtime.app.exit_on_done {
+                runtime.app.clear_exit_request();
+            }
+        } else if notifications_enabled
+            && current
+            && let AgentEvent::TurnComplete(turn) = &envelope.event
+        {
+            self.sessions[idx]
+                .notifications
+                .on_turn_complete(&turn.message);
+        }
+        if current {
+            let exit_on_done = self.sessions[idx].app.exit_on_done;
+            self.sessions[idx]
+                .notifications
+                .on_done(&envelope.event, exit_on_done);
+        }
         let actions = self.sessions[idx].app.update(Msg::Agent(envelope));
         self.dispatch(idx, actions);
     }
@@ -599,8 +793,21 @@ impl<'t> EventLoop<'t> {
         // These two only fire Lua autocmds. Anything a handler does comes back
         // as a `UiAction` on the next wake, which repaints then.
         self.emit_focus_change();
+        dirty |= self.start_mailbox_runs();
         self.emit_status_changes();
-        Ok(dirty | self.start_mailbox_runs())
+        self.emit_notifications();
+        if let Some(runtime) = self.sessions.iter().find(|runtime| {
+            runtime.notifications.agent_stopped_before_drain(
+                runtime.handles.is_finished(),
+                runtime.handles.agent_rx.is_empty(),
+            )
+        }) {
+            return Err(eyre!(
+                "agent for session {} stopped before queue drain",
+                runtime.id()
+            ));
+        }
+        Ok(dirty)
     }
 
     fn handle_ui_action(&mut self, action: UiAction) {
@@ -665,6 +872,7 @@ impl<'t> EventLoop<'t> {
             let _pause = self.input.pause();
             terminal::open_in_editor(path, self.terminal)
         };
+        self.terminal_focused = false;
         match result {
             Ok(code) => code,
             Err(e) => {
@@ -691,6 +899,34 @@ impl<'t> EventLoop<'t> {
                     "focused": i == self.focused,
                 }),
             );
+        }
+    }
+
+    fn emit_notifications(&mut self) {
+        if self.notifier.is_none() {
+            return;
+        }
+        let mut selected = None;
+        for runtime in &mut self.sessions {
+            let candidate = runtime.notifications.reconcile(
+                runtime.app.attention(),
+                runtime.last_status,
+                matches!(runtime.handles.queue.len(), 0),
+                self.terminal_focused,
+            );
+            selected = select_notification(selected, candidate);
+        }
+
+        let Some(notification) = selected else {
+            return;
+        };
+        let Some(notifier) = self.notifier.as_ref() else {
+            return;
+        };
+        let resolved = notifier.notifier();
+        if let Err(error) = notifier.notify(&notification.message()) {
+            self.notifier = None;
+            warn!(?resolved, %error, "terminal notifications disabled after write failure");
         }
     }
 
@@ -923,6 +1159,19 @@ impl<'t> EventLoop<'t> {
     }
 
     fn translate(&mut self, raw: Event) -> (Option<Msg>, Option<Event>) {
+        let supports_focus_reporting = self
+            .notifier
+            .as_ref()
+            .is_some_and(terminal::TerminalNotifier::supports_focus_reporting);
+        if let Some(focused) = terminal_focus_event(&raw) {
+            if supports_focus_reporting {
+                self.terminal_focused = focused;
+            }
+            return (None, None);
+        }
+        if supports_focus_reporting && terminal_input_proves_focus(&raw) {
+            self.terminal_focused = true;
+        }
         match raw {
             Event::Key(key) if key.kind == KeyEventKind::Press => (Some(Msg::Key(key)), None),
             Event::Key(_) => (None, None),
@@ -1004,6 +1253,8 @@ impl<'t> EventLoop<'t> {
 
     fn respawn_agent(&mut self, idx: usize, history: Vec<Message>) {
         let rt = &mut self.sessions[idx];
+        rt.notifications.on_run_start();
+        rt.app.clear_exit_request();
         let lua_handle = rt.app.lua_event_handle.clone();
         let permissions = Arc::clone(&rt.app.permissions);
         rt.handles.respawn(
@@ -1021,6 +1272,11 @@ impl<'t> EventLoop<'t> {
         match action {
             Action::SendMessage(input) => {
                 let rt = &mut self.sessions[idx];
+                let cancel_pending_exit = rt.notifications.waiting_for_exit_drain();
+                rt.notifications.on_run_start();
+                if cancel_pending_exit {
+                    rt.app.clear_exit_request();
+                }
                 let mut input = *input;
                 prepend_preamble(&mut input.preamble, rt.app.shell.drain_results());
                 let run_id = rt.app.run_id;
@@ -1033,7 +1289,9 @@ impl<'t> EventLoop<'t> {
                 });
             }
             Action::CancelAgent { run_id } => {
-                let _ = self.sessions[idx]
+                let runtime = &mut self.sessions[idx];
+                runtime.notifications.on_cancel();
+                let _ = runtime
                     .handles
                     .cmd_tx
                     .try_send(AgentCommand::Cancel { run_id });
@@ -1072,6 +1330,8 @@ impl<'t> EventLoop<'t> {
             }
             Action::Compact => {
                 let rt = &mut self.sessions[idx];
+                rt.notifications.on_run_start();
+                rt.app.clear_exit_request();
                 let run_id = rt.app.run_id;
                 rt.handles.queue.push(QueueItem::Compact { run_id });
             }
@@ -1107,6 +1367,7 @@ impl<'t> EventLoop<'t> {
                     let _pause = self.input.pause();
                     terminal::edit_temp_content(&current_text, self.terminal)
                 };
+                self.terminal_focused = false;
                 match result {
                     Ok(edited) => self.sessions[idx].app.input_box.set_input(edited),
                     Err(e) => self.sessions[idx].app.flash(e),
@@ -1123,9 +1384,11 @@ impl<'t> EventLoop<'t> {
             Action::Suspend => {
                 let _pause = self.input.pause();
                 terminal::suspend(self.terminal);
+                self.terminal_focused = false;
             }
             Action::RefreshModels => self.refresh_models(),
             Action::RefreshUsage => self.refresh_usage(),
+            Action::ManualExit => self.sessions[idx].notifications.on_manual_exit(),
         }
     }
 
@@ -1273,10 +1536,242 @@ fn scroll_delta(kind: MouseEventKind, lines: u32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use maki_agent::{DoneReason, SubagentInfo};
+    use maki_providers::TokenUsage;
 
     const OBSERVATION: &str = "failed";
     const SHELL_RESULT: &str = "command finished";
 
+    fn envelope(event: AgentEvent, run_id: u64, subagent: bool) -> Envelope {
+        Envelope {
+            event,
+            subagent: subagent.then(|| SubagentInfo {
+                parent_tool_use_id: "tool".into(),
+                name: "agent".into(),
+                prompt: None,
+                model: None,
+                answer_tx: None,
+            }),
+            run_id,
+        }
+    }
+
+    fn done(run_id: u64, subagent: bool) -> Envelope {
+        envelope(
+            AgentEvent::Done {
+                usage: TokenUsage::default(),
+                num_turns: 1,
+                reason: DoneReason::EndTurn,
+            },
+            run_id,
+            subagent,
+        )
+    }
+
+    #[test]
+    fn only_current_top_level_events_are_eligible() {
+        assert!(is_current_top_level(4, &done(4, false)));
+        assert!(!is_current_top_level(5, &done(4, false)));
+        assert!(!is_current_top_level(4, &done(4, true)));
+    }
+
+    #[test]
+    fn completion_waits_for_queue_drain() {
+        let mut state = RunNotificationState {
+            response_candidate: Some("done".into()),
+            ..RunNotificationState::default()
+        };
+
+        state.on_done(&done(4, false).event, true);
+        assert_eq!(
+            state.pending_completion,
+            Some(PendingCompletion::WaitingForQueueDrain(
+                Notification::TurnComplete {
+                    response: Some("done".into())
+                }
+            ))
+        );
+        assert!(state.waiting_for_exit_drain());
+
+        state.on_drain();
+
+        assert_eq!(
+            state.pending_completion,
+            Some(PendingCompletion::Due(Notification::TurnComplete {
+                response: Some("done".into())
+            }))
+        );
+        assert!(!state.waiting_for_exit_drain());
+
+        state.on_drain();
+
+        assert_eq!(
+            state.pending_completion,
+            Some(PendingCompletion::Due(Notification::TurnComplete {
+                response: Some("done".into())
+            }))
+        );
+    }
+
+    #[test]
+    fn focused_notification_is_consumed() {
+        let notification = Notification::TurnComplete { response: None };
+        let mut state = RunNotificationState {
+            pending_completion: Some(PendingCompletion::Due(notification)),
+            ..RunNotificationState::default()
+        };
+
+        let selected = state.reconcile(None, SessionStatus::Idle, true, true);
+
+        assert_eq!(selected, None);
+        assert_eq!(state.pending_completion, None);
+    }
+
+    #[test]
+    fn completion_notification_is_one_shot() {
+        let notification = Notification::TurnComplete { response: None };
+        let mut state = RunNotificationState {
+            pending_completion: Some(PendingCompletion::Due(notification.clone())),
+            ..RunNotificationState::default()
+        };
+
+        assert_eq!(
+            state.reconcile(None, SessionStatus::Idle, true, false),
+            Some(notification)
+        );
+        assert_eq!(
+            state.reconcile(None, SessionStatus::Idle, true, false),
+            None
+        );
+    }
+
+    #[test]
+    fn prompt_wins_over_completion_and_is_not_repeated_unchanged() {
+        let prompt = Notification::QuestionRequested;
+        let mut state = RunNotificationState {
+            pending_completion: Some(PendingCompletion::Due(Notification::TurnComplete {
+                response: None,
+            })),
+            ..RunNotificationState::default()
+        };
+
+        assert_eq!(
+            state.reconcile(Some(prompt.clone()), SessionStatus::Idle, true, false),
+            Some(prompt.clone())
+        );
+        assert_eq!(state.pending_completion, None);
+        assert_eq!(
+            state.reconcile(Some(prompt), SessionStatus::NeedsInput, true, false),
+            None
+        );
+    }
+
+    #[test]
+    fn notification_selection_prefers_priority_then_session_order() {
+        let completion = Notification::TurnComplete { response: None };
+        let first_prompt = Notification::QuestionRequested;
+        let second_prompt = Notification::AuthenticationRequired;
+
+        let selected = select_notification(None, Some(completion));
+        let selected = select_notification(selected, Some(first_prompt.clone()));
+        let selected = select_notification(selected, Some(second_prompt));
+
+        assert_eq!(selected, Some(first_prompt));
+    }
+
+    #[test]
+    fn nonempty_queue_suppresses_completion() {
+        let mut state = RunNotificationState {
+            pending_completion: Some(PendingCompletion::Due(Notification::TurnComplete {
+                response: None,
+            })),
+            ..RunNotificationState::default()
+        };
+
+        assert_eq!(
+            state.reconcile(None, SessionStatus::Idle, false, false),
+            None
+        );
+        assert_eq!(state.pending_completion, None);
+    }
+
+    #[test]
+    fn waiting_completion_is_not_consumed() {
+        let notification = Notification::TurnComplete { response: None };
+        let mut state = RunNotificationState {
+            pending_completion: Some(PendingCompletion::WaitingForQueueDrain(
+                notification.clone(),
+            )),
+            ..RunNotificationState::default()
+        };
+
+        assert_eq!(
+            state.reconcile(None, SessionStatus::Idle, true, false),
+            None
+        );
+        assert_eq!(
+            state.pending_completion,
+            Some(PendingCompletion::WaitingForQueueDrain(notification))
+        );
+    }
+
+    #[test]
+    fn stale_queue_drain_does_not_match_current_run() {
+        let current = envelope(AgentEvent::QueueDrained, 8, false);
+        let stale = envelope(AgentEvent::QueueDrained, 7, false);
+        let subagent = envelope(AgentEvent::QueueDrained, 8, true);
+
+        assert!(queue_drain_matches(8, &current));
+        assert!(!queue_drain_matches(8, &stale));
+        assert!(!queue_drain_matches(8, &subagent));
+    }
+
+    #[test]
+    fn exit_scan_skips_runtime_waiting_for_queue_drain() {
+        let success = ExitRequest::Success;
+        let none = ExitRequest::None;
+        let mut waiting = RunNotificationState::default();
+        waiting.on_done(&done(4, false).event, true);
+        let ready = RunNotificationState::default();
+
+        assert_eq!(
+            select_exit_runtime([(0, &success, &waiting), (1, &none, &ready)]),
+            None
+        );
+
+        waiting.on_drain();
+
+        assert_eq!(
+            select_exit_runtime([(0, &success, &waiting), (1, &none, &ready)]),
+            Some(0)
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn focus_events_map_to_terminal_focus_state() {
+        assert_eq!(terminal_focus_event(&Event::FocusGained), Some(true));
+        assert_eq!(terminal_focus_event(&Event::FocusLost), Some(false));
+        assert_eq!(terminal_focus_event(&Event::Resize(80, 24)), None);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn interactive_input_proves_terminal_focus() {
+        let release = crossterm::event::KeyEvent {
+            code: crossterm::event::KeyCode::Enter,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+            kind: KeyEventKind::Release,
+            state: crossterm::event::KeyEventState::NONE,
+        };
+
+        assert!(terminal_input_proves_focus(&Event::Key(
+            crate::components::key(crossterm::event::KeyCode::Enter)
+        )));
+        assert!(terminal_input_proves_focus(&Event::Paste("text".into())));
+        assert!(!terminal_input_proves_focus(&Event::Key(release)));
+        assert!(!terminal_input_proves_focus(&Event::Resize(80, 24)));
+    }
     #[test]
     fn shell_results_do_not_replace_existing_preamble() {
         let mut preamble = vec![Message::observation(OBSERVATION.into())];

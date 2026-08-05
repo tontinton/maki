@@ -2608,7 +2608,8 @@ maki.session.live()
 ```
 
 Lists the sessions currently running in this UI. Status is "working",
-"needs_input", or "idle".
+"needs_input", or "idle". A mailbox follow-up stays "working" without an
+intermediate "idle" status.
 
 **Returns:** (`table|nil`, `string|nil`) Array of `{id, title, status, updated_at, focused}`, or nil and an error.
 

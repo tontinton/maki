@@ -171,6 +171,7 @@ impl App {
         self.active_chat = 0;
         self.chat_index.clear();
         self.status = super::Status::Idle;
+        self.clear_exit_request();
         self.queue.clear();
         self.recoverable_queue.clear();
         self.close_all_overlays();

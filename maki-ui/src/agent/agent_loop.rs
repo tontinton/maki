@@ -26,6 +26,18 @@ use super::ModelSlot;
 use super::cancel_map::RunCancelMap;
 use super::shared_queue::{QueueItem, QueueReceiver};
 
+fn publish_queue_drained(
+    queue: &QueueReceiver,
+    agent_tx: &flume::Sender<Envelope>,
+    run_id: Option<u64>,
+) -> bool {
+    let Some(run_id) = run_id else {
+        return false;
+    };
+    let event_tx = EventSender::new(agent_tx.clone(), run_id);
+    queue.publish_if_empty(|| event_tx.try_send(AgentEvent::QueueDrained))
+}
+
 pub(super) struct AgentLoop {
     model_slot: Arc<ArcSwap<ModelSlot>>,
     config: AgentConfig,
@@ -109,12 +121,15 @@ impl AgentLoop {
         }
 
         while let Ok(()) = self.queue.recv_notify().await {
+            let mut last_run_id = None;
             while let Some(entry) = self.queue.pop() {
                 if entry.run_id() < self.min_run_id {
                     continue;
                 }
+                last_run_id = Some(entry.run_id());
                 self.process_entry(entry).await;
             }
+            publish_queue_drained(&self.queue, &self.agent_tx, last_run_id);
         }
     }
 
@@ -377,5 +392,24 @@ fn spawn_oauth_for_needs_auth(handle: &McpHandle) {
             tracing::info!(server = %server_name, "MCP server authenticated via OAuth");
         })
         .detach();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::shared_queue;
+
+    #[test]
+    fn queue_drain_uses_last_run_id() {
+        let (_queue_tx, queue_rx) = shared_queue::queue();
+        let (event_tx, event_rx) = flume::unbounded();
+
+        assert!(publish_queue_drained(&queue_rx, &event_tx, Some(7)));
+        let envelope = event_rx.try_recv().unwrap();
+        assert!(matches!(envelope.event, AgentEvent::QueueDrained));
+        assert_eq!(envelope.run_id, 7);
+        assert!(!publish_queue_drained(&queue_rx, &event_tx, None));
+        assert!(event_rx.is_empty());
     }
 }

@@ -185,6 +185,7 @@ use std::path::PathBuf;
 
 pub enum Action {
     SendMessage(Box<AgentInput>),
+    ManualExit,
     ShellCommand {
         id: String,
         command: String,

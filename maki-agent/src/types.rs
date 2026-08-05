@@ -577,6 +577,7 @@ pub enum AgentEvent {
         text: String,
         image_count: usize,
     },
+    QueueDrained,
     Done {
         usage: TokenUsage,
         num_turns: u32,
