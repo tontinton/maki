@@ -405,7 +405,6 @@ struct FunctionDelta {
 #[derive(Deserialize)]
 struct ChunkDelta {
     content: Option<ContentDelta>,
-    #[serde(alias = "reasoning")]
     reasoning_content: Option<String>,
     tool_calls: Option<Vec<ToolCallDelta>>,
 }
@@ -511,7 +510,7 @@ pub async fn parse_sse(
         let chunk: SseChunk = match serde_json::from_str(data) {
             Ok(c) => c,
             Err(e) => {
-                warn!(error = %e, "failed to parse SSE chunk");
+                warn!(error = %e, raw_sse = %data, "failed to parse SSE chunk");
                 continue;
             }
         };
