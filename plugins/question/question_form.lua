@@ -607,6 +607,7 @@ function QuestionForm.open(questions)
     border = "rounded",
     reserved_bottom = 1,
     focus = true,
+    needs_input = true,
     split = "below",
   })
 

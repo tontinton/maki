@@ -4205,6 +4205,7 @@ and close the window when you are done.
   - `order` (`integer`) paint order among split windows at the same edge. Default 50.
   - `focus` (`boolean`) whether the window takes keyboard focus on open. Default true.
   - `visible` (`boolean`) whether the window is initially visible. Default true.
+  - `needs_input` (`boolean`) whether the window means the session needs user input. Default false.
 
 **Returns:** ([`Win`](#maki-ui-Win)) Window handle.
 
@@ -4325,6 +4326,7 @@ Updates the window layout on the fly. Only the fields you include in
   - `reserved_top` (`integer`) rows reserved at the top of the content area.
   - `split` (`string`) edge docking, "above", "below", "left", "right", "panel", or "".
   - `order` (`integer`) paint order among split windows.
+  - `needs_input` (`boolean`) whether the window means the session needs user input.
 
 **Example:**
 

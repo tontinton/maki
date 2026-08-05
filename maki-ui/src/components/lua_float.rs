@@ -253,6 +253,10 @@ impl FloatManager {
         }
     }
 
+    pub fn needs_input(&self) -> bool {
+        self.windows.iter().any(|win| win.config.needs_input)
+    }
+
     pub fn handle_key(&mut self, key_event: KeyEvent) -> bool {
         let Some(fid) = self.focused_id else {
             return false;
@@ -986,6 +990,28 @@ mod tests {
 
         assert_eq!(mgr.windows[0].config.title, "Updated");
         assert_eq!(mgr.windows[0].config.zindex, 99);
+    }
+
+    #[test]
+    fn needs_input_tracks_window_lifecycle_and_config() {
+        let mut mgr = FloatManager::new();
+        assert!(!mgr.needs_input());
+
+        let (_event_rx, cmd_tx) = open_with_lines(&mut mgr, &["a"]);
+        assert!(!mgr.needs_input());
+
+        cmd_tx
+            .send(WinCommand::SetConfig(FloatConfigPatch {
+                needs_input: Some(true),
+                ..FloatConfigPatch::default()
+            }))
+            .unwrap();
+        mgr.tick();
+        assert!(mgr.needs_input());
+
+        cmd_tx.send(WinCommand::Close).unwrap();
+        mgr.tick();
+        assert!(!mgr.needs_input());
     }
 
     #[test]

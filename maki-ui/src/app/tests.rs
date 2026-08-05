@@ -3600,6 +3600,25 @@ fn open_split_window(app: &mut App, dir: maki_lua::Split) {
 }
 
 #[test]
+fn attention_float_marks_app_as_awaiting_input_until_close() {
+    let mut app = test_app();
+    let buf = Arc::new(maki_agent::SharedBuf::new());
+    let config = maki_lua::FloatConfig {
+        needs_input: true,
+        ..maki_lua::FloatConfig::default()
+    };
+    let (event_tx, _event_rx) = flume::bounded::<maki_lua::WinEvent>(8);
+    let (cmd_tx, cmd_rx) = flume::bounded::<maki_lua::WinCommand>(8);
+
+    app.float_mgr.open(buf, config, true, event_tx, cmd_rx);
+    assert!(app.awaiting_input());
+
+    cmd_tx.send(maki_lua::WinCommand::Close).unwrap();
+    app.float_mgr.tick();
+    assert!(!app.awaiting_input());
+}
+
+#[test]
 fn below_split_reserves_bottom_and_suppresses_input() {
     let mut app = test_app();
     let (msg_before, _b, _s, input_before, splits_before) = app.layout_geometry(TEST_AREA);

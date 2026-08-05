@@ -1474,10 +1474,12 @@ impl App {
         self.overlays().iter().any(|o| o.is_open())
     }
 
-    /// True when the agent is parked on user input: a permission prompt or an
-    /// auth retry. Drives the `needs_input` session status.
+    /// True when the agent is parked on user input. Drives the `needs_input`
+    /// session status.
     pub(crate) fn awaiting_input(&self) -> bool {
-        self.permission_prompt.is_open() || self.pending_input != PendingInput::None
+        self.permission_prompt.is_open()
+            || self.pending_input != PendingInput::None
+            || self.float_mgr.needs_input()
     }
 
     pub fn has_modal_overlay(&self) -> bool {

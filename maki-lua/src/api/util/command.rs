@@ -303,6 +303,7 @@ pub struct FloatConfig {
     pub split: Split,
     pub order: u16,
     pub visible: bool,
+    pub needs_input: bool,
 }
 
 impl Default for FloatConfig {
@@ -324,6 +325,7 @@ impl Default for FloatConfig {
             split: Split::None,
             order: 50,
             visible: true,
+            needs_input: false,
         }
     }
 }
@@ -354,7 +356,8 @@ impl FloatConfig {
             reserved_top,
             split,
             order,
-            visible
+            visible,
+            needs_input
         );
     }
 }
@@ -377,6 +380,7 @@ pub struct FloatConfigPatch {
     pub split: Option<Split>,
     pub order: Option<u16>,
     pub visible: Option<bool>,
+    pub needs_input: Option<bool>,
 }
 
 pub enum WinEvent {

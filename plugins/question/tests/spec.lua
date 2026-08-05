@@ -682,6 +682,7 @@ case("open_requests_bottom_split", function()
   assert(ok, "open must not error: " .. tostring(err))
   assert(captured, "open_win must be called")
   eq(captured.split, "below", "form must request a bottom split")
+  eq(captured.needs_input, true, "form must mark the session as needing input")
 end)
 
 local function find_span_containing(lines, text)

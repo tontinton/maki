@@ -300,6 +300,7 @@ async fn open_editor(
 ///   - order (integer): paint order among split windows at the same edge. Default 50.
 ///   - focus (boolean): whether the window takes keyboard focus on open. Default true.
 ///   - visible (boolean): whether the window is initially visible. Default true.
+///   - needs_input (boolean): whether the window means the session needs user input. Default false.
 /// @return (Win) Window handle.
 /// @example
 /// local buf = maki.ui.buf()
@@ -341,6 +342,7 @@ fn open_win(
     let split = parse_split(&opts);
     let order: u16 = opts.get("order").unwrap_or(50);
     let visible: bool = opts.get("visible").unwrap_or(true);
+    let needs_input: bool = opts.get("needs_input").unwrap_or(false);
 
     let config = FloatConfig {
         width,
@@ -359,6 +361,7 @@ fn open_win(
         split,
         order,
         visible,
+        needs_input,
     };
 
     let (term_cols, term_rows) = crossterm::terminal::size().unwrap_or((80, 24));
