@@ -157,15 +157,36 @@ impl StatusBar {
                     0
                 };
 
-                right_spans.push(Span::styled(
-                    self.cwd_branch.clone(),
-                    theme::current().status_dim,
-                ));
+                // Truncate cwd_branch and model_id when terminal is narrow.
+                // Estimate ctx+labels width at 35, leave 8 for left side.
+                let max_right = area.width.saturating_sub(43);
+                let half = max_right / 2;
+
+                let cwd = if half < 5 {
+                    // Too narrow, just show tail
+                    let s = &self.cwd_branch;
+                    let keep = 5.min(s.len());
+                    s[s.len() - keep..].to_string()
+                } else if (self.cwd_branch.len() as u16) > half {
+                    let keep = (half - 2).max(1) as usize;
+                    format!("..{}", &self.cwd_branch[self.cwd_branch.len() - keep..])
+                } else {
+                    self.cwd_branch.clone()
+                };
+                let model = if half < 5 {
+                    let s = ctx.model_id;
+                    let keep = 5.min(s.len());
+                    s[s.len() - keep..].to_string()
+                } else if (ctx.model_id.len() as u16) > half {
+                    let keep = (half - 2).max(1) as usize;
+                    format!("..{}", &ctx.model_id[ctx.model_id.len() - keep..])
+                } else {
+                    ctx.model_id.to_string()
+                };
+
+                right_spans.push(Span::styled(cwd, theme::current().status_dim));
                 right_spans.push(Span::raw("  "));
-                right_spans.push(Span::styled(
-                    ctx.model_id.to_string(),
-                    theme::current().status_dim,
-                ));
+                right_spans.push(Span::styled(model, theme::current().status_dim));
 
                 if let Some(ref label) = ctx.thinking_label {
                     right_spans.push(Span::styled(
@@ -216,9 +237,11 @@ impl StatusBar {
             ));
         }
 
+        let right_width: u16 = right_spans.iter().map(|s| s.width() as u16).sum();
+        let max_right = area.width.saturating_sub(8);
         let [left_area, right_area] = Layout::horizontal([
             Constraint::Min(0),
-            Constraint::Length(right_spans.iter().map(|s| s.width() as u16).sum()),
+            Constraint::Length(right_width.min(max_right)),
         ])
         .areas(area);
 
