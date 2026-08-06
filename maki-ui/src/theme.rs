@@ -161,6 +161,10 @@ pub static BUNDLED_THEMES: &[ThemeEntry] = &[
         toml: include_str!("themes/catppuccin_mocha.toml"),
     },
     ThemeEntry {
+        name: "dark_daltonized",
+        toml: include_str!("themes/dark_daltonized.toml"),
+    },
+    ThemeEntry {
         name: "dracula",
         toml: include_str!("themes/dracula.toml"),
     },
@@ -187,6 +191,14 @@ pub static BUNDLED_THEMES: &[ThemeEntry] = &[
     ThemeEntry {
         name: "kanagawa",
         toml: include_str!("themes/kanagawa.toml"),
+    },
+    ThemeEntry {
+        name: "kanagawa_ink",
+        toml: include_str!("themes/kanagawa_ink.toml"),
+    },
+    ThemeEntry {
+        name: "kanagawa_plum",
+        toml: include_str!("themes/kanagawa_plum.toml"),
     },
     ThemeEntry {
         name: "material_darker",
@@ -219,6 +231,10 @@ pub static BUNDLED_THEMES: &[ThemeEntry] = &[
     ThemeEntry {
         name: "rose_pine_dawn",
         toml: include_str!("themes/rose_pine_dawn.toml"),
+    },
+    ThemeEntry {
+        name: "rose_pine_midnight",
+        toml: include_str!("themes/rose_pine_midnight.toml"),
     },
     ThemeEntry {
         name: "rose_pine_moon",
