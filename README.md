@@ -71,6 +71,8 @@ One-liner:
 curl -fsSL https://maki.sh/install.sh | sh
 ```
 
+Installs to `~/.local/bin`. Override with `MAKI_INSTALL_DIR`.
+
 ### Windows (PowerShell)
 
 ```powershell

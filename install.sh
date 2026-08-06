@@ -42,7 +42,33 @@ default_install_dir() {
             printf '%s\n' "${HOME}/.local/bin"
         fi
     else
-        printf '%s\n' "/usr/local/bin"
+        printf '%s\n' "${HOME}/.local/bin"
+    fi
+}
+
+path_has_dir() {
+    dir="$1"
+    case ":${PATH}:" in
+        *":${dir}:"*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+warn_path() {
+    dir="$1"
+    if path_has_dir "${dir}"; then
+        return 0
+    fi
+    echo "note: ${dir} is not in PATH; add it to your shell config, e.g.:"
+    echo "  export PATH=\"${dir}:\$PATH\""
+}
+
+warn_shadowed() {
+    dest="$1"
+    resolved="$(command -v "${BINARY}" 2>/dev/null || true)"
+    if [ -n "${resolved}" ] && [ "${resolved}" != "${dest}" ]; then
+        echo "note: '${BINARY}' resolves to ${resolved}, which shadows ${dest};"
+        echo "  remove it or reorder PATH so the new install comes first"
     fi
 }
 
@@ -119,7 +145,7 @@ main() {
     if mkdir -p "${INSTALL_DIR}" 2>/dev/null && [ -w "${INSTALL_DIR}" ]; then
         mv "${tmp}/${bin_name}" "${dest}"
         chmod +x "${dest}"
-    else
+    elif command -v sudo > /dev/null 2>&1; then
         echo "installing to ${INSTALL_DIR} (requires sudo)..."
         sudo sh -c '
             set -e
@@ -127,12 +153,17 @@ main() {
             mv "$2" "$3"
             chmod +x "$3"
         ' maki-install "${INSTALL_DIR}" "${tmp}/${bin_name}" "${dest}"
+    else
+        err "cannot write to ${INSTALL_DIR} (set MAKI_INSTALL_DIR to a writable directory)"
     fi
 
     echo "${BINARY} ${tag} installed to ${dest}"
 
     if is_windows; then
         add_windows_user_path "${INSTALL_DIR}"
+    else
+        warn_path "${INSTALL_DIR}"
+        warn_shadowed "${dest}"
     fi
     echo ""
 }
