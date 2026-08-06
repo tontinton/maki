@@ -402,11 +402,34 @@ struct FunctionDelta {
     arguments: Option<String>,
 }
 
-#[derive(Deserialize)]
 struct ChunkDelta {
     content: Option<ContentDelta>,
     reasoning_content: Option<String>,
     tool_calls: Option<Vec<ToolCallDelta>>,
+}
+
+/// Custom deserializer: handles both `reasoning_content` (standard) and
+/// `reasoning` (vLLM) as the thinking field, preferring the former when both
+/// are present (AxonHub sends both, causing alias conflicts).
+impl<'de> Deserialize<'de> for ChunkDelta {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Raw {
+            content: Option<ContentDelta>,
+            reasoning_content: Option<String>,
+            reasoning: Option<String>,
+            tool_calls: Option<Vec<ToolCallDelta>>,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        Ok(ChunkDelta {
+            content: raw.content,
+            reasoning_content: raw.reasoning_content.or(raw.reasoning),
+            tool_calls: raw.tool_calls,
+        })
+    }
 }
 
 #[derive(Deserialize, Debug)]
