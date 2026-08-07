@@ -8,7 +8,7 @@ use crate::components::rewind_picker::RewindEntry;
 use crate::components::{Action, LoadedSession};
 use maki_providers::{Model, TokenUsage};
 use maki_storage::id::MakiId;
-use maki_storage::sessions::{SessionMeta, StoredSubagent};
+use maki_storage::session_types::{SessionMeta, StoredSubagent};
 
 use crate::AppSession;
 
@@ -37,7 +37,7 @@ pub(crate) fn session_has_content(session: &AppSession) -> bool {
     !session.messages().is_empty()
         || session.meta.input_draft.is_some()
         || !session.meta.queued_messages.is_empty()
-        || session.meta.mode != Some(maki_storage::sessions::StoredMode::Build)
+        || session.meta.mode != Some(maki_storage::session_types::StoredMode::Build)
 }
 
 impl App {

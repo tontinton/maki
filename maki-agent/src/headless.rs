@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_lock::Mutex;
@@ -9,8 +9,9 @@ use maki_providers::TokenUsage;
 use maki_providers::model::Model;
 use maki_providers::provider::{self, Provider};
 use maki_storage::StateDir;
+use maki_storage::StorageError;
 use maki_storage::id::{MakiId, SessionRef};
-use maki_storage::sessions::Session;
+use maki_storage::sessions::{SESSIONS_DIR, Session, SessionError, SessionLog};
 use serde_json::Value;
 use tracing::{error, warn};
 
@@ -31,40 +32,97 @@ type StoredSession = Session<Message, TokenUsage, ToolOutput>;
 struct SessionStore {
     dir: StateDir,
     session: StoredSession,
+    log: Option<SessionLog>,
+    /// The history epoch last mirrored into `session`; `None` until the first
+    /// `record_turn`. A mismatch means the history was rewritten (compaction,
+    /// restore sanitize) and the session needs a full replace, not a delta.
+    synced_epoch: Option<u64>,
 }
 
 impl SessionStore {
-    fn open(session_id: MakiId, cwd: &str, model_spec: &str) -> Option<Self> {
-        let dir = StateDir::resolve()
-            .map_err(|e| warn!(error = %e, "state dir unavailable; session will not be persisted"))
-            .ok()?;
-        Some(Self::open_in(dir, session_id, cwd, model_spec))
+    fn open(session_id: MakiId, cwd: &str, model_spec: &str) -> Result<Option<Self>, SessionError> {
+        let dir = match StateDir::resolve() {
+            Ok(dir) => dir,
+            Err(e) => {
+                warn!(error = %e, "state dir unavailable; session will not be persisted");
+                return Ok(None);
+            }
+        };
+        Self::open_in(dir, session_id, cwd, model_spec).map(Some)
     }
 
-    fn open_in(dir: StateDir, session_id: MakiId, cwd: &str, model_spec: &str) -> Self {
-        match StoredSession::load(session_id, &dir) {
-            Ok(session) => Self { dir, session },
-            Err(_) => {
+    fn open_in(
+        dir: StateDir,
+        session_id: MakiId,
+        cwd: &str,
+        model_spec: &str,
+    ) -> Result<Self, SessionError> {
+        let sessions_dir = dir.ensure_subdir(SESSIONS_DIR)?;
+        let (session, log) = match StoredSession::load(session_id, &dir) {
+            Ok(session) => {
+                let log = SessionLog::open(&sessions_dir, &session)?;
+                (session, Some(log))
+            }
+            Err(SessionError::Storage(StorageError::NotFound(_))) => {
                 let mut session = StoredSession::new(model_spec, cwd);
                 session.id = session_id;
-                let mut store = Self { dir, session };
-                store.save();
-                store
+                let log = SessionLog::rewrite(&sessions_dir, &session)?;
+                (session, Some(log))
             }
-        }
+            Err(e) => return Err(e),
+        };
+        Ok(Self {
+            dir,
+            session,
+            log,
+            synced_epoch: None,
+        })
     }
 
-    fn save(&mut self) {
-        if let Err(e) = self.session.save(&self.dir) {
+    fn record_turn(&mut self, messages: &[Message], history_epoch: u64, model_spec: String) {
+        // The loop hands over the full accumulated history every turn; push
+        // only the delta so appends stay O(delta) instead of rewriting the
+        // whole session. History rewrites (compaction, restore sanitize) mint
+        // a fresh epoch; any mismatch forces a full replace, which mints a
+        // fresh session epoch and voids the append cursors.
+        let saved = self.session.messages().len();
+        if self.synced_epoch == Some(history_epoch) && messages.len() >= saved {
+            for msg in &messages[saved..] {
+                self.session.push_message(msg.clone());
+            }
+        } else if self.synced_epoch.is_some() || !messages.is_empty() {
+            // A resumed session first synced with no history keeps the loaded
+            // messages; any other mismatch is a real divergence.
+            self.session.replace_messages(messages.to_vec());
+        }
+        self.synced_epoch = Some(history_epoch);
+        self.session.set_model(model_spec);
+        self.session.update_title_if_default();
+        self.persist();
+    }
+
+    fn persist(&mut self) {
+        let Some(sessions_dir) = self.dir.ensure_subdir(SESSIONS_DIR).ok() else {
+            return;
+        };
+        if let Err(e) = self.write_through(&sessions_dir) {
             warn!(error = %e, session_id = %self.session.id, "failed to persist session");
         }
     }
 
-    fn record_turn(&mut self, messages: &[Message], model_spec: String) {
-        self.session.replace_messages(messages.to_vec());
-        self.session.set_model(model_spec);
-        self.session.update_title_if_default();
-        self.save();
+    fn write_through(&mut self, sessions_dir: &Path) -> Result<(), SessionError> {
+        match &mut self.log {
+            Some(log) => {
+                if let Err(SessionError::LogDiverged { .. }) = log.append(&self.session) {
+                    // The cursor is void and still holds the lock; drop it so
+                    // the full rewrite below can lock the session.
+                    self.log = None;
+                    self.log = Some(SessionLog::rewrite(sessions_dir, &self.session)?);
+                }
+            }
+            None => self.log = Some(SessionLog::rewrite(sessions_dir, &self.session)?),
+        }
+        Ok(())
     }
 }
 
@@ -358,9 +416,18 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                     }
                 };
 
-            let mut store = SessionStore::open(session_id, &working_dir, &model.spec());
-            let mut history = History::restored(params.initial_history);
             let mut run_id: u64 = 0;
+            let mut store = match SessionStore::open(session_id, &working_dir, &model.spec()) {
+                Ok(store) => store,
+                Err(e) => {
+                    error!(error = %e, session_id = %session_id, "cannot open session storage");
+                    let _ = EventSender::new(raw_tx.clone(), run_id).send(AgentEvent::Error {
+                        message: e.to_string(),
+                    });
+                    return;
+                }
+            };
+            let mut history = History::restored(params.initial_history);
 
             while let Ok(input) = input_rx.recv_async().await {
                 let event_tx = EventSender::new(raw_tx.clone(), run_id);
@@ -459,7 +526,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                 }
 
                 if let Some(store) = &mut store {
-                    store.record_turn(history.as_slice(), model.spec());
+                    store.record_turn(history.as_slice(), history.epoch(), model.spec());
                 }
                 run_id += 1;
             }
@@ -496,7 +563,7 @@ fn extract_tool_names(tools: &Value) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use maki_storage::sessions::generate_title;
+    use maki_storage::session_types::generate_title;
     use tempfile::TempDir;
 
     use super::*;
@@ -504,6 +571,7 @@ mod tests {
     const SESSION_ID: &str = "01965087-4c71-7f00-8000-000000000000";
     const CWD: &str = "/project";
     const MODEL_SPEC: &str = "anthropic/claude-test";
+    const HISTORY_EPOCH: u64 = 7;
 
     fn session_id() -> MakiId {
         SESSION_ID.parse().unwrap()
@@ -516,6 +584,7 @@ mod tests {
             CWD,
             MODEL_SPEC,
         )
+        .unwrap()
     }
 
     fn load(tmp: &TempDir) -> StoredSession {
@@ -538,7 +607,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut store = store_in(&tmp);
         let messages = vec![Message::user("fix the login bug".into())];
-        store.record_turn(&messages, MODEL_SPEC.into());
+        store.record_turn(&messages, HISTORY_EPOCH, MODEL_SPEC.into());
 
         let loaded = load(&tmp);
         assert_eq!(loaded.messages().len(), 1);
@@ -554,6 +623,7 @@ mod tests {
                 Message::user("fix the login bug".into()),
                 Message::observation("build failed".into()),
             ],
+            HISTORY_EPOCH,
             MODEL_SPEC.into(),
         );
 
@@ -566,7 +636,11 @@ mod tests {
     fn reopening_resumes_existing_session() {
         let tmp = TempDir::new().unwrap();
         let mut store = store_in(&tmp);
-        store.record_turn(&[Message::user("first prompt".into())], MODEL_SPEC.into());
+        store.record_turn(
+            &[Message::user("first prompt".into())],
+            HISTORY_EPOCH,
+            MODEL_SPEC.into(),
+        );
         drop(store);
 
         let mut store = store_in(&tmp);
@@ -576,11 +650,100 @@ mod tests {
             Message::user("first prompt".into()),
             Message::user("second prompt".into()),
         ];
-        store.record_turn(&messages, "other/model".into());
+        store.record_turn(&messages, HISTORY_EPOCH, "other/model".into());
 
         let loaded = load(&tmp);
         assert_eq!(loaded.messages().len(), 2);
         assert_eq!(loaded.model, "other/model");
+    }
+
+    #[test]
+    fn record_turn_replaces_when_history_epoch_changes() {
+        let tmp = TempDir::new().unwrap();
+        let mut store = store_in(&tmp);
+        store.record_turn(
+            &[Message::user("first prompt".into())],
+            1,
+            MODEL_SPEC.into(),
+        );
+        store.record_turn(
+            &[Message::user("rewritten prompt".into())],
+            2,
+            MODEL_SPEC.into(),
+        );
+
+        let loaded = load(&tmp);
+        assert_eq!(loaded.messages().len(), 1);
+        assert_eq!(loaded.messages()[0].user_text(), Some("rewritten prompt"));
+    }
+
+    #[test]
+    fn record_turn_appends_when_epoch_unchanged() {
+        let tmp = TempDir::new().unwrap();
+        let mut store = store_in(&tmp);
+        store.record_turn(
+            &[Message::user("first prompt".into())],
+            1,
+            MODEL_SPEC.into(),
+        );
+        store.record_turn(
+            &[
+                Message::user("first prompt".into()),
+                Message::user("second prompt".into()),
+            ],
+            1,
+            MODEL_SPEC.into(),
+        );
+
+        let loaded = load(&tmp);
+        assert_eq!(loaded.messages().len(), 2);
+        assert_eq!(loaded.messages()[1].user_text(), Some("second prompt"));
+    }
+
+    #[test]
+    fn open_in_errors_when_session_is_locked() {
+        let tmp = TempDir::new().unwrap();
+        let store = store_in(&tmp);
+
+        let err = match SessionStore::open_in(
+            StateDir::from_path(tmp.path().to_path_buf()),
+            session_id(),
+            CWD,
+            MODEL_SPEC,
+        ) {
+            Ok(_) => panic!("expected Locked error"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, SessionError::Locked { .. }));
+        drop(store);
+    }
+
+    #[test]
+    fn open_in_does_not_mint_on_corrupt_meta() {
+        let tmp = TempDir::new().unwrap();
+        store_in(&tmp).record_turn(
+            &[Message::user("hi".into())],
+            HISTORY_EPOCH,
+            MODEL_SPEC.into(),
+        );
+
+        let folder = tmp.path().join(SESSIONS_DIR).join(session_id().to_string());
+        std::fs::write(folder.join("meta.json"), b"not json").unwrap();
+
+        let err = match SessionStore::open_in(
+            StateDir::from_path(tmp.path().to_path_buf()),
+            session_id(),
+            CWD,
+            MODEL_SPEC,
+        ) {
+            Ok(_) => panic!("expected storage error"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, SessionError::Storage(_)));
+        assert!(
+            folder.join("meta.json").exists(),
+            "corrupt session must not be replaced"
+        );
     }
 
     #[test]

@@ -30,7 +30,8 @@ use maki_providers::{Message, Model};
 use maki_storage::StateDir;
 use maki_storage::StorageError;
 use maki_storage::id::{MakiId, MakiIdParseError, SessionRef};
-use maki_storage::sessions::{SessionError, normalize_title};
+use maki_storage::session_types::normalize_title;
+use maki_storage::sessions::SessionError;
 use serde_json::json;
 use tracing::{info, warn};
 

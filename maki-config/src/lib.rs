@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use maki_config_macro::ConfigSection;
 use maki_storage::paths;
-use maki_storage::sessions::{StoredThinking, ThinkingParseError};
+use maki_storage::session_types::{StoredThinking, ThinkingParseError};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use thiserror::Error;
@@ -1820,7 +1820,7 @@ fn insert_permission_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use maki_storage::sessions::Effort;
+    use maki_storage::session_types::Effort;
     use std::fs;
     use tempfile::TempDir;
     use test_case::test_case;

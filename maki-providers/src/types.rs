@@ -9,8 +9,8 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
-pub use maki_storage::sessions::Effort;
-use maki_storage::sessions::{MIN_THINKING_BUDGET, StoredThinking, TitleSource};
+pub use maki_storage::session_types::Effort;
+use maki_storage::session_types::{MIN_THINKING_BUDGET, StoredThinking, TitleSource};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use strum::{Display, IntoStaticStr};
@@ -410,7 +410,7 @@ pub struct EffortDialect<'a> {
 
 pub mod dialect {
     use super::EffortDialect;
-    use maki_storage::sessions::Effort::{High, Low, Max, Medium, Minimal, XHigh};
+    use maki_storage::session_types::Effort::{High, Low, Max, Medium, Minimal, XHigh};
 
     /// Wire string that disables reasoning, for APIs that need an explicit
     /// opt-out.

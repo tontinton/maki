@@ -26,7 +26,7 @@ use maki_providers::model::ModelTier;
 use maki_providers::provider;
 use maki_providers::{ContentBlock, Model, ModelError, Role, ThinkingConfig, TokenUsage, add_cost};
 use maki_storage::id::MakiId;
-use maki_storage::sessions::StoredThinking;
+use maki_storage::session_types::StoredThinking;
 use mlua::{Function, IntoLuaMulti, Lua, Result as LuaResult, Table, Value as LuaValue};
 use serde_json::Value as JsonValue;
 use tracing::info;

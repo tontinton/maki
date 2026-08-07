@@ -20,8 +20,12 @@ use crate::AppSession;
 
 const SAVE_FAILED_PREFIX: &str = "Session save failed";
 const SAVE_RECOVERED: &str = "Session save recovered";
+/// Failed writes are retried in place this many times to ride out transient
+/// lock contention (e.g. a load in another thread holding the flock); a still
+/// failing entry is re-queued for the next wake or the shutdown flush.
+const MAX_FLUSH_ATTEMPTS: usize = 3;
 
-type Pending = Arc<Mutex<HashMap<MakiId, Entry>>>;
+type Pending = Arc<Mutex<(HashMap<MakiId, Entry>, Option<MakiId>)>>;
 
 type DeleteCallback = Box<dyn FnOnce(Result<(), SessionError>) + Send>;
 
@@ -83,9 +87,14 @@ impl StorageWriter {
     }
 
     fn enqueue(&self, id: MakiId, entry: Entry) {
-        lock(&self.pending).insert(id, entry);
+        let mut pending = lock(&self.pending);
+        if matches!(&entry, Entry::Save(_)) {
+            pending.1 = Some(id);
+        }
+        pending.0.insert(id, entry);
+        drop(pending);
         if self.wake.send(()).is_err()
-            && let Some(Entry::Delete(done)) = lock(&self.pending).remove(&id)
+            && let Some(Entry::Delete(done)) = lock(&self.pending).0.remove(&id)
         {
             done(Err(writer_gone()));
         }
@@ -99,7 +108,7 @@ impl StorageWriter {
     }
 }
 
-fn lock(pending: &Pending) -> std::sync::MutexGuard<'_, HashMap<MakiId, Entry>> {
+fn lock(pending: &Pending) -> std::sync::MutexGuard<'_, (HashMap<MakiId, Entry>, Option<MakiId>)> {
     pending.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -128,29 +137,53 @@ impl Writer {
     fn flush(&mut self, pending: &Pending) {
         // Bound first: a `for` head temporary lives for the whole loop, so
         // iterating the guard directly would deadlock the re-insert below.
-        let batch = mem::take(&mut *lock(pending));
-        for (id, entry) in batch {
-            match entry {
-                Entry::Save(session) => {
-                    let result = self.write(&session);
-                    if result.is_err() {
-                        // `checkpoint` never resends an unchanged revision, so
-                        // a dropped snapshot would miss disk for good.
-                        // `or_insert` lets a newer op win; the shutdown flush
-                        // is the last retry.
-                        lock(pending).entry(id).or_insert(Entry::Save(session));
+        // The second slot is the most recently enqueued save id, so the
+        // cursor dropped at the end is the active session's, not an arbitrary
+        // one from the batch's map order.
+        let (mut batch, last_save) = mem::take(&mut *lock(pending));
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            let mut still_failing = HashMap::new();
+            for (id, entry) in batch {
+                match entry {
+                    Entry::Save(session) => {
+                        let result = self.write(&session);
+                        if result.is_err() {
+                            still_failing.insert(id, Entry::Save(session));
+                        }
+                        self.report(id, result);
                     }
-                    self.report(id, result);
-                }
-                Entry::Delete(done) => {
-                    self.forget(id);
-                    done(match AppSession::delete(id, &self.dir) {
-                        Err(SessionError::Storage(StorageError::NotFound(_))) => Ok(()),
-                        result => result,
-                    });
+                    Entry::Delete(done) => {
+                        self.forget(id);
+                        done(match AppSession::delete(id, &self.dir) {
+                            Err(SessionError::Storage(StorageError::NotFound(_))) => Ok(()),
+                            result => result,
+                        });
+                    }
                 }
             }
+            batch = still_failing;
+            if batch.is_empty() || attempts >= MAX_FLUSH_ATTEMPTS {
+                break;
+            }
         }
+        if !batch.is_empty() {
+            // `checkpoint` never resends an unchanged revision, so a dropped
+            // snapshot would miss disk for good. `or_insert` lets a newer op
+            // win; the shutdown flush is the last retry.
+            let mut pending = lock(pending);
+            for (id, entry) in batch {
+                pending.0.entry(id).or_insert(entry);
+            }
+        } // Only the active session stays locked. The UI only saves the
+        // active session, so this releases the flocks of switched-away
+        // sessions and costs one full rewrite when one is revisited; keeping
+        // them would lock every touched session out of other processes for
+        // the whole run. A batch without saves (deletes only) leaves the
+        // cursors alone.
+        self.logs
+            .retain(|id, _| last_save.is_none_or(|last| *id == last));
     }
 
     fn write(&mut self, session: &AppSession) -> Result<(), SessionError> {
@@ -195,6 +228,7 @@ impl Writer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
     use tempfile::TempDir;
 
     const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -273,6 +307,55 @@ mod tests {
 
         assert!(done_rx.recv().unwrap().is_ok());
         assert!(AppSession::load(id, &dir).is_err());
+    }
+
+    /// Cursors (and their flocks) must not accumulate for every touched
+    /// session: once the writer moves on, only the last-written session stays
+    /// locked, so a second process can use the rest.
+    #[test]
+    fn switching_sessions_releases_previous_lock() {
+        let (_tmp, dir) = state_dir();
+        let (writer, _warn_rx) = writer(&dir);
+        let a = AppSession::new(MODEL, CWD);
+        let b = AppSession::new(MODEL, CWD);
+        let (a_id, b_id) = (a.id, b.id);
+        writer.send(Arc::new(a));
+        writer.send(Arc::new(b));
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let loaded_a = loop {
+            if let Ok(session) = AppSession::load(a_id, &dir) {
+                break session;
+            }
+            assert!(Instant::now() < deadline, "session a was never written");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        let loaded_b = loop {
+            if let Ok(session) = AppSession::load(b_id, &dir) {
+                break session;
+            }
+            assert!(Instant::now() < deadline, "session b was never written");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+
+        // The flush that wrote `b` drops `a`'s cursor (and flock) when it
+        // finishes; poll until the bookkeeping ran.
+        let sessions_dir = dir.ensure_subdir(SESSIONS_DIR).unwrap();
+        let mut released = false;
+        while Instant::now() < deadline {
+            let a_free = SessionLog::open(&sessions_dir, &loaded_a).is_ok();
+            let b_free = SessionLog::open(&sessions_dir, &loaded_b).is_ok();
+            if a_free && !b_free {
+                released = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            released,
+            "writer never released the previous session's flock"
+        );
+        writer.shutdown(DRAIN_TIMEOUT);
     }
 
     /// A fresh writer over an existing file has no cursor, so it re-opens the

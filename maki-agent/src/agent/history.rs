@@ -49,6 +49,10 @@ impl History {
         self.snapshot.messages.len()
     }
 
+    pub fn epoch(&self) -> u64 {
+        self.snapshot.epoch
+    }
+
     pub fn is_empty(&self) -> bool {
         self.snapshot.messages.is_empty()
     }

@@ -6,9 +6,12 @@ pub mod auth;
 pub mod id;
 pub mod input_history;
 pub mod log;
+pub mod migration;
 pub mod model;
 pub mod paths;
 pub mod plans;
+mod renders;
+pub mod session_types;
 pub mod sessions;
 pub mod theme;
 pub mod version;
@@ -64,6 +67,8 @@ pub enum StorageError {
     Json(#[from] serde_json::Error),
     #[error("not found: {0}")]
     NotFound(String),
+    #[error("file {path} is {len} bytes, exceeds the {cap} byte cap")]
+    FileTooLarge { path: String, len: u64, cap: u64 },
     #[error("slug collision after max attempts")]
     SlugCollision,
 }
