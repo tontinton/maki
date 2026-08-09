@@ -20,6 +20,7 @@ const SCHEMA_COMPILE_ERROR: &str = "invalid output_schema";
 const SCHEMA_ROOT_ERROR: &str = "output_schema must have type object";
 const STRUCTURED_MISSING_ERROR: &str = "subagent finished without calling structured_output";
 const STRUCTURED_INVALID_ERROR: &str = "subagent result does not match output_schema";
+const SUMMARY_MISSING_ERROR: &str = "subagent finished without providing a summary";
 const UNKNOWN_SUBAGENT_ERR: &str = "unknown subagent type: bogus";
 const SUB_AGENT_ERROR_PREFIX: &str = "sub-agent error: ";
 
@@ -27,6 +28,9 @@ const TASK_TOOL: &str = "task";
 const PROBE_TOOL: &str = "probe";
 const TASK_PROMPT: &str = "do the thing";
 const PLAIN_TEXT: &str = "plain text result";
+const RECOVERED_TEXT: &str = "summary after nudge";
+/// Mirrors the task plugin's `NUDGE_SUMMARY` wording.
+const SUMMARY_NUDGE_FRAGMENT: &str = "concise summary";
 const PROMPT_ERR_MSG: &str = "model exploded";
 const RAISE_MSG: &str = "stub prompt kaboom";
 /// Mirrors the task plugin's `max_concurrent` default.
@@ -39,6 +43,8 @@ const SCENARIO_NEVER_STRUCTURED: &str = "never_structured";
 const SCENARIO_INVALID_ONLY: &str = "invalid_only";
 const SCENARIO_PROMPT_ERROR: &str = "prompt_error";
 const SCENARIO_RAISE: &str = "raise";
+const SCENARIO_NO_SUMMARY: &str = "no_summary";
+const SCENARIO_NO_SUMMARY_THEN_RECOVER: &str = "no_summary_then_recover";
 
 /// Stubs keyed by `opts.name` (the task's `description`). `maki.json` and
 /// `maki.async` stay real so schema validation and semaphore behavior are tested.
@@ -111,6 +117,17 @@ behaviors.prompt_error = function(sess, msg)
   return nil, "@PROMPT_ERR@"
 end
 
+behaviors.no_summary = function(sess, msg)
+  return { text = "" }
+end
+
+behaviors.no_summary_then_recover = function(sess, msg)
+  if #recorder.prompts == 1 then
+    return { text = "" }
+  end
+  return { text = "@RECOVERED_TEXT@" }
+end
+
 behaviors.raise = function(sess, msg)
   error("@RAISE_MSG@")
 end
@@ -170,6 +187,7 @@ fn load_task_host_with_opts(
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let prelude = STUB_PRELUDE
         .replace("@PLAIN_TEXT@", PLAIN_TEXT)
+        .replace("@RECOVERED_TEXT@", RECOVERED_TEXT)
         .replace("@PROMPT_ERR@", PROMPT_ERR_MSG)
         .replace("@RAISE_MSG@", RAISE_MSG);
     host.load_source_with_opts(
@@ -404,6 +422,35 @@ fn plain_path_returns_text_without_local_tools() {
     assert_eq!(snap["has_local_tools"], json!(false));
     assert_eq!(snap["prompt_count"], json!(1));
     assert_eq!(snap["prompts"][0], json!(TASK_PROMPT));
+    assert_eq!(snap["closed"], json!(1));
+}
+
+#[test]
+fn no_summary_nudges_then_recovers() {
+    let (reg, _host) = load_task_host();
+    let out = exec_tool(
+        &reg,
+        TASK_TOOL,
+        task_input(SCENARIO_NO_SUMMARY_THEN_RECOVER, None),
+    )
+    .unwrap();
+    assert_eq!(out, RECOVERED_TEXT);
+
+    let snap = probe(&reg);
+    assert_eq!(snap["prompt_count"], json!(2));
+    let nudge = snap["prompts"][1].as_str().expect("nudge prompt missing");
+    assert!(nudge.contains(SUMMARY_NUDGE_FRAGMENT), "got: {nudge}");
+    assert_eq!(snap["closed"], json!(1));
+}
+
+#[test]
+fn no_summary_errors_after_nudges() {
+    let (reg, _host) = load_task_host();
+    let err = exec_tool(&reg, TASK_TOOL, task_input(SCENARIO_NO_SUMMARY, None)).unwrap_err();
+    assert_eq!(err, SUMMARY_MISSING_ERROR);
+
+    let snap = probe(&reg);
+    assert_eq!(snap["prompt_count"], json!(1 + MAX_STRUCTURED_RETRIES));
     assert_eq!(snap["closed"], json!(1));
 }
 

@@ -731,7 +731,9 @@ impl Drop for LuaSession {
 /// kept across calls, so you can have a multi-turn conversation.
 ///
 /// The returned table has fields: `text` (string), `duration_ms` (integer),
-/// `input_tokens` (integer), `output_tokens` (integer).
+/// `input_tokens` (integer), `output_tokens` (integer). `text` is an empty
+/// string when the subagent produced no text block (e.g. it only called
+/// tools).
 ///
 /// @param message string User message to send.
 /// @return (table?, string?) Result table on success, or `(nil, err)` on failure.
@@ -763,6 +765,7 @@ async fn prompt(
         });
     }
 
+    let history_len = s.history.len();
     let mut agent = Agent::new(
         s.params.clone(),
         AgentRunParams {
@@ -803,19 +806,19 @@ async fn prompt(
         ),
     }
 
-    let text = s
-        .history
-        .as_slice()
+    // Only this call's messages count: older turns may hold stale preamble
+    // text, and the agent loop's empty-response retry leaves a synthetic
+    // "(empty)" assistant marker that must not pass for a real response.
+    let text = s.history.as_slice()[history_len..]
         .iter()
-        .rev()
-        .filter(|m| matches!(m.role, Role::Assistant))
-        .flat_map(|m| m.content.iter())
-        .find_map(|b| match b {
-            ContentBlock::Text { text } => Some(text.as_str()),
-            _ => None,
-        })
-        .unwrap_or("(no response)")
-        .to_owned();
+        .rfind(|m| matches!(m.role, Role::Assistant))
+        .and_then(|m| {
+            m.content.iter().find_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+        });
+    let text = text.map_or_else(String::new, str::to_owned);
 
     let tbl = lua.create_table()?;
     tbl.set("text", text)?;

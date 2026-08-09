@@ -859,7 +859,9 @@ loop runs to completion, calling tools as needed. Conversation history is
 kept across calls, so you can have a multi-turn conversation.
 
 The returned table has fields: `text` (string), `duration_ms` (integer),
-`input_tokens` (integer), `output_tokens` (integer).
+`input_tokens` (integer), `output_tokens` (integer). `text` is an empty
+string when the subagent produced no text block (e.g. it only called
+tools).
 
 **Parameters:**
 

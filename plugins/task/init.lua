@@ -12,14 +12,17 @@ local STRUCTURED_OUTPUT_NAME = "structured_output"
 local STRUCTURED_OUTPUT_DESCRIPTION = "Report your final result. Call it exactly once when your task is complete."
 local STRUCTURED_OUTPUT_ACK = "Output recorded."
 local STRUCTURED_OUTPUT_PROMPT_SUFFIX = "\n\nWhen finished, call the structured_output tool with your final result."
-local MAX_STRUCTURED_RETRIES = 2
+local MAX_NUDGES = 2
 local MAX_SCHEMA_ERRORS = 3
 local SCHEMA_COMPILE_ERROR = "invalid output_schema"
 local SCHEMA_ROOT_ERROR = "output_schema must have type object"
 local STRUCTURED_MISSING_ERROR = "subagent finished without calling structured_output"
 local STRUCTURED_INVALID_ERROR = "subagent result does not match output_schema"
+local SUMMARY_MISSING_ERROR = "subagent finished without providing a summary"
 local NUDGE_MISSING =
   "You did not call the structured_output tool. Call it now with your final result matching its input schema."
+local NUDGE_SUMMARY =
+  "You finished your work but did not provide a summary. Reply with a concise summary of what you did and found."
 local INVALID_INPUT_PREFIX =
   "Input does not match the required schema. Fix the errors and call structured_output again:\n"
 local BODY_INDENT_COLS = 4
@@ -190,9 +193,16 @@ local function handler(input, ctx)
 
     local result, err = sess:prompt(message)
     local retries = 0
-    while not err and validator and not captured and retries < MAX_STRUCTURED_RETRIES do
-      retries = retries + 1
-      result, err = sess:prompt(NUDGE_MISSING)
+    while not err and retries < MAX_NUDGES do
+      if validator and not captured then
+        retries = retries + 1
+        result, err = sess:prompt(NUDGE_MISSING)
+      elseif not validator and result.text == "" then
+        retries = retries + 1
+        result, err = sess:prompt(NUDGE_SUMMARY)
+      else
+        break
+      end
     end
 
     sess:close()
@@ -203,6 +213,9 @@ local function handler(input, ctx)
     if validator and not captured then
       local msg = last_errors and (STRUCTURED_INVALID_ERROR .. ":\n" .. last_errors) or STRUCTURED_MISSING_ERROR
       return { llm_output = msg, is_error = true }
+    end
+    if not validator and result.text == "" then
+      return { llm_output = SUMMARY_MISSING_ERROR, is_error = true }
     end
     return { llm_output = captured and maki.json.encode(captured) or result.text, format = "markdown" }
   end)
