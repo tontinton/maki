@@ -20,6 +20,11 @@ const LUA_CONTEXT_BINDS: &[(&str, &str, &str)] = &[
         "`Esc`",
         "Close without changing anything",
     ),
+    (
+        "Task Picker",
+        "`Ctrl+D`",
+        "Delete finished task (press twice)",
+    ),
 ];
 
 // Built-in plugins own these globally, so they never reach `KEYBINDS`.
