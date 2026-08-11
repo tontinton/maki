@@ -1953,18 +1953,22 @@ fn unloading_plugin_kills_its_jobs() {
     );
     host.load_source("plugin_job", &src).unwrap();
 
+    // The shell creates the redirect target before printf writes to it,
+    // so poll until the file holds a parseable pid, not until it exists.
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while !pid_path.exists() {
+    let pid = loop {
+        if let Ok(pid) = std::fs::read_to_string(&pid_path)
+            .unwrap_or_default()
+            .parse::<i32>()
+        {
+            break pid;
+        }
         assert!(
             std::time::Instant::now() < deadline,
             "plugin job did not publish its process id"
         );
         std::thread::sleep(Duration::from_millis(10));
-    }
-    let pid = std::fs::read_to_string(&pid_path)
-        .unwrap()
-        .parse::<i32>()
-        .unwrap();
+    };
     let pid = Pid::from_raw(pid).unwrap();
     assert!(test_kill_process_group(pid).is_ok());
 
