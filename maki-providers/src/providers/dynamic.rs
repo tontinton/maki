@@ -15,7 +15,7 @@ use strum::IntoEnumIterator;
 use tracing::{debug, warn};
 
 use crate::manifest::ManifestRegistry;
-use crate::model::{Model, ModelPricing, ModelTier};
+use crate::model::{Model, ModelPricing, ModelTier, ThinkingSupport};
 use crate::provider::{BoxFuture, Provider, ProviderKind};
 use crate::{AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse};
 
@@ -67,6 +67,8 @@ struct ScriptModel {
     #[serde(default)]
     supports_thinking: Option<bool>,
     #[serde(default)]
+    requires_thinking: bool,
+    #[serde(default)]
     supports_vision: Option<bool>,
     #[serde(default = "default_max_output_tokens")]
     max_output_tokens: u32,
@@ -84,7 +86,10 @@ impl ScriptModel {
             tier,
             family: base.family(),
             supports_tool_examples_override: self.supports_tool_examples,
-            supports_thinking_override: self.supports_thinking,
+            thinking_override: ThinkingSupport::from_flags(
+                self.supports_thinking,
+                self.requires_thinking,
+            ),
             supports_vision_override: self.supports_vision,
             pricing: self.pricing.clone().unwrap_or_default(),
             max_output_tokens: Some(self.max_output_tokens),

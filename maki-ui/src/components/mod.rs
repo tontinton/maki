@@ -389,7 +389,7 @@ pub(crate) fn test_model() -> maki_providers::Model {
         tier: maki_providers::ModelTier::Medium,
         family: maki_providers::ModelFamily::Claude,
         supports_tool_examples_override: None,
-        supports_thinking_override: None,
+        thinking_override: None,
         supports_vision_override: Some(true),
         pricing: test_pricing(),
         max_output_tokens: Some(8192),

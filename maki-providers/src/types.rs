@@ -653,15 +653,18 @@ pub struct RequestOptions {
 }
 
 impl RequestOptions {
-    /// Strips options the model does not support. Called once before every
-    /// request so UI state, restored sessions, and subagent flags all go
-    /// through the same gate.
+    /// Reconciles options with the model's capabilities. Called once before
+    /// every request so UI state, restored sessions, and subagent flags all go
+    /// through the same gate. Despite the name, thinking clamps both ways:
+    /// down to `Off` when unsupported, up to minimal effort when required.
     pub fn clamped(self, model: &crate::model::Model) -> Self {
         Self {
-            thinking: if model.supports_thinking() {
-                self.thinking
-            } else {
+            thinking: if !model.supports_thinking() {
                 ThinkingConfig::Off
+            } else if model.requires_thinking() && !self.thinking.is_enabled() {
+                ThinkingConfig::Effort(Effort::Minimal)
+            } else {
+                self.thinking
             },
             fast: self.fast && model.supports_fast(),
         }
@@ -707,6 +710,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::model::ThinkingSupport as Support;
     use test_case::test_case;
 
     #[test_case("end_turn", StopReason::EndTurn   ; "end_turn")]
@@ -976,7 +980,7 @@ mod tests {
             tier: crate::model::ModelTier::Medium,
             family: provider.family(),
             supports_tool_examples_override: None,
-            supports_thinking_override: None,
+            thinking_override: None,
             supports_vision_override: Some(provider.family().supports_vision()),
             pricing: crate::model::ModelPricing::default(),
             max_output_tokens: Some(8192),
@@ -984,15 +988,18 @@ mod tests {
         }
     }
 
-    #[test_case(None,        ThinkingConfig::Adaptive, ThinkingConfig::Adaptive ; "provider_default_keeps")]
-    #[test_case(Some(false), ThinkingConfig::Adaptive, ThinkingConfig::Off      ; "override_false_clamps")]
+    #[test_case(None,                    ThinkingConfig::Adaptive, ThinkingConfig::Adaptive        ; "provider_default_keeps")]
+    #[test_case(Some(Support::No),       ThinkingConfig::Adaptive, ThinkingConfig::Off             ; "unsupported_clamps_off")]
+    #[test_case(Some(Support::Yes),      ThinkingConfig::Off,      ThinkingConfig::Off             ; "supported_keeps_off")]
+    #[test_case(Some(Support::Required), ThinkingConfig::Off,      ThinkingConfig::Effort(Minimal) ; "required_raises_off_to_minimal")]
+    #[test_case(Some(Support::Required), ThinkingConfig::Adaptive, ThinkingConfig::Adaptive        ; "required_keeps_enabled")]
     fn request_options_clamped_thinking(
-        supports: Option<bool>,
+        thinking_override: Option<Support>,
         thinking: ThinkingConfig,
         expected: ThinkingConfig,
     ) {
         let mut model = clamp_test_model(crate::provider::ProviderKind::Anthropic);
-        model.supports_thinking_override = supports;
+        model.thinking_override = thinking_override;
         let opts = RequestOptions {
             thinking,
             fast: false,

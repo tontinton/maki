@@ -321,7 +321,7 @@ mod tests {
             tier: crate::model::ModelTier::Medium,
             family: crate::model::ModelFamily::Generic,
             supports_tool_examples_override: None,
-            supports_thinking_override: None,
+            thinking_override: None,
             supports_vision_override: None,
             pricing: ModelPricing::default(),
             max_output_tokens: Some(8192),

@@ -7,7 +7,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use tracing::warn;
 
-use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier};
+use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier, ThinkingSupport};
 use crate::provider::{BoxFuture, Provider};
 use crate::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use crate::{
@@ -355,7 +355,7 @@ impl Provider for Zai {
 
 fn adjust_model(model: &mut Model) {
     if model.id.starts_with("glm-5.2") {
-        model.supports_thinking_override = Some(true);
+        model.thinking_override = Some(ThinkingSupport::Yes);
     }
 }
 

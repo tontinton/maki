@@ -201,6 +201,28 @@ impl ModelFamily {
 
 const FAST_PROVIDER: &str = "anthropic";
 
+/// `Required` marks APIs that reject requests with thinking disabled;
+/// [`crate::RequestOptions::clamped`] raises `Off` to minimal effort for them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThinkingSupport {
+    No,
+    Yes,
+    Required,
+}
+
+impl ThinkingSupport {
+    /// `requires` wins: an API that rejects thinking-off requests
+    /// necessarily supports thinking.
+    pub fn from_flags(supports: Option<bool>, requires: bool) -> Option<Self> {
+        match (requires, supports) {
+            (true, _) => Some(Self::Required),
+            (false, Some(true)) => Some(Self::Yes),
+            (false, Some(false)) => Some(Self::No),
+            (false, None) => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Model {
     pub id: String,
@@ -208,7 +230,8 @@ pub struct Model {
     pub tier: ModelTier,
     pub family: ModelFamily,
     pub supports_tool_examples_override: Option<bool>,
-    pub supports_thinking_override: Option<bool>,
+    /// `None` falls back to discovery, then the provider manifest.
+    pub thinking_override: Option<ThinkingSupport>,
     pub supports_vision_override: Option<bool>,
     pub pricing: ModelPricing,
     /// `None` when unknown, see [`ProviderKind::fallback_max_output`].
@@ -248,7 +271,7 @@ impl Model {
             tier,
             family,
             supports_tool_examples_override: None,
-            supports_thinking_override: None,
+            thinking_override: None,
             supports_vision_override: None,
             pricing,
             max_output_tokens,
@@ -272,7 +295,7 @@ impl Model {
             tier: ModelTier::Medium,
             family: ModelFamily::Generic,
             supports_tool_examples_override: None,
-            supports_thinking_override: Some(meta.supports_thinking),
+            thinking_override: ThinkingSupport::from_flags(Some(meta.supports_thinking), false),
             supports_vision_override: Some(meta.supports_vision),
             pricing: ModelPricing {
                 input: meta.input_price,
@@ -287,8 +310,8 @@ impl Model {
     }
 
     pub fn supports_thinking(&self) -> bool {
-        if let Some(thinking) = self.supports_thinking_override {
-            return thinking;
+        if let Some(thinking) = self.thinking_override {
+            return thinking != ThinkingSupport::No;
         }
         // Discovery keys `known_models` by the builtin slug; resolve dynamic
         // and custom slugs through their base manifest before looking up.
@@ -301,6 +324,10 @@ impl Model {
             .discovered(manifest.slug, &self.id)
             .and_then(|d| d.supports_thinking)
             .unwrap_or(manifest.supports_thinking)
+    }
+
+    pub fn requires_thinking(&self) -> bool {
+        self.thinking_override == Some(ThinkingSupport::Required)
     }
 
     pub fn supports_vision(&self) -> bool {
