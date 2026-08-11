@@ -92,22 +92,11 @@ impl Provider for TensorX {
             let system = super::with_prefix(&self.system_prefix, system, &mut buf);
             let mut body = self.compat.build_body(model, messages, system, tools);
 
-            let (has_thinking, has_reasoning_effort) = {
-                let guard = crate::model_registry::model_registry().read().unwrap();
-                // Discovery keys by the builtin slug; a dynamic wrap's model
-                // carries its own slug, so don't key by model.provider.
-                let info = guard
-                    .discovered("tensorx", &model.id)
-                    .and_then(|d| d.provider_info.clone())
-                    .map(|arc| {
-                        Arc::downcast::<TensorXModelInfo>(arc).expect("wrong provider info type")
+            let (has_thinking, has_reasoning_effort) =
+                crate::model_registry::provider_info::<TensorXModelInfo>("tensorx", &model.id)
+                    .map_or((false, false), |info| {
+                        (info.has_thinking, info.has_reasoning_effort)
                     });
-                if let Some(info) = info {
-                    (info.has_thinking, info.has_reasoning_effort)
-                } else {
-                    (false, false)
-                }
-            };
 
             if has_thinking {
                 body["thinking"] = json!(opts.thinking.is_enabled());

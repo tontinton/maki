@@ -110,11 +110,8 @@ fn model_from_def(def: &ProviderDef, kind: ProviderKind, slug: &str, model_id: &
     let tier = declared
         .map(|m| ModelTier::from(m.tier))
         .unwrap_or(ModelTier::Medium);
-    // TODO: callers holding the registry read guard (e.g. Model::from_spec in
-    // lua agent / run paths) make this a recursive read lock; drop the guard in
-    // the callers as a follow-up, same issue as Model::from_base.
-    let reg = crate::model_registry::model_registry().read().unwrap();
-    let discovered = reg.discovered(slug, model_id);
+    let discovered = crate::model_registry::discovered(slug, model_id);
+    let discovered = discovered.as_ref();
     let max_output_tokens = declared
         .and_then(|m| m.max_output_tokens)
         .or_else(|| discovered.and_then(|d| d.max_output_tokens))
@@ -123,7 +120,6 @@ fn model_from_def(def: &ProviderDef, kind: ProviderKind, slug: &str, model_id: &
         .and_then(|m| m.context_window)
         .or_else(|| discovered.and_then(|d| d.context_window))
         .unwrap_or_else(|| kind.fallback_context_window());
-    drop(reg);
     let supports_tool_examples_override = declared.and_then(|m| m.supports_tool_examples);
     let thinking_override = ThinkingSupport::from_flags(
         declared
@@ -235,11 +231,7 @@ pub fn discover_models(timeouts: Timeouts) -> Vec<String> {
                 match result {
                     Ok(mut models) => {
                         overlay_declared_tiers(def, &mut models);
-                        let slug_arc: Arc<str> = Arc::from(slug_c.as_str());
-                        crate::model_registry::model_registry()
-                            .write()
-                            .unwrap()
-                            .set_known_models(&slug_arc, models.clone());
+                        crate::model_registry::set_known_models(&slug_c, models.clone());
                         for m in models {
                             all_specs.push(format!("{slug_c}/{}", m.id));
                         }
@@ -361,15 +353,14 @@ mod tests {
         let expected_window: u32 = 131_072;
         let expected_output: u32 = 8_192;
 
-        {
-            let mut info = ModelInfo::id_only(model_id.to_string());
-            info.context_window = Some(expected_window);
-            info.max_output_tokens = Some(expected_output);
-            crate::model_registry::model_registry()
-                .write()
-                .unwrap()
-                .set_known_models(&Arc::<str>::from(slug), vec![info]);
-        }
+        crate::model_registry::set_known_models(
+            slug,
+            vec![ModelInfo {
+                context_window: Some(expected_window),
+                max_output_tokens: Some(expected_output),
+                ..ModelInfo::id_only(model_id.to_string())
+            }],
+        );
 
         let def = openai_def(model_id);
         let model = model_from_def(&def, ProviderKind::OpenAi, slug, model_id);

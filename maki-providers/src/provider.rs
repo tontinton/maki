@@ -429,11 +429,7 @@ pub async fn fetch_all_models(
             let batch = match provider.list_models().await {
                 Ok(models) => {
                     if manifest.accepts_arbitrary_models {
-                        let slug: Arc<str> = Arc::from(slug);
-                        crate::model_registry::model_registry()
-                            .write()
-                            .unwrap()
-                            .set_known_models(&slug, models.clone());
+                        crate::model_registry::set_known_models(slug, models.clone());
                     }
                     let mut specs: Vec<String> =
                         models.iter().map(|m| format!("{slug}/{}", m.id)).collect();

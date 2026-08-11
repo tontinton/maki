@@ -197,17 +197,10 @@ impl Provider for OpenRouter {
 
             body["cache_control"] = json!({"type": "ephemeral"});
 
-            let reasoning_info: Option<Arc<OpenRouterModelInfo>> = {
-                let guard = crate::model_registry::model_registry().read().unwrap();
-                // Discovery keys by the builtin slug; a dynamic wrap's model
-                // carries its own slug, so don't key by model.provider.
-                guard
-                    .discovered("openrouter", &model.id)
-                    .and_then(|d| d.provider_info.clone())
-                    .map(|arc| {
-                        Arc::downcast::<OpenRouterModelInfo>(arc).expect("wrong provider info type")
-                    })
-            };
+            let reasoning_info = crate::model_registry::provider_info::<OpenRouterModelInfo>(
+                "openrouter",
+                &model.id,
+            );
 
             let effort_dialect = effort_dialect(reasoning_info.as_deref());
             if model.supports_thinking()

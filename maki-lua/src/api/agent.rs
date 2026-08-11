@@ -49,11 +49,8 @@ fn resolve_model_from_ctx(ctx: &AgentContext, tier: Option<&str>) -> Result<Mode
         return Ok(Model::clone(&ctx.model));
     }
     let slug = &ctx.model.provider;
-    let map = maki_providers::model_registry::model_registry()
-        .read()
-        .unwrap();
-    map.spec_for_tier(slug, effective)
-        .or_else(|| map.spec_for_tier_any(effective))
+    maki_providers::model_registry::spec_for_tier(slug, effective)
+        .or_else(|| maki_providers::model_registry::spec_for_tier_any(effective))
         .filter(|spec| ctx.model_policy.allows(spec))
         .and_then(|s| Model::from_spec(&s).ok())
         .map(Ok)

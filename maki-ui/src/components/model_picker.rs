@@ -278,23 +278,20 @@ fn parse_model_entry(spec: &str) -> Option<ModelEntry> {
         maki_config::providers::resolve_display_name(provider_str, config.get(provider_str))
     };
 
-    let map = model_registry::model_registry().read().unwrap();
-    let override_tiers: Vec<ModelTier> = [
-        ModelTier::Strong,
-        ModelTier::Medium,
-        ModelTier::Weak,
-        ModelTier::Compaction,
-    ]
-    .into_iter()
-    .filter(|&t| map.has_override(spec, t))
-    .collect();
-    let override_label = map.override_tier_label(spec);
-    drop(map);
+    let override_tiers = model_registry::override_tiers(spec);
     let (tier, free) = match maki_providers::Model::from_spec(spec) {
         Ok(m) => (m.tier.to_string(), m.is_free()),
         Err(_) => (String::new(), false),
     };
-    let tier = override_label.unwrap_or(tier);
+    let tier = if override_tiers.is_empty() {
+        tier
+    } else {
+        override_tiers
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("/")
+    };
     let tier = if free {
         format!("{FREE_PREFIX}{tier}")
     } else {

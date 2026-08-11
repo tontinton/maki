@@ -7,13 +7,15 @@
 //! Discovered metadata (context windows, pricing) from `/models` endpoints is
 //! stored in `known_models` and consulted by [`crate::model::Model::from_base`].
 //!
-//! All reads and writes go through [`model_registry`]. The module owns
+//! The global lock never escapes this module: accessors lock internally and
+//! return owned data, so a caller can never hold a read guard across model
+//! construction (recursive read + queued writer = deadlock). The module owns
 //! persistence: [`load_from_storage`] at startup, [`set_and_persist`] on user
 //! edits. Callers never touch the on-disk format directly.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use maki_storage::{StateDir, atomic_write};
 use tracing::warn;
@@ -24,89 +26,123 @@ const TIERS_FILE: &str = "model-tiers";
 
 static REGISTRY: OnceLock<RwLock<ModelRegistry>> = OnceLock::new();
 
-pub fn model_registry() -> &'static RwLock<ModelRegistry> {
+fn read() -> RwLockReadGuard<'static, ModelRegistry> {
+    registry().read().unwrap()
+}
+
+fn write() -> RwLockWriteGuard<'static, ModelRegistry> {
+    registry().write().unwrap()
+}
+
+fn registry() -> &'static RwLock<ModelRegistry> {
     REGISTRY.get_or_init(|| RwLock::new(ModelRegistry::default()))
+}
+
+pub fn spec_for_tier(provider: &str, tier: ModelTier) -> Option<String> {
+    read().spec_for_tier(provider, tier)
+}
+
+pub fn spec_for_tier_any(tier: ModelTier) -> Option<String> {
+    read().spec_for_tier_any(tier)
+}
+
+pub fn discovered(provider: &str, model_id: &str) -> Option<ModelInfo> {
+    read().discovered(provider, model_id).cloned()
+}
+
+/// Typed `provider_info` for a discovered model. Key by the builtin slug, not
+/// `model.provider`: a dynamic wrap's model carries its own slug.
+pub fn provider_info<T: Send + Sync + 'static>(provider: &str, model_id: &str) -> Option<Arc<T>> {
+    let info = read()
+        .discovered(provider, model_id)?
+        .provider_info
+        .clone()?;
+    Arc::downcast(info).ok()
+}
+
+pub fn tier_for(spec: &str, provider: &str, static_tier: Option<ModelTier>) -> ModelTier {
+    read().tier_for(spec, provider, static_tier)
+}
+
+pub fn set_known_models(provider: &str, models: Vec<ModelInfo>) {
+    write().set_known_models(provider, models);
+}
+
+/// Tiers whose override points at `spec`, in descending tier order.
+pub fn override_tiers(spec: &str) -> Vec<ModelTier> {
+    read().override_tiers(spec)
 }
 
 pub fn load_from_storage(dir: &StateDir) {
     let overrides = read_overrides(dir.path().join(TIERS_FILE).as_path());
-    model_registry().write().unwrap().set_overrides(overrides);
+    write().set_overrides(overrides);
 }
 
 pub fn set_and_persist(spec: String, tier: ModelTier, dir: &StateDir) {
-    let snapshot = {
-        let mut reg = model_registry().write().unwrap();
-        reg.set(spec, tier);
-        reg.overrides.clone()
-    };
-    write_overrides(dir.path().join(TIERS_FILE).as_path(), &snapshot);
+    update_and_persist(dir, |reg| reg.set(spec, tier));
 }
 
 pub fn unset_and_persist(spec: &str, tier: ModelTier, dir: &StateDir) {
+    update_and_persist(dir, |reg| reg.unset(spec, tier));
+}
+
+/// Snapshot under the lock, persist outside it: file IO must never run while
+/// holding the registry lock.
+fn update_and_persist(dir: &StateDir, update: impl FnOnce(&mut ModelRegistry)) {
     let snapshot = {
-        let mut reg = model_registry().write().unwrap();
-        reg.unset(spec, tier);
+        let mut reg = write();
+        update(&mut reg);
         reg.overrides.clone()
     };
     write_overrides(dir.path().join(TIERS_FILE).as_path(), &snapshot);
 }
 
 #[derive(Debug, Default)]
-pub struct ModelRegistry {
+struct ModelRegistry {
     /// Keyed by tier (not spec) so inserting a model automatically evicts the
     /// previous holder. Persisted to disk.
     overrides: BTreeMap<ModelTier, String>,
     /// Ordered model info per provider, populated from `list_models()`.
     /// Not persisted - rebuilt every session. Used for auto-tier assignment
     /// and discovered metadata lookup.
-    known_models: HashMap<Arc<str>, Vec<ModelInfo>>,
+    known_models: HashMap<String, Vec<ModelInfo>>,
 }
 
 impl ModelRegistry {
-    pub fn set_overrides(&mut self, overrides: BTreeMap<ModelTier, String>) {
+    fn set_overrides(&mut self, overrides: BTreeMap<ModelTier, String>) {
         self.overrides = overrides;
     }
 
-    pub fn set_known_models(&mut self, provider: &Arc<str>, models: Vec<ModelInfo>) {
-        self.known_models.insert(Arc::clone(provider), models);
+    fn set_known_models(&mut self, provider: &str, models: Vec<ModelInfo>) {
+        self.known_models.insert(provider.to_string(), models);
     }
 
-    pub fn set(&mut self, spec: String, tier: ModelTier) {
+    fn set(&mut self, spec: String, tier: ModelTier) {
         self.overrides.insert(tier, spec);
     }
 
-    pub fn unset(&mut self, spec: &str, tier: ModelTier) {
-        if self.overrides.get(&tier).map(String::as_str) == Some(spec) {
+    fn unset(&mut self, spec: &str, tier: ModelTier) {
+        if self.has_override(spec, tier) {
             self.overrides.remove(&tier);
         }
     }
 
-    pub fn has_override(&self, spec: &str, tier: ModelTier) -> bool {
+    fn has_override(&self, spec: &str, tier: ModelTier) -> bool {
         self.overrides.get(&tier).map(String::as_str) == Some(spec)
     }
 
     /// Lookup discovered metadata for a model by ID.
-    pub fn discovered(&self, provider: &str, model_id: &str) -> Option<&ModelInfo> {
+    fn discovered(&self, provider: &str, model_id: &str) -> Option<&ModelInfo> {
         self.known_models
             .get(provider)?
             .iter()
             .find(|m| m.id == model_id)
     }
 
-    pub fn tier_for(
-        &self,
-        spec: &str,
-        provider: &str,
-        static_tier: Option<ModelTier>,
-    ) -> ModelTier {
+    fn tier_for(&self, spec: &str, provider: &str, static_tier: Option<ModelTier>) -> ModelTier {
         // A spec may hold several tiers; prefer the strongest agent tier,
         // falling back to Compaction only when it is the sole assignment.
-        let mut tiers = self
-            .overrides
-            .iter()
-            .rev()
-            .filter(|(_, s)| s.as_str() == spec)
-            .map(|(&t, _)| t);
+        let mut tiers = self.override_tiers(spec).into_iter();
         if let Some(first) = tiers.next() {
             return match first {
                 ModelTier::Compaction => tiers.next().unwrap_or(first),
@@ -132,7 +168,7 @@ impl ModelRegistry {
         ModelTier::Medium
     }
 
-    pub fn spec_for_tier(&self, provider: &str, tier: ModelTier) -> Option<String> {
+    fn spec_for_tier(&self, provider: &str, tier: ModelTier) -> Option<String> {
         let prefix = format!("{provider}/");
         if let Some(spec) = self.overrides.get(&tier)
             && spec.starts_with(&prefix)
@@ -186,7 +222,7 @@ impl ModelRegistry {
         self.overrides.iter().any(|(&t, s)| s == spec && t != tier)
     }
 
-    pub fn spec_for_tier_any(&self, tier: ModelTier) -> Option<String> {
+    fn spec_for_tier_any(&self, tier: ModelTier) -> Option<String> {
         if let Some(spec) = self.overrides.get(&tier) {
             return Some(spec.clone());
         }
@@ -198,15 +234,13 @@ impl ModelRegistry {
         None
     }
 
-    pub fn override_tier_label(&self, spec: &str) -> Option<String> {
-        let tiers: Vec<_> = self
-            .overrides
+    fn override_tiers(&self, spec: &str) -> Vec<ModelTier> {
+        self.overrides
             .iter()
             .rev()
             .filter(|(_, s)| s.as_str() == spec)
-            .map(|(t, _)| t.to_string())
-            .collect();
-        (!tiers.is_empty()).then(|| tiers.join("/"))
+            .map(|(&t, _)| t)
+            .collect()
     }
 }
 
@@ -277,7 +311,7 @@ mod tests {
         reg.set_overrides(overrides.iter().map(|(t, s)| (*t, s.to_string())).collect());
         if !models.is_empty() {
             reg.set_known_models(
-                &Arc::<str>::from("ollama"),
+                "ollama",
                 models
                     .iter()
                     .map(|s| ModelInfo::id_only(s.to_string()))
@@ -305,7 +339,7 @@ mod tests {
     fn make_tiered(models: &[(&str, ModelTier)]) -> ModelRegistry {
         let mut reg = ModelRegistry::default();
         reg.set_known_models(
-            &Arc::<str>::from("copilot"),
+            "copilot",
             models
                 .iter()
                 .map(|&(id, tier)| ModelInfo {
@@ -433,33 +467,17 @@ mod tests {
     fn discovered_looks_up_by_id() {
         let mut reg = ModelRegistry::default();
         reg.set_known_models(
-            &Arc::<str>::from("llama-cpp"),
+            "llama-cpp",
             vec![
+                ModelInfo::id_only("model-a".into()),
                 ModelInfo {
-                    id: "model-a".into(),
-                    context_window: Some(32_000),
-                    max_output_tokens: None,
-                    pricing: None,
-                    supports_thinking: None,
-                    supports_vision: None,
-                    tier: None,
-                    provider_info: None,
-                },
-                ModelInfo {
-                    id: "model-b".into(),
                     context_window: Some(128_000),
-                    max_output_tokens: None,
-                    pricing: None,
-                    supports_thinking: None,
-                    supports_vision: None,
-                    tier: None,
-                    provider_info: None,
+                    ..ModelInfo::id_only("model-b".into())
                 },
             ],
         );
-        let info = reg.discovered("llama-cpp", "model-a").unwrap();
-        assert_eq!(info.id, "model-a");
-        assert_eq!(info.context_window, Some(32_000));
+        let info = reg.discovered("llama-cpp", "model-b").unwrap();
+        assert_eq!(info.context_window, Some(128_000));
         assert!(reg.discovered("llama-cpp", "model-x").is_none());
         assert!(reg.discovered("ollama", "model-a").is_none());
     }

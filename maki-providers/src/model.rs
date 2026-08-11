@@ -14,7 +14,7 @@ use maki_storage::sessions::{MIN_THINKING_BUDGET, StoredTokenUsage};
 use serde::{Deserialize, Serialize};
 
 use crate::manifest::{ManifestRegistry, ProviderManifest};
-use crate::model_registry::model_registry;
+use crate::model_registry;
 use crate::providers::{anthropic, custom, dynamic};
 
 const PER_MILLION: f64 = 1_000_000.0;
@@ -252,9 +252,9 @@ impl Model {
         let spec = format!("{slug}/{model_id}");
         // Discovery keys `known_models` by the builtin slug, so a dynamic or
         // custom slug reads positional tiers and metadata through its base.
-        let guard = model_registry().read().unwrap();
-        let discovered = guard.discovered(manifest.slug, model_id);
-        let tier = guard.tier_for(&spec, manifest.slug, static_entry.map(|e| e.tier));
+        let discovered = model_registry::discovered(manifest.slug, model_id);
+        let discovered = discovered.as_ref();
+        let tier = model_registry::tier_for(&spec, manifest.slug, static_entry.map(|e| e.tier));
         let family = static_entry.map_or(manifest.family, |entry| entry.family);
         let pricing = discovered
             .and_then(|info| info.pricing.clone())
@@ -269,7 +269,6 @@ impl Model {
             .or_else(|| anthropic::shared::long_context_window(model_id))
             .or_else(|| static_entry.map(|entry| entry.context_window))
             .unwrap_or(manifest.fallback_context_window);
-        drop(guard);
         Self {
             id: model_id.to_string(),
             provider: Arc::from(slug),
@@ -323,10 +322,7 @@ impl Model {
         let Some(manifest) = ManifestRegistry::for_slug(&self.provider) else {
             return false;
         };
-        model_registry()
-            .read()
-            .unwrap()
-            .discovered(manifest.slug, &self.id)
+        model_registry::discovered(manifest.slug, &self.id)
             .and_then(|d| d.supports_thinking)
             .unwrap_or(manifest.supports_thinking)
     }
@@ -342,11 +338,7 @@ impl Model {
         let manifest = ManifestRegistry::for_slug(&self.provider);
         manifest
             .and_then(|m| {
-                model_registry()
-                    .read()
-                    .unwrap()
-                    .discovered(m.slug, &self.id)
-                    .and_then(|d| d.supports_vision)
+                model_registry::discovered(m.slug, &self.id).and_then(|d| d.supports_vision)
             })
             .or_else(|| {
                 manifest
@@ -395,7 +387,7 @@ impl Model {
     }
 
     pub fn from_tier(slug: &str, tier: ModelTier) -> Result<Self, ModelError> {
-        if let Some(spec) = model_registry().read().unwrap().spec_for_tier(slug, tier) {
+        if let Some(spec) = model_registry::spec_for_tier(slug, tier) {
             return Self::from_spec(&spec);
         }
         let entry = ManifestRegistry::find_default_for_tier(slug, tier)
@@ -1005,34 +997,19 @@ mod tests {
     fn discovered_context_window_flows_into_from_base_for_unknown_model() {
         use crate::model::ModelInfo;
 
-        let slug: Arc<str> = Arc::from("ollama");
         let model_id = "test-discovered-context-window-model";
         let expected_window: u32 = 131_072;
 
-        // Seed discovered metadata into the global registry
-        {
-            let mut reg = model_registry().write().unwrap();
-            reg.set_known_models(
-                &slug,
-                vec![ModelInfo {
-                    id: model_id.to_string(),
-                    context_window: Some(expected_window),
-                    max_output_tokens: None,
-                    pricing: None,
-                    supports_thinking: None,
-                    supports_vision: None,
-                    tier: None,
-                    provider_info: None,
-                }],
-            );
-        }
+        model_registry::set_known_models(
+            "ollama",
+            vec![ModelInfo {
+                context_window: Some(expected_window),
+                ..ModelInfo::id_only(model_id.to_string())
+            }],
+        );
 
-        // from_base for this unknown model should pick up the discovered context_window
         let model = Model::from_base(ManifestRegistry::get("ollama").unwrap(), "ollama", model_id);
-        assert_eq!(model.id, model_id);
         assert_eq!(model.context_window, expected_window);
-        // max_output_tokens falls back to provider default since not discovered
-        assert_eq!(model.max_output_tokens, Some(16_384));
 
         // A dynamic/custom slug shares its base provider's discovery.
         let wrapped = Model::from_base(

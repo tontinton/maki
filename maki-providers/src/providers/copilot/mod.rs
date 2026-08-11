@@ -263,20 +263,17 @@ impl Copilot {
     ) -> Result<StreamResponse, AgentError> {
         let auth = self.auth().await?;
         let mut body = responses::build_body(model, messages, system, tools);
-        let reasoning_info = crate::model_registry::model_registry()
-            .read()
-            .unwrap()
-            .discovered("copilot", &model.id)
-            .and_then(|info| info.provider_info.clone())
-            .and_then(|info| Arc::downcast::<CopilotModelInfo>(info).ok())
-            .or_else(|| {
-                self.models
-                    .lock()
-                    .unwrap()
-                    .get(&model.id)
-                    .map(CopilotModel::reasoning_info)
-                    .map(Arc::new)
-            });
+        let reasoning_info = crate::model_registry::provider_info::<CopilotModelInfo>(
+            "copilot", &model.id,
+        )
+        .or_else(|| {
+            self.models
+                .lock()
+                .unwrap()
+                .get(&model.id)
+                .map(CopilotModel::reasoning_info)
+                .map(Arc::new)
+        });
         if let Some(info) = reasoning_info {
             apply_responses_reasoning(&mut body, thinking, model, &effort_dialect(&info));
         }

@@ -34,10 +34,8 @@ pub fn resolve_compaction_model(
     timeouts: maki_providers::Timeouts,
     model_policy: &ModelPolicy,
 ) -> (Arc<dyn Provider>, Model) {
-    if let Some(spec) = maki_providers::model_registry::model_registry()
-        .read()
-        .unwrap()
-        .spec_for_tier_any(maki_providers::ModelTier::Compaction)
+    if let Some(spec) =
+        maki_providers::model_registry::spec_for_tier_any(maki_providers::ModelTier::Compaction)
         && model_policy.allows(&spec)
         && let Ok(mut m) = Model::from_spec(&spec)
         && let Ok(p) = maki_providers::provider::from_model(&mut m, timeouts)
