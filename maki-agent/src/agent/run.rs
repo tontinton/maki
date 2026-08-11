@@ -9,7 +9,7 @@ use maki_providers::{
     ContentBlock, Message, Model, RequestOptions, Role, StopReason, StreamResponse, TokenUsage,
 };
 
-use super::compaction::{self, CONTINUE_AFTER_COMPACT};
+use super::compaction;
 use super::history::{History, sanitize_cancelled_history};
 use super::instructions::LoadedInstructions;
 use super::streaming::stream_with_retry;
@@ -488,12 +488,15 @@ impl<'h> Agent<'h> {
             self.history,
             &self.event_tx,
             &self.cancel,
+            &self.config,
         )
         .await?;
         self.rollback_len = self.history.len();
         self.event_tx.send(AgentEvent::CompactionDone)?;
         self.history
-            .push(Message::synthetic(CONTINUE_AFTER_COMPACT.into()));
+            .push(Message::synthetic(compaction::continue_message(
+                &self.config,
+            )));
         Ok(())
     }
 
@@ -998,6 +1001,27 @@ mod tests {
                 )),
                 expected,
             );
+        });
+    }
+
+    #[test]
+    fn do_compact_appends_post_instructions_to_continue_message() {
+        smol::block_on(async {
+            const POST: &str = "Re-read plan.md";
+            let mut history = History::new(vec![Message::user("go".into())]);
+            let (mut agent, _event_rx) = make_agent(
+                MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+                &mut history,
+            );
+            agent.config.post_compaction_instructions = Some(POST.into());
+            agent.do_compact().await.unwrap();
+            drop(agent);
+
+            let last = history.as_slice().last().unwrap();
+            assert!(matches!(
+                &last.content[0],
+                ContentBlock::Text { text } if text.ends_with(POST) && text != POST
+            ));
         });
     }
 

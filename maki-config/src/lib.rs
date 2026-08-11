@@ -458,6 +458,8 @@ pub struct AgentFileConfig {
     pub max_output_lines: Option<usize>,
     pub max_continuation_turns: Option<u32>,
     pub compaction_buffer: Option<CompactionBuffer>,
+    pub compaction_instructions: Option<String>,
+    pub post_compaction_instructions: Option<String>,
     pub stale_read_check: Option<bool>,
 }
 
@@ -470,6 +472,8 @@ impl AgentFileConfig {
             max_output_lines,
             max_continuation_turns,
             compaction_buffer,
+            compaction_instructions,
+            post_compaction_instructions,
             stale_read_check
         );
     }
@@ -983,6 +987,20 @@ pub struct AgentConfig {
     pub compaction_buffer: CompactionBuffer,
 
     #[config(
+        ty = "String",
+        default = "None",
+        desc = "Extra instructions appended to the compaction summary prompt"
+    )]
+    pub compaction_instructions: Option<String>,
+
+    #[config(
+        ty = "String",
+        default = "None",
+        desc = "Extra instructions the agent receives after any compaction (e.g. re-read plan.md)"
+    )]
+    pub post_compaction_instructions: Option<String>,
+
+    #[config(
         default = true,
         desc = "Require re-reading a file that changed on disk before editing it"
     )]
@@ -1011,6 +1029,8 @@ impl AgentConfig {
                 .max_continuation_turns
                 .unwrap_or(DEFAULT_MAX_CONTINUATION_TURNS),
             compaction_buffer: file.compaction_buffer.unwrap_or(DEFAULT_COMPACTION_BUFFER),
+            compaction_instructions: file.compaction_instructions,
+            post_compaction_instructions: file.post_compaction_instructions,
             stale_read_check: file.stale_read_check.unwrap_or(true),
             max_turns: None,
             allowed_tools: Vec::new(),

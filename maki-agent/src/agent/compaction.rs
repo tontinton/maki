@@ -1,6 +1,6 @@
 use std::env;
 
-use maki_config::CompactionBuffer;
+use maki_config::{AgentConfig, CompactionBuffer};
 use maki_providers::{
     ContentBlock, Message, Model, RequestOptions, Role, StreamResponse, TokenUsage,
 };
@@ -11,8 +11,19 @@ use super::streaming::stream_with_retry;
 use crate::cancel::CancelToken;
 use crate::{AgentError, AgentEvent, EventSender, TurnCompleteEvent};
 
-pub(super) const CONTINUE_AFTER_COMPACT: &str = "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed. If the summary contains a todo list, restore it with todo_write and keep it updated. If you learned important project context during this session, consider saving it to memory before it's lost.";
+const CONTINUE_AFTER_COMPACT: &str = "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed. If the summary contains a todo list, restore it with todo_write and keep it updated. If you learned important project context during this session, consider saving it to memory before it's lost.";
 const IMAGE_PLACEHOLDER: &str = "[image]";
+
+fn normalize(text: &Option<String>) -> Option<&str> {
+    text.as_deref().map(str::trim).filter(|t| !t.is_empty())
+}
+
+pub(super) fn continue_message(config: &AgentConfig) -> String {
+    match normalize(&config.post_compaction_instructions) {
+        Some(extra) => format!("{CONTINUE_AFTER_COMPACT}\n\n{extra}"),
+        None => CONTINUE_AFTER_COMPACT.to_string(),
+    }
+}
 
 pub(super) async fn compact_history(
     provider: &dyn maki_providers::provider::Provider,
@@ -20,6 +31,7 @@ pub(super) async fn compact_history(
     history: &mut History,
     event_tx: &EventSender,
     cancel: &CancelToken,
+    config: &AgentConfig,
 ) -> Result<TokenUsage, AgentError> {
     let compact_start = std::time::Instant::now();
     let mut compaction_history: Vec<Message> = history.as_slice().to_vec();
@@ -27,7 +39,14 @@ pub(super) async fn compact_history(
     strip_images(&mut compaction_history);
     strip_thinking(&mut compaction_history);
     strip_old_tool_results(&mut compaction_history);
-    compaction_history.push(Message::user(crate::prompt::COMPACTION_USER.to_string()));
+    let summary_prompt = match normalize(&config.compaction_instructions) {
+        Some(extra) => format!(
+            "{}\n\nAdditional instructions:\n{extra}",
+            crate::prompt::COMPACTION_USER
+        ),
+        None => crate::prompt::COMPACTION_USER.to_string(),
+    };
+    compaction_history.push(Message::user(summary_prompt));
 
     let empty_tools = serde_json::json!([]);
     let max_attempts = 3;
@@ -107,9 +126,13 @@ pub async fn compact(
     model: &Model,
     history: &mut History,
     event_tx: &EventSender,
+    config: &AgentConfig,
 ) -> Result<(), AgentError> {
     let cancel = CancelToken::none();
-    let usage = compact_history(provider, model, history, event_tx, &cancel).await?;
+    let usage = compact_history(provider, model, history, event_tx, &cancel, config).await?;
+    if let Some(post) = normalize(&config.post_compaction_instructions) {
+        history.push(Message::synthetic(post.to_string()));
+    }
 
     event_tx.send(AgentEvent::Done {
         usage,
@@ -309,6 +332,7 @@ mod tests {
                 &model,
                 &mut history,
                 &EventSender::new(raw_tx, 0),
+                &AgentConfig::default(),
             )
             .await
             .unwrap();
@@ -318,6 +342,51 @@ mod tests {
             assert!(matches!(msgs[0].role, Role::User));
             assert!(matches!(msgs[1].role, Role::Assistant));
         });
+    }
+
+    #[test]
+    fn compact_applies_custom_instructions() {
+        smol::block_on(async {
+            const EXTRA: &str = "Record anything that belongs in plan.md";
+            const POST: &str = "Re-read plan.md and agent.md";
+
+            let provider = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
+            let mut history = History::new(vec![Message::user("work".into())]);
+            let (raw_tx, _rx) = flume::unbounded();
+            let config = AgentConfig {
+                compaction_instructions: Some(EXTRA.into()),
+                post_compaction_instructions: Some(POST.into()),
+                ..Default::default()
+            };
+
+            compact(
+                &provider,
+                &default_model(),
+                &mut history,
+                &EventSender::new(raw_tx, 0),
+                &config,
+            )
+            .await
+            .unwrap();
+
+            let requests = provider.requests.lock().unwrap();
+            let summary_prompt = requests[0].last().unwrap();
+            assert!(matches!(
+                &summary_prompt.content[0],
+                ContentBlock::Text { text }
+                    if text.starts_with(crate::prompt::COMPACTION_USER) && text.ends_with(EXTRA)
+            ));
+            assert!(matches!(
+                &history.as_slice().last().unwrap().content[0],
+                ContentBlock::Text { text } if text == POST
+            ));
+        });
+    }
+
+    #[test_case(Some("  \n ".into()), None ; "whitespace_only_is_none")]
+    #[test_case(Some("  keep plan.md ".into()), Some("keep plan.md") ; "trimmed")]
+    fn normalize_instructions(raw: Option<String>, expected: Option<&str>) {
+        assert_eq!(normalize(&raw), expected);
     }
 
     #[test]
@@ -353,6 +422,7 @@ mod tests {
                 &mut history,
                 &EventSender::new(raw_tx, 0),
                 &CancelToken::none(),
+                &AgentConfig::default(),
             )
             .await
             .unwrap();
@@ -579,6 +649,7 @@ mod tests {
                 &mut history,
                 &EventSender::new(raw_tx, 0),
                 &CancelToken::none(),
+                &AgentConfig::default(),
             )
             .await
             .unwrap();
@@ -620,6 +691,7 @@ mod tests {
                 &mut history,
                 &EventSender::new(raw_tx, 0),
                 &CancelToken::none(),
+                &AgentConfig::default(),
             )
             .await
             .unwrap();

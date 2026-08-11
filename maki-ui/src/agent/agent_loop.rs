@@ -164,7 +164,14 @@ impl AgentLoop {
         let slot = self.model_slot.load();
         let (provider, model) =
             agent::resolve_compaction_model(&slot.provider, &slot.model, self.timeouts);
-        agent::compact(&*provider, &model, &mut self.history, event_tx).await
+        agent::compact(
+            &*provider,
+            &model,
+            &mut self.history,
+            event_tx,
+            &self.config,
+        )
+        .await
     }
 
     async fn do_agent_run(
