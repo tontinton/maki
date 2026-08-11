@@ -121,6 +121,13 @@ fn write_theme_section(out: &mut String) {
     writeln!(out, "Available themes: {names}.\n").unwrap();
     writeln!(
         out,
+        "You can add your own themes too. Drop a `<name>.toml` file into \
+         `themes/` inside your Maki config directory, for example \
+         `~/.config/maki/themes/`. If it reuses a built-in name, yours wins.\n"
+    )
+    .unwrap();
+    writeln!(
+        out,
         "Themes use 24-bit colors, but not every terminal can show them. Maki \
          checks the environment, terminfo, and the terminal itself, and when \
          truecolor is missing it quietly falls back to the closest of the 256 \

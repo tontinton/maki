@@ -1,5 +1,5 @@
 use crate::components::Overlay;
-use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
+use crate::components::list_picker::{ListPicker, PickerAction};
 use crate::theme;
 
 use crossterm::event::KeyEvent;
@@ -14,18 +14,8 @@ pub enum ThemePickerAction {
     Closed,
 }
 
-struct ThemeEntry {
-    name: &'static str,
-}
-
-impl PickerItem for ThemeEntry {
-    fn label(&self) -> &str {
-        self.name
-    }
-}
-
 pub struct ThemePicker {
-    picker: ListPicker<ThemeEntry>,
+    picker: ListPicker<String>,
     original_theme_name: Option<String>,
 }
 
@@ -39,13 +29,10 @@ impl ThemePicker {
 
     pub fn open(&mut self) {
         let current_name = theme::current_theme_name();
-        let entries: Vec<ThemeEntry> = theme::BUNDLED_THEMES
-            .iter()
-            .map(|t| ThemeEntry { name: t.name })
-            .collect();
+        let entries = theme::all_theme_names();
         let current_idx = entries
             .iter()
-            .position(|e| e.name == current_name)
+            .position(|name| *name == current_name)
             .unwrap_or(0);
         self.original_theme_name = Some(current_name);
         self.picker.open(entries, TITLE);
@@ -67,8 +54,8 @@ impl ThemePicker {
                 self.apply_preview();
                 ThemePickerAction::Consumed
             }
-            PickerAction::Select(entry) => {
-                theme::persist_theme(entry.name);
+            PickerAction::Select(name) => {
+                theme::persist_theme(&name);
                 self.original_theme_name = None;
                 ThemePickerAction::Closed
             }
@@ -94,8 +81,8 @@ impl ThemePicker {
     }
 
     fn apply_preview(&self) {
-        if let Some(entry) = self.picker.selected_item()
-            && let Ok(t) = theme::load_by_name(entry.name)
+        if let Some(name) = self.picker.selected_item()
+            && let Ok(t) = theme::load_by_name(name)
         {
             theme::set(t);
         }

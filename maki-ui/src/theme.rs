@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
@@ -270,11 +271,46 @@ pub fn generation() -> u64 {
 }
 
 pub fn load_by_name(name: &str) -> Result<Theme, String> {
+    if let Some(path) = user_themes_dir().map(|d| d.join(format!("{name}.toml")))
+        && let Ok(toml) = std::fs::read_to_string(&path)
+    {
+        return Theme::from_toml(&toml).map_err(|e| format!("{}: {e}", path.display()));
+    }
     BUNDLED_THEMES
         .iter()
         .find(|e| e.name == name)
         .map(|e| Theme::from_toml(e.toml))
         .unwrap_or_else(|| Err(format!("unknown theme: {name}")))
+}
+
+fn user_themes_dir() -> Option<PathBuf> {
+    maki_storage::paths::config_dir()
+        .ok()
+        .map(|d| d.join("themes"))
+}
+
+pub fn all_theme_names() -> Vec<String> {
+    let user_names = user_themes_dir()
+        .and_then(|dir| std::fs::read_dir(dir).ok())
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let path = e.path();
+            if path.extension()? != "toml" {
+                return None;
+            }
+            Some(path.file_stem()?.to_str()?.to_owned())
+        });
+    merge_theme_names(user_names)
+}
+
+fn merge_theme_names(user_names: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut names: Vec<String> = BUNDLED_THEMES.iter().map(|e| e.name.to_owned()).collect();
+    names.extend(user_names);
+    names.sort_unstable();
+    names.dedup();
+    names
 }
 
 pub fn set_current_name(name: &str) {
@@ -1005,6 +1041,13 @@ mod tests {
     #[test]
     fn load_by_name_unknown() {
         assert!(load_by_name("nonexistent").is_err());
+    }
+
+    #[test]
+    fn merge_theme_names_dedups_user_override_and_sorts_in_custom() {
+        let names = merge_theme_names(["dracula".to_owned(), "aaa_custom".to_owned()]);
+        assert_eq!(names.iter().filter(|n| *n == "dracula").count(), 1);
+        assert_eq!(names.first().map(String::as_str), Some("aaa_custom"));
     }
 
     #[test]
