@@ -134,6 +134,7 @@ futures-lite = "2"
 futures = "0.3"
 isahc = { version = "1.7", default-features = false, features = ["text-decoding", "static-curl", "static-ssl"] }
 libc = "0.2"
+windows-sys = { version = "0.61", features = ["Win32_Globalization"] }
 nucleo = "0.5"
 nucleo-matcher = "0.3"
 open = "5"

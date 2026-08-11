@@ -325,6 +325,7 @@ pub struct UiFileConfig {
     pub mouse_scroll_lines: Option<u32>,
     pub show_thinking: Option<bool>,
     pub theme: Option<String>,
+    pub clock_format: Option<ClockFormat>,
     pub tool_output_lines: Option<ToolOutputLinesFile>,
     pub max_input_lines: Option<u32>,
 }
@@ -341,6 +342,7 @@ impl UiFileConfig {
             mouse_scroll_lines,
             show_thinking,
             theme,
+            clock_format,
             max_input_lines
         );
         match (self.tool_output_lines.as_mut(), overlay.tool_output_lines) {
@@ -802,6 +804,17 @@ pub struct Config {
     pub plugins: PluginsConfig,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+pub enum ClockFormat {
+    #[serde(rename = "12h")]
+    Hour12,
+    #[serde(rename = "24h")]
+    Hour24,
+    #[default]
+    #[serde(rename = "system")]
+    System,
+}
+
 #[derive(Debug, Clone, ConfigSection)]
 #[config(section = "ui")]
 pub struct UiConfig {
@@ -829,6 +842,9 @@ pub struct UiConfig {
     )]
     pub show_thinking: bool,
 
+    #[config(default = ClockFormat::System, ty = "String", default_doc = "system", desc = "Clock format for timestamps: \"12h\", \"24h\", or \"system\" (follow the OS preference, 24h when unknown)")]
+    pub clock_format: ClockFormat,
+
     #[config(skip, default = "None")]
     pub theme: Option<String>,
 
@@ -852,6 +868,7 @@ impl UiConfig {
             mouse_scroll_lines: f.mouse_scroll_lines.unwrap_or(DEFAULT_MOUSE_SCROLL_LINES),
             max_input_lines: f.max_input_lines.unwrap_or(DEFAULT_MAX_INPUT_LINES),
             show_thinking: f.show_thinking.unwrap_or(true),
+            clock_format: f.clock_format.unwrap_or_default(),
             theme: f.theme,
             tool_output_lines: ToolOutputLines::from_file(f.tool_output_lines),
         }

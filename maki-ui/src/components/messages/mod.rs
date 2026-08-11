@@ -22,7 +22,7 @@ use crate::render_worker::RenderWorker;
 use crate::selection::Selection;
 use crate::splash::{ColorTransition, Splash};
 use crate::theme;
-use maki_config::{ToolOutputLines, UiConfig};
+use maki_config::{ClockFormat, ToolOutputLines, UiConfig};
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -81,6 +81,7 @@ pub struct MessagesPanel {
     restore_event_tx: Option<EventSender>,
     show_thinking: bool,
     thinking_collapsed: bool,
+    clock_format: ClockFormat,
     /// One re-bake per tool per generation; `snapshot_theme_gen`
     /// only bumps when colors actually land.
     rebake_requested: HashMap<String, u64>,
@@ -127,6 +128,7 @@ impl MessagesPanel {
             restore_event_tx: None,
             show_thinking: ui_config.show_thinking,
             thinking_collapsed: !ui_config.show_thinking,
+            clock_format: ui_config.clock_format,
             rebake_requested: HashMap::new(),
             prompt_progress: None,
         }
@@ -176,7 +178,7 @@ impl MessagesPanel {
             name: Arc::from(name),
         }));
         let mut msg = DisplayMessage::new(role, String::new());
-        msg.timestamp = Some(format_timestamp_now());
+        msg.timestamp = Some(format_timestamp_now(self.clock_format));
         self.messages.push(msg);
     }
 
@@ -208,7 +210,7 @@ impl MessagesPanel {
         msg.tool_output = event.output.map(Arc::new);
         msg.annotation = event.annotation;
         msg.render_header = event.render_header;
-        msg.timestamp = Some(format_timestamp_now());
+        msg.timestamp = Some(format_timestamp_now(self.clock_format));
         self.messages.push(msg);
     }
 

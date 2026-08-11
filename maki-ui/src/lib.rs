@@ -7,6 +7,7 @@ pub mod animation;
 pub mod app;
 pub mod chat;
 mod clipboard;
+mod clock;
 mod color_compat;
 mod components;
 pub use components::command::{BUILTIN_COMMANDS, BuiltinCommand};
