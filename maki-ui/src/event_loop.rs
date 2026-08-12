@@ -614,6 +614,10 @@ impl<'t> EventLoop<'t> {
             UiAction::WinRestView { scroll_top } => {
                 self.focused_app().set_scroll_top(scroll_top);
             }
+            UiAction::Builtin(action) => {
+                let actions = self.focused_app().run_builtin(action);
+                self.dispatch(self.focused, actions);
+            }
         }
     }
 

@@ -58,7 +58,7 @@ use maki_agent::{
     SharedMessages, SubagentInfo,
 };
 use maki_config::{ModelPolicy, UiConfig};
-use maki_lua::{EventHandle, HintReader, KeymapReader, LuaCommandReader, WinView};
+use maki_lua::{BuiltinAction, EventHandle, HintReader, KeymapReader, LuaCommandReader, WinView};
 use maki_providers::{Model, ThinkingConfig, add_cost};
 use maki_storage::StateDir;
 use maki_storage::input_history::InputHistory;
@@ -495,20 +495,16 @@ impl App {
             });
         }
         if key::HELP.matches(key) {
-            self.help_modal.toggle();
-            return Some(vec![]);
+            return Some(self.run_builtin(BuiltinAction::Help));
         }
         if key::TASKS.matches(key) {
-            self.open_tasks();
-            return Some(vec![]);
+            return Some(self.run_builtin(BuiltinAction::Tasks));
         }
         if key::PREV_CHAT.matches(key) {
-            self.active_chat = self.active_chat.saturating_sub(1);
-            return Some(vec![]);
+            return Some(self.run_builtin(BuiltinAction::PrevChat));
         }
         if key::NEXT_CHAT.matches(key) {
-            self.active_chat = (self.active_chat + 1).min(self.chats.len() - 1);
-            return Some(vec![]);
+            return Some(self.run_builtin(BuiltinAction::NextChat));
         }
         if key::SCROLL_HALF_UP.matches(key) {
             let half = self.chats[self.active_chat].half_page();
@@ -713,15 +709,62 @@ impl App {
             });
         }
 
-        if key::PLAN_TOGGLE.matches(key)
-            && self.state.mode == Mode::Plan
-            && self.state.plan.is_ready()
-        {
-            self.plan_form.toggle();
-            return Some(vec![]);
+        if key::PLAN_TOGGLE.matches(key) && self.plan_toggle_ready() {
+            return Some(self.run_builtin(BuiltinAction::PlanToggle));
         }
 
         None
+    }
+
+    fn plan_toggle_ready(&self) -> bool {
+        self.state.mode == Mode::Plan && self.state.plan.is_ready()
+    }
+
+    /// Single implementation behind both the default keybindings and
+    /// `maki.ui.action`, so a Lua rebind can never drift from the
+    /// original key's behavior.
+    pub(crate) fn run_builtin(&mut self, action: BuiltinAction) -> Vec<Action> {
+        match action {
+            BuiltinAction::FilePicker => {
+                self.file_picker.open(&self.state.session.cwd);
+            }
+            BuiltinAction::Search => {
+                let top = self.chats[self.active_chat].scroll_top();
+                let auto = self.chats[self.active_chat].auto_scroll();
+                self.search_modal.open(top, auto);
+            }
+            BuiltinAction::Tasks => {
+                if self.task_picker.is_open() {
+                    self.task_picker.close();
+                } else {
+                    self.open_tasks();
+                }
+            }
+            BuiltinAction::Help => self.help_modal.toggle(),
+            BuiltinAction::PlanToggle => {
+                if self.plan_toggle_ready() {
+                    self.plan_form.toggle();
+                }
+            }
+            BuiltinAction::PlanEditor => {
+                return match self.state.plan.path() {
+                    Some(p) => vec![Action::OpenEditor(p.to_path_buf())],
+                    None => {
+                        self.flash(FLASH_NO_PLAN.into());
+                        vec![]
+                    }
+                };
+            }
+            BuiltinAction::EditInput => return vec![Action::EditInputInEditor],
+            BuiltinAction::PopQueue => {
+                self.queue.remove(0);
+            }
+            BuiltinAction::PrevChat => self.active_chat = self.active_chat.saturating_sub(1),
+            BuiltinAction::NextChat => {
+                self.active_chat = (self.active_chat + 1).min(self.chats.len() - 1);
+            }
+        }
+        vec![]
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Vec<Action> {
@@ -781,25 +824,17 @@ impl App {
 
     fn handle_main_chat_key(&mut self, key: KeyEvent) -> Vec<Action> {
         if key::EDIT_INPUT.matches(key) {
-            return vec![Action::EditInputInEditor];
+            return self.run_builtin(BuiltinAction::EditInput);
         }
         if is_ctrl(&key) {
             if key::POP_QUEUE.matches(key) {
-                self.queue.remove(0);
+                return self.run_builtin(BuiltinAction::PopQueue);
             } else if key::OPEN_EDITOR.matches(key) {
-                return match self.state.plan.path() {
-                    Some(p) => vec![Action::OpenEditor(p.to_path_buf())],
-                    None => {
-                        self.flash(FLASH_NO_PLAN.into());
-                        vec![]
-                    }
-                };
+                return self.run_builtin(BuiltinAction::PlanEditor);
             } else if key::SEARCH.matches(key) {
-                let top = self.chats[self.active_chat].scroll_top();
-                let auto = self.chats[self.active_chat].auto_scroll();
-                self.search_modal.open(top, auto);
+                return self.run_builtin(BuiltinAction::Search);
             } else if key::FILE_PICKER.matches(key) {
-                self.file_picker.open(&self.state.session.cwd);
+                return self.run_builtin(BuiltinAction::FilePicker);
             } else if key.code == KeyCode::Char('v') && self.image_paste_rx.is_empty() {
                 self.start_image_paste();
             } else if let InputAction::PaletteSync(val) = self.input_box.handle_key(key) {

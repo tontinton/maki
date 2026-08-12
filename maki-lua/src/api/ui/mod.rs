@@ -6,11 +6,13 @@ use std::time::Duration;
 use humantime::format_duration;
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Lua, Result as LuaResult, Table};
+use strum::VariantNames;
 
 use crate::api::util::command::{
-    Anchor, Border, Dimension, FloatConfig, HintEntries, HintWriter, Split, TitlePos, UiAction,
-    WinCommand, WinEvent,
+    Anchor, Border, BuiltinAction, Dimension, FloatConfig, HintEntries, HintWriter, Split,
+    TitlePos, UiAction, WinCommand, WinEvent, ui_send,
 };
+use crate::api::util::pair::{Pair, try_pair};
 use crate::docs::{FnDoc, ParamDoc};
 pub(crate) mod blit;
 pub(crate) mod buf;
@@ -247,6 +249,32 @@ fn flash(_lua: &Lua, #[ctx] tx: flume::Sender<UiAction>, msg: String) -> LuaResu
     Ok(())
 }
 
+/// Runs a built-in UI action by name, exactly as its default keybinding
+/// would. Handy when a default key never reaches maki because tmux or
+/// your terminal grabs it first: bind a new key with `maki.keymap.set`
+/// and call this from it.
+///
+/// Valid names: `"file_picker"`, `"search"`, `"tasks"`, `"help"`,
+/// `"plan_toggle"`, `"plan_editor"`, `"edit_input"`, `"pop_queue"`,
+/// `"prev_chat"`, `"next_chat"`.
+///
+/// @param name string Action name, e.g. `"file_picker"`.
+/// @return (boolean|nil, string|nil) `true` on success, or nil and an error message for an unknown name.
+/// @example
+/// -- Open the built-in file picker with Ctrl+Q instead of Ctrl+S:
+/// maki.keymap.set("n", "<C-q>", function()
+///   maki.ui.action("file_picker")
+/// end)
+#[lua_fn]
+fn action(_lua: &Lua, #[ctx] tx: flume::Sender<UiAction>, name: String) -> LuaResult<Pair<bool>> {
+    let builtin = try_pair!(name.parse::<BuiltinAction>().map_err(|_| format!(
+        "unknown action '{name}' (valid: {})",
+        BuiltinAction::VARIANTS.join(", ")
+    )));
+    try_pair!(ui_send(Some(&tx), UiAction::Builtin(builtin)));
+    Ok((Some(true), None))
+}
+
 /// Opens {path} in the user's `$EDITOR` (e.g. vim, nano) and waits for
 /// it to close. This suspends the TUI while the editor is running.
 /// Returns the editor's exit code so you can check if the user saved.
@@ -423,7 +451,7 @@ lua_table! {
     extend "maki.ui" => pub(crate) fn add_ui_fns(), DOCS [
         buf, theme_color, highlight, markdown, humantime, terminal_size,
         display_width, truncate_text,
-        manual flash, manual open_editor, manual open_win, manual set_status_hint,
+        manual flash, manual action, manual open_editor, manual open_win, manual set_status_hint,
     ]
 }
 
@@ -437,6 +465,7 @@ pub(crate) fn create_ui_table(
 
     if let Some(tx) = ui_action_tx {
         flash__register(&t, lua, tx.clone())?;
+        action__register(&t, lua, tx.clone())?;
         open_editor__register(&t, lua, tx.clone())?;
         open_win__register(&t, lua, tx)?;
     }

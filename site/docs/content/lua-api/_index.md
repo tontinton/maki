@@ -4149,6 +4149,38 @@ maki.ui.flash("Copied to clipboard!")
 
 ---
 
+### `maki.ui.action()` {#maki-ui-action}
+
+```lua
+maki.ui.action({name})
+```
+
+Runs a built-in UI action by name, exactly as its default keybinding
+would. Handy when a default key never reaches maki because tmux or
+your terminal grabs it first: bind a new key with `maki.keymap.set`
+and call this from it.
+
+Valid names: `"file_picker"`, `"search"`, `"tasks"`, `"help"`,
+`"plan_toggle"`, `"plan_editor"`, `"edit_input"`, `"pop_queue"`,
+`"prev_chat"`, `"next_chat"`.
+
+**Parameters:**
+
+- `{name}` (`string`) Action name, e.g. `"file_picker"`.
+
+**Returns:** (`boolean|nil`, `string|nil`) `true` on success, or nil and an error message for an unknown name.
+
+**Example:**
+
+```lua
+-- Open the built-in file picker with Ctrl+Q instead of Ctrl+S:
+maki.keymap.set("n", "<C-q>", function()
+  maki.ui.action("file_picker")
+end)
+```
+
+---
+
 ### `maki.ui.open_editor()` {#maki-ui-open_editor}
 
 ```lua

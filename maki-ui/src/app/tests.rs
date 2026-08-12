@@ -13,7 +13,7 @@ use maki_agent::{
     McpSnapshotReader, ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent,
 };
 use maki_config::{PermissionsConfig, UiConfig};
-use maki_lua::{HintReader, KeymapReader, LuaCommandInfo, LuaCommandReader};
+use maki_lua::{BuiltinAction, HintReader, KeymapReader, LuaCommandInfo, LuaCommandReader};
 use maki_providers::{ContentBlock, Effort, Message, Role, TokenUsage};
 use maki_storage::sessions::{StoredMode, StoredThinking};
 use ratatui::layout::Rect;
@@ -4197,4 +4197,11 @@ fn turn_end_keeps_only_the_subagents_that_finished() {
         .map(|sa| sa.tool_use_id.as_str())
         .collect();
     assert_eq!(ids, [FINISHED_TASK_ID]);
+}
+
+#[test]
+fn run_builtin_file_picker_opens_modal() {
+    let mut app = test_app();
+    assert!(app.run_builtin(BuiltinAction::FilePicker).is_empty());
+    assert!(app.file_picker.is_open());
 }
