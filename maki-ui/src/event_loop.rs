@@ -588,6 +588,12 @@ impl<'t> EventLoop<'t> {
             UiAction::Flash(msg) => {
                 self.focused_app().flash(msg);
             }
+            UiAction::InsertInput(text) => {
+                let app = self.focused_app();
+                app.input_box.buffer.insert_text(&text);
+                let value = app.input_box.buffer.value();
+                app.command_palette.sync(&value);
+            }
             UiAction::OpenEditor { path, reply_tx } => {
                 let code = self.open_editor(self.focused, &path);
                 let _ = reply_tx.send(code);

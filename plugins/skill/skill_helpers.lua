@@ -18,7 +18,7 @@ function M.parse_frontmatter(content)
   return fm, body
 end
 
-function M.build_skill_list(skills)
+function M.sorted_skills(skills)
   local sorted = {}
   for _, s in pairs(skills) do
     sorted[#sorted + 1] = s
@@ -26,6 +26,11 @@ function M.build_skill_list(skills)
   table.sort(sorted, function(a, b)
     return a.name < b.name
   end)
+  return sorted
+end
+
+function M.build_skill_list(skills)
+  local sorted = M.sorted_skills(skills)
 
   if #sorted == 0 then
     return "\n\n<available_skills>\nNo skills available.\n</available_skills>"
@@ -36,6 +41,26 @@ function M.build_skill_list(skills)
     lines[#lines + 1] = "- " .. s.name .. ": " .. s.description
   end
   return "\n\n<available_skills>\n" .. table.concat(lines, "\n") .. "\n</available_skills>"
+end
+
+function M.build_picker_items(skills)
+  local sorted = skills[1] and skills or M.sorted_skills(skills)
+  local items = {}
+  for _, skill in ipairs(sorted) do
+    items[#items + 1] = {
+      label = skill.name,
+      detail = skill.description ~= "" and skill.description or nil,
+    }
+  end
+  return items
+end
+
+function M.build_skill_marker(skill_name, suffix)
+  local trimmed_suffix = (suffix or ""):match("^%s*(.-)%s*$")
+  if trimmed_suffix == "" then
+    return "$" .. skill_name .. " "
+  end
+  return "$" .. skill_name .. " " .. trimmed_suffix
 end
 
 return M

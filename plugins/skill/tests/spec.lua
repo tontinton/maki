@@ -1,6 +1,8 @@
 local helpers = require("skill_helpers")
 local parse_frontmatter = helpers.parse_frontmatter
 local build_skill_list = helpers.build_skill_list
+local build_picker_items = helpers.build_picker_items
+local build_skill_marker = helpers.build_skill_marker
 
 local failures = {}
 
@@ -100,6 +102,35 @@ case("build_skill_list_sorted_alphabetically", function()
   local zebra_pos = result:find("zebra")
   assert(alpha_pos < middle_pos, "alpha should come before middle")
   assert(middle_pos < zebra_pos, "middle should come before zebra")
+end)
+
+case("build_picker_items_sorted_alphabetically", function()
+  local items = build_picker_items({
+    z = { name = "zebra", description = "Z skill" },
+    a = { name = "alpha", description = "A skill" },
+  })
+  eq(items[1].label, "alpha")
+  eq(items[1].detail, "A skill")
+  eq(items[2].label, "zebra")
+end)
+
+case("build_picker_items_omits_empty_detail", function()
+  local items = build_picker_items({
+    x = { name = "xray", description = "" },
+  })
+  eq(items[1].detail, nil)
+end)
+
+case("build_skill_marker_without_suffix", function()
+  eq(build_skill_marker("release"), "$release ")
+end)
+
+case("build_skill_marker_with_suffix", function()
+  eq(build_skill_marker("release", "cut v1.2.3"), "$release cut v1.2.3")
+end)
+
+case("build_skill_marker_trims_blank_suffix", function()
+  eq(build_skill_marker("release", "   "), "$release ")
 end)
 
 -- ── builtin plugin_dev skill ──

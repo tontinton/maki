@@ -247,6 +247,20 @@ fn flash(_lua: &Lua, #[ctx] tx: flume::Sender<UiAction>, msg: String) -> LuaResu
     Ok(())
 }
 
+/// Inserts {text} into the main prompt input at the current cursor.
+/// Good for commands that want to generate visible prompt text instead
+/// of hidden state.
+///
+/// @param text string Text to insert.
+/// @return
+/// @example
+/// maki.ui.insert_input("$rust-review ")
+#[lua_fn]
+fn insert_input(_lua: &Lua, #[ctx] tx: flume::Sender<UiAction>, text: String) -> LuaResult<()> {
+    let _ = tx.try_send(UiAction::InsertInput(text));
+    Ok(())
+}
+
 /// Opens {path} in the user's `$EDITOR` (e.g. vim, nano) and waits for
 /// it to close. This suspends the TUI while the editor is running.
 /// Returns the editor's exit code so you can check if the user saved.
@@ -423,7 +437,7 @@ lua_table! {
     extend "maki.ui" => pub(crate) fn add_ui_fns(), DOCS [
         buf, theme_color, highlight, markdown, humantime, terminal_size,
         display_width, truncate_text,
-        manual flash, manual open_editor, manual open_win, manual set_status_hint,
+        manual flash, manual insert_input, manual open_editor, manual open_win, manual set_status_hint,
     ]
 }
 
@@ -437,6 +451,7 @@ pub(crate) fn create_ui_table(
 
     if let Some(tx) = ui_action_tx {
         flash__register(&t, lua, tx.clone())?;
+        insert_input__register(&t, lua, tx.clone())?;
         open_editor__register(&t, lua, tx.clone())?;
         open_win__register(&t, lua, tx)?;
     }

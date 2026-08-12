@@ -783,6 +783,14 @@ impl App {
         if key::EDIT_INPUT.matches(key) {
             return vec![Action::EditInputInEditor];
         }
+        if key::SKILL_PICKER.matches(key) {
+            if self.command_palette.find_lua_command("/skill").is_some() {
+                self.run_lua_command("/skill", String::new());
+            } else {
+                self.flash("Skill picker unavailable".into());
+            }
+            return vec![];
+        }
         if is_ctrl(&key) {
             if key::POP_QUEUE.matches(key) {
                 self.queue.remove(0);
