@@ -994,6 +994,26 @@ mod tests {
     }
 
     #[test]
+    fn discovered_vision_flows_into_curated_provider_model() {
+        use crate::model::ModelInfo;
+
+        model_registry::set_known_models(
+            "synthetic",
+            vec![
+                ModelInfo {
+                    supports_vision: Some(true),
+                    ..ModelInfo::id_only("syn:test-vision".into())
+                },
+                ModelInfo::id_only("syn:test-blind".into()),
+            ],
+        );
+
+        let vision = |id| Model::from_spec(id).unwrap().supports_vision();
+        assert!(vision("synthetic/syn:test-vision"));
+        assert!(!vision("synthetic/syn:test-blind"));
+    }
+
+    #[test]
     fn discovered_context_window_flows_into_from_base_for_unknown_model() {
         use crate::model::ModelInfo;
 

@@ -225,36 +225,39 @@ impl OpenAiCompatProvider {
             .or_else(|| m["max_model_len"].as_u64())
             .or_else(|| m["max_context_length"].as_u64())
             .and_then(|v| u32::try_from(v).ok());
-        let max_output_tokens = m["max_tokens"].as_u64().and_then(|v| u32::try_from(v).ok());
-        let pricing = m["pricing"]
-            .as_object()
-            .and_then(|p| {
-                Some(crate::model::ModelPricing {
-                    input: p.get("prompt")?.as_str()?.parse().ok()?,
-                    output: p.get("completion")?.as_str()?.parse().ok()?,
-                    cache_write: p
-                        .get("cache_creation")?
-                        .as_str()?
-                        .parse::<f64>()
-                        .ok()
-                        .unwrap_or(0.0),
-                    cache_read: p
-                        .get("cache_read")?
-                        .as_str()?
-                        .parse::<f64>()
-                        .ok()
-                        .unwrap_or(0.0),
-                    fast: None,
-                })
+        let max_output_tokens = m["max_tokens"]
+            .as_u64()
+            .or_else(|| m["max_output_length"].as_u64())
+            .and_then(|v| u32::try_from(v).ok());
+        let supports_vision = m["input_modalities"]
+            .as_array()
+            .map(|mods| mods.iter().any(|v| v.as_str() == Some("image")));
+        let pricing = m["pricing"].as_object().and_then(|p| {
+            Some(crate::model::ModelPricing {
+                input: p.get("prompt")?.as_str()?.parse().ok()?,
+                output: p.get("completion")?.as_str()?.parse().ok()?,
+                cache_write: p
+                    .get("cache_creation")?
+                    .as_str()?
+                    .parse::<f64>()
+                    .ok()
+                    .unwrap_or(0.0),
+                cache_read: p
+                    .get("cache_read")?
+                    .as_str()?
+                    .parse::<f64>()
+                    .ok()
+                    .unwrap_or(0.0),
+                fast: None,
             })
-            .unwrap_or_default();
+        });
         Some(crate::model::ModelInfo {
             id: id.to_string(),
             context_window,
             max_output_tokens,
-            pricing: Some(pricing),
+            pricing,
             supports_thinking: None,
-            supports_vision: None,
+            supports_vision,
             tier: None,
             provider_info: None,
         })
@@ -704,6 +707,28 @@ mod tests {
     use test_case::test_case;
 
     const TEST_STREAM_TIMEOUT: Duration = Duration::from_secs(300);
+
+    #[test]
+    fn default_model_parser_reads_context_and_output_length() {
+        let m = json!({"id": "m", "context_length": 524_288, "max_output_length": 65_536});
+        let info = OpenAiCompatProvider::default_model_parser(&m).unwrap();
+        assert_eq!(info.context_window, Some(524_288));
+        assert_eq!(info.max_output_tokens, Some(65_536));
+    }
+
+    #[test]
+    fn default_model_parser_missing_pricing_stays_none() {
+        let info = OpenAiCompatProvider::default_model_parser(&json!({"id": "m"})).unwrap();
+        assert!(info.pricing.is_none());
+    }
+
+    #[test_case(json!({"id": "m", "input_modalities": ["text", "image"]}), Some(true) ; "image_modality_enables_vision")]
+    #[test_case(json!({"id": "m", "input_modalities": ["text"]}), Some(false) ; "text_only_disables_vision")]
+    #[test_case(json!({"id": "m"}), None ; "missing_modalities_stays_unknown")]
+    fn default_model_parser_vision_flag(m: Value, expected: Option<bool>) {
+        let info = OpenAiCompatProvider::default_model_parser(&m).unwrap();
+        assert_eq!(info.supports_vision, expected);
+    }
 
     #[test]
     fn parse_sse_text_and_usage() {

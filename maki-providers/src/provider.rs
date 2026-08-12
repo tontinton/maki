@@ -428,11 +428,9 @@ pub async fn fetch_all_models(
         smol::spawn(async move {
             let batch = match provider.list_models().await {
                 Ok(models) => {
-                    if manifest.accepts_arbitrary_models {
-                        crate::model_registry::set_known_models(slug, models.clone());
-                    }
                     let mut specs: Vec<String> =
                         models.iter().map(|m| format!("{slug}/{}", m.id)).collect();
+                    crate::model_registry::set_known_models(slug, models);
                     for entry in manifest.models {
                         for prefix in entry.prefixes {
                             let spec = format!("{slug}/{prefix}");
