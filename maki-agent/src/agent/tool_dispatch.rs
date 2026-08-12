@@ -10,7 +10,7 @@ use tracing::{debug, error, warn};
 use crate::mcp::{McpSession, TOOL_SEARCH_TOOL_NAME, UNKNOWN_MCP};
 use crate::task_set::TaskSet;
 use crate::tools::registry::{ToolInvocation, ToolRegistry};
-use crate::tools::{LocalToolFn, ToolContext};
+use crate::tools::{LocalToolFn, ToolContext, truncate_bytes};
 use crate::{AgentError, AgentEvent, ToolDoneEvent, ToolOutput, ToolStartEvent};
 use maki_config::ToolKey;
 
@@ -24,6 +24,7 @@ const DOOM_LOOP_THRESHOLD: usize = 3;
 const DOOM_LOOP_MESSAGE: &str = "You have called this tool with identical input 3 times in a row. You are stuck in a loop. Break out and try a different approach.";
 const MCP_BLOCKED_IN_PLAN: &str = "MCP tools are not available in plan mode";
 const UNKNOWN_TOOL_PREFIX: &str = "unknown tool";
+const MCP_PERM_SCOPE_MAX_BYTES: usize = 200;
 
 pub(super) struct RecentCalls(VecDeque<(String, u64)>);
 
@@ -342,14 +343,7 @@ async fn execute_mcp_tool(
             return done(format!("invalid MCP tool key '{tool_name}': {e}"), true);
         }
     };
-    let perm_scope = {
-        let json = input.to_string();
-        if json.len() > 200 {
-            format!("{}\u{2026}", &json[..200])
-        } else {
-            json
-        }
-    };
+    let perm_scope = truncate_bytes(&input.to_string(), MCP_PERM_SCOPE_MAX_BYTES);
     let perm_scopes = crate::tools::PermissionScopes::single(perm_scope);
 
     if let Err(e) = ctx

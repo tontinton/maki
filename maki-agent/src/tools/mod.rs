@@ -631,6 +631,7 @@ mod tests {
     #[test_case(&"x".repeat(LINE_LIMIT),       &"x".repeat(LINE_LIMIT)        ; "exact_boundary")]
     #[test_case(&"x".repeat(LINE_LIMIT + 500), &format!("{}...", "x".repeat(LINE_LIMIT)) ; "long_truncated")]
     #[test_case(&format!("{}\u{1F600}", "a".repeat(LINE_LIMIT - 1)), &format!("{}...", "a".repeat(LINE_LIMIT - 1)) ; "multibyte_char_boundary")]
+    #[test_case(&format!("{}\u{0430}tail", "a".repeat(LINE_LIMIT - 1)), &format!("{}...", "a".repeat(LINE_LIMIT - 1)) ; "two_byte_char_boundary")]
     fn truncate_bytes_cases(input: &str, expected: &str) {
         let result = truncate_bytes(input, LINE_LIMIT);
         assert_eq!(result, expected);
