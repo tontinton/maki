@@ -3,7 +3,7 @@ use maki_ui::keybindings::{ALT_SEP, KEYBINDS, KeyLabel, KeybindContext, Platform
 const FRONTMATTER: &str = "\
 +++
 title = \"Keybindings\"
-weight = 5
+weight = 9
 [extra]
 group = \"Reference\"
 +++";

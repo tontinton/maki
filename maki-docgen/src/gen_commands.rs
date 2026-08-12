@@ -12,7 +12,7 @@ pub fn generate() -> String {
     let mut out = String::new();
     writeln!(out, "+++").unwrap();
     writeln!(out, "title = \"Commands\"").unwrap();
-    writeln!(out, "weight = 4").unwrap();
+    writeln!(out, "weight = 8").unwrap();
     writeln!(out, "[extra]").unwrap();
     writeln!(out, "group = \"Reference\"").unwrap();
     writeln!(out, "+++").unwrap();

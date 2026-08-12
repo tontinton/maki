@@ -209,7 +209,7 @@ fn redact_def(def: &Value) -> Value {
 fn write_front_matter(out: &mut String) {
     writeln!(out, "+++").unwrap();
     writeln!(out, "title = \"Tools\"").unwrap();
-    writeln!(out, "weight = 6").unwrap();
+    writeln!(out, "weight = 4").unwrap();
     writeln!(out, "[extra]").unwrap();
     writeln!(out, "group = \"Reference\"").unwrap();
     writeln!(out, "+++").unwrap();

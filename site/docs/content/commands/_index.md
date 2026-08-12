@@ -1,6 +1,6 @@
 +++
 title = "Commands"
-weight = 4
+weight = 8
 [extra]
 group = "Reference"
 +++

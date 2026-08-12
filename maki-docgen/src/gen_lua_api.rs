@@ -2,7 +2,7 @@ use maki_lua::docs_render;
 
 const FRONTMATTER: &str = r#"+++
 title = "Lua API"
-weight = 11
+weight = 10
 [extra]
 group = "Reference"
 +++

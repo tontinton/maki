@@ -1,8 +1,8 @@
 +++
 title = "ACP"
-weight = 14
+weight = 22
 [extra]
-group = "Reference"
+group = "Guides"
 +++
 
 # ACP (Agent Client Protocol)

@@ -5,37 +5,46 @@ sort_by = "weight"
 
 # Maki Docs
 
-Maki is a terminal coding agent written in Rust. Point it at a codebase, pick an LLM provider, and it reads, edits, searches, and runs code for you while keeping token usage low.
+Maki is a terminal coding agent written in Rust, built bottom up to spend as few tokens as possible without getting dumber. Point it at a repo, pick a provider, and it reads, searches, edits, and runs code for you.
 
-This page is a map of the docs. Skim it once, then jump to what you need.
+The docs are sorted by what you came here to do:
 
-## Start here
+```
+new to maki          ─►  Quick Start, Configuration
+getting things done  ─►  Guides: Skills, Headless Mode, ACP
+looking something up ─►  Reference: Tools, Providers, Permissions, ...
+wondering why        ─►  Concepts: Token Economy, Context
+```
 
-New to Maki? Two pages get you going:
+## Getting started
 
-- [Quick Start](/docs/quick-start/) installs Maki and connects your first provider. Takes a few minutes.
-- [Configuration](/docs/configuration/) covers `init.lua`, the small Lua script where all settings live.
+- [Quick Start](/docs/quick-start/): install, connect a provider, first session.
+- [Configuration](/docs/configuration/): `init.lua`, the small Lua script where all settings live.
 
-## Everyday use
+## Guides
 
-Answers to the "how do I..." questions once Maki is running:
-
-- [Commands](/docs/commands/): `/` palette, concurrent sessions (`/new`, `/sessions`), toggles, and custom commands.
-- [Keybindings](/docs/keybindings/): move around the TUI without touching the mouse. Prefix input with `!` to run a shell command yourself.
-- [Tools](/docs/tools/): the full reference for the built-in tools the agent works with (including `memory` and `skill`).
-- [Permissions](/docs/permissions/): which tools are gated, YOLO, and when Maki asks first.
-- [Skills](/docs/skills/): on-demand Markdown playbooks the agent can load for a workflow.
-
-## Connecting things
-
-- [Providers](/docs/providers/): Anthropic, OpenAI, Ollama, and friends, plus `providers.toml` and model tiers.
-- [MCP](/docs/mcp/): plug in external tool servers over stdio or HTTP.
-
-## Extending and embedding
-
-- [Lua API](/docs/lua-api/): write plugins in Lua with an API that mirrors Neovim.
-- [CLI](/docs/cli/): flags and subcommands (`auth`, `models`, `acp`, `prompt`, ...).
-- [Headless Mode](/docs/headless/): run Maki with `--print` in scripts and CI. Output is Claude Code compatible.
+- [Skills](/docs/skills/): write Markdown playbooks the agent loads on demand.
+- [Headless Mode](/docs/headless/): `--print` for scripts and CI. Drop-in Claude Code compatible.
 - [ACP](/docs/acp/): drive Maki from your editor, like [Zed](https://zed.dev/), over the Agent Client Protocol.
+
+## Concepts
+
+How Maki thinks, worth one read:
+
+- [Token Economy](/docs/token-economy/): where tokens go in an agent loop, and every trick Maki uses to spend fewer of them.
+- [Context](/docs/context/): what enters the model's context and when, and where to put project knowledge (`AGENTS.md`, skills, memory, commands).
+
+## Reference
+
+Look-up material, most of it generated straight from source so it cannot drift:
+
+- [Tools](/docs/tools/): every built-in tool and its parameters.
+- [Providers](/docs/providers/): model catalogs, env vars, `providers.toml`, model tiers.
+- [Permissions](/docs/permissions/): what runs freely, what asks first, TOML rules.
+- [MCP](/docs/mcp/): external tool servers over stdio or HTTP.
+- [Commands](/docs/commands/): the `/` palette, sessions, toggles, custom commands.
+- [Keybindings](/docs/keybindings/): defaults, precedence, rebinding from Lua.
+- [Lua API](/docs/lua-api/): the plugin surface, mirrored from Neovim.
+- [CLI](/docs/cli/): flags and subcommands (`auth`, `models`, `acp`, `prompt`, ...).
 
 Something missing or wrong? Open an issue on [GitHub](https://github.com/tontinton/maki).

@@ -307,7 +307,7 @@ Safe to run more than once.
 
 ## Personal Instructions
 
-On top of the project instruction files Maki loads from the git root down to the cwd (`AGENTS.md`, `CLAUDE.md`, and friends; see [Quick Start](/docs/quick-start/#instruction-files)), you can add:
+On top of the project instruction files Maki loads from the git root down to the cwd (`AGENTS.md`, `CLAUDE.md`, and friends; see [Context](/docs/context/#instruction-files)), you can add:
 
 - `AGENTS.local.md` in any of those project directories for per-directory preferences (gitignored)
 - `~/.config/maki/AGENTS.md` for preferences that apply to all projects
@@ -322,7 +322,7 @@ The `memory` tool and `/memory` command store small Markdown notes under the sta
 
 (Linux/macOS: `~/.local/state/maki/…`; Windows: `%APPDATA%\\maki\\…`). Use them for non-obvious gotchas and decisions that should survive across sessions. They are separate from skills and from `AGENTS.md`.
 
-Related pages: [Skills](/docs/skills/), [CLI](/docs/cli/), [Providers](/docs/providers/#providerstoml)."
+Related pages: [Skills](/docs/skills/), [CLI](/docs/cli/), [Providers](/docs/providers/#providers-toml)."
     )
     .unwrap();
 

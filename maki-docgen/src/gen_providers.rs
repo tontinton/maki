@@ -6,7 +6,7 @@ use strum::IntoEnumIterator;
 
 const FRONT_MATTER: &str = r#"+++
 title = "Providers"
-weight = 7
+weight = 5
 [extra]
 group = "Reference"
 +++"#;

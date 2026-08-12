@@ -1,6 +1,6 @@
 +++
 title = "Permissions"
-weight = 8
+weight = 6
 [extra]
 group = "Reference"
 +++
@@ -19,12 +19,24 @@ Any matching deny blocks the tool. No exceptions.
 
 ## Check Flow
 
-For every tool call, Maki resolves permission like this:
+For every tool call, each scope resolves like this:
 
-1. **Deny wins**: if any rule from any layer matches the tool and scope with a deny, the call is blocked immediately.
-2. If **YOLO** is active and no deny matched, allowed.
-3. **Plan file auto-allow**: file write tools targeting the plan file path are allowed automatically (only if no deny rule matched in step 1). In plan mode, writes to any other path are rejected before this step, and MCP tools are blocked entirely.
-4. Fall back to `default` (per-tool, then global). Built-in default is `"prompt"`.
+```
+tool call
+    │
+deny rule matches?  ── yes ──►  blocked. no exceptions
+    │ no
+allow rule matches? ── yes ──►  runs
+    │ no
+YOLO active?        ── yes ──►  runs
+    │ no
+plan file write?    ── yes ──►  runs
+    │ no
+    ▼
+default: prompt / allow / deny
+```
+
+Deny rules are checked across all three layers before anything else, so a deny cannot be bypassed by YOLO or the plan-file auto-allow. In plan mode, writes to any path other than the plan file are rejected before this flow, and MCP tools are blocked entirely. `default` resolves per-tool first, then global; the built-in default is `"prompt"`.
 
 ## Builtin Defaults
 
