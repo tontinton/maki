@@ -97,4 +97,32 @@ summary=$(first_paragraph docs/content/_index.md)
   done
 } > "$OUT/llms-full.txt"
 
+# 4. Search index (lazy-loaded by the docs search modal)
+python3 - "$OUT/docs/search.json" docs/content <<'EOF'
+import json, os, re, sys
+
+out, root = sys.argv[1], sys.argv[2]
+docs = []
+for slug in os.listdir(root):
+    path = os.path.join(root, slug, "_index.md")
+    if not os.path.isfile(path):
+        continue
+    raw = open(path, encoding="utf-8").read()
+    m = re.match(r"\+\+\+\n(.*?)\n\+\+\+\n", raw, re.S)
+    fm, body = m.group(1), raw[m.end():]
+    title = re.search(r'^title = "(.*)"$', fm, re.M).group(1)
+    weight = re.search(r"^weight = (\d+)$", fm, re.M)
+    body = re.sub(r"^```.*$", "", body, flags=re.M)
+    body = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", body)
+    body = re.sub(r"<[^>]+>", " ", body)
+    body = re.sub(r"[#*`|]", " ", body)
+    body = re.sub(r"-{3,}", " ", body)
+    body = re.sub(r"\s+", " ", body).strip()
+    docs.append((int(weight.group(1)) if weight else 999,
+                 {"title": title, "href": f"/docs/{slug}/", "body": body}))
+docs.sort(key=lambda d: d[0])
+with open(out, "w", encoding="utf-8") as f:
+    json.dump([d for _, d in docs], f, ensure_ascii=False)
+EOF
+
 cp "$OUT/llms.txt" "$OUT/llms-full.txt" "$OUT/docs/"

@@ -9,42 +9,55 @@ Maki is a terminal coding agent written in Rust, built bottom up to spend as few
 
 The docs are sorted by what you came here to do:
 
-```
-new to maki          ─►  Quick Start, Configuration
-getting things done  ─►  Guides: Skills, Headless Mode, ACP
-looking something up ─►  Reference: Tools, Providers, Permissions, ...
-wondering why        ─►  Concepts: Token Economy, Context
-```
+<div class="doc-group">
+  <div class="doc-group-head">
+    <span class="eyebrow">Getting Started</span>
+    <span class="tagline">new to maki</span>
+  </div>
+  <div class="card-grid">
+    <a class="card" href="/docs/quick-start/"><span class="card-title">Quick Start</span><span class="card-desc">Install, connect a provider, first session.</span></a>
+    <a class="card" href="/docs/configuration/"><span class="card-title">Configuration</span><span class="card-desc">init.lua, the small Lua script where all settings live.</span></a>
+  </div>
+</div>
 
-## Getting started
+<div class="doc-group">
+  <div class="doc-group-head">
+    <span class="eyebrow">Guides</span>
+    <span class="tagline">getting things done</span>
+  </div>
+  <div class="card-grid">
+    <a class="card" href="/docs/skills/"><span class="card-title">Skills</span><span class="card-desc">Write Markdown playbooks the agent loads on demand.</span></a>
+    <a class="card" href="/docs/headless/"><span class="card-title">Headless Mode</span><span class="card-desc">--print for scripts and CI. Drop-in Claude Code compatible.</span></a>
+    <a class="card" href="/docs/acp/"><span class="card-title">ACP</span><span class="card-desc">Drive Maki from your editor, like Zed, over the Agent Client Protocol.</span></a>
+  </div>
+</div>
 
-- [Quick Start](/docs/quick-start/): install, connect a provider, first session.
-- [Configuration](/docs/configuration/): `init.lua`, the small Lua script where all settings live.
+<div class="doc-group">
+  <div class="doc-group-head">
+    <span class="eyebrow">Concepts</span>
+    <span class="tagline">wondering why</span>
+  </div>
+  <div class="card-grid">
+    <a class="card" href="/docs/token-economy/"><span class="card-title">Token Economy</span><span class="card-desc">Where tokens go in an agent loop, and every trick Maki uses to spend fewer of them.</span></a>
+    <a class="card" href="/docs/context/"><span class="card-title">Context</span><span class="card-desc">What enters the model's context and when, and where to put project knowledge.</span></a>
+  </div>
+</div>
 
-## Guides
-
-- [Skills](/docs/skills/): write Markdown playbooks the agent loads on demand.
-- [Headless Mode](/docs/headless/): `--print` for scripts and CI. Drop-in Claude Code compatible.
-- [ACP](/docs/acp/): drive Maki from your editor, like [Zed](https://zed.dev/), over the Agent Client Protocol.
-
-## Concepts
-
-How Maki thinks, worth one read:
-
-- [Token Economy](/docs/token-economy/): where tokens go in an agent loop, and every trick Maki uses to spend fewer of them.
-- [Context](/docs/context/): what enters the model's context and when, and where to put project knowledge (`AGENTS.md`, skills, memory, commands).
-
-## Reference
-
-Look-up material, most of it generated straight from source so it cannot drift:
-
-- [Tools](/docs/tools/): every built-in tool and its parameters.
-- [Providers](/docs/providers/): model catalogs, env vars, `providers.toml`, model tiers.
-- [Permissions](/docs/permissions/): what runs freely, what asks first, TOML rules.
-- [MCP](/docs/mcp/): external tool servers over stdio or HTTP.
-- [Commands](/docs/commands/): the `/` palette, sessions, toggles, custom commands.
-- [Keybindings](/docs/keybindings/): defaults, precedence, rebinding from Lua.
-- [Lua API](/docs/lua-api/): the plugin surface, mirrored from Neovim.
-- [CLI](/docs/cli/): flags and subcommands (`auth`, `models`, `acp`, `prompt`, ...).
+<div class="doc-group">
+  <div class="doc-group-head">
+    <span class="eyebrow">Reference</span>
+    <span class="tagline">looking something up</span>
+  </div>
+  <div class="card-grid">
+    <a class="card" href="/docs/tools/"><span class="card-title">Tools</span><span class="card-desc">Every built-in tool and its parameters.</span></a>
+    <a class="card" href="/docs/providers/"><span class="card-title">Providers</span><span class="card-desc">Model catalogs, env vars, providers.toml, model tiers.</span></a>
+    <a class="card" href="/docs/permissions/"><span class="card-title">Permissions</span><span class="card-desc">What runs freely, what asks first, TOML rules.</span></a>
+    <a class="card" href="/docs/mcp/"><span class="card-title">MCP</span><span class="card-desc">External tool servers over stdio or HTTP.</span></a>
+    <a class="card" href="/docs/commands/"><span class="card-title">Commands</span><span class="card-desc">The / palette, sessions, toggles, custom commands.</span></a>
+    <a class="card" href="/docs/keybindings/"><span class="card-title">Keybindings</span><span class="card-desc">Defaults, precedence, rebinding from Lua.</span></a>
+    <a class="card" href="/docs/lua-api/"><span class="card-title">Lua API</span><span class="card-desc">The plugin surface, mirrored from Neovim.</span></a>
+    <a class="card" href="/docs/cli/"><span class="card-title">CLI</span><span class="card-desc">Flags and subcommands (auth, models, acp, prompt, ...).</span></a>
+  </div>
+</div>
 
 Something missing or wrong? Open an issue on [GitHub](https://github.com/tontinton/maki).
