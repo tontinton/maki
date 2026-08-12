@@ -24,33 +24,35 @@
   </script>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Nunito:wght@400;700;800&family=Fraunces:opsz,wght@9..144,700&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;700&,wght@0,400;0,700;1,400&family=Nunito:wght@400;700;800&family=Fraunces:opsz,wght@9..144,700&display=swap" rel="stylesheet">
   <style>
     *,*::before,*::after { margin: 0; padding: 0; box-sizing: border-box; }
 
     :root {
       color-scheme: light;
-      --lavender: oklch(85% 0.06 280);
-      --periwinkle: oklch(78% 0.08 275);
+      --lavender: oklch(86% 0.05 85);
+      --periwinkle: oklch(76% 0.08 80);
       --soft-pink: oklch(82% 0.06 350);
       --salmon: oklch(62% 0.14 40);
       --cream: oklch(97% 0.015 90);
-      --deep-navy: oklch(22% 0.04 270);
-      --text-primary: oklch(22% 0.04 270);
-      --text-secondary: oklch(40% 0.03 270);
-      --text-muted: oklch(52% 0.03 270);
-      --sidebar-bg: oklch(95.5% 0.025 278 / 0.6);
-      --border-subtle: oklch(88% 0.04 278);
-      --border-light: oklch(91% 0.03 280);
-      --accent: oklch(48% 0.14 275);
-      --accent-soft: oklch(92% 0.05 275);
-      --accent-hover: oklch(42% 0.16 275);
-      --code-bg: oklch(94% 0.03 278);
-      --code-block-bg: #1E1E2E;
-
-      --code-block-fg: oklch(86% 0.02 270);
-      --surface-card: oklch(99% 0.008 280 / 0.75);
-      --card-border: oklch(89% 0.035 278);
+      --deep-navy: oklch(25% 0.03 60);
+      --text-primary: oklch(25% 0.03 60);
+      --text-secondary: oklch(41% 0.025 65);
+      --text-muted: oklch(52% 0.025 70);
+      --sidebar-bg: oklch(95.5% 0.02 90 / 0.6);
+      --border-subtle: oklch(88% 0.03 85);
+      --border-light: oklch(91% 0.025 88);
+      --accent: oklch(47% 0.11 50);
+      --accent-soft: oklch(92% 0.045 80);
+      --accent-hover: oklch(41% 0.13 45);
+      --code-bg: oklch(93.5% 0.025 92);
+      --code-paper: oklch(94.5% 0.02 92);
+      --code-border: oklch(87% 0.03 92);
+      --code-caption: oklch(56% 0.035 75);
+      --code-selection: oklch(87% 0.06 85 / 0.5);
+      --code-scrollbar: oklch(80% 0.035 90);
+      --surface-card: oklch(99% 0.008 90 / 0.75);
+      --card-border: oklch(89% 0.03 88);
       --sidebar-w: 240px;
       --toc-w: 250px;
       --content-max: 740px;
@@ -59,51 +61,50 @@
       --ease-smooth: cubic-bezier(0.4, 0, 0.2, 1);
 
       --sky-wash:
-        radial-gradient(55% 80% at 82% -12%, oklch(88% 0.055 350 / 0.35), transparent 62%),
-        linear-gradient(180deg, oklch(92% 0.05 276 / 0.65), oklch(94% 0.03 278 / 0.25) 55%, transparent 85%);
+        radial-gradient(55% 80% at 82% -12%, oklch(89% 0.05 45 / 0.35), transparent 62%),
+        linear-gradient(180deg, oklch(93% 0.04 85 / 0.65), oklch(95% 0.025 88 / 0.25) 55%, transparent 85%);
       --topnav-bg: oklch(97% 0.015 90 / 0.97);
-      --topnav-border: oklch(88% 0.04 280 / 0.35);
-      --topnav-shadow: oklch(70% 0.06 280 / 0.06);
-      --topnav-shadow-deep: oklch(70% 0.06 280 / 0.08);
-      --topnav-scrolled-border: oklch(88% 0.04 280 / 0.5);
-      --sidebar-sep: oklch(78% 0.04 280 / 0.3);
-      --sidebar-border: oklch(88% 0.04 280 / 0.3);
-      --sidebar-label-color: oklch(62% 0.04 275);
-      --sidebar-hover-bg: oklch(92% 0.04 278 / 0.5);
-      --sidebar-active-bg: oklch(92% 0.05 275 / 0.5);
-      --sidebar-scrollbar: oklch(80% 0.04 278);
-      --inline-code-color: oklch(38% 0.10 275);
-      --inline-code-border: oklch(89% 0.03 278);
-      --code-block-border: oklch(28% 0.03 275);
-      --table-head-bg: oklch(94% 0.03 278);
-      --table-border: oklch(88% 0.04 278);
-      --table-row-border: oklch(92% 0.02 280);
-      --table-th-color: oklch(42% 0.05 275);
-      --table-hover-bg: oklch(96% 0.02 278);
-      --blockquote-bg: oklch(94.5% 0.03 278 / 0.5);
+      --topnav-border: oklch(88% 0.03 85 / 0.35);
+      --topnav-shadow: oklch(70% 0.05 80 / 0.06);
+      --topnav-shadow-deep: oklch(70% 0.05 80 / 0.08);
+      --topnav-scrolled-border: oklch(88% 0.03 85 / 0.5);
+      --sidebar-sep: oklch(78% 0.035 85 / 0.3);
+      --sidebar-border: oklch(88% 0.03 85 / 0.3);
+      --sidebar-label-color: oklch(60% 0.04 75);
+      --sidebar-hover-bg: oklch(92% 0.035 85 / 0.5);
+      --sidebar-active-bg: oklch(91% 0.05 80 / 0.5);
+      --sidebar-scrollbar: oklch(80% 0.035 85);
+      --inline-code-color: oklch(40% 0.06 60);
+      --inline-code-border: oklch(86.5% 0.035 90);
+      --table-head-bg: oklch(93.5% 0.025 90);
+      --table-border: oklch(88% 0.03 85);
+      --table-row-border: oklch(92% 0.02 88);
+      --table-th-color: oklch(44% 0.05 60);
+      --table-hover-bg: oklch(96% 0.02 90);
+      --blockquote-bg: oklch(94.5% 0.025 88 / 0.5);
       --tip-accent: oklch(60% 0.11 155);
       --tip-bg: oklch(94% 0.03 155 / 0.4);
       --warn-accent: oklch(65% 0.13 45);
       --warn-bg: oklch(95% 0.03 60 / 0.5);
-      --marker-color: oklch(68% 0.06 275);
-      --hr-color: oklch(88% 0.04 280);
-      --link-underline: oklch(55% 0.12 275 / 0.25);
-      --h2-rule: oklch(88% 0.04 278 / 0.7);
-      --h3-code-border: oklch(88% 0.05 275);
-      --search-input-border: oklch(86% 0.04 278);
-      --search-input-bg: oklch(98% 0.01 280 / 0.7);
-      --search-placeholder: oklch(68% 0.03 275);
-      --search-hint-color: oklch(65% 0.03 275);
-      --search-hint-bg: oklch(94% 0.03 278);
-      --search-hint-border: oklch(88% 0.04 278);
-      --search-results-bg: oklch(98% 0.01 280);
-      --search-results-border: oklch(88% 0.04 278);
-      --search-results-shadow: oklch(60% 0.04 280 / 0.14);
-      --search-result-border: oklch(92% 0.02 280);
-      --search-result-hover: oklch(94% 0.04 278);
-      --overlay-bg: oklch(20% 0.02 270 / 0.3);
-      --mobile-sidebar-shadow: oklch(20% 0.02 270 / 0.1);
-      --kbd-shadow: oklch(80% 0.04 278);
+      --marker-color: oklch(66% 0.06 70);
+      --hr-color: oklch(88% 0.03 85);
+      --link-underline: oklch(52% 0.10 50 / 0.3);
+      --h2-rule: oklch(88% 0.03 85 / 0.7);
+      --h3-code-border: oklch(87% 0.045 80);
+      --search-input-border: oklch(86% 0.035 85);
+      --search-input-bg: oklch(98% 0.01 90 / 0.7);
+      --search-placeholder: oklch(66% 0.03 75);
+      --search-hint-color: oklch(63% 0.03 75);
+      --search-hint-bg: oklch(94% 0.025 88);
+      --search-hint-border: oklch(88% 0.03 85);
+      --search-results-bg: oklch(98% 0.01 90);
+      --search-results-border: oklch(88% 0.03 85);
+      --search-results-shadow: oklch(60% 0.04 80 / 0.14);
+      --search-result-border: oklch(92% 0.02 88);
+      --search-result-hover: oklch(93% 0.03 85);
+      --overlay-bg: oklch(25% 0.02 60 / 0.3);
+      --mobile-sidebar-shadow: oklch(25% 0.02 60 / 0.1);
+      --kbd-shadow: oklch(82% 0.03 85);
     }
 
     [data-theme="dark"] {
@@ -123,9 +124,11 @@
       --accent-soft: oklch(25% 0.05 275);
       --accent-hover: oklch(78% 0.13 275);
       --code-bg: oklch(22% 0.025 275);
-      --code-block-bg: #1E1E2E;
-
-      --code-block-fg: oklch(82% 0.02 270);
+      --code-paper: oklch(20.5% 0.028 277);
+      --code-border: oklch(27% 0.03 276);
+      --code-caption: oklch(58% 0.025 275);
+      --code-selection: oklch(45% 0.08 275 / 0.5);
+      --code-scrollbar: oklch(35% 0.03 275);
       --surface-card: oklch(19.5% 0.025 273 / 0.7);
       --card-border: oklch(27% 0.03 275);
 
@@ -157,7 +160,6 @@
       --sidebar-scrollbar: oklch(35% 0.03 275);
       --inline-code-color: oklch(72% 0.08 275);
       --inline-code-border: oklch(28% 0.03 275);
-      --code-block-border: oklch(26% 0.03 275);
       --table-head-bg: oklch(20% 0.025 275);
       --table-border: oklch(26% 0.03 275);
       --table-row-border: oklch(22% 0.02 275);
@@ -346,7 +348,7 @@
     .search-btn .search-hint {
       margin-left: auto;
       font-size: 0.68rem;
-      font-family: 'JetBrains Mono', monospace;
+      font-family: 'IBM Plex Mono', monospace;
       color: var(--search-hint-color);
       background: var(--search-hint-bg);
       padding: 0.1rem 0.4rem;
@@ -384,7 +386,7 @@
       display: inline-flex;
       align-items: center;
       gap: 0.35rem;
-      font-family: 'JetBrains Mono', monospace;
+      font-family: 'IBM Plex Mono', monospace;
       font-size: 0.68rem;
       font-weight: 400;
       color: var(--text-muted);
@@ -451,7 +453,7 @@
     .badge {
       display: inline-block;
       vertical-align: 0.15em;
-      font-family: 'JetBrains Mono', monospace;
+      font-family: 'IBM Plex Mono', monospace;
       font-size: 0.6rem;
       font-weight: 700;
       text-transform: uppercase;
@@ -466,7 +468,7 @@
 
     .h-anchor {
       margin-left: 0.4rem;
-      font-family: 'JetBrains Mono', monospace;
+      font-family: 'IBM Plex Mono', monospace;
       font-weight: 400;
       color: var(--accent);
       text-decoration: none;
@@ -502,7 +504,7 @@
 
     /* ── INLINE CODE ── */
     code {
-      font-family: 'JetBrains Mono', 'Fira Code', monospace;
+      font-family: 'IBM Plex Mono', 'Fira Code', monospace;
       font-size: 0.84em;
       background: var(--code-bg);
       color: var(--inline-code-color);
@@ -513,43 +515,48 @@
     /* ── CODE BLOCKS ── */
     pre {
       position: relative;
-      background: var(--code-block-bg) !important;
-      color: var(--code-block-fg) !important;
-      color-scheme: dark !important;
-      padding: 1.25rem 1.5rem;
+      background: var(--code-paper);
+      border: 1px solid var(--code-border);
+      color-scheme: light !important;
+      padding: 1.05rem 1.25rem;
       overflow-x: auto;
-      margin-bottom: 1.5rem;
-      border: 1px solid var(--code-block-border);
+      margin-bottom: 1.75rem;
+      scrollbar-width: thin;
+      scrollbar-color: var(--code-scrollbar) transparent;
     }
-    .copy-btn {
-      position: absolute;
-      top: 0.5rem;
-      right: 0.5rem;
-      display: grid;
-      place-items: center;
-      width: 1.7rem;
-      height: 1.7rem;
-      padding: 0;
-      border: 1px solid oklch(40% 0.03 275 / 0.6);
-      background: oklch(25% 0.03 275 / 0.9);
-      color: oklch(70% 0.02 270);
-      cursor: pointer;
-      opacity: 0;
-      transition: opacity 0.15s, color 0.15s, background 0.15s;
-    }
-    pre:hover .copy-btn, .copy-btn:focus-visible { opacity: 1; }
-    .copy-btn:hover { background: oklch(32% 0.03 275); color: oklch(90% 0.02 270); }
-    .copy-btn.copied { color: oklch(78% 0.14 150); opacity: 1; }
-    .copy-btn.copied svg:first-child, .copy-btn:not(.copied) svg:last-child { display: none; }
-    @media (hover: none) { .copy-btn { opacity: 0.7; } }
+    [data-theme="dark"] pre { color-scheme: dark !important; }
+    pre ::selection { background: var(--code-selection); }
     pre code {
+      display: block;
       background: none;
       border: none;
       padding: 0;
-      color: var(--code-block-fg);
-      font-size: 0.87rem;
-      line-height: 1.65;
+      color: inherit;
+      font-size: 0.85rem;
+      line-height: 1.7;
+      font-feature-settings: 'zero';
     }
+    .copy-btn {
+      position: absolute;
+      top: 0.55rem;
+      right: 0.75rem;
+      padding: 0.2rem 0.3rem;
+      border: none;
+      background: var(--code-paper);
+      font: 0.62rem 'IBM Plex Mono', monospace;
+      text-transform: uppercase;
+      letter-spacing: 0.16em;
+      color: var(--code-caption);
+      cursor: pointer;
+      opacity: 0;
+      transition: opacity 0.15s, color 0.15s;
+    }
+    .copy-btn::after { content: 'copy'; }
+    .copy-btn.copied::after { content: 'copied!'; }
+    pre:hover .copy-btn, .copy-btn:focus-visible { opacity: 1; }
+    .copy-btn:hover { color: var(--accent); }
+    .copy-btn.copied { color: var(--tip-accent); opacity: 1; }
+    @media (hover: none) { .copy-btn { opacity: 0.7; } }
 
     /* ── SYNTAX HIGHLIGHTING ── */
     .giallo-l { display: inline-block; min-height: 1lh; width: 100%; }
@@ -623,7 +630,7 @@
     }
     .doc-group-head .eyebrow { font-size: 0.76rem; }
     .doc-group-head .tagline {
-      font-family: 'JetBrains Mono', monospace;
+      font-family: 'IBM Plex Mono', monospace;
       font-size: 0.72rem;
       color: var(--text-muted);
     }
@@ -653,7 +660,7 @@
     }
     .card-title::before {
       content: '❯ ';
-      font-family: 'JetBrains Mono', monospace;
+      font-family: 'IBM Plex Mono', monospace;
       font-size: 0.78rem;
       color: var(--accent);
     }
@@ -736,7 +743,7 @@
     .toc .toc-h3 {
       padding-left: 1.6rem;
       font-weight: 400;
-      font-family: 'JetBrains Mono', monospace;
+      font-family: 'IBM Plex Mono', monospace;
       font-size: 0.72rem;
     }
     .toc .toc-sub { display: none; margin-bottom: 0.2rem; }
@@ -786,7 +793,7 @@
     }
     .search-row input::placeholder { color: var(--search-placeholder); }
     .search-row kbd {
-      font-family: 'JetBrains Mono', monospace;
+      font-family: 'IBM Plex Mono', monospace;
       font-size: 0.62rem;
       color: var(--search-hint-color);
       background: var(--search-hint-bg);
@@ -1060,8 +1067,6 @@
     btn.className = 'copy-btn';
     btn.type = 'button';
     btn.setAttribute('aria-label', 'Copy code');
-    btn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>'
-      + '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>';
     let timer;
     btn.addEventListener('click', async () => {
       await navigator.clipboard.writeText(code.innerText.replace(/\n$/, ''));

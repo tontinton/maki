@@ -4,7 +4,7 @@ set -e
 # Cloudflare Pages build script
 # Assembles the static landing page + Zola docs into a single output dir.
 
-ZOLA_VERSION="${ZOLA_VERSION:-0.19.2}"
+ZOLA_VERSION="${ZOLA_VERSION:-0.22.1}"
 
 if ! command -v zola >/dev/null 2>&1; then
   echo "Installing zola ${ZOLA_VERSION}..."
