@@ -62,7 +62,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
-      - uses: extractions/setup-just@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
       - run: just lint
 
   test:
@@ -73,10 +75,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
-      - uses: extractions/setup-just@v2
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-nextest
+          tool: just,cargo-nextest
       - run: sudo apt-get -o Acquire::Retries=5 install -y ripgrep
       - run: just test
 
@@ -100,7 +101,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
-      - uses: extractions/setup-just@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
       - run: just gen-docs-check
 
   build:
@@ -111,7 +114,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
-      - uses: extractions/setup-just@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
       - run: just build
 
   lint-windows:
@@ -122,7 +127,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
-      - uses: extractions/setup-just@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
       - run: just lint
 
   build-windows:
@@ -133,7 +140,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
-      - uses: extractions/setup-just@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
       - run: just build
 
   ci-pass:
