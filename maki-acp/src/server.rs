@@ -1,21 +1,26 @@
+use std::collections::HashMap;
 use std::io::Write;
-use std::path::PathBuf;
+use std::iter;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use agent_client_protocol_schema::{
     AgentNotification, AgentRequest, AgentResponse, ContentBlock, CurrentModeUpdate,
     EmbeddedResourceResource, Error as AcpError, ImageContent, JsonRpcMessage, LoadSessionRequest,
-    NewSessionRequest, Notification, PromptRequest, PromptResponse, Request, RequestId,
+    McpServer, NewSessionRequest, Notification, PromptRequest, PromptResponse, Request, RequestId,
     RequestPermissionRequest, RequestPermissionResponse, Response, SessionId, SessionModeId,
     SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
-    SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, TextContent,
-    ToolCallId, ToolCallUpdate, ToolCallUpdateFields,
+    SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
+    TextContent, ToolCallId, ToolCallUpdate, ToolCallUpdateFields,
 };
 use color_eyre::eyre::Context;
 use flume::{Receiver, Sender};
 use maki_agent::headless::{self, InteractiveHandle, InteractiveParams};
+use maki_agent::mcp::config::{RawHttpFields, RawStdioFields, RawTransport};
+use maki_agent::mcp::{self, McpHandle};
 use maki_agent::types::AgentEvent;
 use maki_agent::{AgentInput, AgentMode, Envelope, ImageMediaType, ImageSource};
+use maki_config::MAX_SERVER_NAME_LEN;
 use maki_providers::Message;
 use maki_providers::model::Model;
 use maki_providers::provider::available_model_specs;
@@ -33,6 +38,7 @@ type PendingPrompt = Arc<Mutex<Option<RequestId>>>;
 
 struct SessionState {
     handle: InteractiveHandle,
+    mcp: Option<McpHandle>,
     current_mode: AgentMode,
     current_model: String,
     pending_prompt: PendingPrompt,
@@ -102,7 +108,7 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
             handle_incoming_response(&server, &raw);
         } else if let Some(method) = raw.get("method").and_then(Value::as_str) {
             match id {
-                Some(id) => handle_request(&mut server, method, id, &raw, &params),
+                Some(id) => handle_request(&mut server, method, id, &raw, &params).await,
                 None => handle_notification(&server, method),
             }
         } else if let Some(id) = id {
@@ -120,36 +126,19 @@ fn request_id(v: &Value) -> RequestId {
     serde_json::from_value(v.clone()).unwrap_or(RequestId::Null)
 }
 
-fn handle_request(srv: &mut Server, method: &str, id: RequestId, raw: &Value, params: &AcpParams) {
+async fn handle_request(
+    srv: &mut Server,
+    method: &str,
+    id: RequestId,
+    raw: &Value,
+    params: &AcpParams,
+) {
     let result = match method {
         "initialize" => Ok(AgentResponse::InitializeResponse(
             methods::initialize_response(),
         )),
-        "session/new" => parse_params::<NewSessionRequest>(raw).map(|req| {
-            let handle = spawn_session(params, req.cwd, None, Vec::new());
-            let spec = params.model.spec();
-            let resp = methods::new_session_response(handle.session_id.as_str())
-                .config_options(vec![methods::model_config_option(&spec, &srv.model_specs)]);
-            install_session(srv, handle, spec);
-            AgentResponse::NewSessionResponse(resp)
-        }),
-        "session/load" => parse_params::<LoadSessionRequest>(raw).and_then(|req| {
-            let session_ref: SessionRef =
-                req.session_id.0.parse().map_err(|_| {
-                    AcpError::resource_not_found(Some(req.session_id.0.to_string()))
-                })?;
-            let history = load_history(session_ref.id())?;
-            let sid = SessionId::from(session_ref.to_string());
-            for update in translate::replay_history(&history) {
-                session_update(&srv.out_tx, &sid, update);
-            }
-            let handle = spawn_session(params, req.cwd, Some(session_ref), history);
-            let spec = params.model.spec();
-            let resp = methods::load_session_response()
-                .config_options(vec![methods::model_config_option(&spec, &srv.model_specs)]);
-            install_session(srv, handle, spec);
-            Ok(AgentResponse::LoadSessionResponse(resp))
-        }),
+        "session/new" => new_session(srv, raw, params).await,
+        "session/load" => load_session(srv, raw, params).await,
         "session/prompt" => match handle_prompt(srv, raw, &id) {
             Ok(()) => return,
             Err(e) => Err(e),
@@ -161,11 +150,54 @@ fn handle_request(srv: &mut Server, method: &str, id: RequestId, raw: &Value, pa
     srv.respond(id, result);
 }
 
+async fn new_session(
+    srv: &mut Server,
+    raw: &Value,
+    params: &AcpParams,
+) -> Result<AgentResponse, AcpError> {
+    let req: NewSessionRequest = parse_params(raw)?;
+    close_session(srv).await;
+    let mcp = start_mcp(&req.cwd, &req.mcp_servers).await;
+    let handle = spawn_session(params, req.cwd, None, Vec::new(), mcp.clone());
+    let spec = params.model.spec();
+    let resp = methods::new_session_response(handle.session_id.as_str())
+        .config_options(vec![methods::model_config_option(&spec, &srv.model_specs)]);
+    install_session(srv, handle, mcp, spec);
+    Ok(AgentResponse::NewSessionResponse(resp))
+}
+
+async fn load_session(
+    srv: &mut Server,
+    raw: &Value,
+    params: &AcpParams,
+) -> Result<AgentResponse, AcpError> {
+    let req: LoadSessionRequest = parse_params(raw)?;
+    let session_ref: SessionRef = req
+        .session_id
+        .0
+        .parse()
+        .map_err(|_| AcpError::resource_not_found(Some(req.session_id.0.to_string())))?;
+    let history = load_history(session_ref.id())?;
+    close_session(srv).await;
+    let mcp = start_mcp(&req.cwd, &req.mcp_servers).await;
+    let sid = SessionId::from(session_ref.to_string());
+    for update in translate::replay_history(&history) {
+        session_update(&srv.out_tx, &sid, update);
+    }
+    let handle = spawn_session(params, req.cwd, Some(session_ref), history, mcp.clone());
+    let spec = params.model.spec();
+    let resp = methods::load_session_response()
+        .config_options(vec![methods::model_config_option(&spec, &srv.model_specs)]);
+    install_session(srv, handle, mcp, spec);
+    Ok(AgentResponse::LoadSessionResponse(resp))
+}
+
 fn spawn_session(
     params: &AcpParams,
     cwd: PathBuf,
     session_id: Option<SessionRef>,
     history: Vec<Message>,
+    mcp_handle: Option<McpHandle>,
 ) -> InteractiveHandle {
     headless::spawn_interactive(InteractiveParams {
         model: params.model.clone(),
@@ -174,7 +206,7 @@ fn spawn_session(
         timeouts: params.timeouts,
         prompt_slots: Arc::clone(&params.prompt_slots),
         excluded_tools: Vec::new(),
-        mcp_handle: params.mcp_handle.clone(),
+        mcp_handle,
         initial_wd: cwd,
         session_id,
         initial_history: history,
@@ -186,7 +218,93 @@ fn spawn_session(
     })
 }
 
-fn install_session(srv: &mut Server, handle: InteractiveHandle, current_model: String) {
+/// Servers the client injects on `session/new` and `session/load`. A transport we
+/// cannot speak is dropped like a broken `mcp.toml` entry: losing one server beats
+/// losing the session.
+fn injected_servers(servers: &[McpServer]) -> Vec<(String, RawTransport)> {
+    servers
+        .iter()
+        .filter_map(|server| match server {
+            McpServer::Http(http) => Some((
+                server_name(&http.name),
+                RawTransport::Http(RawHttpFields {
+                    url: http.url.clone(),
+                    headers: pairs(&http.headers, |h| (&h.name, &h.value)),
+                    oauth: None,
+                }),
+            )),
+            McpServer::Stdio(stdio) => Some((
+                server_name(&stdio.name),
+                RawTransport::Stdio(RawStdioFields {
+                    command: iter::once(stdio.command.to_string_lossy().into_owned())
+                        .chain(stdio.args.iter().cloned())
+                        .collect(),
+                    environment: pairs(&stdio.env, |e| (&e.name, &e.value)),
+                }),
+            )),
+            _ => {
+                warn!("ignoring injected MCP server, only http and stdio are supported");
+                None
+            }
+        })
+        .collect()
+}
+
+/// Clients name their servers freely, maki names them like `mcp.toml` does.
+fn server_name(name: &str) -> String {
+    name.chars()
+        .take(MAX_SERVER_NAME_LEN)
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
+}
+
+fn pairs<T>(items: &[T], split: impl Fn(&T) -> (&String, &String)) -> HashMap<String, String> {
+    items
+        .iter()
+        .map(|item| {
+            let (name, value) = split(item);
+            (name.clone(), value.clone())
+        })
+        .collect()
+}
+
+/// MCP is per session: the client picks the cwd and may inject its own servers.
+/// Returns as soon as the config is read, the first prompt waits for the tools.
+async fn start_mcp(cwd: &Path, servers: &[McpServer]) -> Option<McpHandle> {
+    let (handle, errors) = mcp::start_with_extra(cwd, injected_servers(servers)).await;
+    if !errors.is_empty() {
+        warn!(%errors, "MCP config errors");
+    }
+    handle
+}
+
+/// Stop the old session before the next one starts, so two generations of the
+/// same MCP servers never fight over a port or a lock file.
+async fn close_session(srv: &mut Server) {
+    let Some(state) = srv.session.take() else {
+        return;
+    };
+    // The event pump dies with the session, so the prompt it owed an answer to
+    // has to be answered here or the client waits on it forever.
+    if let Some(id) = state.pending_prompt.lock().unwrap().take() {
+        let resp = PromptResponse::new(StopReason::Cancelled);
+        send(
+            &srv.out_tx,
+            Response::new(id, Ok(AgentResponse::PromptResponse(resp))),
+        );
+    }
+    state.handle.task.cancel().await;
+    if let Some(mcp) = state.mcp {
+        mcp.shutdown().await;
+    }
+}
+
+fn install_session(
+    srv: &mut Server,
+    handle: InteractiveHandle,
+    mcp: Option<McpHandle>,
+    current_model: String,
+) {
     let pending = PendingPrompt::default();
     start_event_pump(
         handle.event_rx.clone(),
@@ -196,6 +314,7 @@ fn install_session(srv: &mut Server, handle: InteractiveHandle, current_model: S
     );
     srv.session = Some(SessionState {
         handle,
+        mcp,
         current_mode: AgentMode::Build,
         current_model,
         pending_prompt: pending,
@@ -505,5 +624,59 @@ mod tests {
         let dir = StateDir::from_path(tmp.path().to_path_buf());
         let err = load_history_from(&dir, MakiId::generate()).unwrap_err();
         assert_eq!(err.code, AcpError::resource_not_found(None).code);
+    }
+
+    #[test]
+    fn converts_injected_mcp_servers() {
+        let raw = serde_json::json!({
+            "params": {
+                "sessionId": MakiId::generate().to_string(),
+                "cwd": "/project",
+                "mcpServers": [
+                    {
+                        "type": "http",
+                        "name": "kan.dev/mcp",
+                        "url": "http://127.0.0.1:41012",
+                        "headers": [{ "name": "Authorization", "value": "Bearer abc" }]
+                    },
+                    {
+                        "name": "local",
+                        "command": "/usr/bin/mcp",
+                        "args": ["--stdio"],
+                        "env": [{ "name": "TOKEN", "value": "t" }]
+                    },
+                    {
+                        "type": "sse",
+                        "name": "legacy",
+                        "url": "http://127.0.0.1:41013",
+                        "headers": []
+                    }
+                ]
+            }
+        });
+
+        let req: LoadSessionRequest = parse_params(&raw).unwrap();
+        let servers = injected_servers(&req.mcp_servers);
+        assert_eq!(servers.len(), 2, "sse is dropped, not converted");
+
+        let (name, RawTransport::Http(http)) = &servers[0] else {
+            panic!("expected http transport");
+        };
+        assert_eq!(name, "kan-dev-mcp", "wire names are coerced to valid ones");
+        assert_eq!(http.url, "http://127.0.0.1:41012");
+        assert_eq!(
+            http.headers.get("Authorization").map(String::as_str),
+            Some("Bearer abc")
+        );
+
+        let (name, RawTransport::Stdio(stdio)) = &servers[1] else {
+            panic!("expected stdio transport");
+        };
+        assert_eq!(name, "local");
+        assert_eq!(stdio.command, ["/usr/bin/mcp", "--stdio"]);
+        assert_eq!(
+            stdio.environment.get("TOKEN").map(String::as_str),
+            Some("t")
+        );
     }
 }

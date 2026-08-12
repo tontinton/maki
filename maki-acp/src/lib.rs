@@ -18,7 +18,6 @@ pub struct AcpParams {
     pub permissions_config: PermissionsConfig,
     pub timeouts: Timeouts,
     pub initial_wd: PathBuf,
-    pub mcp_handle: Option<maki_agent::McpHandle>,
     pub prompt_slots: Arc<ResolvedSlots>,
     pub yolo: bool,
     pub model_policy: Arc<ModelPolicy>,

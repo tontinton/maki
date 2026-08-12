@@ -23,6 +23,7 @@ pub mod protocol;
 pub mod stdio;
 pub mod transport;
 
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::path::{Path, PathBuf};
@@ -35,8 +36,8 @@ use serde_json::{Value, json};
 use tracing::{info, warn};
 
 use self::config::{
-    McpConfig, McpConfigErrors, McpServerInfo, McpServerStatus, OauthClientConfig, ServerConfig,
-    Transport, load_config, parse_server, transport_kind,
+    McpConfig, McpConfigErrors, McpServerInfo, McpServerStatus, OauthClientConfig, RawServerConfig,
+    RawTransport, ServerConfig, Transport, load_config, parse_server, transport_kind,
 };
 use self::error::McpError;
 use self::http::HttpTransport;
@@ -574,6 +575,28 @@ pub async fn start_connected(cwd: &Path) -> (Option<McpHandle>, McpConfigErrors)
         handle.ready().await;
     }
     (handle, config_errors)
+}
+
+/// `start` plus servers declared at runtime. `mcp.toml` wins on name, so a
+/// runtime server can never swap out the credentials the user configured or
+/// revive one they disabled.
+pub async fn start_with_extra(
+    cwd: &Path,
+    extra: Vec<(String, RawTransport)>,
+) -> (Option<McpHandle>, McpConfigErrors) {
+    let owned_cwd = cwd.to_owned();
+    let (mut config, config_errors) = smol::unblock(move || load_config(&owned_cwd)).await;
+    for (name, transport) in extra {
+        match config.mcp.entry(name) {
+            Entry::Vacant(slot) => {
+                slot.insert(RawServerConfig::runtime(transport));
+            }
+            Entry::Occupied(slot) => {
+                warn!(server = slot.key(), "runtime MCP server already configured");
+            }
+        }
+    }
+    (start_with_config(config), config_errors)
 }
 
 pub fn start_with_config(config: McpConfig) -> Option<McpHandle> {

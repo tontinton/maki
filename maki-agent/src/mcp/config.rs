@@ -149,6 +149,18 @@ pub struct RawServerConfig {
     pub transport: RawTransport,
 }
 
+impl RawServerConfig {
+    /// Server declared at runtime instead of in `mcp.toml`.
+    pub(super) fn runtime(transport: RawTransport) -> Self {
+        Self {
+            enabled: true,
+            timeout: DEFAULT_TIMEOUT_MS,
+            always_load: false,
+            transport,
+        }
+    }
+}
+
 #[derive(Deserialize, Clone)]
 #[serde(untagged)]
 pub enum RawTransport {

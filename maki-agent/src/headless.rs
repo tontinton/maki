@@ -367,6 +367,23 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
             let mut run_id: u64 = 0;
 
             while let Ok(input) = input_rx.recv_async().await {
+                let (trigger, cancel) = CancelToken::new();
+                let cancel_task = smol::spawn({
+                    let cancel_rx = cancel_rx.clone();
+                    async move {
+                        if cancel_rx.recv_async().await.is_ok() {
+                            trigger.cancel();
+                        }
+                    }
+                });
+
+                // MCP connects in the background, so a prompt that beats it waits
+                // here instead of shipping a turn without the MCP tools. The wait
+                // is racing cancel: a slow server must not pin the whole session.
+                if let Some(mcp) = &mcp {
+                    let _ = cancel.race(mcp.ready()).await;
+                }
+
                 let event_tx = EventSender::new(raw_tx.clone(), run_id);
                 let error_tx = event_tx.clone();
 
@@ -413,16 +430,6 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                     system.push('\n');
                     system.push_str(append);
                 }
-
-                let (trigger, cancel) = CancelToken::new();
-                let cancel_task = smol::spawn({
-                    let cancel_rx = cancel_rx.clone();
-                    async move {
-                        if cancel_rx.recv_async().await.is_ok() {
-                            trigger.cancel();
-                        }
-                    }
-                });
 
                 while answer_rx.lock().await.try_recv().is_ok() {}
 

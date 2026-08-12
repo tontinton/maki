@@ -26,6 +26,8 @@ pub const DEFAULT_MAX_INPUT_LINES: u32 = 20;
 
 pub const MIN_MAX_INPUT_LINES: u32 = 1;
 
+pub const MAX_SERVER_NAME_LEN: usize = 64;
+
 pub const DEFAULT_MAX_CONTINUATION_TURNS: u32 = 3;
 pub const DEFAULT_COMPACTION_BUFFER: CompactionBuffer = CompactionBuffer::Percent(20);
 
@@ -1330,7 +1332,7 @@ fn push_rules(
 
 pub fn is_valid_server_name(name: &str) -> bool {
     !name.is_empty()
-        && name.len() <= 64
+        && name.len() <= MAX_SERVER_NAME_LEN
         && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
 
