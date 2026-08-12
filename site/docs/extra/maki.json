@@ -1,0 +1,85 @@
+{
+  "name": "maki",
+  "type": "dark",
+  "colors": {
+    "editor.background": "#1E1E2E",
+    "editor.foreground": "#DDE0EA"
+  },
+  "tokenColors": [
+    {
+      "scope": ["comment", "punctuation.definition.comment"],
+      "settings": { "foreground": "#878DA9", "fontStyle": "" }
+    },
+    {
+      "scope": ["string", "punctuation.definition.string"],
+      "settings": { "foreground": "#ABD695" }
+    },
+    {
+      "scope": ["string.unquoted"],
+      "settings": { "foreground": "#DDE0EA" }
+    },
+    {
+      "scope": [
+        "constant.numeric",
+        "constant.language",
+        "constant.other",
+        "constant.character.escape"
+      ],
+      "settings": { "foreground": "#EDA8C2" }
+    },
+    {
+      "scope": ["keyword", "storage.type", "storage.modifier"],
+      "settings": { "foreground": "#A2B5FA", "fontStyle": "" }
+    },
+    {
+      "scope": ["keyword.operator"],
+      "settings": { "foreground": "#A6ADC8" }
+    },
+    {
+      "scope": [
+        "entity.name.function",
+        "support.function",
+        "entity.name.command",
+        "meta.function-call entity.name",
+        "support.function.builtin"
+      ],
+      "settings": { "foreground": "#F7A87D", "fontStyle": "" }
+    },
+    {
+      "scope": [
+        "entity.name.type",
+        "entity.name.class",
+        "entity.other.inherited-class",
+        "support.type",
+        "support.class"
+      ],
+      "settings": { "foreground": "#A9D5E3" }
+    },
+    {
+      "scope": [
+        "entity.name.tag",
+        "support.type.property-name",
+        "variable.other.member",
+        "variable.other.property",
+        "meta.object-literal.key"
+      ],
+      "settings": { "foreground": "#A2B5FA" }
+    },
+    {
+      "scope": ["variable", "variable.parameter"],
+      "settings": { "foreground": "#DDE0EA" }
+    },
+    {
+      "scope": ["markup.inserted"],
+      "settings": { "foreground": "#ABD695" }
+    },
+    {
+      "scope": ["markup.deleted"],
+      "settings": { "foreground": "#EDA8C2" }
+    },
+    {
+      "scope": ["markup.heading"],
+      "settings": { "foreground": "#A9D5E3" }
+    }
+  ]
+}

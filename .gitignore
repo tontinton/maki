@@ -4,4 +4,5 @@ runs.csv
 /.direnv/
 /site/_build/
 /site/.bin/
+/.playwright-mcp/
 /result
