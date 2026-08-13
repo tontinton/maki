@@ -2,7 +2,7 @@
 //! Lossy corners: NaN floats become `null` (JSON can't represent NaN),
 //! BigInts that overflow `i64` become strings, and tuples become arrays.
 
-use monty::MontyObject;
+use monty_types::MontyObject;
 use serde_json::Value;
 
 pub fn json_to_monty(value: Value) -> MontyObject {

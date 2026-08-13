@@ -7,14 +7,15 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::time::Duration;
 
-use monty::{
-    ExcType, ExtFunctionResult, LimitedTracker, MontyException, MontyObject, MontyRun,
-    NameLookupResult, PrintWriter, PrintWriterCallback, ResolveFutures, ResourceLimits,
-    RunProgress,
+use monty::{MontyRun, RunProgress};
+use monty_types::{
+    CompileOptions, ExcType, ExtFunctionResult, MontyException, MontyObject, NameLookupResult,
+    PrintWriter, PrintWriterCallback, ResourceLimits, ResourceTracker,
 };
 use serde_json::Value;
 use tracing::debug;
 
+use crate::alloc::SandboxScope;
 use crate::convert::{json_to_monty, monty_to_json};
 use crate::error::InterpreterError;
 
@@ -68,7 +69,7 @@ pub fn run(
     limits: ResourceLimits,
 ) -> Result<InterpreterResult, InterpreterError> {
     let mut stdout = String::new();
-    let mut print_writer = PrintWriter::CollectString(&mut stdout);
+    let mut print_writer = PrintWriter::collect_string(&mut stdout);
     let output = run_inner(code, tools, resolver, limits, &mut print_writer)?;
     Ok(InterpreterResult { output, stdout })
 }
@@ -98,10 +99,16 @@ fn run_inner(
     limits: ResourceLimits,
     print_writer: &mut PrintWriter<'_>,
 ) -> Result<Option<Value>, InterpreterError> {
-    let runner = MontyRun::new(code.to_owned(), SCRIPT_NAME, vec![])
-        .map_err(|e| InterpreterError::Parse(e.to_string()))?;
+    let _sandbox = limits.max_memory.is_some().then(SandboxScope::enter);
+    let runner = MontyRun::new(
+        code.to_owned(),
+        SCRIPT_NAME,
+        vec![],
+        CompileOptions::default(),
+    )
+    .map_err(|e| InterpreterError::Parse(e.to_string()))?;
 
-    let tracker = LimitedTracker::new(limits);
+    let tracker = ResourceTracker::new(limits);
 
     let mut progress = runner
         .start(vec![], tracker, print_writer.reborrow())
@@ -198,7 +205,6 @@ fn run_inner(
                     .collect();
 
                 let resolved = resolver(batch)?;
-                let state = reset_clock(state)?;
 
                 let results: Vec<(u32, ExtFunctionResult)> = resolved
                     .into_iter()
@@ -222,30 +228,11 @@ fn run_inner(
     }
 }
 
-/// A script blocked on a tool call (a subagent can run for minutes) must not
-/// burn its own time budget, so every await refreshes it. Monty gives no way
-/// to touch the tracker clock on `ResolveFutures`, but loading a dumped run
-/// starts a fresh clock, so a dump/load round-trip resets it. The copy is
-/// cheap next to any real tool call.
-fn reset_clock(
-    state: ResolveFutures<LimitedTracker>,
-) -> Result<ResolveFutures<LimitedTracker>, InterpreterError> {
-    let bytes = RunProgress::ResolveFutures(state)
-        .dump()
-        .map_err(|e| InterpreterError::Runtime(e.to_string()))?;
-    match RunProgress::load(&bytes).map_err(|e| InterpreterError::Runtime(e.to_string()))? {
-        RunProgress::ResolveFutures(s) => Ok(s),
-        _ => Err(InterpreterError::Runtime(
-            "clock reset produced unexpected state".into(),
-        )),
-    }
-}
-
 pub fn limits(timeout: Duration, max_memory: usize) -> ResourceLimits {
-    ResourceLimits::new()
+    ResourceLimits::default()
         .max_duration(timeout)
         .max_memory(max_memory)
-        .max_recursion_depth(Some(DEFAULT_MAX_RECURSION))
+        .max_recursion_depth(DEFAULT_MAX_RECURSION)
 }
 
 #[cfg(test)]
@@ -256,9 +243,21 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     const DEFAULT_MAX_MEMORY: usize = 50 * 1024 * 1024;
+    const SMALL_MAX_MEMORY: usize = 2 * 1024 * 1024;
+    const OVER_LIMIT_ALLOC: &str = "x = [0] * 10_000_000";
+    const MEMORY_ERR_FRAGMENT: &str = "memory";
 
     fn default_limits() -> ResourceLimits {
         limits(Duration::from_secs(30), DEFAULT_MAX_MEMORY)
+    }
+
+    fn small_memory_limits() -> ResourceLimits {
+        limits(Duration::from_secs(30), SMALL_MAX_MEMORY)
+    }
+
+    fn assert_memory_error(err: InterpreterError) {
+        let msg = err.to_string().to_lowercase();
+        assert!(msg.contains(MEMORY_ERR_FRAGMENT), "got: {msg}");
     }
 
     fn empty_tools() -> HashMap<String, ToolFn> {
@@ -273,6 +272,50 @@ mod tests {
                 (n.into(), f)
             })
             .collect()
+    }
+
+    #[test]
+    fn memory_limit_raises_memory_error() {
+        let err = run(
+            OVER_LIMIT_ALLOC,
+            &empty_tools(),
+            None,
+            small_memory_limits(),
+        )
+        .unwrap_err();
+        assert_memory_error(err);
+    }
+
+    /// Without the scope mutex, the second run would rebase the shared
+    /// baseline and forgive the first its whole usage.
+    #[test]
+    fn concurrent_memory_limited_runs_both_enforce() {
+        let spawn = || {
+            std::thread::spawn(|| {
+                run(
+                    OVER_LIMIT_ALLOC,
+                    &empty_tools(),
+                    None,
+                    small_memory_limits(),
+                )
+                .unwrap_err()
+            })
+        };
+        for handle in [spawn(), spawn()] {
+            assert_memory_error(handle.join().unwrap());
+        }
+    }
+
+    #[test]
+    fn memory_limit_not_tripped_by_small_workload() {
+        let result = run(
+            "sum([i for i in range(1000)])",
+            &empty_tools(),
+            None,
+            small_memory_limits(),
+        )
+        .unwrap();
+        assert_eq!(result.output, Some(json!(499500)));
     }
 
     #[test]
@@ -430,8 +473,8 @@ await main()
     fn resolver_wait_does_not_count_against_timeout() {
         const TIMEOUT: Duration = Duration::from_millis(500);
         const WAIT: Duration = Duration::from_millis(700);
-        // Two awaits: an implementation that resets the clock only once would
-        // still time out on the second wait.
+        // Monty's tracker must stop the clock while we sit in the resolver.
+        // Two awaits so a clock paused only for the first wait still fails.
         let code = r#"
 async def main():
     a = await slow()

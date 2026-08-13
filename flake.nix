@@ -87,10 +87,8 @@
       #   mismatch that prints the real hash. This is both the recovery
       #   path for updates and a hard stop if pinned content ever changes.
       gitDepHashes = {
-        "git+https://github.com/pydantic/monty.git?tag=v0.0.18#45a3b2d57e6ce723fed4166fb032242ece74a663" =
-          "sha256-p9mDjS9FTvsITU98B8AeyUCk4wQhgk71HoyOsNPpB0Y=";
-        "git+https://github.com/samuelcolvin/ruff.git?rev=6aaa91ac2b269df1414954ccd5134f0e6f5c6d30#6aaa91ac2b269df1414954ccd5134f0e6f5c6d30" =
-          "sha256-m5U5OVUvhn5t3yTSSbT/JA+xmydEDQq+zKFNMN7K/MI=";
+        "git+https://github.com/pydantic/monty.git?tag=v0.0.21#70fe3f5781381eb33579e45046f8cb3845953373" =
+          "sha256-P4PgqfYykkZrWGg5G3WQo070lORLEhmXQUQPx3+Yslo=";
       };
 
       missingGitDepHashes = builtins.filter (s: !(builtins.hasAttr s gitDepHashes)) gitDepSources;
