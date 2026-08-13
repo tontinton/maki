@@ -1,6 +1,7 @@
 use shell_words::split;
 use std::io::{Write, stdout};
 use std::path::Path;
+use std::time::Instant;
 
 use color_eyre::Result;
 use crossterm::Command;
@@ -65,8 +66,13 @@ impl TerminalGuard {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
+        let started = Instant::now();
         pop_terminal_modes();
         ratatui::restore();
+        tracing::info!(
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "terminal restored"
+        );
     }
 }
 
