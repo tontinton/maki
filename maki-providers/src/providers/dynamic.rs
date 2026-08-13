@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -593,6 +594,7 @@ pub fn create(slug: &str, timeouts: super::Timeouts) -> Result<Box<dyn Provider>
         inner,
         auth,
         models: &meta.models,
+        refresh_gate: RefreshGate::default(),
     }))
 }
 
@@ -650,28 +652,57 @@ struct DynamicProvider {
     inner: Box<dyn Provider>,
     auth: Arc<Mutex<ResolvedAuth>>,
     models: &'static [ScriptModel],
+    refresh_gate: RefreshGate,
 }
 
-impl DynamicProvider {
-    fn run_auth_script(&self, subcommand: &'static str) -> BoxFuture<'_, Result<(), AgentError>> {
-        Box::pin(async move {
-            let script_path = self.script_path;
-            let auth = self.auth.clone();
-            smol::unblock(move || {
-                let stdout = run_script(script_path, subcommand, SCRIPT_TIMEOUT)?;
-                let parsed: ScriptResolvedAuth =
-                    serde_json::from_str(&stdout).map_err(|e| AgentError::Config {
-                        message: format!(
-                            "{} {subcommand}: invalid JSON: {e}",
-                            script_path.display()
-                        ),
-                    })?;
-                *auth.lock().unwrap() = parsed.into();
-                Ok(())
-            })
-            .await
-        })
+/// Gate around the auth script's `refresh`. Parallel 401s, say from sub-agents
+/// sharing one provider, would each spend the script's rotating refresh token,
+/// so callers queue on the lock and whoever arrives late reuses what the winner
+/// fetched. A refresh may hand back byte-identical credentials, so the
+/// generation counter, not the auth bytes, is what tells a parked caller that a
+/// peer already did the work. The lock orders that bump against the load, which
+/// is why `Relaxed` is enough.
+#[derive(Default)]
+struct RefreshGate {
+    lock: smol::lock::Mutex<()>,
+    generation: AtomicU64,
+}
+
+impl RefreshGate {
+    async fn refresh(
+        &self,
+        script_path: &Path,
+        auth: &Arc<Mutex<ResolvedAuth>>,
+    ) -> Result<(), AgentError> {
+        let before = self.generation.load(Ordering::Relaxed);
+        let _guard = self.lock.lock().await;
+        if self.generation.load(Ordering::Relaxed) != before {
+            debug!("peer refreshed while we waited, skipping script run");
+            return Ok(());
+        }
+        run_auth_script(script_path, auth, "refresh").await?;
+        self.generation.fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
+}
+
+async fn run_auth_script(
+    script_path: &Path,
+    auth: &Arc<Mutex<ResolvedAuth>>,
+    subcommand: &'static str,
+) -> Result<(), AgentError> {
+    let script_path = script_path.to_path_buf();
+    let auth = auth.clone();
+    smol::unblock(move || {
+        let stdout = run_script(&script_path, subcommand, SCRIPT_TIMEOUT)?;
+        let parsed: ScriptResolvedAuth =
+            serde_json::from_str(&stdout).map_err(|e| AgentError::Config {
+                message: format!("{} {subcommand}: invalid JSON: {e}", script_path.display()),
+            })?;
+        *auth.lock().unwrap() = parsed.into();
+        Ok(())
+    })
+    .await
 }
 
 impl Provider for DynamicProvider {
@@ -685,8 +716,31 @@ impl Provider for DynamicProvider {
         opts: RequestOptions,
         session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
-        self.inner
-            .stream_message(model, messages, system, tools, event_tx, opts, session_id)
+        Box::pin(async move {
+            let stream = || {
+                self.inner
+                    .stream_message(model, messages, system, tools, event_tx, opts, session_id)
+            };
+            match stream().await {
+                // The script mints credentials without the user, so an expired
+                // token costs one silent refresh instead of a re-login prompt.
+                Err(e) if e.is_auth_error() => {
+                    debug!(error = %e, "auth error, refreshing script-backed credentials");
+                    match self
+                        .refresh_gate
+                        .refresh(self.script_path, &self.auth)
+                        .await
+                    {
+                        Ok(()) => stream().await,
+                        Err(refresh_err) => {
+                            warn!(error = %refresh_err, "silent refresh failed, falling back to re-login");
+                            Err(e)
+                        }
+                    }
+                }
+                result => result,
+            }
+        })
     }
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
@@ -712,11 +766,13 @@ impl Provider for DynamicProvider {
     }
 
     fn refresh_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
-        self.run_auth_script("refresh")
+        Box::pin(self.refresh_gate.refresh(self.script_path, &self.auth))
     }
 
     fn reload_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
-        self.run_auth_script("reload")
+        // Deliberately ungated: this runs under block_on on the ui thread, and
+        // parking it behind someone else's slow refresh script freezes the ui.
+        Box::pin(run_auth_script(self.script_path, &self.auth, "reload"))
     }
 
     fn fetch_usage(&self) -> BoxFuture<'_, Result<Option<ProviderUsage>, AgentError>> {
@@ -736,6 +792,11 @@ mod tests {
     #[cfg(unix)]
     use tempfile::TempDir;
     use test_case::test_case;
+
+    #[cfg(unix)]
+    const STALE_TOKEN: &str = "Bearer stale";
+    #[cfg(unix)]
+    const CONSTANT_TOKEN: &str = "Bearer constant";
 
     #[test_case("myslug", true ; "valid_simple")]
     #[test_case("my-slug", true ; "valid_hyphen")]
@@ -892,6 +953,78 @@ esac
         assert_eq!(providers[0].models.len(), 1);
         assert_eq!(providers[0].models[0].id, "custom-v1");
         assert_eq!(providers[0].models[0].tier, ModelTier::Strong);
+    }
+
+    /// Writes a `refresh` script that counts its runs in `counter`. A rotating
+    /// script hands back a new token every run; a non-rotating one repeats the
+    /// same bytes, which is how we pin down that the gate trusts its counter and
+    /// not a diff of the credentials.
+    #[cfg(unix)]
+    fn write_counting_refresh_script(dir: &Path, counter: &Path, rotating: bool) -> PathBuf {
+        let path = dir.join("counting-provider");
+        let token = if rotating {
+            "Bearer refreshed-$n"
+        } else {
+            CONSTANT_TOKEN
+        };
+        let script = format!(
+            "#!/bin/sh\n\
+             [ \"$1\" = refresh ] || exit 1\n\
+             n=$(( $(cat '{c}' 2>/dev/null || echo 0) + 1 ))\n\
+             echo \"$n\" > '{c}'\n\
+             printf '{{\"headers\": {{\"authorization\": \"%s\"}}}}' \"{token}\"\n",
+            c = counter.display()
+        );
+        fs::write(&path, script).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    fn script_runs(counter: &Path) -> u32 {
+        fs::read_to_string(counter).unwrap().trim().parse().unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test_case(true, "Bearer refreshed-2" ; "rotating_token")]
+    #[test_case(false, CONSTANT_TOKEN ; "unchanged_token")]
+    fn refresh_gate_single_flights_concurrent_callers(rotating: bool, final_token: &str) {
+        let tmp = TempDir::new().unwrap();
+        let counter = tmp.path().join("count");
+        let script = write_counting_refresh_script(tmp.path(), &counter, rotating);
+        let auth = Arc::new(Mutex::new(ResolvedAuth {
+            base_url: None,
+            headers: vec![("authorization".into(), STALE_TOKEN.into())],
+        }));
+        let gate = RefreshGate::default();
+
+        smol::block_on(async {
+            let (first, second) = futures_lite::future::zip(
+                gate.refresh(&script, &auth),
+                gate.refresh(&script, &auth),
+            )
+            .await;
+            first.unwrap();
+            second.unwrap();
+
+            assert_eq!(
+                script_runs(&counter),
+                1,
+                "concurrent 401s share one script run"
+            );
+            assert_ne!(auth.lock().unwrap().headers[0].1, STALE_TOKEN);
+
+            // The late caller snapshots the bumped generation before locking, so
+            // a refresh that doesn't overlap anyone still runs the script.
+            gate.refresh(&script, &auth).await.unwrap();
+        });
+
+        assert_eq!(
+            script_runs(&counter),
+            2,
+            "a refresh that overlaps nobody runs the script again"
+        );
+        assert_eq!(auth.lock().unwrap().headers[0].1, final_token);
     }
 
     #[cfg(unix)]
