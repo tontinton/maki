@@ -1,6 +1,6 @@
 use maki_providers::provider::Provider;
 use maki_providers::retry::{MAX_TIMEOUT_RETRIES, RetryState};
-use maki_providers::{Message, Model, ProviderEvent, RequestOptions, StreamResponse};
+use maki_providers::{ContentBlock, Message, Model, ProviderEvent, RequestOptions, StreamResponse};
 use maki_storage::id::SessionRef;
 use serde_json::Value;
 use tracing::warn;
@@ -8,12 +8,32 @@ use tracing::warn;
 use crate::cancel::CancelToken;
 use crate::{AgentError, AgentEvent, EventSender};
 
+const FUNCTIONS_PREFIX: &str = "functions.";
+
+/// GPT models sometimes emit `functions.<name>`, a Codex training habit.
+/// Stripped here at the provider boundary so no raw name enters the agent;
+/// the batch plugin mirrors the rule in Lua.
+pub(crate) fn canonical_tool_name(name: &str) -> &str {
+    name.strip_prefix(FUNCTIONS_PREFIX).unwrap_or(name)
+}
+
+fn canonicalize_tool_names(message: &mut Message) {
+    for block in &mut message.content {
+        if let ContentBlock::ToolUse { name, .. } = block {
+            *name = canonical_tool_name(name).to_owned();
+        }
+    }
+}
+
 async fn forward_provider_events(prx: flume::Receiver<ProviderEvent>, event_tx: &EventSender) {
     while let Ok(pe) = prx.recv_async().await {
         let ae = match pe {
             ProviderEvent::TextDelta { text } => AgentEvent::TextDelta { text },
             ProviderEvent::ThinkingDelta { text } => AgentEvent::ThinkingDelta { text },
-            ProviderEvent::ToolUseStart { id, name } => AgentEvent::ToolPending { id, name },
+            ProviderEvent::ToolUseStart { id, name } => AgentEvent::ToolPending {
+                id,
+                name: canonical_tool_name(&name).to_owned(),
+            },
             ProviderEvent::PromptProgress {
                 processed,
                 total,
@@ -63,7 +83,10 @@ pub(crate) async fn stream_with_retry(
         drop(ptx);
         let _ = forwarder.await;
         match result {
-            Ok(r) => return Ok(r),
+            Ok(mut r) => {
+                canonicalize_tool_names(&mut r.message);
+                return Ok(r);
+            }
             Err(AgentError::Cancelled) => return Err(AgentError::Cancelled),
             Err(e) if e.is_retryable() => {
                 if e.should_rotate_key()
@@ -95,5 +118,30 @@ pub(crate) async fn stream_with_retry(
             }
             Err(e) => return Err(e),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use maki_providers::Role;
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn tool_use_names_canonicalized() {
+        let mut message = Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Text { text: "hi".into() },
+                ContentBlock::tool_use("t1", "functions.bash", json!({})),
+                ContentBlock::tool_use("t2", "read", json!({})),
+                ContentBlock::tool_use("t3", "my_functions.x", json!({})),
+            ],
+            ..Default::default()
+        };
+        canonicalize_tool_names(&mut message);
+        let names: Vec<&str> = message.tool_uses().map(|(_, name, _)| name).collect();
+        assert_eq!(names, ["bash", "read", "my_functions.x"]);
     }
 }

@@ -97,6 +97,9 @@ local function normalize_entry(entry)
   if type(tool) ~= "string" then
     return nil, "batch entry missing 'tool'"
   end
+  -- Lua twin of `canonical_tool_name` (streaming.rs): strip GPT's
+  -- `functions.` prefix so headers and the nested-batch guard match.
+  tool = tool:match("^functions%.(.+)") or tool
   local rest = {}
   local has_rest = false
   for k, v in pairs(entry) do

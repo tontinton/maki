@@ -474,6 +474,31 @@ fn flat_nested_and_merged_params_normalize_identically() {
     assert_eq!(calls[2]["params"], json!({ "tag": "nested", "n": 1 }));
 }
 
+/// The batch plugin strips GPT's `functions.` prefix in Lua so child
+/// lookups and the nested-batch guard key on the canonical name.
+#[test]
+fn functions_prefix_stripped_from_child_tool_names() {
+    let (reg, _host) = load_batch_host();
+    let out = run_batch(
+        &reg,
+        json!([
+            { "tool": "functions.ok", "parameters": { "tag": "a" } },
+            { "tool": "functions.batch", "parameters": { "tool_calls": [] } },
+        ]),
+    )
+    .expect("batch failed");
+    let expected = format!(
+        "{}{}{}",
+        section("ok", "ok:a"),
+        section("batch", &format!("{ERROR_PREFIX}{NESTED_ERROR}")),
+        summary_mixed(1, 2, 1)
+    );
+    assert_eq!(out, expected);
+    let calls = recorded_calls(&reg);
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["tool"], json!("ok"));
+}
+
 #[test_case::test_case(json!([]), EMPTY_ERROR ; "empty_list")]
 #[test_case::test_case(json!([{ "tool": "ok", "parameters": { "tag": "x" }, "tag": "y" }]), "duplicate parameter 'tag'" ; "duplicate_key")]
 fn invalid_input_errors_without_dispatch(tool_calls: Value, expected_err: &str) {

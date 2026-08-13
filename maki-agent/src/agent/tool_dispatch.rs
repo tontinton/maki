@@ -68,8 +68,9 @@ pub async fn run(
     ctx: &ToolContext,
     emit: Emit,
 ) -> ToolDoneEvent {
-    // GPT-5.6 was likely trained on Codex sessions where tools are `functions.<name>`
-    let name = name.strip_prefix("functions.").unwrap_or(name);
+    // Covers names re-entering from model JSON (batch children, `call_tool`,
+    // the interpreter bridge); streamed names are canonicalized in streaming.rs.
+    let name = super::streaming::canonical_tool_name(name);
     if let Some(local) = ctx.local_tools.get(name) {
         return run_local_tool(local, id, name, input, ctx, emit);
     }
@@ -565,6 +566,25 @@ mod tests {
             .await;
             assert!(done.is_error);
             assert_eq!(done.output.as_text(), "nope");
+        });
+    }
+
+    #[test]
+    fn functions_prefixed_name_dispatches_to_canonical_tool() {
+        smol::block_on(async {
+            let ctx = local_ctx("ok", |_| Ok("ran".into()));
+            let done = run(
+                ToolRegistry::global(),
+                None,
+                "t1".into(),
+                "functions.ok",
+                &serde_json::json!({}),
+                &ctx,
+                Emit::Silent,
+            )
+            .await;
+            assert!(!done.is_error);
+            assert_eq!(done.output.as_text(), "ran");
         });
     }
 
