@@ -2589,7 +2589,7 @@ local id = maki.session.current()
 maki.session.focus({id})
 ```
 
-Switches the UI to the session with {id}. The session must be live.
+Switches the UI to the session with {id}.
 
 **Parameters:**
 
