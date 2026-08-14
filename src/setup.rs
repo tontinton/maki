@@ -13,6 +13,7 @@ use tracing_subscriber::EnvFilter;
 const PROVIDER_PRIORITY: &[&str] = &[
     "anthropic",
     "openai",
+    "xai",
     "copilot",
     "zai",
     "synthetic",

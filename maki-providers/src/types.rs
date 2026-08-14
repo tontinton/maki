@@ -462,6 +462,13 @@ pub mod dialect {
         adaptive: Some(High),
         off: Some(OFF),
     };
+    /// xAI Grok 4.5/4.6. Adaptive defaults to high; Off sends nothing so the
+    /// model keeps its own default. `xhigh` is advertised on Grok 4.6.
+    pub const GROK: EffortDialect = EffortDialect {
+        supported: &[Low, Medium, High, XHigh],
+        adaptive: Some(High),
+        off: None,
+    };
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -865,6 +872,7 @@ mod tests {
             &dialect::DEEPSEEK,
             &dialect::ANTHROPIC_ADAPTIVE,
             &dialect::TENSORX,
+            &dialect::GROK,
         ];
         for d in all {
             assert!(!d.supported.is_empty());

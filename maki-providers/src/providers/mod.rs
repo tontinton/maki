@@ -28,6 +28,7 @@ pub mod opencode;
 pub(crate) mod openrouter;
 pub(crate) mod synthetic;
 pub(crate) mod tensorx;
+pub(crate) mod xai;
 pub(crate) mod zai;
 
 const LOW_SPEED_BYTES_PER_SEC: u32 = 1;

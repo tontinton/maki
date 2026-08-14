@@ -25,7 +25,7 @@ Every provider honors a `<SLUG>_BASE_URL` env var (`anthropic` -> `ANTHROPIC_BAS
 ANTHROPIC_BASE_URL=https://my-proxy.internal maki
 ```
 
-It wins over `providers.toml` and built-in defaults. `ANTHROPIC_BASE_URL` and `OPENAI_BASE_URL` are the same names the official SDKs use, so an existing proxy setup carries over as is. One exception: `OPENAI_BASE_URL` only redirects the platform API, never the ChatGPT Coding Plan backend.
+It wins over `providers.toml` and built-in defaults. `ANTHROPIC_BASE_URL` and `OPENAI_BASE_URL` are the same names the official SDKs use, so an existing proxy setup carries over as is. Two exceptions: `OPENAI_BASE_URL` only redirects the platform API, never the ChatGPT Coding Plan backend; `XAI_BASE_URL` only redirects the public API-key endpoint, never the OAuth CLI proxy.
 
 You can also set `base_url` for a built-in provider in `~/.config/maki/providers.toml`. It overrides the built-in default and loses to the env var above:
 
@@ -243,6 +243,26 @@ enable_free_models = true
 
 The default is `false`.
 
+### xAI
+
+- **Env var**: `XAI_API_KEY` (also supports OAuth via `maki auth login xai`)
+- **API endpoints**:
+  - `https://api.x.ai/v1`
+  - `https://cli-chat-proxy.grok.com/v1`
+- **Features**: OAuth login, account-specific model catalog, Grok reasoning (low/medium/high/xhigh)
+
+| Tier | Models | Pricing (in/out per 1M tokens) | Context |
+|------|--------|-------------------------------|---------|
+| Medium | **grok-4.3** (default) | $1.25 / $2.50 | 1000K ctx / 131K out |
+| Strong | **grok-4.6** (default) | $2.00 / $6.00 | 500K ctx / 131K out |
+| Strong | grok-4.5 | $2.00 / $6.00 | 500K ctx / 131K out |
+
+Defaults: grok-4.6 (strong), grok-4.3 (medium)
+
+OAuth uses the same first-party xAI client as the official Grok CLI (`maki auth login xai`). Browser login (PKCE) is the desktop default; device code is recommended over SSH or in a container. Tokens refresh automatically. After login, Maki fetches your account catalog from `GET /v1/models-v2` on the Grok CLI proxy and caches it for 15 minutes. `XAI_BASE_URL` only redirects the public API-key endpoint, never the OAuth proxy.
+
+If `~/.grok/auth.json` already exists, login offers to reuse it without writing that file.
+
 ### Opencode Go
 
 - **Env var**: `OPENCODE_API_KEY`
@@ -259,6 +279,7 @@ Models are referenced as `provider/model_id`:
 ```
 anthropic/claude-sonnet-4-6
 openai/gpt-4.1
+xai/grok-4.6
 zai/glm-4.7
 ```
 
@@ -375,7 +396,7 @@ To add a custom provider or proxy, drop an executable script into the config `pr
 
 `resolve` is called each time a new agent spawns, so scripts should read tokens from disk instead of caching them in memory. That way auth changes from other processes get picked up.
 
-The `base` field specifies which built-in provider to inherit the model catalog from. Valid values: `anthropic`, `openai`, `google`, `copilot`, `ollama`, `llama-cpp`, `mistral`, `zai`, `deepseek`, `openrouter`, `synthetic`, `tensorx`, `opencode`.
+The `base` field specifies which built-in provider to inherit the model catalog from. Valid values: `anthropic`, `openai`, `google`, `copilot`, `ollama`, `llama-cpp`, `mistral`, `zai`, `deepseek`, `openrouter`, `synthetic`, `tensorx`, `opencode`, `xai`.
 
 If your provider serves models not in the base catalog, add a `models` subcommand returning:
 

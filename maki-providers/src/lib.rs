@@ -21,6 +21,7 @@ pub use providers::catalog::{
 pub use providers::copilot::auth as copilot_auth;
 pub use providers::dynamic;
 pub use providers::openai::auth as openai_auth;
+pub use providers::xai::auth as xai_auth;
 pub use types::{
     ContentBlock, Effort, EffortDialect, IMAGE_OMITTED_NOTE, ImageMediaType, ImageSource, Message,
     MessageKind, ProviderEvent, ProviderUsage, RequestOptions, Role, StopReason, StreamResponse,

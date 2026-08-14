@@ -38,6 +38,7 @@ An AI coding agent optimized for minimal use of context tokens, while providing 
 
 * Anthropic - `ANTHROPIC_API_KEY` only (using OAuth is against TOS). Bedrock supported via `CLAUDE_CODE_USE_BEDROCK=1`.
 * OpenAI - `OPENAI_API_KEY` and OAuth via `maki auth login openai`.
+* xAI - `XAI_API_KEY` and OAuth via `maki auth login xai`.
 * Google - `GEMINI_API_KEY`.
 * Copilot - `GH_COPILOT_TOKEN` or an existing GitHub Copilot sign-in at `~/.config/github-copilot/`.
 * Ollama - `OLLAMA_HOST` for local (e.g. `http://localhost:11434`), or `OLLAMA_API_KEY` for cloud.

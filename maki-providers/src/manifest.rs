@@ -1,7 +1,7 @@
 use crate::model::{ModelEntry, ModelFamily, ModelTier};
 use crate::providers::{
     anthropic, copilot, custom, deepseek, dynamic, google, llama_cpp, mistral, ollama, openai,
-    openrouter, synthetic, tensorx, zai,
+    openrouter, synthetic, tensorx, xai, zai,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -159,6 +159,17 @@ const OPENCODE: ProviderManifest = ProviderManifest {
     models: &[],
 };
 
+const XAI: ProviderManifest = ProviderManifest {
+    slug: "xai",
+    display_name: "xAI",
+    family: ModelFamily::Generic,
+    supports_thinking: true,
+    accepts_arbitrary_models: true,
+    fallback_max_output: Some(131_072),
+    fallback_context_window: 500_000,
+    models: xai::models(),
+};
+
 const OPENCODE_GO: ProviderManifest = ProviderManifest {
     slug: "opencode-go",
     display_name: "Opencode Go",
@@ -185,6 +196,7 @@ const BUILTINS: &[ProviderManifest] = &[
     TENSORX,
     OPENCODE,
     OPENCODE_GO,
+    XAI,
 ];
 
 pub struct ManifestRegistry;
