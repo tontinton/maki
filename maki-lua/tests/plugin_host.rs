@@ -2706,6 +2706,107 @@ fn ctx_set_deadline_twice_errors() {
     assert!(err.contains(DEADLINE_ALREADY_SET_ERR), "got: {err}");
 }
 
+/// Generous: every wait below ends on an event, never on the clock, so only
+/// an already failing test pays this.
+const CANCEL_TEST_TIMEOUT: Duration = Duration::from_secs(30);
+const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+fn poll_until<T>(what: &str, mut check: impl FnMut() -> Option<T>) -> T {
+    let deadline = std::time::Instant::now() + CANCEL_TEST_TIMEOUT;
+    loop {
+        if let Some(got) = check() {
+            return got;
+        }
+        assert!(std::time::Instant::now() < deadline, "{what}");
+        std::thread::sleep(CANCEL_POLL_INTERVAL);
+    }
+}
+
+const PARKED_DEADLINE_REPLY: &str = "partial: timeout";
+const PARKED_DEADLINE_PLUGIN: &str = r#"
+maki.api.register_tool({
+    name = "parked_deadline",
+    description = "parks past its deadline, finishing from its cancel hook",
+    schema = { type = "object", properties = {}, additionalProperties = false },
+    audiences = { "main" },
+    handler = function(input, ctx)
+        ctx:set_deadline(1)
+        maki.async.on_cancel(function(reason)
+            ctx:finish({ llm_output = "partial: " .. reason, is_error = true })
+        end)
+        maki.fn.jobwait(maki.fn.jobstart("sleep 30"))
+        return "unreachable"
+    end,
+})
+"#;
+
+/// A handler parked in an await runs no Lua when its deadline lapses, so the
+/// host is what ends it, by raising inside the await. Its cancel hooks still
+/// get that last slice, and the reply they finish with beats the generic
+/// timeout error. The handler that already returned nil takes a different
+/// road out, unit tested in `runtime.rs`.
+#[test]
+fn parked_handler_reports_its_hook_finish_reply_on_deadline() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source("parked_deadline_plugin", PARKED_DEADLINE_PLUGIN)
+        .unwrap();
+
+    let result = exec_tool(&reg, "parked_deadline", json!({}));
+
+    assert_eq!(result, Err(PARKED_DEADLINE_REPLY.to_owned()));
+    drop(host);
+}
+
+const BASH_CANCEL_ID: &str = "bash-cancel-1";
+/// Mirrors the cancelled marker in `plugins/lib/maki/partial.lua`.
+const BASH_PARTIAL_MARKER: &str = "[cancelled by user; output above is partial]";
+/// Assembled by printf so the probe never appears in the command header.
+const BASH_PARTIAL_PROBE: &str = "XY";
+const BASH_PARTIAL_CMD: &str = "printf '%s%s\\n' X Y && sleep 30";
+
+/// Esc mid-stream on a real bash run: the lines printed so far come back as
+/// an error reply ending in the marker, not a bare "cancelled".
+#[test]
+fn cancelled_bash_keeps_streamed_output_as_partial() {
+    let (tx, events) = flume::unbounded();
+    let event_tx = maki_agent::EventSender::new(tx, 0);
+    let (trigger, token) = maki_agent::CancelToken::new();
+    let (result_tx, result_rx) = flume::bounded(1);
+    std::thread::spawn(move || {
+        let (reg, host) = builtins_host();
+        let mut ctx = maki_agent::tools::test_support::stub_ctx_with(
+            &maki_agent::AgentMode::Build,
+            Some(&event_tx),
+            Some(BASH_CANCEL_ID),
+        );
+        ctx.cancel = token;
+        // The rtk probe costs up to two 2s job waits before the command even
+        // starts: pointless here, and a flake risk under load.
+        ctx.config.no_rtk = true;
+        let input = json!({ "command": BASH_PARTIAL_CMD });
+        result_tx
+            .send(exec_with_ctx(&reg, "bash", input, &ctx))
+            .ok();
+        drop(host);
+    });
+
+    let buf = poll_until("bash must publish its live buf", || {
+        recv_live_buf(&events, BASH_CANCEL_ID)
+    });
+    poll_until("bash output never reached the live buf", || {
+        buf.take().text().contains(BASH_PARTIAL_PROBE).then_some(())
+    });
+
+    trigger.cancel();
+
+    let err = result_rx
+        .recv_timeout(CANCEL_TEST_TIMEOUT)
+        .expect("cancelled bash must settle")
+        .expect_err("a partial reply is an error reply");
+    assert_eq!(err, format!("{BASH_PARTIAL_PROBE}\n{BASH_PARTIAL_MARKER}"));
+}
+
 #[test]
 fn restore_tool_async_ordering_and_delivery() {
     let (_reg, host) = builtins_host();

@@ -35,6 +35,8 @@ const PARKJOB_HL_TOOL: &str = "parkjob_hl";
 const CMD_TOOL: &str = "cmd";
 const BOOM_TOOL: &str = "boom";
 const BOOM_ERR: &str = "stub tool exploded";
+const PARTIAL_TOOL: &str = "partial";
+const PARTIAL_ERR: &str = "half the output [cancelled by user; output above is partial]";
 const CHILD_USAGE: &str = "12.3k↑ 456↓ $0.123";
 /// Wildly generous vs the expected kill (one poll plus one
 /// [`KILL_GRACE`]); only a watchdog that never fires gets here.
@@ -94,6 +96,10 @@ maki.agent.call_tool = function(ctx, name, input, opts)
     -- one of them its own restore.
     maki.fn.jobwait(maki.fn.jobstart("sleep @PARK_SECS@"))
     return "parkjob_done"
+  elseif name == "partial" then
+    -- Parks past the sweep, then comes back with more than "cancelled".
+    maki.fn.jobwait(maki.fn.jobstart("sleep @PARK_SECS@"))
+    return nil, "@PARTIAL_ERR@"
   elseif name == "spin" then
     -- Never yields, so nothing but the watchdog can end it.
     while true do end
@@ -167,6 +173,7 @@ fn load_batch_host_with(child_src: &str) -> (Arc<ToolRegistry>, PluginHost) {
     let prelude = STUB_PRELUDE
         .replace("@BOOM_ERR@", BOOM_ERR)
         .replace("@CHILD_USAGE@", CHILD_USAGE)
+        .replace("@PARTIAL_ERR@", PARTIAL_ERR)
         .replace("@PARK_SECS@", &PARK_SECS.to_string());
     host.load_source(
         "batch_policy",
@@ -386,7 +393,9 @@ fn assert_indicators(buf: &maki_agent::SharedBuf, style: &str, want: usize, budg
 ///
 /// That sweep runs outside the coroutine, where a child restore that awaits
 /// raises, and one such body must not swallow the rest of the sweep. Children
-/// that already finished keep their own status and output.
+/// that already finished keep their own status and output, and a child whose
+/// own call lands after the sweep with more than "cancelled" trades the
+/// placeholder for it.
 #[test]
 fn cancel_mid_flight_repaints_parked_children_and_spares_finished_ones() {
     let batch = start_batch_with(
@@ -395,33 +404,35 @@ fn cancel_mid_flight_repaints_parked_children_and_spares_finished_ones() {
             { "tool": OK_TOOL, "parameters": { "tag": "a" } },
             { "tool": PARKJOB_TOOL, "parameters": {} },
             { "tool": PARKJOB_HL_TOOL, "parameters": {} },
+            { "tool": PARTIAL_TOOL, "parameters": {} },
             { "tool": BOOM_TOOL, "parameters": {} },
         ]),
     );
-    for (style, want) in [(SUCCESS_STYLE, 1), (ERROR_STYLE, 1), (SPINNER_STYLE, 2)] {
+    for (style, want) in [(SUCCESS_STYLE, 1), (ERROR_STYLE, 1), (SPINNER_STYLE, 3)] {
         assert_indicators(&batch.body, style, want, PAINT_TIMEOUT);
     }
 
     batch.trigger.cancel();
 
-    assert_indicators(&batch.body, ERROR_STYLE, 3, PAINT_TIMEOUT);
+    assert_indicators(&batch.body, ERROR_STYLE, 4, PAINT_TIMEOUT);
     assert_indicators(&batch.body, SPINNER_STYLE, 0, Duration::ZERO);
     assert_indicators(&batch.body, SUCCESS_STYLE, 1, Duration::ZERO);
 
     let cancelled = format!("{ERROR_PREFIX}{CANCELLED_ERROR}");
     let expected = format!(
-        "{}{}{}{}{}",
+        "{}{}{}{}{}{}",
         section(OK_TOOL, "ok:a"),
         section(PARKJOB_TOOL, &cancelled),
         section(PARKJOB_HL_TOOL, &cancelled),
+        section(PARTIAL_TOOL, &format!("{ERROR_PREFIX}{PARTIAL_ERR}")),
         section(BOOM_TOOL, &format!("{ERROR_PREFIX}{BOOM_ERR}")),
-        summary_mixed(1, 4, 3)
+        summary_mixed(1, 5, 4)
     );
     let settled = batch
         .result
         .recv_timeout(BATCH_RESULT_TIMEOUT)
         .expect("batch must settle instead of hanging on its cancelled children");
-    assert_eq!(settled, Ok(expected));
+    assert_eq!(settled, Err(expected));
 }
 
 /// Esc pressed before the batch is even dispatched: the handler still runs
@@ -439,7 +450,7 @@ fn cancelled_batch_dispatches_nothing_and_keeps_born_terminal_errors() {
             { "tool": OK_TOOL, "parameters": { "tag": "a" } },
         ]),
     )
-    .expect("the second sweep must not resettle an already cancelled child");
+    .expect_err("a cancelled batch is an error reply");
     let expected = format!(
         "{}{}{}",
         section(BATCH_TOOL, &format!("{ERROR_PREFIX}{NESTED_ERROR}")),

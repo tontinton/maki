@@ -315,6 +315,7 @@ impl UserData for LuaCtx {
             cell.deadline_secs.set(Some(secs));
             cell.deadline
                 .set(Some(Instant::now() + Duration::from_secs(secs)));
+            cell.deadline_changed.notify(usize::MAX);
             Ok((Some(true), None))
         });
 
@@ -345,6 +346,10 @@ impl UserData for LuaCtx {
                 let Some(loaded) = this.loaded_instructions().cloned() else {
                     return Ok(this.cap_err_pair("find_instructions"));
                 };
+                // Nothing may hold the ctx borrow across the wait: a cancel
+                // hook firing meanwhile needs `ctx:finish`, which takes it
+                // mutably.
+                drop(this);
                 let results = smol::unblock(move || {
                     let cwd = std::env::current_dir().unwrap_or_default();
                     let abs = resolve_abs_with_cwd(dir_path, &cwd);

@@ -14,5 +14,6 @@ pub use instructions::{
     is_instruction_file, load_instruction_text, load_instructions,
 };
 pub use run::{
-    Agent, AgentParams, AgentRunParams, estimate_message_tokens, resolve_compaction_model,
+    Agent, AgentParams, AgentRunParams, EMPTY_RESPONSE_MARKER, estimate_message_tokens,
+    resolve_compaction_model,
 };

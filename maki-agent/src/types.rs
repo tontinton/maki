@@ -708,8 +708,11 @@ impl SharedBuf {
         Some(Arc::clone(&guard))
     }
 
+    /// A copy for a tool reply. Leaves the dirty flag alone: only the UI
+    /// clears it, and a reply can die on the way there (a cancelled run's
+    /// events are stale), which would strand the last repaint a tool made
+    /// on its way out. Re-reading the same lines once costs nothing.
     pub fn take(&self) -> BufferSnapshot {
-        self.dirty.store(false, Ordering::Release);
         let guard = self.committed.lock().unwrap_or_else(|e| e.into_inner());
         BufferSnapshot::from_arc(Arc::clone(&guard))
     }
@@ -1222,7 +1225,10 @@ mod tests {
 
         buf.append(line("l3"));
         let _ = buf.take();
-        assert!(buf.read_if_dirty().is_none(), "take clears dirty");
+        assert!(
+            buf.read_if_dirty().is_some(),
+            "take must leave the flag for the UI"
+        );
     }
 
     #[test]

@@ -867,7 +867,9 @@ tools).
 
 - `{message}` (`string`) User message to send.
 
-**Returns:** (`table?`, `string?`) Result table on success, or `(nil, err)` on failure.
+**Returns:** (`table?`, `string?`) Result table on success, or `(nil, err)` on
+failure. A run cut short after streaming some text hands you both: the
+error and a `{ text = <what it streamed> }` table.
 
 **Example:**
 
@@ -1074,11 +1076,16 @@ permit:release()
 maki.async.on_cancel({fn})
 ```
 
-Register {fn} to run as soon as the current task is cancelled, without
-waiting for whatever it is doing to finish. Use it to paint the
-cancelled state: a handler waiting on children (`gather`, `call_tool`)
-stays parked until they wind down, so anything after the wait is too
-late to reach the screen.
+Register {fn} to run as soon as the current task is cancelled or hits
+its deadline, without waiting for whatever it is doing to finish. Use
+it to paint the cancelled state: a handler waiting on children
+(`gather`, `call_tool`) stays parked until they wind down, so anything
+after the wait is too late to reach the screen.
+
+The callback receives the reason (`"cancelled"` or `"timeout"`) and may
+still call `ctx:finish`; the host prefers that reply over the generic
+cancelled/timeout error. Mark it `is_error = true` and end it with a
+marker, so the model knows the output it gets is cut short.
 
 The callback runs outside your coroutine, so it must not yield. It
 fires at most once, immediately if the task is already cancelled. An
@@ -1087,13 +1094,14 @@ other hooks still run.
 
 **Parameters:**
 
-- `{fn}` (`function`) Zero-argument function to run on cancel.
+- `{fn}` (`function`) Function to run on cancel; receives the reason string.
 
 **Example:**
 
 ```lua
-maki.async.on_cancel(function()
-  view:append({ { "cancelled", "tool_error" } })
+maki.async.on_cancel(function(reason)
+  view:append({ { reason, "tool_error" } })
+  ctx:finish({ llm_output = partial .. "\n[cancelled; output is partial]", is_error = true })
 end)
 maki.async.gather(children)
 ```
@@ -4934,6 +4942,20 @@ function M.resolve(opts, ctx)
 end
 
 return M
+```
+
+### `require("maki.partial")`
+
+```lua
+-- When a tool is cut short, it still hands back what it printed. The marker
+-- tells the model that output is real but unfinished. One home for the
+-- wording and the painting, so every tool says it the same way.
+
+--- Close {view} on the marker and build the tool reply. {out} is everything
+--- the tool streamed, already truncated; empty means the view still shows a
+--- placeholder to drop. {reason} is a cancel-hook reason ("cancelled" |
+--- "timeout").
+function M.cut(view, out, reason, timeout_secs)
 ```
 
 ### `require("maki.scroll")`

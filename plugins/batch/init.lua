@@ -422,8 +422,10 @@ function Batch:annotate(c, ann)
   self:rerender()
 end
 
+-- A child the sweep settled may be settled once more, when its own call
+-- comes back with the partial output the sweep could not know about.
 function Batch:settle(c, status, output)
-  if TERMINAL[c.status] then
+  if TERMINAL[c.status] and c.output ~= CANCELLED_ERROR then
     error(string.format(RESETTLE_FMT, c.tool, c.status, status))
   end
   c.status = status
@@ -456,8 +458,13 @@ function Batch:run_child(c, ctx)
     end,
   })
   -- The sweep may have settled this child mid-call, and the call knows
-  -- nothing about that, so its result is moot.
+  -- nothing about that, so its result is moot. Unless it came back with
+  -- more than the sweep's bare "cancelled": that partial output is worth
+  -- keeping.
   if TERMINAL[c.status] then
+    if err and err ~= CANCELLED_ERROR and c.output == CANCELLED_ERROR then
+      self:settle(c, STATUS.ERROR, err)
+    end
     return
   end
   if err then
@@ -465,6 +472,15 @@ function Batch:run_child(c, ctx)
   else
     self:settle(c, STATUS.SUCCESS, text)
   end
+end
+
+function Batch:reply()
+  return {
+    llm_output = render_llm(self.children),
+    is_error = self.cancelled,
+    body = self.buf,
+    state = to_state(self.children),
+  }
 end
 
 -- Whatever is still non-terminal becomes a cancelled child, so none is
@@ -488,9 +504,13 @@ function Batch:run(ctx)
   end
   -- The cancel reaches neither `call_tool` nor `gather`, so a child parked
   -- in a request would stay drawn as running until the host gives up on
-  -- the whole handler, seconds later.
+  -- the whole handler, seconds later. The finish covers the case where the
+  -- host gives up on us anyway: the model still gets per-child results
+  -- rather than a bare "cancelled".
   maki.async.on_cancel(function()
+    self.cancelled = true
     self:sweep_cancelled()
+    ctx:finish(self:reply())
   end)
   maki.async.gather(funs)
   self:sweep_cancelled()
@@ -511,11 +531,7 @@ local function handler(input, ctx)
   ctx:live_buf(batch.buf)
   batch:run(ctx)
 
-  return {
-    llm_output = render_llm(children),
-    body = batch.buf,
-    state = to_state(children),
-  }
+  return batch:reply()
 end
 
 -- Last resort: no state, output isn't section-formatted.

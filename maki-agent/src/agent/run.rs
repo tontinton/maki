@@ -25,6 +25,10 @@ use crate::{
 use maki_config::{ModelPolicy, ToolOutputLines};
 use maki_storage::id::SessionRef;
 
+/// Stands in for the assistant turn the model left blank, so the nudge
+/// below has something to answer. Never a real response: readers that mine
+/// history for model text must skip it.
+pub const EMPTY_RESPONSE_MARKER: &str = "(empty)";
 const MAX_REAUTH_ATTEMPTS: u32 = 2;
 const NUDGE_PROMPT: &str = "You just executed tool calls but returned an empty response. Please process the tool results above and continue with the task.";
 
@@ -334,7 +338,7 @@ impl<'h> Agent<'h> {
                 self.history.push(Message {
                     role: Role::Assistant,
                     content: vec![ContentBlock::Text {
-                        text: "(empty)".into(),
+                        text: EMPTY_RESPONSE_MARKER.into(),
                     }],
                     ..Default::default()
                 });

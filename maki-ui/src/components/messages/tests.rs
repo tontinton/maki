@@ -1298,6 +1298,10 @@ fn cancel_in_progress_retires_live_buf_to_watched() {
     assert!(panel.watching("t1"));
 
     buf.set_lines(vec![snap_line("after-cancel")]);
+    // The tool hands that same repaint to the host as its reply body, and the
+    // stale-run_id filter drops it. Taking a body must not cost the screen the
+    // last thing a cancelled tool painted.
+    let _dropped_reply = buf.take();
     panel.poll_live_bufs();
     let msg = panel.find_tool_msg_mut("t1").unwrap();
     assert_eq!(

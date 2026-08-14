@@ -116,21 +116,27 @@ fn run(lua: &Lua, r#fn: Function, on_finish: Option<Function>) -> LuaResult<()> 
     Ok(())
 }
 
-/// Register {fn} to run as soon as the current task is cancelled, without
-/// waiting for whatever it is doing to finish. Use it to paint the
-/// cancelled state: a handler waiting on children (`gather`, `call_tool`)
-/// stays parked until they wind down, so anything after the wait is too
-/// late to reach the screen.
+/// Register {fn} to run as soon as the current task is cancelled or hits
+/// its deadline, without waiting for whatever it is doing to finish. Use
+/// it to paint the cancelled state: a handler waiting on children
+/// (`gather`, `call_tool`) stays parked until they wind down, so anything
+/// after the wait is too late to reach the screen.
+///
+/// The callback receives the reason (`"cancelled"` or `"timeout"`) and may
+/// still call `ctx:finish`; the host prefers that reply over the generic
+/// cancelled/timeout error. Mark it `is_error = true` and end it with a
+/// marker, so the model knows the output it gets is cut short.
 ///
 /// The callback runs outside your coroutine, so it must not yield. It
 /// fires at most once, immediately if the task is already cancelled. An
 /// error inside it is logged and never reaches your handler, and the
 /// other hooks still run.
 ///
-/// @param fn function Zero-argument function to run on cancel.
+/// @param fn function Function to run on cancel; receives the reason string.
 /// @example
-/// maki.async.on_cancel(function()
-///   view:append({ { "cancelled", "tool_error" } })
+/// maki.async.on_cancel(function(reason)
+///   view:append({ { reason, "tool_error" } })
+///   ctx:finish({ llm_output = partial .. "\n[cancelled; output is partial]", is_error = true })
 /// end)
 /// maki.async.gather(children)
 #[lua_fn]
