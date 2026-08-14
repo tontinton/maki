@@ -462,6 +462,14 @@ pub enum UiAction {
         scroll_top: u16,
     },
     Builtin(BuiltinAction),
+    /// `reply_tx` answers whether {cmdline} resolved to a known command, not
+    /// how the command itself went: `/compact` streams for a minute, and the
+    /// Lua caller must not park for that long.
+    RunCommand {
+        cmdline: String,
+        depth: u8,
+        reply_tx: flume::Sender<Result<(), String>>,
+    },
 }
 
 /// Hand an action to the UI event loop. A full or closed channel means the

@@ -2551,7 +2551,7 @@ fn command_handler_receives_args_and_fargs(args: &str, expected_flash: &str) {
     .unwrap();
     let rx = host.ui_action_rx();
     host.event_handle()
-        .run_command(Arc::from("p"), Arc::from("/echo"), args.into());
+        .run_command(Arc::from("p"), Arc::from("/echo"), args.into(), 0);
 
     let action = rx
         .recv_timeout(Duration::from_secs(5))
@@ -2559,6 +2559,51 @@ fn command_handler_receives_args_and_fargs(args: &str, expected_flash: &str) {
     assert!(matches!(action, maki_lua::UiAction::Flash(msg) if msg == expected_flash));
 }
 
+const RUN_COMMAND_NO_ACTION: &str = "run_command did not reach the UI";
+
+/// `/go` asks for `/cd ~/src` and flashes the `ok, err` pair it gets back. The
+/// command line travels untouched, since the UI is the side that parses it, and
+/// a handler reached at depth 0 asks for depth 1 so a chain of aliases keeps
+/// counting toward the cap.
+#[test_case::test_case(Ok(()), "true|nil" ; "dispatched")]
+#[test_case::test_case(Err("unknown command".into()), "nil|unknown command" ; "rejected")]
+fn run_command_round_trips_through_ui(reply: Result<(), String>, expected_flash: &str) {
+    let host = PluginHost::new(fresh_registry()).unwrap();
+    host.load_source(
+        "p",
+        r#"
+        maki.api.register_command({
+            name = "/go",
+            handler = function()
+                local ok, err = maki.api.run_command("/cd ~/src")
+                maki.ui.flash(tostring(ok) .. "|" .. tostring(err))
+            end,
+        })
+        "#,
+    )
+    .unwrap();
+    let rx = host.ui_action_rx();
+    host.event_handle()
+        .run_command(Arc::from("p"), Arc::from("/go"), String::new(), 0);
+
+    let maki_lua::UiAction::RunCommand {
+        cmdline,
+        depth,
+        reply_tx,
+    } = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect(RUN_COMMAND_NO_ACTION)
+    else {
+        panic!("{RUN_COMMAND_NO_ACTION}");
+    };
+    assert_eq!((cmdline.as_str(), depth), ("/cd ~/src", 1));
+    reply_tx.send(reply).unwrap();
+
+    let action = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect(RUN_COMMAND_NO_ACTION);
+    assert!(matches!(action, maki_lua::UiAction::Flash(msg) if msg == expected_flash));
+}
 #[test_case::test_case(
     r#"maki.api.register_command({ name = "", handler = function() end })"#,
     "non-empty" ; "empty_name"
@@ -3812,7 +3857,7 @@ fn async_run_from_parked_command_handler_runs_promptly() {
     .unwrap();
     let rx = host.ui_action_rx();
     let handle = host.event_handle();
-    handle.run_command(Arc::from("p"), Arc::from("/park"), String::new());
+    handle.run_command(Arc::from("p"), Arc::from("/park"), String::new(), 0);
 
     let action = rx
         .recv_timeout(Duration::from_secs(5))
@@ -3843,7 +3888,7 @@ fn job_callbacks_fire_while_command_handler_parked() {
     .unwrap();
     let rx = host.ui_action_rx();
     let handle = host.event_handle();
-    handle.run_command(Arc::from("p"), Arc::from("/stream"), String::new());
+    handle.run_command(Arc::from("p"), Arc::from("/stream"), String::new(), 0);
 
     let action = rx
         .recv_timeout(Duration::from_secs(5))

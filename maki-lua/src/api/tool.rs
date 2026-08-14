@@ -31,11 +31,15 @@ use serde_json::{Value, json};
 use crate::api::options::{PluginOpts, register_options__doc, register_options__register};
 use crate::api::ui::buf::{BufHandle, line_to_lua};
 use crate::api::util::command::{
-    CommandEntry, CommandHandlerMap, LuaCommandWriter, publish_command_snapshot,
+    CommandEntry, CommandHandlerMap, LuaCommandWriter, UiAction, publish_command_snapshot,
+    ui_roundtrip,
 };
 use crate::api::util::convert::{json_to_lua, lua_to_json};
 use crate::api::util::ctx::LuaCtx;
-use crate::runtime::{HintContent, LiveCtx, PromptHintCallbacks, PromptHintRegistration, Request};
+use crate::api::util::pair::{Pair, try_pair};
+use crate::runtime::{
+    HintContent, LiveCtx, PromptHintCallbacks, PromptHintRegistration, Request, command_depth,
+};
 
 const TOOL_NAME_MAX: usize = 64;
 const TOOL_HANDLER_RETURN_ERR: &str =
@@ -681,6 +685,56 @@ fn register_command(lua: &Lua, #[ctx] plugin: Arc<str>, spec: Table) -> LuaResul
     register_command_from_lua(lua, &spec, plugin)
 }
 
+/// Runs a slash command by name, exactly as typing it in the input would.
+/// Works for built-ins, custom `/project:` and `/user:` commands, MCP
+/// prompts, and commands other plugins registered.
+///
+/// Use it to alias a command you like under a name you prefer, instead of
+/// reimplementing what it does. See `maki.ui.action` for the same idea
+/// applied to keybound UI actions.
+///
+/// Pass the whole command line, arguments included: `"/cd ~/src"`. The
+/// leading slash is optional. Names match exactly apart from case, so a typo
+/// reports an error instead of running the closest command, and a cycle of
+/// aliases stops with one too.
+///
+/// This returns as soon as the command has been dispatched, not when it
+/// finishes, so aliasing something long-running like `/compact` does not
+/// block your handler.
+///
+/// @param cmdline string Command line, e.g. `"/new"` or `"/cd ~/src"`.
+/// @return (boolean|nil, string|nil) `true` once dispatched, or nil and an error message for an unknown command.
+/// @example
+/// -- /resume as an alias for the built-in session picker:
+/// maki.api.register_command({
+///   name = "/resume",
+///   description = "Alias for /sessions",
+///   handler = function()
+///     local ok, err = maki.api.run_command("/sessions")
+///     if not ok then
+///       maki.ui.flash("could not run /sessions: " .. err)
+///     end
+///   end,
+/// })
+#[lua_fn]
+async fn run_command(
+    lua: Lua,
+    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    cmdline: String,
+) -> LuaResult<Pair<bool>> {
+    let depth = command_depth(&lua).saturating_add(1);
+    let reply = try_pair!(
+        ui_roundtrip(tx.as_ref(), |reply_tx| UiAction::RunCommand {
+            cmdline,
+            depth,
+            reply_tx,
+        })
+        .await
+    );
+    try_pair!(reply);
+    Ok((Some(true), None))
+}
+
 /// Add a piece of text to an aggregate prompt slot. Multiple plugins can each
 /// contribute to the same slot, and all contributions are concatenated.
 ///
@@ -856,6 +910,7 @@ lua_table! {
     extend "maki.api" => pub(crate) fn add_tool_fns(pending: PendingTools, plugin: Arc<str>, opts: PluginOpts), DOCS [
         register_tool(pending), register_command(plugin), register_prompt_hint(plugin),
         register_options(plugin, opts), set_prompt(plugin), get_tools, get_tool,
+        manual run_command,
     ]
 }
 
@@ -864,9 +919,11 @@ pub(crate) fn create_api_table(
     pending: PendingTools,
     plugin: Arc<str>,
     opts: PluginOpts,
+    ui_action_tx: Option<flume::Sender<UiAction>>,
 ) -> LuaResult<Table> {
     let t = lua.create_table()?;
     add_tool_fns(&t, lua, pending, plugin, opts)?;
+    run_command__register(&t, lua, ui_action_tx)?;
     Ok(t)
 }
 

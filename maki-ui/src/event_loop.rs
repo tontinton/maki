@@ -618,6 +618,23 @@ impl<'t> EventLoop<'t> {
                 let actions = self.focused_app().run_builtin(action);
                 self.dispatch(self.focused, actions);
             }
+            UiAction::RunCommand {
+                cmdline,
+                depth,
+                reply_tx,
+            } => {
+                // Answer before dispatching: the caller only waits on the name
+                // resolving, and dispatch may take a while (or exit the app).
+                match self.focused_app().run_cmdline(&cmdline, depth) {
+                    Ok(actions) => {
+                        let _ = reply_tx.send(Ok(()));
+                        self.dispatch(self.focused, actions);
+                    }
+                    Err(e) => {
+                        let _ = reply_tx.send(Err(e));
+                    }
+                }
+            }
         }
     }
 

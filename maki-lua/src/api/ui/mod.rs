@@ -258,6 +258,9 @@ fn flash(_lua: &Lua, #[ctx] tx: flume::Sender<UiAction>, msg: String) -> LuaResu
 /// `"plan_toggle"`, `"plan_editor"`, `"edit_input"`, `"pop_queue"`,
 /// `"prev_chat"`, `"next_chat"`.
 ///
+/// For slash commands rather than keybound actions, see
+/// `maki.api.run_command`.
+///
 /// @param name string Action name, e.g. `"file_picker"`.
 /// @return (boolean|nil, string|nil) `true` on success, or nil and an error message for an unknown name.
 /// @example

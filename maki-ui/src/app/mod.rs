@@ -96,6 +96,12 @@ const IMPLEMENT_PARALLEL_HINT: &str = "Use batch+task to parallelize, assign eac
 const TASK_DONE_DETAIL: &str = "✓ ";
 const MISSING_TOOL_COMPLETION: &str = "Tool did not report completion before the turn ended";
 
+/// Depth budget for `maki.api.run_command` chains. Aliases nest a level or two
+/// in practice; the cap only exists so a command aliasing itself reports an
+/// error instead of ping-ponging with the Lua thread forever.
+pub(crate) const MAX_COMMAND_DEPTH: u8 = 8;
+pub(crate) const COMMAND_DEPTH_MSG: &str = "slash command nested too deeply (alias cycle?)";
+
 #[derive(Clone)]
 pub(super) struct TaskEntry {
     name: String,
@@ -848,7 +854,10 @@ impl App {
             .handle_key(key, &self.input_box.buffer.value())
         {
             CommandAction::Consumed => return vec![],
-            CommandAction::Execute(cmd) => return self.execute_command(cmd),
+            CommandAction::Execute(cmd) => {
+                self.input_box.discard();
+                return self.execute_command(cmd, 0);
+            }
             CommandAction::Complete(text) => {
                 self.command_palette.sync(&text);
                 self.input_box.set_input(text);
@@ -1238,8 +1247,33 @@ impl App {
         idx
     }
 
-    fn execute_command(&mut self, cmd: ParsedCommand) -> Vec<Action> {
-        self.input_box.discard();
+    /// Entry point for `maki.api.run_command`: splits a command line into the
+    /// name and args the input bar would hand over, leading slash optional.
+    /// `Err` means nothing ran at all, so the Lua caller can say why.
+    pub(crate) fn run_cmdline(&mut self, cmdline: &str, depth: u8) -> Result<Vec<Action>, String> {
+        if depth > MAX_COMMAND_DEPTH {
+            return Err(COMMAND_DEPTH_MSG.to_string());
+        }
+        let trimmed = cmdline.trim();
+        let (name, args) = trimmed
+            .split_once(char::is_whitespace)
+            .unwrap_or((trimmed, ""));
+        let resolved = self
+            .command_palette
+            .resolve(&format!("/{}", name.trim_start_matches('/')))
+            .ok_or_else(|| format!("unknown command '{name}'"))?;
+        Ok(self.execute_command(
+            ParsedCommand {
+                name: resolved,
+                args: args.trim().to_string(),
+            },
+            depth,
+        ))
+    }
+
+    /// {depth} is the `maki.api.run_command` hop count, forwarded to a Lua
+    /// handler so an alias cycle keeps counting. 0 when the user typed it.
+    fn execute_command(&mut self, cmd: ParsedCommand, depth: u8) -> Vec<Action> {
         match cmd.name.as_str() {
             "/tasks" => {
                 self.open_tasks();
@@ -1357,14 +1391,14 @@ impl App {
                 self.execute_mcp_prompt(name, &cmd.args)
             }
             name if self.command_palette.find_lua_command(name).is_some() => {
-                self.run_lua_command(name, cmd.args);
+                self.run_lua_command(name, cmd.args, depth);
                 vec![]
             }
             _ => vec![],
         }
     }
 
-    fn run_lua_command(&self, name: &str, args: String) {
+    fn run_lua_command(&self, name: &str, args: String, depth: u8) {
         let Some(lua_cmd) = self.command_palette.find_lua_command(name) else {
             return;
         };
@@ -1372,6 +1406,7 @@ impl App {
             Arc::clone(&lua_cmd.plugin),
             Arc::clone(&lua_cmd.name),
             args,
+            depth,
         );
     }
 

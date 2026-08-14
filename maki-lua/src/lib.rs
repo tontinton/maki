@@ -57,6 +57,24 @@ pub mod test_support {
             })
         }
 
+        /// Next dispatched slash command as `(command, args, depth)`, skipping
+        /// other requests.
+        pub fn try_recv_command(&self) -> Option<(String, String, u8)> {
+            use crate::runtime::Request;
+            while let Ok(req) = self.0.try_recv() {
+                if let Request::RunCommand {
+                    command,
+                    args,
+                    depth,
+                    ..
+                } = req
+                {
+                    return Some((command.to_string(), args, depth));
+                }
+            }
+            None
+        }
+
         /// Next fired autocmd as `(event, data)`, skipping other requests.
         pub fn try_recv_autocmd(&self) -> Option<(String, serde_json::Value)> {
             use crate::runtime::Request;

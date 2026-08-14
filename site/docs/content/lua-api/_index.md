@@ -440,6 +440,53 @@ end
 
 ---
 
+### `maki.api.run_command()` {#maki-api-run_command}
+
+```lua
+maki.api.run_command({cmdline})
+```
+
+Runs a slash command by name, exactly as typing it in the input would.
+Works for built-ins, custom `/project:` and `/user:` commands, MCP
+prompts, and commands other plugins registered.
+
+Use it to alias a command you like under a name you prefer, instead of
+reimplementing what it does. See `maki.ui.action` for the same idea
+applied to keybound UI actions.
+
+Pass the whole command line, arguments included: `"/cd ~/src"`. The
+leading slash is optional. Names match exactly apart from case, so a typo
+reports an error instead of running the closest command, and a cycle of
+aliases stops with one too.
+
+This returns as soon as the command has been dispatched, not when it
+finishes, so aliasing something long-running like `/compact` does not
+block your handler.
+
+**Parameters:**
+
+- `{cmdline}` (`string`) Command line, e.g. `"/new"` or `"/cd ~/src"`.
+
+**Returns:** (`boolean|nil`, `string|nil`) `true` once dispatched, or nil and an error message for an unknown command.
+
+**Example:**
+
+```lua
+-- /resume as an alias for the built-in session picker:
+maki.api.register_command({
+  name = "/resume",
+  description = "Alias for /sessions",
+  handler = function()
+    local ok, err = maki.api.run_command("/sessions")
+    if not ok then
+      maki.ui.flash("could not run /sessions: " .. err)
+    end
+  end,
+})
+```
+
+---
+
 ### `maki.api.create_autocmd()` {#maki-api-create_autocmd}
 
 ```lua
@@ -4171,6 +4218,9 @@ and call this from it.
 Valid names: `"file_picker"`, `"search"`, `"tasks"`, `"help"`,
 `"plan_toggle"`, `"plan_editor"`, `"edit_input"`, `"pop_queue"`,
 `"prev_chat"`, `"next_chat"`.
+
+For slash commands rather than keybound actions, see
+`maki.api.run_command`.
 
 **Parameters:**
 
