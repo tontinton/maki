@@ -57,6 +57,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             prefixes: &[
                 "mistral-medium-latest",
                 "mistral-medium-3.5",
+                "mistral-medium-3-5",
                 "mistral-medium-2604",
             ],
             tier: ModelTier::Strong,
