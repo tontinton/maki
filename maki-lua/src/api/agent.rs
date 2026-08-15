@@ -18,8 +18,8 @@ use maki_agent::tools::{
     ToolContext, ToolFilter, ToolLive,
 };
 use maki_agent::{
-    Agent, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, EMPTY_RESPONSE_MARKER,
-    Envelope, EventSender, History, McpSession, SubagentInfo, ToolDoneEvent,
+    Agent, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, DoneReason,
+    EMPTY_RESPONSE_MARKER, Envelope, EventSender, History, McpSession, SubagentInfo, ToolDoneEvent,
 };
 use maki_lua_macro::{lua_class, lua_fn, lua_table};
 use maki_providers::model::ModelTier;
@@ -35,6 +35,7 @@ use crate::api::ui::buf::BufHandle;
 use crate::api::util::convert::{json_to_lua, lua_to_json, lua_tool_result};
 use crate::api::util::ctx::{AgentContext, LuaCtx};
 use crate::api::util::pair::{Pair, err_pair, try_pair};
+use crate::runtime::CANCELLED_MSG;
 
 const SESSION_CLOSED_ERR: &str = "session closed";
 const DEFAULT_SESSION_AUDIENCE: ToolAudience = ToolAudience::GENERAL_SUB;
@@ -805,7 +806,15 @@ async fn prompt(
     // Auto-compaction can shrink the history mid-run, so clamp the start:
     // after a rewrite the tail is this call's output either way.
     let turn = &s.history.as_slice()[history_len.min(s.history.len())..];
-    if let Err(e) = result {
+    // A subagent can be cancelled on its own, and its caller should hear about
+    // that instead of taking a half-finished answer for a real one, so cancel
+    // reads like an error here even though the run ended normally.
+    let cut_short = match &result {
+        Err(e) => Some(e.to_string()),
+        Ok(DoneReason::Cancelled) => Some(CANCELLED_MSG.to_owned()),
+        Ok(_) => None,
+    };
+    if let Some(err) = cut_short {
         let partial = turn
             .iter()
             .filter(|m| matches!(m.role, Role::Assistant))
@@ -823,7 +832,7 @@ async fn prompt(
             tbl.set("text", partial)?;
             Some(tbl)
         };
-        return Ok((tbl, Some(e.to_string())));
+        return Ok((tbl, Some(err)));
     }
     // Waiting here doubles as an ordering barrier: the relay reaches `Done` only
     // after every `TurnComplete`, so all our `ToolLive::Usage` messages sit in the
@@ -893,7 +902,7 @@ fn call_local_tool(
 
 #[cfg(test)]
 mod tests {
-    use maki_agent::TurnCompleteEvent;
+    use maki_agent::{DoneReason, TurnCompleteEvent};
     use maki_providers::Message;
     use serde_json::json;
 
@@ -984,7 +993,7 @@ mod tests {
             AgentEvent::Done {
                 usage: DONE_USAGE,
                 num_turns: 2,
-                stop_reason: None,
+                reason: DoneReason::EndTurn,
             },
         ] {
             sub_tx.send(envelope(event)).unwrap();

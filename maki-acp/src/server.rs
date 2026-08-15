@@ -525,9 +525,9 @@ fn start_event_pump(
                     );
                     continue;
                 }
-                AgentEvent::Done { stop_reason, .. } => {
+                AgentEvent::Done { reason, .. } => {
                     if let Some(id) = pending.lock().unwrap().take() {
-                        let resp = PromptResponse::new(translate::map_stop_reason(stop_reason));
+                        let resp = PromptResponse::new(translate::map_done_reason(reason));
                         send(
                             &out_tx,
                             Response::new(id, Ok(AgentResponse::PromptResponse(resp))),

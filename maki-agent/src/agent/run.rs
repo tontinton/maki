@@ -19,8 +19,8 @@ use crate::mcp::McpSession;
 use crate::permissions::PermissionManager;
 use crate::tools::{Deadline, FileReadTracker, LocalTools, ToolAudience, ToolContext};
 use crate::{
-    AgentConfig, AgentError, AgentEvent, AgentInput, AgentMode, EventSender, ExtractedCommand,
-    InterruptSource, SessionMailbox, TurnCompleteEvent,
+    AgentConfig, AgentError, AgentEvent, AgentInput, AgentMode, DoneReason, EventSender,
+    ExtractedCommand, InterruptSource, SessionMailbox, TurnCompleteEvent,
 };
 use maki_config::{ModelPolicy, ToolOutputLines};
 use maki_storage::id::SessionRef;
@@ -51,7 +51,7 @@ pub fn resolve_compaction_model(
 
 enum TurnOutcome {
     Continue,
-    Done(Option<StopReason>),
+    Done(DoneReason),
 }
 
 #[derive(Clone)]
@@ -191,7 +191,9 @@ impl<'h> Agent<'h> {
         self
     }
 
-    pub async fn run(&mut self, input: AgentInput) -> Result<(), AgentError> {
+    /// Cancellation is an ending, not a failure: it comes back as
+    /// `Ok(DoneReason::Cancelled)` so callers only report real errors.
+    pub async fn run(&mut self, input: AgentInput) -> Result<DoneReason, AgentError> {
         let AgentInput {
             message,
             mode,
@@ -219,13 +221,17 @@ impl<'h> Agent<'h> {
             "agent run started"
         );
 
-        let result = self.run_loop().await;
+        let reason = match self.run_loop().await {
+            Ok(reason) => reason,
+            Err(AgentError::Cancelled) => {
+                sanitize_cancelled_history(self.history, self.rollback_len);
+                DoneReason::Cancelled
+            }
+            Err(e) => return Err(e),
+        };
+        self.emit_done(reason)?;
 
-        if matches!(result, Err(AgentError::Cancelled)) {
-            sanitize_cancelled_history(self.history, self.rollback_len);
-        }
-
-        result
+        Ok(reason)
     }
 
     fn push_input_context(&mut self, preamble: Vec<Message>) {
@@ -239,20 +245,16 @@ impl<'h> Agent<'h> {
         }
     }
 
-    async fn run_loop(&mut self) -> Result<(), AgentError> {
+    async fn run_loop(&mut self) -> Result<DoneReason, AgentError> {
         loop {
             if let Some(max) = self.config.max_turns
                 && self.num_turns >= max
             {
-                self.emit_done(None)?;
-                return Ok(());
+                return Ok(DoneReason::MaxTurns);
             }
             match self.turn().await? {
                 TurnOutcome::Continue => {}
-                TurnOutcome::Done(stop_reason) => {
-                    self.emit_done(stop_reason)?;
-                    return Ok(());
-                }
+                TurnOutcome::Done(reason) => return Ok(reason),
             }
         }
     }
@@ -366,7 +368,7 @@ impl<'h> Agent<'h> {
         if has_tools {
             Ok(TurnOutcome::Continue)
         } else {
-            Ok(TurnOutcome::Done(stop_reason))
+            Ok(TurnOutcome::Done(stop_reason.into()))
         }
     }
 
@@ -410,17 +412,18 @@ impl<'h> Agent<'h> {
             })))
     }
 
-    fn emit_done(&self, stop_reason: Option<StopReason>) -> Result<(), AgentError> {
+    fn emit_done(&self, reason: DoneReason) -> Result<(), AgentError> {
         info!(
             self.num_turns,
             total_input = self.total_usage.input,
             total_output = self.total_usage.output,
+            %reason,
             "agent run completed"
         );
         self.event_tx.send(AgentEvent::Done {
             usage: self.total_usage,
             num_turns: self.num_turns,
-            stop_reason,
+            reason,
         })
     }
 
@@ -665,7 +668,7 @@ mod tests {
     }
 
     fn make_agent(
-        provider: MockProvider,
+        provider: impl Provider + 'static,
         history: &mut History,
     ) -> (Agent<'_>, flume::Receiver<Envelope>) {
         let (raw_tx, event_rx) = flume::unbounded();
@@ -800,18 +803,17 @@ mod tests {
         events
     }
 
-    async fn run_agent(provider: MockProvider) -> (u32, Option<StopReason>) {
+    async fn run_agent(provider: MockProvider, max_turns: Option<u32>) -> (u32, DoneReason) {
         let mut history = History::new(Vec::new());
         let (mut agent, event_rx) = make_agent(provider, &mut history);
+        agent.config.max_turns = max_turns;
         let _ = agent.run(default_input()).await;
         drain_events(&event_rx)
             .into_iter()
             .find_map(|e| match e.event {
                 AgentEvent::Done {
-                    num_turns,
-                    stop_reason,
-                    ..
-                } => Some((num_turns, stop_reason)),
+                    num_turns, reason, ..
+                } => Some((num_turns, reason)),
                 _ => None,
             })
             .expect("expected Done event")
@@ -901,16 +903,24 @@ mod tests {
         );
     }
 
-    #[test_case(&[StopReason::EndTurn],                                                     1, Some(StopReason::EndTurn)  ; "end_turn_completes")]
-    #[test_case(&[StopReason::MaxTokens, StopReason::EndTurn],                                 2, Some(StopReason::EndTurn)  ; "max_tokens_continues")]
-    #[test_case(&[StopReason::MaxTokens, StopReason::MaxTokens, StopReason::MaxTokens, StopReason::MaxTokens], 4, Some(StopReason::MaxTokens) ; "max_tokens_gives_up_after_limit")]
-    fn turn_counting(stops: &[StopReason], expected_turns: u32, expected_stop: Option<StopReason>) {
+    /// A truncated answer buys another turn, but only until one of the two
+    /// budgets runs out: the continuation limit or the caller's `max_turns`.
+    #[test_case(&[StopReason::EndTurn], None, 1, DoneReason::EndTurn ; "end_turn_completes")]
+    #[test_case(&[StopReason::MaxTokens, StopReason::EndTurn], None, 2, DoneReason::EndTurn ; "max_tokens_continues")]
+    #[test_case(&[StopReason::MaxTokens; 4], None, 4, DoneReason::MaxTokens ; "max_tokens_gives_up_after_limit")]
+    #[test_case(&[StopReason::MaxTokens, StopReason::EndTurn], Some(1), 1, DoneReason::MaxTurns ; "turn_budget_exhausted")]
+    fn turn_counting(
+        stops: &[StopReason],
+        max_turns: Option<u32>,
+        expected_turns: u32,
+        expected_reason: DoneReason,
+    ) {
         smol::block_on(async {
             let responses: Vec<_> = stops.iter().map(|s| text_response(*s)).collect();
             let provider = MockProvider::new(responses);
-            let (turns, stop_reason) = run_agent(provider).await;
+            let (turns, reason) = run_agent(provider, max_turns).await;
             assert_eq!(turns, expected_turns);
-            assert_eq!(stop_reason, expected_stop);
+            assert_eq!(reason, expected_reason);
         });
     }
 
@@ -1069,45 +1079,23 @@ mod tests {
             let (trigger, cancel) = CancelToken::new();
             trigger.cancel();
 
-            let (raw_tx, _rx) = flume::unbounded();
             let mut history = History::new(Vec::new());
-            let mut agent = Agent::new(
-                AgentParams {
-                    provider: Arc::new(HangingProvider),
-                    model: default_model(),
-                    config: AgentConfig::default(),
-                    tool_output_lines: ToolOutputLines::default(),
-                    permissions: Arc::new(PermissionManager::new(
-                        maki_config::PermissionsConfig {
-                            default: maki_config::DefaultEffect::Allow,
-                            rules: vec![],
-                            ..Default::default()
-                        },
-                        std::path::PathBuf::from("/tmp"),
-                    )),
-                    session_id: None,
-                    mailbox: None,
-                    timeouts: maki_providers::Timeouts::default(),
-                    file_tracker: FileReadTracker::fresh(),
-                    prompt_slots: Arc::new(crate::prompt::ResolvedSlots::default()),
-                    subagent_cancels: Arc::new(crate::cancel::CancelMap::new()),
-                    registry: Arc::new(crate::tools::ToolRegistry::new()),
-                    audience: ToolAudience::MAIN,
-                    model_policy: Arc::new(ModelPolicy::default()),
-                },
-                AgentRunParams {
-                    history: &mut history,
-                    system: "system".into(),
-                    event_tx: EventSender::new(raw_tx, 0),
-                    tools: serde_json::json!([]),
-                },
-            )
-            .with_cancel(cancel);
+            let (agent, event_rx) = make_agent(HangingProvider, &mut history);
+            let mut agent = agent.with_cancel(cancel);
 
-            let result = agent.run(default_input()).await;
-            assert!(matches!(result, Err(AgentError::Cancelled)));
+            assert_eq!(
+                agent.run(default_input()).await.unwrap(),
+                DoneReason::Cancelled
+            );
             drop(agent);
             assert_ends_with_cancel_marker(&history);
+            assert!(has_event(&drain_events(&event_rx), |e| matches!(
+                e,
+                AgentEvent::Done {
+                    reason: DoneReason::Cancelled,
+                    ..
+                }
+            )));
         });
     }
 

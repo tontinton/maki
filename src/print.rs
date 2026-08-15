@@ -17,11 +17,11 @@ use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
 use maki_agent::headless::{HeadlessHandle, HeadlessParams};
 use maki_agent::tools::QUESTION_TOOL_NAME;
-use maki_agent::{AgentConfig, AgentEvent, Envelope, ImageSource, PermissionsConfig};
+use maki_agent::{AgentConfig, AgentEvent, DoneReason, Envelope, ImageSource, PermissionsConfig};
 use maki_config::ModelPolicy;
 use maki_lua::EventHandle;
+use maki_providers::TokenUsage;
 use maki_providers::model::Model;
-use maki_providers::{StopReason, TokenUsage};
 use maki_storage::id::SessionRef;
 use serde::Serialize;
 use serde_json::Value;
@@ -58,7 +58,7 @@ struct PrintResult {
     duration_ms: u128,
     num_turns: u32,
     result: String,
-    stop_reason: Option<StopReason>,
+    stop_reason: Option<DoneReason>,
     session_id: SessionRef,
     total_cost_usd: f64,
     usage: TokenUsage,
@@ -215,7 +215,7 @@ pub fn run(
     let mut is_error = false;
     let mut num_turns: u32 = 0;
     let mut usage = TokenUsage::default();
-    let mut stop_reason: Option<StopReason> = None;
+    let mut stop_reason: Option<DoneReason> = None;
 
     while let Ok(envelope) = smol::block_on(event_rx.recv_async()) {
         let Envelope {
@@ -296,11 +296,11 @@ pub fn run(
             AgentEvent::Done {
                 usage: u,
                 num_turns: turns,
-                stop_reason: sr,
+                reason,
             } => {
                 num_turns = *turns;
                 usage = *u;
-                stop_reason = *sr;
+                stop_reason = Some(*reason);
                 break;
             }
             AgentEvent::Error { message } => {
@@ -386,7 +386,7 @@ mod tests {
             duration_ms: 1234,
             num_turns: 2,
             result: "done".into(),
-            stop_reason: Some(StopReason::EndTurn),
+            stop_reason: Some(DoneReason::EndTurn),
             session_id: SessionRef::generate(),
             total_cost_usd: 0.003,
             usage: TokenUsage::default(),

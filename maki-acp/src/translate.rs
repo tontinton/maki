@@ -1,8 +1,9 @@
 use agent_client_protocol_schema::{
-    Content, ContentBlock, ContentChunk, Diff, ImageContent, SessionUpdate, TextContent, ToolCall,
-    ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
-    ToolCallUpdateFields, ToolKind,
+    Content, ContentBlock, ContentChunk, Diff, ImageContent, SessionUpdate, StopReason,
+    TextContent, ToolCall, ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus,
+    ToolCallUpdate, ToolCallUpdateFields, ToolKind,
 };
+use maki_agent::DoneReason;
 use maki_agent::tools::ToolRegistry;
 use maki_agent::types::{ToolDoneEvent, ToolOutput, ToolStartEvent};
 use maki_providers::{ContentBlock as MsgBlock, ImageMediaType, Message, Role as MsgRole};
@@ -157,19 +158,12 @@ pub fn tool_done(event: &ToolDoneEvent) -> SessionUpdate {
     ))
 }
 
-pub fn map_stop_reason(
-    sr: Option<maki_providers::StopReason>,
-) -> agent_client_protocol_schema::StopReason {
-    match sr {
-        Some(maki_providers::StopReason::EndTurn) | None => {
-            agent_client_protocol_schema::StopReason::EndTurn
-        }
-        Some(maki_providers::StopReason::MaxTokens) => {
-            agent_client_protocol_schema::StopReason::MaxTokens
-        }
-        Some(maki_providers::StopReason::ToolUse) => {
-            agent_client_protocol_schema::StopReason::EndTurn
-        }
+pub fn map_done_reason(reason: DoneReason) -> StopReason {
+    match reason {
+        DoneReason::EndTurn => StopReason::EndTurn,
+        DoneReason::MaxTokens => StopReason::MaxTokens,
+        DoneReason::MaxTurns => StopReason::MaxTurnRequests,
+        DoneReason::Cancelled => StopReason::Cancelled,
     }
 }
 
@@ -277,12 +271,13 @@ mod tests {
         assert_eq!(fenced(input), expected);
     }
 
-    #[test_case(None; "missing_stop_reason")]
-    #[test_case(Some(maki_providers::StopReason::ToolUse); "tool_use")]
-    fn stop_reason_without_acp_equivalent_maps_to_end_turn(sr: Option<maki_providers::StopReason>) {
+    /// The only pair whose names disagree, and the one ACP clients read to tell
+    /// "the model stopped" from "the agent ran out of turns".
+    #[test]
+    fn max_turns_maps_to_max_turn_requests() {
         assert_eq!(
-            map_stop_reason(sr),
-            agent_client_protocol_schema::StopReason::EndTurn
+            map_done_reason(DoneReason::MaxTurns),
+            StopReason::MaxTurnRequests
         );
     }
 

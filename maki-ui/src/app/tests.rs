@@ -9,7 +9,7 @@ use arc_swap::ArcSwap;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use maki_agent::permissions::PermissionManager;
 use maki_agent::{
-    ImageMediaType, McpConfigErrors, McpServerInfo, McpServerStatus, McpSnapshot,
+    DoneReason, ImageMediaType, McpConfigErrors, McpServerInfo, McpServerStatus, McpSnapshot,
     McpSnapshotReader, ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent,
 };
 use maki_config::{PermissionsConfig, UiConfig};
@@ -105,6 +105,18 @@ fn agent_msg_with_run_id(event: AgentEvent, run_id: u64) -> Msg {
         subagent: None,
         run_id,
     }))
+}
+
+fn done() -> AgentEvent {
+    AgentEvent::Done {
+        usage: TokenUsage::default(),
+        num_turns: 1,
+        reason: DoneReason::EndTurn,
+    }
+}
+
+fn done_event() -> Msg {
+    agent_msg(done())
 }
 
 fn subagent_info(parent_id: &str, name: &str) -> SubagentInfo {
@@ -260,7 +272,7 @@ fn ctrl_c_quits_when_input_empty() {
     assert!(actions.is_empty());
 }
 
-#[test_case(AgentEvent::Done { usage: TokenUsage::default(), num_turns: 1, stop_reason: None }, ExitRequest::Success ; "done_exits_success")]
+#[test_case(done(), ExitRequest::Success ; "done_exits_success")]
 #[test_case(AgentEvent::Error { message: "boom".into() }, ExitRequest::Error ; "error_exits_error")]
 fn exit_on_done_flag_triggers_exit(event: AgentEvent, expected: ExitRequest) {
     let mut app = test_app();
@@ -1456,11 +1468,7 @@ fn edge_scroll_makes_app_animating() {
     app.status = Status::Streaming;
     app.run_id = 1;
     app.update(agent_msg(AgentEvent::TextDelta { text: "x".into() }));
-    app.update(agent_msg(AgentEvent::Done {
-        usage: TokenUsage::default(),
-        num_turns: 1,
-        stop_reason: None,
-    }));
+    app.update(done_event());
     assert!(!app.is_animating());
     let zone = Rect::new(0, 2, 80, 20);
     set_zone(&mut app, SelectionZone::Messages, zone);
@@ -1646,11 +1654,7 @@ fn pending_copy_not_animating() {
     app.status = Status::Streaming;
     app.run_id = 1;
     app.update(agent_msg(AgentEvent::TextDelta { text: "x".into() }));
-    app.update(agent_msg(AgentEvent::Done {
-        usage: TokenUsage::default(),
-        num_turns: 1,
-        stop_reason: None,
-    }));
+    app.update(done_event());
     make_pending_copy(&mut app);
     assert!(!app.is_animating());
 }
@@ -1838,14 +1842,7 @@ fn stale_done_does_not_drain_queue() {
     cancel_app(&mut app);
     app.queue_and_notify(queued_msg("next"));
 
-    app.update(agent_msg_with_run_id(
-        AgentEvent::Done {
-            usage: TokenUsage::default(),
-            num_turns: 1,
-            stop_reason: None,
-        },
-        1,
-    ));
+    app.update(agent_msg_with_run_id(done(), 1));
     assert_eq!(app.queue.len(), 1);
     assert_eq!(app.status, Status::Idle);
 }
@@ -2686,9 +2683,7 @@ fn streaming_app_with_history() -> App {
 
 /// The stale event is dropped, yet the cancelled turn still reaches disk: the
 /// next frame's checkpoint syncs the mirror whatever event arrived.
-#[test_case(
-    AgentEvent::Done { usage: TokenUsage::default(), num_turns: 1, stop_reason: None } ; "stale_done"
-)]
+#[test_case(done() ; "stale_done")]
 #[test_case(
     AgentEvent::Error { message: "timeout".into() } ; "stale_error"
 )]
@@ -2962,14 +2957,6 @@ fn flush_restored_queue_drops_recovery_snapshot() {
 }
 
 // --- Plan form integration tests ---
-
-fn done_event() -> Msg {
-    agent_msg(AgentEvent::Done {
-        usage: TokenUsage::default(),
-        num_turns: 1,
-        stop_reason: None,
-    })
-}
 
 fn implement_msg(parallel: bool) -> String {
     if parallel {
