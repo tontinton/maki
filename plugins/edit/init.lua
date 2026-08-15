@@ -2,6 +2,7 @@ local shorten_path = require("maki.shorten_path")
 local ToolView = require("maki.tool_view")
 local fuzzy_replace = require("maki.fuzzy_replace")
 local replace_lines = require("edit_helpers").replace_lines
+local insert_after = require("edit_helpers").insert_after
 
 local SNIPPET_MAX_CHARS = 32
 local FALLBACK_VIEW_LINES = 10
@@ -10,7 +11,7 @@ local EDIT_LINES_DESCRIPTION =
   [[Edit lines by number. Replaces lines from `start` to `end` (inclusive) with `new_string`. Use empty `new_string` to delete a range. Do not use with the batch tool.]]
 
 local INSERT_LINES_DESCRIPTION =
-  [[Insert lines before a given line number. Lines at `line` and below shift down. Existing lines are preserved. Do not use with the batch tool.]]
+  [[Insert `new_string` after line `line`, or at the top with 0. Only include new lines, never lines already in the file. Do not use with the batch tool.]]
 
 local EDIT_DESCRIPTION = [[Replace an exact string match in a file.
 
@@ -454,7 +455,7 @@ register_tool_if(opts.insert_lines, {
       },
       line = {
         type = "integer",
-        description = "Line number to insert before (1-indexed). Use 1 to insert at the top.",
+        description = "Line number to insert after (1-indexed). Use 0 to insert at the top.",
         required = true,
       },
       new_string = {
@@ -467,16 +468,16 @@ register_tool_if(opts.insert_lines, {
 
   header = edit_header,
   restore = diff_restore(function(input)
-    return { { new = input.new_string, nr = input.line } }
+    return { { new = input.new_string, nr = input.line + 1 } }
   end),
 
   handler = function(input, ctx)
     local result, err = apply_edit(input.path, ctx, function(content)
-      return replace_lines(content, input.line, nil, input.new_string)
+      return insert_after(content, input.line, input.new_string)
     end)
     if not result then
       return { llm_output = err, is_error = true }
     end
-    return diff_result(result, string.format("inserted at line %d in %s", input.line, shorten_path(result.path)))
+    return diff_result(result, string.format("inserted after line %d in %s", input.line, shorten_path(result.path)))
   end,
 })
