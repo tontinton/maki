@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::iter;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use agent_client_protocol_schema::{
@@ -18,6 +19,7 @@ use flume::{Receiver, Sender};
 use maki_agent::headless::{self, InteractiveHandle, InteractiveParams};
 use maki_agent::mcp::config::{RawHttpFields, RawStdioFields, RawTransport};
 use maki_agent::mcp::{self, McpHandle};
+use maki_agent::permissions::PermissionAnswer;
 use maki_agent::types::AgentEvent;
 use maki_agent::{AgentInput, AgentMode, Envelope, ImageMediaType, ImageSource};
 use maki_config::MAX_SERVER_NAME_LEN;
@@ -34,14 +36,26 @@ use crate::{AcpParams, methods, permissions, translate};
 
 const FIRST_OUTGOING_REQUEST_ID: i64 = 1000;
 
-type PendingPrompt = Arc<Mutex<Option<RequestId>>>;
+/// Ids come from here and are never reused, so a late answer for a closed
+/// session cannot match a request of the session that replaced it.
+static NEXT_OUTGOING_REQUEST_ID: AtomicI64 = AtomicI64::new(FIRST_OUTGOING_REQUEST_ID);
+
+/// What the client still owes us. Only one permission can be outstanding: the
+/// agent holds the answer channel while it waits for one.
+#[derive(Default)]
+struct Pending {
+    prompt: Option<RequestId>,
+    permission: Option<i64>,
+}
+
+type PendingState = Arc<Mutex<Pending>>;
 
 struct SessionState {
     handle: InteractiveHandle,
     mcp: Option<McpHandle>,
     current_mode: AgentMode,
     current_model: String,
-    pending_prompt: PendingPrompt,
+    pending: PendingState,
 }
 
 struct Server {
@@ -286,7 +300,7 @@ async fn close_session(srv: &mut Server) {
     };
     // The event pump dies with the session, so the prompt it owed an answer to
     // has to be answered here or the client waits on it forever.
-    if let Some(id) = state.pending_prompt.lock().unwrap().take() {
+    if let Some(id) = state.pending.lock().unwrap().prompt.take() {
         let resp = PromptResponse::new(StopReason::Cancelled);
         send(
             &srv.out_tx,
@@ -305,7 +319,7 @@ fn install_session(
     mcp: Option<McpHandle>,
     current_model: String,
 ) {
-    let pending = PendingPrompt::default();
+    let pending = PendingState::default();
     start_event_pump(
         handle.event_rx.clone(),
         handle.session_id.clone(),
@@ -317,7 +331,7 @@ fn install_session(
         mcp,
         current_mode: AgentMode::Build,
         current_model,
-        pending_prompt: pending,
+        pending,
     });
 }
 
@@ -362,7 +376,7 @@ fn handle_prompt(srv: &mut Server, raw: &Value, id: &RequestId) -> Result<(), Ac
         .input_tx
         .send(input)
         .map_err(|_| AcpError::new(-32603, "session ended"))?;
-    *session.pending_prompt.lock().unwrap() = Some(id.clone());
+    session.pending.lock().unwrap().prompt = Some(id.clone());
     Ok(())
 }
 
@@ -420,6 +434,9 @@ fn handle_notification(srv: &Server, method: &str) {
     match method {
         "session/cancel" => {
             if let Some(session) = &srv.session {
+                // Any answer still in flight belongs to the cancelled turn, so
+                // forget its id and let it be dropped on arrival.
+                session.pending.lock().unwrap().permission = None;
                 let _ = session.handle.cancel_tx.try_send(());
             }
         }
@@ -429,12 +446,35 @@ fn handle_notification(srv: &Server, method: &str) {
 
 fn handle_incoming_response(srv: &Server, raw: &Value) {
     let Some(session) = &srv.session else { return };
-
-    if let Some(result) = raw.get("result")
-        && let Ok(resp) = serde_json::from_value::<RequestPermissionResponse>(result.clone())
+    let Some(id) = raw.get("id").and_then(Value::as_i64) else {
+        return;
+    };
+    if session
+        .pending
+        .lock()
+        .unwrap()
+        .permission
+        .take_if(|pending| *pending == id)
+        .is_none()
     {
-        let answer = permissions::outcome_to_answer(&resp.outcome);
-        let _ = session.handle.answer_tx.send(answer.encode());
+        warn!(id, "response for an unknown request id");
+        return;
+    }
+    let _ = session
+        .handle
+        .answer_tx
+        .send(permission_answer(raw).encode());
+}
+
+/// A response we cannot read still has to answer the agent, or the tool waits
+/// on a permission that will never come.
+fn permission_answer(raw: &Value) -> PermissionAnswer {
+    match raw
+        .get("result")
+        .map(|result| serde_json::from_value::<RequestPermissionResponse>(result.clone()))
+    {
+        Some(Ok(resp)) => permissions::outcome_to_answer(&resp.outcome),
+        _ => PermissionAnswer::Deny,
     }
 }
 
@@ -484,11 +524,10 @@ fn start_event_pump(
     event_rx: Receiver<Envelope>,
     session_id: SessionRef,
     out_tx: Sender<Value>,
-    pending: PendingPrompt,
+    pending: PendingState,
 ) {
     smol::spawn(async move {
         let sid = SessionId::from(session_id.to_string());
-        let mut next_request_id = FIRST_OUTGOING_REQUEST_ID;
 
         while let Ok(Envelope {
             event, subagent, ..
@@ -514,11 +553,12 @@ fn start_event_pump(
                             ToolCallUpdate::new(ToolCallId::from(id), fields),
                             permissions::permission_options(),
                         ));
-                    next_request_id += 1;
+                    let request_id = NEXT_OUTGOING_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+                    pending.lock().unwrap().permission = Some(request_id);
                     send(
                         &out_tx,
                         Request {
-                            id: RequestId::Number(next_request_id),
+                            id: RequestId::Number(request_id),
                             method: Arc::from(request.method()),
                             params: Some(request),
                         },
@@ -526,7 +566,7 @@ fn start_event_pump(
                     continue;
                 }
                 AgentEvent::Done { reason, .. } => {
-                    if let Some(id) = pending.lock().unwrap().take() {
+                    if let Some(id) = pending.lock().unwrap().prompt.take() {
                         let resp = PromptResponse::new(translate::map_done_reason(reason));
                         send(
                             &out_tx,
@@ -536,7 +576,7 @@ fn start_event_pump(
                     continue;
                 }
                 AgentEvent::Error { message } => {
-                    if let Some(id) = pending.lock().unwrap().take() {
+                    if let Some(id) = pending.lock().unwrap().prompt.take() {
                         let error = AcpError::internal_error().data(Value::String(message));
                         send(&out_tx, Response::<AgentResponse>::new(id, Err(error)));
                     }
@@ -583,12 +623,95 @@ fn json_str(e: &impl std::fmt::Display) -> Value {
 
 #[cfg(test)]
 mod tests {
+    use maki_agent::permissions::PermissionManager;
     use maki_providers::{ContentBlock as MsgBlock, Role, TokenUsage};
     use maki_storage::StateDir;
     use maki_storage::sessions::Session;
     use tempfile::TempDir;
+    use test_case::test_case;
 
     use super::*;
+
+    const ANSWERED_ID: i64 = 1001;
+    const UNKNOWN_ID: i64 = 1002;
+
+    fn allow_once(id: i64) -> Value {
+        serde_json::json!({
+            "id": id,
+            "result": { "outcome": { "outcome": "selected", "optionId": "allow_once" } },
+        })
+    }
+
+    #[test_case(allow_once(ANSWERED_ID), PermissionAnswer::AllowOnce ; "selected_option")]
+    #[test_case(serde_json::json!({ "id": ANSWERED_ID, "result": { "outcome": { "outcome": "cancelled" } } }), PermissionAnswer::Deny ; "cancelled_outcome")]
+    #[test_case(serde_json::json!({ "id": ANSWERED_ID, "result": { "nonsense": true } }), PermissionAnswer::Deny ; "unparsable_result")]
+    #[test_case(serde_json::json!({ "id": ANSWERED_ID, "error": { "code": -32603 } }), PermissionAnswer::Deny ; "jsonrpc_error")]
+    fn permission_answer_maps_response(raw: Value, expected: PermissionAnswer) {
+        assert_eq!(permission_answer(&raw), expected);
+    }
+
+    fn server_awaiting_answer() -> (Server, Receiver<String>) {
+        let (answer_tx, answer_rx) = flume::unbounded();
+        let handle = InteractiveHandle {
+            event_rx: flume::unbounded().1,
+            tool_names: Vec::new(),
+            input_tx: flume::unbounded().0,
+            answer_tx,
+            cancel_tx: flume::unbounded().0,
+            model_tx: flume::unbounded().0,
+            session_id: SessionRef::from(MakiId::generate()),
+            permissions: Arc::new(PermissionManager::new(
+                maki_config::PermissionsConfig::default(),
+                PathBuf::from("/project"),
+            )),
+            task: smol::spawn(async {}),
+        };
+        let server = Server {
+            out_tx: flume::unbounded().0,
+            model_specs: Vec::new(),
+            model_policy: Arc::new(maki_config::ModelPolicy::default()),
+            session: Some(SessionState {
+                handle,
+                mcp: None,
+                current_mode: AgentMode::Build,
+                current_model: String::new(),
+                pending: Arc::new(Mutex::new(Pending {
+                    permission: Some(ANSWERED_ID),
+                    ..Default::default()
+                })),
+            }),
+        };
+        (server, answer_rx)
+    }
+
+    #[test]
+    fn only_the_outstanding_request_id_is_answered() {
+        let (srv, answer_rx) = server_awaiting_answer();
+
+        handle_incoming_response(&srv, &allow_once(UNKNOWN_ID));
+        assert!(answer_rx.is_empty(), "an unknown id is dropped");
+
+        handle_incoming_response(&srv, &allow_once(ANSWERED_ID));
+        assert_eq!(
+            answer_rx.try_recv().ok(),
+            Some(PermissionAnswer::AllowOnce.encode())
+        );
+
+        handle_incoming_response(&srv, &allow_once(ANSWERED_ID));
+        assert!(
+            answer_rx.is_empty(),
+            "a replayed answer cannot land on the next request"
+        );
+    }
+
+    #[test]
+    fn cancel_drops_the_outstanding_permission_request() {
+        let (srv, answer_rx) = server_awaiting_answer();
+        handle_notification(&srv, "session/cancel");
+
+        handle_incoming_response(&srv, &allow_once(ANSWERED_ID));
+        assert!(answer_rx.is_empty(), "the cancelled turn owns that answer");
+    }
 
     #[test]
     fn load_history_round_trips_stored_messages() {
