@@ -13,6 +13,8 @@ Regarding AI use in PRs, describe how you used AI, even include the prompts if u
 
 Useful commands are in the `justfile` file, most useful probably is `just ci` that runs locally basically everything we run in the CI automatically to block PRs.
 
+Rebuilds are slow mostly because of the linker, so dev builds skip debug info for the dependencies and for the C we build from source (`profile.dev.build-override` is where `cc` picks up `-g`). Our own crates keep theirs, so debugging maki feels the same as always, and if you ever want to step into a dependency, add `[profile.dev.package.<name>] debug = true`, or comment out `[profile.dev.package."*"]` in `Cargo.toml` to get all of them back.
+
 My most useful prompts:
 
 ```

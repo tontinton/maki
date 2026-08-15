@@ -32,10 +32,15 @@ Maki is an AI coding agent (like Claude Code and opencode), that is built bottom
 
 ## Testing
 
-- cargo clippy --all --tests -- -D warnings
-- cargo nextest run --workspace
+Cheapest first, and scope to the crate you touched while iterating:
+
+- `just check` (or `cargo check -p <crate> --tests`)
+- `just lint` - `cargo clippy --all --tests -- -D warnings`
+- `just test` - `cargo nextest run --workspace`
 
 Read `justfile` for more.
+
+Dev builds skip debug info for deps and vendored C (our crates keep it); to debug into a dep set `[profile.dev.package.<name>] debug = true`.
 
 ## Nix
 

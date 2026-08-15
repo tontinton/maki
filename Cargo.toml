@@ -191,3 +191,15 @@ inventory = "0.3"
 
 [profile.bench]
 debug = true
+
+# Dev rebuilds are linker bound, and debug info is most of what the linker
+# chews through. Our crates keep theirs so a debugger still works, the 600
+# dependencies do not need any.
+[profile.dev.package."*"]
+debug = false
+
+# `cc` reads DEBUG from here and passes -g when it is on, which covers the C
+# and C++ we build from source: OpenSSL, curl, Luau and 30 tree-sitter
+# grammars. Those static archives held the bulk of the bytes.
+[profile.dev.build-override]
+debug = false

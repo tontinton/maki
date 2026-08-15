@@ -4,6 +4,10 @@ default:
 build *ARGS:
     cargo build {{ARGS}}
 
+# Types only, no codegen, no lints. Add `-p <crate>` to make it cheaper still.
+check *ARGS:
+    cargo check --workspace --tests {{ARGS}}
+
 run *ARGS:
     cargo run {{ARGS}}
 
