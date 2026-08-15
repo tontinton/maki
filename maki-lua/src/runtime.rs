@@ -60,7 +60,10 @@ const MAX_INFLIGHT_TOOLS: usize = 64;
 /// The UI reuses this cap for how many finished bufs it keeps watching.
 pub const WARM_TOOL_CAP: usize = 32;
 const GC_STEP_INTERVAL: usize = 4;
-const WATCHDOG_POLL_INTERVAL: Duration = Duration::from_millis(10);
+/// Only sets how fast the one-shot interrupt is re-armed after it fires, so
+/// the kill still lands within a poll of [`KILL_GRACE`]. The thread ticks even
+/// when no Lua runs, so prefer the slowest interval the grace can hide.
+const WATCHDOG_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// How long a doomed task may run without yielding before the watchdog
 /// shoots it. Cleanup after a cancel or a timeout (batch marking its
 /// children cancelled, rerendering its buf) is plain Lua running with the
