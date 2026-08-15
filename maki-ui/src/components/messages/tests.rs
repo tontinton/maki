@@ -1,6 +1,7 @@
 use super::segment;
 use super::*;
 use crate::components::scrollbar::SCROLLBAR_THUMB;
+use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{Selection, SelectionZone};
 use maki_agent::tools::{BASH_TOOL_NAME, GREP_TOOL_NAME, WRITE_TOOL_NAME};
 use maki_agent::{
@@ -8,6 +9,7 @@ use maki_agent::{
 };
 use ratatui::backend::TestBackend;
 use std::collections::HashSet;
+use std::time::Duration;
 use test_case::test_case;
 
 fn snap_line(text: &str) -> SnapshotLine {
@@ -427,9 +429,110 @@ fn cancel_in_progress_marks_pending_as_error(cache_built: bool) {
     panel.cancel_in_progress();
 
     assert_eq!(panel.in_progress_count(), 0);
-    assert!(!panel.is_animating());
+    assert_eq!(panel.cadence(), Cadence::IDLE);
     assert_eq!(msg_status(&panel, "t1"), ToolStatus::Success);
     assert_eq!(msg_status(&panel, "t2"), ToolStatus::Error);
+}
+
+const THINKING_TEXT: &str = "a long chain of reasoning";
+const HIGHLIGHTED_CODE: &str = "fn main() {}";
+const HIGHLIGHT_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Only `view` advances a typewriter, and collapsed thinking is never drawn,
+/// so its reveal can never finish. Believing it would hold the loop at full
+/// frame rate for as long as the model reasons.
+#[test_case(true  => Cadence::SMOOTH ; "expanded_thinking_reveals")]
+#[test_case(false => Cadence::IDLE   ; "collapsed_thinking_reveals_nothing")]
+fn thinking_animates_only_while_it_is_on_screen(show_thinking: bool) -> Cadence {
+    let config = UiConfig {
+        show_thinking,
+        ..UiConfig::default()
+    };
+    let mut panel = MessagesPanel::new(config, EventHandle::disconnected_for_test());
+
+    panel.thinking_delta(THINKING_TEXT);
+
+    assert!(
+        panel.streaming_thinking.is_animating(),
+        "the typewriter is mid-reveal, it just has nowhere to draw"
+    );
+    panel.cadence()
+}
+
+/// A waiting tool used to claim the whole screen was animating, which is what
+/// pinned the loop at full frame rate. It draws one spinner glyph, so the
+/// glyph rate is all it may ask for. Text arriving beside it earns the smooth
+/// budget.
+#[test_case(false => Cadence::SPINNER ; "waiting_tool_only_spins")]
+#[test_case(true  => Cadence::SMOOTH  ; "streaming_text_beside_it_wins")]
+fn cadence_while_a_tool_is_in_progress(text_streaming: bool) -> Cadence {
+    let mut panel = panel_with_tools(&[("t1", BASH_TOOL_NAME)]);
+    if text_streaming {
+        panel.text_delta("an answer arriving while the tool still runs");
+    }
+    assert_eq!(
+        panel.in_progress_count(),
+        1,
+        "the spinner source has to be live or this proves nothing"
+    );
+    panel.cadence()
+}
+
+/// Without the `show_idle_splash` gate the splash keeps asking for smooth
+/// frames for the rest of the session, long after the first message pushed it
+/// off screen.
+#[test]
+fn splash_stops_driving_cadence_once_a_message_exists() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    assert_eq!(
+        panel.cadence(),
+        Cadence::SMOOTH,
+        "the starfield drifts while the splash is the only thing drawn"
+    );
+
+    panel.tool_start(start("t1", BASH_TOOL_NAME));
+    panel.tool_done(done("t1"));
+
+    assert_eq!(panel.cadence(), Cadence::IDLE, "the splash is gone");
+}
+
+/// `drain_highlights` moved out of `view`, so `tick` is the only thing feeding
+/// the worker now. The wait is the worker's own round trip, not a sleep: the
+/// loop ends the moment the result lands, and the deadline only turns a broken
+/// drain into a failure instead of a hang.
+#[test]
+fn tick_drains_the_highlight_worker() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.tool_start(start("t1", "read"));
+    panel.tool_done(ToolDoneEvent {
+        id: "t1".into(),
+        tool: "read".into(),
+        output: ToolOutput::ReadCode {
+            path: "file.rs".into(),
+            start_line: 1,
+            lines: vec![HIGHLIGHTED_CODE.into()],
+            total_lines: 1,
+            instructions: None,
+        },
+        is_error: false,
+        annotation: None,
+        written_path: None,
+    });
+    rebuild(&mut panel);
+
+    let deadline = Instant::now() + HIGHLIGHT_DEADLINE;
+    while panel.tick() == Dirty::NO {
+        assert!(
+            Instant::now() < deadline,
+            "a highlighted tool stays unstyled until some unrelated repaint"
+        );
+        std::thread::yield_now();
+    }
+
+    assert!(
+        seg_text(&panel, "t1").contains(HIGHLIGHTED_CODE),
+        "the applied result replaces the highlight range in place"
+    );
 }
 
 #[test]
@@ -1156,7 +1259,7 @@ fn second_register_live_buf_replaces_first() {
     panel.tool_start(start("t1", BASH_TOOL_NAME));
     panel.register_live_buf("t1".into(), Arc::clone(&preview));
     panel.register_live_buf("t1".into(), Arc::clone(&handler));
-    panel.poll_live_bufs();
+    let _ = panel.poll_live_bufs();
 
     let msg = panel.find_tool_msg_mut("t1").unwrap();
     assert_eq!(
@@ -1192,13 +1295,14 @@ fn tool_done_moves_live_buf_to_watched_polled_but_not_animating() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     let buf = finish_with_live_buf(&mut panel, "t1", "before", false);
     assert!(panel.watching("t1"));
-    assert!(
-        !panel.is_animating(),
-        "watched bufs must not keep the UI animating"
+    assert_eq!(
+        panel.cadence(),
+        Cadence::IDLE,
+        "a finished tool must not leave a spinner running"
     );
 
     buf.set_lines(vec![snap_line("after")]);
-    panel.poll_live_bufs();
+    assert_eq!(panel.poll_live_bufs(), Dirty::YES, "{OWED}");
     let msg = panel.find_tool_msg_mut("t1").unwrap();
     assert_eq!(
         msg.render_snapshot.as_ref().unwrap().first_line_text(),
@@ -1230,7 +1334,11 @@ fn watched_fifo_evicts_oldest_which_stops_polling_and_restores_with_recorded_cli
     assert!(!panel.watching("t0"));
 
     buf.set_lines(vec![snap_line("after-eviction")]);
-    panel.poll_live_bufs();
+    assert_eq!(
+        panel.poll_live_bufs(),
+        Dirty::NO,
+        "evicted buf must no longer be polled"
+    );
     let msg = panel.find_tool_msg_mut("t0").unwrap();
     assert_eq!(
         msg.render_snapshot.as_ref().unwrap().first_line_text(),
@@ -1275,7 +1383,7 @@ fn tool_done_without_live_buf_is_not_watched_and_click_restores() {
 }
 
 /// The stale-run_id filter drops ToolDone events after a cancel, so the
-/// cancel path itself must retire live bufs: no `is_animating` pin, and
+/// cancel path itself must retire live bufs: no spinner left running, and
 /// the tool stays clickable through the warm path.
 #[test]
 fn cancel_in_progress_retires_live_buf_to_watched() {
@@ -1291,9 +1399,10 @@ fn cancel_in_progress_retires_live_buf_to_watched() {
     panel.register_live_buf("t1".into(), Arc::clone(&buf));
 
     panel.cancel_in_progress();
-    assert!(
-        !panel.is_animating(),
-        "cancel must not leak live bufs that pin animation"
+    assert_eq!(
+        panel.cadence(),
+        Cadence::IDLE,
+        "cancel must not leave a tool marked in progress"
     );
     assert!(panel.watching("t1"));
 
@@ -1302,7 +1411,7 @@ fn cancel_in_progress_retires_live_buf_to_watched() {
     // stale-run_id filter drops it. Taking a body must not cost the screen the
     // last thing a cancelled tool painted.
     let _dropped_reply = buf.take();
-    panel.poll_live_bufs();
+    assert_eq!(panel.poll_live_bufs(), Dirty::YES, "{OWED}");
     let msg = panel.find_tool_msg_mut("t1").unwrap();
     assert_eq!(
         msg.render_snapshot.as_ref().unwrap().first_line_text(),
@@ -1337,7 +1446,11 @@ fn restore_reply_stops_watching_buf() {
     assert!(!panel.watching("t1"));
 
     buf.set_lines(vec![snap_line("stale-mutation")]);
-    panel.poll_live_bufs();
+    assert_eq!(
+        panel.poll_live_bufs(),
+        Dirty::NO,
+        "unwatched buf must no longer be polled"
+    );
     let msg = panel.find_tool_msg_mut("t1").unwrap();
     assert_eq!(
         msg.render_snapshot.as_ref().unwrap().first_line_text(),
@@ -1382,11 +1495,11 @@ fn live_buf_streams_across_clean_polls() {
     panel.register_live_buf("t1".into(), Arc::clone(&buf));
 
     buf.append(snap_line("first"));
-    panel.poll_live_bufs();
-    panel.poll_live_bufs();
+    assert_eq!(panel.poll_live_bufs(), Dirty::YES);
+    assert_eq!(panel.poll_live_bufs(), Dirty::NO, "{QUIET}");
 
     buf.append(snap_line("second"));
-    panel.poll_live_bufs();
+    assert_eq!(panel.poll_live_bufs(), Dirty::YES);
 
     let msg = panel.find_tool_msg_mut("t1").unwrap();
     let snapshot = msg.render_snapshot.as_ref().unwrap();

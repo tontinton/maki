@@ -264,6 +264,10 @@ impl McpSnapshotReader {
     pub fn load(&self) -> Guard<Arc<McpSnapshot>> {
         self.0.load()
     }
+
+    pub fn load_full(&self) -> Arc<McpSnapshot> {
+        self.0.load_full()
+    }
 }
 
 pub enum McpCommand {

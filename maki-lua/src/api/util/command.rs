@@ -89,11 +89,14 @@ impl HintReader {
         Self(Arc::new(ArcSwap::from_pointee(HintSnapshot::default())))
     }
 
-    pub fn load(&self) -> arc_swap::Guard<Arc<HintSnapshot>> {
-        self.0.load()
+    /// Full `Arc` rather than a `Guard`: the UI keeps the last one alive to
+    /// compare identity against the next, which is how it notices a publish.
+    pub fn load_full(&self) -> Arc<HintSnapshot> {
+        self.0.load_full()
     }
 }
 
+/// Publishing end of a plugin's status hints, owned by the Lua thread.
 pub(crate) struct HintWriter {
     store: Arc<ArcSwap<HintSnapshot>>,
     generation: AtomicU64,
@@ -696,14 +699,14 @@ mod tests {
     #[test]
     fn hint_snapshot_publish_and_read() {
         let (writer, reader) = HintWriter::new();
-        assert!(reader.load().entries.is_empty());
+        assert!(reader.load_full().entries.is_empty());
 
         writer.publish(vec![(
             Arc::from("plugA"),
             vec![(" 2/4 ".into(), "fg".into())],
         )]);
 
-        let snap = reader.load();
+        let snap = reader.load_full();
         assert_eq!(snap.entries.len(), 1);
         assert_eq!(snap.generation, 1);
     }

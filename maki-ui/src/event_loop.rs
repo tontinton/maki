@@ -43,12 +43,11 @@ use crate::components::input::Submission;
 use crate::components::usage_modal::UsageFetchState;
 use crate::components::{Action, ExitRequest, Status};
 use crate::input::InputReader;
+use crate::repaint::{Dirty, IDLE_POLL};
 
 use crate::storage_writer::StorageWriter;
 use crate::terminal;
 
-const ANIMATION_INTERVAL_MS: u64 = 16;
-const IDLE_POLL_INTERVAL_MS: u64 = 100;
 /// Max events handled per frame so a flood cannot starve rendering.
 const DRAIN_BUDGET: usize = 256;
 const AGENT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
@@ -449,18 +448,24 @@ impl<'t> EventLoop<'t> {
             let actions = self.focused_app().handle_submit(sub);
             self.dispatch(self.focused, actions);
         }
+        // The first frame always paints. After that only a poller, an event or
+        // an animation tick owes another.
+        let mut dirty = Dirty::YES;
         let result = loop {
-            self.tick();
-            if let Err(e) = self.drain_channels() {
-                break Err(e);
+            dirty |= self.tick();
+            match self.drain_channels() {
+                Ok(d) => dirty |= d,
+                Err(e) => break Err(e),
             }
             self.checkpoint_all();
-            let app = &mut self.sessions[self.focused].app;
-            if let Err(e) = self.terminal.draw(|f| {
-                app.view(f);
-                color_compat::downgrade_if_needed(f.buffer_mut());
-            }) {
-                break Err(e.into());
+            if dirty.take() {
+                let app = &mut self.sessions[self.focused].app;
+                if let Err(e) = self.terminal.draw(|f| {
+                    app.view(f);
+                    color_compat::downgrade_if_needed(f.buffer_mut());
+                }) {
+                    break Err(e.into());
+                }
             }
 
             if let Some(i) = self
@@ -474,15 +479,23 @@ impl<'t> EventLoop<'t> {
                 break Ok(());
             }
 
-            let timeout = if self.sessions[self.focused].app.is_animating() {
-                Duration::from_millis(ANIMATION_INTERVAL_MS)
-            } else {
-                Duration::from_millis(IDLE_POLL_INTERVAL_MS)
-            };
-            if let Some(wake) = self.next_wake(timeout)
-                && let Err(e) = self.handle_wake(wake)
-            {
-                break Err(e);
+            // Sleeping a whole frame instead of a fraction of one is what
+            // makes a spinner cost 12 paints a second instead of 62.
+            let cadence = self.sessions[self.focused].app.cadence();
+            match self.next_wake(cadence.frame().unwrap_or(IDLE_POLL)) {
+                // Any event can change the screen, so paint after handling it
+                // rather than asking every handler to prove it did.
+                Some(wake) => {
+                    dirty = Dirty::YES;
+                    if let Err(e) = self.handle_wake(wake) {
+                        break Err(e);
+                    }
+                }
+                // Only the clock moved, so motion alone owes the frame. The
+                // cadence is the one from before the sleep, so motion that
+                // just stopped still gets a last paint to clear itself off
+                // the screen.
+                None => dirty |= Dirty::from(cadence.moves()),
             }
         };
         // Fatal errors still save every session, kill MCP process groups,
@@ -537,19 +550,20 @@ impl<'t> EventLoop<'t> {
         }
     }
 
-    fn tick(&mut self) {
+    /// Only the focused session is drawn, so only it can owe a frame; focusing
+    /// another is an event, and events always repaint. Background sessions
+    /// still drain their floats, or a plugin writing to a window nobody is
+    /// looking at would lose the output.
+    fn tick(&mut self) -> Dirty {
+        let mut dirty = Dirty::NO;
         for (i, rt) in self.sessions.iter_mut().enumerate() {
-            rt.app.float_mgr.tick();
-            if i != self.focused {
-                continue;
+            if i == self.focused {
+                dirty |= rt.app.tick();
+            } else {
+                let _ = rt.app.float_mgr.tick();
             }
-            rt.app.tick_edge_scroll();
-            rt.app.tick_error_expiry();
-            rt.app.poll_image_paste();
-            rt.app.btw_modal.poll();
-            rt.app.status_bar.poll_branch_update();
-            rt.app.mcp_picker.refresh();
         }
+        dirty
     }
 
     fn handle_agent(&mut self, idx: usize, envelope: Box<maki_agent::Envelope>) {
@@ -557,11 +571,15 @@ impl<'t> EventLoop<'t> {
         self.dispatch(idx, actions);
     }
 
-    fn drain_channels(&mut self) -> Result<()> {
+    fn drain_channels(&mut self) -> Result<Dirty> {
+        let mut dirty = Dirty::NO;
         // Leftovers beyond the budget are picked up right after the next draw.
         for _ in 0..DRAIN_BUDGET {
             match self.next_wake(Duration::ZERO) {
-                Some(wake) => self.handle_wake(wake)?,
+                Some(wake) => {
+                    self.handle_wake(wake)?;
+                    dirty = Dirty::YES;
+                }
                 None => break,
             }
         }
@@ -573,14 +591,16 @@ impl<'t> EventLoop<'t> {
                 || rt.app.state.model.context_window != slot_model.model.context_window
             {
                 rt.app.update_model(&slot_model.model);
+                dirty = Dirty::YES;
             }
         }
         drop(slot_model);
 
+        // These two only fire Lua autocmds. Anything a handler does comes back
+        // as a `UiAction` on the next wake, which repaints then.
         self.emit_focus_change();
         self.emit_status_changes();
-        self.start_mailbox_runs();
-        Ok(())
+        Ok(dirty | self.start_mailbox_runs())
     }
 
     fn handle_ui_action(&mut self, action: UiAction) {
@@ -689,7 +709,7 @@ impl<'t> EventLoop<'t> {
             .fire_autocmd("SessionFocusChanged", data);
     }
 
-    fn start_mailbox_runs(&mut self) {
+    fn start_mailbox_runs(&mut self) -> Dirty {
         let ready: Vec<_> = self
             .sessions
             .iter()
@@ -703,10 +723,12 @@ impl<'t> EventLoop<'t> {
             })
             .collect();
 
+        let dirty = Dirty::from(!ready.is_empty());
         for (index, preamble) in ready {
             let actions = self.sessions[index].app.start_mailbox_run(preamble);
             self.dispatch(index, actions);
         }
+        dirty
     }
 
     /// `List` replies from a background task (the scan can be slow); every

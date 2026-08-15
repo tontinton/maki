@@ -37,6 +37,7 @@ use ratatui::text::Line;
 
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::repaint::Cadence;
 use crate::theme;
 use maki_markdown::render::{CODE_BAR, CODE_BAR_WRAP};
 
@@ -281,6 +282,12 @@ impl SelectionState {
 
     pub fn is_pending_copy(&self) -> bool {
         matches!(self, Self::PendingCopy { .. })
+    }
+
+    /// Edge scroll advances on a timer while a drag rests against the edge of
+    /// the viewport, with no further mouse events to wake the loop.
+    pub fn cadence(&self) -> Cadence {
+        Cadence::when(self.is_edge_scrolling(), Cadence::SMOOTH)
     }
 
     pub fn is_edge_scrolling(&self) -> bool {

@@ -49,6 +49,7 @@ use crate::components::{
     Action, DisplayMessage, DisplayRole, ExitRequest, Overlay, RetryInfo, Status, is_ctrl,
 };
 use crate::image;
+use crate::repaint::{Cadence, Dirty, Watch};
 use crate::selection::{SelectionState, SelectionZone, ZoneRegistry};
 use arc_swap::{ArcSwap, ArcSwapOption};
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
@@ -58,7 +59,9 @@ use maki_agent::{
     SharedMessages, SubagentInfo,
 };
 use maki_config::{ModelPolicy, UiConfig};
-use maki_lua::{BuiltinAction, EventHandle, HintReader, KeymapReader, LuaCommandReader, WinView};
+use maki_lua::{
+    BuiltinAction, EventHandle, HintReader, HintSnapshot, KeymapReader, LuaCommandReader, WinView,
+};
 use maki_providers::{Model, ThinkingConfig, add_cost};
 use maki_storage::StateDir;
 use maki_storage::input_history::InputHistory;
@@ -190,6 +193,7 @@ pub struct App {
     pub(crate) lua_event_handle: EventHandle,
     pub(super) keymap_reader: KeymapReader,
     pub(super) hint_reader: HintReader,
+    hints: Watch<HintSnapshot>,
     pub(crate) restore_event_tx: Option<maki_agent::EventSender>,
     pub(super) restoring: Arc<AtomicBool>,
     subagent_answers: HashMap<String, flume::Sender<String>>,
@@ -280,6 +284,7 @@ impl App {
             permissions,
             model_policy: Arc::clone(&model_policy),
             lua_event_handle,
+            hints: Watch::seeded(hint_reader.load_full()),
             keymap_reader,
             hint_reader,
             restore_event_tx: None,
@@ -334,10 +339,12 @@ impl App {
         self.lua_event_handle.fire_autocmd(event, data);
     }
 
-    pub fn tick_error_expiry(&mut self) {
-        if self.status.is_error_expired() {
-            self.status = Status::Idle;
+    pub fn tick_error_expiry(&mut self) -> Dirty {
+        if !self.status.is_error_expired() {
+            return Dirty::NO;
         }
+        self.status = Status::Idle;
+        Dirty::YES
     }
 
     fn active_chat(&mut self) -> &mut Chat {
@@ -1576,17 +1583,49 @@ impl App {
         self.overlays_mut().iter_mut().for_each(|o| o.close());
     }
 
-    pub fn is_animating(&self) -> bool {
-        !self.image_paste_rx.is_empty()
-            || self.btw_modal.is_animating()
-            || self.file_picker.is_loading()
-            || self.float_mgr.is_open()
-            || self
-                .selection_state
+    /// Every poller that feeds the screen, in one place and never in `view`;
+    /// see [`crate::repaint`] for why.
+    pub fn tick(&mut self) -> Dirty {
+        // `|` never short-circuits: every poller must run on every tick.
+        self.float_mgr.tick()
+            | self.tick_edge_scroll()
+            | self.tick_error_expiry()
+            | self.poll_image_paste()
+            | self.btw_modal.poll()
+            | self.status_bar.poll_branch_update()
+            | self.status_bar.clear_expired_hint()
+            | self.mcp_picker.refresh()
+            | self.model_picker.refresh()
+            | self.usage_modal.poll(&self.usage_slot)
+            | self.hints.poll(self.hint_reader.load_full())
+            | self.tick_file_picker()
+            | Dirty::any(self.chats.iter_mut().map(Chat::tick))
+    }
+
+    fn tick_file_picker(&mut self) -> Dirty {
+        let (dirty, flash) = self.file_picker.tick();
+        if let Some(flash) = flash {
+            self.status_bar.flash(flash);
+        }
+        dirty
+    }
+
+    /// What moves with the clock alone; changes that come from arriving data
+    /// are reported by [`Self::tick`] instead. Overlays answer as a group, so
+    /// adding one to [`Self::overlays`] is enough.
+    pub fn cadence(&self) -> Cadence {
+        Cadence::any([
+            Cadence::any(self.overlays().into_iter().map(Overlay::cadence)),
+            StatusBar::cadence(
+                &self.status,
+                self.restoring.load(Ordering::Relaxed),
+                self.retry_info.is_some(),
+            ),
+            self.selection_state
                 .as_ref()
-                .is_some_and(|s| s.is_edge_scrolling())
-            || self.restoring.load(Ordering::Relaxed)
-            || self.chats.iter().any(|c| c.is_animating())
+                .map_or(Cadence::IDLE, SelectionState::cadence),
+            Cadence::any(self.chats.iter().map(Chat::cadence)),
+        ])
     }
 
     fn finish_subagents(&mut self, role: DisplayRole, text: &str) {

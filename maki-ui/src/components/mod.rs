@@ -49,6 +49,12 @@ pub(crate) trait Overlay {
     fn is_modal(&self) -> bool {
         true
     }
+    /// Override when the overlay draws something that moves on the clock
+    /// alone, like a spinner or a reveal. `App::cadence` asks every overlay,
+    /// so this is the only place one has to say so.
+    fn cadence(&self) -> crate::repaint::Cadence {
+        crate::repaint::Cadence::IDLE
+    }
 }
 
 pub(crate) fn hint_line<K: AsRef<str>, V: AsRef<str>>(pairs: &[(K, V)]) -> Line<'static> {
@@ -395,6 +401,15 @@ pub(crate) fn test_model() -> maki_providers::Model {
         max_output_tokens: Some(8192),
         context_window: TEST_CONTEXT_WINDOW,
     }
+}
+
+/// Every symbol in the buffer, row by row, for `assert!(screen.contains(..))`.
+#[cfg(test)]
+pub(crate) fn buffer_text(buf: &ratatui::buffer::Buffer) -> String {
+    buf.content()
+        .iter()
+        .map(ratatui::buffer::Cell::symbol)
+        .collect()
 }
 
 #[cfg(test)]

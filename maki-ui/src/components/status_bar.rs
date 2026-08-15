@@ -16,6 +16,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::repaint::{Cadence, Dirty};
+
 const TRUNCATE_PREFIX: &str = "..";
 const CWD_MODEL_SEPARATOR: &str = "  ";
 const FAST_LABEL: &str = " [fast]";
@@ -77,27 +79,43 @@ impl StatusBar {
         self.cwd_branch = cwd_branch_label();
     }
 
-    pub fn poll_branch_update(&mut self) {
+    pub fn poll_branch_update(&mut self) -> Dirty {
         let Some(rx) = &self.branch_update_rx else {
-            return;
+            return Dirty::NO;
         };
-        if rx.try_iter().next().is_some() {
-            self.cwd_branch = cwd_branch_label();
+        if rx.try_iter().next().is_none() {
+            return Dirty::NO;
         }
+        let branch = cwd_branch_label();
+        let changed = branch != self.cwd_branch;
+        self.cwd_branch = branch;
+        Dirty::from(changed)
     }
 
     pub fn clear_flash(&mut self) {
         self.flash = None;
     }
 
-    pub fn clear_expired_hint(&mut self) {
+    pub fn clear_expired_hint(&mut self) -> Dirty {
         if self
             .flash
             .as_ref()
-            .is_some_and(|(_, t)| t.elapsed() >= self.flash_duration)
+            .is_none_or(|(_, t)| t.elapsed() < self.flash_duration)
         {
-            self.flash = None;
+            return Dirty::NO;
         }
+        self.flash = None;
+        Dirty::YES
+    }
+
+    /// The bar spins for a whole turn, again while a restore is in flight, and
+    /// it counts a retry down by the second. It sits next to [`Self::view`] so
+    /// a new moving span cannot forget to claim its frames.
+    pub fn cadence(status: &Status, restoring: bool, retrying: bool) -> Cadence {
+        Cadence::when(
+            *status == Status::Streaming || restoring || retrying,
+            Cadence::SPINNER,
+        )
     }
 
     pub fn view(&self, frame: &mut Frame, area: Rect, ctx: &StatusBarContext) {
@@ -329,8 +347,13 @@ mod tests {
     use std::fs;
 
     use super::*;
+    use crate::repaint::expect::QUIET;
     use tempfile::TempDir;
     use test_case::test_case;
+
+    const FLASH_TTL: Duration = Duration::from_secs(3600);
+    const FLASH_MSG: &str = "Copied";
+    const STALE_BRANCH: &str = "/nowhere:gone";
 
     #[test_case("/home/user/projects/app", "/home/user", "~/projects/app" ; "inside_home")]
     #[test_case("/tmp/other", "/home/user", "/tmp/other"                  ; "outside_home")]
@@ -379,12 +402,50 @@ mod tests {
         );
     }
 
-    #[test]
-    fn clear_expired_hint_removes_stale_flash() {
-        let mut bar = StatusBar::new(Duration::ZERO);
-        bar.flash("Copied".into());
-        bar.clear_expired_hint();
-        assert!(bar.flash.is_none());
+    /// Once the flash is gone nothing clears the debt, so only the tick that
+    /// removes it may report a change, or the loop never settles. The two
+    /// lifetimes stand in for time passing: rewinding an `Instant` by an hour
+    /// panics on a machine that booted less than an hour ago.
+    #[test_case(false, FLASH_TTL      => Dirty::NO  ; "no_flash")]
+    #[test_case(true,  FLASH_TTL      => Dirty::NO  ; "flash_still_visible")]
+    #[test_case(true,  Duration::ZERO => Dirty::YES ; "flash_expired")]
+    fn clear_expired_hint_owes_the_frame_only_once(flashing: bool, ttl: Duration) -> Dirty {
+        let mut bar = StatusBar::new(ttl);
+        if flashing {
+            bar.flash(FLASH_MSG.into());
+        }
+
+        let first = bar.clear_expired_hint();
+        assert_eq!(bar.clear_expired_hint(), Dirty::NO, "{QUIET}");
+        first
+    }
+
+    /// The watcher fires for any write near `.git/HEAD`, most of which leave
+    /// the branch alone, so repainting on each one means a repaint per commit,
+    /// stash and index refresh while a build touches the repo. Either way the
+    /// poll has to leave the bounded channel empty, or the watcher's
+    /// `try_send` drops the next real switch.
+    #[test_case(false => Dirty::NO  ; "unchanged_branch")]
+    #[test_case(true  => Dirty::YES ; "switched_branch")]
+    fn poll_branch_update_reports_only_real_changes(stale: bool) -> Dirty {
+        let label = cwd_branch_label();
+        let (tx, rx) = flume::bounded(1);
+        let mut bar = StatusBar::new(FLASH_TTL);
+        bar.cwd_branch = if stale {
+            STALE_BRANCH.into()
+        } else {
+            label.clone()
+        };
+        bar.branch_update_rx = Some(rx);
+        tx.send(()).unwrap();
+
+        let dirty = bar.poll_branch_update();
+        assert_eq!(bar.cwd_branch, label);
+        assert!(
+            tx.try_send(()).is_ok(),
+            "a full channel makes the watcher drop the next switch"
+        );
+        dirty
     }
 
     #[test]

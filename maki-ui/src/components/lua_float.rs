@@ -16,6 +16,7 @@ use crate::components::{
     scrollbar::render_vertical_scrollbar,
     tool_display::{SPINNER_STYLE_NAME, SPINNER_STYLE_PREFIX, resolve_span_style},
 };
+use crate::repaint::{Cadence, Dirty};
 use crate::theme;
 
 /// A top band, a bottom band, and the scrollable middle. When the window is too
@@ -219,13 +220,17 @@ impl FloatManager {
         }
     }
 
-    pub fn tick(&mut self) {
+    /// Runs for backgrounded sessions too, or a plugin writing to a window
+    /// nobody is looking at would lose its output.
+    pub fn tick(&mut self) -> Dirty {
         let mut closed_ids = Vec::new();
+        let mut dirty = Dirty::NO;
 
         for win in &mut self.windows {
             if let Some(lines) = win.buf.read_if_dirty() {
                 win.cached_lines = lines;
                 win.bring_cursor_into_view();
+                dirty = Dirty::YES;
             }
 
             loop {
@@ -245,12 +250,21 @@ impl FloatManager {
                     }
                     Err(flume::TryRecvError::Empty) => break,
                 }
+                dirty = Dirty::YES;
             }
         }
 
         if !closed_ids.is_empty() {
             self.remove_windows(|w| closed_ids.contains(&w.id));
+            dirty = Dirty::YES;
         }
+        dirty
+    }
+
+    /// Float snapshots bake spinner spans at render time, so an open float has
+    /// to keep painting for plugin spinners to turn.
+    pub fn cadence(&self) -> Cadence {
+        Cadence::when(self.is_open(), Cadence::SPINNER)
     }
 
     pub fn needs_input(&self) -> bool {
@@ -638,11 +652,16 @@ impl Overlay for FloatManager {
     fn close(&mut self) {
         self.close_all();
     }
+
+    fn cadence(&self) -> Cadence {
+        self.cadence()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::repaint::expect::{OWED, QUIET};
     use maki_agent::SnapshotSpan;
     use maki_lua::{Dimension, FloatConfigPatch};
     use test_case::test_case;
@@ -953,24 +972,12 @@ mod tests {
     }
 
     #[test]
-    fn gc_on_disconnect() {
-        let mut mgr = FloatManager::new();
-        let (event_tx, cmd_rx, _event_rx, cmd_tx) = make_channels();
-        mgr.open(make_buf(&["a"]), make_config(), true, event_tx, cmd_rx);
-        assert!(mgr.is_open(), "{}", EXPECT_OPEN);
-
-        drop(cmd_tx);
-        mgr.tick();
-        assert!(!mgr.is_open(), "{}", EXPECT_CLOSED);
-    }
-
-    #[test]
     fn set_cursor_command() {
         let mut mgr = FloatManager::new();
         let (_event_rx, cmd_tx) = open_with_lines(&mut mgr, &["a", "b", "c", "d", "e"]);
 
         cmd_tx.send(WinCommand::SetCursor(3)).unwrap();
-        mgr.tick();
+        let _ = mgr.tick();
         assert_eq!(mgr.windows[0].cursor, 3, "{}", EXPECT_CURSOR);
     }
 
@@ -986,7 +993,7 @@ mod tests {
                 ..FloatConfigPatch::default()
             }))
             .unwrap();
-        mgr.tick();
+        let _ = mgr.tick();
 
         assert_eq!(mgr.windows[0].config.title, "Updated");
         assert_eq!(mgr.windows[0].config.zindex, 99);
@@ -1006,11 +1013,11 @@ mod tests {
                 ..FloatConfigPatch::default()
             }))
             .unwrap();
-        mgr.tick();
+        let _ = mgr.tick();
         assert!(mgr.needs_input());
 
         cmd_tx.send(WinCommand::Close).unwrap();
-        mgr.tick();
+        let _ = mgr.tick();
         assert!(!mgr.needs_input());
     }
 
@@ -1020,7 +1027,7 @@ mod tests {
         let (event_rx, cmd_tx) = open_with_lines(&mut mgr, &["a"]);
 
         cmd_tx.send(WinCommand::Close).unwrap();
-        mgr.tick();
+        let _ = mgr.tick();
         assert!(!mgr.is_open(), "{}", EXPECT_CLOSED);
         assert!(event_rx.drain().any(|e| matches!(e, WinEvent::Close)));
     }
@@ -1064,7 +1071,7 @@ mod tests {
         assert_eq!(mgr.windows[0].cached_lines.len(), 1);
 
         buf.append(make_line("second"));
-        mgr.tick();
+        let _ = mgr.tick();
         assert_eq!(mgr.windows[0].cached_lines.len(), 2);
     }
 
@@ -1080,7 +1087,7 @@ mod tests {
         mgr.windows[0].cursor = 4;
 
         buf.set_lines(vec![make_line("only")]);
-        mgr.tick();
+        let _ = mgr.tick();
         assert_eq!(mgr.windows[0].cursor, 0, "{}", EXPECT_CURSOR);
     }
 
@@ -1143,7 +1150,7 @@ mod tests {
 
         assert_eq!(mgr.focused_id, Some(1));
         cmd_tx2.send(WinCommand::Close).unwrap();
-        mgr.tick();
+        let _ = mgr.tick();
 
         assert_eq!(mgr.windows.len(), 2);
         let fallback_id = mgr.focused_id.expect("should have fallback focus");
@@ -1166,7 +1173,7 @@ mod tests {
 
         cmd_tx1.send(WinCommand::Close).unwrap();
         cmd_tx2.send(WinCommand::Close).unwrap();
-        mgr.tick();
+        let _ = mgr.tick();
 
         assert!(!mgr.is_open(), "{}", EXPECT_CLOSED);
         assert!(erx1.drain().any(|e| matches!(e, WinEvent::Close)));
@@ -1182,7 +1189,7 @@ mod tests {
         mgr.open(buf, make_config(), true, event_tx, cmd_rx);
 
         cmd_tx.send(WinCommand::SetCursor(5)).unwrap();
-        mgr.tick();
+        let _ = mgr.tick();
         assert_eq!(mgr.windows[0].cursor, 0, "cursor clamps to 0 on empty buf");
     }
 
@@ -1198,7 +1205,7 @@ mod tests {
             }))
             .unwrap();
         cmd_tx.send(WinCommand::SetCursor(3)).unwrap();
-        mgr.tick();
+        let _ = mgr.tick();
 
         assert_eq!(mgr.windows[0].config.title, "Updated");
         assert_eq!(mgr.windows[0].cursor, 3, "{}", EXPECT_CURSOR);
@@ -1214,7 +1221,7 @@ mod tests {
         mgr.open(buf, cfg, true, event_tx, cmd_rx);
 
         cmd_tx.send(WinCommand::SetCursor(99)).unwrap();
-        mgr.tick();
+        let _ = mgr.tick();
         assert_eq!(
             mgr.windows[0].cursor, 2,
             "cursor stops before reserved bottom rows"
@@ -1235,7 +1242,7 @@ mod tests {
         mgr.windows[0].cursor = 3;
 
         buf.set_lines(vec![make_line("a"), make_line("b")]);
-        mgr.tick();
+        let _ = mgr.tick();
         assert_eq!(
             mgr.windows[0].cursor, 0,
             "cursor clamps accounting for reserved rows"
@@ -1303,7 +1310,7 @@ mod tests {
             buf.append(make_line(&format!("line{i}")));
         }
 
-        mgr.tick();
+        let _ = mgr.tick();
 
         assert_eq!(mgr.windows[0].cached_lines.len(), 10);
         assert_eq!(
@@ -1365,7 +1372,7 @@ mod tests {
         mgr.open(buf, cfg, true, event_tx, cmd_rx);
 
         cmd_tx.send(WinCommand::SetCursor(0)).unwrap();
-        mgr.tick();
+        let _ = mgr.tick();
         assert_eq!(
             mgr.windows[0].cursor, 2,
             "{EXPECT_CURSOR}: cursor cannot enter reserved top rows",
@@ -1383,7 +1390,7 @@ mod tests {
         mgr.open(buf, cfg, true, event_tx, cmd_rx);
 
         cmd_tx.send(WinCommand::SetCursor(99)).unwrap();
-        mgr.tick();
+        let _ = mgr.tick();
         assert_eq!(
             mgr.windows[0].cursor, 2,
             "{EXPECT_CURSOR}: only row 2 is scrollable",
@@ -1440,13 +1447,85 @@ mod tests {
 
         buf.append(make_line("second"));
         buf.append(make_line("third"));
-        mgr.tick();
+        let _ = mgr.tick();
 
         assert_eq!(
             mgr.windows[0].cached_lines.len(),
             3,
             "all appends since last read must be visible after one tick",
         );
+    }
+
+    /// Plugin output lands in the buffer behind the UI's back, so an append is
+    /// only ever seen because `tick` reports it. Exactly once, though: this
+    /// poller runs for every session, so a manager that keeps reporting dirty
+    /// with nothing to show would keep the whole loop awake forever.
+    #[test]
+    fn buffer_append_owes_exactly_one_frame() {
+        let mut mgr = FloatManager::new();
+        assert_eq!(mgr.tick(), Dirty::NO, "{QUIET}");
+
+        let (event_tx, cmd_rx, _event_rx, _cmd_tx) = make_channels();
+        let buf = make_buf(&["initial"]);
+        mgr.open(buf.clone(), make_config(), true, event_tx, cmd_rx);
+        assert_eq!(mgr.tick(), Dirty::NO, "{QUIET}");
+
+        buf.append(make_line("second"));
+        assert_eq!(mgr.tick(), Dirty::YES, "{OWED}");
+        assert_eq!(mgr.tick(), Dirty::NO, "{QUIET}");
+    }
+
+    /// Every command changes what is drawn, and `Close` reports through a
+    /// different branch than the rest because it breaks out of the drain loop.
+    #[test_case(WinCommand::SetCursor(2) ; "set_cursor")]
+    #[test_case(WinCommand::SetVisible(false) ; "set_visible")]
+    #[test_case(WinCommand::Close ; "close")]
+    fn window_command_owes_exactly_one_frame(cmd: WinCommand) {
+        let mut mgr = FloatManager::new();
+        let (_event_rx, cmd_tx) = open_with_lines(&mut mgr, &["a", "b", "c"]);
+
+        cmd_tx.send(cmd).unwrap();
+        assert_eq!(mgr.tick(), Dirty::YES, "{OWED}");
+        assert_eq!(mgr.tick(), Dirty::NO, "{QUIET}");
+    }
+
+    /// A plugin that goes away drops its sender and the window goes with it.
+    /// Nothing else wakes the loop, so that removal is only painted if this
+    /// tick reports it.
+    #[test]
+    fn disconnected_cmd_channel_closes_the_window_and_owes_one_frame() {
+        let mut mgr = FloatManager::new();
+        let (_event_rx, cmd_tx) = open_with_lines(&mut mgr, &["a"]);
+        assert!(mgr.is_open(), "{EXPECT_OPEN}");
+
+        drop(cmd_tx);
+        assert_eq!(mgr.tick(), Dirty::YES, "{OWED}");
+        assert!(!mgr.is_open(), "{EXPECT_CLOSED}");
+        assert_eq!(mgr.tick(), Dirty::NO, "{QUIET}");
+    }
+
+    /// `visible` only gates panel windows in [`FloatManager::panel_reqs`]; a
+    /// popup is drawn either way, spinner spans and all, so gating the cadence
+    /// on it would freeze a plugin's spinner instead of saving frames.
+    #[test]
+    fn cadence_spins_while_any_window_is_open_visible_or_not() {
+        let mut mgr = FloatManager::new();
+        assert_eq!(mgr.cadence(), Cadence::IDLE);
+
+        let (_event_rx, cmd_tx) = open_with_lines(&mut mgr, &["a"]);
+        assert_eq!(mgr.cadence(), Cadence::SPINNER);
+
+        cmd_tx.send(WinCommand::SetVisible(false)).unwrap();
+        let _ = mgr.tick();
+        assert!(!mgr.windows[0].visible);
+        assert_eq!(
+            mgr.cadence(),
+            Cadence::SPINNER,
+            "an invisible window still counts as open, so the loop keeps painting it"
+        );
+
+        mgr.close_all();
+        assert_eq!(mgr.cadence(), Cadence::IDLE);
     }
 
     #[test]
@@ -1456,7 +1535,7 @@ mod tests {
 
         cmd_tx.send(WinCommand::Close).unwrap();
         cmd_tx.send(WinCommand::SetCursor(2)).unwrap();
-        mgr.tick();
+        let _ = mgr.tick();
 
         assert!(!mgr.is_open(), "{EXPECT_CLOSED}");
     }
@@ -1478,7 +1557,7 @@ mod tests {
         let (_event_rx, cmd_tx) = open_with_lines(&mut mgr, &["a"]);
 
         cmd_tx.send(WinCommand::Close).unwrap();
-        mgr.tick();
+        let _ = mgr.tick();
 
         let key_event = KeyEvent::new(
             crossterm::event::KeyCode::Char('a'),
@@ -1954,11 +2033,11 @@ mod tests {
         assert_eq!(mgr.panel_reqs().len(), 1);
 
         cmd_tx.send(WinCommand::SetVisible(false)).unwrap();
-        mgr.tick();
+        let _ = mgr.tick();
         assert_eq!(mgr.panel_reqs().len(), 0);
 
         cmd_tx.send(WinCommand::SetVisible(true)).unwrap();
-        mgr.tick();
+        let _ = mgr.tick();
         assert_eq!(mgr.panel_reqs().len(), 1);
     }
 
@@ -1986,7 +2065,7 @@ mod tests {
         assert_eq!(mgr.focused_id, Some(1));
 
         cmd_tx_modal.send(WinCommand::Close).unwrap();
-        mgr.tick();
+        let _ = mgr.tick();
 
         assert_eq!(
             mgr.focused_id, None,
