@@ -44,10 +44,7 @@ Dev builds skip debug info for deps and vendored C (our crates keep it); to debu
 
 ## Nix
 
-- `nix build` — build the project in a sandboxed environment
-- `nix develop` — enter the dev shell (Rust toolchain, formatters, CLI tools)
-- `nix fmt` — format all `.nix` files with `nixfmt`
-- `nix flake check` — run all flake checks (including git-dep-hashes drift detection)
+`nix develop` (dev shell; exports `OPENSSL_NO_VENDOR`, saves ~80s cold build - export it yourself outside the shell if you have libssl-dev), `nix build`, `nix fmt` (nixfmt), `nix flake check` (includes git-dep-hashes drift).
 
 ## Architecture
 
