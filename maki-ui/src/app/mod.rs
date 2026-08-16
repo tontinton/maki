@@ -776,6 +776,10 @@ impl App {
             BuiltinAction::NextChat => {
                 self.active_chat = (self.active_chat + 1).min(self.chats.len() - 1);
             }
+            BuiltinAction::ModelPicker => {
+                self.model_picker.open(&self.state.model.spec());
+                return vec![Action::RefreshModels];
+            }
         }
         vec![]
     }
@@ -838,6 +842,9 @@ impl App {
     fn handle_main_chat_key(&mut self, key: KeyEvent) -> Vec<Action> {
         if key::EDIT_INPUT.matches(key) {
             return self.run_builtin(BuiltinAction::EditInput);
+        }
+        if key::MODEL_PICKER.matches(key) {
+            return self.run_builtin(BuiltinAction::ModelPicker);
         }
         if is_ctrl(&key) {
             if key::POP_QUEUE.matches(key) {

@@ -4541,3 +4541,24 @@ fn run_builtin_file_picker_opens_modal() {
     assert!(app.run_builtin(BuiltinAction::FilePicker).is_empty());
     assert!(app.file_picker.is_open());
 }
+
+#[test]
+fn run_builtin_model_picker_opens_and_refreshes() {
+    let mut app = test_app();
+    let actions = app.run_builtin(BuiltinAction::ModelPicker);
+    assert!(app.model_picker.is_open());
+    assert!(matches!(&actions[..], [Action::RefreshModels]));
+}
+
+#[test]
+fn alt_m_opens_model_picker() {
+    let mut app = test_app();
+    let key = KeyEvent {
+        code: KeyCode::Char('m'),
+        modifiers: KeyModifiers::CONTROL,
+        kind: crossterm::event::KeyEventKind::Press,
+        state: crossterm::event::KeyEventState::NONE,
+    };
+    app.update(Msg::Key(key));
+    assert!(app.model_picker.is_open());
+}
