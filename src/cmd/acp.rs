@@ -59,6 +59,7 @@ pub fn run(model_arg: Option<String>, yolo: bool, no_plugins: bool, no_jit: bool
 
     let prompt_slots = plugin_host.event_handle().collect_prompt_slots();
 
+    let event_handle = plugin_host.event_handle();
     maki_acp::run(maki_acp::AcpParams {
         model,
         config: config.agent,
@@ -69,5 +70,6 @@ pub fn run(model_arg: Option<String>, yolo: bool, no_plugins: bool, no_jit: bool
         yolo,
         model_policy: Arc::new(config.provider.model_policy.clone()),
         plugin_rules: plugin_host.plugin_rules(),
+        on_session_end: Some(Arc::new(move |id| event_handle.end_session(id))),
     })
 }

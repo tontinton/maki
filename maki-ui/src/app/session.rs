@@ -336,6 +336,7 @@ impl App {
         // that just ended needs its id, and the stamp always reads
         // whichever session is current.
         self.fire_session_autocmd("SessionReset", serde_json::json!({}));
+        self.lua_event_handle.end_session(self.state.session.id);
         let session = self.blank_session();
         self.apply_stored_permissions(&session.meta);
         self.state.session = Arc::new(session);
@@ -388,10 +389,14 @@ impl App {
         session: AppSession,
         fallback_model: &Model,
     ) -> LoadedSession {
+        let previous = self.state.session.id;
         self.checkpoint_now();
         self.apply_stored_permissions(&session.meta);
         self.state =
             SessionState::from_session(session, fallback_model, &self.storage, &self.model_policy);
+        if previous != self.state.session.id {
+            self.lua_event_handle.end_session(previous);
+        }
         for w in self.state.warnings.drain(..) {
             self.status_bar.flash(w);
         }

@@ -108,6 +108,17 @@ pub mod test_support {
             }
             None
         }
+
+        /// Next `SessionEnd` request as the session being left behind.
+        pub fn try_recv_end_session(&self) -> Option<maki_storage::id::MakiId> {
+            use crate::runtime::Request;
+            while let Ok(req) = self.0.try_recv() {
+                if let Request::EndSession { session } = req {
+                    return Some(session);
+                }
+            }
+            None
+        }
     }
 
     pub fn probed_event_handle() -> (crate::EventHandle, RequestProbe) {

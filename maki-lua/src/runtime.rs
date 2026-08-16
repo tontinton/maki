@@ -289,6 +289,9 @@ pub enum Request {
         event: String,
         data: Value,
     },
+    EndSession {
+        session: maki_storage::id::MakiId,
+    },
     ClickTool {
         tool_use_id: String,
         /// 1-based line in the tool's live buffer; 0 means the click landed
@@ -3190,6 +3193,14 @@ pub fn spawn(
                             if event == TURN_END_EVENT {
                                 rt.lua.gc_collect().ok();
                             }
+                        }
+                        Request::EndSession { session } => {
+                            let data = json_to_lua(
+                                &rt.lua,
+                                &serde_json::json!({ "session_id": session.to_string() }),
+                            )
+                            .unwrap_or(LuaValue::Nil);
+                            crate::api::autocmd::dispatch(&rt.lua, "SessionEnd", None, data);
                         }
                         Request::Describe {
                             plugin,

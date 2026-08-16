@@ -75,6 +75,7 @@ struct Server {
     model_policy: Arc<ModelPolicy>,
     client_elicits_form: bool,
     session: Option<SessionState>,
+    on_session_end: Option<Arc<dyn Fn(maki_storage::id::MakiId) + Send + Sync>>,
 }
 
 impl Server {
@@ -108,6 +109,7 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
         model_policy: Arc::clone(&params.model_policy),
         client_elicits_form: false,
         session: None,
+        on_session_end: params.on_session_end.clone(),
     };
 
     let (in_tx, in_rx) = flume::unbounded::<Incoming>();
@@ -122,6 +124,12 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
         }
     }
 
+    if let Some(session) = server.session.take() {
+        if let Some(cb) = &server.on_session_end {
+            cb(session.handle.session_id.id());
+        }
+        drop(session);
+    }
     drop(server);
     writer_task.await;
     reader_task.await.context("read stdin")?;
@@ -489,6 +497,9 @@ async fn close_session(srv: &mut Server) {
     let Some(state) = srv.session.take() else {
         return;
     };
+    if let Some(cb) = &srv.on_session_end {
+        cb(state.handle.session_id.id());
+    }
     // The event pump dies with the session, so the prompt it owed an answer to
     // has to be answered here or the client waits on it forever.
     if let Some(id) = state.pending.lock().unwrap().prompt.take() {
@@ -910,6 +921,7 @@ mod tests {
             model_specs: Vec::new(),
             model_policy: Arc::new(ModelPolicy::default()),
             client_elicits_form: false,
+            on_session_end: None,
             session: Some(SessionState {
                 handle,
                 mcp: None,

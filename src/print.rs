@@ -325,6 +325,7 @@ pub fn run(
         })
         .await;
     });
+    lua_handle.end_session(session_id.id());
 
     let duration_ms = start.elapsed().as_millis();
     // Zero on an unpriced model, which is what its turns reported too.

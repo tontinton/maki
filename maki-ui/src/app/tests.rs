@@ -675,6 +675,8 @@ fn session_reset_names_the_session_that_ended() {
     let (event, data) = probe.try_recv_autocmd().expect("SessionReset fired");
     assert_eq!(event, "SessionReset");
     assert_eq!(data["session_id"], serde_json::json!(ended));
+    let ended_id = probe.try_recv_end_session().expect("SessionEnd queued");
+    assert_eq!(ended_id.to_string(), ended);
     assert_ne!(
         app.state.session.id.to_string(),
         ended,

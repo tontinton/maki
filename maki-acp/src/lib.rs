@@ -24,6 +24,8 @@ pub struct AcpParams {
     pub yolo: bool,
     pub model_policy: Arc<ModelPolicy>,
     pub plugin_rules: Arc<PluginRuleStore>,
+    /// Called when an ACP session is replaced or the server exits.
+    pub on_session_end: Option<Arc<dyn Fn(maki_storage::id::MakiId) + Send + Sync>>,
 }
 
 pub fn run(params: AcpParams) -> color_eyre::Result<()> {

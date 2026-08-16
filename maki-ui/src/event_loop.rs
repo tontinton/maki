@@ -1061,6 +1061,7 @@ impl<'t> EventLoop<'t> {
                         return;
                     }
                     let rt = self.remove_runtime(i);
+                    self.ctx.lua_event_handle.end_session(rt.id());
                     rt.handles.cancel();
                 }
                 self.ctx.storage_writer.delete(id, move |res| {
@@ -1564,6 +1565,9 @@ impl<'t> EventLoop<'t> {
             elapsed
         };
         let exit = self.sessions[self.focused].app.exit_request;
+        for rt in &self.sessions {
+            self.ctx.lua_event_handle.end_session(rt.id());
+        }
         if let Some(ref h) = self.ctx.mcp_handle {
             mcp::kill_process_groups(&h.reader().load().pids);
         }
