@@ -1,20 +1,24 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Function, Lua, RegistryKey, Result as LuaResult, Table, Value};
 
 use crate::api::fs::expand_tilde;
 use crate::api::util::command::{UiAction, ui_roundtrip, ui_send};
-use crate::api::util::pair::{Pair, try_pair};
+use crate::api::util::pair::{Pair, err_pair, try_pair};
 use crate::plugin_permissions::PluginPermissions;
 use crate::runtime::{active_task_id, job_task_id, with_jobs};
+
+const DEFAULT_TAIL: usize = 20;
+const MAX_TAIL_LINES: usize = 1024;
+const DEFAULT_WAIT_MS: u64 = 30_000;
 
 const READER_BUF_SIZE: usize = 8 * 1024;
 
@@ -33,11 +37,34 @@ pub(crate) enum JobOwner {
 
 struct JobMeta {
     owner: JobOwner,
+    command: String,
     pid: u32,
+    started: Instant,
     on_stdout: Option<RegistryKey>,
     on_stderr: Option<RegistryKey>,
     on_exit: Option<RegistryKey>,
     event_rx: Option<flume::Receiver<JobEvent>>,
+    stdout_tail: VecDeque<String>,
+    stderr_tail: VecDeque<String>,
+    tail_cap: usize,
+    exit_code: Option<i32>,
+}
+
+impl JobMeta {
+    fn record_line(&mut self, stdout: bool, line: &str) {
+        if self.tail_cap == 0 {
+            return;
+        }
+        let tail = if stdout {
+            &mut self.stdout_tail
+        } else {
+            &mut self.stderr_tail
+        };
+        if tail.len() >= self.tail_cap {
+            tail.pop_front();
+        }
+        tail.push_back(line.to_string());
+    }
 }
 
 pub(crate) struct JobStore {
@@ -154,15 +181,30 @@ impl JobStore {
             id,
             JobMeta {
                 owner,
+                command: cmd.to_string(),
                 pid,
+                started: Instant::now(),
                 on_stdout,
                 on_stderr,
                 on_exit,
                 event_rx: Some(event_rx),
+                stdout_tail: VecDeque::new(),
+                stderr_tail: VecDeque::new(),
+                tail_cap: DEFAULT_TAIL,
+                exit_code: None,
             },
         );
 
         Ok(id)
+    }
+
+    fn configure(&mut self, id: u32, tail: Option<usize>) {
+        let Some(job) = self.jobs.get_mut(&id) else {
+            return;
+        };
+        if let Some(cap) = tail {
+            job.tail_cap = cap.min(MAX_TAIL_LINES);
+        }
     }
 
     pub fn is_empty(&self, owner: &JobOwner) -> bool {
@@ -221,6 +263,47 @@ impl JobStore {
                 }
             }
         }
+    }
+
+    pub fn record_event(&mut self, job_id: u32, event: &JobEvent) {
+        let Some(job) = self.jobs.get_mut(&job_id) else {
+            return;
+        };
+        match event {
+            JobEvent::Stdout(line) => job.record_line(true, line),
+            JobEvent::Stderr(line) => job.record_line(false, line),
+            JobEvent::Exit(code) => job.exit_code = Some(*code),
+        }
+    }
+
+    pub fn snapshot(&self, job_id: u32, task_id: Option<u64>, plugin: &str) -> Option<JobSnapshot> {
+        let job = self.jobs.get(&job_id)?;
+        job.can_access(task_id, plugin).then(|| JobSnapshot {
+            id: job_id,
+            command: job.command.clone(),
+            pid: job.pid,
+            elapsed_secs: job.started.elapsed().as_secs(),
+            exit_code: job.exit_code,
+            stdout_lines: job.stdout_tail.iter().cloned().collect(),
+            stderr_lines: job.stderr_tail.iter().cloned().collect(),
+        })
+    }
+
+    pub fn list(&self, task_id: Option<u64>, plugin: &str) -> Vec<JobSnapshot> {
+        self.jobs
+            .iter()
+            .filter(|(_, job)| job.can_access(task_id, plugin))
+            .filter(|(_, job)| job.exit_code.is_none())
+            .map(|(&id, job)| JobSnapshot {
+                id,
+                command: job.command.clone(),
+                pid: job.pid,
+                elapsed_secs: job.started.elapsed().as_secs(),
+                exit_code: None,
+                stdout_lines: Vec::new(),
+                stderr_lines: Vec::new(),
+            })
+            .collect()
     }
 
     pub fn kill(&mut self, job_id: u32, task_id: Option<u64>, plugin: &str) {
@@ -297,6 +380,16 @@ impl Drop for CheckedOutReceiver {
     }
 }
 
+pub(crate) struct JobSnapshot {
+    pub id: u32,
+    pub command: String,
+    pub pid: u32,
+    pub elapsed_secs: u64,
+    pub exit_code: Option<i32>,
+    pub stdout_lines: Vec<String>,
+    pub stderr_lines: Vec<String>,
+}
+
 impl JobMeta {
     fn can_access(&self, task_id: Option<u64>, plugin: &str) -> bool {
         match &self.owner {
@@ -359,6 +452,8 @@ fn kill_job(meta: &mut JobMeta) {
 ///   `owner` (string?) job lifetime. `"task"` (default) ends the job with
 ///     the current call. `"plugin"` keeps it alive until the plugin unloads
 ///     or reloads.
+///   `tail` (integer?) trailing lines per stream kept for `jobinfo`
+///     (default 20, 0 disables, max 1024).
 /// @return (integer) Job id.
 /// @example
 /// local id = maki.fn.jobstart("ls -la", {
@@ -390,7 +485,7 @@ fn jobstart(
         }
     };
 
-    let (cwd, env, on_stdout, on_stderr, on_exit) = match opts {
+    let (cwd, env, on_stdout, on_stderr, on_exit, tail) = match opts {
         Some(ref opts) => {
             let cwd: Option<String> = opts.get("cwd").ok();
             let env: Option<HashMap<String, String>> = opts
@@ -412,15 +507,89 @@ fn jobstart(
                 .ok()
                 .map(|f| lua.create_registry_value(f))
                 .transpose()?;
-            (cwd, env, on_stdout, on_stderr, on_exit)
+            let tail: Option<usize> = opts.get("tail").ok();
+            if let Some(n) = tail
+                && n > MAX_TAIL_LINES
+            {
+                return Err(mlua::Error::runtime(format!(
+                    "jobstart: tail must be in 0..={MAX_TAIL_LINES}"
+                )));
+            }
+            (cwd, env, on_stdout, on_stderr, on_exit, tail)
         }
-        None => (None, None, None, None, None),
+        None => (None, None, None, None, None, None),
     };
 
     with_jobs(lua, |store| {
-        store.start(owner, &cmd, cwd, env, on_stdout, on_stderr, on_exit)
+        let id = store.start(owner, &cmd, cwd, env, on_stdout, on_stderr, on_exit)?;
+        store.configure(id, tail);
+        Ok::<u32, String>(id)
     })
     .map_err(mlua::Error::runtime)
+}
+
+/// Snapshot a job this plugin can see. Live jobs report tails collected
+/// so far. Task and plugin jobs are gone after they exit, so this is
+/// a live view today.
+///
+/// @param job_id integer Job id returned by `jobstart`.
+/// @return (table|nil, string|nil) `{ id, command, pid, status,
+///   exit_code, elapsed_secs, stdout_lines, stderr_lines }`, or nil and
+///   an error. `status` is `"running"` or `"exited"`.
+/// @example
+/// local info = maki.fn.jobinfo(id)
+#[lua_fn(guard = Run)]
+fn jobinfo(lua: &Lua, #[ctx] plugin: Arc<str>, job_id: u32) -> LuaResult<Pair<Value>> {
+    let task_id = active_task_id(lua);
+    match with_jobs(lua, |store| store.snapshot(job_id, task_id, &plugin)) {
+        Some(snap) => Ok((Some(Value::Table(snapshot_table(lua, &snap)?)), None)),
+        None => Ok(err_pair("job: not found")),
+    }
+}
+
+/// List live jobs this plugin can see: the current task's jobs plus
+/// this plugin's plugin-owned jobs.
+///
+/// @return (table) array of `{ id, command, pid, elapsed_secs }`.
+/// @example
+/// local jobs = maki.fn.joblist()
+#[lua_fn(guard = Run)]
+fn joblist(lua: &Lua, #[ctx] plugin: Arc<str>) -> LuaResult<Pair<Value>> {
+    let task_id = active_task_id(lua);
+    let snaps = with_jobs(lua, |store| store.list(task_id, &plugin));
+    let result = lua.create_table()?;
+    for (i, snap) in snaps.iter().enumerate() {
+        result.set(i + 1, snapshot_table(lua, snap)?)?;
+    }
+    Ok((Some(Value::Table(result)), None))
+}
+
+fn snapshot_table(lua: &Lua, snap: &JobSnapshot) -> LuaResult<Table> {
+    let row = lua.create_table()?;
+    row.set("id", snap.id)?;
+    row.set("command", snap.command.as_str())?;
+    row.set("pid", snap.pid)?;
+    row.set("elapsed_secs", snap.elapsed_secs)?;
+    row.set(
+        "status",
+        if snap.exit_code.is_some() {
+            "exited"
+        } else {
+            "running"
+        },
+    )?;
+    row.set("exit_code", snap.exit_code)?;
+    let stdout = lua.create_table()?;
+    for (i, line) in snap.stdout_lines.iter().enumerate() {
+        stdout.set(i + 1, line.as_str())?;
+    }
+    row.set("stdout_lines", stdout)?;
+    let stderr = lua.create_table()?;
+    for (i, line) in snap.stderr_lines.iter().enumerate() {
+        stderr.set(i + 1, line.as_str())?;
+    }
+    row.set("stderr_lines", stderr)?;
+    Ok(row)
 }
 
 /// Kill a running job immediately (SIGKILL on Unix). Safe to call on
@@ -466,7 +635,7 @@ async fn jobwait(
         .ok_or_else(|| mlua::Error::runtime("unknown job id or already waited"))?;
     let receiver = CheckedOutReceiver::new(&lua, job_id, receiver);
 
-    let timeout = Duration::from_millis(timeout_ms.unwrap_or(30_000));
+    let timeout = Duration::from_millis(timeout_ms.unwrap_or(DEFAULT_WAIT_MS));
     let deadline = smol::Timer::after(timeout);
     futures_lite::pin!(deadline);
 
@@ -504,6 +673,7 @@ async fn jobwait(
 /// both deliver events identically.
 pub(crate) fn deliver_job_event(lua: &Lua, job_id: u32, event: &JobEvent) -> LuaResult<()> {
     let callback = with_jobs(lua, |store| {
+        store.record_event(job_id, event);
         store
             .callback_key(job_id, event)
             .and_then(|key| lua.registry_value::<Function>(key).ok())
@@ -609,7 +779,8 @@ lua_table! {
         perms: &PluginPermissions,
         tx: Option<flume::Sender<UiAction>>,
     ), DOCS [
-        jobstart(perms, plugin), jobstop(perms, plugin), jobwait(perms, plugin), executable(perms),
+        jobstart(perms, plugin), jobstop(perms, plugin), jobwait(perms, plugin),
+        jobinfo(perms, plugin), joblist(perms, plugin), executable(perms),
         winsaveview(tx), winrestview(tx),
     ]
 }
@@ -631,6 +802,27 @@ mod tests {
 
     fn plugin_owner() -> JobOwner {
         JobOwner::Plugin(Arc::from(TEST_PLUGIN))
+    }
+
+    fn stub_job(
+        owner: JobOwner,
+        on_stdout: Option<RegistryKey>,
+        on_exit: Option<RegistryKey>,
+    ) -> JobMeta {
+        JobMeta {
+            owner,
+            command: String::new(),
+            pid: 0,
+            started: Instant::now(),
+            on_stdout,
+            on_stderr: None,
+            on_exit,
+            event_rx: None,
+            stdout_tail: VecDeque::new(),
+            stderr_tail: VecDeque::new(),
+            tail_cap: DEFAULT_TAIL,
+            exit_code: None,
+        }
     }
 
     fn start_echo(store: &mut JobStore) -> u32 {
@@ -960,17 +1152,9 @@ mod tests {
             .unwrap();
         let callback_key = lua.create_registry_value(callback).unwrap();
         with_jobs(&lua, |store| {
-            store.jobs.insert(
-                1,
-                JobMeta {
-                    owner: task_owner(1),
-                    pid: 0,
-                    on_stdout: None,
-                    on_stderr: None,
-                    on_exit: Some(callback_key),
-                    event_rx: None,
-                },
-            );
+            store
+                .jobs
+                .insert(1, stub_job(task_owner(1), None, Some(callback_key)));
         });
 
         assert!(deliver_job_event(&lua, 1, &JobEvent::Exit(0)).is_err());
@@ -990,22 +1174,77 @@ mod tests {
             .unwrap();
         let callback_key = lua.create_registry_value(callback).unwrap();
         let mut store = make_store();
-        store.jobs.insert(
-            1,
-            JobMeta {
-                owner: task_owner(1),
-                pid: 0,
-                on_stdout: Some(callback_key),
-                on_stderr: None,
-                on_exit: None,
-                event_rx: None,
-            },
-        );
+        store
+            .jobs
+            .insert(1, stub_job(task_owner(1), Some(callback_key), None));
         assert_eq!(Arc::strong_count(&capture), 2);
 
         store.finish(&lua, 1);
         lua.gc_collect().unwrap();
 
         assert_eq!(Arc::strong_count(&capture), 1);
+    }
+
+    #[test]
+    fn snapshot_reports_live_tails_and_hides_inaccessible_jobs() {
+        let mut store = make_store();
+        let id = start_echo(&mut store);
+        store.record_event(id, &JobEvent::Stdout("hello".into()));
+        store.record_event(id, &JobEvent::Stderr("warn".into()));
+
+        let snap = store.snapshot(id, Some(1), TEST_PLUGIN).unwrap();
+        assert_eq!(snap.command, "echo hello");
+        assert_eq!(snap.stdout_lines, ["hello"]);
+        assert_eq!(snap.stderr_lines, ["warn"]);
+        assert!(snap.exit_code.is_none());
+        assert!(store.snapshot(id, Some(2), TEST_PLUGIN).is_none());
+        assert!(store.snapshot(999, Some(1), TEST_PLUGIN).is_none());
+    }
+
+    #[test]
+    fn tail_cap_drops_oldest_lines() {
+        let mut store = make_store();
+        let id = start_echo(&mut store);
+        store.configure(id, Some(2));
+        store.record_event(id, &JobEvent::Stdout("a".into()));
+        store.record_event(id, &JobEvent::Stdout("b".into()));
+        store.record_event(id, &JobEvent::Stdout("c".into()));
+        let snap = store.snapshot(id, Some(1), TEST_PLUGIN).unwrap();
+        assert_eq!(snap.stdout_lines, ["b", "c"]);
+    }
+
+    #[test]
+    fn list_is_live_and_access_scoped() {
+        let lua = Lua::new();
+        let mut store = make_store();
+        let task = start_echo(&mut store);
+        let plugin = store
+            .start(plugin_owner(), "echo plugin", None, None, None, None, None)
+            .unwrap();
+
+        let from_task: Vec<u32> = store
+            .list(Some(1), TEST_PLUGIN)
+            .iter()
+            .map(|s| s.id)
+            .collect();
+        assert!(from_task.contains(&task));
+        assert!(from_task.contains(&plugin));
+
+        let from_other: Vec<u32> = store
+            .list(Some(2), "other-plugin")
+            .iter()
+            .map(|s| s.id)
+            .collect();
+        assert!(from_other.is_empty());
+
+        store.record_event(task, &JobEvent::Exit(0));
+        store.finish(&lua, task);
+        let live: Vec<u32> = store
+            .list(Some(1), TEST_PLUGIN)
+            .iter()
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(live, [plugin]);
+        assert!(store.snapshot(task, Some(1), TEST_PLUGIN).is_none());
     }
 }

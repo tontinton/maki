@@ -2215,6 +2215,81 @@ fn unloading_plugin_kills_its_jobs() {
 }
 
 #[test]
+fn jobinfo_and_joblist_see_live_plugin_jobs() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let src = format!(
+        r#"
+local job_id
+maki.api.register_tool({{
+    name = "start_listed_job",
+    description = "starts a plugin job for inspect",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        job_id = maki.fn.jobstart("printf 'hello-tail\n'; exec sleep 30", {{
+            owner = "plugin",
+            tail = 8,
+        }})
+        return tostring(job_id)
+    end,
+}})
+maki.api.register_tool({{
+    name = "inspect_listed_job",
+    description = "jobinfo and joblist for the live job",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        local info = maki.fn.jobinfo(job_id)
+        if not info then return "missing" end
+        local listed = false
+        for _, row in ipairs(maki.fn.joblist()) do
+            if row.id == job_id then listed = true end
+        end
+        return table.concat({{
+            info.status,
+            info.command,
+            tostring(listed),
+            table.concat(info.stdout_lines, ","),
+        }}, "|")
+    end,
+}})
+maki.api.register_tool({{
+    name = "stop_listed_job",
+    description = "stop the inspect job",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        maki.fn.jobstop(job_id)
+        return "stopped"
+    end,
+}})
+"#
+    );
+    host.load_source("job_inspect", &src).unwrap();
+    let _id = exec_tool(&reg, "start_listed_job", json!({})).unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let state = loop {
+        let state = exec_tool(&reg, "inspect_listed_job", json!({})).unwrap();
+        if state.starts_with("running|") && state.contains("hello-tail") {
+            break state;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "jobinfo never saw the live job: {state}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(
+        state.contains("|true|"),
+        "joblist should include the live job, got {state}"
+    );
+
+    exec_tool(&reg, "stop_listed_job", json!({})).unwrap();
+}
+
+#[test]
 fn vm_recovers_after_async_job_tool() {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();

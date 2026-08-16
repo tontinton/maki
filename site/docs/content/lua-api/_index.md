@@ -1587,6 +1587,8 @@ Requires the `run` [plugin permission](#plugin-permissions).
   - `owner` (`string?`) job lifetime. `"task"` (default) ends the job with
     the current call. `"plugin"` keeps it alive until the plugin unloads
     or reloads.
+  - `tail` (`integer?`) trailing lines per stream kept for `jobinfo`
+    (default 20, 0 disables, max 1024).
 
 **Returns:** (`integer`) Job id.
 
@@ -1656,6 +1658,51 @@ local result = maki.fn.jobwait(id, 5000)
 if result then
   print(result.stdout)
 end
+```
+
+---
+
+### `maki.fn.jobinfo()` {#maki-fn-jobinfo}
+
+```lua
+maki.fn.jobinfo({job_id})
+```
+
+Snapshot a job this plugin can see. Live jobs report tails collected
+so far. Task and plugin jobs are gone after they exit, so this is
+a live view today.
+
+**Parameters:**
+
+- `{job_id}` (`integer`) Job id returned by `jobstart`.
+
+**Returns:** (`table|nil`, `string|nil`) `{ id, command, pid, status,
+  exit_code, elapsed_secs, stdout_lines, stderr_lines }`, or nil and
+  an error. `status` is `"running"` or `"exited"`.
+
+**Example:**
+
+```lua
+local info = maki.fn.jobinfo(id)
+```
+
+---
+
+### `maki.fn.joblist()` {#maki-fn-joblist}
+
+```lua
+maki.fn.joblist()
+```
+
+List live jobs this plugin can see: the current task's jobs plus
+this plugin's plugin-owned jobs.
+
+**Returns:** (`table`) array of `{ id, command, pid, elapsed_secs }`.
+
+**Example:**
+
+```lua
+local jobs = maki.fn.joblist()
 ```
 
 ---
