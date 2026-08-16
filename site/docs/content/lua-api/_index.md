@@ -1586,7 +1586,13 @@ Requires the `run` [plugin permission](#plugin-permissions).
   - `on_exit` (`function?`) called with `(job_id, code)` when the process finishes.
   - `owner` (`string?`) job lifetime. `"task"` (default) ends the job with
     the current call. `"plugin"` keeps it alive until the plugin unloads
-    or reloads.
+    or reloads. `"session"` keeps it alive until that session ends, and
+    survives plugin reload; requires `session`.
+  - `session` (`string?`) session id. Required when `owner = "session"`.
+  - `notify` (`boolean|table?`) when the process exits, post a mailbox
+    observation to `session`. `true` uses `{ wake = true, on_success = true }`.
+    A table accepts `wake` (boolean, default true) and `on_success`
+    (boolean, default true). Only valid with `owner = "session"`.
   - `tail` (`integer?`) trailing lines per stream kept for `jobinfo`
     (default 20, 0 disables, max 1024).
 
@@ -1634,8 +1640,11 @@ maki.fn.jobwait({job_id}, {timeout_ms?})
 ```
 
 Wait for a job to finish and collect its output. Returns a result
-table with `stdout`, `stderr`, and `exit_code`. Returns `nil` if the
-job does not finish before the timeout.
+table with `stdout`, `stderr`, `exit_code`, and `truncated`. `truncated`
+is false when the collected lines are the full output; a job that already
+exited answers from its captured tail, so `truncated` is true and the
+output may be missing lines. Returns `nil` if the job does not finish
+before the timeout.
 
 While waiting, the job's `on_stdout`, `on_stderr`, and `on_exit`
 callbacks fire as events arrive (like Neovim), so you can stream
@@ -1648,7 +1657,7 @@ Requires the `run` [plugin permission](#plugin-permissions).
 - `{job_id}` (`integer`) Job id returned by `jobstart`.
 - `{timeout_ms?}` (`integer?`) Maximum wait in milliseconds (default 30000).
 
-**Returns:** (`table?`) `{ stdout, stderr, exit_code }`, or nil on timeout.
+**Returns:** (`table?`) `{ stdout, stderr, exit_code, truncated }`, or nil on timeout.
 
 **Example:**
 
@@ -1669,14 +1678,15 @@ maki.fn.jobinfo({job_id})
 ```
 
 Snapshot a job this plugin can see. Live jobs report tails collected
-so far. Task and plugin jobs are gone after they exit, so this is
-a live view today.
+so far; session-owned jobs still answer after they exit.
+
+Requires the `run` [plugin permission](#plugin-permissions).
 
 **Parameters:**
 
 - `{job_id}` (`integer`) Job id returned by `jobstart`.
 
-**Returns:** (`table|nil`, `string|nil`) `{ id, command, pid, status,
+**Returns:** (`table|nil`, `string|nil`) `{ id, command, pid, session, status,
   exit_code, elapsed_secs, stdout_lines, stderr_lines }`, or nil and
   an error. `status` is `"running"` or `"exited"`.
 
@@ -1691,18 +1701,26 @@ local info = maki.fn.jobinfo(id)
 ### `maki.fn.joblist()` {#maki-fn-joblist}
 
 ```lua
-maki.fn.joblist()
+maki.fn.joblist({session?})
 ```
 
-List live jobs this plugin can see: the current task's jobs plus
-this plugin's plugin-owned jobs.
+List jobs this plugin can see, including exited session-owned jobs (so an
+id started before a reload stays findable). Pass a session id to restrict
+session-owned jobs to that session.
 
-**Returns:** (`table`) array of `{ id, command, pid, elapsed_secs }`.
+Requires the `run` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{session?}` (`string?`) Session id filter.
+
+**Returns:** (`table`) array of `{ id, command, pid, session, status, exit_code,
+  elapsed_secs, stdout_lines, stderr_lines }`.
 
 **Example:**
 
 ```lua
-local jobs = maki.fn.joblist()
+local jobs = maki.fn.joblist(maki.session.current())
 ```
 
 ---

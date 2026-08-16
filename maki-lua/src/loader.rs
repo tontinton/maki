@@ -952,8 +952,8 @@ impl EventHandle {
         });
     }
 
-    /// Fire `SessionEnd` for a session that is going away. Call from every
-    /// session-end path (reset, load, delete, shutdown, ACP, headless).
+    /// Kill session-owned jobs and fire `SessionEnd`. Call from every
+    /// session-end path so a Lua monitor can stay a plugin.
     pub fn end_session(&self, session: maki_storage::id::MakiId) {
         let _ = self.tx.try_send(Request::EndSession { session });
     }

@@ -289,6 +289,7 @@ pub enum Request {
         event: String,
         data: Value,
     },
+    /// Reap session-owned jobs and fire `SessionEnd`.
     EndSession {
         session: maki_storage::id::MakiId,
     },
@@ -1702,6 +1703,7 @@ impl LuaRuntime {
         self.warm_tools.borrow_mut().clear();
         with_jobs(&self.lua, |store| {
             store.kill_owner(&self.lua, &JobOwner::Plugin(Arc::from(name)));
+            store.detach_plugin_callbacks(&self.lua, name);
         });
         if let Some(mut store) = self.lua.app_data_mut::<PluginOptionSpecs>() {
             store.remove(name);
@@ -3195,12 +3197,17 @@ pub fn spawn(
                             }
                         }
                         Request::EndSession { session } => {
+                            // Handlers may still inspect or stop the jobs, so
+                            // the event fires before the reap.
                             let data = json_to_lua(
                                 &rt.lua,
                                 &serde_json::json!({ "session_id": session.to_string() }),
                             )
                             .unwrap_or(LuaValue::Nil);
                             crate::api::autocmd::dispatch(&rt.lua, "SessionEnd", None, data);
+                            with_jobs(&rt.lua, |store| {
+                                store.kill_session(&rt.lua, session);
+                            });
                         }
                         Request::Describe {
                             plugin,
