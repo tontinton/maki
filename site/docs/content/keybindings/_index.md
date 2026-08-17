@@ -15,7 +15,7 @@ On macOS, some bindings use Option or Fn keys instead (run `/help` for exact key
 |-----|--------|
 | `Ctrl+C` | Quit / clear input |
 | `Ctrl+H` | Show keybindings |
-| `Ctrl+N` / `Ctrl+P` | Next / previous task chat |
+| `Ctrl+P` | Browse sessions |
 | `Ctrl+F` | Search messages |
 | `Ctrl+S` | File picker |
 | `Ctrl+O` | Open plan in editor |

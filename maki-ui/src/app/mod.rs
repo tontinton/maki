@@ -88,6 +88,7 @@ const FLASH_REWIND: &str = "Press esc again to rewind...";
 const AUTH_EXPIRED_MSG: &str =
     "Token expired. Run `maki auth login` in another terminal, then press Enter to retry.";
 const FLASH_NO_PLAN: &str = "No plan file";
+const SESSIONS_COMMAND: &str = "/sessions";
 const FAST_UNSUPPORTED_MSG: &str = "Fast mode requires an Anthropic Opus 4.6+ model (API only)";
 const FAST_ON_MSG: &str = "Fast mode: on";
 const FAST_OFF_MSG: &str = "Fast mode: off";
@@ -513,11 +514,9 @@ impl App {
         if key::TASKS.matches(key) {
             return Some(self.run_builtin(BuiltinAction::Tasks));
         }
-        if key::PREV_CHAT.matches(key) {
-            return Some(self.run_builtin(BuiltinAction::PrevChat));
-        }
-        if key::NEXT_CHAT.matches(key) {
-            return Some(self.run_builtin(BuiltinAction::NextChat));
+        if key::SESSIONS.matches(key) {
+            self.run_lua_command(SESSIONS_COMMAND, String::new(), 0);
+            return Some(vec![]);
         }
         if key::SCROLL_HALF_UP.matches(key) {
             let half = self.chats[self.active_chat].half_page();

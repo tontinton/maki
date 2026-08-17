@@ -129,8 +129,7 @@ pub mod key {
 
     pub const QUIT: Bind = ctrl_bind!('c');
     pub const HELP: Bind = ctrl_bind!('h');
-    pub const PREV_CHAT: Bind = ctrl_bind!('p');
-    pub const NEXT_CHAT: Bind = ctrl_bind!('n');
+    pub const SESSIONS: Bind = ctrl_bind!('p');
     pub const SCROLL_HALF_UP: Bind = ctrl_bind!('u');
     pub const SCROLL_HALF_DOWN: Bind = ctrl_bind!('d');
     pub const SCROLL_LINE_UP: Bind = ctrl_bind!('y');
@@ -317,8 +316,8 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
-        label: KeyLabel::Alt(key::NEXT_CHAT.label, key::PREV_CHAT.label),
-        description: "Next / previous task chat",
+        label: KeyLabel::Single(key::SESSIONS.label),
+        description: "Browse sessions",
         context: KeybindContext::General,
         platform: Platform::All,
     },
