@@ -407,6 +407,35 @@ If your provider serves models not in the base catalog, add a `models` subcomman
 
 Only `id` is required. Optional fields: `tier` (default `medium`), `context_window` (128K), `max_output_tokens` (16K), `pricing` (`{input, output, cache_write, cache_read}`, all per 1M tokens), `supports_tool_examples` (defaults to the base provider's setting), `supports_thinking` (defaults to the base provider's setting), `requires_thinking` (default false; for APIs that reject requests with thinking off, raises it to minimal effort and implies `supports_thinking`), `supports_vision` (defaults to the base provider's setting; when false, image input and the `view_image` tool are disabled). The first model listed per tier is used for sub-agents. Without this subcommand, the base provider's models are used.
 
+A `llama-cpp` model can replace Maki's token-budget mapping with its native thinking fields. Each thinking mode maps to a JSON fragment merged into the request body:
+
+```json
+[{
+  "id": "reasoning-model",
+  "supports_thinking": true,
+  "thinking_fields": {
+    "off": {"reasoning_effort": "none"},
+    "adaptive": {"reasoning_effort": "medium"},
+    "low": {"reasoning_effort": "low"},
+    "medium": {"reasoning_effort": "medium"},
+    "xhigh": {"reasoning_effort": "xhigh"}
+  }
+}]
+```
+
+`off` is used when thinking is off, `adaptive` when thinking is on without a chosen level. Any other key is an effort level, one of `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. The levels you declare are the ones the model accepts: whatever you ask for snaps into them, downwards first, so a level the model never advertised is never sent. Every part is optional.
+
+Fragments are merged into the body, so nesting works too. A template toggle is just a fragment:
+
+```json
+"thinking_fields": {
+  "off": {"chat_template_kwargs": {"enable_thinking": false}},
+  "adaptive": {"chat_template_kwargs": {"enable_thinking": true}}
+}
+```
+
+Named modes send only these fields, no token budget. An explicit `/thinking <budget>` snaps into the levels you declared; a model that declares none gets the `adaptive` fragment plus `thinking_budget_tokens`. Any mode you left undeclared falls back to the usual `thinking_budget_tokens` mapping, so no request ever ends up saying nothing. Models without `thinking_fields` keep the existing llama.cpp behavior.
+
 Dynamic provider models are namespaced as `{slug}/{model_id}` (e.g. `myproxy/claude-sonnet-4-6`).
 
 ### Script Name Rules

@@ -312,6 +312,7 @@ mod tests {
             pricing: ModelPricing::ZERO,
             max_output_tokens: Some(131_072),
             context_window: 500_000,
+            thinking_fields: None,
         }
     }
 

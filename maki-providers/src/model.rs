@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use crate::manifest::{ManifestRegistry, ProviderManifest};
 use crate::model_registry;
 use crate::providers::{anthropic, custom, dynamic};
+use crate::types::ThinkingFields;
 
 const PER_MILLION: f64 = 1_000_000.0;
 
@@ -242,6 +243,7 @@ pub struct Model {
     /// `None` when unknown, see [`ProviderKind::fallback_max_output`].
     pub max_output_tokens: Option<u32>,
     pub context_window: u32,
+    pub thinking_fields: Option<Box<ThinkingFields>>,
 }
 
 impl Model {
@@ -280,6 +282,7 @@ impl Model {
             pricing,
             max_output_tokens,
             context_window,
+            thinking_fields: None,
         }
     }
 
@@ -310,6 +313,7 @@ impl Model {
             },
             max_output_tokens: Some(meta.output),
             context_window: meta.context,
+            thinking_fields: None,
         }
     }
 

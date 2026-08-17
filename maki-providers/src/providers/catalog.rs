@@ -1027,6 +1027,7 @@ mod tests {
             pricing: ModelPricing::default(),
             max_output_tokens: None,
             context_window: 0,
+            thinking_fields: None,
         };
         let (tx, _rx) = flume::unbounded();
         let result = smol::block_on(provider.stream_message(

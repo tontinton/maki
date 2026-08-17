@@ -17,6 +17,7 @@ use tracing::{debug, warn};
 use crate::manifest::ManifestRegistry;
 use crate::model::{Model, ModelPricing, ModelTier, ThinkingSupport};
 use crate::provider::{BoxFuture, Provider, ProviderKind};
+use crate::types::ThinkingFields;
 use crate::{AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse};
 
 use super::ResolvedAuth;
@@ -38,6 +39,7 @@ const INFO_TIMEOUT: Duration = Duration::from_secs(5);
 const SCRIPT_TIMEOUT: Duration = Duration::from_secs(30);
 const PROVIDERS_DIR: &str = "providers";
 const SCRIPT_CACHE_FILE: &str = "provider-scripts.json";
+const THINKING_FIELDS_KEY: &str = "thinking_fields";
 
 struct DynamicProviderMeta {
     slug: String,
@@ -77,6 +79,8 @@ struct ScriptModel {
     context_window: u32,
     #[serde(default)]
     pricing: Option<ModelPricing>,
+    #[serde(default)]
+    thinking_fields: Option<ThinkingFields>,
 }
 
 impl ScriptModel {
@@ -95,6 +99,7 @@ impl ScriptModel {
             pricing: self.pricing.clone().unwrap_or_default(),
             max_output_tokens: Some(self.max_output_tokens),
             context_window: self.context_window,
+            thinking_fields: self.thinking_fields.clone().map(Box::new),
         }
     }
 }
@@ -313,13 +318,52 @@ fn build_meta(
         }
     };
 
-    let models = match &described.models {
-        Some(json) => serde_json::from_str(json).unwrap_or_else(|e| {
-            warn!(slug, error = %e, "invalid models JSON, falling back to base models");
-            Vec::new()
-        }),
+    // Entry by entry, so one bad model never costs the whole list.
+    let models: Vec<ScriptModel> = match &described.models {
+        Some(json) => serde_json::from_str::<Vec<Value>>(json)
+            .unwrap_or_else(|e| {
+                warn!(slug, error = %e, "invalid models JSON, falling back to base models");
+                Vec::new()
+            })
+            .into_iter()
+            .filter_map(|mut entry| {
+                let error = match serde_json::from_value::<ScriptModel>(entry.clone()) {
+                    Ok(model) => return Some(model),
+                    Err(e) => e,
+                };
+                // Malformed thinking fields cost the field, not the model.
+                let without_fields = entry
+                    .as_object_mut()
+                    .is_some_and(|o| o.remove(THINKING_FIELDS_KEY).is_some())
+                    .then(|| serde_json::from_value::<ScriptModel>(entry).ok())
+                    .flatten();
+                match without_fields {
+                    Some(model) => {
+                        warn!(slug, error = %error, model = model.id, "invalid thinking_fields, dropping them");
+                        Some(model)
+                    }
+                    None => {
+                        warn!(slug, error = %error, "invalid model entry, skipping");
+                        None
+                    }
+                }
+            })
+            .collect(),
         None => Vec::new(),
     };
+
+    // Only the llama.cpp request path reads these, so anywhere else they would
+    // vanish without a trace.
+    if !matches!(base, ProviderKind::LlamaCpp)
+        && let Some(model) = models.iter().find(|m| m.thinking_fields.is_some())
+    {
+        warn!(
+            slug,
+            base = %info.base,
+            model = model.id,
+            "thinking_fields only applies to llama-cpp models, ignoring"
+        );
+    }
 
     Some(DynamicProviderMeta {
         slug,
@@ -739,12 +783,21 @@ mod tests {
 
     #[test]
     fn script_model_deserialization() {
-        let full = r#"{"id": "my-model", "tier": "strong", "supports_tool_examples": true, "max_output_tokens": 32000, "context_window": 200000, "pricing": {"input": 3.0, "output": 15.0, "cache_write": 3.75, "cache_read": 0.30}}"#;
+        let full = r#"{"id": "my-model", "tier": "strong", "supports_tool_examples": true, "max_output_tokens": 32000, "context_window": 200000, "pricing": {"input": 3.0, "output": 15.0, "cache_write": 3.75, "cache_read": 0.30}, "thinking_fields": {"adaptive": {"reasoning_effort": "medium"}, "low": {"reasoning_effort": "low"}}}"#;
         let model: ScriptModel = serde_json::from_str(full).unwrap();
         assert_eq!(model.id, "my-model");
         assert_eq!(model.tier, ModelTier::Strong);
         assert_eq!(model.supports_tool_examples, Some(true));
         assert!(model.pricing.is_some());
+        let resolved = model.to_model(
+            "dynamic",
+            ProviderKind::LlamaCpp,
+            model.id.clone(),
+            model.tier,
+        );
+        let mut body = serde_json::json!({});
+        crate::ThinkingConfig::Adaptive.apply_local_thinking(&mut body, &resolved);
+        assert_eq!(body, serde_json::json!({"reasoning_effort": "medium"}));
 
         let minimal: ScriptModel = serde_json::from_str(r#"{"id": "custom-v1"}"#).unwrap();
         assert_eq!(minimal.tier, ModelTier::Medium);
@@ -752,6 +805,26 @@ mod tests {
         assert_eq!(minimal.max_output_tokens, 16384);
         assert_eq!(minimal.context_window, 128_000);
         assert!(minimal.pricing.is_none());
+        assert!(minimal.thinking_fields.is_none());
+    }
+
+    #[test]
+    fn bad_thinking_fields_keeps_the_model() {
+        let described = ScriptDescription {
+            modified_ns: 0,
+            size: 0,
+            info: r#"{"display_name": "T", "base": "llama-cpp", "has_auth": false}"#.into(),
+            models: Some(
+                r#"[{"id": "typo", "thinking_fields": {"hight": {"reasoning_effort": "high"}}},
+                    {"id": "broken", "tier": 7},
+                    {"id": "good"}]"#
+                    .into(),
+            ),
+        };
+        let meta = build_meta("t".into(), PathBuf::new(), &described).unwrap();
+        let ids: Vec<&str> = meta.models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["typo", "good"]);
+        assert!(meta.models[0].thinking_fields.is_none());
     }
 
     #[cfg(unix)]

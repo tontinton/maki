@@ -7,17 +7,20 @@
 //! belongs in model context, and must never be mistaken for the user talking.
 
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 pub use maki_storage::sessions::Effort;
 use maki_storage::sessions::{MIN_THINKING_BUDGET, StoredThinking, TitleSource};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use strum::{Display, IntoStaticStr};
 use tracing::warn;
 
 use crate::TokenUsage;
 use crate::model::Model;
+
+const LOCAL_BUDGET_FIELD: &str = "thinking_budget_tokens";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageMediaType {
@@ -408,6 +411,60 @@ pub struct EffortDialect<'a> {
     pub off: Option<&'static str>,
 }
 
+/// How a local model spells thinking on the wire, in place of a token budget.
+/// Each mode carries the JSON fragment merged into the request body, so any
+/// shape a chat template needs works without a schema per provider.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct ThinkingFields {
+    #[serde(default)]
+    off: Option<Map<String, Value>>,
+    #[serde(default)]
+    adaptive: Option<Map<String, Value>>,
+    /// Keyed by [`Effort`]; the declared keys are the levels the model accepts.
+    #[serde(flatten)]
+    levels: BTreeMap<Effort, Map<String, Value>>,
+}
+
+impl ThinkingFields {
+    /// Levels snap to the declared ones, so a level the model never advertised
+    /// is never sent. A token budget picks the level it corresponds to; models
+    /// that declare no levels fall back to `adaptive` and keep the count
+    /// (the returned flag tells the caller to still send the budget field).
+    fn fragment(
+        &self,
+        thinking: ThinkingConfig,
+        max: Option<u32>,
+    ) -> Option<(&Map<String, Value>, bool)> {
+        let level = match thinking {
+            ThinkingConfig::Off => return self.off.as_ref().map(|f| (f, false)),
+            ThinkingConfig::Adaptive => return self.adaptive.as_ref().map(|f| (f, false)),
+            ThinkingConfig::Effort(level) => level,
+            ThinkingConfig::Budget(n) => {
+                if self.levels.is_empty() {
+                    return self.adaptive.as_ref().map(|f| (f, true));
+                }
+                Effort::from_budget(n, max.unwrap_or(FALLBACK_MAX_THINKING_BUDGET))
+            }
+        };
+        let declared: Vec<Effort> = self.levels.keys().copied().collect();
+        self.levels
+            .get(&level.snap(&declared))
+            .or(self.adaptive.as_ref())
+            .map(|f| (f, false))
+    }
+}
+
+fn merge_body(body: &mut Map<String, Value>, fragment: &Map<String, Value>) {
+    for (key, value) in fragment {
+        match (body.get_mut(key), value.as_object()) {
+            (Some(Value::Object(target)), Some(source)) => merge_body(target, source),
+            _ => {
+                body.insert(key.clone(), value.clone());
+            }
+        }
+    }
+}
+
 pub mod dialect {
     use super::EffortDialect;
     use maki_storage::sessions::Effort::{High, Low, Max, Medium, Minimal, XHigh};
@@ -588,12 +645,25 @@ impl ThinkingConfig {
     }
 
     pub fn apply_local_thinking(self, body: &mut Value, model: &Model) {
-        let budget = match self.budget(model.max_thinking_budget()) {
+        let max = model.max_thinking_budget();
+        if let Some(fields) = &model.thinking_fields
+            && let Some((fragment, keep_budget)) = fields.fragment(self, max)
+            && let Some(object) = body.as_object_mut()
+        {
+            merge_body(object, fragment);
+            if keep_budget && let Budgeted::Tokens(budget) = self.budget(max) {
+                body[LOCAL_BUDGET_FIELD] = json!(budget);
+            }
+            return;
+        }
+        // No fragment means the model has no way to spell this mode, so the
+        // budget field takes over: a request must never end up saying nothing.
+        let budget = match self.budget(max) {
             Budgeted::Off => 0,
             Budgeted::Adaptive => -1,
             Budgeted::Tokens(n) => i64::from(n),
         };
-        body["thinking_budget_tokens"] = json!(budget);
+        body[LOCAL_BUDGET_FIELD] = json!(budget);
     }
 
     pub fn parse(input: &str, current: Self) -> Result<Self, &'static str> {
@@ -862,6 +932,25 @@ mod tests {
         }
     }
 
+    fn native_thinking_model(id: &str, fields: Value) -> crate::model::Model {
+        let mut model = thinking_model(id);
+        model.thinking_fields = Some(Box::new(serde_json::from_value(fields).unwrap()));
+        model
+    }
+
+    fn native_effort_model() -> crate::model::Model {
+        native_thinking_model(
+            "local-model",
+            json!({
+                "off": {"reasoning_effort": "none"},
+                "adaptive": {"reasoning_effort": "medium"},
+                "low": {"reasoning_effort": "low"},
+                "medium": {"reasoning_effort": "medium"},
+                "xhigh": {"reasoning_effort": "xhigh"}
+            }),
+        )
+    }
+
     #[test]
     fn dialects_have_non_empty_ascending_supported() {
         let all = [
@@ -970,6 +1059,67 @@ mod tests {
         assert_eq!(body["thinking_budget_tokens"], expected);
     }
 
+    #[test_case(ThinkingConfig::Off,           json!({"reasoning_effort": "none"})   ; "off")]
+    #[test_case(ThinkingConfig::Adaptive,      json!({"reasoning_effort": "medium"}) ; "adaptive")]
+    #[test_case(ThinkingConfig::Effort(Low),   json!({"reasoning_effort": "low"})    ; "low")]
+    #[test_case(ThinkingConfig::Effort(High),  json!({"reasoning_effort": "medium"}) ; "undeclared_high_snaps_down")]
+    #[test_case(ThinkingConfig::Effort(XHigh), json!({"reasoning_effort": "xhigh"})  ; "xhigh")]
+    #[test_case(ThinkingConfig::Budget(4096),  json!({"reasoning_effort": "xhigh"})  ; "numeric_budget_maps_to_declared_level")]
+    fn local_native_effort_uses_declared_levels(config: ThinkingConfig, expected: Value) {
+        let mut body = json!({});
+        config.apply_local_thinking(&mut body, &native_effort_model());
+        assert_eq!(body, expected);
+    }
+
+    #[test]
+    fn local_required_thinking_maps_off_to_lowest_native_effort() {
+        let mut model = native_effort_model();
+        model.thinking_override = Some(Support::Required);
+        let thinking = RequestOptions {
+            thinking: ThinkingConfig::Off,
+            fast: false,
+        }
+        .clamped(&model)
+        .thinking;
+        let mut body = json!({});
+        thinking.apply_local_thinking(&mut body, &model);
+        assert_eq!(body, json!({"reasoning_effort": "low"}));
+    }
+
+    #[test_case(ThinkingConfig::Off,          json!({"chat_template_kwargs": {"enable_thinking": false, "keep": 1}}) ; "off")]
+    #[test_case(ThinkingConfig::Adaptive,     json!({"chat_template_kwargs": {"enable_thinking": true, "keep": 1}})  ; "adaptive")]
+    #[test_case(ThinkingConfig::Effort(High), json!({"chat_template_kwargs": {"enable_thinking": true, "keep": 1}})  ; "effort_without_levels_uses_adaptive")]
+    #[test_case(ThinkingConfig::Budget(2048), json!({"chat_template_kwargs": {"enable_thinking": true, "keep": 1}, "thinking_budget_tokens": 2048}) ; "numeric_budget")]
+    fn local_native_toggle_merges_into_nested_object(config: ThinkingConfig, expected: Value) {
+        let model = native_thinking_model(
+            "local-toggle-model",
+            json!({
+                "off": {"chat_template_kwargs": {"enable_thinking": false}},
+                "adaptive": {"chat_template_kwargs": {"enable_thinking": true}}
+            }),
+        );
+        let mut body = json!({"chat_template_kwargs": {"keep": 1}});
+        config.apply_local_thinking(&mut body, &model);
+        assert_eq!(body, expected);
+    }
+
+    /// A mode the model has no fragment for must still reach the server, so
+    /// the budget field takes over instead of the request saying nothing.
+    #[test_case(json!({"low": {"reasoning_effort": "low"}}), ThinkingConfig::Off, 0 ; "off_without_off")]
+    #[test_case(json!({"adaptive": {"enable_thinking": true}}), ThinkingConfig::Off, 0 ; "toggle_without_off")]
+    #[test_case(json!({"off": {"reasoning_effort": "none"}}), ThinkingConfig::Adaptive, -1 ; "adaptive_without_adaptive")]
+    #[test_case(json!({"off": {"reasoning_effort": "none"}}), ThinkingConfig::Budget(4096), 4096 ; "budget_without_levels")]
+    fn local_native_missing_fragment_falls_back_to_budget(
+        fields: Value,
+        config: ThinkingConfig,
+        expected: i64,
+    ) {
+        let model = native_thinking_model("local-partial", fields);
+        let mut body = json!({});
+        config.apply_local_thinking(&mut body, &model);
+        assert_eq!(body, json!({ "thinking_budget_tokens": expected }));
+    }
+
     /// llama.cpp models have no known output window; the budget the user
     /// asked for must reach the server untouched.
     #[test]
@@ -993,6 +1143,7 @@ mod tests {
             pricing: crate::model::ModelPricing::default(),
             max_output_tokens: Some(8192),
             context_window: 200_000,
+            thinking_fields: None,
         }
     }
 
