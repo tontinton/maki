@@ -14,9 +14,9 @@ pub use mcp::{
 };
 pub(crate) mod task_set;
 pub use agent::{
-    Agent, AgentParams, AgentRunParams, EMPTY_RESPONSE_MARKER, History, HistorySnapshot,
-    Instructions, LoadedInstructions, SharedMessages, UNAVAILABLE_RESULT,
-    close_dangling_tool_calls, find_subdirectory_instructions, is_instruction_file,
+    Agent, AgentParams, AgentRunParams, History, HistorySnapshot, Instructions, LoadedInstructions,
+    SharedMessages, UNAVAILABLE_RESULT, close_dangling_tool_calls, find_subdirectory_instructions,
+    is_instruction_file,
 };
 pub use cancel::{CancelMap, CancelToken, CancelTrigger};
 pub use mailbox::{MailboxError, SessionMailbox};
@@ -35,7 +35,7 @@ use std::path::{Path, PathBuf};
 
 pub use maki_providers::AgentError;
 use maki_providers::Message;
-pub use maki_providers::{ImageMediaType, ImageSource, ThinkingConfig};
+pub use maki_providers::{EMPTY_RESPONSE_MARKER, ImageMediaType, ImageSource, ThinkingConfig};
 pub use types::{
     AgentEvent, BufferSnapshot, DoneReason, Envelope, EventSender, GrepFileEntry, GrepLine,
     GrepMatchGroup, InstructionBlock, NO_FILES_FOUND, SharedBuf, SnapshotLine, SnapshotSpan,

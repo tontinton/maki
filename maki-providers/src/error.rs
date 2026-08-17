@@ -26,6 +26,8 @@ pub enum AgentError {
     Cancelled,
     #[error("stream timed out after {secs}s of inactivity")]
     Timeout { secs: u64 },
+    #[error("compaction returned no summary")]
+    EmptySummary,
 }
 
 impl AgentError {
@@ -41,6 +43,7 @@ impl AgentError {
             | Self::Channel
             | Self::Json(_)
             | Self::Cancelled
+            | Self::EmptySummary
             | Self::HttpRequest(_) => false,
         }
     }
@@ -108,6 +111,7 @@ impl AgentError {
             Self::Json(_) => "received an invalid response from the API".into(),
             Self::Channel => "internal error, try again".into(),
             Self::Cancelled => "cancelled".into(),
+            Self::EmptySummary => "compaction returned no summary, history kept as is".into(),
         }
     }
 

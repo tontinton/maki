@@ -6,7 +6,7 @@ use tracing::{error, info, warn};
 
 use maki_providers::provider::Provider;
 use maki_providers::{
-    ContentBlock, Message, Model, RequestOptions, Role, StopReason, StreamResponse, TokenUsage,
+    ContentBlock, Message, Model, RequestOptions, StopReason, StreamResponse, TokenUsage,
 };
 
 use super::compaction;
@@ -25,12 +25,11 @@ use crate::{
 use maki_config::{ModelPolicy, ToolOutputLines};
 use maki_storage::id::SessionRef;
 
-/// Stands in for the assistant turn the model left blank, so the nudge
-/// below has something to answer. Never a real response: readers that mine
-/// history for model text must skip it.
-pub const EMPTY_RESPONSE_MARKER: &str = "(empty)";
 const MAX_REAUTH_ATTEMPTS: u32 = 2;
 const NUDGE_PROMPT: &str = "You just executed tool calls but returned an empty response. Please process the tool results above and continue with the task.";
+/// A model that stalls once often stalls again on the retry, so it gets a
+/// second chance before the turn ends empty handed.
+const MAX_NUDGES: u32 = 2;
 
 pub fn resolve_compaction_model(
     provider: &Arc<dyn Provider>,
@@ -101,7 +100,7 @@ pub struct Agent<'h> {
     config: AgentConfig,
     tool_output_lines: ToolOutputLines,
     reauth_attempts: u32,
-    post_tool_empty_retried: bool,
+    nudges: u32,
     permissions: Arc<PermissionManager>,
     opts: RequestOptions,
     session_id: Option<SessionRef>,
@@ -143,7 +142,7 @@ impl<'h> Agent<'h> {
             rollback_len: 0,
             mcp: None,
             reauth_attempts: 0,
-            post_tool_empty_retried: false,
+            nudges: 0,
             opts: RequestOptions::default(),
             session_id: params.session_id,
             mailbox: params.mailbox,
@@ -330,25 +329,11 @@ impl<'h> Agent<'h> {
             self.context_size +=
                 estimate_message_tokens(&self.history.as_slice()[history_len_before..]);
         } else {
-            let has_text = response.message.first_text_content().is_some();
-
-            if !has_text && !self.post_tool_empty_retried && self.history.has_recent_tool_results(5)
-            {
-                self.post_tool_empty_retried = true;
-                warn!("empty response after tool calls, nudging model to continue");
-                self.event_tx.send(AgentEvent::Nudge)?;
-                self.history.push(Message {
-                    role: Role::Assistant,
-                    content: vec![ContentBlock::Text {
-                        text: EMPTY_RESPONSE_MARKER.into(),
-                    }],
-                    ..Default::default()
-                });
-                self.history.push(Message::synthetic(NUDGE_PROMPT.into()));
+            if response.message.first_text_content().is_some() {
+                self.history.push(response.message);
+            } else if self.recover_stalled_turn()? {
                 return Ok(TurnOutcome::Continue);
             }
-
-            self.history.push(response.message);
 
             if stop_reason == Some(StopReason::MaxTokens)
                 && self.num_turns <= self.config.max_continuation_turns
@@ -427,8 +412,28 @@ impl<'h> Agent<'h> {
         })
     }
 
+    /// The turn came back without text, so [`Message::empty_marker`] takes its
+    /// place in history. Returns true when the model was nudged to try again.
+    fn recover_stalled_turn(&mut self) -> Result<bool, AgentError> {
+        // Asked before the marker lands, since it shifts the recent window.
+        let nudge = self.nudges < MAX_NUDGES && self.history.has_recent_tool_results(5);
+        self.history.push(Message::empty_marker());
+        if !nudge {
+            return Ok(false);
+        }
+
+        self.nudges += 1;
+        warn!(
+            self.nudges,
+            "empty response after tool calls, nudging model to continue"
+        );
+        self.event_tx.send(AgentEvent::Nudge)?;
+        self.history.push(Message::synthetic(NUDGE_PROMPT.into()));
+        Ok(true)
+    }
+
     async fn process_tool_calls(&mut self, response: StreamResponse) -> Result<(), AgentError> {
-        self.post_tool_empty_retried = false;
+        self.nudges = 0;
         let ctx = self.tool_context();
         tool_dispatch::process_tool_calls(
             response,
@@ -656,10 +661,21 @@ mod tests {
     }
 
     fn empty_response() -> StreamResponse {
+        assistant_response(vec![])
+    }
+
+    fn thinking_response() -> StreamResponse {
+        assistant_response(vec![ContentBlock::Thinking {
+            thinking: "stalled".into(),
+            signature: None,
+        }])
+    }
+
+    fn assistant_response(content: Vec<ContentBlock>) -> StreamResponse {
         StreamResponse {
             message: Message {
                 role: Role::Assistant,
-                content: vec![],
+                content,
                 ..Default::default()
             },
             usage: TokenUsage::default(),
@@ -1130,15 +1146,25 @@ mod tests {
             empty_response(),
             text_response(StopReason::EndTurn),
         ],
-        3, true
+        3, 1
         ; "nudge_on_empty_after_tools"
+    )]
+    #[test_case(
+        vec![
+            tool_call_response("glob", "t1"),
+            thinking_response(),
+            empty_response(),
+            empty_response(),
+        ],
+        4, 2
+        ; "nudges_twice_then_gives_up"
     )]
     #[test_case(
         vec![
             tool_call_response("glob", "t1"),
             text_response(StopReason::EndTurn),
         ],
-        2, false
+        2, 0
         ; "no_nudge_when_text_after_tools"
     )]
     #[test_case(
@@ -1146,10 +1172,10 @@ mod tests {
             empty_response(),
             text_response(StopReason::EndTurn),
         ],
-        1, false
+        1, 0
         ; "no_nudge_without_recent_tools"
     )]
-    fn nudge_behavior(responses: Vec<StreamResponse>, expected_turns: u32, expect_nudge: bool) {
+    fn nudge_behavior(responses: Vec<StreamResponse>, expected_turns: u32, expected_nudges: usize) {
         smol::block_on(async {
             let mut history = History::new(Vec::new());
             let (mut agent, event_rx) = make_agent(MockProvider::new(responses), &mut history);
@@ -1157,10 +1183,12 @@ mod tests {
             drop(agent);
             let events = drain_events(&event_rx);
 
-            assert_eq!(
-                has_event(&events, |e| matches!(e, AgentEvent::Nudge)),
-                expect_nudge,
-            );
+            let nudges = events
+                .iter()
+                .filter(|e| matches!(e.event, AgentEvent::Nudge))
+                .count();
+            assert_eq!(nudges, expected_nudges);
+
             let done = events
                 .iter()
                 .find_map(|e| match &e.event {
@@ -1169,6 +1197,15 @@ mod tests {
                 })
                 .expect("expected Done event");
             assert_eq!(done, expected_turns);
+
+            assert!(
+                history
+                    .as_slice()
+                    .iter()
+                    .all(|m| m.content.iter().any(|b| !b.is_thinking())),
+                "history holds a message no provider will accept: {:?}",
+                history.as_slice()
+            );
         });
     }
 
