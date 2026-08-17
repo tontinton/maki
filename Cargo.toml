@@ -203,3 +203,10 @@ debug = false
 # grammars. Those static archives held the bulk of the bytes.
 [profile.dev.build-override]
 debug = false
+
+# crossterm 0.29.0 has no VT input on Windows, so bracketed paste never decodes and a
+# multiline paste submits at the first newline (#336). Pinned to the head of
+# crossterm-rs/crossterm#1030, which lives in refs/pull/1030/head on the upstream repo.
+# Remove once the PR ships in a crossterm release.
+[patch.crates-io]
+crossterm = { git = "https://github.com/crossterm-rs/crossterm", rev = "3ca54292d2b1f1c58e200a06122ddaf5dd6b5c77" }

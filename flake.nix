@@ -89,6 +89,8 @@
       gitDepHashes = {
         "git+https://github.com/pydantic/monty.git?tag=v0.0.21#70fe3f5781381eb33579e45046f8cb3845953373" =
           "sha256-P4PgqfYykkZrWGg5G3WQo070lORLEhmXQUQPx3+Yslo=";
+        "git+https://github.com/crossterm-rs/crossterm?rev=3ca54292d2b1f1c58e200a06122ddaf5dd6b5c77#3ca54292d2b1f1c58e200a06122ddaf5dd6b5c77" =
+          "sha256-A5lgiEEi7mktf7m2GljdAxst7Fdl7Uqko29Xq6o90Ow=";
       };
 
       missingGitDepHashes = builtins.filter (s: !(builtins.hasAttr s gitDepHashes)) gitDepSources;
