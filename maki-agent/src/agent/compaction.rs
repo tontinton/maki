@@ -99,6 +99,7 @@ fn finish_compact(
         model: model.id.clone(),
         cost: model.cost_of(&response.usage, false),
         context_size: Some(response.usage.output),
+        context_window: model.context_window,
     })));
 
     // Swapping the history for a summary the model never wrote would throw the

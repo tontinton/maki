@@ -1,16 +1,18 @@
 use std::path::{Path, PathBuf};
 
 use agent_client_protocol_schema::{
-    Content, ContentBlock, ContentChunk, Diff, ImageContent, SessionUpdate, StopReason,
+    Content, ContentBlock, ContentChunk, Cost, Diff, ImageContent, SessionUpdate, StopReason,
     TextContent, ToolCall, ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus,
-    ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+    ToolCallUpdate, ToolCallUpdateFields, ToolKind, UsageUpdate,
 };
 use maki_agent::DoneReason;
 use maki_agent::tools::ToolRegistry;
-use maki_agent::types::{ToolDoneEvent, ToolOutput, ToolStartEvent};
+use maki_agent::types::{ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent};
 use maki_providers::{ContentBlock as MsgBlock, ImageMediaType, Message, Role as MsgRole};
 
 const MIN_FENCE_LEN: usize = 3;
+/// Model pricing is quoted in US dollars, so that is the reported currency.
+const CURRENCY: &str = "USD";
 
 /// File-level tools report a location so the client can follow along. Directory
 /// scoped tools (glob, grep, list) and commands (bash) target no single file.
@@ -272,6 +274,20 @@ pub fn map_done_reason(reason: DoneReason) -> StopReason {
         DoneReason::MaxTurns => StopReason::MaxTurnRequests,
         DoneReason::Cancelled => StopReason::Cancelled,
     }
+}
+
+/// Per ACP "Session Usage Updates": the current context gauge plus the
+/// session's cumulative cost. Each turn's event only carries its own turn's
+/// share, so the caller tracks the running total across turns.
+pub fn usage_update(event: &TurnCompleteEvent, cost_total: Option<f64>) -> SessionUpdate {
+    let used = event
+        .context_size
+        .unwrap_or_else(|| event.usage.context_tokens()) as u64;
+    let mut update = UsageUpdate::new(used, u64::from(event.context_window));
+    if let Some(cost) = cost_total {
+        update = update.cost(Cost::new(cost, CURRENCY));
+    }
+    SessionUpdate::UsageUpdate(update)
 }
 
 pub fn replay_history(messages: &[Message], cwd: &Path, home: Option<&Path>) -> Vec<SessionUpdate> {
@@ -713,5 +729,52 @@ mod tests {
         )]);
         let json = updates_json(&[msg]);
         assert!(json[0].get("locations").is_none(), "{:?}", json[0]);
+    }
+
+    fn turn_event(
+        context_size: Option<u32>,
+        context_window: u32,
+        cost: Option<f64>,
+    ) -> TurnCompleteEvent {
+        TurnCompleteEvent {
+            message: Message::default(),
+            usage: maki_providers::TokenUsage {
+                input: 1_000,
+                output: 200,
+                cache_creation: 0,
+                cache_read: 50_000,
+            },
+            model: "test-model".into(),
+            cost,
+            context_size,
+            context_window,
+        }
+    }
+
+    #[test]
+    fn usage_update_reports_gauge_and_cumulative_cost() {
+        let event = turn_event(Some(60_000), 200_000, Some(0.05));
+        let json = serde_json::to_value(usage_update(&event, Some(0.125))).unwrap();
+        assert_eq!(json["sessionUpdate"], "usage_update");
+        assert_eq!(json["used"], 60_000);
+        assert_eq!(json["size"], 200_000);
+        assert_eq!(json["cost"]["amount"], 0.125);
+        assert_eq!(json["cost"]["currency"], CURRENCY);
+    }
+
+    #[test]
+    fn usage_update_without_cost_omits_cost() {
+        let event = turn_event(Some(60_000), 200_000, None);
+        let json = serde_json::to_value(usage_update(&event, None)).unwrap();
+        assert_eq!(json["used"], 60_000);
+        assert_eq!(json["size"], 200_000);
+        assert!(json.get("cost").is_none(), "{json}");
+    }
+
+    #[test]
+    fn usage_update_falls_back_to_usage_when_context_size_missing() {
+        let event = turn_event(None, 200_000, None);
+        let json = serde_json::to_value(usage_update(&event, None)).unwrap();
+        assert_eq!(json["used"], 51_200);
     }
 }

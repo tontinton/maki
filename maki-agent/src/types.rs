@@ -849,6 +849,9 @@ pub struct TurnCompleteEvent {
     pub cost: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_size: Option<u32>,
+    /// The model's context window, so consumers can gauge `context_size`
+    /// against the ceiling without resolving the model.
+    pub context_window: u32,
 }
 
 #[derive(Debug, Clone, Serialize)]

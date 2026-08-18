@@ -966,6 +966,7 @@ mod tests {
             model: "test-model".into(),
             cost: Some(cost),
             context_size: None,
+            context_window: 0,
         }))
     }
 

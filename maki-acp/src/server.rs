@@ -24,9 +24,9 @@ use maki_agent::tools::{LocalToolFn, LocalTools, QUESTION_TOOL_NAME, local_tool}
 use maki_agent::types::AgentEvent;
 use maki_agent::{AgentInput, AgentMode, Envelope, ImageMediaType, ImageSource};
 use maki_config::MAX_SERVER_NAME_LEN;
-use maki_providers::Message;
 use maki_providers::model::Model;
 use maki_providers::provider::available_model_specs;
+use maki_providers::{Message, TokenUsage, add_cost};
 use maki_storage::id::{MakiId, SessionRef};
 use serde::Serialize;
 use serde_json::Value;
@@ -190,7 +190,7 @@ async fn new_session(
     let spec = params.model.spec();
     let resp = methods::new_session_response(handle.session_id.as_str())
         .config_options(vec![methods::model_config_option(&spec, &srv.model_specs)]);
-    install_session(srv, handle, mcp, spec, pending, cwd);
+    install_session(srv, handle, mcp, spec, pending, cwd, None);
     Ok(AgentResponse::NewSessionResponse(resp))
 }
 
@@ -205,7 +205,7 @@ async fn load_session(
         .0
         .parse()
         .map_err(|_| AcpError::resource_not_found(Some(req.session_id.0.to_string())))?;
-    let (history, recorded_cwd) = load_history(session_ref.id())?;
+    let (history, recorded_cwd, restored_usage) = load_history(session_ref.id())?;
     close_session(srv).await;
     let mcp = start_mcp(&req.cwd, &req.mcp_servers).await;
     let sid = SessionId::from(session_ref.to_string());
@@ -226,7 +226,10 @@ async fn load_session(
     let spec = params.model.spec();
     let resp = methods::load_session_response()
         .config_options(vec![methods::model_config_option(&spec, &srv.model_specs)]);
-    install_session(srv, handle, mcp, spec, pending, cwd);
+    // The restored total predates any per-turn cost, so price it once with the
+    // current model; later turns add their own exact cost.
+    let restored_cost = params.model.cost_of(&restored_usage, false);
+    install_session(srv, handle, mcp, spec, pending, cwd, restored_cost);
     Ok(AgentResponse::LoadSessionResponse(resp))
 }
 
@@ -417,6 +420,7 @@ fn install_session(
     current_model: String,
     pending: PendingState,
     cwd: PathBuf,
+    initial_cost: Option<f64>,
 ) {
     start_event_pump(
         handle.event_rx.clone(),
@@ -425,6 +429,7 @@ fn install_session(
         Arc::clone(&pending),
         cwd,
         maki_storage::paths::home(),
+        initial_cost,
     );
     srv.session = Some(SessionState {
         handle,
@@ -435,7 +440,9 @@ fn install_session(
     });
 }
 
-fn load_history(session_id: MakiId) -> Result<(Vec<Message>, Option<PathBuf>), AcpError> {
+fn load_history(
+    session_id: MakiId,
+) -> Result<(Vec<Message>, Option<PathBuf>, TokenUsage), AcpError> {
     let storage = maki_storage::StateDir::resolve()
         .map_err(|e| AcpError::internal_error().data(json_str(&e)))?;
     load_history_from(&storage, session_id)
@@ -447,7 +454,7 @@ fn load_history(session_id: MakiId) -> Result<(Vec<Message>, Option<PathBuf>), A
 fn load_history_from(
     storage: &maki_storage::StateDir,
     session_id: MakiId,
-) -> Result<(Vec<Message>, Option<PathBuf>), AcpError> {
+) -> Result<(Vec<Message>, Option<PathBuf>, TokenUsage), AcpError> {
     let session: maki_storage::sessions::Session<
         Message,
         maki_providers::TokenUsage,
@@ -460,7 +467,8 @@ fn load_history_from(
     } else {
         None
     };
-    Ok((session.take_messages(), recorded))
+    let usage = session.token_usage;
+    Ok((session.take_messages(), recorded, usage))
 }
 
 fn handle_prompt(srv: &mut Server, raw: &Value, id: &RequestId) -> Result<(), AcpError> {
@@ -641,14 +649,21 @@ fn start_event_pump(
     pending: PendingState,
     cwd: PathBuf,
     home: Option<PathBuf>,
+    initial_cost: Option<f64>,
 ) {
     smol::spawn(async move {
         let sid = SessionId::from(session_id.to_string());
+        let mut cost_total = initial_cost;
 
         while let Ok(Envelope {
             event, subagent, ..
         }) = event_rx.recv_async().await
         {
+            // Subagent stream events stay out of the transcript, but their
+            // turns still spend session money.
+            if let AgentEvent::TurnComplete(tc) = &event {
+                add_cost(&mut cost_total, tc.cost);
+            }
             if subagent.is_some() {
                 continue;
             }
@@ -662,6 +677,7 @@ fn start_event_pump(
                 }
                 AgentEvent::ToolOutput { id, content } => translate::tool_output(&id, &content),
                 AgentEvent::ToolDone(event) => translate::tool_done(&event, &cwd, home.as_deref()),
+                AgentEvent::TurnComplete(event) => translate::usage_update(&event, cost_total),
                 AgentEvent::PermissionRequest { id, tool, scopes } => {
                     let fields =
                         ToolCallUpdateFields::new().title(format!("{tool}: {}", scopes.join(", ")));
@@ -862,15 +878,21 @@ mod tests {
         let mut session: Session<Message, TokenUsage, maki_agent::ToolOutput> =
             Session::new("anthropic/test-model", "/project");
         session.replace_messages(messages.clone());
+        session.token_usage = TokenUsage {
+            input: 1_000,
+            output: 200,
+            ..Default::default()
+        };
         session.save(&dir).unwrap();
 
         let id: MakiId = session.id;
-        let (history, recorded) = load_history_from(&dir, id).unwrap();
+        let (history, recorded, usage) = load_history_from(&dir, id).unwrap();
         assert_eq!(
             serde_json::to_value(&history).unwrap(),
             serde_json::to_value(&messages).unwrap()
         );
         assert_eq!(recorded, Some(PathBuf::from("/project")));
+        assert_eq!(usage, session.token_usage);
     }
 
     #[test]
@@ -880,7 +902,7 @@ mod tests {
         let mut session: Session<Message, TokenUsage, maki_agent::ToolOutput> =
             Session::new("anthropic/test-model", "relative/project");
         session.save(&dir).unwrap();
-        let (_, recorded) = load_history_from(&dir, session.id).unwrap();
+        let (_, recorded, _) = load_history_from(&dir, session.id).unwrap();
         assert_eq!(recorded, None);
     }
 
