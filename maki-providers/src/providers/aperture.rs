@@ -172,7 +172,12 @@ fn default_path_prefix(kind: Option<ProviderKind>) -> &'static str {
         // Command Code like Zai: the plan endpoint is `/alpha/generate`, and the
         // credits base url already carries `/provider/v1`, so a prefix would
         // double up either way.
-        Some(ProviderKind::Anthropic | ProviderKind::Zai | ProviderKind::CommandCode) => "",
+        Some(
+            ProviderKind::Anthropic
+            | ProviderKind::Zai
+            | ProviderKind::CommandCode
+            | ProviderKind::CommandCodeCredits,
+        ) => "",
         Some(ProviderKind::Google) => GEMINI_PATH_PREFIX,
         Some(
             ProviderKind::Ollama

@@ -19,7 +19,7 @@ use crate::providers::aperture::Aperture;
 use crate::providers::catalog::{
     OPENCODE_FAMILY_SLUGS, available_if_warm, catalog_providers, catalog_providers_if_available,
 };
-use crate::providers::commandcode::CommandCode;
+use crate::providers::commandcode::{CommandCode, CommandCodeCredits};
 use crate::providers::copilot::Copilot;
 use crate::providers::deepseek::DeepSeek;
 use crate::providers::dynamic;
@@ -61,6 +61,8 @@ pub enum ProviderKind {
     Aperture,
     #[strum(serialize = "command-code")]
     CommandCode,
+    #[strum(serialize = "command-code-credits")]
+    CommandCodeCredits,
 }
 
 impl ProviderKind {
@@ -82,6 +84,7 @@ impl ProviderKind {
             Self::Xai => "xAI",
             Self::Aperture => "Aperture",
             Self::CommandCode => "Command Code",
+            Self::CommandCodeCredits => "Command Code Credits",
         }
     }
 
@@ -103,6 +106,7 @@ impl ProviderKind {
             Self::Xai => "XAI_API_KEY",
             Self::Aperture => "",
             Self::CommandCode => "COMMAND_CODE_API_KEY",
+            Self::CommandCodeCredits => "COMMAND_CODE_API_KEY",
         }
     }
 
@@ -126,6 +130,7 @@ impl ProviderKind {
             Self::Xai => "https://api.x.ai/v1",
             Self::Aperture => "Aperture gateway (set APERTURE_HOST)",
             Self::CommandCode => "https://api.commandcode.ai",
+            Self::CommandCodeCredits => "https://api.commandcode.ai/provider/v1",
         }
     }
 
@@ -160,8 +165,11 @@ impl ProviderKind {
                 "Tailscale Aperture LLM gateway; set APERTURE_HOST or configure in providers.toml",
             ),
             Self::CommandCode => Some(
-                "Token-plan (GOAT/Pro/Max/Team) access to the whole Command Code catalog, per-model reasoning effort",
+                "Token-plan (GOAT/Pro/Max/Team) access via browser login, per-model reasoning effort",
             ),
+            Self::CommandCodeCredits => {
+                Some("Metered pay-as-you-go credits on the same account, via API key")
+            }
             _ => None,
         }
     }
@@ -184,6 +192,7 @@ impl ProviderKind {
             Self::Xai => ModelFamily::Generic,
             Self::Aperture => ModelFamily::Generic,
             Self::CommandCode => ModelFamily::Generic,
+            Self::CommandCodeCredits => ModelFamily::Generic,
         }
     }
 
@@ -210,6 +219,7 @@ impl ProviderKind {
             Self::Xai => Some(131_072),
             Self::Aperture => Some(16_384),
             Self::CommandCode => Some(64_000),
+            Self::CommandCodeCredits => Some(64_000),
         }
     }
 
@@ -231,6 +241,7 @@ impl ProviderKind {
             Self::Xai => 500_000,
             Self::Aperture => 128_000,
             Self::CommandCode => 200_000,
+            Self::CommandCodeCredits => 200_000,
         }
     }
 
@@ -258,6 +269,7 @@ impl ProviderKind {
             Self::Xai => Ok(Box::new(Xai::new(timeouts)?)),
             Self::Aperture => Ok(Box::new(Aperture::new(timeouts)?)),
             Self::CommandCode => Ok(Box::new(CommandCode::new(timeouts)?)),
+            Self::CommandCodeCredits => Ok(Box::new(CommandCodeCredits::new(timeouts)?)),
         }
     }
 }

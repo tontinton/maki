@@ -410,7 +410,7 @@ fn build_sections() -> Vec<ProviderSection> {
                     kind,
                     name: kind.display_name(),
                     auth_line: format!(
-                        "{} (or an existing Command Code CLI login in `~/.commandcode/auth.json`)",
+                        "browser login via `maki auth login command-code`, {}, or an existing Command Code CLI login in `~/.commandcode/auth.json`",
                         format_auth(kind)
                     ),
                     urls: vec![kind.base_url()],

@@ -224,6 +224,18 @@ const COMMAND_CODE: ProviderManifest = ProviderManifest {
     models: commandcode::models(),
 };
 
+const COMMAND_CODE_CREDITS: ProviderManifest = ProviderManifest {
+    slug: "command-code-credits",
+    display_name: "Command Code Credits",
+    family: ModelFamily::Generic,
+    supports_thinking: true,
+    accepts_arbitrary_models: true,
+    fallback_max_output: Some(64_000),
+    fallback_context_window: 200_000,
+    pricing_schedule: None,
+    models: commandcode::models(),
+};
+
 const BUILTINS: &[ProviderManifest] = &[
     ANTHROPIC,
     OPENAI,
@@ -242,6 +254,7 @@ const BUILTINS: &[ProviderManifest] = &[
     XAI,
     APERTURE,
     COMMAND_CODE,
+    COMMAND_CODE_CREDITS,
 ];
 
 pub struct ManifestRegistry;

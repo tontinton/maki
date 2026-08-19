@@ -24,7 +24,7 @@ use crate::{AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, S
 use super::ResolvedAuth;
 use super::anthropic::Anthropic;
 use super::aperture::Aperture;
-use super::commandcode::CommandCode;
+use super::commandcode::{CommandCode, CommandCodeCredits};
 use super::copilot::Copilot;
 use super::deepseek::DeepSeek;
 use super::google::Google;
@@ -595,6 +595,9 @@ pub fn create(slug: &str, timeouts: super::Timeouts) -> Result<Box<dyn Provider>
                 .with_system_prefix(meta.system_prefix.clone()),
         ),
         ProviderKind::CommandCode => Box::new(CommandCode::with_auth(auth.clone(), timeouts)),
+        ProviderKind::CommandCodeCredits => {
+            Box::new(CommandCodeCredits::with_auth(auth.clone(), timeouts))
+        }
     };
 
     Ok(Box::new(DynamicProvider {

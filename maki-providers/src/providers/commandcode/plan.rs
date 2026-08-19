@@ -1,13 +1,12 @@
-//! Command Code token-plan provider (GOAT / Pro / Max / Team).
+//! The Command Code token plans (GOAT / Pro / Max / Team).
 //!
-//! Token plans do not speak the OpenAI-compatible `/provider/v1/chat/completions`
-//! endpoint the pay-as-you-go Provider plan uses. They speak a custom SSE
-//! protocol at `POST {base}/alpha/generate`: a request envelope of
-//! `config`/`memory`/`taste`/`skills`/`params`/`threadId`, and a Vercel-AI-SDK
-//! shaped event stream (`text-delta`, `reasoning-delta`, `tool-call`, `finish`).
-//! Wire format reverse-engineered from `pi-commandcode-provider` against
-//! command-code CLI 1.15.1; the model catalog at `/provider/v1/models` is the
-//! only OpenAI-shaped part.
+//! Plans do not speak the OpenAI-compatible `/provider/v1/chat/completions`
+//! endpoint that [`super::credits`] uses. They speak a custom SSE protocol at
+//! `POST {base}/alpha/generate`: a request envelope of
+//! `config`/`memory`/`taste`/`skills`/`params`/`threadId`, and a
+//! Vercel-AI-SDK shaped event stream (`text-delta`, `reasoning-delta`,
+//! `tool-call`, `finish`). Reverse-engineered from `pi-commandcode-provider`
+//! against command-code CLI 1.15.1, not from token-plan API docs.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -16,33 +15,29 @@ use flume::Sender;
 use futures_lite::io::{AsyncBufReadExt, BufReader};
 use isahc::{AsyncReadResponseExt, HttpClient, Request};
 use maki_storage::id::{MakiId, SessionRef};
-use maki_storage::sessions::Effort;
-use maki_storage::sessions::Effort::{High, Low, Max, Medium, XHigh};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::{debug, warn};
 
-use crate::model::{Model, ModelEntry, ModelInfo, ThinkingSupport};
+use crate::model::{Model, ModelInfo};
 use crate::provider::{BoxFuture, Provider};
-use crate::types::EffortDialect;
 use crate::{
     AgentError, ContentBlock, Message, ProviderEvent, RequestOptions, Role, StopReason,
-    StreamResponse, ThinkingConfig, TokenUsage,
+    StreamResponse, TokenUsage,
 };
 
-use super::{KeyPool, ResolvedAuth, http_client, next_sse_line, user_agent};
+use super::super::{KeyPool, ResolvedAuth, Timeouts, http_client, next_sse_line, user_agent};
+use super::{
+    BASE_URL, ENV_VAR, MAX_GENERATE_TOKENS, PLAN_SLUG, reasoning_effort, resolve_auth_from_key,
+    resolve_key_pool,
+};
 
-const SLUG: &str = "command-code";
-const BASE_URL: &str = "https://api.commandcode.ai";
-const ENV_VAR: &str = "COMMAND_CODE_API_KEY";
 /// Sent as `x-command-code-version`; the endpoint gates behaviour on it.
 const CLI_VERSION: &str = "1.15.1";
-/// The generate endpoint's own ceiling, independent of the model window.
-const MAX_GENERATE_TOKENS: u32 = 64_000;
 const DEFAULT_TEMPERATURE: f64 = 0.3;
 
 inventory::submit!(maki_config::providers::BuiltInProvider {
-    slug: SLUG,
+    slug: PLAN_SLUG,
     display_name: "Command Code",
     protocol: maki_config::providers::Protocol::CommandCode,
     default_base_url: BASE_URL,
@@ -53,146 +48,6 @@ inventory::submit!(maki_config::providers::BuiltInProvider {
     needs_url: false,
 });
 
-/// Empty on purpose: the catalog is fetched from `/provider/v1/models`, and a
-/// token plan bills against the subscription, so static per-token pricing here
-/// would only be a second source of truth to keep in sync.
-pub(crate) const fn models() -> &'static [ModelEntry] {
-    &[]
-}
-
-const FULL: &[Effort] = &[Low, Medium, High, XHigh, Max];
-const TO_XHIGH: &[Effort] = &[Low, Medium, High, XHigh];
-const TO_HIGH: &[Effort] = &[Low, Medium, High];
-const HIGH_MAX: &[Effort] = &[High, Max];
-const HIGH_XHIGH: &[Effort] = &[High, XHigh];
-const NONE: &[Effort] = &[];
-
-/// `(model id, accepted reasoning efforts, accepts image input)`.
-///
-/// `/provider/v1/models` returns only id/name/context_length, so reasoning and
-/// vision have to come from somewhere: this is a snapshot of the
-/// command-code@1.15.1 bundled catalog. An id missing here is treated as
-/// text-only with provider-chosen reasoning depth, which is what the CLI does
-/// too, so a newly released model degrades instead of erroring.
-///
-/// ponytail: hand-maintained snapshot. Refresh from
-/// <https://commandcode.ai/docs/resources/pricing-limits> when models land; if
-/// the catalog endpoint ever exposes these fields, delete the table.
-const CATALOG: &[(&str, &[Effort], bool)] = &[
-    ("MiniMaxAI/MiniMax-M3", NONE, true),
-    ("Qwen/Qwen3.6-Plus", NONE, true),
-    ("Qwen/Qwen3.7-Flash", NONE, true),
-    ("Qwen/Qwen3.7-Plus", NONE, true),
-    ("Qwen/Qwen3.8-Max", &[Low, Medium, XHigh], true),
-    ("claude-fable-5", FULL, true),
-    ("claude-haiku-4-5-20251001", NONE, true),
-    ("claude-opus-4-7", FULL, true),
-    ("claude-opus-4-8", FULL, true),
-    ("claude-opus-5", FULL, true),
-    ("claude-sonnet-4-6", FULL, true),
-    ("claude-sonnet-5", FULL, true),
-    ("deepseek/deepseek-v4-flash", HIGH_MAX, false),
-    ("deepseek/deepseek-v4-pro", HIGH_MAX, false),
-    ("google/gemini-3.1-flash-lite", TO_HIGH, true),
-    ("google/gemini-3.5-flash", TO_HIGH, true),
-    ("google/gemini-3.5-flash-lite", TO_HIGH, true),
-    ("google/gemini-3.6-flash", TO_HIGH, true),
-    ("gpt-5.3-codex", TO_XHIGH, true),
-    ("gpt-5.4", TO_XHIGH, true),
-    ("gpt-5.4-mini", TO_HIGH, true),
-    ("gpt-5.5", TO_XHIGH, true),
-    ("gpt-5.6-luna", FULL, true),
-    ("gpt-5.6-sol", FULL, true),
-    ("gpt-5.6-terra", FULL, true),
-    ("meta/muse-spark-1.1", NONE, true),
-    ("meta/muse-spark-1.2", NONE, true),
-    ("meta/muse-spark-1.2-contributor", NONE, true),
-    ("moonshotai/Kimi-K2.5", NONE, true),
-    ("moonshotai/Kimi-K2.6", NONE, true),
-    ("moonshotai/Kimi-K2.7-Code", NONE, true),
-    ("moonshotai/Kimi-K2.7-Code-Highspeed", NONE, true),
-    ("moonshotai/Kimi-K3", NONE, true),
-    ("sakana/fugu-ultra", HIGH_XHIGH, true),
-    ("stepfun/Step-3.7-Flash", NONE, true),
-    ("thinkingmachines/inkling", NONE, true),
-    ("thinkingmachines/inkling-small", NONE, true),
-    ("xai/grok-4.5", TO_HIGH, true),
-    ("xiaomi/mimo-v2.5", NONE, true),
-    ("zai-org/GLM-5.2", HIGH_MAX, false),
-];
-
-fn catalog_entry(model_id: &str) -> Option<&'static (&'static str, &'static [Effort], bool)> {
-    CATALOG.iter().find(|(id, _, _)| *id == model_id)
-}
-
-/// `None` means send no `reasoning_effort` and let Command Code pick, which is
-/// also what an unknown model gets.
-fn reasoning_effort(model: &Model, thinking: ThinkingConfig) -> Option<&'static str> {
-    let (_, efforts, _) = catalog_entry(&model.id)?;
-    if efforts.is_empty() {
-        return None;
-    }
-    thinking.effort_str(
-        &EffortDialect {
-            supported: efforts,
-            // Command Code has no adaptive level and no explicit opt-out
-            // string: both mean "omit the field".
-            adaptive: None,
-            off: None,
-        },
-        model,
-    )
-}
-
-/// Credential files written by the Command Code CLI and by pi/omp hosts. maki's
-/// own `KeyPool` (env, `maki auth login`, providers.toml) is tried first; this
-/// is the fallback that makes an existing CLI login just work.
-fn key_from_cli_files() -> Option<String> {
-    let home = std::env::var_os("HOME").map(std::path::PathBuf::from)?;
-    let paths = [
-        home.join(".commandcode/auth.json"),
-        home.join(".omp/agent/auth.json"),
-        home.join(".pi/agent/auth.json"),
-    ];
-    for path in paths {
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let Ok(root) = serde_json::from_str::<Value>(&text) else {
-            continue;
-        };
-        let direct = ["apiKey", "commandcode"]
-            .iter()
-            .find_map(|k| root.get(*k)?.as_str());
-        if let Some(key) = direct {
-            return Some(key.to_string());
-        }
-        // `{"command-code": {"type":"api","key":"..."}}` from the CLI, or the
-        // same shape with `type: "oauth"` and an `access` token.
-        let nested = ["commandcode", "command-code"].iter().find_map(|k| {
-            let record = root.get(*k)?;
-            record.get("key").or_else(|| record.get("access"))?.as_str()
-        });
-        if let Some(key) = nested {
-            return Some(key.to_string());
-        }
-    }
-    None
-}
-
-fn resolve_key_pool() -> Result<KeyPool, AgentError> {
-    match KeyPool::resolve(SLUG, ENV_VAR) {
-        Ok(pool) => Ok(pool),
-        Err(e) => key_from_cli_files().map_or(Err(e), |key| Ok(KeyPool::from_keys(vec![key]))),
-    }
-}
-
-fn resolve_auth_from_key(key: &str, base_url: Option<String>) -> ResolvedAuth {
-    let mut auth = ResolvedAuth::bearer(key);
-    auth.base_url = base_url;
-    auth
-}
-
 pub struct CommandCode {
     client: HttpClient,
     auth: Arc<Mutex<ResolvedAuth>>,
@@ -201,10 +56,10 @@ pub struct CommandCode {
 }
 
 impl CommandCode {
-    pub fn new(timeouts: super::Timeouts) -> Result<Self, AgentError> {
-        let pool = resolve_key_pool()?;
+    pub fn new(timeouts: Timeouts) -> Result<Self, AgentError> {
+        let pool = resolve_key_pool(PLAN_SLUG)?;
         let config = maki_config::providers::ProvidersConfig::load();
-        let base_url = maki_config::providers::resolve_base_url(SLUG, config.get(SLUG));
+        let base_url = maki_config::providers::resolve_base_url(PLAN_SLUG, config.get(PLAN_SLUG));
         Ok(Self {
             client: http_client(timeouts),
             auth: Arc::new(Mutex::new(resolve_auth_from_key(pool.current(), base_url))),
@@ -213,7 +68,7 @@ impl CommandCode {
         })
     }
 
-    pub(crate) fn with_auth(auth: Arc<Mutex<ResolvedAuth>>, timeouts: super::Timeouts) -> Self {
+    pub(crate) fn with_auth(auth: Arc<Mutex<ResolvedAuth>>, timeouts: Timeouts) -> Self {
         Self {
             client: http_client(timeouts),
             auth,
@@ -715,19 +570,6 @@ async fn parse_sse(
     })
 }
 
-// --- model catalog ---
-
-#[derive(Deserialize)]
-struct CatalogModel {
-    id: String,
-    context_length: Option<u32>,
-}
-
-#[derive(Deserialize)]
-struct CatalogResponse {
-    data: Vec<CatalogModel>,
-}
-
 impl Provider for CommandCode {
     fn stream_message<'a>(
         &'a self,
@@ -751,55 +593,17 @@ impl Provider for CommandCode {
             if response.status().as_u16() != 200 {
                 return Err(AgentError::from_response(response).await);
             }
-            let body = response.text().await?;
-            let catalog: CatalogResponse = serde_json::from_str(&body)?;
-            let mut infos: Vec<ModelInfo> = catalog
-                .data
-                .into_iter()
-                .map(|m| {
-                    let entry = catalog_entry(&m.id);
-                    ModelInfo {
-                        context_window: m.context_length,
-                        // The catalog exposes no output ceiling, so the context
-                        // window stands in for it, as the reference client
-                        // does. A model whose real cap is under 64k would be
-                        // asked for more than it allows.
-                        max_output_tokens: Some(
-                            m.context_length
-                                .unwrap_or(MAX_GENERATE_TOKENS)
-                                .min(MAX_GENERATE_TOKENS),
-                        ),
-                        supports_thinking: entry.map(|(_, efforts, _)| !efforts.is_empty()),
-                        supports_vision: entry.map(|(_, _, vision)| *vision),
-                        ..ModelInfo::id_only(m.id)
-                    }
-                })
-                .collect();
-            infos.sort_by(|a, b| a.id.cmp(&b.id));
-            Ok(infos)
+            super::parse_models(&response.text().await?)
         })
     }
 
-    /// Discovery has not necessarily run when the first request goes out, and
-    /// until it does the Generic manifest answers "no vision, thinking on
-    /// everything" — which silently strips images from the first turn on a
-    /// vision model. Seed both from the catalog snapshot; unknown ids fall
-    /// through to discovery unchanged.
     fn adjust_model(&self, model: &mut Model) {
-        let Some((_, efforts, vision)) = catalog_entry(&model.id) else {
-            return;
-        };
-        model.supports_vision_override = Some(*vision);
-        model.thinking_override = Some(if efforts.is_empty() {
-            ThinkingSupport::No
-        } else {
-            ThinkingSupport::Yes
-        });
+        super::adjust_model(model);
     }
 
     fn reload_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
         Box::pin(async {
-            let pool = resolve_key_pool()?;
+            let pool = resolve_key_pool(PLAN_SLUG)?;
             let base_url = self.base_url();
             *self.auth.lock().unwrap() = resolve_auth_from_key(pool.current(), base_url);
             Ok(())
@@ -820,29 +624,12 @@ impl Provider for CommandCode {
 
 #[cfg(test)]
 mod tests {
+    use super::super::tests::model;
     use super::*;
-    use crate::model::{ModelFamily, ModelPricing, ModelTier};
-
-    fn model(id: &str) -> Model {
-        Model {
-            id: id.into(),
-            provider: Arc::from(SLUG),
-            tier: ModelTier::Medium,
-            family: ModelFamily::Generic,
-            supports_tool_examples_override: None,
-            thinking_override: None,
-            supports_vision_override: None,
-            pricing: ModelPricing::default(),
-            max_output_tokens: Some(200_000),
-            context_window: 400_000,
-            discovered_free: false,
-            thinking_fields: None,
-        }
-    }
 
     fn provider() -> CommandCode {
         CommandCode {
-            client: http_client(super::super::Timeouts::default()),
+            client: http_client(Timeouts::default()),
             auth: Arc::new(Mutex::new(ResolvedAuth::bearer("k"))),
             key_pool: None,
             stream_timeout: Duration::from_secs(300),
@@ -863,35 +650,6 @@ mod tests {
         assert_eq!(body["params"]["system"], "sys");
         assert_eq!(body["params"]["messages"][0]["role"], "user");
         assert_eq!(body["config"]["workingDir"], "/tmp/proj");
-    }
-
-    #[test]
-    fn effort_snaps_to_what_the_model_accepts() {
-        // deepseek accepts only high/max, so Low must not go out as "low".
-        assert_eq!(
-            reasoning_effort(
-                &model("deepseek/deepseek-v4-pro"),
-                ThinkingConfig::Effort(Low)
-            ),
-            Some("high"),
-        );
-        assert_eq!(
-            reasoning_effort(&model("claude-opus-5"), ThinkingConfig::Effort(XHigh)),
-            Some("xhigh"),
-        );
-        // Non-reasoning and unknown models send nothing at all.
-        assert_eq!(
-            reasoning_effort(&model("moonshotai/Kimi-K3"), ThinkingConfig::Effort(High)),
-            None,
-        );
-        assert_eq!(
-            reasoning_effort(&model("brand/new-model"), ThinkingConfig::Effort(High)),
-            None,
-        );
-        assert_eq!(
-            reasoning_effort(&model("claude-opus-5"), ThinkingConfig::Off),
-            None,
-        );
     }
 
     #[test]
@@ -1068,26 +826,6 @@ mod tests {
         drop(tx);
         assert!(result.message.content.is_empty());
         assert_eq!(rx.len(), 0);
-    }
-
-    #[test]
-    fn catalog_capabilities_apply_before_discovery_warms() {
-        let cc = provider();
-        let mut vision_model = model("claude-opus-5");
-        cc.adjust_model(&mut vision_model);
-        assert!(vision_model.supports_vision());
-        assert!(vision_model.supports_thinking());
-
-        let mut plain = model("moonshotai/Kimi-K3");
-        cc.adjust_model(&mut plain);
-        assert!(plain.supports_vision());
-        assert!(!plain.supports_thinking());
-
-        // Unknown ids stay untouched so discovery can still fill them in.
-        let mut unknown = model("brand/new-model");
-        cc.adjust_model(&mut unknown);
-        assert!(unknown.supports_vision_override.is_none());
-        assert!(unknown.thinking_override.is_none());
     }
 
     #[test]

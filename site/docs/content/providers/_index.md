@@ -294,9 +294,17 @@ Aperture discovers models from your gateway. Set `APERTURE_HOST` to your Tailsca
 
 ### Command Code
 
-- **Env var**: `COMMAND_CODE_API_KEY` (or an existing Command Code CLI login in `~/.commandcode/auth.json`)
+- **Env var**: browser login via `maki auth login command-code`, `COMMAND_CODE_API_KEY`, or an existing Command Code CLI login in `~/.commandcode/auth.json`
 - **API**: `https://api.commandcode.ai`
-- **Features**: Token-plan (GOAT/Pro/Max/Team) access to the whole Command Code catalog, per-model reasoning effort
+- **Features**: Token-plan (GOAT/Pro/Max/Team) access via browser login, per-model reasoning effort
+
+No hardcoded model catalog. Use any model ID supported by this provider.
+
+### Command Code Credits
+
+- **Env var**: `COMMAND_CODE_API_KEY`
+- **API**: `https://api.commandcode.ai/provider/v1`
+- **Features**: Metered pay-as-you-go credits on the same account, via API key
 
 No hardcoded model catalog. Use any model ID supported by this provider.
 
@@ -453,7 +461,7 @@ To add a custom provider or proxy, drop an executable script into the config `pr
 
 `resolve` is called each time a new agent spawns, so scripts should read tokens from disk instead of caching them in memory. That way auth changes from other processes get picked up.
 
-The `base` field specifies which built-in provider to inherit the model catalog from. Valid values: `anthropic`, `openai`, `google`, `copilot`, `ollama`, `llama-cpp`, `mistral`, `zai`, `deepseek`, `openrouter`, `synthetic`, `tensorx`, `opencode`, `xai`, `aperture`, `command-code`.
+The `base` field specifies which built-in provider to inherit the model catalog from. Valid values: `anthropic`, `openai`, `google`, `copilot`, `ollama`, `llama-cpp`, `mistral`, `zai`, `deepseek`, `openrouter`, `synthetic`, `tensorx`, `opencode`, `xai`, `aperture`, `command-code`, `command-code-credits`.
 
 If your provider serves models not in the base catalog, add a `models` subcommand returning:
 

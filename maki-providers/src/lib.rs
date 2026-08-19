@@ -21,6 +21,7 @@ pub use providers::catalog::{
     catalog_provider, catalog_provider_if_available, catalog_providers,
     catalog_providers_if_available, model_meta_if_available, warm_catalog,
 };
+pub use providers::commandcode::auth as commandcode_auth;
 pub use providers::copilot::auth as copilot_auth;
 pub use providers::dynamic;
 pub use providers::openai::auth as openai_auth;
