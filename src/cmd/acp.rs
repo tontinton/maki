@@ -21,13 +21,22 @@ pub fn run(model_arg: Option<String>, yolo: bool, no_plugins: bool, no_jit: bool
     let mut plugin_host = PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !no_jit)
         .context("initialize lua plugin host")?;
 
+    let discovery = maki_lua::discover_installed(no_plugins);
+    for problem in discovery.problems {
+        eprintln!(
+            "warning: {}",
+            super::sanitize_warning(format!("skipping package: {problem}"))
+        );
+    }
+    let packages = discovery.packages;
     let raw_config = plugin_host
         .load_init_files_or_skip(no_plugins, &cwd)
         .context("load init.lua files")?;
 
+    let names: Vec<String> = packages.iter().map(|p| p.name.clone()).collect();
     let mut config = raw_config
         .unwrap_or_default()
-        .into_config(false)
+        .into_config(false, &names)
         .context("invalid config")?;
     config.permissions = load_permissions(&cwd);
 
@@ -39,6 +48,9 @@ pub fn run(model_arg: Option<String>, yolo: bool, no_plugins: bool, no_jit: bool
     plugin_host
         .load_builtins(&config.plugins)
         .context("load builtin plugins")?;
+    for warning in plugin_host.load_packages(&packages, &config.plugins) {
+        eprintln!("warning: {warning}");
+    }
 
     let timeouts = maki_providers::Timeouts {
         connect: config.provider.connect_timeout,

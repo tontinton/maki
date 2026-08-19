@@ -1456,7 +1456,7 @@ mod tests {
             "provider": {"allowed_models": [startup.spec()]}
         }))
         .unwrap();
-        let policy = raw.into_config(false).unwrap().provider.model_policy;
+        let policy = raw.into_config(false, &[]).unwrap().provider.model_policy;
 
         assert!(
             resolve_set_model(

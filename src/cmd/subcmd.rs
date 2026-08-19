@@ -543,7 +543,15 @@ pub fn models(no_plugins: bool, no_jit: bool) -> Result<()> {
 
     let host = PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !no_jit)
         .context("initialize lua plugin host")?;
-    let config = load_effective_config(&host, no_plugins, &cwd)?;
+    let discovery = maki_lua::discover_installed(no_plugins);
+    for problem in discovery.problems {
+        eprintln!(
+            "warning: {}",
+            super::sanitize_warning(format!("skipping package: {problem}"))
+        );
+    }
+    let packages = discovery.packages;
+    let config = load_effective_config(&host, no_plugins, &cwd, &packages)?;
 
     smol::block_on(fetch_all_models(
         &config.provider.model_policy,
@@ -560,11 +568,17 @@ pub fn models(no_plugins: bool, no_jit: bool) -> Result<()> {
     Ok(())
 }
 
-fn load_effective_config(host: &PluginHost, no_plugins: bool, cwd: &Path) -> Result<Config> {
+fn load_effective_config(
+    host: &PluginHost,
+    no_plugins: bool,
+    cwd: &Path,
+    packages: &[maki_lua::DiscoveredPackage],
+) -> Result<Config> {
+    let names: Vec<String> = packages.iter().map(|p| p.name.clone()).collect();
     host.load_init_files_or_skip(no_plugins, cwd)
         .context("load init.lua files")?
         .unwrap_or_default()
-        .into_config(false)
+        .into_config(false, &names)
         .context("invalid config")
 }
 
@@ -575,18 +589,30 @@ pub fn index(path: &str, no_plugins: bool, no_jit: bool) -> Result<()> {
     let mut host = PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !no_jit)
         .context("initialize lua plugin host")?;
 
+    let discovery = maki_lua::discover_installed(no_plugins);
+    for problem in discovery.problems {
+        eprintln!(
+            "warning: {}",
+            super::sanitize_warning(format!("skipping package: {problem}"))
+        );
+    }
+    let packages = discovery.packages;
     let raw_config = host
         .load_init_files_or_skip(no_plugins, &cwd)
         .context("load init.lua files")?;
 
+    let names: Vec<String> = packages.iter().map(|p| p.name.clone()).collect();
     let mut config = raw_config
         .unwrap_or_default()
-        .into_config(false)
+        .into_config(false, &names)
         .context("invalid config")?;
     config.permissions = load_permissions(&cwd);
 
     host.load_builtins(&config.plugins)
         .context("load builtin plugins")?;
+    for warning in host.load_packages(&packages, &config.plugins) {
+        eprintln!("warning: {warning}");
+    }
 
     let abs_path = Path::new(path)
         .canonicalize()
@@ -672,15 +698,27 @@ pub fn prompt(
     let reg = ToolRegistry::global_arc();
     let mut host =
         PluginHost::with_jit(Arc::clone(reg), !no_jit).context("initialize lua plugin host")?;
+    let discovery = maki_lua::discover_installed(no_plugins);
+    for problem in discovery.problems {
+        eprintln!(
+            "warning: {}",
+            super::sanitize_warning(format!("skipping package: {problem}"))
+        );
+    }
+    let packages = discovery.packages;
     let raw_config = host
         .load_init_files_or_skip(no_plugins, &cwd)
         .context("load init.lua files")?;
+    let package_names: Vec<String> = packages.iter().map(|p| p.name.clone()).collect();
     let config = raw_config
         .unwrap_or_default()
-        .into_config(false)
+        .into_config(false, &package_names)
         .context("invalid config")?;
     host.load_builtins(&config.plugins)
         .context("load builtin plugins")?;
+    for warning in host.load_packages(&packages, &config.plugins) {
+        eprintln!("warning: {warning}");
+    }
 
     if tools {
         let ctx = DescriptionContext {

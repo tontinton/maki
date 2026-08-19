@@ -25,4 +25,26 @@ pub enum PluginError {
     UnknownPlugin { plugin: String },
     #[error("plugin host is not running")]
     HostDead,
+    #[error("package {name} at {path} has no plugin/*.lua entrypoint")]
+    PackageEmpty { name: String, path: PathBuf },
+    #[error("package file {path} resolves outside its package directory")]
+    PackageEscape { path: PathBuf },
+    #[error(
+        "package \"{name}\" at {path} has the same name as a bundled plugin; \
+         rename its directory"
+    )]
+    PackageNameConflict { name: String, path: PathBuf },
+    #[error("package manifest {path} is not valid toml: {message}")]
+    PackageManifest { path: PathBuf, message: String },
+    #[error("cannot resolve the maki data directory, so no package was looked for: {source}")]
+    PackageSiteUnavailable {
+        #[source]
+        source: io::Error,
+    },
+    #[error("two packages are both named \"{name}\": {first} and {second}")]
+    DuplicatePackage {
+        name: String,
+        first: PathBuf,
+        second: PathBuf,
+    },
 }

@@ -13,6 +13,7 @@ pub(crate) mod log;
 pub(crate) mod model;
 pub(crate) mod net;
 pub(crate) mod options;
+pub(crate) mod pack;
 pub(crate) mod session;
 pub(crate) mod slot;
 pub(crate) mod split;

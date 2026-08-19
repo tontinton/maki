@@ -14,8 +14,9 @@ use crate::api::keymap::KeymapReader;
 use crate::api::options::{PluginOptionSpecs, PluginOpts};
 use crate::api::util::command::{HintReader, LuaCommandReader, UiAction};
 use crate::error::PluginError;
+use crate::pack::DiscoveredPackage;
 use crate::plugin_permissions::{PluginPermissions, load_plugin_permissions};
-use crate::runtime::{self, ClickFallback, LuaThread, Request, RestoreItem};
+use crate::runtime::{self, ClickFallback, LoadChunk, LuaThread, Request, RestoreItem};
 use maki_agent::prompt::ResolvedSlots;
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -110,6 +111,13 @@ static BUNDLED_PLUGINS: &[BundledPlugin] = &[
     },
 ];
 
+/// Every bundled name, not just the default-enabled ones. An external package
+/// sharing an owner name with any of them would let one package's unload tear
+/// down the other's registrations.
+pub(crate) fn is_bundled(name: &str) -> bool {
+    BUNDLED_PLUGINS.iter().any(|p| p.name == name)
+}
+
 pub(crate) fn lib_dir() -> &'static Dir<'static> {
     &BUNDLED_PLUGINS
         .iter()
@@ -122,6 +130,54 @@ static BUNDLED_DIRS: LazyLock<&'static [&'static Dir<'static>]> = LazyLock::new(
     let dirs: Vec<&'static Dir<'static>> = BUNDLED_PLUGINS.iter().map(|p| &p.dir).collect();
     Vec::leak(dirs)
 });
+
+/// A package's entrypoints: every `plugin/*.lua`, sorted by filename so load
+/// order is deterministic across machines.
+///
+/// A repository can commit a symlink, so each entry is resolved and checked to
+/// be inside the package before it is read.
+fn package_entrypoints(root: &Path) -> Result<Vec<PathBuf>, PluginError> {
+    let entrypoint_dir = root.join("plugin");
+    let entries = match fs::read_dir(&entrypoint_dir) {
+        Ok(entries) => entries,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(source) => {
+            return Err(PluginError::Io {
+                path: entrypoint_dir,
+                source,
+            });
+        }
+    };
+    let mut files = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|source| PluginError::Io {
+            path: entrypoint_dir.clone(),
+            source,
+        })?;
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("lua") {
+            continue;
+        }
+        let resolved = path.canonicalize().map_err(|e| PluginError::Io {
+            path: path.clone(),
+            source: e,
+        })?;
+        if !resolved.starts_with(root) {
+            return Err(PluginError::PackageEscape { path });
+        }
+        if resolved.is_file() {
+            let Some(file_name) = path.file_name().map(std::ffi::OsString::from) else {
+                continue;
+            };
+            files.push((file_name, resolved));
+        }
+    }
+    // By file name, not by the resolved path: a package may symlink an entry
+    // elsewhere inside itself, and load order must still be the order a user
+    // sees in `plugin/`.
+    files.sort_by(|(a, _), (b, _)| a.cmp(b));
+    Ok(files.into_iter().map(|(_, path)| path).collect())
+}
 
 pub struct PluginHost {
     inner: LuaThread,
@@ -257,6 +313,11 @@ impl PluginHost {
     fn send_builtin_loads(&self, config: &PluginsConfig) -> Result<(), PluginError> {
         for (plugin, opts) in &config.opts {
             let keys: Vec<&str> = opts.keys().map(String::as_str).collect();
+            // An installed package may take options too, and its options are
+            // passed when the package itself loads, not here.
+            if config.packages.contains(plugin) {
+                continue;
+            }
             if !BUNDLED_PLUGINS.iter().any(|p| p.name == plugin.as_str()) {
                 return Err(PluginError::UnknownPluginOptions {
                     plugin: plugin.clone(),
@@ -296,8 +357,8 @@ impl PluginHost {
                 .map(Arc::new)
                 .unwrap_or_default();
             self.send_load(
-                name,
-                init.to_owned(),
+                Arc::clone(&name),
+                vec![LoadChunk::new(name.as_ref(), init)],
                 None,
                 PluginPermissions::trusted(),
                 opts,
@@ -309,7 +370,7 @@ impl PluginHost {
     fn send_load(
         &self,
         name: Arc<str>,
-        source: String,
+        chunks: Vec<LoadChunk>,
         plugin_dir: Option<PathBuf>,
         permissions: PluginPermissions,
         opts: PluginOpts,
@@ -319,7 +380,7 @@ impl PluginHost {
             .tx
             .send(Request::LoadSource {
                 name,
-                source,
+                chunks,
                 plugin_dir,
                 permissions,
                 opts,
@@ -384,7 +445,7 @@ impl PluginHost {
     ) -> Result<(), PluginError> {
         self.send_load(
             Arc::from(name),
-            source.to_owned(),
+            vec![LoadChunk::new(name, source)],
             None,
             PluginPermissions::trusted(),
             Arc::new(opts),
@@ -399,7 +460,7 @@ impl PluginHost {
     ) -> Result<(), PluginError> {
         self.send_load(
             Arc::from(name),
-            source.to_owned(),
+            vec![LoadChunk::new(name, source)],
             None,
             permissions,
             PluginOpts::default(),
@@ -419,11 +480,160 @@ impl PluginHost {
         // unknown-plugin guards about user plugin names.
         self.send_load(
             Arc::from("user"),
-            source,
+            vec![LoadChunk::new(path.display().to_string(), source)],
             plugin_dir,
             permissions,
             PluginOpts::default(),
         )
+    }
+
+    /// Loads one external package directory as a single owner.
+    ///
+    /// Every `plugin/*.lua` becomes a chunk, and the chunks share one
+    /// environment, so what one file registers the next can use. The whole set
+    /// commits or none of it does.
+    pub fn load_package(
+        &self,
+        name: &str,
+        dir: &Path,
+        permissions: PluginPermissions,
+        opts: PluginOpts,
+    ) -> Result<(), PluginError> {
+        // Refused here and not only in discovery, because loading an owner
+        // drops that owner's existing registrations first. A package named
+        // after a bundled plugin would unload the builtin before its own
+        // entrypoint ever ran, so every caller has to be gated, not just the
+        // one that walks the site directory.
+        if is_bundled(name) {
+            return Err(PluginError::PackageNameConflict {
+                name: name.to_owned(),
+                path: dir.to_path_buf(),
+            });
+        }
+        // Resolved once here, so the manifest, the entrypoints, and later
+        // `require` calls all agree on one directory even if the path they came
+        // from changes underneath us.
+        let root = dir.canonicalize().map_err(|e| PluginError::Io {
+            path: dir.to_path_buf(),
+            source: e,
+        })?;
+        let files = package_entrypoints(&root)?;
+        if files.is_empty() {
+            return Err(PluginError::PackageEmpty {
+                name: name.to_owned(),
+                path: root,
+            });
+        }
+
+        let mut chunks = Vec::with_capacity(files.len());
+        for path in files {
+            let source = fs::read_to_string(&path).map_err(|e| PluginError::Io {
+                path: path.clone(),
+                source: e,
+            })?;
+            chunks.push(LoadChunk::new(path.display().to_string(), source));
+        }
+        self.send_load(Arc::from(name), chunks, Some(root), permissions, opts)
+    }
+
+    /// Loads the manually installed packages that load at startup.
+    ///
+    /// A broken package must not stop maki from starting, so each failure is
+    /// reported and the remaining packages still load. Packages the config
+    /// disabled are skipped, as are `opt/` packages, which wait to be
+    /// activated.
+    /// Takes the package operations Lua recorded, leaving the queue empty.
+    ///
+    /// Called by the host after the initiating task has exited, which keeps a
+    /// load off the thread that requested it.
+    fn take_pending_pack_ops(&self) -> Result<Vec<crate::api::pack::PackOp>, PluginError> {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        self.inner
+            .tx
+            .send(Request::TakePackOps { reply: reply_tx })
+            .map_err(|_| PluginError::HostDead)?;
+        reply_rx.recv().map_err(|_| PluginError::HostDead)
+    }
+
+    /// Loads every package that should be loaded now: the `start/` ones, and
+    /// the `opt/` ones that `maki.packadd` named.
+    ///
+    /// Activation names are collected here rather than acted on inside
+    /// `packadd`, because a load waits on a reply from the runtime thread that
+    /// `packadd` is called on. They are collected after each round as well as
+    /// before the first, so a package that activates another one still has it
+    /// loaded in this startup rather than the next.
+    pub fn load_packages(
+        &self,
+        packages: &[DiscoveredPackage],
+        config: &PluginsConfig,
+    ) -> Vec<String> {
+        let mut failures = Vec::new();
+        let mut loaded: Vec<&str> = Vec::new();
+        let mut round: Vec<&DiscoveredPackage> = packages
+            .iter()
+            .filter(|pkg| pkg.eager && config.packages.iter().any(|n| n == &pkg.name))
+            .collect();
+
+        // A `loop` and not `while !round.is_empty()`: with no `start` package
+        // installed the first round is empty, and the names `init.lua` already
+        // recorded still have to be collected.
+        loop {
+            for pkg in round {
+                let opts = config
+                    .opts
+                    .get(&pkg.name)
+                    .cloned()
+                    .map(Arc::new)
+                    .unwrap_or_default();
+                // A package the user installed by hand is granted what it asks
+                // for. Only a package maki fetched needs an approval as well.
+                let permissions = pkg.requested.clone().granted_for_manual_install();
+                loaded.push(&pkg.name);
+                if let Err(e) = self.load_package(&pkg.name, &pkg.dir, permissions, opts) {
+                    tracing::error!(
+                        package = %pkg.name,
+                        path = %pkg.dir.display(),
+                        error = %e,
+                        "failed to load package"
+                    );
+                    failures.push(crate::pack::sanitize_message(&format!(
+                        "{}: failed to load: {e}",
+                        pkg.name
+                    )));
+                }
+            }
+
+            let ops = match self.take_pending_pack_ops() {
+                Ok(ops) => ops,
+                Err(e) => {
+                    failures.push(format!("could not read package activations: {e}"));
+                    break;
+                }
+            };
+            round = Vec::new();
+            for op in ops {
+                let crate::api::pack::PackOp::Activate { name } = op;
+                if loaded.contains(&name.as_str()) {
+                    continue;
+                }
+                // Refused rather than loaded when the config disabled it, so
+                // `packadd` cannot be a way around `plugins.<name>.enabled`.
+                let found = packages
+                    .iter()
+                    .find(|pkg| pkg.name == name && config.packages.iter().any(|n| n == &pkg.name));
+                match found {
+                    Some(pkg) => round.push(pkg),
+                    None => failures.push(crate::pack::sanitize_message(&format!(
+                        "packadd {name:?}: no package with that name is installed"
+                    ))),
+                }
+            }
+            if round.is_empty() {
+                break;
+            }
+        }
+        failures
     }
 
     pub fn event_handle(&self) -> EventHandle {

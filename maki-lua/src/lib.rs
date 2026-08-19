@@ -4,6 +4,7 @@ pub mod docs_render;
 mod error;
 pub mod language;
 mod loader;
+mod pack;
 pub(crate) mod plugin_permissions;
 mod runtime;
 
@@ -17,7 +18,10 @@ pub use api::util::command::{
 pub use docs::{DocKind, FnDoc, ModuleDoc, ParamDoc, api_docs};
 pub use error::PluginError;
 pub use loader::{EventHandle, PluginHost};
-pub use plugin_permissions::{Permission, PluginPermissions};
+pub use pack::{
+    DiscoveredPackage, Discovery, MANAGED_GROUP, discover, discover_installed, site_dir,
+};
+pub use plugin_permissions::{Permission, PluginPermissions, Requested};
 pub use runtime::{KILL_GRACE, RestoreItem, WARM_TOOL_CAP};
 
 pub mod test_support {

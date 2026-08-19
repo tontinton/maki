@@ -11,6 +11,20 @@ use maki_storage::StateDir;
 use crate::cli::{AuthAction, Cli, Command, McpAction, MigrateAction};
 use crate::update;
 
+fn sanitize_warning(message: impl std::fmt::Display) -> String {
+    message
+        .to_string()
+        .chars()
+        .map(|character| {
+            if character == '\n' || character == '\t' || !character.is_control() {
+                character
+            } else {
+                ' '
+            }
+        })
+        .collect()
+}
+
 pub fn dispatch(cli: Cli) -> Result<()> {
     match cli.command {
         Some(Command::Auth { action }) => {
