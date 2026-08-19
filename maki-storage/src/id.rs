@@ -45,6 +45,14 @@ impl MakiId {
     pub fn as_bytes(&self) -> &[u8; UUID_BYTES] {
         &self.0
     }
+
+    /// The standard hyphenated RFC 4122 form, for wire protocols that expect a
+    /// UUID rather than maki's base58 `Display`. Lives here so callers never
+    /// need `Uuid` directly (see `disallowed-methods` in clippy.toml) or a
+    /// hand-rolled hex formatter that can drift from the real thing.
+    pub fn hyphenated(&self) -> String {
+        Uuid::from_bytes(self.0).hyphenated().to_string()
+    }
 }
 
 impl fmt::Display for MakiId {

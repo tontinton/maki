@@ -34,6 +34,7 @@ fn protocol_kind(protocol: Protocol) -> ProviderKind {
         Protocol::Openai | Protocol::OpenaiResponses => ProviderKind::OpenAi,
         Protocol::Anthropic => ProviderKind::Anthropic,
         Protocol::Google => ProviderKind::Google,
+        Protocol::CommandCode => ProviderKind::CommandCode,
     }
 }
 

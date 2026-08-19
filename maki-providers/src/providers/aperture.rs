@@ -169,7 +169,10 @@ fn kind_supports_thinking(kind: ProviderKind) -> bool {
 /// instead of silently inheriting `/v1` (which broke Zai once already).
 fn default_path_prefix(kind: Option<ProviderKind>) -> &'static str {
     match kind {
-        Some(ProviderKind::Anthropic | ProviderKind::Zai) => "",
+        // Command Code like Zai: the plan endpoint is `/alpha/generate`, and the
+        // credits base url already carries `/provider/v1`, so a prefix would
+        // double up either way.
+        Some(ProviderKind::Anthropic | ProviderKind::Zai | ProviderKind::CommandCode) => "",
         Some(ProviderKind::Google) => GEMINI_PATH_PREFIX,
         Some(
             ProviderKind::Ollama

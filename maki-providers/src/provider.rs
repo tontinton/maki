@@ -19,6 +19,7 @@ use crate::providers::aperture::Aperture;
 use crate::providers::catalog::{
     OPENCODE_FAMILY_SLUGS, available_if_warm, catalog_providers, catalog_providers_if_available,
 };
+use crate::providers::commandcode::CommandCode;
 use crate::providers::copilot::Copilot;
 use crate::providers::deepseek::DeepSeek;
 use crate::providers::dynamic;
@@ -58,6 +59,8 @@ pub enum ProviderKind {
     #[strum(serialize = "xai")]
     Xai,
     Aperture,
+    #[strum(serialize = "command-code")]
+    CommandCode,
 }
 
 impl ProviderKind {
@@ -78,6 +81,7 @@ impl ProviderKind {
             Self::Opencode => "Opencode Zen",
             Self::Xai => "xAI",
             Self::Aperture => "Aperture",
+            Self::CommandCode => "Command Code",
         }
     }
 
@@ -98,6 +102,7 @@ impl ProviderKind {
             Self::Opencode => "OPENCODE_API_KEY",
             Self::Xai => "XAI_API_KEY",
             Self::Aperture => "",
+            Self::CommandCode => "COMMAND_CODE_API_KEY",
         }
     }
 
@@ -120,6 +125,7 @@ impl ProviderKind {
             Self::Opencode => "https://opencode.ai/zen/v1",
             Self::Xai => "https://api.x.ai/v1",
             Self::Aperture => "Aperture gateway (set APERTURE_HOST)",
+            Self::CommandCode => "https://api.commandcode.ai",
         }
     }
 
@@ -153,6 +159,9 @@ impl ProviderKind {
             Self::Aperture => Some(
                 "Tailscale Aperture LLM gateway; set APERTURE_HOST or configure in providers.toml",
             ),
+            Self::CommandCode => Some(
+                "Token-plan (GOAT/Pro/Max/Team) access to the whole Command Code catalog, per-model reasoning effort",
+            ),
             _ => None,
         }
     }
@@ -174,6 +183,7 @@ impl ProviderKind {
             Self::Opencode => ModelFamily::Generic,
             Self::Xai => ModelFamily::Generic,
             Self::Aperture => ModelFamily::Generic,
+            Self::CommandCode => ModelFamily::Generic,
         }
     }
 
@@ -199,6 +209,7 @@ impl ProviderKind {
             Self::Opencode => Some(128_000),
             Self::Xai => Some(131_072),
             Self::Aperture => Some(16_384),
+            Self::CommandCode => Some(64_000),
         }
     }
 
@@ -219,6 +230,7 @@ impl ProviderKind {
             Self::Opencode => 256_000,
             Self::Xai => 500_000,
             Self::Aperture => 128_000,
+            Self::CommandCode => 200_000,
         }
     }
 
@@ -245,6 +257,7 @@ impl ProviderKind {
             Self::Opencode => Ok(Box::new(Opencode::new(timeouts)?)),
             Self::Xai => Ok(Box::new(Xai::new(timeouts)?)),
             Self::Aperture => Ok(Box::new(Aperture::new(timeouts)?)),
+            Self::CommandCode => Ok(Box::new(CommandCode::new(timeouts)?)),
         }
     }
 }

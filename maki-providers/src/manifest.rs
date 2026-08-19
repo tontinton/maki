@@ -1,8 +1,8 @@
 use crate::model::{ModelEntry, ModelFamily, ModelTier};
 use crate::pricing::PricingSchedule;
 use crate::providers::{
-    anthropic, aperture, copilot, custom, deepseek, dynamic, google, llama_cpp, mistral, ollama,
-    openai, openrouter, synthetic, tensorx, xai, zai,
+    anthropic, aperture, commandcode, copilot, custom, deepseek, dynamic, google, llama_cpp,
+    mistral, ollama, openai, openrouter, synthetic, tensorx, xai, zai,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -212,6 +212,18 @@ const APERTURE: ProviderManifest = ProviderManifest {
     pricing_schedule: None,
 };
 
+const COMMAND_CODE: ProviderManifest = ProviderManifest {
+    slug: "command-code",
+    display_name: "Command Code",
+    family: ModelFamily::Generic,
+    supports_thinking: true,
+    accepts_arbitrary_models: true,
+    fallback_max_output: Some(64_000),
+    fallback_context_window: 200_000,
+    pricing_schedule: None,
+    models: commandcode::models(),
+};
+
 const BUILTINS: &[ProviderManifest] = &[
     ANTHROPIC,
     OPENAI,
@@ -229,6 +241,7 @@ const BUILTINS: &[ProviderManifest] = &[
     OPENCODE_GO,
     XAI,
     APERTURE,
+    COMMAND_CODE,
 ];
 
 pub struct ManifestRegistry;

@@ -292,6 +292,14 @@ If `~/.grok/auth.json` already exists, login offers to reuse it without writing 
 
 Aperture discovers models from your gateway. Set `APERTURE_HOST` to your Tailscale Aperture endpoint (e.g. `https://your-host.tailnet.ts.net`). No API key needed, Tailscale handles auth.
 
+### Command Code
+
+- **Env var**: `COMMAND_CODE_API_KEY` (or an existing Command Code CLI login in `~/.commandcode/auth.json`)
+- **API**: `https://api.commandcode.ai`
+- **Features**: Token-plan (GOAT/Pro/Max/Team) access to the whole Command Code catalog, per-model reasoning effort
+
+No hardcoded model catalog. Use any model ID supported by this provider.
+
 ### Opencode Go
 
 - **Env var**: `OPENCODE_API_KEY`
@@ -445,7 +453,7 @@ To add a custom provider or proxy, drop an executable script into the config `pr
 
 `resolve` is called each time a new agent spawns, so scripts should read tokens from disk instead of caching them in memory. That way auth changes from other processes get picked up.
 
-The `base` field specifies which built-in provider to inherit the model catalog from. Valid values: `anthropic`, `openai`, `google`, `copilot`, `ollama`, `llama-cpp`, `mistral`, `zai`, `deepseek`, `openrouter`, `synthetic`, `tensorx`, `opencode`, `xai`, `aperture`.
+The `base` field specifies which built-in provider to inherit the model catalog from. Valid values: `anthropic`, `openai`, `google`, `copilot`, `ollama`, `llama-cpp`, `mistral`, `zai`, `deepseek`, `openrouter`, `synthetic`, `tensorx`, `opencode`, `xai`, `aperture`, `command-code`.
 
 If your provider serves models not in the base catalog, add a `models` subcommand returning:
 

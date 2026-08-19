@@ -405,6 +405,19 @@ fn build_sections() -> Vec<ProviderSection> {
                     entries: ManifestRegistry::get(&kind.to_string()).unwrap().models,
                 });
             }
+            ProviderKind::CommandCode => {
+                sections.push(ProviderSection {
+                    kind,
+                    name: kind.display_name(),
+                    auth_line: format!(
+                        "{} (or an existing Command Code CLI login in `~/.commandcode/auth.json`)",
+                        format_auth(kind)
+                    ),
+                    urls: vec![kind.base_url()],
+                    features: kind.features(),
+                    entries: ManifestRegistry::get(&kind.to_string()).unwrap().models,
+                });
+            }
             ProviderKind::Copilot => {
                 sections.push(ProviderSection {
                     kind,

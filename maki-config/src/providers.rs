@@ -93,6 +93,7 @@ pub enum Protocol {
     OpenaiResponses,
     Anthropic,
     Google,
+    CommandCode,
 }
 
 impl FromStr for Protocol {
@@ -104,6 +105,7 @@ impl FromStr for Protocol {
             "openai-responses" => Ok(Self::OpenaiResponses),
             "anthropic" => Ok(Self::Anthropic),
             "google" => Ok(Self::Google),
+            "commandcode" | "command-code" => Ok(Self::CommandCode),
             _ => Err(format!("unknown protocol: {s}")),
         }
     }
