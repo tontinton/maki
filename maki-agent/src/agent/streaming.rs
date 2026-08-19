@@ -25,10 +25,17 @@ fn canonicalize_tool_names(message: &mut Message) {
     }
 }
 
-async fn forward_provider_events(prx: flume::Receiver<ProviderEvent>, event_tx: &EventSender) {
+async fn forward_provider_events(
+    prx: flume::Receiver<ProviderEvent>,
+    event_tx: &EventSender,
+) -> String {
+    let mut streamed = String::new();
     while let Ok(pe) = prx.recv_async().await {
         let ae = match pe {
-            ProviderEvent::TextDelta { text } => AgentEvent::TextDelta { text },
+            ProviderEvent::TextDelta { text } => {
+                streamed.push_str(&text);
+                AgentEvent::TextDelta { text }
+            }
             ProviderEvent::ThinkingDelta { text } => AgentEvent::ThinkingDelta { text },
             ProviderEvent::ToolUseStart { id, name } => AgentEvent::ToolPending {
                 id,
@@ -48,6 +55,32 @@ async fn forward_provider_events(prx: flume::Receiver<ProviderEvent>, event_tx: 
             break;
         }
     }
+    streamed
+}
+
+/// Cancelling mid-stream carries the text the user still sees on screen,
+/// so the caller can keep it in history. A cancel during the retry backoff
+/// carries nothing: the `Retry` event already made the view drop the failed
+/// attempt's text (`stream_reset`), and history must agree with the view.
+#[derive(Debug)]
+pub(crate) enum StreamError {
+    Cancelled { streamed: String },
+    Other(AgentError),
+}
+
+impl From<AgentError> for StreamError {
+    fn from(e: AgentError) -> Self {
+        Self::Other(e)
+    }
+}
+
+impl From<StreamError> for AgentError {
+    fn from(e: StreamError) -> Self {
+        match e {
+            StreamError::Cancelled { .. } => Self::Cancelled,
+            StreamError::Other(e) => e,
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -61,7 +94,7 @@ pub(crate) async fn stream_with_retry(
     cancel: &CancelToken,
     opts: RequestOptions,
     session_id: Option<&SessionRef>,
-) -> Result<StreamResponse, AgentError> {
+) -> Result<StreamResponse, StreamError> {
     let opts = opts.clamped(model);
     let messages = maki_providers::adapt_images_for_model(model, messages);
     let messages = &*messages;
@@ -81,13 +114,13 @@ pub(crate) async fn stream_with_retry(
         )
         .await;
         drop(ptx);
-        let _ = forwarder.await;
+        let streamed = forwarder.await;
         match result {
             Ok(mut r) => {
                 canonicalize_tool_names(&mut r.message);
                 return Ok(r);
             }
-            Err(AgentError::Cancelled) => return Err(AgentError::Cancelled),
+            Err(AgentError::Cancelled) => return Err(StreamError::Cancelled { streamed }),
             Err(e) if e.is_retryable() => {
                 if e.should_rotate_key()
                     && let Ok(true) = provider.rotate_key().await
@@ -96,7 +129,7 @@ pub(crate) async fn stream_with_retry(
                 }
                 let (attempt, delay) = retry.next_delay();
                 if matches!(e, AgentError::Timeout { .. }) && attempt > MAX_TIMEOUT_RETRIES {
-                    return Err(e);
+                    return Err(e.into());
                 }
                 let delay_ms = delay.as_millis() as u64;
                 warn!(attempt, delay_ms, error = %e, "retryable, will retry");
@@ -113,10 +146,12 @@ pub(crate) async fn stream_with_retry(
                 )
                 .await;
                 if cancel.is_cancelled() {
-                    return Err(AgentError::Cancelled);
+                    return Err(StreamError::Cancelled {
+                        streamed: String::new(),
+                    });
                 }
             }
-            Err(e) => return Err(e),
+            Err(e) => return Err(e.into()),
         }
     }
 }

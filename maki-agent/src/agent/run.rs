@@ -6,13 +6,13 @@ use tracing::{error, info, warn};
 
 use maki_providers::provider::Provider;
 use maki_providers::{
-    ContentBlock, Message, Model, RequestOptions, StopReason, StreamResponse, TokenUsage,
+    ContentBlock, Message, Model, RequestOptions, Role, StopReason, StreamResponse, TokenUsage,
 };
 
 use super::compaction;
 use super::history::{History, sanitize_cancelled_history};
 use super::instructions::LoadedInstructions;
-use super::streaming::stream_with_retry;
+use super::streaming::{StreamError, stream_with_retry};
 use super::tool_dispatch::{self, RecentCalls};
 use crate::cancel::{CancelMap, CancelToken};
 use crate::mcp::McpSession;
@@ -294,10 +294,20 @@ impl<'h> Agent<'h> {
                 self.reauth_attempts = 0;
                 r
             }
-            Err(e) if e.is_auth_error() => {
+            Err(StreamError::Cancelled { streamed }) => {
+                if !streamed.trim().is_empty() {
+                    self.history.push(Message {
+                        role: Role::Assistant,
+                        content: vec![ContentBlock::Text { text: streamed }],
+                        ..Default::default()
+                    });
+                }
+                return Err(AgentError::Cancelled);
+            }
+            Err(StreamError::Other(e)) if e.is_auth_error() => {
                 return self.wait_for_reauth(e).await;
             }
-            Err(e) => {
+            Err(StreamError::Other(e)) => {
                 error!(error = %e, model = %self.model.id, self.num_turns, "stream_message failed");
                 return Err(e);
             }
@@ -634,6 +644,49 @@ mod tests {
                 let mut responses = self.responses.lock().unwrap();
                 assert!(!responses.is_empty(), "MockProvider: no more responses");
                 Ok(responses.remove(0))
+            })
+        }
+
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
+            Box::pin(async { unimplemented!() })
+        }
+    }
+
+    /// Streams `delta` (if any), fires `cancel_after_delta` (if any),
+    /// then fails with `fail_status` or hangs until cancelled.
+    #[derive(Default)]
+    struct StubStreamProvider {
+        delta: Option<&'static str>,
+        cancel_after_delta: Mutex<Option<crate::cancel::CancelTrigger>>,
+        fail_status: Option<u16>,
+    }
+
+    impl Provider for StubStreamProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            _: &'a [Message],
+            _: &'a str,
+            _: &'a Value,
+            ptx: &'a flume::Sender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a SessionRef>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(async move {
+                if let Some(text) = self.delta {
+                    ptx.send(ProviderEvent::TextDelta { text: text.into() })
+                        .unwrap();
+                }
+                if let Some(trigger) = self.cancel_after_delta.lock().unwrap().take() {
+                    trigger.cancel();
+                }
+                match self.fail_status {
+                    Some(status) => Err(AgentError::Api {
+                        status,
+                        message: "stub".into(),
+                    }),
+                    None => futures_lite::future::pending().await,
+                }
             })
         }
 
@@ -1068,36 +1121,11 @@ mod tests {
     #[test]
     fn cancel_token_aborts_during_api_call() {
         smol::block_on(async {
-            struct HangingProvider;
-            impl Provider for HangingProvider {
-                fn stream_message<'a>(
-                    &'a self,
-                    _: &'a Model,
-                    _: &'a [Message],
-                    _: &'a str,
-                    _: &'a Value,
-                    _: &'a flume::Sender<ProviderEvent>,
-                    _: RequestOptions,
-                    _: Option<&'a SessionRef>,
-                ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
-                    Box::pin(async {
-                        futures_lite::future::pending::<()>().await;
-                        unreachable!()
-                    })
-                }
-                fn list_models(
-                    &self,
-                ) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>>
-                {
-                    Box::pin(async { unimplemented!() })
-                }
-            }
-
             let (trigger, cancel) = CancelToken::new();
             trigger.cancel();
 
             let mut history = History::new(Vec::new());
-            let (agent, event_rx) = make_agent(HangingProvider, &mut history);
+            let (agent, event_rx) = make_agent(StubStreamProvider::default(), &mut history);
             let mut agent = agent.with_cancel(cancel);
 
             assert_eq!(
@@ -1113,6 +1141,78 @@ mod tests {
                     ..
                 }
             )));
+        });
+    }
+
+    #[test]
+    fn cancel_mid_stream_keeps_partial_text_in_history() {
+        const PARTIAL: &str = "partial answer";
+        smol::block_on(async {
+            let (trigger, cancel) = CancelToken::new();
+            let provider = StubStreamProvider {
+                delta: Some(PARTIAL),
+                cancel_after_delta: Mutex::new(Some(trigger)),
+                ..Default::default()
+            };
+            let mut history = History::new(Vec::new());
+            let (agent, _event_rx) = make_agent(provider, &mut history);
+            let mut agent = agent.with_cancel(cancel);
+
+            assert_eq!(
+                agent.run(default_input()).await.unwrap(),
+                DoneReason::Cancelled
+            );
+            drop(agent);
+            assert_ends_with_cancel_marker(&history);
+            let messages = history.as_slice();
+            let partial = &messages[messages.len() - 2];
+            assert!(matches!(partial.role, Role::Assistant));
+            assert!(matches!(&partial.content[0], ContentBlock::Text { text } if text == PARTIAL));
+        });
+    }
+
+    /// The `Retry` event already made the view drop the failed attempt's
+    /// text, so history must not resurrect it (see `StreamError`).
+    #[test]
+    fn cancel_during_retry_backoff_discards_failed_attempt_text() {
+        const PARTIAL: &str = "doomed attempt";
+        smol::block_on(async {
+            let (trigger, cancel) = CancelToken::new();
+            let provider = StubStreamProvider {
+                delta: Some(PARTIAL),
+                fail_status: Some(529),
+                ..Default::default()
+            };
+            let mut history = History::new(Vec::new());
+            let (agent, event_rx) = make_agent(provider, &mut history);
+            let mut agent = agent.with_cancel(cancel);
+
+            let mut trigger = Some(trigger);
+            let pump = smol::spawn(async move {
+                while let Ok(envelope) = event_rx.recv_async().await {
+                    if matches!(envelope.event, AgentEvent::Retry { .. })
+                        && let Some(t) = trigger.take()
+                    {
+                        t.cancel();
+                    }
+                }
+            });
+
+            assert_eq!(
+                agent.run(default_input()).await.unwrap(),
+                DoneReason::Cancelled
+            );
+            drop(agent);
+            pump.await;
+
+            assert_ends_with_cancel_marker(&history);
+            assert!(
+                history.as_slice().iter().all(|m| !m
+                    .content
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::Text { text } if text == PARTIAL))),
+                "failed attempt's text must not reach history"
+            );
         });
     }
 

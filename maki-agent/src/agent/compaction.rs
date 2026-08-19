@@ -7,7 +7,7 @@ use maki_providers::{
 use tracing::info;
 
 use super::history::{History, remove_orphaned_tool_results};
-use super::streaming::stream_with_retry;
+use super::streaming::{StreamError, stream_with_retry};
 use crate::cancel::CancelToken;
 use crate::{AgentError, AgentEvent, DoneReason, EventSender, TurnCompleteEvent};
 
@@ -75,11 +75,11 @@ pub(super) async fn compact_history(
                 }
                 return finish_compact(response, history, event_tx, compact_start, model);
             }
-            Err(e) if e.is_context_overflow() && attempt < max_attempts - 1 => {
+            Err(StreamError::Other(e)) if e.is_context_overflow() && attempt < max_attempts - 1 => {
                 last_error = Some(e);
                 truncate_oldest_round(&mut compaction_history);
             }
-            Err(e) => return Err(e),
+            Err(e) => return Err(e.into()),
         }
     }
 
