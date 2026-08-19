@@ -1,3 +1,4 @@
+pub mod elicitation;
 pub mod methods;
 pub mod permissions;
 pub mod server;

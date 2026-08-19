@@ -7,10 +7,10 @@ use std::sync::{Arc, Mutex};
 
 use agent_client_protocol_schema::{
     AgentNotification, AgentRequest, AgentResponse, ContentBlock, CurrentModeUpdate,
-    EmbeddedResourceResource, Error as AcpError, ImageContent, JsonRpcMessage, LoadSessionRequest,
-    McpServer, NewSessionRequest, Notification, PromptRequest, PromptResponse, Request, RequestId,
-    RequestPermissionRequest, RequestPermissionResponse, Response, SessionId, SessionModeId,
-    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
+    EmbeddedResourceResource, Error as AcpError, ImageContent, InitializeRequest, JsonRpcMessage,
+    LoadSessionRequest, McpServer, NewSessionRequest, Notification, PromptRequest, PromptResponse,
+    Request, RequestId, RequestPermissionRequest, RequestPermissionResponse, Response, SessionId,
+    SessionModeId, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
     SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
     TextContent, ToolCallId, ToolCallUpdate, ToolCallUpdateFields,
 };
@@ -20,6 +20,7 @@ use maki_agent::headless::{self, InteractiveHandle, InteractiveParams};
 use maki_agent::mcp::config::{RawHttpFields, RawStdioFields, RawTransport};
 use maki_agent::mcp::{self, McpHandle};
 use maki_agent::permissions::PermissionAnswer;
+use maki_agent::tools::{LocalToolFn, LocalTools, QUESTION_TOOL_NAME, local_tool};
 use maki_agent::types::AgentEvent;
 use maki_agent::{AgentInput, AgentMode, Envelope, ImageMediaType, ImageSource};
 use maki_config::MAX_SERVER_NAME_LEN;
@@ -32,7 +33,7 @@ use serde_json::Value;
 use smol::io::AsyncBufReadExt;
 use tracing::{debug, warn};
 
-use crate::{AcpParams, methods, permissions, translate};
+use crate::{AcpParams, elicitation, methods, permissions, translate};
 
 const FIRST_OUTGOING_REQUEST_ID: i64 = 1000;
 
@@ -40,12 +41,18 @@ const FIRST_OUTGOING_REQUEST_ID: i64 = 1000;
 /// session cannot match a request of the session that replaced it.
 static NEXT_OUTGOING_REQUEST_ID: AtomicI64 = AtomicI64::new(FIRST_OUTGOING_REQUEST_ID);
 
-/// What the client still owes us. Only one permission can be outstanding: the
-/// agent holds the answer channel while it waits for one.
+/// What the client still owes us. `ask` is the one outstanding request that
+/// blocks a tool (permission or elicitation): there can only be one, because
+/// both wait on the agent's single answer channel.
 #[derive(Default)]
 struct Pending {
     prompt: Option<RequestId>,
-    permission: Option<i64>,
+    ask: Option<(i64, AskKind)>,
+}
+
+enum AskKind {
+    Permission,
+    Elicitation,
 }
 
 type PendingState = Arc<Mutex<Pending>>;
@@ -62,6 +69,7 @@ struct Server {
     out_tx: Sender<Value>,
     model_specs: Vec<String>,
     model_policy: Arc<maki_config::ModelPolicy>,
+    client_elicits_form: bool,
     session: Option<SessionState>,
 }
 
@@ -89,6 +97,7 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
         out_tx,
         model_specs: available_model_specs(&params.model_policy),
         model_policy: Arc::clone(&params.model_policy),
+        client_elicits_form: false,
         session: None,
     };
 
@@ -148,9 +157,13 @@ async fn handle_request(
     params: &AcpParams,
 ) {
     let result = match method {
-        "initialize" => Ok(AgentResponse::InitializeResponse(
-            methods::initialize_response(),
-        )),
+        "initialize" => {
+            srv.client_elicits_form = parse_params::<InitializeRequest>(raw)
+                .is_ok_and(|req| elicitation::supports_form(&req.client_capabilities));
+            Ok(AgentResponse::InitializeResponse(
+                methods::initialize_response(),
+            ))
+        }
         "session/new" => new_session(srv, raw, params).await,
         "session/load" => load_session(srv, raw, params).await,
         "session/prompt" => match handle_prompt(srv, raw, &id) {
@@ -173,11 +186,11 @@ async fn new_session(
     close_session(srv).await;
     let mcp = start_mcp(&req.cwd, &req.mcp_servers).await;
     let cwd = req.cwd.clone();
-    let handle = spawn_session(params, req.cwd, None, Vec::new(), mcp.clone());
+    let (handle, pending) = spawn_session(srv, params, req.cwd, None, Vec::new(), mcp.clone());
     let spec = params.model.spec();
     let resp = methods::new_session_response(handle.session_id.as_str())
         .config_options(vec![methods::model_config_option(&spec, &srv.model_specs)]);
-    install_session(srv, handle, mcp, spec, cwd);
+    install_session(srv, handle, mcp, spec, pending, cwd);
     Ok(AgentResponse::NewSessionResponse(resp))
 }
 
@@ -202,28 +215,47 @@ async fn load_session(
         session_update(&srv.out_tx, &sid, update);
     }
     let cwd = req.cwd.clone();
-    let handle = spawn_session(params, req.cwd, Some(session_ref), history, mcp.clone());
+    let (handle, pending) = spawn_session(
+        srv,
+        params,
+        req.cwd,
+        Some(session_ref),
+        history,
+        mcp.clone(),
+    );
     let spec = params.model.spec();
     let resp = methods::load_session_response()
         .config_options(vec![methods::model_config_option(&spec, &srv.model_specs)]);
-    install_session(srv, handle, mcp, spec, cwd);
+    install_session(srv, handle, mcp, spec, pending, cwd);
     Ok(AgentResponse::LoadSessionResponse(resp))
 }
 
 fn spawn_session(
+    srv: &Server,
     params: &AcpParams,
     cwd: PathBuf,
     session_id: Option<SessionRef>,
     history: Vec<Message>,
     mcp_handle: Option<McpHandle>,
-) -> InteractiveHandle {
-    headless::spawn_interactive(InteractiveParams {
+) -> (InteractiveHandle, PendingState) {
+    let pending = PendingState::default();
+    // Without form elicitation the question tool would spin forever waiting
+    // for a TUI that does not exist, so it is dropped and the model asks in
+    // plain text instead.
+    let (excluded_tools, local_tools) = if srv.client_elicits_form {
+        let tool = question_tool(srv.out_tx.clone(), Arc::clone(&pending));
+        let map: LocalTools = Arc::new(HashMap::from([(QUESTION_TOOL_NAME.to_owned(), tool)]));
+        (Vec::new(), map)
+    } else {
+        (vec![QUESTION_TOOL_NAME], LocalTools::default())
+    };
+    let handle = headless::spawn_interactive(InteractiveParams {
         model: params.model.clone(),
         config: params.config.clone(),
         permissions_config: params.permissions_config.clone(),
         timeouts: params.timeouts,
         prompt_slots: Arc::clone(&params.prompt_slots),
-        excluded_tools: Vec::new(),
+        excluded_tools,
         mcp_handle,
         initial_wd: cwd,
         session_id,
@@ -234,6 +266,66 @@ fn spawn_session(
         workflow: false,
         model_policy: Arc::clone(&params.model_policy),
         plugin_rules: Arc::clone(&params.plugin_rules),
+        local_tools,
+    });
+    (handle, pending)
+}
+
+/// Sends a request the client must answer and records it as the outstanding
+/// ask, registered before sending so the response can never race past us.
+fn ask_client(
+    out_tx: &Sender<Value>,
+    pending: &PendingState,
+    kind: AskKind,
+    request: AgentRequest,
+) -> i64 {
+    let id = NEXT_OUTGOING_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+    pending.lock().unwrap().ask = Some((id, kind));
+    send(
+        out_tx,
+        Request {
+            id: RequestId::Number(id),
+            method: Arc::from(request.method()),
+            params: Some(request),
+        },
+    );
+    id
+}
+
+/// Shadows the Lua `question` tool: sends `elicitation/create` to the client
+/// and blocks the tool call until the form comes back. Serializes on the same
+/// answer channel as permissions, so at most one ask is in flight.
+fn question_tool(out_tx: Sender<Value>, pending: PendingState) -> LocalToolFn {
+    local_tool(move |input, ctx| {
+        let out_tx = out_tx.clone();
+        let pending = Arc::clone(&pending);
+        Box::pin(async move {
+            let session_id = ctx
+                .session_id
+                .as_ref()
+                .map(ToString::to_string)
+                .ok_or("no session")?;
+            let request = elicitation::form_request(&session_id, ctx.tool_use_id, &input)?;
+            let rx = ctx.user_response_rx.as_ref().ok_or("no answer channel")?;
+
+            let guard = rx.lock().await;
+            let request = AgentRequest::CreateElicitationRequest(request);
+            let id = ask_client(&out_tx, &pending, AskKind::Elicitation, request);
+            let response = ctx.cancel.race(guard.recv_async()).await;
+            // Cleared while still holding the channel, so a stale id cannot
+            // clobber whatever ask comes next.
+            let _ = pending
+                .lock()
+                .unwrap()
+                .ask
+                .take_if(|(ask_id, _)| *ask_id == id);
+            drop(guard);
+
+            Ok(match response {
+                Ok(Ok(raw)) => elicitation::format_response(&input, &raw),
+                _ => elicitation::DISMISSED.to_owned(),
+            })
+        })
     })
 }
 
@@ -323,9 +415,9 @@ fn install_session(
     handle: InteractiveHandle,
     mcp: Option<McpHandle>,
     current_model: String,
+    pending: PendingState,
     cwd: PathBuf,
 ) {
-    let pending = PendingState::default();
     start_event_pump(
         handle.event_rx.clone(),
         handle.session_id.clone(),
@@ -452,7 +544,7 @@ fn handle_notification(srv: &Server, method: &str) {
             if let Some(session) = &srv.session {
                 // Any answer still in flight belongs to the cancelled turn, so
                 // forget its id and let it be dropped on arrival.
-                session.pending.lock().unwrap().permission = None;
+                session.pending.lock().unwrap().ask = None;
                 let _ = session.handle.cancel_tx.try_send(());
             }
         }
@@ -465,21 +557,27 @@ fn handle_incoming_response(srv: &Server, raw: &Value) {
     let Some(id) = raw.get("id").and_then(Value::as_i64) else {
         return;
     };
-    if session
+    let ask = session
         .pending
         .lock()
         .unwrap()
-        .permission
-        .take_if(|pending| *pending == id)
-        .is_none()
-    {
+        .ask
+        .take_if(|(ask_id, _)| *ask_id == id);
+    let Some((_, kind)) = ask else {
         warn!(id, "response for an unknown request id");
         return;
-    }
-    let _ = session
-        .handle
-        .answer_tx
-        .send(permission_answer(raw).encode());
+    };
+    let answer = match kind {
+        AskKind::Permission => permission_answer(raw).encode(),
+        // The waiting question tool parses this; an error response decodes to
+        // nothing and counts as a dismissal.
+        AskKind::Elicitation => raw
+            .get("result")
+            .cloned()
+            .unwrap_or(Value::Null)
+            .to_string(),
+    };
+    let _ = session.handle.answer_tx.send(answer);
 }
 
 /// A response we cannot read still has to answer the agent, or the tool waits
@@ -573,16 +671,7 @@ fn start_event_pump(
                             ToolCallUpdate::new(ToolCallId::from(id), fields),
                             permissions::permission_options(),
                         ));
-                    let request_id = NEXT_OUTGOING_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
-                    pending.lock().unwrap().permission = Some(request_id);
-                    send(
-                        &out_tx,
-                        Request {
-                            id: RequestId::Number(request_id),
-                            method: Arc::from(request.method()),
-                            params: Some(request),
-                        },
-                    );
+                    ask_client(&out_tx, &pending, AskKind::Permission, request);
                     continue;
                 }
                 AgentEvent::Done { reason, .. } => {
@@ -671,6 +760,10 @@ mod tests {
     }
 
     fn server_awaiting_answer() -> (Server, Receiver<String>) {
+        server_with_ask(AskKind::Permission)
+    }
+
+    fn server_with_ask(kind: AskKind) -> (Server, Receiver<String>) {
         let (answer_tx, answer_rx) = flume::unbounded();
         let handle = InteractiveHandle {
             event_rx: flume::unbounded().1,
@@ -691,14 +784,15 @@ mod tests {
             out_tx: flume::unbounded().0,
             model_specs: Vec::new(),
             model_policy: Arc::new(maki_config::ModelPolicy::default()),
+            client_elicits_form: false,
             session: Some(SessionState {
                 handle,
                 mcp: None,
                 current_mode: AgentMode::Build,
                 current_model: String::new(),
                 pending: Arc::new(Mutex::new(Pending {
-                    permission: Some(ANSWERED_ID),
-                    ..Default::default()
+                    prompt: None,
+                    ask: Some((ANSWERED_ID, kind)),
                 })),
             }),
         };
@@ -732,6 +826,22 @@ mod tests {
 
         handle_incoming_response(&srv, &allow_once(ANSWERED_ID));
         assert!(answer_rx.is_empty(), "the cancelled turn owns that answer");
+    }
+
+    #[test]
+    fn elicitation_response_forwards_the_raw_result() {
+        let (srv, answer_rx) = server_with_ask(AskKind::Elicitation);
+        let raw = serde_json::json!({
+            "id": ANSWERED_ID,
+            "result": { "action": "accept", "content": { "q1": "axum" } },
+        });
+
+        handle_incoming_response(&srv, &raw);
+        let forwarded = answer_rx.try_recv().unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&forwarded).unwrap(),
+            raw["result"]
+        );
     }
 
     #[test]

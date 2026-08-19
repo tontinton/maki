@@ -432,7 +432,7 @@ mod tests {
         let mut tools: HashMap<String, LocalToolFn> = HashMap::new();
         tools.insert(
             LOCAL_TOOL_NAME.into(),
-            Arc::new(|_: &serde_json::Value| Ok(String::new())) as LocalToolFn,
+            maki_agent::tools::local_tool(|_, _| Box::pin(async { Ok(String::new()) })),
         );
         ctx.local_tools = Arc::new(tools);
         ctx.live_sink = Some(flume::unbounded().0);

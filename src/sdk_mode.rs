@@ -506,6 +506,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         workflow,
         model_policy: Arc::clone(&model_policy),
         plugin_rules,
+        local_tools: Default::default(),
     });
 
     let (out_tx, out_rx) = flume::unbounded::<String>();

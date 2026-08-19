@@ -184,7 +184,7 @@ get-size2 = "=0.10.1"
 notify = { version = "9.0.0-rc.2", default-features = false, features = ["flume", "macos_fsevent"] }
 serde_yaml = "0.9"
 shell-words = "1"
-agent-client-protocol-schema = "0.13"
+agent-client-protocol-schema = { version = "0.13", features = ["unstable_elicitation"] }
 
 wait-timeout = "0.2"
 inventory = "0.3"

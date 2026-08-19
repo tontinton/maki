@@ -185,8 +185,18 @@ pub fn timeout_annotation(secs: u64) -> String {
     format!("{formatted} timeout")
 }
 
-pub type LocalToolFn = Arc<dyn Fn(&Value) -> Result<String, String> + Send + Sync>;
+pub type LocalToolResult = BoxFuture<'static, Result<String, String>>;
+pub type LocalToolFn = Arc<dyn Fn(Value, ToolContext) -> LocalToolResult + Send + Sync>;
 pub type LocalTools = Arc<HashMap<String, LocalToolFn>>;
+
+/// Coerces a closure into a [`LocalToolFn`]; the bound gives the boxed
+/// future a coercion target that `Arc::new` alone does not.
+pub fn local_tool<F>(f: F) -> LocalToolFn
+where
+    F: Fn(Value, ToolContext) -> LocalToolResult + Send + Sync + 'static,
+{
+    Arc::new(f)
+}
 
 #[derive(Clone)]
 pub struct ToolContext {

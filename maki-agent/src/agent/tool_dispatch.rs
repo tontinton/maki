@@ -73,7 +73,7 @@ pub async fn run(
     // the interpreter bridge); streamed names are canonicalized in streaming.rs.
     let name = super::streaming::canonical_tool_name(name);
     if let Some(local) = ctx.local_tools.get(name) {
-        return run_local_tool(local, id, name, input, ctx, emit);
+        return run_local_tool(local, id, name, input, ctx, emit).await;
     }
     let entry = registry.get(name);
     // LLM providers send tool names in wire format (server__tool) but our
@@ -257,7 +257,7 @@ fn run_tool_search(
     }
 }
 
-fn run_local_tool(
+async fn run_local_tool(
     local: &LocalToolFn,
     id: String,
     name: &str,
@@ -267,7 +267,11 @@ fn run_local_tool(
 ) -> ToolDoneEvent {
     let tool_id: Arc<str> = Arc::from(name);
     emit_raw_start(ctx, emit, &id, &tool_id, name.to_owned(), input);
-    let (output, is_error) = match local(input) {
+    let tool_ctx = ToolContext {
+        tool_use_id: Some(id.clone()),
+        ..ctx.clone()
+    };
+    let (output, is_error) = match local(input.clone(), tool_ctx).await {
         Ok(output) => (output, false),
         Err(e) => {
             warn!(tool = %name, error = %e, "local tool failed");
@@ -525,7 +529,13 @@ mod tests {
     ) -> ToolContext {
         let mut ctx = crate::tools::test_support::stub_ctx(&AgentMode::Build);
         let mut map = std::collections::HashMap::new();
-        map.insert(name.to_owned(), Arc::new(f) as LocalToolFn);
+        map.insert(
+            name.to_owned(),
+            crate::tools::local_tool(move |input, _ctx| {
+                let result = f(&input);
+                Box::pin(async move { result })
+            }),
+        );
         ctx.local_tools = Arc::new(map);
         ctx
     }
@@ -592,7 +602,10 @@ mod tests {
             let mut map = std::collections::HashMap::new();
             map.insert(
                 "local_echo".to_owned(),
-                Arc::new(|input: &Value| Ok(input.to_string())) as LocalToolFn,
+                crate::tools::local_tool(|input, _ctx| {
+                    let out = input.to_string();
+                    Box::pin(async move { Ok(out) })
+                }),
             );
             ctx.local_tools = Arc::new(map);
 
