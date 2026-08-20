@@ -123,7 +123,7 @@ pub const TOP_LEVEL_FIELDS: &[ConfigField] = &[
         ty: "bool",
         default: ConfigValue::Bool(false),
         min: None,
-        description: "Start every session with Anthropic fast mode (Opus only; ignored otherwise)",
+        description: "Start every session with fast mode (Anthropic Opus and OpenAI GPT-5.4+ only; ignored otherwise)",
     },
     ConfigField {
         name: "always_workflow",

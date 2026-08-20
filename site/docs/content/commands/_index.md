@@ -27,7 +27,7 @@ Type `/` in the input box to open the command palette.
 | `/btw` | Ask a quick question (no tools, no history pollution) |
 | `/yolo` | Toggle YOLO mode (skip all permission prompts) |
 | `/thinking` | Toggle extended thinking (off, adaptive, effort level, or budget) |
-| `/fast` | Toggle Anthropic fast mode (Opus only) |
+| `/fast` | Toggle fast mode (Anthropic Opus / OpenAI GPT-5.4+) |
 | `/workflow` | Toggle workflow mode (task callable inside code_execution) |
 | `/exit` | Exit the application |
 | `/reload` | Reload plugins and config |
@@ -43,7 +43,7 @@ Sessions run concurrently. `/new` starts a fresh session while the old one keeps
 
 - **`/yolo`**: skip permission prompts for this session (deny rules still apply). Config: `always_yolo = true`.
 - **`/thinking`**: extended thinking. Optional arg: `off`, `adaptive`, an effort level (`minimal` … `max`), or a token budget number. Config: `always_thinking`.
-- **`/fast`**: Anthropic fast mode (Opus only; ignored on other models). Config: `always_fast = true`.
+- **`/fast`**: fast mode (Anthropic Opus and OpenAI GPT-5.4+ only; ignored on other models). Config: `always_fast = true`.
 - **`/workflow`**: let `code_execution` call the `task` tool (and other workflow-only tools) from inside the Python sandbox. Config: `always_workflow = true`.
 - **Plan / build**: not a slash command. Press `Tab` in the input to toggle plan mode (plan-file writes only).
 - **`/reload`**: rebuild plugins and config without leaving the app.

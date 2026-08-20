@@ -4,7 +4,7 @@ use flume::Sender;
 use maki_storage::StateDir;
 use maki_storage::id::SessionRef;
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 use tracing::{debug, warn};
 
 use crate::model::Model;
@@ -275,6 +275,19 @@ fn resolve_openai_base_url() -> Option<String> {
     maki_config::providers::configured_base_url("openai", config.get("openai"))
 }
 
+/// Opts into Fast mode, the tier OpenAI used to call Priority Processing. We
+/// re-check `supports_fast()` rather than trusting `opts.fast` alone, so a
+/// stale UI flag can never bill an ineligible model at the premium rate.
+///
+/// `"fast"` and `"priority"` mean the same thing on the wire, and the response
+/// echoes back the tier actually served, which may not be the one we asked
+/// for.
+fn apply_fast_mode(body: &mut Value, model: &Model, opts: RequestOptions) {
+    if opts.fast && model.supports_fast() {
+        body["service_tier"] = json!("fast");
+    }
+}
+
 impl Provider for OpenAi {
     fn stream_message<'a>(
         &'a self,
@@ -291,7 +304,15 @@ impl Provider for OpenAi {
             let system = super::super::with_prefix(&self.system_prefix, system, &mut buf);
 
             if is_codex_model(&model.id) {
-                let body = super::responses::build_body(model, messages, system, tools);
+                let mut body = super::responses::build_body(model, messages, system, tools);
+                // Every fast-capable model is also a plan model, so this branch
+                // is where fast mode actually lands. `codex_auth` sends OAuth
+                // traffic to the ChatGPT Coding Plan backend, which bills by
+                // subscription and does not sell the tier, so gate on the
+                // same predicate it uses and the two cannot disagree.
+                if !self.is_oauth() {
+                    apply_fast_mode(&mut body, model, opts);
+                }
                 let stream_timeout = self.compat.stream_timeout();
                 return self
                     .with_oauth_retry(|| async {
@@ -312,6 +333,7 @@ impl Provider for OpenAi {
             let mut body = self.compat.build_body(model, messages, system, tools);
             opts.thinking
                 .apply_reasoning_effort(&mut body, &dialect::STANDARD, model);
+            apply_fast_mode(&mut body, model, opts);
             self.with_oauth_retry(|| async {
                 let auth = self.current_auth();
                 self.compat
@@ -397,6 +419,63 @@ mod tests {
     #[test_case("gpt-5.6-sol")]
     fn gpt_5_6_models_use_coding_plan(model_id: &str) {
         assert!(is_codex_model(model_id));
+    }
+
+    /// Fast mode rides the Responses branch, so every model carrying fast-tier
+    /// pricing must route through it -- otherwise `apply_fast_mode` is dead code.
+    #[test_case("gpt-5.6-sol")]
+    #[test_case("gpt-5.6-terra")]
+    #[test_case("gpt-5.6-luna")]
+    #[test_case("gpt-5.5")]
+    #[test_case("gpt-5.4")]
+    #[test_case("gpt-5.4-mini")]
+    fn every_fast_capable_model_routes_through_the_responses_branch(model_id: &str) {
+        let model = Model::from_spec(&format!("openai/{model_id}")).unwrap();
+        assert!(model.supports_fast(), "{model_id} should have fast pricing");
+        assert!(
+            is_codex_model(model_id),
+            "{model_id} should route to Responses"
+        );
+    }
+
+    #[test]
+    fn sets_service_tier_on_capable_model() {
+        let model = Model::from_spec("openai/gpt-5.6-sol").unwrap();
+        let mut body = serde_json::json!({});
+        apply_fast_mode(&mut body, &model, fast_opts());
+        assert_eq!(body["service_tier"], serde_json::json!("fast"));
+    }
+
+    #[test]
+    fn ignores_stale_flag_on_ineligible_model() {
+        // gpt-5.4-nano has no published fast rate, so opts.fast must not
+        // upgrade the request and bill a premium that was never quoted.
+        let model = Model::from_spec("openai/gpt-5.4-nano").unwrap();
+        let mut body = serde_json::json!({});
+        apply_fast_mode(&mut body, &model, fast_opts());
+        assert!(body.get("service_tier").is_none());
+    }
+
+    #[test]
+    fn absent_when_not_requested() {
+        let model = Model::from_spec("openai/gpt-5.6-sol").unwrap();
+        let mut body = serde_json::json!({});
+        apply_fast_mode(&mut body, &model, RequestOptions::default());
+        assert!(body.get("service_tier").is_none());
+    }
+
+    /// Resellers surface the same model ids without selling the tier.
+    #[test]
+    fn not_applied_for_a_reseller_serving_the_same_model() {
+        let model = Model::from_spec("openrouter/gpt-5.6-sol").unwrap();
+        assert!(!model.supports_fast());
+    }
+
+    fn fast_opts() -> RequestOptions {
+        RequestOptions {
+            fast: true,
+            ..Default::default()
+        }
     }
 
     #[test_case("gpt-5.6-luna", Some(372_000))]
