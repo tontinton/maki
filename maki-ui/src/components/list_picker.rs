@@ -588,21 +588,17 @@ fn render_ready<T: PickerItem>(
     popup
 }
 
-fn section_gap<T: PickerItem>(filtered: &[usize], items: &[T], idx: usize) -> usize {
-    let item = &items[filtered[idx]];
-    let is_break = match item.section() {
-        None => false,
-        Some(sec) => {
-            idx == 0
-                || items[filtered[idx - 1]]
-                    .section()
-                    .is_none_or(|prev| prev != sec)
-        }
-    };
-    if !is_break {
+fn section_gap<T: PickerItem>(filtered: &[usize], items: &[T], idx: usize, start: usize) -> usize {
+    let Some(sec) = items[filtered[idx]].section() else {
         return 0;
+    };
+    if idx == start {
+        return 1;
     }
-    if idx == 0 { 1 } else { 2 }
+    let is_break = items[filtered[idx - 1]]
+        .section()
+        .is_none_or(|prev| prev != sec);
+    if is_break { 2 } else { 0 }
 }
 
 fn visual_rows_in_range<T: PickerItem>(
@@ -612,7 +608,9 @@ fn visual_rows_in_range<T: PickerItem>(
     end: usize,
 ) -> usize {
     let item_count = end.saturating_sub(start);
-    let section_rows: usize = (start..end).map(|i| section_gap(filtered, items, i)).sum();
+    let section_rows: usize = (start..end)
+        .map(|i| section_gap(filtered, items, i, start))
+        .sum();
     item_count + section_rows
 }
 
@@ -684,12 +682,7 @@ fn render_list<T: PickerItem>(
 
     let mut lines: Vec<Line> = Vec::new();
     let mut i = scroll_offset;
-    let mut last_section: Option<&str> = if scroll_offset > 0 && scroll_offset - 1 < filtered.len()
-    {
-        items[filtered[scroll_offset - 1]].section()
-    } else {
-        None
-    };
+    let mut last_section: Option<&str> = None;
 
     while lines.len() < viewport_height && i < filtered.len() {
         let item_idx = filtered[i];
