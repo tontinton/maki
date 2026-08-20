@@ -24,6 +24,7 @@ pub(crate) mod treesitter;
 pub(crate) mod ui;
 pub(crate) mod util;
 pub(crate) mod uv;
+pub(crate) mod version;
 pub(crate) mod yaml;
 
 use std::sync::Arc;

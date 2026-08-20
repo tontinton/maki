@@ -33,10 +33,24 @@ pub fn run(model_arg: Option<String>, yolo: bool, no_plugins: bool, no_jit: bool
         .load_init_files_or_skip(no_plugins, &cwd)
         .context("load init.lua files")?;
 
-    let names: Vec<String> = packages.iter().map(|p| p.name.clone()).collect();
+    // Read after the init files, so declared packages are configurable and
+    // installable here too, not only under the terminal UI.
+    let declared = if no_plugins {
+        Vec::new()
+    } else {
+        plugin_host
+            .declared_packages()
+            .context("read declared packages")?
+    };
+
+    let known: Vec<String> = packages
+        .iter()
+        .map(|p| p.name.clone())
+        .chain(declared.iter().map(|d| d.spec.name.clone()))
+        .collect();
     let mut config = raw_config
         .unwrap_or_default()
-        .into_config(false, &names)
+        .into_config(false, &known)
         .context("invalid config")?;
     config.permissions = load_permissions(&cwd);
 
@@ -51,6 +65,38 @@ pub fn run(model_arg: Option<String>, yolo: bool, no_plugins: bool, no_jit: bool
     for warning in plugin_host.load_packages(&packages, &config.plugins) {
         eprintln!("warning: {warning}");
     }
+    let installed = maki_lua::install_declared(&declared, maki_lua::Interaction::None);
+    for warning in installed
+        .failures
+        .iter()
+        .cloned()
+        .chain(plugin_host.load_packages(&installed.packages, &config.plugins))
+    {
+        eprintln!("warning: {warning}");
+    }
+
+    // Same order as the terminal entry point: everything loaded first, then
+    // whatever `init.lua` asked to change. Draining here rather than inside
+    // the Lua call is what keeps unloading from waiting on the thread that
+    // requested it.
+    let mut active: std::collections::BTreeSet<String> = packages
+        .iter()
+        .chain(&installed.packages)
+        .filter(|p| p.eager && config.plugins.packages.iter().any(|n| n == &p.name))
+        .map(|p| p.name.clone())
+        .collect();
+    let available: Vec<maki_lua::DiscoveredPackage> = packages
+        .iter()
+        .chain(&installed.packages)
+        .cloned()
+        .collect();
+    maki_lua::drain_pack_ops(
+        &plugin_host,
+        &declared,
+        &available,
+        &mut active,
+        &config.plugins,
+    );
 
     let timeouts = maki_providers::Timeouts {
         connect: config.provider.connect_timeout,

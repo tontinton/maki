@@ -2796,6 +2796,7 @@ dependencies = [
  "maki-interpreter",
  "maki-lua-macro",
  "maki-markdown",
+ "maki-pack",
  "maki-providers",
  "maki-storage",
  "mlua",
@@ -2881,6 +2882,21 @@ dependencies = [
  "smol",
  "test-case",
  "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
+name = "maki-pack"
+version = "0.4.12"
+dependencies = [
+ "semver",
+ "serde",
+ "serde_json",
+ "smol",
+ "tempfile",
+ "test-case",
+ "thiserror 2.0.18",
+ "toml",
  "tracing",
 ]
 

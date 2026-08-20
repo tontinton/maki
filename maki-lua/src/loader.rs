@@ -487,6 +487,76 @@ impl PluginHost {
         )
     }
 
+    /// Packages declared by `maki.pack.add` in `init.lua`.
+    ///
+    /// Read after the init files have run, which is when the declared set is
+    /// complete and before anything is installed.
+    pub fn declared_packages(&self) -> Result<Vec<crate::api::pack::Declared>, PluginError> {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        self.inner
+            .tx
+            .send(Request::CollectPackages { reply: reply_tx })
+            .map_err(|_| PluginError::HostDead)?;
+        reply_rx.recv().map_err(|_| PluginError::HostDead)
+    }
+
+    /// Takes the package operations Lua recorded, leaving the queue empty.
+    ///
+    /// Called by the host after the initiating task has exited, which keeps an
+    /// unload off the thread that requested it.
+    pub fn take_pending_pack_ops(&self) -> Result<Vec<crate::api::pack::PackOp>, PluginError> {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        self.inner
+            .tx
+            .send(Request::TakePackOps { reply: reply_tx })
+            .map_err(|_| PluginError::HostDead)?;
+        reply_rx.recv().map_err(|_| PluginError::HostDead)
+    }
+
+    /// Loads every `start/` package, and every managed package the caller
+    /// installed.
+    ///
+    /// Activation is not handled here. `maki.packadd` records an operation,
+    /// and every recorded operation is applied at one drain point once all of
+    /// this has run, so a package activated by another one still loads in this
+    /// startup.
+    pub fn load_packages(
+        &self,
+        packages: &[DiscoveredPackage],
+        config: &PluginsConfig,
+    ) -> Vec<String> {
+        let mut failures = Vec::new();
+        for pkg in packages
+            .iter()
+            .filter(|pkg| pkg.eager && config.packages.iter().any(|n| n == &pkg.name))
+        {
+            let opts = config
+                .opts
+                .get(&pkg.name)
+                .cloned()
+                .map(Arc::new)
+                .unwrap_or_default();
+            // A package the user installed by hand is granted what it asks
+            // for. A package maki fetched is granted only where the request
+            // and a recorded approval agree, so a manifest cannot certify
+            // itself.
+            let permissions = crate::pack::effective_permissions(pkg);
+            if let Err(e) = self.load_package(&pkg.name, &pkg.dir, permissions, opts) {
+                tracing::error!(
+                    package = %pkg.name,
+                    path = %pkg.dir.display(),
+                    error = %e,
+                    "failed to load package"
+                );
+                failures.push(crate::pack::sanitize_message(&format!(
+                    "{}: failed to load: {e}",
+                    pkg.name
+                )));
+            }
+        }
+        failures
+    }
+
     /// Loads one external package directory as a single owner.
     ///
     /// Every `plugin/*.lua` becomes a chunk, and the chunks share one
@@ -499,17 +569,6 @@ impl PluginHost {
         permissions: PluginPermissions,
         opts: PluginOpts,
     ) -> Result<(), PluginError> {
-        // Refused here and not only in discovery, because loading an owner
-        // drops that owner's existing registrations first. A package named
-        // after a bundled plugin would unload the builtin before its own
-        // entrypoint ever ran, so every caller has to be gated, not just the
-        // one that walks the site directory.
-        if is_bundled(name) {
-            return Err(PluginError::PackageNameConflict {
-                name: name.to_owned(),
-                path: dir.to_path_buf(),
-            });
-        }
         // Resolved once here, so the manifest, the entrypoints, and later
         // `require` calls all agree on one directory even if the path they came
         // from changes underneath us.
@@ -535,107 +594,6 @@ impl PluginHost {
         }
         self.send_load(Arc::from(name), chunks, Some(root), permissions, opts)
     }
-
-    /// Loads the manually installed packages that load at startup.
-    ///
-    /// A broken package must not stop maki from starting, so each failure is
-    /// reported and the remaining packages still load. Packages the config
-    /// disabled are skipped, as are `opt/` packages, which wait to be
-    /// activated.
-    /// Takes the package operations Lua recorded, leaving the queue empty.
-    ///
-    /// Called by the host after the initiating task has exited, which keeps a
-    /// load off the thread that requested it.
-    fn take_pending_pack_ops(&self) -> Result<Vec<crate::api::pack::PackOp>, PluginError> {
-        let (reply_tx, reply_rx) = flume::bounded(1);
-        self.inner
-            .tx
-            .send(Request::TakePackOps { reply: reply_tx })
-            .map_err(|_| PluginError::HostDead)?;
-        reply_rx.recv().map_err(|_| PluginError::HostDead)
-    }
-
-    /// Loads every package that should be loaded now: the `start/` ones, and
-    /// the `opt/` ones that `maki.packadd` named.
-    ///
-    /// Activation names are collected here rather than acted on inside
-    /// `packadd`, because a load waits on a reply from the runtime thread that
-    /// `packadd` is called on. They are collected after each round as well as
-    /// before the first, so a package that activates another one still has it
-    /// loaded in this startup rather than the next.
-    pub fn load_packages(
-        &self,
-        packages: &[DiscoveredPackage],
-        config: &PluginsConfig,
-    ) -> Vec<String> {
-        let mut failures = Vec::new();
-        let mut loaded: Vec<&str> = Vec::new();
-        let mut round: Vec<&DiscoveredPackage> = packages
-            .iter()
-            .filter(|pkg| pkg.eager && config.packages.iter().any(|n| n == &pkg.name))
-            .collect();
-
-        // A `loop` and not `while !round.is_empty()`: with no `start` package
-        // installed the first round is empty, and the names `init.lua` already
-        // recorded still have to be collected.
-        loop {
-            for pkg in round {
-                let opts = config
-                    .opts
-                    .get(&pkg.name)
-                    .cloned()
-                    .map(Arc::new)
-                    .unwrap_or_default();
-                // A package the user installed by hand is granted what it asks
-                // for. Only a package maki fetched needs an approval as well.
-                let permissions = pkg.requested.clone().granted_for_manual_install();
-                loaded.push(&pkg.name);
-                if let Err(e) = self.load_package(&pkg.name, &pkg.dir, permissions, opts) {
-                    tracing::error!(
-                        package = %pkg.name,
-                        path = %pkg.dir.display(),
-                        error = %e,
-                        "failed to load package"
-                    );
-                    failures.push(crate::pack::sanitize_message(&format!(
-                        "{}: failed to load: {e}",
-                        pkg.name
-                    )));
-                }
-            }
-
-            let ops = match self.take_pending_pack_ops() {
-                Ok(ops) => ops,
-                Err(e) => {
-                    failures.push(format!("could not read package activations: {e}"));
-                    break;
-                }
-            };
-            round = Vec::new();
-            for op in ops {
-                let crate::api::pack::PackOp::Activate { name } = op;
-                if loaded.contains(&name.as_str()) {
-                    continue;
-                }
-                // Refused rather than loaded when the config disabled it, so
-                // `packadd` cannot be a way around `plugins.<name>.enabled`.
-                let found = packages
-                    .iter()
-                    .find(|pkg| pkg.name == name && config.packages.iter().any(|n| n == &pkg.name));
-                match found {
-                    Some(pkg) => round.push(pkg),
-                    None => failures.push(crate::pack::sanitize_message(&format!(
-                        "packadd {name:?}: no package with that name is installed"
-                    ))),
-                }
-            }
-            if round.is_empty() {
-                break;
-            }
-        }
-        failures
-    }
-
     pub fn event_handle(&self) -> EventHandle {
         EventHandle {
             tx: self.inner.tx.clone(),

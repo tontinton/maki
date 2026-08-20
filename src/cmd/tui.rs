@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::env;
 use std::io::{self, IsTerminal, Read};
 use std::path::Path;
@@ -73,6 +74,26 @@ impl Drop for Teardown {
     }
 }
 
+/// Which package owners are loaded right now.
+///
+/// `load_packages` skips a package that is not eager or that the config
+/// disabled, so the set of packages handed to it is not the set that loaded.
+/// This applies the same two filters, and is the answer an update needs to
+/// decide whether reloading a package would start something that was
+/// deliberately left dormant.
+fn active_owners(
+    manual: &[DiscoveredPackage],
+    installed: &[DiscoveredPackage],
+    config: &maki_config::PluginsConfig,
+) -> BTreeSet<String> {
+    manual
+        .iter()
+        .chain(installed)
+        .filter(|p| p.eager && config.packages.iter().any(|n| n == &p.name))
+        .map(|p| p.name.clone())
+        .collect()
+}
+
 fn discover_commands(disable: bool) -> Vec<CustomCommand> {
     if disable {
         return Vec::new();
@@ -91,10 +112,26 @@ fn load_config(
         .load_init_files_or_skip(cli.no_plugins, cwd)
         .context("load init.lua files")?;
 
-    let names: Vec<String> = packages.iter().map(|p| p.name.clone()).collect();
+    // Read after the init files, because that is when `maki.pack.add` has run
+    // and the declared set is complete. Both discovered and declared names
+    // have to be known before validation, or `plugins.<name>` would reject a
+    // package the user just declared.
+    let declared = if cli.no_plugins {
+        Vec::new()
+    } else {
+        plugin_host
+            .declared_packages()
+            .context("read declared packages")?
+    };
+
+    let known: Vec<String> = packages
+        .iter()
+        .map(|p| p.name.clone())
+        .chain(declared.iter().map(|d| d.spec.name.clone()))
+        .collect();
     let mut config = raw_config
         .unwrap_or_default()
-        .into_config(cli.no_rtk, &names)
+        .into_config(cli.no_rtk, &known)
         .context("invalid config")?;
     config.permissions = load_permissions(cwd);
 
@@ -179,6 +216,38 @@ fn build_stack(
     // After the builtins, so a package claiming a builtin tool name is the side
     // that fails rather than breaking the builtin.
     warnings.extend(plugin_host.load_packages(&packages, &config.plugins));
+
+    // Declared with `maki.pack.add` in init.lua. Installing here rather than
+    // inside the call keeps a clone off the Lua thread, and is the phase
+    // Neovim's own `load` default defers to.
+    match plugin_host.declared_packages() {
+        Ok(declared) => {
+            let installed = maki_lua::install_declared(&declared, maki_lua::Interaction::Tty);
+            warnings.extend(installed.failures.iter().cloned());
+            warnings.extend(plugin_host.load_packages(&installed.packages, &config.plugins));
+
+            // Applied last, once every package `init.lua` could have named is
+            // loaded, so an update knows whether it is reloading something
+            // that was running. This is also the only safe place for it: the
+            // work unloads owners, which waits on the Lua thread, so it cannot
+            // run inside the Lua call that asked for it.
+            let mut active = active_owners(&packages, &installed.packages, &config.plugins);
+            let available: Vec<maki_lua::DiscoveredPackage> = packages
+                .iter()
+                .chain(&installed.packages)
+                .cloned()
+                .collect();
+            let report = maki_lua::drain_pack_ops(
+                &plugin_host,
+                &declared,
+                &available,
+                &mut active,
+                &config.plugins,
+            );
+            warnings.extend(report.failures.iter().cloned());
+        }
+        Err(e) => warnings.push(format!("could not read declared packages: {e}")),
+    }
 
     let commands = discover_commands(cli.no_commands);
 

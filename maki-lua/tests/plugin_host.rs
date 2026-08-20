@@ -3180,6 +3180,25 @@ fn discovered_config(found: &maki_lua::Discovery) -> (Vec<String>, PluginsConfig
     (names, config)
 }
 
+/// The whole startup order: load what starts eagerly, then apply whatever
+/// those loads recorded. `maki.packadd` only takes effect at the second step.
+fn activate_all(
+    host: &PluginHost,
+    found: &maki_lua::Discovery,
+    config: &PluginsConfig,
+) -> Vec<String> {
+    let mut failures = host.load_packages(&found.packages, config);
+    let mut active: std::collections::BTreeSet<String> = found
+        .packages
+        .iter()
+        .filter(|p| p.eager && config.packages.iter().any(|n| n == &p.name))
+        .map(|p| p.name.clone())
+        .collect();
+    let report = maki_lua::drain_pack_ops(host, &[], &found.packages, &mut active, config);
+    failures.extend(report.failures);
+    failures
+}
+
 /// `maki.packadd` is the activation path for an `opt/` package. A `start`
 /// package that calls it must get the named package loaded in the same
 /// startup, not the next one, or its registrations never appear.
@@ -3198,10 +3217,8 @@ fn packadd_from_a_start_package_activates_an_opt_package() {
 
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    assert!(
-        host.load_packages(&found.packages, &config).is_empty(),
-        "both packages must load without a failure"
-    );
+    let failures = activate_all(&host, &found, &config);
+    assert!(failures.is_empty(), "got: {failures:?}");
 
     let snap = host.command_reader().load();
     assert_eq!(
@@ -3226,7 +3243,7 @@ fn packadd_reports_a_name_that_is_not_installed() {
 
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    let failures = host.load_packages(&found.packages, &config);
+    let failures = activate_all(&host, &found, &config);
     assert_eq!(failures.len(), 1, "got: {failures:?}");
     assert!(failures[0].contains("absent_pack"), "got: {failures:?}");
 }
@@ -3257,7 +3274,7 @@ fn packadd_cannot_activate_a_disabled_package() {
 
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    let failures = host.load_packages(&found.packages, &config);
+    let failures = activate_all(&host, &found, &config);
     assert_eq!(failures.len(), 1, "got: {failures:?}");
     assert_eq!(
         host.command_reader().load().commands.len(),

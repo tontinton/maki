@@ -53,6 +53,8 @@ pub fn api_docs() -> Vec<&'static ModuleDoc> {
     use crate::api;
     vec![
         &api::util::setup::DOCS,
+        &api::pack::DOCS,
+        &api::version::DOCS,
         &api::tool::DOCS,
         &api::autocmd::DOCS,
         &api::slot::DOCS,
@@ -157,11 +159,25 @@ mod tests {
                 .insert(key);
         }
 
+        // Documented here but attached by the runtime rather than by
+        // `create_maki_global`, so the table built for this test has none of
+        // them. `setup`, `pack`, and `version` are attached only when a config
+        // store is present, which is what limits them to `init.lua`;
+        // `packadd` is attached for every plugin, just later.
+        const RUNTIME_ATTACHED: [&str; 4] = ["setup", "pack", "version", "packadd"];
+
         for (name, mut expected) in documented {
+            if RUNTIME_ATTACHED
+                .iter()
+                .any(|only| name == format!("maki.{only}"))
+            {
+                continue;
+            }
             let actual = table_keys(&resolve_table(&maki, name));
             if name == "maki" {
-                // Documented here, but injected later by the runtime.
-                expected.remove("setup");
+                for only in RUNTIME_ATTACHED {
+                    expected.remove(only);
+                }
             }
             let expected: BTreeSet<String> = expected.iter().map(|s| s.to_string()).collect();
             assert_eq!(

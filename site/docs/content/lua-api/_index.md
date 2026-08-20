@@ -84,6 +84,8 @@ The rules:
 | Module | What it is for |
 | --- | --- |
 | [`maki`](#maki) | The global entry point. |
+| [`maki.pack`](#maki-pack) | Declaring external packages, modelled after `vim.pack`. |
+| [`maki.version`](#maki-version) | Version constraints, modelled after `vim.version`. |
 | [`maki.api`](#maki-api) | Plugin registration. |
 | [`maki.agent`](#maki-agent) | Subagent primitives for plugins that need to talk to an LLM. |
 | [`maki.agent.Session`](#maki-agent-Session) | A subagent session with its own conversation history. |
@@ -175,6 +177,179 @@ set; an empty {sep} splits into single characters.
 maki.split("a,b,c", ",")                   -- { "a", "b", "c" }
 maki.split("x*y*z", "*", { plain = true }) -- { "x", "y", "z" }
 maki.split("\nhello\nworld\n", "\n", { trimempty = true }) -- { "hello", "world" }
+```
+
+---
+
+### `maki.packadd()` {#maki-packadd}
+
+```lua
+maki.packadd({name})
+```
+
+Activate an installed package that is not loaded, like `:packadd`.
+
+This is how an `opt/` package, or one declared with no automatic load, is
+brought in. It is available to any plugin, unlike `add`, `update`, and
+`del`: activating code that is already installed and already approved is a
+much weaker act than fetching new code.
+
+Loading happens after this call returns, for the same reason as `update`.
+
+**Parameters:**
+
+- `{name}` (`string`) Package to activate.
+
+**Example:**
+
+```lua
+maki.packadd("maki-goal")
+```
+
+
+## maki.pack {#maki-pack}
+
+Declaring external packages, modelled after `vim.pack`.
+
+Available only inside `init.lua`, because installing a package fetches
+code and that is a configuration decision rather than something a
+plugin may do for itself.
+
+```lua
+maki.pack.add({ "https://github.com/user/maki-goal" })
+```
+
+---
+
+### `maki.pack.add()` {#maki-pack-add}
+
+```lua
+maki.pack.add({specs}, {opts?})
+```
+
+Declare packages to install and load, like `vim.pack.add`.
+
+Recording is all this does. The host installs and loads the declared set
+after `init.lua` finishes, so a slow clone never blocks the call and a
+package failure never stops maki from starting.
+
+Only available inside `init.lua`. Declaring a package fetches code, so it is
+configuration rather than something a downloaded plugin may do.
+
+**Parameters:**
+
+- `{specs}` (`table`) List of specs. Each is a source string, or a table with
+
+  `src` (string, required), `name` (string), and `version` (string or
+
+
+  `maki.version.range()`).
+
+- `{opts?}` (`table?`) Options: `load` (boolean|table) `false` installs the
+
+  package without loading it, leaving it for `maki.packadd`; a table of
+
+
+  `event`, `cmd`, and `keys` loads it the first time one of those fires.
+
+  - `confirm` (`boolean`) `false` clones a new source without asking, which
+
+  states that the source is trusted and never approves its permissions.
+
+
+**Example:**
+
+```lua
+maki.pack.add({
+  { src = "https://github.com/user/maki-goal", version = "main" },
+})
+```
+
+---
+
+### `maki.pack.update()` {#maki-pack-update}
+
+```lua
+maki.pack.update({names?}, {opts?})
+```
+
+Update packages to what their version now resolves to, like
+`vim.pack.update`.
+
+The work happens after this call returns, because updating unloads and
+reloads the package and unloading waits on the runtime this call occupies.
+
+**Parameters:**
+
+- `{names?}` (`table?`) Package names. Omit for every declared package.
+- `{opts?}` (`table?`) `offline` to work without the network, and `target` of
+  - `"version"` (`the default`) to take what version now resolves to, or
+
+  `"lockfile"` to go back to the recorded revision.
+
+
+**Example:**
+
+```lua
+maki.pack.update({ "maki-goal" })
+maki.pack.update(nil, { target = "lockfile" })
+```
+
+---
+
+### `maki.pack.del()` {#maki-pack-del}
+
+```lua
+maki.pack.del({names})
+```
+
+Remove packages, like `vim.pack.del`.
+
+Runs after this call returns, for the same reason as `update`.
+
+**Parameters:**
+
+- `{names}` (`table`) Package names to remove.
+
+**Example:**
+
+```lua
+maki.pack.del({ "maki-goal" })
+```
+
+
+## maki.version {#maki-version}
+
+Version constraints, modelled after `vim.version`.
+
+```lua
+local v = maki.version.range("^1.2")
+```
+
+---
+
+### `maki.version.range()` {#maki-version-range}
+
+```lua
+maki.version.range({spec})
+```
+
+Build a semver constraint, like `vim.version.range`.
+
+A package given a range installs the greatest tag the constraint admits.
+
+**Parameters:**
+
+- `{spec}` (`string`) Constraint, for example `"^1.2"` or `">=1.0, <2.0"`.
+
+**Returns:** (`table`) Value to pass as a spec's `version`.
+
+**Example:**
+
+```lua
+maki.pack.add({
+  { src = "https://github.com/user/plugin", version = maki.version.range("^1") },
+})
 ```
 
 

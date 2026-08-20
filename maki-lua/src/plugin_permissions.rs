@@ -25,6 +25,17 @@ impl Permission {
         Permission::Env,
     ];
 
+    /// Parses the name used in `plugin.toml` and in the approval store.
+    ///
+    /// Both use one spelling on purpose. If an approval were recorded under a
+    /// different name from the request, `intersect` would silently never
+    /// match, and every managed package would run with nothing granted.
+    pub fn from_key(key: &str) -> Option<Self> {
+        Permission::ALL
+            .into_iter()
+            .find(|p| p.manifest_key() == key)
+    }
+
     pub(crate) const fn manifest_key(self) -> &'static str {
         match self {
             Permission::FsRead => "fs_read",
@@ -56,6 +67,21 @@ impl PluginPermissions {
         Self {
             allowed: [false; 5],
         }
+    }
+
+    /// Builds a set from the names an approval records.
+    ///
+    /// A name this build does not know is ignored rather than treated as a
+    /// grant, so an approval file written by a newer maki cannot widen what an
+    /// older one allows.
+    pub fn from_approved<'a>(names: impl IntoIterator<Item = &'a str>) -> Self {
+        let mut out = Self::denied();
+        for name in names {
+            if let Some(perm) = Permission::from_key(name) {
+                out.set(perm, true);
+            }
+        }
+        out
     }
 
     pub fn is_allowed(&self, perm: Permission) -> bool {

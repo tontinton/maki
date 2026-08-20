@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use maki_config::RawConfig;
 use mlua::{Function, Lua, LuaSerdeExt, Result as LuaResult};
 
+use crate::api::pack::packadd__doc;
 use crate::api::split::split__doc;
 use crate::docs::{DocKind, FnDoc, ModuleDoc, ParamDoc};
 
@@ -34,6 +35,7 @@ accepts the same keys as the Configuration reference.",
 })",
         },
         split__doc,
+        packadd__doc,
     ],
 };
 

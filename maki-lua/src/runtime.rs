@@ -144,10 +144,6 @@ pub enum Request {
     /// Plugins are loaded, so native codegen may start using idle time. Sent
     /// last so it never interleaves with the loads themselves.
     WarmJit,
-    /// Takes the package operations Lua recorded, leaving the queue empty.
-    TakePackOps {
-        reply: flume::Sender<Vec<crate::api::pack::PackOp>>,
-    },
     LoadSource {
         name: Arc<str>,
         chunks: Vec<LoadChunk>,
@@ -200,6 +196,16 @@ pub enum Request {
     },
     CollectPluginOptions {
         reply: flume::Sender<PluginOptionSpecs>,
+    },
+    /// Packages `init.lua` declared. Read after the init files have run, since
+    /// that is when the declared set is complete.
+    CollectPackages {
+        reply: flume::Sender<Vec<crate::api::pack::Declared>>,
+    },
+    /// Takes the operations Lua recorded, leaving the queue empty so the same
+    /// work is never applied twice.
+    TakePackOps {
+        reply: flume::Sender<Vec<crate::api::pack::PackOp>>,
     },
     Shutdown,
     RestoreToolAsync {
@@ -1503,12 +1509,12 @@ impl LuaRuntime {
         })?;
 
         lua.set_app_data(CommandHandlerMap::new());
-        lua.set_app_data(crate::api::pack::PackStore::default());
         lua.set_app_data(JobStore::new());
         lua.set_app_data(SpawnQueue::new());
         lua.set_app_data(command_writer);
         lua.set_app_data(PromptHintCallbacks::default());
         lua.set_app_data(PluginOptionSpecs::default());
+        lua.set_app_data(crate::api::pack::PackStore::default());
         lua.set_app_data(AutocmdStore::default());
         lua.set_app_data(SlotStore::default());
         lua.set_app_data(KeymapStore::new());
@@ -1871,7 +1877,28 @@ impl LuaRuntime {
             let setup_fn = crate::api::util::setup::create_setup_fn(&self.lua, Arc::clone(cs))
                 .map_err(&map_err)?;
             maki.set("setup", setup_fn).map_err(&map_err)?;
+
+            // Attached under the same condition as `setup`, so declaring a
+            // package is available to `init.lua` and to nothing else. `add`
+            // fetches code and rewrites the lockfile, which is a configuration
+            // decision; a downloaded package must not be able to make it for
+            // itself, whatever permissions it holds.
+            maki.set(
+                "pack",
+                crate::api::pack::create_pack_table(&self.lua).map_err(&map_err)?,
+            )
+            .map_err(&map_err)?;
+            maki.set(
+                "version",
+                crate::api::version::create_version_table(&self.lua).map_err(&map_err)?,
+            )
+            .map_err(&map_err)?;
         }
+        crate::api::pack::add_packadd(&self.lua, &maki).map_err(&map_err)?;
+
+        // Available to every plugin, not only `init.lua`: activating a package
+        // that is already installed and already approved is far weaker than
+        // fetching new code, which is what the `maki.pack` table gates.
         crate::api::pack::add_packadd(&self.lua, &maki).map_err(&map_err)?;
 
         let env = self.build_env(maki, require_root).map_err(&map_err)?;
@@ -2807,18 +2834,6 @@ pub fn spawn(
                             })
                             .detach();
                         }
-                        Request::TakePackOps { reply } => {
-                            let ops = rt
-                                .lua
-                                .app_data_ref::<crate::api::pack::PackStore>()
-                                .map(|store| {
-                                    std::mem::take(
-                                        &mut store.lock().expect("pack declarations").pending,
-                                    )
-                                })
-                                .unwrap_or_default();
-                            let _ = reply.send(ops);
-                        }
                         Request::ClearPlugin { plugin, reply } => {
                             drain_barrier(&rt.lua, &ex, &gate, &spawn_rx).await;
                             rt.clear_plugin(&plugin);
@@ -2890,6 +2905,26 @@ pub fn spawn(
                         }
                         Request::CollectPluginOptions { reply } => {
                             let _ = reply.send(collect_plugin_options(&rt.lua));
+                        }
+                        Request::TakePackOps { reply } => {
+                            let ops = rt
+                                .lua
+                                .app_data_ref::<crate::api::pack::PackStore>()
+                                .map(|store| {
+                                    std::mem::take(
+                                        &mut store.lock().expect("pack declarations").pending,
+                                    )
+                                })
+                                .unwrap_or_default();
+                            let _ = reply.send(ops);
+                        }
+                        Request::CollectPackages { reply } => {
+                            let declared = rt
+                                .lua
+                                .app_data_ref::<crate::api::pack::PackStore>()
+                                .map(|store| store.lock().expect("pack declarations").specs.clone())
+                                .unwrap_or_default();
+                            let _ = reply.send(declared);
                         }
                         Request::RestoreToolAsync { item, event_tx } => {
                             spawn_restore(&ex, &gate, &restores, &rt, item, event_tx);
