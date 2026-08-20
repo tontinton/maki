@@ -22,6 +22,7 @@ pub fn run(model_arg: Option<String>, yolo: bool, no_plugins: bool, no_jit: bool
         .context("initialize lua plugin host")?;
 
     let discovery = maki_lua::discover_installed(no_plugins);
+    let names = discovery.known_names();
     for problem in discovery.problems {
         eprintln!(
             "warning: {}",
@@ -43,9 +44,9 @@ pub fn run(model_arg: Option<String>, yolo: bool, no_plugins: bool, no_jit: bool
             .context("read declared packages")?
     };
 
-    let known: Vec<String> = packages
+    let known: Vec<String> = names
         .iter()
-        .map(|p| p.name.clone())
+        .cloned()
         .chain(declared.iter().map(|d| d.spec.name.clone()))
         .collect();
     let mut config = raw_config

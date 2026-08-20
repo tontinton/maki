@@ -241,6 +241,67 @@ fn granted(
     }
 }
 
+/// Whether a declared package is already installed from the source it names.
+///
+/// Both halves matter. A recorded revision only describes the source it was
+/// recorded for, so a name pointed at a different repository is neither
+/// installed nor covered by the decision that trusted the old one.
+fn installed_from_declared_source(
+    declared: &crate::api::pack::Declared,
+    lock: &maki_pack::lockfile::Lockfile,
+    manager: &maki_pack::manager::Manager,
+) -> bool {
+    let spec = &declared.spec;
+    lock.get(&spec.name)
+        .is_some_and(|entry| entry.src == spec.src)
+        && manager.resolve(lock, &spec.name).is_some()
+}
+
+/// The declared packages that are already installed at the source and revision
+/// the lockfile records.
+///
+/// Reads only: no git, no lock, no network. This is what a session still has
+/// when it cannot install, so one held lock does not take away the packages
+/// the user already had.
+fn resolved_on_disk(
+    specs: &[crate::api::pack::Declared],
+    site: &Path,
+    lock: &maki_pack::lockfile::Lockfile,
+    failures: &mut Vec<String>,
+) -> Vec<DiscoveredPackage> {
+    let manager = maki_pack::manager::Manager::new(site);
+    let mut found = Vec::new();
+    for declared in specs {
+        let spec = &declared.spec;
+        if !installed_from_declared_source(declared, lock, &manager) {
+            continue;
+        }
+        let Some(dir) = manager.resolve(lock, &spec.name) else {
+            continue;
+        };
+        let requested = match load_requested_permissions(&dir) {
+            Ok(requested) => requested,
+            Err(problem) => {
+                // Named here, because the caller only reports why installing
+                // stopped. Dropping this would make the package vanish with
+                // the lock error as the only clue.
+                failures.push(sanitize_message(&format!("{}: {problem}", spec.name)));
+                continue;
+            }
+        };
+        found.push(DiscoveredPackage {
+            name: spec.name.clone(),
+            requested,
+            origin: Origin::Fetched {
+                src: spec.src.clone(),
+            },
+            dir,
+            eager: matches!(declared.load, crate::api::pack::LoadMode::Eager),
+        });
+    }
+    found
+}
+
 /// Installs the packages `init.lua` declared, and reports where each one
 /// landed.
 ///
@@ -440,6 +501,14 @@ pub fn install_declared(
                 // bare "another process" would be wrong after a crash.
                 tracing::error!(error = %e, "could not take the package lock");
                 report.failures.push(sanitize_message(&e.to_string()));
+                // Installing needs the lock; reading what is already there
+                // does not. Returning nothing would tell the session it has
+                // no managed packages at all, because discovery skips the
+                // managed group, so a second maki started during a clone
+                // would come up with every package the user has missing.
+                if let Some(lock) = read_lockfile(lock_path.as_deref()) {
+                    report.packages = resolved_on_disk(specs, &site, &lock, &mut report.failures);
+                }
                 return report;
             }
         },
@@ -752,6 +821,8 @@ fn commit_batch(batch: CommitBatch<'_>, report: &mut PackReport) {
 /// deleting one is refused, because every plugin is an owner.
 fn runnable_ops<'a>(
     ops: &'a [crate::api::pack::PackOp],
+    manual: &Discovery,
+    lock: &maki_pack::lockfile::Lockfile,
     report: &mut PackReport,
 ) -> Vec<&'a crate::api::pack::PackOp> {
     use crate::api::pack::PackOp;
@@ -762,6 +833,11 @@ fn runnable_ops<'a>(
         }
     };
 
+    // Every name the walk saw, not only the ones that loaded. A package whose
+    // manifest became unreadable after it loaded is still the live owner of
+    // its name, and reading the loadable set alone would let this batch tear
+    // that owner down.
+    let manual_names = manual.known_names();
     let mut seen = std::collections::BTreeSet::new();
     let mut conflicted = std::collections::BTreeSet::new();
     for op in ops {
@@ -782,13 +858,30 @@ fn runnable_ops<'a>(
             if conflicted.contains(name) {
                 return false;
             }
-            match owner_conflict(name) {
-                Some(error) => {
-                    report.failures.push(error);
-                    false
-                }
-                None => true,
+            if let Some(error) = owner_conflict(name) {
+                report.failures.push(error);
+                return false;
             }
+            // A lock entry proves a managed package exists under this name, not
+            // that the loaded owner is that one. With an orphan entry beside a
+            // hand-installed package of the same name, deleting unloads the
+            // manual package's registrations and removes the managed checkout,
+            // and nothing brings the manual one back. Refused here so every
+            // pass agrees, since not being declared is exactly what gets an
+            // operation this far.
+            if manual_names.iter().any(|manual| manual == name) && lock.get(name).is_some() {
+                let where_it_is = manual
+                    .packages
+                    .iter()
+                    .find(|package| package.name == name)
+                    .map(|package| format!(" at {}", package.dir.display()))
+                    .unwrap_or_default();
+                report.failures.push(format!(
+                    "{name}: managed package name conflicts with manual package{where_it_is}"
+                ));
+                return false;
+            }
+            true
         })
         .collect()
 }
@@ -796,7 +889,6 @@ fn runnable_ops<'a>(
 /// What the update pass reads while it resolves each requested revision.
 struct Prepare<'a> {
     declared: &'a [crate::api::pack::Declared],
-    manual: &'a [DiscoveredPackage],
     manager: &'a maki_pack::manager::Manager,
     active: &'a std::collections::BTreeSet<String>,
 }
@@ -816,7 +908,6 @@ fn prepare_updates(
 
     let Prepare {
         declared,
-        manual,
         manager,
         active,
     } = ctx;
@@ -840,14 +931,18 @@ fn prepare_updates(
                 .push(format!("{name}: not installed, so it cannot be updated"));
             continue;
         };
-        if let Some(package) = manual.iter().find(|package| package.name == *name) {
+        // A declaration that now names a different repository is a new trust
+        // decision, and the prompt for it belongs to the install path.
+        // Updating here would fetch and record the very source the user had
+        // the chance to refuse, on the strength of the lock entry the old
+        // source left behind.
+        if previous.src != declaration.spec.src {
             report.failures.push(format!(
-                "{name}: managed package name conflicts with manual package at {}",
-                package.dir.display()
+                "{name}: the declared source changed, so it cannot be updated; \
+                 reload to install it from the new source"
             ));
             continue;
         }
-
         let existed = manager.resolve(lock, name).is_some();
         let mut preview = lock.clone();
         let refresh = match options.target {
@@ -1058,14 +1153,13 @@ pub fn apply_pack_ops(
     // Decided once. Four later passes walk this batch, and each repeating the
     // same two guards is how one of them ends up disagreeing with the others
     // about whether an operation may run.
-    let runnable = runnable_ops(ops, &mut report);
+    let manual = discover(&site);
+    let runnable = runnable_ops(ops, &manual, &lock, &mut report);
 
-    let manual = discover(&site).packages;
     let prepared = prepare_updates(
         &runnable,
         &Prepare {
             declared,
-            manual: &manual,
             manager: &manager,
             active: &active,
         },
@@ -1524,11 +1618,33 @@ pub fn plan_command(
 
     match cmd {
         PackCommand::Update { names, options } => {
-            let names = if names.is_empty() {
-                known.iter().map(|n| (*n).to_owned()).collect()
+            // Updating asks what is installed as well as what is declared, for
+            // the same reason deletion does. Applying an update installs when
+            // there is no lock entry, so a package whose install was declined
+            // at startup would be cloned and recorded by a later bare
+            // `/packupdate`, and the next start would see it as installed and
+            // never ask again.
+            let names: Vec<String> = if names.is_empty() {
+                known
+                    .iter()
+                    .filter(|name| installed.iter().any(|i| i == *name))
+                    .map(|n| (*n).to_owned())
+                    .collect()
             } else {
-                resolve(names)?
+                let names = resolve(names)?;
+                for name in &names {
+                    if !installed.contains(name) {
+                        return Err(format!(
+                            "{name}: not installed, so there is nothing to update; \
+                             reload to install it"
+                        ));
+                    }
+                }
+                names
             };
+            if names.is_empty() {
+                return Err("no declared package is installed; nothing was updated".into());
+            }
             Ok(names
                 .into_iter()
                 .map(|name| PackOp::Update {
@@ -1808,7 +1924,11 @@ pub fn drain_pack_ops(
     config: &maki_config::PluginsConfig,
     interaction: Interaction,
 ) -> PackReport {
-    let ops = match host.take_pending_pack_ops() {
+    // Read and closed in one message. `maki.packadd` records here whenever
+    // the runtime cannot serve it directly, and a read followed by a separate
+    // close leaves a window where a spawned Lua task records an activation
+    // that is then sealed away unread.
+    let ops = match host.seal_pack_ops() {
         Ok(ops) => ops,
         Err(e) => {
             tracing::error!(error = %e, "could not read pending package operations");
@@ -2044,18 +2164,69 @@ fn write_atomically(path: &Path, text: &str) -> std::io::Result<()> {
 ///
 /// Problems are collected rather than returned as one error, because one
 /// unusable package must not stop the others from loading.
+/// Something the walk could not use, and the name it had for it.
+///
+/// One record and not two lists, because the name and the reason are two
+/// halves of one fact and the config layer needs the name: a `plugins.<name>`
+/// table naming a package that failed to load still names something real.
+#[derive(Debug)]
+pub struct Problem {
+    /// `None` when the failure belongs to no single package, such as a group
+    /// directory that could not be read at all.
+    pub name: Option<String>,
+    pub error: PluginError,
+}
+
+impl std::fmt::Display for Problem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.error)
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct Discovery {
     pub packages: Vec<DiscoveredPackage>,
-    pub problems: Vec<PluginError>,
+    pub problems: Vec<Problem>,
 }
 
-fn sorted_paths(dir: &Path, problems: &mut Vec<PluginError>) -> Vec<PathBuf> {
+impl Discovery {
+    /// Records a package that was found but cannot load.
+    fn refuse(&mut self, name: String, error: PluginError) {
+        self.problems.push(Problem {
+            name: Some(name),
+            error,
+        });
+    }
+
+    /// Records a failure that names no package.
+    fn note(&mut self, error: PluginError) {
+        self.problems.push(Problem { name: None, error });
+    }
+
+    /// Every package name the walk saw, loadable or not.
+    ///
+    /// This is what a `plugins.<name>` table is validated against. Validating
+    /// against the loadable set instead would turn a package maki itself
+    /// refused into a config error, and blame the user's config for it.
+    pub fn known_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .packages
+            .iter()
+            .map(|package| package.name.clone())
+            .chain(self.problems.iter().filter_map(|p| p.name.clone()))
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+}
+
+fn sorted_paths(dir: &Path, out: &mut Discovery) -> Vec<PathBuf> {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
         Err(source) => {
-            problems.push(PluginError::Io {
+            out.note(PluginError::Io {
                 path: dir.to_path_buf(),
                 source,
             });
@@ -2066,7 +2237,7 @@ fn sorted_paths(dir: &Path, problems: &mut Vec<PluginError>) -> Vec<PathBuf> {
     for entry in entries {
         match entry {
             Ok(entry) => paths.push(entry.path()),
-            Err(source) => problems.push(PluginError::Io {
+            Err(source) => out.note(PluginError::Io {
                 path: dir.to_path_buf(),
                 source,
             }),
@@ -2086,10 +2257,9 @@ pub fn discover_installed(no_plugins: bool) -> Discovery {
     let site = match site_dir() {
         Ok(site) => site,
         Err(source) => {
-            return Discovery {
-                packages: Vec::new(),
-                problems: vec![PluginError::PackageSiteUnavailable { source }],
-            };
+            let mut out = Discovery::default();
+            out.note(PluginError::PackageSiteUnavailable { source });
+            return out;
         }
     };
     discover(&site)
@@ -2102,12 +2272,12 @@ pub fn discover_installed(no_plugins: bool) -> Discovery {
 /// it just means no packages are installed.
 pub fn discover(site: &Path) -> Discovery {
     let mut out = Discovery::default();
-    for group in sorted_paths(&site.join("pack"), &mut out.problems) {
+    for group in sorted_paths(&site.join("pack"), &mut out) {
         if group.file_name().and_then(|n| n.to_str()) == Some(MANAGED_GROUP) {
             continue;
         }
         for (sub, eager) in [("start", true), ("opt", false)] {
-            for dir in sorted_paths(&group.join(sub), &mut out.problems) {
+            for dir in sorted_paths(&group.join(sub), &mut out) {
                 let Some(name) = dir.file_name().and_then(|n| n.to_str()) else {
                     continue;
                 };
@@ -2121,7 +2291,7 @@ pub fn discover(site: &Path) -> Discovery {
                         // A package that cannot even be resolved is reported
                         // rather than silently vanishing, since an unreadable
                         // directory looks identical to one that is not there.
-                        out.problems.push(PluginError::Io { path: dir, source });
+                        out.refuse(name, PluginError::Io { path: dir, source });
                         continue;
                     }
                 };
@@ -2130,23 +2300,33 @@ pub fn discover(site: &Path) -> Discovery {
                 }
 
                 if is_bundled(&name) {
-                    out.problems
-                        .push(PluginError::PackageNameConflict { name, path: root });
+                    out.refuse(
+                        name.clone(),
+                        PluginError::PackageNameConflict { name, path: root },
+                    );
                     continue;
                 }
-                if let Some(prev) = out.packages.iter().find(|p| p.name == name) {
-                    out.problems.push(PluginError::DuplicatePackage {
-                        name,
-                        first: prev.dir.clone(),
-                        second: root,
-                    });
+                let first = out
+                    .packages
+                    .iter()
+                    .find(|p| p.name == name)
+                    .map(|p| p.dir.clone());
+                if let Some(first) = first {
+                    out.refuse(
+                        name.clone(),
+                        PluginError::DuplicatePackage {
+                            name,
+                            first,
+                            second: root,
+                        },
+                    );
                     continue;
                 }
 
                 let requested = match load_requested_permissions(&root) {
                     Ok(requested) => requested,
                     Err(problem) => {
-                        out.problems.push(problem);
+                        out.refuse(name, problem);
                         continue;
                     }
                 };
@@ -2288,16 +2468,162 @@ mod tests {
         );
     }
 
+    fn declared_pack(name: &str, src: &str) -> crate::api::pack::Declared {
+        crate::api::pack::Declared {
+            spec: maki_pack::Spec::new(src).with_name(name),
+            load: crate::api::pack::LoadMode::Eager,
+            confirm: true,
+            data: None,
+        }
+    }
+
     fn declared_named(names: &[&str]) -> Vec<crate::api::pack::Declared> {
         names
             .iter()
-            .map(|n| crate::api::pack::Declared {
-                spec: maki_pack::Spec::new(format!("https://example.com/{n}")).with_name(*n),
-                load: crate::api::pack::LoadMode::Eager,
-                confirm: true,
-                data: None,
-            })
+            .map(|n| declared_pack(n, &format!("https://example.com/{n}")))
             .collect()
+    }
+
+    /// Sets up a site where `name` is installed from `src` at one revision.
+    fn installed_site(name: &str, src: &str) -> (tempfile::TempDir, maki_pack::lockfile::Lockfile) {
+        let site = tempfile::TempDir::new().unwrap();
+        let mut lock = maki_pack::lockfile::Lockfile::default();
+        lock.record(name, src, "abc123");
+        fs::create_dir_all(maki_pack::paths::revision_dir(site.path(), name, "abc123")).unwrap();
+        (site, lock)
+    }
+
+    /// Every pass over a batch has to agree about which operations may run.
+    /// A lock entry proves a managed package exists under a name, not that the
+    /// loaded owner is that one: with an orphan entry beside a hand-installed
+    /// package of the same name, `/packdel!` unloaded the manual package's
+    /// registrations, removed the managed checkout and revoked its approval,
+    /// and nothing brought the manual package back. Not being declared is
+    /// exactly what gets an operation this far, so no later pass can catch it.
+    #[test]
+    fn a_name_held_by_a_manual_package_runs_no_operation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        make_package(tmp.path(), "vendor", "start", "demo");
+        let manual = discover(tmp.path());
+        assert_eq!(
+            manual.packages.len(),
+            1,
+            "the hand-installed package is there"
+        );
+
+        let mut lock = maki_pack::lockfile::Lockfile::default();
+        lock.record("demo", "https://example.com/demo", "abc123");
+
+        // A manifest that stopped parsing does not stop the package from being
+        // the live owner of its name, so the guard has to hold for it too.
+        fs::write(
+            tmp.path()
+                .join("pack/vendor/start/demo")
+                .join("plugin.toml"),
+            "not = valid = toml",
+        )
+        .unwrap();
+        let refused = discover(tmp.path());
+        assert!(refused.packages.is_empty(), "it can no longer be loaded");
+        let mut report = PackReport::default();
+        assert!(
+            runnable_ops(
+                &[crate::api::pack::PackOp::Delete {
+                    name: "demo".to_owned(),
+                    force: true,
+                }],
+                &refused,
+                &lock,
+                &mut report,
+            )
+            .is_empty(),
+            "a package that stopped loading still holds its name"
+        );
+
+        // One at a time: two operations naming one package are refused as a
+        // pair, which would hide whether this guard fired at all.
+        for op in [
+            crate::api::pack::PackOp::Delete {
+                name: "demo".to_owned(),
+                force: true,
+            },
+            crate::api::pack::PackOp::Activate {
+                name: "demo".to_owned(),
+            },
+            crate::api::pack::PackOp::Update {
+                name: "demo".to_owned(),
+                options: Default::default(),
+            },
+        ] {
+            let mut report = PackReport::default();
+            let ops = vec![op.clone()];
+            let runnable = runnable_ops(&ops, &manual, &lock, &mut report);
+
+            assert!(runnable.is_empty(), "{op:?} must not run");
+            assert_eq!(report.failures.len(), 1, "got: {:?}", report.failures);
+            assert!(
+                report.failures[0].contains("conflicts with manual package"),
+                "{op:?}: {}",
+                report.failures[0]
+            );
+        }
+    }
+
+    /// The rule that decides whether installing is a fresh trust decision.
+    /// `.maki/init.lua` is project local, so a repository maki opens can point
+    /// a name the user already trusts somewhere else.
+    #[test]
+    fn a_package_is_only_installed_when_the_recorded_source_matches() {
+        let src = "https://example.com/demo";
+        let (site, lock) = installed_site("demo", src);
+        let manager = maki_pack::manager::Manager::new(site.path());
+
+        assert!(
+            installed_from_declared_source(&declared_pack("demo", src), &lock, &manager),
+            "same name, same source, and on disk"
+        );
+        assert!(
+            !installed_from_declared_source(
+                &declared_pack("demo", "https://elsewhere.example/demo"),
+                &lock,
+                &manager
+            ),
+            "a name pointed at another repository is a new trust decision"
+        );
+    }
+
+    /// A held lock stops an install, but it does not make the packages already
+    /// on disk disappear. Discovery skips the managed group, so reporting none
+    /// left the session with every managed package missing.
+    #[test]
+    fn packages_already_on_disk_resolve_without_git_or_a_lock() {
+        let src = "https://example.com/demo";
+        let (site, lock) = installed_site("demo", src);
+
+        let mut failures = Vec::new();
+        let found = resolved_on_disk(
+            &[declared_pack("demo", src)],
+            site.path(),
+            &lock,
+            &mut failures,
+        );
+        assert_eq!(found.len(), 1, "the installed package is still usable");
+        assert_eq!(found[0].name, "demo");
+        assert_eq!(
+            found[0].dir,
+            maki_pack::paths::revision_dir(site.path(), "demo", "abc123")
+        );
+
+        let moved = resolved_on_disk(
+            &[declared_pack("demo", "https://elsewhere.example/demo")],
+            site.path(),
+            &lock,
+            &mut failures,
+        );
+        assert!(
+            moved.is_empty(),
+            "the recorded revision describes the old source only"
+        );
     }
 
     fn active_set(names: &[&str]) -> std::collections::BTreeSet<String> {
@@ -2696,14 +3022,45 @@ mod tests {
         assert!(err.contains("++ofline"), "{err}");
     }
 
-    /// No name means every declared package, which is what the command's own
-    /// help says and what `:packupdate` does.
+    /// No name means every declared package that is installed, which is what
+    /// the command's own help says and what `:packupdate` does.
     #[test]
-    fn packupdate_without_a_name_plans_every_declared_package() {
+    fn packupdate_without_a_name_plans_every_installed_declared_package() {
         let declared = declared_named(&["alpha", "beta"]);
+        let installed = vec!["alpha".to_owned(), "beta".to_owned()];
         let cmd = PackCommand::parse("/packupdate", "", false).unwrap();
-        let ops = plan_command(&cmd, &declared, &[], &active_set(&[])).unwrap();
+        let ops = plan_command(&cmd, &declared, &installed, &active_set(&[])).unwrap();
         assert_eq!(ops.len(), 2);
+    }
+
+    /// Declining the install prompt has to stick. Applying an update installs
+    /// when there is no lock entry, so planning one for a declared package
+    /// that is not installed let a bare `/packupdate` clone and record the
+    /// source the user had just refused, after which startup saw it as
+    /// installed and never asked again.
+    #[test]
+    fn packupdate_leaves_a_declared_package_that_is_not_installed() {
+        let declared = declared_named(&["alpha", "beta"]);
+        let installed = vec!["alpha".to_owned()];
+        let active = active_set(&[]);
+
+        let ops = plan_command(
+            &PackCommand::parse("/packupdate", "", false).unwrap(),
+            &declared,
+            &installed,
+            &active,
+        )
+        .unwrap();
+        assert_eq!(ops.len(), 1, "only the installed package is updated");
+
+        let err = plan_command(
+            &PackCommand::parse("/packupdate", "beta", false).unwrap(),
+            &declared,
+            &installed,
+            &active,
+        )
+        .expect_err("naming it explicitly is still not an install");
+        assert!(err.contains("beta"), "{err}");
     }
 
     #[test]
@@ -2817,6 +3174,21 @@ mod tests {
         assert!(PackCommand::parse("/packdel", "++all ++offline", false).is_err());
     }
 
+    /// A package maki itself refused is still a name the user can write in
+    /// `plugins.<name>`. Validating a config against the loadable set alone
+    /// turned one bad manifest into a startup failure that blamed the config.
+    #[test]
+    fn a_package_that_cannot_be_read_is_still_a_known_name() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = make_package(tmp.path(), "vendor", "start", "broken");
+        fs::write(dir.join("plugin.toml"), "not = valid = toml").unwrap();
+
+        let found = discover(tmp.path());
+        assert!(found.packages.is_empty(), "the package must not load");
+        assert_eq!(found.problems.len(), 1, "and the reason must be reported");
+        assert_eq!(found.known_names(), vec!["broken".to_owned()]);
+    }
+
     #[test]
     fn missing_site_dir_is_not_a_problem() {
         let found = discover(&PathBuf::from("/definitely/not/here"));
@@ -2872,7 +3244,10 @@ mod tests {
         assert!(found.packages.is_empty());
         assert!(matches!(
             found.problems.as_slice(),
-            [PluginError::PackageNameConflict { .. }]
+            [Problem {
+                error: PluginError::PackageNameConflict { .. },
+                ..
+            }]
         ));
     }
 
@@ -2887,7 +3262,10 @@ mod tests {
         assert!(found.packages.is_empty());
         assert!(matches!(
             found.problems.as_slice(),
-            [PluginError::PackageNameConflict { .. }]
+            [Problem {
+                error: PluginError::PackageNameConflict { .. },
+                ..
+            }]
         ));
     }
 
@@ -2901,7 +3279,10 @@ mod tests {
         assert_eq!(found.packages.len(), 1, "the first one still loads");
         assert!(matches!(
             found.problems.as_slice(),
-            [PluginError::DuplicatePackage { .. }]
+            [Problem {
+                error: PluginError::DuplicatePackage { .. },
+                ..
+            }]
         ));
     }
 

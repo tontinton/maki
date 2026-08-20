@@ -2690,23 +2690,26 @@ fn undeclared_opts_fail_the_load() {
     assert!(err.to_string().contains(UNDECLARED_OPTS_ERR), "got: {err}");
 }
 
+/// A disabled package keeps its options in `opts` but leaves `packages`, which
+/// is exactly the shape `into_config` produces. Treating that as an unknown
+/// name stopped maki from booting over options it was already ignoring, and
+/// only for packages: a disabled builtin in the same state just warned.
 #[test]
-fn opts_for_unknown_plugin_fail_load_builtins() {
+fn opts_for_a_disabled_package_do_not_stop_the_load() {
     let reg = fresh_registry();
     let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    let mut config = PluginsConfig::from_plugins(HashMap::new());
-    config.opts.insert(
-        "bsah".to_owned(),
-        json_obj(serde_json::json!({ "timeout_secs": 5 })),
-    );
-    let err = host
-        .load_builtins(&config)
-        .expect_err("load_builtins should fail");
-    assert!(
-        err.to_string()
-            .contains("plugins.bsah sets options (timeout_secs)"),
-        "got: {err}"
-    );
+    let config = PluginsConfig {
+        enabled: true,
+        names: vec!["grep".to_owned()],
+        packages: Vec::new(),
+        opts: HashMap::from([(
+            "my_pack".to_owned(),
+            json_obj(serde_json::json!({ "timeout_secs": 5 })),
+        )]),
+    };
+    host.load_builtins(&config)
+        .expect("a disabled package must not stop the builtins from loading");
+    assert!(reg.get("grep").is_some(), "enabled plugin still loads");
 }
 
 #[test]
@@ -3863,6 +3866,37 @@ fn packadd_from_a_start_package_activates_an_opt_package() {
         "the activated package must have registered its command"
     );
     assert_eq!(snap.commands[0].name.as_ref(), "/lazy");
+}
+
+/// `maki.packadd` is on the maki table for every plugin, and the runtime
+/// serves it from the activation catalog. Arming that catalog can fail, and
+/// the recording path it falls back to is only read by the startup drain, so
+/// after that drain a call must report rather than queue where nothing looks.
+#[test]
+fn packadd_reports_when_the_activation_catalog_was_never_armed() {
+    let site = site_with_two(("waker_pack", ""), ("lazy_pack", ""));
+    let found = maki_lua::discover(site.path());
+    let (_, config) = discovered_config(&found);
+
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    // Deliberately no `arm_packages`: this is the startup where it failed.
+    assert!(
+        host.load_packages(&found.packages, &config).is_empty(),
+        "the start package must load"
+    );
+    maki_lua::drain_pack_ops(
+        &host,
+        &[],
+        &found.packages,
+        &config,
+        maki_lua::Interaction::None,
+    );
+
+    let err = host
+        .load_source("late_plugin", r#"maki.packadd("lazy_pack")"#)
+        .expect_err("packadd must report once the startup drain is over");
+    assert!(err.to_string().contains("activation catalog"), "got: {err}");
 }
 
 /// A name that matches no installed package is reported. Doing nothing would

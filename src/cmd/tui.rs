@@ -189,7 +189,7 @@ fn load_config(
     plugin_host: &PluginHost,
     cli: &Cli,
     cwd: &Path,
-    packages: &[DiscoveredPackage],
+    names: &[String],
 ) -> Result<Config> {
     let raw_config = plugin_host
         .load_init_files_or_skip(cli.no_plugins, cwd)
@@ -207,9 +207,9 @@ fn load_config(
             .context("read declared packages")?
     };
 
-    let known: Vec<String> = packages
+    let known: Vec<String> = names
         .iter()
-        .map(|p| p.name.clone())
+        .cloned()
         .chain(declared.iter().map(|d| d.spec.name.clone()))
         .collect();
 
@@ -277,6 +277,10 @@ fn build_stack(
     // Discovered before the config is built, so `plugins.<name>` can configure
     // an installed package, and reused afterwards to load it.
     let discovery = maki_lua::discover_installed(cli.no_plugins);
+    // Taken before the problems are consumed, and includes the names
+    // discovery refused, so a package it could not read does not become a
+    // config error pointing at the user's `plugins.<name>` table.
+    let names = discovery.known_names();
     warnings.extend(
         discovery
             .problems
@@ -288,7 +292,7 @@ fn build_stack(
     let (fallback_config, fallback_model) = fallback.unzip();
     let reloading = fallback_model.is_some();
     let (config, config_rejected) = config_or_fallback(
-        load_config(&plugin_host, cli, cwd, &packages),
+        load_config(&plugin_host, cli, cwd, &names),
         fallback_config,
         &mut warnings,
     )?;
@@ -328,6 +332,15 @@ fn build_stack(
             );
             warnings.extend(plugin_host.load_packages(&packages, &config.plugins));
             warnings.push("package changes in the rejected config were not applied".to_owned());
+            // Nothing drains the queue on this path, so it is closed here
+            // instead. Left open, every later `maki.packadd` that the runtime
+            // cannot serve would be recorded for a drain that already decided
+            // not to run.
+            if let Err(error) = plugin_host.seal_pack_ops() {
+                warnings.push(format!(
+                    "could not close the package activation queue: {error}"
+                ));
+            }
         }
         Ok(declared) => {
             let interaction = if cli.print || cli.is_sdk_mode() {

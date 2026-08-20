@@ -108,7 +108,9 @@ const RESTORE_ITEM_TIMEOUT: Duration = Duration::from_secs(60);
 ///
 /// Generous on purpose, for the same reason `RESTORE_ITEM_TIMEOUT` is: a
 /// wrongly killed load costs the user a working plugin.
-const LOAD_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long one load may run before the runtime abandons it.
+pub(crate) const LOAD_TIMEOUT_SECS: u64 = 30;
+const LOAD_TIMEOUT: Duration = Duration::from_secs(LOAD_TIMEOUT_SECS);
 #[cfg(test)]
 struct LoadTimeout(Duration);
 
@@ -257,9 +259,12 @@ pub enum Request {
         change: crate::api::pack::PackChange,
         reply: flume::Sender<()>,
     },
-    /// Takes the operations Lua recorded, leaving the queue empty so the same
-    /// work is never applied twice.
-    TakePackOps {
+    /// Closes the queue and hands over whatever is still in it.
+    ///
+    /// Both halves in one message on purpose: a Lua task can record an
+    /// activation between a read and a separate close, and closing without
+    /// taking would strand it in a queue nobody reads again.
+    SealPackOps {
         reply: flume::Sender<Vec<crate::api::pack::PackOp>>,
     },
     /// Hands the runtime the packages that are installed but not loaded, so it
@@ -3443,14 +3448,15 @@ pub fn spawn(
                         Request::CollectPluginOptions { reply } => {
                             let _ = reply.send(collect_plugin_options(&rt.lua));
                         }
-                        Request::TakePackOps { reply } => {
+                        Request::SealPackOps { reply } => {
                             let ops = rt
                                 .lua
                                 .app_data_ref::<crate::api::pack::PackStore>()
                                 .map(|store| {
-                                    std::mem::take(
-                                        &mut store.lock().expect("pack declarations").pending,
-                                    )
+                                    let mut declarations =
+                                        store.lock().expect("pack declarations");
+                                    declarations.drained = true;
+                                    std::mem::take(&mut declarations.pending)
                                 })
                                 .unwrap_or_default();
                             let _ = reply.send(ops);

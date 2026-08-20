@@ -544,14 +544,14 @@ pub fn models(no_plugins: bool, no_jit: bool) -> Result<()> {
     let host = PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !no_jit)
         .context("initialize lua plugin host")?;
     let discovery = maki_lua::discover_installed(no_plugins);
+    let names = discovery.known_names();
     for problem in discovery.problems {
         eprintln!(
             "warning: {}",
             super::sanitize_warning(format!("skipping package: {problem}"))
         );
     }
-    let packages = discovery.packages;
-    let config = load_effective_config(&host, no_plugins, &cwd, &packages)?;
+    let config = load_effective_config(&host, no_plugins, &cwd, &names)?;
 
     smol::block_on(fetch_all_models(
         &config.provider.model_policy,
@@ -572,7 +572,7 @@ fn load_effective_config(
     host: &PluginHost,
     no_plugins: bool,
     cwd: &Path,
-    packages: &[maki_lua::DiscoveredPackage],
+    names: &[String],
 ) -> Result<Config> {
     let raw = host
         .load_init_files_or_skip(no_plugins, cwd)
@@ -582,9 +582,9 @@ fn load_effective_config(
     } else {
         host.declared_packages().context("read declared packages")?
     };
-    let known: Vec<String> = packages
+    let known: Vec<String> = names
         .iter()
-        .map(|package| package.name.clone())
+        .cloned()
         .chain(declared.into_iter().map(|package| package.spec.name))
         .collect();
     raw.unwrap_or_default()
@@ -600,6 +600,7 @@ pub fn index(path: &str, no_plugins: bool, no_jit: bool) -> Result<()> {
         .context("initialize lua plugin host")?;
 
     let discovery = maki_lua::discover_installed(no_plugins);
+    let names = discovery.known_names();
     for problem in discovery.problems {
         eprintln!(
             "warning: {}",
@@ -618,9 +619,9 @@ pub fn index(path: &str, no_plugins: bool, no_jit: bool) -> Result<()> {
         host.declared_packages().context("read declared packages")?
     };
 
-    let known: Vec<String> = packages
+    let known: Vec<String> = names
         .iter()
-        .map(|p| p.name.clone())
+        .cloned()
         .chain(declared.iter().map(|d| d.spec.name.clone()))
         .collect();
     let mut config = raw_config
@@ -728,6 +729,7 @@ pub fn prompt(
     let mut host =
         PluginHost::with_jit(Arc::clone(reg), !no_jit).context("initialize lua plugin host")?;
     let discovery = maki_lua::discover_installed(no_plugins);
+    let package_names = discovery.known_names();
     for problem in discovery.problems {
         eprintln!(
             "warning: {}",
@@ -745,9 +747,9 @@ pub fn prompt(
     } else {
         host.declared_packages().context("read declared packages")?
     };
-    let known: Vec<String> = packages
+    let known: Vec<String> = package_names
         .iter()
-        .map(|p| p.name.clone())
+        .cloned()
         .chain(declared.iter().map(|d| d.spec.name.clone()))
         .collect();
     let config = raw_config

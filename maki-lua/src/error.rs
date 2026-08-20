@@ -17,14 +17,14 @@ pub enum PluginError {
         #[source]
         source: io::Error,
     },
-    #[error(
-        "plugins.{plugin} sets options ({keys}), but there is no bundled plugin named \"{plugin}\""
-    )]
-    UnknownPluginOptions { plugin: String, keys: String },
     #[error("no bundled plugin named \"{plugin}\" (enabled via plugins.{plugin})")]
     UnknownPlugin { plugin: String },
     #[error("plugin host is not running")]
     HostDead,
+    #[error(
+        "the plugin host is still running background work, so \"{owner}\" could not be loaded or unloaded in time"
+    )]
+    HostBusy { owner: String },
     #[error("package {name} at {path} has no plugin/*.lua entrypoint")]
     PackageEmpty { name: String, path: PathBuf },
     #[error("package file {path} resolves outside its package directory")]

@@ -21,6 +21,34 @@ use maki_agent::prompt::ResolvedSlots;
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// How long a load or an unload waits for the runtime to answer.
+///
+/// Both handlers first wait for in-flight Lua tasks to reach zero, and a plain
+/// `maki.async.run` loop has no deadline and no cancel token, so that wait can
+/// never end. `/packupdate` unloads and reloads an owner after the terminal has
+/// been restored, which turned that into a process hung with no UI and no
+/// message.
+///
+/// Derived from the runtime's own load budget rather than picked: a shorter
+/// deadline would report a load that is still legitimately running as stuck,
+/// and that load would then commit its registrations after its caller had
+/// already treated it as failed.
+const HOST_REPLY_TIMEOUT: Duration = Duration::from_secs(crate::runtime::LOAD_TIMEOUT_SECS + 5);
+
+/// A reply that has not come yet, told apart from one that never can.
+///
+/// A host that is still working is a different fact from a host that has gone,
+/// and reporting the second as the first would send the user looking for a
+/// plugin to stop when there is no host left to stop it in.
+fn reply_failure(error: flume::RecvTimeoutError, owner: &str) -> PluginError {
+    match error {
+        flume::RecvTimeoutError::Timeout => PluginError::HostBusy {
+            owner: owner.to_owned(),
+        },
+        flume::RecvTimeoutError::Disconnected => PluginError::HostDead,
+    }
+}
+
 struct BundledPlugin {
     name: &'static str,
     dir: Dir<'static>,
@@ -360,26 +388,25 @@ impl PluginHost {
 
     fn send_builtin_loads(&self, config: &PluginsConfig) -> Result<(), PluginError> {
         for (plugin, opts) in &config.opts {
-            let keys: Vec<&str> = opts.keys().map(String::as_str).collect();
-            // An installed package may take options too, and its options are
-            // passed when the package itself loads, not here.
-            if config.packages.contains(plugin) {
+            // An enabled package takes its options when the package itself
+            // loads, and an enabled builtin takes them in the loop below.
+            if config.packages.contains(plugin) || config.names.contains(plugin) {
                 continue;
             }
-            if !BUNDLED_PLUGINS.iter().any(|p| p.name == plugin.as_str()) {
-                return Err(PluginError::UnknownPluginOptions {
-                    plugin: plugin.clone(),
-                    keys: keys.join(", "),
-                });
-            }
-            if !config.names.contains(plugin) {
-                tracing::warn!(
-                    plugin = plugin.as_str(),
-                    keys = keys.join(", "),
-                    "plugin is disabled; its plugins.{} options are ignored until re-enabled",
-                    plugin
-                );
-            }
+            // What is left is a name that exists but is not loading: a builtin
+            // or a package the config disabled, or one discovery refused. It
+            // cannot be a typo, because the config layer validated every
+            // `plugins.<name>` key against the same names before this ran. A
+            // package used to reach this as an error, which stopped maki from
+            // starting over options it was already ignoring.
+            let keys: Vec<&str> = opts.keys().map(String::as_str).collect();
+            tracing::warn!(
+                plugin = plugin.as_str(),
+                keys = keys.join(", "),
+                "nothing named {} is loading; its plugins.{} options are ignored",
+                plugin,
+                plugin
+            );
         }
         for builtin in &config.names {
             let dir = match BUNDLED_PLUGINS.iter().find(|p| p.name == builtin.as_str()) {
@@ -426,6 +453,7 @@ impl PluginHost {
         mark_package_active: bool,
     ) -> Result<(), PluginError> {
         let (reply_tx, reply_rx) = flume::bounded(1);
+        let owner = name.to_string();
         self.inner
             .tx
             .send(Request::LoadSource {
@@ -438,7 +466,9 @@ impl PluginHost {
                 reply: reply_tx,
             })
             .map_err(|_| PluginError::HostDead)?;
-        reply_rx.recv().map_err(|_| PluginError::HostDead)?
+        reply_rx
+            .recv_timeout(HOST_REPLY_TIMEOUT)
+            .map_err(|e| reply_failure(e, &owner))?
     }
 
     /// Option specs declared by loaded plugins via `maki.api.register_options`,
@@ -480,7 +510,9 @@ impl PluginHost {
                 reply: reply_tx,
             })
             .map_err(|_| PluginError::HostDead)?;
-        reply_rx.recv().map_err(|_| PluginError::HostDead)?;
+        reply_rx
+            .recv_timeout(HOST_REPLY_TIMEOUT)
+            .map_err(|e| reply_failure(e, plugin))?;
         Ok(())
     }
 
@@ -569,7 +601,9 @@ impl PluginHost {
             .tx
             .send(Request::CollectActivePackages { reply: reply_tx })
             .map_err(|_| PluginError::HostDead)?;
-        reply_rx.recv().map_err(|_| PluginError::HostDead)
+        reply_rx
+            .recv_timeout(HOST_REPLY_TIMEOUT)
+            .map_err(|e| reply_failure(e, "packages"))
     }
 
     #[cfg(test)]
@@ -650,11 +684,16 @@ impl PluginHost {
     ///
     /// Called by the host after the initiating task has exited, which keeps an
     /// unload off the thread that requested it.
-    pub fn take_pending_pack_ops(&self) -> Result<Vec<crate::api::pack::PackOp>, PluginError> {
+    /// Refuses further `maki.packadd` calls, and returns anything the queue
+    /// still holds.
+    ///
+    /// One call and not a read followed by a close, because a Lua task can
+    /// record an activation between the two and closing would strand it.
+    pub fn seal_pack_ops(&self) -> Result<Vec<crate::api::pack::PackOp>, PluginError> {
         let (reply_tx, reply_rx) = flume::bounded(1);
         self.inner
             .tx
-            .send(Request::TakePackOps { reply: reply_tx })
+            .send(Request::SealPackOps { reply: reply_tx })
             .map_err(|_| PluginError::HostDead)?;
         reply_rx.recv().map_err(|_| PluginError::HostDead)
     }
@@ -1039,6 +1078,23 @@ mod tests {
             PluginOpts::default(),
         )
         .expect("an active package must not run twice");
+    }
+
+    /// `/packupdate` unloads and loads an owner after the terminal has been
+    /// restored, and the runtime waits there for in-flight Lua tasks to reach
+    /// zero. A `maki.async.run` loop never lets that happen, so the reply has
+    /// a deadline; a host that is merely busy must say so, because reporting a
+    /// dead host would point the user at the wrong thing entirely.
+    #[test]
+    fn a_slow_reply_and_a_gone_host_are_different_failures() {
+        assert!(matches!(
+            reply_failure(flume::RecvTimeoutError::Timeout, "demo"),
+            PluginError::HostBusy { owner } if owner == "demo"
+        ));
+        assert!(matches!(
+            reply_failure(flume::RecvTimeoutError::Disconnected, "demo"),
+            PluginError::HostDead
+        ));
     }
 
     /// jit=true is exercised by the whole integration suite

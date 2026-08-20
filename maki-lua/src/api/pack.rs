@@ -110,6 +110,13 @@ pub struct PackDeclarations {
     /// `maki.packadd` must record a host operation. `Some` means the runtime
     /// owns activation, including when the catalog is empty.
     pub dormant: Option<Vec<Dormant>>,
+    /// Set once the drain point has taken the pending operations.
+    ///
+    /// Arming the catalog can fail, and then `dormant` stays `None` for the
+    /// rest of the session and every `maki.packadd` records an operation that
+    /// nothing will ever read. This says the queue is closed, whatever the
+    /// catalog did.
+    pub drained: bool,
 }
 
 /// One installed, unloaded package and the triggers that activate it.
@@ -562,6 +569,15 @@ fn enqueue(lua: &Lua, op: PackOp, name: &str) -> LuaResult<()> {
         .ok_or_else(|| mlua::Error::runtime("pack: not available here"))?
         .clone();
     let mut declarations = store.lock().expect("pack declarations");
+    if declarations.drained {
+        return Err(mlua::Error::runtime(
+            "maki.packadd: packages have already been loaded, so it only works \
+             while init.lua and the packages themselves are running",
+        ));
+    }
+    // Two calls naming one package still load it once. The name is checked
+    // against what discovery found when the host drains this, so an unknown
+    // one is reported there rather than guessed at here.
     if !declarations.pending.contains(&op) {
         declarations.pending.push(op);
     }
@@ -890,6 +906,12 @@ pub(crate) fn add_packadd(
                 let state = {
                     let mut declarations = store.lock().expect("pack declarations");
                     let Some(dormant) = declarations.dormant.as_ref() else {
+                        if declarations.drained {
+                            return Err(mlua::Error::runtime(format!(
+                                "packadd: package {name:?} cannot be activated, because \
+                                 startup could not build the activation catalog"
+                            )));
+                        }
                         let operation = PackOp::Activate { name };
                         if !declarations.pending.contains(&operation) {
                             declarations.pending.push(operation);
@@ -1338,6 +1360,30 @@ mod tests {
         function.call::<()>("demo").unwrap();
 
         assert_eq!(store.lock().unwrap().pending.len(), 1);
+    }
+
+    /// The recording path is only read by the startup drain. Arming the
+    /// activation catalog can fail, and then every later `packadd` lands here,
+    /// so it has to report rather than queue where nothing will look.
+    #[test]
+    fn packadd_after_the_drain_is_refused() {
+        let (lua, store) = lua_with_store();
+        let maki = lua.create_table().unwrap();
+        add_packadd(&lua, &maki, None).unwrap();
+        store.lock().unwrap().drained = true;
+
+        let f: mlua::Function = maki.get("packadd").expect("packadd should be registered");
+        let err = f
+            .call::<()>("demo")
+            .expect_err("nothing reads the queue after the drain");
+        assert!(
+            err.to_string().contains("already been loaded"),
+            "got: {err}"
+        );
+        assert!(
+            store.lock().unwrap().pending.is_empty(),
+            "a refused call must not leave a request behind"
+        );
     }
 
     #[test]
