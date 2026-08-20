@@ -192,9 +192,23 @@ impl CommandCode {
         if response.status().as_u16() == 200 {
             parse_sse(response, event_tx, self.stream_timeout).await
         } else {
-            Err(AgentError::from_response(response).await)
+            Err(api_error(response).await)
         }
     }
+}
+
+/// Command Code reports HTTP failures as
+/// `{"success":false,"error":{"code","status","message"}}`. Lifting the message
+/// out keeps a plan or quota refusal readable — "MODEL_NOT_IN_PLAN: ..." rather
+/// than a wall of JSON the user has to parse by eye.
+async fn api_error(mut response: isahc::Response<isahc::AsyncBody>) -> AgentError {
+    let status = response.status().as_u16();
+    let body = response.text().await.unwrap_or_default();
+    let message = serde_json::from_str::<Value>(&body)
+        .ok()
+        .and_then(|v| Some(v.pointer("/error/message")?.as_str()?.to_string()))
+        .unwrap_or(body);
+    AgentError::Api { status, message }
 }
 
 /// Command Code groups requests server-side by project. The reference client
@@ -540,10 +554,15 @@ async fn parse_sse(
                     message,
                 });
             }
-            // reasoning-start/reasoning-end/tool-result carry no content maki
-            // needs; the block boundaries are implied by the deltas. Anything
-            // else is logged, not dropped silently: the protocol is
-            // reverse-engineered and may grow events that matter.
+            // Everything the live stream also emits, none of it load-bearing
+            // here: block boundaries are implied by the deltas, the assembled
+            // `tool-call` supersedes the `tool-input-*` fragments that precede
+            // it, and `finish-step` reports per-step usage that `finish`
+            // totals. Listing them keeps the log below meaningful — an event
+            // that reaches it is genuinely one this parser has never seen.
+            "start" | "start-step" | "finish-step" | "text-start" | "text-end"
+            | "reasoning-start" | "reasoning-end" | "tool-input-start" | "tool-input-delta"
+            | "tool-input-end" | "tool-result" | "provider-metadata" => {}
             other => debug!(event = other, "unhandled Command Code stream event"),
         }
     }
@@ -591,7 +610,7 @@ impl Provider for CommandCode {
         Box::pin(async move {
             let mut response = client.send_async(request?).await?;
             if response.status().as_u16() != 200 {
-                return Err(AgentError::from_response(response).await);
+                return Err(api_error(response).await);
             }
             super::parse_models(&response.text().await?)
         })
@@ -796,6 +815,86 @@ mod tests {
         );
         assert!(id.chars().all(|c| c.is_ascii_hexdigit() || c == '-'));
         assert_ne!(thread_id(), thread_id());
+    }
+
+    #[test]
+    fn live_event_vocabulary_is_all_accounted_for() {
+        // Every event type observed from api.commandcode.ai on text, tool-call
+        // and reasoning turns. A new one here means the protocol moved.
+        let sse = concat!(
+            "{\"type\":\"start\"}\n",
+            "{\"type\":\"start-step\",\"warnings\":[]}\n",
+            "{\"type\":\"reasoning-start\",\"id\":\"reasoning-0\"}\n",
+            "{\"type\":\"reasoning-delta\",\"id\":\"reasoning-0\",\"text\":\"hmm\"}\n",
+            "{\"type\":\"reasoning-end\",\"id\":\"reasoning-0\"}\n",
+            "{\"type\":\"text-start\",\"id\":\"txt-0\"}\n",
+            "{\"type\":\"text-delta\",\"id\":\"txt-0\",\"text\":\"OK\"}\n",
+            "{\"type\":\"text-end\",\"id\":\"txt-0\"}\n",
+            "{\"type\":\"tool-input-start\",\"id\":\"c1\",\"toolName\":\"bash\"}\n",
+            "{\"type\":\"tool-input-delta\",\"id\":\"c1\",\"delta\":\"{\\\"command\\\":\"}\n",
+            "{\"type\":\"tool-input-end\",\"id\":\"c1\"}\n",
+            "{\"type\":\"tool-call\",\"toolCallId\":\"c1\",\"toolName\":\"bash\",",
+            "\"input\":{\"command\":\"ls /tmp\"}}\n",
+            "{\"type\":\"finish-step\",\"finishReason\":\"tool-calls\"}\n",
+            "{\"type\":\"finish\",\"finishReason\":\"tool-calls\",\"totalUsage\":",
+            "{\"inputTokens\":117,\"inputTokenDetails\":{\"noCacheTokens\":117,\"cacheReadTokens\":0},",
+            "\"outputTokens\":36,\"totalTokens\":153}}\n",
+        );
+        let response = isahc::Response::builder()
+            .status(200)
+            .body(isahc::AsyncBody::from(sse))
+            .unwrap();
+        let (tx, rx) = flume::unbounded();
+        let result = smol::block_on(parse_sse(response, &tx, Duration::from_secs(5))).unwrap();
+        drop(tx);
+
+        assert_eq!(result.stop_reason, Some(StopReason::ToolUse));
+        // The streaming tool-input fragments must not become a second call.
+        assert_eq!(result.message.content.len(), 3);
+        assert!(matches!(
+            &result.message.content[0],
+            ContentBlock::Thinking { thinking, .. } if thinking == "hmm"
+        ));
+        assert!(matches!(
+            &result.message.content[1],
+            ContentBlock::Text { text } if text == "OK"
+        ));
+        assert!(matches!(
+            &result.message.content[2],
+            ContentBlock::ToolUse { id, name, input, .. }
+                if id == "c1" && name == "bash" && input["command"] == "ls /tmp"
+        ));
+        // Real payloads carry noCacheTokens, so the subtraction never runs.
+        assert_eq!(result.usage.input, 117);
+        assert_eq!(result.usage.output, 36);
+        assert_eq!(rx.len(), 3);
+    }
+
+    #[test]
+    fn http_errors_surface_the_message_not_the_envelope() {
+        // Verbatim 403 body from api.commandcode.ai for an out-of-plan model.
+        let body = r#"{"success":false,"error":{"code":"FORBIDDEN","status":403,"message":"MODEL_NOT_IN_PLAN: Gemini 3.5 Flash Lite available in Pro and above plans"}}"#;
+        let response = isahc::Response::builder()
+            .status(403)
+            .body(isahc::AsyncBody::from(body))
+            .unwrap();
+        let err = smol::block_on(api_error(response));
+        assert!(matches!(err, AgentError::Api { status: 403, .. }));
+        assert_eq!(
+            err.to_string(),
+            "API error (403): MODEL_NOT_IN_PLAN: Gemini 3.5 Flash Lite available in Pro and above plans"
+        );
+
+        // A body that is not the documented envelope still reaches the user.
+        let response = isahc::Response::builder()
+            .status(502)
+            .body(isahc::AsyncBody::from("upstream down"))
+            .unwrap();
+        assert!(
+            smol::block_on(api_error(response))
+                .to_string()
+                .contains("upstream down")
+        );
     }
 
     #[test]
