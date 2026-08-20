@@ -30,6 +30,10 @@ const NUDGE_PROMPT: &str = "You just executed tool calls but returned an empty r
 /// A model that stalls once often stalls again on the retry, so it gets a
 /// second chance before the turn ends empty handed.
 const MAX_NUDGES: u32 = 2;
+/// Without this note a cancelled reply replays in history as a finished
+/// turn, and a model resuming its own cut-off text can wedge the session
+/// (seen with llama.cpp stuck on an unterminated tool call).
+const CANCELLED_TEXT_NOTE: &str = "[Response cut off by user cancel]";
 
 pub fn resolve_compaction_model(
     provider: &Arc<dyn Provider>,
@@ -295,10 +299,13 @@ impl<'h> Agent<'h> {
                 r
             }
             Err(StreamError::Cancelled { streamed }) => {
-                if !streamed.trim().is_empty() {
+                let streamed = streamed.trim_end();
+                if !streamed.is_empty() {
                     self.history.push(Message {
                         role: Role::Assistant,
-                        content: vec![ContentBlock::Text { text: streamed }],
+                        content: vec![ContentBlock::Text {
+                            text: format!("{streamed}\n\n{CANCELLED_TEXT_NOTE}"),
+                        }],
                         ..Default::default()
                     });
                 }
@@ -1168,7 +1175,11 @@ mod tests {
             let messages = history.as_slice();
             let partial = &messages[messages.len() - 2];
             assert!(matches!(partial.role, Role::Assistant));
-            assert!(matches!(&partial.content[0], ContentBlock::Text { text } if text == PARTIAL));
+            let expected = format!("{PARTIAL}\n\n{CANCELLED_TEXT_NOTE}");
+            assert!(
+                matches!(&partial.content[0], ContentBlock::Text { text } if *text == expected),
+                "kept text must carry the truncation note so the model never resumes it"
+            );
         });
     }
 
@@ -1208,10 +1219,12 @@ mod tests {
 
             assert_ends_with_cancel_marker(&history);
             assert!(
-                history.as_slice().iter().all(|m| !m
-                    .content
+                history
+                    .as_slice()
                     .iter()
-                    .any(|b| matches!(b, ContentBlock::Text { text } if text == PARTIAL))),
+                    .all(|m| !m.content.iter().any(
+                        |b| matches!(b, ContentBlock::Text { text } if text.contains(PARTIAL))
+                    )),
                 "failed attempt's text must not reach history"
             );
         });
