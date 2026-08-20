@@ -1,4 +1,5 @@
 local M = {}
+local SKILL_MARKER_PREFIX = "$skill:"
 
 function M.parse_frontmatter(content)
   local rest = content:match("^%s*%-%-%-\n(.*)")
@@ -44,7 +45,7 @@ function M.build_skill_list(skills)
 end
 
 function M.build_picker_items(skills)
-  local sorted = skills[1] and skills or M.sorted_skills(skills)
+  local sorted = M.sorted_skills(skills)
   local items = {}
   for _, skill in ipairs(sorted) do
     items[#items + 1] = {
@@ -52,15 +53,15 @@ function M.build_picker_items(skills)
       detail = skill.description ~= "" and skill.description or nil,
     }
   end
-  return items
+  return items, sorted
 end
 
 function M.build_skill_marker(skill_name, suffix)
   local trimmed_suffix = (suffix or ""):match("^%s*(.-)%s*$")
   if trimmed_suffix == "" then
-    return "$" .. skill_name .. " "
+    return SKILL_MARKER_PREFIX .. skill_name .. " "
   end
-  return "$" .. skill_name .. " " .. trimmed_suffix
+  return SKILL_MARKER_PREFIX .. skill_name .. " " .. trimmed_suffix
 end
 
 return M

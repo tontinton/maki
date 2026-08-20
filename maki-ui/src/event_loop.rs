@@ -39,7 +39,7 @@ use crate::agent::{AgentCommand, AgentHandles, ModelSlot, shared_queue::QueueIte
 use crate::app::shell::{ShellEvent, spawn_shell};
 use crate::app::{App, Msg, QueuedMessage, SubmitOutcome};
 use crate::color_compat;
-use crate::components::input::Submission;
+use crate::components::input::{InputAction, Submission};
 use crate::components::usage_modal::UsageFetchState;
 use crate::components::{Action, ExitRequest, Status};
 use crate::input::InputReader;
@@ -590,9 +590,9 @@ impl<'t> EventLoop<'t> {
             }
             UiAction::InsertInput(text) => {
                 let app = self.focused_app();
-                app.input_box.buffer.insert_text(&text);
-                let value = app.input_box.buffer.value();
-                app.command_palette.sync(&value);
+                if let InputAction::PaletteSync(value) = app.input_box.handle_paste(&text) {
+                    app.command_palette.sync(&value);
+                }
             }
             UiAction::OpenEditor { path, reply_tx } => {
                 let code = self.open_editor(self.focused, &path);

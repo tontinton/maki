@@ -134,11 +134,11 @@ end
 
 local boot_skills = discover_skills()
 local description = "Load a skill that provides instructions and workflows for specific tasks."
+  .. " If the user writes $skill:name in their message, load the skill named name first."
   .. build_skill_list(boot_skills)
 
 local function open_skill_picker(skills)
-  local sorted = helpers.sorted_skills(skills)
-  local items = build_picker_items(sorted)
+  local items, sorted = build_picker_items(skills)
   if #items == 0 then
     maki.ui.flash("No skills available")
     return nil
@@ -231,16 +231,22 @@ maki.api.register_tool({
   end,
 })
 
+local function insert_skill_marker(suffix)
+  local skill = open_skill_picker(discover_skills())
+  if skill then
+    maki.ui.insert_input(build_skill_marker(skill.name, suffix))
+  end
+end
+
 maki.api.register_command({
   name = "/skill",
-  description = "Pick a skill and insert a visible $skill marker into the prompt",
+  description = "Pick a skill and insert a visible $skill:name marker into the prompt",
   nargs = "*",
   handler = function(opts)
-    local skill = open_skill_picker(discover_skills())
-    if not skill then
-      return
-    end
-
-    maki.ui.insert_input(build_skill_marker(skill.name, opts.args))
+    insert_skill_marker(opts.args)
   end,
 })
+
+maki.keymap.set("n", "<M-s>", function()
+  insert_skill_marker()
+end, { desc = "Insert skill marker" })

@@ -114,6 +114,17 @@ case("build_picker_items_sorted_alphabetically", function()
   eq(items[2].label, "zebra")
 end)
 
+case("build_picker_items_sorts_array_input", function()
+  local items, sorted = build_picker_items({
+    { name = "zebra", description = "Z skill" },
+    { name = "alpha", description = "A skill" },
+  })
+  eq(items[1].label, "alpha")
+  eq(sorted[1].name, "alpha")
+  eq(items[2].label, "zebra")
+  eq(sorted[2].name, "zebra")
+end)
+
 case("build_picker_items_omits_empty_detail", function()
   local items = build_picker_items({
     x = { name = "xray", description = "" },
@@ -122,15 +133,15 @@ case("build_picker_items_omits_empty_detail", function()
 end)
 
 case("build_skill_marker_without_suffix", function()
-  eq(build_skill_marker("release"), "$release ")
+  eq(build_skill_marker("release"), "$skill:release ")
 end)
 
 case("build_skill_marker_with_suffix", function()
-  eq(build_skill_marker("release", "cut v1.2.3"), "$release cut v1.2.3")
+  eq(build_skill_marker("release", "cut v1.2.3"), "$skill:release cut v1.2.3")
 end)
 
 case("build_skill_marker_trims_blank_suffix", function()
-  eq(build_skill_marker("release", "   "), "$release ")
+  eq(build_skill_marker("release", "   "), "$skill:release ")
 end)
 
 -- ── builtin plugin_dev skill ──

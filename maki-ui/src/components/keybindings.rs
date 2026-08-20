@@ -155,11 +155,6 @@ pub mod key {
         modifiers: KeyModifiers::ALT,
         label: "Alt+O",
     };
-    pub const SKILL_PICKER: Bind = Bind {
-        code: KeyCode::Char('s'),
-        modifiers: KeyModifiers::ALT,
-        label: "Alt+S",
-    };
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, EnumIter)]
@@ -464,12 +459,6 @@ pub const KEYBINDS: &[Keybind] = &[
     Keybind {
         label: KeyLabel::Single(key::EDIT_INPUT.label),
         description: "Edit input in external editor",
-        context: KeybindContext::Editing,
-        platform: Platform::All,
-    },
-    Keybind {
-        label: KeyLabel::Single(key::SKILL_PICKER.label),
-        description: "Insert skill marker",
         context: KeybindContext::Editing,
         platform: Platform::All,
     },

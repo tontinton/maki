@@ -4,6 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crossterm::event::{KeyCode, KeyModifiers};
 use maki_agent::ToolOutput;
 use maki_agent::tools::{
     DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool, ToolContext,
@@ -2659,6 +2660,19 @@ fn sessions_plugin_registers_commands() {
         "missing /sessions in {names:?}"
     );
     assert!(names.contains(&"/rename"), "missing /rename in {names:?}");
+}
+
+#[test]
+fn skill_plugin_registers_alt_s_keymap() {
+    let (_reg, host) = builtins_host();
+    let snap = host.keymap_reader().load();
+    let entry = snap
+        .entries
+        .iter()
+        .find(|entry| entry.key == KeyCode::Char('s') && entry.modifiers == KeyModifiers::ALT)
+        .expect("missing Alt+S skill keymap");
+    assert_eq!(entry.plugin.as_ref(), "skill");
+    assert_eq!(entry.desc, "Insert skill marker");
 }
 
 #[test]
