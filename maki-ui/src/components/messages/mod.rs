@@ -46,6 +46,7 @@ use ratatui::text::{Line, Span};
 use tracing::warn;
 
 const THINKING_HIDDEN_HEADER: &str = "thinking> ...";
+const REFLOW_MARGIN_VIEWPORTS: u32 = 1;
 
 #[derive(Clone, Copy)]
 pub struct PromptProgress {
@@ -750,7 +751,7 @@ impl MessagesPanel {
         }
 
         if width_changed {
-            self.cache.invalidate_from_msg_count();
+            self.cache.mark_all_width_stale();
             let thinking = thinking_style();
             let assistant = assistant_style();
             self.streaming_thinking.set_style(
@@ -801,20 +802,13 @@ impl MessagesPanel {
             streaming_heights.push(wrapped_line_count(lines, width));
         }
 
-        let cached_height = self.cache.total_height(width);
         let streaming_sum: u32 = streaming_heights.iter().map(|&h| h as u32).sum();
-        let total_lines: u16 = (cached_height + streaming_sum).min(u16::MAX as u32) as u16;
-        self.last_total_lines = total_lines;
-        let max_scroll = total_lines.saturating_sub(self.viewport_height);
-        self.scroll_top = self.scroll_top.min(max_scroll);
-        if !has_selection {
-            if self.scroll_top >= max_scroll {
-                self.auto_scroll = true;
-            }
-            if self.auto_scroll {
-                self.scroll_top = max_scroll;
-            }
-        }
+        // The reflow window is picked from `scroll_top` and the bottom pin,
+        // and the reflow changes the heights both are derived from: resolve
+        // before to aim the window, and after to place the result.
+        self.resolve_scroll(width, streaming_sum, has_selection);
+        self.reflow_viewport(width);
+        let total_lines = self.resolve_scroll(width, streaming_sum, has_selection);
 
         let viewport = Rect::new(area.x, area.y, width, area.height);
         let mut cursor = RenderCursor::new(self.scroll_top, viewport);
@@ -1306,62 +1300,141 @@ impl MessagesPanel {
                         .push(Segment::with_lines(lines, search_text, Some(i)));
                     continue;
                 }
-                let style = match &msg.role {
-                    DisplayRole::User => user_style(),
-                    DisplayRole::Assistant => assistant_style(),
-                    DisplayRole::Thinking => thinking_style(),
-                    DisplayRole::Error => error_style(),
-                    DisplayRole::Done => done_style(),
-                    DisplayRole::Tool(_) => unreachable!(),
-                };
-                let prefix = if msg.plan_path.is_some() {
-                    ""
-                } else {
-                    style.prefix
-                };
-                let mut lines = if style.use_markdown {
-                    text_to_lines(
-                        &msg.text,
-                        prefix,
-                        style.text_style,
-                        style.prefix_style,
-                        self.viewport_width,
-                        style.max_line_bytes,
-                    )
-                } else {
-                    plain_lines(&msg.text, prefix, style.text_style, style.prefix_style)
-                };
-                if let Some(pp) = &msg.plan_path {
-                    if !msg.text.is_empty() {
-                        let rule = hr_line(self.viewport_width, theme::current().plan_rule);
-                        lines.insert(0, rule.clone());
-                        lines.push(rule);
-                    } else {
-                        lines.clear();
-                    }
-                    if !msg.text.is_empty() {
-                        lines.push(Line::from(""));
-                    }
-                    lines.push(Line::from(Span::styled(
-                        pp.to_owned(),
-                        theme::current().plan_path,
-                    )));
-                    lines.push(Line::from(Span::styled(
-                        format!(
-                            "{} to open in editor ($VISUAL / $EDITOR)",
-                            key::OPEN_EDITOR.label
-                        ),
-                        theme::current().tool_dim,
-                    )));
-                }
-
-                let search_text = format!("{prefix}{}", msg.text);
+                let (lines, search_text) = build_message_lines(msg, self.viewport_width);
                 self.cache.push_spacer_if_needed();
                 self.cache
                     .push(Segment::with_lines(lines, search_text, Some(i)));
             }
         }
         self.cache.mark_built(self.messages.len());
+    }
+
+    /// Clamps `scroll_top` against the document height and applies the bottom
+    /// pin, returning the total the scrollbar draws from.
+    fn resolve_scroll(&mut self, width: u16, streaming_sum: u32, has_selection: bool) -> u16 {
+        let total_lines: u16 =
+            (self.cache.total_height(width) + streaming_sum).min(u16::MAX as u32) as u16;
+        self.last_total_lines = total_lines;
+        let max_scroll = total_lines.saturating_sub(self.viewport_height);
+        self.scroll_top = self.scroll_top.min(max_scroll);
+        if !has_selection {
+            if self.scroll_top >= max_scroll {
+                self.auto_scroll = true;
+            }
+            if self.auto_scroll {
+                self.scroll_top = max_scroll;
+            }
+        }
+        total_lines
+    }
+
+    /// Re-lays out the stale segments the viewport plus its margin reaches,
+    /// keeping the topmost visible one pinned: `scroll_top` is a line offset,
+    /// so re-laying out anything above the viewport would slide the content
+    /// the reader is looking at.
+    ///
+    /// The window is walked outward from an anchor segment, counting heights
+    /// only after each segment is reflowed. Document offsets move as the
+    /// reflow runs, so a window expressed in them would need repeated passes
+    /// to settle; this one is right the first time.
+    fn reflow_viewport(&mut self, width: u16) {
+        let anchor = (!self.auto_scroll)
+            .then(|| self.cache.anchor_at(self.scroll_top as u32, width))
+            .flatten();
+        let viewport = self.viewport_height as u32;
+        let margin = viewport.saturating_mul(REFLOW_MARGIN_VIEWPORTS);
+        let below = viewport.saturating_add(margin);
+        // Pinned to the bottom (or scrolled into the streaming tail): the
+        // viewport is the last `below` lines, so the window is all above.
+        let (start, above) = match anchor {
+            Some((i, _)) => (i, margin),
+            None => (self.cache.len().saturating_sub(1), below),
+        };
+        let len_before = self.cache.len();
+
+        let mut acc = 0;
+        let mut i = start;
+        while i < self.cache.len() && acc < below {
+            acc += self.reflowed_height(i, width);
+            i += 1;
+        }
+        let mut acc = 0;
+        let mut i = start;
+        while i > 0 && acc < above {
+            i -= 1;
+            acc += self.reflowed_height(i, width);
+        }
+
+        // A rebuild can insert a missing instruction segment, which shifts the
+        // anchor index. Rare enough to just skip the pin for one frame.
+        if let Some(anchor) = anchor
+            && self.cache.len() == len_before
+        {
+            self.scroll_top = self.cache.anchor_offset(anchor, width).min(u16::MAX as u32) as u16;
+        }
+    }
+
+    /// Reflows `seg_idx` if it is stale, then reports the height it draws at.
+    fn reflowed_height(&mut self, seg_idx: usize, width: u16) -> u32 {
+        // A tool segment and its instruction segment both map back to the
+        // same parent, and one `rebuild_tool_segment` clears both flags.
+        // Re-check so the parent is not rebuilt twice.
+        if self.cache.get(seg_idx).is_some_and(|s| s.stale) {
+            self.reflow_segment(seg_idx, width);
+        }
+        self.cache
+            .get(seg_idx)
+            .map_or(0, |s| s.height(width) as u32)
+    }
+
+    fn reflow_segment(&mut self, seg_idx: usize, width: u16) {
+        // Clear up front so a reflow that bails early (message gone, empty
+        // instructions) costs one frame of old-width lines instead of
+        // retrying forever.
+        let Some(seg) = self.cache.get_mut(seg_idx) else {
+            return;
+        };
+        seg.stale = false;
+        let (tool_id, msg_idx) = (seg.tool_id.clone(), seg.msg_index);
+
+        if let Some(tid) = tool_id {
+            let parent = segment::instruction_parent(&tid)
+                .map(str::to_string)
+                .unwrap_or(tid);
+            self.rebuild_tool_segment(&parent);
+            return;
+        }
+
+        let Some(msg_idx) = msg_idx else {
+            return;
+        };
+
+        let collapsed = self
+            .messages
+            .get(msg_idx)
+            .is_some_and(|m| matches!(m.role, DisplayRole::Thinking) && m.thinking_collapsed);
+        if collapsed {
+            // Geometry is width-independent, but `width_changed` also fires on
+            // theme changes; rebuild so spans pick up the new palette.
+            self.rebuild_thinking_segment(msg_idx, width);
+        } else {
+            self.reflow_text_segment(seg_idx, width);
+        }
+    }
+
+    fn reflow_text_segment(&mut self, seg_idx: usize, width: u16) {
+        let Some(msg_idx) = self.cache.get(seg_idx).and_then(|s| s.msg_index) else {
+            return;
+        };
+        let Some(msg) = self.messages.get(msg_idx) else {
+            return;
+        };
+        let (lines, search_text) = build_message_lines(msg, width);
+        let Some(seg) = self.cache.get_mut(seg_idx) else {
+            return;
+        };
+        seg.set_lines(lines);
+        seg.search_text = search_text;
     }
 }
 
@@ -1385,4 +1458,61 @@ fn logical_line_count(text: &str) -> usize {
     } else {
         text.bytes().filter(|&b| b == b'\n').count() + 1
     }
+}
+
+/// Builds ratatui lines for a non-Tool, non-collapsed-Thinking message at the
+/// given width, returning the lines and search text. Shared by
+/// `rebuild_line_cache` (new messages) and `reflow_text_segment` (stale-on-resize
+/// messages) so both paths produce identical segments.
+fn build_message_lines(msg: &DisplayMessage, width: u16) -> (Vec<Line<'static>>, String) {
+    let style = match &msg.role {
+        DisplayRole::User => user_style(),
+        DisplayRole::Assistant => assistant_style(),
+        DisplayRole::Thinking => thinking_style(),
+        DisplayRole::Error => error_style(),
+        DisplayRole::Done => done_style(),
+        DisplayRole::Tool(_) => unreachable!(),
+    };
+    let prefix = if msg.plan_path.is_some() {
+        ""
+    } else {
+        style.prefix
+    };
+    let mut lines = if style.use_markdown {
+        text_to_lines(
+            &msg.text,
+            prefix,
+            style.text_style,
+            style.prefix_style,
+            width,
+            style.max_line_bytes,
+        )
+    } else {
+        plain_lines(&msg.text, prefix, style.text_style, style.prefix_style)
+    };
+    if let Some(pp) = &msg.plan_path {
+        if !msg.text.is_empty() {
+            let rule = hr_line(width, theme::current().plan_rule);
+            lines.insert(0, rule.clone());
+            lines.push(rule);
+        } else {
+            lines.clear();
+        }
+        if !msg.text.is_empty() {
+            lines.push(Line::from(""));
+        }
+        lines.push(Line::from(Span::styled(
+            pp.to_owned(),
+            theme::current().plan_path,
+        )));
+        lines.push(Line::from(Span::styled(
+            format!(
+                "{} to open in editor ($VISUAL / $EDITOR)",
+                key::OPEN_EDITOR.label
+            ),
+            theme::current().tool_dim,
+        )));
+    }
+    let search_text = format!("{prefix}{}", msg.text);
+    (lines, search_text)
 }

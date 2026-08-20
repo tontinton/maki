@@ -1900,3 +1900,340 @@ fn stream_reset_clears_thinking_expand_state() {
         "new stream must stay hidden; got: {text}"
     );
 }
+
+#[test]
+fn stale_height_keeps_the_old_width_but_drawn_height_does_not() {
+    let long_line = Line::from("x".repeat(80));
+    let mut seg = Segment::with_lines(vec![long_line.clone()], "test".into(), None);
+
+    let h_wide = seg.height(80);
+    assert_eq!(h_wide, 1, "80 chars at width 80 fits on one line");
+
+    // Keeping the old height is what keeps a resize cheap: the document
+    // layout stays put until the segment is really reflowed.
+    seg.stale = true;
+    assert_eq!(
+        seg.height(40),
+        h_wide,
+        "stale segment should return old cached height, not recompute"
+    );
+    // Callers that re-wrap the lines themselves need the real number.
+    assert_eq!(
+        seg.drawn_height(40),
+        2,
+        "drawn_height must report what the lines really take at the new width"
+    );
+
+    seg.set_lines(vec![long_line]);
+    assert_eq!(seg.height(40), 2, "80 chars at width 40 wraps to two lines");
+}
+
+#[test]
+fn copy_after_resize_keeps_offscreen_text() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    let body = "x".repeat(60);
+    for i in 0..30 {
+        panel.push(DisplayMessage::new(
+            DisplayRole::Assistant,
+            format!("m{i:02}{body}"),
+        ));
+    }
+    render(&mut panel, 80, 10);
+    render(&mut panel, 40, 10);
+
+    let total: u32 = panel.segment_heights().iter().map(|&h| h as u32).sum();
+    let area = Rect::new(0, 0, 40, 10);
+    let sel = make_sel(area, (0, 0), (total - 1, 39));
+    let text = panel.extract_selection_text(&sel, area);
+
+    // The top of the transcript is far off-screen and never gets reflowed.
+    // Selection sizes its buffer from `height` and then re-wraps, so a height
+    // measured at the old width would clip every line it copies.
+    assert!(
+        text.contains(&format!("m00{body}")),
+        "off-screen message was truncated in the copy: {text:?}"
+    );
+}
+
+#[test]
+fn resize_reflows_only_viewport_segments() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    // 30 messages, each ~60 chars beyond the label — enough to exceed
+    // viewport (10) + reflow margin (1 * 10 = 10 lines) so top segments
+    // stay out of the reflow range when auto-scrolled to the bottom.
+    for i in 0..30 {
+        panel.push(DisplayMessage::new(
+            DisplayRole::Assistant,
+            format!("message {i:02} {}", "x".repeat(60)),
+        ));
+    }
+    render(&mut panel, 80, 10);
+    let seg_count_before = panel.cache.len();
+    assert!(seg_count_before > 0);
+
+    render(&mut panel, 40, 10);
+
+    // Cache preserved — no nuke
+    assert_eq!(
+        panel.cache.len(),
+        seg_count_before,
+        "resize must not clear the segment cache"
+    );
+
+    let segs = panel.cache.segments();
+
+    // Bottom segments (near the auto-scrolled viewport) are reflowed
+    let bottom_fresh = segs
+        .iter()
+        .filter(|s| s.msg_index.is_some())
+        .rev()
+        .take(5)
+        .all(|s| !s.stale);
+    assert!(
+        bottom_fresh,
+        "viewport segments should be reflowed to new width"
+    );
+
+    // Top segments (far above the viewport) remain width-stale
+    let top_stale = segs
+        .iter()
+        .filter(|s| s.msg_index.is_some())
+        .take(5)
+        .all(|s| s.stale);
+    assert!(
+        top_stale,
+        "off-viewport segments should stay width-stale after resize"
+    );
+}
+
+fn msg_seg_text(panel: &MessagesPanel, msg_idx: usize) -> String {
+    panel
+        .cache
+        .segments()
+        .iter()
+        .find(|s| s.msg_index == Some(msg_idx) && s.tool_id.is_none())
+        .unwrap()
+        .lines()
+        .iter()
+        .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+        .collect()
+}
+
+#[test]
+fn reflow_rebuilds_collapsed_thinking_instead_of_only_stamping() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.show_thinking = false;
+    let mut m = DisplayMessage::new(DisplayRole::Thinking, "one\ntwo".to_string());
+    m.thinking_collapsed = true;
+    panel.push(m);
+    render(&mut panel, 80, 10);
+    assert!(
+        msg_seg_text(&panel, 0).contains("(2 lines)"),
+        "indicator should report the initial line count"
+    );
+
+    // Change what the indicator renders, then mark it stale the way a theme
+    // change does. Clearing the flag without rebuilding keeps the old spans.
+    panel.messages[0].text = "one\ntwo\nthree\nfour".to_string();
+    panel.cache.mark_all_width_stale();
+    render(&mut panel, 80, 10);
+
+    assert!(
+        msg_seg_text(&panel, 0).contains("(4 lines)"),
+        "stale collapsed-thinking segment must be rebuilt, not just stamped; got: {}",
+        msg_seg_text(&panel, 0)
+    );
+}
+
+#[test]
+fn reflow_runs_without_a_width_or_scroll_change() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    for i in 0..5 {
+        panel.push(DisplayMessage::new(
+            DisplayRole::Assistant,
+            format!("message {i}"),
+        ));
+    }
+    render(&mut panel, 80, 10);
+
+    // Segments go stale between frames without either trigger firing.
+    panel.cache.mark_all_width_stale();
+    render(&mut panel, 80, 10);
+
+    assert!(
+        panel.cache.segments().iter().all(|s| !s.stale),
+        "visible segments must be reflowed even when width and scroll_top are unchanged"
+    );
+}
+
+#[test]
+fn resize_reflows_tool_segment_and_keeps_instruction_segment() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.tool_start(start("t1", "read"));
+    panel.tool_done(ToolDoneEvent {
+        id: "t1".into(),
+        tool: "read".into(),
+        output: read_code_with_instructions(instruction_blocks()),
+        is_error: false,
+        annotation: None,
+        written_path: None,
+    });
+    render(&mut panel, 80, 10);
+
+    // Tool + spacer + instruction segments are built up front.
+    let seg_count = panel.cache.len();
+    assert!(seg_count >= 3);
+
+    render(&mut panel, 40, 10);
+
+    // The instruction segment already exists, so reflowing the tool segment
+    // updates it in place rather than re-inserting (exercises the to_reflow
+    // index path through `rebuild_tool_segment` and the upsert).
+    assert_eq!(
+        panel.cache.len(),
+        seg_count,
+        "reflow must reuse the existing instruction segment, not re-insert"
+    );
+    // The viewport auto-scrolls to the bottom, where the tool and instruction
+    // segments sit, so neither stays stale after the resize.
+    assert!(
+        panel.cache.segments().iter().all(|s| !s.stale),
+        "tool and instruction segments in the viewport must be reflowed, not left stale"
+    );
+}
+
+#[test]
+fn big_widen_keeps_no_stale_segment_in_the_viewport() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    for i in 0..40 {
+        panel.push(DisplayMessage::new(
+            DisplayRole::Assistant,
+            format!("message {i:02} {}", "x".repeat(150)),
+        ));
+    }
+    render(&mut panel, 80, 30);
+    render(&mut panel, 240, 30);
+
+    // 3x widen: content shrinks and the bottom pin pulls up, so a single
+    // pre-reflow pass would leave stale segments in the viewport.
+    let vh = 30u32;
+    let top = panel.scroll_top() as u32;
+    let mut offset: u32 = 0;
+    for seg in panel.cache.segments() {
+        let h = seg.height(240) as u32;
+        let in_view = offset < top.saturating_add(vh) && offset + h > top;
+        assert!(
+            !(in_view && seg.stale),
+            "a stale segment overlaps the viewport after a big widen"
+        );
+        offset += h;
+    }
+    assert!(
+        panel.cache.segments().iter().any(|s| s.stale),
+        "off-viewport segments must stay stale so the test exercises convergence"
+    );
+}
+
+#[test]
+fn anchored_resize_keeps_the_topmost_visible_segment() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    for i in 0..40 {
+        panel.push(DisplayMessage::new(
+            DisplayRole::Assistant,
+            format!("message {i:02} {}", "x".repeat(60)),
+        ));
+    }
+    render(&mut panel, 80, 10);
+    panel.set_scroll_top(panel.max_scroll() / 2); // mid-transcript, unpins
+    render(&mut panel, 80, 10);
+    assert!(
+        !panel.auto_scroll(),
+        "the test must start anchored, not pinned"
+    );
+    let before = panel
+        .cache
+        .anchor_at(panel.scroll_top() as u32, 79)
+        .expect("scroll_top lands inside a segment");
+
+    render(&mut panel, 40, 10);
+
+    let after = panel
+        .cache
+        .anchor_at(panel.scroll_top() as u32, 39)
+        .expect("scroll_top still lands inside a segment after the resize");
+    assert_eq!(
+        after.0, before.0,
+        "narrowing must not slide the anchored topmost segment off the viewport"
+    );
+    assert!(
+        !panel.auto_scroll(),
+        "an anchored mid-transcript resize must not flip to the bottom pin"
+    );
+}
+const THEME_CODE: &str = "fn main() { let x = 1; }";
+const THEME_CODE_KEYWORDS: [&str; 3] = ["fn", "main", "let"];
+
+fn code_span_styles(panel: &MessagesPanel, tool_id: &str) -> Vec<(String, Style)> {
+    panel
+        .cache
+        .segments()
+        .iter()
+        .find(|s| s.tool_id.as_deref() == Some(tool_id))
+        .unwrap()
+        .lines()
+        .iter()
+        .flat_map(|l| l.spans.iter())
+        .filter(|s| THEME_CODE_KEYWORDS.contains(&s.content.trim()))
+        .map(|s| (s.content.to_string(), s.style))
+        .collect()
+}
+
+fn drain_highlight_worker(panel: &mut MessagesPanel) {
+    let deadline = Instant::now() + HIGHLIGHT_DEADLINE;
+    while panel.tick() == Dirty::NO {
+        assert!(
+            Instant::now() < deadline,
+            "the highlight worker never delivered a result"
+        );
+        std::thread::yield_now();
+    }
+    render(panel, 80, 20);
+}
+
+/// The unit test above only proves two generations make two keys. This is the
+/// wiring: drop `theme_gen` at a call site and the old palette gets spliced
+/// straight back in with no test to catch it.
+#[test]
+fn theme_switch_repaints_highlighted_code() {
+    theme::set(theme::load_by_name("dracula").unwrap());
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.tool_start(start("t1", "read"));
+    panel.tool_done(ToolDoneEvent {
+        id: "t1".into(),
+        tool: "read".into(),
+        output: ToolOutput::ReadCode {
+            path: "file.rs".into(),
+            start_line: 1,
+            lines: vec![THEME_CODE.into()],
+            total_lines: 1,
+            instructions: None,
+        },
+        is_error: false,
+        annotation: None,
+        written_path: None,
+    });
+    render(&mut panel, 80, 20);
+    drain_highlight_worker(&mut panel);
+    let dracula = code_span_styles(&panel, "t1");
+    assert!(!dracula.is_empty(), "no highlighted keywords to compare");
+
+    theme::set(theme::load_by_name("tokyonight").unwrap());
+    render(&mut panel, 80, 20);
+    drain_highlight_worker(&mut panel);
+
+    assert_ne!(
+        dracula,
+        code_span_styles(&panel, "t1"),
+        "a theme switch must re-highlight, not splice old-palette lines back"
+    );
+}

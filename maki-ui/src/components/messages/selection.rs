@@ -38,14 +38,23 @@ pub(super) fn extract_selection_text(
             continue;
         }
 
-        let tmp_area = Rect::new(0, 0, width, h);
+        // `h` is the document layout height, which can predate a resize (see
+        // `Segment::height`), while the wrap below happens at the real width.
+        // The rows we copy come from that wrap, so measure and clamp against
+        // it, and take the whole segment whenever the selection covers it.
+        let drawn = seg.drawn_height(width);
+        let tmp_area = Rect::new(0, 0, width, drawn);
         let mut tmp = Buffer::empty(tmp_area);
         Paragraph::new(seg.lines().to_vec())
             .wrap(Wrap { trim: false })
             .render(tmp_area, &mut tmp);
 
-        let rel_start = doc_start.row.saturating_sub(seg_start) as u16;
-        let rel_end = ((doc_end.row + 1).saturating_sub(seg_start) as u16).min(h);
+        let rel_start = (doc_start.row.saturating_sub(seg_start) as u16).min(drawn);
+        let rel_end = if doc_end.row + 1 >= seg_end {
+            drawn
+        } else {
+            ((doc_end.row + 1 - seg_start) as u16).min(drawn)
+        };
 
         let start_col = if seg_start > doc_start.row {
             0
