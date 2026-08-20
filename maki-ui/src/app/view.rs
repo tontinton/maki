@@ -1,6 +1,7 @@
 use std::sync::atomic::Ordering;
 
 use crate::components::Overlay;
+use crate::components::input::Placeholder;
 #[cfg(test)]
 use crate::components::keybindings::KeybindContext;
 use crate::components::queue_panel;
@@ -190,7 +191,13 @@ impl App {
             for &(idx, rect) in &layout.panel_windows {
                 self.float_mgr.view_panel(frame, idx, rect);
             }
-            let streaming = self.status == Status::Streaming;
+            let placeholder = if self.status == Status::Streaming {
+                Placeholder::Queue
+            } else if self.state.session.messages().is_empty() {
+                Placeholder::Suggestion
+            } else {
+                Placeholder::Blank
+            };
             let panel_hint = (self.state.mode == Mode::Plan)
                 .then(|| self.plan_form.hint_line())
                 .flatten()
@@ -198,7 +205,7 @@ impl App {
             self.input_box.view(
                 frame,
                 layout.input_area,
-                streaming,
+                placeholder,
                 self.separator_style(),
                 !self.any_overlay_open(),
                 panel_hint,

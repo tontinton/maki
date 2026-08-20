@@ -14,7 +14,7 @@ use std::mem;
 use maki_providers::ImageSource;
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 
@@ -40,6 +40,17 @@ const PLACEHOLDER_SUGGESTIONS: &[&str] = &[
     "refactor a module",
     "remove dead code",
 ];
+const QUEUE_PLACEHOLDER: &str = "Queue another prompt...";
+const ASK_PREFIX: &str = "Ask maki to ";
+const ASK_SUFFIX: &str = "...";
+const BLANK_PLACEHOLDER: &str = " ";
+
+#[derive(Clone, Copy)]
+pub enum Placeholder {
+    Suggestion,
+    Blank,
+    Queue,
+}
 
 pub enum InputAction {
     Submit(Submission),
@@ -321,7 +332,7 @@ impl InputBox {
         &mut self,
         frame: &mut Frame,
         area: Rect,
-        streaming: bool,
+        placeholder: Placeholder,
         border_style: Style,
         focused: bool,
         top_right_hint: Option<Line<'_>>,
@@ -349,33 +360,22 @@ impl InputBox {
 
         let is_empty = self.buffer.value().is_empty();
         let mut styled_lines: Vec<Line> = if is_empty && self.pending_images.is_empty() {
-            let placeholder_base = theme::current().input_placeholder;
-            if streaming {
-                vec![Line::from(vec![
-                    super::chevron_span(),
-                    if focused {
-                        Span::styled("Q", placeholder_base.reversed())
-                    } else {
-                        Span::styled("Q", placeholder_base)
-                    },
-                    Span::styled("ueue another prompt...", placeholder_base),
-                ])]
-            } else {
-                vec![Line::from(vec![
-                    super::chevron_span(),
-                    if focused {
-                        Span::styled("A", placeholder_base.reversed())
-                    } else {
-                        Span::styled("A", placeholder_base)
-                    },
-                    Span::styled("sk maki to ", placeholder_base),
-                    Span::styled(
-                        self.placeholder_hint,
-                        placeholder_base.add_modifier(ratatui::style::Modifier::ITALIC),
-                    ),
-                    Span::styled("...", placeholder_base),
-                ])]
-            }
+            let base = theme::current().input_placeholder;
+            let (head, tail) = match placeholder {
+                Placeholder::Suggestion => (
+                    ASK_PREFIX,
+                    vec![
+                        Span::styled(self.placeholder_hint, base.add_modifier(Modifier::ITALIC)),
+                        Span::styled(ASK_SUFFIX, base),
+                    ],
+                ),
+                Placeholder::Queue => (QUEUE_PLACEHOLDER, Vec::new()),
+                Placeholder::Blank => (BLANK_PLACEHOLDER, Vec::new()),
+            };
+            let mut spans = vec![super::chevron_span()];
+            spans.extend(cursor_on_first_char(head, base, focused));
+            spans.extend(tail);
+            vec![Line::from(spans)]
         } else {
             let cursor_y = self.buffer.y();
             let cursor_x = self.buffer.x();
@@ -523,6 +523,12 @@ impl InputBox {
 
         None
     }
+}
+
+fn cursor_on_first_char(text: &'static str, base: Style, focused: bool) -> [Span<'static>; 2] {
+    let (first, rest) = text.split_at(text.chars().next().map_or(0, char::len_utf8));
+    let cursor = if focused { base.reversed() } else { base };
+    [Span::styled(first, cursor), Span::styled(rest, base)]
 }
 
 fn random_placeholder_hint() -> &'static str {
@@ -871,15 +877,15 @@ mod tests {
         input: &mut InputBox,
         width: u16,
         height: u16,
-        streaming: bool,
-        border_style: Style,
+        placeholder: Placeholder,
     ) -> ratatui::Terminal<ratatui::backend::TestBackend> {
+        let border_style = Style::new().fg(theme::current().mode_build);
         let backend = ratatui::backend::TestBackend::new(width, height);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {
                 let area = Rect::new(0, 0, width, height);
-                input.view(frame, area, streaming, border_style, true, None);
+                input.view(frame, area, placeholder, border_style, true, None);
             })
             .unwrap();
         terminal
@@ -890,13 +896,7 @@ mod tests {
         width: u16,
         height: u16,
     ) -> ratatui::Terminal<ratatui::backend::TestBackend> {
-        render_input_with(
-            input,
-            width,
-            height,
-            false,
-            Style::new().fg(theme::current().mode_build),
-        )
+        render_input_with(input, width, height, Placeholder::Suggestion)
     }
 
     fn has_scrollbar_thumb(terminal: &ratatui::Terminal<ratatui::backend::TestBackend>) -> bool {
@@ -1018,12 +1018,27 @@ mod tests {
         assert_eq!(input.copy_text(), "❯ line1\n  line2");
     }
 
-    #[test]
-    fn placeholder_has_prefix() {
+    #[test_case(Placeholder::Blank, "" ; "blank_shows_only_the_chevron")]
+    #[test_case(Placeholder::Queue, QUEUE_PLACEHOLDER ; "queue_asks_for_another_prompt")]
+    fn placeholder_row(placeholder: Placeholder, expected: &str) {
         let mut input = InputBox::new(InputHistory::default(), 20);
+        let terminal = render_input_with(&mut input, 40, 4, placeholder);
+        assert_eq!(
+            rendered_row(&terminal, 1),
+            format!("{CHEVRON}{expected}").trim_end()
+        );
+    }
+
+    #[test]
+    fn suggestion_placeholder_shows_a_hint() {
+        const HINT: &str = "fix a bug";
+        let mut input = InputBox::new(InputHistory::default(), 20);
+        input.placeholder_hint = HINT;
         let terminal = render_input(&mut input, 40, 4);
-        let row = rendered_row(&terminal, 1);
-        assert!(row.starts_with(CHEVRON), "placeholder row: {row:?}");
+        assert_eq!(
+            rendered_row(&terminal, 1),
+            format!("{CHEVRON}{ASK_PREFIX}{HINT}{ASK_SUFFIX}")
+        );
     }
 
     fn test_image() -> ImageSource {
