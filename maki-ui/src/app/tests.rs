@@ -3,7 +3,7 @@ use crate::agent::shared_queue;
 use crate::chat::{CANCELLED_TEXT, DONE_TEXT, ERROR_TEXT};
 use crate::components::btw_modal::BtwEvent;
 use crate::components::command::ParsedCommand;
-use crate::components::file_picker::EMPTY_DIR_MSG;
+use crate::components::file_picker::UNREADABLE_DIR_MSG;
 use crate::components::keybindings::{KeybindContext, key as kb};
 use crate::components::{ExitRequest, buffer_text, key, test_model};
 use crate::repaint::expect::{OWED, QUIET};
@@ -1651,7 +1651,7 @@ fn tick_forwards_the_file_picker_flash_to_the_status_bar() {
         std::thread::yield_now();
     }
 
-    assert_eq!(app.status_bar.flash_text(), Some(EMPTY_DIR_MSG));
+    assert_eq!(app.status_bar.flash_text(), Some(UNREADABLE_DIR_MSG));
     assert!(!app.file_picker.is_open());
 }
 
