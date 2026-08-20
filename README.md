@@ -48,6 +48,7 @@ An AI coding agent optimized for minimal use of context tokens, while providing 
 * DeepSeek - `DEEPSEEK_API_KEY`.
 * OpenRouter - `OPENROUTER_API_KEY`.
 * Synthetic - `SYNTHETIC_API_KEY`.
+* TensorX - `TENSORX_API_KEY`.
 * OpenCode Zen - `OPENCODE_API_KEY`, or the free `public` key for zero-cost models. Models from the models.dev catalog.
 * OpenCode Go - `OPENCODE_API_KEY`. Models from the models.dev catalog.
 * Aperture - `APERTURE_HOST` (e.g. `https://your-host.tailnet.ts.net`). No API key needed, Tailscale handles auth.
