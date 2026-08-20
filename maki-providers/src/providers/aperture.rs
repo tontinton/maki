@@ -160,14 +160,32 @@ fn kind_supports_thinking(kind: ProviderKind) -> bool {
 /// request path to the upstream's configured base url. The prefix therefore
 /// follows the API format the request uses: `/v1` for OpenAI chat (and for the
 /// generic gateway path), `/v1beta` for Gemini. Anthropic gets none because its
-/// provider rebuilds `/v1/messages` from the bare origin. An upstream whose
-/// base url already carries a path (e.g. z.ai's `/api/paas/v4`) would double up,
-/// so `path_prefix` in the overrides can replace it per gateway provider.
+/// provider rebuilds `/v1/messages` from the bare origin. Zai gets none because
+/// its API has no `/v1` segment at all (`/api/paas/v4/chat/completions`), so
+/// the upstream base url must carry the full path and any prefix would double
+/// up. `path_prefix` in the overrides replaces the default per gateway
+/// provider.
+/// Exhaustive on purpose: a new `ProviderKind` must state its prefix here
+/// instead of silently inheriting `/v1` (which broke Zai once already).
 fn default_path_prefix(kind: Option<ProviderKind>) -> &'static str {
     match kind {
-        Some(ProviderKind::Anthropic) => "",
+        Some(ProviderKind::Anthropic | ProviderKind::Zai) => "",
         Some(ProviderKind::Google) => GEMINI_PATH_PREFIX,
-        _ => DEFAULT_PATH_PREFIX,
+        Some(
+            ProviderKind::Ollama
+            | ProviderKind::LlamaCpp
+            | ProviderKind::Mistral
+            | ProviderKind::DeepSeek
+            | ProviderKind::OpenRouter
+            | ProviderKind::Synthetic
+            | ProviderKind::TensorX
+            | ProviderKind::OpenAi
+            | ProviderKind::Copilot
+            | ProviderKind::Opencode
+            | ProviderKind::Xai
+            | ProviderKind::Aperture,
+        )
+        | None => DEFAULT_PATH_PREFIX,
     }
 }
 
@@ -556,7 +574,7 @@ mod tests {
     }
 
     #[test_case(Some(ProviderKind::Ollama), Some("https://aperture.example.com/v1") ; "ollama_appends_v1")]
-    #[test_case(Some(ProviderKind::Zai), Some("https://aperture.example.com/v1") ; "zai_appends_v1")]
+    #[test_case(Some(ProviderKind::Zai), Some("https://aperture.example.com") ; "zai_keeps_bare_host")]
     #[test_case(Some(ProviderKind::DeepSeek), Some("https://aperture.example.com/v1") ; "deepseek_appends_v1")]
     #[test_case(None, Some("https://aperture.example.com/v1") ; "unrouted_appends_v1")]
     #[test_case(Some(ProviderKind::Google), Some("https://aperture.example.com/v1beta") ; "google_appends_v1beta")]
@@ -568,6 +586,7 @@ mod tests {
     }
 
     #[test_case(Some("") , Some("https://aperture.example.com") ; "empty_prefix_keeps_bare_host")]
+    #[test_case(Some("v1"), Some("https://aperture.example.com/v1") ; "configured_prefix_beats_zai_default")]
     #[test_case(Some("api/paas/v4"), Some("https://aperture.example.com/api/paas/v4") ; "prefix_gets_leading_slash")]
     #[test_case(Some("/v1/"), Some("https://aperture.example.com/v1") ; "prefix_trailing_slash_trimmed")]
     fn routed_auth_path_prefix_override_wins(configured: Option<&str>, expected: Option<&str>) {
