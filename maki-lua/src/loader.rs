@@ -362,6 +362,7 @@ impl PluginHost {
                 None,
                 PluginPermissions::trusted(),
                 opts,
+                false,
             )?;
         }
         Ok(())
@@ -374,6 +375,7 @@ impl PluginHost {
         plugin_dir: Option<PathBuf>,
         permissions: PluginPermissions,
         opts: PluginOpts,
+        mark_package_active: bool,
     ) -> Result<(), PluginError> {
         let (reply_tx, reply_rx) = flume::bounded(1);
         self.inner
@@ -384,6 +386,7 @@ impl PluginHost {
                 plugin_dir,
                 permissions,
                 opts,
+                mark_package_active,
                 reply: reply_tx,
             })
             .map_err(|_| PluginError::HostDead)?;
@@ -449,6 +452,7 @@ impl PluginHost {
             None,
             PluginPermissions::trusted(),
             Arc::new(opts),
+            false,
         )
     }
 
@@ -464,6 +468,7 @@ impl PluginHost {
             None,
             permissions,
             PluginOpts::default(),
+            false,
         )
     }
 
@@ -484,6 +489,7 @@ impl PluginHost {
             plugin_dir,
             permissions,
             PluginOpts::default(),
+            false,
         )
     }
 
@@ -496,6 +502,15 @@ impl PluginHost {
         self.inner
             .tx
             .send(Request::CollectPackages { reply: reply_tx })
+            .map_err(|_| PluginError::HostDead)?;
+        reply_rx.recv().map_err(|_| PluginError::HostDead)
+    }
+
+    pub fn active_packages(&self) -> Result<std::collections::BTreeSet<String>, PluginError> {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        self.inner
+            .tx
+            .send(Request::CollectActivePackages { reply: reply_tx })
             .map_err(|_| PluginError::HostDead)?;
         reply_rx.recv().map_err(|_| PluginError::HostDead)
     }
@@ -592,7 +607,7 @@ impl PluginHost {
             })?;
             chunks.push(LoadChunk::new(path.display().to_string(), source));
         }
-        self.send_load(Arc::from(name), chunks, Some(root), permissions, opts)
+        self.send_load(Arc::from(name), chunks, Some(root), permissions, opts, true)
     }
     pub fn event_handle(&self) -> EventHandle {
         EventHandle {

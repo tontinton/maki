@@ -21,99 +21,86 @@ pub struct BuiltinCommand {
     pub name: &'static str,
     pub description: &'static str,
     pub max_args: usize,
+    /// Whether a trailing `!` is part of this command rather than a typo.
+    ///
+    /// Matching is a fuzzy match on the typed word, and `!` appears in no
+    /// command name, so without this the bang form matches nothing and falls
+    /// through to the model as an ordinary message.
+    pub bang: bool,
+}
+
+impl BuiltinCommand {
+    const fn new(name: &'static str, description: &'static str, max_args: usize) -> Self {
+        Self {
+            name,
+            description,
+            max_args,
+            bang: false,
+        }
+    }
+
+    const fn with_bang(name: &'static str, description: &'static str, max_args: usize) -> Self {
+        Self {
+            name,
+            description,
+            max_args,
+            bang: true,
+        }
+    }
 }
 
 pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
-    BuiltinCommand {
-        name: "/compact",
-        description: "Summarize and compact conversation history",
-        max_args: 0,
-    },
-    BuiltinCommand {
-        name: "/new",
-        description: "Start a new session",
-        max_args: 0,
-    },
-    BuiltinCommand {
-        name: "/help",
-        description: "Show keybindings",
-        max_args: 0,
-    },
-    BuiltinCommand {
-        name: "/usage",
-        description: "Show token usage breakdown",
-        max_args: 0,
-    },
-    BuiltinCommand {
-        name: "/queue",
-        description: "Remove items from queue",
-        max_args: 0,
-    },
-    BuiltinCommand {
-        name: "/model",
-        description: "Switch model",
-        max_args: 0,
-    },
-    BuiltinCommand {
-        name: "/theme",
-        description: "Switch color theme",
-        max_args: 0,
-    },
-    BuiltinCommand {
-        name: "/mcp",
-        description: "Configure MCP servers",
-        max_args: 0,
-    },
-    BuiltinCommand {
-        name: "/login",
-        description: "Authenticate with an LLM provider",
-        max_args: 0,
-    },
-    BuiltinCommand {
-        name: "/cd",
-        description: "Change working directory",
-        max_args: 1,
-    },
-    BuiltinCommand {
-        name: "/btw",
-        description: "Ask a quick question (no tools, no history pollution)",
-        max_args: usize::MAX,
-    },
-    BuiltinCommand {
-        name: "/yolo",
-        description: "Toggle YOLO mode (skip all permission prompts)",
-        max_args: 0,
-    },
-    BuiltinCommand {
-        name: "/thinking",
-        description: "Toggle extended thinking (off, adaptive, effort level, or budget)",
-        max_args: 1,
-    },
-    BuiltinCommand {
-        name: "/fast",
-        description: "Toggle Anthropic fast mode (Opus only)",
-        max_args: 0,
-    },
-    BuiltinCommand {
-        name: "/workflow",
-        description: "Toggle workflow mode (task callable inside code_execution)",
-        max_args: 0,
-    },
-    BuiltinCommand {
-        name: "/exit",
-        description: "Exit the application",
-        max_args: 0,
-    },
-    BuiltinCommand {
-        name: "/reload",
-        description: "Reload plugins and config",
-        max_args: 0,
-    },
+    BuiltinCommand::new("/tasks", "Browse and search tasks", 0),
+    BuiltinCommand::new("/compact", "Summarize and compact conversation history", 0),
+    BuiltinCommand::new("/new", "Start a new session", 0),
+    BuiltinCommand::new("/help", "Show keybindings", 0),
+    BuiltinCommand::new("/usage", "Show token usage breakdown", 0),
+    BuiltinCommand::new("/queue", "Remove items from queue", 0),
+    BuiltinCommand::new("/model", "Switch model", 0),
+    BuiltinCommand::new("/theme", "Switch color theme", 0),
+    BuiltinCommand::new("/mcp", "Configure MCP servers", 0),
+    BuiltinCommand::new("/login", "Authenticate with an LLM provider", 0),
+    BuiltinCommand::new("/cd", "Change working directory", 1),
+    BuiltinCommand::new(
+        "/btw",
+        "Ask a quick question (no tools, no history pollution)",
+        usize::MAX,
+    ),
+    BuiltinCommand::new("/yolo", "Toggle YOLO mode (skip all permission prompts)", 0),
+    BuiltinCommand::new(
+        "/thinking",
+        "Toggle extended thinking (off, adaptive, effort level, or budget)",
+        1,
+    ),
+    BuiltinCommand::new("/fast", "Toggle Anthropic fast mode (Opus only)", 0),
+    BuiltinCommand::new(
+        "/workflow",
+        "Toggle workflow mode (task callable inside code_execution)",
+        0,
+    ),
+    BuiltinCommand::new("/exit", "Exit the application", 0),
+    BuiltinCommand::new("/reload", "Reload plugins and config", 0),
+    // Host commands rather than Lua ones: both unload an owner, and unloading
+    // waits on a reply from the Lua thread that a Lua handler would be
+    // occupying. Being built in also keeps them usable under `--no-plugins`,
+    // which is when a package is most likely to be what needs removing.
+    BuiltinCommand::with_bang(
+        "/packupdate",
+        "Update packages (++offline, ++lockfile, or a name)",
+        usize::MAX,
+    ),
+    BuiltinCommand::with_bang(
+        "/packdel",
+        "Remove undeclared packages (++all, or a name)",
+        usize::MAX,
+    ),
 ];
 
 pub struct ParsedCommand {
     pub name: String,
     pub args: String,
+    /// The user typed the command with a trailing `!`.
+    pub bang: bool,
 }
 
 pub enum CommandAction {
@@ -137,6 +124,12 @@ struct CommandItem {
     command_type: CommandType,
 }
 
+impl CommandItem {
+    fn accepts_bang(&self) -> bool {
+        matches!(&self.command_type, CommandType::Builtin(command) if command.bang)
+    }
+}
+
 struct Match {
     command_type: CommandType,
     indices: Vec<u32>,
@@ -154,7 +147,6 @@ pub struct CommandPalette {
     lua_generation: u64,
     nucleo: Nucleo<CommandItem>,
     matcher: Matcher,
-    current_arg_count: usize,
 }
 
 impl CommandPalette {
@@ -184,7 +176,6 @@ impl CommandPalette {
             lua_generation,
             nucleo,
             matcher: Matcher::new(Config::DEFAULT),
-            current_arg_count: 0,
         }
     }
 
@@ -268,7 +259,14 @@ impl CommandPalette {
             },
             KeyCode::Tab => {
                 if let Some(item) = self.filtered.get(self.selected) {
-                    let name = self.item_name(item);
+                    let mut name = self.item_name(item);
+                    // The bang was taken off before matching, so it has to go
+                    // back on here. Without this, completing `/packdel!` would
+                    // hand back `/packdel` and quietly turn a forced command
+                    // into the confirming one.
+                    if command_input(input).is_some_and(|(_, _, bang)| bang) {
+                        name.push('!');
+                    }
                     let text = if self.item_has_args(item) {
                         format!("{name} ")
                     } else {
@@ -298,20 +296,13 @@ impl CommandPalette {
             self.lua_commands = lua_snap.commands.clone();
             self.nucleo = Self::build_nucleo(&self.custom, &self.mcp_prompts, &self.lua_commands);
         }
-        let Some(stripped) = input.strip_prefix('/') else {
+        if !input.starts_with('/') {
             self.filtered.clear();
-            self.current_arg_count = 0;
             return;
-        };
-
-        let parts: Vec<&str> = stripped.split_whitespace().collect();
-        let cmd_word = parts.first().copied().unwrap_or(stripped);
-        let trailing_space = stripped.ends_with(char::is_whitespace);
-
-        self.current_arg_count = if trailing_space {
-            parts.len()
-        } else {
-            parts.len().saturating_sub(1)
+        }
+        let Some((cmd_word, arg_count, bang)) = command_input(input) else {
+            self.filtered.clear();
+            return;
         };
 
         self.nucleo.pattern.reparse(
@@ -322,14 +313,14 @@ impl CommandPalette {
             false,
         );
 
-        self.tick();
+        self.tick(arg_count, bang);
     }
 
-    fn tick(&mut self) {
+    fn tick(&mut self, arg_count: usize, bang: bool) {
         loop {
             let status = self.nucleo.tick(TICK_TIMEOUT_MS);
             if status.changed {
-                self.refresh_matches();
+                self.refresh_matches(arg_count, bang);
             }
             if !status.running {
                 break;
@@ -337,7 +328,7 @@ impl CommandPalette {
         }
     }
 
-    fn refresh_matches(&mut self) {
+    fn refresh_matches(&mut self, arg_count: usize, bang: bool) {
         let snapshot = self.nucleo.snapshot();
         let pattern = snapshot.pattern();
         let has_pattern = !pattern.column_pattern(0).atoms.is_empty();
@@ -348,7 +339,10 @@ impl CommandPalette {
             let cmd_item = &item.data;
             let col = &item.matcher_columns[0];
 
-            if self.current_arg_count > cmd_item.max_args {
+            if arg_count > cmd_item.max_args {
+                continue;
+            }
+            if bang && !cmd_item.accepts_bang() {
                 continue;
             }
 
@@ -375,7 +369,6 @@ impl CommandPalette {
 
     pub fn close(&mut self) {
         self.filtered.clear();
-        self.current_arg_count = 0;
     }
 
     pub fn move_up(&mut self) {
@@ -438,6 +431,7 @@ impl CommandPalette {
         Some(ParsedCommand {
             name,
             args: args.to_string(),
+            bang: command_input(input).is_some_and(|(_, _, bang)| bang),
         })
     }
 
@@ -445,10 +439,10 @@ impl CommandPalette {
     /// spelling that [`crate::app::App`] dispatches on. Case-insensitive like
     /// typing, but never fuzzy: an alias names one command on purpose, and a
     /// typo should report itself instead of running the closest neighbor.
-    pub fn resolve(&self, name: &str) -> Option<String> {
+    pub fn resolve(&self, name: &str, bang: bool) -> Option<String> {
         Self::items(&self.custom, &self.mcp_prompts, &self.lua_commands)
+            .find(|item| item.name.eq_ignore_ascii_case(name) && (!bang || item.accepts_bang()))
             .map(|item| item.name)
-            .find(|n| n.eq_ignore_ascii_case(name))
     }
 
     pub fn find_custom_command(&self, display_name: &str) -> Option<&CustomCommand> {
@@ -572,6 +566,19 @@ impl CommandPalette {
     }
 }
 
+fn command_input(input: &str) -> Option<(&str, usize, bool)> {
+    let stripped = input.strip_prefix('/')?;
+    let mut parts = stripped.split_whitespace();
+    let first = parts.next();
+    let word = first.unwrap_or(stripped);
+    let (word, bang) = word
+        .strip_suffix('!')
+        .map_or((word, false), |word| (word, true));
+    let arg_count =
+        parts.count() + usize::from(first.is_some() && stripped.ends_with(char::is_whitespace));
+    Some((word, arg_count, bang))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -676,21 +683,53 @@ mod tests {
     fn sync_filters_on_first_word_only() {
         let p = synced("/cd ~/foo");
         assert!(p.is_active());
-        assert_eq!(p.filtered.len(), 1);
-        let name = p.item_name(&p.filtered[0]);
-        assert_eq!(name, "/cd");
+        // The argument takes no part in matching, so the command word alone
+        // decides the result. Asserted as "`/cd` wins" rather than "one match",
+        // because any command that fuzzy-matches `cd` and accepts arguments
+        // legitimately appears too.
+        assert_eq!(p.item_name(&p.filtered[0]), "/cd");
+        assert!(
+            !p.filtered.iter().any(|m| p.item_name(m).contains("foo")),
+            "nothing should have matched on the argument"
+        );
     }
 
-    #[test_case("/compact ", false ; "zero_arg_cmd_with_space")]
-    #[test_case("/help ", false     ; "zero_arg_help_with_space")]
-    #[test_case("/cd ", true        ; "one_arg_cmd_with_space")]
-    #[test_case("/cd ~/foo", true   ; "one_arg_cmd_mid_arg")]
-    #[test_case("/cd  ~/foo", true  ; "one_arg_cmd_double_space")]
-    #[test_case("/cd ~/foo ", false ; "one_arg_cmd_second_space")]
-    #[test_case("/btw hello world", true ; "btw_stays_active_with_many_args")]
-    fn sync_respects_nargs(input: &str, expect_active: bool) {
+    /// Whether the named command is still on offer for this input. Asked of
+    /// one command rather than of the whole list, because the list also holds
+    /// every other command that fuzzy-matches the same word.
+    #[test_case("/compact ", "/compact", false ; "zero_arg_cmd_with_space")]
+    #[test_case("/tasks ", "/tasks", false     ; "zero_arg_tasks_with_space")]
+    #[test_case("/cd ", "/cd", true            ; "one_arg_cmd_with_space")]
+    #[test_case("/cd ~/foo", "/cd", true       ; "one_arg_cmd_mid_arg")]
+    #[test_case("/cd  ~/foo", "/cd", true      ; "one_arg_cmd_double_space")]
+    #[test_case("/cd ~/foo ", "/cd", false     ; "one_arg_cmd_second_space")]
+    #[test_case("/btw hello world", "/btw", true ; "btw_stays_active_with_many_args")]
+    fn sync_respects_nargs(input: &str, command: &str, expect_offered: bool) {
         let p = synced(input);
-        assert_eq!(p.is_active(), expect_active);
+        let offered = p.filtered.iter().any(|m| p.item_name(m) == command);
+        assert_eq!(offered, expect_offered, "{command} for {input:?}");
+    }
+
+    /// A command that declares a bang is offered for the bang form, and one
+    /// that does not is not. Without the second half, `/help!` would offer
+    /// `/help` and then silently drop what was typed.
+    #[test_case("/packupdate!", "/packupdate", true  ; "declared_bang")]
+    #[test_case("/packdel!", "/packdel", true        ; "declared_bang_del")]
+    #[test_case("/help!", "/help", false             ; "undeclared_bang")]
+    fn sync_offers_only_commands_that_take_a_bang(input: &str, command: &str, expect: bool) {
+        let p = synced(input);
+        let offered = p.filtered.iter().any(|m| p.item_name(m) == command);
+        assert_eq!(offered, expect, "{command} for {input:?}");
+    }
+
+    #[test]
+    fn confirm_reports_the_bang() {
+        let mut p = CommandPalette::new(Arc::from([]), empty_snapshot(), LuaCommandReader::empty());
+        p.sync("/packupdate! ++offline");
+        let cmd = p.confirm("/packupdate! ++offline").unwrap();
+        assert_eq!(cmd.name, "/packupdate");
+        assert_eq!(cmd.args, "++offline");
+        assert!(cmd.bang, "the trailing ! has to reach the handler");
     }
 
     #[test]
@@ -710,7 +749,9 @@ mod tests {
     #[test_case("/CD ~/foo", "/cd", "~/foo"   ; "case_insensitive")]
     #[test_case("/compact", "/compact", ""    ; "other_command")]
     #[test_case("/cmp", "/compact", ""    ; "fuzzy-match-1")]
-    #[test_case("/pct", "/compact", ""    ; "fuzzy-match-2")]
+    // `cmpt` rather than `pct`: the latter also matches `/packupdate`, and
+    // which of the two a fuzzy matcher prefers is not what this asserts.
+    #[test_case("/cmpt", "/compact", ""    ; "fuzzy-match-2")]
     #[test_case("/btw hello world", "/btw", "hello world" ; "btw_multi_word")]
     fn confirm_parses_args(input: &str, expected_name: &str, expected_args: &str) {
         let mut p = CommandPalette::new(Arc::from([]), empty_snapshot(), LuaCommandReader::empty());
@@ -877,7 +918,7 @@ mod tests {
 
     #[test_case("/cmp", "/compact" ; "compact_fuzzy")]
     #[test_case("/new", "/new" ; "new_exact")]
-    #[test_case("/thm", "/theme" ; "theme_fuzzy")]
+    #[test_case("/tsk", "/tasks" ; "tasks_fuzzy")]
     fn nucleo_highlights_matching_indices(input: &str, expected_cmd: &str) {
         let p = synced(input);
         assert!(p.is_active(), "Input '{}' should activate palette", input);

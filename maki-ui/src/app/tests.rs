@@ -612,6 +612,7 @@ fn cmd(name: &str) -> ParsedCommand {
     ParsedCommand {
         name: name.to_string(),
         args: String::new(),
+        bang: false,
     }
 }
 
@@ -2443,6 +2444,7 @@ fn cd_command_behavior() {
         ParsedCommand {
             name: "/cd".into(),
             args: "/tmp".into(),
+            bang: false,
         },
         0,
     );
@@ -2459,6 +2461,7 @@ fn cd_command_behavior() {
         ParsedCommand {
             name: "/cd".into(),
             args: "/nonexistent_path_12345".into(),
+            bang: false,
         },
         0,
     );
@@ -2523,6 +2526,51 @@ fn run_cmdline_splits_args_off_the_name() {
     let actions = app.run_cmdline("/btw what is rust?", 0).unwrap();
 
     assert!(matches!(&actions[..], [Action::Btw(q)] if q == "what is rust?"));
+}
+
+#[test]
+fn run_cmdline_preserves_declared_bang() {
+    let mut app = test_app();
+
+    app.run_cmdline("/packdel! demo", 0).unwrap();
+
+    assert_eq!(
+        app.exit_request,
+        ExitRequest::Pack(PackRequest {
+            name: "/packdel".into(),
+            args: "demo".into(),
+            bang: true,
+        })
+    );
+}
+
+/// Only a person may change the installed package set. A non-zero depth means
+/// `maki.api.run_command` sent this, so a downloaded package must not be able
+/// to fetch new code for itself or delete the rest.
+#[test_case("/packupdate demo" ; "update")]
+#[test_case("/packdel! ++all"  ; "delete_all")]
+fn run_cmdline_refuses_pack_commands_from_lua(cmdline: &str) {
+    let mut app = test_app();
+
+    let actions = app.run_cmdline(cmdline, 1).unwrap();
+
+    assert!(
+        actions.is_empty(),
+        "a refused command must produce no action"
+    );
+    assert_eq!(
+        app.exit_request,
+        ExitRequest::None,
+        "a Lua caller must not be able to leave the UI for a package change"
+    );
+}
+
+#[test]
+fn run_cmdline_rejects_undeclared_bang() {
+    let mut app = test_app();
+
+    assert!(app.run_cmdline("/help!", 0).is_err());
+    assert!(!app.help_modal.is_open());
 }
 
 /// Only the typed path clears the input, so a keybind or autocmd reaching for
@@ -2999,6 +3047,7 @@ fn btw_empty_flashes_error() {
         ParsedCommand {
             name: "/btw".into(),
             args: String::new(),
+            bang: false,
         },
         0,
     );
@@ -3016,6 +3065,7 @@ fn btw_with_question_returns_action() {
         ParsedCommand {
             name: "/btw".into(),
             args: "what is rust?".into(),
+            bang: false,
         },
         0,
     );
@@ -3779,6 +3829,7 @@ fn thinking_explicit_args() {
         ParsedCommand {
             name: "/thinking".into(),
             args: "8192".into(),
+            bang: false,
         },
         0,
     );
@@ -3788,6 +3839,7 @@ fn thinking_explicit_args() {
         ParsedCommand {
             name: "/thinking".into(),
             args: "high".into(),
+            bang: false,
         },
         0,
     );

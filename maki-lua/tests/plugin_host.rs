@@ -3116,6 +3116,38 @@ end
     );
 }
 
+#[test]
+fn loaded_package_set_excludes_a_package_that_failed_to_load() {
+    let site = tempfile::TempDir::new().unwrap();
+    for (name, source) in [("good", ""), ("broken", "this is not lua")] {
+        let plugin = site
+            .path()
+            .join("pack/vendor/start")
+            .join(name)
+            .join("plugin");
+        std::fs::create_dir_all(&plugin).unwrap();
+        std::fs::write(plugin.join("init.lua"), source).unwrap();
+    }
+    let found = maki_lua::discover(site.path());
+    let names: Vec<String> = found
+        .packages
+        .iter()
+        .map(|package| package.name.clone())
+        .collect();
+    let config = maki_config::PluginsConfig::from_plugins_and_packages(Default::default(), &names);
+    let host = PluginHost::new(fresh_registry()).unwrap();
+
+    let failures = host.load_packages(&found.packages, &config);
+    let loaded = host.active_packages().unwrap();
+
+    assert!(loaded.contains("good"));
+    assert!(!loaded.contains("broken"));
+    assert_eq!(failures.len(), 1);
+
+    host.unload("good").unwrap();
+    assert!(host.active_packages().unwrap().is_empty());
+}
+
 /// If `lua/` itself links out of the package, its target must not become the
 /// sandbox root; otherwise everything under that target would be requireable.
 #[cfg(unix)]
@@ -3158,7 +3190,10 @@ fn discovered_opt_package_is_not_loaded_at_startup() {
 
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    assert!(host.load_packages(&found.packages, &config).is_empty());
+    let failures = host.load_packages(&found.packages, &config);
+    let loaded = host.active_packages().unwrap();
+    assert!(loaded.is_empty());
+    assert!(failures.is_empty());
 
     assert_eq!(host.command_reader().load().commands.len(), 0);
 }
@@ -3188,13 +3223,7 @@ fn activate_all(
     config: &PluginsConfig,
 ) -> Vec<String> {
     let mut failures = host.load_packages(&found.packages, config);
-    let mut active: std::collections::BTreeSet<String> = found
-        .packages
-        .iter()
-        .filter(|p| p.eager && config.packages.iter().any(|n| n == &p.name))
-        .map(|p| p.name.clone())
-        .collect();
-    let report = maki_lua::drain_pack_ops(host, &[], &found.packages, &mut active, config);
+    let report = maki_lua::drain_pack_ops(host, &[], &found.packages, config);
     failures.extend(report.failures);
     failures
 }

@@ -150,6 +150,7 @@ pub enum Request {
         plugin_dir: Option<PathBuf>,
         permissions: PluginPermissions,
         opts: PluginOpts,
+        mark_package_active: bool,
         reply: flume::Sender<LoadResult>,
     },
     CallTool {
@@ -201,6 +202,9 @@ pub enum Request {
     /// that is when the declared set is complete.
     CollectPackages {
         reply: flume::Sender<Vec<crate::api::pack::Declared>>,
+    },
+    CollectActivePackages {
+        reply: flume::Sender<std::collections::BTreeSet<String>>,
     },
     /// Takes the operations Lua recorded, leaving the queue empty so the same
     /// work is never applied twice.
@@ -2012,6 +2016,17 @@ impl LuaRuntime {
     }
 
     fn clear_plugin(&mut self, plugin: &str) {
+        if let Some(store) = self
+            .lua
+            .app_data_ref::<crate::api::pack::PackStore>()
+            .map(|store| store.clone())
+        {
+            store
+                .lock()
+                .expect("pack declarations")
+                .active
+                .remove(plugin);
+        }
         self.registry.clear_plugin(plugin);
         self.plugin_rules.remove(plugin);
         self.drop_plugin_keys(plugin);
@@ -2793,10 +2808,37 @@ pub fn spawn(
                             plugin_dir,
                             permissions,
                             opts,
+                            mark_package_active,
                             reply,
                         } => {
+                            if mark_package_active
+                                && rt
+                                    .lua
+                                    .app_data_ref::<crate::api::pack::PackStore>()
+                                    .is_some_and(|store| {
+                                        store
+                                            .lock()
+                                            .expect("pack declarations")
+                                            .active
+                                            .contains(name.as_ref())
+                                    })
+                            {
+                                let _ = reply.send(Ok(()));
+                                continue;
+                            }
                             drain_barrier(&rt.lua, &ex, &gate, &spawn_rx).await;
                             let res = rt.load_source(Arc::clone(&name), &chunks, plugin_dir, &permissions, opts, None).await;
+                            if mark_package_active
+                                && res.is_ok()
+                                && let Some(store) =
+                                    rt.lua.app_data_ref::<crate::api::pack::PackStore>()
+                            {
+                                store
+                                    .lock()
+                                    .expect("pack declarations")
+                                    .active
+                                    .insert(name.to_string());
+                            }
                             let _ = reply.send(res);
                         }
                         Request::CallTool {
@@ -2925,6 +2967,16 @@ pub fn spawn(
                                 .map(|store| store.lock().expect("pack declarations").specs.clone())
                                 .unwrap_or_default();
                             let _ = reply.send(declared);
+                        }
+                        Request::CollectActivePackages { reply } => {
+                            let active = rt
+                                .lua
+                                .app_data_ref::<crate::api::pack::PackStore>()
+                                .map(|store| {
+                                    store.lock().expect("pack declarations").active.clone()
+                                })
+                                .unwrap_or_default();
+                            let _ = reply.send(active);
                         }
                         Request::RestoreToolAsync { item, event_tx } => {
                             spawn_restore(&ex, &gate, &restores, &rt, item, event_tx);

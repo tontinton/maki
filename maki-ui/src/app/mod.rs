@@ -28,6 +28,7 @@ use crate::app::tasks::TaskOutcome;
 use crate::chat::Chat;
 use crate::chat::{CANCELLED_TEXT, ChatEventResult, DONE_TEXT, ERROR_TEXT};
 use crate::clipboard::ClipboardState;
+use crate::components::PackRequest;
 use crate::components::btw_modal::BtwModal;
 use crate::components::command::{CommandAction, CommandPalette, ParsedCommand};
 use crate::components::file_picker::{FilePickerModal, FilePickerModalAction};
@@ -1287,14 +1288,18 @@ impl App {
         let (name, args) = trimmed
             .split_once(char::is_whitespace)
             .unwrap_or((trimmed, ""));
+        let (name, bang) = name
+            .strip_suffix('!')
+            .map_or((name, false), |name| (name, true));
         let resolved = self
             .command_palette
-            .resolve(&format!("/{}", name.trim_start_matches('/')))
+            .resolve(&format!("/{}", name.trim_start_matches('/')), bang)
             .ok_or_else(|| format!("unknown command '{name}'"))?;
         Ok(self.execute_command(
             ParsedCommand {
                 name: resolved,
                 args: args.trim().to_string(),
+                bang,
             },
             depth,
         ))
@@ -1394,6 +1399,31 @@ impl App {
             }
             "/exit" => self.quit(),
             "/reload" => self.quit_with(ExitRequest::Reload),
+            cmd_name @ ("/packupdate" | "/packdel") => {
+                // Only a person may change the installed set. `depth` is
+                // non-zero when `maki.api.run_command` sent this, so without
+                // the guard a downloaded package could call
+                // `/packupdate <itself>` and fetch new code under the approval
+                // it already holds, or `/packdel! ++all` and remove the rest.
+                if depth > 0 {
+                    self.flash(format!("{cmd_name} can only be run by you"));
+                    return vec![];
+                }
+                // Refused here, while the user is watching, rather than after
+                // the UI has closed: a typo in a flag should say so at the
+                // prompt, not tear the session down and report it afterwards.
+                match maki_lua::PackCommand::parse(cmd_name, &cmd.args) {
+                    Ok(_) => self.quit_with(ExitRequest::Pack(PackRequest {
+                        name: cmd_name.to_owned(),
+                        args: cmd.args.clone(),
+                        bang: cmd.bang,
+                    })),
+                    Err(msg) => {
+                        self.flash(msg);
+                        vec![]
+                    }
+                }
+            }
             name if name.starts_with("/project:") || name.starts_with("/user:") => {
                 self.execute_custom_command(name, &cmd.args)
             }

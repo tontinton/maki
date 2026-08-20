@@ -598,12 +598,7 @@ fn drain_declared(
         .chain(&installed.packages)
         .cloned()
         .collect();
-    let mut active: std::collections::BTreeSet<String> = available
-        .iter()
-        .filter(|p| p.eager && config.packages.iter().any(|n| n == &p.name))
-        .map(|p| p.name.clone())
-        .collect();
-    maki_lua::drain_pack_ops(host, declared, &available, &mut active, config).failures
+    maki_lua::drain_pack_ops(host, declared, &available, config).failures
 }
 
 pub fn index(path: &str, no_plugins: bool, no_jit: bool) -> Result<()> {

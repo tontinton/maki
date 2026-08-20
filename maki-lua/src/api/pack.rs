@@ -6,6 +6,7 @@
 //! occupying. The host installs and loads the recorded set afterwards, which is
 //! also the phase Neovim defers to.
 
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
 use maki_lua_macro::{lua_fn, lua_table};
@@ -68,6 +69,16 @@ pub struct Declared {
     pub confirm: bool,
 }
 
+impl Declared {
+    /// Whether this package loads in the startup phase.
+    ///
+    /// Asked by callers outside this crate too, so it is one method rather
+    /// than a `LoadMode` match repeated in each of them.
+    pub fn is_eager(&self) -> bool {
+        matches!(self.load, LoadMode::Eager)
+    }
+}
+
 /// Everything `init.lua` declared, in declaration order.
 ///
 /// Session state only. What is installed, and at which revision, lives in the
@@ -75,6 +86,8 @@ pub struct Declared {
 #[derive(Debug, Default, Clone)]
 pub struct PackDeclarations {
     pub specs: Vec<Declared>,
+    /// Package owners that loaded successfully in this runtime.
+    pub active: BTreeSet<String>,
     /// Operations recorded by Lua for the host to perform after the calling
     /// task has exited. Nothing here runs inline: `update` and `del` unload an
     /// owner, and unloading blocks on a reply from the runtime thread the
@@ -273,7 +286,9 @@ fn parse_spec(value: LuaValue) -> LuaResult<Spec> {
 ///   `maki.version.range()`).
 /// @param opts table? Options: `load` (boolean|table) `false` installs the
 ///   package without loading it, leaving it for `maki.packadd`; a table of
-///   `event`, `cmd`, and `keys` loads it the first time one of those fires.
+///   `event`, `cmd`, and `keys` names what should wake it. Trigger tables are
+///   recorded and checked but not dispatched yet, so a package that declares
+///   one installs and stays dormant until `maki.packadd` activates it.
 ///   `confirm` (boolean) `false` clones a new source without asking, which
 ///   states that the source is trusted and never approves its permissions.
 /// @example
@@ -300,6 +315,17 @@ fn add(lua: &Lua, specs: Table, opts: Option<Table>) -> LuaResult<()> {
 
     let mut declarations = store.lock().expect("pack declarations");
     for declared in parsed {
+        // Said plainly rather than left to be discovered. The triggers are
+        // recorded and validated, but nothing dispatches on them yet, so the
+        // package installs and waits. Staying dormant is the safe half of the
+        // feature; silently never waking would not be.
+        if let LoadMode::Triggered(_) = &declared.load {
+            tracing::warn!(
+                package = %declared.spec.name,
+                "lazy triggers are recorded but not dispatched yet; \
+                 the package stays dormant until maki.packadd activates it"
+            );
+        }
         // Neovim keeps the first declaration of a name for the session.
         if !declarations
             .specs
@@ -432,15 +458,14 @@ fn enqueue(lua: &Lua, op: PackOp, name: &str) -> LuaResult<()> {
 #[lua_fn]
 fn update(lua: &Lua, names: Option<Table>, opts: Option<Table>) -> LuaResult<()> {
     let options = parse_update_options(opts)?;
-    let names = names_arg(names)?;
-    // Omitting the argument means every declared package, which is what the
-    // documentation has always said. Enumerating them here rather than at the
-    // point of application keeps one meaning of "which packages" and lets a
-    // name be validated the same way whether it was typed or implied.
-    let names = if names.is_empty() {
-        declared_names(lua)?
-    } else {
-        names
+    // Only an omitted argument means every package. An explicit empty list is
+    // useful when callers compute a selection and must not become a bulk
+    // update by accident.
+    let names = match names {
+        Some(names) => names
+            .sequence_values::<String>()
+            .collect::<LuaResult<_>>()?,
+        None => declared_names(lua)?,
     };
     for name in names {
         enqueue(
@@ -474,6 +499,7 @@ fn parse_update_options(opts: Option<Table>) -> LuaResult<UpdateOptions> {
     let Some(opts) = opts else {
         return Ok(UpdateOptions::default());
     };
+    reject_unknown_fields(&opts, &["offline", "target"], "pack.update")?;
     let offline = match opts.get::<LuaValue>("offline")? {
         LuaValue::Nil => false,
         LuaValue::Boolean(b) => b,
@@ -665,6 +691,21 @@ mod tests {
 
     /// The name becomes a directory, so an unsafe one is refused here rather
     /// than reaching the filesystem.
+    /// A package name is an owner name. If a package could be called `bash`,
+    /// removing it would unload the bundled bash tool rather than the package.
+    #[test]
+    fn a_builtin_name_is_refused() {
+        let lua = Lua::new();
+        lua.set_app_data(PackStore::default());
+        let spec = lua.create_table().unwrap();
+        spec.set("src", "https://example.com/x").unwrap();
+        spec.set("name", "bash").unwrap();
+        let specs = lua.create_sequence_from([spec]).unwrap();
+
+        let err = call(&lua, "add", specs).expect_err("a builtin name is not available");
+        assert!(err.to_string().contains("builtin"), "{err}");
+    }
+
     #[test]
     fn an_unsafe_name_is_refused() {
         let (lua, _store) = lua_with_store();
@@ -943,6 +984,37 @@ mod tests {
             call(&lua, "update", lua.create_sequence_from(["a"]).unwrap()).unwrap();
         }
         assert_eq!(store.lock().unwrap().pending.len(), 1);
+    }
+
+    #[test]
+    fn an_explicit_empty_update_list_does_not_update_every_package() {
+        let (lua, store) = lua_with_store();
+        let declared = lua
+            .create_sequence_from(["https://github.com/user/repo"])
+            .unwrap();
+        add_fn(&lua).call::<()>(declared).unwrap();
+        let update: mlua::Function = create_pack_table(&lua).unwrap().get("update").unwrap();
+
+        update
+            .call::<()>(lua.create_table().unwrap())
+            .expect("an empty selection is valid");
+
+        assert!(store.lock().unwrap().pending.is_empty());
+    }
+
+    #[test]
+    fn update_rejects_unknown_options() {
+        let (lua, store) = lua_with_store();
+        let opts = lua.create_table().unwrap();
+        opts.set("ofline", true).unwrap();
+        let update: mlua::Function = create_pack_table(&lua).unwrap().get("update").unwrap();
+
+        assert!(
+            update
+                .call::<()>((lua.create_table().unwrap(), opts))
+                .is_err()
+        );
+        assert!(store.lock().unwrap().pending.is_empty());
     }
 
     /// A name reaches the filesystem, so it is refused here rather than later.

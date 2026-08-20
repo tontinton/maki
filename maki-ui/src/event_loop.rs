@@ -1515,7 +1515,7 @@ impl<'t> EventLoop<'t> {
             phase_start = Instant::now();
             elapsed
         };
-        let exit = self.sessions[self.focused].app.exit_request;
+        let exit = self.sessions[self.focused].app.exit_request.clone();
         if let Some(ref h) = self.ctx.mcp_handle {
             mcp::kill_process_groups(&h.reader().load().pids);
         }

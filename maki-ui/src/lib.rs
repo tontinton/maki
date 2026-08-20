@@ -42,6 +42,7 @@ use maki_storage::id::MakiId;
 pub type AppSession = maki_storage::sessions::Session<Message, TokenUsage, ToolOutput>;
 
 pub(crate) use agent::AgentCommand;
+pub use components::PackRequest;
 pub use event_loop::EventLoopParams;
 
 /// How a UI generation ended. On `Reload`, each tab carries its in-memory
@@ -54,6 +55,8 @@ pub enum RunOutcome {
     Reload {
         tabs: Vec<AppSession>,
         focused: usize,
+        /// A package change to carry out before the generation is rebuilt.
+        pack: Option<components::PackRequest>,
     },
 }
 
@@ -64,19 +67,29 @@ pub fn run(params: EventLoopParams, initial_prompt: Option<String>) -> Result<Ru
         let el = event_loop::EventLoop::new(&mut terminal, params)?;
         el.run(initial_prompt)?
     };
-    Ok(match report.exit {
+    let event_loop::ShutdownReport {
+        exit,
+        tabs,
+        focused,
+    } = report;
+    Ok(match exit {
         components::ExitRequest::Reload => RunOutcome::Reload {
-            tabs: report.tabs,
-            focused: report.focused,
+            tabs,
+            focused,
+            pack: None,
+        },
+        components::ExitRequest::Pack(request) => RunOutcome::Reload {
+            tabs,
+            focused,
+            pack: Some(request),
         },
         exit => {
-            let session_id = report
-                .tabs
-                .get(report.focused)
+            let session_id = tabs
+                .get(focused)
                 .filter(|s| app::session_has_content(s))
                 .map(|s| s.id);
             let started = Instant::now();
-            drop(report);
+            drop(tabs);
             tracing::info!(
                 elapsed_ms = started.elapsed().as_millis() as u64,
                 "session buffers dropped"

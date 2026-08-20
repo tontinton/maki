@@ -103,10 +103,14 @@ pub fn read_approvals() -> maki_pack::approvals::Approvals {
     let Some(path) = approvals_path() else {
         return maki_pack::approvals::Approvals::default();
     };
-    let text = match fs::read_to_string(&path) {
+    read_approvals_file(&path).unwrap_or_default()
+}
+
+fn read_approvals_file(path: &Path) -> Option<maki_pack::approvals::Approvals> {
+    let text = match fs::read_to_string(path) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return maki_pack::approvals::Approvals::default();
+            return Some(maki_pack::approvals::Approvals::default());
         }
         Err(error) => {
             tracing::error!(
@@ -114,18 +118,18 @@ pub fn read_approvals() -> maki_pack::approvals::Approvals {
                 %error,
                 "pack approval store could not be read; granting nothing"
             );
-            return maki_pack::approvals::Approvals::default();
+            return None;
         }
     };
     match serde_json::from_str(&text) {
-        Ok(approvals) => approvals,
+        Ok(approvals) => Some(approvals),
         Err(e) => {
             tracing::error!(
                 path = %path.display(),
                 error = %e,
                 "pack approval store is unreadable; granting nothing"
             );
-            maki_pack::approvals::Approvals::default()
+            None
         }
     }
 }
@@ -374,7 +378,6 @@ pub fn apply_pack_ops(
     ops: &[crate::api::pack::PackOp],
     declared: &[crate::api::pack::Declared],
     packages: &[DiscoveredPackage],
-    active: &std::collections::BTreeSet<String>,
     config: &maki_config::PluginsConfig,
 ) -> PackReport {
     use crate::api::pack::{PackOp, UpdateTarget};
@@ -428,6 +431,18 @@ pub fn apply_pack_ops(
             return report;
         }
     };
+    // Updated as the batch proceeds. Read once and left alone, a delete
+    // followed by an activate in the same batch would skip the activate as
+    // "already loaded" for a package the delete had just unloaded.
+    let mut active = match host.active_packages() {
+        Ok(active) => active,
+        Err(error) => {
+            report
+                .failures
+                .push(format!("could not read active packages: {error}"));
+            return report;
+        }
+    };
 
     let mut changed = false;
     let manual = discover(&site).packages;
@@ -470,11 +485,23 @@ pub fn apply_pack_ops(
                     ));
                     continue;
                 }
-                report.unloaded.push(name.clone());
+                active.remove(name);
                 match manager.remove(name, &mut lock) {
                     Ok(()) => {
                         changed = true;
                         report.removed.push(name.clone());
+                        // Last, so a step that fails earlier leaves the
+                        // approval exactly as it was. Revoking first would
+                        // strip the grant from a package that is still
+                        // installed, and every guarded call it makes would
+                        // then report a permission problem instead of the
+                        // removal that actually failed.
+                        if !revoke_approval(name) {
+                            report.failures.push(format!(
+                                "{name}: removed, but its approval could not be revoked; \
+                                 reinstalling the same source would not ask again"
+                            ));
+                        }
                     }
                     Err(e) => {
                         let msg = redact_error(&e);
@@ -525,10 +552,10 @@ pub fn apply_pack_ops(
                                 }
                                 continue;
                             }
-                            report.unloaded.push(name.clone());
                             // Only reload what was running. Updating a package
                             // that was dormant, or waiting on a lazy trigger,
                             // must not be the thing that starts it.
+                            active.remove(name);
                             match load_one(
                                 host,
                                 name,
@@ -538,10 +565,15 @@ pub fn apply_pack_ops(
                                 },
                                 config,
                             ) {
-                                Ok(()) => report.loaded.push(name.clone()),
-                                Err(message) => report
+                                Ok(()) => {
+                                    active.insert(name.clone());
+                                }
+                                // The old owner is already gone, so this is a
+                                // package that is now installed and not
+                                // running. Saying so beats reporting success.
+                                Err(msg) => report
                                     .failures
-                                    .push(format!("{name}: updated but failed to load: {message}")),
+                                    .push(format!("{name}: updated but failed to load: {msg}")),
                             }
                         }
                         changed |= result.changed;
@@ -581,8 +613,8 @@ pub fn apply_pack_ops(
                 match found {
                     Some((dir, origin)) => match load_one(host, name, &dir, origin, config) {
                         Ok(()) => {
+                            active.insert(name.clone());
                             report.activated.push(name.clone());
-                            report.loaded.push(name.clone());
                         }
                         Err(message) => report
                             .failures
@@ -603,6 +635,15 @@ pub fn apply_pack_ops(
         && let Some(path) = lock_path
         && !write_lockfile(&path, &lock)
     {
+        // The packages moved on disk but nothing recorded where. The next
+        // start reads the old lockfile and loads the old revisions, so these
+        // updates did not stick and must not be counted as done.
+        for (name, _) in report.updated.drain(..) {
+            report.failures.push(format!(
+                "{name}: the new revision could not be recorded, so the old one \
+                comes back on the next start"
+            ));
+        }
         report
             .failures
             .push("packages changed but the lockfile could not be written".to_owned());
@@ -615,6 +656,161 @@ fn owner_conflict(name: &str) -> Option<String> {
         .then(|| format!("{name}: managed package name conflicts with a builtin plugin"))
 }
 
+/// Every package name the lockfile records, whether or not `init.lua` still
+/// declares it.
+///
+/// Removal is a property of what is on disk, not of what is declared. A user
+/// who deletes the `maki.pack.add` line and then wants the files gone is the
+/// ordinary case, and asking the declarations would answer "unknown package".
+pub fn installed_names() -> Option<Vec<String>> {
+    let lock = read_lockfile(lockfile_path().as_deref())?;
+    Some(lock.install_order().map(str::to_owned).collect())
+}
+
+/// What `/packupdate` or `/packdel` asked for.
+///
+/// Parsed here rather than in the UI so the flags mean exactly what the Lua
+/// options mean; `++lockfile` and `target = "lockfile"` reach the same field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PackCommand {
+    Update {
+        /// Empty means every declared package.
+        names: Vec<String>,
+        options: crate::api::pack::UpdateOptions,
+    },
+    Delete {
+        names: Vec<String>,
+        /// `++all`. Without a bang, active packages are kept.
+        all: bool,
+    },
+}
+
+impl PackCommand {
+    pub fn parse(name: &str, args: &str) -> Result<Self, String> {
+        use crate::api::pack::{UpdateOptions, UpdateTarget};
+
+        let mut names = Vec::new();
+        let mut options = UpdateOptions::default();
+        let mut all = false;
+        for word in args.split_whitespace() {
+            match word {
+                "++offline" => options.offline = true,
+                "++lockfile" => options.target = UpdateTarget::Lockfile,
+                "++all" => all = true,
+                // Refused rather than treated as a package name. A flag maki
+                // does not know is a mistake, and silently reading `++ofline`
+                // as a package would report the wrong problem.
+                flag if flag.starts_with('+') || flag.starts_with('-') => {
+                    return Err(format!("{name}: unknown option {flag:?}"));
+                }
+                other => names.push(other.to_owned()),
+            }
+        }
+
+        match name {
+            "/packupdate" => {
+                if all {
+                    return Err("/packupdate: ++all is not an option; omit the name instead".into());
+                }
+                Ok(PackCommand::Update { names, options })
+            }
+            "/packdel" => {
+                if options != UpdateOptions::default() {
+                    return Err("/packdel: ++offline and ++lockfile apply to /packupdate".into());
+                }
+                if all != names.is_empty() {
+                    return Err("/packdel: name a package, or pass ++all".into());
+                }
+                Ok(PackCommand::Delete { names, all })
+            }
+            other => Err(format!("{other}: not a package command")),
+        }
+    }
+}
+
+/// Turns a command into the operations that carry it out.
+///
+/// `declared` names what `init.lua` asked for, `installed` what the lockfile
+/// records, and `active` what is loaded. All three are passed in rather than
+/// read here, so this stays a pure decision that a test can drive.
+pub fn plan_command(
+    cmd: &PackCommand,
+    bang: bool,
+    declared: &[crate::api::pack::Declared],
+    installed: &[String],
+    active: &std::collections::BTreeSet<String>,
+) -> Result<Vec<crate::api::pack::PackOp>, String> {
+    use crate::api::pack::PackOp;
+
+    let known: Vec<&str> = declared.iter().map(|d| d.spec.name.as_str()).collect();
+    let resolve = |names: &[String]| -> Result<Vec<String>, String> {
+        for name in names {
+            if !known.contains(&name.as_str()) {
+                return Err(format!("{name}: not a package declared with maki.pack.add"));
+            }
+        }
+        Ok(names.to_vec())
+    };
+
+    match cmd {
+        PackCommand::Update { names, options } => {
+            let names = if names.is_empty() {
+                known.iter().map(|n| (*n).to_owned()).collect()
+            } else {
+                resolve(names)?
+            };
+            Ok(names
+                .into_iter()
+                .map(|name| PackOp::Update {
+                    name,
+                    options: *options,
+                })
+                .collect())
+        }
+        PackCommand::Delete { names, all } => {
+            // Deletion asks what is installed, not what is declared. Removing
+            // the `maki.pack.add` line and then removing the files is the
+            // normal way to get rid of a package, and it is the only way that
+            // works under `--no-plugins`, where nothing is declared at all.
+            let names = if *all {
+                // Without the bang this removes only what is not running,
+                // matching `:packdel ++all`. Removing a loaded package is the
+                // destructive half, so it needs the bang to say so.
+                installed
+                    .iter()
+                    .filter(|name| !known.contains(&name.as_str()))
+                    .filter(|name| bang || !active.contains(*name))
+                    .cloned()
+                    .collect()
+            } else {
+                for name in names {
+                    if !installed.contains(name) {
+                        return Err(format!("{name}: not an installed package"));
+                    }
+                    if known.contains(&name.as_str()) {
+                        return Err(format!(
+                            "{name}: package is still declared; remove it from maki.pack.add first"
+                        ));
+                    }
+                    if active.contains(name) && !bang {
+                        return Err(format!(
+                            "{name}: package is active; use /packdel! to remove it"
+                        ));
+                    }
+                }
+                names.to_vec()
+            };
+            if names.is_empty() {
+                return Err("no package matched; nothing was removed".into());
+            }
+            Ok(names
+                .into_iter()
+                .map(|name| PackOp::Delete { name })
+                .collect())
+        }
+    }
+}
+
 /// Applies whatever `init.lua` asked for, once everything it could refer to is
 /// loaded.
 ///
@@ -625,15 +821,10 @@ fn owner_conflict(name: &str) -> Option<String> {
 /// startup thread, after the packages are loaded, means the work happens off
 /// the Lua thread (so unloading cannot wait on itself) and before the terminal
 /// is taken over (so a clone cannot freeze a redraw).
-///
-/// `active` is the set of package owners currently loaded. It is updated in
-/// place, because whether a package was running decides whether an update
-/// reloads it.
 pub fn drain_pack_ops(
     host: &crate::loader::PluginHost,
     declared: &[crate::api::pack::Declared],
     packages: &[DiscoveredPackage],
-    active: &mut std::collections::BTreeSet<String>,
     config: &maki_config::PluginsConfig,
 ) -> PackReport {
     let ops = match host.take_pending_pack_ops() {
@@ -643,14 +834,7 @@ pub fn drain_pack_ops(
             return PackReport::default();
         }
     };
-    let report = apply_pack_ops(host, &ops, declared, packages, active, config);
-    for name in &report.unloaded {
-        active.remove(name);
-    }
-    for name in &report.loaded {
-        active.insert(name.clone());
-    }
-    report
+    apply_pack_ops(host, &ops, declared, packages, config)
 }
 
 /// What a batch of package operations did.
@@ -664,10 +848,6 @@ pub struct PackReport {
     pub updated: Vec<(String, String)>,
     pub removed: Vec<String>,
     pub activated: Vec<String>,
-    /// Names that are now loaded, or no longer loaded, so the caller can keep
-    /// its active set in step without asking the runtime.
-    pub loaded: Vec<String>,
-    pub unloaded: Vec<String>,
     pub failures: Vec<String>,
 }
 
@@ -700,7 +880,7 @@ impl PackReport {
 /// carry a password. The git runner redacts its own output, but an error built
 /// outside it (an unsatisfied version range, for one) never passed through
 /// that, so the redaction is applied at the point of logging instead.
-fn redact_error(e: &impl std::fmt::Display) -> String {
+pub(crate) fn redact_error(e: &impl std::fmt::Display) -> String {
     sanitize_message(&maki_pack::git::redact(&e.to_string()))
 }
 
@@ -726,6 +906,11 @@ fn resolve_for_activation(
         .map(|p| (p.dir, p.origin))
 }
 
+/// Loads one package and says whether it worked.
+///
+/// Deliberately not `load_packages`, which only logs a failure. A caller that
+/// has just unloaded the old owner has to know the new one did not arrive, or
+/// it reports an update that left the package gone.
 fn load_one(
     host: &crate::loader::PluginHost,
     name: &str,
@@ -773,6 +958,7 @@ pub(crate) fn read_lockfile(path: Option<&Path>) -> Option<maki_pack::lockfile::
     }
 }
 
+/// Writes the lockfile, and says whether it landed.
 fn write_lockfile(path: &Path, lock: &maki_pack::lockfile::Lockfile) -> bool {
     match lock.to_json() {
         Ok(text) => match write_atomically(path, &text) {
@@ -784,6 +970,38 @@ fn write_lockfile(path: &Path, lock: &maki_pack::lockfile::Lockfile) -> bool {
         },
         Err(e) => {
             tracing::error!(error = %e, "failed to serialize pack lockfile");
+            false
+        }
+    }
+}
+
+/// Drops a package's recorded approval.
+///
+/// Removal stops when this fails, so a deleted package never leaves a grant
+/// that can silently return with a later install.
+fn revoke_approval(name: &str) -> bool {
+    let Some(path) = approvals_path() else {
+        return true;
+    };
+    let Some(mut approvals) = read_approvals_file(&path) else {
+        return false;
+    };
+    approvals.revoke(name);
+    let text = if approvals.is_empty() {
+        "{}".to_owned()
+    } else {
+        match serde_json::to_string_pretty(&approvals) {
+            Ok(text) => text,
+            Err(e) => {
+                tracing::error!(error = %e, "failed to serialize pack approvals");
+                return false;
+            }
+        }
+    };
+    match write_atomically(&path, &text) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::error!(path = %path.display(), error = %e, "failed to write pack approvals");
             false
         }
     }
@@ -960,6 +1178,23 @@ mod tests {
         assert!(read_lockfile(Some(&path)).unwrap().is_empty());
     }
 
+    #[test]
+    fn an_invalid_approval_store_is_not_safe_to_overwrite() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("approvals.json");
+        fs::write(&path, "not json").unwrap();
+
+        assert!(read_approvals_file(&path).is_none());
+    }
+
+    #[test]
+    fn a_missing_approval_store_reads_as_empty() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("missing.json");
+
+        assert!(read_approvals_file(&path).unwrap().is_empty());
+    }
+
     fn make_package(site: &Path, group: &str, sub: &str, name: &str) -> PathBuf {
         let dir = site.join("pack").join(group).join(sub).join(name);
         fs::create_dir_all(dir.join("plugin")).unwrap();
@@ -1067,6 +1302,158 @@ mod tests {
             !granted(&moved, &approvals).is_allowed(Permission::Run),
             "an approval for one repository must not grant another"
         );
+    }
+
+    fn declared_named(names: &[&str]) -> Vec<crate::api::pack::Declared> {
+        names
+            .iter()
+            .map(|n| crate::api::pack::Declared {
+                spec: maki_pack::Spec::new(format!("https://example.com/{n}")).with_name(*n),
+                load: crate::api::pack::LoadMode::Eager,
+                confirm: true,
+            })
+            .collect()
+    }
+
+    fn active_set(names: &[&str]) -> std::collections::BTreeSet<String> {
+        names.iter().map(|n| (*n).to_owned()).collect()
+    }
+
+    #[test]
+    fn packupdate_flags_map_onto_the_same_options_lua_uses() {
+        use crate::api::pack::{UpdateOptions, UpdateTarget};
+
+        let cmd = PackCommand::parse("/packupdate", "++offline ++lockfile").unwrap();
+        assert_eq!(
+            cmd,
+            PackCommand::Update {
+                names: vec![],
+                options: UpdateOptions {
+                    target: UpdateTarget::Lockfile,
+                    offline: true,
+                },
+            }
+        );
+    }
+
+    /// A mistyped flag must not become a package name, or the error would name
+    /// the wrong problem.
+    #[test]
+    fn an_unknown_flag_is_refused_rather_than_read_as_a_name() {
+        let err = PackCommand::parse("/packupdate", "++ofline")
+            .expect_err("a misspelled flag is not a package");
+        assert!(err.contains("++ofline"), "{err}");
+    }
+
+    /// No name means every declared package, which is what the command's own
+    /// help says and what `:packupdate` does.
+    #[test]
+    fn packupdate_without_a_name_plans_every_declared_package() {
+        let declared = declared_named(&["alpha", "beta"]);
+        let cmd = PackCommand::parse("/packupdate", "").unwrap();
+        let ops = plan_command(&cmd, false, &declared, &[], &active_set(&[])).unwrap();
+        assert_eq!(ops.len(), 2);
+    }
+
+    #[test]
+    fn packupdate_refuses_a_package_that_was_never_declared() {
+        let declared = declared_named(&["alpha"]);
+        let cmd = PackCommand::parse("/packupdate", "ghost").unwrap();
+        let err = plan_command(&cmd, false, &declared, &[], &active_set(&[]))
+            .expect_err("an undeclared package cannot be updated");
+        assert!(err.contains("ghost"), "{err}");
+    }
+
+    /// `++all` without the bang removes only what is not running, and with the
+    /// bang removes everything. This is the confirmation the bang stands in
+    /// for: the destructive half has to be asked for explicitly.
+    #[test]
+    fn packdel_all_skips_loaded_packages_unless_the_bang_is_given() {
+        let declared = Vec::new();
+        let installed = vec!["alpha".to_owned(), "beta".to_owned()];
+        let active = active_set(&["alpha"]);
+        let cmd = PackCommand::parse("/packdel", "++all").unwrap();
+
+        let ops = plan_command(&cmd, false, &declared, &installed, &active).unwrap();
+        assert_eq!(
+            ops,
+            vec![crate::api::pack::PackOp::Delete {
+                name: "beta".to_owned()
+            }],
+            "without the bang, the loaded package stays"
+        );
+
+        let forced = plan_command(&cmd, true, &declared, &installed, &active).unwrap();
+        assert_eq!(forced.len(), 2, "the bang removes the loaded one too");
+    }
+
+    /// Deleting a package is how you get rid of one you no longer declare, so
+    /// it has to work from the installed set alone. Asking the declarations
+    /// would make the ordinary "remove the line, then remove the files"
+    /// sequence impossible, and would break the command under `--no-plugins`,
+    /// where nothing is declared at all.
+    #[test]
+    fn packdel_removes_an_installed_package_that_is_no_longer_declared() {
+        let installed = vec!["orphan".to_owned()];
+        let cmd = PackCommand::parse("/packdel", "orphan").unwrap();
+
+        let ops = plan_command(&cmd, false, &[], &installed, &active_set(&[]))
+            .expect("an installed package can be removed without a declaration");
+        assert_eq!(
+            ops,
+            vec![crate::api::pack::PackOp::Delete {
+                name: "orphan".to_owned()
+            }]
+        );
+    }
+
+    #[test]
+    fn packdel_refuses_a_package_that_startup_would_reinstall() {
+        let declared = declared_named(&["alpha"]);
+        let installed = vec!["alpha".to_owned()];
+        let cmd = PackCommand::parse("/packdel", "alpha").unwrap();
+
+        let error = plan_command(&cmd, true, &declared, &installed, &active_set(&[]))
+            .expect_err("a declared package would be reinstalled during the reload");
+
+        assert!(error.contains("remove it from maki.pack.add"), "{error}");
+    }
+
+    #[test]
+    fn packdel_requires_bang_for_an_active_named_package() {
+        let installed = vec!["alpha".to_owned()];
+        let active = active_set(&["alpha"]);
+        let cmd = PackCommand::parse("/packdel", "alpha").unwrap();
+
+        assert!(plan_command(&cmd, false, &[], &installed, &active).is_err());
+        assert_eq!(
+            plan_command(&cmd, true, &[], &installed, &active).unwrap(),
+            vec![crate::api::pack::PackOp::Delete {
+                name: "alpha".to_owned()
+            }]
+        );
+    }
+
+    #[test]
+    fn packdel_refuses_a_package_that_is_not_installed() {
+        let cmd = PackCommand::parse("/packdel", "ghost").unwrap();
+        let err = plan_command(&cmd, false, &[], &[], &active_set(&[]))
+            .expect_err("nothing to remove is an error, not a silent success");
+        assert!(err.contains("ghost"), "{err}");
+    }
+
+    #[test]
+    fn packdel_needs_either_a_name_or_all_but_not_both() {
+        assert!(PackCommand::parse("/packdel", "").is_err());
+        assert!(PackCommand::parse("/packdel", "++all alpha").is_err());
+        assert!(PackCommand::parse("/packdel", "alpha").is_ok());
+    }
+
+    /// The update flags mean nothing to a delete, so accepting them silently
+    /// would let a user believe an offline delete did something different.
+    #[test]
+    fn packdel_refuses_the_update_flags() {
+        assert!(PackCommand::parse("/packdel", "++all ++offline").is_err());
     }
 
     #[test]

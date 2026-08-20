@@ -250,7 +250,13 @@ configuration rather than something a downloaded plugin may do.
   package without loading it, leaving it for `maki.packadd`; a table of
 
 
-  `event`, `cmd`, and `keys` loads it the first time one of those fires.
+  `event`, `cmd`, and `keys` names what should wake it. Trigger tables are
+
+
+  recorded and checked but not dispatched yet, so a package that declares
+
+
+  one installs and stays dormant until `maki.packadd` activates it.
 
   - `confirm` (`boolean`) `false` clones a new source without asking, which
 

@@ -79,24 +79,12 @@ pub fn run(model_arg: Option<String>, yolo: bool, no_plugins: bool, no_jit: bool
     // whatever `init.lua` asked to change. Draining here rather than inside
     // the Lua call is what keeps unloading from waiting on the thread that
     // requested it.
-    let mut active: std::collections::BTreeSet<String> = packages
-        .iter()
-        .chain(&installed.packages)
-        .filter(|p| p.eager && config.plugins.packages.iter().any(|n| n == &p.name))
-        .map(|p| p.name.clone())
-        .collect();
     let available: Vec<maki_lua::DiscoveredPackage> = packages
         .iter()
         .chain(&installed.packages)
         .cloned()
         .collect();
-    maki_lua::drain_pack_ops(
-        &plugin_host,
-        &declared,
-        &available,
-        &mut active,
-        &config.plugins,
-    );
+    maki_lua::drain_pack_ops(&plugin_host, &declared, &available, &config.plugins);
 
     let timeouts = maki_providers::Timeouts {
         connect: config.provider.connect_timeout,

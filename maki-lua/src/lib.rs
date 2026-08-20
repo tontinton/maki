@@ -20,9 +20,9 @@ pub use docs::{DocKind, FnDoc, ModuleDoc, ParamDoc, api_docs};
 pub use error::PluginError;
 pub use loader::{EventHandle, PluginHost};
 pub use pack::{
-    DiscoveredPackage, Discovery, InstallReport, Interaction, MANAGED_GROUP, Origin, PackReport,
-    apply_pack_ops, discover, discover_installed, drain_pack_ops, install_declared, lockfile_path,
-    site_dir,
+    DiscoveredPackage, Discovery, InstallReport, Interaction, MANAGED_GROUP, Origin, PackCommand,
+    PackReport, apply_pack_ops, discover, discover_installed, drain_pack_ops, install_declared,
+    installed_names, lockfile_path, plan_command, site_dir,
 };
 pub use plugin_permissions::{Permission, PluginPermissions, Requested};
 pub use runtime::{KILL_GRACE, RestoreItem, WARM_TOOL_CAP};

@@ -1,4 +1,3 @@
-use std::collections::BTreeSet;
 use std::env;
 use std::io::{self, IsTerminal, Read};
 use std::path::Path;
@@ -74,24 +73,46 @@ impl Drop for Teardown {
     }
 }
 
-/// Which package owners are loaded right now.
+/// Carries out `/packupdate` or `/packdel`, and reports what happened.
 ///
-/// `load_packages` skips a package that is not eager or that the config
-/// disabled, so the set of packages handed to it is not the set that loaded.
-/// This applies the same two filters, and is the answer an update needs to
-/// decide whether reloading a package would start something that was
-/// deliberately left dormant.
-fn active_owners(
-    manual: &[DiscoveredPackage],
-    installed: &[DiscoveredPackage],
-    config: &maki_config::PluginsConfig,
-) -> BTreeSet<String> {
-    manual
-        .iter()
-        .chain(installed)
-        .filter(|p| p.eager && config.packages.iter().any(|n| n == &p.name))
-        .map(|p| p.name.clone())
-        .collect()
+/// Runs between UI generations, which is the one place that can do this: it is
+/// off the Lua thread, so unloading an owner cannot wait on the thread that
+/// asked for it, and the terminal is not held, so a clone cannot stall a
+/// redraw.
+fn run_pack_command(stack: &Stack, request: &maki_ui::PackRequest) -> Vec<String> {
+    let cmd = match maki_lua::PackCommand::parse(&request.name, &request.args) {
+        Ok(cmd) => cmd,
+        Err(msg) => return vec![msg],
+    };
+    let declared = match stack.plugin_host.declared_packages() {
+        Ok(declared) => declared,
+        Err(e) => return vec![format!("could not read declared packages: {e}")],
+    };
+    let installed = match maki_lua::installed_names() {
+        Some(installed) => installed,
+        None => return vec!["could not read the package lockfile".to_owned()],
+    };
+    let active = match stack.plugin_host.active_packages() {
+        Ok(active) => active,
+        Err(error) => return vec![format!("could not read active packages: {error}")],
+    };
+
+    let ops = match maki_lua::plan_command(&cmd, request.bang, &declared, &installed, &active) {
+        Ok(ops) => ops,
+        Err(msg) => return vec![msg],
+    };
+    // `/packupdate` and `/packdel` name managed packages, which resolve from
+    // the lockfile, so no discovered set is needed here.
+    let report = maki_lua::apply_pack_ops(
+        &stack.plugin_host,
+        &ops,
+        &declared,
+        &[],
+        &stack.config.plugins,
+    );
+    let mut messages = vec![report.summary()];
+    messages.extend(report.failures.iter().cloned());
+    messages
 }
 
 fn discover_commands(disable: bool) -> Vec<CustomCommand> {
@@ -156,16 +177,21 @@ fn load_config(
     Ok(config)
 }
 
+/// Returns the config to use, and whether it came from the fallback.
+///
+/// The second half matters because a rejected `init.lua` may also have called
+/// `maki.pack.del`. Reporting that the old config was kept and then deleting
+/// the package anyway would be the worst of both.
 fn config_or_fallback(
     loaded: Result<Config>,
     fallback: Option<Config>,
     warnings: &mut Vec<String>,
-) -> Result<Config> {
+) -> Result<(Config, bool)> {
     match (loaded, fallback) {
-        (Ok(config), _) => Ok(config),
+        (Ok(config), _) => Ok((config, false)),
         (Err(e), Some(last_good)) => {
             warnings.push(format!("{CONFIG_FALLBACK_WARNING}: {e:#}"));
-            Ok(last_good)
+            Ok((last_good, true))
         }
         (Err(e), None) => Err(e),
     }
@@ -198,7 +224,7 @@ fn build_stack(
 
     let (fallback_config, fallback_model) = fallback.unzip();
     let reloading = fallback_model.is_some();
-    let config = config_or_fallback(
+    let (config, config_rejected) = config_or_fallback(
         load_config(&plugin_host, cli, cwd, &packages),
         fallback_config,
         &mut warnings,
@@ -221,6 +247,14 @@ fn build_stack(
     // inside the call keeps a clone off the Lua thread, and is the phase
     // Neovim's own `load` default defers to.
     match plugin_host.declared_packages() {
+        // Checked before anything is cloned or loaded, not after. A refused
+        // config must not have any part of itself carried out, and installing
+        // is already a visible act: it reaches the network, writes the
+        // lockfile, and can run the fetched code under a package name the
+        // fallback config happens to enable.
+        Ok(_) if config_rejected => {
+            warnings.push("package changes in the rejected config were not applied".to_owned());
+        }
         Ok(declared) => {
             let installed = maki_lua::install_declared(&declared, maki_lua::Interaction::Tty);
             warnings.extend(installed.failures.iter().cloned());
@@ -231,19 +265,13 @@ fn build_stack(
             // that was running. This is also the only safe place for it: the
             // work unloads owners, which waits on the Lua thread, so it cannot
             // run inside the Lua call that asked for it.
-            let mut active = active_owners(&packages, &installed.packages, &config.plugins);
             let available: Vec<maki_lua::DiscoveredPackage> = packages
                 .iter()
                 .chain(&installed.packages)
                 .cloned()
                 .collect();
-            let report = maki_lua::drain_pack_ops(
-                &plugin_host,
-                &declared,
-                &available,
-                &mut active,
-                &config.plugins,
-            );
+            let report =
+                maki_lua::drain_pack_ops(&plugin_host, &declared, &available, &config.plugins);
             warnings.extend(report.failures.iter().cloned());
         }
         Err(e) => warnings.push(format!("could not read declared packages: {e}")),
@@ -479,9 +507,17 @@ pub fn run(mut cli: Cli) -> Result<()> {
             RunOutcome::Reload {
                 tabs: reloaded,
                 focused: f,
+                pack,
             } => {
                 let started = Instant::now();
                 let last_good = (stack.config.clone(), stack.model.clone());
+                // Before the host is shut down, because the work needs it: an
+                // update unloads the old owner and loads the new one. The
+                // generation is then rebuilt below, exactly as `/reload` does,
+                // so the session comes back with the new package set.
+                let pack_messages = pack
+                    .map(|request| run_pack_command(&stack, &request))
+                    .unwrap_or_default();
                 // Shut the old host down first so nothing can repopulate
                 // the registry after the clear: its senders disconnect, the
                 // watchdog aborts in-flight callbacks, and only this thread
@@ -499,7 +535,12 @@ pub fn run(mut cli: Cli) -> Result<()> {
                     tabs.push(session);
                 }
                 stack = new_stack;
-                warnings = new_warnings;
+                // Ahead of the rebuild's own warnings, and not replaced by
+                // them. The user typed the command that produced these, so
+                // losing them to the reload would answer a direct request
+                // with silence.
+                warnings = pack_messages;
+                warnings.extend(new_warnings);
                 focused = f.min(tabs.len() - 1);
                 tracing::info!(
                     elapsed_ms = started.elapsed().as_millis() as u64,
@@ -583,10 +624,15 @@ mod tests {
         last_good.always_fast = true;
         let mut warnings = Vec::new();
 
-        let config = config_or_fallback(Err(eyre!("boom")), Some(last_good), &mut warnings)
-            .expect("fallback config");
+        let (config, rejected) =
+            config_or_fallback(Err(eyre!("boom")), Some(last_good), &mut warnings)
+                .expect("fallback config");
 
         assert!(config.always_fast);
+        assert!(
+            rejected,
+            "the caller has to know the new config was refused"
+        );
         assert_eq!(warnings.len(), 1);
         assert!(
             warnings[0].starts_with(CONFIG_FALLBACK_WARNING),
