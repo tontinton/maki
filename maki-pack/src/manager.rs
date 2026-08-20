@@ -229,6 +229,34 @@ impl Manager {
         })
     }
 
+    pub async fn revision_log(
+        &self,
+        name: &str,
+        from: &str,
+        to: &str,
+    ) -> Result<Vec<String>, ManagerError> {
+        self.check_name(name, "")?;
+        for rev in [from, to] {
+            if !revision_is_safe_component(rev) {
+                return Err(ManagerError::UnsafeRevision {
+                    rev: rev.to_owned(),
+                });
+            }
+        }
+        let output = git::run(
+            git::log_args(&self.hooks_dir()?, from, to),
+            Some(self.work_dir(name)),
+        )
+        .await?;
+        Ok(output
+            .stdout
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_owned)
+            .collect())
+    }
+
     /// Rejects a name that would not stay inside the package root.
     ///
     /// Every path this type builds is `<site>/pack/core/<name>/...`, and an
@@ -564,17 +592,24 @@ mod tests {
     #[test]
     fn a_refused_name_creates_nothing() {
         let dir = site();
-        let outside = dir.path().join("outside");
-        fs::create_dir_all(&outside).unwrap();
-
         let site_dir = dir.path().join("site");
+        // Where `pack/core/../outside` actually lands. Guarding a different
+        // directory would leave this test passing with the guard removed.
+        let escaped = site_dir.join("pack").join("outside");
+        fs::create_dir_all(&escaped).unwrap();
+        fs::write(escaped.join("keep"), "mine").unwrap();
+
         let mgr = Manager::new(&site_dir);
         let mut lock = Lockfile::default();
         let spec = Spec::new("https://x/demo").with_name("../outside");
 
         let _ = smol::block_on(mgr.ensure_installed(&spec, &mut lock));
         let _ = mgr.remove("../outside", &mut lock);
-        assert!(outside.is_dir(), "a refused name must not touch anything");
+
+        assert!(
+            escaped.join("keep").is_file(),
+            "a refused name must not touch what it points at"
+        );
     }
 
     #[test]
@@ -1052,7 +1087,6 @@ mod tests {
 
     /// The lockfile is committed and hand-edited, so its values are input. Both
     /// halves become path components and must not escape the site directory.
-    #[test_case("/tmp/evil" ; "absolute_revision")]
     #[test_case("../../evil" ; "traversing_revision")]
     #[test_case("has/slash" ; "revision_with_separator")]
     fn a_crafted_lockfile_revision_does_not_resolve(rev: &str) {
@@ -1061,13 +1095,35 @@ mod tests {
         let mut lock = Lockfile::default();
         lock.record("demo", "https://x/demo", rev);
 
-        // Make the escaped target exist, so only the guard can reject it.
+        // The escaped target has to exist, or the guard is not what rejects it.
+        // Every case stays inside this temporary directory: a test must never
+        // create or reuse a path shared with the machine it runs on.
         let escaped = paths::revision_dir(dir.path(), "demo", rev);
-        let _ = fs::create_dir_all(&escaped);
+        fs::create_dir_all(&escaped)
+            .expect("the escaped target must exist for this to prove anything");
 
         assert!(
             mgr.resolve(&lock, "demo").is_none(),
             "revision {rev:?} must not resolve to a directory outside the package"
+        );
+    }
+
+    /// The absolute case needs a path built at run time, so it cannot be a
+    /// `test_case` string. It must point inside this test's own directory: an
+    /// absolute literal would make the test create or reuse a path on the
+    /// machine running it.
+    #[test]
+    fn an_absolute_lockfile_revision_does_not_resolve() {
+        let dir = site();
+        let mgr = Manager::new(dir.path());
+        let mut lock = Lockfile::default();
+        let escaped = dir.path().join("evil");
+        fs::create_dir_all(&escaped).expect("the escaped target must exist");
+        lock.record("demo", "https://x/demo", escaped.display().to_string());
+
+        assert!(
+            mgr.resolve(&lock, "demo").is_none(),
+            "an absolute revision must not resolve outside the package"
         );
     }
 

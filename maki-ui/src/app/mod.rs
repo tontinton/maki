@@ -28,7 +28,6 @@ use crate::app::tasks::TaskOutcome;
 use crate::chat::Chat;
 use crate::chat::{CANCELLED_TEXT, ChatEventResult, DONE_TEXT, ERROR_TEXT};
 use crate::clipboard::ClipboardState;
-use crate::components::PackRequest;
 use crate::components::btw_modal::BtwModal;
 use crate::components::command::{CommandAction, CommandPalette, ParsedCommand};
 use crate::components::file_picker::{FilePickerModal, FilePickerModalAction};
@@ -842,7 +841,9 @@ impl App {
         for entry in &snap.entries {
             if entry.key == key.code
                 && entry.modifiers == key.modifiers
-                && self.lua_event_handle.run_keybind_callback(entry.id)
+                && self
+                    .lua_event_handle
+                    .run_keybind_callback(entry.id, entry.key, entry.modifiers)
             {
                 return true;
             }
@@ -1412,12 +1413,8 @@ impl App {
                 // Refused here, while the user is watching, rather than after
                 // the UI has closed: a typo in a flag should say so at the
                 // prompt, not tear the session down and report it afterwards.
-                match maki_lua::PackCommand::parse(cmd_name, &cmd.args) {
-                    Ok(_) => self.quit_with(ExitRequest::Pack(PackRequest {
-                        name: cmd_name.to_owned(),
-                        args: cmd.args.clone(),
-                        bang: cmd.bang,
-                    })),
+                match maki_lua::PackCommand::parse(cmd_name, &cmd.args, cmd.bang) {
+                    Ok(command) => self.quit_with(ExitRequest::Pack(command)),
                     Err(msg) => {
                         self.flash(msg);
                         vec![]

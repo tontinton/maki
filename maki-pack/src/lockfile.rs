@@ -50,24 +50,10 @@ impl Lockfile {
         self.packages.remove(name);
     }
 
-    /// Puts an entry back exactly as it was.
-    ///
-    /// An update drops the pin so `version` is resolved again. If that resolve
-    /// then fails, the pin has to return: a later operation in the same batch
-    /// writes the lockfile, and a package that is still on disk would
-    /// otherwise be recorded nowhere.
-    pub fn restore(&mut self, name: impl Into<String>, entry: LockEntry) {
-        self.packages.insert(name.into(), entry);
-    }
-
     /// Names in the order they should be installed from a lockfile, which is
     /// alphabetical so a first start costs the same on every machine.
     pub fn install_order(&self) -> impl Iterator<Item = &str> {
         self.packages.keys().map(String::as_str)
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.packages.is_empty()
     }
 
     pub fn to_json(&self) -> Result<String, serde_json::Error> {

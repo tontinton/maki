@@ -574,31 +574,22 @@ fn load_effective_config(
     cwd: &Path,
     packages: &[maki_lua::DiscoveredPackage],
 ) -> Result<Config> {
-    let names: Vec<String> = packages.iter().map(|p| p.name.clone()).collect();
-    host.load_init_files_or_skip(no_plugins, cwd)
-        .context("load init.lua files")?
-        .unwrap_or_default()
-        .into_config(false, &names)
-        .context("invalid config")
-}
-
-/// Applies whatever the init files recorded, once every package is loaded.
-///
-/// Draining here and not inside the Lua call is what keeps an unload off the
-/// thread that asked for it.
-fn drain_declared(
-    host: &PluginHost,
-    declared: &[maki_lua::Declared],
-    packages: &[maki_lua::DiscoveredPackage],
-    installed: &maki_lua::InstallReport,
-    config: &maki_config::PluginsConfig,
-) -> Vec<String> {
-    let available: Vec<maki_lua::DiscoveredPackage> = packages
+    let raw = host
+        .load_init_files_or_skip(no_plugins, cwd)
+        .context("load init.lua files")?;
+    let declared = if no_plugins {
+        Vec::new()
+    } else {
+        host.declared_packages().context("read declared packages")?
+    };
+    let known: Vec<String> = packages
         .iter()
-        .chain(&installed.packages)
-        .cloned()
+        .map(|package| package.name.clone())
+        .chain(declared.into_iter().map(|package| package.spec.name))
         .collect();
-    maki_lua::drain_pack_ops(host, declared, &available, config).failures
+    raw.unwrap_or_default()
+        .into_config(false, &known)
+        .context("invalid config")
 }
 
 pub fn index(path: &str, no_plugins: bool, no_jit: bool) -> Result<()> {
@@ -640,21 +631,15 @@ pub fn index(path: &str, no_plugins: bool, no_jit: bool) -> Result<()> {
 
     host.load_builtins(&config.plugins)
         .context("load builtin plugins")?;
-    for warning in host.load_packages(&packages, &config.plugins) {
-        eprintln!("warning: {warning}");
-    }
-    let installed = maki_lua::install_declared(&declared, maki_lua::Interaction::None);
-    for warning in installed
-        .failures
-        .iter()
-        .cloned()
-        .chain(host.load_packages(&installed.packages, &config.plugins))
-    {
-        eprintln!("warning: {warning}");
-    }
-    // Same order as the terminal entry point. Without this a `maki.packadd`
-    // in init.lua would be recorded here and never applied.
-    for warning in drain_declared(&host, &declared, &packages, &installed, &config.plugins) {
+    for warning in super::load_external_packages(
+        &host,
+        &packages,
+        &declared,
+        &[],
+        &config.plugins,
+        maki_lua::Interaction::None,
+        false,
+    )? {
         eprintln!("warning: {warning}");
     }
 
@@ -771,21 +756,15 @@ pub fn prompt(
         .context("invalid config")?;
     host.load_builtins(&config.plugins)
         .context("load builtin plugins")?;
-    for warning in host.load_packages(&packages, &config.plugins) {
-        eprintln!("warning: {warning}");
-    }
-    let installed = maki_lua::install_declared(&declared, maki_lua::Interaction::None);
-    for warning in installed
-        .failures
-        .iter()
-        .cloned()
-        .chain(host.load_packages(&installed.packages, &config.plugins))
-    {
-        eprintln!("warning: {warning}");
-    }
-    // Same order as the terminal entry point. Without this a `maki.packadd`
-    // in init.lua would be recorded here and never applied.
-    for warning in drain_declared(&host, &declared, &packages, &installed, &config.plugins) {
+    for warning in super::load_external_packages(
+        &host,
+        &packages,
+        &declared,
+        &[],
+        &config.plugins,
+        maki_lua::Interaction::None,
+        false,
+    )? {
         eprintln!("warning: {warning}");
     }
 

@@ -62,29 +62,17 @@ pub fn run(model_arg: Option<String>, yolo: bool, no_plugins: bool, no_jit: bool
     plugin_host
         .load_builtins(&config.plugins)
         .context("load builtin plugins")?;
-    for warning in plugin_host.load_packages(&packages, &config.plugins) {
+    for warning in super::load_external_packages(
+        &plugin_host,
+        &packages,
+        &declared,
+        &[],
+        &config.plugins,
+        maki_lua::Interaction::None,
+        false,
+    )? {
         eprintln!("warning: {warning}");
     }
-    let installed = maki_lua::install_declared(&declared, maki_lua::Interaction::None);
-    for warning in installed
-        .failures
-        .iter()
-        .cloned()
-        .chain(plugin_host.load_packages(&installed.packages, &config.plugins))
-    {
-        eprintln!("warning: {warning}");
-    }
-
-    // Same order as the terminal entry point: everything loaded first, then
-    // whatever `init.lua` asked to change. Draining here rather than inside
-    // the Lua call is what keeps unloading from waiting on the thread that
-    // requested it.
-    let available: Vec<maki_lua::DiscoveredPackage> = packages
-        .iter()
-        .chain(&installed.packages)
-        .cloned()
-        .collect();
-    maki_lua::drain_pack_ops(&plugin_host, &declared, &available, &config.plugins);
 
     let timeouts = maki_providers::Timeouts {
         connect: config.provider.connect_timeout,

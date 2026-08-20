@@ -2298,6 +2298,139 @@ fn setup_not_called_returns_none() {
 }
 
 #[test]
+fn custom_package_loader_receives_data_and_marks_the_package_active() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.send_run_init_lua(
+        r#"
+maki.pack.add({{
+  src = "https://example.com/custom",
+  name = "custom",
+  data = { command = "/custom-loaded" },
+}}, {
+  confirm = false,
+  load = function(package)
+    maki.api.register_command({
+      name = package.spec.data.command,
+      handler = function() end,
+    })
+  end,
+})
+"#
+        .to_owned(),
+        "test_init.lua".to_owned(),
+        None,
+    )
+    .unwrap();
+    let declared = host.declared_packages().unwrap().remove(0);
+    let path = tempfile::TempDir::new().unwrap();
+
+    host.run_pack_loader(
+        declared,
+        path.path(),
+        maki_lua::PluginPermissions::trusted(),
+        Default::default(),
+    )
+    .unwrap();
+
+    assert!(host.active_packages().unwrap().contains("custom"));
+    let snapshot = host.command_reader().load();
+    let command = snapshot
+        .commands
+        .iter()
+        .find(|command| command.name.as_ref() == "/custom-loaded")
+        .expect("custom loader should register its command");
+    assert_eq!(command.plugin.as_ref(), "custom");
+
+    host.unload("custom").unwrap();
+    assert!(host.command_reader().load().commands.is_empty());
+}
+
+#[test]
+fn a_failed_custom_package_loader_does_not_mark_the_package_active() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.send_run_init_lua(
+        r#"
+maki.pack.add({ "https://example.com/broken" }, {
+  confirm = false,
+  load = function() error("custom loader failed") end,
+})
+"#
+        .to_owned(),
+        "test_init.lua".to_owned(),
+        None,
+    )
+    .unwrap();
+    let declared = host.declared_packages().unwrap().remove(0);
+    let path = tempfile::TempDir::new().unwrap();
+
+    let error = host
+        .run_pack_loader(
+            declared,
+            path.path(),
+            maki_lua::PluginPermissions::trusted(),
+            Default::default(),
+        )
+        .expect_err("the loader error must reach the host");
+
+    assert!(
+        error.to_string().contains("custom loader failed"),
+        "{error}"
+    );
+    assert!(!host.active_packages().unwrap().contains("broken"));
+}
+
+#[test]
+fn package_change_event_carries_the_neovim_fields_and_original_data() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.send_run_init_lua(
+        r#"
+maki.pack.add({{
+  src = "https://example.com/evented",
+  name = "evented",
+  data = { marker = "kept" },
+}}, { confirm = false })
+maki.api.create_autocmd("PackChanged", {
+  callback = function(event)
+    assert(event.data.active == false)
+    assert(event.data.kind == "install")
+    assert(event.data.spec.data.marker == "kept")
+    assert(event.match == event.data.path)
+    maki.api.register_command({ name = "/pack-event", handler = function() end })
+  end,
+})
+"#
+        .to_owned(),
+        "test_init.lua".to_owned(),
+        None,
+    )
+    .unwrap();
+    let declared = host.declared_packages().unwrap().remove(0);
+    let path = tempfile::TempDir::new().unwrap();
+
+    host.fire_pack_changed(
+        "PackChanged",
+        maki_lua::PackChange {
+            declared,
+            active: false,
+            kind: maki_lua::PackChangeKind::Install,
+            path: path.path().to_path_buf(),
+        },
+    )
+    .unwrap();
+
+    assert!(
+        host.command_reader()
+            .load()
+            .commands
+            .iter()
+            .any(|command| command.name.as_ref() == "/pack-event")
+    );
+}
+
+#[test]
 fn setup_all_sections_at_once() {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
@@ -2826,6 +2959,464 @@ fn package_dir(files: &[(&str, &str)]) -> tempfile::TempDir {
     tmp
 }
 
+/// Builds a dormant package entry the runtime can activate.
+fn dormant(name: &str, dir: &std::path::Path, cmd: &str) -> maki_lua::Dormant {
+    maki_lua::Dormant {
+        name: name.to_owned(),
+        dir: dir.to_path_buf(),
+        permissions: maki_lua::PluginPermissions::trusted(),
+        opts: Default::default(),
+        triggers: maki_lua::Triggers {
+            cmd: vec![cmd.to_owned()],
+            ..Default::default()
+        },
+        state: maki_lua::PackState::Inactive,
+    }
+}
+
+fn command_names(host: &PluginHost) -> Vec<String> {
+    host.command_reader()
+        .load()
+        .commands
+        .iter()
+        .map(|command| command.name.to_string())
+        .collect()
+}
+
+#[test]
+fn unloading_an_inactive_package_removes_its_pending_trigger() {
+    let package = package_dir(&[("init.lua", "")]);
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.set_dormant_packages(vec![dormant("demo", package.path(), "/lazy")])
+        .unwrap();
+    assert!(command_names(&host).iter().any(|name| name == "/lazy"));
+
+    host.unload("demo").unwrap();
+
+    assert!(command_names(&host).iter().all(|name| name != "/lazy"));
+}
+
+/// The whole point of a command trigger: the package is on disk and not
+/// loaded, and running the command it declared loads it and then runs it.
+///
+/// This works only because the runtime activates the package itself.
+/// `PluginHost::load_package` waits for a reply from the runtime thread, so
+/// the thread handling the command cannot use it; it reads the package and
+/// calls `load_source` directly instead.
+#[test]
+fn a_command_trigger_loads_the_package_and_then_runs_the_command() {
+    let pkg = package_dir(&[(
+        "init.lua",
+        r#"
+        maki.api.register_command({
+          name = "/lazy",
+          handler = function()
+            maki.ui.flash("ran")
+          end,
+        })
+        "#,
+    )]);
+
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.set_dormant_packages(vec![dormant("demo", pkg.path(), "/lazy")])
+        .unwrap();
+
+    // Visible before it loads, or the user could never type what wakes it.
+    let snap = host.command_reader().load();
+    assert!(
+        snap.commands.iter().any(|c| c.name.as_ref() == "/lazy"),
+        "a pending trigger must appear in the palette"
+    );
+    drop(snap);
+
+    let rx = host.ui_action_rx();
+    host.event_handle()
+        .run_command("demo".into(), "/lazy".into(), String::new(), 0);
+
+    let action = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the command did not run after loading its package");
+    assert!(matches!(action, maki_lua::UiAction::Flash(message) if message == "ran"));
+}
+
+/// A runtime `packadd` must not wait for the startup host drain. Neovim lets
+/// one plugin request an optional package when it needs it, and Maki exposes
+/// the same operation to every plugin.
+#[test]
+fn runtime_packadd_activates_a_manual_opt_package() {
+    let site = site_with_package(
+        "opt",
+        "lazy_pack",
+        &[(
+            "init.lua",
+            r#"maki.api.register_command({ name = "/loaded", handler = function() end })"#,
+        )],
+    );
+    let found = maki_lua::discover(site.path());
+    let names: Vec<String> = found
+        .packages
+        .iter()
+        .map(|package| package.name.clone())
+        .collect();
+    let config = PluginsConfig::from_plugins_and_packages(Default::default(), &names);
+
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    maki_lua::arm_packages(
+        &host,
+        &found.packages,
+        &[],
+        &[],
+        &Default::default(),
+        &config,
+    )
+    .unwrap();
+
+    host.load_source("caller", r#"maki.packadd("lazy_pack")"#)
+        .unwrap();
+
+    // This request is queued after the activation request, so its reply is a
+    // deterministic fence for the load rather than a timed wait.
+    assert!(host.active_packages().unwrap().contains("lazy_pack"));
+    assert!(command_names(&host).iter().any(|name| name == "/loaded"));
+}
+
+#[test]
+fn runtime_packadd_does_not_reactivate_a_manual_start_package() {
+    let site = site_with_package("start", "start_pack", &[("init.lua", "")]);
+    let found = maki_lua::discover(site.path());
+    let names: Vec<String> = found
+        .packages
+        .iter()
+        .map(|package| package.name.clone())
+        .collect();
+    let config = PluginsConfig::from_plugins_and_packages(Default::default(), &names);
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    maki_lua::arm_packages(
+        &host,
+        &found.packages,
+        &[],
+        &[],
+        &Default::default(),
+        &config,
+    )
+    .unwrap();
+
+    let error = host
+        .load_source("caller", r#"maki.packadd("start_pack")"#)
+        .expect_err("a start package is not an optional activation target");
+
+    assert!(error.to_string().contains("not installed"), "got: {error}");
+}
+
+#[test]
+fn runtime_packadd_reports_an_unknown_package() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.set_dormant_packages(Vec::new()).unwrap();
+
+    let error = host
+        .load_source("caller", r#"maki.packadd("missing")"#)
+        .expect_err("Neovim reports a missing optional package");
+
+    assert!(error.to_string().contains("not installed"), "got: {error}");
+}
+
+#[test]
+fn init_callback_uses_runtime_packadd_after_catalog_is_ready() {
+    let package = package_dir(&[(
+        "init.lua",
+        r#"maki.api.register_command({ name = "/loaded", handler = function() end })"#,
+    )]);
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.send_run_init_lua(
+        r#"
+        maki.api.create_autocmd("PackWake", {
+          callback = function()
+            maki.packadd("demo")
+          end,
+        })
+        "#
+        .to_owned(),
+        "init.lua".to_owned(),
+        None,
+    )
+    .unwrap();
+    host.set_dormant_packages(vec![maki_lua::Dormant {
+        triggers: Default::default(),
+        ..dormant("demo", package.path(), "/unused")
+    }])
+    .unwrap();
+
+    host.load_source("caller", r#"maki.api.exec_autocmds("PackWake")"#)
+        .unwrap();
+
+    assert!(host.active_packages().unwrap().contains("demo"));
+}
+
+#[test]
+fn host_packadd_removes_pending_triggers_after_activation() {
+    let package = package_dir(&[(
+        "init.lua",
+        r#"maki.api.register_command({ name = "/actual", handler = function() end })"#,
+    )]);
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.set_dormant_packages(vec![dormant("demo", package.path(), "/declared")])
+        .unwrap();
+
+    host.load_package(
+        "demo",
+        package.path(),
+        maki_lua::PluginPermissions::trusted(),
+        Default::default(),
+    )
+    .unwrap();
+
+    let names = command_names(&host);
+    assert!(names.iter().any(|name| name == "/actual"));
+    assert!(
+        names.iter().all(|name| name != "/declared"),
+        "an active package must not keep a pending trigger: {names:?}"
+    );
+}
+
+/// A host-fired event wakes the package that listens for it, and the listener
+/// the package registers receives that same event rather than the next one.
+///
+/// Activation runs before the dispatch, which is the whole reason only
+/// host-fired events can be triggers: the request arrives on the runtime loop,
+/// where a load can be awaited first. A Lua `exec_autocmds` dispatches
+/// synchronously and has no such point.
+#[test]
+fn a_host_fired_event_activates_the_package_that_listens_for_it() {
+    let pkg = package_dir(&[(
+        "init.lua",
+        r#"
+
+        local seen = 0
+        maki.api.create_autocmd("TurnEnd", {
+          callback = function()
+            seen = seen + 1
+            maki.ui.flash("saw" .. seen)
+          end,
+        })
+        "#,
+    )]);
+
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.set_dormant_packages(vec![maki_lua::Dormant {
+        triggers: maki_lua::Triggers {
+            event: vec!["TurnEnd".to_owned()],
+            ..Default::default()
+        },
+        ..dormant("demo", pkg.path(), "/unused")
+    }])
+    .unwrap();
+
+    let rx = host.ui_action_rx();
+    host.event_handle()
+        .fire_autocmd("TurnEnd", serde_json::Value::Null);
+
+    let action = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the package did not receive the event that woke it");
+    assert!(matches!(action, maki_lua::UiAction::Flash(message) if message == "saw1"));
+    assert!(host.active_packages().unwrap().contains("demo"));
+    assert!(
+        matches!(rx.try_recv(), Err(flume::TryRecvError::Empty)),
+        "the event reached the woken listener more than once"
+    );
+}
+
+/// A key trigger wakes the package and then runs the binding it registered.
+///
+/// The binding the package creates gets a fresh id, and the UI sent the id of
+/// the pending entry, so resolving by id after the load would find nothing.
+/// The key is what carries across.
+#[test]
+fn a_key_trigger_resolves_by_key_because_the_id_changes_across_the_load() {
+    let pkg = package_dir(&[(
+        "init.lua",
+        r#"
+        maki.keymap.set("n", "<C-g>", function()
+          maki.ui.flash("pressed")
+        end)
+        "#,
+    )]);
+
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.set_dormant_packages(vec![maki_lua::Dormant {
+        triggers: maki_lua::Triggers {
+            keys: vec!["<C-g>".to_owned()],
+            ..Default::default()
+        },
+        ..dormant("demo", pkg.path(), "/unused")
+    }])
+    .unwrap();
+
+    // Published, or the UI would never send the press here at all.
+    let snap = host.keymap_reader().load();
+    let entry = snap
+        .entries
+        .iter()
+        .find(|e| e.key == crossterm::event::KeyCode::Char('g'))
+        .expect("a pending key must be published")
+        .clone();
+    drop(snap);
+
+    let rx = host.ui_action_rx();
+    host.event_handle()
+        .run_keybind_callback(entry.id, entry.key, entry.modifiers);
+
+    let action = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the key did not run the binding from its package");
+    assert!(matches!(action, maki_lua::UiAction::Flash(message) if message == "pressed"));
+}
+
+#[test]
+fn a_stale_real_key_id_does_not_activate_a_dormant_package() {
+    let pkg = package_dir(&[(
+        "init.lua",
+        r#"maki.keymap.set("n", "<C-g>", function() end)"#,
+    )]);
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source("old", r#"maki.keymap.set("n", "<C-g>", function() end)"#)
+        .unwrap();
+    let snapshot = host.keymap_reader().load();
+    let old = snapshot.entries[0].clone();
+    drop(snapshot);
+
+    host.set_dormant_packages(vec![maki_lua::Dormant {
+        triggers: maki_lua::Triggers {
+            keys: vec!["<C-g>".to_owned()],
+            ..Default::default()
+        },
+        ..dormant("demo", pkg.path(), "/unused")
+    }])
+    .unwrap();
+    host.unload("old").unwrap();
+
+    host.event_handle()
+        .run_keybind_callback(old.id, old.key, old.modifiers);
+
+    assert!(!host.active_packages().unwrap().contains("demo"));
+}
+
+/// A package whose top level fails is not tried again. Without this, every
+/// later use of the command that woke it would re-run the broken code.
+#[test]
+fn a_package_that_fails_to_activate_is_not_retried() {
+    let pkg = package_dir(&[("init.lua", r#"error("broken package")"#)]);
+
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source(
+        "fence",
+        r#"
+        maki.api.register_command({
+          name = "/fence",
+          handler = function() maki.ui.flash("fenced") end,
+        })
+        "#,
+    )
+    .unwrap();
+    host.set_dormant_packages(vec![dormant("demo", pkg.path(), "/lazy")])
+        .unwrap();
+    assert!(
+        command_names(&host).iter().any(|n| n == "/lazy"),
+        "the trigger is offered before the failure"
+    );
+
+    let rx = host.ui_action_rx();
+    let handle = host.event_handle();
+    handle.run_command("demo".into(), "/lazy".into(), String::new(), 0);
+    handle.run_command("fence".into(), "/fence".into(), String::new(), 0);
+
+    let action = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the command fence did not run");
+    assert!(matches!(action, maki_lua::UiAction::Flash(message) if message == "fenced"));
+    assert!(!host.active_packages().unwrap().contains("demo"));
+    assert!(
+        command_names(&host).iter().all(|n| n != "/lazy"),
+        "a package that failed to load must stop being offered, not be retried"
+    );
+
+    host.set_dormant_packages(vec![dormant("demo", pkg.path(), "/lazy")])
+        .unwrap();
+    assert!(
+        command_names(&host).iter().all(|name| name != "/lazy"),
+        "refreshing the catalog must preserve the failed state"
+    );
+
+    let replacement = package_dir(&[(
+        "init.lua",
+        r#"maki.api.register_command({ name = "/fixed", handler = function() end })"#,
+    )]);
+    host.set_dormant_packages(vec![dormant("demo", replacement.path(), "/lazy")])
+        .unwrap();
+    host.load_source("caller", r#"maki.packadd("demo")"#)
+        .unwrap();
+
+    assert!(host.active_packages().unwrap().contains("demo"));
+    assert!(
+        command_names(&host).iter().any(|name| name == "/fixed"),
+        "a new immutable revision must be eligible after the old one failed"
+    );
+}
+
+/// A command nothing declared must not wake anything, or any typo would load
+/// an unrelated package.
+#[test]
+fn an_unrelated_command_does_not_activate_a_dormant_package() {
+    let pkg = package_dir(&[(
+        "init.lua",
+        r#"maki.api.register_command({ name = "/lazy", handler = function() end })"#,
+    )]);
+
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source(
+        "fence",
+        r#"
+        maki.api.register_command({
+          name = "/fence",
+          handler = function() maki.ui.flash("fenced") end,
+        })
+        "#,
+    )
+    .unwrap();
+    host.set_dormant_packages(vec![dormant("demo", pkg.path(), "/lazy")])
+        .unwrap();
+
+    let rx = host.ui_action_rx();
+    let handle = host.event_handle();
+    handle.run_command("demo".into(), "/other".into(), String::new(), 0);
+    handle.run_command("fence".into(), "/fence".into(), String::new(), 0);
+    let action = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the command fence did not run");
+    assert!(matches!(action, maki_lua::UiAction::Flash(message) if message == "fenced"));
+    assert!(!host.active_packages().unwrap().contains("demo"));
+
+    let snap = host.command_reader().load();
+    assert!(
+        snap.commands
+            .iter()
+            .all(|c| c.plugin.as_ref() != "demo" || c.description.as_ref().contains("loads demo")),
+        "the package must still be dormant, so only its pending entry shows"
+    );
+}
+
 #[test]
 fn package_loads_every_entrypoint_under_one_owner() {
     let pkg = package_dir(&[
@@ -3030,12 +3621,28 @@ fn discovered_start_package_is_found_and_loaded() {
 
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    assert!(host.load_packages(&found.packages, &config).is_empty());
+    host.load_packages(&found.packages, &config);
 
     let snap = host.command_reader().load();
     assert_eq!(snap.commands.len(), 1);
     assert_eq!(snap.commands[0].name.as_ref(), "/demo");
     assert_eq!(snap.commands[0].plugin.as_ref(), "demo_pack");
+}
+
+#[test]
+fn package_load_failure_reaches_the_caller() {
+    let site = site_with_package("start", "broken_pack", &[("init.lua", "this is not lua")]);
+    let found = maki_lua::discover(site.path());
+    let config =
+        PluginsConfig::from_plugins_and_packages(Default::default(), &["broken_pack".to_owned()]);
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+
+    let failures = host.load_packages(&found.packages, &config);
+
+    assert_eq!(failures.len(), 1);
+    assert!(failures[0].contains("broken_pack"), "{:?}", failures);
+    assert!(!host.active_packages().unwrap().contains("broken_pack"));
 }
 
 /// Builtins must still load when a package is installed. Packages once shared
@@ -3060,7 +3667,7 @@ fn installed_package_does_not_break_builtin_loading() {
     let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
     host.load_builtins(&config)
         .expect("an installed package must not stop the builtins from loading");
-    assert!(host.load_packages(&found.packages, &config).is_empty());
+    host.load_packages(&found.packages, &config);
 
     assert!(reg.has("grep"), "builtin tools should still be registered");
     let names: Vec<String> = host
@@ -3105,7 +3712,7 @@ end
     let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
     host.load_builtins(&config)
         .expect("package options must not be rejected as unknown plugin options");
-    assert!(host.load_packages(&found.packages, &config).is_empty());
+    host.load_packages(&found.packages, &config);
 
     assert!(
         host.command_reader()
@@ -3117,7 +3724,7 @@ end
 }
 
 #[test]
-fn loaded_package_set_excludes_a_package_that_failed_to_load() {
+fn active_package_set_excludes_a_package_that_failed_to_load() {
     let site = tempfile::TempDir::new().unwrap();
     for (name, source) in [("good", ""), ("broken", "this is not lua")] {
         let plugin = site
@@ -3138,14 +3745,11 @@ fn loaded_package_set_excludes_a_package_that_failed_to_load() {
     let host = PluginHost::new(fresh_registry()).unwrap();
 
     let failures = host.load_packages(&found.packages, &config);
-    let loaded = host.active_packages().unwrap();
+    let active = host.active_packages().unwrap();
 
-    assert!(loaded.contains("good"));
-    assert!(!loaded.contains("broken"));
     assert_eq!(failures.len(), 1);
-
-    host.unload("good").unwrap();
-    assert!(host.active_packages().unwrap().is_empty());
+    assert!(active.contains("good"));
+    assert!(!active.contains("broken"));
 }
 
 /// If `lua/` itself links out of the package, its target must not become the
@@ -3190,10 +3794,7 @@ fn discovered_opt_package_is_not_loaded_at_startup() {
 
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    let failures = host.load_packages(&found.packages, &config);
-    let loaded = host.active_packages().unwrap();
-    assert!(loaded.is_empty());
-    assert!(failures.is_empty());
+    host.load_packages(&found.packages, &config);
 
     assert_eq!(host.command_reader().load().commands.len(), 0);
 }
@@ -3223,7 +3824,13 @@ fn activate_all(
     config: &PluginsConfig,
 ) -> Vec<String> {
     let mut failures = host.load_packages(&found.packages, config);
-    let report = maki_lua::drain_pack_ops(host, &[], &found.packages, config);
+    let report = maki_lua::drain_pack_ops(
+        host,
+        &[],
+        &found.packages,
+        config,
+        maki_lua::Interaction::None,
+    );
     failures.extend(report.failures);
     failures
 }
@@ -3338,7 +3945,7 @@ maki.api.register_command({
 
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    assert!(host.load_packages(&found.packages, &config).is_empty());
+    host.load_packages(&found.packages, &config);
 
     let snap = host.command_reader().load();
     assert_eq!(snap.commands.len(), 1);
@@ -3381,7 +3988,7 @@ maki.api.register_command({
 
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    assert!(host.load_packages(&found.packages, &config).is_empty());
+    host.load_packages(&found.packages, &config);
 
     let snap = host.command_reader().load();
     assert_eq!(snap.commands[0].name.as_ref(), "/allowed");

@@ -10,6 +10,17 @@ use crate::api::util::dispatch::{DepthGuard, call_isolated};
 static NEXT_AUTOCMD_ID: AtomicU64 = AtomicU64::new(1);
 
 const WILDCARD_PATTERN: &str = "*";
+pub(crate) const LAZY_EVENTS: &[&str] = &[
+    "TurnStart",
+    "TurnEnd",
+    "TurnError",
+    "ToolStart",
+    "ToolDone",
+    "SessionReset",
+    "SessionFocusChanged",
+    "SessionStatusChanged",
+    "TaskStatusChanged",
+];
 
 pub(crate) struct AutocmdEntry {
     pub id: u64,
@@ -131,7 +142,8 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 /// `"TurnError"`, `"ToolStart"`, `"ToolDone"`, `"SessionReset"`,
 /// `"SessionFocusChanged"`, `"SessionStatusChanged"`, and
 /// `"TaskStatusChanged"`. Plugins can also fire their own events with
-/// `exec_autocmds`.
+/// `exec_autocmds`. Package operations fire `"PackChangedPre"` and
+/// `"PackChanged"`.
 ///
 /// Each host event carries `data.session_id`. For `"SessionReset"` that
 /// is the session being left behind; the other events name the session now

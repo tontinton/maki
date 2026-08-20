@@ -31,8 +31,7 @@ use serde_json::{Value, json};
 use crate::api::options::{PluginOpts, register_options__doc, register_options__register};
 use crate::api::ui::buf::{BufHandle, line_to_lua};
 use crate::api::util::command::{
-    CommandEntry, CommandHandlerMap, LuaCommandWriter, UiAction, publish_command_snapshot,
-    ui_roundtrip,
+    CommandEntry, CommandHandlerMap, UiAction, publish_command_snapshot, ui_roundtrip,
 };
 use crate::api::util::convert::{json_to_lua, lua_to_json};
 use crate::api::util::ctx::LuaCtx;
@@ -1395,13 +1394,7 @@ fn register_command_from_lua(lua: &Lua, spec: &Table, plugin: Arc<str>) -> LuaRe
         );
     }
 
-    let map = lua
-        .app_data_ref::<CommandHandlerMap>()
-        .ok_or_else(|| mlua::Error::runtime("register_command: not initialized"))?;
-    let writer = lua
-        .app_data_ref::<LuaCommandWriter>()
-        .ok_or_else(|| mlua::Error::runtime("register_command: not initialized"))?;
-    publish_command_snapshot(&map, &writer);
+    publish_command_snapshot(lua)?;
 
     Ok(())
 }

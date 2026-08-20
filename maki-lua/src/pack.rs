@@ -8,53 +8,25 @@ use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
+use crossterm::event::{KeyCode, KeyModifiers};
+
+use crate::api::pack::{Dormant, PackState};
 use crate::error::PluginError;
 use crate::loader::is_bundled;
 use crate::plugin_permissions::{Requested, load_requested_permissions};
+use maki_pack::Spec;
 
-pub(crate) fn sanitize_message(message: &str) -> String {
-    message
-        .chars()
-        .map(|character| {
-            if character == '\n' || character == '\t' || !character.is_control() {
-                character
-            } else {
-                ' '
-            }
-        })
-        .collect()
-}
-
-/// The group name reserved for packages maki installs itself. Manual discovery
-/// skips it, so one package can never be found twice, once from disk and once
-/// from recorded state, with the two disagreeing about its revision.
-///
-/// Re-exported rather than repeated: `maki-pack` decides where it puts a
-/// checkout, and a second copy here that drifted would stop discovery skipping
-/// the directory it writes.
-pub use maki_pack::paths::MANAGED_GROUP;
+use maki_pack::paths::MANAGED_GROUP;
 
 /// `<data>/site`, the root Neovim would call a package path.
-pub fn site_dir() -> Result<PathBuf, std::io::Error> {
+pub(crate) fn site_dir() -> Result<PathBuf, std::io::Error> {
     maki_storage::paths::data_dir().map(|d| d.join("site"))
 }
 
-/// How a package reached the disk, which is what decides whose word grants its
-/// permissions.
-///
-/// This is a distinction the code needs and did not have. A manifest is written
-/// by whoever wrote the package. For a package the user placed by hand that is
-/// effectively the user, so the manifest is their own statement of intent. For
-/// a package maki fetched it is a stranger, and letting the manifest grant
-/// itself permissions would make the request self-certifying: an update could
-/// add `run = true` and gain the ability to start subprocesses without anyone
-/// agreeing to it.
+/// How a package reached the disk, which decides how permissions are granted.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Origin {
-    /// The user put the files under `pack/<group>/`. Trusted like `init.lua`.
+enum Origin {
     Manual,
-    /// Maki cloned it from this source. The source is part of the approval key,
-    /// so re-pointing a name at another repository does not inherit its grants.
     Fetched { src: String },
 }
 
@@ -63,13 +35,13 @@ pub struct DiscoveredPackage {
     pub name: String,
     /// Canonical package root. Resolved once, here, so the manifest, the
     /// entrypoints, and every later `require` agree on one directory.
-    pub dir: PathBuf,
+    pub(crate) dir: PathBuf,
     /// `start/` packages load at startup; `opt/` packages wait to be activated.
-    pub eager: bool,
+    pub(crate) eager: bool,
     /// What the package's manifest asks for. Never a grant on its own for a
     /// fetched package; see `Origin`.
-    pub requested: Requested,
-    pub origin: Origin,
+    pub(crate) requested: Requested,
+    origin: Origin,
 }
 
 /// `pack-lock.json`, beside the user's configuration so it can be committed.
@@ -77,7 +49,7 @@ pub struct DiscoveredPackage {
 /// `global_config_dirs` returns several candidates; the last is the one
 /// `append_permission_rule` already treats as writable, so the lockfile uses
 /// the same directory rather than inventing its own rule.
-pub fn lockfile_path() -> Option<PathBuf> {
+pub(crate) fn lockfile_path() -> Option<PathBuf> {
     maki_config::global_config_dirs()
         .into_iter()
         .next_back()
@@ -90,8 +62,102 @@ pub fn lockfile_path() -> Option<PathBuf> {
 /// so a package set reproduces on another machine. An approval is the opposite
 /// kind of fact: one person's decision to trust one repository on one machine,
 /// which must not travel with a repository into someone else's checkout.
-pub fn approvals_path() -> Option<PathBuf> {
+fn approvals_path() -> Option<PathBuf> {
     site_dir().ok().map(|dir| dir.join("pack-approvals.json"))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Interaction {
+    Tty,
+    None,
+}
+
+impl Interaction {
+    fn confirm(self, prompt: &str) -> bool {
+        if self != Self::Tty || !io::stdin().is_terminal() {
+            return false;
+        }
+        eprint!("{} [y/N] ", sanitize_message(prompt));
+        let _ = io::stderr().flush();
+        let mut input = String::new();
+        io::stdin().read_line(&mut input).is_ok() && input.trim().eq_ignore_ascii_case("y")
+    }
+}
+
+pub fn sanitize_message(message: &str) -> String {
+    message
+        .chars()
+        .map(|character| {
+            if character == '\n' || character == '\t' || !character.is_control() {
+                character
+            } else {
+                ' '
+            }
+        })
+        .collect()
+}
+
+#[derive(Debug, Default)]
+pub struct InstallReport {
+    pub packages: Vec<DiscoveredPackage>,
+    pub failures: Vec<String>,
+}
+
+struct InstallCandidate {
+    declared: crate::api::pack::Declared,
+    spec: Spec,
+    confirm: bool,
+    source_changed: bool,
+}
+
+fn install_candidates(
+    specs: &[crate::api::pack::Declared],
+    lock: &maki_pack::lockfile::Lockfile,
+    manager: &maki_pack::manager::Manager,
+    lock_confirm: Option<bool>,
+) -> Vec<InstallCandidate> {
+    let mut candidates = Vec::new();
+    for name in lock.install_order() {
+        if manager.resolve(lock, name).is_some() {
+            continue;
+        }
+        let Some(entry) = lock.get(name) else {
+            continue;
+        };
+        let current = specs.iter().find(|declared| declared.spec.name == name);
+        if current.is_some_and(|declared| declared.spec.src != entry.src) {
+            continue;
+        }
+        let spec = Spec::new(entry.src.clone()).with_name(name.to_owned());
+        let declared = current
+            .cloned()
+            .map(|mut declared| {
+                declared.spec = spec.clone();
+                declared
+            })
+            .unwrap_or_else(|| synthetic_declared(spec.clone()));
+        candidates.push(InstallCandidate {
+            declared,
+            spec,
+            confirm: lock_confirm.unwrap_or(true),
+            source_changed: false,
+        });
+    }
+    for declared in specs {
+        let source_changed = lock
+            .get(&declared.spec.name)
+            .is_some_and(|entry| entry.src != declared.spec.src);
+        let needs_install = source_changed || lock.get(&declared.spec.name).is_none();
+        if needs_install {
+            candidates.push(InstallCandidate {
+                declared: declared.clone(),
+                spec: declared.spec.clone(),
+                confirm: declared.confirm,
+                source_changed,
+            });
+        }
+    }
+    candidates
 }
 
 /// Reads the approval store.
@@ -134,11 +200,17 @@ fn read_approvals_file(path: &Path) -> Option<maki_pack::approvals::Approvals> {
     }
 }
 
+fn read_approvals_for_write() -> Option<maki_pack::approvals::Approvals> {
+    approvals_path()
+        .map(|path| read_approvals_file(&path))
+        .unwrap_or_else(|| Some(maki_pack::approvals::Approvals::default()))
+}
+
 /// Effective permissions for a package about to load.
 ///
 /// The whole point of `Origin`: a fetched package's own manifest is a request,
 /// and a request is not a grant.
-pub fn effective_permissions(
+pub(crate) fn effective_permissions(
     pkg: &DiscoveredPackage,
 ) -> crate::plugin_permissions::PluginPermissions {
     granted(pkg, &read_approvals())
@@ -149,7 +221,7 @@ pub fn effective_permissions(
 /// Separated from the disk read so it can be tested against a store built in
 /// the test rather than against whatever the person running the tests happens
 /// to have approved.
-pub fn granted(
+fn granted(
     pkg: &DiscoveredPackage,
     approvals: &maki_pack::approvals::Approvals,
 ) -> crate::plugin_permissions::PluginPermissions {
@@ -169,38 +241,6 @@ pub fn granted(
     }
 }
 
-/// Whether this entry point can ask the user a question.
-///
-/// An install runs downloaded code, so it is a trust decision. A run with no
-/// terminal cannot take one, and must refuse rather than assume consent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Interaction {
-    Tty,
-    None,
-}
-
-impl Interaction {
-    fn confirm(self, prompt: &str) -> bool {
-        if self != Self::Tty || !io::stdin().is_terminal() {
-            return false;
-        }
-        eprint!("{} [y/N] ", sanitize_message(prompt));
-        let _ = io::stderr().flush();
-        let mut input = String::new();
-        io::stdin().read_line(&mut input).is_ok() && input.trim().eq_ignore_ascii_case("y")
-    }
-}
-
-/// What an install pass produced, and what it could not.
-///
-/// Failures are returned rather than only logged: installation runs before
-/// logging is set up, so a message written there reaches nobody.
-#[derive(Debug, Default)]
-pub struct InstallReport {
-    pub packages: Vec<DiscoveredPackage>,
-    pub failures: Vec<String>,
-}
-
 /// Installs the packages `init.lua` declared, and reports where each one
 /// landed.
 ///
@@ -211,19 +251,176 @@ pub struct InstallReport {
 /// A package that fails to install is reported and skipped. One unreachable
 /// repository must not stop maki from starting, or a network problem would
 /// make the editor unusable.
-pub fn install_declared(
-    specs: &[crate::api::pack::Declared],
+/// What the approval pass reads while it decides what each package may have.
+struct Grant<'a> {
+    manager: &'a maki_pack::manager::Manager,
+    manual: &'a [DiscoveredPackage],
+    lock: &'a maki_pack::lockfile::Lockfile,
     interaction: Interaction,
+    delivers_agent_events: bool,
+    source_changes: &'a std::collections::BTreeSet<String>,
+}
+
+/// Narrows each installed package to what its request and a stored approval
+/// agree on, asking about anything new.
+///
+/// Kept apart from installing, because a manifest arrives with the code it
+/// describes. Deciding what a package may have has to be a separate step from
+/// putting it on disk, or the download would be deciding its own access.
+fn grant_installed(
+    specs: &[crate::api::pack::Declared],
+    ctx: &Grant<'_>,
+    report: &mut InstallReport,
+) {
+    let Grant {
+        manager,
+        manual,
+        lock,
+        interaction,
+        delivers_agent_events,
+        source_changes,
+    } = ctx;
+    let interaction = *interaction;
+    let delivers_agent_events = *delivers_agent_events;
+
+    let Some(mut approvals) = read_approvals_for_write() else {
+        report
+            .failures
+            .push("the package approval store is unreadable, so no package was loaded".to_owned());
+        return;
+    };
+    let mut approvals_changed = false;
+    let mut revoked_sources = std::collections::BTreeSet::new();
+    let mut newly_approved = std::collections::BTreeSet::new();
+    for name in source_changes.iter() {
+        let declared = specs
+            .iter()
+            .find(|declared| declared.spec.name == *name)
+            .expect("source changes come from declarations");
+        if revoke_mismatched_approval(&mut approvals, name, &declared.spec.src) {
+            approvals_changed = true;
+            revoked_sources.insert(name.clone());
+        }
+    }
+    for declared in specs {
+        if let Some(error) = owner_conflict(&declared.spec.name) {
+            if !report
+                .failures
+                .iter()
+                .any(|failure| failure.starts_with(&format!("{}:", declared.spec.name)))
+            {
+                report.failures.push(error);
+            }
+            continue;
+        }
+        if let Some(manual) = manual.iter().find(|p| p.name == declared.spec.name) {
+            if !report
+                .failures
+                .iter()
+                .any(|failure| failure.starts_with(&format!("{}:", declared.spec.name)))
+            {
+                report.failures.push(format!(
+                    "{}: managed package name conflicts with manual package at {}",
+                    declared.spec.name,
+                    manual.dir.display()
+                ));
+            }
+            continue;
+        }
+        let Some(dir) = manager.resolve(lock, &declared.spec.name) else {
+            continue;
+        };
+        if lock
+            .get(&declared.spec.name)
+            .is_none_or(|entry| entry.src != declared.spec.src)
+        {
+            continue;
+        }
+        // A manifest that exists but cannot be read is not the same fact as
+        // an absent one, so it stops this package rather than approving an
+        // empty request nobody wrote.
+        let requested = match load_requested_permissions(&dir) {
+            Ok(requested) => requested,
+            Err(problem) => {
+                report.failures.push(sanitize_message(&format!(
+                    "{}: {problem}",
+                    declared.spec.name
+                )));
+                continue;
+            }
+        };
+        let names = requested.names();
+        let key =
+            maki_pack::approvals::ApprovalKey::new(declared.spec.name.clone(), &declared.spec.src);
+        let approved = approvals.get(&key).unwrap_or(&[]);
+        let missing: Vec<&str> = names
+            .iter()
+            .map(String::as_str)
+            .filter(|name| !approved.iter().any(|approved| approved == name))
+            .collect();
+        if !missing.is_empty() {
+            let accepted = interaction.confirm(&format!(
+                "Allow package {} these permissions: {}?",
+                declared.spec.name,
+                missing.join(", ")
+            ));
+            if !accepted {
+                report.failures.push(format!(
+                    "{}: permission approval is required for {}",
+                    declared.spec.name,
+                    missing.join(", ")
+                ));
+                continue;
+            }
+            approvals.approve(&key, names);
+            approvals_changed = true;
+            newly_approved.insert(declared.spec.name.clone());
+        }
+        report.packages.push(DiscoveredPackage {
+            name: declared.spec.name.clone(),
+            requested,
+            origin: Origin::Fetched {
+                src: declared.spec.src.clone(),
+            },
+            dir,
+            eager: declared.loads_at_start(delivers_agent_events),
+        });
+    }
+    if approvals_changed && !write_approvals(&approvals) {
+        for package in std::mem::take(&mut report.packages) {
+            if newly_approved.contains(&package.name) {
+                report.failures.push(format!(
+                    "{}: permission approval could not be saved",
+                    package.name
+                ));
+            } else {
+                report.packages.push(package);
+            }
+        }
+        for name in revoked_sources {
+            report.failures.push(format!(
+                "{name}: the old source permission approval could not be revoked"
+            ));
+        }
+    }
+}
+
+pub fn install_declared(
+    host: &crate::loader::PluginHost,
+    specs: &[crate::api::pack::Declared],
+    lock_confirm: Option<bool>,
+    interaction: Interaction,
+    delivers_agent_events: bool,
 ) -> InstallReport {
     let mut report = InstallReport::default();
-    if specs.is_empty() {
+    if specs.is_empty() && lock_confirm.is_none() {
         return report;
     }
     let site = match site_dir() {
         Ok(site) => site,
         Err(error) => {
             report.failures.push(format!(
-                "no data directory, so no package was installed: {error}"
+                "no data directory, so packages cannot be installed: {error}"
             ));
             return report;
         }
@@ -254,114 +451,156 @@ pub fn install_declared(
         None => {
             report
                 .failures
-                .push("the pack lockfile is unreadable, so no package was installed".to_owned());
+                .push("pack lockfile is unreadable; no package was installed".to_owned());
             return report;
         }
     };
-
+    let original_lock = lock.clone();
     let manager = maki_pack::manager::Manager::new(&site);
     let manual = discover(&site).packages;
-    let mut changed = false;
+    let collides = |name: &str| manual.iter().find(|package| package.name == name);
+    let mut source_changes = std::collections::BTreeSet::new();
+    let candidates = install_candidates(specs, &lock, &manager, lock_confirm);
 
-    // Asked once for the whole batch, before anything is cloned. A package
-    // already recorded at the revision it asks for is not a new trust
-    // decision, so only a fresh source prompts. Credentials are redacted,
-    // because the prompt is the one place a source is shown in full.
-    let new_sources: Vec<String> = specs
+    let requiring_confirmation: Vec<String> = candidates
         .iter()
-        .filter(|declared| {
-            declared.confirm && manager.resolve(&lock, &declared.spec.name).is_none()
-        })
-        .map(|declared| {
+        .filter(|candidate| candidate.confirm)
+        .map(|candidate| {
             format!(
                 "{} from {}",
-                declared.spec.name,
-                maki_pack::git::redact(&declared.spec.src)
+                candidate.spec.name,
+                maki_pack::git::redact(&candidate.spec.src)
             )
         })
         .collect();
-    if !new_sources.is_empty()
-        && !interaction.confirm(&format!(
+    let confirmed = requiring_confirmation.is_empty()
+        || interaction.confirm(&format!(
             "Install these packages?\n  {}",
-            new_sources.join("\n  ")
-        ))
-    {
-        report.failures.push(format!(
-            "installation was not confirmed, so {} package(s) were not installed",
-            new_sources.len()
+            requiring_confirmation.join("\n  ")
         ));
-        return report;
+    let mut accepted = Vec::new();
+    for candidate in candidates {
+        if let Some(error) = owner_conflict(&candidate.spec.name) {
+            report.failures.push(error);
+            continue;
+        }
+        if let Some(manual) = collides(&candidate.spec.name) {
+            report.failures.push(format!(
+                "{}: managed package name conflicts with manual package at {}",
+                candidate.spec.name,
+                manual.dir.display()
+            ));
+            continue;
+        }
+        if candidate.confirm && !confirmed {
+            report.failures.push(format!(
+                "{}: installation requires confirmation; set confirm = false for a non-interactive install",
+                candidate.spec.name
+            ));
+            continue;
+        }
+        accepted.push(candidate);
     }
 
-    for declared in specs {
-        let spec = &declared.spec;
-        if let Some(error) = owner_conflict(&spec.name) {
-            report.failures.push(sanitize_message(&error));
-            continue;
-        }
-        if let Some(package) = manual.iter().find(|package| package.name == spec.name) {
-            report.failures.push(sanitize_message(&format!(
-                "{}: a manual package at {} already has this name",
-                spec.name,
-                package.dir.display()
-            )));
-            continue;
-        }
-        let result = match smol::block_on(manager.ensure_installed(spec, &mut lock)) {
-            Ok(result) => result,
+    for candidate in &accepted {
+        let change = crate::api::pack::PackChange {
+            declared: candidate.declared.clone(),
+            active: false,
+            kind: crate::api::pack::PackChangeKind::Install,
+            path: maki_pack::paths::package_root(&site, &candidate.spec.name),
+        };
+        let _ = host.fire_pack_changed("PackChangedPre", change);
+    }
+
+    let mut installed_changes = Vec::new();
+    for candidate in accepted {
+        let InstallCandidate {
+            declared,
+            spec,
+            source_changed,
+            ..
+        } = candidate;
+        match smol::block_on(manager.ensure_installed(&spec, &mut lock)) {
+            Ok(result) => {
+                if result.changed {
+                    if source_changed {
+                        source_changes.insert(spec.name.clone());
+                    }
+                    installed_changes.push((declared, result.dir));
+                }
+            }
             Err(e) => {
                 let message = redact_error(&e);
-                tracing::error!(package = %spec.name, error = %message, "failed to install package");
-                report
-                    .failures
-                    .push(format!("{}: failed to install: {message}", spec.name));
-                continue;
+                tracing::error!(
+                    package = %spec.name,
+                    error = %message,
+                    "failed to install package"
+                );
+                report.failures.push(format!("{}: {message}", spec.name));
             }
-        };
-        // A manifest that exists but cannot be parsed is not the same fact as
-        // one that is absent, so it stops this package rather than loading it
-        // with a request nobody wrote.
-        let requested = match load_requested_permissions(&result.dir) {
-            Ok(requested) => requested,
-            Err(problem) => {
-                report
-                    .failures
-                    .push(sanitize_message(&format!("{}: {problem}", spec.name)));
-                continue;
-            }
-        };
-        changed |= result.changed;
-        report.packages.push(DiscoveredPackage {
-            name: spec.name.clone(),
-            requested,
-            origin: Origin::Fetched {
-                src: spec.src.clone(),
-            },
-            dir: result.dir,
-            // `load = false` installs the package and leaves it for
-            // `maki.packadd`, which is the state a lazy trigger delays.
-            eager: matches!(declared.load, crate::api::pack::LoadMode::Eager),
-        });
-    }
-
-    // Written once, after the installs, and only when something moved.
-    if changed {
-        let recorded = match lock_path {
-            Some(path) => write_lockfile(&path, &lock),
-            None => false,
-        };
-        if !recorded {
-            // The packages are on disk but nothing records where. The next
-            // start reads the old lockfile and would not find them, so they
-            // must not be reported as installed either.
-            report.packages.clear();
-            report
-                .failures
-                .push("the pack lockfile could not be written, so no package was used".to_owned());
         }
     }
 
+    if lock != original_lock {
+        let Some(path) = lock_path.as_deref() else {
+            report
+                .failures
+                .push("packages changed but no lockfile path is available".to_owned());
+            return report;
+        };
+        if !write_lockfile(path, &lock) {
+            report
+                .failures
+                .push("packages changed but the lockfile could not be written".to_owned());
+            return report;
+        }
+    }
+    for (declared, path) in installed_changes {
+        let _ = host.fire_pack_changed(
+            "PackChanged",
+            crate::api::pack::PackChange {
+                declared,
+                active: false,
+                kind: crate::api::pack::PackChangeKind::Install,
+                path,
+            },
+        );
+    }
+
+    grant_installed(
+        specs,
+        &Grant {
+            manager: &manager,
+            manual: &manual,
+            lock: &lock,
+            interaction,
+            delivers_agent_events,
+            source_changes: &source_changes,
+        },
+        &mut report,
+    );
     report
+}
+
+fn synthetic_declared(spec: Spec) -> crate::api::pack::Declared {
+    crate::api::pack::Declared {
+        spec,
+        load: crate::api::pack::LoadMode::Dormant,
+        confirm: true,
+        data: None,
+    }
+}
+
+fn owner_conflict(name: &str) -> Option<String> {
+    is_bundled(name)
+        .then(|| format!("{name}: managed package name conflicts with a builtin plugin"))
+}
+
+fn activation_refusal(name: &str, config: &maki_config::PluginsConfig) -> Option<String> {
+    owner_conflict(name).or_else(|| {
+        (!config.packages.iter().any(|package| package == name))
+            .then(|| format!("{name}: package is disabled, so it was not activated"))
+    })
 }
 
 /// Applies the package operations Lua recorded.
@@ -373,14 +612,389 @@ pub fn install_declared(
 ///
 /// Each operation is independent, so one failure is reported and the rest still
 /// run.
+/// An update that resolved to a revision, waiting on review and approval.
+struct PreparedUpdate {
+    declared: crate::api::pack::Declared,
+    installed: maki_pack::manager::Installed,
+    was_active: bool,
+    force: bool,
+    source_changed: bool,
+    review: String,
+}
+
+/// What `commit_batch` needs to record a batch, or to undo it.
+struct CommitBatch<'a> {
+    host: &'a crate::loader::PluginHost,
+    config: &'a maki_config::PluginsConfig,
+    manager: &'a maki_pack::manager::Manager,
+    lock: &'a maki_pack::lockfile::Lockfile,
+    lock_path: Option<&'a Path>,
+    original_lock: &'a maki_pack::lockfile::Lockfile,
+    approvals_before: Option<&'a maki_pack::approvals::Approvals>,
+    approvals_changed: bool,
+    completed_changes: Vec<crate::api::pack::PackChange>,
+}
+
+/// Records what the batch did, or puts back what it can when it cannot.
+///
+/// The lockfile is the only durable record of where a checkout went. If it
+/// cannot be written the packages have still moved on disk, so every change
+/// has to be undone and no operation may be reported as done: the next start
+/// reads the old lockfile and would not find the new revisions.
+fn commit_batch(batch: CommitBatch<'_>, report: &mut PackReport) {
+    let CommitBatch {
+        host,
+        config,
+        manager,
+        lock,
+        lock_path,
+        original_lock,
+        approvals_before,
+        approvals_changed,
+        completed_changes,
+    } = batch;
+
+    // The lockfile is the durable record, so it decides whether anything moved.
+    // A flag carried beside it could only ever disagree with it.
+    let changed = lock != original_lock;
+    let lock_written = !changed || lock_path.is_some_and(|path| write_lockfile(path, lock));
+    if !lock_written {
+        if approvals_changed
+            && approvals_before
+                .as_ref()
+                .is_none_or(|approvals| !write_approvals(approvals))
+        {
+            report.failures.push(
+                    "the previous package approvals could not be restored after the lockfile write failed"
+                        .to_owned(),
+                );
+        }
+        for change in &completed_changes {
+            let name = &change.declared.spec.name;
+            let Some(previous) = original_lock.get(name) else {
+                continue;
+            };
+            let restored = match change.kind {
+                crate::api::pack::PackChangeKind::Update => {
+                    if change.active
+                        && let Err(error) = host.unload(name)
+                    {
+                        report.failures.push(format!(
+                            "{name}: the unrecorded revision could not be unloaded: {error}"
+                        ));
+                        continue;
+                    }
+                    manager.resolve(original_lock, name)
+                }
+                crate::api::pack::PackChangeKind::Delete => {
+                    let spec = Spec::new(previous.src.clone()).with_name(name.clone());
+                    let mut restore_lock = original_lock.clone();
+                    match smol::block_on(manager.ensure_installed(&spec, &mut restore_lock)) {
+                        Ok(installed) => Some(installed.dir),
+                        Err(error) => {
+                            let message = redact_error(&error);
+                            report.failures.push(format!(
+                                "{name}: the removed checkout could not be restored: {message}"
+                            ));
+                            None
+                        }
+                    }
+                }
+                crate::api::pack::PackChangeKind::Install => None,
+            };
+            if change.active
+                && let Some(path) = restored
+                && let Err(error) =
+                    load_declared_one(host, &change.declared, &path, &previous.src, config)
+            {
+                report.failures.push(format!(
+                    "{name}: the previous revision failed to reload: {error}"
+                ));
+            }
+        }
+        // The packages moved on disk but nothing recorded where. The next
+        // catalog reads the old lockfile, so an unrecorded revision must not
+        // remain active or be counted as done.
+        for (name, _) in report.updated.drain(..) {
+            report.failures.push(format!(
+                "{name}: the new revision could not be recorded, so the old one \
+                     comes back on the next start"
+            ));
+        }
+        for name in report.removed.drain(..) {
+            report.failures.push(format!(
+                    "{name}: the removal could not be recorded, so the package comes back on the next start"
+                ));
+        }
+        report
+            .failures
+            .push("packages changed but the lockfile could not be written".to_owned());
+    } else {
+        for name in &report.removed {
+            if !revoke_approval(name) {
+                report.failures.push(format!(
+                    "{name}: removed, but its approval could not be revoked; \
+                        reinstalling the same source restores the old grants"
+                ));
+            }
+        }
+        for change in completed_changes {
+            let _ = host.fire_pack_changed("PackChanged", change);
+        }
+    }
+}
+
+/// The operations in a batch that may run, in request order.
+///
+/// A name given more than one operation in one batch is refused outright:
+/// which of them won would depend on the order the passes below happen to run
+/// in. A name that belongs to a builtin owner is refused for the same reason
+/// deleting one is refused, because every plugin is an owner.
+fn runnable_ops<'a>(
+    ops: &'a [crate::api::pack::PackOp],
+    report: &mut PackReport,
+) -> Vec<&'a crate::api::pack::PackOp> {
+    use crate::api::pack::PackOp;
+
+    let name_of = |op: &'a PackOp| match op {
+        PackOp::Update { name, .. } | PackOp::Delete { name, .. } | PackOp::Activate { name } => {
+            name.as_str()
+        }
+    };
+
+    let mut seen = std::collections::BTreeSet::new();
+    let mut conflicted = std::collections::BTreeSet::new();
+    for op in ops {
+        let name = name_of(op);
+        if !seen.insert(name) {
+            conflicted.insert(name);
+        }
+    }
+    for name in &conflicted {
+        report.failures.push(format!(
+            "{name}: several package operations were requested; nothing was changed for it"
+        ));
+    }
+
+    ops.iter()
+        .filter(|op| {
+            let name = name_of(op);
+            if conflicted.contains(name) {
+                return false;
+            }
+            match owner_conflict(name) {
+                Some(error) => {
+                    report.failures.push(error);
+                    false
+                }
+                None => true,
+            }
+        })
+        .collect()
+}
+
+/// What the update pass reads while it resolves each requested revision.
+struct Prepare<'a> {
+    declared: &'a [crate::api::pack::Declared],
+    manual: &'a [DiscoveredPackage],
+    manager: &'a maki_pack::manager::Manager,
+    active: &'a std::collections::BTreeSet<String>,
+}
+
+/// Resolves every requested update to a revision, without moving anything.
+///
+/// Separate from applying them, because Neovim shows the whole set for review
+/// before the first checkout moves, and a declined review must leave the
+/// lockfile exactly as it was.
+fn prepare_updates(
+    runnable: &[&crate::api::pack::PackOp],
+    ctx: &Prepare<'_>,
+    lock: &mut maki_pack::lockfile::Lockfile,
+    report: &mut PackReport,
+) -> Vec<PreparedUpdate> {
+    use crate::api::pack::{PackOp, UpdateTarget};
+
+    let Prepare {
+        declared,
+        manual,
+        manager,
+        active,
+    } = ctx;
+    let mut prepared = Vec::new();
+    for op in runnable {
+        let PackOp::Update { name, options } = op else {
+            continue;
+        };
+        let Some(declaration) = declared
+            .iter()
+            .find(|declaration| declaration.spec.name == *name)
+        else {
+            report.failures.push(format!(
+                "{name}: not declared with maki.pack.add, so it cannot be updated"
+            ));
+            continue;
+        };
+        let Some(previous) = lock.get(name).cloned() else {
+            report
+                .failures
+                .push(format!("{name}: not installed, so it cannot be updated"));
+            continue;
+        };
+        if let Some(package) = manual.iter().find(|package| package.name == *name) {
+            report.failures.push(format!(
+                "{name}: managed package name conflicts with manual package at {}",
+                package.dir.display()
+            ));
+            continue;
+        }
+
+        let existed = manager.resolve(lock, name).is_some();
+        let mut preview = lock.clone();
+        let refresh = match options.target {
+            UpdateTarget::Version => {
+                preview.remove(name);
+                options.remote(maki_pack::manager::Refresh::Always)
+            }
+            UpdateTarget::Lockfile => options.remote(maki_pack::manager::Refresh::IfMissing),
+        };
+        let installed =
+            match smol::block_on(manager.install(&declaration.spec, &mut preview, refresh)) {
+                Ok(installed) => installed,
+                Err(error) => {
+                    let message = redact_error(&error);
+                    tracing::error!(package = %name, error = %message, "failed to prepare update");
+                    report.failures.push(format!("{name}: {message}"));
+                    continue;
+                }
+            };
+        if existed && previous.src == declaration.spec.src && previous.rev == installed.rev {
+            continue;
+        }
+        let subjects = if previous.src == declaration.spec.src {
+            match smol::block_on(manager.revision_log(name, &previous.rev, &installed.rev)) {
+                Ok(subjects) => subjects,
+                Err(error) => {
+                    let message = redact_error(&error);
+                    tracing::error!(package = %name, error = %message, "failed to review update");
+                    report
+                        .failures
+                        .push(format!("{name}: could not review update: {message}"));
+                    continue;
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        let mut review = format!("{name}: {} -> {}", previous.rev, installed.rev);
+        for subject in subjects {
+            review.push_str("\n    ");
+            review.push_str(&subject);
+        }
+        prepared.push(PreparedUpdate {
+            declared: declaration.clone(),
+            installed,
+            was_active: active.contains(name),
+            force: options.force,
+            source_changed: previous.src != declaration.spec.src,
+            review,
+        });
+    }
+    prepared
+}
+
+/// What the delete pass reads while it decides what may be removed.
+struct Remove<'a> {
+    declared: &'a [crate::api::pack::Declared],
+    site: &'a Path,
+    manager: &'a maki_pack::manager::Manager,
+    lock: &'a maki_pack::lockfile::Lockfile,
+    active: &'a std::collections::BTreeSet<String>,
+}
+
+/// Works out which removals may go ahead, without removing anything.
+///
+/// Separate from applying them for the same reason updates are: every
+/// pre-event fires before the first file moves, so the whole batch has to be
+/// known first.
+fn prepare_deletes(
+    runnable: &[&crate::api::pack::PackOp],
+    ctx: &Remove<'_>,
+    report: &mut PackReport,
+) -> std::collections::BTreeMap<String, crate::api::pack::PackChange> {
+    use crate::api::pack::PackOp;
+
+    let Remove {
+        declared,
+        site,
+        manager,
+        lock,
+        active,
+    } = ctx;
+    let mut prepared_deletes = std::collections::BTreeMap::new();
+    for op in runnable {
+        let PackOp::Delete { name, force } = op else {
+            continue;
+        };
+        // `/packdel` refuses a package that is still declared, because the
+        // next start would install it again. `maki.pack.del` reaches this
+        // point without that check, so it is made here as well and both
+        // callers get the same rule.
+        if declared.iter().any(|d| d.spec.name == *name) {
+            report.failures.push(format!(
+                "{name}: still declared with maki.pack.add, so it would be \
+                 installed again; remove the declaration first"
+            ));
+            continue;
+        }
+        // Checked before anything is unloaded. `unload` takes an owner name,
+        // and every plugin is an owner, so a crafted lock entry must not make
+        // deleting a package clear a builtin with the same name.
+        let Some(entry) = lock.get(name) else {
+            tracing::error!(package = %name, "not a managed package; refusing to remove");
+            report.failures.push(format!(
+                "{name}: not a managed package, so it was not removed"
+            ));
+            continue;
+        };
+        let was_active = active.contains(name);
+        if was_active && !force {
+            report
+                .failures
+                .push(format!("{name}: package is active; use force to remove it"));
+            continue;
+        }
+        let declaration = declared
+            .iter()
+            .find(|declaration| declaration.spec.name == *name)
+            .cloned()
+            .unwrap_or_else(|| {
+                synthetic_declared(Spec::new(entry.src.clone()).with_name(name.clone()))
+            });
+        let path = manager
+            .resolve(lock, name)
+            .unwrap_or_else(|| maki_pack::paths::package_root(site, name));
+        prepared_deletes.insert(
+            name.clone(),
+            crate::api::pack::PackChange {
+                declared: declaration,
+                active: was_active,
+                kind: crate::api::pack::PackChangeKind::Delete,
+                path,
+            },
+        );
+    }
+    prepared_deletes
+}
+
 pub fn apply_pack_ops(
     host: &crate::loader::PluginHost,
     ops: &[crate::api::pack::PackOp],
     declared: &[crate::api::pack::Declared],
     packages: &[DiscoveredPackage],
     config: &maki_config::PluginsConfig,
+    interaction: Interaction,
 ) -> PackReport {
-    use crate::api::pack::{PackOp, UpdateTarget};
+    use crate::api::pack::PackOp;
 
     let mut report = PackReport::default();
     if ops.is_empty() {
@@ -431,9 +1045,7 @@ pub fn apply_pack_ops(
             return report;
         }
     };
-    // Updated as the batch proceeds. Read once and left alone, a delete
-    // followed by an activate in the same batch would skip the activate as
-    // "already loaded" for a package the delete had just unloaded.
+    let original_lock = lock.clone();
     let mut active = match host.active_packages() {
         Ok(active) => active,
         Err(error) => {
@@ -443,157 +1055,257 @@ pub fn apply_pack_ops(
             return report;
         }
     };
+    // Decided once. Four later passes walk this batch, and each repeating the
+    // same two guards is how one of them ends up disagreeing with the others
+    // about whether an operation may run.
+    let runnable = runnable_ops(ops, &mut report);
 
-    let mut changed = false;
     let manual = discover(&site).packages;
-    for op in ops {
-        let name = match op {
-            PackOp::Update { name, .. } | PackOp::Delete { name } | PackOp::Activate { name } => {
-                name
-            }
-        };
-        if let Some(error) = owner_conflict(name) {
-            report.failures.push(error);
-            continue;
-        }
-        if manual.iter().any(|package| package.name == *name) && lock.get(name).is_some() {
+    let prepared = prepare_updates(
+        &runnable,
+        &Prepare {
+            declared,
+            manual: &manual,
+            manager: &manager,
+            active: &active,
+        },
+        &mut lock,
+        &mut report,
+    );
+
+    let review_items: Vec<&str> = prepared
+        .iter()
+        .filter(|update| !update.force)
+        .map(|update| update.review.as_str())
+        .collect();
+    let review_accepted = review_items.is_empty()
+        || interaction.confirm(&format!(
+            "Apply these package updates?\n  {}",
+            review_items.join("\n  ")
+        ));
+    let mut approvals = read_approvals_for_write();
+    let approvals_before = approvals.clone();
+    let mut approvals_changed = false;
+    let mut revoked_sources = std::collections::BTreeSet::new();
+    let mut approved = Vec::new();
+    for update in prepared {
+        let name = &update.declared.spec.name;
+        let Some(approvals) = approvals.as_mut() else {
             report.failures.push(format!(
-                "{name}: managed package name conflicts with a manual package"
+                "{name}: the package approval store is unreadable, so it was not updated"
+            ));
+            continue;
+        };
+        if !update.force && !review_accepted {
+            report.failures.push(format!(
+                "{name}: update requires confirmation; use force for a non-interactive update"
             ));
             continue;
         }
+        match approve_permissions(
+            interaction,
+            name,
+            &update.declared.spec.src,
+            &update.installed.dir,
+            approvals,
+        ) {
+            Ok(changed) => {
+                let revoked = update.source_changed
+                    && !changed
+                    && revoke_mismatched_approval(approvals, name, &update.declared.spec.src);
+                if revoked {
+                    revoked_sources.insert(name.clone());
+                }
+                approvals_changed |= changed || revoked;
+                approved.push((update, changed));
+            }
+            Err(message) => report.failures.push(message),
+        }
+    }
+    if approvals_changed
+        && approvals
+            .as_ref()
+            .is_none_or(|approvals| !write_approvals(approvals))
+    {
+        approved.retain(|(update, newly_approved)| {
+            if *newly_approved {
+                report.failures.push(format!(
+                    "{}: permission approval could not be saved",
+                    update.declared.spec.name
+                ));
+                false
+            } else {
+                true
+            }
+        });
+        for name in revoked_sources {
+            report.failures.push(format!(
+                "{name}: the old source permission approval could not be revoked"
+            ));
+        }
+    }
+
+    let mut approved: std::collections::BTreeMap<String, PreparedUpdate> = approved
+        .into_iter()
+        .map(|(update, _)| (update.declared.spec.name.clone(), update))
+        .collect();
+    let mut prepared_deletes = prepare_deletes(
+        &runnable,
+        &Remove {
+            declared,
+            site: &site,
+            manager: &manager,
+            lock: &lock,
+            active: &active,
+        },
+        &mut report,
+    );
+
+    // Neovim sends every pre-event in request order before it applies any
+    // change. A dependency observer can therefore see the complete batch
+    // before the first checkout moves.
+    for op in &runnable {
+        let change = match op {
+            PackOp::Delete { name, .. } => prepared_deletes.get(name).cloned(),
+            PackOp::Update { name, .. } => {
+                approved
+                    .get(name)
+                    .map(|update| crate::api::pack::PackChange {
+                        declared: update.declared.clone(),
+                        active: update.was_active,
+                        kind: crate::api::pack::PackChangeKind::Update,
+                        path: update.installed.dir.clone(),
+                    })
+            }
+            PackOp::Activate { .. } => None,
+        };
+        if let Some(change) = change {
+            let _ = host.fire_pack_changed("PackChangedPre", change);
+        }
+    }
+
+    active = match host.active_packages() {
+        Ok(active) => active,
+        Err(error) => {
+            report.failures.push(format!(
+                "package state changed during PackChangedPre, but could not be read: {error}"
+            ));
+            return report;
+        }
+    };
+    for (name, update) in &mut approved {
+        update.was_active = active.contains(name);
+    }
+    for (name, change) in &mut prepared_deletes {
+        change.active = active.contains(name);
+    }
+    for operation in &runnable {
+        let PackOp::Delete { name, force: false } = operation else {
+            continue;
+        };
+        if prepared_deletes
+            .get(name)
+            .is_some_and(|change| change.active)
+        {
+            prepared_deletes.remove(name);
+            report.failures.push(format!(
+                "{name}: package became active during PackChangedPre; use force to remove it"
+            ));
+        }
+    }
+
+    let mut completed_changes = Vec::new();
+    for op in &runnable {
         match op {
-            PackOp::Delete { name } => {
-                // Checked before anything is unloaded. `unload` takes an owner
-                // name, and every plugin is an owner, so deleting a name that
-                // is not a managed package would tear down whatever else
-                // answers to it: `del("bash")` would unregister the bundled
-                // bash tool, its keymaps, and its hints.
-                if lock.get(name).is_none() {
-                    tracing::error!(package = %name, "not a managed package; refusing to remove");
+            PackOp::Delete { name, .. } => {
+                let Some(change) = prepared_deletes.remove(name) else {
+                    continue;
+                };
+                if let Err(error) = host.unload(name) {
+                    tracing::error!(package = %name, %error, "failed to unload package");
                     report.failures.push(format!(
-                        "{name}: not a managed package, so it was not removed"
+                        "{name}: owner cleanup failed, so it was not removed: {error}"
                     ));
                     continue;
                 }
-                // Unloaded before the files go, so nothing keeps running from a
-                // directory that no longer exists.
-                if let Err(e) = host.unload(name) {
-                    tracing::error!(package = %name, error = %e, "failed to unload package");
-                    report.failures.push(format!(
-                        "{name}: owner cleanup failed, so it was not removed: {e}"
-                    ));
-                    continue;
+                if change.active {
+                    active.remove(name);
                 }
-                active.remove(name);
                 match manager.remove(name, &mut lock) {
                     Ok(()) => {
-                        changed = true;
                         report.removed.push(name.clone());
-                        // Last, so a step that fails earlier leaves the
-                        // approval exactly as it was. Revoking first would
-                        // strip the grant from a package that is still
-                        // installed, and every guarded call it makes would
-                        // then report a permission problem instead of the
-                        // removal that actually failed.
-                        if !revoke_approval(name) {
-                            report.failures.push(format!(
-                                "{name}: removed, but its approval could not be revoked; \
-                                 reinstalling the same source would not ask again"
-                            ));
-                        }
+                        completed_changes.push(change);
                     }
                     Err(e) => {
                         let msg = redact_error(&e);
                         tracing::error!(package = %name, error = %msg, "failed to remove");
                         report.failures.push(format!("{name}: {msg}"));
-                    }
-                }
-            }
-            PackOp::Update { name, options } => {
-                let Some(spec) = declared
-                    .iter()
-                    .find(|d| &d.spec.name == name)
-                    .map(|d| &d.spec)
-                else {
-                    tracing::error!(package = %name, "not a declared package; cannot update");
-                    report.failures.push(format!(
-                        "{name}: not declared with maki.pack.add, so it cannot be updated"
-                    ));
-                    continue;
-                };
-                // Kept so a failure can put it back. Dropping the pin is what
-                // makes `version` be resolved again, but a failed update must
-                // not leave the package unpinned: a later successful operation
-                // writes the lockfile, and the pin would be gone from it.
-                let previous = lock.get(name).cloned();
-                let was_active = active.contains(name);
-                let refresh = match options.target {
-                    UpdateTarget::Version => {
-                        lock.remove(name);
-                        options.remote(maki_pack::manager::Refresh::Always)
-                    }
-                    // Restoring the recorded revision needs no fetch: either it
-                    // is already materialized, or it has to be obtained, and
-                    // `IfMissing` covers both.
-                    UpdateTarget::Lockfile => {
-                        options.remote(maki_pack::manager::Refresh::IfMissing)
-                    }
-                };
-                match smol::block_on(manager.install(spec, &mut lock, refresh)) {
-                    Ok(result) => {
-                        if was_active {
-                            if let Err(e) = host.unload(name) {
-                                tracing::error!(package = %name, error = %e, "failed to unload");
-                                report.failures.push(format!("{name}: {e}"));
-                                match previous {
-                                    Some(entry) => lock.restore(name, entry),
-                                    None => lock.remove(name),
-                                }
-                                continue;
-                            }
-                            // Only reload what was running. Updating a package
-                            // that was dormant, or waiting on a lazy trigger,
-                            // must not be the thing that starts it.
-                            active.remove(name);
-                            match load_one(
+                        if change.active {
+                            match load_declared_one(
                                 host,
-                                name,
-                                &result.dir,
-                                Origin::Fetched {
-                                    src: spec.src.clone(),
-                                },
+                                &change.declared,
+                                &change.path,
+                                &change.declared.spec.src,
                                 config,
                             ) {
                                 Ok(()) => {
                                     active.insert(name.clone());
                                 }
-                                // The old owner is already gone, so this is a
-                                // package that is now installed and not
-                                // running. Saying so beats reporting success.
-                                Err(msg) => report
-                                    .failures
-                                    .push(format!("{name}: updated but failed to load: {msg}")),
+                                Err(error) => report.failures.push(format!(
+                                    "{name}: the old package also failed to reload: {error}"
+                                )),
                             }
                         }
-                        changed |= result.changed;
-                        report.updated.push((name.clone(), result.rev));
-                    }
-                    Err(e) => {
-                        let msg = redact_error(&e);
-                        tracing::error!(package = %name, error = %msg, "failed to update");
-                        if let Some(entry) = previous {
-                            lock.restore(name, entry);
-                        }
-                        report.failures.push(format!("{name}: {msg}"));
                     }
                 }
             }
-            PackOp::Activate { name } => {
-                if !config.packages.iter().any(|package| package == name) {
+            PackOp::Update { name, .. } => {
+                let Some(update) = approved.remove(name) else {
+                    continue;
+                };
+                if update.was_active
+                    && let Err(error) = host.unload(name)
+                {
+                    tracing::error!(package = %name, %error, "failed to unload package");
                     report.failures.push(format!(
-                        "{name}: package is disabled, so it was not activated"
+                        "{name}: owner cleanup failed, so it was not updated: {error}"
                     ));
+                    continue;
+                }
+                if update.was_active {
+                    active.remove(name);
+                }
+                lock.record(name, &update.declared.spec.src, &update.installed.rev);
+                report
+                    .updated
+                    .push((name.clone(), update.installed.rev.clone()));
+                if update.was_active {
+                    let loaded = load_declared_one(
+                        host,
+                        &update.declared,
+                        &update.installed.dir,
+                        &update.declared.spec.src,
+                        config,
+                    );
+                    match loaded {
+                        Ok(()) => {
+                            active.insert(name.clone());
+                        }
+                        Err(message) => report
+                            .failures
+                            .push(format!("{name}: updated but failed to load: {message}")),
+                    }
+                }
+                completed_changes.push(crate::api::pack::PackChange {
+                    declared: update.declared,
+                    active: update.was_active,
+                    kind: crate::api::pack::PackChangeKind::Update,
+                    path: update.installed.dir,
+                });
+            }
+            PackOp::Activate { name } => {
+                if let Some(error) = activation_refusal(name, config) {
+                    report.failures.push(error);
                     continue;
                 }
                 // Already loaded is success, not an error. Loading again would
@@ -604,7 +1316,7 @@ pub fn apply_pack_ops(
                 }
                 // The caller's set is tried first. It already holds every
                 // package this startup discovered or installed, so the common
-                // case needs no managed state at all.
+                // case reads no managed state at all.
                 let found = packages
                     .iter()
                     .find(|package| package.name == *name)
@@ -613,12 +1325,10 @@ pub fn apply_pack_ops(
                 match found {
                     Some((dir, origin)) => match load_one(host, name, &dir, origin, config) {
                         Ok(()) => {
-                            active.insert(name.clone());
                             report.activated.push(name.clone());
+                            active.insert(name.clone());
                         }
-                        Err(message) => report
-                            .failures
-                            .push(format!("{name}: failed to activate: {message}")),
+                        Err(msg) => report.failures.push(format!("{name}: {msg}")),
                     },
                     None => {
                         tracing::error!(package = %name, "not installed; cannot activate");
@@ -631,29 +1341,66 @@ pub fn apply_pack_ops(
         }
     }
 
-    if changed
-        && let Some(path) = lock_path
-        && !write_lockfile(&path, &lock)
-    {
-        // The packages moved on disk but nothing recorded where. The next
-        // start reads the old lockfile and loads the old revisions, so these
-        // updates did not stick and must not be counted as done.
-        for (name, _) in report.updated.drain(..) {
-            report.failures.push(format!(
-                "{name}: the new revision could not be recorded, so the old one \
-                comes back on the next start"
-            ));
-        }
-        report
-            .failures
-            .push("packages changed but the lockfile could not be written".to_owned());
-    }
+    commit_batch(
+        CommitBatch {
+            host,
+            config,
+            manager: &manager,
+            lock: &lock,
+            lock_path: lock_path.as_deref(),
+            original_lock: &original_lock,
+            approvals_before: approvals_before.as_ref(),
+            approvals_changed,
+            completed_changes,
+        },
+        &mut report,
+    );
     report
 }
 
-fn owner_conflict(name: &str) -> Option<String> {
-    is_bundled(name)
-        .then(|| format!("{name}: managed package name conflicts with a builtin plugin"))
+fn approve_permissions(
+    interaction: Interaction,
+    name: &str,
+    src: &str,
+    dir: &Path,
+    approvals: &mut maki_pack::approvals::Approvals,
+) -> Result<bool, String> {
+    let requested = load_requested_permissions(dir)
+        .map_err(|e| redact_error(&e))?
+        .names();
+    let key = maki_pack::approvals::ApprovalKey::new(name, src);
+    let approved = approvals.get(&key).unwrap_or(&[]);
+    let missing: Vec<&str> = requested
+        .iter()
+        .map(String::as_str)
+        .filter(|permission| !approved.iter().any(|item| item == permission))
+        .collect();
+    if missing.is_empty() {
+        return Ok(false);
+    }
+    if !interaction.confirm(&format!(
+        "Allow package {name} these permissions: {}?",
+        missing.join(", ")
+    )) {
+        return Err(format!(
+            "{name}: permission approval is required for {}",
+            missing.join(", ")
+        ));
+    }
+    approvals.approve(&key, requested);
+    Ok(true)
+}
+
+fn revoke_mismatched_approval(
+    approvals: &mut maki_pack::approvals::Approvals,
+    name: &str,
+    src: &str,
+) -> bool {
+    let key = maki_pack::approvals::ApprovalKey::new(name, src);
+    if approvals.get(&key).is_some() {
+        return false;
+    }
+    approvals.revoke(name)
 }
 
 /// Every package name the lockfile records, whether or not `init.lua` still
@@ -665,6 +1412,22 @@ fn owner_conflict(name: &str) -> Option<String> {
 pub fn installed_names() -> Option<Vec<String>> {
     let lock = read_lockfile(lockfile_path().as_deref())?;
     Some(lock.install_order().map(str::to_owned).collect())
+}
+
+/// Where one installed package lives, if the lockfile records it.
+pub fn installed_package(name: &str) -> Option<DiscoveredPackage> {
+    let site = site_dir().ok()?;
+    let lock = read_lockfile(lockfile_path().as_deref())?;
+    let manager = maki_pack::manager::Manager::new(&site);
+    let dir = manager.resolve(&lock, name)?;
+    let src = lock.get(name)?.src.clone();
+    Some(DiscoveredPackage {
+        name: name.to_owned(),
+        requested: load_requested_permissions(&dir).ok()?,
+        dir,
+        eager: true,
+        origin: Origin::Fetched { src },
+    })
 }
 
 /// What `/packupdate` or `/packdel` asked for.
@@ -680,13 +1443,15 @@ pub enum PackCommand {
     },
     Delete {
         names: Vec<String>,
-        /// `++all`. Without a bang, active packages are kept.
         all: bool,
+        force: bool,
     },
 }
 
 impl PackCommand {
-    pub fn parse(name: &str, args: &str) -> Result<Self, String> {
+    /// Reads one command line. `bang` is the trailing `!`, which the palette
+    /// has already taken off the name.
+    pub fn parse(name: &str, args: &str, bang: bool) -> Result<Self, String> {
         use crate::api::pack::{UpdateOptions, UpdateTarget};
 
         let mut names = Vec::new();
@@ -703,7 +1468,8 @@ impl PackCommand {
                 flag if flag.starts_with('+') || flag.starts_with('-') => {
                     return Err(format!("{name}: unknown option {flag:?}"));
                 }
-                other => names.push(other.to_owned()),
+                other if !names.iter().any(|name| name == other) => names.push(other.to_owned()),
+                _ => {}
             }
         }
 
@@ -712,6 +1478,7 @@ impl PackCommand {
                 if all {
                     return Err("/packupdate: ++all is not an option; omit the name instead".into());
                 }
+                options.force = bang;
                 Ok(PackCommand::Update { names, options })
             }
             "/packdel" => {
@@ -721,7 +1488,11 @@ impl PackCommand {
                 if all != names.is_empty() {
                     return Err("/packdel: name a package, or pass ++all".into());
                 }
-                Ok(PackCommand::Delete { names, all })
+                Ok(PackCommand::Delete {
+                    names,
+                    all,
+                    force: bang,
+                })
             }
             other => Err(format!("{other}: not a package command")),
         }
@@ -735,7 +1506,6 @@ impl PackCommand {
 /// read here, so this stays a pure decision that a test can drive.
 pub fn plan_command(
     cmd: &PackCommand,
-    bang: bool,
     declared: &[crate::api::pack::Declared],
     installed: &[String],
     active: &std::collections::BTreeSet<String>,
@@ -767,7 +1537,7 @@ pub fn plan_command(
                 })
                 .collect())
         }
-        PackCommand::Delete { names, all } => {
+        PackCommand::Delete { names, all, force } => {
             // Deletion asks what is installed, not what is declared. Removing
             // the `maki.pack.add` line and then removing the files is the
             // normal way to get rid of a package, and it is the only way that
@@ -779,7 +1549,7 @@ pub fn plan_command(
                 installed
                     .iter()
                     .filter(|name| !known.contains(&name.as_str()))
-                    .filter(|name| bang || !active.contains(*name))
+                    .filter(|name| *force || !active.contains(*name))
                     .cloned()
                     .collect()
             } else {
@@ -792,7 +1562,7 @@ pub fn plan_command(
                             "{name}: package is still declared; remove it from maki.pack.add first"
                         ));
                     }
-                    if active.contains(name) && !bang {
+                    if active.contains(name) && !force {
                         return Err(format!(
                             "{name}: package is active; use /packdel! to remove it"
                         ));
@@ -805,8 +1575,217 @@ pub fn plan_command(
             }
             Ok(names
                 .into_iter()
-                .map(|name| PackOp::Delete { name })
+                .map(|name| PackOp::Delete {
+                    name,
+                    force: *force,
+                })
                 .collect())
+        }
+    }
+}
+
+/// Hands the runtime every installed package that can be activated later.
+///
+/// This includes manual `opt/` packages, managed packages declared with
+/// `load = false`, and packages with lazy triggers. The same runtime table
+/// therefore serves explicit `maki.packadd` calls and automatic activation.
+///
+/// `reserved` carries the names the caller resolves *before* Lua commands:
+/// builtins and discovered custom commands. A trigger on one of those could
+/// never fire, because the palette would dispatch the other one first, so it
+/// is refused rather than left as a command that silently does nothing.
+pub fn arm_packages(
+    host: &crate::loader::PluginHost,
+    packages: &[DiscoveredPackage],
+    declared: &[crate::api::pack::Declared],
+    reserved: &[String],
+    active: &std::collections::BTreeSet<String>,
+    config: &maki_config::PluginsConfig,
+) -> Result<(), PluginError> {
+    let mut names = std::collections::BTreeSet::new();
+    let mut dormant = Vec::new();
+    for package in packages {
+        if owner_conflict(&package.name).is_some() {
+            continue;
+        }
+        if !names.insert(package.name.clone()) {
+            continue;
+        }
+        let Some(triggers) = activation_triggers(package, declared) else {
+            continue;
+        };
+        // A package the config disabled stays disabled. Waking it on a
+        // trigger would be a way around `plugins.<name>.enabled = false`.
+        if !config.packages.iter().any(|name| name == &package.name) {
+            continue;
+        }
+        // Already loaded, because an eager load or `maki.packadd` named it.
+        // Cataloging it again would let a later trigger run its top level a
+        // second time under an owner that is already registered.
+        if active.contains(&package.name) {
+            continue;
+        }
+        let package = match &package.origin {
+            // Re-resolve managed packages from the lockfile. An update or
+            // deletion may have changed the path since installation returned.
+            Origin::Fetched { .. } => match installed_package(&package.name) {
+                Some(package) => package,
+                None => continue,
+            },
+            Origin::Manual => package.clone(),
+        };
+        let permissions = effective_permissions(&package);
+        if !package.requested.is_granted_by(&permissions) {
+            continue;
+        }
+        dormant.push(Dormant {
+            // Narrowed here, once, by the same rule a startup load uses.
+            // Activation must not be a way to get more than the package
+            // would have been granted at startup.
+            permissions,
+            name: package.name.clone(),
+            dir: package.dir,
+            opts: config
+                .opts
+                .get(&package.name)
+                .cloned()
+                .map(std::sync::Arc::new)
+                .unwrap_or_default(),
+            triggers,
+            state: PackState::Inactive,
+        });
+    }
+
+    let dormant = filter_trigger_collisions(host, dormant, reserved);
+
+    host.set_dormant_packages(dormant)
+}
+
+fn filter_trigger_collisions(
+    host: &crate::loader::PluginHost,
+    dormant: Vec<Dormant>,
+    reserved: &[String],
+) -> Vec<Dormant> {
+    // A trigger that claims a name something already answers to would shadow
+    // it until the package loads, and then lose the name anyway once the real
+    // registration wins. Refusing the trigger keeps the working command
+    // working; the package can still be woken with `maki.packadd`.
+    //
+    // The published snapshot mixes real registrations with the pending entries
+    // a previous arming put there for these same packages. Startup arms twice,
+    // once before loading and once after, so without this the second pass
+    // would see its own pending entries and drop every trigger it had just
+    // published.
+    let arming: std::collections::BTreeSet<&str> =
+        dormant.iter().map(|pkg| pkg.name.as_str()).collect();
+    let mut taken: Vec<String> = host
+        .command_reader()
+        .load()
+        .commands
+        .iter()
+        .filter(|command| !arming.contains(command.plugin.as_ref()))
+        .map(|command| command.name.to_string())
+        .collect();
+    taken.extend(reserved.iter().cloned());
+    let mut seen: Vec<String> = Vec::new();
+    let mut seen_keys: Vec<(KeyCode, KeyModifiers)> = Vec::new();
+    // Keys a loaded plugin already answers. The snapshot suppresses a pending
+    // entry for one of these, so arming it would leave a package with a
+    // trigger that can never fire and no warning saying why.
+    let bound: Vec<(KeyCode, KeyModifiers)> = host
+        .keymap_reader()
+        .load()
+        .entries
+        .iter()
+        .filter(|e| !arming.contains(e.plugin.as_ref()))
+        .map(|e| (e.key, e.modifiers))
+        .collect();
+    dormant
+        .into_iter()
+        .map(|mut pkg| {
+            pkg.triggers.cmd.retain(|cmd| {
+                if taken.iter().any(|t| t == cmd) {
+                    tracing::warn!(
+                        package = %pkg.name,
+                        command = %cmd,
+                        "a command with this name already exists; the trigger is ignored"
+                    );
+                    return false;
+                }
+                // Two packages claiming one command would race, and which one
+                // won would depend on declaration order.
+                if seen.iter().any(|t| t == cmd) {
+                    tracing::warn!(
+                        package = %pkg.name,
+                        command = %cmd,
+                        "another package already claims this command; the trigger is ignored"
+                    );
+                    return false;
+                }
+                seen.push(cmd.clone());
+                true
+            });
+            // Keys need the same rule. `with_dormant` already refuses a key a
+            // loaded plugin holds, but nothing there stops two dormant
+            // packages claiming one key, and which of them a press woke would
+            // then depend on declaration order.
+            pkg.triggers.keys.retain(|notation| {
+                // Parsed once, before either test. Parsing inside the bound
+                // check ran it again for every key a plugin already holds, and
+                // reported an unusable notation as "already bound" whenever
+                // some other binding happened to exist.
+                let Ok(parsed) = crate::api::keymap::parse_key_notation(notation) else {
+                    tracing::warn!(
+                        package = %pkg.name,
+                        key = %notation,
+                        "not a usable key notation; the trigger is ignored"
+                    );
+                    return false;
+                };
+                if bound.contains(&parsed) {
+                    tracing::warn!(
+                        package = %pkg.name,
+                        key = %notation,
+                        "a plugin already binds this key; the trigger is ignored"
+                    );
+                    return false;
+                }
+                if seen_keys.contains(&parsed) {
+                    tracing::warn!(
+                        package = %pkg.name,
+                        key = %notation,
+                        "another package already claims this key; the trigger is ignored"
+                    );
+                    return false;
+                }
+                seen_keys.push(parsed);
+                true
+            });
+            pkg
+        })
+        .collect()
+}
+
+/// Automatic triggers for one package, or an empty set when only an explicit
+/// `maki.packadd` may activate it.
+fn activation_triggers(
+    package: &DiscoveredPackage,
+    declared: &[crate::api::pack::Declared],
+) -> Option<crate::api::pack::Triggers> {
+    use crate::api::pack::LoadMode;
+
+    match &package.origin {
+        Origin::Manual if !package.eager => Some(crate::api::pack::Triggers::default()),
+        Origin::Manual => None,
+        Origin::Fetched { .. } => {
+            let declaration = declared
+                .iter()
+                .find(|declaration| declaration.spec.name == package.name)?;
+            match &declaration.load {
+                LoadMode::Dormant => Some(crate::api::pack::Triggers::default()),
+                LoadMode::Triggered(triggers) => Some(triggers.clone()),
+                LoadMode::Eager | LoadMode::Custom(_) => None,
+            }
         }
     }
 }
@@ -821,11 +1800,13 @@ pub fn plan_command(
 /// startup thread, after the packages are loaded, means the work happens off
 /// the Lua thread (so unloading cannot wait on itself) and before the terminal
 /// is taken over (so a clone cannot freeze a redraw).
+///
 pub fn drain_pack_ops(
     host: &crate::loader::PluginHost,
     declared: &[crate::api::pack::Declared],
     packages: &[DiscoveredPackage],
     config: &maki_config::PluginsConfig,
+    interaction: Interaction,
 ) -> PackReport {
     let ops = match host.take_pending_pack_ops() {
         Ok(ops) => ops,
@@ -834,7 +1815,7 @@ pub fn drain_pack_ops(
             return PackReport::default();
         }
     };
-    apply_pack_ops(host, &ops, declared, packages, config)
+    apply_pack_ops(host, &ops, declared, packages, config, interaction)
 }
 
 /// What a batch of package operations did.
@@ -896,7 +1877,7 @@ fn resolve_for_activation(
     name: &str,
 ) -> Option<(PathBuf, Origin)> {
     if let Some(dir) = manager.resolve(lock, name) {
-        let src = lock.get(name).map(|e| e.src.clone()).unwrap_or_default();
+        let src = lock.get(name)?.src.clone();
         return Some((dir, Origin::Fetched { src }));
     }
     discover(site)
@@ -904,6 +1885,38 @@ fn resolve_for_activation(
         .into_iter()
         .find(|p| p.name == name)
         .map(|p| (p.dir, p.origin))
+}
+
+/// What one package load should be given.
+///
+/// Both load paths go through this, so a change to how a grant is narrowed or
+/// where options come from cannot reach one of them and miss the other.
+fn load_inputs(
+    name: &str,
+    dir: &Path,
+    origin: Origin,
+    config: &maki_config::PluginsConfig,
+) -> Result<
+    (
+        crate::plugin_permissions::PluginPermissions,
+        crate::api::options::PluginOpts,
+    ),
+    String,
+> {
+    let package = DiscoveredPackage {
+        name: name.to_owned(),
+        requested: load_requested_permissions(dir).map_err(|e| redact_error(&e))?,
+        dir: dir.to_path_buf(),
+        eager: true,
+        origin,
+    };
+    let opts = config
+        .opts
+        .get(name)
+        .cloned()
+        .map(std::sync::Arc::new)
+        .unwrap_or_default();
+    Ok((effective_permissions(&package), opts))
 }
 
 /// Loads one package and says whether it worked.
@@ -918,20 +1931,28 @@ fn load_one(
     origin: Origin,
     config: &maki_config::PluginsConfig,
 ) -> Result<(), String> {
-    let package = DiscoveredPackage {
-        name: name.to_owned(),
-        requested: load_requested_permissions(dir).map_err(|e| redact_error(&e))?,
-        dir: dir.to_path_buf(),
-        eager: true,
-        origin,
+    let (permissions, opts) = load_inputs(name, dir, origin, config)?;
+    host.load_package(name, dir, permissions, opts)
+        .map_err(|error| redact_error(&error))
+}
+
+fn load_declared_one(
+    host: &crate::loader::PluginHost,
+    declared: &crate::api::pack::Declared,
+    dir: &Path,
+    src: &str,
+    config: &maki_config::PluginsConfig,
+) -> Result<(), String> {
+    let origin = Origin::Fetched {
+        src: src.to_owned(),
     };
-    let opts = config
-        .opts
-        .get(name)
-        .cloned()
-        .map(std::sync::Arc::new)
-        .unwrap_or_default();
-    host.load_package(name, dir, effective_permissions(&package), opts)
+    if !matches!(declared.load, crate::api::pack::LoadMode::Custom(_)) {
+        return load_one(host, &declared.spec.name, dir, origin, config);
+    }
+    let (permissions, opts) = load_inputs(&declared.spec.name, dir, origin, config)?;
+    let mut declared = declared.clone();
+    declared.spec.src = src.to_owned();
+    host.run_pack_loader(declared, dir, permissions, opts)
         .map_err(|error| redact_error(&error))
 }
 
@@ -958,6 +1979,25 @@ pub(crate) fn read_lockfile(path: Option<&Path>) -> Option<maki_pack::lockfile::
     }
 }
 
+fn write_approvals(approvals: &maki_pack::approvals::Approvals) -> bool {
+    let Some(path) = approvals_path() else {
+        return false;
+    };
+    match serde_json::to_string_pretty(approvals) {
+        Ok(text) => match write_atomically(&path, &text) {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::error!(path = %path.display(), %error, "failed to write pack approvals");
+                false
+            }
+        },
+        Err(error) => {
+            tracing::error!(%error, "failed to serialize pack approvals");
+            false
+        }
+    }
+}
+
 /// Writes the lockfile, and says whether it landed.
 fn write_lockfile(path: &Path, lock: &maki_pack::lockfile::Lockfile) -> bool {
     match lock.to_json() {
@@ -977,8 +2017,9 @@ fn write_lockfile(path: &Path, lock: &maki_pack::lockfile::Lockfile) -> bool {
 
 /// Drops a package's recorded approval.
 ///
-/// Removal stops when this fails, so a deleted package never leaves a grant
-/// that can silently return with a later install.
+/// A best-effort write: failing to revoke leaves a stale grant that only takes
+/// effect if the same name and source are installed again, so it is logged
+/// rather than allowed to abort the removal that already happened.
 fn revoke_approval(name: &str) -> bool {
     let Some(path) = approvals_path() else {
         return true;
@@ -987,24 +2028,7 @@ fn revoke_approval(name: &str) -> bool {
         return false;
     };
     approvals.revoke(name);
-    let text = if approvals.is_empty() {
-        "{}".to_owned()
-    } else {
-        match serde_json::to_string_pretty(&approvals) {
-            Ok(text) => text,
-            Err(e) => {
-                tracing::error!(error = %e, "failed to serialize pack approvals");
-                return false;
-            }
-        }
-    };
-    match write_atomically(&path, &text) {
-        Ok(()) => true,
-        Err(e) => {
-            tracing::error!(path = %path.display(), error = %e, "failed to write pack approvals");
-            false
-        }
-    }
+    write_approvals(&approvals)
 }
 
 /// Writes through a temporary file and renames, so a crash mid-write cannot
@@ -1013,15 +2037,7 @@ fn write_atomically(path: &Path, text: &str) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension("json.incoming");
-    // Flushed before the rename. Without this the rename can reach the disk
-    // first, so a crash leaves the real name pointing at a file whose contents
-    // never got there, and the lockfile reads as truncated on the next start.
-    let mut file = fs::File::create(&tmp)?;
-    file.write_all(text.as_bytes())?;
-    file.sync_all()?;
-    drop(file);
-    fs::rename(&tmp, path)
+    maki_storage::atomic_write(path, text.as_bytes()).map_err(std::io::Error::other)
 }
 
 /// What a discovery walk found, and what it had to refuse.
@@ -1152,48 +2168,16 @@ pub fn discover(site: &Path) -> Discovery {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
-    use crate::plugin_permissions::Permission;
+    use crate::loader::PluginHost;
+    use crate::plugin_permissions::{Permission, PluginPermissions};
+    use maki_agent::tools::ToolRegistry;
 
-    #[test]
-    fn terminal_messages_keep_layout_but_remove_control_characters() {
-        assert_eq!(
-            sanitize_message("package\u{1b}[31m\rname\nnext"),
-            "package [31m name\nnext"
-        );
-    }
-
-    #[test]
-    fn a_lockfile_read_error_is_not_treated_as_a_missing_file() {
-        let dir = tempfile::TempDir::new().unwrap();
-
-        assert!(read_lockfile(Some(dir.path())).is_none());
-    }
-
-    #[test]
-    fn a_missing_lockfile_reads_as_empty() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("missing.json");
-
-        assert!(read_lockfile(Some(&path)).unwrap().is_empty());
-    }
-
-    #[test]
-    fn an_invalid_approval_store_is_not_safe_to_overwrite() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("approvals.json");
-        fs::write(&path, "not json").unwrap();
-
-        assert!(read_approvals_file(&path).is_none());
-    }
-
-    #[test]
-    fn a_missing_approval_store_reads_as_empty() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("missing.json");
-
-        assert!(read_approvals_file(&path).unwrap().is_empty());
-    }
+    const EMPTY_PACK_SUMMARY: &str = "no package changed";
+    const FULL_PACK_SUMMARY: &str = "packages: 1 updated, 2 removed, 1 activated, 2 failed";
+    const SAFE_PROMPT: &str = "update [31m name\nnext";
 
     fn make_package(site: &Path, group: &str, sub: &str, name: &str) -> PathBuf {
         let dir = site.join("pack").join(group).join(sub).join(name);
@@ -1311,6 +2295,7 @@ mod tests {
                 spec: maki_pack::Spec::new(format!("https://example.com/{n}")).with_name(*n),
                 load: crate::api::pack::LoadMode::Eager,
                 confirm: true,
+                data: None,
             })
             .collect()
     }
@@ -1320,10 +2305,365 @@ mod tests {
     }
 
     #[test]
+    fn only_manual_opt_packages_are_explicit_activation_targets() {
+        let mut package = greedy("demo", Origin::Manual);
+        package.eager = false;
+        assert!(activation_triggers(&package, &[]).is_some());
+
+        package.eager = true;
+        assert!(activation_triggers(&package, &[]).is_none());
+    }
+
+    #[test]
+    fn managed_activation_uses_the_declaration_with_the_same_name() {
+        let package = greedy(
+            "demo",
+            Origin::Fetched {
+                src: "https://example.com/demo".to_owned(),
+            },
+        );
+        let mut declared = declared_named(&["other", "demo"]);
+        declared[1].load = crate::api::pack::LoadMode::Triggered(crate::api::pack::Triggers {
+            cmd: vec!["/demo".to_owned()],
+            ..Default::default()
+        });
+
+        let triggers = activation_triggers(&package, &declared).expect("demo is activatable");
+
+        assert_eq!(triggers.cmd, ["/demo"]);
+    }
+
+    #[test]
+    fn builtin_owners_and_disabled_packages_cannot_be_activated() {
+        let config = maki_config::PluginsConfig::from_plugins_and_packages(
+            Default::default(),
+            &["bash".to_owned(), "demo".to_owned()],
+        );
+
+        assert!(owner_conflict("bash").is_some());
+        assert!(activation_refusal("bash", &config).is_some());
+        assert!(activation_refusal("disabled", &config).is_some());
+        assert!(activation_refusal("demo", &config).is_none());
+
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let mut package = greedy("bash", Origin::Manual);
+        package.eager = false;
+        arm_packages(&host, &[package], &[], &[], &Default::default(), &config).unwrap();
+
+        let error = host
+            .load_source("caller", r#"maki.packadd("bash")"#)
+            .expect_err("a catalog refresh must not reintroduce a builtin owner");
+        assert!(error.to_string().contains("not installed"), "got: {error}");
+    }
+
+    #[test]
+    fn trigger_collisions_keep_only_unclaimed_commands_and_keys() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(
+            "loaded",
+            r#"
+            maki.api.register_command({ name = "/taken", handler = function() end })
+            maki.keymap.set("n", "<C-g>", function() end)
+            "#,
+        )
+        .unwrap();
+        let package = |name: &str, commands: &[&str], keys: &[&str]| Dormant {
+            name: name.to_owned(),
+            dir: PathBuf::from("/nowhere"),
+            permissions: PluginPermissions::denied(),
+            opts: Default::default(),
+            triggers: crate::api::pack::Triggers {
+                cmd: commands
+                    .iter()
+                    .map(|command| (*command).to_owned())
+                    .collect(),
+                keys: keys.iter().map(|key| (*key).to_owned()).collect(),
+                ..Default::default()
+            },
+            state: PackState::Inactive,
+        };
+        let dormant = vec![
+            package(
+                "first",
+                &["/taken", "/reserved", "/shared"],
+                &["<C-g>", "<C-x>"],
+            ),
+            package("second", &["/shared", "/second"], &["<C-x>", "<C-y>"]),
+        ];
+
+        let filtered = filter_trigger_collisions(&host, dormant, &["/reserved".to_owned()]);
+
+        assert_eq!(filtered[0].triggers.cmd, ["/shared"]);
+        assert_eq!(filtered[0].triggers.keys, ["<C-x>"]);
+        assert_eq!(filtered[1].triggers.cmd, ["/second"]);
+        assert_eq!(filtered[1].triggers.keys, ["<C-y>"]);
+    }
+
+    /// Startup arms twice: once before the packages load, and once after. The
+    /// first pass publishes a pending palette entry for each trigger so the
+    /// user can type the command that wakes the package. The second pass must
+    /// not read those entries as names that are already taken, or every
+    /// trigger it just published would be dropped and no lazy package could
+    /// ever be woken by its command or key.
+    #[test]
+    fn a_second_arming_keeps_the_triggers_the_first_published() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let package = || Dormant {
+            name: "lazy".to_owned(),
+            dir: PathBuf::from("/nowhere"),
+            permissions: PluginPermissions::denied(),
+            opts: Default::default(),
+            triggers: crate::api::pack::Triggers {
+                cmd: vec!["/lazy".to_owned()],
+                keys: vec!["<C-l>".to_owned()],
+                ..Default::default()
+            },
+            state: PackState::Inactive,
+        };
+
+        let first = filter_trigger_collisions(&host, vec![package()], &[]);
+        assert_eq!(first[0].triggers.cmd, ["/lazy"]);
+        host.set_dormant_packages(first).unwrap();
+
+        let second = filter_trigger_collisions(&host, vec![package()], &[]);
+
+        assert_eq!(
+            second[0].triggers.cmd,
+            ["/lazy"],
+            "the pending entry the first arming published is not a collision"
+        );
+        assert_eq!(second[0].triggers.keys, ["<C-l>"]);
+    }
+
+    #[test]
+    fn terminal_prompts_keep_layout_but_remove_control_characters() {
+        assert_eq!(
+            sanitize_message("update\u{1b}[31m\rname\nnext"),
+            SAFE_PROMPT
+        );
+    }
+
+    #[test]
+    fn a_changed_source_does_not_fetch_the_old_lock_entry() {
+        let site = tempfile::TempDir::new().unwrap();
+        let manager = maki_pack::manager::Manager::new(site.path());
+        let mut lock = maki_pack::lockfile::Lockfile::default();
+        lock.record("demo", "https://example.com/old", "abc123");
+        let mut declared = declared_named(&["demo"]);
+        declared[0].spec.src = "https://example.com/new".to_owned();
+
+        let candidates = install_candidates(&declared, &lock, &manager, Some(false));
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].spec.src, "https://example.com/new");
+        assert!(candidates[0].confirm);
+        assert!(candidates[0].source_changed);
+    }
+
+    #[test]
+    fn an_installed_revision_does_not_block_a_source_change() {
+        let site = tempfile::TempDir::new().unwrap();
+        let manager = maki_pack::manager::Manager::new(site.path());
+        let mut lock = maki_pack::lockfile::Lockfile::default();
+        lock.record("demo", "https://example.com/old", "abc123");
+        fs::create_dir_all(maki_pack::paths::revision_dir(
+            site.path(),
+            "demo",
+            "abc123",
+        ))
+        .unwrap();
+        let mut declared = declared_named(&["demo"]);
+        declared[0].spec.src = "https://example.com/new".to_owned();
+
+        let candidates = install_candidates(&declared, &lock, &manager, Some(true));
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].spec.src, "https://example.com/new");
+        assert!(candidates[0].source_changed);
+    }
+
+    #[test]
+    fn an_installed_matching_revision_needs_no_install() {
+        let site = tempfile::TempDir::new().unwrap();
+        let manager = maki_pack::manager::Manager::new(site.path());
+        let mut lock = maki_pack::lockfile::Lockfile::default();
+        lock.record("demo", "https://example.com/demo", "abc123");
+        fs::create_dir_all(maki_pack::paths::revision_dir(
+            site.path(),
+            "demo",
+            "abc123",
+        ))
+        .unwrap();
+        let declared = declared_named(&["demo"]);
+
+        assert!(install_candidates(&declared, &lock, &manager, Some(true)).is_empty());
+    }
+
+    #[test]
+    fn a_missing_matching_lock_entry_is_planned_once() {
+        let site = tempfile::TempDir::new().unwrap();
+        let manager = maki_pack::manager::Manager::new(site.path());
+        let mut lock = maki_pack::lockfile::Lockfile::default();
+        lock.record("demo", "https://example.com/demo", "abc123");
+        let declared = declared_named(&["demo"]);
+
+        let candidates = install_candidates(&declared, &lock, &manager, Some(true));
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0].declared.load,
+            crate::api::pack::LoadMode::Eager
+        );
+    }
+
+    #[test]
+    fn permission_check_accepts_no_request_and_rejects_an_unapproved_request() {
+        let package = tempfile::TempDir::new().unwrap();
+        let mut approvals = maki_pack::approvals::Approvals::default();
+        assert_eq!(
+            approve_permissions(
+                Interaction::None,
+                "demo",
+                "https://example.com/demo",
+                package.path(),
+                &mut approvals,
+            ),
+            Ok(false)
+        );
+
+        fs::write(
+            package.path().join("plugin.toml"),
+            "[permissions]\nrun = true\n",
+        )
+        .unwrap();
+        let error = approve_permissions(
+            Interaction::None,
+            "demo",
+            "https://example.com/demo",
+            package.path(),
+            &mut approvals,
+        )
+        .expect_err("an unapproved request must not pass in headless mode");
+        assert!(error.contains("run"), "{error}");
+    }
+
+    #[test]
+    fn permission_check_reuses_an_exact_approval() {
+        let package = tempfile::TempDir::new().unwrap();
+        fs::write(
+            package.path().join("plugin.toml"),
+            "[permissions]\nrun = true\n",
+        )
+        .unwrap();
+        let src = "https://example.com/demo";
+        let mut approvals = maki_pack::approvals::Approvals::default();
+        approvals.approve(
+            &maki_pack::approvals::ApprovalKey::new("demo", src),
+            vec!["run".to_owned()],
+        );
+
+        assert_eq!(
+            approve_permissions(
+                Interaction::None,
+                "demo",
+                src,
+                package.path(),
+                &mut approvals,
+            ),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn a_lockfile_read_error_is_not_treated_as_a_missing_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        assert!(read_lockfile(Some(dir.path())).is_none());
+    }
+
+    #[test]
+    fn a_missing_lockfile_reads_as_empty() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("missing.json");
+
+        assert_eq!(
+            read_lockfile(Some(&path)).unwrap().install_order().count(),
+            0
+        );
+    }
+
+    #[test]
+    fn an_invalid_approval_store_is_not_safe_to_overwrite() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("approvals.json");
+        fs::write(&path, "not json").unwrap();
+
+        assert!(read_approvals_file(&path).is_none());
+    }
+
+    #[test]
+    fn a_missing_approval_store_reads_as_empty() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("missing.json");
+
+        assert!(read_approvals_file(&path).unwrap().is_empty());
+    }
+
+    #[test]
+    fn atomic_writes_replace_an_existing_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("pack-lock.json");
+        fs::write(&path, "old").unwrap();
+
+        write_atomically(&path, "new").unwrap();
+
+        assert_eq!(fs::read_to_string(path).unwrap(), "new");
+    }
+
+    #[test]
+    fn a_source_change_keeps_an_approval_for_the_new_source() {
+        let name = "demo";
+        let old_src = "https://example.com/old";
+        let new_src = "https://example.com/new";
+        let mut approvals = maki_pack::approvals::Approvals::default();
+        approvals.approve(
+            &maki_pack::approvals::ApprovalKey::new(name, new_src),
+            vec!["run".to_owned()],
+        );
+
+        assert!(!revoke_mismatched_approval(&mut approvals, name, new_src));
+        assert!(
+            approvals
+                .get(&maki_pack::approvals::ApprovalKey::new(name, new_src))
+                .is_some()
+        );
+
+        approvals.approve(
+            &maki_pack::approvals::ApprovalKey::new(name, old_src),
+            vec!["run".to_owned()],
+        );
+        assert!(revoke_mismatched_approval(&mut approvals, name, new_src));
+        assert!(approvals.is_empty());
+    }
+
+    #[test]
+    fn pack_report_summary_lists_each_result_count() {
+        assert_eq!(PackReport::default().summary(), EMPTY_PACK_SUMMARY);
+        let report = PackReport {
+            updated: vec![("updated".to_owned(), "revision".to_owned())],
+            removed: vec!["removed-one".to_owned(), "removed-two".to_owned()],
+            activated: vec!["activated".to_owned()],
+            failures: vec!["failed-one".to_owned(), "failed-two".to_owned()],
+        };
+
+        assert_eq!(report.summary(), FULL_PACK_SUMMARY);
+    }
+
+    #[test]
     fn packupdate_flags_map_onto_the_same_options_lua_uses() {
         use crate::api::pack::{UpdateOptions, UpdateTarget};
 
-        let cmd = PackCommand::parse("/packupdate", "++offline ++lockfile").unwrap();
+        let cmd = PackCommand::parse("/packupdate", "++offline ++lockfile", false).unwrap();
         assert_eq!(
             cmd,
             PackCommand::Update {
@@ -1331,16 +2671,27 @@ mod tests {
                 options: UpdateOptions {
                     target: UpdateTarget::Lockfile,
                     offline: true,
+                    force: false,
                 },
             }
         );
+    }
+
+    #[test]
+    fn packupdate_bang_sets_force() {
+        let PackCommand::Update { options, .. } =
+            PackCommand::parse("/packupdate", "", true).unwrap()
+        else {
+            panic!("expected update command");
+        };
+        assert!(options.force);
     }
 
     /// A mistyped flag must not become a package name, or the error would name
     /// the wrong problem.
     #[test]
     fn an_unknown_flag_is_refused_rather_than_read_as_a_name() {
-        let err = PackCommand::parse("/packupdate", "++ofline")
+        let err = PackCommand::parse("/packupdate", "++ofline", false)
             .expect_err("a misspelled flag is not a package");
         assert!(err.contains("++ofline"), "{err}");
     }
@@ -1350,16 +2701,16 @@ mod tests {
     #[test]
     fn packupdate_without_a_name_plans_every_declared_package() {
         let declared = declared_named(&["alpha", "beta"]);
-        let cmd = PackCommand::parse("/packupdate", "").unwrap();
-        let ops = plan_command(&cmd, false, &declared, &[], &active_set(&[])).unwrap();
+        let cmd = PackCommand::parse("/packupdate", "", false).unwrap();
+        let ops = plan_command(&cmd, &declared, &[], &active_set(&[])).unwrap();
         assert_eq!(ops.len(), 2);
     }
 
     #[test]
     fn packupdate_refuses_a_package_that_was_never_declared() {
         let declared = declared_named(&["alpha"]);
-        let cmd = PackCommand::parse("/packupdate", "ghost").unwrap();
-        let err = plan_command(&cmd, false, &declared, &[], &active_set(&[]))
+        let cmd = PackCommand::parse("/packupdate", "ghost", false).unwrap();
+        let err = plan_command(&cmd, &declared, &[], &active_set(&[]))
             .expect_err("an undeclared package cannot be updated");
         assert!(err.contains("ghost"), "{err}");
     }
@@ -1369,22 +2720,29 @@ mod tests {
     /// for: the destructive half has to be asked for explicitly.
     #[test]
     fn packdel_all_skips_loaded_packages_unless_the_bang_is_given() {
-        let declared = Vec::new();
         let installed = vec!["alpha".to_owned(), "beta".to_owned()];
         let active = active_set(&["alpha"]);
-        let cmd = PackCommand::parse("/packdel", "++all").unwrap();
+        let cmd = PackCommand::parse("/packdel", "++all", false).unwrap();
 
-        let ops = plan_command(&cmd, false, &declared, &installed, &active).unwrap();
+        let ops = plan_command(&cmd, &[], &installed, &active).unwrap();
         assert_eq!(
             ops,
             vec![crate::api::pack::PackOp::Delete {
-                name: "beta".to_owned()
+                name: "beta".to_owned(),
+                force: false,
             }],
             "without the bang, the loaded package stays"
         );
 
-        let forced = plan_command(&cmd, true, &declared, &installed, &active).unwrap();
+        let cmd = PackCommand::parse("/packdel", "++all", true).unwrap();
+        let forced = plan_command(&cmd, &[], &installed, &active).unwrap();
         assert_eq!(forced.len(), 2, "the bang removes the loaded one too");
+        assert!(forced.into_iter().all(|operation| {
+            matches!(
+                operation,
+                crate::api::pack::PackOp::Delete { force: true, .. }
+            )
+        }));
     }
 
     /// Deleting a package is how you get rid of one you no longer declare, so
@@ -1395,14 +2753,15 @@ mod tests {
     #[test]
     fn packdel_removes_an_installed_package_that_is_no_longer_declared() {
         let installed = vec!["orphan".to_owned()];
-        let cmd = PackCommand::parse("/packdel", "orphan").unwrap();
+        let cmd = PackCommand::parse("/packdel", "orphan", false).unwrap();
 
-        let ops = plan_command(&cmd, false, &[], &installed, &active_set(&[]))
+        let ops = plan_command(&cmd, &[], &installed, &active_set(&[]))
             .expect("an installed package can be removed without a declaration");
         assert_eq!(
             ops,
             vec![crate::api::pack::PackOp::Delete {
-                name: "orphan".to_owned()
+                name: "orphan".to_owned(),
+                force: false,
             }]
         );
     }
@@ -1411,9 +2770,9 @@ mod tests {
     fn packdel_refuses_a_package_that_startup_would_reinstall() {
         let declared = declared_named(&["alpha"]);
         let installed = vec!["alpha".to_owned()];
-        let cmd = PackCommand::parse("/packdel", "alpha").unwrap();
+        let cmd = PackCommand::parse("/packdel", "alpha", true).unwrap();
 
-        let error = plan_command(&cmd, true, &declared, &installed, &active_set(&[]))
+        let error = plan_command(&cmd, &declared, &installed, &active_set(&[]))
             .expect_err("a declared package would be reinstalled during the reload");
 
         assert!(error.contains("remove it from maki.pack.add"), "{error}");
@@ -1423,60 +2782,46 @@ mod tests {
     fn packdel_requires_bang_for_an_active_named_package() {
         let installed = vec!["alpha".to_owned()];
         let active = active_set(&["alpha"]);
-        let cmd = PackCommand::parse("/packdel", "alpha").unwrap();
+        let cmd = PackCommand::parse("/packdel", "alpha", false).unwrap();
 
-        assert!(plan_command(&cmd, false, &[], &installed, &active).is_err());
+        assert!(plan_command(&cmd, &[], &installed, &active).is_err());
+        let cmd = PackCommand::parse("/packdel", "alpha", true).unwrap();
         assert_eq!(
-            plan_command(&cmd, true, &[], &installed, &active).unwrap(),
+            plan_command(&cmd, &[], &installed, &active).unwrap(),
             vec![crate::api::pack::PackOp::Delete {
-                name: "alpha".to_owned()
+                name: "alpha".to_owned(),
+                force: true,
             }]
         );
     }
 
     #[test]
     fn packdel_refuses_a_package_that_is_not_installed() {
-        let cmd = PackCommand::parse("/packdel", "ghost").unwrap();
-        let err = plan_command(&cmd, false, &[], &[], &active_set(&[]))
+        let cmd = PackCommand::parse("/packdel", "ghost", false).unwrap();
+        let err = plan_command(&cmd, &[], &[], &active_set(&[]))
             .expect_err("nothing to remove is an error, not a silent success");
         assert!(err.contains("ghost"), "{err}");
     }
 
     #[test]
     fn packdel_needs_either_a_name_or_all_but_not_both() {
-        assert!(PackCommand::parse("/packdel", "").is_err());
-        assert!(PackCommand::parse("/packdel", "++all alpha").is_err());
-        assert!(PackCommand::parse("/packdel", "alpha").is_ok());
+        assert!(PackCommand::parse("/packdel", "", false).is_err());
+        assert!(PackCommand::parse("/packdel", "++all alpha", false).is_err());
+        assert!(PackCommand::parse("/packdel", "alpha", false).is_ok());
     }
 
     /// The update flags mean nothing to a delete, so accepting them silently
     /// would let a user believe an offline delete did something different.
     #[test]
     fn packdel_refuses_the_update_flags() {
-        assert!(PackCommand::parse("/packdel", "++all ++offline").is_err());
+        assert!(PackCommand::parse("/packdel", "++all ++offline", false).is_err());
     }
 
     #[test]
     fn missing_site_dir_is_not_a_problem() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let found = discover(&tmp.path().join("absent"));
+        let found = discover(&PathBuf::from("/definitely/not/here"));
         assert!(found.packages.is_empty());
         assert!(found.problems.is_empty());
-    }
-
-    #[test]
-    fn unreadable_package_root_is_reported() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let pack = tmp.path().join("pack");
-        fs::write(&pack, "not a directory").unwrap();
-
-        let found = discover(tmp.path());
-
-        assert!(found.packages.is_empty());
-        assert!(matches!(
-            found.problems.as_slice(),
-            [PluginError::Io { .. }]
-        ));
     }
 
     #[test]

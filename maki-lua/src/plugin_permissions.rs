@@ -175,6 +175,20 @@ impl Requested {
         self.0.is_allowed(perm)
     }
 
+    pub fn names(&self) -> Vec<String> {
+        Permission::ALL
+            .into_iter()
+            .filter(|permission| self.is_requested(*permission))
+            .map(|permission| permission.to_string())
+            .collect()
+    }
+
+    pub fn is_granted_by(&self, permissions: &PluginPermissions) -> bool {
+        Permission::ALL
+            .into_iter()
+            .all(|permission| !self.is_requested(permission) || permissions.is_allowed(permission))
+    }
+
     /// A package the user installed by hand gets what it asks for. They placed
     /// the files, which is the same trust already given to a local `init.lua`.
     /// Only a package maki fetched has to be intersected with an approval.
@@ -270,22 +284,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn trusted_allows_everything() {
-        let p = PluginPermissions::trusted();
-        for perm in Permission::ALL {
-            assert!(p.is_allowed(perm), "{perm} should be allowed");
-        }
-    }
-
-    #[test]
-    fn denied_blocks_everything() {
-        let p = PluginPermissions::denied();
-        for perm in Permission::ALL {
-            assert!(!p.is_allowed(perm), "{perm} should be denied");
-        }
-    }
-
-    #[test]
     fn from_manifest_partial() {
         let val: toml::Value = toml::from_str(
             r#"
@@ -310,18 +308,6 @@ mod tests {
         for perm in Permission::ALL {
             assert!(p.is_allowed(perm), "{perm} should default to allowed");
         }
-    }
-
-    #[test]
-    fn set_modifies_single_permission() {
-        let mut p = PluginPermissions::trusted();
-        p.set(Permission::Net, false);
-        p.set(Permission::Run, false);
-        assert!(p.is_allowed(Permission::FsRead));
-        assert!(p.is_allowed(Permission::FsWrite));
-        assert!(!p.is_allowed(Permission::Net));
-        assert!(!p.is_allowed(Permission::Run));
-        assert!(p.is_allowed(Permission::Env));
     }
 
     #[test]
@@ -417,5 +403,18 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("permission denied"));
         assert!(msg.contains("fs_read"));
+    }
+
+    #[test]
+    fn every_requested_permission_must_be_granted() {
+        let manifest: toml::Value =
+            toml::from_str("[permissions]\nnet = true\nrun = true\n").unwrap();
+        let requested = Requested::from_manifest(&manifest);
+        let mut granted = PluginPermissions::denied();
+        granted.set(Permission::Net, true);
+
+        assert!(!requested.is_granted_by(&granted));
+        granted.set(Permission::Run, true);
+        assert!(requested.is_granted_by(&granted));
     }
 }

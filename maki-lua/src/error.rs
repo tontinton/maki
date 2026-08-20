@@ -29,6 +29,8 @@ pub enum PluginError {
     PackageEmpty { name: String, path: PathBuf },
     #[error("package file {path} resolves outside its package directory")]
     PackageEscape { path: PathBuf },
+    #[error("{plugin} did not finish loading within {milliseconds}ms")]
+    LoadTimeout { plugin: String, milliseconds: u128 },
     #[error(
         "package \"{name}\" at {path} has the same name as a bundled plugin; \
          rename its directory"

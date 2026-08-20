@@ -6,23 +6,58 @@ mod tui;
 use color_eyre::Result;
 use color_eyre::eyre::Context;
 
+use maki_lua::{Declared, DiscoveredPackage, Interaction, PluginHost};
 use maki_storage::StateDir;
 
 use crate::cli::{AuthAction, Cli, Command, McpAction, MigrateAction};
 use crate::update;
 
+/// Strips control characters out of a message before it reaches a terminal.
+///
+/// One rule, shared with the package code that formats its own warnings: a
+/// second copy here could start disagreeing about what is safe to print.
 fn sanitize_warning(message: impl std::fmt::Display) -> String {
-    message
-        .to_string()
-        .chars()
-        .map(|character| {
-            if character == '\n' || character == '\t' || !character.is_control() {
-                character
-            } else {
-                ' '
-            }
-        })
-        .collect()
+    maki_lua::sanitize_message(&message.to_string())
+}
+
+fn load_external_packages(
+    host: &PluginHost,
+    packages: &[DiscoveredPackage],
+    declared: &[Declared],
+    reserved: &[String],
+    config: &maki_config::PluginsConfig,
+    interaction: Interaction,
+    delivers_agent_events: bool,
+) -> Result<Vec<String>> {
+    let lock_confirm = host
+        .pack_lock_confirm()
+        .context("read package confirmation")?;
+    let installed = maki_lua::install_declared(
+        host,
+        declared,
+        lock_confirm,
+        interaction,
+        delivers_agent_events,
+    );
+    let mut warnings = installed.failures;
+    let available: Vec<DiscoveredPackage> = packages
+        .iter()
+        .chain(installed.packages.iter())
+        .cloned()
+        .collect();
+
+    let active = host.active_packages().context("read active packages")?;
+    maki_lua::arm_packages(host, &available, declared, reserved, &active, config)
+        .context("catalog activatable packages")?;
+    warnings.extend(host.load_packages(packages, config));
+    warnings.extend(host.load_declared_packages(&installed.packages, declared, config));
+    warnings
+        .extend(maki_lua::drain_pack_ops(host, declared, &available, config, interaction).failures);
+
+    let active = host.active_packages().context("refresh active packages")?;
+    maki_lua::arm_packages(host, &available, declared, reserved, &active, config)
+        .context("refresh activatable packages")?;
+    Ok(warnings)
 }
 
 pub fn dispatch(cli: Cli) -> Result<()> {

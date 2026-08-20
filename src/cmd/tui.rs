@@ -79,25 +79,27 @@ impl Drop for Teardown {
 /// off the Lua thread, so unloading an owner cannot wait on the thread that
 /// asked for it, and the terminal is not held, so a clone cannot stall a
 /// redraw.
-fn run_pack_command(stack: &Stack, request: &maki_ui::PackRequest) -> Vec<String> {
-    let cmd = match maki_lua::PackCommand::parse(&request.name, &request.args) {
-        Ok(cmd) => cmd,
-        Err(msg) => return vec![msg],
-    };
+fn run_pack_command(
+    stack: &Stack,
+    command: &maki_lua::PackCommand,
+    no_plugins: bool,
+    reserved: &[String],
+) -> Vec<String> {
     let declared = match stack.plugin_host.declared_packages() {
         Ok(declared) => declared,
         Err(e) => return vec![format!("could not read declared packages: {e}")],
     };
-    let installed = match maki_lua::installed_names() {
-        Some(installed) => installed,
-        None => return vec!["could not read the package lockfile".to_owned()],
-    };
+
     let active = match stack.plugin_host.active_packages() {
         Ok(active) => active,
         Err(error) => return vec![format!("could not read active packages: {error}")],
     };
+    let installed = match maki_lua::installed_names() {
+        Some(installed) => installed,
+        None => return vec!["the pack lockfile is unreadable".to_owned()],
+    };
 
-    let ops = match maki_lua::plan_command(&cmd, request.bang, &declared, &installed, &active) {
+    let ops = match maki_lua::plan_command(command, &declared, &installed, &active) {
         Ok(ops) => ops,
         Err(msg) => return vec![msg],
     };
@@ -109,10 +111,70 @@ fn run_pack_command(stack: &Stack, request: &maki_ui::PackRequest) -> Vec<String
         &declared,
         &[],
         &stack.config.plugins,
+        maki_lua::Interaction::Tty,
     );
     let mut messages = vec![report.summary()];
     messages.extend(report.failures.iter().cloned());
+    let discovery = maki_lua::discover_installed(no_plugins);
+    messages.extend(
+        discovery
+            .problems
+            .into_iter()
+            .map(|problem| super::sanitize_warning(format!("skipping package: {problem}"))),
+    );
+    let available: Vec<DiscoveredPackage> = discovery
+        .packages
+        .into_iter()
+        .chain(
+            declared
+                .iter()
+                .filter_map(|package| maki_lua::installed_package(&package.spec.name)),
+        )
+        .collect();
+    match stack.plugin_host.active_packages() {
+        Ok(active) => {
+            if let Err(error) = maki_lua::arm_packages(
+                &stack.plugin_host,
+                &available,
+                &declared,
+                reserved,
+                &active,
+                &stack.config.plugins,
+            ) {
+                messages.push(format!("could not refresh package state: {error}"));
+            }
+        }
+        Err(error) => messages.push(format!("could not refresh package state: {error}")),
+    }
     messages
+}
+
+fn reserved_command_names(commands: &[CustomCommand]) -> Vec<String> {
+    maki_ui::BUILTIN_COMMANDS
+        .iter()
+        .map(|command| command.name.to_string())
+        .chain(commands.iter().map(CustomCommand::display_name))
+        .collect()
+}
+
+fn catalog_packages(
+    host: &PluginHost,
+    packages: &[DiscoveredPackage],
+    declared: &[maki_lua::Declared],
+    reserved: &[String],
+    config: &maki_config::PluginsConfig,
+    warnings: &mut Vec<String>,
+) {
+    match host.active_packages() {
+        Ok(active) => {
+            if let Err(error) =
+                maki_lua::arm_packages(host, packages, declared, reserved, &active, config)
+            {
+                warnings.push(format!("could not catalog packages: {error}"));
+            }
+        }
+        Err(error) => warnings.push(format!("could not read active packages: {error}")),
+    }
 }
 
 fn discover_commands(disable: bool) -> Vec<CustomCommand> {
@@ -150,6 +212,7 @@ fn load_config(
         .map(|p| p.name.clone())
         .chain(declared.iter().map(|d| d.spec.name.clone()))
         .collect();
+
     let mut config = raw_config
         .unwrap_or_default()
         .into_config(cli.no_rtk, &known)
@@ -239,9 +302,11 @@ fn build_stack(
         }
     }
 
-    // After the builtins, so a package claiming a builtin tool name is the side
-    // that fails rather than breaking the builtin.
-    warnings.extend(plugin_host.load_packages(&packages, &config.plugins));
+    let commands = discover_commands(cli.no_commands);
+
+    // Everything the palette resolves ahead of a Lua command. A trigger on
+    // one of these would never fire, so it is removed from automatic matching.
+    let reserved = reserved_command_names(&commands);
 
     // Declared with `maki.pack.add` in init.lua. Installing here rather than
     // inside the call keeps a clone off the Lua thread, and is the phase
@@ -253,31 +318,46 @@ fn build_stack(
         // lockfile, and can run the fetched code under a package name the
         // fallback config happens to enable.
         Ok(_) if config_rejected => {
+            catalog_packages(
+                &plugin_host,
+                &packages,
+                &[],
+                &reserved,
+                &config.plugins,
+                &mut warnings,
+            );
+            warnings.extend(plugin_host.load_packages(&packages, &config.plugins));
             warnings.push("package changes in the rejected config were not applied".to_owned());
         }
         Ok(declared) => {
-            let installed = maki_lua::install_declared(&declared, maki_lua::Interaction::Tty);
-            warnings.extend(installed.failures.iter().cloned());
-            warnings.extend(plugin_host.load_packages(&installed.packages, &config.plugins));
-
-            // Applied last, once every package `init.lua` could have named is
-            // loaded, so an update knows whether it is reloading something
-            // that was running. This is also the only safe place for it: the
-            // work unloads owners, which waits on the Lua thread, so it cannot
-            // run inside the Lua call that asked for it.
-            let available: Vec<maki_lua::DiscoveredPackage> = packages
-                .iter()
-                .chain(&installed.packages)
-                .cloned()
-                .collect();
-            let report =
-                maki_lua::drain_pack_ops(&plugin_host, &declared, &available, &config.plugins);
-            warnings.extend(report.failures.iter().cloned());
+            let interaction = if cli.print || cli.is_sdk_mode() {
+                maki_lua::Interaction::None
+            } else {
+                maki_lua::Interaction::Tty
+            };
+            warnings.extend(super::load_external_packages(
+                &plugin_host,
+                &packages,
+                &declared,
+                &reserved,
+                &config.plugins,
+                interaction,
+                !cli.print && !cli.is_sdk_mode(),
+            )?);
         }
-        Err(e) => warnings.push(format!("could not read declared packages: {e}")),
+        Err(e) => {
+            catalog_packages(
+                &plugin_host,
+                &packages,
+                &[],
+                &reserved,
+                &config.plugins,
+                &mut warnings,
+            );
+            warnings.extend(plugin_host.load_packages(&packages, &config.plugins));
+            warnings.push(format!("could not read declared packages: {e}"));
+        }
     }
-
-    let commands = discover_commands(cli.no_commands);
 
     let model_result = setup::resolve_model(cli.model.as_deref(), &config.provider, storage);
     let (model, needs_login) = match (model_result, fallback_model) {
@@ -367,10 +447,6 @@ pub fn run(mut cli: Cli) -> Result<()> {
     setup::install_panic_log_hook();
     setup::warn_ignored_provider_fields();
 
-    // Discovery runs before logging is initialized, so a package problem has
-    // no log to reach either. The TUI shows these in its first generation; a
-    // mode that never opens the UI has to report them here or a broken
-    // package fails in complete silence.
     if cli.is_sdk_mode() || cli.print {
         for warning in &startup_warnings {
             eprintln!("warning: {warning}");
@@ -504,20 +580,32 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 }
                 return Ok(());
             }
+            RunOutcome::Pack {
+                tabs: reloaded,
+                focused: f,
+                command,
+            } => {
+                let started = Instant::now();
+                let reserved = reserved_command_names(&stack.commands);
+                warnings = run_pack_command(&stack, &command, cli.no_plugins, &reserved);
+                tabs = reloaded;
+                if tabs.is_empty() {
+                    tabs.push(AppSession::new(&stack.model.spec(), &cwd_str));
+                }
+                stack.commands = discover_commands(cli.no_commands);
+                focused = f.min(tabs.len() - 1);
+                tracing::info!(
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    tabs = tabs.len(),
+                    "package command: resumed UI"
+                );
+            }
             RunOutcome::Reload {
                 tabs: reloaded,
                 focused: f,
-                pack,
             } => {
                 let started = Instant::now();
                 let last_good = (stack.config.clone(), stack.model.clone());
-                // Before the host is shut down, because the work needs it: an
-                // update unloads the old owner and loads the new one. The
-                // generation is then rebuilt below, exactly as `/reload` does,
-                // so the session comes back with the new package set.
-                let pack_messages = pack
-                    .map(|request| run_pack_command(&stack, &request))
-                    .unwrap_or_default();
                 // Shut the old host down first so nothing can repopulate
                 // the registry after the clear: its senders disconnect, the
                 // watchdog aborts in-flight callbacks, and only this thread
@@ -535,12 +623,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
                     tabs.push(session);
                 }
                 stack = new_stack;
-                // Ahead of the rebuild's own warnings, and not replaced by
-                // them. The user typed the command that produced these, so
-                // losing them to the reload would answer a direct request
-                // with silence.
-                warnings = pack_messages;
-                warnings.extend(new_warnings);
+                warnings = new_warnings;
                 focused = f.min(tabs.len() - 1);
                 tracing::info!(
                     elapsed_ms = started.elapsed().as_millis() as u64,

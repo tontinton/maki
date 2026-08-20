@@ -224,23 +224,9 @@ pub enum ExitRequest {
     Success,
     Error,
     Reload,
-    /// Leave the UI, change the installed packages, and come back.
-    ///
-    /// A package change unloads and reloads owners and can clone from the
-    /// network. Neither may happen on the Lua thread, which is where a Lua
-    /// command handler would run, and neither should happen while the terminal
-    /// is held, which is where a redraw would stall. Reusing the reload path
-    /// puts the work exactly where `/reload` already rebuilds a generation.
-    Pack(PackRequest),
-}
-
-/// A package command on its way out of the UI, still unparsed.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct PackRequest {
-    /// `/packupdate` or `/packdel`.
-    pub name: String,
-    pub args: String,
-    pub bang: bool,
+    /// Leave the UI so the caller can change packages without holding the
+    /// terminal or blocking the Lua thread.
+    Pack(maki_lua::PackCommand),
 }
 
 impl ExitRequest {

@@ -2536,10 +2536,10 @@ fn run_cmdline_preserves_declared_bang() {
 
     assert_eq!(
         app.exit_request,
-        ExitRequest::Pack(PackRequest {
-            name: "/packdel".into(),
-            args: "demo".into(),
-            bang: true,
+        ExitRequest::Pack(maki_lua::PackCommand::Delete {
+            names: vec!["demo".into()],
+            all: false,
+            force: true,
         })
     );
 }

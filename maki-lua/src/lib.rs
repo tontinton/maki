@@ -10,7 +10,7 @@ mod runtime;
 
 pub use api::keymap::{KeymapEntry, KeymapReader, KeymapSnapshot};
 pub use api::options::{OptionSpec, OptionType, PluginOptionSpecs};
-pub use api::pack::{Declared, PackOp};
+pub use api::pack::{Declared, Dormant, PackChange, PackChangeKind, PackOp, PackState, Triggers};
 pub use api::util::command::{
     Anchor, Axis, Border, BuiltinAction, Dimension, Edge, FloatConfig, FloatConfigPatch,
     HintReader, HintSnapshot, LuaCommandInfo, LuaCommandReader, ModelRequest, SessionRequest,
@@ -20,9 +20,9 @@ pub use docs::{DocKind, FnDoc, ModuleDoc, ParamDoc, api_docs};
 pub use error::PluginError;
 pub use loader::{EventHandle, PluginHost};
 pub use pack::{
-    DiscoveredPackage, Discovery, InstallReport, Interaction, MANAGED_GROUP, Origin, PackCommand,
-    PackReport, apply_pack_ops, discover, discover_installed, drain_pack_ops, install_declared,
-    installed_names, lockfile_path, plan_command, site_dir,
+    DiscoveredPackage, Discovery, InstallReport, Interaction, PackCommand, PackReport,
+    apply_pack_ops, arm_packages, discover, discover_installed, drain_pack_ops, install_declared,
+    installed_names, installed_package, plan_command, sanitize_message,
 };
 pub use plugin_permissions::{Permission, PluginPermissions, Requested};
 pub use runtime::{KILL_GRACE, RestoreItem, WARM_TOOL_CAP};

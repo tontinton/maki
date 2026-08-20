@@ -131,6 +131,54 @@ static BUNDLED_DIRS: LazyLock<&'static [&'static Dir<'static>]> = LazyLock::new(
     Vec::leak(dirs)
 });
 
+/// Reads a package off disk into the chunks a load needs.
+///
+/// Deliberately separate from sending the load. Everything here is file I/O
+/// and nothing touches the Lua state, so the runtime thread can call it too.
+/// That is what makes a lazy trigger possible: `PluginHost::load_package`
+/// waits on a reply from the runtime, so the runtime cannot use it, but the
+/// runtime can read the package itself and then call `load_source` directly.
+pub(crate) fn read_package(
+    name: &str,
+    dir: &Path,
+) -> Result<(PathBuf, Vec<LoadChunk>), PluginError> {
+    // Refused here and not only in discovery, because loading an owner drops
+    // that owner's existing registrations first. A package named after a
+    // bundled plugin would unload the builtin before its own entrypoint ever
+    // ran, so every path that reaches a load has to be gated, not just the one
+    // that walks the site directory.
+    if is_bundled(name) {
+        return Err(PluginError::PackageNameConflict {
+            name: name.to_owned(),
+            path: dir.to_path_buf(),
+        });
+    }
+    // Resolved once here, so the manifest, the entrypoints, and later
+    // `require` calls all agree on one directory even if the path they came
+    // from changes underneath us.
+    let root = dir.canonicalize().map_err(|e| PluginError::Io {
+        path: dir.to_path_buf(),
+        source: e,
+    })?;
+    let files = package_entrypoints(&root)?;
+    if files.is_empty() {
+        return Err(PluginError::PackageEmpty {
+            name: name.to_owned(),
+            path: root,
+        });
+    }
+
+    let mut chunks = Vec::with_capacity(files.len());
+    for path in files {
+        let source = fs::read_to_string(&path).map_err(|e| PluginError::Io {
+            path: path.clone(),
+            source: e,
+        })?;
+        chunks.push(LoadChunk::new(path.display().to_string(), source));
+    }
+    Ok((root, chunks))
+}
+
 /// A package's entrypoints: every `plugin/*.lua`, sorted by filename so load
 /// order is deterministic across machines.
 ///
@@ -506,6 +554,15 @@ impl PluginHost {
         reply_rx.recv().map_err(|_| PluginError::HostDead)
     }
 
+    pub fn pack_lock_confirm(&self) -> Result<Option<bool>, PluginError> {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        self.inner
+            .tx
+            .send(Request::CollectPackConfirm { reply: reply_tx })
+            .map_err(|_| PluginError::HostDead)?;
+        reply_rx.recv().map_err(|_| PluginError::HostDead)
+    }
+
     pub fn active_packages(&self) -> Result<std::collections::BTreeSet<String>, PluginError> {
         let (reply_tx, reply_rx) = flume::bounded(1);
         self.inner
@@ -513,6 +570,80 @@ impl PluginHost {
             .send(Request::CollectActivePackages { reply: reply_tx })
             .map_err(|_| PluginError::HostDead)?;
         reply_rx.recv().map_err(|_| PluginError::HostDead)
+    }
+
+    #[cfg(test)]
+    fn set_load_timeout(&self, timeout: Duration) -> Result<(), PluginError> {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        self.inner
+            .tx
+            .send(Request::SetLoadTimeout {
+                timeout,
+                reply: reply_tx,
+            })
+            .map_err(|_| PluginError::HostDead)?;
+        reply_rx.recv().map_err(|_| PluginError::HostDead)
+    }
+
+    pub fn run_pack_loader(
+        &self,
+        declared: crate::api::pack::Declared,
+        path: &Path,
+        permissions: PluginPermissions,
+        opts: PluginOpts,
+    ) -> Result<(), PluginError> {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        self.inner
+            .tx
+            .send(Request::RunPackLoader {
+                declared,
+                path: path.to_path_buf(),
+                permissions,
+                opts,
+                reply: reply_tx,
+            })
+            .map_err(|_| PluginError::HostDead)?;
+        reply_rx.recv().map_err(|_| PluginError::HostDead)?
+    }
+
+    pub fn fire_pack_changed(
+        &self,
+        event: &'static str,
+        change: crate::api::pack::PackChange,
+    ) -> Result<(), PluginError> {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        self.inner
+            .tx
+            .send(Request::FirePackChanged {
+                event,
+                change,
+                reply: reply_tx,
+            })
+            .map_err(|_| PluginError::HostDead)?;
+        reply_rx.recv().map_err(|_| PluginError::HostDead)
+    }
+
+    /// Tells the runtime which packages are installed but not loaded, so a
+    /// trigger can activate one.
+    ///
+    /// Sent from the host because only the host knows where each package
+    /// landed and what its approval narrowed the permissions to. The runtime
+    /// then owns the activation itself, which is the only way it can happen:
+    /// `load_package` waits on a reply from the runtime thread.
+    pub fn set_dormant_packages(
+        &self,
+        packages: Vec<crate::api::pack::Dormant>,
+    ) -> Result<(), PluginError> {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        self.inner
+            .tx
+            .send(Request::SetDormantPackages {
+                packages,
+                reply: reply_tx,
+            })
+            .map_err(|_| PluginError::HostDead)?;
+        reply_rx.recv().map_err(|_| PluginError::HostDead)?;
+        Ok(())
     }
 
     /// Takes the package operations Lua recorded, leaving the queue empty.
@@ -528,50 +659,6 @@ impl PluginHost {
         reply_rx.recv().map_err(|_| PluginError::HostDead)
     }
 
-    /// Loads every `start/` package, and every managed package the caller
-    /// installed.
-    ///
-    /// Activation is not handled here. `maki.packadd` records an operation,
-    /// and every recorded operation is applied at one drain point once all of
-    /// this has run, so a package activated by another one still loads in this
-    /// startup.
-    pub fn load_packages(
-        &self,
-        packages: &[DiscoveredPackage],
-        config: &PluginsConfig,
-    ) -> Vec<String> {
-        let mut failures = Vec::new();
-        for pkg in packages
-            .iter()
-            .filter(|pkg| pkg.eager && config.packages.iter().any(|n| n == &pkg.name))
-        {
-            let opts = config
-                .opts
-                .get(&pkg.name)
-                .cloned()
-                .map(Arc::new)
-                .unwrap_or_default();
-            // A package the user installed by hand is granted what it asks
-            // for. A package maki fetched is granted only where the request
-            // and a recorded approval agree, so a manifest cannot certify
-            // itself.
-            let permissions = crate::pack::effective_permissions(pkg);
-            if let Err(e) = self.load_package(&pkg.name, &pkg.dir, permissions, opts) {
-                tracing::error!(
-                    package = %pkg.name,
-                    path = %pkg.dir.display(),
-                    error = %e,
-                    "failed to load package"
-                );
-                failures.push(crate::pack::sanitize_message(&format!(
-                    "{}: failed to load: {e}",
-                    pkg.name
-                )));
-            }
-        }
-        failures
-    }
-
     /// Loads one external package directory as a single owner.
     ///
     /// Every `plugin/*.lua` becomes a chunk, and the chunks share one
@@ -584,31 +671,96 @@ impl PluginHost {
         permissions: PluginPermissions,
         opts: PluginOpts,
     ) -> Result<(), PluginError> {
-        // Resolved once here, so the manifest, the entrypoints, and later
-        // `require` calls all agree on one directory even if the path they came
-        // from changes underneath us.
-        let root = dir.canonicalize().map_err(|e| PluginError::Io {
-            path: dir.to_path_buf(),
-            source: e,
-        })?;
-        let files = package_entrypoints(&root)?;
-        if files.is_empty() {
-            return Err(PluginError::PackageEmpty {
-                name: name.to_owned(),
-                path: root,
-            });
-        }
-
-        let mut chunks = Vec::with_capacity(files.len());
-        for path in files {
-            let source = fs::read_to_string(&path).map_err(|e| PluginError::Io {
-                path: path.clone(),
-                source: e,
-            })?;
-            chunks.push(LoadChunk::new(path.display().to_string(), source));
-        }
+        let (root, chunks) = read_package(name, dir)?;
         self.send_load(Arc::from(name), chunks, Some(root), permissions, opts, true)
     }
+
+    /// Loads the manually installed packages that load at startup.
+    ///
+    /// A broken package must not stop maki from starting, so each failure is
+    /// reported and the remaining packages still load. Packages the config
+    /// disabled are skipped, as are `opt/` packages, which wait to be
+    /// activated.
+    pub fn load_packages(
+        &self,
+        packages: &[DiscoveredPackage],
+        config: &PluginsConfig,
+    ) -> Vec<String> {
+        let mut failures = Vec::new();
+        for pkg in packages.iter().filter(|p| p.eager) {
+            if !config.packages.iter().any(|n| n == &pkg.name) {
+                continue;
+            }
+            let opts = config
+                .opts
+                .get(&pkg.name)
+                .cloned()
+                .map(Arc::new)
+                .unwrap_or_default();
+            // A package the user installed by hand is granted what it asks
+            // for. A package maki fetched is granted only where the request
+            // and a recorded approval agree, so a manifest cannot certify
+            // itself.
+            let permissions = crate::pack::effective_permissions(pkg);
+            if let Err(e) = self.load_package(&pkg.name, &pkg.dir, permissions, opts) {
+                let message = crate::pack::redact_error(&e);
+                tracing::error!(
+                    package = %pkg.name,
+                    path = %pkg.dir.display(),
+                    error = %message,
+                    "failed to load package"
+                );
+                failures.push(format!("{}: failed to load: {message}", pkg.name));
+            }
+        }
+        failures
+    }
+
+    pub fn load_declared_packages(
+        &self,
+        packages: &[DiscoveredPackage],
+        declared: &[crate::api::pack::Declared],
+        config: &PluginsConfig,
+    ) -> Vec<String> {
+        let mut failures = Vec::new();
+        for package in packages.iter().filter(|package| package.eager) {
+            if !config.packages.iter().any(|name| name == &package.name) {
+                continue;
+            }
+            let Some(declaration) = declared
+                .iter()
+                .find(|declaration| declaration.spec.name == package.name)
+            else {
+                failures.extend(self.load_packages(std::slice::from_ref(package), config));
+                continue;
+            };
+            if !matches!(declaration.load, crate::api::pack::LoadMode::Custom(_)) {
+                failures.extend(self.load_packages(std::slice::from_ref(package), config));
+                continue;
+            }
+            let permissions = crate::pack::effective_permissions(package);
+            let opts = config
+                .opts
+                .get(&package.name)
+                .cloned()
+                .map(Arc::new)
+                .unwrap_or_default();
+            if let Err(error) =
+                self.run_pack_loader(declaration.clone(), &package.dir, permissions, opts)
+            {
+                let message = crate::pack::redact_error(&error);
+                tracing::error!(
+                    package = %package.name,
+                    path = %package.dir.display(),
+                    error = %message,
+                    "custom package loader failed"
+                );
+                failures.push(format!("{}: custom loader failed: {message}", package.name));
+            }
+        }
+        failures
+    }
+
     pub fn event_handle(&self) -> EventHandle {
         EventHandle {
             tx: self.inner.tx.clone(),
@@ -752,9 +904,14 @@ impl EventHandle {
         });
     }
 
-    pub fn run_keybind_callback(&self, id: u64) -> bool {
+    pub fn run_keybind_callback(
+        &self,
+        id: u64,
+        key: crossterm::event::KeyCode,
+        modifiers: crossterm::event::KeyModifiers,
+    ) -> bool {
         self.prio_tx
-            .try_send(Request::RunKeybindCallback { id })
+            .try_send(Request::RunKeybindCallback { id, key, modifiers })
             .is_ok()
     }
 }
@@ -767,6 +924,122 @@ mod tests {
     use maki_agent::tools::ToolRegistry;
     use std::time::Instant;
     use test_case::test_case;
+
+    fn package_with_source(source: &str) -> tempfile::TempDir {
+        let package = tempfile::TempDir::new().unwrap();
+        let plugin_dir = package.path().join("plugin");
+        std::fs::create_dir(&plugin_dir).unwrap();
+        std::fs::write(plugin_dir.join("init.lua"), source).unwrap();
+        package
+    }
+
+    #[test]
+    fn spinning_package_load_times_out() {
+        let package = package_with_source("while true do end");
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.set_load_timeout(Duration::from_millis(300)).unwrap();
+
+        let started = Instant::now();
+        let error = host
+            .load_package(
+                "spinner",
+                package.path(),
+                PluginPermissions::trusted(),
+                PluginOpts::default(),
+            )
+            .expect_err("the watchdog must stop the load");
+
+        assert!(
+            matches!(error, PluginError::LoadTimeout { .. }),
+            "got: {error:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(20), "{error}");
+    }
+
+    #[test]
+    fn parked_package_load_times_out_and_rolls_back() {
+        let package = package_with_source(
+            r#"
+            maki.api.register_command({ name = "/parked", handler = function() end })
+            maki.async.run(function()
+              maki.api.register_command({ name = "/late", handler = function() end })
+            end)
+            maki.async.await(1, function(_callback) end)
+            "#,
+        );
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.set_load_timeout(Duration::from_millis(300)).unwrap();
+
+        let error = host
+            .load_package(
+                "parked",
+                package.path(),
+                PluginPermissions::trusted(),
+                PluginOpts::default(),
+            )
+            .expect_err("the wall-clock timer must stop the load");
+
+        assert!(matches!(error, PluginError::LoadTimeout { .. }));
+        assert!(
+            host.command_reader()
+                .load()
+                .commands
+                .iter()
+                .all(|command| !matches!(command.name.as_ref(), "/parked" | "/late"))
+        );
+        host.load_source("after_timeout", "").unwrap();
+    }
+
+    #[test]
+    fn failed_package_discards_queued_async_work() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+
+        host.load_source(
+            "failed",
+            r#"
+            maki.async.run(function()
+              maki.api.register_command({ name = "/late", handler = function() end })
+            end)
+            error("stop")
+            "#,
+        )
+        .expect_err("the package must fail");
+        host.load_source("fence", "").unwrap();
+
+        assert!(
+            host.command_reader()
+                .load()
+                .commands
+                .iter()
+                .all(|command| command.name.as_ref() != "/late")
+        );
+    }
+
+    #[test]
+    fn loading_an_active_package_does_not_run_it_again() {
+        let package = package_with_source("");
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_package(
+            "once",
+            package.path(),
+            PluginPermissions::trusted(),
+            PluginOpts::default(),
+        )
+        .unwrap();
+        std::fs::write(
+            package.path().join("plugin/init.lua"),
+            "error('loaded twice')",
+        )
+        .unwrap();
+
+        host.load_package(
+            "once",
+            package.path(),
+            PluginPermissions::trusted(),
+            PluginOpts::default(),
+        )
+        .expect("an active package must not run twice");
+    }
 
     /// jit=true is exercised by the whole integration suite
     /// (`tests/plugin_host.rs` boots hosts via `new`); only the O1
@@ -993,7 +1266,7 @@ mod tests {
         );
 
         let handle = host.event_handle();
-        handle.run_keybind_callback(entry.id);
+        handle.run_keybind_callback(entry.id, entry.key, entry.modifiers);
 
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {

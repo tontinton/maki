@@ -97,6 +97,32 @@ static NEXT_TASK_ID: AtomicU64 = AtomicU64::new(1);
 /// seconds on a loaded debug build, and a wrongly killed restore loses the
 /// tool's rendered output.
 const RESTORE_ITEM_TIMEOUT: Duration = Duration::from_secs(60);
+/// Wall clock one plugin or package gets to finish loading.
+///
+/// A load registers commands, tools, and handlers; it is not where work
+/// belongs, so this is far past any legitimate one. It exists because the
+/// load runs on the request loop, and since a lazy trigger can start one,
+/// that loop is also what serves the keypress that woke the package. Without
+/// a bound, a runaway top level freezes a live session rather than just
+/// failing to start.
+///
+/// Generous on purpose, for the same reason `RESTORE_ITEM_TIMEOUT` is: a
+/// wrongly killed load costs the user a working plugin.
+const LOAD_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(test)]
+struct LoadTimeout(Duration);
+
+#[cfg(not(test))]
+fn load_timeout(_lua: &Lua) -> Duration {
+    LOAD_TIMEOUT
+}
+
+#[cfg(test)]
+fn load_timeout(lua: &Lua) -> Duration {
+    lua.app_data_ref::<LoadTimeout>()
+        .map(|timeout| timeout.0)
+        .unwrap_or(LOAD_TIMEOUT)
+}
 const TURN_END_EVENT: &str = "TurnEnd";
 /// Without a cap, a runaway plugin OOM-kills the whole process.
 /// With one, it hits a catchable Lua error instead.
@@ -129,6 +155,11 @@ pub struct LoadChunk {
     pub source: String,
 }
 
+enum PluginLoad<'a> {
+    Chunks(&'a [LoadChunk]),
+    Function { function: Function, argument: Table },
+}
+
 impl LoadChunk {
     pub fn new(name: impl Into<String>, source: impl Into<String>) -> Self {
         Self {
@@ -144,6 +175,11 @@ pub enum Request {
     /// Plugins are loaded, so native codegen may start using idle time. Sent
     /// last so it never interleaves with the loads themselves.
     WarmJit,
+    #[cfg(test)]
+    SetLoadTimeout {
+        timeout: Duration,
+        reply: flume::Sender<()>,
+    },
     LoadSource {
         name: Arc<str>,
         chunks: Vec<LoadChunk>,
@@ -203,13 +239,41 @@ pub enum Request {
     CollectPackages {
         reply: flume::Sender<Vec<crate::api::pack::Declared>>,
     },
+    CollectPackConfirm {
+        reply: flume::Sender<Option<bool>>,
+    },
     CollectActivePackages {
         reply: flume::Sender<std::collections::BTreeSet<String>>,
+    },
+    RunPackLoader {
+        declared: crate::api::pack::Declared,
+        path: PathBuf,
+        permissions: PluginPermissions,
+        opts: PluginOpts,
+        reply: flume::Sender<LoadResult>,
+    },
+    FirePackChanged {
+        event: &'static str,
+        change: crate::api::pack::PackChange,
+        reply: flume::Sender<()>,
     },
     /// Takes the operations Lua recorded, leaving the queue empty so the same
     /// work is never applied twice.
     TakePackOps {
         reply: flume::Sender<Vec<crate::api::pack::PackOp>>,
+    },
+    /// Hands the runtime the packages that are installed but not loaded, so it
+    /// can activate one when a trigger fires. Sent by the host after the
+    /// packages are on disk, because only the host knows where they landed and
+    /// what the approval narrowed their permissions to.
+    SetDormantPackages {
+        packages: Vec<crate::api::pack::Dormant>,
+        reply: flume::Sender<()>,
+    },
+    /// Activates one package after the Lua callback that called `packadd`
+    /// returns to the request loop.
+    ActivatePackage {
+        name: String,
     },
     Shutdown,
     RestoreToolAsync {
@@ -235,6 +299,11 @@ pub enum Request {
     },
     RunKeybindCallback {
         id: u64,
+        /// Carried alongside the id so activation can re-resolve after a load.
+        /// The binding a package registers gets a new id, so the id the UI
+        /// sent is meaningless once the package has loaded; the key is not.
+        key: crossterm::event::KeyCode,
+        modifiers: crossterm::event::KeyModifiers,
     },
     Describe {
         plugin: Arc<str>,
@@ -1108,12 +1177,17 @@ pub(crate) fn with_live_ctx<R>(lua: &Lua, f: impl FnOnce(&LiveCtx) -> R) -> Opti
 
 pub(crate) fn enqueue_async_task(lua: &Lua, work_fn: RegistryKey) -> Result<(), mlua::Error> {
     let handle = lua.app_data_ref::<TaskHandle>();
-    let (cancel, live_ctx, command_depth) = match &handle {
+    let (cancel, live_ctx, command_depth, parent_task_id) = match &handle {
         Some(h) => {
             let cell = lock_cell(h);
-            (cell.cancel.clone(), cell.live.clone(), cell.command_depth)
+            (
+                cell.cancel.clone(),
+                cell.live.clone(),
+                cell.command_depth,
+                Some(cell.id),
+            )
         }
-        None => (CancelToken::none(), None, 0),
+        None => (CancelToken::none(), None, 0, None),
     };
 
     let mut task = PendingAsyncTask {
@@ -1123,6 +1197,7 @@ pub(crate) fn enqueue_async_task(lua: &Lua, work_fn: RegistryKey) -> Result<(), 
         live_ctx,
         owner: None,
         command_depth,
+        parent_task_id,
     };
 
     if let Some(h) = &handle {
@@ -1278,6 +1353,7 @@ pub(crate) struct PendingAsyncTask {
     pub live_ctx: Option<LiveCtx>,
     pub owner: Option<Arc<BufsClaim>>,
     pub command_depth: u8,
+    pub parent_task_id: Option<u64>,
 }
 
 /// Shared ownership of a task's `bufs`: the scope holds one clone, each
@@ -1519,6 +1595,8 @@ impl LuaRuntime {
         lua.set_app_data(PromptHintCallbacks::default());
         lua.set_app_data(PluginOptionSpecs::default());
         lua.set_app_data(crate::api::pack::PackStore::default());
+        #[cfg(test)]
+        lua.set_app_data(LoadTimeout(LOAD_TIMEOUT));
         lua.set_app_data(AutocmdStore::default());
         lua.set_app_data(SlotStore::default());
         lua.set_app_data(KeymapStore::new());
@@ -1637,13 +1715,6 @@ impl LuaRuntime {
                     tracing::warn!(plugin = name, error = %e, "failed to drop command handler key");
                 }
             }
-            drop(cmd_map);
-            if let (Some(map), Some(writer)) = (
-                self.lua.app_data_ref::<CommandHandlerMap>(),
-                self.lua.app_data_ref::<LuaCommandWriter>(),
-            ) {
-                publish_command_snapshot(&map, &writer);
-            }
         }
         if let Some(mut hints) = self.lua.app_data_mut::<PromptHintCallbacks>()
             && let Some(regs) = hints.remove(name)
@@ -1656,6 +1727,7 @@ impl LuaRuntime {
                 }
             }
         }
+        self.publish_commands();
     }
 
     async fn run_hint_callback(&self, plugin: &str, func: Function) -> Option<String> {
@@ -1849,6 +1921,96 @@ impl LuaRuntime {
         opts: PluginOpts,
         config_store: Option<&ConfigStore>,
     ) -> LoadResult {
+        self.load_bounded(
+            name,
+            PluginLoad::Chunks(chunks),
+            plugin_dir,
+            permissions,
+            opts,
+            config_store,
+        )
+        .await
+    }
+
+    /// Bounds both CPU-bound and parked plugin top levels.
+    ///
+    /// The task deadline lets the watchdog interrupt Lua that never yields.
+    /// The timer ends a load parked in an await that never wakes.
+    async fn load_bounded(
+        &mut self,
+        name: Arc<str>,
+        load: PluginLoad<'_>,
+        plugin_dir: Option<PathBuf>,
+        permissions: &PluginPermissions,
+        opts: PluginOpts,
+        config_store: Option<&ConfigStore>,
+    ) -> LoadResult {
+        let timeout = load_timeout(&self.lua);
+        let deadline = Instant::now() + timeout;
+        let lua = self.lua.clone();
+        let scope = TaskScope::new(
+            &lua,
+            TaskCell::new(CancelToken::none(), Some(deadline), None),
+        );
+        let load_task_id = lock_cell(scope.handle()).id;
+        let inner = self.load_source_inner(
+            Arc::clone(&name),
+            load,
+            plugin_dir,
+            permissions,
+            opts,
+            config_store,
+        );
+        let timeout_error = {
+            let plugin = name.to_string();
+            async move {
+                smol::Timer::after(timeout).await;
+                Err(PluginError::LoadTimeout {
+                    plugin,
+                    milliseconds: timeout.as_millis(),
+                })
+            }
+        };
+        let mut result = futures_lite::future::or(scope.scope_future(inner), timeout_error).await;
+        if result.is_err() && Instant::now() >= deadline {
+            result = Err(PluginError::LoadTimeout {
+                plugin: name.to_string(),
+                milliseconds: timeout.as_millis(),
+            });
+        }
+        if result.is_err() {
+            self.discard_spawned_by(load_task_id);
+            self.rollback_load(&name);
+        }
+        result
+    }
+
+    fn discard_spawned_by(&self, parent_task_id: u64) {
+        let Some(queue) = self.lua.app_data_ref::<SpawnQueue>() else {
+            return;
+        };
+        let mut keep = Vec::new();
+        while let Ok(task) = queue.rx.try_recv() {
+            if task.parent_task_id == Some(parent_task_id) {
+                self.lua.remove_registry_value(task.work_fn).ok();
+            } else {
+                keep.push(task);
+            }
+        }
+        for task in keep {
+            queue.tx.send(task).ok();
+        }
+    }
+
+    async fn load_source_inner(
+        &mut self,
+        name: Arc<str>,
+        load: PluginLoad<'_>,
+        plugin_dir: Option<PathBuf>,
+        permissions: &PluginPermissions,
+        opts: PluginOpts,
+        config_store: Option<&ConfigStore>,
+    ) -> LoadResult {
         let map_err = |e: mlua::Error| PluginError::Lua {
             plugin: name.to_string(),
             source: e,
@@ -1898,46 +2060,49 @@ impl LuaRuntime {
             )
             .map_err(&map_err)?;
         }
-        crate::api::pack::add_packadd(&self.lua, &maki).map_err(&map_err)?;
-
         // Available to every plugin, not only `init.lua`: activating a package
         // that is already installed and already approved is far weaker than
         // fetching new code, which is what the `maki.pack` table gates.
-        crate::api::pack::add_packadd(&self.lua, &maki).map_err(&map_err)?;
+        crate::api::pack::add_packadd(&self.lua, &maki, Some(self.tx.clone())).map_err(&map_err)?;
 
         let env = self.build_env(maki, require_root).map_err(&map_err)?;
 
         self.drop_plugin_keys(&name);
 
-        // Chunks run in order against one environment, so a later file sees
-        // what an earlier one registered. The first failure stops the rest.
-        let mut exec_result = Ok(());
-        for chunk in chunks {
-            let main_fn = self
-                .lua
-                .load(chunk.source.as_str())
-                .set_name(chunk.name.as_str())
-                .set_environment(env.clone())
-                .into_function();
-            exec_result = match main_fn {
-                Ok(func) => {
-                    queue_codegen(&self.codegen_queue, &func);
-                    func.call_async::<()>(()).await
+        let exec_result = match load {
+            PluginLoad::Chunks(chunks) => {
+                let mut result = Ok(());
+                for chunk in chunks {
+                    let main_fn = self
+                        .lua
+                        .load(chunk.source.as_str())
+                        .set_name(chunk.name.as_str())
+                        .set_environment(env.clone())
+                        .into_function();
+                    result = match main_fn {
+                        Ok(function) => {
+                            queue_codegen(&self.codegen_queue, &function);
+                            function.call_async::<()>(()).await
+                        }
+                        Err(error) => Err(error),
+                    };
+                    if result.is_err() {
+                        break;
+                    }
                 }
-                Err(e) => Err(e),
-            };
-            if exec_result.is_err() {
-                break;
+                result
             }
-        }
+            PluginLoad::Function { function, argument } => {
+                function.set_environment(env).map_err(&map_err)?;
+                queue_codegen(&self.codegen_queue, &function);
+                function.call_async::<()>(argument).await
+            }
+        };
 
         // Checked once, after the last chunk: an option that a later chunk
         // reads must not be reported as unused by an earlier one.
         let exec_result = exec_result.and_then(|()| self.check_opts_consumed(&name, &opts));
         if let Err(e) = exec_result {
-            let stale = self.drain_pending();
-            self.discard_pending(stale);
-            self.clear_plugin(&name);
             return Err(map_err(e));
         }
 
@@ -1975,12 +2140,19 @@ impl LuaRuntime {
             })
             .collect();
 
+        // A lazy load can be parked in an async top level when `/reload`
+        // starts. The watchdog interrupt only fires at a Lua safepoint, so a
+        // future suspended in Rust is not woken by it and can finish here long
+        // after the new stack cleared the registry and filled it again.
+        // Committing then would replace the new generation's tools with this
+        // dead one's.
+        if self.shutdown.load(Ordering::Acquire) {
+            self.discard_pending(pending);
+            return Err(PluginError::HostDead);
+        }
+
         if let Err(e) = self.registry.replace_plugin(&name, registry_entries) {
             self.discard_pending(pending);
-            // The chunks already published commands, keymaps, hints, and slots
-            // before we got here, so a conflict at the commit point has to
-            // unwind them too, not just drop the pending tools.
-            self.clear_plugin(&name);
             return Err(match e {
                 RegistryError::NameConflict { name: n, .. } => PluginError::NameConflict {
                     plugin: name.to_string(),
@@ -2015,31 +2187,296 @@ impl LuaRuntime {
         Ok(())
     }
 
+    fn rollback_load(&mut self, name: &str) {
+        let pending = self.drain_pending();
+        self.discard_pending(pending);
+        self.clear_plugin(name);
+    }
+
+    async fn load_pack_function(
+        &mut self,
+        name: Arc<str>,
+        function: Function,
+        argument: Table,
+        path: PathBuf,
+        permissions: &PluginPermissions,
+        opts: PluginOpts,
+    ) -> LoadResult {
+        self.load_bounded(
+            name,
+            PluginLoad::Function { function, argument },
+            Some(path),
+            permissions,
+            opts,
+            None,
+        )
+        .await
+    }
+
+    /// The registered handler for a command, if one is registered.
+    fn command_handler(&self, plugin: &str, command: &str) -> Option<Function> {
+        self.lua.app_data_ref::<CommandHandlerMap>().and_then(|m| {
+            let entry = m.get(plugin)?.get(command)?;
+            self.lua.registry_value::<Function>(&entry.handler).ok()
+        })
+    }
+
+    /// Loads the dormant package that declared this command, if there is one.
+    ///
+    /// Returns whether a package was loaded, after the load, so the caller can
+    /// look the handler up again and dispatch once against what the package
+    /// just registered. Nothing is delivered twice: the command has not been
+    /// dispatched yet at this point.
+    async fn activate_for_command(&mut self, plugin: &str, command: &str) -> bool {
+        self.activate_matching(|d| d.name == plugin && d.handles_command(command))
+            .await
+    }
+
+    /// Loads the installed package named by `maki.packadd`.
+    async fn activate_package(&mut self, name: &str) {
+        let Some(store) = self
+            .lua
+            .app_data_ref::<crate::api::pack::PackStore>()
+            .map(|store| store.clone())
+        else {
+            return;
+        };
+        let state = {
+            let declarations = store.lock().expect("pack declarations");
+            if declarations.active.contains(name) {
+                return;
+            }
+            declarations
+                .dormant
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .find(|package| package.name == name)
+                .map(|package| package.state.clone())
+        };
+        match state {
+            Some(crate::api::pack::PackState::Inactive) => {
+                self.activate_matching(|package| package.name == name).await;
+            }
+            Some(crate::api::pack::PackState::Failed(error)) => tracing::warn!(
+                package = name,
+                %error,
+                "package activation already failed"
+            ),
+            None => tracing::warn!(
+                package = name,
+                "package is not installed or is not available for activation"
+            ),
+        }
+    }
+
+    /// Resolves a keybind callback, by id first and then by key.
+    ///
+    /// The id is the fast path for an ordinary binding. The key is what
+    /// survives an activation, because the binding a package registers when it
+    /// loads has an id the UI never sent.
+    fn keybind_callback(
+        &self,
+        id: u64,
+        key: crossterm::event::KeyCode,
+        modifiers: crossterm::event::KeyModifiers,
+    ) -> Option<Function> {
+        let store = self.lua.app_data_ref::<KeymapStore>()?;
+        let registry = match store.callback_for_id(id) {
+            Some(registry) => registry,
+            // Only a pending press falls back to the key. A real id that no
+            // longer resolves means the binding was replaced between the
+            // snapshot and this request, and running whatever holds the key
+            // now would deliver the press to a plugin the user never saw.
+            None if id == crate::api::keymap::PENDING_KEYMAP_ID => {
+                store.callback_for_key(key, modifiers)?
+            }
+            None => return None,
+        };
+        self.lua.registry_value::<Function>(registry).ok()
+    }
+
+    /// Loads the dormant package bound to this key, if there is one.
+    async fn activate_for_key(
+        &mut self,
+        key: crossterm::event::KeyCode,
+        modifiers: crossterm::event::KeyModifiers,
+    ) -> bool {
+        self.activate_matching(|d| {
+            d.triggers.keys.iter().any(|k| {
+                crate::api::keymap::parse_key_notation(k)
+                    .is_ok_and(|(c, m)| c == key && m == modifiers)
+            })
+        })
+        .await
+    }
+
+    /// Loads every dormant package listening for this event.
+    ///
+    /// Unlike a command, one event can wake several packages, so this loads
+    /// all of them before the caller dispatches. Each listener therefore sees
+    /// the event that woke it rather than the next one.
+    async fn activate_for_event(&mut self, event: &str) -> bool {
+        self.activate_matching(|d| d.triggers.event.iter().any(|e| e == event))
+            .await
+    }
+
+    /// Loads every dormant package a trigger selects.
+    ///
+    /// The runtime handles requests in sequence, so no other trigger can start
+    /// while a selected package is loading.
+    async fn activate_matching(
+        &mut self,
+        pick: impl Fn(&crate::api::pack::Dormant) -> bool,
+    ) -> bool {
+        let Some(store) = self
+            .lua
+            .app_data_ref::<crate::api::pack::PackStore>()
+            .map(|s| s.clone())
+        else {
+            return false;
+        };
+
+        let mut loaded = false;
+        let mut changed = false;
+        loop {
+            let target = {
+                let decls = store.lock().expect("pack declarations");
+                let Some(pkg) = decls
+                    .dormant
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .find(|d| d.is_startable() && pick(d))
+                else {
+                    break;
+                };
+                pkg.clone()
+            };
+
+            let outcome = match crate::loader::read_package(&target.name, &target.dir) {
+                Ok((root, chunks)) => {
+                    self.load_source(
+                        Arc::from(target.name.as_str()),
+                        &chunks,
+                        Some(root),
+                        &target.permissions,
+                        target.opts.clone(),
+                        None,
+                    )
+                    .await
+                }
+                Err(e) => Err(e),
+            };
+
+            loaded |= outcome.is_ok();
+            changed = true;
+            match outcome {
+                Ok(()) => {
+                    self.mark_package_active(&target.name);
+                }
+                // Recorded rather than reset to `Inactive`. A package whose
+                // top level fails would otherwise be re-run by every later
+                // trigger that would have woken it.
+                Err(e) => {
+                    let message = crate::pack::redact_error(&e);
+                    tracing::error!(package = %target.name, error = %message, "failed to activate package");
+                    let failure = crate::api::pack::PackState::Failed(message);
+                    let mut decls = store.lock().expect("pack declarations");
+                    let Some(dormant) = decls.dormant.as_mut() else {
+                        tracing::error!(
+                            package = %target.name,
+                            "package activation catalog disappeared during load"
+                        );
+                        break;
+                    };
+                    if let Some(package) = dormant
+                        .iter_mut()
+                        .find(|package| package.name == target.name)
+                    {
+                        package.state = failure;
+                    } else {
+                        let mut failed = target;
+                        failed.state = failure;
+                        dormant.push(failed);
+                    }
+                }
+            }
+        }
+        if !changed {
+            return false;
+        }
+        // The pending entries are gone either way, and a successful load has
+        // put the real registrations there instead.
+        self.publish_snapshots();
+        loaded
+    }
+
+    /// Republishes both snapshots the UI reads.
+    ///
+    /// Both, because a dormant package can contribute a command and a key, and
+    /// activating it has to take each pending entry away at the same moment
+    /// the real registrations appear.
+    fn publish_snapshots(&self) {
+        self.publish_commands();
+        crate::api::keymap::publish_keymap_snapshot(&self.lua);
+    }
+
+    /// Republishes the command snapshot the UI reads.
+    fn publish_commands(&self) {
+        publish_command_snapshot(&self.lua).ok();
+    }
+
+    fn mark_package_active(&self, name: &str) {
+        if let Some(store) = self.lua.app_data_ref::<crate::api::pack::PackStore>() {
+            let mut declarations = store.lock().expect("pack declarations");
+            declarations.active.insert(name.to_owned());
+            if let Some(dormant) = declarations.dormant.as_mut() {
+                dormant.retain(|package| package.name != name);
+            }
+        }
+    }
+
+    fn package_is_active(&self, name: &str) -> bool {
+        self.lua
+            .app_data_ref::<crate::api::pack::PackStore>()
+            .is_some_and(|store| {
+                store
+                    .lock()
+                    .expect("pack declarations")
+                    .active
+                    .contains(name)
+            })
+    }
+
     fn clear_plugin(&mut self, plugin: &str) {
+        // Same reason as the commit guard in `load_source`: after shutdown the
+        // registry belongs to the next generation, and a rollback from this
+        // one would delete tools it never registered.
+        if self.shutdown.load(Ordering::Acquire) {
+            return;
+        }
         if let Some(store) = self
             .lua
             .app_data_ref::<crate::api::pack::PackStore>()
             .map(|store| store.clone())
         {
-            store
-                .lock()
-                .expect("pack declarations")
-                .active
-                .remove(plugin);
+            let mut declarations = store.lock().expect("pack declarations");
+            declarations.active.remove(plugin);
+            if let Some(dormant) = declarations.dormant.as_mut() {
+                dormant.retain(|package| package.name != plugin);
+            }
         }
         self.registry.clear_plugin(plugin);
         self.plugin_rules.remove(plugin);
         self.drop_plugin_keys(plugin);
         if let Some(mut store) = self.lua.app_data_mut::<KeymapStore>() {
             let keys = store.clear_plugin(plugin);
-            let entries = store.snapshot_entries();
             drop(store);
             for key in keys {
                 let _ = self.lua.remove_registry_value(key);
             }
-            if let Some(writer) = self.lua.app_data_ref::<KeymapWriter>() {
-                writer.publish(entries);
-            }
+            crate::api::keymap::publish_keymap_snapshot(&self.lua);
         }
         if let Some(mut store) = self.lua.app_data_mut::<HintStore>() {
             store.clear_plugin(plugin);
@@ -2802,6 +3239,11 @@ pub fn spawn(
                     match msg {
                         Request::Shutdown => break,
                         Request::WarmJit => codegen_armed = true,
+                        #[cfg(test)]
+                        Request::SetLoadTimeout { timeout, reply } => {
+                            rt.lua.set_app_data(LoadTimeout(timeout));
+                            let _ = reply.send(());
+                        }
                         Request::LoadSource {
                             name,
                             chunks,
@@ -2811,33 +3253,15 @@ pub fn spawn(
                             mark_package_active,
                             reply,
                         } => {
-                            if mark_package_active
-                                && rt
-                                    .lua
-                                    .app_data_ref::<crate::api::pack::PackStore>()
-                                    .is_some_and(|store| {
-                                        store
-                                            .lock()
-                                            .expect("pack declarations")
-                                            .active
-                                            .contains(name.as_ref())
-                                    })
-                            {
+                            if mark_package_active && rt.package_is_active(&name) {
                                 let _ = reply.send(Ok(()));
                                 continue;
                             }
                             drain_barrier(&rt.lua, &ex, &gate, &spawn_rx).await;
                             let res = rt.load_source(Arc::clone(&name), &chunks, plugin_dir, &permissions, opts, None).await;
-                            if mark_package_active
-                                && res.is_ok()
-                                && let Some(store) =
-                                    rt.lua.app_data_ref::<crate::api::pack::PackStore>()
-                            {
-                                store
-                                    .lock()
-                                    .expect("pack declarations")
-                                    .active
-                                    .insert(name.to_string());
+                            if mark_package_active && res.is_ok() {
+                                rt.mark_package_active(&name);
+                                rt.publish_snapshots();
                             }
                             let _ = reply.send(res);
                         }
@@ -2881,17 +3305,88 @@ pub fn spawn(
                             rt.clear_plugin(&plugin);
                             let _ = reply.send(());
                         }
+                        Request::SetDormantPackages { packages, reply } => {
+                            if let Some(store) =
+                                rt.lua.app_data_ref::<crate::api::pack::PackStore>()
+                            {
+                                let mut declarations = store.lock().expect("pack declarations");
+                                let failed: HashMap<
+                                    String,
+                                    (PathBuf, crate::api::pack::PackState),
+                                > = declarations
+                                    .dormant
+                                    .as_deref()
+                                    .unwrap_or_default()
+                                    .iter()
+                                    .filter(|package| {
+                                        matches!(package.state, crate::api::pack::PackState::Failed(_))
+                                    })
+                                    .map(|package| {
+                                        (
+                                            package.name.clone(),
+                                            (package.dir.clone(), package.state.clone()),
+                                        )
+                                    })
+                                    .collect();
+                                declarations.dormant = Some(
+                                    packages
+                                        .into_iter()
+                                        .map(|mut package| {
+                                            if let Some((_, state)) = failed
+                                                .get(&package.name)
+                                                .filter(|(path, _)| path == &package.dir)
+                                            {
+                                                package.state = state.clone();
+                                            }
+                                            package
+                                        })
+                                        .collect(),
+                                );
+                            }
+                            rt.publish_snapshots();
+                            let _ = reply.send(());
+                        }
+                        Request::ActivatePackage { name } => {
+                            rt.activate_package(&name).await;
+                        }
                         Request::RunCommand {
                             plugin,
                             command,
                             args,
                             depth,
                         } => {
-                            let handler_fn =
-                                rt.lua.app_data_ref::<CommandHandlerMap>().and_then(|m| {
-                                    let entry = m.get(&plugin)?.get(&command)?;
-                                    rt.lua.registry_value::<Function>(&entry.handler).ok()
-                                });
+                            // A command that resolves to nothing may belong to
+                            // a package that has not loaded yet. This is the
+                            // first point on this thread that can do anything
+                            // about it: `PluginHost::load_package` waits for a
+                            // reply from this very loop, but `load_source` is
+                            // ours to call directly.
+                            let mut woke = false;
+                            // Deliberately no `drain_barrier` here, unlike a
+                            // load or a plugin clear. The barrier waits for
+                            // every gated task, and a running tool may be
+                            // waiting on a command or keybind that only this
+                            // loop can deliver, so waiting for it first would
+                            // deadlock the runtime. Activation does not need
+                            // the barrier anyway: it registers a brand new
+                            // owner, so no in-flight task can be holding the
+                            // state it replaces.
+                            if rt.command_handler(&plugin, &command).is_none() {
+                                woke = rt.activate_for_command(&plugin, &command).await;
+                            }
+                            let handler_fn = rt.command_handler(&plugin, &command);
+                            // A package that woke and still does not answer to
+                            // the command it declared is a broken package, not
+                            // a mistyped command. Said clearly, because the
+                            // dispatch below simply does nothing otherwise and
+                            // the user is left with a command that vanished.
+                            if woke && handler_fn.is_none() {
+                                tracing::warn!(
+                                    package = %plugin,
+                                    command = %command,
+                                    "package loaded but never registered the command that woke it"
+                                );
+                            }
                             if let Some(func) = handler_fn {
                                 let lua = rt.lua.clone();
                                 ex.spawn(async move {
@@ -2968,15 +3463,111 @@ pub fn spawn(
                                 .unwrap_or_default();
                             let _ = reply.send(declared);
                         }
+                        Request::CollectPackConfirm { reply } => {
+                            let confirm = rt
+                                .lua
+                                .app_data_ref::<crate::api::pack::PackStore>()
+                                .and_then(|store| {
+                                    store.lock().expect("pack declarations").lock_confirm
+                                });
+                            let _ = reply.send(confirm);
+                        }
                         Request::CollectActivePackages { reply } => {
                             let active = rt
                                 .lua
                                 .app_data_ref::<crate::api::pack::PackStore>()
-                                .map(|store| {
-                                    store.lock().expect("pack declarations").active.clone()
-                                })
+                                .map(|store| store.lock().expect("pack declarations").active.clone())
                                 .unwrap_or_default();
                             let _ = reply.send(active);
+                        }
+                        Request::RunPackLoader {
+                            declared,
+                            path,
+                            permissions,
+                            opts,
+                            reply,
+                        } => {
+                            let name = declared.spec.name.clone();
+                            if rt.package_is_active(&name) {
+                                let _ = reply.send(Ok(()));
+                                continue;
+                            }
+                            let input = (|| {
+                                let crate::api::pack::LoadMode::Custom(loader) = &declared.load
+                                else {
+                                    unreachable!("only a custom load reaches this request")
+                                };
+                                let function = rt.lua.registry_value::<Function>(loader.as_ref())?;
+                                let data = rt.lua.create_table()?;
+                                data.set(
+                                    "spec",
+                                    crate::api::pack::spec_to_lua(
+                                        &rt.lua,
+                                        &declared.spec,
+                                        declared.data.as_ref(),
+                                    )?,
+                                )?;
+                                data.set("path", path.display().to_string())?;
+                                Ok::<_, mlua::Error>((function, data))
+                            })()
+                            .map_err(|source| PluginError::Lua {
+                                plugin: name.clone(),
+                                source,
+                            });
+                            let result = match input {
+                                Ok((function, data)) => {
+                                    rt.load_pack_function(
+                                        Arc::from(name.as_str()),
+                                        function,
+                                        data,
+                                        path,
+                                        &permissions,
+                                        opts,
+                                    )
+                                    .await
+                                }
+                                Err(error) => Err(error),
+                            };
+                            if result.is_ok() {
+                                rt.mark_package_active(&name);
+                                rt.publish_snapshots();
+                            }
+                            let _ = reply.send(result);
+                        }
+                        Request::FirePackChanged {
+                            event,
+                            change,
+                            reply,
+                        } => {
+                            let path = change.path.display().to_string();
+                            let data = rt.lua.create_table().and_then(|data| {
+                                data.set("active", change.active)?;
+                                data.set("kind", change.kind.as_str())?;
+                                data.set(
+                                    "spec",
+                                    crate::api::pack::spec_to_lua(
+                                        &rt.lua,
+                                        &change.declared.spec,
+                                        change.declared.data.as_ref(),
+                                    )?,
+                                )?;
+                                data.set("path", path.as_str())?;
+                                Ok(data)
+                            });
+                            match data {
+                                Ok(data) => crate::api::autocmd::dispatch(
+                                    &rt.lua,
+                                    event,
+                                    Some(&path),
+                                    LuaValue::Table(data),
+                                ),
+                                Err(error) => tracing::warn!(
+                                    event,
+                                    error = %error,
+                                    "failed to build package change event"
+                                ),
+                            }
+                            let _ = reply.send(());
                         }
                         Request::RestoreToolAsync { item, event_tx } => {
                             spawn_restore(&ex, &gate, &restores, &rt, item, event_tx);
@@ -3038,6 +3629,15 @@ pub fn spawn(
                             .detach();
                         }
                         Request::FireAutocmd { event, data } => {
+                            // Only host-fired events wake a package, and this
+                            // is why: the request arrives here, where a load
+                            // can be awaited before the dispatch. A Lua
+                            // `exec_autocmds` dispatches synchronously and
+                            // has no such point, so it activates nothing.
+                            // Activation happens first, so the listener the
+                            // package registers receives this event, not the
+                            // next one, and receives it exactly once.
+                            rt.activate_for_event(&event).await;
                             let data = json_to_lua(&rt.lua, &data).unwrap_or(LuaValue::Nil);
                             crate::api::autocmd::dispatch(&rt.lua, &event, None, data);
                             if event == TURN_END_EVENT {
@@ -3082,11 +3682,21 @@ pub fn spawn(
                             })
                             .detach();
                         }
-                        Request::RunKeybindCallback { id } => {
-                            let func = rt.lua.app_data_ref::<KeymapStore>().and_then(|store| {
-                                let key = store.callback_for_id(id)?;
-                                rt.lua.registry_value::<Function>(key).ok()
-                            });
+                        Request::RunKeybindCallback {
+                            id,
+                            key,
+                            modifiers,
+                        } => {
+                            // A press that resolves to nothing may belong to a
+                            // package that has not loaded. After the load the
+                            // binding is looked up by key, never by id: the
+                            // real registration gets an id the UI never saw.
+                            if id == crate::api::keymap::PENDING_KEYMAP_ID
+                                && rt.keybind_callback(id, key, modifiers).is_none()
+                            {
+                                rt.activate_for_key(key, modifiers).await;
+                            }
+                            let func = rt.keybind_callback(id, key, modifiers);
                             if let Some(func) = func {
                                 let lua = rt.lua.clone();
                                 ex.spawn(async move {
@@ -3531,6 +4141,7 @@ mod tests {
             live_ctx: None,
             owner: None,
             command_depth: 0,
+            parent_task_id: None,
         }
     }
 
@@ -4062,6 +4673,7 @@ mod tests {
             live_ctx: None,
             owner: None,
             command_depth: 0,
+            parent_task_id: None,
         };
 
         let ex = Rc::new(smol::LocalExecutor::new());

@@ -90,7 +90,13 @@ impl KeymapStore {
         plugin: Arc<str>,
         desc: String,
     ) -> (u64, Option<RegistryKey>) {
-        let id = NEXT_KEYMAP_ID.fetch_add(1, Ordering::Relaxed);
+        // Skipping the sentinel keeps `PENDING_KEYMAP_ID` meaning exactly one
+        // thing. The counter would have to wrap for this to matter, but the
+        // invariant is cheap to hold and expensive to debug once broken.
+        let mut id = NEXT_KEYMAP_ID.fetch_add(1, Ordering::Relaxed);
+        if id == PENDING_KEYMAP_ID {
+            id = NEXT_KEYMAP_ID.fetch_add(1, Ordering::Relaxed);
+        }
         let old = self
             .bindings
             .iter()
@@ -140,6 +146,58 @@ impl KeymapStore {
             .collect()
     }
 
+    /// Adds the keys of packages that have not loaded yet.
+    ///
+    /// A key trigger only works if the UI knows to send the press here, and it
+    /// reads this snapshot to decide. `PENDING_KEYMAP_ID` marks an entry no
+    /// binding owns; the runtime fails that id and then resolves by key, which
+    /// is what survives the load.
+    fn with_dormant(
+        mut entries: Vec<KeymapEntry>,
+        dormant: &[crate::api::pack::Dormant],
+    ) -> Vec<KeymapEntry> {
+        for pkg in dormant.iter().filter(|d| d.is_startable()) {
+            for notation in &pkg.triggers.keys {
+                let Ok((key, modifiers)) = parse_key_notation(notation) else {
+                    continue;
+                };
+                // A real binding wins. Publishing both would let the pending
+                // entry shadow a key a loaded plugin already answers.
+                if entries
+                    .iter()
+                    .any(|e| e.key == key && e.modifiers == modifiers)
+                {
+                    continue;
+                }
+                entries.push(KeymapEntry {
+                    key,
+                    modifiers,
+                    desc: format!("loads {}", pkg.name),
+                    plugin: Arc::from(pkg.name.as_str()),
+                    id: PENDING_KEYMAP_ID,
+                });
+            }
+        }
+        entries
+    }
+
+    /// Resolves by key rather than by id.
+    ///
+    /// Activation needs this. A dormant package's pending entry carries an id
+    /// that no real binding has, and the binding the package registers when it
+    /// loads gets a fresh id, so the id the UI sent cannot be carried across
+    /// the load. The key and modifiers can.
+    pub(crate) fn callback_for_key(
+        &self,
+        key: KeyCode,
+        modifiers: KeyModifiers,
+    ) -> Option<&RegistryKey> {
+        self.bindings
+            .iter()
+            .find(|b| b.key == key && b.modifiers == modifiers)
+            .map(|b| &b.callback)
+    }
+
     pub fn callback_for_id(&self, id: u64) -> Option<&RegistryKey> {
         self.bindings
             .iter()
@@ -147,6 +205,11 @@ impl KeymapStore {
             .map(|b| &b.callback)
     }
 }
+
+/// The id published for a key that only a dormant package answers.
+///
+/// No real binding can hold it because `KeymapStore::set` skips this value.
+pub(crate) const PENDING_KEYMAP_ID: u64 = u64::MAX;
 
 pub fn parse_key_notation(input: &str) -> Result<(KeyCode, KeyModifiers), String> {
     let s = input.trim();
@@ -244,9 +307,18 @@ fn parse_key_name(name: &str) -> Result<KeyCode, String> {
     }
 }
 
-fn publish_keymap_snapshot(lua: &Lua) {
+/// The one place a keymap snapshot is published.
+///
+/// Dormant keys are added here rather than by the callers, so no later
+/// `keymap.set` can publish a snapshot that quietly drops them and leaves a
+/// package with a trigger the UI no longer sends.
+pub(crate) fn publish_keymap_snapshot(lua: &Lua) {
     if let Some(store) = lua.app_data_ref::<KeymapStore>() {
-        let entries = store.snapshot_entries();
+        let dormant = lua
+            .app_data_ref::<crate::api::pack::PackStore>()
+            .and_then(|s| s.lock().expect("pack declarations").dormant.clone())
+            .unwrap_or_default();
+        let entries = KeymapStore::with_dormant(store.snapshot_entries(), &dormant);
         if let Some(writer) = lua.app_data_ref::<KeymapWriter>() {
             writer.publish(entries);
         }

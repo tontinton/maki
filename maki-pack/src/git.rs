@@ -93,12 +93,51 @@ pub fn list_tags_args(empty_hooks_dir: &Path) -> Vec<String> {
     args
 }
 
+pub fn log_args(empty_hooks_dir: &Path, from: &str, to: &str) -> Vec<String> {
+    let mut args = hardening_args(empty_hooks_dir);
+    args.extend([
+        "log".to_owned(),
+        "--format=%h %s".to_owned(),
+        "--no-merges".to_owned(),
+        format!("{from}..{to}"),
+    ]);
+    args
+}
+
 /// Environment every invocation runs with. Disabling the terminal prompt makes
 /// a credential request fail immediately instead of hanging a startup on a
 /// prompt nobody is watching.
 pub fn hardening_env() -> [(&'static str, &'static str); 2] {
     [("GIT_TERMINAL_PROMPT", "0"), ("GIT_ASKPASS", "")]
 }
+
+/// Variables that let a caller make git run something else, or look somewhere
+/// else, and that therefore never reach it from us.
+///
+/// maki loads `.maki/.env` from the working directory into its own environment
+/// at startup, so anything in a repository you opened would otherwise be
+/// inherited here. `GIT_SSH_COMMAND` alone turns "install this package" into
+/// "run this command". Dropping `GIT_CONFIG_COUNT` is enough to disable the
+/// numbered `GIT_CONFIG_KEY_n` and `GIT_CONFIG_VALUE_n` pairs with it, because
+/// git reads none of them without the count.
+pub const DENIED_ENV: &[&str] = &[
+    "GIT_SSH",
+    "GIT_SSH_COMMAND",
+    "GIT_EXEC_PATH",
+    "GIT_PROXY_COMMAND",
+    "GIT_EXTERNAL_DIFF",
+    "GIT_CONFIG",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+    "GIT_ATTR_SOURCE",
+];
 
 /// What one git invocation produced.
 #[derive(Debug, Clone)]
@@ -155,6 +194,9 @@ pub async fn run(args: Vec<String>, cwd: Option<PathBuf>) -> Result<GitOutput, G
         }
         for (key, value) in hardening_env() {
             cmd.env(key, value);
+        }
+        for key in DENIED_ENV {
+            cmd.env_remove(key);
         }
         cmd.output()
     })
@@ -232,6 +274,7 @@ mod tests {
         assert!(hooks_flag_present(&checkout_args(&hooks(), "main")));
         assert!(hooks_flag_present(&rev_parse_args(&hooks(), "HEAD")));
         assert!(hooks_flag_present(&list_tags_args(&hooks())));
+        assert!(hooks_flag_present(&log_args(&hooks(), "old", "new")));
     }
 
     /// The flags have to come before the subcommand, or git treats them as
@@ -350,17 +393,48 @@ mod tests {
         let hooks = dir.path().join("nohooks");
         std::fs::create_dir_all(&hooks).unwrap();
 
-        let init = smol::block_on(run(
+        // Not skipped when git is missing. A test that returns early proves
+        // nothing and reports success, which is worse than a red build telling
+        // you the environment is wrong.
+        smol::block_on(run(
             vec!["init".to_owned(), "--quiet".to_owned()],
             Some(dir.path().to_path_buf()),
-        ));
-        if init.is_err() {
-            return; // git is not available in this environment
-        }
+        ))
+        .expect("git must be available to run the git tests");
 
         let out = smol::block_on(run(list_tags_args(&hooks), Some(dir.path().to_path_buf())))
             .expect("listing tags in a fresh repository should succeed");
         assert!(parse_tags(&out.stdout).is_empty());
+    }
+
+    /// maki reads `.maki/.env` from whatever directory you opened, so a
+    /// repository can put variables in this process. `GIT_SSH_COMMAND` would
+    /// then run during a package clone. Proven by giving git a value that
+    /// would fail loudly if it ever reached it.
+    #[test]
+    fn a_project_env_cannot_make_git_run_something_else() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // SAFETY: the test process sets this only for its own children.
+        unsafe { std::env::set_var("GIT_SSH_COMMAND", "/nonexistent/pwned") };
+        unsafe { std::env::set_var("GIT_CONFIG_COUNT", "1") };
+        unsafe { std::env::set_var("GIT_CONFIG_KEY_0", "core.sshCommand") };
+        unsafe { std::env::set_var("GIT_CONFIG_VALUE_0", "/nonexistent/pwned") };
+
+        let out = smol::block_on(run(
+            vec!["init".to_owned(), "--quiet".to_owned()],
+            Some(dir.path().to_path_buf()),
+        ));
+
+        unsafe { std::env::remove_var("GIT_SSH_COMMAND") };
+        unsafe { std::env::remove_var("GIT_CONFIG_COUNT") };
+        unsafe { std::env::remove_var("GIT_CONFIG_KEY_0") };
+        unsafe { std::env::remove_var("GIT_CONFIG_VALUE_0") };
+
+        out.expect("git must not inherit an injected command from the environment");
+        assert!(
+            DENIED_ENV.contains(&"GIT_SSH_COMMAND") && DENIED_ENV.contains(&"GIT_CONFIG_COUNT"),
+            "the deny list has to keep covering the command injection variables"
+        );
     }
 
     #[test]

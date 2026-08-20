@@ -195,6 +195,9 @@ brought in. It is available to any plugin, unlike `add`, `update`, and
 much weaker act than fetching new code.
 
 Loading happens after this call returns, for the same reason as `update`.
+A runtime call reports an unknown, disabled, or previously failed package
+immediately. During `init.lua`, the host reports the result after startup
+has installed and cataloged packages.
 
 **Parameters:**
 
@@ -232,6 +235,7 @@ Declare packages to install and load, like `vim.pack.add`.
 Recording is all this does. The host installs and loads the declared set
 after `init.lua` finishes, so a slow clone never blocks the call and a
 package failure never stops maki from starting.
+The first declaration of a package name wins for the current session.
 
 Only available inside `init.lua`. Declaring a package fetches code, so it is
 configuration rather than something a downloaded plugin may do.
@@ -240,27 +244,38 @@ configuration rather than something a downloaded plugin may do.
 
 - `{specs}` (`table`) List of specs. Each is a source string, or a table with
 
-  `src` (string, required), `name` (string), and `version` (string or
+  `src` (string, required), `name` (string), `version` (string or
 
 
-  `maki.version.range()`).
-
-- `{opts?}` (`table?`) Options: `load` (boolean|table) `false` installs the
-
-  package without loading it, leaving it for `maki.packadd`; a table of
+  `maki.version.range()`), and arbitrary `data` passed to `get`, change
 
 
-  `event`, `cmd`, and `keys` names what should wake it. Trigger tables are
+  events, and a custom loader.
+
+- `{opts?}` (`table?`) Options: `confirm` (boolean, default true) asks before
+
+  installation. `load` (boolean|table|function) controls loading. `false`
 
 
-  recorded and checked but not dispatched yet, so a package that declares
+  leaves the package for `maki.packadd`. A table of `event`, `cmd`, and
 
 
-  one installs and stays dormant until `maki.packadd` activates it.
+  `keys` names what wakes it. A function runs as the package owner with
 
-  - `confirm` (`boolean`) `false` clones a new source without asking, which
 
-  states that the source is trusted and never approves its permissions.
+  `{ spec, path }` and is fully responsible for loading it. Credentials in
+
+
+  `spec.src` are redacted. The first
+
+
+  trigger loads the package and is then delivered to it. `event` accepts
+
+
+  only the host events that `create_autocmd` documents.
+
+
+  HTTP sources with credentials are rejected; use a Git credential helper.
 
 
 **Example:**
@@ -269,6 +284,33 @@ configuration rather than something a downloaded plugin may do.
 maki.pack.add({
   { src = "https://github.com/user/maki-goal", version = "main" },
 })
+```
+
+---
+
+### `maki.pack.get()` {#maki-pack-get}
+
+```lua
+maki.pack.get({names?}, {opts?})
+```
+
+Gets managed package information, optionally filtered by name.
+
+This is the read-only part of `maki.pack`, so packages may call it too.
+Information comes from the current declarations and lockfile and does not
+contact a remote.
+
+**Parameters:**
+
+- `{names?}` (`table?`) Package names. Omit for all managed packages.
+- `{opts?}` (`table?`) Reserved for future compatibility. Omit it.
+
+**Returns:** (`table`) Package records with `spec`, `path`, `rev`, and `active`.
+
+**Example:**
+
+```lua
+local packages = maki.pack.get({ "maki-goal" })
 ```
 
 ---
@@ -288,10 +330,13 @@ reloads the package and unloading waits on the runtime this call occupies.
 **Parameters:**
 
 - `{names?}` (`table?`) Package names. Omit for every declared package.
-- `{opts?}` (`table?`) `offline` to work without the network, and `target` of
+- `{opts?}` (`table?`) `offline` works without the network. `target` is
   - `"version"` (`the default`) to take what version now resolves to, or
 
-  `"lockfile"` to go back to the recorded revision.
+  `"lockfile"` to go back to the recorded revision. `force` skips the
+
+
+  update review, but not a new permission approval.
 
 
 **Example:**
@@ -306,7 +351,7 @@ maki.pack.update(nil, { target = "lockfile" })
 ### `maki.pack.del()` {#maki-pack-del}
 
 ```lua
-maki.pack.del({names})
+maki.pack.del({names}, {opts?})
 ```
 
 Remove packages, like `vim.pack.del`.
@@ -316,6 +361,7 @@ Runs after this call returns, for the same reason as `update`.
 **Parameters:**
 
 - `{names}` (`table`) Package names to remove.
+- `{opts?}` (`table?`) `force` allows removal of an active package.
 
 **Example:**
 
@@ -746,7 +792,8 @@ Built-in events fired by the host: `"TurnStart"`, `"TurnEnd"`,
 `"TurnError"`, `"ToolStart"`, `"ToolDone"`, `"SessionReset"`,
 `"SessionFocusChanged"`, `"SessionStatusChanged"`, and
 `"TaskStatusChanged"`. Plugins can also fire their own events with
-`exec_autocmds`.
+`exec_autocmds`. Package operations fire `"PackChangedPre"` and
+`"PackChanged"`.
 
 Each host event carries `data.session_id`. For `"SessionReset"` that
 is the session being left behind; the other events name the session now
@@ -5693,4 +5740,3 @@ end
 
 return truncate
 ```
-

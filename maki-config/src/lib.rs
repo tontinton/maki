@@ -163,7 +163,7 @@ pub enum ConfigError {
     )]
     RemovedEditSubTool { tool: &'static str },
     #[error(
-        "invalid config: plugins.{plugin}: no bundled plugin or installed \
+        "invalid config: plugins.{plugin}: no bundled plugin or known \
          package is named \"{plugin}\" (available: {valid})"
     )]
     UnknownPlugin { plugin: String, valid: String },
@@ -271,10 +271,10 @@ impl RawConfig {
         self.tools.extend(overlay.tools);
     }
 
-    /// `packages` are the external package names discovery found. They are
-    /// passed in rather than stored, because an installed package is host
-    /// state: it is not written in any config file and must not survive a
-    /// merge between two of them.
+    /// `packages` are the external package names the host discovered or the
+    /// init files declared. They are passed in rather than stored, because an
+    /// installed package is host state: no config file writes it, and it must
+    /// not survive a merge between two of them.
     pub fn into_config(self, no_rtk: bool, packages: &[String]) -> Result<Config, ConfigError> {
         self.validate_plugin_tables(packages)?;
         // Only bundled names, because a builtin's name is also its tool name
@@ -325,6 +325,7 @@ impl RawConfig {
             let mut valid: Vec<&str> = DEFAULT_BUILTINS.to_vec();
             valid.extend(packages.iter().map(String::as_str));
             valid.sort_unstable();
+            valid.dedup();
             return Err(ConfigError::UnknownPlugin {
                 plugin: plugin.clone(),
                 valid: valid.join(", "),

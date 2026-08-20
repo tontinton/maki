@@ -134,8 +134,25 @@ pub(crate) struct CommandEntry {
 
 pub(crate) type CommandHandlerMap = HashMap<Arc<str>, HashMap<Arc<str>, CommandEntry>>;
 
-pub(crate) fn publish_command_snapshot(map: &CommandHandlerMap, writer: &LuaCommandWriter) {
-    let commands = map
+/// Publishes the commands the palette can offer.
+///
+/// `dormant` carries the packages that are installed but not loaded. Their
+/// commands are published too, because a lazy trigger that cannot be found is
+/// not a trigger: the user has to be able to type the command that wakes the
+/// package. Running one activates the package first and then dispatches, so a
+/// published pending command behaves like any other.
+pub(crate) fn publish_command_snapshot(lua: &Lua) -> Result<(), mlua::Error> {
+    let map = lua
+        .app_data_ref::<CommandHandlerMap>()
+        .ok_or_else(|| mlua::Error::runtime("command store not initialized"))?;
+    let writer = lua
+        .app_data_ref::<LuaCommandWriter>()
+        .ok_or_else(|| mlua::Error::runtime("command writer not initialized"))?;
+    let dormant = lua
+        .app_data_ref::<crate::api::pack::PackStore>()
+        .and_then(|store| store.lock().expect("pack declarations").dormant.clone())
+        .unwrap_or_default();
+    let mut commands: Vec<LuaCommandInfo> = map
         .iter()
         .flat_map(|(plugin, cmds)| {
             cmds.iter().map(move |(name, entry)| LuaCommandInfo {
@@ -146,7 +163,27 @@ pub(crate) fn publish_command_snapshot(map: &CommandHandlerMap, writer: &LuaComm
             })
         })
         .collect();
+
+    for pkg in dormant.iter().filter(|d| d.is_startable()) {
+        for cmd in &pkg.triggers.cmd {
+            // A real registration always wins. Once the package has loaded, it
+            // owns the name, and listing the pending entry as well would show
+            // the command twice.
+            if commands.iter().any(|c| c.name.as_ref() == cmd.as_str()) {
+                continue;
+            }
+            commands.push(LuaCommandInfo {
+                name: Arc::from(cmd.as_str()),
+                description: Arc::from(format!("{} (loads {})", cmd, pkg.name)),
+                plugin: Arc::from(pkg.name.as_str()),
+                // Unknown until the package registers the command, and too few
+                // would stop the palette matching once arguments are typed.
+                max_args: usize::MAX,
+            });
+        }
+    }
     writer.publish(commands);
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -567,7 +604,9 @@ mod tests {
             .insert(Arc::from("/cmd3"), make_entry(&lua, "desc3"));
 
         let (writer, reader) = LuaCommandWriter::new();
-        publish_command_snapshot(&map, &writer);
+        lua.set_app_data(map);
+        lua.set_app_data(writer);
+        publish_command_snapshot(&lua).unwrap();
 
         let snap = reader.load();
         assert_eq!(snap.commands.len(), 3);

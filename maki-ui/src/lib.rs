@@ -42,7 +42,6 @@ use maki_storage::id::MakiId;
 pub type AppSession = maki_storage::sessions::Session<Message, TokenUsage, ToolOutput>;
 
 pub(crate) use agent::AgentCommand;
-pub use components::PackRequest;
 pub use event_loop::EventLoopParams;
 
 /// How a UI generation ended. On `Reload`, each tab carries its in-memory
@@ -55,8 +54,11 @@ pub enum RunOutcome {
     Reload {
         tabs: Vec<AppSession>,
         focused: usize,
-        /// A package change to carry out before the generation is rebuilt.
-        pack: Option<components::PackRequest>,
+    },
+    Pack {
+        tabs: Vec<AppSession>,
+        focused: usize,
+        command: maki_lua::PackCommand,
     },
 }
 
@@ -73,15 +75,11 @@ pub fn run(params: EventLoopParams, initial_prompt: Option<String>) -> Result<Ru
         focused,
     } = report;
     Ok(match exit {
-        components::ExitRequest::Reload => RunOutcome::Reload {
+        components::ExitRequest::Reload => RunOutcome::Reload { tabs, focused },
+        components::ExitRequest::Pack(command) => RunOutcome::Pack {
             tabs,
             focused,
-            pack: None,
-        },
-        components::ExitRequest::Pack(request) => RunOutcome::Reload {
-            tabs,
-            focused,
-            pack: Some(request),
+            command,
         },
         exit => {
             let session_id = tabs
