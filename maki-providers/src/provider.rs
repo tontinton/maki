@@ -629,9 +629,9 @@ mod tests {
     #[test]
     fn provider_for_slug_unknown_returns_error() {
         let tmp = tempfile::tempdir().unwrap();
-        crate::providers::catalog::warm_empty_catalog_for_tests(maki_storage::StateDir::from_path(
-            tmp.path().to_path_buf(),
-        ));
+        let _catalog = crate::providers::catalog::warm_empty_catalog_for_tests(
+            maki_storage::StateDir::from_path(tmp.path().to_path_buf()),
+        );
         let result = provider_for_slug("nonexistent-provider-xyz", Timeouts::default());
         match result {
             Err(e) => {

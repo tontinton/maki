@@ -788,19 +788,41 @@ impl Provider for CatalogProvider {
     }
 }
 
+/// The catalog is a process-global, so the tests that seed it are not
+/// independent of each other. Every seeding helper takes this lock and hands
+/// the guard back, and holding it for the length of the test is what keeps one
+/// test's seed from landing under another test's assertions.
 #[cfg(test)]
-pub(crate) fn seed_catalog_for_tests(index: schema::CatalogIndex, state_dir: StateDir) {
-    let _ = SHARED_CATALOG.set(Mutex::new(CatalogData::from_index(
-        index,
-        false,
-        &state_dir,
-        std::collections::HashSet::new(),
-    )));
+static CATALOG_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+/// Replaces the catalog rather than initialising it once: with `OnceLock::set`
+/// the first test to run silently decided the contents for every test after
+/// it, so a suite passed or failed on thread scheduling.
+#[cfg(test)]
+#[must_use = "hold the guard for the whole test, or another test may reseed underneath it"]
+pub(crate) fn seed_catalog_for_tests(
+    index: schema::CatalogIndex,
+    state_dir: StateDir,
+) -> std::sync::MutexGuard<'static, ()> {
+    // A test that panicked while holding the lock poisoned it but left the
+    // catalog usable, so recover rather than cascading one failure into all.
+    let guard = CATALOG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let data = CatalogData::from_index(index, false, &state_dir, std::collections::HashSet::new());
+    match SHARED_CATALOG.get() {
+        Some(existing) => *existing.lock().unwrap_or_else(|e| e.into_inner()) = data,
+        None => {
+            let _ = SHARED_CATALOG.set(Mutex::new(data));
+        }
+    }
+    guard
 }
 
 #[cfg(test)]
-pub(crate) fn warm_empty_catalog_for_tests(state_dir: StateDir) {
-    seed_catalog_for_tests(HashMap::new(), state_dir);
+#[must_use = "hold the guard for the whole test, or another test may reseed underneath it"]
+pub(crate) fn warm_empty_catalog_for_tests(
+    state_dir: StateDir,
+) -> std::sync::MutexGuard<'static, ()> {
+    seed_catalog_for_tests(HashMap::new(), state_dir)
 }
 
 /// Defers catalog resolution to first use so that provider construction
@@ -1513,7 +1535,7 @@ mod tests {
                 models,
             },
         )]);
-        super::seed_catalog_for_tests(index, state_dir);
+        let _catalog = super::seed_catalog_for_tests(index, state_dir);
 
         let model = super::Model::from_spec(&format!("opencode/{model_id}")).unwrap();
         assert_eq!(model.is_free(), expected);
