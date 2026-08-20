@@ -13,6 +13,8 @@ use maki_agent::{
 };
 use maki_providers::Message;
 
+use maki_config::bash_command;
+
 use super::App;
 
 const STREAM_FLUSH_INTERVAL: Duration = Duration::from_millis(100);
@@ -212,12 +214,8 @@ async fn run_command(
     max_output_lines: usize,
     max_output_bytes: usize,
 ) -> Result<String, String> {
-    let mut std_cmd = StdCommand::new("bash");
-    std_cmd
-        .arg("-c")
-        .arg(command)
-        .env("GIT_TERMINAL_PROMPT", "0");
-
+    let mut std_cmd: StdCommand = bash_command(command)?;
+    std_cmd.env("GIT_TERMINAL_PROMPT", "0");
     #[cfg(unix)]
     unsafe {
         std_cmd.pre_exec(|| {

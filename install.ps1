@@ -94,9 +94,42 @@ function Install-Maki([string]$Tag) {
 
         Write-Host "$Binary $Tag installed to $dest"
         Add-ToUserPath -Dir $InstallDir
+
+        # The bash tool needs a real bash, which almost always means Git for
+        # Windows. The full lookup lives in maki-config, here we only decide
+        # whether to offer the install, so a git on PATH is a good enough sign.
+        if (-not (Get-Command git.exe -ErrorAction Ignore)) {
+            Write-Host ""
+            Write-Host "warning: git not found. The bash tool needs Git for Windows (or Cygwin, or MSYS2)."
+            $wanted = (Test-WinGetAvailable) -and (Test-Interactive) -and
+                (Read-Host "Install Git for Windows via winget? (y/N)") -imatch '^y'
+            if ($wanted) {
+                Write-Host "Installing Git for Windows..."
+                winget install --id Git.Git -e --source winget
+                if ($LASTEXITCODE -eq 0) {
+                    Write-Host "Git for Windows installed. Restart your terminal to use bash."
+                    return
+                }
+                Write-Host "winget failed (exit $LASTEXITCODE)."
+            }
+            Write-Host "To install Git for Windows:"
+            Write-Host "  winget install --id Git.Git -e --source winget"
+            Write-Host "  or download from https://git-scm.com/download/win"
+        }
     } finally {
         Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
     }
+}
+
+function Test-WinGetAvailable {
+    return $null -ne (Get-Command winget -ErrorAction Ignore)
+}
+
+# Read-Host is a terminating error in a non interactive host, and by the time
+# we prompt maki is already installed, so a CI install must not fail there.
+function Test-Interactive {
+    return [Environment]::UserInteractive -and -not $env:CI -and
+        -not [Console]::IsInputRedirected
 }
 
 function Add-ToUserPath([string]$Dir) {

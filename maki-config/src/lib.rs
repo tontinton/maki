@@ -15,7 +15,10 @@ use tracing::warn;
 const PROJECT_DIR: &str = ".maki";
 const PERMISSIONS_FILE: &str = "permissions.toml";
 
+mod bash;
 pub mod providers;
+
+pub use bash::bash_command;
 
 pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 50 * 1024;
 pub const DEFAULT_MAX_OUTPUT_LINES: usize = 2000;
