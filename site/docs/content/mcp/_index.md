@@ -1,6 +1,6 @@
 +++
 title = "MCP"
-weight = 10
+weight = 7
 [extra]
 group = "Reference"
 +++
@@ -71,6 +71,20 @@ One option lives at the top level of `mcp.toml`, outside any server:
 Every tool definition a server exposes costs context window space, on every request. Take Datadog's MCP server: with all toolsets on it ships over 100 tools, when a task often needs three.
 
 So Maki, like Claude Code, defers MCP tools by default. The model sees one small `tool_search` tool that lists the deferred names, searches when it actually needs something, and the matches stay loaded for the rest of the session. Resume a session and the tools it was using come back. Subagents keep their own loads, so their searches don't bloat your main conversation.
+
+```
+server ships 117 tool definitions
+        │
+  more than defer_tools (10)?
+   │ no          │ yes
+   ▼             ▼
+   all load      context gets one small tool: tool_search
+   upfront       │
+                 │  model: tool_search("logs")
+                 ▼
+                 3 matches load, stay for the session
+                 114 definitions never enter context
+```
 
 You don't configure anything for this. Add the server as usual:
 

@@ -71,6 +71,7 @@ All fields are optional. Typos in field names cause an error right away.
 |-------|------|---------|-----|-------------|
 | `splash_animation` | bool | `true` | - | Show splash animation on startup |
 | `scrollbar` | bool | `true` | - | Show vertical scrollbar in scrollable areas |
+| `notifications` | string | `auto` | - | Terminal notification method: auto, osc9, bell, or off |
 | `flash_duration_ms` | u64 | `1500` | - | Duration of flash messages (ms) |
 | `typewriter_ms_per_char` | u64 | `4` | - | Typewriter effect speed (ms/char) |
 | `mouse_scroll_lines` | u32 | `3` | 1 | Lines per mouse wheel scroll |
@@ -268,7 +269,7 @@ Safe to run more than once.
 
 ## Personal Instructions
 
-On top of the project instruction files Maki loads from the git root down to the cwd (`AGENTS.md`, `CLAUDE.md`, and friends; see [Quick Start](/docs/quick-start/#instruction-files)), you can add:
+On top of the project instruction files Maki loads from the git root down to the cwd (`AGENTS.md`, `CLAUDE.md`, and friends; see [Context](/docs/context/#instruction-files)), you can add:
 
 - `AGENTS.local.md` in any of those project directories for per-directory preferences (gitignored)
 - `~/.config/maki/AGENTS.md` for preferences that apply to all projects
@@ -283,4 +284,4 @@ The `memory` tool and `/memory` command store small Markdown notes under the sta
 
 (Linux/macOS: `~/.local/state/maki/…`; Windows: `%APPDATA%\maki\…`). Use them for non-obvious gotchas and decisions that should survive across sessions. They are separate from skills and from `AGENTS.md`.
 
-Related pages: [Skills](/docs/skills/), [CLI](/docs/cli/), [Providers](/docs/providers/#providerstoml).
+Related pages: [Skills](/docs/skills/), [CLI](/docs/cli/), [Providers](/docs/providers/#providers-toml).

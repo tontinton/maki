@@ -18,7 +18,7 @@ pub fn initialize_response() -> InitializeResponse {
             AgentCapabilities::new()
                 .load_session(true)
                 .prompt_capabilities(PromptCapabilities::new().image(true).embedded_context(true))
-                .mcp_capabilities(McpCapabilities::default()),
+                .mcp_capabilities(McpCapabilities::new().http(true)),
         )
         .auth_methods(vec![])
         .agent_info(Implementation::new("maki", VERSION))

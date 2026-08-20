@@ -10,7 +10,7 @@ use maki_agent::tools::{
     DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool, ToolContext,
     ToolExecResult, ToolInvocation, ToolLive, ToolRegistry, ToolSource, timeout_annotation,
 };
-use maki_config::{AlwaysThinking, PluginsConfig, ToolOutputLines};
+use maki_config::{AlwaysThinking, Effect, PluginsConfig, ToolKey, ToolOutputLines};
 use maki_lua::{PluginError, PluginHost, WARM_TOOL_CAP};
 use maki_storage::id::SessionRef;
 #[cfg(unix)]
@@ -321,6 +321,82 @@ fn unload_round_trip() {
 
     host.unload("unload_test").unwrap();
     assert!(!reg.has("echo_"));
+}
+
+const PERMISSION_RULE_SRC: &str =
+    r#"maki.api.register_permission_rule({ tool = "edit", scope = "/tmp/x/**" })"#;
+const NO_RULE_SRC: &str = "local _ = 1";
+
+#[test]
+fn permission_rule_lands_in_store_and_unload_clears() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+
+    host.load_source("perm_plugin", PERMISSION_RULE_SRC)
+        .unwrap();
+    let rules = host.plugin_rules().snapshot();
+    assert_eq!(rules.len(), 1);
+    assert_eq!(rules[0].tool, ToolKey::native("edit"));
+    assert_eq!(rules[0].scope.as_deref(), Some("/tmp/x/**"));
+    assert_eq!(rules[0].effect, Effect::Allow);
+
+    host.unload("perm_plugin").unwrap();
+    assert!(host.plugin_rules().snapshot().is_empty());
+}
+
+#[test]
+fn permission_rule_failed_load_leaves_store_empty() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+
+    let src = format!("{PERMISSION_RULE_SRC}\nerror('boom after rule')");
+    let err = host
+        .load_source("perm_broken", &src)
+        .expect_err("expected lua error");
+    assert!(matches!(err, PluginError::Lua { .. }));
+    assert!(host.plugin_rules().snapshot().is_empty());
+}
+
+#[test]
+fn reload_clears_stale_rules_of_that_plugin_only() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+
+    host.load_source("perm_a", PERMISSION_RULE_SRC).unwrap();
+    host.load_source(
+        "perm_b",
+        r#"maki.api.register_permission_rule({ tool = "write", scope = "/tmp/y/**", effect = "deny" })"#,
+    )
+    .unwrap();
+    assert_eq!(host.plugin_rules().snapshot().len(), 2);
+
+    host.load_source("perm_a", NO_RULE_SRC).unwrap();
+    let rules = host.plugin_rules().snapshot();
+    assert_eq!(rules.len(), 1);
+    assert_eq!(rules[0].tool, ToolKey::native("write"));
+    assert_eq!(rules[0].scope.as_deref(), Some("/tmp/y/**"));
+    assert_eq!(rules[0].effect, Effect::Deny);
+}
+
+#[test_case::test_case(r#"{ tool = "srv.tool", scope = "/x/**" }"#, "only native tools are allowed" ; "mcp_tool")]
+#[test_case::test_case(r#"{ tool = "mcp:srv", scope = "/x/**" }"#, "invalid tool name" ; "invalid_tool_chars")]
+#[test_case::test_case(r#"{ tool = "*", scope = "/x/**" }"#, "only native tools are allowed" ; "wildcard_tool")]
+#[test_case::test_case(r#"{ scope = "/x/**" }"#, "'tool' must be a native tool name string" ; "missing_tool")]
+#[test_case::test_case(r#"{ tool = "edit" }"#, "'scope' must be a string" ; "missing_scope")]
+#[test_case::test_case(r#"{ tool = "edit", scope = "" }"#, "'scope' must be non-empty" ; "empty_scope")]
+#[test_case::test_case(r#"{ tool = "edit", scope = "/x/**", effect = "maybe" }"#, "invalid effect 'maybe'" ; "bad_effect")]
+#[test_case::test_case(r#"{ tool = "edit", scope = "/x/**", bogus = 1 }"#, "unknown key 'bogus'" ; "unknown_key")]
+fn permission_rule_validation_rejects(spec: &str, expected_err: &str) {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let err = host
+        .load_source(
+            "perm_invalid",
+            &format!("maki.api.register_permission_rule({spec})"),
+        )
+        .expect_err("expected validation error");
+    assert!(matches!(err, PluginError::Lua { .. }));
+    assert!(err.to_string().contains(expected_err), "got: {err}");
 }
 
 #[test_case::test_case(BAD_NAME_SRC, MINIMAL_SCHEMA, "invalid name" ; "invalid_tool_name")]
@@ -2550,7 +2626,7 @@ fn command_handler_can_insert_visible_prompt_text() {
     .unwrap();
     let rx = host.ui_action_rx();
     host.event_handle()
-        .run_command(Arc::from("p"), Arc::from("/mention"), String::new());
+        .run_command(Arc::from("p"), Arc::from("/mention"), String::new(), 0);
 
     let action = rx
         .recv_timeout(Duration::from_secs(5))
@@ -2577,7 +2653,7 @@ fn command_handler_receives_args_and_fargs(args: &str, expected_flash: &str) {
     .unwrap();
     let rx = host.ui_action_rx();
     host.event_handle()
-        .run_command(Arc::from("p"), Arc::from("/echo"), args.into());
+        .run_command(Arc::from("p"), Arc::from("/echo"), args.into(), 0);
 
     let action = rx
         .recv_timeout(Duration::from_secs(5))
@@ -2585,6 +2661,51 @@ fn command_handler_receives_args_and_fargs(args: &str, expected_flash: &str) {
     assert!(matches!(action, maki_lua::UiAction::Flash(msg) if msg == expected_flash));
 }
 
+const RUN_COMMAND_NO_ACTION: &str = "run_command did not reach the UI";
+
+/// `/go` asks for `/cd ~/src` and flashes the `ok, err` pair it gets back. The
+/// command line travels untouched, since the UI is the side that parses it, and
+/// a handler reached at depth 0 asks for depth 1 so a chain of aliases keeps
+/// counting toward the cap.
+#[test_case::test_case(Ok(()), "true|nil" ; "dispatched")]
+#[test_case::test_case(Err("unknown command".into()), "nil|unknown command" ; "rejected")]
+fn run_command_round_trips_through_ui(reply: Result<(), String>, expected_flash: &str) {
+    let host = PluginHost::new(fresh_registry()).unwrap();
+    host.load_source(
+        "p",
+        r#"
+        maki.api.register_command({
+            name = "/go",
+            handler = function()
+                local ok, err = maki.api.run_command("/cd ~/src")
+                maki.ui.flash(tostring(ok) .. "|" .. tostring(err))
+            end,
+        })
+        "#,
+    )
+    .unwrap();
+    let rx = host.ui_action_rx();
+    host.event_handle()
+        .run_command(Arc::from("p"), Arc::from("/go"), String::new(), 0);
+
+    let maki_lua::UiAction::RunCommand {
+        cmdline,
+        depth,
+        reply_tx,
+    } = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect(RUN_COMMAND_NO_ACTION)
+    else {
+        panic!("{RUN_COMMAND_NO_ACTION}");
+    };
+    assert_eq!((cmdline.as_str(), depth), ("/cd ~/src", 1));
+    reply_tx.send(reply).unwrap();
+
+    let action = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect(RUN_COMMAND_NO_ACTION);
+    assert!(matches!(action, maki_lua::UiAction::Flash(msg) if msg == expected_flash));
+}
 #[test_case::test_case(
     r#"maki.api.register_command({ name = "", handler = function() end })"#,
     "non-empty" ; "empty_name"
@@ -2743,6 +2864,107 @@ fn ctx_set_deadline_twice_errors() {
     host.load_source("deadline_twice", &src).unwrap();
     let err = exec_tool(&reg, "deadline_twice", serde_json::json!({})).unwrap_err();
     assert!(err.contains(DEADLINE_ALREADY_SET_ERR), "got: {err}");
+}
+
+/// Generous: every wait below ends on an event, never on the clock, so only
+/// an already failing test pays this.
+const CANCEL_TEST_TIMEOUT: Duration = Duration::from_secs(30);
+const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+fn poll_until<T>(what: &str, mut check: impl FnMut() -> Option<T>) -> T {
+    let deadline = std::time::Instant::now() + CANCEL_TEST_TIMEOUT;
+    loop {
+        if let Some(got) = check() {
+            return got;
+        }
+        assert!(std::time::Instant::now() < deadline, "{what}");
+        std::thread::sleep(CANCEL_POLL_INTERVAL);
+    }
+}
+
+const PARKED_DEADLINE_REPLY: &str = "partial: timeout";
+const PARKED_DEADLINE_PLUGIN: &str = r#"
+maki.api.register_tool({
+    name = "parked_deadline",
+    description = "parks past its deadline, finishing from its cancel hook",
+    schema = { type = "object", properties = {}, additionalProperties = false },
+    audiences = { "main" },
+    handler = function(input, ctx)
+        ctx:set_deadline(1)
+        maki.async.on_cancel(function(reason)
+            ctx:finish({ llm_output = "partial: " .. reason, is_error = true })
+        end)
+        maki.fn.jobwait(maki.fn.jobstart("sleep 30"))
+        return "unreachable"
+    end,
+})
+"#;
+
+/// A handler parked in an await runs no Lua when its deadline lapses, so the
+/// host is what ends it, by raising inside the await. Its cancel hooks still
+/// get that last slice, and the reply they finish with beats the generic
+/// timeout error. The handler that already returned nil takes a different
+/// road out, unit tested in `runtime.rs`.
+#[test]
+fn parked_handler_reports_its_hook_finish_reply_on_deadline() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source("parked_deadline_plugin", PARKED_DEADLINE_PLUGIN)
+        .unwrap();
+
+    let result = exec_tool(&reg, "parked_deadline", json!({}));
+
+    assert_eq!(result, Err(PARKED_DEADLINE_REPLY.to_owned()));
+    drop(host);
+}
+
+const BASH_CANCEL_ID: &str = "bash-cancel-1";
+/// Mirrors the cancelled marker in `plugins/lib/maki/partial.lua`.
+const BASH_PARTIAL_MARKER: &str = "[cancelled by user; output above is partial]";
+/// Assembled by printf so the probe never appears in the command header.
+const BASH_PARTIAL_PROBE: &str = "XY";
+const BASH_PARTIAL_CMD: &str = "printf '%s%s\\n' X Y && sleep 30";
+
+/// Esc mid-stream on a real bash run: the lines printed so far come back as
+/// an error reply ending in the marker, not a bare "cancelled".
+#[test]
+fn cancelled_bash_keeps_streamed_output_as_partial() {
+    let (tx, events) = flume::unbounded();
+    let event_tx = maki_agent::EventSender::new(tx, 0);
+    let (trigger, token) = maki_agent::CancelToken::new();
+    let (result_tx, result_rx) = flume::bounded(1);
+    std::thread::spawn(move || {
+        let (reg, host) = builtins_host();
+        let mut ctx = maki_agent::tools::test_support::stub_ctx_with(
+            &maki_agent::AgentMode::Build,
+            Some(&event_tx),
+            Some(BASH_CANCEL_ID),
+        );
+        ctx.cancel = token;
+        // The rtk probe costs up to two 2s job waits before the command even
+        // starts: pointless here, and a flake risk under load.
+        ctx.config.no_rtk = true;
+        let input = json!({ "command": BASH_PARTIAL_CMD });
+        result_tx
+            .send(exec_with_ctx(&reg, "bash", input, &ctx))
+            .ok();
+        drop(host);
+    });
+
+    let buf = poll_until("bash must publish its live buf", || {
+        recv_live_buf(&events, BASH_CANCEL_ID)
+    });
+    poll_until("bash output never reached the live buf", || {
+        buf.take().text().contains(BASH_PARTIAL_PROBE).then_some(())
+    });
+
+    trigger.cancel();
+
+    let err = result_rx
+        .recv_timeout(CANCEL_TEST_TIMEOUT)
+        .expect("cancelled bash must settle")
+        .expect_err("a partial reply is an error reply");
+    assert_eq!(err, format!("{BASH_PARTIAL_PROBE}\n{BASH_PARTIAL_MARKER}"));
 }
 
 #[test]
@@ -3750,7 +3972,7 @@ fn async_run_from_parked_command_handler_runs_promptly() {
     .unwrap();
     let rx = host.ui_action_rx();
     let handle = host.event_handle();
-    handle.run_command(Arc::from("p"), Arc::from("/park"), String::new());
+    handle.run_command(Arc::from("p"), Arc::from("/park"), String::new(), 0);
 
     let action = rx
         .recv_timeout(Duration::from_secs(5))
@@ -3781,7 +4003,7 @@ fn job_callbacks_fire_while_command_handler_parked() {
     .unwrap();
     let rx = host.ui_action_rx();
     let handle = host.event_handle();
-    handle.run_command(Arc::from("p"), Arc::from("/stream"), String::new());
+    handle.run_command(Arc::from("p"), Arc::from("/stream"), String::new(), 0);
 
     let action = rx
         .recv_timeout(Duration::from_secs(5))

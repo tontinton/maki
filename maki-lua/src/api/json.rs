@@ -22,6 +22,7 @@ human-readable error strings.",
             desc: "The Lua value to validate.",
         }],
         returns: "(table?) Array of error strings, or nil if valid.",
+        guard: None,
         example: "local errs = validator:validate({ name = 123 })\n\
 if errs then\n\
   for _, msg in ipairs(errs) do print(msg) end\n\

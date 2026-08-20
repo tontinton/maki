@@ -2,10 +2,11 @@ use crossterm::event::KeyEvent;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 
-use maki_agent::{McpConfigErrors, McpServerInfo, McpServerStatus, McpSnapshotReader};
+use maki_agent::{McpConfigErrors, McpServerInfo, McpServerStatus, McpSnapshot, McpSnapshotReader};
 
 use crate::components::Overlay;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
+use crate::repaint::{Cadence, Dirty, Watch};
 
 const TITLE: &str = " MCP Servers ";
 
@@ -73,41 +74,46 @@ impl PickerItem for McpEntry {
 
 pub struct McpPicker {
     picker: ListPicker<McpEntry>,
-    snapshot: McpSnapshotReader,
+    reader: McpSnapshotReader,
+    servers: Watch<McpSnapshot>,
     config_errors: McpConfigErrors,
-    last_generation: u64,
 }
 
 impl McpPicker {
-    pub fn new(snapshot: McpSnapshotReader, config_errors: McpConfigErrors) -> Self {
+    pub fn new(reader: McpSnapshotReader, config_errors: McpConfigErrors) -> Self {
         Self {
             picker: ListPicker::new(),
-            snapshot,
+            reader,
+            servers: Watch::default(),
             config_errors,
-            last_generation: 0,
         }
     }
 
     pub fn open(&mut self) {
-        let guard = self.snapshot.load();
-        self.last_generation = guard.generation;
-        let (entries, enabled) = build_entries(&guard.infos);
+        let _ = self.servers.poll(self.reader.load_full());
+        let (entries, enabled) = self.entries();
         let errors = (!self.config_errors.is_empty()).then(|| self.config_errors.to_string());
         self.picker.set_error_text(errors);
         self.picker.open_toggleable(entries, enabled, TITLE);
     }
 
-    pub fn refresh(&mut self) {
+    pub fn refresh(&mut self) -> Dirty {
         if !self.picker.is_open() {
-            return;
+            return Dirty::NO;
         }
-        let guard = self.snapshot.load();
-        if guard.generation == self.last_generation {
-            return;
+        if self.servers.poll(self.reader.load_full()) == Dirty::NO {
+            return Dirty::NO;
         }
-        self.last_generation = guard.generation;
-        let (entries, enabled) = build_entries(&guard.infos);
+        let (entries, enabled) = self.entries();
         self.picker.replace_toggleable(entries, enabled);
+        Dirty::YES
+    }
+
+    fn entries(&self) -> (Vec<McpEntry>, Vec<bool>) {
+        self.servers
+            .get()
+            .map(|s| build_entries(&s.infos))
+            .unwrap_or_default()
     }
 
     pub fn is_open(&self) -> bool {
@@ -149,6 +155,10 @@ impl Overlay for McpPicker {
 
     fn close(&mut self) {
         self.picker.close()
+    }
+
+    fn cadence(&self) -> Cadence {
+        self.picker.cadence()
     }
 }
 

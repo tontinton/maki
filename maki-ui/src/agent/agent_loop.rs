@@ -12,12 +12,12 @@ use maki_agent::tools::{
 };
 use maki_agent::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentParams, AgentRunParams, CancelMap,
-    CancelToken, CancelTrigger, Envelope, EventSender, History, Instructions, McpCommand,
-    PromptRole, SessionMailbox, SharedMessages, ToolOutputLines,
+    CancelToken, CancelTrigger, DoneReason, Envelope, EventSender, History, Instructions,
+    McpCommand, PromptRole, SessionMailbox, SharedMessages, ToolOutputLines,
 };
 use maki_config::ModelPolicy;
 use maki_lua::EventHandle;
-use maki_providers::{AgentError, Message, Model, TokenUsage};
+use maki_providers::{AgentError, Message, Model};
 use maki_storage::id::SessionRef;
 use serde_json::Value;
 use tracing::error;
@@ -109,11 +109,18 @@ impl AgentLoop {
         }
 
         while let Ok(()) = self.queue.recv_notify().await {
+            let mut last_run_id = None;
             while let Some(entry) = self.queue.pop() {
                 if entry.run_id() < self.min_run_id {
                     continue;
                 }
+                last_run_id = Some(entry.run_id());
                 self.process_entry(entry).await;
+            }
+            if let Some(run_id) = last_run_id {
+                let event_tx = EventSender::new(self.agent_tx.clone(), run_id);
+                self.queue
+                    .publish_if_empty(|| event_tx.try_send(AgentEvent::QueueDrained));
             }
         }
     }
@@ -274,11 +281,11 @@ impl AgentLoop {
 
         self.clear_cancel_trigger(run_id);
 
-        if matches!(result, Err(AgentError::Cancelled)) {
+        if matches!(result, Ok(DoneReason::Cancelled)) {
             self.min_run_id = run_id + 1;
         }
 
-        result
+        result.map(|_| ())
     }
 
     /// Base tools only. MCP definitions are injected per request by
@@ -328,22 +335,11 @@ impl AgentLoop {
     }
 
     fn emit_error(&self, run_id: u64, error: AgentError) {
+        error!(error = %error, "agent error");
         let event_tx = EventSender::new(self.agent_tx.clone(), run_id);
-        match error {
-            AgentError::Cancelled => {
-                let _ = event_tx.send(AgentEvent::Done {
-                    usage: TokenUsage::default(),
-                    num_turns: 0,
-                    stop_reason: None,
-                });
-            }
-            e => {
-                error!(error = %e, "agent error");
-                let _ = event_tx.send(AgentEvent::Error {
-                    message: e.user_message(),
-                });
-            }
-        }
+        let _ = event_tx.send(AgentEvent::Error {
+            message: error.user_message(),
+        });
     }
 }
 

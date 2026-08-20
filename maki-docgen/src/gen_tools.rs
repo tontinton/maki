@@ -135,13 +135,6 @@ fn write_param_table(out: &mut String, params: &[Param]) {
     }
 }
 
-fn source_label(source: &ToolSource) -> &'static str {
-    match source {
-        ToolSource::Lua { .. } => "lua plugin",
-        ToolSource::Mcp { .. } => "mcp",
-    }
-}
-
 fn write_tool_entry(out: &mut String, name: &str, info: &ToolInfo, opt_in: &HashSet<String>) {
     let description = info
         .def
@@ -153,11 +146,14 @@ fn write_tool_entry(out: &mut String, name: &str, info: &ToolInfo, opt_in: &Hash
     let summary = first_paragraph(description);
 
     writeln!(out).unwrap();
-    let mut badge_text = source_label(&info.source).to_string();
-    if opt_in.contains(name) {
-        badge_text.push_str(", opt-in");
+    let mut badges = String::new();
+    if matches!(info.source, ToolSource::Mcp { .. }) {
+        badges.push_str(" <span class=\"badge\">mcp</span>");
     }
-    writeln!(out, "### `{name}` *({badge_text})*").unwrap();
+    if opt_in.contains(name) {
+        badges.push_str(" <span class=\"badge badge-optin\">opt-in</span>");
+    }
+    writeln!(out, "### `{name}`{badges} {{#{name}}}").unwrap();
     writeln!(out).unwrap();
     writeln!(out, "{summary}").unwrap();
     writeln!(out).unwrap();
@@ -209,7 +205,7 @@ fn redact_def(def: &Value) -> Value {
 fn write_front_matter(out: &mut String) {
     writeln!(out, "+++").unwrap();
     writeln!(out, "title = \"Tools\"").unwrap();
-    writeln!(out, "weight = 6").unwrap();
+    writeln!(out, "weight = 4").unwrap();
     writeln!(out, "[extra]").unwrap();
     writeln!(out, "group = \"Reference\"").unwrap();
     writeln!(out, "+++").unwrap();

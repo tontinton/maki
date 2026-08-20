@@ -6,6 +6,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use include_dir::{Dir, include_dir};
+use maki_agent::permissions::PluginRuleStore;
 use maki_agent::tools::ToolRegistry;
 use maki_config::{PluginsConfig, RawConfig};
 
@@ -124,6 +125,7 @@ static BUNDLED_DIRS: LazyLock<&'static [&'static Dir<'static>]> = LazyLock::new(
 
 pub struct PluginHost {
     inner: LuaThread,
+    plugin_rules: Arc<PluginRuleStore>,
 }
 
 impl Drop for PluginHost {
@@ -131,8 +133,9 @@ impl Drop for PluginHost {
         let Some(handle) = self.inner.join.take() else {
             return;
         };
-        self.inner.shutdown.store(true, Ordering::Release);
-        let _ = self.inner.tx.send(Request::Shutdown);
+        // Start the shutdown first, or the join below waits for all
+        // queued bulk work to drain.
+        self.begin_shutdown();
         let (done_tx, done_rx) = flume::bounded(1);
         std::thread::spawn(move || {
             let _ = done_tx.send(handle.join().is_err());
@@ -154,8 +157,19 @@ impl PluginHost {
     /// interpreter with full debug info. Applied at VM creation, so
     /// every chunk gets it, init.lua files included.
     pub fn with_jit(registry: Arc<ToolRegistry>, jit: bool) -> Result<Self, PluginError> {
-        let lua = runtime::spawn(registry, *BUNDLED_DIRS, jit)?;
-        Ok(Self { inner: lua })
+        let plugin_rules = Arc::new(PluginRuleStore::default());
+        let lua = runtime::spawn(registry, *BUNDLED_DIRS, jit, Arc::clone(&plugin_rules))?;
+        Ok(Self {
+            inner: lua,
+            plugin_rules,
+        })
+    }
+
+    /// The store that `maki.api.register_permission_rule` writes into. Hand
+    /// it to every [`maki_agent::permissions::PermissionManager`] so plugin
+    /// rules apply to all sessions.
+    pub fn plugin_rules(&self) -> Arc<PluginRuleStore> {
+        Arc::clone(&self.plugin_rules)
     }
 
     /// Stop the Lua thread from taking new work without joining it, so the
@@ -476,11 +490,12 @@ impl EventHandle {
         }
     }
 
-    pub fn run_command(&self, plugin: Arc<str>, command: Arc<str>, args: String) {
+    pub fn run_command(&self, plugin: Arc<str>, command: Arc<str>, args: String, depth: u8) {
         let _ = self.prio_tx.try_send(Request::RunCommand {
             plugin,
             command,
             args,
+            depth,
         });
     }
 
@@ -677,17 +692,24 @@ mod tests {
         let (prio_tx, prio_rx) = flume::bounded(8);
         let (tx, _rx) = flume::bounded(8);
         let handle = EventHandle { tx, prio_tx };
-        handle.run_command(Arc::from("myplugin"), Arc::from("/greet"), "world".into());
+        handle.run_command(
+            Arc::from("myplugin"),
+            Arc::from("/greet"),
+            "world".into(),
+            2,
+        );
         let req = prio_rx.try_recv().unwrap();
         match req {
             Request::RunCommand {
                 plugin,
                 command,
                 args,
+                depth,
             } => {
                 assert_eq!(plugin.as_ref(), "myplugin");
                 assert_eq!(command.as_ref(), "/greet");
                 assert_eq!(args, "world");
+                assert_eq!(depth, 2);
             }
             _ => panic!("expected RunCommand"),
         }

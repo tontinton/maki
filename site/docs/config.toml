@@ -6,5 +6,5 @@ build_search_index = false
 [markdown.highlighting]
 enabled = true
 style = "inline"
-light_theme = "catppuccin-latte"
-dark_theme = "catppuccin-mocha"
+theme = "maki"
+extra_themes = ["extra/maki.json"]

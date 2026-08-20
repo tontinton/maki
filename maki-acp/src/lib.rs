@@ -1,3 +1,4 @@
+pub mod elicitation;
 pub mod methods;
 pub mod permissions;
 pub mod server;
@@ -6,6 +7,7 @@ pub mod translate;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use maki_agent::permissions::PluginRuleStore;
 use maki_agent::prompt::ResolvedSlots;
 use maki_agent::{AgentConfig, PermissionsConfig};
 use maki_config::ModelPolicy;
@@ -18,10 +20,10 @@ pub struct AcpParams {
     pub permissions_config: PermissionsConfig,
     pub timeouts: Timeouts,
     pub initial_wd: PathBuf,
-    pub mcp_handle: Option<maki_agent::McpHandle>,
     pub prompt_slots: Arc<ResolvedSlots>,
     pub yolo: bool,
     pub model_policy: Arc<ModelPolicy>,
+    pub plugin_rules: Arc<PluginRuleStore>,
 }
 
 pub fn run(params: AcpParams) -> color_eyre::Result<()> {

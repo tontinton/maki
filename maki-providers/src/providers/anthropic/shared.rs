@@ -1,4 +1,5 @@
 use std::ops::ControlFlow;
+use std::sync::LazyLock;
 
 use flume::Sender;
 use serde::{Deserialize, Serialize};
@@ -7,8 +8,8 @@ use tracing::{debug, warn};
 
 use crate::model::{FastPricing, Model, ModelEntry, ModelFamily, ModelPricing, ModelTier};
 use crate::{
-    AgentError, ContentBlock, Message, ProviderEvent, Role, StopReason, StreamResponse,
-    ThinkingConfig, TokenUsage,
+    AgentError, ContentBlock, EMPTY_RESPONSE_MARKER, Message, ProviderEvent, Role, StopReason,
+    StreamResponse, ThinkingConfig, TokenUsage,
 };
 
 pub(super) const BETA_TOOL_EXAMPLES_BEDROCK: &str = "tool-examples-2025-10-29";
@@ -39,6 +40,10 @@ pub(crate) fn long_context_window(model_id: &str) -> Option<u32> {
 }
 
 pub(super) const MESSAGE_CACHE_BREAKPOINTS: usize = 2;
+
+static EMPTY_CONTENT: LazyLock<ContentBlock> = LazyLock::new(|| ContentBlock::Text {
+    text: EMPTY_RESPONSE_MARKER.into(),
+});
 
 #[derive(Serialize)]
 pub(crate) struct CacheControl {
@@ -153,6 +158,28 @@ pub(super) struct WireMessage<'a> {
     pub content: Vec<WireContentBlock<'a>>,
 }
 
+/// The API rejects blank text blocks, and messages with no block at all, so
+/// blanks go and a message left bare falls back to the marker.
+fn wire_content(msg: &Message) -> Vec<WireContentBlock<'_>> {
+    let mut content: Vec<WireContentBlock<'_>> = msg
+        .content
+        .iter()
+        .filter(|block| !matches!(block, ContentBlock::Text { text } if text.trim().is_empty()))
+        .map(|inner| WireContentBlock {
+            inner,
+            cache_control: None,
+        })
+        .collect();
+
+    if content.is_empty() {
+        content.push(WireContentBlock {
+            inner: &EMPTY_CONTENT,
+            cache_control: None,
+        });
+    }
+    content
+}
+
 pub(super) fn build_wire_messages(messages: &[Message]) -> Vec<WireMessage<'_>> {
     let len = messages.len();
 
@@ -160,23 +187,20 @@ pub(super) fn build_wire_messages(messages: &[Message]) -> Vec<WireMessage<'_>> 
         .iter()
         .enumerate()
         .map(|(msg_idx, msg)| {
-            let cache_last_block = msg_idx + MESSAGE_CACHE_BREAKPOINTS >= len;
+            let mut content = wire_content(msg);
+
+            // The API rejects `cache_control` on thinking blocks, so walk back to
+            // the last block that can carry it. All thinking means no breakpoint,
+            // which beats a fatal one.
+            if msg_idx + MESSAGE_CACHE_BREAKPOINTS >= len
+                && let Some(block) = content.iter_mut().rfind(|b| !b.inner.is_thinking())
+            {
+                block.cache_control = Some(EPHEMERAL);
+            }
 
             WireMessage {
                 role: &msg.role,
-                content: msg
-                    .content
-                    .iter()
-                    .enumerate()
-                    .map(|(block_idx, block)| WireContentBlock {
-                        inner: block,
-                        cache_control: if cache_last_block && block_idx + 1 == msg.content.len() {
-                            Some(EPHEMERAL)
-                        } else {
-                            None
-                        },
-                    })
-                    .collect(),
+                content,
             }
         })
         .collect()

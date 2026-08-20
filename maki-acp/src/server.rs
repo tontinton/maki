@@ -1,47 +1,75 @@
+use std::collections::HashMap;
 use std::io::Write;
-use std::path::PathBuf;
+use std::iter;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use agent_client_protocol_schema::{
     AgentNotification, AgentRequest, AgentResponse, ContentBlock, CurrentModeUpdate,
-    EmbeddedResourceResource, Error as AcpError, ImageContent, JsonRpcMessage, LoadSessionRequest,
-    NewSessionRequest, Notification, PromptRequest, PromptResponse, Request, RequestId,
-    RequestPermissionRequest, RequestPermissionResponse, Response, SessionId, SessionModeId,
-    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
-    SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, TextContent,
-    ToolCallId, ToolCallUpdate, ToolCallUpdateFields,
+    EmbeddedResourceResource, Error as AcpError, ImageContent, InitializeRequest, JsonRpcMessage,
+    LoadSessionRequest, McpServer, NewSessionRequest, Notification, PromptRequest, PromptResponse,
+    Request, RequestId, RequestPermissionRequest, RequestPermissionResponse, Response, SessionId,
+    SessionModeId, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
+    SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
+    TextContent, ToolCallId, ToolCallUpdate, ToolCallUpdateFields,
 };
 use color_eyre::eyre::Context;
 use flume::{Receiver, Sender};
 use maki_agent::headless::{self, InteractiveHandle, InteractiveParams};
+use maki_agent::mcp::config::{RawHttpFields, RawStdioFields, RawTransport};
+use maki_agent::mcp::{self, McpHandle};
+use maki_agent::permissions::PermissionAnswer;
+use maki_agent::tools::{LocalToolFn, LocalTools, QUESTION_TOOL_NAME, local_tool};
 use maki_agent::types::AgentEvent;
 use maki_agent::{AgentInput, AgentMode, Envelope, ImageMediaType, ImageSource};
-use maki_providers::Message;
+use maki_config::MAX_SERVER_NAME_LEN;
 use maki_providers::model::Model;
 use maki_providers::provider::available_model_specs;
+use maki_providers::{Message, TokenUsage, add_cost};
 use maki_storage::id::{MakiId, SessionRef};
 use serde::Serialize;
 use serde_json::Value;
 use smol::io::AsyncBufReadExt;
 use tracing::{debug, warn};
 
-use crate::{AcpParams, methods, permissions, translate};
+use crate::{AcpParams, elicitation, methods, permissions, translate};
 
 const FIRST_OUTGOING_REQUEST_ID: i64 = 1000;
 
-type PendingPrompt = Arc<Mutex<Option<RequestId>>>;
+/// Ids come from here and are never reused, so a late answer for a closed
+/// session cannot match a request of the session that replaced it.
+static NEXT_OUTGOING_REQUEST_ID: AtomicI64 = AtomicI64::new(FIRST_OUTGOING_REQUEST_ID);
+
+/// What the client still owes us. `ask` is the one outstanding request that
+/// blocks a tool (permission or elicitation): there can only be one, because
+/// both wait on the agent's single answer channel.
+#[derive(Default)]
+struct Pending {
+    prompt: Option<RequestId>,
+    ask: Option<(i64, AskKind)>,
+}
+
+enum AskKind {
+    Permission,
+    Elicitation,
+}
+
+type PendingState = Arc<Mutex<Pending>>;
 
 struct SessionState {
     handle: InteractiveHandle,
+    mcp: Option<McpHandle>,
     current_mode: AgentMode,
     current_model: String,
-    pending_prompt: PendingPrompt,
+    pending: PendingState,
 }
 
 struct Server {
     out_tx: Sender<Value>,
     model_specs: Vec<String>,
     model_policy: Arc<maki_config::ModelPolicy>,
+    client_elicits_form: bool,
     session: Option<SessionState>,
 }
 
@@ -69,6 +97,7 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
         out_tx,
         model_specs: available_model_specs(&params.model_policy),
         model_policy: Arc::clone(&params.model_policy),
+        client_elicits_form: false,
         session: None,
     };
 
@@ -102,7 +131,7 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
             handle_incoming_response(&server, &raw);
         } else if let Some(method) = raw.get("method").and_then(Value::as_str) {
             match id {
-                Some(id) => handle_request(&mut server, method, id, &raw, &params),
+                Some(id) => handle_request(&mut server, method, id, &raw, &params).await,
                 None => handle_notification(&server, method),
             }
         } else if let Some(id) = id {
@@ -120,36 +149,23 @@ fn request_id(v: &Value) -> RequestId {
     serde_json::from_value(v.clone()).unwrap_or(RequestId::Null)
 }
 
-fn handle_request(srv: &mut Server, method: &str, id: RequestId, raw: &Value, params: &AcpParams) {
+async fn handle_request(
+    srv: &mut Server,
+    method: &str,
+    id: RequestId,
+    raw: &Value,
+    params: &AcpParams,
+) {
     let result = match method {
-        "initialize" => Ok(AgentResponse::InitializeResponse(
-            methods::initialize_response(),
-        )),
-        "session/new" => parse_params::<NewSessionRequest>(raw).map(|req| {
-            let handle = spawn_session(params, req.cwd, None, Vec::new());
-            let spec = params.model.spec();
-            let resp = methods::new_session_response(handle.session_id.as_str())
-                .config_options(vec![methods::model_config_option(&spec, &srv.model_specs)]);
-            install_session(srv, handle, spec);
-            AgentResponse::NewSessionResponse(resp)
-        }),
-        "session/load" => parse_params::<LoadSessionRequest>(raw).and_then(|req| {
-            let session_ref: SessionRef =
-                req.session_id.0.parse().map_err(|_| {
-                    AcpError::resource_not_found(Some(req.session_id.0.to_string()))
-                })?;
-            let history = load_history(session_ref.id())?;
-            let sid = SessionId::from(session_ref.to_string());
-            for update in translate::replay_history(&history) {
-                session_update(&srv.out_tx, &sid, update);
-            }
-            let handle = spawn_session(params, req.cwd, Some(session_ref), history);
-            let spec = params.model.spec();
-            let resp = methods::load_session_response()
-                .config_options(vec![methods::model_config_option(&spec, &srv.model_specs)]);
-            install_session(srv, handle, spec);
-            Ok(AgentResponse::LoadSessionResponse(resp))
-        }),
+        "initialize" => {
+            srv.client_elicits_form = parse_params::<InitializeRequest>(raw)
+                .is_ok_and(|req| elicitation::supports_form(&req.client_capabilities));
+            Ok(AgentResponse::InitializeResponse(
+                methods::initialize_response(),
+            ))
+        }
+        "session/new" => new_session(srv, raw, params).await,
+        "session/load" => load_session(srv, raw, params).await,
         "session/prompt" => match handle_prompt(srv, raw, &id) {
             Ok(()) => return,
             Err(e) => Err(e),
@@ -161,20 +177,92 @@ fn handle_request(srv: &mut Server, method: &str, id: RequestId, raw: &Value, pa
     srv.respond(id, result);
 }
 
+async fn new_session(
+    srv: &mut Server,
+    raw: &Value,
+    params: &AcpParams,
+) -> Result<AgentResponse, AcpError> {
+    let req: NewSessionRequest = parse_params(raw)?;
+    close_session(srv).await;
+    let mcp = start_mcp(&req.cwd, &req.mcp_servers).await;
+    let cwd = req.cwd.clone();
+    let (handle, pending) = spawn_session(srv, params, req.cwd, None, Vec::new(), mcp.clone());
+    let spec = params.model.spec();
+    let resp = methods::new_session_response(handle.session_id.as_str())
+        .config_options(vec![methods::model_config_option(&spec, &srv.model_specs)]);
+    install_session(srv, handle, mcp, spec, pending, cwd, None);
+    Ok(AgentResponse::NewSessionResponse(resp))
+}
+
+async fn load_session(
+    srv: &mut Server,
+    raw: &Value,
+    params: &AcpParams,
+) -> Result<AgentResponse, AcpError> {
+    let req: LoadSessionRequest = parse_params(raw)?;
+    let session_ref: SessionRef = req
+        .session_id
+        .0
+        .parse()
+        .map_err(|_| AcpError::resource_not_found(Some(req.session_id.0.to_string())))?;
+    let (history, recorded_cwd, restored_usage, restored_model) = load_history(session_ref.id())?;
+    close_session(srv).await;
+    let mcp = start_mcp(&req.cwd, &req.mcp_servers).await;
+    let sid = SessionId::from(session_ref.to_string());
+    let home = maki_storage::paths::home();
+    let replay_cwd = recorded_cwd.as_deref().unwrap_or(&req.cwd);
+    for update in translate::replay_history(&history, replay_cwd, home.as_deref()) {
+        session_update(&srv.out_tx, &sid, update);
+    }
+    let cwd = req.cwd.clone();
+    let (handle, pending) = spawn_session(
+        srv,
+        params,
+        req.cwd,
+        Some(session_ref),
+        history,
+        mcp.clone(),
+    );
+    let spec = params.model.spec();
+    let resp = methods::load_session_response()
+        .config_options(vec![methods::model_config_option(&spec, &srv.model_specs)]);
+    // The restored total predates any per-turn cost, so price it once with
+    // the model the session recorded (the current default may cost 10x more
+    // or less); later turns add their own exact cost.
+    let restored_cost = Model::from_spec(&restored_model)
+        .map(|m| m.cost_of(&restored_usage, false))
+        .unwrap_or_else(|_| params.model.cost_of(&restored_usage, false));
+    install_session(srv, handle, mcp, spec, pending, cwd, restored_cost);
+    Ok(AgentResponse::LoadSessionResponse(resp))
+}
+
 fn spawn_session(
+    srv: &Server,
     params: &AcpParams,
     cwd: PathBuf,
     session_id: Option<SessionRef>,
     history: Vec<Message>,
-) -> InteractiveHandle {
-    headless::spawn_interactive(InteractiveParams {
+    mcp_handle: Option<McpHandle>,
+) -> (InteractiveHandle, PendingState) {
+    let pending = PendingState::default();
+    // Without form elicitation the question tool would spin forever waiting
+    // for a TUI that does not exist, so it is dropped and the model asks in
+    // plain text instead.
+    let (excluded_tools, local_tools) = if srv.client_elicits_form {
+        let tool = question_tool(srv.out_tx.clone(), Arc::clone(&pending));
+        let map: LocalTools = Arc::new(HashMap::from([(QUESTION_TOOL_NAME.to_owned(), tool)]));
+        (Vec::new(), map)
+    } else {
+        (vec![QUESTION_TOOL_NAME], LocalTools::default())
+    };
+    let handle = headless::spawn_interactive(InteractiveParams {
         model: params.model.clone(),
         config: params.config.clone(),
         permissions_config: params.permissions_config.clone(),
         timeouts: params.timeouts,
         prompt_slots: Arc::clone(&params.prompt_slots),
-        excluded_tools: Vec::new(),
-        mcp_handle: params.mcp_handle.clone(),
+        excluded_tools,
+        mcp_handle,
         initial_wd: cwd,
         session_id,
         initial_history: history,
@@ -183,35 +271,197 @@ fn spawn_session(
         append_system_prompt: None,
         workflow: false,
         model_policy: Arc::clone(&params.model_policy),
+        plugin_rules: Arc::clone(&params.plugin_rules),
+        local_tools,
+    });
+    (handle, pending)
+}
+
+/// Sends a request the client must answer and records it as the outstanding
+/// ask, registered before sending so the response can never race past us.
+fn ask_client(
+    out_tx: &Sender<Value>,
+    pending: &PendingState,
+    kind: AskKind,
+    request: AgentRequest,
+) -> i64 {
+    let id = NEXT_OUTGOING_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+    pending.lock().unwrap().ask = Some((id, kind));
+    send(
+        out_tx,
+        Request {
+            id: RequestId::Number(id),
+            method: Arc::from(request.method()),
+            params: Some(request),
+        },
+    );
+    id
+}
+
+/// Shadows the Lua `question` tool: sends `elicitation/create` to the client
+/// and blocks the tool call until the form comes back. Serializes on the same
+/// answer channel as permissions, so at most one ask is in flight.
+fn question_tool(out_tx: Sender<Value>, pending: PendingState) -> LocalToolFn {
+    local_tool(move |input, ctx| {
+        let out_tx = out_tx.clone();
+        let pending = Arc::clone(&pending);
+        Box::pin(async move {
+            let session_id = ctx
+                .session_id
+                .as_ref()
+                .map(ToString::to_string)
+                .ok_or("no session")?;
+            // Batch/code_execution children dispatch with an empty id; a
+            // scope pointing at a tool call the client never saw would get
+            // the elicitation rejected or dropped.
+            let tool_call_id = ctx.tool_use_id.filter(|id| !id.is_empty());
+            let request = elicitation::form_request(&session_id, tool_call_id, &input)?;
+            let rx = ctx.user_response_rx.as_ref().ok_or("no answer channel")?;
+
+            let guard = rx.lock().await;
+            let request = AgentRequest::CreateElicitationRequest(request);
+            let id = ask_client(&out_tx, &pending, AskKind::Elicitation, request);
+            let response = ctx.cancel.race(guard.recv_async()).await;
+            // Cleared while still holding the channel, so a stale id cannot
+            // clobber whatever ask comes next.
+            let _ = pending
+                .lock()
+                .unwrap()
+                .ask
+                .take_if(|(ask_id, _)| *ask_id == id);
+            drop(guard);
+
+            Ok(match response {
+                Ok(Ok(raw)) => elicitation::format_response(&input, &raw),
+                _ => elicitation::DISMISSED.to_owned(),
+            })
+        })
     })
 }
 
-fn install_session(srv: &mut Server, handle: InteractiveHandle, current_model: String) {
-    let pending = PendingPrompt::default();
+/// Servers the client injects on `session/new` and `session/load`. A transport we
+/// cannot speak is dropped like a broken `mcp.toml` entry: losing one server beats
+/// losing the session.
+fn injected_servers(servers: &[McpServer]) -> Vec<(String, RawTransport)> {
+    servers
+        .iter()
+        .filter_map(|server| match server {
+            McpServer::Http(http) => Some((
+                server_name(&http.name),
+                RawTransport::Http(RawHttpFields {
+                    url: http.url.clone(),
+                    headers: pairs(&http.headers, |h| (&h.name, &h.value)),
+                    oauth: None,
+                }),
+            )),
+            McpServer::Stdio(stdio) => Some((
+                server_name(&stdio.name),
+                RawTransport::Stdio(RawStdioFields {
+                    command: iter::once(stdio.command.to_string_lossy().into_owned())
+                        .chain(stdio.args.iter().cloned())
+                        .collect(),
+                    environment: pairs(&stdio.env, |e| (&e.name, &e.value)),
+                }),
+            )),
+            _ => {
+                warn!("ignoring injected MCP server, only http and stdio are supported");
+                None
+            }
+        })
+        .collect()
+}
+
+/// Clients name their servers freely, maki names them like `mcp.toml` does.
+fn server_name(name: &str) -> String {
+    name.chars()
+        .take(MAX_SERVER_NAME_LEN)
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
+}
+
+fn pairs<T>(items: &[T], split: impl Fn(&T) -> (&String, &String)) -> HashMap<String, String> {
+    items
+        .iter()
+        .map(|item| {
+            let (name, value) = split(item);
+            (name.clone(), value.clone())
+        })
+        .collect()
+}
+
+/// MCP is per session: the client picks the cwd and may inject its own servers.
+/// Returns as soon as the config is read, the first prompt waits for the tools.
+async fn start_mcp(cwd: &Path, servers: &[McpServer]) -> Option<McpHandle> {
+    let (handle, errors) = mcp::start_with_extra(cwd, injected_servers(servers)).await;
+    if !errors.is_empty() {
+        warn!(%errors, "MCP config errors");
+    }
+    handle
+}
+
+/// Stop the old session before the next one starts, so two generations of the
+/// same MCP servers never fight over a port or a lock file.
+async fn close_session(srv: &mut Server) {
+    let Some(state) = srv.session.take() else {
+        return;
+    };
+    // The event pump dies with the session, so the prompt it owed an answer to
+    // has to be answered here or the client waits on it forever.
+    if let Some(id) = state.pending.lock().unwrap().prompt.take() {
+        let resp = PromptResponse::new(StopReason::Cancelled);
+        send(
+            &srv.out_tx,
+            Response::new(id, Ok(AgentResponse::PromptResponse(resp))),
+        );
+    }
+    state.handle.task.cancel().await;
+    if let Some(mcp) = state.mcp {
+        mcp.shutdown().await;
+    }
+}
+
+fn install_session(
+    srv: &mut Server,
+    handle: InteractiveHandle,
+    mcp: Option<McpHandle>,
+    current_model: String,
+    pending: PendingState,
+    cwd: PathBuf,
+    initial_cost: Option<f64>,
+) {
     start_event_pump(
         handle.event_rx.clone(),
         handle.session_id.clone(),
         srv.out_tx.clone(),
         Arc::clone(&pending),
+        cwd,
+        maki_storage::paths::home(),
+        initial_cost,
     );
     srv.session = Some(SessionState {
         handle,
+        mcp,
         current_mode: AgentMode::Build,
         current_model,
-        pending_prompt: pending,
+        pending,
     });
 }
 
-fn load_history(session_id: MakiId) -> Result<Vec<Message>, AcpError> {
+fn load_history(
+    session_id: MakiId,
+) -> Result<(Vec<Message>, Option<PathBuf>, TokenUsage, String), AcpError> {
     let storage = maki_storage::StateDir::resolve()
         .map_err(|e| AcpError::internal_error().data(json_str(&e)))?;
     load_history_from(&storage, session_id)
 }
 
+/// History plus the absolute cwd the session recorded in its header. Tool
+/// inputs from a past run resolve against that cwd, not the client's current
+/// one; a non-absolute recording falls back to the caller's cwd.
 fn load_history_from(
     storage: &maki_storage::StateDir,
     session_id: MakiId,
-) -> Result<Vec<Message>, AcpError> {
+) -> Result<(Vec<Message>, Option<PathBuf>, TokenUsage, String), AcpError> {
     let session: maki_storage::sessions::Session<
         Message,
         maki_providers::TokenUsage,
@@ -219,7 +469,14 @@ fn load_history_from(
     > = maki_storage::sessions::Session::load(session_id, storage).map_err(|e| {
         AcpError::resource_not_found(Some(format!("session/{session_id}"))).data(json_str(&e))
     })?;
-    Ok(session.take_messages())
+    let recorded = if Path::new(&session.cwd).is_absolute() {
+        Some(PathBuf::from(&session.cwd))
+    } else {
+        None
+    };
+    let usage = session.token_usage;
+    let model = session.model.clone();
+    Ok((session.take_messages(), recorded, usage, model))
 }
 
 fn handle_prompt(srv: &mut Server, raw: &Value, id: &RequestId) -> Result<(), AcpError> {
@@ -243,7 +500,7 @@ fn handle_prompt(srv: &mut Server, raw: &Value, id: &RequestId) -> Result<(), Ac
         .input_tx
         .send(input)
         .map_err(|_| AcpError::new(-32603, "session ended"))?;
-    *session.pending_prompt.lock().unwrap() = Some(id.clone());
+    session.pending.lock().unwrap().prompt = Some(id.clone());
     Ok(())
 }
 
@@ -301,6 +558,9 @@ fn handle_notification(srv: &Server, method: &str) {
     match method {
         "session/cancel" => {
             if let Some(session) = &srv.session {
+                // Any answer still in flight belongs to the cancelled turn, so
+                // forget its id and let it be dropped on arrival.
+                session.pending.lock().unwrap().ask = None;
                 let _ = session.handle.cancel_tx.try_send(());
             }
         }
@@ -310,12 +570,41 @@ fn handle_notification(srv: &Server, method: &str) {
 
 fn handle_incoming_response(srv: &Server, raw: &Value) {
     let Some(session) = &srv.session else { return };
+    let Some(id) = raw.get("id").and_then(Value::as_i64) else {
+        return;
+    };
+    let ask = session
+        .pending
+        .lock()
+        .unwrap()
+        .ask
+        .take_if(|(ask_id, _)| *ask_id == id);
+    let Some((_, kind)) = ask else {
+        warn!(id, "response for an unknown request id");
+        return;
+    };
+    let answer = match kind {
+        AskKind::Permission => permission_answer(raw).encode(),
+        // The waiting question tool parses this; an error response decodes to
+        // nothing and counts as a dismissal.
+        AskKind::Elicitation => raw
+            .get("result")
+            .cloned()
+            .unwrap_or(Value::Null)
+            .to_string(),
+    };
+    let _ = session.handle.answer_tx.send(answer);
+}
 
-    if let Some(result) = raw.get("result")
-        && let Ok(resp) = serde_json::from_value::<RequestPermissionResponse>(result.clone())
+/// A response we cannot read still has to answer the agent, or the tool waits
+/// on a permission that will never come.
+fn permission_answer(raw: &Value) -> PermissionAnswer {
+    match raw
+        .get("result")
+        .map(|result| serde_json::from_value::<RequestPermissionResponse>(result.clone()))
     {
-        let answer = permissions::outcome_to_answer(&resp.outcome);
-        let _ = session.handle.answer_tx.send(answer.encode());
+        Some(Ok(resp)) => permissions::outcome_to_answer(&resp.outcome),
+        _ => PermissionAnswer::Deny,
     }
 }
 
@@ -365,16 +654,24 @@ fn start_event_pump(
     event_rx: Receiver<Envelope>,
     session_id: SessionRef,
     out_tx: Sender<Value>,
-    pending: PendingPrompt,
+    pending: PendingState,
+    cwd: PathBuf,
+    home: Option<PathBuf>,
+    initial_cost: Option<f64>,
 ) {
     smol::spawn(async move {
         let sid = SessionId::from(session_id.to_string());
-        let mut next_request_id = FIRST_OUTGOING_REQUEST_ID;
+        let mut cost_total = initial_cost;
 
         while let Ok(Envelope {
             event, subagent, ..
         }) = event_rx.recv_async().await
         {
+            // Subagent stream events stay out of the transcript, but their
+            // turns still spend session money.
+            if let AgentEvent::TurnComplete(tc) = &event {
+                add_cost(&mut cost_total, tc.cost);
+            }
             if subagent.is_some() {
                 continue;
             }
@@ -383,9 +680,12 @@ fn start_event_pump(
                 AgentEvent::TextDelta { text } => translate::text_delta(&text),
                 AgentEvent::ThinkingDelta { text } => translate::thinking_delta(&text),
                 AgentEvent::ToolPending { id, name } => translate::tool_pending(&id, &name),
-                AgentEvent::ToolStart(event) => translate::tool_start(&event),
+                AgentEvent::ToolStart(event) => {
+                    translate::tool_start(&event, &cwd, home.as_deref())
+                }
                 AgentEvent::ToolOutput { id, content } => translate::tool_output(&id, &content),
-                AgentEvent::ToolDone(event) => translate::tool_done(&event),
+                AgentEvent::ToolDone(event) => translate::tool_done(&event, &cwd, home.as_deref()),
+                AgentEvent::TurnComplete(event) => translate::usage_update(&event, cost_total),
                 AgentEvent::PermissionRequest { id, tool, scopes } => {
                     let fields =
                         ToolCallUpdateFields::new().title(format!("{tool}: {}", scopes.join(", ")));
@@ -395,20 +695,12 @@ fn start_event_pump(
                             ToolCallUpdate::new(ToolCallId::from(id), fields),
                             permissions::permission_options(),
                         ));
-                    next_request_id += 1;
-                    send(
-                        &out_tx,
-                        Request {
-                            id: RequestId::Number(next_request_id),
-                            method: Arc::from(request.method()),
-                            params: Some(request),
-                        },
-                    );
+                    ask_client(&out_tx, &pending, AskKind::Permission, request);
                     continue;
                 }
-                AgentEvent::Done { stop_reason, .. } => {
-                    if let Some(id) = pending.lock().unwrap().take() {
-                        let resp = PromptResponse::new(translate::map_stop_reason(stop_reason));
+                AgentEvent::Done { reason, .. } => {
+                    if let Some(id) = pending.lock().unwrap().prompt.take() {
+                        let resp = PromptResponse::new(translate::map_done_reason(reason));
                         send(
                             &out_tx,
                             Response::new(id, Ok(AgentResponse::PromptResponse(resp))),
@@ -417,7 +709,7 @@ fn start_event_pump(
                     continue;
                 }
                 AgentEvent::Error { message } => {
-                    if let Some(id) = pending.lock().unwrap().take() {
+                    if let Some(id) = pending.lock().unwrap().prompt.take() {
                         let error = AcpError::internal_error().data(Value::String(message));
                         send(&out_tx, Response::<AgentResponse>::new(id, Err(error)));
                     }
@@ -464,12 +756,117 @@ fn json_str(e: &impl std::fmt::Display) -> Value {
 
 #[cfg(test)]
 mod tests {
+    use maki_agent::permissions::PermissionManager;
     use maki_providers::{ContentBlock as MsgBlock, Role, TokenUsage};
     use maki_storage::StateDir;
     use maki_storage::sessions::Session;
     use tempfile::TempDir;
+    use test_case::test_case;
 
     use super::*;
+
+    const ANSWERED_ID: i64 = 1001;
+    const UNKNOWN_ID: i64 = 1002;
+
+    fn allow_once(id: i64) -> Value {
+        serde_json::json!({
+            "id": id,
+            "result": { "outcome": { "outcome": "selected", "optionId": "allow_once" } },
+        })
+    }
+
+    #[test_case(allow_once(ANSWERED_ID), PermissionAnswer::AllowOnce ; "selected_option")]
+    #[test_case(serde_json::json!({ "id": ANSWERED_ID, "result": { "outcome": { "outcome": "cancelled" } } }), PermissionAnswer::Deny ; "cancelled_outcome")]
+    #[test_case(serde_json::json!({ "id": ANSWERED_ID, "result": { "nonsense": true } }), PermissionAnswer::Deny ; "unparsable_result")]
+    #[test_case(serde_json::json!({ "id": ANSWERED_ID, "error": { "code": -32603 } }), PermissionAnswer::Deny ; "jsonrpc_error")]
+    fn permission_answer_maps_response(raw: Value, expected: PermissionAnswer) {
+        assert_eq!(permission_answer(&raw), expected);
+    }
+
+    fn server_awaiting_answer() -> (Server, Receiver<String>) {
+        server_with_ask(AskKind::Permission)
+    }
+
+    fn server_with_ask(kind: AskKind) -> (Server, Receiver<String>) {
+        let (answer_tx, answer_rx) = flume::unbounded();
+        let handle = InteractiveHandle {
+            event_rx: flume::unbounded().1,
+            tool_names: Vec::new(),
+            input_tx: flume::unbounded().0,
+            answer_tx,
+            cancel_tx: flume::unbounded().0,
+            model_tx: flume::unbounded().0,
+            session_id: SessionRef::from(MakiId::generate()),
+            permissions: Arc::new(PermissionManager::new(
+                maki_config::PermissionsConfig::default(),
+                PathBuf::from("/project"),
+                Arc::default(),
+            )),
+            task: smol::spawn(async {}),
+        };
+        let server = Server {
+            out_tx: flume::unbounded().0,
+            model_specs: Vec::new(),
+            model_policy: Arc::new(maki_config::ModelPolicy::default()),
+            client_elicits_form: false,
+            session: Some(SessionState {
+                handle,
+                mcp: None,
+                current_mode: AgentMode::Build,
+                current_model: String::new(),
+                pending: Arc::new(Mutex::new(Pending {
+                    prompt: None,
+                    ask: Some((ANSWERED_ID, kind)),
+                })),
+            }),
+        };
+        (server, answer_rx)
+    }
+
+    #[test]
+    fn only_the_outstanding_request_id_is_answered() {
+        let (srv, answer_rx) = server_awaiting_answer();
+
+        handle_incoming_response(&srv, &allow_once(UNKNOWN_ID));
+        assert!(answer_rx.is_empty(), "an unknown id is dropped");
+
+        handle_incoming_response(&srv, &allow_once(ANSWERED_ID));
+        assert_eq!(
+            answer_rx.try_recv().ok(),
+            Some(PermissionAnswer::AllowOnce.encode())
+        );
+
+        handle_incoming_response(&srv, &allow_once(ANSWERED_ID));
+        assert!(
+            answer_rx.is_empty(),
+            "a replayed answer cannot land on the next request"
+        );
+    }
+
+    #[test]
+    fn cancel_drops_the_outstanding_permission_request() {
+        let (srv, answer_rx) = server_awaiting_answer();
+        handle_notification(&srv, "session/cancel");
+
+        handle_incoming_response(&srv, &allow_once(ANSWERED_ID));
+        assert!(answer_rx.is_empty(), "the cancelled turn owns that answer");
+    }
+
+    #[test]
+    fn elicitation_response_forwards_the_raw_result() {
+        let (srv, answer_rx) = server_with_ask(AskKind::Elicitation);
+        let raw = serde_json::json!({
+            "id": ANSWERED_ID,
+            "result": { "action": "accept", "content": { "q1": "axum" } },
+        });
+
+        handle_incoming_response(&srv, &raw);
+        let forwarded = answer_rx.try_recv().unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&forwarded).unwrap(),
+            raw["result"]
+        );
+    }
 
     #[test]
     fn load_history_round_trips_stored_messages() {
@@ -489,14 +886,33 @@ mod tests {
         let mut session: Session<Message, TokenUsage, maki_agent::ToolOutput> =
             Session::new("anthropic/test-model", "/project");
         session.replace_messages(messages.clone());
+        session.token_usage = TokenUsage {
+            input: 1_000,
+            output: 200,
+            ..Default::default()
+        };
         session.save(&dir).unwrap();
 
         let id: MakiId = session.id;
-        let history = load_history_from(&dir, id).unwrap();
+        let (history, recorded, usage, model) = load_history_from(&dir, id).unwrap();
+        assert_eq!(model, "anthropic/test-model");
         assert_eq!(
             serde_json::to_value(&history).unwrap(),
             serde_json::to_value(&messages).unwrap()
         );
+        assert_eq!(recorded, Some(PathBuf::from("/project")));
+        assert_eq!(usage, session.token_usage);
+    }
+
+    #[test]
+    fn load_history_records_absolute_cwd_only() {
+        let tmp = TempDir::new().unwrap();
+        let dir = StateDir::from_path(tmp.path().to_path_buf());
+        let mut session: Session<Message, TokenUsage, maki_agent::ToolOutput> =
+            Session::new("anthropic/test-model", "relative/project");
+        session.save(&dir).unwrap();
+        let (_, recorded, _, _) = load_history_from(&dir, session.id).unwrap();
+        assert_eq!(recorded, None);
     }
 
     #[test]
@@ -505,5 +921,59 @@ mod tests {
         let dir = StateDir::from_path(tmp.path().to_path_buf());
         let err = load_history_from(&dir, MakiId::generate()).unwrap_err();
         assert_eq!(err.code, AcpError::resource_not_found(None).code);
+    }
+
+    #[test]
+    fn converts_injected_mcp_servers() {
+        let raw = serde_json::json!({
+            "params": {
+                "sessionId": MakiId::generate().to_string(),
+                "cwd": "/project",
+                "mcpServers": [
+                    {
+                        "type": "http",
+                        "name": "kan.dev/mcp",
+                        "url": "http://127.0.0.1:41012",
+                        "headers": [{ "name": "Authorization", "value": "Bearer abc" }]
+                    },
+                    {
+                        "name": "local",
+                        "command": "/usr/bin/mcp",
+                        "args": ["--stdio"],
+                        "env": [{ "name": "TOKEN", "value": "t" }]
+                    },
+                    {
+                        "type": "sse",
+                        "name": "legacy",
+                        "url": "http://127.0.0.1:41013",
+                        "headers": []
+                    }
+                ]
+            }
+        });
+
+        let req: LoadSessionRequest = parse_params(&raw).unwrap();
+        let servers = injected_servers(&req.mcp_servers);
+        assert_eq!(servers.len(), 2, "sse is dropped, not converted");
+
+        let (name, RawTransport::Http(http)) = &servers[0] else {
+            panic!("expected http transport");
+        };
+        assert_eq!(name, "kan-dev-mcp", "wire names are coerced to valid ones");
+        assert_eq!(http.url, "http://127.0.0.1:41012");
+        assert_eq!(
+            http.headers.get("Authorization").map(String::as_str),
+            Some("Bearer abc")
+        );
+
+        let (name, RawTransport::Stdio(stdio)) = &servers[1] else {
+            panic!("expected stdio transport");
+        };
+        assert_eq!(name, "local");
+        assert_eq!(stdio.command, ["/usr/bin/mcp", "--stdio"]);
+        assert_eq!(
+            stdio.environment.get("TOKEN").map(String::as_str),
+            Some("t")
+        );
     }
 }

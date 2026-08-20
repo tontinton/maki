@@ -2,8 +2,56 @@
 
 {% block title %}{{ section.title }} | {{ config.title }}{% endblock %}
 
+{% block bodyclass %}page-{{ section.path | trim_start_matches(pat="/") | trim_end_matches(pat="/") }}{% endblock %}
+
 {% block content %}
+{%- set root = get_section(path="_index.md") -%}
+{%- set ordered = [] -%}
+{%- for group in ["Getting Started", "Guides", "Concepts", "Reference"] -%}
+  {%- for sub in root.subsections -%}
+    {%- set s = get_section(path=sub) -%}
+    {%- if s.extra.group == group -%}
+      {%- set_global ordered = ordered | concat(with=[s]) -%}
+    {%- endif -%}
+  {%- endfor -%}
+{%- endfor -%}
+{%- set prev = false -%}
+{%- set next = false -%}
+{%- set found = false -%}
+{%- for s in ordered -%}
+  {%- if s.permalink == section.permalink -%}
+    {%- set_global found = true -%}
+  {%- elif not found -%}
+    {%- set_global prev = s -%}
+  {%- elif not next -%}
+    {%- set_global next = s -%}
+  {%- endif -%}
+{%- endfor -%}
+<div class="page-head">
+  <span class="eyebrow">{{ section.extra.group }}</span>
+  <div class="page-actions">
+    <span class="page-tokens" title="Estimated tokens if you paste this page into an LLM"></span>
+    <button id="copy-md" type="button" title="Copy this page as Markdown for an LLM">
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+      <span class="action-label">Copy as Markdown</span>
+    </button>
+  </div>
+</div>
 {{ section.content | safe }}
+<nav class="page-nav">
+  {%- if prev %}
+  <a href="{{ prev.permalink }}" class="pn-prev">
+    <span class="pn-dir">← Previous</span>
+    <span class="pn-title">{{ prev.title }}</span>
+  </a>
+  {%- endif %}
+  {%- if next %}
+  <a href="{{ next.permalink }}" class="pn-next">
+    <span class="pn-dir">Next →</span>
+    <span class="pn-title">{{ next.title }}</span>
+  </a>
+  {%- endif %}
+</nav>
 {% endblock %}
 
 {% block toc %}

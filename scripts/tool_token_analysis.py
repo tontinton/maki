@@ -70,7 +70,7 @@ def extract_batch_subtool_calls(session):
     tool_outputs = session.get("tool_outputs", {})
     sub_calls = []
 
-    for tid, val in tool_outputs.items():
+    for val in tool_outputs.values():
         if not isinstance(val, dict) or "Batch" not in val:
             continue
         batch = val["Batch"]
@@ -132,7 +132,7 @@ def print_table(title, headers, rows, aligns=None):
     print(f"├{'─' * (sum(widths) + 2 * len(widths) + len(widths) - 1)}┤")
 
     for r in rows:
-        row_str = " │ ".join(f"{str(r[i]):{a}{w}}" for i, (a, w) in enumerate(zip(aligns, widths)))
+        row_str = " │ ".join(f"{r[i]!s:{a}{w}}" for i, (a, w) in enumerate(zip(aligns, widths)))
         print(f"│ {row_str} │")
 
     print(f"└{'─' * (sum(widths) + 2 * len(widths) + len(widths) - 1)}┘")
@@ -294,11 +294,7 @@ def print_top_expensive_calls(all_calls, n=15):
 
         if name == "bash":
             detail = str(inp.get("command", ""))[:60]
-        elif name == "read":
-            detail = str(inp.get("path", ""))[:60]
-        elif name in ("edit", "multiedit"):
-            detail = str(inp.get("path", ""))[:60]
-        elif name == "write":
+        elif name == "read" or name in ("edit", "multiedit") or name == "write":
             detail = str(inp.get("path", ""))[:60]
         elif name == "grep":
             detail = str(inp.get("pattern", ""))[:60]

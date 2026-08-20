@@ -1,6 +1,7 @@
 local truncate = require("maki.truncate")
 local ToolView = require("maki.tool_view")
 local output_limits = require("maki.output_limits")
+local partial = require("maki.partial")
 
 local RTK_REWRITE_TIMEOUT_MS = 2000
 local RTK_UNSUPPORTED_FLAGS = {
@@ -353,8 +354,13 @@ maki.api.register_tool({
 
     local output_parts = {}
     local has_output = false
+    local finished = false
 
     local function finish(exit_code)
+      if finished then
+        return
+      end
+      finished = true
       local output = table.concat(output_parts)
       output = truncate(output, max_lines, max_bytes)
 
@@ -408,6 +414,17 @@ maki.api.register_tool({
         finish(code)
       end,
     })
+
+    -- Esc or deadline: hand back the lines streamed so far, so the model
+    -- keeps what the user just watched instead of a bare error.
+    maki.async.on_cancel(function(reason)
+      if finished then
+        return
+      end
+      finished = true
+      local out = truncate(table.concat(output_parts), max_lines, max_bytes)
+      ctx:finish(partial.cut(view, out, reason, timeout_secs))
+    end)
 
     return nil
   end,

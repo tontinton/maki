@@ -20,6 +20,8 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Color;
 
+use crate::repaint::{Cadence, Dirty};
+
 pub(crate) const DONE_TEXT: &str = "Done!";
 pub(crate) const ERROR_TEXT: &str = "Error";
 pub(crate) const CANCELLED_TEXT: &str = "Cancelled";
@@ -119,6 +121,7 @@ impl Chat {
             AgentEvent::QueueItemConsumed { text, image_count } => {
                 return ChatEventResult::QueueItemConsumed { text, image_count };
             }
+            AgentEvent::QueueDrained => {}
             AgentEvent::Retry { .. } => unreachable!("handled before handle_event"),
             AgentEvent::Done { .. } => {
                 self.messages_panel.flush();
@@ -220,8 +223,12 @@ impl Chat {
         self.messages_panel.set_accent(color);
     }
 
-    pub fn is_animating(&self) -> bool {
-        self.messages_panel.is_animating()
+    pub fn tick(&mut self) -> Dirty {
+        self.messages_panel.tick()
+    }
+
+    pub fn cadence(&self) -> Cadence {
+        self.messages_panel.cadence()
     }
 
     pub fn view(&mut self, frame: &mut Frame, area: Rect, has_selection: bool) {

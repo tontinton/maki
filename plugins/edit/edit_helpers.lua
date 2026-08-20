@@ -45,4 +45,13 @@ function M.replace_lines(content, start_line, end_line, new_string)
   return trailing_nl and joined .. "\n" or joined
 end
 
+-- Insert `new_string` after line `after_line` and check arguments.
+function M.insert_after(content, after_line, new_string)
+  local lines = split_lines(content)
+  if after_line < 0 or after_line > #lines then
+    return nil, string.format("after line %d out of range (0-%d)", after_line, #lines)
+  end
+  return M.replace_lines(content, after_line + 1, nil, new_string)
+end
+
 return M

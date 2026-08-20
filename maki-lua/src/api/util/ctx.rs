@@ -315,6 +315,7 @@ impl UserData for LuaCtx {
             cell.deadline_secs.set(Some(secs));
             cell.deadline
                 .set(Some(Instant::now() + Duration::from_secs(secs)));
+            cell.deadline_changed.notify(usize::MAX);
             Ok((Some(true), None))
         });
 
@@ -345,6 +346,10 @@ impl UserData for LuaCtx {
                 let Some(loaded) = this.loaded_instructions().cloned() else {
                     return Ok(this.cap_err_pair("find_instructions"));
                 };
+                // Nothing may hold the ctx borrow across the wait: a cancel
+                // hook firing meanwhile needs `ctx:finish`, which takes it
+                // mutably.
+                drop(this);
                 let results = smol::unblock(move || {
                     let cwd = std::env::current_dir().unwrap_or_default();
                     let abs = resolve_abs_with_cwd(dir_path, &cwd);
@@ -427,7 +432,7 @@ mod tests {
         let mut tools: HashMap<String, LocalToolFn> = HashMap::new();
         tools.insert(
             LOCAL_TOOL_NAME.into(),
-            Arc::new(|_: &serde_json::Value| Ok(String::new())) as LocalToolFn,
+            maki_agent::tools::local_tool(|_, _| Box::pin(async { Ok(String::new()) })),
         );
         ctx.local_tools = Arc::new(tools);
         ctx.live_sink = Some(flume::unbounded().0);

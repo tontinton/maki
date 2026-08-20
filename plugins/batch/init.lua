@@ -97,6 +97,9 @@ local function normalize_entry(entry)
   if type(tool) ~= "string" then
     return nil, "batch entry missing 'tool'"
   end
+  -- Lua twin of `canonical_tool_name` (streaming.rs): strip GPT's
+  -- `functions.` prefix so headers and the nested-batch guard match.
+  tool = tool:match("^functions%.(.+)") or tool
   local rest = {}
   local has_rest = false
   for k, v in pairs(entry) do
@@ -419,10 +422,13 @@ function Batch:annotate(c, ann)
   self:rerender()
 end
 
+-- A child the sweep settled may be settled once more, when its own call
+-- comes back with the partial output the sweep could not know about.
 function Batch:settle(c, status, output)
-  if TERMINAL[c.status] then
+  if TERMINAL[c.status] and not c.swept then
     error(string.format(RESETTLE_FMT, c.tool, c.status, status))
   end
+  c.swept = nil
   c.status = status
   c.output = output
   self:attach_body(c)
@@ -453,8 +459,13 @@ function Batch:run_child(c, ctx)
     end,
   })
   -- The sweep may have settled this child mid-call, and the call knows
-  -- nothing about that, so its result is moot.
+  -- nothing about that, so its result is moot. Unless it came back with
+  -- more than the sweep's bare reason: that partial output is worth
+  -- keeping.
   if TERMINAL[c.status] then
+    if err and c.swept and err ~= c.output then
+      self:settle(c, STATUS.ERROR, err)
+    end
     return
   end
   if err then
@@ -464,12 +475,22 @@ function Batch:run_child(c, ctx)
   end
 end
 
--- Whatever is still non-terminal becomes a cancelled child, so none is
+function Batch:reply()
+  return {
+    llm_output = render_llm(self.children),
+    is_error = self.cancelled,
+    body = self.buf,
+    state = to_state(self.children),
+  }
+end
+
+-- Whatever is still non-terminal becomes a {reason} child, so none is
 -- left dangling, on screen or in the output.
-function Batch:sweep_cancelled()
+function Batch:sweep_cancelled(reason)
   for _, c in ipairs(self.children) do
     if not TERMINAL[c.status] then
-      self:settle(c, STATUS.ERROR, CANCELLED_ERROR)
+      self:settle(c, STATUS.ERROR, reason)
+      c.swept = true
     end
   end
 end
@@ -485,12 +506,19 @@ function Batch:run(ctx)
   end
   -- The cancel reaches neither `call_tool` nor `gather`, so a child parked
   -- in a request would stay drawn as running until the host gives up on
-  -- the whole handler, seconds later.
-  maki.async.on_cancel(function()
-    self:sweep_cancelled()
+  -- the whole handler, seconds later. The finish covers the case where the
+  -- host gives up on us anyway: the model still gets per-child results
+  -- rather than a bare "cancelled".
+  -- The reason is the model's only clue why the children stopped: a
+  -- deadline must not read as an Esc it can never retry its way out of.
+  maki.async.on_cancel(function(reason)
+    self.cancelled = true
+    self.cut_reason = reason
+    self:sweep_cancelled(reason)
+    ctx:finish(self:reply())
   end)
   maki.async.gather(funs)
-  self:sweep_cancelled()
+  self:sweep_cancelled(self.cut_reason or CANCELLED_ERROR)
 end
 
 --- Tool entry points --------------------------------------------------------
@@ -508,11 +536,7 @@ local function handler(input, ctx)
   ctx:live_buf(batch.buf)
   batch:run(ctx)
 
-  return {
-    llm_output = render_llm(children),
-    body = batch.buf,
-    state = to_state(children),
-  }
+  return batch:reply()
 end
 
 -- Last resort: no state, output isn't section-formatted.

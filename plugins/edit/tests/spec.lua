@@ -220,6 +220,7 @@ case("cjk_exact_match", function()
 end)
 
 local replace_lines = require("edit_helpers").replace_lines
+local insert_after = require("edit_helpers").insert_after
 
 case("replace_lines_range_replace_and_delete", function()
   local content = "aaa\nbbb\nccc\nddd\neee\n"
@@ -260,6 +261,24 @@ case("replace_lines_insert_mode", function()
 
   local r4 = replace_lines(content, 2, nil, "")
   eq(r4, "aaa\n\nbbb\nccc\n")
+end)
+
+case("insert_after_mode", function()
+  local content = "aaa\nbbb\nccc\n"
+
+  local r0 = insert_after(content, 0, "TOP")
+  eq(r0, "TOP\naaa\nbbb\nccc\n")
+
+  local r2 = insert_after(content, 2, "XXX\nYYY")
+  eq(r2, "aaa\nbbb\nXXX\nYYY\nccc\n")
+
+  local r3 = insert_after(content, 3, "END")
+  eq(r3, "aaa\nbbb\nccc\nEND\n")
+
+  local _, e1 = insert_after(content, -1, "x")
+  has(e1, "out of range")
+  local _, e2 = insert_after(content, 4, "x")
+  has(e2, "out of range")
 end)
 
 if #failures > 0 then

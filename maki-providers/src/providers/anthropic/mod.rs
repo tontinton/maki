@@ -530,7 +530,7 @@ pub(crate) async fn parse_sse(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ContentBlock, ProviderEvent, Role, StopReason, TokenUsage};
+    use crate::{ContentBlock, EMPTY_RESPONSE_MARKER, ProviderEvent, Role, StopReason, TokenUsage};
     use serde_json::{Value, json};
     use shared::build_wire_messages;
     use std::time::Duration;
@@ -803,53 +803,88 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
         })
     }
 
-    #[test]
-    fn cache_control_placement() {
-        let single = vec![Message::user("only".into())];
-        let wire = build_wire_messages(&single);
-        let json: Value = serde_json::to_value(&wire).unwrap();
-        assert_eq!(
-            json[0]["content"][0]["cache_control"],
-            json!({"type": "ephemeral"})
-        );
+    fn text_block(text: &str) -> ContentBlock {
+        ContentBlock::Text { text: text.into() }
+    }
 
-        let multi = vec![
+    fn thinking_block(thinking: &str) -> ContentBlock {
+        ContentBlock::Thinking {
+            thinking: thinking.into(),
+            signature: None,
+        }
+    }
+
+    fn message(role: Role, content: Vec<ContentBlock>) -> Message {
+        Message {
+            role,
+            content,
+            ..Default::default()
+        }
+    }
+
+    /// `expected` names the (message, block) pairs that should carry a breakpoint.
+    #[test_case(vec![Message::user("only".into())], &[(0, 0)] ; "single_message")]
+    #[test_case(
+        vec![
             Message::user("first".into()),
-            Message {
-                role: Role::Assistant,
-                content: vec![ContentBlock::Text {
-                    text: "reply".into(),
-                }],
-                ..Default::default()
-            },
-            Message {
-                role: Role::User,
-                content: vec![
-                    ContentBlock::ToolResult {
-                        tool_use_id: "t1".into(),
-                        content: "ok".into(),
-                        is_error: false,
-                    },
-                    ContentBlock::Text {
-                        text: "second".into(),
-                    },
-                ],
-                ..Default::default()
-            },
-        ];
-        let wire = build_wire_messages(&multi);
-        let json: Value = serde_json::to_value(&wire).unwrap();
+            message(Role::Assistant, vec![text_block("reply")]),
+            message(Role::User, vec![
+                ContentBlock::ToolResult {
+                    tool_use_id: "t1".into(),
+                    content: "ok".into(),
+                    is_error: false,
+                },
+                text_block("second"),
+            ]),
+        ],
+        &[(1, 0), (2, 1)]
+        ; "last_two_messages_only"
+    )]
+    #[test_case(
+        vec![
+            message(Role::Assistant, vec![
+                thinking_block("hmm"),
+                text_block("reply"),
+                thinking_block("more"),
+            ]),
+            message(Role::Assistant, vec![thinking_block("stalled")]),
+        ],
+        &[(0, 1)]
+        ; "skips_thinking_blocks"
+    )]
+    fn cache_control_placement(messages: Vec<Message>, expected: &[(usize, usize)]) {
+        let json: Value = serde_json::to_value(build_wire_messages(&messages)).unwrap();
 
-        assert!(json[0]["content"][0].get("cache_control").is_none());
-        assert_eq!(
-            json[1]["content"][0]["cache_control"],
-            json!({"type": "ephemeral"})
-        );
-        assert!(json[2]["content"][0].get("cache_control").is_none());
-        assert_eq!(
-            json[2]["content"][1]["cache_control"],
-            json!({"type": "ephemeral"})
-        );
+        let marked: Vec<(usize, usize)> = json
+            .as_array()
+            .unwrap()
+            .iter()
+            .enumerate()
+            .flat_map(|(msg_idx, msg)| {
+                msg["content"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, block)| block["cache_control"] == json!({"type": "ephemeral"}))
+                    .map(move |(block_idx, _)| (msg_idx, block_idx))
+            })
+            .collect();
+        assert_eq!(marked, expected);
+    }
+
+    #[test]
+    fn blank_text_blocks_never_reach_the_wire() {
+        let messages = vec![
+            message(Role::Assistant, vec![text_block(" \n"), text_block("kept")]),
+            message(Role::Assistant, vec![text_block("   ")]),
+        ];
+        let json: Value = serde_json::to_value(build_wire_messages(&messages)).unwrap();
+
+        assert_eq!(json[0]["content"].as_array().unwrap().len(), 1);
+        assert_eq!(json[0]["content"][0]["text"], "kept");
+        assert_eq!(json[1]["content"].as_array().unwrap().len(), 1);
+        assert_eq!(json[1]["content"][0]["text"], EMPTY_RESPONSE_MARKER);
     }
 
     #[test]

@@ -19,11 +19,12 @@ use color_eyre::eyre::{Context, eyre};
 use flume::{Receiver, Sender};
 use maki_agent::headless::{self, InteractiveHandle, InteractiveParams};
 use maki_agent::mcp;
-use maki_agent::permissions::PermissionAnswer;
+use maki_agent::permissions::{PermissionAnswer, PluginRuleStore};
 use maki_agent::prompt::ResolvedSlots;
 use maki_agent::tools::QUESTION_TOOL_NAME;
 use maki_agent::{
-    AgentConfig, AgentEvent, AgentInput, AgentMode, Envelope, PermissionsConfig, ToolOutput,
+    AgentConfig, AgentEvent, AgentInput, AgentMode, DoneReason, Envelope, PermissionsConfig,
+    ToolOutput,
 };
 use maki_config::ModelPolicy;
 use maki_providers::model::Model;
@@ -449,6 +450,7 @@ pub struct SdkParams {
     pub fast: bool,
     pub workflow: bool,
     pub model_policy: Arc<ModelPolicy>,
+    pub plugin_rules: Arc<PluginRuleStore>,
 }
 
 struct Shared {
@@ -469,6 +471,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         fast,
         workflow,
         model_policy,
+        plugin_rules,
     } = params;
     cli.warn_ignored_flags();
     if let Some(max) = cli.max_turns {
@@ -502,6 +505,8 @@ pub fn run(params: SdkParams) -> Result<()> {
         append_system_prompt: cli.append_system_prompt.clone().filter(|s| !s.is_empty()),
         workflow,
         model_policy: Arc::clone(&model_policy),
+        plugin_rules,
+        local_tools: Default::default(),
     });
 
     let (out_tx, out_rx) = flume::unbounded::<String>();
@@ -959,6 +964,7 @@ impl EventPump {
             | AgentEvent::ToolOutput { .. }
             | AgentEvent::ToolDone(_)
             | AgentEvent::QueueItemConsumed { .. }
+            | AgentEvent::QueueDrained
             | AgentEvent::AutoCompacting
             | AgentEvent::CompactionDone
             | AgentEvent::AuthRequired
@@ -1044,10 +1050,12 @@ impl EventPump {
             AgentEvent::Done {
                 usage,
                 num_turns,
-                stop_reason: _,
+                reason,
             } => {
+                // An interrupted run leaves a partial answer, so it is not a success.
+                let is_error = *reason == DoneReason::Cancelled;
                 let result = mem::take(&mut self.result_text);
-                self.emit_turn_result(false, result, *num_turns, *usage)?;
+                self.emit_turn_result(is_error, result, *num_turns, *usage)?;
             }
             AgentEvent::Error { message } => {
                 self.emit_turn_result(true, message.clone(), 0, TokenUsage::default())?;

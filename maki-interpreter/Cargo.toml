@@ -5,9 +5,17 @@ edition.workspace = true
 
 [dependencies]
 monty = { workspace = true }
+monty-types = { workspace = true }
+# Unused directly: pins the transitive version. get-size2 0.10.3 moved to
+# compact_str 0.10, which breaks the GetSize derive in the crates.io
+# ruff_python_ast (still on compact_str 0.9) that monty depends on.
+get-size2 = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
 test-case = { workspace = true }
+
+[package.metadata.cargo-machete]
+ignored = ["get-size2"]

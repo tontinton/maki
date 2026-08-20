@@ -7,6 +7,7 @@ use mlua::{Lua, Table};
 
 use crate::docs::{DocKind, FnDoc, ModuleDoc, api_docs};
 use crate::loader::lib_dir;
+use crate::plugin_permissions::Permission;
 
 const SKILL_MODULE: &str = "plugin_dev";
 const REFERENCE_MODULE: &str = "plugin_dev_reference";
@@ -16,6 +17,46 @@ const DESCRIPTION: &str = "Write or modify maki plugins or init.lua config in Lu
 const REFERENCE_PLACEHOLDER: &str = "__MAKI_REFERENCE_PATH__";
 
 const EXAMPLE: &str = include_str!("../../plugins/glob/init.lua");
+
+const PERMISSIONS_ANCHOR: &str = "plugin-permissions";
+
+/// Generated from [`Permission::ALL`] so the reference can never drift from
+/// the real gate set. `anchored` adds the explicit heading id for the site;
+/// the skill copy stays plain markdown.
+fn permissions_section(anchored: bool) -> String {
+    const TEMPLATE: &str = r#"## Permissions and plugin.toml{ANCHOR}
+
+Sensitive APIs are gated per plugin file; every gated function's entry in
+this reference names the permission it needs. The permissions are: {NAMES}.
+A gated call without its permission raises
+`permission denied: '<name>' not granted for this plugin`.
+
+Grants come from a `plugin.toml` next to the Lua file (for
+`~/.config/maki/init.lua` that is `~/.config/maki/plugin.toml`):
+
+```toml
+[permissions]
+{KEYS}```
+
+The rules:
+
+- No `plugin.toml` at all: every permission is denied, and maki logs a
+  warning at load time.
+- `plugin.toml` exists: permissions default to granted; set a key to
+  `false` to revoke it. An empty file grants everything.
+- Invalid TOML: everything denied, with a warning in the log.
+"#;
+    let keys = Permission::ALL.map(Permission::manifest_key);
+    let anchor = if anchored {
+        format!(" {{#{PERMISSIONS_ANCHOR}}}")
+    } else {
+        String::new()
+    };
+    TEMPLATE
+        .replace("{ANCHOR}", &anchor)
+        .replace("{NAMES}", &keys.map(|k| format!("`{k}`")).join(", "))
+        .replace("{KEYS}", &keys.map(|k| format!("{k} = true\n")).concat())
+}
 
 const GUIDE: &str = r#"# Writing maki plugins
 
@@ -31,6 +72,8 @@ full API reference is at the end of this document.
 
 Either file can call `maki.setup({ ... })` for configuration and register
 tools or commands. There are no separate plugin directories yet.
+
+{PERMISSIONS}
 
 ## Development loop
 
@@ -102,6 +145,8 @@ end
 
 Lua errors are reserved for programmer mistakes, like passing a number where
 a string belongs.
+
+{PERMISSIONS}
 "#;
 
 const COMPACT_HEADER: &str = r#"# Lua API
@@ -126,7 +171,7 @@ const FULL_SOURCE_MAX_BYTES: usize = 1024;
 /// model reads only the sections it needs.
 fn skill_content(reference: &str) -> String {
     format!(
-        "{GUIDE}{EXAMPLE}```\n\n# Full API reference\n\n\
+        "{guide}{EXAMPLE}```\n\n# Full API reference\n\n\
          The complete Lua API reference - every function with parameters, return\n\
          values, and examples, plus shared helper module sources - is on disk at:\n\n\
          `{REFERENCE_PLACEHOLDER}`\n\n\
@@ -136,7 +181,8 @@ fn skill_content(reference: &str) -> String {
          signature or parameter table from the index alone.\n\n\
          Signatures use Neovim notation: `{{path}}` is required, `{{opts?}}` is\n\
          optional, `{{...}}` is variadic.\n{}",
-        reference_index(reference)
+        reference_index(reference),
+        guide = GUIDE.replace("{PERMISSIONS}", permissions_section(false).trim_end()),
     )
 }
 
@@ -435,6 +481,15 @@ fn push_fn(out: &mut String, module: &ModuleDoc, f: &FnDoc, classes: &ClassLinks
         out.push_str(f.desc);
         out.push_str("\n\n");
     }
+    if let Some(guard) = f.guard {
+        if compact {
+            out.push_str(&format!("Requires the `{guard}` plugin permission.\n\n"));
+        } else {
+            out.push_str(&format!(
+                "Requires the `{guard}` [plugin permission](#{PERMISSIONS_ANCHOR}).\n\n"
+            ));
+        }
+    }
     if !f.params.is_empty() {
         out.push_str("**Parameters:**\n\n");
         for p in f.params {
@@ -473,7 +528,11 @@ fn render(compact: bool) -> String {
     } else {
         class_links()
     };
-    let mut out = String::from(if compact { COMPACT_HEADER } else { HEADER });
+    let mut out = if compact {
+        String::from(COMPACT_HEADER)
+    } else {
+        HEADER.replace("{PERMISSIONS}", permissions_section(true).trim_end())
+    };
 
     if !compact {
         out.push_str("\n## Overview\n\n| Module | What it is for |\n| --- | --- |\n");

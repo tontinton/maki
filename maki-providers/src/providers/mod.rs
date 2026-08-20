@@ -12,6 +12,7 @@ use tracing::debug;
 use crate::AgentError;
 
 pub(crate) mod anthropic;
+pub(crate) mod aperture;
 pub(crate) mod catalog;
 pub(crate) mod copilot;
 pub mod custom;
@@ -28,6 +29,7 @@ pub mod opencode;
 pub(crate) mod openrouter;
 pub(crate) mod synthetic;
 pub(crate) mod tensorx;
+pub(crate) mod xai;
 pub(crate) mod zai;
 
 const LOW_SPEED_BYTES_PER_SEC: u32 = 1;

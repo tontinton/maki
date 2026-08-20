@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use maki_config::{
     DefaultEffect, Effect, FILE_WRITE_TOOLS, PermissionRule, PermissionTarget, PermissionsConfig,
@@ -151,6 +151,41 @@ impl PermissionAnswer {
     }
 }
 
+/// Permission rules declared by Lua plugins via
+/// `maki.api.register_permission_rule`, keyed by plugin name. Shared between
+/// the Lua runtime (writer, on plugin load/unload) and every
+/// [`PermissionManager`] (reader).
+#[derive(Default)]
+pub struct PluginRuleStore(Mutex<HashMap<Arc<str>, Vec<PermissionRule>>>);
+
+impl PluginRuleStore {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<Arc<str>, Vec<PermissionRule>>> {
+        self.0.lock().unwrap_or_else(|e| {
+            warn!("plugin rule mutex was poisoned, recovering");
+            e.into_inner()
+        })
+    }
+
+    /// An empty `rules` removes the entry, so a reload that registers
+    /// nothing clears the stale rules.
+    pub fn replace(&self, plugin: &str, rules: Vec<PermissionRule>) {
+        let mut map = self.lock();
+        if rules.is_empty() {
+            map.remove(plugin);
+        } else {
+            map.insert(Arc::from(plugin), rules);
+        }
+    }
+
+    pub fn remove(&self, plugin: &str) {
+        self.lock().remove(plugin);
+    }
+
+    pub fn snapshot(&self) -> Vec<PermissionRule> {
+        self.lock().values().flatten().cloned().collect()
+    }
+}
+
 pub struct PermissionManager {
     session_rules: Mutex<Vec<PermissionRule>>,
     config_rules: Vec<PermissionRule>,
@@ -159,10 +194,15 @@ pub struct PermissionManager {
     default: DefaultEffect,
     tool_defaults: HashMap<ToolKey, DefaultEffect>,
     cwd: PathBuf,
+    plugin_rules: Arc<PluginRuleStore>,
 }
 
 impl PermissionManager {
-    pub fn new(config: PermissionsConfig, cwd: PathBuf) -> Self {
+    pub fn new(
+        config: PermissionsConfig,
+        cwd: PathBuf,
+        plugin_rules: Arc<PluginRuleStore>,
+    ) -> Self {
         let config_rules = config.rules;
         let builtin_rules = builtin_rules(&cwd);
 
@@ -197,6 +237,7 @@ impl PermissionManager {
             default: config.default,
             tool_defaults: config.tool_defaults,
             cwd,
+            plugin_rules,
         }
     }
 
@@ -212,6 +253,7 @@ impl PermissionManager {
             default: self.default,
             tool_defaults: self.tool_defaults.clone(),
             cwd: self.cwd.clone(),
+            plugin_rules: Arc::clone(&self.plugin_rules),
         }
     }
 
@@ -230,6 +272,7 @@ impl PermissionManager {
         plan_path: Option<&Path>,
     ) -> PermissionCheck {
         let session = self.session_rules();
+        let plugin = self.plugin_rules.snapshot();
 
         // Any matching deny wins. No specificity hierarchy — a Wildcard
         // deny blocks everything, a tool-specific deny blocks that tool.
@@ -245,6 +288,7 @@ impl PermissionManager {
                 .iter()
                 .chain(&self.config_rules)
                 .chain(&self.builtin_rules)
+                .chain(&plugin)
             {
                 if !matches_rule(&r.tool, tool) || !rule_matches_scope(r, scope) {
                     continue;
@@ -665,8 +709,20 @@ mod tests {
         }
     }
 
+    fn mgr_with(config: PermissionsConfig, cwd: PathBuf) -> PermissionManager {
+        PermissionManager::new(config, cwd, Arc::default())
+    }
+
     fn default_mgr() -> PermissionManager {
-        PermissionManager::new(PermissionsConfig::default(), PathBuf::from("/tmp"))
+        mgr_with(PermissionsConfig::default(), PathBuf::from("/tmp"))
+    }
+
+    fn plugin_edit_rule(scope: &str, effect: Effect) -> PermissionRule {
+        PermissionRule {
+            tool: ToolKey::native("edit"),
+            scope: Some(scope.into()),
+            effect,
+        }
     }
 
     #[test_case("*", "anything" => true ; "star")]
@@ -687,7 +743,7 @@ mod tests {
     #[test_case(vec!["cd /tmp", "cargo test"], vec!["cd *", "cargo *"], true ; "all_allowed")]
     #[test_case(vec!["cd /tmp", "cargo test"], vec!["cargo *"], false ; "missing_rule")]
     fn compound_check(scopes: Vec<&str>, rules: Vec<&str>, expect_allowed: bool) {
-        let mgr = PermissionManager::new(
+        let mgr = mgr_with(
             make_config(rules.into_iter().map(allow_rule).collect()),
             PathBuf::from("/tmp"),
         );
@@ -697,7 +753,7 @@ mod tests {
 
     #[test]
     fn compound_denied_if_any_segment_denied() {
-        let mgr = PermissionManager::new(
+        let mgr = mgr_with(
             make_config(vec![
                 allow_rule("cd *"),
                 allow_rule("cargo *"),
@@ -718,7 +774,7 @@ mod tests {
 
     #[test]
     fn complex_constructs_force_prompt_even_with_allow_star() {
-        let mgr = PermissionManager::new(make_config(vec![allow_rule("*")]), PathBuf::from("/tmp"));
+        let mgr = mgr_with(make_config(vec![allow_rule("*")]), PathBuf::from("/tmp"));
         assert!(matches!(
             mgr.check_multi(&ToolKey::native("bash"), &["echo $(whoami)"], true, None),
             PermissionCheck::NeedsPrompt { .. }
@@ -809,7 +865,7 @@ mod tests {
 
     #[test]
     fn session_rule_overrides_config() {
-        let mgr = PermissionManager::new(
+        let mgr = mgr_with(
             make_config(vec![allow_rule("cargo *")]),
             PathBuf::from("/tmp"),
         );
@@ -822,7 +878,7 @@ mod tests {
 
     #[test]
     fn deny_overrides_default_allow() {
-        let mgr = PermissionManager::new(
+        let mgr = mgr_with(
             PermissionsConfig {
                 default: DefaultEffect::Allow,
                 rules: vec![deny_rule("rm *")],
@@ -873,7 +929,7 @@ mod tests {
     #[test]
     fn boundary_inside_proceeds() {
         let tmp = std::env::temp_dir();
-        let mgr = PermissionManager::new(PermissionsConfig::default(), tmp.clone());
+        let mgr = mgr_with(PermissionsConfig::default(), tmp.clone());
         assert!(
             mgr.boundary_block_reason(&tmp.join("some_file.txt"))
                 .is_none()
@@ -883,7 +939,7 @@ mod tests {
     #[test]
     fn boundary_outside_proceeds_via_prompt() {
         let tmp = std::env::temp_dir();
-        let mgr = PermissionManager::new(PermissionsConfig::default(), tmp);
+        let mgr = mgr_with(PermissionsConfig::default(), tmp);
         #[cfg(unix)]
         let outside = Path::new("/etc/hosts");
         #[cfg(windows)]
@@ -912,7 +968,7 @@ mod tests {
             .join("..")
             .join("Windows")
             .join("System32");
-        let mgr = PermissionManager::new(PermissionsConfig::default(), sub.clone());
+        let mgr = mgr_with(PermissionsConfig::default(), sub.clone());
         assert!(
             mgr.boundary_block_reason(&attack).is_none(),
             "outside-cwd dotdot path should prompt, not hard-block: {}",
@@ -935,7 +991,7 @@ mod tests {
         let _ = std::os::unix::fs::symlink(&tmp, &link);
 
         let attack = link.join("..").join("escape_target");
-        let mgr = PermissionManager::new(PermissionsConfig::default(), project.clone());
+        let mgr = mgr_with(PermissionsConfig::default(), project.clone());
         assert!(
             mgr.boundary_block_reason(&attack).is_none(),
             "outside-boundary edits are gated by the prompt, not hard-blocked: {}",
@@ -948,7 +1004,7 @@ mod tests {
     fn boundary_nonexistent_cwd_proceeds_via_lexical_tail() {
         let missing = std::env::temp_dir().join("__maki_test_absent_cwd_xyz");
         let _ = std::fs::remove_dir_all(&missing);
-        let mgr = PermissionManager::new(PermissionsConfig::default(), missing.clone());
+        let mgr = mgr_with(PermissionsConfig::default(), missing.clone());
         assert!(
             mgr.boundary_block_reason(&missing.join("file.txt"))
                 .is_none()
@@ -970,7 +1026,7 @@ mod tests {
 
     #[test]
     fn check_multi_force_prompt_skips_allow_rules() {
-        let mgr = PermissionManager::new(
+        let mgr = mgr_with(
             make_config(vec![allow_rule("cargo *"), allow_rule("git *")]),
             PathBuf::from("/tmp"),
         );
@@ -1003,8 +1059,7 @@ mod tests {
 
     #[test]
     fn check_multi_deny_wins_over_force_prompt() {
-        let mgr =
-            PermissionManager::new(make_config(vec![deny_rule("rm *")]), PathBuf::from("/tmp"));
+        let mgr = mgr_with(make_config(vec![deny_rule("rm *")]), PathBuf::from("/tmp"));
         assert!(matches!(
             mgr.check_multi(&ToolKey::native("bash"), &["rm -rf /"], true, None),
             PermissionCheck::Denied
@@ -1013,7 +1068,7 @@ mod tests {
 
     #[test]
     fn check_multi_partial_coverage_prompts_uncovered() {
-        let mgr = PermissionManager::new(
+        let mgr = mgr_with(
             make_config(vec![allow_rule("cargo *")]),
             PathBuf::from("/tmp"),
         );
@@ -1145,7 +1200,7 @@ mod tests {
 
     #[test]
     fn deny_rule_with_none_scope_blocks_everything() {
-        let mgr = PermissionManager::new(
+        let mgr = mgr_with(
             make_config(vec![PermissionRule {
                 tool: ToolKey::native("bash"),
                 scope: None,
@@ -1161,7 +1216,7 @@ mod tests {
 
     #[test]
     fn wildcard_deny_blocks_all_tools() {
-        let mgr = PermissionManager::new(
+        let mgr = mgr_with(
             make_config(vec![PermissionRule {
                 tool: ToolKey::Wildcard,
                 scope: None,
@@ -1182,7 +1237,7 @@ mod tests {
 
     #[test]
     fn mcp_deny_always_blocks_all_arguments() {
-        let mgr = PermissionManager::new(make_config(vec![]), PathBuf::from("/tmp"));
+        let mgr = mgr_with(make_config(vec![]), PathBuf::from("/tmp"));
         let tool = ToolKey::McpTool {
             server: "deepwiki".into(),
             tool: "search".into(),
@@ -1207,8 +1262,7 @@ mod tests {
 
     #[test]
     fn yolo_mode_allows_but_deny_still_blocks() {
-        let mgr =
-            PermissionManager::new(make_config(vec![deny_rule("rm *")]), PathBuf::from("/tmp"));
+        let mgr = mgr_with(make_config(vec![deny_rule("rm *")]), PathBuf::from("/tmp"));
         mgr.toggle_yolo();
         assert!(mgr.is_yolo());
         assert!(matches!(
@@ -1241,7 +1295,7 @@ mod tests {
 
     #[test]
     fn default_deny_blocks_unmatched() {
-        let mgr = PermissionManager::new(
+        let mgr = mgr_with(
             PermissionsConfig {
                 default: DefaultEffect::Deny,
                 ..Default::default()
@@ -1256,7 +1310,7 @@ mod tests {
 
     #[test]
     fn default_deny_with_allow_rules() {
-        let mgr = PermissionManager::new(
+        let mgr = mgr_with(
             PermissionsConfig {
                 default: DefaultEffect::Deny,
                 rules: vec![allow_rule("cargo *")],
@@ -1276,7 +1330,7 @@ mod tests {
 
     #[test]
     fn default_allow_allows_unmatched() {
-        let mgr = PermissionManager::new(
+        let mgr = mgr_with(
             PermissionsConfig {
                 default: DefaultEffect::Allow,
                 ..Default::default()
@@ -1291,7 +1345,7 @@ mod tests {
 
     #[test]
     fn default_prompt_is_default_behavior() {
-        let mgr = PermissionManager::new(PermissionsConfig::default(), PathBuf::from("/tmp"));
+        let mgr = mgr_with(PermissionsConfig::default(), PathBuf::from("/tmp"));
         assert!(matches!(
             mgr.check(&ToolKey::native("bash"), "cargo test", None),
             PermissionCheck::NeedsPrompt { .. }
@@ -1300,7 +1354,7 @@ mod tests {
 
     #[test]
     fn mcp_server_wildcard_matches_all_server_tools() {
-        let mgr = PermissionManager::new(
+        let mgr = mgr_with(
             make_config(vec![PermissionRule {
                 tool: ToolKey::McpServer {
                     server: "deepwiki".into(),
@@ -1336,7 +1390,7 @@ mod tests {
 
     #[test]
     fn mcp_server_wildcard_does_not_match_other_server() {
-        let mgr = PermissionManager::new(
+        let mgr = mgr_with(
             make_config(vec![PermissionRule {
                 tool: ToolKey::McpServer {
                     server: "deepwiki".into(),
@@ -1361,7 +1415,7 @@ mod tests {
 
     #[test]
     fn per_tool_default_overrides_global() {
-        let mgr = PermissionManager::new(
+        let mgr = mgr_with(
             PermissionsConfig {
                 default: DefaultEffect::Deny,
                 tool_defaults: HashMap::from([(ToolKey::native("bash"), DefaultEffect::Allow)]),
@@ -1394,6 +1448,39 @@ mod tests {
             ),
             expect_allowed,
         );
+    }
+
+    #[test]
+    fn plugin_rules_apply_to_manager_and_forks() {
+        let store = Arc::new(PluginRuleStore::default());
+        let mgr = PermissionManager::new(
+            PermissionsConfig::default(),
+            PathBuf::from("/tmp"),
+            Arc::clone(&store),
+        );
+        let fork = mgr.fork();
+        store.replace("memory", vec![plugin_edit_rule("/x/**", Effect::Allow)]);
+        for m in [&mgr, &fork] {
+            assert!(matches!(
+                m.check(&ToolKey::native("edit"), "/x/f", None),
+                PermissionCheck::Allowed
+            ));
+        }
+    }
+
+    #[test]
+    fn config_deny_beats_plugin_allow() {
+        let store = Arc::new(PluginRuleStore::default());
+        store.replace("memory", vec![plugin_edit_rule("/x/**", Effect::Allow)]);
+        let mgr = PermissionManager::new(
+            make_config(vec![plugin_edit_rule("/x/**", Effect::Deny)]),
+            PathBuf::from("/tmp"),
+            store,
+        );
+        assert!(matches!(
+            mgr.check(&ToolKey::native("edit"), "/x/f", None),
+            PermissionCheck::Denied
+        ));
     }
 
     #[test]

@@ -3,7 +3,7 @@ use maki_ui::keybindings::{ALT_SEP, KEYBINDS, KeyLabel, KeybindContext, Platform
 const FRONTMATTER: &str = "\
 +++
 title = \"Keybindings\"
-weight = 5
+weight = 9
 [extra]
 group = \"Reference\"
 +++";
@@ -13,6 +13,9 @@ const LUA_CONTEXT_BINDS: &[(&str, &str, &str)] = &[
     ("Session Picker", "`Ctrl+R`", "Rename session"),
     ("Session Picker", "`Ctrl+D`", "Delete session (press twice)"),
 ];
+
+// Built-in plugins own these globally, so they never reach `KEYBINDS`.
+const PLUGIN_BINDS: &[(&str, &str)] = &[("`Ctrl+P`", "Browse sessions")];
 
 const MAIN_CONTEXTS: &[KeybindContext] = &[
     KeybindContext::General,
@@ -97,6 +100,15 @@ fn write_context_specific(out: &mut String) {
     }
 }
 
+fn write_plugin_binds(out: &mut String) {
+    out.push_str("\n## Plugins\n\n");
+    out.push_str("Built-in plugins register these themselves, and your own plugins can add more with `maki.keymap.set`:\n\n");
+    out.push_str("| Key | Action |\n|-----|--------|\n");
+    for (key, desc) in PLUGIN_BINDS {
+        out.push_str(&format!("| {key} | {desc} |\n"));
+    }
+}
+
 fn write_inheritance(out: &mut String) {
     let children: Vec<_> = all_contexts()
         .filter(|ctx| ctx.parent().is_some())
@@ -138,6 +150,7 @@ pub fn generate() -> String {
     }
 
     write_context_specific(&mut out);
+    write_plugin_binds(&mut out);
     write_inheritance(&mut out);
     write_overrides(&mut out);
 

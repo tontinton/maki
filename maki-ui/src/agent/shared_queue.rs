@@ -174,6 +174,15 @@ impl QueueReceiver {
         lock(&self.items).pop_front()
     }
 
+    /// Runs `publish` under the queue lock, so a drain event can never
+    /// interleave with a concurrent push.
+    pub(crate) fn publish_if_empty(&self, publish: impl FnOnce()) {
+        let items = lock(&self.items);
+        if items.is_empty() {
+            publish();
+        }
+    }
+
     pub(crate) async fn recv_notify(&self) -> Result<(), flume::RecvError> {
         self.notify_rx.recv_async().await
     }
@@ -187,6 +196,10 @@ impl InterruptSource for QueueReceiver {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+    use std::sync::Barrier;
+    use std::thread;
+
     use super::*;
     use test_case::test_case;
 
@@ -218,5 +231,37 @@ mod tests {
         let expected = usize::from(visible);
         assert_eq!(tx.panel_len(), expected);
         assert_eq!(tx.panel_entries().len(), expected);
+    }
+
+    #[test]
+    fn nonempty_queue_does_not_publish_drain() {
+        let (tx, rx) = queue();
+        tx.push(msg(false));
+        let called = Cell::new(false);
+
+        rx.publish_if_empty(|| called.set(true));
+        assert!(!called.get());
+    }
+
+    #[test]
+    fn drain_publication_is_serialized_with_push() {
+        let (tx, rx) = queue();
+        let barrier = Arc::new(Barrier::new(2));
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let worker_barrier = Arc::clone(&barrier);
+        let worker_order = Arc::clone(&order);
+        let worker = thread::spawn(move || {
+            worker_barrier.wait();
+            tx.push(msg(false));
+            lock(&worker_order).push("push");
+        });
+
+        rx.publish_if_empty(|| {
+            barrier.wait();
+            lock(&order).push("drain");
+        });
+        worker.join().unwrap();
+
+        assert_eq!(*lock(&order), ["drain", "push"]);
     }
 }

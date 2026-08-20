@@ -1,3 +1,4 @@
+use maki_providers::Effort;
 use maki_providers::manifest::ManifestRegistry;
 use maki_providers::model::{ModelEntry, ModelTier};
 use maki_providers::provider::ProviderKind;
@@ -6,7 +7,7 @@ use strum::IntoEnumIterator;
 
 const FRONT_MATTER: &str = r#"+++
 title = "Providers"
-weight = 7
+weight = 5
 [extra]
 group = "Reference"
 +++"#;
@@ -27,7 +28,7 @@ Every provider honors a `<SLUG>_BASE_URL` env var (`anthropic` -> `ANTHROPIC_BAS
 ANTHROPIC_BASE_URL=https://my-proxy.internal maki
 ```
 
-It wins over `providers.toml` and built-in defaults. `ANTHROPIC_BASE_URL` and `OPENAI_BASE_URL` are the same names the official SDKs use, so an existing proxy setup carries over as is. One exception: `OPENAI_BASE_URL` only redirects the platform API, never the ChatGPT Coding Plan backend.
+It wins over `providers.toml` and built-in defaults. `ANTHROPIC_BASE_URL` and `OPENAI_BASE_URL` are the same names the official SDKs use, so an existing proxy setup carries over as is. Two exceptions: `OPENAI_BASE_URL` only redirects the platform API, never the ChatGPT Coding Plan backend; `XAI_BASE_URL` only redirects the public API-key endpoint, never the OAuth CLI proxy.
 
 You can also set `base_url` for a built-in provider in `~/.config/maki/providers.toml`. It overrides the built-in default and loses to the env var above:
 
@@ -55,6 +56,10 @@ You will need `AWS_REGION` and one of the following for auth:
 
 You can override the model with `ANTHROPIC_MODEL` and the endpoint with `ANTHROPIC_BEDROCK_BASE_URL`. These env var names match Claude Code, so if you were already using Bedrock there, the same setup works here."#;
 
+const XAI_OAUTH_NOTE: &str = r#"OAuth uses the same first-party xAI client as the official Grok CLI (`maki auth login xai`). Browser login (PKCE) is the desktop default; device code is recommended over SSH or in a container. Tokens refresh automatically. After login, Maki fetches your account catalog from `GET /v1/models-v2` on the Grok CLI proxy and caches it for 15 minutes. `XAI_BASE_URL` only redirects the public API-key endpoint, never the OAuth proxy.
+
+If `~/.grok/auth.json` already exists, login offers to reuse it without writing that file."#;
+
 const OPENCODE_FREE_MODELS_NOTE: &str = r#"By default Maki hides free models from the Opencode catalog. To list free models (they use a public fallback, no API key needed), add this to `~/.config/maki/providers.toml`:
 
 ```toml
@@ -80,6 +85,7 @@ Models are referenced as `provider/model_id`:
 ```
 anthropic/claude-sonnet-4-6
 openai/gpt-4.1
+xai/grok-4.6
 zai/glm-4.7
 ```
 
@@ -195,6 +201,7 @@ supports_vision = false
 | `discover_models` | bool | When true, also probe the provider's model list endpoint (default false) |
 | `enable_free_models` | bool | Opencode only. Show free catalog models (default false) |
 | `models` | array | Declared models for custom providers (see below) |
+| `overrides` | table | Aperture only. Per-upstream model overrides (see below) |
 
 ### Model fields
 
@@ -216,6 +223,25 @@ Custom slugs must not reuse a built-in provider name. A bad TOML parse exits wit
 
 You can also create a custom provider interactively with `maki auth login` and choosing the custom option. That writes a starter entry to this file.
 
+### Aperture overrides
+
+Aperture proxies upstream providers, exposing each model as `aperture/<upstream>/<model>`. Overrides keyed by upstream provider id live under `[aperture.overrides]`:
+
+```toml
+[aperture.overrides.llmserver]
+base = "llama-cpp"
+context_window = 131072
+max_output_tokens = 16384
+
+[aperture.overrides.llmserver.models."qwen-3.6"]
+context_window = 262144
+supports_vision = true
+```
+
+Provider-level fields apply to every model from that upstream; per-model entries under `models` win field by field. Fields: `context_window`, `max_output_tokens`, `supports_thinking`, `supports_vision`, `base` (remaps an opaque vendor to a native provider; e.g. `llama-cpp`, `google`, `anthropic`), and `path_prefix`. Model ids containing dots must be quoted (`"qwen3.6"`) since TOML treats a bare dotted key as a nested table.
+
+Maki sends `/v1` (or `/v1beta` for Gemini routes), and Aperture appends that path to the upstream's base url. If an upstream base url already carries its own path, set `path_prefix = ""` for it to avoid a doubled path.
+
 ### Plans
 
 {plans_body}"#
@@ -224,6 +250,7 @@ You can also create a custom provider interactively with `maki auth login` and c
 
 fn dynamic_providers_section() -> String {
     let valid_values: Vec<String> = ProviderKind::iter().map(|k| format!("`{k}`")).collect();
+    let efforts: Vec<String> = Effort::ALL.iter().map(|e| format!("`{e}`")).collect();
 
     format!(
         r#"## Dynamic Providers
@@ -251,6 +278,35 @@ If your provider serves models not in the base catalog, add a `models` subcomman
 
 Only `id` is required. Optional fields: `tier` (default `medium`), `context_window` (128K), `max_output_tokens` (16K), `pricing` (`{{input, output, cache_write, cache_read}}`, all per 1M tokens), `supports_tool_examples` (defaults to the base provider's setting), `supports_thinking` (defaults to the base provider's setting), `requires_thinking` (default false; for APIs that reject requests with thinking off, raises it to minimal effort and implies `supports_thinking`), `supports_vision` (defaults to the base provider's setting; when false, image input and the `view_image` tool are disabled). The first model listed per tier is used for sub-agents. Without this subcommand, the base provider's models are used.
 
+A `llama-cpp` model can replace Maki's token-budget mapping with its native thinking fields. Each thinking mode maps to a JSON fragment merged into the request body:
+
+```json
+[{{
+  "id": "reasoning-model",
+  "supports_thinking": true,
+  "thinking_fields": {{
+    "off": {{"reasoning_effort": "none"}},
+    "adaptive": {{"reasoning_effort": "medium"}},
+    "low": {{"reasoning_effort": "low"}},
+    "medium": {{"reasoning_effort": "medium"}},
+    "xhigh": {{"reasoning_effort": "xhigh"}}
+  }}
+}}]
+```
+
+`off` is used when thinking is off, `adaptive` when thinking is on without a chosen level. Any other key is an effort level, one of {}. The levels you declare are the ones the model accepts: whatever you ask for snaps into them, downwards first, so a level the model never advertised is never sent. Every part is optional.
+
+Fragments are merged into the body, so nesting works too. A template toggle is just a fragment:
+
+```json
+"thinking_fields": {{
+  "off": {{"chat_template_kwargs": {{"enable_thinking": false}}}},
+  "adaptive": {{"chat_template_kwargs": {{"enable_thinking": true}}}}
+}}
+```
+
+Named modes send only these fields, no token budget. An explicit `/thinking <budget>` snaps into the levels you declared; a model that declares none gets the `adaptive` fragment plus `thinking_budget_tokens`. Any mode you left undeclared falls back to the usual `thinking_budget_tokens` mapping, so no request ever ends up saying nothing. Models without `thinking_fields` keep the existing llama.cpp behavior.
+
 Dynamic provider models are namespaced as `{{slug}}/{{model_id}}` (e.g. `myproxy/claude-sonnet-4-6`).
 
 ### Script Name Rules
@@ -260,6 +316,7 @@ Dynamic provider models are namespaced as `{{slug}}/{{model_id}}` (e.g. `myproxy
 - Can't reuse a built-in provider's slug
 - Must be executable"#,
         valid_values.join(", "),
+        efforts.join(", "),
     )
 }
 
@@ -297,6 +354,8 @@ fn format_auth(kind: ProviderKind) -> String {
     let env = kind.api_key_env();
     if kind == ProviderKind::Ollama {
         format!("`OLLAMA_HOST` for local/remote (e.g. `http://localhost:11434`), `{env}` for auth")
+    } else if kind == ProviderKind::Aperture {
+        "`APERTURE_HOST` (e.g. `https://your-host.tailnet.ts.net`)".into()
     } else {
         format!("`{env}`")
     }
@@ -329,6 +388,19 @@ fn build_sections() -> Vec<ProviderSection> {
                     name: kind.display_name(),
                     auth_line: format!("{} (also supports OAuth device flow)", format_auth(kind)),
                     urls: vec![kind.base_url()],
+                    features: kind.features(),
+                    entries: ManifestRegistry::get(&kind.to_string()).unwrap().models,
+                });
+            }
+            ProviderKind::Xai => {
+                sections.push(ProviderSection {
+                    kind,
+                    name: kind.display_name(),
+                    auth_line: format!(
+                        "{} (also supports OAuth via `maki auth login xai`)",
+                        format_auth(kind)
+                    ),
+                    urls: vec![kind.base_url(), "https://cli-chat-proxy.grok.com/v1"],
                     features: kind.features(),
                     entries: ManifestRegistry::get(&kind.to_string()).unwrap().models,
                 });
@@ -422,6 +494,10 @@ fn no_catalog_note(kind: ProviderKind) -> &'static str {
             "Connects to any OpenAI-compatible `/v1` endpoint. Point `LLAMA_CPP_HOST` \
              to your server address (defaults to `http://localhost:8080`)."
         }
+        ProviderKind::Aperture => {
+            "Aperture discovers models from your gateway. Set `APERTURE_HOST` to your Tailscale Aperture \
+             endpoint (e.g. `https://your-host.tailnet.ts.net`). No API key needed, Tailscale handles auth."
+        }
         ProviderKind::OpenRouter => {
             "OpenRouter aggregates models from many providers behind a single API key. \
              Browse available models at [openrouter.ai/models](https://openrouter.ai/models). \
@@ -463,6 +539,10 @@ fn write_section(out: &mut String, section: &ProviderSection) {
 
     if section.kind == ProviderKind::Opencode {
         let _ = writeln!(out, "\n{OPENCODE_FREE_MODELS_NOTE}");
+    }
+
+    if section.kind == ProviderKind::Xai {
+        let _ = writeln!(out, "\n{XAI_OAUTH_NOTE}");
     }
 }
 

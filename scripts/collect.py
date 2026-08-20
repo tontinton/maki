@@ -9,7 +9,6 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-
 AGENTS = ("maki", "claude-code", "opencode")
 
 PER_MILLION = 1_000_000
@@ -71,7 +70,7 @@ _active_agent = ""
 
 
 def _ts():
-    return datetime.now().strftime("%H:%M:%S")
+    return datetime.now(timezone.utc).astimezone().strftime("%H:%M:%S")
 
 
 def _log(msg):

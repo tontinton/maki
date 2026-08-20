@@ -49,6 +49,7 @@ use crate::components::{
     Action, DisplayMessage, DisplayRole, ExitRequest, Overlay, RetryInfo, Status, is_ctrl,
 };
 use crate::image;
+use crate::repaint::{Cadence, Dirty, Watch};
 use crate::selection::{SelectionState, SelectionZone, ZoneRegistry};
 use arc_swap::{ArcSwap, ArcSwapOption};
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
@@ -58,8 +59,10 @@ use maki_agent::{
     SharedMessages, SubagentInfo,
 };
 use maki_config::{ModelPolicy, UiConfig};
-use maki_lua::{EventHandle, HintReader, KeymapReader, LuaCommandReader, WinView};
-use maki_providers::{Model, ThinkingConfig, add_cost};
+use maki_lua::{
+    BuiltinAction, EventHandle, HintReader, HintSnapshot, KeymapReader, LuaCommandReader, WinView,
+};
+use maki_providers::{ContentBlock, Message, Model, ThinkingConfig, add_cost};
 use maki_storage::StateDir;
 use maki_storage::input_history::InputHistory;
 use maki_storage::model::persist_model;
@@ -95,6 +98,13 @@ const IMPLEMENT_PARALLEL_HINT: &str = "Use batch+task to parallelize, assign eac
 
 const TASK_DONE_DETAIL: &str = "✓ ";
 const MISSING_TOOL_COMPLETION: &str = "Tool did not report completion before the turn ended";
+const NOTIFICATION_PREVIEW_CHARS: usize = 200;
+
+/// Depth budget for `maki.api.run_command` chains. Aliases nest a level or two
+/// in practice; the cap only exists so a command aliasing itself reports an
+/// error instead of ping-ponging with the Lua thread forever.
+pub(crate) const MAX_COMMAND_DEPTH: u8 = 8;
+pub(crate) const COMMAND_DEPTH_MSG: &str = "slash command nested too deeply (alias cycle?)";
 
 #[derive(Clone)]
 pub(super) struct TaskEntry {
@@ -113,6 +123,73 @@ impl PickerItem for TaskEntry {
     fn is_spinning(&self) -> bool {
         matches!(self.finished, Some(false))
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Notification {
+    TurnComplete { response: Option<String> },
+    PermissionRequested { tool: Option<String> },
+    AuthenticationRequired,
+    QuestionRequested,
+    PlanReady,
+}
+
+impl Notification {
+    /// Prompts blocking the agent outrank turn completions.
+    pub(crate) fn is_urgent(&self) -> bool {
+        !matches!(self, Self::TurnComplete { .. })
+    }
+
+    pub(crate) fn message(&self) -> String {
+        match self {
+            Self::TurnComplete { response } => response
+                .clone()
+                .unwrap_or_else(|| "Agent turn complete".into()),
+            Self::PermissionRequested { tool: Some(tool) } => {
+                format!("Permission requested: {tool}")
+            }
+            Self::PermissionRequested { tool: None } => "Permission requested".into(),
+            Self::AuthenticationRequired => "Authentication required".into(),
+            Self::QuestionRequested => "Question requested".into(),
+            Self::PlanReady => "Plan ready".into(),
+        }
+    }
+
+    pub(crate) fn error_completion() -> Self {
+        Self::TurnComplete {
+            response: Some("Agent stopped with an error".into()),
+        }
+    }
+}
+
+/// Lazy, so a huge response only costs the first `NOTIFICATION_PREVIEW_CHARS`
+/// characters.
+fn notification_preview<'a>(chunks: impl Iterator<Item = &'a str>) -> Option<String> {
+    let mut preview: String = chunks
+        .flat_map(str::split_whitespace)
+        .enumerate()
+        .flat_map(|(i, word)| (i > 0).then_some(' ').into_iter().chain(word.chars()))
+        .take(NOTIFICATION_PREVIEW_CHARS)
+        .collect();
+    if preview.ends_with(' ') {
+        preview.pop();
+    }
+    (!preview.is_empty()).then_some(preview)
+}
+
+fn normalize_preview(text: &str) -> Option<String> {
+    notification_preview(std::iter::once(text))
+}
+
+pub(crate) fn turn_response(message: &Message) -> Option<String> {
+    if message.has_tool_calls() {
+        return None;
+    }
+
+    notification_preview(message.content.iter().filter_map(|block| match block {
+        ContentBlock::Text { text } => Some(text.as_str()),
+        _ => None,
+    }))
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -184,6 +261,7 @@ pub struct App {
     pub(crate) lua_event_handle: EventHandle,
     pub(super) keymap_reader: KeymapReader,
     pub(super) hint_reader: HintReader,
+    hints: Watch<HintSnapshot>,
     pub(crate) restore_event_tx: Option<maki_agent::EventSender>,
     pub(super) restoring: Arc<AtomicBool>,
     subagent_answers: HashMap<String, flume::Sender<String>>,
@@ -274,6 +352,7 @@ impl App {
             permissions,
             model_policy: Arc::clone(&model_policy),
             lua_event_handle,
+            hints: Watch::seeded(hint_reader.load_full()),
             keymap_reader,
             hint_reader,
             restore_event_tx: None,
@@ -328,10 +407,12 @@ impl App {
         self.lua_event_handle.fire_autocmd(event, data);
     }
 
-    pub fn tick_error_expiry(&mut self) {
-        if self.status.is_error_expired() {
-            self.status = Status::Idle;
+    pub fn tick_error_expiry(&mut self) -> Dirty {
+        if !self.status.is_error_expired() {
+            return Dirty::NO;
         }
+        self.status = Status::Idle;
+        Dirty::YES
     }
 
     fn active_chat(&mut self) -> &mut Chat {
@@ -495,20 +576,10 @@ impl App {
             });
         }
         if key::HELP.matches(key) {
-            self.help_modal.toggle();
-            return Some(vec![]);
+            return Some(self.run_builtin(BuiltinAction::Help));
         }
         if key::TASKS.matches(key) {
-            self.open_tasks();
-            return Some(vec![]);
-        }
-        if key::PREV_CHAT.matches(key) {
-            self.active_chat = self.active_chat.saturating_sub(1);
-            return Some(vec![]);
-        }
-        if key::NEXT_CHAT.matches(key) {
-            self.active_chat = (self.active_chat + 1).min(self.chats.len() - 1);
-            return Some(vec![]);
+            return Some(self.run_builtin(BuiltinAction::Tasks));
         }
         if key::SCROLL_HALF_UP.matches(key) {
             let half = self.chats[self.active_chat].half_page();
@@ -713,15 +784,66 @@ impl App {
             });
         }
 
-        if key::PLAN_TOGGLE.matches(key)
-            && self.state.mode == Mode::Plan
-            && self.state.plan.is_ready()
-        {
-            self.plan_form.toggle();
-            return Some(vec![]);
+        if key::PLAN_TOGGLE.matches(key) && self.plan_toggle_ready() {
+            return Some(self.run_builtin(BuiltinAction::PlanToggle));
         }
 
         None
+    }
+
+    fn plan_toggle_ready(&self) -> bool {
+        self.state.mode == Mode::Plan && self.state.plan.is_ready()
+    }
+
+    /// Single implementation behind both the default keybindings and
+    /// `maki.ui.action`, so a Lua rebind can never drift from the
+    /// original key's behavior.
+    pub(crate) fn run_builtin(&mut self, action: BuiltinAction) -> Vec<Action> {
+        match action {
+            BuiltinAction::FilePicker => {
+                self.file_picker.open(&self.state.session.cwd);
+            }
+            BuiltinAction::Search => {
+                let top = self.chats[self.active_chat].scroll_top();
+                let auto = self.chats[self.active_chat].auto_scroll();
+                self.search_modal.open(top, auto);
+            }
+            BuiltinAction::Tasks => {
+                if self.task_picker.is_open() {
+                    self.task_picker.close();
+                } else {
+                    self.open_tasks();
+                }
+            }
+            BuiltinAction::Help => self.help_modal.toggle(),
+            BuiltinAction::PlanToggle => {
+                if self.plan_toggle_ready() {
+                    self.plan_form.toggle();
+                }
+            }
+            BuiltinAction::PlanEditor => {
+                return match self.state.plan.path() {
+                    Some(p) => vec![Action::OpenEditor(p.to_path_buf())],
+                    None => {
+                        self.flash(FLASH_NO_PLAN.into());
+                        vec![]
+                    }
+                };
+            }
+            BuiltinAction::EditInput => return vec![Action::EditInputInEditor],
+            BuiltinAction::PopQueue => {
+                self.queue.remove(0);
+            }
+            BuiltinAction::PrevChat => self.active_chat = self.active_chat.saturating_sub(1),
+            BuiltinAction::NextChat => {
+                self.active_chat = (self.active_chat + 1).min(self.chats.len() - 1);
+            }
+            BuiltinAction::ModelPicker => {
+                self.model_picker.open(&self.state.model.spec());
+                return vec![Action::RefreshModels];
+            }
+        }
+        vec![]
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Vec<Action> {
@@ -781,25 +903,20 @@ impl App {
 
     fn handle_main_chat_key(&mut self, key: KeyEvent) -> Vec<Action> {
         if key::EDIT_INPUT.matches(key) {
-            return vec![Action::EditInputInEditor];
+            return self.run_builtin(BuiltinAction::EditInput);
+        }
+        if key::MODEL_PICKER.matches(key) {
+            return self.run_builtin(BuiltinAction::ModelPicker);
         }
         if is_ctrl(&key) {
             if key::POP_QUEUE.matches(key) {
-                self.queue.remove(0);
+                return self.run_builtin(BuiltinAction::PopQueue);
             } else if key::OPEN_EDITOR.matches(key) {
-                return match self.state.plan.path() {
-                    Some(p) => vec![Action::OpenEditor(p.to_path_buf())],
-                    None => {
-                        self.flash(FLASH_NO_PLAN.into());
-                        vec![]
-                    }
-                };
+                return self.run_builtin(BuiltinAction::PlanEditor);
             } else if key::SEARCH.matches(key) {
-                let top = self.chats[self.active_chat].scroll_top();
-                let auto = self.chats[self.active_chat].auto_scroll();
-                self.search_modal.open(top, auto);
+                return self.run_builtin(BuiltinAction::Search);
             } else if key::FILE_PICKER.matches(key) {
-                self.file_picker.open(&self.state.session.cwd);
+                return self.run_builtin(BuiltinAction::FilePicker);
             } else if key.code == KeyCode::Char('v') && self.image_paste_rx.is_empty() {
                 self.start_image_paste();
             } else if let InputAction::PaletteSync(val) = self.input_box.handle_key(key) {
@@ -813,7 +930,10 @@ impl App {
             .handle_key(key, &self.input_box.buffer.value())
         {
             CommandAction::Consumed => return vec![],
-            CommandAction::Execute(cmd) => return self.execute_command(cmd),
+            CommandAction::Execute(cmd) => {
+                self.input_box.discard();
+                return self.execute_command(cmd, 0);
+            }
             CommandAction::Complete(text) => {
                 self.command_palette.sync(&text);
                 self.input_box.set_input(text);
@@ -880,7 +1000,11 @@ impl App {
     fn quit_with(&mut self, req: ExitRequest) -> Vec<Action> {
         self.save_input_history();
         self.exit_request = req;
-        vec![]
+        vec![Action::ManualExit]
+    }
+
+    pub(crate) fn clear_exit_request(&mut self) {
+        self.exit_request = ExitRequest::None;
     }
 
     pub(crate) fn handle_submit(&mut self, sub: Submission) -> Vec<Action> {
@@ -1203,8 +1327,33 @@ impl App {
         idx
     }
 
-    fn execute_command(&mut self, cmd: ParsedCommand) -> Vec<Action> {
-        self.input_box.discard();
+    /// Entry point for `maki.api.run_command`: splits a command line into the
+    /// name and args the input bar would hand over, leading slash optional.
+    /// `Err` means nothing ran at all, so the Lua caller can say why.
+    pub(crate) fn run_cmdline(&mut self, cmdline: &str, depth: u8) -> Result<Vec<Action>, String> {
+        if depth > MAX_COMMAND_DEPTH {
+            return Err(COMMAND_DEPTH_MSG.to_string());
+        }
+        let trimmed = cmdline.trim();
+        let (name, args) = trimmed
+            .split_once(char::is_whitespace)
+            .unwrap_or((trimmed, ""));
+        let resolved = self
+            .command_palette
+            .resolve(&format!("/{}", name.trim_start_matches('/')))
+            .ok_or_else(|| format!("unknown command '{name}'"))?;
+        Ok(self.execute_command(
+            ParsedCommand {
+                name: resolved,
+                args: args.trim().to_string(),
+            },
+            depth,
+        ))
+    }
+
+    /// {depth} is the `maki.api.run_command` hop count, forwarded to a Lua
+    /// handler so an alias cycle keeps counting. 0 when the user typed it.
+    fn execute_command(&mut self, cmd: ParsedCommand, depth: u8) -> Vec<Action> {
         match cmd.name.as_str() {
             "/tasks" => {
                 self.open_tasks();
@@ -1322,14 +1471,14 @@ impl App {
                 self.execute_mcp_prompt(name, &cmd.args)
             }
             name if self.command_palette.find_lua_command(name).is_some() => {
-                self.run_lua_command(name, cmd.args);
+                self.run_lua_command(name, cmd.args, depth);
                 vec![]
             }
             _ => vec![],
         }
     }
 
-    fn run_lua_command(&self, name: &str, args: String) {
+    fn run_lua_command(&self, name: &str, args: String, depth: u8) {
         let Some(lua_cmd) = self.command_palette.find_lua_command(name) else {
             return;
         };
@@ -1337,6 +1486,7 @@ impl App {
             Arc::clone(&lua_cmd.plugin),
             Arc::clone(&lua_cmd.name),
             args,
+            depth,
         );
     }
 
@@ -1498,6 +1648,24 @@ impl App {
         !self.recoverable_queue.is_empty()
     }
 
+    pub(crate) fn attention(&self) -> Option<Notification> {
+        if let Some(tool) = self.permission_prompt.tool() {
+            let tool = (!matches!(tool, maki_config::ToolKey::Wildcard))
+                .then(|| normalize_preview(&tool.to_string()))
+                .flatten();
+            return Some(Notification::PermissionRequested { tool });
+        }
+        if matches!(self.pending_input, PendingInput::AuthRetry { .. }) {
+            return Some(Notification::AuthenticationRequired);
+        }
+        if self.status != Status::Streaming && self.plan_form_active() {
+            return Some(Notification::PlanReady);
+        }
+        self.float_mgr
+            .needs_input()
+            .then_some(Notification::QuestionRequested)
+    }
+
     pub fn has_modal_overlay(&self) -> bool {
         self.overlays().iter().any(|o| o.is_open() && o.is_modal())
     }
@@ -1506,17 +1674,49 @@ impl App {
         self.overlays_mut().iter_mut().for_each(|o| o.close());
     }
 
-    pub fn is_animating(&self) -> bool {
-        !self.image_paste_rx.is_empty()
-            || self.btw_modal.is_animating()
-            || self.file_picker.is_loading()
-            || self.float_mgr.is_open()
-            || self
-                .selection_state
+    /// Every poller that feeds the screen, in one place and never in `view`;
+    /// see [`crate::repaint`] for why.
+    pub fn tick(&mut self) -> Dirty {
+        // `|` never short-circuits: every poller must run on every tick.
+        self.float_mgr.tick()
+            | self.tick_edge_scroll()
+            | self.tick_error_expiry()
+            | self.poll_image_paste()
+            | self.btw_modal.poll()
+            | self.status_bar.poll_branch_update()
+            | self.status_bar.clear_expired_hint()
+            | self.mcp_picker.refresh()
+            | self.model_picker.refresh()
+            | self.usage_modal.poll(&self.usage_slot)
+            | self.hints.poll(self.hint_reader.load_full())
+            | self.tick_file_picker()
+            | Dirty::any(self.chats.iter_mut().map(Chat::tick))
+    }
+
+    fn tick_file_picker(&mut self) -> Dirty {
+        let (dirty, flash) = self.file_picker.tick();
+        if let Some(flash) = flash {
+            self.status_bar.flash(flash);
+        }
+        dirty
+    }
+
+    /// What moves with the clock alone; changes that come from arriving data
+    /// are reported by [`Self::tick`] instead. Overlays answer as a group, so
+    /// adding one to [`Self::overlays`] is enough.
+    pub fn cadence(&self) -> Cadence {
+        Cadence::any([
+            Cadence::any(self.overlays().into_iter().map(Overlay::cadence)),
+            StatusBar::cadence(
+                &self.status,
+                self.restoring.load(Ordering::Relaxed),
+                self.retry_info.is_some(),
+            ),
+            self.selection_state
                 .as_ref()
-                .is_some_and(|s| s.is_edge_scrolling())
-            || self.restoring.load(Ordering::Relaxed)
-            || self.chats.iter().any(|c| c.is_animating())
+                .map_or(Cadence::IDLE, SelectionState::cadence),
+            Cadence::any(self.chats.iter().map(Chat::cadence)),
+        ])
     }
 
     fn finish_subagents(&mut self, role: DisplayRole, text: &str) {

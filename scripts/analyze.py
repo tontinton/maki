@@ -41,7 +41,7 @@ def fmt_table(title, headers, rows, aligns=None):
     widths = [max(len(str(c)) for c in col) for col in cols]
 
     def fmt_row(vals):
-        return "  ".join(f"{str(v):{a}{w}}" for v, a, w in zip(vals, aligns, widths))
+        return "  ".join(f"{v!s:{a}{w}}" for v, a, w in zip(vals, aligns, widths))
 
     print(f"\n{'=' * len(title)}")
     print(title)

@@ -1,5 +1,6 @@
 use crate::components::Overlay;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
+use crate::repaint::Cadence;
 
 use crossterm::event::KeyEvent;
 use maki_providers::{Message, Role};
@@ -114,6 +115,10 @@ impl Overlay for RewindPicker {
 
     fn close(&mut self) {
         self.close()
+    }
+
+    fn cadence(&self) -> Cadence {
+        self.picker.cadence()
     }
 }
 

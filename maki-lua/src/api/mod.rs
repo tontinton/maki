@@ -28,13 +28,14 @@ use std::sync::Arc;
 use mlua::{Lua, Result as LuaResult, Table};
 
 use crate::api::options::PluginOpts;
-use crate::api::tool::PendingTools;
+use crate::api::tool::{PendingRules, PendingTools};
 use crate::api::util::command::UiAction;
 use crate::plugin_permissions::PluginPermissions;
 
 pub(crate) fn create_maki_global(
     lua: &Lua,
     pending: PendingTools,
+    pending_rules: PendingRules,
     plugin: Arc<str>,
     ui_action_tx: Option<flume::Sender<UiAction>>,
     permissions: &PluginPermissions,
@@ -42,7 +43,14 @@ pub(crate) fn create_maki_global(
 ) -> LuaResult<Table> {
     let maki = lua.create_table()?;
 
-    let api = tool::create_api_table(lua, pending, Arc::clone(&plugin), opts)?;
+    let api = tool::create_api_table(
+        lua,
+        pending,
+        pending_rules,
+        Arc::clone(&plugin),
+        opts,
+        ui_action_tx.clone(),
+    )?;
     autocmd::add_autocmd_methods(&api, lua, Arc::clone(&plugin))?;
     slot::add_slot_methods(&api, lua, Arc::clone(&plugin))?;
     maki.set("api", api)?;

@@ -28,6 +28,7 @@ toml = { workspace = true }
 arc-swap = { workspace = true }
 getrandom = { workspace = true }
 futures-lite = { workspace = true }
+wait-timeout = { workspace = true }
 image = { workspace = true }
 base64 = { workspace = true }
 nucleo = { workspace = true }

@@ -208,6 +208,14 @@ local function handler(input, ctx)
     sess:close()
 
     if err then
+      -- A result alongside the error means the run was cut short after
+      -- streaming some text, and half a transcript beats a bare error.
+      if result then
+        return {
+          llm_output = "sub-agent interrupted (" .. err .. "). Partial output:\n" .. result.text,
+          is_error = true,
+        }
+      end
       return { llm_output = "sub-agent error: " .. err, is_error = true }
     end
     if validator and not captured then

@@ -10,7 +10,7 @@ use tracing::{debug, error, warn};
 use crate::mcp::{McpSession, TOOL_SEARCH_TOOL_NAME, UNKNOWN_MCP};
 use crate::task_set::TaskSet;
 use crate::tools::registry::{ToolInvocation, ToolRegistry};
-use crate::tools::{LocalToolFn, ToolContext};
+use crate::tools::{LocalToolFn, ToolContext, truncate_bytes};
 use crate::{AgentError, AgentEvent, ToolDoneEvent, ToolOutput, ToolStartEvent};
 use maki_config::ToolKey;
 
@@ -24,6 +24,7 @@ const DOOM_LOOP_THRESHOLD: usize = 3;
 const DOOM_LOOP_MESSAGE: &str = "You have called this tool with identical input 3 times in a row. You are stuck in a loop. Break out and try a different approach.";
 const MCP_BLOCKED_IN_PLAN: &str = "MCP tools are not available in plan mode";
 const UNKNOWN_TOOL_PREFIX: &str = "unknown tool";
+const MCP_PERM_SCOPE_MAX_BYTES: usize = 200;
 
 pub(super) struct RecentCalls(VecDeque<(String, u64)>);
 
@@ -68,10 +69,11 @@ pub async fn run(
     ctx: &ToolContext,
     emit: Emit,
 ) -> ToolDoneEvent {
-    // GPT-5.6 was likely trained on Codex sessions where tools are `functions.<name>`
-    let name = name.strip_prefix("functions.").unwrap_or(name);
+    // Covers names re-entering from model JSON (batch children, `call_tool`,
+    // the interpreter bridge); streamed names are canonicalized in streaming.rs.
+    let name = super::streaming::canonical_tool_name(name);
     if let Some(local) = ctx.local_tools.get(name) {
-        return run_local_tool(local, id, name, input, ctx, emit);
+        return run_local_tool(local, id, name, input, ctx, emit).await;
     }
     let entry = registry.get(name);
     // LLM providers send tool names in wire format (server__tool) but our
@@ -255,7 +257,7 @@ fn run_tool_search(
     }
 }
 
-fn run_local_tool(
+async fn run_local_tool(
     local: &LocalToolFn,
     id: String,
     name: &str,
@@ -265,7 +267,11 @@ fn run_local_tool(
 ) -> ToolDoneEvent {
     let tool_id: Arc<str> = Arc::from(name);
     emit_raw_start(ctx, emit, &id, &tool_id, name.to_owned(), input);
-    let (output, is_error) = match local(input) {
+    let tool_ctx = ToolContext {
+        tool_use_id: Some(id.clone()),
+        ..ctx.clone()
+    };
+    let (output, is_error) = match local(input.clone(), tool_ctx).await {
         Ok(output) => (output, false),
         Err(e) => {
             warn!(tool = %name, error = %e, "local tool failed");
@@ -341,14 +347,7 @@ async fn execute_mcp_tool(
             return done(format!("invalid MCP tool key '{tool_name}': {e}"), true);
         }
     };
-    let perm_scope = {
-        let json = input.to_string();
-        if json.len() > 200 {
-            format!("{}\u{2026}", &json[..200])
-        } else {
-            json
-        }
-    };
+    let perm_scope = truncate_bytes(&input.to_string(), MCP_PERM_SCOPE_MAX_BYTES);
     let perm_scopes = crate::tools::PermissionScopes::single(perm_scope);
 
     if let Err(e) = ctx
@@ -530,7 +529,13 @@ mod tests {
     ) -> ToolContext {
         let mut ctx = crate::tools::test_support::stub_ctx(&AgentMode::Build);
         let mut map = std::collections::HashMap::new();
-        map.insert(name.to_owned(), Arc::new(f) as LocalToolFn);
+        map.insert(
+            name.to_owned(),
+            crate::tools::local_tool(move |input, _ctx| {
+                let result = f(&input);
+                Box::pin(async move { result })
+            }),
+        );
         ctx.local_tools = Arc::new(map);
         ctx
     }
@@ -569,6 +574,25 @@ mod tests {
     }
 
     #[test]
+    fn functions_prefixed_name_dispatches_to_canonical_tool() {
+        smol::block_on(async {
+            let ctx = local_ctx("ok", |_| Ok("ran".into()));
+            let done = run(
+                ToolRegistry::global(),
+                None,
+                "t1".into(),
+                "functions.ok",
+                &serde_json::json!({}),
+                &ctx,
+                Emit::Silent,
+            )
+            .await;
+            assert!(!done.is_error);
+            assert_eq!(done.output.as_text(), "ran");
+        });
+    }
+
+    #[test]
     fn local_tool_notify_emits_tool_start_with_raw_input() {
         smol::block_on(async {
             let (tx, rx) = flume::unbounded::<crate::Envelope>();
@@ -578,7 +602,10 @@ mod tests {
             let mut map = std::collections::HashMap::new();
             map.insert(
                 "local_echo".to_owned(),
-                Arc::new(|input: &Value| Ok(input.to_string())) as LocalToolFn,
+                crate::tools::local_tool(|input, _ctx| {
+                    let out = input.to_string();
+                    Box::pin(async move { Ok(out) })
+                }),
             );
             ctx.local_tools = Arc::new(map);
 
@@ -697,7 +724,11 @@ mod tests {
                 ..Default::default()
             };
             let dir = TempDir::new().unwrap();
-            let permissions = Arc::new(PermissionManager::new(deny_cfg, dir.path().to_path_buf()));
+            let permissions = Arc::new(PermissionManager::new(
+                deny_cfg,
+                dir.path().to_path_buf(),
+                Arc::default(),
+            ));
             let mut ctx = crate::tools::test_support::stub_ctx_with_permissions(
                 &AgentMode::Build,
                 permissions,
@@ -815,7 +846,11 @@ mod tests {
                 ..Default::default()
             };
             let dir = TempDir::new().unwrap();
-            let permissions = Arc::new(PermissionManager::new(deny_cfg, dir.path().to_path_buf()));
+            let permissions = Arc::new(PermissionManager::new(
+                deny_cfg,
+                dir.path().to_path_buf(),
+                Arc::default(),
+            ));
             let ctx = crate::tools::test_support::stub_ctx_with_permissions(
                 &AgentMode::Build,
                 permissions,
@@ -923,7 +958,11 @@ mod tests {
                 ..Default::default()
             };
             let dir = TempDir::new().unwrap();
-            let permissions = Arc::new(PermissionManager::new(deny_cfg, dir.path().to_path_buf()));
+            let permissions = Arc::new(PermissionManager::new(
+                deny_cfg,
+                dir.path().to_path_buf(),
+                Arc::default(),
+            ));
             let ctx = crate::tools::test_support::stub_ctx_with_permissions(
                 &AgentMode::Build,
                 permissions,

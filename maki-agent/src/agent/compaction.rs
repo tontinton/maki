@@ -7,9 +7,9 @@ use maki_providers::{
 use tracing::info;
 
 use super::history::{History, remove_orphaned_tool_results};
-use super::streaming::stream_with_retry;
+use super::streaming::{StreamError, stream_with_retry};
 use crate::cancel::CancelToken;
-use crate::{AgentError, AgentEvent, EventSender, TurnCompleteEvent};
+use crate::{AgentError, AgentEvent, DoneReason, EventSender, TurnCompleteEvent};
 
 const CONTINUE_AFTER_COMPACT: &str = "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed. If the summary contains a todo list, restore it with todo_write and keep it updated. If you learned important project context during this session, consider saving it to memory before it's lost.";
 const IMAGE_PLACEHOLDER: &str = "[image]";
@@ -73,19 +73,13 @@ pub(super) async fn compact_history(
                         "compaction succeeded after truncating oldest rounds"
                     );
                 }
-                return Ok(finish_compact(
-                    response,
-                    history,
-                    event_tx,
-                    compact_start,
-                    model,
-                ));
+                return finish_compact(response, history, event_tx, compact_start, model);
             }
-            Err(e) if e.is_context_overflow() && attempt < max_attempts - 1 => {
+            Err(StreamError::Other(e)) if e.is_context_overflow() && attempt < max_attempts - 1 => {
                 last_error = Some(e);
                 truncate_oldest_round(&mut compaction_history);
             }
-            Err(e) => return Err(e),
+            Err(e) => return Err(e.into()),
         }
     }
 
@@ -98,14 +92,21 @@ fn finish_compact(
     event_tx: &EventSender,
     compact_start: std::time::Instant,
     model: &Model,
-) -> TokenUsage {
+) -> Result<TokenUsage, AgentError> {
     let _ = event_tx.send(AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
         message: response.message.clone(),
         usage: response.usage,
         model: model.id.clone(),
         cost: model.cost_of(&response.usage, false),
         context_size: Some(response.usage.output),
+        context_window: model.context_window,
     })));
+
+    // Swapping the history for a summary the model never wrote would throw the
+    // session away for nothing.
+    if response.message.first_text_content().is_none() {
+        return Err(AgentError::EmptySummary);
+    }
 
     let new_history = vec![
         Message::user("What did we do so far?".into()),
@@ -118,7 +119,7 @@ fn finish_compact(
         "compaction completed"
     );
 
-    response.usage
+    Ok(response.usage)
 }
 
 pub async fn compact(
@@ -137,7 +138,7 @@ pub async fn compact(
     event_tx.send(AgentEvent::Done {
         usage,
         num_turns: 1,
-        stop_reason: None,
+        reason: DoneReason::EndTurn,
     })?;
 
     Ok(())
@@ -164,12 +165,7 @@ fn strip_images(messages: &mut [Message]) {
 
 fn strip_thinking(messages: &mut [Message]) {
     for msg in messages {
-        msg.content.retain(|block| {
-            !matches!(
-                block,
-                ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. }
-            )
-        });
+        msg.content.retain(|block| !block.is_thinking());
     }
 }
 
@@ -341,6 +337,39 @@ mod tests {
             assert_eq!(msgs.len(), 2);
             assert!(matches!(msgs[0].role, Role::User));
             assert!(matches!(msgs[1].role, Role::Assistant));
+        });
+    }
+
+    #[test_case(vec![] ; "no_content")]
+    #[test_case(vec![ContentBlock::Text { text: " \n".into() }] ; "blank_text")]
+    fn compact_keeps_history_when_summary_has_no_text(content: Vec<ContentBlock>) {
+        smol::block_on(async {
+            let provider = MockProvider::new(vec![Ok(StreamResponse {
+                message: Message {
+                    role: Role::Assistant,
+                    content,
+                    ..Default::default()
+                },
+                usage: TokenUsage::default(),
+                stop_reason: Some(StopReason::EndTurn),
+            })]);
+            const KEPT: &str = "first";
+            let mut history = History::new(vec![Message::user(KEPT.into())]);
+            let (raw_tx, _rx) = flume::unbounded();
+
+            let err = compact(
+                &provider,
+                &default_model(),
+                &mut history,
+                &EventSender::new(raw_tx, 0),
+                &AgentConfig::default(),
+            )
+            .await
+            .expect_err("empty summary must fail");
+
+            assert!(matches!(err, AgentError::EmptySummary));
+            assert_eq!(history.len(), 1);
+            assert_eq!(history.as_slice()[0].user_text(), Some(KEPT));
         });
     }
 

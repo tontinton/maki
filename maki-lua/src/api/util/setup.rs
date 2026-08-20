@@ -27,6 +27,7 @@ accepts the same keys as the Configuration reference.",
                 desc: "Configuration table.",
             }],
             returns: "",
+            guard: None,
             example: "maki.setup({\n\
   model = \"opus\",\n\
   keymaps = false,\n\

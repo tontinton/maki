@@ -15,6 +15,7 @@ use isahc::config::{Configurable, RedirectPolicy};
 use maki_storage::StateDir;
 use maki_storage::auth::{McpAuthData, load_mcp_auth, save_mcp_auth};
 use tracing::{info, warn};
+use url::Url;
 
 use self::callback::{CallbackResult, CallbackServer};
 use self::discovery::parse_www_authenticate;
@@ -160,7 +161,8 @@ pub async fn authenticate(
         &pkce.challenge,
         scope.as_deref(),
         server_url,
-    );
+    )
+    .map_err(&wrap)?;
 
     info!(server = server_name, endpoint = %auth_server.authorization_endpoint, "starting OAuth authorization");
     let result = match interaction {
@@ -330,9 +332,15 @@ fn build_authorization_url(
     code_challenge: &str,
     scope: Option<&str>,
     resource: &str,
-) -> String {
+) -> Result<String, OAuthError> {
+    let parsed = Url::parse(authorization_endpoint).map_err(|e| {
+        OAuthError::InvalidResponse(format!(
+            "invalid authorization endpoint {authorization_endpoint}: {e}"
+        ))
+    })?;
+    let sep = if parsed.query().is_some() { '&' } else { '?' };
     let mut url = format!(
-        "{authorization_endpoint}?response_type=code&client_id={}&redirect_uri={}&state={state}&code_challenge={code_challenge}&code_challenge_method=S256&resource={}",
+        "{authorization_endpoint}{sep}response_type=code&client_id={}&redirect_uri={}&state={state}&code_challenge={code_challenge}&code_challenge_method=S256&resource={}",
         token::url_encode(client_id),
         token::url_encode(redirect_uri),
         token::url_encode(resource),
@@ -341,5 +349,75 @@ fn build_authorization_url(
         url.push_str("&scope=");
         url.push_str(&token::url_encode(s));
     }
-    url
+    Ok(url)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{OAuthError, build_authorization_url};
+    use test_case::test_case;
+    use url::Url;
+
+    const CLIENT_ID: &str = "client-id";
+    const REDIRECT_URI: &str = "http://127.0.0.1:8080/callback";
+    const STATE: &str = "state-value";
+    const CHALLENGE: &str = "challenge-value";
+
+    const SCOPE: &str = "offline#access";
+    const RESOURCE: &str = "https://example.com/resource a b";
+
+    fn query_pairs(url: &str) -> Vec<(String, String)> {
+        let parsed = Url::parse(url).expect("built authorization URL should parse");
+        parsed
+            .query_pairs()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn has(pairs: &[(String, String)], key: &str, value: &str) -> bool {
+        pairs.iter().any(|(k, v)| k == key && v == value)
+    }
+
+    #[test_case("https://example.com/authorize", None; "plain_endpoint")]
+    #[test_case("https://mcp-slack.example.com/dcr/authorize?provider=slack", Some("slack"); "slack_provider")]
+    fn builds_authorization_url(endpoint: &str, provider: Option<&str>) {
+        let url = build_authorization_url(
+            endpoint,
+            CLIENT_ID,
+            REDIRECT_URI,
+            STATE,
+            CHALLENGE,
+            Some(SCOPE),
+            RESOURCE,
+        )
+        .expect("endpoint should parse");
+
+        assert!(url.contains("resource=https%3A%2F%2Fexample.com%2Fresource%20a%20b"));
+        assert!(url.contains("scope=offline%23access"));
+
+        let pairs = query_pairs(&url);
+        assert!(has(&pairs, "response_type", "code"));
+        assert!(has(&pairs, "client_id", CLIENT_ID));
+        assert!(has(&pairs, "resource", RESOURCE));
+        assert!(has(&pairs, "scope", SCOPE));
+        if let Some(expected) = provider {
+            assert!(has(&pairs, "provider", expected));
+        }
+    }
+
+    #[test_case("not a url"; "invalid_endpoint")]
+    fn invalid_endpoint_returns_error(endpoint: &str) {
+        assert!(matches!(
+            build_authorization_url(
+                endpoint,
+                CLIENT_ID,
+                REDIRECT_URI,
+                STATE,
+                CHALLENGE,
+                None,
+                RESOURCE
+            ),
+            Err(OAuthError::InvalidResponse(_))
+        ));
+    }
 }

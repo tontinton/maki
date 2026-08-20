@@ -1,6 +1,8 @@
 use std::cmp::Reverse;
 use std::collections::HashMap;
 
+use arc_swap::ArcSwapOption;
+
 use crossterm::event::{KeyCode, KeyEvent};
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
@@ -17,6 +19,7 @@ use crate::components::ModalScroll;
 use crate::components::keybindings::key;
 use crate::components::modal::Modal;
 use crate::components::scrollbar::render_vertical_scrollbar;
+use crate::repaint::{Dirty, Watch};
 use crate::theme;
 
 const TITLE: &str = " Token usage ";
@@ -29,8 +32,8 @@ const HOUR: i64 = 3600;
 const DAY: i64 = 24 * HOUR;
 const WEEK: i64 = 7 * DAY;
 
-/// Live provider quota fetch, shared from the event loop. `Loading` is shown
-/// until the background fetch completes; the modal reads this each render.
+/// Live provider quota fetch, shared from the event loop. A detached task
+/// drops the answer into the slot, and [`UsageModal::poll`] is what notices.
 pub enum UsageFetchState {
     Loading,
     Ready(ProviderUsage),
@@ -43,13 +46,13 @@ pub struct UsageModalContext<'a> {
     pub by_model: &'a HashMap<String, StoredTokenUsage>,
     pub model: &'a Model,
     pub fast: bool,
-    pub quota: Option<&'a UsageFetchState>,
     pub clock_format: ClockFormat,
 }
 
 pub struct UsageModal {
     open: bool,
     scroll: ModalScroll,
+    quota: Watch<UsageFetchState>,
 }
 
 impl UsageModal {
@@ -57,7 +60,18 @@ impl UsageModal {
         Self {
             open: false,
             scroll: ModalScroll::new_top(),
+            quota: Watch::default(),
         }
+    }
+
+    /// Picks up a finished quota fetch. Nothing wakes the loop when the task
+    /// stores its result, so an unpolled modal sits on `Loading` until the
+    /// user happens to press a key.
+    pub fn poll(&mut self, slot: &ArcSwapOption<UsageFetchState>) -> Dirty {
+        if !self.open {
+            return Dirty::NO;
+        }
+        self.quota.poll(slot.load_full())
     }
 
     pub fn is_open(&self) -> bool {
@@ -69,6 +83,8 @@ impl UsageModal {
         self.scroll.reset();
     }
 
+    /// Keeps the last answer: `/usage` refetches on every open, and until that
+    /// lands it beats a blank panel.
     pub fn close(&mut self) {
         self.open = false;
         self.scroll.reset();
@@ -91,7 +107,7 @@ impl UsageModal {
         }
 
         let theme = theme::current();
-        let lines = build_lines(ctx, &theme);
+        let lines = build_lines(ctx, self.quota.get(), &theme);
 
         let total = lines.len() as u16;
         let modal = Modal {
@@ -139,7 +155,11 @@ fn pricing_for(id: &str, current: &Model) -> Option<ModelPricing> {
     })
 }
 
-fn build_lines(ctx: &UsageModalContext, theme: &crate::theme::Theme) -> Vec<Line<'static>> {
+fn build_lines(
+    ctx: &UsageModalContext,
+    quota: Option<&UsageFetchState>,
+    theme: &crate::theme::Theme,
+) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = Vec::new();
     let fg = Style::new().fg(theme.foreground);
 
@@ -155,7 +175,7 @@ fn build_lines(ctx: &UsageModalContext, theme: &crate::theme::Theme) -> Vec<Line
     };
     lines.push(Line::from(totals_row(ctx.total, total_cost, theme)));
 
-    if let Some(state) = ctx.quota {
+    if let Some(state) = quota {
         lines.push(Line::default());
         lines.push(Line::from(Span::styled(
             format!("{PREFIX}{} quota", ctx.model.provider_display_name()),
@@ -379,8 +399,11 @@ fn relative(seconds: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::components::{buffer_text, test_model};
+    use crate::repaint::expect::{OWED, QUIET};
     use crossterm::event::KeyModifiers;
     use maki_providers::UsageLimit;
+    use std::sync::Arc;
     use test_case::test_case;
 
     fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
@@ -485,6 +508,84 @@ mod tests {
         let err = quota_lines(&UsageFetchState::Error("nope".into()), &theme, clock);
         assert_eq!(err.len(), 1);
         assert!(err[0].spans.iter().any(|s| s.content.contains("nope")));
+    }
+
+    fn slot(state: UsageFetchState) -> ArcSwapOption<UsageFetchState> {
+        ArcSwapOption::from_pointee(state)
+    }
+
+    fn render(modal: &mut UsageModal) -> String {
+        let backend = ratatui::backend::TestBackend::new(120, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let model = test_model();
+        let ctx = UsageModalContext {
+            total: &TokenUsage::default(),
+            by_model: &HashMap::new(),
+            model: &model,
+            fast: false,
+            clock_format: ClockFormat::Hour24,
+        };
+        terminal
+            .draw(|f| {
+                modal.view(f, f.area(), &ctx);
+            })
+            .unwrap();
+        buffer_text(terminal.backend().buffer())
+    }
+
+    /// Nothing wakes the loop when the fetch stores its answer, so the modal
+    /// has to notice on its own, and exactly once: the slot keeps holding the
+    /// same `Arc` for as long as the modal stays open, and a poll that cannot
+    /// tell "still there" from "just arrived" repaints on every tick. A closed
+    /// modal is not on screen, so it must not pick anything up.
+    #[test]
+    fn poll_owes_a_frame_only_for_a_value_the_open_modal_has_not_seen() {
+        let slot = slot(UsageFetchState::Loading);
+        let mut modal = UsageModal::new();
+
+        assert_eq!(
+            modal.poll(&slot),
+            Dirty::NO,
+            "a closed modal ignores the slot"
+        );
+        assert!(modal.quota.get().is_none());
+
+        modal.toggle();
+        assert_eq!(modal.poll(&slot), Dirty::YES, "{OWED}");
+        assert_eq!(modal.poll(&slot), Dirty::NO, "{QUIET}");
+
+        slot.store(Some(Arc::new(UsageFetchState::Unsupported)));
+        assert_eq!(
+            modal.poll(&slot),
+            Dirty::YES,
+            "a refetch owes a frame, whatever it holds"
+        );
+    }
+
+    /// `view` renders what the modal owns, never the shared slot. Reading the
+    /// slot mid render is what forced the old loop to paint constantly. Closing
+    /// keeps the last answer, so a reopen has something to show while the
+    /// refetch is on its way, and owes no frame for what is already drawn.
+    #[test]
+    fn quota_reaches_the_screen_only_after_a_poll_and_survives_a_reopen() {
+        let slot = slot(UsageFetchState::Unsupported);
+        let mut modal = UsageModal::new();
+        modal.toggle();
+
+        assert!(
+            !render(&mut modal).contains(NO_USAGE_ENDPOINT),
+            "an unpolled quota must not appear on screen"
+        );
+        assert_eq!(modal.poll(&slot), Dirty::YES, "{OWED}");
+        assert!(render(&mut modal).contains(NO_USAGE_ENDPOINT));
+
+        modal.close();
+        modal.toggle();
+        assert_eq!(modal.poll(&slot), Dirty::NO, "{QUIET}");
+        assert!(
+            render(&mut modal).contains(NO_USAGE_ENDPOINT),
+            "a reopened modal still shows the last answer it saw"
+        );
     }
 
     #[test]

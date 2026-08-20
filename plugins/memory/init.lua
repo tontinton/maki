@@ -2,28 +2,57 @@ local ToolView = require("maki.tool_view")
 local helpers = require("memory_helpers")
 local ListPicker = require("maki.list_picker")
 
+local WRITE_TOOLS = { "write", "edit", "multiedit", "edit_lines", "insert_lines" }
+
 local function memories_path_suffix()
   local cwd = maki.uv.cwd()
   local root = maki.fs.root(cwd, ".git") or cwd
   return "projects/" .. helpers.project_id(root) .. "/memories"
 end
 
+local function legacy_dir_if_exists(suffix)
+  local legacy = maki.env.legacy_dir()
+  if not legacy then
+    return nil
+  end
+  local dir = maki.fs.joinpath(legacy, suffix)
+  local meta = maki.fs.metadata(dir)
+  if meta and meta.is_dir then
+    return dir
+  end
+end
+
+-- Notes live outside cwd, where file-write tools normally prompt; pre-allow
+-- them here so the agent can edit notes directly. Reads may come from the
+-- legacy dir while writes go to the state dir, so cover both.
+local function register_write_rules()
+  local suffix = memories_path_suffix()
+  local dirs = { legacy_dir_if_exists(suffix) }
+  local state = maki.env.state_dir()
+  if state then
+    dirs[#dirs + 1] = maki.fs.joinpath(state, suffix)
+  end
+  for _, dir in ipairs(dirs) do
+    for _, tool in ipairs(WRITE_TOOLS) do
+      maki.api.register_permission_rule({ tool = tool, scope = dir .. "/**" })
+    end
+  end
+end
+register_write_rules()
+
 local function resolve_dir(check_legacy)
+  local suffix = memories_path_suffix()
   if check_legacy then
-    local legacy = maki.env.legacy_dir()
-    if legacy then
-      local dir = maki.fs.joinpath(legacy, memories_path_suffix())
-      local meta = maki.fs.metadata(dir)
-      if meta and meta.is_dir then
-        return dir
-      end
+    local dir = legacy_dir_if_exists(suffix)
+    if dir then
+      return dir
     end
   end
   local state = maki.env.state_dir()
   if not state then
     return nil, "cannot resolve state dir"
   end
-  return maki.fs.joinpath(state, memories_path_suffix())
+  return maki.fs.joinpath(state, suffix)
 end
 
 maki.api.register_prompt_hint({
@@ -129,12 +158,22 @@ local function cmd_delete(path, dir)
   return "deleted " .. path
 end
 
+local function with_dir(res, dir)
+  local prefix = "dir: " .. dir .. "\n\n"
+  if type(res) == "string" then
+    return prefix .. res
+  end
+  res.llm_output = prefix .. res.llm_output
+  return res
+end
+
 maki.api.register_tool({
   name = "memory",
   description = "Persistent, project-scoped scratchpad for learnings, patterns, decisions, and gotchas across sessions.\n\n"
     .. "- Notes are retrieved by tag; reuse the tags from your system prompt when they fit.\n"
     .. "- Save important context before compaction or to build up project knowledge.\n"
-    .. "- Keep entries concise and current. Delete outdated information.",
+    .. "- Keep entries concise and current. Delete outdated information.\n"
+    .. "- Notes are plain files; `list` and `read` report the dir, so use the edit tool on `<dir>/<name>` for targeted changes.",
 
   schema = {
     type = "object",
@@ -206,6 +245,9 @@ maki.api.register_tool({
     end
     if err then
       return { llm_output = "error: " .. err, is_error = true }
+    end
+    if cmd == "list" or cmd == "read" then
+      return with_dir(result, dir)
     end
     return result
   end,

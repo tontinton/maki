@@ -35,11 +35,11 @@ use std::path::{Path, PathBuf};
 
 pub use maki_providers::AgentError;
 use maki_providers::Message;
-pub use maki_providers::{ImageMediaType, ImageSource, ThinkingConfig};
+pub use maki_providers::{EMPTY_RESPONSE_MARKER, ImageMediaType, ImageSource, ThinkingConfig};
 pub use types::{
-    AgentEvent, BufferSnapshot, Envelope, EventSender, GrepFileEntry, GrepLine, GrepMatchGroup,
-    InstructionBlock, NO_FILES_FOUND, SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle,
-    SubagentInfo, TextOutput, ToolDoneEvent, ToolInput, ToolOutput, ToolStartEvent,
+    AgentEvent, BufferSnapshot, DoneReason, Envelope, EventSender, GrepFileEntry, GrepLine,
+    GrepMatchGroup, InstructionBlock, NO_FILES_FOUND, SharedBuf, SnapshotLine, SnapshotSpan,
+    SpanStyle, SubagentInfo, TextOutput, ToolDoneEvent, ToolInput, ToolOutput, ToolStartEvent,
     TurnCompleteEvent,
 };
 

@@ -1,6 +1,6 @@
 +++
 title = "Permissions"
-weight = 8
+weight = 6
 [extra]
 group = "Reference"
 +++
@@ -9,22 +9,35 @@ group = "Reference"
 
 Maki uses a permission system to decide what each tool is allowed to do and when to ask you first.
 
-Rules come from three layers, combined for resolution:
+Rules come from four layers, combined for resolution:
 
 1. **Session rules**, set during the current session (in-memory only)
 2. **Config rules**, loaded from TOML permission files
 3. **Builtin rules**, the hardcoded defaults
+4. **Plugin rules**, declared by plugins via [`maki.api.register_permission_rule`](/lua-api/#maki-api-register_permission_rule)
 
-Any matching deny blocks the tool. No exceptions.
+Any matching deny blocks the tool. No exceptions, so a config deny always beats a plugin allow.
 
 ## Check Flow
 
-For every tool call, Maki resolves permission like this:
+For every tool call, each scope resolves like this:
 
-1. **Deny wins**: if any rule from any layer matches the tool and scope with a deny, the call is blocked immediately.
-2. If **YOLO** is active and no deny matched, allowed.
-3. **Plan file auto-allow**: file write tools targeting the plan file path are allowed automatically (only if no deny rule matched in step 1). In plan mode, writes to any other path are rejected before this step, and MCP tools are blocked entirely.
-4. Fall back to `default` (per-tool, then global). Built-in default is `"prompt"`.
+```
+tool call
+    │
+deny rule matches?  ── yes ──►  blocked. no exceptions
+    │ no
+allow rule matches? ── yes ──►  runs
+    │ no
+YOLO active?        ── yes ──►  runs
+    │ no
+plan file write?    ── yes ──►  runs
+    │ no
+    ▼
+default: prompt / allow / deny
+```
+
+Deny rules are checked across all layers before anything else, so a deny cannot be bypassed by YOLO or the plan-file auto-allow. In plan mode, writes to any path other than the plan file are rejected before this flow, and MCP tools are blocked entirely. `default` resolves per-tool first, then global; the built-in default is `"prompt"`.
 
 ## Builtin Defaults
 
@@ -38,6 +51,8 @@ File-write tools are pre-allowed inside the project working directory (cwd at se
 | `edit_lines` | `<cwd>/**` | Same, when the opt-in tool is enabled |
 | `insert_lines` | `<cwd>/**` | Same, when the opt-in tool is enabled |
 | `task` | `*` | Subagent spawning always allowed |
+
+The memory plugin uses a plugin rule to pre-allow the file-write tools inside its notes directory (under maki's state dir), so the agent can edit memory notes directly without a prompt.
 
 These tools have no builtin allow rule, so they prompt (or follow your `default`) every time unless you add rules:
 
@@ -179,6 +194,10 @@ Some constructs are too complex to analyze statically, so they always trigger a 
 - Arithmetic expansion: `$((...))`
 
 Brace groups `{ ... }` and control flow (`if`, `for`, …) are segmented when possible; they do not by themselves force a prompt the way substitutions do.
+
+## Plugin Permissions
+
+Lua plugins have a separate, unrelated gate. A `plugin.toml` manifest next to the Lua file controls which gated `maki.*` APIs it may call. No manifest means every gated call is denied, including for your own `init.lua`. The [Lua API reference](/lua-api/#plugin-permissions) documents the manifest and lists every permission.
 
 ## Session Persistence
 

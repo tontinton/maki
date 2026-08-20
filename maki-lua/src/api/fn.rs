@@ -599,9 +599,6 @@ lua_table! {
     /// control. Use these to run shell commands, wait for output, and check
     /// whether programs are installed.
     ///
-    /// Job functions need the `run` permission. `executable` needs the `env`
-    /// permission.
-    ///
     /// ```lua
     /// local id = maki.fn.jobstart("git status", {
     ///   on_exit = function(code) print("done: " .. code) end,

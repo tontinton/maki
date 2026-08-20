@@ -18,8 +18,8 @@ use maki_agent::tools::{
     ToolContext, ToolFilter, ToolLive,
 };
 use maki_agent::{
-    Agent, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, Envelope, EventSender,
-    History, McpSession, SubagentInfo, ToolDoneEvent,
+    Agent, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, DoneReason,
+    EMPTY_RESPONSE_MARKER, Envelope, EventSender, History, McpSession, SubagentInfo, ToolDoneEvent,
 };
 use maki_lua_macro::{lua_class, lua_fn, lua_table};
 use maki_providers::model::ModelTier;
@@ -35,6 +35,7 @@ use crate::api::ui::buf::BufHandle;
 use crate::api::util::convert::{json_to_lua, lua_to_json, lua_tool_result};
 use crate::api::util::ctx::{AgentContext, LuaCtx};
 use crate::api::util::pair::{Pair, err_pair, try_pair};
+use crate::runtime::CANCELLED_MSG;
 
 const SESSION_CLOSED_ERR: &str = "session closed";
 const DEFAULT_SESSION_AUDIENCE: ToolAudience = ToolAudience::GENERAL_SUB;
@@ -172,7 +173,10 @@ async fn system_prompt(
     ctx: mlua::UserDataRef<LuaCtx>,
     opts: Table,
 ) -> LuaResult<Pair<String>> {
-    let agent = try_pair!(dispatch_ctx(&ctx, "system_prompt"));
+    let slots = Arc::clone(&try_pair!(dispatch_ctx(&ctx, "system_prompt")).prompt_slots);
+    // Nothing may hold the ctx borrow across the wait: a cancel hook firing
+    // meanwhile needs `ctx:finish`, which takes it mutably.
+    drop(ctx);
     let prompt_id_str: String = opts.get("prompt_id")?;
     let prompt_id = match prompt_id_str.as_str() {
         "research" => maki_agent::prompt::PromptId::Research,
@@ -193,7 +197,7 @@ async fn system_prompt(
         _ => return Err(mlua::Error::runtime("instructions must be bool or string")),
     };
 
-    let assembled = maki_agent::prompt::assemble(prompt_id, &agent.prompt_slots, &instructions);
+    let assembled = maki_agent::prompt::assemble(prompt_id, &slots, &instructions);
     Ok((Some(vars.apply(&assembled).into_owned()), None))
 }
 
@@ -455,8 +459,10 @@ async fn session(
             let weak = lua.weak();
             local_map.insert(
                 name,
-                Arc::new(move |input: &JsonValue| call_local_tool(&weak, &handler, input))
-                    as LocalToolFn,
+                maki_agent::tools::local_tool(move |input, _ctx| {
+                    let result = call_local_tool(&weak, &handler, &input);
+                    Box::pin(async move { result })
+                }),
             );
         }
     }
@@ -738,7 +744,9 @@ impl Drop for LuaSession {
 /// tools).
 ///
 /// @param message string User message to send.
-/// @return (table?, string?) Result table on success, or `(nil, err)` on failure.
+/// @return (table?, string?) Result table on success, or `(nil, err)` on
+/// failure. A run cut short after streaming some text hands you both: the
+/// error and a `{ text = <what it streamed> }` table.
 /// @example
 /// local r, err = sess:prompt("What files are in this project?")
 /// if err then error(err) end
@@ -794,8 +802,39 @@ async fn prompt(
     };
     let result = agent.run(input).await;
     drop(agent);
-    if let Err(e) = result {
-        return Ok((None, Some(e.to_string())));
+    // Only this call's messages count: older turns may hold stale preamble
+    // text, and the agent loop's empty-response retry leaves a synthetic
+    // "(empty)" assistant marker that must not pass for a real response.
+    // Auto-compaction can shrink the history mid-run, so clamp the start:
+    // after a rewrite the tail is this call's output either way.
+    let turn = &s.history.as_slice()[history_len.min(s.history.len())..];
+    // A subagent can be cancelled on its own, and its caller should hear about
+    // that instead of taking a half-finished answer for a real one, so cancel
+    // reads like an error here even though the run ended normally.
+    let cut_short = match &result {
+        Err(e) => Some(e.to_string()),
+        Ok(DoneReason::Cancelled) => Some(CANCELLED_MSG.to_owned()),
+        Ok(_) => None,
+    };
+    if let Some(err) = cut_short {
+        let partial = turn
+            .iter()
+            .filter(|m| matches!(m.role, Role::Assistant))
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } if text != EMPTY_RESPONSE_MARKER => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let tbl = if partial.is_empty() {
+            None
+        } else {
+            let tbl = lua.create_table()?;
+            tbl.set("text", partial)?;
+            Some(tbl)
+        };
+        return Ok((tbl, Some(err)));
     }
     // Waiting here doubles as an ordering barrier: the relay reaches `Done` only
     // after every `TurnComplete`, so all our `ToolLive::Usage` messages sit in the
@@ -808,12 +847,7 @@ async fn prompt(
         ),
     }
 
-    // Only this call's messages count: older turns may hold stale preamble
-    // text, and the agent loop's empty-response retry leaves a synthetic
-    // "(empty)" assistant marker that must not pass for a real response.
-    // Auto-compaction can shrink the history mid-run, so clamp the start:
-    // after a rewrite the tail is this call's output either way.
-    let text = s.history.as_slice()[history_len.min(s.history.len())..]
+    let text = turn
         .iter()
         .rfind(|m| matches!(m.role, Role::Assistant))
         .and_then(|m| {
@@ -870,7 +904,7 @@ fn call_local_tool(
 
 #[cfg(test)]
 mod tests {
-    use maki_agent::TurnCompleteEvent;
+    use maki_agent::{DoneReason, TurnCompleteEvent};
     use maki_providers::Message;
     use serde_json::json;
 
@@ -932,6 +966,7 @@ mod tests {
             model: "test-model".into(),
             cost: Some(cost),
             context_size: None,
+            context_window: 0,
         }))
     }
 
@@ -961,7 +996,7 @@ mod tests {
             AgentEvent::Done {
                 usage: DONE_USAGE,
                 num_turns: 2,
-                stop_reason: None,
+                reason: DoneReason::EndTurn,
             },
         ] {
             sub_tx.send(envelope(event)).unwrap();

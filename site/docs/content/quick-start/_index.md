@@ -7,7 +7,7 @@ group = "Getting Started"
 
 # Quick Start
 
-Install Maki, connect a provider, and run your first session. Takes a few minutes.
+Install Maki, connect a provider, run a first session. A few minutes, start to finish.
 
 ## Install
 
@@ -69,50 +69,34 @@ nix run github:tontinton/maki
 
 Or download a pre-built binary from [GitHub Releases](https://github.com/tontinton/maki/releases/latest).
 
-## API Keys
+## Connect a provider
 
-Export a key for at least one provider (e.g. `ANTHROPIC_API_KEY`). Some providers support OAuth login instead via `maki auth login <provider>`.
+```bash
+maki auth login              # interactive picker (OAuth or API key)
+export ANTHROPIC_API_KEY=... # or just export a key
+```
 
-See [Providers](/docs/providers/) for the full list of supported providers, environment variables, and setup instructions.
+Anthropic, OpenAI, Google, Ollama, and friends all work; multiple keys in one var rotate on rate limits. Every env var and model catalog is in [Providers](/docs/providers/).
 
-## Run
+## First session
 
-From your project directory:
+From a repo:
 
 ```bash
 maki
 ```
 
-Type a prompt, press **Enter**, and the agent starts working.
+Type what you want done, press Enter, watch it work. Worth knowing on day one:
 
-## Keybindings
+- **Permissions.** File edits inside the repo run freely. `bash` and web tools ask first: `y` allows once, `s` for the session, `a` for the project. Deny rules always win; `/yolo` skips the prompts. Details in [Permissions](/docs/permissions/).
+- **Plan mode.** `Tab` toggles it. The agent may only write the plan file until you approve, then back to build mode.
+- **Models.** `/model` switches mid-session.
+- **Sessions.** `/new` starts a second session while the first keeps working in the background; `/sessions` jumps between them. Tomorrow, `maki --continue` resumes where you left off.
+- **Your shell.** Prefix input with `!` to run a command yourself (`!cargo test`). `!!` hides command and output from the agent.
+- **Escape hatch.** `Esc Esc` cancels a streaming response. When idle, it rewinds instead.
+- **Help.** `Ctrl+H` lists every keybinding, or see [Keybindings](/docs/keybindings/).
 
-These are the defaults. Plugins and `init.lua` can rebind most of them with `maki.keymap.set`; see [Keybindings](/docs/keybindings/) for precedence and caveats.
-
-- **Newline in input**: Shift+Enter, Ctrl+Enter, Ctrl+J, or Alt+Enter
-- **Scroll output**: Ctrl+U / Ctrl+D (half page)
-- **Cancel streaming**: Esc Esc
-- **Rewind (when idle)**: Esc Esc
-- **Toggle plan / build**: Tab
-- **Paste image from clipboard**: Ctrl+V (needs a vision-capable model)
-- **Run a shell command yourself**: prefix the input with `!` (or `!!` to hide it from the agent). 5 minute timeout. This is your shell, not the agent `bash` tool.
-- **Quit**: Ctrl+C
-- **All keybindings**: Ctrl+H
-
-## Sessions
-
-`/new` starts another session while the previous one keeps working in the background. `/sessions` (or the session picker) jumps between them. See [Commands](/docs/commands/#sessions).
-
-## Choosing a Model
-
-Connect a provider first:
-
-```bash
-maki auth login          # interactive picker
-# or export ANTHROPIC_API_KEY=...
-```
-
-Set a default in your config (optional; otherwise Maki remembers the last model you used):
+## Default model (optional)
 
 ```lua
 -- ~/.config/maki/init.lua
@@ -123,46 +107,21 @@ maki.setup({
 })
 ```
 
-Switch models mid-session with `/model`. See [Providers](/docs/providers/) for the full catalog and [CLI](/docs/cli/) for `maki auth` / `maki models`.
+Without it, Maki remembers the last model you used.
 
-## Plan before you edit
+## Teach it your project
 
-Press `Tab` to enter plan mode. The agent may only write the plan file until you approve implementation. Press `Tab` again to return to build mode, or use the plan form when the draft is ready.
-
-## Project Configuration
-
-Add a `.maki/` directory to your project root for per-project settings:
+Maki loads `AGENTS.md` (or `CLAUDE.md`, `.cursorrules`, and friends) from your repo automatically. Per-project settings live under `.maki/`:
 
 ```
 .maki/
-├── init.lua           # Overrides global config
-├── permissions.toml   # Permission rules
+├── init.lua           # overrides global config
+├── permissions.toml   # permission rules
 ├── mcp.toml           # MCP server config
-├── commands/          # Custom slash commands (.md files)
-└── skills/            # Project skills (each dir has a SKILL.md)
-AGENTS.md              # Loaded into agent context automatically
-AGENTS.local.md        # Personal per-project instructions (gitignored)
+├── commands/          # custom slash commands (.md files)
+└── skills/            # project skills (each dir has a SKILL.md)
+AGENTS.md              # always in context
+AGENTS.local.md        # personal per-project instructions (gitignored)
 ```
 
-### Instruction files
-
-At session start Maki walks from the project git root down to the working directory (if there is no `.git` root, only the cwd). In each directory it loads **one** project instruction file (first match wins), then always loads `AGENTS.local.md` if present. Closer directories win on conflicts. After that it loads one global `AGENTS.md` from your config dir:
-
-| Order | File |
-|------|------|
-| 1 | `AGENTS.md` |
-| 2 | `CLAUDE.md` |
-| 3 | `.github/copilot-instructions.md` |
-| 4 | `COPILOT.md` |
-| 5 | `.cursorrules` |
-| 6 | `.windsurfrules` |
-| 7 | `.clinerules` |
-| 8 | `CONVENTIONS.md` |
-| 9 | `GEMINI.md` |
-| 10 | `CODING_AGENT.md` |
-
-Put coding conventions, repo quirks, and off-limits directories in here. When the agent `read`s under a subdirectory, Maki can also pull in that subdir's instruction file if it has not been loaded yet.
-
-For reusable playbooks the agent loads on demand, add a skill under `.maki/skills/`. See [Skills](/docs/skills/).
-
-See [Configuration](/docs/configuration/) for all options.
+Which instruction file wins, when subdirectory rules load, and how skills and memory fit together: [Context](/docs/context/). All settings: [Configuration](/docs/configuration/).

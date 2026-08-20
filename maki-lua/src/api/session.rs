@@ -37,7 +37,8 @@ async fn list(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult
 }
 
 /// Lists the sessions currently running in this UI. Status is "working",
-/// "needs_input", or "idle".
+/// "needs_input", or "idle". A mailbox follow-up stays "working" without an
+/// intermediate "idle" status.
 ///
 /// @return (table|nil, string|nil) Array of `{id, title, status, updated_at, focused}`, or nil and an error.
 /// @example
@@ -57,7 +58,7 @@ async fn current(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaRes
     roundtrip(lua, tx, SessionRequest::Current).await
 }
 
-/// Switches the UI to the session with {id}. The session must be live.
+/// Switches the UI to the session with {id}.
 ///
 /// @param id string Session id, as returned by `list()` or `live()`.
 /// @return (boolean|nil, string|nil) true on success, or nil and an error.

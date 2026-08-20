@@ -278,6 +278,10 @@ fn expand_lua_fn(args: LuaFnArgs, func: &mut ItemFn) -> syn::Result<TokenStream2
         doc.params.iter().zip(&rendered).map(
             |((_, ty, d), name)| quote!(crate::docs::ParamDoc { name: #name, ty: #ty, desc: #d }),
         );
+    let guard_doc = match &args.guard {
+        Some(g) => quote!(Some(crate::plugin_permissions::Permission::#g.manifest_key())),
+        None => quote!(None),
+    };
     let doc_const = quote! {
         #[allow(non_upper_case_globals)]
         pub(crate) const #doc_ident: crate::docs::FnDoc = crate::docs::FnDoc {
@@ -287,6 +291,7 @@ fn expand_lua_fn(args: LuaFnArgs, func: &mut ItemFn) -> syn::Result<TokenStream2
             params: &[#(#param_docs),*],
             returns: #returns,
             example: #example,
+            guard: #guard_doc,
         };
     };
 

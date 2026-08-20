@@ -7,17 +7,20 @@
 //! belongs in model context, and must never be mistaken for the user talking.
 
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 pub use maki_storage::sessions::Effort;
 use maki_storage::sessions::{MIN_THINKING_BUDGET, StoredThinking, TitleSource};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use strum::{Display, IntoStaticStr};
 use tracing::warn;
 
 use crate::TokenUsage;
 use crate::model::Model;
+
+const LOCAL_BUDGET_FIELD: &str = "thinking_budget_tokens";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageMediaType {
@@ -89,6 +92,8 @@ impl ImageSource {
 
 pub const IMAGE_OMITTED_NOTE: &str =
     "[image omitted: the current model does not support image input]";
+/// See [`Message::empty_marker`].
+pub const EMPTY_RESPONSE_MARKER: &str = "(empty)";
 
 /// For models without vision, image blocks become a text note instead of a
 /// wire block the API would reject. History keeps the pixels, so switching
@@ -165,6 +170,12 @@ pub enum ContentBlock {
     },
 }
 
+impl ContentBlock {
+    pub fn is_thinking(&self) -> bool {
+        matches!(self, Self::Thinking { .. } | Self::RedactedThinking { .. })
+    }
+}
+
 /// Who a message came from, which `role` cannot say. Providers only
 /// accept user and assistant, so anything the host wants to report has to
 /// travel as a user message, and without this there is no way to tell it
@@ -211,6 +222,19 @@ pub struct Message {
 }
 
 impl Message {
+    /// Stands in for an assistant turn with no text, thinking alone or empty,
+    /// which providers reject as the trailing message. Never a real response:
+    /// readers mining history for model text must skip it.
+    pub fn empty_marker() -> Self {
+        Self {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text {
+                text: EMPTY_RESPONSE_MARKER.into(),
+            }],
+            ..Default::default()
+        }
+    }
+
     /// Something the host saw, reported to the model without pretending
     /// the user said it.
     pub fn observation(text: String) -> Self {
@@ -277,7 +301,7 @@ impl Message {
 
     pub fn first_text_content(&self) -> Option<&str> {
         self.content.iter().find_map(|b| match b {
-            ContentBlock::Text { text } if !text.is_empty() => Some(text.as_str()),
+            ContentBlock::Text { text } if !text.trim().is_empty() => Some(text.as_str()),
             _ => None,
         })
     }
@@ -384,9 +408,11 @@ const OPUS: &str = "opus";
 /// `claude-opus-4.7` -> `("opus", (4, 7))`, `claude-opus-5-1m` -> `("opus", (5, 0))`.
 /// Copilot writes the version with a dot, hence the two separators. Legacy ids
 /// put the version first (`claude-3-5-sonnet-20241022`), so a numeric family
-/// tells us there is no modern version to read here.
+/// tells us there is no modern version to read here. Gateway ids keep a
+/// vendor prefix (`anthropic/claude-opus-4-7`), so read the last path segment.
 fn claude_version(model_id: &str) -> Option<(&str, (u32, u32))> {
-    let mut parts = model_id.strip_prefix("claude-")?.split(['-', '.']);
+    let bare = model_id.rsplit('/').next().unwrap_or(model_id);
+    let mut parts = bare.strip_prefix("claude-")?.split(['-', '.']);
     let family = parts.next().filter(|f| f.parse::<u32>().is_err())?;
     let major = parts.next()?.parse().ok()?;
     let minor = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
@@ -406,6 +432,60 @@ pub struct EffortDialect<'a> {
     pub adaptive: Option<Effort>,
     /// Explicit opt-out string, e.g. GLM `"none"`.
     pub off: Option<&'static str>,
+}
+
+/// How a local model spells thinking on the wire, in place of a token budget.
+/// Each mode carries the JSON fragment merged into the request body, so any
+/// shape a chat template needs works without a schema per provider.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct ThinkingFields {
+    #[serde(default)]
+    off: Option<Map<String, Value>>,
+    #[serde(default)]
+    adaptive: Option<Map<String, Value>>,
+    /// Keyed by [`Effort`]; the declared keys are the levels the model accepts.
+    #[serde(flatten)]
+    levels: BTreeMap<Effort, Map<String, Value>>,
+}
+
+impl ThinkingFields {
+    /// Levels snap to the declared ones, so a level the model never advertised
+    /// is never sent. A token budget picks the level it corresponds to; models
+    /// that declare no levels fall back to `adaptive` and keep the count
+    /// (the returned flag tells the caller to still send the budget field).
+    fn fragment(
+        &self,
+        thinking: ThinkingConfig,
+        max: Option<u32>,
+    ) -> Option<(&Map<String, Value>, bool)> {
+        let level = match thinking {
+            ThinkingConfig::Off => return self.off.as_ref().map(|f| (f, false)),
+            ThinkingConfig::Adaptive => return self.adaptive.as_ref().map(|f| (f, false)),
+            ThinkingConfig::Effort(level) => level,
+            ThinkingConfig::Budget(n) => {
+                if self.levels.is_empty() {
+                    return self.adaptive.as_ref().map(|f| (f, true));
+                }
+                Effort::from_budget(n, max.unwrap_or(FALLBACK_MAX_THINKING_BUDGET))
+            }
+        };
+        let declared: Vec<Effort> = self.levels.keys().copied().collect();
+        self.levels
+            .get(&level.snap(&declared))
+            .or(self.adaptive.as_ref())
+            .map(|f| (f, false))
+    }
+}
+
+fn merge_body(body: &mut Map<String, Value>, fragment: &Map<String, Value>) {
+    for (key, value) in fragment {
+        match (body.get_mut(key), value.as_object()) {
+            (Some(Value::Object(target)), Some(source)) => merge_body(target, source),
+            _ => {
+                body.insert(key.clone(), value.clone());
+            }
+        }
+    }
 }
 
 pub mod dialect {
@@ -461,6 +541,13 @@ pub mod dialect {
         supported: &[Low, Medium, High],
         adaptive: Some(High),
         off: Some(OFF),
+    };
+    /// xAI Grok 4.5/4.6. Adaptive defaults to high; Off sends nothing so the
+    /// model keeps its own default. `xhigh` is advertised on Grok 4.6.
+    pub const GROK: EffortDialect = EffortDialect {
+        supported: &[Low, Medium, High, XHigh],
+        adaptive: Some(High),
+        off: None,
     };
 }
 
@@ -527,15 +614,15 @@ impl ThinkingConfig {
     /// token budget.
     pub fn apply_to_body(self, body: &mut Value, model: &Model) {
         if Self::requires_adaptive(&model.id) {
-            match self {
-                Self::Off => {}
-                Self::Adaptive => body["thinking"] = json!({"type": "adaptive"}),
-                Self::Effort(_) | Self::Budget(_) => {
-                    body["thinking"] = json!({"type": "adaptive"});
-                    if let Some(effort) = self.effort_str(&dialect::ANTHROPIC_ADAPTIVE, model) {
-                        body["output_config"]["effort"] = json!(effort);
-                    }
-                }
+            if matches!(self, Self::Off) {
+                return;
+            }
+            // These models default `display` to "omitted", so thinking arrives
+            // empty and tool calls pop up out of nowhere in the UI. Asking for
+            // the summary back costs nothing: thinking tokens bill the same.
+            body["thinking"] = json!({"type": "adaptive", "display": "summarized"});
+            if let Some(effort) = self.effort_str(&dialect::ANTHROPIC_ADAPTIVE, model) {
+                body["output_config"]["effort"] = json!(effort);
             }
             return;
         }
@@ -581,12 +668,25 @@ impl ThinkingConfig {
     }
 
     pub fn apply_local_thinking(self, body: &mut Value, model: &Model) {
-        let budget = match self.budget(model.max_thinking_budget()) {
+        let max = model.max_thinking_budget();
+        if let Some(fields) = &model.thinking_fields
+            && let Some((fragment, keep_budget)) = fields.fragment(self, max)
+            && let Some(object) = body.as_object_mut()
+        {
+            merge_body(object, fragment);
+            if keep_budget && let Budgeted::Tokens(budget) = self.budget(max) {
+                body[LOCAL_BUDGET_FIELD] = json!(budget);
+            }
+            return;
+        }
+        // No fragment means the model has no way to spell this mode, so the
+        // budget field takes over: a request must never end up saying nothing.
+        let budget = match self.budget(max) {
             Budgeted::Off => 0,
             Budgeted::Adaptive => -1,
             Budgeted::Tokens(n) => i64::from(n),
         };
-        body["thinking_budget_tokens"] = json!(budget);
+        body[LOCAL_BUDGET_FIELD] = json!(budget);
     }
 
     pub fn parse(input: &str, current: Self) -> Result<Self, &'static str> {
@@ -855,6 +955,25 @@ mod tests {
         }
     }
 
+    fn native_thinking_model(id: &str, fields: Value) -> crate::model::Model {
+        let mut model = thinking_model(id);
+        model.thinking_fields = Some(Box::new(serde_json::from_value(fields).unwrap()));
+        model
+    }
+
+    fn native_effort_model() -> crate::model::Model {
+        native_thinking_model(
+            "local-model",
+            json!({
+                "off": {"reasoning_effort": "none"},
+                "adaptive": {"reasoning_effort": "medium"},
+                "low": {"reasoning_effort": "low"},
+                "medium": {"reasoning_effort": "medium"},
+                "xhigh": {"reasoning_effort": "xhigh"}
+            }),
+        )
+    }
+
     #[test]
     fn dialects_have_non_empty_ascending_supported() {
         let all = [
@@ -865,6 +984,7 @@ mod tests {
             &dialect::DEEPSEEK,
             &dialect::ANTHROPIC_ADAPTIVE,
             &dialect::TENSORX,
+            &dialect::GROK,
         ];
         for d in all {
             assert!(!d.supported.is_empty());
@@ -884,13 +1004,14 @@ mod tests {
     #[test_case(ThinkingConfig::Budget(10000), "claude-sonnet-4-6", json!({"thinking": {"type": "enabled", "budget_tokens": 4096}}) ; "budget_legacy_sonnet")]
     #[test_case(ThinkingConfig::Budget(10000), "claude-opus-4-6", json!({"thinking": {"type": "enabled", "budget_tokens": 4096}}) ; "budget_legacy_opus_4_6")]
     #[test_case(ThinkingConfig::Off, "claude-opus-4-7", json!({}) ; "off_adaptive_model")]
-    #[test_case(ThinkingConfig::Adaptive, "claude-opus-4-7", json!({"thinking": {"type": "adaptive"}}) ; "adaptive_adaptive_model")]
-    #[test_case(ThinkingConfig::Budget(10000), "claude-opus-4-7", json!({"thinking": {"type": "adaptive"}, "output_config": {"effort": "high"}}) ; "budget_adaptive_opus_4_7")]
-    #[test_case(ThinkingConfig::Effort(Low), "claude-opus-4-7", json!({"thinking": {"type": "adaptive"}, "output_config": {"effort": "low"}}) ; "effort_low_passthrough")]
-    #[test_case(ThinkingConfig::Budget(10000), "claude-opus-4-8-1m", json!({"thinking": {"type": "adaptive"}, "output_config": {"effort": "high"}}) ; "budget_adaptive_opus_4_8_long_context")]
-    #[test_case(ThinkingConfig::Budget(10000), "claude-opus-5-1m", json!({"thinking": {"type": "adaptive"}, "output_config": {"effort": "high"}}) ; "budget_adaptive_opus_5_unparsable_minor")]
-    #[test_case(ThinkingConfig::Budget(10000), "claude-opus-4.7", json!({"thinking": {"type": "adaptive"}, "output_config": {"effort": "high"}}) ; "budget_adaptive_copilot_dotted_id")]
-    #[test_case(ThinkingConfig::Budget(10000), "claude-sonnet-5", json!({"thinking": {"type": "adaptive"}, "output_config": {"effort": "high"}}) ; "budget_adaptive_sonnet_5")]
+    #[test_case(ThinkingConfig::Adaptive, "claude-opus-4-7", json!({"thinking": {"type": "adaptive", "display": "summarized"}}) ; "adaptive_adaptive_model")]
+    #[test_case(ThinkingConfig::Budget(10000), "claude-opus-4-7", json!({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": "high"}}) ; "budget_adaptive_opus_4_7")]
+    #[test_case(ThinkingConfig::Effort(Low), "claude-opus-4-7", json!({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": "low"}}) ; "effort_low_passthrough")]
+    #[test_case(ThinkingConfig::Budget(10000), "claude-opus-4-8-1m", json!({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": "high"}}) ; "budget_adaptive_opus_4_8_long_context")]
+    #[test_case(ThinkingConfig::Budget(10000), "claude-opus-5-1m", json!({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": "high"}}) ; "budget_adaptive_opus_5_unparsable_minor")]
+    #[test_case(ThinkingConfig::Budget(10000), "claude-opus-4.7", json!({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": "high"}}) ; "budget_adaptive_copilot_dotted_id")]
+    #[test_case(ThinkingConfig::Budget(10000), "claude-sonnet-5", json!({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": "high"}}) ; "budget_adaptive_sonnet_5")]
+    #[test_case(ThinkingConfig::Budget(10000), "anthropic/claude-opus-4-7", json!({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": "high"}}) ; "budget_adaptive_gateway_prefixed_id")]
     #[test_case(ThinkingConfig::Budget(10000), "claude-3-5-sonnet-20241022", json!({"thinking": {"type": "enabled", "budget_tokens": 4096}}) ; "budget_legacy_dated_id")]
     fn thinking_apply_to_body(config: ThinkingConfig, model_id: &str, expected: Value) {
         let mut body = json!({});
@@ -962,6 +1083,67 @@ mod tests {
         assert_eq!(body["thinking_budget_tokens"], expected);
     }
 
+    #[test_case(ThinkingConfig::Off,           json!({"reasoning_effort": "none"})   ; "off")]
+    #[test_case(ThinkingConfig::Adaptive,      json!({"reasoning_effort": "medium"}) ; "adaptive")]
+    #[test_case(ThinkingConfig::Effort(Low),   json!({"reasoning_effort": "low"})    ; "low")]
+    #[test_case(ThinkingConfig::Effort(High),  json!({"reasoning_effort": "medium"}) ; "undeclared_high_snaps_down")]
+    #[test_case(ThinkingConfig::Effort(XHigh), json!({"reasoning_effort": "xhigh"})  ; "xhigh")]
+    #[test_case(ThinkingConfig::Budget(4096),  json!({"reasoning_effort": "xhigh"})  ; "numeric_budget_maps_to_declared_level")]
+    fn local_native_effort_uses_declared_levels(config: ThinkingConfig, expected: Value) {
+        let mut body = json!({});
+        config.apply_local_thinking(&mut body, &native_effort_model());
+        assert_eq!(body, expected);
+    }
+
+    #[test]
+    fn local_required_thinking_maps_off_to_lowest_native_effort() {
+        let mut model = native_effort_model();
+        model.thinking_override = Some(Support::Required);
+        let thinking = RequestOptions {
+            thinking: ThinkingConfig::Off,
+            fast: false,
+        }
+        .clamped(&model)
+        .thinking;
+        let mut body = json!({});
+        thinking.apply_local_thinking(&mut body, &model);
+        assert_eq!(body, json!({"reasoning_effort": "low"}));
+    }
+
+    #[test_case(ThinkingConfig::Off,          json!({"chat_template_kwargs": {"enable_thinking": false, "keep": 1}}) ; "off")]
+    #[test_case(ThinkingConfig::Adaptive,     json!({"chat_template_kwargs": {"enable_thinking": true, "keep": 1}})  ; "adaptive")]
+    #[test_case(ThinkingConfig::Effort(High), json!({"chat_template_kwargs": {"enable_thinking": true, "keep": 1}})  ; "effort_without_levels_uses_adaptive")]
+    #[test_case(ThinkingConfig::Budget(2048), json!({"chat_template_kwargs": {"enable_thinking": true, "keep": 1}, "thinking_budget_tokens": 2048}) ; "numeric_budget")]
+    fn local_native_toggle_merges_into_nested_object(config: ThinkingConfig, expected: Value) {
+        let model = native_thinking_model(
+            "local-toggle-model",
+            json!({
+                "off": {"chat_template_kwargs": {"enable_thinking": false}},
+                "adaptive": {"chat_template_kwargs": {"enable_thinking": true}}
+            }),
+        );
+        let mut body = json!({"chat_template_kwargs": {"keep": 1}});
+        config.apply_local_thinking(&mut body, &model);
+        assert_eq!(body, expected);
+    }
+
+    /// A mode the model has no fragment for must still reach the server, so
+    /// the budget field takes over instead of the request saying nothing.
+    #[test_case(json!({"low": {"reasoning_effort": "low"}}), ThinkingConfig::Off, 0 ; "off_without_off")]
+    #[test_case(json!({"adaptive": {"enable_thinking": true}}), ThinkingConfig::Off, 0 ; "toggle_without_off")]
+    #[test_case(json!({"off": {"reasoning_effort": "none"}}), ThinkingConfig::Adaptive, -1 ; "adaptive_without_adaptive")]
+    #[test_case(json!({"off": {"reasoning_effort": "none"}}), ThinkingConfig::Budget(4096), 4096 ; "budget_without_levels")]
+    fn local_native_missing_fragment_falls_back_to_budget(
+        fields: Value,
+        config: ThinkingConfig,
+        expected: i64,
+    ) {
+        let model = native_thinking_model("local-partial", fields);
+        let mut body = json!({});
+        config.apply_local_thinking(&mut body, &model);
+        assert_eq!(body, json!({ "thinking_budget_tokens": expected }));
+    }
+
     /// llama.cpp models have no known output window; the budget the user
     /// asked for must reach the server untouched.
     #[test]
@@ -985,6 +1167,7 @@ mod tests {
             pricing: crate::model::ModelPricing::default(),
             max_output_tokens: Some(8192),
             context_window: 200_000,
+            thinking_fields: None,
         }
     }
 

@@ -129,8 +129,7 @@ pub mod key {
 
     pub const QUIT: Bind = ctrl_bind!('c');
     pub const HELP: Bind = ctrl_bind!('h');
-    pub const PREV_CHAT: Bind = ctrl_bind!('p');
-    pub const NEXT_CHAT: Bind = ctrl_bind!('n');
+    pub const SESSIONS: Bind = ctrl_bind!('p');
     pub const SCROLL_HALF_UP: Bind = ctrl_bind!('u');
     pub const SCROLL_HALF_DOWN: Bind = ctrl_bind!('d');
     pub const SCROLL_LINE_UP: Bind = ctrl_bind!('y');
@@ -144,6 +143,7 @@ pub mod key {
     pub const OPEN_EDITOR: Bind = ctrl_bind!('o');
     pub const PLAN_TOGGLE: Bind = ctrl_bind!('t');
     pub const TASKS: Bind = ctrl_bind!('x');
+    pub const MODEL_PICKER: Bind = ctrl_bind!('m');
     pub const REFRESH: Bind = ctrl_bind!('r');
     pub const SUSPEND: Bind = ctrl_bind!('z');
     pub const DELETE: Bind = ctrl_bind!('d');
@@ -316,12 +316,6 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
-        label: KeyLabel::Alt(key::NEXT_CHAT.label, key::PREV_CHAT.label),
-        description: "Next / previous task chat",
-        context: KeybindContext::General,
-        platform: Platform::All,
-    },
-    Keybind {
         label: KeyLabel::Single(key::SEARCH.label),
         description: "Search messages",
         context: KeybindContext::General,
@@ -348,6 +342,12 @@ pub const KEYBINDS: &[Keybind] = &[
     Keybind {
         label: KeyLabel::Single(key::TASKS.label),
         description: "Open tasks",
+        context: KeybindContext::General,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(key::MODEL_PICKER.label),
+        description: "Model picker",
         context: KeybindContext::General,
         platform: Platform::All,
     },

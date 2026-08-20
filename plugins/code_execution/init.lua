@@ -6,12 +6,15 @@
 local truncate = require("maki.truncate")
 local ToolView = require("maki.tool_view")
 local output_limits = require("maki.output_limits")
+local partial = require("maki.partial")
 
 local DEFAULT_MAX_OUTPUT_LINES = 2000
 local DEFAULT_MAX_OUTPUT_BYTES = 50 * 1024
 local MAX_SCRIPT_LINES = 2000
 local NO_OUTPUT = "(no output)"
 local SEPARATOR = "──────"
+local CANCELLED_ERR = "cancelled"
+local TIME_LIMIT_SUBSTR = "time limit exceeded"
 local PREAMBLE = "import re\nimport asyncio\nimport sys\nimport os\nimport json\n"
 local TOOLS_HEADER = "\n\nAvailable tools (called as Python functions with keyword arguments):\n"
 local WORKFLOW_TOOLS_NOTE =
@@ -226,13 +229,32 @@ local function handler(input, ctx)
   view:append({ { "Waiting for output...", "dim" } })
 
   local waiting = true
+  local output_parts = {}
   local function show(line)
     if waiting then
       waiting = false
       view:clear()
     end
+    output_parts[#output_parts + 1] = line
     view:append(line)
   end
+
+  local max_lines, max_bytes = output_limits.resolve(opts, ctx)
+
+  -- Memoized, because a cancel reaches us twice: once through the hook and
+  -- again as the interpreter's error, and the view is painted only once.
+  local cut_reply
+  local function cut(reason)
+    cut_reply = cut_reply
+      or partial.cut(view, truncate(table.concat(output_parts, "\n"), max_lines, max_bytes), reason, timeout)
+    return cut_reply
+  end
+
+  -- Only for a handler still parked when the host gives up on it: normally
+  -- the interpreter sees the cancel and we return the partial reply below.
+  maki.async.on_cancel(function(reason)
+    ctx:finish(cut(reason))
+  end)
 
   local tools = {}
   for _, t in ipairs(interpreter_tools(maki.api.get_tools({ config = config }), ctx:audience(), ctx:workflow())) do
@@ -251,6 +273,12 @@ local function handler(input, ctx)
   })
 
   if err then
+    if err == CANCELLED_ERR then
+      return cut("cancelled")
+    end
+    if err:find(TIME_LIMIT_SUBSTR, 1, true) then
+      return cut("timeout")
+    end
     if waiting then
       view:clear()
     end
@@ -270,7 +298,6 @@ local function handler(input, ctx)
     view:append({ { "No output", "dim" } })
   end
 
-  local max_lines, max_bytes = output_limits.resolve(opts, ctx)
   local llm_output = truncate(output, max_lines, max_bytes)
   view:finish()
 

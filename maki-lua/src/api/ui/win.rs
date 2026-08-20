@@ -109,6 +109,7 @@ const recv__doc: FnDoc = FnDoc {
         desc: "Max milliseconds to wait before a timeout event is returned.",
     }],
     returns: "(table|nil) Event table, or nil if the window has closed.",
+    guard: None,
     example: "while true do\n  local ev = win:recv()\n  if not ev or ev.key == \"q\" then break end\n  if ev.type == \"key\" and ev.key == \"j\" then\n    -- move cursor down\n  end\nend\nwin:close()",
 };
 

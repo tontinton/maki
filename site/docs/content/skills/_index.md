@@ -1,8 +1,8 @@
 +++
 title = "Skills"
-weight = 9
+weight = 20
 [extra]
-group = "Reference"
+group = "Guides"
 +++
 
 # Skills

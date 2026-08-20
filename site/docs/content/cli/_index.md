@@ -1,6 +1,6 @@
 +++
 title = "CLI"
-weight = 12
+weight = 11
 [extra]
 group = "Reference"
 +++

@@ -4,7 +4,7 @@ set -e
 # Cloudflare Pages build script
 # Assembles the static landing page + Zola docs into a single output dir.
 
-ZOLA_VERSION="${ZOLA_VERSION:-0.19.2}"
+ZOLA_VERSION="${ZOLA_VERSION:-0.22.1}"
 
 if ! command -v zola >/dev/null 2>&1; then
   echo "Installing zola ${ZOLA_VERSION}..."
@@ -96,5 +96,42 @@ summary=$(first_paragraph docs/content/_index.md)
     body "$f"
   done
 } > "$OUT/llms-full.txt"
+
+# Per-page token estimate (chars/4), shown next to "Copy as Markdown"
+for f in $pages; do
+  slug=$(basename "$(dirname "$f")")
+  t=$(awk -v c="$(wc -c < "$OUT/docs/$slug/index.md")" \
+    'BEGIN { t = c / 4; if (t >= 1000) printf "%.1fk", t / 1000; else printf "%d", int(t) }')
+  sed -i "s|<span class=\"page-tokens\"[^>]*></span>|<span class=\"page-tokens\" title=\"Estimated tokens if you paste this page into an LLM\">~$t tokens</span>|" \
+    "$OUT/docs/$slug/index.html"
+done
+
+# 4. Search index (lazy-loaded by the docs search modal)
+python3 - "$OUT/docs/search.json" docs/content <<'EOF'
+import json, os, re, sys
+
+out, root = sys.argv[1], sys.argv[2]
+docs = []
+for slug in os.listdir(root):
+    path = os.path.join(root, slug, "_index.md")
+    if not os.path.isfile(path):
+        continue
+    raw = open(path, encoding="utf-8").read()
+    m = re.match(r"\+\+\+\n(.*?)\n\+\+\+\n", raw, re.S)
+    fm, body = m.group(1), raw[m.end():]
+    title = re.search(r'^title = "(.*)"$', fm, re.M).group(1)
+    weight = re.search(r"^weight = (\d+)$", fm, re.M)
+    body = re.sub(r"^```.*$", "", body, flags=re.M)
+    body = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", body)
+    body = re.sub(r"<[^>]+>", " ", body)
+    body = re.sub(r"[#*`|]", " ", body)
+    body = re.sub(r"-{3,}", " ", body)
+    body = re.sub(r"\s+", " ", body).strip()
+    docs.append((int(weight.group(1)) if weight else 999,
+                 {"title": title, "href": f"/docs/{slug}/", "body": body}))
+docs.sort(key=lambda d: d[0])
+with open(out, "w", encoding="utf-8") as f:
+    json.dump([d for _, d in docs], f, ensure_ascii=False)
+EOF
 
 cp "$OUT/llms.txt" "$OUT/llms-full.txt" "$OUT/docs/"

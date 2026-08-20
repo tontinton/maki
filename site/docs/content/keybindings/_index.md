@@ -1,6 +1,6 @@
 +++
 title = "Keybindings"
-weight = 5
+weight = 9
 [extra]
 group = "Reference"
 +++
@@ -15,12 +15,12 @@ On macOS, some bindings use Option or Fn keys instead (run `/help` for exact key
 |-----|--------|
 | `Ctrl+C` | Quit / clear input |
 | `Ctrl+H` | Show keybindings |
-| `Ctrl+N` / `Ctrl+P` | Next / previous task chat |
 | `Ctrl+F` | Search messages |
 | `Ctrl+S` | File picker |
 | `Ctrl+O` | Open plan in editor |
 | `Ctrl+T` | Toggle plan panel |
 | `Ctrl+X` | Open tasks |
+| `Ctrl+M` | Model picker |
 
 ## Editing
 
@@ -87,6 +87,14 @@ Some pickers add extra bindings on top of the defaults:
 | Session Picker | `Ctrl+N` | New session |
 | Session Picker | `Ctrl+R` | Rename session |
 | Session Picker | `Ctrl+D` | Delete session (press twice) |
+
+## Plugins
+
+Built-in plugins register these themselves, and your own plugins can add more with `maki.keymap.set`:
+
+| Key | Action |
+|-----|--------|
+| `Ctrl+P` | Browse sessions |
 
 ## Context Inheritance
 

@@ -20,6 +20,7 @@ use std::sync::{Arc, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use maki_storage::{StateDir, atomic_write};
 use tracing::warn;
 
+use crate::manifest::ManifestRegistry;
 use crate::model::{ModelInfo, ModelTier};
 
 const TIERS_FILE: &str = "model-tiers";
@@ -149,16 +150,15 @@ impl ModelRegistry {
                 t => t,
             };
         }
-        if let Some((_, model_id)) = spec.split_once('/')
+        if tiers_from_discovery(provider)
+            && let Some((_, model_id)) = spec.split_once('/')
             && let Some(models) = self.known_models.get(provider)
-            && let Some(model) = models.iter().find(|model| model.id == model_id)
+            && let Some(pos) = models.iter().position(|model| model.id == model_id)
         {
-            if let Some(tier) = model.tier {
+            if let Some(tier) = models[pos].tier {
                 return tier;
             }
-            if static_tier.is_none()
-                && let Some(pos) = models.iter().position(|candidate| candidate.id == model_id)
-            {
+            if static_tier.is_none() {
                 return tier_for_position(pos);
             }
         }
@@ -176,11 +176,14 @@ impl ModelRegistry {
             return Some(spec.clone());
         }
 
-        let candidate = self
-            .discovered_static_candidate(provider, tier)
-            .or_else(|| self.metadata_candidate(provider, tier))
-            .or_else(|| static_candidate(provider, tier))
-            .or_else(|| self.positional_candidate(provider, tier))?;
+        let candidate = if tiers_from_discovery(provider) {
+            self.discovered_static_candidate(provider, tier)
+                .or_else(|| self.metadata_candidate(provider, tier))
+                .or_else(|| static_candidate(provider, tier))
+                .or_else(|| self.positional_candidate(provider, tier))
+        } else {
+            static_candidate(provider, tier)
+        }?;
 
         (!self.claimed_elsewhere(&candidate, tier)).then_some(candidate)
     }
@@ -244,6 +247,14 @@ impl ModelRegistry {
     }
 }
 
+/// Discovery metadata (context window, pricing, vision) is stored for every
+/// provider, but only providers that accept arbitrary models may use the
+/// discovered list for tier auto-assignment; curated providers keep their
+/// static tier tables.
+fn tiers_from_discovery(provider: &str) -> bool {
+    ManifestRegistry::get(provider).is_none_or(|m| m.accepts_arbitrary_models)
+}
+
 fn static_candidate(provider: &str, tier: ModelTier) -> Option<String> {
     static_prefixes(provider, tier)
         .next()
@@ -251,7 +262,7 @@ fn static_candidate(provider: &str, tier: ModelTier) -> Option<String> {
 }
 
 fn static_prefixes(provider: &str, tier: ModelTier) -> impl Iterator<Item = &'static str> {
-    crate::manifest::ManifestRegistry::get(provider)
+    ManifestRegistry::get(provider)
         .into_iter()
         .flat_map(|manifest| manifest.models)
         .filter(move |entry| entry.default && entry.tier == tier)
@@ -334,6 +345,27 @@ mod tests {
         assert_eq!(t("ollama/pos1", None), ModelTier::Weak);
         assert_eq!(t("ollama/pos2", None), ModelTier::Weak);
         assert_eq!(t("ollama/unknown", None), ModelTier::Medium);
+    }
+
+    #[test]
+    fn curated_provider_ignores_discovered_tiers() {
+        let mut reg = ModelRegistry::default();
+        reg.set_known_models(
+            "synthetic",
+            vec![ModelInfo {
+                tier: Some(ModelTier::Strong),
+                ..ModelInfo::id_only("syn:large:vision".into())
+            }],
+        );
+
+        assert_ne!(
+            reg.tier_for("synthetic/syn:large:vision", "synthetic", None),
+            ModelTier::Strong
+        );
+        assert_ne!(
+            reg.spec_for_tier("synthetic", ModelTier::Strong),
+            Some("synthetic/syn:large:vision".into())
+        );
     }
 
     fn make_tiered(models: &[(&str, ModelTier)]) -> ModelRegistry {

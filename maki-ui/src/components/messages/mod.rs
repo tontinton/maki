@@ -22,6 +22,7 @@ use crate::render_worker::RenderWorker;
 use crate::selection::Selection;
 use crate::splash::{ColorTransition, Splash};
 use crate::theme;
+use crate::update;
 use maki_config::{ClockFormat, ToolOutputLines, UiConfig};
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -38,6 +39,8 @@ use maki_lua::{EventHandle, WARM_TOOL_CAP, WinView};
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
+
+use crate::repaint::{Cadence, Dirty};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use tracing::warn;
@@ -427,7 +430,7 @@ impl MessagesPanel {
         for id in &affected_ids {
             // The stale-run_id filter drops these tools' ToolDone events,
             // so retire their live bufs here: keeps them clickable via
-            // the warm path and stops them pinning `is_animating`.
+            // the warm path and stops them being polled forever.
             self.retire_live_buf(id);
             self.rebuild_tool_segment(id);
         }
@@ -689,14 +692,32 @@ impl MessagesPanel {
         msg.tool_output.as_deref()?.owned_instructions()
     }
 
-    pub fn is_animating(&self) -> bool {
-        self.in_progress_count() > 0
-            || self.streaming_thinking.is_animating()
-            || self.streaming_text.is_animating()
-            || self.show_idle_splash()
+    /// Drains the highlight worker and every live tool buffer. These used to
+    /// run inside [`Self::view`], which is why a running tool had to claim it
+    /// was animating: it was the only way to keep them fed.
+    pub fn tick(&mut self) -> Dirty {
+        let mut dirty = self.drain_highlights() | self.poll_live_bufs();
+        if self.show_idle_splash() {
+            dirty |= self.idle_splash.poll_update(update::latest_version());
+        }
+        dirty
+    }
+
+    pub fn cadence(&self) -> Cadence {
+        // Collapsed thinking draws a line count, not the text, so its
+        // typewriter reveals nothing and never advances either, since only
+        // `view` ticks it. Believing it would pin the loop at full frame rate
+        // for the whole reasoning phase.
+        let smooth = self.streaming_text.is_animating()
             || self.accent.is_animating()
-            || !self.live_bufs.is_empty()
-            || self.streaming_thinking_collapsed()
+            || (self.streaming_thinking.is_animating() && !self.streaming_thinking_collapsed());
+        Cadence::any([
+            // A running tool draws a spinner. Its output arriving is data, and
+            // `tick` reports that separately.
+            Cadence::when(self.in_progress_count() > 0, Cadence::SPINNER),
+            Cadence::when(smooth, Cadence::SMOOTH),
+            Cadence::when(self.show_idle_splash(), self.idle_splash.cadence()),
+        ])
     }
 
     fn streaming_thinking_collapsed(&self) -> bool {
@@ -744,8 +765,6 @@ impl MessagesPanel {
                 assistant.prefix_style,
             );
         }
-        self.drain_highlights();
-        self.poll_live_bufs();
         self.rebuild_line_cache();
         if self.in_progress_count() > 0 {
             self.update_spinners();
@@ -925,7 +944,8 @@ impl MessagesPanel {
 
     /// Moves a finished tool's live buf to the watched set, flushing any
     /// last dirty lines. Called on completion and on cancellation, so
-    /// `live_bufs` never leaks entries that keep `is_animating` true.
+    /// `live_bufs` never leaks entries that outlive their tool, and the capped
+    /// watched set keeps what `tick` polls bounded.
     /// Returns whether a live buf existed for this id.
     fn retire_live_buf(&mut self, id: &str) -> bool {
         let Some(buf) = self.live_bufs.remove(id) else {
@@ -1065,16 +1085,21 @@ impl MessagesPanel {
         self.live_bufs.insert(id, body);
     }
 
-    fn poll_live_bufs(&mut self) {
-        let dirty: Vec<_> = self
+    /// Snapshots are baked at the last width `view` saw, and a resize
+    /// invalidates every segment anyway (see `width_changed` in `view`), so
+    /// polling ahead of the frame that reflows them is safe.
+    fn poll_live_bufs(&mut self) -> Dirty {
+        let updated: Vec<_> = self
             .live_bufs
             .iter()
             .chain(self.watched_bufs.iter().map(|(id, buf)| (id, buf)))
             .filter_map(|(id, buf)| buf.read_if_dirty().map(|lines| (id.clone(), lines)))
             .collect();
-        for (tool_id, lines) in dirty {
+        let dirty = Dirty::from(!updated.is_empty());
+        for (tool_id, lines) in updated {
             self.store_snapshot(&tool_id, BufferSnapshot::from_arc(lines), false, None);
         }
+        dirty
     }
 
     fn build_tool_segment_lines(
@@ -1191,7 +1216,8 @@ impl MessagesPanel {
         }
     }
 
-    fn drain_highlights(&mut self) {
+    fn drain_highlights(&mut self) -> Dirty {
+        let mut dirty = Dirty::NO;
         while let Some(result) = self.hl_worker.try_recv() {
             if let Some(seg) = self
                 .cache
@@ -1200,8 +1226,10 @@ impl MessagesPanel {
                 .find(|s| s.matches_pending_highlight(result.id))
             {
                 seg.apply_highlight_result(result.lines);
+                dirty = Dirty::YES;
             }
         }
+        dirty
     }
 
     fn rebuild_tool_segment(&mut self, tool_id: &str) {

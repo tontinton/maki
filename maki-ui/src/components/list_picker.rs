@@ -9,6 +9,7 @@ use crate::components::is_ctrl;
 use crate::components::keybindings::key;
 use crate::components::modal::Modal;
 use crate::components::scrollbar::render_vertical_scrollbar;
+use crate::repaint::Cadence;
 use crate::text_buffer::TextBuffer;
 use crate::theme;
 
@@ -306,6 +307,15 @@ impl<T: PickerItem> ListPicker<T> {
         self.state.is_some()
     }
 
+    pub fn cadence(&self) -> Cadence {
+        Cadence::when(
+            self.state
+                .as_ref()
+                .is_some_and(|s| s.items.iter().any(PickerItem::is_spinning)),
+            Cadence::SPINNER,
+        )
+    }
+
     pub fn close(&mut self) {
         self.state = None;
     }
@@ -480,6 +490,10 @@ impl<T: PickerItem> Overlay for ListPicker<T> {
 
     fn close(&mut self) {
         self.close()
+    }
+
+    fn cadence(&self) -> Cadence {
+        self.cadence()
     }
 }
 
@@ -812,6 +826,7 @@ mod tests {
     struct Entry {
         label: String,
         detail: Option<String>,
+        spinning: bool,
     }
 
     impl Entry {
@@ -819,6 +834,7 @@ mod tests {
             Self {
                 label: label.into(),
                 detail: None,
+                spinning: false,
             }
         }
     }
@@ -830,6 +846,26 @@ mod tests {
         fn detail(&self) -> Option<&str> {
             self.detail.as_deref()
         }
+        fn is_spinning(&self) -> bool {
+            self.spinning
+        }
+    }
+
+    /// The running-task spinner is drawn here and nowhere else, so this is the
+    /// only place that can tell the loop to keep painting it.
+    #[test]
+    fn a_spinning_item_animates_the_picker() {
+        let mut p = ListPicker::new();
+        p.open(entries(&["idle task"]), " Test ");
+        assert_eq!(p.cadence(), Cadence::IDLE);
+
+        let mut running = Entry::new("running task");
+        running.spinning = true;
+        p.replace_items(vec![running]);
+        assert_eq!(p.cadence(), Cadence::SPINNER);
+
+        p.close();
+        assert_eq!(p.cadence(), Cadence::IDLE, "a closed picker draws nothing");
     }
 
     fn entries(names: &[&str]) -> Vec<Entry> {

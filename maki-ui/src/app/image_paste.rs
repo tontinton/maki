@@ -4,6 +4,8 @@ use std::thread;
 use crate::image;
 use maki_agent::{ImageMediaType, ImageSource};
 
+use crate::repaint::Dirty;
+
 use super::App;
 
 const IMAGE_NOT_SUPPORTED_MSG: &str = "Model does not support image input";
@@ -39,7 +41,8 @@ impl App {
         self.status_bar.flash(flash);
     }
 
-    pub fn poll_image_paste(&mut self) {
+    pub fn poll_image_paste(&mut self) -> Dirty {
+        let mut dirty = Dirty::NO;
         let mut i = 0;
         while i < self.image_paste_rx.len() {
             let Ok(result) = self.image_paste_rx[i].try_recv() else {
@@ -47,6 +50,7 @@ impl App {
                 continue;
             };
             self.image_paste_rx.swap_remove(i);
+            dirty = Dirty::YES;
             match result {
                 Ok(source) => {
                     if !self.state.model.supports_vision() {
@@ -59,5 +63,6 @@ impl App {
                 Err(e) => self.status_bar.flash(format!("Image paste failed: {e}")),
             }
         }
+        dirty
     }
 }

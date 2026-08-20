@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use crate::manifest::{ManifestRegistry, ProviderManifest};
 use crate::model_registry;
 use crate::providers::{anthropic, custom, dynamic};
+use crate::types::ThinkingFields;
 
 const PER_MILLION: f64 = 1_000_000.0;
 
@@ -235,13 +236,16 @@ pub struct Model {
     pub tier: ModelTier,
     pub family: ModelFamily,
     pub supports_tool_examples_override: Option<bool>,
-    /// `None` falls back to discovery, then the provider manifest.
+    /// Resolved thinking support, used by gateway providers (e.g. Aperture)
+    /// that stream through a native provider chosen at runtime. `None` falls
+    /// back to discovery, then the provider manifest.
     pub thinking_override: Option<ThinkingSupport>,
     pub supports_vision_override: Option<bool>,
     pub pricing: ModelPricing,
     /// `None` when unknown, see [`ProviderKind::fallback_max_output`].
     pub max_output_tokens: Option<u32>,
     pub context_window: u32,
+    pub thinking_fields: Option<Box<ThinkingFields>>,
 }
 
 impl Model {
@@ -280,6 +284,7 @@ impl Model {
             pricing,
             max_output_tokens,
             context_window,
+            thinking_fields: None,
         }
     }
 
@@ -310,6 +315,7 @@ impl Model {
             },
             max_output_tokens: Some(meta.output),
             context_window: meta.context,
+            thinking_fields: None,
         }
     }
 
@@ -919,6 +925,7 @@ mod tests {
     #[test_case("anthropic/claude-99-turbo", "anthropic", "claude-99-turbo" ; "unknown_anthropic_model_accepted")]
     #[test_case("zai/glm-99", "zai", "glm-99" ; "unknown_zai_model_accepted")]
     #[test_case("openai/gpt-99", "openai", "gpt-99" ; "unknown_openai_model_accepted")]
+    #[test_case("xai/grok-99", "xai", "grok-99" ; "unknown_xai_model_accepted")]
     #[test_case("synthetic/hf:nonexistent", "synthetic", "hf:nonexistent" ; "unknown_synthetic_model_accepted")]
     #[test_case("ollama/my-custom-model", "ollama", "my-custom-model" ; "unknown_ollama_model_accepted")]
     #[test_case("deepseek/my-custom-model", "deepseek", "my-custom-model" ; "unknown_deepseek_model_accepted")]
@@ -953,6 +960,7 @@ mod tests {
 
     #[test_case("anthropic/claude-opus-4-8",       true  ; "claude")]
     #[test_case("openai/gpt-5.4",                   true  ; "gpt")]
+    #[test_case("xai/grok-4.6",                     true  ; "grok")]
     #[test_case("google/gemini-2.5-pro",            true  ; "gemini")]
     #[test_case("copilot/claude-opus-4.7",          true  ; "copilot_entry_beats_generic_family")]
     #[test_case("zai/glm-5-code",                   false ; "glm_code_text_only")]
@@ -991,6 +999,26 @@ mod tests {
             output: 150.0,
         });
         assert!(!model.supports_fast());
+    }
+
+    #[test]
+    fn discovered_vision_flows_into_curated_provider_model() {
+        use crate::model::ModelInfo;
+
+        model_registry::set_known_models(
+            "synthetic",
+            vec![
+                ModelInfo {
+                    supports_vision: Some(true),
+                    ..ModelInfo::id_only("syn:test-vision".into())
+                },
+                ModelInfo::id_only("syn:test-blind".into()),
+            ],
+        );
+
+        let vision = |id| Model::from_spec(id).unwrap().supports_vision();
+        assert!(vision("synthetic/syn:test-vision"));
+        assert!(!vision("synthetic/syn:test-blind"));
     }
 
     #[test]

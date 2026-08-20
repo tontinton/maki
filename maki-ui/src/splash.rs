@@ -1,4 +1,5 @@
 use crate::components::keybindings::key;
+use crate::repaint::{Cadence, Dirty};
 use crate::theme::{self, lerp_u8};
 use crate::update;
 use ratatui::buffer::Buffer;
@@ -8,6 +9,7 @@ use std::time::Instant;
 
 const LOGO: &str = "maki";
 const TAGLINE: &str = "the efficient coder";
+const UPDATE_HINT: &str = " run maki update to get v";
 const HELP_SEGMENTS: &[(&str, bool)] = &[
     (key::HELP.label, true),
     (" help", false),
@@ -119,6 +121,7 @@ pub struct Splash {
     field_offset: f32,
     animate: bool,
     tip_idx: usize,
+    latest_version: Option<&'static str>,
 }
 
 impl Default for Splash {
@@ -137,7 +140,30 @@ impl Splash {
             field_offset: (u64::from_le_bytes(rng) % 10_000) as f32,
             animate,
             tip_idx,
+            latest_version: None,
         }
+    }
+
+    /// The update check answers long after the splash is first painted, and
+    /// storing its answer wakes nothing. Reading it in [`Self::render`] would
+    /// put a version on screen that no poller ever saw, so a still splash
+    /// (`splash_animation = false`) would never show the notice at all.
+    pub fn poll_update(&mut self, latest: Option<&'static str>) -> Dirty {
+        if self.latest_version == latest {
+            return Dirty::NO;
+        }
+        self.latest_version = latest;
+        Dirty::YES
+    }
+
+    /// The starfield drifts for as long as the splash is up. With it off the
+    /// only motion left is the entry fade, which ends, so the loop settles on
+    /// the start screen instead of burning a core on a still picture.
+    pub fn cadence(&self) -> Cadence {
+        Cadence::when(
+            self.animate || self.start.elapsed().as_secs_f32() < FADE_DURATION,
+            Cadence::SMOOTH,
+        )
     }
 
     pub fn render(&self, area: Rect, buf: &mut Buffer, accent: Color) {
@@ -152,7 +178,6 @@ impl Splash {
             ease_out_cubic(t / FADE_DURATION)
         };
 
-        let new_version = update::latest_version();
         let block_height = 8;
         let top_y = area.y + area.height.saturating_sub(block_height) / 2;
         let tag_y = top_y + 1;
@@ -166,7 +191,7 @@ impl Splash {
         render_centered_faded(area, buf, fade, 0.75, tag_y, TAGLINE);
         self.render_help(area, buf, fade, help_y, accent);
         self.render_tip(area, buf, fade, tip_y, accent);
-        render_version(area, buf, fade, area.y, new_version);
+        render_version(area, buf, fade, area.y, self.latest_version);
     }
 
     fn render_field(&self, area: Rect, buf: &mut Buffer, t: f32, fade: f32, accent: Color) {
@@ -405,7 +430,7 @@ fn render_version(area: Rect, buf: &mut Buffer, fade: f32, y: u16, new_version: 
     let theme = theme::current();
     let bg = theme.background;
     let text = match new_version {
-        Some(v) => format!("v{} run maki update to get v{}", update::CURRENT, v),
+        Some(v) => format!("v{}{UPDATE_HINT}{v}", update::CURRENT),
         None => format!("v{}", update::CURRENT),
     };
     let style = faded_style(
@@ -482,7 +507,10 @@ fn ease_out_cubic(t: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::components::buffer_text;
+    use crate::repaint::expect::{OWED, QUIET};
     use std::time::Duration;
+    use test_case::test_case;
 
     fn transition_at(from: (u8, u8, u8), to: (u8, u8, u8), offset: Duration) -> (u8, u8, u8) {
         let mut ct = ColorTransition::new(Color::Rgb(from.0, from.1, from.2));
@@ -514,6 +542,48 @@ mod tests {
 
         let done = ct.resolve_rgb(ct.start + Duration::from_secs(1));
         assert_eq!(done, (10, 20, 30));
+    }
+
+    const NEW_VERSION: &str = "99.9.9";
+    const UNPOLLED: &str = "an unpolled version must not appear on screen";
+    const POLLED: &str = "a polled version must appear on screen";
+
+    fn rendered(splash: &Splash) -> String {
+        let area = Rect::new(0, 0, 80, 20);
+        let mut buf = Buffer::empty(area);
+        splash.render(area, &mut buf, Color::Blue);
+        buffer_text(&buf)
+    }
+
+    /// The check answers on its own, so the notice only reaches the screen
+    /// because a poll reported it. A still splash owes no other frame, so
+    /// reading the answer in `render` would hide it until the user typed.
+    #[test]
+    fn an_update_notice_reaches_the_screen_only_after_a_poll() {
+        let mut splash = Splash::new(false);
+        assert_eq!(splash.poll_update(None), Dirty::NO, "{QUIET}");
+        assert!(!rendered(&splash).contains(NEW_VERSION), "{UNPOLLED}");
+
+        assert_eq!(splash.poll_update(Some(NEW_VERSION)), Dirty::YES, "{OWED}");
+        assert_eq!(splash.poll_update(Some(NEW_VERSION)), Dirty::NO, "{QUIET}");
+
+        let screen = rendered(&splash);
+        assert!(screen.contains(UPDATE_HINT.trim_end()), "{POLLED}");
+        assert!(screen.contains(NEW_VERSION), "{POLLED}");
+    }
+
+    /// `splash_animation = false` is what a user on a slow machine reaches
+    /// for, so the start screen really has to stop painting once the entry
+    /// fade is over.
+    #[test_case(false, false => Cadence::SMOOTH ; "entry_fade_is_running")]
+    #[test_case(false, true  => Cadence::IDLE   ; "still_splash_settles_after_the_fade")]
+    #[test_case(true,  true  => Cadence::SMOOTH ; "starfield_drifts_for_as_long_as_it_is_up")]
+    fn splash_cadence(animate: bool, faded: bool) -> Cadence {
+        let mut splash = Splash::new(animate);
+        if faded {
+            splash.start -= Duration::from_secs_f32(FADE_DURATION);
+        }
+        splash.cadence()
     }
 
     #[test]

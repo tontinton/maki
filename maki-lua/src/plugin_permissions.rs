@@ -1,4 +1,5 @@
 use std::fmt;
+use std::io;
 use std::path::Path;
 
 use mlua::{Error as LuaError, Function, IntoLuaMulti, Lua, Result as LuaResult};
@@ -16,7 +17,7 @@ pub enum Permission {
 }
 
 impl Permission {
-    const ALL: [Permission; 5] = [
+    pub(crate) const ALL: [Permission; 5] = [
         Permission::FsRead,
         Permission::FsWrite,
         Permission::Net,
@@ -24,7 +25,7 @@ impl Permission {
         Permission::Env,
     ];
 
-    fn manifest_key(self) -> &'static str {
+    pub(crate) const fn manifest_key(self) -> &'static str {
         match self {
             Permission::FsRead => "fs_read",
             Permission::FsWrite => "fs_write",
@@ -115,10 +116,11 @@ impl PluginPermissions {
 }
 
 fn denied_error(perm: Permission) -> LuaError {
-    LuaError::runtime(format!(
-        "permission denied: '{}' not granted for this plugin",
-        perm
-    ))
+    let msg = format!(
+        "permission denied: '{perm}' not granted for this plugin (grant it in {MANIFEST_FILE} next to the plugin file)"
+    );
+    warn!(permission = %perm, "{msg}");
+    LuaError::runtime(msg)
 }
 
 pub(crate) fn load_plugin_permissions(plugin_dir: Option<&Path>) -> PluginPermissions {
@@ -138,7 +140,22 @@ pub(crate) fn load_plugin_permissions(plugin_dir: Option<&Path>) -> PluginPermis
                 PluginPermissions::denied()
             }
         },
-        Err(_) => PluginPermissions::denied(),
+        Err(e) => {
+            if e.kind() == io::ErrorKind::NotFound {
+                warn!(
+                    dir = %dir.display(),
+                    "no {MANIFEST_FILE} next to plugin; all permissions denied. Create one \
+                     (even an empty file) next to it to grant permissions"
+                );
+            } else {
+                warn!(
+                    path = %manifest_path.display(),
+                    error = %e,
+                    "cannot read {MANIFEST_FILE}, denying all permissions"
+                );
+            }
+            PluginPermissions::denied()
+        }
     }
 }
 

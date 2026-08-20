@@ -15,6 +15,7 @@ use crate::model::{Model, ModelFamily, ModelInfo};
 use crate::providers::Timeouts;
 use crate::providers::anthropic::Anthropic;
 use crate::providers::anthropic::bedrock;
+use crate::providers::aperture::Aperture;
 use crate::providers::catalog::{
     OPENCODE_FAMILY_SLUGS, available_if_warm, catalog_providers, catalog_providers_if_available,
 };
@@ -29,6 +30,7 @@ use crate::providers::opencode::Opencode;
 use crate::providers::openrouter::OpenRouter;
 use crate::providers::synthetic::Synthetic;
 use crate::providers::tensorx::TensorX;
+use crate::providers::xai::Xai;
 use crate::providers::zai::Zai;
 use crate::{AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse};
 
@@ -53,6 +55,9 @@ pub enum ProviderKind {
     TensorX,
     #[strum(serialize = "opencode")]
     Opencode,
+    #[strum(serialize = "xai")]
+    Xai,
+    Aperture,
 }
 
 impl ProviderKind {
@@ -71,6 +76,8 @@ impl ProviderKind {
             Self::Synthetic => "Synthetic",
             Self::TensorX => "TensorX",
             Self::Opencode => "Opencode Zen",
+            Self::Xai => "xAI",
+            Self::Aperture => "Aperture",
         }
     }
 
@@ -89,6 +96,8 @@ impl ProviderKind {
             Self::Synthetic => "SYNTHETIC_API_KEY",
             Self::TensorX => "TENSORX_API_KEY",
             Self::Opencode => "OPENCODE_API_KEY",
+            Self::Xai => "XAI_API_KEY",
+            Self::Aperture => "",
         }
     }
 
@@ -109,6 +118,8 @@ impl ProviderKind {
             Self::Synthetic => "https://api.synthetic.new/openai/v1",
             Self::TensorX => "https://api.tensorx.ai/v1",
             Self::Opencode => "https://opencode.ai/zen/v1",
+            Self::Xai => "https://api.x.ai/v1",
+            Self::Aperture => "Aperture gateway (set APERTURE_HOST)",
         }
     }
 
@@ -136,6 +147,12 @@ impl ProviderKind {
             Self::Opencode => Some(
                 "Dynamically discovered models via [models.dev](https://models.dev/) + all the models provided by Opencode Zen API",
             ),
+            Self::Xai => Some(
+                "OAuth login, account-specific model catalog, Grok reasoning (low/medium/high/xhigh)",
+            ),
+            Self::Aperture => Some(
+                "Tailscale Aperture LLM gateway; set APERTURE_HOST or configure in providers.toml",
+            ),
             _ => None,
         }
     }
@@ -155,6 +172,8 @@ impl ProviderKind {
             Self::Synthetic => ModelFamily::Synthetic,
             Self::TensorX => ModelFamily::Generic,
             Self::Opencode => ModelFamily::Generic,
+            Self::Xai => ModelFamily::Generic,
+            Self::Aperture => ModelFamily::Generic,
         }
     }
 
@@ -178,6 +197,8 @@ impl ProviderKind {
             Self::Synthetic => Some(32_000),
             Self::TensorX => None,
             Self::Opencode => Some(128_000),
+            Self::Xai => Some(131_072),
+            Self::Aperture => Some(16_384),
         }
     }
 
@@ -196,6 +217,8 @@ impl ProviderKind {
             Self::Synthetic => 128_000,
             Self::TensorX => 200_000,
             Self::Opencode => 256_000,
+            Self::Xai => 500_000,
+            Self::Aperture => 128_000,
         }
     }
 
@@ -220,6 +243,8 @@ impl ProviderKind {
             Self::Synthetic => Ok(Box::new(Synthetic::new(timeouts)?)),
             Self::TensorX => Ok(Box::new(TensorX::new(timeouts)?)),
             Self::Opencode => Ok(Box::new(Opencode::new(timeouts)?)),
+            Self::Xai => Ok(Box::new(Xai::new(timeouts)?)),
+            Self::Aperture => Ok(Box::new(Aperture::new(timeouts)?)),
         }
     }
 }
@@ -302,6 +327,20 @@ pub fn from_model(model: &mut Model, timeouts: Timeouts) -> Result<Box<dyn Provi
     provider.adjust_model(model);
     debug!(provider = %model.provider, model = %model.id, "provider created");
     Ok(provider)
+}
+
+/// Adjust a model against its provider's static table without retaining the
+/// provider. Used to reconcile a resumed model so it matches one started
+/// fresh (e.g. inherited thinking support for a routed Aperture model).
+pub fn adjust_model(model: &mut Model, timeouts: Timeouts) -> Result<(), AgentError> {
+    // Script-backed providers adjust nothing but run their auth script at
+    // construction; resumed-session callers sit on the UI thread and must
+    // not wait on that.
+    if dynamic::display_name(&model.provider).is_some() {
+        return Ok(());
+    }
+    provider_for_slug(&model.provider, timeouts)?.adjust_model(model);
+    Ok(())
 }
 
 pub fn from_model_fallback(model: &mut Model, timeouts: Timeouts) -> Box<dyn Provider> {
@@ -428,11 +467,9 @@ pub async fn fetch_all_models(
         smol::spawn(async move {
             let batch = match provider.list_models().await {
                 Ok(models) => {
-                    if manifest.accepts_arbitrary_models {
-                        crate::model_registry::set_known_models(slug, models.clone());
-                    }
                     let mut specs: Vec<String> =
                         models.iter().map(|m| format!("{slug}/{}", m.id)).collect();
+                    crate::model_registry::set_known_models(slug, models);
                     for entry in manifest.models {
                         for prefix in entry.prefixes {
                             let spec = format!("{slug}/{prefix}");

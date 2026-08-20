@@ -12,13 +12,17 @@ on:
       - "scripts/**/*.py"
       - ".github/workflows/python.yml"
 
+env:
+  RUFF_VERSION: 0.16.2
+  TY_VERSION: 0.0.70
+
 jobs:
   lint:
     name: Ruff
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: pip install ruff
+      - run: .github/scripts/retry.sh pip install "ruff==${RUFF_VERSION}"
       - run: ruff check scripts/
 
   typecheck:
@@ -26,5 +30,5 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: pip install ty
+      - run: .github/scripts/retry.sh pip install "ty==${TY_VERSION}"
       - run: ty check scripts/

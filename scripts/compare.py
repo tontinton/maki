@@ -13,7 +13,7 @@ from pathlib import Path
 
 
 def _ts():
-    return datetime.now().strftime("%H:%M:%S")
+    return datetime.now(timezone.utc).astimezone().strftime("%H:%M:%S")
 
 
 DEFAULT_AGENTS = ["claude-code", "maki", "opencode"]

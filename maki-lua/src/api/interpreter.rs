@@ -176,10 +176,12 @@ async fn interpreter_run(lua: Lua, code: String, opts: Table) -> LuaResult<Pair<
         Ok::<(), mlua::Error>(())
     };
 
-    let (result, cb) = cancel
-        .race(futures_lite::future::zip(run, recv_loop))
-        .await
-        .map_err(mlua::Error::runtime)?;
+    // A cancel comes back as a pair error, not a raise, so the caller can
+    // still report the lines it streamed before the cut.
+    let (result, cb) = match cancel.race(futures_lite::future::zip(run, recv_loop)).await {
+        Ok(v) => v,
+        Err(e) => return Ok((None, Some(e))),
+    };
     cb?;
 
     let tbl = lua.create_table()?;
@@ -201,8 +203,7 @@ lua_table! {
     /// Run Python code in a memory-safe, time-limited sandbox.
     ///
     /// The sandbox uses the monty interpreter. Python code can call back into
-    /// Lua-defined tools, and stdout is streamed line by line. Requires the
-    /// `run` permission.
+    /// Lua-defined tools, and stdout is streamed line by line.
     ///
     /// ```lua
     /// local r, err = maki.interpreter.run("print('hello')", {

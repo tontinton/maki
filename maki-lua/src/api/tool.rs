@@ -20,7 +20,7 @@ use maki_agent::{
     AgentEvent, BufferSnapshot, ImageMediaType, ImageSource, InstructionBlock, SharedBuf,
     TextOutput, ToolOutput,
 };
-use maki_config::ToolOutputLines;
+use maki_config::{Effect, PermissionRule, ToolKey, ToolOutputLines};
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{
     Function, Lua, LuaSerdeExt, MultiValue, RegistryKey, Result as LuaResult, Table,
@@ -31,17 +31,22 @@ use serde_json::{Value, json};
 use crate::api::options::{PluginOpts, register_options__doc, register_options__register};
 use crate::api::ui::buf::{BufHandle, line_to_lua};
 use crate::api::util::command::{
-    CommandEntry, CommandHandlerMap, LuaCommandWriter, publish_command_snapshot,
+    CommandEntry, CommandHandlerMap, LuaCommandWriter, UiAction, publish_command_snapshot,
+    ui_roundtrip,
 };
 use crate::api::util::convert::{json_to_lua, lua_to_json};
 use crate::api::util::ctx::LuaCtx;
-use crate::runtime::{HintContent, LiveCtx, PromptHintCallbacks, PromptHintRegistration, Request};
+use crate::api::util::pair::{Pair, try_pair};
+use crate::runtime::{
+    HintContent, LiveCtx, PromptHintCallbacks, PromptHintRegistration, Request, command_depth,
+};
 
 const TOOL_NAME_MAX: usize = 64;
 const TOOL_HANDLER_RETURN_ERR: &str =
     "tool handler must return string or {output=string, is_error?=bool}";
 const TIMEOUT_PARSE_ERR: &str = "register_tool: 'timeout' must be a positive number, 0, or false";
 const NARGS_ERR: &str = r#"register_command: 'nargs' must be 0, 1, "?", "*", or "+""#;
+const PERMISSION_RULE_KEYS: &[&str] = &["tool", "scope", "effect"];
 const MAX_HINT_CONTENT_SIZE: usize = 1024 * 1024;
 const DESCRIBE_TIMEOUT: Duration = Duration::from_secs(3);
 const PLAIN_HEADER_STYLE: &str = "tool";
@@ -135,6 +140,8 @@ pub(crate) struct PendingTool {
 }
 
 pub(crate) type PendingTools = Arc<Mutex<Vec<PendingTool>>>;
+
+pub(crate) type PendingRules = Arc<Mutex<Vec<PermissionRule>>>;
 
 pub(crate) struct LuaTool {
     pub(crate) name: Arc<str>,
@@ -644,6 +651,93 @@ fn register_tool(lua: &Lua, #[ctx] pending: PendingTools, spec: Table) -> LuaRes
     register_tool_from_lua(lua, &spec, pending)
 }
 
+/// Declare an agent permission rule for a native tool. Use it to pre-allow
+/// (or pre-deny) tool calls on paths your plugin owns, like a storage
+/// directory outside the working dir, so the user is not prompted for them.
+///
+/// Rules live as long as the plugin is loaded: a reload replaces them, and a
+/// reload that registers none clears the old ones. User config and session
+/// deny rules always win over a plugin allow.
+///
+/// @param spec table Rule specification:
+///   tool   (string) Required. Native tool name (e.g. "edit", "write").
+///                   MCP tools and the "*" wildcard are not allowed.
+///   scope  (string) Required. Scope pattern the rule applies to, e.g.
+///                   "/abs/dir/**" for a directory subtree.
+///   effect (string) Optional. "allow" (default) or "deny".
+/// @return
+/// @example
+/// maki.api.register_permission_rule({
+///   tool = "write",
+///   scope = notes_dir .. "/**",
+/// })
+#[lua_fn]
+fn register_permission_rule(
+    _lua: &Lua,
+    #[ctx] pending_rules: PendingRules,
+    spec: Table,
+) -> LuaResult<()> {
+    for entry in spec.pairs::<String, LuaValue>() {
+        let (key, _) = entry.map_err(|_| {
+            mlua::Error::runtime("register_permission_rule: spec keys must be strings")
+        })?;
+        if !PERMISSION_RULE_KEYS.contains(&key.as_str()) {
+            return Err(mlua::Error::runtime(format!(
+                "register_permission_rule: unknown key '{key}' (valid: tool, scope, effect)"
+            )));
+        }
+    }
+
+    let tool: String = spec.get("tool").map_err(|_| {
+        mlua::Error::runtime("register_permission_rule: 'tool' must be a native tool name string")
+    })?;
+    let tool = match ToolKey::parse(&tool) {
+        Ok(key @ ToolKey::Native(_)) => key,
+        Ok(_) => {
+            return Err(mlua::Error::runtime(
+                "register_permission_rule: only native tools are allowed (no wildcard or MCP)",
+            ));
+        }
+        Err(e) => {
+            return Err(mlua::Error::runtime(format!(
+                "register_permission_rule: {e}"
+            )));
+        }
+    };
+
+    let scope: String = spec
+        .get("scope")
+        .map_err(|_| mlua::Error::runtime("register_permission_rule: 'scope' must be a string"))?;
+    if scope.is_empty() {
+        return Err(mlua::Error::runtime(
+            "register_permission_rule: 'scope' must be non-empty",
+        ));
+    }
+
+    let effect = spec
+        .get::<Option<String>>("effect")
+        .map_err(|_| mlua::Error::runtime("register_permission_rule: 'effect' must be a string"))?;
+    let effect = match effect.as_deref() {
+        None | Some("allow") => Effect::Allow,
+        Some("deny") => Effect::Deny,
+        Some(other) => {
+            return Err(mlua::Error::runtime(format!(
+                "register_permission_rule: invalid effect '{other}' (expected \"allow\" or \"deny\")"
+            )));
+        }
+    };
+
+    pending_rules
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(PermissionRule {
+            tool,
+            scope: Some(scope),
+            effect,
+        });
+    Ok(())
+}
+
 /// Register a slash-command that appears in the user input bar.
 ///
 /// Slash commands let the user trigger plugin actions by typing `/name` in the
@@ -679,6 +773,56 @@ fn register_tool(lua: &Lua, #[ctx] pending: PendingTools, spec: Table) -> LuaRes
 #[lua_fn]
 fn register_command(lua: &Lua, #[ctx] plugin: Arc<str>, spec: Table) -> LuaResult<()> {
     register_command_from_lua(lua, &spec, plugin)
+}
+
+/// Runs a slash command by name, exactly as typing it in the input would.
+/// Works for built-ins, custom `/project:` and `/user:` commands, MCP
+/// prompts, and commands other plugins registered.
+///
+/// Use it to alias a command you like under a name you prefer, instead of
+/// reimplementing what it does. See `maki.ui.action` for the same idea
+/// applied to keybound UI actions.
+///
+/// Pass the whole command line, arguments included: `"/cd ~/src"`. The
+/// leading slash is optional. Names match exactly apart from case, so a typo
+/// reports an error instead of running the closest command, and a cycle of
+/// aliases stops with one too.
+///
+/// This returns as soon as the command has been dispatched, not when it
+/// finishes, so aliasing something long-running like `/compact` does not
+/// block your handler.
+///
+/// @param cmdline string Command line, e.g. `"/new"` or `"/cd ~/src"`.
+/// @return (boolean|nil, string|nil) `true` once dispatched, or nil and an error message for an unknown command.
+/// @example
+/// -- /resume as an alias for the built-in session picker:
+/// maki.api.register_command({
+///   name = "/resume",
+///   description = "Alias for /sessions",
+///   handler = function()
+///     local ok, err = maki.api.run_command("/sessions")
+///     if not ok then
+///       maki.ui.flash("could not run /sessions: " .. err)
+///     end
+///   end,
+/// })
+#[lua_fn]
+async fn run_command(
+    lua: Lua,
+    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    cmdline: String,
+) -> LuaResult<Pair<bool>> {
+    let depth = command_depth(&lua).saturating_add(1);
+    let reply = try_pair!(
+        ui_roundtrip(tx.as_ref(), |reply_tx| UiAction::RunCommand {
+            cmdline,
+            depth,
+            reply_tx,
+        })
+        .await
+    );
+    try_pair!(reply);
+    Ok((Some(true), None))
 }
 
 /// Add a piece of text to an aggregate prompt slot. Multiple plugins can each
@@ -853,20 +997,25 @@ lua_table! {
     /// maki.api.register_tool({ name = "greet", ... })
     /// maki.api.register_prompt_hint({ slot = "tool_usage", content = "..." })
     /// ```
-    extend "maki.api" => pub(crate) fn add_tool_fns(pending: PendingTools, plugin: Arc<str>, opts: PluginOpts), DOCS [
-        register_tool(pending), register_command(plugin), register_prompt_hint(plugin),
-        register_options(plugin, opts), set_prompt(plugin), get_tools, get_tool,
+    extend "maki.api" => pub(crate) fn add_tool_fns(pending: PendingTools, pending_rules: PendingRules, plugin: Arc<str>, opts: PluginOpts), DOCS [
+        register_tool(pending), register_permission_rule(pending_rules), register_command(plugin),
+        register_prompt_hint(plugin), register_options(plugin, opts), set_prompt(plugin),
+        get_tools, get_tool,
+        manual run_command,
     ]
 }
 
 pub(crate) fn create_api_table(
     lua: &Lua,
     pending: PendingTools,
+    pending_rules: PendingRules,
     plugin: Arc<str>,
     opts: PluginOpts,
+    ui_action_tx: Option<flume::Sender<UiAction>>,
 ) -> LuaResult<Table> {
     let t = lua.create_table()?;
-    add_tool_fns(&t, lua, pending, plugin, opts)?;
+    add_tool_fns(&t, lua, pending, pending_rules, plugin, opts)?;
+    run_command__register(&t, lua, ui_action_tx)?;
     Ok(t)
 }
 

@@ -9,6 +9,7 @@ use maki_config::ToolKey;
 use maki_providers::{AgentError, ContentBlock, Message, Role, StopReason, TokenUsage};
 use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
+use strum::Display;
 
 pub const NO_FILES_FOUND: &str = "No files found";
 
@@ -524,6 +525,29 @@ pub fn tool_results(results: Vec<ToolDoneEvent>) -> Message {
     }
 }
 
+/// Why a run ended. The provider's `StopReason` describes one turn, this
+/// describes the whole run, including the endings only the agent knows about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Display)]
+#[strum(serialize_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
+pub enum DoneReason {
+    EndTurn,
+    MaxTokens,
+    MaxTurns,
+    Cancelled,
+}
+
+impl From<Option<StopReason>> for DoneReason {
+    /// We only ask at the end of a turn that called no tool, so a tool-use stop
+    /// and a provider that says nothing both mean the same thing: it is over.
+    fn from(reason: Option<StopReason>) -> Self {
+        match reason {
+            Some(StopReason::MaxTokens) => Self::MaxTokens,
+            Some(StopReason::EndTurn | StopReason::ToolUse) | None => Self::EndTurn,
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
@@ -553,10 +577,11 @@ pub enum AgentEvent {
         text: String,
         image_count: usize,
     },
+    QueueDrained,
     Done {
         usage: TokenUsage,
         num_turns: u32,
-        stop_reason: Option<StopReason>,
+        reason: DoneReason,
     },
     AutoCompacting,
     CompactionDone,
@@ -708,8 +733,11 @@ impl SharedBuf {
         Some(Arc::clone(&guard))
     }
 
+    /// A copy for a tool reply. Leaves the dirty flag alone: only the UI
+    /// clears it, and a reply can die on the way there (a cancelled run's
+    /// events are stale), which would strand the last repaint a tool made
+    /// on its way out. Re-reading the same lines once costs nothing.
     pub fn take(&self) -> BufferSnapshot {
-        self.dirty.store(false, Ordering::Release);
         let guard = self.committed.lock().unwrap_or_else(|e| e.into_inner());
         BufferSnapshot::from_arc(Arc::clone(&guard))
     }
@@ -821,6 +849,9 @@ pub struct TurnCompleteEvent {
     pub cost: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_size: Option<u32>,
+    /// The model's context window, so consumers can gauge `context_size`
+    /// against the ceiling without resolving the model.
+    pub context_window: u32,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -902,6 +933,12 @@ mod tests {
     #[test_case(ToolOutput::Diff { path: "a.rs".into(), before: String::new(), after: String::new(), summary: "ok".into() }, None ; "diff_no_annotation")]
     fn annotation_cases(output: ToolOutput, expected: Option<&str>) {
         assert_eq!(output.annotation().as_deref(), expected);
+    }
+
+    #[test_case(None ; "no_stop_reason")]
+    #[test_case(Some(StopReason::ToolUse) ; "tool_use")]
+    fn stop_reason_without_its_own_ending_becomes_end_turn(stop: Option<StopReason>) {
+        assert_eq!(DoneReason::from(stop), DoneReason::EndTurn);
     }
 
     #[test]
@@ -1222,7 +1259,10 @@ mod tests {
 
         buf.append(line("l3"));
         let _ = buf.take();
-        assert!(buf.read_if_dirty().is_none(), "take clears dirty");
+        assert!(
+            buf.read_if_dirty().is_some(),
+            "take must leave the flag for the UI"
+        );
     }
 
     #[test]

@@ -279,12 +279,12 @@ pub enum McpAction {
 pub enum AuthAction {
     /// Authenticate with a provider (interactive if no provider specified)
     Login {
-        /// Provider slug (e.g. zai, openai). Omit for interactive selection.
+        /// Provider slug (e.g. zai, openai, xai). Omit for interactive selection.
         provider: Option<String>,
     },
     /// Remove stored credentials for a provider
     Logout {
-        /// Provider slug (e.g. openai)
+        /// Provider slug (e.g. openai, xai)
         provider: String,
     },
     /// Show authentication status for all providers

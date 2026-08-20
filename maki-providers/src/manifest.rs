@@ -1,7 +1,7 @@
 use crate::model::{ModelEntry, ModelFamily, ModelTier};
 use crate::providers::{
-    anthropic, copilot, custom, deepseek, dynamic, google, llama_cpp, mistral, ollama, openai,
-    openrouter, synthetic, tensorx, zai,
+    anthropic, aperture, copilot, custom, deepseek, dynamic, google, llama_cpp, mistral, ollama,
+    openai, openrouter, synthetic, tensorx, xai, zai,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -159,6 +159,17 @@ const OPENCODE: ProviderManifest = ProviderManifest {
     models: &[],
 };
 
+const XAI: ProviderManifest = ProviderManifest {
+    slug: "xai",
+    display_name: "xAI",
+    family: ModelFamily::Generic,
+    supports_thinking: true,
+    accepts_arbitrary_models: true,
+    fallback_max_output: Some(131_072),
+    fallback_context_window: 500_000,
+    models: xai::models(),
+};
+
 const OPENCODE_GO: ProviderManifest = ProviderManifest {
     slug: "opencode-go",
     display_name: "Opencode Go",
@@ -168,6 +179,17 @@ const OPENCODE_GO: ProviderManifest = ProviderManifest {
     fallback_max_output: Some(64_000),
     fallback_context_window: 128_000,
     models: &[],
+};
+
+const APERTURE: ProviderManifest = ProviderManifest {
+    slug: "aperture",
+    display_name: "Aperture",
+    family: ModelFamily::Generic,
+    supports_thinking: false,
+    accepts_arbitrary_models: true,
+    fallback_max_output: Some(16_384),
+    fallback_context_window: 128_000,
+    models: aperture::models(),
 };
 
 const BUILTINS: &[ProviderManifest] = &[
@@ -185,6 +207,8 @@ const BUILTINS: &[ProviderManifest] = &[
     TENSORX,
     OPENCODE,
     OPENCODE_GO,
+    XAI,
+    APERTURE,
 ];
 
 pub struct ManifestRegistry;

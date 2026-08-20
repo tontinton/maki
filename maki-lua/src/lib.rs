@@ -10,9 +10,9 @@ mod runtime;
 pub use api::keymap::{KeymapEntry, KeymapReader, KeymapSnapshot};
 pub use api::options::{OptionSpec, OptionType, PluginOptionSpecs};
 pub use api::util::command::{
-    Anchor, Axis, Border, Dimension, Edge, FloatConfig, FloatConfigPatch, HintReader, HintSnapshot,
-    LuaCommandInfo, LuaCommandReader, SessionReply, SessionRequest, Split, TitlePos, UiAction,
-    WinCommand, WinEvent, WinView,
+    Anchor, Axis, Border, BuiltinAction, Dimension, Edge, FloatConfig, FloatConfigPatch,
+    HintReader, HintSnapshot, LuaCommandInfo, LuaCommandReader, SessionReply, SessionRequest,
+    Split, TitlePos, UiAction, WinCommand, WinEvent, WinView,
 };
 pub use docs::{DocKind, FnDoc, ModuleDoc, ParamDoc, api_docs};
 pub use error::PluginError;
@@ -23,7 +23,9 @@ pub use runtime::{KILL_GRACE, RestoreItem, WARM_TOOL_CAP};
 pub mod test_support {
     use crate::KeymapReader;
     use crate::api::keymap::{KeymapEntry, KeymapWriter};
-    use crate::api::util::command::{LuaCommandInfo, LuaCommandReader, LuaCommandWriter};
+    use crate::api::util::command::{
+        HintEntries, HintReader, HintWriter, LuaCommandInfo, LuaCommandReader, LuaCommandWriter,
+    };
 
     pub struct LuaCommandWriterHandle(LuaCommandWriter);
 
@@ -36,6 +38,20 @@ pub mod test_support {
     pub fn lua_command_writer_pair() -> (LuaCommandWriterHandle, LuaCommandReader) {
         let (writer, reader) = LuaCommandWriter::new();
         (LuaCommandWriterHandle(writer), reader)
+    }
+
+    /// Stands in for the Lua thread publishing a plugin's status hints.
+    pub struct HintWriterHandle(HintWriter);
+
+    impl HintWriterHandle {
+        pub fn publish(&self, entries: HintEntries) {
+            self.0.publish(entries);
+        }
+    }
+
+    pub fn hint_writer_pair() -> (HintWriterHandle, HintReader) {
+        let (writer, reader) = HintWriter::new();
+        (HintWriterHandle(writer), reader)
     }
 
     /// Observes which requests an [`crate::EventHandle`] sends, without a
@@ -55,6 +71,24 @@ pub mod test_support {
                 Request::RestoreToolAsync { item, .. } => ("restore", item.clicks),
                 _ => ("other", Vec::new()),
             })
+        }
+
+        /// Next dispatched slash command as `(command, args, depth)`, skipping
+        /// other requests.
+        pub fn try_recv_command(&self) -> Option<(String, String, u8)> {
+            use crate::runtime::Request;
+            while let Ok(req) = self.0.try_recv() {
+                if let Request::RunCommand {
+                    command,
+                    args,
+                    depth,
+                    ..
+                } = req
+                {
+                    return Some((command.to_string(), args, depth));
+                }
+            }
+            None
         }
 
         /// Next fired autocmd as `(event, data)`, skipping other requests.

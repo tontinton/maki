@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use arc_swap::ArcSwap;
 use maki_agent::SharedBuf;
 use mlua::RegistryKey;
+use strum::{EnumString, VariantNames};
 
 pub(crate) const NO_UI_ERR: &str = "no interactive UI attached";
 const UI_DROPPED_ERR: &str = "ui event loop dropped the request";
@@ -88,11 +89,14 @@ impl HintReader {
         Self(Arc::new(ArcSwap::from_pointee(HintSnapshot::default())))
     }
 
-    pub fn load(&self) -> arc_swap::Guard<Arc<HintSnapshot>> {
-        self.0.load()
+    /// Full `Arc` rather than a `Guard`: the UI keeps the last one alive to
+    /// compare identity against the next, which is how it notices a publish.
+    pub fn load_full(&self) -> Arc<HintSnapshot> {
+        self.0.load_full()
     }
 }
 
+/// Publishing end of a plugin's status hints, owned by the Lua thread.
 pub(crate) struct HintWriter {
     store: Arc<ArcSwap<HintSnapshot>>,
     generation: AtomicU64,
@@ -420,6 +424,24 @@ pub struct WinView {
     pub auto_scroll: bool,
 }
 
+/// Lua sees these through `maki.ui.action` as the snake_case variant
+/// names, so renaming a variant breaks user configs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, EnumString, VariantNames)]
+#[strum(serialize_all = "snake_case")]
+pub enum BuiltinAction {
+    FilePicker,
+    Search,
+    Tasks,
+    Help,
+    PlanToggle,
+    PlanEditor,
+    EditInput,
+    PopQueue,
+    PrevChat,
+    NextChat,
+    ModelPicker,
+}
+
 pub enum UiAction {
     OpenWin {
         buf: Arc<SharedBuf>,
@@ -443,6 +465,15 @@ pub enum UiAction {
     },
     WinRestView {
         scroll_top: u16,
+    },
+    Builtin(BuiltinAction),
+    /// `reply_tx` answers whether {cmdline} resolved to a known command, not
+    /// how the command itself went: `/compact` streams for a minute, and the
+    /// Lua caller must not park for that long.
+    RunCommand {
+        cmdline: String,
+        depth: u8,
+        reply_tx: flume::Sender<Result<(), String>>,
     },
 }
 
@@ -515,6 +546,16 @@ mod tests {
             .filter(|c| c.plugin.as_ref() == "plugA")
             .collect();
         assert_eq!(plug_a_cmds.len(), 2);
+    }
+
+    #[test]
+    fn builtin_action_names_are_snake_case() {
+        for name in BuiltinAction::VARIANTS {
+            assert!(
+                name.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+                "lua-facing action name '{name}' is not snake_case"
+            );
+        }
     }
 
     #[test]
@@ -660,14 +701,14 @@ mod tests {
     #[test]
     fn hint_snapshot_publish_and_read() {
         let (writer, reader) = HintWriter::new();
-        assert!(reader.load().entries.is_empty());
+        assert!(reader.load_full().entries.is_empty());
 
         writer.publish(vec![(
             Arc::from("plugA"),
             vec![(" 2/4 ".into(), "fg".into())],
         )]);
 
-        let snap = reader.load();
+        let snap = reader.load_full();
         assert_eq!(snap.entries.len(), 1);
         assert_eq!(snap.generation, 1);
     }

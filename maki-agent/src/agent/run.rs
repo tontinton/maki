@@ -12,21 +12,24 @@ use maki_providers::{
 use super::compaction;
 use super::history::{History, sanitize_cancelled_history};
 use super::instructions::LoadedInstructions;
-use super::streaming::stream_with_retry;
+use super::streaming::{StreamError, stream_with_retry};
 use super::tool_dispatch::{self, RecentCalls};
 use crate::cancel::{CancelMap, CancelToken};
 use crate::mcp::McpSession;
 use crate::permissions::PermissionManager;
 use crate::tools::{Deadline, FileReadTracker, LocalTools, ToolAudience, ToolContext};
 use crate::{
-    AgentConfig, AgentError, AgentEvent, AgentInput, AgentMode, EventSender, ExtractedCommand,
-    InterruptSource, SessionMailbox, TurnCompleteEvent,
+    AgentConfig, AgentError, AgentEvent, AgentInput, AgentMode, DoneReason, EventSender,
+    ExtractedCommand, InterruptSource, SessionMailbox, TurnCompleteEvent,
 };
 use maki_config::{ModelPolicy, ToolOutputLines};
 use maki_storage::id::SessionRef;
 
 const MAX_REAUTH_ATTEMPTS: u32 = 2;
 const NUDGE_PROMPT: &str = "You just executed tool calls but returned an empty response. Please process the tool results above and continue with the task.";
+/// A model that stalls once often stalls again on the retry, so it gets a
+/// second chance before the turn ends empty handed.
+const MAX_NUDGES: u32 = 2;
 
 pub fn resolve_compaction_model(
     provider: &Arc<dyn Provider>,
@@ -47,7 +50,7 @@ pub fn resolve_compaction_model(
 
 enum TurnOutcome {
     Continue,
-    Done(Option<StopReason>),
+    Done(DoneReason),
 }
 
 #[derive(Clone)]
@@ -97,7 +100,7 @@ pub struct Agent<'h> {
     config: AgentConfig,
     tool_output_lines: ToolOutputLines,
     reauth_attempts: u32,
-    post_tool_empty_retried: bool,
+    nudges: u32,
     permissions: Arc<PermissionManager>,
     opts: RequestOptions,
     session_id: Option<SessionRef>,
@@ -139,7 +142,7 @@ impl<'h> Agent<'h> {
             rollback_len: 0,
             mcp: None,
             reauth_attempts: 0,
-            post_tool_empty_retried: false,
+            nudges: 0,
             opts: RequestOptions::default(),
             session_id: params.session_id,
             mailbox: params.mailbox,
@@ -187,7 +190,9 @@ impl<'h> Agent<'h> {
         self
     }
 
-    pub async fn run(&mut self, input: AgentInput) -> Result<(), AgentError> {
+    /// Cancellation is an ending, not a failure: it comes back as
+    /// `Ok(DoneReason::Cancelled)` so callers only report real errors.
+    pub async fn run(&mut self, input: AgentInput) -> Result<DoneReason, AgentError> {
         let AgentInput {
             message,
             mode,
@@ -215,13 +220,17 @@ impl<'h> Agent<'h> {
             "agent run started"
         );
 
-        let result = self.run_loop().await;
+        let reason = match self.run_loop().await {
+            Ok(reason) => reason,
+            Err(AgentError::Cancelled) => {
+                sanitize_cancelled_history(self.history, self.rollback_len);
+                DoneReason::Cancelled
+            }
+            Err(e) => return Err(e),
+        };
+        self.emit_done(reason)?;
 
-        if matches!(result, Err(AgentError::Cancelled)) {
-            sanitize_cancelled_history(self.history, self.rollback_len);
-        }
-
-        result
+        Ok(reason)
     }
 
     fn push_input_context(&mut self, preamble: Vec<Message>) {
@@ -235,20 +244,16 @@ impl<'h> Agent<'h> {
         }
     }
 
-    async fn run_loop(&mut self) -> Result<(), AgentError> {
+    async fn run_loop(&mut self) -> Result<DoneReason, AgentError> {
         loop {
             if let Some(max) = self.config.max_turns
                 && self.num_turns >= max
             {
-                self.emit_done(None)?;
-                return Ok(());
+                return Ok(DoneReason::MaxTurns);
             }
             match self.turn().await? {
                 TurnOutcome::Continue => {}
-                TurnOutcome::Done(stop_reason) => {
-                    self.emit_done(stop_reason)?;
-                    return Ok(());
-                }
+                TurnOutcome::Done(reason) => return Ok(reason),
             }
         }
     }
@@ -289,10 +294,20 @@ impl<'h> Agent<'h> {
                 self.reauth_attempts = 0;
                 r
             }
-            Err(e) if e.is_auth_error() => {
+            Err(StreamError::Cancelled { streamed }) => {
+                if !streamed.trim().is_empty() {
+                    self.history.push(Message {
+                        role: Role::Assistant,
+                        content: vec![ContentBlock::Text { text: streamed }],
+                        ..Default::default()
+                    });
+                }
+                return Err(AgentError::Cancelled);
+            }
+            Err(StreamError::Other(e)) if e.is_auth_error() => {
                 return self.wait_for_reauth(e).await;
             }
-            Err(e) => {
+            Err(StreamError::Other(e)) => {
                 error!(error = %e, model = %self.model.id, self.num_turns, "stream_message failed");
                 return Err(e);
             }
@@ -324,25 +339,11 @@ impl<'h> Agent<'h> {
             self.context_size +=
                 estimate_message_tokens(&self.history.as_slice()[history_len_before..]);
         } else {
-            let has_text = response.message.first_text_content().is_some();
-
-            if !has_text && !self.post_tool_empty_retried && self.history.has_recent_tool_results(5)
-            {
-                self.post_tool_empty_retried = true;
-                warn!("empty response after tool calls, nudging model to continue");
-                self.event_tx.send(AgentEvent::Nudge)?;
-                self.history.push(Message {
-                    role: Role::Assistant,
-                    content: vec![ContentBlock::Text {
-                        text: "(empty)".into(),
-                    }],
-                    ..Default::default()
-                });
-                self.history.push(Message::synthetic(NUDGE_PROMPT.into()));
+            if response.message.first_text_content().is_some() {
+                self.history.push(response.message);
+            } else if self.recover_stalled_turn()? {
                 return Ok(TurnOutcome::Continue);
             }
-
-            self.history.push(response.message);
 
             if stop_reason == Some(StopReason::MaxTokens)
                 && self.num_turns <= self.config.max_continuation_turns
@@ -362,7 +363,7 @@ impl<'h> Agent<'h> {
         if has_tools {
             Ok(TurnOutcome::Continue)
         } else {
-            Ok(TurnOutcome::Done(stop_reason))
+            Ok(TurnOutcome::Done(stop_reason.into()))
         }
     }
 
@@ -403,25 +404,47 @@ impl<'h> Agent<'h> {
                     .model
                     .cost_of(&response.usage, self.opts.clamped(&self.model).fast),
                 context_size: Some(response.usage.context_tokens()),
+                context_window: self.model.context_window,
             })))
     }
 
-    fn emit_done(&self, stop_reason: Option<StopReason>) -> Result<(), AgentError> {
+    fn emit_done(&self, reason: DoneReason) -> Result<(), AgentError> {
         info!(
             self.num_turns,
             total_input = self.total_usage.input,
             total_output = self.total_usage.output,
+            %reason,
             "agent run completed"
         );
         self.event_tx.send(AgentEvent::Done {
             usage: self.total_usage,
             num_turns: self.num_turns,
-            stop_reason,
+            reason,
         })
     }
 
+    /// The turn came back without text, so [`Message::empty_marker`] takes its
+    /// place in history. Returns true when the model was nudged to try again.
+    fn recover_stalled_turn(&mut self) -> Result<bool, AgentError> {
+        // Asked before the marker lands, since it shifts the recent window.
+        let nudge = self.nudges < MAX_NUDGES && self.history.has_recent_tool_results(5);
+        self.history.push(Message::empty_marker());
+        if !nudge {
+            return Ok(false);
+        }
+
+        self.nudges += 1;
+        warn!(
+            self.nudges,
+            "empty response after tool calls, nudging model to continue"
+        );
+        self.event_tx.send(AgentEvent::Nudge)?;
+        self.history.push(Message::synthetic(NUDGE_PROMPT.into()));
+        Ok(true)
+    }
+
     async fn process_tool_calls(&mut self, response: StreamResponse) -> Result<(), AgentError> {
-        self.post_tool_empty_retried = false;
+        self.nudges = 0;
         let ctx = self.tool_context();
         tool_dispatch::process_tool_calls(
             response,
@@ -630,6 +653,49 @@ mod tests {
         }
     }
 
+    /// Streams `delta` (if any), fires `cancel_after_delta` (if any),
+    /// then fails with `fail_status` or hangs until cancelled.
+    #[derive(Default)]
+    struct StubStreamProvider {
+        delta: Option<&'static str>,
+        cancel_after_delta: Mutex<Option<crate::cancel::CancelTrigger>>,
+        fail_status: Option<u16>,
+    }
+
+    impl Provider for StubStreamProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            _: &'a [Message],
+            _: &'a str,
+            _: &'a Value,
+            ptx: &'a flume::Sender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a SessionRef>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(async move {
+                if let Some(text) = self.delta {
+                    ptx.send(ProviderEvent::TextDelta { text: text.into() })
+                        .unwrap();
+                }
+                if let Some(trigger) = self.cancel_after_delta.lock().unwrap().take() {
+                    trigger.cancel();
+                }
+                match self.fail_status {
+                    Some(status) => Err(AgentError::Api {
+                        status,
+                        message: "stub".into(),
+                    }),
+                    None => futures_lite::future::pending().await,
+                }
+            })
+        }
+
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
+            Box::pin(async { unimplemented!() })
+        }
+    }
+
     fn default_model() -> Model {
         Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap()
     }
@@ -649,10 +715,21 @@ mod tests {
     }
 
     fn empty_response() -> StreamResponse {
+        assistant_response(vec![])
+    }
+
+    fn thinking_response() -> StreamResponse {
+        assistant_response(vec![ContentBlock::Thinking {
+            thinking: "stalled".into(),
+            signature: None,
+        }])
+    }
+
+    fn assistant_response(content: Vec<ContentBlock>) -> StreamResponse {
         StreamResponse {
             message: Message {
                 role: Role::Assistant,
-                content: vec![],
+                content,
                 ..Default::default()
             },
             usage: TokenUsage::default(),
@@ -661,7 +738,7 @@ mod tests {
     }
 
     fn make_agent(
-        provider: MockProvider,
+        provider: impl Provider + 'static,
         history: &mut History,
     ) -> (Agent<'_>, flume::Receiver<Envelope>) {
         let (raw_tx, event_rx) = flume::unbounded();
@@ -678,6 +755,7 @@ mod tests {
                         ..Default::default()
                     },
                     std::path::PathBuf::from("/tmp"),
+                    Arc::default(),
                 )),
                 session_id: None,
                 mailbox: None,
@@ -796,18 +874,17 @@ mod tests {
         events
     }
 
-    async fn run_agent(provider: MockProvider) -> (u32, Option<StopReason>) {
+    async fn run_agent(provider: MockProvider, max_turns: Option<u32>) -> (u32, DoneReason) {
         let mut history = History::new(Vec::new());
         let (mut agent, event_rx) = make_agent(provider, &mut history);
+        agent.config.max_turns = max_turns;
         let _ = agent.run(default_input()).await;
         drain_events(&event_rx)
             .into_iter()
             .find_map(|e| match e.event {
                 AgentEvent::Done {
-                    num_turns,
-                    stop_reason,
-                    ..
-                } => Some((num_turns, stop_reason)),
+                    num_turns, reason, ..
+                } => Some((num_turns, reason)),
                 _ => None,
             })
             .expect("expected Done event")
@@ -897,16 +974,24 @@ mod tests {
         );
     }
 
-    #[test_case(&[StopReason::EndTurn],                                                     1, Some(StopReason::EndTurn)  ; "end_turn_completes")]
-    #[test_case(&[StopReason::MaxTokens, StopReason::EndTurn],                                 2, Some(StopReason::EndTurn)  ; "max_tokens_continues")]
-    #[test_case(&[StopReason::MaxTokens, StopReason::MaxTokens, StopReason::MaxTokens, StopReason::MaxTokens], 4, Some(StopReason::MaxTokens) ; "max_tokens_gives_up_after_limit")]
-    fn turn_counting(stops: &[StopReason], expected_turns: u32, expected_stop: Option<StopReason>) {
+    /// A truncated answer buys another turn, but only until one of the two
+    /// budgets runs out: the continuation limit or the caller's `max_turns`.
+    #[test_case(&[StopReason::EndTurn], None, 1, DoneReason::EndTurn ; "end_turn_completes")]
+    #[test_case(&[StopReason::MaxTokens, StopReason::EndTurn], None, 2, DoneReason::EndTurn ; "max_tokens_continues")]
+    #[test_case(&[StopReason::MaxTokens; 4], None, 4, DoneReason::MaxTokens ; "max_tokens_gives_up_after_limit")]
+    #[test_case(&[StopReason::MaxTokens, StopReason::EndTurn], Some(1), 1, DoneReason::MaxTurns ; "turn_budget_exhausted")]
+    fn turn_counting(
+        stops: &[StopReason],
+        max_turns: Option<u32>,
+        expected_turns: u32,
+        expected_reason: DoneReason,
+    ) {
         smol::block_on(async {
             let responses: Vec<_> = stops.iter().map(|s| text_response(*s)).collect();
             let provider = MockProvider::new(responses);
-            let (turns, stop_reason) = run_agent(provider).await;
+            let (turns, reason) = run_agent(provider, max_turns).await;
             assert_eq!(turns, expected_turns);
-            assert_eq!(stop_reason, expected_stop);
+            assert_eq!(reason, expected_reason);
         });
     }
 
@@ -1037,73 +1122,98 @@ mod tests {
     #[test]
     fn cancel_token_aborts_during_api_call() {
         smol::block_on(async {
-            struct HangingProvider;
-            impl Provider for HangingProvider {
-                fn stream_message<'a>(
-                    &'a self,
-                    _: &'a Model,
-                    _: &'a [Message],
-                    _: &'a str,
-                    _: &'a Value,
-                    _: &'a flume::Sender<ProviderEvent>,
-                    _: RequestOptions,
-                    _: Option<&'a SessionRef>,
-                ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
-                    Box::pin(async {
-                        futures_lite::future::pending::<()>().await;
-                        unreachable!()
-                    })
-                }
-                fn list_models(
-                    &self,
-                ) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>>
-                {
-                    Box::pin(async { unimplemented!() })
-                }
-            }
-
             let (trigger, cancel) = CancelToken::new();
             trigger.cancel();
 
-            let (raw_tx, _rx) = flume::unbounded();
             let mut history = History::new(Vec::new());
-            let mut agent = Agent::new(
-                AgentParams {
-                    provider: Arc::new(HangingProvider),
-                    model: default_model(),
-                    config: AgentConfig::default(),
-                    tool_output_lines: ToolOutputLines::default(),
-                    permissions: Arc::new(PermissionManager::new(
-                        maki_config::PermissionsConfig {
-                            default: maki_config::DefaultEffect::Allow,
-                            rules: vec![],
-                            ..Default::default()
-                        },
-                        std::path::PathBuf::from("/tmp"),
-                    )),
-                    session_id: None,
-                    mailbox: None,
-                    timeouts: maki_providers::Timeouts::default(),
-                    file_tracker: FileReadTracker::fresh(),
-                    prompt_slots: Arc::new(crate::prompt::ResolvedSlots::default()),
-                    subagent_cancels: Arc::new(crate::cancel::CancelMap::new()),
-                    registry: Arc::new(crate::tools::ToolRegistry::new()),
-                    audience: ToolAudience::MAIN,
-                    model_policy: Arc::new(ModelPolicy::default()),
-                },
-                AgentRunParams {
-                    history: &mut history,
-                    system: "system".into(),
-                    event_tx: EventSender::new(raw_tx, 0),
-                    tools: serde_json::json!([]),
-                },
-            )
-            .with_cancel(cancel);
+            let (agent, event_rx) = make_agent(StubStreamProvider::default(), &mut history);
+            let mut agent = agent.with_cancel(cancel);
 
-            let result = agent.run(default_input()).await;
-            assert!(matches!(result, Err(AgentError::Cancelled)));
+            assert_eq!(
+                agent.run(default_input()).await.unwrap(),
+                DoneReason::Cancelled
+            );
             drop(agent);
             assert_ends_with_cancel_marker(&history);
+            assert!(has_event(&drain_events(&event_rx), |e| matches!(
+                e,
+                AgentEvent::Done {
+                    reason: DoneReason::Cancelled,
+                    ..
+                }
+            )));
+        });
+    }
+
+    #[test]
+    fn cancel_mid_stream_keeps_partial_text_in_history() {
+        const PARTIAL: &str = "partial answer";
+        smol::block_on(async {
+            let (trigger, cancel) = CancelToken::new();
+            let provider = StubStreamProvider {
+                delta: Some(PARTIAL),
+                cancel_after_delta: Mutex::new(Some(trigger)),
+                ..Default::default()
+            };
+            let mut history = History::new(Vec::new());
+            let (agent, _event_rx) = make_agent(provider, &mut history);
+            let mut agent = agent.with_cancel(cancel);
+
+            assert_eq!(
+                agent.run(default_input()).await.unwrap(),
+                DoneReason::Cancelled
+            );
+            drop(agent);
+            assert_ends_with_cancel_marker(&history);
+            let messages = history.as_slice();
+            let partial = &messages[messages.len() - 2];
+            assert!(matches!(partial.role, Role::Assistant));
+            assert!(matches!(&partial.content[0], ContentBlock::Text { text } if text == PARTIAL));
+        });
+    }
+
+    /// The `Retry` event already made the view drop the failed attempt's
+    /// text, so history must not resurrect it (see `StreamError`).
+    #[test]
+    fn cancel_during_retry_backoff_discards_failed_attempt_text() {
+        const PARTIAL: &str = "doomed attempt";
+        smol::block_on(async {
+            let (trigger, cancel) = CancelToken::new();
+            let provider = StubStreamProvider {
+                delta: Some(PARTIAL),
+                fail_status: Some(529),
+                ..Default::default()
+            };
+            let mut history = History::new(Vec::new());
+            let (agent, event_rx) = make_agent(provider, &mut history);
+            let mut agent = agent.with_cancel(cancel);
+
+            let mut trigger = Some(trigger);
+            let pump = smol::spawn(async move {
+                while let Ok(envelope) = event_rx.recv_async().await {
+                    if matches!(envelope.event, AgentEvent::Retry { .. })
+                        && let Some(t) = trigger.take()
+                    {
+                        t.cancel();
+                    }
+                }
+            });
+
+            assert_eq!(
+                agent.run(default_input()).await.unwrap(),
+                DoneReason::Cancelled
+            );
+            drop(agent);
+            pump.await;
+
+            assert_ends_with_cancel_marker(&history);
+            assert!(
+                history.as_slice().iter().all(|m| !m
+                    .content
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::Text { text } if text == PARTIAL))),
+                "failed attempt's text must not reach history"
+            );
         });
     }
 
@@ -1138,15 +1248,25 @@ mod tests {
             empty_response(),
             text_response(StopReason::EndTurn),
         ],
-        3, true
+        3, 1
         ; "nudge_on_empty_after_tools"
+    )]
+    #[test_case(
+        vec![
+            tool_call_response("glob", "t1"),
+            thinking_response(),
+            empty_response(),
+            empty_response(),
+        ],
+        4, 2
+        ; "nudges_twice_then_gives_up"
     )]
     #[test_case(
         vec![
             tool_call_response("glob", "t1"),
             text_response(StopReason::EndTurn),
         ],
-        2, false
+        2, 0
         ; "no_nudge_when_text_after_tools"
     )]
     #[test_case(
@@ -1154,10 +1274,10 @@ mod tests {
             empty_response(),
             text_response(StopReason::EndTurn),
         ],
-        1, false
+        1, 0
         ; "no_nudge_without_recent_tools"
     )]
-    fn nudge_behavior(responses: Vec<StreamResponse>, expected_turns: u32, expect_nudge: bool) {
+    fn nudge_behavior(responses: Vec<StreamResponse>, expected_turns: u32, expected_nudges: usize) {
         smol::block_on(async {
             let mut history = History::new(Vec::new());
             let (mut agent, event_rx) = make_agent(MockProvider::new(responses), &mut history);
@@ -1165,10 +1285,12 @@ mod tests {
             drop(agent);
             let events = drain_events(&event_rx);
 
-            assert_eq!(
-                has_event(&events, |e| matches!(e, AgentEvent::Nudge)),
-                expect_nudge,
-            );
+            let nudges = events
+                .iter()
+                .filter(|e| matches!(e.event, AgentEvent::Nudge))
+                .count();
+            assert_eq!(nudges, expected_nudges);
+
             let done = events
                 .iter()
                 .find_map(|e| match &e.event {
@@ -1177,6 +1299,15 @@ mod tests {
                 })
                 .expect("expected Done event");
             assert_eq!(done, expected_turns);
+
+            assert!(
+                history
+                    .as_slice()
+                    .iter()
+                    .all(|m| m.content.iter().any(|b| !b.is_thinking())),
+                "history holds a message no provider will accept: {:?}",
+                history.as_slice()
+            );
         });
     }
 

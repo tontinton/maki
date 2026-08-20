@@ -1,6 +1,6 @@
 +++
 title = "Commands"
-weight = 4
+weight = 8
 [extra]
 group = "Reference"
 +++
@@ -84,5 +84,32 @@ Review $ARGUMENTS and suggest improvements.
 Use `$ARGUMENTS` in the command body. It gets replaced with whatever you type after the command name. The command is treated as accepting args if the body contains `$ARGUMENTS` or you set `argument-hint`.
 
 For example, `/project:review main.rs` replaces `$ARGUMENTS` with `main.rs`.
+
+## Aliasing commands
+
+Prefer a different name for a command? `maki.api.run_command` runs any slash command exactly as typing it would, so an alias is a one-line handler in your `init.lua` instead of a reimplementation.
+
+```lua
+-- ~/.config/maki/init.lua
+local aliases = {
+    { name = "/clear", target = "/new", description = "Alias for /new" },
+    { name = "/resume", target = "/sessions", description = "Alias for /sessions" },
+}
+
+for _, alias in ipairs(aliases) do
+    maki.api.register_command({
+        name = alias.name,
+        description = alias.description,
+        handler = function()
+            local ok, err = maki.api.run_command(alias.target)
+            if not ok then
+                maki.ui.flash("could not run " .. alias.target .. ": " .. err)
+            end
+        end,
+    })
+end
+```
+
+Both names stay in the palette: aliasing adds a name, it does not rename or hide the original. It works for any command listed above, plus plugin commands and MCP prompts. See [`maki.api.run_command`](/docs/lua-api/#maki-api-run_command) for matching and error handling, or [`maki.ui.action`](/docs/lua-api/#maki-ui-action) to bind a key instead of a name.
 
 Related: [CLI](/docs/cli/) for shell flags and subcommands, [Skills](/docs/skills/) for on-demand playbooks.
