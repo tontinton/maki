@@ -34,6 +34,16 @@ const SECTIONS: &[(&str, &[&str])] = &[
         &["batch", "code_execution", "question"],
     ),
     (
+        "Process Supervision",
+        &[
+            "monitor",
+            "monitor_stop",
+            "monitor_list",
+            "monitor_peek",
+            "monitor_wait",
+        ],
+    ),
+    (
         "Agent & Knowledge",
         &["task", "todo_write", "memory", "skill"],
     ),
