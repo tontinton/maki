@@ -23,6 +23,7 @@ use crate::setup;
 const FALLBACK_MODEL_SPEC: &str = "anthropic/claude-sonnet-4-20250514";
 const CONFIG_FALLBACK_WARNING: &str = "config reload failed, using previous config";
 const MODEL_FALLBACK_WARNING: &str = "model resolution failed, keeping previous model";
+#[cfg(all(feature = "sandbox", target_os = "linux"))]
 const EMPTY_TOOL_RESULT: &str = "empty tool result";
 
 /// One generation of the app: everything torn down and rebuilt on `/reload`.
