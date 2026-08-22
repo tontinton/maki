@@ -2322,6 +2322,8 @@ Requires the `run` [plugin permission](#plugin-permissions).
 
   Optional fields:
 
+  - `preamble` (`string?`) Python source (imports, helpers) compiled ahead of
+    {code}. Tracebacks are rebased so line 1 is {code} line 1.
   - `tools` (`table?`) map of `name -> function` for tools the sandbox may call.
     Each function receives the tool input table and must return `(string)` or
     `(nil, err)`. Tool calls are batched and dispatched concurrently.

@@ -49,7 +49,7 @@ fn forward_calls(
 
 async fn call_lua_tool(lua: Lua, f: Option<Function>, pc: &PendingCall) -> Result<Value, String> {
     let Some(f) = f else {
-        return Err(format!("unknown tool: {}", pc.name));
+        return Err("unknown tool".to_owned());
     };
     let input = build_tool_input(&pc.args, &pc.kwargs)?;
     let arg = json_to_lua(&lua, &input).map_err(|e| e.to_string())?;
@@ -57,9 +57,7 @@ async fn call_lua_tool(lua: Lua, f: Option<Function>, pc: &PendingCall) -> Resul
         .call_async::<mlua::MultiValue>(arg)
         .await
         .map_err(|e| e.to_string())?;
-    lua_tool_result(values)
-        .map(Value::String)
-        .map_err(|e| format!("{}: {e}", pc.name))
+    lua_tool_result(values).map(Value::String)
 }
 
 /// Run Python code in a sandboxed interpreter with memory and time limits.
@@ -78,6 +76,8 @@ async fn call_lua_tool(lua: Lua, f: Option<Function>, pc: &PendingCall) -> Resul
 ///   `on_output` (function) - called with each stdout line (string) as it is
 ///     produced. Must not yield.
 /// Optional fields:
+///   `preamble` (string?) - Python source (imports, helpers) compiled ahead of
+///     {code}. Tracebacks are rebased so line 1 is {code} line 1.
 ///   `tools` (table?) - map of `name -> function` for tools the sandbox may call.
 ///     Each function receives the tool input table and must return `(string)` or
 ///     `(nil, err)`. Tool calls are batched and dispatched concurrently.
@@ -95,6 +95,7 @@ async fn interpreter_run(lua: Lua, code: String, opts: Table) -> LuaResult<Pair<
     let timeout_secs: u64 = required(&opts, "timeout")?;
     let max_memory_mb: usize = required(&opts, "max_memory_mb")?;
     let on_output: Function = required(&opts, "on_output")?;
+    let preamble: String = opts.get::<Option<String>>("preamble")?.unwrap_or_default();
     let tools_tbl: Option<Table> = opts.get("tools")?;
 
     let mut fns: HashMap<String, Function> = HashMap::new();
@@ -144,12 +145,19 @@ async fn interpreter_run(lua: Lua, code: String, opts: Table) -> LuaResult<Pair<
         };
 
         let mut flushed = 0usize;
-        let result = runner::run_streaming(&code, &tools, Some(&resolver), limits, &mut |chunk| {
-            flushed += chunk.len();
-            for line in chunk.lines() {
-                let _ = tx.send(BridgeMsg::Line(line.to_owned()));
-            }
-        })
+        let result = runner::run(
+            &code,
+            &preamble,
+            &tools,
+            Some(&resolver),
+            limits,
+            &mut |chunk| {
+                flushed += chunk.len();
+                for line in chunk.lines() {
+                    let _ = tx.send(BridgeMsg::Line(line.to_owned()));
+                }
+            },
+        )
         .map_err(|e| e.to_string());
         if let Ok(ir) = &result {
             for line in ir.stdout[flushed..].lines() {
@@ -167,7 +175,12 @@ async fn interpreter_run(lua: Lua, code: String, opts: Table) -> LuaResult<Pair<
                     let futs = batch.into_iter().map(|pc| {
                         let f = fns.get(&pc.name).cloned();
                         let lua = lua.clone();
-                        async move { (pc.call_id, call_lua_tool(lua, f, &pc).await) }
+                        // Name the tool on every failure: neither a traceback nor a
+                        // list of gathered results says which call broke.
+                        async move {
+                            let result = call_lua_tool(lua, f, &pc).await;
+                            (pc.call_id, result.map_err(|e| format!("{}: {e}", pc.name)))
+                        }
                     });
                     let _ = reply.send(join_all(futs).await);
                 }

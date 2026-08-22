@@ -62,20 +62,11 @@ impl PrintWriterCallback for StreamingWriter<'_> {
     }
 }
 
+/// `preamble` holds imports and helpers; it is compiled ahead of `code` as one
+/// script, and tracebacks come back rebased so line 1 is `code` line 1.
 pub fn run(
     code: &str,
-    tools: &HashMap<String, ToolFn>,
-    resolver: Option<&AsyncResolver>,
-    limits: ResourceLimits,
-) -> Result<InterpreterResult, InterpreterError> {
-    let mut stdout = String::new();
-    let mut print_writer = PrintWriter::collect_string(&mut stdout);
-    let output = run_inner(code, tools, resolver, limits, &mut print_writer)?;
-    Ok(InterpreterResult { output, stdout })
-}
-
-pub fn run_streaming(
-    code: &str,
+    preamble: &str,
     tools: &HashMap<String, ToolFn>,
     resolver: Option<&AsyncResolver>,
     limits: ResourceLimits,
@@ -86,27 +77,45 @@ pub fn run_streaming(
         flushed_pos: 0,
         on_line: on_output,
     };
-    let mut print_writer = PrintWriter::Callback(&mut writer);
-    let output = run_inner(code, tools, resolver, limits, &mut print_writer)?;
-    let stdout = writer.buffer;
-    Ok(InterpreterResult { output, stdout })
+    let preamble = preamble.trim_end_matches('\n');
+    let script = if preamble.is_empty() {
+        code.to_owned()
+    } else {
+        format!("{preamble}\n{code}")
+    };
+    let output = execute(
+        script,
+        tools,
+        resolver,
+        limits,
+        &mut PrintWriter::Callback(&mut writer),
+    )
+    .map_err(|e| {
+        let offset = preamble.lines().count();
+        match e {
+            InterpreterError::Parse(msg) => InterpreterError::Parse(rebase_traceback(&msg, offset)),
+            InterpreterError::Runtime(msg) => {
+                InterpreterError::Runtime(rebase_traceback(&msg, offset))
+            }
+            other => other,
+        }
+    })?;
+    Ok(InterpreterResult {
+        output,
+        stdout: writer.buffer,
+    })
 }
 
-fn run_inner(
-    code: &str,
+fn execute(
+    script: String,
     tools: &HashMap<String, ToolFn>,
     resolver: Option<&AsyncResolver>,
     limits: ResourceLimits,
     print_writer: &mut PrintWriter<'_>,
 ) -> Result<Option<Value>, InterpreterError> {
     let _sandbox = limits.max_memory.is_some().then(SandboxScope::enter);
-    let runner = MontyRun::new(
-        code.to_owned(),
-        SCRIPT_NAME,
-        vec![],
-        CompileOptions::default(),
-    )
-    .map_err(|e| InterpreterError::Parse(e.to_string()))?;
+    let runner = MontyRun::new(script, SCRIPT_NAME, vec![], CompileOptions::default())
+        .map_err(|e| InterpreterError::Parse(e.to_string()))?;
 
     let tracker = ResourceTracker::new(limits);
 
@@ -228,6 +237,39 @@ fn run_inner(
     }
 }
 
+/// Monty counts lines in the whole script, so user frames come back
+/// `preamble_lines` too high. Preamble frames are dropped along with their
+/// source excerpt: the caller never wrote those lines, so pointing at them only
+/// sends it hunting through code it cannot see.
+fn rebase_traceback(msg: &str, preamble_lines: usize) -> String {
+    let prefix = format!("  File \"{SCRIPT_NAME}\", line ");
+    let mut kept: Vec<Cow<'_, str>> = Vec::new();
+    let mut in_preamble_frame = false;
+    for line in msg.lines() {
+        match line.strip_prefix(&prefix).and_then(split_line_number) {
+            Some((number, rest)) => {
+                in_preamble_frame = number <= preamble_lines;
+                if !in_preamble_frame {
+                    kept.push(format!("{prefix}{}{rest}", number - preamble_lines).into());
+                }
+            }
+            None if in_preamble_frame && line.starts_with(' ') => {}
+            None => {
+                in_preamble_frame = false;
+                kept.push(line.into());
+            }
+        }
+    }
+    kept.join("\n")
+}
+
+fn split_line_number(rest: &str) -> Option<(usize, &str)> {
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    rest[..end].parse().ok().map(|n| (n, &rest[end..]))
+}
+
 pub fn limits(timeout: Duration, max_memory: usize) -> ResourceLimits {
     ResourceLimits::default()
         .max_duration(timeout)
@@ -241,13 +283,40 @@ mod tests {
     use serde_json::json;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use test_case::test_case;
 
+    const NO_PREAMBLE: &str = "";
+    const RAISING_PREAMBLE: &str = "def helper():\n    raise ValueError('inside preamble')\n";
     const DEFAULT_MAX_MEMORY: usize = 50 * 1024 * 1024;
     const SMALL_MAX_MEMORY: usize = 2 * 1024 * 1024;
     const OVER_LIMIT_ALLOC: &str = "x = [0] * 10_000_000";
     const MEMORY_ERR_FRAGMENT: &str = "memory";
     const NESTED_TIMEOUT: Duration = Duration::from_secs(5);
     const NESTED_DEADLOCK: &str = "nested run deadlocked";
+    const USER_ERROR_LINE: usize = 2;
+
+    fn run_code(
+        code: &str,
+        tools: &HashMap<String, ToolFn>,
+        resolver: Option<&AsyncResolver>,
+        limits: ResourceLimits,
+    ) -> Result<InterpreterResult, InterpreterError> {
+        run(code, NO_PREAMBLE, tools, resolver, limits, &mut |_| {})
+    }
+
+    fn run_with_preamble(
+        code: &str,
+        preamble: &str,
+    ) -> Result<InterpreterResult, InterpreterError> {
+        run(
+            code,
+            preamble,
+            &empty_tools(),
+            None,
+            default_limits(),
+            &mut |_| {},
+        )
+    }
 
     fn default_limits() -> ResourceLimits {
         limits(Duration::from_secs(30), DEFAULT_MAX_MEMORY)
@@ -266,6 +335,15 @@ mod tests {
         HashMap::new()
     }
 
+    fn reported_lines(msg: &str) -> Vec<usize> {
+        let prefix = format!("File \"{SCRIPT_NAME}\", line ");
+        msg.lines()
+            .filter_map(|l| l.trim_start().strip_prefix(&prefix))
+            .filter_map(split_line_number)
+            .map(|(n, _)| n)
+            .collect()
+    }
+
     fn stub_tools(names: &[&str]) -> HashMap<String, ToolFn> {
         names
             .iter()
@@ -278,7 +356,7 @@ mod tests {
 
     #[test]
     fn memory_limit_raises_memory_error() {
-        let err = run(
+        let err = run_code(
             OVER_LIMIT_ALLOC,
             &empty_tools(),
             None,
@@ -294,7 +372,7 @@ mod tests {
     fn concurrent_memory_limited_runs_both_enforce() {
         let spawn = || {
             std::thread::spawn(|| {
-                run(
+                run_code(
                     OVER_LIMIT_ALLOC,
                     &empty_tools(),
                     None,
@@ -317,12 +395,12 @@ mod tests {
         std::thread::spawn(move || {
             let subagent: ToolFn = Box::new(|_, _, _| {
                 let inner = std::thread::spawn(|| {
-                    run("2 + 3", &empty_tools(), None, default_limits()).unwrap()
+                    run_code("2 + 3", &empty_tools(), None, default_limits()).unwrap()
                 });
                 Ok(inner.join().unwrap().output.unwrap())
             });
             let tools = HashMap::from([("task".to_owned(), subagent)]);
-            let _ = tx.send(run("task()", &tools, None, default_limits()));
+            let _ = tx.send(run_code("task()", &tools, None, default_limits()));
         });
         let result = rx.recv_timeout(NESTED_TIMEOUT).expect(NESTED_DEADLOCK);
         assert_eq!(result.unwrap().output, Some(json!(5)));
@@ -330,7 +408,7 @@ mod tests {
 
     #[test]
     fn memory_limit_not_tripped_by_small_workload() {
-        let result = run(
+        let result = run_code(
             "sum([i for i in range(1000)])",
             &empty_tools(),
             None,
@@ -342,14 +420,14 @@ mod tests {
 
     #[test]
     fn simple_expression() {
-        let result = run("2 + 3", &empty_tools(), None, default_limits()).unwrap();
+        let result = run_code("2 + 3", &empty_tools(), None, default_limits()).unwrap();
         assert_eq!(result.output, Some(json!(5)));
         assert!(result.stdout.is_empty());
     }
 
     #[test]
     fn print_output() {
-        let result = run(
+        let result = run_code(
             "print('hello world')",
             &empty_tools(),
             None,
@@ -366,7 +444,7 @@ mod tests {
             "echo".into(),
             Box::new(|_, args, _| Ok(args.first().cloned().unwrap_or(json!(null)))),
         );
-        let result = run("echo(42)", &tools, None, default_limits()).unwrap();
+        let result = run_code("echo(42)", &tools, None, default_limits()).unwrap();
         assert_eq!(result.output, Some(json!(42)));
     }
 
@@ -384,19 +462,19 @@ mod tests {
                 Ok(json!(format!("hello {name}")))
             }),
         );
-        let result = run("greet(name='world')", &tools, None, default_limits()).unwrap();
+        let result = run_code("greet(name='world')", &tools, None, default_limits()).unwrap();
         assert_eq!(result.output, Some(json!("hello world")));
     }
 
     #[test]
     fn parse_error() {
-        let err = run("def", &empty_tools(), None, default_limits()).unwrap_err();
+        let err = run_code("def", &empty_tools(), None, default_limits()).unwrap_err();
         assert!(matches!(err, InterpreterError::Parse(_)));
     }
 
     #[test]
     fn unknown_tool_raises_name_error() {
-        let err = run("nonexistent()", &empty_tools(), None, default_limits()).unwrap_err();
+        let err = run_code("nonexistent()", &empty_tools(), None, default_limits()).unwrap_err();
         assert!(
             matches!(err, InterpreterError::Runtime(_)),
             "expected Runtime NameError, got {err:?}"
@@ -410,15 +488,16 @@ mod tests {
             "fail".into(),
             Box::new(|_, _, _| Err("intentional failure".into())),
         );
-        let err = run("fail()", &tools, None, default_limits()).unwrap_err();
+        let err = run_code("fail()", &tools, None, default_limits()).unwrap_err();
         assert!(matches!(err, InterpreterError::ToolCall { .. }));
     }
 
     #[test]
     fn streaming_collects_stdout() {
         let mut called = false;
-        let result = run_streaming(
+        let result = run(
             "print('hello')\nprint('world')",
+            NO_PREAMBLE,
             &empty_tools(),
             None,
             default_limits(),
@@ -457,7 +536,7 @@ await main()
                 .collect())
         });
 
-        let result = run(code, &tools, Some(&resolver), default_limits()).unwrap();
+        let result = run_code(code, &tools, Some(&resolver), default_limits()).unwrap();
         assert_eq!(result.output, Some(json!("a_val|b_val")));
     }
 
@@ -483,7 +562,7 @@ await main()
                 .collect())
         });
 
-        let result = run(code, &tools, Some(&resolver), default_limits()).unwrap();
+        let result = run_code(code, &tools, Some(&resolver), default_limits()).unwrap();
         assert!(result.output.is_some());
         assert!(
             call_count.load(Ordering::SeqCst) >= 2,
@@ -493,10 +572,11 @@ await main()
 
     #[test]
     fn resolver_wait_does_not_count_against_timeout() {
-        const TIMEOUT: Duration = Duration::from_millis(500);
-        const WAIT: Duration = Duration::from_millis(700);
+        const TIMEOUT: Duration = Duration::from_millis(1000);
+        const WAIT: Duration = Duration::from_millis(1100);
         // Monty's tracker must stop the clock while we sit in the resolver.
-        // Two awaits so a clock paused only for the first wait still fails.
+        // Two awaits so a clock paused only for the first wait still fails,
+        // and generous durations so a busy machine cannot tip the balance.
         let code = r#"
 async def main():
     a = await slow()
@@ -514,8 +594,63 @@ await main()
         });
 
         let lims = limits(TIMEOUT, DEFAULT_MAX_MEMORY);
-        let result = run(code, &tools, Some(&resolver), lims).unwrap();
+        let result = run_code(code, &tools, Some(&resolver), lims).unwrap();
         assert_eq!(result.output, Some(json!("donedone")));
+    }
+
+    #[test_case("x = 1\nprint(boom_undefined)\n", "import re\nimport asyncio\n" ; "runtime_frame")]
+    #[test_case("x = 1\nprint(boom_undefined)\n", "import re" ; "preamble_without_trailing_newline")]
+    #[test_case("x = 1\ndef\n", "import re\n" ; "parse_error")]
+    fn traceback_lines_count_from_the_users_first_line(code: &str, preamble: &str) {
+        let err = run_with_preamble(code, preamble).unwrap_err().to_string();
+        assert_eq!(reported_lines(&err), [USER_ERROR_LINE], "got: {err}");
+    }
+
+    /// The error must survive even though the frame that raised it is gone.
+    #[test]
+    fn preamble_frames_are_dropped_from_traceback() {
+        let err = run_with_preamble("helper()\n", RAISING_PREAMBLE)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(reported_lines(&err), [1], "preamble frame leaked: {err}");
+        assert!(!err.contains("raise ValueError"), "excerpt leaked: {err}");
+        assert!(err.contains("inside preamble"), "error lost: {err}");
+    }
+
+    /// The `gather` helper in the code_execution preamble awaits calls one at a
+    /// time so it can catch each failure alone. That stays concurrent only
+    /// because every call is already pending when the first await parks, and
+    /// here is where we would notice if that stopped being true.
+    #[test]
+    fn calls_made_before_the_first_await_resolve_in_one_batch() {
+        let code = r#"
+async def main():
+    out = []
+    for call in [tool_a(), tool_fail(), tool_b()]:
+        try:
+            out.append(await call)
+        except Exception as e:
+            out.append(str(e))
+    return out
+await main()
+"#;
+        let tools = stub_tools(&["tool_a", "tool_b", "tool_fail"]);
+        let batches = Arc::new(AtomicUsize::new(0));
+        let counted = batches.clone();
+        let resolver: AsyncResolver = Box::new(move |pending: Vec<PendingCall>| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Ok(pending
+                .into_iter()
+                .map(|pc| match pc.name.as_str() {
+                    "tool_fail" => (pc.call_id, Err("boom".to_owned())),
+                    name => (pc.call_id, Ok(json!(name))),
+                })
+                .collect())
+        });
+
+        let result = run_code(code, &tools, Some(&resolver), default_limits()).unwrap();
+        assert_eq!(result.output, Some(json!(["tool_a", "boom", "tool_b"])));
+        assert_eq!(batches.load(Ordering::SeqCst), 1, "calls must be batched");
     }
 
     #[test]
@@ -539,7 +674,7 @@ await main()
                 .collect())
         });
 
-        let err = run(code, &tools, Some(&resolver), default_limits()).unwrap_err();
+        let err = run_code(code, &tools, Some(&resolver), default_limits()).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("boom"),

@@ -1,7 +1,7 @@
 -- Policy for the Python interpreter: which tools it may call, what the model
--- sees (via the `describe(dctx)` callback), and the import preamble. The
--- sandbox and dispatch live in Rust, which exposes primitives only
--- (`maki.api.get_tools`, `maki.agent.call_tool`); orchestration policy is here.
+-- sees (via the `describe(dctx)` callback), and the preamble. The sandbox and
+-- dispatch live in Rust, which exposes primitives only (`maki.api.get_tools`,
+-- `maki.agent.call_tool`); orchestration policy is here.
 
 local truncate = require("maki.truncate")
 local ToolView = require("maki.tool_view")
@@ -15,10 +15,42 @@ local NO_OUTPUT = "(no output)"
 local SEPARATOR = "──────"
 local CANCELLED_ERR = "cancelled"
 local TIME_LIMIT_SUBSTR = "time limit exceeded"
-local PREAMBLE = "import re\nimport asyncio\nimport sys\nimport os\nimport json\n"
+-- Same marker the batch tool uses for a failed child, so a failure reads the
+-- same wherever the model meets it.
+local ERROR_PREFIX = "[ERROR] "
+local ASYNCIO_GATHER = "asyncio.gather"
+local GATHER_HINT = "\n\nHint: `gather(...)` keeps the other results, returning `"
+  .. ERROR_PREFIX
+  .. "...` for the failed call."
+-- `asyncio.gather` cancels its siblings the moment one call raises, throwing away
+-- results the model already paid for, so `gather` awaits each call in its own
+-- `try` instead. Awaiting one at a time is still concurrent: every call was made
+-- before the first await, so they all sit pending and the host dispatches them in
+-- one batch. Tasks look like the obvious fix, but monty 0.0.21 fails the whole
+-- gather on an external call error rather than raising inside the awaiting task,
+-- and a coroutine wrapper is lazy, so a call handed over that way would run alone.
+-- Only `RuntimeError` is caught, the shape a failed tool call arrives in; a
+-- TypeError from the script itself must still stop the run.
+local PREAMBLE = ([[
+import re
+import asyncio
+import sys
+import os
+import json
+async def gather(*calls):
+    if len(calls) == 1 and isinstance(calls[0], list):
+        calls = calls[0]
+    results = []
+    for c in calls:
+        try:
+            results.append(await c)
+        except RuntimeError as e:
+            results.append('%s' + str(e))
+    return results
+]]):format(ERROR_PREFIX)
 local TOOLS_HEADER = "\n\nAvailable tools (called as Python functions with keyword arguments):\n"
 local WORKFLOW_TOOLS_NOTE =
-  "\nWorkflow mode: orchestrate subagents from this script. Await every `task(...)` call and use `asyncio.gather` for parallel fan-out. Pass `output_schema` to task for machine-readable results (a JSON string, parse with `json.loads`).\n"
+  "\nWorkflow mode: orchestrate subagents from this script. Await every `task(...)` call and use `gather(task(...), task(...))` for parallel fan-out. Pass `output_schema` to task for machine-readable results (a JSON string, parse with `json.loads`).\n"
 local PY_TYPES = { string = "str", integer = "int", boolean = "bool", array = "list" }
 
 local opts = maki.api.register_options(output_limits.extend({
@@ -80,10 +112,10 @@ end
 
 local description = [[Execute Python code in a sandboxed interpreter with tools as callable functions.
 
-Use for chained/dependent tool calls and filtering/processing results, e.g. filtering web tool output. **DRAMATICALLY** faster than sequential tool calls!
+Use for chained/dependent tool calls and filtering/processing results, e.g. filtering web tool output. **DRAMATICALLY** cheaper than sequential tool calls!
 
 - All tools are async and return strings: `result = await read(path='file.txt', offset=1, limit=0)`. Parse output yourself.
-- Use `asyncio.gather()` for concurrency within one execution.
+- Concurrency: `a, b = await gather(read(path='a.py', offset=1, limit=0), grep(pattern='x'))`. Pass calls directly, never wrapped in `async def`.
 - Available libs: re, asyncio, sys, os, json. No other imports, no classes, no filesystem/network access.
 - Fresh sandbox each run: no state persists between executions.
 - 30s script timeout (`timeout` param); time awaiting tool calls doesn't count.
@@ -98,7 +130,7 @@ local schema = {
   properties = {
     code = {
       type = "string",
-      description = "Python code to execute. Tools are async functions that return strings (not objects). You MUST await every call: `result = await read(path='/file', offset=1, limit=0)`. Use `await asyncio.gather(...)` for concurrency.",
+      description = "Python code to execute. Tools are async functions that return strings (not objects). You MUST await every call: `result = await read(path='/file', offset=1, limit=0)`. Use `await gather(...)` for concurrency.",
     },
     timeout = {
       type = "integer",
@@ -110,7 +142,7 @@ local schema = {
 local examples = {
   {
     code = [[files = (await glob(pattern='**/*.rs')).strip().split('\n')
-results = await asyncio.gather(*[read(path=f, offset=1, limit=0) for f in files if f.strip()])
+results = await gather(*[read(path=f, offset=1, limit=0) for f in files if f.strip()])
 for f, c in zip(files, results):
     if 'fn main' in c: print(f)]],
   },
@@ -260,9 +292,10 @@ local function handler(input, ctx)
     end
   end
 
-  local result, err = maki.interpreter.run(PREAMBLE .. input.code, {
+  local result, err = maki.interpreter.run(input.code, {
     timeout = timeout,
     max_memory_mb = opts.max_memory_mb,
+    preamble = PREAMBLE,
     on_output = show,
     tools = tools,
   })
@@ -279,7 +312,10 @@ local function handler(input, ctx)
     end
     view:append_text(err)
     view:finish()
-    return { llm_output = err, is_error = true, body = buf }
+    -- The run is already paid for, so point a script that reached for
+    -- `asyncio.gather` at the wrapper that would have kept its other results.
+    local hint = input.code:find(ASYNCIO_GATHER, 1, true) and GATHER_HINT or ""
+    return { llm_output = err .. hint, is_error = true, body = buf }
   end
 
   local output = result.stdout or ""

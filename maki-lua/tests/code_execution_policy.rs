@@ -12,6 +12,9 @@ use maki_lua::PluginHost;
 const CODE_EXECUTION_SRC: &str = include_str!("../../plugins/code_execution/init.lua");
 
 const ECHO_PREFIX: &str = "echo:";
+const FAIL_MSG: &str = "fixture blew up";
+const ERROR_PREFIX: &str = "[ERROR] ";
+const GATHER_HINT_SUBSTR: &str = "`gather(...)` keeps the other results";
 const TASK_PREFIX: &str = "task:";
 const WORKFLOW_NOTE_SUBSTR: &str = "Workflow mode: orchestrate subagents";
 const INTERP_ECHO_SIG: &str = "- interp_echo(msg: str, count: int = None, flag: bool = None, items: list = None, raw: any = None) -> str";
@@ -53,6 +56,13 @@ maki.api.register_tool({{
     handler = function(input) return "{ECHO_PREFIX}" .. input.msg end,
 }})
 maki.api.register_tool({{
+    name = "interp_fail",
+    description = "failing interpreter fixture",
+    audiences = {{ "main", "interpreter" }},
+    schema = {{ type = "object", properties = {{}}, additionalProperties = false }},
+    handler = function() return {{ llm_output = "{FAIL_MSG}", is_error = true }} end,
+}})
+maki.api.register_tool({{
     name = "sub_tool",
     description = "subagent fixture",
     audiences = {{ "general_sub", "interpreter" }},
@@ -63,8 +73,7 @@ maki.api.register_tool({{
     )
 }
 
-fn setup() -> (Arc<ToolRegistry>, PluginHost) {
-    let reg = Arc::new(ToolRegistry::new());
+fn setup_with(reg: Arc<ToolRegistry>) -> (Arc<ToolRegistry>, PluginHost) {
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     host.load_source("code_execution", CODE_EXECUTION_SRC)
         .expect("real plugin should load");
@@ -73,16 +82,14 @@ fn setup() -> (Arc<ToolRegistry>, PluginHost) {
     (reg, host)
 }
 
+fn setup() -> (Arc<ToolRegistry>, PluginHost) {
+    setup_with(Arc::new(ToolRegistry::new()))
+}
+
 /// Uses the global native registry because `interpreter_bridge::dispatch` does.
 /// Safe: nextest runs each test in its own process.
 fn setup_native() -> (Arc<ToolRegistry>, PluginHost) {
-    let reg = Arc::clone(ToolRegistry::global_arc());
-    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    host.load_source("code_execution", CODE_EXECUTION_SRC)
-        .expect("real plugin should load");
-    host.load_source("policy_fixtures", &fixture_plugin())
-        .expect("fixture plugin should load");
-    (reg, host)
+    setup_with(Arc::clone(ToolRegistry::global_arc()))
 }
 
 fn describe(
@@ -118,10 +125,16 @@ fn exec_code(reg: &ToolRegistry, ctx: &ToolContext, code: &str) -> Result<String
         })
 }
 
-fn stub_ctx_for(reg: &Arc<ToolRegistry>, mode: &AgentMode) -> ToolContext {
-    let mut ctx = stub_ctx(mode);
-    ctx.registry = Arc::clone(reg);
-    ctx
+fn run_code_in(code: &str, workflow: bool) -> Result<String, String> {
+    let (reg, _host) = setup_native();
+    let mut ctx = stub_ctx(&AgentMode::Build);
+    ctx.registry = Arc::clone(&reg);
+    ctx.workflow = workflow;
+    exec_code(&reg, &ctx, code)
+}
+
+fn run_code(code: &str) -> Result<String, String> {
+    run_code_in(code, false)
 }
 
 #[test]
@@ -165,40 +178,70 @@ fn except_filter_removes_tool_from_description() {
 
 #[test]
 fn interpreter_calls_advertised_tool_end_to_end() {
-    let (reg, _host) = setup_native();
-    let ctx = stub_ctx_for(&reg, &AgentMode::Build);
-    let out = exec_code(
-        &reg,
-        &ctx,
-        "result = await interp_echo(msg='hi')\nprint(result)",
-    )
-    .expect("advertised tool must be callable");
+    let out = run_code("result = await interp_echo(msg='hi')\nprint(result)")
+        .expect("advertised tool must be callable");
     assert!(out.contains(&format!("{ECHO_PREFIX}hi")), "got: {out}");
+}
+
+/// The list form covers a model that forgets the `*`. It must run rather than
+/// cost a TypeError round-trip.
+#[test_case::test_case("gather(interp_echo(msg='hi'), interp_fail())" ; "varargs")]
+#[test_case::test_case("gather([interp_echo(msg='hi'), interp_fail()])" ; "single_list")]
+fn gather_keeps_sibling_results_when_one_call_fails(call: &str) {
+    let out = run_code(&format!("ok, bad = await {call}\nprint(ok)\nprint(bad)"))
+        .expect("a failed call must not fail the script");
+    assert!(out.contains(&format!("{ECHO_PREFIX}hi")), "got: {out}");
+    assert!(
+        out.contains(&format!("{ERROR_PREFIX}interp_fail: {FAIL_MSG}")),
+        "failed call must name the tool and its error: {out}"
+    );
+}
+
+/// Only a failed tool call belongs in the results. The script's own mistake
+/// must stop the run instead of hiding as an `[ERROR]` entry.
+#[test]
+fn gather_lets_script_errors_through() {
+    let err = run_code("await gather(interp_echo(msg='hi'), 'not a call')")
+        .expect_err("awaiting a non-call must raise");
+    assert!(!err.contains(ERROR_PREFIX), "got: {err}");
+}
+
+/// `asyncio.gather` still cancels its siblings, so its error is the one place
+/// worth pointing at the wrapper. A bare await is fail-fast on purpose and
+/// must not nag.
+#[test_case::test_case("await interp_fail()", false ; "plain_await_stays_fail_fast")]
+#[test_case::test_case("await asyncio.gather(interp_echo(msg='hi'), interp_fail())", true ; "asyncio_gather_points_at_the_wrapper")]
+fn failed_call_error_names_the_tool_and_hints_only_for_asyncio_gather(code: &str, hint: bool) {
+    let err = run_code(code).expect_err("a failed call must raise");
+    assert!(
+        err.contains("interp_fail") && err.contains(FAIL_MSG),
+        "got: {err}"
+    );
+    assert_eq!(err.contains(GATHER_HINT_SUBSTR), hint, "got: {err}");
+}
+
+/// The model counts lines in the code it wrote, so the preamble it never sees
+/// must not shift them. Guards the plugin passing the preamble as its own
+/// option instead of pasting it onto the code.
+#[test]
+fn traceback_lines_are_numbered_from_the_users_first_line() {
+    let err = run_code("x = 1\nprint(boom_undefined)").expect_err("undefined name must error");
+    assert!(err.contains("line 2, in <module>"), "got: {err}");
 }
 
 #[test]
 fn workflow_tool_not_callable_when_workflow_false() {
-    let (reg, _host) = setup_native();
-    let ctx = stub_ctx_for(&reg, &AgentMode::Build);
-    let err = exec_code(&reg, &ctx, "await wf_task(prompt='x')")
+    let err = run_code("await wf_task(prompt='x')")
         .expect_err("workflow tool must not be in the fn-map when workflow=false");
     assert!(err.contains("wf_task"), "got: {err}");
 }
 
 /// Regression guard: the old `ctx:agent_context()` take() used to reset
-/// audience/workflow reads. That accessor is gone now, this makes sure
-/// workflow tools stay callable when `ctx.workflow = true`.
+/// audience/workflow reads, leaving workflow tools uncallable.
 #[test]
 fn workflow_tool_callable_when_workflow_true() {
-    let (reg, _host) = setup_native();
-    let mut ctx = stub_ctx_for(&reg, &AgentMode::Build);
-    ctx.workflow = true;
-    let out = exec_code(
-        &reg,
-        &ctx,
-        "result = await wf_task(prompt='x')\nprint(result)",
-    )
-    .expect("workflow tool must be callable when workflow=true");
+    let out = run_code_in("result = await wf_task(prompt='x')\nprint(result)", true)
+        .expect("workflow tool must be callable when workflow=true");
     assert!(out.contains(&format!("{TASK_PREFIX}x")), "got: {out}");
 }
 
