@@ -9,6 +9,7 @@ use tracing::{debug, warn};
 
 use crate::model::Model;
 use crate::provider::{BoxFuture, Provider};
+use crate::types::EffortDialect;
 use crate::{
     AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse, UsageLimit,
     dialect,
@@ -275,6 +276,23 @@ fn resolve_openai_base_url() -> Option<String> {
     maki_config::providers::configured_base_url("openai", config.get("openai"))
 }
 
+// Codex models drop `minimal` and never take an explicit "none", so they get
+// their own dialects; the plain plan models keep both.
+fn plan_dialect(model_id: &str) -> &'static EffortDialect<'static> {
+    if !model_id.contains("-codex") {
+        return if model_id.starts_with("gpt-5.6-") {
+            &dialect::GPT_5_6
+        } else {
+            &dialect::CODING_PLAN
+        };
+    }
+    if model_id.starts_with("gpt-5.1-codex") && !model_id.starts_with("gpt-5.1-codex-max") {
+        &dialect::CODEX_5_1
+    } else {
+        &dialect::CODEX
+    }
+}
+
 impl Provider for OpenAi {
     fn stream_message<'a>(
         &'a self,
@@ -291,7 +309,13 @@ impl Provider for OpenAi {
             let system = super::super::with_prefix(&self.system_prefix, system, &mut buf);
 
             if is_codex_model(&model.id) {
-                let body = super::responses::build_body(model, messages, system, tools);
+                let mut body = super::responses::build_body(model, messages, system, tools);
+                super::responses::apply_responses_reasoning(
+                    &mut body,
+                    opts.thinking,
+                    model,
+                    plan_dialect(&model.id),
+                );
                 let stream_timeout = self.compat.stream_timeout();
                 return self
                     .with_oauth_retry(|| async {
@@ -388,9 +412,13 @@ impl Provider for OpenAi {
 
 #[cfg(test)]
 mod tests {
+    use maki_storage::sessions::Effort;
+    use serde_json::json;
     use test_case::test_case;
 
+    use super::super::responses;
     use super::*;
+    use crate::ThinkingConfig;
 
     #[test_case("gpt-5.6-luna")]
     #[test_case("gpt-5.6-terra")]
@@ -409,6 +437,70 @@ mod tests {
     #[test_case("gpt-5.4-nano", None)]
     fn coding_plan_context_window_resolves_plan_models(model_id: &str, expected: Option<u32>) {
         assert_eq!(coding_plan_context_window(model_id), expected);
+    }
+
+    #[test_case(ThinkingConfig::Adaptive, "gpt-5.3-codex", "medium" ; "adaptive")]
+    #[test_case(ThinkingConfig::Effort(Effort::Minimal), "gpt-5.3-codex", "low" ; "minimal_snaps_to_low_on_codex")]
+    #[test_case(ThinkingConfig::Effort(Effort::Low), "gpt-5.3-codex", "low" ; "low")]
+    #[test_case(ThinkingConfig::Effort(Effort::Medium), "gpt-5.3-codex", "medium" ; "medium")]
+    #[test_case(ThinkingConfig::Effort(Effort::High), "gpt-5.3-codex", "high" ; "high")]
+    #[test_case(ThinkingConfig::Effort(Effort::XHigh), "gpt-5.3-codex", "xhigh" ; "xhigh")]
+    #[test_case(ThinkingConfig::Effort(Effort::Max), "gpt-5.3-codex", "xhigh" ; "max_snaps_to_xhigh_on_codex")]
+    #[test_case(ThinkingConfig::Effort(Effort::XHigh), "gpt-5.1-codex", "high" ; "xhigh_snaps_to_high_on_5_1")]
+    #[test_case(ThinkingConfig::Effort(Effort::XHigh), "gpt-5.1-codex-max", "xhigh" ; "xhigh_passes_through_on_5_1_max")]
+    #[test_case(ThinkingConfig::Effort(Effort::Minimal), "gpt-5.5", "minimal" ; "minimal_passes_through_on_5_5")]
+    #[test_case(ThinkingConfig::Off, "gpt-5.5", "none" ; "off_is_explicit_on_5_5")]
+    #[test_case(ThinkingConfig::Effort(Effort::Max), "gpt-5.5", "xhigh" ; "max_snaps_to_xhigh_on_5_5")]
+    #[test_case(ThinkingConfig::Effort(Effort::Minimal), "gpt-5.6-sol", "minimal" ; "minimal_passes_through_on_5_6_sol")]
+    #[test_case(ThinkingConfig::Off, "gpt-5.6-sol", "none" ; "off_is_explicit_on_5_6_sol")]
+    #[test_case(ThinkingConfig::Effort(Effort::Max), "gpt-5.6-sol", "max" ; "max_passes_through_on_5_6_sol")]
+    #[test_case(ThinkingConfig::Effort(Effort::Max), "gpt-5.6-terra", "max" ; "max_passes_through_on_5_6_terra")]
+    #[test_case(ThinkingConfig::Effort(Effort::Max), "gpt-5.6-luna", "max" ; "max_passes_through_on_5_6_luna")]
+    fn responses_reasoning_uses_responses_effort_object(
+        thinking: ThinkingConfig,
+        model_id: &str,
+        expected: &str,
+    ) {
+        let model = Model::from_spec(&format!("openai/{model_id}")).unwrap();
+        let mut body = json!({});
+        responses::apply_responses_reasoning(&mut body, thinking, &model, plan_dialect(&model.id));
+        assert_eq!(body["reasoning"]["effort"], expected);
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn plan_models_have_a_reviewed_dialect() {
+        const EXPECTED: &[(&str, &EffortDialect)] = &[
+            ("gpt-5.6-luna", &dialect::GPT_5_6),
+            ("gpt-5.6-terra", &dialect::GPT_5_6),
+            ("gpt-5.6-sol", &dialect::GPT_5_6),
+            ("gpt-5.5", &dialect::CODING_PLAN),
+            ("gpt-5.4", &dialect::CODING_PLAN),
+            ("gpt-5.4-mini", &dialect::CODING_PLAN),
+            ("gpt-5.2", &dialect::CODING_PLAN),
+        ];
+        const UNREVIEWED: &str = "new PLAN_MODELS entry needs an effort dialect decision";
+
+        for model_id in PLAN_MODELS {
+            let (_, expected) = EXPECTED
+                .iter()
+                .find(|(id, _)| id == model_id)
+                .unwrap_or_else(|| panic!("{UNREVIEWED}: {model_id}"));
+            assert_eq!(plan_dialect(model_id), *expected, "{model_id}");
+        }
+    }
+
+    #[test]
+    fn responses_reasoning_omits_effort_when_disabled() {
+        let model = Model::from_spec("openai/gpt-5.3-codex").unwrap();
+        let mut body = json!({});
+        responses::apply_responses_reasoning(
+            &mut body,
+            ThinkingConfig::Off,
+            &model,
+            plan_dialect(&model.id),
+        );
+        assert!(body.get("reasoning").is_none());
     }
 
     #[test]

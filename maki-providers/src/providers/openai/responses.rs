@@ -7,15 +7,18 @@ use isahc::{HttpClient, Request};
 use serde_json::{Value, json};
 use tracing::{debug, warn};
 
+use crate::model::Model;
 use crate::providers::ResolvedAuth;
+use crate::types::EffortDialect;
 use crate::{
-    AgentError, ContentBlock, Message, ProviderEvent, Role, StopReason, StreamResponse, TokenUsage,
+    AgentError, ContentBlock, Message, ProviderEvent, Role, StopReason, StreamResponse,
+    ThinkingConfig, TokenUsage,
 };
 
 const RESPONSES_PATH: &str = "/responses";
 
 pub(crate) fn build_body(
-    model: &crate::model::Model,
+    model: &Model,
     messages: &[Message],
     system: &str,
     tools: &Value,
@@ -34,6 +37,17 @@ pub(crate) fn build_body(
         body["tools"] = wire_tools;
     }
     body
+}
+
+pub(crate) fn apply_responses_reasoning(
+    body: &mut Value,
+    thinking: ThinkingConfig,
+    model: &Model,
+    dialect: &EffortDialect,
+) {
+    if let Some(effort) = thinking.effort_str(dialect, model) {
+        body["reasoning"] = json!({ "effort": effort });
+    }
 }
 
 pub(crate) fn convert_input(messages: &[Message]) -> Value {

@@ -502,6 +502,32 @@ pub mod dialect {
         adaptive: Some(Medium),
         off: None,
     };
+    /// OpenAI Responses API models whose highest effort is `xhigh`.
+    pub const CODEX: EffortDialect = EffortDialect {
+        supported: &[Low, Medium, High, XHigh],
+        adaptive: Some(Medium),
+        off: None,
+    };
+    /// OpenAI GPT-5.1 Codex Responses API models.
+    pub const CODEX_5_1: EffortDialect = EffortDialect {
+        supported: &[Low, Medium, High],
+        adaptive: Some(Medium),
+        off: None,
+    };
+    /// OpenAI Coding Plan models that aren't Codex. They keep `minimal`, and
+    /// the Responses API opts out of reasoning with an explicit "none".
+    pub const CODING_PLAN: EffortDialect = EffortDialect {
+        supported: &[Minimal, Low, Medium, High, XHigh],
+        adaptive: Some(Medium),
+        off: Some(OFF),
+    };
+    /// OpenAI GPT-5.6 Coding Plan models (Luna, Terra, Sol), which also take
+    /// `max`.
+    pub const GPT_5_6: EffortDialect = EffortDialect {
+        supported: &[Minimal, Low, Medium, High, XHigh, Max],
+        adaptive: Some(Medium),
+        off: Some(OFF),
+    };
     /// opencode chat-completions, openrouter (static fallback).
     pub const PREFER_HIGH: EffortDialect = EffortDialect {
         supported: &[Low, Medium, High],
@@ -978,6 +1004,10 @@ mod tests {
     fn dialects_have_non_empty_ascending_supported() {
         let all = [
             &dialect::STANDARD,
+            &dialect::CODEX,
+            &dialect::CODEX_5_1,
+            &dialect::CODING_PLAN,
+            &dialect::GPT_5_6,
             &dialect::PREFER_HIGH,
             &dialect::HIGH_ONLY,
             &dialect::GLM,
@@ -1024,6 +1054,13 @@ mod tests {
     #[test_case(&dialect::STANDARD, ThinkingConfig::Effort(Minimal), Some("minimal") ; "standard_minimal_passthrough")]
     #[test_case(&dialect::STANDARD, ThinkingConfig::Effort(Max),     Some("high")    ; "standard_max_snaps_down")]
     #[test_case(&dialect::STANDARD, ThinkingConfig::Budget(1024),    Some("medium")  ; "standard_quarter_budget")]
+    #[test_case(&dialect::CODEX, ThinkingConfig::Adaptive,        Some("medium") ; "codex_adaptive")]
+    #[test_case(&dialect::CODEX, ThinkingConfig::Effort(Minimal), Some("low")    ; "codex_minimal_snaps_up")]
+    #[test_case(&dialect::CODEX, ThinkingConfig::Effort(Max),     Some("xhigh")  ; "codex_max_snaps_down")]
+    #[test_case(&dialect::CODING_PLAN, ThinkingConfig::Effort(Minimal), Some("minimal") ; "coding_plan_minimal_passthrough")]
+    #[test_case(&dialect::CODING_PLAN, ThinkingConfig::Effort(Max),     Some("xhigh")   ; "coding_plan_max_snaps_down")]
+    #[test_case(&dialect::CODING_PLAN, ThinkingConfig::Off,             Some("none")    ; "coding_plan_off")]
+    #[test_case(&dialect::GPT_5_6, ThinkingConfig::Off,                 Some("none")    ; "gpt_5_6_off")]
     #[test_case(&dialect::PREFER_HIGH, ThinkingConfig::Adaptive,        Some("high") ; "prefer_high_adaptive")]
     #[test_case(&dialect::HIGH_ONLY, ThinkingConfig::Adaptive,        Some("high") ; "high_only_adaptive")]
     #[test_case(&dialect::HIGH_ONLY, ThinkingConfig::Effort(Minimal), Some("high") ; "high_only_minimal")]
