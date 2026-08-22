@@ -667,21 +667,6 @@ fn search_text_includes_role_prefix() {
     assert_eq!(texts[4], "thinking> hmm");
 }
 
-#[test_case(&["short", &"x".repeat(200)], 80, 4 ; "long_line_wraps")]
-#[test_case(&["", "a", ""],                 40, 3 ; "empty_lines_count_as_one")]
-#[test_case(&[&"a".repeat(80)],              80, 1 ; "exactly_width_no_wrap")]
-#[test_case(&[&"a".repeat(81)],              80, 2 ; "one_over_width_wraps")]
-#[test_case(&["hello", "world"],              0, 2 ; "zero_width_returns_line_count")]
-#[test_case(&["aaaa bbbb cccc dddd"],         10, 2 ; "word_boundary_wrap")]
-#[test_case(&["aaaaaa bbbbbbbbb"],            10, 2 ; "word_straddles_boundary")]
-fn wrapped_line_count_cases(input: &[&str], width: u16, expected: u16) {
-    let lines: Vec<Line<'static>> = input
-        .iter()
-        .map(|s| Line::from(Span::raw(s.to_string())))
-        .collect();
-    assert_eq!(wrapped_line_count(&lines, width), expected);
-}
-
 #[test]
 fn update_tool_model_sets_annotation() {
     let mut panel = panel_with_tools(&[("t1", "task"), ("t2", "bash")]);

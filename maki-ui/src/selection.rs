@@ -23,9 +23,9 @@
 //! so the copied text would lose that space unless we put it back. But we
 //! should only add a space for word-boundary wraps, not mid-word ones
 //! (where a long token just overflows the column). `LineBreaks` tracks
-//! both line starts and wrap types: `compute_wrap_types()` walks each
-//! line the same way ratatui does and classifies every break, then
-//! `append_rows` calls `needs_space()` to decide.
+//! both line starts and word wraps: `from_lines()` replays ratatui's wrap
+//! machine through [`crate::wrap`] and marks the rows that start after a
+//! swallowed space, then `append_rows` calls `needs_space()`.
 
 use std::cmp::Ordering;
 use std::time::Instant;
@@ -35,10 +35,11 @@ use ratatui::layout::Rect;
 use ratatui::style::Modifier;
 use ratatui::text::Line;
 
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthStr;
 
 use crate::repaint::Cadence;
 use crate::theme;
+use crate::wrap::{self, Break};
 use maki_markdown::render::{CODE_BAR, CODE_BAR_WRAP};
 
 /// Position in doc space (full logical document, not just visible window).
@@ -354,13 +355,12 @@ impl LineBreaks {
                 continue;
             }
             set_bit(&mut line_starts, row);
-            let wrap_types = compute_wrap_types(line, width);
-            for is_word_wrap in &wrap_types {
+            wrap::breaks(line, width, |kind| {
                 row += 1;
-                if *is_word_wrap {
+                if kind == Break::Word {
                     set_bit(&mut word_wraps, row);
                 }
-            }
+            });
             row += 1;
         }
         Self::Bitmap {
@@ -382,44 +382,6 @@ impl LineBreaks {
             Self::Bitmap { word_wraps, .. } => get_bit(word_wraps, row),
         }
     }
-}
-
-fn compute_wrap_types(line: &Line<'_>, width: u16) -> Vec<bool> {
-    let w = width as usize;
-    let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-    let chars: Vec<char> = text.chars().collect();
-    let mut wraps = Vec::new();
-    let mut i = 0;
-    let mut col = 0;
-    let mut last_breakable: Option<usize> = None;
-
-    while i < chars.len() {
-        let ch = chars[i];
-        let cw = ch.width().unwrap_or(0);
-
-        if ch == ' ' || ch == '\t' {
-            last_breakable = Some(i);
-        }
-
-        if col + cw > w && col > 0 {
-            if let Some(bp) = last_breakable {
-                wraps.push(true);
-                i = bp + 1;
-                while i < chars.len() && chars[i] == ' ' {
-                    i += 1;
-                }
-            } else {
-                wraps.push(false);
-            }
-            col = 0;
-            last_breakable = None;
-            continue;
-        }
-
-        col += cw;
-        i += 1;
-    }
-    wraps
 }
 
 fn is_code_wrap_continuation(line: &Line<'_>) -> bool {
@@ -1147,22 +1109,6 @@ mod tests {
         assert_eq!(wrap_extract(input, width), expected);
     }
 
-    fn cwt(input: &str, width: u16) -> Vec<bool> {
-        compute_wrap_types(&Line::from(input), width)
-    }
-
-    #[test_case("abcdef",        5, &[false]              ; "char_overflow")]
-    #[test_case("ab cd",         3, &[true]               ; "word_boundary")]
-    #[test_case("ab   cd",       4, &[true]               ; "multiple_consecutive_spaces")]
-    #[test_case("abcdefghij",    3, &[false, false, false] ; "long_word_multiple_wraps")]
-    #[test_case("hi worldaaaaaa",5, &[true, false, false]  ; "mixed_word_then_char")]
-    #[test_case("ab\tcd",        3, &[true]               ; "tab_as_breakpoint")]
-    #[test_case("漢字漢字",       3, &[false, false, false] ; "cjk_double_width_char_wrap")]
-    #[test_case("漢 字字",        3, &[true, false]          ; "cjk_with_space_word_wrap")]
-    fn cwt_cases(input: &str, width: u16, expected: &[bool]) {
-        assert_eq!(cwt(input, width), expected);
-    }
-
     #[test]
     fn from_lines_no_wrap_marks_each_line_as_start() {
         let lines = vec![Line::from("abc"), Line::from("def"), Line::from("ghi")];
@@ -1231,18 +1177,6 @@ mod tests {
         let mut out = String::new();
         append_rows(&buf, area, &sel, from, to, &mut out, &LineBreaks::EveryRow);
         assert!(out.is_empty());
-    }
-
-    #[test]
-    fn cwt_multi_span_line() {
-        use ratatui::text::Span;
-        let line = Line::from(vec![Span::raw("hello "), Span::raw("world")]);
-        let wraps = compute_wrap_types(&line, 6);
-        assert_eq!(
-            wraps,
-            vec![true],
-            "word wrap should work across span boundaries"
-        );
     }
 
     #[test]

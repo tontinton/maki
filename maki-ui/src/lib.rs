@@ -25,6 +25,7 @@ mod text_buffer;
 mod theme;
 pub use theme::BUNDLED_THEMES;
 pub mod update;
+pub mod wrap;
 
 mod agent;
 mod event_loop;
