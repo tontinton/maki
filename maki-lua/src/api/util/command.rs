@@ -5,11 +5,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use arc_swap::ArcSwap;
 use maki_agent::SharedBuf;
-use mlua::RegistryKey;
+use mlua::{Lua, RegistryKey, Result as LuaResult, Value};
 use strum::{EnumString, VariantNames};
 
+use crate::api::util::convert::json_to_lua;
+use crate::api::util::pair::{Pair, try_pair};
+
 pub(crate) const NO_UI_ERR: &str = "no interactive UI attached";
-const UI_DROPPED_ERR: &str = "ui event loop dropped the request";
+pub(crate) const UI_DROPPED_ERR: &str = "ui event loop dropped the request";
 
 #[derive(Clone)]
 pub struct LuaCommandInfo {
@@ -412,7 +415,17 @@ pub enum SessionRequest {
     SetTitle { id: String, title: String },
 }
 
-pub type SessionReply = Result<serde_json::Value, String>;
+pub enum ModelRequest {
+    Get,
+    Available,
+    Set {
+        spec: Option<String>,
+        thinking: Option<String>,
+        fast: Option<bool>,
+    },
+}
+
+pub type UiReply = Result<serde_json::Value, String>;
 
 /// Viewport of the focused chat transcript, zero-based like the rest of the
 /// UI; `maki.fn.winsaveview` is what puts it in Vim's 1-based shape.
@@ -457,7 +470,11 @@ pub enum UiAction {
     },
     Session {
         req: SessionRequest,
-        reply_tx: flume::Sender<SessionReply>,
+        reply_tx: flume::Sender<UiReply>,
+    },
+    Model {
+        req: ModelRequest,
+        reply_tx: flume::Sender<UiReply>,
     },
     WinSaveView {
         reply_tx: flume::Sender<WinView>,
@@ -495,6 +512,19 @@ pub(crate) async fn ui_roundtrip<T>(
     let (reply_tx, reply_rx) = flume::bounded(1);
     ui_send(tx, action(reply_tx))?;
     reply_rx.recv_async().await.map_err(|_| UI_DROPPED_ERR)
+}
+
+/// `ui_roundtrip` for JSON replies, shaped into the `(value, err)` pair Lua
+/// expects. Never reaching the UI and the UI refusing both land in the error
+/// slot.
+pub(crate) async fn ui_json_roundtrip(
+    lua: &Lua,
+    tx: Option<&flume::Sender<UiAction>>,
+    action: impl FnOnce(flume::Sender<UiReply>) -> UiAction,
+) -> LuaResult<Pair<Value>> {
+    let reply = try_pair!(ui_roundtrip(tx, action).await);
+    let value = try_pair!(reply);
+    Ok((Some(json_to_lua(lua, &value)?), None))
 }
 
 #[cfg(test)]

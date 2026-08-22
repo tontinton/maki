@@ -19,7 +19,7 @@ use maki_agent::{
 use maki_config::{PermissionsConfig, UiConfig};
 use maki_lua::test_support::{HintWriterHandle, hint_writer_pair};
 use maki_lua::{BuiltinAction, HintReader, KeymapReader, LuaCommandInfo, LuaCommandReader};
-use maki_providers::{ContentBlock, Effort, Message, Role, TokenUsage};
+use maki_providers::{ContentBlock, Effort, Message, Role, THINKING_USAGE, TokenUsage};
 use maki_storage::sessions::{StoredMode, StoredThinking};
 use ratatui::layout::Rect;
 use std::env;
@@ -39,6 +39,9 @@ const HINT_STYLE: &str = "fg";
 const RETRY_MESSAGE: &str = "overloaded";
 const RETRY_DELAY: Duration = Duration::from_secs(5);
 const MISSING_DIR: &str = "gone";
+const SONNET_SPEC: &str = "anthropic/claude-sonnet-4-5";
+const OPUS_SPEC: &str = "anthropic/claude-opus-4-8";
+const PLAIN_MODEL_SPEC: &str = "ollama/qwen3";
 const WALK_TIMEOUT: Duration = Duration::from_secs(5);
 /// Stands in for a size the provider measured, baseline included.
 const MEASURED_CONTEXT: u32 = 100_000;
@@ -3786,7 +3789,7 @@ fn thinking_unsupported_model_flashes_error() {
 
     app.execute_command(cmd("/thinking"), 0);
     assert_eq!(app.state.thinking, ThinkingConfig::Off);
-    assert!(app.status_bar.flash_text().is_some());
+    assert_eq!(app.status_bar.flash_text(), Some(THINKING_UNSUPPORTED_MSG));
 }
 
 #[test]
@@ -3806,7 +3809,7 @@ fn thinking_restored_from_session_meta() {
 }
 
 fn set_opus_model(app: &mut App) {
-    app.state.model = maki_providers::Model::from_spec("anthropic/claude-opus-4-8").unwrap();
+    app.state.model = maki_providers::Model::from_spec(OPUS_SPEC).unwrap();
 }
 
 #[test]
@@ -3868,7 +3871,7 @@ fn subagent_history_finishes_workflow_chat() {
     assert_eq!(app.chats[1].last_message_text(), DONE_TEXT);
 }
 
-#[test_case("anthropic/claude-sonnet-4-5" ; "non_opus_anthropic")]
+#[test_case(SONNET_SPEC ; "non_opus_anthropic")]
 #[test_case("openai/gpt-5.5" ; "non_anthropic")]
 fn fast_flashes_error_on_ineligible_model(spec: &str) {
     let mut app = test_app();
@@ -3901,7 +3904,7 @@ fn fast_normalized_off_when_restored_onto_ineligible_model() {
     let storage = StateDir::from_path(tmp.path().to_path_buf());
     // Saved as fast=true, but sonnet cannot do fast mode, so restoring must drop
     // it to false or the UI would show a phantom [fast] badge.
-    let mut session = AppSession::new("anthropic/claude-sonnet-4-5", "/tmp/test");
+    let mut session = AppSession::new(SONNET_SPEC, "/tmp/test");
     session.meta.fast = true;
 
     let state = SessionState::from_session(
@@ -3914,12 +3917,98 @@ fn fast_normalized_off_when_restored_onto_ineligible_model() {
 }
 
 #[test]
+fn model_state_reports_the_model_and_what_it_supports() {
+    let mut app = test_app();
+    app.state.model = maki_providers::Model::from_spec(PLAIN_MODEL_SPEC).unwrap();
+    assert_eq!(
+        app.model_state(),
+        serde_json::json!({
+            "spec": PLAIN_MODEL_SPEC,
+            "id": "qwen3",
+            "provider": "ollama",
+            "thinking": "off",
+            "fast": false,
+            "supports_thinking": false,
+            "supports_fast": false,
+        })
+    );
+
+    set_opus_model(&mut app);
+    app.set_thinking("high").unwrap();
+    app.set_fast(true).unwrap();
+    assert_eq!(
+        app.model_state(),
+        serde_json::json!({
+            "spec": OPUS_SPEC,
+            "id": "claude-opus-4-8",
+            "provider": "anthropic",
+            "thinking": "high",
+            "fast": true,
+            "supports_thinking": true,
+            "supports_fast": true,
+        })
+    );
+}
+
+/// What `model_state` reports has to parse back into the same state, or a
+/// `maki.model.get` -> `maki.model.set` hop would silently change it.
+#[test_case(ThinkingConfig::Off, "off" ; "off")]
+#[test_case(ThinkingConfig::Adaptive, "adaptive" ; "adaptive")]
+#[test_case(ThinkingConfig::Effort(Effort::High), "high" ; "effort")]
+#[test_case(ThinkingConfig::Budget(8192), "8192" ; "budget")]
+fn model_state_thinking_round_trips_into_set_thinking(thinking: ThinkingConfig, expected: &str) {
+    let mut app = test_app();
+    app.state.thinking = thinking;
+
+    let reported = app.model_state()["thinking"].as_str().unwrap().to_owned();
+    assert_eq!(reported, expected);
+    assert_eq!(app.set_thinking(&reported).unwrap(), thinking);
+    assert_eq!(app.set_thinking(&reported).unwrap(), thinking);
+}
+
+#[test]
+fn set_thinking_toggles_on_blank_input() {
+    let mut app = test_app();
+    assert_eq!(app.set_thinking("").unwrap(), ThinkingConfig::Adaptive);
+    assert_eq!(app.set_thinking("").unwrap(), ThinkingConfig::Off);
+}
+
+#[test_case(true, "garbage", THINKING_USAGE ; "unknown_word")]
+#[test_case(true, "0", THINKING_USAGE ; "zero_budget")]
+#[test_case(false, "low", THINKING_UNSUPPORTED_MSG ; "model_without_thinking")]
+fn set_thinking_keeps_state_on_rejected_input(supported: bool, input: &str, expected: &str) {
+    let mut app = test_app();
+    app.set_thinking("high").unwrap();
+    if !supported {
+        app.state.model.thinking_override = Some(maki_providers::ThinkingSupport::No);
+    }
+
+    assert_eq!(app.set_thinking(input).unwrap_err(), expected);
+    assert_eq!(app.state.thinking, ThinkingConfig::Effort(Effort::High));
+}
+
+/// Fast must never get stuck on: after switching to a model without fast mode,
+/// you still have to be able to turn it off.
+#[test]
+fn fast_turns_off_on_a_model_that_lost_fast_support() {
+    let mut app = test_app();
+    set_opus_model(&mut app);
+    app.execute_command(cmd("/fast"), 0);
+    assert!(app.state.fast);
+
+    app.state.model = maki_providers::Model::from_spec(SONNET_SPEC).unwrap();
+    app.execute_command(cmd("/fast"), 0);
+    assert!(!app.state.fast);
+    assert_eq!(app.status_bar.flash_text(), Some(FAST_OFF_MSG));
+}
+
+#[test]
 fn update_model_to_ineligible_resets_fast() {
     let mut app = test_app();
     set_opus_model(&mut app);
     app.state.fast = true;
 
-    let sonnet = maki_providers::Model::from_spec("anthropic/claude-sonnet-4-5").unwrap();
+    let sonnet = maki_providers::Model::from_spec(SONNET_SPEC).unwrap();
     app.state.update_model(&sonnet);
     assert!(!app.state.fast);
 }

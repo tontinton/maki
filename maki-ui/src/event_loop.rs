@@ -24,7 +24,8 @@ use maki_agent::{
 };
 use maki_config::{ModelPolicy, UiConfig};
 use maki_lua::{
-    EventHandle, HintReader, KeymapReader, LuaCommandReader, SessionReply, SessionRequest, UiAction,
+    EventHandle, HintReader, KeymapReader, LuaCommandReader, ModelRequest, SessionRequest,
+    UiAction, UiReply,
 };
 use maki_providers::Timeouts;
 use maki_providers::provider::{Provider, fetch_all_models, from_model};
@@ -54,6 +55,9 @@ use crate::terminal;
 const DRAIN_BUDGET: usize = 256;
 const AGENT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 const DELETE_FOCUSED_ERR: &str = "cannot delete the focused session";
+const MODEL_POLICY_ERR: &str = "Model is not allowed by policy";
+const INVALID_MODEL_ERR: &str = "Invalid model";
+const PROVIDER_INIT_ERR: &str = "Failed to create provider";
 const NOT_LIVE_ERR: &str = "session not live";
 
 /// Tabs carry their in-memory sessions so `/reload` reopens them without a
@@ -813,6 +817,9 @@ impl<'t> EventLoop<'t> {
             UiAction::Session { req, reply_tx } => {
                 self.handle_session_request(req, reply_tx);
             }
+            UiAction::Model { req, reply_tx } => {
+                let _ = reply_tx.send(self.handle_model_request(req));
+            }
             UiAction::WinSaveView { reply_tx } => {
                 let _ = reply_tx.send(self.focused_app().win_view());
             }
@@ -942,11 +949,7 @@ impl<'t> EventLoop<'t> {
     /// `List` replies from a background task (the scan can be slow); every
     /// other request is answered synchronously by the event loop, which owns
     /// the live runtimes.
-    fn handle_session_request(
-        &mut self,
-        req: SessionRequest,
-        reply_tx: flume::Sender<SessionReply>,
-    ) {
+    fn handle_session_request(&mut self, req: SessionRequest, reply_tx: flume::Sender<UiReply>) {
         match req {
             SessionRequest::List => {
                 let storage = self.ctx.storage.clone();
@@ -1059,7 +1062,38 @@ impl<'t> EventLoop<'t> {
         }
     }
 
-    fn submit_text(&mut self, idx: usize, text: String) -> SessionReply {
+    /// Lua acts on the focused session, the same target the model picker and
+    /// `/thinking` write to.
+    fn handle_model_request(&mut self, req: ModelRequest) -> UiReply {
+        match req {
+            ModelRequest::Get => Ok(self.focused_app().model_state()),
+            ModelRequest::Available => {
+                let available = self.ctx.available_models.load();
+                Ok(json!(
+                    available.as_deref().map(Vec::as_slice).unwrap_or(&[])
+                ))
+            }
+            ModelRequest::Set {
+                spec,
+                thinking,
+                fast,
+            } => {
+                if let Some(spec) = spec {
+                    self.change_model(&spec)?;
+                }
+                let app = self.focused_app();
+                if let Some(thinking) = thinking {
+                    app.set_thinking(&thinking)?;
+                }
+                if let Some(fast) = fast {
+                    app.set_fast(fast)?;
+                }
+                Ok(app.model_state())
+            }
+        }
+    }
+
+    fn submit_text(&mut self, idx: usize, text: String) -> UiReply {
         let msg = QueuedMessage {
             text,
             images: Vec::new(),
@@ -1284,7 +1318,11 @@ impl<'t> EventLoop<'t> {
                 }
                 self.respawn_agent(idx, loaded.messages);
             }
-            Action::ChangeModel(spec) => self.change_model(spec),
+            Action::ChangeModel(spec) => {
+                if let Err(e) = self.change_model(&spec) {
+                    self.focused_app().flash(e);
+                }
+            }
             Action::RefreshProvider { slug } => self.refresh_provider(slug),
             Action::AssignTier(spec, tier) => {
                 maki_providers::model_registry::set_and_persist(spec, tier, &self.ctx.storage);
@@ -1355,30 +1393,23 @@ impl<'t> EventLoop<'t> {
         }
     }
 
-    fn change_model(&mut self, spec: String) {
-        if !self.ctx.model_policy.allows(&spec) {
-            self.focused_app()
-                .flash(format!("Model is not allowed by policy: {spec}"));
-            return;
+    fn change_model(&mut self, spec: &str) -> Result<(), String> {
+        if !self.ctx.model_policy.allows(spec) {
+            return Err(format!("{MODEL_POLICY_ERR}: {spec}"));
         }
-        match Model::from_spec(&spec) {
-            Ok(mut new_model) => match from_model(&mut new_model, self.ctx.timeouts) {
-                Ok(new_provider) => {
-                    let app = self.focused_app();
-                    app.update_model(&new_model);
-                    app.record_recent_model(&spec);
-                    app.usage_slot.store(None);
-                    self.ctx.model_slot.store(Arc::new(ModelSlot {
-                        model: new_model,
-                        provider: Arc::from(new_provider),
-                    }));
-                }
-                Err(e) => self
-                    .focused_app()
-                    .flash(format!("Failed to create provider: {e}")),
-            },
-            Err(e) => self.focused_app().flash(format!("Invalid model: {e}")),
-        }
+        let mut new_model =
+            Model::from_spec(spec).map_err(|e| format!("{INVALID_MODEL_ERR}: {e}"))?;
+        let new_provider = from_model(&mut new_model, self.ctx.timeouts)
+            .map_err(|e| format!("{PROVIDER_INIT_ERR}: {e}"))?;
+        let app = self.focused_app();
+        app.update_model(&new_model);
+        app.record_recent_model(spec);
+        app.usage_slot.store(None);
+        self.ctx.model_slot.store(Arc::new(ModelSlot {
+            model: new_model,
+            provider: Arc::from(new_provider),
+        }));
+        Ok(())
     }
 
     fn refresh_models(&self) {
@@ -1424,8 +1455,10 @@ impl<'t> EventLoop<'t> {
                     provider: Arc::from(provider),
                 }));
             }
-        } else if let Some(builtin) = maki_config::providers::builtin_provider(&slug) {
-            self.change_model(builtin.default_model.to_string());
+        } else if let Some(builtin) = maki_config::providers::builtin_provider(&slug)
+            && let Err(e) = self.change_model(builtin.default_model)
+        {
+            self.focused_app().flash(e);
         }
     }
 

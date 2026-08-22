@@ -89,6 +89,7 @@ const AUTH_EXPIRED_MSG: &str =
     "Token expired. Run `maki auth login` in another terminal, then press Enter to retry.";
 const FLASH_NO_PLAN: &str = "No plan file";
 const FAST_UNSUPPORTED_MSG: &str = "Fast mode requires an Anthropic Opus 4.6+ model (API only)";
+const THINKING_UNSUPPORTED_MSG: &str = "Thinking requires a model that supports it";
 const FAST_ON_MSG: &str = "Fast mode: on";
 const FAST_OFF_MSG: &str = "Fast mode: off";
 const WORKFLOW_ON_MSG: &str = "Workflow mode: on";
@@ -383,6 +384,39 @@ impl App {
     pub(crate) fn update_model(&mut self, model: &Model) {
         self.state.update_model(model);
         persist_model(&self.storage, &self.state.session.model);
+    }
+
+    /// Takes the spelling both `/thinking` and `maki.model.set` accept; a
+    /// blank {input} toggles.
+    pub(crate) fn set_thinking(&mut self, input: &str) -> Result<ThinkingConfig, String> {
+        if !self.state.model.supports_thinking() {
+            return Err(THINKING_UNSUPPORTED_MSG.into());
+        }
+        self.state.thinking =
+            ThinkingConfig::parse(input.trim(), self.state.thinking).map_err(str::to_owned)?;
+        Ok(self.state.thinking)
+    }
+
+    pub(crate) fn set_fast(&mut self, fast: bool) -> Result<(), String> {
+        if fast && !self.state.model.supports_fast() {
+            return Err(FAST_UNSUPPORTED_MSG.into());
+        }
+        self.state.fast = fast;
+        Ok(())
+    }
+
+    /// What `maki.model.get` hands to Lua.
+    pub(crate) fn model_state(&self) -> serde_json::Value {
+        let model = &self.state.model;
+        serde_json::json!({
+            "spec": model.spec(),
+            "id": model.id,
+            "provider": model.provider.to_string(),
+            "thinking": self.state.thinking.to_string(),
+            "fast": self.state.fast,
+            "supports_thinking": model.supports_thinking(),
+            "supports_fast": model.supports_fast(),
+        })
     }
 
     pub(crate) fn record_recent_model(&mut self, spec: &str) {
@@ -1421,33 +1455,18 @@ impl App {
                 vec![]
             }
             "/thinking" => {
-                if !self.state.model.supports_thinking() {
-                    self.flash("Thinking requires a model that supports it".into());
-                    return vec![];
-                }
-                match ThinkingConfig::parse(cmd.args.trim(), self.state.thinking) {
-                    Ok(thinking) => {
-                        self.state.thinking = thinking;
-                        self.flash(format!("Thinking: {thinking}"));
-                    }
-                    Err(msg) => self.flash(msg.into()),
+                match self.set_thinking(&cmd.args) {
+                    Ok(thinking) => self.flash(format!("Thinking: {thinking}")),
+                    Err(msg) => self.flash(msg),
                 }
                 vec![]
             }
             "/fast" => {
-                if !self.state.model.supports_fast() {
-                    self.flash(FAST_UNSUPPORTED_MSG.into());
-                    return vec![];
+                let fast = !self.state.fast;
+                match self.set_fast(fast) {
+                    Ok(()) => self.flash(if fast { FAST_ON_MSG } else { FAST_OFF_MSG }.into()),
+                    Err(msg) => self.flash(msg),
                 }
-                self.state.fast = !self.state.fast;
-                self.flash(
-                    if self.state.fast {
-                        FAST_ON_MSG
-                    } else {
-                        FAST_OFF_MSG
-                    }
-                    .into(),
-                );
                 vec![]
             }
             "/workflow" => {

@@ -99,6 +99,7 @@ The rules:
 | [`maki.json.SchemaValidator`](#maki-json-SchemaValidator) | A compiled JSON Schema validator. |
 | [`maki.keymap`](#maki-keymap) | Key mappings, modeled after `vim.keymap`. |
 | [`maki.log`](#maki-log) | Structured logging for plugins. |
+| [`maki.model`](#maki-model) | The model behind the focused session. |
 | [`maki.net`](#maki-net) | HTTP client for fetching web content. |
 | [`maki.session`](#maki-session) | Host session primitives. |
 | [`maki.text`](#maki-text) | Text transformation utilities. |
@@ -2614,6 +2615,88 @@ Emit an ERROR-level log message. Use for failures that need attention.
 
 ```lua
 maki.log.error("failed to connect to API")
+```
+
+
+## maki.model {#maki-model}
+
+The model behind the focused session. Good for a keybind that flips
+between your two go-to models, or lifts thinking for one hard question.
+Without an interactive UI every function returns
+`nil, "no interactive UI attached"`.
+
+---
+
+### `maki.model.get()` {#maki-model-get}
+
+```lua
+maki.model.get()
+```
+
+Reads the focused session's model, thinking level, and fast mode.
+`thinking` comes back in the spelling `set` accepts, so a table from here
+can go straight back in.
+
+**Returns:** (`table|nil`, `string|nil`) `{spec, id, provider, thinking, fast,
+  supports_thinking, supports_fast}`, or nil and an error.
+
+**Example:**
+
+```lua
+local m = maki.model.get()
+if m.spec ~= "anthropic/claude-opus-4-6" then ... end
+```
+
+---
+
+### `maki.model.available()` {#maki-model-available}
+
+```lua
+maki.model.available()
+```
+
+Lists the model specs you can switch to: what the providers you are logged
+into offer, minus what your model policy blocks. The list fills in the
+background at startup, so right after launch it can still be empty.
+
+**Returns:** (`table|nil`, `string|nil`) Array of `"provider/id"` specs, or nil and an error.
+
+**Example:**
+
+```lua
+local specs = maki.model.available()
+```
+
+---
+
+### `maki.model.set()` {#maki-model-set}
+
+```lua
+maki.model.set({opts})
+```
+
+Switches the focused session's model, thinking level, or fast mode. Fields
+you leave out stay as they are, so this doubles as a thinking-only switch.
+Answers with the new state, in the same shape `get` returns.
+
+**Parameters:**
+
+- `{opts}` (`string|table`) A model spec, or a table with any of:
+  - `spec` (`string`) `"provider/id"`, as listed by `available()`;
+  - `thinking` (`string|number`) `"off"`, `"adaptive"`, an effort level
+
+  (`"minimal"` to `"max"`), a token budget, or `""` to toggle it on and off;
+
+  - `fast` (`boolean`) Anthropic fast mode.
+
+**Returns:** (`table|nil`, `string|nil`) The new state, or nil and an error.
+
+**Example:**
+
+```lua
+maki.model.set("anthropic/claude-opus-4-6")
+maki.model.set({ spec = "zai/glm-5", thinking = "high" })
+maki.keymap.set("n", "<M-t>", function() maki.model.set({ thinking = "" }) end)
 ```
 
 

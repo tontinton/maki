@@ -391,7 +391,7 @@ impl StopReason {
     }
 }
 
-const THINKING_USAGE: &str =
+pub const THINKING_USAGE: &str =
     "Usage: /thinking [off|adaptive|minimal|low|medium|high|xhigh|max|<budget>]";
 
 /// Effort levels are percentages, so they need a ceiling even when the model
