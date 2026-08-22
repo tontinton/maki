@@ -6,16 +6,17 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use agent_client_protocol_schema::{
-    AgentNotification, AgentRequest, AgentResponse, ContentBlock, CurrentModeUpdate,
-    EmbeddedResourceResource, Error as AcpError, ImageContent, InitializeRequest, JsonRpcMessage,
-    LoadSessionRequest, McpServer, NewSessionRequest, Notification, PromptRequest, PromptResponse,
-    Request, RequestId, RequestPermissionRequest, RequestPermissionResponse, Response, SessionId,
-    SessionModeId, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
-    SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
-    TextContent, ToolCallId, ToolCallUpdate, ToolCallUpdateFields,
+    AgentNotification, AgentRequest, AgentResponse, ConfigOptionUpdate, ContentBlock,
+    CurrentModeUpdate, EmbeddedResourceResource, Error as AcpError, ImageContent,
+    InitializeRequest, JsonRpcMessage, LoadSessionRequest, McpServer, NewSessionRequest,
+    Notification, PromptRequest, PromptResponse, Request, RequestId, RequestPermissionRequest,
+    RequestPermissionResponse, Response, SessionId, SessionModeId, SessionNotification,
+    SessionUpdate, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse,
+    SetSessionModeRequest, SetSessionModeResponse, StopReason, TextContent, ToolCallId,
+    ToolCallUpdate, ToolCallUpdateFields,
 };
 use color_eyre::eyre::Context;
-use flume::{Receiver, Sender};
+use flume::{Receiver, Sender, WeakSender};
 use maki_agent::headless::{self, InteractiveHandle, InteractiveParams};
 use maki_agent::mcp::config::{RawHttpFields, RawStdioFields, RawTransport};
 use maki_agent::mcp::{self, McpHandle};
@@ -23,9 +24,9 @@ use maki_agent::permissions::PermissionAnswer;
 use maki_agent::tools::{LocalToolFn, LocalTools, QUESTION_TOOL_NAME, local_tool};
 use maki_agent::types::AgentEvent;
 use maki_agent::{AgentInput, AgentMode, Envelope, ImageMediaType, ImageSource};
-use maki_config::MAX_SERVER_NAME_LEN;
+use maki_config::{MAX_SERVER_NAME_LEN, ModelPolicy};
 use maki_providers::model::Model;
-use maki_providers::provider::available_model_specs;
+use maki_providers::provider::{available_model_specs, fetch_all_models};
 use maki_providers::{Message, TokenUsage, add_cost};
 use maki_storage::id::{MakiId, SessionRef};
 use serde::Serialize;
@@ -68,7 +69,7 @@ struct SessionState {
 struct Server {
     out_tx: Sender<Value>,
     model_specs: Vec<String>,
-    model_policy: Arc<maki_config::ModelPolicy>,
+    model_policy: Arc<ModelPolicy>,
     client_elicits_form: bool,
     session: Option<SessionState>,
 }
@@ -77,6 +78,11 @@ impl Server {
     fn respond(&self, id: RequestId, result: Result<AgentResponse, AcpError>) {
         send(&self.out_tx, Response::new(id, result));
     }
+}
+
+enum Incoming {
+    Line(String),
+    Models(Vec<String>),
 }
 
 pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
@@ -101,48 +107,111 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
         session: None,
     };
 
-    let stdin = smol::Unblock::new(std::io::stdin());
-    let mut reader = smol::io::BufReader::new(stdin);
-    let mut line = String::new();
+    let (in_tx, in_rx) = flume::unbounded::<Incoming>();
+    // Weak, so a discovery still in flight cannot keep the loop alive once stdin closes.
+    discover_models(
+        server.model_specs.clone(),
+        Arc::clone(&params.model_policy),
+        in_tx.downgrade(),
+    );
+    let reader_task = smol::spawn(read_stdin(in_tx));
 
-    loop {
-        line.clear();
-        if reader.read_line(&mut line).await.context("read stdin")? == 0 {
-            break;
-        }
-
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        let raw: Value = match serde_json::from_str(trimmed) {
-            Ok(v) => v,
-            Err(e) => {
-                warn!(error = %e, "invalid JSON on stdin");
-                server.respond(RequestId::Null, Err(AcpError::parse_error()));
-                continue;
-            }
-        };
-
-        let id = raw.get("id").map(request_id);
-
-        if raw.get("result").is_some() || raw.get("error").is_some() {
-            handle_incoming_response(&server, &raw);
-        } else if let Some(method) = raw.get("method").and_then(Value::as_str) {
-            match id {
-                Some(id) => handle_request(&mut server, method, id, &raw, &params).await,
-                None => handle_notification(&server, method),
-            }
-        } else if let Some(id) = id {
-            server.respond(id, Err(AcpError::invalid_request()));
+    while let Ok(incoming) = in_rx.recv_async().await {
+        match incoming {
+            Incoming::Line(line) => handle_line(&mut server, &line, &params).await,
+            Incoming::Models(specs) => refresh_models(&mut server, specs),
         }
     }
 
     drop(server);
     writer_task.await;
+    reader_task.await.context("read stdin")?;
 
     Ok(())
+}
+
+/// Lives in its own task because `read_line` is not cancel safe: the main loop
+/// waits on discovery too, and a dropped read would eat half a line.
+async fn read_stdin(tx: Sender<Incoming>) -> std::io::Result<()> {
+    let mut reader = smol::io::BufReader::new(smol::Unblock::new(std::io::stdin()));
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line).await? == 0 {
+            return Ok(());
+        }
+        if tx.send_async(Incoming::Line(line)).await.is_err() {
+            return Ok(());
+        }
+    }
+}
+
+/// Static manifests miss providers that only list their models over the wire
+/// (OpenRouter and friends), so the same discovery the TUI runs happens here,
+/// in the background.
+fn discover_models(mut specs: Vec<String>, policy: Arc<ModelPolicy>, tx: WeakSender<Incoming>) {
+    smol::spawn(async move {
+        fetch_all_models(
+            &policy,
+            |batch| {
+                for spec in batch.models {
+                    if !specs.contains(&spec) {
+                        specs.push(spec);
+                    }
+                }
+            },
+            None,
+        )
+        .await;
+        if let Some(tx) = tx.upgrade() {
+            let _ = tx.send_async(Incoming::Models(specs)).await;
+        }
+    })
+    .detach();
+}
+
+/// Discovery lands after the client already built its selector from the offline
+/// list, so the fuller list gets pushed to the live session.
+fn refresh_models(srv: &mut Server, specs: Vec<String>) {
+    if specs == srv.model_specs {
+        return;
+    }
+    srv.model_specs = specs;
+    let Some(session) = &srv.session else { return };
+    let option = methods::model_config_option(&session.current_model, &srv.model_specs);
+    session_update(
+        &srv.out_tx,
+        &SessionId::from(session.handle.session_id.to_string()),
+        SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(vec![option])),
+    );
+}
+
+async fn handle_line(server: &mut Server, line: &str, params: &AcpParams) {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+
+    let raw: Value = match serde_json::from_str(trimmed) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(error = %e, "invalid JSON on stdin");
+            server.respond(RequestId::Null, Err(AcpError::parse_error()));
+            return;
+        }
+    };
+
+    let id = raw.get("id").map(request_id);
+
+    if raw.get("result").is_some() || raw.get("error").is_some() {
+        handle_incoming_response(server, &raw);
+    } else if let Some(method) = raw.get("method").and_then(Value::as_str) {
+        match id {
+            Some(id) => handle_request(server, method, id, &raw, params).await,
+            None => handle_notification(server, method),
+        }
+    } else if let Some(id) = id {
+        server.respond(id, Err(AcpError::invalid_request()));
+    }
 }
 
 fn request_id(v: &Value) -> RequestId {
@@ -767,6 +836,7 @@ mod tests {
 
     const ANSWERED_ID: i64 = 1001;
     const UNKNOWN_ID: i64 = 1002;
+    const DISCOVERED_SPEC: &str = "openrouter/discovered-model";
 
     fn allow_once(id: i64) -> Value {
         serde_json::json!({
@@ -783,12 +853,9 @@ mod tests {
         assert_eq!(permission_answer(&raw), expected);
     }
 
-    fn server_awaiting_answer() -> (Server, Receiver<String>) {
-        server_with_ask(AskKind::Permission)
-    }
-
-    fn server_with_ask(kind: AskKind) -> (Server, Receiver<String>) {
+    fn server_with_ask(kind: AskKind) -> (Server, Receiver<String>, Receiver<Value>) {
         let (answer_tx, answer_rx) = flume::unbounded();
+        let (out_tx, out_rx) = flume::unbounded();
         let handle = InteractiveHandle {
             event_rx: flume::unbounded().1,
             tool_names: Vec::new(),
@@ -805,9 +872,9 @@ mod tests {
             task: smol::spawn(async {}),
         };
         let server = Server {
-            out_tx: flume::unbounded().0,
+            out_tx,
             model_specs: Vec::new(),
-            model_policy: Arc::new(maki_config::ModelPolicy::default()),
+            model_policy: Arc::new(ModelPolicy::default()),
             client_elicits_form: false,
             session: Some(SessionState {
                 handle,
@@ -820,12 +887,12 @@ mod tests {
                 })),
             }),
         };
-        (server, answer_rx)
+        (server, answer_rx, out_rx)
     }
 
     #[test]
     fn only_the_outstanding_request_id_is_answered() {
-        let (srv, answer_rx) = server_awaiting_answer();
+        let (srv, answer_rx, ..) = server_with_ask(AskKind::Permission);
 
         handle_incoming_response(&srv, &allow_once(UNKNOWN_ID));
         assert!(answer_rx.is_empty(), "an unknown id is dropped");
@@ -845,7 +912,7 @@ mod tests {
 
     #[test]
     fn cancel_drops_the_outstanding_permission_request() {
-        let (srv, answer_rx) = server_awaiting_answer();
+        let (srv, answer_rx, ..) = server_with_ask(AskKind::Permission);
         handle_notification(&srv, "session/cancel");
 
         handle_incoming_response(&srv, &allow_once(ANSWERED_ID));
@@ -854,7 +921,7 @@ mod tests {
 
     #[test]
     fn elicitation_response_forwards_the_raw_result() {
-        let (srv, answer_rx) = server_with_ask(AskKind::Elicitation);
+        let (srv, answer_rx, ..) = server_with_ask(AskKind::Elicitation);
         let raw = serde_json::json!({
             "id": ANSWERED_ID,
             "result": { "action": "accept", "content": { "q1": "axum" } },
@@ -866,6 +933,26 @@ mod tests {
             serde_json::from_str::<Value>(&forwarded).unwrap(),
             raw["result"]
         );
+    }
+
+    #[test]
+    fn discovered_models_are_pushed_to_the_client() {
+        let (mut srv, .., out_rx) = server_with_ask(AskKind::Permission);
+        let specs = vec![DISCOVERED_SPEC.to_owned()];
+
+        refresh_models(&mut srv, specs.clone());
+        let update = out_rx.try_recv().expect("the fuller list is announced");
+        let option = &update["params"]["update"]["configOptions"][0];
+        assert_eq!(option["id"], methods::MODEL_CONFIG_ID);
+        assert!(
+            option["options"]
+                .as_array()
+                .is_some_and(|opts| opts.iter().any(|o| o["value"] == DISCOVERED_SPEC)),
+            "the discovered spec is selectable"
+        );
+
+        refresh_models(&mut srv, specs);
+        assert!(out_rx.is_empty(), "an unchanged list is not re-announced");
     }
 
     #[test]
